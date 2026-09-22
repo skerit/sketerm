@@ -130,6 +130,7 @@ pub const BrowserView = struct {
     /// keeping large selections responsive while fsync runs.
     paste_runs: std.ArrayList(*PasteRun) = .empty,
     paste_idle: c.guint = 0,
+    external_paste: ?*@import("ops.zig").ExternalPaste = null,
     jobs: std.ArrayList(*JobRow) = .empty,
     transfers: std.ArrayList(*ActiveTransfer) = .empty,
     /// Cross-host copies waiting for their destination (jobs.zig).
@@ -456,6 +457,7 @@ pub const BrowserView = struct {
     pub const requestFreeSpace = @import("conn.zig").requestFreeSpace;
     pub const openDir = @import("conn.zig").openDir;
     pub const refreshDir = @import("conn.zig").refreshDir;
+    pub const refreshTab = @import("conn.zig").refreshTab;
     pub const clearFailureCaches = @import("preview.zig").clearFailureCaches;
     pub const queueListing = @import("conn.zig").queueListing;
     pub const nextReq = @import("conn.zig").nextReq;
@@ -1072,6 +1074,7 @@ pub const BrowserView = struct {
     /// reach.
     fn fenceWidgets(self: *BrowserView) void {
         self.widgets_dead = true;
+        @import("ops.zig").cancelExternalPaste(self, null);
         self.severPreviewAnimation();
         if (self.bar_idle_src != 0) {
             _ = c.g_source_remove(self.bar_idle_src);
@@ -1356,6 +1359,7 @@ pub const BrowserView = struct {
     }
 
     pub fn deinit(self: *BrowserView) void {
+        @import("ops.zig").cancelExternalPaste(self, null);
         self.cancelInlineRename(null);
         // Flush rather than drop: a sidebar drag in the last 400ms
         // before teardown is still the width the user chose. This runs
@@ -1618,18 +1622,11 @@ pub const BrowserView = struct {
         cssutil.install("browser_view", any_widget, css);
     }
 
-    /// Re-list what the tab is showing, without touching history or
-    /// the view: the same one-shot `list` the resync path uses, for
-    /// the root and for every miller/column directory beside it.
+    /// Reload without moving history; a dead connection is retried first.
     fn onRefreshClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         const self = cast.userData(BrowserView, user);
         const tab = self.currentTab() orelse return;
-        self.clearFailureCaches();
-        self.refreshDir(tab, tab.root);
-        for (tab.subdirs.items) |d| self.refreshDir(tab, d);
-        // An explicit reload always re-asks git: the recency cache is
-        // exactly what the user is overriding by pressing this.
-        self.refreshGitForced(tab);
+        self.refreshTab(tab);
     }
 
     /// Split into a second browser pane. The pane binding table owns

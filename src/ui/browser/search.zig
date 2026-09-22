@@ -84,6 +84,8 @@ const MAX_REJECT_TEXT = 120;
 /// render rather than only in a status line the next action erases.
 pub const TabQuery = struct {
     hc: *HostConn,
+    /// Intent not yet submitted; owned by the tab, like the running job.
+    queued: bool = false,
     /// 0 until the daemon answers the start request with an id.
     job: u64 = 0,
     kind: query.Kind,
@@ -139,7 +141,7 @@ pub const TabQuery = struct {
 
 /// Start `q` on `tab`, whose root Dir the caller has already put into
 /// flat mode. Replaces any query the tab was already running.
-/// @return false when nothing was started.
+/// @return false when nothing was started or queued.
 pub fn queryStart(
     self: *BrowserView,
     tab: *BTab,
@@ -148,14 +150,16 @@ pub fn queryStart(
     q: query.Query,
     mode: TabQuery.Mode,
 ) bool {
-    if (tab.hc.state != .ready) {
+    if (tab.hc.state == .dead) {
         self.setStatusFmt("not connected to {s}", .{tab.hc.label()});
+        tab.root.setLoadError("the query host is not connected");
         return false;
     }
     queryForget(self, tab);
     const tq = self.allocator.create(TabQuery) catch return false;
     tq.* = .{
         .hc = tab.hc,
+        .queued = true,
         .kind = q.kind,
         .mode = mode,
         .text = self.allocator.dupe(u8, text) catch {
@@ -169,10 +173,23 @@ pub fn queryStart(
         },
     };
     tab.query = tq;
+    tab.root.clearLoadError();
+    tab.root.loaded = false;
+    if (tab.hc.state == .connecting) return true;
+    return dispatchQueuedQuery(self, tab);
+}
 
+/// Readiness dispatches only unsent intent, never a previously started command.
+pub fn dispatchQueuedQuery(self: *BrowserView, tab: *BTab) bool {
+    const tq = tab.query orelse return false;
+    if (!tq.queued or tab.hc.state != .ready) return false;
+    const q = query.parse(tq.text, tq.kind == .content) orelse return false;
+    tq.hc = tab.hc;
+    tq.queued = false;
+    tab.root.clearLoadError();
     var jl: [220]u8 = undefined;
     const jlbl = std.fmt.bufPrint(&jl, "{s} \"{s}\" in {s}", .{
-        q.kindLabel(), q.pattern[0..@min(q.pattern.len, 80)], root,
+        q.kindLabel(), q.pattern[0..@min(q.pattern.len, 80)], tq.root,
     }) catch "query";
     // Single-shot by contract: the relative-time predicate belongs to
     // the job about to be started and to nothing after it.
@@ -187,9 +204,126 @@ pub fn queryStart(
     // pretending to be live.
     if (tab.query == tq and !queryRequested(self, tab)) {
         queryForget(self, tab);
+        tab.root.setLoadError("could not start the query");
         return false;
     }
     return true;
+}
+
+test "queued queries own their intent, survive dial failure and dispatch only once" {
+    const t = std.testing;
+    const types = @import("types.zig");
+    const muxclient = @import("../../mux/client.zig");
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var view = BrowserView{ .allocator = a, .pane = null, .widgets_dead = true };
+    defer if (view.coalesced_render_src != 0) {
+        _ = c.g_source_remove(view.coalesced_render_src);
+    };
+    var hc = HostConn{ .view = &view, .host = null };
+    var pair: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &pair));
+    hc.conn = .{ .allocator = a, .fd = pair[0], .proto = 1 };
+    defer hc.conn.deinit();
+    var peer = muxclient.Conn{ .allocator = a, .fd = pair[1] };
+    defer peer.deinit();
+    peer.setNonBlocking();
+    var root = types.Dir{ .allocator = a, .path = @constCast("/saved"), .view_id = 0, .flat = true, .loaded = true };
+    var tab = BTab{
+        .view = &view,
+        .hc = &hc,
+        .root = &root,
+        .page = undefined,
+        .listing_box = undefined,
+        .colview = undefined,
+        .tab_label = undefined,
+    };
+    try view.tabs.append(a, &tab);
+    const cases = [_]struct { text: []const u8, content: bool }{
+        .{ .text = "@7d *.zig", .content = false },
+        .{ .text = "needle", .content = true },
+        .{ .text = "!printf result", .content = false },
+    };
+    for (cases) |case| {
+        hc.state = .connecting;
+        const text = try a.dupe(u8, case.text);
+        try t.expect(queryStart(&view, &tab, "/saved", text, query.parse(text, case.content).?, .results));
+        @memset(text, 'x');
+        try t.expectEqualStrings(case.text, tab.query.?.text);
+        try t.expect(tab.query.?.queued);
+        try t.expect(!root.loaded);
+        try t.expectEqual(@as(usize, 0), view.pending_jobs.items.len);
+        try t.expect(!dispatchQueuedQuery(&view, &tab));
+        view.failPendingListings(&hc, "dial failed");
+        try t.expectEqualStrings("dial failed", root.load_error.?);
+        try t.expect(tab.query.?.queued);
+
+        hc.state = .ready;
+        try t.expect(dispatchQueuedQuery(&view, &tab));
+        try t.expect(!dispatchQueuedQuery(&view, &tab));
+        try t.expect(!tab.query.?.queued and root.load_error == null);
+        try t.expectEqual(@as(usize, 1), view.pending_jobs.items.len);
+        try t.expect(peer.fillAvailable());
+        const frame = (try peer.takeFrame()) orelse return error.MissingQuery;
+        defer frame.deinit(a);
+        const sent = try std.json.parseFromSliceLeaky(struct {
+            op: []const u8,
+            path: []const u8,
+            pattern: []const u8,
+            within_ms: u64,
+        }, a, frame.payload, .{ .ignore_unknown_fields = true });
+        const expected = query.parse(case.text, case.content).?;
+        try t.expectEqualStrings(expected.op(), sent.op);
+        try t.expectEqualStrings("/saved", sent.path);
+        try t.expectEqualStrings(expected.pattern, sent.pattern);
+        try t.expectEqual(expected.within_ms, sent.within_ms);
+        try t.expect((try peer.takeFrame()) == null);
+        try t.expect(!root.loaded);
+        tab.query.?.job = 42;
+        _ = queryConsumeEvent(&view, &hc, .{
+            .job = 42,
+            .ev = if (expected.live()) "ready" else "done",
+        });
+        try t.expect(root.loaded);
+        tab.query.?.job = 0;
+
+        // Both tab close and navigation already use this cancellation path.
+        queryForget(&view, &tab);
+        try t.expect(tab.query == null and view.pending_jobs.items[0].tab == null);
+        view.pending_jobs.clearRetainingCapacity();
+        hc.state = .connecting;
+        try t.expect(queryStart(&view, &tab, "/saved", case.text, expected, .results));
+        queryForget(&view, &tab);
+        hc.state = .ready;
+        try t.expect(!dispatchQueuedQuery(&view, &tab));
+        try t.expectEqual(@as(usize, 0), view.pending_jobs.items.len);
+
+        // Transport loss before the first ready/done event is a failed scan,
+        // including when its start acknowledgement never arrived.
+        try t.expect(queryStart(&view, &tab, "/saved", case.text, expected, .results));
+        try t.expect(!root.loaded and !tab.query.?.queued);
+        hc.state = .dead;
+        view.failPendingListings(&hc, "connection lost");
+        try t.expect(root.loaded and !root.streaming);
+        try t.expect(tab.query.?.ended and tab.query.?.failed and !tab.query.?.queued);
+        var note_buf: [256]u8 = undefined;
+        const note = queryNote(&tab, &note_buf);
+        try t.expect(std.mem.indexOf(u8, note, "FAILED") != null);
+        try t.expect(std.mem.indexOf(u8, note, "scanning") == null);
+        try t.expect(std.mem.indexOf(u8, note, "waiting") == null);
+        const format = @import("../../filebrowser/format.zig");
+        try t.expectEqual(format.ListingState.failed, format.listingState(root.loaded, tab.query.?.failed, root.isFlat(), 0));
+        hc.state = .ready;
+        try t.expect(!dispatchQueuedQuery(&view, &tab));
+        try t.expectEqual(@as(usize, 1), view.pending_jobs.items.len);
+        try t.expect(peer.fillAvailable());
+        const interrupted_frame = (try peer.takeFrame()) orelse return error.MissingQuery;
+        interrupted_frame.deinit(a);
+        try t.expect((try peer.takeFrame()) == null);
+        queryForget(&view, &tab);
+        view.pending_jobs.clearRetainingCapacity();
+    }
 }
 
 /// Whether the tab's query still has a request in flight or an id.
@@ -251,6 +385,7 @@ pub fn queryConsumeEvent(self: *BrowserView, hc: *HostConn, e: WireJobEv) bool {
         return true;
     }
     if (std.mem.eql(u8, e.ev, "ready")) {
+        tab.root.loaded = true;
         tq.ready = true;
         tq.matches = e.matches;
         tq.watches = e.watches;
@@ -274,6 +409,7 @@ pub fn queryConsumeEvent(self: *BrowserView, hc: *HostConn, e: WireJobEv) bool {
         return true;
     }
     if (e.terminalEv()) {
+        tab.root.loaded = true;
         tq.ended = true;
         if (std.mem.eql(u8, e.ev, "done")) {
             tq.matches = e.matches;
@@ -300,9 +436,11 @@ pub fn queryConsumeEvent(self: *BrowserView, hc: *HostConn, e: WireJobEv) bool {
 pub fn queryNote(tab: *BTab, buf: []u8) []const u8 {
     const tq = tab.query orelse return "";
     var w = std.Io.Writer.fixed(buf);
-    const state: []const u8 = if (tq.mode == .flat)
+    const state: []const u8 = if (tq.queued)
+        "query waiting for connection"
+    else if (tq.mode == .flat)
         (if (tq.live()) "flat view, live" else "flat view")
-    else if (!tq.ready and tq.kind == .live_name)
+    else if (!tq.ready and tq.live())
         "live query, scanning"
     else if (tq.live())
         "live query"
@@ -331,7 +469,7 @@ pub fn queryNote(tab: *BTab, buf: []u8) []const u8 {
 /// flat tab, which keeps updating for as long as it is open.
 pub fn startSearch(self: *BrowserView) void {
     const tab = self.currentTab() orelse return;
-    if (tab.hc.state != .ready) {
+    if (tab.hc.state == .dead) {
         self.setStatusFmt("not connected to {s}", .{tab.hc.label()});
         return;
     }
@@ -360,11 +498,11 @@ pub fn runQuery(self: *BrowserView, tab: *BTab, text: []const u8, q: query.Query
     const rtab = self.newTab(tab.hc.host, root) orelse return;
     // Flat results: no live view (newTab already subscribed the
     // root -- undo that; the query stream is the listing).
-    self.closeViewOf(rtab.hc, rtab.root);
     var i: usize = 0;
     while (i < self.pending.items.len) {
         if (self.pending.items[i].tab == rtab) self.dropPending(i) else i += 1;
     }
+    self.closeViewOf(rtab.hc, rtab.root);
     rtab.root.flat = true;
     rtab.root.loaded = true;
     rtab.root.view_id = 0;
@@ -373,7 +511,8 @@ pub fn runQuery(self: *BrowserView, tab: *BTab, text: []const u8, q: query.Query
     var lbl: [200:0]u8 = undefined;
     const ltxt = std.fmt.bufPrintZ(&lbl, "{s}: {s}", .{ q.kindLabel(), text }) catch "query";
     c.gtk_label_set_text(rtab.tab_label, ltxt.ptr);
-    _ = queryStart(self, rtab, root, text, q, .results);
+    if (!queryStart(self, rtab, root, text, q, .results))
+        rtab.root.setLoadError("could not start the query");
     self.renderTab(rtab);
 }
 

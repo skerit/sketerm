@@ -5,7 +5,7 @@
 //! the batch. `beginPaste` starts every source whose name is free
 //! immediately and parks only the colliding ones here; the dialog then
 //! works through the parked list while the rest of the copy is already
-//! running. "Apply to all" drains the queue in one decision.
+//! running. "Apply to all" drains the queue until a decision is refused.
 //!
 //! Each parked item asks BOTH hosts for the facts a person needs to
 //! decide -- size, modification time, and a thumbnail where the
@@ -559,6 +559,11 @@ fn onChoice(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     // Applying pops items, so the popover must not be asked about them
     // afterwards; close first and reopen for whatever is left.
     closeDialog(self);
+    _ = applyChoices(self, choice, all);
+    if (self.conflicts.queue.items.len > 0) showDialog(self);
+}
+
+fn applyChoices(self: *BrowserView, choice: Choice, all: bool) usize {
     var applied: usize = 0;
     while (self.conflicts.queue.items.len > 0) {
         const item = self.conflicts.queue.items[0];
@@ -568,24 +573,37 @@ fn onChoice(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
             @memcpy(manifest_buf[0..token.len], token);
             break :blk manifest_buf[0..token.len];
         } else manifest_buf[0..0];
-        applyOne(self, item, choice);
+        var status_buf: [256]u8 = undefined;
+        const status = std.mem.span(c.gtk_label_get_text(self.status_label));
+        const status_len = @min(status.len, status_buf.len);
+        @memcpy(status_buf[0..status_len], status[0..status_len]);
+        if (!applyOne(self, item, choice)) {
+            // Some durable-admission refusals have no status of their own.
+            // Never leave the previous item's success on a failed decision.
+            if (std.mem.eql(u8, status_buf[0..status_len], std.mem.span(c.gtk_label_get_text(self.status_label))))
+                self.setStatusFmt("could not apply \"{s}\" to {s}; retry or skip", .{ @tagName(choice), item.name() });
+            return applied;
+        }
         dropHead(self);
         if (manifest.len > 0) self.settleUserBatch(manifest);
         applied += 1;
         if (!all) break;
     }
     if (applied > 1) self.setStatusFmt("applied \"{s}\" to {d} conflicts", .{ @tagName(choice), applied });
-    if (self.conflicts.queue.items.len > 0) showDialog(self);
+    return applied;
 }
 
-fn applyOne(self: *BrowserView, item: *Item, choice_in: Choice) void {
-    if (!self.tabAlive(item.tab)) {
-        self.setStatus("the target tab closed; conflict dropped");
-        return;
-    }
-    if (item.tab.hc != item.dst_hc) {
-        self.setStatus("the target tab moved to another host; conflict dropped");
-        return;
+fn applyOne(self: *BrowserView, item: *Item, choice_in: Choice) bool {
+    // Skip only records a decision; it needs no live destination connection.
+    if (choice_in != .skip) {
+        if (!self.tabAlive(item.tab)) {
+            self.setStatus("the target tab closed; conflict not applied");
+            return false;
+        }
+        if (!@import("../../filebrowser/paths.zig").hostEq(item.tab.hc.host, item.dst_hc.host)) {
+            self.setStatus("the target tab moved to another host; conflict not applied");
+            return false;
+        }
     }
     // A directory cannot be "overwritten" in place and a file cannot be
     // merged: map an apply-to-all decision onto what this item is.
@@ -599,17 +617,18 @@ fn applyOne(self: *BrowserView, item: *Item, choice_in: Choice) void {
     };
     switch (choice) {
         .skip => {
-            if (self.resolvePasteConflict(item.tab, item.src_host, item.src, item.dst, item.cut, .{
+            if (!self.resolvePasteConflict(item.tab, item.src_host, item.src, item.dst, item.cut, .{
                 .batch_id = item.batch_id,
                 .batch_total = item.batch_total,
-            }, item.manifest_token, item.manifest_index, true))
-                self.setStatusFmt("skipped {s}", .{item.name()})
-            else
+            }, item.manifest_token, item.manifest_index, true)) {
                 self.setStatusFmt("could not save the skip decision for {s}", .{item.name()});
+                return false;
+            }
+            self.setStatusFmt("skipped {s}", .{item.name()});
         },
         .keep_both => {
             var name_buf: [512]u8 = undefined;
-            const dir = std.fs.path.dirname(item.dst) orelse return;
+            const dir = std.fs.path.dirname(item.dst) orelse return false;
             // The pasted item's own kind decides whether its name has an
             // extension; the stat may still be in flight, and then the
             // colliding row (same name, almost always the same kind) is
@@ -617,24 +636,25 @@ fn applyOne(self: *BrowserView, item: *Item, choice_in: Choice) void {
             const src_dir = if (item.src_known) item.src_is_dir else item.is_dir;
             const unique = uniqueDstNameIn(item.tab, dir, item.name(), src_dir, &name_buf) orelse {
                 self.setStatusFmt("no free name for {s}", .{item.name()});
-                return;
+                return false;
             };
             var dst_buf: [4096]u8 = undefined;
             const dst = std.fmt.bufPrint(&dst_buf, "{s}/{s}", .{
                 if (dir.len == 1) "" else dir, unique,
-            }) catch return;
-            _ = self.resolvePasteConflict(item.tab, item.src_host, item.src, dst, item.cut, .{ .no_replace = true, .batch_id = item.batch_id, .batch_total = item.batch_total }, item.manifest_token, item.manifest_index, false);
+            }) catch return false;
+            return self.resolvePasteConflict(item.tab, item.src_host, item.src, dst, item.cut, .{ .no_replace = true, .batch_id = item.batch_id, .batch_total = item.batch_total }, item.manifest_token, item.manifest_index, false);
         },
-        .overwrite => _ = self.resolvePasteConflict(item.tab, item.src_host, item.src, item.dst, item.cut, .{ .batch_id = item.batch_id, .batch_total = item.batch_total }, item.manifest_token, item.manifest_index, false),
+        .overwrite => return self.resolvePasteConflict(item.tab, item.src_host, item.src, item.dst, item.cut, .{ .batch_id = item.batch_id, .batch_total = item.batch_total }, item.manifest_token, item.manifest_index, false),
         .merge => {
-            _ = self.resolvePasteConflict(item.tab, item.src_host, item.src, item.dst, item.cut, .{ .dir_mode = "merge", .undoable = false, .batch_id = item.batch_id, .batch_total = item.batch_total }, item.manifest_token, item.manifest_index, false);
+            if (!self.resolvePasteConflict(item.tab, item.src_host, item.src, item.dst, item.cut, .{ .dir_mode = "merge", .undoable = false, .batch_id = item.batch_id, .batch_total = item.batch_total }, item.manifest_token, item.manifest_index, false)) return false;
             self.setStatusFmt("merging into {s} (a merge cannot be undone)", .{item.name()});
         },
         .replace => {
-            _ = self.resolvePasteConflict(item.tab, item.src_host, item.src, item.dst, item.cut, .{ .dir_mode = "replace", .undoable = false, .batch_id = item.batch_id, .batch_total = item.batch_total }, item.manifest_token, item.manifest_index, false);
+            if (!self.resolvePasteConflict(item.tab, item.src_host, item.src, item.dst, item.cut, .{ .dir_mode = "replace", .undoable = false, .batch_id = item.batch_id, .batch_total = item.batch_total }, item.manifest_token, item.manifest_index, false)) return false;
             self.setStatusFmt("replacing {s} (a replace cannot be undone)", .{item.name()});
         },
     }
+    return true;
 }
 
 test "verdictText names the newer side and compares sizes" {
@@ -698,4 +718,213 @@ test "merge is offered only when BOTH sides are known directories" {
     // not offered merge: the source might be a plain file.
     dir.src_known = false;
     try t.expect(!dir.mergeable());
+}
+
+// No daemon is contacted: successful submissions go to a socketpair whose
+// peer never answers. Run these GTK-label tests on an isolated Wayland display.
+const DecisionTest = struct {
+    view: BrowserView = .{ .allocator = std.testing.allocator },
+    root: @import("types.zig").Dir = .{ .allocator = std.testing.allocator, .path = @constCast("/destination"), .view_id = 1 },
+    hc: HostConn = undefined,
+    tab: BTab = undefined,
+    status: ?*c.GtkWidget = null,
+    peer: c_int = -1,
+
+    fn init(self: *DecisionTest) !void {
+        if (c.getenv("SKETERM_TEST_FILE_CONFLICT") == null) return error.SkipZigTest;
+        try std.testing.expect(c.gtk_init_check() != 0);
+        self.* = .{};
+        errdefer self.deinit();
+        self.status = c.gtk_label_new("sentinel").?;
+        _ = c.g_object_ref_sink(self.status);
+        self.view.status_label = @ptrCast(self.status.?);
+        self.view.root_box = self.status.?;
+        self.hc = .{ .view = &self.view, .host = null };
+        self.tab = .{
+            .view = &self.view,
+            .hc = &self.hc,
+            .root = &self.root,
+            .page = self.status.?,
+            .listing_box = self.status.?,
+            .colview = @ptrCast(self.status.?),
+            .tab_label = self.view.status_label,
+        };
+        try self.view.tabs.append(self.view.allocator, &self.tab);
+    }
+
+    fn connect(self: *DecisionTest) !void {
+        var pair: [2]c_int = undefined;
+        try std.testing.expectEqual(@as(c_int, 0), c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &pair));
+        self.peer = pair[1];
+        self.hc.conn = .{ .allocator = self.view.allocator, .fd = pair[0], .copy_no_replace = true };
+        self.hc.conn.setNonBlocking();
+        self.hc.state = .ready;
+    }
+
+    fn add(self: *DecisionTest, name: []const u8, is_dir: bool) !*Item {
+        const a = self.view.allocator;
+        const item = try a.create(Item);
+        errdefer a.destroy(item);
+        const src = try std.fmt.allocPrint(a, "/source/{s}", .{name});
+        errdefer a.free(src);
+        const dst = try std.fmt.allocPrint(a, "/destination/{s}", .{name});
+        errdefer a.free(dst);
+        item.* = .{
+            .tab = &self.tab,
+            .src_hc = &self.hc,
+            .dst_hc = &self.hc,
+            .src = src,
+            .dst = dst,
+            .src_host = null,
+            .is_dir = is_dir,
+            .src_known = true,
+            .src_is_dir = is_dir,
+            .cut = false,
+        };
+        try self.view.conflicts.queue.append(a, item);
+        return item;
+    }
+
+    fn expectStatus(self: *DecisionTest, expected: []const u8) !void {
+        try std.testing.expectEqualStrings(expected, std.mem.span(c.gtk_label_get_text(self.view.status_label)));
+    }
+
+    fn deinit(self: *DecisionTest) void {
+        const a = self.view.allocator;
+        self.view.conflicts.deinit(a);
+        for (self.view.pending_jobs.items) |pending| {
+            if (pending.undo_op) |undo| undo.destroy(a);
+            a.free(pending.label);
+            a.destroy(pending);
+        }
+        self.view.pending_jobs.deinit(a);
+        self.view.tabs.deinit(a);
+        if (self.peer >= 0) {
+            if (self.hc.write_watch_id != 0) _ = c.g_source_remove(self.hc.write_watch_id);
+            self.hc.conn.deinit();
+            _ = c.close(self.peer);
+        }
+        if (self.status) |status| c.g_object_unref(status);
+    }
+};
+
+test "conflict decisions retain refused submissions and still allow skip" {
+    const t = std.testing;
+    for ([_]Choice{ .overwrite, .keep_both, .merge, .replace }) |choice| {
+        var f: DecisionTest = .{};
+        try f.init();
+        defer f.deinit();
+        const item = try f.add("first", choice == .merge or choice == .replace);
+        _ = try f.add("second", false);
+        try t.expectEqual(@as(usize, 0), applyChoices(&f.view, choice, false));
+        try t.expectEqual(@as(usize, 2), f.view.conflicts.queue.items.len);
+        try t.expect(f.view.conflicts.queue.items[0] == item);
+        try f.expectStatus("not connected to local");
+        try t.expectEqual(@as(usize, 0), f.view.pending_jobs.items.len);
+        // Apply-all must stop, not spin on the retained head or consume it.
+        try t.expectEqual(@as(usize, 0), applyChoices(&f.view, choice, true));
+        try t.expectEqual(@as(usize, 2), f.view.conflicts.queue.items.len);
+        try t.expectEqual(@as(usize, 1), applyChoices(&f.view, .skip, false));
+        try f.expectStatus("skipped first");
+        try t.expectEqual(@as(usize, 1), applyChoices(&f.view, .skip, true));
+        try t.expectEqual(@as(usize, 0), f.view.conflicts.queue.items.len);
+    }
+}
+
+test "conflict decisions stop apply-all after a successful prefix and retry on reconnect" {
+    const t = std.testing;
+    var f: DecisionTest = .{};
+    try f.init();
+    defer f.deinit();
+    try f.connect();
+    var dead = HostConn{ .view = &f.view, .host = null, .state = .dead };
+    var blocked_tab = f.tab;
+    blocked_tab.hc = &dead;
+    try f.view.tabs.append(t.allocator, &blocked_tab);
+    _ = try f.add("one", false);
+    _ = try f.add("two", false);
+    const blocked = try f.add("three", false);
+    blocked.tab = &blocked_tab;
+    blocked.dst_hc = &dead;
+    blocked.src_hc = &dead;
+    const last = try f.add("four", false);
+    try t.expectEqual(@as(usize, 2), applyChoices(&f.view, .overwrite, true));
+    try t.expectEqualSlices(*Item, &.{ blocked, last }, f.view.conflicts.queue.items);
+    try t.expectEqual(@as(usize, 2), f.view.pending_jobs.items.len);
+    try f.expectStatus("not connected to local"); // not "applied ... to 2 conflicts"
+    blocked_tab.hc = &f.hc; // same host, new connection identity
+    try t.expectEqual(@as(usize, 2), applyChoices(&f.view, .overwrite, true));
+    try t.expectEqual(@as(usize, 0), f.view.conflicts.queue.items.len);
+    try t.expectEqual(@as(usize, 4), f.view.pending_jobs.items.len);
+    try f.expectStatus("applied \"overwrite\" to 2 conflicts");
+}
+
+test "conflict decisions replace stale success on silent refusal and allow skip after host change" {
+    const t = std.testing;
+    var f: DecisionTest = .{};
+    try f.init();
+    defer f.deinit();
+    const item = try f.add("first", true);
+    item.manifest_token = try t.allocator.dupe(u8, "unavailable-manifest");
+    item.manifest_index = 0;
+    f.view.setStatus("done: previous transfer");
+    try t.expectEqual(@as(usize, 0), applyChoices(&f.view, .merge, true));
+    try t.expectEqualSlices(*Item, &.{item}, f.view.conflicts.queue.items);
+    try f.expectStatus("could not apply \"merge\" to first; retry or skip");
+
+    // A non-durable conflict can still be explicitly skipped when its tab
+    // no longer targets the original host; a transfer must remain refused.
+    t.allocator.free(item.manifest_token.?);
+    item.manifest_token = null;
+    item.manifest_index = null;
+    var other = HostConn{ .view = &f.view, .host = @constCast("other-host") };
+    f.tab.hc = &other;
+    try t.expectEqual(@as(usize, 0), applyChoices(&f.view, .merge, false));
+    try f.expectStatus("the target tab moved to another host; conflict not applied");
+    try t.expectEqual(@as(usize, 1), applyChoices(&f.view, .skip, false));
+    try f.expectStatus("skipped first");
+}
+
+test "conflict decisions retain a failed durable skip until it can be persisted" {
+    const t = std.testing;
+    var f: DecisionTest = .{};
+    try f.init();
+    defer f.deinit();
+    const old_state = if (c.getenv("XDG_STATE_HOME")) |value| try t.allocator.dupeZ(u8, std.mem.span(value)) else null;
+    defer {
+        if (old_state) |value| {
+            _ = c.setenv("XDG_STATE_HOME", value, 1);
+            t.allocator.free(value);
+        } else _ = c.unsetenv("XDG_STATE_HOME");
+    }
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var state_buf: [4096:0]u8 = undefined;
+    const state = try std.fmt.bufPrintZ(&state_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    try t.expectEqual(@as(c_int, 0), c.setenv("XDG_STATE_HOME", state, 1));
+    var failing = std.testing.FailingAllocator.init(t.allocator, .{});
+    const service = try failing.allocator().create(@import("../file_transfers.zig").Service);
+    service.* = .{ .allocator = failing.allocator(), .shutting_down = true };
+    defer service.deinit();
+    f.view.transfer_service = service;
+    const item = try f.add("first", false);
+    const token = service.newUserBatch("", "", false, 1, 1, &.{.{
+        .src_path = item.src,
+        .dst_path = item.dst,
+        .conflict_is_dir = false,
+    }}, @ptrCast(&f.view)) orelse return error.BatchCreateFailed;
+    item.manifest_token = try t.allocator.dupe(u8, token);
+    item.manifest_index = 0;
+    failing.fail_index = failing.alloc_index;
+    defer failing.fail_index = std.math.maxInt(usize);
+    try t.expectEqual(@as(usize, 0), applyChoices(&f.view, .skip, true));
+    failing.fail_index = std.math.maxInt(usize);
+    try t.expectEqualSlices(*Item, &.{item}, f.view.conflicts.queue.items);
+    try t.expectEqual(@as(usize, 1), service.batches.items.len);
+    try t.expect(!service.userBatchItemMaterialized(token, 0));
+    try f.expectStatus("could not save the skip decision for first");
+    try t.expectEqual(@as(usize, 1), applyChoices(&f.view, .skip, true));
+    try t.expectEqual(@as(usize, 0), f.view.conflicts.queue.items.len);
+    try t.expectEqual(@as(usize, 0), service.batches.items.len);
+    try f.expectStatus("skipped first");
 }

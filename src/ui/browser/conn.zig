@@ -320,6 +320,18 @@ pub fn failPendingListings(self: *BrowserView, hc: *HostConn, reason: []const u8
         }
         self.dropPending(i);
     }
+    for (self.tabs.items) |tab| {
+        const tq = tab.query orelse continue;
+        if (tq.hc != hc) continue;
+        if (tq.queued) {
+            tab.root.setLoadError(reason);
+        } else if (!tq.ended) {
+            tab.root.loaded = true;
+            tab.root.streaming = false;
+            tq.ended = true;
+            tq.failed = true;
+        }
+    }
     self.renderCurrent();
 }
 
@@ -342,14 +354,9 @@ pub fn wireReady(self: *BrowserView, hc: *HostConn) void {
     // fresh connection and re-subscribe their views (the old view
     // subscriptions died with the old socket).
     for (self.tabs.items) |tab| {
-        if (tab.hc == hc or tab.hc.state != .dead or !hostEq(tab.hc.host, hc.host)) continue;
-        tab.hc = hc;
-        @import("diskusage.zig").rebind(tab, hc);
-        tab.free_req = 0;
-        tab.free_dirty = false;
-        tab.free_bytes = null;
-        self.resubscribeDir(tab, tab.root);
-        for (tab.subdirs.items) |d| self.resubscribeDir(tab, d);
+        if (tab.hc != hc and tab.hc.state == .dead and hostEq(tab.hc.host, hc.host))
+            rebindTab(self, tab, hc);
+        if (tab.hc == hc) _ = @import("search.zig").dispatchQueuedQuery(self, tab);
     }
     self.clearReconnect(hc.host);
     // The overlay for the visible tab was skipped while this host was
@@ -366,6 +373,25 @@ pub fn wireReady(self: *BrowserView, hc: *HostConn) void {
     // browsing: the mount helper's own connect (ssh auth, deploy
     // check) is the whole latency of the first double-click open.
     if (hc.host) |host| _ = @import("../hostmount.zig").ensure(self.allocator, host);
+    self.renderCurrent();
+}
+
+/// Used both by readiness and an explicit retry while the replacement dials.
+fn rebindTab(self: *BrowserView, tab: *BTab, hc: *HostConn) void {
+    tab.hc = hc;
+    @import("diskusage.zig").rebind(tab, hc);
+    tab.free_req = 0;
+    tab.free_dirty = false;
+    tab.free_bytes = null;
+    // Results belong to a query/collection, not an open_view subscription.
+    if (!tab.root.isFlat() and tab.root.archive.len == 0)
+        self.resubscribeDir(tab, tab.root);
+    if (tab.query) |tq| if (tq.queued) {
+        tq.hc = hc;
+        tab.root.clearLoadError();
+    };
+    for (tab.subdirs.items) |d| self.resubscribeDir(tab, d);
+    for (tab.ancestors.items) |d| self.resubscribeDir(tab, d);
 }
 
 /// One host being re-dialed after a drop, with backoff. Owned by
@@ -384,7 +410,7 @@ pub const Reconnect = struct {
 };
 
 /// Re-dial delays; after three attempts the host stays dead until the
-/// user navigates (every attempt may spawn a real ssh). The first is
+/// user refreshes or navigates (every attempt may spawn a real ssh). The first is
 /// never earlier than the transfer retry floor.
 const RECONNECT_DELAYS_MS = [_]c.guint{ 5_000, 10_000, 20_000 };
 
@@ -459,7 +485,7 @@ fn onReconnectTick(user: ?*anyopaque) callconv(.c) c.gboolean {
     }
     r.attempts += 1;
     if (r.attempts > RECONNECT_DELAYS_MS.len) {
-        self.setStatusFmt("gave up reconnecting to {s} -- navigate to retry", .{r.host});
+        self.setStatusFmt("gave up reconnecting to {s} -- refresh to retry", .{r.host});
         self.clearReconnect(r.host);
         return 0;
     }
@@ -918,6 +944,192 @@ pub fn refreshDir(self: *BrowserView, tab: *BTab, dir: *Dir) void {
     self.queueListing(tab, dir, .list);
 }
 
+/// Reload in place: reconnect without navigating or moving either history stack.
+pub fn refreshTab(self: *BrowserView, tab: *BTab) void {
+    self.clearFailureCaches();
+    if (tab.hc.state == .dead) {
+        const hc = self.hostConnFor(tab.hc.host) orelse return;
+        // Local autostart may already have rebound the tab in wireReady.
+        if (hc.state != .dead and tab.hc != hc) rebindTab(self, tab, hc);
+    } else {
+        if (!tab.root.isFlat() and tab.root.archive.len == 0)
+            self.refreshDir(tab, tab.root);
+        for (tab.subdirs.items) |d| self.refreshDir(tab, d);
+        for (tab.ancestors.items) |d| self.refreshDir(tab, d);
+    }
+    _ = @import("search.zig").dispatchQueuedQuery(self, tab);
+    self.renderTab(tab);
+    if (!self.widgets_dead) {
+        self.syncPathEntry(tab);
+        self.refreshGitForced(tab);
+    }
+}
+
+test "refresh reconnects in place and restores and refreshes Miller ancestors" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Refresh uses caches and listing metadata even with rendering fenced off.
+    var view = BrowserView{
+        .allocator = a,
+        .pane = null,
+        .widgets_dead = true,
+        .thumb_failed = std.StringHashMap(void).init(a),
+        .emblems = .{
+            .arena = std.heap.ArenaAllocator.init(a),
+            .list = &.{.{ .attr = "user.test", .icon = "test-emblem" }},
+        },
+    };
+    defer view.thumb_failed.deinit();
+    defer view.emblems.deinit();
+    try view.thumb_failed.put(try a.dupe(u8, "failed-thumbnail"), {});
+    var dead = HostConn{ .view = &view, .host = null, .state = .dead };
+    var fresh = HostConn{ .view = &view, .host = null };
+    // Reuse an in-flight reconnect, without dialing a real daemon in this test.
+    try view.conns.append(a, &dead);
+    try view.conns.append(a, &fresh);
+    const root = view.makeDir("/data") orelse return error.OutOfMemory;
+    const sub = view.makeDir("/data/sub") orelse return error.OutOfMemory;
+    const ancestor = view.makeDir("/") orelse return error.OutOfMemory;
+    var tab = BTab{
+        .view = &view,
+        .hc = &dead,
+        .root = root,
+        .page = undefined,
+        .listing_box = undefined,
+        .colview = undefined,
+        .tab_label = undefined,
+        .view_mode = .miller,
+    };
+    try view.tabs.append(a, &tab);
+    try tab.subdirs.append(a, sub);
+    try tab.ancestors.append(a, ancestor);
+    try tab.back.append(a, try a.dupe(u8, "/back"));
+    try tab.fwd.append(a, try a.dupe(u8, "/forward"));
+    for ([_]*Dir{ root, sub, ancestor }) |dir| {
+        dir.loaded = true;
+        dir.setLoadError("connection lost");
+        try dir.entries.append(a, try types.testEntry(a, "old", null));
+    }
+
+    refreshTab(&view, &tab);
+    try t.expectEqual(@as(u32, 0), view.thumb_failed.count());
+    try t.expect(tab.hc == &fresh);
+    try t.expectEqual(@as(usize, 3), view.pending.items.len);
+    for (view.pending.items) |p| {
+        try t.expect(p.hc == &fresh and !p.sent and p.op == .open_view);
+        try t.expect(p.dir.view_id > 3);
+        try t.expect(!p.dir.loaded and p.dir.load_error == null);
+        try t.expectEqual(@as(usize, 0), p.dir.entries.items.len);
+    }
+    try t.expectEqual(@as(usize, 1), tab.back.items.len);
+    try t.expectEqual(@as(usize, 1), tab.fwd.items.len);
+    try t.expectEqualStrings("/back", tab.back.items[0]);
+    try t.expectEqualStrings("/forward", tab.fwd.items[0]);
+
+    var pair: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &pair));
+    defer _ = c.close(pair[1]);
+    fresh.conn = .{ .allocator = a, .fd = pair[0], .proto = 1 };
+    defer fresh.conn.deinit();
+    fresh.state = .ready;
+    var attrs_buf: [64]u8 = undefined;
+    try t.expectEqualStrings("user.test", view.attrSpec(&tab, &attrs_buf));
+    for (view.pending.items) |p| view.sendListingOp(p);
+    refreshTab(&view, &tab);
+    try t.expectEqual(@as(usize, 6), view.pending.items.len);
+    for (view.pending.items[3..]) |p|
+        try t.expect(p.sent and p.op == .list);
+    try t.expect(view.pending.items[5].dir == ancestor);
+
+    // Refresh can supersede an initial streaming open before its final chunk.
+    root.streaming = true;
+    const req = view.pending.items[3].req;
+    var buf: [128]u8 = undefined;
+    const reply = try std.fmt.bufPrint(&buf, "{{\"req\":{d},\"ok\":true,\"entries\":[]}}", .{req});
+    try t.expect(view.onReply(&fresh, reply));
+    try t.expect(root.loaded and !root.streaming);
+
+    // The same rebinding used by wireReady also restores ancestor views.
+    var replacement = HostConn{ .view = &view, .host = null };
+    const old_ancestor_id = ancestor.view_id;
+    rebindTab(&view, &tab, &replacement);
+    try t.expectEqual(@as(usize, 3), view.pending.items.len);
+    try t.expect(ancestor.view_id > old_ancestor_id);
+    for (view.pending.items) |p|
+        try t.expect(p.hc == &replacement and p.op == .open_view and !p.sent);
+}
+
+test "refresh retries an unsent query after an initial dial failure without subscribing its result root" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var view = BrowserView{
+        .allocator = a,
+        .pane = null,
+        .widgets_dead = true,
+        .thumb_failed = std.StringHashMap(void).init(a),
+    };
+    defer view.thumb_failed.deinit();
+    try view.thumb_failed.put(try a.dupe(u8, "failed-thumbnail"), {});
+    var old = HostConn{ .view = &view, .host = null };
+    var fresh = HostConn{ .view = &view, .host = null };
+    try view.conns.append(a, &old);
+    try view.conns.append(a, &fresh);
+    var root = Dir{ .allocator = a, .path = @constCast("/saved"), .view_id = 0, .flat = true };
+    var tab = BTab{
+        .view = &view,
+        .hc = &old,
+        .root = &root,
+        .page = undefined,
+        .listing_box = undefined,
+        .colview = undefined,
+        .tab_label = undefined,
+    };
+    try view.tabs.append(a, &tab);
+    try t.expect(view.queryStart(&tab, "/saved", "*.zig", .{ .kind = .live_name, .pattern = "*.zig" }, .results));
+    defer view.queryForget(&tab);
+    old.state = .dead;
+    view.failPendingListings(&old, "dial failed");
+    try t.expectEqualStrings("dial failed", root.load_error.?);
+    try t.expect(tab.query.?.queued and !tab.query.?.ended and !tab.query.?.failed);
+    refreshTab(&view, &tab);
+    try t.expectEqual(@as(u32, 0), view.thumb_failed.count());
+    try t.expect(tab.query.?.queued and tab.query.?.hc == &fresh);
+    try t.expect(!root.loaded and root.load_error == null);
+    try t.expectEqual(@as(u32, 0), root.view_id);
+    try t.expectEqual(@as(usize, 0), view.pending.items.len);
+    try t.expectEqual(@as(usize, 0), view.pending_jobs.items.len);
+
+    var pair: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &pair));
+    defer _ = c.close(pair[1]);
+    fresh.conn = .{ .allocator = a, .fd = pair[0], .proto = 1 };
+    defer fresh.conn.deinit();
+    fresh.state = .ready;
+    refreshTab(&view, &tab);
+    refreshTab(&view, &tab);
+    try t.expect(!tab.query.?.queued and !root.loaded);
+    try t.expectEqual(@as(usize, 1), view.pending_jobs.items.len);
+    try t.expectEqual(@as(usize, 0), view.pending.items.len);
+    try t.expectEqual(@as(usize, 0), tab.back.items.len);
+    try t.expectEqual(@as(usize, 0), tab.fwd.items.len);
+
+    // A command/query already submitted must not be replayed on the next host.
+    fresh.state = .dead;
+    view.failPendingListings(&fresh, "connection lost during query");
+    const interrupted = tab.query.?;
+    var replacement = HostConn{ .view = &view, .host = null, .state = .ready };
+    rebindTab(&view, &tab, &replacement);
+    refreshTab(&view, &tab);
+    try t.expect(tab.query == interrupted and interrupted.failed and interrupted.ended);
+    try t.expect(root.loaded and !root.streaming);
+    try t.expectEqual(@as(usize, 1), view.pending_jobs.items.len);
+    try t.expectEqual(@as(usize, 0), view.pending.items.len);
+}
+
 pub fn queueListing(self: *BrowserView, tab: *BTab, dir: *Dir, op: @FieldType(Pending, "op")) void {
     const req = self.nextReq();
     const p = self.allocator.create(Pending) catch return;
@@ -927,6 +1139,7 @@ pub fn queueListing(self: *BrowserView, tab: *BTab, dir: *Dir, op: @FieldType(Pe
         return;
     };
     p.listing_generation = dir.snapshot.begin(self.allocator);
+    dir.clearLoadError();
     if (tab.hc.state == .ready) {
         self.sendListingOp(p);
     } else if (tab.hc.state == .dead) {
@@ -1184,6 +1397,7 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
                 p.dir.entries = p.staged;
                 p.staged = .empty;
                 p.dir.loaded = true;
+                p.dir.streaming = false;
                 p.dir.sort();
                 if (rep.truncated) self.setStatus("listing truncated (very large directory)");
                 var deferred: ?DeferredDeltas = if (p.dir.snapshot.finish(p.listing_generation))
@@ -1375,7 +1589,11 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
             // claiming to be live.
             if (pj.kind == .query) {
                 if (pj.tab) |t| {
-                    if (self.tabAlive(t)) self.queryForget(t);
+                    if (self.tabAlive(t)) {
+                        t.root.setLoadError(errorPhrase(rep.@"error"));
+                        self.queryForget(t);
+                        self.scheduleCoalescedRender();
+                    }
                 }
             }
             if (pj.kind == .disk_usage) {
@@ -1569,8 +1787,12 @@ pub fn onDelta(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
         const dir = tab.dirByView(d.view) orelse continue;
         if (dir.snapshot.push(self.allocator, payload)) return false;
         if (d.gone) {
+            @import("selection.zig").forgetDeleted(tab, dir.path);
             dir.gone = true;
             if (dir == tab.root) {
+                // The error view retains the old rows, so no structural
+                // splice can retire their visual range for us.
+                self.commitVisual(tab);
                 // The rows on screen describe a directory that is not
                 // there any more; keeping them without saying so is
                 // the same lie as an empty listing for a failed one.
@@ -1636,6 +1858,10 @@ pub fn onDelta(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
                 structural = true;
                 colview.invalidateBackingRefs(tab);
                 tab.noteChanged(dir, ch.name);
+                var path_buf: [4200]u8 = undefined;
+                if (std.fmt.bufPrint(&path_buf, "{s}/{s}", .{
+                    if (dir.path.len == 1) "" else dir.path, ch.name,
+                })) |path| @import("selection.zig").forgetDeleted(tab, path) else |_| {}
                 dir.del(ch.name);
             }
         }
@@ -1649,6 +1875,62 @@ pub fn onDelta(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
         return structural or recount;
     }
     return false;
+}
+
+test "authoritative delta deletion disarms selected paths and saved descendants only" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var view = BrowserView{ .allocator = a, .pane = null, .widgets_dead = true };
+    var hc = HostConn{ .view = &view, .host = null };
+    var root = Dir{ .allocator = a, .path = @constCast("/data"), .view_id = 1 };
+    var tab = BTab{
+        .view = &view,
+        .hc = &hc,
+        .root = &root,
+        .page = undefined,
+        .listing_box = undefined,
+        .colview = undefined,
+        .tab_label = undefined,
+    };
+    try view.tabs.append(a, &tab);
+    for ([_]*std.ArrayList([]u8){ &tab.selected, &tab.sel.saved, &tab.pending_select }) |paths| {
+        for ([_][]const u8{ "/data/B", "/data/B/child", "/data/B/deep/child", "/data/BB/keep", "/not-yet-listed" }) |path|
+            try paths.append(a, try a.dupe(u8, path));
+    }
+    // A partial listing/upsert must not prune identities absent from it.
+    try t.expect(onDelta(&view, &hc,
+        \\{"view":1,"changes":[{"op":"upsert","entry":{"name":"other","kind":"file"}}]}
+    ));
+    try t.expectEqual(@as(usize, 5), tab.selected.items.len);
+    // The delete is authoritative even if this listing never carried B.
+    const deletion =
+        \\{"view":1,"changes":[{"op":"del","name":"B"}]}
+    ;
+    try t.expect(onDelta(&view, &hc, deletion));
+    try t.expect(onDelta(&view, &hc, deletion));
+    for ([_]*std.ArrayList([]u8){ &tab.selected, &tab.sel.saved, &tab.pending_select }) |paths| {
+        try t.expectEqual(@as(usize, 2), paths.items.len);
+        try t.expectEqualStrings("/data/BB/keep", paths.items[0]);
+        try t.expectEqualStrings("/not-yet-listed", paths.items[1]);
+    }
+    try t.expect(onDelta(&view, &hc,
+        \\{"view":1,"changes":[{"op":"upsert","entry":{"name":"B","kind":"dir"}}]}
+    ));
+    try t.expectEqual(@as(usize, 2), tab.selected.items.len);
+    try t.expectEqual(@as(usize, 2), tab.sel.saved.items.len);
+    try t.expectEqual(@as(usize, 2), tab.pending_select.items.len);
+    // Root joining must not form //B, and a deleted link names itself,
+    // never its target.
+    root.path = @constCast("/");
+    try root.entries.append(a, try types.testEntry(a, "link", "/not-yet-listed"));
+    try tab.selected.append(a, try a.dupe(u8, "/link"));
+    try t.expect(onDelta(&view, &hc,
+        \\{"view":1,"changes":[{"op":"del","name":"link"}]}
+    ));
+    try t.expectEqual(@as(usize, 2), tab.selected.items.len);
+    try t.expectEqualStrings("/not-yet-listed", tab.selected.items[1]);
 }
 
 fn applyDeferredDeltas(self: *BrowserView, tab: *BTab, dir: *Dir, hc: *HostConn, deferred: *DeferredDeltas) bool {
@@ -1710,6 +1992,7 @@ pub fn mintViewId(self: *BrowserView) u32 {
 /// chunks onto `entries` and re-opening a loaded directory listed
 /// every file twice.
 pub fn resubscribeDir(self: *BrowserView, tab: *BTab, dir: *Dir) void {
+    self.cancelPendingDir(dir);
     colview.invalidateBackingRefs(tab);
     var full_buf: [4096]u8 = undefined;
     for (dir.entries.items) |*e| {
@@ -1727,6 +2010,7 @@ fn resetForResubscribe(dir: *Dir, allocator: std.mem.Allocator, fresh_view: u32)
     dir.entries.clearRetainingCapacity();
     dir.loaded = false;
     dir.streaming = false;
+    dir.clearLoadError();
     dir.view_id = fresh_view;
 }
 

@@ -172,7 +172,11 @@ fn clipStore(self: *BrowserView, tab: *BTab, srcs: []const []u8, cut: bool) void
         return;
     };
     const board = self.clipboard();
-    board.set(tab.hc.host, roots, cut, tab.root.dev);
+    if (!board.set(tab.hc.host, roots, cut, tab.root.dev)) {
+        _ = c.gdk_clipboard_set_content(clip, null);
+        self.setStatus("file copy/cut canceled: out of memory");
+        return;
+    }
     if (!exportClipToGdk(board, clip)) {
         self.setStatus("file clipboard export failed; copy/cut canceled");
         return;
@@ -214,11 +218,10 @@ fn onFileClipboardChanged(clip: *c.GdkClipboard, _: ?*anyopaque) callconv(.c) vo
 /// Mirror the internal clipboard onto the GDK clipboard so other apps
 /// can paste it: text/plain is newline-delimited absolute paths (a
 /// text-editor paste gives usable paths, Nemo-style, no file://) and
-/// x-special/gnome-copied-files carries file:// URIs so GNOME-family
-/// file managers paste the files themselves.
+/// GNOME and URI-list/KDE formats carry file:// URIs and the cut flag.
 ///
 /// Paste-into-self uses the internal board only while GDK still owns
-/// this export; external clipboard contents are not imported. Remote
+/// this export; external offers use a separate bounded read. Remote
 /// entries export their TEXT form only (the path on that host, which
 /// is what a paste into a terminal or editor wants); the file:// list
 /// is skipped because a local file manager would use this disk.
@@ -227,7 +230,11 @@ fn exportClipToGdk(board: *clipboard.Board, clip: *c.GdkClipboard) bool {
     // synchronously, and the old owner must not clear the new board.
     file_clipboard_owner.release();
     var exported = false;
-    defer if (!exported) board.clear();
+    defer if (!exported) {
+        board.clear();
+        // Do not leave a previous cut export available for re-import.
+        _ = c.gdk_clipboard_set_content(clip, null);
+    };
     if (board.isEmpty()) return false;
     const local = board.host == null;
     const a = board.allocator;
@@ -249,14 +256,21 @@ fn exportClipToGdk(board: *clipboard.Board, clip: *c.GdkClipboard) bool {
     }
     text.append(a, 0) catch return false;
     // The typed provider copies the string into its GValue; the union
-    // takes ownership of both providers; set_content refs the union,
+    // takes ownership of its providers; set_content refs the union,
     // so our own ref is dropped afterwards.
     const text_provider = c.gdk_content_provider_new_typed(c.G_TYPE_STRING, text.items.ptr);
     const provider = if (local) blk: {
         const bytes = c.g_bytes_new(gnome.items.ptr, gnome.items.len);
         defer c.g_bytes_unref(bytes);
-        const gnome_provider = c.gdk_content_provider_new_for_bytes("x-special/gnome-copied-files", bytes);
-        var providers = [_]?*c.GdkContentProvider{ gnome_provider, text_provider };
+        const gnome_provider = c.gdk_content_provider_new_for_bytes(clipboard.GNOME, bytes);
+        const uris = gnome.items[if (board.cut) @as(usize, 4) else 5..];
+        const uri_bytes = c.g_bytes_new(uris.ptr, uris.len);
+        defer c.g_bytes_unref(uri_bytes);
+        const uri_provider = c.gdk_content_provider_new_for_bytes(clipboard.URI, uri_bytes);
+        const cut_bytes = c.g_bytes_new(if (board.cut) "1" else "0", 1);
+        defer c.g_bytes_unref(cut_bytes);
+        const cut_provider = c.gdk_content_provider_new_for_bytes(clipboard.KDE_CUT, cut_bytes);
+        var providers = [_]?*c.GdkContentProvider{ gnome_provider, uri_provider, cut_provider, text_provider };
         break :blk c.gdk_content_provider_new_union(&providers, providers.len);
     } else text_provider;
     defer c.g_object_unref(@as(?*anyopaque, @ptrCast(provider)));
@@ -281,12 +295,205 @@ fn exportClipToGdk(board: *clipboard.Board, clip: *c.GdkClipboard) bool {
 /// another pane, on another host.
 pub fn pasteIntoCurrent(self: *BrowserView) void {
     const tab = self.currentTab() orelse return;
+    pasteIntoTab(self, tab);
+}
+
+pub fn canPaste(self: *BrowserView, tab: *BTab) bool {
+    if (!self.clipboard().isEmpty()) return true;
+    const clip = c.gtk_widget_get_clipboard(@ptrCast(@alignCast(tab.colview))) orelse return false;
+    if (file_clipboard_owner.clip == clip and c.gdk_clipboard_get_content(clip) == file_clipboard_owner.provider) return false;
+    const formats = c.gdk_clipboard_get_formats(clip);
+    return c.gdk_content_formats_contain_mime_type(formats, clipboard.GNOME) != 0 or
+        c.gdk_content_formats_contain_mime_type(formats, clipboard.URI) != 0;
+}
+
+pub fn pasteIntoTab(self: *BrowserView, tab: *BTab) void {
+    if (self.widgets_dead) return;
+    if (self.picker) |picker| if (picker.suppress_ops) return;
+    cancelExternalPaste(self, null);
     const board = self.clipboard();
-    if (board.isEmpty()) {
-        self.setStatus("clipboard is empty");
+    if (!board.isEmpty()) {
+        _ = self.beginPaste(tab, board.hostOpt(), board.items(), board.cut, true);
         return;
     }
-    self.beginPaste(tab, board.hostOpt(), board.items(), board.cut, true);
+    if (!canPaste(self, tab)) {
+        self.setStatus("clipboard contains no supported files");
+        return;
+    }
+    const clip = c.gtk_widget_get_clipboard(@ptrCast(@alignCast(tab.colview))) orelse return;
+    const formats = c.gdk_clipboard_get_formats(clip);
+    const gnome = c.gdk_content_formats_contain_mime_type(formats, clipboard.GNOME) != 0;
+    if (!gnome and c.gdk_content_formats_contain_mime_type(formats, clipboard.URI) == 0) {
+        self.setStatus("clipboard contains no supported files");
+        return;
+    }
+    const read = self.allocator.create(ExternalPaste) catch {
+        self.setStatus("paste not started: out of memory");
+        return;
+    };
+    read.* = .{
+        .allocator = self.allocator,
+        .view = self,
+        .tab = tab,
+        .generation = tab.navigation_generation,
+        .view_id = tab.root.view_id,
+        .clip = clip,
+        .cancel = c.g_cancellable_new().?,
+        .kind = if (gnome) .gnome else .uri,
+        .kde_hint = !gnome and c.gdk_content_formats_contain_mime_type(formats, clipboard.KDE_CUT) != 0,
+    };
+    _ = c.g_object_ref(clip);
+    self.external_paste = read;
+    read.changed = c.g_signal_connect_data(clip, "changed", @ptrCast(&ExternalPaste.clipChanged), read, null, c.G_CONNECT_DEFAULT);
+    read.timeout = c.g_timeout_add(10_000, &ExternalPaste.timedOut, read);
+    self.setStatus("reading files from clipboard...");
+    read.open();
+}
+
+/// The async callbacks own this allocation. Teardown severs `view` and
+/// cancels IO; only the final callback releases the request's storage.
+pub const ExternalPaste = struct {
+    allocator: std.mem.Allocator,
+    view: ?*BrowserView,
+    tab: *BTab,
+    generation: u64,
+    view_id: u32,
+    clip: *c.GdkClipboard,
+    cancel: *c.GCancellable,
+    stream: ?*c.GInputStream = null,
+    kind: enum { gnome, uri, kde_cut },
+    kde_hint: bool,
+    data: std.ArrayList(u8) = .empty,
+    board: ?clipboard.Board = null,
+    failure: ?[]const u8 = null,
+    changed: c.gulong = 0,
+    timeout: c.guint = 0,
+
+    fn open(self: *ExternalPaste) void {
+        const mime: [*:0]const u8 = switch (self.kind) {
+            .gnome => clipboard.GNOME,
+            .uri => clipboard.URI,
+            .kde_cut => clipboard.KDE_CUT,
+        };
+        var mimes = [_:null]?[*:0]const u8{mime};
+        c.gdk_clipboard_read_async(self.clip, @ptrCast(&mimes), c.G_PRIORITY_DEFAULT, self.cancel, &opened, self);
+    }
+
+    fn clipChanged(_: *c.GdkClipboard, user: ?*anyopaque) callconv(.c) void {
+        const self = cast.userData(ExternalPaste, user);
+        self.failure = "clipboard changed; paste canceled";
+        c.g_cancellable_cancel(self.cancel);
+    }
+
+    fn timedOut(user: ?*anyopaque) callconv(.c) c.gboolean {
+        const self = cast.userData(ExternalPaste, user);
+        self.timeout = 0;
+        self.failure = "clipboard did not respond; paste canceled";
+        c.g_cancellable_cancel(self.cancel);
+        return 0;
+    }
+
+    fn opened(source: ?*c.GObject, result: ?*c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
+        const self = cast.userData(ExternalPaste, user);
+        self.stream = c.gdk_clipboard_read_finish(@ptrCast(source), result, null, null);
+        if (self.stream == null or self.view == null or self.failure != null) {
+            self.finish("could not read files from clipboard");
+            return;
+        }
+        self.readMore();
+    }
+
+    fn readMore(self: *ExternalPaste) void {
+        c.g_input_stream_read_bytes_async(self.stream.?, 16 * 1024, c.G_PRIORITY_DEFAULT, self.cancel, &chunk, self);
+    }
+
+    fn chunk(source: ?*c.GObject, result: ?*c.GAsyncResult, user: ?*anyopaque) callconv(.c) void {
+        const self = cast.userData(ExternalPaste, user);
+        const bytes = c.g_input_stream_read_bytes_finish(@ptrCast(source), result, null);
+        defer if (bytes) |b| c.g_bytes_unref(b);
+        if (bytes == null or self.view == null or self.failure != null) {
+            self.finish("could not read files from clipboard");
+            return;
+        }
+        var size: c.gsize = 0;
+        const raw = c.g_bytes_get_data(bytes, &size);
+        if (size > 0) {
+            const limit: usize = if (self.kind == .kde_cut) 16 else clipboard.MAX_EXTERNAL_BYTES;
+            if (size > limit - self.data.items.len) {
+                self.finish("file clipboard is too large; paste canceled");
+                return;
+            }
+            const data: [*]const u8 = @ptrCast(raw.?);
+            self.data.appendSlice(self.allocator, data[0..size]) catch {
+                self.finish("paste canceled: out of memory");
+                return;
+            };
+            self.readMore();
+            return;
+        }
+        if (self.kind == .kde_cut) {
+            const hint = std.mem.trim(u8, self.data.items, "\r\n");
+            if (!std.mem.eql(u8, hint, "0") and !std.mem.eql(u8, hint, "1")) {
+                self.finish("invalid clipboard cut flag; paste canceled");
+                return;
+            }
+            self.board.?.cut = std.mem.eql(u8, hint, "1");
+        } else {
+            self.board = clipboard.parseExternal(self.allocator, self.data.items, self.kind == .gnome) catch |err| {
+                self.finish(switch (err) {
+                    error.OutOfMemory => "paste canceled: out of memory",
+                    error.PayloadTooLarge, error.TooManyFiles => "file clipboard is too large; paste canceled",
+                    else => "clipboard must contain valid local file URIs; paste canceled",
+                });
+                return;
+            };
+            if (self.kde_hint) {
+                self.kind = .kde_cut;
+                self.data.clearRetainingCapacity();
+                c.g_object_unref(self.stream.?);
+                self.stream = null;
+                self.open();
+                return;
+            }
+        }
+        self.finish(null);
+    }
+
+    fn finish(self: *ExternalPaste, failure: ?[]const u8) void {
+        if (self.changed != 0) c.g_signal_handler_disconnect(self.clip, self.changed);
+        if (self.timeout != 0) _ = c.g_source_remove(self.timeout);
+        defer {
+            if (self.stream) |stream| c.g_object_unref(stream);
+            c.g_object_unref(self.clip);
+            c.g_object_unref(self.cancel);
+            self.data.deinit(self.allocator);
+            if (self.board) |*board| board.deinit();
+            self.allocator.destroy(self);
+        }
+        const view = self.view orelse return;
+        view.external_paste = null;
+        if (view.widgets_dead) return;
+        if (self.failure orelse failure) |message| {
+            view.setStatus(message);
+            return;
+        }
+        if (!view.tabAlive(self.tab) or self.tab.navigation_generation != self.generation or self.tab.root.view_id != self.view_id) {
+            view.setStatus("destination changed; paste canceled");
+            return;
+        }
+        const board = &self.board.?;
+        // file: URIs always name this machine, even in a remote tab.
+        if (view.beginPaste(self.tab, null, board.items(), board.cut, false) and board.cut)
+            _ = c.gdk_clipboard_set_content(self.clip, null);
+    }
+};
+
+pub fn cancelExternalPaste(self: *BrowserView, tab: ?*BTab) void {
+    const read = self.external_paste orelse return;
+    if (tab != null and read.tab != tab.?) return;
+    self.external_paste = null;
+    read.view = null;
+    c.g_cancellable_cancel(read.cancel);
 }
 
 /// Is `tab` still one of this view's tabs? Anything that parks work
@@ -301,6 +508,7 @@ pub fn tabAlive(self: *BrowserView, tab: *BTab) bool {
 }
 
 pub fn cancelDropStateForTab(self: *BrowserView, tab: *BTab) void {
+    cancelExternalPaste(self, tab);
     var i: usize = 0;
     while (i < self.drop_probes.items.len) {
         const probe = self.drop_probes.items[i];
@@ -383,6 +591,8 @@ fn rememberFailureStatus(self: *BrowserView, saved: *[256]u8, saved_len: *usize)
 /// parked in conflict.zig's queue and decided while the rest of the
 /// batch is already copying. The clipboard is only consulted by the
 /// caller, so a dual-pane send uses the same path as Paste Here.
+/// True means every actionable item was admitted or journaled. A partial
+/// admission keeps the original cut clipboard available for retry.
 pub fn beginPaste(
     self: *BrowserView,
     tab: *BTab,
@@ -390,29 +600,29 @@ pub fn beginPaste(
     srcs: []const []u8,
     cut: bool,
     clear_clipboard: bool,
-) void {
+) bool {
     const src_hc = self.hostConnFor(src_host) orelse {
         self.setStatus("paste not started: cannot allocate a host connection");
-        return;
+        return false;
     };
     if (tab.hc.state == .ready and !tab.hc.conn.copy_no_replace) {
         self.setStatusFmt("paste not queued: {s} lacks safe no-replace support", .{tab.hc.label()});
-        return;
+        return false;
     }
     const run = self.allocator.create(PasteRun) catch {
         self.setStatus("paste not started: out of memory");
-        return;
+        return false;
     };
     const dst_dir = self.allocator.dupe(u8, tab.root.path) catch {
         self.allocator.destroy(run);
         self.setStatus("paste not started: out of memory");
-        return;
+        return false;
     };
     const src_host_owned = if (src_host) |host| self.allocator.dupe(u8, host) catch {
         self.allocator.free(dst_dir);
         self.allocator.destroy(run);
         self.setStatus("paste not started: out of memory");
-        return;
+        return false;
     } else null;
     run.* = .{
         .tab = tab,
@@ -435,15 +645,22 @@ pub fn beginPaste(
         var dst_buf: [4096]u8 = undefined;
         const dst = std.fmt.bufPrint(&dst_buf, "{s}/{s}", .{
             if (dst_dir.len == 1) "" else dst_dir, base,
-        }) catch continue;
+        }) catch {
+            rejectPasteItem(self, run, "paste not queued: destination path is too long");
+            continue;
+        };
         // Pasting an entry into its own folder: a move is a no-op, a
         // copy lands beside the original under a free name ("x (copy)"),
         // the way every file manager answers Ctrl+C, Ctrl+V in place.
         // It used to be a silent "nothing to paste here" for both.
         if (hostEq(src_host, tab.hc.host) and std.mem.eql(u8, src, dst)) {
             if (!cut) {
-                duplicateEntry(self, tab, src);
-                duplicated += 1;
+                if (duplicateEntry(self, tab, src)) {
+                    duplicated += 1;
+                } else {
+                    run.rejected += 1;
+                    rememberFailureStatus(self, &run.failure, &run.failure_len);
+                }
             }
             continue;
         }
@@ -453,11 +670,17 @@ pub fn beginPaste(
         if (hostEq(src_host, tab.hc.host) and dirWithin(dst_dir, src)) {
             refused_self += 1;
             self.setStatusFmt("paste refused: {s} cannot go inside itself", .{base});
+            run.rejected += 1;
+            rememberFailureStatus(self, &run.failure, &run.failure_len);
             continue;
         }
-        const src_owned = self.allocator.dupe(u8, src) catch continue;
+        const src_owned = self.allocator.dupe(u8, src) catch {
+            rejectPasteItem(self, run, "paste not queued: out of memory");
+            continue;
+        };
         const dst_owned = self.allocator.dupe(u8, dst) catch {
             self.allocator.free(src_owned);
+            rejectPasteItem(self, run, "paste not queued: out of memory");
             continue;
         };
         run.items.append(self.allocator, .{
@@ -467,19 +690,22 @@ pub fn beginPaste(
         }) catch {
             self.allocator.free(src_owned);
             self.allocator.free(dst_owned);
+            rejectPasteItem(self, run, "paste not queued: out of memory");
         };
     }
     if (run.items.items.len == 0) {
-        run.destroy(self.allocator);
+        defer run.destroy(self.allocator);
         // The refusal has to survive: "nothing to paste here" reads as
         // an empty clipboard, which is the one thing it is not.
-        if (refused_self > 0)
+        if (run.rejected > 0)
+            finishPasteRun(self, run)
+        else if (refused_self > 0)
             self.setStatus("paste refused: a folder cannot go inside itself")
         else if (duplicated > 0)
             self.setStatusFmt("duplicating {d} item(s) in place", .{duplicated})
         else
             self.setStatus("nothing to paste here");
-        return;
+        return duplicated > 0 and run.rejected == 0;
     }
     run.total = run.items.items.len;
     if (run.total > 1) run.batch_id = newBatchId();
@@ -505,25 +731,26 @@ pub fn beginPaste(
             admitPasteItem(self, run, run.items.items[run.next]);
             run.next += 1;
         }
-        if (cut and clear_clipboard) self.clipboard().clear();
+        const complete = run.rejected == 0 and (run.admitted > 0 or run.conflicts > 0 or duplicated > 0);
+        if (cut and clear_clipboard and complete) self.clipboard().clear();
         finishPasteRun(self, run);
         run.destroy(self.allocator);
         self.renderJobs();
-        return;
+        return complete;
     }
 
     const service = self.transfer_service orelse {
         conflict.cancelBatch(self, run.batch_id);
         run.destroy(self.allocator);
         self.setStatus("paste not started because durable recovery is unavailable");
-        return;
+        return false;
     };
     if (run.batch_id == 0) run.batch_id = newBatchId();
     const specs = self.allocator.alloc(@import("../file_transfers.zig").BatchSpec, run.items.items.len) catch {
         conflict.cancelBatch(self, run.batch_id);
         run.destroy(self.allocator);
         self.setStatus("paste not started: out of memory");
-        return;
+        return false;
     };
     defer self.allocator.free(specs);
     for (run.items.items, 0..) |item, i| specs[i] = .{
@@ -543,26 +770,34 @@ pub fn beginPaste(
         conflict.cancelBatch(self, run.batch_id);
         run.destroy(self.allocator);
         self.setStatus("paste not started because its batch recovery record could not be saved");
-        return;
+        return false;
     };
+    const complete = run.rejected == 0;
+    if (cut and clear_clipboard and complete) self.clipboard().clear();
     run.manifest_token = self.allocator.dupe(u8, manifest) catch {
         service.redispatchUserBatch(manifest);
         run.destroy(self.allocator);
         self.setStatus("paste recovery was saved but could not be attached to this pane");
-        return;
+        return complete;
     };
     for (run.items.items, 0..) |*item, i| item.manifest_index = i;
-    if (cut and clear_clipboard) self.clipboard().clear();
     self.paste_runs.append(self.allocator, run) catch {
         service.redispatchUserBatch(manifest);
         run.destroy(self.allocator);
-        self.setStatus("paste not started: out of memory");
-        return;
+        self.setStatus("paste recovery was saved but could not be attached to this pane");
+        return complete;
     };
     self.setStatusFmt("queuing 0 of {d} transfer(s)", .{run.total});
     self.renderJobs();
     if (self.paste_idle == 0)
         self.paste_idle = c.g_idle_add(@ptrCast(&onPasteIdle), @ptrCast(self));
+    return complete;
+}
+
+fn rejectPasteItem(self: *BrowserView, run: *PasteRun, message: []const u8) void {
+    run.rejected += 1;
+    self.setStatus(message);
+    rememberFailureStatus(self, &run.failure, &run.failure_len);
 }
 
 fn queuePasteConflict(self: *BrowserView, run: *PasteRun, item: PasteItem, is_dir: bool) void {
@@ -606,6 +841,12 @@ fn admitPasteItem(self: *BrowserView, run: *PasteRun, item: PasteItem) void {
 }
 
 fn finishPasteRun(self: *BrowserView, run: *PasteRun) void {
+    if (run.rejected > 0 and (run.admitted > 0 or run.conflicts > 0)) {
+        self.setStatusFmt("{d} queued; {d} conflicts; {d} not queued: {s}", .{
+            run.admitted, run.conflicts, run.rejected, run.failure[0..run.failure_len],
+        });
+        return;
+    }
     switch (pasteBatchAction(run.admitted, run.conflicts, run.rejected, run.failure_len > 0)) {
         .preserve_failure => self.setStatus(run.failure[0..run.failure_len]),
         .rejected => self.setStatusFmt("{d} item(s) could not be queued", .{run.rejected}),
@@ -927,22 +1168,26 @@ fn pasteOneAdmittedOn(
 
 /// Copy an entry beside itself under a free name ("x.txt" -> "x (copy).txt").
 /// Undoable like any other copy: the created path is what undo drops.
-pub fn duplicateEntry(self: *BrowserView, tab: *BTab, path: []const u8) void {
+pub fn duplicateEntry(self: *BrowserView, tab: *BTab, path: []const u8) bool {
     const base = std.fs.path.basename(path);
     var name_buf: [512]u8 = undefined;
     const unique = uniqueDstName(tab, base, &name_buf) orelse {
         self.setStatusFmt("no free name beside {s}", .{base});
-        return;
+        return false;
     };
     const dir = std.fs.path.dirname(path) orelse "/";
     var dst_buf: [4096]u8 = undefined;
     const dst = std.fmt.bufPrint(&dst_buf, "{s}/{s}", .{
         if (dir.len == 1) "" else dir, unique,
-    }) catch return;
+    }) catch {
+        self.setStatus("duplicate not queued: destination path is too long");
+        return false;
+    };
     var lbl: [128]u8 = undefined;
     const label = std.fmt.bufPrint(&lbl, "duplicate {s}", .{base}) catch "duplicate";
-    _ = self.startDaemonJobUndo(tab.hc, "copy", path, dst, label, self.makeUndo(tab.hc.host, .delete_created, dst, path, ""), .{ .no_replace = true });
+    if (!self.startDaemonJobUndo(tab.hc, "copy", path, dst, label, self.makeUndo(tab.hc.host, .delete_created, dst, path, ""), .{ .no_replace = true })) return false;
     self.setStatusFmt("duplicating {s} -> {s}", .{ base, unique });
+    return true;
 }
 
 /// Create a link to `target` in `tab`'s directory. Both kinds go
@@ -2659,7 +2904,7 @@ pub fn sendToPeer(self: *BrowserView, move: bool, clicked: ?[]const u8) void {
         self.setStatus("both panes show the same directory");
         return;
     }
-    peer.beginPaste(peer_tab, tab.hc.host, roots, move, false);
+    _ = peer.beginPaste(peer_tab, tab.hc.host, roots, move, false);
     var buf: [4300]u8 = undefined;
     self.setStatusFmt("{s} {d} item(s) to {s}", .{
         if (move) "moving" else "copying",
@@ -2692,16 +2937,18 @@ test "file clipboard ownership follows local and remote GDK providers" {
         _ = c.gdk_clipboard_set_content(clip, null);
     }
     for ([_]?[]const u8{ null, "remote" }) |host| {
-        board.set(host, &.{"/first"}, true, 1);
+        try t.expect(board.set(host, &.{"/first"}, true, 1));
         try t.expect(exportClipToGdk(board, clip));
         const formats = c.gdk_clipboard_get_formats(clip);
         try t.expectEqual(host == null, c.gdk_content_formats_contain_mime_type(formats, "x-special/gnome-copied-files") != 0);
+        try t.expectEqual(host == null, c.gdk_content_formats_contain_mime_type(formats, clipboard.URI) != 0);
+        try t.expectEqual(host == null, c.gdk_content_formats_contain_mime_type(formats, clipboard.KDE_CUT) != 0);
         c.g_signal_emit_by_name(clip, "changed");
         try t.expect(board.cut);
         try t.expectEqualStrings("/first", board.first().?);
 
         // A new Files export synchronously replaces the previous provider.
-        board.set(host, &.{"/second"}, true, 1);
+        try t.expect(board.set(host, &.{"/second"}, true, 1));
         try t.expect(exportClipToGdk(board, clip));
         try t.expect(board.cut);
         try t.expectEqualStrings("/second", board.first().?);
@@ -2712,16 +2959,16 @@ test "file clipboard ownership follows local and remote GDK providers" {
         try t.expect(!board.cut);
         try t.expect(file_clipboard_owner.clip == null);
 
-        board.set(host, &.{"/third"}, true, 1);
+        try t.expect(board.set(host, &.{"/third"}, true, 1));
         try t.expect(exportClipToGdk(board, clip));
         // External ownership has no local content provider.
         try t.expect(c.gdk_clipboard_set_content(clip, null) != 0);
         try t.expect(board.isEmpty());
         try t.expect(!board.cut);
 
-        board.set(host, &.{"/fourth"}, true, 1);
+        try t.expect(board.set(host, &.{"/fourth"}, true, 1));
         try t.expect(exportClipToGdk(board, clip));
-        board.set(host, &.{"/failed-export"}, true, 1);
+        try t.expect(board.set(host, &.{"/failed-export"}, true, 1));
         failing.fail_index = failing.alloc_index;
         try t.expect(!exportClipToGdk(board, clip));
         failing.fail_index = std.math.maxInt(usize);
@@ -2729,13 +2976,437 @@ test "file clipboard ownership follows local and remote GDK providers" {
         try t.expect(!board.cut);
         try t.expect(file_clipboard_owner.clip == null);
     }
-    board.set(null, &.{"relative-path-cannot-be-a-file-uri"}, true, 1);
+    try t.expect(board.set(null, &.{"relative-path-cannot-be-a-file-uri"}, true, 1));
     try t.expect(!exportClipToGdk(board, clip));
     try t.expect(board.isEmpty());
 
-    board.set("remote", &.{"/last"}, true, 1);
+    try t.expect(board.set("remote", &.{"/last"}, true, 1));
     try t.expect(exportClipToGdk(board, clip));
     clipboard.resetShared();
     c.gdk_clipboard_set_text(clip, "ownership changed after board teardown");
     try t.expect(file_clipboard_owner.clip == null);
+}
+
+// Test-only fixture: no socket is initialized, and both host connections
+// are prelisted so importing local URIs cannot autostart a real daemon.
+const ExternalPasteTest = struct {
+    view: BrowserView = .{ .allocator = std.testing.allocator },
+    root: Dir = .{ .allocator = std.testing.allocator, .path = @constCast("/destination"), .view_id = 1 },
+    local: HostConn = undefined,
+    remote: HostConn = undefined,
+    tab: BTab = undefined,
+    column: ?*c.GtkWidget = null,
+    status: ?*c.GtkWidget = null,
+    clip: ?*c.GdkClipboard = null,
+    window: ?*c.GtkWidget = null,
+
+    fn init(self: *ExternalPasteTest) !void {
+        if (c.getenv("SKETERM_TEST_FILE_CLIPBOARD") == null) return error.SkipZigTest;
+        try std.testing.expect(c.gtk_init_check() != 0);
+        self.* = .{};
+        errdefer self.deinit();
+        self.column = c.gtk_column_view_new(null).?;
+        _ = c.g_object_ref_sink(self.column);
+        self.status = c.gtk_label_new(null).?;
+        _ = c.g_object_ref_sink(self.status);
+        self.view.status_label = @ptrCast(self.status.?);
+        self.clip = c.gtk_widget_get_clipboard(self.column).?;
+        self.local = .{ .view = &self.view, .host = null };
+        self.remote = .{ .view = &self.view, .host = @constCast("test-remote") };
+        self.tab = .{
+            .view = &self.view,
+            .hc = &self.remote,
+            .root = &self.root,
+            .page = self.column.?,
+            .listing_box = self.column.?,
+            .colview = @ptrCast(self.column.?),
+            .tab_label = self.view.status_label,
+        };
+        try self.view.conns.appendSlice(self.view.allocator, &.{ &self.local, &self.remote });
+        try self.view.tabs.append(self.view.allocator, &self.tab);
+    }
+
+    fn enableConflicts(self: *ExternalPasteTest) !void {
+        self.tab.hc = &self.local;
+        try std.testing.expect(self.local.state == .connecting);
+        self.window = c.gtk_window_new().?;
+        _ = c.g_object_ref(self.window);
+        const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0).?;
+        self.view.root_box = box;
+        self.view.jobs_box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0).?;
+        self.tab.page = box;
+        c.gtk_box_append(@ptrCast(box), self.column);
+        c.gtk_box_append(@ptrCast(box), self.status);
+        c.gtk_box_append(@ptrCast(box), self.view.jobs_box);
+        c.gtk_window_set_child(@ptrCast(self.window), box);
+        c.gtk_window_set_default_size(@ptrCast(self.window), 800, 600);
+        c.gtk_window_present(@ptrCast(self.window));
+        const clock = @import("../../util/clock.zig");
+        const deadline = clock.nowMs() + 5000;
+        while (c.gtk_widget_get_mapped(self.window) == 0 and clock.nowMs() < deadline) {
+            _ = c.g_main_context_iteration(null, 0);
+            c.g_usleep(1000);
+        }
+        try std.testing.expect(c.gtk_widget_get_mapped(self.window) != 0);
+        var entry = try @import("types.zig").testEntry(self.view.allocator, "one", null);
+        errdefer entry.deinit(self.view.allocator);
+        try self.root.entries.append(self.view.allocator, entry);
+    }
+
+    fn deinit(self: *ExternalPasteTest) void {
+        if (self.view.external_paste) |read| {
+            var done = false;
+            c.g_object_weak_ref(@ptrCast(read.cancel), &retired, &done);
+            cancelExternalPaste(&self.view, null);
+            waitRetired(&done) catch @panic("clipboard callback did not retire");
+        }
+        file_clipboard_owner.release();
+        clipboard.resetShared();
+        if (self.clip) |clip| _ = c.gdk_clipboard_set_content(clip, null);
+        conflict.cancelTab(&self.view, &self.tab);
+        self.view.conflicts.deinit(self.view.allocator);
+        self.view.jobs_panel.cancelTick();
+        if (self.window) |window| {
+            c.gtk_window_destroy(@ptrCast(window));
+            c.g_object_unref(window);
+        }
+        self.view.jobs_panel.deinit(self.view.allocator);
+        for (self.root.entries.items) |*entry| entry.deinit(self.view.allocator);
+        self.root.entries.deinit(self.view.allocator);
+        if (self.column) |widget| c.g_object_unref(widget);
+        if (self.status) |widget| c.g_object_unref(widget);
+        self.view.tabs.deinit(self.view.allocator);
+        self.view.conns.deinit(self.view.allocator);
+    }
+
+    const Payload = struct { mime: [*:0]const u8, data: []const u8 };
+
+    fn offer(self: *ExternalPasteTest, payloads: []const Payload) !void {
+        var providers: [3]?*c.GdkContentProvider = undefined;
+        try std.testing.expect(payloads.len > 0 and payloads.len <= providers.len);
+        for (payloads, 0..) |payload, i| {
+            const bytes = c.g_bytes_new(payload.data.ptr, payload.data.len).?;
+            defer c.g_bytes_unref(bytes);
+            providers[i] = c.gdk_content_provider_new_for_bytes(payload.mime, bytes).?;
+        }
+        const provider = c.gdk_content_provider_new_union(&providers, payloads.len).?;
+        defer c.g_object_unref(provider); // union owns its children
+        try std.testing.expect(c.gdk_clipboard_set_content(self.clip.?, provider) != 0);
+    }
+
+    fn retired(user: ?*anyopaque, _: [*c]c.GObject) callconv(.c) void {
+        cast.userData(bool, user).* = true;
+    }
+
+    fn waitRetired(done: *bool) !void {
+        const clock = @import("../../util/clock.zig");
+        const deadline = clock.nowMs() + 5000;
+        while (!done.* and clock.nowMs() < deadline) {
+            _ = c.g_main_context_iteration(null, 0);
+            c.g_usleep(1000);
+        }
+        try std.testing.expect(done.*);
+    }
+
+    fn paste(self: *ExternalPasteTest) !void {
+        try self.pasteWithConflicts();
+        try self.noJobs();
+    }
+
+    fn pasteWithConflicts(self: *ExternalPasteTest) !void {
+        pasteIntoTab(&self.view, &self.tab);
+        const read = self.view.external_paste orelse return error.TestUnexpectedResult;
+        var done = false;
+        const cancel = read.cancel;
+        c.g_object_weak_ref(@ptrCast(cancel), &retired, &done);
+        defer if (!done) c.g_object_weak_unref(@ptrCast(cancel), &retired, &done);
+        try waitRetired(&done);
+        try std.testing.expect(self.view.external_paste == null);
+    }
+
+    fn expectStatus(self: *ExternalPasteTest, expected: []const u8) !void {
+        try std.testing.expectEqualStrings(expected, std.mem.span(c.gtk_label_get_text(self.view.status_label)));
+    }
+
+    fn noJobs(self: *ExternalPasteTest) !void {
+        try self.noTransfers();
+        try std.testing.expectEqual(@as(usize, 0), self.view.conflicts.queue.items.len);
+    }
+
+    fn noTransfers(self: *ExternalPasteTest) !void {
+        const t = std.testing;
+        try t.expectEqual(@as(u32, 1), self.view.next_req);
+        try t.expectEqual(@as(usize, 2), self.view.conns.items.len);
+        try t.expect(self.view.transfer_service == null);
+        try t.expectEqual(@as(usize, 0), self.view.pending.items.len);
+        try t.expectEqual(@as(usize, 0), self.view.pending_jobs.items.len);
+        try t.expectEqual(@as(usize, 0), self.view.jobs.items.len);
+        try t.expectEqual(@as(usize, 0), self.view.transfers.items.len);
+        try t.expectEqual(@as(usize, 0), self.view.deferred_transfers.items.len);
+        try t.expectEqual(@as(usize, 0), self.view.paste_runs.items.len);
+        try t.expectEqual(@as(c.guint, 0), self.view.paste_idle);
+    }
+
+    fn expectOneConflict(self: *ExternalPasteTest, cut: bool) !void {
+        const t = std.testing;
+        try self.noTransfers();
+        try t.expectEqual(@as(usize, 1), self.view.conflicts.queue.items.len);
+        const item = self.view.conflicts.queue.items[0];
+        try t.expectEqualStrings("/source/one", item.src);
+        try t.expectEqualStrings("/destination/one", item.dst);
+        try t.expectEqual(cut, item.cut);
+        try t.expect(item.src_hc == &self.local and item.dst_hc == &self.local);
+        try t.expect(item.manifest_token == null);
+        try t.expect(self.view.conflicts.popover != null);
+        try t.expect(c.gtk_widget_get_root(self.view.conflicts.popover.?) != null);
+        try t.expect(c.gtk_widget_get_root(self.view.jobs_box) != null);
+    }
+};
+
+test "external paste reads real GNOME and URI providers and refuses malformed payloads" {
+    const t = std.testing;
+    var f: ExternalPasteTest = .{};
+    try f.init();
+    defer f.deinit();
+    const refusal = "paste not started because durable recovery is unavailable";
+    for ([_]struct { mime: [*:0]const u8, data: []const u8, status: []const u8 }{
+        .{ .mime = clipboard.GNOME, .data = "copy\nfile:///source/one%20file", .status = refusal },
+        .{ .mime = clipboard.GNOME, .data = "cut\nfile:///source/one", .status = refusal },
+        .{ .mime = clipboard.URI, .data = "# comment\r\nfile:///source/one\r\n", .status = refusal },
+        .{ .mime = clipboard.GNOME, .data = "move\nfile:///source/one", .status = "clipboard must contain valid local file URIs; paste canceled" },
+        .{ .mime = clipboard.URI, .data = "file:///source/one\nhttps://example.invalid/two", .status = "clipboard must contain valid local file URIs; paste canceled" },
+    }) |case| {
+        try f.offer(&.{.{ .mime = case.mime, .data = case.data }});
+        try t.expect(canPaste(&f.view, &f.tab));
+        const provider = c.gdk_clipboard_get_content(f.clip.?);
+        try f.paste();
+        try f.expectStatus(case.status);
+        // A refused external cut is neither consumed nor imported globally.
+        try t.expect(c.gdk_clipboard_get_content(f.clip.?) == provider);
+        try t.expect(f.view.clipboard().isEmpty());
+    }
+    // Prefer GNOME when both formats are offered, not the malformed URI list.
+    try f.offer(&.{
+        .{ .mime = clipboard.URI, .data = "not a URI" },
+        .{ .mime = clipboard.GNOME, .data = "copy\nfile:///source/one" },
+    });
+    try f.paste();
+    try f.expectStatus(refusal);
+    c.gdk_clipboard_set_text(f.clip.?, "/source/one");
+    try t.expect(!canPaste(&f.view, &f.tab));
+    pasteIntoTab(&f.view, &f.tab);
+    try t.expect(f.view.external_paste == null);
+    try f.expectStatus("clipboard contains no supported files");
+}
+
+test "external paste reads KDE cut metadata rather than guessing from its presence" {
+    var f: ExternalPasteTest = .{};
+    try f.init();
+    defer f.deinit();
+    f.tab.hc = &f.local;
+    f.root.path = @constCast("/source");
+    // Same-folder moves are no-ops. Copies reach duplicateEntry, whose
+    // startDaemonJobUndo refuses our disconnected host before minting a req.
+    // These different outcomes expose the parsed cut flag without a seam.
+    for ([_]struct { hint: []const u8, status: []const u8 }{
+        .{ .hint = "0", .status = "not connected to local" },
+        .{ .hint = "1", .status = "nothing to paste here" },
+        .{ .hint = "1\r\n", .status = "nothing to paste here" },
+        .{ .hint = "2", .status = "invalid clipboard cut flag; paste canceled" },
+        .{ .hint = "", .status = "invalid clipboard cut flag; paste canceled" },
+        .{ .hint = "12345678901234567", .status = "file clipboard is too large; paste canceled" },
+    }) |case| {
+        try f.offer(&.{
+            .{ .mime = clipboard.URI, .data = "file:///source/one" },
+            .{ .mime = clipboard.KDE_CUT, .data = case.hint },
+        });
+        try f.paste();
+        try f.expectStatus(case.status);
+    }
+    // GNOME owns the verb when present; KDE metadata is only a URI-list hint.
+    try f.offer(&.{
+        .{ .mime = clipboard.GNOME, .data = "cut\nfile:///source/one" },
+        .{ .mime = clipboard.KDE_CUT, .data = "invalid" },
+    });
+    try f.paste();
+    try f.expectStatus("nothing to paste here");
+}
+
+test "external paste pending reads respect ownership navigation and teardown fences" {
+    const t = std.testing;
+    const Change = enum { owner, timeout, generation, view_id, removed_tab, cancel, tab_teardown, view_fence, widgets_dead };
+    for (std.enums.values(Change)) |change| {
+        var f: ExternalPasteTest = .{};
+        try f.init();
+        defer f.deinit();
+        try f.offer(&.{.{ .mime = clipboard.URI, .data = "file:///source/one" }});
+        const tab = try t.allocator.create(BTab);
+        tab.* = f.tab;
+        var tab_live = true;
+        defer if (tab_live) t.allocator.destroy(tab);
+        f.view.tabs.items[0] = tab;
+        pasteIntoTab(&f.view, tab);
+        const read = f.view.external_paste orelse return error.TestUnexpectedResult;
+        var done = false;
+        const cancel = read.cancel;
+        c.g_object_weak_ref(@ptrCast(cancel), &ExternalPasteTest.retired, &done);
+        defer if (!done) c.g_object_weak_unref(@ptrCast(cancel), &ExternalPasteTest.retired, &done);
+        switch (change) {
+            .owner => c.gdk_clipboard_set_text(f.clip.?, "replacement clipboard"),
+            .timeout => {
+                _ = c.g_source_remove(read.timeout);
+                _ = ExternalPaste.timedOut(read);
+            },
+            .generation => tab.navigation_generation += 1,
+            .view_id => f.root.view_id += 1,
+            .removed_tab => {
+                f.view.tabs.clearRetainingCapacity();
+                t.allocator.destroy(tab);
+                tab_live = false;
+            },
+            .cancel, .view_fence => {
+                // Cancellation for a different tab must leave this request alone.
+                cancelExternalPaste(&f.view, &f.tab);
+                try t.expect(f.view.external_paste == read);
+                if (change == .view_fence) f.view.widgets_dead = true;
+                cancelExternalPaste(&f.view, null);
+                try t.expect(read.view == null);
+            },
+            .tab_teardown => {
+                cancelDropStateForTab(&f.view, tab);
+                try t.expect(read.view == null);
+                f.view.tabs.clearRetainingCapacity();
+                t.allocator.destroy(tab);
+                tab_live = false;
+            },
+            .widgets_dead => f.view.widgets_dead = true,
+        }
+        // Direct GTK write also works after the simulated widget fence.
+        c.gtk_label_set_text(f.view.status_label, "sentinel");
+        try ExternalPasteTest.waitRetired(&done);
+        try t.expect(f.view.external_paste == null);
+        try f.noJobs();
+        try f.expectStatus(switch (change) {
+            .owner => "clipboard changed; paste canceled",
+            .timeout => "clipboard did not respond; paste canceled",
+            .generation, .view_id, .removed_tab => "destination changed; paste canceled",
+            else => "sentinel",
+        });
+    }
+}
+
+test "external paste does not reimport a consumed internal cut export" {
+    const t = std.testing;
+    var f: ExternalPasteTest = .{};
+    try f.init();
+    defer f.deinit();
+    const board = f.view.clipboard();
+    try t.expect(board.set(null, &.{"/source/one"}, true, 0));
+    try t.expect(exportClipToGdk(board, f.clip.?));
+    const provider = c.gdk_clipboard_get_content(f.clip.?);
+    try t.expect(canPaste(&f.view, &f.tab));
+    board.clear(); // successful internal cut consumption leaves the MIME export
+    try t.expect(!canPaste(&f.view, &f.tab));
+    pasteIntoTab(&f.view, &f.tab);
+    try t.expect(f.view.external_paste == null);
+    try t.expect(c.gdk_clipboard_get_content(f.clip.?) == provider);
+    try f.expectStatus("clipboard contains no supported files");
+    try f.noJobs();
+    // A genuinely new provider offering the same file is not suppressed.
+    try f.offer(&.{.{ .mime = clipboard.GNOME, .data = "copy\nfile:///source/one" }});
+    try t.expect(canPaste(&f.view, &f.tab));
+    try f.paste();
+    try f.expectStatus("paste not started because durable recovery is unavailable");
+}
+
+test "paste complete admission retains the whole internal cut on partial admission" {
+    const t = std.testing;
+    for ([_]bool{ true, false }) |partial| {
+        var f: ExternalPasteTest = .{};
+        try f.init();
+        defer f.deinit();
+        try f.enableConflicts();
+        const board = f.view.clipboard();
+        const sources: []const []const u8 = if (partial) &.{ "/source/one", "/source/two" } else &.{"/source/one"};
+        try t.expect(board.set(null, sources, true, 0));
+        try t.expect(exportClipToGdk(board, f.clip.?));
+        const provider = c.gdk_clipboard_get_content(f.clip.?);
+        const original_items = board.items().ptr;
+        try t.expectEqual(!partial, beginPaste(&f.view, &f.tab, board.hostOpt(), board.items(), board.cut, true));
+        try f.expectOneConflict(true);
+        try t.expect(c.gdk_clipboard_get_content(f.clip.?) == provider);
+        if (partial) {
+            try t.expect(board.cut);
+            try t.expectEqual(@as(usize, 2), board.items().len);
+            try t.expect(board.items().ptr == original_items);
+            try t.expectEqualStrings("/source/one", board.items()[0]);
+            try t.expectEqualStrings("/source/two", board.items()[1]);
+            try t.expect(canPaste(&f.view, &f.tab));
+            try f.expectStatus("0 queued; 1 conflicts; 1 not queued: not connected to local");
+        } else {
+            try t.expect(board.isEmpty());
+            try t.expect(!canPaste(&f.view, &f.tab));
+            try f.expectStatus("0 item(s) queued; 1 name conflict(s) waiting for a decision");
+        }
+    }
+}
+
+test "paste complete admission retains external GNOME cut unless every item is admitted" {
+    const t = std.testing;
+    for ([_]bool{ true, false }) |partial| {
+        var f: ExternalPasteTest = .{};
+        try f.init();
+        defer f.deinit();
+        try f.enableConflicts();
+        try f.offer(&.{.{
+            .mime = clipboard.GNOME,
+            .data = if (partial) "cut\nfile:///source/one\nfile:///source/two" else "cut\nfile:///source/one",
+        }});
+        const provider = c.gdk_clipboard_get_content(f.clip.?).?;
+        _ = c.g_object_ref(provider);
+        defer c.g_object_unref(provider);
+        try f.pasteWithConflicts();
+        try f.expectOneConflict(true);
+        try t.expect(f.view.clipboard().isEmpty());
+        if (partial) {
+            try t.expect(c.gdk_clipboard_get_content(f.clip.?) == provider);
+            try t.expect(c.gdk_content_formats_contain_mime_type(c.gdk_clipboard_get_formats(f.clip.?), clipboard.GNOME) != 0);
+            try t.expect(canPaste(&f.view, &f.tab));
+            try f.expectStatus("0 queued; 1 conflicts; 1 not queued: not connected to local");
+        } else {
+            try t.expect(c.gdk_clipboard_get_content(f.clip.?) == null);
+            try t.expect(!canPaste(&f.view, &f.tab));
+            try f.expectStatus("0 item(s) queued; 1 name conflict(s) waiting for a decision");
+        }
+    }
+}
+
+test "paste complete admission counts self-copy refusal and overlong destination construction" {
+    const t = std.testing;
+    const long_base = [_]u8{'x'} ** 4090;
+    const long_source = try std.fmt.allocPrint(t.allocator, "/{s}", .{&long_base});
+    defer t.allocator.free(long_source);
+    for ([_]bool{ true, false }) |self_copy| {
+        var f: ExternalPasteTest = .{};
+        try f.init();
+        defer f.deinit();
+        try f.enableConflicts();
+        const board = f.view.clipboard();
+        const refused = if (self_copy) "/destination" else long_source;
+        const cut = !self_copy;
+        try t.expect(board.set(null, &.{ "/source/one", refused }, cut, 0));
+        try t.expect(exportClipToGdk(board, f.clip.?));
+        const provider = c.gdk_clipboard_get_content(f.clip.?);
+        try t.expect(!beginPaste(&f.view, &f.tab, board.hostOpt(), board.items(), board.cut, true));
+        try f.expectOneConflict(cut);
+        try t.expectEqual(cut, board.cut);
+        try t.expectEqual(@as(usize, 2), board.items().len);
+        try t.expectEqualStrings("/source/one", board.items()[0]);
+        try t.expectEqualStrings(refused, board.items()[1]);
+        try t.expect(c.gdk_clipboard_get_content(f.clip.?) == provider);
+        try f.expectStatus(if (self_copy)
+            "0 queued; 1 conflicts; 1 not queued: paste refused: destination cannot go inside itself"
+        else
+            "0 queued; 1 conflicts; 1 not queued: paste not queued: destination path is too long");
+    }
 }

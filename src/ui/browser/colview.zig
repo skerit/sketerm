@@ -1414,6 +1414,21 @@ pub fn renderList(self: *BrowserView, tab: *BTab) void {
     const old_n = itemCount(tab);
     const new_n: c.guint = @intCast(items.items.len);
 
+    // Visual ranges are positional. Keep them through content refreshes,
+    // but commit before a different ordered set of identities takes over.
+    if (tab.sel.anchor != null) {
+        const unchanged = same_order: {
+            if (old_n != new_n) break :same_order false;
+            for (items.items, 0..) |it, i| {
+                const od = itemDataAt(tab, @intCast(i)) orelse break :same_order false;
+                const nd = itemPayload(it) orelse break :same_order false;
+                if (!sameStructuralItem(od, nd)) break :same_order false;
+            }
+            break :same_order true;
+        };
+        if (!unchanged) self.commitVisual(tab);
+    }
+
     // Windowed splice: rows whose identity AND content are unchanged
     // keep their exact GObjects, so GTK never rebinds them — a
     // watch-delta storm on a busy directory repaints only the rows
@@ -1493,26 +1508,150 @@ pub fn syncSelectionFromPaths(tab: *BTab) void {
     setSelection(tab, want);
 }
 
-/// May the row at this store position keep its GObject for this new
-/// item? Identity must match (path, depth, zebra parity when it
-/// shows, header fields) and the row must not be named as changed.
-fn reusableItem(self: *BrowserView, tab: *BTab, od: *ItemData, nd: *ItemData) bool {
+/// Only owned row fields: the old borrowed entry/dir may already be fenced off.
+fn sameStructuralItem(od: *const ItemData, nd: *const ItemData) bool {
     if (od.kind != nd.kind) return false;
+    if (od.kind == .group) return od.group_id == nd.group_id;
+    return od.depth == nd.depth and std.mem.eql(u8, od.path, nd.path);
+}
+
+/// Structural identity plus presentation/content decides GObject reuse.
+fn reusableItem(self: *BrowserView, tab: *BTab, od: *ItemData, nd: *ItemData) bool {
+    if (!sameStructuralItem(od, nd)) return false;
     if (od.kind == .group) {
-        return od.group_id == nd.group_id and od.group_count == nd.group_count and
+        return od.group_count == nd.group_count and
             std.mem.eql(
                 u8,
                 std.mem.sliceTo(&od.group_label, 0),
                 std.mem.sliceTo(&nd.group_label, 0),
             );
     }
-    if (od.depth != nd.depth or od.is_dir != nd.is_dir) return false;
+    if (od.is_dir != nd.is_dir) return false;
     if (self.zebra and od.alt != nd.alt) return false;
-    if (!std.mem.eql(u8, od.path, nd.path)) return false;
     for (tab.changed_paths.items) |chp| {
         if (std.mem.eql(u8, chp, od.path)) return false;
     }
     return true;
+}
+
+test "visual row identity ignores content but distinguishes paths depth and headers" {
+    const t = std.testing;
+    const old = ItemData{ .allocator = t.allocator, .tab = undefined, .kind = .entry, .path = @constCast("/data/B") };
+    var fresh = old;
+    fresh.alt = true;
+    fresh.is_dir = true;
+    try t.expect(sameStructuralItem(&old, &fresh));
+    fresh.path = @constCast("/data/C");
+    try t.expect(!sameStructuralItem(&old, &fresh));
+    fresh = old;
+    fresh.depth = 1;
+    try t.expect(!sameStructuralItem(&old, &fresh));
+    fresh = old;
+    fresh.kind = .group;
+    fresh.group_id = 7;
+    try t.expect(!sameStructuralItem(&old, &fresh));
+    var header = fresh;
+    header.group_count = 42;
+    header.group_label[0] = 0;
+    try t.expect(sameStructuralItem(&header, &fresh));
+    header.group_id = 8;
+    try t.expect(!sameStructuralItem(&header, &fresh));
+}
+
+test "visual render boundary commits structural changes but keeps content refreshes" {
+    const opt_in = c.getenv("SKETERM_TEST_BROWSER_UI") orelse return error.SkipZigTest;
+    if (!std.mem.eql(u8, std.mem.span(opt_in), "1")) return error.SkipZigTest;
+    const t = std.testing;
+    try t.expect(c.gtk_init_check() != 0);
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const types = @import("types.zig");
+    var view = BrowserView{ .allocator = a, .pane = null };
+    view.notebook = @ptrCast(c.gtk_notebook_new().?);
+    _ = c.g_object_ref_sink(view.notebook);
+    defer c.g_object_unref(view.notebook);
+    view.status_label = @ptrCast(c.gtk_label_new(null).?);
+    _ = c.g_object_ref_sink(view.status_label);
+    defer c.g_object_unref(view.status_label);
+    var hc = types.HostConn{ .view = &view, .host = null };
+    var root = Dir{ .allocator = a, .path = @constCast("/data"), .view_id = 1 };
+    const store = c.g_list_store_new(itemType()).?;
+    const model = c.gtk_multi_selection_new(@ptrCast(store)).?; // takes store
+    const cv = c.gtk_column_view_new(@ptrCast(model)).?; // takes model
+    const scroller = c.gtk_scrolled_window_new().?;
+    _ = c.g_object_ref_sink(scroller);
+    defer c.g_object_unref(scroller);
+    c.gtk_scrolled_window_set_child(@ptrCast(scroller), cv);
+    var tab = BTab{
+        .view = &view,
+        .hc = &hc,
+        .root = &root,
+        .page = scroller,
+        .listing_box = scroller,
+        .colview = @ptrCast(cv),
+        .tab_label = view.status_label,
+        .store = store,
+        .selmodel = @ptrCast(model),
+        .scroller = scroller,
+    };
+    try view.tabs.append(a, &tab);
+    const Change = enum { content, count, insert, reorder, delete_before, delete_anchor, empty, group, gone };
+    for (std.enums.values(Change)) |change| {
+        invalidateBackingRefs(&tab);
+        for (root.entries.items) |*e| e.deinit(a);
+        root.entries.clearRetainingCapacity();
+        for ([_][]const u8{ "A", "B", "C" }) |name|
+            try root.entries.append(a, try types.testEntry(a, name, null));
+        tab.vs.grouped = false;
+        for (tab.selected.items) |p| a.free(p);
+        tab.selected.clearRetainingCapacity();
+        renderList(&view, &tab);
+        try tab.selected.append(a, try a.dupe(u8, "/data/B"));
+        try tab.selected.append(a, try a.dupe(u8, "/data/C"));
+        try tab.sel.saved.append(a, try a.dupe(u8, "/data/A"));
+        tab.sel.anchor = 1;
+        syncSelectionFromPaths(&tab);
+
+        if (change != .count) invalidateBackingRefs(&tab);
+        switch (change) {
+            .content => {
+                root.entries.items[1].size += 1;
+                tab.changed_all = true; // even a full content resplice is not a reorder
+            },
+            .count => {
+                root.entries.items[1].children = 5;
+                refreshEntryRowAt(&view, &tab, 1, &root, &root.entries.items[1]);
+                try t.expectEqual(@as(?c_int, 1), tab.sel.anchor);
+            },
+            .insert => try root.entries.insert(a, 1, try types.testEntry(a, "AA", null)),
+            .reorder => std.mem.swap(Entry, &root.entries.items[1], &root.entries.items[2]),
+            .delete_before, .delete_anchor => {
+                const name: []const u8 = if (change == .delete_before) "A" else "B";
+                selection.forgetDeleted(&tab, if (change == .delete_before) "/data/A" else "/data/B");
+                root.del(name);
+            },
+            .empty => {
+                selection.forgetDeleted(&tab, "/data");
+                for (root.entries.items) |*e| e.deinit(a);
+                root.entries.clearRetainingCapacity();
+            },
+            .group => tab.vs.grouped = true,
+            .gone => try t.expect(@import("conn.zig").onDelta(&view, &hc,
+                \\{"view":1,"gone":true}
+            )),
+        }
+        renderList(&view, &tab);
+        const content_only = change == .content or change == .count;
+        try t.expectEqual(if (content_only) @as(?c_int, 1) else null, tab.sel.anchor);
+        try t.expectEqual(@as(usize, if (content_only) 1 else 0), tab.sel.saved.items.len);
+        const expected: usize = if (change == .empty or change == .gone) 0 else if (change == .delete_anchor) 1 else 2;
+        try t.expectEqual(expected, tab.selected.items.len);
+        try t.expectEqual(expected, countSelected(&tab));
+        if (expected == 2) try t.expectEqualStrings("/data/B", tab.selected.items[0]);
+        if (expected > 0) try t.expectEqualStrings("/data/C", tab.selected.items[expected - 1]);
+        selection.commitVisual(&view, &tab);
+    }
 }
 
 /// Re-aim reused rows' borrowed Dir/Entry pointers at the fresh

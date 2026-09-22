@@ -128,25 +128,69 @@ pub fn pruneSelectionToVisible(tab: *BTab) void {
     const a = tab.view.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
-    var hidden = std.StringHashMap(void).init(arena.allocator());
+    var visible = std.StringHashMap(?bool).init(arena.allocator());
+    for (tab.selected.items) |path| {
+        const owned = arena.allocator().dupe(u8, path) catch return;
+        visible.put(owned, null) catch return;
+    }
     var buf: [4200]u8 = undefined;
     var i: usize = 0;
     while (i <= tab.subdirs.items.len) : (i += 1) {
         const dir = if (i == 0) tab.root else tab.subdirs.items[i - 1];
         for (dir.entries.items) |e| {
-            if (entryVisible(tab, e)) continue;
             const p = dir.fullPath(e, &buf) orelse continue;
-            const owned = arena.allocator().dupe(u8, p) catch continue;
-            hidden.put(owned, {}) catch {};
+            const hit = visible.getPtr(p) orelse continue;
+            // Content-search rows share a file identity: any visible hit
+            // keeps the file selected, regardless of the other hits.
+            hit.* = (hit.* orelse false) or entryVisible(tab, e);
         }
     }
-    if (hidden.count() == 0) return;
     i = 0;
     while (i < tab.selected.items.len) {
-        if (hidden.contains(tab.selected.items[i])) {
+        if (visible.get(tab.selected.items[i]).? == false) {
             a.free(tab.selected.orderedRemove(i));
         } else i += 1;
     }
+}
+
+test "visibility pruning keeps any visible content hit and unknown paths" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const types = @import("types.zig");
+    var view = BrowserView{ .allocator = a, .pane = null };
+    var root = types.Dir{ .allocator = a, .path = @constCast("/data"), .view_id = 1, .flat = true };
+    try root.entries.append(a, try types.testEntry(a, "hit.txt:2: first", "/data/hit.txt"));
+    try root.entries.append(a, try types.testEntry(a, "hit.txt:7: second", "/data/hit.txt"));
+    try root.entries.append(a, try types.testEntry(a, ".first", "/data/.first"));
+    var tab = BTab{
+        .view = &view,
+        .hc = undefined,
+        .root = &root,
+        .page = undefined,
+        .listing_box = undefined,
+        .colview = undefined,
+        .tab_label = undefined,
+        .filter = @constCast("first"),
+    };
+    for (0..2) |_| {
+        // Cover the pattern-select caller's subsequent render-time pruning,
+        // with both visible-first and hidden-first duplicate ordering.
+        @import("nav.zig").selectPatternDirs(&view, &tab, "*", false);
+        try t.expectEqual(@as(usize, 1), tab.selected.items.len);
+        try tab.selected.append(a, try a.dupe(u8, "/data/.first"));
+        try tab.selected.append(a, try a.dupe(u8, "/not-yet-listed"));
+        pruneSelectionToVisible(&tab);
+        try t.expectEqual(@as(usize, 2), tab.selected.items.len);
+        try t.expectEqualStrings("/data/hit.txt", tab.selected.items[0]);
+        try t.expectEqualStrings("/not-yet-listed", tab.selected.items[1]);
+        std.mem.swap(Entry, &root.entries.items[0], &root.entries.items[1]);
+    }
+    tab.filter = @constCast("missing");
+    pruneSelectionToVisible(&tab);
+    try t.expectEqual(@as(usize, 1), tab.selected.items.len);
+    try t.expectEqualStrings("/not-yet-listed", tab.selected.items[0]);
 }
 
 /// Toggle the filter bar (Ctrl+I). Hiding it clears the filter: a

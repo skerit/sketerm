@@ -422,10 +422,7 @@ fn onItem(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         .prefs => win.openPrefs(),
         .reload => if (bv) |v| {
             if (v.currentTab()) |tab| {
-                v.clearFailureCaches();
-                v.refreshDir(tab, tab.root);
-                for (tab.subdirs.items) |d| v.refreshDir(tab, d);
-                v.refreshGitForced(tab);
+                v.refreshTab(tab);
             }
         },
         .toggle_hidden => if (bv) |v| {

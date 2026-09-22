@@ -504,6 +504,19 @@ pub fn visualForget(self: *BrowserView, tab: *BTab) void {
     tab.sel.saved.clearRetainingCapacity();
 }
 
+/// Only authoritative deletion events may disarm absent paths: an
+/// incomplete listing or a collapsed subtree is not evidence of deletion.
+pub fn forgetDeleted(tab: *BTab, path: []const u8) void {
+    for ([_]*std.ArrayList([]u8){ &tab.selected, &tab.sel.saved, &tab.pending_select }) |paths| {
+        var i: usize = 0;
+        while (i < paths.items.len) {
+            if (@import("../../filebrowser/paths.zig").dirWithin(paths.items[i], path)) {
+                tab.view.allocator.free(paths.orderedRemove(i));
+            } else i += 1;
+        }
+    }
+}
+
 // -- registers ---------------------------------------------------
 
 /// The paths a register verb acts on: the whole selection when the
@@ -789,7 +802,7 @@ pub fn copyRegisterHere(self: *BrowserView, tab: *BTab, name: []const u8) void {
             continue;
         }
         total += srcs.items.len;
-        self.beginPaste(tab, host, srcs.items, false, false);
+        _ = self.beginPaste(tab, host, srcs.items, false, false);
     }
     if (waiting > 0) {
         self.setStatusFmt("copying {d} item(s); {d} skipped: their host is still connecting, run it again", .{ total, waiting });

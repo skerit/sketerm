@@ -290,7 +290,9 @@ pub fn navigateMode(self: *BrowserView, tab: *BTab, host_in: ?[]const u8, path_i
         self.setStatusFmt("via sketerm: {s} (bypassed mount {s})", .{ bp.host(), bp.mountpoint() });
     }
     const same_host = hostEq(tab.hc.host, host);
-    if (same_host and tab.hc.state != .dead and std.mem.eql(u8, tab.root.path, path)) {
+    if (same_host and tab.hc.state != .dead and !tab.root.isFlat() and
+        tab.root.archive.len == 0 and std.mem.eql(u8, tab.root.path, path))
+    {
         // Already there: nothing to list, but a history move still
         // has to walk the stacks (a location can repeat in them).
         switch (intent) {

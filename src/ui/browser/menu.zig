@@ -205,7 +205,9 @@ pub fn showEntryMenu(
         // copy made in ANY pane -- which is what made a remote folder
         // look like it had no Paste at all.
         if (!self.clipboard().isEmpty())
-            buildPaste(self, tab, ctx, edit.submenuIcon("Paste", .{ .name = "edit-paste-symbolic" }));
+            buildPaste(self, tab, ctx, edit.submenuIcon("Paste", .{ .name = "edit-paste-symbolic" }))
+        else if (@import("ops.zig").canPaste(self, tab))
+            edit.itemIcon("Paste", .{ .name = "edit-paste-symbolic" }, &onMenuPaste, ctx);
         const org = m.section();
         org.item("Rename…", &onMenuRename, ctx);
         buildCopyTo(self, ctx, org.submenu("Copy To"));
@@ -237,9 +239,9 @@ pub fn showEntryMenu(
         // click is the pane, not a file.
         buildCreateNew(self, ctx, m, false);
         const paste = m.section();
-        if (!self.clipboard().isEmpty()) {
+        if (@import("ops.zig").canPaste(self, tab)) {
             paste.itemIcon("Paste", .{ .name = "edit-paste-symbolic" }, &onMenuPaste, ctx);
-            buildPasteSpecial(self, tab, ctx, paste.submenu("Paste Special"));
+            if (!self.clipboard().isEmpty()) buildPasteSpecial(self, tab, ctx, paste.submenu("Paste Special"));
         }
         const viewsec = m.section();
         viewsec.check("Show Hidden Files", tab.show_hidden, &onMenuToggleHidden, ctx);
@@ -955,10 +957,9 @@ pub fn onMenuCopyPath(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 pub fn onMenuPaste(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const ctx = cast.userData(MenuCtx, user);
     const self = ctx.view;
-    const board = self.clipboard();
-    if (board.isEmpty()) return menuDone(ctx);
-    self.beginPaste(ctx.tab, board.hostOpt(), board.items(), board.cut, true);
+    const tab = ctx.tab;
     menuDone(ctx);
+    @import("ops.zig").pasteIntoTab(self, tab);
 }
 
 pub fn onMenuTermTab(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
@@ -1262,7 +1263,7 @@ pub fn onMenuDuplicate(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     @memcpy(pbuf[0..path.len], path);
     const pcopy = pbuf[0..path.len];
     menuDone(ctx);
-    self.duplicateEntry(tab, pcopy);
+    _ = self.duplicateEntry(tab, pcopy);
 }
 
 pub fn onMenuPasteSymlink(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
