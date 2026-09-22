@@ -53,19 +53,14 @@ pub const FONT_CANDIDATES = if (@import("../util/platform.zig").is_macos) [_][*:
     "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
 };
 
+/// Ceiling for a custom shader source file; shadertoy-style effects
+/// are a few KiB, so this only refuses something that is not a shader.
+pub const MAX_SHADER_BYTES: usize = 256 * 1024;
+
+/// A custom shader file's source, or null when it is absent, empty,
+/// unreadable or over `MAX_SHADER_BYTES`.
 pub fn loadShaderFile(allocator: std.mem.Allocator, path: []const u8) ?[]u8 {
-    const max_size = 256 * 1024;
-    var path_z: [4096]u8 = undefined;
-    if (path.len >= path_z.len) return null;
-    @memcpy(path_z[0..path.len], path);
-    path_z[path.len] = 0;
-    const fp = c.fopen(@ptrCast(&path_z), "rb") orelse return null;
-    defer _ = c.fclose(fp);
-    const scratch = allocator.alloc(u8, max_size + 1) catch return null;
-    defer allocator.free(scratch);
-    const n = c.fread(scratch.ptr, 1, scratch.len, fp);
-    if (n == 0 or n > max_size or c.ferror(fp) != 0) return null;
-    return allocator.dupe(u8, scratch[0..n]) catch null;
+    return @import("../util/readfile.zig").sizedOrNull(allocator, path, MAX_SHADER_BYTES);
 }
 
 pub const TerminalSurface = struct {

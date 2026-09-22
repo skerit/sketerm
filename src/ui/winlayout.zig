@@ -7,6 +7,7 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const cast = @import("../util/cast.zig");
 const pathZ = @import("../util/pathz.zig").pathZ;
+const readfile = @import("../util/readfile.zig");
 const logActionError = winmod.logActionError;
 const layout_mod = @import("../layout.zig");
 const Pane = @import("pane.zig").Pane;
@@ -38,8 +39,7 @@ pub const PanedRatioCtx = struct {
 };
 
 
-/// Spawn a new tab from a layout TabSpec (used on --restore).
-/// Handles both v2 (tree) and v1-compat (cwd/command) fields. `at_end`
+/// Spawn a new tab from a layout TabSpec (used on --restore). `at_end`
 /// forces an append so a multi-tab restore keeps its saved order.
 pub fn newTabFromSpec(self: *Window, spec: @import("../layout.zig").TabSpec, at_end: bool) !void {
     const wrapper = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
@@ -430,28 +430,11 @@ fn restoreTabsWithTree(self: *Window, specs: []const layout_mod.TabSpec) void {
 
 pub fn loadLayoutSimple(self: *Window, path: []const u8) !bool {
     const layout_simple = @import("../layout_simple.zig");
-    // Zig 0.16's `std.fs.cwd().openFile` requires an `Io`. Use libc.
-    var path_z: [4096]u8 = undefined;
-    const p = pathZ(&path_z, path) catch {
-        std.debug.print("sketerm: path too long: {s}\n", .{path});
+    const bytes = (try readfile.sized(self.allocator, path, layout_simple.MAX_FILE_BYTES)) orelse {
+        std.debug.print("sketerm: cannot read {s} (missing, empty or over {d} bytes)\n", .{ path, layout_simple.MAX_FILE_BYTES });
         return false;
     };
-    const fp = c.fopen(p, "rb") orelse {
-        std.debug.print("sketerm: cannot open {s}\n", .{path});
-        return false;
-    };
-    defer _ = c.fclose(fp);
-    if (c.fseek(fp, 0, c.SEEK_END) != 0) return false;
-    const size_long = c.ftell(fp);
-    if (size_long <= 0 or size_long > 1024 * 1024) return false;
-    if (c.fseek(fp, 0, c.SEEK_SET) != 0) return false;
-    const size: usize = @intCast(size_long);
-    const bytes = self.allocator.alloc(u8, size) catch return false;
     defer self.allocator.free(bytes);
-    if (c.fread(bytes.ptr, 1, size, fp) != size) {
-        std.debug.print("sketerm: short read on {s}\n", .{path});
-        return false;
-    }
     var parsed = layout_simple.parse(self.allocator, bytes) catch |err| {
         std.debug.print("sketerm: parse {s}: {s}\n", .{ path, @errorName(err) });
         return false;

@@ -2403,7 +2403,7 @@ fn onKey(_: *c.GtkEventControllerKey, keyval: c_uint, _: c_uint, state: c.GdkMod
             .font_inc => self.canvas.zoomBy(1.2),
             .font_dec => self.canvas.zoomBy(1.0 / 1.2),
             .font_reset => self.canvas.actual(),
-            .copy, .copy_selection, .interrupt_or_copy => copyImage(self),
+            .copy_selection, .interrupt_or_copy => copyImage(self),
             else => return 0,
         }
         return 1;

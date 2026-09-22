@@ -15,6 +15,11 @@ const c = @import("c.zig").c;
 const ParamKV = @import("render/shader_pass.zig").ParamKV;
 const atomicwrite = @import("util/atomicwrite.zig");
 const pathz_util = @import("util/pathz.zig");
+const readfile = @import("util/readfile.zig");
+
+/// Ceiling for a preset file on load: a shader path plus a few dozen
+/// `param = value` lines, so anything near this is not a preset.
+pub const MAX_FILE_BYTES: usize = 64 * 1024;
 
 pub const Preset = struct {
     name: []const u8 = "",
@@ -138,15 +143,13 @@ pub fn load(allocator: std.mem.Allocator, name: []const u8) !Preset {
 }
 
 fn loadFromPath(allocator: std.mem.Allocator, name: []const u8, path: []const u8) !Preset {
-    var path_z: [4096]u8 = undefined;
-    const fp = c.fopen(try pathz_util.pathZ(&path_z, path), "rb") orelse return error.NotFound;
-    defer _ = c.fclose(fp);
-    const max_size = 64 * 1024;
-    const buf = try allocator.alloc(u8, max_size + 1);
-    defer allocator.free(buf);
-    const n = c.fread(buf.ptr, 1, buf.len, fp);
-    if (n > max_size or c.ferror(fp) != 0) return error.ReadFailed;
-    var preset = try parse(allocator, buf[0..n]);
+    const bytes = readfile.cappedAlloc(allocator, path, MAX_FILE_BYTES) catch |err| return switch (err) {
+        error.OpenFailed => error.NotFound,
+        error.StreamTooLong => error.ReadFailed,
+        else => err,
+    };
+    defer allocator.free(bytes);
+    var preset = try parse(allocator, bytes);
     preset.name = try allocator.dupe(u8, name);
     return preset;
 }

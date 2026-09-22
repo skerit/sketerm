@@ -633,33 +633,44 @@ missing entry keeps the default binding. Unknown action names and
 unparseable accelerators warn on load and are skipped; an accelerator
 that shadows another binding warns too.
 
-Action names (stable across versions, from `src/ui/input.zig`):
+Action names (stable across versions; the one list is the `Action`
+enum in `src/ui/action.zig`, and a unit test fails when this block
+drifts from it). The same names drive the command palette, the pane and
+window menus and `sketerm cli action <name>`. `copy` and `paste` are
+accepted as older spellings of `copy_selection` and `paste_clipboard`.
 
 ```
-new_tab close_tab next_tab prev_tab copy paste split_h split_v
-font_inc font_dec font_reset search_open cross_search attach_all
-save_layout save_layout_as save_default_layout load_layout
-prompt_prev prompt_next pane_next pane_prev prefs_open
-broadcast_cycle restore_closed_tab toggle_pin_tab toggle_tab_bar
-reload_config launch_app app_windows
+new_tab new_tab_as_profile close_tab next_tab prev_tab rename_tab
+color_tab split_h split_v font_inc font_dec font_reset search_open
+cross_search attach_all save_layout save_layout_as save_default_layout
+load_layout prompt_prev prompt_next pane_next pane_prev prefs_open
+welcome_open broadcast_cycle restore_closed_tab toggle_pin_tab
+toggle_tab_bar toggle_tab_sidebar tab_collapse tab_expand tab_tree_next
+tab_tree_prev reload_config launch_app app_windows
 goto_tab_1 goto_tab_2 goto_tab_3 goto_tab_4 goto_tab_5
 goto_tab_6 goto_tab_7 goto_tab_8 goto_tab_9
 duplicate_tab detach_tab configure_shader shader_preset_pick
-apply_profile show_scrollback new_durable_tab new_browser_tab
-new_browser_split new_web_tab new_web_split web_reader
-close_pane toggle_browser_face new_editor_tab
-new_editor_split toggle_editor_face mux_detach paste_clipboard
-new_browser_split close_pane toggle_browser_face new_editor_tab
-new_editor_split toggle_editor_face web_discard_background
-mux_detach paste_clipboard
-copy_selection
-copy_screen copy_scrollback copy_command_output
+shader_pick shader_clear apply_profile set_pane_title screenshot_pane
+record_session record_session_stop upload_file download_file
+mux_rename mux_kill files_browse_here files_open_app show_scrollback
+new_durable_tab new_browser_tab new_browser_split new_web_tab
+new_web_split new_incognito_web_tab new_tor_web_tab web_route_menu
+web_route_direct web_route_tor web_hints web_reader
+web_discard_background web_devtools web_print_pdf web_fill_password
+web_site_info web_history web_bookmarks close_pane toggle_browser_face
+new_editor_tab new_editor_split toggle_editor_face toggle_web_face
+toggle_panel_face panel_open panel_close mux_detach paste_clipboard
+copy_selection copy_screen copy_scrollback copy_command_output
 select_command_output interrupt_or_copy clear_and_scrollback
 clear_scrollback scrollback_page_up scrollback_page_down
-scrollback_top scrollback_bottom command_palette hints_open
-copy_mode zoom_pane
-toggle_tab_sidebar tab_collapse tab_expand tab_tree_next tab_tree_prev
+scrollback_top scrollback_bottom command_palette hints_open copy_mode
+zoom_pane select_all context_menu reset_terminal open_link copy_link
 ```
+
+`close_pane` defaults to `Ctrl+Shift+Alt+W` (`Cmd+Shift+Option+W` on
+macOS): the `close_tab` chord plus Alt, for the smaller unit.
+`open_link` / `copy_link` act on the link the pane's context menu was
+last raised on.
 
 The tree-style-tab actions use platform-specific defaults:
 

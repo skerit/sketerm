@@ -2155,8 +2155,6 @@ pub const Window = struct {
             ictx.shortcut_ctx = @ptrCast(self);
             ictx.bindings = self.bindings.items;
         }
-        pane.menu_sink = onMenuAction;
-        pane.menu_sink_ctx = @ptrCast(self);
         pane.surface.image_store.debug = self.debug_images;
         pane.surface.image_store.budget_bytes = @as(usize, self.config.image_memory_mb) * 1024 * 1024;
         pane.surface.image_pass.debug = self.debug_images;
@@ -2644,8 +2642,6 @@ pub const Window = struct {
         // pane now lives in -- the one list makePane and
         // applyConfigChange apply.
         self.applyPaneMouseFlags(pane);
-        pane.menu_sink = onMenuAction;
-        pane.menu_sink_ctx = @ptrCast(self);
         if (@import("browser.zig").BrowserView.fromPane(pane)) |bv| self.installBrowserHooks(bv);
         // Re-point active_profile off the SOURCE window's config arena
         // (which is freed on its next applyConfigChange / deinit) onto
@@ -3914,29 +3910,6 @@ pub const Window = struct {
         self.verifyAllTabs();
     }
 
-    /// Copy the focused pane's visible screen to the system clipboard.
-    /// Same body as input.zig::copyScreen — duplicated here because
-    /// the menu sink hits the Window directly while runAction goes
-    /// through the per-pane Ctx. Both paths feed the same extractScreen.
-    pub fn copyFocusedScreen(self: *Window) void {
-        const pane = self.focusedPane() orelse return;
-        const screen = pane.terminal.screen;
-        const text = screen.extractScreen(self.allocator) catch return;
-        defer self.allocator.free(text);
-        if (text.len == 0) return;
-        clipboard.copyText(self.allocator, self.app_window, text);
-    }
-
-    /// Copy the focused pane's scrollback ring + active screen.
-    pub fn copyFocusedScrollback(self: *Window) void {
-        const pane = self.focusedPane() orelse return;
-        const screen = pane.terminal.screen;
-        const text = screen.extractScrollback(self.allocator) catch return;
-        defer self.allocator.free(text);
-        if (text.len == 0) return;
-        clipboard.copyText(self.allocator, self.app_window, text);
-    }
-
     /// Open the focused pane's scrollback + screen in a pager tab.
     /// Kitty's show_scrollback: dump to a 0600 temp file, spawn
     /// `less -R +G <file>` (or `$PAGER <file>`) in a new tab; the
@@ -4487,14 +4460,55 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         .new_editor_split => self.newEditorSplit(@intCast(c.GTK_ORIENTATION_HORIZONTAL)) catch |err| logActionError("new_editor_split", err),
         // Only reached when the focused pane has NO editor face.
         .toggle_editor_face => showToast(self, "This pane has no editor. Use New Editor Tab."),
+        // Only reached when the focused pane has NO web face.
+        .toggle_web_face => showToast(self, "This pane has no web page. Use New Web Tab."),
         .panel_open => @import("panelpicker.zig").open(self),
         .panel_close => if (!@import("panelhost.zig").closeNearest(self, self.focusedPane()))
             showToast(self, "No panel to close here. Use Open Saved Panel… to show one."),
+        // Only reached when the focused pane has NO panel face.
+        .toggle_panel_face => showToast(self, "This pane shows no panel. Use Open Saved Panel… to show one."),
         .mux_detach => if (self.focusedPane()) |p| self.detachPaneToShell(p),
+        .mux_rename => self.renameFocusedMuxSession(),
+        .mux_kill => self.killFocusedMuxSession(),
         .command_palette => palette_mod.open(self) catch |err| logActionError("command_palette", err),
         .hints_open => self.openHints(),
         .copy_mode => self.openCopyMode(),
-        else => {},
+        .new_tab_as_profile => self.openProfilePicker(),
+        .rename_tab => self.renameCurrentTab(),
+        .color_tab => self.chooseTabColor(),
+        .shader_pick => self.pickPaneShader(),
+        .shader_clear => self.clearPaneShader(),
+        .set_pane_title => self.setFocusedPaneTitle(),
+        .screenshot_pane => screenshotFocusedPane(self),
+        .record_session => recordFocusedSession(self),
+        .record_session_stop => if (self.focusedPane()) |p| p.terminal.requestRecordStop(),
+        .upload_file => openUploadDialog(self),
+        .download_file => if (self.focusedPane()) |p| @import("remote_browser.zig").open(self, p),
+        .files_browse_here => if (self.focusedPane()) |p| self.openBrowserHere(p, null) catch |err|
+            logActionError("files_browse_here", err),
+        .files_open_app => self.openInFilesApp(),
+        // Reached only when the pane holds no link captured by its
+        // context menu: the verbs act on what the menu was raised on.
+        .open_link, .copy_link => showToast(self, "No link here. Right-click a link to open or copy it."),
+        // Pane-tier verbs `input.runAction` always consumes; they get
+        // here only when no pane with an input context is focused.
+        .paste_clipboard,
+        .copy_selection,
+        .copy_screen,
+        .copy_scrollback,
+        .copy_command_output,
+        .select_command_output,
+        .interrupt_or_copy,
+        .clear_and_scrollback,
+        .clear_scrollback,
+        .scrollback_page_up,
+        .scrollback_page_down,
+        .scrollback_top,
+        .scrollback_bottom,
+        .select_all,
+        .context_menu,
+        .reset_terminal,
+        => {},
     }
 }
 
@@ -4502,74 +4516,15 @@ fn onWebextFocusChanged(_: *c.GObject, _: ?*anyopaque, _: ?*anyopaque) callconv(
     @import("webface.zig").tabsChanged();
 }
 
-/// Public entry-point used by the command palette. Tries the
-/// focused pane's input controller first (covers per-pane actions
-/// like copy_selection / paste_clipboard / scrollback_*) and falls
-/// through to `onShortcut` for window-level actions. Mirrors the
-/// dispatch order the keybind handler uses, so palette dispatch
-/// and keybind dispatch hit the exact same code paths.
+/// Run `action` against the focused pane (the palette, the window
+/// hamburger, the tab-strip menu, remote control): `Pane.runAction`,
+/// i.e. exactly the path a keybind takes, or straight to the window
+/// tier when no pane is focused.
 pub fn dispatchAction(window: *Window, action: @import("input.zig").Action) void {
     if (window.focusedPane()) |pane| {
-        if (pane.input_ctx) |ictx| {
-            if (@import("input.zig").runAction(ictx, action) != 0) return;
-        }
+        if (pane.input_ctx != null) return pane.runAction(action);
     }
     onShortcut(@ptrCast(window), action);
-}
-
-fn onMenuAction(ctx: ?*anyopaque, action: @import("menu.zig").Action) void {
-    const self = cast.userData(Window, ctx);
-    switch (action) {
-        // A browser owning the sidebar takes "new tab" for itself.
-        .new_tab => if (!self.newTabInBrowser())
-            self.newShellTab(null) catch |err| logActionError("new_tab", err),
-        .new_tab_as_profile => self.openProfilePicker(),
-        .apply_profile => self.openApplyProfilePicker(),
-        .duplicate_tab => self.duplicateCurrentTab(),
-        .shader_pick => self.pickPaneShader(),
-        .shader_preset => self.openShaderPresetPicker(),
-        .shader_config => {
-            // No active shader → offer the picker instead.
-            if (!@import("shader_dialog.zig").open(self)) self.pickPaneShader();
-        },
-        .shader_clear => self.clearPaneShader(),
-        .close_tab => self.closeCurrentTreeItem(),
-        .rename_tab => self.renameCurrentTab(),
-        .color_tab => self.chooseTabColor(),
-        .pin_tab => self.togglePinCurrentTab(),
-        .toggle_tab_sidebar => self.toggleTabSidebarVisibility(),
-        .tab_collapse => self.collapseCurrentTab(true),
-        .tab_expand => self.collapseCurrentTab(false),
-        .tab_tree_next => self.tabTreeStep(true),
-        .tab_tree_prev => self.tabTreeStep(false),
-        .split_h => self.splitFocused(@intCast(c.GTK_ORIENTATION_HORIZONTAL)) catch |err| logActionError("split_h", err),
-        .split_v => self.splitFocused(@intCast(c.GTK_ORIENTATION_VERTICAL)) catch |err| logActionError("split_v", err),
-        .files_browse_here => if (self.focusedPane()) |p| self.openBrowserHere(p, null) catch |err|
-            logActionError("files_browse_here", err),
-        .files_browse_tab => self.newBrowserTabFrom(self.focusedPane(), null) catch |err|
-            logActionError("files_browse_tab", err),
-        .files_open_app => self.openInFilesApp(),
-        .close_pane => self.closeFocusedPane(),
-        .zoom_pane => self.toggleZoomPane(),
-        .set_pane_title => self.setFocusedPaneTitle(),
-        // Detach = close the pane; Terminal.deinit on a remote pane
-        // sends DETACH and leaves the session running in the daemon.
-        .upload_file => openUploadDialog(self),
-        .download_file => if (self.focusedPane()) |p| @import("remote_browser.zig").open(self, p),
-        .mux_detach => if (self.focusedPane()) |p| self.detachPaneToShell(p),
-        .mux_rename => self.renameFocusedMuxSession(),
-        .mux_kill => self.killFocusedMuxSession(),
-        .copy_screen => self.copyFocusedScreen(),
-        .copy_scrollback => self.copyFocusedScrollback(),
-        .screenshot_pane => screenshotFocusedPane(self),
-        .record_session => recordFocusedSession(self),
-        .record_session_stop => if (self.focusedPane()) |p| p.terminal.requestRecordStop(),
-        .launch_remote_app => if (self.focusedPane()) |p| @import("app_launcher.zig").open(self, p),
-        .prefs_open => self.openPrefs(),
-        .welcome_open => self.openWelcome(),
-        .search => self.openSearch(),
-        else => {},
-    }
 }
 
 /// Carries its own allocator: the picker's cancel callback can fire

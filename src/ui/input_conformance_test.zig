@@ -652,6 +652,75 @@ test "rebuildBindings: an empty accel unbinds the action outright" {
     for (list.items) |b| try std.testing.expect(b.action != .new_tab);
 }
 
+test "rebuildBindings: keybind.copy / keybind.paste bind the copy and paste verbs" {
+    // `keybind.copy` is documented in docs/config.md; it used to parse
+    // into an Action no dispatch arm handled, so the key did nothing.
+    var list: std.ArrayList(input.Binding) = .empty;
+    defer list.deinit(std.testing.allocator);
+    rebuiltWith(&list, &.{
+        .{ .name = "copy", .accel = "<Control>F7" },
+        .{ .name = "paste", .accel = "<Control>F8" },
+    });
+    try std.testing.expectEqual(
+        @as(?input.Action, .copy_selection),
+        input.matchBinding(list.items, c.GDK_KEY_F7, c.GDK_CONTROL_MASK),
+    );
+    try std.testing.expectEqual(
+        @as(?input.Action, .paste_clipboard),
+        input.matchBinding(list.items, c.GDK_KEY_F8, c.GDK_CONTROL_MASK),
+    );
+    // The alias REPLACES the verb's defaults like its canonical name would.
+    for (list.items) |b| {
+        if (b.action == .paste_clipboard) try std.testing.expectEqual(@as(c_uint, c.GDK_KEY_F8), b.keyval);
+    }
+}
+
+test "matchBinding: close_pane has a default one Alt away from close_tab" {
+    const linux_tab = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK;
+    try std.testing.expectEqual(
+        @as(?input.Action, .close_tab),
+        input.matchBinding(&input.linux_default_bindings, c.GDK_KEY_w, linux_tab),
+    );
+    try std.testing.expectEqual(
+        @as(?input.Action, .close_pane),
+        input.matchBinding(&input.linux_default_bindings, c.GDK_KEY_w, linux_tab | c.GDK_ALT_MASK),
+    );
+    try std.testing.expectEqual(
+        @as(?input.Action, .close_pane),
+        input.matchBinding(&input.macos_default_bindings, c.GDK_KEY_w, c.GDK_META_MASK | c.GDK_SHIFT_MASK | c.GDK_ALT_MASK),
+    );
+}
+
+test "docs/config.md lists exactly the action vocabulary" {
+    // The keybind section's name block is the user's reference; it had
+    // drifted into duplicates and missing verbs while hand-maintained.
+    const doc = @embedFile("docs_config_md");
+    const anchor = std.mem.indexOf(u8, doc, "### `keybind.<action>`") orelse return error.KeybindSectionMissing;
+    const open = std.mem.indexOfPos(u8, doc, anchor, "```\n") orelse return error.NameBlockMissing;
+    const close = std.mem.indexOfPos(u8, doc, open + 4, "```") orelse return error.NameBlockUnterminated;
+    const block = doc[open + 4 .. close];
+
+    var seen = std.EnumSet(input.Action).initEmpty();
+    var it = std.mem.tokenizeAny(u8, block, " \n");
+    while (it.next()) |name| {
+        const a = std.meta.stringToEnum(input.Action, name) orelse {
+            std.debug.print("docs/config.md lists '{s}', which is not an action\n", .{name});
+            return error.UnknownActionDocumented;
+        };
+        if (seen.contains(a)) {
+            std.debug.print("docs/config.md lists '{s}' twice\n", .{name});
+            return error.ActionDocumentedTwice;
+        }
+        seen.insert(a);
+    }
+    inline for (@typeInfo(input.Action).@"enum".fields) |f| {
+        if (!seen.contains(@field(input.Action, f.name))) {
+            std.debug.print("docs/config.md does not list action '{s}'\n", .{f.name});
+            return error.ActionUndocumented;
+        }
+    }
+}
+
 test "matchBinding: unmatched key returns null" {
     const bindings = input.default_bindings[0..];
     // No default binding for plain F12.
@@ -670,9 +739,9 @@ test "matchBinding: first-match wins on duplicate accelerators" {
     // wins per the linear-scan implementation. Documents the contract
     // so callers can rely on order when overriding defaults.
     const bindings = [_]input.Binding{
-        .{ .keyval = c.GDK_KEY_a, .mods = 0, .action = .copy },
-        .{ .keyval = c.GDK_KEY_a, .mods = 0, .action = .paste },
+        .{ .keyval = c.GDK_KEY_a, .mods = 0, .action = .copy_selection },
+        .{ .keyval = c.GDK_KEY_a, .mods = 0, .action = .paste_clipboard },
     };
     const got = input.matchBinding(bindings[0..], c.GDK_KEY_a, 0);
-    try std.testing.expectEqual(@as(?input.Action, .copy), got);
+    try std.testing.expectEqual(@as(?input.Action, .copy_selection), got);
 }

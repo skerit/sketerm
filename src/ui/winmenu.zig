@@ -1,12 +1,11 @@
 //! The terminal window's headerbar hamburger.
 //!
-//! Every row here is a row of `menu.zig`'s declarative spec, taken by
-//! `menu.labelFor`/`menu.iconFor` and dispatched through the focused
-//! pane's `runMenuAction` — i.e. the same `Sink` a right-click row
-//! uses, with the same pane-local-then-Window handling behind it.
-//! Nothing is re-implemented here: this file decides WHICH verbs make
-//! sense window-level and nothing else, so a relabelled or rewired
-//! verb moves in both menus at once.
+//! Every row is an `action.zig` verb, worded by `menu.labelFor` /
+//! `menu.iconFor` (the pane context menu's spec) and run through
+//! `window.dispatchAction`, the same path a keybind or a right-click
+//! row takes. Nothing is re-implemented here: this file decides WHICH
+//! verbs make sense window-level and nothing else, so a relabelled or
+//! rewired verb moves in both menus at once.
 //!
 //! The rows are built fresh per open (sensitivity depends on the
 //! focused pane's session), the classicmenu way.
@@ -17,25 +16,26 @@ const cast = @import("../util/cast.zig");
 const classicmenu = @import("browser/classicmenu.zig");
 const appmenu = @import("appmenu.zig");
 const menu = @import("menu.zig");
-const Window = @import("window.zig").Window;
+const Action = @import("action.zig").Action;
+const winmod = @import("window.zig");
+const Window = winmod.Window;
 
 /// One row: the verb, and the window to run it on. Owned by the menu
 /// Root (mechanism 1 — the popover frees it), never by the row.
 const RowCtx = struct {
     allocator: std.mem.Allocator,
     win: *Window,
-    action: menu.Action,
+    action: Action,
 };
 
 fn onRow(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
     const ctx = cast.userData(RowCtx, user);
-    const pane = ctx.win.focusedPane() orelse return;
-    pane.runMenuAction(ctx.action);
+    winmod.dispatchAction(ctx.win, ctx.action);
 }
 
 /// Append one spec row. `enabled = false` greys it out rather than
 /// hiding it, so the menu still shows what this window CAN do.
-fn row(m: classicmenu.Menu, win: *Window, action: menu.Action, enabled: bool) void {
+fn row(m: classicmenu.Menu, win: *Window, comptime action: Action, enabled: bool) void {
     const ctx = win.allocator.create(RowCtx) catch return;
     ctx.* = .{ .allocator = win.allocator, .win = win, .action = action };
     m.root.own(cast.destroyCtx(RowCtx), @ptrCast(ctx));

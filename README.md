@@ -144,7 +144,8 @@ and `docs/config.md`); saving it applies immediately.
 
 | Shortcut               | Action                             |
 |------------------------|------------------------------------|
-| `Ctrl+Shift+T` / `W`   | New tab / close tab or pane        |
+| `Ctrl+Shift+T` / `W`   | New tab / close tab                |
+| `Ctrl+Shift+Alt+W`     | Close pane                         |
 | `Ctrl+Tab`, `Alt+1..9` | Next tab, jump to tab N            |
 | `Ctrl+Shift+D` / `R`   | Split horizontal / vertical        |
 | `Ctrl+Shift+Left/Right`| Cycle focus between panes          |

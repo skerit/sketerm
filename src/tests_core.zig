@@ -140,6 +140,7 @@ comptime {
     _ = @import("ui/tabforest.zig");
     _ = @import("ui/debounce.zig");
     _ = @import("ui/commandcat.zig");
+    _ = @import("ui/action.zig");
     _ = @import("ui/panel/canary.zig");
     _ = @import("ui/panel/doc.zig");
     _ = @import("ui/panel/assets.zig");

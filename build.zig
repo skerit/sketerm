@@ -1009,6 +1009,9 @@ pub fn build(b: *std.Build) void {
     if (have_x264) addVideo(b, tests_mod);
     if (have_vtenc) addVtEnc(b, tests_mod);
     addTreeSitter(b, tests_mod, tree_sitter);
+    // docs/ is outside the source module root; drift tests that check a
+    // doc against its code vocabulary embed it this way.
+    tests_mod.addAnonymousImport("docs_config_md", .{ .root_source_file = b.path("docs/config.md") });
     const tests = b.addTest(.{
         .root_module = tests_mod,
         .use_llvm = test_llvm,

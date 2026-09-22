@@ -2,77 +2,17 @@
 //! buttons. (GTK4's GtkPopoverMenu does NOT render per-item icons, so
 //! the model approach can't show them; we build the rows ourselves.)
 //!
-//! Actions dispatch via a single sink callback. Names use the
-//! "term" action prefix; widget gets a GSimpleActionGroup inserted,
-//! and each button drives its action via action-name.
+//! Every row is an `action.zig` verb, dispatched through a single sink
+//! callback. The widget gets a "term" GSimpleActionGroup whose action
+//! names derive from the verbs' tags, and each button drives its action
+//! via action-name.
 
 const std = @import("std");
 const c = @import("../c.zig").c;
 const cast = @import("../util/cast.zig");
 const menuchrome = @import("menuchrome.zig");
 
-pub const Action = enum {
-    copy,
-    copy_screen,
-    copy_scrollback,
-    copy_output,
-    /// Select the whole buffer (scrollback + screen) using the
-    /// terminal's own line-select mode.
-    select_all,
-    /// Line-select the last OSC 133 command output zone.
-    select_output,
-    /// Open the pane search bar (Ctrl+Shift+F's action).
-    search,
-    /// Wipe the scrollback ring; the visible screen stays.
-    clear_scrollback,
-    paste,
-    new_tab,
-    new_tab_as_profile,
-    duplicate_tab,
-    close_tab,
-    rename_tab,
-    color_tab,
-    pin_tab,
-    /// Tree-style tabs: the sidebar itself, and folding the selected
-    /// tab's children away. Bindable from the palette too, but a
-    /// feature nobody can find is a feature nobody has.
-    toggle_tab_sidebar,
-    tab_collapse,
-    tab_expand,
-    tab_tree_next,
-    tab_tree_prev,
-    split_h,
-    split_v,
-    files_browse_here,
-    files_browse_tab,
-    files_open_app,
-    zoom_pane,
-    close_pane,
-    set_pane_title,
-    apply_profile,
-    shader_pick,
-    shader_preset,
-    shader_config,
-    shader_clear,
-    upload_file,
-    download_file,
-    mux_detach,
-    mux_rename,
-    mux_kill,
-    reset_terminal,
-    screenshot_pane,
-    record_session,
-    record_session_stop,
-    launch_remote_app,
-    open_link,
-    copy_link,
-    /// Bring back a pane's HIDDEN web face ("Show this pane's shell"
-    /// swapped it away, and every affordance to return with it lives
-    /// on the browser toolbar that is now invisible).
-    show_web_face,
-    prefs_open,
-    welcome_open,
-};
+const Action = @import("action.zig").Action;
 
 pub const Sink = *const fn (ctx: ?*anyopaque, action: Action) void;
 
@@ -84,28 +24,26 @@ const ActionSlot = struct {
 };
 
 /// Optional pre-popup callback. Pane uses this to update the
-/// "term.copy-link" action's enabled state (and stash the URI for
-/// the activate handler) based on what's under the click. Return
-/// false to suppress the menu entirely (right-click rebound to
-/// paste) — the hook may perform its own action instead.
+/// `copy_link` row's enabled state (and stash the URI for the
+/// activate handler) based on what's under the click. Return false to
+/// suppress the menu entirely (right-click rebound to paste); the
+/// hook may perform its own action instead.
 pub const PrePopupFn = *const fn (ctx: ?*anyopaque, group: *c.GSimpleActionGroup, x: f64, y: f64) bool;
 
 const Bind = struct {
-    name: [*:0]const u8,
     label: [*:0]const u8,
-    detailed: [*:0]const u8,
     /// Symbolic icon name (stock Adwaita, or a bundled sketerm-* icon).
     icon: [*:0]const u8,
     action: Action,
     /// Row only makes sense when the right-click landed on a
     /// hyperlink / detected URL. These rows (and their section
-    /// separator) hide when the pre-popup hook leaves "copy-link"
+    /// separator) hide when the pre-popup hook leaves `copy_link`
     /// disabled.
     link_only: bool = false,
     /// Row only makes sense on a session whose PTY lives on another
-    /// machine (SSH / UDP host) — file transfer to a local session
+    /// machine (SSH / UDP host); file transfer to a local session
     /// is pointless. Hidden when the pre-popup hook leaves
-    /// "upload-file" disabled.
+    /// `upload_file` disabled.
     host_only: bool = false,
     /// Recording-state pair: 1 = "start recording" row (hidden while
     /// the session records), 2 = "stop" row (shown only while it
@@ -114,7 +52,7 @@ const Bind = struct {
     /// Row only makes sense while the pane carries a HIDDEN web face
     /// (the only state with no other way back to the browser). Hidden
     /// (with its trailing separator) when the pre-popup hook leaves
-    /// "show-web" disabled.
+    /// `toggle_web_face` disabled.
     web_only: bool = false,
 };
 
@@ -139,76 +77,76 @@ const Item = union(enum) {
 /// Top-level menu layout. Submenu children open in a nested popover
 /// on hover (and on click), classic-menu style.
 const MENU = [_]Item{
-    .{ .bind = .{ .name = "show-web", .label = "Return to Browser", .detailed = "term.show-web", .icon = "web-browser-symbolic", .action = .show_web_face, .web_only = true } },
+    .{ .bind = .{ .label = "Return to Browser", .icon = "web-browser-symbolic", .action = .toggle_web_face, .web_only = true } },
     .separator,
-    .{ .bind = .{ .name = "open-link", .label = "Open Link", .detailed = "term.open-link", .icon = "web-browser-symbolic", .action = .open_link, .link_only = true } },
-    .{ .bind = .{ .name = "copy-link", .label = "Copy Link", .detailed = "term.copy-link", .icon = "insert-link-symbolic", .action = .copy_link, .link_only = true } },
+    .{ .bind = .{ .label = "Open Link", .icon = "web-browser-symbolic", .action = .open_link, .link_only = true } },
+    .{ .bind = .{ .label = "Copy Link", .icon = "insert-link-symbolic", .action = .copy_link, .link_only = true } },
     .separator,
-    .{ .bind = .{ .name = "copy", .label = "Copy", .detailed = "term.copy", .icon = "edit-copy-symbolic", .action = .copy } },
-    .{ .bind = .{ .name = "paste", .label = "Paste", .detailed = "term.paste", .icon = "edit-paste-symbolic", .action = .paste } },
-    .{ .bind = .{ .name = "select-all", .label = "Select All", .detailed = "term.select-all", .icon = "edit-select-all-symbolic", .action = .select_all } },
+    .{ .bind = .{ .label = "Copy", .icon = "edit-copy-symbolic", .action = .copy_selection } },
+    .{ .bind = .{ .label = "Paste", .icon = "edit-paste-symbolic", .action = .paste_clipboard } },
+    .{ .bind = .{ .label = "Select All", .icon = "edit-select-all-symbolic", .action = .select_all } },
     .{ .submenu = .{ .label = "Copy More", .icon = "edit-select-all-symbolic", .items = &.{
-        .{ .name = "copy-screen", .label = "Copy Screen", .detailed = "term.copy-screen", .icon = "edit-select-all-symbolic", .action = .copy_screen },
-        .{ .name = "copy-scrollback", .label = "Copy Scrollback", .detailed = "term.copy-scrollback", .icon = "edit-select-all-symbolic", .action = .copy_scrollback },
-        .{ .name = "copy-output", .label = "Copy Command Output", .detailed = "term.copy-output", .icon = "utilities-terminal-symbolic", .action = .copy_output },
-        .{ .name = "select-output", .label = "Select Command Output", .detailed = "term.select-output", .icon = "edit-select-all-symbolic", .action = .select_output },
+        .{ .label = "Copy Screen", .icon = "edit-select-all-symbolic", .action = .copy_screen },
+        .{ .label = "Copy Scrollback", .icon = "edit-select-all-symbolic", .action = .copy_scrollback },
+        .{ .label = "Copy Command Output", .icon = "utilities-terminal-symbolic", .action = .copy_command_output },
+        .{ .label = "Select Command Output", .icon = "edit-select-all-symbolic", .action = .select_command_output },
     } } },
-    .{ .bind = .{ .name = "search", .label = "Find…", .detailed = "term.search", .icon = "edit-find-symbolic", .action = .search } },
+    .{ .bind = .{ .label = "Find…", .icon = "edit-find-symbolic", .action = .search_open } },
     .separator,
-    .{ .bind = .{ .name = "split-h", .label = "Split Left / Right", .detailed = "term.split-h", .icon = "sketerm-split-left-right-symbolic", .action = .split_h } },
-    .{ .bind = .{ .name = "split-v", .label = "Split Top / Bottom", .detailed = "term.split-v", .icon = "sketerm-split-top-bottom-symbolic", .action = .split_v } },
+    .{ .bind = .{ .label = "Split Left / Right", .icon = "sketerm-split-left-right-symbolic", .action = .split_h } },
+    .{ .bind = .{ .label = "Split Top / Bottom", .icon = "sketerm-split-top-bottom-symbolic", .action = .split_v } },
     .{ .submenu = .{ .label = "Files", .icon = "folder-symbolic", .items = &.{
-        .{ .name = "files-here", .label = "Browse Here in Pane", .detailed = "term.files-here", .icon = "folder-open-symbolic", .action = .files_browse_here },
-        .{ .name = "files-tab", .label = "Browse Here in New Tab", .detailed = "term.files-tab", .icon = "folder-new-symbolic", .action = .files_browse_tab },
-        .{ .name = "files-app", .label = "Open in Sketerm Files", .detailed = "term.files-app", .icon = "system-file-manager-symbolic", .action = .files_open_app },
+        .{ .label = "Browse Here in Pane", .icon = "folder-open-symbolic", .action = .files_browse_here },
+        .{ .label = "Browse Here in New Tab", .icon = "folder-new-symbolic", .action = .new_browser_tab },
+        .{ .label = "Open in Sketerm Files", .icon = "system-file-manager-symbolic", .action = .files_open_app },
     } } },
     .{ .submenu = .{ .label = "Pane", .icon = "view-grid-symbolic", .items = &.{
-        .{ .name = "zoom-pane", .label = "Zoom / Unzoom Pane", .detailed = "term.zoom-pane", .icon = "view-fullscreen-symbolic", .action = .zoom_pane },
-        .{ .name = "set-pane-title", .label = "Set Pane Title…", .detailed = "term.set-pane-title", .icon = "document-edit-symbolic", .action = .set_pane_title },
-        .{ .name = "apply-profile", .label = "Apply Profile to Pane…", .detailed = "term.apply-profile", .icon = "preferences-other-symbolic", .action = .apply_profile },
-        .{ .name = "screenshot-pane", .label = "Screenshot Pane…", .detailed = "term.screenshot-pane", .icon = "camera-photo-symbolic", .action = .screenshot_pane },
-        .{ .name = "record-session", .label = "Record Session (asciicast)…", .detailed = "term.record-session", .icon = "media-record-symbolic", .action = .record_session, .rec_row = 1 },
-        .{ .name = "record-stop", .label = "Stop Session Recording", .detailed = "term.record-stop", .icon = "media-playback-stop-symbolic", .action = .record_session_stop, .rec_row = 2 },
-        .{ .name = "close-pane", .label = "Close Pane", .detailed = "term.close-pane", .icon = "window-close-symbolic", .action = .close_pane },
+        .{ .label = "Zoom / Unzoom Pane", .icon = "view-fullscreen-symbolic", .action = .zoom_pane },
+        .{ .label = "Set Pane Title…", .icon = "document-edit-symbolic", .action = .set_pane_title },
+        .{ .label = "Apply Profile to Pane…", .icon = "preferences-other-symbolic", .action = .apply_profile },
+        .{ .label = "Screenshot Pane…", .icon = "camera-photo-symbolic", .action = .screenshot_pane },
+        .{ .label = "Record Session (asciicast)…", .icon = "media-record-symbolic", .action = .record_session, .rec_row = 1 },
+        .{ .label = "Stop Session Recording", .icon = "media-playback-stop-symbolic", .action = .record_session_stop, .rec_row = 2 },
+        .{ .label = "Close Pane", .icon = "window-close-symbolic", .action = .close_pane },
     } } },
     .{ .submenu = .{ .label = "Shader", .icon = "sketerm-rendering-symbolic", .items = &.{
-        .{ .name = "shader-pick", .label = "Pane Shader…", .detailed = "term.shader-pick", .icon = "sketerm-rendering-symbolic", .action = .shader_pick },
-        .{ .name = "shader-preset", .label = "Shader Preset…", .detailed = "term.shader-preset", .icon = "sketerm-starred-symbolic", .action = .shader_preset },
-        .{ .name = "shader-config", .label = "Configure Shader…", .detailed = "term.shader-config", .icon = "preferences-other-symbolic", .action = .shader_config },
-        .{ .name = "shader-clear", .label = "Clear Pane Shader", .detailed = "term.shader-clear", .icon = "edit-clear-symbolic", .action = .shader_clear },
+        .{ .label = "Pane Shader…", .icon = "sketerm-rendering-symbolic", .action = .shader_pick },
+        .{ .label = "Shader Preset…", .icon = "sketerm-starred-symbolic", .action = .shader_preset_pick },
+        .{ .label = "Configure Shader…", .icon = "preferences-other-symbolic", .action = .configure_shader },
+        .{ .label = "Clear Pane Shader", .icon = "edit-clear-symbolic", .action = .shader_clear },
     } } },
     .separator,
     .{ .submenu = .{ .label = "Tab", .icon = "tab-new-symbolic", .items = &.{
-        .{ .name = "new-tab", .label = "New Tab", .detailed = "term.new-tab", .icon = "tab-new-symbolic", .action = .new_tab },
-        .{ .name = "new-tab-as-profile", .label = "New Tab as Profile…", .detailed = "term.new-tab-as-profile", .icon = "tab-new-symbolic", .action = .new_tab_as_profile },
-        .{ .name = "duplicate-tab", .label = "Duplicate Tab", .detailed = "term.duplicate-tab", .icon = "edit-copy-symbolic", .action = .duplicate_tab },
-        .{ .name = "rename-tab", .label = "Rename Tab…", .detailed = "term.rename-tab", .icon = "document-edit-symbolic", .action = .rename_tab },
-        .{ .name = "color-tab", .label = "Tab Colour…", .detailed = "term.color-tab", .icon = "color-select-symbolic", .action = .color_tab },
-        .{ .name = "pin-tab", .label = "Pin / Unpin Tab", .detailed = "term.pin-tab", .icon = "view-pin-symbolic", .action = .pin_tab },
-        .{ .name = "toggle-tab-sidebar", .label = "Tab Tree Sidebar", .detailed = "term.toggle-tab-sidebar", .icon = "sidebar-show-symbolic", .action = .toggle_tab_sidebar },
-        .{ .name = "tab-collapse", .label = "Collapse Tab Subtree", .detailed = "term.tab-collapse", .icon = "pan-end-symbolic", .action = .tab_collapse },
-        .{ .name = "tab-expand", .label = "Expand Tab Subtree", .detailed = "term.tab-expand", .icon = "pan-down-symbolic", .action = .tab_expand },
-        .{ .name = "tab-tree-next", .label = "Next Tab (Tree Order)", .detailed = "term.tab-tree-next", .icon = "go-down-symbolic", .action = .tab_tree_next },
-        .{ .name = "tab-tree-prev", .label = "Previous Tab (Tree Order)", .detailed = "term.tab-tree-prev", .icon = "go-up-symbolic", .action = .tab_tree_prev },
-        .{ .name = "close-tab", .label = "Close Tab", .detailed = "term.close-tab", .icon = "window-close-symbolic", .action = .close_tab },
+        .{ .label = "New Tab", .icon = "tab-new-symbolic", .action = .new_tab },
+        .{ .label = "New Tab as Profile…", .icon = "tab-new-symbolic", .action = .new_tab_as_profile },
+        .{ .label = "Duplicate Tab", .icon = "edit-copy-symbolic", .action = .duplicate_tab },
+        .{ .label = "Rename Tab…", .icon = "document-edit-symbolic", .action = .rename_tab },
+        .{ .label = "Tab Colour…", .icon = "color-select-symbolic", .action = .color_tab },
+        .{ .label = "Pin / Unpin Tab", .icon = "view-pin-symbolic", .action = .toggle_pin_tab },
+        .{ .label = "Tab Tree Sidebar", .icon = "sidebar-show-symbolic", .action = .toggle_tab_sidebar },
+        .{ .label = "Collapse Tab Subtree", .icon = "pan-end-symbolic", .action = .tab_collapse },
+        .{ .label = "Expand Tab Subtree", .icon = "pan-down-symbolic", .action = .tab_expand },
+        .{ .label = "Next Tab (Tree Order)", .icon = "go-down-symbolic", .action = .tab_tree_next },
+        .{ .label = "Previous Tab (Tree Order)", .icon = "go-up-symbolic", .action = .tab_tree_prev },
+        .{ .label = "Close Tab", .icon = "window-close-symbolic", .action = .close_tab },
     } } },
     .separator,
-    .{ .bind = .{ .name = "launch-app", .label = "Launch App…", .detailed = "term.launch-app", .icon = "application-x-executable-symbolic", .action = .launch_remote_app } },
+    .{ .bind = .{ .label = "Launch App…", .icon = "application-x-executable-symbolic", .action = .launch_app } },
     .{ .submenu = .{ .label = "Session", .icon = "network-server-symbolic", .remote_only = true, .items = &.{
-        .{ .name = "upload-file", .label = "Upload File…", .detailed = "term.upload-file", .icon = "document-send-symbolic", .action = .upload_file, .host_only = true },
-        .{ .name = "download-file", .label = "Download File…", .detailed = "term.download-file", .icon = "folder-download-symbolic", .action = .download_file, .host_only = true },
-        .{ .name = "mux-detach", .label = "Detach Session", .detailed = "term.mux-detach", .icon = "network-offline-symbolic", .action = .mux_detach },
-        .{ .name = "mux-rename", .label = "Rename Session…", .detailed = "term.mux-rename", .icon = "document-edit-symbolic", .action = .mux_rename },
-        .{ .name = "mux-kill", .label = "Kill Session", .detailed = "term.mux-kill", .icon = "process-stop-symbolic", .action = .mux_kill },
+        .{ .label = "Upload File…", .icon = "document-send-symbolic", .action = .upload_file, .host_only = true },
+        .{ .label = "Download File…", .icon = "folder-download-symbolic", .action = .download_file, .host_only = true },
+        .{ .label = "Detach Session", .icon = "network-offline-symbolic", .action = .mux_detach },
+        .{ .label = "Rename Session…", .icon = "document-edit-symbolic", .action = .mux_rename },
+        .{ .label = "Kill Session", .icon = "process-stop-symbolic", .action = .mux_kill },
     } } },
     .separator,
-    .{ .bind = .{ .name = "clear-scrollback", .label = "Clear Scrollback", .detailed = "term.clear-scrollback", .icon = "edit-clear-all-symbolic", .action = .clear_scrollback } },
-    .{ .bind = .{ .name = "reset", .label = "Reset Terminal", .detailed = "term.reset", .icon = "view-refresh-symbolic", .action = .reset_terminal } },
-    .{ .bind = .{ .name = "prefs", .label = "Preferences…", .detailed = "term.prefs", .icon = "preferences-system-symbolic", .action = .prefs_open } },
-    .{ .bind = .{ .name = "welcome", .label = "Welcome Tour", .detailed = "term.welcome", .icon = "help-about-symbolic", .action = .welcome_open } },
+    .{ .bind = .{ .label = "Clear Scrollback", .icon = "edit-clear-all-symbolic", .action = .clear_scrollback } },
+    .{ .bind = .{ .label = "Reset Terminal", .icon = "view-refresh-symbolic", .action = .reset_terminal } },
+    .{ .bind = .{ .label = "Preferences…", .icon = "preferences-system-symbolic", .action = .prefs_open } },
+    .{ .bind = .{ .label = "Welcome Tour", .icon = "help-about-symbolic", .action = .welcome_open } },
 };
 
-/// Flat view of every action row (top-level and submenu children) —
+/// Flat view of every action row (top-level and submenu children),
 /// the action-group registration source.
 const BINDS = blk: {
     var n: usize = 0;
@@ -232,6 +170,43 @@ const BINDS = blk: {
     };
     break :blk arr;
 };
+
+/// The action group every menu-bearing widget carries.
+const GROUP = "term";
+const GROUP_PREFIX = GROUP ++ ".";
+
+/// The detailed GAction name every action is registered under: the
+/// group prefix, then its tag with `_` spelled `-`, since a GAction
+/// name may not contain `_`.
+const GACTION_DETAILED = blk: {
+    @setEvalBranchQuota(20_000);
+    const fields = @typeInfo(Action).@"enum".fields;
+    var names: [fields.len][:0]const u8 = undefined;
+    for (fields, 0..) |f, i| {
+        var buf = [_:0]u8{0} ** (GROUP_PREFIX.len + f.name.len);
+        @memcpy(buf[0..GROUP_PREFIX.len], GROUP_PREFIX);
+        for (f.name, 0..) |ch, j| buf[GROUP_PREFIX.len + j] = if (ch == '_') '-' else ch;
+        const final = buf;
+        names[i] = &final;
+    }
+    break :blk names;
+};
+
+fn detailedName(action: Action) [:0]const u8 {
+    return GACTION_DETAILED[@intFromEnum(action)];
+}
+
+fn gactionName(action: Action) [:0]const u8 {
+    return detailedName(action)[GROUP_PREFIX.len..];
+}
+
+/// Enable or disable one row's action in a menu's group (the pre-popup
+/// hook's per-pane state); an action without a row is ignored.
+pub fn setEnabled(group: *c.GSimpleActionGroup, action: Action, enabled: bool) void {
+    if (c.g_action_map_lookup_action(@ptrCast(group), gactionName(action).ptr)) |act| {
+        c.g_simple_action_set_enabled(@ptrCast(@alignCast(act)), @intFromBool(enabled));
+    }
+}
 
 const N_SUBMENUS = blk: {
     var n: usize = 0;
@@ -283,26 +258,22 @@ const N_HOST_WIDGETS = blk: {
     break :blk n;
 };
 
-/// This spec's wording and icon for one action, so another surface
-/// can offer the same verb without a second copy of either. The
-/// window hamburger is the consumer: its rows are this table's rows,
-/// dispatched through the same `Sink`, so a relabelled verb moves in
-/// both places at once.
-///
-/// `Action` has exactly one row (pinned by a test below), which is
-/// what makes the lookup total.
-pub fn labelFor(action: Action) [*:0]const u8 {
+fn bindFor(comptime action: Action) Bind {
     for (BINDS) |b| {
-        if (b.action == action) return b.label;
+        if (b.action == action) return b;
     }
-    unreachable;
+    @compileError("no pane-menu row for action " ++ @tagName(action));
 }
 
-pub fn iconFor(action: Action) [*:0]const u8 {
-    for (BINDS) |b| {
-        if (b.action == action) return b.icon;
-    }
-    unreachable;
+/// This spec's wording for one action, so another surface (the window
+/// hamburger, the tab-strip menu) offers the same verb without a
+/// second copy of it; a relabelled verb moves in every menu at once.
+pub fn labelFor(comptime action: Action) [*:0]const u8 {
+    return comptime bindFor(action).label;
+}
+
+pub fn iconFor(comptime action: Action) [*:0]const u8 {
+    return comptime bindFor(action).icon;
 }
 
 /// Widget data key under which a menu-bearing widget publishes its
@@ -368,7 +339,7 @@ pub fn attachWithPrePopup(
     for (BINDS) |b| {
         const slot = try allocator.create(ActionSlot);
         slot.* = .{ .allocator = allocator, .sink = sink, .sink_ctx = sink_ctx, .action = b.action };
-        const act = c.g_simple_action_new(b.name, null);
+        const act = c.g_simple_action_new(gactionName(b.action).ptr, null);
         _ = c.g_signal_connect_data(
             act,
             "activate",
@@ -380,16 +351,14 @@ pub fn attachWithPrePopup(
         c.g_action_map_add_action(@ptrCast(group), @ptrCast(act));
         c.g_object_unref(act);
     }
-    c.gtk_widget_insert_action_group(widget, "term", @ptrCast(group));
+    c.gtk_widget_insert_action_group(widget, GROUP, @ptrCast(group));
     c.g_object_unref(group);
 
     // Link + mux + file-transfer actions default disabled; the pane's
     // pre-popup hook enables them per-popup. Their rows show/hide on
     // that state.
-    for ([_][*:0]const u8{ "open-link", "copy-link", "mux-detach", "mux-rename", "mux-kill", "upload-file", "download-file", "record-stop" }) |name| {
-        if (c.g_action_map_lookup_action(@ptrCast(group), name)) |act| {
-            c.g_simple_action_set_enabled(@ptrCast(@alignCast(act)), 0);
-        }
+    for ([_]Action{ .open_link, .copy_link, .mux_detach, .mux_rename, .mux_kill, .upload_file, .download_file, .record_session_stop }) |a| {
+        setEnabled(@ptrCast(group), a, false);
     }
 
     // Popover: a custom GtkPopover holding a column of icon+label
@@ -447,7 +416,7 @@ pub fn attachWithPrePopup(
             },
             .bind => |b| {
                 const btn = menuchrome.makeRow(b.icon, b.label, false);
-                c.gtk_actionable_set_action_name(@ptrCast(btn), b.detailed);
+                c.gtk_actionable_set_action_name(@ptrCast(btn), detailedName(b.action).ptr);
                 _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&menuchrome.onItemClicked), @ptrCast(popover), null, c.G_CONNECT_DEFAULT);
                 c.gtk_box_append(@ptrCast(list), btn);
                 if (b.link_only) {
@@ -472,7 +441,7 @@ pub fn attachWithPrePopup(
                 const sub_list = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
                 for (s.items) |b| {
                     const child = menuchrome.makeRow(b.icon, b.label, false);
-                    c.gtk_actionable_set_action_name(@ptrCast(child), b.detailed);
+                    c.gtk_actionable_set_action_name(@ptrCast(child), detailedName(b.action).ptr);
                     _ = c.g_signal_connect_data(child, "clicked", @ptrCast(&menuchrome.onItemClicked), @ptrCast(popover), null, c.G_CONNECT_DEFAULT);
                     c.gtk_box_append(@ptrCast(sub_list), child);
                     if (b.host_only) {
@@ -528,52 +497,24 @@ pub fn popupAt(widget: *c.GtkWidget, x: f64, y: f64) bool {
     return showAt(ctx, x, y);
 }
 
-test "menu: label/icon lookup answers for every action" {
-    // `labelFor`/`iconFor` are `unreachable` on a miss because the
-    // one-row-per-Action test below makes a miss impossible; this
-    // walks every arm so the pair is proven total, not assumed.
-    inline for (@typeInfo(Action).@"enum".fields) |field| {
-        const a: Action = @enumFromInt(field.value);
-        try std.testing.expect(std.mem.span(labelFor(a)).len != 0);
-        try std.testing.expect(std.mem.span(iconFor(a)).len != 0);
-    }
-}
-
-test "menu: every row's detailed action name matches its bare name" {
-    // A typo here produces a row that LOOKS enabled and does nothing
-    // when clicked: gtk_actionable_set_action_name silently accepts an
-    // action that the group does not contain. The action-group
-    // registration below uses `name`, the button uses `detailed`, so
-    // the two must agree or the row is dead.
+test "menu: registered and detailed action names agree" {
+    // A mismatch produces a row that LOOKS enabled and does nothing when
+    // clicked: gtk_actionable_set_action_name silently accepts an action
+    // the group does not contain.
     for (BINDS) |b| {
-        const bare = std.mem.span(b.name);
-        const detailed = std.mem.span(b.detailed);
-        try std.testing.expect(std.mem.startsWith(u8, detailed, "term."));
-        try std.testing.expectEqualStrings(bare, detailed["term.".len..]);
+        const detailed = detailedName(b.action);
+        try std.testing.expect(std.mem.startsWith(u8, detailed, GROUP_PREFIX));
+        try std.testing.expectEqualStrings(gactionName(b.action), detailed[GROUP_PREFIX.len..]);
+        try std.testing.expect(std.mem.indexOfScalar(u8, gactionName(b.action), '_') == null);
+        try std.testing.expect(c.g_action_name_is_valid(gactionName(b.action).ptr) != 0);
     }
 }
 
-test "menu: row names are unique" {
-    // Duplicates would make g_action_map_add_action overwrite the
-    // first registration, so one of the two rows would drive the
-    // other's Action.
+test "menu: no action has two rows" {
+    // Two rows for one action would register the same GAction twice,
+    // and the second registration silently replaces the first.
     for (BINDS, 0..) |a, i| {
-        for (BINDS[i + 1 ..]) |b| {
-            try std.testing.expect(!std.mem.eql(u8, std.mem.span(a.name), std.mem.span(b.name)));
-        }
-    }
-}
-
-test "menu: every Action has exactly one row" {
-    // Adding an Action without a row (or two rows for one Action)
-    // is otherwise invisible until someone hunts for a missing item.
-    inline for (@typeInfo(Action).@"enum".fields) |field| {
-        const want: Action = @enumFromInt(field.value);
-        var seen: usize = 0;
-        for (BINDS) |b| {
-            if (b.action == want) seen += 1;
-        }
-        try std.testing.expectEqual(@as(usize, 1), seen);
+        for (BINDS[i + 1 ..]) |b| try std.testing.expect(a.action != b.action);
     }
 }
 
@@ -679,12 +620,12 @@ fn showAtPrepared(ctx: *ClickCtx, x: f64, y: f64) bool {
     //   - Session submenu (detach/rename/kill) → durable session.
     //   - Link rows (open/copy) → a link under the click.
     //   - File-transfer rows (upload/download) → a remote-host session.
-    menuchrome.setGroupVisible(ctx.group, "mux-detach", &ctx.remote_widgets);
-    menuchrome.setGroupVisible(ctx.group, "copy-link", &ctx.link_widgets);
-    menuchrome.setGroupVisible(ctx.group, "show-web", &ctx.web_widgets);
-    menuchrome.setGroupVisible(ctx.group, "upload-file", &ctx.host_widgets);
-    menuchrome.setGroupVisible(ctx.group, "record-session", &ctx.rec_start_widgets);
-    menuchrome.setGroupVisible(ctx.group, "record-stop", &ctx.rec_stop_widgets);
+    menuchrome.setGroupVisible(ctx.group, gactionName(.mux_detach).ptr, &ctx.remote_widgets);
+    menuchrome.setGroupVisible(ctx.group, gactionName(.copy_link).ptr, &ctx.link_widgets);
+    menuchrome.setGroupVisible(ctx.group, gactionName(.toggle_web_face).ptr, &ctx.web_widgets);
+    menuchrome.setGroupVisible(ctx.group, gactionName(.upload_file).ptr, &ctx.host_widgets);
+    menuchrome.setGroupVisible(ctx.group, gactionName(.record_session).ptr, &ctx.rec_start_widgets);
+    menuchrome.setGroupVisible(ctx.group, gactionName(.record_session_stop).ptr, &ctx.rec_stop_widgets);
     // Fresh popup: no submenu open.
     for (ctx.subs) |maybe_sub| {
         const sub = maybe_sub orelse continue;

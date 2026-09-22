@@ -1,7 +1,6 @@
-//! Keyboard input → xterm byte encoding → PTY write.
-//!
-//! Subset implemented in M4. Full xterm spec + modifyOtherKeys=1
-//! and CSI u progressive enhancement come later.
+//! Keyboard input: the binding table and the pane tier of action
+//! dispatch (`runAction`), then xterm / modifyOtherKeys / kitty CSI u
+//! key encoding for everything a binding did not claim.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -57,6 +56,15 @@ pub const Ctx = struct {
     /// Menu / Shift+F10). @return false when the pane has no menu
     /// attached yet, so the key falls through to the child.
     context_menu: ?*const fn (ctx: ?*anyopaque) bool = null,
+    /// Swap the pane's panel and terminal faces. @return false when the
+    /// pane has no panel face, so the key falls through.
+    panel_toggle: ?*const fn (ctx: ?*anyopaque) bool = null,
+    /// Open (`copy` false) or copy the hyperlink the context menu was
+    /// raised on. @return false when no link was captured.
+    link_verb: ?*const fn (ctx: ?*anyopaque, copy: bool) bool = null,
+    /// A verb changed the selection host-side (no daemon event will
+    /// announce it), so assistive technology must be told.
+    selection_changed: ?*const fn (ctx: ?*anyopaque) void = null,
     /// Optional shortcut sink for tab/split/etc actions. May be null
     /// for top-level shortcuts handled elsewhere.
     shortcut_sink: ?*const fn (ctx: ?*anyopaque, action: Action) void = null,
@@ -106,7 +114,8 @@ const REPEAT_WINDOW_US: i64 = 120_000;
 /// The action vocabulary, defined GTK-free in `action.zig` and
 /// re-exported here so `input.Action` keeps resolving. Add new actions
 /// there, not here.
-pub const Action = @import("action.zig").Action;
+const action_mod = @import("action.zig");
+pub const Action = action_mod.Action;
 
 /// One configured keybind: a (keyval, modifier-mask) → Action mapping.
 pub const Binding = struct {
@@ -124,6 +133,8 @@ const bindings_before_tree = [_]Binding{
     // Ctrl+Shift+...
     .{ .keyval = c.GDK_KEY_t, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .new_tab },
     .{ .keyval = c.GDK_KEY_w, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .close_tab },
+    // The added Alt picks the smaller unit: the focused pane.
+    .{ .keyval = c.GDK_KEY_w, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK | c.GDK_ALT_MASK, .action = .close_pane },
     .{ .keyval = c.GDK_KEY_d, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .split_h },
     .{ .keyval = c.GDK_KEY_r, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .split_v },
     .{ .keyval = c.GDK_KEY_f, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .search_open },
@@ -237,6 +248,7 @@ const macos_app_bindings = [_]Binding{
     // Cmd+...
     .{ .keyval = c.GDK_KEY_t, .mods = c.GDK_META_MASK, .action = .new_tab },
     .{ .keyval = c.GDK_KEY_w, .mods = c.GDK_META_MASK, .action = .close_tab },
+    .{ .keyval = c.GDK_KEY_w, .mods = c.GDK_META_MASK | c.GDK_SHIFT_MASK | c.GDK_ALT_MASK, .action = .close_pane },
     .{ .keyval = c.GDK_KEY_d, .mods = c.GDK_META_MASK, .action = .split_h },
     .{ .keyval = c.GDK_KEY_d, .mods = c.GDK_META_MASK | c.GDK_SHIFT_MASK, .action = .split_v },
     .{ .keyval = c.GDK_KEY_f, .mods = c.GDK_META_MASK, .action = .search_open },
@@ -411,127 +423,21 @@ pub fn rebuildBindings(list: *std.ArrayList(Binding), ally: std.mem.Allocator, k
     }
 }
 
-/// Convert an Action to its config-key string form. Stable across
-/// versions — config files reference these names. Inverse: `actionFromName`.
-pub fn actionName(a: Action) []const u8 {
-    return switch (a) {
-        .new_tab => "new_tab",
-        .close_tab => "close_tab",
-        .next_tab => "next_tab",
-        .prev_tab => "prev_tab",
-        .copy => "copy",
-        .paste => "paste",
-        .split_h => "split_h",
-        .split_v => "split_v",
-        .font_inc => "font_inc",
-        .font_dec => "font_dec",
-        .font_reset => "font_reset",
-        .search_open => "search_open",
-        .cross_search => "cross_search",
-        .attach_all => "attach_all",
-        .save_layout => "save_layout",
-        .save_layout_as => "save_layout_as",
-        .save_default_layout => "save_default_layout",
-        .load_layout => "load_layout",
-        .prompt_prev => "prompt_prev",
-        .prompt_next => "prompt_next",
-        .pane_next => "pane_next",
-        .pane_prev => "pane_prev",
-        .prefs_open => "prefs_open",
-        .welcome_open => "welcome_open",
-        .broadcast_cycle => "broadcast_cycle",
-        .restore_closed_tab => "restore_closed_tab",
-        .toggle_pin_tab => "toggle_pin_tab",
-        .toggle_tab_bar => "toggle_tab_bar",
-        .toggle_tab_sidebar => "toggle_tab_sidebar",
-        .tab_collapse => "tab_collapse",
-        .tab_expand => "tab_expand",
-        .tab_tree_next => "tab_tree_next",
-        .tab_tree_prev => "tab_tree_prev",
-        .reload_config => "reload_config",
-        .launch_app => "launch_app",
-        .app_windows => "app_windows",
-        .goto_tab_1 => "goto_tab_1",
-        .goto_tab_2 => "goto_tab_2",
-        .goto_tab_3 => "goto_tab_3",
-        .goto_tab_4 => "goto_tab_4",
-        .goto_tab_5 => "goto_tab_5",
-        .goto_tab_6 => "goto_tab_6",
-        .goto_tab_7 => "goto_tab_7",
-        .goto_tab_8 => "goto_tab_8",
-        .goto_tab_9 => "goto_tab_9",
-        .duplicate_tab => "duplicate_tab",
-        .detach_tab => "detach_tab",
-        .configure_shader => "configure_shader",
-        .shader_preset_pick => "shader_preset_pick",
-        .apply_profile => "apply_profile",
-        .show_scrollback => "show_scrollback",
-        .new_durable_tab => "new_durable_tab",
-        .new_browser_tab => "new_browser_tab",
-        .new_browser_split => "new_browser_split",
-        .new_web_tab => "new_web_tab",
-        .new_web_split => "new_web_split",
-        .new_incognito_web_tab => "new_incognito_web_tab",
-        .new_tor_web_tab => "new_tor_web_tab",
-        .web_route_menu => "web_route_menu",
-        .web_route_direct => "web_route_direct",
-        .web_route_tor => "web_route_tor",
-        .web_hints => "web_hints",
-        .web_reader => "web_reader",
-        .web_discard_background => "web_discard_background",
-        .web_devtools => "web_devtools",
-        .web_print_pdf => "web_print_pdf",
-        .web_fill_password => "web_fill_password",
-        .web_site_info => "web_site_info",
-        .web_history => "web_history",
-        .web_bookmarks => "web_bookmarks",
-        .close_pane => "close_pane",
-        .toggle_browser_face => "toggle_browser_face",
-        .new_editor_tab => "new_editor_tab",
-        .new_editor_split => "new_editor_split",
-        .toggle_editor_face => "toggle_editor_face",
-        .toggle_web_face => "toggle_web_face",
-        .panel_open => "panel_open",
-        .panel_close => "panel_close",
-        .mux_detach => "mux_detach",
-        .paste_clipboard => "paste_clipboard",
-        .copy_selection => "copy_selection",
-        .copy_screen => "copy_screen",
-        .copy_scrollback => "copy_scrollback",
-        .copy_command_output => "copy_command_output",
-        .select_command_output => "select_command_output",
-        .interrupt_or_copy => "interrupt_or_copy",
-        .clear_and_scrollback => "clear_and_scrollback",
-        .clear_scrollback => "clear_scrollback",
-        .scrollback_page_up => "scrollback_page_up",
-        .scrollback_page_down => "scrollback_page_down",
-        .scrollback_top => "scrollback_top",
-        .scrollback_bottom => "scrollback_bottom",
-        .command_palette => "command_palette",
-        .hints_open => "hints_open",
-        .copy_mode => "copy_mode",
-        .zoom_pane => "zoom_pane",
-        .select_all => "select_all",
-        .context_menu => "context_menu",
-    };
-}
-
-pub fn actionFromName(name: []const u8) ?Action {
-    inline for (@typeInfo(Action).@"enum".fields) |field| {
-        if (std.mem.eql(u8, name, field.name)) return @enumFromInt(field.value);
-    }
-    return null;
-}
+/// The config-key / IPC spelling of an action (its tag name); see
+/// `action.zig` for the aliases `actionFromName` also accepts.
+pub const actionName = action_mod.name;
+pub const actionFromName = action_mod.fromName;
 
 /// Human-friendly label for the prefs UI.
 pub fn actionLabel(a: Action) []const u8 {
     return switch (a) {
         .new_tab => "New tab",
+        .new_tab_as_profile => "New tab as profile…",
         .close_tab => "Close tab",
         .next_tab => "Next tab",
         .prev_tab => "Previous tab",
-        .copy => "Copy",
-        .paste => "Paste",
+        .rename_tab => "Rename tab…",
+        .color_tab => "Tab colour…",
         .split_h => "Split horizontal",
         .split_v => "Split vertical",
         .font_inc => "Increase font size",
@@ -575,7 +481,19 @@ pub fn actionLabel(a: Action) []const u8 {
         .detach_tab => "Detach tab into a new window",
         .configure_shader => "Configure shader (sliders for the pane's shader params)",
         .shader_preset_pick => "Shader preset (apply or delete a saved shader preset)",
+        .shader_pick => "Pick a shader file for this pane…",
+        .shader_clear => "Clear this pane's shader",
         .apply_profile => "Apply profile to pane (colors, font, scrollback…)",
+        .set_pane_title => "Set pane title…",
+        .screenshot_pane => "Screenshot pane to a PNG…",
+        .record_session => "Record session (asciicast)…",
+        .record_session_stop => "Stop session recording",
+        .upload_file => "Upload a file to this pane's host…",
+        .download_file => "Download a file from this pane's host…",
+        .mux_rename => "Rename mux session…",
+        .mux_kill => "Kill mux session",
+        .files_browse_here => "Browse files here (this pane)",
+        .files_open_app => "Open this directory in Sketerm Files",
         .show_scrollback => "Show scrollback in pager",
         .new_durable_tab => "New durable tab (mux)",
         .new_browser_tab => "New file browser tab",
@@ -602,6 +520,7 @@ pub fn actionLabel(a: Action) []const u8 {
         .new_editor_split => "Split into a text editor pane",
         .toggle_editor_face => "Show the text editor / show the shell (this pane)",
         .toggle_web_face => "Show the web browser / show the shell (this pane)",
+        .toggle_panel_face => "Show the panel / show the shell (this pane)",
         .panel_open => "Open a saved panel (this session's stored documents)…",
         .panel_close => "Close the panel on this pane, its tab, or the window's only one",
         .mux_detach => "Detach mux session (pane drops to a local shell)",
@@ -624,6 +543,9 @@ pub fn actionLabel(a: Action) []const u8 {
         .zoom_pane => "Zoom pane (fill the tab; toggle)",
         .select_all => "Select all (scrollback + screen)",
         .context_menu => "Open the context menu at the cursor",
+        .reset_terminal => "Reset terminal",
+        .open_link => "Open the link under the context menu",
+        .copy_link => "Copy the link under the context menu",
     };
 }
 
@@ -1035,6 +957,19 @@ pub fn runAction(ctx: *Ctx, action: Action) c.gboolean {
             const flip = ctx.web_toggle orelse return 0;
             return if (flip(ctx.pane_ctx)) 1 else 0;
         },
+        .toggle_panel_face => {
+            const flip = ctx.panel_toggle orelse return 0;
+            return if (flip(ctx.pane_ctx)) 1 else 0;
+        },
+        .open_link, .copy_link => {
+            const verb = ctx.link_verb orelse return 0;
+            return if (verb(ctx.pane_ctx, action == .copy_link)) 1 else 0;
+        },
+        .reset_terminal => {
+            ctx.terminal.screen.fullReset();
+            c.gtk_gl_area_queue_render(@ptrCast(ctx.widget));
+            return 1;
+        },
         // One hints chord, face decides: a pane wearing the web face
         // gets LINK hints (the terminal quick-select would scan the
         // hidden shell under it); otherwise the window-level sink runs
@@ -1062,6 +997,7 @@ pub fn runAction(ctx: *Ctx, action: Action) c.gboolean {
             screen.selection.extend(last_row, @intCast(screen.cols));
             screen.dirty = true;
             c.gtk_gl_area_queue_render(@ptrCast(ctx.widget));
+            notifySelection(ctx);
             return 1;
         },
         .paste_clipboard => {
@@ -1096,6 +1032,7 @@ pub fn runAction(ctx: *Ctx, action: Action) c.gboolean {
             const row = screen.rowForLineIdFast(z.start_id) orelse return 1;
             if (screen.selectCmdZoneAt(row)) {
                 c.gtk_widget_queue_draw(ctx.widget);
+                notifySelection(ctx);
             }
             return 1;
         },
@@ -1180,7 +1117,12 @@ fn copySelection(ctx: *Ctx) void {
         screen.selection.clear();
         screen.dirty = true;
         c.gtk_gl_area_queue_render(@ptrCast(ctx.widget));
+        notifySelection(ctx);
     }
+}
+
+fn notifySelection(ctx: *Ctx) void {
+    if (ctx.selection_changed) |f| f(ctx.pane_ctx);
 }
 
 fn copyScreen(ctx: *Ctx) void {

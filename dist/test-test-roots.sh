@@ -75,7 +75,7 @@ while IFS= read -r module; do
             class=cef
             ;;
         # Deliberate GTK-free model/data exceptions under ui/.
-        ui/tabforest.zig|ui/debounce.zig|ui/commandcat.zig|ui/panel/canary.zig|ui/panel/doc.zig|ui/panel/assets.zig|ui/panel/events.zig)
+        ui/action.zig|ui/tabforest.zig|ui/debounce.zig|ui/commandcat.zig|ui/panel/canary.zig|ui/panel/doc.zig|ui/panel/assets.zig|ui/panel/events.zig)
             class=core
             ;;
         # Toolkit/render modules and the few GUI-dependency outliers outside

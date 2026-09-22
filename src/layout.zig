@@ -1,7 +1,8 @@
 //! Layout — save/restore window topology + per-pane cwd/command.
 //!
-//! Schema v2: tabs each carry a Tree (pane | split), recursive.
-//! v1 saves are still parseable (loader fallback below).
+//! Schema v2: tabs each carry a Tree (pane | split), recursive. v1
+//! was never released, so v2 is the oldest shape on disk; later
+//! fields are all optional so older v2 files keep parsing.
 
 const std = @import("std");
 const c = @import("c.zig").c;
@@ -9,6 +10,7 @@ const browser_model = @import("filebrowser/model.zig");
 const editor_model = @import("editor/model.zig");
 const web_model = @import("web/model.zig");
 const atomicwrite = @import("util/atomicwrite.zig");
+const readfile = @import("util/readfile.zig");
 
 /// Ceiling for a serialized layout, both on save and on load. It is
 /// deliberately far above any plausible session: at 1MB a big session
@@ -129,18 +131,11 @@ fn serialiseForSave(layout: Layout, w: *std.Io.Writer) !void {
     try std.json.Stringify.value(layout, .{ .whitespace = .indent_2 }, w);
 }
 
+/// @return error.BadFile when the file is absent, empty, over
+/// `MAX_FILE_BYTES` or unreadable.
 pub fn load(allocator: std.mem.Allocator, path: []const u8) !std.json.Parsed(Layout) {
-    var path_z: [4096]u8 = undefined;
-    const fp = c.fopen(try pathZ(&path_z, path), "rb") orelse return error.OpenFailed;
-    defer _ = c.fclose(fp);
-    if (c.fseek(fp, 0, c.SEEK_END) != 0) return error.ReadFailed;
-    const size_long = c.ftell(fp);
-    if (size_long <= 0 or size_long > MAX_FILE_BYTES) return error.BadFile;
-    if (c.fseek(fp, 0, c.SEEK_SET) != 0) return error.ReadFailed;
-    const size: usize = @intCast(size_long);
-    const bytes = try allocator.alloc(u8, size);
+    const bytes = (try readfile.sized(allocator, path, MAX_FILE_BYTES)) orelse return error.BadFile;
     defer allocator.free(bytes);
-    if (c.fread(bytes.ptr, 1, size, fp) != size) return error.ShortRead;
     return try std.json.parseFromSlice(Layout, allocator, bytes, .{
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,

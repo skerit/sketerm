@@ -47,7 +47,7 @@ const menu = @import("menu.zig");
 const clipboard = @import("clipboard.zig");
 const MouseAction = @import("../config.zig").MouseAction;
 pub const InputCtx = input.Ctx;
-pub const MenuAction = menu.Action;
+const Action = input.Action;
 
 pub const FONT_CANDIDATES = @import("terminal_surface.zig").FONT_CANDIDATES;
 
@@ -74,9 +74,6 @@ pub const Pane = struct {
     ax_selfcheck_done: bool = false,
     allocator: std.mem.Allocator,
     input_ctx: ?*input.Ctx = null,
-    /// External sink for menu actions (set by Window).
-    menu_sink: ?menu.Sink = null,
-    menu_sink_ctx: ?*anyopaque = null,
     /// Window-level forwarding for terminal sinks.
     win_title_ctx: ?*anyopaque = null,
     win_on_title: ?*const fn (ctx: ?*anyopaque, pane: *Pane, title: []const u8) void = null,
@@ -550,6 +547,9 @@ pub const Pane = struct {
             ictx.browser_toggle = toggleBrowserFaceSink;
             ictx.editor_toggle = toggleEditorFaceSink;
             ictx.web_toggle = toggleWebFaceSink;
+            ictx.panel_toggle = togglePanelFaceSink;
+            ictx.link_verb = linkVerbSink;
+            ictx.selection_changed = selectionChangedSink;
             ictx.context_menu = contextMenuAtCursorSink;
         }
 
@@ -625,83 +625,15 @@ pub const Pane = struct {
         return self;
     }
 
-    /// Run a context-menu verb on this pane from a surface that is not
-    /// the pane's own popover — the window hamburger. Goes through the
-    /// SAME sink a right-click row does, so pane-local handling and the
-    /// Window fallback both stay in one place.
-    pub fn runMenuAction(self: *Pane, action: menu.Action) void {
-        paneMenuSink(@ptrCast(self), action);
-    }
-
-    fn handleMenuLocal(self: *Pane, action: menu.Action) bool {
-        switch (action) {
-            .copy => {
-                if (!self.terminal.screen.selection.isActive()) return true;
-                const text = self.terminal.screen.extractSelection(self.allocator) catch return true;
-                defer self.allocator.free(text);
-                if (text.len == 0) return true;
-                clipboard.copyText(self.allocator, @ptrCast(self.surface.area), text);
-                if (self.clear_select_on_copy) {
-                    self.terminal.screen.selection.clear();
-                    self.terminal.screen.dirty = true;
-                    c.gtk_gl_area_queue_render(@ptrCast(self.surface.area));
-                    self.a11yNudge();
-                }
-                return true;
-            },
-            .paste => {
-                clipboard.pasteFromClipboard(@ptrCast(self.surface.area), self.terminal);
-                return true;
-            },
-            .copy_output => {
-                const maybe = self.terminal.screen.extractLastCommandOutput(self.allocator) catch return true;
-                const text = maybe orelse return true;
-                defer self.allocator.free(text);
-                if (text.len == 0) return true;
-                clipboard.copyText(self.allocator, @ptrCast(self.surface.area), text);
-                return true;
-            },
-            .reset_terminal => {
-                self.terminal.screen.fullReset();
-                return true;
-            },
-            .copy_link => {
-                const uri = self.menu_link_uri orelse return true;
-                if (uri.len == 0) return true;
-                clipboard.copyText(self.allocator, @ptrCast(self.surface.area), uri);
-                return true;
-            },
-            .open_link => {
-                const uri = self.menu_link_uri orelse return true;
-                launchUri(uri);
-                return true;
-            },
-            .show_web_face => {
-                if (self.hasWebFace()) self.setWebVisible(true);
-                return true;
-            },
-            // These three already exist as keybind actions. Delegating
-            // keeps ONE implementation each: a menu row and its chord
-            // can never drift apart.
-            .select_all => {
-                const ictx = self.input_ctx orelse return true;
-                _ = input.runAction(ictx, .select_all);
-                self.a11yNudge();
-                return true;
-            },
-            .select_output => {
-                const ictx = self.input_ctx orelse return true;
-                _ = input.runAction(ictx, .select_command_output);
-                self.a11yNudge();
-                return true;
-            },
-            .clear_scrollback => {
-                const ictx = self.input_ctx orelse return true;
-                _ = input.runAction(ictx, .clear_scrollback);
-                return true;
-            },
-            else => return false,
-        }
+    /// Run `action` on this pane: its own input tier first, then the
+    /// Window's shortcut sink, which is the same path a keybind takes.
+    /// A verb the pane declines (no face to swap to, no link captured)
+    /// still reaches the Window, which explains itself instead of doing
+    /// nothing.
+    pub fn runAction(self: *Pane, action: Action) void {
+        const ictx = self.input_ctx orelse return;
+        if (input.runAction(ictx, action) != 0) return;
+        if (ictx.shortcut_sink) |f| f(ictx.shortcut_ctx, action);
     }
 
     /// Wired into input.zig's `context_menu`: the Menu key / Shift+F10
@@ -770,6 +702,28 @@ pub const Pane = struct {
         if (!self.hasWebFace()) return false;
         self.setWebVisible(!self.webFaceVisible());
         return true;
+    }
+
+    fn togglePanelFaceSink(ctx: ?*anyopaque) bool {
+        return cast.userData(Pane, ctx).togglePanelFace();
+    }
+
+    /// Wired into input.zig's link_verb: open or copy the link the
+    /// context menu captured at popup time.
+    fn linkVerbSink(ctx: ?*anyopaque, copy: bool) bool {
+        const self = cast.userData(Pane, ctx);
+        const uri = self.menu_link_uri orelse return false;
+        if (uri.len == 0) return false;
+        if (copy) {
+            clipboard.copyText(self.allocator, @ptrCast(self.surface.area), uri);
+        } else {
+            launchUri(uri);
+        }
+        return true;
+    }
+
+    fn selectionChangedSink(ctx: ?*anyopaque) void {
+        cast.userData(Pane, ctx).a11yNudge();
     }
 
     /// Push the current selection to PRIMARY (always, for middle-
@@ -2413,10 +2367,8 @@ fn onAreaUnmap(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
     detachA11y(self);
 }
 
-fn paneMenuSink(ctx: ?*anyopaque, action: menu.Action) void {
-    const self = cast.userData(Pane, ctx);
-    if (self.handleMenuLocal(action)) return;
-    if (self.menu_sink) |f| f(self.menu_sink_ctx, action);
+fn paneMenuSink(ctx: ?*anyopaque, action: Action) void {
+    cast.userData(Pane, ctx).runAction(action);
 }
 
 /// Called just before the right-click context menu pops up. We
@@ -2454,20 +2406,13 @@ fn paneMenuPrePopup(ctx: ?*anyopaque, group: *c.GSimpleActionGroup, x: f64, y: f
     // hasContent, not isActive: a bare left click leaves an active
     // but empty selection, which would keep Copy sensitive and
     // copying nothing.
-    if (c.g_action_map_lookup_action(@ptrCast(group), "copy")) |act| {
-        c.g_simple_action_set_enabled(@ptrCast(@alignCast(act)), @intFromBool(screen.selection.hasContent()));
-    }
+    menu.setEnabled(group, .copy_selection, screen.selection.hasContent());
     const output_avail = screen.lastCommandOutputAvailable();
-    for ([_][*:0]const u8{ "copy-output", "select-output" }) |name| {
-        if (c.g_action_map_lookup_action(@ptrCast(group), name)) |act| {
-            c.g_simple_action_set_enabled(@ptrCast(@alignCast(act)), @intFromBool(output_avail));
-        }
-    }
+    menu.setEnabled(group, .copy_command_output, output_avail);
+    menu.setEnabled(group, .select_command_output, output_avail);
     // Nothing in the ring → nothing to clear, and Select All would
     // produce the same selection as selecting the screen.
-    if (c.g_action_map_lookup_action(@ptrCast(group), "clear-scrollback")) |act| {
-        c.g_simple_action_set_enabled(@ptrCast(@alignCast(act)), @intFromBool(screen.scrollbackCount() > 0));
-    }
+    menu.setEnabled(group, .clear_scrollback, screen.scrollbackCount() > 0);
 
     // The Session submenu splits into two independent conditions:
     //   - detach / rename / kill make sense on any DURABLE session
@@ -2480,33 +2425,18 @@ fn paneMenuPrePopup(ctx: ?*anyopaque, group: *c.GSimpleActionGroup, x: f64, y: f
     // its representative action is left disabled.
     const is_durable = if (self.terminal.remote) |r| !r.ephemeral else false;
     const is_host_remote = if (self.terminal.remote) |r| r.host != null else false;
-    for ([_][*:0]const u8{ "mux-detach", "mux-rename", "mux-kill" }) |name| {
-        if (c.g_action_map_lookup_action(@ptrCast(group), name)) |act| {
-            c.g_simple_action_set_enabled(@ptrCast(@alignCast(act)), @intFromBool(is_durable));
-        }
-    }
-    for ([_][*:0]const u8{ "upload-file", "download-file" }) |name| {
-        if (c.g_action_map_lookup_action(@ptrCast(group), name)) |act| {
-            c.g_simple_action_set_enabled(@ptrCast(@alignCast(act)), @intFromBool(is_host_remote));
-        }
-    }
+    for ([_]Action{ .mux_detach, .mux_rename, .mux_kill }) |a| menu.setEnabled(group, a, is_durable);
+    for ([_]Action{ .upload_file, .download_file }) |a| menu.setEnabled(group, a, is_host_remote);
 
     // Recording rows: exactly one of the start/stop pair shows,
     // tracking the session's asciicast recording state.
-    if (c.g_action_map_lookup_action(@ptrCast(group), "record-session")) |act| {
-        c.g_simple_action_set_enabled(@ptrCast(@alignCast(act)), @intFromBool(!self.terminal.recording));
-    }
-    if (c.g_action_map_lookup_action(@ptrCast(group), "record-stop")) |act| {
-        c.g_simple_action_set_enabled(@ptrCast(@alignCast(act)), @intFromBool(self.terminal.recording));
-    }
+    menu.setEnabled(group, .record_session, !self.terminal.recording);
+    menu.setEnabled(group, .record_session_stop, self.terminal.recording);
 
     // "Return to Browser": only while the pane carries a web face the
     // user has swapped away — the browser toolbar with every other way
     // back is invisible in exactly that state.
-    if (c.g_action_map_lookup_action(@ptrCast(group), "show-web")) |act| {
-        const hidden_web = self.hasWebFace() and !self.webFaceVisible();
-        c.g_simple_action_set_enabled(@ptrCast(@alignCast(act)), @intFromBool(hidden_web));
-    }
+    menu.setEnabled(group, .toggle_web_face, self.hasWebFace() and !self.webFaceVisible());
 
     // Free any URI captured from a previous popup.
     if (self.menu_link_uri) |old| {
@@ -2608,11 +2538,8 @@ fn paneMenuPrePopup(ctx: ?*anyopaque, group: *c.GSimpleActionGroup, x: f64, y: f
         }
     }
 
-    for ([_][*:0]const u8{ "copy-link", "open-link" }) |name| {
-        if (c.g_action_map_lookup_action(@ptrCast(group), name)) |act| {
-            c.g_simple_action_set_enabled(@ptrCast(@alignCast(act)), if (has_link) 1 else 0);
-        }
-    }
+    menu.setEnabled(group, .copy_link, has_link);
+    menu.setEnabled(group, .open_link, has_link);
     return true;
 }
 

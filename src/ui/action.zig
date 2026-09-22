@@ -11,15 +11,27 @@
 //!
 //! `input.zig` re-exports this as `input.Action`, so every existing
 //! reference keeps working against a single definition.
+//!
+//! It is the ONE verb vocabulary: keybinds, the command palette, the
+//! pane context menu, the window hamburger, the tab-strip menu and the
+//! remote-control `action` command all name these members and reach
+//! them through the same dispatch (`input.runAction`, then the Window's
+//! shortcut sink). The tag name is the stable config/IPC spelling.
+
+const std = @import("std");
 
 pub const Action = enum {
     // Window-level (dispatched via shortcut_sink to Window).
     new_tab,
+    /// Pick a profile, then open a new tab wearing it.
+    new_tab_as_profile,
     close_tab,
     next_tab,
     prev_tab,
-    copy,
-    paste,
+    /// Rename the current tab (inline title editor).
+    rename_tab,
+    /// Pick a colour for the current tab's strip entry.
+    color_tab,
     split_h,
     split_v,
     font_inc,
@@ -35,9 +47,8 @@ pub const Action = enum {
     /// Save the current tab/split layout as the user's default,
     /// auto-loaded on every subsequent cold start.
     save_default_layout,
-    /// Pick a saved layout file (.json/.layout) and load its tabs
-    /// into the current window — appends, mirroring the `--layout`
-    /// CLI flag's semantics (existing tabs are left in place).
+    /// Pick a saved layout file (.json/.layout) and open its tabs in a
+    /// fresh window, leaving the current window's tabs untouched.
     load_layout,
     prompt_prev,
     prompt_next,
@@ -103,9 +114,34 @@ pub const Action = enum {
     configure_shader,
     /// Open the shader-preset picker (apply/delete saved presets).
     shader_preset_pick,
+    /// Pick a shader file for the focused pane.
+    shader_pick,
+    /// Drop the focused pane's custom shader.
+    shader_clear,
     /// Apply a profile's settings bundle to the focused LIVE pane
     /// (popover picker; "default" restores the Default settings).
     apply_profile,
+    /// Give the focused pane a title of its own (titlebar + tab).
+    set_pane_title,
+    /// Save the focused pane as a PNG through a save dialog.
+    screenshot_pane,
+    /// Start an asciicast recording of the focused session; the file is
+    /// written by the session's own host.
+    record_session,
+    /// Stop the focused session's asciicast recording.
+    record_session_stop,
+    /// Send a local file to the focused pane's remote host.
+    upload_file,
+    /// Fetch a file from the focused pane's remote host.
+    download_file,
+    /// Rename the focused durable mux session.
+    mux_rename,
+    /// Kill the focused durable mux session outright.
+    mux_kill,
+    /// Give the focused pane a file-browser face at its cwd.
+    files_browse_here,
+    /// Open the focused pane's cwd in the Sketerm Files application.
+    files_open_app,
     /// Dump scrollback + visible screen to a temp file and open it
     /// in a pager (`less -R +G`, or `$PAGER`) in a new tab. Kitty's
     /// show_scrollback equivalent.
@@ -198,6 +234,10 @@ pub const Action = enum {
     /// locally like toggle_browser_face; a pane without a web face
     /// leaves the key to the terminal.
     toggle_web_face,
+    /// Flip the focused pane between the declarative panel shown ON it
+    /// and its shell. Dispatched locally like toggle_browser_face; a
+    /// pane without a panel face leaves the key to the terminal.
+    toggle_panel_face,
     /// Open the saved-panel picker: every declarative panel document
     /// stored for the focused pane's session, opened in a tab of its
     /// own (src/ui/panelpicker.zig). The user's own way back to a
@@ -253,4 +293,51 @@ pub const Action = enum {
     /// anchored at the text cursor. Bound to the Menu key and
     /// Shift+F10 (the two cross-desktop conventions).
     context_menu,
+    /// Hard-reset the focused pane's screen (RIS).
+    reset_terminal,
+    /// Open the hyperlink the context menu was raised on; a pane with
+    /// no captured link leaves the key to the terminal.
+    open_link,
+    /// Copy the hyperlink the context menu was raised on.
+    copy_link,
 };
+
+/// Spellings that resolve to a member without being its tag, kept so
+/// config files and scripts written against them keep working.
+const aliases = [_]struct { name: []const u8, action: Action }{
+    // Documented `keybind.copy` / `keybind.paste` long before the
+    // members they meant were named.
+    .{ .name = "copy", .action = .copy_selection },
+    .{ .name = "paste", .action = .paste_clipboard },
+};
+
+comptime {
+    for (aliases) |a| {
+        if (std.meta.stringToEnum(Action, a.name) != null)
+            @compileError("action alias shadows a member: " ++ a.name);
+    }
+}
+
+/// The stable config/IPC name of `a`.
+pub fn name(a: Action) []const u8 {
+    return @tagName(a);
+}
+
+/// Inverse of `name`, also accepting the legacy aliases.
+pub fn fromName(n: []const u8) ?Action {
+    if (std.meta.stringToEnum(Action, n)) |a| return a;
+    for (aliases) |a| {
+        if (std.mem.eql(u8, a.name, n)) return a.action;
+    }
+    return null;
+}
+
+test "action names round-trip and the aliases resolve" {
+    inline for (@typeInfo(Action).@"enum".fields) |f| {
+        const a: Action = @field(Action, f.name);
+        try std.testing.expectEqual(@as(?Action, a), fromName(name(a)));
+    }
+    try std.testing.expectEqual(@as(?Action, .copy_selection), fromName("copy"));
+    try std.testing.expectEqual(@as(?Action, .paste_clipboard), fromName("paste"));
+    try std.testing.expectEqual(@as(?Action, null), fromName("no_such_action"));
+}

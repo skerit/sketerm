@@ -2394,24 +2394,30 @@ fn addKeybindRow(group: *c.AdwPreferencesGroup, ctx: *Ctx, which: @FieldType(Key
     c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
 }
 
+/// Whether config entry `name` binds this row's command. Terminal rows
+/// resolve through `actionFromName`, so a legacy alias (`keybind.copy`)
+/// is the row it always meant.
+fn keybindRowMatches(which: @FieldType(KeybindRowCtx, "which"), name: []const u8) bool {
+    return switch (which) {
+        .act => |a| input_mod.actionFromName(name) == a,
+        .ed => |cmd| std.mem.eql(u8, name, ecmd.name(cmd)),
+    };
+}
+
 fn refreshKeybindButtonLabel(rctx: *KeybindRowCtx) void {
     // Look up the active accel: config override wins, otherwise the
     // default table for this row's kind.
-    const action_name: []const u8 = switch (rctx.which) {
-        .act => |a| input_mod.actionName(a),
-        .ed => |cmd| ecmd.name(cmd),
-    };
     const list = switch (rctx.which) {
         .act => rctx.parent.cfg.keybinds.items,
         .ed => rctx.parent.cfg.editor_keybinds.items,
     };
     var accel: []const u8 = "";
     var found_in_config = false;
+    // The LAST matching entry is the one `rebuildBindings` leaves in force.
     for (list) |kb| {
-        if (std.mem.eql(u8, kb.name, action_name)) {
+        if (keybindRowMatches(rctx.which, kb.name)) {
             accel = kb.accel;
             found_in_config = true;
-            break;
         }
     }
     if (!found_in_config) {
@@ -2541,13 +2547,13 @@ fn setKeybind(rctx: *KeybindRowCtx, accel: []const u8) void {
     };
     const accel_dup = arena.dupe(u8, accel) catch return;
 
-    // Replace existing entry, or append.
-    for (list.items) |*entry| {
-        if (std.mem.eql(u8, entry.name, action_name)) {
-            entry.accel = accel_dup;
-            rctx.parent.ev();
-            return;
-        }
+    // Drop every entry binding this command (an alias spelling
+    // included), then append the canonical one.
+    var i: usize = 0;
+    while (i < list.items.len) {
+        if (keybindRowMatches(rctx.which, list.items[i].name)) {
+            _ = list.orderedRemove(i);
+        } else i += 1;
     }
     const name_dup = arena.dupe(u8, action_name) catch return;
     // The list's backing array lives in the prefs arena (cloneInto);

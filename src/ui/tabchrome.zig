@@ -6,13 +6,23 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const cast = @import("../util/cast.zig");
 const menuchrome = @import("menuchrome.zig");
+const menu = @import("menu.zig");
+const Action = @import("action.zig").Action;
 const Pane = @import("pane.zig").Pane;
 const winmod = @import("window.zig");
 const Window = winmod.Window;
 const tab_effects = @import("tab_effects.zig");
 const connectManualPopoverClose = winmod.connectManualPopoverClose;
 
-const TabMenuAction = enum { new_tab, rename, duplicate, color, pin, move_new_window, collapse, close_subtree, close };
+/// What a tab-strip menu row does: a shared `action.zig` verb, run
+/// on the selected page (the right-click already selected it) through
+/// the ordinary dispatch, or a verb about the CLICKED page itself,
+/// which no keybind has a way to name.
+const TabMenuAction = union(enum) {
+    verb: Action,
+    page: PageVerb,
+};
+const PageVerb = enum { move_new_window, collapse, close_subtree, close };
 const TabMenuToggleKind = enum { show_activity, warn_inactive };
 
 const TabMenuActionCtx = struct {
@@ -54,16 +64,16 @@ pub fn onTabContextMenu(ctx: ?*anyopaque, page: *c.AdwTabPage, anchor: *c.GtkWid
 
     const list = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
 
-    addTabMenuAction(self, popover, list, page, "New Tab", "tab-new-symbolic", .new_tab);
+    addTabMenuVerb(self, popover, list, page, .new_tab);
 
     c.gtk_box_append(@ptrCast(list), c.gtk_separator_new(c.GTK_ORIENTATION_HORIZONTAL));
 
-    addTabMenuAction(self, popover, list, page, "Rename Tab…", "document-edit-symbolic", .rename);
-    addTabMenuAction(self, popover, list, page, "Duplicate Tab", "edit-copy-symbolic", .duplicate);
-    addTabMenuAction(self, popover, list, page, "Tab Colour…", "color-select-symbolic", .color);
-    addTabMenuAction(self, popover, list, page, "Pin / Unpin Tab", "view-pin-symbolic", .pin);
+    addTabMenuVerb(self, popover, list, page, .rename_tab);
+    addTabMenuVerb(self, popover, list, page, .duplicate_tab);
+    addTabMenuVerb(self, popover, list, page, .color_tab);
+    addTabMenuVerb(self, popover, list, page, .toggle_pin_tab);
     if (c.adw_tab_view_get_n_pages(self.tab_view) > 1 and c.adw_tab_page_get_pinned(page) == 0)
-        addTabMenuAction(self, popover, list, page, "Move to New Window", "window-new-symbolic", .move_new_window);
+        addTabMenuAction(self, popover, list, page, "Move to New Window", "window-new-symbolic", .{ .page = .move_new_window });
 
     c.gtk_box_append(@ptrCast(list), c.gtk_separator_new(c.GTK_ORIENTATION_HORIZONTAL));
 
@@ -76,12 +86,12 @@ pub fn onTabContextMenu(ctx: ?*anyopaque, page: *c.AdwTabPage, anchor: *c.GtkWid
         c.gtk_box_append(@ptrCast(list), c.gtk_separator_new(c.GTK_ORIENTATION_HORIZONTAL));
         const collapse_label: [*:0]const u8 =
             if (self.tab_forest.isCollapsed(page)) "Expand Subtree" else "Collapse Subtree";
-        addTabMenuAction(self, popover, list, page, collapse_label, "view-list-symbolic", .collapse);
-        addTabMenuAction(self, popover, list, page, "Close Subtree", "edit-delete-symbolic", .close_subtree);
+        addTabMenuAction(self, popover, list, page, collapse_label, "view-list-symbolic", .{ .page = .collapse });
+        addTabMenuAction(self, popover, list, page, "Close Subtree", "edit-delete-symbolic", .{ .page = .close_subtree });
     }
 
     c.gtk_box_append(@ptrCast(list), c.gtk_separator_new(c.GTK_ORIENTATION_HORIZONTAL));
-    addTabMenuAction(self, popover, list, page, "Close Tab", "window-close-symbolic", .close);
+    addTabMenuAction(self, popover, list, page, "Close Tab", "window-close-symbolic", .{ .page = .close });
 
     // Measured on Adwaita/GTK 4.22: this box's minimum height EQUALS its
     // natural (366px with every conditional row, 430px once popover
@@ -90,6 +100,12 @@ pub fn onTabContextMenu(ctx: ?*anyopaque, page: *c.AdwTabPage, anchor: *c.GtkWid
     // the menu down the frame it maps. The scroller is the fix.
     menuchrome.setPopoverList(popover.?, list.?);
     c.gtk_popover_popup(@ptrCast(popover));
+}
+
+/// A row for a shared verb, worded exactly as the pane context menu
+/// words it.
+fn addTabMenuVerb(self: *Window, popover: *c.GtkWidget, list: *c.GtkWidget, page: *c.AdwTabPage, comptime verb: Action) void {
+    addTabMenuAction(self, popover, list, page, menu.labelFor(verb), menu.iconFor(verb), .{ .verb = verb });
 }
 
 /// Icon+label button row that runs a window method on the selected tab.
@@ -115,20 +131,16 @@ pub fn onTabMenuActionClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) v
     const a = cast.userData(TabMenuActionCtx, user);
     c.gtk_popover_popdown(@ptrCast(a.popover));
     switch (a.action) {
-        .new_tab => if (!a.window.newTabInBrowser()) {
-            a.window.newShellTab(null) catch {};
+        .verb => |verb| winmod.dispatchAction(a.window, verb),
+        .page => |verb| switch (verb) {
+            .move_new_window => if (pageStillOpen(a.window, a.page))
+                a.window.moveTabToNewWindow(a.page),
+            .collapse => if (pageStillOpen(a.window, a.page))
+                a.window.setTabCollapsed(a.page, !a.window.tab_forest.isCollapsed(a.page)),
+            .close_subtree => if (pageStillOpen(a.window, a.page))
+                a.window.closeTabSubtree(a.page),
+            .close => a.window.closeCurrentTab(),
         },
-        .rename => a.window.renameCurrentTab(),
-        .duplicate => a.window.duplicateCurrentTab(),
-        .color => chooseTabColor(a.window),
-        .pin => a.window.togglePinCurrentTab(),
-        .move_new_window => if (pageStillOpen(a.window, a.page))
-            a.window.moveTabToNewWindow(a.page),
-        .collapse => if (pageStillOpen(a.window, a.page))
-            a.window.setTabCollapsed(a.page, !a.window.tab_forest.isCollapsed(a.page)),
-        .close_subtree => if (pageStillOpen(a.window, a.page))
-            a.window.closeTabSubtree(a.page),
-        .close => a.window.closeCurrentTab(),
     }
 }
 

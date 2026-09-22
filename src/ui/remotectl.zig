@@ -1109,12 +1109,15 @@ fn paneRoute(action: input.Action) PaneRoute {
         .toggle_browser_face,
         .toggle_editor_face,
         .toggle_web_face,
+        .toggle_panel_face,
+        .reset_terminal,
+        .open_link,
+        .copy_link,
         => .pane_local,
 
-        // Window / application scoped. `copy` and `paste` are in the
-        // vocabulary but nothing implements them; they land here as the
-        // no-op they already were.
+        // Window / application scoped.
         .new_tab,
+        .new_tab_as_profile,
         .new_web_tab,
         .new_editor_tab,
         .new_incognito_web_tab,
@@ -1149,8 +1152,6 @@ fn paneRoute(action: input.Action) PaneRoute {
         .broadcast_cycle,
         .web_discard_background,
         .command_palette,
-        .copy,
-        .paste,
         => .window,
 
         // Everything else resolves a pane or a tab from focus and has no
@@ -1195,6 +1196,20 @@ fn paneRoute(action: input.Action) PaneRoute {
         .web_bookmarks,
         .panel_open,
         .panel_close,
+        .rename_tab,
+        .color_tab,
+        .shader_pick,
+        .shader_clear,
+        .set_pane_title,
+        .screenshot_pane,
+        .record_session,
+        .record_session_stop,
+        .upload_file,
+        .download_file,
+        .mux_rename,
+        .mux_kill,
+        .files_browse_here,
+        .files_open_app,
         => .focus_derived,
     };
 }

@@ -26,6 +26,10 @@
 const std = @import("std");
 const layout = @import("layout.zig");
 
+/// Ceiling for a `.layout` file on load. The format is hand-written, so
+/// a file this size is already far past anything a person types.
+pub const MAX_FILE_BYTES: usize = 1024 * 1024;
+
 /// A parsed simple-format layout. Owns its memory via the arena.
 pub const Parsed = struct {
     arena: std.heap.ArenaAllocator,
