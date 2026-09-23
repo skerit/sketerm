@@ -13,8 +13,10 @@
 //! breaks when a whitespace character follows a non-whitespace one, on
 //! `breakUndoGroup`, and on any non-typing transaction or undo/redo.
 //!
-//! Gotcha: `isDirty` compares revision numbers, so undoing back to the
-//! saved state still reads dirty (revisions only grow).
+//! Dirtiness is a POSITION in the undo history, not a revision: every
+//! history entry carries the content state its forward change produced,
+//! `markSaved` records the current one, and undoing (or redoing) back to
+//! it reads clean again. `revision` still only grows; it keys caches.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -46,6 +48,10 @@ pub const SelSnapshot = struct {
 
 const HistEntry = struct {
     edits: std.ArrayList(OwnedEdit),
+    /// Content state the FORWARD change of this entry produced; it rides
+    /// the entry between the undo and redo stacks so a redo lands on the
+    /// same state it left.
+    state: u64 = 0,
     /// Owned copy of the pre-transaction selection, when the caller
     /// supplied one.
     before: ?[]Selection = null,
@@ -125,7 +131,15 @@ pub const Document = struct {
     alloc: Allocator,
     rope: Rope,
     revision: u64,
+    /// Revision at the last `markSaved`. Informational (the crash
+    /// journal records it); dirtiness is `saved_state`'s business.
     saved_revision: u64,
+    /// Content state with an EMPTY undo stack.
+    base_state: u64 = 0,
+    /// Next fresh content state; never reused.
+    next_state: u64 = 1,
+    /// Content state that is on disk, or `NEVER_SAVED`.
+    saved_state: u64 = 0,
     line_ending: LineEnding,
     undo_stack: std.ArrayList(HistEntry),
     redo_stack: std.ArrayList(HistEntry),
@@ -303,12 +317,30 @@ pub const Document = struct {
         self.observers = .{ null, null, null, null };
     }
 
+    /// `saved_state` of a buffer no history position matches.
+    pub const NEVER_SAVED: u64 = std.math.maxInt(u64);
+
+    /// The content state the document is in: the top undo entry's, or
+    /// the base state with an empty history.
+    pub fn state(self: *const Document) u64 {
+        const n = self.undo_stack.items.len;
+        return if (n == 0) self.base_state else self.undo_stack.items[n - 1].state;
+    }
+
     pub fn isDirty(self: *const Document) bool {
-        return self.revision != self.saved_revision;
+        return self.state() != self.saved_state;
     }
 
     pub fn markSaved(self: *Document) void {
-        self.saved_revision = self.revision;
+        self.markStateSaved(self.state(), self.revision);
+    }
+
+    /// Record that history state `st`, snapshotted at `revision` when a
+    /// save started, is what is on disk now, even if the buffer moved on
+    /// while the write was in flight.
+    pub fn markStateSaved(self: *Document, st: u64, revision: u64) void {
+        self.saved_revision = revision;
+        self.saved_state = st;
     }
 
     /// Declare the content different from disk without an edit having
@@ -317,8 +349,15 @@ pub const Document = struct {
     /// The revision moves so every revision-keyed cache re-derives.
     pub fn markUnsaved(self: *Document) void {
         self.saved_revision = self.revision;
+        self.saved_state = NEVER_SAVED;
         self.revision += 1;
         self.typing = null;
+    }
+
+    fn freshState(self: *Document) u64 {
+        const s = self.next_state;
+        self.next_state += 1;
+        return s;
     }
 
     /// Caller-owned bytes in the document's on-disk line-ending style.
@@ -402,6 +441,9 @@ pub const Document = struct {
                     const top = &self.undo_stack.items[self.undo_stack.items.len - 1];
                     std.debug.assert(top.edits.items.len == 1);
                     top.edits.items[0].deleted_len += edit.inserted.len;
+                    // The group's content moved on: a save taken mid-word
+                    // must not read clean once the word grows.
+                    top.state = self.freshState();
                     self.typing = .{ .end = new_end, .last_cp = cp };
                     freeEntryList(self.alloc, &inverse);
                     return self.revision;
@@ -423,6 +465,7 @@ pub const Document = struct {
         errdefer self.typing = null;
         try self.undo_stack.append(self.alloc, .{
             .edits = inverse,
+            .state = self.freshState(),
             .before = kept,
             .before_primary = if (before) |b| b.primary else 0,
         });
@@ -447,6 +490,7 @@ pub const Document = struct {
         // restores it; the consumed entry keeps its own copy.
         try self.redo_stack.append(self.alloc, .{
             .edits = redo_entry,
+            .state = entry.state,
             .before = self.dupeSels(entry.before),
             .before_primary = entry.before_primary,
         });
@@ -466,6 +510,7 @@ pub const Document = struct {
         errdefer freeEntryList(self.alloc, &undo_entry);
         try self.undo_stack.append(self.alloc, .{
             .edits = undo_entry,
+            .state = entry.state,
             .before = self.dupeSels(entry.before),
             .before_primary = entry.before_primary,
         });
@@ -859,6 +904,87 @@ test "document markSaved clears dirty" {
     try testing.expect(doc.isDirty());
     doc.markSaved();
     try testing.expect(!doc.isDirty());
+}
+
+test "document undoing back to the saved text reads clean" {
+    var doc = try Document.initFromBytes(testing.allocator, "base");
+    defer doc.deinit();
+    var tx = tr.Transaction.init(doc.revision);
+    defer tx.deinit(testing.allocator);
+    try tx.addReplace(testing.allocator, 0, 4, "saved");
+    _ = try doc.applyTransaction(&tx);
+    doc.markSaved();
+    try testing.expect(!doc.isDirty());
+
+    var tx2 = tr.Transaction.init(doc.revision);
+    defer tx2.deinit(testing.allocator);
+    try tx2.addInsert(testing.allocator, 5, " later");
+    _ = try doc.applyTransaction(&tx2);
+    try testing.expect(doc.isDirty());
+    _ = try doc.undo();
+    // Revisions only grow, but the history position is the saved one.
+    try testing.expect(!doc.isDirty());
+    _ = try doc.undo();
+    try testing.expect(doc.isDirty());
+    _ = try doc.redo();
+    try testing.expect(!doc.isDirty());
+    _ = try doc.redo();
+    try testing.expect(doc.isDirty());
+}
+
+test "document a save in the middle of a typed word stays exact" {
+    var doc = Document.initEmpty(testing.allocator);
+    defer doc.deinit();
+    try typeChar(&doc, 0, "a");
+    doc.markSaved();
+    // Coalesces into the SAME undo entry, yet the content moved on.
+    try typeChar(&doc, 1, "b");
+    try testing.expectEqual(@as(usize, 1), doc.undo_stack.items.len);
+    try testing.expect(doc.isDirty());
+    // Undo drops the whole group: "" is not what was saved either.
+    _ = try doc.undo();
+    try testing.expect(doc.isDirty());
+}
+
+test "document a new edit after undo never matches the saved state again" {
+    var doc = Document.initEmpty(testing.allocator);
+    defer doc.deinit();
+    try typeChar(&doc, 0, "x");
+    doc.markSaved();
+    _ = try doc.undo();
+    try testing.expect(doc.isDirty());
+    // Same TEXT as the save, but a different history branch: dirty is
+    // conservative there, never optimistic.
+    try typeChar(&doc, 0, "x");
+    try testing.expect(doc.isDirty());
+    doc.markSaved();
+    try testing.expect(!doc.isDirty());
+}
+
+test "document a save that raced an edit marks the snapshotted state" {
+    var doc = try Document.initFromBytes(testing.allocator, "v1");
+    defer doc.deinit();
+    try typeChar(&doc, 2, "!");
+    const st = doc.state();
+    const rev = doc.revision;
+    // The user keeps typing while the write is in flight.
+    doc.breakUndoGroup();
+    try typeChar(&doc, 3, "?");
+    doc.markStateSaved(st, rev);
+    try testing.expect(doc.isDirty());
+    try testing.expect(doc.revision != doc.saved_revision);
+    _ = try doc.undo();
+    try testing.expect(!doc.isDirty());
+}
+
+test "document a recovered buffer cannot be undone into a clean state" {
+    var doc = try Document.initFromBytes(testing.allocator, "recovered");
+    defer doc.deinit();
+    doc.markUnsaved();
+    try testing.expect(doc.isDirty());
+    try typeChar(&doc, 0, "!");
+    _ = try doc.undo();
+    try testing.expect(doc.isDirty());
 }
 
 test "document initVerbatim keeps every byte of a crash snapshot" {

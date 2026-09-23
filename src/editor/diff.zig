@@ -470,13 +470,14 @@ test "reloadFromBytes: undo restores the pre-reload text exactly" {
         try testing.expectEqualStrings("alpha\nbeta\ngamma\n", txt);
     }
     try testing.expect(doc.isDirty()); // the pre-reload text is not on disk
-    // Redo returns to the reloaded content.
+    // Redo returns to the reloaded content, which IS what is on disk.
     _ = try doc.redo();
     {
         const txt = try doc.textAlloc(a);
         defer a.free(txt);
         try testing.expectEqualStrings("alpha\nBETA\ngamma\ndelta\n", txt);
     }
+    try testing.expect(!doc.isDirty());
 }
 
 test "reloadFromBytes: prior undo history survives the reload" {
