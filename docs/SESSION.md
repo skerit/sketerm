@@ -20881,3 +20881,275 @@ string literals on each side. smoke-e2e's cast stage covers the early
 duration, `.` to the last frame and `,` back (with frame numbers), and skip
 silence finishing a 29 s pause in seconds with the duration unchanged;
 `SKETERM_SMOKE_E2E_CAST_ONLY=1` runs it and the viewer cast stage alone.
+
+## 2026-09-23: editor language coverage
+
+`src/editor/languages.zig` is the one language registry (62 rows: name, LSP id,
+extensions/filenames/patterns, shebangs, head sniffing for `.h`, comment and
+literal rules, grammars, fold fallback, tab policy); detection, toggle-comment
+(line tokens, or block pairs per line for CSS/HTML/XML), the LSP languageId and
+the no-tree fallbacks all derive from it. `src/editor/grammars.zig` is the
+single grammar list build.zig compiles and syntax.zig binds; 18 grammars were
+vendored (C++, Python, Rust, JS/JSX, TS, TSX, Bash, Go, HTML, CSS, TOML, YAML,
+Lua, Make, Java, Diff, XML, Dockerfile) with a drift test that every query
+compiles and every capture maps. `lexical.zig` gives grammar-less documents
+string/comment-aware bracket matching, bracket folds and the quote gate.
+`.editorconfig` (spec globs, root, unset; read through the daemon in one
+round trip) and content-detected indentation resolve per tab (override >
+required tabs > .editorconfig > content > preferred tabs > config), shown on
+the status line and overridable from six palette commands; save applies
+trim/final-newline/BOM as one undo step. Cost: GUI binary 14.0 -> 27.2 MB,
+about 25 s of cold compile one grammar at a time (C++ 4.5 s). Rig: smoke-e2e
+`SKETERM_SMOKE_E2E_EDITOR_LANG_ONLY=1`.
+
+## 2026-09-23: workspace cleanup (actions, SGR, colour, config table, quake)
+
+Actions have one vocabulary and one dispatch; `copy`/`paste` work as keybinds
+(aliases of copy_selection/paste_clipboard), close_pane has a default chord
+(Ctrl+Shift+Alt+W), `toggle_panel_face` is a palette action. `--debug-events`
+prints each applied daemon event and snapshot swap. `close_button_on_tab` is
+wired live and in Preferences. SGR 4:4/4:5 are real dotted/dashed underlines in
+both render passes (keeping the curly bit for older peers); one `style.Resolver`
+owns colour resolution, and RTL overlay rows now draw cell backgrounds at visual
+columns. DECRQSS `m` reports the full style. The config file is one declarative
+key table with round-trip tests over every key, alias and retired key.
+`predictive_echo` is a per-profile setting. Quake mode places the window through
+wlr-layer-shell (gtk4-layer-shell loaded at runtime, `-Dlayer-shell=false` to
+build without it) and `--toggle` hides instead of minimizing. The GUI-side
+parser, the DCS events nobody emitted, the pty GLib reaper and two old spikes are
+gone. New unit tests for grid_pass, modes, palette, winlayout, xsearch,
+clipboard, tabbar, tabsidebar; smoke-e2e stages `SKETERM_SMOKE_E2E_WORKSPACE_ONLY`
+and `SKETERM_SMOKE_E2E_QUAKE_ONLY`. Found, not fixed: host-clipboard paste into
+forwarded apps never completes (the Wayland brain has no clipboard-read path
+since fb22c14f); the focused pane's top border shade changes after a config
+reload; a profile's flat `default_bg` loses to the auto-theme background.
+
+## 2026-09-23: browser correctness and privacy
+
+A tab's network route now fails closed: if the engine refuses the route's
+proxy or the WebRTC policy that keeps UDP inside it (`disable_non_proxied_udp`,
+set on every proxied route), that route's helper serves nothing and the tab
+says why (`ev_route_refused`). The helper's capabilities are one declared list
+(`protocol.Cap`), parsed the same way by every client and checked against the
+constants at compile time; old-helper compatibility is kept. The external
+begin-frame pacing mode is gone (older clients' frame requests are accepted and
+ignored). Site data, cookies, the menu's capabilities and Print to PDF use the
+tab's own helper, and Print to PDF on a remote tab delivers the file to this
+machine. Private tabs record no history and store no per-site settings, and
+incognito container ids now stay inside the helper's range (before, every
+incognito tab dropped the GUI's whole helper connection). A tab moved to another
+route keeps its page until the new instance loads it (it landed on about:blank,
+the cause of the red route stage). MCP `web_close` closes one page through a new
+`web-close` control verb; headless MCP supports `via:` routes. Download File on
+a remote pane uses the shared file picker. smoke-e2e gained stages for routed
+site info, private history, web_close, via:, remote print and Download File,
+plus rig fixes (wall-time waits, the lowest window id as the GUI's window, one
+palette driver, the rig no longer inherits the calling pane's daemon identity,
+which had written rig pages into the user's real history). The full smoke-e2e
+still does not reach its end: stages later in the run fail from state left by
+earlier stages and from load; two stray 330x27 toplevels appear on the main GUI
+after the theme stage (cause unknown).
+
+## 2026-09-23: stray drag-icon windows, Ctrl+C under a flood, picker connection reuse
+
+The two 330x27 stray toplevels later e2e stages took for the main window were
+tree-sidebar drag icons (`tabsidebar.zig onDragBegin`): role-less surfaces GTK
+keeps with their last buffer. The wlhost replay path (`compositor.zig
+replayFrame`) showed them as windows while the live path had always filtered
+role-less surfaces; both now share `Surface.mapsToView`, and the sidebar-drag
+and theme stages check a new read-only viewer's full replay for phantom
+toplevels (`appdrive.attachObserver`). The offload stage's "loop survived
+Ctrl+C" was never lost input: the byte was traced to the PTY and echoed as ^C,
+and bash lawfully outlived that one SIGINT (21 of 300 plain loops under load,
+measured outside sketerm); the loop now traps INT, and smoke-mux/smoke-broker
+gained a keystroke-under-flood stage (`runUnderFlood`). Download File's picker
+no longer dials the pane's host or warms a FUSE mount: a Terminal lends its
+file-service connection to one browser view (`Terminal.FsLease`), routes the fs
+frames it does not own to it, and ends the loan with its transport; the rig's
+fake ssh counts dials to prove it (`SKETERM_SMOKE_E2E_DOWNLOAD_ONLY`). Other
+browser views and local pickers still dial per open (listed for a later pass).
+
+## 2026-09-24: editor and LSP client correctness
+
+Language servers are shared per (server, root) across every editor face in the
+process; a dead remote link redials on demand with backoff, and a failed local
+server shows its stderr tail. Completion follows the server: `sortText` order
+before the cap, local filtering on `filterText`, re-asking (`triggerKind` 3) only
+when `isIncomplete`, and `additionalTextEdits` applied in the same undo step.
+`workspace/configuration` is answered from `[lsp.<name>] settings`, `$/progress`
+and `window/showMessage` reach the status line, and `relatedInformation` shows in
+the hover (Alt+F8 jumps to it). Every editor chord is a rebindable command in one
+table; "saved" is a position in the undo history; project replace edits buffers
+instead of writing to disk; the crash journal writes off the main thread; loads,
+saves and probes share one pooled connection per host; editorview.zig is split
+into io/find/journal/keys modules. Still open: inlay-hint click navigation, remote
+server stderr from the daemon, and rigs for crash-recovery UI, Save As, column
+drag and IME preedit. New stage: `SKETERM_SMOKE_E2E_EDITOR_OPS_ONLY`.
+
+## 2026-09-24: MCP, panels and accessibility cleanup
+
+The MCP server is split into one module per tool group behind table dispatch, so
+a tool without a handler no longer compiles. Every GUI connection goes through
+one kept-alive client (`ipc/ctlclient.zig`), and every GUI refusal carries a
+structured `error_code` (text matching stays only for older GUIs). Without a GUI
+the pane tools drive the server's headless terminals; `ui_wait_event` reads panel
+events without consuming them; `run_command output_only` reports only a zone that
+completed after the send; `file_rename`/`file_copy` refuse to overwrite unless
+`overwrite:true`. Older GUIs and daemons fall back on every one of these paths.
+Panels gained checkbox and table components and are reachable from the pane and
+window menus (new `panel_open_window` action). Terminal panes report text
+attributes over AT-SPI, web pages answer hit tests, the macOS bridge gained
+selection and range-frame logic (ObjC hookup unverified off macOS), and
+docs/mcp.md carries a tool reference generated from the tool table with a drift
+test. tools/list measures 266,611 bytes for 124 tools.
+
+## 2026-09-24: shutdown with an editor pane open no longer segfaults
+
+`Window.deinit` freed every Terminal before `Pane.deinit`'s last-resort
+`severFaces`, so clearing the editor's face title re-rendered the tab title from
+a freed `pane.terminal`. `Window.deinit` now severs every pane's faces while its
+Terminal is still alive, the same order the tab-close sweep uses; smoke-atspi's
+editor-teardown stage covers it through the GUI's exit status.
+
+## 2026-09-24: file manager safety, structure and dedup
+
+State files resolve through `util/xdg.zig` (no `/tmp` fallback) and our scratch
+files are swept by `util/dirsweep.zig`; the wire shapes, the job verbs
+(`fsjob.Op`) and the fsdrive start API each have one home; the cross-host copy
+engine moved to `crosscopy.zig` and the popover prompts to `prompts.zig`. A
+remote tab's Trash is that host's trash, Compare/Sync lists every mirror deletion
+and sends it to the trash, New from Template lists through the daemon on every
+host, and the viewer reuses one connection across a remote batch
+(`VIEWER_REUSE`). A tab's selection is one hash-indexed `SelectionSet`; every
+transfer phase change is checked against `transfer.zig`'s table, and a window's
+copy queue waits on other windows' copies to the same disk. Mount bypass is
+browsed "via sketerm" only after both daemons agree on the path (`FILES_BYPASS`).
+Still open: ledger-based token checks, one retry timer, merged sync-back watchers,
+and the pre-existing `FILES_SELECTION`/`FILES_BUGS` reds.
+
+## 2026-09-24: broker everywhere, quit_idle, dmabuf SIGBUS, VT52
+
+Every sketerm-mux daemon, local or remote-autostarted, now runs as a broker with
+one worker per session, and a worker's `.attach` and the broker's hand-off end in
+a single `attachClientToSession`. `--broker` stays a no-op, clients still work
+against old single-process daemons (smoke-mux passes against one built from the
+previous master) and `sketerm doctor` still lists them. Stale idle daemons retire
+through an atomic `quit_idle`, so a session spawned during an upgrade is no
+longer killed; daemons without the flag keep the old probe path. The daemon no
+longer maps a file-backed LINEAR dma-buf (an app could SIGBUS every session), its
+own parser follows DECANM into VT52, the welcome's capability flags come from one
+table (`capabilities.zig`), and `daemon_serve.zig` is split into per-service
+modules. The rigs fork a real broker; UDP sessions, FUSE mounts, the in-terminal
+viewer and the static-musl build are driven through it. Still open: macOS remote
+audio (needs a Mac) and splitting daemon.zig itself.
+
+## 2026-09-24: forwarded-app video streaming, negotiated
+
+Busy, photo-like forwarded app windows now stream as lossy video in the normal
+build: x264, SVT-AV1 and libavcodec are dlopen'd through header-only shims,
+`-Dvideo` is auto-detected from pkg-config, and `sketerm-mux` still links libc
+only. The viewer lists the codecs it decodes (`app_video_codec`) and the daemon
+picks one every viewer shares instead of hardcoding x264; an old GUI's `video`
+bool still means H.264 in both directions. Encoders are keyed per (window, pool),
+which fixed streams feeding every other frame to each decoder; a skipped frame
+forces a keyframe and an undecodable tile is dropped instead of killing the
+connection. `zig build smoke-video` streams a real mpv through the lossless,
+legacy-bool, H.264 and AV1 paths and checks decoded pixels against the lossless
+reference. VAAPI encode is left out (it would break the libc-only daemon rule).
+
+## 2026-09-24: workers survive broker restarts, host paste, LSP stderr
+
+A broker restart no longer loses sessions: workers wait on a socket at
+`<socket>.w/<origin_id>` when their broker dies, and the next broker on that
+socket adopts them over a fresh control pair. `quit_idle {"handover":true}`
+(welcome flag `worker_handover`) lets an upgrade replace a stale broker that holds
+sessions, while `.shutdown`, SIGTERM and the lifetime fence still end them;
+workers from builds before this have no listener, so a handover refuses while one
+is held. Forwarded apps can paste the host clipboard (`paste_request`, flag
+`app_paste_request`), a paste with no viewer answers empty instead of hanging, and
+a host clipboard change cancels the app's own selection source. A remote language
+server's stderr tail arrives with its `chan_close`, and plain CLI connections no
+longer load libavcodec (`sketerm mux list` 26.2 -> 22.0 ms). New stages:
+smoke-broker's handover stage and `smoke_paste` in smoke-mux and smoke-broker.
+
+## 2026-09-24: browser extension, userscript and filter-list features
+
+Every extension whose filters match a blocking request is now consulted in order
+and the answers fold the Chrome way (a cancel wins, then the latest redirect, then
+everyone's header edits); `onSendHeaders`/`onResponseStarted`/`onCompleted`/
+`onErrorOccurred` and `webNavigation` fire. `tabs.executeScript`/`insertCSS`/
+`getZoom`, `windows.get*`, `permissions` and `commands` are real; what cannot work
+yet (`menus.create`, `tabs.remove`, `setZoom`, `notifications`) fails per the spec
+instead of pretending (capability `webext-events`, smoke-web stage 43).
+`storage.local` and the new userscript GM value store merge by key across route
+helpers under a flock. Userscripts gained a `@grant`-gated GM_* API with
+`@connect`-enforced `GM_xmlhttpRequest`, injected without eval so they run under
+`script-src 'none'` (capability `userscripts-gm`, stage 44). New verbs
+`web_extensions`/`web_userscripts`/`web_filter_lists` open the managers from the
+window menu's Browser submenu, the pane and page menus and the palette, including
+a new Filter Lists manager (smoke-e2e `WEB_MANAGERS`).
+
+## 2026-09-24: file manager verbs, tags and the FILES reds
+
+Undo and redo now select what they restore, which fixed FILES_BUGS; FILES_SELECTION
+was the rig's 2x OCR misreading "ZAAROW", and small rows now also try 3x. Batch
+Rename is previewed before anything is sent (collisions refused), counted from the
+daemon's replies, undone by one Ctrl+Z and opened by F2 on a multi-row selection.
+`#tag` searches through a new `tag_find` walk and the daemon keeps a verified
+`tags.idx`. User actions gained Kind/Selection/Match/Hosts conditions and
+%F %n %d %h tokens, and the shell-typing verbs only type into a live shell on the
+tab's host. The Transfer Center shows one card per transfer token, and Compare/Sync
+asks on its own window. New e2e stages cover these verbs, Compare/Sync, the
+conflict dialog with the Transfer Center, and a remote tab's trash; smoke-fs runs
+one pass. Still open: pane drag-and-drop and download_file onto the file service,
+ledger-based token checks and one retry timer.
+
+## 2026-09-24: Window and Pane state gets owners; snapshot colours; profile bg
+
+Pane's 13 `win_*_ctx` copies are one `Pane.sinks`, its four faces are
+`Pane.faces` slots (`ui/paneface.zig`, one copy of the two-phase detach) and its
+titlebar is `ui/panetitlebar.zig`. Window's search/hints/copy-mode, zoom,
+closed-tab, tab-ack and shell-integration state became structs, and its quake,
+face-tab, tree-sidebar and picker code moved into `winquake`/`winfaces`/
+`wintabforest`/`winpickers.zig` (window.zig 5610 -> 4452 lines; fields Window
+96 -> 65, Pane 109 -> 36). Snapshots no longer overwrite the viewer's configured
+fg/bg with the daemon's built-ins, which is why a config reload visibly changed a
+pane and its focus border (`SKETERM_SMOKE_E2E_BORDER_ONLY`). A profile's own flat
+`default_bg`/`default_fg` now outranks the auto_theme built-in pair; only
+`light.`/`dark.` keys rank above it.
+
+## 2026-09-24: shared per-host connections, snapshot palette, rig fixes
+
+File-manager views, pickers and remote LSP links now share one daemon connection
+per host per process (`ui/hostlink.zig`), shaped like the pane lease so views do
+not care which one they ride; request and view ids are minted process-wide since
+frames reach every view on the link. The app switcher and welcome tour borrow idle
+connections from `editorio.pool` instead of dialing their own, and the new
+`FILES_REUSE` e2e stage counts fake-ssh dials for a second remote tab. After a
+daemon snapshot a pane keeps its configured palette and cursor colour unless an
+app set them. smoke-cell's box-drawing check, red since it landed, now looks for
+an unbroken run instead of the most-lit column, and `TWO_GUIS` says clearly when
+`sketerm-webengine` is missing. Ctrl+Shift+J after a click in the file list could
+not be reproduced.
+
+## 2026-09-24: browser files split by seam
+
+`src/web/cefhost.zig` (17.1k lines) and `src/ui/webface.zig` (10.5k) were split
+by pure moves into `src/web/cefhost/` (webext, webrequest, semlayer, intercept,
+cookies, downloads, security, usercontent, observe, a11y) and `src/ui/webface/`
+(client, containers, cookiesync, downloads, menus, prompts, store, frames,
+observed, a11y, hints, siteinfo, automation, pageview, password, print), leaving
+6.6k and 4.2k lines. Moved `Host`/`WebFace` methods are free functions taking
+`*Host`/`*WebFace`, re-exported under their old names, so no caller changed. The
+test-roots gate classifies `web/cefhost/*` as CEF-only, and `src/web/CLAUDE.md`
+has the module table.
+
+## 2026-09-24: window title names the tab and the pane
+
+Without `window_title_template` the window title is now `sketerm | <tab>
+| <pane>`: the selected tab's label, then the focused pane's own title
+(manual lock, face title, then OSC title), each left out when empty or
+when it repeats an earlier part. It follows tab relabels, tab switches
+and every focus move, including IPC/MCP focus while the window is not
+active, which a pane's focus-enter never saw. smoke-e2e WINDOW_TITLE
+drives it; `titlefmt.composeWindowTitle` is unit-tested.
