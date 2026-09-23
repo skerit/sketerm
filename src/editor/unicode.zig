@@ -240,6 +240,15 @@ fn isContinuation(b: u8) bool {
     return b & 0xC0 == 0x80;
 }
 
+/// The longest prefix of `text` of at most `max` bytes that does not cut
+/// a codepoint.
+pub fn clipUtf8(text: []const u8, max: usize) []const u8 {
+    if (text.len <= max) return text;
+    var end = max;
+    while (end > 0 and isContinuation(text[end])) end -= 1;
+    return text[0..end];
+}
+
 /// Decodes the codepoint starting at `i`; invalid bytes decode as
 /// U+FFFD with length 1.
 pub fn decodeAt(text: []const u8, i: usize) struct { cp: u21, len: usize } {
@@ -423,6 +432,14 @@ pub fn prevWordBoundary(text: []const u8, i: usize) usize {
 // ======================================================================
 
 const testing = std.testing;
+
+test "clipUtf8 never cuts a codepoint" {
+    try std.testing.expectEqualStrings("abc", clipUtf8("abc", 10));
+    try std.testing.expectEqualStrings("ab", clipUtf8("abc", 2));
+    // U+00E9 is two bytes: a cut inside it backs off to before it.
+    try std.testing.expectEqualStrings("a", clipUtf8("a\u{e9}b", 2));
+    try std.testing.expectEqualStrings("a\u{e9}", clipUtf8("a\u{e9}b", 3));
+}
 
 test "range table is sorted and non-overlapping" {
     var prev_last: u21 = 0;

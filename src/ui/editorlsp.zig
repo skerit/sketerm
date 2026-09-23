@@ -18,18 +18,22 @@
 //!
 //! ## Connection sharing
 //!
-//! One `Conn` per (server, workspace root). Two Zig files in the same
-//! project share one `zls`; a file in a different project gets its own.
-//! `refs` counts the tabs using it and the last tab out shuts it down.
+//! One `Conn` per (server, workspace root) for the whole PROCESS, owned
+//! by `editorlsp_conn.registry`: two Zig files in the same project share
+//! one `zls` even when they are open in different editor faces, and a
+//! file in a different project gets its own. `refs` counts the tabs
+//! using it, from every face, and the last tab out shuts it down. Each
+//! face keeps its own `Manager` for popups and per-tab state.
 //!
 //! ## Remote documents
 //!
 //! The server runs NEAR THE FILES: for a `host:/path` spec the daemon
 //! on `host` spawns it (`lsp_open`) and bridges its stdio as a byte
 //! channel; this file relays the raw JSON-RPC bytes over a dedicated
-//! per-host mux connection (`RemoteLink`, watched with `g_unix_fd_add`
-//! like every other socket — the connect itself happens on a worker
-//! thread because the ssh bootstrap blocks). The `Session`, staleness
+//! per-host mux connection (`RemoteLink` in editorlsp_link.zig, watched
+//! with `g_unix_fd_add` like every other socket; the connect itself
+//! happens on a worker thread because the ssh bootstrap blocks, and a
+//! dead link is redialed on demand with backoff). The `Session`, staleness
 //! discipline, position-encoding negotiation and every feature are the
 //! LOCAL client unchanged: only `pumpWrite` and the link's frame
 //! router know the transport is not a pipe. Discovery is the daemon's:
@@ -60,22 +64,18 @@ const rpc = @import("../lsp/rpc.zig");
 const session = @import("../lsp/session.zig");
 const pos = @import("../lsp/position.zig");
 const servers = @import("../lsp/servers.zig");
-const proc = @import("../lsp/proc.zig");
 const diagnostics = @import("../lsp/diagnostics.zig");
 const docsync = @import("../lsp/docsync.zig");
-const pending_mod = @import("../lsp/pending.zig");
 const semantic = @import("../lsp/semantic.zig");
 const inlay = @import("../lsp/inlay.zig");
 const layout_mod = @import("../render/editor_layout.zig");
 const syntax = @import("../editor/syntax.zig");
-const muxclient = @import("../mux/client.zig");
-const wire = @import("../mux/wire.zig");
 
 /// `SKETERM_LSP_DEBUG=1` traces attach decisions, server lifecycle and
 /// published diagnostics to stderr. There is no other way to see why a
 /// server did not attach: every failure on that path is deliberately
 /// silent for the user.
-fn dbg(comptime fmt: []const u8, args: anytype) void {
+pub fn dbg(comptime fmt: []const u8, args: anytype) void {
     const on = @import("../util/profile.zig").getenv("SKETERM_LSP_DEBUG") != null;
     if (!on) return;
     var buf: [512]u8 = undefined;
@@ -86,8 +86,6 @@ fn dbg(comptime fmt: []const u8, args: anytype) void {
 /// Completion re-request debounce while the popup is open. Short: the
 /// list must feel attached to the keystrokes.
 const COMPLETION_DEBOUNCE_MS: c_uint = 120;
-/// How long a server gets to exit after `shutdown` before SIGKILL.
-const SHUTDOWN_GRACE_MS: c_uint = 1500;
 /// Signature help re-request debounce as the caret walks the argument
 /// list. Same reasoning as COMPLETION_DEBOUNCE_MS: the active parameter
 /// has to keep up with the typing.
@@ -113,6 +111,8 @@ const SIG_W: c_int = 560;
 /// popular symbol can be tens of thousands, and building that many
 /// GtkLabels locks the UI for seconds.
 const MAX_ROWS: usize = 300;
+/// Between the status line's fragments (an em dash).
+const STATUS_SEP = "  \u{2014}  ";
 
 // ======================================================================
 // Per-tab state
@@ -132,6 +132,10 @@ pub const TabState = struct {
     signature_timer: c_uint = 0,
     /// Debounced inlay-hint / semantic-token refresh; 0 = idle.
     decor_timer: c_uint = 0,
+    /// Another face's tab has this URI open on the same server, so this
+    /// copy sends nothing and gets no answers until that one closes
+    /// (`Registry.promotePassive`).
+    passive: bool = false,
 
     // ---- display-only decorations ------------------------------------
     //
@@ -232,653 +236,12 @@ pub const TabState = struct {
 };
 
 // ======================================================================
-// One server process
+// Servers and links: process-wide, see editorlsp_conn.zig
 // ======================================================================
 
-pub const Conn = struct {
-    mgr: *Manager,
-    /// Registry name ("zls"), owned.
-    name: []u8,
-    /// Workspace root path, owned.
-    root: []u8,
-    /// `file://` root URI, owned.
-    root_uri: []u8,
-    child: proc.Child = .{},
-    /// Remote transport: the server runs on the daemon's host and its
-    /// stdio rides `link` as chan_data frames for channel `chan`.
-    /// Null = local child process. Everything except `pumpWrite` and
-    /// teardown is transport-blind.
-    remote: ?Remote = null,
-    sess: session.Session,
-    watch_out: c_uint = 0,
-    watch_err: c_uint = 0,
-    watch_in: c_uint = 0,
-    /// Bytes of `sess.out` already handed to the pipe.
-    out_pos: usize = 0,
-    /// Tabs currently attached.
-    refs: usize = 0,
-    /// Set once teardown has begun; every callback becomes a no-op.
-    closing: bool = false,
-    /// Grace timer between `shutdown` and SIGKILL; 0 = none.
-    kill_timer: c_uint = 0,
-    /// Deferred removal after a transport/session failure; 0 = none.
-    remove_idle: c_uint = 0,
-    /// Exact-pid child watch. It outlives this connection when teardown
-    /// wins the race with child exit.
-    child_watch: ?*LocalChildWatch = null,
-    /// Last line the server wrote to stderr, for the status line.
-    last_stderr: [160]u8 = undefined,
-    last_stderr_len: usize = 0,
-
-    fn handler(self: *Conn) session.Handler {
-        return .{
-            .ctx = self,
-            .on_response = onResponse,
-            .on_notification = onNotification,
-            .on_state = onState,
-            .on_apply_edit = onApplyEdit,
-        };
-    }
-
-    /// The server asked us to write a `WorkspaceEdit` — how a code
-    /// action that carries only a `command` gets its work done.
-    fn onApplyEdit(ctx: *anyopaque, params: std.json.Value) bool {
-        const self: *Conn = @ptrCast(@alignCast(ctx));
-        if (self.closing) return false;
-        const edit = switch (params) {
-            .object => |o| o.get("edit") orelse std.json.Value.null,
-            else => std.json.Value.null,
-        };
-        const r = self.mgr.applyWorkspaceEdit(self, edit);
-        self.mgr.reportEditOutcome(r);
-        // An edit whose files all had to be OPENED has applied nothing
-        // yet but is not a refusal — `applied:false` would make the
-        // server think its command failed.
-        return r.touched + r.opened > 0;
-    }
-
-    fn onResponse(ctx: *anyopaque, req: session.Request, env: rpc.Envelope) void {
-        const self: *Conn = @ptrCast(@alignCast(ctx));
-        if (self.closing) return;
-        self.mgr.handleResponse(self, req, env);
-    }
-
-    fn onNotification(ctx: *anyopaque, method: []const u8, params: std.json.Value) void {
-        const self: *Conn = @ptrCast(@alignCast(ctx));
-        if (self.closing) return;
-        self.mgr.handleNotification(self, method, params);
-    }
-
-    fn onState(ctx: *anyopaque, state: session.State) void {
-        const self: *Conn = @ptrCast(@alignCast(ctx));
-        if (state == .ready) self.mgr.onServerReady(self);
-        if (state == .dead) self.mgr.onServerDead(self);
-    }
-
-    pub const Remote = struct {
-        link: *RemoteLink,
-        chan: u32,
-        /// False once chan_close went out (or came in) — nothing may
-        /// be queued for the channel after that.
-        open: bool = true,
-    };
-
-    /// Push whatever the session queued into the server's stdin.
-    /// Installs a writable watch only when the pipe is full, so the
-    /// common case costs one write() and no GLib source.
-    ///
-    /// Remote transport: the bytes become chan_data frames on the
-    /// link's mux connection instead — the link owns the partial-write
-    /// buffering (its own G_IO_OUT watch), so the whole queue moves at
-    /// once.
-    fn pumpWrite(self: *Conn) void {
-        if (self.closing) return;
-        if (self.remote) |*rm| {
-            if (self.sess.out.items.len == 0) return;
-            defer {
-                self.sess.out.clearRetainingCapacity();
-                self.out_pos = 0;
-            }
-            if (!rm.open or rm.link.state != .up) return;
-            const CHUNK: usize = 1 << 20;
-            var off: usize = 0;
-            const bytes = self.sess.out.items;
-            while (off < bytes.len) {
-                const end = @min(off + CHUNK, bytes.len);
-                const payload = self.mgr.alloc.alloc(u8, 4 + (end - off)) catch {
-                    self.sess.markDead();
-                    return;
-                };
-                defer self.mgr.alloc.free(payload);
-                std.mem.writeInt(u32, payload[0..4], rm.chan, .little);
-                @memcpy(payload[4..], bytes[off..end]);
-                rm.link.conn.queueFrame(.chan_data, payload) catch {
-                    rm.link.markDead();
-                    return;
-                };
-                off = end;
-            }
-            rm.link.armWriteWatch();
-            return;
-        }
-        if (self.child.stdin < 0) return;
-        while (self.out_pos < self.sess.out.items.len) {
-            const rest = self.sess.out.items[self.out_pos..];
-            const n = c.write(self.child.stdin, rest.ptr, rest.len);
-            if (n > 0) {
-                self.out_pos += @intCast(n);
-                continue;
-            }
-            const err = std.posix.errno(@as(isize, @intCast(n)));
-            if (err == .AGAIN or err == .INTR) {
-                if (self.watch_in == 0) {
-                    self.watch_in = c.g_unix_fd_add(
-                        self.child.stdin,
-                        c.G_IO_OUT | c.G_IO_ERR | c.G_IO_HUP,
-                        @ptrCast(&onWritable),
-                        @ptrCast(self),
-                    );
-                }
-                return;
-            }
-            // A broken pipe means the server is gone.
-            self.sess.markDead();
-            return;
-        }
-        self.sess.out.clearRetainingCapacity();
-        self.out_pos = 0;
-        if (self.watch_in != 0) {
-            _ = c.g_source_remove(self.watch_in);
-            self.watch_in = 0;
-        }
-    }
-
-    fn onWritable(_: c_int, cond: c.GIOCondition, user: ?*anyopaque) callconv(.c) c.gboolean {
-        const self = cast.userData(Conn, user);
-        if (self.closing) {
-            self.watch_in = 0;
-            return 0;
-        }
-        if ((cond & (c.G_IO_ERR | c.G_IO_HUP)) != 0) {
-            self.watch_in = 0;
-            self.sess.markDead();
-            return 0;
-        }
-        const had = self.watch_in;
-        self.watch_in = 0;
-        self.pumpWrite();
-        // pumpWrite reinstalls the watch when it is still short; if it
-        // did, keep THIS source (same fd, same callback) rather than
-        // leaving two behind.
-        if (self.watch_in != 0) {
-            _ = c.g_source_remove(self.watch_in);
-            self.watch_in = had;
-            return 1;
-        }
-        return 0;
-    }
-
-    fn onReadable(fd: c_int, cond: c.GIOCondition, user: ?*anyopaque) callconv(.c) c.gboolean {
-        const self = cast.userData(Conn, user);
-        if (self.closing) {
-            self.watch_out = 0;
-            return 0;
-        }
-        var buf: [16384]u8 = undefined;
-        while (true) {
-            const n = c.read(fd, &buf, buf.len);
-            if (n > 0) {
-                self.sess.feed(buf[0..@intCast(n)]);
-                if (self.sess.state == .dead) break;
-                continue;
-            }
-            if (n == 0) {
-                // EOF: the server exited (or never exec'd).
-                self.watch_out = 0;
-                self.sess.markDead();
-                return 0;
-            }
-            const err = std.posix.errno(@as(isize, @intCast(n)));
-            if (err == .AGAIN) break;
-            if (err == .INTR) continue;
-            self.watch_out = 0;
-            self.sess.markDead();
-            return 0;
-        }
-        self.pumpWrite();
-        if (self.sess.state == .dead) {
-            self.watch_out = 0;
-            return 0;
-        }
-        if ((cond & (c.G_IO_ERR | c.G_IO_HUP)) != 0) {
-            self.watch_out = 0;
-            self.sess.markDead();
-            return 0;
-        }
-        return 1;
-    }
-
-    /// Drain stderr so the pipe never fills (a server whose stderr
-    /// blocks stops serving), keeping the last line for the status bar.
-    fn onStderr(fd: c_int, cond: c.GIOCondition, user: ?*anyopaque) callconv(.c) c.gboolean {
-        const self = cast.userData(Conn, user);
-        if (self.closing) {
-            self.watch_err = 0;
-            return 0;
-        }
-        var buf: [4096]u8 = undefined;
-        while (true) {
-            const n = c.read(fd, &buf, buf.len);
-            if (n > 0) {
-                const chunk = buf[0..@intCast(n)];
-                var it = std.mem.tokenizeScalar(u8, chunk, '\n');
-                while (it.next()) |line| {
-                    const trimmed = std.mem.trim(u8, line, " \t\r");
-                    if (trimmed.len == 0) continue;
-                    const take = @min(trimmed.len, self.last_stderr.len);
-                    @memcpy(self.last_stderr[0..take], trimmed[0..take]);
-                    self.last_stderr_len = take;
-                }
-                continue;
-            }
-            break;
-        }
-        if ((cond & (c.G_IO_ERR | c.G_IO_HUP)) != 0) {
-            self.watch_err = 0;
-            return 0;
-        }
-        return 1;
-    }
-
-    fn stderrText(self: *const Conn) []const u8 {
-        return self.last_stderr[0..self.last_stderr_len];
-    }
-
-    fn dropWatches(self: *Conn) void {
-        for ([_]*c_uint{ &self.watch_out, &self.watch_err, &self.watch_in }) |w| {
-            if (w.* != 0) _ = c.g_source_remove(w.*);
-            w.* = 0;
-        }
-        if (self.kill_timer != 0) {
-            _ = c.g_source_remove(self.kill_timer);
-            self.kill_timer = 0;
-        }
-        if (self.remove_idle != 0) {
-            _ = c.g_source_remove(self.remove_idle);
-            self.remove_idle = 0;
-        }
-    }
-
-    fn destroy(self: *Conn) void {
-        self.closing = true;
-        self.dropWatches();
-        const mgr = self.mgr;
-        var drop_link: ?*RemoteLink = null;
-        if (self.remote) |*rm| {
-            // Tell the daemon to take the server down (SIGTERM its
-            // group). A dropped link needs nothing: client death kills
-            // the channel and its child daemon-side.
-            if (rm.open and rm.link.state == .up) {
-                var hdr: [4]u8 = undefined;
-                rm.link.conn.queueFrame(.chan_close, wire.putChanHeader(&hdr, rm.chan)) catch {};
-                rm.link.armWriteWatch();
-            }
-            rm.open = false;
-            drop_link = rm.link;
-            self.remote = null;
-        }
-        self.child.killHard();
-        self.child.closePipes();
-        if (self.child_watch) |watch| {
-            watch.conn = null;
-            self.child_watch = null;
-            self.child.pid = -1;
-        } else {
-            // Only possible if installing the child watch failed before
-            // this connection became visible to the main loop.
-            self.child.reapBlocking();
-        }
-        self.sess.deinit();
-        const a = mgr.alloc;
-        a.free(self.name);
-        a.free(self.root);
-        a.free(self.root_uri);
-        a.destroy(self);
-        // After the free: the idle-link scan must not see this Conn.
-        if (drop_link) |link| mgr.maybeDropLink(link);
-    }
-};
-
-/// GLib owns this exact-pid child watch until reap, independently of its nullable `Conn` back-pointer.
-const LocalChildWatch = struct {
-    pid: c.pid_t,
-    conn: ?*Conn,
-    source: c_uint = 0,
-
-    fn create(pid: c.pid_t, conn: ?*Conn) ?*LocalChildWatch {
-        const self = std.heap.c_allocator.create(LocalChildWatch) catch return null;
-        self.* = .{ .pid = pid, .conn = conn };
-        self.source = c.g_child_watch_add_full(
-            c.G_PRIORITY_DEFAULT,
-            pid,
-            @ptrCast(&onExited),
-            @ptrCast(self),
-            @ptrCast(&free),
-        );
-        if (self.source == 0) {
-            std.heap.c_allocator.destroy(self);
-            return null;
-        }
-        return self;
-    }
-
-    fn onExited(pid: c.GPid, _: c_int, user: ?*anyopaque) callconv(.c) void {
-        const self = cast.userData(LocalChildWatch, user);
-        self.source = 0;
-        c.g_spawn_close_pid(pid);
-        if (pid != self.pid) return;
-        const cn = self.conn orelse return;
-        self.conn = null;
-        if (cn.child_watch != self) return;
-        cn.child_watch = null;
-        // A crashed leader may leave build tools in its process group.
-        // While that group exists its id cannot be reused.
-        _ = c.kill(-pid, c.SIGKILL);
-        cn.child.pid = -1;
-        if (!cn.closing) cn.sess.markDead();
-    }
-
-    fn free(user: ?*anyopaque) callconv(.c) void {
-        std.heap.c_allocator.destroy(cast.userData(LocalChildWatch, user));
-    }
-};
-
-// ======================================================================
-// Remote links: one mux connection per host, carrying LSP byte channels
-// ======================================================================
-
-/// A dedicated mux connection to one remote host, used ONLY for LSP
-/// traffic (fs jobs make their own short-lived connections; sharing
-/// one would tangle this link's frame stream with request/reply
-/// pumps). Established on a worker thread — the ssh bootstrap blocks —
-/// then watched on the GLib loop like every other socket. Owned by the
-/// Manager; dropped when the last remote Conn on it goes away. A link
-/// that failed to connect, or whose daemon does not advertise
-/// `lsp:true`, stays recorded as `.dead` so repeated attaches on that
-/// host cost nothing (and stay silent).
-pub const RemoteLink = struct {
-    mgr: *Manager,
-    /// Host part of the spec ("box", "user@box", "udp:box"), owned.
-    host: []u8,
-    state: enum { connecting, up, dead } = .connecting,
-    /// Valid only while `.up`.
-    conn: muxclient.Conn = undefined,
-    watch_in: c_uint = 0,
-    watch_out: c_uint = 0,
-    next_req: u32 = 1,
-    /// lsp_open requests in flight.
-    pending: std.ArrayList(Pending) = .empty,
-    /// Tabs parked here until the connect worker hands the socket back.
-    waiting: std.ArrayList(u64) = .empty,
-
-    const Pending = struct { req: u32, tab_id: u64 };
-
-    fn destroyLink(self: *RemoteLink) void {
-        self.dropLinkWatches();
-        if (self.state == .up) self.conn.deinit();
-        self.state = .dead;
-        const a = self.mgr.alloc;
-        self.pending.deinit(a);
-        self.waiting.deinit(a);
-        a.free(self.host);
-        a.destroy(self);
-    }
-
-    fn dropLinkWatches(self: *RemoteLink) void {
-        for ([_]*c_uint{ &self.watch_in, &self.watch_out }) |w| {
-            if (w.* != 0) _ = c.g_source_remove(w.*);
-            w.* = 0;
-        }
-    }
-
-    /// The transport failed (EOF, write error, hangup): every server
-    /// on it is gone. The record stays `.dead` in the Manager's list
-    /// so later attaches on this host degrade silently instead of
-    /// redialing per document.
-    fn markDead(self: *RemoteLink) void {
-        if (self.state == .dead) return;
-        const was_up = self.state == .up;
-        self.state = .dead;
-        dbg("link {s}: dead", .{self.host});
-        self.dropLinkWatches();
-        if (was_up) self.conn.deinit();
-        self.pending.clearRetainingCapacity();
-        self.waiting.clearRetainingCapacity();
-        // markDead on each session routes through onServerDead, which
-        // detaches tabs and clears decorations — the same path a local
-        // server crash takes.
-        for (self.mgr.conns.items) |cn| {
-            if (cn.remote) |*rm| {
-                if (rm.link == self) {
-                    rm.open = false;
-                    cn.sess.markDead();
-                }
-            }
-        }
-    }
-
-    /// Non-blocking flush; a short write leaves the rest in the mux
-    /// Conn's wbuf and a G_IO_OUT watch drains it.
-    fn armWriteWatch(self: *RemoteLink) void {
-        if (self.state != .up) return;
-        self.conn.flushQueued() catch {
-            self.markDead();
-            return;
-        };
-        if (self.conn.wbuf.items.len > 0 and self.watch_out == 0) {
-            self.watch_out = c.g_unix_fd_add(
-                self.conn.fd,
-                c.G_IO_OUT | c.G_IO_ERR | c.G_IO_HUP,
-                @ptrCast(&onLinkWritable),
-                @ptrCast(self),
-            );
-        }
-    }
-
-    fn onLinkWritable(_: c_int, cond: c.GIOCondition, user: ?*anyopaque) callconv(.c) c.gboolean {
-        const self = cast.userData(RemoteLink, user);
-        if (self.state != .up) {
-            self.watch_out = 0;
-            return 0;
-        }
-        if ((cond & (c.G_IO_ERR | c.G_IO_HUP)) != 0) {
-            self.watch_out = 0;
-            self.markDead();
-            return 0;
-        }
-        self.conn.flushQueued() catch {
-            self.watch_out = 0;
-            self.markDead();
-            return 0;
-        };
-        if (self.conn.wbuf.items.len == 0) {
-            self.watch_out = 0;
-            return 0;
-        }
-        return 1;
-    }
-
-    fn onLinkReadable(_: c_int, cond: c.GIOCondition, user: ?*anyopaque) callconv(.c) c.gboolean {
-        const self = cast.userData(RemoteLink, user);
-        if (self.state != .up) {
-            self.watch_in = 0;
-            return 0;
-        }
-        if (!self.conn.fillAvailable()) {
-            self.watch_in = 0;
-            self.markDead();
-            return 0;
-        }
-        while (true) {
-            const maybe = self.conn.takeFrame() catch {
-                self.watch_in = 0;
-                self.markDead();
-                return 0;
-            };
-            const f = maybe orelse break;
-            defer f.deinit(self.conn.allocator);
-            self.handleFrame(f);
-            if (self.state != .up) {
-                self.watch_in = 0;
-                return 0;
-            }
-        }
-        if ((cond & (c.G_IO_ERR | c.G_IO_HUP)) != 0) {
-            self.watch_in = 0;
-            self.markDead();
-            return 0;
-        }
-        // Handlers may have queued replies (didOpen after ready, …).
-        self.armWriteWatch();
-        return 1;
-    }
-
-    fn connByChan(self: *RemoteLink, chan: u32) ?*Conn {
-        for (self.mgr.conns.items) |cn| {
-            if (cn.closing) continue;
-            if (cn.remote) |*rm| {
-                if (rm.link == self and rm.chan == chan) return cn;
-            }
-        }
-        return null;
-    }
-
-    fn handleFrame(self: *RemoteLink, f: muxclient.Conn.OwnedFrame) void {
-        switch (f.ftype) {
-            .lsp_reply => self.mgr.onLspReply(self, f.payload),
-            .chan_data => {
-                const id = wire.decodeChanId(f.payload) orelse return;
-                const cn = self.connByChan(id) orelse return;
-                cn.sess.feed(f.payload[4..]);
-                if (cn.sess.state != .dead) cn.pumpWrite();
-            },
-            .chan_close => {
-                const id = wire.decodeChanId(f.payload) orelse return;
-                const cn = self.connByChan(id) orelse return;
-                if (cn.remote) |*rm| rm.open = false;
-                // Same as a local server's stdout EOF.
-                cn.sess.markDead();
-            },
-            // Anything else on this dedicated connection (peer_info,
-            // marker pushes, …) is not for us.
-            else => {},
-        }
-    }
-
-    /// Queue an lsp_open for `tab`'s document, once. The candidate
-    /// list is the CLIENT's config; which of them is installed — and
-    /// where the root markers resolve — only the remote host can say.
-    fn sendOpen(self: *RemoteLink, tab: *ETab) void {
-        if (self.state != .up) return;
-        for (self.pending.items) |p| {
-            if (p.tab_id == tab.id) return;
-        }
-        const mgr = self.mgr;
-        const conf = mgr.cfg() orelse return;
-        const spec = tab.spec orelse return;
-        const loc = paths.parseSpec(spec);
-        const lang = tab.language.lspId();
-        if (lang.len == 0) return;
-        const candidates = conf.lspServerCandidates(lang, mgr.alloc) catch return;
-        defer mgr.alloc.free(candidates);
-        if (candidates.len == 0) return;
-        const req = self.next_req;
-        self.next_req += 1;
-        self.pending.append(mgr.alloc, .{ .req = req, .tab_id = tab.id }) catch return;
-        dbg("link {s}: lsp_open req={d} dir={s} ({d} candidates)", .{ self.host, req, servers.dirnameOf(loc.path), candidates.len });
-        self.conn.queueJson(.lsp_open, .{
-            .req = req,
-            .dir = servers.dirnameOf(loc.path),
-            .servers = candidates,
-        }) catch {
-            self.markDead();
-            return;
-        };
-        self.armWriteWatch();
-    }
-
-    fn takePending(self: *RemoteLink, req: u32) ?u64 {
-        for (self.pending.items, 0..) |p, i| {
-            if (p.req == req) {
-                _ = self.pending.swapRemove(i);
-                return p.tab_id;
-            }
-        }
-        return null;
-    }
-
-    /// Ask the daemon to close (and thereby kill) a channel we ended
-    /// up not using — a reply for a tab that closed meanwhile, or a
-    /// duplicate spawn that lost the (name, root) dedupe race.
-    fn discardChannel(self: *RemoteLink, chan: u32) void {
-        if (self.state != .up) return;
-        var hdr: [4]u8 = undefined;
-        self.conn.queueFrame(.chan_close, wire.putChanHeader(&hdr, chan)) catch {
-            self.markDead();
-            return;
-        };
-        self.armWriteWatch();
-    }
-};
-
-/// The blocking half of a link connect: ssh bootstrap + hello/welcome
-/// on a g_thread, handed back to the GLib loop via idle. The fence
-/// carries "is the EditorView still alive" across the gap.
-const LinkJob = struct {
-    fence: *editorview.Fence,
-    /// Owned by the job (the link's copy may be freed while we run).
-    host: []u8,
-    conn: muxclient.Conn = undefined,
-    ok: bool = false,
-    lsp: bool = false,
-
-    fn destroy(self: *LinkJob) void {
-        const a = std.heap.c_allocator;
-        a.free(self.host);
-        self.fence.unref();
-        a.destroy(self);
-    }
-};
-
-fn linkThread(data: ?*anyopaque) callconv(.c) ?*anyopaque {
-    const job = cast.userData(LinkJob, data);
-    const a = std.heap.c_allocator;
-    run: {
-        var config = Config.load(a);
-        defer config.deinit();
-        const conn = muxclient.Conn.connectRemote(a, job.host, config.muxConnectOptions()) catch break :run;
-        job.conn = conn;
-        job.ok = true;
-        job.lsp = conn.lsp_support;
-    }
-    _ = c.g_idle_add(@ptrCast(&linkIdle), @ptrCast(job));
-    return null;
-}
-
-fn linkIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const job = cast.userData(LinkJob, user);
-    defer job.destroy();
-    const view = job.fence.viewIfAlive() orelse {
-        if (job.ok) job.conn.deinit();
-        return 0;
-    };
-    const mgr = view.lsp orelse {
-        if (job.ok) job.conn.deinit();
-        return 0;
-    };
-    mgr.onLinkConnected(job);
-    return 0;
-}
+const conn_mod = @import("editorlsp_conn.zig");
+pub const Conn = conn_mod.Conn;
+const registry = &conn_mod.registry;
 
 // ======================================================================
 // Popup list (completion / locations / symbols)
@@ -1066,17 +429,12 @@ const SigPopup = struct {
 };
 
 // ======================================================================
-// Manager: one per EditorView
+// Manager: one per EditorView (the servers are shared, see above)
 // ======================================================================
 
 pub const Manager = struct {
     view: *EditorView,
     alloc: std.mem.Allocator,
-    conns: std.ArrayList(*Conn) = .empty,
-    /// One per remote host with (past or present) LSP traffic. Dead
-    /// entries stay recorded so a host that failed once degrades
-    /// silently instead of redialing per document.
-    links: std.ArrayList(*RemoteLink) = .empty,
     list: ListPopup = undefined,
     /// Monotonic context generation and exact in-flight completion
     /// request. Edits, caret moves and popup close all invalidate both.
@@ -1107,10 +465,6 @@ pub const Manager = struct {
     /// motion arrives hundreds of times a second, and a trace that logs
     /// every one of them is unreadable exactly when it is needed.
     dwell_gate: DwellGate = .initial,
-    /// `TextEdit[]`s from a `WorkspaceEdit` whose file was still
-    /// loading. They apply when that load settles, and are reported
-    /// when it cannot deliver them. See `applyWorkspaceEdit`.
-    pending_edits: pending_mod.Queue = .{},
     /// How many of the current WorkspaceEdit's files have been written
     /// so far, for the "…and here is the final count" status line the
     /// deferred half owes the user.
@@ -1122,24 +476,24 @@ pub const Manager = struct {
         self.list = .{ .mgr = self };
         self.hover = .{ .mgr = self };
         self.sig = .{ .mgr = self };
+        registry.register(self);
         return self;
     }
 
+    /// Lets go of this face's documents (a server whose last tab this was
+    /// shuts down) and leaves the registry.
     pub fn destroy(self: *Manager) void {
         self.cancelDwell();
         self.closePopup();
         self.closeHover();
         self.closeSignature();
         self.unparentPopups();
-        // Pop-based: Conn.destroy scans the live conns (and can drop
-        // an idle link), so neither list may hold freed pointers
-        // mid-loop.
-        while (self.conns.pop()) |cn| cn.destroy();
-        self.conns.deinit(self.alloc);
-        while (self.links.pop()) |link| link.destroyLink();
-        self.links.deinit(self.alloc);
+        // Unregistered FIRST so a passive copy promoted by these detaches
+        // is one in another face, never a tab about to be detached here.
+        registry.unregister(self);
+        for (self.view.tabs.items) |t| self.detachTab(t);
+        registry.noteFaceGone();
         self.list.deinit();
-        self.pending_edits.deinit(self.alloc);
         self.hint_view.deinit(self.alloc);
         self.scratch.deinit(self.alloc);
         self.alloc.destroy(self);
@@ -1166,238 +520,17 @@ pub const Manager = struct {
         self.sig.doc_label = null;
     }
 
-    fn cfg(self: *Manager) ?*const Config {
+    pub fn cfg(self: *Manager) ?*const Config {
         if (self.view.ownerWindow()) |win| return &win.config;
         return self.view.standalone_config;
     }
 
     // ---- connections --------------------------------------------------
 
-    fn findConn(self: *Manager, name: []const u8, root: []const u8) ?*Conn {
-        for (self.conns.items) |cn| {
-            if (cn.closing or cn.sess.state == .dead) continue;
-            if (cn.remote != null) continue;
-            if (std.mem.eql(u8, cn.name, name) and std.mem.eql(u8, cn.root, root)) return cn;
-        }
-        return null;
-    }
-
-    /// A live remote server for (host, name, root). Dead sessions are
-    /// skipped: reusing one would attach the tab to a server that will
-    /// never answer, where a fresh lsp_open might succeed.
-    fn findRemoteConn(self: *Manager, link: *RemoteLink, name: []const u8, root: []const u8) ?*Conn {
-        for (self.conns.items) |cn| {
-            if (cn.closing or cn.sess.state == .dead) continue;
-            const rm = cn.remote orelse continue;
-            if (rm.link != link) continue;
-            if (std.mem.eql(u8, cn.name, name) and std.mem.eql(u8, cn.root, root)) return cn;
-        }
-        return null;
-    }
-
-    fn findLink(self: *Manager, host: []const u8) ?*RemoteLink {
-        for (self.links.items) |link| {
-            if (std.mem.eql(u8, link.host, host)) return link;
-        }
-        return null;
-    }
-
-    /// Start connecting to `host`'s daemon on a worker thread (the ssh
-    /// bootstrap blocks). The link is listed immediately in
-    /// `.connecting` state so attaches can park on it.
-    fn startLink(self: *Manager, host: []const u8) ?*RemoteLink {
-        const link = self.alloc.create(RemoteLink) catch return null;
-        const host_dup = self.alloc.dupe(u8, host) catch {
-            self.alloc.destroy(link);
-            return null;
-        };
-        link.* = .{ .mgr = self, .host = host_dup };
-        self.links.append(self.alloc, link) catch {
-            self.alloc.free(host_dup);
-            self.alloc.destroy(link);
-            return null;
-        };
-        const job = std.heap.c_allocator.create(LinkJob) catch {
-            link.state = .dead;
-            return link;
-        };
-        const job_host = std.heap.c_allocator.dupe(u8, host) catch {
-            std.heap.c_allocator.destroy(job);
-            link.state = .dead;
-            return link;
-        };
-        self.view.fence.ref();
-        job.* = .{ .fence = self.view.fence, .host = job_host };
-        const th = c.g_thread_new("sketerm-lsplink", @ptrCast(&linkThread), @ptrCast(job));
-        if (th == null) {
-            job.destroy();
-            link.state = .dead;
-            return link;
-        }
-        c.g_thread_unref(th);
-        dbg("link {s}: connecting", .{host});
-        return link;
-    }
-
-    /// The connect worker handed the socket back (or failed).
-    fn onLinkConnected(self: *Manager, job: *LinkJob) void {
-        const link = self.findLink(job.host) orelse {
-            if (job.ok) job.conn.deinit();
-            return;
-        };
-        if (link.state != .connecting) {
-            if (job.ok) job.conn.deinit();
-            return;
-        }
-        if (!job.ok or !job.lsp) {
-            dbg("link {s}: {s}", .{ link.host, if (!job.ok) "connect failed" else "daemon has no lsp support" });
-            link.state = .dead;
-            link.waiting.clearRetainingCapacity();
-            return;
-        }
-        link.conn = job.conn;
-        link.conn.setNonBlocking();
-        link.state = .up;
-        link.watch_in = c.g_unix_fd_add(
-            link.conn.fd,
-            c.G_IO_IN | c.G_IO_ERR | c.G_IO_HUP,
-            @ptrCast(&RemoteLink.onLinkReadable),
-            @ptrCast(link),
-        );
-        dbg("link {s}: up", .{link.host});
-        // Everything that parked while we dialed.
-        var i: usize = 0;
-        while (i < link.waiting.items.len) : (i += 1) {
-            const tab = self.view.findTabByIdPublic(link.waiting.items[i]) orelse continue;
-            link.sendOpen(tab);
-        }
-        link.waiting.clearRetainingCapacity();
-    }
-
-    /// Drop `link` when nothing references it any more — the remote
-    /// mirror of "the last tab out shuts the server down". Called
-    /// after a remote Conn is destroyed.
-    fn maybeDropLink(self: *Manager, link: *RemoteLink) void {
-        if (link.state == .connecting) return;
-        if (link.pending.items.len > 0 or link.waiting.items.len > 0) return;
-        for (self.conns.items) |cn| {
-            if (cn.remote) |*rm| {
-                if (rm.link == link) return;
-            }
-        }
-        for (self.links.items, 0..) |x, i| {
-            if (x != link) continue;
-            _ = self.links.orderedRemove(i);
-            break;
-        }
-        dbg("link {s}: dropped (idle)", .{link.host});
-        link.destroyLink();
-    }
-
-    /// `lsp_reply` from a host's daemon: it picked a server, resolved
-    /// the root on ITS filesystem, and spawned — or found nothing, in
-    /// which case the tab silently stays serverless.
-    fn onLspReply(self: *Manager, link: *RemoteLink, payload: []const u8) void {
-        const Reply = struct {
-            req: u32 = 0,
-            ok: bool = false,
-            chan: u32 = 0,
-            name: []const u8 = "",
-            root: []const u8 = "",
-        };
-        var parsed = std.json.parseFromSlice(Reply, self.alloc, payload, .{
-            .ignore_unknown_fields = true,
-        }) catch return;
-        defer parsed.deinit();
-        const rep = parsed.value;
-        const tab_id = link.takePending(rep.req) orelse {
-            if (rep.ok) link.discardChannel(rep.chan);
-            return;
-        };
-        if (!rep.ok) {
-            dbg("link {s}: no server for req {d} (remote host has none installed)", .{ link.host, rep.req });
-            return;
-        }
-        const tab = self.view.findTabByIdPublic(tab_id) orelse {
-            // Closed while the request was in flight; the channel's
-            // server was spawned for nothing — take it down.
-            link.discardChannel(rep.chan);
-            return;
-        };
-        dbg("link {s}: {s} root={s} chan={d}", .{ link.host, rep.name, rep.root, rep.chan });
-        if (self.findRemoteConn(link, rep.name, rep.root)) |existing| {
-            // Two documents of one project raced their lsp_opens: keep
-            // the first server, kill the duplicate.
-            link.discardChannel(rep.chan);
-            self.bindTabToConn(tab, existing);
-            return;
-        }
-        const cn = self.createRemoteConn(link, rep.name, rep.root, rep.chan) orelse {
-            link.discardChannel(rep.chan);
-            return;
-        };
-        self.bindTabToConn(tab, cn);
-    }
-
-    fn createRemoteConn(self: *Manager, link: *RemoteLink, name: []const u8, root: []const u8, chan: u32) ?*Conn {
-        const cn = self.alloc.create(Conn) catch return null;
-        const name_dup = self.alloc.dupe(u8, name) catch {
-            self.alloc.destroy(cn);
-            return null;
-        };
-        const root_dup = self.alloc.dupe(u8, root) catch {
-            self.alloc.free(name_dup);
-            self.alloc.destroy(cn);
-            return null;
-        };
-        const root_uri = servers.pathToUri(self.alloc, root) catch {
-            self.alloc.free(name_dup);
-            self.alloc.free(root_dup);
-            self.alloc.destroy(cn);
-            return null;
-        };
-        cn.* = .{
-            .mgr = self,
-            .name = name_dup,
-            .root = root_dup,
-            .root_uri = root_uri,
-            .remote = .{ .link = link, .chan = chan },
-            .sess = undefined,
-        };
-        cn.sess = session.Session.init(self.alloc, cn.handler());
-        self.conns.append(self.alloc, cn) catch {
-            cn.sess.deinit();
-            self.alloc.free(cn.name);
-            self.alloc.free(cn.root);
-            self.alloc.free(cn.root_uri);
-            self.alloc.destroy(cn);
-            return null;
-        };
-        // init_options stays a CLIENT concern (it travels inside
-        // `initialize`); find the config record the daemon's pick
-        // corresponds to. pid 0 = "no processId": ours means nothing
-        // on the server's host, and clangd exits when the advertised
-        // pid does not exist.
-        var init_options: []const u8 = "";
-        if (self.cfg()) |conf| {
-            const list = conf.lspServerList(self.alloc) catch &.{};
-            defer self.alloc.free(list);
-            for (list) |srv| {
-                if (std.mem.eql(u8, srv.name, name)) {
-                    init_options = srv.init_options;
-                    break;
-                }
-            }
-            cn.sess.start(cn.root_uri, 0, init_options);
-        } else cn.sess.start(cn.root_uri, 0, "");
-        cn.pumpWrite();
-        return cn;
-    }
-
     /// The transport-blind bottom half of an attach: point the tab's
     /// state at `cn` and open the document once both sides are ready.
     /// Shared by the local spawn path and the remote reply path.
-    fn bindTabToConn(self: *Manager, tab: *ETab, cn: *Conn) void {
+    pub fn bindTabToConn(self: *Manager, tab: *ETab, cn: *Conn) void {
         const spec = tab.spec orelse return;
         const loc = paths.parseSpec(spec);
         const lang = tab.language.lspId();
@@ -1435,22 +568,32 @@ pub const Manager = struct {
         if (tab.lsp) |st| {
             if (st.conn != null) return; // already served
         }
-        const link = self.findLink(host) orelse self.startLink(host) orelse return;
+        // A dead link whose backoff has passed is redialed here.
+        const link = registry.linkFor(host) orelse return;
         switch (link.state) {
             .dead => {},
-            .up => link.sendOpen(tab),
-            .connecting => {
-                for (link.waiting.items) |id| {
-                    if (id == tab.id) return;
-                }
-                link.waiting.append(self.alloc, tab.id) catch {};
-            },
+            .up => link.sendOpen(conf, tab),
+            .connecting => link.park(tab.id),
+        }
+    }
+
+    /// `host`'s link came (back) up: every serverless document of this
+    /// face on that host asks for its server again.
+    pub fn reattachHost(self: *Manager, host: []const u8) void {
+        for (self.view.tabs.items) |tab| {
+            const spec = tab.spec orelse continue;
+            const tab_host = paths.parseSpec(spec).host orelse continue;
+            if (!std.mem.eql(u8, tab_host, host)) continue;
+            if (tab.lsp) |st| {
+                if (st.conn != null) continue;
+            }
+            self.attachTab(tab);
         }
     }
 
     fn commandInstalled(ctx: ?*anyopaque, command: []const u8) bool {
         const self = cast.userData(Manager, ctx);
-        return proc.onPath(self.alloc, command);
+        return @import("../lsp/proc.zig").onPath(self.alloc, command);
     }
 
     fn dirExists(_: ?*anyopaque, dir: []const u8, name: []const u8) bool {
@@ -1459,131 +602,53 @@ pub const Manager = struct {
         return c.access(full.ptr, c.F_OK) == 0;
     }
 
-    fn spawnConn(self: *Manager, srv: *const @import("../config.zig").LspServer, root: []const u8) ?*Conn {
-        const cn = self.alloc.create(Conn) catch return null;
-        const name = self.alloc.dupe(u8, srv.name) catch {
-            self.alloc.destroy(cn);
-            return null;
-        };
-        const root_dup = self.alloc.dupe(u8, root) catch {
-            self.alloc.free(name);
-            self.alloc.destroy(cn);
-            return null;
-        };
-        const root_uri = servers.pathToUri(self.alloc, root) catch {
-            self.alloc.free(name);
-            self.alloc.free(root_dup);
-            self.alloc.destroy(cn);
-            return null;
-        };
-        cn.* = .{
-            .mgr = self,
-            .name = name,
-            .root = root_dup,
-            .root_uri = root_uri,
-            .sess = undefined,
-        };
-        cn.sess = session.Session.init(self.alloc, cn.handler());
-
-        var argv: std.ArrayList([]const u8) = .empty;
-        defer argv.deinit(self.alloc);
-        proc.splitArgs(self.alloc, srv.args, &argv) catch {};
-        cn.child = proc.spawn(self.alloc, srv.command, argv.items, root) catch {
-            // Nothing was watched or listed yet, so tear down by hand
-            // rather than through `destroy` (which would kill a pid we
-            // never got).
-            cn.sess.deinit();
-            self.alloc.free(cn.name);
-            self.alloc.free(cn.root);
-            self.alloc.free(cn.root_uri);
-            self.alloc.destroy(cn);
-            return null;
-        };
-        cn.child_watch = LocalChildWatch.create(cn.child.pid, cn) orelse {
-            // No source can reap this child later, so finish the exact
-            // child synchronously before discarding the failed spawn.
-            cn.child.killHard();
-            cn.child.closePipes();
-            cn.child.reapBlocking();
-            cn.sess.deinit();
-            self.alloc.free(cn.name);
-            self.alloc.free(cn.root);
-            self.alloc.free(cn.root_uri);
-            self.alloc.destroy(cn);
-            return null;
-        };
-        cn.watch_out = c.g_unix_fd_add(
-            cn.child.stdout,
-            c.G_IO_IN | c.G_IO_ERR | c.G_IO_HUP,
-            @ptrCast(&Conn.onReadable),
-            @ptrCast(cn),
-        );
-        cn.watch_err = c.g_unix_fd_add(
-            cn.child.stderr,
-            c.G_IO_IN | c.G_IO_ERR | c.G_IO_HUP,
-            @ptrCast(&Conn.onStderr),
-            @ptrCast(cn),
-        );
-        self.conns.append(self.alloc, cn) catch {
-            cn.destroy();
-            return null;
-        };
-        cn.sess.start(cn.root_uri, c.getpid(), srv.init_options);
-        cn.pumpWrite();
-        return cn;
-    }
-
-    fn onServerReady(self: *Manager, cn: *Conn) void {
-        dbg("{s} ready (sync={s} completion={} hover={} definition={})", .{ cn.name, @tagName(cn.sess.caps.sync), cn.sess.caps.completion, cn.sess.caps.hover, cn.sess.caps.definition });
-        // Open every already-attached document now that the server has
-        // told us what it can do (didOpen is refused before `.ready`).
+    /// `cn` finished initializing: open every document of this face that
+    /// was waiting for it (didOpen is refused before `.ready`).
+    pub fn onServerReady(self: *Manager, cn: *Conn) void {
         for (self.view.tabs.items) |tab| {
             const st = tab.lsp orelse continue;
             if (st.conn != cn) continue;
             self.openDocument(tab, st);
         }
-        cn.pumpWrite();
-        self.view.updateStatusExternal();
+        self.view.updateStatus();
     }
 
-    fn onServerDead(self: *Manager, cn: *Conn) void {
-        dbg("{s} dead: {s} / stderr: {s}", .{ cn.name, cn.sess.errText(), cn.stderrText() });
-        const local = cn.remote == null;
-        if (local) cn.closing = true;
+    /// `cn` is gone: this face's documents on it become serverless (the
+    /// next feature request re-attaches), and a server that had been
+    /// working, or that said why it stopped, says so on the status line.
+    pub fn onServerDead(self: *Manager, cn: *Conn) void {
+        var any = false;
         for (self.view.tabs.items) |tab| {
             const st = tab.lsp orelse continue;
             if (st.conn != cn) continue;
+            any = true;
             st.conn = null;
             st.sync.open = false;
+            st.passive = false;
             st.diags.clear();
             st.dropDecorations();
         }
-        if (local) cn.refs = 0;
-        if (self.list.open and self.list.mode != .none) self.closePopup();
         // Session.markDead drops the pending table WITHOUT calling back,
         // so an in-flight completion that never got a popup would keep
         // `completion_request_conn` pointing at the Conn the idle
-        // remover is about to free — and the next session's ids restart
+        // remover is about to free, and the next session's ids restart
         // at 1, so a same-address replacement could compare equal.
-        self.invalidateCompletion();
+        if (self.completion_request_conn == cn) self.invalidateCompletion();
+        if (!any) return;
+        if (self.list.open and self.list.mode != .none) self.closePopup();
         if (self.hover.open) self.closeHover();
         self.closeSignature();
-        cn.dropWatches();
-        // Session callbacks are reached from fd and child-watch
-        // callbacks. Removing/freeing their Conn inline would make the
-        // callback return through freed user-data, so local removal is
-        // always deferred to a fresh main-loop turn. Remote teardown is
-        // owned by its daemon channel/link and deliberately unchanged.
-        if (local and cn.remove_idle == 0)
-            cn.remove_idle = c.g_idle_add(@ptrCast(&onRemoveDeadIdle), @ptrCast(cn));
-        self.view.queueRenderExternal();
-    }
-
-    fn onRemoveDeadIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
-        const cn = cast.userData(Conn, user);
-        cn.remove_idle = 0;
-        cn.mgr.removeConn(cn);
-        return 0;
+        var why_buf: [200]u8 = undefined;
+        const why = cn.failureText(&why_buf);
+        if (cn.was_ready or why.len > 0) {
+            var buf: [260]u8 = undefined;
+            const msg = if (why.len > 0)
+                std.fmt.bufPrint(&buf, "{s} stopped: {s}", .{ cn.name, why }) catch "Language server stopped."
+            else
+                std.fmt.bufPrint(&buf, "{s} stopped.", .{cn.name}) catch "Language server stopped.";
+            self.view.postStatus(msg);
+        }
+        self.view.queueRender();
     }
 
     // ---- tab lifecycle -------------------------------------------------
@@ -1615,7 +680,7 @@ pub const Manager = struct {
         const dir = servers.dirnameOf(loc.path);
         const root = servers.findRoot(dir, srv.root_files, dirExists, null);
         dbg("{s} -> {s} ({s}) root={s}", .{ spec, srv.name, srv.command, root });
-        const cn = self.findConn(srv.name, root) orelse self.spawnConn(srv, root) orelse {
+        const cn = registry.findConn(srv.name, root) orelse registry.spawnConn(srv, root) orelse {
             dbg("could not spawn {s}", .{srv.command});
             return;
         };
@@ -1638,7 +703,7 @@ pub const Manager = struct {
     /// `onDocumentReplaced` opens it. Nothing is stranded: that path
     /// calls back in here, and so does `onServerReady` for a document
     /// that finished loading before the server finished starting.
-    fn openDocument(self: *Manager, tab: *ETab, st: *TabState) void {
+    pub fn openDocument(self: *Manager, tab: *ETab, st: *TabState) void {
         const cn = st.conn orelse return;
         if (st.sync.open) return;
         // Before `.ready` the session refuses notifications, so marking
@@ -1654,6 +719,14 @@ pub const Manager = struct {
         // alone (a `.h` whose head reads as C++, a shebang script).
         const refined = tab.language.lspId();
         if (refined.len > 0) st.sync.language_id = refined;
+        // A client opens a URI once per server: the same file in another
+        // face stays passive until that copy closes.
+        if (registry.uriOpenElsewhere(cn, st.sync.uri, tab.id)) {
+            dbg("{s} is open in another face: passive copy", .{st.sync.uri});
+            st.passive = true;
+            return;
+        }
+        st.passive = false;
         const text = tab.doc.textAlloc(self.alloc) catch return;
         defer self.alloc.free(text);
         st.sync.noteSent(1, tab.doc.revision, text);
@@ -1667,8 +740,7 @@ pub const Manager = struct {
 
     /// The async load finished with nothing to load (a new file): there
     /// is no document-replace to ride on, so open it from here.
-    pub fn ensureOpen(self: *Manager, tab: *ETab, load_gen: u64) void {
-        self.finishPendingEdits(tab, load_gen);
+    pub fn ensureOpen(self: *Manager, tab: *ETab) void {
         const st = tab.lsp orelse {
             self.attachTab(tab);
             return;
@@ -1681,52 +753,25 @@ pub const Manager = struct {
     }
 
     fn detachFromConn(self: *Manager, tab: *ETab, st: *TabState, cn: *Conn) void {
-        if (st.sync.open and !cn.closing) {
+        _ = self;
+        const was_open = st.sync.open;
+        if (was_open and !cn.closing) {
             cn.sess.didClose(st.sync.uri);
             cn.pumpWrite();
         }
         st.sync.open = false;
+        st.passive = false;
         cn.sess.forgetTab(tab.id);
         if (cn.refs > 0) cn.refs -= 1;
         st.conn = null;
-        if (cn.refs == 0) self.shutdownConn(cn);
-    }
-
-    /// Ask a server to stop, and SIGKILL it if it does not.
-    fn shutdownConn(self: *Manager, cn: *Conn) void {
-        _ = self;
-        if (cn.closing) return;
-        cn.sess.stop();
-        cn.pumpWrite();
-        cn.child.terminate();
-        if (cn.kill_timer == 0)
-            cn.kill_timer = c.g_timeout_add(SHUTDOWN_GRACE_MS, @ptrCast(&onKillTimer), @ptrCast(cn));
-    }
-
-    fn onKillTimer(user: ?*anyopaque) callconv(.c) c.gboolean {
-        const cn = cast.userData(Conn, user);
-        cn.kill_timer = 0;
-        if (cn.closing) return 0;
-        cn.mgr.removeConn(cn);
-        return 0;
-    }
-
-    fn removeConn(self: *Manager, cn: *Conn) void {
-        for (self.conns.items, 0..) |x, i| {
-            if (x != cn) continue;
-            _ = self.conns.orderedRemove(i);
-            cn.destroy();
-            return;
-        }
+        // The server may know this URI again, through a copy in another
+        // face that waited its turn.
+        if (was_open and !cn.closing) registry.promotePassive(cn, st.sync.uri);
+        if (cn.refs == 0) registry.shutdownConn(cn);
     }
 
     /// The tab is closing (or its document was replaced by a reload).
     pub fn detachTab(self: *Manager, tab: *ETab) void {
-        // Before the early return below: a tab can be queued for
-        // deferred edits and then close (a binary or unreadable file
-        // closes its own tab from the load handler) whether or not it
-        // ever got a server.
-        self.failPendingEdits(tab.id, "the document closed");
         const st = tab.lsp orelse return;
         if (self.list.open and self.list.tab_id == tab.id) self.closePopup();
         if (self.hover.open) self.closeHover();
@@ -1809,12 +854,7 @@ pub const Manager = struct {
     /// The document object was replaced (a load/reload): the old
     /// observer died with it and the server must be told the content
     /// changed wholesale.
-    pub fn onDocumentReplaced(self: *Manager, tab: *ETab, load_gen: u64) void {
-        // A WorkspaceEdit for a file that had no tab opened one; its
-        // bytes have just arrived, so its edits apply now. Done BEFORE
-        // the sync bookkeeping below so the server is told about the
-        // final text in one didChange rather than two.
-        self.finishPendingEdits(tab, load_gen);
+    pub fn onDocumentReplaced(self: *Manager, tab: *ETab) void {
         const st = tab.lsp orelse {
             self.attachTab(tab);
             return;
@@ -1844,29 +884,24 @@ pub const Manager = struct {
 
     // ---- inbound -------------------------------------------------------
 
-    fn tabForUri(self: *Manager, cn: *Conn, uri: []const u8) ?*ETab {
+    /// This face's tab that has `uri` open on `cn` (a passive copy never
+    /// is: the server's view of the file belongs to another face).
+    pub fn tabForUri(self: *Manager, cn: *Conn, uri: []const u8) ?*ETab {
         for (self.view.tabs.items) |tab| {
             const st = tab.lsp orelse continue;
-            if (st.conn != cn) continue;
+            if (st.conn != cn or st.passive) continue;
             if (std.mem.eql(u8, st.sync.uri, uri)) return tab;
         }
         return null;
     }
 
-    fn handleNotification(self: *Manager, cn: *Conn, method: []const u8, params: std.json.Value) void {
-        if (!std.mem.eql(u8, method, "textDocument/publishDiagnostics")) return;
+    /// `textDocument/publishDiagnostics` for `tab`, routed here by URI.
+    pub fn handleDiagnostics(self: *Manager, cn: *Conn, tab: *ETab, params: std.json.Value) void {
         const obj = switch (params) {
             .object => |o| o,
             else => return,
         };
-        const uri = switch (obj.get("uri") orelse std.json.Value.null) {
-            .string => |s| s,
-            else => return,
-        };
-        const tab = self.tabForUri(cn, uri) orelse {
-            dbg("diagnostics for an unknown uri: {s}", .{uri});
-            return;
-        };
+        const uri = strOf(obj.get("uri")) orelse return;
         const st = tab.lsp orelse return;
         const version: ?i64 = publicationVersion(obj.get("version"));
         if (!st.diags.acceptsPublication(version)) {
@@ -1924,12 +959,45 @@ pub const Manager = struct {
         }
         dbg("diagnostics for {s}: {d}", .{ uri, list.items.len });
         if (!(st.diags.replacePublication(mapper.revision, version, list.items) catch false)) return;
-        self.view.queueRenderExternal();
-        self.view.updateStatusExternal();
+        self.view.queueRender();
+        self.view.updateStatus();
     }
 
-    fn handleResponse(self: *Manager, cn: *Conn, req: session.Request, env: rpc.Envelope) void {
-        const tab = self.view.findTabByIdPublic(req.tab_id);
+    /// `window/showMessage` (and a `showMessageRequest`'s text) on this
+    /// face's status line. Errors, warnings and info are shown; `Log`
+    /// type messages only reach `SKETERM_LSP_DEBUG`.
+    pub fn serverMessage(self: *Manager, cn: *Conn, params: std.json.Value) void {
+        const text = firstLine(conn_mod.messageText(params));
+        if (text.len == 0) return;
+        const kind: i64 = if (params == .object) switch (params.object.get("type") orelse std.json.Value.null) {
+            .integer => |i| i,
+            else => 3,
+        } else 3;
+        dbg("{s} says ({d}): {s}", .{ cn.name, kind, text });
+        if (kind >= 4) return;
+        var buf: [320]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "{s}: {s}", .{ cn.name, @import("../editor/unicode.zig").clipUtf8(text, 200) }) catch return;
+        self.view.postStatus(msg);
+    }
+
+    /// The server asked us to write a `WorkspaceEdit`: how a code action
+    /// that carries only a `command` gets its work done. @return the
+    /// `applied` answer.
+    pub fn onServerApplyEdit(self: *Manager, cn: *Conn, params: std.json.Value) bool {
+        const edit = switch (params) {
+            .object => |o| o.get("edit") orelse std.json.Value.null,
+            else => std.json.Value.null,
+        };
+        const r = self.applyWorkspaceEdit(cn, edit);
+        self.reportEditOutcome(r);
+        // An edit whose files all had to be OPENED has applied nothing
+        // yet but is not a refusal: `applied:false` would make the
+        // server think its command failed.
+        return r.touched + r.opened > 0;
+    }
+
+    pub fn handleResponse(self: *Manager, cn: *Conn, req: session.Request, env: rpc.Envelope) void {
+        const tab = self.view.findTabById(req.tab_id);
         switch (req.kind) {
             .completion => self.onCompletion(cn, req, env, tab),
             .completion_resolve => self.onCompletionResolve(req, env),
@@ -1984,6 +1052,11 @@ pub const Manager = struct {
             self.view.setStatusText("Language server is still starting…");
             return null;
         }
+        if (st.passive) {
+            self.view.setStatusText("This file is open in another editor; its language server follows that copy.");
+            return null;
+        }
+        cn.last_mgr = self;
         self.flushChanges(tab);
         return .{ .tab = tab, .st = st, .cn = cn };
     }
@@ -2635,7 +1708,7 @@ pub const Manager = struct {
             self.view.setStatusText("Rename failed.");
             return;
         }
-        const tab = self.view.findTabByIdPublic(req.tab_id) orelse return;
+        const tab = self.view.findTabById(req.tab_id) orelse return;
         if (!EditStamp.fromRequest(req).matches(tab.id, tab.doc.revision)) {
             self.view.setStatusText("Document changed while renaming; try again.");
             return;
@@ -2818,69 +1891,35 @@ pub const Manager = struct {
             if (self.applyTextEdits(tab, edits, enc)) out.touched += 1 else out.skipped += 1;
             return;
         }
+        _ = spec;
         const blob = serializeValue(self.alloc, edits) catch {
             out.skipped += 1;
             return;
         };
         defer self.alloc.free(blob);
-        self.pending_edits.push(self.alloc, spec, blob, enc, tab.id, tab.io_gen) catch {
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(self.alloc);
+        payload.print(self.alloc, "{s}\n{s}", .{ @tagName(enc), blob }) catch {
+            out.skipped += 1;
+            return;
+        };
+        self.view.deferEdit(tab, .lsp_text_edits, payload.items) catch {
             out.skipped += 1;
             return;
         };
         out.opened += 1;
     }
 
-    const PendingOutcome = struct { applied: usize = 0, stale: usize = 0 };
-
-    /// Apply (and drop) every queued edit for `tab`, now that its load
-    /// has settled. Nothing stays queued afterwards.
-    fn drainPendingEdits(self: *Manager, tab: *ETab, load_gen: u64) PendingOutcome {
-        var taken = self.pending_edits.take(self.alloc, tab.id, load_gen);
-        defer {
-            for (taken.ready.items) |e| e.deinit(self.alloc);
-            taken.ready.deinit(self.alloc);
-        }
-        var out = PendingOutcome{ .stale = taken.stale };
-        for (taken.ready.items) |e| {
-            var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, e.edits, .{}) catch continue;
-            defer parsed.deinit();
-            if (self.applyTextEdits(tab, parsed.value, e.enc)) out.applied += 1;
-        }
-        return out;
-    }
-
-    /// A load settled: deliver what it was carrying for this tab.
-    ///
-    /// EVERY path that clears `ETab.loading` has to reach this or
-    /// `failPendingEdits` — a first load, a not-found load, a
-    /// reload-in-place, and a load that ends in the tab being closed.
-    /// `EditorView.onIoDone` enforces that with a defer rather than by
-    /// remembering.
-    pub fn finishPendingEdits(self: *Manager, tab: *ETab, load_gen: u64) void {
-        const drained = self.drainPendingEdits(tab, load_gen);
-        if (drained.applied > 0) {
-            self.pending_touched += drained.applied;
-            self.reportDeferredEdits();
-        }
-        if (drained.stale > 0)
-            self.view.setStatusText("This document was replaced before a deferred edit could be applied.");
-    }
-
-    /// The tab can never receive its queued edits (it is closing, or
-    /// its load failed). Say so: `reportEditOutcome` already promised
-    /// the user those files were edited.
-    /// Takes an ID rather than a pointer: the tab is often already
-    /// destroyed by the path that has to report this.
-    pub fn failPendingEdits(self: *Manager, tab_id: u64, why: [*:0]const u8) void {
-        const lost = self.pending_edits.drop(self.alloc, tab_id);
-        if (lost == 0) return;
-        var buf: [200:0]u8 = undefined;
-        const msg = std.fmt.bufPrintZ(
-            &buf,
-            "{d} edit(s) from a cross-file change were NOT applied: {s}.",
-            .{ lost, why },
-        ) catch "A cross-file edit was not applied.";
-        self.view.setStatusText(msg);
+    /// A deferred `TextEdit[]` for a file whose load just landed. The
+    /// payload is `<encoding>\n<TextEdit[] JSON>`: the connection that
+    /// produced the edits may be gone by now, so its encoding travels
+    /// with them. @return whether the edits applied.
+    pub fn applyDeferred(self: *Manager, tab: *ETab, payload: []const u8) bool {
+        const nl = std.mem.indexOfScalar(u8, payload, '\n') orelse return false;
+        const enc = std.meta.stringToEnum(pos.Encoding, payload[0..nl]) orelse return false;
+        var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, payload[nl + 1 ..], .{}) catch return false;
+        defer parsed.deinit();
+        return self.applyTextEdits(tab, parsed.value, enc);
     }
 
     fn applyTextEdits(self: *Manager, tab: *ETab, edits_val: std.json.Value, enc: pos.Encoding) bool {
@@ -3102,7 +2141,8 @@ pub const Manager = struct {
         const tab = self.view.activeTab() orelse return null;
         const st = tab.lsp orelse return null;
         const cn = st.conn orelse return null;
-        if (cn.sess.state != .ready) return null;
+        if (cn.sess.state != .ready or st.passive) return null;
+        cn.last_mgr = self;
         self.flushChanges(tab);
         return .{ .tab = tab, .st = st, .cn = cn };
     }
@@ -3276,7 +2316,7 @@ pub const Manager = struct {
             self.view.setStatusText("The server could not resolve that action.");
             return;
         }
-        const tab = self.view.findTabByIdPublic(req.tab_id) orelse return;
+        const tab = self.view.findTabById(req.tab_id) orelse return;
         if (!EditStamp.fromRequest(req).matches(tab.id, tab.doc.revision)) {
             self.view.setStatusText("Document changed; ask for code actions again.");
             return;
@@ -3384,9 +2424,10 @@ pub const Manager = struct {
     /// The deferred half of a WorkspaceEdit landed (a file that had to
     /// be opened first). Restates the running total so the user is not
     /// left with a count that was only a promise.
-    fn reportDeferredEdits(self: *Manager) void {
+    pub fn reportDeferredEdits(self: *Manager, applied: usize) void {
+        self.pending_touched += applied;
         var buf: [200:0]u8 = undefined;
-        const remaining = self.pending_edits.len();
+        const remaining = self.view.deferred.countKind(.lsp_text_edits);
         const msg = if (remaining > 0)
             std.fmt.bufPrintZ(
                 &buf,
@@ -3573,7 +2614,7 @@ pub const Manager = struct {
             win.to,
         ) catch return;
         dbg("inlayHint: {d} hints for lines {d}..{d}", .{ st.hints.items.items.len, win.from, win.to });
-        self.view.queueRenderExternal();
+        self.view.queueRender();
     }
 
     /// Show hint `idx`'s tooltip at the pointer, resolving it first when
@@ -3671,7 +2712,7 @@ pub const Manager = struct {
             st.sem_ranged = false;
         }
         self.rebuildSemanticSpans(tab, st, cn);
-        self.view.queueRenderExternal();
+        self.view.queueRender();
     }
 
     /// Decode the packed array into document byte ranges tagged with a
@@ -3905,14 +2946,20 @@ pub const Manager = struct {
     /// `EditorView.postStatus`, which does that for any message.
     pub fn statusSummary(self: *Manager, tab: *ETab, buf: []u8) []const u8 {
         const st = tab.lsp orelse return "";
-        if (st.conn == null) return "";
+        const cn = st.conn orelse return "";
+        var w: std.Io.Writer = .fixed(buf);
+        var prog_buf: [220]u8 = undefined;
+        const prog = cn.sess.progress.summary(&prog_buf);
+        if (prog.len > 0) w.print(STATUS_SEP ++ "{s}: {s}", .{ cn.name, prog }) catch {};
         if (self.diagnosticTextAtCaret(tab)) |txt| {
             defer self.alloc.free(txt);
-            return std.fmt.bufPrint(buf, "  —  {s}", .{txt}) catch "";
+            w.print(STATUS_SEP ++ "{s}", .{txt}) catch {};
+            return buf[0..w.end];
         }
         const cnts = st.diags.counts();
-        if (cnts.errors == 0 and cnts.warnings == 0) return "";
-        return std.fmt.bufPrint(buf, "  —  {d} error(s), {d} warning(s)", .{ cnts.errors, cnts.warnings }) catch "";
+        if (cnts.errors != 0 or cnts.warnings != 0)
+            w.print(STATUS_SEP ++ "{d} error(s), {d} warning(s)", .{ cnts.errors, cnts.warnings }) catch {};
+        return buf[0..w.end];
     }
 
     // ---- popup widgets --------------------------------------------------------
@@ -4473,7 +3520,7 @@ const TabCtx = struct {
     }
 
     fn resolve(self: *TabCtx) ?struct { mgr: *Manager, tab: *ETab } {
-        const tab = self.mgr.view.findTabByIdPublic(self.tab_id) orelse return null;
+        const tab = self.mgr.view.findTabById(self.tab_id) orelse return null;
         return .{ .mgr = self.mgr, .tab = tab };
     }
 };
@@ -4921,177 +3968,4 @@ test "lsp workspace edit: null and absent versions remain unversioned" {
     try std.testing.expect(textDocumentVersion(.null) == .unversioned);
     try std.testing.expect(textDocumentVersion(.{ .integer = 7 }) == .numeric);
     try std.testing.expect(textDocumentVersion(.{ .string = "7" }) == .invalid);
-}
-
-fn testWaitForChildReaped(pid: c.pid_t, timeout_ms: usize) bool {
-    var elapsed: usize = 0;
-    while (elapsed < timeout_ms) : (elapsed += 1) {
-        while (c.g_main_context_iteration(null, 0) != 0) {}
-        if (c.kill(pid, 0) < 0 and std.posix.errno(-1) == .SRCH) {
-            var status: c_int = 0;
-            const r = c.waitpid(pid, &status, c.WNOHANG);
-            if (r < 0 and std.posix.errno(r) == .INTR) continue;
-            return r < 0;
-        }
-        _ = c.usleep(1000);
-    }
-    return false;
-}
-
-fn testWaitForProcessGroupGone(pgid: c.pid_t, timeout_ms: usize) bool {
-    var elapsed: usize = 0;
-    while (elapsed < timeout_ms) : (elapsed += 1) {
-        while (c.g_main_context_iteration(null, 0) != 0) {}
-        if (c.kill(-pgid, 0) < 0 and std.posix.errno(-1) == .SRCH) return true;
-        _ = c.usleep(1000);
-    }
-    return false;
-}
-
-fn testWaitForFakeServerReady(child: *proc.Child) bool {
-    var buf: [64]u8 = undefined;
-    var used: usize = 0;
-    var elapsed: usize = 0;
-    while (elapsed < 2000) : (elapsed += 1) {
-        const n = c.read(child.stdout, buf[used..].ptr, buf.len - used);
-        if (n > 0) {
-            used += @intCast(n);
-            if (std.mem.indexOf(u8, buf[0..used], "ready") != null) return true;
-        }
-        _ = c.usleep(1000);
-    }
-    return false;
-}
-
-test "lsp local pool rejects a dead connection and selects its replacement" {
-    const testing = std.testing;
-    var view: EditorView = undefined;
-    var mgr = Manager{ .view = &view, .alloc = testing.allocator };
-    defer mgr.conns.deinit(testing.allocator);
-
-    var dead = Conn{
-        .mgr = &mgr,
-        .name = @constCast(@as([]const u8, "fake")),
-        .root = @constCast(@as([]const u8, "/workspace")),
-        .root_uri = @constCast(@as([]const u8, "file:///workspace")),
-        .sess = undefined,
-    };
-    dead.sess = session.Session.init(testing.allocator, dead.handler());
-    defer dead.sess.deinit();
-    dead.sess.state = .dead;
-    try mgr.conns.append(testing.allocator, &dead);
-    try testing.expect(mgr.findConn("fake", "/workspace") == null);
-
-    var replacement = Conn{
-        .mgr = &mgr,
-        .name = @constCast(@as([]const u8, "fake")),
-        .root = @constCast(@as([]const u8, "/workspace")),
-        .root_uri = @constCast(@as([]const u8, "file:///workspace")),
-        .sess = undefined,
-    };
-    replacement.sess = session.Session.init(testing.allocator, replacement.handler());
-    defer replacement.sess.deinit();
-    replacement.sess.state = .initializing;
-    try mgr.conns.append(testing.allocator, &replacement);
-    try testing.expectEqual(&replacement, mgr.findConn("fake", "/workspace").?);
-}
-
-test "lsp local child watch reaps a crashed fake server before restart" {
-    const testing = std.testing;
-    var crashed = try proc.spawn(testing.allocator, "sh", &.{ "-c", "exit 23" }, "/");
-    const crashed_pid = crashed.pid;
-    const crashed_watch = LocalChildWatch.create(crashed_pid, null);
-    try testing.expect(crashed_watch != null);
-    if (crashed_watch == null) {
-        crashed.killHard();
-        crashed.closePipes();
-        crashed.reapBlocking();
-        return;
-    }
-    crashed.closePipes();
-    try testing.expect(testWaitForChildReaped(crashed_pid, 2000));
-
-    var replacement = try proc.spawn(
-        testing.allocator,
-        "sh",
-        &.{ "-c", "trap '' TERM; printf 'ready\\n'; while :; do sleep 1; done" },
-        "/",
-    );
-    const replacement_pid = replacement.pid;
-    const replacement_watch = LocalChildWatch.create(replacement_pid, null);
-    try testing.expect(replacement_watch != null);
-    if (replacement_watch == null) {
-        replacement.killHard();
-        replacement.closePipes();
-        replacement.reapBlocking();
-        return;
-    }
-    try testing.expect(testWaitForFakeServerReady(&replacement));
-    replacement.killHard();
-    replacement.closePipes();
-    try testing.expect(testWaitForChildReaped(replacement_pid, 2000));
-    try testing.expect(testWaitForProcessGroupGone(replacement_pid, 2000));
-}
-
-test "lsp local shutdown retains reap watch after connection teardown" {
-    const testing = std.testing;
-    var child = try proc.spawn(
-        testing.allocator,
-        "sh",
-        &.{ "-c", "trap '' TERM; printf 'ready\\n'; while :; do sleep 1; done" },
-        "/",
-    );
-    const pid = child.pid;
-    var child_owned = true;
-    defer if (child_owned) {
-        child.killHard();
-        child.closePipes();
-        child.reapBlocking();
-    };
-    try testing.expect(testWaitForFakeServerReady(&child));
-
-    var view: EditorView = undefined;
-    var mgr = Manager{ .view = &view, .alloc = testing.allocator };
-    defer mgr.conns.deinit(testing.allocator);
-    const cn = try testing.allocator.create(Conn);
-    cn.* = .{
-        .mgr = &mgr,
-        .name = try testing.allocator.dupe(u8, "fake"),
-        .root = try testing.allocator.dupe(u8, "/workspace"),
-        .root_uri = try testing.allocator.dupe(u8, "file:///workspace"),
-        .child = child,
-        .sess = undefined,
-    };
-    child_owned = false;
-    cn.sess = session.Session.init(testing.allocator, cn.handler());
-    cn.child_watch = LocalChildWatch.create(pid, cn);
-    try testing.expect(cn.child_watch != null);
-    if (cn.child_watch == null) {
-        cn.destroy();
-        return;
-    }
-    try mgr.conns.append(testing.allocator, cn);
-
-    cn.child.terminate();
-    var elapsed: usize = 0;
-    while (elapsed < 30) : (elapsed += 1) {
-        while (c.g_main_context_iteration(null, 0) != 0) {}
-        _ = c.usleep(1000);
-    }
-    try testing.expect(c.kill(pid, 0) == 0);
-
-    // The dead-session callback schedules this idle instead of freeing
-    // Conn on its own stack; after it runs, only the detached child-watch
-    // record remains to observe and reap the SIGKILLed exact child.
-    cn.closing = true;
-    cn.remove_idle = c.g_idle_add(@ptrCast(&Manager.onRemoveDeadIdle), @ptrCast(cn));
-    try testing.expect(cn.remove_idle != 0);
-    var idle_spins: usize = 0;
-    while (mgr.conns.items.len > 0 and idle_spins < 100) : (idle_spins += 1) {
-        _ = c.g_main_context_iteration(null, 0);
-        _ = c.usleep(1000);
-    }
-    try testing.expectEqual(@as(usize, 0), mgr.conns.items.len);
-    try testing.expect(testWaitForChildReaped(pid, 2000));
-    try testing.expect(testWaitForProcessGroupGone(pid, 2000));
 }
