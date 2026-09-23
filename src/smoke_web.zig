@@ -1252,6 +1252,9 @@ const Client = struct {
     view_create_fail_seq: u32 = 0,
     /// `ev_route_refused` frames seen (a routed helper failing closed).
     route_refused_seq: u32 = 0,
+    /// The last refusal's reason.
+    route_refused_reason: [256]u8 = undefined,
+    route_refused_len: usize = 0,
     view_create_fail_view: u32 = 0,
     view_create_fail_context: u32 = 0,
     view_create_fail_reason: [128]u8 = @splat(0),
@@ -2200,9 +2203,11 @@ const Client = struct {
                 self.view_create_fail_seq += 1;
             },
             .ev_route_refused => {
-                _ = proto.decode(proto.EvRouteRefused, frame.payload) catch fail("ev_route_refused decode");
+                const r = proto.decode(proto.EvRouteRefused, frame.payload) catch fail("ev_route_refused decode");
                 // Must follow the handshake, never precede it.
                 if (self.ack_proto == 0) fail("ev_route_refused arrived before hello_ack");
+                self.route_refused_len = @min(r.reason.len, self.route_refused_reason.len);
+                @memcpy(self.route_refused_reason[0..self.route_refused_len], r.reason[0..self.route_refused_len]);
                 self.route_refused_seq += 1;
             },
             .ev_cert_error => {
@@ -2964,6 +2969,11 @@ const IceCount = struct { total: u32, udp: u32 };
 /// UDP ones separately: what a page can learn of this machine's network
 /// through WebRTC. Gathering ends at `complete` or after 4s.
 fn iceProbe(cl: *Client, view: u32, comptime what: []const u8) IceCount {
+    // On a loaded document of its own: an eval sent into a fresh view
+    // races its first navigation and is interrupted by it.
+    cl.resetTitle();
+    cl.send(proto.Navigate{ .view = view, .url = "data:text/html,<title>ice-probe</title>" });
+    if (!cl.waitTitle("ice-probe", 20_000)) fail(what ++ ": the probe page never loaded");
     const js =
         "(async()=>{const pc=new RTCPeerConnection({iceServers:[]});pc.createDataChannel('x');" ++
         "const c=[];pc.onicecandidate=e=>{if(e.candidate&&e.candidate.candidate)c.push(e.candidate.candidate)};" ++
@@ -7130,7 +7140,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // The differ binds ids to the element for the document's lifetime,
     // so the chrome that a modal made inert comes back under its old
     // ids and is summarised on one line instead of re-sent in full.
+    cl.resetTitle();
     cl.navigate(modal_page);
+    // The query must reach THIS document: sent straight after the
+    // navigate, a loaded host answered it from the previous page.
+    if (!cl.waitTitle("Hosts", 20_000)) fail("stage 11b modal: the modal page never loaded");
     // A query BEFORE any walk of this document solicits one instead of
     // answering "no snapshot yet": act-by-name right after an open with
     // the first snapshot skipped must not cost a snapshot turn.
@@ -9358,6 +9372,32 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         pass("stage 26 proxy refusal (a refused route serves nothing: told after the handshake, context-0 and container views both refused, no buffer)");
         fc.deinit();
         reapHelper(fail_pid, "stage 26 proxy refusal");
+    }
+
+    // The WebRTC half of the route is as load-bearing as the proxy: an
+    // instance whose engine accepts the proxy but refuses the policy
+    // that keeps UDP inside it fails closed the same way, and says why.
+    {
+        var sock_w_buf: [96]u8 = undefined;
+        const sock_w = std.fmt.bufPrintZ(&sock_w_buf, "{s}/xw.sock", .{dir}) catch fail("socket path");
+        var cache_w_buf: [128]u8 = undefined;
+        const cache_w = std.fmt.bufPrintZ(&cache_w_buf, "{s}/cache-webrtc-fail", .{dir}) catch fail("cache path");
+        _ = c.setenv("SKETERM_WEB_FAIL_WEBRTC_POLICY", "1", 1);
+        const w_pid = spawnHelperArgs(exe, sock_w.ptr, cache_w.ptr, &[_][*:0]const u8{ "--ozone-platform=headless", "--proxy", "socks5://127.0.0.1:9" });
+        _ = c.unsetenv("SKETERM_WEB_FAIL_WEBRTC_POLICY");
+        g_pid = w_pid;
+        var wc = Client{ .gpa = gpa, .fd = connectWithRetry(sock_w.ptr, sock_w.len) };
+        wc.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web-webrtc-fail" });
+        if (!wc.waitSeq(&wc.route_refused_seq, 0, 20_000))
+            fail("stage 26 webrtc refusal: an instance whose WebRTC policy was refused never said so");
+        if (std.mem.indexOf(u8, wc.route_refused_reason[0..wc.route_refused_len], "WebRTC") == null)
+            fail("stage 26 webrtc refusal: the refusal does not name the WebRTC policy");
+        wc.send(proto.ViewCreate{ .view = egress_global_fail_view, .w = 320, .h = 240, .scale_x1000 = 1000, .context = 0 });
+        if (!wc.waitSeq(&wc.view_create_fail_seq, 0, 10_000))
+            fail("stage 26 webrtc refusal: a view of the refused instance was created");
+        pass("stage 26 webrtc refusal (a refused WebRTC policy fails the route closed and names itself)");
+        wc.deinit();
+        reapHelper(w_pid, "stage 26 webrtc refusal");
     }
 
     // ── Stage 37: cookie JAR isolation between containers ─────

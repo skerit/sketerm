@@ -30,6 +30,7 @@ const appdrive = @import("ipc/appdrive.zig");
 const ctlsock = @import("smoke/ctlsock.zig");
 const tcpserver = @import("smoke/tcpserver.zig");
 const editorlang_stage = @import("smoke/editorlang.zig");
+const rigwin = @import("smoke/rigwin.zig");
 const muxclient = @import("mux/client.zig");
 const muxwire = @import("mux/wire.zig");
 const panel_assets = @import("ui/panel/assets.zig");
@@ -489,6 +490,25 @@ pub fn main() u8 {
     _ = c.setenv("XDG_CACHE_HOME", rt.ptr, 1);
     _ = c.setenv("XDG_DATA_HOME", rt.ptr, 1);
     _ = c.unsetenv("SKETERM_SOCKET");
+    // Run from inside a sketerm pane, the rig inherits that pane's
+    // identity, and the GUI child then took `SKETERM_MUX_SOCKET` as its
+    // web store's daemon: every page the rig loaded was recorded in the
+    // USER'S real browsing history.
+    for ([_][*:0]const u8{ "SKETERM_MUX_SOCKET", "SKETERM_SESSION", "SKETERM_SESSION_ORIGIN_ID", "SKETERM_PANE_ID" }) |name|
+        _ = c.unsetenv(name);
+    // Downloads land in the rig too: with no user-dirs.dirs under the
+    // isolated config home, GLib's download directory falls back to the
+    // user's REAL $HOME.
+    {
+        var dl_buf: [300:0]u8 = undefined;
+        const dl = std.fmt.bufPrintZ(&dl_buf, "{s}/dl", .{rt}) catch return fail("download dir path");
+        _ = c.mkdir(dl.ptr, 0o700);
+        var ud_path_buf: [300:0]u8 = undefined;
+        const ud_path = std.fmt.bufPrintZ(&ud_path_buf, "{s}/user-dirs.dirs", .{rt}) catch return fail("user-dirs path");
+        var ud_buf: [400]u8 = undefined;
+        const ud = std.fmt.bufPrint(&ud_buf, "XDG_DOWNLOAD_DIR=\"{s}\"\n", .{dl}) catch return fail("user-dirs body");
+        if (!writeFile(ud_path, ud)) return fail("could not write the rig's user-dirs.dirs");
+    }
     if (c.getenv("SKETERM_SMOKE_E2E_KILL_IMAGES") != null)
         _ = c.setenv("SKETERM_MUX_LOG", "debug", 1);
     defer @import("util/pathz.zig").removeTree(rt);
@@ -851,7 +871,7 @@ pub fn main() u8 {
         if (offloadPolicyStage(allocator, app, sock_path)) |why| return failMsg(why);
         // The general rig SIGKILLs its GUI. This stage must observe normal
         // surface destruction, not mistake a truncated trace for a leak.
-        app.closeWindow(app.windows.items[0].id) catch return fail("offload final window close failed");
+        app.closeWindow(mainWin(app).id) catch return fail("offload final window close failed");
         const exit_deadline = clock.nowMs() + 10_000;
         var exit_status: c_int = 0;
         while (clock.nowMs() < exit_deadline) {
@@ -971,14 +991,14 @@ pub fn main() u8 {
         // so give the toplevel focus the way a desktop would and warm
         // the helper the same way before the stage proper.
         if (app.windows.items.len == 0) return fail("focused browser-action smoke lost its window");
-        app.focusWindow(app.windows.items[0].id) catch return fail("focused browser-action smoke could not focus the window");
+        app.focusWindow(mainWin(app).id) catch return fail("focused browser-action smoke could not focus the window");
         if (roundtrip(allocator, sock_path, "{\"cmd\":\"web-open\",\"target\":\"tab\"}\n")) |r| allocator.free(r) else return fail("focused browser-action smoke could not warm the browser helper");
         var warm_tries: u32 = 0;
         while (warm_tries < 600) : (warm_tries += 1) {
             const list = roundtrip(allocator, sock_path, "{\"cmd\":\"web-list\"}\n") orelse continue;
             defer allocator.free(list);
             if (std.mem.indexOf(u8, list, "\"helper\":\"ready\"") != null) break;
-            _ = app.pumpOnce(100);
+            pumpFor(app, 100);
         } else return fail("focused browser-action smoke: the browser helper never became ready");
         _ = app.waitIdle(300, 8_000);
         if (webActionGuiStage(allocator, app, sock_path)) |why| return failMsg(why);
@@ -990,9 +1010,20 @@ pub fn main() u8 {
         const app = drive orelse return fail("focused web route smoke has no display driver");
         if (!have_web_action) return fail("focused web route smoke needs zig-out/bin/sketerm-webengine (run `zig build web` first)");
         if (app.windows.items.len == 0) return fail("focused web route smoke lost its window");
-        app.focusWindow(app.windows.items[0].id) catch return fail("focused web route smoke could not focus the window");
+        app.focusWindow(mainWin(app).id) catch return fail("focused web route smoke could not focus the window");
         if (webRouteStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
-        say("web route: focused route-button, menu, Tor switch through the SOCKS5 stub, palette actions and Tor-born tab stage passed");
+        say("web route: focused route-button, menu, Tor switch through the SOCKS5 stub, site info, palette actions and Tor-born tab stage passed");
+        teardown();
+        return 0;
+    }
+    if (c.getenv("SKETERM_SMOKE_E2E_WEB_PAGES_ONLY") != null) {
+        const app = drive orelse return fail("focused web pages smoke has no display driver");
+        if (!have_web_action) return fail("focused web pages smoke needs zig-out/bin/sketerm-webengine (run `zig build web` first)");
+        if (app.windows.items.len == 0) return fail("focused web pages smoke lost its window");
+        app.focusWindow(mainWin(app).id) catch return fail("focused web pages smoke could not focus the window");
+        if (webPagesStages(allocator, app, sock_path, rt)) |why| return failMsg(why);
+        if (remoteDownloadStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
+        say("Download File: the picker opened on the remote pane's directory and the pick downloaded into the download directory");
         teardown();
         return 0;
     }
@@ -1000,7 +1031,7 @@ pub fn main() u8 {
         const app = drive orelse return fail("focused web popup smoke has no display driver");
         if (!have_web_action) return fail("focused web popup smoke needs zig-out/bin/sketerm-webengine (run `zig build web` first)");
         if (app.windows.items.len == 0) return fail("focused web popup smoke lost its window");
-        app.focusWindow(app.windows.items[0].id) catch return fail("focused web popup smoke could not focus the window");
+        app.focusWindow(mainWin(app).id) catch return fail("focused web popup smoke could not focus the window");
         if (webPopupStage(allocator, app, sock_path)) |why| return failMsg(why);
         say("web popups: focused popup-window, self-close, tab popup and user-tab stage passed");
         teardown();
@@ -1148,10 +1179,13 @@ pub fn main() u8 {
             say("web popups: a popup-shaped open became a ~500x600 toplevel and no tab, its window.close() took the toplevel down with no shell left, a featureless open became a tab that closed itself, and a user-opened page could not close its own tab");
 
             if (webRouteStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
-            say("web route: the toolbar route button opened its menu, Tor moved the tab through the SOCKS5 stub into its own helper instance, the palette actions moved it back and forth, and new_tor_web_tab opened a Tor-born tab");
+            say("web route: the toolbar route button opened its menu, Tor moved the tab through the SOCKS5 stub into its own helper instance, its site-info popover counted cookies from that instance, the palette actions moved it back and forth, and new_tor_web_tab opened a Tor-born tab");
+            if (webPagesStages(allocator, app, sock_path, rt)) |why| return failMsg(why);
         } else {
             say("SKIP browser-action GUI stage (sketerm-webengine is not built; run `zig build web` first)");
         }
+        if (remoteDownloadStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
+        say("Download File: the picker opened on the remote pane's directory and the pick downloaded into the download directory");
 
         // Run the secondary-window ownership fuse before the known
         // mouse-reporting stage can abort the rest of the full rig.
@@ -1838,7 +1872,7 @@ fn projectStage(
     if (maybe_app) |app| {
         _ = app.drainLive(2_000);
         if (app.windows.items.len == 0) return "the display session lost its window";
-        const win_id = app.windows.items[0].id;
+        const win_id = mainWin(app).id;
         const before = gutterMarkPixels(allocator, app, win_id);
 
         const treq = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"send-text\",\"pane\":{d},\"data\":\"// touched\"}}\n", .{ppane}) catch return "fmt";
@@ -1854,7 +1888,7 @@ fn projectStage(
             // PUMP: `snapshotRgba` reads the last frame this viewer
             // actually received, so a sleep alone would poll a stale
             // window for ever.
-            _ = app.pumpOnce(250);
+            pumpFor(app, 250);
             after = gutterMarkPixels(allocator, app, win_id);
             if (after > before + 8) break;
         }
@@ -1897,7 +1931,7 @@ fn projectStage(
 
     // ── project-wide search, driven by a real seat ────────────────
     if (maybe_app) |app| {
-        const win_id = app.windows.items[0].id;
+        const win_id = mainWin(app).id;
         // Focus the canvas so the chord reaches the editor face.
         const freq = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"focus\",\"pane\":{d}}}\n", .{ppane}) catch return "fmt";
         const fresp = roundtrip(allocator, sock_path, freq) orelse return "project focus roundtrip";
@@ -1928,8 +1962,8 @@ fn projectStage(
         // Activate the first hit: it must open other.zig at the match.
         // Rows are at the bottom panel; walk down from the entry with
         // Tab-free navigation by clicking the first hit row.
-        const wh: f64 = @floatFromInt(app.windows.items[0].h);
-        const ww: f64 = @floatFromInt(app.windows.items[0].w);
+        const wh: f64 = @floatFromInt(mainWin(app).h);
+        const ww: f64 = @floatFromInt(mainWin(app).w);
         // The results list fills the panel below its two toolbars; the
         // first hit row is the second row from its top.
         var opened = false;
@@ -1949,7 +1983,7 @@ fn projectStage(
 
     // ── the outline panel ─────────────────────────────────────────
     if (maybe_app) |app| {
-        const win_id = app.windows.items[0].id;
+        const win_id = mainWin(app).id;
         const band_before = captureRightBand(allocator, app, win_id) orelse
             return "could not sample the editor canvas band";
         defer band_before.deinit(allocator);
@@ -1993,7 +2027,7 @@ fn projectStage(
 
     // ── previewed, then applied, project-wide replace ─────────────
     if (maybe_app) |app| {
-        const win_id = app.windows.items[0].id;
+        const win_id = mainWin(app).id;
         // Ctrl+Shift+H with the needle already typed opens the replace
         // row AND puts the caret in it.
         app.pressKey(null, "ctrl+shift+h") catch return "injecting ctrl+shift+h failed";
@@ -2017,7 +2051,7 @@ fn projectStage(
         var wrote = false;
         var w_tries: u32 = 0;
         while (w_tries < 80) : (w_tries += 1) {
-            _ = app.pumpOnce(250);
+            pumpFor(app, 250);
             if (fileContains(other_path, "REPLACEDTOKEN")) {
                 wrote = true;
                 break;
@@ -2180,16 +2214,16 @@ fn sidebarChipRight(app: *appdrive.App, win_id: u32) usize {
 /// no longer touches config.conf, so this pixel probe — not a file — is
 /// the proof that a toggle reached the window it was aimed at.
 fn waitSidebarVisible(app: *appdrive.App, win_id: u32, want: bool, timeout_ms: u32) bool {
-    var waited: u32 = 0;
+    // Wall clock, as in `waitPopup`: a pump call is not a time unit.
+    const deadline = clock.nowMs() + timeout_ms;
     while (true) {
         // Live head, not the last replica frame: a full-window commit
         // of a 1250x950 window is over the harness's 1 MB backlog cap
         // (see `viewerWaitOcr`), so frames arrive by resync only.
         _ = app.drainLive(500);
         if ((sidebarChipRight(app, win_id) != 0) == want) return true;
-        if (waited >= timeout_ms) return false;
-        _ = app.pumpOnce(100);
-        waited += 100;
+        if (clock.nowMs() >= deadline) return false;
+        pumpFor(app, 100);
     }
 }
 
@@ -2246,7 +2280,7 @@ fn learnDragRowPair(
             first.?.min_x == drag.?.min_x and
             (!require_below or drag.?.min_y > first.?.min_y))
             return .{ .first = first.?, .drag = drag.? };
-        _ = app.pumpOnce(400);
+        pumpFor(app, 400);
     }
     return null;
 }
@@ -2375,7 +2409,7 @@ fn expectRealTreeStep(
 fn commandPaletteStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]const u8) ?[]const u8 {
     _ = app.drainLive(1_000);
     if (app.windows.items.len == 0) return "the display session lost its window";
-    const win_id = app.windows.items[0].id;
+    const win_id = mainWin(app).id;
 
     const before = tabCount(allocator, sock_path) orelse
         return "list roundtrip failed before the command-palette stage";
@@ -2388,45 +2422,30 @@ fn commandPaletteStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_pa
         keep_n = listPaneIds(r, &keep_ids);
     }
 
-    // Open it through the same action the keybind dispatches.
+    // Open it through the same action the keybind dispatches, in pane
+    // 1's window: unaddressed, the action goes to whichever window GTK
+    // last made active, and a window an earlier stage left open opened
+    // it out of sight of every check below. The window is ACTIVATED
+    // first, as a user's click would: an earlier stage left another
+    // window activated, and this one's hollow cursor showed it was not.
+    app.focusWindow(win_id) catch return "activating the palette's window failed";
+    _ = app.waitIdle(300, 5_000);
     var ref = app.frameRef(win_id, true) orelse return "no baseline frame for the command palette";
     defer ref.deinit(allocator);
-    const opened = roundtrip(allocator, sock_path, "{\"cmd\":\"action\",\"data\":\"command_palette\"}\n") orelse
+    const opened = roundtrip(allocator, sock_path, "{\"cmd\":\"action\",\"pane\":1,\"data\":\"command_palette\"}\n") orelse
         return "command_palette action roundtrip failed";
     allocator.free(opened);
     if (!app.waitChangeSince(win_id, &ref, 15_000, 0.01, null))
         return "the command palette did not open";
-    // Let the present animation finish BEFORE the pre-typing baseline,
-    // or the fade-in is still repainting and the "did the entry take
-    // the text" check below passes on the animation instead.
-    _ = app.waitVisualSettle(win_id, 300, 5_000, 0.002, null);
-
-    // Type the query. The palette filters ~80 rows down to a handful,
-    // which is a large visual change; if nothing moves, the entry never
-    // took the text and any ranking verdict below would be a lie.
-    var ref2 = app.frameRef(win_id, true) orelse return "no pre-typing frame for the command palette";
-    defer ref2.deinit(allocator);
-    app.typeText(null, "tab") catch {};
-    var typed = app.waitChangeSince(win_id, &ref2, 5_000, 0.005, null);
-    if (!typed) {
-        // GTK's wayland IM module can leave a focused GtkText waiting
-        // for the compositor to produce its text, and nothing in this
-        // harness plays IME. A paste goes through GtkText's own binding
-        // and bypasses the IM entirely.
-        app.pasteText(null, "tab") catch return "pasting the palette query failed";
-        typed = app.waitChangeSince(win_id, &ref2, 8_000, 0.005, null);
-    }
-    if (!typed) return "typing 'tab' into the palette changed nothing on screen";
-    _ = app.waitVisualSettle(win_id, 300, 5_000, 0.002, null);
-
-    // No screenshot on the happy path, deliberately. AdwDialog presents
-    // with a fade, and the frame this rig captures reliably predates the
-    // filter being painted — a success artefact would show an
-    // UNFILTERED palette and read as though the stage were bogus. The
-    // verdict below is behavioural and does not depend on pixels; the
-    // failure branch keeps a frame for whoever has to debug a red run.
-    app.pressKey(null, "return") catch return "injecting return into the palette failed";
-    _ = app.waitIdle(300, 5_000);
+    // Type the query, wait for the FILTERED list (the palette narrows
+    // ~80 rows to a handful; the search runs after a delay, and a Return
+    // before it lands runs the unfiltered top row) and press Return.
+    // One palette driver, shared with the editor-languages stage. Aimed
+    // at the palette's window, not the seat's last target: a small
+    // toplevel an earlier stage left mapped had taken the keyboard.
+    // No screenshot on the happy path: the verdict below is behavioural,
+    // and the failure branch keeps a frame.
+    if (editorlang_stage.paletteQuery(allocator, app, win_id, win_id, "tab")) |why| return why;
 
     // This check is self-validating, which is why it is the one that
     // matters: with an EMPTY entry the top row is the catalogue's first,
@@ -2438,7 +2457,7 @@ fn commandPaletteStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_pa
     while (tries < 50) : (tries += 1) {
         got = tabCount(allocator, sock_path) orelse got;
         if (got == before + 1) break;
-        _ = app.pumpOnce(100);
+        pumpFor(app, 100);
     }
     if (got != before + 1) {
         _ = c.fprintf(platform.stderr(), "smoke-e2e: palette tabs %zu -> %zu\n", before, got);
@@ -2466,7 +2485,7 @@ fn commandPaletteStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_pa
     // fade, and until it finishes GTK can still route (and eat) the
     // first keystrokes typed at the shell underneath.
     if (app.windows.items.len > 0)
-        _ = app.waitVisualSettle(app.windows.items[0].id, 300, 5_000, 0.002, null);
+        _ = app.waitVisualSettle(mainWin(app).id, 300, 5_000, 0.002, null);
     return null;
 }
 
@@ -2523,7 +2542,7 @@ fn treeSidebarStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
     if (roundtrip(allocator, sock_path, browser_focus)) |r| allocator.free(r) else return "file-browser focus failed before real tree-key coverage";
     _ = app.waitIdle(400, 8_000);
     if (app.windows.items.len == 0) return "the display session lost its window";
-    const win_id = app.windows.items[0].id;
+    const win_id = mainWin(app).id;
     if (expectRealTreeStep(allocator, app, sock_path, tree_prev_key, "file browser")) |err| return err;
 
     const editor_resp = roundtrip(allocator, sock_path, "{\"cmd\":\"new-editor-tab\",\"pane\":1}\n") orelse
@@ -2581,7 +2600,7 @@ fn treeSidebarStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
             web_pane = std.fmt.parseInt(u32, rest[0..end], 10) catch continue;
             break;
         }
-        _ = app.pumpOnce(100);
+        pumpFor(app, 100);
     } else return "no web view appeared after new_web_tab";
     if (web_pane == 0) return "web-list reported no pane id for the new browser";
     var web_nav_buf: [192]u8 = undefined;
@@ -2668,7 +2687,7 @@ fn treeSidebarStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
     _ = app.waitIdle(300, 5_000);
     app.pressKey(null, tree_toggle_key) catch return "injecting toggle_tab_sidebar failed";
     _ = app.waitIdle(400, 5_000);
-    if (sidebarChipRight(app, win_id) == 0)
+    if (!waitSidebarVisible(app, win_id, true, 6_000))
         return "the real web-face sidebar toggle did not show the sidebar";
 
     const tabs_with_sidebar = blk: {
@@ -2789,7 +2808,7 @@ fn treeSidebarStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
     const width_before = sidebarChipRight(app, win_id);
     if (width_before == 0) return "no selected sidebar row was visible to measure";
     const grab_x = @as(f64, @floatFromInt(width_before + 8));
-    const mid_y = @as(f64, @floatFromInt(app.windows.items[0].h)) * 0.6;
+    const mid_y = @as(f64, @floatFromInt(mainWin(app).h)) * 0.6;
     app.drag(win_id, grab_x, mid_y, grab_x + 90, mid_y, 1) catch
         return "dragging the sidebar divider failed";
     _ = app.waitIdle(300, 5_000);
@@ -2799,7 +2818,7 @@ fn treeSidebarStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
     while (wtries < 40) : (wtries += 1) {
         width_after = sidebarChipRight(app, win_id);
         if (width_after >= width_before + 60) break;
-        _ = app.pumpOnce(100);
+        pumpFor(app, 100);
     }
     if (width_after < width_before + 60) {
         _ = c.fprintf(platform.stderr(), "smoke-e2e: sidebar chip right %zu -> %zu\n", width_before, width_after);
@@ -2810,7 +2829,7 @@ fn treeSidebarStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
     var saw_width = false;
     var ctries: u32 = 0;
     while (ctries < 60) : (ctries += 1) {
-        _ = app.pumpOnce(100);
+        pumpFor(app, 100);
         var pbuf: [512:0]u8 = undefined;
         const p = std.fmt.bufPrintZ(&pbuf, "{s}/sketerm/config.conf", .{rt}) catch break;
         if (readFileAlloc(allocator, p)) |body| {
@@ -2914,7 +2933,7 @@ fn waitTreeParent(
                 if (ok) return loc;
             }
         }
-        _ = app.pumpOnce(200);
+        pumpFor(app, 200);
     }
     return null;
 }
@@ -2929,7 +2948,7 @@ fn sidebarDragStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
         keep_n = listPaneIds(r, &keep_ids);
     }
     if (app.windows.items.len == 0) return "the display session lost its window";
-    const win_id = app.windows.items[0].id;
+    const win_id = mainWin(app).id;
 
     // Two more tabs: enough for a three-row tree with a stable first row.
     var extra: [2]u32 = .{ 0, 0 };
@@ -3027,13 +3046,13 @@ fn sidebarDragStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
                 break;
             }
         }
-        _ = app.pumpOnce(200);
+        pumpFor(app, 200);
     }
     if (!nested_seen)
         return "the dragged sidebar row never repainted below its new parent";
 
     // 2. Drop on the empty list below the rows -> back to the root level.
-    const empty_y = @as(f64, @floatFromInt(app.windows.items[0].h)) * 0.75;
+    const empty_y = @as(f64, @floatFromInt(mainWin(app).h)) * 0.75;
     app.dragDnd(win_id, mid.of(nested).x, mid.of(nested).y, onto.x, empty_y, 1) catch
         return "dragging a sidebar row onto the empty list failed";
     _ = app.waitIdle(300, 6_000);
@@ -3075,7 +3094,7 @@ fn sidebarDragStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
                     break;
                 }
             }
-            _ = app.pumpOnce(100);
+            pumpFor(app, 100);
         }
         if (reordered_ok) break;
     }
@@ -3130,7 +3149,7 @@ fn waitAccent(app: *appdrive.App, win_id: u32, want: bool, timeout_ms: u32) bool
         const n = accentPixels(app, win_id);
         if (want and n >= 200) return true;
         if (!want and n < 20) return true;
-        _ = app.pumpOnce(200);
+        pumpFor(app, 200);
     }
     return false;
 }
@@ -3142,7 +3161,7 @@ fn waitAccent(app: *appdrive.App, win_id: u32, want: bool, timeout_ms: u32) bool
 /// view-only lease chip.
 fn watchAlongStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]const u8) ?[]const u8 {
     if (app.windows.items.len == 0) return "the display session lost its window";
-    const win_id = app.windows.items[0].id;
+    const win_id = mainWin(app).id;
     var keep_ids: [64]u32 = undefined;
     var keep_n: usize = 0;
     {
@@ -3360,7 +3379,7 @@ fn waitAssistantChip(app: *appdrive.App, win_id: u32, want: bool, timeout_ms: u3
         const box = assistantChipBox(app, win_id);
         if (want and box != null) return box;
         if (!want and box == null) return .{ .x = 0, .y = 0, .w = 0, .h = 0 };
-        _ = app.pumpOnce(200);
+        pumpFor(app, 200);
     }
     return null;
 }
@@ -3391,7 +3410,7 @@ fn magentaPixels(app: *appdrive.App, win_id: u32) usize {
 
 /// Non-popup toplevels currently mapped on the display session.
 fn toplevelCount(app: *appdrive.App) usize {
-    _ = app.pumpOnce(120);
+    pumpFor(app, 120);
     var n: usize = 0;
     for (app.windows.items) |w| {
         if (w.popup or w.frames == 0) continue;
@@ -3414,7 +3433,7 @@ fn assistantChipStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_pat
         return null;
     }
     if (app.windows.items.len == 0) return "the display session lost its window";
-    const win_id = app.windows.items[0].id;
+    const win_id = mainWin(app).id;
     var keep_ids: [64]u32 = undefined;
     var keep_n: usize = 0;
     {
@@ -3494,7 +3513,7 @@ fn assistantChipStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_pat
     var waited: u32 = 0;
     var tabs_now: usize = tabs_before;
     while (waited < 15_000) : (waited += 250) {
-        _ = app.pumpOnce(250);
+        pumpFor(app, 250);
         tabs_now = tabCount(allocator, sock_path) orelse tabs_before;
         if (tabs_now > tabs_before) break;
     }
@@ -3517,7 +3536,7 @@ fn assistantChipStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_pat
     // produced the placeholder terminal plus a chrome-less window.
     var embed_waited: u32 = 0;
     while (embed_waited < 20_000 and magentaPixels(app, win_id) < 5_000) : (embed_waited += 250)
-        _ = app.pumpOnce(250);
+        pumpFor(app, 250);
     if (magentaPixels(app, win_id) < 5_000) {
         if (app.screenshotPng(win_id, 0, null, 0)) |shot| {
             defer allocator.free(shot.png);
@@ -3529,7 +3548,7 @@ fn assistantChipStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_pat
         return "a free-floating app window survived the Watch tab (the app must be embedded, not floated)";
     var chip_waited: u32 = 0;
     while (chip_waited < 10_000 and accentPixels(app, win_id) < accent_before_watch + 150) : (chip_waited += 200)
-        _ = app.pumpOnce(200);
+        pumpFor(app, 200);
     if (accentPixels(app, win_id) < accent_before_watch + 150)
         return "the read-only watched app tab exposed no pane-level lease controls";
 
@@ -3638,7 +3657,7 @@ fn waitPaneChip(app: *appdrive.App, win_id: u32, timeout_ms: u32) ?ChipBox {
     var waited: u32 = 0;
     while (waited <= timeout_ms) : (waited += 200) {
         if (paneChipBox(app, win_id)) |box| return box;
-        _ = app.pumpOnce(200);
+        pumpFor(app, 200);
     }
     return null;
 }
@@ -3655,7 +3674,7 @@ fn waitColorBox(app: *appdrive.App, win_id: u32, comptime pred: fn (r: i32, g: i
     var waited: u32 = 0;
     while (waited <= timeout_ms) : (waited += 200) {
         if (colorBox(app, win_id, pred)) |box| return box;
-        _ = app.pumpOnce(200);
+        pumpFor(app, 200);
     }
     return null;
 }
@@ -3689,7 +3708,7 @@ fn assistantWebWatchStage(allocator: std.mem.Allocator, app: *appdrive.App, sock
         return null;
     }
     if (app.windows.items.len == 0) return "the display session lost its window";
-    const win_id = app.windows.items[0].id;
+    const win_id = mainWin(app).id;
     var keep_ids: [64]u32 = undefined;
     var keep_n: usize = 0;
     {
@@ -3748,7 +3767,7 @@ fn assistantWebWatchStage(allocator: std.mem.Allocator, app: *appdrive.App, sock
     var waited: u32 = 0;
     var web_pane: u32 = 0;
     while (waited < 30_000) : (waited += 250) {
-        _ = app.pumpOnce(250);
+        pumpFor(app, 250);
         const r = roundtrip(allocator, sock_path, "{\"cmd\":\"web-list\"}\n") orelse continue;
         defer allocator.free(r);
         if (std.mem.indexOf(u8, r, "watch-page.html")) |at| {
@@ -3824,7 +3843,7 @@ fn assistantWebWatchStage(allocator: std.mem.Allocator, app: *appdrive.App, sock
     var chip_waited: u32 = 0;
     var narrowed = false;
     while (chip_waited < 8_000 and !narrowed) : (chip_waited += 200) {
-        _ = app.pumpOnce(200);
+        pumpFor(app, 200);
         if (paneChipBox(app, win_id)) |now| narrowed = now.w + 20 < take.w else narrowed = true;
     }
     if (!narrowed) {
@@ -3958,7 +3977,7 @@ fn mkdirAllPath(path: [:0]const u8) void {
 fn webActionGuiStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]const u8) ?[]const u8 {
     _ = app.drainLive(1_000);
     if (app.windows.items.len == 0) return "the display session lost its window before the browser-action stage";
-    const win_id = app.windows.items[0].id;
+    const win_id = mainWin(app).id;
     if (openPopup(app) != null) return "a popup was already open before the browser-action stage";
     var keep_ids: [64]u32 = undefined;
     const keep_n = blk: {
@@ -3983,7 +4002,7 @@ fn webActionGuiStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0
             first_view = views[0];
             if (findToolbarColor(app, win_id, .blue) != null) break;
         }
-        _ = app.pumpOnce(100);
+        pumpFor(app, 100);
     } else {
         if (roundtrip(allocator, sock, "{\"cmd\":\"web-list\"}\n")) |l| {
             defer allocator.free(l);
@@ -4016,7 +4035,7 @@ fn webActionGuiStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0
             second_view = activeWebView(list, pane);
             if (second_view != 0 and second_view != first_view and findToolbarColor(app, win_id, .orange) != null) break;
         }
-        _ = app.pumpOnce(100);
+        pumpFor(app, 100);
     } else return "switching the WebGroup to its second page did not refresh the orange per-tab action icon";
 
     // Switch back and require the blue icon to return before clicking it.
@@ -4032,7 +4051,7 @@ fn webActionGuiStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0
                 break;
             }
         }
-        _ = app.pumpOnce(100);
+        pumpFor(app, 100);
     } else return "switching back did not restore the first page's blue action icon";
 
     app.clickEx(win_id, action.x, action.y, 1, 100, 1) catch return "the trusted action-button click could not be injected";
@@ -4080,7 +4099,7 @@ fn webActionGuiStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0
         var waited: u32 = 0;
         while (waited < 20_000) : (waited += 100) {
             if (hasToplevelOtherThan(app, &.{win_id})) |id| break :blk id;
-            _ = app.pumpOnce(100);
+            pumpFor(app, 100);
         }
         return "the browser-action second window never mapped";
     };
@@ -4210,7 +4229,7 @@ fn waitPopupColor(app: *appdrive.App, popup: u32, color: ToolbarColor, timeout_m
     var waited: u32 = 0;
     while (waited < timeout_ms) : (waited += 100) {
         if (findToolbarColor(app, popup, color)) |p| return p;
-        _ = app.pumpOnce(100);
+        pumpFor(app, 100);
     }
     return null;
 }
@@ -4221,7 +4240,7 @@ fn waitToolbarExclusive(app: *appdrive.App, win: u32, wanted: ToolbarColor, abse
         if (findToolbarColor(app, win, wanted)) |point| {
             if (findToolbarColor(app, win, absent) == null) return point;
         }
-        _ = app.pumpOnce(100);
+        pumpFor(app, 100);
     }
     return null;
 }
@@ -4233,7 +4252,7 @@ fn waitSplitToolbarExclusive(app: *appdrive.App, win: u32, wanted: ToolbarColor,
             if (findToolbarColorRange(app, win, absent, true) == null and
                 findToolbarColorRange(app, win, absent, false) == null) return point;
         }
-        _ = app.pumpOnce(100);
+        pumpFor(app, 100);
     }
     return null;
 }
@@ -4243,7 +4262,7 @@ fn waitSplitToolbarAbsent(app: *appdrive.App, win: u32, color: ToolbarColor, tim
     while (waited < timeout_ms) : (waited += 100) {
         if (findToolbarColorRange(app, win, color, true) == null and
             findToolbarColorRange(app, win, color, false) == null) return {};
-        _ = app.pumpOnce(100);
+        pumpFor(app, 100);
     }
     return null;
 }
@@ -4343,7 +4362,7 @@ fn remoteProjectStage(
     // still open with its own marks, and a run once went green off
     // those. Assert the selected tab actually holds the remote pane,
     // and fail the stage if the focus never took.
-    const win_id = app.windows.items[0].id;
+    const win_id = mainWin(app).id;
     {
         var selected = false;
         var st: u32 = 0;
@@ -4365,7 +4384,7 @@ fn remoteProjectStage(
     var marks: usize = 0;
     var g: u32 = 0;
     while (g < 80) : (g += 1) {
-        _ = app.pumpOnce(250);
+        pumpFor(app, 250);
         marks = gutterMarkPixels(allocator, app, win_id);
         if (marks > 8) break;
     }
@@ -4545,9 +4564,9 @@ comptime {
 fn realInputStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]const u8) ?[]const u8 {
     _ = app.drainLive(3_000);
     if (app.windows.items.len == 0) return "the display session has no window to drive";
-    const win_id = app.windows.items[0].id;
-    const win_w = app.windows.items[0].w;
-    const win_h = app.windows.items[0].h;
+    const win_id = mainWin(app).id;
+    const win_w = mainWin(app).w;
+    const win_h = mainWin(app).h;
     if (win_w <= 0 or win_h <= 0) return "the GUI's window has no size";
 
     // A real click in the middle of the window: pointer routing, and
@@ -4578,7 +4597,7 @@ fn realInputStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [
         const resp = roundtrip(allocator, sock_path, "{\"cmd\":\"get-text\",\"pane\":1}\n") orelse continue;
         defer allocator.free(resp);
         if (countMarker(allocator, resp, KEY_MARKER) >= 2) break;
-        _ = app.pumpOnce(200);
+        pumpFor(app, 200);
     } else return "keys typed on the real seat never reached the pane's shell";
 
     // A PNG of the live window: the encode path callers rely on, and a
@@ -4762,7 +4781,7 @@ fn webRouteStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]con
                     break;
                 }
             }
-            if (gui_win == 0) _ = app.pumpOnce(200);
+            if (gui_win == 0) pumpFor(app, 200);
         }
     }
     if (gui_win == 0) {
@@ -4790,7 +4809,15 @@ fn webRouteStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]con
         const btn = waitOcrWordCenter(allocator, app, gui_win, "Direct", 15_000) orelse
             return "the toolbar's route button (\"Direct\") was not found by OCR";
         app.clickEx(gui_win, btn.x, btn.y, 1, 100, 1) catch return "clicking the route button failed";
-        const menu = waitPopup(app, true, 10_000) orelse return "the route button opened no menu";
+        const menu = waitPopup(app, true, 10_000) orelse {
+            _ = c.fprintf(platform.stderr(), "smoke-e2e: route button clicked at %.1f,%.1f\n", btn.x, btn.y);
+            dumpToplevels(app);
+            if (app.screenshotPng(gui_win, 1400, null, 0)) |shot| {
+                defer allocator.free(shot.png);
+                writePng("/tmp/sketerm-e2e-route-nomenu.png", shot.png);
+            } else |_| {}
+            return "the route button opened no menu";
+        };
         _ = app.waitIdle(200, 3_000);
         if (app.screenshotPng(menu, 1024, null, 0)) |shot| {
             defer allocator.free(shot.png);
@@ -4812,14 +4839,14 @@ fn webRouteStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]con
         var waited: u32 = 0;
         while (waited < 30_000) : (waited += 200) {
             if (webPaneTitled(allocator, sock, pane, "\"route\":\"tor\"")) break;
-            _ = app.pumpOnce(200);
+            pumpFor(app, 200);
         } else return "the tab never reported route:tor after choosing Tor";
     }
     {
         var waited: u32 = 0;
         while (waited < 60_000) : (waited += 200) {
             if (tor_stub.tunnels.load(.acquire) > tunnels_at_start and doc.hits.load(.acquire) > direct_hits) break;
-            _ = app.pumpOnce(200);
+            pumpFor(app, 200);
         } else return "the Tor tab's reload never came through the SOCKS5 stub";
     }
     if (tor_stub.first_port.load(.acquire) != doc.lis.port) return "the Tor stub's first tunnel was not to the document server";
@@ -4835,6 +4862,7 @@ fn webRouteStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]con
     if (ocr.available()) {
         if (waitOcrWordCenter(allocator, app, gui_win, "Tor", 15_000) == null) return "the toolbar's route button does not read \"Tor\" after the switch";
     }
+    if (siteInfoAnswersStage(allocator, app, sock, pane)) |why| return why;
 
     // Palette actions move it back and forth over IPC.
     if (roundtrip(allocator, sock, "{\"cmd\":\"action\",\"data\":\"web_route_direct\"}\n")) |r| allocator.free(r) else return "web_route_direct roundtrip failed";
@@ -4842,7 +4870,7 @@ fn webRouteStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]con
         var waited: u32 = 0;
         while (waited < 30_000) : (waited += 200) {
             if (webPaneTitled(allocator, sock, pane, "\"route\":\"direct\"")) break;
-            _ = app.pumpOnce(200);
+            pumpFor(app, 200);
         } else return "web_route_direct did not move the tab back to direct";
     }
     const tunnels_before_tor2 = tor_stub.tunnels.load(.acquire);
@@ -4851,8 +4879,12 @@ fn webRouteStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]con
         var waited: u32 = 0;
         while (waited < 60_000) : (waited += 200) {
             if (webPaneTitled(allocator, sock, pane, "\"route\":\"tor\"") and tor_stub.tunnels.load(.acquire) > tunnels_before_tor2) break;
-            _ = app.pumpOnce(200);
-        } else return "web_route_tor did not move the tab back onto the stub";
+            pumpFor(app, 200);
+        } else {
+            _ = c.fprintf(platform.stderr(), "smoke-e2e: tor tunnels %u -> %u, refused %u, doc hits %u\n", tunnels_before_tor2, tor_stub.tunnels.load(.acquire), tor_stub.refused.load(.acquire), doc.hits.load(.acquire));
+            dumpWebList(allocator, sock);
+            return "web_route_tor did not move the tab back onto the stub";
+        }
     }
 
     // A tab BORN on Tor: blank, routed from its first view.
@@ -4875,16 +4907,456 @@ fn webRouteStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]con
                 if (std.mem.indexOf(u8, before, row) != null) continue;
                 if (webPaneTitled(allocator, sock, p, "\"route\":\"tor\"")) tor_pane = p;
             }
-            _ = app.pumpOnce(200);
+            pumpFor(app, 200);
         }
     }
     if (tor_pane == 0) return "new_tor_web_tab opened no tab on route:tor";
+
+    // Hand the window back without the two Tor tabs: a Tor tab left
+    // focused is what the palette stage after this one then typed into.
+    for ([_]u32{ tor_pane, pane }) |p| {
+        var close_buf: [96]u8 = undefined;
+        const close_req = std.fmt.bufPrint(&close_buf, "{{\"cmd\":\"close-pane\",\"pane\":{d}}}\n", .{p}) catch return "close-pane request";
+        if (roundtrip(allocator, sock, close_req)) |r| allocator.free(r);
+        if (!waitPaneGone(allocator, sock, p, 10_000)) return "a route-stage tab survived close-pane";
+    }
+    if (roundtrip(allocator, sock, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r);
+    _ = app.waitIdle(200, 4_000);
 
     say(if (seat_switched)
         "route: the seat opened the route menu and chose Tor"
     else
         "route: Tor chosen over IPC (no tesseract for the seat half)");
     return null;
+}
+
+/// The site-info popover of a ROUTED tab answers from the tab's own
+/// helper instance: its cookie count arrives ("stored" is in both the
+/// none and the some wording) instead of staying at "Counting cookies"
+/// forever, which is what asking the direct instance about a view it
+/// does not have produced. Closed again with Escape.
+fn siteInfoAnswersStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]const u8, pane: u32) ?[]const u8 {
+    var focus_buf: [96]u8 = undefined;
+    const focus_req = std.fmt.bufPrint(&focus_buf, "{{\"cmd\":\"focus\",\"pane\":{d}}}\n", .{pane}) catch return "focus request";
+    if (roundtrip(allocator, sock, focus_req)) |r| allocator.free(r) else return "focusing the routed tab for site info failed";
+    _ = app.waitIdle(200, 4_000);
+    if (roundtrip(allocator, sock, "{\"cmd\":\"action\",\"data\":\"web_site_info\"}\n")) |r| allocator.free(r) else return "web_site_info roundtrip failed";
+    const pop = waitPopup(app, true, 10_000) orelse return "web_site_info opened no popover on the routed tab";
+    _ = app.waitIdle(200, 3_000);
+    const ocr = @import("util/ocr.zig");
+    if (ocr.available()) {
+        if (!viewerWaitOcr(allocator, app, pop, "stored", 20_000)) {
+            if (app.screenshotPng(pop, 1024, null, 0)) |shot| {
+                defer allocator.free(shot.png);
+                writePng("/tmp/sketerm-e2e-route-siteinfo-fail.png", shot.png);
+            } else |_| {}
+            return "the routed tab's site-info popover never showed its cookie count";
+        }
+    } else say("route: tesseract unavailable; the site-info popover opened but its cookie count was not read");
+    if (app.screenshotPng(pop, 1024, null, 0)) |shot| {
+        defer allocator.free(shot.png);
+        writePng("/tmp/sketerm-e2e-route-4-siteinfo.png", shot.png);
+    } else |_| {}
+    app.pressKey(pop, "Escape") catch return "injecting Escape into the site-info popover failed";
+    if (waitPopup(app, false, 10_000) == null) return "the site-info popover did not close on Escape";
+    return null;
+}
+
+/// The browser stages after the route stage, in the order the full rig
+/// and `SKETERM_SMOKE_E2E_WEB_PAGES_ONLY` both run them.
+fn webPagesStages(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]const u8, rt: [:0]const u8) ?[]const u8 {
+    if (webPrivateStage(allocator, app, sock, rt)) |why| return why;
+    say("private browsing: an incognito tab's page stayed out of the history journal that an ordinary tab's page reached");
+    if (webClosePageStage(allocator, app, sock)) |why| return why;
+    say("web_close: MCP closed one of a browser's two pages and kept the pane, then the last page took the pane");
+    if (webViaRouteStage(allocator, app, sock, rt)) |why| return why;
+    say("via: route: the tab's instance ran behind the loopback SOCKS5 bridge and its page arrived through the fake-SSH host");
+    if (webRemotePrintStage(allocator, app, sock, rt)) |why| return why;
+    say("remote print: Print to PDF on an on: tab staged the PDF on the remote host and delivered it to the local path picked");
+    return null;
+}
+
+const e2e_pages_page =
+    "<html><head><title>e2e-pages</title></head><body style=\"margin:0;background:#c020e0\"></body></html>";
+
+/// Pane ids `web-list` names right now, into `out`.
+fn webPaneIds(allocator: std.mem.Allocator, sock: [:0]const u8, out: []u32) ?usize {
+    const wl = roundtrip(allocator, sock, "{\"cmd\":\"web-list\"}\n") orelse return null;
+    defer allocator.free(wl);
+    var n: usize = 0;
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, wl, from, "{\"pane\":")) |at| {
+        from = at + 8;
+        if (n >= out.len) break;
+        out[n] = parseNumAfter(wl[at..], "{\"pane\":") orelse continue;
+        n += 1;
+    }
+    return n;
+}
+
+/// Failure forensics: the whole `web-list` reply on stderr.
+fn dumpWebList(allocator: std.mem.Allocator, sock: [:0]const u8) void {
+    const wl = roundtrip(allocator, sock, "{\"cmd\":\"web-list\"}\n") orelse return;
+    defer allocator.free(wl);
+    _ = c.fprintf(platform.stderr(), "smoke-e2e: web-list was: %.*s\n", @as(c_int, @intCast(@min(wl.len, 3000))), wl.ptr);
+}
+
+fn closePaneGone(allocator: std.mem.Allocator, sock: [:0]const u8, pane: u32) bool {
+    var close_buf: [96]u8 = undefined;
+    const close_req = std.fmt.bufPrint(&close_buf, "{{\"cmd\":\"close-pane\",\"pane\":{d}}}\n", .{pane}) catch return false;
+    if (roundtrip(allocator, sock, close_req)) |r| allocator.free(r);
+    return waitPaneGone(allocator, sock, pane, 10_000);
+}
+
+/// Private browsing records nothing: a page loaded in a tab from the
+/// user's "New Incognito Tab" action never reaches the daemon's history
+/// journal, while an ordinary tab's page, loaded AFTER it over the same
+/// channel, does (which is what makes the absence meaningful).
+fn webPrivateStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]const u8, rt: []const u8) ?[]const u8 {
+    var doc = HttpDoc{ .body = e2e_pages_page };
+    if (!doc.start()) return "the private-browsing document server did not start";
+    defer doc.stop();
+
+    var known: [64]u32 = undefined;
+    const known_n = webPaneIds(allocator, sock, &known) orelse return "web-list failed before the incognito tab";
+    if (roundtrip(allocator, sock, "{\"cmd\":\"action\",\"data\":\"new_incognito_web_tab\"}\n")) |r| allocator.free(r) else return "new_incognito_web_tab roundtrip failed";
+    var private_pane: u32 = 0;
+    {
+        var waited: u32 = 0;
+        while (private_pane == 0 and waited < 20_000) : (waited += 200) {
+            const wl = roundtrip(allocator, sock, "{\"cmd\":\"web-list\"}\n") orelse return "web-list failed after the incognito tab";
+            defer allocator.free(wl);
+            private_pane = newWebPane(wl, known[0..known_n]) orelse 0;
+            if (private_pane == 0) pumpFor(app, 200);
+        }
+    }
+    if (private_pane == 0) return "new_incognito_web_tab opened no web view";
+    var req_buf: [256]u8 = undefined;
+    const nav = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"web-navigate\",\"pane\":{d},\"data\":\"http://127.0.0.1:{d}/e2e-private-visit\"}}\n", .{ private_pane, doc.lis.port }) catch return "web-navigate request";
+    if (roundtrip(allocator, sock, nav)) |r| allocator.free(r) else return "navigating the incognito tab failed";
+    if (!waitWebPaneTitled(allocator, sock, app, private_pane, "e2e-pages", 30_000)) {
+        dumpWebList(allocator, sock);
+        return "the incognito tab's page never loaded";
+    }
+
+    const open_req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"web-open\",\"target\":\"tab\",\"data\":\"http://127.0.0.1:{d}/e2e-normal-visit\"}}\n", .{doc.lis.port}) catch return "web-open request";
+    const opened = roundtrip(allocator, sock, open_req) orelse return "opening the ordinary tab failed";
+    defer allocator.free(opened);
+    const normal_pane = parseNumAfter(opened, "\"pane\":") orelse return "the ordinary tab's reply named no pane";
+    if (!waitWebPaneTitled(allocator, sock, app, normal_pane, "e2e-pages", 30_000)) return "the ordinary tab's page never loaded";
+
+    var path_buf: [512:0]u8 = undefined;
+    const history = std.fmt.bufPrintZ(&path_buf, "{s}/sketerm/web/history.jsonl", .{rt}) catch return "history path";
+    var recorded = false;
+    {
+        var waited: u32 = 0;
+        while (!recorded and waited < 20_000) : (waited += 200) {
+            if (readFileAlloc(allocator, history)) |body| {
+                defer allocator.free(body);
+                if (std.mem.indexOf(u8, body, "e2e-private-visit") != null) return "an incognito tab's page was written to the history journal";
+                recorded = std.mem.indexOf(u8, body, "e2e-normal-visit") != null;
+            }
+            if (!recorded) pumpFor(app, 200);
+        }
+    }
+    if (!recorded) {
+        if (readFileAlloc(allocator, history)) |body| {
+            defer allocator.free(body);
+            _ = c.fprintf(platform.stderr(), "smoke-e2e: history.jsonl: %.*s\n", @as(c_int, @intCast(@min(body.len, 3000))), body.ptr);
+        } else _ = c.fprintf(platform.stderr(), "smoke-e2e: no history.jsonl at %s (did the GUI's web store reach another daemon?)\n", history.ptr);
+        return "the ordinary tab's page never reached the history journal, so the incognito absence proves nothing";
+    }
+    if (!closePaneGone(allocator, sock, normal_pane)) return "the ordinary tab survived close-pane";
+    if (!closePaneGone(allocator, sock, private_pane)) return "the incognito tab survived close-pane";
+    return null;
+}
+
+/// `web_close` over MCP against the GUI closes ONE page: a browser pane
+/// with two pages (the second made the user's way, "New Tab" while the
+/// tree sidebar lists the browser) keeps its pane and other page after
+/// the first close, and only the close of its last page takes the pane.
+fn webClosePageStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]const u8) ?[]const u8 {
+    if (app.windows.items.len == 0) return "the display session lost its window before the web_close stage";
+    const win_id = mainWin(app).id;
+    var doc = HttpDoc{ .body = e2e_pages_page };
+    if (!doc.start()) return "the web_close document server did not start";
+    defer doc.stop();
+    var req_buf: [256]u8 = undefined;
+    const open_req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"web-open\",\"target\":\"tab\",\"data\":\"http://127.0.0.1:{d}/\"}}\n", .{doc.lis.port}) catch return "web-open request";
+    const opened = roundtrip(allocator, sock, open_req) orelse return "opening the web_close page failed";
+    defer allocator.free(opened);
+    const pane = parseNumAfter(opened, "\"pane\":") orelse return "the web_close reply named no pane";
+    if (!waitWebPaneTitled(allocator, sock, app, pane, "e2e-pages", 30_000)) return "the web_close page never loaded";
+
+    const focus_req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"focus\",\"pane\":{d}}}\n", .{pane}) catch return "focus request";
+    if (roundtrip(allocator, sock, focus_req)) |r| allocator.free(r) else return "focusing the browser pane failed";
+    _ = app.waitIdle(300, 5_000);
+    app.pressKey(null, tree_toggle_key) catch return "injecting toggle_tab_sidebar failed";
+    if (!waitSidebarVisible(app, win_id, true, 6_000)) return "the sidebar did not open over the browser";
+    if (roundtrip(allocator, sock, "{\"cmd\":\"action\",\"data\":\"new_tab\"}\n")) |r| allocator.free(r) else return "new_tab roundtrip failed";
+    _ = app.waitIdle(400, 8_000);
+    const pages = blk: {
+        const wl = roundtrip(allocator, sock, "{\"cmd\":\"web-list\"}\n") orelse return "web-list failed after the in-browser new tab";
+        defer allocator.free(wl);
+        break :blk webViewsOnPane(wl, pane);
+    };
+    // The sidebar is per-window state the later stages expect hidden.
+    if (roundtrip(allocator, sock, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r);
+    _ = app.waitIdle(200, 4_000);
+    app.pressKey(null, tree_toggle_key) catch return "injecting toggle_tab_sidebar (off) failed";
+    if (!waitSidebarVisible(app, win_id, false, 6_000)) return "the sidebar did not hide again";
+    if (pages != 2) return "New Tab with the sidebar open did not give the browser a second page";
+
+    var m = McpChild.spawn(allocator, sock) orelse return "could not spawn `sketerm mcp` for the web_close stage";
+    defer m.close();
+    if (!m.initialize()) return "the web_close MCP did not answer initialize";
+    var args: [64]u8 = undefined;
+    const close_args = std.fmt.bufPrint(&args, "{{\"pane\":{d}}}", .{pane}) catch return "web_close arguments";
+    {
+        const r = m.call("web_close", close_args, 30_000) orelse return "the first web_close timed out";
+        if (mcpHas(r, "isError\":true")) return "the first web_close failed";
+        if (!mcpHas(r, "\"pane_closed\":false")) return "web_close of one of two pages reported the pane closed";
+    }
+    {
+        var waited: u32 = 0;
+        while (true) : (waited += 200) {
+            const wl = roundtrip(allocator, sock, "{\"cmd\":\"web-list\"}\n") orelse return "web-list failed after the first web_close";
+            defer allocator.free(wl);
+            const left = webViewsOnPane(wl, pane);
+            if (left == 1) break;
+            if (left == 0) return "web_close of one page closed the whole browser pane";
+            if (waited >= 10_000) return "web_close left both pages open";
+            pumpFor(app, 200);
+        }
+    }
+    {
+        const r = m.call("web_close", close_args, 30_000) orelse return "the second web_close timed out";
+        if (mcpHas(r, "isError\":true")) return "the second web_close failed";
+        if (!mcpHas(r, "\"pane_closed\":true")) return "web_close of the last page did not report the pane closed";
+    }
+    if (!waitPaneGone(allocator, sock, pane, 10_000)) return "web_close of the last page left its pane open";
+    if (roundtrip(allocator, sock, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r);
+    _ = app.waitIdle(200, 4_000);
+    return null;
+}
+
+/// A `via:` route end to end: the tab's helper instance runs behind the
+/// loopback SOCKS5 bridge (`--proxy socks5://127.0.0.1:<port>`, read off
+/// its command line), the bridge dials through the fake-SSH "localhost"
+/// daemon, and the page still arrives. The instance fails closed without
+/// its proxy (smoke-web proves that), so a loaded page is a page that
+/// came through the bridge.
+fn webViaRouteStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]const u8, rt: [:0]const u8) ?[]const u8 {
+    var doc = HttpDoc{ .body = e2e_pages_page };
+    if (!doc.start()) return "the via: document server did not start";
+    defer doc.stop();
+    var req_buf: [256]u8 = undefined;
+    const open_req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"web-open\",\"target\":\"tab\",\"route\":\"via:localhost\",\"data\":\"http://127.0.0.1:{d}/e2e-via\"}}\n", .{doc.lis.port}) catch return "web-open request";
+    const opened = roundtrip(allocator, sock, open_req) orelse return "opening the via: tab failed";
+    defer allocator.free(opened);
+    if (std.mem.indexOf(u8, opened, "\"ok\":true") == null) {
+        _ = c.fprintf(platform.stderr(), "smoke-e2e: via web-open said %.*s\n", @as(c_int, @intCast(@min(opened.len, 400))), opened.ptr);
+        return "web-open refused the via:localhost route";
+    }
+    const pane = parseNumAfter(opened, "\"pane\":") orelse return "the via: reply named no pane";
+    if (!waitWebPaneTitled(allocator, sock, app, pane, "e2e-pages", 60_000)) return "the via:localhost page never loaded";
+    if (!webPaneTitled(allocator, sock, pane, "\"route\":\"via:localhost\"")) return "the via: tab does not report route via:localhost";
+    if (doc.hits.load(.acquire) == 0) return "the via: page never reached the document server";
+    if (!routedHelperSocketExists(rt, child_pid, "mux-")) return "no helper socket for the via: route slug exists";
+    if (!routedHelperBehindLoopbackProxy(child_pid, "mux-")) return "the via: helper instance does not run behind the loopback SOCKS5 bridge";
+    if (!closePaneGone(allocator, sock, pane)) return "the via: tab survived close-pane";
+    if (roundtrip(allocator, sock, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r);
+    _ = app.waitIdle(200, 4_000);
+    return null;
+}
+
+/// Print to PDF on a tab whose browser runs on ANOTHER host (`on:`),
+/// driven the user's way: the action, then the save dialog. The remote
+/// helper prints into a staged file on its own host and the GUI brings
+/// it here through the daemon's transfer, so the PDF lands at the local
+/// path picked. Before this the pick was handed to the remote helper,
+/// which wrote it on the remote host (or nowhere).
+fn webRemotePrintStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]const u8, rt: [:0]const u8) ?[]const u8 {
+    var doc = HttpDoc{ .body = e2e_pages_page };
+    if (!doc.start()) return "the remote-print document server did not start";
+    defer doc.stop();
+    var req_buf: [256]u8 = undefined;
+    const open_req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"web-open\",\"target\":\"tab\",\"route\":\"on:localhost\",\"data\":\"http://127.0.0.1:{d}/e2e-on\"}}\n", .{doc.lis.port}) catch return "web-open request";
+    const opened = roundtrip(allocator, sock, open_req) orelse return "opening the on: tab failed";
+    defer allocator.free(opened);
+    if (std.mem.indexOf(u8, opened, "\"ok\":true") == null) return "web-open refused the on:localhost route";
+    const pane = parseNumAfter(opened, "\"pane\":") orelse return "the on: reply named no pane";
+    if (!waitWebPaneTitled(allocator, sock, app, pane, "e2e-pages", 90_000)) {
+        dumpWebList(allocator, sock);
+        return "the on:localhost page never loaded";
+    }
+    if (!webPaneTitled(allocator, sock, pane, "\"route\":\"on:localhost\"")) return "the on: tab does not report route on:localhost";
+
+    var out_buf: [256:0]u8 = undefined;
+    const out = std.fmt.bufPrintZ(&out_buf, "{s}/e2e-remote-print.pdf", .{rt}) catch return "pdf path";
+    _ = c.unlink(out.ptr);
+    var known_buf: [16]u32 = undefined;
+    const known = known_buf[0..knownToplevels(app, &known_buf)];
+    const focus_req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"focus\",\"pane\":{d}}}\n", .{pane}) catch return "focus request";
+    if (roundtrip(allocator, sock, focus_req)) |r| allocator.free(r) else return "focusing the on: tab failed";
+    _ = app.waitIdle(200, 4_000);
+    if (roundtrip(allocator, sock, "{\"cmd\":\"action\",\"data\":\"web_print_pdf\"}\n")) |r| allocator.free(r) else return "web_print_pdf roundtrip failed";
+    const picker = waitNewToplevel(app, known, 15_000) orelse return "Print to PDF on a remote tab opened no save dialog";
+    _ = app.waitIdle(300, 5_000);
+    // The name entry has focus in a save dialog; an absolute path there
+    // is the destination.
+    app.pressKey(picker, "ctrl+a") catch return "select-all in the save dialog failed";
+    app.typeText(picker, out) catch return "typing the PDF path failed";
+    app.pressKey(picker, "Enter") catch return "confirming the save dialog failed";
+    if (!waitToplevelGone(app, picker, 10_000)) return "the save dialog stayed open after Enter";
+    if (hasToplevelOtherThan(app, known) != null) {
+        dumpToplevels(app);
+        return "the Print to PDF save dialog left a toplevel behind";
+    }
+
+    var arrived = false;
+    {
+        const deadline = clock.nowMs() + 60_000;
+        while (!arrived and clock.nowMs() < deadline) {
+            if (readFileAlloc(allocator, out)) |body| {
+                defer allocator.free(body);
+                arrived = std.mem.startsWith(u8, body, "%PDF");
+            }
+            if (!arrived) pumpFor(app, 250);
+        }
+    }
+    if (!arrived) {
+        if (app.windows.items.len != 0) {
+            if (app.screenshotPng(mainWin(app).id, 1400, null, 0)) |shot| {
+                defer allocator.free(shot.png);
+                writePng("/tmp/sketerm-e2e-remote-print-fail.png", shot.png);
+            } else |_| {}
+        }
+        return "the remote tab's PDF never arrived at the local path picked";
+    }
+    if (!closePaneGone(allocator, sock, pane)) return "the on: tab survived close-pane";
+    if (roundtrip(allocator, sock, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r);
+    _ = app.waitIdle(200, 4_000);
+    return null;
+}
+
+/// "Download File…" on a pane whose session lives on another host,
+/// driven the user's way: the action opens sketerm's own file picker on
+/// that host at the pane's directory, and the pick downloads over the
+/// session into the download directory.
+fn remoteDownloadStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]const u8, rt: [:0]const u8) ?[]const u8 {
+    const BYTES = "REMOTE-DOWNLOAD-BYTES\n";
+    var src_dir_buf: [300:0]u8 = undefined;
+    const src_dir = std.fmt.bufPrintZ(&src_dir_buf, "{s}/dlsrc", .{rt}) catch return "download source dir";
+    _ = c.mkdir(src_dir.ptr, 0o700);
+    var src_buf: [320:0]u8 = undefined;
+    const src = std.fmt.bufPrintZ(&src_buf, "{s}/e2e-remote-dl.txt", .{src_dir}) catch return "download source path";
+    if (!writeFile(src, BYTES)) return "could not write the remote download source";
+    var dest_buf: [320:0]u8 = undefined;
+    const dest = std.fmt.bufPrintZ(&dest_buf, "{s}/dl/e2e-remote-dl.txt", .{rt}) catch return "download dest path";
+    _ = c.unlink(dest.ptr);
+
+    const opened = roundtrip(allocator, sock, "{\"cmd\":\"new-durable-tab\",\"host\":\"ssh:localhost\"}\n") orelse return "opening a remote session tab failed";
+    defer allocator.free(opened);
+    if (std.mem.indexOf(u8, opened, "\"ok\":true") == null) return "the remote session tab was refused";
+    const pane = parseNumAfter(opened, "\"pane\":") orelse return "the remote session reply named no pane";
+    // OSC 7 gives the pane the directory the picker opens at. The rig
+    // emits it itself: whether the remote login shell's prompt reports
+    // its directory depends on the user's shell setup, not on this build.
+    var req_buf: [600]u8 = undefined;
+    const cd_req = std.fmt.bufPrint(
+        &req_buf,
+        "{{\"cmd\":\"send-text\",\"pane\":{d},\"data\":\"cd {s} && printf '\\\\033]7;file://localhost%s\\\\033\\\\\\\\' \\\"$PWD\\\"\\n\"}}\n",
+        .{ pane, src_dir },
+    ) catch return "cd request";
+    {
+        var cwd_buf: [340]u8 = undefined;
+        const want_cwd = std.fmt.bufPrint(&cwd_buf, "\"cwd\":\"{s}\"", .{src_dir}) catch return "cwd needle";
+        const deadline = clock.nowMs() + 45_000;
+        var sent_at: i64 = 0;
+        while (true) {
+            if (clock.nowMs() - sent_at > 5_000) {
+                if (roundtrip(allocator, sock, cd_req)) |r| allocator.free(r);
+                sent_at = clock.nowMs();
+            }
+            const list = roundtrip(allocator, sock, "{\"cmd\":\"list\"}\n") orelse return "list failed while the remote shell started";
+            defer allocator.free(list);
+            if (std.mem.indexOf(u8, list, want_cwd) != null) break;
+            if (clock.nowMs() >= deadline) {
+                _ = c.fprintf(platform.stderr(), "smoke-e2e: list was: %.*s\n", @as(c_int, @intCast(@min(list.len, 4000))), list.ptr);
+                const text_req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"get-text\",\"pane\":{d}}}\n", .{pane}) catch return "get-text request";
+                if (roundtrip(allocator, sock, text_req)) |t| {
+                    defer allocator.free(t);
+                    _ = c.fprintf(platform.stderr(), "smoke-e2e: remote pane text: %.*s\n", @as(c_int, @intCast(@min(t.len, 3000))), t.ptr);
+                }
+                return "the remote session never reported the download source as its directory";
+            }
+            pumpFor(app, 250);
+        }
+    }
+
+    var known_buf: [16]u32 = undefined;
+    const known = known_buf[0..knownToplevels(app, &known_buf)];
+    const focus_req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"focus\",\"pane\":{d}}}\n", .{pane}) catch return "focus request";
+    if (roundtrip(allocator, sock, focus_req)) |r| allocator.free(r) else return "focusing the remote pane failed";
+    _ = app.waitIdle(200, 4_000);
+    if (roundtrip(allocator, sock, "{\"cmd\":\"action\",\"data\":\"download_file\"}\n")) |r| allocator.free(r) else return "download_file roundtrip failed";
+    const picker = waitNewToplevel(app, known, 15_000) orelse return "Download File opened no picker";
+    if (!viewerWaitOcr(allocator, app, picker, "e2e-remote-dl", 20_000)) {
+        if (app.screenshotPng(picker, 1400, null, 0)) |shot| {
+            defer allocator.free(shot.png);
+            writePng("/tmp/sketerm-e2e-download-picker-fail.png", shot.png);
+        } else |_| {}
+        return "the Download File picker does not list the pane's directory on its host";
+    }
+    // The listing has focus: type-ahead selects the one file, Enter picks it.
+    app.typeText(picker, "e2e-remote-dl") catch return "type-ahead in the picker failed";
+    _ = app.waitIdle(200, 3_000);
+    app.pressKey(picker, "Enter") catch return "confirming the picker failed";
+    if (!waitToplevelGone(app, picker, 10_000)) return "the Download File picker stayed open after Enter";
+    if (hasToplevelOtherThan(app, known) != null) {
+        dumpToplevels(app);
+        return "the Download File picker left a toplevel behind";
+    }
+    var arrived = false;
+    {
+        const deadline = clock.nowMs() + 30_000;
+        while (!arrived and clock.nowMs() < deadline) {
+            if (readFileAlloc(allocator, dest)) |body| {
+                defer allocator.free(body);
+                arrived = std.mem.eql(u8, body, BYTES);
+            }
+            if (!arrived) pumpFor(app, 250);
+        }
+    }
+    if (!arrived) return "the picked remote file never arrived in the download directory";
+    if (!closePaneGone(allocator, sock, pane)) return "the remote session tab survived close-pane";
+    if (roundtrip(allocator, sock, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r);
+    _ = app.waitIdle(200, 4_000);
+    return null;
+}
+
+/// Is some process serving `web-<pid>-<slug prefix>*` started with
+/// `--proxy socks5://127.0.0.1:...`? Read from /proc command lines.
+fn routedHelperBehindLoopbackProxy(pid: c.pid_t, slug_prefix: []const u8) bool {
+    const d = c.opendir("/proc") orelse return false;
+    defer _ = c.closedir(d);
+    var want_buf: [64]u8 = undefined;
+    const want = std.fmt.bufPrint(&want_buf, "web-{d}-{s}", .{ pid, slug_prefix }) catch return false;
+    while (c.readdir(d)) |ent| {
+        const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
+        if (name.len == 0 or name[0] < '0' or name[0] > '9') continue;
+        var pbuf: [64:0]u8 = undefined;
+        const p = std.fmt.bufPrintZ(&pbuf, "/proc/{s}/cmdline", .{name}) catch continue;
+        const f = c.fopen(p.ptr, "rb") orelse continue;
+        var buf: [8192]u8 = undefined;
+        const n = c.fread(&buf, 1, buf.len, f);
+        _ = c.fclose(f);
+        const cmd = buf[0..n];
+        if (std.mem.indexOf(u8, cmd, want) == null) continue;
+        if (std.mem.indexOf(u8, cmd, "--proxy\x00socks5://127.0.0.1:") != null) return true;
+    }
+    return false;
 }
 
 /// Does `$rt/sketerm/web-<pid>-<slug prefix>*.sock` exist? The routed
@@ -5003,7 +5475,7 @@ fn waitPageColor(app: *appdrive.App, win_id: u32, color: PageColor, ms: u32) ?Po
     while (true) {
         if (findPageColor(app, win_id, color)) |p| return p;
         if (waited >= ms) return null;
-        _ = app.pumpOnce(200);
+        pumpFor(app, 200);
         waited += 200;
     }
 }
@@ -5101,7 +5573,7 @@ fn waitWebPaneTitled(allocator: std.mem.Allocator, sock: [:0]const u8, app: *app
     while (true) {
         if (webPaneTitled(allocator, sock, pane, needle)) return true;
         if (waited >= ms) return false;
-        _ = app.pumpOnce(200);
+        pumpFor(app, 200);
         waited += 200;
     }
 }
@@ -5113,7 +5585,7 @@ fn waitNewToplevel(app: *appdrive.App, known: []const u32, ms: u32) ?u32 {
     while (true) {
         if (hasToplevelOtherThan(app, known)) |id| return id;
         if (waited >= ms) return null;
-        _ = app.pumpOnce(200);
+        pumpFor(app, 200);
         waited += 200;
     }
 }
@@ -5121,17 +5593,19 @@ fn waitNewToplevel(app: *appdrive.App, known: []const u32, ms: u32) ?u32 {
 fn waitToplevelGone(app: *appdrive.App, id: u32, ms: u32) bool {
     var waited: u32 = 0;
     while (true) {
-        _ = app.pumpOnce(120);
+        pumpFor(app, 120);
         if (app.winById(id) == null or app.windowGone(id)) return true;
         if (waited >= ms) return false;
-        _ = app.pumpOnce(200);
+        pumpFor(app, 200);
         waited += 200;
     }
 }
 
+const mainWin = rigwin.mainWin;
+
 /// Every toplevel id the display session currently shows.
 fn knownToplevels(app: *appdrive.App, out: []u32) usize {
-    _ = app.pumpOnce(120);
+    pumpFor(app, 120);
     var n: usize = 0;
     for (app.windows.items) |w| {
         if (n >= out.len) break;
@@ -5209,7 +5683,7 @@ fn webPopupStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]con
                     break;
                 }
             }
-            if (magenta == null) _ = app.pumpOnce(200);
+            if (magenta == null) pumpFor(app, 200);
         }
     }
     const magenta_pt = magenta orelse return "the opener page never painted its magenta half in any toplevel";
@@ -5247,7 +5721,7 @@ fn webPopupStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]con
                     break;
                 }
             }
-            _ = app.pumpOnce(200);
+            pumpFor(app, 200);
         }
         if (!sized) {
             if (last) |b| _ = c.fprintf(platform.stderr(), "smoke-e2e: popup viewport painted %zux%zu\n", b.w, b.h);
@@ -5269,7 +5743,7 @@ fn webPopupStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]con
             const wl = roundtrip(allocator, sock, "{\"cmd\":\"web-list\"}\n") orelse return "web-list failed after the popup opened";
             defer allocator.free(wl);
             popup_pane = newWebPane(wl, web_before) orelse 0;
-            if (popup_pane == 0) _ = app.pumpOnce(200);
+            if (popup_pane == 0) pumpFor(app, 200);
         }
     }
     if (popup_pane == 0) return "the popup window presents no web view";
@@ -5309,7 +5783,7 @@ fn webPopupStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]con
                 const wl = roundtrip(allocator, sock, "{\"cmd\":\"web-list\"}\n") orelse return "web-list failed after the tab open";
                 defer allocator.free(wl);
                 tab_pane = newWebPane(wl, web_before) orelse 0;
-                if (tab_pane == 0) _ = app.pumpOnce(200);
+                if (tab_pane == 0) pumpFor(app, 200);
             }
         }
     }
@@ -5335,7 +5809,7 @@ fn webPopupStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]con
     if (webEval(allocator, sock, opener_pane, "setTimeout(function(){window.close();},100);1", 5_000)) |r| allocator.free(r);
     _ = app.waitIdle(300, 3_000);
     _ = c.usleep(1_500_000);
-    _ = app.pumpOnce(200);
+    pumpFor(app, 200);
     {
         const list5 = roundtrip(allocator, sock, "{\"cmd\":\"list\"}\n") orelse return "list failed after the self-close attempt";
         defer allocator.free(list5);
@@ -5351,22 +5825,46 @@ fn webPopupStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]con
     return null;
 }
 
+/// Failure forensics: every surface the display session holds.
+fn dumpToplevels(app: *appdrive.App) void {
+    for (app.windows.items) |w| {
+        _ = c.fprintf(platform.stderr(), "smoke-e2e:   surface %u popup=%d frames=%llu %dx%d\n", w.id, @as(c_int, @intFromBool(w.popup)), @as(c_ulonglong, w.frames), w.w, w.h);
+    }
+}
+
+/// Pump the display session for `ms` of WALL time. One `pumpOnce` is one
+/// frame and returns at once while the GUI streams, so a wait loop that
+/// counts pump calls as elapsed time runs out long before its budget.
+fn pumpFor(app: *appdrive.App, ms: u32) void {
+    const until = clock.nowMs() + ms;
+    while (true) {
+        const left = until - clock.nowMs();
+        if (left <= 0) return;
+        _ = app.pumpOnce(@intCast(@min(left, 200)));
+    }
+}
+
 fn openPopup(app: *appdrive.App) ?u32 {
-    _ = app.pumpOnce(120);
+    pumpFor(app, 120);
     for (app.windows.items) |w| {
         if (w.popup and w.frames > 0) return w.id;
     }
     return null;
 }
 
+/// Wait up to `ms` of WALL time for a popup to be open (or closed). The
+/// budget cannot be counted in pump calls: `pumpOnce` handles one frame
+/// and returns at once while the GUI streams, so a counted "10s" was
+/// spent in well under a second and a popup queued behind a busy window's
+/// frames never arrived (the route stage's "opened no menu").
 fn waitPopup(app: *appdrive.App, want_open: bool, ms: u32) ?u32 {
-    var waited: u32 = 0;
+    const deadline = clock.nowMs() + ms;
     while (true) {
+        _ = app.drainLive(200);
         const id = openPopup(app);
         if ((id != null) == want_open) return id orelse 0;
-        if (waited >= ms) return null;
-        _ = app.pumpOnce(200);
-        waited += 200;
+        if (clock.nowMs() >= deadline) return null;
+        pumpFor(app, 100);
     }
 }
 
@@ -5482,12 +5980,12 @@ fn offloadPolicyStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:
     }
     if (!closeGuiPaneAndWait(allocator, sock, browser_pane)) return "offload browser close failed";
     if (expectOffload(allocator, app, 1, 2)) |why| return why;
-    const start = app.windows.items[0].frames;
+    const start = mainWin(app).frames;
     const animate = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"send-text\",\"pane\":{d},\"data\":\"sh -c 'i=0; while :; do printf \\\\rFRAME-%s $i; i=$((i+1)); sleep 0.02; done'\\n\"}}\n", .{panes[1]}) catch return "offload redraw format";
     const sent = roundtrip(allocator, sock, animate) orelse return "offload redraw command failed";
     defer allocator.free(sent);
     const deadline = clock.nowMs() + 60_000;
-    while (app.windows.items[0].frames - start < 600) {
+    while (mainWin(app).frames - start < 600) {
         if (clock.nowMs() >= deadline) return "offload sibling never rendered 600 frames";
         if (expectOffload(allocator, app, 1, 2)) |why| return why;
         _ = app.pumpOnce(20);
@@ -5496,6 +5994,17 @@ fn offloadPolicyStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:
     const stopped = roundtrip(allocator, sock, stop_req) orelse return "offload redraw stop failed";
     defer allocator.free(stopped);
     if (!mcpHas(stopped, "\"ok\":true")) return "offload redraw stop refused";
+    // The loop must actually be gone: a fresh prompt after it. Asserted
+    // here, where it happens, rather than read later as "fresh input
+    // never ran" (which is what a surviving loop looked like).
+    if (!waitPanePrompt(allocator, sock, panes[1], 10_000)) {
+        const dump_req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"get-text\",\"pane\":{d}}}\n", .{panes[1]}) catch return "offload redraw loop survived Ctrl+C";
+        if (roundtrip(allocator, sock, dump_req)) |t| {
+            defer allocator.free(t);
+            _ = c.fprintf(platform.stderr(), "smoke-e2e: redraw pane after Ctrl+C: %.*s\n", @as(c_int, @intCast(@min(t.len, 600))), t.ptr + (t.len - @min(t.len, 600)));
+        }
+        return "offload redraw loop survived Ctrl+C";
+    }
     if (!closeGuiPaneAndWait(allocator, sock, panes[0])) return "offload hidden history close failed";
     if (expectOffload(allocator, app, 1, 1)) |why| return why;
 
@@ -5513,7 +6022,7 @@ fn offloadPolicyStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:
     const prefs = blk: {
         const until = clock.nowMs() + 10_000;
         while (clock.nowMs() < until) {
-            _ = app.pumpOnce(100);
+            pumpFor(app, 100);
             for (app.windows.items) |w| {
                 if (!w.popup and w.frames > 0 and std.mem.eql(u8, w.title orelse "", "Preferences")) break :blk w.id;
             }
@@ -5536,7 +6045,7 @@ fn offloadPolicyStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:
     const text_reply = roundtrip(allocator, sock, text_req) orelse return "offload text send failed";
     defer allocator.free(text_reply);
     if (!waitPaneText(allocator, sock, panes[1], "OFFLOADOK", 10_000)) return "offload survivor did not execute fresh input";
-    if (waitOcrWordCenter(allocator, app, app.windows.items[0].id, "OFFLOADOK", 10_000) == null) return "offload survivor text was not visible in rendered pixels";
+    if (waitOcrWordCenter(allocator, app, mainWin(app).id, "OFFLOADOK", 10_000) == null) return "offload survivor text was not visible in rendered pixels";
     say("offload remained enabled across renewal, tab/face switches, reload, Preferences restore and splits; fresh terminal text rendered");
     return null;
 }
@@ -5603,25 +6112,22 @@ fn killSessionMenuStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_p
     const second = roundtrip(allocator, sock_path, "{\"cmd\":\"new-tab\"}\n") orelse return "Kill Session: second-window tab failed";
     defer allocator.free(second);
     const second_pane = parseNumAfter(second, "\"pane\":") orelse return "Kill Session: second-window pane id missing";
+    // The detached window is the toplevel that is NEW, not any window
+    // but the first: an earlier stage's leftover windows were picked
+    // that way, and the second window's input went to one of them.
+    var known_buf: [32]u32 = undefined;
+    const known = known_buf[0..knownToplevels(app, &known_buf)];
     var detach_buf: [128]u8 = undefined;
     const detach_req = std.fmt.bufPrint(&detach_buf, "{{\"cmd\":\"action\",\"data\":\"detach_tab\",\"pane\":{d}}}\n", .{second_pane}) catch return "Kill Session: detach format";
     const detached = roundtrip(allocator, sock_path, detach_req) orelse return "Kill Session: detach tab failed";
     defer allocator.free(detached);
     if (!mcpHas(detached, "\"ok\":true")) return "Kill Session: detach tab refused";
-    var second_win: u32 = 0;
-    const window_deadline = clock.nowMs() + 10_000;
-    while (second_win == 0 and clock.nowMs() < window_deadline) {
-        _ = app.pumpOnce(200);
-        for (app.windows.items) |w| {
-            if (!w.popup and w.frames > 0 and w.id != app.windows.items[0].id) second_win = w.id;
-        }
-    }
-    if (second_win == 0) return "Kill Session: second window never rendered";
+    const second_win = waitNewToplevel(app, known, 10_000) orelse return "Kill Session: second window never rendered";
     var focus_buf: [128]u8 = undefined;
     const primary_focus = std.fmt.bufPrint(&focus_buf, "{{\"cmd\":\"focus\",\"pane\":{d}}}\n", .{survivor}) catch return "Kill Session: primary focus format";
     const primary = roundtrip(allocator, sock_path, primary_focus) orelse return "Kill Session: primary focus failed";
     defer allocator.free(primary);
-    app.focusWindow(app.windows.items[0].id) catch return "Kill Session: primary seat focus failed";
+    app.focusWindow(mainWin(app).id) catch return "Kill Session: primary seat focus failed";
     _ = app.drainLive(1_000);
     const survivor_ids = listedPaneIds(allocator, sock_path) orelse return "Kill Session: survivor list failed";
     defer allocator.free(survivor_ids);
@@ -5665,7 +6171,7 @@ fn killSessionMenuStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_p
         }
         if (transport == .auto) {
             const deadline = clock.nowMs() + 20_000;
-            while (!pidGone(proxy_pid) and clock.nowMs() < deadline) _ = app.pumpOnce(100);
+            while (!pidGone(proxy_pid) and clock.nowMs() < deadline) pumpFor(app, 100);
             if (!pidGone(proxy_pid)) return "Kill Session: automatic attachment never retired its SSH proxy for UDP";
             const probe = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"send-text\",\"pane\":{d},\"data\":\"printf '%s%s\\\\n' UPGRADED UDP\\n\"}}\n", .{target}) catch return "Kill Session: upgrade probe format";
             const sent = roundtrip(allocator, sock_path, probe) orelse return "Kill Session: upgrade probe failed";
@@ -5683,17 +6189,17 @@ fn killSessionMenuStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_p
         defer allocator.free(focused);
         _ = app.drainLive(2_000);
         if (app.windows.items.len == 0) return "Kill Session: GUI window disappeared";
-        const win = app.windows.items[0].id;
-        const width: f64 = @floatFromInt(app.windows.items[0].w);
-        const height: f64 = @floatFromInt(app.windows.items[0].h);
+        const win = mainWin(app).id;
+        const width: f64 = @floatFromInt(mainWin(app).w);
+        const height: f64 = @floatFromInt(mainWin(app).h);
         if (images) {
-            const frame_before = app.windows.items[0].frames;
+            const frame_before = mainWin(app).frames;
             const animate = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"send-text\",\"pane\":{d},\"data\":\"sh '{s}'\\n\"}}\n", .{ target, image_script }) catch return "Kill Session: animation request format";
             const sent = roundtrip(allocator, sock_path, animate) orelse return "Kill Session: animation request failed";
             defer allocator.free(sent);
             const deadline = clock.nowMs() + 10_000;
             while (clock.nowMs() < deadline) {
-                _ = app.pumpOnce(100);
+                pumpFor(app, 100);
                 const w = app.winById(win) orelse return "Kill Session: image animation lost GUI window";
                 if (w.frames >= frame_before + 12 and magentaPixels(app, win) >= 10_000) break;
             } else return "Kill Session: image animation did not produce 12 frames and visible image pixels";
@@ -5711,7 +6217,7 @@ fn killSessionMenuStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_p
         const submenu = blk: {
             const deadline = clock.nowMs() + 10_000;
             while (clock.nowMs() < deadline) {
-                _ = app.pumpOnce(200);
+                pumpFor(app, 200);
                 for (app.windows.items) |w| {
                     if (w.popup and w.id != menu and w.frames > 0) break :blk w.id;
                 }
@@ -5736,7 +6242,7 @@ fn killSessionMenuStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_p
         if (!waitMuxSessionGone(allocator, mux_sock, session)) return "Kill Session: target durable session survived on daemon";
         if (transport == .ssh or transport == .auto) {
             const deadline = clock.nowMs() + 10_000;
-            while (!pidGone(proxy_pid) and clock.nowMs() < deadline) _ = app.pumpOnce(100);
+            while (!pidGone(proxy_pid) and clock.nowMs() < deadline) pumpFor(app, 100);
             if (!pidGone(proxy_pid)) return "Kill Session: detached SSH proxy did not exit after teardown";
             std.debug.print("smoke-e2e: Kill Session: detached SSH proxy pid {d} is gone\n", .{proxy_pid});
         }
@@ -5780,9 +6286,9 @@ fn killSessionMenuStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_p
 fn contextMenuStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]const u8) ?[]const u8 {
     _ = app.drainLive(3_000);
     if (app.windows.items.len == 0) return "the display session lost its window";
-    const win_id = app.windows.items[0].id;
-    const cx = @as(f64, @floatFromInt(app.windows.items[0].w)) / 2;
-    const cy = @as(f64, @floatFromInt(app.windows.items[0].h)) / 2;
+    const win_id = mainWin(app).id;
+    const cx = @as(f64, @floatFromInt(mainWin(app).w)) / 2;
+    const cy = @as(f64, @floatFromInt(mainWin(app).h)) / 2;
     if (openPopup(app) != null) return "a popup was already open before the context-menu stage";
 
     // ── pointer path ────────────────────────────────────────────
@@ -5822,14 +6328,17 @@ fn contextMenuStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
     // Focus is only genuinely back on the pane if typed bytes reach
     // its shell again — a popover that keeps the keyboard grab, or a
     // pane that never regains focus, dies here.
-    app.typeText(null, "echo " ++ MENU_MARKER ++ "\n") catch
+    // An empty line first: an earlier stage left "clea" on the prompt,
+    // and the marker then ran as `cleaecho`.
+    app.pressKey(win_id, "ctrl+u") catch return "clearing the shell line failed";
+    app.typeText(win_id, "echo " ++ MENU_MARKER ++ "\n") catch
         return "injecting keystrokes after the menu closed failed";
     var tries: u32 = 0;
     while (tries < 75) : (tries += 1) {
         const resp = roundtrip(allocator, sock_path, "{\"cmd\":\"get-text\",\"pane\":1}\n") orelse continue;
         defer allocator.free(resp);
         if (countMarker(allocator, resp, MENU_MARKER) >= 2) break;
-        _ = app.pumpOnce(200);
+        pumpFor(app, 200);
     } else return "focus never returned to the pane after the context menu closed";
     return null;
 }
@@ -5859,7 +6368,7 @@ fn dumpWindowRoster(app: *appdrive.App, why: []const u8) void {
 /// Ids of every non-popup surface currently known, so a newly mapped
 /// toplevel can be told from the ones already on screen.
 fn hasToplevelOtherThan(app: *appdrive.App, known: []const u32) ?u32 {
-    _ = app.pumpOnce(120);
+    pumpFor(app, 120);
     outer: for (app.windows.items) |w| {
         if (w.popup or w.frames == 0) continue;
         for (known) |k| {
@@ -5876,7 +6385,7 @@ fn hasToplevelOtherThan(app: *appdrive.App, known: []const u32) ?u32 {
 fn viewerMenuStage(allocator: std.mem.Allocator, app: *appdrive.App, rt: []const u8, wl: [*:0]const u8) ?[]const u8 {
     _ = app.drainLive(2_000);
     if (app.windows.items.len == 0) return "the display session lost its window";
-    const term_win = app.windows.items[0].id;
+    const term_win = mainWin(app).id;
 
     // An image to open: a PNG of the terminal window itself, which is
     // guaranteed to exist and to decode.
@@ -5917,7 +6426,7 @@ fn viewerMenuStage(allocator: std.mem.Allocator, app: *appdrive.App, rt: []const
     var waited: u32 = 0;
     const viewer_win = while (waited < 25_000) : (waited += 200) {
         if (hasToplevelOtherThan(app, known[0..n_known])) |id| break id;
-        _ = app.pumpOnce(200);
+        pumpFor(app, 200);
     } else return "the image viewer never mapped a window";
     _ = app.waitVisualSettle(viewer_win, 400, 10_000, 0.002, null);
 
@@ -6040,7 +6549,7 @@ fn castCountRgb(allocator: std.mem.Allocator, app: *appdrive.App, win_id: u32, r
 fn castWaitRgb(allocator: std.mem.Allocator, app: *appdrive.App, win_id: u32, rgb: [3]u8, min: usize, present: bool, timeout_ms: i64) bool {
     const deadline = clock.nowMs() + timeout_ms;
     while (clock.nowMs() < deadline) {
-        _ = app.pumpOnce(200);
+        pumpFor(app, 200);
         const n = castCountRgb(allocator, app, win_id, rgb);
         if (present and n >= min) return true;
         if (!present and n < min) return true;
@@ -6115,7 +6624,7 @@ fn castPlaybackStage(
     var waited: u32 = 0;
     const cast_win = while (waited < 25_000) : (waited += 200) {
         if (hasToplevelOtherThan(app, known[0..n_known])) |id| break id;
-        _ = app.pumpOnce(200);
+        pumpFor(app, 200);
     } else return "sketerm play never mapped a window";
     _ = app.waitVisualSettle(cast_win, 400, 10_000, 0.002, null);
 
@@ -6304,7 +6813,7 @@ fn viewerWaitOcr(allocator: std.mem.Allocator, app: *appdrive.App, win_id: u32, 
         _ = app.drainLive(2_000);
         if (app.winById(win_id)) |w| {
             if (w.frames == last_frame) {
-                _ = app.pumpOnce(200);
+                pumpFor(app, 200);
                 continue;
             }
             last_frame = w.frames;
@@ -6375,7 +6884,11 @@ fn waitOcrWordCenter(
     if (!ocr.available()) return null;
     const deadline = clock.nowMs() + timeout_ms;
     while (clock.nowMs() < deadline) {
-        _ = app.pumpOnce(200);
+        // The live head, as `viewerWaitOcr` does: past the harness's
+        // backlog cap frames arrive by resync only, and OCR of the last
+        // replica frame kept reading a popover still fading in.
+        _ = app.drainLive(2_000);
+        pumpFor(app, 200);
         const shot = app.snapshotRgba(win_id, null) catch continue;
         defer allocator.free(shot.px);
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -6467,7 +6980,7 @@ fn keepMuxLog(rt: []const u8) void {
 
 /// Every toplevel the display session shows, for a failure report.
 fn windowsDiag(app: *appdrive.App) void {
-    _ = app.pumpOnce(120);
+    pumpFor(app, 120);
     for (app.windows.items) |w| {
         const title: []const u8 = w.title orelse "";
         const app_id: []const u8 = w.app_id orelse "";
@@ -6525,7 +7038,7 @@ fn viewerCastStage(
 ) ?[]const u8 {
     _ = app.drainLive(2_000);
     if (app.windows.items.len == 0) return "the display session lost its window";
-    const term_win = app.windows.items[0].id;
+    const term_win = mainWin(app).id;
 
     // The image half of the batch: a screenshot of the terminal
     // window, guaranteed to exist and to decode.
@@ -6637,7 +7150,7 @@ fn viewerCastStage(
     var waited: u32 = 0;
     const vwin = while (waited < 25_000) : (waited += 200) {
         if (hasToplevelOtherThan(app, known[0..n_known])) |id| break id;
-        _ = app.pumpOnce(200);
+        pumpFor(app, 200);
     } else return "sketerm view never mapped a window";
     _ = app.waitVisualSettle(vwin, 400, 10_000, 0.002, null);
 
@@ -6866,7 +7379,7 @@ fn waitWindowGone(app: *appdrive.App, win_id: u32, timeout_ms: i64) bool {
         if (app.winById(win_id) == null) return true;
         _ = app.drainLive(500);
         if (app.winById(win_id) == null) return true;
-        _ = app.pumpOnce(200);
+        pumpFor(app, 200);
     }
     return app.winById(win_id) == null;
 }
@@ -7085,7 +7598,7 @@ fn secondGuiBrowserStage(
     {
         const d = clock.nowMs() + 20_000;
         while (clock.nowMs() < d and sock2 == null) {
-            _ = app.pumpOnce(200);
+            pumpFor(app, 200);
             sock2 = findRenameControlSocket(allocator, rt, sock_path, &sock2_buf);
         }
     }
@@ -7094,13 +7607,13 @@ fn secondGuiBrowserStage(
         const d = clock.nowMs() + 45_000;
         var loaded = false;
         while (clock.nowMs() < d and !loaded) {
-            _ = app.pumpOnce(250);
+            pumpFor(app, 250);
             const list = roundtrip(allocator, s2, "{\"cmd\":\"web-list\"}\n") orelse continue;
             defer allocator.free(list);
             loaded = std.mem.indexOf(u8, list, "e2e-two-guis") != null;
         }
         if (!loaded) {
-            if (app.screenshotPng(app.windows.items[0].id, 0, null, 0)) |shot| {
+            if (app.screenshotPng(mainWin(app).id, 0, null, 0)) |shot| {
                 defer allocator.free(shot.png);
                 writePng("zig-out/smoke-e2e-two-guis.png", shot.png);
             } else |_| {}
@@ -7225,7 +7738,7 @@ fn filesReconnectStage(
     var stable: u32 = 0;
     var last: [3]usize = .{ 0, 0, 0 };
     while (clock.nowMs() < deadline) {
-        _ = app.pumpOnce(500);
+        pumpFor(app, 500);
         const a = ocrCount(allocator, app, child.win, "ALPHAROW") orelse return null;
         const b = ocrCount(allocator, app, child.win, "BETAROW") orelse return null;
         const g = ocrCount(allocator, app, child.win, "GAMMAROW") orelse return null;
@@ -7299,7 +7812,7 @@ fn clickOcrWord(allocator: std.mem.Allocator, app: *appdrive.App, win_id: u32, n
             app.clickEx(win_id, p.x, p.y, button, 80, 1) catch return false;
             return true;
         }
-        _ = app.pumpOnce(300);
+        pumpFor(app, 300);
     }
     return false;
 }
@@ -7308,7 +7821,7 @@ fn waitPathState(path: [:0]const u8, exists: bool, timeout_ms: i64, app: *appdri
     const deadline = clock.nowMs() + timeout_ms;
     while (clock.nowMs() < deadline) {
         if ((c.access(path.ptr, c.F_OK) == 0) == exists) return true;
-        _ = app.pumpOnce(150);
+        pumpFor(app, 150);
     }
     return false;
 }
@@ -7427,7 +7940,10 @@ fn filesMutationSelectStage(
     }
     // The menu pops down and the name popover (its own popup surface)
     // takes the keyboard; type into whatever has it.
-    if (waitPopup(app, false, 10_000) == null) return "files select: the background menu never closed";
+    // THE MENU's surface must go, not "every popup": the name popover
+    // replaces it at once, and a sampler that reads the live head never
+    // sees the instant with no popup at all.
+    if (!waitToplevelGone(app, bg_menu, 10_000)) return "files select: the background menu never closed";
     const name_pop = waitPopup(app, true, 10_000) orelse {
         viewerShot(allocator, app, child.win, "files-select-nopopover");
         return "files select: the folder-name popover never opened";
@@ -7562,7 +8078,7 @@ fn filesMutationSelectStage(
         var loaded = false;
         var t: u32 = 0;
         while (t < 60 and !loaded) : (t += 1) {
-            _ = app.pumpOnce(250);
+            pumpFor(app, 250);
             const greq = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"get-text\",\"pane\":{d}}}\n", .{pane}) catch return "fmt";
             const gresp = roundtrip(allocator, main_sock, greq) orelse continue;
             defer allocator.free(gresp);
@@ -7663,7 +8179,7 @@ fn ocrRowCenter(allocator: std.mem.Allocator, app: *appdrive.App, win_id: u32, n
     while (clock.nowMs() < deadline) {
         _ = app.drainLive(2_000);
         const shot = app.snapshotRgba(win_id, null) catch {
-            _ = app.pumpOnce(300);
+            pumpFor(app, 300);
             continue;
         };
         defer allocator.free(shot.px);
@@ -7689,7 +8205,7 @@ fn ocrRowCenter(allocator: std.mem.Allocator, app: *appdrive.App, win_id: u32, n
                 }
             }
         }
-        _ = app.pumpOnce(300);
+        pumpFor(app, 300);
     }
     return null;
 }
@@ -8166,7 +8682,7 @@ fn filesHtmlOpenCheck(
     var waited: u32 = 0;
     const hsock = while (waited < 30_000) : (waited += 100) {
         if (findRenameControlSocket(allocator, rt, main_sock, &sock_buf)) |found| break found;
-        _ = app.pumpOnce(100);
+        pumpFor(app, 100);
     } else return "files select: the html Files window's control socket never appeared";
     if (openPopup(app) != null) return "files select: a popup was already open before the row menu";
     if (!clickOcrWord(allocator, app, hchild.win, row_name, 3, 8_000))
@@ -8187,7 +8703,7 @@ fn filesHtmlOpenCheck(
     // A cold CEF start under load can take most of a minute; a remote
     // helper adds the fake-SSH bootstrap on top.
     while (t < 360 and !seen) : (t += 1) {
-        _ = app.pumpOnce(250);
+        pumpFor(app, 250);
         const resp = roundtrip(allocator, hsock, "{\"cmd\":\"web-list\"}\n") orelse continue;
         if (last_list) |l| allocator.free(l);
         last_list = resp;
@@ -8217,7 +8733,7 @@ fn filesHtmlOpenCheck(
         const deadline = clock.nowMs() + 60_000;
         var done = false;
         while (clock.nowMs() < deadline) {
-            _ = app.pumpOnce(100);
+            pumpFor(app, 100);
             const progress = roundtrip(allocator, hsock, list) orelse continue;
             defer allocator.free(progress);
             if (mcpHas(progress, "\"state\":\"done\"")) {
@@ -8248,7 +8764,7 @@ fn filesHtmlOpenCheck(
         const closed = roundtrip(allocator, hsock, close_req) orelse return "files select: close-pane did not reply";
         defer allocator.free(closed);
         if (!mcpHas(closed, "\"ok\":true")) return "files select: closing the web pane was refused";
-        _ = app.pumpOnce(1_500);
+        pumpFor(app, 1_500);
     }
     if (!closeRenameFilesWithin(app, hchild, 45_000)) return "files select: the html Files window did not close cleanly";
     return null;
@@ -8285,7 +8801,7 @@ fn inlineRenameLifetimeStage(
     var completed_ok = false;
     var waited: u32 = 0;
     while (waited < 10_000) : (waited += 200) {
-        _ = app.pumpOnce(200);
+        pumpFor(app, 200);
         if (c.access(completed.ptr, c.F_OK) == 0 and c.access(normal.ptr, c.F_OK) != 0) {
             completed_ok = true;
             break;
@@ -8330,7 +8846,7 @@ fn inlineRenameLifetimeStage(
         @as(f64, @floatFromInt(tab_win.h)) * 0.258,
         2,
     ) catch return "could not middle-click the browser tab";
-    _ = app.pumpOnce(800);
+    pumpFor(app, 800);
     if (app.winById(tab_child.win) == null) return "browser-tab close killed the files window";
     if (!closeRenameFiles(app, tab_child))
         return "browser-tab close did not synchronously dispose the pending inline rename";
@@ -8369,7 +8885,7 @@ fn inlineRenameLifetimeStage(
     defer allocator.free(browser);
     if (std.mem.indexOf(u8, browser, "\"ok\":true") == null)
         return "inline rename browser-here was rejected";
-    _ = app.pumpOnce(1_500);
+    pumpFor(app, 1_500);
     if (!armInlineRename(app, pane_child.win, "p", "abandoned", 0.82, true))
         return "could not arm inline rename before pane close";
     var close_buf: [128]u8 = undefined;
@@ -8380,7 +8896,7 @@ fn inlineRenameLifetimeStage(
     defer allocator.free(closed);
     if (!mcpHas(closed, "\"ok\":true"))
         return "inline rename close-pane was rejected";
-    _ = app.pumpOnce(800);
+    pumpFor(app, 800);
     const healthy = roundtrip(allocator, sock, "{\"cmd\":\"list\"}\n") orelse
         return "files process stopped serving after inline rename pane close";
     defer allocator.free(healthy);
@@ -8457,7 +8973,7 @@ fn quickLookStage(allocator: std.mem.Allocator, app: *appdrive.App, rt: []const 
     var waited: u32 = 0;
     const files_win = while (waited < 25_000) : (waited += 200) {
         if (hasToplevelOtherThan(app, known[0..n_known])) |id| break id;
-        _ = app.pumpOnce(200);
+        pumpFor(app, 200);
     } else return "sketerm files never mapped a window";
     _ = app.waitVisualSettle(files_win, 400, 15_000, 0.002, null);
     if (n_known < known.len) {
@@ -8470,17 +8986,17 @@ fn quickLookStage(allocator: std.mem.Allocator, app: *appdrive.App, rt: []const 
     // Space that follows is a Quick Look toggle, not type-ahead input.
     const fw = app.winById(files_win) orelse return "the files window vanished";
     app.clickEx(files_win, @as(f64, @floatFromInt(fw.w)) * 0.55, @as(f64, @floatFromInt(fw.h)) * 0.6, 1, 60, 1) catch return "clicking the listing failed";
-    _ = app.pumpOnce(300);
+    pumpFor(app, 300);
     app.pressKey(files_win, "a") catch return "injecting the type-ahead key failed";
-    _ = app.pumpOnce(300);
+    pumpFor(app, 300);
     app.pressKey(files_win, "Escape") catch return "injecting Escape failed";
-    _ = app.pumpOnce(200);
+    pumpFor(app, 200);
     app.pressKey(files_win, "space") catch return "injecting Space failed";
 
     waited = 0;
     const ql_win = while (waited < 25_000) : (waited += 200) {
         if (hasToplevelOtherThan(app, known[0..n_known])) |id| break id;
-        _ = app.pumpOnce(200);
+        pumpFor(app, 200);
     } else return "Space did not open a quick-look viewer window";
     _ = app.waitVisualSettle(ql_win, 400, 10_000, 0.002, null);
     if (!viewerWaitOcr(allocator, app, ql_win, "QLALPHA", 25_000))
@@ -8504,7 +9020,7 @@ fn quickLookStage(allocator: std.mem.Allocator, app: *appdrive.App, rt: []const 
     waited = 0;
     const ql2 = while (waited < 25_000) : (waited += 200) {
         if (hasToplevelOtherThan(app, known[0..n_known])) |id| break id;
-        _ = app.pumpOnce(200);
+        pumpFor(app, 200);
     } else return "a second Space did not reopen the quick-look viewer";
     // Let the fresh window finish mapping before keying into it.
     _ = app.waitVisualSettle(ql2, 300, 8_000, 0.002, null);
@@ -9646,7 +10162,7 @@ fn waitPanelTextEvent(
     defer allocator.free(value_field);
     var tries: u32 = 0;
     while (tries < 40) : (tries += 1) {
-        _ = app.pumpOnce(150);
+        pumpFor(app, 150);
         var req_buf: [128]u8 = undefined;
         const req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"panel-events\",\"panel_id\":{d},\"session\":\"e2e-scope\"}}\n", .{panel_id}) catch return false;
         const reply = roundtrip(allocator, sock_path, req) orelse return false;
@@ -9722,7 +10238,7 @@ fn panelStage(
     var waited: u32 = 0;
     const win_id = while (waited < 25_000) : (waited += 200) {
         if (hasToplevelOtherThan(app, known[0..n_known])) |id| break id;
-        _ = app.pumpOnce(200);
+        pumpFor(app, 200);
     } else return "the panel never mapped a window";
     _ = app.waitVisualSettle(win_id, 400, 10_000, 0.002, null);
 
@@ -9735,7 +10251,7 @@ fn panelStage(
     var got_click = false;
     var tries: u32 = 0;
     while (tries < 40 and !got_click) : (tries += 1) {
-        _ = app.pumpOnce(150);
+        pumpFor(app, 150);
         var ev_buf: [128]u8 = undefined;
         const ev_req = std.fmt.bufPrint(&ev_buf, "{{\"cmd\":\"panel-events\",\"panel_id\":{d},\"session\":\"e2e-scope\"}}\n", .{panel_id}) catch
             return "panel-events fmt";
@@ -9817,7 +10333,7 @@ fn panelStage(
     var got_change = false;
     tries = 0;
     while (tries < 40 and !got_change) : (tries += 1) {
-        _ = app.pumpOnce(150);
+        pumpFor(app, 150);
         var ev_buf: [128]u8 = undefined;
         const ev_req = std.fmt.bufPrint(&ev_buf, "{{\"cmd\":\"panel-events\",\"panel_id\":{d},\"session\":\"e2e-scope\"}}\n", .{panel_id}) catch
             return "panel-events fmt";
@@ -10075,7 +10591,7 @@ fn panelStage(
     const closed = roundtrip(allocator, sock_path, close_req) orelse return "panel-close roundtrip";
     defer allocator.free(closed);
     if (!mcpHas(closed, "\"ok\":true")) return "panel-close not ok";
-    _ = app.pumpOnce(500);
+    pumpFor(app, 500);
 
     const gone = roundtrip(allocator, sock_path, "{\"cmd\":\"panel-list\",\"session\":\"e2e-scope\"}\n") orelse
         return "panel-list(after close) roundtrip";
@@ -10248,7 +10764,7 @@ fn panelStage(
     const cli_close = runCli(allocator, &.{ "--socket", sock_path, "panel-close", "--panel-id", id_str, "--session", "e2e-scope" });
     defer allocator.free(cli_close.out);
     if (cli_close.code != 0) return "sketerm cli panel-close exited nonzero";
-    _ = app.pumpOnce(300);
+    pumpFor(app, 300);
     return null;
 }
 
@@ -10823,7 +11339,7 @@ fn mcpMuxPanelStage(
     if (!m.startCall("ui_wait_event", "{\"name\":\"origin-pane\",\"timeout_ms\":20000}"))
         return "could not start local-origin ui_wait_event";
     var settle: u32 = 0;
-    while (settle < 5) : (settle += 1) _ = app.pumpOnce(100);
+    while (settle < 5) : (settle += 1) pumpFor(app, 100);
     const window = app.winById(term_win) orelse return "the terminal window vanished under its panel";
     if (button_point) |click| {
         app.clickEx(term_win, click.x, click.y, 1, 100, 1) catch
@@ -10842,7 +11358,7 @@ fn mcpMuxPanelStage(
         }) |point| {
             app.clickEx(term_win, wf * point[0], hf * point[1], 1, 100, 1) catch
                 return "clicking a mux panel pane quadrant failed";
-            _ = app.pumpOnce(100);
+            pumpFor(app, 100);
         }
     }
     const event = m.recv(30_000) orelse return "local-origin ui_wait_event never answered";
@@ -10909,7 +11425,7 @@ fn mcpMuxPanelStage(
         _ = c.fprintf(platform.stderr(), "smoke-e2e: local-origin delete reply: %.*s\n", @as(c_int, @intCast(deleted.len)), deleted.ptr);
         return "local-origin ui_delete failed";
     }
-    _ = app.pumpOnce(500);
+    pumpFor(app, 500);
     const alive = roundtrip(allocator, gui_sock, "{\"cmd\":\"screen-info\",\"pane\":1}\n") orelse
         return "the origin pane stopped answering after ui_close";
     defer allocator.free(alive);
@@ -10964,7 +11480,7 @@ fn mcpPanelStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:
     var waited: u32 = 0;
     const win_id = while (waited < 25_000) : (waited += 200) {
         if (hasToplevelOtherThan(app, known[0..n_known])) |id| break id;
-        _ = app.pumpOnce(200);
+        pumpFor(app, 200);
     } else return "ui_show never mapped a panel window";
     _ = app.waitVisualSettle(win_id, 400, 10_000, 0.002, null);
     const pw = app.winById(win_id) orelse return "the MCP panel window vanished";
@@ -10977,7 +11493,7 @@ fn mcpPanelStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:
     // Give the server a moment to be inside its poll loop, pumping so
     // the compositor side keeps running.
     var settle: u32 = 0;
-    while (settle < 5) : (settle += 1) _ = app.pumpOnce(100);
+    while (settle < 5) : (settle += 1) pumpFor(app, 100);
     // Aim at the button's own text, as the pane-origin stage does; the
     // window centre is only a fallback for a host without OCR.
     const click = waitOcrWordCenter(allocator, app, win_id, "Approve", 10_000) orelse
@@ -11027,7 +11543,7 @@ fn mcpPanelStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:
     defer allocator.free(foreign);
     if (std.mem.indexOf(u8, foreign, "\"ok\":true") == null) return "panel-show(foreign) not ok";
     const foreign_id = parseNumAfter(foreign, "\"panel_id\":") orelse return "foreign panel has no panel_id";
-    _ = app.pumpOnce(300);
+    pumpFor(app, 300);
     const foreign_saved = m.call("ui_save", "{\"name\":\"foreign\",\"session\":\"\"}", 20_000) orelse
         return "ui_save(foreign) timed out";
     if (mcpHas(foreign_saved, "isError"))
@@ -11044,7 +11560,7 @@ fn mcpPanelStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:
     const dropped = m.call("ui_delete", "{\"name\":\"foreign\",\"session\":\"\"}", 20_000) orelse
         return "ui_delete(foreign) timed out";
     if (mcpHas(dropped, "isError")) return "ui_delete(foreign) returned an error";
-    _ = app.pumpOnce(300);
+    pumpFor(app, 300);
 
     // ui_save cannot invent a document for a panel that is not on
     // screen: that is a refusal, never a stale save.
@@ -11055,7 +11571,7 @@ fn mcpPanelStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:
     const closed = m.call("ui_close", "{\"name\":\"mcp-e2e\",\"session\":\"\"}", 20_000) orelse
         return "ui_close timed out";
     if (mcpHas(closed, "isError")) return "ui_close returned an error";
-    _ = app.pumpOnce(500);
+    pumpFor(app, 500);
     const after_close = m.call("ui_panels", "{\"session\":\"\"}", 20_000) orelse return "ui_panels timed out";
     if (!mcpHas(after_close, "\"live\":[]")) return "a closed panel is still listed as live";
     if (!mcpHas(after_close, "Epoch 42")) return "ui_close destroyed the saved document";
@@ -11066,7 +11582,7 @@ fn mcpPanelStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:
         \\{"name":"mcp-e2e","session":"","target":"window","load":"mcp-e2e"}
     , 30_000) orelse return "ui_show(load) timed out";
     if (mcpHas(reshown, "isError")) return "ui_show could not re-open the saved panel";
-    _ = app.pumpOnce(500);
+    pumpFor(app, 500);
     const deleted = m.call("ui_delete", "{\"name\":\"mcp-e2e\",\"session\":\"\"}", 20_000) orelse
         return "ui_delete timed out";
     if (mcpHas(deleted, "isError")) return "ui_delete returned an error";
@@ -11077,7 +11593,7 @@ fn mcpPanelStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:
     const gone = m.call("ui_close", "{\"name\":\"mcp-e2e\",\"session\":\"\"}", 20_000) orelse
         return "final ui_close timed out";
     if (mcpHas(gone, "isError")) return "the re-opened panel could not be closed";
-    _ = app.pumpOnce(500);
+    pumpFor(app, 500);
     return null;
 }
 
@@ -11242,7 +11758,7 @@ fn remotePanelAssetStage(
     var waited: u32 = 0;
     const control_win = while (waited < 25_000) : (waited += 200) {
         if (hasToplevelOtherThan(app, known[0..n_known])) |id| break id;
-        _ = app.pumpOnce(200);
+        pumpFor(app, 200);
     } else return "the remote native control never mapped a window";
     _ = app.waitVisualSettle(control_win, 400, 10_000, 0.002, null);
     // OCR is a HEURISTIC and must not be the product verdict here. The
@@ -11266,7 +11782,7 @@ fn remotePanelAssetStage(
         "{\"name\":\"remote-control\",\"session\":\"remote-panel-assets\",\"timeout_ms\":20000}",
     )) return "could not start remote ui_wait_event";
     var settle: u32 = 0;
-    while (settle < 5) : (settle += 1) _ = app.pumpOnce(100);
+    while (settle < 5) : (settle += 1) pumpFor(app, 100);
     const control_window = app.winById(control_win) orelse return "the remote control window vanished";
     app.clickEx(
         control_win,
@@ -11323,7 +11839,7 @@ fn remotePanelAssetStage(
     waited = 0;
     const selective_win = while (waited < 25_000) : (waited += 200) {
         if (hasToplevelOtherThan(app, known[0..n_known])) |id| break id;
-        _ = app.pumpOnce(200);
+        pumpFor(app, 200);
     } else return "the remote selective panel never mapped";
     if (!waitForPanelColor(allocator, app, selective_win, .{ 0x20, 0x80, 0xff }, 12_000))
         return "remote selective image A did not render";
@@ -11421,7 +11937,7 @@ fn remotePanelAssetStage(
     waited = 0;
     const win_id = while (waited < 25_000) : (waited += 200) {
         if (hasToplevelOtherThan(app, known[0..n_known])) |id| break id;
-        _ = app.pumpOnce(200);
+        pumpFor(app, 200);
     } else return "the hydrated remote image panel never mapped a window";
     if (!waitForPanelColor(allocator, app, win_id, .{ 0x20, 0x80, 0xff }, 12_000))
         return "the remote-only blue image never rendered in the GUI panel";
@@ -11624,7 +12140,7 @@ fn remotePanelAssetStage(
     owner.sendJson(.kill, .{ .name = session }) catch return "could not send remote panel session cleanup";
     const killed = owner.recvExpectFor(&.{.ok}, 10_000) catch return "remote panel session cleanup was not acknowledged";
     killed.deinit(allocator);
-    _ = app.pumpOnce(500);
+    pumpFor(app, 500);
     return null;
 }
 
@@ -11816,7 +12332,7 @@ fn panelPickerStage(
     const probe_closed = roundtrip(allocator, sock_path, close_probe) orelse return "panel-close(probe) roundtrip";
     defer allocator.free(probe_closed);
     if (std.mem.indexOf(u8, probe_closed, "\"ok\":true") == null) return "panel-close(probe) not ok";
-    _ = app.pumpOnce(500);
+    pumpFor(app, 500);
 
     // Attach that same local lifetime through an explicit `sock:/path` host.
     // The picker must classify the CONNECTED Unix transport as local and use
@@ -11931,7 +12447,7 @@ fn panelPickerStage(
     {
         var waited: u32 = 0;
         while (waited < 20_000) : (waited += 200) {
-            _ = app.pumpOnce(200);
+            pumpFor(app, 200);
             const now = paneRows(allocator, sock_path) orelse continue;
             if (now != rows_before) break;
         } else return "the keybind config was written but never applied";
@@ -11985,7 +12501,7 @@ fn panelPickerStage(
     // The picker lists broken-then-good (sorted by name) and focuses the
     // first row. Activating the BROKEN one must mount nothing at all.
     app.pressKey(term_win, "Return") catch return "activating the broken row failed";
-    _ = app.pumpOnce(900);
+    pumpFor(app, 900);
     {
         const after_broken = roundtrip(allocator, sock_path, list_req) orelse
             return "panel-list(after the broken row) roundtrip";
@@ -11998,7 +12514,7 @@ fn panelPickerStage(
     // in a tab of its own.
     app.pressKey(term_win, "Down") catch return "moving to the saved row failed";
     app.pressKey(term_win, "Down") catch return "moving to the final saved row failed";
-    _ = app.pumpOnce(400);
+    pumpFor(app, 400);
     app.pressKey(term_win, "Return") catch return "opening the saved panel failed";
 
     var saved_panel_id: u32 = 0;
@@ -12050,7 +12566,7 @@ fn panelPickerStage(
     var closed = false;
     tries = 0;
     while (tries < 50 and !closed) : (tries += 1) {
-        _ = app.pumpOnce(200);
+        pumpFor(app, 200);
         const live = roundtrip(allocator, sock_path, list_req) orelse continue;
         defer allocator.free(live);
         closed = std.mem.indexOf(u8, live, "\"name\":\"e2e-saved\"") == null;
@@ -12128,7 +12644,7 @@ fn panelPickerStage(
     }
     if (picker_escapes == 3) return "the teardown picker never visibly closed";
     var teardown_waited: u32 = 0;
-    while (teardown_waited < 1_400) : (teardown_waited += 100) _ = app.pumpOnce(100);
+    while (teardown_waited < 1_400) : (teardown_waited += 100) pumpFor(app, 100);
     const after_teardown = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse
         return "GUI stopped serving after picker worker teardown";
     defer allocator.free(after_teardown);
@@ -12146,7 +12662,7 @@ fn panelPickerStage(
         \\
     )) return "could not restore confirm_close after the picker cancellation";
     var restore_waited: u32 = 0;
-    while (restore_waited < 1_500) : (restore_waited += 100) _ = app.pumpOnce(100);
+    while (restore_waited < 1_500) : (restore_waited += 100) pumpFor(app, 100);
 
     // The pane the picker was driven from is still a working terminal.
     const alive = roundtrip(allocator, sock_path, "{\"cmd\":\"screen-info\",\"pane\":1}\n") orelse
@@ -12262,7 +12778,7 @@ fn panePanelLifetimeStage(
         // is both alive and still owning pane 1.
         var waited: u32 = 0;
         while (waited < 3_000) : (waited += 250) {
-            _ = app.pumpOnce(250);
+            pumpFor(app, 250);
             const alive = roundtrip(allocator, sock_path, "{\"cmd\":\"screen-info\",\"pane\":1}\n") orelse
                 return "the GUI stopped serving after a pane panel was closed";
             defer allocator.free(alive);
@@ -12369,7 +12885,7 @@ fn themeSingletonStage(
     var primary_id: u32 = 0;
     var primary_waited: u32 = 0;
     while (primary_waited < 15_000) : (primary_waited += 100) {
-        _ = app.pumpOnce(100);
+        pumpFor(app, 100);
         var count: u32 = 0;
         for (app.windows.items) |w| {
             if (w.popup) continue;
@@ -12414,7 +12930,7 @@ fn themeSingletonStage(
     var secondary: u32 = 0;
     var detach_waited: u32 = 0;
     while (detach_waited < 15_000) : (detach_waited += 100) {
-        _ = app.pumpOnce(100);
+        pumpFor(app, 100);
         var found: u32 = 0;
         var candidate: u32 = 0;
         for (app.windows.items) |w| {
@@ -12502,7 +13018,7 @@ fn themeSingletonStage(
     var width_saved = false;
     var width_waited: u32 = 0;
     while (width_waited < 6_000) : (width_waited += 100) {
-        _ = app.pumpOnce(100);
+        pumpFor(app, 100);
         if (readFileAlloc(allocator, cfg_path)) |body| {
             defer allocator.free(body);
             if (std.mem.indexOf(u8, body, "tab_sidebar_width = ") != null) {
@@ -12526,7 +13042,7 @@ fn themeSingletonStage(
     var prefs_id: u32 = 0;
     var prefs_waited: u32 = 0;
     while (prefs_waited < 15_000) : (prefs_waited += 100) {
-        _ = app.pumpOnce(100);
+        pumpFor(app, 100);
         var count: u32 = 0;
         for (app.windows.items) |w| {
             if (w.popup) continue;
@@ -12546,7 +13062,7 @@ fn themeSingletonStage(
     if (std.mem.indexOf(u8, prefs_second, "\"ok\":true") == null) return "reopening secondary Preferences was not ok";
     var reuse_waited: u32 = 0;
     while (reuse_waited < 2_000) : (reuse_waited += 100) {
-        _ = app.pumpOnce(100);
+        pumpFor(app, 100);
         var count: u32 = 0;
         for (app.windows.items) |w| {
             if (w.popup) continue;
@@ -12577,10 +13093,13 @@ fn themeSingletonStage(
     const moved = roundtrip(allocator, sock, detach_again) orelse return "detaching from the secondary failed";
     defer allocator.free(moved);
     if (std.mem.indexOf(u8, moved, "\"ok\":true") == null) return "detaching from the secondary was not ok";
-    var gone: u32 = 0;
-    while (gone < 20_000) : (gone += 250) {
-        _ = app.pumpOnce(250);
+    // Wall clock, as in `waitPopup`: a pump-counted budget ran out while
+    // the teardown was still queued behind the main window's frames.
+    const gone_deadline = clock.nowMs() + 20_000;
+    while (clock.nowMs() < gone_deadline) {
+        _ = app.drainLive(250);
         if (app.windowGone(secondary) and app.windowGone(prefs_id)) break;
+        pumpFor(app, 100);
     }
     if (!app.windowGone(secondary)) return "the detached window never closed";
     if (!app.windowGone(prefs_id)) return "Preferences outlived its destroyed secondary parent";
@@ -12597,7 +13116,7 @@ fn themeSingletonStage(
     // dispatched into the freed Window many times over.
     var alive_waited: u32 = 0;
     while (alive_waited < 5_000) : (alive_waited += 250) {
-        _ = app.pumpOnce(250);
+        pumpFor(app, 250);
         // A single failed connect is NOT proof the GUI died: this rig runs
         // on a loaded box and the control socket can refuse a connection
         // while the main loop is mid-frame. Only a REAPED child (or a
@@ -12610,7 +13129,7 @@ fn themeSingletonStage(
                 theme_pid = 0;
                 return "the GUI EXITED after a secondary window was closed under a theme flip";
             }
-            _ = app.pumpOnce(250);
+            pumpFor(app, 250);
         } else return "the GUI stopped serving after a secondary window was closed under a theme flip";
         defer allocator.free(alive);
         if (std.mem.indexOf(u8, alive, "\"ok\":true") == null)
@@ -12732,7 +13251,7 @@ fn waitForPanelColor(
 ) bool {
     var waited: u32 = 0;
     while (waited < timeout_ms) : (waited += 200) {
-        _ = app.pumpOnce(200);
+        pumpFor(app, 200);
         const shot = app.snapshotRgba(win_id, null) catch continue;
         defer allocator.free(shot.px);
         if (panelColorPixels(shot.px, want) >= 400) return true;
@@ -12748,7 +13267,7 @@ fn waitForPanelColorAny(
 ) bool {
     var waited: u32 = 0;
     while (waited < timeout_ms) : (waited += 200) {
-        _ = app.pumpOnce(200);
+        pumpFor(app, 200);
         for (app.windows.items) |window| {
             if (window.popup) continue;
             const shot = app.snapshotRgba(window.id, null) catch continue;
@@ -13094,7 +13613,7 @@ fn hintsStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]c
 /// assertion catches either mistake.
 fn scrollbarStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]const u8) ?[]const u8 {
     if (app.windows.items.len == 0) return "the display session has no window to drive";
-    const win = app.windows.items[0];
+    const win = mainWin(app);
     const win_w: f64 = @floatFromInt(win.w);
     const win_h: f64 = @floatFromInt(win.h);
     if (win_w <= 0 or win_h <= 0) return "the GUI's window has no size";
@@ -13311,9 +13830,9 @@ fn waitPaneGone(allocator: std.mem.Allocator, sock_path: [:0]const u8, pane: u32
 fn editorInputStage(allocator: std.mem.Allocator, app: *appdrive.App) ?[]const u8 {
     _ = app.drainLive(3_000);
     if (app.windows.items.len == 0) return "the display session lost its window";
-    const win_id = app.windows.items[0].id;
-    const cx = @as(f64, @floatFromInt(app.windows.items[0].w)) / 2;
-    const cy = @as(f64, @floatFromInt(app.windows.items[0].h)) / 2;
+    const win_id = mainWin(app).id;
+    const cx = @as(f64, @floatFromInt(mainWin(app).w)) / 2;
+    const cy = @as(f64, @floatFromInt(mainWin(app).h)) / 2;
 
     app.clickEx(win_id, cx, cy, 1, 100, 1) catch return "clicking the editor canvas failed";
     _ = app.waitIdle(300, 5_000);
@@ -13325,7 +13844,7 @@ fn editorInputStage(allocator: std.mem.Allocator, app: *appdrive.App) ?[]const u
     // object cannot exist at all — which is precisely why input
     // verification there was worthless.
     var im_tries: u32 = 0;
-    while (im_tries < 50 and textInputCount(app) == 0) : (im_tries += 1) _ = app.pumpOnce(100);
+    while (im_tries < 50 and textInputCount(app) == 0) : (im_tries += 1) pumpFor(app, 100);
     if (textInputCount(app) == 0)
         return "the focused editor created no zwp_text_input_v3 — GTK is NOT on its Wayland input-method path";
 
@@ -13393,7 +13912,7 @@ fn waitEditorAtlasExact(
 ) ?EditorAtlasStats {
     var waited: u32 = 0;
     while (waited < 15_000) : (waited += 100) {
-        _ = app.pumpOnce(100);
+        pumpFor(app, 100);
         const stats = editorAtlasStats(allocator, sock_path, pane) orelse continue;
         if (stats.created == created and stats.deleted == deleted and
             stats.config_syncs == config_syncs and stats.layout_rebuilds == layout_rebuilds and
@@ -13411,7 +13930,7 @@ fn waitEditorAtlasRecreated(
 ) ?EditorAtlasStats {
     var waited: u32 = 0;
     while (waited < 15_000) : (waited += 100) {
-        _ = app.pumpOnce(100);
+        pumpFor(app, 100);
         const stats = editorAtlasStats(allocator, sock_path, pane) orelse continue;
         if (stats.created > before.created and stats.deleted >= before.deleted and
             stats.created - before.created == stats.deleted - before.deleted and
@@ -13431,7 +13950,7 @@ fn editorAtlasLifecycleStage(
     var stats = blk: {
         var waited: u32 = 0;
         while (waited < 15_000) : (waited += 100) {
-            _ = app.pumpOnce(100);
+            pumpFor(app, 100);
             const current = editorAtlasStats(allocator, sock_path, pane) orelse continue;
             if (editorAtlasHealthy(current)) break :blk current;
         }
@@ -13856,9 +14375,9 @@ fn deadKeyStage(allocator: std.mem.Allocator, rt: []const u8, mux_sock: []const 
     _ = c.usleep(1_200_000); // first pane's shell
 
     if (app.windows.items.len == 0) return "the Belgian display session lost its window";
-    const win_id = app.windows.items[0].id;
-    const cx = @as(f64, @floatFromInt(app.windows.items[0].w)) / 2;
-    const cy = @as(f64, @floatFromInt(app.windows.items[0].h)) / 2;
+    const win_id = mainWin(app).id;
+    const cx = @as(f64, @floatFromInt(mainWin(app).w)) / 2;
+    const cy = @as(f64, @floatFromInt(mainWin(app).h)) / 2;
 
     // ── face 1: the terminal pane ─────────────────────────────────
     app.clickEx(win_id, cx, cy, 1, 100, 1) catch return "clicking the Belgian GUI's pane failed";
@@ -14109,7 +14628,7 @@ fn wsWaitMarkerIn(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [
     var waited: u32 = 0;
     while (waited < ms) : (waited += 200) {
         if (wsMarkerIn(allocator, sock_path, pane, needle) >= want) return true;
-        _ = app.pumpOnce(200);
+        pumpFor(app, 200);
     }
     return false;
 }
@@ -14154,7 +14673,7 @@ fn wsColorPixels(px: []const u8, want: [3]u8) usize {
 fn wsWaitCoverage(allocator: std.mem.Allocator, app: *appdrive.App, win: u32, want: [3]u8, frac: f64, present: bool, ms: u32) bool {
     var waited: u32 = 0;
     while (waited < ms) : (waited += 200) {
-        _ = app.pumpOnce(200);
+        pumpFor(app, 200);
         const shot = app.snapshotRgba(win, null) catch continue;
         defer allocator.free(shot.px);
         const total = @as(f64, @floatFromInt(shot.w)) * @as(f64, @floatFromInt(shot.h));
@@ -14245,7 +14764,7 @@ fn wsFontStep(allocator: std.mem.Allocator, app: *appdrive.App, win: u32, sock_p
         app.pressKey(win, chord) catch return null;
         var waited: u32 = 0;
         while (waited < 4_000) : (waited += 200) {
-            _ = app.pumpOnce(200);
+            pumpFor(app, 200);
             const now = wsPaneCells(allocator, sock_path) orelse continue;
             if (if (grow) now > base else now < base) return now;
         }
@@ -14256,7 +14775,7 @@ fn wsFontStep(allocator: std.mem.Allocator, app: *appdrive.App, win: u32, sock_p
 fn wsWaitCells(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]const u8, want: u32, ms: u32) bool {
     var waited: u32 = 0;
     while (waited < ms) : (waited += 200) {
-        _ = app.pumpOnce(200);
+        pumpFor(app, 200);
         if (wsPaneCells(allocator, sock_path) == want) return true;
     }
     return false;
@@ -14289,7 +14808,7 @@ fn wsCopyPasteKeybinds(allocator: std.mem.Allocator, app: *appdrive.App, win: u3
     var copied = false;
     var waited: u32 = 0;
     while (waited < 8_000 and !copied) : (waited += 250) {
-        _ = app.pumpOnce(250);
+        pumpFor(app, 250);
         const clip = app.getClipboard(2_000) catch continue;
         defer allocator.free(clip);
         copied = std.mem.indexOf(u8, clip, "ZWcopy42") != null;
@@ -14307,7 +14826,7 @@ fn wsCopyPasteKeybinds(allocator: std.mem.Allocator, app: *appdrive.App, win: u3
     waited = 0;
     while (waited < 8_000 and !pasted) : (waited += 200) {
         pasted = wsCountText(allocator, sock_path, 1, "ZWcopy42", true) >= 2;
-        if (!pasted) _ = app.pumpOnce(200);
+        if (!pasted) pumpFor(app, 200);
     }
     if (!pasted) {
         wsDumpPane(allocator, sock_path, 1);
@@ -14482,7 +15001,7 @@ fn wsFindBar(allocator: std.mem.Allocator, app: *appdrive.App, win: u32, sock_pa
     var scrolled = false;
     var waited: u32 = 0;
     while (waited < 8_000 and !scrolled) : (waited += 250) {
-        _ = app.pumpOnce(250);
+        pumpFor(app, 250);
         const r = roundtrip(allocator, sock_path, "{\"cmd\":\"screen-info\",\"pane\":1}\n") orelse continue;
         defer allocator.free(r);
         scrolled = (parseNumAfter(r, "\"view_offset\":") orelse 0) > 0;
@@ -14520,7 +15039,7 @@ fn wsCrossSearch(allocator: std.mem.Allocator, app: *appdrive.App, win: u32, soc
     app.pressKey(win, "return") catch {};
     var waited: u32 = 0;
     while (waited < 10_000) : (waited += 250) {
-        _ = app.pumpOnce(250);
+        pumpFor(app, 250);
         if (wsFocusedPane(allocator, sock_path) == other) return null;
     }
     wsShot(allocator, app, win, "xsearch");
@@ -14611,7 +15130,7 @@ fn wsPanelFace(allocator: std.mem.Allocator, app: *appdrive.App, win: u32, sock_
     var waited: u32 = 0;
     var hidden = false;
     while (waited < 8_000 and !hidden) : (waited += 200) {
-        _ = app.pumpOnce(200);
+        pumpFor(app, 200);
         const shot = app.snapshotRgba(win, null) catch continue;
         defer allocator.free(shot.px);
         hidden = panelColorPixels(shot.px, color) < 50;
@@ -14821,7 +15340,7 @@ fn quakeToggleStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
 
     _ = app.drainLive(3_000);
     if (app.windows.items.len == 0) return "the display session has no window to drive";
-    const win_id = app.windows.items[0].id;
+    const win_id = mainWin(app).id;
     if (quakeExpectSize(app, win_id, 1920, 540)) |why| return why;
 
     // The toggle hides only a shown AND active window; the viewer is the
@@ -14855,7 +15374,7 @@ fn quakeToggleStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
         const resp = roundtrip(allocator, sock_path, "{\"cmd\":\"get-text\",\"pane\":1}\n") orelse continue;
         defer allocator.free(resp);
         if (countMarker(allocator, resp, QUAKE_MARKER) >= 2) break;
-        _ = app.pumpOnce(200);
+        pumpFor(app, 200);
     } else return "the pane's shell produced no output after the reveal";
 
     // Live reload: the mapped window follows a changed percentage.
@@ -14868,7 +15387,7 @@ fn quakeToggleStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
         if (app.windowGeometry(back)) |size| {
             if (size.w == 1920 and size.h == 270) return null;
         }
-        _ = app.pumpOnce(100);
+        pumpFor(app, 100);
     }
     const last = app.windowGeometry(back) orelse return "the quake window vanished during the live reload";
     return whyf("quake_height_percent = 25 was not applied live: window is {d}x{d}, wanted 1920x270", .{ last.w, last.h });
@@ -15133,6 +15652,35 @@ fn readFileAlloc(allocator: std.mem.Allocator, path: [:0]const u8) ?[]u8 {
         };
     }
     return out.toOwnedSlice(allocator) catch null;
+}
+
+/// Wait until the pane's last non-blank line is a shell prompt (ends in
+/// `$`): the foreground command is gone and the shell reads again.
+fn waitPanePrompt(allocator: std.mem.Allocator, sock: [:0]const u8, pane: u32, ms: u32) bool {
+    const deadline = clock.nowMs() + ms;
+    while (clock.nowMs() < deadline) {
+        var buf: [128]u8 = undefined;
+        const req = std.fmt.bufPrint(&buf, "{{\"cmd\":\"get-text\",\"pane\":{d}}}\n", .{pane}) catch return false;
+        if (roundtrip(allocator, sock, req)) |resp| {
+            defer allocator.free(resp);
+            // The reply is JSON: the text ends before `"}` and its
+            // newlines are the two-character `\n` escape.
+            var s: []const u8 = std.mem.trimEnd(u8, resp, " \r\n}");
+            if (std.mem.endsWith(u8, s, "\"")) s = s[0 .. s.len - 1];
+            while (true) {
+                const t = std.mem.trimEnd(u8, s, " ");
+                if (std.mem.endsWith(u8, t, "\\n")) {
+                    s = t[0 .. t.len - 2];
+                    continue;
+                }
+                s = t;
+                break;
+            }
+            if (std.mem.endsWith(u8, s, "$")) return true;
+        }
+        _ = c.usleep(200_000);
+    }
+    return false;
 }
 
 fn waitPaneText(

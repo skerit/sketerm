@@ -16,6 +16,7 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const appdrive = @import("../ipc/appdrive.zig");
 const ctlsock = @import("ctlsock.zig");
+const rigwin = @import("rigwin.zig");
 
 const Info = struct {
     language: []const u8 = "",
@@ -125,7 +126,7 @@ const Ctx = struct {
         if (std.mem.indexOf(u8, reply, "\"ok\":true") == null) return false;
         _ = self.app.drainLive(1_000);
         if (self.app.windows.items.len == 0) return false;
-        const w = self.app.windows.items[0];
+        const w = rigwin.mainWin(self.app);
         self.app.clickEx(w.id, @as(f64, @floatFromInt(w.w)) / 2, @as(f64, @floatFromInt(w.h)) / 2, 1, 100, 1) catch return false;
         _ = self.app.waitIdle(300, 5_000);
         self.app.pressKey(null, "ctrl+home") catch return false;
@@ -136,6 +137,12 @@ const Ctx = struct {
     fn closeAll(self: *Ctx) void {
         for (self.panes.items) |p| {
             var buf: [96]u8 = undefined;
+            // Saved first: a dirty editor tab turns close-pane into a
+            // "Discard unsaved changes?" dialog, which stayed up over the
+            // window and swallowed the next stage's keys.
+            const save = std.fmt.bufPrint(&buf, "{{\"cmd\":\"send-keys\",\"pane\":{d},\"data\":\"ctrl+s\"}}\n", .{p}) catch continue;
+            if (ctlsock.roundtrip(self.allocator, self.app, self.sock, save)) |r| self.allocator.free(r);
+            _ = self.app.waitIdle(200, 3_000);
             const req = std.fmt.bufPrint(&buf, "{{\"cmd\":\"close-pane\",\"pane\":{d}}}\n", .{p}) catch continue;
             if (ctlsock.roundtrip(self.allocator, self.app, self.sock, req)) |r| self.allocator.free(r);
             _ = self.app.waitIdle(200, 3_000);
@@ -333,28 +340,36 @@ pub fn stage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]const u
 fn paletteRun(ctx: *Ctx, label: []const u8) ?[]const u8 {
     const app = ctx.app;
     if (app.windows.items.len == 0) return "the display session lost its window";
-    const win_id = app.windows.items[0].id;
+    const win_id = rigwin.mainWin(app).id;
     var ref = app.frameRef(win_id, true) orelse return "no baseline frame for the palette";
     defer ref.deinit(ctx.allocator);
     // The chord a user presses, from the focused editor canvas.
     app.pressKey(null, "ctrl+shift+p") catch return "injecting ctrl+shift+p failed";
     if (!app.waitChangeSince(win_id, &ref, 15_000, 0.01, null)) return "ctrl+shift+p did not open the command palette";
+    return paletteQuery(ctx.allocator, app, null, win_id, label);
+}
+
+/// Type `label` into the command palette open in `win_id`, wait until
+/// the list is FILTERED to it, and press Return. `kbd` is the keyboard
+/// target (null = the seat's current one). Shared by every stage that
+/// drives the palette, so the waits below exist once.
+pub fn paletteQuery(allocator: std.mem.Allocator, app: *appdrive.App, kbd: ?u32, win_id: u32, label: []const u8) ?[]const u8 {
     // Let the present fade finish first, or it passes for typed text.
     _ = app.waitVisualSettle(win_id, 600, 8_000, 0.0005, null);
     var ref2 = app.frameRef(win_id, true) orelse return "no pre-typing palette frame";
-    defer ref2.deinit(ctx.allocator);
+    defer ref2.deinit(allocator);
     // Wait for the FILTERED list, not the echoed text: GtkSearchEntry
     // runs the search after a delay, and a Return before it lands runs
     // the unfiltered top row. Emptying all but one of the visible rows
     // repaints several percent of the window; the echoed query alone is
     // a fraction of one.
     const FILTERED: f64 = 1.0;
-    app.typeText(null, label) catch {};
+    app.typeText(kbd, label) catch {};
     var filtered = app.waitChangeSince(win_id, &ref2, 8_000, FILTERED, null);
     if (!filtered) {
         // GTK's wayland IM module can leave a GtkText waiting for an
         // IME that this harness does not play; a paste bypasses it.
-        app.pasteText(null, label) catch return "pasting the palette query failed";
+        app.pasteText(kbd, label) catch return "pasting the palette query failed";
         filtered = app.waitChangeSince(win_id, &ref2, 8_000, FILTERED, null);
     }
     if (!filtered) return "the palette never filtered down to the typed query";
@@ -363,7 +378,7 @@ fn paletteRun(ctx: *Ctx, label: []const u8) ?[]const u8 {
     // committed frame) so Return takes the row the whole query ranks.
     _ = app.waitVisualSettle(win_id, 1_000, 8_000, 0.002, null);
     _ = app.waitFrameAfter(win_id, app.frameCount(win_id), 3_000);
-    app.pressKey(null, "return") catch return "injecting return into the palette failed";
+    app.pressKey(kbd, "return") catch return "injecting return into the palette failed";
     _ = app.waitIdle(300, 5_000);
     return null;
 }
