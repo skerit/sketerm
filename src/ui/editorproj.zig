@@ -32,12 +32,9 @@ const findbar = @import("findbar.zig");
 const psearch = @import("../editor/psearch.zig");
 const gitdiff = @import("../editor/gitdiff.zig");
 const search = @import("../editor/search.zig");
-const Document = @import("../editor/document.zig").Document;
-const tr = @import("../editor/transaction.zig");
-const vm = @import("../editor/view_model.zig");
 const fsdrive = @import("../ipc/fsdrive.zig");
 const paths = @import("../filebrowser/paths.zig");
-const servers = @import("../lsp/servers.zig");
+const editorio = @import("editorio.zig");
 
 /// Worker threads allocate from the C allocator, like every other
 /// editor IO job: the models they build are MOVED onto the main thread
@@ -59,6 +56,9 @@ const DirCache = struct {
     fs: *fsdrive.Fs,
     arena: std.heap.ArenaAllocator,
     dirs: std.ArrayList(Entry) = .empty,
+    /// A listing failed in TRANSPORT: the discovery answer means nothing
+    /// and the job retries on a fresh connection.
+    transport_err: ?anyerror = null,
 
     const Entry = struct { dir: []u8, names: [][]u8 };
 
@@ -72,7 +72,8 @@ const DirCache = struct {
             if (std.mem.eql(u8, e.dir, dir)) return e.names;
         }
         const a = self.arena.allocator();
-        var listing = self.fs.list(dir) catch {
+        var listing = self.fs.list(dir) catch |err| {
+            if (editorio.isTransportError(err)) self.transport_err = err;
             // A directory we cannot list holds no markers we can see.
             const empty = a.dupe(u8, dir) catch return null;
             self.dirs.append(wa, .{ .dir = empty, .names = &.{} }) catch return null;
@@ -118,6 +119,19 @@ const ProjJob = struct {
         self.fence.unref();
         wa.destroy(self);
     }
+
+    fn run(self: *ProjJob, fs: *fsdrive.Fs) !void {
+        var cache = DirCache{ .fs = fs, .arena = std.heap.ArenaAllocator.init(wa) };
+        defer cache.deinit();
+        const found = project_mod.discover(self.spec, self.markers, DirCache.exists, &cache);
+        if (cache.transport_err) |err| return err;
+        const f = found orelse return;
+        self.found = true;
+        self.root_len = @min(f.root.len, self.root_buf.len);
+        @memcpy(self.root_buf[0..self.root_len], f.root[0..self.root_len]);
+        self.marker_len = @min(f.marker.len, self.marker_buf.len);
+        @memcpy(self.marker_buf[0..self.marker_len], f.marker[0..self.marker_len]);
+    }
 };
 
 /// Resolve `tab`'s project in the background. Idempotent and cheap to
@@ -157,20 +171,7 @@ pub fn resolveProject(view: *EditorView, tab: *ETab) void {
 
 fn projThread(data: ?*anyopaque) callconv(.c) ?*anyopaque {
     const job = cast.userData(ProjJob, data);
-    const loc = paths.parseSpec(job.spec);
-    if (ev.connectFs(loc.host)) |fs_val| {
-        var fs = fs_val;
-        defer fs.deinit();
-        var cache = DirCache{ .fs = &fs, .arena = std.heap.ArenaAllocator.init(wa) };
-        defer cache.deinit();
-        if (project_mod.discover(job.spec, job.markers, DirCache.exists, &cache)) |found| {
-            job.found = true;
-            job.root_len = @min(found.root.len, job.root_buf.len);
-            @memcpy(job.root_buf[0..job.root_len], found.root[0..job.root_len]);
-            job.marker_len = @min(found.marker.len, job.marker_buf.len);
-            @memcpy(job.marker_buf[0..job.marker_len], found.marker[0..job.marker_len]);
-        }
-    } else |_| {}
+    editorio.withFs(paths.parseSpec(job.spec).host, job, ProjJob.run) catch {};
     _ = c.g_idle_add(@ptrCast(&projIdle), @ptrCast(job));
     return null;
 }
@@ -179,7 +180,7 @@ fn projIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
     const job = cast.userData(ProjJob, user);
     defer job.destroy();
     const view = job.fence.viewIfAlive() orelse return 0;
-    const tab = view.findTabByIdPublic(job.tab_id) orelse return 0;
+    const tab = view.findTabById(job.tab_id) orelse return 0;
     if (tab.proj_gen != job.gen) return 0;
     tab.proj_gen = 0;
     if (!job.found) return 0;
@@ -199,7 +200,7 @@ fn projIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
         view.allocator.free(rp);
         tab.restored_project = null;
     }
-    view.updateStatusExternal();
+    view.updateStatus();
     if (view.git_gutter) refreshGit(view, tab);
     return 0;
 }
@@ -241,6 +242,23 @@ const GitJob = struct {
         self.fence.unref();
         wa.destroy(self);
     }
+
+    /// One daemon job on the FILE'S host: it finds the repository from
+    /// the file's own directory, runs the diff there and parses it
+    /// there. Any daemon-side failure (including a daemon whose build
+    /// has no such verb) leaves the tab saying it does not know, never
+    /// "clean"; only a transport failure is returned, for the retry.
+    fn run(self: *GitJob, fs: *fsdrive.Fs) !void {
+        const res = fs.gitDiff(wa, paths.parseSpec(self.spec).path, JOB_TIMEOUT_MS) catch |err| {
+            if (editorio.isTransportError(err)) return err;
+            return;
+        };
+        self.runs = res.runs;
+        self.repo = res.repo;
+        self.tracked = res.tracked;
+        self.initial = res.initial;
+        self.ok = true;
+    }
 };
 
 /// Recompute `tab`'s gutter marks against HEAD. No-op without a
@@ -279,41 +297,16 @@ pub fn refreshGit(view: *EditorView, tab: *ETab) void {
 
 fn gitThread(data: ?*anyopaque) callconv(.c) ?*anyopaque {
     const job = cast.userData(GitJob, data);
-    run: {
-        const loc = paths.parseSpec(job.spec);
-        var fs = ev.connectFs(loc.host) catch break :run;
-        defer fs.deinit();
-        // One daemon job on the FILE'S host: it finds the repository
-        // from the file's own directory, runs the diff there and
-        // parses it there. Any failure (including a daemon whose
-        // build has no such verb, which answers "unknown fs job op")
-        // leaves the tab saying it does not know, never "clean".
-        const res = fs.gitDiff(wa, loc.path, JOB_TIMEOUT_MS) catch break :run;
-        job.runs = res.runs;
-        job.repo = res.repo;
-        job.tracked = res.tracked;
-        job.initial = res.initial;
-        job.ok = true;
-        drainJobEvents(&fs);
-    }
+    editorio.withFs(paths.parseSpec(job.spec).host, job, GitJob.run) catch {};
     _ = c.g_idle_add(@ptrCast(&gitIdle), @ptrCast(job));
     return null;
-}
-
-/// Discard whatever job events are still stashed, so the next job's
-/// drain sees only its own.
-fn drainJobEvents(fs: *fsdrive.Fs) void {
-    while (fs.takeJobEvent()) |e0| {
-        var e = e0;
-        e.deinit();
-    }
 }
 
 fn gitIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
     const job = cast.userData(GitJob, user);
     defer job.destroy();
     const view = job.fence.viewIfAlive() orelse return 0;
-    const tab = view.findTabByIdPublic(job.tab_id) orelse return 0;
+    const tab = view.findTabById(job.tab_id) orelse return 0;
     if (tab.git_gen != job.gen) return 0;
     tab.git_gen = 0;
     tab.git.refreshing = false;
@@ -332,8 +325,8 @@ fn gitIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
         defer view.allocator.free(marks);
         tab.git.setFromLines(&tab.doc, marks) catch return 0;
     }
-    view.queueRenderExternal();
-    view.updateStatusExternal();
+    view.queueRender();
+    view.updateStatus();
     return 0;
 }
 
@@ -475,25 +468,31 @@ fn startSearchJob(view: *EditorView, mode: SearchMode) void {
 
 fn searchThread(data: ?*anyopaque) callconv(.c) ?*anyopaque {
     const job = cast.userData(SearchJob, data);
-    run: {
-        const host: ?[]const u8 = if (job.host.len == 0) null else job.host;
-        var fs = ev.connectFs(host) catch {
-            job.setErr("cannot reach the daemon");
-            break :run;
-        };
-        defer fs.deinit();
+    const host: ?[]const u8 = if (job.host.len == 0) null else job.host;
+    editorio.withFs(host, job, searchOn) catch job.setErr("cannot reach the daemon");
+    _ = c.g_idle_add(@ptrCast(&searchIdle), @ptrCast(job));
+    return null;
+}
 
+/// The search body. Only a failure to START is returned (a stale pooled
+/// connection shows there, before anything was collected), so a retry
+/// never doubles a result set.
+fn searchOn(job: *SearchJob, fs: *fsdrive.Fs) !void {
+    const host: ?[]const u8 = if (job.host.len == 0) null else job.host;
+    run: {
         // Candidate FILES from the daemon. The literal seed is what
         // grep can filter on; without one, every file under the root is
         // a candidate and the cap does the bounding.
         const seed = psearch.literalSeed(job.needle, job.opts);
         const djob = if (seed.len > 0)
-            fs.startGrep(job.root, seed) catch {
+            fs.startGrep(job.root, seed) catch |err| {
+                if (editorio.isTransportError(err)) return err;
                 job.setErr("could not start the search");
                 break :run;
             }
         else
-            fs.startFind(job.root, "*") catch {
+            fs.startFind(job.root, "*") catch |err| {
+                if (editorio.isTransportError(err)) return err;
                 job.setErr("could not start the search");
                 break :run;
             };
@@ -539,24 +538,13 @@ fn searchThread(data: ?*anyopaque) callconv(.c) ?*anyopaque {
             var spec_buf: [paths.SPEC_BUF_LEN]u8 = undefined;
             const spec = paths.formatSpec(&spec_buf, host, path);
             const idx = job.results.addFile(spec) catch continue;
-            ev.readAllCapped(&fs, path, &content, ev.MAX_FILE_BYTES) catch {
+            editorio.readAllCapped(fs, path, &content, editorio.MAX_FILE_BYTES) catch {
                 job.results.setNote(idx, "unreadable", .failed) catch {};
                 continue;
             };
-            const hits = job.results.scanContent(idx, content.items) catch continue;
-            if (job.mode == .preview and hits > 0) {
-                var arena = std.heap.ArenaAllocator.init(wa);
-                defer arena.deinit();
-                const mtime: i64 = if (fs.statFollow(arena.allocator(), path)) |e2|
-                    e2.mtime_ns
-                else |_|
-                    0;
-                _ = job.results.planReplace(idx, content.items, mtime) catch {};
-            }
+            _ = job.results.scanContent(idx, content.items) catch continue;
         }
     }
-    _ = c.g_idle_add(@ptrCast(&searchIdle), @ptrCast(job));
-    return null;
 }
 
 fn searchIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
@@ -634,12 +622,12 @@ pub fn buildPanel(view: *EditorView) void {
     c.gtk_box_append(@ptrCast(rrow), rentry);
     view.search_replace_entry = rentry.?;
     const prev = c.gtk_button_new_with_label("Preview");
-    c.gtk_widget_set_tooltip_text(prev, "Compute every replacement without writing anything");
+    c.gtk_widget_set_tooltip_text(prev, "List every file the replacement would change");
     _ = c.g_signal_connect_data(prev, "clicked", @ptrCast(&onPreviewClicked), @ptrCast(view), null, c.G_CONNECT_DEFAULT);
     c.gtk_box_append(@ptrCast(rrow), prev);
     view.search_preview_btn = prev.?;
     const apply = c.gtk_button_new_with_label("Apply");
-    c.gtk_widget_set_tooltip_text(apply, "Write the previewed replacement to every file");
+    c.gtk_widget_set_tooltip_text(apply, "Replace in every listed file's buffer, opening it when needed; nothing is saved");
     c.gtk_widget_set_sensitive(apply, 0);
     _ = c.g_signal_connect_data(apply, "clicked", @ptrCast(&onApplyClicked), @ptrCast(view), null, c.G_CONNECT_DEFAULT);
     c.gtk_box_append(@ptrCast(rrow), apply);
@@ -764,8 +752,8 @@ fn rebuildResultRows(view: *EditorView) void {
         const rel = relativeTo(r.root, spec);
         const head_z = if (f.state == .failed)
             std.fmt.bufPrintZ(&head, "{s} — {s}", .{ rel, r.note(@intCast(fi)) }) catch continue
-        else if (view.replace_previewed and f.planned)
-            std.fmt.bufPrintZ(&head, "{s} ({d}) — will be rewritten", .{ rel, f.hit_count }) catch continue
+        else if (view.replace_previewed)
+            std.fmt.bufPrintZ(&head, "{s} ({d}) \u{2014} will be replaced in its buffer", .{ rel, f.hit_count }) catch continue
         else
             std.fmt.bufPrintZ(&head, "{s} ({d})", .{ rel, f.hit_count }) catch continue;
         appendRow(view, head_z.ptr, null, true);
@@ -878,152 +866,106 @@ fn onPreviewActivate(_: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
 }
 
 // ---- applying a previewed replace -------------------------------------
+//
+// One policy with a language-server rename (docs/lsp.md): the change
+// lands in BUFFERS, as one undoable transaction per file, and nothing is
+// written to disk behind the user's back. A file with no tab is opened
+// as one and gets its replacement when its load lands (the view's
+// deferred-edit queue), re-planned against the text that actually
+// arrived, so a file that changed since the preview is replaced as it
+// is now rather than overwritten with a stale plan.
 
-const ApplyItem = struct {
-    spec: []u8,
-    content: []u8,
-    mtime_ns: i64,
+/// What a deferred project replace carries through the queue.
+const ReplaceSpec = struct {
+    needle: []const u8,
+    template: []const u8,
+    opts: psearch.Options,
 };
 
-const ApplyJob = struct {
-    fence: *Fence,
-    items: []ApplyItem,
-    ok: usize = 0,
-    conflicts: usize = 0,
-    failures: usize = 0,
-
-    fn destroy(self: *ApplyJob) void {
-        for (self.items) |it| {
-            wa.free(it.spec);
-            wa.free(it.content);
-        }
-        wa.free(self.items);
-        self.fence.unref();
-        wa.destroy(self);
-    }
-};
-
-/// Apply the previewed plan.
-///
-/// A file that is OPEN in a tab goes through its document as ONE
-/// transaction, so Ctrl+Z undoes the whole file's replacement and the
-/// buffer, the highlighter, the folds and the language server all see
-/// the edit. Everything else is written by the worker through the same
-/// atomic install (temp file + expected mtime) an ordinary save uses,
-/// so a file that changed since the preview is REFUSED rather than
-/// clobbered.
+/// Apply the previewed replace to every file that had hits.
 fn applyReplace(view: *EditorView) void {
     if (!view.replace_previewed) {
         setSearchStatus(view, "Press Preview first.");
         return;
     }
     const r = &view.results;
-    var in_buffers: usize = 0;
-    var items: std.ArrayList(ApplyItem) = .empty;
-    defer items.deinit(wa);
+    var payload: std.Io.Writer.Allocating = .init(view.allocator);
+    defer payload.deinit();
+    std.json.Stringify.value(ReplaceSpec{
+        .needle = r.needle,
+        .template = r.replacement,
+        .opts = r.opts,
+    }, .{}, &payload.writer) catch return;
 
+    var now: usize = 0;
+    var opening: usize = 0;
+    var failed: usize = 0;
     for (r.files.items, 0..) |f, fi| {
-        if (!f.planned or f.hit_count == 0) continue;
+        if (f.hit_count == 0) continue;
         const spec = r.fileSpec(@intCast(fi));
-        if (view.tabForSpec(spec)) |tab| {
-            if (replaceInDoc(view, tab, r.needle, r.replacement, r.opts)) |n| {
-                if (n > 0) {
-                    in_buffers += 1;
-                    // Apply means the same thing for every file: an
-                    // open buffer is saved too, so disk and buffer
-                    // agree afterwards. The transaction is still ONE
-                    // undo step — undoing re-dirties the buffer and the
-                    // user saves again.
-                    view.saveTab(tab);
-                }
-            }
+        const tab = view.tabForSpec(spec) orelse blk: {
+            view.openSpec(spec, null);
+            break :blk view.tabForSpec(spec) orelse {
+                failed += 1;
+                continue;
+            };
+        };
+        if (tab.loading) {
+            view.deferEdit(tab, .project_replace, payload.written()) catch {
+                failed += 1;
+                continue;
+            };
+            opening += 1;
             continue;
         }
-        const content = r.planned(@intCast(fi)) orelse continue;
-        const spec_copy = wa.dupe(u8, spec) catch continue;
-        const body = wa.dupe(u8, content) catch {
-            wa.free(spec_copy);
+        const n = replaceInDoc(view, tab, r.needle, r.replacement, r.opts) orelse {
+            failed += 1;
             continue;
         };
-        items.append(wa, .{
-            .spec = spec_copy,
-            .content = body,
-            .mtime_ns = f.expected_mtime_ns,
-        }) catch {
-            wa.free(spec_copy);
-            wa.free(body);
-        };
+        if (n > 0) now += 1;
     }
 
     view.replace_previewed = false;
     c.gtk_widget_set_sensitive(view.search_apply_btn, 0);
-    if (items.items.len == 0) {
-        var buf: [160:0]u8 = undefined;
-        const z = std.fmt.bufPrintZ(&buf, "Replaced in {d} open buffer(s); nothing left to write.", .{in_buffers}) catch return;
-        setSearchStatusZ(view, z.ptr);
-        return;
-    }
-
-    const job = wa.create(ApplyJob) catch return;
-    view.fence.ref();
-    job.* = .{
-        .fence = view.fence,
-        .items = items.toOwnedSlice(wa) catch {
-            view.fence.unref();
-            wa.destroy(job);
-            return;
-        },
-    };
-    setSearchStatus(view, "Applying…");
-    const th = c.g_thread_new("sketerm-preplace", @ptrCast(&applyThread), @ptrCast(job));
-    if (th == null) {
-        job.destroy();
-        return;
-    }
-    c.g_thread_unref(th);
+    var buf: [320:0]u8 = undefined;
+    const msg = applyOutcome(&buf, now, opening, failed);
+    setSearchStatusZ(view, msg.ptr);
+    view.setStatusText(msg.ptr);
 }
 
-fn applyThread(data: ?*anyopaque) callconv(.c) ?*anyopaque {
-    const job = cast.userData(ApplyJob, data);
-    for (job.items) |it| {
-        const loc = paths.parseSpec(it.spec);
-        var fs = ev.connectFs(loc.host) catch {
-            job.failures += 1;
-            continue;
-        };
-        defer fs.deinit();
-        _ = fs.writeFileAtomic(loc.path, it.content, if (it.mtime_ns != 0) it.mtime_ns else null) catch |err| {
-            if (err == fsdrive.Error.Conflict) job.conflicts += 1 else job.failures += 1;
-            continue;
-        };
-        job.ok += 1;
-    }
-    _ = c.g_idle_add(@ptrCast(&applyIdle), @ptrCast(job));
-    return null;
+/// The outcome sentence, undo shape included (one undo step per file),
+/// in the words a rename's outcome uses.
+fn applyOutcome(buf: *[320:0]u8, now: usize, opening: usize, failed: usize) [:0]const u8 {
+    const total = now + opening;
+    var w: std.Io.Writer = .fixed(buf[0 .. buf.len - 1]);
+    w.print("Replaced in {d} file(s)", .{total}) catch {};
+    if (total > 1) w.print(" \u{2014} {d} separate undo steps, one per file", .{total}) catch {};
+    if (opening > 0) w.print("; {d} opened for it", .{opening}) catch {};
+    if (failed > 0) w.print("; {d} could not be changed", .{failed}) catch {};
+    if (total > 0) w.writeAll("; review and save (Save All)") catch {};
+    w.writeAll(".") catch {};
+    const n = w.end;
+    buf[n] = 0;
+    return buf[0..n :0];
 }
 
-fn applyIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const job = cast.userData(ApplyJob, user);
-    const ok = job.ok;
-    const conflicts = job.conflicts;
-    const failures = job.failures;
-    const view_opt = job.fence.viewIfAlive();
-    job.destroy();
-    const view = view_opt orelse return 0;
-    var buf: [200:0]u8 = undefined;
-    const z = std.fmt.bufPrintZ(
-        &buf,
-        "Replaced in {d} file(s){s}{s}.",
-        .{
-            ok,
-            if (conflicts > 0) " — some were refused: they changed on disk since the preview" else "",
-            if (failures > 0) " — some could not be written" else "",
-        },
-    ) catch return 0;
-    setSearchStatusZ(view, z.ptr);
-    // Re-run the search so the list reflects what is on disk now.
-    startSearchJob(view, .search);
-    return 0;
+/// A deferred replace for a file that just loaded: re-planned against
+/// the text that arrived. @return whether anything changed.
+pub fn applyDeferredReplace(view: *EditorView, tab: *ETab, payload: []const u8) bool {
+    var parsed = std.json.parseFromSlice(ReplaceSpec, view.allocator, payload, .{
+        .ignore_unknown_fields = true,
+    }) catch return false;
+    defer parsed.deinit();
+    const spec = parsed.value;
+    const n = replaceInDoc(view, tab, spec.needle, spec.template, spec.opts) orelse return false;
+    return n > 0;
+}
+
+/// The files that had to be opened first got their replacement.
+pub fn reportDeferredReplace(view: *EditorView, files: usize) void {
+    var buf: [160:0]u8 = undefined;
+    const msg = std.fmt.bufPrintZ(&buf, "Replaced in {d} more file(s) as they loaded; review and save.", .{files}) catch "Replaced.";
+    view.setStatusText(msg.ptr);
 }
 
 fn onApplyClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
@@ -1040,45 +982,8 @@ fn replaceInDoc(
     template: []const u8,
     opts: psearch.Options,
 ) ?usize {
-    const alloc = view.allocator;
-    const matches = search.findAll(alloc, &tab.doc, needle, opts) catch return null;
-    defer alloc.free(matches);
-    if (matches.len == 0) return 0;
-
-    var tx = tr.Transaction.init(tab.doc.revision);
-    defer tx.deinit(alloc);
-    // The transaction BORROWS its inserted slices, so the expansions
-    // have to outlive the apply.
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var re_opt: ?search.Regex = if (opts.regex)
-        (search.Regex.init(alloc, needle, opts) catch return null)
-    else
-        null;
-    defer if (re_opt) |*r| r.deinit();
-
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(alloc);
-    var prev_end: usize = 0;
-    var applied: usize = 0;
-    for (matches) |m| {
-        if (m.start < prev_end) continue;
-        var with = template;
-        if (re_opt) |*re| {
-            buf.clearRetainingCapacity();
-            const caps = (re.capturesAt(&tab.doc, m.start) catch null) orelse continue;
-            re.expand(&tab.doc, caps, template, &buf) catch continue;
-            with = arena.dupe(u8, buf.items) catch continue;
-        }
-        tx.addReplace(alloc, m.start, m.end - m.start, with) catch return applied;
-        prev_end = m.end;
-        applied += 1;
-    }
-    _ = tab.doc.applyTransactionSel(&tx, vm.snapshotOf(&tab.sels)) catch return null;
-    tab.sels.mapThrough(tx.edits.items, .editor);
-    vm.clampSelections(&tab.doc, &tab.sels);
-    view.afterExternalEdit(tab);
+    const applied = search.replaceAllIn(view.allocator, &tab.doc, &tab.sels, needle, template, opts) catch return null;
+    if (applied > 0) view.afterExternalEdit(tab);
     return applied;
 }
 
@@ -1110,4 +1015,27 @@ pub fn statusFragment(view: *EditorView, tab: *ETab, buf: []u8) []const u8 {
         proj.label(),
         tab.git.hunkCount(&tab.doc),
     }) catch "";
+}
+
+// ======================================================================
+// Tests
+// ======================================================================
+
+test "editorproj: the apply outcome states the undo shape" {
+    const t = std.testing;
+    var buf: [320:0]u8 = undefined;
+    try t.expectEqualStrings(
+        "Replaced in 3 file(s) \u{2014} 3 separate undo steps, one per file; 2 opened for it; review and save (Save All).",
+        applyOutcome(&buf, 1, 2, 0),
+    );
+    try t.expectEqualStrings("Replaced in 1 file(s); review and save (Save All).", applyOutcome(&buf, 1, 0, 0));
+    try t.expectEqualStrings("Replaced in 0 file(s); 1 could not be changed.", applyOutcome(&buf, 0, 0, 1));
+}
+
+test "editorproj: paths are shown relative to the project root" {
+    const t = std.testing;
+    try t.expectEqualStrings("src/a.zig", relativeTo("box:/proj", "box:/proj/src/a.zig"));
+    try t.expectEqualStrings("a.zig", relativeTo("/", "/a.zig"));
+    // Outside the root: the whole path, never a truncated one.
+    try t.expectEqualStrings("/elsewhere/b.zig", relativeTo("/proj", "/elsewhere/b.zig"));
 }

@@ -63,8 +63,8 @@ pub fn syncIndent(view: *EditorView, tab: *ETab) void {
         // Wrapped-row estimates were made at the old width.
         tab.rows_lines = 0;
     }
-    view.updateStatusExternal();
-    view.queueRenderExternal();
+    view.updateStatus();
+    view.queueRender();
 }
 
 /// Language and indentation for the status line ("Python, Spaces: 4

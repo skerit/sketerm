@@ -3,8 +3,10 @@
 //! per-item icons, so rows are built by hand; every heap signal
 //! context carries its allocator and a matching destroy-notify).
 //!
-//! Behaviour lives in `EditorView.menuAction`; state (which rows can
-//! act) is decided per popup by `EditorView.menuPrePopup`, which also
+//! Every row that is a verb of the editor is an `editor/commands.zig`
+//! command dispatched through `EditorView.runCommand`, the same path as
+//! its keybinding and palette row; state (which rows can act) is
+//! decided per popup by `EditorView.menuPrePopup`, which also
 //! moves the caret when the click lands outside every selection. LSP
 //! rows hide entirely when no server is attached to the document —
 //! present-but-dead menu items are worse than absent ones.
@@ -21,42 +23,12 @@ const tabhost = @import("tabhost.zig");
 const clipboard = @import("clipboard.zig");
 const siblingapp = @import("siblingapp.zig");
 const paths = @import("../filebrowser/paths.zig");
-
-pub const Action = enum {
-    cut,
-    copy,
-    paste,
-    select_all,
-    toggle_comment,
-    duplicate,
-    move_up,
-    move_down,
-    join,
-    sort,
-    indent,
-    dedent,
-    trim_ws,
-    case_upper,
-    case_lower,
-    case_title,
-    goto_def,
-    references,
-    rename,
-    format,
-    code_actions,
-    fold,
-    unfold,
-    fold_all,
-    unfold_all,
-    find,
-    replace,
-    goto_line,
-};
+const ecmd = @import("../editor/commands.zig");
 
 const ActionSlot = struct {
     allocator: std.mem.Allocator,
     view: *EditorView,
-    action: Action,
+    action: ecmd.Command,
 };
 
 const Bind = struct {
@@ -64,7 +36,7 @@ const Bind = struct {
     label: [*:0]const u8,
     detailed: [*:0]const u8,
     icon: [*:0]const u8,
-    action: Action,
+    action: ecmd.Command,
     /// Row only makes sense with a language server attached to the
     /// active document; hidden (with its leading separator) otherwise.
     lsp_only: bool = false,
@@ -90,25 +62,25 @@ const MENU = [_]Item{
     .separator,
     .{ .bind = .{ .name = "toggle-comment", .label = "Toggle Line Comment", .detailed = "edmenu.toggle-comment", .icon = "format-indent-more-symbolic", .action = .toggle_comment } },
     .{ .submenu = .{ .label = "Line", .icon = "view-list-symbolic", .items = &.{
-        .{ .name = "duplicate", .label = "Duplicate Down", .detailed = "edmenu.duplicate", .icon = "edit-copy-symbolic", .action = .duplicate },
-        .{ .name = "move-up", .label = "Move Up", .detailed = "edmenu.move-up", .icon = "go-up-symbolic", .action = .move_up },
-        .{ .name = "move-down", .label = "Move Down", .detailed = "edmenu.move-down", .icon = "go-down-symbolic", .action = .move_down },
-        .{ .name = "join", .label = "Join Lines", .detailed = "edmenu.join", .icon = "format-justify-fill-symbolic", .action = .join },
-        .{ .name = "sort", .label = "Sort Lines", .detailed = "edmenu.sort", .icon = "view-sort-ascending-symbolic", .action = .sort },
+        .{ .name = "duplicate", .label = "Duplicate Down", .detailed = "edmenu.duplicate", .icon = "edit-copy-symbolic", .action = .duplicate_line_down },
+        .{ .name = "move-up", .label = "Move Up", .detailed = "edmenu.move-up", .icon = "go-up-symbolic", .action = .move_line_up },
+        .{ .name = "move-down", .label = "Move Down", .detailed = "edmenu.move-down", .icon = "go-down-symbolic", .action = .move_line_down },
+        .{ .name = "join", .label = "Join Lines", .detailed = "edmenu.join", .icon = "format-justify-fill-symbolic", .action = .join_lines },
+        .{ .name = "sort", .label = "Sort Lines", .detailed = "edmenu.sort", .icon = "view-sort-ascending-symbolic", .action = .sort_lines },
         .{ .name = "indent", .label = "Indent", .detailed = "edmenu.indent", .icon = "format-indent-more-symbolic", .action = .indent },
         .{ .name = "dedent", .label = "Dedent", .detailed = "edmenu.dedent", .icon = "format-indent-less-symbolic", .action = .dedent },
-        .{ .name = "trim-ws", .label = "Trim Trailing Whitespace", .detailed = "edmenu.trim-ws", .icon = "edit-clear-symbolic", .action = .trim_ws },
+        .{ .name = "trim-ws", .label = "Trim Trailing Whitespace", .detailed = "edmenu.trim-ws", .icon = "edit-clear-symbolic", .action = .trim_trailing_ws },
     } } },
     .{ .submenu = .{ .label = "Change Case", .icon = "format-text-rich-symbolic", .items = &.{
-        .{ .name = "case-upper", .label = "UPPERCASE", .detailed = "edmenu.case-upper", .icon = "format-text-rich-symbolic", .action = .case_upper },
-        .{ .name = "case-lower", .label = "lowercase", .detailed = "edmenu.case-lower", .icon = "format-text-rich-symbolic", .action = .case_lower },
-        .{ .name = "case-title", .label = "Title Case", .detailed = "edmenu.case-title", .icon = "format-text-rich-symbolic", .action = .case_title },
+        .{ .name = "case-upper", .label = "UPPERCASE", .detailed = "edmenu.case-upper", .icon = "format-text-rich-symbolic", .action = .upper_case },
+        .{ .name = "case-lower", .label = "lowercase", .detailed = "edmenu.case-lower", .icon = "format-text-rich-symbolic", .action = .lower_case },
+        .{ .name = "case-title", .label = "Title Case", .detailed = "edmenu.case-title", .icon = "format-text-rich-symbolic", .action = .title_case },
     } } },
     .separator,
-    .{ .bind = .{ .name = "goto-def", .label = "Go to Definition", .detailed = "edmenu.goto-def", .icon = "go-jump-symbolic", .action = .goto_def, .lsp_only = true } },
-    .{ .bind = .{ .name = "references", .label = "Find References", .detailed = "edmenu.references", .icon = "edit-find-symbolic", .action = .references, .lsp_only = true } },
-    .{ .bind = .{ .name = "rename", .label = "Rename Symbol…", .detailed = "edmenu.rename", .icon = "document-edit-symbolic", .action = .rename, .lsp_only = true } },
-    .{ .bind = .{ .name = "format", .label = "Format Document", .detailed = "edmenu.format", .icon = "format-justify-left-symbolic", .action = .format, .lsp_only = true } },
+    .{ .bind = .{ .name = "goto-def", .label = "Go to Definition", .detailed = "edmenu.goto-def", .icon = "go-jump-symbolic", .action = .goto_definition, .lsp_only = true } },
+    .{ .bind = .{ .name = "references", .label = "Find References", .detailed = "edmenu.references", .icon = "edit-find-symbolic", .action = .find_references, .lsp_only = true } },
+    .{ .bind = .{ .name = "rename", .label = "Rename Symbol…", .detailed = "edmenu.rename", .icon = "document-edit-symbolic", .action = .rename_symbol, .lsp_only = true } },
+    .{ .bind = .{ .name = "format", .label = "Format Document", .detailed = "edmenu.format", .icon = "format-justify-left-symbolic", .action = .format_document, .lsp_only = true } },
     .{ .bind = .{ .name = "code-actions", .label = "Code Actions…", .detailed = "edmenu.code-actions", .icon = "dialog-information-symbolic", .action = .code_actions, .lsp_only = true } },
     .separator,
     .{ .submenu = .{ .label = "Folding", .icon = "view-restore-symbolic", .items = &.{
@@ -327,16 +299,13 @@ fn onRightClick(g: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaq
 //     (`git_status`, `git_diff`) are read-only. There is no write path
 //     to put behind such a row.
 
-pub const GutterAction = enum {
-    toggle_fold,
-    fold_all,
-    unfold_all,
-    goto_line,
-    copy_line_number,
-    select_line,
-    next_hunk,
-    prev_hunk,
+/// A gutter row: a verb about the clicked LINE, or a plain command.
+pub const GutterAction = union(enum) {
+    line: LineVerb,
+    command: ecmd.Command,
 };
+
+pub const LineVerb = enum { toggle_fold, copy_line_number, select_line };
 
 /// Heap context for one gutter-menu row: the view, the verb and the
 /// line the menu was opened on. Owned by the classicmenu Root.
@@ -392,20 +361,20 @@ pub fn showGutterMenu(view: *EditorView, line: usize, x: f64, y: f64) void {
         if (st.folded) "Unfold This Region" else "Fold This Region",
         if (st.folded) "list-add-symbolic" else "list-remove-symbolic",
         st.folded or st.foldable,
-        .toggle_fold,
+        .{ .line = .toggle_fold },
         line,
     );
-    gutterRow(m, root, view, "Fold All", "view-restore-symbolic", st.folding, .fold_all, line);
-    gutterRow(m, root, view, "Unfold All", "view-fullscreen-symbolic", st.any_folded, .unfold_all, line);
+    gutterRow(m, root, view, "Fold All", "view-restore-symbolic", st.folding, .{ .command = .fold_all }, line);
+    gutterRow(m, root, view, "Unfold All", "view-fullscreen-symbolic", st.any_folded, .{ .command = .unfold_all }, line);
 
     // The line itself. The label carries no line number: the number
     // is in the gutter directly under the pointer, and a row whose
     // text changes per click is harder to find again than one whose
     // text never moves.
     const l = m.section();
-    gutterRow(l, root, view, "Copy Line Number", "edit-copy-symbolic", true, .copy_line_number, line);
-    gutterRow(l, root, view, "Select This Line", "edit-select-all-symbolic", true, .select_line, line);
-    gutterRow(l, root, view, "Go to Line\u{2026}", "go-jump-symbolic", true, .goto_line, line);
+    gutterRow(l, root, view, "Copy Line Number", "edit-copy-symbolic", true, .{ .line = .copy_line_number }, line);
+    gutterRow(l, root, view, "Select This Line", "edit-select-all-symbolic", true, .{ .line = .select_line }, line);
+    gutterRow(l, root, view, "Go to Line\u{2026}", "go-jump-symbolic", true, .{ .command = .goto_line }, line);
 
     // Change navigation: the gutter is where the diff marks are drawn,
     // so this is where a person looks for them. Insensitive with no
@@ -413,8 +382,8 @@ pub fn showGutterMenu(view: *EditorView, line: usize, x: f64, y: f64) void {
     // answer to the question, and `stepHunk` says which of the two
     // reasons it is on the status line.
     const g = m.section();
-    gutterRow(g, root, view, "Next Change", "go-down-symbolic", st.has_hunks, .next_hunk, line);
-    gutterRow(g, root, view, "Previous Change", "go-up-symbolic", st.has_hunks, .prev_hunk, line);
+    gutterRow(g, root, view, "Next Change", "go-down-symbolic", st.has_hunks, .{ .command = .next_hunk }, line);
+    gutterRow(g, root, view, "Previous Change", "go-up-symbolic", st.has_hunks, .{ .command = .prev_hunk }, line);
 
     _ = root.popupVia(@ptrCast(view.area), view.root_box, x, y);
 }
@@ -430,21 +399,12 @@ pub fn showGutterMenu(view: *EditorView, line: usize, x: f64, y: f64) void {
 // re-encoding path to put behind a line-ending row — a menu that
 // exists to not be empty is worse than no menu.
 
-pub const StatusAction = enum {
-    toggle_wrap,
-    goto_line,
-    next_hunk,
-    prev_hunk,
-    next_diag,
-    prev_diag,
-};
-
 const StatusCtx = struct {
     allocator: std.mem.Allocator,
     view: *EditorView,
-    action: StatusAction,
+    action: ecmd.Command,
 
-    fn make(root: *classicmenu.Root, view: *EditorView, action: StatusAction) ?*StatusCtx {
+    fn make(root: *classicmenu.Root, view: *EditorView, action: ecmd.Command) ?*StatusCtx {
         const ctx = view.allocator.create(StatusCtx) catch return null;
         ctx.* = .{ .allocator = view.allocator, .view = view, .action = action };
         root.own(cast.destroyCtx(StatusCtx), @ptrCast(ctx));
@@ -454,7 +414,7 @@ const StatusCtx = struct {
 
 fn onStatusRow(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
     const ctx = cast.userData(StatusCtx, user);
-    ctx.view.statusAction(ctx.action);
+    ctx.view.menuAction(ctx.action);
 }
 
 fn statusRow(
@@ -464,7 +424,7 @@ fn statusRow(
     label: [*:0]const u8,
     icon: [*:0]const u8,
     enabled: bool,
-    action: StatusAction,
+    action: ecmd.Command,
 ) void {
     const ctx = StatusCtx.make(root, view, action) orelse return;
     m.itemIconEnabled(label, .{ .name = icon }, enabled, &onStatusRow, @ptrCast(ctx));
@@ -492,8 +452,8 @@ pub fn showStatusMenu(view: *EditorView, x: f64, y: f64) void {
     // already follow.
     if (st.lsp) {
         const d = m.section();
-        statusRow(d, root, view, "Next Diagnostic", "dialog-warning-symbolic", true, .next_diag);
-        statusRow(d, root, view, "Previous Diagnostic", "dialog-warning-symbolic", true, .prev_diag);
+        statusRow(d, root, view, "Next Diagnostic", "dialog-warning-symbolic", true, .next_diagnostic);
+        statusRow(d, root, view, "Previous Diagnostic", "dialog-warning-symbolic", true, .prev_diagnostic);
     }
 
     _ = root.popupVia(@ptrCast(@alignCast(view.status_label)), view.root_box, x, y);
@@ -539,7 +499,7 @@ const TabCtx = struct {
 
     fn resolve(user: ?*anyopaque) ?struct { view: *EditorView, tab: *ETab } {
         const self = cast.userData(TabCtx, user);
-        const tab = self.view.findTabByIdPublic(self.tab_id) orelse return null;
+        const tab = self.view.findTabById(self.tab_id) orelse return null;
         return .{ .view = self.view, .tab = tab };
     }
 };

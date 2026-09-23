@@ -145,13 +145,15 @@ const editorproj = @import("editorproj.zig");
 const editoroutline = @import("editoroutline.zig");
 const editorlang = @import("editorlang.zig");
 const doclang = @import("../editor/doclang.zig");
+const editorfind = @import("editorfind.zig");
+const editorkeys = @import("editorkeys.zig");
+const editorio = @import("editorio.zig");
+const editorjournal = @import("editorjournal.zig");
+const deferred = @import("../editor/deferred.zig");
 const a11y = @import("../a11y/atspi.zig");
 const a11ydoc = @import("../a11y/docsource.zig");
 const docview = @import("../a11y/docview.zig");
 const clock = @import("../util/clock.zig");
-
-/// Open size cap: bigger files are refused with a clear error.
-pub const MAX_FILE_BYTES: usize = 64 << 20;
 
 /// Documents up to this size re-parse SYNCHRONOUSLY on every edit —
 /// a full tree-sitter parse of ~100KB is well under a frame, and the
@@ -161,26 +163,10 @@ pub const MAX_FILE_BYTES: usize = 64 << 20;
 const SYNC_PARSE_LIMIT: usize = 128 * 1024;
 const PARSE_DEBOUNCE_MS: c_uint = 40;
 
-// ---- crash recovery ---------------------------------------------------
-//
-// See editor/journal.zig for the record format and the flock-based
-// crash predicate. The five steps of its UI contract land here:
-// `armJournal`/`journalTick` (open + debounced write), `onIoDone`
-// (clear after save), `ETab.destroy` (discard on close), `offerRecovery`
-// (the startup offer) and the `prune` inside it.
-
-/// Debounce between snapshots of a dirty buffer. Long enough that
-/// typing never pays for it, short enough that a crash costs a second.
-const JOURNAL_DEBOUNCE_MS: c_uint = 1500;
-/// Records nobody claimed in a week are dropped (contract step 5).
-const JOURNAL_MAX_AGE_MS: i64 = 7 * 24 * 60 * 60 * 1000;
-/// Seed for the "is the buffer identical to what was saved" hash. See
-/// `journalTick` for why a revision comparison is not enough.
-const SAVED_HASH_SEED: u64 = 0x5a7ed;
-
-/// The recovery offer is per PROCESS, not per face: several editor
-/// faces must not each open the same records.
-var recovery_offered: bool = false;
+/// Document tab ids are unique across EVERY editor face of the process:
+/// a language server is shared between faces (editorlsp's registry), and
+/// its requests are routed back to a tab by id alone.
+var next_doc_tab_id: u64 = 1;
 
 /// Refcounted liveness fence shared by IO worker threads, GLib idle
 /// deliveries, clipboard reads and dialog callbacks. The mutex only
@@ -233,269 +219,6 @@ pub const Fence = struct {
         return if (self.alive) self.view else null;
     }
 };
-
-/// One daemon-backed read or atomic write, run on a detached thread
-/// (fsdrive calls block; the GLib loop must not). Owned allocations
-/// via c_allocator; delivered with g_idle_add.
-const IoJob = struct {
-    fence: *Fence,
-    /// Matches ETab.io_gen; a mismatch at delivery = orphaned.
-    gen: u64,
-    kind: enum { load, save },
-    spec: []u8,
-    save_bytes: []u8 = &.{},
-    expected_mtime: ?i64 = null,
-    /// Document revision the save snapshot was taken at.
-    revision: u64 = 0,
-
-    ok: bool = false,
-    conflict: bool = false,
-    /// Load of a path that does not exist (yet): a new empty file.
-    not_found: bool = false,
-    binary: bool = false,
-    err_buf: [96]u8 = undefined,
-    err_len: usize = 0,
-    bytes: []u8 = &.{},
-    /// Post-op identity of the file: the new conflict baseline after a
-    /// load/save, and the OTHER file's identity after a conflict.
-    disk: reload.DiskState = .{},
-    /// Reload that must land on the current cursor/scroll, not at the
-    /// top of the document.
-    keep_position: bool = false,
-    /// `.editorconfig` properties for the loaded path.
-    ec: @import("../editor/editorconfig.zig").Props = .{},
-
-    fn setErr(self: *IoJob, text: []const u8) void {
-        self.err_len = @min(text.len, self.err_buf.len);
-        @memcpy(self.err_buf[0..self.err_len], text[0..self.err_len]);
-    }
-
-    fn errText(self: *const IoJob) []const u8 {
-        return self.err_buf[0..self.err_len];
-    }
-
-    fn destroy(self: *IoJob) void {
-        const a = std.heap.c_allocator;
-        a.free(self.spec);
-        if (self.save_bytes.len > 0) a.free(self.save_bytes);
-        if (self.bytes.len > 0) a.free(self.bytes);
-        self.fence.unref();
-        a.destroy(self);
-    }
-};
-
-pub fn connectFs(host: ?[]const u8) !fsdrive.Fs {
-    const allocator = std.heap.c_allocator;
-    const conn = if (host) |remote| blk: {
-        var config = Config.load(allocator);
-        defer config.deinit();
-        break :blk try muxclient.Conn.connectRemote(allocator, remote, config.muxConnectOptions());
-    } else try muxclient.Conn.connectLocalAutostart(allocator);
-    return fsdrive.Fs.initConn(allocator, conn);
-}
-
-/// Observe one path's identity, following symlinks (fsdrive.statFollow
-/// explains why the follow is mandatory).
-///
-/// A missing path answers `present = false`; a TRANSPORT failure
-/// returns false, so a dead link can never be mistaken for a deleted
-/// file.
-fn probePath(fs: *fsdrive.Fs, path: []const u8, out: *reload.DiskState) bool {
-    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
-    defer arena.deinit();
-    const e = fs.statFollow(arena.allocator(), path) catch |err| {
-        if (err == fsdrive.Error.FsOpFailed or err == fsdrive.Error.BadRequest) {
-            out.* = .{ .known = true, .present = false };
-            return true;
-        }
-        return false;
-    };
-    out.* = .{
-        .known = true,
-        .present = true,
-        .mtime_ns = e.mtime_ns,
-        .mtime_ms = e.mtime_ms,
-        .size = e.size,
-        .ino = e.ino,
-        .mode = e.mode,
-    };
-    return true;
-}
-
-/// Read a whole host-side file into `out`, refusing anything over
-/// `MAX_FILE_BYTES`. The project layer reads files through this too,
-/// so a candidate that is too big is refused identically to one the
-/// user tries to open.
-pub fn readAllCapped(fs: *fsdrive.Fs, path: []const u8, out: *std.ArrayList(u8), cap: usize) !void {
-    var info: fsdrive.ReadInfo = .{ .size = 0, .eof = true };
-    return readAllInto(fs, path, out, cap, &info);
-}
-
-fn readAllInto(fs: *fsdrive.Fs, path: []const u8, out: *std.ArrayList(u8), cap: usize, info_out: *fsdrive.ReadInfo) !void {
-    const allocator = std.heap.c_allocator;
-    const probe = try fs.read(path, 0, 0, out);
-    if (probe.size > cap) return error.SourceTooLarge;
-    info_out.* = probe;
-    try out.ensureTotalCapacity(allocator, @intCast(probe.size));
-    var offset: u64 = 0;
-    while (offset < probe.size) {
-        const before = out.items.len;
-        const remaining = probe.size - offset;
-        const requested: u32 = @intCast(@min(remaining, fsdrive.fsserve.MAX_READ));
-        const info = try fs.read(path, offset, requested, out);
-        const received = out.items.len - before;
-        if (received == 0) return error.ShortRead;
-        offset += received;
-        if (out.items.len > cap) return error.SourceTooLarge;
-        if (info.eof) break;
-    }
-    if (offset != probe.size) return error.ShortRead;
-}
-
-fn ioThread(job: *IoJob) void {
-    const allocator = std.heap.c_allocator;
-    const loc = paths.parseSpec(job.spec);
-    run: {
-        var fs = connectFs(loc.host) catch |err| {
-            job.setErr(@errorName(err));
-            break :run;
-        };
-        defer fs.deinit();
-        switch (job.kind) {
-            .load => {
-                job.ec = editorlang.readEditorconfig(&fs, loc.path);
-                var out: std.ArrayList(u8) = .empty;
-                var info: fsdrive.ReadInfo = .{ .size = 0, .eof = true };
-                readAllInto(&fs, loc.path, &out, MAX_FILE_BYTES, &info) catch |err| {
-                    out.deinit(allocator);
-                    if (err == error.SourceTooLarge or err == error.ShortRead) {
-                        job.setErr(@errorName(err));
-                    } else {
-                        // Unreadable = treat as a NEW file (editor
-                        // convention); a transport failure was caught
-                        // by connectFs above.
-                        job.not_found = true;
-                        job.ok = true;
-                    }
-                    break :run;
-                };
-                if (@import("../editor/document.zig").looksBinary(out.items)) {
-                    out.deinit(allocator);
-                    job.binary = true;
-                    job.setErr("binary file (NUL bytes near the start) — refusing to edit");
-                    break :run;
-                }
-                job.bytes = out.toOwnedSlice(allocator) catch {
-                    out.deinit(allocator);
-                    job.setErr("OutOfMemory");
-                    break :run;
-                };
-                // Identity from the FD the bytes came through (never a
-                // separate stat, which could see a newer file than the
-                // one just read) — with the permission bits filled in
-                // from a follow-stat, since a read cannot report them.
-                job.disk = .{
-                    .known = true,
-                    .present = true,
-                    .mtime_ns = info.mtime_ns,
-                    .size = info.size,
-                    .ino = info.ino,
-                };
-                var st: reload.DiskState = .{};
-                if (probePath(&fs, loc.path, &st) and st.present) {
-                    job.disk.mode = st.mode;
-                    if (job.disk.mtime_ns == 0) job.disk.mtime_ns = st.mtime_ns;
-                    job.disk.mtime_ms = st.mtime_ms;
-                }
-                job.ok = true;
-            },
-            .save => {
-                const res = fs.writeFileAtomic(loc.path, job.save_bytes, job.expected_mtime) catch |err| {
-                    if (err == fsdrive.Error.Conflict) {
-                        job.conflict = true;
-                        if (fs.lastConflict()) |ci| job.disk = .{
-                            .known = true,
-                            .present = true,
-                            .mtime_ns = ci.mtime_ns,
-                            .mtime_ms = ci.mtime_ms,
-                            .size = ci.size,
-                            .ino = ci.ino,
-                            .mode = ci.mode,
-                        };
-                    } else {
-                        const detail = fs.lastErr();
-                        if (detail.len > 0) job.setErr(detail) else job.setErr(@errorName(err));
-                    }
-                    break :run;
-                };
-                job.disk = .{
-                    .known = true,
-                    .present = true,
-                    .mtime_ns = res.mtime_ns,
-                    .mtime_ms = res.mtime_ms,
-                    .size = res.size,
-                    .ino = res.ino,
-                    .mode = res.mode,
-                };
-                job.ok = true;
-            },
-        }
-    }
-    _ = c.g_idle_add(@ptrCast(&ioIdle), @ptrCast(job));
-}
-
-/// One batched disk-identity probe: every open document on ONE host,
-/// statted through ONE connection. This is the whole external-change
-/// detector (see `EditorView.checkDisk` for why it is a poll and not a
-/// daemon watch).
-const ProbeItem = struct {
-    tab_id: u64,
-    path: []u8,
-    state: reload.DiskState = .{},
-    /// False when the probe could not be taken (transport failure) —
-    /// which must never be reported as "the file is gone".
-    ok: bool = false,
-};
-
-const ProbeJob = struct {
-    fence: *Fence,
-    /// Owned copy of the host part of the specs ("" = local).
-    host: []u8,
-    items: []ProbeItem,
-
-    fn destroy(self: *ProbeJob) void {
-        const a = std.heap.c_allocator;
-        for (self.items) |it| a.free(it.path);
-        a.free(self.items);
-        a.free(self.host);
-        self.fence.unref();
-        a.destroy(self);
-    }
-};
-
-fn probeThread(job: *ProbeJob) void {
-    const host: ?[]const u8 = if (job.host.len == 0) null else job.host;
-    if (connectFs(host)) |fs_val| {
-        var fs = fs_val;
-        defer fs.deinit();
-        for (job.items) |*it| it.ok = probePath(&fs, it.path, &it.state);
-    } else |_| {}
-    _ = c.g_idle_add(@ptrCast(&probeIdle), @ptrCast(job));
-}
-
-fn probeIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const job = cast.userData(ProbeJob, user);
-    if (job.fence.viewIfAlive()) |view| view.onProbeDone(job);
-    job.destroy();
-    return 0;
-}
-
-fn ioIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const job = cast.userData(IoJob, user);
-    if (job.fence.viewIfAlive()) |view| view.onIoDone(job);
-    job.destroy();
-    return 0;
-}
 
 /// One open document tab. Models only — the shared GLArea renders
 /// whichever tab is active.
@@ -664,16 +387,11 @@ pub const ETab = struct {
     /// re-derivation lands. Owned; dropped as soon as it does.
     restored_project: ?[]u8 = null,
 
-    /// Crash-recovery slot: opened on the first edit that dirties this
-    /// buffer and held (lock included) for the tab's lifetime, so no
-    /// other process offers OUR record while we are alive.
-    journal: ?journal.Handle = null,
-    /// Hash of the buffer as of the last load/save. `Document.isDirty`
-    /// compares REVISIONS, so undoing back to the saved state still
-    /// reads dirty; this is what keeps a record for a buffer identical
-    /// to disk from being offered as recovered work.
-    saved_hash: u64 = 0,
-    saved_hash_valid: bool = false,
+    /// Crash-recovery slot (ui/editorjournal.zig): opened on the first
+    /// tick that finds this buffer dirty and held, lock included, for the
+    /// tab's lifetime, so no other process offers OUR record while we are
+    /// alive.
+    journal: ?*editorjournal.Slot = null,
     /// Journaling gave up on this buffer (over `journal.MAX_CONTENT`).
     /// Reported once; never retried.
     journal_off: bool = false,
@@ -688,10 +406,7 @@ pub const ETab = struct {
         if (self.restored_project) |rp| a.free(rp);
         // Closing a tab (or a clean quit, which destroys every tab) is
         // exactly the "no crash happened" case: drop the record.
-        if (self.journal) |*h| {
-            h.discard();
-            self.journal = null;
-        }
+        editorjournal.release(self);
         // Normally `Manager.detachTab` has already run (closeTabForce);
         // this is the last-resort free for a tab destroyed on an error
         // path before it was ever listed.
@@ -738,7 +453,7 @@ pub const ETab = struct {
         self.br_valid = false;
     }
 
-    fn clearMatches(self: *ETab) void {
+    pub fn clearMatches(self: *ETab) void {
         if (self.matches.len > 0) self.view.allocator.free(self.matches);
         self.matches = &.{};
         self.current_match = null;
@@ -748,7 +463,7 @@ pub const ETab = struct {
         return self.doc.isDirty();
     }
 
-    fn title(self: *const ETab) []const u8 {
+    pub fn title(self: *const ETab) []const u8 {
         const s = self.spec orelse return "Untitled";
         const loc = paths.parseSpec(s);
         const base = std.fs.path.basename(loc.path);
@@ -766,23 +481,23 @@ pub const Alert = enum {
     deleted,
 };
 
-const DlgCtx = struct {
+pub const DlgCtx = struct {
     fence: *Fence,
     tab_id: u64,
 
-    fn create(view: *EditorView, tab: *ETab) ?*DlgCtx {
+    pub fn create(view: *EditorView, tab: *ETab) ?*DlgCtx {
         const ctx = std.heap.c_allocator.create(DlgCtx) catch return null;
         view.fence.ref();
         ctx.* = .{ .fence = view.fence, .tab_id = tab.id };
         return ctx;
     }
 
-    fn destroy(self: *DlgCtx) void {
+    pub fn destroy(self: *DlgCtx) void {
         self.fence.unref();
         std.heap.c_allocator.destroy(self);
     }
 
-    fn resolve(self: *DlgCtx) ?struct { view: *EditorView, tab: *ETab } {
+    pub fn resolve(self: *DlgCtx) ?struct { view: *EditorView, tab: *ETab } {
         const view = self.fence.viewIfAlive() orelse return null;
         const tab = view.findTabById(self.tab_id) orelse return null;
         return .{ .view = view, .tab = tab };
@@ -814,6 +529,10 @@ const ClosedDoc = struct {
 };
 
 pub const EditorView = struct {
+    pub const saveTab = editorio.saveTab;
+    pub const revertTab = editorio.revertTab;
+    pub const checkDisk = editorio.checkDisk;
+
     pub const AtlasTextureStats = struct {
         created: u64,
         deleted: u64,
@@ -967,8 +686,11 @@ pub const EditorView = struct {
 
     tabs: std.ArrayList(*ETab) = .empty,
     active: ?*ETab = null,
-    next_tab_id: u64 = 1,
     next_io_gen: u64 = 1,
+    /// Cross-file changes waiting for one of their documents to load
+    /// (editor/deferred.zig): applied by `deliverDeferredEdits` when the
+    /// bytes land, reported by `failDeferredEdits` when they cannot.
+    deferred: deferred.Queue = .{},
 
     /// Closed documents remembered for undo-close-tab, the editor's
     /// mirror of the browser's ring (browser/tabs.zig). Only the spec
@@ -1015,7 +737,7 @@ pub const EditorView = struct {
     /// Resolved editor-command bindings: `editor/commands.zig` defaults
     /// overlaid with `editor_keybind.*` config entries. Rebuilt by
     /// syncConfig; owned.
-    ed_bindings: std.ArrayList(EdBinding) = .empty,
+    keys: editorkeys.Table = .{},
     /// Corner of an in-progress Shift+Alt block selection, in
     /// (line, byte column). Null when no block drag is active.
     block_anchor: ?struct { line: usize, col: usize } = null,
@@ -1138,7 +860,7 @@ pub const EditorView = struct {
         self.syncConfig();
         self.startBlink();
         if (spec) |s| self.openSpec(s, null) else _ = self.newTab(null);
-        self.offerRecovery();
+        editorjournal.offerRecovery(self);
         return self;
     }
 
@@ -1178,7 +900,7 @@ pub const EditorView = struct {
         self.auto_indent = cfg.editor_auto_indent;
         self.auto_close = cfg.editor_auto_close_pairs;
         self.smart_backspace = cfg.editor_smart_backspace;
-        self.rebuildEdBindings(cfg);
+        self.keys.rebuild(self.allocator, cfg.editor_keybinds.items);
         self.text_blending = switch (cfg.text_blending) {
             .native => .native,
             .linear => .linear,
@@ -1215,12 +937,9 @@ pub const EditorView = struct {
         // a config change lands without restarting the editor.
         if (!cfg.editor_lsp) {
             if (self.lsp) |m| {
-                // Each tab's TabState owns four GLib timers and a
-                // document observer. Dropping the pointer left both
-                // live against a Manager that `destroy` had freed: the
-                // next debounce tick resolved through it, and every
-                // keystroke ran `observeEdits` against a freed `Conn`.
-                for (self.tabs.items) |t| m.detachTab(t);
+                // `destroy` detaches every tab first: each TabState owns
+                // GLib timers and a document observer that must not
+                // outlive the Manager.
                 m.destroy();
                 self.lsp = null;
             }
@@ -1258,7 +977,7 @@ pub const EditorView = struct {
     /// language (name, extension, head) as a side effect, which is
     /// tracked whether or not highlighting is on: comments, brackets,
     /// folds and indentation need it regardless. Null = no highlighting.
-    fn detectLang(self: *EditorView, tab: *ETab) ?syntax.Lang {
+    pub fn detectLang(self: *EditorView, tab: *ETab) ?syntax.Lang {
         if (tab.language.detectLanguage(tab.spec, &tab.doc)) editorlang.syncIndent(self, tab);
         if (!self.syntax_on) return null;
         return tab.language.grammarLang();
@@ -1279,7 +998,7 @@ pub const EditorView = struct {
     /// the config. Call after anything that changes the language, the
     /// document IDENTITY (a load replaces `tab.doc` wholesale, which
     /// drops the observer with it) or the `editor_syntax` setting.
-    fn ensureHighlighter(self: *EditorView, tab: *ETab) void {
+    pub fn ensureHighlighter(self: *EditorView, tab: *ETab) void {
         const want = self.detectLang(tab);
         if (want == null) {
             if (tab.hl != null) {
@@ -1314,7 +1033,7 @@ pub const EditorView = struct {
     /// GUI is single-threaded (CLAUDE.md), and a stale highlighter is
     /// a supported state — the affected lines simply render
     /// unhighlighted until the parse lands.
-    fn scheduleParse(self: *EditorView, tab: *ETab) void {
+    pub fn scheduleParse(self: *EditorView, tab: *ETab) void {
         const hl = tab.hl orelse return;
         if (!hl.isStale(&tab.doc)) return;
         if (tab.doc.rope.len() <= SYNC_PARSE_LIMIT) {
@@ -1577,7 +1296,7 @@ pub const EditorView = struct {
     /// so walking Right off the end of a folded header opens it rather
     /// than teleporting the caret into invisible text. (Up/Down never
     /// need it: `stepVisualRow` steps over folds.)
-    fn revealCaretLines(self: *EditorView, tab: *ETab) void {
+    pub fn revealCaretLines(self: *EditorView, tab: *ETab) void {
         if (tab.folds.isEmpty()) return;
         var changed = false;
         for (tab.sels.sels.items) |s| {
@@ -1967,7 +1686,7 @@ pub const EditorView = struct {
         if (self.toolbar_box) |bar| c.gtk_widget_set_visible(bar, 0);
         self.syncConfig();
         self.startBlink();
-        self.offerRecovery();
+        editorjournal.offerRecovery(self);
         return self;
     }
 
@@ -2031,7 +1750,7 @@ pub const EditorView = struct {
         self.widgets_dead = true;
         self.stopBlink();
         self.stopScrollbarSync();
-        self.stopJournalTimer();
+        editorjournal.stopTimer(self);
         self.detachIm();
         // LSP popovers are parented to the GLArea with
         // gtk_widget_set_parent and MUST be unparented before it
@@ -2050,7 +1769,7 @@ pub const EditorView = struct {
         self.widgets_dead = true;
         self.stopBlink();
         self.stopScrollbarSync();
-        self.stopJournalTimer();
+        editorjournal.stopTimer(self);
         self.stopNoteExpiry();
         self.detachIm();
     }
@@ -2184,9 +1903,9 @@ pub const EditorView = struct {
         self.a11y_src.deinit();
         self.stopBlink();
         self.stopScrollbarSync();
-        self.stopJournalTimer();
+        editorjournal.stopTimer(self);
         self.stopNoteExpiry();
-        self.dropRecovery();
+        editorjournal.dropRecovery(self);
         self.clearPreedit();
         self.detachIm();
         // Before the tabs: the manager owns each tab's TabState and
@@ -2202,6 +1921,7 @@ pub const EditorView = struct {
             self.allocator.free(cd.project);
         }
         self.closed_docs.deinit(self.allocator);
+        self.deferred.deinit(self.allocator);
         // After the tabs: each one releases its project reference.
         self.projects.deinit();
         self.results.deinit();
@@ -2220,7 +1940,7 @@ pub const EditorView = struct {
                 .{ self.atlas_textures_created, self.atlas_textures_deleted },
             );
         }
-        self.ed_bindings.deinit(self.allocator);
+        self.keys.deinit(self.allocator);
         self.pass.deinit();
         self.font.deinit(self.allocator);
         self.allocator.destroy(self);
@@ -2318,14 +2038,14 @@ pub const EditorView = struct {
         c.gtk_widget_set_hexpand(overlay, 1);
         c.gtk_widget_set_vexpand(overlay, 1);
         c.gtk_overlay_set_child(@ptrCast(overlay), area_widget);
-        self.buildFindBar();
+        editorfind.build(self);
         c.gtk_overlay_add_overlay(@ptrCast(overlay), self.find_bar);
 
         // The external-change banner sits between the tab strip and
         // the canvas (a real child, not an overlay: it must not cover
         // the find bar, and it must not steal a click from the text).
-        self.buildBanner();
-        self.buildRecoverBanner();
+        editorio.buildBanner(self);
+        editorjournal.buildBanner(self);
         // Above the change banner: it is about work that predates this
         // session, so it reads first.
         c.gtk_box_append(@ptrCast(vbox), self.recover_box);
@@ -2449,158 +2169,6 @@ pub const EditorView = struct {
         return toolbtn.barButton(box, icon, text, tooltip, cb, @ptrCast(self));
     }
 
-    /// Browser-style find bar, floating at the canvas's top-right.
-    /// Two rows: find (always) and replace (only in replace mode).
-    fn buildFindBar(self: *EditorView) void {
-        const outer = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 4);
-        c.gtk_widget_add_css_class(outer, "toolbar");
-        c.gtk_widget_add_css_class(outer, "osd");
-        c.gtk_widget_set_halign(outer, c.GTK_ALIGN_END);
-        c.gtk_widget_set_valign(outer, c.GTK_ALIGN_START);
-        c.gtk_widget_set_margin_top(outer, 8);
-        c.gtk_widget_set_margin_end(outer, 8);
-        c.gtk_widget_set_visible(outer, 0);
-
-        const row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 4);
-        const parts = findbar.build(row, .{
-            .placeholder = "Find",
-            .width_chars = 22,
-            .count_width_chars = 9,
-            .regex_tooltip = "Regular expression. Replacements expand $1..$9 (and $0 for the whole match).",
-        }, .{
-            .ctx = @ptrCast(self),
-            .on_changed = @ptrCast(&onFindChanged),
-            .on_activate = @ptrCast(&onFindActivate),
-            .on_stop = @ptrCast(&onFindStop),
-            .on_toggle_changed = @ptrCast(&onFindOptionToggled),
-        });
-        self.find_entry = parts.entry;
-        self.find_count = parts.count.?;
-        self.find_case = parts.case_btn;
-        self.find_word = parts.word_btn;
-        self.find_regex = parts.regex_btn;
-        _ = findbar.navButton(row, "go-up-symbolic", "Previous match (Shift+Enter)", @ptrCast(&onFindPrevClicked), @ptrCast(self));
-        _ = findbar.navButton(row, "go-down-symbolic", "Next match (Enter)", @ptrCast(&onFindNextClicked), @ptrCast(self));
-        _ = findbar.navButton(row, "window-close-symbolic", "Close (Escape)", @ptrCast(&onFindCloseClicked), @ptrCast(self));
-        c.gtk_box_append(@ptrCast(outer), row);
-
-        const rrow = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 4);
-        const rentry = c.gtk_entry_new();
-        c.gtk_entry_set_placeholder_text(@ptrCast(rentry), "Replace with");
-        c.gtk_editable_set_width_chars(@ptrCast(rentry), 22);
-        _ = c.g_signal_connect_data(rentry, "activate", @ptrCast(&onReplaceActivate), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        c.gtk_box_append(@ptrCast(rrow), rentry);
-        self.replace_entry = rentry.?;
-        const rbtn = c.gtk_button_new_with_label("Replace");
-        _ = c.g_signal_connect_data(rbtn, "clicked", @ptrCast(&onReplaceClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        c.gtk_box_append(@ptrCast(rrow), rbtn);
-        const abtn = c.gtk_button_new_with_label("All");
-        c.gtk_widget_set_tooltip_text(abtn, "Replace every match (one undo step)");
-        _ = c.g_signal_connect_data(abtn, "clicked", @ptrCast(&onReplaceAllClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        c.gtk_box_append(@ptrCast(rrow), abtn);
-        c.gtk_widget_set_visible(rrow, 0);
-        c.gtk_box_append(@ptrCast(outer), rrow);
-        self.replace_row = rrow.?;
-
-        // Escape anywhere in the bar closes it and returns focus.
-        const keys = c.gtk_event_controller_key_new();
-        c.gtk_event_controller_set_propagation_phase(@ptrCast(keys), c.GTK_PHASE_CAPTURE);
-        _ = c.g_signal_connect_data(keys, "key-pressed", @ptrCast(&onFindKey), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        c.gtk_widget_add_controller(outer, @ptrCast(keys));
-
-        self.find_bar = outer.?;
-    }
-
-    /// Full-width inline banner for external file changes. Same
-    /// Adwaita vocabulary as the find bar ("toolbar" styling), hidden
-    /// until a document needs it.
-    fn buildBanner(self: *EditorView) void {
-        const row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 6);
-        c.gtk_widget_add_css_class(row, "toolbar");
-        c.gtk_widget_add_css_class(row, "warning");
-        c.gtk_widget_set_margin_start(row, 6);
-        c.gtk_widget_set_margin_end(row, 6);
-        c.gtk_widget_set_margin_top(row, 2);
-        c.gtk_widget_set_margin_bottom(row, 2);
-        c.gtk_widget_set_visible(row, 0);
-
-        const icon = c.gtk_image_new_from_icon_name("dialog-warning-symbolic");
-        c.gtk_box_append(@ptrCast(row), icon);
-
-        const label = c.gtk_label_new("");
-        c.gtk_label_set_xalign(@ptrCast(label), 0);
-        c.gtk_label_set_wrap(@ptrCast(label), 1);
-        c.gtk_widget_set_hexpand(label, 1);
-        c.gtk_box_append(@ptrCast(row), label);
-        self.banner_label = @ptrCast(@alignCast(label));
-
-        const reload_btn = c.gtk_button_new_with_label("Reload");
-        c.gtk_widget_set_tooltip_text(reload_btn, "Replace the buffer with the version on disk");
-        _ = c.g_signal_connect_data(reload_btn, "clicked", @ptrCast(&onBannerReload), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        c.gtk_box_append(@ptrCast(row), reload_btn);
-        self.banner_reload = reload_btn.?;
-
-        const save_btn = c.gtk_button_new_with_label("Save Anyway");
-        c.gtk_widget_add_css_class(save_btn, "destructive-action");
-        c.gtk_widget_set_tooltip_text(save_btn, "Write this buffer over the version on disk");
-        _ = c.g_signal_connect_data(save_btn, "clicked", @ptrCast(&onBannerSave), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        c.gtk_box_append(@ptrCast(row), save_btn);
-        self.banner_save = save_btn.?;
-
-        const dismiss = c.gtk_button_new_from_icon_name("window-close-symbolic");
-        c.gtk_button_set_has_frame(@ptrCast(dismiss), 0);
-        c.gtk_widget_set_tooltip_text(dismiss, "Dismiss");
-        _ = c.g_signal_connect_data(dismiss, "clicked", @ptrCast(&onBannerDismiss), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        c.gtk_box_append(@ptrCast(row), dismiss);
-
-        self.banner_box = row.?;
-    }
-
-    /// The crash-recovery offer. Same shape as the external-change
-    /// banner (inline, dismissible, never modal) because it is the same
-    /// kind of news: something happened to your files while you were
-    /// not looking, and only you can decide what to do about it.
-    fn buildRecoverBanner(self: *EditorView) void {
-        const row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 6);
-        c.gtk_widget_add_css_class(row, "toolbar");
-        c.gtk_widget_add_css_class(row, "accent");
-        c.gtk_widget_set_margin_start(row, 6);
-        c.gtk_widget_set_margin_end(row, 6);
-        c.gtk_widget_set_margin_top(row, 2);
-        c.gtk_widget_set_margin_bottom(row, 2);
-        c.gtk_widget_set_visible(row, 0);
-
-        const icon = c.gtk_image_new_from_icon_name("document-revert-symbolic");
-        c.gtk_box_append(@ptrCast(row), icon);
-
-        const label = c.gtk_label_new("");
-        c.gtk_label_set_xalign(@ptrCast(label), 0);
-        c.gtk_label_set_wrap(@ptrCast(label), 1);
-        c.gtk_widget_set_hexpand(label, 1);
-        c.gtk_box_append(@ptrCast(row), label);
-        self.recover_label = @ptrCast(@alignCast(label));
-
-        const recover_btn = c.gtk_button_new_with_label("Recover");
-        c.gtk_widget_add_css_class(recover_btn, "suggested-action");
-        c.gtk_widget_set_tooltip_text(recover_btn, "Open each unsaved buffer in a tab, still unsaved");
-        _ = c.g_signal_connect_data(recover_btn, "clicked", @ptrCast(&onRecoverClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        c.gtk_box_append(@ptrCast(row), recover_btn);
-
-        const discard_btn = c.gtk_button_new_with_label("Discard");
-        c.gtk_widget_add_css_class(discard_btn, "destructive-action");
-        c.gtk_widget_set_tooltip_text(discard_btn, "Delete these snapshots for good");
-        _ = c.g_signal_connect_data(discard_btn, "clicked", @ptrCast(&onRecoverDiscardClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        c.gtk_box_append(@ptrCast(row), discard_btn);
-
-        const later = c.gtk_button_new_from_icon_name("window-close-symbolic");
-        c.gtk_button_set_has_frame(@ptrCast(later), 0);
-        c.gtk_widget_set_tooltip_text(later, "Not now — the snapshots are kept");
-        _ = c.g_signal_connect_data(later, "clicked", @ptrCast(&onRecoverLaterClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        c.gtk_box_append(@ptrCast(row), later);
-
-        self.recover_box = row.?;
-    }
-
     // ---- tabs ---------------------------------------------------------
 
     fn findTabByPage(self: *EditorView, page: *c.GtkWidget) ?*ETab {
@@ -2610,14 +2178,14 @@ pub const EditorView = struct {
         return null;
     }
 
-    fn findTabById(self: *EditorView, id: u64) ?*ETab {
+    pub fn findTabById(self: *EditorView, id: u64) ?*ETab {
         for (self.tabs.items) |t| {
             if (t.id == id) return t;
         }
         return null;
     }
 
-    fn findTabByGen(self: *EditorView, gen: u64) ?*ETab {
+    pub fn findTabByGen(self: *EditorView, gen: u64) ?*ETab {
         if (gen == 0) return null;
         for (self.tabs.items) |t| {
             if (t.io_gen == gen) return t;
@@ -2631,7 +2199,7 @@ pub const EditorView = struct {
         const page = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
         tab.* = .{
             .view = self,
-            .id = self.next_tab_id,
+            .id = next_doc_tab_id,
             .page = page.?,
             .handle = undefined,
             .doc = Document.initEmpty(self.allocator),
@@ -2648,12 +2216,11 @@ pub const EditorView = struct {
             .outline = outline_mod.Outline.init(self.allocator),
             .language = doclang.DocLang.init(self.allocator),
         };
-        tab.doc.addObserver(.{ .ctx = tab, .before_apply = ETab.observeEdits });
-        tab.doc.addObserver(self.a11y_src.editObserver());
+        self.installDocObservers(tab);
         tab.language.setConfig(self.insert_spaces, self.tab_width);
         tab.layout.tab_cols = tab.language.indent.tab_width;
         tab.layout.wrap_words = self.wrap_words;
-        self.next_tab_id += 1;
+        next_doc_tab_id += 1;
         if (spec) |s| tab.spec = self.allocator.dupe(u8, s) catch null;
         const handle = self.tabhost.addPage(page.?, tab.title()) orelse {
             tab.destroy();
@@ -2670,7 +2237,7 @@ pub const EditorView = struct {
         self.applyWrapWidth(tab);
         tab.layout.theme = self.theme;
         self.ensureHighlighter(tab);
-        if (tab.spec != null) self.startLoad(tab);
+        if (tab.spec != null) editorio.startLoad(self, tab);
         self.attachLsp(tab);
         editorproj.resolveProject(self, tab);
         self.refresh(tab);
@@ -2733,7 +2300,7 @@ pub const EditorView = struct {
         const self = cast.userData(EditorView, user);
         if (self.widgets_dead) return;
         self.active = self.findTabByPage(page);
-        self.updateBanner();
+        editorio.updateBanner(self);
         self.applyPaneFaceTitle();
         if (self.active) |tab| {
             editorproj.onTabActivated(self, tab);
@@ -2764,7 +2331,7 @@ pub const EditorView = struct {
         }, .{ .allocator = self.allocator, .cb = &onCloseDirtyResponse, .ctx = @ptrCast(ctx) }) == null) ctx.destroy();
     }
 
-    fn dialogParent(self: *EditorView) ?*c.GtkWidget {
+    pub fn dialogParent(self: *EditorView) ?*c.GtkWidget {
         if (self.widgets_dead) return null;
         const root = c.gtk_widget_get_root(self.root_box) orelse return null;
         return @ptrCast(@alignCast(root));
@@ -2829,10 +2396,13 @@ pub const EditorView = struct {
         self.openSpecRestored(entry.spec, entry.cursor, entry.top_line, entry.project);
     }
 
-    fn closeTabForce(self: *EditorView, tab: *ETab) void {
+    pub fn closeTabForce(self: *EditorView, tab: *ETab) void {
         // Undo-close needs the spec + caret before anything is freed.
         self.stashClosedDoc(tab);
         tab.io_gen = 0; // orphan any in-flight IO
+        // Edits parked for a load that will now never land are reported,
+        // never silently dropped.
+        self.failDeferredEdits(tab.id, "the document closed");
         // didClose + drop this tab's pending requests, while the
         // document (and its URI) still exist.
         if (self.lsp) |m| m.detachTab(tab);
@@ -2871,7 +2441,7 @@ pub const EditorView = struct {
     /// Give `tab` a language server if one is configured and installed.
     /// Creates the manager on first use; silent when nothing claims the
     /// document's language.
-    fn attachLsp(self: *EditorView, tab: *ETab) void {
+    pub fn attachLsp(self: *EditorView, tab: *ETab) void {
         const conf: *const Config = if (self.ownerWindow()) |win|
             &win.config
         else
@@ -2882,12 +2452,92 @@ pub const EditorView = struct {
         m.attachTab(tab);
     }
 
-    pub fn activeTab(self: *EditorView) ?*ETab {
-        return self.active;
+    /// The observers every document of a tab carries: the fold/git/outline
+    /// anchors and the accessibility change log. A load or a recovery
+    /// REPLACES the document, which drops them, so both come back here.
+    fn installDocObservers(self: *EditorView, tab: *ETab) void {
+        tab.doc.addObserver(.{ .ctx = tab, .before_apply = ETab.observeEdits });
+        tab.doc.addObserver(self.a11y_src.editObserver());
     }
 
-    pub fn findTabByIdPublic(self: *EditorView, id: u64) ?*ETab {
-        return self.findTabById(id);
+    /// Swap in a new Document (a first load, a recovered buffer).
+    /// Everything anchored into the old byte space dies with it; the
+    /// language server is told by the caller, which knows why.
+    pub fn replaceDocument(self: *EditorView, tab: *ETab, new_doc: Document) void {
+        tab.doc.deinit();
+        tab.doc = new_doc;
+        tab.folds.clear();
+        tab.folds_epoch += 1;
+        tab.folds_valid = false;
+        tab.fm_valid = false;
+        tab.br_valid = false;
+        tab.sel_stack.clear();
+        self.installDocObservers(tab);
+        // A new text: re-detect the language (a shebang may only be
+        // visible now) and re-attach the highlighter's observer.
+        self.ensureHighlighter(tab);
+    }
+
+    /// Park a cross-file change for `tab`, which must be LOADING: it is
+    /// applied when that load lands or reported when it cannot.
+    pub fn deferEdit(self: *EditorView, tab: *ETab, kind: deferred.Kind, payload: []const u8) !void {
+        try self.deferred.push(self.allocator, kind, tab.spec orelse "", payload, tab.id, tab.io_gen);
+    }
+
+    /// A load settled: apply what was waiting for it. EVERY path that
+    /// clears `ETab.loading` reaches this or `failDeferredEdits`.
+    pub fn deliverDeferredEdits(self: *EditorView, tab: *ETab, load_gen: u64) void {
+        var taken = self.deferred.take(self.allocator, tab.id, load_gen);
+        defer taken.deinit(self.allocator);
+        var lsp_applied: usize = 0;
+        var replaced: usize = 0;
+        var lost: usize = taken.stale;
+        for (taken.ready.items) |e| {
+            switch (e.kind) {
+                .lsp_text_edits => {
+                    const m = self.lsp orelse {
+                        lost += 1;
+                        continue;
+                    };
+                    if (m.applyDeferred(tab, e.payload)) lsp_applied += 1 else lost += 1;
+                },
+                .project_replace => {
+                    if (editorproj.applyDeferredReplace(self, tab, e.payload)) replaced += 1 else lost += 1;
+                },
+            }
+        }
+        if (lsp_applied > 0) {
+            if (self.lsp) |m| m.reportDeferredEdits(lsp_applied);
+        }
+        if (replaced > 0) editorproj.reportDeferredReplace(self, replaced);
+        if (lost > 0) {
+            var buf: [160:0]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(
+                &buf,
+                "{d} deferred edit(s) could not be applied: the document changed before it loaded.",
+                .{lost},
+            ) catch "A deferred edit could not be applied.";
+            self.setStatusText(msg);
+        }
+    }
+
+    /// The tab can never receive its parked changes (it is closing, or
+    /// its load failed). Say so: an outcome line already promised them.
+    /// Takes an id: the tab is often already gone.
+    pub fn failDeferredEdits(self: *EditorView, tab_id: u64, why: [*:0]const u8) void {
+        const lost = self.deferred.drop(self.allocator, tab_id);
+        if (lost == 0) return;
+        var buf: [200:0]u8 = undefined;
+        const msg = std.fmt.bufPrintZ(
+            &buf,
+            "{d} edit(s) from a cross-file change were NOT applied: {s}.",
+            .{ lost, why },
+        ) catch "A cross-file edit was not applied.";
+        self.setStatusText(msg);
+    }
+
+    pub fn activeTab(self: *EditorView) ?*ETab {
+        return self.active;
     }
 
     /// The open tab holding `spec`, if any — how a project-wide replace
@@ -2917,14 +2567,6 @@ pub const EditorView = struct {
     /// switch, for `STATUS_NOTE_MS`, then disappears on its own.
     pub fn setStatusText(self: *EditorView, text: [*:0]const u8) void {
         self.postStatus(std.mem.span(text));
-    }
-
-    pub fn queueRenderExternal(self: *EditorView) void {
-        self.queueRender();
-    }
-
-    pub fn updateStatusExternal(self: *EditorView) void {
-        self.updateStatus();
     }
 
     /// Post-edit bookkeeping for an edit the LSP client applied
@@ -2965,7 +2607,7 @@ pub const EditorView = struct {
     /// Put the caret on an LSP position. `character` is in the server's
     /// negotiated encoding, so it goes through the position mapper
     /// rather than being treated as a byte column.
-    fn applyWantPos(self: *EditorView, tab: *ETab, p: lsp_pos.Position) void {
+    pub fn applyWantPos(self: *EditorView, tab: *ETab, p: lsp_pos.Position) void {
         const enc: lsp_pos.Encoding = blk: {
             const st = tab.lsp orelse break :blk .utf16;
             const cn = st.conn orelse break :blk .utf16;
@@ -3274,7 +2916,7 @@ pub const EditorView = struct {
         self.applyWrapWidth(tab);
     }
 
-    fn queueRender(self: *EditorView) void {
+    pub fn queueRender(self: *EditorView) void {
         if (self.widgets_dead) return;
         c.gtk_gl_area_queue_render(self.area);
     }
@@ -3286,7 +2928,7 @@ pub const EditorView = struct {
         return @floatFromInt(atlas.cell_h);
     }
 
-    fn viewportHeightPx(self: *EditorView) f32 {
+    pub fn viewportHeightPx(self: *EditorView) f32 {
         const h = c.gtk_widget_get_height(@ptrCast(self.area));
         const scale = c.gtk_widget_get_scale_factor(@ptrCast(self.area));
         return @floatFromInt(h * scale);
@@ -3310,7 +2952,7 @@ pub const EditorView = struct {
     /// Push the tab's wrap setting into its Layout. Any change to the
     /// wrap width invalidates the layout cache AND the row estimate,
     /// since both are keyed on it.
-    fn applyWrapWidth(self: *EditorView, tab: *ETab) void {
+    pub fn applyWrapWidth(self: *EditorView, tab: *ETab) void {
         const want: ?f32 = if (!tab.wrap) null else blk: {
             const atlas = self.atlas orelse break :blk null;
             const total = self.viewportWidthPx();
@@ -3431,7 +3073,7 @@ pub const EditorView = struct {
 
     /// Never scroll past the last row (keeping one screen minus a row
     /// of content visible), nor above the top.
-    fn clampAnchor(self: *EditorView, tab: *ETab, view_h: f32) void {
+    pub fn clampAnchor(self: *EditorView, tab: *ETab, view_h: f32) void {
         self.ensureRows(tab);
         const n_lines = tab.doc.rope.lineCount();
         if (n_lines == 0) {
@@ -3518,7 +3160,7 @@ pub const EditorView = struct {
 
     /// Scroll so the primary caret is on screen, vertically AND
     /// horizontally. Called after every cursor change.
-    fn ensureCaretVisible(self: *EditorView, tab: *ETab) void {
+    pub fn ensureCaretVisible(self: *EditorView, tab: *ETab) void {
         if (self.widgets_dead) return;
         const view_h = self.viewportHeightPx();
         if (view_h <= 0) return;
@@ -3796,228 +3438,13 @@ pub const EditorView = struct {
         self.queueRender();
     }
 
-    // ---- find / replace -------------------------------------------------
-
-    fn findOptions(self: *EditorView) search.Options {
-        return .{
-            .case_sensitive = c.gtk_toggle_button_get_active(@ptrCast(self.find_case)) != 0,
-            .whole_word = c.gtk_toggle_button_get_active(@ptrCast(self.find_word)) != 0,
-            .regex = c.gtk_toggle_button_get_active(@ptrCast(self.find_regex)) != 0,
-        };
-    }
-
-    /// GtkEditable-based so it works for the GtkSearchEntry needle and
-    /// the plain GtkEntry replace field alike.
-    fn entryText(w: *c.GtkWidget) []const u8 {
-        const buf = c.gtk_editable_get_text(@ptrCast(w));
-        if (buf == null) return "";
-        const z: [*:0]const u8 = @ptrCast(buf);
-        return z[0..std.mem.len(z)];
-    }
-
-    /// Open (or focus) the find bar; `replace` also reveals the second
-    /// row. A selection on one line seeds the needle.
-    pub fn openFind(self: *EditorView, replace: bool) void {
-        const tab = self.active orelse return;
-        if (!self.find_open) {
-            const sel = tab.sels.primary();
-            if (!sel.isCaret() and sel.end() - sel.start() < 120) {
-                const text = tab.doc.rope.sliceAlloc(self.allocator, sel.start(), sel.end()) catch null;
-                if (text) |t| {
-                    defer self.allocator.free(t);
-                    if (std.mem.indexOfScalar(u8, t, '\n') == null) {
-                        const z = self.allocator.dupeZ(u8, t) catch null;
-                        if (z) |zz| {
-                            defer self.allocator.free(zz);
-                            c.gtk_editable_set_text(@ptrCast(self.find_entry), zz.ptr);
-                        }
-                    }
-                }
-            }
-        }
-        self.find_open = true;
-        c.gtk_widget_set_visible(self.find_bar, 1);
-        c.gtk_widget_set_visible(self.replace_row, if (replace) 1 else 0);
-        // With a needle already typed, Ctrl+H should land in the
-        // replacement field; otherwise the needle comes first.
-        if (replace and entryText(self.find_entry).len > 0) {
-            _ = c.gtk_widget_grab_focus(self.replace_entry);
-        } else {
-            _ = c.gtk_widget_grab_focus(self.find_entry);
-            c.gtk_editable_select_region(@ptrCast(self.find_entry), 0, -1);
-        }
-        self.recomputeMatches(tab, true);
-    }
-
-    fn closeFind(self: *EditorView) void {
-        if (!self.find_open) return;
-        self.find_open = false;
-        c.gtk_widget_set_visible(self.find_bar, 0);
-        if (self.active) |tab| tab.clearMatches();
-        _ = c.gtk_widget_grab_focus(@ptrCast(self.area));
-        self.queueRender();
-    }
-
-    /// Re-run the search for the active needle. `select` moves the
-    /// current match to the one nearest the caret.
-    fn recomputeMatches(self: *EditorView, tab: *ETab, select: bool) void {
-        const needle = entryText(self.find_entry);
-        if (tab.needle.len > 0) self.allocator.free(tab.needle);
-        tab.needle = self.allocator.dupe(u8, needle) catch &.{};
-        tab.clearMatches();
-        self.find_bad_pattern = false;
-        if (needle.len > 0) {
-            tab.matches = search.findAll(self.allocator, &tab.doc, needle, self.findOptions()) catch |e| blk: {
-                // A pattern the user is still typing is invalid most of
-                // the time; that is a label, not an error dialog.
-                self.find_bad_pattern = e != error.OutOfMemory;
-                break :blk &.{};
-            };
-        }
-        if (select and tab.matches.len > 0) {
-            tab.current_match = search.pick(tab.matches, tab.sels.primary().start(), true);
-        }
-        self.updateFindCount(tab);
-        self.queueRender();
-    }
-
-    fn updateFindCount(self: *EditorView, tab: *ETab) void {
-        var buf: [40:0]u8 = undefined;
-        const txt: [:0]const u8 = if (self.find_bad_pattern)
-            "Bad pattern"
-        else if (tab.matches.len == 0)
-            (if (entryText(self.find_entry).len == 0) "" else "No results")
-        else if (tab.current_match) |i|
-            std.fmt.bufPrintZ(&buf, "{d} of {d}", .{ i + 1, tab.matches.len }) catch ""
-        else
-            std.fmt.bufPrintZ(&buf, "{d} matches", .{tab.matches.len}) catch "";
-        c.gtk_label_set_text(self.find_count, txt.ptr);
-    }
-
-    /// Step to the next/previous match (wrapping) and select it.
-    fn stepMatch(self: *EditorView, forward: bool) void {
-        const tab = self.active orelse return;
-        if (!std.mem.eql(u8, tab.needle, entryText(self.find_entry))) self.recomputeMatches(tab, false);
-        if (tab.matches.len == 0) {
-            self.updateFindCount(tab);
-            return;
-        }
-        const caret = tab.sels.primary();
-        const from = if (forward) caret.end() else caret.start();
-        // Stepping off the match we are sitting on, not onto it again.
-        var idx = search.pick(tab.matches, from, forward) orelse return;
-        if (search.indexOfRange(tab.matches, caret.start(), caret.end())) |cur| {
-            if (idx == cur) {
-                idx = if (forward)
-                    (cur + 1) % tab.matches.len
-                else
-                    (cur + tab.matches.len - 1) % tab.matches.len;
-            }
-        }
-        tab.current_match = idx;
-        const m = tab.matches[idx];
-        tab.sels.keepPrimaryOnly();
-        tab.sels.sels.items[0] = .{ .anchor = m.start, .head = m.end };
-        tab.goal_x = null;
-        // A match inside a folded region unfolds it, for the same
-        // reason goto does.
-        self.revealCaretLines(tab);
-        self.updateFindCount(tab);
-        self.ensureCaretVisible(tab);
-        self.updateStatus();
-        self.queueRender();
-    }
-
-    /// Compiled needle for the replace paths, or null in literal mode
-    /// (and when the pattern does not compile, which the count label
-    /// has already reported).
-    fn replaceRegex(self: *EditorView, tab: *ETab) ?search.Regex {
-        const opts = self.findOptions();
-        if (!opts.regex) return null;
-        return search.Regex.init(self.allocator, tab.needle, opts) catch null;
-    }
-
-    fn replaceCurrent(self: *EditorView) void {
-        const tab = self.active orelse return;
-        const idx = tab.current_match orelse {
-            self.stepMatch(true);
-            return;
-        };
-        if (idx >= tab.matches.len) return;
-        const m = tab.matches[idx];
-        const template = entryText(self.replace_entry);
-
-        // In regex mode the replacement is the template EXPANDED against
-        // this match's captures, so it differs per match.
-        var expanded: std.ArrayList(u8) = .empty;
-        defer expanded.deinit(self.allocator);
-        var with = template;
-        if (self.replaceRegex(tab)) |re_val| {
-            var re = re_val;
-            defer re.deinit();
-            const caps = (re.capturesAt(&tab.doc, m.start) catch null) orelse return;
-            re.expand(&tab.doc, caps, template, &expanded) catch return;
-            with = expanded.items;
-        } else if (self.findOptions().regex) return;
-
-        tab.sels.keepPrimaryOnly();
-        tab.sels.sels.items[0] = .{ .anchor = m.start, .head = m.end };
-        vm.insertText(self.allocator, &tab.doc, &tab.sels, with) catch return;
-        self.afterDocEdit(tab);
-        self.stepMatch(true);
-    }
-
-    /// Every match replaced in ONE transaction, so it is one undo step.
-    fn replaceAll(self: *EditorView) void {
-        const tab = self.active orelse return;
-        self.recomputeMatches(tab, false);
-        if (tab.matches.len == 0) return;
-        const template = entryText(self.replace_entry);
-        var tx = tr.Transaction.init(tab.doc.revision);
-        defer tx.deinit(self.allocator);
-
-        // The transaction BORROWS its inserted slices, so every expanded
-        // replacement has to outlive the apply — hence the arena.
-        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena_state.deinit();
-        const arena = arena_state.allocator();
-        var re_opt = self.replaceRegex(tab);
-        defer if (re_opt) |*r| r.deinit();
-        if (re_opt == null and self.findOptions().regex) return;
-
-        var buf: std.ArrayList(u8) = .empty;
-        defer buf.deinit(self.allocator);
-        var prev_end: usize = 0;
-        var applied: usize = 0;
-        for (tab.matches) |m| {
-            if (m.start < prev_end) continue; // overlapping (can't happen, defensive)
-            var with = template;
-            if (re_opt) |*re| {
-                buf.clearRetainingCapacity();
-                const caps = (re.capturesAt(&tab.doc, m.start) catch null) orelse continue;
-                re.expand(&tab.doc, caps, template, &buf) catch continue;
-                with = arena.dupe(u8, buf.items) catch continue;
-            }
-            tx.addReplace(self.allocator, m.start, m.end - m.start, with) catch return;
-            prev_end = m.end;
-            applied += 1;
-        }
-        _ = tab.doc.applyTransactionSel(&tx, vm.snapshotOf(&tab.sels)) catch return;
-        tab.sels.mapThrough(tx.edits.items, .editor);
-        vm.clampSelections(&tab.doc, &tab.sels);
-        var msg_buf: [64:0]u8 = undefined;
-        const msg = std.fmt.bufPrintZ(&msg_buf, "Replaced {d} occurrence(s).", .{applied}) catch "Replaced.";
-        self.afterDocEdit(tab);
-        self.setStatus(msg.ptr);
-    }
-
     /// Post-edit bookkeeping shared by every path that mutates the
     /// document: the layout cache and the row estimate are both keyed
     /// on the document, and open find results go stale.
     /// (The Layout cache and the row estimate self-heal: the former is
     /// keyed on `doc.revision`, the latter on the line count plus the
     /// per-line `note` the renderer makes.)
-    fn afterDocEdit(self: *EditorView, tab: *ETab) void {
+    pub fn afterDocEdit(self: *EditorView, tab: *ETab) void {
         // The edit already replayed onto the syntax trees through the
         // document's observer (Document.EditObserver); this only picks
         // the moment to re-parse.
@@ -4027,7 +3454,7 @@ pub const EditorView = struct {
         // the fresh tree.
         tab.sel_stack.clear();
         self.syncFolds(tab);
-        if (self.find_open) self.recomputeMatches(tab, false);
+        if (self.find_open) editorfind.recompute(self, tab, false);
         // The edit was already captured by the LSP document observer
         // (Document slot 2); this only arms the debounce that flushes
         // it, and lets an open completion list follow the caret.
@@ -4037,101 +3464,9 @@ pub const EditorView = struct {
         }
         // Crash recovery: the first edit that dirties a buffer opens its
         // journal slot on the next tick (editor/journal.zig).
-        self.armJournal();
+        editorjournal.arm(self);
         editoroutline.onDocumentChanged(self, tab);
         self.refresh(tab);
-    }
-
-    fn onFindChanged(_: *c.GtkEditable, user: ?*anyopaque) callconv(.c) void {
-        const self = cast.userData(EditorView, user);
-        const tab = self.active orelse return;
-        self.recomputeMatches(tab, true);
-    }
-
-    fn onFindActivate(_: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
-        const self = cast.userData(EditorView, user);
-        self.stepMatch(true);
-    }
-
-    fn onReplaceActivate(_: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
-        const self = cast.userData(EditorView, user);
-        self.replaceCurrent();
-    }
-
-    fn onFindOptionToggled(_: *c.GtkToggleButton, user: ?*anyopaque) callconv(.c) void {
-        const self = cast.userData(EditorView, user);
-        const tab = self.active orelse return;
-        self.recomputeMatches(tab, true);
-    }
-
-    fn onFindNextClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-        cast.userData(EditorView, user).stepMatch(true);
-    }
-
-    fn onFindPrevClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-        cast.userData(EditorView, user).stepMatch(false);
-    }
-
-    fn onFindCloseClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-        cast.userData(EditorView, user).closeFind();
-    }
-
-    /// GtkSearchEntry "stop-search" (Esc in the entry). The bar's own
-    /// capture-phase Esc handler normally wins; this is the backstop.
-    fn onFindStop(_: *c.GtkSearchEntry, user: ?*anyopaque) callconv(.c) void {
-        cast.userData(EditorView, user).closeFind();
-    }
-
-    fn onReplaceClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-        cast.userData(EditorView, user).replaceCurrent();
-    }
-
-    fn onReplaceAllClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-        cast.userData(EditorView, user).replaceAll();
-    }
-
-    fn onFindKey(
-        _: *c.GtkEventControllerKey,
-        keyval: c_uint,
-        _: c_uint,
-        state: c.GdkModifierType,
-        user: ?*anyopaque,
-    ) callconv(.c) c.gboolean {
-        const self = cast.userData(EditorView, user);
-        const mods = state & input.SIGNIFICANT_MODS;
-        const shift = (mods & c.GDK_SHIFT_MASK) != 0;
-        const ctrl = (mods & c.GDK_CONTROL_MASK) != 0;
-        // Ctrl+F / Ctrl+H must also work from INSIDE the bar (the
-        // canvas controller never sees these — the entry has focus).
-        if (ctrl and !shift) {
-            switch (c.gdk_keyval_to_lower(keyval)) {
-                c.GDK_KEY_f => {
-                    self.openFind(false);
-                    return 1;
-                },
-                c.GDK_KEY_h => {
-                    self.openFind(true);
-                    return 1;
-                },
-                else => {},
-            }
-        }
-        switch (keyval) {
-            c.GDK_KEY_Escape => {
-                self.closeFind();
-                return 1;
-            },
-            c.GDK_KEY_Return, c.GDK_KEY_KP_Enter => {
-                // Shift+Enter steps backwards from either entry; plain
-                // Enter in the replace entry replaces (its "activate").
-                if (shift) {
-                    self.stepMatch(false);
-                    return 1;
-                }
-                return 0;
-            },
-            else => return 0,
-        }
     }
 
     // ---- shared post-edit refresh ------------------------------------
@@ -4151,7 +3486,7 @@ pub const EditorView = struct {
         pane.setFaceTitle(txt);
     }
 
-    fn refresh(self: *EditorView, tab: *ETab) void {
+    pub fn refresh(self: *EditorView, tab: *ETab) void {
         if (self.widgets_dead) return;
         tab.handle.setTitle(tab.title());
         tab.handle.setDirty(tab.isDirty());
@@ -4190,7 +3525,7 @@ pub const EditorView = struct {
         a11y.notifyChanged(@ptrCast(self.area));
     }
 
-    fn updateStatus(self: *EditorView) void {
+    pub fn updateStatus(self: *EditorView) void {
         if (self.widgets_dead) return;
         // Every caret move, edit, tab switch and dirty-flag change
         // funnels through here, so this is also where the screen
@@ -4211,7 +3546,7 @@ pub const EditorView = struct {
         // The diagnostic under the caret (or the document's error /
         // warning counts) rides the same line — the editor has no
         // second status surface to put it on.
-        var lsp_buf: [260]u8 = undefined;
+        var lsp_buf: [480]u8 = undefined;
         const lsp_note: []const u8 = if (self.lsp) |m| m.statusSummary(tab, &lsp_buf) else "";
         // Project + gutter summary. Empty string for a loose file, so a
         // document with no project reads exactly as it always did.
@@ -4327,903 +3662,6 @@ pub const EditorView = struct {
         return 0; // G_SOURCE_REMOVE
     }
 
-    // ---- IO -----------------------------------------------------------
-
-    fn startLoad(self: *EditorView, tab: *ETab) void {
-        self.startLoadEx(tab, false);
-    }
-
-    fn startLoadEx(self: *EditorView, tab: *ETab, keep_position: bool) void {
-        const spec = tab.spec orelse return;
-        const a = std.heap.c_allocator;
-        const job = a.create(IoJob) catch return;
-        const owned = a.dupe(u8, spec) catch {
-            a.destroy(job);
-            return;
-        };
-        self.fence.ref();
-        tab.io_gen = self.next_io_gen;
-        self.next_io_gen += 1;
-        job.* = .{
-            .fence = self.fence,
-            .gen = tab.io_gen,
-            .kind = .load,
-            .spec = owned,
-            .keep_position = keep_position,
-        };
-        tab.loading = true;
-        self.updateStatus();
-        const thread = std.Thread.spawn(.{}, ioThread, .{job}) catch {
-            tab.loading = false;
-            tab.io_gen = 0;
-            job.destroy();
-            return;
-        };
-        thread.detach();
-    }
-
-    pub fn saveTab(self: *EditorView, tab: *ETab) void {
-        if (tab.loading) {
-            self.setStatus("Still loading — try again in a moment.");
-            return;
-        }
-        if (tab.io_gen != 0) {
-            self.setStatus("A save is already in flight.");
-            return;
-        }
-        if (tab.spec == null) {
-            self.saveTabAs(tab);
-            return;
-        }
-        editorlang.beforeSave(self, tab);
-        // The guarded save IS the before-save disk check: the daemon
-        // compares the baseline against the destination inside the
-        // install, which no client-side poll can do race-free.
-        const guard: ?i64 = if (tab.disk.present and tab.disk.mtime_ns != 0) tab.disk.mtime_ns else null;
-        self.startSave(tab, guard);
-    }
-
-    fn startSave(self: *EditorView, tab: *ETab, expected_mtime: ?i64) void {
-        const spec = tab.spec orelse return;
-        const a = std.heap.c_allocator;
-        const bytes = tab.doc.materialize(a) catch return;
-        const job = a.create(IoJob) catch {
-            a.free(bytes);
-            return;
-        };
-        const owned = a.dupe(u8, spec) catch {
-            a.free(bytes);
-            a.destroy(job);
-            return;
-        };
-        self.fence.ref();
-        tab.io_gen = self.next_io_gen;
-        self.next_io_gen += 1;
-        job.* = .{
-            .fence = self.fence,
-            .gen = tab.io_gen,
-            .kind = .save,
-            .spec = owned,
-            .save_bytes = bytes,
-            .expected_mtime = expected_mtime,
-            .revision = tab.doc.revision,
-        };
-        self.setStatus("Saving…");
-        const thread = std.Thread.spawn(.{}, ioThread, .{job}) catch {
-            tab.io_gen = 0;
-            job.destroy();
-            return;
-        };
-        thread.detach();
-    }
-
-    fn onIoDone(self: *EditorView, job: *IoJob) void {
-        const tab = self.findTabByGen(job.gen) orelse return;
-        tab.io_gen = 0;
-        switch (job.kind) {
-            .load => {
-                tab.loading = false;
-                // A cross-file edit (rename, code action) parks its
-                // hunk for a LOADING tab and the outcome line already
-                // told the user it applied. So every exit below must
-                // either deliver it or say it was lost — enforced here
-                // rather than remembered at four return statements.
-                // The delivering paths clear `undelivered`; the
-                // tab-closing ones report through `detachTab`, which
-                // makes this defer a no-op for them.
-                var undelivered = true;
-                const load_tab_id = tab.id; // the closing paths free `tab`
-                defer if (undelivered) {
-                    if (self.lsp) |m| m.failPendingEdits(load_tab_id, "the file could not be loaded");
-                };
-                if (job.binary) {
-                    self.errorDialog("Cannot edit binary file", job.errText());
-                    self.closeTabForce(tab);
-                    return;
-                }
-                if (!job.ok) {
-                    self.errorDialog("Could not open file", job.errText());
-                    self.closeTabForce(tab);
-                    return;
-                }
-                if (job.not_found) {
-                    // New file (or an unreadable one): keep the empty
-                    // document and record NO baseline, so the disk
-                    // probe stays silent about a file we never read.
-                    tab.disk = .{};
-                    tab.keep_active = false;
-                    self.clearAlert(tab);
-                    // No document-replace rides on this branch, so the
-                    // (empty, but now FINAL) buffer has to be opened on
-                    // the server from here — `openDocument` defers
-                    // while `loading` is set, which it no longer is.
-                    undelivered = false; // ensureOpen drains
-                    if (self.lsp) |m| m.ensureOpen(tab, job.gen) else self.attachLsp(tab);
-                    editorlang.onLoaded(self, tab, job.ec);
-                    self.setStatus("New file.");
-                    self.refresh(tab);
-                    return;
-                }
-                if (job.keep_position and tab.keep_active) {
-                    self.finishReloadInPlace(tab, job);
-                    editorlang.onLoaded(self, tab, job.ec);
-                    // The document object SURVIVES a reload-in-place,
-                    // so no replace hook runs and this is the only
-                    // place the queued edits can be delivered. True
-                    // even when the diff failed: the buffer is then
-                    // the text the server described, so the edits
-                    // still fit.
-                    undelivered = false;
-                    if (self.lsp) |m| m.finishPendingEdits(tab, job.gen);
-                    return;
-                }
-                var new_doc = Document.initFromBytes(self.allocator, job.bytes) catch {
-                    self.errorDialog("Could not open file", "OutOfMemory");
-                    self.closeTabForce(tab);
-                    return;
-                };
-                tab.doc.deinit();
-                tab.doc = new_doc;
-                new_doc = undefined;
-                // The loaded text is a different document: re-detect
-                // the language (a shebang only becomes visible now) and
-                // re-attach the observer the swap just dropped.
-                self.ensureHighlighter(tab);
-                editorlang.onLoaded(self, tab, job.ec);
-                // Folds anchor into the OLD document's byte space and
-                // the trail describes its offsets; both die with it.
-                tab.folds.clear();
-                tab.folds_epoch += 1;
-                tab.folds_valid = false;
-                tab.fm_valid = false;
-                tab.br_valid = false;
-                tab.sel_stack.clear();
-                tab.doc.addObserver(.{ .ctx = tab, .before_apply = ETab.observeEdits });
-        tab.doc.addObserver(self.a11y_src.editObserver());
-                // The observer the swap dropped has to be re-installed
-                // and the server told the content changed wholesale;
-                // a first-time load is where the server is attached.
-                undelivered = false; // onDocumentReplaced drains
-                if (self.lsp) |m| m.onDocumentReplaced(tab, job.gen) else self.attachLsp(tab);
-                tab.layout.invalidateAll();
-                tab.rows_lines = 0;
-                tab.anchor = .{};
-                tab.scroll_x = 0;
-                tab.max_width = 0;
-                self.applyWrapWidth(tab);
-                tab.disk = job.disk;
-                tab.seen = job.disk;
-                self.clearAlert(tab);
-                {
-                    const caret = @min(tab.want_cursor orelse 0, tab.doc.rope.len());
-                    tab.want_cursor = null;
-                    tab.sels.keepPrimaryOnly();
-                    tab.sels.sels.items[0] = Selection.caret(caret);
-                }
-                if (tab.want_pos) |p| {
-                    tab.want_pos = null;
-                    self.applyWantPos(tab, p);
-                } else if (tab.want_top_line) |top| {
-                    // Restored scroll: a LINE, so it survives a
-                    // different pane width and wrap setting. Applied
-                    // only when nothing else claimed the viewport.
-                    tab.want_top_line = null;
-                    const lines = tab.doc.rope.lineCount();
-                    tab.anchor = .{ .line = @min(top, lines -| 1), .row = 0, .offset = 0 };
-                }
-                self.noteSavedHash(tab);
-                tab.keep_active = false;
-                // The document is new: its project may be too, and the
-                // gutter marks anchored into the old byte space are gone.
-                tab.git.clear();
-                tab.outline.clear();
-                tab.outline_rev = 0;
-                editorproj.resolveProject(self, tab);
-                editorproj.refreshGit(self, tab);
-                editoroutline.refresh(self, tab, true);
-                self.refresh(tab);
-            },
-            .save => {
-                if (job.conflict) {
-                    tab.close_after_save = false;
-                    // NOT a modal: the same inline banner the probe
-                    // raises, so a refused save and an observed change
-                    // can never produce two competing prompts.
-                    tab.seen = job.disk;
-                    tab.dismissed = null;
-                    tab.alert = .changed;
-                    tab.alert_from_save = true;
-                    self.updateBanner();
-                    self.setStatus("Save refused: the file changed on disk.");
-                    return;
-                }
-                if (!job.ok) {
-                    tab.close_after_save = false;
-                    self.errorDialog("Save failed", job.errText());
-                    self.updateStatus();
-                    return;
-                }
-                tab.disk = job.disk;
-                tab.seen = job.disk;
-                self.clearAlert(tab);
-                if (tab.doc.revision == job.revision) tab.doc.markSaved();
-                // Contract step 3: the record goes, the lock stays.
-                if (!tab.isDirty()) {
-                    if (tab.journal) |*h| h.clear();
-                }
-                self.noteSavedHash(tab);
-                if (self.lsp) |m| m.onSaved(tab);
-                editorproj.refreshGit(self, tab);
-                if (tab.close_after_save) {
-                    tab.close_after_save = false;
-                    if (!tab.isDirty()) {
-                        self.closeTabForce(tab);
-                        return;
-                    }
-                }
-                self.refresh(tab);
-                self.setStatus("Saved.");
-            },
-        }
-    }
-
-    /// A reload that KEEPS the document: the arriving bytes are diffed
-    /// onto the live buffer as ONE transaction (editor/diff.zig), so
-    /// undo restores the pre-reload text, every edit observer
-    /// (highlighter, folds/git/outline anchors, LSP didChange, a11y
-    /// change log) sees ordinary edits, and carets/selections map
-    /// through instead of clamping.
-    fn finishReloadInPlace(self: *EditorView, tab: *ETab, job: *IoJob) void {
-        tab.keep_active = false;
-        const changed = ediff.reloadFromBytes(self.allocator, &tab.doc, job.bytes, &tab.sels) catch {
-            // Out of memory mid-diff: the transaction applied atomically
-            // or not at all, so the buffer is intact — just stale.
-            self.setStatus("Reload failed: out of memory.");
-            return;
-        };
-        tab.disk = job.disk;
-        tab.seen = job.disk;
-        self.clearAlert(tab);
-        self.noteSavedHash(tab);
-        // Contract step 3 (same as a save): clean buffer, record goes.
-        if (!tab.isDirty()) {
-            if (tab.journal) |*h| h.clear();
-        }
-        if (!changed) {
-            self.refresh(tab);
-            return;
-        }
-        // A changed line count moves the whole row estimate.
-        tab.rows_lines = 0;
-        // A reload only changes the language via a new shebang. The
-        // same language keeps the incrementally-updated tree (the
-        // highlighter observer already saw the edits) and just needs
-        // the debounced re-parse; a different one swaps grammars.
-        if (!std.meta.eql(self.detectLang(tab), tab.hl_lang)) {
-            self.ensureHighlighter(tab);
-        } else {
-            self.scheduleParse(tab);
-        }
-        // The LSP observer captured the diff as ordinary edits, but this
-        // path does not go through `afterDocEdit` — the only other
-        // caller of `onEdited` — so nothing armed the didChange
-        // debounce and the server kept the pre-reload text (and its
-        // diagnostics) until the user happened to type.
-        if (self.lsp) |m| m.onEdited(tab);
-        self.clampAnchor(tab, self.viewportHeightPx());
-        editorproj.refreshGit(self, tab);
-        editoroutline.refresh(self, tab, true);
-        self.refresh(tab);
-        self.setStatus("Reloaded: the file changed on disk.");
-    }
-
-    fn errorDialog(self: *EditorView, heading: [*:0]const u8, detail: []const u8) void {
-        var body: [200:0]u8 = undefined;
-        const b = std.fmt.bufPrintZ(&body, "{s}", .{detail}) catch "unknown error";
-        _ = confirm.present(self.dialogParent(), .{
-            .heading = heading,
-            .body = b.ptr,
-            .responses = &.{
-                .{ .id = "ok", .label = "OK", .is_default = true, .is_close = true },
-            },
-        }, null);
-    }
-
-    // ---- external-change detection -------------------------------------
-    //
-    // Detection is a BATCHED STAT POLL, not a daemon directory watch.
-    // The daemon's live views (`open_view`) are directory-scoped: they
-    // cost a full stat-per-entry listing of the containing directory
-    // (opening one file in a huge tree would list thousands of
-    // siblings), they need a persistent connection parked on the GLib
-    // loop (which for a remote host cannot be established without a
-    // worker thread — the thing the GUI must not grow), and their
-    // inotify backend is Linux-only, so a remote macOS/BSD host would
-    // behave DIFFERENTLY. They also carry no IN_MODIFY, so a writer
-    // holding the fd open produces nothing until close — a poll is
-    // needed as a backstop regardless.
-    //
-    // A stat probe has none of that: one connection per HOST carries
-    // every open document's stat (so twenty tabs in one directory —
-    // or twenty directories — are one round trip, strictly stronger
-    // than per-(host, dir) dedupe), it is identical local and remote,
-    // and it runs on the same detached-thread + g_idle_add path the
-    // loads and saves already use. It fires when the user comes back
-    // to the editor (canvas focus, pane focus, tab switch), which is
-    // exactly when a stale buffer starts to matter, and the save path
-    // is guarded by the daemon-side mtime check, which is race-free in
-    // a way no poll can be.
-
-    /// Rate limit: focus-in storms (click, alt-tab, tab switch) must
-    /// not turn into a round trip each.
-    const PROBE_MIN_INTERVAL_MS: i64 = 400;
-
-    /// Probe every open document's file for external changes. Cheap,
-    /// idempotent and safe to call from any user-facing event.
-    pub fn checkDisk(self: *EditorView) void {
-        if (self.widgets_dead) return;
-        if (self.probes_in_flight > 0) return;
-        const now = @import("../util/clock.zig").nowMs();
-        if (now - self.last_probe_ms < PROBE_MIN_INTERVAL_MS) return;
-        self.last_probe_ms = now;
-
-        const a = std.heap.c_allocator;
-        var hosts: std.ArrayList([]const u8) = .empty;
-        defer hosts.deinit(a);
-        for (self.tabs.items) |t| {
-            const spec = t.spec orelse continue;
-            if (t.io_gen != 0 or t.loading) continue;
-            const host = paths.parseSpec(spec).host orelse "";
-            var seen = false;
-            for (hosts.items) |h| {
-                if (std.mem.eql(u8, h, host)) seen = true;
-            }
-            if (!seen) hosts.append(a, host) catch return;
-        }
-        for (hosts.items) |host| self.probeHost(host);
-    }
-
-    /// One probe job for every document on `host` — one connection,
-    /// one thread, N stats.
-    fn probeHost(self: *EditorView, host: []const u8) void {
-        const a = std.heap.c_allocator;
-        var items: std.ArrayList(ProbeItem) = .empty;
-        defer items.deinit(a);
-        for (self.tabs.items) |t| {
-            const spec = t.spec orelse continue;
-            if (t.io_gen != 0 or t.loading) continue;
-            const loc = paths.parseSpec(spec);
-            if (!std.mem.eql(u8, loc.host orelse "", host)) continue;
-            const path = a.dupe(u8, loc.path) catch continue;
-            items.append(a, .{ .tab_id = t.id, .path = path }) catch {
-                a.free(path);
-                continue;
-            };
-        }
-        if (items.items.len == 0) return;
-        const owned_items = items.toOwnedSlice(a) catch return;
-        const owned_host = a.dupe(u8, host) catch {
-            for (owned_items) |it| a.free(it.path);
-            a.free(owned_items);
-            return;
-        };
-        const job = a.create(ProbeJob) catch {
-            for (owned_items) |it| a.free(it.path);
-            a.free(owned_items);
-            a.free(owned_host);
-            return;
-        };
-        self.fence.ref();
-        job.* = .{ .fence = self.fence, .host = owned_host, .items = owned_items };
-        self.probes_in_flight += 1;
-        const thread = std.Thread.spawn(.{}, probeThread, .{job}) catch {
-            self.probes_in_flight -= 1;
-            job.destroy();
-            return;
-        };
-        thread.detach();
-    }
-
-    fn onProbeDone(self: *EditorView, job: *ProbeJob) void {
-        if (self.probes_in_flight > 0) self.probes_in_flight -= 1;
-        if (self.widgets_dead) return;
-        for (job.items) |it| {
-            // A probe that could not be TAKEN (dead link, unreachable
-            // host) says nothing — it must never read as "deleted".
-            if (!it.ok) continue;
-            const tab = self.findTabById(it.tab_id) orelse continue;
-            // A load/save started after the probe owns the baseline.
-            if (tab.io_gen != 0 or tab.loading) continue;
-            self.applyDiskState(tab, it.state);
-        }
-        self.updateBanner();
-    }
-
-    /// The whole external-change state machine for one document.
-    fn applyDiskState(self: *EditorView, tab: *ETab, obs: reload.DiskState) void {
-        tab.seen = obs;
-        switch (reload.compare(tab.disk, obs)) {
-            .unchanged => {
-                // Reverted underneath us: a banner about a change that
-                // is no longer there is noise.
-                if (tab.alert != .none) self.clearAlert(tab);
-                tab.dismissed = null;
-            },
-            .permissions => {
-                // Content is identical; only the bits moved. Re-baseline
-                // silently so the next save is not refused for it.
-                tab.disk.mode = obs.mode;
-                self.setStatus("Permissions changed on disk.");
-            },
-            .deleted => {
-                if (tab.dismissed) |d| {
-                    if (reload.sameState(d, obs)) return;
-                }
-                // Keep the content; the buffer is simply no longer
-                // backed by a file, and Save recreates it (the absent
-                // baseline drops the conflict guard).
-                tab.disk = obs;
-                tab.dismissed = null;
-                tab.alert = .deleted;
-                tab.alert_from_save = false;
-            },
-            .modified, .replaced, .reappeared => {
-                if (tab.dismissed) |d| {
-                    if (reload.sameState(d, obs)) return;
-                }
-                tab.dismissed = null;
-                if (!tab.isDirty()) {
-                    // Clean buffer: reload quietly, keeping the caret
-                    // and the scroll position. No prompt — that is what
-                    // good editors do.
-                    self.reloadKeepingPosition(tab);
-                    return;
-                }
-                tab.alert = .changed;
-                tab.alert_from_save = false;
-            },
-        }
-    }
-
-    fn reloadKeepingPosition(self: *EditorView, tab: *ETab) void {
-        tab.keep_active = true;
-        self.startLoadEx(tab, true);
-    }
-
-    // ---- the inline banner ----------------------------------------------
-
-    fn clearAlert(self: *EditorView, tab: *ETab) void {
-        tab.alert = .none;
-        tab.alert_from_save = false;
-        tab.dismissed = null;
-        self.updateBanner();
-    }
-
-    /// Render the ACTIVE tab's alert (each document carries its own).
-    fn updateBanner(self: *EditorView) void {
-        if (self.widgets_dead) return;
-        const tab = self.active orelse {
-            c.gtk_widget_set_visible(self.banner_box, 0);
-            return;
-        };
-        if (tab.alert == .none) {
-            c.gtk_widget_set_visible(self.banner_box, 0);
-            return;
-        }
-        var buf: [320:0]u8 = undefined;
-        const text: [:0]const u8 = switch (tab.alert) {
-            .none => unreachable,
-            .changed => if (tab.alert_from_save)
-                std.fmt.bufPrintZ(&buf, "Save refused: \"{s}\" changed on disk since you opened it.", .{tab.title()}) catch "The file changed on disk."
-            else
-                std.fmt.bufPrintZ(&buf, "\"{s}\" changed on disk.", .{tab.title()}) catch "The file changed on disk.",
-            .deleted => std.fmt.bufPrintZ(&buf, "\"{s}\" no longer exists on disk.", .{tab.title()}) catch "The file no longer exists on disk.",
-        };
-        c.gtk_label_set_text(self.banner_label, text.ptr);
-        c.gtk_widget_set_visible(self.banner_reload, if (tab.alert == .changed) 1 else 0);
-        c.gtk_button_set_label(
-            @ptrCast(self.banner_save),
-            if (tab.alert == .deleted) "Save" else "Save Anyway",
-        );
-        c.gtk_widget_set_visible(self.banner_box, 1);
-    }
-
-    fn onBannerReload(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-        const self = cast.userData(EditorView, user);
-        const tab = self.active orelse return;
-        self.revertTab(tab);
-    }
-
-    /// Replace a buffer with the version on disk — the banner's
-    /// "Reload", reachable for any tab (the tab context menu's
-    /// "Revert"). A dirty buffer asks first; losing unsaved work stays
-    /// behind a confirmation.
-    pub fn revertTab(self: *EditorView, tab: *ETab) void {
-        if (tab.isDirty()) {
-            // Losing unsaved work is the one thing that still deserves
-            // a confirmation — and it follows a deliberate click.
-            self.confirmReloadDirty(tab);
-            return;
-        }
-        self.clearAlert(tab);
-        self.reloadKeepingPosition(tab);
-    }
-
-    fn onBannerSave(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-        const self = cast.userData(EditorView, user);
-        const tab = self.active orelse return;
-        self.clearAlert(tab);
-        // Deliberate overwrite (or re-create): no conflict guard.
-        self.startSave(tab, null);
-    }
-
-    fn onBannerDismiss(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-        const self = cast.userData(EditorView, user);
-        const tab = self.active orelse return;
-        // Stay quiet for THIS on-disk state only: a further change
-        // raises the banner again, and the save baseline is untouched,
-        // so Ctrl+S is still refused.
-        tab.dismissed = tab.seen;
-        tab.alert = .none;
-        tab.alert_from_save = false;
-        self.updateBanner();
-    }
-
-    fn confirmReloadDirty(self: *EditorView, tab: *ETab) void {
-        const ctx = DlgCtx.create(self, tab) orelse return;
-        if (confirm.present(self.dialogParent(), .{
-            .heading = "Discard your changes?",
-            .body = "Reloading replaces the buffer with the on-disk version; your unsaved edits are lost.",
-            .responses = &.{
-                .{ .id = "cancel", .label = "Cancel", .is_default = true, .is_close = true },
-                .{ .id = "reload", .label = "Discard and Reload", .appearance = .destructive },
-            },
-        }, .{ .allocator = self.allocator, .cb = &onReloadDirtyResponse, .ctx = @ptrCast(ctx) }) == null) ctx.destroy();
-    }
-
-    fn onReloadDirtyResponse(user: ?*anyopaque, resp: []const u8) void {
-        const ctx: *DlgCtx = @ptrCast(@alignCast(user.?));
-        defer ctx.destroy();
-        const r = ctx.resolve() orelse return;
-        if (std.mem.eql(u8, resp, "reload")) {
-            r.view.clearAlert(r.tab);
-            r.view.reloadKeepingPosition(r.tab);
-        }
-    }
-
-    // ---- crash recovery -------------------------------------------------
-    //
-    // Journal writes are DEBOUNCED off one timer for the whole face
-    // rather than one per tab: the tick is a cheap walk over the tabs,
-    // and a single source is a single thing to disarm at teardown
-    // (`stopJournalTimer`, called from every path that kills the
-    // widgets, exactly like the blink timer).
-
-    /// Arm the debounce after any edit. No-op when it is already
-    /// running or the feature is off.
-    fn armJournal(self: *EditorView) void {
-        if (!self.crash_recovery or self.journal_timer != 0) return;
-        self.journal_timer = c.g_timeout_add(JOURNAL_DEBOUNCE_MS, @ptrCast(&onJournalTimer), @ptrCast(self));
-    }
-
-    fn stopJournalTimer(self: *EditorView) void {
-        if (self.journal_timer != 0) {
-            _ = c.g_source_remove(self.journal_timer);
-            self.journal_timer = 0;
-        }
-    }
-
-    fn onJournalTimer(user: ?*anyopaque) callconv(.c) c.gboolean {
-        const self = cast.userData(EditorView, user);
-        var any = false;
-        for (self.tabs.items) |t| {
-            if (self.journalTick(t)) any = true;
-        }
-        if (!any) {
-            self.journal_timer = 0;
-            return 0;
-        }
-        return 1;
-    }
-
-    /// One tab's snapshot decision. True while the tab still wants the
-    /// timer running.
-    fn journalTick(self: *EditorView, tab: *ETab) bool {
-        if (!self.crash_recovery) {
-            if (tab.journal) |*h| {
-                h.discard();
-                tab.journal = null;
-            }
-            return false;
-        }
-        if (!tab.isDirty()) {
-            // Clean: drop the snapshot but KEEP the lock, so the slot is
-            // still ours when the buffer goes dirty again.
-            if (tab.journal) |*h| h.clear();
-            return false;
-        }
-        // Given up on (too large): nothing more to do for this tab, so
-        // it must not keep the timer spinning either.
-        if (tab.journal_off) return false;
-        if (tab.loading) return true;
-        if (tab.journal == null) {
-            tab.journal = journal.open(self.allocator, tab.spec orelse "") catch {
-                tab.journal_off = true;
-                return false;
-            };
-        }
-        const h = &tab.journal.?;
-        if (!h.shouldWrite(tab.doc.revision)) return true;
-
-        const text = tab.doc.textAlloc(self.allocator) catch return true;
-        defer self.allocator.free(text);
-        // `isDirty` is a revision comparison, so undoing back to the
-        // saved state still reads dirty. Keeping a record for a buffer
-        // that is byte-identical to disk would offer the user their own
-        // unchanged file as "unsaved work" after a crash, so compare
-        // the CONTENT here — the bytes are in hand anyway, which is why
-        // this is cheaper than teaching Document a second dirty rule.
-        if (tab.saved_hash_valid and std.hash.Wyhash.hash(SAVED_HASH_SEED, text) == tab.saved_hash) {
-            h.clear();
-            return true;
-        }
-        var hdr = journal.Header{
-            .spec = tab.spec orelse "",
-            .remote = if (tab.spec) |s| paths.parseSpec(s).host != null else false,
-            .crlf = tab.doc.line_ending == .crlf,
-            .revision = tab.doc.revision,
-            .saved_revision = tab.doc.saved_revision,
-            .cursor = @intCast(tab.sels.primary().head),
-        };
-        hdr.setBaseline(tab.disk);
-        h.write(hdr, text) catch |e| {
-            if (e == journal.Error.BufferTooLarge) {
-                tab.journal_off = true;
-                self.setStatus("Buffer too large for crash recovery — save often.");
-            }
-            return true;
-        };
-        return true;
-    }
-
-    /// Record the content hash of the buffer as it now sits on disk.
-    fn noteSavedHash(self: *EditorView, tab: *ETab) void {
-        const text = tab.doc.textAlloc(self.allocator) catch {
-            tab.saved_hash_valid = false;
-            return;
-        };
-        defer self.allocator.free(text);
-        tab.saved_hash = std.hash.Wyhash.hash(SAVED_HASH_SEED, text);
-        tab.saved_hash_valid = true;
-    }
-
-    /// Prune stale records and offer whatever a previous run left
-    /// behind. Runs ONCE per process, from the first editor face.
-    fn offerRecovery(self: *EditorView) void {
-        if (recovery_offered or !self.crash_recovery) return;
-        recovery_offered = true;
-        _ = journal.prune(self.allocator, JOURNAL_MAX_AGE_MS) catch {};
-        const entries = journal.list(self.allocator) catch return;
-        if (entries.len == 0) {
-            journal.freeEntries(self.allocator, entries);
-            return;
-        }
-        self.recovery = entries;
-        self.updateRecoverBanner();
-    }
-
-    fn dropRecovery(self: *EditorView) void {
-        if (self.recovery.len == 0) return;
-        journal.freeEntries(self.allocator, self.recovery);
-        self.recovery = &.{};
-    }
-
-    fn updateRecoverBanner(self: *EditorView) void {
-        if (self.widgets_dead) return;
-        if (self.recovery.len == 0) {
-            c.gtk_widget_set_visible(self.recover_box, 0);
-            return;
-        }
-        var names: [180]u8 = undefined;
-        var n: usize = 0;
-        for (self.recovery, 0..) |e, i| {
-            const name = recoveryName(e.header.spec);
-            const sep: []const u8 = if (i == 0) "" else ", ";
-            if (n + sep.len + name.len + 4 > names.len) {
-                const more = std.fmt.bufPrint(names[n..], ", ...", .{}) catch break;
-                n += more.len;
-                break;
-            }
-            @memcpy(names[n .. n + sep.len], sep);
-            n += sep.len;
-            @memcpy(names[n .. n + name.len], name);
-            n += name.len;
-        }
-        var buf: [320:0]u8 = undefined;
-        const text = std.fmt.bufPrintZ(
-            &buf,
-            "{d} unsaved buffer(s) from a previous session ({s}), last changed {s}: {s}",
-            .{
-                self.recovery.len,
-                if (self.recovery.len == 1) "one editor" else "earlier editors",
-                agoText(self.recovery[0].header.updated_ms),
-                names[0..n],
-            },
-        ) catch "Unsaved buffers from a previous session are recoverable.";
-        c.gtk_label_set_text(self.recover_label, text.ptr);
-        c.gtk_widget_set_visible(self.recover_box, 1);
-    }
-
-    fn recoveryName(spec: []const u8) []const u8 {
-        if (spec.len == 0) return "Untitled";
-        const loc = paths.parseSpec(spec);
-        const base = std.fs.path.basename(loc.path);
-        return if (base.len == 0) spec else base;
-    }
-
-    /// "4 minutes ago" for the banner. Wall clock, because that is what
-    /// the record carries and what the user recognises.
-    fn agoText(updated_ms: i64) []const u8 {
-        const now: i64 = clock.wallMs();
-        const delta = @max(0, now - updated_ms);
-        const mins = @divTrunc(delta, 60_000);
-        if (mins < 1) return "moments ago";
-        if (mins < 60) return "in the last hour";
-        const hours = @divTrunc(mins, 60);
-        if (hours < 24) return "earlier today";
-        return "over a day ago";
-    }
-
-    fn onRecoverClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-        const self = cast.userData(EditorView, user);
-        const entries = self.recovery;
-        self.recovery = &.{};
-        defer journal.freeEntries(self.allocator, entries);
-        var opened: usize = 0;
-        for (entries) |e| {
-            if (self.recoverOne(e)) {
-                opened += 1;
-                // Its content now lives in a tab with its own fresh slot.
-                journal.remove(self.allocator, e.key) catch {};
-            }
-            // A record we FAILED to open stays on disk: the failure may
-            // be a transient one (fd exhaustion, a permission blip) and
-            // deleting it would throw the work away for good. `prune`
-            // ages genuinely abandoned records out.
-        }
-        self.updateRecoverBanner();
-        var buf: [80:0]u8 = undefined;
-        const msg = std.fmt.bufPrintZ(&buf, "Recovered {d} unsaved buffer(s).", .{opened}) catch "Recovered.";
-        self.setStatus(msg.ptr);
-        // Show whether each file moved on since the crash, rather than
-        // writing anything back: the ordinary probe compares the
-        // recovered baseline and raises the ordinary banner.
-        self.last_probe_ms = 0;
-        self.checkDisk();
-    }
-
-    /// Build one tab from a record: the snapshot's bytes, its caret,
-    /// its line-ending style, still DIRTY, and the disk identity it was
-    /// taken against as the buffer's baseline.
-    fn recoverOne(self: *EditorView, entry: journal.Entry) bool {
-        var rec = journal.read(self.allocator, entry.key) catch return false;
-        defer rec.deinit(self.allocator);
-
-        // Restore-vs-recover: the layout decides WHICH files are open,
-        // the journal decides their CONTENT. A tab already holding this
-        // spec is ADOPTED (its in-flight load orphaned) rather than
-        // duplicated, so the two can never produce two tabs for one
-        // file whichever order they run in — and the unsaved bytes win
-        // over the on-disk copy.
-        const existing = if (rec.header.spec.len > 0) self.tabForSpec(rec.header.spec) else null;
-        const tab = existing orelse self.newTab(null) orelse return false;
-        if (existing != null) tab.io_gen = 0;
-        if (existing == null and rec.header.spec.len > 0) {
-            if (self.allocator.dupe(u8, rec.header.spec)) |s| {
-                if (tab.spec) |old| self.allocator.free(old);
-                tab.spec = s;
-            } else |_| {}
-        }
-        // The snapshot is in-memory text and the header already carries
-        // its style: sniffing it again would classify an LF buffer that
-        // holds pasted CRLF lines as CRLF and strip every one of those
-        // CRs out of the work being recovered.
-        const new_doc = Document.initVerbatim(
-            self.allocator,
-            rec.content,
-            if (rec.header.crlf) .crlf else .lf,
-        ) catch return false;
-        tab.doc.deinit();
-        tab.doc = new_doc;
-        tab.doc.markUnsaved();
-        tab.doc.addObserver(.{ .ctx = tab, .before_apply = ETab.observeEdits });
-        tab.doc.addObserver(self.a11y_src.editObserver());
-        self.ensureHighlighter(tab);
-        if (self.lsp) |m| m.onDocumentReplaced(tab, 0) else self.attachLsp(tab);
-        tab.layout.invalidateAll();
-        tab.rows_lines = 0;
-        tab.anchor = .{};
-        self.applyWrapWidth(tab);
-        tab.disk = rec.header.baseline();
-        tab.seen = tab.disk;
-        // The recovered bytes are NOT what is on disk, so the saved
-        // hash must stay unknown or journalTick would drop the record.
-        tab.saved_hash_valid = false;
-        const caret = @min(@as(usize, @intCast(rec.header.cursor)), tab.doc.rope.len());
-        tab.sels.keepPrimaryOnly();
-        tab.sels.sels.items[0] = Selection.caret(caret);
-        self.refresh(tab);
-        self.ensureCaretVisible(tab);
-        // Immediately re-journal: a recovered buffer that is never
-        // touched must survive a SECOND crash.
-        _ = self.journalTick(tab);
-        self.armJournal();
-        return true;
-    }
-
-    fn onRecoverLaterClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-        const self = cast.userData(EditorView, user);
-        // Only the offer goes away. The records stay on disk and are
-        // offered again next launch — declining must never destroy work.
-        self.dropRecovery();
-        self.updateRecoverBanner();
-    }
-
-    fn onRecoverDiscardClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-        const self = cast.userData(EditorView, user);
-        if (self.recovery.len == 0) return;
-        var body: [160:0]u8 = undefined;
-        const b = std.fmt.bufPrintZ(
-            &body,
-            "{d} unsaved buffer(s) from a previous session will be deleted. This cannot be undone.",
-            .{self.recovery.len},
-        ) catch "These unsaved buffers will be deleted.";
-        const ctx = std.heap.c_allocator.create(DlgCtx) catch return;
-        self.fence.ref();
-        ctx.* = .{ .fence = self.fence, .tab_id = 0 };
-        if (confirm.present(self.dialogParent(), .{
-            .heading = "Discard recovered work?",
-            .body = b.ptr,
-            .responses = &.{
-                .{ .id = "cancel", .label = "Cancel", .is_default = true, .is_close = true },
-                .{ .id = "discard", .label = "Discard", .appearance = .destructive },
-            },
-        }, .{ .allocator = self.allocator, .cb = &onRecoverDiscardResponse, .ctx = @ptrCast(ctx) }) == null) ctx.destroy();
-    }
-
-    fn onRecoverDiscardResponse(user: ?*anyopaque, resp: []const u8) void {
-        const ctx: *DlgCtx = @ptrCast(@alignCast(user.?));
-        defer ctx.destroy();
-        // tab_id 0 never resolves to a tab, so this one uses the fence
-        // directly: the records are the view's, not a tab's.
-        const view = ctx.fence.viewIfAlive() orelse return;
-        if (!std.mem.eql(u8, resp, "discard")) return;
-        for (view.recovery) |e| journal.remove(view.allocator, e.key) catch {};
-        view.dropRecovery();
-        view.updateRecoverBanner();
-        view.setStatus("Discarded the recovered snapshots.");
-    }
-
     // ---- Save As / Open pickers ---------------------------------------
 
     pub fn saveTabAs(self: *EditorView, tab: *ETab) void {
@@ -5261,12 +3699,12 @@ pub const EditorView = struct {
         r.tab.spec = owned;
         r.tab.disk = .{};
         r.tab.seen = .{};
-        r.view.clearAlert(r.tab);
+        editorio.clearAlert(r.view, r.tab);
         // "Save As untitled.zig" is the moment the language becomes
         // knowable for a buffer that never had a filename.
         r.view.ensureHighlighter(r.tab);
         r.view.refresh(r.tab);
-        r.view.startSave(r.tab, null);
+        editorio.startSave(r.view, r.tab, null);
     }
 
     const OpenCtx = struct {
@@ -5521,180 +3959,20 @@ pub const EditorView = struct {
         const ctrl = (mods & c.GDK_CONTROL_MASK) != 0;
         const shift = (mods & c.GDK_SHIFT_MASK) != 0;
         const alt = (mods & c.GDK_ALT_MASK) != 0;
-        const lower = c.gdk_keyval_to_lower(keyval);
 
         // An open LSP popup owns the navigation keys first: Up/Down
         // move its selection, Enter/Tab accept, Escape dismisses.
         if (self.lsp) |m| {
             if (m.handleKey(keyval, ctrl)) return 1;
         }
-        // Ctrl+Shift+O is the outline PANEL. It used to raise a
-        // transient document-symbol popup; the panel is the same data
-        // in a form you can keep open (and it falls back to the syntax
-        // tree where no server answers), so it takes the chord and the
-        // popup path now only serves workspace symbols (Ctrl+T).
-        if (ctrl and shift and !alt and lower == c.GDK_KEY_o) {
-            editoroutline.toggle(self);
-            return 1;
-        }
-        if (self.handleLspKey(keyval, lower, ctrl, shift, alt)) return 1;
-
-        // Editor-command bindings (editor/commands.zig): defaults
-        // overlaid with `editor_keybind.*`, resolved in syncConfig. A
-        // user override deliberately wins over the hardcoded chords
-        // below.
         if (self.active) |tab| {
-            if (self.matchEdBinding(keyval, lower, mods)) |cmd| {
+            // Every chord is a command (editor/commands.zig): defaults
+            // overlaid with `editor_keybind.*`, resolved in syncConfig.
+            if (self.keys.match(keyval, c.gdk_keyval_to_lower(keyval), mods)) |cmd| {
                 self.runCommand(tab, cmd);
                 return 1;
             }
-        }
-
-        if (!alt) {
-            if (self.active) |tab| {
-                if (self.handleEditKey(tab, keyval, ctrl, shift)) return 1;
-                if (ctrl and !shift) {
-                    switch (lower) {
-                        c.GDK_KEY_a => {
-                            vm.selectAll(&tab.doc, &tab.sels);
-                            self.refresh(tab);
-                            return 1;
-                        },
-                        c.GDK_KEY_c => {
-                            self.copySelection(tab);
-                            return 1;
-                        },
-                        c.GDK_KEY_x => {
-                            self.cutSelection(tab);
-                            return 1;
-                        },
-                        c.GDK_KEY_v => {
-                            self.pasteClipboard();
-                            return 1;
-                        },
-                        c.GDK_KEY_z => {
-                            vm.undo(self.allocator, &tab.doc, &tab.sels) catch {};
-                            self.afterDocEdit(tab);
-                            return 1;
-                        },
-                        c.GDK_KEY_y => {
-                            vm.redo(self.allocator, &tab.doc, &tab.sels) catch {};
-                            self.afterDocEdit(tab);
-                            return 1;
-                        },
-                        c.GDK_KEY_f => {
-                            self.openFind(false);
-                            return 1;
-                        },
-                        c.GDK_KEY_h => {
-                            self.openFind(true);
-                            return 1;
-                        },
-                        c.GDK_KEY_s => {
-                            self.saveTab(tab);
-                            return 1;
-                        },
-                        c.GDK_KEY_o => {
-                            self.openPicker();
-                            return 1;
-                        },
-                        c.GDK_KEY_w => {
-                            self.requestCloseTab(tab);
-                            return 1;
-                        },
-                        // Go to matching bracket. Ctrl+M is free here
-                        // (the global Ctrl+SHIFT+M is zoom_pane and is
-                        // NOT shadowed).
-                        c.GDK_KEY_m => {
-                            self.gotoMatchingBracket(tab, false);
-                            return 1;
-                        },
-                        else => {},
-                    }
-                }
-                if (ctrl and shift) {
-                    switch (lower) {
-                        // Fold / unfold at the caret — VS Code's
-                        // Ctrl+Shift+[ and Ctrl+Shift+]. GDK reports
-                        // the SHIFTED keyvals, so both spellings are
-                        // matched.
-                        c.GDK_KEY_bracketleft, c.GDK_KEY_braceleft => {
-                            self.foldAtCaret(tab);
-                            return 1;
-                        },
-                        c.GDK_KEY_bracketright, c.GDK_KEY_braceright => {
-                            self.unfoldAtCaret(tab);
-                            return 1;
-                        },
-                        c.GDK_KEY_m => {
-                            // Extend the selection to the match.
-                            self.gotoMatchingBracket(tab, true);
-                            return 1;
-                        },
-                        c.GDK_KEY_z => {
-                            vm.redo(self.allocator, &tab.doc, &tab.sels) catch {};
-                            self.afterDocEdit(tab);
-                            return 1;
-                        },
-                        c.GDK_KEY_s => {
-                            self.saveTabAs(tab);
-                            return 1;
-                        },
-                        // Project-wide search / replace. Shadows the
-                        // global bindings while the editor has focus,
-                        // exactly like Ctrl+Shift+S above.
-                        c.GDK_KEY_f => {
-                            editorproj.openSearch(self, false);
-                            return 1;
-                        },
-                        c.GDK_KEY_h => {
-                            editorproj.openSearch(self, true);
-                            return 1;
-                        },
-                        else => {},
-                    }
-                }
-            }
-            // Change-hunk navigation, next to F8's diagnostics.
-            if (keyval == c.GDK_KEY_F7 and !ctrl) {
-                editorproj.stepHunk(self, !shift);
-                return 1;
-            }
-        } else if (self.active) |tab| {
-            // Alt+Z: soft wrap toggle (the VS Code chord).
-            if (lower == c.GDK_KEY_z and !ctrl and !shift) {
-                self.toggleWrap(tab);
-                return 1;
-            }
-            // Shift+Alt+Right / Left: expand / shrink the selection to
-            // the enclosing syntax node (VS Code's chord).
-            if (shift and !ctrl) {
-                switch (keyval) {
-                    c.GDK_KEY_Right, c.GDK_KEY_KP_Right => {
-                        self.expandSelection(tab);
-                        return 1;
-                    },
-                    c.GDK_KEY_Left, c.GDK_KEY_KP_Left => {
-                        self.shrinkSelection(tab);
-                        return 1;
-                    },
-                    else => {},
-                }
-            }
-            // Ctrl+Alt+[ / ]: fold all / unfold all.
-            if (ctrl and !shift) {
-                switch (lower) {
-                    c.GDK_KEY_bracketleft, c.GDK_KEY_braceleft => {
-                        self.foldAll(tab);
-                        return 1;
-                    },
-                    c.GDK_KEY_bracketright, c.GDK_KEY_braceright => {
-                        self.unfoldAll(tab);
-                        return 1;
-                    },
-                    else => {},
-                }
-            }
+            if (!alt and self.handleEditKey(tab, keyval, ctrl, shift)) return 1;
         }
 
         // Unclaimed chords fall back to the pane's binding table so
@@ -5705,69 +3983,20 @@ pub const EditorView = struct {
         return 0;
     }
 
-    /// Language-server chords. Deliberately the VS Code set, so muscle
-    /// memory carries over:
-    ///
-    ///   Ctrl+Space          completion
-    ///   Ctrl+I              hover (also shows the diagnostic at the caret)
-    ///   F12 / Shift+F12     definition / references
-    ///   Ctrl+F12            type definition
-    ///   Ctrl+Shift+F12      declaration
-    ///   F8 / Shift+F8       next / previous diagnostic
-    ///   Ctrl+Shift+O        document symbols
-    ///   Ctrl+T              workspace symbols
-    ///   F2                  rename
-    ///   Ctrl+Shift+I        format (the selection, when there is one)
-    ///
-    /// A chord whose feature has no server behind it reports on the
-    /// status line and is still CONSUMED: falling through to the pane's
-    /// binding table would make F12 do something unrelated depending on
-    /// whether zls happens to be installed.
-    fn handleLspKey(self: *EditorView, keyval: c_uint, lower: c_uint, ctrl: bool, shift: bool, alt: bool) bool {
-        if (alt) return false;
-        if (self.active == null) return false;
+    /// The language-server commands. A command whose feature has no
+    /// server behind it reports on the status line and is still
+    /// CONSUMED: falling through to the pane's binding table would make
+    /// F12 do something unrelated depending on whether zls happens to
+    /// be installed.
+    fn runLspCommand(self: *EditorView, cmd: ecmd.Command) void {
         const conf: *const Config = if (self.ownerWindow()) |win|
             &win.config
         else
-            self.standalone_config orelse return false;
-        if (!conf.editor_lsp) return false;
-
-        const want: ?enum {
-            completion,
-            hover,
-            definition,
-            declaration,
-            type_definition,
-            references,
-            workspace_symbols,
-            rename,
-            format,
-            diag_next,
-            diag_prev,
-            signature,
-            code_action,
-        } = blk: {
-            if (ctrl and shift and keyval == c.GDK_KEY_space) break :blk .signature;
-            if (ctrl and !shift and keyval == c.GDK_KEY_space) break :blk .completion;
-            // Ctrl+. — VS Code's Quick Fix. `period` and `KP_Decimal`
-            // are different keyvals and both reach here.
-            if (ctrl and (keyval == c.GDK_KEY_period or keyval == c.GDK_KEY_KP_Decimal))
-                break :blk .code_action;
-            if (ctrl and !shift and lower == c.GDK_KEY_i) break :blk .hover;
-            if (ctrl and shift and lower == c.GDK_KEY_i) break :blk .format;
-            if (ctrl and !shift and lower == c.GDK_KEY_t) break :blk .workspace_symbols;
-            if (keyval == c.GDK_KEY_F2 and !ctrl and !shift) break :blk .rename;
-            if (keyval == c.GDK_KEY_F8) break :blk if (shift) .diag_prev else .diag_next;
-            if (keyval == c.GDK_KEY_F12) {
-                if (ctrl and shift) break :blk .declaration;
-                if (ctrl) break :blk .type_definition;
-                if (shift) break :blk .references;
-                break :blk .definition;
-            }
-            break :blk null;
-        };
-        const action = want orelse return false;
-
+            self.standalone_config orelse return;
+        if (!conf.editor_lsp) {
+            self.setStatus("Language servers are switched off (editor_lsp = false).");
+            return;
+        }
         if (self.lsp == null) {
             // Nothing has ever claimed a document here; create the
             // manager so the "no language server" report is honest
@@ -5776,24 +4005,24 @@ pub const EditorView = struct {
         }
         const m = self.lsp orelse {
             self.setStatus("No language server for this file.");
-            return true;
+            return;
         };
-        switch (action) {
-            .completion => m.requestCompletion(true),
-            .hover => m.requestHover(),
-            .definition => m.requestDefinition(.definition),
-            .declaration => m.requestDefinition(.declaration),
-            .type_definition => m.requestDefinition(.type_definition),
-            .references => m.requestDefinition(.references),
+        switch (cmd) {
+            .trigger_completion => m.requestCompletion(true),
+            .signature_help => m.requestSignatureHelp(true, 1, 0),
+            .show_hover => m.requestHover(),
+            .code_actions => m.requestCodeActions(),
+            .format_document => m.requestFormatting(),
+            .rename_symbol => m.startRename(),
+            .goto_definition => m.requestDefinition(.definition),
+            .goto_declaration => m.requestDefinition(.declaration),
+            .goto_type_definition => m.requestDefinition(.type_definition),
+            .find_references => m.requestDefinition(.references),
             .workspace_symbols => m.requestWorkspaceSymbols(),
-            .rename => m.startRename(),
-            .format => m.requestFormatting(),
-            .diag_next => m.stepDiagnostic(true),
-            .diag_prev => m.stepDiagnostic(false),
-            .signature => m.requestSignatureHelp(true, 1, 0),
-            .code_action => m.requestCodeActions(),
+            .next_diagnostic => m.stepDiagnostic(true),
+            .prev_diagnostic => m.stepDiagnostic(false),
+            else => unreachable,
         }
-        return true;
     }
 
     /// Movement + structural edit keys. @return true when consumed.
@@ -5909,7 +4138,7 @@ pub const EditorView = struct {
             },
             c.GDK_KEY_Escape => {
                 if (self.find_open) {
-                    self.closeFind();
+                    editorfind.close(self);
                     return true;
                 }
                 // A posted status message is dismissible: Escape is
@@ -5941,45 +4170,10 @@ pub const EditorView = struct {
 
     // ---- editor commands (editor/commands.zig) ------------------------
 
-    pub const EdBinding = struct {
-        keyval: c_uint,
-        mods: c_uint,
-        cmd: ecmd.Command,
-    };
-
-    /// Resolve the editor-command binding table: each command's default
-    /// accelerator, overridden (or unbound, empty accel) by
-    /// `editor_keybind.<command>` config entries. A separate table from
-    /// the window/pane bindings on purpose: these chords exist only
-    /// while the editor canvas has focus and can never eat a terminal
-    /// key.
-    fn rebuildEdBindings(self: *EditorView, cfg: *const Config) void {
-        self.ed_bindings.clearRetainingCapacity();
-        inline for (@typeInfo(ecmd.Command).@"enum".fields) |f| {
-            const cmd: ecmd.Command = @enumFromInt(f.value);
-            var accel: []const u8 = ecmd.defaultAccel(cmd);
-            for (cfg.editor_keybinds.items) |kb| {
-                if (std.mem.eql(u8, kb.name, f.name)) accel = kb.accel;
-            }
-            if (accel.len > 0) {
-                if (input.parseAccel(accel)) |p| {
-                    self.ed_bindings.append(self.allocator, .{
-                        .keyval = p.keyval,
-                        .mods = p.mods & input.SIGNIFICANT_MODS,
-                        .cmd = cmd,
-                    }) catch return;
-                } else {
-                    std.debug.print("sketerm: editor_keybind: bad accelerator '{s}' for '{s}'\n", .{ accel, f.name });
-                }
-            }
-        }
-    }
-
-    fn matchEdBinding(self: *EditorView, keyval: c_uint, lower: c_uint, mods: c_uint) ?ecmd.Command {
-        for (self.ed_bindings.items) |b| {
-            if ((b.keyval == lower or b.keyval == keyval) and b.mods == mods) return b.cmd;
-        }
-        return null;
+    /// The command a key event is bound to, if any (the find bar asks
+    /// too, so its chords follow the same table).
+    pub fn matchEdBinding(self: *EditorView, keyval: c_uint, lower: c_uint, mods: c_uint) ?ecmd.Command {
+        return self.keys.match(keyval, lower, mods);
     }
 
     /// Dispatch one editor command (keybinding, palette or context
@@ -6076,8 +4270,80 @@ pub const EditorView = struct {
                 ecmd.splitSelectionIntoLines(a, &tab.doc, &tab.sels) catch return;
                 self.afterMove(tab);
             },
+            .select_all => {
+                vm.selectAll(&tab.doc, &tab.sels);
+                self.refresh(tab);
+            },
+            .expand_selection => self.expandSelection(tab),
+            .shrink_selection => self.shrinkSelection(tab),
+            .goto_matching_bracket => self.gotoMatchingBracket(tab, false),
+            .select_to_matching_bracket => self.gotoMatchingBracket(tab, true),
+            .copy => self.copySelection(tab),
+            .cut => self.cutSelection(tab),
+            .paste => self.pasteClipboard(),
+            .undo => {
+                vm.undo(a, &tab.doc, &tab.sels) catch {};
+                self.afterDocEdit(tab);
+            },
+            .redo => {
+                vm.redo(a, &tab.doc, &tab.sels) catch {};
+                self.afterDocEdit(tab);
+            },
+            .find => editorfind.open(self, false),
+            .replace => editorfind.open(self, true),
+            .project_search => editorproj.openSearch(self, false),
+            .project_replace => editorproj.openSearch(self, true),
+            .save => self.saveTab(tab),
+            .save_as => self.saveTabAs(tab),
+            .save_all => self.saveAll(),
+            .open_file => self.openPicker(),
+            .close_tab => self.requestCloseTab(tab),
+            .fold => self.foldAtCaret(tab),
+            .unfold => self.unfoldAtCaret(tab),
+            .fold_all => self.foldAll(tab),
+            .unfold_all => self.unfoldAll(tab),
+            .toggle_wrap => self.toggleWrap(tab),
+            .toggle_outline => editoroutline.toggle(self),
+            .next_hunk => editorproj.stepHunk(self, true),
+            .prev_hunk => editorproj.stepHunk(self, false),
+            .trigger_completion,
+            .signature_help,
+            .show_hover,
+            .code_actions,
+            .format_document,
+            .rename_symbol,
+            .goto_definition,
+            .goto_declaration,
+            .goto_type_definition,
+            .find_references,
+            .workspace_symbols,
+            .next_diagnostic,
+            .prev_diagnostic,
+            => self.runLspCommand(cmd),
             .indent_use_tabs, .indent_use_spaces, .indent_width_2, .indent_width_4, .indent_width_8, .indent_auto => editorlang.runIndentCommand(self, tab, cmd),
         }
+    }
+
+    /// Save every modified document that has a file; an Untitled one
+    /// needs a name first and is only counted.
+    pub fn saveAll(self: *EditorView) void {
+        var saved: usize = 0;
+        var untitled: usize = 0;
+        for (self.tabs.items) |t| {
+            if (!t.isDirty()) continue;
+            if (t.spec == null) {
+                untitled += 1;
+                continue;
+            }
+            self.saveTab(t);
+            saved += 1;
+        }
+        var buf: [96:0]u8 = undefined;
+        const msg = if (untitled > 0)
+            std.fmt.bufPrintZ(&buf, "Saving {d} document(s); {d} untitled need Save As.", .{ saved, untitled }) catch "Saving."
+        else
+            std.fmt.bufPrintZ(&buf, "Saving {d} document(s).", .{saved}) catch "Saving.";
+        self.setStatus(msg.ptr);
     }
 
     /// Syntax gate for quote auto-close: an offset whose token is a
@@ -6223,53 +4489,12 @@ pub const EditorView = struct {
         }
     }
 
-    /// Context-menu dispatch. Rows that reduce to an editor command go
-    /// through `runCommand` (same code path as the keybindings).
-    pub fn menuAction(self: *EditorView, act: editormenu.Action) void {
+    /// Menu dispatch (canvas and status line): every row is a command,
+    /// run through the same path as its keybinding.
+    pub fn menuAction(self: *EditorView, cmd: ecmd.Command) void {
         if (self.widgets_dead) return;
         const tab = self.active orelse return;
-        switch (act) {
-            .cut => self.cutSelection(tab),
-            .copy => self.copySelection(tab),
-            .paste => self.pasteClipboard(),
-            .select_all => {
-                vm.selectAll(&tab.doc, &tab.sels);
-                self.refresh(tab);
-            },
-            .toggle_comment => self.runCommand(tab, .toggle_comment),
-            .duplicate => self.runCommand(tab, .duplicate_line_down),
-            .move_up => self.runCommand(tab, .move_line_up),
-            .move_down => self.runCommand(tab, .move_line_down),
-            .join => self.runCommand(tab, .join_lines),
-            .sort => self.runCommand(tab, .sort_lines),
-            .indent => self.runCommand(tab, .indent),
-            .dedent => self.runCommand(tab, .dedent),
-            .trim_ws => self.runCommand(tab, .trim_trailing_ws),
-            .case_upper => self.runCommand(tab, .upper_case),
-            .case_lower => self.runCommand(tab, .lower_case),
-            .case_title => self.runCommand(tab, .title_case),
-            .goto_def, .references, .rename, .format, .code_actions => {
-                const m = self.lsp orelse {
-                    self.setStatus("No language server for this file.");
-                    return;
-                };
-                switch (act) {
-                    .goto_def => m.requestDefinition(.definition),
-                    .references => m.requestDefinition(.references),
-                    .rename => m.startRename(),
-                    .format => m.requestFormatting(),
-                    .code_actions => m.requestCodeActions(),
-                    else => unreachable,
-                }
-            },
-            .fold => self.foldAtCaret(tab),
-            .unfold => self.unfoldAtCaret(tab),
-            .fold_all => self.foldAll(tab),
-            .unfold_all => self.unfoldAll(tab),
-            .find => self.openFind(false),
-            .replace => self.openFind(true),
-            .goto_line => self.promptGotoLine(),
-        }
+        self.runCommand(tab, cmd);
     }
 
     // ---- gutter and status-line menus ----------------------------------
@@ -6332,11 +4557,12 @@ pub const EditorView = struct {
     pub fn gutterAction(self: *EditorView, act: editormenu.GutterAction, line: usize) void {
         if (self.widgets_dead) return;
         const tab = self.active orelse return;
-        switch (act) {
+        const verb = switch (act) {
+            .command => |cmd| return self.runCommand(tab, cmd),
+            .line => |v| v,
+        };
+        switch (verb) {
             .toggle_fold => self.toggleFoldLine(tab, line),
-            .fold_all => self.foldAll(tab),
-            .unfold_all => self.unfoldAll(tab),
-            .goto_line => self.promptGotoLine(),
             .copy_line_number => {
                 var buf: [24:0]u8 = undefined;
                 const z = std.fmt.bufPrintZ(&buf, "{d}", .{line + 1}) catch return;
@@ -6352,8 +4578,6 @@ pub const EditorView = struct {
                 tab.goal_x = null;
                 self.afterMove(tab);
             },
-            .next_hunk => editorproj.stepHunk(self, true),
-            .prev_hunk => editorproj.stepHunk(self, false),
         }
     }
 
@@ -6374,22 +4598,6 @@ pub const EditorView = struct {
             .has_hunks = self.git_gutter and !tab.git.isEmpty(),
             .lsp = tab.lsp != null and self.lsp != null,
         };
-    }
-
-    /// Status-line menu dispatch. Every row here acts on something the
-    /// status line itself reports — there is deliberately nothing else
-    /// on it.
-    pub fn statusAction(self: *EditorView, act: editormenu.StatusAction) void {
-        if (self.widgets_dead) return;
-        const tab = self.active orelse return;
-        switch (act) {
-            .toggle_wrap => self.toggleWrap(tab),
-            .goto_line => self.promptGotoLine(),
-            .next_hunk => editorproj.stepHunk(self, true),
-            .prev_hunk => editorproj.stepHunk(self, false),
-            .next_diag => if (self.lsp) |m| m.stepDiagnostic(true),
-            .prev_diag => if (self.lsp) |m| m.stepDiagnostic(false),
-        }
     }
 
     // ---- mouse --------------------------------------------------------

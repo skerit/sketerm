@@ -440,11 +440,11 @@ pub const EditorWindow = struct {
     }
 
     fn onFind(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
-        cast.userData(EditorWindow, user).view.openFind(false);
+        @import("editorfind.zig").open(cast.userData(EditorWindow, user).view, false);
     }
 
     fn onReplace(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
-        cast.userData(EditorWindow, user).view.openFind(true);
+        @import("editorfind.zig").open(cast.userData(EditorWindow, user).view, true);
     }
 
     fn onWrap(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
