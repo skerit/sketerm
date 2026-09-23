@@ -18,6 +18,13 @@ if [ -n "${INSTALL_TEST_PKG_CONFIG_LOG:-}" ]; then
     printf ' <%s>' "$@" >> "$INSTALL_TEST_PKG_CONFIG_LOG"
     printf '\n' >> "$INSTALL_TEST_PKG_CONFIG_LOG"
 fi
+for missing in ${INSTALL_TEST_PKG_CONFIG_MISSING:-}; do
+    # A module this "release" never ships, whatever --deps installed.
+    if [ "${1:-}" = --modversion ] && [ "${2:-}" = "$missing" ]; then
+        printf 'missing development package\n' >&2
+        exit 88
+    fi
+done
 if [ "${INSTALL_TEST_PKG_CONFIG_FAIL:-0}" -eq 1 ] \
         && [ ! -e "${INSTALL_TEST_DEPS_READY:-/no/such/file}" ]; then
     printf 'missing development package\n' >&2
@@ -208,6 +215,10 @@ EOF
 
 cat > "$fakebin/dpkg-query" <<'EOF'
 #!/usr/bin/env bash
+for never in ${INSTALL_TEST_DPKG_NEVER_INSTALLED:-}; do
+    # A package no apt call of this run can install (optional deps).
+    [ "${3:-}" = "$never" ] && exit 1
+done
 if [ "${INSTALL_TEST_DEPS_MISSING:-0}" -eq 1 ] \
         && [ ! -e "${INSTALL_TEST_DEPS_READY:-/no/such/file}" ]; then
     exit 1
@@ -300,6 +311,15 @@ printf '<apt>' >> "$INSTALL_TEST_APT_LOG"
 printf ' <%s>' "$@" >> "$INSTALL_TEST_APT_LOG"
 printf '\n' >> "$INSTALL_TEST_APT_LOG"
 if [ "${1:-}" = install ]; then
+    for arg in "$@"; do
+        # The release has no such package: apt fails the whole call, as
+        # it would for one unknown name inside a required list.
+        if [ -n "${INSTALL_TEST_APT_UNAVAILABLE:-}" ] \
+                && [ "$arg" = "$INSTALL_TEST_APT_UNAVAILABLE" ]; then
+            printf 'E: Unable to locate package %s\n' "$arg" >&2
+            exit 100
+        fi
+    done
     : > "$INSTALL_TEST_DEPS_READY"
 fi
 EOF
@@ -432,6 +452,7 @@ BASH_ENV="$work/no-makepkg.bash" \
     CEF_LIB="$cef_lib" \
     INSTALL_TEST_PKG_CONFIG_FAIL=1 \
     INSTALL_TEST_DEPS_MISSING=1 \
+    INSTALL_TEST_DPKG_NEVER_INSTALLED=libgtk4-layer-shell-dev \
     INSTALL_TEST_DEPS_READY="$INSTALL_TEST_DEPS_READY" \
     INSTALL_TEST_APT_LOG="$INSTALL_TEST_APT_LOG" \
     INSTALL_TEST_ALLOW_SUDO=1 \
@@ -445,6 +466,15 @@ BASH_ENV="$work/no-makepkg.bash" \
 
 [ -f "$(<"$INSTALL_TEST_DEB_LOG")" ] \
     || fail "non-Arch --no-install did not build a package"
+# gtk4-layer-shell is absent from Ubuntu 24.04, so it must never sit in the
+# required apt list (one unknown name fails that whole call) and gets an
+# apt call of its own instead.
+[[ "$(<"$INSTALL_TEST_APT_LOG")" == *"<apt> <install> <-y> <libgtk4-layer-shell-dev>"* ]] \
+    || fail "--gui-only --deps did not install the optional gtk4-layer-shell dev package in its own apt call"
+! grep -q '<libpulse-dev> <libgtk4-layer-shell-dev>' "$INSTALL_TEST_APT_LOG" \
+    || fail "libgtk4-layer-shell-dev was put in the required apt list"
+grep -q '^<call> <build> <-Doptimize=ReleaseFast>$' "$INSTALL_TEST_ZIG_LOG" \
+    || fail "a host with gtk4-layer-shell was built with the layer-shell fallback flag"
 [ ! -e "$INSTALL_TEST_FORBIDDEN" ] \
     || fail "non-Arch --no-install attempted a privileged install"
 [[ "$(<"$INSTALL_TEST_ZIG_LOG")" == *"<call> <build> <-Doptimize=ReleaseFast>"* ]] \
@@ -487,6 +517,51 @@ BASH_ENV="$work/no-makepkg.bash" \
     > "$work/debian-auto.out" 2>&1
 [[ "$(<"$INSTALL_TEST_ZIG_LOG")" == *"<call> <build> <-Doptimize=ReleaseFast>"* ]] \
     || fail "auto --deps stayed locked to a mux-only build"
+
+# Ubuntu 24.04: no libgtk4-layer-shell-dev in the archive at all. The
+# optional apt call fails, the installer says so and goes on, and the GUI
+# is built with -Dlayer-shell=false (the quake fallback) rather than not
+# at all.
+rm -f "$INSTALL_TEST_DEPS_READY"
+: > "$INSTALL_TEST_ZIG_LOG"
+: > "$INSTALL_TEST_APT_LOG"
+set +e
+BASH_ENV="$work/no-makepkg.bash" \
+    PATH="$fakebin:$PATH" \
+    SKETERM_TIC="$fakebin/tic" \
+    CEF_INCLUDE="$cef_include" \
+    CEF_LIB="$cef_lib" \
+    INSTALL_TEST_PKG_CONFIG_FAIL=1 \
+    INSTALL_TEST_PKG_CONFIG_MISSING=gtk4-layer-shell-0 \
+    INSTALL_TEST_DEPS_MISSING=1 \
+    INSTALL_TEST_DPKG_NEVER_INSTALLED=libgtk4-layer-shell-dev \
+    INSTALL_TEST_APT_UNAVAILABLE=libgtk4-layer-shell-dev \
+    INSTALL_TEST_DEPS_READY="$INSTALL_TEST_DEPS_READY" \
+    INSTALL_TEST_APT_LOG="$INSTALL_TEST_APT_LOG" \
+    INSTALL_TEST_ALLOW_SUDO=1 \
+    INSTALL_TEST_ZIG_LOG="$INSTALL_TEST_ZIG_LOG" \
+    INSTALL_TEST_DEB_LOG="$INSTALL_TEST_DEB_LOG" \
+    INSTALL_TEST_CONTROL_LOG="$INSTALL_TEST_CONTROL_LOG" \
+    INSTALL_TEST_REAL_DPKG_DEB="$real_dpkg_deb" \
+    INSTALL_TEST_FORBIDDEN="$INSTALL_TEST_FORBIDDEN" \
+    "$fixture/dist/install.sh" --gui-only --deps --no-install \
+    > "$work/debian-no-layer-shell.out" 2>&1
+status=$?
+set -e
+[ "$status" -eq 0 ] \
+    || fail "a release without libgtk4-layer-shell-dev failed the GUI install: $(<"$work/debian-no-layer-shell.out")"
+[[ "$(<"$INSTALL_TEST_APT_LOG")" == *"<apt> <install> <-y> <libgtk4-layer-shell-dev>"* ]] \
+    || fail "the optional gtk4-layer-shell package was not attempted"
+[[ "$(<"$work/debian-no-layer-shell.out")" == *"libgtk4-layer-shell-dev is not available on this release"* ]] \
+    || fail "an unavailable optional package was not reported"
+[[ "$(<"$work/debian-no-layer-shell.out")" == *"gtk4-layer-shell development files missing"* ]] \
+    || fail "building without gtk4-layer-shell was not reported"
+grep -q '^<call> <build> <-Doptimize=ReleaseFast> <-Dlayer-shell=false>$' "$INSTALL_TEST_ZIG_LOG" \
+    || fail "a host without gtk4-layer-shell was not built with -Dlayer-shell=false"
+[[ "$(<"$INSTALL_TEST_ZIG_LOG")" == *"<call> <build> <web> <-Doptimize=ReleaseFast>"* ]] \
+    || fail "the browser helper was skipped on a host without gtk4-layer-shell"
+[[ "$(<"$INSTALL_TEST_ZIG_LOG")" == *"<call> <build> <mux-portable> <-Doptimize=ReleaseFast>"* ]] \
+    || fail "the portable daemon was skipped on a host without gtk4-layer-shell"
 
 rm -f "$INSTALL_TEST_DEPS_READY" "$INSTALL_TEST_ZIG_LOG"
 : > "$INSTALL_TEST_APT_LOG"
@@ -878,11 +953,15 @@ BASH_ENV="$work/no-packager.bash" \
     [[ " ${depends[*]} " == *" gtk4>=4.14 "* ]] || fail "PKGBUILD lacks GTK minimum"
     [[ " ${depends[*]} " == *" libadwaita>=1.4 "* ]] || fail "PKGBUILD lacks libadwaita minimum"
     [[ " ${depends[*]} " == *" glib2>=2.74 "* ]] || fail "PKGBUILD lacks GLib minimum"
+    [[ " ${depends[*]} " == *" gtk4-layer-shell "* ]] || fail "PKGBUILD lacks gtk4-layer-shell (linked into the GUI for quake placement)"
     [[ " ${makedepends[*]} " == *" zig>=0.16.0 "* ]] || fail "PKGBUILD lacks Zig minimum"
     [[ " ${makedepends[*]} " == *" zig<0.17.0 "* ]] || fail "PKGBUILD lacks Zig upper bound"
     PATH="$fakebin:$PATH" build
     PATH="$fakebin:$PATH" package
 )
+
+grep -q '^<call> <build> <-Doptimize=ReleaseFast>$' "$work/package-zig.log" \
+    || fail "PKGBUILD build() did not build the GUI with gtk4-layer-shell (it is a hard dependency there)"
 
 [[ "$(<"$work/package-zig.log")" == *"<call> <build> <web> <-Doptimize=ReleaseFast> <-Dcef-include=/usr/include/cef> <-Dcef-lib=/usr/lib/cef>"* ]] \
     || fail "PKGBUILD build() did not build sketerm-webengine"

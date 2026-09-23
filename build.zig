@@ -53,6 +53,20 @@ pub fn build(b: *std.Build) void {
     // is. See `vendor/cimport_root.h` for the headers + workaround
     // defines. pkg-config resolution is attached to this TranslateC
     // step, not run here, so `zig build mux` never probes GUI packages.
+    //
+    // wlr-layer-shell placement for quake mode (ui/quake.zig) comes from
+    // gtk4-layer-shell, which is LINKED rather than dlopen'd: it works by
+    // interposing libwayland-client's `wl_proxy_*` symbols, so it only
+    // functions when it precedes libwayland-client in the DT_NEEDED
+    // order (`configureSysDeps` links it before the GTK roster for that
+    // reason); a dlopen after GTK has pulled libwayland in lands behind
+    // it in the symbol search scope and intercepts nothing. Linux only,
+    // on by default; `-Dlayer-shell=false` builds a GUI that keeps the
+    // xdg-toplevel fallback everywhere, for hosts without the package
+    // (Ubuntu 24.04 ships none). Compositor support is still probed at
+    // RUNTIME (`gtk_layer_is_supported`) -- linking is not a switch.
+    gui_layer_shell = target.result.os.tag == .linux and
+        (b.option(bool, "layer-shell", "Link gtk4-layer-shell for quake-mode edge/monitor placement (default on on Linux)") orelse true);
     const cbindings_mod = buildCBindings(b, target, optimize);
 
     // Lean translation of `vendor/cimport_core.h` for the GTK-free
@@ -1681,6 +1695,14 @@ fn buildCBindings(
     // shadows the system gdkversionmacros.h.
     tc.addIncludePath(b.path("vendor/aro_shims"));
     tc.linkSystemLibrary(gui_pkg, .{ .use_pkg_config = .force });
+    // The macro is what `vendor/cimport_root.h` keys the
+    // <gtk4-layer-shell.h> include on, so a `-Dlayer-shell=false` build
+    // has no `gtk_layer_*` decls at all and window.zig's `@hasDecl`
+    // gate compiles the layer path out.
+    if (gui_layer_shell) {
+        tc.defineCMacro("SKETERM_LAYER_SHELL", "1");
+        tc.linkSystemLibrary("gtk4-layer-shell-0", .{ .use_pkg_config = .force });
+    }
     tc.addIncludePath(b.path("vendor"));
 
     // Post-process: replace `_ = @ptrCast(@alignCast(<expr>));` with
@@ -2009,6 +2031,13 @@ fn configureSysDeps(
 ) void {
     mod.addImport("cbindings", cbindings_mod);
     mod.addIncludePath(b.path("vendor/aro_shims"));
+    // FIRST, before the GTK roster: gtk4-layer-shell interposes
+    // libwayland-client's wl_proxy_* and only wins when it precedes
+    // libwayland-client in DT_NEEDED order (upstream linking.md).
+    // `smoke-e2e`'s quake stage checks the loaded order of the shipped
+    // binary, so a reorder here fails a rig rather than a user.
+    if (mod.resolved_target.?.result.os.tag == .linux and gui_layer_shell)
+        addPkgConfig(b, mod, "gtk4-layer-shell-0");
     addPkgConfig(b, mod, gui_pkg);
     // Per-window WM_CLASS for remote app windows (wlapp.zig calls
     // XChangeProperty directly — GTK links X11 but doesn't re-export
@@ -2032,6 +2061,13 @@ fn configureSysDeps(
     addZstd(b, mod);
     mod.addIncludePath(b.path("vendor"));
 }
+
+/// Whether GUI targets link gtk4-layer-shell (`-Dlayer-shell`, Linux
+/// only). Written once by `build()` before the TranslateC step and any
+/// `configureSysDeps` call read it; file scope because the twenty GUI
+/// modules all go through `configureSysDeps` and the link ORDER inside
+/// it is the whole point (see there).
+var gui_layer_shell = false;
 
 /// Resolve a pkg-config package only when a reachable compile step needs it.
 fn addPkgConfig(b: *std.Build, mod: *std.Build.Module, pkg: []const u8) void {

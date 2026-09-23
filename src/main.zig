@@ -292,8 +292,12 @@ const HELP_TEXT =
     \\  --toggle              Show/hide the running instance (Quake mode).
     \\                        Bind your compositor's keyboard shortcut to
     \\                        `sketerm --toggle`. KWin: System Settings →
-    \\                        Shortcuts → Custom Shortcuts. Wayland note:
-    \\                        focus-stealing prevention may delay raise.
+    \\                        Shortcuts → Custom Shortcuts. With quake_enabled
+    \\                        on a wlr-layer-shell compositor (KWin, wlroots)
+    \\                        the window is a layer surface placed by
+    \\                        quake_edge/quake_monitor; elsewhere it is a
+    \\                        plain window, and focus-stealing prevention may
+    \\                        delay the raise.
     \\  --debug-events        Print each applied daemon event and snapshot
     \\                        swap to stderr
     \\  --debug-images        Print image upload + draw diagnostics to stderr

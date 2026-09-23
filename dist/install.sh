@@ -184,6 +184,17 @@ probe_web() {
     web_why=""
 }
 
+# Sets layer_ok. gtk4-layer-shell is optional at build time because Ubuntu
+# 24.04 has no libgtk4-layer-shell-dev at all: without it the GUI is built
+# with -Dlayer-shell=false and quake mode keeps its xdg-toplevel fallback
+# (sketerm_build warns), instead of the GUI being dropped.
+probe_layer_shell() {
+    layer_ok=0
+    if pkg-config --modversion gtk4-layer-shell-0 >/dev/null 2>&1; then
+        layer_ok=1
+    fi
+}
+
 # --------------------------------------------------------------- build deps
 
 DEB_BUILD_DEPS=(
@@ -199,6 +210,24 @@ DEB_BUILD_DEPS=(
 # build-time requirements even though the unused native link is dropped and
 # mux-portable deliberately does not link fribidi.
 DEB_BUILD_DEPS_MUX=(build-essential pkg-config ncurses-bin libfribidi-dev)
+# Optional GUI build inputs, each in its own apt call whose failure is a
+# warning: gtk4-layer-shell exists in Debian 13+ and Ubuntu 25.04+ but not
+# in Ubuntu 24.04, and one unknown name in the required list above would
+# fail the whole install there. probe_layer_shell decides what the build
+# then gets.
+DEB_BUILD_DEPS_OPTIONAL=(libgtk4-layer-shell-dev)
+
+install_deb_deps_optional() {
+    local -n list=$1
+    local p
+    for p in "${list[@]}"; do
+        dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q '^install ok installed$' \
+            && continue
+        say "installing optional build dependency: $p"
+        as_root apt-get install -y "$p" \
+            || warn "$p is not available on this release; building without it"
+    done
+}
 
 install_deb_deps() {
     local -n list=$1
@@ -224,7 +253,7 @@ install_deb_deps() {
 
 build_all() {
     check_zig
-    sketerm_build "$root" "$1" "$web_ok" "$CEF_INCLUDE" "$CEF_LIB" "$web_why" "$2"
+    sketerm_build "$root" "$1" "$web_ok" "$CEF_INCLUDE" "$CEF_LIB" "$web_why" "$2" "$layer_ok"
 }
 
 # The remote-deployment artifact has a fixed target list; everything else
@@ -510,7 +539,12 @@ select_kind() {
                 warn "building the sketerm-mux daemon only; pass --gui-only to make this fatal"
             fi ;;
     esac
-    if [ "$kind" = gui ]; then probe_web; else web_ok=0; web_why=""; fi
+    if [ "$kind" = gui ]; then
+        probe_web
+        probe_layer_shell
+    else
+        web_ok=0; web_why=""; layer_ok=1
+    fi
 }
 
 if command -v dpkg-deb >/dev/null 2>&1; then
@@ -524,6 +558,7 @@ if command -v dpkg-deb >/dev/null 2>&1; then
             install_deb_deps DEB_BUILD_DEPS_MUX
         else
             install_deb_deps DEB_BUILD_DEPS
+            install_deb_deps_optional DEB_BUILD_DEPS_OPTIONAL
         fi
     fi
     select_kind

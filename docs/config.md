@@ -795,34 +795,51 @@ editor_keybind.sort_lines =
 ### Quake mode
 
 Applied to the primary window when `quake_enabled` is on; `sketerm
---toggle` raises or hides the running instance.
+--toggle` shows or hides the running instance (bind it to a
+compositor shortcut). A hidden window keeps its tabs, panes and
+sessions; the toggle hides rather than minimizes, because a layer
+surface cannot be minimized and Wayland has no unminimize request.
 
 | Key | Type | Default | Notes |
 | --- | --- | --- | --- |
-| `quake_enabled` | bool | `false` | With it on, the primary window is sized from the monitor instead of the 1000x700 default. |
-| `quake_monitor` | string | `active` | `active` (the monitor the window is on), `primary`, a 0-based index, or a connector name such as `DP-1`. Anything unrecognised resolves to `active`. |
-| `quake_edge` | enum | `top` | `top`, `bottom`, `left`, `right`. **Parsed, serialised, and currently moves nothing** -- see below. |
+| `quake_enabled` | bool | `false` | With it on, the primary window is placed from the monitor instead of the 1000x700 default. Switching it on at runtime re-places a live window; switching it off after the window became a layer surface takes effect at the next start (there is no way back to a plain toplevel). |
+| `quake_monitor` | string | unset | `active`, `primary`, a 0-based index, or a connector name such as `DP-1`. Empty, and anything unrecognised, resolves to `active`. Under layer-shell `active` leaves the output to the compositor (the focused output on KWin and wlroots); on the fallback it is the monitor the window is on. |
+| `quake_edge` | enum | `top` | `top`, `bottom`, `left`, `right`. Real under wlr-layer-shell: the window is anchored to that edge and a partial size is centred along it. On the fallback it is recorded and moves nothing -- see below. |
 | `quake_width_percent` | float | `100.0` | Clamped 1..100, of the target monitor. |
 | `quake_height_percent` | float | `50.0` | Clamped 1..100. |
 
-Platform caveats, stated plainly because the intended behaviour and
-the actual behaviour differ:
+Two placement paths, chosen at runtime by `gtk_layer_is_supported()`
+(the library is linked, the compositor decides):
 
-- **`quake_edge` does not move the window.** Wayland does not permit
-  a client to position its own toplevel, and GTK4 removed
-  `gtk_window_move` on every backend, so there is no call sketerm can
-  make to push the window against an edge. The key is recorded so a
-  compositor window rule (or a future layer-shell backend) can
-  consume it. Today, pin the window with a KWin or Mutter rule.
-- **Monitor targeting is exact only at 100% x 100%.** That is the one
-  case that goes through `gtk_window_fullscreen_on_monitor`, the only
-  GTK4 call that names a monitor. At any smaller size sketerm can
-  only set the window size and the compositor decides where it lands.
-- **Percentages are of the full monitor rectangle, not the work
-  area.** `gdk_monitor_get_workarea` is gone in GTK4, so panels and
-  docks are not subtracted.
-- **GTK4 has no primary-monitor concept**, so `quake_monitor =
-  primary` resolves to the display's first monitor.
+- **wlr-layer-shell** (KWin, sway, Hyprland, every wlroots
+  compositor), through gtk4-layer-shell: the primary window is a
+  layer surface on the OVERLAY layer (it shows over fullscreen
+  windows too), keyboard mode ON_DEMAND (it takes focus when shown
+  and gives it up when you click elsewhere), no exclusive zone,
+  namespace `sketerm-quake`. The edge is anchored; a 100% axis is
+  anchored to both of its edges and stretched by the compositor; the
+  other axis is centred. A live reload of any of the five keys
+  re-applies anchors, size and monitor in place (a monitor change
+  remaps the surface). Needs a build with gtk4-layer-shell: the
+  `zig build` default on Linux, `-Dlayer-shell=false` for hosts
+  without the package. Arch, Debian 13 and Ubuntu 25.04+ ship it;
+  Ubuntu 24.04 does not, and `dist/install.sh` builds the fallback
+  there and says so.
+- **Fallback** (GNOME Wayland, X11, a compositor without the
+  protocol, a build without the library): the window stays an
+  xdg-toplevel. Wayland does not permit a client to position its own
+  toplevel and GTK4 removed `gtk_window_move` on every backend, so
+  `quake_edge` moves nothing there; pin the window with a KWin or
+  Mutter rule. Monitor targeting is exact only at 100% x 100%, the
+  one case that goes through `gtk_window_fullscreen_on_monitor`; at
+  any smaller size sketerm sets the window size and the compositor
+  decides where it lands.
+
+On both paths, percentages are of the full monitor rectangle, not
+the work area (`gdk_monitor_get_workarea` is gone in GTK4, so panels
+and docks are not subtracted), and GTK4 has no primary-monitor
+concept, so `quake_monitor = primary` resolves to the display's first
+monitor.
 
 ### Profile selection
 

@@ -40,6 +40,11 @@ depends=(
     'fontconfig'
     'libvpx'  # VP9/WebM app-window recording (GUI only)
     'libpulse' # remote-audio playback (GUI links libpulse + glib mainloop)
+    # Quake-mode edge/monitor placement through wlr-layer-shell. LINKED into
+    # the GUI (it interposes libwayland-client, so it cannot be dlopen'd);
+    # compositor support is still probed at runtime, so GNOME/X11 keep the
+    # xdg-toplevel fallback.
+    'gtk4-layer-shell'
     'opus'     # runtime-loaded remote-audio compression
     'glycin'   # sandboxed runtime-loaded image decoding for Viewer
     'libheif'  # Glycin AVIF/HEIF loader runtime
@@ -90,8 +95,9 @@ build() {
     # $CEF_INCLUDE/$CEF_LIB the way install.sh's non-Arch backends do: the
     # Arch package must link against the same cef on every host, and makepkg
     # does not scrub the caller's environment. web_ok is 1 unconditionally
-    # because cef is a hard dependency of this package, not a probed option.
-    sketerm_build "$(_srcroot)" gui 1 /usr/include/cef /usr/lib/cef "" "$CARCH"
+    # because cef is a hard dependency of this package, not a probed option;
+    # the trailing 1 says the same of gtk4-layer-shell.
+    sketerm_build "$(_srcroot)" gui 1 /usr/include/cef /usr/lib/cef "" "$CARCH" 1
 }
 
 package() {

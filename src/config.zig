@@ -1180,11 +1180,8 @@ pub const Config = struct {
     /// Empty = "active". GTK4 has no primary-monitor concept, so
     /// "primary" resolves to the display's first monitor.
     quake_monitor: []const u8 = "",
-    /// Which edge the window drops from. ADVISORY ONLY: GTK4 removed
-    /// toplevel positioning on every backend and Wayland forbids it
-    /// outright, so nothing sketerm can call moves the window to an
-    /// edge. Recorded so a compositor window rule (or a future
-    /// layer-shell backend) can consume it; it moves nothing itself.
+    /// Which edge the window drops from; only the wlr-layer-shell path
+    /// can anchor it, the xdg-toplevel fallback records it and moves nothing.
     quake_edge: QuakeEdge = .top,
     /// Coverage of the target monitor, in percent (1..100).
     quake_width_percent: f32 = 100.0,

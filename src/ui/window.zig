@@ -1072,9 +1072,11 @@ pub const Window = struct {
             c.G_CONNECT_DEFAULT,
         );
 
-        // Quake geometry replaces the 1000x700 default size. Primary
-        // only: `--toggle` drives the primary window, and a secondary
-        // is an ordinary window.
+        // Quake placement replaces the 1000x700 default size, and
+        // under layer-shell this is what turns the window into a layer
+        // surface: it MUST run before the first map (nothing above
+        // realizes the window). Primary only: `--toggle` drives the
+        // primary window, and a secondary is an ordinary window.
         if (is_primary) self.applyQuakeGeometry();
 
         return self;
@@ -1276,7 +1278,9 @@ pub const Window = struct {
         self.applyConfigChangeOpts(new_cfg, .{});
     }
     pub fn applyConfigChangeOpts(self: *Window, new_cfg: *const Config, opts: winconfig.ApplyOpts) void {
+        const quake_moved = quake.settingsChanged(&self.config, new_cfg);
         winconfig.applyConfigChangeOpts(self, new_cfg, opts);
+        if (quake_moved) self.applyQuakeGeometry();
         for (self.panes.items) |p| {
             if (@import("editorview.zig").EditorView.fromPane(p)) |ev| ev.syncConfig();
         }
@@ -1366,49 +1370,71 @@ pub const Window = struct {
         @import("welcome.zig").open(self);
     }
 
-    /// Quake-mode toggle. If the window is hidden / minimized,
-    /// raise + focus it. Otherwise minimize. We minimize rather than
-    /// `set_visible(false)` because hiding destroys the GdkSurface →
-    /// GL context loss → atlas + image upload rebuild on every reveal.
-    /// Wayland caveat: focus-stealing prevention may delay the raise.
+    /// Quake-mode toggle (`sketerm --toggle`): hide when shown and
+    /// focused, else show and present. Hide rather than minimize: a
+    /// layer surface has no minimize at all, and Wayland has no
+    /// unminimize request either, so a reveal from a minimized
+    /// xdg-toplevel hung on an activation token the `--toggle` process
+    /// never holds, while a fresh map is honoured everywhere. Hiding
+    /// keeps the widget tree, the panes and their sessions; only the
+    /// wl_surface goes, and `TerminalSurface` treats a re-realize as
+    /// routine.
     pub fn toggleQuake(self: *Window) void {
         const window: *c.GtkWindow = @ptrCast(@alignCast(self.app_window));
-        // Re-resolve the geometry on every reveal: with
-        // `quake_monitor = active` the target follows the pointer's
-        // monitor, and monitors come and go.
-        self.applyQuakeGeometry();
-        // gtk_window_is_active reflects "this window has focus AND is
-        // visible". Minimized windows return false; so do unfocused
-        // ones. Combine with mapped-state to disambiguate.
+        // gtk_window_is_active is "has focus AND is visible", so a
+        // shown-but-unfocused window is raised, not hidden.
         const mapped = c.gtk_widget_get_mapped(self.app_window) != 0;
         const active = c.gtk_window_is_active(window) != 0;
         if (mapped and active) {
-            c.gtk_window_minimize(window);
-        } else {
-            c.gtk_window_unminimize(window);
-            c.gtk_window_present(window);
+            c.gtk_widget_set_visible(self.app_window, 0);
+            return;
         }
+        // Re-resolve on every reveal: with `quake_monitor = active`
+        // the target follows the user, and monitors come and go.
+        self.applyQuakeGeometry();
+        c.gtk_widget_set_visible(self.app_window, 1);
+        c.gtk_window_present(window);
     }
 
-    /// Size the window per the `quake_*` config against its target
-    /// monitor. No-op unless `quake_enabled`.
-    ///
-    /// What actually reaches the compositor: the SIZE (always) and
-    /// the MONITOR (only when the requested coverage is the whole
-    /// screen, since `gtk_window_fullscreen_on_monitor` is the sole
-    /// GTK4 call that names one). The EDGE cannot be applied at all —
-    /// GTK4 has no toplevel-positioning API on any backend and
-    /// Wayland forbids self-placement — so a partial-size quake
-    /// window lands wherever the compositor puts it. See
-    /// `ui/quake.zig`.
-    pub fn applyQuakeGeometry(self: *Window) void {
-        if (!self.config.quake_enabled) return;
-        const window: *c.GtkWindow = @ptrCast(@alignCast(self.app_window));
-        const wp = self.config.quake_width_percent;
-        const hp = self.config.quake_height_percent;
-        const monitor = self.quakeMonitor();
+    /// Whether this build has gtk4-layer-shell at all (`-Dlayer-shell`,
+    /// Linux only): the decls exist exactly when the TranslateC step
+    /// included its header, so every layer call sits behind this.
+    const quake_layer_shell = @hasDecl(c, "gtk_layer_init_for_window");
 
-        if (quake.coversMonitor(wp, hp)) {
+    /// Place the primary window per the `quake_*` config: through the
+    /// layer surface when the compositor has wlr-layer-shell, else the
+    /// xdg-toplevel fallback (size, plus `fullscreen_on_monitor` at
+    /// full coverage -- the one GTK4 call that names a monitor; the
+    /// edge cannot be applied there at all, see `ui/quake.zig`). Runs
+    /// from `init` before the first map, on every reveal, and on a
+    /// config apply that moved a quake key. With quake switched off
+    /// the fallback window is unfullscreened; a window that already
+    /// became a layer surface stays one until the next start, which
+    /// is said on stderr.
+    pub fn applyQuakeGeometry(self: *Window) void {
+        if (!self.is_primary) return;
+        const window: *c.GtkWindow = @ptrCast(@alignCast(self.app_window));
+        if (!self.config.quake_enabled) {
+            if (quakeIsLayerWindow(window)) {
+                std.debug.print("sketerm: quake_enabled = false takes effect at the next start (the window is a layer surface)\n", .{});
+                return;
+            }
+            c.gtk_window_unfullscreen(window);
+            return;
+        }
+        const monitor = self.quakeMonitor();
+        var geo: c.GdkRectangle = .{ .x = 0, .y = 0, .width = 0, .height = 0 };
+        if (monitor) |m| c.gdk_monitor_get_geometry(m, &geo);
+        if (geo.width <= 0 or geo.height <= 0) return;
+        const placement = quake.place(
+            .{ .x = geo.x, .y = geo.y, .w = geo.width, .h = geo.height },
+            self.config.quake_width_percent,
+            self.config.quake_height_percent,
+            self.config.quake_edge,
+        );
+        if (self.quakeLayerApply(window, monitor, placement)) return;
+
+        if (placement.coversMonitor()) {
             if (monitor) |m| {
                 c.gtk_window_fullscreen_on_monitor(window, m);
                 return;
@@ -1417,17 +1443,70 @@ pub const Window = struct {
             return;
         }
         c.gtk_window_unfullscreen(window);
+        c.gtk_window_set_default_size(window, placement.rect.w, placement.rect.h);
+    }
 
-        var geo: c.GdkRectangle = .{ .x = 0, .y = 0, .width = 0, .height = 0 };
-        if (monitor) |m| c.gdk_monitor_get_geometry(m, &geo);
-        if (geo.width <= 0 or geo.height <= 0) return;
-        const want = quake.geometry(
-            .{ .x = geo.x, .y = geo.y, .w = geo.width, .h = geo.height },
-            wp,
-            hp,
-            self.config.quake_edge,
-        );
-        c.gtk_window_set_default_size(window, want.w, want.h);
+    /// True when the window has been initialised as a layer surface.
+    fn quakeIsLayerWindow(window: *c.GtkWindow) bool {
+        if (comptime !quake_layer_shell) return false;
+        return c.gtk_layer_is_layer_window(window) != 0;
+    }
+
+    /// Layer-shell half of `applyQuakeGeometry`: true when the window
+    /// is (or just became) a layer surface and `placement` went through
+    /// it. False on a build without gtk4-layer-shell, on X11, and on a
+    /// compositor without zwlr_layer_shell_v1 (`gtk_layer_is_supported`
+    /// is the runtime check; it also comes back false when the library
+    /// was linked behind libwayland-client, which build.zig's link
+    /// order prevents).
+    ///
+    /// The role is taken when GTK asks for the surface's xdg role at
+    /// map time, so a window that is already mapped when quake is
+    /// switched on (config apply) is hidden around the init and shown
+    /// again once the placement is set. The reverse has no API: once a
+    /// layer surface, always one, until the next start.
+    ///
+    /// Layer OVERLAY, not TOP: a drop-down summoned by a hotkey must
+    /// show over a fullscreen window too, and it is unmapped when not
+    /// in use, so it never permanently covers anything. Keyboard mode
+    /// ON_DEMAND, not EXCLUSIVE: the surface takes focus when it maps
+    /// and gives it up when the user clicks elsewhere, so a half-height
+    /// terminal does not lock the keyboard away from the window under
+    /// it. No exclusive zone: nothing gets pushed aside.
+    fn quakeLayerApply(self: *Window, window: *c.GtkWindow, monitor: ?*c.GdkMonitor, placement: quake.Placement) bool {
+        if (comptime !quake_layer_shell) return false;
+        var remap = false;
+        if (c.gtk_layer_is_layer_window(window) == 0) {
+            if (c.gtk_layer_is_supported() == 0) return false;
+            remap = c.gtk_widget_get_mapped(self.app_window) != 0;
+            if (remap) c.gtk_widget_set_visible(self.app_window, 0);
+            c.gtk_layer_init_for_window(window);
+            c.gtk_layer_set_namespace(window, "sketerm-quake");
+            c.gtk_layer_set_layer(window, c.GTK_LAYER_SHELL_LAYER_OVERLAY);
+            c.gtk_layer_set_keyboard_mode(window, c.GTK_LAYER_SHELL_KEYBOARD_MODE_ON_DEMAND);
+            c.gtk_layer_set_exclusive_zone(window, 0);
+        }
+        // `active` is the compositor's choice (null output = the
+        // focused output on KWin and wlroots), which is what a
+        // drop-down that follows the user means; the pixel size still
+        // came from the best-known monitor. Only a CHANGED monitor is
+        // set: the library remaps a mapped surface on every set.
+        const spec = quake.parseMonitor(self.config.quake_monitor);
+        const want: ?*c.GdkMonitor = if (spec == .active) null else monitor;
+        const have: ?*c.GdkMonitor = c.gtk_layer_get_monitor(window);
+        if (have != want) c.gtk_layer_set_monitor(window, want);
+        c.gtk_layer_set_anchor(window, c.GTK_LAYER_SHELL_EDGE_LEFT, @intFromBool(placement.anchors.left));
+        c.gtk_layer_set_anchor(window, c.GTK_LAYER_SHELL_EDGE_RIGHT, @intFromBool(placement.anchors.right));
+        c.gtk_layer_set_anchor(window, c.GTK_LAYER_SHELL_EDGE_TOP, @intFromBool(placement.anchors.top));
+        c.gtk_layer_set_anchor(window, c.GTK_LAYER_SHELL_EDGE_BOTTOM, @intFromBool(placement.anchors.bottom));
+        // Centring on the unpinned axis is the protocol's own rule for
+        // a single anchored edge, so no margins are needed for it.
+        c.gtk_window_set_default_size(window, placement.layer_w, placement.layer_h);
+        if (remap) {
+            c.gtk_widget_set_visible(self.app_window, 1);
+            c.gtk_window_present(window);
+        }
+        return true;
     }
 
     /// The `GdkMonitor` `quake_monitor` names, or null when the

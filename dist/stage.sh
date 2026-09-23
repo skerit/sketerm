@@ -127,18 +127,27 @@ sketerm_pkgver() {
 }
 
 # The one build recipe. $web_ok gates the browser helper; $web_skip_reason is
-# the caller's explanation for why it is off, and $7 is the package manager's
-# host architecture (empty reason for Arch, which requires distro cef).
+# the caller's explanation for why it is off, $7 is the package manager's
+# host architecture (empty reason for Arch, which requires distro cef), and
+# $8 (default 1) says whether gtk4-layer-shell development files exist: 0
+# builds the GUI with -Dlayer-shell=false, which keeps quake mode on the
+# xdg-toplevel fallback everywhere (Ubuntu 24.04 ships no
+# libgtk4-layer-shell-dev; Arch always has it, so PKGBUILD passes 1).
 sketerm_build() {
     local root=$1 kind=$2 web_ok=$3 cef_include=$4 cef_lib=$5 web_skip_reason=${6:-}
-    local package_arch=$7 portable_target
+    local package_arch=$7 layer_shell=${8:-1} portable_target
+    local gui_flags=()
     portable_target=$(sketerm_portable_target_for_arch "$package_arch") || portable_target=
     cd "$root"
 
     if [ "$kind" = gui ]; then
+        if [ "$layer_shell" -eq 0 ]; then
+            gui_flags+=(-Dlayer-shell=false)
+            sketerm_warn "gtk4-layer-shell development files missing; quake_edge and quake_monitor fall back to xdg-toplevel placement (install libgtk4-layer-shell-dev for wlr-layer-shell placement)"
+        fi
         # Normal builds runtime-load Opus automatically.
         sketerm_say "building GUI + daemon"
-        zig build -Doptimize=ReleaseFast
+        zig build -Doptimize=ReleaseFast ${gui_flags[@]+"${gui_flags[@]}"}
         if [ "$web_ok" -eq 1 ]; then
             # The browser helper is built against a SPLIT cef install (headers
             # and runtime in two places, unlike the single-tree upstream

@@ -101,6 +101,14 @@
  * (audio_sink.zig). GUI-only — never in the mux graph. */
 #include <pulse/pulseaudio.h>
 #include <pulse/glib-mainloop.h>
+/* wlr-layer-shell placement for quake mode (ui/quake.zig, the quake
+ * region of ui/window.zig). build.zig's TranslateC step defines the
+ * macro only when it links gtk4-layer-shell (-Dlayer-shell, on by
+ * default on Linux): no macro, no gtk_layer_* decls, and window.zig's
+ * comptime @hasDecl gate compiles the layer path out. Never on macOS. */
+#ifdef SKETERM_LAYER_SHELL
+#include <gtk4-layer-shell.h>
+#endif
 #else
 #include <util.h>        /* macOS: openpty/forkpty */
 #include <sys/random.h>  /* macOS: getentropy lives here */
