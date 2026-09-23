@@ -1191,7 +1191,7 @@ pub const Highlighter = struct {
             // structure.normalizeRegions' narrowest-wins rule (see the
             // rationale there) so the gutter marker and this resolver
             // can never disagree about what line N folds.
-            if (foldOf(node)) |r| {
+            if (foldOf(doc, node)) |r| {
                 if (r.start_line == line) return r;
             }
             const parent = ts.ts_node_parent(node);
@@ -1216,7 +1216,7 @@ pub const Highlighter = struct {
         var node = ts.ts_node_descendant_for_byte_range(root, @intCast(offset), @intCast(offset));
         if (ts.ts_node_is_null(node)) return null;
         while (true) {
-            if (foldOf(node)) |r| {
+            if (foldOf(doc, node)) |r| {
                 if (r.start_line < line and r.end_line >= line) return r;
             }
             const parent = ts.ts_node_parent(node);
@@ -1245,7 +1245,7 @@ pub const Highlighter = struct {
         const root = ts.ts_tree_root_node(tree);
         if (!ts.ts_node_is_null(root)) {
             var budget: usize = WALK_BUDGET;
-            try collectFolds(alloc, root, from, to, &out, &budget, 0);
+            try collectFolds(alloc, doc, root, from, to, &out, &budget, 0);
         }
         const kept = structure.normalizeRegions(out.items);
         out.shrinkRetainingCapacity(kept.len);
@@ -1253,13 +1253,42 @@ pub const Highlighter = struct {
     }
 
     /// A node's fold region, or null when it does not hide a line.
-    /// `end_line - 1` keeps the closing delimiter's line visible, which
-    /// is what makes a folded `fn f() {` still show its `}`.
-    fn foldOf(node: ts.TSNode) ?FoldRegion {
+    ///
+    /// A last line that OPENS with a closer (`}`, `)`, `]`, `end`, `fi`,
+    /// `</tag>`) stays visible, which is what makes a folded `fn f() {`
+    /// still show its `}`. Any other last line is body and is hidden
+    /// with the rest: a Python or YAML block has no closer, and keeping
+    /// its last line visible folded a body down to its final statement.
+    fn foldOf(doc: *const Document, node: ts.TSNode) ?FoldRegion {
         const sp = ts.ts_node_start_point(node);
         const ep = ts.ts_node_end_point(node);
-        if (ep.row < sp.row + 2) return null;
-        return .{ .start_line = sp.row, .end_line = ep.row - 1 };
+        // Ending at column 0 means the last row holds none of the node.
+        const last_row: usize = if (ep.column == 0 and ep.row > 0) ep.row - 1 else ep.row;
+        const end = if (lineOpensWithCloser(doc, last_row)) last_row -| 1 else last_row;
+        if (end <= sp.row) return null;
+        return .{ .start_line = sp.row, .end_line = end };
+    }
+
+    fn lineOpensWithCloser(doc: *const Document, line: usize) bool {
+        if (line >= doc.rope.lineCount()) return false;
+        const off = structure.firstNonBlankOffset(doc, line);
+        var buf: [8]u8 = undefined;
+        const end = @min(off + buf.len, doc.rope.len());
+        var w: usize = 0;
+        var it = doc.rope.iterateRange(off, end);
+        while (it.next()) |chunk| {
+            @memcpy(buf[w .. w + chunk.len], chunk);
+            w += chunk.len;
+        }
+        const head = buf[0..w];
+        if (head.len == 0) return false;
+        if (std.mem.indexOfScalar(u8, ")]}", head[0]) != null) return true;
+        if (std.mem.startsWith(u8, head, "</")) return true;
+        for ([_][]const u8{ "end", "fi", "done", "esac" }) |kw| {
+            if (std.mem.startsWith(u8, head, kw) and
+                (head.len == kw.len or !(std.ascii.isAlphanumeric(head[kw.len]) or head[kw.len] == '_'))) return true;
+        }
+        return false;
     }
 
     /// Recursion depth cap. Grammars nest a few tens deep at worst;
@@ -1268,6 +1297,7 @@ pub const Highlighter = struct {
 
     fn collectFolds(
         alloc: std.mem.Allocator,
+        doc: *const Document,
         node: ts.TSNode,
         from: usize,
         to: usize,
@@ -1286,9 +1316,9 @@ pub const Highlighter = struct {
             const e: usize = ts.ts_node_end_byte(child);
             if (e <= from or s >= to) continue;
             if (s >= from) {
-                if (foldOf(child)) |r| try out.append(alloc, r);
+                if (foldOf(doc, child)) |r| try out.append(alloc, r);
             }
-            try collectFolds(alloc, child, from, to, out, budget, depth + 1);
+            try collectFolds(alloc, doc, child, from, to, out, budget, depth + 1);
         }
     }
 };
@@ -1895,6 +1925,20 @@ test "syntax: fold regions come from the tree and keep the closer visible" {
     const narrow = try hl.foldRegionsIn(a, &doc, line2, doc.rope.len());
     defer a.free(narrow);
     for (narrow) |rg| try testing.expect(rg.start_line >= 2);
+}
+
+test "syntax: a block with no closer folds its whole body" {
+    const a = testing.allocator;
+    const src = "def f():\n    a = 1\n    b = g(a)\nc = 3\n";
+    var doc = try openDoc(src);
+    defer doc.deinit();
+    var hl = try Highlighter.init(a, .python);
+    defer hl.deinit();
+    try hl.parse(&doc);
+    const r = (try hl.foldRegionAtLine(&doc, 0)).?;
+    // Line 2 ends in `)` but OPENS with content: it is body, not a closer.
+    try testing.expectEqual(@as(usize, 2), r.end_line);
+    try testing.expect(!r.hides(3));
 }
 
 test "syntax: fold state re-resolves through the tree after an edit" {
