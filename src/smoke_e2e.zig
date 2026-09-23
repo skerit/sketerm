@@ -649,6 +649,7 @@ pub fn main() u8 {
         const body = std.fmt.bufPrint(&script_buf,
             \\#!/bin/sh
             \\if [ "$1" = "-G" ]; then printf 'hostname 127.0.0.1\n'; exit 0; fi
+            \\printf 'dial\n' >> '{s}/ssh-dials'
             \\if [ -e '{s}/ssh-delay' ]; then sleep 2; fi
             \\export XDG_RUNTIME_DIR='{s}'
             \\export XDG_STATE_HOME='{s}'
@@ -661,7 +662,7 @@ pub fn main() u8 {
             \\printf '%s\n' "$$" > '{s}/ssh-child-'"$SKETERM_APP_ID"
             \\exec '{s}' --proxy --socket '{s}'
             \\
-        , .{ rt, rrt, rrt, rrt, mux_abs, rsock, rt, mux_abs, rsock }) catch return fail("fake ssh body");
+        , .{ rt, rt, rrt, rrt, rrt, mux_abs, rsock, rt, mux_abs, rsock }) catch return fail("fake ssh body");
         const fp = c.fopen(ssh_path.ptr, "wb") orelse return fail("fake ssh open");
         const wrote = c.fwrite(body.ptr, 1, body.len, fp) == body.len;
         _ = c.fclose(fp);
@@ -1024,6 +1025,13 @@ pub fn main() u8 {
         if (webPagesStages(allocator, app, sock_path, rt)) |why| return failMsg(why);
         if (remoteDownloadStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
         say("Download File: the picker opened on the remote pane's directory and the pick downloaded into the download directory");
+        teardown();
+        return 0;
+    }
+    if (c.getenv("SKETERM_SMOKE_E2E_DOWNLOAD_ONLY") != null) {
+        const app = drive orelse return fail("focused Download File smoke has no display driver");
+        if (remoteDownloadStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
+        say("Download File: focused picker-over-the-pane's-session and download stage passed");
         teardown();
         return 0;
     }
@@ -5240,6 +5248,15 @@ fn webRemotePrintStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [
     return null;
 }
 
+/// Connections the fake ssh has carried to the fake remote host so far.
+fn sshDials(allocator: std.mem.Allocator, rt: [:0]const u8) usize {
+    var path_buf: [320:0]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buf, "{s}/ssh-dials", .{rt}) catch return 0;
+    const body = readFileAlloc(allocator, path) orelse return 0;
+    defer allocator.free(body);
+    return std.mem.count(u8, body, "\n");
+}
+
 /// "Download File…" on a pane whose session lives on another host,
 /// driven the user's way: the action opens sketerm's own file picker on
 /// that host at the pane's directory, and the pick downloads over the
@@ -5300,6 +5317,10 @@ fn remoteDownloadStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [
     const focus_req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"focus\",\"pane\":{d}}}\n", .{pane}) catch return "focus request";
     if (roundtrip(allocator, sock, focus_req)) |r| allocator.free(r) else return "focusing the remote pane failed";
     _ = app.waitIdle(200, 4_000);
+    // The picker browses over the pane's own session: from here to the
+    // finished download, nothing may dial the host again (the picker's
+    // own connection and its FUSE warm-up each used to).
+    const dials_before = sshDials(allocator, rt);
     if (roundtrip(allocator, sock, "{\"cmd\":\"action\",\"data\":\"download_file\"}\n")) |r| allocator.free(r) else return "download_file roundtrip failed";
     const picker = waitNewToplevel(app, known, 15_000) orelse return "Download File opened no picker";
     if (!viewerWaitOcr(allocator, app, picker, "e2e-remote-dl", 20_000)) {
@@ -5330,6 +5351,9 @@ fn remoteDownloadStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [
         }
     }
     if (!arrived) return "the picked remote file never arrived in the download directory";
+    const dials_after = sshDials(allocator, rt);
+    if (dials_after != dials_before)
+        return whyf("Download File dialed the pane's host {d} more time(s) instead of riding the pane's session", .{dials_after -| dials_before});
     if (!closePaneGone(allocator, sock, pane)) return "the remote session tab survived close-pane";
     if (roundtrip(allocator, sock, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r);
     _ = app.waitIdle(200, 4_000);

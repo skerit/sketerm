@@ -605,7 +605,7 @@ pub fn beginPaste(
         self.setStatus("paste not started: cannot allocate a host connection");
         return false;
     };
-    if (tab.hc.state == .ready and !tab.hc.conn.copy_no_replace) {
+    if (tab.hc.state == .ready and !tab.hc.io().copy_no_replace) {
         self.setStatusFmt("paste not queued: {s} lacks safe no-replace support", .{tab.hc.label()});
         return false;
     }
@@ -1108,7 +1108,7 @@ fn pasteOneAdmittedOn(
     opts: PasteOpts,
 ) bool {
     const base = std.fs.path.basename(src);
-    if (opts.no_replace and dst_hc.state == .ready and !dst_hc.conn.copy_no_replace) {
+    if (opts.no_replace and dst_hc.state == .ready and !dst_hc.io().copy_no_replace) {
         self.setStatusFmt("operation not queued: {s} lacks safe no-replace support", .{dst_hc.label()});
         return false;
     }
@@ -1479,7 +1479,7 @@ pub fn onEditorRenameDone(
         return;
     }
     const hc = self.hostConnFor(if (er.host) |h| @as(?[]const u8, h) else null) orelse return;
-    if (!hc.conn.copy_no_replace) {
+    if (!hc.io().copy_no_replace) {
         self.setStatusFmt("rename not started: {s} lacks safe no-replace support", .{hc.label()});
         return;
     }
@@ -1551,7 +1551,7 @@ pub fn onBatchRenameApply(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void 
     const ctx = cast.userData(MenuCtx, user);
     const self = ctx.view;
     const tab = ctx.tab;
-    if (!tab.hc.conn.copy_no_replace) {
+    if (!tab.hc.io().copy_no_replace) {
         self.setStatusFmt("batch rename not started: {s} lacks safe no-replace support", .{tab.hc.label()});
         return menuDone(ctx);
     }
@@ -1950,7 +1950,7 @@ pub fn onEntryDialogActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c)
 /// Send the rename wire op for `old` → same directory, `name`; with
 /// the undo record. Shared by the popover dialog and inline rename.
 pub fn commitRename(self: *BrowserView, tab: *BTab, old: []const u8, name: []const u8) void {
-    if (!tab.hc.conn.copy_no_replace) {
+    if (!tab.hc.io().copy_no_replace) {
         self.setStatusFmt("rename not started: {s} lacks safe no-replace support", .{tab.hc.label()});
         return;
     }
@@ -2392,7 +2392,7 @@ pub fn beginHistory(self: *BrowserView, direction: HistoryDirection) void {
     self.history_busy = true;
     switch (op.kind) {
         .rename_back => {
-            if (!hc.conn.copy_no_replace) {
+            if (!hc.io().copy_no_replace) {
                 self.setStatusFmt("history operation retained: {s} lacks safe no-replace support", .{hc.label()});
                 return self.restoreHistory(op, direction);
             }
@@ -2832,7 +2832,7 @@ pub fn feedDropProbe(self: *BrowserView, hc: *HostConn, rep: WireReply) bool {
             return true;
         }
         if (std.mem.eql(u8, rep.@"error", "NOENT")) {
-            if (!probe.dst_hc.conn.copy_no_replace) {
+            if (!probe.dst_hc.io().copy_no_replace) {
                 self.setStatusFmt("drop not queued: {s} runs an older daemon without safe no-replace support", .{probe.dst_hc.label()});
                 return true;
             }

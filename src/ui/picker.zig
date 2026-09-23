@@ -65,6 +65,7 @@ const BTab = @import("browser/types.zig").BTab;
 const nav = @import("browser/nav.zig");
 const confirm = @import("confirm.zig");
 const guessMime = @import("browser/open.zig").guessMime;
+const DrainHandle = @import("../terminal.zig").DrainHandle;
 
 pub const ResultCb = *const fn (ctx: ?*anyopaque, result: ?fpicker.Result) void;
 
@@ -228,6 +229,30 @@ pub const PickerWindow = struct {
         cb: ResultCb,
         cb_ctx: ?*anyopaque,
     ) !*PickerWindow {
+        return openWith(allocator, parent, req, null, cb, cb_ctx);
+    }
+
+    /// `open` browsing the lender pane's host over that pane's own session
+    /// connection instead of dialing the host again.
+    pub fn openLent(
+        allocator: std.mem.Allocator,
+        parent: ?*c.GtkWindow,
+        req: fpicker.Request,
+        lender: *DrainHandle,
+        cb: ResultCb,
+        cb_ctx: ?*anyopaque,
+    ) !*PickerWindow {
+        return openWith(allocator, parent, req, lender, cb, cb_ctx);
+    }
+
+    fn openWith(
+        allocator: std.mem.Allocator,
+        parent: ?*c.GtkWindow,
+        req: fpicker.Request,
+        lender: ?*DrainHandle,
+        cb: ResultCb,
+        cb_ctx: ?*anyopaque,
+    ) !*PickerWindow {
         const self = try allocator.create(PickerWindow);
         self.* = .{ .allocator = allocator, .mode = req.mode, .cb = cb, .cb_ctx = cb_ctx };
         errdefer {
@@ -249,7 +274,7 @@ pub const PickerWindow = struct {
             .visible = &visibleCb,
             .suppress_ops = true,
         };
-        self.view = try BrowserView.attachForPicker(allocator, &self.hooks, req.initial_spec);
+        self.view = try BrowserView.attachForPicker(allocator, &self.hooks, req.initial_spec, lender);
         self.buildWindow(parent, req.title);
         self.built = true;
         self.syncFromSelection();

@@ -1081,10 +1081,11 @@ pub const TransferOpts = struct {
 /// Remote-to-remote picks the destination daemon when it advertises
 /// cross_move; everything else (and the fallback) is the local daemon,
 /// which for a MOVE must itself advertise cross_move.
-fn coordinatorSupports(hc: *const HostConn, move: bool, no_replace: bool) bool {
-    return hc.state == .ready and hc.conn.durable_copy and hc.conn.durable_copy_v2 and
-        (!move or hc.conn.cross_move) and
-        (!no_replace or hc.conn.copy_no_replace);
+fn coordinatorSupports(hc: *HostConn, move: bool, no_replace: bool) bool {
+    const link = hc.io();
+    return hc.state == .ready and link.durable_copy and link.durable_copy_v2 and
+        (!move or link.cross_move) and
+        (!no_replace or link.copy_no_replace);
 }
 
 test "durable coordinator requires install and cancellation election support" {
@@ -1394,15 +1395,15 @@ fn startTransferImpl(
         deferTransfer(self, src_hc, src_path, dst_hc, dst_path, opts, user_token, initial_coordinator, false);
         return;
     }
-    if (opts.no_replace and !dst_hc.conn.copy_no_replace) {
+    if (opts.no_replace and !dst_hc.io().copy_no_replace) {
         self.setStatusFmt("transfer not queued: {s} lacks safe no-replace support", .{dst_hc.label()});
         if (user_token) |token| if (self.transfer_service) |service| service.abandonMediated(token);
         return;
     }
     const x = fstransfer.Xfer.init(
         self.allocator,
-        &src_hc.conn,
-        &dst_hc.conn,
+        src_hc.io(),
+        dst_hc.io(),
         &self.next_req,
         src_path,
         dst_path,
@@ -1578,8 +1579,8 @@ pub fn adoptMediated(ctx: *anyopaque, rec: @import("../file_transfers.zig").Medi
     const dst_hc = self.hostConnFor(if (rec.dst_host.len == 0) null else rec.dst_host) orelse return;
     const x = fstransfer.Xfer.init(
         self.allocator,
-        &src_hc.conn,
-        &dst_hc.conn,
+        src_hc.io(),
+        dst_hc.io(),
         &self.next_req,
         rec.src_path,
         rec.dst_path,
@@ -2071,7 +2072,7 @@ pub fn startDaemonJobUndo(self: *BrowserView, hc: *HostConn, comptime op: []cons
         if (undo) |u| u.destroy(self.allocator);
         return false;
     }
-    if (mode.no_replace and !hc.conn.copy_no_replace) {
+    if (mode.no_replace and !hc.io().copy_no_replace) {
         self.setStatusFmt("operation not queued: {s} lacks safe no-replace support", .{hc.label()});
         if (undo) |u| u.destroy(self.allocator);
         return false;
@@ -2129,7 +2130,7 @@ pub fn verifyCopies(self: *BrowserView) bool {
 }
 
 pub fn startHistoryJob(self: *BrowserView, hc: *HostConn, op_name: []const u8, path: []const u8, to: []const u8, pattern: []const u8, label: []const u8, op: *UndoOp, direction: HistoryDirection, no_replace: bool) void {
-    if (no_replace and !hc.conn.copy_no_replace) {
+    if (no_replace and !hc.io().copy_no_replace) {
         self.setStatusFmt("history operation retained: {s} lacks safe no-replace support", .{hc.label()});
         return self.restoreHistory(op, direction);
     }

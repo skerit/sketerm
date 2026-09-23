@@ -27,6 +27,7 @@ const debounce = @import("../debounce.zig");
 const iconload = @import("../iconload.zig");
 const toolbtn = @import("../toolbtn.zig");
 const Pane = @import("../pane.zig").Pane;
+const DrainHandle = @import("../../terminal.zig").DrainHandle;
 const file_transfers = @import("../file_transfers.zig");
 const image_canvas = @import("../image_canvas.zig");
 const cssutil = @import("../cssutil.zig");
@@ -105,6 +106,14 @@ pub const PickerHooks = struct {
     suppress_ops: bool = true,
 };
 
+/// The session a view borrows its host's connection from.
+pub const Lender = struct {
+    /// Liveness fence of the lending pane's Terminal.
+    drain: *DrainHandle,
+    /// The lender's host in browser form (owned by the view).
+    host: ?[]u8,
+};
+
 pub const BrowserView = struct {
     allocator: std.mem.Allocator,
     /// The terminal pane this face rides -- null for a paneless
@@ -113,6 +122,9 @@ pub const BrowserView = struct {
     pane: ?*Pane = null,
     /// Picker presentation hooks; null = normal browsing.
     picker: ?*PickerHooks = null,
+    /// A pane session lending its own connection for its host (the
+    /// Download File picker); this view then never dials that host.
+    lender: ?Lender = null,
     conns: std.ArrayList(*HostConn) = .empty,
     /// Backoff timers re-dialing hosts whose connection dropped while
     /// tabs were still on them (conn.zig scheduleReconnect).
@@ -924,8 +936,10 @@ pub const BrowserView = struct {
     /// same connections, no pane coupling. The caller (PickerWindow)
     /// owns teardown: destroy the widget tree, then call deinit()
     /// once the destroy has unwound. `hooks` must outlive the view.
-    pub fn attachForPicker(allocator: std.mem.Allocator, hooks: *PickerHooks, start_spec: ?[]const u8) !*BrowserView {
+    pub fn attachForPicker(allocator: std.mem.Allocator, hooks: *PickerHooks, start_spec: ?[]const u8, lender: ?*DrainHandle) !*BrowserView {
         const self = try createCommon(allocator, hooks);
+        // Before the first tab: its host connection is the lent one.
+        if (lender) |drain| self.adoptLender(drain);
         self.buildUi();
         // The picker is one location, not a tab set.
         c.gtk_notebook_set_show_tabs(self.notebook, 0);
@@ -937,6 +951,18 @@ pub const BrowserView = struct {
         self.applyChromeState();
         self.openStartSpec(start_spec);
         return self;
+    }
+
+    fn adoptLender(self: *BrowserView, drain: *DrainHandle) void {
+        if (!drain.alive.load(.acquire)) return;
+        const term = drain.terminal orelse return;
+        const remote = term.remote orelse return;
+        const paths = @import("../../filebrowser/paths.zig");
+        const host = paths.browserHost(remote.host);
+        self.lender = .{
+            .drain = drain,
+            .host = if (host) |h| (self.allocator.dupe(u8, h) catch return) else null,
+        };
     }
 
     fn openStartSpec(self: *BrowserView, start_spec: ?[]const u8) void {
@@ -1487,6 +1513,8 @@ pub const BrowserView = struct {
         if (self.completion_source != 0) _ = c.g_source_remove(self.completion_source);
         if (self.completion_request) |request| request.destroy(self.allocator);
         self.locbar.deinit(self.allocator);
+        if (self.lender) |lender| if (lender.host) |h| self.allocator.free(h);
+        self.lender = null;
         self.closed_tabs.deinit(self.allocator);
         self.views.deinit(self.allocator);
         self.sel.deinit(self.allocator);

@@ -383,6 +383,9 @@ pub const Terminal = struct {
         fs_reads: std.ArrayList(*RemoteFileRead) = .empty,
         fs_next_req: u32 = 0x80000000,
         fs_read_timer: c_uint = 0,
+        /// The one borrower of this connection's file-service lane
+        /// (borrowed pointer; see `FsLease`).
+        fs_lease: ?*FsLease = null,
         /// xfer id of the most recent directory-list request; a listing
         /// with a different id is stale (we navigated away) and ignored.
         list_xfer: u32 = 0,
@@ -422,6 +425,74 @@ pub const Terminal = struct {
             if (self.panel_generation == 0) self.panel_generation = 1;
         }
     };
+
+    /// A borrower of this session connection's file-service lane: it
+    /// queues `fs_op` frames on the lent connection and receives every
+    /// `fs_reply`/`fs_data`/`fs_delta`/`fs_job` frame the Terminal's own
+    /// ranged reads do not claim. The lender ends the lease synchronously
+    /// (`on_lost`) whenever that connection stops being this session's
+    /// live transport, so a lessee never writes into a replaced one.
+    pub const FsLease = struct {
+        ctx: *anyopaque,
+        on_frame: *const fn (ctx: *anyopaque, ftype: mux_wire.FrameType, payload: []const u8) void,
+        on_lost: *const fn (ctx: *anyopaque) void,
+        /// The lender's liveness fence; null once the lease has ended.
+        drain: ?*DrainHandle = null,
+
+        /// The lent connection while the lease holds.
+        pub fn conn(self: *FsLease) ?*mux_client.Conn {
+            const remote = self.lender() orelse return null;
+            return &remote.conn;
+        }
+
+        /// Deliver what the lessee queued on the lent connection.
+        pub fn flush(self: *FsLease) void {
+            if (self.lender() == null) return;
+            self.drain.?.terminal.?.armRemoteWriteWatch();
+        }
+
+        /// End the lease from the lessee's side; `on_lost` does not fire.
+        pub fn release(self: *FsLease) void {
+            if (self.lender()) |remote| remote.fs_lease = null;
+            self.drain = null;
+        }
+
+        fn lender(self: *FsLease) ?*Remote {
+            const d = self.drain orelse return null;
+            if (!d.alive.load(.acquire)) return null;
+            const t = d.terminal orelse return null;
+            const remote = t.remote orelse return null;
+            if (remote.fs_lease != self) return null;
+            return remote;
+        }
+    };
+
+    /// Lend this session's connection to `lease`, one borrower at a time.
+    /// @return false when the transport is down, the session ended, or the
+    /// lane is already lent.
+    pub fn lendFsLane(self: *Terminal, lease: *FsLease) bool {
+        const remote = self.remote orelse return false;
+        if (!remote.isLive() or remote.fs_lease != null) return false;
+        lease.drain = self.drain;
+        remote.fs_lease = lease;
+        return true;
+    }
+
+    /// The lent connection is going away (transport lost or replaced,
+    /// session ended, teardown): tell the lessee before it can write again.
+    fn endFsLease(self: *Terminal) void {
+        const remote = self.remote orelse return;
+        const lease = remote.fs_lease orelse return;
+        remote.fs_lease = null;
+        lease.drain = null;
+        lease.on_lost(lease.ctx);
+    }
+
+    fn forwardFsFrame(self: *Terminal, frame: mux_wire.Frame) void {
+        const remote = self.remote orelse return;
+        const lease = remote.fs_lease orelse return;
+        lease.on_frame(lease.ctx, frame.ftype, frame.payload);
+    }
 
     const ReconnectJob = struct {
         drain: *DrainHandle,
@@ -878,6 +949,7 @@ pub const Terminal = struct {
         }
         remote.bumpPanelGeneration();
         if (self.on_panel_work_cancel) |cancel| cancel(self);
+        self.endFsLease();
         remote.conn.deinit();
         remote.pending_record = 0;
         self.failPendingTicket();
@@ -1140,7 +1212,9 @@ pub const Terminal = struct {
     fn finishTransportUpgrade(self: *Terminal, job: *ReconnectJob) c.gboolean {
         const remote = self.remote orelse return 0;
         if (!remote.isLive() or job.session_missing) return 0;
-        if (remote.upload != null or remote.download != null or remote.pending_record != 0) return 0;
+        // A lent file-service lane pins the transport like a transfer does:
+        // its open views live on this connection, not on the upgraded one.
+        if (remote.upload != null or remote.download != null or remote.pending_record != 0 or remote.fs_lease != null) return 0;
         if (job.control) {
             if (job.conn) |*candidate| {
                 candidate.setNonBlocking();
@@ -1483,8 +1557,9 @@ pub const Terminal = struct {
             .control_state => self.handleControlState(frame.payload),
             .play_state => self.handlePlayState(frame.payload),
             .panel_request => self.handlePanelRequest(frame.payload),
-            .fs_data => self.handleRemoteFileData(frame.payload),
-            .fs_reply => self.handleRemoteFileReply(frame.payload),
+            .fs_data => if (!self.handleRemoteFileData(frame.payload)) self.forwardFsFrame(frame),
+            .fs_reply => if (!self.handleRemoteFileReply(frame.payload)) self.forwardFsFrame(frame),
+            .fs_delta, .fs_job => self.forwardFsFrame(frame),
             .session_meta => {
                 const Meta = struct {
                     cwd: []const u8 = "",
@@ -1575,10 +1650,11 @@ pub const Terminal = struct {
         return null;
     }
 
-    fn handleRemoteFileData(self: *Terminal, payload: []const u8) void {
-        if (payload.len < 12) return;
+    /// @return false when the chunk answers none of this Terminal's reads.
+    fn handleRemoteFileData(self: *Terminal, payload: []const u8) bool {
+        if (payload.len < 12) return false;
         const token = std.mem.readInt(u32, payload[0..4], .little);
-        const index = self.remoteFileReadIndex(token) orelse return;
+        const index = self.remoteFileReadIndex(token) orelse return false;
         const remote = self.remote.?;
         const read = remote.fs_reads.items[index];
         const off = std.mem.readInt(u64, payload[4..12], .little);
@@ -1587,31 +1663,38 @@ pub const Terminal = struct {
             chunk.len > read.max_bytes -| read.data.items.len)
         {
             self.finishRemoteFileRead(index, .{ .failure = "malformed remote asset data" });
-            return;
+            return true;
         }
         read.data.appendSlice(self.allocator, chunk) catch {
             self.finishRemoteFileRead(index, .{ .failure = "out of memory receiving remote asset" });
-            return;
+            return true;
         };
         read.received_data = true;
+        return true;
     }
 
-    fn handleRemoteFileReply(self: *Terminal, payload: []const u8) void {
-        const Reply = struct {
-            req: u32 = 0,
-            ok: bool = false,
-            @"error": []const u8 = "",
-            size: u64 = 0,
-            eof: bool = false,
-            mtime_ns: i64 = 0,
-            ino: u64 = 0,
-        };
-        var parsed = std.json.parseFromSlice(Reply, self.allocator, payload, .{
+    const RemoteFileReply = struct {
+        req: u32 = 0,
+        ok: bool = false,
+        @"error": []const u8 = "",
+        size: u64 = 0,
+        eof: bool = false,
+        mtime_ns: i64 = 0,
+        ino: u64 = 0,
+    };
+
+    /// @return false when the reply answers none of this Terminal's reads.
+    fn handleRemoteFileReply(self: *Terminal, payload: []const u8) bool {
+        var parsed = std.json.parseFromSlice(RemoteFileReply, self.allocator, payload, .{
             .ignore_unknown_fields = true,
-        }) catch return;
+        }) catch return false;
         defer parsed.deinit();
-        const reply = parsed.value;
-        const index = self.remoteFileReadIndex(reply.req) orelse return;
+        const index = self.remoteFileReadIndex(parsed.value.req) orelse return false;
+        self.advanceRemoteFileRead(index, parsed.value);
+        return true;
+    }
+
+    fn advanceRemoteFileRead(self: *Terminal, index: usize, reply: RemoteFileReply) void {
         const remote = self.remote.?;
         const read = remote.fs_reads.items[index];
         if (!reply.ok) {
@@ -1743,6 +1826,7 @@ pub const Terminal = struct {
         remote.closed = true;
         self.closePanelOrigin();
         self.failPendingTicket();
+        self.endFsLease();
         self.cancelRemoteFileReads();
         self.cancelUploads();
         self.cancelDownload();
@@ -3218,6 +3302,7 @@ pub const Terminal = struct {
             // Detach, don't kill: the session keeps running in the
             // daemon — that's the entire point.
             self.failPendingTicket();
+            self.endFsLease();
             self.drain.terminal = null;
             self.drain.alive.store(false, .release);
             if (remote.watch_id != 0) _ = c.g_source_remove(remote.watch_id);
@@ -3835,6 +3920,93 @@ test "canceling an asynchronous remote file read ignores late frames" {
     );
     term.handleRemoteFrame(.{ .ftype = .fs_reply, .payload = reply });
     try testing.expect(!capture.called);
+}
+
+test "a lent file-service lane gets the fs frames the Terminal does not claim, and ends with it" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    var pair: [2]c_int = undefined;
+    try testing.expectEqual(@as(c_int, 0), platform.socketpairCloexec(&pair));
+    var remote = Terminal.Remote{
+        .conn = .{ .allocator = allocator, .fd = pair[0], .proto = mux_wire.PROTO_VERSION },
+        .session = @constCast("lent"),
+        .origin_name = @constCast("lent"),
+        .predictor = undefined,
+    };
+    defer {
+        remote.fs_reads.deinit(allocator);
+        remote.conn.deinit();
+    }
+    remote.conn.setNonBlocking();
+    var peer = mux_client.Conn{ .allocator = allocator, .fd = pair[1], .proto = mux_wire.PROTO_VERSION };
+    defer peer.deinit();
+    var drain = DrainHandle{};
+    var term: Terminal = undefined;
+    term.allocator = allocator;
+    term.remote = &remote;
+    term.drain = &drain;
+    drain.terminal = &term;
+
+    const Lessee = struct {
+        frames: [4]usize = .{ 0, 0, 0, 0 },
+        lost: usize = 0,
+        fn onFrame(ctx: *anyopaque, ftype: mux_wire.FrameType, _: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const slot: usize = switch (ftype) {
+                .fs_reply => 0,
+                .fs_data => 1,
+                .fs_delta => 2,
+                .fs_job => 3,
+                else => return,
+            };
+            self.frames[slot] += 1;
+        }
+        fn onLost(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.lost += 1;
+        }
+        fn readDone(_: ?*anyopaque, _: *Terminal, _: u32, result: Terminal.RemoteFileResult) void {
+            if (result == .success) testing.allocator.free(result.success.bytes);
+        }
+    };
+    var lessee = Lessee{};
+    var lease = Terminal.FsLease{ .ctx = &lessee, .on_frame = Lessee.onFrame, .on_lost = Lessee.onLost };
+    try testing.expect(term.lendFsLane(&lease));
+    try testing.expectEqual(&remote.conn, lease.conn().?);
+    // One borrower at a time.
+    var second = Terminal.FsLease{ .ctx = &lessee, .on_frame = Lessee.onFrame, .on_lost = Lessee.onLost };
+    try testing.expect(!term.lendFsLane(&second));
+
+    // The Terminal's own ranged read keeps its reply; everything else goes on.
+    const token = try term.beginRemoteFileRead("/remote/asset.png", 1024, 5_000, null, Lessee.readDone);
+    (try peer.recvExpectFor(&.{.fs_op}, 1_000)).deinit(allocator);
+    var own_buf: [128]u8 = undefined;
+    const own = try std.fmt.bufPrint(&own_buf, "{{\"req\":{d},\"ok\":false,\"error\":\"gone\"}}", .{token});
+    term.handleRemoteFrame(.{ .ftype = .fs_reply, .payload = own });
+    term.handleRemoteFrame(.{ .ftype = .fs_reply, .payload = "{\"req\":7,\"ok\":true}" });
+    var data: [16]u8 = undefined;
+    std.mem.writeInt(u32, data[0..4], 7, .little);
+    std.mem.writeInt(u64, data[4..12], 0, .little);
+    @memcpy(data[12..], "abcd");
+    term.handleRemoteFrame(.{ .ftype = .fs_data, .payload = &data });
+    term.handleRemoteFrame(.{ .ftype = .fs_delta, .payload = "{}" });
+    term.handleRemoteFrame(.{ .ftype = .fs_job, .payload = "{}" });
+    try testing.expectEqualSlices(usize, &.{ 1, 1, 1, 1 }, &lessee.frames);
+
+    // The lender ends the lease: the lessee hears it once and loses the conn.
+    term.endFsLease();
+    try testing.expectEqual(@as(usize, 1), lessee.lost);
+    try testing.expect(lease.conn() == null);
+    lease.release();
+    try testing.expectEqual(@as(usize, 1), lessee.lost);
+    term.handleRemoteFrame(.{ .ftype = .fs_delta, .payload = "{}" });
+    try testing.expectEqual(@as(usize, 1), lessee.frames[2]);
+
+    // A lessee's own release is silent and frees the lane.
+    try testing.expect(term.lendFsLane(&second));
+    second.release();
+    try testing.expect(remote.fs_lease == null);
+    try testing.expectEqual(@as(usize, 1), lessee.lost);
 }
 
 test "a tagged mux error is never charged to an unrelated pending request" {

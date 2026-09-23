@@ -13,6 +13,8 @@ const colkeys = @import("../../filebrowser/colkeys.zig");
 const colview = @import("colview.zig");
 const mediacols = @import("mediacols.zig");
 const muxclient = @import("../../mux/client.zig");
+const mux_wire = @import("../../mux/wire.zig");
+const DrainHandle = @import("../../terminal.zig").DrainHandle;
 
 const types = @import("types.zig");
 const BTab = @import("types.zig").BTab;
@@ -56,6 +58,9 @@ pub const ConnectCtx = struct {
 pub fn hostConnFor(self: *BrowserView, host: ?[]const u8) ?*HostConn {
     for (self.conns.items) |hc| {
         if (hc.state != .dead and hostEq(hc.host, host)) return hc;
+    }
+    if (self.lender) |lender| {
+        if (hostEq(lender.host, host)) return leaseHostConn(self, lender.drain, host);
     }
     const hc = self.allocator.create(HostConn) catch return null;
     hc.* = .{
@@ -138,6 +143,58 @@ pub fn hostConnFor(self: *BrowserView, host: ?[]const u8) ?*HostConn {
     startConnectThread(ctx);
     self.setStatusFmt("connecting to {s}…", .{host.?});
     return hc;
+}
+
+/// A HostConn riding the lender pane's session connection instead of a
+/// dial of its own. While the lane cannot be lent (the session is
+/// reconnecting, or another view holds it) the host is dead and the
+/// reconnect timer asks again; this view never dials the lender's host.
+fn leaseHostConn(self: *BrowserView, drain: *DrainHandle, host: ?[]const u8) ?*HostConn {
+    const hc = self.allocator.create(HostConn) catch return null;
+    hc.* = .{
+        .view = self,
+        .host = if (host) |h| (self.allocator.dupe(u8, h) catch {
+            self.allocator.destroy(hc);
+            return null;
+        }) else null,
+        .conn = .{ .allocator = self.allocator, .fd = -1 },
+        .lease = .{ .ctx = @ptrCast(hc), .on_frame = &onLentFrame, .on_lost = &onLentLost },
+    };
+    self.conns.append(self.allocator, hc) catch {
+        if (hc.host) |h| self.allocator.free(h);
+        self.allocator.destroy(hc);
+        return null;
+    };
+    const lent = if (!drain.alive.load(.acquire)) false else if (drain.terminal) |t| t.lendFsLane(&hc.lease.?) else false;
+    if (!lent) {
+        hc.state = .dead;
+        self.setStatusFmt("waiting for the session's connection to {s}", .{hc.label()});
+        if (host) |h| self.scheduleReconnect(h);
+        return hc;
+    }
+    self.wireReady(hc);
+    return hc;
+}
+
+/// A frame of the lent lane, dispatched exactly as an own drain would.
+fn onLentFrame(ctx: *anyopaque, ftype: mux_wire.FrameType, payload: []const u8) void {
+    const hc: *HostConn = @ptrCast(@alignCast(ctx));
+    const self = hc.view;
+    if (self.widgets_dead or hc.state != .ready) return;
+    var effects: FrameEffects = .{};
+    feedFrame(self, hc, ftype, payload, &effects);
+    if (!self.widgets_dead) finishFrames(self, effects);
+}
+
+/// The lender's transport went away: the lane and every view on it died.
+fn onLentLost(ctx: *anyopaque) void {
+    const hc: *HostConn = @ptrCast(@alignCast(ctx));
+    if (hc.state != .ready) return;
+    if (hc.view.widgets_dead) {
+        hc.state = .dead;
+        return;
+    }
+    hc.view.hostDied(hc);
 }
 
 /// Ticket mint resolved (ticket or null) — start the connect worker.
@@ -338,14 +395,17 @@ pub fn failPendingListings(self: *BrowserView, hc: *HostConn, reason: []const u8
 /// Make a freshly connected HostConn live: non-blocking fd, GLib
 /// watch, and flush every request that queued while connecting.
 pub fn wireReady(self: *BrowserView, hc: *HostConn) void {
-    hc.conn.setNonBlocking();
     hc.state = .ready;
-    hc.watch_id = c.g_unix_fd_add(
-        hc.conn.fd,
-        c.G_IO_IN | c.G_IO_HUP | c.G_IO_ERR,
-        @ptrCast(&onFdReadable),
-        @ptrCast(hc),
-    );
+    // A lent connection is read (and watched) by its Terminal.
+    if (hc.lease == null) {
+        hc.conn.setNonBlocking();
+        hc.watch_id = c.g_unix_fd_add(
+            hc.conn.fd,
+            c.G_IO_IN | c.G_IO_HUP | c.G_IO_ERR,
+            @ptrCast(&onFdReadable),
+            @ptrCast(hc),
+        );
+    }
     for (self.pending.items) |p| {
         if (p.sent or p.hc != hc) continue;
         self.sendListingOp(p);
@@ -372,7 +432,10 @@ pub fn wireReady(self: *BrowserView, hc: *HostConn) void {
     // Warm the host's FUSE mount NOW, while the user is still
     // browsing: the mount helper's own connect (ssh auth, deploy
     // check) is the whole latency of the first double-click open.
-    if (hc.host) |host| _ = @import("../hostmount.zig").ensure(self.allocator, host);
+    // A picker never opens what it lists, so it dials nothing extra.
+    if (self.picker == null) {
+        if (hc.host) |host| _ = @import("../hostmount.zig").ensure(self.allocator, host);
+    }
     self.renderCurrent();
 }
 
@@ -723,7 +786,8 @@ pub fn hostDied(self: *BrowserView, hc: *HostConn) void {
         _ = c.g_source_remove(hc.drain_idle);
         hc.drain_idle = 0;
     }
-    hc.conn.deinit();
+    // A lent connection belongs to its Terminal: end the lease, never close it.
+    if (hc.lease) |*l| l.release() else hc.conn.deinit();
     hc.state = .dead;
     self.pumpCopyQueue();
     if (self.transfer_service) |service| {
@@ -768,7 +832,7 @@ pub fn sendOpResult(self: *BrowserView, hc: *HostConn, args: anytype) SendResult
         self.setStatusFmt("not connected to {s}", .{hc.label()});
         return .transport;
     }
-    hc.conn.queueJson(.fs_op, args) catch |err| {
+    hc.io().queueJson(.fs_op, args) catch |err| {
         if (err == error.WriteFailed) {
             self.setStatus("daemon connection lost");
             return .transport;
@@ -782,7 +846,7 @@ pub fn sendOpResult(self: *BrowserView, hc: *HostConn, args: anytype) SendResult
 
 pub fn closeViewOf(self: *BrowserView, hc: *HostConn, dir: *Dir) void {
     if (dir.view_id == 0 or hc.state != .ready) return;
-    hc.conn.queueJson(.fs_op, .{
+    hc.io().queueJson(.fs_op, .{
         .req = @as(u32, 0),
         .op = "close_view",
         .view = dir.view_id,
@@ -796,7 +860,9 @@ pub fn closeViewOf(self: *BrowserView, hc: *HostConn, dir: *Dir) void {
 /// delivery.
 pub fn ensureWriteFlush(self: *BrowserView, hc: *HostConn) void {
     _ = self;
-    if (hc.state != .ready or hc.write_watch_id != 0) return;
+    if (hc.state != .ready) return;
+    if (hc.lease) |*l| return l.flush();
+    if (hc.write_watch_id != 0) return;
     if (hc.conn.wbuf.items.len == 0) return;
     hc.write_watch_id = c.g_unix_fd_add(
         hc.conn.fd,
@@ -1170,8 +1236,7 @@ const DRAIN_BUDGET_US: i64 = 8_000;
 /// @return true when the budget ran out with frames still buffered.
 fn drainFrames(self: *BrowserView, hc: *HostConn) bool {
     const deadline = c.g_get_monotonic_time() + DRAIN_BUDGET_US;
-    var dirty = false;
-    var xfer_touched = false;
+    var effects: FrameEffects = .{};
     var over_budget = false;
     while (true) {
         // A reply can end the view mid-drain: the picker's typed-name
@@ -1187,33 +1252,49 @@ fn drainFrames(self: *BrowserView, hc: *HostConn) bool {
         // The frame payload belongs to the CONN's allocator (the
         // C allocator for thread-connected remotes), not ours.
         defer f.deinit(hc.conn.allocator);
-        if (self.feedTransfers(hc, f.ftype, f.payload)) {
-            xfer_touched = true;
-            continue;
-        }
-        if (self.feedPreview(hc, f.ftype, f.payload)) continue;
-        if (self.feedRestore(hc, f.ftype, f.payload)) continue;
-        if (self.feedRemoteThumb(hc, f.ftype, f.payload)) continue;
-        if (self.feedProbes(hc, f.ftype, f.payload)) continue;
-        if (self.feedAttrRequest(hc, f.ftype, f.payload)) continue;
-        if (self.feedSnapRequest(hc, f.ftype, f.payload)) continue;
-        if (self.feedGit(hc, f.ftype, f.payload)) continue;
-        if (self.feedDiff(hc, f.ftype, f.payload)) continue;
-        if (mediacols.feed(self, hc, f.ftype, f.payload)) continue;
-        switch (f.ftype) {
-            .fs_reply => {
-                if (self.onReply(hc, f.payload)) dirty = true;
-            },
-            .fs_delta => {
-                if (self.onDelta(hc, f.payload)) dirty = true;
-            },
-            .fs_job => self.onJobEvent(hc, f.payload),
-            else => {},
-        }
+        feedFrame(self, hc, f.ftype, f.payload, &effects);
     }
-    if (xfer_touched) self.reapTransfers();
-    if (xfer_touched) self.renderJobs();
-    if (xfer_touched) {
+    finishFrames(self, effects);
+    return over_budget;
+}
+
+/// What a run of frames left to do once, after the run.
+const FrameEffects = struct {
+    dirty: bool = false,
+    xfer_touched: bool = false,
+};
+
+/// Hand one frame to whichever part of the view is waiting for it.
+fn feedFrame(self: *BrowserView, hc: *HostConn, ftype: mux_wire.FrameType, payload: []const u8, effects: *FrameEffects) void {
+    if (self.feedTransfers(hc, ftype, payload)) {
+        effects.xfer_touched = true;
+        return;
+    }
+    if (self.feedPreview(hc, ftype, payload)) return;
+    if (self.feedRestore(hc, ftype, payload)) return;
+    if (self.feedRemoteThumb(hc, ftype, payload)) return;
+    if (self.feedProbes(hc, ftype, payload)) return;
+    if (self.feedAttrRequest(hc, ftype, payload)) return;
+    if (self.feedSnapRequest(hc, ftype, payload)) return;
+    if (self.feedGit(hc, ftype, payload)) return;
+    if (self.feedDiff(hc, ftype, payload)) return;
+    if (mediacols.feed(self, hc, ftype, payload)) return;
+    switch (ftype) {
+        .fs_reply => {
+            if (self.onReply(hc, payload)) effects.dirty = true;
+        },
+        .fs_delta => {
+            if (self.onDelta(hc, payload)) effects.dirty = true;
+        },
+        .fs_job => self.onJobEvent(hc, payload),
+        else => {},
+    }
+}
+
+fn finishFrames(self: *BrowserView, effects: FrameEffects) void {
+    if (effects.xfer_touched) {
+        self.reapTransfers();
+        self.renderJobs();
         // fstransfer sends only QUEUE; a chunk that outgrew the
         // socket buffer needs the writable watch to finish delivery.
         for (self.transfers.items) |t| {
@@ -1224,8 +1305,7 @@ fn drainFrames(self: *BrowserView, hc: *HostConn) bool {
     // Socket-driven renders are throttled: chunk runs and delta
     // storms otherwise rebuild the listing model per drain, which
     // eats clicks and flickers hover for as long as the data trickles.
-    if (dirty) self.scheduleListingRender();
-    return over_budget;
+    if (effects.dirty) self.scheduleListingRender();
 }
 
 fn ensureDrainIdle(hc: *HostConn) void {

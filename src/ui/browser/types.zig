@@ -281,7 +281,12 @@ pub const HostConn = struct {
     view: *BrowserView,
     /// null = local; otherwise the terminal host-string form.
     host: ?[]u8,
+    /// The connection this HostConn dialed and owns. A lent HostConn
+    /// keeps it inert (no fd) and talks through `lease` instead.
     conn: muxclient.Conn = undefined,
+    /// A pane session's connection lent to this host (`BrowserView.lender`):
+    /// its frames arrive through the Terminal, and its end is `hostDied`.
+    lease: ?@import("../../terminal.zig").Terminal.FsLease = null,
     state: enum { connecting, ready, dead } = .connecting,
     watch_id: c.guint = 0,
     /// POLLOUT watch draining a queued-send backlog (0 = none). Sends
@@ -317,11 +322,21 @@ pub const HostConn = struct {
         return self.host orelse "local";
     }
 
+    /// The connection this host's frames travel on. A lent host whose
+    /// lease ended falls back to its inert `conn`, so a stray write fails
+    /// instead of reaching whatever transport the session has now.
+    pub fn io(self: *HostConn) *muxclient.Conn {
+        if (self.lease) |*l| if (l.conn()) |lent| return lent;
+        return &self.conn;
+    }
+
     pub fn destroy(self: *HostConn, allocator: std.mem.Allocator) void {
         if (self.watch_id != 0) _ = c.g_source_remove(self.watch_id);
         if (self.write_watch_id != 0) _ = c.g_source_remove(self.write_watch_id);
         if (self.drain_idle != 0) _ = c.g_source_remove(self.drain_idle);
-        if (self.state == .ready) self.conn.deinit();
+        if (self.lease) |*l| {
+            l.release();
+        } else if (self.state == .ready) self.conn.deinit();
         if (self.templates_dir) |td| allocator.free(td);
         if (self.home_dir) |hd| allocator.free(hd);
         for (self.user_dirs) |d| {

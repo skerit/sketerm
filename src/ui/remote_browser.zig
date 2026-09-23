@@ -25,6 +25,7 @@ const mux_client = @import("../mux/client.zig");
 const Window = @import("window.zig").Window;
 const Pane = @import("pane.zig").Pane;
 const Terminal = @import("../terminal.zig").Terminal;
+const DrainHandle = @import("../terminal.zig").DrainHandle;
 
 /// Whether the daemon behind `conn` serves the file service the native
 /// picker browses through. No welcome flag names that service (it
@@ -48,26 +49,55 @@ const PickCtx = struct {
     allocator: std.mem.Allocator,
     win: *Window,
     pane: *Pane,
+    /// The pane session's fence; never freed, so it identifies the
+    /// session even after the pane is gone.
+    session: *DrainHandle,
+    window: *picker.PickerWindow = undefined,
 };
 
+/// Download pickers currently open (GUI thread only). The picker browses
+/// over its pane's own session, whose lane lends to one view at a time,
+/// so a second request for the same pane presents the open one.
+var open_picks: std.ArrayList(*PickCtx) = .empty;
+
 fn openPicker(win: *Window, pane: *Pane) bool {
+    for (open_picks.items) |open_ctx| {
+        if (open_ctx.session != pane.terminal.drain) continue;
+        c.gtk_window_present(open_ctx.window.window);
+        return true;
+    }
     const ctx = win.allocator.create(PickCtx) catch return false;
-    ctx.* = .{ .allocator = win.allocator, .win = win, .pane = pane };
+    ctx.* = .{ .allocator = win.allocator, .win = win, .pane = pane, .session = pane.terminal.drain };
+    open_picks.append(win.allocator, ctx) catch {
+        win.allocator.destroy(ctx);
+        return false;
+    };
     var spec_buf: [@import("browser.zig").SPEC_BUF_LEN]u8 = undefined;
-    _ = picker.PickerWindow.open(win.allocator, @ptrCast(win.app_window), .{
+    ctx.window = picker.PickerWindow.openLent(win.allocator, @ptrCast(win.app_window), .{
         .mode = .open_file,
         .title = "Download File",
         .accept_label = "Download",
         .initial_spec = Window.paneBrowserSpec(pane, &spec_buf),
-    }, &onPicked, @ptrCast(ctx)) catch {
+    }, pane.terminal.drain, &onPicked, @ptrCast(ctx)) catch {
+        forgetPick(ctx);
         win.allocator.destroy(ctx);
         return false;
     };
     return true;
 }
 
+fn forgetPick(ctx: *PickCtx) void {
+    for (open_picks.items, 0..) |open_ctx, i| {
+        if (open_ctx != ctx) continue;
+        _ = open_picks.swapRemove(i);
+        break;
+    }
+    if (open_picks.items.len == 0) open_picks.clearAndFree(ctx.allocator);
+}
+
 fn onPicked(user: ?*anyopaque, result: ?fpicker.Result) void {
     const ctx = cast.userData(PickCtx, user);
+    forgetPick(ctx);
     defer ctx.allocator.destroy(ctx);
     const res = result orelse return;
     if (res.specs.len == 0) return;
