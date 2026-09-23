@@ -2313,7 +2313,7 @@ pub const Window = struct {
         const pane = try self.makeRemotePaneFromSnap(conn, name, null, attached.snapshot.payload, attached.identity, pane_id, false, false, true);
         if (pane.terminal.remote) |r| {
             r.ephemeral = true; // GUI-owned → close kills the session (no leak)
-            r.predictor.force = .never;
+            pane.terminal.markLocalEcho();
         }
         // Profile visuals: makeRemotePaneFromSnap applied the base config, so
         // re-apply with the profile to pick up its font/colours.

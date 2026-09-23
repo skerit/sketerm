@@ -371,6 +371,7 @@ pub fn applyPaneConfig(self: *Window, pane: *Pane, opts: Window.PaneConfigOpts) 
     term.screen.track_activity = self.config.track_tab_activity;
     term.screen.allow_clipboard_read = self.config.clipboard_read;
     term.screen.word_chars = self.config.word_chars;
+    term.setPredictMode(s.predictive_echo);
 
     // Shader resolution: explicit user pick / clear > profile
     // settings. Both the pick and an explicit clear are sticky —
@@ -946,6 +947,7 @@ pub fn applyConfigChangeOpts(self: *Window, new_cfg: *const Config, opts: ApplyO
         applyScrollbackCapacity(screen, s.scrollback);
         screen.scroll_on_output = self.config.scroll_on_output;
         screen.word_chars = self.config.word_chars;
+        p.terminal.setPredictMode(s.predictive_echo);
         applyPaneMouseFlags(self, p);
         // These slices pointed into the old config arena (freed
         // when this function returns) — re-point them at the new

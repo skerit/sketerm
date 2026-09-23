@@ -358,6 +358,10 @@ pub const Terminal = struct {
         /// runs while predictions are outstanding, so echo-less input
         /// (password prompts) flushes even when no events arrive.
         predictor: predict_mod.Predictor,
+        /// The session is this GUI's own on the local daemon (a local
+        /// tab or panel tab): its echo lands within a frame, so
+        /// prediction stays off whatever the config or env say.
+        local_echo: bool = false,
         expire_timer: c_uint = 0,
         /// Sketerm-native app channels: the wlhost compositor brain
         /// renders these as local windows.
@@ -626,10 +630,7 @@ pub const Terminal = struct {
             .predictor = predict_mod.Predictor.init(allocator),
             .is_app = envelope.app,
         };
-        if (profile_util.getenv("SKETERM_PREDICT")) |v| {
-            if (std.mem.eql(u8, v, "always")) remote.predictor.force = .always;
-            if (std.mem.eql(u8, v, "never")) remote.predictor.force = .never;
-        }
+        remote.predictor.force = predictMode(remote, .auto);
 
         self.* = .{
             .drain = drain,
@@ -3177,6 +3178,25 @@ pub const Terminal = struct {
         if (remote.expire_timer != 0) return;
         if (remote.predictor.pending.items.len == 0) return;
         remote.expire_timer = c.g_timeout_add(250, @ptrCast(&predictTimerCb), @ptrCast(self));
+    }
+
+    fn predictMode(remote: *const Remote, configured: predict_mod.Mode) predict_mod.Mode {
+        return predict_mod.resolveMode(remote.local_echo, profile_util.getenv("SKETERM_PREDICT"), configured);
+    }
+
+    /// Apply the pane's configured `predictive_echo` (no-op on a local terminal).
+    pub fn setPredictMode(self: *Terminal, configured: predict_mod.Mode) void {
+        const remote = self.remote orelse return;
+        remote.predictor.force = predictMode(remote, configured);
+        self.syncPredictions();
+    }
+
+    /// Mark the session as this GUI's own on the local daemon, which turns prediction off for good.
+    pub fn markLocalEcho(self: *Terminal) void {
+        const remote = self.remote orelse return;
+        remote.local_echo = true;
+        remote.predictor.force = .never;
+        self.syncPredictions();
     }
 
     fn predictTimerCb(user: ?*anyopaque) callconv(.c) c.gboolean {

@@ -2552,9 +2552,7 @@ fn panelTabDone(user: ?*anyopaque) callconv(.c) c.gboolean {
         relayError(terminal, job.request_id, message);
         return 0;
     };
-    if (pane.terminal.remote) |pane_remote| {
-        pane_remote.predictor.force = .never;
-    }
+    pane.terminal.markLocalEcho();
 
     const reports = if (job.report_assets)
         job.resolver.reports(host.allocator) catch {

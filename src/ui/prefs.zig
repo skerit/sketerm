@@ -1470,6 +1470,7 @@ fn behaviorPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     addInputMethodRow(@ptrCast(@alignCast(input_group)), ctx);
     addEntryRowString(@ptrCast(@alignCast(input_group)), ctx, "Word characters", "Chars considered part of a word for double-click selection.", &ctx.cfg.word_chars, applyOnly);
     addSwitchRow(@ptrCast(@alignCast(input_group)), ctx, "Smart copy", "Ctrl+Shift+C with no selection forwards Ctrl+C.", &ctx.cfg.smart_copy, applyOnly);
+    addPredictiveEchoRow(@ptrCast(@alignCast(input_group)), ctx);
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(input_group)));
 
     // Scrollback.
@@ -1589,6 +1590,36 @@ fn addTextBlendingRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
     cctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .on_change = textBlendingSelected };
     _ = c.g_signal_connect_data(row, "notify::selected", @ptrCast(&comboChanged), @ptrCast(cctx), @ptrCast(cast.destroyCtx(ComboCtx)), c.G_CONNECT_DEFAULT);
     c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
+}
+
+const PredictMode = @import("../mux/predict.zig").Mode;
+
+/// Combo labels, one per mode in enum order (the combo index IS the tag).
+const predictive_echo_labels = std.EnumArray(PredictMode, [*:0]const u8).init(.{
+    .auto = "Automatic (slow links only)",
+    .always = "Always",
+    .never = "Never",
+});
+
+fn addPredictiveEchoRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
+    var labels: [predictive_echo_labels.values.len:null]?[*:0]const u8 = undefined;
+    for (predictive_echo_labels.values, 0..) |label, i| labels[i] = label;
+    const items = c.gtk_string_list_new(&labels);
+    const row = c.adw_combo_row_new();
+    c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), "Predictive echo");
+    c.adw_action_row_set_subtitle(@ptrCast(@alignCast(row)), "Draw typed characters before a remote session echoes them back. Automatic shows them only on a slow link that has confirmed earlier predictions. Local tabs never predict.");
+    c.adw_combo_row_set_model(@ptrCast(@alignCast(row)), @ptrCast(@alignCast(items)));
+    c.g_object_unref(items);
+    c.adw_combo_row_set_selected(@ptrCast(@alignCast(row)), @intFromEnum(ctx.edit.predictive_echo));
+    const cctx = ctx.allocator.create(ComboCtx) catch return;
+    cctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .on_change = predictiveEchoSelected };
+    _ = c.g_signal_connect_data(row, "notify::selected", @ptrCast(&comboChanged), @ptrCast(cctx), @ptrCast(cast.destroyCtx(ComboCtx)), c.G_CONNECT_DEFAULT);
+    c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
+}
+
+fn predictiveEchoSelected(ctx: *Ctx, idx: c_uint) void {
+    ctx.edit.predictive_echo = std.enums.fromInt(PredictMode, idx) orelse .auto;
+    ctx.ev();
 }
 
 fn textBlendingSelected(ctx: *Ctx, idx: c_uint) void {
