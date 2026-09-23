@@ -2058,7 +2058,8 @@ pub const Container = struct {
     name: []u8,
     /// The name published to the helper as `context_create.name`, and
     /// thus half of the engine's on-disk jar path
-    /// (`{profile}/contexts/{jar}-{id}`; `cefhost.sanitizeContextName`).
+    /// (`{profile}/{jar}-{id}`, an immediate child of the profile
+    /// directory; `cefhost.sanitizeContextName`).
     /// Fixed at creation so a RENAME keeps the cookies: deriving the
     /// path from the display name would silently hand a renamed
     /// container a fresh, empty jar.
@@ -6112,6 +6113,16 @@ pub const WebFace = struct {
         g_next_view += 1;
         self.sent_w = 0;
         self.sent_h = 0;
+        // The page moves with the tab: it is PENDING on the new view
+        // until that view commits it, so the new view's blank first
+        // document cannot replace it (`setUrl`) and a second move before
+        // the commit still carries it.
+        if (self.pending_url == null) {
+            if (self.url) |u| {
+                if (u.len != 0 and !std.mem.eql(u8, u, "about:blank"))
+                    self.pending_url = self.allocator.dupe(u8, u) catch null;
+            }
+        }
         self.cl = want;
         if (self.actions) |a| a.bindView(self.view, self.cl);
         want.register(self);
@@ -6818,16 +6829,27 @@ pub const WebFace = struct {
     }
 
     fn setUrl(self: *WebFace, url: []const u8) void {
+        // The blank document a fresh view holds until the navigation it
+        // was created for commits is not the tab's page. Adopting it
+        // dropped `pending_url`, so a route move (or any view re-mint)
+        // in that window navigated the new view to about:blank.
+        if (isPreNavigationBlank(url, self.pending_url)) return;
+        // A new document settles the pending navigation, and so does the
+        // pending page itself arriving, even when it is the page a moved
+        // tab already showed (`setRoute`).
+        const unchanged = if (self.url) |u| std.mem.eql(u8, u, url) else false;
+        if (self.pending_url) |p| {
+            if (!unchanged or std.mem.eql(u8, p, url)) {
+                self.allocator.free(p);
+                self.pending_url = null;
+            }
+        }
         if (self.url) |u| {
             if (std.mem.eql(u8, u, url)) return;
             self.allocator.free(u);
         }
         self.url = self.allocator.dupe(u8, url) catch null;
         tabsChanged(); // MV2 onUpdated
-        if (self.pending_url) |u| {
-            self.allocator.free(u);
-            self.pending_url = null;
-        }
         self.noteNavigation(url);
         // A page that has not answered with a title yet is named by its
         // host everywhere, so a navigation renames it.
@@ -6900,6 +6922,14 @@ pub const WebFace = struct {
         return std.mem.startsWith(u8, url, "http://") or
             std.mem.startsWith(u8, url, "https://") or
             std.mem.startsWith(u8, url, "file://");
+    }
+
+    /// Whether `url` is the blank document a view reports before the
+    /// navigation this face asked for (`pending`) commits.
+    fn isPreNavigationBlank(url: []const u8, pending: ?[]const u8) bool {
+        const want = pending orelse return false;
+        const blank = url.len == 0 or std.mem.eql(u8, url, "about:blank");
+        return blank and !std.mem.eql(u8, want, "about:blank");
     }
 
     /// site_get answer: apply everything the origin has stored — zoom,
@@ -10345,6 +10375,65 @@ fn freePopupCtx(user: ?*anyopaque, _: ?*c.GClosure) callconv(.c) void {
     const ctx: *PopupCtx = @ptrCast(@alignCast(user orelse return));
     ctx.allocator.free(ctx.url);
     ctx.allocator.destroy(ctx);
+}
+
+test "a private page is an observed or incognito one, and stores nothing per site" {
+    const t = std.testing;
+    var face: WebFace = undefined;
+    face.observed = false;
+    face.container = 0;
+    var origin = "https://site.example".*;
+    face.nav_origin = &origin;
+    try t.expect(!face.isPrivate());
+    try t.expectEqualStrings("https://site.example", face.storeOrigin().?);
+    // An assistant's page this GUI only watches is not this user's.
+    face.observed = true;
+    try t.expect(face.isPrivate());
+    try t.expect(face.storeOrigin() == null);
+    // An incognito id the registry no longer knows is still private by
+    // its range; a stored id is not.
+    face.observed = false;
+    face.container = EPHEMERAL_CONTAINER_BASE + 7;
+    try t.expect(face.isPrivate());
+    try t.expect(face.storeOrigin() == null);
+    face.container = 7;
+    try t.expect(!face.isPrivate());
+}
+
+test "print and DevTools refuse what the tab's own helper cannot do here" {
+    const t = std.testing;
+    var cl: Client = .{};
+    var face: WebFace = undefined;
+    face.cl = &cl;
+    face.attached = false;
+    face.view_live = true;
+    try t.expect(face.printRefusal() != null); // no print_pdf capability
+    try t.expect(face.devToolsRefusal() != null);
+    cl.caps.insert(.print_pdf);
+    cl.caps.insert(.devtools);
+    try t.expect(face.printRefusal() == null);
+    try t.expect(face.devToolsRefusal() == null);
+    // A remote helper: the PDF must come HERE, which needs staging, and
+    // the inspector would open in a window over there.
+    @memcpy(cl.host[0..4], "box1");
+    cl.host_len = 4;
+    try t.expect(face.printRefusal() != null);
+    try t.expect(face.devToolsRefusal() != null);
+    cl.caps.insert(.print_pdf_staging);
+    try t.expect(face.printRefusal() == null);
+    try t.expect(face.devToolsRefusal() != null);
+}
+
+test "a fresh view's blank document is not the page it was created for" {
+    const t = std.testing;
+    const blank = WebFace.isPreNavigationBlank;
+    try t.expect(blank("about:blank", "http://site.example/"));
+    // A fresh view reports an EMPTY url before about:blank.
+    try t.expect(blank("", "http://site.example/"));
+    try t.expect(!blank("about:blank", null));
+    try t.expect(!blank("about:blank", "about:blank"));
+    try t.expect(!blank("http://site.example/", "http://site.example/"));
+    try t.expect(!blank("http://other.example/", "http://site.example/"));
 }
 
 test "hostOf names the site a message is about" {
