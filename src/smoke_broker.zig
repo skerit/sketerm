@@ -394,6 +394,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // worker's poll loop owns the PTY write queue there. ──
     @import("smoke_input_backlog.zig").run(allocator, sock_path);
     std.debug.print("smoke-broker: input backlog drained in order via worker ok\n", .{});
+    @import("smoke_input_backlog.zig").runUnderFlood(allocator, sock_path);
+    std.debug.print("smoke-broker: input reached a flooding child via worker ok\n", .{});
 
     // ── external display sessions + the controller lease THROUGH THE
     // BROKER. The hub paths ride the worker's 'Y' datagram and the

@@ -2440,6 +2440,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // by the daemon, delivered in order once the child wakes (shared
     // stage, also run against a real broker by smoke-broker).
     @import("smoke_input_backlog.zig").run(allocator, sock_path);
+    // And a keystroke typed while the child floods its terminal.
+    @import("smoke_input_backlog.zig").runUnderFlood(allocator, sock_path);
 
     // Quick CLI connections send no hello and must still be served.
     noHelloStage(allocator, sock_path);

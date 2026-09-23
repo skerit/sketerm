@@ -6049,7 +6049,15 @@ fn offloadPolicyStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:
     if (!closeGuiPaneAndWait(allocator, sock, browser_pane)) return "offload browser close failed";
     if (expectOffload(allocator, app, 1, 2)) |why| return why;
     const start = mainWin(app).frames;
-    const animate = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"send-text\",\"pane\":{d},\"data\":\"sh -c 'i=0; while :; do printf \\\\rFRAME-%s $i; i=$((i+1)); sleep 0.02; done'\\n\"}}\n", .{panes[1]}) catch return "offload redraw format";
+    // `trap exit INT`: without it bash may lawfully survive the one
+    // Ctrl+C below. A SIGINT that lands while a `sleep` child is exiting
+    // normally reads to bash as "the child handled it" and the loop goes
+    // on; measured outside sketerm, 21 of 300 plain loops outlived one
+    // SIGINT to their process group under load, 0 of 300 trapped ones.
+    // In the rig's red runs the tty had echoed ^C mid-stream and the loop
+    // printed on after it, so the keystroke HAD arrived; with the trap a
+    // surviving loop can only mean it never reached the terminal.
+    const animate = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"send-text\",\"pane\":{d},\"data\":\"sh -c 'trap exit INT; i=0; while :; do printf \\\\rFRAME-%s $i; i=$((i+1)); sleep 0.02; done'\\n\"}}\n", .{panes[1]}) catch return "offload redraw format";
     const sent = roundtrip(allocator, sock, animate) orelse return "offload redraw command failed";
     defer allocator.free(sent);
     const deadline = clock.nowMs() + 60_000;

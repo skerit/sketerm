@@ -14,6 +14,10 @@
 //! compare the hash it prints against the one computed here — a missing,
 //! reordered or duplicated byte changes the digest.
 //!
+//! `runUnderFlood` is the opposite pressure: one keystroke typed while
+//! the child floods its terminal and the client reads slowly must still
+//! reach the child promptly.
+//!
 //! Run by BOTH smoke-mux (monolith) and smoke-broker (the worker owns
 //! the PTY there; same poll loop, different process).
 
@@ -111,7 +115,9 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8) void {
     // mode stays on so the trailing ^D is an EOF for md5sum.
     conn.sendJson(.spawn, .{
         .name = "inbacklog",
-        .argv = [_][]const u8{ "/bin/sh", "-c", "stty -echo; echo READY; sleep 3; md5sum; echo DONE" },
+        // Held open after DONE: a session that already exited answers the
+        // cleanup kill with `.err`, which read as a failed stage.
+        .argv = [_][]const u8{ "/bin/sh", "-c", "stty -echo; echo READY; sleep 3; md5sum; echo DONE; sleep 30" },
         .rows = @as(u16, 10),
         .cols = @as(u16, 80),
     }) catch fail("spawn send");
@@ -162,4 +168,59 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8) void {
     conn.sendJson(.kill, .{ .name = "inbacklog" }) catch fail("kill");
     (conn.recvExpect(&.{ .ok, .gone }) catch fail("kill ok")).deinit(allocator);
     std.debug.print("smoke input-backlog stage: {d} KiB queued past a sleeping child arrived intact\n", .{PAYLOAD_BYTES / 1024});
+}
+
+/// Upper bound for one keystroke to reach a child whose terminal is
+/// flooding. Generous for a loaded box; starved input never arrives.
+const FLOOD_INPUT_DEADLINE_MS: i64 = 5_000;
+
+/// Input typed while the child floods its terminal and the client reads
+/// slowly (a busy GUI) must still reach the child promptly: the flood only
+/// stops once the child has read one byte, so starved input fails here.
+pub fn runUnderFlood(allocator: std.mem.Allocator, sock_path: []const u8) void {
+    const clock = @import("util/clock.zig");
+    var conn = client_mod.Conn.connect(allocator, sock_path) catch fail("flood: connect");
+    defer conn.deinit();
+    conn.sendJson(.hello, .{ .proto = wire.PROTO_VERSION }) catch fail("flood: hello");
+    (conn.recvExpect(&.{.welcome}) catch fail("flood: welcome")).deinit(allocator);
+    conn.sendJson(.spawn, .{
+        .name = "inflood",
+        .argv = [_][]const u8{ "/bin/sh", "-c", "stty -echo -icanon min 1; yes FLOODING-THE-TERMINAL & head -c 1 >/dev/null; kill $!; wait; echo; echo GOT-INPUT; sleep 30" },
+        .rows = @as(u16, 10),
+        .cols = @as(u16, 80),
+    }) catch fail("flood: spawn send");
+    (conn.recvExpect(&.{.ok}) catch fail("flood: spawn ok")).deinit(allocator);
+
+    var mirror = Mirror{ .allocator = allocator, .pool = allocator.create(Pool) catch fail("flood: pool") };
+    mirror.pool.* = Pool.init(allocator) catch fail("flood: pool init");
+    defer {
+        if (mirror.screen) |s| s.deinit();
+        mirror.pool.deinit();
+        allocator.destroy(mirror.pool);
+    }
+    conn.sendJson(.attach, .{ .name = "inflood" }) catch fail("flood: attach");
+    const snap = conn.recvExpect(&.{.snapshot}) catch fail("flood: snapshot");
+    mirror.applySnapshot(snap.payload) catch fail("flood: snapshot apply");
+    snap.deinit(allocator);
+    if (!waitForText(allocator, &conn, &mirror, "FLOODING-THE-TERMINAL", 10_000)) fail("flood: the child never started flooding");
+
+    // Let the flood build a backlog while this client reads slowly.
+    const flood_until = clock.nowMs() + 1_000;
+    while (clock.nowMs() < flood_until) {
+        const f = conn.recvFrameFor(100) catch |err| switch (err) {
+            error.Timeout => continue,
+            else => fail("flood: stream read"),
+        };
+        f.deinit(allocator);
+        _ = c.usleep(2_000);
+    }
+    conn.sendFrame(.input, "x") catch fail("flood: input send (the daemon stopped reading its client)");
+    const sent_at = clock.nowMs();
+    if (!waitForText(allocator, &conn, &mirror, "GOT-INPUT", FLOOD_INPUT_DEADLINE_MS))
+        fail("flood: a keystroke sent while the child flooded its terminal never reached it (input starved by output)");
+    const took = clock.nowMs() - sent_at;
+
+    conn.sendJson(.kill, .{ .name = "inflood" }) catch fail("flood: kill");
+    (conn.recvExpect(&.{ .ok, .gone }) catch fail("flood: kill ok")).deinit(allocator);
+    std.debug.print("smoke input-backlog stage: a keystroke reached a flooding child in {d} ms\n", .{took});
 }
