@@ -245,13 +245,7 @@ pub const Renderer = struct {
         if (at.bold) try out.appendSlice(a, ";1");
         if (at.dim) try out.appendSlice(a, ";2");
         if (at.italic) try out.appendSlice(a, ";3");
-        if (at.curly_underline) {
-            try out.appendSlice(a, ";4:3");
-        } else if (at.double_underline) {
-            try out.appendSlice(a, ";4:2");
-        } else if (at.underline) {
-            try out.appendSlice(a, ";4");
-        }
+        try out.appendSlice(a, @import("../grid/screen_ops.zig").sgrUnderlineParam(at));
         if (at.blink) try out.appendSlice(a, ";5");
         if (at.fast_blink) try out.appendSlice(a, ";6");
         if (at.reverse) try out.appendSlice(a, ";7");

@@ -92,7 +92,17 @@ attached client's mirror.
 SGR — reset, bold, dim, italic, underline, slow-blink, reverse,
 conceal, strike, 256-color fg/bg (`38/48;5;n`), truecolor
 (`38/48;2;r;g;b`), default (`39/49`), framed / encircled /
-overlined (subset).
+overlined (subset), underline colour (`58;5;n` / `58;2;r;g;b`,
+`59` resets).
+
+Underline styles (`4:N`, the kitty / iTerm2 sub-parameter form) are
+all distinct and replace each other: `4:0` none, `4:1` single (same
+as plain `4`), `4:2` double (same as `21`), `4:3` curly, `4:4`
+dotted, `4:5` dashed. `24` clears every style. The style bits live
+in `grid/style_pool.zig` `Attrs.UnderlineStyle`; the render geometry
+of each (and the dotted / dashed on-off pattern) is `render/style.zig`.
+Dotted and dashed also carry the curly bit, so a client older than
+their own bits draws the undercurl it always drew for them.
 
 ### Device status / version
 - DA1 (`CSI c`), and DECID (`CSI Z`) with the same payload
@@ -191,9 +201,19 @@ Default behavior per app:
 | Prefix | Purpose                                   | Supported |
 |--------|-------------------------------------------|----|
 | `q`    | Sixel image                               | ✓ |
-| `$q`   | DECRQSS — report setting (m/r/" q)        | ✓ |
+| `$q`   | DECRQSS — report setting (m / r / SP q)   | ✓ |
 | `+q`   | XTGETTCAP — terminfo query                | ✓ (TN, Co, RGB, Tc, bce, U8, civis/cnorm, csr, Su) |
 | `P`    | DECUDK — user-defined keys                | never |
+
+DECRQSS answers `DCS 1 $ r <setting> ST` for three selectors and
+`DCS 0 $ r ST` for anything else: `m` reports the current SGR state
+as a reset-then-set sequence in xterm's shape (`0;1;4:3;38;2;r;g;bm`
+for bold, curly-underlined truecolor text; palette 0-15 use the short
+`30-37`/`90-97` forms, underline colour is `58;5;n` / `58;2;r;g;b`),
+`r` the DECSTBM margins (`t;br`), and `SP q` the DECSCUSR cursor shape
+(`N SP q`). The SGR encoder is `screen_ops.sgrParams`, the inverse of
+the SGR parser in the same file; `parser/sgr_conformance_test.zig`
+round-trips every attribute and colour through both.
 
 ## APC frames
 

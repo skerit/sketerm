@@ -19,8 +19,6 @@ const atlas_mod = @import("atlas.zig");
 const Atlas = atlas_mod.Atlas;
 const Screen = @import("../grid/screen.zig").Screen;
 const StylePool = @import("../grid/style_pool.zig").Pool;
-const StyleEntry = @import("../grid/style_pool.zig").Entry;
-const Color = @import("../grid/style_pool.zig").Color;
 const Cell = @import("../grid/cell.zig").Cell;
 const Line = @import("../grid/line.zig").Line;
 const Scaling = @import("../grid/line.zig").Scaling;
@@ -29,7 +27,7 @@ const style_util = @import("style.zig");
 const blend = @import("blend.zig");
 
 /// Per-cell instance data. Layout matches the vertex attribs
-/// declared in `realize`. 100 bytes — for 200×80 cells: 1.6 MB.
+/// declared in `realize`. 120 bytes — for 200×80 cells: 1.9 MB.
 pub const Instance = extern struct {
     cell_xy: [2]f32 = .{ 0, 0 },
     cell_size: [2]f32 = .{ 0, 0 },
@@ -95,7 +93,7 @@ pub const VERT_SRC = style_util.DECO_GLSL ++
     \\uniform float u_dim_bg;
     \\// Pane clear colour — the effective bg of a cell that carries no
     \\// explicit one (a_bg.a == 0). Only the linear-corrected coverage
-    \\// remap reads it; it is the same `eff_bg` resolveStyleColors
+    \\// remap reads it; it is the same `eff_bg` the style.zig Resolver
     \\// feeds to applyMinContrast, so the two agree by construction.
     \\uniform vec4 u_default_bg;
     \\
@@ -107,6 +105,7 @@ pub const VERT_SRC = style_util.DECO_GLSL ++
     \\out float v_deco_kind;
     \\out vec2 v_deco_local;
     \\out float v_deco_w_px;
+    \\out float v_deco_thin_px;
     \\out float v_bold;
     \\out float v_colored;
     \\out float v_dim_k;
@@ -124,6 +123,9 @@ pub const VERT_SRC = style_util.DECO_GLSL ++
     \\    v_deco_kind = 0.0;
     \\    v_deco_local = vec2(0.0);
     \\    v_deco_w_px = a_cell_size.x;
+    \\    // The dotted / dashed pattern unit; GridPass ships the CPU
+    \\    // decoThin of the same cell height for its strips.
+    \\    v_deco_thin_px = sk_decoThin(a_cell_size.y);
     \\    v_bold = a_bold;
     \\    v_colored = a_colored;
     \\    v_dim_k = u_dim_fg;
@@ -196,6 +198,7 @@ pub const FRAG_SRC = blend.GLSL_HELPERS ++ style_util.DECO_GLSL ++ std.fmt.compt
     \\in float v_deco_kind;
     \\in vec2 v_deco_local;
     \\in float v_deco_w_px;
+    \\in float v_deco_thin_px;
     \\in float v_bold;
     \\in float v_colored;
     \\in float v_dim_k;
@@ -232,7 +235,8 @@ pub const FRAG_SRC = blend.GLSL_HELPERS ++ style_util.DECO_GLSL ++ std.fmt.compt
     \\    }}
     \\    // Decoration shaders: kinds 1/4/5 (under, strike, over) are flat
     \\    // strips; 2 (double-underline) draws two thin sub-lines; 3 (curly)
-    \\    // is a sine wave covered by anti-aliased stamping.
+    \\    // is a sine wave covered by anti-aliased stamping; 6/7 (dotted,
+    \\    // dashed) keep the pattern's lit columns of a flat strip.
     \\    float kind = v_deco_kind + 0.5;
     \\    if (kind >= 2.0 && kind < 3.0) {{
     \\        // Double underline: top half + bottom half drawn, gap in middle.
@@ -248,6 +252,11 @@ pub const FRAG_SRC = blend.GLSL_HELPERS ++ style_util.DECO_GLSL ++ std.fmt.compt
     \\        // The curly wave's own antialiasing is coverage too, so it
     \\        // gets the same remap as a glyph edge.
     \\        o_frag = sk_out(vec4(v_color.rgb, v_color.a * sk_correctCoverage(aa, v_color.rgb, v_bg)));
+    \\        return;
+    \\    }}
+    \\    if (kind >= 6.0 && kind < 8.0) {{
+    \\        if (sk_patternCoverage(v_deco_kind, v_deco_local.x * v_deco_w_px, v_deco_thin_px) < 0.5) discard;
+    \\        o_frag = sk_out(v_color);
     \\        return;
     \\    }}
     \\    o_frag = sk_out(v_color);
@@ -582,11 +591,12 @@ pub const CellPass = struct {
         const y: f32 = pad + @as(f32, @floatFromInt(row)) * ch;
 
         // First, lay down cell-aligned bg + per-codepoint glyph.
-        // Style resolution is expensive (Pool.get + 2 × colorToRGBA +
-        // reverse swap + dim multiply + deco-kind chain). Runs of
-        // consecutive cells with the same style_ref are common — vim's
-        // chrome strings, tree-view rows, status lines. Cache the last
-        // resolved values per style_ref and reuse.
+        // Style resolution is expensive (Pool.get + the Resolver's
+        // colour maths + deco-kind chain). Runs of consecutive cells
+        // with the same style_ref are common — vim's chrome strings,
+        // tree-view rows, status lines. Cache the last resolved values
+        // per style_ref and reuse.
+        const resolver = self.styleResolver();
         var col: u16 = 0;
         const cells = ln.cells[0..@min(@as(usize, cols), ln.cells.len)];
         var cached_style: u16 = 0xFFFF;
@@ -610,15 +620,12 @@ pub const CellPass = struct {
 
             if (cell.style_ref != cached_style) {
                 const style = pool.get(cell.style_ref);
-                const resolved = self.resolveStyleColors(style);
+                const resolved = resolver.resolve(style);
                 cached_fg = resolved.fg;
                 cached_bg = if (resolved.has_bg) resolved.bg else .{ 0, 0, 0, 0 };
                 cached_has_bg = resolved.has_bg;
                 cached_deco = @floatFromInt(@intFromEnum(style_util.decoKind(style.attrs)));
-                cached_deco_color = switch (style.underline_color) {
-                    .default => cached_fg,
-                    else => self.colorToRGBA(style.underline_color, true),
-                };
+                cached_deco_color = resolved.deco;
                 cached_attr_italic = style.attrs.italic;
                 // Shader shear is the fallback for families without a
                 // real italic face; with one, the italic glyph itself
@@ -769,7 +776,7 @@ pub const CellPass = struct {
             // cells. The most visible failure mode: dim placeholder
             // text containing `...`, `->`, `=>` etc. shows a bright
             // glyph at the ligature anchor while the rest stays dim.
-            const fg = self.resolveStyleColors(style).fg;
+            const fg = self.styleResolver().resolve(style).fg;
 
             for (shaped) |sg| {
                 const cluster_col = run_start + @as(u16, @intCast(@min(@as(usize, sg.cluster), @as(usize, run_len) - 1)));
@@ -841,57 +848,18 @@ pub const CellPass = struct {
         c.glBindVertexArray(0);
     }
 
-    fn colorToVec(self: *const CellPass, color: Color, is_fg: bool, reverse: bool) [4]f32 {
-        return style_util.colorToVec(color, is_fg, reverse, self.default_fg, self.default_bg, &self.palette);
-    }
-
-    /// Resolve a Color to RGBA without considering reverse video —
-    /// the caller swaps fg/bg explicitly to honour reverse on
-    /// non-default colors too.
-    fn colorToRGBA(self: *const CellPass, color: Color, is_fg: bool) [4]f32 {
-        return style_util.colorToRGBA(color, is_fg, self.default_fg, self.default_bg, &self.palette);
-    }
-
-    /// Resolve a style entry to its final fg/bg vec4s with bold-bright
-    /// lifting (palette 0..7 → 8..15 when bold), reverse-video swap,
-    /// and dim attenuation applied. `has_bg` reports whether the bg
-    /// is explicit (the caller leaves the instance bg zeroed when not,
-    /// so the window-clear color shows through).
-    fn resolveStyleColors(self: *const CellPass, style: StyleEntry) struct {
-        fg: [4]f32,
-        bg: [4]f32,
-        has_bg: bool,
-    } {
-        var fg_color = style.fg;
-        if (style.attrs.bold and self.allow_bold and self.bold_is_bright) {
-            if (fg_color == .palette and fg_color.palette < 8) {
-                fg_color = .{ .palette = fg_color.palette + 8 };
-            }
-        }
-        var fg_rgba = self.colorToRGBA(fg_color, true);
-        var bg_rgba = self.colorToRGBA(style.bg, false);
-        var has_bg = style.bg != .default;
-        if (style.attrs.reverse) {
-            const tmp = fg_rgba;
-            fg_rgba = bg_rgba;
-            bg_rgba = tmp;
-            has_bg = true;
-        }
-        if (style.attrs.dim) {
-            fg_rgba[0] *= DIM_FG_SCALE;
-            fg_rgba[1] *= DIM_FG_SCALE;
-            fg_rgba[2] *= DIM_FG_SCALE;
-        }
-        // Effective bg is the clearcolor when the cell has none.
-        const eff_bg = if (has_bg) bg_rgba else self.default_bg;
-        fg_rgba = style_util.applyMinContrast(fg_rgba, eff_bg, self.min_contrast);
-        return .{ .fg = fg_rgba, .bg = bg_rgba, .has_bg = has_bg };
+    /// The shared colour resolution over this pass's current defaults,
+    /// palette and tunables; the same maths GridPass runs.
+    fn styleResolver(self: *const CellPass) style_util.Resolver {
+        return .{
+            .default_fg = self.default_fg,
+            .default_bg = self.default_bg,
+            .palette = &self.palette,
+            .bold_is_bright = self.allow_bold and self.bold_is_bright,
+            .min_contrast = self.min_contrast,
+        };
     }
 };
-
-/// Per-channel attenuation applied to fg color when SGR 2 (dim/faint)
-/// is set. Matches the value used in grid_pass.zig.
-const DIM_FG_SCALE: f32 = 0.65;
 
 /// Forwards to the canonical predicate on Screen. CellPass skips
 /// rows for which this returns true so the GridPass overlay path

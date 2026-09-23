@@ -3739,10 +3739,15 @@ pub const Screen = struct {
     /// DECRQSS reply format: `DCS Ps $ r <answer> ST` where Ps=1 if
     /// recognized, 0 if not.
     fn handleDecrqss(self: *Screen, sel: []const u8) void {
-        var resp_buf: [64]u8 = undefined;
+        // The longest answer is the SGR one: its parameters plus the
+        // `DCS 1 $ r` / `m` / `ST` framing.
+        var resp_buf: [screen_ops.sgr_params_max_len + 8]u8 = undefined;
         if (sel.len == 1 and sel[0] == 'm') {
-            // SGR query — report current style. v1: just SGR 0 reset.
-            const s = std.fmt.bufPrint(&resp_buf, "\x1bP1$r0m\x1b\\", .{}) catch return;
+            // SGR query: the current style as a reset-then-set
+            // sequence, xterm's shape (`0;1;31m` for bold red).
+            var params_buf: [screen_ops.sgr_params_max_len]u8 = undefined;
+            const params = screen_ops.sgrParams(self.pool.get(self.cur_style), &params_buf) catch return;
+            const s = std.fmt.bufPrint(&resp_buf, "\x1bP1$r{s}m\x1b\\", .{params}) catch return;
             self.respond(s);
             return;
         }

@@ -209,6 +209,7 @@ comptime {
     _ = @import("parser/kitty_image.zig");
     _ = @import("parser/multicell_conformance_test.zig");
     _ = @import("parser/screen_conformance_test.zig");
+    _ = @import("parser/sgr_conformance_test.zig");
     _ = @import("parser/glyph_protocol.zig");
     _ = @import("grid/glyph_glossary.zig");
     _ = @import("parser/sixel.zig");

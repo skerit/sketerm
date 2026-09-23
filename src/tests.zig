@@ -103,6 +103,7 @@ comptime {
     _ = @import("parser/conformance_test.zig");
     _ = @import("parser/fuzz_test.zig");
     _ = @import("parser/screen_conformance_test.zig");
+    _ = @import("parser/sgr_conformance_test.zig");
     _ = @import("parser/wezterm_conformance_test.zig");
     _ = @import("grid/cell.zig");
     _ = @import("grid/style_pool.zig");
@@ -321,6 +322,7 @@ comptime {
     _ = @import("render/atlas_test.zig");
     _ = @import("render/atlas.zig");
     _ = @import("render/cell_pass.zig");
+    _ = @import("render/grid_pass.zig");
     _ = @import("render/style.zig");
     _ = @import("ui/input_conformance_test.zig");
     _ = @import("parser/multicell_conformance_test.zig");

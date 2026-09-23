@@ -1,12 +1,13 @@
 //! Overlay pass — cursor, selection, preedit, bell flash, focus
-//! border, scrollback indicator, and the bidi-reordered glyph runs
-//! that don't fit the cell-instance pipeline (any row containing
-//! non-ASCII characters or per-line scaling).
+//! border, scrollback indicator, and the glyph runs that don't fit
+//! the cell-instance pipeline: rows with RTL or complex-script
+//! content (`Screen.rowNeedsBidiOrComplexShape`) and rows with
+//! per-line scaling (DECDWL / DECDHL).
 //!
-//! The cell grid itself (per-cell bg + per-cell glyph for ASCII /
-//! single-scaling rows) lives in `cell_pass.zig` and uses GPU
-//! instancing + a persistent VBO. Anything OUTSIDE the cell-aligned
-//! single-scale ASCII grid lands here.
+//! The cell grid itself (per-cell bg + per-cell glyph for every other
+//! row, CJK / emoji / box-drawing included) lives in `cell_pass.zig`
+//! and uses GPU instancing + a persistent VBO. Anything OUTSIDE that
+//! cell-aligned single-scale grid lands here.
 //!
 //! Per-frame VBO. Acceptable size since overlays are tiny vs. the
 //! cell grid: cursor + selection + a bell flash is at most ~50 quads.
@@ -19,7 +20,6 @@ const atlas_mod = @import("atlas.zig");
 const Atlas = atlas_mod.Atlas;
 const Screen = @import("../grid/screen.zig").Screen;
 const StylePool = @import("../grid/style_pool.zig").Pool;
-const Color = @import("../grid/style_pool.zig").Color;
 const StyleEntry = @import("../grid/style_pool.zig").Entry;
 const Cell = @import("../grid/cell.zig").Cell;
 const style_util = @import("style.zig");
@@ -47,10 +47,12 @@ pub const VERT_SRC =
     \\// Effective bg behind this quad — only the linear-corrected
     \\// coverage remap reads it.
     \\in vec3 a_bg;
-    \\// Curly-underline strip: (local x, local y, cell width px). A
-    \\// non-zero z marks the quad as a curly strip; the fragment stage
-    \\// then draws the shared wave inside it instead of a solid fill.
-    \\in vec3 a_curly;
+    \\// Shaded decoration strip: (local x, local y, cell width px,
+    \\// thin px). A non-zero z marks the quad as a strip; the fragment
+    \\// stage then rasterises `a_strip_kind` (style.zig `Deco`: curly,
+    \\// dotted or dashed) inside it instead of filling it solid.
+    \\in vec4 a_strip;
+    \\in float a_strip_kind;
     \\
     \\uniform vec2 u_screen_px;
     \\uniform float u_dim_fg;
@@ -63,7 +65,8 @@ pub const VERT_SRC =
     \\out float v_bold;
     \\out float v_colored;
     \\out float v_dim_k;
-    \\out vec3 v_curly;
+    \\out vec4 v_strip;
+    \\out float v_strip_kind;
     \\
     \\void main() {
     \\    vec2 pos = a_pos;
@@ -83,14 +86,16 @@ pub const VERT_SRC =
     \\    v_bold = a_bold;
     \\    v_colored = a_colored;
     \\    v_dim_k = k;
-    \\    v_curly = a_curly;
+    \\    v_strip = a_strip;
+    \\    v_strip_kind = a_strip_kind;
     \\}
 ;
 
 // ATLAS_TEXEL = 1/PAGE_SIZE — per-texel UV step for the faux-bold
 // left-neighbor sample (see cell_pass.zig comment).
-// `sk_curlyCoverage` comes from `style.DECO_GLSL`, shared with
-// CellPass so an overlay row's undercurl matches its neighbours'.
+// `sk_curlyCoverage` and `sk_patternCoverage` come from
+// `style.DECO_GLSL`, shared with CellPass so an overlay row's undercurl
+// or dotted line matches its neighbours'.
 pub const FRAG_SRC = blend.GLSL_HELPERS ++ style_util.DECO_GLSL ++ std.fmt.comptimePrint(
     \\
     \\const float ATLAS_TEXEL = 1.0 / {d}.0;
@@ -102,7 +107,8 @@ pub const FRAG_SRC = blend.GLSL_HELPERS ++ style_util.DECO_GLSL ++ std.fmt.compt
     \\in float v_bold;
     \\in float v_colored;
     \\in float v_dim_k;
-    \\in vec3 v_curly;
+    \\in vec4 v_strip;
+    \\in float v_strip_kind;
     \\
     \\uniform sampler2DArray u_atlas;
     \\
@@ -124,10 +130,14 @@ pub const FRAG_SRC = blend.GLSL_HELPERS ++ style_util.DECO_GLSL ++ std.fmt.compt
     \\            float cov = sk_correctCoverage(t.a, v_color.rgb, v_bg);
     \\            o_frag = sk_out(vec4(v_color.rgb, cov * v_color.a));
     \\        }}
-    \\    }} else if (v_curly.z > 0.0) {{
+    \\    }} else if (v_strip.z > 0.0 && v_strip_kind > 5.5) {{
+    \\        // Dotted / dashed strip: the same lit columns CellPass keeps.
+    \\        if (sk_patternCoverage(v_strip_kind, v_strip.x * v_strip.z, v_strip.w) < 0.5) discard;
+    \\        o_frag = sk_out(v_color);
+    \\    }} else if (v_strip.z > 0.0) {{
     \\        // Curly underline strip: same wave CellPass draws, and the
     \\        // same coverage remap since its edge is antialiased.
-    \\        float aa = sk_curlyCoverage(v_curly.xy, v_curly.z);
+    \\        float aa = sk_curlyCoverage(v_strip.xy, v_strip.z);
     \\        if (aa <= 0.0) discard;
     \\        o_frag = sk_out(vec4(v_color.rgb, v_color.a * sk_correctCoverage(aa, v_color.rgb, v_bg)));
     \\    }} else {{
@@ -153,10 +163,12 @@ const Vertex = extern struct {
     /// mode, and left at the pane clear colour for overlays that are
     /// not cell glyphs (cursor, selection, focus border, …).
     bg: [3]f32 = .{ 0, 0, 0 },
-    /// Curly-underline strip: (local x, local y, cell width px).
-    /// z == 0 (every other quad) means "not a curly strip"; the
+    /// Shaded decoration strip: (local x, local y, cell width px,
+    /// thin px). z == 0 (every other quad) means "not a strip"; the
     /// fragment stage then fills solid as before.
-    curly: [3]f32 = .{ 0, 0, 0 },
+    strip: [4]f32 = .{ 0, 0, 0, 0 },
+    /// `style.Deco` of the strip: curly, dotted or dashed.
+    strip_kind: f32 = 0.0,
 };
 
 /// Snapshot of every input that affects the overlay vertex buffer
@@ -412,7 +424,7 @@ pub const GridPass = struct {
         if (self.program != 0) return;
         // Pre-grow the vertex buffer once so the first few frames
         // don't repeatedly realloc as the overlay reaches steady state.
-        // 2048 vertices × ~52 B = ~100 KB — well within budget.
+        // 2048 vertices x @sizeOf(Vertex) is under 200 KB.
         if (self.vbuf.capacity < 2048) {
             try self.vbuf.ensureTotalCapacity(self.allocator, 2048);
         }
@@ -445,7 +457,8 @@ pub const GridPass = struct {
         .{ .name = "a_baseline_y", .off = @offsetOf(Vertex, "baseline_y"), .count = 1 },
         .{ .name = "a_colored", .off = @offsetOf(Vertex, "colored"), .count = 1 },
         .{ .name = "a_bg", .off = @offsetOf(Vertex, "bg"), .count = 3 },
-        .{ .name = "a_curly", .off = @offsetOf(Vertex, "curly"), .count = 3 },
+        .{ .name = "a_strip", .off = @offsetOf(Vertex, "strip"), .count = 4 },
+        .{ .name = "a_strip_kind", .off = @offsetOf(Vertex, "strip_kind"), .count = 1 },
     };
 
     /// Build the vertex buffer for the current screen state.
@@ -924,16 +937,9 @@ pub const GridPass = struct {
                 // Skip the bidi resolution + heap allocs on rows that
                 // can't reorder visually. CJK / emoji / box-drawing
                 // are non-ASCII but logical == visual.
-                if (!@import("cell_pass.zig").rowNeedsBidiOrComplexShape(row_cells)) break :blk screen.col;
-                const bidi = @import("../grid/bidi.zig");
-                const sc = self.bidiScratch(row_cells.len) catch break :blk screen.col;
-                for (row_cells, 0..) |rc, i| {
-                    sc.cps[i] = if (rc.rune == 0) ' ' else rc.rune;
-                    sc.idx[i] = i;
-                }
-                _ = bidi.lineLevels(sc.cps, sc.lvls, .auto);
-                bidi.levelsToVisualOrder(sc.lvls, sc.idx);
-                for (sc.idx, 0..) |logical, visual| if (logical == screen.col) break :blk @intCast(visual);
+                if (!rowNeedsBidi(row_cells)) break :blk screen.col;
+                const order = self.visualOrder(row_cells) catch break :blk screen.col;
+                for (order, 0..) |logical, visual| if (logical == screen.col) break :blk @intCast(visual);
                 break :blk screen.col;
             };
             const cx: f32 = pad + @as(f32, @floatFromInt(visual_col)) * cw;
@@ -1180,39 +1186,59 @@ pub const GridPass = struct {
         const y_origin_shift: f32 = if (scaling == .dhl_bot) -ch else 0.0;
         const y: f32 = pad + @as(f32, @floatFromInt(row)) * ch;
 
-        // Backgrounds (always emit non-default; default bg falls through
-        // to clearcolor). Reverse video swaps fg/bg of THIS cell;
-        // we resolve fg first then swap below.
-        for (cells, 0..) |cell, col| {
-            const style = pool.get(cell.style_ref);
-            const has_explicit_bg = style.bg != .default or style.attrs.reverse;
-            if (!has_explicit_bg) continue;
-            // For reverse, draw the cell's fg as the bg.
-            const bg = if (style.attrs.reverse)
-                self.resolveColor(style.fg, true)
-            else
-                self.resolveColor(style.bg, false);
-            const x: f32 = pad + @as(f32, @floatFromInt(col)) * cw * x_scale;
+        // Visual order of a bidi row, shared by the bg and glyph sweeps
+        // so a cell's bg moves with its glyph. A scratch allocation
+        // failure falls back to logical order.
+        const order: ?[]const usize = if (rowNeedsBidi(cells) and self.enable_bidi)
+            (self.visualOrder(cells) catch null)
+        else
+            null;
+
+        // Backgrounds: only cells that paint their own (explicit
+        // colour or reverse video); the default bg falls through to
+        // the clear colour. The resolver applies the same bold-bright
+        // lift under reverse that CellPass does.
+        const resolver = self.styleResolver();
+        for (0..cells.len) |visual| {
+            const logical = if (order) |o| o[visual] else visual;
+            const resolved = resolver.resolve(pool.get(cells[logical].style_ref));
+            if (!resolved.has_bg) continue;
+            const x: f32 = pad + @as(f32, @floatFromInt(visual)) * cw * x_scale;
             // Cell content bg — apply bg-dim when unfocused.
-            try self.pushQuadDim(.{ x, y }, .{ cw * x_scale, ch }, .{ 0, 0 }, .{ 0, 0 }, bg, 0.0, 2.0);
+            try self.pushQuadDim(.{ x, y }, .{ cw * x_scale, ch }, .{ 0, 0 }, .{ 0, 0 }, resolved.bg, 0.0, 2.0);
         }
 
         // Glyphs — bidi-reorder runs to visual order before shaping.
-        if (rowNeedsBidi(cells) and self.enable_bidi) {
-            try self.emitBidiGlyphs(atlas, pool, glossary, cells, row, cw, ch, ascent, scaling);
+        if (order) |o| {
+            try self.emitBidiGlyphs(atlas, pool, glossary, cells, o, row, cw, ch, ascent, scaling);
         } else {
             try self.emitLogicalGlyphs(atlas, pool, glossary, cells, row, cw, ch, ascent, scaling, x_scale, y_scale, y_origin_shift);
         }
     }
 
-    /// SGR line decorations (underline / double / curly / strike /
-    /// overline) for one overlay cell at its visual column. CellPass
-    /// draws these in-shader for plain rows; overlay rows get flat
-    /// quads here — placed by the SAME `style.zig` geometry, so a row
-    /// that switches passes has no seam — except curly, which gets a
-    /// strip quad evaluated by the shared `sk_curlyCoverage` so both
-    /// passes draw the same wave. Honours SGR 58 underline_color,
-    /// falling back to the resolved fg.
+    /// Visual-to-logical column order of a bidi row: `order[v]` is the
+    /// logical index of the cell shown at visual column v. Backed by
+    /// the scratch buffers, so the slice is valid until the next call.
+    fn visualOrder(self: *GridPass, cells: []const Cell) ![]const usize {
+        const bidi = @import("../grid/bidi.zig");
+        const sc = try self.bidiScratch(cells.len);
+        for (cells, 0..) |cell, i| {
+            sc.cps[i] = if (cell.rune == 0) ' ' else cell.rune;
+            sc.idx[i] = i;
+        }
+        _ = bidi.lineLevels(sc.cps, sc.lvls, .auto);
+        bidi.levelsToVisualOrder(sc.lvls, sc.idx);
+        return sc.idx;
+    }
+
+    /// SGR line decorations for one overlay cell at its visual column.
+    /// CellPass draws these in-shader for plain rows; overlay rows get
+    /// quads here, placed by the SAME `style.zig` geometry so a row
+    /// that switches passes has no seam. The `shaded` kinds (curly,
+    /// dotted, dashed) get a strip quad the fragment stage rasterises
+    /// with the shared `sk_curlyCoverage` / `sk_patternCoverage`, so
+    /// both passes light the same pixels there too. Colour is the
+    /// resolver's decoration colour (SGR 58, else the resolved fg).
     fn emitCellDeco(
         self: *GridPass,
         pool: *const StylePool,
@@ -1226,19 +1252,11 @@ pub const GridPass = struct {
         if ((cell.flags & cell_mod.FLAG_WIDE_CONT) != 0) return; // wide continuation
         const style = pool.get(cell.style_ref);
         const a = style.attrs;
-        const has_line = a.underline or a.double_underline or a.curly_underline;
-        if (!has_line and !a.strikethrough and !a.overline) return;
+        const ul = style_util.underlineKind(a);
+        if (ul == .none and !a.strikethrough and !a.overline) return;
 
-        var fg = self.resolveColor(if (a.reverse) style.bg else style.fg, !a.reverse);
-        if (a.dim) {
-            fg[0] *= 0.65;
-            fg[1] *= 0.65;
-            fg[2] *= 0.65;
-        }
-        const color = switch (style.underline_color) {
-            .default => fg,
-            else => self.resolveColor(style.underline_color, true),
-        };
+        const resolved = self.styleResolver().resolve(style);
+        const color = resolved.deco;
 
         const is_wide = (cell.flags & cell_mod.FLAG_WIDE_LEFT) != 0;
         const x: f32 = self.pad + @as(f32, @floatFromInt(visual_col)) * cw * x_scale;
@@ -1251,25 +1269,52 @@ pub const GridPass = struct {
             }
         }.line;
 
-        if (a.double_underline) {
+        if (ul == .double_underline) {
             for (style_util.decoDoubleLines(ch)) |r| try push(self, r, x, y, w, color);
-        } else if (a.curly_underline) {
-            const strip = style_util.decoStrip(.curly, ch);
-            try self.pushCurlyQuad(
+        } else if (ul.shaded()) {
+            const strip = style_util.decoStrip(ul, ch);
+            try self.pushStripQuad(
                 .{ x, y + strip.y },
                 .{ w, strip.h },
                 color,
-                self.effectiveBg(style),
+                resolved.eff_bg,
                 w,
+                style_util.decoThin(ch),
+                ul,
             );
-        } else if (a.underline) {
-            try push(self, style_util.decoStrip(.underline, ch), x, y, w, color);
+        } else if (ul != .none) {
+            try push(self, style_util.decoStrip(ul, ch), x, y, w, color);
         }
         if (a.strikethrough) {
             try push(self, style_util.decoStrip(.strikethrough, ch), x, y, w, color);
         }
         if (a.overline) {
             try push(self, style_util.decoStrip(.overline, ch), x, y, w, color);
+        }
+    }
+
+    /// The decoration sweep of an overlay row: every cell at its
+    /// visual column (`order`, or logical order when null). Separate
+    /// from the glyph sweep because decorations draw on spaces and
+    /// empty cells too (underlined whitespace is meaningful).
+    fn emitRowDecos(
+        self: *GridPass,
+        pool: *const StylePool,
+        cells: []const Cell,
+        order: ?[]const usize,
+        y: f32,
+        cw: f32,
+        ch: f32,
+        x_scale: f32,
+    ) !void {
+        if (order) |ord| {
+            for (ord, 0..) |logical, visual| {
+                try self.emitCellDeco(pool, cells[logical], visual, y, cw, ch, x_scale);
+            }
+        } else {
+            for (cells, 0..) |cell, col| {
+                try self.emitCellDeco(pool, cell, col, y, cw, ch, x_scale);
+            }
         }
     }
 
@@ -1290,6 +1335,7 @@ pub const GridPass = struct {
     ) !void {
         const pad = self.pad;
         const y: f32 = pad + @as(f32, @floatFromInt(row)) * ch;
+        const resolver = self.styleResolver();
 
         var col: u16 = 0;
         const cols: u16 = @intCast(cells.len);
@@ -1300,22 +1346,8 @@ pub const GridPass = struct {
                 continue;
             }
             const style = pool.get(cell.style_ref);
-            // Reverse: draw fg using bg color (and bg using fg).
-            // Bold lifts palette 0..7 → 8..15 (xterm convention) when
-            // allow_bold && bold_is_bright.
-            var fg_color = if (style.attrs.reverse) style.bg else style.fg;
-            if (style.attrs.bold and self.allow_bold and self.bold_is_bright) {
-                if (fg_color == .palette and fg_color.palette < 8) {
-                    fg_color = .{ .palette = fg_color.palette + 8 };
-                }
-            }
-            var fg = self.resolveColor(fg_color, !style.attrs.reverse);
-            if (style.attrs.dim) {
-                fg[0] *= 0.65;
-                fg[1] *= 0.65;
-                fg[2] *= 0.65;
-            }
-            fg = style_util.applyMinContrast(fg, self.effectiveBg(style), self.min_contrast);
+            const resolved = resolver.resolve(style);
+            const fg = resolved.fg;
             const bold = style.attrs.bold and self.allow_bold;
             const x: f32 = pad + @as(f32, @floatFromInt(col)) * cw * x_scale;
             const g = atlas.lookupGlyph(glossary, cell.rune, bold, style.attrs.italic, fg) catch {
@@ -1336,16 +1368,12 @@ pub const GridPass = struct {
                 const bold_f: f32 = if (is_single and style.attrs.bold and self.allow_bold) 1.0 else 0.0;
                 const baseline_y: f32 = y + ch;
                 const colored_f: f32 = if (g.colored) 1.0 else 0.0;
-                try self.pushGlyphQuadStyled(.{ gx, gy }, .{ gw, gh }, .{ g.u0, g.v0 }, .{ g.u1, g.v1 }, @floatFromInt(g.layer), fg, 1.0, italic_f, bold_f, baseline_y, colored_f, self.effectiveBg(style));
+                try self.pushGlyphQuadStyled(.{ gx, gy }, .{ gw, gh }, .{ g.u0, g.v0 }, .{ g.u1, g.v1 }, @floatFromInt(g.layer), fg, 1.0, italic_f, bold_f, baseline_y, colored_f, resolved.eff_bg);
             }
             col += 1;
         }
 
-        // Decorations draw even on spaces/empty cells (underlined
-        // whitespace is meaningful), so this is a separate sweep.
-        for (cells, 0..) |cell, dcol| {
-            try self.emitCellDeco(pool, cell, dcol, y + y_origin_shift, cw, ch, x_scale);
-        }
+        try self.emitRowDecos(pool, cells, null, y + y_origin_shift, cw, ch, x_scale);
     }
 
     fn emitBidiGlyphs(
@@ -1354,47 +1382,26 @@ pub const GridPass = struct {
         pool: *const StylePool,
         glossary: *const @import("../grid/glyph_glossary.zig").Glossary,
         cells: []const Cell,
+        indices: []const usize,
         row: u16,
         cw: f32,
         ch: f32,
         ascent: f32,
         scaling: @import("../grid/line.zig").Scaling,
     ) !void {
-        const bidi = @import("../grid/bidi.zig");
         const pad = self.pad;
         const x_scale: f32 = if (scaling == .single) 1.0 else 2.0;
         const y_scale: f32 = if (scaling == .dhl_top or scaling == .dhl_bot) 2.0 else 1.0;
         const y_origin_shift: f32 = if (scaling == .dhl_bot) -ch else 0.0;
         const y: f32 = pad + @as(f32, @floatFromInt(row)) * ch;
-
-        const sc = self.bidiScratch(cells.len) catch return;
-        const levels = sc.lvls;
-        const indices = sc.idx;
-        const cps = sc.cps;
-        for (cells, 0..) |cell, i| {
-            cps[i] = if (cell.rune == 0) ' ' else cell.rune;
-            indices[i] = i;
-        }
-        _ = bidi.lineLevels(cps, levels, .auto);
-        bidi.levelsToVisualOrder(levels, indices);
+        const resolver = self.styleResolver();
 
         for (indices, 0..) |logical, visual| {
             const cell = cells[logical];
             if ((cell.flags & cell_mod.FLAG_WIDE_CONT) != 0 or cell.rune == 0 or cell.rune == ' ') continue;
             const style = pool.get(cell.style_ref);
-            var fg_color = if (style.attrs.reverse) style.bg else style.fg;
-            if (style.attrs.bold and self.allow_bold and self.bold_is_bright) {
-                if (fg_color == .palette and fg_color.palette < 8) {
-                    fg_color = .{ .palette = fg_color.palette + 8 };
-                }
-            }
-            var fg = self.resolveColor(fg_color, !style.attrs.reverse);
-            if (style.attrs.dim) {
-                fg[0] *= 0.65;
-                fg[1] *= 0.65;
-                fg[2] *= 0.65;
-            }
-            fg = style_util.applyMinContrast(fg, self.effectiveBg(style), self.min_contrast);
+            const resolved = resolver.resolve(style);
+            const fg = resolved.fg;
             const bold = style.attrs.bold and self.allow_bold;
             const x: f32 = pad + @as(f32, @floatFromInt(visual)) * cw * x_scale;
             const g = atlas.lookupGlyph(glossary, cell.rune, bold, style.attrs.italic, fg) catch continue;
@@ -1408,14 +1415,11 @@ pub const GridPass = struct {
             const bold_f: f32 = if (is_single and style.attrs.bold and self.allow_bold) 1.0 else 0.0;
             const baseline_y: f32 = y + ch;
             const colored_f: f32 = if (g.colored) 1.0 else 0.0;
-            try self.pushGlyphQuadStyled(.{ gx, gy }, .{ gw, gh }, .{ g.u0, g.v0 }, .{ g.u1, g.v1 }, @floatFromInt(g.layer), fg, 1.0, italic_f, bold_f, baseline_y, colored_f, self.effectiveBg(style));
+            try self.pushGlyphQuadStyled(.{ gx, gy }, .{ gw, gh }, .{ g.u0, g.v0 }, .{ g.u1, g.v1 }, @floatFromInt(g.layer), fg, 1.0, italic_f, bold_f, baseline_y, colored_f, resolved.eff_bg);
         }
 
-        // Decorations at visual columns — separate sweep so
-        // underlined spaces still draw.
-        for (indices, 0..) |logical, visual| {
-            try self.emitCellDeco(pool, cells[logical], visual, y + y_origin_shift, cw, ch, x_scale);
-        }
+        // Decorations at visual columns.
+        try self.emitRowDecos(pool, cells, indices, y + y_origin_shift, cw, ch, x_scale);
     }
 
     fn pushQuad(
@@ -1455,28 +1459,34 @@ pub const GridPass = struct {
         try self.vbuf.appendSlice(self.allocator, &verts);
     }
 
-    /// Curly-underline strip. Same quad as `pushQuadDim` plus the
-    /// per-corner strip-local coordinates the fragment stage needs to
-    /// evaluate the shared wave; `cell_w_px` sets its period and must
-    /// be the full strip width (two cells for a wide cell), the same
-    /// value CellPass's instance carries as `cell_size.x`.
-    fn pushCurlyQuad(
+    /// Shaded decoration strip (curly / dotted / dashed). Same quad as
+    /// `pushQuadDim` plus the per-corner strip-local coordinates the
+    /// fragment stage needs to evaluate the shared wave or pattern;
+    /// `cell_w_px` sets the wave's period and the pattern's pixel
+    /// scale and must be the full strip width (two cells for a wide
+    /// cell), the same value CellPass's instance carries as
+    /// `cell_size.x`; `thin_px` is the CPU `decoThin` of the cell
+    /// height, the pattern unit CellPass derives in its vertex stage.
+    fn pushStripQuad(
         self: *GridPass,
         origin: [2]f32,
         size: [2]f32,
         color: [4]f32,
         bg: [4]f32,
         cell_w_px: f32,
+        thin_px: f32,
+        kind: style_util.Deco,
     ) !void {
         const px0 = origin[0];
         const py0 = origin[1];
         const px1 = origin[0] + size[0];
         const py1 = origin[1] + size[1];
         const b: [3]f32 = .{ bg[0], bg[1], bg[2] };
-        const tl = Vertex{ .pos = .{ px0, py0 }, .uv = .{ 0, 0, 0 }, .color = color, .is_glyph = 0.0, .dim = 1.0, .bg = b, .curly = .{ 0, 0, cell_w_px } };
-        const tr = Vertex{ .pos = .{ px1, py0 }, .uv = .{ 0, 0, 0 }, .color = color, .is_glyph = 0.0, .dim = 1.0, .bg = b, .curly = .{ 1, 0, cell_w_px } };
-        const bl = Vertex{ .pos = .{ px0, py1 }, .uv = .{ 0, 0, 0 }, .color = color, .is_glyph = 0.0, .dim = 1.0, .bg = b, .curly = .{ 0, 1, cell_w_px } };
-        const br = Vertex{ .pos = .{ px1, py1 }, .uv = .{ 0, 0, 0 }, .color = color, .is_glyph = 0.0, .dim = 1.0, .bg = b, .curly = .{ 1, 1, cell_w_px } };
+        const k: f32 = @floatFromInt(@intFromEnum(kind));
+        const tl = Vertex{ .pos = .{ px0, py0 }, .uv = .{ 0, 0, 0 }, .color = color, .is_glyph = 0.0, .dim = 1.0, .bg = b, .strip = .{ 0, 0, cell_w_px, thin_px }, .strip_kind = k };
+        const tr = Vertex{ .pos = .{ px1, py0 }, .uv = .{ 0, 0, 0 }, .color = color, .is_glyph = 0.0, .dim = 1.0, .bg = b, .strip = .{ 1, 0, cell_w_px, thin_px }, .strip_kind = k };
+        const bl = Vertex{ .pos = .{ px0, py1 }, .uv = .{ 0, 0, 0 }, .color = color, .is_glyph = 0.0, .dim = 1.0, .bg = b, .strip = .{ 0, 1, cell_w_px, thin_px }, .strip_kind = k };
+        const br = Vertex{ .pos = .{ px1, py1 }, .uv = .{ 0, 0, 0 }, .color = color, .is_glyph = 0.0, .dim = 1.0, .bg = b, .strip = .{ 1, 1, cell_w_px, thin_px }, .strip_kind = k };
         try self.vbuf.appendSlice(self.allocator, &[_]Vertex{ tl, tr, bl, tr, br, bl });
     }
 
@@ -1560,23 +1570,17 @@ pub const GridPass = struct {
         try self.vbuf.appendSlice(self.allocator, &verts);
     }
 
-    /// Resolve a Color → RGBA without considering reverse video. The
-    /// caller swaps fg/bg explicitly (for cells with explicit colors
-    /// reverse should still flip them).
-    /// The bg an overlay glyph actually sits on — explicit cell bg
-    /// (fg when reversed), else the clearcolor.
-    fn effectiveBg(self: *const GridPass, style: StyleEntry) [4]f32 {
-        if (style.attrs.reverse) return self.resolveColor(style.fg, true);
-        if (style.bg != .default) return self.resolveColor(style.bg, false);
-        return self.default_bg;
-    }
-
-    fn resolveColor(self: *const GridPass, color: Color, is_fg: bool) [4]f32 {
-        return style_util.colorToRGBA(color, is_fg, self.default_fg, self.default_bg, &self.palette);
-    }
-
-    fn colorToVec(self: *const GridPass, color: Color, is_fg: bool, reverse: bool) [4]f32 {
-        return style_util.colorToVec(color, is_fg, reverse, self.default_fg, self.default_bg, &self.palette);
+    /// The shared colour resolution over this pass's current defaults,
+    /// palette and tunables; the same maths CellPass runs, which is
+    /// what keeps an overlay row's colours equal to its neighbours'.
+    fn styleResolver(self: *const GridPass) style_util.Resolver {
+        return .{
+            .default_fg = self.default_fg,
+            .default_bg = self.default_bg,
+            .palette = &self.palette,
+            .bold_is_bright = self.allow_bold and self.bold_is_bright,
+            .min_contrast = self.min_contrast,
+        };
     }
 
     pub fn draw(self: *GridPass, atlas: *Atlas, viewport_w: i32, viewport_h: i32) void {
@@ -1607,3 +1611,204 @@ pub const GridPass = struct {
 };
 
 const palette_256 = @import("../grid/palette.zig").default_256;
+
+// ── Tests: CPU quad emission, no GL context ─────────────────────────
+//
+// `emitCellDeco` / `emitRowDecos` build vertices from a style pool
+// and cells alone (no atlas, no GL), so the overlay's decoration
+// placement is checked here against the same `style.zig` geometry
+// CellPass's shader uses; `smoke-cell` then proves the pixels.
+
+const testing = std.testing;
+const Attrs = @import("../grid/style_pool.zig").Attrs;
+
+const Bounds = struct { x0: f32, y0: f32, x1: f32, y1: f32 };
+
+/// Bounding box of quad `i` (six vertices) in `verts`.
+fn quadBounds(verts: []const Vertex, i: usize) Bounds {
+    var b = Bounds{ .x0 = std.math.inf(f32), .y0 = std.math.inf(f32), .x1 = -std.math.inf(f32), .y1 = -std.math.inf(f32) };
+    for (verts[i * 6 .. i * 6 + 6]) |v| {
+        b.x0 = @min(b.x0, v.pos[0]);
+        b.y0 = @min(b.y0, v.pos[1]);
+        b.x1 = @max(b.x1, v.pos[0]);
+        b.y1 = @max(b.y1, v.pos[1]);
+    }
+    return b;
+}
+
+fn expectQuadRect(verts: []const Vertex, i: usize, x: f32, w: f32, y: f32, r: style_util.DecoRect) !void {
+    const b = quadBounds(verts, i);
+    try testing.expectEqual(x, b.x0);
+    try testing.expectEqual(x + w, b.x1);
+    try testing.expectEqual(y + r.y, b.y0);
+    try testing.expectEqual(y + r.y + r.h, b.y1);
+}
+
+test "emitCellDeco: every decoration kind lands where style.zig says" {
+    var pool = try StylePool.init(testing.allocator);
+    defer pool.deinit();
+    var gp = GridPass.init(testing.allocator);
+    defer gp.deinit();
+    const cw: f32 = 8;
+    const ch: f32 = 17;
+    const y: f32 = 40;
+    const col: usize = 2;
+    const x = gp.pad + @as(f32, @floatFromInt(col)) * cw;
+
+    for (std.enums.values(style_util.Deco)) |kind| {
+        if (kind == .none) continue;
+        var a = Attrs{};
+        switch (kind) {
+            .underline => a.setUnderlineStyle(.single),
+            .double_underline => a.setUnderlineStyle(.double),
+            .curly => a.setUnderlineStyle(.curly),
+            .dotted => a.setUnderlineStyle(.dotted),
+            .dashed => a.setUnderlineStyle(.dashed),
+            .strikethrough => a.strikethrough = true,
+            .overline => a.overline = true,
+            .none => unreachable,
+        }
+        const cell = Cell{ .rune = ' ', .style_ref = try pool.intern(.{ .attrs = a }) };
+        gp.vbuf.clearRetainingCapacity();
+        try gp.emitCellDeco(&pool, cell, col, y, cw, ch, 1.0);
+        const verts = gp.vbuf.items;
+        if (kind == .double_underline) {
+            try testing.expectEqual(@as(usize, 12), verts.len);
+            for (style_util.decoDoubleLines(ch), 0..) |r, i| try expectQuadRect(verts, i, x, cw, y, r);
+            continue;
+        }
+        try testing.expectEqual(@as(usize, 6), verts.len);
+        try expectQuadRect(verts, 0, x, cw, y, style_util.decoStrip(kind, ch));
+        // Shaded kinds ship the strip attributes the fragment stage
+        // rasterises with; solid ones must not, or they would be
+        // shaded too.
+        for (verts) |v| {
+            if (kind.shaded()) {
+                try testing.expectEqual(cw, v.strip[2]);
+                try testing.expectEqual(style_util.decoThin(ch), v.strip[3]);
+                try testing.expectEqual(@as(f32, @floatFromInt(@intFromEnum(kind))), v.strip_kind);
+            } else {
+                try testing.expectEqual(@as(f32, 0), v.strip[2]);
+            }
+        }
+    }
+}
+
+test "emitCellDeco: underline plus strike plus overline emit three independent quads" {
+    var pool = try StylePool.init(testing.allocator);
+    defer pool.deinit();
+    var gp = GridPass.init(testing.allocator);
+    defer gp.deinit();
+    const ch: f32 = 20;
+    const cell = Cell{ .rune = 'x', .style_ref = try pool.intern(.{ .attrs = .{ .underline = true, .strikethrough = true, .overline = true } }) };
+    try gp.emitCellDeco(&pool, cell, 0, 0, 9, ch, 1.0);
+    try testing.expectEqual(@as(usize, 18), gp.vbuf.items.len);
+    try expectQuadRect(gp.vbuf.items, 0, gp.pad, 9, 0, style_util.decoStrip(.underline, ch));
+    try expectQuadRect(gp.vbuf.items, 1, gp.pad, 9, 0, style_util.decoStrip(.strikethrough, ch));
+    try expectQuadRect(gp.vbuf.items, 2, gp.pad, 9, 0, style_util.decoStrip(.overline, ch));
+}
+
+test "emitCellDeco: decoration colour is the resolver's, not a private copy" {
+    var pool = try StylePool.init(testing.allocator);
+    defer pool.deinit();
+    var gp = GridPass.init(testing.allocator);
+    defer gp.deinit();
+    gp.min_contrast = 4.5;
+    // Bold + dim + reverse with palette colours: the lift, swap, dim
+    // and contrast snap all apply, and the deco colour must be the
+    // very fg the glyphs get.
+    const entry = StyleEntry{ .fg = .{ .palette = 1 }, .bg = .{ .palette = 7 }, .attrs = .{ .bold = true, .dim = true, .reverse = true, .underline = true } };
+    const cell = Cell{ .rune = ' ', .style_ref = try pool.intern(entry) };
+    try gp.emitCellDeco(&pool, cell, 0, 0, 8, 17, 1.0);
+    const want = gp.styleResolver().resolve(entry);
+    try testing.expectEqual(want.deco, gp.vbuf.items[0].color);
+    try testing.expectEqual(want.fg, want.deco);
+    // SGR 58 overrides it with the raw colour.
+    var with_58 = entry;
+    with_58.underline_color = .{ .rgb = .{ .r = 255, .g = 0, .b = 0 } };
+    const cell58 = Cell{ .rune = ' ', .style_ref = try pool.intern(with_58) };
+    gp.vbuf.clearRetainingCapacity();
+    try gp.emitCellDeco(&pool, cell58, 0, 0, 8, 17, 1.0);
+    try testing.expectEqual([4]f32{ 1, 0, 0, 1 }, gp.vbuf.items[0].color);
+}
+
+test "emitCellDeco: a wide cell spans two columns and its continuation emits nothing" {
+    var pool = try StylePool.init(testing.allocator);
+    defer pool.deinit();
+    var gp = GridPass.init(testing.allocator);
+    defer gp.deinit();
+    const cw: f32 = 8;
+    const ch: f32 = 17;
+    const ref = try pool.intern(.{ .attrs = .{ .dashed_underline = true } });
+    const left = Cell{ .rune = 0x4E2D, .style_ref = ref, .flags = cell_mod.FLAG_WIDE_LEFT };
+    const cont = Cell{ .rune = 0, .style_ref = ref, .flags = cell_mod.FLAG_WIDE_CONT };
+    try gp.emitCellDeco(&pool, left, 3, 0, cw, ch, 1.0);
+    try testing.expectEqual(@as(usize, 6), gp.vbuf.items.len);
+    try expectQuadRect(gp.vbuf.items, 0, gp.pad + 3 * cw, 2 * cw, 0, style_util.decoStrip(.dashed, ch));
+    // The strip's own width doubles with it, so the pattern's pixel
+    // scale matches CellPass's `cell_size.x` for the same wide cell.
+    try testing.expectEqual(2 * cw, gp.vbuf.items[0].strip[2]);
+    try gp.emitCellDeco(&pool, cont, 4, 0, cw, ch, 1.0);
+    try testing.expectEqual(@as(usize, 6), gp.vbuf.items.len);
+    // DECDWL doubles the column pitch and the width again.
+    gp.vbuf.clearRetainingCapacity();
+    try gp.emitCellDeco(&pool, left, 3, 0, cw, ch, 2.0);
+    try expectQuadRect(gp.vbuf.items, 0, gp.pad + 3 * cw * 2, 4 * cw, 0, style_util.decoStrip(.dashed, ch));
+}
+
+test "emitRowDecos: a bidi row draws decorations at visual columns" {
+    var pool = try StylePool.init(testing.allocator);
+    defer pool.deinit();
+    var gp = GridPass.init(testing.allocator);
+    defer gp.deinit();
+    const cw: f32 = 8;
+    const ch: f32 = 17;
+    const plain = try pool.intern(.{});
+    const under = try pool.intern(.{ .attrs = .{ .underline = true } });
+    // Three Hebrew letters: logical 0 is the RIGHTMOST cell on screen.
+    const cells = [_]Cell{
+        .{ .rune = 0x05D0, .style_ref = under },
+        .{ .rune = 0x05D1, .style_ref = plain },
+        .{ .rune = 0x05D2, .style_ref = plain },
+    };
+    try testing.expect(GridPass.rowNeedsBidi(&cells));
+    const order = try gp.visualOrder(&cells);
+    try testing.expectEqualSlices(usize, &.{ 2, 1, 0 }, order);
+
+    try gp.emitRowDecos(&pool, &cells, order, 0, cw, ch, 1.0);
+    try testing.expectEqual(@as(usize, 6), gp.vbuf.items.len);
+    try expectQuadRect(gp.vbuf.items, 0, gp.pad + 2 * cw, cw, 0, style_util.decoStrip(.underline, ch));
+
+    // Logical order (an LTR complex-script row) keeps it at column 0.
+    gp.vbuf.clearRetainingCapacity();
+    try gp.emitRowDecos(&pool, &cells, null, 0, cw, ch, 1.0);
+    try expectQuadRect(gp.vbuf.items, 0, gp.pad, cw, 0, style_util.decoStrip(.underline, ch));
+}
+
+test "emitRowDecos: an underlined space in an RTL run moves with the run" {
+    var pool = try StylePool.init(testing.allocator);
+    defer pool.deinit();
+    var gp = GridPass.init(testing.allocator);
+    defer gp.deinit();
+    const cw: f32 = 8;
+    const ch: f32 = 17;
+    const plain = try pool.intern(.{});
+    const dotted = try pool.intern(.{ .attrs = .{ .dotted_underline = true } });
+    // "ab" then Hebrew with an underlined space off the RTL run's
+    // centre: the LTR prefix stays put, the run (logical 2..5)
+    // mirrors, so the space at logical 3 shows at visual 4.
+    const cells = [_]Cell{
+        .{ .rune = 'a', .style_ref = plain },
+        .{ .rune = 'b', .style_ref = plain },
+        .{ .rune = 0x05D0, .style_ref = plain },
+        .{ .rune = ' ', .style_ref = dotted },
+        .{ .rune = 0x05D1, .style_ref = plain },
+        .{ .rune = 0x05D2, .style_ref = plain },
+    };
+    const order = try gp.visualOrder(&cells);
+    try testing.expectEqualSlices(usize, &.{ 0, 1, 5, 4, 3, 2 }, order);
+    const visual_of_space: usize = 4;
+    try gp.emitRowDecos(&pool, &cells, order, 0, cw, ch, 1.0);
+    try testing.expectEqual(@as(usize, 6), gp.vbuf.items.len);
+    try expectQuadRect(gp.vbuf.items, 0, gp.pad + @as(f32, @floatFromInt(visual_of_space)) * cw, cw, 0, style_util.decoStrip(.dotted, ch));
+}

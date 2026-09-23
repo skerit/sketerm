@@ -11,6 +11,8 @@ const Line = @import("line.zig").Line;
 const Pool = @import("style_pool.zig").Pool;
 const Charset = Screen.Charset;
 const Entry = @import("style_pool.zig").Entry;
+const Attrs = @import("style_pool.zig").Attrs;
+const Color = @import("style_pool.zig").Color;
 const version = @import("../version.zig");
 
 /// The two replies that name our own version, built once at comptime
@@ -1289,29 +1291,17 @@ pub fn sgr(self: *Screen, params: Event.Csi) void {
             2 => entry.attrs.dim = true,
             3 => entry.attrs.italic = true,
             4 => {
-                // `4` alone or `4;N` → plain underline.
-                // `4:0` → no underline; `4:1` → straight; `4:2`
-                // → double; `4:3` → curly; `4:4` → dotted; `4:5`
-                // → dashed. Sub-param-aware, kitty/iTerm2 spec.
+                // `4` alone or `4;N` -> plain underline. `4:N` picks
+                // the style (kitty/iTerm2 spec, `Attrs.UnderlineStyle`
+                // numbers them); an unknown N is a plain underline.
+                // Styles replace each other: `4:3` after `4:2` leaves
+                // only curly.
                 if (i + 1 < params.n_params and params.isSub(i + 1)) {
-                    const style = params.params[i + 1];
-                    switch (style) {
-                        0 => {
-                            entry.attrs.underline = false;
-                            entry.attrs.double_underline = false;
-                            entry.attrs.curly_underline = false;
-                        },
-                        1 => entry.attrs.underline = true,
-                        2 => entry.attrs.double_underline = true,
-                        3 => entry.attrs.curly_underline = true,
-                        // 4/5 (dotted/dashed) — fold into curly for now;
-                        // we have no separate flag.
-                        4, 5 => entry.attrs.curly_underline = true,
-                        else => entry.attrs.underline = true,
-                    }
+                    const style = std.enums.fromInt(Attrs.UnderlineStyle, params.params[i + 1]) orelse .single;
+                    entry.attrs.setUnderlineStyle(style);
                     i += 1;
                 } else {
-                    entry.attrs.underline = true;
+                    entry.attrs.setUnderlineStyle(.single);
                 }
             },
             5 => entry.attrs.blink = true,
@@ -1319,17 +1309,13 @@ pub fn sgr(self: *Screen, params: Event.Csi) void {
             7 => entry.attrs.reverse = true,
             8 => entry.attrs.invisible = true,
             9 => entry.attrs.strikethrough = true,
-            21 => entry.attrs.double_underline = true,
+            21 => entry.attrs.setUnderlineStyle(.double),
             22 => {
                 entry.attrs.bold = false;
                 entry.attrs.dim = false;
             },
             23 => entry.attrs.italic = false,
-            24 => {
-                entry.attrs.underline = false;
-                entry.attrs.double_underline = false;
-                entry.attrs.curly_underline = false;
-            },
+            24 => entry.attrs.setUnderlineStyle(.none),
             25 => {
                 entry.attrs.blink = false;
                 entry.attrs.fast_blink = false;
@@ -1381,6 +1367,76 @@ pub fn sgr(self: *Screen, params: Event.Csi) void {
         compactStylePool(self, );
         break :blk self.pool.intern(entry) catch self.cur_style;
     };
+}
+
+// ── SGR encoding ─────────────────────────────────────────────
+//
+// The inverse of `sgr`: a style entry back to the parameters that
+// recreate it, in the shape xterm's DECRQSS report uses (a `0` reset
+// first, then every attribute and colour that is set). DECRQSS and the
+// tty mirror both encode through here; `parser/sgr_conformance_test.zig`
+// round-trips every attribute and colour through `sgr` and back.
+
+/// The `;4...` item for the entry's underline style, empty for none;
+/// single is reported as plain `4`, the form every terminal knows.
+pub fn sgrUnderlineParam(attrs: Attrs) []const u8 {
+    return switch (attrs.underlineStyle()) {
+        .none => "",
+        .single => ";4",
+        inline else => |s| std.fmt.comptimePrint(";4:{d}", .{@intFromEnum(s)}),
+    };
+}
+
+/// Longest `sgrParams` output: every attribute plus truecolor fg, bg
+/// and underline colour. `sgr_conformance_test.zig` pins it, so a new
+/// attribute that lengthens the worst case fails there, not in a
+/// silently truncated DECRQSS reply.
+pub const sgr_params_max_len: usize = 75;
+
+/// A colour as SGR items: `base`+n for palette 0-7, `base`+60+n for
+/// 8-15, else `ext;5;n` / `ext;2;r;g;b`. Without a `base` (SGR 58 has
+/// none) every palette index takes the `ext;5;n` form.
+fn sgrColorParams(buf: []u8, color: Color, base: ?u8, ext: u8) ![]const u8 {
+    return switch (color) {
+        .default => buf[0..0],
+        .palette => |p| blk: {
+            if (base) |b| {
+                if (p < 8) break :blk try std.fmt.bufPrint(buf, ";{d}", .{b + p});
+                if (p < 16) break :blk try std.fmt.bufPrint(buf, ";{d}", .{b + 60 + (p - 8)});
+            }
+            break :blk try std.fmt.bufPrint(buf, ";{d};5;{d}", .{ ext, p });
+        },
+        .rgb => |c| try std.fmt.bufPrint(buf, ";{d};2;{d};{d};{d}", .{ ext, c.r, c.g, c.b }),
+    };
+}
+
+/// Writes the parameters that recreate `e` from a reset style, e.g.
+/// `0;1;4:3;38;2;255;0;0`, and returns the written slice.
+pub fn sgrParams(e: Entry, buf: []u8) ![]const u8 {
+    var len: usize = 0;
+    const put = struct {
+        fn item(out: []u8, at: *usize, s: []const u8) !void {
+            if (at.* + s.len > out.len) return error.NoSpaceLeft;
+            @memcpy(out[at.* .. at.* + s.len], s);
+            at.* += s.len;
+        }
+    }.item;
+    const a = e.attrs;
+    try put(buf, &len, "0");
+    if (a.bold) try put(buf, &len, ";1");
+    if (a.dim) try put(buf, &len, ";2");
+    if (a.italic) try put(buf, &len, ";3");
+    try put(buf, &len, sgrUnderlineParam(a));
+    if (a.blink) try put(buf, &len, ";5");
+    if (a.fast_blink) try put(buf, &len, ";6");
+    if (a.reverse) try put(buf, &len, ";7");
+    if (a.invisible) try put(buf, &len, ";8");
+    if (a.strikethrough) try put(buf, &len, ";9");
+    if (a.overline) try put(buf, &len, ";53");
+    len += (try sgrColorParams(buf[len..], e.fg, 30, 38)).len;
+    len += (try sgrColorParams(buf[len..], e.bg, 40, 48)).len;
+    len += (try sgrColorParams(buf[len..], e.underline_color, null, 58)).len;
+    return buf[0..len];
 }
 
 /// Garbage-collect the interned style pool. Walks every live cell

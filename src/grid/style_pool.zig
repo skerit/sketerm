@@ -32,6 +32,8 @@ pub const Color = union(enum) {
     }
 };
 
+/// Bit order is wire format: snapshots carry the raw u16, so a new
+/// attribute takes a `_pad` bit and never moves an existing one.
 pub const Attrs = packed struct(u16) {
     bold: bool = false,
     dim: bool = false,
@@ -45,7 +47,42 @@ pub const Attrs = packed struct(u16) {
     double_underline: bool = false,
     curly_underline: bool = false,
     overline: bool = false,
-    _pad: u4 = 0,
+    dotted_underline: bool = false,
+    dashed_underline: bool = false,
+    _pad: u2 = 0,
+
+    /// The SGR `4:N` underline styles, numbered as the sub-parameter
+    /// numbers them; this enum is the one home of that vocabulary.
+    pub const UnderlineStyle = enum(u3) {
+        none = 0,
+        single = 1,
+        double = 2,
+        curly = 3,
+        dotted = 4,
+        dashed = 5,
+    };
+
+    /// The one underline style these attrs carry; dotted and dashed
+    /// are tested before curly because they carry its bit too.
+    pub fn underlineStyle(self: Attrs) UnderlineStyle {
+        if (self.dotted_underline) return .dotted;
+        if (self.dashed_underline) return .dashed;
+        if (self.curly_underline) return .curly;
+        if (self.double_underline) return .double;
+        if (self.underline) return .single;
+        return .none;
+    }
+
+    /// Replaces whatever underline style was set; `.none` clears them all.
+    /// Dotted and dashed also set the curly bit, so a peer that predates
+    /// their bits draws the undercurl it always drew for `4:4` / `4:5`.
+    pub fn setUnderlineStyle(self: *Attrs, style: UnderlineStyle) void {
+        self.underline = style == .single;
+        self.double_underline = style == .double;
+        self.curly_underline = style == .curly or style == .dotted or style == .dashed;
+        self.dotted_underline = style == .dotted;
+        self.dashed_underline = style == .dashed;
+    }
 };
 
 pub const Entry = struct {
@@ -187,6 +224,72 @@ test "intern dedups" {
     const idx3 = try p.intern(e3);
     try std.testing.expectEqual(idx1, idx2);
     try std.testing.expect(idx1 != idx3);
+}
+
+test "Attrs keeps its u16 wire layout with the new underline bits in the pad" {
+    // The snapshot format serialises attrs as this raw integer; the
+    // twelve original bits must stay where an older peer reads them.
+    var a = Attrs{};
+    a.overline = true;
+    try std.testing.expectEqual(@as(u16, 1 << 11), @as(u16, @bitCast(a)));
+    a = .{};
+    a.dotted_underline = true;
+    try std.testing.expectEqual(@as(u16, 1 << 12), @as(u16, @bitCast(a)));
+    a = .{};
+    a.dashed_underline = true;
+    try std.testing.expectEqual(@as(u16, 1 << 13), @as(u16, @bitCast(a)));
+}
+
+test "setUnderlineStyle is exclusive and underlineStyle reads it back" {
+    var a = Attrs{};
+    inline for (comptime std.enums.values(Attrs.UnderlineStyle)) |style| {
+        a.setUnderlineStyle(style);
+        try std.testing.expectEqual(style, a.underlineStyle());
+        var set: u8 = 0;
+        inline for (.{ "underline", "double_underline", "curly_underline", "dotted_underline", "dashed_underline" }) |name| {
+            set += @intFromBool(@field(a, name));
+        }
+        const want: u8 = switch (style) {
+            .none => 0,
+            // Their own bit plus the curly fallback bit.
+            .dotted, .dashed => 2,
+            else => 1,
+        };
+        try std.testing.expectEqual(want, set);
+    }
+    // Switching styles replaces rather than accumulates.
+    a.setUnderlineStyle(.double);
+    a.setUnderlineStyle(.curly);
+    try std.testing.expect(!a.double_underline and a.curly_underline);
+    a.setUnderlineStyle(.dotted);
+    a.setUnderlineStyle(.single);
+    try std.testing.expect(!a.dotted_underline and !a.curly_underline and a.underline);
+}
+
+test "dotted and dashed read as curly to a peer without their bits" {
+    // An older peer's Attrs ends at overline with a u4 pad: it sees the
+    // low twelve bits only, and must find the curly bit there.
+    const Old = packed struct(u16) {
+        bold: bool,
+        dim: bool,
+        italic: bool,
+        underline: bool,
+        blink: bool,
+        fast_blink: bool,
+        reverse: bool,
+        invisible: bool,
+        strikethrough: bool,
+        double_underline: bool,
+        curly_underline: bool,
+        overline: bool,
+        _pad: u4,
+    };
+    inline for (.{ Attrs.UnderlineStyle.dotted, Attrs.UnderlineStyle.dashed }) |style| {
+        var a = Attrs{};
+        a.setUnderlineStyle(style);
+        const old: Old = @bitCast(a);
+        try std.testing.expect(old.curly_underline and !old.underline and !old.double_underline);
+    }
 }
 
 test "intern truecolor" {

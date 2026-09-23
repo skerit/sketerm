@@ -1325,9 +1325,15 @@ pub fn main() !u8 {
         if (rc != 0) return rc;
     }
 
-    // Straight decorations: CellPass vs GridPass pixel parity.
+    // Straight + patterned decorations: CellPass vs GridPass pixel parity.
     {
         const rc = try decoGeometryStage(allocator);
+        if (rc != 0) return rc;
+    }
+
+    // Decoration + bg colour: both passes resolve through style.zig.
+    {
+        const rc = try decoColorParityStage(allocator);
         if (rc != 0) return rc;
     }
 
@@ -1819,22 +1825,25 @@ fn curlyUnderlineStage(allocator: std.mem.Allocator) !u8 {
     return 0;
 }
 
-/// Underline / double underline / strikethrough / overline must land
-/// on the SAME scanlines whichever pass draws them, and on the
-/// scanlines `render/style.zig` says. The curly stage above is the
+/// Underline / double underline / strikethrough / overline / dotted /
+/// dashed must light the SAME pixels whichever pass draws them, and
+/// the pixels `render/style.zig` says. The curly stage above is the
 /// wave's counterpart to this one.
 ///
 /// Both halves matter. The two passes rasterise decorations through
 /// completely different code — CellPass places a strip in its vertex
-/// shader and shades it, GridPass emits flat quads on the CPU — so a
-/// row that gets routed to the overlay (RTL / complex script / DW-DH)
-/// used to show a different underline from its plain neighbour. The
-/// stage renders the same decorated spaces on a plain row and on a
-/// row carrying one Thai codepoint (complex script, still LTR, so
-/// columns do not move) and compares the two per-column vertical
-/// profiles bit for bit. It then compares BOTH against the rects the
-/// shared geometry predicts, so a pass that drifts in lockstep with
-/// its own private copy of the maths still fails.
+/// shader and shades it, GridPass emits quads on the CPU (strip quads
+/// the fragment stage patterns, for dotted / dashed) — so a row that
+/// gets routed to the overlay (RTL / complex script / DW-DH) used to
+/// show a different underline from its plain neighbour. The stage
+/// renders the same decorated spaces on a plain row and on a row
+/// carrying one Thai codepoint (complex script, still LTR, so columns
+/// do not move) and compares the two cells of every group pixel for
+/// pixel, scanlines AND columns. It then compares BOTH against the
+/// map the shared geometry predicts (strip rows x `decoPatternLit`
+/// columns), so a pass that drifts in lockstep with its own private
+/// copy of the maths still fails, and so does a dotted line that
+/// lights every column.
 fn decoGeometryStage(allocator: std.mem.Allocator) !u8 {
     const DW: c_int = 320;
     const DH: c_int = 160;
@@ -1884,22 +1893,24 @@ fn decoGeometryStage(allocator: std.mem.Allocator) !u8 {
     var ec = Ctx{ .screen = screen, .allocator = allocator };
 
     // Decorated SPACES only: nothing but the decoration is lit inside
-    // the probed columns, so a profile is the decoration itself.
+    // the probed cells, so a lit map is the decoration itself.
     // Column groups (0-based): 0-1 underline, 3-4 double, 6-7 strike,
-    // 9-10 overline, 12-13 curly; the odd columns between them stay
-    // undecorated.
+    // 9-10 overline, 12-13 curly, 15-16 dotted, 18-19 dashed; the
+    // columns between them stay undecorated.
     const deco_row =
         "\x1b[38;2;255;0;0m" ++
         "\x1b[4m  \x1b[24m " ++
         "\x1b[21m  \x1b[24m " ++
         "\x1b[9m  \x1b[29m " ++
         "\x1b[53m  \x1b[55m " ++
-        "\x1b[4:3m  \x1b[24m";
+        "\x1b[4:3m  \x1b[24m " ++
+        "\x1b[4:4m  \x1b[24m " ++
+        "\x1b[4:5m  \x1b[24m";
     parser.advance("\x1b[1;1H" ++ deco_row ++ "\x1b[3;1H" ++ deco_row ++
         // One Thai codepoint far to the right of the probes routes row
         // 3 to the GridPass overlay (complex script) while leaving the
         // row left-to-right, so visual columns == logical columns.
-        "\x1b[3;21H\u{0E01}" ++
+        "\x1b[3;22H\u{0E01}" ++
         // Park the cursor on the last row so its quad cannot land in a
         // probed band.
         "\x1b[6;24H", Emit.cb, @ptrCast(&ec));
@@ -1942,16 +1953,26 @@ fn decoGeometryStage(allocator: std.mem.Allocator) !u8 {
             const sum: u32 = @as(u32, buf[o]) + buf[o + 1] + buf[o + 2];
             return sum > 30;
         }
-        fn markRect(r: style_util.DecoRect, out: []bool) void {
-            var i: usize = @intFromFloat(r.y);
+        /// Mark the rect's scanlines in a `cw x ch` map, every column
+        /// the pattern lights (all of them for a solid kind).
+        fn markRect(kind: style_util.Deco, r: style_util.DecoRect, ch: f32, cw_px: usize, out: []bool) void {
+            var dy: usize = @intFromFloat(r.y);
             const end: usize = @intFromFloat(r.y + r.h);
-            while (i < end and i < out.len) : (i += 1) out[i] = true;
+            while (dy < end and dy * cw_px < out.len) : (dy += 1) {
+                for (0..cw_px) |dx| {
+                    const x_px: f32 = @as(f32, @floatFromInt(dx)) + 0.5;
+                    out[dy * cw_px + dx] = style_util.decoPatternLit(kind, x_px, ch);
+                }
+            }
         }
     };
 
-    const profile = try allocator.alloc(bool, chu * 2);
-    defer allocator.free(profile);
-    const want = try allocator.alloc(bool, chu);
+    // One `cw x ch` lit map per pass, plus the expected one.
+    const cell_map = try allocator.alloc(bool, cw * chu);
+    defer allocator.free(cell_map);
+    const grid_map = try allocator.alloc(bool, cw * chu);
+    defer allocator.free(grid_map);
+    const want = try allocator.alloc(bool, cw * chu);
     defer allocator.free(want);
 
     const Group = struct { name: []const u8, col: usize, kind: style_util.Deco };
@@ -1961,71 +1982,259 @@ fn decoGeometryStage(allocator: std.mem.Allocator) !u8 {
         .{ .name = "strike", .col = 6, .kind = .strikethrough },
         .{ .name = "overline", .col = 9, .kind = .overline },
         .{ .name = "curly", .col = 12, .kind = .curly },
+        .{ .name = "dotted", .col = 15, .kind = .dotted },
+        .{ .name = "dashed", .col = 18, .kind = .dashed },
     };
 
     var failures: u8 = 0;
     for (groups) |grp| {
-        const x = pad + grp.col * cw + cw / 2;
-        const cell_prof = profile[0..chu];
-        const grid_prof = profile[chu..];
-        for (0..chu) |dy| {
-            // Row 0 is drawn by CellPass, row 2 by the GridPass overlay.
-            cell_prof[dy] = helpers.lit(fb, wu, hu, x, pad + dy);
-            grid_prof[dy] = helpers.lit(fb, wu, hu, x, pad + 2 * chu + dy);
-        }
-
-        var n_cell: usize = 0;
-        var n_grid: usize = 0;
-        for (cell_prof) |b| n_cell += @intFromBool(b);
-        for (grid_prof) |b| n_grid += @intFromBool(b);
-        std.debug.print("smoke-cell: deco {s} lit cell={d} grid={d} (ch={d})\n", .{ grp.name, n_cell, n_grid, chu });
-        if (n_cell == 0 or n_grid == 0) {
-            std.debug.print("smoke-cell: deco FAIL - {s} missing from a pass (cell={d} grid={d})\n", .{ grp.name, n_cell, n_grid });
-            failures += 1;
-            continue;
-        }
-
-        if (grp.kind == .curly) {
-            // The wave's SHAPE is curlyUnderlineStage's job; what this
-            // stage adds is where the strip sits, which that stage
-            // takes as given. Neither pass may light a pixel outside
-            // the shared strip.
-            @memset(want, false);
-            helpers.markRect(style_util.decoStrip(.curly, chf), want);
+        // Both cells of the group: the pattern restarts at every cell,
+        // so the second cell must be the first one again.
+        for (0..2) |ci| {
+            const x0 = pad + (grp.col + ci) * cw;
             for (0..chu) |dy| {
-                if ((cell_prof[dy] or grid_prof[dy]) and !want[dy]) {
-                    std.debug.print("smoke-cell: deco FAIL - curly lit outside its strip at dy={d}\n", .{dy});
-                    failures += 1;
-                    break;
+                for (0..cw) |dx| {
+                    // Row 0 is drawn by CellPass, row 2 by the GridPass overlay.
+                    cell_map[dy * cw + dx] = helpers.lit(fb, wu, hu, x0 + dx, pad + dy);
+                    grid_map[dy * cw + dx] = helpers.lit(fb, wu, hu, x0 + dx, pad + 2 * chu + dy);
                 }
             }
-            continue;
-        }
 
-        @memset(want, false);
-        if (grp.kind == .double_underline) {
-            for (style_util.decoDoubleLines(chf)) |r| helpers.markRect(r, want);
-        } else {
-            helpers.markRect(style_util.decoStrip(grp.kind, chf), want);
-        }
+            var n_cell: usize = 0;
+            var n_grid: usize = 0;
+            for (cell_map) |b| n_cell += @intFromBool(b);
+            for (grid_map) |b| n_grid += @intFromBool(b);
+            std.debug.print("smoke-cell: deco {s}[{d}] lit cell={d} grid={d} (cw={d} ch={d})\n", .{ grp.name, ci, n_cell, n_grid, cw, chu });
+            if (n_cell == 0 or n_grid == 0) {
+                std.debug.print("smoke-cell: deco FAIL - {s} missing from a pass (cell={d} grid={d})\n", .{ grp.name, n_cell, n_grid });
+                failures += 1;
+                continue;
+            }
 
-        var mismatch_pass: usize = 0;
-        var mismatch_want: usize = 0;
-        for (0..chu) |dy| {
-            if (cell_prof[dy] != grid_prof[dy]) mismatch_pass += 1;
-            if (cell_prof[dy] != want[dy] or grid_prof[dy] != want[dy]) mismatch_want += 1;
-        }
-        if (mismatch_pass != 0) {
-            std.debug.print("smoke-cell: deco FAIL - {s} differs between CellPass and GridPass on {d} scanline(s)\n", .{ grp.name, mismatch_pass });
-            failures += 1;
-        }
-        if (mismatch_want != 0) {
-            std.debug.print("smoke-cell: deco FAIL - {s} does not match style.zig geometry on {d} scanline(s)\n", .{ grp.name, mismatch_want });
-            failures += 1;
+            if (grp.kind == .curly) {
+                // The wave's SHAPE is curlyUnderlineStage's job; what
+                // this stage adds is where the strip sits, which that
+                // stage takes as given. Neither pass may light a pixel
+                // outside the shared strip.
+                @memset(want, false);
+                helpers.markRect(.curly, style_util.decoStrip(.curly, chf), chf, cw, want);
+                for (0..chu) |dy| {
+                    for (0..cw) |dx| {
+                        const i = dy * cw + dx;
+                        if ((cell_map[i] or grid_map[i]) and !want[i]) {
+                            std.debug.print("smoke-cell: deco FAIL - curly lit outside its strip at dy={d}\n", .{dy});
+                            failures += 1;
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
+
+            @memset(want, false);
+            if (grp.kind == .double_underline) {
+                for (style_util.decoDoubleLines(chf)) |r| helpers.markRect(grp.kind, r, chf, cw, want);
+            } else {
+                helpers.markRect(grp.kind, style_util.decoStrip(grp.kind, chf), chf, cw, want);
+            }
+
+            var mismatch_pass: usize = 0;
+            var mismatch_want: usize = 0;
+            var n_want: usize = 0;
+            for (0..cw * chu) |i| {
+                n_want += @intFromBool(want[i]);
+                if (cell_map[i] != grid_map[i]) mismatch_pass += 1;
+                if (cell_map[i] != want[i] or grid_map[i] != want[i]) mismatch_want += 1;
+            }
+            if (mismatch_pass != 0) {
+                std.debug.print("smoke-cell: deco FAIL - {s} differs between CellPass and GridPass on {d} pixel(s)\n", .{ grp.name, mismatch_pass });
+                failures += 1;
+            }
+            if (mismatch_want != 0) {
+                std.debug.print("smoke-cell: deco FAIL - {s} does not match style.zig geometry on {d} pixel(s) (want {d} lit, cell {d}, grid {d})\n", .{ grp.name, mismatch_want, n_want, n_cell, n_grid });
+                failures += 1;
+            }
+            // A patterned kind must really leave columns dark: a
+            // dotted line that lights the whole strip is a plain
+            // underline, and the map comparison above would only catch
+            // that if the expectation itself had gaps.
+            if (grp.kind.shaded()) {
+                const strip = style_util.decoStrip(grp.kind, chf);
+                const strip_px: usize = @as(usize, @intFromFloat(strip.h)) * cw;
+                if (n_want >= strip_px or n_cell >= strip_px or n_grid >= strip_px) {
+                    std.debug.print("smoke-cell: deco FAIL - {s} lights its whole strip (want {d}, cell {d}, grid {d} of {d})\n", .{ grp.name, n_want, n_cell, n_grid, strip_px });
+                    failures += 1;
+                }
+            }
         }
     }
 
     if (failures != 0) return 86;
     std.debug.print("smoke-cell: deco geometry parity OK\n", .{});
+    return 0;
+}
+
+/// Decoration and bg COLOUR parity: a bold + dim + reverse cell with
+/// an SGR-58-less underline, drawn on a plain row by CellPass and on
+/// an RTL row by GridPass, must get the same colours from both, and
+/// the colours `style.Resolver` predicts. The overlay used to skip
+/// the bold-bright lift on the bg and the min-contrast snap on the
+/// decoration, so this runs with a contrast floor that snaps.
+fn decoColorParityStage(allocator: std.mem.Allocator) !u8 {
+    const DW: c_int = 160;
+    const DH: c_int = 96;
+
+    var fbo: c_uint = 0;
+    var rbo: c_uint = 0;
+    c.glGenFramebuffers(1, &fbo);
+    c.glGenRenderbuffers(1, &rbo);
+    c.glBindRenderbuffer(c.GL_RENDERBUFFER, rbo);
+    c.glRenderbufferStorage(c.GL_RENDERBUFFER, c.GL_RGBA8, DW, DH);
+    c.glBindFramebuffer(c.GL_FRAMEBUFFER, fbo);
+    c.glFramebufferRenderbuffer(c.GL_FRAMEBUFFER, c.GL_COLOR_ATTACHMENT0, c.GL_RENDERBUFFER, rbo);
+    defer {
+        c.glBindFramebuffer(c.GL_FRAMEBUFFER, 0);
+        c.glDeleteFramebuffers(1, &fbo);
+        c.glDeleteRenderbuffers(1, &rbo);
+    }
+    if (c.glCheckFramebufferStatus(c.GL_FRAMEBUFFER) != c.GL_FRAMEBUFFER_COMPLETE) {
+        std.debug.print("smoke-cell: deco colour FAIL - framebuffer incomplete\n", .{});
+        return 87;
+    }
+
+    const atlas: ?*Atlas = fonts.openAtlas(allocator, FONT_SIZE);
+    if (atlas == null) {
+        std.debug.print("smoke-cell: deco colour FAIL - no font\n", .{});
+        return 88;
+    }
+    defer atlas.?.deinit();
+    atlas.?.realize();
+
+    var pool = try StylePool.init(allocator);
+    defer pool.deinit();
+    const cols: u16 = 12;
+    const screen = try Screen.init(allocator, &pool, cols, 4);
+    defer screen.deinit();
+
+    var parser = @import("parser/vt.zig").Parser.init(allocator);
+    defer parser.deinit();
+    const Ctx = struct { screen: *Screen, allocator: std.mem.Allocator };
+    const Emit = struct {
+        fn cb(user: ?*anyopaque, ev: @import("parser/event.zig").Event) void {
+            const ec: *Ctx = @ptrCast(@alignCast(user.?));
+            var mut = ev;
+            ec.screen.apply(ev);
+            mut.deinit(ec.allocator);
+        }
+    };
+    var ec = Ctx{ .screen = screen, .allocator = allocator };
+    // Blue on blue: bold lifts the fg to bright blue, reverse makes
+    // that the bg, dim darkens the plain blue the underline is drawn
+    // in, and the contrast floor then snaps it against the bright bg.
+    const styled = "\x1b[1;2;7;4;34;44m  \x1b[0m";
+    parser.advance("\x1b[1;1H" ++ styled ++
+        // Row 3: the same two cells followed by a Hebrew letter, which
+        // routes the row to the overlay AND mirrors it (RTL paragraph).
+        "\x1b[3;1H" ++ styled ++ "\x1b[3;12H\u{05D0}" ++
+        "\x1b[4;12H", Emit.cb, @ptrCast(&ec));
+
+    var cell_pass = CellPass.init(allocator);
+    defer cell_pass.deinit();
+    try cell_pass.realize();
+    cell_pass.min_contrast = 4.5;
+    var grid_pass = GridPass.init(allocator);
+    defer grid_pass.deinit();
+    try grid_pass.realize();
+    grid_pass.min_contrast = 4.5;
+    grid_pass.canvas_w = @floatFromInt(DW);
+    grid_pass.canvas_h = @floatFromInt(DH);
+
+    c.glViewport(0, 0, DW, DH);
+    c.glClearColor(0, 0, 0, 1);
+    c.glClear(c.GL_COLOR_BUFFER_BIT);
+    cell_pass.markAllDirty();
+    try cell_pass.rebuildAndUpload(screen, &pool, atlas.?);
+    cell_pass.draw(atlas.?, DW, DH);
+    grid_pass.vbuf_valid = false;
+    try grid_pass.buildVertices(screen, &pool, atlas.?, false, true, &.{});
+    grid_pass.draw(atlas.?, DW, DH);
+    c.glFinish();
+
+    const fb = try allocator.alloc(u8, @as(usize, @intCast(DW * DH)) * 4);
+    defer allocator.free(fb);
+    c.glReadPixels(0, 0, DW, DH, c.GL_RGBA, c.GL_UNSIGNED_BYTE, fb.ptr);
+
+    const wu: usize = @intCast(DW);
+    const hu: usize = @intCast(DH);
+    const cw: usize = atlas.?.cell_w;
+    const chu: usize = atlas.?.cell_h;
+    const chf: f32 = @floatFromInt(chu);
+    const pad: usize = @intFromFloat(grid_pass.pad);
+
+    // The prediction, from the one resolver both passes use, over the
+    // same defaults, palette and tunables they were given.
+    const entry = pool.get(screen.cellAt(0, 0).style_ref);
+    const want = (style_util.Resolver{
+        .default_fg = screen.default_fg,
+        .default_bg = screen.default_bg,
+        .palette = &screen.palette,
+        .bold_is_bright = true,
+        .min_contrast = 4.5,
+    }).resolve(entry);
+    // The scenario only proves something if the snap fired and the
+    // lift changed the bg; guard against a palette that happens to
+    // pass the floor.
+    const snapped = (want.deco[0] == 0 and want.deco[1] == 0 and want.deco[2] == 0) or
+        (want.deco[0] == 1 and want.deco[1] == 1 and want.deco[2] == 1);
+    if (!snapped or !want.has_bg) {
+        std.debug.print("smoke-cell: deco colour FAIL - scenario does not snap (deco {d:.2} {d:.2} {d:.2})\n", .{ want.deco[0], want.deco[1], want.deco[2] });
+        return 89;
+    }
+
+    const helpers = struct {
+        fn px(buf: []const u8, w: usize, h: usize, x: usize, y_top: usize) [3]u8 {
+            const o = ((h - 1 - y_top) * w + x) * 4;
+            return .{ buf[o], buf[o + 1], buf[o + 2] };
+        }
+        fn close(got: [3]u8, exp: [4]f32) bool {
+            for (0..3) |i| {
+                const e: i32 = @intFromFloat(@round(exp[i] * 255.0));
+                if (@abs(@as(i32, got[i]) - e) > 2) return false;
+            }
+            return true;
+        }
+    };
+
+    const strip = style_util.decoStrip(.underline, chf);
+    const strip_y: usize = @intFromFloat(strip.y);
+    var failures: u8 = 0;
+    const Probe = struct { name: []const u8, row: u16 };
+    for ([_]Probe{ .{ .name = "CellPass", .row = 0 }, .{ .name = "GridPass(RTL)", .row = 2 } }) |p| {
+        for (0..2) |logical| {
+            // Row 2 is mirrored: ask the screen where the cell went.
+            const visual: usize = screen.logicalToVisualCol(allocator, @intCast(p.row), @intCast(logical));
+            if (p.row == 2 and visual == logical) {
+                std.debug.print("smoke-cell: deco colour FAIL - RTL row did not reorder\n", .{});
+                return 90;
+            }
+            const x = pad + visual * cw + cw / 2;
+            const y_bg = pad + p.row * chu + chu / 3;
+            const y_deco = pad + p.row * chu + strip_y;
+            const bg = helpers.px(fb, wu, hu, x, y_bg);
+            const deco = helpers.px(fb, wu, hu, x, y_deco);
+            std.debug.print("smoke-cell: deco colour {s} col {d}: bg {d},{d},{d} deco {d},{d},{d}\n", .{ p.name, visual, bg[0], bg[1], bg[2], deco[0], deco[1], deco[2] });
+            if (!helpers.close(bg, want.bg)) {
+                std.debug.print("smoke-cell: deco colour FAIL - {s} bg is not the resolver's ({d:.3} {d:.3} {d:.3})\n", .{ p.name, want.bg[0], want.bg[1], want.bg[2] });
+                failures += 1;
+            }
+            if (!helpers.close(deco, want.deco)) {
+                std.debug.print("smoke-cell: deco colour FAIL - {s} underline is not the resolver's ({d:.3} {d:.3} {d:.3})\n", .{ p.name, want.deco[0], want.deco[1], want.deco[2] });
+                failures += 1;
+            }
+        }
+    }
+
+    if (failures != 0) return 91;
+    std.debug.print("smoke-cell: deco colour parity OK\n", .{});
     return 0;
 }
