@@ -112,6 +112,8 @@ const SIG_W: c_int = 560;
 /// popular symbol can be tens of thousands, and building that many
 /// GtkLabels locks the UI for seconds.
 const MAX_ROWS: usize = 300;
+/// relatedInformation entries shown per diagnostic.
+const MAX_RELATED: usize = 16;
 /// Completion items KEPT per answer. Far above MAX_ROWS on purpose: the
 /// list is filtered locally as the user types, and rows past the first
 /// screenful are exactly the ones a longer prefix brings back.
@@ -1455,12 +1457,92 @@ pub const Manager = struct {
     fn diagnosticTextAt(self: *Manager, tab: *ETab, offset: usize) ?[]u8 {
         const st = tab.lsp orelse return null;
         const d = st.diags.at(offset) orelse return null;
-        return std.fmt.allocPrint(self.alloc, "{s}: {s}{s}{s}", .{
+        var out: std.ArrayList(u8) = .empty;
+        out.print(self.alloc, "{s}: {s}{s}{s}", .{
             d.severity.label(),
             d.message,
             if (d.source.len > 0) "  —  " else "",
             d.source,
-        }) catch null;
+        }) catch {
+            out.deinit(self.alloc);
+            return null;
+        };
+        // The server's `relatedInformation`, one line each; Alt+F8
+        // (`diagnostic_related`) jumps to them.
+        var rel: [MAX_RELATED]diagnostics.Related = undefined;
+        var n: usize = 0;
+        if (diagnostics.relatedOf(self.alloc, d.raw, &rel, &n)) |parsed_val| {
+            var parsed = parsed_val;
+            defer parsed.deinit();
+            for (rel[0..n]) |r| {
+                out.print(self.alloc, "\n  \u{21b3} {s}:{d}: {s}", .{ servers.basenameOf(r.uri), r.line + 1, r.message }) catch break;
+            }
+        }
+        return out.toOwnedSlice(self.alloc) catch {
+            out.deinit(self.alloc);
+            return null;
+        };
+    }
+
+    /// The locations the diagnostic at the caret points to
+    /// (`relatedInformation`), in the results popup; one is jumped to
+    /// directly, like a single definition.
+    pub fn showRelated(self: *Manager) void {
+        const r = self.ready("related information") orelse return;
+        const st = r.tab.lsp orelse return;
+        const d = st.diags.at(r.tab.sels.primary().head) orelse {
+            self.view.setStatusText("No diagnostic at the caret.");
+            return;
+        };
+        var rel: [MAX_RELATED]diagnostics.Related = undefined;
+        var n: usize = 0;
+        var parsed = diagnostics.relatedOf(self.alloc, d.raw, &rel, &n) orelse {
+            self.view.setStatusText("This diagnostic has no related locations.");
+            return;
+        };
+        defer parsed.deinit();
+        self.list.clearItems();
+        self.list.mode = .locations;
+        self.list.tab_id = r.tab.id;
+        self.list.revision = r.tab.doc.revision;
+        self.list.filter.clearRetainingCapacity();
+        for (rel[0..n]) |ri| {
+            const path = (servers.uriToPath(self.alloc, ri.uri) catch continue) orelse continue;
+            defer self.alloc.free(path);
+            const spec = self.specForConnPath(r.cn, path) orelse continue;
+            const label = std.fmt.allocPrint(self.alloc, "{s}:{d}", .{ servers.basenameOf(path), ri.line + 1 }) catch {
+                self.alloc.free(spec);
+                continue;
+            };
+            const detail = self.alloc.dupe(u8, ri.message) catch {
+                self.alloc.free(spec);
+                self.alloc.free(label);
+                continue;
+            };
+            self.list.items.append(self.alloc, .{
+                .label = label,
+                .detail = detail,
+                .payload = spec,
+                .line = ri.line,
+                .col = ri.character,
+            }) catch {
+                freeItem(self.alloc, .{ .label = label, .detail = detail, .payload = spec });
+                break;
+            };
+        }
+        if (self.list.items.items.len == 0) {
+            self.closePopup();
+            self.view.setStatusText("This diagnostic has no related locations.");
+            return;
+        }
+        if (self.list.items.items.len == 1) {
+            const it = self.list.items.items[0];
+            self.openLocation(it.payload, it.line, it.col);
+            self.closePopup();
+            return;
+        }
+        self.applyFilter();
+        self.showPopup();
     }
 
     // ---- navigation --------------------------------------------------------
@@ -3023,7 +3105,10 @@ pub const Manager = struct {
         if (self.diagnosticTextAtCaret(tab)) |txt| {
             defer self.alloc.free(txt);
             var buf: [220:0]u8 = undefined;
-            const msg = std.fmt.bufPrintZ(&buf, "{s}", .{txt}) catch return;
+            // The status line gets the message; related lines are the
+            // hover's (and Alt+F8's) business.
+            const first = txt[0 .. std.mem.indexOfScalar(u8, txt, '\n') orelse txt.len];
+            const msg = std.fmt.bufPrintZ(&buf, "{s}", .{@import("../editor/unicode.zig").clipUtf8(first, buf.len - 1)}) catch return;
             self.view.setStatusText(msg);
         }
     }
@@ -3053,7 +3138,8 @@ pub const Manager = struct {
         if (prog.len > 0) w.print(STATUS_SEP ++ "{s}: {s}", .{ cn.name, prog }) catch {};
         if (self.diagnosticTextAtCaret(tab)) |txt| {
             defer self.alloc.free(txt);
-            w.print(STATUS_SEP ++ "{s}", .{txt}) catch {};
+            // The message only: related lines belong to the hover.
+            w.print(STATUS_SEP ++ "{s}", .{firstLine(txt)}) catch {};
             return buf[0..w.end];
         }
         const cnts = st.diags.counts();

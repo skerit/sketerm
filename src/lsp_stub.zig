@@ -7,7 +7,8 @@
 //! Its "language" is trivial and deterministic:
 //!
 //!   * every occurrence of the word `BAD` is published as an error
-//!     diagnostic, and `MEH` as a warning — recomputed on didOpen and
+//!     diagnostic (whose relatedInformation points at the first `fn`),
+//!     and `MEH` as a warning — recomputed on didOpen and
 //!     didChange, so incremental sync is verified by whether the
 //!     diagnostics follow the edit;
 //!   * completion offers a fixed set of items, one of which carries a
@@ -384,7 +385,19 @@ fn publishDiagnostics() void {
             first = false;
             out.appendSlice(alloc, "{\"range\":") catch return;
             appendRange(&out, at, at + spec[0].len);
-            out.print(alloc, ",\"severity\":{d},\"source\":\"stub\",\"message\":\"{s}\"}}", .{ spec[1], spec[2] }) catch return;
+            out.print(alloc, ",\"severity\":{d},\"source\":\"stub\",\"message\":\"{s}\"", .{ spec[1], spec[2] }) catch return;
+            // An error points back at the document's first `fn`, so a
+            // client's relatedInformation navigation is observable.
+            if (spec[1] == 1) {
+                if (std.mem.indexOf(u8, doc_text.items, "fn ")) |fn_at| {
+                    out.appendSlice(alloc, ",\"relatedInformation\":[{\"location\":{\"uri\":\"") catch return;
+                    out.appendSlice(alloc, doc_uri.items) catch return;
+                    out.appendSlice(alloc, "\",\"range\":") catch return;
+                    appendRange(&out, fn_at, fn_at + 2);
+                    out.appendSlice(alloc, "},\"message\":\"stub: the first fn\"}]") catch return;
+                }
+            }
+            out.append(alloc, '}') catch return;
             from = at + spec[0].len;
         }
     }

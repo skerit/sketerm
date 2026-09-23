@@ -1021,6 +1021,43 @@ fn runLeg(allocator: std.mem.Allocator, remote: bool) u8 {
     savePng(app, win_id, shot("diagnostic-nav.png"));
     say("PASS F8 put the caret on a diagnostic line (rows {d}-{d}) -> zig-out/smoke-lsp-gui{s}-diagnostic-nav.png", .{ caret_after.?[0], caret_after.?[1], g_leg });
 
+    // ── 2a. related information (Alt+F8) ─────────────────────────
+    //
+    // The stub's error points back at the first `fn`: Alt+F8 on it must
+    // put the caret there. Proven through the text: a letter typed after
+    // the jump lands in front of `fn`, then is undone.
+    if (!plan.real_server) {
+        app.pressKey(win_id, "ctrl+Home") catch {};
+        pumpFor(app, 200);
+        app.pressKey(win_id, "F8") catch {};
+        pumpFor(app, 400);
+        app.pressKey(win_id, "alt+F8") catch {};
+        pumpFor(app, 800);
+        app.typeText(win_id, "Q") catch {};
+        pumpFor(app, 300);
+        app.pressKey(win_id, "ctrl+s") catch {};
+        var related_ok = false;
+        var rs: i64 = 0;
+        while (rs < 10_000) : (rs += 250) {
+            pumpFor(app, 250);
+            const content = readFile(allocator, doc_path.ptr) orelse continue;
+            defer allocator.free(content);
+            if (std.mem.indexOf(u8, content, "Qfn ") != null) {
+                related_ok = true;
+                break;
+            }
+        }
+        if (!related_ok) return fail("Alt+F8 did not jump to the diagnostic's related location", .{});
+        app.pressKey(win_id, "ctrl+z") catch {};
+        pumpFor(app, 300);
+        app.pressKey(win_id, "ctrl+s") catch {};
+        pumpFor(app, 800);
+        app.pressKey(win_id, "ctrl+Home") catch {};
+        app.pressKey(win_id, "F8") catch {};
+        pumpFor(app, 600);
+        say("PASS Alt+F8 jumped to the diagnostic's relatedInformation", .{});
+    }
+
     // ── 3. hover (Ctrl+I) ─────────────────────────────────────────
     const popups_before_hover = popupCount(app);
     app.pressKey(win_id, "ctrl+i") catch {};

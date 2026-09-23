@@ -231,7 +231,92 @@ pub const Store = struct {
 // Tests
 // ======================================================================
 
+/// One `relatedInformation` entry: a location that explains the
+/// diagnostic ("previous declaration is here"). Borrowed from the
+/// parsed JSON it came from.
+pub const Related = struct {
+    uri: []const u8,
+    line: u32,
+    character: u32,
+    message: []const u8,
+};
+
+/// The `relatedInformation` of a diagnostic's original JSON (`raw`),
+/// at most `out.len` entries. Returns the parse, which owns the strings
+/// the entries borrow; the caller deinits it. Null when there are none.
+pub fn relatedOf(alloc: Allocator, raw: []const u8, out: []Related, n: *usize) ?std.json.Parsed(std.json.Value) {
+    n.* = 0;
+    if (raw.len == 0) return null;
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch return null;
+    const arr = switch (parsed.value) {
+        .object => |o| switch (o.get("relatedInformation") orelse .null) {
+            .array => |a| a.items,
+            else => &[_]std.json.Value{},
+        },
+        else => &[_]std.json.Value{},
+    };
+    for (arr) |ri| {
+        if (n.* >= out.len) break;
+        if (ri != .object) continue;
+        const loc = ri.object.get("location") orelse continue;
+        if (loc != .object) continue;
+        const uri = switch (loc.object.get("uri") orelse .null) {
+            .string => |u| u,
+            else => continue,
+        };
+        const msg = switch (ri.object.get("message") orelse .null) {
+            .string => |m| m,
+            else => "",
+        };
+        var line: u32 = 0;
+        var ch: u32 = 0;
+        if (loc.object.get("range")) |rng| {
+            if (rng == .object) {
+                if (rng.object.get("start")) |st| {
+                    if (st == .object) {
+                        line = intU32(st.object.get("line"));
+                        ch = intU32(st.object.get("character"));
+                    }
+                }
+            }
+        }
+        out[n.*] = .{ .uri = uri, .line = line, .character = ch, .message = msg };
+        n.* += 1;
+    }
+    if (n.* == 0) {
+        parsed.deinit();
+        return null;
+    }
+    return parsed;
+}
+
+fn intU32(v: ?std.json.Value) u32 {
+    return switch (v orelse .null) {
+        .integer => |i| if (i < 0) 0 else @intCast(@min(i, std.math.maxInt(u32))),
+        else => 0,
+    };
+}
+
 const testing = std.testing;
+
+test "diagnostics: relatedInformation is read back from the original JSON" {
+    var out: [4]Related = undefined;
+    var n: usize = 0;
+    const raw =
+        \\{"message":"redeclared","relatedInformation":[
+        \\{"location":{"uri":"file:///a.zig","range":{"start":{"line":3,"character":4},"end":{"line":3,"character":9}}},"message":"first declared here"},
+        \\{"bogus":1}]}
+    ;
+    var parsed = relatedOf(testing.allocator, raw, &out, &n) orelse return error.TestUnexpectedResult;
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 1), n);
+    try testing.expectEqualStrings("file:///a.zig", out[0].uri);
+    try testing.expectEqual(@as(u32, 3), out[0].line);
+    try testing.expectEqual(@as(u32, 4), out[0].character);
+    try testing.expectEqualStrings("first declared here", out[0].message);
+    try testing.expect(relatedOf(testing.allocator, "{\"message\":\"x\"}", &out, &n) == null);
+    try testing.expect(relatedOf(testing.allocator, "", &out, &n) == null);
+}
 
 fn mk(start: usize, end: usize, sev: Severity, msg: []const u8) Diagnostic {
     return .{

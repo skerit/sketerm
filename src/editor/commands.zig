@@ -104,6 +104,7 @@ pub const Command = enum {
     workspace_symbols,
     next_diagnostic,
     prev_diagnostic,
+    diagnostic_related,
     // Per-tab indentation (palette only, no default chord).
     indent_use_tabs,
     indent_use_spaces,
@@ -285,6 +286,11 @@ pub fn info(cmd: Command) Info {
         },
         .next_diagnostic => .{ .label = "Next Diagnostic", .describe = "Jump to the next problem the language server reported.", .accels = &.{"F8"} },
         .prev_diagnostic => .{ .label = "Previous Diagnostic", .describe = "Jump to the previous problem the language server reported.", .accels = &.{"<Shift>F8"} },
+        .diagnostic_related => .{
+            .label = "Go to Related Information",
+            .describe = "List (or jump to) the locations the diagnostic at the caret refers to.",
+            .accels = &.{"<Alt>F8"},
+        },
         // Per-tab settings, reached from the palette; no chord.
         .indent_use_tabs => .{ .label = "Indent Using Tabs", .describe = "Indent this tab's document with hard tabs, whatever the file or .editorconfig says.", .accels = &.{} },
         .indent_use_spaces => .{ .label = "Indent Using Spaces", .describe = "Indent this tab's document with spaces, whatever the file or .editorconfig says.", .accels = &.{} },

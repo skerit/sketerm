@@ -4021,6 +4021,7 @@ pub const EditorView = struct {
             .workspace_symbols => m.requestWorkspaceSymbols(),
             .next_diagnostic => m.stepDiagnostic(true),
             .prev_diagnostic => m.stepDiagnostic(false),
+            .diagnostic_related => m.showRelated(),
             else => unreachable,
         }
     }
@@ -4319,6 +4320,7 @@ pub const EditorView = struct {
             .workspace_symbols,
             .next_diagnostic,
             .prev_diagnostic,
+            .diagnostic_related,
             => self.runLspCommand(cmd),
             .indent_use_tabs, .indent_use_spaces, .indent_width_2, .indent_width_4, .indent_width_8, .indent_auto => editorlang.runIndentCommand(self, tab, cmd),
         }
