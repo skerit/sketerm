@@ -10,7 +10,7 @@ never touches a disk and never runs a process.
 
 ```
 src/editor/project.zig    root discovery + the project set        GTK-free
-src/editor/psearch.zig    search results + the replace planner    GTK-free
+src/editor/psearch.zig    search results (replacement: search.zig) GTK-free
 src/editor/gitdiff.zig    unified-diff -> anchored gutter marks   GTK-free
 src/editor/outline.zig    symbol list, LSP or tree-sitter fed     GTK-free
 src/ui/editorproj.zig     the daemon jobs + the search panel      GTK
@@ -128,27 +128,31 @@ rather than on a re-guessed offset.
 
 ### Replace: preview, then apply
 
-1. **Preview** re-runs the whole search and computes, per file, the
-   full rewritten content plus the file's mtime at that moment.
-2. The panel shows which files will be rewritten and how many hits
-   each has. Nothing has been written.
-3. **Apply**:
+1. **Preview** re-runs the whole search and lists, per file, how many
+   hits a replace would change. Nothing has been written.
+2. **Apply** is the same policy as a language-server rename
+   (docs/lsp.md): the change lands in **buffers**, never on disk behind
+   the user's back.
    * a file OPEN in a tab is replaced through its Document as ONE
-     transaction and then SAVED, so `Ctrl+Z` undoes that file's whole
-     replacement (re-dirtying the buffer, which the user then saves
-     again) and the highlighter, the folds, the outline and the
-     language server all see the edit;
-   * every other file is written by the same atomic path an ordinary
-     `Ctrl+S` uses (temp file + `install` with the expected mtime), so
-     a file that changed since the preview is REFUSED, not clobbered.
-     The panel says how many were refused.
-4. The search re-runs, so the list reflects what is on disk now.
+     transaction, so `Ctrl+Z` undoes that file's whole replacement and
+     the highlighter, the folds, the outline and the language server all
+     see the edit;
+   * a file with no tab is OPENED as one, and its replacement is parked
+     in `editor/deferred.zig` until its load lands; it is then planned
+     against the text that actually arrived (a file that changed since
+     the preview is replaced as it is now, not overwritten with a stale
+     plan), or reported if the load fails.
+   * the regex template expansion (`$0`..`$9`, `$$`) is the find bar's own
+     (`editor/search.zig`), so the two cannot drift.
+3. The outcome line gives the file count with its undo shape ("one undo
+   step per file") and how many tabs were opened for it; the buffers are
+   left modified for the user to review and save (Save All,
+   `Ctrl+Alt+S`).
 
-Undo is therefore **per file**, and only for files that were open when
-the replace ran. That asymmetry is the reason the preview exists and is
-not optional.
+Undo is therefore **per file**, for every file the replace touched.
 
-`Enter` in the replacement entry previews; `Ctrl+Enter` applies. The
+`Ctrl+Shift+H` pressed again once a needle is typed moves to the
+replacement entry. `Enter` in the replacement entry previews; `Ctrl+Enter` applies. The
 destructive half needs the modifier, and it is the one action with no
 other keyboard route.
 

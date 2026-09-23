@@ -30,6 +30,7 @@ const appdrive = @import("ipc/appdrive.zig");
 const ctlsock = @import("smoke/ctlsock.zig");
 const tcpserver = @import("smoke/tcpserver.zig");
 const editorlang_stage = @import("smoke/editorlang.zig");
+const editorops_stage = @import("smoke/editorops.zig");
 const rigwin = @import("smoke/rigwin.zig");
 const muxclient = @import("mux/client.zig");
 const muxwire = @import("mux/wire.zig");
@@ -692,8 +693,10 @@ pub fn main() u8 {
             tor_stub_up = true;
             tor_line = std.fmt.bufPrint(&tor_line_buf, "mux_tor_socks_endpoint = 127.0.0.1:{d}\n", .{tor_stub.lis.port}) catch return fail("tor line");
         }
-        var config_buf: [256]u8 = undefined;
-        const config_text = std.fmt.bufPrint(&config_buf, "# smoke-e2e\napp_view = window\ngraphics_offload = true\n{s}{s}{s}", .{
+        var config_buf: [512]u8 = undefined;
+        const config_text = std.fmt.bufPrint(&config_buf, "# smoke-e2e\napp_view = window\ngraphics_offload = true\n{s}{s}{s}{s}", .{
+            // The editor-ops stage drives a command rebound here.
+            editorops_stage.CONFIG_LINE,
             if (c.getenv("SKETERM_SMOKE_E2E_FILES_ICONS") != null) "files_default_view = icons\n" else "",
             // The quake stage drives `sketerm --toggle` against a window
             // that was placed by quake config from its first map.
@@ -1049,6 +1052,13 @@ pub fn main() u8 {
         const app = drive orelse return fail("focused editor language smoke has no display driver");
         if (editorlang_stage.stage(allocator, app, sock_path, rt)) |why| return failMsg(why);
         say("editor languages: Python/Makefile/TypeScript highlighted, Ctrl+/ wrote each language's comment token, string brackets refused (tree and lexical), Makefile Tab wrote a tab, .editorconfig and the palette override set the indentation");
+        teardown();
+        return 0;
+    }
+    if (c.getenv("SKETERM_SMOKE_E2E_EDITOR_OPS_ONLY") != null) {
+        const app = drive orelse return fail("focused editor ops smoke has no display driver");
+        if (editorops_stage.stage(allocator, app, sock_path, rt)) |why| return failMsg(why);
+        say("editor ops: rebound join_lines on its config chord, find-bar Replace All in one undo step, Go to Line, a fold stepped over, project Replace in buffers until Save All");
         teardown();
         return 0;
     }
@@ -1462,6 +1472,8 @@ pub fn main() u8 {
             say("editor atlas: zoom/config rebuilds and re-realize kept one live texture; teardown verifier armed");
             if (editorlang_stage.stage(allocator, app, sock_path, rt)) |why| return failMsg(why);
             say("editor languages: grammars, comment tokens, string-aware brackets, Makefile tabs, .editorconfig and the indentation override");
+            if (editorops_stage.stage(allocator, app, sock_path, rt)) |why| return failMsg(why);
+            say("editor ops: rebound command, find-bar Replace All, Go to Line, folds, project Replace");
         }
 
         // 6c-2. The project layer, on a REAL git repository: root

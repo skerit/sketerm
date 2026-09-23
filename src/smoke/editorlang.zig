@@ -38,18 +38,18 @@ const Info = struct {
 const Reply = struct { ok: bool = false, lang: Info = .{} };
 const TextReply = struct { ok: bool = false, text: []const u8 = "" };
 
-const Ctx = struct {
+pub const Ctx = struct {
     allocator: std.mem.Allocator,
     app: *appdrive.App,
     sock: [:0]const u8,
     arena: std.heap.ArenaAllocator,
     panes: std.ArrayList(u32) = .empty,
 
-    fn a(self: *Ctx) std.mem.Allocator {
+    pub fn a(self: *Ctx) std.mem.Allocator {
         return self.arena.allocator();
     }
 
-    fn roundtrip(self: *Ctx, line: []const u8) ?[]u8 {
+    pub fn roundtrip(self: *Ctx, line: []const u8) ?[]u8 {
         const r = ctlsock.roundtrip(self.allocator, self.app, self.sock, line) orelse return null;
         defer self.allocator.free(r);
         return self.a().dupe(u8, r) catch null;
@@ -57,7 +57,7 @@ const Ctx = struct {
 
     /// `editor-lang` for `pane`, optionally at `offset`; null until the
     /// document has loaded.
-    fn info(self: *Ctx, pane: u32, offset: ?usize) ?Info {
+    pub fn info(self: *Ctx, pane: u32, offset: ?usize) ?Info {
         const req = if (offset) |o|
             std.fmt.allocPrint(self.a(), "{{\"cmd\":\"editor-lang\",\"pane\":{d},\"data\":\"{d}\"}}\n", .{ pane, o }) catch return null
         else
@@ -68,7 +68,7 @@ const Ctx = struct {
         return parsed.lang;
     }
 
-    fn waitInfo(self: *Ctx, pane: u32, offset: ?usize) ?Info {
+    pub fn waitInfo(self: *Ctx, pane: u32, offset: ?usize) ?Info {
         var waited: u32 = 0;
         while (waited < 15_000) : (waited += 100) {
             if (self.info(pane, offset)) |i| return i;
@@ -77,7 +77,7 @@ const Ctx = struct {
         return null;
     }
 
-    fn text(self: *Ctx, pane: u32) ?[]const u8 {
+    pub fn text(self: *Ctx, pane: u32) ?[]const u8 {
         const req = std.fmt.allocPrint(self.a(), "{{\"cmd\":\"get-text\",\"pane\":{d}}}\n", .{pane}) catch return null;
         const reply = self.roundtrip(req) orelse return null;
         const parsed = std.json.parseFromSliceLeaky(TextReply, self.a(), reply, .{ .ignore_unknown_fields = true }) catch return null;
@@ -87,7 +87,7 @@ const Ctx = struct {
 
     /// Poll the document until it starts with `prefix`; on a miss, say
     /// what the document and the status line held instead.
-    fn waitTextPrefix(self: *Ctx, pane: u32, prefix: []const u8) bool {
+    pub fn waitTextPrefix(self: *Ctx, pane: u32, prefix: []const u8) bool {
         var waited: u32 = 0;
         var last: []const u8 = "";
         while (waited < 10_000) : (waited += 100) {
@@ -102,7 +102,7 @@ const Ctx = struct {
         return false;
     }
 
-    fn open(self: *Ctx, path: []const u8) ?u32 {
+    pub fn open(self: *Ctx, path: []const u8) ?u32 {
         const req = std.fmt.allocPrint(self.a(), "{{\"cmd\":\"new-editor-tab\",\"data\":\"{s}\"}}\n", .{path}) catch return null;
         const reply = self.roundtrip(req) orelse return null;
         const at = std.mem.indexOf(u8, reply, "\"pane\":") orelse return null;
@@ -120,7 +120,7 @@ const Ctx = struct {
 
     /// Focus `pane`, give its canvas the keyboard as a click does, and
     /// put the caret back at the document start (the click moved it).
-    fn focus(self: *Ctx, pane: u32) bool {
+    pub fn focus(self: *Ctx, pane: u32) bool {
         const req = std.fmt.allocPrint(self.a(), "{{\"cmd\":\"focus\",\"pane\":{d}}}\n", .{pane}) catch return false;
         const reply = self.roundtrip(req) orelse return false;
         if (std.mem.indexOf(u8, reply, "\"ok\":true") == null) return false;
@@ -134,7 +134,7 @@ const Ctx = struct {
         return true;
     }
 
-    fn closeAll(self: *Ctx) void {
+    pub fn closeAll(self: *Ctx) void {
         for (self.panes.items) |p| {
             var buf: [96]u8 = undefined;
             // Saved first: a dirty editor tab turns close-pane into a
@@ -151,7 +151,7 @@ const Ctx = struct {
     }
 };
 
-fn writeFile(path: []const u8, body: []const u8) bool {
+pub fn writeFile(path: []const u8, body: []const u8) bool {
     var zbuf: [512]u8 = undefined;
     const z = std.fmt.bufPrintZ(&zbuf, "{s}", .{path}) catch return false;
     const fp = c.fopen(z.ptr, "wb") orelse return false;
@@ -161,7 +161,7 @@ fn writeFile(path: []const u8, body: []const u8) bool {
 
 /// Create `path`; an existing directory is fine (a rerun in the same
 /// runtime dir), and a real failure shows up as the fixture write.
-fn mkdir(path: []const u8) void {
+pub fn mkdir(path: []const u8) void {
     var zbuf: [512]u8 = undefined;
     const z = std.fmt.bufPrintZ(&zbuf, "{s}", .{path}) catch return;
     _ = c.mkdir(z.ptr, 0o755);

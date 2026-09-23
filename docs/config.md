@@ -133,7 +133,7 @@ first, and that is also the order rules are scanned in).
 | `[profile.<name>]` | profile-level keys; `<name>` = `default` edits the Default bundle |
 | `[platform.<name>]` | anything the top level accepts, applied only on `<name>` (`linux`, `macos`) |
 | `[domain.<name>]` | `host`, `transport` |
-| `[lsp.<name>]` | `command`, `args`, `languages`, `root_files`, `init_options`, `enabled` |
+| `[lsp.<name>]` | `command`, `args`, `languages`, `root_files`, `init_options`, `settings`, `enabled` |
 | `[mcp]` | `tools`, `web_gui` (defaults for every `sketerm mcp` run) |
 | `[mcp.<name>]` | `tools`, `web_gui` (an MCP profile selected with `--profile`; a different namespace from `[profile.<name>]`) |
 
@@ -991,6 +991,7 @@ built-in as it evolves.
 | `languages` | string | Comma-separated LSP languageIds this server handles. |
 | `root_files` | string | Comma-separated marker filenames; the nearest ancestor containing one becomes the workspace root. Empty = the document's own directory. |
 | `init_options` | string | Raw JSON object passed as `initialize.initializationOptions`. Malformed JSON is dropped rather than corrupting the request. |
+| `settings` | string | Raw JSON object of server settings: `workspace/configuration` is answered from it by dotted section, and it is pushed once with `workspace/didChangeConfiguration` after `initialized`. Malformed JSON is dropped. |
 | `enabled` | bool | |
 
 Note that when the prefs dialog writes the file back, every field of

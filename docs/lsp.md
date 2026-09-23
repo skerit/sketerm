@@ -16,14 +16,20 @@ src/lsp/docsync.zig      per-document version counter + the didChange queue
 src/lsp/diagnostics.zig  diagnostics as anchored byte ranges
 src/lsp/semantic.zig     the token legend, the packed data array, delta splicing
 src/lsp/inlay.zig        inlay hints as (byte offset, text) pairs
+src/lsp/symbols.zig      documentSymbol / workspace symbol answers flattened for the popup and outline
+src/lsp/completion.zig   completion context, sortText ranking, filterText matching, additionalTextEdits
+src/lsp/progress.zig     $/progress tokens and the status-line summary
+src/lsp/stderrtail.zig   the bounded tail of a server's stderr
 src/lsp/proc.zig         fork/exec with non-blocking stdio pipes (libc only);
                          spawnSock = the daemon-side socketpair variant
+src/editor/deferred.zig  cross-file edits parked until their tab's load lands
 src/mux/daemon.zig       handleLspOpen: remote spawn + root resolution + relay
-src/ui/editorlsp.zig     the ONLY GTK part: fd watches, popups, every feature,
-                         and RemoteLink (the per-host LSP transport)
+src/ui/editorlsp.zig     GTK: popups and every feature (one Manager per editor face)
+src/ui/editorlsp_conn.zig GTK: the process-wide registry of server connections
+src/ui/editorlsp_link.zig GTK: RemoteLink, the per-host LSP transport
 ```
 
-Everything above `editorlsp.zig` is GTK-free and lives in **both** test
+Everything above the `ui/` rows is GTK-free and lives in **both** test
 roots (`src/tests.zig` and `src/tests_core.zig`). `session.zig` never
 touches a file descriptor: bytes come in through `feed()` and go out into
 `out`, which is what lets `src/lsp/session_test.zig` drive the entire
@@ -44,8 +50,11 @@ standard. The child is forked with three pipes, all non-blocking:
   thread — the GUI is single-threaded.
 * **stdin** is written directly; a `G_IO_OUT` watch is installed **only**
   when a write comes up short, and removed again when the queue drains.
-* **stderr** is drained and the last line kept for the status line. It
-  has to be drained: a server whose stderr pipe fills stops serving.
+* **stderr** is drained into a bounded tail (`lsp/stderrtail.zig`, the
+  newest 1 KiB, cut on a line boundary). It has to be drained: a server
+  whose stderr pipe fills stops serving. When a server dies (or never
+  starts), the status line names it with the session's own error or the
+  last stderr lines, so a crash says why instead of going quiet.
 
 The child gets its own process group, so killing it kills whatever build
 tooling it spawned.
@@ -132,11 +141,19 @@ for a feature ("No language server for hover."). A host that failed
 once is remembered (`RemoteLink` stays listed as dead) so repeated
 attaches neither redial nor prompt.
 
-Known limitations: the remote server's stderr goes to /dev/null on the
-daemon host (nobody is there to read it; the GUI's status line loses
-the last-stderr-line nicety for remote conns), and a dead link is not
-redialed until the editor face is recreated — reconnect-on-demand was
-traded away to avoid a retry storm against an unreachable host.
+A dead link is **redialed on demand, with backoff** (`editorlsp_link.zig`):
+the next attach or feature request that needs the host redials once the
+retry time has passed, the wait doubling from 2 s up to 5 min after each
+failure and resetting on success. An unreachable host costs one quiet
+dial per window instead of a storm, and a host that comes back is used
+again without recreating the editor.
+
+A remote server's stderr: the GUI accepts a stderr tail after the channel
+id in the `chan_close` that ends a channel and shows it like a local
+one. Today's daemons still send the server's stderr to /dev/null and the
+id alone (which is what older daemons send too), so for remote servers
+the status line has the session error only. Capturing it daemon-side is
+open work.
 
 ## Position encoding
 
@@ -214,12 +231,17 @@ the document is **dropped** — this is the same discipline
 
 * completion, hover: dropped (their ranges describe text that is gone).
   ACCEPTING from an already-shown completion list is deliberately not
-  gated the same way: the popup stays up across a keystroke on purpose
-  (it re-requests on a 120 ms debounce), so the accept falls back from
-  the server's `textEdit` offsets to the client word scan — word start
-  plus live caret — rather than inserting nothing. A
-  `completionItem/resolve` answer is correlated to its list and item and
-  carries documentation TEXT, so it too is revision-independent;
+  gated the same way: the popup stays up across keystrokes on purpose
+  (it filters locally), so the accept falls back from the server's
+  `textEdit` offsets to the client word scan — word start plus live
+  caret — rather than inserting nothing. `additionalTextEdits` ride the
+  same accept as ONE transaction; an extra edit that ends before the
+  word start is still exact after typing (typing only happens at the
+  caret), one that reaches past it is applied only while the document is
+  unchanged since it was converted. A `completionItem/resolve` answer is
+  correlated to its list and item; it carries documentation text and,
+  for servers that compute auto-imports lazily, `additionalTextEdits`,
+  converted against the text as it is on arrival;
 * formatting: refused with "Document changed while formatting";
 * documentSymbol (the outline panel): refused and re-asked. Filling the
   outline stamps it with the current revision, so a mis-mapped fill
@@ -254,9 +276,15 @@ the document is **dropped** — this is the same discipline
   queue **first**, so an answer always describes the text on screen —
   the debounce trades server CPU against how fresh diagnostics feel, and
   nothing else.
-* **completion** re-requests **120 ms** after a keystroke while the popup
-  is open, and immediately on an explicit Ctrl+Space or a server-declared
-  trigger character.
+* **completion** is requested on an explicit Ctrl+Space (`triggerKind`
+  1) or a server-declared trigger character (2, with
+  `triggerCharacter`). The answer is sorted by `sortText` (label as the
+  fallback) before anything is capped, up to 5000 items are kept and 300
+  rows shown. While the popup is open, each keystroke filters the list
+  locally against `filterText` (else the label), using the document text
+  from the replace start to the caret; a keystroke that matches nothing
+  closes it. Only a list the server marked `isIncomplete` is asked again,
+  **120 ms** after the keystroke, with `triggerKind` 3.
 * A new request of a kind **cancels** the in-flight one for that tab with
   `$/cancelRequest` (`Session.cancelKind`). The cancelled request stays in
   the pending table until its answer arrives — the answer is consumed and
@@ -269,10 +297,19 @@ the document is **dropped** — this is the same discipline
 ## Server-to-client requests
 
 Answered, always. A server that waits on us stops serving the user.
-`window/workDoneProgress/create`, `client/(un)registerCapability` and
-`workspace/configuration` get `null` (an array of nulls, one per
-requested section, for the last one); anything else gets a real
+`workspace/configuration` is answered from the server's `settings`
+(below), one value per requested item by dotted `section` (null where
+the settings have nothing); the same object is pushed once with
+`workspace/didChangeConfiguration` after `initialized`.
+`window/workDoneProgress/create` and `client/(un)registerCapability`
+get `null`, and `window/showMessageRequest` gets `null` after its text
+is shown like a `window/showMessage`. Anything else gets a real
 MethodNotFound error rather than silence.
+
+Server notifications the user sees: `window/showMessage` on the status
+line (errors, warnings and info; `logMessage` goes to the debug log
+only), and `$/progress` (`lsp/progress.zig`) as a "server: title N% message"
+fragment in the status line while a work-done token is live.
 
 ## Features and how a user reaches them
 
@@ -283,13 +320,14 @@ in the standalone editor window, because both are one `EditorView`.
 | --- | --- |
 | — | **Diagnostics**: squiggles under the offending text, a coloured stripe at the left edge of the gutter, and the diagnostic under the caret in the status line |
 | `F8` / `Shift+F8` | next / previous diagnostic |
+| `Alt+F8` | the diagnostic's `relatedInformation` locations (also listed in its hover) |
 | `Ctrl+Space` | completion (explicit); a trigger character opens it too |
 | `Ctrl+I` | hover — also shows the diagnostic at the caret, even for a server with no hover provider |
 | `F12` | go to definition |
 | `Shift+F12` | find references |
 | `Ctrl+F12` | go to type definition |
 | `Ctrl+Shift+F12` | go to declaration |
-| `Ctrl+Shift+O` | document symbols |
+| `Ctrl+Shift+O` | the outline panel (document symbols, Tree-sitter until the server answers) |
 | `Ctrl+T` | workspace symbols (query = the word at the caret or the selection) |
 | `F2` | rename |
 | `Ctrl+Shift+I` | format document, or the selection when there is one |
@@ -387,7 +425,7 @@ and never reports a count alone.
 a file the user has not opened used to be counted as skipped and left
 alone, which is how a rename silently missed most of its own work. The
 tab is now opened through the ordinary machinery, and — because the load
-is async — the `TextEdit[]` is queued in `lsp/pending.zig` against the
+is async — the `TextEdit[]` is queued in `editor/deferred.zig` against the
 tab and its LOAD, then applied when the bytes land and reported again
 with the final count. The queue's rule is "applied or reported, never
 forgotten": a hunk is identified by tab plus load generation (never by
@@ -596,9 +634,18 @@ thing.
 
 The workspace root is the nearest ancestor directory of the document
 holding one of `root_files`, falling back to the document's own
-directory. One server process is shared per (server, root) pair, and the
-last tab out shuts it down (`shutdown`, then `exit`, then SIGKILL after
-1.5 s).
+directory. One server process is shared per (server, root) pair **for
+the whole process**, across every editor face (pane faces and the
+standalone editor window alike; `ui/editorlsp_conn.zig`'s registry), and
+the last tab out, in whichever face, shuts it down (`shutdown`, then
+`exit`, then SIGKILL after 1.5 s). The same file open in two faces is two
+buffers, but LSP lets a client open a URI once: the first owns the
+server's view and the second is passive (no diagnostics, features say so)
+until the first closes.
+
+`settings` is a raw JSON object, server-specific like `init_options`:
+what `workspace/configuration` is answered from and what
+`workspace/didChangeConfiguration` pushes.
 
 The Editor page in Preferences carries these switches plus one group
 per server (enabled / command / arguments / languages / root markers) and

@@ -2,8 +2,10 @@
 
 The editor face's editing verbs live in `src/editor/commands.zig`
 (GTK-free, unit-tested in both test roots); the GTK dispatch, the
-binding table and the context menu live in `src/ui/editorview.zig` and
-`src/ui/editormenu.zig`. Every command builds ONE transaction through
+binding table in `src/ui/editorkeys.zig`, and the dispatch
+(`EditorView.runCommand`) and context menu in `src/ui/editorview.zig` and
+`src/ui/editormenu.zig`. No editor chord is hardcoded outside that table
+except plain movement, Tab/Enter/Backspace/Delete and Escape. Every command builds ONE transaction through
 `Document.applyTransactionSel`, so each invocation is exactly one undo
 step -- across any number of carets -- and undo restores the pre-command
 selection.
@@ -11,7 +13,9 @@ selection.
 ## Commands and default bindings
 
 Bindings are configurable as `editor_keybind.<command> = <accel>`
-lines (GTK accelerator syntax; empty value unbinds), editable on the
+lines (GTK accelerator syntax; empty value unbinds; an override replaces
+every default chord of its command and wins a chord another command had
+by default), editable on the
 Preferences -> Keybindings page under "Editor Commands". They are a
 separate namespace from `keybind.*` on purpose: they exist only while
 the editor canvas has focus and can never shadow or consume a terminal
@@ -39,6 +43,33 @@ key. Defaults follow VS Code / Sublime muscle memory where one exists.
 | `add_caret_above` | Ctrl+Alt+Up | Byte column, clamped to the target line |
 | `add_caret_below` | Ctrl+Alt+Down | |
 | `split_selection_lines` | Shift+Alt+I | One caret at the end of each covered line |
+| `select_all` | Ctrl+A | |
+| `expand_selection` | Shift+Alt+Right | Grow to the enclosing syntax node (keypad Right too) |
+| `shrink_selection` | Shift+Alt+Left | Undo one expand step |
+| `goto_matching_bracket` | Ctrl+M | |
+| `select_to_matching_bracket` | Ctrl+Shift+M | |
+| `copy` / `cut` / `paste` | Ctrl+C / Ctrl+X / Ctrl+V | Selections (cut/copy) and every caret (paste) |
+| `undo` / `redo` | Ctrl+Z / Ctrl+Y | Redo also answers Ctrl+Shift+Z |
+| `find` / `replace` | Ctrl+F / Ctrl+H | The find bar. Inside it: Enter / Shift+Enter step, Tab hops between the find and replace entries, Enter in the replace entry replaces one, Ctrl+Alt+Enter replaces all (one undo step), Escape closes |
+| `project_search` / `project_replace` | Ctrl+Shift+F / Ctrl+Shift+H | Ctrl+Shift+H again (with a needle typed) moves to the replacement; see docs/project.md for preview, apply and the undo policy |
+| `save` / `save_as` / `save_all` | Ctrl+S / Ctrl+Shift+S / Ctrl+Alt+S | |
+| `open_file` / `close_tab` | Ctrl+O / Ctrl+W | Close asks first when the document is dirty |
+| `fold` / `unfold` | Ctrl+Shift+[ / Ctrl+Shift+] | |
+| `fold_all` / `unfold_all` | Ctrl+Alt+[ / Ctrl+Alt+] | |
+| `toggle_wrap` | Alt+Z | |
+| `toggle_outline` | Ctrl+Shift+O | The symbol outline panel |
+| `next_hunk` / `prev_hunk` | F7 / Shift+F7 | Changes against HEAD |
+| `trigger_completion` | Ctrl+Space | Language-server verbs below report on the status line when no server serves the file |
+| `signature_help` | Ctrl+Shift+Space | |
+| `show_hover` | Ctrl+I | |
+| `code_actions` | Ctrl+. | |
+| `format_document` | Ctrl+Shift+I | Selection only when there is one |
+| `rename_symbol` | F2 | |
+| `goto_definition` / `goto_declaration` / `goto_type_definition` | F12 / Ctrl+Shift+F12 / Ctrl+F12 | |
+| `find_references` | Shift+F12 | |
+| `workspace_symbols` | Ctrl+T | |
+| `next_diagnostic` / `prev_diagnostic` | F8 / Shift+F8 | |
+| `diagnostic_related` | Alt+F8 | The diagnostic's `relatedInformation` locations (hover lists them too) |
 | `indent_use_tabs` | -- | Per-tab override: indent with hard tabs (see "Indentation") |
 | `indent_use_spaces` | -- | Per-tab override: indent with spaces |
 | `indent_width_2` / `_4` / `_8` | -- | Per-tab override of the indent (and tab) width |
