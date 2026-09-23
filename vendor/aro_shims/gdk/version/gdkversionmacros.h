@@ -78,7 +78,7 @@
  *
  * The micro version component of the library's version, e.g. "3" for "1.2.3".
  */
-#define GDK_MICRO_VERSION (4)
+#define GDK_MICRO_VERSION (5)
 /**
  * GDK_VERSION_4_0:
  *
