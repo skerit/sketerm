@@ -2087,9 +2087,10 @@ pub const Container = struct {
 
 var g_containers: std.ArrayList(Container) = .empty;
 var g_next_container_id: u32 = 1;
-/// Ephemeral (incognito) ids live above every id the daemon store will
-/// ever mint — see `createContainerAt`.
-const EPHEMERAL_CONTAINER_BASE: u32 = 0x8000_0000;
+/// Ephemeral (incognito) ids are the wire's ephemeral context partition,
+/// above every id the daemon store will ever mint — see
+/// `createContainerAt`.
+const EPHEMERAL_CONTAINER_BASE: u32 = proto.EPHEMERAL_CTX_BASE;
 var g_next_ephemeral_id: u32 = EPHEMERAL_CONTAINER_BASE;
 
 pub fn containers() []Container {
@@ -2147,14 +2148,15 @@ pub fn createContainerAt(gpa: std.mem.Allocator, spec: ContainerSpec) u32 {
     // ids come from a DISJOINT high range: the daemon store counts up
     // from 1, and an incognito tab opened before the stored registry
     // arrived would otherwise be able to claim an id a real container
-    // already owns on disk — two identities, one cookie jar.
+    // already owns on disk — two identities, one cookie jar. The range
+    // is the helper's own ephemeral window: an id past it makes the
+    // helper drop this GUI's whole connection.
     const id = if (spec.id != 0)
         spec.id
-    else if (spec.ephemeral) blk: {
-        const e = g_next_ephemeral_id;
-        g_next_ephemeral_id += 1;
-        break :blk e;
-    } else g_next_container_id;
+    else if (spec.ephemeral)
+        proto.mintEphemeralCtx(&g_next_ephemeral_id) orelse return 0
+    else
+        g_next_container_id;
     if (findContainer(id) != null) return 0;
     const color = spec.color orelse if (spec.ephemeral)
         container_palette[container_palette.len - 1]

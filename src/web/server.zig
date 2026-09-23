@@ -236,7 +236,7 @@ const Conn = struct {
     /// [base+EPHEMERAL_CTX_BASE, base+EPHEMERAL_CTX_BASE+WINDOW).
     fn mapCtx(self: *const Conn, id: u32) !u32 {
         if (id < proto.EPHEMERAL_CTX_BASE) return id;
-        if (id >= proto.EPHEMERAL_CTX_BASE + proto.CONN_ID_WINDOW) return error.ContextIdPastWindow;
+        if (id >= proto.EPHEMERAL_CTX_END) return error.ContextIdPastWindow;
         return self.base() + id;
     }
 };

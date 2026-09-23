@@ -1738,7 +1738,7 @@ pub const Engine = struct {
         switch (spec) {
             .default => return .{ .id = 0, .ephemeral = false },
             .ephemeral => {
-                const id = self.next_eph;
+                const id = proto.mintEphemeralCtx(&self.next_eph) orelse return error.StoreIo;
                 self.send(proto.ContextCreate{
                     .id = id,
                     .ephemeral = 1,
@@ -1752,7 +1752,6 @@ pub const Engine = struct {
                     .published_gen = self.helper_gen,
                     .views = 1,
                 }) catch return error.StoreIo;
-                self.next_eph += 1;
                 return .{ .id = id, .ephemeral = true };
             },
             .named => |name| {

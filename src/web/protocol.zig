@@ -465,6 +465,34 @@ pub const CONN_ID_WINDOW: u32 = 0x0010_0000;
 /// which is why it must never be window-shifted.
 pub const EPHEMERAL_CTX_BASE: u32 = 0x4000_0000;
 
+/// One past the last ephemeral context id a client may mint. A helper
+/// under `multi-client` drops the whole connection for an id at or past
+/// it (every page of that client with it), so minting stops here.
+pub const EPHEMERAL_CTX_END: u32 = EPHEMERAL_CTX_BASE + CONN_ID_WINDOW;
+
+/// The next client-minted ephemeral context id from counter `next`
+/// (which starts at `EPHEMERAL_CTX_BASE`), or null once the window is
+/// spent.
+pub fn mintEphemeralCtx(next: *u32) ?u32 {
+    if (next.* < EPHEMERAL_CTX_BASE or next.* >= EPHEMERAL_CTX_END) return null;
+    const id = next.*;
+    next.* += 1;
+    return id;
+}
+
+test "ephemeral context ids stay inside the window a helper accepts" {
+    var next: u32 = EPHEMERAL_CTX_BASE;
+    try std.testing.expectEqual(@as(?u32, EPHEMERAL_CTX_BASE), mintEphemeralCtx(&next));
+    try std.testing.expectEqual(@as(?u32, EPHEMERAL_CTX_BASE + 1), mintEphemeralCtx(&next));
+    next = EPHEMERAL_CTX_END - 1;
+    try std.testing.expectEqual(@as(?u32, EPHEMERAL_CTX_END - 1), mintEphemeralCtx(&next));
+    try std.testing.expectEqual(@as(?u32, null), mintEphemeralCtx(&next));
+    // The GUI once minted from 0x8000_0000, past the window: every
+    // incognito tab made the helper drop the GUI's whole connection.
+    next = 0x8000_0000;
+    try std.testing.expectEqual(@as(?u32, null), mintEphemeralCtx(&next));
+}
+
 /// Refuse to buffer a frame larger than this; a peer claiming more is
 /// desynchronised, not ambitious.
 pub const MAX_FRAME: u32 = 16 * 1024 * 1024;
