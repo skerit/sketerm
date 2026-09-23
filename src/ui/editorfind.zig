@@ -303,6 +303,14 @@ fn onReplaceAllClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     replaceAll(cast.userData(EditorView, user));
 }
 
+/// The keyboard focus is `w` or inside it (a search entry focuses its
+/// inner text widget).
+fn focusWithin(w: *c.GtkWidget) bool {
+    const root = c.gtk_widget_get_root(w) orelse return false;
+    const f = c.gtk_root_get_focus(root) orelse return false;
+    return f == w or c.gtk_widget_is_ancestor(f, w) != 0;
+}
+
 fn onFindKey(
     _: *c.GtkEventControllerKey,
     keyval: c_uint,
@@ -330,13 +338,27 @@ fn onFindKey(
             return 1;
         },
         c.GDK_KEY_Return, c.GDK_KEY_KP_Enter => {
+            // Ctrl+Alt+Enter replaces every match (VS Code's chord);
             // Shift+Enter steps backwards from either entry; plain Enter
-            // in the replace entry replaces (its "activate").
+            // in the replace entry replaces one (its "activate").
+            if ((mods & (c.GDK_CONTROL_MASK | c.GDK_ALT_MASK)) == (c.GDK_CONTROL_MASK | c.GDK_ALT_MASK)) {
+                replaceAll(view);
+                return 1;
+            }
             if ((mods & c.GDK_SHIFT_MASK) != 0) {
                 step(view, false);
                 return 1;
             }
             return 0;
+        },
+        c.GDK_KEY_Tab, c.GDK_KEY_ISO_Left_Tab => {
+            // Tab hops between the two entries while the replace row is
+            // up, instead of walking every toggle button in between.
+            if (c.gtk_widget_get_visible(view.replace_row) == 0 or mods & ~@as(c_uint, c.GDK_SHIFT_MASK) != 0) return 0;
+            const in_replace = focusWithin(view.replace_entry);
+            const target = if (in_replace) view.find_entry else view.replace_entry;
+            _ = c.gtk_widget_grab_focus(target);
+            return 1;
         },
         else => return 0,
     }

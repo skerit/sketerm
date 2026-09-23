@@ -854,6 +854,19 @@ fn onPanelKey(
         closeSearch(view);
         return 1;
     }
+    // The panel's own chords must work from INSIDE its entries, where the
+    // canvas never sees a key: Ctrl+Shift+H again moves to the
+    // replacement, as in the find bar. They come from the binding table.
+    const mods = state & @import("input.zig").SIGNIFICANT_MODS;
+    if (view.matchEdBinding(keyval, c.gdk_keyval_to_lower(keyval), mods)) |cmd| {
+        switch (cmd) {
+            .project_search, .project_replace => {
+                openSearch(view, cmd == .project_replace);
+                return 1;
+            },
+            else => {},
+        }
+    }
     if (ctrl and (keyval == c.GDK_KEY_Return or keyval == c.GDK_KEY_KP_Enter)) {
         applyReplace(view);
         return 1;
