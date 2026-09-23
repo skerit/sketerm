@@ -148,7 +148,7 @@ const FULL_CAPS =
 
 /// Bring a session all the way to `.ready` with the full capability set.
 fn readySession(alloc: std.mem.Allocator, s: *Session) !void {
-    s.start("file:///proj", 1234, "");
+    s.start("file:///proj", 1234, "", "");
     var sent: std.ArrayList(Sent) = .empty;
     defer freeSent(alloc, &sent);
     try drain(alloc, s, &sent);
@@ -202,7 +202,7 @@ const Fixture = struct {
     /// Start and discard the `initialize` frame, leaving the caller to
     /// answer it with the capability set the test is about.
     fn boot(self: *Fixture) !void {
-        self.s.start("", 1, "");
+        self.s.start("", 1, "", "");
         _ = try self.drainSent();
     }
 
@@ -231,7 +231,7 @@ test "session: a non-positive client pid initializes with processId null" {
     var fx: Fixture = undefined;
     fx.init();
     defer fx.deinit();
-    fx.s.start("file:///proj", 0, "");
+    fx.s.start("file:///proj", 0, "", "");
     const sent = try fx.drainSent();
     try testing.expectEqualStrings("initialize", sent.items[0].method());
     const pid_field = sent.items[0].params().object.get("processId") orelse return error.TestExpectedField;
@@ -569,6 +569,86 @@ test "session: server-to-client requests are always answered" {
     try testing.expectEqual(@as(usize, 2), sent.items[1].parsed.value.object.get("result").?.array.items.len);
     // Unimplemented gets a real error, so the server stops waiting.
     try testing.expect(sent.items[2].parsed.value.object.get("error") != null);
+}
+
+test "session: workspace/configuration answers from the configured settings" {
+    var fx: Fixture = undefined;
+    fx.init();
+    defer fx.deinit();
+    fx.s.start(
+        "file:///proj",
+        1,
+        "",
+        \\{"zls":{"enable_snippets":false},"typescript":{"format":{"semicolons":"remove"}}}
+    ,
+    );
+    _ = try fx.drainSent();
+    try fx.feed(
+        \\{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}
+    );
+    {
+        // Push-model servers get the settings right after `initialized`.
+        const boot = try fx.drainSent();
+        try testing.expectEqual(@as(usize, 2), boot.items.len);
+        try testing.expectEqualStrings("initialized", boot.items[0].method());
+        try testing.expectEqualStrings("workspace/didChangeConfiguration", boot.items[1].method());
+        const pushed = boot.items[1].params().object.get("settings").?;
+        try testing.expect(pushed.object.get("zls") != null);
+    }
+    try fx.feed(
+        \\{"jsonrpc":"2.0","id":7,"method":"workspace/configuration","params":{"items":[{"section":"zls"},{"section":"typescript.format"},{"section":"missing"},{"scopeUri":"file:///proj"}]}}
+    );
+    const sent = try fx.drainSent();
+    const result = sent.items[0].parsed.value.object.get("result").?.array.items;
+    try testing.expectEqual(@as(usize, 4), result.len);
+    try testing.expectEqual(false, result[0].object.get("enable_snippets").?.bool);
+    try testing.expectEqualStrings("remove", result[1].object.get("semicolons").?.string);
+    try testing.expect(result[2] == .null);
+    // No section: the whole object.
+    try testing.expect(result[3].object.get("typescript") != null);
+}
+
+test "session: settings that are not a JSON object are never sent" {
+    var fx: Fixture = undefined;
+    fx.init();
+    defer fx.deinit();
+    fx.s.start("file:///proj", 1, "", "not json");
+    _ = try fx.drainSent();
+    try fx.feed(
+        \\{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}
+    );
+    const boot = try fx.drainSent();
+    try testing.expectEqual(@as(usize, 1), boot.items.len);
+    try fx.feed(
+        \\{"jsonrpc":"2.0","id":8,"method":"workspace/configuration","params":{"items":[{"section":"a"}]}}
+    );
+    const sent = try fx.drainSent();
+    try testing.expect(sent.items[0].parsed.value.object.get("result").?.array.items[0] == .null);
+}
+
+test "session: progress is folded and message requests are answered" {
+    var fx: Fixture = undefined;
+    fx.init();
+    defer fx.deinit();
+    try fx.ready();
+    fx.s.out.clearRetainingCapacity();
+    try fx.feed(
+        \\{"jsonrpc":"2.0","method":"$/progress","params":{"token":"i","value":{"kind":"begin","title":"Indexing","percentage":10}}}
+    );
+    var out: [64]u8 = undefined;
+    try testing.expectEqualStrings("Indexing 10%", fx.s.progress.summary(&out));
+    // The UI still hears about it, to repaint.
+    try testing.expectEqualStrings("$/progress", fx.rec.notifications.items[fx.rec.notifications.items.len - 1]);
+    try fx.feed(
+        \\{"jsonrpc":"2.0","id":31,"method":"window/showMessageRequest","params":{"type":1,"message":"restart?","actions":[{"title":"Yes"}]}}
+    );
+    const sent = try fx.drainSent();
+    try testing.expectEqual(@as(i64, 31), sent.items[0].id().?);
+    try testing.expect(sent.items[0].parsed.value.object.get("result").? == .null);
+    try testing.expectEqualStrings("window/showMessageRequest", fx.rec.notifications.items[fx.rec.notifications.items.len - 1]);
+    // A dead server reports no progress.
+    fx.s.markDead();
+    try testing.expect(fx.s.progress.isEmpty());
 }
 
 test "session: a string request id is echoed back verbatim" {

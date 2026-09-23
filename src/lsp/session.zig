@@ -19,14 +19,22 @@
 //! ## Server -> client requests
 //!
 //! Must be answered or a server blocks forever. Anything we do not
-//! implement is answered with a MethodNotFound error, and the two
-//! progress-creation requests every server sends are answered `null`.
+//! implement is answered with a MethodNotFound error.
+//! `workspace/configuration` is answered from the server's configured
+//! `settings` object (null per section it does not have), progress and
+//! capability registrations get `null`, and `window/showMessageRequest`
+//! gets `null` (no action chosen) while its message still reaches the
+//! handler like a `window/showMessage`.
+//!
+//! Work-done progress (`$/progress`) is folded into `progress` here, and
+//! the notification still reaches the handler so a UI can repaint.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const rpc = @import("rpc.zig");
 const pos = @import("position.zig");
 const semantic = @import("semantic.zig");
+const progress_mod = @import("progress.zig");
 
 pub const Encoding = pos.Encoding;
 
@@ -199,6 +207,12 @@ pub const Session = struct {
     /// is the version and lives on the caller's side.
     last_error: [240]u8 = undefined,
     last_error_len: usize = 0,
+    /// The server's configured `settings` JSON object (owned; empty =
+    /// none): what `workspace/configuration` is answered from and what
+    /// `workspace/didChangeConfiguration` pushes after `initialized`.
+    settings: []u8 = &.{},
+    /// Work-done progress the server is reporting right now.
+    progress: progress_mod.Table = .{},
 
     pub fn init(alloc: Allocator, handler: Handler) Session {
         return .{ .alloc = alloc, .handler = handler };
@@ -209,6 +223,8 @@ pub const Session = struct {
         self.out.deinit(self.alloc);
         self.pending.deinit(self.alloc);
         self.caps.deinit(self.alloc);
+        if (self.settings.len > 0) self.alloc.free(self.settings);
+        self.settings = &.{};
     }
 
     pub fn errText(self: *const Session) []const u8 {
@@ -243,6 +259,7 @@ pub const Session = struct {
     /// The server's stdin is gone / the process exited.
     pub fn markDead(self: *Session) void {
         self.pending.clearRetainingCapacity();
+        self.progress.clear();
         self.setState(.dead);
     }
 
@@ -278,7 +295,10 @@ pub const Session = struct {
         const env = rpc.classify(parsed.value);
         switch (env.kind) {
             .invalid => {},
-            .notification => self.handler.on_notification(self.handler.ctx, env.method, env.params),
+            .notification => {
+                if (std.mem.eql(u8, env.method, "$/progress")) _ = self.progress.absorb(env.params);
+                self.handler.on_notification(self.handler.ctx, env.method, env.params);
+            },
             .request => self.answerServerRequest(env),
             .response => self.completeRequest(env),
         }
@@ -302,7 +322,7 @@ pub const Session = struct {
         const nullable = std.mem.eql(u8, env.method, "window/workDoneProgress/create") or
             std.mem.eql(u8, env.method, "client/registerCapability") or
             std.mem.eql(u8, env.method, "client/unregisterCapability") or
-            std.mem.eql(u8, env.method, "workspace/configuration");
+            std.mem.eql(u8, env.method, "window/showMessageRequest");
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.alloc);
         if (std.mem.eql(u8, env.method, "workspace/applyEdit")) {
@@ -312,17 +332,18 @@ pub const Session = struct {
                 "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{{\"applied\":{s}}}}}",
                 .{ id_tok.items, if (applied) "true" else "false" },
             ) catch return;
-        } else if (nullable) {
-            // workspace/configuration wants an ARRAY (one entry per
-            // requested section); the others want a bare null.
+        } else if (std.mem.eql(u8, env.method, "workspace/configuration")) {
+            // An ARRAY, one entry per requested section.
             var result: std.ArrayList(u8) = .empty;
             defer result.deinit(self.alloc);
-            if (std.mem.eql(u8, env.method, "workspace/configuration")) {
-                appendConfigurationNulls(self.alloc, &result, env.params) catch return;
-            } else {
-                result.appendSlice(self.alloc, "null") catch return;
-            }
+            appendConfiguration(self.alloc, &result, self.settings, env.params) catch return;
             buf.print(self.alloc, "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{s}}}", .{ id_tok.items, result.items }) catch return;
+        } else if (nullable) {
+            // The user sees a showMessageRequest's text like any other
+            // message; answering null says no action was chosen.
+            if (std.mem.eql(u8, env.method, "window/showMessageRequest"))
+                self.handler.on_notification(self.handler.ctx, env.method, env.params);
+            buf.print(self.alloc, "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":null}}", .{id_tok.items}) catch return;
         } else {
             buf.print(
                 self.alloc,
@@ -333,24 +354,62 @@ pub const Session = struct {
         rpc.frameInto(self.alloc, &self.out, buf.items) catch {};
     }
 
-    /// `[null, null, …]` with one entry per requested configuration
-    /// section: the result array must be the same length as
-    /// `params.items` or servers log a type error and some (clangd)
-    /// stop asking for anything again.
-    fn appendConfigurationNulls(alloc: Allocator, out: *std.ArrayList(u8), params: std.json.Value) Allocator.Error!void {
-        var n: usize = 1;
-        if (params == .object) {
-            if (params.object.get("items")) |items| {
-                if (items == .array) n = @max(items.array.items.len, 1);
+    /// One entry per requested configuration item: the value at its
+    /// dotted `section` inside `settings` (the whole object when it names
+    /// no section), `null` where there is none. The array must be the
+    /// same length as `params.items` or servers log a type error and some
+    /// (clangd) stop asking for anything again.
+    fn appendConfiguration(
+        alloc: Allocator,
+        out: *std.ArrayList(u8),
+        settings: []const u8,
+        params: std.json.Value,
+    ) Allocator.Error!void {
+        var parsed: ?std.json.Parsed(std.json.Value) = if (settings.len > 0)
+            std.json.parseFromSlice(std.json.Value, alloc, settings, .{}) catch null
+        else
+            null;
+        defer if (parsed) |*p| p.deinit();
+        const root: ?std.json.Value = if (parsed) |p| p.value else null;
+
+        const items: []const std.json.Value = blk: {
+            if (params == .object) {
+                if (params.object.get("items")) |it| {
+                    if (it == .array and it.array.items.len > 0) break :blk it.array.items;
+                }
             }
-        }
+            break :blk &.{std.json.Value.null};
+        };
         try out.append(alloc, '[');
-        var i: usize = 0;
-        while (i < n) : (i += 1) {
+        for (items, 0..) |item, i| {
             if (i > 0) try out.append(alloc, ',');
-            try out.appendSlice(alloc, "null");
+            const section: ?[]const u8 = if (item == .object) switch (item.object.get("section") orelse std.json.Value.null) {
+                .string => |s| s,
+                else => null,
+            } else null;
+            const value = if (root) |r| settingsSection(r, section) else null;
+            if (value) |v| {
+                var w: std.Io.Writer.Allocating = .init(alloc);
+                defer w.deinit();
+                std.json.Stringify.value(v, .{}, &w.writer) catch return error.OutOfMemory;
+                try out.appendSlice(alloc, w.written());
+            } else try out.appendSlice(alloc, "null");
         }
         try out.append(alloc, ']');
+    }
+
+    /// The value at a dotted `section` path inside `root`, or the whole
+    /// object for no section.
+    fn settingsSection(root: std.json.Value, section: ?[]const u8) ?std.json.Value {
+        const path = section orelse return root;
+        if (path.len == 0) return root;
+        var cur = root;
+        var it = std.mem.splitScalar(u8, path, '.');
+        while (it.next()) |part| {
+            if (cur != .object) return null;
+            cur = cur.object.get(part) orelse return null;
+        }
+        return cur;
     }
 
     fn completeRequest(self: *Session, env: rpc.Envelope) void {
@@ -386,6 +445,15 @@ pub const Session = struct {
         self.caps.deinit(self.alloc);
         self.caps = parseCaps(self.alloc, env.result);
         self.sendNotification("initialized", "{}");
+        // Push-model servers read their settings from here; pull-model
+        // ones ask `workspace/configuration`, answered from the same
+        // object.
+        if (self.settings.len > 0) {
+            var p: std.ArrayList(u8) = .empty;
+            defer p.deinit(self.alloc);
+            p.print(self.alloc, "{{\"settings\":{s}}}", .{self.settings}) catch {};
+            if (p.items.len > 0) self.sendNotification("workspace/didChangeConfiguration", p.items);
+        }
         self.setState(.ready);
     }
 
@@ -474,8 +542,14 @@ pub const Session = struct {
     /// Pass 0 (or negative) when the server runs on ANOTHER host: our
     /// pid is meaningless there, and servers that watch `processId`
     /// (clangd does) would exit the moment they find no such process.
-    pub fn start(self: *Session, root_uri: []const u8, client_pid: i32, init_options: []const u8) void {
+    /// `settings` is the server's configured `settings` object (empty =
+    /// none); a value that is not a JSON object is ignored, like
+    /// `init_options`.
+    pub fn start(self: *Session, root_uri: []const u8, client_pid: i32, init_options: []const u8, settings: []const u8) void {
         if (self.state != .idle) return;
+        if (settings.len > 0 and isJsonObject(self.alloc, settings)) {
+            self.settings = self.alloc.dupe(u8, settings) catch &.{};
+        }
         var params: std.ArrayList(u8) = .empty;
         defer params.deinit(self.alloc);
         if (client_pid > 0)
@@ -608,7 +682,8 @@ pub const CLIENT_CAPS =
     \\"clientInfo":{"name":"sketerm"},
     \\"capabilities":{
     \\"general":{"positionEncodings":["utf-8","utf-16"]},
-    \\"workspace":{"applyEdit":true,"workspaceEdit":{"documentChanges":true},"symbol":{"dynamicRegistration":false},"configuration":true,"executeCommand":{"dynamicRegistration":false}},
+    \\"workspace":{"applyEdit":true,"workspaceEdit":{"documentChanges":true},"symbol":{"dynamicRegistration":false},"configuration":true,"didChangeConfiguration":{"dynamicRegistration":false},"executeCommand":{"dynamicRegistration":false}},
+    \\"window":{"workDoneProgress":true,"showMessage":{}},
     \\"textDocument":{
     \\"synchronization":{"dynamicRegistration":false,"willSave":false,"didSave":true},
     \\"publishDiagnostics":{"relatedInformation":true,"versionSupport":true},

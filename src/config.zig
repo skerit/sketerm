@@ -1439,6 +1439,7 @@ pub const Config = struct {
                 .args = try arena.dupe(u8, s.args),
                 .root_files = try arena.dupe(u8, s.root_files),
                 .init_options = try arena.dupe(u8, s.init_options),
+                .settings = try arena.dupe(u8, s.settings),
                 .enabled = s.enabled,
             });
         }
@@ -1671,6 +1672,7 @@ pub const Config = struct {
             if (srv.languages.len > 0) try w.print("languages = {s}\n", .{srv.languages});
             if (srv.root_files.len > 0) try w.print("root_files = {s}\n", .{srv.root_files});
             if (srv.init_options.len > 0) try w.print("init_options = {s}\n", .{srv.init_options});
+            if (srv.settings.len > 0) try w.print("settings = {s}\n", .{srv.settings});
             if (!srv.enabled) try w.writeAll("enabled = false\n");
         }
 
@@ -2215,6 +2217,8 @@ fn applyLspKv(srv: *LspServer, arena: std.mem.Allocator, key: []const u8, value:
         srv.root_files = try arena.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "init_options")) {
         srv.init_options = try arena.dupe(u8, value);
+    } else if (std.mem.eql(u8, key, "settings")) {
+        srv.settings = try arena.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "enabled")) {
         srv.enabled = try parseBool(value);
     } else return error.UnknownKey;
@@ -4372,6 +4376,7 @@ test "config: [lsp.name] sections parse, seed from builtins and round-trip" {
         \\
         \\[lsp.zls]
         \\args = --enable-debug-log
+        \\settings = {"zls":{"enable_snippets":false}}
         \\
         \\[lsp.clangd]
         \\enabled = false
@@ -4409,6 +4414,7 @@ test "config: [lsp.name] sections parse, seed from builtins and round-trip" {
     defer cfg2.deinit();
     try std.testing.expectEqual(@as(u16, 400), cfg2.editor_lsp_debounce_ms);
     try std.testing.expectEqualStrings("--enable-debug-log", cfg2.lspServerFor("zig").?.args);
+    try std.testing.expectEqualStrings("{\"zls\":{\"enable_snippets\":false}}", cfg2.lspServerFor("zig").?.settings);
     try std.testing.expect(cfg2.lspServerFor("c") == null);
     try std.testing.expectEqualStrings("pylsp", cfg2.lspServerFor("python").?.command);
 }

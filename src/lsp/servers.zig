@@ -37,6 +37,12 @@ pub const Server = struct {
     /// pass-through string, not a typed schema. Malformed JSON is
     /// dropped rather than corrupting the request.
     init_options: []const u8 = "",
+    /// Raw JSON object of server settings: what `workspace/configuration`
+    /// is answered from (by dotted section) and what
+    /// `workspace/didChangeConfiguration` pushes after `initialized`.
+    /// Server-specific by definition, so a pass-through like
+    /// `init_options`; malformed JSON is dropped.
+    settings: []const u8 = "",
     enabled: bool = true,
 
     pub fn handles(self: *const Server, language_id: []const u8) bool {

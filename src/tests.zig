@@ -392,6 +392,8 @@ comptime {
     _ = @import("lsp/pending.zig");
     _ = @import("lsp/symbols.zig");
     _ = @import("lsp/proc.zig");
+    _ = @import("lsp/stderrtail.zig");
+    _ = @import("lsp/progress.zig");
     _ = @import("render/editor_font.zig");
     _ = @import("render/editor_layout.zig");
     _ = @import("render/editor_viewport.zig");

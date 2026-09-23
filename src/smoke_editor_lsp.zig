@@ -270,7 +270,7 @@ fn rangeOnlyStage(alloc: std.mem.Allocator) !?u8 {
     };
     h.sess = session.Session.init(alloc, h.handler());
     defer h.deinit();
-    h.sess.start("file:///smoke", c.getpid(), "");
+    h.sess.start("file:///smoke", c.getpid(), "", "");
     if (!h.waitFor(&h, Harness.readyCond, 4000)) return fail("range-only stub never reached ready", .{});
     if (h.sess.caps.semantic_tokens) return fail("range-only stub advertised `full`", .{});
     if (!h.sess.caps.semantic_tokens_range) return fail("the `range` provider was not recognised", .{});
@@ -332,7 +332,7 @@ fn runOnce(alloc: std.mem.Allocator, utf8: bool) !?u8 {
     h.sess = session.Session.init(alloc, h.handler());
     defer h.deinit();
 
-    h.sess.start("file:///smoke", c.getpid(), "");
+    h.sess.start("file:///smoke", c.getpid(), "", "");
     if (!h.waitFor(&h, Harness.readyCond, 4000)) return fail("stub server never reached ready", .{});
     const want_enc: pos.Encoding = if (utf8) .utf8 else .utf16;
     if (h.sess.caps.encoding != want_enc)
