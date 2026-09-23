@@ -160,11 +160,27 @@ fn setDropHint(r: *Sidebar.Row, zone: Zone) void {
 /// A generous middle band on purpose: nesting is the gesture users
 /// reach for most, and a thin one is a lottery on a 26px row.
 fn zoneAt(r: *Sidebar.Row, y: f64) Zone {
-    const h: f64 = @floatFromInt(c.gtk_widget_get_height(r.row));
+    return zoneFor(y, @floatFromInt(c.gtk_widget_get_height(r.row)));
+}
+
+/// `zoneAt` for a row `h` px tall; a row with no height yet nests.
+fn zoneFor(y: f64, h: f64) Zone {
     if (h <= 0) return .into;
     if (y < h * 0.3) return .above;
     if (y > h * 0.7) return .below;
     return .into;
+}
+
+/// Whether a drop in `zone` lands AFTER its anchor in strip order: a
+/// nested tab follows its new parent, like a sibling placed below it.
+fn landsAfter(zone: Zone) bool {
+    return zone != .above;
+}
+
+/// Start margin of a row at tree `depth`, capped so deep rows keep a title.
+fn indentPx(depth: usize) c_int {
+    const d: c_int = @intCast(@min(depth, MAX_DEPTH));
+    return d * INDENT_PX;
 }
 
 /// Painted like a selected row would be, but owned by us: the sidebar
@@ -506,8 +522,7 @@ pub const Sidebar = struct {
         // indented the row itself — with a twisty + favicon leading
         // every row, an indented body reads as a tree, not as ragged
         // text.)
-        const d: c_int = @intCast(@min(depth, MAX_DEPTH));
-        c.gtk_widget_set_margin_start(box, d * INDENT_PX);
+        c.gtk_widget_set_margin_start(box, indentPx(depth));
         c.gtk_list_box_row_set_child(@ptrCast(row), box);
 
         r.* = .{
@@ -1049,7 +1064,7 @@ pub const Sidebar = struct {
                 // does, then place it in THIS window's forest. The
                 // PaneTree travels with the page as qdata.
                 var pos = c.adw_tab_view_get_page_position(win.tab_view, page);
-                if (zone == .below or zone == .into) pos += 1;
+                if (landsAfter(zone)) pos += 1;
                 if (!win.transferPageFrom(d.view, d.page, pos)) return 0;
             } else if (d.page == page) {
                 return 0;
@@ -1224,4 +1239,33 @@ fn installCss(any_widget: *c.GtkWidget) void {
         \\}
     ;
     cssutil.install("tabsidebar", any_widget, css);
+}
+
+test "zoneFor: outer thirds reorder, the middle nests, an unsized row nests" {
+    const t = std.testing;
+    try t.expectEqual(Zone.above, zoneFor(0, 26));
+    try t.expectEqual(Zone.above, zoneFor(7.7, 26));
+    try t.expectEqual(Zone.into, zoneFor(7.9, 26));
+    try t.expectEqual(Zone.into, zoneFor(13, 26));
+    try t.expectEqual(Zone.into, zoneFor(18.1, 26));
+    try t.expectEqual(Zone.below, zoneFor(18.3, 26));
+    try t.expectEqual(Zone.below, zoneFor(26, 26));
+    try t.expectEqual(Zone.into, zoneFor(5, 0));
+    try t.expectEqual(Zone.into, zoneFor(5, -1));
+}
+
+test "landsAfter: only a drop above the anchor lands before it" {
+    try std.testing.expect(!landsAfter(.above));
+    try std.testing.expect(landsAfter(.into));
+    try std.testing.expect(landsAfter(.below));
+}
+
+test "indentPx: one step per level, capped at MAX_DEPTH" {
+    const t = std.testing;
+    try t.expectEqual(@as(c_int, 0), indentPx(0));
+    try t.expectEqual(INDENT_PX, indentPx(1));
+    try t.expectEqual(3 * INDENT_PX, indentPx(3));
+    const cap: c_int = @intCast(MAX_DEPTH);
+    try t.expectEqual(cap * INDENT_PX, indentPx(MAX_DEPTH));
+    try t.expectEqual(cap * INDENT_PX, indentPx(MAX_DEPTH + 40));
 }

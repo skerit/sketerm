@@ -136,6 +136,7 @@ comptime {
     _ = @import("ui/imhost.zig");
     _ = @import("ui/tree.zig");
     _ = @import("ui/tabbar.zig");
+    _ = @import("ui/tabsidebar.zig");
     _ = @import("ui/tabforest.zig");
     _ = @import("ui/debounce.zig");
     _ = @import("ui/commandcat.zig");

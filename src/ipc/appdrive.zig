@@ -196,6 +196,10 @@ pub const Window = struct {
     sid: u32,
     w: i32 = 0,
     h: i32 = 0,
+    /// xdg_surface window geometry: the visible window without the
+    /// client-side shadow `w`/`h` include; 0 until the app sets one.
+    geo_w: i32 = 0,
+    geo_h: i32 = 0,
     scale: i32 = 1,
     format: u32 = 0,
     /// Latest COMPOSITED pixels (own buffer + every subsurface
@@ -244,10 +248,19 @@ pub const Window = struct {
     /// remember; `configureState` then leaves the app at its own
     /// choice when it leaves the state.
     fn rememberFloating(self: *Window) void {
-        if (self.w > 0 and self.h > 0) {
-            self.restore_w = self.w;
-            self.restore_h = self.h;
+        const size = self.geometrySize();
+        if (size[0] > 0 and size[1] > 0) {
+            self.restore_w = size[0];
+            self.restore_h = size[1];
         }
+    }
+
+    /// The window's size in configure units: its xdg window geometry,
+    /// or the buffer size for an app that declared none. Configuring
+    /// with the buffer size of a CSD window grows it by its shadow.
+    fn geometrySize(self: *const Window) [2]i32 {
+        if (self.geo_w > 0 and self.geo_h > 0) return .{ self.geo_w, self.geo_h };
+        return .{ self.w, self.h };
     }
 
     fn deinit(self: *Window, a: std.mem.Allocator) void {
@@ -1675,6 +1688,7 @@ pub const App = struct {
             .toplevel_state_request = onStateRequest,
             .toplevel_title = onTitle,
             .toplevel_app_id = onAppId,
+            .toplevel_geometry = onGeometry,
             .toplevel_gone = onGone,
             .popup_new = onPopupNew,
             .popup_gone = onGone,
@@ -1928,6 +1942,15 @@ pub const App = struct {
         const copy = ch.app.allocator.dupe(u8, title) catch return;
         if (win.title) |old| ch.app.allocator.free(old);
         win.title = copy;
+    }
+
+    fn onGeometry(ctx: ?*anyopaque, sid: u32, x: i32, y: i32, w: i32, h: i32) void {
+        _ = x;
+        _ = y;
+        const ch = chanOf(ctx);
+        const win = ch.app.ensureWindow(ch.id, sid, false) orelse return;
+        win.geo_w = w;
+        win.geo_h = h;
     }
 
     fn onAppId(ctx: ?*anyopaque, sid: u32, app_id: []const u8) void {
@@ -2528,9 +2551,10 @@ pub const App = struct {
         for (self.windows.items) |w| {
             if (w.popup or w.w <= 0 or w.h <= 0) continue;
             const bits: u32 = if (w.id == win_id) 1 else 0;
+            const size = w.geometrySize();
             var units: std.ArrayList(u8) = .empty;
             defer units.deinit(a);
-            wlpipe.appendConfigure(&units, a, w.sid, w.w, w.h, bits) catch return Error.OutOfMemory;
+            wlpipe.appendConfigure(&units, a, w.sid, size[0], size[1], bits) catch return Error.OutOfMemory;
             try self.sendIntents(w.chan, units.items);
         }
     }
@@ -3117,6 +3141,15 @@ pub const App = struct {
         const win = self.winById(win_id) orelse return null;
         if (win.w <= 0 or win.h <= 0) return null;
         return .{ .w = win.w, .h = win.h };
+    }
+
+    /// The window's visible size (xdg window geometry, shadow excluded),
+    /// falling back to `windowSize` for an app that never declared one.
+    pub fn windowGeometry(self: *App, win_id: u32) ?struct { w: i32, h: i32 } {
+        const win = self.winById(win_id) orelse return null;
+        const size = win.geometrySize();
+        if (size[0] <= 0 or size[1] <= 0) return null;
+        return .{ .w = size[0], .h = size[1] };
     }
 
     /// % of pixels currently differing from a `FrameRef`, WITHOUT

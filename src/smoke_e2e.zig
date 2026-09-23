@@ -672,8 +672,11 @@ pub fn main() u8 {
             tor_line = std.fmt.bufPrint(&tor_line_buf, "mux_tor_socks_endpoint = 127.0.0.1:{d}\n", .{tor_stub.lis.port}) catch return fail("tor line");
         }
         var config_buf: [256]u8 = undefined;
-        const config_text = std.fmt.bufPrint(&config_buf, "# smoke-e2e\napp_view = window\ngraphics_offload = true\n{s}{s}", .{
+        const config_text = std.fmt.bufPrint(&config_buf, "# smoke-e2e\napp_view = window\ngraphics_offload = true\n{s}{s}{s}", .{
             if (c.getenv("SKETERM_SMOKE_E2E_FILES_ICONS") != null) "files_default_view = icons\n" else "",
+            // The quake stage drives `sketerm --toggle` against a window
+            // that was placed by quake config from its first map.
+            if (c.getenv("SKETERM_SMOKE_E2E_QUAKE_ONLY") != null) QUAKE_CONFIG_LINE else "",
             tor_line,
         }) catch return fail("config text");
         if (!writeFile(cfg, config_text)) return fail("could not write the isolated config.conf");
@@ -761,7 +764,15 @@ pub fn main() u8 {
             if (trace != 2) _ = c.close(trace);
             _ = c.setenv("WAYLAND_DEBUG", "client", 1);
         }
-        const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "--no-save", null };
+        // The workspace stage also proves `--debug-events` end to end:
+        // the flag goes on the real command line and stderr is kept.
+        const debug_events = c.getenv("SKETERM_SMOKE_E2E_WORKSPACE_ONLY") != null;
+        if (debug_events) {
+            const trace = c.open(debug_events_log, c.O_WRONLY | c.O_CREAT | c.O_TRUNC, @as(c_uint, 0o600));
+            if (trace < 0 or c.dup2(trace, 2) < 0) c._exit(126);
+            if (trace != 2) _ = c.close(trace);
+        }
+        const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "--no-save", if (debug_events) "--debug-events" else null, null };
         _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
         c._exit(127);
     }
@@ -1038,9 +1049,25 @@ pub fn main() u8 {
         teardown();
         return 0;
     }
+    if (c.getenv("SKETERM_SMOKE_E2E_WORKSPACE_ONLY") != null) {
+        const app = drive orelse return fail("focused workspace smoke has no display driver");
+        if (workspaceStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
+        say("workspace: focused keybind, pane, tab, search, profile, shader and panel-face stage passed");
+        if (debugEventsLogStage(allocator)) |why| return failMsg(why);
+        say("--debug-events: applied daemon events and snapshot swaps reached stderr");
+        teardown();
+        return 0;
+    }
     if (c.getenv("SKETERM_SMOKE_E2E_CONFIG_ONLY") != null) {
         if (configReloadStage(allocator, sock_path, rt)) |why| return failMsg(why);
         say("config: focused live in-place, rename-over, watcher, and repeated reload stage passed");
+        teardown();
+        return 0;
+    }
+    if (c.getenv("SKETERM_SMOKE_E2E_QUAKE_ONLY") != null) {
+        const app = drive orelse return fail("the quake stage needs the display session driver");
+        if (quakeToggleStage(allocator, app, sock_path, rt, &wl_z)) |why| return failMsg(why);
+        say("quake: link order, placement, --toggle hide/show with the pane intact, and live reload passed");
         teardown();
         return 0;
     }
@@ -1177,6 +1204,13 @@ pub fn main() u8 {
     // observable.
     if (cursorTrailStage(allocator, sock_path, rt, pid)) |why| return failMsg(why);
     say("cursor trail animated on cursor jumps and returned the pane to idle");
+
+    // 3f. The workspace verbs through their own entry points: chords on
+    // the seat, the palette's `action` path, and config keys.
+    if (drive) |app| {
+        if (workspaceStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
+        say("workspace: font, copy/paste keybinds, zoom, close_pane chord, broadcast, find bar, cross search, profile, panel face, pin, restore, shader preset and close buttons");
+    }
 
     // 4. split, then list must show two panes.
     const split_resp = roundtrip(allocator, sock_path, "{\"cmd\":\"split\",\"pane\":1,\"direction\":\"h\"}\n") orelse return fail("split roundtrip");
@@ -13953,6 +13987,962 @@ fn configReloadStage(allocator: std.mem.Allocator, sock_path: [:0]const u8, rt: 
     allocator.free(rl2);
     if (waitCols(allocator, sock_path, base_cols, true, 15_000) == null)
         return "the stage could not put the defaults back for the stages after it";
+    return null;
+}
+
+// ── Workspace stage (TERM-1) ────────────────────────────────────────
+//
+// The workspace verbs no other stage drove: font resize, the
+// copy/paste keybinds, zoom, the close_pane default chord, broadcast
+// typing, pinning, restore_closed_tab, the terminal find bar,
+// cross-session search, apply_profile, shader presets, the panel-face
+// toggle and close_button_on_tab. Each sub-stage enters through the
+// user's own entry point (a real chord on the seat, or the `action`
+// command the palette and keybinds share) and leaves the window as it
+// found it. The stage owns config.conf for its duration (auto reload
+// applies it) and puts the defaults back at the end.
+
+/// The GUI's stderr in the focused workspace run, which passes
+/// `--debug-events`.
+const debug_events_log: [*:0]const u8 = "zig-out/smoke-e2e-debug-events.log";
+
+/// `--debug-events` printed the events the workspace stage caused and
+/// the snapshot swaps its font resizes forced (a resize answers with a
+/// SNAPSHOT), each tagged with its session.
+fn debugEventsLogStage(allocator: std.mem.Allocator) ?[]const u8 {
+    const log = readFileAlloc(allocator, std.mem.span(debug_events_log)) orelse
+        return "--debug-events: the GUI's stderr log is missing";
+    defer allocator.free(log);
+    if (std.mem.indexOf(u8, log, "] print_run \"") == null)
+        return "--debug-events: no applied print_run event was printed";
+    if (std.mem.indexOf(u8, log, "] csi ESC[") == null)
+        return "--debug-events: no applied CSI event was printed";
+    if (std.mem.indexOf(u8, log, "] snapshot ") == null)
+        return "--debug-events: no snapshot swap was printed";
+    return null;
+}
+
+const ws_profile = "e2ered";
+const ws_red: [3]u8 = .{ 0xc8, 0x00, 0x00 };
+const ws_magenta: [3]u8 = .{ 0xff, 0x00, 0xff };
+
+/// The config the stage runs under. `font_size` is the reload sentinel.
+fn wsConfig(buf: []u8, close_buttons: bool, font_size: u32) ?[]const u8 {
+    return std.fmt.bufPrint(buf,
+        \\# smoke-e2e workspace stage
+        \\font_size = {d}
+        \\close_button_on_tab = {s}
+        \\track_tab_activity = false
+        \\inactive_warn_secs = 86400
+        \\keybind.copy = <Control>F7
+        \\keybind.paste = <Control>F8
+        \\
+        \\[profile.{s}]
+        \\default_bg = #c80000
+        \\light.default_bg = #c80000
+        \\dark.default_bg = #c80000
+        \\
+    , .{ font_size, if (close_buttons) "true" else "false", ws_profile }) catch null;
+}
+
+fn wsMainWindow(app: *appdrive.App) ?u32 {
+    _ = app.drainLive(500);
+    for (app.windows.items) |w| {
+        if (!w.popup) return w.id;
+    }
+    return null;
+}
+
+fn wsAction(allocator: std.mem.Allocator, sock_path: [:0]const u8, name: []const u8, pane: ?u32) bool {
+    var buf: [160]u8 = undefined;
+    const req = if (pane) |p|
+        std.fmt.bufPrint(&buf, "{{\"cmd\":\"action\",\"data\":\"{s}\",\"pane\":{d}}}\n", .{ name, p }) catch return false
+    else
+        std.fmt.bufPrint(&buf, "{{\"cmd\":\"action\",\"data\":\"{s}\"}}\n", .{name}) catch return false;
+    const resp = roundtrip(allocator, sock_path, req) orelse return false;
+    defer allocator.free(resp);
+    return std.mem.indexOf(u8, resp, "\"ok\":true") != null;
+}
+
+fn wsSendText(allocator: std.mem.Allocator, sock_path: [:0]const u8, pane: u32, text: []const u8) bool {
+    var buf: [512]u8 = undefined;
+    const req = std.fmt.bufPrint(&buf, "{{\"cmd\":\"send-text\",\"pane\":{d},\"data\":\"{s}\"}}\n", .{ pane, text }) catch return false;
+    const resp = roundtrip(allocator, sock_path, req) orelse return false;
+    defer allocator.free(resp);
+    return std.mem.indexOf(u8, resp, "\"ok\":true") != null;
+}
+
+fn wsFocus(allocator: std.mem.Allocator, sock_path: [:0]const u8, pane: u32) bool {
+    var buf: [64]u8 = undefined;
+    const req = std.fmt.bufPrint(&buf, "{{\"cmd\":\"focus\",\"pane\":{d}}}\n", .{pane}) catch return false;
+    const resp = roundtrip(allocator, sock_path, req) orelse return false;
+    defer allocator.free(resp);
+    return std.mem.indexOf(u8, resp, "\"ok\":true") != null;
+}
+
+/// Occurrences of `needle` in one pane's visible text.
+fn wsMarkerIn(allocator: std.mem.Allocator, sock_path: [:0]const u8, pane: u32, needle: []const u8) usize {
+    return wsCountText(allocator, sock_path, pane, needle, false);
+}
+
+/// Occurrences of `needle` in one pane's text, scrollback included when `history`.
+fn wsCountText(allocator: std.mem.Allocator, sock_path: [:0]const u8, pane: u32, needle: []const u8, history: bool) usize {
+    var buf: [80]u8 = undefined;
+    const req = std.fmt.bufPrint(&buf, "{{\"cmd\":\"get-text\",\"pane\":{d},\"scrollback\":{d}}}\n", .{ pane, @intFromBool(history) }) catch return 0;
+    const resp = roundtrip(allocator, sock_path, req) orelse return 0;
+    defer allocator.free(resp);
+    return std.mem.count(u8, resp, needle);
+}
+
+/// Print one pane's text to stderr, for a failed wait.
+fn wsDumpPane(allocator: std.mem.Allocator, sock_path: [:0]const u8, pane: u32) void {
+    var buf: [64]u8 = undefined;
+    const req = std.fmt.bufPrint(&buf, "{{\"cmd\":\"get-text\",\"pane\":{d}}}\n", .{pane}) catch return;
+    const resp = roundtrip(allocator, sock_path, req) orelse return;
+    defer allocator.free(resp);
+    _ = c.fprintf(platform.stderr(), "smoke-e2e: pane %u text: %.*s\n", pane, @as(c_int, @intCast(@min(resp.len, 3000))), resp.ptr);
+}
+
+/// Poll one pane's text, pumping the display session in between: a
+/// clipboard paste only completes while the viewer serves the data.
+fn wsWaitMarkerIn(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]const u8, pane: u32, needle: []const u8, want: usize, ms: u32) bool {
+    var waited: u32 = 0;
+    while (waited < ms) : (waited += 200) {
+        if (wsMarkerIn(allocator, sock_path, pane, needle) >= want) return true;
+        _ = app.pumpOnce(200);
+    }
+    return false;
+}
+
+/// The focused pane according to `list`, or 0.
+fn wsFocusedPane(allocator: std.mem.Allocator, sock_path: [:0]const u8) u32 {
+    const r = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse return 0;
+    defer allocator.free(r);
+    const at = std.mem.indexOf(u8, r, "\"focused\":true") orelse return 0;
+    const id_at = std.mem.lastIndexOf(u8, r[0..at], "{\"id\":") orelse return 0;
+    return parseNumAfter(r[id_at..], "{\"id\":") orelse 0;
+}
+
+/// Whether `list` reports pane `pane` zoomed.
+fn wsPaneZoomed(allocator: std.mem.Allocator, sock_path: [:0]const u8, pane: u32) ?bool {
+    const r = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse return null;
+    defer allocator.free(r);
+    var key_buf: [32]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_buf, "{{\"id\":{d},", .{pane}) catch return null;
+    const at = std.mem.indexOf(u8, r, key) orelse return null;
+    const end = std.mem.indexOfScalarPos(u8, r, at, '}') orelse return null;
+    return std.mem.indexOf(u8, r[at..end], "\"zoomed\":true") != null;
+}
+
+/// Pixels of `shot` within 12 of `want` on every channel.
+fn wsColorPixels(px: []const u8, want: [3]u8) usize {
+    var hits: usize = 0;
+    var i: usize = 0;
+    while (i + 3 < px.len) : (i += 4) {
+        var ok = true;
+        inline for (0..3) |ch| {
+            const d = @as(i32, px[i + ch]) - @as(i32, want[ch]);
+            if (d < -12 or d > 12) ok = false;
+        }
+        if (ok) hits += 1;
+    }
+    return hits;
+}
+
+/// Wait until `want` covers at least (`present`) or at most
+/// (`!present`) `frac` of the main window.
+fn wsWaitCoverage(allocator: std.mem.Allocator, app: *appdrive.App, win: u32, want: [3]u8, frac: f64, present: bool, ms: u32) bool {
+    var waited: u32 = 0;
+    while (waited < ms) : (waited += 200) {
+        _ = app.pumpOnce(200);
+        const shot = app.snapshotRgba(win, null) catch continue;
+        defer allocator.free(shot.px);
+        const total = @as(f64, @floatFromInt(shot.w)) * @as(f64, @floatFromInt(shot.h));
+        if (total == 0) continue;
+        const cover = @as(f64, @floatFromInt(wsColorPixels(shot.px, want))) / total;
+        if ((cover >= frac) == present) return true;
+    }
+    return false;
+}
+
+fn wsShot(allocator: std.mem.Allocator, app: *appdrive.App, win: u32, tag: []const u8) void {
+    const shot = app.screenshotPng(win, 1400, null, 0) catch return;
+    defer allocator.free(shot.png);
+    var name_buf: [128]u8 = undefined;
+    const name = std.fmt.bufPrintZ(&name_buf, "/tmp/sketerm-e2e-workspace-{s}.png", .{tag}) catch return;
+    writePng(name.ptr, shot.png);
+    _ = c.fprintf(platform.stderr(), "smoke-e2e: workspace screenshot %s\n", name.ptr);
+}
+
+/// Split pane `of` and return the new pane, which the split focuses.
+fn wsSplit(allocator: std.mem.Allocator, sock_path: [:0]const u8, of: u32) ?u32 {
+    const before = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse return null;
+    defer allocator.free(before);
+    var ids: [64]u32 = undefined;
+    const n = listPaneIds(before, &ids);
+    var buf: [96]u8 = undefined;
+    const req = std.fmt.bufPrint(&buf, "{{\"cmd\":\"split\",\"pane\":{d},\"direction\":\"h\"}}\n", .{of}) catch return null;
+    const resp = roundtrip(allocator, sock_path, req) orelse return null;
+    defer allocator.free(resp);
+    if (std.mem.indexOf(u8, resp, "\"ok\":true") == null) return null;
+    var waited: u32 = 0;
+    while (waited < 10_000) : (waited += 100) {
+        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse return null;
+        defer allocator.free(r);
+        var now: [64]u32 = undefined;
+        const m = listPaneIds(r, &now);
+        for (now[0..m]) |id| {
+            if (!contains(ids[0..n], id)) return id;
+        }
+        _ = c.usleep(100_000);
+    }
+    return null;
+}
+
+fn wsNewTab(allocator: std.mem.Allocator, sock_path: [:0]const u8) ?u32 {
+    const resp = roundtrip(allocator, sock_path, "{\"cmd\":\"new-tab\"}\n") orelse return null;
+    defer allocator.free(resp);
+    if (std.mem.indexOf(u8, resp, "\"ok\":true") == null) return null;
+    return parseNumAfter(resp, "\"pane\":");
+}
+
+fn wsClosePane(allocator: std.mem.Allocator, sock_path: [:0]const u8, pane: u32) bool {
+    var buf: [64]u8 = undefined;
+    const req = std.fmt.bufPrint(&buf, "{{\"cmd\":\"close-pane\",\"pane\":{d}}}\n", .{pane}) catch return false;
+    if (roundtrip(allocator, sock_path, req)) |r| allocator.free(r) else return false;
+    return waitPaneGone(allocator, sock_path, pane, 15_000);
+}
+
+/// Type a shell line on the seat into the focused pane and wait for
+/// its output, retrying the prompt the way copyModeStage does.
+fn wsTypeLine(allocator: std.mem.Allocator, app: *appdrive.App, win: u32, sock_path: [:0]const u8, pane: u32, line: []const u8, marker: []const u8, want: usize) bool {
+    var attempt: u32 = 0;
+    while (attempt < 4) : (attempt += 1) {
+        app.pressKey(win, "ctrl+u") catch return false;
+        _ = app.waitIdle(120, 2_000);
+        app.typeText(win, line) catch return false;
+        app.typeText(win, "\n") catch return false;
+        if (wsWaitMarkerIn(allocator, app, sock_path, pane, marker, want, 8_000)) return true;
+    }
+    return false;
+}
+
+/// Pane 1's grid as rows * cols: one point of font size can leave the
+/// cell WIDTH unchanged, so a column count alone is not a signal.
+fn wsPaneCells(allocator: std.mem.Allocator, sock_path: [:0]const u8) ?u32 {
+    const resp = roundtrip(allocator, sock_path, "{\"cmd\":\"screen-info\",\"pane\":1}\n") orelse return null;
+    defer allocator.free(resp);
+    const rows = parseNumAfter(resp, "\"rows\":") orelse return null;
+    const cols = parseNumAfter(resp, "\"cols\":") orelse return null;
+    return rows * cols;
+}
+
+/// Press `chord` (up to three times) until pane 1's cell count moves
+/// the `grow` way from `base`; the observed count, or null.
+fn wsFontStep(allocator: std.mem.Allocator, app: *appdrive.App, win: u32, sock_path: [:0]const u8, chord: []const u8, base: u32, grow: bool) ?u32 {
+    var presses: u32 = 0;
+    while (presses < 3) : (presses += 1) {
+        app.pressKey(win, chord) catch return null;
+        var waited: u32 = 0;
+        while (waited < 4_000) : (waited += 200) {
+            _ = app.pumpOnce(200);
+            const now = wsPaneCells(allocator, sock_path) orelse continue;
+            if (if (grow) now > base else now < base) return now;
+        }
+    }
+    return null;
+}
+
+fn wsWaitCells(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]const u8, want: u32, ms: u32) bool {
+    var waited: u32 = 0;
+    while (waited < ms) : (waited += 200) {
+        _ = app.pumpOnce(200);
+        if (wsPaneCells(allocator, sock_path) == want) return true;
+    }
+    return false;
+}
+
+fn wsFontResize(allocator: std.mem.Allocator, app: *appdrive.App, win: u32, sock_path: [:0]const u8) ?[]const u8 {
+    if (!wsFocus(allocator, sock_path, 1)) return "font: focus pane 1";
+    _ = app.waitIdle(200, 3_000);
+    const base = wsPaneCells(allocator, sock_path) orelse return "font: no grid";
+    _ = wsFontStep(allocator, app, win, sock_path, "ctrl+=", base, false) orelse
+        return "font: Ctrl+= (font_inc) did not shrink the grid";
+    app.pressKey(win, "ctrl+0") catch return "font: pressing Ctrl+0 failed";
+    if (!wsWaitCells(allocator, app, sock_path, base, 10_000)) return "font: Ctrl+0 (font_reset) did not restore the grid";
+    _ = wsFontStep(allocator, app, win, sock_path, "ctrl+-", base, true) orelse
+        return "font: Ctrl+- (font_dec) did not grow the grid";
+    app.pressKey(win, "ctrl+0") catch return "font: pressing Ctrl+0 failed";
+    if (!wsWaitCells(allocator, app, sock_path, base, 10_000)) return "font: the second Ctrl+0 did not restore the grid";
+    return null;
+}
+
+fn wsCopyPasteKeybinds(allocator: std.mem.Allocator, app: *appdrive.App, win: u32, sock_path: [:0]const u8) ?[]const u8 {
+    if (!wsFocus(allocator, sock_path, 1)) return "copy/paste: focus pane 1";
+    if (!wsTypeLine(allocator, app, win, sock_path, 1, "clear; echo ZWcopy$((6*7))", "ZWcopy42", 1))
+        return "copy/paste: the sample output never appeared";
+    // keybind.copy = <Control>F7 (the documented alias of copy_selection).
+    if (!wsAction(allocator, sock_path, "select_all", 1)) return "copy/paste: select_all action";
+    _ = app.waitIdle(200, 3_000);
+    app.setClipboard("ZWstale") catch return "copy/paste: seeding the clipboard failed";
+    app.pressKey(win, "ctrl+f7") catch return "copy/paste: pressing Ctrl+F7 failed";
+    var copied = false;
+    var waited: u32 = 0;
+    while (waited < 8_000 and !copied) : (waited += 250) {
+        _ = app.pumpOnce(250);
+        const clip = app.getClipboard(2_000) catch continue;
+        defer allocator.free(clip);
+        copied = std.mem.indexOf(u8, clip, "ZWcopy42") != null;
+    }
+    if (!copied) return "copy/paste: keybind.copy (Ctrl+F7) did not copy the selection";
+    // keybind.paste = <Control>F8 (the alias of paste_clipboard) pastes
+    // what Ctrl+F7 just copied back into the prompt: a second ZWcopy42
+    // can only come from the paste (counted with scrollback, since the
+    // pasted blank rows scroll the first one off). The GUI's own copy,
+    // not a host offer: the display session's replicas never learn the
+    // brain's server-created offers, so a host-clipboard paste into a
+    // forwarded client gets no answer (reported, MUX-owned).
+    app.pressKey(win, "ctrl+f8") catch return "copy/paste: pressing Ctrl+F8 failed";
+    var pasted = false;
+    waited = 0;
+    while (waited < 8_000 and !pasted) : (waited += 200) {
+        pasted = wsCountText(allocator, sock_path, 1, "ZWcopy42", true) >= 2;
+        if (!pasted) _ = app.pumpOnce(200);
+    }
+    if (!pasted) {
+        wsDumpPane(allocator, sock_path, 1);
+        return "copy/paste: keybind.paste (Ctrl+F8) did not paste the clipboard";
+    }
+    // The bracketed paste sits unexecuted on the prompt; Ctrl+C drops it.
+    app.pressKey(win, "ctrl+c") catch {};
+    _ = app.waitIdle(300, 3_000);
+    return null;
+}
+
+fn wsZoomAndClosePane(allocator: std.mem.Allocator, app: *appdrive.App, win: u32, sock_path: [:0]const u8) ?[]const u8 {
+    const extra = wsSplit(allocator, sock_path, 1) orelse return "zoom: split failed";
+    if (!wsFocus(allocator, sock_path, extra)) return "zoom: focus the split";
+    _ = app.waitIdle(200, 3_000);
+    app.pressKey(win, "ctrl+shift+m") catch return "zoom: pressing Ctrl+Shift+M failed";
+    var waited: u32 = 0;
+    while (waited < 8_000) : (waited += 200) {
+        if (wsPaneZoomed(allocator, sock_path, extra) orelse false) break;
+        _ = c.usleep(200_000);
+    } else return "zoom: Ctrl+Shift+M (zoom_pane) did not zoom the focused pane";
+    app.pressKey(win, "ctrl+shift+m") catch return "zoom: pressing Ctrl+Shift+M again failed";
+    waited = 0;
+    while (waited < 8_000) : (waited += 200) {
+        if (!(wsPaneZoomed(allocator, sock_path, extra) orelse true)) break;
+        _ = c.usleep(200_000);
+    } else return "zoom: the second Ctrl+Shift+M did not unzoom";
+    // close_pane's default chord: Ctrl+Shift+W plus Alt.
+    app.pressKey(win, "ctrl+shift+alt+w") catch return "close_pane: pressing Ctrl+Shift+Alt+W failed";
+    if (!waitPaneGone(allocator, sock_path, extra, 10_000))
+        return "close_pane: Ctrl+Shift+Alt+W did not close the focused pane";
+    if (paneCols(allocator, sock_path) == null)
+        return "close_pane: the chord took pane 1 with it";
+    return null;
+}
+
+fn wsBroadcast(allocator: std.mem.Allocator, app: *appdrive.App, win: u32, sock_path: [:0]const u8) ?[]const u8 {
+    const extra = wsSplit(allocator, sock_path, 1) orelse return "broadcast: split failed";
+    defer _ = wsClosePane(allocator, sock_path, extra);
+    if (!wsFocus(allocator, sock_path, 1)) return "broadcast: focus pane 1";
+    _ = app.waitIdle(200, 3_000);
+    // off -> group -> all. `group` only links panes given a group
+    // name, so `all` is the mode that reaches an ungrouped split.
+    if (!wsAction(allocator, sock_path, "broadcast_cycle", null)) return "broadcast: broadcast_cycle action";
+    if (!wsAction(allocator, sock_path, "broadcast_cycle", null)) return "broadcast: second cycle";
+    _ = app.waitIdle(200, 3_000);
+    if (!wsTypeLine(allocator, app, win, sock_path, 1, "echo ZWcast$((5*5))", "ZWcast25", 1))
+        return "broadcast: the typed line did not run in the focused pane";
+    if (!wsWaitMarkerIn(allocator, app, sock_path, extra, "ZWcast25", 1, 8_000))
+        return "broadcast: all mode did not copy the keystrokes to the other pane";
+    // all -> off.
+    if (!wsAction(allocator, sock_path, "broadcast_cycle", null)) return "broadcast: third cycle";
+    _ = app.waitIdle(200, 3_000);
+    if (!wsTypeLine(allocator, app, win, sock_path, 1, "echo ZWsolo$((5*6))", "ZWsolo30", 1))
+        return "broadcast: typing after broadcast off did not reach pane 1";
+    _ = c.usleep(1_000_000);
+    if (wsMarkerIn(allocator, sock_path, extra, "ZWsolo") != 0)
+        return "broadcast: cycling back to off still broadcast the keystrokes";
+    return null;
+}
+
+/// Pane ids of every tab in `list` order, first pane of each.
+fn wsTabFirstPanes(allocator: std.mem.Allocator, sock_path: [:0]const u8, out: []u32) usize {
+    const r = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse return 0;
+    defer allocator.free(r);
+    var n: usize = 0;
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, r, from, "\"panes\":[{\"id\":")) |at| : (from = at + 15) {
+        if (n == out.len) break;
+        out[n] = parseNumAfter(r[at..], "\"panes\":[{\"id\":") orelse continue;
+        n += 1;
+    }
+    return n;
+}
+
+/// Toggle the pin of `pane`'s tab and wait until the tab order starts
+/// with `want`.
+fn wsTogglePinExpect(allocator: std.mem.Allocator, sock_path: [:0]const u8, pane: u32, want: []const u32) bool {
+    if (!wsFocus(allocator, sock_path, pane)) return false;
+    if (!wsAction(allocator, sock_path, "toggle_pin_tab", pane)) return false;
+    var order: [32]u32 = undefined;
+    var waited: u32 = 0;
+    while (waited < 8_000) : (waited += 200) {
+        const n = wsTabFirstPanes(allocator, sock_path, &order);
+        if (n >= want.len and std.mem.eql(u32, order[0..want.len], want)) return true;
+        _ = c.usleep(200_000);
+    }
+    return false;
+}
+
+/// Pinned tabs form a section at the front: a pin goes to the END of
+/// it, an unpin to the start of the unpinned tabs. With one pinned tab
+/// an unpin moves nothing, so two tabs are pinned to make it visible.
+fn wsPin(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]const u8) ?[]const u8 {
+    const a = wsNewTab(allocator, sock_path) orelse return "pin: new-tab failed";
+    defer _ = wsClosePane(allocator, sock_path, a);
+    const b = wsNewTab(allocator, sock_path) orelse return "pin: second new-tab failed";
+    defer _ = wsClosePane(allocator, sock_path, b);
+    _ = app.waitIdle(300, 5_000);
+    var order: [32]u32 = undefined;
+    const n = wsTabFirstPanes(allocator, sock_path, &order);
+    if (n < 3 or order[n - 2] != a or order[n - 1] != b) return "pin: the new tabs are not last";
+    if (!wsTogglePinExpect(allocator, sock_path, b, &.{b}))
+        return "pin: a pinned tab did not move to the pinned section at the front";
+    if (!wsTogglePinExpect(allocator, sock_path, a, &.{ b, a }))
+        return "pin: a second pin did not join the end of the pinned section";
+    if (!wsTogglePinExpect(allocator, sock_path, b, &.{ a, b }))
+        return "pin: unpinning did not move the tab behind the pinned section";
+    if (!wsTogglePinExpect(allocator, sock_path, a, &.{ a, b }))
+        return "pin: unpinning the last pinned tab failed";
+    return null;
+}
+
+fn wsRestoreClosed(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]const u8, rt: []const u8) ?[]const u8 {
+    var dir_buf: [300:0]u8 = undefined;
+    const dir = std.fmt.bufPrintZ(&dir_buf, "{s}/zwrestore", .{rt}) catch return "restore: dir path";
+    _ = c.mkdir(dir.ptr, 0o700);
+    const tab_pane = wsNewTab(allocator, sock_path) orelse return "restore: new-tab failed";
+    _ = app.waitIdle(300, 5_000);
+    var cd_buf: [400]u8 = undefined;
+    const cd = std.fmt.bufPrint(&cd_buf, "cd {s} && echo ZWcd$((3*3))\\n", .{dir}) catch return "restore: cd fmt";
+    if (!wsSendText(allocator, sock_path, tab_pane, cd)) return "restore: send cd";
+    if (!wsWaitMarkerIn(allocator, app, sock_path, tab_pane, "ZWcd9", 1, 10_000)) return "restore: the cd never ran";
+    // Wait for the cwd report (OSC 7) to reach the pane before closing.
+    var waited: u32 = 0;
+    while (waited < 8_000) : (waited += 200) {
+        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse return "restore: list";
+        defer allocator.free(r);
+        if (std.mem.indexOf(u8, r, dir) != null) break;
+        _ = c.usleep(200_000);
+    } else return "restore: the pane never reported the new cwd";
+    const tabs_before = tabCount(allocator, sock_path) orelse return "restore: tab count";
+    if (!wsClosePane(allocator, sock_path, tab_pane)) return "restore: closing the tab failed";
+    // The restored tab's pane is the one id that was not there before.
+    var ids_before: [64]u32 = undefined;
+    const n_before = blk: {
+        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse return "restore: list before";
+        defer allocator.free(r);
+        break :blk listPaneIds(r, &ids_before);
+    };
+    if (!wsAction(allocator, sock_path, "restore_closed_tab", null)) return "restore: restore_closed_tab action";
+    waited = 0;
+    var restored: u32 = 0;
+    while (waited < 10_000 and restored == 0) : (waited += 200) {
+        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse return "restore: list after";
+        defer allocator.free(r);
+        if (countTabs(r) == tabs_before and std.mem.indexOf(u8, r, dir) != null) {
+            var ids_now: [64]u32 = undefined;
+            for (ids_now[0..listPaneIds(r, &ids_now)]) |id| {
+                if (!contains(ids_before[0..n_before], id)) restored = id;
+            }
+        }
+        if (restored == 0) _ = c.usleep(200_000);
+    }
+    if (restored == 0) return "restore: restore_closed_tab did not bring the tab back in its cwd";
+    if (!wsClosePane(allocator, sock_path, restored)) return "restore: closing the restored tab failed";
+    return null;
+}
+
+fn wsFindBar(allocator: std.mem.Allocator, app: *appdrive.App, win: u32, sock_path: [:0]const u8) ?[]const u8 {
+    if (!wsFocus(allocator, sock_path, 1)) return "find: focus pane 1";
+    if (!wsSendText(allocator, sock_path, 1, "clear; echo ZWfind$((2*21)); seq 1 400\\n")) return "find: send";
+    if (!wsWaitMarkerIn(allocator, app, sock_path, 1, "\\n400", 1, 15_000)) return "find: the seq never finished";
+    _ = app.waitIdle(300, 5_000);
+    var ref = app.frameRef(win, true) orelse return "find: no baseline frame";
+    defer ref.deinit(allocator);
+    if (!wsAction(allocator, sock_path, "search_open", null)) return "find: search_open action";
+    if (!app.waitChangeSince(win, &ref, 8_000, 0.002, null)) return "find: the find bar did not open";
+    _ = app.waitVisualSettle(win, 300, 5_000, 0.002, null);
+    app.typeText(win, "ZWfind42") catch return "find: typing the query failed";
+    app.pressKey(win, "return") catch {};
+    var scrolled = false;
+    var waited: u32 = 0;
+    while (waited < 8_000 and !scrolled) : (waited += 250) {
+        _ = app.pumpOnce(250);
+        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"screen-info\",\"pane\":1}\n") orelse continue;
+        defer allocator.free(r);
+        scrolled = (parseNumAfter(r, "\"view_offset\":") orelse 0) > 0;
+    }
+    app.pressKey(win, "escape") catch {};
+    _ = app.waitIdle(200, 3_000);
+    _ = wsAction(allocator, sock_path, "scrollback_bottom", 1);
+    if (!scrolled) {
+        wsShot(allocator, app, win, "find");
+        return "find: searching the scrollback did not scroll back to the match";
+    }
+    return null;
+}
+
+fn wsCrossSearch(allocator: std.mem.Allocator, app: *appdrive.App, win: u32, sock_path: [:0]const u8) ?[]const u8 {
+    const other = wsNewTab(allocator, sock_path) orelse return "xsearch: new-tab failed";
+    defer _ = wsClosePane(allocator, sock_path, other);
+    _ = app.waitIdle(300, 5_000);
+    if (!wsSendText(allocator, sock_path, other, "echo ZWxs$((7*11))\\n")) return "xsearch: send";
+    if (!wsWaitMarkerIn(allocator, app, sock_path, other, "ZWxs77", 1, 10_000)) return "xsearch: marker never ran";
+    if (!wsFocus(allocator, sock_path, 1)) return "xsearch: focus pane 1";
+    _ = app.waitIdle(300, 5_000);
+    if (wsFocusedPane(allocator, sock_path) != 1) return "xsearch: pane 1 did not take focus";
+    var ref = app.frameRef(win, true) orelse return "xsearch: no baseline frame";
+    defer ref.deinit(allocator);
+    if (!wsAction(allocator, sock_path, "cross_search", null)) return "xsearch: cross_search action";
+    if (!app.waitChangeSince(win, &ref, 8_000, 0.01, null)) return "xsearch: the dialog did not open";
+    _ = app.waitVisualSettle(win, 300, 5_000, 0.002, null);
+    app.typeText(win, "ZWxs77") catch return "xsearch: typing the query failed";
+    app.pressKey(win, "return") catch return "xsearch: running the search failed";
+    _ = app.waitVisualSettle(win, 400, 8_000, 0.002, null);
+    // The hit list follows the entry: Tab moves to its first row.
+    app.pressKey(win, "tab") catch {};
+    _ = app.waitIdle(200, 2_000);
+    app.pressKey(win, "return") catch {};
+    var waited: u32 = 0;
+    while (waited < 10_000) : (waited += 250) {
+        _ = app.pumpOnce(250);
+        if (wsFocusedPane(allocator, sock_path) == other) return null;
+    }
+    wsShot(allocator, app, win, "xsearch");
+    app.pressKey(win, "escape") catch {};
+    return "xsearch: activating the hit did not focus the session's pane";
+}
+
+fn wsApplyProfile(allocator: std.mem.Allocator, app: *appdrive.App, win: u32, sock_path: [:0]const u8) ?[]const u8 {
+    if (!wsFocus(allocator, sock_path, 1)) return "profile: focus pane 1";
+    if (!wsSendText(allocator, sock_path, 1, "clear\\n")) return "profile: clear";
+    _ = app.waitIdle(300, 5_000);
+    if (!wsAction(allocator, sock_path, "apply_profile", null)) return "profile: apply_profile action";
+    const pop = waitPopup(app, true, 8_000) orelse return "profile: the profile picker did not open";
+    // Rows: "default", then the named profiles in file order.
+    app.pressKey(pop, "tab") catch {};
+    _ = app.waitIdle(150, 2_000);
+    app.pressKey(pop, "return") catch return "profile: choosing the profile failed";
+    if (!wsWaitCoverage(allocator, app, win, ws_red, 0.2, true, 10_000)) {
+        wsShot(allocator, app, win, "profile");
+        return "profile: applying the red profile did not repaint the pane";
+    }
+    if (!wsAction(allocator, sock_path, "apply_profile", null)) return "profile: second apply_profile action";
+    const pop2 = waitPopup(app, true, 8_000) orelse return "profile: the picker did not reopen";
+    app.pressKey(pop2, "return") catch return "profile: choosing default failed";
+    if (!wsWaitCoverage(allocator, app, win, ws_red, 0.02, false, 10_000))
+        return "profile: applying default did not take the red profile off";
+    return null;
+}
+
+fn wsShaderPreset(allocator: std.mem.Allocator, app: *appdrive.App, win: u32, sock_path: [:0]const u8, rt: []const u8) ?[]const u8 {
+    var dir_buf: [300:0]u8 = undefined;
+    const dir = std.fmt.bufPrintZ(&dir_buf, "{s}/sketerm/shader-presets", .{rt}) catch return "shader: dir";
+    _ = c.mkdir(dir.ptr, 0o700);
+    var shader_buf: [320:0]u8 = undefined;
+    const shader = std.fmt.bufPrintZ(&shader_buf, "{s}/zw-magenta.glsl", .{rt}) catch return "shader: path";
+    if (!writeFile(shader, "void mainImage(out vec4 fragColor, in vec2 fragCoord) { fragColor = vec4(1.0, 0.0, 1.0, 1.0); }\n"))
+        return "shader: writing the shader failed";
+    var preset_buf: [340:0]u8 = undefined;
+    const preset = std.fmt.bufPrintZ(&preset_buf, "{s}/zw-magenta.conf", .{dir}) catch return "shader: preset path";
+    var body_buf: [400]u8 = undefined;
+    const body = std.fmt.bufPrint(&body_buf, "shader = {s}\nanimate = false\n", .{shader}) catch return "shader: preset body";
+    if (!writeFile(preset, body)) return "shader: writing the preset failed";
+    defer _ = c.unlink(preset.ptr);
+
+    if (!wsFocus(allocator, sock_path, 1)) return "shader: focus pane 1";
+    _ = app.waitIdle(200, 3_000);
+    if (!wsAction(allocator, sock_path, "shader_preset_pick", null)) return "shader: shader_preset_pick action";
+    const pop = waitPopup(app, true, 8_000) orelse return "shader: the preset picker did not open";
+    app.pressKey(pop, "return") catch return "shader: choosing the preset failed";
+    if (!wsWaitCoverage(allocator, app, win, ws_magenta, 0.2, true, 10_000)) {
+        wsShot(allocator, app, win, "shader");
+        return "shader: applying the preset did not run its shader";
+    }
+    if (!wsAction(allocator, sock_path, "shader_clear", null)) return "shader: shader_clear action";
+    if (!wsWaitCoverage(allocator, app, win, ws_magenta, 0.02, false, 10_000))
+        return "shader: shader_clear did not remove the preset's shader";
+    return null;
+}
+
+fn wsPanelFace(allocator: std.mem.Allocator, app: *appdrive.App, win: u32, sock_path: [:0]const u8) ?[]const u8 {
+    const color: [3]u8 = .{ 0x35, 0xa0, 0xe0 };
+    const image_path = std.fmt.allocPrintSentinel(allocator, "/tmp/sketerm-e2e-toggle-panel-{d}.png", .{c.getpid()}, 0) catch
+        return "panel: image path";
+    defer allocator.free(image_path);
+    defer _ = c.unlink(image_path.ptr);
+    if (!writeSolidPng(allocator, image_path.ptr, color[0], color[1], color[2])) return "panel: image fixture";
+    var show_buf: [900]u8 = undefined;
+    const show_req = std.fmt.bufPrint(
+        &show_buf,
+        "{{\"cmd\":\"panel-show\",\"name\":\"e2e-toggle\",\"session\":\"e2e-toggle\"," ++
+            "\"target\":\"pane\",\"pane\":1,\"document\":\"{{\\\"root\\\":\\\"img\\\",\\\"components\\\":{{" ++
+            "\\\"img\\\":{{\\\"type\\\":\\\"image\\\",\\\"src\\\":\\\"{s}\\\"}}}}}}\"}}\n",
+        .{image_path},
+    ) catch return "panel: request fmt";
+    const shown = roundtrip(allocator, sock_path, show_req) orelse return "panel: panel-show roundtrip";
+    defer allocator.free(shown);
+    if (!mcpHas(shown, "\"ok\":true")) return "panel: panel-show not ok";
+    const id = parseNumAfter(shown, "\"panel_id\":") orelse return "panel: no panel_id";
+    defer {
+        var buf: [128]u8 = undefined;
+        if (std.fmt.bufPrint(&buf, "{{\"cmd\":\"panel-close\",\"panel_id\":{d},\"session\":\"e2e-toggle\"}}\n", .{id})) |req| {
+            if (roundtrip(allocator, sock_path, req)) |r| allocator.free(r);
+        } else |_| {}
+    }
+    if (!waitForPanelColor(allocator, app, win, color, 12_000)) return "panel: the panel face never painted";
+    // toggle_panel_face: panel -> shell -> panel.
+    if (!wsAction(allocator, sock_path, "toggle_panel_face", 1)) return "panel: toggle_panel_face action";
+    var waited: u32 = 0;
+    var hidden = false;
+    while (waited < 8_000 and !hidden) : (waited += 200) {
+        _ = app.pumpOnce(200);
+        const shot = app.snapshotRgba(win, null) catch continue;
+        defer allocator.free(shot.px);
+        hidden = panelColorPixels(shot.px, color) < 50;
+    }
+    if (!hidden) return "panel: toggle_panel_face did not bring the shell back";
+    if (!wsAction(allocator, sock_path, "toggle_panel_face", 1)) return "panel: second toggle";
+    if (!waitForPanelColor(allocator, app, win, color, 8_000)) return "panel: toggle_panel_face did not show the panel again";
+    return null;
+}
+
+/// Height of the chrome above the terminal area: the first row, from
+/// the top, that is almost entirely the terminal's own background,
+/// sampled at the window centre where no text sits after `clear`. The
+/// match is near-exact because a light header bar (250,250,251) sits a
+/// few levels from a light terminal (247,247,247).
+fn wsChromeHeight(allocator: std.mem.Allocator, app: *appdrive.App, win: u32) ?u32 {
+    const shot = app.snapshotRgba(win, null) catch return null;
+    defer allocator.free(shot.px);
+    if (shot.w == 0 or shot.h < 4) return null;
+    const mid = ((shot.h / 2) * shot.w + shot.w / 2) * 4;
+    const bg = shot.px[mid .. mid + 3];
+    var y: u32 = 0;
+    while (y < shot.h / 2) : (y += 1) {
+        var same: u32 = 0;
+        var x: u32 = 0;
+        while (x < shot.w) : (x += 1) {
+            const i = (y * shot.w + x) * 4;
+            var ok = true;
+            inline for (0..3) |ch| {
+                const d = @as(i32, shot.px[i + ch]) - @as(i32, bg[ch]);
+                if (d < -1 or d > 1) ok = false;
+            }
+            if (ok) same += 1;
+        }
+        if (same * 10 >= shot.w * 9) return y;
+    }
+    return null;
+}
+
+/// Pixels whose red+green moved by more than 60 between two captures.
+fn wsChangedPixels(a: []const u8, b: []const u8) usize {
+    if (a.len != b.len) return std.math.maxInt(usize);
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i + 3 < a.len) : (i += 4) {
+        const d = @abs(@as(i32, a[i]) - @as(i32, b[i])) + @abs(@as(i32, a[i + 1]) - @as(i32, b[i + 1]));
+        if (d > 60) n += 1;
+    }
+    return n;
+}
+
+fn wsCloseButtons(allocator: std.mem.Allocator, app: *appdrive.App, win: u32, sock_path: [:0]const u8, cfg_path: [:0]const u8) ?[]const u8 {
+    const extra = wsNewTab(allocator, sock_path) orelse return "close button: new-tab failed";
+    defer _ = wsClosePane(allocator, sock_path, extra);
+    if (!wsFocus(allocator, sock_path, extra)) return "close button: focus the new tab";
+    if (!wsSendText(allocator, sock_path, extra, "clear\\n")) return "close button: clear";
+    _ = app.waitVisualSettle(win, 400, 8_000, 0.001, null);
+    const size = app.windowSize(win) orelse return "close button: no window size";
+    const chrome = wsChromeHeight(allocator, app, win) orelse {
+        wsShot(allocator, app, win, "closebtn-geometry");
+        return "close button: could not find where the tab strip ends";
+    };
+    if (chrome < 8) return "close button: no tab strip above the terminal";
+    // Only the chrome: the terminal below it blinks its cursor. The
+    // strip itself animates for a few seconds after a tab is added (the
+    // activity glow the teardown verifier arms on every tab), so it has
+    // to hold still before the baseline is taken; the stage config keeps
+    // output activity and the 60s inactivity wash out of it. The last
+    // rows above the terminal are the pane's own border, not the strip:
+    // its shade changes on a config reload (it blends over a dark
+    // backdrop in a fresh tab, over the terminal bg after the reload).
+    const strip: appdrive.App.Region = .{ .x = 0, .y = 0, .w = @intCast(size.w), .h = chrome -| 6 };
+    _ = app.waitVisualSettle(win, 1_000, 15_000, 0.0001, strip);
+    const on = app.snapshotRgba(win, strip) catch return "close button: first strip capture";
+    defer allocator.free(on.px);
+
+    // The same config with only the key flipped: the strip itself is
+    // the reload sentinel, so nothing else on screen moves.
+    var cfg_buf: [512]u8 = undefined;
+    var ref = app.frameRef(win, true) orelse return "close button: no baseline frame";
+    defer ref.deinit(allocator);
+    if (!writeFile(cfg_path, wsConfig(&cfg_buf, false, 13) orelse return "close button: config fmt"))
+        return "close button: writing the config failed";
+    if (!app.waitChangeSince(win, &ref, 15_000, 0.0001, strip)) {
+        wsShot(allocator, app, win, "closebtn");
+        return "close button: close_button_on_tab = false changed nothing in the tab strip";
+    }
+    _ = app.waitVisualSettle(win, 400, 8_000, 0.0005, strip);
+    const off = app.snapshotRgba(win, strip) catch return "close button: second strip capture";
+    defer allocator.free(off.px);
+
+    var ref2 = app.frameRef(win, true) orelse return "close button: no second baseline";
+    defer ref2.deinit(allocator);
+    if (!writeFile(cfg_path, wsConfig(&cfg_buf, true, 13) orelse return "close button: config fmt"))
+        return "close button: restoring the config failed";
+    if (!app.waitChangeSince(win, &ref2, 15_000, 0.0001, strip))
+        return "close button: turning close_button_on_tab back on changed nothing";
+    _ = app.waitVisualSettle(win, 400, 8_000, 0.0005, strip);
+    const back = app.snapshotRgba(win, strip) catch return "close button: third strip capture";
+    defer allocator.free(back.px);
+
+    const changed_off = wsChangedPixels(on.px, off.px);
+    const changed_back = wsChangedPixels(on.px, back.px);
+    _ = c.fprintf(platform.stderr(), "smoke-e2e: close buttons: strip %u px tall, %zu px changed when hidden, %zu when restored\n", strip.h, changed_off, changed_back);
+    if (changed_off < 12) {
+        wsShot(allocator, app, win, "closebtn");
+        return "close button: close_button_on_tab = false did not remove the tab close button";
+    }
+    if (changed_back * 4 > changed_off) {
+        wsDumpStrip("on", on.px, on.w, on.h);
+        wsDumpStrip("off", off.px, off.w, off.h);
+        wsDumpStrip("back", back.px, back.w, back.h);
+        return "close button: turning the key back on did not restore the button";
+    }
+    return null;
+}
+
+/// A captured strip as raw RGBA under /tmp, for a failed comparison.
+fn wsDumpStrip(tag: []const u8, px: []const u8, w: u32, h: u32) void {
+    var name_buf: [128]u8 = undefined;
+    const name = std.fmt.bufPrintZ(&name_buf, "/tmp/sketerm-e2e-closebtn-{s}-{d}x{d}.rgba", .{ tag, w, h }) catch return;
+    writePng(name.ptr, px);
+    _ = c.fprintf(platform.stderr(), "smoke-e2e: close buttons: raw strip %s\n", name.ptr);
+}
+
+fn workspaceStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]const u8, rt: []const u8) ?[]const u8 {
+    const win = wsMainWindow(app) orelse return "workspace: no GUI window";
+    var path_buf: [512:0]u8 = undefined;
+    const cfg_path = std.fmt.bufPrintZ(&path_buf, "{s}/sketerm/config.conf", .{rt}) catch return "workspace: config path";
+    const base_cols = paneCols(allocator, sock_path) orelse return "workspace: no cols";
+    var cfg_buf: [512]u8 = undefined;
+    if (!writeFile(cfg_path, wsConfig(&cfg_buf, true, 13) orelse return "workspace: config fmt"))
+        return "workspace: writing the stage config failed";
+    if (waitCols(allocator, sock_path, base_cols, false, 15_000) == null)
+        return "workspace: the stage config was never applied";
+    defer {
+        _ = c.unlink(cfg_path.ptr);
+        if (roundtrip(allocator, sock_path, "{\"cmd\":\"action\",\"data\":\"reload_config\"}\n")) |r| allocator.free(r);
+        _ = waitCols(allocator, sock_path, base_cols, true, 15_000);
+    }
+    const steps = .{
+        .{ "font resize", wsFontResize },
+        .{ "copy/paste keybinds", wsCopyPasteKeybinds },
+        .{ "zoom + close_pane chord", wsZoomAndClosePane },
+        .{ "broadcast typing", wsBroadcast },
+        .{ "find bar", wsFindBar },
+        .{ "cross-session search", wsCrossSearch },
+        .{ "apply_profile", wsApplyProfile },
+        .{ "toggle_panel_face", wsPanelFace },
+    };
+    // Every step cleans up after itself; a leaked tab would change the
+    // tab strip the close-button step measures, so it fails here, named.
+    const tabs0 = tabCount(allocator, sock_path) orelse return "workspace: tab count";
+    inline for (steps) |step| {
+        if (step[1](allocator, app, win, sock_path)) |why| return why;
+        if (tabCount(allocator, sock_path) != tabs0) return "workspace: " ++ step[0] ++ " left a tab behind";
+        say("workspace: " ++ step[0] ++ " passed");
+    }
+    if (wsPin(allocator, app, sock_path)) |why| return why;
+    if (tabCount(allocator, sock_path) != tabs0) return "workspace: pinning left a tab behind";
+    say("workspace: pinning passed");
+    if (wsRestoreClosed(allocator, app, sock_path, rt)) |why| return why;
+    if (tabCount(allocator, sock_path) != tabs0) return "workspace: restore_closed_tab left a tab behind";
+    say("workspace: restore_closed_tab passed");
+    if (wsShaderPreset(allocator, app, win, sock_path, rt)) |why| return why;
+    say("workspace: shader preset passed");
+    if (wsCloseButtons(allocator, app, win, sock_path, cfg_path)) |why| return why;
+    say("workspace: close_button_on_tab passed");
+    return null;
+}
+
+/// The quake stage's config.conf: what `main` writes for every run plus
+/// the one key under test, so the live-reload step can rewrite the file
+/// with a changed percentage and nothing else.
+const QUAKE_CONFIG_LINE = "quake_enabled = true\n";
+const QUAKE_MARKER = "sketerm-e2e-quake-5150";
+
+/// Quake mode through its one user entry point, `sketerm --toggle`,
+/// against a GUI started with `quake_enabled = true`
+/// (SKETERM_SMOKE_E2E_QUAKE_ONLY). This display session has no
+/// zwlr_layer_shell_v1, so what runs here is the xdg-toplevel FALLBACK
+/// of `Window.applyQuakeGeometry`; the layer path needs a KWin or
+/// wlroots session and no rig on the box can exercise it.
+///
+/// 1. The shipped binary's load order. gtk4-layer-shell interposes
+///    libwayland-client's wl_proxy_* symbols and only wins when the
+///    loader finds it first, so `LD_DEBUG=libs` of a bare `--version`
+///    run (DT_NEEDED libraries load before main) must list it before
+///    libwayland-client: upstream's own check, and the one thing a
+///    reorder in build.zig's `configureSysDeps` would break silently,
+///    since the runtime probe would merely report "unsupported".
+/// 2. `quake_enabled` reached placement: the toplevel is 100% x 50% of
+///    the 1920x1080 virtual output from its first map.
+/// 3. The toggle hides the shown, focused window (its toplevel leaves
+///    the session) without touching the pane's session, and a second
+///    toggle brings it back at the same size with the pane and its
+///    shell intact: a command typed after the reveal produces output.
+/// 4. A live reload of `quake_height_percent` re-sizes the mapped
+///    window in place.
+fn quakeToggleStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]const u8, rt: []const u8, wl: [*:0]const u8) ?[]const u8 {
+    if (comptime @hasDecl(c, "gtk_layer_init_for_window")) {
+        if (quakeLinkOrder(allocator, rt)) |why| return why;
+        say("quake: libgtk4-layer-shell loads before libwayland-client in the shipped binary");
+    } else {
+        say("quake: built with -Dlayer-shell=false, link order not checked");
+    }
+
+    _ = app.drainLive(3_000);
+    if (app.windows.items.len == 0) return "the display session has no window to drive";
+    const win_id = app.windows.items[0].id;
+    if (quakeExpectSize(app, win_id, 1920, 540)) |why| return why;
+
+    // The toggle hides only a shown AND active window; the viewer is the
+    // compositor brain here, so activating it is the viewer's job.
+    app.focusWindow(win_id) catch return "activating the quake window failed";
+    _ = app.waitIdle(300, 5_000);
+    if (quakeExpectSize(app, win_id, 1920, 540)) |why| return why;
+
+    if (quakeToggle(wl)) |why| return why;
+    var waited: u32 = 0;
+    while (!app.windowGone(win_id)) : (waited += 1) {
+        if (waited >= 400) return "--toggle did not hide the quake window (its toplevel stayed in the display session)";
+        _ = app.pumpOnce(50);
+    }
+    const hidden_list = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse return "list roundtrip while hidden";
+    defer allocator.free(hidden_list);
+    if (std.mem.indexOf(u8, hidden_list, "\"panes\":[{") == null) return "hiding the quake window lost its pane";
+
+    if (quakeToggle(wl)) |why| return why;
+    const back = quakeWaitShown(app, win_id, 30_000) orelse return "--toggle did not bring the quake window back";
+    if (quakeExpectSize(app, back, 1920, 540)) |why| return why;
+
+    // The same shell, still attached: output arrives in the pane.
+    var req_buf: [256]u8 = undefined;
+    const send_req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"send-text\",\"pane\":1,\"data\":\"echo {s}\\n\"}}\n", .{QUAKE_MARKER}) catch return "send-text request";
+    const send_resp = roundtrip(allocator, sock_path, send_req) orelse return "send-text roundtrip after the reveal";
+    defer allocator.free(send_resp);
+    if (std.mem.indexOf(u8, send_resp, "\"ok\":true") == null) return "send-text after the reveal was refused";
+    var tries: u32 = 0;
+    while (tries < 75) : (tries += 1) {
+        const resp = roundtrip(allocator, sock_path, "{\"cmd\":\"get-text\",\"pane\":1}\n") orelse continue;
+        defer allocator.free(resp);
+        if (countMarker(allocator, resp, QUAKE_MARKER) >= 2) break;
+        _ = app.pumpOnce(200);
+    } else return "the pane's shell produced no output after the reveal";
+
+    // Live reload: the mapped window follows a changed percentage.
+    var cfg_buf: [512:0]u8 = undefined;
+    const cfg_path = std.fmt.bufPrintZ(&cfg_buf, "{s}/sketerm/config.conf", .{rt}) catch return "config path";
+    if (!writeFile(cfg_path, "# smoke-e2e\napp_view = window\ngraphics_offload = true\n" ++ QUAKE_CONFIG_LINE ++ "quake_height_percent = 25\n"))
+        return "could not rewrite config.conf";
+    const deadline = clock.nowMs() + 20_000;
+    while (clock.nowMs() < deadline) {
+        if (app.windowGeometry(back)) |size| {
+            if (size.w == 1920 and size.h == 270) return null;
+        }
+        _ = app.pumpOnce(100);
+    }
+    const last = app.windowGeometry(back) orelse return "the quake window vanished during the live reload";
+    return whyf("quake_height_percent = 25 was not applied live: window is {d}x{d}, wanted 1920x270", .{ last.w, last.h });
+}
+
+/// `sketerm --toggle` as the user runs it: a second process that hands
+/// its command line to the primary instance over the session bus.
+fn quakeToggle(wl: [*:0]const u8) ?[]const u8 {
+    const pid = spawnSketermChild(g_app_id, wl, &.{"--toggle"});
+    if (pid <= 0) return "fork for --toggle failed";
+    var status: c_int = 0;
+    const deadline = clock.nowMs() + 30_000;
+    while (clock.nowMs() < deadline) {
+        if (c.waitpid(pid, &status, c.WNOHANG) == pid) {
+            if (c.WIFEXITED(status) and c.WEXITSTATUS(status) == 0) return null;
+            return whyf("`sketerm --toggle` exited with status {d}", .{status});
+        }
+        _ = c.usleep(50_000);
+    }
+    reap(pid, c.SIGKILL, 0);
+    return "`sketerm --toggle` did not exit (no primary instance reachable on the session bus?)";
+}
+
+/// The window's visible size (its xdg window geometry: GTK's CSD
+/// shadow pads the buffer) must be exactly `w` x `h`.
+fn quakeExpectSize(app: *appdrive.App, win_id: u32, w: i32, h: i32) ?[]const u8 {
+    const size = app.windowGeometry(win_id) orelse return "the quake window has no size";
+    if (size.w != w or size.h != h)
+        return whyf("the quake window is {d}x{d}, wanted {d}x{d} of the 1920x1080 output", .{ size.w, size.h, w, h });
+    return null;
+}
+
+/// A new non-popup toplevel (not `old_id`) that committed a frame, or
+/// null at the deadline.
+fn quakeWaitShown(app: *appdrive.App, old_id: u32, timeout_ms: i64) ?u32 {
+    const deadline = clock.nowMs() + timeout_ms;
+    while (clock.nowMs() < deadline) {
+        for (app.windows.items) |w| {
+            if (!w.popup and w.id != old_id and w.frames > 0) return w.id;
+        }
+        _ = app.pumpOnce(50);
+    }
+    return null;
+}
+
+/// The loader's library order for the shipped binary, from
+/// `LD_DEBUG=libs` (glibc appends the pid to LD_DEBUG_OUTPUT).
+fn quakeLinkOrder(allocator: std.mem.Allocator, rt: []const u8) ?[]const u8 {
+    var out_buf: [512:0]u8 = undefined;
+    const out = std.fmt.bufPrintZ(&out_buf, "{s}/ld-libs", .{rt}) catch return "LD_DEBUG output path";
+    const pid = c.fork();
+    if (pid < 0) return "fork for the link-order check failed";
+    if (pid == 0) {
+        platform.dieWithParent();
+        _ = c.setenv("LD_DEBUG", "libs", 1);
+        _ = c.setenv("LD_DEBUG_OUTPUT", out.ptr, 1);
+        const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "--version", null };
+        _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
+        c._exit(127);
+    }
+    if (!waitExit(pid, 20_000)) {
+        reap(pid, c.SIGKILL, 0);
+        return "`sketerm --version` under LD_DEBUG did not exit";
+    }
+    var path_buf: [560:0]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buf, "{s}.{d}", .{ out, pid }) catch return "LD_DEBUG output file path";
+    const text = readFileAlloc(allocator, path) orelse return "LD_DEBUG=libs wrote nothing for the shipped binary";
+    defer allocator.free(text);
+    const layer = std.mem.indexOf(u8, text, "find library=libgtk4-layer-shell.so") orelse
+        return "the shipped binary does not load libgtk4-layer-shell at all";
+    const wayland = std.mem.indexOf(u8, text, "find library=libwayland-client.so") orelse
+        return "the shipped binary does not load libwayland-client";
+    if (layer > wayland)
+        return "libgtk4-layer-shell loads AFTER libwayland-client, so its wl_proxy_* interposition cannot work (configureSysDeps link order)";
     return null;
 }
 
