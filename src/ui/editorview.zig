@@ -4008,7 +4008,7 @@ pub const EditorView = struct {
             return;
         };
         switch (cmd) {
-            .trigger_completion => m.requestCompletion(true),
+            .trigger_completion => m.requestCompletion(.invoked),
             .signature_help => m.requestSignatureHelp(true, 1, 0),
             .show_hover => m.requestHover(),
             .code_actions => m.requestCodeActions(),

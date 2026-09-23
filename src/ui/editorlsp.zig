@@ -63,6 +63,7 @@ const Config = @import("../config.zig").Config;
 const rpc = @import("../lsp/rpc.zig");
 const session = @import("../lsp/session.zig");
 const pos = @import("../lsp/position.zig");
+const compl = @import("../lsp/completion.zig");
 const servers = @import("../lsp/servers.zig");
 const diagnostics = @import("../lsp/diagnostics.zig");
 const docsync = @import("../lsp/docsync.zig");
@@ -111,6 +112,10 @@ const SIG_W: c_int = 560;
 /// popular symbol can be tens of thousands, and building that many
 /// GtkLabels locks the UI for seconds.
 const MAX_ROWS: usize = 300;
+/// Completion items KEPT per answer. Far above MAX_ROWS on purpose: the
+/// list is filtered locally as the user types, and rows past the first
+/// screenful are exactly the ones a longer prefix brings back.
+const MAX_COMPLETION_ITEMS: usize = 5000;
 /// Between the status line's fragments (an em dash).
 const STATUS_SEP = "  \u{2014}  ";
 
@@ -273,6 +278,14 @@ const Item = struct {
     /// Exact completionItem/resolve request currently targeting this
     /// item. A row index is not identity across list replacements.
     resolve_id: i64 = 0,
+    /// Completion: `sortText` (else the label) and `filterText` (else
+    /// the label). Owned; empty for other modes.
+    sort_key: []u8 = &.{},
+    filter_key: []u8 = &.{},
+    /// Completion: `additionalTextEdits` (auto-imports and the like), in
+    /// document bytes as of `extras_rev`. Owned.
+    extras: []compl.Extra = &.{},
+    extras_rev: u64 = 0,
 };
 
 const CompletionStamp = struct {
@@ -330,6 +343,17 @@ fn completionAcceptRange(
     return .{ .start = start, .end = end };
 }
 
+fn freeItem(a: std.mem.Allocator, it: Item) void {
+    a.free(it.label);
+    a.free(it.detail);
+    a.free(it.payload);
+    if (it.raw.len > 0) a.free(it.raw);
+    if (it.doc.len > 0) a.free(it.doc);
+    if (it.sort_key.len > 0) a.free(it.sort_key);
+    if (it.filter_key.len > 0) a.free(it.filter_key);
+    if (it.extras.len > 0) compl.freeExtras(a, it.extras);
+}
+
 const ListPopup = struct {
     mgr: *Manager,
     popover: ?*c.GtkWidget = null,
@@ -354,16 +378,13 @@ const ListPopup = struct {
     /// Symbols: incremental filter typed since the popup opened.
     filter: std.ArrayList(u8) = .empty,
     open: bool = false,
+    /// Completion: the server said `isIncomplete`, so typing re-asks as
+    /// well as filtering what is here.
+    incomplete: bool = false,
 
     fn clearItems(self: *ListPopup) void {
         const a = self.mgr.alloc;
-        for (self.items.items) |it| {
-            a.free(it.label);
-            a.free(it.detail);
-            a.free(it.payload);
-            if (it.raw.len > 0) a.free(it.raw);
-            if (it.doc.len > 0) a.free(it.doc);
-        }
+        for (self.items.items) |it| freeItem(a, it);
         self.items.clearRetainingCapacity();
         self.shown.clearRetainingCapacity();
     }
@@ -1000,7 +1021,7 @@ pub const Manager = struct {
         const tab = self.view.findTabById(req.tab_id);
         switch (req.kind) {
             .completion => self.onCompletion(cn, req, env, tab),
-            .completion_resolve => self.onCompletionResolve(req, env),
+            .completion_resolve => self.onCompletionResolve(cn, req, env),
             .hover => self.onHover(req, env, tab),
             .definition, .declaration, .type_definition, .references => self.onLocations(cn, req, env, tab),
             .document_symbol, .workspace_symbol => self.onSymbols(cn, req, env, tab),
@@ -1103,18 +1124,17 @@ pub const Manager = struct {
         self.completion_request_conn = null;
     }
 
-    pub fn requestCompletion(self: *Manager, explicit: bool) void {
+    pub fn requestCompletion(self: *Manager, trigger: compl.Trigger) void {
         const r = self.ready("completion") orelse return;
         if (!r.cn.sess.caps.completion) {
-            if (explicit) self.view.setStatusText("Server offers no completion.");
+            if (trigger == .invoked) self.view.setStatusText("Server offers no completion.");
             return;
         }
         const caret = r.tab.sels.primary().head;
         const word_start = wordStart(&r.tab.doc, caret);
-        dbg("completion at {d} (prefix from {d}), explicit={}", .{ caret, word_start, explicit });
-        const trigger_kind: u8 = if (explicit) 1 else 2;
-        var extra: [64]u8 = undefined;
-        const ex = std.fmt.bufPrint(&extra, ",\"context\":{{\"triggerKind\":{d}}}", .{trigger_kind}) catch "";
+        dbg("completion at {d} (prefix from {d}), trigger={s}", .{ caret, word_start, @tagName(trigger) });
+        var extra: [96]u8 = undefined;
+        const ex = compl.contextJson(&extra, trigger);
         const params = self.docPosParams(r, caret, ex) orelse return;
         self.invalidateCompletion();
         self.list.tab_id = r.tab.id;
@@ -1158,6 +1178,16 @@ pub const Manager = struct {
             return;
         };
         dbg("completion: {d} raw items (rev {d} vs {d})", .{ items.len, req.revision, tab.doc.revision });
+        // A re-asked list keeps the row the user was on, by label.
+        const refresh = self.list.open and self.list.mode == .completion and self.list.tab_id == tab.id;
+        var keep_buf: [128]u8 = undefined;
+        var keep: []const u8 = "";
+        if (refresh and self.list.sel < self.list.shown.items.len) {
+            const cur = self.list.items.items[self.list.shown.items[self.list.sel]].label;
+            const n0 = @min(cur.len, keep_buf.len);
+            @memcpy(keep_buf[0..n0], cur[0..n0]);
+            keep = keep_buf[0..n0];
+        }
         self.list.clearItems();
         self.list.mode = .completion;
         self.list.tab_id = tab.id;
@@ -1166,11 +1196,13 @@ pub const Manager = struct {
         self.list.range_start = @min(req.aux, tab.doc.rope.len());
         self.list.range_end = tab.sels.primary().head;
         self.list.filter.clearRetainingCapacity();
+        self.list.incomplete = compl.isIncomplete(env.result);
 
         const enc = cn.sess.caps.encoding;
-        var n: usize = 0;
+        var built: std.ArrayList(Item) = .empty;
+        defer built.deinit(self.alloc);
         for (items) |raw| {
-            if (n >= MAX_ROWS) break;
+            if (built.items.len >= MAX_COMPLETION_ITEMS) break;
             if (raw != .object) continue;
             const o = raw.object;
             const label = strOf(o.get("label")) orelse continue;
@@ -1178,11 +1210,7 @@ pub const Manager = struct {
             // there ("11", "15"), which reads as noise in the list.
             const detail = strOf(o.get("detail")) orelse completionKindName(o.get("kind"));
             var insert = strOf(o.get("insertText")) orelse label;
-            var item = Item{
-                .label = self.alloc.dupe(u8, label) catch continue,
-                .detail = self.alloc.dupe(u8, detail) catch continue,
-                .payload = &.{},
-            };
+            var item = Item{ .label = &.{}, .detail = &.{}, .payload = &.{} };
             // A server-supplied textEdit is authoritative about WHAT it
             // replaces — the client-side word scan is only a fallback.
             if (o.get("textEdit")) |te| {
@@ -1195,22 +1223,72 @@ pub const Manager = struct {
                     if (strOf(te.object.get("newText"))) |nt| insert = nt;
                 }
             }
-            item.payload = self.alloc.dupe(u8, insert) catch continue;
-            if (cn.sess.caps.completion_resolve) {
-                item.raw = serializeValue(self.alloc, raw) catch &.{};
-            }
-            self.list.items.append(self.alloc, item) catch break;
-            n += 1;
+            if (self.buildCompletionItem(&item, raw, label, detail, insert, tab, enc, cn.sess.caps.completion_resolve)) {
+                built.append(self.alloc, item) catch {
+                    freeItem(self.alloc, item);
+                    break;
+                };
+            } else freeItem(self.alloc, item);
         }
+        // The server's ranking, BEFORE any cap or filter: `sortText` is
+        // what orders a list, never the order items came in.
+        const keys = self.alloc.alloc([]const u8, built.items.len) catch return;
+        defer self.alloc.free(keys);
+        for (built.items, 0..) |it, i| keys[i] = it.sort_key;
+        const order = compl.rankOrder(self.alloc, keys) catch return;
+        defer self.alloc.free(order);
+        self.list.items.ensureTotalCapacity(self.alloc, order.len) catch return;
+        for (order) |i| self.list.items.appendAssumeCapacity(built.items[i]);
+        built.clearRetainingCapacity();
         if (self.list.items.items.len == 0) {
             self.closePopup();
             return;
         }
         self.applyFilter();
+        self.list.sel = 0;
+        if (keep.len > 0) {
+            for (self.list.shown.items, 0..) |idx, row| {
+                if (std.mem.eql(u8, self.list.items.items[idx].label, keep)) {
+                    self.list.sel = row;
+                    break;
+                }
+            }
+        }
+        if (self.list.shown.items.len == 0) {
+            // Everything was filtered out by what was typed meanwhile.
+            self.closePopup();
+            return;
+        }
         self.showPopup();
     }
 
-    fn onCompletionResolve(self: *Manager, req: session.Request, env: rpc.Envelope) void {
+    /// Fill `item`'s owned fields from one server item. False on OOM;
+    /// the caller frees whatever was filled either way it goes wrong.
+    fn buildCompletionItem(
+        self: *Manager,
+        item: *Item,
+        raw: std.json.Value,
+        label: []const u8,
+        detail: []const u8,
+        insert: []const u8,
+        tab: *ETab,
+        enc: pos.Encoding,
+        keep_raw: bool,
+    ) bool {
+        const a = self.alloc;
+        const o = raw.object;
+        item.label = a.dupe(u8, label) catch return false;
+        item.detail = a.dupe(u8, detail) catch return false;
+        item.payload = a.dupe(u8, insert) catch return false;
+        item.sort_key = a.dupe(u8, compl.sortKey(o, label)) catch return false;
+        item.filter_key = a.dupe(u8, compl.filterKey(o, label)) catch return false;
+        item.extras = compl.parseExtras(a, raw, &tab.doc.rope, enc) catch return false;
+        item.extras_rev = tab.doc.revision;
+        if (keep_raw) item.raw = serializeValue(a, raw) catch &.{};
+        return true;
+    }
+
+    fn onCompletionResolve(self: *Manager, cn: *Conn, req: session.Request, env: rpc.Envelope) void {
         if (env.has_error or !self.list.open or self.list.mode != .completion) return;
         const ref = unpackCompletionRef(req.aux);
         const idx = ref.index;
@@ -1222,6 +1300,17 @@ pub const Manager = struct {
         const item = &self.list.items.items[idx];
         if (!self.list.completionStamp().matchesResolve(req, item.resolve_id)) return;
         item.resolve_id = 0;
+        // Servers that compute auto-imports lazily (tsserver) send
+        // `additionalTextEdits` only here. Converted against the text as
+        // it is NOW, which is what `extras_rev` records.
+        if (item.extras.len == 0) {
+            if (self.view.findTabById(req.tab_id)) |tab| {
+                if (compl.parseExtras(self.alloc, env.result, &tab.doc.rope, cn.sess.caps.encoding)) |ex| {
+                    item.extras = ex;
+                    item.extras_rev = tab.doc.revision;
+                } else |_| {}
+            }
+        }
         const doc_text = hoverText(self.alloc, env.result) catch return;
         if (doc_text.len == 0) {
             self.alloc.free(doc_text);
@@ -1277,17 +1366,28 @@ pub const Manager = struct {
         ) orelse return self.closePopup();
         const start = range.start;
         const end = range.end;
-        const text = self.alloc.dupe(u8, item.payload) catch return;
-        defer self.alloc.free(text);
-        self.closePopup();
-
+        // The popup owns `item`: build the edit list (borrowing its
+        // texts) before closing it, and close only after applying.
+        var edits = compl.assemble(
+            self.alloc,
+            start,
+            end,
+            item.payload,
+            item.extras,
+            @min(self.list.range_start, start),
+            item.extras_rev == tab.doc.revision,
+            tab.doc.rope.len(),
+        ) catch return self.closePopup();
+        defer edits.deinit(self.alloc);
         var tx = tr.Transaction.init(tab.doc.revision);
         defer tx.deinit(self.alloc);
-        tx.addReplace(self.alloc, start, end - start, text) catch return;
+        tx.edits.appendSlice(self.alloc, edits.items) catch return self.closePopup();
         const before = vm.snapshotOf(&tab.sels);
-        _ = tab.doc.applyTransactionSel(&tx, before) catch return;
+        _ = tab.doc.applyTransactionSel(&tx, before) catch return self.closePopup();
         tab.sels.mapThrough(tx.edits.items, .editor);
         vm.clampSelections(&tab.doc, &tab.sels);
+        // Only now: the edits borrow the item's texts.
+        self.closePopup();
         self.view.afterExternalEdit(tab);
     }
 
@@ -3041,6 +3141,7 @@ pub const Manager = struct {
         self.list.generation = 0;
         self.list.range_start = 0;
         self.list.range_end = 0;
+        self.list.incomplete = false;
         self.list.clearItems();
         self.list.filter.clearRetainingCapacity();
         if (was_open) {
@@ -3048,20 +3149,26 @@ pub const Manager = struct {
         }
     }
 
-    /// Narrow `shown` to the labels matching the typed filter.
+    /// Narrow `shown` to the rows matching what was typed.
     ///
-    /// The MATCHER is the shared `suggest.subsequenceMatch` — this file
-    /// is where the codebase's only fuzzy matching lives, and the
-    /// framework carries a subsequence matcher precisely so it does not
-    /// have to be re-written here. The ranking framework's `merge` is
-    /// NOT used, and must not be: `shown` is a visibility index whose
-    /// ascending order IS the display order, and that order is the
-    /// server's ranking for completions (what servers put in sortText)
-    /// or document hierarchy for symbols, where the label indentation
-    /// only means anything while parents and children stay adjacent.
-    /// A score sort would scramble both.
+    /// Symbols and locations match their label against `filter`, typed
+    /// into the popup. Completion matches each item's `filterText` (else
+    /// its label) against the DOCUMENT text between the item's replace
+    /// start and the caret, so the list follows the word as it grows and
+    /// nothing is re-requested unless the server said `isIncomplete`.
+    /// Shown rows are capped at MAX_ROWS; the kept items are not.
+    ///
+    /// The MATCHER is the shared subsequence matcher (lsp/completion.zig
+    /// wraps it). The ranking framework's `merge` is NOT used, and must
+    /// not be: `shown` is a visibility index whose ascending order IS the
+    /// display order, and that order is the server's `sortText` ranking
+    /// for completions (items are sorted once, on arrival) or document
+    /// hierarchy for symbols, where the label indentation only means
+    /// anything while parents and children stay adjacent. A score sort
+    /// would scramble both.
     fn applyFilter(self: *Manager) void {
         self.list.shown.clearRetainingCapacity();
+        if (self.list.mode == .completion) return self.applyCompletionFilter();
         const f = self.list.filter.items;
         for (self.list.items.items, 0..) |it, i| {
             if (suggest.subsequenceMatch(it.label, f)) {
@@ -3071,6 +3178,23 @@ pub const Manager = struct {
         if (self.list.sel >= self.list.shown.items.len) {
             self.list.sel = if (self.list.shown.items.len == 0) 0 else self.list.shown.items.len - 1;
         }
+    }
+
+    fn applyCompletionFilter(self: *Manager) void {
+        const tab = self.view.findTabById(self.list.tab_id) orelse return;
+        const caret = @min(self.list.range_end, tab.doc.rope.len());
+        var buf: [256]u8 = undefined;
+        for (self.list.items.items, 0..) |it, i| {
+            if (self.list.shown.items.len >= MAX_ROWS) break;
+            // A server textEdit may start before the word (a `.` member
+            // site, a sigil); its prefix is measured from there.
+            const from = @min(if (it.has_edit) it.edit_start else self.list.range_start, caret);
+            const prefix = typedPrefix(&tab.doc, from, caret, &buf);
+            if (compl.matches(it.filter_key, prefix)) {
+                self.list.shown.append(self.alloc, i) catch break;
+            }
+        }
+        if (self.list.sel >= self.list.shown.items.len) self.list.sel = 0;
     }
 
     fn rebuildRows(self: *Manager) void {
@@ -3408,7 +3532,13 @@ pub const Manager = struct {
         if (!self.list.open or self.list.mode != .completion) return;
         if (caret < self.list.range_start) return self.closePopup();
         self.list.range_end = caret;
-        // Re-request against the new prefix, debounced.
+        // Narrow what we have at once; a keystroke that matches nothing
+        // ends the list, as in every editor.
+        self.applyFilter();
+        if (self.list.shown.items.len == 0) return self.closePopup();
+        self.rebuildRows();
+        // Only a list the server cut short is asked again, debounced.
+        if (!self.list.incomplete) return;
         const st = tab.lsp orelse return;
         if (st.completion_timer != 0) return;
         st.completion_timer = TabCtx.arm(self, tab, COMPLETION_DEBOUNCE_MS, @ptrCast(&onCompletionTimer));
@@ -3421,7 +3551,7 @@ pub const Manager = struct {
         const st = r.tab.lsp orelse return 0;
         st.completion_timer = 0;
         if (!r.mgr.list.open or r.mgr.list.mode != .completion) return 0;
-        r.mgr.requestCompletion(false);
+        r.mgr.requestCompletion(.incomplete);
         return 0;
     }
 
@@ -3472,7 +3602,7 @@ pub const Manager = struct {
                 self.requestSignatureHelp(false, 2, ch);
             }
         }
-        if (cn.sess.caps.isTrigger(ch)) self.requestCompletion(false);
+        if (cn.sess.caps.isTrigger(ch)) self.requestCompletion(.{ .character = ch });
     }
 };
 
@@ -3706,6 +3836,19 @@ fn textDocumentVersion(v: ?std.json.Value) TextDocumentVersion {
         .integer => |version| .{ .numeric = version },
         else => .invalid,
     };
+}
+
+/// The document bytes [from, to) the user has typed for a completion,
+/// clipped to `buf` (a longer "prefix" is not a word being completed).
+fn typedPrefix(doc: *const Document, from: usize, to: usize, buf: []u8) []const u8 {
+    const end = @min(to, from + buf.len);
+    var w: usize = 0;
+    var it = doc.rope.iterateRange(from, end);
+    while (it.next()) |chunk| {
+        @memcpy(buf[w .. w + chunk.len], chunk);
+        w += chunk.len;
+    }
+    return buf[0..w];
 }
 
 /// `CompletionList` (`{isIncomplete, items}`) and a bare array both

@@ -141,6 +141,56 @@ fn trimmedTail(s: []const u8) []const u8 {
     return std.mem.trimEnd(u8, s, " \t\r\n");
 }
 
+/// Type `prefix` at the end of the document, open completion with
+/// Ctrl+Space, type `more` once the list is up, wait for the (delayed)
+/// re-ask, accept the FIRST row with Return, save, and check the last
+/// line ends with `want`. Null on success, else why not.
+fn completionPick(
+    allocator: std.mem.Allocator,
+    app: *appdrive.App,
+    win_id: u32,
+    doc_path: [:0]const u8,
+    prefix: []const u8,
+    more: []const u8,
+    want: []const u8,
+) ?[]const u8 {
+    app.pressKey(win_id, "Escape") catch {};
+    app.pressKey(win_id, "ctrl+End") catch {};
+    pumpFor(app, 300);
+    app.typeText(win_id, prefix) catch {};
+    pumpFor(app, 400);
+    const before = popupCount(app);
+    app.pressKey(win_id, "ctrl+space") catch {};
+    var spent: u32 = 0;
+    var up = false;
+    while (spent < 20_000) : (spent += 200) {
+        pumpFor(app, 200);
+        if (popupCount(app) > before) {
+            up = true;
+            break;
+        }
+    }
+    if (!up) return "no completion popup";
+    pumpFor(app, 600);
+    if (more.len > 0) {
+        app.typeText(win_id, more) catch {};
+        // The stub answers after 800ms; the re-ask leaves after 120ms.
+        pumpFor(app, 2500);
+        if (popupCount(app) <= before) return "the list closed while filtering";
+    }
+    app.pressKey(win_id, "Return") catch {};
+    pumpFor(app, 800);
+    app.pressKey(win_id, "ctrl+s") catch {};
+    spent = 0;
+    while (spent < 15_000) : (spent += 250) {
+        pumpFor(app, 250);
+        const content = readFile(allocator, doc_path.ptr) orelse continue;
+        defer allocator.free(content);
+        if (std.mem.endsWith(u8, trimmedTail(content), want)) return null;
+    }
+    return "the accepted text is not what was expected";
+}
+
 /// The document + config for whichever server we found.
 const Plan = struct {
     /// Registry name for the `[lsp.<name>]` section.
@@ -166,8 +216,8 @@ const Plan = struct {
     marker_body: []const u8,
     body: []const u8,
     /// One more character typed while the completion popup is open,
-    /// for the accept-during-the-debounce race. It must keep the word
-    /// being completed a word (the list is NOT filtered locally).
+    /// for the accept-during-the-debounce race. The list is filtered
+    /// locally, so it must keep at least one offered item matching.
     race_extra: []const u8 = "x",
     /// Typed at the end of the document BEFORE the race stage retypes
     /// `completion_prefix`. Stage 4 accepts a completion into the
@@ -178,8 +228,8 @@ const Plan = struct {
     /// client. The prelude closes that statement and opens an IDENTICAL
     /// fresh site, so the stage never rides a particular server version's
     /// error recovery. Same trick `signature_call` already uses with its
-    /// leading `; `. Empty = the site is still open (the stub, which
-    /// answers regardless of context).
+    /// leading `; `. The stub answers regardless of context but still
+    /// needs a fresh word: the list is filtered by what precedes the caret.
     race_prelude: []const u8 = "",
     /// Text to type after Ctrl+Space is pressed at the end of the file.
     real_server: bool,
@@ -302,6 +352,7 @@ fn pickPlan(allocator: std.mem.Allocator, stub_path: []const u8) Plan {
             .marker_body = "{\"compilerOptions\":{\"strict\":true,\"target\":\"ES2020\"},\"include\":[\"*.ts\"]}\n",
             .body = TS_BODY,
             .completion_prefix = "gre",
+            .race_extra = "e",
             // Close the expression statement stage 4 accepted into and
             // start a fresh one on the next line.
             .race_prelude = ";\n",
@@ -325,6 +376,7 @@ fn pickPlan(allocator: std.mem.Allocator, stub_path: []const u8) Plan {
             // Typed at Ctrl+End — inside `use()`'s unterminated body, an
             // expression position where clangd offers both `add_` fns.
             .completion_prefix = " add_t",
+            .race_extra = "w",
             // Terminate the return stage 4 completed and open a second
             // one, still inside `use()`'s unterminated body.
             .race_prelude = ";\n    return",
@@ -345,6 +397,7 @@ fn pickPlan(allocator: std.mem.Allocator, stub_path: []const u8) Plan {
             .body = ZLS_BODY,
             // After the trailing `std.` — member completion.
             .completion_prefix = "deb",
+            .race_extra = "u",
             // Close the const stage 4 completed and open an identical
             // member-completion site on a fresh declaration.
             .race_prelude = ";\nconst probe2 = std.",
@@ -370,6 +423,9 @@ fn pickPlan(allocator: std.mem.Allocator, stub_path: []const u8) Plan {
         .body = ZIG_BODY,
         .completion_prefix = "stub",
         .race_extra = "A",
+        // Stage 4 accepted into the last line; typed onto that word, the
+        // prefix would filter every item out.
+        .race_prelude = "\n",
         .signature_call = " stubCall(",
         .real_server = false,
     };
@@ -1198,6 +1254,28 @@ fn runLeg(allocator: std.mem.Allocator, remote: bool) u8 {
         if (!accepted)
             return fail("accepting a completion one keystroke after the list arrived inserted nothing", .{});
         say("PASS completion accepted mid-debounce (document tail: …{s})", .{saw});
+    }
+
+    // ── 4b. completion ranking, extra edits and trigger kinds ──────
+    //
+    // Only the scripted stub makes these observable in the text: its
+    // list arrives out of sortText order, one item carries an
+    // additionalTextEdits import line, one is named after the request's
+    // triggerKind, and the list is isIncomplete.
+    if (!plan.real_server) {
+        if (completionPick(allocator, app, win_id, doc_path, "\nstub", "", "stubGamma")) |why|
+            return fail("sortText: {s}", .{why});
+        say("PASS completion ranked by sortText (first row stubGamma)", .{});
+        if (completionPick(allocator, app, win_id, doc_path, "\nstubT", "k", "stubTk3")) |why|
+            return fail("isIncomplete re-request: {s}", .{why});
+        say("PASS an isIncomplete list re-asked with triggerKind 3 while filtering", .{});
+        if (completionPick(allocator, app, win_id, doc_path, "\nstubImp", "", "stubImport")) |why|
+            return fail("additionalTextEdits: {s}", .{why});
+        const content = readFile(allocator, doc_path.ptr) orelse return fail("read back the document", .{});
+        defer allocator.free(content);
+        if (!std.mem.startsWith(u8, content, "// imported by stubImport\n"))
+            return fail("the accepted item's additionalTextEdits were not applied (head: {s})", .{content[0..@min(content.len, 40)]});
+        say("PASS completion applied additionalTextEdits in the same accept", .{});
     }
 
     // ── 4b. signature help ────────────────────────────────────────

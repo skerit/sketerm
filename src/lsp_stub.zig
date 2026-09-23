@@ -11,7 +11,12 @@
 //!     didChange, so incremental sync is verified by whether the
 //!     diagnostics follow the edit;
 //!   * completion offers a fixed set of items, one of which carries a
-//!     `textEdit` and needs `completionItem/resolve` for its docs;
+//!     `textEdit` and needs `completionItem/resolve` for its docs. The
+//!     list arrives OUT of `sortText` order, one item carries
+//!     `additionalTextEdits` (a comment line inserted at the top), one is
+//!     labelled after the request's `triggerKind` (`stubTk<kind>`), and
+//!     the list says `isIncomplete`, so a client that ranks, applies the
+//!     extra edits and re-asks with kind 3 is observable in the text;
 //!   * hover reports the byte offset and the word under the cursor;
 //!   * definition/declaration/typeDefinition point at the FIRST
 //!     occurrence of that word, references at all of them;
@@ -137,7 +142,7 @@ fn handle(body: []const u8) bool {
         replyRaw(id, "null");
     } else if (std.mem.eql(u8, env.method, "textDocument/completion")) {
         if (completion_delay_ms > 0) _ = c.usleep(completion_delay_ms * 1000);
-        replyRaw(id, COMPLETION_RESULT);
+        replyCompletion(id, env.params);
     } else if (std.mem.eql(u8, env.method, "completionItem/resolve")) {
         replyResolve(id, env.params);
     } else if (std.mem.eql(u8, env.method, "textDocument/hover")) {
@@ -224,12 +229,24 @@ const CAPS_RANGE_ONLY =
     \\"semanticTokensProvider":{"legend":{"tokenTypes":["function","variable","keyword","property"],"tokenModifiers":["declaration","readonly","deprecated","defaultLibrary"]},"range":true}}
 ;
 
-const COMPLETION_RESULT =
-    \\{"isIncomplete":false,"items":[
-    \\{"label":"stubAlpha","kind":3,"detail":"fn () void","insertText":"stubAlpha"},
-    \\{"label":"stubBeta","kind":6,"detail":"method","insertText":"stubBeta"},
-    \\{"label":"stubGamma","kind":13,"detail":"const"}]}
-;
+fn replyCompletion(id: i64, params: std.json.Value) void {
+    const kind: i64 = switch (objGet(objGet(params, "context") orelse .null, "triggerKind") orelse .null) {
+        .integer => |k| k,
+        else => 0,
+    };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    out.print(alloc,
+        \\{{"isIncomplete":true,"items":[
+        \\{{"label":"stubAlpha","kind":3,"detail":"fn () void","insertText":"stubAlpha","sortText":"2"}},
+        \\{{"label":"stubBeta","kind":6,"detail":"method","insertText":"stubBeta","sortText":"3"}},
+        \\{{"label":"stubGamma","kind":13,"detail":"const","sortText":"1"}},
+        \\{{"label":"stubImport","kind":9,"detail":"module","sortText":"4","additionalTextEdits":[
+        \\{{"range":{{"start":{{"line":0,"character":0}},"end":{{"line":0,"character":0}}}},"newText":"// imported by stubImport\n"}}]}},
+        \\{{"label":"stubTk{d}","kind":1,"detail":"triggerKind","sortText":"5"}}]}}
+    , .{kind}) catch return;
+    replyRaw(id, out.items);
+}
 
 // ---- document -----------------------------------------------------------
 

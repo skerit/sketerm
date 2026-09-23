@@ -60,6 +60,7 @@ comptime {
     _ = @import("lsp/proc.zig");
     _ = @import("lsp/stderrtail.zig");
     _ = @import("lsp/progress.zig");
+    _ = @import("lsp/completion.zig");
     _ = @import("filebrowser/cache.zig");
     _ = @import("filebrowser/colkeys.zig");
     _ = @import("filebrowser/clipboard.zig");
