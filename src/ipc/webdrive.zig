@@ -90,6 +90,8 @@ const webprofiles = @import("webprofiles.zig");
 const webremote = @import("webprofilesremote.zig");
 const netpolicy = @import("../web/netpolicy.zig");
 const webroute = @import("../web/route.zig");
+const socksbridge = @import("socksbridge.zig");
+const mux_cli = @import("mux_cli.zig");
 
 /// Default logical size a headless view is created at. There is no
 /// allocation to inherit one from, and pages lay out sanely at a
@@ -673,48 +675,23 @@ pub const Engine = struct {
     /// navigated view that every following call then ignored — which
     /// reads exactly like `web_open` dropping its url.
     current: u32 = 0,
-    cap_shm: bool = false,
-    cap_semantic: bool = false,
-    cap_reader_ids: bool = false,
-    cap_semantic_request_ids: bool = false,
-    /// The helper can create a view directly at a url, so a view opened
-    /// with one never holds a blank document first.
-    cap_view_url: bool = false,
-    /// The helper runs the in-process content-blocking filter engine.
-    cap_intercept: bool = false,
-    /// The helper accepts identity contexts...
-    cap_contexts: bool = false,
-    /// ...and REFUSES a view whose context does not exist rather than
-    /// silently resolving it through the shared jar. Profiles require
-    /// both: without the second one a refused context is invisible.
-    cap_contexts_fail_closed: bool = false,
-    /// The helper enforces per-view network policy (0x86 block).
-    cap_net_policy: bool = false,
-    /// The helper serves several concurrent clients (Phase 1). Gates
-    /// teardown: a multi-client helper that has not exited by the
-    /// grace deadline is serving someone else (or mid-flush) and must
-    /// be ABANDONED, never signalled.
-    cap_multi_client: bool = false,
-    /// The helper presents its views as toplevels on the web session
-    /// (`presenter` in hello_ack). Reported, never inferred: a helper
+    /// What the CURRENT helper advertised in `hello_ack`; empty before
+    /// it and after the helper is lost. Everything reported from it
+    /// (presenter, observe) is a reported fact, never inferred: a helper
     /// in session mode whose presenter failed to arm still says no.
-    cap_presenter: bool = false,
-    /// The helper lets a second client OBSERVE this one's views
-    /// (`observe`): what the GUI's Watch / Take control on this
-    /// assistant's browser rides on. Reported, never inferred.
-    cap_observe: bool = false,
-    /// The helper can really open popups (`popup-open`). Headless
-    /// clients ALLOW them: an agent driving a sign-in flow needs the
-    /// window the provider posts its result back through, and there is
-    /// no user here for a popup to annoy.
-    cap_popup_open: bool = false,
-    /// The helper reports downloads (`ev_download_offer` and the rest
-    /// of the 0x78 block). Without it a download this client cannot
-    /// answer is held helper-side and nothing lands anywhere.
-    cap_downloads: bool = false,
-    /// The helper accepts `download_start`: a url can be fetched
-    /// through the view's own browser, with its cookies and session.
-    cap_download_start: bool = false,
+    /// Profiles need BOTH `contexts` and `contexts-fail-closed`, since
+    /// without the second an unknown context resolves through the shared
+    /// jar invisibly; a `multi-client` helper that outlives the teardown
+    /// grace is serving someone else and is abandoned, never signalled.
+    caps: proto.Caps = .initEmpty(),
+    /// Why this ROUTED helper serves nothing (`ev_route_refused`), owned;
+    /// null while it serves. Cleared with the connection: a fresh helper
+    /// tries its route again.
+    route_refused: ?[]u8 = null,
+    /// The loopback SOCKS5 -> mux bridge a `via:` engine's `--proxy`
+    /// points at, created at the first start and kept across helper
+    /// restarts (its port is baked into each spawn's argv).
+    egress: ?*socksbridge.Egress = null,
     /// Downloads this engine has seen, page-initiated ones included.
     /// Bounded by `DOWNLOAD_CAP`, drop-oldest-finished.
     downloads: std.ArrayList(Download) = .empty,
@@ -754,9 +731,13 @@ pub const Engine = struct {
     /// Bumped by every successful helper start, so "was this context
     /// published to the helper that is running NOW" is derivable.
     helper_gen: u32 = 0,
-    cap_review: bool = false,
     diagnostic: diagnostic.Capture = .{},
     broker_diagnostics: bool = false,
+
+    /// Whether the current helper advertised `cap`.
+    pub fn has(self: *const Engine, cap: proto.Cap) bool {
+        return self.caps.contains(cap);
+    }
 
     pub fn diagnosticReport(self: *Engine, arena: std.mem.Allocator) diagnostic.Report {
         if (self.diagnostic.id[0] == 0) {
@@ -842,7 +823,7 @@ pub const Engine = struct {
     pub fn deinit(self: *Engine) void {
         defer self.diagnostic.deinit();
         self.dropConnection();
-        if (self.pid > 0 and self.cap_multi_client and self.remote != null) {
+        if (self.pid > 0 and self.has(.multi_client) and self.remote != null) {
             // Broker-owned store + multi-client helper: the helper
             // exits (and flushes jars via `cef_shutdown`) with its LAST
             // client on its own, whether or not this process waits —
@@ -903,7 +884,7 @@ pub const Engine = struct {
         // Dropping our connection without destroy hands the session to
         // the daemon's own liveness rule: it reaps once no Wayland
         // client (i.e. the helper) remains.
-        self.teardownSession(!(self.cap_multi_client and self.remote != null));
+        self.teardownSession(!(self.has(.multi_client) and self.remote != null));
         if (self.mux_sock) |sck| {
             self.gpa.free(sck);
             self.mux_sock = null;
@@ -919,6 +900,11 @@ pub const Engine = struct {
         // a context_destroy against the kill risks a half-written one.
         self.clearContexts();
         self.live.deinit(self.gpa);
+        if (self.route_refused) |r| self.gpa.free(r);
+        self.route_refused = null;
+        // After the helper: it was the bridge's only client.
+        if (self.egress) |eg| eg.close();
+        self.egress = null;
         var pit = self.profile_policy.iterator();
         while (pit.next()) |entry| {
             self.gpa.free(entry.key_ptr.*);
@@ -1079,13 +1065,13 @@ pub const Engine = struct {
     /// Whether an attached viewer sees PIXELS: the helper is a session
     /// client AND advertised the presenter in its handshake.
     pub fn presenterActive(self: *const Engine) bool {
-        return self.session != null and self.state == .ready and self.cap_presenter;
+        return self.session != null and self.state == .ready and self.has(.presenter);
     }
 
     /// Whether a GUI can watch this engine's pages as browser pages:
     /// the live helper advertised `observe`.
     pub fn observeActive(self: *const Engine) bool {
-        return self.state == .ready and self.cap_observe;
+        return self.state == .ready and self.has(.observe);
     }
 
     /// The helper socket a second client connects to, once the helper
@@ -1234,19 +1220,7 @@ pub const Engine = struct {
         // are safe in the store, so the next open republishes the SAME
         // id and lands in the SAME jar; ephemeral ones are simply gone.
         self.clearContexts();
-        self.cap_shm = false;
-        self.cap_semantic = false;
-        self.cap_reader_ids = false;
-        self.cap_review = false;
-        self.cap_semantic_request_ids = false;
-        self.cap_view_url = false;
-        self.cap_intercept = false;
-        self.cap_contexts = false;
-        self.cap_contexts_fail_closed = false;
-        self.cap_net_policy = false;
-        self.cap_multi_client = false;
-        self.cap_downloads = false;
-        self.cap_download_start = false;
+        self.caps = .initEmpty();
         // A download in flight died with the helper. Failing it here is
         // what turns a lost helper into an ANSWER for whoever is
         // waiting on the file, instead of a wait that runs out.
@@ -1426,12 +1400,13 @@ pub const Engine = struct {
         const env = self.sessionEnv();
 
         // The route's proxy, prepared BEFORE the fork (nothing may
-        // allocate between fork and exec). `.mux` names none here: its
-        // bridge port is not known until the bridge binds, so an
-        // unproxiable route must never reach this function.
+        // allocate between fork and exec). A `via:` route binds its
+        // SOCKS5 -> mux bridge here, so its port is in the argv.
         var proxy_z: [512:0]u8 = undefined;
         var proxy_buf: [512]u8 = undefined;
-        const proxy: ?[*:0]const u8 = if (self.routeSpec().proxyUrl(&proxy_buf)) |url|
+        const proxy_url = socksbridge.routeProxy(self.gpa, self.routeSpec(), &self.egress, mux_cli.muxConnect, &proxy_buf) catch
+            return self.failStart("could not start this route's egress bridge (the via host's daemon is unreachable, or the loopback listener would not bind); nothing was opened directly instead");
+        const proxy: ?[*:0]const u8 = if (proxy_url) |url|
             (std.fmt.bufPrintZ(&proxy_z, "{s}", .{url}) catch
                 return self.failStart("the route's proxy url is too long")).ptr
         else
@@ -1464,7 +1439,7 @@ pub const Engine = struct {
                 // Arm the presenter: THIS helper is a client of a hub
                 // nobody else renders into, so its toplevels are the
                 // watch-along surface and not a stray desktop window.
-                _ = c.setenv(proto.CAP_PRESENTER_ENV, "1", 1);
+                _ = c.setenv(proto.PRESENTER_ENV, "1", 1);
                 _ = c.unsetenv("WAYLAND_SOCKET");
                 _ = c.unsetenv("DISPLAY");
                 _ = c.unsetenv("XAUTHORITY");
@@ -1512,6 +1487,10 @@ pub const Engine = struct {
     /// (only the client that owns the pid can record it truthfully).
     fn handshake(self: *Engine, fd: c_int, owner: Owner) bool {
         const spawned = owner == .self_spawned;
+        // A fresh helper tries its route again; only its own refusal
+        // counts from here.
+        if (self.route_refused) |r| self.gpa.free(r);
+        self.route_refused = null;
         self.fd = fd;
         _ = c.fcntl(fd, c.F_SETFL, c.O_NONBLOCK);
         self.state = .ready;
@@ -1525,7 +1504,7 @@ pub const Engine = struct {
         // Wait for the ack so protocol and capability skew surface here
         // rather than as a silent later timeout.
         const ack_deadline = clock.nowMs() + 10_000;
-        while (self.state == .ready and !self.cap_semantic and !self.cap_shm) {
+        while (self.state == .ready and !self.has(.semantic) and !self.has(.frames_shm)) {
             if (clock.nowMs() >= ack_deadline) {
                 if (spawned) self.killChild();
                 self.lost();
@@ -1613,6 +1592,10 @@ pub const Engine = struct {
     /// shared jar, and never loads it UNPOLICED.
     pub fn openViewIn(self: *Engine, url: []const u8, w: u16, h: u16, spec: ProfileSpec, policy_arg: ?*const NetPolicy) !*View {
         if (!self.ensure()) return error.Unavailable;
+        // A routed helper that refused its route says so right after
+        // the handshake; read that before minting a view it would refuse.
+        self.pumpOnce(0);
+        if (self.state != .ready) return if (self.route_refused != null) error.RouteRefused else error.Unavailable;
         self.diagnostic.stage = .creating_browser;
 
         // The effective policy: the explicit one, else the profile's
@@ -1622,7 +1605,7 @@ pub const Engine = struct {
             if (self.profile_policy.getPtr(spec.named)) |p| policy = p;
         }
         if (policy != null) {
-            if (!self.cap_net_policy) return error.PolicyUnsupported;
+            if (!self.has(.net_policy)) return error.PolicyUnsupported;
             // The helper can hold this many policies; past it a policied
             // view would silently run unpoliced, so refuse instead.
             if (self.views.items.len >= proto.MAX_POLICY_VIEWS) return error.PolicyTooManyViews;
@@ -1635,7 +1618,7 @@ pub const Engine = struct {
             // Both caps, or nothing: with CAP_CONTEXTS alone an old
             // helper resolves an unknown context through the SHARED jar
             // and never says so.
-            if (!self.cap_contexts or !self.cap_contexts_fail_closed) return error.ContextsUnsupported;
+            if (!self.has(.contexts) or !self.has(.contexts_fail_closed)) return error.ContextsUnsupported;
             if (spec == .named) profile_name = spec.named;
             const pick = try self.resolveContext(spec);
             ctx_id = pick.id;
@@ -1680,7 +1663,7 @@ pub const Engine = struct {
         // double-free through the local.
         owned_pol = null;
         try self.views.append(self.gpa, v);
-        if (url.len > 0 and self.cap_view_url) {
+        if (url.len > 0 and self.has(.view_create_url)) {
             self.send(proto.ViewCreateUrl{
                 .view = v.id,
                 .w = w,
@@ -1701,7 +1684,7 @@ pub const Engine = struct {
         // A hidden view is never painted; headless views are always
         // "shown" — nothing else would ever show them.
         self.send(proto.ViewShow{ .view = v.id }) catch return error.Unavailable;
-        if (url.len > 0 and !self.cap_view_url) {
+        if (url.len > 0 and !self.has(.view_create_url)) {
             self.send(proto.Navigate{ .view = v.id, .url = url }) catch return error.Unavailable;
         }
         self.current = v.id;
@@ -1878,7 +1861,7 @@ pub const Engine = struct {
     /// Whether this helper CAN serve profiles. Only meaningful once the
     /// handshake happened: before that the caps are simply unknown.
     pub fn contextsSupported(self: *const Engine) bool {
-        return self.cap_contexts and self.cap_contexts_fail_closed;
+        return self.has(.contexts) and self.has(.contexts_fail_closed);
     }
 
     /// Can a profile be opened at all? Deliberately does NOT spawn the
@@ -2171,7 +2154,7 @@ pub const Engine = struct {
     pub fn netPolicyStatus(self: *Engine, id: u32, budget_ms: i64) !*View {
         if (!self.ensure()) return error.Unavailable;
         if (self.findView(id) == null) return error.NoView;
-        if (self.cap_net_policy) {
+        if (self.has(.net_policy)) {
             self.send(proto.NetPolicyReq{ .view = id }) catch return error.Unavailable;
             const deadline = clock.nowMs() + @max(budget_ms, 100);
             while (clock.nowMs() < deadline) {
@@ -2388,7 +2371,7 @@ pub const Engine = struct {
     /// request id to poll with `download`.
     pub fn startDownload(self: *Engine, view_id: u32, url: []const u8, path: ?[]const u8) DownloadError!u32 {
         if (!self.ensure()) return error.Unavailable;
-        if (!self.cap_downloads or !self.cap_download_start) return error.Unsupported;
+        if (!self.has(.downloads) or !self.has(.download_start)) return error.Unsupported;
         if (self.findView(view_id) == null) return error.NoView;
         if (path) |p| {
             if (p.len == 0 or p[0] != '/') return error.BadPath;
@@ -2588,12 +2571,6 @@ pub const Engine = struct {
         self.send(proto.InterceptSet{ .view = id, .enabled = if (enabled) 1 else 0 }) catch return error.Unavailable;
     }
 
-    /// Reload the filter set (seed + config dir + `paths`).
-    pub fn reloadLists(self: *Engine, paths: []const []const u8) !void {
-        if (!self.ensure()) return error.Unavailable;
-        self.send(proto.InterceptLists{ .paths = paths }) catch return error.Unavailable;
-    }
-
     /// Current per-view counters (freshened by a status_req + pump).
     pub fn networkStatus(self: *Engine, id: u32, budget_ms: i64) !struct {
         enabled: bool,
@@ -2620,7 +2597,7 @@ pub const Engine = struct {
     /// the returned copy.
     pub fn networkLog(self: *Engine, arena: std.mem.Allocator, id: u32, since: u32, max: u16, budget_ms: i64) ![]const u8 {
         if (!self.ensure()) return error.Unavailable;
-        if (!self.cap_intercept) return error.NoIntercept;
+        if (!self.has(.intercept)) return error.NoIntercept;
         const v = self.findView(id) orelse return error.NoView;
         if (v.net_log) |old| {
             self.gpa.free(old);
@@ -2629,7 +2606,7 @@ pub const Engine = struct {
         v.net_log_waiting = true;
         // The reason-carrying lane when the helper has it; the legacy
         // frame otherwise. Both park the same JSON shape on the view.
-        if (self.cap_net_policy) {
+        if (self.has(.net_policy)) {
             self.send(proto.NetLogReq{ .view = id, .since = since, .max = max }) catch return error.Unavailable;
         } else {
             self.send(proto.InterceptLogReq{ .view = id, .since = since, .max = max }) catch return error.Unavailable;
@@ -2661,7 +2638,6 @@ pub const Engine = struct {
     fn awaitFirstPaint(self: *Engine, view_id: u32, budget_ms: i64) void {
         const v0 = self.findView(view_id) orelse return;
         if (v0.frame_gen != 0) return;
-        self.send(proto.FrameRequest{ .view = view_id, .flags = 0 }) catch return;
         const deadline = clock.nowMs() + budget_ms;
         while (clock.nowMs() < deadline) {
             const v = self.findView(view_id) orelse return;
@@ -2676,7 +2652,7 @@ pub const Engine = struct {
     /// single-threaded dispatch, so nothing else could overlap it.
     pub fn runOp(self: *Engine, arena: std.mem.Allocator, view_id: u32, req: OpReq, budget_ms: i64) !OpOut {
         if (!self.ensure()) return error.Unavailable;
-        if (!self.cap_semantic) return error.NoSemantic;
+        if (!self.has(.semantic)) return error.NoSemantic;
         if (self.findView(view_id) == null) return error.NoView;
 
         // `click`/`hover` are synthesized through the real input path,
@@ -2685,7 +2661,7 @@ pub const Engine = struct {
 
         const ki = @intFromEnum(req.kind);
         const v = self.findView(view_id) orelse return error.NoView;
-        if (!self.cap_semantic_request_ids and v.legacy_quarantine.isHeld(ki))
+        if (!self.has(.semantic_request_ids) and v.legacy_quarantine.isHeld(ki))
             return error.LegacySemanticReplyPending;
         // Drop a stale parked reply from an earlier timed-out call of
         // the same kind: it answers an older question.
@@ -2693,7 +2669,7 @@ pub const Engine = struct {
             self.gpa.free(old.text);
             v.inbox[ki] = null;
         }
-        const request = if (self.cap_semantic_request_ids) self.nextSemanticRequest() else 0;
+        const request = if (self.has(.semantic_request_ids)) self.nextSemanticRequest() else 0;
         v.waiting[ki] = true;
         v.waiting_request[ki] = request;
         if (req.kind == .snapshot)
@@ -2703,7 +2679,7 @@ pub const Engine = struct {
 
         const sent: anyerror!void = switch (req.kind) {
             .snapshot => self.sendSemantic(request, proto.SemSnapshotReq{ .view = view_id, .mode = req.mode, .detail = req.detail, .scope = req.scope }),
-            .act => if (if (self.cap_reader_ids) readerGuard(v, req.id) else null) |guard|
+            .act => if (if (self.has(.reader_ids)) readerGuard(v, req.id) else null) |guard|
                 self.sendSemantic(request, proto.SemActGuarded{
                     .view = view_id,
                     .doc_gen = guard.doc_gen,
@@ -2717,7 +2693,7 @@ pub const Engine = struct {
                 self.sendSemantic(request, proto.SemAction{ .view = view_id, .id = req.id, .action = req.action, .arg = req.arg }),
             .expand => self.sendSemantic(request, proto.SemExpand{ .view = view_id, .id = req.id, .off = req.off, .len = req.len }),
             .query => self.sendSemantic(request, proto.SemQueryReq{ .view = view_id, .kind = req.action, .arg = req.arg }),
-            .read => if (self.cap_reader_ids)
+            .read => if (self.has(.reader_ids))
                 self.sendSemantic(request, proto.SemReadIds{ .view = view_id })
             else
                 self.sendSemantic(request, proto.SemRead{ .view = view_id }),
@@ -2776,15 +2752,15 @@ pub const Engine = struct {
 
     // ---- frames / screenshot ----------------------------------------
 
-    /// PNG of the view's newest software frame. Briefly nudges the
-    /// engine for a fresh paint, but settles for the existing buffer —
-    /// a static page repaints nothing, which is correct, not stale.
+    /// PNG of the view's newest software frame. Briefly waits for a
+    /// paint already on its way (the engine paces itself), but settles
+    /// for the existing buffer — a static page repaints nothing, which is
+    /// correct, not stale.
     pub fn screenshotPng(self: *Engine, arena: std.mem.Allocator, view_id: u32, budget_ms: i64) ![]u8 {
         if (!self.ensure()) return error.Unavailable;
         const v0 = self.findView(view_id) orelse return error.NoView;
         const gen0 = v0.frame_gen;
         const had_frame = v0.buf_fd >= 0;
-        self.send(proto.FrameRequest{ .view = view_id, .flags = 0 }) catch return error.Unavailable;
         const deadline = clock.nowMs() + @max(budget_ms, 200);
         while (clock.nowMs() < deadline) {
             const v = self.findView(view_id) orelse return error.NoView;
@@ -2976,43 +2952,12 @@ pub const Engine = struct {
                     self.reason = "the browser helper speaks a different protocol version";
                     return;
                 }
-                self.cap_shm = false;
-                self.cap_semantic = false;
-                self.cap_reader_ids = false;
-                self.cap_review = false;
-                self.cap_semantic_request_ids = false;
-                self.cap_view_url = false;
-                self.cap_intercept = false;
-                self.cap_contexts = false;
-                self.cap_contexts_fail_closed = false;
-                self.cap_net_policy = false;
-                self.cap_presenter = false;
-                self.cap_observe = false;
-                self.cap_downloads = false;
-                self.cap_download_start = false;
-                for (ack.caps) |cap| {
-                    if (std.mem.eql(u8, cap, proto.CAP_FRAMES_SHM)) self.cap_shm = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_SEMANTIC)) self.cap_semantic = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_VIEW_CREATE_URL)) self.cap_view_url = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_INTERCEPT)) self.cap_intercept = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_READER_IDS)) self.cap_reader_ids = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_REVIEW)) self.cap_review = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_SEMANTIC_REQUEST_IDS)) self.cap_semantic_request_ids = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_CONTEXTS)) self.cap_contexts = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_CONTEXTS_FAIL_CLOSED)) self.cap_contexts_fail_closed = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_NET_POLICY)) self.cap_net_policy = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_MULTI_CLIENT)) self.cap_multi_client = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_PRESENTER)) self.cap_presenter = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_OBSERVE)) self.cap_observe = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_POPUP_OPEN)) self.cap_popup_open = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_DOWNLOADS)) self.cap_downloads = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_DOWNLOAD_START)) self.cap_download_start = true;
-                }
+                self.caps = proto.parseCaps(ack.caps);
                 // Headless: allow real popups for the whole connection.
                 // A cancelled popup makes window.open return null, which
                 // is what breaks every federated sign-in at its last
                 // step; there is no user here to protect from one.
-                if (self.cap_popup_open) {
+                if (self.has(.popup_open)) {
                     self.send(proto.PopupPolicySet{
                         .view = 0,
                         .mode = proto.popup_mode_allow,
@@ -3122,6 +3067,15 @@ pub const Engine = struct {
                     v.cert = navfault.CertRec.init(self.gpa, ev, if (accept) .accepted else .refused) catch null;
                     self.send(proto.CertDecision{ .view = ev.view, .proceed = if (accept) 1 else 0 }) catch {};
                 }
+            },
+            .ev_route_refused => {
+                // Fail closed: the helper will open nothing, so let it go
+                // and say why; the next call starts a fresh one, which
+                // tries the route again.
+                const ev = proto.decode(proto.EvRouteRefused, frame.payload) catch return;
+                self.setOwned(&self.route_refused, ev.reason);
+                self.lost();
+                self.reason = self.route_refused orelse LOST_MSG;
             },
             .ev_view_create_failed => {
                 // The ONLY negative signal a context request produces:
@@ -3579,10 +3533,10 @@ const Pair = struct {
     fn handshake(self: *Pair, contexts: bool, fail_closed: bool) void {
         self.eng.state = .ready;
         self.eng.helper_gen +%= 1;
-        self.eng.cap_semantic = true;
-        self.eng.cap_view_url = true;
-        self.eng.cap_contexts = contexts;
-        self.eng.cap_contexts_fail_closed = fail_closed;
+        self.eng.caps.setPresent(.semantic, true);
+        self.eng.caps.setPresent(.view_create_url, true);
+        self.eng.caps.setPresent(.contexts, contexts);
+        self.eng.caps.setPresent(.contexts_fail_closed, fail_closed);
     }
 
     fn deinit(self: *Pair) void {
@@ -3624,14 +3578,14 @@ test "a profile is refused, opening nothing, unless BOTH context caps are advert
     var buf: [8192]u8 = undefined;
 
     // No contexts at all: an old helper (and the smoke fake).
-    p.eng.cap_contexts = false;
-    p.eng.cap_contexts_fail_closed = false;
+    p.eng.caps.setPresent(.contexts, false);
+    p.eng.caps.setPresent(.contexts_fail_closed, false);
     try std.testing.expectError(error.ContextsUnsupported, p.eng.openViewIn("https://x.test/", 800, 600, .{ .named = "work" }, null));
     try std.testing.expectError(error.ContextsUnsupported, p.eng.openViewIn("https://x.test/", 800, 600, .ephemeral, null));
 
     // CAP_CONTEXTS alone is WORSE than none: such a helper resolves an
     // unknown context through the shared jar and never says so.
-    p.eng.cap_contexts = true;
+    p.eng.caps.setPresent(.contexts, true);
     try std.testing.expectError(error.ContextsUnsupported, p.eng.openViewIn("https://x.test/", 800, 600, .{ .named = "work" }, null));
 
     // Fail closed means exactly this: no view, and not one byte on the
@@ -3640,7 +3594,7 @@ test "a profile is refused, opening nothing, unless BOTH context caps are advert
     try std.testing.expectEqual(@as(usize, 0), p.drain(&buf).len);
 
     // An invalid name is refused on its own, after the caps pass.
-    p.eng.cap_contexts_fail_closed = true;
+    p.eng.caps.setPresent(.contexts_fail_closed, true);
     try std.testing.expectError(error.InvalidName, p.eng.openViewIn("https://x.test/", 800, 600, .{ .named = "Default Jar" }, null));
     try std.testing.expectError(error.InvalidName, p.eng.openViewIn("https://x.test/", 800, 600, .{ .named = "default" }, null));
     try std.testing.expectEqual(@as(usize, 0), p.eng.views.items.len);
@@ -3985,7 +3939,7 @@ test "profile listing reports store and live state without spawning a helper" {
     try std.testing.expectEqual(@as(u32, 0), (try p.eng.profileList(arena))[0].views);
 
     // A helper without the caps makes profiles unavailable, and SAYS so.
-    p.eng.cap_contexts_fail_closed = false;
+    p.eng.caps.setPresent(.contexts_fail_closed, false);
     try std.testing.expect(!p.eng.profilesAvailable());
     try std.testing.expect(std.mem.indexOf(u8, p.eng.profileUnavailableReason(), "contexts-fail-closed") != null);
 }
@@ -4032,7 +3986,7 @@ test "a policied open is refused, opening nothing, without the net-policy capabi
     var buf: [8192]u8 = undefined;
 
     const pol = NetPolicy{ .allow_top = &.{"site.example"}, .max_requests = 10 };
-    try std.testing.expect(!p.eng.cap_net_policy);
+    try std.testing.expect(!p.eng.has(.net_policy));
     try std.testing.expectError(error.PolicyUnsupported, p.eng.openViewIn("https://site.example/", 800, 600, .default, &pol));
     // Fail closed: no view, and not one byte on the wire — the page was
     // never loaded unpoliced.
@@ -4044,7 +3998,7 @@ test "net_policy_set travels strictly before view_create_url, naming the same vi
     const gpa = std.testing.allocator;
     var p = try Pair.init(gpa);
     defer p.deinit();
-    p.eng.cap_net_policy = true;
+    p.eng.caps.setPresent(.net_policy, true);
     var buf: [16384]u8 = undefined;
 
     const pol = NetPolicy{ .allow_top = &.{"site.example"}, .max_requests = 5, .block_ads = true };
@@ -4077,7 +4031,7 @@ test "ev_net_policy: a stale serial is ignored, the live one updates, active=0 f
     const gpa = std.testing.allocator;
     var p = try Pair.init(gpa);
     defer p.deinit();
-    p.eng.cap_net_policy = true;
+    p.eng.caps.setPresent(.net_policy, true);
     var buf: [16384]u8 = undefined;
 
     const pol = NetPolicy{ .allow_top = &.{"site.example"} };
@@ -4143,7 +4097,7 @@ test "a live policy only tightens: loosenings are named and never sent" {
     const gpa = std.testing.allocator;
     var p = try Pair.init(gpa);
     defer p.deinit();
-    p.eng.cap_net_policy = true;
+    p.eng.caps.setPresent(.net_policy, true);
     var buf: [16384]u8 = undefined;
 
     const pol = NetPolicy{
@@ -4197,7 +4151,7 @@ test "a partial tighten leaves every omitted field exactly as it was" {
     const gpa = std.testing.allocator;
     var p = try Pair.init(gpa);
     defer p.deinit();
-    p.eng.cap_net_policy = true;
+    p.eng.caps.setPresent(.net_policy, true);
     var buf: [16384]u8 = undefined;
 
     const all_schemes = netpolicy.default_schemes | netpolicy.schemeBit("ws").? | netpolicy.schemeBit("wss").?;
@@ -4244,7 +4198,7 @@ test "explicit scheme and private-address fields still tighten, and widen attemp
     const gpa = std.testing.allocator;
     var p = try Pair.init(gpa);
     defer p.deinit();
-    p.eng.cap_net_policy = true;
+    p.eng.caps.setPresent(.net_policy, true);
     var buf: [16384]u8 = undefined;
 
     const ws = netpolicy.schemeBit("ws").?;
@@ -4358,7 +4312,7 @@ test "a present empty host list narrows a live view to no hosts; an absent one i
     const gpa = std.testing.allocator;
     var p = try Pair.init(gpa);
     defer p.deinit();
-    p.eng.cap_net_policy = true;
+    p.eng.caps.setPresent(.net_policy, true);
     var buf: [16384]u8 = undefined;
 
     const pol = NetPolicy{
@@ -4408,7 +4362,7 @@ test "a profile's session-default policy rides its web_open, and only its own" {
     const gpa = std.testing.allocator;
     var p = try Pair.init(gpa);
     defer p.deinit();
-    p.eng.cap_net_policy = true;
+    p.eng.caps.setPresent(.net_policy, true);
     var buf: [16384]u8 = undefined;
 
     const pol = NetPolicy{ .allow_top = &.{"site.example"}, .max_requests = 7 };

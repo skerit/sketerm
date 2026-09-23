@@ -2068,9 +2068,9 @@
   //
   // Manifest-declared actions are real: state crosses the bridge and
   // trusted clicks come back from GTK. The remaining namespaces below
-  // are benign stubs.
-  // and are meant to read as stubs. What they buy is that an extension
-  // RUNS instead of dying on line one. Anything an extension feature-
+  // are stubs whose asynchronous methods REJECT naming the API (a
+  // resolved no-op would lie to feature detection). What they buy is
+  // that an extension RUNS instead of dying on line one. Anything an extension feature-
   // detects (`privacy`, `dns`, `contentScripts`, `storage.sync`/`managed`,
   // `filterResponseData`) is deliberately LEFT ABSENT, because degrading
   // gracefully is what that detection is for and a stub would defeat it.

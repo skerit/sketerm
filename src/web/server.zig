@@ -103,90 +103,77 @@ const max_conn_id: u32 = proto.ENGINE_VIEW_BASE / proto.CONN_ID_WINDOW - 1;
 /// memfd frames that follow. Conditional ones are appended at handshake
 /// time — adding either kind is ONE line and nothing else, which is the
 /// whole point of the shape below.
-const unconditional_caps = [_][]const u8{
-    proto.CAP_FRAMES_SHM,
-    proto.CAP_INPUT,
-    proto.CAP_NAVIGATION,
-    proto.CAP_SEMANTIC,
-    proto.CAP_VIEW_CREATE_URL,
-    proto.CAP_DISCARD,
-    proto.CAP_FIND,
-    proto.CAP_ZOOM,
-    proto.CAP_CONTEXT_MENU,
-    proto.CAP_INTERCEPT,
-    proto.CAP_NET_POLICY,
-    proto.CAP_TLS,
-    proto.CAP_PERMISSIONS,
-    proto.CAP_SCROLL,
-    proto.CAP_DEVTOOLS,
-    proto.CAP_PRINT_PDF,
-    proto.CAP_CLIPBOARD,
-    proto.CAP_POPUP_OPEN,
-    proto.CAP_DOWNLOADS,
-    proto.CAP_DOWNLOAD_START,
-    proto.CAP_DOWNLOAD_STAGING,
-    proto.CAP_DOWNLOAD_ERRORS,
-    proto.CAP_A11Y,
-    proto.CAP_A11Y_CARET,
-    proto.CAP_CONTEXTS,
-    proto.CAP_CONTEXTS_FAIL_CLOSED,
-    proto.CAP_USERSCRIPTS,
-    proto.CAP_SITEDATA,
-    proto.CAP_FLUSH,
-    proto.CAP_FRAMES_INLINE,
-    proto.CAP_WEBEXT,
-    proto.CAP_WEBEXT_TABS,
-    proto.CAP_WEBEXT_ACTION,
-    proto.CAP_WEBEXT_TRANSACTION,
-    proto.CAP_FILTER_SUBSCRIBE,
-    proto.CAP_READER_IDS,
-    proto.CAP_REVIEW,
-    proto.CAP_SEMANTIC_REQUEST_IDS,
-    proto.CAP_MULTI_CLIENT,
-    proto.CAP_COOKIE_SYNC,
-    proto.CAP_OBSERVE,
-    proto.CAP_LOAD_RETRY,
+const unconditional_caps = [_]proto.Cap{
+    .frames_shm,
+    .input,
+    .navigation,
+    .semantic,
+    .view_create_url,
+    .discard,
+    .find,
+    .zoom,
+    .context_menu,
+    .intercept,
+    .net_policy,
+    .tls,
+    .permissions,
+    .scroll,
+    .devtools,
+    .print_pdf,
+    .print_pdf_staging,
+    .clipboard,
+    .popup_open,
+    .downloads,
+    .download_start,
+    .download_staging,
+    .download_errors,
+    .a11y,
+    .a11y_caret,
+    .contexts,
+    .contexts_fail_closed,
+    .userscripts,
+    .sitedata,
+    .flush,
+    .frames_inline,
+    .webext,
+    .webext_tabs,
+    .webext_action,
+    .webext_transaction,
+    .filter_subscribe,
+    .reader_ids,
+    .review,
+    .semantic_request_ids,
+    .multi_client,
+    .cookie_sync,
+    .observe,
+    .load_retry,
 };
 
-/// Test-only negotiation seam for exercising an older helper client path.
-fn advertiseReaderIds() bool {
-    return c.getenv("SKETERM_WEB_DISABLE_READER_IDS") == null;
-}
-
-fn advertiseSemanticRequestIds() bool {
-    return c.getenv("SKETERM_WEB_DISABLE_SEMANTIC_REQUEST_IDS") == null;
-}
-
-fn advertiseNetPolicy() bool {
-    return c.getenv("SKETERM_WEB_DISABLE_NET_POLICY") == null;
+/// Test-only negotiation seam: an environment switch that withholds one
+/// capability, so a rig can exercise the client path an OLDER helper
+/// takes without building one.
+fn withheld(cap: proto.Cap) bool {
+    const env: [*:0]const u8 = switch (cap) {
+        .reader_ids => "SKETERM_WEB_DISABLE_READER_IDS",
+        .semantic_request_ids => "SKETERM_WEB_DISABLE_SEMANTIC_REQUEST_IDS",
+        .net_policy => "SKETERM_WEB_DISABLE_NET_POLICY",
+        else => return false,
+    };
+    return c.getenv(env) != null;
 }
 
 /// Bounded builder for the `hello_ack` capability set. Its capacity is
-/// derived from the protocol's OWN vocabulary — the number of `CAP_*`
-/// constants `protocol.zig` declares — so there is no size to bump and
-/// no count to keep in step: advertising more capabilities than exist
-/// is not expressible. This replaced a fixed array plus a hand-tracked
-/// `ncaps`, which three parallel branches each had to merge by hand.
+/// the protocol's own vocabulary (`proto.Cap`), so there is no size to
+/// bump and advertising more capabilities than exist is not expressible.
 const CapList = struct {
-    const capacity = blk: {
-        @setEvalBranchQuota(20_000);
-        var n: usize = 0;
-        for (@typeInfo(proto).@"struct".decls) |d| {
-            if (std.mem.startsWith(u8, d.name, "CAP_")) n += 1;
-        }
-        break :blk n;
-    };
+    const capacity = @typeInfo(proto.Cap).@"enum".fields.len;
 
     buf: [capacity][]const u8 = undefined,
     len: usize = 0,
 
-    fn add(self: *CapList, cap: []const u8) void {
-        self.buf[self.len] = cap;
+    fn add(self: *CapList, cap: proto.Cap) void {
+        self.buf[self.len] = cap.name();
         self.len += 1;
-    }
-
-    fn addAll(self: *CapList, caps: []const []const u8) void {
-        for (caps) |cap| self.add(cap);
     }
 
     fn slice(self: *const CapList) []const []const u8 {
@@ -837,14 +824,11 @@ pub const Server = struct {
                 const req = try proto.decode(proto.Hello, frame.payload);
                 if (req.proto != proto.PROTO_VERSION) return error.ProtocolMismatch;
                 var caps: CapList = .{};
-                for (&unconditional_caps) |cap| {
-                    if (std.mem.eql(u8, cap, proto.CAP_READER_IDS) and !advertiseReaderIds()) continue;
-                    if (std.mem.eql(u8, cap, proto.CAP_SEMANTIC_REQUEST_IDS) and !advertiseSemanticRequestIds()) continue;
-                    if (std.mem.eql(u8, cap, proto.CAP_NET_POLICY) and !advertiseNetPolicy()) continue;
-                    caps.add(cap);
+                for (unconditional_caps) |cap| {
+                    if (!withheld(cap)) caps.add(cap);
                 }
-                if (cefhost.isAccelerated()) caps.add(proto.CAP_FRAMES_DMABUF);
-                if (self.host.presenterActive()) caps.add(proto.CAP_PRESENTER);
+                if (cefhost.isAccelerated()) caps.add(.frames_dmabuf);
+                if (self.host.presenterActive()) caps.add(.presenter);
                 try cn.out.post(proto.HelloAck{
                     .proto = proto.PROTO_VERSION,
                     .engine_name = cefhost.engineName(),
@@ -852,6 +836,8 @@ pub const Server = struct {
                     .caps = caps.slice(),
                 }, null);
                 cn.greeted = true;
+                if (self.host.route_refusal.len != 0)
+                    try cn.out.post(proto.EvRouteRefused{ .reason = self.host.route_refusal }, null);
             },
             .context_create => self.host.contextCreate(try self.dec(cn, proto.ContextCreate, frame.payload)),
             .context_destroy => self.host.contextDestroy((try self.dec(cn, proto.ContextDestroy, frame.payload)).id),
@@ -881,7 +867,10 @@ pub const Server = struct {
             // v1 accepts the release for symmetry but keeps no per-buffer
             // state: one memfd per view, replaced on resize.
             .frame_release => _ = try self.dec(cn, proto.FrameRelease, frame.payload),
-            .frame_request => self.host.beginFrame(try self.dec(cn, proto.FrameRequest, frame.payload)),
+            // Retired with client-driven pacing: the engine paces itself
+            // (`cefhost.externalPacingLatency`). Older clients still send
+            // it, and it is accepted and ignored.
+            .frame_request => {},
             .frame_mode => {
                 const req = try proto.decode(proto.FrameMode, frame.payload);
                 // Per-connection, latching (an anonymous buffer is

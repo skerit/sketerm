@@ -191,9 +191,10 @@ pub const Action = enum {
     /// dimmed, until it is looked at again. What
     /// `web_discard_minutes` does on a timer, on demand.
     web_discard_background,
-    /// Open the browser engine's DevTools for the focused web pane,
-    /// in a split beside it (src/ui/webface.zig). No debugging port
-    /// is involved: the inspector is another helper-side view.
+    /// Open the browser engine's DevTools for the focused web pane
+    /// (src/ui/webface.zig). CEF 151 always gives the inspector a window
+    /// of its own; an engine that can render it windowless gets a split
+    /// beside the page instead. No debugging port is involved.
     web_devtools,
     /// Save the focused web pane's page as a PDF, through a save
     /// dialog; the browser helper writes the file.

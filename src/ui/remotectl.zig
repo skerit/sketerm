@@ -1278,6 +1278,9 @@ const WebViewInfo = struct {
     can_fwd: bool,
     focused: bool,
     visible: bool,
+    /// The pane's active page: the one every pane-addressed web verb
+    /// acts on.
+    active: bool,
     /// Finished main-frame loads on this view. A caller settling a
     /// navigation needs it: `loading:false` is also true in the gap
     /// between asking for a page and the engine starting it.
@@ -1325,6 +1328,7 @@ fn webCmd(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList(u8), all
                         .can_fwd = face.can_fwd,
                         .focused = focused == p and cur == face,
                         .visible = p.webFaceVisible() and cur == face,
+                        .active = cur == face,
                         .load_seq = face.load_seq,
                         .cert = if (face.cert_rec) |*rec| rec.wire() else null,
                         .load_error = if (face.load_error_rec) |*rec| rec.wire() else null,
@@ -1425,6 +1429,15 @@ fn webCmd(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList(u8), all
             if (url.len > 0) face.navigate(url);
         }
         return ipc_protocol.writeOkFlat(out, allocator, .{ .pane = pane.id, .view = face.view });
+    }
+
+    if (eql(u8, req.cmd, "web-close")) {
+        const pane = reqPaneExact(self, req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
+        const g = @import("webgroup.zig").Group.fromPane(pane) orelse
+            return ipc_protocol.writeErr(out, allocator, "no web view on that pane (web_tabs lists them; web_open makes one)");
+        const closed = g.closeByView(ownerWindow(self, pane), req.view) orelse
+            return ipc_protocol.writeErr(out, allocator, "no such page on that pane (web-list names each page's view)");
+        return ipc_protocol.writeOkFlat(out, allocator, .{ .view = closed.view, .pane_closed = closed.pane_closed });
     }
 
     const face = webFaceOf(self, req) orelse

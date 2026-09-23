@@ -1,6 +1,6 @@
 //! Semantic layer bookkeeping for the browser helper: the shadow tree,
 //! stable protocol ids, delta computation and the agent-facing text
-//! format of docs/proposal-browser-protocol.md.
+//! format the `sem_*` frames of protocol.zig carry.
 //!
 //! CEF-FREE by construction (std only), because the whole point of the
 //! design is that an engine which can only produce FULL trees still

@@ -4,8 +4,8 @@
 //! This used to be built inside `palette.zig`'s `open()`, interleaved
 //! with AdwActionRow construction, which meant the command set could
 //! not be queried unless a dialog was on screen. That was the concrete
-//! blocker on "the omnibox and the palette become ONE system"
-//! (docs/proposal-browser.md): a source you can only run from inside a
+//! blocker on "the omnibox and the palette become ONE system": a
+//! source you can only run from inside a
 //! dialog cannot be installed in another surface. Here the rows are a
 //! plain slice and `source()` hands them to `suggest.merge` from
 //! anywhere — a palette, an omnibox, or a test.
@@ -209,7 +209,7 @@ pub const curated = [_]Row{
     .{ .icon = "web-browser-symbolic", .title = "Discard Background Web Tabs",
        .desc = "Let go of every web page that is not on screen. Each pane keeps its last frame, dimmed, and reloads when you look at it again.", .action = .web_discard_background },
     .{ .icon = "applications-engineering-symbolic", .title = "Open DevTools (Web Pane)",
-       .desc = "Open the browser engine's inspector for this web pane, in a split beside it. No remote debugging port is opened.", .action = .web_devtools },
+       .desc = "Open the browser engine's inspector for this web pane. The engine opens it in a window of its own; no remote debugging port is opened.", .action = .web_devtools },
     .{ .icon = "document-print-symbolic", .title = "Print Web Page to PDF…",
        .desc = "Save this web pane's page as a PDF file; the browser engine renders it.", .action = .web_print_pdf },
     .{ .icon = "dialog-password-symbolic", .title = "Fill Password (Web Pane)…",

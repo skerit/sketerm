@@ -17,8 +17,8 @@ const std = @import("std");
 /// Protocol revision carried by `hello`/`hello_ack`.
 pub const PROTO_VERSION: u32 = 1;
 
-/// Capabilities a v1 helper advertises. Reserved-but-unimplemented
-/// names live in docs/proposal-browser-protocol.md, not here.
+/// Capabilities a v1 helper may advertise; `Cap` below is the one list
+/// every client parses them through.
 pub const CAP_FRAMES_SHM = "frames-shm";
 /// Frames delivered as dma-buf planes (`frame_dmabuf`) instead of a
 /// memfd of pixels. Advertised only when the helper actually got a GPU
@@ -44,8 +44,15 @@ pub const CAP_DISCARD = "discard";
 /// other. No remote debugging port is ever opened.
 pub const CAP_DEVTOOLS = "devtools";
 /// The helper accepts `print_pdf`: render a view to a PDF file at a
-/// path IT can write (helper and client are the same machine in v1).
+/// path IT can write, on the helper's own host.
 pub const CAP_PRINT_PDF = "print-pdf";
+/// The helper honours `PrintPdf.stage`: it prints into a private file
+/// of its own choosing and names it in `EvPrintPdfDone.staged`, which is
+/// how a client on ANOTHER host gets the PDF (it fetches the staged file
+/// through the daemon's file service). Without it a remote helper can
+/// only write a path on its own host, so a client must not offer the
+/// verb for a remote view.
+pub const CAP_PRINT_PDF_STAGING = "print-pdf-staging";
 /// The helper accepts `input_paste` and `clipboard_read`, and answers
 /// the latter with `ev_clipboard_text`.
 ///
@@ -244,7 +251,7 @@ pub const CAP_MULTI_CLIENT = "multi-client";
 pub const CAP_PRESENTER = "presenter";
 /// The environment variable that arms the presenter in a helper; only
 /// a launcher that started the helper as a hub's client may set it.
-pub const CAP_PRESENTER_ENV = "SKETERM_WEB_PRESENTER";
+pub const PRESENTER_ENV = "SKETERM_WEB_PRESENTER";
 
 /// Cross-instance cookie SYNCHRONISATION (0xE0 block).
 ///
@@ -310,6 +317,132 @@ pub const CAP_OBSERVE = "observe";
 /// every such blink is an `ev_load_error` the client has to retry
 /// itself. `web/loadretry.zig` is the rule.
 pub const CAP_LOAD_RETRY = "load-retry";
+
+/// Every capability this protocol names, as one enum: the declaring home
+/// every client tracks a helper's `hello_ack` through (`Caps`,
+/// `parseCaps`) and the helper advertises from. A member's wire name is
+/// the `CAP_*` constant of the same name, resolved at comptime, and the
+/// check below refuses a constant without a member, so a capability can
+/// never again be added to one hand-kept flag list and missed in another.
+pub const Cap = enum {
+    frames_shm,
+    frames_dmabuf,
+    input,
+    navigation,
+    semantic,
+    view_create_url,
+    discard,
+    devtools,
+    print_pdf,
+    print_pdf_staging,
+    clipboard,
+    find,
+    zoom,
+    context_menu,
+    intercept,
+    net_policy,
+    popup_open,
+    tls,
+    permissions,
+    downloads,
+    download_start,
+    download_staging,
+    download_errors,
+    a11y,
+    a11y_caret,
+    userscripts,
+    contexts,
+    contexts_fail_closed,
+    sitedata,
+    flush,
+    scroll,
+    filter_subscribe,
+    frames_inline,
+    webext,
+    webext_tabs,
+    reader_ids,
+    review,
+    semantic_request_ids,
+    webext_action,
+    webext_transaction,
+    multi_client,
+    presenter,
+    cookie_sync,
+    observe,
+    load_retry,
+
+    /// The wire name `hello_ack` carries.
+    pub fn name(self: Cap) []const u8 {
+        return switch (self) {
+            inline else => |tag| @field(protocol, capConstName(@tagName(tag))),
+        };
+    }
+
+    /// The member a wire name denotes; null for a name this build does
+    /// not know (a newer helper's capability is not an error).
+    pub fn fromName(wire: []const u8) ?Cap {
+        inline for (@typeInfo(Cap).@"enum".fields) |f| {
+            const cap: Cap = @enumFromInt(f.value);
+            if (std.mem.eql(u8, wire, cap.name())) return cap;
+        }
+        return null;
+    }
+};
+
+/// The capabilities one connection's helper advertised.
+pub const Caps = std.EnumSet(Cap);
+
+/// A `hello_ack` capability list as a set; unknown names are skipped.
+pub fn parseCaps(names: []const []const u8) Caps {
+    var set = Caps.initEmpty();
+    for (names) |n| {
+        if (Cap.fromName(n)) |cap| set.insert(cap);
+    }
+    return set;
+}
+
+const protocol = @This();
+
+/// `frames_shm` -> `CAP_FRAMES_SHM`.
+fn capConstName(comptime tag: []const u8) []const u8 {
+    comptime {
+        @setEvalBranchQuota(10_000);
+        var buf: [tag.len + 4]u8 = undefined;
+        @memcpy(buf[0..4], "CAP_");
+        for (tag, 0..) |ch, i| buf[4 + i] = std.ascii.toUpper(ch);
+        const out = buf;
+        return &out;
+    }
+}
+
+comptime {
+    // Every `CAP_*` constant is a member: a new capability that skips
+    // the enum fails the build here instead of never being parsed.
+    @setEvalBranchQuota(100_000);
+    var n: usize = 0;
+    for (@typeInfo(protocol).@"struct".decls) |d| {
+        if (!std.mem.startsWith(u8, d.name, "CAP_")) continue;
+        n += 1;
+        var found = false;
+        for (@typeInfo(Cap).@"enum".fields) |f| {
+            if (std.mem.eql(u8, capConstName(f.name), d.name)) found = true;
+        }
+        if (!found) @compileError(d.name ++ " has no member in protocol.Cap");
+    }
+    if (n != @typeInfo(Cap).@"enum".fields.len) @compileError("protocol.Cap and the CAP_* constants disagree");
+}
+
+test "every capability round-trips through its wire name and parseCaps skips unknowns" {
+    inline for (@typeInfo(Cap).@"enum".fields) |f| {
+        const cap: Cap = @enumFromInt(f.value);
+        try std.testing.expectEqual(cap, Cap.fromName(cap.name()).?);
+    }
+    const set = parseCaps(&.{ CAP_DISCARD, "from-the-future", CAP_TLS });
+    try std.testing.expect(set.contains(.discard));
+    try std.testing.expect(set.contains(.tls));
+    try std.testing.expectEqual(@as(usize, 2), set.count());
+    try std.testing.expectEqualStrings("contexts-fail-closed", Cap.contexts_fail_closed.name());
+}
 
 /// Per-connection id window under `multi-client`: connection k owns
 /// client-minted view ids translated into globals by adding
@@ -440,6 +573,7 @@ pub const Tag = enum(u8) {
     context_create = 0x90,
     context_destroy = 0x91,
     ev_view_create_failed = 0x92,
+    ev_route_refused = 0x93,
     sem_eval = 0xA0,
     sem_eval_result = 0xA1,
     devtools_show = 0xA2,
@@ -747,6 +881,10 @@ pub const HelloAck = struct {
     }
 };
 
+/// THE SCALE CONTRACT, for every frame that carries geometry: `w`/`h` are
+/// LOGICAL pixels, `scale_x1000` the real fractional device scale, and
+/// the buffer the helper announces back is PHYSICAL,
+/// `ceil(logical * scale)`. Input coordinates stay logical.
 pub const ViewCreate = struct {
     pub const tag: Tag = .view_create;
     view: u32,
@@ -2742,9 +2880,8 @@ pub const ENGINE_VIEW_BASE: u32 = 0x4000_0000;
 // -- print to PDF (0xA4 block, capability "print-pdf") ----------------
 
 /// Render `view` to a PDF at `path`. The path is interpreted by the
-/// HELPER, which is on the same machine as the client in v1; the
-/// helper never creates directories and never overwrites anything the
-/// engine's own writer would not.
+/// HELPER, on its own host; the helper never creates directories and
+/// never overwrites anything the engine's own writer would not.
 pub const PrintPdf = struct {
     pub const tag: Tag = .print_pdf;
     view: u32,
@@ -2753,6 +2890,24 @@ pub const PrintPdf = struct {
     /// `Paper` value; anything unknown means the engine default.
     paper: u8,
     path: []const u8,
+    /// Optional trailing field (capability `print-pdf-staging`): nonzero
+    /// prints into a private file of the helper's choosing, reported in
+    /// `EvPrintPdfDone.staged`; `path` is then only the correlation key.
+    /// An older helper ignores the byte and writes `path` itself, which
+    /// is why a client sends it only when the capability is advertised.
+    stage: u8 = 0,
+
+    pub fn decodeFrom(payload: []const u8) !PrintPdf {
+        var cur = Cur{ .buf = payload };
+        var out: PrintPdf = .{
+            .view = try cur.readU32(),
+            .flags = try cur.readU8(),
+            .paper = try cur.readU8(),
+            .path = try cur.readStr(),
+        };
+        out.stage = cur.readU8() catch 0;
+        return out;
+    }
 };
 
 /// `PrintPdf.flags` bits.
@@ -2785,6 +2940,21 @@ pub const EvPrintPdfDone = struct {
     view: u32,
     ok: u8,
     path: []const u8,
+    /// Optional trailing field: where a STAGED print is, on the helper's
+    /// host; empty for an unstaged print or a failure (a failed staging
+    /// file is removed by the helper).
+    staged: []const u8 = "",
+
+    pub fn decodeFrom(payload: []const u8) !EvPrintPdfDone {
+        var cur = Cur{ .buf = payload };
+        var out: EvPrintPdfDone = .{
+            .view = try cur.readU32(),
+            .ok = try cur.readU8(),
+            .path = try cur.readStr(),
+        };
+        out.staged = cur.readStr() catch "";
+        return out;
+    }
 };
 
 // -- scroll position (0xC2 block, capability "scroll") ----------------
@@ -2940,6 +3110,16 @@ pub const EvViewCreateFailed = struct {
     pub const tag: Tag = .ev_view_create_failed;
     view: u32,
     context: u32,
+    reason: []const u8,
+};
+
+/// This ROUTED helper instance serves nothing: the engine refused its
+/// route's proxy (or the WebRTC policy that keeps UDP inside it), so it
+/// fails closed. Posted right after `hello_ack` on every connection; a
+/// client that predates the frame skips it and still sees every view it
+/// asks for refused with the same sentence (`ev_view_create_failed`).
+pub const EvRouteRefused = struct {
+    pub const tag: Tag = .ev_route_refused;
     reason: []const u8,
 };
 
@@ -4289,6 +4469,35 @@ test "a sem_eval without the trailing max_str decodes as the serializer default"
 // read that as "a gesture" rather than as a truncated frame — the
 // difference between an old helper behaving as it always did and one
 // whose every popup is silently blocked.
+test "print frames: the staging fields are optional trailers both ways" {
+    const gpa = std.testing.allocator;
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(gpa);
+    // A new client's request, read by this build: the stage byte lands.
+    try encodePayload(gpa, &body, PrintPdf{ .view = 3, .flags = print_flag_background, .paper = 0, .path = "/tmp/a.pdf", .stage = 1 });
+    const req = try decode(PrintPdf, body.items);
+    try std.testing.expectEqual(@as(u8, 1), req.stage);
+    try std.testing.expectEqualStrings("/tmp/a.pdf", req.path);
+    // An OLD client's request stops at the path: no stage, no error.
+    body.clearRetainingCapacity();
+    try putU32(gpa, &body, 3);
+    try putU8(gpa, &body, 0);
+    try putU8(gpa, &body, 0);
+    try putStr(gpa, &body, "/tmp/b.pdf");
+    try std.testing.expectEqual(@as(u8, 0), (try decode(PrintPdf, body.items)).stage);
+    // An OLD helper's answer has no staged path.
+    body.clearRetainingCapacity();
+    try putU32(gpa, &body, 3);
+    try putU8(gpa, &body, 1);
+    try putStr(gpa, &body, "/tmp/b.pdf");
+    const old = try decode(EvPrintPdfDone, body.items);
+    try std.testing.expectEqualStrings("", old.staged);
+    // A new helper's answer carries it.
+    body.clearRetainingCapacity();
+    try encodePayload(gpa, &body, EvPrintPdfDone{ .view = 3, .ok = 1, .path = "/tmp/a.pdf", .staged = "/tmp/sketerm-webpdf-x" });
+    try std.testing.expectEqualStrings("/tmp/sketerm-webpdf-x", (try decode(EvPrintPdfDone, body.items)).staged);
+}
+
 test "an ev_popup_request without the trailing gesture byte still decodes" {
     const gpa = std.testing.allocator;
     var buf: std.ArrayList(u8) = .empty;

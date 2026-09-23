@@ -1,9 +1,17 @@
 # The CEF browser helper on macOS
 
-Status: **the full `zig build smoke-web` suite passes on macOS —
-exit 0, every stage green** (Apple Silicon, macOS 26, CEF 151.3.16,
-verified 2026-08-20, including an eyeballed screenshot of a real
-rendered page). The one known red is `zig build test-web`: the unit
+Status: **last verified on macOS on 2026-08-20**, when the full
+`zig build smoke-web` suite passed there — exit 0, every stage green
+(Apple Silicon, macOS 26, CEF 151.3.16, including an eyeballed
+screenshot of a real rendered page). Everything the helper gained since
+has been verified on Linux only; the parts with a platform surface are
+the broker-owned helper lifetime (2026-08-21), per-route helper
+instances started with `--proxy` (Tor's SOCKS5 endpoint, or the loopback
+bridge a `via:` route dials its host through), helper-side staging files
+under `/tmp` for remote downloads and prints, and the removal of
+client-driven begin frames (the engine paces itself; the CFRunLoop
+lifeline below is unchanged). Re-run smoke-web on a Mac before trusting
+any of them there. The one known red is `zig build test-web`: the unit
 test binary links the framework directly and dyld cannot resolve
 `@executable_path/../Frameworks/…` from `.zig-cache/o/<hash>/test` —
 the fix is staging (or symlinking) the framework next to the test

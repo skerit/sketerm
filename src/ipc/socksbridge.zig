@@ -21,6 +21,7 @@ const channel_pump = @import("../mux/channel_pump.zig");
 const clock = @import("../util/clock.zig");
 const platform = @import("../util/platform.zig");
 const FdCancel = @import("../util/fdcancel.zig").FdCancel;
+const webroute = @import("../web/route.zig");
 
 // ---------------------------------------------------------------------
 // SOCKS5 protocol driver (pure, unit-tested)
@@ -610,6 +611,38 @@ pub const Egress = struct {
     }
 };
 
+/// The proxy url a route's helper instance is started with, or null for
+/// a route that wants none (direct, and `on:`, whose helper runs on the
+/// host itself). A `via:` route binds its loopback SOCKS5 -> mux bridge
+/// into `egress` on first use and keeps it across helper restarts, so the
+/// port is known before the helper's argv is built; a bridge that cannot
+/// bind is an error, never a direct helper under a routed name. The one
+/// home for this decision, shared by the GUI's and the headless engine's
+/// instance spawns.
+pub fn routeProxy(
+    gpa: std.mem.Allocator,
+    spec: webroute.Spec,
+    egress: *?*Egress,
+    connectFn: *const fn (allocator: std.mem.Allocator, host: ?[]const u8) ?client.Conn,
+    buf: []u8,
+) error{BridgeFailed}!?[]const u8 {
+    switch (spec.kind) {
+        .direct, .remote_browser => return null,
+        .tor => return spec.proxyUrl(buf) orelse error.BridgeFailed,
+        .mux => {
+            if (egress.* == null) {
+                const eg = Egress.create(gpa, spec.host, connectFn) orelse return error.BridgeFailed;
+                if (!eg.spawn()) {
+                    eg.close();
+                    return error.BridgeFailed;
+                }
+                egress.* = eg;
+            }
+            return std.fmt.bufPrint(buf, "socks5://127.0.0.1:{d}", .{egress.*.?.port()}) catch error.BridgeFailed;
+        },
+    }
+}
+
 fn platformSocket() c_int {
     return platform.socketCloexec(c.AF_INET, c.SOCK_STREAM, 0);
 }
@@ -617,6 +650,24 @@ fn platformSocket() c_int {
 // ---------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------
+
+test "routeProxy: tor names its endpoint, direct and on: want no proxy, and nothing binds for them" {
+    const Never = struct {
+        fn connect(_: std.mem.Allocator, _: ?[]const u8) ?client.Conn {
+            unreachable;
+        }
+    };
+    var egress: ?*Egress = null;
+    var buf: [80]u8 = undefined;
+    const tor = try routeProxy(std.testing.allocator, .{ .kind = .tor, .endpoint = "127.0.0.1:9050" }, &egress, Never.connect, &buf);
+    try std.testing.expectEqualStrings("socks5://127.0.0.1:9050", tor.?);
+    try std.testing.expect((try routeProxy(std.testing.allocator, .{}, &egress, Never.connect, &buf)) == null);
+    try std.testing.expect((try routeProxy(std.testing.allocator, .{ .kind = .remote_browser, .host = "box" }, &egress, Never.connect, &buf)) == null);
+    try std.testing.expect(egress == null);
+    // A tor url that cannot be formatted is an error, never "no proxy".
+    var tiny: [4]u8 = undefined;
+    try std.testing.expectError(error.BridgeFailed, routeProxy(std.testing.allocator, .{ .kind = .tor, .endpoint = "127.0.0.1:9050" }, &egress, Never.connect, &tiny));
+}
 
 test "driver: greeting then domain CONNECT" {
     var s = Socks{};

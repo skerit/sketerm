@@ -16,8 +16,9 @@
 //!   truncation behave the same. One engine per ROUTE (`g_engines`):
 //!   `web_open route:"tor"` gets its own helper instance, socket, cookie
 //!   jar and proxy, and view ids are minted process-wide so a handle
-//!   still names exactly one view. `via:`/`on:` are refused here rather
-//!   than served direct; `capabilities` says so as `web_routes`.
+//!   still names exactly one view; a `via:` engine's proxy is a local
+//!   SOCKS5 bridge to its mux host. `on:` is refused here rather than
+//!   served direct; `capabilities` says so as `web_routes`.
 //!
 //! Two invariants shape every function here (src/ipc/CLAUDE.md):
 //!
@@ -282,8 +283,8 @@ pub const RouteSupport = enum {
     none,
     /// The GUI backend: every kind (direct, tor, via:<host>, on:<host>).
     gui,
-    /// The headless backend: direct and tor, each its own helper
-    /// instance; via:/on: are refused.
+    /// The headless backend: direct, tor and via:<host>, each its own
+    /// local helper instance; on:<host> is refused.
     headless,
 
     pub fn name(self: RouteSupport) []const u8 {
@@ -299,7 +300,7 @@ pub const RouteSupport = enum {
         return switch (self) {
             .none => "per-tab browser routes: none (no browser backend answers here)",
             .gui => "per-tab browser routes: direct, tor, via:<host> and on:<host> all work (web_open route:); the GUI runs one browser instance per route",
-            .headless => "per-tab browser routes: direct and tor work (web_open route:, each its own browser instance with its own cookie jar); via:<host> and on:<host> are refused headlessly, never downgraded to direct",
+            .headless => "per-tab browser routes: direct, tor and via:<host> work (web_open route:, each its own browser instance with its own cookie jar); on:<host> is refused headlessly, never downgraded to direct",
         };
     }
 };
@@ -335,7 +336,7 @@ pub fn downloadCapability() struct { supported: bool, started: bool } {
     if (guiDrivesWeb()) return .{ .supported = true, .started = true };
     const e = headlessEngine() orelse return .{ .supported = false, .started = false };
     if (e.state != .ready) return .{ .supported = true, .started = false };
-    return .{ .supported = e.cap_downloads and e.cap_download_start, .started = true };
+    return .{ .supported = e.has(.downloads) and e.has(.download_start), .started = true };
 }
 
 /// The engine-lifecycle half of the preflight: whether the broker lane
@@ -475,6 +476,10 @@ pub const View = struct {
     can_fwd: bool = false,
     focused: bool = false,
     visible: bool = false,
+    /// GUI: this is its pane's ACTIVE page, the one a pane handle means
+    /// (a pane holds several pages; web-list lists each). Headless views
+    /// are their own handles and leave it false.
+    active: bool = false,
     /// Finished main-frame loads on this view (both backends report
     /// it). `web_open`'s settle needs a COUNTER, not a flag: `loading`
     /// is false before the requested navigation starts as well as after
@@ -863,10 +868,16 @@ fn appendEngineViews(
 fn viewFor(views: Views, handle: ?u32) ?View {
     if (views.views.len == 0) return null;
     if (handle) |p| {
+        // A GUI pane holds several pages and every pane-addressed verb
+        // acts on its ACTIVE one; a GUI too old to report `active` (or a
+        // headless view, its own handle) answers with the first match.
+        var first: ?View = null;
         for (views.views) |v| {
-            if (v.pane == p) return v;
+            if (v.pane != p) continue;
+            if (v.active) return v;
+            if (first == null) first = v;
         }
-        return null;
+        return first;
     }
     for (views.views) |v| {
         if (v.focused) return v;
@@ -970,7 +981,7 @@ pub fn runOp(drv: Driver, arena: std.mem.Allocator, handle: u32, op: Op, timeout
                 req.kind = .query;
                 const qk = web_proto.SemQuery.fromOperationName(op.action orelse "find_text") orelse
                     return .{ .err = fail(.invalid_args, "unknown query kind") };
-                if (qk == .review and !e.cap_review) return .{ .err = fail(.unavailable, "this browser helper does not advertise review support; rebuild/restart the helper") };
+                if (qk == .review and !e.has(.review)) return .{ .err = fail(.unavailable, "this browser helper does not advertise review support; rebuild/restart the helper") };
                 req.action = @intFromEnum(qk);
                 req.arg = op.data orelse "";
             } else if (eql(u8, op.op, "read")) {
@@ -991,7 +1002,7 @@ pub fn runOp(drv: Driver, arena: std.mem.Allocator, handle: u32, op: Op, timeout
                 .snapshot_kind = if (out.snap_kind == @intFromEnum(web_proto.SnapKind.delta)) "delta" else "full",
                 .doc_gen = out.doc_gen,
                 .rev = out.rev,
-                .reader_ids = req.kind == .read and e.cap_reader_ids,
+                .reader_ids = req.kind == .read and e.has(.reader_ids),
                 .timed_out = out.timed_out,
             } };
         },
@@ -1115,23 +1126,20 @@ test "a route text is direct only when it says so" {
     try t.expect(!isDirectRoute("bogus"));
 }
 
-/// Which route kinds the HEADLESS backend can realize: the ones whose
-/// proxy is known before the helper starts, because a route here IS a
-/// helper instance started with `--proxy`.
-///
-/// `.mux` needs the local SOCKS5 bridge that today lives in the GUI
-/// face, and `.remote_browser` needs a helper on another host; both are
-/// refused rather than approximated, because a view that browsed direct under
-/// a route label is the one outcome a route must never produce.
-fn headlessRouteSupported(kind: webroute.Kind) bool {
+/// Why the HEADLESS backend cannot realize a route kind, or null when it
+/// can. A route here IS a local helper instance started with `--proxy`
+/// (`socksbridge.routeProxy`: tor's SOCKS5 endpoint, or the loopback
+/// bridge a `via:` route dials its mux host through), so `on:<host>`,
+/// whose helper runs ON that host and ships frames in-band, is the one
+/// kind with no headless realization. It is refused rather than
+/// approximated: a view that browsed direct under a route label is the
+/// one outcome a route must never produce.
+fn headlessRouteRefusal(kind: webroute.Kind) ?[]const u8 {
     return switch (kind) {
-        .direct, .tor => true,
-        .mux, .remote_browser => false,
+        .direct, .tor, .mux => null,
+        .remote_browser => "on:<host> needs the GUI backend: it runs the browser ON that host and shows its frames in-band, which the headless engine (a local helper it screenshots from shared memory) cannot present. Use via:<host> to leave from that host with a local browser, or drive the GUI. `capabilities` reports which backend answers (web_backend) and which routes it has (web_routes). Nothing was opened - a routed tab must never silently browse direct.",
     };
 }
-
-const HEADLESS_ROUTE_REFUSAL =
-    "this route needs the GUI backend: the headless browser engine realizes a route as its own helper instance and can only do that for 'direct' and 'tor' (via:<host> needs the GUI's SOCKS5 bridge, on:<host> a helper on that host). `capabilities` reports which backend answers (web_backend) and which routes it has (web_routes). Nothing was opened - a routed tab must never silently browse direct.";
 
 /// The Tor SOCKS5 endpoint a `tor` route dials, from config. Read per
 /// routed open rather than cached: a route must never be built from a
@@ -1148,8 +1156,8 @@ const RouteEngineOutcome = union(enum) { engine: *webdrive.Engine, err: Fail };
 fn headlessRouteEngine(arena: std.mem.Allocator, text: []const u8) RouteEngineOutcome {
     const probe = webroute.Spec.parse(text, "0.0.0.0:1") orelse
         return .{ .err = fail(.invalid_args, "'route' is not a route: use direct | tor | via:<host> | on:<host>") };
-    if (!headlessRouteSupported(probe.kind))
-        return .{ .err = fail(.unavailable, HEADLESS_ROUTE_REFUSAL) };
+    if (headlessRouteRefusal(probe.kind)) |why|
+        return .{ .err = fail(.unavailable, why) };
     const spec = webroute.Spec.parse(text, torEndpoint(arena)) orelse
         return .{ .err = fail(.unavailable, "this machine has no usable Tor SOCKS5 endpoint (config 'mux_tor_socks_endpoint'), so a tor route cannot be built. Nothing was opened - a tor tab must never fall back to the direct path.") };
     const e = headlessEngineFor(spec) orelse
@@ -1193,6 +1201,11 @@ fn openView(drv: Driver, arena: std.mem.Allocator, url: ?[]const u8, where: []co
             const v = e.openViewIn(url orelse "", w, h, spec, policy) catch |err| {
                 const name: []const u8 = if (spec == .named) spec.named else "";
                 return .{ .err = switch (err) {
+                    error.RouteRefused => fail(.unavailable, try std.fmt.allocPrint(
+                        arena,
+                        "{s}. Nothing was opened; the next web_open on this route starts a fresh browser that tries the route again.",
+                        .{e.reason},
+                    )),
                     error.PolicyUnsupported => fail(.unavailable, "this browser helper does not advertise the net-policy capability, so the requested policy cannot be ENFORCED. Nothing was opened: there is deliberately no unpoliced fallback."),
                     error.PolicyTooManyViews => fail(.conflict, try std.fmt.allocPrint(
                         arena,
@@ -1605,6 +1618,23 @@ fn openResult(
         try treeSection(&res, arena, "snapshot", s.tree);
         try res.text(TRUST_LINE);
     }
+    return res.finish();
+}
+
+/// `web_close` with a GUI attached: one page of `pane` went, and the pane
+/// with it only when `pane_closed`.
+fn closeGuiResult(arena: std.mem.Allocator, pane: u32, remaining: usize, pane_closed: bool) ![]const u8 {
+    var res = mcp.Res.init(arena);
+    try res.fact("backend", "gui");
+    try res.fact("closed", pane);
+    try res.fact("remaining", remaining);
+    try res.fact("current", @as(u32, 0));
+    try res.fact("pane_closed", pane_closed);
+    try res.fact("profile_released", false);
+    if (pane_closed)
+        try res.textf("closed pane {d} (its last page); {d} web views left", .{ pane, remaining })
+    else
+        try res.textf("closed the active page of pane {d}; the pane stays open with its other pages; {d} web views left", .{ pane, remaining });
     return res.finish();
 }
 
@@ -3479,22 +3509,34 @@ pub fn capturePng(drv: Driver, arena: std.mem.Allocator, view: View, timeout: i6
     return .{ .done = png };
 }
 
-/// Close one web view. GUI-attached this is the user's PANE, which is
-/// exactly what `close_pane` does — the GUI handle IS the pane id, and
-/// the GUI grants no page-granular close verb yet.
+/// Close one web view. GUI-attached this is ONE PAGE of the pane's
+/// browser (`web-close`); only the pane's last page takes the pane with
+/// it. A GUI that predates the verb answers "unknown command" and gets
+/// the old whole-pane close instead, which is all it can do.
 fn closeTool(drv: Driver, arena: std.mem.Allocator, views: ?Views, handle: ?u32) ![]const u8 {
     const vs = views orelse return helperErr(drv, arena, views);
     const view = viewFor(vs, handle) orelse return helperErr(drv, arena, views);
     switch (drv) {
         .gui => |backend| {
+            const remaining = if (vs.views.len > 0) vs.views.len - 1 else 0;
             const reply = mcp.ipcParsed(arena, backend, .{
-                .cmd = "close-pane",
+                .cmd = "web-close",
                 .pane = view.pane,
+                .view = view.view,
             }) catch |e| return failRes(arena, try guiUnreachable(arena, e));
+            if (!reply.ok and std.mem.eql(u8, reply.err, "unknown command")) {
+                const pane = mcp.ipcParsed(arena, backend, .{
+                    .cmd = "close-pane",
+                    .pane = view.pane,
+                }) catch |e| return failRes(arena, try guiUnreachable(arena, e));
+                if (!pane.ok) return failRes(arena, fail(.failed, pane.err));
+                return closeGuiResult(arena, view.pane, remaining, true);
+            }
             if (!reply.ok) return failRes(arena, fail(.failed, reply.err));
+            const pane_closed = if (reply.value.object.get("pane_closed")) |pc| pc == .bool and pc.bool else true;
             // The GUI owns what is focused afterwards; asking it again
-            // would race the pane teardown it just started.
-            return closeResult(arena, .gui, view.pane, if (vs.views.len > 0) vs.views.len - 1 else 0, 0, "", false);
+            // would race the pane teardown it may just have started.
+            return closeGuiResult(arena, view.pane, remaining, pane_closed);
         },
         .headless => |e| {
             const released = std.mem.eql(u8, view.profile_kind, "ephemeral");
@@ -5720,17 +5762,15 @@ test "web_open routes: the GUI is told, a bad grammar is refused, headless says 
     try t.expect(std.mem.indexOf(u8, refused, "via:<host>") != null);
     try t.expectEqual(@as(usize, 1), bad.requests.items.len);
 
-    // Headless realizes a route as its own helper instance, and can do
-    // that only for the routes whose proxy it knows up front: `via:` and
-    // `on:` are refused rather than served on the direct path.
+    // Headless realizes a route as its own LOCAL helper instance, so
+    // `on:`, whose browser runs on the other host, is refused rather than
+    // served on the direct path.
     var engine = webdrive.Engine{ .gpa = arena, .dir = @constCast(""), .client_name = @constCast("") };
     const headless = Driver{ .headless = &engine };
-    for ([_][]const u8{ "via:box", "on:box" }) |r| {
-        const no = try openView(headless, arena, "https://example.com/", "tab", 800, 600, .default, null, r);
-        try t.expectEqual(mcp.ErrCode.unavailable, no.err.code);
-        try t.expect(std.mem.indexOf(u8, no.err.text, "web_backend") != null);
-        try t.expect(std.mem.indexOf(u8, no.err.text, "never silently browse direct") != null);
-    }
+    const no = try openView(headless, arena, "https://example.com/", "tab", 800, 600, .default, null, "on:box");
+    try t.expectEqual(mcp.ErrCode.unavailable, no.err.code);
+    try t.expect(std.mem.indexOf(u8, no.err.text, "web_backend") != null);
+    try t.expect(std.mem.indexOf(u8, no.err.text, "never silently browse direct") != null);
 }
 
 test "the headless backend keeps one engine per route, keyed by its slug" {
@@ -5803,7 +5843,7 @@ test "the headless backend keeps one engine per route, keyed by its slug" {
     try t.expectEqualStrings("tor", parsed.object.get("structuredContent").?.object.get("route").?.string);
 }
 
-test "a headless tor route resolves to the tor engine, via: does not resolve at all" {
+test "a headless tor or via: route resolves to its own engine, on: does not resolve at all" {
     var arena_state = testArena();
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -5832,19 +5872,26 @@ test "a headless tor route resolves to the tor engine, via: does not resolve at 
         },
     }
 
-    // The two kinds the headless engine cannot realize: refused with the
-    // sentence that names the backend fact, and nothing minted for them.
+    // via: is a local helper instance of its own whose proxy is the
+    // SOCKS5 bridge to that host; resolving it binds nothing yet (the
+    // bridge comes up with the helper, at the first call that needs it).
+    const via = headlessRouteEngine(arena, "via:box").engine;
+    try t.expectEqual(webroute.Kind.mux, via.routeSpec().kind);
+    try t.expect(via != headlessEngine().?);
+    try t.expect(via.egress == null);
+    var vbuf: [64]u8 = undefined;
+    try t.expectEqualStrings("via:box", via.routeText(&vbuf));
+    try t.expect(headlessRouteEngine(arena, "via:box").engine == via);
+
+    // The one kind the headless engine cannot realize: refused with the
+    // sentence that names the backend fact, and nothing minted for it.
     const before = g_engines.items.len;
-    for ([_][]const u8{ "via:box", "on:box" }) |text| {
-        const out = headlessRouteEngine(arena, text);
-        try t.expectEqual(mcp.ErrCode.unavailable, out.err.code);
-        try t.expect(std.mem.indexOf(u8, out.err.text, "web_backend") != null);
-    }
+    const out = headlessRouteEngine(arena, "on:box");
+    try t.expectEqual(mcp.ErrCode.unavailable, out.err.code);
+    try t.expect(std.mem.indexOf(u8, out.err.text, "web_backend") != null);
     try t.expectEqual(before, g_engines.items.len);
-    try t.expect(!headlessRouteSupported(.mux));
-    try t.expect(!headlessRouteSupported(.remote_browser));
-    try t.expect(headlessRouteSupported(.direct));
-    try t.expect(headlessRouteSupported(.tor));
+    try t.expect(headlessRouteRefusal(.remote_browser) != null);
+    for ([_]webroute.Kind{ .direct, .tor, .mux }) |kind| try t.expect(headlessRouteRefusal(kind) == null);
 }
 
 /// Scripted web_gui side effects for the fail-closed test: no GUI
@@ -5997,6 +6044,36 @@ test "the profile-error vocabulary types each refusal" {
     // Anything that is not a profile error still routes to the helper
     // vocabulary rather than becoming a bare "failed".
     try t.expectEqual(mcp.ErrCode.not_found, (try profileFail(arena, &engine, "", error.NoView)).code);
+}
+
+test "web_close with a GUI closes one PAGE of the pane, and falls back to the pane on an older GUI" {
+    var arena_state = testArena();
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const t = std.testing;
+
+    // Pane 7 holds two pages; the second (view 12) is the active one, so
+    // it is the one a pane handle means and the one closed.
+    const TWO_PAGES = "{\"ok\":true,\"views\":[{\"pane\":7,\"view\":11,\"url\":\"https://a.example/\",\"active\":false,\"load_seq\":1},{\"pane\":7,\"view\":12,\"url\":\"https://b.example/\",\"active\":true,\"focused\":true,\"load_seq\":1}]}";
+    var page = ScriptedBackend{ .allocator = t.allocator, .responses = &.{ TWO_PAGES, "{\"ok\":true,\"view\":12,\"pane_closed\":false}" } };
+    defer page.deinit();
+    const out = try webTool(arena, page.backend(), "web_close", try jsonArgs(arena, "{\"pane\":7}"));
+    try t.expect(std.mem.indexOf(u8, page.requests.items[1], "\"cmd\":\"web-close\"") != null);
+    try t.expect(std.mem.indexOf(u8, page.requests.items[1], "\"view\":12") != null);
+    const parsed = try mcp.expectToolResultShape(arena, "web_close", out);
+    const sc = parsed.object.get("structuredContent").?.object;
+    try t.expect(!sc.get("pane_closed").?.bool);
+    try t.expectEqual(@as(i64, 7), sc.get("closed").?.integer);
+    try t.expectEqual(@as(usize, 2), page.requests.items.len);
+
+    // A GUI that predates the verb: the old whole-pane close, and the
+    // result says the pane went.
+    var old = ScriptedBackend{ .allocator = t.allocator, .responses = &.{ ONE_VIEW, "{\"ok\":false,\"error\":\"unknown command\"}", "{\"ok\":true}" } };
+    defer old.deinit();
+    const old_out = try webTool(arena, old.backend(), "web_close", try jsonArgs(arena, "{\"pane\":7}"));
+    try t.expect(std.mem.indexOf(u8, old.requests.items[2], "\"cmd\":\"close-pane\"") != null);
+    const oparsed = try mcp.expectToolResultShape(arena, "web_close", old_out);
+    try t.expect(oparsed.object.get("structuredContent").?.object.get("pane_closed").?.bool);
 }
 
 test "web_close / web_profiles / web_profile_reset result shapes" {

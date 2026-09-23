@@ -2030,7 +2030,7 @@ pub const Window = struct {
     /// pane's cwd is a path on THAT host, so passing the bare path to a
     /// browser face would open a local directory that usually does not
     /// exist. Writes into `buf`; null when the pane reported no cwd.
-    fn paneBrowserSpec(pane: *Pane, buf: []u8) ?[]const u8 {
+    pub fn paneBrowserSpec(pane: *Pane, buf: []u8) ?[]const u8 {
         const raw: ?[]const u8 = if (pane.terminal.remote) |r| r.host else null;
         const host = @import("../filebrowser/paths.zig").browserHost(raw);
         return files_entry.startSpec(buf, host, pane.terminal.cwd);

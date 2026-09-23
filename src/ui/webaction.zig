@@ -318,7 +318,7 @@ pub const Toolbar = struct {
         // helper that advertised the capability; a remote client has it
         // forced off, so this is also what keeps extension actions from
         // being driven across the mux wire.
-        if (!cl.cap_webext_action or cl.state != .ready) return false;
+        if (!cl.has(.webext_action) or cl.state != .ready) return false;
         // Closing the previous popup posts a ViewDestroy, and a post
         // that loses the connection frees every Action (helperGone ->
         // refresh -> clearActions) and destroys their buttons with the
@@ -338,7 +338,7 @@ pub const Toolbar = struct {
         // Capabilities belong to the CONNECTION and are cleared when it
         // is lost, so the client is re-read rather than reused.
         const conn = self.cl orelse return false;
-        if (!conn.cap_webext_action or conn.state != .ready) return false;
+        if (!conn.has(.webext_action) or conn.state != .ready) return false;
         const popup = if (live.popup) Popup.create(self, live.button) else null;
         if (live.popup and popup == null) return false;
         self.popup = popup;
@@ -515,7 +515,7 @@ test "refresh closes the popup before it borrows the action list" {
 
 test "activate re-resolves its action after the close instead of reusing it" {
     const gpa = std.testing.allocator;
-    var cl = webface.Client{ .state = .ready, .cap_webext_action = true };
+    var cl = webface.Client{ .state = .ready, .caps = .initOne(.webext_action) };
 
     // A close that loses the connection: the caller's `*Action` is
     // freed, and activate must stop rather than post with it.
@@ -699,7 +699,6 @@ const Popup = struct {
         self.w = fb.w;
         self.h = fb.h;
         self.stride = fb.stride;
-        self.owner.post(proto.FrameRequest{ .view = self.view, .flags = 0 });
     }
 
     fn damage(self: *Popup, ev: proto.FrameDamage) void {

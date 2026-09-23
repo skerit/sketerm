@@ -581,6 +581,10 @@ fn populateFetched(self: *Switcher) void {
             // route left to Take control (its floating window carries an
             // unclickable badge, not a button).
             if (self.win.sessionPlacement(session.name, host) == .pane) continue;
+            // An assistant's browser shown as a watch already: the watch
+            // tab's own chip owns the lease, exactly as a pane's does.
+            if (assistants.kindOf(session.name, session.app) == .web and
+                webwatch.placementFor(self.win, host, session.name) != .none) continue;
             var running_apps: usize = 0;
             for (session.audio_streams, 0..) |info, index| {
                 if (!info.running) continue;
@@ -1438,12 +1442,8 @@ fn startAttach(self: *Switcher, target: SessionTarget, lease: muxtabs.Lease, pla
     // helper (webwatch.zig), locally by socket, remotely through the
     // host's daemon. The app session is never attached for it.
     if (assistants.kindOf(target.session, true) == .web) {
-        const ok = if (target_host) |h| blk: {
-            if (std.mem.startsWith(u8, h, "sock:"))
-                break :blk webwatch.openLocal(self.win, labelForHost(self, h), h["sock:".len..], target.session, lease);
-            break :blk webwatch.openRemote(self.win, h, h, target.session, lease);
-        } else webwatch.openLocal(self.win, "assistant", "", target.session, lease);
-        if (ok) {
+        const label = if (target_host) |h| labelForHost(self, h) else "assistant";
+        if (webwatch.openFor(self.win, label, target_host, target.session, lease)) {
             c.gtk_window_close(@ptrCast(self.window));
         } else {
             self.note = "the assistant's browser could not be watched";

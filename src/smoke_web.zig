@@ -30,11 +30,11 @@
 //! The certificate stages need `openssl s_server`; a host without one
 //! SKIPS them rather than failing, so the rig stays runnable anywhere.
 //!
-//! Every stage still drives `frame_request`s (~120/s in `Client.pump`,
-//! what the GUI's frame-clock tick does), but since the internal-
-//! scheduler default (`externalPacingLatency` in cefhost.zig) they are
-//! advisory: paints arrive on the engine's own damage-driven schedule,
-//! and the CAP travels as `view_max_fps` instead of as request spacing.
+//! No stage asks for frames: the engine paces itself
+//! (`externalPacingLatency` in cefhost.zig), paints arrive on its own
+//! damage-driven schedule, and the CAP travels as `view_max_fps`. Stage
+//! 20 alone sends the retired `frame_request`, as an older client does,
+//! to prove it is accepted and costs nothing.
 //!
 //! The HiDPI stage runs LAST on purpose: its scale changes leave the
 //! engine re-laying-out for a while, and running it mid-rig made the
@@ -135,6 +135,12 @@ const egress_view_b: u32 = 6;
 const egress_view_c: u32 = 7;
 const egress_unknown_view: u32 = 11;
 const egress_proxy_fail_view: u32 = 12;
+/// The context-0 view a refused route instance must also refuse.
+const egress_global_fail_view: u32 = 13;
+/// The WebRTC candidate-gathering views (stage 26w): one on a routed
+/// helper, one on a direct control.
+const webrtc_routed_view: u32 = 15;
+const webrtc_direct_view: u32 = 16;
 /// The negative-control view on a direct instance (stage 27).
 const egress_direct_view: u32 = 14;
 
@@ -1096,31 +1102,9 @@ const Client = struct {
     nfds: usize = 0,
 
     ack_proto: u32 = 0,
-    ack_shm: bool = false,
-    ack_semantic: bool = false,
-    ack_reader_ids: bool = false,
-    ack_semantic_request_ids: bool = false,
-    ack_dmabuf: bool = false,
-    ack_view_url: bool = false,
-    ack_discard: bool = false,
-    ack_tls: bool = false,
-    ack_permissions: bool = false,
-    ack_devtools: bool = false,
-    ack_print_pdf: bool = false,
-    ack_downloads: bool = false,
-    ack_load_retry: bool = false,
-    ack_download_start: bool = false,
-    ack_contexts: bool = false,
-    ack_contexts_fail_closed: bool = false,
-    ack_webext: bool = false,
-    ack_webext_tabs: bool = false,
-    ack_filter_subscribe: bool = false,
-    ack_webext_action: bool = false,
-    ack_webext_transaction: bool = false,
-    ack_multi_client: bool = false,
-    ack_presenter: bool = false,
-    ack_observe: bool = false,
-    ack_flush: bool = false,
+    /// What the helper advertised, through the one list every client
+    /// parses (`proto.Cap`).
+    ack_caps: proto.Caps = .initEmpty(),
 
     /// Observe family (stage ob). Last `ev_observe_view` and its
     /// counters per state, last `ev_observe_state`.
@@ -1227,14 +1211,6 @@ const Client = struct {
     dma_ids: [16]u32 = @splat(0),
     dma_nids: usize = 0,
 
-    /// Frame pacing. The helper runs its browsers with external begin
-    /// frames, so NOTHING paints unless this rig asks: every wait loop
-    /// drives requests while it waits, exactly as the GUI's frame-clock
-    /// tick does.
-    have_view: bool = false,
-    last_req_us: i64 = 0,
-    req_count: u32 = 0,
-
     title: [1024]u8 = @splat(0),
     title_len: usize = 0,
     /// View id the last `ev_title` named — under multi-client this must
@@ -1274,6 +1250,8 @@ const Client = struct {
     load_retry_seq: u32 = 0,
     load_retry_code: i32 = 0,
     view_create_fail_seq: u32 = 0,
+    /// `ev_route_refused` frames seen (a routed helper failing closed).
+    route_refused_seq: u32 = 0,
     view_create_fail_view: u32 = 0,
     view_create_fail_context: u32 = 0,
     view_create_fail_reason: [128]u8 = @splat(0),
@@ -1343,8 +1321,6 @@ const Client = struct {
     eval_ok: u8 = 0,
     eval_seq: u32 = 0,
 
-    ack_intercept: bool = false,
-    ack_userscripts: bool = false,
     // Interception: last coalesced status counters, and the last log
     // pull rendered to JSON.
     int_enabled: u8 = 1,
@@ -1396,6 +1372,9 @@ const Client = struct {
     print_seq: u32 = 0,
     print_path: [1024]u8 = @splat(0),
     print_path_len: usize = 0,
+    /// `EvPrintPdfDone.staged`, NUL-terminated for fopen.
+    print_staged: [256]u8 = @splat(0),
+    print_staged_len: usize = 0,
 
     /// Downloads: the last held offer, and the last progress frame.
     dl_offer_seq: u32 = 0,
@@ -1418,10 +1397,6 @@ const Client = struct {
     dl_prog_total: u64 = 0,
     dl_done: u8 = 0,
     dl_failed: u8 = 0,
-    ack_a11y: bool = false,
-    ack_a11y_caret: bool = false,
-    ack_sitedata: bool = false,
-    ack_cookie_sync: bool = false,
     /// Stage 41 only; null everywhere else.
     ck: ?*CkState = null,
     /// Cookies + site data. `cookie_names` is the last enumeration
@@ -1445,7 +1420,6 @@ const Client = struct {
     site_removed: u32 = 0,
     site_detail: [128]u8 = @splat(0),
     site_detail_len: usize = 0,
-    ack_frames_inline: bool = false,
     /// Inline frame family (stage 32): pixels reassembled from
     /// `frame_inline` payloads, plus what the assertions need — the
     /// union area of the LAST frame's rects (damage economy) and
@@ -1533,50 +1507,39 @@ const Client = struct {
         });
     }
 
-    /// Ask the helper for one frame, at most `min_gap_us` after the
-    /// previous request.
-    fn frameRequest(self: *Client, min_gap_us: i64) void {
-        if (!self.have_view or self.fd < 0) return;
-        const now = nowUs();
-        if (now - self.last_req_us < min_gap_us) return;
-        self.last_req_us = now;
-        self.req_count += 1;
-        self.send(proto.FrameRequest{ .view = view_id, .flags = 0 });
-        // An inspector is an ordinary view: it paints when somebody
-        // asks, exactly like the page it inspects.
-        if (self.dev_view != 0) self.send(proto.FrameRequest{ .view = self.dev_view, .flags = 0 });
-        if (self.ext_popup_view != 0 and self.ext_popup_state == proto.webext_popup_opened)
-            self.send(proto.FrameRequest{ .view = self.ext_popup_view, .flags = 0 });
-    }
-
-    /// Wait for helper output while driving frames at ~120Hz — what the
-    /// GUI's active tick does, and what every stage below needs in
-    /// order to see any paint at all.
+    /// Wait for helper output. The engine paces itself, so nothing has
+    /// to be asked for while waiting.
     fn pump(self: *Client, timeout_ms: c_int) void {
         if (self.fd < 0) return;
         const deadline = nowMs() + timeout_ms;
         while (true) {
-            self.frameRequest(8_000);
             const left = deadline - nowMs();
             const slice: c_int = @intCast(std.math.clamp(left, 0, 8));
             if (self.pumpRaw(slice) or nowMs() >= deadline) return;
         }
     }
 
-    /// Drive begin frames at `target_fps` for `duration_ms` and report
-    /// what came back. The measurement primitive of the pacing stages.
-    fn drive(self: *Client, duration_ms: i64, target_fps: i64) struct { requests: u32, paints: u32, ms: i64 } {
+    /// Watch the helper for `duration_ms` and report how many paints
+    /// came back. The measurement primitive of the pacing stages;
+    /// `old_client_fps` > 0 additionally sends the retired `frame_request`
+    /// at that rate, the way a client that predates self-pacing does.
+    fn drive(self: *Client, duration_ms: i64, old_client_fps: i64) struct { requests: u32, paints: u32, ms: i64 } {
         const start = nowMs();
         const end = start + duration_ms;
-        const req0 = self.req_count;
         const dmg0 = self.paintCount();
-        const gap: i64 = if (target_fps <= 0) std.math.maxInt(i64) else @divTrunc(1_000_000, target_fps);
+        const gap: i64 = if (old_client_fps <= 0) std.math.maxInt(i64) else @divTrunc(1000, old_client_fps);
+        var requests: u32 = 0;
+        var next_req = start;
         while (nowMs() < end) {
-            if (target_fps > 0) self.frameRequest(gap);
+            if (old_client_fps > 0 and nowMs() >= next_req) {
+                self.send(proto.FrameRequest{ .view = view_id, .flags = 0 });
+                requests += 1;
+                next_req = nowMs() + @max(gap, 1);
+            }
             _ = self.pumpRaw(1);
         }
         return .{
-            .requests = self.req_count - req0,
+            .requests = requests,
             .paints = self.paintCount() - dmg0,
             .ms = nowMs() - start,
         };
@@ -1706,40 +1669,7 @@ const Client = struct {
                 const ack = proto.HelloAck.decodeAlloc(frame.payload, self.gpa) catch fail("hello_ack decode");
                 defer self.gpa.free(ack.caps);
                 self.ack_proto = ack.proto;
-                for (ack.caps) |cap| {
-                    if (std.mem.eql(u8, cap, proto.CAP_FRAMES_SHM)) self.ack_shm = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_SEMANTIC)) self.ack_semantic = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_READER_IDS)) self.ack_reader_ids = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_SEMANTIC_REQUEST_IDS)) self.ack_semantic_request_ids = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_FRAMES_DMABUF)) self.ack_dmabuf = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_VIEW_CREATE_URL)) self.ack_view_url = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_INTERCEPT)) self.ack_intercept = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_DISCARD)) self.ack_discard = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_TLS)) self.ack_tls = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_PERMISSIONS)) self.ack_permissions = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_DEVTOOLS)) self.ack_devtools = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_PRINT_PDF)) self.ack_print_pdf = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_DOWNLOADS)) self.ack_downloads = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_LOAD_RETRY)) self.ack_load_retry = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_DOWNLOAD_START)) self.ack_download_start = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_A11Y)) self.ack_a11y = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_A11Y_CARET)) self.ack_a11y_caret = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_CONTEXTS)) self.ack_contexts = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_CONTEXTS_FAIL_CLOSED)) self.ack_contexts_fail_closed = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_USERSCRIPTS)) self.ack_userscripts = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_SITEDATA)) self.ack_sitedata = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_COOKIE_SYNC)) self.ack_cookie_sync = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_FRAMES_INLINE)) self.ack_frames_inline = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_WEBEXT)) self.ack_webext = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_WEBEXT_TABS)) self.ack_webext_tabs = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_FILTER_SUBSCRIBE)) self.ack_filter_subscribe = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_WEBEXT_ACTION)) self.ack_webext_action = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_WEBEXT_TRANSACTION)) self.ack_webext_transaction = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_MULTI_CLIENT)) self.ack_multi_client = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_PRESENTER)) self.ack_presenter = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_OBSERVE)) self.ack_observe = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_FLUSH)) self.ack_flush = true;
-                }
+                self.ack_caps = proto.parseCaps(ack.caps);
             },
             .ev_observe_view => {
                 const ev = proto.decode(proto.EvObserveView, frame.payload) catch fail("ev_observe_view decode");
@@ -2049,6 +1979,9 @@ const Client = struct {
                 self.print_ok = p.ok;
                 self.print_path_len = @min(p.path.len, self.print_path.len);
                 @memcpy(self.print_path[0..self.print_path_len], p.path[0..self.print_path_len]);
+                self.print_staged_len = @min(p.staged.len, self.print_staged.len - 1);
+                @memcpy(self.print_staged[0..self.print_staged_len], p.staged[0..self.print_staged_len]);
+                self.print_staged[self.print_staged_len] = 0;
                 self.print_seq += 1;
             },
             .ev_webext_state => {
@@ -2266,6 +2199,12 @@ const Client = struct {
                 @memcpy(self.view_create_fail_reason[0..self.view_create_fail_reason_len], e.reason[0..self.view_create_fail_reason_len]);
                 self.view_create_fail_seq += 1;
             },
+            .ev_route_refused => {
+                _ = proto.decode(proto.EvRouteRefused, frame.payload) catch fail("ev_route_refused decode");
+                // Must follow the handshake, never precede it.
+                if (self.ack_proto == 0) fail("ev_route_refused arrived before hello_ack");
+                self.route_refused_seq += 1;
+            },
             .ev_cert_error => {
                 const e = proto.decode(proto.EvCertError, frame.payload) catch fail("ev_cert_error decode");
                 self.cert_seq += 1;
@@ -2346,6 +2285,10 @@ const Client = struct {
     }
 
     /// Evaluate `code` and wait for the answer; returns the raw JSON.
+    fn acks(self: *const Client, cap: proto.Cap) bool {
+        return self.ack_caps.contains(cap);
+    }
+
     fn evalWait(self: *Client, code: []const u8, want_await: bool, timeout_ms: i64) []const u8 {
         return self.evalWaitView(view_id, code, want_await, timeout_ms);
     }
@@ -2793,7 +2736,7 @@ fn driveUntil(cl: *Client, timeout_ms: i64, ctx: anytype, comptime pred: fn (@Ty
     const deadline = nowMs() + timeout_ms;
     while (nowMs() < deadline) {
         if (pred(ctx)) return true;
-        _ = cl.drive(150, 120);
+        _ = cl.drive(150, 0);
     }
     return pred(ctx);
 }
@@ -2903,7 +2846,7 @@ fn certStage(cl: *Client, dir: []const u8) void {
         }
         pass("stage 22g permission request (client consulted, denied, page sees code 1)");
     } else {
-        _ = cl.drive(3000, 120);
+        _ = cl.drive(3000, 0);
         if (cl.perm_seq != 0) fail(
             "stage 22g: the engine now DOES ask the client for permission -- " ++
                 "replace this stage with a real allow/deny round trip",
@@ -2920,7 +2863,7 @@ fn certStage(cl: *Client, dir: []const u8) void {
     // Leave the view on a data: page: everything after this stage
     // assumes no network is involved.
     cl.send(proto.Navigate{ .view = view_id, .url = red_page });
-    _ = cl.drive(500, 120);
+    _ = cl.drive(500, 0);
 }
 
 /// The DRM question the browser spike answered once by hand and nothing
@@ -3013,6 +2956,30 @@ fn emeProbe(cl: *Client, key_system: []const u8, caps: []const u8, out: []u8) []
     const n = @min(json.len, out.len);
     @memcpy(out[0..n], json[0..n]);
     return out[0..n];
+}
+
+const IceCount = struct { total: u32, udp: u32 };
+
+/// Gather ICE candidates in `view` with no ICE servers and count them,
+/// UDP ones separately: what a page can learn of this machine's network
+/// through WebRTC. Gathering ends at `complete` or after 4s.
+fn iceProbe(cl: *Client, view: u32, comptime what: []const u8) IceCount {
+    const js =
+        "(async()=>{const pc=new RTCPeerConnection({iceServers:[]});pc.createDataChannel('x');" ++
+        "const c=[];pc.onicecandidate=e=>{if(e.candidate&&e.candidate.candidate)c.push(e.candidate.candidate)};" ++
+        "await pc.setLocalDescription(await pc.createOffer());" ++
+        "await new Promise(r=>{if(pc.iceGatheringState==='complete')return r();" ++
+        "pc.onicegatheringstatechange=()=>{if(pc.iceGatheringState==='complete')r()};setTimeout(r,4000)});" ++
+        "pc.close();return 'ice:'+c.length+':'+c.filter(x=>/ udp /i.test(x)).length+':';})()";
+    const json = cl.evalWaitView(view, js, true, 30_000);
+    const at = std.mem.indexOf(u8, json, "ice:") orelse {
+        std.debug.print("smoke-web: " ++ what ++ " ICE probe said {s}\n", .{json});
+        fail(what ++ ": the ICE probe never answered");
+    };
+    var it = std.mem.splitScalar(u8, json[at + 4 ..], ':');
+    const total = std.fmt.parseInt(u32, it.next() orelse "", 10) catch fail(what ++ ": ICE probe total");
+    const udp = std.fmt.parseInt(u32, it.next() orelse "", 10) catch fail(what ++ ": ICE probe udp");
+    return .{ .total = total, .udp = udp };
 }
 
 // ── Stage 32 plumbing: a mini mux client + a byte bridge ──────────
@@ -3380,9 +3347,8 @@ fn runNetChangeStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8
             const d = nowMs() + 15_000;
             while (cl.ack_proto == 0 and nowMs() < d) cl.pump(100);
         }
-        if (!cl.ack_load_retry) fail("stage nc: hello_ack lacks the load-retry capability");
+        if (!cl.acks(.load_retry)) fail("stage nc: hello_ack lacks the load-retry capability");
         cl.send(proto.ViewCreate{ .view = view_id, .w = 640, .h = 480, .scale_x1000 = 1000, .context = 0 });
-        cl.have_view = true;
         if (!cl.waitBufferAfter(0, 20_000)) fail("stage nc: no frame_buffer for the view");
 
         const errs0 = cl.load_err_seq;
@@ -3403,7 +3369,6 @@ fn runNetChangeStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8
         pass("stage nc a network change under a main-frame load is retried once and reported as a retry, not a failure");
 
         cl.send(proto.ViewDestroy{ .view = view_id });
-        cl.have_view = false;
         cl.pump(500);
         cl.deinit();
         reapHelper(pid, "stage nc (one blink)");
@@ -3426,7 +3391,6 @@ fn runNetChangeStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8
             while (cl.ack_proto == 0 and nowMs() < d) cl.pump(100);
         }
         cl.send(proto.ViewCreate{ .view = view_id, .w = 640, .h = 480, .scale_x1000 = 1000, .context = 0 });
-        cl.have_view = true;
         if (!cl.waitBufferAfter(0, 20_000)) fail("stage nc: no frame_buffer for the second view");
 
         const served0 = srv.path_hits.load(.acquire);
@@ -3446,7 +3410,6 @@ fn runNetChangeStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8
         pass("stage nc the retry is bounded: a second network change is reported as the failure it is");
 
         cl.send(proto.ViewDestroy{ .view = view_id });
-        cl.have_view = false;
         cl.pump(500);
         cl.deinit();
         reapHelper(pid, "stage nc (two blinks)");
@@ -3478,9 +3441,8 @@ fn runDownloadHoldStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const
         const d = nowMs() + 15_000;
         while (cl.ack_proto == 0 and nowMs() < d) cl.pump(100);
     }
-    if (!cl.ack_downloads) fail("stage 22j3: hello_ack lacks the downloads capability");
+    if (!cl.acks(.downloads)) fail("stage 22j3: hello_ack lacks the downloads capability");
     cl.send(proto.ViewCreate{ .view = view_id, .w = 640, .h = 480, .scale_x1000 = 1000, .context = 0 });
-    cl.have_view = true;
     if (!cl.waitBufferAfter(0, 20_000)) fail("stage 22j3: no frame_buffer for the view");
 
     cl.navigate(download_page);
@@ -3489,7 +3451,7 @@ fn runDownloadHoldStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const
         var tries: u8 = 0;
         while (tries < 5 and cl.dl_offer_seq == offer0) : (tries += 1) {
             cl.clickCenter();
-            _ = cl.drive(400, 120);
+            _ = cl.drive(400, 0);
         }
     }
     if (!cl.waitSeq(&cl.dl_offer_seq, offer0, 20_000))
@@ -3521,7 +3483,6 @@ fn runDownloadHoldStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const
     pass("stage 22j3 an unanswered download offer expires into a failed frame and leaves no file behind");
 
     cl.send(proto.ViewDestroy{ .view = view_id });
-    cl.have_view = false;
     {
         const d = nowMs() + 1_500;
         while (nowMs() < d) cl.pump(50);
@@ -3578,7 +3539,7 @@ fn runWebrequestStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u
             const d = nowMs() + 15_000;
             while (cl.ack_proto == 0 and nowMs() < d) cl.pump(100);
         }
-        if (!cl.ack_webext) fail("stage 34: hello_ack lacks the webext capability");
+        if (!cl.acks(.webext)) fail("stage 34: hello_ack lacks the webext capability");
 
         cl.send(proto.WebextSet{ .id = ext_id, .dir = ext_dir, .enabled = 1 });
         {
@@ -3598,7 +3559,6 @@ fn runWebrequestStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u
         }
 
         cl.send(proto.ViewCreate{ .view = view_id, .w = 640, .h = 480, .scale_x1000 = 1000, .context = 0 });
-        cl.have_view = true;
         if (!cl.waitBufferAfter(0, 20_000)) fail("stage 34: no frame_buffer for the page view");
 
         // -- 34a: cancel, redirect, header modification ---------------
@@ -3662,7 +3622,6 @@ fn runWebrequestStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u
         pass("stage 34b held request released when the extension is removed mid-flight");
 
         cl.send(proto.ViewDestroy{ .view = view_id });
-        cl.have_view = false;
         {
             const d = nowMs() + 2500;
             while (nowMs() < d) cl.pump(50);
@@ -3696,7 +3655,6 @@ fn runWebrequestStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u
         }
 
         cl.send(proto.ViewCreate{ .view = view_id, .w = 640, .h = 480, .scale_x1000 = 1000, .context = 0 });
-        cl.have_view = true;
         if (!cl.waitBufferAfter(0, 20_000)) fail("stage 34c: no frame_buffer");
         cl.resetTitle();
         cl.send(proto.Navigate{ .view = view_id, .url = page_c });
@@ -3722,7 +3680,6 @@ fn runWebrequestStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u
 
         cl.send(proto.WebextRemove{ .id = ext_id });
         cl.send(proto.ViewDestroy{ .view = view_id });
-        cl.have_view = false;
         {
             const d = nowMs() + 2500;
             while (nowMs() < d) cl.pump(50);
@@ -3776,8 +3733,8 @@ fn runWebextStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
             const d = nowMs() + 15_000;
             while (cl.ack_proto == 0 and nowMs() < d) cl.pump(100);
         }
-        if (!cl.ack_webext) fail("stage 33 webext: hello_ack lacks the webext capability");
-        if (!cl.ack_webext_transaction) fail("stage 33 webext: hello_ack lacks the webext transaction capability");
+        if (!cl.acks(.webext)) fail("stage 33 webext: hello_ack lacks the webext capability");
+        if (!cl.acks(.webext_transaction)) fail("stage 33 webext: hello_ack lacks the webext transaction capability");
 
         cl.send(proto.WebextSet{ .id = ext_id, .dir = ext_dir, .enabled = 1 });
         {
@@ -3828,7 +3785,6 @@ fn runWebextStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
         }
 
         cl.send(proto.ViewCreate{ .view = view_id, .w = 640, .h = 480, .scale_x1000 = 1000, .context = 0 });
-        cl.have_view = true;
         if (!cl.waitBufferAfter(0, 20_000)) fail("stage 33 webext: no frame_buffer for the page view");
         cl.resetTitle();
         cl.send(proto.Navigate{ .view = view_id, .url = page_url });
@@ -3845,7 +3801,6 @@ fn runWebextStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
         // is closed during the normal loop, not left for cef_shutdown.
         cl.send(proto.WebextRemove{ .id = ext_id });
         cl.send(proto.ViewDestroy{ .view = view_id });
-        cl.have_view = false;
         {
             const d = nowMs() + 2500;
             while (nowMs() < d) cl.pump(50);
@@ -3873,7 +3828,6 @@ fn runWebextStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
         if (cl.we_ok != 1) fail("stage 33 webext: extension failed to load on restart");
 
         cl.send(proto.ViewCreate{ .view = view_id, .w = 640, .h = 480, .scale_x1000 = 1000, .context = 0 });
-        cl.have_view = true;
         if (!cl.waitBufferAfter(0, 20_000)) fail("stage 33 webext: no frame_buffer on restart");
         cl.resetTitle();
         cl.send(proto.Navigate{ .view = view_id, .url = page_url });
@@ -3887,7 +3841,6 @@ fn runWebextStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
 
         cl.send(proto.WebextRemove{ .id = ext_id });
         cl.send(proto.ViewDestroy{ .view = view_id });
-        cl.have_view = false;
         {
             const d = nowMs() + 2500;
             while (nowMs() < d) cl.pump(50);
@@ -4145,7 +4098,7 @@ fn runActionStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
         const deadline = nowMs() + 15_000;
         while (cl.ack_proto == 0 and nowMs() < deadline) cl.pump(100);
     }
-    if (!cl.ack_webext_action) fail("stage 40: hello_ack lacks the webext-action capability");
+    if (!cl.acks(.webext_action)) fail("stage 40: hello_ack lacks the webext-action capability");
 
     const bad_set_before = cl.we_seq;
     cl.send(proto.WebextSet{ .id = "../bad", .dir = popup_dir, .enabled = 1 });
@@ -4167,7 +4120,6 @@ fn runActionStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
         fail("stage 40: overlong wire extension id was not rejected");
 
     cl.send(proto.ViewCreate{ .view = view_id, .w = 640, .h = 480, .scale_x1000 = 1000, .context = 0 });
-    cl.have_view = true;
     if (!cl.waitBufferAfter(0, 20_000)) fail("stage 40: no frame_buffer for the page view");
     cl.send(proto.Navigate{ .view = view_id, .url = page_url });
     cl.sendTabs(&.{.{ .id = 40, .view = view_id, .active = true, .url = page_url, .title = "action" }});
@@ -4567,7 +4519,6 @@ fn runActionStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
     cl.send(proto.WebextRemove{ .id = "missing@sketerm.test" });
     cl.send(proto.WebextRemove{ .id = "page@sketerm.test" });
     cl.send(proto.ViewDestroy{ .view = view_id });
-    cl.have_view = false;
     {
         const deadline = nowMs() + 2500;
         while (nowMs() < deadline) cl.pump(50);
@@ -4871,8 +4822,8 @@ fn runShapeStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) vo
         const d = nowMs() + 15_000;
         while (cl.ack_proto == 0 and nowMs() < d) cl.pump(100);
     }
-    if (!cl.ack_webext) fail("stage 35a: hello_ack lacks the webext capability");
-    if (!cl.ack_webext_tabs) fail("stage 35a: hello_ack lacks the webext-tabs capability");
+    if (!cl.acks(.webext)) fail("stage 35a: hello_ack lacks the webext capability");
+    if (!cl.acks(.webext_tabs)) fail("stage 35a: hello_ack lacks the webext-tabs capability");
 
     cl.send(proto.WebextSet{ .id = "shape@sketerm.test", .dir = ext_dir, .enabled = 1 });
     {
@@ -4889,7 +4840,6 @@ fn runShapeStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) vo
     }
 
     cl.send(proto.ViewCreate{ .view = view_id, .w = 640, .h = 480, .scale_x1000 = 1000, .context = 0 });
-    cl.have_view = true;
     if (!cl.waitBufferAfter(0, 20_000)) fail("stage 35a: no frame_buffer for the page view");
 
     // Publish a tab for the view BEFORE navigating: `sender.tab` is what
@@ -4918,7 +4868,6 @@ fn runShapeStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) vo
 
     cl.send(proto.WebextRemove{ .id = "shape@sketerm.test" });
     cl.send(proto.ViewDestroy{ .view = view_id });
-    cl.have_view = false;
     {
         const d = nowMs() + 2500;
         while (nowMs() < d) cl.pump(50);
@@ -5021,7 +4970,7 @@ fn runUboStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8, pinn
         const d = nowMs() + 15_000;
         while (cl.ack_proto == 0 and nowMs() < d) cl.pump(100);
     }
-    if (!cl.ack_webext) fail("stage 35b: hello_ack lacks the webext capability");
+    if (!cl.acks(.webext)) fail("stage 35b: hello_ack lacks the webext capability");
 
     cl.send(proto.WebextSet{ .id = ext_id, .dir = ext_dir, .enabled = 1 });
     {
@@ -5034,7 +4983,6 @@ fn runUboStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8, pinn
     }
 
     cl.send(proto.ViewCreate{ .view = view_id, .w = 800, .h = 600, .scale_x1000 = 1000, .context = 0 });
-    cl.have_view = true;
     if (!cl.waitBufferAfter(0, 20_000)) fail("stage 35b: no frame_buffer for the page view");
     // The tab's url must be CURRENT: it is what `documentUrl` reports
     // for every subresource, and uBO decides first-vs-third party from
@@ -5153,7 +5101,6 @@ fn runUboStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8, pinn
 
     cl.send(proto.WebextRemove{ .id = ext_id });
     cl.send(proto.ViewDestroy{ .view = view_id });
-    cl.have_view = false;
     {
         const d = nowMs() + 4000;
         while (nowMs() < d) cl.pump(50);
@@ -5357,10 +5304,9 @@ fn runFilterSubscriptionStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: [
         while (cl.ack_proto == 0 and nowMs() < deadline) cl.pump(100);
     }
     if (cl.ack_proto != proto.PROTO_VERSION) fail("stage 39: no hello_ack");
-    if (!cl.ack_filter_subscribe) fail("stage 39: fetching is disabled (no filter-subscribe capability)");
+    if (!cl.acks(.filter_subscribe)) fail("stage 39: fetching is disabled (no filter-subscribe capability)");
 
     cl.send(proto.ViewCreate{ .view = view_id, .w = 320, .h = 240, .scale_x1000 = 1000, .context = 0 });
-    cl.have_view = true;
     if (!cl.waitBufferAfter(0, 20_000)) fail("stage 39: no page view buffer");
 
     // The target must reach the server BEFORE subscription. This fails
@@ -5445,7 +5391,6 @@ fn runFilterSubscriptionStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: [
     cl.send(proto.InterceptSubscribe{ .update_hours = 1, .urls = &slow_urls });
     if (!waitHttpCount(&cl, &http.slow_hits, 1, 10_000)) fail("stage 39: slow teardown fetch never started");
     if (cl.sub_done_seq != seq) fail("stage 39: slow fetch completed before teardown could exercise cancellation");
-    cl.have_view = false;
     cl.deinit();
     reapHelperTimeout(pid, "stage 39 filter subscription", 15_000);
     pass("stage 39 filter subscription (fetch/reload, zero-hit block, rejected replacements, removal, teardown)");
@@ -5485,13 +5430,13 @@ fn runMultiClientStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const 
         while (a.ack_proto == 0 and nowMs() < d) a.pump(100);
     }
     if (a.ack_proto != proto.PROTO_VERSION) fail("stage mc1: client A got no hello_ack");
-    if (!a.ack_multi_client) fail("stage mc1: hello_ack lacks the multi-client capability");
+    if (!a.acks(.multi_client)) fail("stage mc1: hello_ack lacks the multi-client capability");
     // Negative control: a helper nobody started as a session client
     // must not present. This rig's helpers inherit the rig's own
     // WAYLAND_DISPLAY when there is one, and toplevels on the user's
     // desktop for every hidden view would be the bug the env flag exists
     // to prevent.
-    if (a.ack_presenter) fail("stage mc1: a helper started without SKETERM_WEB_PRESENTER advertised the presenter");
+    if (a.acks(.presenter)) fail("stage mc1: a helper started without SKETERM_WEB_PRESENTER advertised the presenter");
     var b = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
     b.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web-mc-b" });
     {
@@ -5508,9 +5453,7 @@ fn runMultiClientStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const 
     // BOTH clients mint view id 1. Each must get its own page and see
     // its title event under ITS id — the namespace round trip.
     a.send(proto.ViewCreate{ .view = 1, .w = 320, .h = 240, .scale_x1000 = 1000, .context = 0 });
-    a.have_view = true;
     b.send(proto.ViewCreate{ .view = 1, .w = 320, .h = 240, .scale_x1000 = 1000, .context = 0 });
-    b.have_view = true;
     a.send(proto.Navigate{ .view = 1, .url = alpha_page });
     b.send(proto.Navigate{ .view = 1, .url = beta_page });
     {
@@ -5620,7 +5563,6 @@ fn runMultiClientStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const 
     pass("stage mc4 a non-reading client does not stall the others");
 
     // ── mc5: engine survives A's death, exits with B's ────────────
-    a.have_view = false;
     a.deinit();
     // The engine must NOT exit: B is still there. Give the reap a
     // moment, then prove both liveness and B's continued service.
@@ -5634,7 +5576,6 @@ fn runMultiClientStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const 
     }
     b.send(proto.Navigate{ .view = 1, .url = beta_page });
     if (!b.waitTitle("mc:beta", 20_000)) fail("stage mc5: client B lost service when client A died");
-    b.have_view = false;
     b.deinit();
     reapHelperTimeout(pid, "stage mc5 last-client exit", 30_000);
     pass("stage mc5 engine survived one client's death and exited with the last");
@@ -5669,9 +5610,8 @@ fn runObserveStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) 
         while (a.ack_proto == 0 and nowMs() < d) a.pump(100);
     }
     if (a.ack_proto != proto.PROTO_VERSION) fail("stage ob1: client A got no hello_ack");
-    if (!a.ack_observe) fail("stage ob1: hello_ack lacks the observe capability");
+    if (!a.acks(.observe)) fail("stage ob1: hello_ack lacks the observe capability");
     a.send(proto.ViewCreate{ .view = 1, .w = 320, .h = 240, .scale_x1000 = 1000, .context = 0 });
-    a.have_view = true;
     a.send(proto.Navigate{ .view = 1, .url = alpha_page });
     if (!a.waitTitle("ob:alpha", 30_000)) fail("stage ob1: client A never saw its page title");
 
@@ -5706,7 +5646,6 @@ fn runObserveStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) 
 
     // ── ob2: subscribe read-only: seeded title + pixels under B's id ──
     b.send(proto.ObserveSubscribe{ .view = 1, .target = a_view1, .control = 0 });
-    b.have_view = true;
     {
         const d = nowMs() + 10_000;
         while (b.ost_seq == 0 and nowMs() < d) {
@@ -5952,7 +5891,6 @@ fn runObserveStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) 
     pass("stage ob6 the owner destroying a view ends the observer's subscription and only that one");
 
     // ── ob7: the observer leaves; the owner's view is intact ──────
-    b.have_view = false;
     b.deinit();
     _ = c.usleep(300_000);
     {
@@ -5964,7 +5902,6 @@ fn runObserveStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) 
     }
     a.send(proto.Navigate{ .view = 1, .url = gamma_page });
     if (!a.waitTitle("ob:gamma", 20_000)) fail("stage ob7: the owner's view did not survive the observer disconnecting");
-    a.have_view = false;
     a.deinit();
     reapHelperTimeout(pid, "stage ob7 last-client exit", 30_000);
     pass("stage ob7 an observer disconnecting leaves the owner's views intact");
@@ -6006,7 +5943,6 @@ fn openInProfile(cl: *Client, ctx_id: u32, url: []const u8, prefix: []const u8, 
     while (true) : (attempt += 1) {
         const fail_seq = cl.view_create_fail_seq;
         cl.send(proto.ViewCreate{ .view = 1, .w = 320, .h = 240, .scale_x1000 = 1000, .context = ctx_id });
-        cl.have_view = true;
         cl.send(proto.Navigate{ .view = 1, .url = url });
         const d = nowMs() + 20_000;
         var refused = false;
@@ -6021,7 +5957,6 @@ fn openInProfile(cl: *Client, ctx_id: u32, url: []const u8, prefix: []const u8, 
         if (!refused) fail(what ++ ": the page never reached its title");
         if (attempt >= 1) fail(what ++ ": browser create refused twice (bring-up not deterministic)");
         std.debug.print("smoke-web: NOTE {s}: browser create refused (\"{s}\"), retrying once\n", .{ what, cl.view_create_fail_reason[0..cl.view_create_fail_reason_len] });
-        cl.have_view = false;
         _ = c.usleep(1_000_000);
     }
 }
@@ -6059,7 +5994,7 @@ fn runFlushLingerStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const 
             while (a.ack_proto == 0 and nowMs() < d) a.pump(100);
         }
         if (a.ack_proto != proto.PROTO_VERSION) fail("stage fl1: no hello_ack");
-        if (!a.ack_flush) fail("stage fl1: hello_ack lacks the flush-store capability");
+        if (!a.acks(.flush)) fail("stage fl1: hello_ack lacks the flush-store capability");
         a.send(proto.ContextCreate{ .id = ctx_id, .ephemeral = 0, .name = "flushdemo", .proxy = "" });
         openInProfile(&a, ctx_id, set_url, "jarA:", "stage fl1");
         if (std.mem.indexOf(u8, a.titleSlice(), jar_cookie) == null)
@@ -6077,7 +6012,6 @@ fn runFlushLingerStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const 
         var status: c_int = 0;
         _ = c.waitpid(pid, &status, 0);
         g_pid = -1;
-        a.have_view = false;
         a.teardown_allow_close = true;
         a.deinit();
     }
@@ -6100,7 +6034,6 @@ fn runFlushLingerStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const 
             std.debug.print("smoke-web: post-kill title was \"{s}\"\n", .{b.titleSlice()});
             fail("stage fl2: the flushed cookie did not survive kill -9 (flush_store did not reach disk)");
         }
-        b.have_view = false;
         b.deinit();
         reapHelperTimeout(pid, "stage fl2 teardown", 30_000);
     }
@@ -6119,7 +6052,6 @@ fn runFlushLingerStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const 
         if (a.ack_proto != proto.PROTO_VERSION) fail("stage fl3: no hello_ack");
         a.send(proto.ContextCreate{ .id = ctx_id, .ephemeral = 0, .name = "flushdemo", .proxy = "" });
         openInProfile(&a, ctx_id, set_url, "jarA:", "stage fl3");
-        a.have_view = false;
         a.teardown_allow_close = true;
         a.deinit();
 
@@ -6143,7 +6075,6 @@ fn runFlushLingerStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const 
         openInProfile(&b, ctx_id, plain_url, "jarB:", "stage fl3 successor");
         if (std.mem.indexOf(u8, b.titleSlice(), jar_cookie) == null)
             fail("stage fl3: the successor did not see the lingering engine's live jar");
-        b.have_view = false;
         b.teardown_allow_close = true;
         b.deinit();
         break :blk pid;
@@ -6189,7 +6120,6 @@ fn runFlushLingerStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const 
         openInProfile(&d2, ctx_id, plain_url, "jarB:", "stage fl4");
         if (std.mem.indexOf(u8, d2.titleSlice(), jar_cookie) == null)
             fail("stage fl4: the TTL reap lost the jar (the reap was not the graceful path)");
-        d2.have_view = false;
         d2.deinit();
         reapHelperTimeout(pid, "stage fl4 teardown", 30_000);
     }
@@ -6341,7 +6271,7 @@ fn runCookieSyncStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u
     }
     if (a.ack_proto != proto.PROTO_VERSION or b.ack_proto != proto.PROTO_VERSION)
         fail("stage 42 cookie sync: one of the two helpers never answered hello");
-    if (!a.ack_cookie_sync or !b.ack_cookie_sync)
+    if (!a.acks(.cookie_sync) or !b.acks(.cookie_sync))
         fail("stage 42 cookie sync: hello_ack lacks the cookie-sync capability");
 
     var http = HttpProbe{ .cookie_router = true };
@@ -6351,7 +6281,6 @@ fn runCookieSyncStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u
     a.send(proto.CookieSyncEnable{ .enable = 1 });
     b.send(proto.CookieSyncEnable{ .enable = 1 });
     a.send(proto.ViewCreate{ .view = sync_view_a, .w = 320, .h = 240, .scale_x1000 = 1000, .context = 0 });
-    a.have_view = true;
 
     // ── 41a: a Set-Cookie response header in A ────────────────────
     var url_buf: [96]u8 = undefined;
@@ -6661,7 +6590,6 @@ fn runCookieSyncStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u
     a.send(proto.CookieSyncEnable{ .enable = 0 });
     b.send(proto.CookieSyncEnable{ .enable = 0 });
     a.send(proto.ViewDestroy{ .view = sync_view_a });
-    a.have_view = false;
     a.teardown_allow_close = true;
     b.teardown_allow_close = true;
     {
@@ -6760,16 +6688,15 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         while (cl.ack_proto == 0 and nowMs() < deadline) cl.pump(100);
     }
     if (cl.ack_proto != proto.PROTO_VERSION) fail("stage 1 handshake: no hello_ack with proto 1");
-    if (!cl.ack_shm) fail("stage 1 handshake: hello_ack lacks the frames-shm capability");
-    if (!cl.ack_tls) fail("stage 1 handshake: hello_ack lacks the tls capability");
-    if (!cl.ack_permissions) fail("stage 1 handshake: hello_ack lacks the permissions capability");
-    if (!cl.ack_reader_ids) fail("stage 1 handshake: hello_ack lacks the reader-ids capability");
-    if (!cl.ack_semantic_request_ids) fail("stage 1 handshake: hello_ack lacks semantic request ids");
+    if (!cl.acks(.frames_shm)) fail("stage 1 handshake: hello_ack lacks the frames-shm capability");
+    if (!cl.acks(.tls)) fail("stage 1 handshake: hello_ack lacks the tls capability");
+    if (!cl.acks(.permissions)) fail("stage 1 handshake: hello_ack lacks the permissions capability");
+    if (!cl.acks(.reader_ids)) fail("stage 1 handshake: hello_ack lacks the reader-ids capability");
+    if (!cl.acks(.semantic_request_ids)) fail("stage 1 handshake: hello_ack lacks semantic request ids");
     pass("stage 1 handshake");
 
     // ── Stage 2: paint into the shared memfd ──────────────────────
     cl.send(proto.ViewCreate{ .view = view_id, .w = 800, .h = 600, .scale_x1000 = 1000, .context = 0 });
-    cl.have_view = true;
     if (!cl.waitBufferAfter(0, 20_000)) fail("stage 2 paint: no frame_buffer for the new view");
     if (cl.fb.?.w != 800 or cl.fb.?.h != 600) fail("stage 2 paint: frame_buffer geometry is not 800x600");
     cl.navigate(red_page);
@@ -6815,7 +6742,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             fail("stage 3b SPA: trusted semantic click failed");
         if (!cl.waitTitle("spa:trusted=true:/learn", 15_000))
             fail("stage 3b SPA: the trusted route transition did not finish");
-        _ = cl.drive(2_000, 120);
+        _ = cl.drive(2_000, 0);
         const path = cl.evalWait("location.pathname", false, 15_000);
         if (std.mem.indexOf(u8, path, "/learn") == null)
             fail("stage 3b SPA: helper survived but lost the soft-navigation route");
@@ -6930,7 +6857,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         var tries: u8 = 0;
         while (tries < 5 and !cl.sawPopup("example.invalid")) : (tries += 1) {
             cl.clickCenter();
-            _ = cl.drive(400, 120);
+            _ = cl.drive(400, 0);
         }
     }
     if (!cl.waitPopup("example.invalid", 15_000)) fail("stage 6 popup: no ev_popup_request for the opened url");
@@ -6954,7 +6881,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     cl.popup_gesture = 0xff;
     cl.popup_len = 0;
     cl.navigate(popup_auto_page);
-    _ = cl.drive(3000, 120);
+    _ = cl.drive(3000, 0);
     if (cl.sawPopup("auto.invalid")) fail("stage 6b popup: the engine forwarded a gestureless window.open");
     pass("stage 6b gestureless popup (never reaches the client)");
 
@@ -6991,7 +6918,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             var tries: u8 = 0;
             while (tries < 5 and !std.mem.startsWith(u8, cl.titleSlice(), "opened:")) : (tries += 1) {
                 cl.clickCenter();
-                _ = cl.drive(400, 120);
+                _ = cl.drive(400, 0);
             }
         }
         if (!cl.waitTitle("opened:handle:popup", 15_000)) {
@@ -7041,7 +6968,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             var tries: u8 = 0;
             while (tries < 5 and !std.mem.startsWith(u8, cl.titleSlice(), "opened:")) : (tries += 1) {
                 cl.clickCenter();
-                _ = cl.drive(400, 120);
+                _ = cl.drive(400, 0);
             }
         }
         if (!cl.waitTitle("opened:handle:plain", 15_000)) fail("stage 6d popup: a featureless window.open did not answer a handle");
@@ -7054,7 +6981,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         if (cl.pp_view == popup_view_1) fail("stage 6d popup: the second popup reused the first popup's view id");
         // The client retires it, the way a user closing the tab does.
         cl.send(proto.ViewDestroy{ .view = cl.pp_view });
-        _ = cl.drive(500, 120);
+        _ = cl.drive(500, 0);
         pass("stage 6d featureless popup (chromeless = 0)");
 
         // ── Stage 6e: BLOCK mode cancels and reports the request ─────
@@ -7068,13 +6995,13 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             var tries: u8 = 0;
             while (tries < 5 and !cl.sawPopup("127.0.0.1")) : (tries += 1) {
                 cl.clickCenter();
-                _ = cl.drive(400, 120);
+                _ = cl.drive(400, 0);
             }
         }
         if (!cl.waitPopup("127.0.0.1", 15_000)) fail("stage 6e popup: BLOCK mode posted no ev_popup_request");
         if (cl.popup_view != view_id) fail("stage 6e popup: ev_popup_request named the wrong opener");
         if (cl.popup_gesture != 1) fail("stage 6e popup: the blocked request lost its user gesture");
-        _ = cl.drive(1000, 120);
+        _ = cl.drive(1000, 0);
         if (cl.pp_opened_seq != 2) fail("stage 6e popup: BLOCK mode still opened a real popup");
         pass("stage 6e block mode (cancelled, reported as ev_popup_request)");
 
@@ -7093,7 +7020,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     pass("stage 7 nav_action back");
 
     // ── Stage 8: semantic snapshot, ids stable across two requests ─
-    if (!cl.ack_semantic) fail("stage 8 semantic: hello_ack lacks the semantic capability");
+    if (!cl.acks(.semantic)) fail("stage 8 semantic: hello_ack lacks the semantic capability");
     cl.navigate(form_page);
     cl.resetSem();
     cl.snapshot(1, 1);
@@ -7516,7 +7443,6 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     }
     pass("stage 41 reader ids correlate overlap, refuse stale, and recover navigation/stop races");
     if (c.getenv("SKETERM_SMOKE_WEB_READER_ONLY") != null) {
-        cl.have_view = false;
         cl.send(proto.ViewDestroy{ .view = view_id });
         cl.deinit();
         reapHelperTimeout(pid, "reader-only teardown", 15_000);
@@ -7915,7 +7841,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
     // ── Stage 18: HiDPI — physical buffer, logical input ────────────
     //
-    // The scale contract in docs/proposal-browser-protocol.md: w/h on
+    // The scale contract (`protocol.ViewCreate`): w/h on
     // the wire stay LOGICAL, the announced buffer is
     // ceil(logical * scale), and the ENGINE must actually paint into
     // all of it. v1 pinned the scale to 1000 precisely because a
@@ -7989,33 +7915,29 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
     // ── Stage 19: paints above the old 60fps ceiling ───────────────
     //
-    // CEF's windowless scheduler clamps `windowless_frame_rate` at 60,
-    // which is what external begin frames replace. Driving requests
-    // faster than that has to produce paints faster than that, or the
-    // whole change bought nothing.
+    // CEF's windowless scheduler defaults `windowless_frame_rate` to 60;
+    // the helper raises it (240, clamped by `view_max_fps`), so an
+    // animating page has to paint faster than that on its own.
     {
         cl.navigate(anim_page);
-        _ = cl.drive(500, 240); // let the animation get going
-        const hot = cl.drive(2000, 240);
-        const req_fps = @divTrunc(@as(i64, hot.requests) * 1000, @max(hot.ms, 1));
+        _ = cl.drive(500, 0); // let the animation get going
+        const hot = cl.drive(2000, 0);
         const paint_fps = @divTrunc(@as(i64, hot.paints) * 1000, @max(hot.ms, 1));
         std.debug.print(
-            "smoke-web: MEASURED uncapped: {d} begin-frames ({d}/s), {d} paints ({d}/s) over {d} ms\n",
-            .{ hot.requests, req_fps, hot.paints, paint_fps, hot.ms },
+            "smoke-web: MEASURED uncapped: {d} paints ({d}/s) over {d} ms\n",
+            .{ hot.paints, paint_fps, hot.ms },
         );
-        if (req_fps <= 60) fail("stage 19 fps: the rig itself never drove above 60 begin-frames/s");
         if (paint_fps <= 65) fail("stage 19 fps: paints did not exceed the old 60fps windowless ceiling");
 
         // ... and the cap is honoured: `view_max_fps 30` must hold the
-        // engine's scheduler to ~30 paints/s however hard the client
-        // drives requests.
+        // engine's scheduler to ~30 paints/s.
         cl.send(proto.ViewMaxFps{ .view = view_id, .fps = 30 });
-        _ = cl.drive(300, 240); // let the new rate land
-        const capped = cl.drive(2000, 240);
+        _ = cl.drive(300, 0); // let the new rate land
+        const capped = cl.drive(2000, 0);
         const cap_fps = @divTrunc(@as(i64, capped.paints) * 1000, @max(capped.ms, 1));
         std.debug.print(
-            "smoke-web: MEASURED capped at 30: {d} begin-frames, {d} paints ({d}/s) over {d} ms\n",
-            .{ capped.requests, capped.paints, cap_fps, capped.ms },
+            "smoke-web: MEASURED capped at 30: {d} paints ({d}/s) over {d} ms\n",
+            .{ capped.paints, cap_fps, capped.ms },
         );
         if (cap_fps < 20 or cap_fps > 40) fail("stage 19 fps: view_max_fps 30 did not produce ~30 paints/s");
         cl.send(proto.ViewMaxFps{ .view = view_id, .fps = 0 });
@@ -8024,21 +7946,22 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
     // ── Stage 20: an idle page paints nothing ──────────────────────
     //
-    // The other half of the deal: asking for frames is not the same as
-    // producing them, so a page with nothing to show must cost zero
-    // paints no matter how hard it is driven.
+    // The other half of the deal: a page with nothing to show costs zero
+    // paints, even under an OLDER client that still sends the retired
+    // `frame_request` at 120/s (the helper accepts and ignores it).
     {
         cl.navigate(static_page);
-        _ = cl.drive(1000, 120); // let the load's own paints finish
+        _ = cl.drive(1000, 0); // let the load's own paints finish
         const quiet = cl.drive(3000, 120);
         std.debug.print(
-            "smoke-web: MEASURED static page: {d} begin-frames, {d} paints over {d} ms\n",
+            "smoke-web: MEASURED static page: {d} old-client frame_requests, {d} paints over {d} ms\n",
             .{ quiet.requests, quiet.paints, quiet.ms },
         );
-        if (quiet.requests < 200) fail("stage 20 idle: the rig did not actually drive frames");
+        if (quiet.requests < 200) fail("stage 20 idle: the rig did not actually send the old client's requests");
         if (quiet.paints != 0) fail("stage 20 idle: a static page painted while nothing changed");
+        if (cl.fd < 0) fail("stage 20 idle: an old client's frame_request cost it the connection");
     }
-    pass("stage 20 idle page (hundreds of begin-frames, zero paints)");
+    pass("stage 20 idle page (zero paints, an old client's frame_requests ignored)");
 
     // ── Stage 21: no client, page still alive — and boundable ──────
     //
@@ -8048,7 +7971,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // lever the GUI would use on a view it cannot present.
     {
         cl.navigate(anim_page);
-        _ = cl.drive(300, 120);
+        _ = cl.drive(300, 0);
         const abandoned = cl.drive(1500, 0);
         std.debug.print(
             "smoke-web: MEASURED unattended: {d} paints in {d} ms with ZERO client requests\n",
@@ -8071,9 +7994,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // ── Stage 22: input paints immediately ─────────────────────────
     {
         cl.navigate(click_paint_page);
-        _ = cl.drive(700, 120);
-        const settled = cl.drive(300, 120);
-        if (settled.paints != 0) fail("stage 22 promotion: the probe page was not quiet before the click");
+        _ = cl.drive(700, 0);
+        const settled = cl.drive(300, 0);
+        if (settled.paints != 0) fail("stage 22 input: the probe page was not quiet before the click");
 
         const before = cl.dmg_seq;
         const t0 = nowMs();
@@ -8081,18 +8004,17 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         cl.clickCenter();
         var latency: i64 = -1;
         while (nowMs() - t0 < 2000) {
-            cl.frameRequest(8_000);
             _ = cl.pumpRaw(1);
             if (cl.dmg_seq > before) {
                 latency = nowMs() - t0;
                 break;
             }
         }
-        if (latency < 0) fail("stage 22 promotion: a click on a static page produced no paint");
+        if (latency < 0) fail("stage 22 input: a click on a static page produced no paint");
         std.debug.print("smoke-web: MEASURED click-to-paint latency: {d} ms\n", .{latency});
-        if (latency > 150) fail("stage 22 promotion: the paint after a click took more than 150 ms");
+        if (latency > 150) fail("stage 22 input: the paint after a click took more than 150 ms");
     }
-    pass("stage 22 input promotion (click paints within a frame or two)");
+    pass("stage 22 input paints (a click paints within a frame or two)");
 
     // ── Stage 22b: a view created AT a url mints ONE document ──────
     //
@@ -8103,7 +8025,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // (capability `view-create-url`) removes the blank document
     // instead of asking every client to see past it.
     {
-        if (!cl.ack_view_url) fail("stage 22b: hello_ack lacks the view-create-url capability");
+        if (!cl.acks(.view_create_url)) fail("stage 22b: hello_ack lacks the view-create-url capability");
         // View 1 was created blank at stage 2: the contrast this stage
         // exists for has to be REAL, not assumed.
         if (cl.blank_load_seq == 0) fail("stage 22b: no blank load was ever seen (the contrast is not being measured)");
@@ -8178,7 +8100,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // must report it. No network is touched: the request is cancelled
     // at on_before_resource_load, before it ever leaves the process.
     {
-        if (!cl.ack_intercept) fail("stage 22d: hello_ack lacks the intercept capability");
+        if (!cl.acks(.intercept)) fail("stage 22d: hello_ack lacks the intercept capability");
         cl.navigate(blocked_img_page);
         if (!cl.waitBlocked(1, 20_000)) {
             std.debug.print("smoke-web: intercept status blocked={d} total={d} rules={d}\n", .{ cl.int_blocked, cl.int_total, cl.int_rules });
@@ -8277,7 +8199,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // a matching page and mutate the DOM; an empty replace-all set
     // must clear it so the next navigation runs nothing.
     {
-        if (!cl.ack_userscripts) fail("stage 29: hello_ack lacks the userscripts capability");
+        if (!cl.acks(.userscripts)) fail("stage 29: hello_ack lacks the userscripts capability");
         const scripts = [_]proto.UsScript{.{ .id = 1, .source = .{ .s = usc_source } }};
         cl.send(proto.UsScriptSet{ .scripts = &scripts });
         cl.navigate(usc_page_a);
@@ -8357,7 +8279,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // rather than left hanging, and the next `view_show` produces a
     // fresh frame buffer plus the same page again.
     {
-        if (!cl.ack_discard) fail("stage 22e: hello_ack lacks the discard capability");
+        if (!cl.acks(.discard)) fail("stage 22e: hello_ack lacks the discard capability");
         cl.resetTitle();
         const fb_before = cl.fb_seq;
         cl.send(proto.ViewCreateUrl{
@@ -8425,7 +8347,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // done event for a file that never appeared would be the whole bug
     // this stage exists to catch.
     {
-        if (!cl.ack_print_pdf) fail("stage 22h print_pdf: hello_ack lacks the print-pdf capability");
+        if (!cl.acks(.print_pdf)) fail("stage 22h print_pdf: hello_ack lacks the print-pdf capability");
         cl.navigate(article_page);
         var pdf_buf: [128]u8 = undefined;
         const pdf = std.fmt.bufPrintZ(&pdf_buf, "{s}/page.pdf", .{dir}) catch fail("pdf path");
@@ -8451,6 +8373,31 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         const size = c.ftell(f);
         if (size < 1000) fail("stage 22h print_pdf: the PDF is too small to hold a rendered page");
         std.debug.print("smoke-web: MEASURED pdf {d} bytes\n", .{size});
+        if (cl.print_staged_len != 0) fail("stage 22h print_pdf: an unstaged print reported a staged path");
+
+        // STAGED (print-pdf-staging): the request path is only the
+        // correlation key; the helper prints into a private file of its
+        // own and names it, which is how a client on another host gets
+        // the PDF. Nothing may appear at the request path.
+        if (!cl.acks(.print_pdf_staging)) fail("stage 22h print_pdf: hello_ack lacks the print-pdf-staging capability");
+        var key_buf: [128]u8 = undefined;
+        const key = std.fmt.bufPrintZ(&key_buf, "{s}/staged-key.pdf", .{dir}) catch fail("pdf key path");
+        const staged_seq = cl.print_seq;
+        cl.send(proto.PrintPdf{ .view = view_id, .flags = proto.print_flag_background, .paper = 0, .path = key, .stage = 1 });
+        if (!cl.waitSeq(&cl.print_seq, staged_seq, 30_000)) fail("stage 22h print_pdf: no answer to a staged print");
+        if (cl.print_ok != 1) fail("stage 22h print_pdf: the staged print failed");
+        if (!std.mem.eql(u8, cl.print_path[0..cl.print_path_len], key))
+            fail("stage 22h print_pdf: the staged answer did not echo the correlation key");
+        if (cl.print_staged_len == 0) fail("stage 22h print_pdf: a staged print named no staged file");
+        if (c.access(key.ptr, c.F_OK) == 0) fail("stage 22h print_pdf: a staged print wrote the request path too");
+        {
+            const sf = c.fopen(@ptrCast(&cl.print_staged), "rb") orelse fail("stage 22h print_pdf: the staged file does not exist");
+            defer _ = c.fclose(sf);
+            var shead: [5]u8 = @splat(0);
+            if (c.fread(&shead, 1, shead.len, sf) != shead.len or !std.mem.eql(u8, &shead, "%PDF-"))
+                fail("stage 22h print_pdf: the staged file is not a PDF");
+        }
+        _ = c.unlink(@ptrCast(&cl.print_staged));
 
         // A path nothing can write must come back as a FAILED print,
         // not as silence: a client waiting on a save would hang.
@@ -8492,7 +8439,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // Either way the client is ANSWERED, which is the property that
     // keeps a GUI from waiting forever on a menu item.
     {
-        if (!cl.ack_devtools) fail("stage 22i devtools: hello_ack lacks the devtools capability");
+        if (!cl.acks(.devtools)) fail("stage 22i devtools: hello_ack lacks the devtools capability");
         cl.navigate(form_page);
         const seq = cl.dev_reply_seq;
         cl.send(proto.DevToolsShow{ .view = view_id, .x = 0, .y = 0 });
@@ -8594,7 +8541,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // cancels with a terminal `failed` frame — the "always answered"
     // property every held decision on this wire keeps.
     {
-        if (!cl.ack_downloads) fail("stage 22j downloads: hello_ack lacks the downloads capability");
+        if (!cl.acks(.downloads)) fail("stage 22j downloads: hello_ack lacks the downloads capability");
 
         // -- accept ----------------------------------------------------
         cl.navigate(download_page);
@@ -8637,7 +8584,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             var tries: u8 = 0;
             while (tries < 5 and cl.dl_offer_seq == offer1) : (tries += 1) {
                 cl.clickCenter();
-                _ = cl.drive(400, 120);
+                _ = cl.drive(400, 0);
             }
         }
         if (!cl.waitSeq(&cl.dl_offer_seq, offer1, 20_000))
@@ -8669,7 +8616,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // deadline: that silence is exactly how "download this" reported
     // success and wrote nothing.
     {
-        if (!cl.ack_download_start) fail("stage 22j2: hello_ack lacks the download-start capability");
+        if (!cl.acks(.download_start)) fail("stage 22j2: hello_ack lacks the download-start capability");
         cl.navigate(blue_page);
         const offer0 = cl.dl_offer_seq;
         const ASKED_REQ: u32 = 4242;
@@ -8729,7 +8676,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     pass("stage 22j3 staged download reports a private helper path and delivers exact bytes");
     // ── Stage 22j: the accessibility tree, only on demand ──────────
     {
-        if (!cl.ack_a11y) fail("stage 22k a11y: hello_ack lacks the a11y capability");
+        if (!cl.acks(.a11y)) fail("stage 22k a11y: hello_ack lacks the a11y capability");
         const ax_page = "data:text/html,<html><body style='background:%23fff'>" ++
             "<h1>Axheading</h1><button>Axgo</button>" ++
             "<input type=checkbox checked aria-label=Axcheck>" ++
@@ -8794,7 +8741,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     //      on every update, so an uncoalesced caret would post a frame
     //      per unrelated tree change.
     {
-        if (!cl.ack_a11y_caret) fail("stage 36 a11y: hello_ack lacks the a11y-caret capability");
+        if (!cl.acks(.a11y_caret)) fail("stage 36 a11y: hello_ack lacks the a11y-caret capability");
         const page = "data:text/html,<html><body style='background:%23fff;margin:0'>" ++
             "<button id=b style='position:absolute;left:40px;top:60px;width:140px;height:44px'>Axpress</button>" ++
             "<input id=t style='position:absolute;left:40px;top:160px;width:240px' value='Axcaret text'>" ++
@@ -8936,7 +8883,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // value), a clear that removes it, and an enumeration that then
     // finds nothing. The `sitedata` capability gates all of it.
     {
-        if (!cl.ack_sitedata) fail("stage 31 site data: hello_ack lacks the sitedata capability");
+        if (!cl.acks(.sitedata)) fail("stage 31 site data: hello_ack lacks the sitedata capability");
         var http = HttpProbe{};
         if (!http.start()) fail("stage 31 site data: could not start the loopback http probe");
         defer http.shutdown();
@@ -9030,7 +8977,6 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     }
 
     // ── Stage 23: teardown ────────────────────────────────────────
-    cl.have_view = false;
     cl.send(proto.ViewDestroy{ .view = view_id });
     cl.deinit();
     {
@@ -9064,19 +9010,18 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             while (gc.ack_proto == 0 and nowMs() < deadline) gc.pump(100);
         }
         if (gc.ack_proto != proto.PROTO_VERSION) fail("stage 24 gpu: no hello_ack from the auto-mode helper");
-        if (!gc.ack_shm) fail("stage 24 gpu: frames-shm must stay advertised even in GPU mode");
+        if (!gc.acks(.frames_shm)) fail("stage 24 gpu: frames-shm must stay advertised even in GPU mode");
 
         // 640x480 logical at 1.5 = 960x720 physical, which is also the
         // scale contract the GPU path has to reproduce THROUGH a
         // different mechanism (browser zoom instead of the screen
         // info's device scale factor).
         gc.send(proto.ViewCreate{ .view = view_id, .w = 640, .h = 480, .scale_x1000 = 1500, .context = 0 });
-        gc.have_view = true;
         gc.send(proto.Navigate{ .view = view_id, .url = anim_page });
-        _ = gc.drive(3000, 120);
-        const run = gc.drive(2000, 120);
+        _ = gc.drive(3000, 0);
+        const run = gc.drive(2000, 0);
 
-        if (gc.ack_dmabuf) {
+        if (gc.acks(.frames_dmabuf)) {
             std.debug.print(
                 "smoke-web: MEASURED gpu mode: {d} dma-buf frames, {d} memfd frames, {d} distinct pool buffers, fourcc 0x{x} modifier 0x{x} planes {d}\n",
                 .{ gc.dma_seq, gc.dmg_seq, gc.dma_nids, gc.dma.?.fourcc, gc.dma.?.modifier, gc.dma.?.nplanes },
@@ -9105,7 +9050,6 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             if (gc.fb.?.w != 960 or gc.fb.?.h != 720) fail("stage 24 gpu: the fallback buffer is not physical");
             pass("stage 24 gpu frames (no GPU available: automatic software fallback, memfd frames)");
         }
-        gc.have_view = false;
         gc.send(proto.ViewDestroy{ .view = view_id });
         gc.deinit();
         reapHelper(gpu_pid, "stage 24 gpu");
@@ -9128,19 +9072,21 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             while (sc.ack_proto == 0 and nowMs() < deadline) sc.pump(100);
         }
         if (sc.ack_proto != proto.PROTO_VERSION) fail("stage 25 forced software: no hello_ack");
-        if (sc.ack_dmabuf) fail("stage 25 forced software: frames-dmabuf advertised despite SKETERM_WEB_GPU=0");
+        if (sc.acks(.frames_dmabuf)) fail("stage 25 forced software: frames-dmabuf advertised despite SKETERM_WEB_GPU=0");
         sc.send(proto.ViewCreate{ .view = view_id, .w = 320, .h = 240, .scale_x1000 = 1000, .context = 0 });
-        sc.have_view = true;
         sc.send(proto.Navigate{ .view = view_id, .url = red_page });
-        const run = sc.drive(4000, 120);
+        const run = sc.drive(4000, 0);
         if (sc.dma_seq != 0) fail("stage 25 forced software: a dma-buf frame arrived anyway");
         if (run.paints == 0 or sc.fb == null) fail("stage 25 forced software: nothing painted into a memfd");
         pass("stage 25 forced software (no capability, no GPU frames, memfd path intact)");
-        sc.have_view = false;
         sc.send(proto.ViewDestroy{ .view = view_id });
         sc.deinit();
         reapHelper(sw_pid, "stage 25 forced software");
     }
+
+    // The routed half of stage 26w, compared against its direct control
+    // in the stage-27 negative-control block.
+    var routed_ice: IceCount = .{ .total = 0, .udp = 0 };
 
     // ── Stages 26/27: route instances ────────────────────────────
     //
@@ -9175,8 +9121,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             while (ec.ack_proto == 0 and nowMs() < deadline) ec.pump(100);
         }
         if (ec.ack_proto != proto.PROTO_VERSION) fail("stage 26 route: no hello_ack from the routed helper");
-        if (!ec.ack_contexts) fail("stage 26 route: hello_ack lacks the contexts capability");
-        if (!ec.ack_contexts_fail_closed) fail("stage 26 route: hello_ack lacks the contexts-fail-closed capability");
+        if (!ec.acks(.contexts)) fail("stage 26 route: hello_ack lacks the contexts capability");
+        if (!ec.acks(.contexts_fail_closed)) fail("stage 26 route: hello_ack lacks the contexts-fail-closed capability");
 
         // A nonzero context that was never created must not resolve to the
         // global context. The helper reports only this view's failure and
@@ -9222,6 +9168,17 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             fail("stage 26 route: a container view of a routed instance never reached the instance proxy");
         pass("stage 26 route (container view egresses through the instance proxy; a context-level proxy never overrides the route)");
 
+        // Stage 26w: WebRTC stays inside the route. A SOCKS5 proxy
+        // carries no UDP, so under `disable_non_proxied_udp` a page on a
+        // routed instance gathers no UDP candidate at all, where the
+        // direct control below gathers its host candidates: the real
+        // address never leaks over ICE.
+        ec.send(proto.ViewCreate{ .view = webrtc_routed_view, .w = 320, .h = 240, .scale_x1000 = 1000, .context = 0 });
+        routed_ice = iceProbe(&ec, webrtc_routed_view, "stage 26w webrtc");
+        std.debug.print("smoke-web: MEASURED routed ICE: {d} candidates, {d} udp\n", .{ routed_ice.total, routed_ice.udp });
+        if (routed_ice.udp != 0) fail("stage 26w webrtc: a routed instance gathered UDP candidates (the real address leaks around the proxy)");
+        ec.send(proto.ViewDestroy{ .view = webrtc_routed_view });
+
         // Stage 27: a SECOND routed instance on another proxy, with the
         // SAME container id: each instance's view leaves through its own
         // proxy and no other — isolation is per instance, which is what
@@ -9259,11 +9216,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         // last client goes away is the shape this stage has to unwind
         // cleanly, and the strict reap below is what proves it did.
         eb.send(proto.ViewDestroy{ .view = egress_view_c });
-        eb.have_view = false;
         eb.teardown_allow_close = true;
         ec.send(proto.ViewDestroy{ .view = egress_view_a });
         ec.send(proto.ViewDestroy{ .view = egress_view_b });
-        ec.have_view = false;
         ec.teardown_allow_close = true;
         {
             const d = nowMs() + 4000;
@@ -9315,7 +9270,6 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         if (dc.ack_proto != proto.PROTO_VERSION) fail("stage 27 negative control: no hello_ack");
         dc.send(proto.ContextCreate{ .id = 14, .ephemeral = 1, .name = "ctx-proxy-only", .proxy = url_c });
         dc.send(proto.ViewCreate{ .view = egress_direct_view, .w = 320, .h = 240, .scale_x1000 = 1000, .context = 14 });
-        dc.have_view = true;
         // The host does not resolve, so a direct navigation ends in a
         // load error; that (or a load, or 6s) is the bound the probe is
         // held against.
@@ -9331,16 +9285,29 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             fail("stage 27 negative control: a context-level proxy routed traffic on a direct instance");
         }
         pass("stage 27 negative control (a context-level proxy alone routes nothing: the route is the instance)");
-        dc.have_view = false;
         dc.send(proto.ViewDestroy{ .view = egress_direct_view });
+
+        // The control half of stage 26w: the same probe on a DIRECT
+        // instance gathers host candidates over UDP, so the routed zero
+        // above is the policy and not a host without interfaces.
+        dc.send(proto.ViewCreate{ .view = webrtc_direct_view, .w = 320, .h = 240, .scale_x1000 = 1000, .context = 0 });
+        const direct_ice = iceProbe(&dc, webrtc_direct_view, "stage 26w webrtc control");
+        std.debug.print("smoke-web: MEASURED direct ICE: {d} candidates, {d} udp\n", .{ direct_ice.total, direct_ice.udp });
+        if (direct_ice.udp == 0) fail("stage 26w webrtc: the direct control gathered no UDP candidate, so the routed result proves nothing on this host");
+        pass("stage 26w webrtc (a routed instance gathers no UDP candidate; the direct control does)");
+        dc.send(proto.ViewDestroy{ .view = webrtc_direct_view });
         dc.deinit();
         reapHelper(d_pid, "stage 27 negative control");
     }
 
-    // An instance whose route proxy is refused on a container context
-    // rolls that context back before it enters the registry. The
-    // immediately following view therefore fails exactly like any other
-    // missing context and never gets a buffer.
+    // An instance whose route proxy the engine refuses FAILS CLOSED:
+    // the refusal of the GLOBAL context at install ends its service, so
+    // the client is told right after the handshake (`ev_route_refused`),
+    // a container context is rolled back, and every view, the
+    // un-containered one on the global context included, is refused
+    // with the route's sentence and never gets a buffer. Before this a
+    // refused global proxy only logged, and a context-0 tab browsed
+    // direct under a Tor label.
     {
         var sock_fail_buf: [96]u8 = undefined;
         const sock_fail = std.fmt.bufPrintZ(&sock_fail_buf, "{s}/xf.sock", .{dir}) catch fail("socket path");
@@ -9356,8 +9323,19 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             const deadline = nowMs() + 20_000;
             while (fc.ack_proto == 0 and nowMs() < deadline) fc.pump(100);
         }
-        if (!fc.ack_contexts or !fc.ack_contexts_fail_closed)
+        if (!fc.acks(.contexts) or !fc.acks(.contexts_fail_closed))
             fail("stage 26 proxy refusal: helper lacks strict context support");
+        if (!fc.waitSeq(&fc.route_refused_seq, 0, 10_000))
+            fail("stage 26 proxy refusal: the refused route instance never said so after the handshake");
+        // The context-0 view: the one that used to leak direct.
+        fc.send(proto.ViewCreate{ .view = egress_global_fail_view, .w = 320, .h = 240, .scale_x1000 = 1000, .context = 0 });
+        if (!fc.waitSeq(&fc.view_create_fail_seq, 0, 10_000))
+            fail("stage 26 proxy refusal: a context-0 view of a refused route instance was created");
+        if (fc.view_create_fail_view != egress_global_fail_view)
+            fail("stage 26 proxy refusal: the context-0 refusal named the wrong view");
+        if (std.mem.indexOf(u8, fc.view_create_fail_reason[0..fc.view_create_fail_reason_len], "route") == null)
+            fail("stage 26 proxy refusal: the context-0 refusal does not say it is the route");
+        const ctx_fail_seq = fc.view_create_fail_seq;
         fc.send(proto.ContextCreate{
             .id = 13,
             .ephemeral = 1,
@@ -9371,13 +9349,13 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             .scale_x1000 = 1000,
             .context = 13,
         });
-        if (!fc.waitSeq(&fc.view_create_fail_seq, 0, 10_000))
+        if (!fc.waitSeq(&fc.view_create_fail_seq, ctx_fail_seq, 10_000))
             fail("stage 26 proxy refusal: the view did not report creation failure");
         if (fc.view_create_fail_view != egress_proxy_fail_view or fc.view_create_fail_context != 13)
             fail("stage 26 proxy refusal: the failure named the wrong view or context");
         if (fc.fb_seq != 0 or fc.dma_seq != 0 or fc.inline_seq != 0)
             fail("stage 26 proxy refusal: a failed egress view still received a frame buffer");
-        pass("stage 26 proxy refusal (instance proxy refused on a container context: rollback, view creation fails closed)");
+        pass("stage 26 proxy refusal (a refused route serves nothing: told after the handshake, context-0 and container views both refused, no buffer)");
         fc.deinit();
         reapHelper(fail_pid, "stage 26 proxy refusal");
     }
@@ -9411,8 +9389,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             while (jc.ack_proto == 0 and nowMs() < deadline) jc.pump(100);
         }
         if (jc.ack_proto != proto.PROTO_VERSION) fail("stage 37 jars: no hello_ack from the jar helper");
-        if (!jc.ack_contexts) fail("stage 37 jars: hello_ack lacks the contexts capability");
-        if (!jc.ack_sitedata) fail("stage 37 jars: hello_ack lacks the sitedata capability");
+        if (!jc.acks(.contexts)) fail("stage 37 jars: hello_ack lacks the contexts capability");
+        if (!jc.acks(.sitedata)) fail("stage 37 jars: hello_ack lacks the sitedata capability");
 
         var http = HttpProbe{ .body = jar_page };
         if (!http.start()) fail("stage 37 jars: could not start the loopback http probe");
@@ -9491,7 +9469,6 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
         jc.send(proto.ViewDestroy{ .view = jar_view_a });
         jc.send(proto.ViewDestroy{ .view = jar_view_b });
-        jc.have_view = false;
         jc.teardown_allow_close = true;
         {
             const d = nowMs() + 3000;
@@ -9616,12 +9593,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             while (rc.ack_proto == 0 and nowMs() < deadline) rc.pump(100);
         }
         if (rc.ack_proto != proto.PROTO_VERSION) fail("stage 32: no hello_ack over the bridge");
-        if (!rc.ack_frames_inline) fail("stage 32: hello_ack lacks the frames-inline capability");
+        if (!rc.acks(.frames_inline)) fail("stage 32: hello_ack lacks the frames-inline capability");
 
         // Paint: the red page must arrive as in-band pixels, with NO
         // memfd announcement and NO descriptor ever crossing.
         rc.send(proto.ViewCreate{ .view = view_id, .w = 320, .h = 240, .scale_x1000 = 1000, .context = 0 });
-        rc.have_view = true;
         rc.send(proto.Navigate{ .view = view_id, .url = red_page });
         if (!rc.waitInlineCenter(.{ 0, 0, 255 }, 30_000)) fail("stage 32: no red inline frame");
         if (rc.fb_seq != 0) fail("stage 32: a frame_buffer crossed the bridge (memfd family leaked through)");
@@ -9678,7 +9654,6 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         // Teardown: closing the protocol socket ends the channel; the
         // daemon kills the helper (it dies with the channel) and the
         // daemon itself goes by exact pid.
-        rc.have_view = false;
         rc.deinit(); // closes pair[0]; the bridge sees EOF and exits
         bridge.stop();
         mux.deinit();

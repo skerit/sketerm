@@ -41,7 +41,7 @@ const platform = @import("../util/platform.zig");
 
 /// The environment flag that arms the presenter. Set by webdrive for a
 /// session-mode helper; nothing else may set it.
-pub const ENV_FLAG = @import("protocol.zig").CAP_PRESENTER_ENV;
+pub const ENV_FLAG = @import("protocol.zig").PRESENTER_ENV;
 /// app_id of every presenter toplevel: the browser identity, so a
 /// viewer that adopts the window groups and icons it as sketerm-web.
 pub const APP_ID = "dev.sker.sketerm.web";
@@ -934,10 +934,6 @@ pub const Presenter = struct {
             _ = self.flushOut();
             return;
         }
-    }
-
-    pub fn surfaceCount(self: *const Presenter) usize {
-        return self.surfaces.items.len;
     }
 
     fn createSurface(self: *Presenter, view: u32, pw: u16, ph: u16, scale_x1000: u16) ?*Surface {

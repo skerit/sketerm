@@ -428,8 +428,12 @@ pub const Omnibox = struct {
     fn tabsSource(ctx: ?*anyopaque, q: []const u8, gpa: std.mem.Allocator, out: *std.ArrayList(suggest.Candidate)) void {
         const self: *Omnibox = @ptrCast(@alignCast(ctx.?));
         const arena = self.render_arena.allocator();
-        for (webface.openFaces()) |f| {
+        var faces = webface.ownFaces();
+        while (faces.next()) |f| {
             if (f == self.face or f.attached or f.widgets_dead) continue;
+            // A private tab is offered only to private tabs and never
+            // shows up in an ordinary tab's suggestions.
+            if (f.isPrivate() != self.face.isPrivate()) continue;
             const url = f.url orelse continue;
             const title: []const u8 = f.title orelse url;
             const score = suggest.fieldsScore(q, title, url);

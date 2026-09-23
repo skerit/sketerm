@@ -1,5 +1,5 @@
 //! WebFace — a real browser inside a pane, rendered by the optional
-//! `sketerm-webengine` helper (src/web/, docs/proposal-browser.md).
+//! `sketerm-webengine` helper (src/web/, and its CLAUDE.md).
 //!
 //! Two objects live here:
 //!
@@ -77,55 +77,39 @@
 //! An untouched page still costs nothing: the scheduler only paints on
 //! damage (smoke-web stage 20 holds it at zero).
 //!
-//! The pacer below still runs, because the GUI-side state it manages is
-//! about PRESENTING, not painting — when the tick exists, and when the
-//! face may stop watching. Its requests ride along through
-//! `src/web/pace.zig`:
-//!
-//! - IDLE: a 5Hz GLib timeout asks for a frame, so a page that starts
-//!   moving on its own is still noticed. NO frame-clock tick exists in
-//!   this state — see the `tick_id` docblock in
-//!   `src/ui/terminal_surface.zig`: an installed tick keeps GDK's frame
-//!   clock cycling at monitor refresh even when nothing is drawn, and
-//!   on Wayland each empty cycle leaks a frame-callback object id per
-//!   offload subsurface until KWin's id space runs out and the process
-//!   dies. `stopTick` is not an optimisation, it is the crash guard.
-//! - ACTIVE: a tick on the view widget paces requests at the CURRENT
-//!   output's real refresh (from `gdk_frame_clock_get_refresh_info`),
-//!   clamped by `browser_max_fps`. Any input promotes here immediately,
-//!   so the first paint after a keystroke has no added latency.
-//! - Back to IDLE after ~250ms of requests that produced no paint, at
-//!   which point the tick REMOVES ITSELF (`onTick` returning
-//!   G_SOURCE_REMOVE and zeroing `tick_id`), exactly like the terminal
-//!   surface's animation tick.
+//! So this face sends NO frame requests and installs NO frame-clock tick
+//! at all: a paint arrives, its texture is set, GTK presents it. The
+//! only pacing input it owns is the cap: `syncMaxFps` ships
+//! `browser_max_fps` clamped to the refresh of the output the view is ON
+//! (`gdk_monitor_get_refresh_rate` of the surface's monitor, re-read on
+//! realize and when the surface enters another monitor), and the helper
+//! applies it via `set_windowless_frame_rate`. That also keeps the old
+//! crash guard true by construction: an installed tick keeps GDK's frame
+//! clock cycling at monitor refresh even when nothing is drawn, and on
+//! Wayland each empty cycle leaks a frame-callback object id per offload
+//! subsurface until KWin's id space runs out (see the `tick_id` docblock
+//! in `src/ui/terminal_surface.zig`); this face has no tick to leak.
+//! The client-driven pacer that used to run here (`pace.zig`, idle
+//! requests at 5Hz, a tick while active) was the losing side of that
+//! A/B and is gone; `frame_request` stays on the wire only for older
+//! clients, and the helper ignores it.
 //!
 //! A background tab's view widget is unmapped: the face then sends
-//! `view_hide` and stops asking altogether, so an off-screen page paints
-//! nothing at all. `SKETERM_WEB_PACE=1` logs every transition (and
-//! aborts if a demoted face somehow kept its tick).
-//!
-//! The REQUESTS the pacer sends are advisory now: the helper's default
-//! is CEF's OWN scheduler (`externalPacingLatency` in
-//! `src/web/cefhost.zig` — external begin frames measured a constant
-//! ~30ms of added input latency that no request timing could remove),
-//! so paints arrive on their own and `frame_request` only keeps the
-//! helper's watchdog quiet. What replaced request-spacing as the
-//! throttle is `view_max_fps`: `syncMaxFps` ships the cap clamped to
-//! the CURRENT output's refresh whenever either changes, and the
-//! helper applies it via `set_windowless_frame_rate`.
+//! `view_hide`, so an off-screen page paints nothing at all.
 //!
 //! Set `SKETERM_WEB_STATS=1` for a per-second stderr line with the
 //! delivered frame rate, the time spent here, the bytes actually
-//! uploaded, the GPU imports, and the REQUESTS and TICKS behind them.
+//! uploaded, the GPU imports, and the frame-clock PRESENTS behind them.
 //! MEASURED at 3840x2160 on a 60fps animating page whose spinner damages
 //! 64x64: 1787 MiB/s handed to GDK before, 2 MiB/s of damage rects
 //! after, and 0 MiB/s once the frame is a dma-buf import.
 //!
-//! Read the `ticks` number first when the browser looks slow. It is the
-//! rate the COMPOSITOR is willing to present at, and everything else is
-//! capped by it: a window straddling the gap between two monitors gets
-//! zero ticks, and GSK's Vulkan renderer driving a 4K GtkGLArea measured
-//! 11 ticks/s against `ngl`'s 140. Neither is an engine problem and no
+//! Read the `presents` number first when the browser looks slow: it
+//! counts the paint cycles of the frame clocks showing a web face, i.e.
+//! the rate the COMPOSITOR is willing to present at, and everything else
+//! is capped by it. A window straddling the gap between two monitors
+//! gets zero, and GSK's Vulkan renderer on a 4K surface measured roughly
+//! a tenth of `ngl`'s rate. Neither is an engine problem and no
 //! engine-side change moves either.
 //!
 //! The helper rewrites the buffer in place, so a rect can be read
@@ -137,7 +121,7 @@
 //!
 //! ## Scale (HiDPI)
 //!
-//! Per docs/proposal-browser-protocol.md "Scale contract": w/h on the
+//! Per the scale contract (`protocol.ViewCreate`): w/h on the
 //! wire are LOGICAL, `scale_x1000` is the real fractional device scale,
 //! and the buffer that comes back is PHYSICAL. The scale comes from
 //! `gdk_surface_get_scale()` — `gtk_widget_get_scale_factor()` rounds
@@ -211,7 +195,6 @@ const reader_model = @import("../web/reader.zig");
 const reader_guards = @import("../web/reader_guards.zig");
 const webhints = @import("../web/hints.zig");
 const findbin = @import("../web/findbin.zig");
-const pace = @import("../web/pace.zig");
 const web_model = @import("../web/model.zig");
 const clock = @import("../util/clock.zig");
 const fsserve = @import("../mux/fsserve.zig");
@@ -284,14 +267,13 @@ const Stats = struct {
     /// allocates — the path is still correct, just no longer free.
     gpu_imports: u32 = 0,
     gpu_copies: u32 = 0,
-    /// Frame requests sent and frame-clock ticks taken in this window.
-    /// They are what separates "the engine is slow" from "the compositor
-    /// is not running our frame clock" — a pane whose ticks are near
-    /// zero is being throttled by the compositor (occluded, on no
-    /// output, or on a monitor that is asleep) and no engine-side change
-    /// can move it. That distinction cost an evening once.
-    reqs: u32 = 0,
-    ticks: u32 = 0,
+    /// Paint cycles of the frame clocks showing a web face in this
+    /// window. What separates "the engine is slow" from "the compositor
+    /// is not presenting us": near zero means the compositor throttles
+    /// the surface (occluded, on no output, on a monitor that is asleep)
+    /// and no engine-side change can move it. That distinction cost an
+    /// evening once.
+    presents: u32 = 0,
     ns_total: u64 = 0,
     ns_max: u64 = 0,
     bytes: u64 = 0,
@@ -322,8 +304,8 @@ const Stats = struct {
         const mbps = @as(f64, @floatFromInt(self.bytes)) * 1e9 /
             @as(f64, @floatFromInt(span)) / (1024.0 * 1024.0);
         std.debug.print(
-            "webface stats: {d:.1} fps, frame avg {d:.1} us max {d:.1} us, {d:.0} MiB/s, gpu {d} imported / {d} copied, {d} reqs {d} ticks\n",
-            .{ fps, avg_us, @as(f64, @floatFromInt(self.ns_max)) / 1000.0, mbps, self.gpu_imports, self.gpu_copies, self.reqs, self.ticks },
+            "webface stats: {d:.1} fps, frame avg {d:.1} us max {d:.1} us, {d:.0} MiB/s, gpu {d} imported / {d} copied, {d} presents\n",
+            .{ fps, avg_us, @as(f64, @floatFromInt(self.ns_max)) / 1000.0, mbps, self.gpu_imports, self.gpu_copies, self.presents },
         );
         self.* = .{ .on = true, .checked = true, .window_start_ns = now };
     }
@@ -338,12 +320,12 @@ var g_stats: Stats = .{};
 /// Input-to-pixel latency probe: a timer alternates a synthetic pointer
 /// move between a point INSIDE a hover-styled element (expected to turn
 /// red) and one outside it (back to blue), and the render callback reads
-/// the probed pixel back from the GL framebuffer after the draw. The
-/// printed delta is input-send to pixel-in-our-framebuffer; compositor
-/// presentation adds one more cycle on top and is NOT included.
-/// `slow` (700ms period) starts each probe from the pacer's idle state —
-/// the user's "mouse arrives at a button on a static page" case; `fast`
-/// (100ms) keeps the view active.
+/// the probed pixel back out of the engine's buffer. The printed delta
+/// is input-send to pixel-in-our-mapping; compositor presentation adds
+/// one more cycle on top and is NOT included. `slow` (700ms period)
+/// starts each probe from a page that has been still for a while — the
+/// user's "mouse arrives at a button on a static page" case; `fast`
+/// (100ms) keeps it busy.
 const Lat = struct {
     mode: enum { off, slow, fast } = .off,
     checked: bool = false,
@@ -351,8 +333,6 @@ const Lat = struct {
     pending: bool = false,
     expect_hover: bool = false,
     t_input_us: i64 = 0,
-    /// First frame REQUEST sent after the input; 0 until one goes out.
-    req_us: i64 = 0,
     /// First frame arrival after the input; 0 until one lands.
     arrival_us: i64 = 0,
     /// Frames that arrived between the input and the matching pixel.
@@ -373,20 +353,6 @@ const Lat = struct {
 var g_lat: Lat = .{};
 
 // ---------------------------------------------------------------------
-// Pace logging (`SKETERM_WEB_PACE=1`)
-// ---------------------------------------------------------------------
-
-var g_pace_log: struct { on: bool = false, checked: bool = false } = .{};
-
-fn paceLogging() bool {
-    if (!g_pace_log.checked) {
-        g_pace_log.checked = true;
-        g_pace_log.on = c.getenv("SKETERM_WEB_PACE") != null;
-    }
-    return g_pace_log.on;
-}
-
-// ---------------------------------------------------------------------
 // App-level frame cap
 // ---------------------------------------------------------------------
 
@@ -395,9 +361,38 @@ fn paceLogging() bool {
 /// paces — every face reads the same number.
 var g_max_fps: u16 = 0;
 
+/// Refresh rate assumed before a view's surface can say which output it
+/// is on.
+const DEFAULT_DISPLAY_FPS: u16 = 60;
+
+/// The `view_max_fps` a face ships: the configured cap (0 = follow the
+/// display) clamped to the refresh of the output the view is on, since
+/// painting faster than the output presents is pure waste. A configured
+/// cap below 5 would make the page feel broken and one above 1000
+/// describes no real display, so both are clamped.
+fn effectiveMaxFps(cap: u16, display_fps: u16) u16 {
+    const display = if (display_fps == 0) DEFAULT_DISPLAY_FPS else display_fps;
+    if (cap == 0) return display;
+    return @min(std.math.clamp(cap, 5, 1000), display);
+}
+
+test "the frame cap follows the display, and a configured cap only ever lowers it" {
+    try std.testing.expectEqual(@as(u16, 144), effectiveMaxFps(0, 144));
+    try std.testing.expectEqual(@as(u16, 60), effectiveMaxFps(0, 0));
+    try std.testing.expectEqual(@as(u16, 30), effectiveMaxFps(30, 144));
+    try std.testing.expectEqual(@as(u16, 60), effectiveMaxFps(240, 60));
+    try std.testing.expectEqual(@as(u16, 5), effectiveMaxFps(1, 60));
+}
+
 /// Push the configured cap (0 = follow the display) into every live
 /// face. Called from `applyConfigChange` and at window construction, the
 /// same shape as `imhost.setPreference`.
+pub fn setMaxFps(fps: u16) void {
+    g_max_fps = fps;
+    var it = ownFaces();
+    while (it.next()) |f| f.syncMaxFps();
+}
+
 /// The machine-wide Tor SOCKS5 endpoint and the default route text,
 /// both from config (`mux_tor_socks_endpoint`, `web_route`). Stored as
 /// bytes so config arenas can be swapped underneath; every route that
@@ -431,14 +426,6 @@ pub fn defaultRoute() webroute.Spec {
     return webroute.Spec.parse(g_default_route[0..g_default_route_len], torEndpoint()) orelse .{};
 }
 
-pub fn setMaxFps(fps: u16) void {
-    g_max_fps = fps;
-    for (g_client.faces.items) |f| {
-        f.pacer.cap_fps = fps;
-        f.syncMaxFps();
-    }
-}
-
 // ---------------------------------------------------------------------
 // Automatic tab discard
 // ---------------------------------------------------------------------
@@ -454,7 +441,8 @@ var g_discard_minutes: u32 = 30;
 /// `applyConfigChange` and at window construction.
 pub fn setDiscardMinutes(minutes: u32) void {
     g_discard_minutes = minutes;
-    for (g_client.faces.items) |f| {
+    var it = ownFaces();
+    while (it.next()) |f| {
         f.stopDiscardTimer();
         if (!f.on_screen) f.armDiscardTimer();
     }
@@ -465,7 +453,8 @@ pub fn setDiscardMinutes(minutes: u32) void {
 /// which is what the toast reports.
 pub fn discardBackground() usize {
     var n: usize = 0;
-    for (g_client.faces.items) |f| {
+    var it = ownFaces();
+    while (it.next()) |f| {
         if (f.on_screen) continue;
         if (f.discardNow()) n += 1;
     }
@@ -475,20 +464,47 @@ pub fn discardBackground() usize {
 /// Whether the connected helper can discard at all, so a UI can say
 /// "not supported" instead of quietly doing nothing.
 pub fn discardSupported() bool {
-    return g_client.cap_discard;
+    return g_client.has(.discard);
 }
 
-/// Every registered web face in this GUI process — the omnibox's
-/// open-tabs source. Borrowed; do not hold across GTK dispatch.
-pub fn openFaces() []const *WebFace {
-    return g_client.faces.items;
+/// Every face of this user's OWN tabs in this GUI process: the local
+/// helper's and every route instance's, but never an observer's (those
+/// pages are an assistant's). Iterate without GTK dispatch in between;
+/// faces register and unregister on the main loop.
+pub const OwnFaces = struct {
+    client: usize = 0,
+    face: usize = 0,
+
+    pub fn next(self: *OwnFaces) ?*WebFace {
+        while (true) {
+            const cl: *Client = if (self.client == 0)
+                &g_client
+            else if (self.client - 1 < g_aux_clients.items.len)
+                g_aux_clients.items[self.client - 1]
+            else
+                return null;
+            if (self.face < cl.faces.items.len) {
+                defer self.face += 1;
+                return cl.faces.items[self.face];
+            }
+            self.client += 1;
+            self.face = 0;
+        }
+    }
+};
+
+pub fn ownFaces() OwnFaces {
+    return .{};
 }
 
-/// Resolve a view id to its face — the id-not-pointer indirection the
-/// popup toast uses too, so a deferred activation can never touch a
-/// face that died in between.
+/// Resolve a view id to its face on WHICHEVER helper serves it (view ids
+/// come from one process-wide mint, so the lookup is unambiguous) — the
+/// id-not-pointer indirection popovers and toasts use, so a deferred
+/// activation can never touch a face that died in between. A routed or
+/// remote tab resolves too; a local-only lookup silently dropped every
+/// site-info action on those.
 pub fn faceByView(view: u32) ?*WebFace {
-    return g_client.findFace(view);
+    return findFaceGlobal(view);
 }
 
 /// Resolve a view on its owning client. Auxiliary UI must use this form:
@@ -663,7 +679,7 @@ pub const Client = struct {
     egress: ?*socksbridge.Egress = null,
     /// Storage for a formatted (non-static) unavailable reason; stable
     /// because clients are never freed.
-    reason_buf: [256]u8 = undefined,
+    reason_buf: [384]u8 = undefined,
     in: std.ArrayList(u8) = .empty,
     out: proto.Outbox = undefined,
     /// Descriptors received through SCM_RIGHTS, in arrival order. A
@@ -675,96 +691,17 @@ pub const Client = struct {
     connect_timer: c.guint = 0,
     connect_tries: u32 = 0,
     faces: std.ArrayList(*WebFace) = .empty,
-    /// The helper advertised `discard` (protocol `CAP_DISCARD`). An
-    /// older helper without it never sees a `view_discard` and every
-    /// hidden face behaves exactly as it did before the feature: paused
-    /// painting, browser kept.
-    cap_discard: bool = false,
-    /// Capabilities the CURRENT helper answered with. A helper that
-    /// predates either feature advertises neither, sends neither event,
-    /// and the face keeps behaving exactly as it did before them — the
-    /// degradation is silent by construction, and these two flags only
-    /// keep the GUI from posting decisions such a helper would ignore.
-    has_tls: bool = false,
-    has_permissions: bool = false,
-    /// Capabilities the CURRENT helper advertised. A helper too old
-    /// for one of these leaves its menu row insensitive rather than
-    /// hidden, so the verb is still discoverable.
-    cap_devtools: bool = false,
-    cap_print_pdf: bool = false,
-    /// The helper accepts `input_paste`/`clipboard_read`. Without it
-    /// the browser has NO working clipboard at all, so the face must
-    /// not claim Ctrl+V/C/X and leave the user with nothing.
-    cap_clipboard: bool = false,
-    /// The helper can really open a popup, keeping window.opener.
-    /// Without it every popup is cancelled and reported, which is the
-    /// old behaviour.
-    cap_popup_open: bool = false,
-    cap_downloads: bool = false,
-    /// The helper accepts `download_start`: a url can be downloaded
-    /// through a view's own browser, with that browser's session.
-    cap_download_start: bool = false,
-    cap_download_staging: bool = false,
-    /// The helper accepts `a11y_enable` and streams the AX tree. An
-    /// older helper simply skips the unknown frame, so this flag only
-    /// records what the face may expect back.
-    cap_a11y: bool = false,
-    /// The helper streams `ev_a11y_caret`. Without it the projection
-    /// still serves Text, but with no caret for a braille display.
-    cap_a11y_caret: bool = false,
-    /// The helper accepts `context_create`/`context_destroy` (per-tab
-    /// identity contexts). An older helper ignores the frames and every
-    /// view shares one cookie jar — silent, correct degradation.
-    cap_contexts: bool = false,
-    /// The helper applies proxy preferences transactionally and refuses
-    /// unknown nonzero contexts instead of falling back to direct traffic.
-    /// Egress views require this; ordinary direct views do not.
-    cap_contexts_fail_closed: bool = false,
-    /// The current connection's `hello_ack` has arrived. Egress views wait
-    /// for it because capability absence is a refusal, not degradation.
+    /// What the CURRENT connection's helper advertised in `hello_ack`;
+    /// empty until it arrives and again after every disconnect, because a
+    /// restart may land on a different helper build. Every feature a
+    /// helper may lack degrades by construction: a verb it does not
+    /// advertise is never posted, and its menu row is insensitive rather
+    /// than hidden, so it stays discoverable.
+    caps: proto.Caps = .initEmpty(),
+    /// The current connection's `hello_ack` has arrived. Container views
+    /// wait for it, because whether the helper can keep a container's
+    /// identity apart (`contexts-fail-closed`) is only known from it.
     hello_done: bool = false,
-    /// The helper accepts the 0xC0 user-content sets (userscripts +
-    /// userstyles). On the ack the client fetches both sets from the
-    /// daemon web store and pushes them; an older helper skips the
-    /// frames and pages get no user content — silent degradation.
-    cap_userscripts: bool = false,
-    /// The helper answers the cookie / site-data frames. An older one
-    /// advertises nothing, is sent none of them, and the site-info
-    /// popover hides that section — permissions and blocking, which
-    /// need no helper support at all, keep working.
-    cap_sitedata: bool = false,
-    /// The helper reports `ev_scroll` and accepts `scroll_to`, which is
-    /// what makes a restored page come back where it was left. An older
-    /// helper restores the page at the top, silently — the alternative
-    /// would be refusing to restore at all.
-    cap_scroll: bool = false,
-    /// The helper accepts `frame_mode` and can deliver `frame_inline`
-    /// frames. A REMOTE client requires it: without it the bridge would
-    /// silently eat every frame descriptor and the pane would stay
-    /// black, so its absence is a described failure, never a hang.
-    cap_frames_inline: bool = false,
-    /// The local helper hosts MV2-flavor WebExtensions (the 0xB0 frame
-    /// block). Remote clients suppress it because extension package paths
-    /// belong to the GUI host and are not transferred.
-    cap_webext: bool = false,
-    /// The helper accepts `webext_tabs` (0xB6), i.e. `browser.tabs` and
-    /// `sender.tab` can be made real. Without it every extension sees
-    /// `tabId = -1`.
-    cap_webext_tabs: bool = false,
-    /// The helper exposes browser-action toolbar state and real popups.
-    cap_webext_action: bool = false,
-    /// Correlated prepare/commit handshake for failure-atomic package upgrades.
-    cap_webext_transaction: bool = false,
-    /// The helper fetches subscribed filter lists itself (0xC4).
-    cap_filter_subscribe: bool = false,
-    /// Rich reader results and revision-guarded reader actions.
-    cap_reader_ids: bool = false,
-    /// Semantic requests/results carry a client-minted operation id.
-    cap_semantic_request_ids: bool = false,
-    /// The helper observes its jars and applies foreign changes (the
-    /// 0xE0 block). What re-shares one identity across the route
-    /// instances; see `cookieSyncOnReady`.
-    cap_cookie_sync: bool = false,
     /// `cookie_sync_enable` was posted on the CURRENT connection.
     sync_enabled: bool = false,
 
@@ -788,38 +725,9 @@ pub const Client = struct {
     /// same key is reused by the next watch on that assistant.
     obs_key: [384]u8 = undefined,
     obs_key_len: usize = 0,
-    /// The helper advertised "observe".
-    cap_observe: bool = false,
-    cap_multi_client: bool = false,
     /// The `webwatch.Watch` this observer client serves, nulled by the
     /// watch before it frees itself (the back-pointer fence).
     watch: ?*anyopaque = null,
-
-    /// The proxy this instance's helper is spawned with, or null for a
-    /// direct instance. A `.mux` route binds its bridge here, so the
-    /// port is known before the helper's argv is built; a bridge that
-    /// cannot bind fails the client rather than spawning a direct
-    /// helper under a routed name.
-    fn instanceProxy(self: *Client, buf: []u8) error{BridgeFailed}!?[]const u8 {
-        const spec = self.routeSpec();
-        switch (spec.kind) {
-            .direct, .remote_browser => return null,
-            .tor => return spec.proxyUrl(buf),
-            .mux => {
-                if (self.egress == null) {
-                    const eg = socksbridge.Egress.create(self.gpa, spec.host, mux_cli.muxConnect) orelse
-                        return error.BridgeFailed;
-                    if (!eg.spawn()) {
-                        eg.close();
-                        return error.BridgeFailed;
-                    }
-                    self.egress = eg;
-                }
-                return std.fmt.bufPrint(buf, "socks5://127.0.0.1:{d}", .{self.egress.?.port()}) catch
-                    return error.BridgeFailed;
-            },
-        }
-    }
 
     fn hostSlice(self: *const Client) []const u8 {
         return self.host[0..self.host_len];
@@ -837,6 +745,11 @@ pub const Client = struct {
 
     pub fn isRemote(self: *const Client) bool {
         return self.host_len != 0;
+    }
+
+    /// Whether the current connection's helper advertised `cap`.
+    pub fn has(self: *const Client, cap: proto.Cap) bool {
+        return self.caps.contains(cap);
     }
 
     /// Bring the helper up if it is not already. Never blocks: a
@@ -898,7 +811,7 @@ pub const Client = struct {
         var proxy_z: [96:0]u8 = undefined;
         const proxy: ?[:0]const u8 = blk: {
             var pbuf: [80]u8 = undefined;
-            const url = (self.instanceProxy(&pbuf) catch {
+            const url = (socksbridge.routeProxy(self.gpa, self.routeSpec(), &self.egress, mux_cli.muxConnect, &pbuf) catch {
                 self.fail("Could not start the egress bridge for this route (the mux host is unreachable or the loopback listener would not bind).");
                 return;
             }) orelse break :blk null;
@@ -1060,22 +973,9 @@ pub const Client = struct {
         }
         // Capabilities belong to the CONNECTION, not to the client: a
         // restart may land on a different helper build.
-        self.cap_discard = false;
-        self.cap_contexts = false;
-        self.cap_contexts_fail_closed = false;
-        self.cap_cookie_sync = false;
+        self.caps = .initEmpty();
         self.sync_enabled = false;
         self.hello_done = false;
-        self.cap_frames_inline = false;
-        self.cap_filter_subscribe = false;
-        self.cap_reader_ids = false;
-        self.cap_semantic_request_ids = false;
-        self.cap_webext = false;
-        self.cap_webext_tabs = false;
-        self.cap_webext_action = false;
-        self.cap_webext_transaction = false;
-        self.cap_observe = false;
-        self.cap_multi_client = false;
         self.adopted = false;
         if (self.bridge) |br| {
             self.bridge = null;
@@ -1393,14 +1293,14 @@ pub const Client = struct {
     /// (src/ui/webuserscripts.zig); a helper without the capability,
     /// or a store-less daemon, degrades to "no user content".
     pub fn refreshUserContent(self: *Client) void {
-        if (self.state != .ready or !self.cap_userscripts) return;
+        if (self.state != .ready or !self.has(.userscripts)) return;
         _ = webstore.userscriptList(self.gpa, @ptrCast(self), &onUserscriptsReply);
         _ = webstore.userstyleList(self.gpa, @ptrCast(self), &onUserstylesReply);
     }
 
     fn onUserscriptsReply(ctx: ?*anyopaque, ok: bool, payload: []const u8) void {
         const self = cast.userData(Client, ctx);
-        if (!ok or self.state != .ready or !self.cap_userscripts) return;
+        if (!ok or self.state != .ready or !self.has(.userscripts)) return;
         var arena = std.heap.ArenaAllocator.init(self.gpa);
         defer arena.deinit();
         const list = webstore.parseUserscripts(arena.allocator(), payload);
@@ -1418,7 +1318,7 @@ pub const Client = struct {
 
     fn onUserstylesReply(ctx: ?*anyopaque, ok: bool, payload: []const u8) void {
         const self = cast.userData(Client, ctx);
-        if (!ok or self.state != .ready or !self.cap_userscripts) return;
+        if (!ok or self.state != .ready or !self.has(.userscripts)) return;
         var arena = std.heap.ArenaAllocator.init(self.gpa);
         defer arena.deinit();
         const list = webstore.parseUserstyles(arena.allocator(), payload);
@@ -1584,67 +1484,12 @@ pub const Client = struct {
                     self.fail("The browser helper speaks a different protocol version.");
                     return;
                 }
-                self.cap_discard = false;
-                self.has_tls = false;
-                self.has_permissions = false;
-                self.cap_devtools = false;
-                self.cap_print_pdf = false;
-                self.cap_clipboard = false;
-                self.cap_popup_open = false;
-                self.cap_downloads = false;
-                self.cap_download_start = false;
-                self.cap_download_staging = false;
-                self.cap_a11y = false;
-                self.cap_a11y_caret = false;
-                self.cap_contexts = false;
-                self.cap_contexts_fail_closed = false;
-                self.cap_userscripts = false;
-                self.cap_sitedata = false;
-                self.cap_scroll = false;
-                self.cap_frames_inline = false;
-                self.cap_filter_subscribe = false;
-                self.cap_reader_ids = false;
-                self.cap_semantic_request_ids = false;
-                self.cap_webext = false;
-                self.cap_webext_tabs = false;
-                self.cap_webext_action = false;
-                self.cap_webext_transaction = false;
-                self.cap_cookie_sync = false;
+                self.caps = proto.parseCaps(ack.caps);
                 self.sync_enabled = false;
-                for (ack.caps) |cap| {
-                    if (std.mem.eql(u8, cap, proto.CAP_DISCARD)) self.cap_discard = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_TLS)) self.has_tls = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_PERMISSIONS)) self.has_permissions = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_DEVTOOLS)) self.cap_devtools = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_PRINT_PDF)) self.cap_print_pdf = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_CLIPBOARD)) self.cap_clipboard = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_POPUP_OPEN)) self.cap_popup_open = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_DOWNLOADS)) self.cap_downloads = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_DOWNLOAD_START)) self.cap_download_start = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_DOWNLOAD_STAGING)) self.cap_download_staging = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_A11Y)) self.cap_a11y = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_A11Y_CARET)) self.cap_a11y_caret = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_CONTEXTS)) self.cap_contexts = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_CONTEXTS_FAIL_CLOSED)) self.cap_contexts_fail_closed = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_USERSCRIPTS)) self.cap_userscripts = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_SITEDATA)) self.cap_sitedata = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_SCROLL)) self.cap_scroll = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_FRAMES_INLINE)) self.cap_frames_inline = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_WEBEXT)) self.cap_webext = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_WEBEXT_TABS)) self.cap_webext_tabs = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_WEBEXT_ACTION)) self.cap_webext_action = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_WEBEXT_TRANSACTION)) self.cap_webext_transaction = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_FILTER_SUBSCRIBE)) self.cap_filter_subscribe = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_READER_IDS)) self.cap_reader_ids = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_SEMANTIC_REQUEST_IDS)) self.cap_semantic_request_ids = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_COOKIE_SYNC)) self.cap_cookie_sync = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_OBSERVE)) self.cap_observe = true;
-                    if (std.mem.eql(u8, cap, proto.CAP_MULTI_CLIENT)) self.cap_multi_client = true;
-                }
                 // Joined another window's helper: it must be able to
                 // serve two clients, or our views would fight for its
                 // one id space.
-                if (self.adopted and !self.cap_multi_client) {
+                if (self.adopted and !self.has(.multi_client)) {
                     self.failWith("Another sketerm window owns the browser and its helper cannot be shared (no multi-client capability). Close that window's browser pages, or restart it on this build.", false);
                     return;
                 }
@@ -1656,7 +1501,7 @@ pub const Client = struct {
                     // Nothing of this GUI's is published into an
                     // assistant's helper (see `observer`); the one
                     // thing sent is the request to be told its pages.
-                    if (!self.cap_observe) {
+                    if (!self.has(.observe)) {
                         self.failWith("The assistant's browser helper is too old to be watched (no observe capability).", false);
                         return;
                     }
@@ -1668,17 +1513,17 @@ pub const Client = struct {
                 // A remote helper without inline frames would keep
                 // posting memfd frames whose descriptors the bridge
                 // silently ate: a black pane forever. Fail loudly now.
-                if (self.isRemote() and !self.cap_frames_inline) {
+                if (self.isRemote() and !self.has(.frames_inline)) {
                     self.fail("The browser helper on the remote host is too old for remote browsing (no frames-inline capability).");
                     return;
                 }
                 self.hello_done = true;
                 if (self.isRemote()) {
-                    self.cap_webext = false;
-                    self.cap_webext_tabs = false;
-                    self.cap_webext_action = false;
-                    self.cap_webext_transaction = false;
-                } else if (self.cap_webext) {
+                    // Extension package paths belong to THIS host; a
+                    // remote helper is told about none of them.
+                    for ([_]proto.Cap{ .webext, .webext_tabs, .webext_action, .webext_transaction }) |cap|
+                        self.caps.remove(cap);
+                } else if (self.has(.webext)) {
                     webext.publish(self);
                     tabsChanged();
                 }
@@ -1691,9 +1536,9 @@ pub const Client = struct {
                 // The capability was unknown until this reply, so this
                 // is the first point the configured set can be sent.
                 publishFilterSubs(self);
-                // Direct views were minted optimistically before the ack.
-                // Egress views wait until the strict context guarantee is
-                // known, so release (or visibly refuse) those waiters now.
+                // Plain views were minted optimistically before the ack.
+                // Container views wait until the strict context guarantee
+                // is known, so release (or visibly refuse) those now.
                 for (self.faces.items) |face| face.ensureView();
             },
             .ev_webext_state => {
@@ -1718,9 +1563,9 @@ pub const Client = struct {
             },
             .ev_webext_open_popup => {
                 // Same gate as every other capability-scoped feature:
-                // remote clients have `cap_webext_action` forced off, so
+                // remote clients have `webext-action` stripped, so
                 // this also keeps the old remote refusal.
-                if (!self.cap_webext_action or self.state != .ready) return;
+                if (!self.has(.webext_action) or self.state != .ready) return;
                 const ev = proto.decode(proto.EvWebextOpenPopup, frame.payload) catch return;
                 const face = self.findFace(ev.view);
                 const ok = if (face) |f| f.openWebextPopup(ev.id) else false;
@@ -1810,6 +1655,13 @@ pub const Client = struct {
             .ev_view_create_failed => {
                 const ev = proto.decode(proto.EvViewCreateFailed, frame.payload) catch return;
                 if (self.findFace(ev.view)) |face| face.onViewCreateFailed(ev);
+            },
+            .ev_route_refused => {
+                // The route instance fails closed: every tab on it shows
+                // why, and Reload starts a fresh helper that tries the
+                // route again.
+                const ev = proto.decode(proto.EvRouteRefused, frame.payload) catch return;
+                self.fail(std.fmt.bufPrint(&self.reason_buf, "Route blocked: {s}.", .{ev.reason}) catch "Route blocked: this route's browser serves nothing.");
             },
             .ev_clipboard_text => {
                 const ev = proto.decode(proto.EvClipboardText, frame.payload) catch return;
@@ -1905,7 +1757,7 @@ pub const Client = struct {
             },
             .ev_print_pdf_done => {
                 const ev = proto.decode(proto.EvPrintPdfDone, frame.payload) catch return;
-                if (self.findFace(ev.view)) |face| face.onPrintDone(ev.ok != 0, ev.path);
+                if (self.findFace(ev.view)) |face| face.onPrintDone(ev);
             },
             .ev_download_offer => {
                 const ev = proto.decode(proto.EvDownloadOffer, frame.payload) catch return;
@@ -2237,7 +2089,8 @@ var g_containers: std.ArrayList(Container) = .empty;
 var g_next_container_id: u32 = 1;
 /// Ephemeral (incognito) ids live above every id the daemon store will
 /// ever mint — see `createContainerAt`.
-var g_next_ephemeral_id: u32 = 0x8000_0000;
+const EPHEMERAL_CONTAINER_BASE: u32 = 0x8000_0000;
+var g_next_ephemeral_id: u32 = EPHEMERAL_CONTAINER_BASE;
 
 pub fn containers() []Container {
     return g_containers.items;
@@ -2455,7 +2308,7 @@ fn windowFocused(win: *Window) bool {
 /// onRemoved/onActivated, so nothing can desynchronise the way an
 /// incremental protocol would.
 fn publishTabs(cl: *Client) void {
-    if (!cl.cap_webext_tabs or cl.state != .ready) return;
+    if (!cl.has(.webext_tabs) or cl.state != .ready) return;
     var rows: std.ArrayList(TabJson) = .empty;
     defer rows.deinit(cl.gpa);
     for (cl.faces.items) |f| {
@@ -2530,7 +2383,7 @@ pub fn setFilterSubscriptions(gpa: std.mem.Allocator, urls: []const []const u8, 
 }
 
 fn publishFilterSubs(cl: *Client) void {
-    if (!cl.cap_filter_subscribe or cl.state != .ready) return;
+    if (!cl.has(.filter_subscribe) or cl.state != .ready) return;
     var view: std.ArrayList([]const u8) = .empty;
     defer view.deinit(cl.gpa);
     for (g_sub_urls.items) |u| view.append(cl.gpa, u) catch return;
@@ -2573,19 +2426,6 @@ var g_containers_loading: bool = false;
 /// is not the same bit as `g_containers_loaded`.
 var g_containers_fetched: bool = false;
 var g_containers_gpa: ?std.mem.Allocator = null;
-
-/// True once the daemon's stored registry has been merged in (or has
-/// definitively failed).
-///
-/// A face bound to a container must not mint its view before this. The
-/// helper resolves an unknown context id to the DEFAULT request context
-/// rather than erroring, so a view created ahead of its
-/// `context_create` loads in the shared jar with nothing to show for
-/// it — the exact "you are not in the identity you think you are"
-/// failure containers exist to prevent.
-pub fn containersLoaded() bool {
-    return g_containers_loaded;
-}
 
 /// Host of an http(s) url, or null when there is nothing to key a rule
 /// on (a blank tab, a data: url, a search term the omnibox has not
@@ -3047,7 +2887,7 @@ fn nextSyncReq() u32 {
 
 /// A subscribed-or-subscribable sync participant.
 fn isSyncPeer(cl: *const Client) bool {
-    return !cl.isRemote() and cl.state == .ready and cl.hello_done and cl.cap_cookie_sync;
+    return !cl.isRemote() and cl.state == .ready and cl.hello_done and cl.has(.cookie_sync);
 }
 
 fn syncPeerCount() usize {
@@ -3629,27 +3469,20 @@ pub const WebFace = struct {
     /// tree's lifetime must own one) plus its handler id.
     scale_surface: ?*c.GdkSurface = null,
     scale_handler: c.gulong = 0,
+    /// `enter-monitor` on `scale_surface` (the frame cap follows the
+    /// output's refresh) and, under `SKETERM_WEB_STATS`, `after-paint`
+    /// on its frame clock.
+    monitor_handler: c.gulong = 0,
+    present_handler: c.gulong = 0,
     /// Last pointer position in view coordinates — scroll events carry
     /// no coordinates of their own.
     last_x: i32 = 0,
     last_y: i32 = 0,
 
-    /// Adaptive frame pacing (see the header). Nothing this view shows
-    /// is painted unless this decides to ask for it.
-    pacer: pace.Pacer = .{},
-    /// GTK frame-clock tick id on `view_area`, 0 when not installed. It
-    /// exists ONLY while the page is actively repainting and removes
-    /// itself the moment it is not — an idle tick is a KWin crash, not
-    /// a waste (see the header and `terminal_surface.zig`'s `tick_id`).
-    tick_id: c_uint = 0,
-    /// Slow GLib timeout (5Hz): the idle floor that notices a page
-    /// starting to move, and the reason no tick is needed to do so.
-    /// Armed for the face's whole on-screen life.
-    idle_timer: c.guint = 0,
     /// Latency-probe timer (`SKETERM_WEB_LAT`), 0 when absent.
     lat_timer: c.guint = 0,
     /// Whether the view widget is mapped. A background tab is unmapped: it
-    /// gets `view_hide` and is never asked for a frame.
+    /// gets `view_hide` and paints nothing.
     on_screen: bool = false,
     /// The helper destroyed this view's browser at our request
     /// (`view_discard`): the page is gone from memory, the LAST frame
@@ -3754,8 +3587,6 @@ pub const WebFace = struct {
     /// `toggled` handler does not act on its own state sync.
     reader_syncing: bool = false,
 
-    last_snapshot: ?[]u8 = null,
-    last_snapshot_meta: AutoMeta = .{},
     last_eval: ?[]u8 = null,
     /// Every ID ever returned by rich reader mode on this helper view.
     /// New reads refresh matching guards and invalidate absent ones;
@@ -4046,7 +3877,6 @@ pub const WebFace = struct {
         self.* = .{ .allocator = allocator };
         self.pane = pane;
         self.container = opts.container;
-        self.pacer.cap_fps = g_max_fps;
         if (opts.url) |u| self.pending_url = allocator.dupe(u8, u) catch null;
 
         self.buildUi();
@@ -4223,10 +4053,10 @@ pub const WebFace = struct {
         if (self.site_info) |si| si.sever(self.widgets_dead);
         if (self.actions) |a| a.sever(self.widgets_dead);
         // Same mechanism (2: sever at the single choke point) for the
-        // pacing sources and the discard countdown, which carry this
-        // face as user-data and are not signals, so the disconnect loop
-        // below misses them.
-        self.stopPacing();
+        // latency probe and the discard countdown, which carry this face
+        // as user-data and are not signals, so the disconnect loop below
+        // misses them.
+        self.stopLatProbe();
         self.stopDiscardTimer();
         self.stopDlTimer();
         // The a11y bus watch carries this face as user-data too.
@@ -4301,7 +4131,7 @@ pub const WebFace = struct {
         webstore.cancelFor(@ptrCast(self));
         self.axTeardown();
         self.detachScaleWatch();
-        self.stopPacing();
+        self.stopLatProbe();
         if (self.reader) |r| {
             r.sever(self.widgets_dead);
             r.destroy();
@@ -4363,9 +4193,6 @@ pub const WebFace = struct {
         for (self.auto_results.items) |r| self.allocator.free(r.text);
         self.auto_results.clearRetainingCapacity();
         self.auto_ops.clearRetainingCapacity();
-        if (self.last_snapshot) |s| self.allocator.free(s);
-        self.last_snapshot = null;
-        self.last_snapshot_meta = .{};
         if (self.last_eval) |e| self.allocator.free(e);
         self.last_eval = null;
     }
@@ -4392,7 +4219,7 @@ pub const WebFace = struct {
             }
             i += 1;
         }
-        if (kind != .network and self.cl.cap_semantic_request_ids) return false;
+        if (kind != .network and self.cl.has(.semantic_request_ids)) return false;
         if (self.auto_legacy_quarantine.isHeld(@intFromEnum(kind))) return true;
         for (self.auto_ops.items) |op| {
             if (op.kind == kind) return true;
@@ -4418,7 +4245,7 @@ pub const WebFace = struct {
         self.auto_ops.append(self.allocator, .{
             .token = token,
             .kind = kind,
-            .request = if (kind != .network and self.cl.cap_semantic_request_ids) token else 0,
+            .request = if (kind != .network and self.cl.has(.semantic_request_ids)) token else 0,
             .want_full = want_full,
             .started_ms = clock.nowMs(),
         }) catch return null;
@@ -4477,7 +4304,6 @@ pub const WebFace = struct {
 
     pub fn autoSnapshot(self: *WebFace, mode: u8, detail: u8, scope: u32) ?u32 {
         const token = self.autoBegin(.snapshot, mode == @intFromEnum(proto.SnapMode.full) or scope != 0) orelse return null;
-        self.promote();
         self.postSemantic(token, proto.SemSnapshotReq{
             .view = self.view,
             .mode = mode,
@@ -4493,7 +4319,7 @@ pub const WebFace = struct {
         // them lives (resetEpoch clears the store on ready/unavailable),
         // so store membership already implies the capability; the gate
         // is the cheap belt against a misbehaving helper.
-        if (if (self.cl.cap_reader_ids) self.readerGuard(id) else null) |guard| {
+        if (if (self.cl.has(.reader_ids)) self.readerGuard(id) else null) |guard| {
             self.postSemantic(token, proto.SemActGuarded{
                 .view = self.view,
                 .doc_gen = guard.doc_gen,
@@ -4506,9 +4332,6 @@ pub const WebFace = struct {
         } else {
             self.postSemantic(token, proto.SemAction{ .view = self.view, .id = id, .action = action, .arg = arg });
         }
-        // The helper synthesizes real input for this; the paints it
-        // causes still need somebody asking for frames.
-        self.promote();
         return token;
     }
 
@@ -4526,7 +4349,7 @@ pub const WebFace = struct {
 
     pub fn autoRead(self: *WebFace) ?u32 {
         const token = self.autoBegin(.read, false) orelse return null;
-        if (self.cl.cap_reader_ids)
+        if (self.cl.has(.reader_ids))
             self.postSemantic(token, proto.SemReadIds{ .view = self.view })
         else
             self.postSemantic(token, proto.SemRead{ .view = self.view });
@@ -4564,7 +4387,7 @@ pub const WebFace = struct {
     }
 
     fn postSemantic(self: *WebFace, token: u32, value: anytype) void {
-        if (!self.cl.cap_semantic_request_ids) {
+        if (!self.cl.has(.semantic_request_ids)) {
             self.cl.post(value);
             return;
         }
@@ -4813,7 +4636,7 @@ pub const WebFace = struct {
             .blocked = self.net_blocked,
             .total = self.net_total,
             .perms = perms[0..n],
-            .sitedata = client().cap_sitedata and self.view_live,
+            .sitedata = self.siteDataUsable(),
         }, open);
     }
 
@@ -4882,20 +4705,29 @@ pub const WebFace = struct {
         return r;
     }
 
+    /// Whether the site-data verbs can reach this page's jar: they go to
+    /// the tab's OWN helper (a routed tab's jar lives in its route's
+    /// instance), and never for an attached view, whose jar belongs to
+    /// the page it presents (an observer's cookie frames are refused by
+    /// the helper and would never be answered).
+    fn siteDataUsable(self: *const WebFace) bool {
+        return self.view_live and !self.attached and self.cl.has(.sitedata);
+    }
+
     /// Ask the helper what this site has stored. Silently does nothing
     /// on a helper without the capability — the popover hides the
     /// section it would fill.
     pub fn requestCookies(self: *WebFace) void {
         const info = self.site_info orelse return;
-        if (!self.view_live or !client().cap_sitedata) return;
+        if (!self.siteDataUsable()) return;
         const req = self.nextSiteReq();
         info.noteCookieRequest(req);
-        client().post(proto.CookiesReq{ .view = self.view, .req = req, .url = "" });
+        self.cl.post(proto.CookiesReq{ .view = self.view, .req = req, .url = "" });
     }
 
     pub fn deleteCookie(self: *WebFace, name: []const u8) void {
-        if (!self.view_live or !client().cap_sitedata) return;
-        client().post(proto.CookieDelete{
+        if (!self.siteDataUsable()) return;
+        self.cl.post(proto.CookieDelete{
             .view = self.view,
             .req = self.nextSiteReq(),
             .url = "",
@@ -4904,16 +4736,16 @@ pub const WebFace = struct {
     }
 
     pub fn clearCookies(self: *WebFace) void {
-        if (!self.view_live or !client().cap_sitedata) return;
-        client().post(proto.CookiesClear{ .view = self.view, .req = self.nextSiteReq(), .url = "" });
+        if (!self.siteDataUsable()) return;
+        self.cl.post(proto.CookiesClear{ .view = self.view, .req = self.nextSiteReq(), .url = "" });
     }
 
     /// Everything: cookies, the origin's script-visible storage, and
     /// the HTTP cache. The helper reports what it could not do exactly
     /// as asked in `EvSitedataDone.detail`.
     pub fn clearSiteData(self: *WebFace) void {
-        if (!self.view_live or !client().cap_sitedata) return;
-        client().post(proto.SitedataClear{
+        if (!self.siteDataUsable()) return;
+        self.cl.post(proto.SitedataClear{
             .view = self.view,
             .req = self.nextSiteReq(),
             .url = "",
@@ -4936,15 +4768,23 @@ pub const WebFace = struct {
             }
             i += 1;
         }
-        webstore.siteSetPerm(self.allocator, origin, key, "");
+        if (self.storeOrigin()) |o| webstore.siteSetPerm(self.allocator, o, key, "");
         self.refreshSiteInfo(false);
+    }
+
+    /// The origin whose stored site settings this page may WRITE: its
+    /// current origin, or null for a private page (`isPrivate`), whose
+    /// overrides apply to it alone and are never persisted.
+    fn storeOrigin(self: *const WebFace) ?[]const u8 {
+        if (self.isPrivate()) return null;
+        return self.nav_origin;
     }
 
     /// The popover's blocking switch: same decision as the toolbar
     /// shield, so it stores the same override.
     pub fn setBlockingForSite(self: *WebFace, on: bool) void {
         self.setNetwork(on);
-        if (self.nav_origin) |origin|
+        if (self.storeOrigin()) |origin|
             webstore.siteSetBlock(self.allocator, origin, if (on) null else false);
         self.refreshSiteInfo(false);
     }
@@ -4969,17 +4809,7 @@ pub const WebFace = struct {
             .dy = dy,
             .mods = 0,
         });
-        self.promote();
         return true;
-    }
-
-    /// The last snapshot the helper sent, solicited or not.
-    pub fn lastSnapshot(self: *WebFace) ?[]const u8 {
-        return self.last_snapshot;
-    }
-
-    pub fn lastSnapshotMeta(self: *WebFace) AutoMeta {
-        return self.last_snapshot_meta;
     }
 
     /// The full text of the last eval result, which a truncated tool
@@ -5020,7 +4850,6 @@ pub const WebFace = struct {
         });
         // The matcher lives on the view area's key controller.
         _ = c.gtk_widget_grab_focus(self.view_area);
-        self.promote();
         return true;
     }
 
@@ -5217,7 +5046,6 @@ pub const WebFace = struct {
             }
         }
         _ = self.autoAct(sid, @intFromEnum(proto.SemAct.click), "");
-        self.promote();
     }
 
     /// PNG of the PAGE as the user sees it, for `screenshot_pane` /
@@ -5227,10 +5055,6 @@ pub const WebFace = struct {
     /// with the same widget-paintable technique.
     pub fn screenshotPng(self: *WebFace) ?*c.GBytes {
         if (self.widgets_dead) return null;
-        // Automation looking at the page counts as activity: the shot
-        // itself is of whatever was last painted, but going active now
-        // keeps a burst of them from each being an idle-floor tick old.
-        self.promote();
         return widgetshot.widgetToPng(self.overlay);
     }
 
@@ -5242,11 +5066,6 @@ pub const WebFace = struct {
     pub fn onSnapshot(self: *WebFace, ev: proto.SemSnapshot, request: u32) void {
         if (!self.acceptsOp(.snapshot, request)) return;
         const meta: AutoMeta = .{ .doc_gen = ev.doc_gen, .rev = ev.rev, .snap_kind = ev.kind };
-        if (self.allocator.dupe(u8, ev.payload.s)) |owned| {
-            if (self.last_snapshot) |old| self.allocator.free(old);
-            self.last_snapshot = owned;
-            self.last_snapshot_meta = meta;
-        } else |_| {}
         self.completeOp(.snapshot, request, true, ev.payload.s, meta);
     }
 
@@ -5287,85 +5106,36 @@ pub const WebFace = struct {
         }
     }
 
-    // ---- frame pacing ------------------------------------------------
+    // ---- frame rate --------------------------------------------------
 
-    /// Ask the helper for one frame, now.
-    fn requestFrame(self: *WebFace) void {
-        if (!self.view_live or !self.on_screen) return;
-        self.cl.post(proto.FrameRequest{ .view = self.view, .flags = 0 });
-        if (g_stats.enabled()) g_stats.reqs += 1;
-        if (g_lat.mode != .off and g_lat.pending and g_lat.req_us == 0)
-            g_lat.req_us = c.g_get_monotonic_time();
-        self.pacer.noteRequest(c.g_get_monotonic_time());
-    }
-
-    /// Ship the frame-rate cap the helper should apply — the configured
-    /// `browser_max_fps` clamped to the CURRENT output's real refresh
-    /// (`Pacer.effectiveFps`). The helper's internal scheduler paces
-    /// paints with it (`set_windowless_frame_rate`); only changes are
-    /// sent.
+    /// Ship the frame-rate cap the helper's scheduler applies
+    /// (`set_windowless_frame_rate`): `browser_max_fps` clamped to the
+    /// refresh of the output the view is on. Only changes are sent.
     fn syncMaxFps(self: *WebFace) void {
         if (!self.view_live) return;
-        const want = self.pacer.effectiveFps();
+        const want = effectiveMaxFps(g_max_fps, self.displayFps());
         if (want == self.sent_max_fps) return;
         self.sent_max_fps = want;
         self.cl.post(proto.ViewMaxFps{ .view = self.view, .fps = want });
     }
 
-    /// Go active: what every input, navigation and geometry change does.
-    /// Idempotent and cheap, so callers never check state first.
-    fn promote(self: *WebFace) void {
-        const was_idle = self.pacer.promote();
-        if (was_idle and paceLogging())
-            std.debug.print("webface pace: view {d} idle -> active ({d} fps)\n", .{ self.view, self.pacer.effectiveFps() });
-        self.ensureTick();
+    /// Refresh rate, in Hz, of the output the view's surface is on; the
+    /// default before the widget has a surface to ask about.
+    fn displayFps(self: *WebFace) u16 {
+        if (self.widgets_dead) return DEFAULT_DISPLAY_FPS;
+        const native = c.gtk_widget_get_native(self.view_area) orelse return DEFAULT_DISPLAY_FPS;
+        const surface = c.gtk_native_get_surface(native) orelse return DEFAULT_DISPLAY_FPS;
+        const monitor = c.gdk_display_get_monitor_at_surface(c.gdk_surface_get_display(surface), surface) orelse
+            return DEFAULT_DISPLAY_FPS;
+        const mhz = c.gdk_monitor_get_refresh_rate(monitor);
+        if (mhz <= 0) return DEFAULT_DISPLAY_FPS;
+        return @intCast(std.math.clamp(@divTrunc(mhz + 500, 1000), 1, 1000));
     }
 
-    /// Install the frame-clock tick if it is not already running, and
-    /// only while there is something on screen to pace. Modelled on
-    /// `TerminalSurface.ensureTickRunning`; the counterpart that takes
-    /// it away is `onTick` returning G_SOURCE_REMOVE, plus `stopTick`
-    /// for the paths that end the pacing outright.
-    fn ensureTick(self: *WebFace) void {
-        if (self.tick_id != 0) return;
-        if (self.widgets_dead or !self.on_screen) return;
-        if (self.pacer.state != .active) return;
-        self.tick_id = c.gtk_widget_add_tick_callback(
-            self.view_area,
-            @ptrCast(&onTick),
-            @ptrCast(self),
-            null,
-        );
-    }
-
-    fn stopTick(self: *WebFace) void {
-        if (self.tick_id == 0) return;
-        if (!self.widgets_dead) c.gtk_widget_remove_tick_callback(self.view_area, self.tick_id);
-        self.tick_id = 0;
-    }
-
-    /// Arm the idle floor. One 200ms timeout for the face's whole life;
-    /// it is what notices a page starting to animate on its own, and it
-    /// is deliberately NOT a tick.
-    fn startIdleTimer(self: *WebFace) void {
-        if (self.idle_timer != 0) return;
-        const ms: c_uint = @intCast(@divTrunc(pace.Pacer.idleIntervalUs(), 1000));
-        self.idle_timer = c.g_timeout_add(ms, @ptrCast(&onIdleTimer), @ptrCast(self));
-    }
-
-    /// End all pacing: tick gone, timeout gone, state reset. Idempotent,
-    /// and safe to call with the widgets already finalized.
-    fn stopPacing(self: *WebFace) void {
-        self.stopTick();
-        if (self.idle_timer != 0) {
-            _ = c.g_source_remove(self.idle_timer);
-            self.idle_timer = 0;
-        }
-        if (self.lat_timer != 0) {
-            _ = c.g_source_remove(self.lat_timer);
-            self.lat_timer = 0;
-        }
-        self.pacer.stop();
+    fn stopLatProbe(self: *WebFace) void {
+        if (self.lat_timer == 0) return;
+        _ = c.g_source_remove(self.lat_timer);
+        self.lat_timer = 0;
     }
 
     /// Arm the latency probe (measurement harness, env-gated).
@@ -5384,8 +5154,8 @@ pub const WebFace = struct {
         if (self.sent_w < 200 or self.sent_h < 200) return 1;
         if (g_lat.pending) {
             std.debug.print(
-                "weblat: {s} UNANSWERED after probe period (state {s}, {d} frames)\n",
-                .{ if (g_lat.expect_hover) "hover" else "clear", @tagName(self.pacer.state), g_lat.frames_seen },
+                "weblat: {s} UNANSWERED after probe period ({d} frames)\n",
+                .{ if (g_lat.expect_hover) "hover" else "clear", g_lat.frames_seen },
             );
         }
         g_lat.expect_hover = !g_lat.expect_hover;
@@ -5394,34 +5164,28 @@ pub const WebFace = struct {
         g_lat.pending = true;
         g_lat.frames_seen = 0;
         g_lat.arrival_us = 0;
-        g_lat.req_us = 0;
         g_lat.t_input_us = c.g_get_monotonic_time();
         self.sendPointer(.move, x, y, 0, 0, 0);
         return 1;
     }
 
-    /// A paint landed: keep the view active, and wake it if the page
-    /// started moving while nobody was touching it.
+    /// A paint landed: the latency probe's arrival clock.
     fn notePaint(self: *WebFace) void {
+        _ = self;
         if (g_lat.mode != .off and g_lat.pending) {
             g_lat.frames_seen += 1;
             if (g_lat.arrival_us == 0) g_lat.arrival_us = c.g_get_monotonic_time();
         }
-        if (self.pacer.notePaint() and paceLogging())
-            std.debug.print("webface pace: view {d} idle -> active (paint)\n", .{self.view});
-        self.ensureTick();
     }
 
     /// The page went on or off screen (tab switch, pane teardown). An
-    /// off-screen page is not painted at all: `view_hide` stops the
-    /// helper's own watchdog too, so nothing anywhere renders it — and
-    /// after `web_discard_minutes` of that, the page is let go entirely.
+    /// off-screen page is not painted at all (`view_hide`), and after
+    /// `web_discard_minutes` of that, the page is let go entirely.
     fn setOnScreen(self: *WebFace, on: bool) void {
         if (self.on_screen == on) return;
         self.on_screen = on;
         tabsChanged(); // MV2 onActivated
         if (on) {
-            if (paceLogging()) std.debug.print("webface pace: view {d} on screen\n", .{self.view});
             self.stopDiscardTimer();
             // `view_show` IS the revive frame, so the order below is
             // "clear our own discarded state, then show": the helper
@@ -5429,18 +5193,13 @@ pub const WebFace = struct {
             // on a face that is no longer dimmed.
             self.noteRevived();
             if (self.view_live) self.cl.post(proto.ViewShow{ .view = self.view });
-            self.startIdleTimer();
             self.startLatProbe();
-            // A tab coming forward must show its current content at
-            // once, not at the next idle tick.
-            self.promote();
             return;
         }
         if (self.view_live) self.cl.post(proto.ViewHide{ .view = self.view });
         self.cancelHints();
-        self.stopPacing();
+        self.stopLatProbe();
         self.armDiscardTimer();
-        if (paceLogging()) std.debug.print("webface pace: view {d} off screen (tick={d})\n", .{ self.view, self.tick_id });
     }
 
     // ---- tab discard --------------------------------------------------
@@ -5451,7 +5210,7 @@ pub const WebFace = struct {
     fn armDiscardTimer(self: *WebFace) void {
         if (self.discard_timer != 0 or self.discarded or self.observed) return;
         if (g_discard_minutes == 0 or self.on_screen) return;
-        if (!self.view_live or !self.cl.cap_discard) return;
+        if (!self.view_live or !self.cl.has(.discard)) return;
         const ms: u64 = @as(u64, g_discard_minutes) * 60 * 1000;
         self.discard_timer = c.g_timeout_add(
             @intCast(@min(ms, std.math.maxInt(c_uint))),
@@ -5489,18 +5248,17 @@ pub const WebFace = struct {
     pub fn discardNow(self: *WebFace) bool {
         if (self.discarded or !self.view_live) return false;
         const cl = self.cl;
-        if (!cl.cap_discard) return false;
+        if (!cl.has(.discard)) return false;
         self.stopDiscardTimer();
         cl.post(proto.ViewDiscard{ .view = self.view });
         self.discarded = true;
         self.abandonAutoOps(false);
         self.invalidateReaderGuards();
-        self.stopPacing();
+        self.stopLatProbe();
         self.dropMap();
         // A fresh helper-side view knows no cap; the revival re-sends.
         self.sent_max_fps = 0xffff;
         if (!self.widgets_dead) c.gtk_widget_add_css_class(self.picture, DISCARDED_CLASS);
-        if (paceLogging()) std.debug.print("webface pace: view {d} discarded\n", .{self.view});
         return true;
     }
 
@@ -5512,7 +5270,6 @@ pub const WebFace = struct {
         if (!self.discarded) return;
         self.discarded = false;
         if (!self.widgets_dead) c.gtk_widget_remove_css_class(self.picture, DISCARDED_CLASS);
-        if (paceLogging()) std.debug.print("webface pace: view {d} revived\n", .{self.view});
     }
 
     /// Bring a discarded page back on purpose, with `view_show` as the
@@ -5523,7 +5280,6 @@ pub const WebFace = struct {
         if (!self.discarded) return;
         self.noteRevived();
         if (self.view_live) self.cl.post(proto.ViewShow{ .view = self.view });
-        self.promote();
     }
 
     // ---- device scale ----------------------------------------------
@@ -5587,13 +5343,50 @@ pub const WebFace = struct {
             null,
             0,
         );
+        // A window dragged onto an output with another refresh rate
+        // moves the helper-side frame cap with it.
+        self.monitor_handler = c.g_signal_connect_data(
+            @ptrCast(surface),
+            "enter-monitor",
+            @ptrCast(&onSurfaceMonitor),
+            self,
+            null,
+            0,
+        );
+        // Stats only: count the surface's presents (see `Stats`). A
+        // signal on the frame clock, never a tick, so an idle surface's
+        // clock is left alone.
+        if (g_stats.enabled()) {
+            if (c.gdk_surface_get_frame_clock(surface)) |clock_obj| {
+                self.present_handler = c.g_signal_connect_data(
+                    @ptrCast(clock_obj),
+                    "after-paint",
+                    @ptrCast(&onAfterPaint),
+                    self,
+                    null,
+                    0,
+                );
+            }
+        }
     }
 
+    /// Disconnects everything `attachScaleWatch` connected. The frame
+    /// clock belongs to the surface, which this face holds a reference
+    /// to until the end of this call.
     fn detachScaleWatch(self: *WebFace) void {
         const surface = self.scale_surface orelse return;
         if (self.scale_handler != 0) {
             c.g_signal_handler_disconnect(@ptrCast(surface), self.scale_handler);
             self.scale_handler = 0;
+        }
+        if (self.monitor_handler != 0) {
+            c.g_signal_handler_disconnect(@ptrCast(surface), self.monitor_handler);
+            self.monitor_handler = 0;
+        }
+        if (self.present_handler != 0) {
+            if (c.gdk_surface_get_frame_clock(surface)) |clock_obj|
+                c.g_signal_handler_disconnect(@ptrCast(clock_obj), self.present_handler);
+            self.present_handler = 0;
         }
         c.g_object_unref(@ptrCast(surface));
         self.scale_surface = null;
@@ -6150,7 +5943,6 @@ pub const WebFace = struct {
                 .mods = 0,
             });
         }
-        self.promote();
         return true;
     }
 
@@ -6243,6 +6035,22 @@ pub const WebFace = struct {
 
     /// A helper connection came up (first start, or after a Reload).
     /// This tab's route, rebuilt from the face's own copies.
+    /// Whether this page leaves no trace in the daemon's web store: a page
+    /// in an EPHEMERAL container (an incognito tab, "private, throwaway"),
+    /// or a page this GUI only observes (a watched assistant's browsing is
+    /// not this user's). Such a page records no history, persists no
+    /// per-site override it makes (zoom, popups, blocking, permission
+    /// answers apply to it alone), and is offered only to other private
+    /// pages' address bars. An explicit bookmark is still the user's.
+    /// A container the registry no longer knows is judged by its id range,
+    /// so a destroyed incognito container can never read as persistent.
+    pub fn isPrivate(self: *const WebFace) bool {
+        if (self.observed) return true;
+        if (self.container == 0) return false;
+        if (findContainer(self.container)) |ctn| return ctn.ephemeral;
+        return self.container >= EPHEMERAL_CONTAINER_BASE;
+    }
+
     pub fn routeSpec(self: *const WebFace) webroute.Spec {
         return .{
             .kind = self.route_kind,
@@ -6422,7 +6230,6 @@ pub const WebFace = struct {
         self.obs_control = control;
         self.clearStatus();
         self.layoutObserved();
-        self.promote();
     }
 
     /// `ev_observe_state{refused}`: this page will never show.
@@ -6491,6 +6298,16 @@ pub const WebFace = struct {
                 self.setStatus("Browser view creation failed: the requested container is unavailable.", false);
                 return;
             }
+            // Only a helper that REFUSES an unknown context keeps the
+            // container's identity apart; an older one resolves a failed
+            // context through the shared jar and never says so. That is
+            // known from the `hello_ack` alone, whose handler kicks every
+            // waiter.
+            if (!cl.hello_done) return;
+            if (!cl.has(.contexts_fail_closed)) {
+                self.setStatus("This browser helper is too old to keep containers apart (no contexts-fail-closed capability). Update it, or open the page outside the container.", false);
+                return;
+            }
         }
         // THE FIRST BUFFER MUST ALREADY BE THE RIGHT SIZE. The area's
         // CURRENT allocation is the truth whenever it has one; the
@@ -6536,7 +6353,6 @@ pub const WebFace = struct {
         }
         // The first load has to paint promptly, and nothing paints
         // unless somebody asks.
-        self.promote();
         // Accessibility rides the view's lifecycle: every path that
         // mints the view (first create, helper restart) re-asserts it.
         self.ensureA11y();
@@ -6614,7 +6430,6 @@ pub const WebFace = struct {
         self.noteBufferGeometry(fb.w, fb.h);
         // A fresh buffer holds nothing yet: ask for the repaint that
         // fills it rather than waiting for the idle floor.
-        self.promote();
     }
 
     /// Hand a frame texture to the picture, sized to its LOGICAL extent
@@ -7035,8 +6850,8 @@ pub const WebFace = struct {
     // ---- web store (daemon-side history + per-site settings) --------
 
     /// Bookkeeping on a committed navigation: record the visit in the
-    /// daemon web store and, when the origin changed, fetch its stored
-    /// per-site zoom.
+    /// daemon web store (never for a private page, `isPrivate`) and,
+    /// when the origin changed, fetch its stored per-site settings.
     fn noteNavigation(self: *WebFace, url: []const u8) void {
         if (!recordableUrl(url)) {
             // A blank/error page is bookmarkable by nothing; make sure
@@ -7045,9 +6860,13 @@ pub const WebFace = struct {
             self.updateStar();
             return;
         }
-        webstore.recordVisit(self.allocator, url, "");
         if (self.visit_url) |u| self.allocator.free(u);
-        self.visit_url = self.allocator.dupe(u8, url) catch null;
+        self.visit_url = null;
+        if (!self.isPrivate()) {
+            webstore.recordVisit(self.allocator, url, "");
+            // The pending history entry `onTitle` completes.
+            self.visit_url = self.allocator.dupe(u8, url) catch null;
+        }
         // Per-URL, not per-origin: two pages of one site are two
         // different bookmarks.
         self.refreshBookmarkState();
@@ -7068,7 +6887,9 @@ pub const WebFace = struct {
         self.site_popup = .inherit;
         self.pushPopupPolicy();
         self.nav_origin = self.allocator.dupe(u8, origin) catch null;
-        _ = webstore.siteGet(self.allocator, origin, @ptrCast(self), &onSiteReply);
+        // An observed page's site settings are its owner's: the helper
+        // refuses every one of them for an observer anyway.
+        if (!self.observed) _ = webstore.siteGet(self.allocator, origin, @ptrCast(self), &onSiteReply);
     }
 
     /// Only real documents make history; about:/data:/chrome-error
@@ -7241,7 +7062,6 @@ pub const WebFace = struct {
 
     pub fn onLoad(self: *WebFace, ev: proto.EvLoad) void {
         // A document changing state is about to paint.
-        self.promote();
         if (ev.state == @intFromEnum(proto.LoadState.started)) {
             navfault.loadStarted(self.allocator, &self.cert_rec, &self.load_error_rec, ev.url);
             self.cancelHints();
@@ -7265,7 +7085,7 @@ pub const WebFace = struct {
             // growing clamps to its current height and lands short.
             if (self.pending_scroll) |want| {
                 self.pending_scroll = null;
-                if (self.view_live and self.cl.cap_scroll)
+                if (self.view_live and self.cl.has(.scroll))
                     self.cl.post(proto.ScrollTo{ .view = self.view, .x = want.x, .y = want.y });
             }
         }
@@ -7349,7 +7169,7 @@ pub const WebFace = struct {
         if (self.cert_rec) |*rec| rec.verdict = if (proceed) .accepted else .refused;
         // A helper without the capability never sent the event, so it
         // can only be a decision for a request nobody holds.
-        if (self.cl.has_tls) self.cl.post(proto.CertDecision{
+        if (self.cl.has(.tls)) self.cl.post(proto.CertDecision{
             .view = self.view,
             .proceed = if (proceed) 1 else 0,
         });
@@ -7359,7 +7179,6 @@ pub const WebFace = struct {
             // moment the user overrode the verification.
             self.cert_exception = true;
             self.updateSiteButton();
-            self.promote();
             return;
         }
         // "Back to safety" means LEAVING, not sitting on a cancelled
@@ -7406,7 +7225,7 @@ pub const WebFace = struct {
     }
 
     fn postPermission(self: *WebFace, prompt: u64, allow: bool) void {
-        if (!self.cl.has_permissions) return;
+        if (!self.cl.has(.permissions)) return;
         self.cl.post(proto.PermissionDecision{
             .view = self.view,
             .prompt = prompt,
@@ -7438,7 +7257,9 @@ pub const WebFace = struct {
                 return;
             };
         }
-        if (g_site_setting_sink) |sink| sink(origin, types, allow);
+        if (!self.isPrivate()) {
+            if (g_site_setting_sink) |sink| sink(origin, types, allow);
+        }
     }
 
     /// Show the head of the queue, or hide the banner when it is empty.
@@ -7552,7 +7373,7 @@ pub const WebFace = struct {
     /// in progress — the client re-checks the gesture bit when the
     /// popup is announced.
     fn pushPopupPolicy(self: *WebFace) void {
-        if (!self.cl.cap_popup_open) return;
+        if (!self.cl.has(.popup_open)) return;
         const allow = self.popupAllowed(true);
         self.cl.post(proto.PopupPolicySet{
             .view = self.view,
@@ -7773,7 +7594,6 @@ pub const WebFace = struct {
         // as well would load the old address first.
         self.noteRevived();
         cl.post(proto.Navigate{ .view = self.view, .url = url });
-        self.promote();
     }
 
     pub fn navAction(self: *WebFace, action: proto.NavAct) void {
@@ -7782,7 +7602,6 @@ pub const WebFace = struct {
         self.noteRevived();
         self.cl.post(proto.NavAction{ .view = self.view, .action = @intFromEnum(action) });
         if (action == .stop) self.invalidateReaderGuards();
-        self.promote();
     }
 
     // ---- find-in-page ----------------------------------------------
@@ -7825,7 +7644,6 @@ pub const WebFace = struct {
             .find_next = 0,
             .text = q,
         });
-        self.promote();
     }
 
     /// Step through the current search's matches.
@@ -7840,7 +7658,6 @@ pub const WebFace = struct {
             .find_next = 1,
             .text = q,
         });
-        self.promote();
     }
 
     pub fn onFindResult(self: *WebFace, ev: proto.EvFindResult) void {
@@ -7891,7 +7708,7 @@ pub const WebFace = struct {
             self.syncReaderButton(false);
             return;
         }
-        if (self.cl.cap_reader_ids) {
+        if (self.cl.has(.reader_ids)) {
             const parsed = reader_model.parse(self.allocator, res.text) catch {
                 self.toast("Could not read this page.");
                 self.syncReaderButton(false);
@@ -8044,10 +7861,9 @@ pub const WebFace = struct {
         self.zoom_x100 = level_x100;
         // A user-chosen zoom is a per-site setting: persist it on the
         // daemon so the origin comes back at this zoom (0 clears).
-        if (self.nav_origin) |o| webstore.siteSetZoom(self.allocator, o, level_x100);
+        if (self.storeOrigin()) |o| webstore.siteSetZoom(self.allocator, o, level_x100);
         if (!self.view_live) return;
         self.cl.post(proto.SetZoom{ .view = self.view, .level_x100 = level_x100 });
-        self.promote();
     }
 
     /// Face-local chords, tried after the window bindings and before
@@ -8196,75 +8012,20 @@ pub const WebFace = struct {
             &onMenuSiteStyle,
             ctx,
         );
-        // A helper too old for either verb greys the row out rather
-        // than hiding it: what a browser pane CAN do stays visible.
-        const cl = self.cl;
-        const tools = m.section();
-        tools.itemIconEnabled(
-            "Print to PDF…",
-            .{ .name = "document-print-symbolic" },
-            // A remote helper would write the PDF on ITS host; greyed
-            // out until the remote fetch path exists.
-            self.view_live and cl.cap_print_pdf and !cl.isRemote(),
-            &onMenuPrintPdf,
-            ctx,
-        );
-        tools.itemIconEnabled(
-            "Open DevTools",
-            .{ .name = "applications-engineering-symbolic" },
-            self.view_live and !self.attached and cl.cap_devtools,
-            &onMenuDevTools,
-            ctx,
-        );
-        tools.itemIconEnabled(
-            "Fill Password…",
-            .{ .name = "dialog-password-symbolic" },
-            self.view_live and ctx.page != null,
-            &onMenuFillPassword,
-            ctx,
-        );
+        self.appendToolRows(m, ctx);
 
         // Container / identity actions.
         const tabs = m.section();
         tabs.itemIcon("New Incognito Web Tab", .{ .name = "view-private-symbolic" }, &onMenuIncognito, ctx);
+        const cl = self.cl;
         tabs.itemIconEnabled(
             if (cl.isRemote()) "Extensions (local browsers only)" else "Extensions...",
             .{ .name = "application-x-addon-symbolic" },
-            cl.cap_webext and !cl.isRemote(),
+            cl.has(.webext) and !cl.isRemote(),
             &onMenuExtensions,
             ctx,
         );
-        if (containers().len != 0) {
-            const cont = tabs.submenu("New Tab in Container");
-            for (containers()) |*ctn| {
-                const rc = self.allocator.create(ContainerRowCtx) catch continue;
-                rc.* = .{ .allocator = self.allocator, .face = self, .container = ctn.id };
-                root.own(freeContainerRowCtx, rc);
-                var lbuf: [128]u8 = undefined;
-                cont.item(classicmenu.escapeLabel(ctn.name, &lbuf), &onMenuOpenInContainer, rc);
-            }
-        }
-        tabs.itemIcon("Containers…", .{ .name = "system-users-symbolic" }, &onMenuContainers, ctx);
-        // "Always open this site in X" for the page in front of the
-        // user. The rule is keyed on the HOST, re-derived at click time
-        // from the face's current address, so the row owns no string.
-        if (self.url != null and containers().len != 0) {
-            const asg = tabs.submenu("Always Open This Site In");
-            const none_rc = self.allocator.create(ContainerRowCtx) catch null;
-            if (none_rc) |rc| {
-                rc.* = .{ .allocator = self.allocator, .face = self, .container = 0 };
-                root.own(freeContainerRowCtx, rc);
-                asg.item("No container", &onMenuAssignSite, rc);
-            }
-            for (containers()) |*ctn| {
-                if (ctn.ephemeral) continue;
-                const rc = self.allocator.create(ContainerRowCtx) catch continue;
-                rc.* = .{ .allocator = self.allocator, .face = self, .container = ctn.id };
-                root.own(freeContainerRowCtx, rc);
-                var abuf: [128]u8 = undefined;
-                asg.item(classicmenu.escapeLabel(ctn.name, &abuf), &onMenuAssignSite, rc);
-            }
-        }
+        self.appendContainerRows(root, tabs, ctx);
 
         const x: f64 = @floatFromInt(ev.x + @as(i32, self.snap_dx));
         const y: f64 = @floatFromInt(ev.y + @as(i32, self.snap_dy));
@@ -8280,6 +8041,62 @@ pub const WebFace = struct {
     fn freeContainerRowCtx(user: ?*anyopaque) callconv(.c) void {
         const ctx = cast.userData(ContainerRowCtx, user);
         ctx.allocator.destroy(ctx);
+    }
+
+    /// The tools section both menus share, judged against the tab's OWN
+    /// helper. A helper too old for a verb greys the row out rather than
+    /// hiding it: what a browser pane CAN do stays visible.
+    fn appendToolRows(self: *WebFace, m: classicmenu.Menu, ctx: *MenuCtx) void {
+        const tools = m.section();
+        tools.itemIconEnabled("Print to PDF…", .{ .name = "document-print-symbolic" }, self.canPrintPdf(), &onMenuPrintPdf, ctx);
+        tools.itemIconEnabled(
+            "Open DevTools",
+            .{ .name = "applications-engineering-symbolic" },
+            self.devToolsRefusal() == null,
+            &onMenuDevTools,
+            ctx,
+        );
+        tools.itemIconEnabled(
+            "Fill Password…",
+            .{ .name = "dialog-password-symbolic" },
+            self.view_live and ctx.page != null,
+            &onMenuFillPassword,
+            ctx,
+        );
+    }
+
+    /// The container rows both menus share: a new tab in a container,
+    /// the manager, and "always open this site in X" for the page in
+    /// front of the user. The site rule is keyed on the HOST, re-derived
+    /// at click time from the face's current address, so no row owns a
+    /// string.
+    fn appendContainerRows(self: *WebFace, root: *classicmenu.Root, tabs: classicmenu.Menu, ctx: *MenuCtx) void {
+        if (containers().len != 0) {
+            const cont = tabs.submenu("New Tab in Container");
+            for (containers()) |*ctn| {
+                const rc = self.allocator.create(ContainerRowCtx) catch continue;
+                rc.* = .{ .allocator = self.allocator, .face = self, .container = ctn.id };
+                root.own(freeContainerRowCtx, rc);
+                var lbuf: [128]u8 = undefined;
+                cont.item(classicmenu.escapeLabel(ctn.name, &lbuf), &onMenuOpenInContainer, rc);
+            }
+        }
+        tabs.itemIcon("Containers…", .{ .name = "system-users-symbolic" }, &onMenuContainers, ctx);
+        if (self.url == null or containers().len == 0) return;
+        const asg = tabs.submenu("Always Open This Site In");
+        if (self.allocator.create(ContainerRowCtx) catch null) |rc| {
+            rc.* = .{ .allocator = self.allocator, .face = self, .container = 0 };
+            root.own(freeContainerRowCtx, rc);
+            asg.item("No container", &onMenuAssignSite, rc);
+        }
+        for (containers()) |*ctn| {
+            if (ctn.ephemeral) continue;
+            const rc = self.allocator.create(ContainerRowCtx) catch continue;
+            rc.* = .{ .allocator = self.allocator, .face = self, .container = ctn.id };
+            root.own(freeContainerRowCtx, rc);
+            var abuf: [128]u8 = undefined;
+            asg.item(classicmenu.escapeLabel(ctn.name, &abuf), &onMenuAssignSite, rc);
+        }
     }
 
     fn onMenuIncognito(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
@@ -8330,7 +8147,7 @@ pub const WebFace = struct {
     /// @return false when no helper can take it, so the pane binding
     /// falls through to the terminal exactly as before.
     fn pasteFromClipboard(self: *WebFace) bool {
-        if (!self.view_live or !self.cl.cap_clipboard) return false;
+        if (!self.view_live or !self.cl.has(.clipboard)) return false;
         const ctx = self.allocator.create(PasteCtx) catch return false;
         ctx.* = .{ .allocator = self.allocator, .cl = self.cl, .view = self.view };
         if (!clipboard.readFrom(
@@ -8352,7 +8169,7 @@ pub const WebFace = struct {
     /// `cut` also deletes the selection, helper-side and after the
     /// answer, so the text cannot be lost to a racing delete.
     fn copyToClipboard(self: *WebFace, cut: bool) bool {
-        if (!self.view_live or !self.cl.cap_clipboard) return false;
+        if (!self.view_live or !self.cl.has(.clipboard)) return false;
         self.clip_seq +%= 1;
         self.cl.post(proto.ClipboardRead{
             .view = self.view,
@@ -8473,14 +8290,11 @@ pub const WebFace = struct {
     /// once, so the next popup from the page obeys without a reload.
     fn onMenuAllowPopups(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
         const face = cast.userData(MenuCtx, user).face;
-        const origin = face.nav_origin orelse return;
-        if (face.site_popup == .allow) {
-            face.site_popup = .inherit;
-            webstore.siteSetPopup(face.allocator, origin, "");
-        } else {
-            face.site_popup = .allow;
-            webstore.siteSetPopup(face.allocator, origin, "allow");
-        }
+        if (face.nav_origin == null) return;
+        face.site_popup = if (face.site_popup == .allow) .inherit else .allow;
+        face.pushPopupPolicy();
+        if (face.storeOrigin()) |origin|
+            webstore.siteSetPopup(face.allocator, origin, if (face.site_popup == .allow) "allow" else "");
     }
 
     fn onMenuHistory(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
@@ -8587,29 +8401,7 @@ pub const WebFace = struct {
             ctx,
         );
 
-        const cl = client();
-        const tools = m.section();
-        tools.itemIconEnabled(
-            "Print to PDF…",
-            .{ .name = "document-print-symbolic" },
-            self.view_live and cl.cap_print_pdf,
-            &onMenuPrintPdf,
-            ctx,
-        );
-        tools.itemIconEnabled(
-            "Open DevTools",
-            .{ .name = "applications-engineering-symbolic" },
-            self.view_live and !self.attached and cl.cap_devtools,
-            &onMenuDevTools,
-            ctx,
-        );
-        tools.itemIconEnabled(
-            "Fill Password…",
-            .{ .name = "dialog-password-symbolic" },
-            self.view_live and ctx.page != null,
-            &onMenuFillPassword,
-            ctx,
-        );
+        self.appendToolRows(m, ctx);
 
         const tabs = m.section();
         tabs.itemIcon("New Incognito Web Tab", .{ .name = "view-private-symbolic" }, &onMenuIncognito, ctx);
@@ -8624,37 +8416,7 @@ pub const WebFace = struct {
             const rm = tabs.submenuIcon(rlabel.ptr, .{ .name = current.icon() });
             self.appendRouteRows(root, rm, current);
         }
-        if (containers().len != 0) {
-            const cont = tabs.submenu("New Tab in Container");
-            for (containers()) |*ctn| {
-                const rc = self.allocator.create(ContainerRowCtx) catch continue;
-                rc.* = .{ .allocator = self.allocator, .face = self, .container = ctn.id };
-                root.own(freeContainerRowCtx, rc);
-                var lbuf: [128]u8 = undefined;
-                cont.item(classicmenu.escapeLabel(ctn.name, &lbuf), &onMenuOpenInContainer, rc);
-            }
-        }
-        tabs.itemIcon("Containers…", .{ .name = "system-users-symbolic" }, &onMenuContainers, ctx);
-        // "Always open this site in X" for the page in front of the
-        // user. The rule is keyed on the HOST, re-derived at click time
-        // from the face's current address, so the row owns no string.
-        if (self.url != null and containers().len != 0) {
-            const asg = tabs.submenu("Always Open This Site In");
-            const none_rc = self.allocator.create(ContainerRowCtx) catch null;
-            if (none_rc) |rc| {
-                rc.* = .{ .allocator = self.allocator, .face = self, .container = 0 };
-                root.own(freeContainerRowCtx, rc);
-                asg.item("No container", &onMenuAssignSite, rc);
-            }
-            for (containers()) |*ctn| {
-                if (ctn.ephemeral) continue;
-                const rc = self.allocator.create(ContainerRowCtx) catch continue;
-                rc.* = .{ .allocator = self.allocator, .face = self, .container = ctn.id };
-                root.own(freeContainerRowCtx, rc);
-                var abuf: [128]u8 = undefined;
-                asg.item(classicmenu.escapeLabel(ctn.name, &abuf), &onMenuAssignSite, rc);
-            }
-        }
+        self.appendContainerRows(root, tabs, ctx);
         var shell_buf: [96]u8 = undefined;
         tabs.itemIconEnabled(
             self.shellRowLabel(&shell_buf),
@@ -8884,12 +8646,19 @@ pub const WebFace = struct {
     /// Ask the helper for this page's inspector. The pane is opened by
     /// the REPLY (`ev_devtools_view`), because only then is there a
     /// view id to present.
+    /// Why DevTools cannot open for this page, or null when it can. An
+    /// inspector cannot inspect itself, and a REMOTE page's inspector
+    /// would open in a window on the remote host, where nobody sees it.
+    fn devToolsRefusal(self: *const WebFace) ?[]const u8 {
+        if (self.attached or !self.view_live) return "";
+        if (!self.cl.has(.devtools)) return "This browser helper is too old for DevTools.";
+        if (self.cl.isRemote()) return "DevTools is not available for a page running on another host: the engine would open it in a window there.";
+        return null;
+    }
+
     pub fn openDevTools(self: *WebFace) void {
-        // An inspector cannot inspect itself.
-        if (self.attached) return;
-        if (!self.view_live) return;
-        if (!self.cl.cap_devtools) {
-            self.toast("This browser helper is too old for DevTools.");
+        if (self.devToolsRefusal()) |why| {
+            if (why.len != 0) self.toast(why);
             return;
         }
         if (self.devtools_pending) return;
@@ -8941,13 +8710,31 @@ pub const WebFace = struct {
         view: u32,
     };
 
-    /// Save dialog -> `print_pdf`. The helper writes the file itself
-    /// (it is the process holding the page), so the pick has to be a
-    /// path on THIS machine.
+    /// Whether Print to PDF can put a PDF on THIS machine: a local helper
+    /// writes the picked path itself, a remote one prints into a staged
+    /// file the daemon's file service then brings here, which needs
+    /// `print-pdf-staging`. An attached view's page is not this tab's to
+    /// print (the helper refuses the frame for an observer).
+    fn canPrintPdf(self: *const WebFace) bool {
+        return self.printRefusal() == null;
+    }
+
+    fn printRefusal(self: *const WebFace) ?[]const u8 {
+        if (!self.view_live) return "This page is not loaded.";
+        if (self.attached) return "This view presents another page and cannot be printed from here.";
+        if (!self.cl.has(.print_pdf)) return "This browser helper is too old to print to PDF.";
+        if (self.cl.isRemote() and !self.cl.has(.print_pdf_staging))
+            return "The browser helper on the remote host is too old to send a PDF to this computer (no print-pdf-staging capability).";
+        return null;
+    }
+
+    /// Save dialog -> `print_pdf`. The pick is always a path on THIS
+    /// machine: a local helper writes it itself, a remote one prints into
+    /// a staged file on its host and the PDF is delivered here afterwards
+    /// (`deliverStagedPdf`).
     pub fn printToPdf(self: *WebFace) void {
-        if (!self.view_live) return;
-        if (!self.cl.cap_print_pdf) {
-            self.toast("This browser helper is too old to print to PDF.");
+        if (self.printRefusal()) |why| {
+            if (self.view_live) self.toast(why);
             return;
         }
         const pickwin = @import("picker.zig");
@@ -8994,14 +8781,15 @@ pub const WebFace = struct {
         const res = result orelse return;
         if (res.specs.len == 0) return;
         const win: ?*c.GtkWindow = if (self.ownerWindow()) |w| @ptrCast(w.app_window) else null;
-        // The HELPER writes the file and it runs on this machine; a
-        // `host:/path` pick has nothing that could honour it.
+        // The PDF lands on THIS machine whichever host the page lives on,
+        // so a `host:/path` pick has nothing that could honour it.
         const path = @import("picker.zig").localPathOrRefuse(
             win,
             res.specs[0],
-            "The browser engine writes the PDF itself, on this machine — pick a local path.",
+            "Print to PDF saves on this computer; pick a local path.",
         ) orelse return;
-        if (!self.view_live) return;
+        if (self.printRefusal()) |why| return self.toast(why);
+        const remote = self.cl.isRemote();
         self.cl.post(proto.PrintPdf{
             .view = self.view,
             // Background graphics ON: a page saved without them looks
@@ -9009,17 +8797,23 @@ pub const WebFace = struct {
             .flags = proto.print_flag_background,
             .paper = @intFromEnum(proto.Paper.default),
             .path = path,
+            .stage = @intFromBool(remote),
         });
         var msg: [512]u8 = undefined;
-        self.toast(std.fmt.bufPrint(&msg, "Printing to {s}…", .{path}) catch "Printing to PDF…");
+        self.toast(if (remote)
+            std.fmt.bufPrint(&msg, "Printing on {s}; the PDF will be sent to {s}…", .{ self.cl.hostSlice(), path }) catch "Printing to PDF…"
+        else
+            std.fmt.bufPrint(&msg, "Printing to {s}…", .{path}) catch "Printing to PDF…");
     }
 
-    fn onPrintDone(self: *WebFace, ok: bool, path: []const u8) void {
+    fn onPrintDone(self: *WebFace, ev: proto.EvPrintPdfDone) void {
+        const path = ev.path;
         var msg: [512]u8 = undefined;
-        if (!ok) {
+        if (ev.ok == 0) {
             self.toast(std.fmt.bufPrint(&msg, "Could not write {s}", .{path}) catch "Could not write the PDF");
             return;
         }
+        if (ev.staged.len != 0) return self.deliverStagedPdf(ev.staged, path);
         const win = self.ownerWindow() orelse return;
         const text = std.fmt.bufPrintZ(&msg, "Saved {s}", .{path}) catch "Saved the PDF";
         const note = c.adw_toast_new(text.ptr);
@@ -9046,6 +8840,43 @@ pub const WebFace = struct {
             );
         } else |_| {}
         c.adw_toast_overlay_add_toast(win.toast_overlay, note);
+    }
+
+    /// A remote helper printed into `staged` on its own host: bring that
+    /// file to `local_path` through the daemon's durable transfer, as a
+    /// row of the download strip, so progress, cancel, delivery retry
+    /// and Open behave exactly as they do for a downloaded file. The
+    /// transfer consumes the staged file once delivery is verified.
+    fn deliverStagedPdf(self: *WebFace, staged: []const u8, local_path: []const u8) void {
+        const a = self.allocator;
+        const d = a.create(Download) catch return self.toast("Could not record the PDF delivery.");
+        d.* = .{
+            .id = 0,
+            .name = a.dupe(u8, std.fs.path.basename(local_path)) catch &.{},
+            .path = a.dupe(u8, staged) catch &.{},
+            .remote_host = &.{},
+            .remote_path = a.dupe(u8, local_path) catch &.{},
+            .source_host = a.dupe(u8, self.cl.hostSlice()) catch &.{},
+            .staged = true,
+            .downloaded = true,
+            .row = undefined,
+            .label = undefined,
+            .bar = undefined,
+            .status = undefined,
+            .cancel_btn = undefined,
+            .open_btn = undefined,
+            .reveal_btn = undefined,
+        };
+        if (d.path.len == 0 or d.remote_path.len == 0 or d.source_host.len == 0) {
+            d.free(a);
+            return self.toast("Could not record the PDF delivery.");
+        }
+        self.downloads.append(a, d) catch {
+            d.free(a);
+            return self.toast("Could not record the PDF delivery.");
+        };
+        self.buildDlRow(d);
+        self.beginHandoff(d);
     }
 
     /// Hand the finished PDF to whatever the desktop opens PDFs with.
@@ -9081,8 +8912,8 @@ pub const WebFace = struct {
     /// the user can see (and cancel) what an assistant is fetching.
     pub fn webDownloadStart(self: *WebFace, url: []const u8, path: []const u8) ?u32 {
         if (self.widgets_dead) return null;
-        if (!self.cl.cap_downloads or !self.cl.cap_download_start) return null;
-        if (self.cl.isRemote() and !self.cl.cap_download_staging) return null;
+        if (!self.cl.has(.downloads) or !self.cl.has(.download_start)) return null;
+        if (self.cl.isRemote() and !self.cl.has(.download_staging)) return null;
         // A watched page is another client's view: the helper drops
         // `download_start` for an alias at its edge (`observerAllows`)
         // with no reply, so the request would sit `pending` until the
@@ -9114,10 +8945,10 @@ pub const WebFace = struct {
     /// Whether a remote-browser container is what refused a download
     /// request, so the caller can say WHY rather than "unavailable".
     pub fn webDownloadRefusal(self: *WebFace) []const u8 {
-        if (self.cl.isRemote() and !self.cl.cap_download_staging) return "update the remote browser helper to support download delivery";
+        if (self.cl.isRemote() and !self.cl.has(.download_staging)) return "update the remote browser helper to support download delivery";
         if (self.cl.observer) return "this pane watches another client's page; downloads belong to the page's owner";
-        if (!self.cl.cap_downloads) return "this browser helper does not report downloads";
-        if (!self.cl.cap_download_start) return "this browser helper cannot start a download for a url (capability 'download-start')";
+        if (!self.cl.has(.downloads)) return "this browser helper does not report downloads";
+        if (!self.cl.has(.download_start)) return "this browser helper cannot start a download for a url (capability 'download-start')";
         return "the web view cannot take a download request now";
     }
 
@@ -9294,7 +9125,7 @@ pub const WebFace = struct {
         // with a visible reason until the remote download path (helper
         // staging dir -> daemon file_get -> local pick) is designed;
         // this branch is the seam it plugs into.
-        if (self.cl.isRemote() and !self.cl.cap_download_staging) {
+        if (self.cl.isRemote() and !self.cl.has(.download_staging)) {
             declineDownload(ev.view, ev.id);
             self.toast("Update the remote browser helper to save downloads on this or another machine.");
             return;
@@ -9598,7 +9429,7 @@ pub const WebFace = struct {
     fn updateDlRow(self: *WebFace, d: *Download) void {
         if (self.widgets_dead) return;
         if (d.retry_btn) |button| {
-            c.gtk_widget_set_visible(button, @intFromBool(d.state == .failed and download_policy.retryAction(d.downloaded, d.url.len != 0, self.cl.cap_download_start) != .unavailable));
+            c.gtk_widget_set_visible(button, @intFromBool(d.state == .failed and download_policy.retryAction(d.downloaded, d.url.len != 0, self.cl.has(.download_start)) != .unavailable));
             c.gtk_widget_set_tooltip_text(button, if (d.downloaded) "Retry delivery of the completed download" else "Retry download from the beginning");
         }
         c.gtk_widget_set_visible(d.open_btn, @intFromBool(d.state == .done and d.remote_host.len == 0));
@@ -9898,7 +9729,7 @@ pub const WebFace = struct {
             self.beginHandoff(d);
             return;
         }
-        if (!self.view_live or !self.cl.cap_download_start or d.url.len == 0) {
+        if (!self.view_live or !self.cl.has(.download_start) or d.url.len == 0) {
             self.toast("Reload the page before retrying this download.");
             return;
         }
@@ -10012,7 +9843,7 @@ pub const WebFace = struct {
         const self = cast.userData(WebFace, user);
         const want = !self.net_enabled;
         self.setNetwork(want);
-        if (self.nav_origin) |origin| {
+        if (self.storeOrigin()) |origin| {
             // A choice that matches the global default clears the
             // override rather than pinning it, so changing the default
             // later still moves this site.
@@ -10115,69 +9946,6 @@ pub const WebFace = struct {
         _ = c.gtk_widget_grab_focus(self.entry);
     }
 
-    /// Frame-clock tick: one frame request per refresh, capped.
-    ///
-    /// SELF-REMOVING, and that is the load-bearing property — see the
-    /// header. It leaves whenever there is nothing to pace (page gone
-    /// quiet, view off screen, widgets dying), zeroing `tick_id` on the
-    /// way out exactly like `terminal_surface.zig`'s tick does.
-    fn onTick(_: *c.GtkWidget, frame_clock: *c.GdkFrameClock, user: ?*anyopaque) callconv(.c) c.gboolean {
-        const self = cast.userData(WebFace, user);
-        if (self.widgets_dead or !self.on_screen or !self.view_live or self.pacer.state != .active) {
-            self.tick_id = 0;
-            return 0; // G_SOURCE_REMOVE
-        }
-        // Pace against the CURRENT output: dragging the window from the
-        // 60Hz panel to the 165Hz one changes this with no config
-        // change and no reconnect.
-        if (g_stats.enabled()) g_stats.ticks += 1;
-        self.pacer.display_fps = refreshFps(frame_clock, self.pacer.display_fps);
-        // A changed refresh rate (window dragged across outputs) moves
-        // the helper-side cap with it.
-        self.syncMaxFps();
-        if (self.pacer.dueAt(c.g_get_monotonic_time())) self.requestFrame();
-        if (self.pacer.demoteDue()) {
-            self.pacer.demote();
-            self.tick_id = 0;
-            if (paceLogging())
-                std.debug.print("webface pace: view {d} active -> idle\n", .{self.view});
-            return 0; // G_SOURCE_REMOVE
-        }
-        return 1; // G_SOURCE_CONTINUE
-    }
-
-    /// The idle floor: a few requests a second so a page that starts
-    /// moving on its own is noticed. Runs for the face's whole life and
-    /// does nothing at all while the tick is pacing.
-    fn onIdleTimer(user: ?*anyopaque) callconv(.c) c.gboolean {
-        const self = cast.userData(WebFace, user);
-        if (self.widgets_dead) {
-            self.idle_timer = 0;
-            return 0; // G_SOURCE_REMOVE
-        }
-        if (self.pacer.state == .idle) {
-            // THE KWIN-CRASH GUARD, checked from outside the tick's own
-            // callback so it observes what actually happened: an idle
-            // face must hold no frame-clock tick. An explicit branch,
-            // not std.debug.assert — this project builds ReleaseFast,
-            // where that compiles away.
-            if (paceLogging()) {
-                std.debug.print("webface pace: view {d} idle, tick_id={d}\n", .{ self.view, self.tick_id });
-                if (self.tick_id != 0) @panic("webface: idle with a frame-clock tick still installed");
-            }
-            self.requestFrame();
-            return 1; // G_SOURCE_CONTINUE
-        }
-        // Active, but the tick has not asked for anything in an idle
-        // interval: the frame clock is not running (an occluded or
-        // unredirected surface stops it). The tick being the ONLY
-        // requester would freeze the page here, so the floor applies in
-        // both states — it just never fires while the tick delivers.
-        if (c.g_get_monotonic_time() - self.pacer.last_req_us >= pace.Pacer.idleIntervalUs())
-            self.requestFrame();
-        return 1; // G_SOURCE_CONTINUE
-    }
-
     fn onAreaMap(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
         cast.userData(WebFace, user).setOnScreen(true);
     }
@@ -10194,6 +9962,7 @@ pub const WebFace = struct {
         const self = cast.userData(WebFace, user);
         self.attachScaleWatch();
         self.syncScale();
+        self.syncMaxFps();
     }
 
     fn onAreaUnrealize(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
@@ -10263,12 +10032,10 @@ pub const WebFace = struct {
         if (!matched) return;
         const now = c.g_get_monotonic_time();
         const arr = if (g_lat.arrival_us != 0) g_lat.arrival_us else now;
-        const req = if (g_lat.req_us != 0) g_lat.req_us else now;
         std.debug.print(
-            "weblat: {s} input->req {d:.1} ms, ->arrival {d:.1} ms, ->pixel {d:.1} ms, {d} frames\n",
+            "weblat: {s} input->arrival {d:.1} ms, ->pixel {d:.1} ms, {d} frames\n",
             .{
                 if (g_lat.expect_hover) "hover" else "clear",
-                @as(f64, @floatFromInt(req - g_lat.t_input_us)) / 1000.0,
                 @as(f64, @floatFromInt(arr - g_lat.t_input_us)) / 1000.0,
                 @as(f64, @floatFromInt(now - g_lat.t_input_us)) / 1000.0,
                 g_lat.frames_seen,
@@ -10279,6 +10046,14 @@ pub const WebFace = struct {
 
     fn onSurfaceScale(_: ?*c.GObject, _: ?*c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
         cast.userData(WebFace, user).syncScale();
+    }
+
+    fn onSurfaceMonitor(_: ?*c.GdkSurface, _: ?*c.GdkMonitor, user: ?*anyopaque) callconv(.c) void {
+        cast.userData(WebFace, user).syncMaxFps();
+    }
+
+    fn onAfterPaint(_: ?*c.GdkFrameClock, _: ?*anyopaque) callconv(.c) void {
+        g_stats.presents += 1;
     }
 
     fn onResize(_: ?*c.GtkDrawingArea, w: c_int, h: c_int, user: ?*anyopaque) callconv(.c) void {
@@ -10308,7 +10083,6 @@ pub const WebFace = struct {
             .h = nh,
             .scale_x1000 = scale,
         });
-        self.promote();
     }
 
     /// `webframe.wireInput` sink. The GDK-to-protocol translation is
@@ -10358,7 +10132,6 @@ pub const WebFace = struct {
                 .dy = webframe.wheelDelta(dy),
                 .mods = mods,
             });
-            self.promote();
             return 1;
         }
 
@@ -10398,7 +10171,6 @@ pub const WebFace = struct {
             if (focused) tabsChanged();
             if (!self.view_live) return;
             self.cl.post(proto.InputFocus{ .view = self.view, .focused = @intFromBool(focused) });
-            if (focused) self.promote();
         }
     };
 
@@ -10432,7 +10204,6 @@ pub const WebFace = struct {
         });
         // ANY input goes active immediately, so the paint it causes has
         // no pacing latency added to it.
-        self.promote();
     }
 
     fn sendKey(
@@ -10455,7 +10226,6 @@ pub const WebFace = struct {
             .mods = mods,
             .text = text,
         });
-        self.promote();
         return 1;
     }
 };
@@ -10489,25 +10259,6 @@ fn webCopySink(pane_ctx: ?*anyopaque, cut: bool) bool {
     if (!pane.webFaceVisible()) return false;
     const face = WebFace.fromPane(pane) orelse return false;
     return face.copyToClipboard(cut);
-}
-
-/// The refresh rate of the output this frame clock drives, or `fallback`
-/// when GDK does not know one yet (an unmapped or just-realized
-/// surface). `gdk_frame_clock_get_refresh_info` reports the interval in
-/// microseconds; clamped to a sane band so a nonsense value cannot turn
-/// into a request storm.
-fn refreshFps(frame_clock: *c.GdkFrameClock, fallback: u16) u16 {
-    var interval_us: i64 = 0;
-    var presentation_us: i64 = 0;
-    c.gdk_frame_clock_get_refresh_info(
-        frame_clock,
-        c.gdk_frame_clock_get_frame_time(frame_clock),
-        &interval_us,
-        &presentation_us,
-    );
-    if (interval_us <= 0) return fallback;
-    const fps = @divTrunc(@as(i64, 1_000_000), interval_us);
-    return @intCast(std.math.clamp(fps, 1, @as(i64, pace.max_cap_fps)));
 }
 
 const modsFromState = webframe.modsFromState;

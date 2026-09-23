@@ -243,37 +243,6 @@ fn effectiveWindowlessFps(max_fps: u16) c_int {
     return std.math.clamp(@as(c_int, max_fps), 1, windowless_fps);
 }
 
-/// Whether the browsers this process creates are driven by the CLIENT's
-/// `frame_request`s (`external_begin_frame_enabled`) or by CEF's own
-/// windowless scheduler. Fixed per browser at creation.
-///
-/// `SKETERM_WEB_EXTERNAL_BEGINFRAME=1`/`=0` forces it either way; that
-/// is the switch the measurements in `externalPacingLatency` were taken
-/// with.
-fn externalPacingDefault() bool {
-    if (c.getenv("SKETERM_WEB_EXTERNAL_BEGINFRAME")) |v| {
-        const s = std.mem.span(v);
-        return !(std.mem.eql(u8, s, "0") or std.mem.eql(u8, s, "off") or std.mem.eql(u8, s, "no"));
-    }
-    return false;
-}
-
-/// How long a view may go without a client `frame_request` before the
-/// helper begins pacing it itself.
-///
-/// THE WATCHDOG, and the answer to "what if the GUI stalls": external
-/// begin frames make the CLIENT the frame source, so a client that stops
-/// asking freezes the page — no animation, no rAF, no video, and no way
-/// for the user to tell that apart from a hung renderer. Past this
-/// deadline the helper issues its own begin frames, so the worst case is
-/// a visibly slow page rather than a dead one. The
-/// deadline is deliberately LONGER than the GUI's idle interval (5Hz),
-/// so a live GUI is always the pacer and this never fires. Once it does
-/// fire it keeps firing at this same spacing, i.e. the self-paced floor
-/// is 1000/250 = 4fps: alive, obviously degraded, and cheap enough to
-/// leave running under a wedged client forever.
-const watchdog_ms: i64 = 250;
-
 /// How long a `devtools_show` may go without the engine producing the
 /// browser it promised before the client is told nothing opened.
 const adopt_timeout_ms: i64 = 8000;
@@ -325,7 +294,11 @@ pub fn isAccelerated() bool {
 /// periods of added latency on every interaction — the user-facing
 /// "hover takes a few frames" bug — so internal pacing wins and the
 /// client's cap now travels as `view_max_fps` instead of as request
-/// spacing.
+/// spacing. The external mode (and its `SKETERM_WEB_EXTERNAL_BEGINFRAME`
+/// switch, the self-pacing watchdog and the GUI's pacer) was removed
+/// once no reachable helper could run it: every helper with
+/// `frames-inline` (2026-08-12) or `multi-client` already paced itself.
+/// `frame_request` stays on the wire for older clients and is ignored.
 ///
 /// What the old external default bought, and where that went:
 /// - cap enforcement: now `set_windowless_frame_rate` (view_max_fps).
@@ -361,7 +334,7 @@ pub fn isAccelerated() bool {
 /// used to impose.)
 /// How the engine is told what DPR to lay out at.
 ///
-/// The protocol's scale contract (docs/proposal-browser-protocol.md) is
+/// The protocol's scale contract (`protocol.ViewCreate`) is
 /// "view rect LOGICAL, buffers PHYSICAL, DPR from `get_screen_info`".
 /// That works exactly as documented under headless ozone, and NOT under
 /// any real ozone platform: MEASURED under `--ozone-platform=wayland`,
@@ -392,7 +365,7 @@ fn zoomLevelFor(scale_x1000: u16) f64 {
 }
 
 // Latency tracing (`SKETERM_WEB_LAT`, measurement harness): stamps the
-// input/begin-frame/paint path so the GUI's probe deltas decompose.
+// input/paint path so the GUI's probe deltas decompose.
 var g_lat_trace: enum { unknown, off, on } = .unknown;
 
 fn latTrace() bool {
@@ -475,14 +448,8 @@ pub const View = struct {
     buf_unpainted: bool = false,
     gen: u32 = 0,
     hidden: bool = false,
-    /// Monotonic milliseconds of the last begin frame issued for this
-    /// view, whoever asked for it. Drives the watchdog.
-    last_begin_ms: i64 = 0,
     /// Client-set frame-rate cap (`view_max_fps`), 0 = uncapped.
     max_fps: u16 = 0,
-    /// Whether this browser was created with external begin frames, so
-    /// the client is the frame source. See `externalPacingLatency`.
-    external_pacing: bool = false,
     /// Last address CEF reported, owned; the `ev_nav_state` payload,
     /// and — after a `view_discard` — the address the browser comes
     /// back at.
@@ -1080,6 +1047,16 @@ pub const Host = struct {
     /// context at create, so a routed instance has no direct path at
     /// all — the route is the process, never a per-view setting.
     instance_proxy: []const u8 = "",
+    /// Why this ROUTED instance serves nothing (empty while it serves):
+    /// the engine refused the route's proxy, or the WebRTC policy that
+    /// keeps UDP inside it, on some request context. From then on no
+    /// browser, background page or fetch is created, every view is
+    /// refused with this sentence, and every client is told at its
+    /// handshake (`ev_route_refused`): a routed tab that cannot prove its
+    /// traffic takes the route must not load at all. Static text in
+    /// `route_refusal_buf`.
+    route_refusal: []const u8 = "",
+    route_refusal_buf: [256]u8 = undefined,
     /// The Wayland presenter (capability "presenter"): every presentable
     /// view is mirrored as a toplevel on the session hub. Null when the
     /// helper was not started as a session client, or once it disarmed.
@@ -1192,8 +1169,26 @@ pub const Host = struct {
         }
     };
 
-    /// One `print_pdf` in flight.
-    const Print = struct { view: u32, path: []u8 };
+    /// One `print_pdf` in flight. `path` is the client's (the answer's
+    /// correlation key); `staged`, when set, is where the engine really
+    /// writes.
+    const Print = struct {
+        view: u32,
+        path: []u8,
+        staged: ?[:0]u8 = null,
+
+        fn target(self: *const Print) []const u8 {
+            return if (self.staged) |s| s else self.path;
+        }
+
+        fn deinit(self: *Print, gpa: std.mem.Allocator, unlink_staged: bool) void {
+            if (self.staged) |s| {
+                if (unlink_staged) _ = c.unlink(s.ptr);
+                gpa.free(s);
+            }
+            gpa.free(self.path);
+        }
+    };
 
     /// One engine download. `before_cb` is the HELD target decision
     /// (`ev_download_offer`'s other half); `item_cb` is the latest
@@ -1294,7 +1289,8 @@ pub const Host = struct {
         for (self.webext_reload.items) |p| self.gpa.free(p);
         self.webext_reload.deinit(self.gpa);
         extorigins.clear();
-        for (self.prints.items) |p| self.gpa.free(p.path);
+        // Nobody will fetch a staged print that never finished.
+        for (self.prints.items) |*p| p.deinit(self.gpa, true);
         self.prints.deinit(self.gpa);
         // destroyAll's dropBrowser sweep already cancelled and freed
         // per-view entries; whatever is left never named a live view.
@@ -1350,16 +1346,21 @@ pub const Host = struct {
     /// Call it ONLY where the reference is about to be handed to such a
     /// call; a pre-flight refusal wants `requireContext`, which answers
     /// the same question without minting a reference nobody consumes.
-    fn contextForSpawn(self: *Host, v: *const View) error{ContextGone}!?*cef.cef_request_context_t {
+    fn contextForSpawn(self: *Host, v: *const View) SpawnRefusal!?*cef.cef_request_context_t {
+        try self.requireContext(v);
         if (v.context == 0) return null;
-        const rc = self.lookupContext(v.context) orelse return error.ContextGone;
+        const rc = self.lookupContext(v.context).?;
         if (rc.base.base.add_ref) |add| add(&rc.base.base);
         return rc;
     }
 
-    /// `contextForSpawn`'s refusal without its reference: the container a
-    /// view names still exists (or it never named one).
-    fn requireContext(self: *Host, v: *const View) error{ContextGone}!void {
+    const SpawnRefusal = error{ ContextGone, RouteRefused };
+
+    /// `contextForSpawn`'s refusal without its reference: this instance
+    /// still serves its route, and the container a view names still
+    /// exists (or it never named one).
+    fn requireContext(self: *Host, v: *const View) SpawnRefusal!void {
+        if (self.route_refusal.len != 0) return error.RouteRefused;
         if (v.context == 0) return;
         if (self.lookupContext(v.context) == null) return error.ContextGone;
     }
@@ -1402,13 +1403,20 @@ pub const Host = struct {
         const rc: *cef.cef_request_context_t = ops.create(ops.ctx, &settings) orelse return;
 
         // A proxied context is all-or-nothing. Registering an rc whose
-        // preference was refused would make its views use direct traffic.
-        // The proxy is the INSTANCE's route (per-context proxies were
-        // removed with per-tab routing); a direct instance leaves it
-        // empty and every context is direct.
-        if (self.instance_proxy.len != 0 and !applyProxy(rc, self.instance_proxy)) {
-            release(&rc.base.base);
-            return;
+        // preference was refused would make its views use direct traffic,
+        // and an engine that refused the route once has no business
+        // serving it at all (`route_refusal`). The proxy is the
+        // INSTANCE's route; a direct instance leaves it empty and every
+        // context is direct.
+        if (self.instance_proxy.len != 0) {
+            if (routeContext(rc, self.instance_proxy)) |why| {
+                release(&rc.base.base);
+                self.refuseRoute(why);
+                // The client minting the context learns now; any other
+                // connection at its next view, which is refused.
+                self.post(proto.EvRouteRefused{ .reason = self.route_refusal });
+                return;
+            }
         }
 
         // The global registration does not reach this context.
@@ -1476,19 +1484,27 @@ pub const Host = struct {
     pub fn install(self: *Host) void {
         g_host = self;
         installHandlers();
-        // The global context serves context-0 (default-jar) views; a
-        // routed instance must proxy it too, or an un-containered tab
-        // would leak direct. A refusal here is fatal to the route's
-        // promise, so log loudly — the instance still runs (its
-        // container views are proxied at create), matching how a failed
-        // container proxy refuses just that context.
+        // The global context serves context-0 (default-jar) views,
+        // background pages and filter fetches; a routed instance must
+        // route it too, or an un-containered tab would leak direct.
         if (self.instance_proxy.len != 0) {
             const global_c: ?*cef.cef_request_context_t = cef.cef_request_context_get_global_context();
-            const global = global_c orelse return;
+            const global = global_c orelse return self.refuseRoute("the engine has no global request context to route");
             defer release(&global.base.base);
-            if (!applyProxy(global, self.instance_proxy))
-                std.debug.print("sketerm-web: could not apply route proxy to the global context\n", .{});
+            if (routeContext(global, self.instance_proxy)) |why| self.refuseRoute(why);
         }
+    }
+
+    /// Stop serving: see `route_refusal`. Idempotent; the first reason
+    /// is the one clients are told.
+    fn refuseRoute(self: *Host, why: []const u8) void {
+        if (self.route_refusal.len != 0) return;
+        self.route_refusal = std.fmt.bufPrint(
+            &self.route_refusal_buf,
+            "this route's browser serves nothing, because {s} (it fails closed rather than browse outside the route)",
+            .{why},
+        ) catch "this route's browser serves nothing (it fails closed rather than browse outside the route)";
+        std.debug.print("sketerm-web: {s}\n", .{self.route_refusal});
     }
 
     // -- presenter -----------------------------------------------------
@@ -1912,6 +1928,10 @@ pub const Host = struct {
 
     fn createViewAtWith(self: *Host, req: proto.ViewCreate, initial_url: []const u8, ops: *const BrowserSpawnOps) !void {
         if (req.view == 0 or self.find(req.view) != null) return;
+        if (self.route_refusal.len != 0) {
+            self.post(proto.EvViewCreateFailed{ .view = req.view, .context = req.context, .reason = self.route_refusal });
+            return;
+        }
         if (req.context != 0 and self.lookupContext(req.context) == null) {
             self.post(proto.EvViewCreateFailed{
                 .view = req.view,
@@ -2053,8 +2073,7 @@ pub const Host = struct {
                 ps.pol = os.pol;
             }
         }
-        // MUTATES its argument, so it must be handed the POPUP.
-        window_info.* = windowlessInfo(pv);
+        window_info.* = windowlessInfo();
         slot.* = .{
             .popup_id = popup_id,
             .opener_cef_id = opener.cef_id,
@@ -2152,7 +2171,7 @@ pub const Host = struct {
     }
 
     fn createBrowserSystem(_: ?*anyopaque, self: *Host, v: *View, initial_url: []const u8) ?*cef.cef_browser_t {
-        var winfo = windowlessInfo(v);
+        var winfo = windowlessInfo();
         var bsettings = windowlessSettings(v);
 
         var url = std.mem.zeroes(cef.cef_string_t);
@@ -2525,7 +2544,7 @@ pub const Host = struct {
             // A vanished container joins the first group: the record is
             // worth keeping (the client still knows the id) and the page
             // must not come back on the global context.
-            if (err == error.BrowserCreateFailed or err == error.ContextGone) {
+            if (err == error.BrowserCreateFailed or err == error.ContextGone or err == error.RouteRefused) {
                 v.discarded = true;
             } else {
                 self.destroyView(id);
@@ -2615,7 +2634,7 @@ pub const Host = struct {
         const v = try self.registerDevtoolsView(src);
         errdefer self.destroyView(v.id);
 
-        var winfo = windowlessInfo(v);
+        var winfo = windowlessInfo();
         var bsettings = windowlessSettings(v);
         var point = cef.cef_point_t{ .x = 0, .y = 0 };
         const inspect = req.x != 0 or req.y != 0;
@@ -2692,27 +2711,31 @@ pub const Host = struct {
     /// `ev_print_pdf_done`, including for a view that does not exist —
     /// a client waiting on a save must never wait forever.
     pub fn printPdf(self: *Host, req: proto.PrintPdf) void {
-        const v = self.find(req.view) orelse {
-            self.post(proto.EvPrintPdfDone{ .view = req.view, .ok = 0, .path = req.path });
-            return;
-        };
-        const host = browserHost(v) orelse {
-            self.post(proto.EvPrintPdfDone{ .view = req.view, .ok = 0, .path = req.path });
-            return;
-        };
+        const refuse = proto.EvPrintPdfDone{ .view = req.view, .ok = 0, .path = req.path };
+        const v = self.find(req.view) orelse return self.post(refuse);
+        const host = browserHost(v) orelse return self.post(refuse);
         defer release(&host.base);
-        const print = host.print_to_pdf orelse {
-            self.post(proto.EvPrintPdfDone{ .view = req.view, .ok = 0, .path = req.path });
-            return;
-        };
-        const owned = self.gpa.dupe(u8, req.path) catch {
-            self.post(proto.EvPrintPdfDone{ .view = req.view, .ok = 0, .path = req.path });
-            return;
-        };
-        self.prints.append(self.gpa, .{ .view = v.id, .path = owned }) catch {
-            self.gpa.free(owned);
-            self.post(proto.EvPrintPdfDone{ .view = req.view, .ok = 0, .path = req.path });
-            return;
+        const print = host.print_to_pdf orelse return self.post(refuse);
+        const owned = self.gpa.dupe(u8, req.path) catch return self.post(refuse);
+        var entry: Print = .{ .view = v.id, .path = owned };
+        // Staged: the client is on another host and fetches the file
+        // afterwards, so the engine writes a private file of ours and the
+        // request path only correlates the answer.
+        if (req.stage != 0) {
+            var buf: [64:0]u8 = undefined;
+            const staged = stagingFile(&buf, "webpdf") orelse {
+                self.gpa.free(owned);
+                return self.post(refuse);
+            };
+            entry.staged = self.gpa.dupeZ(u8, staged) catch {
+                _ = c.unlink(staged.ptr);
+                self.gpa.free(owned);
+                return self.post(refuse);
+            };
+        }
+        self.prints.append(self.gpa, entry) catch {
+            entry.deinit(self.gpa, false);
+            return self.post(refuse);
         };
 
         var settings = std.mem.zeroes(cef.cef_pdf_print_settings_t);
@@ -2724,23 +2747,26 @@ pub const Host = struct {
             settings.paper_height = sheet.h;
         }
         var path = std.mem.zeroes(cef.cef_string_t);
-        setStr(req.path, &path);
+        setStr(entry.target(), &path);
         defer cef.cef_string_utf16_clear(&path);
         print(host, &path, &settings, &pdf_callback);
     }
 
     /// The engine finished writing (or failed to write) a PDF. The
-    /// path is the correlation key: CEF's callback carries no request
-    /// id, and a client may have several prints in flight.
+    /// path it wrote is the correlation key: CEF's callback carries no
+    /// request id, and a client may have several prints in flight.
     fn onPrintDone(self: *Host, path: []const u8, ok: bool) void {
         for (self.prints.items, 0..) |p, i| {
-            if (!std.mem.eql(u8, p.path, path)) continue;
-            const done = self.prints.orderedRemove(i);
-            defer self.gpa.free(done.path);
+            if (!std.mem.eql(u8, p.target(), path)) continue;
+            var done = self.prints.orderedRemove(i);
+            // A failed staging file is ours to remove; a written one now
+            // belongs to the client's delivery.
+            defer done.deinit(self.gpa, !ok);
             self.post(proto.EvPrintPdfDone{
                 .view = done.view,
                 .ok = if (ok) 1 else 0,
                 .path = done.path,
+                .staged = if (ok) (done.staged orelse "") else "",
             });
             return;
         }
@@ -3557,10 +3583,6 @@ pub const Host = struct {
                 if (host.was_resized) |wr| wr(host);
             }
         }.f);
-        // Nothing repaints without a begin frame, and a resize that
-        // waits for the client's next one shows a stale/black buffer in
-        // the meantime.
-        if (!v.hidden) issueBeginFrame(v);
         self.observeGeometry(v);
     }
 
@@ -3572,9 +3594,8 @@ pub const Host = struct {
         const v = if (show) self.findWake(id) orelse return else self.find(id) orelse return;
         if (v.discarded) return;
         v.hidden = !show;
-        // A view coming back needs the invalidate below to land on a
-        // frame; a view going away is simply never asked again.
-        defer if (show) issueBeginFrame(v);
+        // A view coming back repaints everything (the invalidate): its
+        // pixels may be stale from before it was hidden.
         withHost(v, if (show) struct {
             fn f(host: *cef.cef_browser_host_t) void {
                 if (host.was_hidden) |wh| wh(host, 0);
@@ -3587,37 +3608,12 @@ pub const Host = struct {
         }.f);
     }
 
-    // -- frame pacing --------------------------------------------------
+    // -- periodic duties -----------------------------------------------
 
-    /// One client-requested frame. A hidden view is not painted at all:
-    /// nobody can see it, and the whole point of external begin frames
-    /// is that nothing is rendered unless somebody asks.
-    pub fn beginFrame(self: *Host, req: proto.FrameRequest) void {
-        const v = self.find(req.view) orelse return;
-        if (v.hidden) return;
-        issueBeginFrame(v);
-    }
-
-    fn issueBeginFrame(v: *View) void {
-        // The timestamp is recorded either way: it is what keeps the
-        // watchdog quiet for a client that IS asking.
-        v.last_begin_ms = nowMs();
-        // Without external begin frames CEF drives its own scheduler and
-        // `send_external_begin_frame` is out of contract — the request
-        // has already done its real job (promoting the view out of
-        // hidden state, above).
-        if (!v.external_pacing) return;
-        latStamp("bf");
-        withHost(v, struct {
-            fn f(host: *cef.cef_browser_host_t) void {
-                if (host.send_external_begin_frame) |bf| bf(host);
-            }
-        }.f);
-    }
-
-    /// Keep every visible view alive when the client stops asking (see
-    /// `watchdog_ms`). Called once per poll iteration; a client pacing
-    /// at anything above 4Hz never reaches the deadline.
+    /// Everything that has to happen on time rather than on an event:
+    /// filter-list fetches, a stopped scroll's resting position, and the
+    /// deadlines of engine promises nobody else would ever answer.
+    /// Called once per poll iteration.
     pub fn watchdog(self: *Host, now_ms: i64) void {
         filterSubPump(self, now_ms);
         filterSubTick(self, now_ms);
@@ -3645,11 +3641,6 @@ pub const Host = struct {
             if (now_ms - v.popup_opened_ms <= adopt_timeout_ms) continue;
             self.destroyView(v.id);
             pi = 0;
-        }
-        for (self.views.items) |v| {
-            if (v.hidden or v.windowed) continue;
-            if (now_ms - v.last_begin_ms < watchdog_ms) continue;
-            issueBeginFrame(v);
         }
     }
 
@@ -4180,18 +4171,13 @@ pub const Host = struct {
         if (d.decided) return;
         var target = req.path;
         if (req.stage != 0) {
-            const template = "/tmp/sketerm-webdl-XXXXXX";
-            @memcpy(d.staging[0..template.len], template);
-            d.staging[template.len] = 0;
-            const fd = c.mkstemp(&d.staging);
-            if (fd < 0) {
+            const staged = stagingFile(&d.staging, "webdl") orelse {
                 d.interrupt_reason = 1;
                 self.cancelDl(d);
                 return;
-            }
-            _ = c.close(fd);
-            d.staging_len = template.len;
-            target = d.staging[0..d.staging_len];
+            };
+            d.staging_len = staged.len;
+            target = staged;
         }
         d.decided = true;
         d.dirty = true;
@@ -5316,6 +5302,7 @@ pub const Host = struct {
             self.removePopupView(v);
             self.popupError(req, switch (err) {
                 error.ContextGone => "the page's browser context no longer exists",
+                error.RouteRefused => self.route_refusal,
                 else => "popup browser creation failed",
             });
         };
@@ -5345,7 +5332,7 @@ pub const Host = struct {
         // have been destroyed since it opened, and a popup created on
         // the global context would leave the container's egress.
         const rc = try self.contextForSpawn(v);
-        var winfo = windowlessInfo(v);
+        var winfo = windowlessInfo();
         // Popups are short-lived and small. Force software frames so the
         // GTK popover owns one simple mapping, never a dma-buf pool.
         winfo.shared_texture_enabled = 0;
@@ -5532,7 +5519,9 @@ pub const Host = struct {
     /// still injects at context creation, so `injectBackground` can send
     /// its scripts on load.
     fn spawnBackground(self: *Host, v: *View, url_utf8: []const u8) !void {
-        var winfo = windowlessInfo(v);
+        // A background page can fetch; on a refused route it must not.
+        try self.requireContext(v);
+        var winfo = windowlessInfo();
         var bsettings = windowlessSettings(v);
         var url = std.mem.zeroes(cef.cef_string_t);
         setStr(url_utf8, &url);
@@ -6930,7 +6919,7 @@ pub const Host = struct {
         var hdr_buf: [HOLD_HDR_MAX]u8 = undefined;
         var hdr_len: u16 = 0;
         if (go_second) {
-            if (req) |r| hdr_len = wreqHeadersJson(r, &hdr_buf);
+            if (req) |r| hdr_len = headerMapJson(r, &hdr_buf);
         }
 
         var cb: ?*cef.cef_callback_t = null;
@@ -9147,6 +9136,33 @@ test "a context whose proxy is refused registers nothing and releases once" {
     try std.testing.expectEqual(@as(usize, 1), ContextCreateTest.released);
     try std.testing.expectEqual(@as(usize, 0), host.contexts.items.len);
     try std.testing.expect(host.lookupContext(5) == null);
+
+    // Fail CLOSED, instance-wide: the client is told, and no view, not
+    // even an un-containered one on the global context, is ever created.
+    var told = false;
+    while (out.front()) |m| {
+        var reader = proto.Reader.init(m.bytes);
+        while (reader.next() catch null) |frame| {
+            if (frame.tag == .ev_route_refused) told = true;
+        }
+        out.advance(m.bytes.len);
+    }
+    try std.testing.expect(told);
+    try std.testing.expect(host.route_refusal.len != 0);
+    var injected: ViewConstructionTest = .{};
+    var spawn_ops = injected.ops();
+    try host.createViewAtWith(ViewConstructionTest.req(9, 0), "", &spawn_ops);
+    try std.testing.expectEqual(@as(usize, 0), injected.browser_calls);
+    try std.testing.expectEqual(@as(usize, 0), host.viewCount());
+    var reader = proto.Reader.init(out.front().?.bytes);
+    const frame = (try reader.next()).?;
+    try std.testing.expectEqual(proto.Tag.ev_view_create_failed, frame.tag);
+    const failure = try proto.decode(proto.EvViewCreateFailed, frame.payload);
+    try std.testing.expectEqualStrings(host.route_refusal, failure.reason);
+    // The same gate covers every other browser the instance could make
+    // (revivals, popups, background pages).
+    const v = try host.registerView(ViewConstructionTest.req(10, 0));
+    try std.testing.expectError(error.RouteRefused, host.requireContext(v));
 }
 
 test "an accepted context is released exactly once, by its destroy" {
@@ -10530,6 +10546,10 @@ fn subGetAuthCredentials(
 
 /// Start one fetch. Returns false when nothing was started.
 fn filterSubFetch(host: *Host, url: []const u8, dest: []const u8, serial: u32) bool {
+    // A browserless request rides the global context: on a refused
+    // route it would leave outside it, so it is never started (the
+    // previous copy of the list keeps blocking, as for any failure).
+    if (host.route_refusal.len != 0) return false;
     // `cef_request_create` is a plain extern fn here, not an optional
     // function pointer like the struct members are.
     const req = cef.cef_request_create() orelse return false;
@@ -11558,7 +11578,7 @@ fn onResourceResponse(
 
     var hdr_buf: [HOLD_HDR_MAX]u8 = undefined;
     var hdr_len: u16 = 0;
-    if (response) |resp| hdr_len = wreqResponseHeadersJson(resp, &hdr_buf);
+    if (response) |resp| hdr_len = headerMapJson(resp, &hdr_buf);
 
     g_wreq.acquire();
     var slot: ?*Hold = null;
@@ -11599,40 +11619,6 @@ fn onResourceResponse(
     g_wreq.release();
     wreqPoke();
     return 0;
-}
-
-/// A response's headers as a JSON array. IO THREAD, no allocation.
-fn wreqResponseHeadersJson(resp: *cef.cef_response_t, out: []u8) u16 {
-    const gh = resp.get_header_map orelse return 0;
-    const map = cef.cef_string_multimap_alloc() orelse return 0;
-    defer cef.cef_string_multimap_free(map);
-    gh(resp, map);
-    var w = std.Io.Writer.fixed(out);
-    w.writeByte('[') catch return 0;
-    const n = cef.cef_string_multimap_size(map);
-    var i: usize = 0;
-    var first = true;
-    while (i < n) : (i += 1) {
-        var key = std.mem.zeroes(cef.cef_string_t);
-        var val = std.mem.zeroes(cef.cef_string_t);
-        defer cef.cef_string_utf16_clear(&key);
-        defer cef.cef_string_utf16_clear(&val);
-        if (cef.cef_string_multimap_key(map, i, &key) == 0) continue;
-        _ = cef.cef_string_multimap_value(map, i, &val);
-        var kbuf: [256]u8 = undefined;
-        var vbuf: [1024]u8 = undefined;
-        const ks = utf16Into(&key, &kbuf);
-        const vs = utf16Into(&val, &vbuf);
-        if (!first) w.writeByte(',') catch break;
-        first = false;
-        w.writeAll("{\"name\":") catch break;
-        jsonStr(&w, ks) catch break;
-        w.writeAll(",\"value\":") catch break;
-        jsonStr(&w, vs) catch break;
-        w.writeByte('}') catch break;
-    }
-    w.writeByte(']') catch return 0;
-    return @intCast(w.end);
 }
 
 /// IO THREAD. Completes a logged entry with status/size/timing.
@@ -11952,13 +11938,13 @@ fn wreqTypeOf(t: cef.cef_resource_type_t) webrequest.RType {
     };
 }
 
-/// Serialize a request's headers into `out` as a JSON array. IO THREAD:
-/// CEF allocates the multimap, we allocate nothing.
-fn wreqHeadersJson(req: *cef.cef_request_t, out: []u8) u16 {
-    const gh = req.get_header_map orelse return 0;
+/// Serialize a request's or a response's headers into `out` as a JSON
+/// array. IO THREAD: CEF allocates the multimap, we allocate nothing.
+fn headerMapJson(owner: anytype, out: []u8) u16 {
+    const gh = owner.*.get_header_map orelse return 0;
     const map = cef.cef_string_multimap_alloc() orelse return 0;
     defer cef.cef_string_multimap_free(map);
-    gh(req, map);
+    gh(owner, map);
     var w = std.Io.Writer.fixed(out);
     w.writeByte('[') catch return 0;
     const n = cef.cef_string_multimap_size(map);
@@ -12072,7 +12058,7 @@ fn wreqConsider(
     var hdr_buf: [HOLD_HDR_MAX]u8 = undefined;
     var hdr_len: u16 = 0;
     if (need_before.want_request_headers or need_send.want_request_headers) {
-        hdr_len = wreqHeadersJson(req, &hdr_buf);
+        hdr_len = headerMapJson(req, &hdr_buf);
     }
 
     g_wreq.acquire();
@@ -12296,20 +12282,14 @@ fn onGetResourceRequestHandler(
 /// The windowless `cef_window_info_t` every browser this helper makes
 /// is created with — the ordinary views AND the inspector, which is
 /// exactly what makes DevTools just another view.
-fn windowlessInfo(v: *View) cef.cef_window_info_t {
+fn windowlessInfo() cef.cef_window_info_t {
     var winfo = std.mem.zeroes(cef.cef_window_info_t);
     winfo.size = @sizeOf(cef.cef_window_info_t);
     winfo.windowless_rendering_enabled = 1;
-    // The frame source: with this set, Chromium produces a frame per
-    // `send_external_begin_frame` and never on its own, which is what
-    // lifts the 60fps ceiling AND what makes an untouched page cost
-    // nothing. It is fixed at browser creation and cannot be toggled
-    // per frame, so ALL adaptive behaviour lives in how often somebody
-    // asks (client pacing + the watchdog).
-    v.external_pacing = externalPacingDefault();
-    winfo.external_begin_frame_enabled = if (v.external_pacing) 1 else 0;
-    // GPU frames. Fixed at browser creation like the flag above, and
-    // only ever honoured when the process got a GPU: with it set and no
+    // `external_begin_frame_enabled` stays 0: the engine paces itself
+    // (see `externalPacingLatency`).
+    // GPU frames. Fixed at browser creation, and only ever honoured
+    // when the process got a GPU: with it set and no
     // GPU compositing available, Chromium simply keeps calling
     // `on_paint`, which is the software path this helper already has.
     // That is the whole fallback — no probe, no timeout.
@@ -12377,6 +12357,32 @@ fn browserHostInt(b: ?*cef.cef_browser_t, comptime name: []const u8) c_int {
     defer release(&host.base);
     const f = @field(host, name) orelse return 0;
     return f(host);
+}
+
+/// Create a private, empty file `/tmp/sketerm-<kind>-XXXXXX` in `buf`
+/// for output a client on another host fetches afterwards (a staged
+/// download or print). Null when nothing could be created.
+fn stagingFile(buf: [:0]u8, comptime kind: []const u8) ?[:0]u8 {
+    const path = std.fmt.bufPrintZ(buf, "/tmp/sketerm-" ++ kind ++ "-XXXXXX", .{}) catch return null;
+    const fd = c.mkstemp(path.ptr);
+    if (fd < 0) return null;
+    _ = c.close(fd);
+    return path;
+}
+
+test "staging files are private, empty and never shared between two requests" {
+    var a: [64:0]u8 = undefined;
+    var b: [64:0]u8 = undefined;
+    const pa = stagingFile(&a, "webpdf") orelse return error.NoStaging;
+    defer _ = c.unlink(pa.ptr);
+    const pb = stagingFile(&b, "webpdf") orelse return error.NoStaging;
+    defer _ = c.unlink(pb.ptr);
+    try std.testing.expect(std.mem.startsWith(u8, pa, "/tmp/sketerm-webpdf-"));
+    try std.testing.expect(!std.mem.eql(u8, pa, pb));
+    var st: c.struct_stat = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), c.stat(pa.ptr, &st));
+    try std.testing.expectEqual(@as(c_uint, 0o600), @as(c_uint, @intCast(st.st_mode)) & 0o777);
+    try std.testing.expectEqual(@as(i64, 0), @as(i64, st.st_size));
 }
 
 fn release(base: *cef.cef_base_ref_counted_t) void {
@@ -12481,6 +12487,49 @@ fn applyProxy(rc: *cef.cef_request_context_t, proxy_url: []const u8) bool {
     const set_pref = base.set_preference orelse return false;
     value_transferred = true;
     return set_pref(base, &pref_key, val, &err) != 0;
+}
+
+/// The Chromium profile preference that decides which network paths
+/// WebRTC may use, and the value that keeps it inside a proxy: with
+/// `disable_non_proxied_udp` WebRTC gathers no host or STUN candidate at
+/// all and uses UDP only through a proxy that supports it (SOCKS5 here
+/// does not), so a page cannot learn this machine's addresses through
+/// ICE on a Tor or `via:` route. smoke-web's route stage proves it by
+/// gathering candidates on a routed and a direct helper.
+pub const WEBRTC_POLICY_PREF = "webrtc.ip_handling_policy";
+pub const WEBRTC_POLICY_ROUTED = "disable_non_proxied_udp";
+
+/// Put `rc` on this instance's route: the proxy, then the WebRTC policy
+/// that keeps UDP inside it. Null on success, else why not (the caller
+/// refuses the route; nothing here may be half-applied and served).
+fn routeContext(rc: *cef.cef_request_context_t, proxy_url: []const u8) ?[]const u8 {
+    if (!applyProxy(rc, proxy_url)) return "the engine refused the route's proxy setting";
+    if (!setStringPref(rc, WEBRTC_POLICY_PREF, WEBRTC_POLICY_ROUTED))
+        return "the engine refused the WebRTC policy that keeps UDP inside the route";
+    return null;
+}
+
+/// `set_preference(name, <string>)` on a context's preference manager,
+/// with the same consume-on-receipt rule as `applyProxy`: the value is
+/// the callee's the moment it is passed, pass or fail.
+fn setStringPref(rc: *cef.cef_request_context_t, name: []const u8, value: []const u8) bool {
+    if (c.getenv("SKETERM_WEB_FAIL_WEBRTC_POLICY") != null) return false;
+    const val: *cef.cef_value_t = cef.cef_value_create() orelse return false;
+    var transferred = false;
+    defer if (!transferred) release(&val.base);
+    var sval = std.mem.zeroes(cef.cef_string_t);
+    defer cef.cef_string_utf16_clear(&sval);
+    setStr(value, &sval);
+    if ((val.set_string orelse return false)(val, &sval) == 0) return false;
+    var key = std.mem.zeroes(cef.cef_string_t);
+    defer cef.cef_string_utf16_clear(&key);
+    setStr(name, &key);
+    var err = std.mem.zeroes(cef.cef_string_t);
+    defer cef.cef_string_utf16_clear(&err);
+    const base: *cef.cef_preference_manager_t = &rc.base;
+    const set_pref = base.set_preference orelse return false;
+    transferred = true;
+    return set_pref(base, &key, val, &err) != 0;
 }
 
 /// Borrowed UTF-8 view of a CEF string; `free` releases it.
@@ -13391,13 +13440,6 @@ fn onFlushComplete(_: [*c]cef.cef_completion_callback_t) callconv(.c) void {
     host.flushCompleted();
 }
 
-/// Milliseconds until CEF next wants `pump()`; -1 = nothing scheduled.
-var pump_delay_ms: i64 = -1;
-
-fn onScheduleMessagePumpWork(_: [*c]cef.cef_browser_process_handler_t, delay: i64) callconv(.c) void {
-    pump_delay_ms = delay;
-}
-
 /// Hand the semantic-layer secrets to every child process; the renderer
 /// picks them back up in `onWebKitInitialized`.
 fn onBeforeChildProcessLaunch(
@@ -13421,12 +13463,6 @@ fn onBeforeChildProcessLaunch(
 
 fn getBrowserProcessHandler(_: [*c]cef.cef_app_t) callconv(.c) [*c]cef.cef_browser_process_handler_t {
     return &bp_handler;
-}
-
-/// Poll timeout CEF asked for, clamped to `cap` ms.
-pub fn pumpTimeoutMs(cap: i64) i64 {
-    if (pump_delay_ms < 0) return cap;
-    return @min(@max(pump_delay_ms, 0), cap);
 }
 
 fn getRenderHandler(_: [*c]cef.cef_client_t) callconv(.c) [*c]cef.cef_render_handler_t {
@@ -15951,7 +15987,6 @@ pub fn apiHash() bool {
 pub fn executeProcess(argc: c_int, argv: [*c][*c]u8) ?u8 {
     bp_handler = std.mem.zeroes(cef.cef_browser_process_handler_t);
     bp_handler.base = staticBase(cef.cef_browser_process_handler_t);
-    bp_handler.on_schedule_message_pump_work = onScheduleMessagePumpWork;
     bp_handler.on_before_child_process_launch = onBeforeChildProcessLaunch;
     v8_handler = std.mem.zeroes(cef.cef_v8_handler_t);
     v8_handler.base = staticBase(cef.cef_v8_handler_t);
@@ -16042,7 +16077,6 @@ pub fn initialize(argc: c_int, argv: [*c][*c]u8, cache_dir: []const u8, log_file
 /// One iteration of CEF's message loop. Every handler above runs
 /// inside this call, on this thread.
 pub fn pump() void {
-    pump_delay_ms = -1;
     cef.cef_do_message_loop_work();
 }
 

@@ -92,7 +92,9 @@ carets, a project layer and a Language Server Protocol client.
 `sketerm web` is a Chromium-based browser (via CEF) with a reader mode,
 a built-in ad filter, identity containers, and a network route per tab
 (direct, Tor, via one of your SSH hosts, or the browser running on that
-host) with cookies shared across routes. Every one of these also works
+host); logins follow you between the routes whose browser runs on this
+machine (direct, Tor, via), while a browser running on another host
+keeps its own cookie jar there. Every one of these also works
 as a *face* on a pane inside a terminal window (`--here`/`--tab`).
 
 **MCP server.** `sketerm mcp` is a Model Context Protocol server on stdio

@@ -133,6 +133,9 @@ pub const Request = struct {
     /// web-scroll wheel deltas, logical pixels, positive = right/down.
     dx: ?i32 = null,
     dy: ?i32 = null,
+    /// web-close: the helper view (one PAGE of the pane's browser) to
+    /// close; null = the pane's active page.
+    view: ?u32 = null,
 };
 
 pub fn parseRequest(allocator: std.mem.Allocator, line: []const u8) !std.json.Parsed(Request) {

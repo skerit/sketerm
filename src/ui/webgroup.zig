@@ -203,6 +203,33 @@ pub const Group = struct {
         return self.indexOf(face) != null;
     }
 
+    /// The page presenting helper view `view`, if this group has it.
+    pub fn pageByView(self: *Group, view: u32) ?*WebFace {
+        for (self.pages.items) |p| {
+            if (p.face.view == view) return p.face;
+        }
+        return null;
+    }
+
+    pub const Closed = struct { view: u32, pane_closed: bool };
+
+    /// Close ONE page for the `web-close` remote-control verb: the page
+    /// presenting `view`, or the active page when null. The pane's only
+    /// page takes the pane (and its tab) with it, the way an MCP-opened
+    /// web tab has always gone; any other page leaves the pane and its
+    /// other pages alone. Null when there is no such page. The group is
+    /// gone when `pane_closed` is true.
+    pub fn closeByView(self: *Group, win: *@import("window.zig").Window, view: ?u32) ?Closed {
+        const face = if (view) |id| self.pageByView(id) orelse return null else self.active() orelse return null;
+        const id = face.view;
+        if (self.pages.items.len <= 1) {
+            win.closePane(self.pane);
+            return .{ .view = id, .pane_closed = true };
+        }
+        self.closePage(face, .promote);
+        return .{ .view = id, .pane_closed = false };
+    }
+
     /// Raise `face` (and the pane's web face with it).
     pub fn setActive(self: *Group, face: *WebFace) void {
         if (self.widgets_dead) return;

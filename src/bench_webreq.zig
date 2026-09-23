@@ -124,7 +124,7 @@ const Client = struct {
     fd: c_int,
     in: std.ArrayList(u8) = .empty,
     ack_proto: u32 = 0,
-    ack_webext: bool = false,
+    ack_caps: proto.Caps = .initEmpty(),
     we_ok: u8 = 0xff,
     title: [4096]u8 = @splat(0),
     title_len: usize = 0,
@@ -181,9 +181,7 @@ const Client = struct {
                 const a = proto.HelloAck.decodeAlloc(f.payload, self.gpa) catch return;
                 defer self.gpa.free(a.caps);
                 self.ack_proto = a.proto;
-                for (a.caps) |cap| {
-                    if (std.mem.eql(u8, cap, proto.CAP_WEBEXT)) self.ack_webext = true;
-                }
+                self.ack_caps = proto.parseCaps(a.caps);
             },
             .ev_title => {
                 const t = proto.decode(proto.EvTitle, f.payload) catch return;
@@ -461,7 +459,7 @@ fn runScenario(
         while (cl.ack_proto == 0 and nowMs() < d) cl.pump(50);
     }
     if (cl.ack_proto == 0) fail("helper never answered the handshake");
-    if (!cl.ack_webext) fail("helper lacks the webext capability");
+    if (!cl.ack_caps.contains(.webext)) fail("helper lacks the webext capability");
 
     if (ext_dir) |ed| {
         cl.send(proto.WebextSet{ .id = "benchwreq01", .dir = ed, .enabled = 1 });

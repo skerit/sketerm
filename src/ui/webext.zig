@@ -210,7 +210,7 @@ fn saveRemoval(id: []const u8) InstallError!void {
 /// extension in the window that had it working. The join asks for
 /// state only; toggles and installs still post as they always did.
 pub fn publish(cl: *webface.Client) void {
-    if (cl.state != .ready or cl.isRemote() or !cl.cap_webext) return;
+    if (cl.state != .ready or cl.isRemote() or !cl.has(.webext)) return;
     if (!cl.adopted) {
         for (g_exts.items) |*e| {
             cl.post(proto.WebextSet{ .id = e.id, .dir = e.dir, .enabled = if (e.enabled) 1 else 0 });
@@ -339,7 +339,7 @@ pub fn installArchive(gpa: std.mem.Allocator, xpi_path: []const u8) InstallError
     defer if (tx_owned) tx.deinit();
 
     const cl = webface.client();
-    if (archiveRoute(cl.state == .ready, cl.cap_webext, cl.cap_webext_transaction) == .helper_transaction) {
+    if (archiveRoute(cl.state == .ready, cl.has(.webext), cl.has(.webext_transaction)) == .helper_transaction) {
         const pending = gpa.create(PendingInstall) catch return error.OutOfMemory;
         var pending_owned = true;
         errdefer if (pending_owned) gpa.destroy(pending);
@@ -429,7 +429,7 @@ fn destroyPending(pending: *PendingInstall) void {
 
 fn restoreHelper(pending: *PendingInstall) void {
     const cl = webface.client();
-    if (cl.state != .ready or !cl.cap_webext) return;
+    if (cl.state != .ready or !cl.has(.webext)) return;
     if (find(pending.tx.id)) |old| {
         _ = cl.postChecked(proto.WebextSet{
             .id = old.id,

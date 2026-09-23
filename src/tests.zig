@@ -47,7 +47,6 @@ comptime {
     _ = @import("web/semantic.zig");
     _ = @import("web/reader.zig");
     _ = @import("web/hints.zig");
-    _ = @import("web/pace.zig");
     _ = @import("web/filter.zig");
     _ = @import("web/filtersub.zig");
     _ = @import("web/netpolicy.zig");
@@ -177,6 +176,7 @@ comptime {
     _ = @import("ui/webstore.zig");
     _ = @import("ui/websiteinfo.zig");
     _ = @import("ui/webhistory.zig");
+    _ = @import("ui/webwatch.zig");
     _ = @import("ui/browser.zig");
     _ = @import("ui/browser/view.zig");
     _ = @import("ui/browser/types.zig");

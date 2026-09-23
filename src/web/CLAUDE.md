@@ -76,15 +76,22 @@ begin frame REGARDLESS of their spacing — immediate-on-input, 0.3/5/10/
 same constant ~30ms of added input-to-paint latency, against 5-19ms for
 the internal scheduler. That is the "hovering a button takes a few
 frames" bug. The numbers live at `externalPacingLatency` in
-`cefhost.zig`; `SKETERM_WEB_EXTERNAL_BEGINFRAME=1`/`=0` still forces
-either mode for A/B work.
+`cefhost.zig`. The external mode itself is GONE (2026-09): its env
+switch, the helper's self-pacing watchdog, `pace.zig` and the GUI's
+idle `frame_request` traffic went with it, because no helper any client
+can still reach runs it (every helper with `frames-inline` or
+`multi-client` already paced itself). `frame_request` stays on the wire
+for older clients and the helper accepts and ignores it; smoke-web stage
+20 sends it at 120/s and asserts it costs nothing.
 
 `windowless_frame_rate` also bounds the frame CAPTURER, not just the
-scheduler, so it throttles externally paced frames too.
+scheduler.
 
 An idle page must keep costing nothing: the scheduler paints only on
 damage (smoke-web stage 20 asserts zero paints on a static page), and a
-hidden view is stopped outright by `view_hide`.
+hidden view is stopped outright by `view_hide`. The GUI installs no
+frame-clock tick for a page at all; the cap follows the output the view
+is on (`WebFace.syncMaxFps`, re-read on realize and `enter-monitor`).
 
 ## The canvas is opaque only if the BROWSER says so
 
@@ -137,7 +144,15 @@ the browser, and answers `ev_devtools_view` with `devtools = 0, reason
 
 `print_pdf` (0xA4) has no such caveat: `print_to_pdf` writes the file
 and the completion callback is correlated BY PATH, because CEF's
-callback carries no request id.
+callback carries no request id. With `print-pdf-staging` the optional
+trailing `PrintPdf.stage` byte makes the helper print into a private
+`/tmp/sketerm-webpdf-*` file of its own and name it in the trailing
+`EvPrintPdfDone.staged`, the request path staying the correlation key:
+that is how a tab on an `on:<host>` helper gets its PDF onto the GUI's
+machine (the GUI delivers the staged file through the daemon's durable
+transfer, as a download-strip row). A failed staged print is removed
+by the helper. DevTools is refused for such a tab: CEF would open the
+inspector in a window on the remote host.
 
 ## Accessibility (0x70 block, capability "a11y")
 
@@ -781,12 +796,12 @@ offset destroys 1px detail into uniform gray on its own.
 - A host without `/dev/dri` has no GPU path at all; smoke-web stage 24
   reports the software fallback rather than failing, so read it.
 - `SKETERM_WEB_STATS=1` prints a per-second line with delivered fps,
-  client-side cost, bytes uploaded, GPU imports, requests and TICKS.
-  Read `ticks` first when it looks slow: it is the rate the COMPOSITOR
-  will present at and it caps everything else (GSK's Vulkan renderer
-  measured roughly half the ngl renderer's tick rate on a 4K surface).
-- `SKETERM_WEB_PACE=1` logs pacing transitions and aborts if a demoted
-  face kept its tick. `SKETERM_WEB_LAT=1` runs the hover latency probe.
+  client-side cost, bytes uploaded, GPU imports and PRESENTS (paint
+  cycles of the frame clocks showing a web face). Read `presents` first
+  when it looks slow: it is the rate the COMPOSITOR will present at and
+  it caps everything else (GSK's Vulkan renderer measured roughly half
+  the ngl renderer's rate on a 4K surface).
+- `SKETERM_WEB_LAT=1` runs the hover latency probe.
 - `zig build measure-web` is the latency/sharpness rig; it reproduces a
   fractional 1.5x desktop through sketerm's own compositor.
 
@@ -852,6 +867,21 @@ over, and both are measured, not assumed:
   its own helper process with its own profile and a plain fixed-server
   proxy instead. The probe frames that measured this were removed; they
   live on the `spike/cef-routing-experiments` branch.
+- **A routed instance FAILS CLOSED** (`Host.route_refusal`). The proxy
+  and the WebRTC policy that keeps UDP inside it (`webrtc.ip_handling_policy
+  = disable_non_proxied_udp`, set per request context by `routeContext`)
+  are applied to the global context at `install` and to every container
+  context at create; the first refusal ends the instance's service: every
+  `view_create*` is answered `ev_view_create_failed` with the sentence,
+  `requireContext` refuses revivals, popups and background pages, filter
+  fetches never start, and each client is told right after `hello_ack`
+  (`ev_route_refused`, 0x93) — the GUI fails that route's client with
+  the reason, Reload retries with a fresh helper. Before this a refused
+  global proxy only logged a line, and every un-containered tab on a Tor
+  instance browsed direct. `SKETERM_WEB_FAIL_PROXY` /
+  `SKETERM_WEB_FAIL_WEBRTC_POLICY` are the deterministic refusal seams;
+  smoke-web's route stage proves both the refusal and, by gathering ICE
+  candidates on a routed and a direct helper, that the policy holds.
 - **A malformed proxy preference is NOT protected by `pac_mandatory`.**
   Of the two PAC forms, only `{mode:"pac_script", pac_url:"data:..."}`
   works: it routes per-URL and fails CLOSED when the proxy is
@@ -1300,8 +1330,10 @@ costs the caller its entire 120s deadline and explains nothing.
 
 - The wire protocol is **append-only**: new frame tags and capabilities,
   never a renumbering or a version bump. `protocol.zig` is the source of
-  truth (`docs/proposal-browser-protocol.md` is an untracked design doc
-  and may be absent). `view_create_url` (capability `view-create-url`)
+  truth, and `protocol.Cap` the one capability list: every client parses
+  `hello_ack` through `parseCaps` into a `Caps` set and the helper
+  advertises from the same enum, so a new `CAP_*` constant without a
+  member is a compile error. `view_create_url` (capability `view-create-url`)
   is the worked example of the rule: the initial url had to be a NEW
   frame, because adding a field to `view_create` would have changed an
   existing frame's layout.
@@ -1377,8 +1409,12 @@ costs the caller its entire 120s deadline and explains nothing.
   released at the same moment. Nothing about a decision is remembered
   helper-side — no cert exception, no allowed origin — because a
   stateless render helper is the wrong owner for a stored security
-  decision; the GUI remembers permissions in memory and a
-  `SiteSettingSink` is where persistence plugs in.
+  decision. The GUI owns them: a permission answer is remembered per
+  face and persisted to the daemon's web store through the
+  `SiteSettingSink` (`installStoreSiteSink`), and preloaded from it on
+  the next visit — except on a PRIVATE page (`WebFace.isPrivate`: an
+  incognito container or an observed assistant page), whose answers
+  apply to that page alone.
 - **`ev_popup_request` carries an OPTIONAL TRAILING `user_gesture`
   byte**, and its decoder treats a short payload as "field absent,
   assume a gesture". That is the only frame on this wire allowed to

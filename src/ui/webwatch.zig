@@ -79,11 +79,6 @@ pub const Watch = struct {
         return null;
     }
 
-    /// The assistant's name, for chips and toasts.
-    pub fn labelSlice(self: *const Watch) []const u8 {
-        return self.label;
-    }
-
     /// Change the lease of every page: `observe_control` per alias;
     /// the helper answers each with its state and the chip follows.
     pub fn setLease(self: *Watch, lease: muxtabs.Lease) void {
@@ -253,9 +248,56 @@ pub fn placementLocal(win: *Window, mux_socket: []const u8, session: []const u8)
 
 pub fn placementRemote(win: *Window, host: []const u8, session: []const u8) Placement {
     var key_buf: [MAX_KEY]u8 = undefined;
-    const key = std.fmt.bufPrint(&key_buf, "host:{s}|{s}", .{ host, session }) catch return .none;
+    const key = remoteKey(&key_buf, host, session) orelse return .none;
     const w = find(win, key) orelse return .none;
     return .{ .watching = w.lease };
+}
+
+/// Where an assistant's web session lives, in the host vocabulary the
+/// Session Overview carries: `sock:<mux socket>` for a local assistant's
+/// private daemon, a mux host spec for one on another machine, null for
+/// the local default. The one place that vocabulary is split, for both
+/// the placement query and the watch itself.
+const HostRef = union(enum) {
+    local: []const u8,
+    remote: []const u8,
+
+    fn of(host: ?[]const u8) HostRef {
+        const h = host orelse return .{ .local = "" };
+        if (std.mem.startsWith(u8, h, "sock:")) return .{ .local = h["sock:".len..] };
+        return .{ .remote = h };
+    }
+};
+
+/// What this window already shows for the web session `session` on
+/// `host` (the Session Overview's vocabulary, see `HostRef`).
+pub fn placementFor(win: *Window, host: ?[]const u8, session: []const u8) Placement {
+    return switch (HostRef.of(host)) {
+        .local => |sock| placementLocal(win, sock, session),
+        .remote => |h| placementRemote(win, h, session),
+    };
+}
+
+/// Watch (or take control of) the web session `session` on `host`, in
+/// the Session Overview's vocabulary; `label` names the assistant.
+pub fn openFor(win: *Window, label: []const u8, host: ?[]const u8, session: []const u8, lease: muxtabs.Lease) bool {
+    return switch (HostRef.of(host)) {
+        .local => |sock| openLocal(win, label, sock, session, lease),
+        .remote => |h| openRemote(win, label, h, session, lease),
+    };
+}
+
+/// `host:<host>|<session>`, the key of a REMOTE assistant's watch.
+fn remoteKey(buf: []u8, host: []const u8, session: []const u8) ?[]const u8 {
+    return std.fmt.bufPrint(buf, "host:{s}|{s}", .{ host, session }) catch null;
+}
+
+test "the overview's host vocabulary splits into a local socket or a remote host" {
+    try std.testing.expectEqualStrings("/run/x/mux.sock", HostRef.of("sock:/run/x/mux.sock").local);
+    try std.testing.expectEqualStrings("", HostRef.of(null).local);
+    try std.testing.expectEqualStrings("box", HostRef.of("box").remote);
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("host:box|web-a", remoteKey(&buf, "box", "web-a").?);
 }
 
 /// `sock:<helper socket>` for a LOCAL assistant session, resolved
@@ -283,7 +325,7 @@ pub fn openLocal(win: *Window, label: []const u8, mux_socket: []const u8, sessio
 /// `session` beside its own socket and bridges it.
 pub fn openRemote(win: *Window, label: []const u8, host: []const u8, session: []const u8, lease: muxtabs.Lease) bool {
     var key_buf: [MAX_KEY]u8 = undefined;
-    const key = std.fmt.bufPrint(&key_buf, "host:{s}|{s}", .{ host, session }) catch return false;
+    const key = remoteKey(&key_buf, host, session) orelse return false;
     if (find(win, key)) |w| return reuse(w, lease);
     const cl = webface.observerClient(win.allocator, .{ .remote = .{ .host = host, .session = session } }) orelse return false;
     return start(win, cl, label, key, lease);

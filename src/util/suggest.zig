@@ -1,6 +1,5 @@
 //! Shared suggestion/ranking framework — the "one grown-up system"
-//! behind the omnibox and the command palette (docs/proposal-browser.md
-//! "Command palette synthesis"): URL / search / history / bookmarks /
+//! behind the omnibox and the command palette: URL / search / history / bookmarks /
 //! open-tabs / commands are pluggable `Source`s merged into one ranked
 //! list.
 //!

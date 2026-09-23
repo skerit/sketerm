@@ -238,7 +238,6 @@ comptime {
     _ = @import("web/semantic.zig");
     _ = @import("web/reader.zig");
     _ = @import("web/hints.zig");
-    _ = @import("web/pace.zig");
     _ = @import("web/filter.zig");
     _ = @import("web/filtersub.zig");
     _ = @import("web/userscript.zig");

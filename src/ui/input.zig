@@ -508,7 +508,7 @@ pub fn actionLabel(a: Action) []const u8 {
         .web_hints => "Link hints on the web page (type a label to click)",
         .web_reader => "Reader view on/off (this pane's web page)",
         .web_discard_background => "Discard background web tabs (free their memory)",
-        .web_devtools => "Open DevTools for this web pane (in a split)",
+        .web_devtools => "Open DevTools for this web pane (in a window of its own)",
         .web_print_pdf => "Print this web page to a PDF file",
         .web_fill_password => "Fill a saved login from the keyring into this web page",
         .web_site_info => "Site information, permissions and stored data for this web page",

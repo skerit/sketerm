@@ -1,19 +1,91 @@
-//! Remote file picker — a small window that browses the session's
-//! filesystem (via the daemon's `file_list`) so the user can navigate
-//! to a file and download it, instead of typing a path. Read-only.
+//! "Download File…" on a remote pane: pick a file on the pane's host and
+//! download it over the pane's own session (`Terminal.startDownload`,
+//! the session-level transfer every daemon since 2026-06 serves).
+//!
+//! The picking is sketerm's native file picker (`picker.zig`: places,
+//! thumbnails, every view mode) whenever the pane's daemon runs the file
+//! service it browses through. A daemon older than that service still
+//! answers the session-level `file_list`, and gets the small listing
+//! window below instead, so the verb keeps working against it.
 //!
 //! Lifetime: heap-allocated `Browser`, freed on the window's "destroy".
 //! It holds Window + Pane (not the Terminal) and re-fetches the live
 //! Terminal through the Window's pane list before every action, so a
-//! pane closing under it can't dangle.
+//! pane closing under it can't dangle. The picker path's context is
+//! freed by its one callback, which checks the pane the same way.
 
 const std = @import("std");
 const c = @import("../c.zig").c;
 const cast = @import("../util/cast.zig");
 const fmtSize = @import("../filebrowser/format.zig").fmtSize;
+const fpicker = @import("../filebrowser/picker.zig");
+const picker = @import("picker.zig");
+const paths = @import("../filebrowser/paths.zig");
+const mux_client = @import("../mux/client.zig");
 const Window = @import("window.zig").Window;
 const Pane = @import("pane.zig").Pane;
 const Terminal = @import("../terminal.zig").Terminal;
+
+/// Whether the daemon behind `conn` serves the file service the native
+/// picker browses through. No welcome flag names that service (it
+/// arrived 2026-07-23); `udp_ticket` (2026-07-30) is the earliest flag
+/// every later daemon announces unconditionally, so its presence proves
+/// the service, and its absence costs at most a week of daemons the
+/// older listing window instead.
+pub fn hasFileService(conn: *const mux_client.Conn) bool {
+    return conn.udp_tickets;
+}
+
+/// Open the download picker for `pane` (a pane whose session lives on
+/// another host; the menu row is hidden anywhere else).
+pub fn open(win: *Window, pane: *Pane) void {
+    const remote = pane.terminal.remote orelse return;
+    if (hasFileService(&remote.conn) and openPicker(win, pane)) return;
+    openLegacy(win, pane);
+}
+
+const PickCtx = struct {
+    allocator: std.mem.Allocator,
+    win: *Window,
+    pane: *Pane,
+};
+
+fn openPicker(win: *Window, pane: *Pane) bool {
+    const ctx = win.allocator.create(PickCtx) catch return false;
+    ctx.* = .{ .allocator = win.allocator, .win = win, .pane = pane };
+    var spec_buf: [@import("browser.zig").SPEC_BUF_LEN]u8 = undefined;
+    _ = picker.PickerWindow.open(win.allocator, @ptrCast(win.app_window), .{
+        .mode = .open_file,
+        .title = "Download File",
+        .accept_label = "Download",
+        .initial_spec = Window.paneBrowserSpec(pane, &spec_buf),
+    }, &onPicked, @ptrCast(ctx)) catch {
+        win.allocator.destroy(ctx);
+        return false;
+    };
+    return true;
+}
+
+fn onPicked(user: ?*anyopaque, result: ?fpicker.Result) void {
+    const ctx = cast.userData(PickCtx, user);
+    defer ctx.allocator.destroy(ctx);
+    const res = result orelse return;
+    if (res.specs.len == 0) return;
+    // The pane may have closed while the dialog was up.
+    for (ctx.win.panes.items) |p| {
+        if (p != ctx.pane) continue;
+        const remote = p.terminal.remote orelse return;
+        const loc = paths.parseSpec(res.specs[0]);
+        // The session downloads from ITS host; a file browsed on another
+        // one has no path the session could fetch.
+        if (!paths.hostEq(loc.host, paths.browserHost(remote.host))) {
+            @import("window.zig").showToast(ctx.win, "That file is on another host than this session; pick one on the session's host.");
+            return;
+        }
+        p.terminal.startDownload(loc.path);
+        return;
+    }
+}
 
 const Browser = struct {
     allocator: std.mem.Allocator,
@@ -37,8 +109,9 @@ const Browser = struct {
     }
 };
 
-/// Open the remote file browser for `pane` (must be a remote pane).
-pub fn open(win: *Window, pane: *Pane) void {
+/// The listing window, for a daemon without the file service (see
+/// `hasFileService`): browses through the session's own `file_list`.
+fn openLegacy(win: *Window, pane: *Pane) void {
     if (pane.terminal.remote == null) return;
     const allocator = win.allocator;
 
