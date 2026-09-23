@@ -31,11 +31,13 @@ const indentation = @import("indentation.zig");
 // Command registry (names, palette labels, default accelerators)
 // ======================================================================
 
-/// Every editor-face command that is bindable through
-/// `editor_keybind.<name> = <accel>` config lines. The names are the
-/// stable config vocabulary; the default accelerators follow VS Code /
-/// Sublime muscle memory where one exists.
+/// Every editor-face command. Each is bindable through
+/// `editor_keybind.<name> = <accel>` config lines, listed in the command
+/// palette while an editor face has focus, and dispatched by ONE switch
+/// (`EditorView.runCommand`). The names are the stable config
+/// vocabulary.
 pub const Command = enum {
+    // Line and text editing.
     duplicate_line_up,
     duplicate_line_down,
     move_line_up,
@@ -49,6 +51,7 @@ pub const Command = enum {
     upper_case,
     lower_case,
     title_case,
+    // Carets and selections.
     goto_line,
     select_next_occurrence,
     skip_occurrence,
@@ -56,6 +59,52 @@ pub const Command = enum {
     add_caret_above,
     add_caret_below,
     split_selection_lines,
+    select_all,
+    expand_selection,
+    shrink_selection,
+    goto_matching_bracket,
+    select_to_matching_bracket,
+    // Clipboard and history.
+    copy,
+    cut,
+    paste,
+    undo,
+    redo,
+    // Find.
+    find,
+    replace,
+    project_search,
+    project_replace,
+    // Documents.
+    save,
+    save_as,
+    save_all,
+    open_file,
+    close_tab,
+    // View.
+    fold,
+    unfold,
+    fold_all,
+    unfold_all,
+    toggle_wrap,
+    toggle_outline,
+    next_hunk,
+    prev_hunk,
+    // Language server.
+    trigger_completion,
+    signature_help,
+    show_hover,
+    code_actions,
+    format_document,
+    rename_symbol,
+    goto_definition,
+    goto_declaration,
+    goto_type_definition,
+    find_references,
+    workspace_symbols,
+    next_diagnostic,
+    prev_diagnostic,
+    // Per-tab indentation (palette only, no default chord).
     indent_use_tabs,
     indent_use_spaces,
     indent_width_2,
@@ -65,6 +114,186 @@ pub const Command = enum {
 };
 
 pub const COMMAND_COUNT: usize = @typeInfo(Command).@"enum".fields.len;
+
+/// Everything the UI says about one command. A single record per
+/// command, so adding one is one switch arm and the build breaks
+/// without it.
+pub const Info = struct {
+    label: [:0]const u8,
+    describe: [:0]const u8,
+    /// Default accelerators in GTK accel-string form; the FIRST is the
+    /// one menus, prefs and the palette show. Several exist only where a
+    /// keyboard reports one chord as distinct keyvals (a shifted
+    /// bracket, the keypad period) or two chords are both common.
+    accels: []const []const u8,
+};
+
+/// The command table. Accelerators follow what other editors already
+/// put in people's fingers: VS Code for the line verbs, carets, LSP and
+/// folding; Sublime for join (Ctrl+J) and sort (F9).
+pub fn info(cmd: Command) Info {
+    return switch (cmd) {
+        .duplicate_line_up => .{
+            .label = "Duplicate Line / Selection Up",
+            .describe = "Copy the caret's line (or the selection) and keep the caret on the upper copy.",
+            .accels = &.{"<Shift><Alt>Up"},
+        },
+        .duplicate_line_down => .{
+            .label = "Duplicate Line / Selection Down",
+            .describe = "Copy the caret's line (or the selection) and move the caret to the lower copy.",
+            .accels = &.{"<Shift><Alt>Down"},
+        },
+        .move_line_up => .{ .label = "Move Line Up", .describe = "Swap the selected lines with the line above them.", .accels = &.{"<Alt>Up"} },
+        .move_line_down => .{ .label = "Move Line Down", .describe = "Swap the selected lines with the line below them.", .accels = &.{"<Alt>Down"} },
+        .join_lines => .{
+            .label = "Join Lines",
+            .describe = "Join each selected line with the next, collapsing the next line's leading whitespace to one space.",
+            .accels = &.{"<Control>j"},
+        },
+        .sort_lines => .{ .label = "Sort Selected Lines", .describe = "Sort the lines covered by each selection in byte order.", .accels = &.{"F9"} },
+        .toggle_comment => .{
+            .label = "Toggle Line Comment",
+            .describe = "Comment or uncomment the selected lines with the language's line-comment prefix.",
+            .accels = &.{"<Control>slash"},
+        },
+        .indent => .{ .label = "Indent Lines", .describe = "Indent the selected lines by one tab stop.", .accels = &.{"<Control>bracketright"} },
+        .dedent => .{ .label = "Dedent Lines", .describe = "Remove one leading tab stop from the selected lines.", .accels = &.{"<Control>bracketleft"} },
+        .trim_trailing_ws => .{
+            .label = "Trim Trailing Whitespace",
+            .describe = "Delete trailing spaces and tabs on every line of the document.",
+            .accels = &.{"<Control><Alt>t"},
+        },
+        .upper_case => .{ .label = "UPPERCASE", .describe = "Uppercase the selection (or the word at each caret).", .accels = &.{"<Control><Alt>u"} },
+        .lower_case => .{ .label = "lowercase", .describe = "Lowercase the selection (or the word at each caret).", .accels = &.{"<Control><Alt>l"} },
+        .title_case => .{ .label = "Title Case", .describe = "Title-case the selection (or the word at each caret).", .accels = &.{"<Control><Alt>i"} },
+        .goto_line => .{ .label = "Go to Line\u{2026}", .describe = "Jump to a 1-based line (and optional column).", .accels = &.{"<Control>g"} },
+        .select_next_occurrence => .{
+            .label = "Select Next Occurrence",
+            .describe = "Add a selection on the next match of the selected text (or the word at the caret).",
+            .accels = &.{"<Control>d"},
+        },
+        .skip_occurrence => .{
+            .label = "Skip Occurrence",
+            .describe = "Drop the newest occurrence selection and take the next match instead.",
+            .accels = &.{"<Control><Alt>d"},
+        },
+        .select_all_occurrences => .{
+            .label = "Select All Occurrences",
+            .describe = "Select every match of the selected text (or the word at the caret).",
+            .accels = &.{"<Control><Shift>l"},
+        },
+        .add_caret_above => .{ .label = "Add Caret Above", .describe = "Add a caret on the line above each caret, same column.", .accels = &.{"<Control><Alt>Up"} },
+        .add_caret_below => .{ .label = "Add Caret Below", .describe = "Add a caret on the line below each caret, same column.", .accels = &.{"<Control><Alt>Down"} },
+        .split_selection_lines => .{
+            .label = "Split Selection into Line Carets",
+            .describe = "Replace each selection with one caret at the end of every line it covers.",
+            .accels = &.{"<Shift><Alt>i"},
+        },
+        .select_all => .{ .label = "Select All", .describe = "Select the whole document.", .accels = &.{"<Control>a"} },
+        .expand_selection => .{
+            .label = "Expand Selection",
+            .describe = "Grow every selection to the smallest syntax node around it.",
+            .accels = &.{ "<Shift><Alt>Right", "<Shift><Alt>KP_Right" },
+        },
+        .shrink_selection => .{
+            .label = "Shrink Selection",
+            .describe = "Undo one Expand Selection step.",
+            .accels = &.{ "<Shift><Alt>Left", "<Shift><Alt>KP_Left" },
+        },
+        .goto_matching_bracket => .{
+            .label = "Go to Matching Bracket",
+            .describe = "Jump every caret to the other half of its bracket pair.",
+            .accels = &.{"<Control>m"},
+        },
+        .select_to_matching_bracket => .{
+            .label = "Select to Matching Bracket",
+            .describe = "Extend every selection to the other half of its bracket pair.",
+            .accels = &.{"<Control><Shift>m"},
+        },
+        .copy => .{ .label = "Copy", .describe = "Copy the selections to the clipboard.", .accels = &.{"<Control>c"} },
+        .cut => .{ .label = "Cut", .describe = "Copy the selections to the clipboard and delete them.", .accels = &.{"<Control>x"} },
+        .paste => .{ .label = "Paste", .describe = "Insert the clipboard at every caret.", .accels = &.{"<Control>v"} },
+        .undo => .{ .label = "Undo", .describe = "Undo the last edit, restoring the selection it was made from.", .accels = &.{"<Control>z"} },
+        .redo => .{ .label = "Redo", .describe = "Redo the last undone edit.", .accels = &.{ "<Control>y", "<Control><Shift>z" } },
+        .find => .{ .label = "Find\u{2026}", .describe = "Open the find bar over the document.", .accels = &.{"<Control>f"} },
+        .replace => .{ .label = "Replace\u{2026}", .describe = "Open the find bar with its replace row.", .accels = &.{"<Control>h"} },
+        .project_search => .{
+            .label = "Find in Project\u{2026}",
+            .describe = "Search every file of the document's project.",
+            .accels = &.{"<Control><Shift>f"},
+        },
+        .project_replace => .{
+            .label = "Replace in Project\u{2026}",
+            .describe = "Preview and apply a replacement across the document's project.",
+            .accels = &.{"<Control><Shift>h"},
+        },
+        .save => .{ .label = "Save", .describe = "Save the document.", .accels = &.{"<Control>s"} },
+        .save_as => .{ .label = "Save As\u{2026}", .describe = "Save the document under a new name.", .accels = &.{"<Control><Shift>s"} },
+        .save_all => .{ .label = "Save All", .describe = "Save every modified document that has a file.", .accels = &.{"<Control><Alt>s"} },
+        .open_file => .{ .label = "Open File\u{2026}", .describe = "Open files in new document tabs.", .accels = &.{"<Control>o"} },
+        .close_tab => .{ .label = "Close Document", .describe = "Close the document tab, asking first when it has unsaved changes.", .accels = &.{"<Control>w"} },
+        .fold => .{
+            .label = "Fold Region",
+            .describe = "Fold the region headed by the caret's line, or the innermost one around it.",
+            .accels = &.{ "<Control><Shift>bracketleft", "<Control><Shift>braceleft" },
+        },
+        .unfold => .{
+            .label = "Unfold Region",
+            .describe = "Unfold the region at or around the caret.",
+            .accels = &.{ "<Control><Shift>bracketright", "<Control><Shift>braceright" },
+        },
+        .fold_all => .{
+            .label = "Fold All",
+            .describe = "Fold every foldable region of the document.",
+            .accels = &.{ "<Control><Alt>bracketleft", "<Control><Alt>braceleft" },
+        },
+        .unfold_all => .{
+            .label = "Unfold All",
+            .describe = "Unfold every folded region.",
+            .accels = &.{ "<Control><Alt>bracketright", "<Control><Alt>braceright" },
+        },
+        .toggle_wrap => .{ .label = "Toggle Soft Wrap", .describe = "Wrap long lines at the window edge, or stop wrapping them.", .accels = &.{"<Alt>z"} },
+        .toggle_outline => .{
+            .label = "Toggle Outline Panel",
+            .describe = "Show or hide the document's symbol outline beside the text.",
+            .accels = &.{"<Control><Shift>o"},
+        },
+        .next_hunk => .{ .label = "Next Change", .describe = "Jump to the next change against HEAD.", .accels = &.{"F7"} },
+        .prev_hunk => .{ .label = "Previous Change", .describe = "Jump to the previous change against HEAD.", .accels = &.{"<Shift>F7"} },
+        .trigger_completion => .{ .label = "Trigger Completion", .describe = "Ask the language server for completions at the caret.", .accels = &.{"<Control>space"} },
+        .signature_help => .{ .label = "Signature Help", .describe = "Show the parameter list of the call around the caret.", .accels = &.{"<Control><Shift>space"} },
+        .show_hover => .{
+            .label = "Show Hover",
+            .describe = "Show what the language server knows about the symbol at the caret, and its diagnostic.",
+            .accels = &.{"<Control>i"},
+        },
+        .code_actions => .{
+            .label = "Code Actions\u{2026}",
+            .describe = "Quick fixes and refactorings for the selection or the caret.",
+            .accels = &.{ "<Control>period", "<Control>KP_Decimal" },
+        },
+        .format_document => .{ .label = "Format Document", .describe = "Format the document, or the selection when there is one.", .accels = &.{"<Control><Shift>i"} },
+        .rename_symbol => .{ .label = "Rename Symbol\u{2026}", .describe = "Rename the symbol at the caret across the project.", .accels = &.{"F2"} },
+        .goto_definition => .{ .label = "Go to Definition", .describe = "Jump to where the symbol at the caret is defined.", .accels = &.{"F12"} },
+        .goto_declaration => .{ .label = "Go to Declaration", .describe = "Jump to where the symbol at the caret is declared.", .accels = &.{"<Control><Shift>F12"} },
+        .goto_type_definition => .{ .label = "Go to Type Definition", .describe = "Jump to the definition of the type of the symbol at the caret.", .accels = &.{"<Control>F12"} },
+        .find_references => .{ .label = "Find References", .describe = "List every reference to the symbol at the caret.", .accels = &.{"<Shift>F12"} },
+        .workspace_symbols => .{
+            .label = "Workspace Symbols\u{2026}",
+            .describe = "Search the project's symbols for the word at the caret or the selection.",
+            .accels = &.{"<Control>t"},
+        },
+        .next_diagnostic => .{ .label = "Next Diagnostic", .describe = "Jump to the next problem the language server reported.", .accels = &.{"F8"} },
+        .prev_diagnostic => .{ .label = "Previous Diagnostic", .describe = "Jump to the previous problem the language server reported.", .accels = &.{"<Shift>F8"} },
+        // Per-tab settings, reached from the palette; no chord.
+        .indent_use_tabs => .{ .label = "Indent Using Tabs", .describe = "Indent this tab's document with hard tabs, whatever the file or .editorconfig says.", .accels = &.{} },
+        .indent_use_spaces => .{ .label = "Indent Using Spaces", .describe = "Indent this tab's document with spaces, whatever the file or .editorconfig says.", .accels = &.{} },
+        .indent_width_2 => .{ .label = "Indent Width: 2", .describe = "Use an indent (and tab) width of 2 columns in this tab.", .accels = &.{} },
+        .indent_width_4 => .{ .label = "Indent Width: 4", .describe = "Use an indent (and tab) width of 4 columns in this tab.", .accels = &.{} },
+        .indent_width_8 => .{ .label = "Indent Width: 8", .describe = "Use an indent (and tab) width of 8 columns in this tab.", .accels = &.{} },
+        .indent_auto => .{ .label = "Indent Automatically (Detect / .editorconfig)", .describe = "Drop this tab's indentation override and use .editorconfig, the file's content, then the defaults.", .accels = &.{} },
+    };
+}
 
 pub fn name(cmd: Command) []const u8 {
     return @tagName(cmd);
@@ -78,101 +307,35 @@ pub fn fromName(s: []const u8) ?Command {
 }
 
 pub fn label(cmd: Command) [:0]const u8 {
-    return switch (cmd) {
-        .duplicate_line_up => "Duplicate Line / Selection Up",
-        .duplicate_line_down => "Duplicate Line / Selection Down",
-        .move_line_up => "Move Line Up",
-        .move_line_down => "Move Line Down",
-        .join_lines => "Join Lines",
-        .sort_lines => "Sort Selected Lines",
-        .toggle_comment => "Toggle Line Comment",
-        .indent => "Indent Lines",
-        .dedent => "Dedent Lines",
-        .trim_trailing_ws => "Trim Trailing Whitespace",
-        .upper_case => "UPPERCASE",
-        .lower_case => "lowercase",
-        .title_case => "Title Case",
-        .goto_line => "Go to Line…",
-        .select_next_occurrence => "Select Next Occurrence",
-        .skip_occurrence => "Skip Occurrence",
-        .select_all_occurrences => "Select All Occurrences",
-        .add_caret_above => "Add Caret Above",
-        .add_caret_below => "Add Caret Below",
-        .split_selection_lines => "Split Selection into Line Carets",
-        .indent_use_tabs => "Indent Using Tabs",
-        .indent_use_spaces => "Indent Using Spaces",
-        .indent_width_2 => "Indent Width: 2",
-        .indent_width_4 => "Indent Width: 4",
-        .indent_width_8 => "Indent Width: 8",
-        .indent_auto => "Indent Automatically (Detect / .editorconfig)",
-    };
-}
-
-/// Default accelerator, GTK accel-string form. Chosen from what other
-/// editors already put in people's fingers: Alt+Up/Down (VS Code move
-/// line), Shift+Alt+Up/Down (VS Code copy line), Ctrl+/ (everyone's
-/// comment toggle), Ctrl+D (VS Code/Sublime add next occurrence),
-/// Ctrl+Shift+L (VS Code select all occurrences), Ctrl+Alt+Up/Down
-/// (VS Code add caret), Shift+Alt+I (VS Code split into lines),
-/// Ctrl+J (Sublime/JetBrains join), F9 (Sublime sort), Ctrl+G
-/// (universal go-to-line), Ctrl+]/[ (VS Code indent/dedent).
-pub fn defaultAccel(cmd: Command) []const u8 {
-    return switch (cmd) {
-        .duplicate_line_up => "<Shift><Alt>Up",
-        .duplicate_line_down => "<Shift><Alt>Down",
-        .move_line_up => "<Alt>Up",
-        .move_line_down => "<Alt>Down",
-        .join_lines => "<Control>j",
-        .sort_lines => "F9",
-        .toggle_comment => "<Control>slash",
-        .indent => "<Control>bracketright",
-        .dedent => "<Control>bracketleft",
-        .trim_trailing_ws => "<Control><Alt>t",
-        .upper_case => "<Control><Alt>u",
-        .lower_case => "<Control><Alt>l",
-        .title_case => "<Control><Alt>i",
-        .goto_line => "<Control>g",
-        .select_next_occurrence => "<Control>d",
-        .skip_occurrence => "<Control><Alt>d",
-        .select_all_occurrences => "<Control><Shift>l",
-        .add_caret_above => "<Control><Alt>Up",
-        .add_caret_below => "<Control><Alt>Down",
-        .split_selection_lines => "<Shift><Alt>i",
-        // Per-tab settings, reached from the palette; no chord.
-        .indent_use_tabs, .indent_use_spaces, .indent_width_2, .indent_width_4, .indent_width_8, .indent_auto => "",
-    };
+    return info(cmd).label;
 }
 
 /// One-line palette / prefs description.
 pub fn describe(cmd: Command) [:0]const u8 {
-    return switch (cmd) {
-        .duplicate_line_up => "Copy the caret's line (or the selection) and keep the caret on the upper copy.",
-        .duplicate_line_down => "Copy the caret's line (or the selection) and move the caret to the lower copy.",
-        .move_line_up => "Swap the selected lines with the line above them.",
-        .move_line_down => "Swap the selected lines with the line below them.",
-        .join_lines => "Join each selected line with the next, collapsing the next line's leading whitespace to one space.",
-        .sort_lines => "Sort the lines covered by each selection in byte order.",
-        .toggle_comment => "Comment or uncomment the selected lines with the language's line-comment prefix.",
-        .indent => "Indent the selected lines by one tab stop.",
-        .dedent => "Remove one leading tab stop from the selected lines.",
-        .trim_trailing_ws => "Delete trailing spaces and tabs on every line of the document.",
-        .upper_case => "Uppercase the selection (or the word at each caret).",
-        .lower_case => "Lowercase the selection (or the word at each caret).",
-        .title_case => "Title-case the selection (or the word at each caret).",
-        .goto_line => "Jump to a 1-based line (and optional column).",
-        .select_next_occurrence => "Add a selection on the next match of the selected text (or the word at the caret).",
-        .skip_occurrence => "Drop the newest occurrence selection and take the next match instead.",
-        .select_all_occurrences => "Select every match of the selected text (or the word at the caret).",
-        .add_caret_above => "Add a caret on the line above each caret, same column.",
-        .add_caret_below => "Add a caret on the line below each caret, same column.",
-        .split_selection_lines => "Replace each selection with one caret at the end of every line it covers.",
-        .indent_use_tabs => "Indent this tab's document with hard tabs, whatever the file or .editorconfig says.",
-        .indent_use_spaces => "Indent this tab's document with spaces, whatever the file or .editorconfig says.",
-        .indent_width_2 => "Use an indent (and tab) width of 2 columns in this tab.",
-        .indent_width_4 => "Use an indent (and tab) width of 4 columns in this tab.",
-        .indent_width_8 => "Use an indent (and tab) width of 8 columns in this tab.",
-        .indent_auto => "Drop this tab's indentation override and use .editorconfig, the file's content, then the defaults.",
-    };
+    return info(cmd).describe;
+}
+
+/// The accelerator menus and the palette show for `cmd`.
+pub fn defaultAccel(cmd: Command) []const u8 {
+    const all = info(cmd).accels;
+    return if (all.len == 0) "" else all[0];
+}
+
+pub fn defaultAccels(cmd: Command) []const []const u8 {
+    return info(cmd).accels;
+}
+
+test "commands: no two default accelerators are spelled the same" {
+    for (0..COMMAND_COUNT) |i| {
+        for (info(@enumFromInt(i)).accels) |a| {
+            for (0..COMMAND_COUNT) |j| {
+                for (info(@enumFromInt(j)).accels) |b| {
+                    if (i == j and a.ptr == b.ptr) continue;
+                    try testing.expect(!std.ascii.eqlIgnoreCase(a, b));
+                }
+            }
+        }
+    }
 }
 
 /// The change an indentation command makes to the tab's override (a
@@ -1237,8 +1400,8 @@ test "commands registry round trip" {
         // there is one, belongs to exactly one command.
         const accel = defaultAccel(cmd);
         if (accel.len > 0) {
-            inline for (@typeInfo(Command).@"enum".fields) |g| {
-                const other: Command = @enumFromInt(g.value);
+            for (0..COMMAND_COUNT) |j| {
+                const other: Command = @enumFromInt(j);
                 if (other != cmd) try testing.expect(!std.mem.eql(u8, accel, defaultAccel(other)));
             }
         }

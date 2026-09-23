@@ -160,6 +160,7 @@ comptime {
     _ = @import("ui/editorlsp.zig");
     _ = @import("ui/editorproj.zig");
     _ = @import("ui/editoroutline.zig");
+    _ = @import("ui/editorkeys.zig");
     _ = @import("ui/clipboard.zig");
     _ = @import("ui/modes.zig");
     _ = @import("ui/xsearch.zig");

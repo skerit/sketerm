@@ -451,11 +451,14 @@ pub const Feed = struct {
         for (self.rows, 0..) |row, i| {
             const score = suggest.fieldsScore(q, row.title, row.desc);
             if (score <= 0) continue;
+            // A title typed out in full outranks the longer titles it
+            // prefixes ("Save" over "Save Layout"), which tie otherwise.
+            const whole: f32 = if (q.len > 0 and std.ascii.eqlIgnoreCase(q, row.title)) 0.01 else 0;
             out.append(gpa, .{
                 .title = row.title,
                 .detail = row.desc,
                 .kind = .command,
-                .score = score + self.mru.boost(keyOf(row)),
+                .score = score + whole + self.mru.boost(keyOf(row)),
                 .payload = i,
             }) catch {};
         }
