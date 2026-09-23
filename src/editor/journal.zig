@@ -48,34 +48,30 @@
 //! at load/save time so the UI can tell "the file is untouched" from
 //! "the file moved on under us" and let the user decide.
 //!
-//! UI WIRING CONTRACT (not wired yet — `src/ui/editorview.zig` owns it)
+//! THE UI SIDE is `src/ui/editorjournal.zig`, and it keeps this contract:
 //!
-//!   * per tab, on the first edit that makes the buffer dirty:
-//!     `journal.open(alloc, spec orelse "")` → store the `Handle` on the
-//!     tab. Keep the handle for the tab's lifetime; the lock it holds is
-//!     what tells other processes this buffer is alive.
-//!   * on a debounce timer (a second of idle, say) while dirty:
-//!     `if (h.shouldWrite(doc.revision)) try h.writeDocument(&doc, hdr)`
-//!     with `hdr.spec`/`hdr.remote`/`hdr.cursor` filled from the tab and
-//!     `hdr.setBaseline(tab.disk)` from its `reload.DiskState`.
-//!     `error.BufferTooLarge` means "recovery is off for this buffer" —
-//!     surface it, do not retry.
-//!   * after a successful save: `doc.markSaved(); h.clear()` (keeps the
-//!     lock, drops the snapshot). On tab close or a clean quit:
-//!     `h.discard()`.
-//!   * at startup, before restoring the layout: `journal.list(alloc)` →
-//!     offer each `Entry` (`header.spec`, `header.updated_ms`), then
-//!     `journal.read(alloc, key)` for the ones the user takes, build the
-//!     tab with `Document.initVerbatim(rec.content, style)` — NOT
+//!   * per tab, on the first tick that finds the buffer dirty:
+//!     `journal.open(alloc, spec orelse "")`, held for the tab's
+//!     lifetime; the lock it holds is what tells other processes this
+//!     buffer is alive.
+//!   * on a debounce timer while dirty: `h.shouldWrite(doc.state())`,
+//!     then `h.snapshot(...)` on the main thread (an owned, immutable
+//!     copy) and `Snapshot.write` on a DETACHED worker, so the hash, the
+//!     JSON header and the fsync never block the GLib loop. The history
+//!     state rides back to `h.noteWritten`. `error.BufferTooLarge` means
+//!     "recovery is off for this buffer": surfaced once, never retried.
+//!   * once the buffer is clean again (a save, a reload, an undo back to
+//!     the saved text): `h.clear()` (keeps the lock, drops the
+//!     snapshot). On tab close or a clean quit: `h.discard()`. Both wait
+//!     for an in-flight write rather than racing its rename.
+//!   * at startup, once per process: `journal.prune` then `journal.list`,
+//!     offered in an inline banner; the records the user takes are read
+//!     with `journal.read`, built with `Document.initVerbatim` (never
 //!     `initFromBytes`, which re-sniffs the style and would strip the
-//!     CRs out of an LF buffer holding pasted CRLF lines — plus the
-//!     caret at `header.cursor` and the style from `header.crlf`, mark
-//!     it dirty (it IS unsaved work), and `journal.remove(alloc, key)`
-//!     ONLY once it opened. Compare
-//!     `rec.baseline()` against a fresh stat with `reload.compare` and
-//!     show the verdict rather than saving anything automatically.
-//!   * a periodic `journal.prune(alloc, ...)` (a week, say) keeps
-//!     declined records from living forever.
+//!     CRs out of an LF buffer holding pasted CRLF lines), marked dirty,
+//!     and `journal.remove`d ONLY once they opened. The recorded
+//!     baseline is compared by the ordinary disk probe, which raises the
+//!     ordinary banner rather than saving anything automatically.
 //!
 //! GTK-free and allocator-explicit: this file is part of the core test
 //! root and must stay buildable in the `sketerm-mux` dependency set.
@@ -92,10 +88,10 @@ const reload = @import("reload.zig");
 pub const VERSION: u32 = 1;
 pub const MIN_READ_VERSION: u32 = 1;
 
-/// Buffers larger than this are not journaled: the write would stall
-/// the UI thread and the crash window it protects is small compared to
-/// the cost. `Handle.write` answers `error.BufferTooLarge` so the face
-/// can tell the user recovery is off for that buffer.
+/// Buffers larger than this are not journaled (it equals the editor's
+/// load limit). `Handle.snapshot` and `Handle.write` answer
+/// `error.BufferTooLarge` so the face can tell the user recovery is off
+/// for that buffer.
 pub const MAX_CONTENT: usize = 64 * 1024 * 1024;
 
 /// A header line longer than this is corruption, not a header.
@@ -244,9 +240,10 @@ pub const Handle = struct {
     rec_path: []u8,
     lock_path: []u8,
     lock_fd: c_int = -1,
-    /// Revision of the last successful write; `shouldWrite` compares
-    /// against it so an idle buffer costs nothing.
-    written_revision: ?u64 = null,
+    /// Document history state (`Document.state`) of the last successful
+    /// write; `shouldWrite` compares against it, so an idle buffer, and
+    /// one undone and redone back to the same text, costs nothing.
+    written_state: ?u64 = null,
 
     pub fn release(self: *Handle) void {
         if (self.lock_fd >= 0) _ = c.close(self.lock_fd);
@@ -276,37 +273,83 @@ pub const Handle = struct {
         if (pathz.pathZ(&z, self.rec_path)) |p| {
             _ = c.unlink(p);
         } else |_| {}
-        self.written_revision = null;
+        self.written_state = null;
     }
 
-    /// True when a snapshot at `revision` would differ from the last one
-    /// written. The caller still owns the debounce policy (a timer, an
-    /// idle callback); this only answers "is there anything new".
-    pub fn shouldWrite(self: *const Handle, revision: u64) bool {
-        const w = self.written_revision orelse return true;
-        return w != revision;
+    /// True when a snapshot of history state `state` would differ from
+    /// the last one written. The caller still owns the debounce policy;
+    /// this only answers "is there anything new".
+    pub fn shouldWrite(self: *const Handle, state: u64) bool {
+        const w = self.written_state orelse return true;
+        return w != state;
     }
 
-    /// Snapshot a document. `header` supplies the identity fields; the
-    /// content-derived ones are filled in here.
-    pub fn writeDocument(self: *Handle, doc: *const Document, header: Header) !void {
-        const text = try doc.textAlloc(self.alloc);
-        defer self.alloc.free(text);
+    /// Record that the snapshot of `state` landed.
+    pub fn noteWritten(self: *Handle, state: u64) void {
+        self.written_state = state;
+    }
+
+    /// An owned, immutable copy of `doc` ready for `Snapshot.write` on
+    /// any thread. `header` supplies the identity fields; the ones the
+    /// document knows are filled in here.
+    pub fn snapshot(self: *const Handle, alloc: Allocator, doc: *const Document, header: Header) !Snapshot {
+        if (doc.rope.len() > MAX_CONTENT) return Error.BufferTooLarge;
         var h = header;
         h.revision = doc.revision;
         h.saved_revision = doc.saved_revision;
         h.crlf = doc.line_ending == .crlf;
-        try self.write(h, text);
+        const content = try doc.textAlloc(alloc);
+        errdefer alloc.free(content);
+        return Snapshot.init(alloc, self.rec_path, h, content);
     }
 
     /// Snapshot arbitrary bytes (the buffer as it lives in memory:
-    /// LF-normalized when `header.crlf`).
+    /// LF-normalized when `header.crlf`) synchronously.
     pub fn write(self: *Handle, header: Header, content: []const u8) !void {
         if (content.len > MAX_CONTENT) return Error.BufferTooLarge;
+        const copy = try self.alloc.dupe(u8, content);
+        var snap = Snapshot.init(self.alloc, self.rec_path, header, copy) catch |err| {
+            self.alloc.free(copy);
+            return err;
+        };
+        defer snap.deinit();
+        try snap.write();
+    }
+};
+
+/// One record write, detached from its `Handle`: everything it touches
+/// is owned here, so `write` may run on a worker thread while the handle
+/// and the document stay with the main thread.
+pub const Snapshot = struct {
+    alloc: Allocator,
+    rec_path: []u8,
+    header: Header,
+    /// Owned copy of `header.spec`, which it points at.
+    spec: []u8,
+    content: []u8,
+
+    /// Takes ownership of `content`; copies the path and the spec.
+    fn init(alloc: Allocator, rec_path: []const u8, header: Header, content: []u8) !Snapshot {
+        const path = try alloc.dupe(u8, rec_path);
+        errdefer alloc.free(path);
+        const spec = try alloc.dupe(u8, header.spec);
         var h = header;
+        h.spec = spec;
+        return .{ .alloc = alloc, .rec_path = path, .header = h, .spec = spec, .content = content };
+    }
+
+    pub fn deinit(self: *Snapshot) void {
+        self.alloc.free(self.rec_path);
+        self.alloc.free(self.spec);
+        self.alloc.free(self.content);
+    }
+
+    /// Hash, frame and durably replace the record.
+    pub fn write(self: *Snapshot) !void {
+        var h = self.header;
         h.version = VERSION;
-        h.content_len = content.len;
-        h.content_hash = std.hash.Wyhash.hash(0xc0ffee, content);
+        h.content_len = self.content.len;
+        h.content_hash = std.hash.Wyhash.hash(0xc0ffee, self.content);
         h.updated_ms = wallMs();
         h.pid = @intCast(c.getpid());
 
@@ -318,14 +361,13 @@ pub const Handle = struct {
         // make the content start in the wrong place.
         std.debug.assert(std.mem.indexOfScalar(u8, header_json, '\n') == null);
 
-        const blob = try self.alloc.alloc(u8, header_json.len + 1 + content.len);
+        const blob = try self.alloc.alloc(u8, header_json.len + 1 + self.content.len);
         defer self.alloc.free(blob);
         @memcpy(blob[0..header_json.len], header_json);
         blob[header_json.len] = '\n';
-        @memcpy(blob[header_json.len + 1 ..], content);
+        @memcpy(blob[header_json.len + 1 ..], self.content);
 
         try writeFileAtomic(self.rec_path, blob);
-        self.written_revision = h.revision;
     }
 };
 
@@ -682,6 +724,14 @@ const ScopedDir = struct {
     }
 };
 
+/// The UI's write path, synchronously: snapshot, write, note.
+fn writeDoc(h: *Handle, doc: *const Document, header: Header) !void {
+    var snap = try h.snapshot(testing.allocator, doc, header);
+    defer snap.deinit();
+    try snap.write();
+    h.noteWritten(doc.state());
+}
+
 fn dirtyDoc(alloc: Allocator, text: []const u8) !Document {
     var doc = try Document.initFromBytes(alloc, text);
     errdefer doc.deinit();
@@ -703,7 +753,7 @@ test "journal: a crashed editor's buffer is recoverable, a live one's is not" {
 
     var live = try open(alloc, "/tmp/live.txt");
     defer live.release();
-    try live.writeDocument(&doc, .{ .spec = "/tmp/live.txt", .cursor = 3 });
+    try writeDoc(&live, &doc, .{ .spec = "/tmp/live.txt", .cursor = 3 });
 
     // A live owner holds its lock, so nothing is offered.
     {
@@ -715,7 +765,7 @@ test "journal: a crashed editor's buffer is recoverable, a live one's is not" {
     // Simulate a crash: the process dies, so the lock goes away without
     // the record being discarded.
     var crashed = try open(alloc, "/tmp/crashed.txt");
-    try crashed.writeDocument(&doc, .{ .spec = "/tmp/crashed.txt", .cursor = 7 });
+    try writeDoc(&crashed, &doc, .{ .spec = "/tmp/crashed.txt", .cursor = 7 });
     const key = try alloc.dupe(u8, crashed.key);
     defer alloc.free(key);
     crashed.release(); // closes the fd == what process death does
@@ -742,6 +792,51 @@ test "journal: a crashed editor's buffer is recoverable, a live one's is not" {
     try testing.expectEqual(@as(usize, 0), after.len);
 }
 
+test "journal: a snapshot is detached from the live document" {
+    const alloc = testing.allocator;
+    var scope = try ScopedDir.init(alloc, "detached");
+    defer scope.deinit();
+
+    var doc = try dirtyDoc(alloc, "first\n");
+    defer doc.deinit();
+    var h = try open(alloc, "/tmp/detached.txt");
+    const key = try alloc.dupe(u8, h.key);
+    defer alloc.free(key);
+    var snap = try h.snapshot(alloc, &doc, .{ .spec = "/tmp/detached.txt" });
+    const want = try doc.textAlloc(alloc);
+    defer alloc.free(want);
+    // The user keeps typing while the worker has the snapshot.
+    const tr = @import("transaction.zig");
+    var tx = tr.Transaction.init(doc.revision);
+    defer tx.deinit(alloc);
+    try tx.addInsert(alloc, 0, "LATER ");
+    _ = try doc.applyTransaction(&tx);
+    try snap.write();
+    snap.deinit();
+    h.release();
+
+    var rec = try read(alloc, key);
+    defer rec.deinit(alloc);
+    try testing.expectEqualStrings(want, rec.content);
+}
+
+test "journal: an undo and redo back to the written state writes nothing" {
+    const alloc = testing.allocator;
+    var scope = try ScopedDir.init(alloc, "states");
+    defer scope.deinit();
+
+    var doc = try dirtyDoc(alloc, "abc");
+    defer doc.deinit();
+    var h = try open(alloc, "/tmp/states.txt");
+    defer h.discard();
+    try writeDoc(&h, &doc, .{ .spec = "/tmp/states.txt" });
+    _ = try doc.undo();
+    try testing.expect(h.shouldWrite(doc.state()));
+    _ = try doc.redo();
+    // Revisions moved twice; the content did not.
+    try testing.expect(!h.shouldWrite(doc.state()));
+}
+
 test "journal: a clean save prunes the record" {
     const alloc = testing.allocator;
     var scope = try ScopedDir.init(alloc, "clean");
@@ -750,8 +845,8 @@ test "journal: a clean save prunes the record" {
     var doc = try dirtyDoc(alloc, "abc");
     defer doc.deinit();
     var h = try open(alloc, "/tmp/f.txt");
-    try h.writeDocument(&doc, .{ .spec = "/tmp/f.txt" });
-    try testing.expect(!h.shouldWrite(doc.revision));
+    try writeDoc(&h, &doc, .{ .spec = "/tmp/f.txt" });
+    try testing.expect(!h.shouldWrite(doc.state()));
 
     // The face saved the file: mark it and drop the snapshot.
     doc.markSaved();
@@ -775,8 +870,8 @@ test "journal: two editors of the same file keep separate records" {
     var a = try open(alloc, "/tmp/same.txt");
     var b = try open(alloc, "/tmp/same.txt");
     try testing.expect(!std.mem.eql(u8, a.key, b.key));
-    try a.writeDocument(&doc_a, .{ .spec = "/tmp/same.txt" });
-    try b.writeDocument(&doc_b, .{ .spec = "/tmp/same.txt" });
+    try writeDoc(&a, &doc_a, .{ .spec = "/tmp/same.txt" });
+    try writeDoc(&b, &doc_b, .{ .spec = "/tmp/same.txt" });
     a.release();
     b.release();
 
@@ -802,7 +897,7 @@ test "journal: a saved buffer is never offered for recovery" {
     var doc = try Document.initFromBytes(alloc, "unchanged");
     defer doc.deinit();
     var h = try open(alloc, "/tmp/clean.txt");
-    try h.writeDocument(&doc, .{ .spec = "/tmp/clean.txt" });
+    try writeDoc(&h, &doc, .{ .spec = "/tmp/clean.txt" });
     h.release();
 
     const entries = try list(alloc);
@@ -818,7 +913,7 @@ test "journal: a truncated record is refused, not handed back as work" {
     var doc = try dirtyDoc(alloc, "important text");
     defer doc.deinit();
     var h = try open(alloc, "/tmp/t.txt");
-    try h.writeDocument(&doc, .{ .spec = "/tmp/t.txt" });
+    try writeDoc(&h, &doc, .{ .spec = "/tmp/t.txt" });
     const key = try alloc.dupe(u8, h.key);
     defer alloc.free(key);
     const rec_path = try alloc.dupe(u8, h.rec_path);
@@ -858,7 +953,7 @@ test "journal: CRLF style and disk baseline survive the round trip" {
         .mode = 0o644,
     });
     var h = try open(alloc, "box:/etc/hosts");
-    try h.writeDocument(&doc, header);
+    try writeDoc(&h, &doc, header);
     const key = try alloc.dupe(u8, h.key);
     defer alloc.free(key);
     h.release();

@@ -220,7 +220,14 @@ fn journalStage(allocator: std.mem.Allocator) !?u8 {
     var h = try journal.open(allocator, "/tmp/smoke-target.txt");
     var hdr = journal.Header{ .spec = "/tmp/smoke-target.txt", .cursor = 17 };
     hdr.setBaseline(.{ .known = true, .present = true, .mtime_ns = 42, .size = 18, .ino = 7, .mode = 0o644 });
-    try h.writeDocument(&doc, hdr);
+    {
+        // The editor face's own path: an owned snapshot, written the way
+        // its worker writes it.
+        var snap = try h.snapshot(allocator, &doc, hdr);
+        defer snap.deinit();
+        try snap.write();
+        h.noteWritten(doc.state());
+    }
 
     // A LIVE owner is never offered.
     {
@@ -263,7 +270,12 @@ fn journalStage(allocator: std.mem.Allocator) !?u8 {
 
     // A clean save + close leaves nothing behind.
     var h2 = try journal.open(allocator, "/tmp/smoke-target.txt");
-    try h2.writeDocument(&doc, hdr);
+    {
+        var snap = try h2.snapshot(allocator, &doc, hdr);
+        defer snap.deinit();
+        try snap.write();
+        h2.noteWritten(doc.state());
+    }
     doc.markSaved();
     h2.discard();
     const after = try journal.list(allocator);
@@ -1267,14 +1279,23 @@ pub fn main() !u8 {
             std.debug.print("smoke-editor: FAIL — project search found nothing\n", .{});
             return 12;
         }
-        const plan = (try res.planReplace(f0, HL_SRC, 42)).?;
-        if (std.mem.indexOf(u8, plan, "STD") == null) {
-            std.debug.print("smoke-editor: FAIL — replace plan did not replace\n", .{});
-            return 12;
-        }
-        if (std.mem.indexOf(u8, plan, "\nconst std") != null) {
-            std.debug.print("smoke-editor: FAIL — replace plan missed an occurrence\n", .{});
-            return 12;
+        // Applying it is the find bar's own Replace All over a buffer.
+        {
+            var rdoc = try Document.initFromBytes(allocator, HL_SRC);
+            defer rdoc.deinit();
+            var rsels = try SelectionSet.initSingle(allocator, Selection.caret(0));
+            defer rsels.deinit(allocator);
+            const n = try search.replaceAllIn(allocator, &rdoc, &rsels, res.needle, res.replacement, res.opts);
+            const replaced = try rdoc.textAlloc(allocator);
+            defer allocator.free(replaced);
+            if (n != hits or std.mem.indexOf(u8, replaced, "STD") == null) {
+                std.debug.print("smoke-editor: FAIL — project replace did not replace every hit\n", .{});
+                return 12;
+            }
+            if (std.mem.indexOf(u8, replaced, "\nconst std") != null) {
+                std.debug.print("smoke-editor: FAIL — project replace missed an occurrence\n", .{});
+                return 12;
+            }
         }
         // The seed a regex hands the daemon must be SOUND: every match
         // of the pattern contains it.
@@ -1286,8 +1307,8 @@ pub fn main() !u8 {
             }
         }
         std.debug.print(
-            "smoke-editor: project search hits={d} files={d} plan_bytes={d}\n",
-            .{ res.hitCount(), res.matchedFiles(), plan.len },
+            "smoke-editor: project search hits={d} files={d}\n",
+            .{ res.hitCount(), res.matchedFiles() },
         );
 
         // 6. Root discovery is the LSP machinery, one marker list wider.

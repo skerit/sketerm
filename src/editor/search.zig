@@ -29,6 +29,9 @@ const Allocator = std.mem.Allocator;
 const Document = @import("document.zig").Document;
 const unicode = @import("unicode.zig");
 const regex = @import("regex.zig");
+const tr = @import("transaction.zig");
+const vm = @import("view_model.zig");
+const SelectionSet = @import("selection.zig").SelectionSet;
 
 pub const Match = struct {
     start: usize,
@@ -151,25 +154,43 @@ pub const Regex = struct {
         self.matcher.prog = &self.prog;
     }
 
-    /// Every non-overlapping match, ascending. An empty match advances
-    /// by one CODEPOINT, so `x*` terminates and never reports the same
-    /// position twice.
+    /// Where a walk over the document stands between two `next` calls.
+    const Walk = struct {
+        pos: usize = 0,
+        done: bool = false,
+    };
+
+    /// The next non-overlapping match with its captures. An empty match
+    /// advances by one CODEPOINT, so `x*` terminates and never reports
+    /// the same position twice.
+    fn next(self: *Regex, doc: *const Document, walk: *Walk) Error!?regex.Captures {
+        const src = docSource(doc);
+        while (!walk.done and walk.pos <= src.len) {
+            const caps = (try self.matcher.search(src, walk.pos)) orelse {
+                walk.done = true;
+                return null;
+            };
+            const m = Match{ .start = caps.start(), .end = caps.end() };
+            if (m.end > m.start) {
+                walk.pos = m.end;
+            } else if (m.end >= src.len) {
+                walk.done = true;
+            } else {
+                walk.pos = m.end + cpLenAt(doc, m.end);
+            }
+            if (!self.whole_word or wholeWordOk(doc, m)) return caps;
+        }
+        return null;
+    }
+
+    /// Every non-overlapping match, ascending.
     pub fn findAll(self: *Regex, doc: *const Document) Error![]Match {
         self.rebind();
-        const src = docSource(doc);
         var out: std.ArrayList(Match) = .empty;
         errdefer out.deinit(self.alloc);
-        var pos: usize = 0;
-        while (pos <= src.len) {
-            const caps = (try self.matcher.search(src, pos)) orelse break;
-            const m = Match{ .start = caps.start(), .end = caps.end() };
-            if (!self.whole_word or wholeWordOk(doc, m)) try out.append(self.alloc, m);
-            if (m.end > m.start) {
-                pos = m.end;
-            } else {
-                if (m.end >= src.len) break;
-                pos = m.end + cpLenAt(doc, m.end);
-            }
+        var walk: Walk = .{};
+        while (try self.next(doc, &walk)) |caps| {
+            try out.append(self.alloc, .{ .start = caps.start(), .end = caps.end() });
         }
         return out.toOwnedSlice(self.alloc);
     }
@@ -339,6 +360,108 @@ fn scanWindow(
             try out.append(alloc, .{ .start = base + i, .end = base + i + pat.len });
         }
     }
+}
+
+/// One replacement of a Replace All: the span it rewrites and the text
+/// that goes there, captures already expanded.
+pub const Replacement = struct {
+    start: usize,
+    end: usize,
+    text: []const u8,
+};
+
+/// Every replacement `template` makes for `needle` in `doc`, ascending
+/// and non-overlapping; slices and texts live in `arena`.
+///
+/// The ONE definition of Replace All, shared by the find bar, the
+/// project panel and the raw-file writer. A regex replacement expands
+/// the captures of the very match it replaces (no second search, so
+/// there is no "captures not found" state to skip or paper over), and a
+/// zero-width match inserts its expansion where it matched, as
+/// JavaScript, Python and VS Code do: `x*` over "ab" with "-" gives
+/// "-a-b-". Literal mode inserts the template verbatim.
+pub fn planReplaceAll(
+    arena: Allocator,
+    doc: *const Document,
+    needle: []const u8,
+    template: []const u8,
+    opts: Options,
+) Error![]Replacement {
+    var out: std.ArrayList(Replacement) = .empty;
+    if (needle.len == 0) return out.toOwnedSlice(arena);
+    if (!opts.regex) {
+        const matches = try findAll(arena, doc, needle, opts);
+        const text = try arena.dupe(u8, template);
+        try out.ensureTotalCapacity(arena, matches.len);
+        for (matches) |m| out.appendAssumeCapacity(.{ .start = m.start, .end = m.end, .text = text });
+        return out.toOwnedSlice(arena);
+    }
+    var re = try Regex.init(arena, needle, opts);
+    defer re.deinit();
+    re.rebind();
+    var walk: Regex.Walk = .{};
+    while (try re.next(doc, &walk)) |caps| {
+        var buf: std.ArrayList(u8) = .empty;
+        try re.expand(doc, caps, template, &buf);
+        try out.append(arena, .{ .start = caps.start(), .end = caps.end(), .text = buf.items });
+    }
+    return out.toOwnedSlice(arena);
+}
+
+/// The replacement for ONE match (the find bar's Replace), or null when
+/// the pattern no longer matches exactly there (the document moved).
+/// Caller frees.
+pub fn replacementAt(
+    alloc: Allocator,
+    doc: *const Document,
+    needle: []const u8,
+    template: []const u8,
+    opts: Options,
+    m: Match,
+) Error!?[]u8 {
+    if (!opts.regex) return try alloc.dupe(u8, template);
+    var re = try Regex.init(alloc, needle, opts);
+    defer re.deinit();
+    const caps = (try re.capturesAt(doc, m.start)) orelse return null;
+    if (caps.end() != m.end) return null;
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(alloc);
+    try re.expand(doc, caps, template, &buf);
+    return try buf.toOwnedSlice(alloc);
+}
+
+/// Apply a Replace All plan to `doc` as ONE transaction, so it is one
+/// undo step, mapping `sels` through it. @return the replacement count.
+pub fn applyPlan(
+    alloc: Allocator,
+    doc: *Document,
+    sels: *SelectionSet,
+    plan: []const Replacement,
+) !usize {
+    if (plan.len == 0) return 0;
+    var tx = tr.Transaction.init(doc.revision);
+    defer tx.deinit(alloc);
+    for (plan) |r| try tx.addReplace(alloc, r.start, r.end - r.start, r.text);
+    _ = try doc.applyTransactionSel(&tx, vm.snapshotOf(sels));
+    sels.mapThrough(tx.edits.items, .editor);
+    vm.clampSelections(doc, sels);
+    return plan.len;
+}
+
+/// Replace every match of `needle` in `doc` (the whole Replace All).
+/// @return the replacement count.
+pub fn replaceAllIn(
+    alloc: Allocator,
+    doc: *Document,
+    sels: *SelectionSet,
+    needle: []const u8,
+    template: []const u8,
+    opts: Options,
+) !usize {
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const plan = try planReplaceAll(arena_state.allocator(), doc, needle, template, opts);
+    return applyPlan(alloc, doc, sels, plan);
 }
 
 /// Index of the match to select when searching from `from` (a caret
@@ -621,4 +744,74 @@ test "search: multi-line needle" {
     try testing.expectEqual(@as(usize, 2), m.len);
     try testing.expectEqual(@as(usize, 4), m[0].start);
     try testing.expectEqual(@as(usize, 14), m[1].start);
+}
+
+/// Replace All over `text`, as the find bar applies it.
+fn replacedText(text: []const u8, needle: []const u8, template: []const u8, opts: Options) ![]u8 {
+    const a = testing.allocator;
+    var doc = try docOf(text);
+    defer doc.deinit();
+    var sels = try SelectionSet.initSingle(a, @import("selection.zig").Selection.caret(0));
+    defer sels.deinit(a);
+    _ = try replaceAllIn(a, &doc, &sels, needle, template, opts);
+    return doc.textAlloc(a);
+}
+
+test "search replace: zero-width matches insert at every position" {
+    const a = testing.allocator;
+    const out = try replacedText("ab", "x*", "-", .{ .regex = true });
+    defer a.free(out);
+    try testing.expectEqualStrings("-a-b-", out);
+    // An empty match right after a non-empty one is still a match:
+    // JavaScript and Python both give "-b--c-".
+    const adj = try replacedText("baac", "a*", "-", .{ .regex = true });
+    defer a.free(adj);
+    try testing.expectEqualStrings("-b--c-", adj);
+}
+
+test "search replace: captures come from the match being replaced" {
+    const a = testing.allocator;
+    const out = try replacedText("k1=v1\nk2=v2\n", "(\\w+)=(\\w+)", "$2=$1", .{ .regex = true });
+    defer a.free(out);
+    try testing.expectEqualStrings("v1=k1\nv2=k2\n", out);
+    // A group that did not participate expands to nothing, `$$` is a
+    // dollar and `$0` the whole match.
+    const opt = try replacedText("ab b", "(a)?b", "[$1|$0|$$]", .{ .regex = true });
+    defer a.free(opt);
+    try testing.expectEqualStrings("[a|ab|$] [|b|$]", opt);
+}
+
+test "search replace: literal templates are verbatim and one undo step" {
+    const a = testing.allocator;
+    var doc = try docOf("one two one");
+    defer doc.deinit();
+    var sels = try SelectionSet.initSingle(a, @import("selection.zig").Selection.caret(0));
+    defer sels.deinit(a);
+    try testing.expectEqual(@as(usize, 2), try replaceAllIn(a, &doc, &sels, "one", "$1", .{}));
+    const got = try doc.textAlloc(a);
+    defer a.free(got);
+    try testing.expectEqualStrings("$1 two $1", got);
+    _ = try doc.undo();
+    const back = try doc.textAlloc(a);
+    defer a.free(back);
+    try testing.expectEqualStrings("one two one", back);
+}
+
+test "search replace: whole-word regex skips embedded matches" {
+    const a = testing.allocator;
+    const out = try replacedText("cat scatter cat", "c.t", "dog", .{ .regex = true, .whole_word = true });
+    defer a.free(out);
+    try testing.expectEqualStrings("dog scatter dog", out);
+}
+
+test "search replace: a single replacement refuses a match that moved" {
+    const a = testing.allocator;
+    var doc = try docOf("id=7 id=42");
+    defer doc.deinit();
+    const opts = Options{ .regex = true };
+    const hit = (try replacementAt(a, &doc, "id=(\\d+)", "$1", opts, .{ .start = 5, .end = 10 })).?;
+    defer a.free(hit);
+    try testing.expectEqualStrings("42", hit);
+    // A stale span (end no longer where the match ends) answers null.
+    try testing.expect((try replacementAt(a, &doc, "id=(\\d+)", "$1", opts, .{ .start = 5, .end = 9 })) == null);
 }

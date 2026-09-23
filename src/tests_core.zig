@@ -55,7 +55,7 @@ comptime {
     _ = @import("lsp/session_test.zig");
     _ = @import("lsp/diagnostics.zig");
     _ = @import("lsp/docsync.zig");
-    _ = @import("lsp/pending.zig");
+    _ = @import("editor/deferred.zig");
     _ = @import("lsp/symbols.zig");
     _ = @import("lsp/proc.zig");
     _ = @import("lsp/stderrtail.zig");
