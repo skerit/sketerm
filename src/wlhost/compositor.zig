@@ -561,6 +561,13 @@ pub const Surface = struct {
     /// xdg_dialog_v1.set_modal is in effect for this toplevel.
     modal: bool = false,
 
+    /// Whether this surface's pixels belong to a window (toplevel, popup or
+    /// subsurface role); cursor and drag-icon surfaces commit buffers too and
+    /// must never reach the view, live or replayed.
+    pub fn mapsToView(self: *const Surface) bool {
+        return self.toplevel != 0 or self.popup != 0 or self.subparent != 0;
+    }
+
     pub fn freeOwned(self: *Surface, a: std.mem.Allocator) void {
         self.frame_cbs.deinit(a);
         self.release_cbs.deinit(a);
@@ -3327,7 +3334,7 @@ pub const Compositor = struct {
     }
 
     fn replayFrame(self: *Compositor, sid: u32, s: *const Surface) Error!void {
-        if (s.committed_buffer == 0) return;
+        if (s.committed_buffer == 0 or !s.mapsToView()) return;
         const info = self.buffers.get(s.committed_buffer) orelse return;
         try self.pushFrame(sid, info);
     }
@@ -4872,6 +4879,91 @@ test "state_sync: serialize, restore into replica, windows replay" {
     // safe (events were generated but nobody ships them).
     replica.clearOut();
     try t.expect(!replica.dead);
+}
+
+test "state_sync: role-less surfaces with a buffer never replay as windows" {
+    // GTK keeps a drag-icon surface (no xdg role) with its last buffer
+    // after a within-app drag. The live commit path never shows it; a
+    // replica rebuilt from state_sync must not turn it into a toplevel.
+    var tv = TestView{};
+    var brain = try Compositor.init(t.allocator, tv.view());
+    defer brain.deinit();
+    var buf: [128]u8 = undefined;
+
+    try getRegistry(&brain);
+    try bindGlobal(&brain, 1, "wl_compositor", 4, 3);
+    try bindGlobal(&brain, 2, "wl_shm", 1, 4);
+    try bindGlobal(&brain, 5, "xdg_wm_base", 2, 5);
+    { // toplevel: surface 6, xdg_surface 7, xdg_toplevel 8, initial commit
+        var b = wire.Builder.init(&buf, 3, 0);
+        b.putNewId(6);
+        try req(&brain, try b.finish());
+        var b2 = wire.Builder.init(&buf, 5, 2);
+        b2.putNewId(7);
+        b2.putObject(6);
+        try req(&brain, try b2.finish());
+        var b3 = wire.Builder.init(&buf, 7, 1);
+        b3.putNewId(8);
+        try req(&brain, try b3.finish());
+        var b4 = wire.Builder.init(&buf, 6, 6);
+        try req(&brain, try b4.finish());
+    }
+    { // the role-less surface: 11
+        var b = wire.Builder.init(&buf, 3, 0);
+        b.putNewId(11);
+        try req(&brain, try b.finish());
+    }
+    { // create_pool(9, fd, 32)
+        var b = wire.Builder.init(&buf, 4, 0);
+        b.putNewId(9);
+        b.putInt(32);
+        try req(&brain, try b.finish());
+    }
+    var px: [32]u8 = undefined;
+    for (&px, 0..) |*p, i| p.* = @intCast(i + 1);
+    {
+        var unit: std.ArrayList(u8) = .empty;
+        defer unit.deinit(t.allocator);
+        try pipe.appendPoolUpdate(&unit, t.allocator, 9, 0, &px);
+        try brain.feed(unit.items);
+    }
+    // Buffers 10 (toplevel) and 12 (icon): 2x2 xrgb each, stride 8.
+    inline for (.{ .{ 10, 0, 6 }, .{ 12, 16, 11 } }) |spec| {
+        var b = wire.Builder.init(&buf, 9, 0);
+        b.putNewId(spec[0]);
+        b.putInt(spec[1]);
+        b.putInt(2);
+        b.putInt(2);
+        b.putInt(8);
+        b.putUint(1);
+        try req(&brain, try b.finish());
+        var b2 = wire.Builder.init(&buf, spec[2], 1); // attach
+        b2.putObject(spec[0]);
+        b2.putInt(0);
+        b2.putInt(0);
+        try req(&brain, try b2.finish());
+        var b3 = wire.Builder.init(&buf, spec[2], 6); // commit
+        try req(&brain, try b3.finish());
+    }
+    // Live: only the toplevel reached the view.
+    try t.expectEqual(@as(usize, 1), tv.frames);
+
+    const blob = try brain.serializeState(t.allocator);
+    defer t.allocator.free(blob);
+    var tv2 = TestView{};
+    var replica = try Compositor.init(t.allocator, tv2.view());
+    defer replica.deinit();
+    {
+        var units: std.ArrayList(u8) = .empty;
+        defer units.deinit(t.allocator);
+        try pipe.appendPoolMeta(&units, t.allocator, .pool_create, 9, 32);
+        try pipe.appendPoolUpdate(&units, t.allocator, 9, 0, &px);
+        try pipe.appendUnit(&units, t.allocator, .state_sync, blob);
+        try replica.feed(units.items);
+    }
+    try t.expectEqual(@as(usize, 1), tv2.new_count);
+    try t.expectEqual(@as(usize, 1), tv2.frames);
+    try t.expectEqual(@as(u8, 1), tv2.last_pixels[0]);
 }
 
 test "applyIntent: configure and request_close reach the app" {

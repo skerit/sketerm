@@ -813,6 +813,25 @@ pub const App = struct {
         local_sock: ?[]const u8,
         expected_origin_id: ?[]const u8,
     ) Error!*App {
+        return attachAs(allocator, session_name, kb_layout, local_sock, expected_origin_id, .driver);
+    }
+
+    /// Attach a read-only viewer: it gets the same full replay a new
+    /// viewer gets, and never takes the controller lease from the driver.
+    pub fn attachObserver(allocator: std.mem.Allocator, session_name: []const u8, local_sock: ?[]const u8) Error!*App {
+        return attachAs(allocator, session_name, null, local_sock, null, .observer);
+    }
+
+    const AttachRole = enum { driver, observer };
+
+    fn attachAs(
+        allocator: std.mem.Allocator,
+        session_name: []const u8,
+        kb_layout: ?[]const u8,
+        local_sock: ?[]const u8,
+        expected_origin_id: ?[]const u8,
+        role: AttachRole,
+    ) Error!*App {
         launch_err_len = 0;
         const layout_name = kb_layout orelse "";
         const blob = keymaps.get(layout_name) orelse return Error.BadLayout;
@@ -848,7 +867,8 @@ pub const App = struct {
         conn.sendAttach(name, .{
             .origin_id = if (origin_id_valid) &origin_id else "",
             .kind = "mcp",
-            .control = true,
+            .control = role == .driver,
+            .read_only = role == .observer,
         }) catch return Error.SpawnFailed;
         const snap = conn.recvExpectFor(&.{.snapshot}, 15_000) catch |err| {
             setStepErr("attach", &conn, err);

@@ -1476,11 +1476,7 @@ pub fn commit(self: *Compositor, sid: u32, surf: *Surface) Error!void {
 
     if (took_buffer and surf.committed_buffer != 0) {
         if (self.buffers.get(surf.committed_buffer)) |info| {
-            // Only mapped surfaces (toplevel/popup/subsurface role)
-            // reach the view — cursor surfaces (set_cursor, no role)
-            // commit buffers too and must NOT become windows.
-            if (surf.toplevel != 0 or surf.popup != 0 or surf.subparent != 0)
-                try pushFrame(self, sid, info);
+            if (surf.mapsToView()) try pushFrame(self, sid, info);
             // Released immediately: pixels were copied out (or
             // ignored — either way we won't read them later).
             var buf: [8]u8 = undefined;

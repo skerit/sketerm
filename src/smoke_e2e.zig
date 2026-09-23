@@ -3125,7 +3125,9 @@ fn sidebarDragStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
     closeAddedPanes(allocator, sock_path, app, keep_ids[0..keep_n]);
     if (roundtrip(allocator, sock_path, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r);
     _ = app.waitIdle(200, 4_000);
-    return null;
+    // The row drags left GTK drag-icon surfaces behind, still holding
+    // their last buffer: exactly what a viewer's replay must not show.
+    return expectNoPhantomToplevels(allocator, app);
 }
 
 /// Pixels of the shared "assistant accent" rgba(255,120,40): the
@@ -5854,6 +5856,48 @@ fn dumpToplevels(app: *appdrive.App) void {
     for (app.windows.items) |w| {
         _ = c.fprintf(platform.stderr(), "smoke-e2e:   surface %u popup=%d frames=%llu %dx%d\n", w.id, @as(c_int, @intFromBool(w.popup)), @as(c_ulonglong, w.frames), w.w, w.h);
     }
+}
+
+/// A toplevel on the main GUI's connection that carries no app_id: every
+/// GTK toplevel sets one, so this is a role-less surface (a drag icon)
+/// that a viewer turned into a window.
+fn phantomToplevel(app: *appdrive.App, chan: u32) ?*appdrive.Window {
+    for (app.windows.items) |w| {
+        if (!w.popup and w.chan == chan and w.app_id == null) return w;
+    }
+    return null;
+}
+
+/// The main GUI shows no toplevels besides its real windows, both in the
+/// rig's long-lived viewer and in the full replay a NEW viewer receives
+/// (where drag-icon surfaces once came back as 240x27 windows).
+fn expectNoPhantomToplevels(allocator: std.mem.Allocator, app: *appdrive.App) ?[]const u8 {
+    const main_win = rigwin.mainWindow(app) orelse return "the display session lost the GUI's window";
+    const chan = main_win.chan;
+    const sid = main_win.sid;
+    if (phantomToplevel(app, chan)) |w| {
+        dumpToplevels(app);
+        return whyf("the rig's viewer shows a toplevel that is no window: surface {d}, {d}x{d}, no app_id", .{ w.id, w.w, w.h });
+    }
+    const fresh = appdrive.App.attachObserver(allocator, DISPLAY_SESSION, g_mux_sock) catch
+        return "attaching a read-only viewer to the display session failed";
+    defer fresh.detach();
+    // The replay lands after the attach snapshot and rebuilds every
+    // surface in one pass: once the GUI's own window has its pixels back,
+    // everything the replay was going to show is there.
+    const deadline = clock.nowMs() + 15_000;
+    while (clock.nowMs() < deadline) {
+        _ = fresh.pumpOnce(100);
+        for (fresh.windows.items) |w| {
+            if (w.chan == chan and w.sid == sid and w.frames > 0) break;
+        } else continue;
+        break;
+    } else return "a new viewer never received the GUI's window";
+    if (phantomToplevel(fresh, chan)) |w| {
+        dumpToplevels(fresh);
+        return whyf("a new viewer's replay turned a role-less surface into a toplevel: surface {d}, {d}x{d}, no app_id", .{ w.id, w.w, w.h });
+    }
+    return null;
 }
 
 /// Pump the display session for `ms` of WALL time. One `pumpOnce` is one
@@ -13173,7 +13217,10 @@ fn themeSingletonStage(
         _ = app.waitIdle(200, 2_000);
         break;
     } else return "the main GUI disappeared during the secondary-window lifetime stage";
-    return null;
+    // Two GUIs repainting under a 200ms theme flip is the traffic that
+    // pushes this viewer into a native resync; the stray 330x27 windows
+    // later stages mistook for the main window were that replay's work.
+    return expectNoPhantomToplevels(allocator, app);
 }
 
 /// A solid-colour PNG for the image_compare sides. Two visibly
