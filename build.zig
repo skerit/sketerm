@@ -1059,6 +1059,8 @@ pub fn build(b: *std.Build) void {
     // C runtime — `mux`/`mux-portable` use configureCoreDeps WITHOUT it,
     // which is what keeps the daemon's link graph clean.
     addTreeSitter(b, coretests_mod, tree_sitter);
+    // config.zig's drift test embeds docs/config.md, as in tests_mod.
+    coretests_mod.addAnonymousImport("docs_config_md", .{ .root_source_file = b.path("docs/config.md") });
     const coretests = b.addTest(.{
         .root_module = coretests_mod,
         .use_llvm = test_llvm,

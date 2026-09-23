@@ -41,8 +41,12 @@ key = value
   loads on an older one.
 - A value that fails to parse warns with its line number and leaves
   that key at its previous value.
-- Files larger than 64 KiB are truncated at that point with a
-  warning.
+- A file larger than 64 KiB is refused with a warning naming it: at
+  startup the built-in defaults are used, and a live reload keeps the
+  running config. Nothing is parsed in part, because a file cut at an
+  arbitrary line changes meaning silently. The Preferences dialog
+  refuses to write past the same limit, so a file it saved always
+  loads.
 
 ### Value types
 
@@ -55,7 +59,7 @@ key = value
 | path | string; a leading `~` or `~/` expands to `$HOME` (`~user` is not supported) |
 | colour | `#RRGGBB`, `#RRGGBBAA`, `R,G,B` or `R,G,B,A` with components 0..255 |
 | palette | exactly 16 colon-separated `#RRGGBB` entries |
-| enum | one of the listed bare words |
+| enum | one of the listed bare words; `-` and `_` are interchangeable on read (`block-gestureless` = `block_gestureless`), and each key writes back one fixed spelling |
 
 ## The one structural rule: app-level vs profile-level
 
@@ -105,13 +109,14 @@ further down.
 | Family | Shape |
 | --- | --- |
 | `keybind.<action>` | `keybind.new_tab = <Control><Shift>t` |
+| `editor_keybind.<command>` | `editor_keybind.toggle_comment = <Control>slash` |
 | `hint.<name>.<field>` | `hint.jira.regex = [A-Z]+-[0-9]+` |
 | `symbol_map.<name>` | `symbol_map.powerline = U+E0A0-U+E0A3 Symbols Nerd Font` |
 | `shader_param.<name>` | `shader_param.glow = 0.55` |
 | `light.<key>` / `dark.<key>` | `light.default_bg = #fdf6e3` |
 
 `light.` / `dark.` are profile-level and therefore work both at the
-top level and inside a profile section. The other four are app-level
+top level and inside a profile section. The other five are app-level
 and only work at the top level -- which includes a
 `[platform.<name>]` section, since that is the top level made
 conditional.
@@ -152,7 +157,7 @@ Valid at the top level (= the Default profile) and inside
 | `font_family_bold` | string | unset | Empty means "derive bold from `font_family`", which is wrong when you pair one family's regular with another's bold. |
 | `font_family_italic` | string | unset | as above |
 | `font_family_bold_italic` | string | unset | as above |
-| `font_weight` | int | `0` | CSS weight 100..900 for the regular face. `0` = the font's own default (400). Selects the family's weight file AND sets the `wght` axis on a variable font, which is the only way to reach intermediate weights. A value outside 100..900 is a parse error, not a clamp. |
+| `font_weight` | int | `0` | CSS weight 100..900 for the regular face. `0` = the font's own default (400), and is accepted in a profile section too, so a profile can go back to it when the Default profile pins a weight. Selects the family's weight file AND sets the `wght` axis on a variable font, which is the only way to reach intermediate weights. Any other value outside 100..900 is a parse error, not a clamp. |
 | `font_weight_bold` | int | `0` | Same, for the bold face (`0` = 700). |
 | `font_features` | string | unset | OpenType features for HarfBuzz, whitespace/comma separated, CSS/kitty syntax: `-calt +ss01 zero cv05=3`. |
 | `font_size` | int | `14` | Points. |
@@ -249,6 +254,23 @@ the window and the gap belongs to no single profile.
 
 `custom_shader_animation` and the `shader_param.*` family are
 app-level.
+
+### Predictive echo
+
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `predictive_echo` | enum | `auto` | `auto`, `always`, `never`. Mosh-style local echo on remote (mux) panes: a typed printable character is drawn speculatively, underlined, before the real echo arrives, and reconciled against it. `auto` draws predictions only once a previous one has been confirmed by a real echo (so a password prompt never shows them) and the measured round trip is at least 60 ms; `always` draws them unconditionally; `never` turns the overlay off. Per profile, so a profile used for slow hosts can differ from the Default. Preferences: Behavior, Input, "Predictive echo" (edits the profile selected at the top of the window). |
+
+Local tabs and splits never predict, whatever this key or the
+environment say: their shell runs on this machine's daemon, so the
+real echo lands within a frame and a prediction would only flicker.
+The key matters for panes attached to a remote host (`sketerm ssh`,
+remote mux sessions).
+
+The `SKETERM_PREDICT=auto|always|never` environment variable still
+overrides this key for every other pane of the process it is set on:
+an explicit invocation beats persistent config, as with the other
+environment overrides below.
 
 ---
 
@@ -711,6 +733,10 @@ editor *font* is per-profile.
 | `editor_tab_width` | int | `4` | 1..16. The fallback indent and tab width: a per-tab override, a language that requires tabs, `.editorconfig` and the file's own indentation all come first (docs/editor-commands.md, "Indentation"). |
 | `editor_insert_spaces` | bool | `true` | False inserts a real tab. The fallback style, under the same precedence. |
 | `editor_soft_wrap` | bool | `false` | Initial state for new editor tabs; per-tab from there. |
+| `editor_wrap_words` | bool | `true` | Soft wrap prefers UAX #14 word/line-break opportunities; `false` wraps at any grapheme (denser, useful for logs and minified text). A token wider than the view wraps mid-token either way. |
+| `editor_auto_indent` | bool | `true` | Enter deepens the indent after an opening bracket and drops a pending closer onto its own line. `false` copies the previous line's leading whitespace only. |
+| `editor_auto_close_pairs` | bool | `true` | Typing an opening bracket or quote inserts its closer; typing the closer when it is next moves past it, Backspace between an empty pair deletes both, and wrapping a selection surrounds it. |
+| `editor_smart_backspace` | bool | `true` | Backspace in a line's leading spaces retreats one tab stop. |
 | `editor_line_numbers` | bool | `true` | |
 | `editor_highlight_current_line` | bool | `true` | |
 | `editor_syntax` | bool | `true` | Tree-sitter highlighting. |
@@ -726,6 +752,23 @@ editor *font* is per-profile.
 | `editor_lsp` | bool | `true` | Master switch for the language-server client. Off means no server is ever spawned. |
 | `editor_lsp_diagnostics` | bool | `true` | Squiggles and gutter markers; off keeps the rest of LSP working. |
 | `editor_lsp_debounce_ms` | int | `250` | Delay after the last keystroke before `textDocument/didChange` is flushed. A feature request always flushes first regardless. |
+| `editor_lsp_inlay_hints` | bool | `true` | Inline type and parameter-name annotations from the server, for the visible viewport only. Display-only: they never enter the document. |
+| `editor_lsp_semantic_tokens` | bool | `true` | Server-computed token colours layered on top of the Tree-sitter highlighting; the server wins where it speaks. |
+| `editor_lsp_signature_help` | bool | `true` | Signature help while typing a call, on the server's trigger characters and on Ctrl+Shift+Space. |
+| `editor_lsp_hover_delay_ms` | int | `500` | How long the pointer must sit still over a symbol before a hover is requested. `0` disables mouse-dwell hover; Ctrl+I is unaffected. |
+
+#### `editor_keybind.<command>`
+
+The editor face's own binding namespace, kept apart from
+`keybind.<action>` so an editor chord can never shadow, or be consumed
+by, the terminal's table. `<command>` is an editor command name from
+`src/editor/commands.zig`, the value a GTK accelerator string, and an
+empty value unbinds the command:
+
+```
+editor_keybind.toggle_comment = <Control>slash
+editor_keybind.sort_lines =
+```
 
 ### Forwarded apps and remote sessions
 
@@ -905,8 +948,8 @@ palette gains a "New Tab on `<name>`" entry, and `sketerm mux <name>`
 
 | Key | Type | Default | Values |
 | --- | --- | --- | --- |
-| `host` | string | unset | `host` or `user@host`. Empty means the section is ignored. |
-| `transport` | enum | `auto` | `auto` probes roaming UDP and falls back to the SSH pipe; `ssh` and `udp` force one. |
+| `host` | string | unset | `host` or `user@host`. Empty means the section is ignored. A `tor:` prefix (`tor:hidden.onion`) forces the Tor transport and a later `transport` key may not demote it. |
+| `transport` | enum | `auto` | `auto` probes roaming UDP and falls back to the SSH pipe; `ssh` and `udp` force one; `tor` forces SSH through `mux_tor_socks_endpoint` with no direct fallback. |
 
 ```
 [domain.devbox]
@@ -990,6 +1033,7 @@ start on an unknown term, naming it.
 | --- | --- |
 | `SKETERM_FONT` | `font` (absolute path to a .ttf/.otf) |
 | `SKETERM_SCROLLBACK` | `scrollback` |
+| `SKETERM_PREDICT` | `predictive_echo` (`auto`, `always` or `never`), for every remote pane, not just the Default profile |
 
 ## Reload semantics
 
@@ -1015,10 +1059,10 @@ start on an unknown term, naming it.
 
 - **A reload honours an active `--config <path>` override**, re-reading
   the same file the process was started with rather than the XDG path.
-- A reload that cannot read the file leaves the running config alone
-  and warns -- unlike startup, where a missing file means "use
-  defaults". An empty file is likewise refused, since it is nearly
-  always a truncate caught mid-write.
+- A reload that cannot read the file, or finds it over the 64 KiB
+  limit, leaves the running config alone and warns -- unlike startup,
+  where a missing file means "use defaults". An empty file is likewise
+  refused, since it is nearly always a truncate caught mid-write.
 - Auto-reload is suppressed while the Preferences dialog is open, so a
   hand edit cannot be silently undone by the dialog's own copy.
 

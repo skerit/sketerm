@@ -10,6 +10,7 @@
         "src",
         "data",
         "dist/test-test-roots.sh",
+        "docs/config.md",
         "terminfo",
         "vendor/aro_shims",
         "vendor/avdec_shim.c",

@@ -14,11 +14,15 @@ const builtin = @import("builtin");
 const lsp_servers = @import("lsp/servers.zig");
 const filtersub = @import("web/filtersub.zig");
 const atomicwrite = @import("util/atomicwrite.zig");
+const readfile = @import("util/readfile.zig");
+const predict = @import("mux/predict.zig");
 const diag = @import("util/diag.zig");
 const socks5_client = @import("mux/socks5_client.zig");
 const webroute = @import("web/route.zig");
 pub const titlefmt = @import("util/titlefmt.zig");
 
+/// Size cap for config.conf, read and write: `loadFromPath` refuses a
+/// larger file and `save` refuses to produce one, so the two agree.
 pub const MAX_FILE_BYTES: usize = 64 * 1024;
 
 /// Historical tab-label behaviour: the OSC 0/2 title, verbatim.
@@ -214,15 +218,6 @@ fn parseCodepoint(text: []const u8) !u32 {
     return v;
 }
 
-/// CSS-style font weight, 100..900. Anything outside that is a config
-/// error rather than a silent clamp: a weight of 12 is a typo, and
-/// pretending it means 100 hides it.
-fn parseWeight(value: []const u8) !u16 {
-    const v = try parseU32(value);
-    if (v < 100 or v > 900) return error.BadFontWeight;
-    return @intCast(v);
-}
-
 /// What activating a hint does. `open` hands URLs to the desktop and
 /// existing files to the editor; `command` runs `HintRule.command`
 /// with {match} substituted.
@@ -360,10 +355,10 @@ pub const ColorSet = struct {
         return out;
     }
 
-    /// Deep-copy the one heap-backed field into `arena`.
+    /// Deep-copy every heap-backed field into `arena`.
     pub fn cloneInto(self: *const ColorSet, arena: std.mem.Allocator) error{OutOfMemory}!ColorSet {
         var out = self.*;
-        if (self.scheme) |s| out.scheme = try arena.dupe(u8, s);
+        try cloneRows(color_set_keys, &out, arena);
         return out;
     }
 };
@@ -460,6 +455,12 @@ pub const ProfileSettings = struct {
     /// defining mainImage; iChannel0 = the rendered frame). Empty =
     /// off. Compile errors disable the pass, never blank the pane.
     custom_shader: []const u8 = "",
+
+    /// Mosh-style predictive local echo on remote (mux) panes: `auto`
+    /// shows predictions only on a slow, confirmed link, `always`
+    /// draws them unconditionally, `never` turns the overlay off. The
+    /// SKETERM_PREDICT env var still overrides this for every pane.
+    predictive_echo: predict.Mode = .auto,
 
     // Text editor (the editor face rides a pane, so its FONT is a
     // pane-level choice like the terminal font — and its fallback,
@@ -628,20 +629,7 @@ pub const ProfileSettings = struct {
     /// Deep-copy every heap-backed field into `arena`.
     pub fn cloneInto(self: *const ProfileSettings, arena: std.mem.Allocator) error{OutOfMemory}!ProfileSettings {
         var out = self.*;
-        if (self.font_path) |s| out.font_path = try arena.dupe(u8, s);
-        out.font_family = try arena.dupe(u8, self.font_family);
-        out.font_family_bold = try arena.dupe(u8, self.font_family_bold);
-        out.font_family_italic = try arena.dupe(u8, self.font_family_italic);
-        out.font_family_bold_italic = try arena.dupe(u8, self.font_family_bold_italic);
-        out.editor_font_family = try arena.dupe(u8, self.editor_font_family);
-        out.font_features = try arena.dupe(u8, self.font_features);
-        out.scheme = try arena.dupe(u8, self.scheme);
-        out.light = try self.light.cloneInto(arena);
-        out.dark = try self.dark.cloneInto(arena);
-        if (self.shell) |s| out.shell = try arena.dupe(u8, s);
-        out.term_env = try arena.dupe(u8, self.term_env);
-        out.color_term_env = try arena.dupe(u8, self.color_term_env);
-        out.custom_shader = try arena.dupe(u8, self.custom_shader);
+        try cloneRows(profile_keys, &out, arena);
         return out;
     }
 };
@@ -706,6 +694,13 @@ pub const McpProfile = struct {
     /// Whether serializing this record writes anything.
     pub fn isEmpty(self: *const McpProfile) bool {
         return self.tools.len == 0 and self.web_gui == null;
+    }
+
+    pub fn cloneInto(self: *const McpProfile, arena: std.mem.Allocator) error{OutOfMemory}!McpProfile {
+        var out = self.*;
+        out.name = try arena.dupe(u8, self.name);
+        out.tools = try arena.dupe(u8, self.tools);
+        return out;
     }
 };
 
@@ -1419,72 +1414,8 @@ pub const Config = struct {
         var out = self.*;
         out.arena = null;
         out.settings = try self.settings.cloneInto(arena);
-        out.hint_editor = try arena.dupe(u8, self.hint_editor);
-        out.quake_monitor = try arena.dupe(u8, self.quake_monitor);
-        out.hint_alphabet = try arena.dupe(u8, self.hint_alphabet);
-        out.web_store_socket = try arena.dupe(u8, self.web_store_socket);
-        out.filter_lists = .empty;
-        try out.filter_lists.ensureTotalCapacity(arena, self.filter_lists.items.len);
-        for (self.filter_lists.items) |u| out.filter_lists.appendAssumeCapacity(try arena.dupe(u8, u));
-        out.hint_rules = .empty;
-        try out.hint_rules.ensureTotalCapacity(arena, self.hint_rules.items.len);
-        for (self.hint_rules.items) |hr| {
-            out.hint_rules.appendAssumeCapacity(.{
-                .name = try arena.dupe(u8, hr.name),
-                .pattern = try arena.dupe(u8, hr.pattern),
-                .action = hr.action,
-                .command = try arena.dupe(u8, hr.command),
-            });
-        }
-        out.symbol_maps = .empty;
-        try out.symbol_maps.ensureTotalCapacity(arena, self.symbol_maps.items.len);
-        for (self.symbol_maps.items) |sm| {
-            out.symbol_maps.appendAssumeCapacity(.{
-                .name = try arena.dupe(u8, sm.name),
-                .lo = sm.lo,
-                .hi = sm.hi,
-                .family = try arena.dupe(u8, sm.family),
-            });
-        }
-        out.background_image = try arena.dupe(u8, self.background_image);
-        out.web_search_engine = try arena.dupe(u8, self.web_search_engine);
-        out.web_route = try arena.dupe(u8, self.web_route);
-        out.word_chars = try arena.dupe(u8, self.word_chars);
-        out.gtk_theme = try arena.dupe(u8, self.gtk_theme);
-        out.app_keyboard_layout = try arena.dupe(u8, self.app_keyboard_layout);
-        out.gpu_apps = try arena.dupe(u8, self.gpu_apps);
-        out.mux_udp_port_range = try arena.dupe(u8, self.mux_udp_port_range);
-        out.mux_tor_socks_endpoint = try arena.dupe(u8, self.mux_tor_socks_endpoint);
-        out.default_profile = try arena.dupe(u8, self.default_profile);
-        out.editor_theme = try arena.dupe(u8, self.editor_theme);
-        out.editor_project_markers = try arena.dupe(u8, self.editor_project_markers);
-        out.tab_title_template = try arena.dupe(u8, self.tab_title_template);
-        out.window_title_template = try arena.dupe(u8, self.window_title_template);
-        out.keybinds = .empty;
-        try out.keybinds.ensureTotalCapacity(arena, self.keybinds.items.len);
-        for (self.keybinds.items) |kb| {
-            out.keybinds.appendAssumeCapacity(.{
-                .name = try arena.dupe(u8, kb.name),
-                .accel = try arena.dupe(u8, kb.accel),
-            });
-        }
-        out.editor_keybinds = .empty;
-        try out.editor_keybinds.ensureTotalCapacity(arena, self.editor_keybinds.items.len);
-        for (self.editor_keybinds.items) |kb| {
-            out.editor_keybinds.appendAssumeCapacity(.{
-                .name = try arena.dupe(u8, kb.name),
-                .accel = try arena.dupe(u8, kb.accel),
-            });
-        }
-        out.shader_params = .empty;
-        try out.shader_params.ensureTotalCapacity(arena, self.shader_params.items.len);
-        for (self.shader_params.items) |sp| {
-            out.shader_params.appendAssumeCapacity(.{
-                .name = try arena.dupe(u8, sp.name),
-                .value = sp.value,
-                .color = sp.color,
-            });
-        }
+        try cloneRows(app_keys, &out, arena);
+        // The sections, which are not keys of the table.
         out.profiles = .empty;
         try out.profiles.ensureTotalCapacity(arena, self.profiles.items.len);
         for (self.profiles.items) |p| {
@@ -1514,6 +1445,10 @@ pub const Config = struct {
                 .enabled = s.enabled,
             });
         }
+        out.mcp = try self.mcp.cloneInto(arena);
+        out.mcp_profiles = .empty;
+        try out.mcp_profiles.ensureTotalCapacity(arena, self.mcp_profiles.items.len);
+        for (self.mcp_profiles.items) |p| out.mcp_profiles.appendAssumeCapacity(try p.cloneInto(arena));
         out.platform_sections = .empty;
         try out.platform_sections.ensureTotalCapacity(arena, self.platform_sections.items.len);
         for (self.platform_sections.items) |sec| {
@@ -1563,6 +1498,9 @@ pub const Config = struct {
                 error.NotReadable => if (override_path != null) {
                     warnConfig("--config path {s} not readable, using defaults", .{path});
                 },
+                // Already warned by loadFromPath, naming the file.
+                error.TooLarge => {},
+                error.OutOfMemory => warnConfig("out of memory reading {s}, using defaults", .{path}),
             }
         }
         var cfg = Config{};
@@ -1570,30 +1508,29 @@ pub const Config = struct {
         return cfg;
     }
 
+    pub const LoadError = error{ PathTooLong, NotReadable, TooLarge, OutOfMemory };
+
     /// Read and parse one config file, env overrides included.
     ///
     /// Unlike `loadWithOverride` an unreadable file is an ERROR, not
     /// "use defaults": a LIVE reload (the `reload_config` action, the
     /// file watcher) that raced an editor's rename would otherwise
-    /// silently reset every setting the user has.
-    pub fn loadFromPath(allocator: std.mem.Allocator, path: []const u8) !Config {
-        // Zig 0.16's `std.fs` requires an `Io` instance we don't
-        // thread through here. Just use libc — we link it anyway.
-        const c = @import("c.zig").c;
-        // path is caller-owned and not necessarily NUL-terminated;
-        // copy onto a stack buffer with a trailing 0.
-        var path_z: [4096]u8 = undefined;
-        if (path.len >= path_z.len) return error.PathTooLong;
-        @memcpy(path_z[0..path.len], path);
-        path_z[path.len] = 0;
-        const fp = c.fopen(@ptrCast(&path_z), "rb") orelse return error.NotReadable;
-        defer _ = c.fclose(fp);
-        var buf: [MAX_FILE_BYTES + 1]u8 = undefined;
-        const n = c.fread(&buf, 1, buf.len, fp);
-        if (n > MAX_FILE_BYTES) {
-            warnConfig("{s} larger than 64 KiB; trailing settings ignored", .{path});
-        }
-        var cfg = try loadFromBytes(allocator, buf[0..@min(n, MAX_FILE_BYTES)]);
+    /// silently reset every setting the user has. A file over
+    /// `MAX_FILE_BYTES` is refused the same way rather than parsed in
+    /// part: a truncated file changes meaning silently, and `save`
+    /// could never have written one.
+    pub fn loadFromPath(allocator: std.mem.Allocator, path: []const u8) LoadError!Config {
+        const bytes = readfile.cappedAlloc(allocator, path, MAX_FILE_BYTES) catch |err| switch (err) {
+            error.PathTooLong => return error.PathTooLong,
+            error.OpenFailed, error.MkdirFailed => return error.NotReadable,
+            error.StreamTooLong => {
+                warnConfig("{s} is larger than {d} KiB and was not loaded", .{ path, MAX_FILE_BYTES / 1024 });
+                return error.TooLarge;
+            },
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        defer allocator.free(bytes);
+        var cfg = try loadFromBytes(allocator, bytes);
         applyEnvOverrides(&cfg, allocator);
         return cfg;
     }
@@ -1676,403 +1613,24 @@ pub const Config = struct {
         try self.serialise(w);
     }
 
-    /// Same content as save() but directly into a Writer — used by
-    /// tests + the prefs dialog's preview path.
     /// Emit every pane-level key of `s` that differs from `base`.
     /// Top-level (Default) settings diff against the schema defaults;
     /// profile sections diff against the Default settings — so a
     /// profile section only carries what makes it different.
     fn serialiseSettings(s: *const ProfileSettings, base: *const ProfileSettings, w: *std.Io.Writer) !void {
-        // Font.
-        if (!eqOptStr(s.font_path, base.font_path)) {
-            if (s.font_path) |fp| try w.print("font = {s}\n", .{fp});
-        }
-        if (!std.mem.eql(u8, s.font_family, base.font_family))
-            try w.print("font_family = {s}\n", .{s.font_family});
-        if (!std.mem.eql(u8, s.font_family_bold, base.font_family_bold))
-            try w.print("font_family_bold = {s}\n", .{s.font_family_bold});
-        if (!std.mem.eql(u8, s.font_family_italic, base.font_family_italic))
-            try w.print("font_family_italic = {s}\n", .{s.font_family_italic});
-        if (!std.mem.eql(u8, s.font_family_bold_italic, base.font_family_bold_italic))
-            try w.print("font_family_bold_italic = {s}\n", .{s.font_family_bold_italic});
-        if (s.builtin_box_drawing != base.builtin_box_drawing)
-            try w.print("builtin_box_drawing = {s}\n", .{if (s.builtin_box_drawing) "true" else "false"});
-        if (s.font_weight != base.font_weight) try w.print("font_weight = {d}\n", .{s.font_weight});
-        if (s.font_weight_bold != base.font_weight_bold)
-            try w.print("font_weight_bold = {d}\n", .{s.font_weight_bold});
-        if (!std.mem.eql(u8, s.font_features, base.font_features))
-            try w.print("font_features = {s}\n", .{s.font_features});
-        if (s.font_size != base.font_size) try w.print("font_size = {d}\n", .{s.font_size});
-        if (!std.mem.eql(u8, s.editor_font_family, base.editor_font_family))
-            try w.print("editor_font_family = {s}\n", .{s.editor_font_family});
-        if (s.editor_font_size != base.editor_font_size)
-            try w.print("editor_font_size = {d}\n", .{s.editor_font_size});
-        if (s.line_pad_px != base.line_pad_px) try w.print("line_pad_px = {d}\n", .{s.line_pad_px});
-        if (s.padding != base.padding) try w.print("padding = {d:.2}\n", .{s.padding});
-
-        // Pane presentation.
-        if (s.pane_border_width != base.pane_border_width)
-            try w.print("pane_border_width = {d:.2}\n", .{s.pane_border_width});
-        if (!eqColor(s.pane_border_color_active, base.pane_border_color_active))
-            try writeColorA(w, "pane_border_color_active", s.pane_border_color_active);
-        if (!eqColor(s.pane_border_color, base.pane_border_color))
-            try writeColorA(w, "pane_border_color", s.pane_border_color);
-        if (s.pane_corner_radius != base.pane_corner_radius)
-            try w.print("pane_corner_radius = {d:.2}\n", .{s.pane_corner_radius});
-
-        // Colors.
-        if (!eqColor(s.default_fg, base.default_fg)) try writeColor(w, "default_fg", s.default_fg);
-        if (!eqColor(s.default_bg, base.default_bg)) try writeColor(w, "default_bg", s.default_bg);
-        if (!eqColor(s.cursor_color, base.cursor_color)) try writeColor(w, "cursor_color", s.cursor_color);
-        if (s.cursor_color_default != base.cursor_color_default)
-            try w.print("cursor_color_default = {s}\n", .{if (s.cursor_color_default) "true" else "false"});
-        if (!std.mem.eql(u8, s.scheme, base.scheme)) try w.print("scheme = {s}\n", .{s.scheme});
-        const pal_differs = blk: {
-            if (s.palette == null and base.palette == null) break :blk false;
-            if (s.palette == null or base.palette == null) break :blk true;
-            break :blk !std.meta.eql(s.palette.?, base.palette.?);
-        };
-        if (pal_differs) {
-            if (s.palette) |pal| try writePalette16(w, "palette", pal);
-            // null-while-base-set isn't expressible in the format;
-            // the parse-time seed keeps base's palette in that case.
-        }
-        try serialiseColorSet(&s.light, &base.light, "light", w);
-        try serialiseColorSet(&s.dark, &base.dark, "dark", w);
-
-        // Shell + env.
-        if (!eqOptStr(s.shell, base.shell)) {
-            if (s.shell) |sh| try w.print("shell = {s}\n", .{sh});
-        }
-        if (!std.mem.eql(u8, s.term_env, base.term_env))
-            try w.print("term = {s}\n", .{s.term_env});
-        if (!std.mem.eql(u8, s.color_term_env, base.color_term_env))
-            try w.print("color_term = {s}\n", .{s.color_term_env});
-        if (s.login_shell != base.login_shell)
-            try w.print("login_shell = {s}\n", .{if (s.login_shell) "true" else "false"});
-
-        if (s.scrollback != base.scrollback) try w.print("scrollback = {d}\n", .{s.scrollback});
-
-        if (!std.mem.eql(u8, s.custom_shader, base.custom_shader))
-            try w.print("custom_shader = {s}\n", .{s.custom_shader});
+        try writeRows(profile_keys, s, base, w);
     }
 
-    /// Emit the `<prefix>.<key>` lines of a light/dark variant whose
-    /// value differs from `base`'s same-prefix variant. Clearing a
-    /// field back to null is not expressible, same as `palette`.
-    fn serialiseColorSet(set: *const ColorSet, base: *const ColorSet, prefix: []const u8, w: *std.Io.Writer) !void {
-        var key_buf: [64]u8 = undefined;
-        const K = struct {
-            fn f(buf: []u8, pfx: []const u8, name: []const u8) []const u8 {
-                return std.fmt.bufPrint(buf, "{s}.{s}", .{ pfx, name }) catch unreachable;
-            }
-        };
-        if (set.default_fg) |v| {
-            if (!eqOptColor(base.default_fg, v)) try writeColor(w, K.f(&key_buf, prefix, "default_fg"), v);
-        }
-        if (set.default_bg) |v| {
-            if (!eqOptColor(base.default_bg, v)) try writeColor(w, K.f(&key_buf, prefix, "default_bg"), v);
-        }
-        if (set.cursor_color) |v| {
-            if (!eqOptColor(base.cursor_color, v)) try writeColor(w, K.f(&key_buf, prefix, "cursor_color"), v);
-        }
-        if (set.cursor_color_default) |v| {
-            if (base.cursor_color_default == null or base.cursor_color_default.? != v)
-                try w.print("{s} = {s}\n", .{ K.f(&key_buf, prefix, "cursor_color_default"), if (v) "true" else "false" });
-        }
-        if (set.scheme) |v| {
-            if (base.scheme == null or !std.mem.eql(u8, base.scheme.?, v))
-                try w.print("{s} = {s}\n", .{ K.f(&key_buf, prefix, "scheme"), v });
-        }
-        if (set.palette) |v| {
-            if (base.palette == null or !std.meta.eql(base.palette.?, v))
-                try writePalette16(w, K.f(&key_buf, prefix, "palette"), v);
-        }
-    }
-
-    fn eqOptColor(a: ?[4]f32, b: [4]f32) bool {
-        return a != null and eqColor(a.?, b);
-    }
-
-    const eqOptStr = @import("util/strz.zig").eqOpt;
-
+    /// Same content as save() but directly into a Writer — used by
+    /// tests + the prefs dialog's preview path. The flat keys come out
+    /// of the key table in table order; the sections follow by hand.
     pub fn serialise(self: *const Config, w: *std.Io.Writer) !void {
         try w.writeAll("# sketerm config (auto-saved by Preferences dialog)\n");
 
         // Default profile settings, at top level (key compat with
-        // pre-profile configs).
-        const schema_defaults = ProfileSettings{};
-        try serialiseSettings(&self.settings, &schema_defaults, w);
-
-        // Cursor.
-        if (self.cursor_shape != .block) try w.print("cursor_shape = {s}\n", .{@tagName(self.cursor_shape)});
-        if (!self.cursor_blink) try w.writeAll("cursor_blink = false\n");
-        if (self.cursor_blink_ms != 500) try w.print("cursor_blink_ms = {d}\n", .{self.cursor_blink_ms});
-        if (self.cursor_trail) try w.writeAll("cursor_trail = true\n");
-        if (self.cursor_trail_ms != 300) try w.print("cursor_trail_ms = {d}\n", .{self.cursor_trail_ms});
-
-        // Behaviour.
-        if (!self.bracketed_paste) try w.writeAll("bracketed_paste = false\n");
-        if (self.modify_other_keys != 0) try w.print("modify_other_keys = {d}\n", .{self.modify_other_keys});
-
-        // Rendering.
-        if (!self.ligatures) try w.writeAll("ligatures = false\n");
-        if (!self.bidi) try w.writeAll("bidi = false\n");
-        if (!self.auto_theme) try w.writeAll("auto_theme = false\n");
-        if (!self.graphics_offload) try w.writeAll("graphics_offload = false\n");
-        if (self.browser_max_fps != 0) try w.print("browser_max_fps = {d}\n", .{self.browser_max_fps});
-        if (self.web_discard_minutes != 30) try w.print("web_discard_minutes = {d}\n", .{self.web_discard_minutes});
-        if (!self.web_download_ask) try w.print("web_download_ask = false\n", .{});
-        if (self.web_popup_policy != .block_gestureless) try w.print("web_popup_policy = {s}\n", .{
-            switch (self.web_popup_policy) {
-                .block_gestureless => "block-gestureless",
-                .allow => "allow",
-                .block_all => "block-all",
-            },
-        });
-        if (!std.mem.eql(u8, self.web_search_engine, default_web_search_engine))
-            try w.print("web_search_engine = {s}\n", .{self.web_search_engine});
-        if (!std.mem.eql(u8, self.web_route, "direct"))
-            try w.print("web_route = {s}\n", .{self.web_route});
-
-        // Bell.
-        if (!self.shell_integration) try w.writeAll("shell_integration = off\n");
-        if (self.bell_audible) try w.writeAll("bell_audible = true\n");
-        if (!self.bell_visible) try w.writeAll("bell_visible = false\n");
-        if (!self.bell_urgent) try w.writeAll("bell_urgent = false\n");
-        if (self.notify_command_secs != 15) try w.print("notify_command_secs = {d}\n", .{self.notify_command_secs});
-
-        // Behavioural extras.
-        if (self.scroll_on_output) try w.writeAll("scroll_on_output = true\n");
-        if (!self.track_tab_activity) try w.writeAll("track_tab_activity = false\n");
-        if (self.inactive_warn_secs != 60) try w.print("inactive_warn_secs = {d}\n", .{self.inactive_warn_secs});
-        if (self.tab_ack_delay_secs != 1.0) try w.print("tab_ack_delay_secs = {d:.2}\n", .{self.tab_ack_delay_secs});
-        if (self.image_memory_mb != 320) try w.print("image_memory_mb = {d}\n", .{self.image_memory_mb});
-        if (!self.smart_copy) try w.writeAll("smart_copy = false\n");
-        if (!self.config_auto_reload) try w.writeAll("config_auto_reload = false\n");
-        if (!std.mem.eql(u8, self.word_chars, "-_.,/?:@&=+%~"))
-            try w.print("word_chars = {s}\n", .{self.word_chars});
-        if (self.gtk_theme.len > 0) try w.print("gtk_theme = {s}\n", .{self.gtk_theme});
-        if (self.app_keyboard_layout.len > 0)
-            try w.print("app_keyboard_layout = {s}\n", .{self.app_keyboard_layout});
-        if (self.app_view != .window) try w.print("app_view = {s}\n", .{@tagName(self.app_view)});
-        if (self.input_method != .auto)
-            try w.print("input_method = {s}\n", .{@tagName(self.input_method)});
-        if (self.gpu_apps.len > 0) try w.print("gpu_apps = {s}\n", .{self.gpu_apps});
-        if (self.mux_udp_port_range.len > 0)
-            try w.print("mux_udp_port_range = {s}\n", .{self.mux_udp_port_range});
-        if (!std.mem.eql(u8, self.mux_tor_socks_endpoint, socks5_client.DEFAULT_ENDPOINT))
-            try w.print("mux_tor_socks_endpoint = {s}\n", .{self.mux_tor_socks_endpoint});
-
-        // File browser.
-        if (self.files_default_view != .details)
-            try w.print("files_default_view = {s}\n", .{@tagName(self.files_default_view)});
-        if (self.files_show_hidden) try w.writeAll("files_show_hidden = true\n");
-        if (!self.files_confirm_delete) try w.writeAll("files_confirm_delete = false\n");
-        if (self.files_verify_copy) try w.writeAll("files_verify_copy = true\n");
-        if (self.files_remote_video != .auto)
-            try w.print("files_remote_video = {s}\n", .{@tagName(self.files_remote_video)});
-
-        // Text editor.
-        if (self.editor_tab_width != 4) try w.print("editor_tab_width = {d}\n", .{self.editor_tab_width});
-        if (!self.editor_insert_spaces) try w.writeAll("editor_insert_spaces = false\n");
-        if (self.editor_soft_wrap) try w.writeAll("editor_soft_wrap = true\n");
-        if (!self.editor_wrap_words) try w.writeAll("editor_wrap_words = false\n");
-        if (!self.editor_line_numbers) try w.writeAll("editor_line_numbers = false\n");
-        if (!self.editor_highlight_current_line)
-            try w.writeAll("editor_highlight_current_line = false\n");
-        if (!self.editor_syntax) try w.writeAll("editor_syntax = false\n");
-        if (!self.editor_bracket_match) try w.writeAll("editor_bracket_match = false\n");
-        if (!self.editor_folding) try w.writeAll("editor_folding = false\n");
-        if (!self.editor_fold_indent_fallback)
-            try w.writeAll("editor_fold_indent_fallback = false\n");
-        if (!self.editor_crash_recovery) try w.writeAll("editor_crash_recovery = false\n");
-        if (!self.editor_lsp) try w.writeAll("editor_lsp = false\n");
-        if (!self.editor_lsp_diagnostics) try w.writeAll("editor_lsp_diagnostics = false\n");
-        if (self.editor_lsp_debounce_ms != 250)
-            try w.print("editor_lsp_debounce_ms = {d}\n", .{self.editor_lsp_debounce_ms});
-        if (!self.editor_lsp_inlay_hints) try w.writeAll("editor_lsp_inlay_hints = false\n");
-        if (!self.editor_lsp_semantic_tokens) try w.writeAll("editor_lsp_semantic_tokens = false\n");
-        if (!self.editor_lsp_signature_help) try w.writeAll("editor_lsp_signature_help = false\n");
-        if (self.editor_lsp_hover_delay_ms != 500)
-            try w.print("editor_lsp_hover_delay_ms = {d}\n", .{self.editor_lsp_hover_delay_ms});
-        if (!std.mem.eql(u8, self.editor_theme, "dark"))
-            try w.print("editor_theme = {s}\n", .{self.editor_theme});
-        if (self.editor_project_markers.len > 0)
-            try w.print("editor_project_markers = {s}\n", .{self.editor_project_markers});
-        if (!self.editor_git_gutter) try w.writeAll("editor_git_gutter = false\n");
-        if (self.editor_outline) try w.writeAll("editor_outline = true\n");
-        if (self.editor_project_search_max_files != 4000)
-            try w.print("editor_project_search_max_files = {d}\n", .{self.editor_project_search_max_files});
-        if (!self.editor_auto_indent) try w.writeAll("editor_auto_indent = false\n");
-        if (!self.editor_auto_close_pairs) try w.writeAll("editor_auto_close_pairs = false\n");
-        if (!self.editor_smart_backspace) try w.writeAll("editor_smart_backspace = false\n");
-
-        // Window.
-        if (self.tab_position != .top) try w.print("tab_position = {s}\n", .{@tagName(self.tab_position)});
-        if (!self.close_button_on_tab) try w.writeAll("close_button_on_tab = false\n");
-        if (self.always_on_top) try w.writeAll("always_on_top = true\n");
-        if (self.new_tab_after_current) try w.writeAll("new_tab_after_current = true\n");
-        if (self.confirm_close != .multiple)
-            try w.print("confirm_close = {s}\n", .{@tagName(self.confirm_close)});
-
-        // Mouse.
-        if (!self.mouse_autohide) try w.writeAll("mouse_autohide = false\n");
-        if (self.copy_on_selection) try w.writeAll("copy_on_selection = true\n");
-        if (self.clear_select_on_copy) try w.writeAll("clear_select_on_copy = true\n");
-        if (self.disable_mouse_paste) try w.writeAll("disable_mouse_paste = true\n");
-        if (self.clipboard_read) try w.writeAll("clipboard_read = allow\n");
-        if (self.hint_editor.len > 0) try w.print("hint_editor = {s}\n", .{self.hint_editor});
-        if (self.hint_alphabet.len > 0) try w.print("hint_alphabet = {s}\n", .{self.hint_alphabet});
-        if (self.hint_multiple) try w.writeAll("hint_multiple = true\n");
-        for (self.symbol_maps.items) |sm| {
-            // A map with no family routes nothing (the atlas skips it)
-            // and would serialise as a trailing-space line the parser
-            // then rejects on the next load. Skipping it keeps the file
-            // reloadable; the Preferences dialog flags such an entry.
-            if (sm.family.len == 0) continue;
-            if (sm.lo == sm.hi) {
-                try w.print("symbol_map.{s} = U+{X} {s}\n", .{ sm.name, sm.lo, sm.family });
-            } else {
-                try w.print("symbol_map.{s} = U+{X}-U+{X} {s}\n", .{ sm.name, sm.lo, sm.hi, sm.family });
-            }
-        }
-        for (self.hint_rules.items) |hr| {
-            if (hr.pattern.len > 0) try w.print("hint.{s}.regex = {s}\n", .{ hr.name, hr.pattern });
-            try w.print("hint.{s}.action = {s}\n", .{ hr.name, @tagName(hr.action) });
-            if (hr.command.len > 0) try w.print("hint.{s}.command = {s}\n", .{ hr.name, hr.command });
-        }
-        if (self.mouse_middle_click != .paste_primary)
-            try w.print("mouse_middle_click = {s}\n", .{@tagName(self.mouse_middle_click)});
-        if (self.mouse_right_click != .menu)
-            try w.print("mouse_right_click = {s}\n", .{@tagName(self.mouse_right_click)});
-        if (self.disable_mousewheel_zoom) try w.writeAll("disable_mousewheel_zoom = true\n");
-        if (self.link_single_click) try w.writeAll("link_single_click = true\n");
-
-        // Search.
-        if (self.search_case_sensitive) try w.writeAll("search_case_sensitive = true\n");
-
-        // Bold.
-        if (!self.allow_bold) try w.writeAll("allow_bold = false\n");
-        if (!self.bold_is_bright) try w.writeAll("bold_is_bright = false\n");
-
-        // URL detection.
-        if (!self.auto_url_detect) try w.writeAll("auto_url_detect = false\n");
-
-        // Custom keybindings — emit one line per non-default override.
-        for (self.keybinds.items) |kb| {
-            try w.print("keybind.{s} = {s}\n", .{ kb.name, kb.accel });
-        }
-        for (self.editor_keybinds.items) |kb| {
-            try w.print("editor_keybind.{s} = {s}\n", .{ kb.name, kb.accel });
-        }
-
-        // Shader param overrides.
-        for (self.shader_params.items) |sp| {
-            if (sp.color) |col| {
-                try w.print("shader_param.{s} = #{x:0>2}{x:0>2}{x:0>2}\n", .{
-                    sp.name,
-                    @as(u8, @intFromFloat(std.math.clamp(col[0], 0.0, 1.0) * 255.0)),
-                    @as(u8, @intFromFloat(std.math.clamp(col[1], 0.0, 1.0) * 255.0)),
-                    @as(u8, @intFromFloat(std.math.clamp(col[2], 0.0, 1.0) * 255.0)),
-                });
-            } else {
-                try w.print("shader_param.{s} = {d}\n", .{ sp.name, sp.value });
-            }
-        }
-
-        // Background opacity.
-        if (self.background_opacity != 1.0)
-            try w.print("background_opacity = {d:.2}\n", .{self.background_opacity});
-
-        // Overlay scrollbar.
-        if (self.scrollbar != .auto) try w.print("scrollbar = {s}\n", .{@tagName(self.scrollbar)});
-        if (self.scrollbar_width != 4.0)
-            try w.print("scrollbar_width = {d:.2}\n", .{self.scrollbar_width});
-        if (!eqColor(self.scrollbar_trough_color, .{ 0.5, 0.5, 0.5, 0.18 }))
-            try writeColorA(w, "scrollbar_trough_color", self.scrollbar_trough_color);
-        if (!eqColor(self.scrollbar_thumb_color, .{ 0.5, 0.5, 0.5, 0.30 }))
-            try writeColorA(w, "scrollbar_thumb_color", self.scrollbar_thumb_color);
-        if (!eqColor(self.scrollbar_thumb_active_color, .{ 0.40, 0.55, 0.85, 0.70 }))
-            try writeColorA(w, "scrollbar_thumb_active_color", self.scrollbar_thumb_active_color);
-
-        // Split separators.
-        if (self.pane_gap != 4.0) try w.print("pane_gap = {d:.2}\n", .{self.pane_gap});
-        if (!eqColor(self.pane_gap_color, .{ 0x35.0 / 255.0, 0x35.0 / 255.0, 0x35.0 / 255.0, 1.0 }))
-            try writeColorA(w, "pane_gap_color", self.pane_gap_color);
-
-        // Quake mode.
-        if (self.quake_enabled) try w.writeAll("quake_enabled = true\n");
-        if (self.quake_monitor.len > 0)
-            try w.print("quake_monitor = {s}\n", .{self.quake_monitor});
-        if (self.quake_edge != .top) try w.print("quake_edge = {s}\n", .{@tagName(self.quake_edge)});
-        if (self.quake_width_percent != 100.0)
-            try w.print("quake_width_percent = {d:.2}\n", .{self.quake_width_percent});
-        if (self.quake_height_percent != 50.0)
-            try w.print("quake_height_percent = {d:.2}\n", .{self.quake_height_percent});
-
-        // Inactive pane dimming.
-        if (self.inactive_darken != 0.2)
-            try w.print("inactive_darken = {d:.2}\n", .{self.inactive_darken});
-        if (self.inactive_desaturate != 0.0)
-            try w.print("inactive_desaturate = {d:.2}\n", .{self.inactive_desaturate});
-        if (self.minimum_contrast != 1.0)
-            try w.print("minimum_contrast = {d:.2}\n", .{self.minimum_contrast});
-        if (self.text_blending != .native)
-            try w.print("text_blending = {s}\n", .{@tagName(self.text_blending)});
-
-        // Background layer.
-        if (self.background_image.len > 0)
-            try w.print("background_image = {s}\n", .{self.background_image});
-        if (self.background_image_opacity != 0.3)
-            try w.print("background_image_opacity = {d:.2}\n", .{self.background_image_opacity});
-        if (self.custom_shader_animation)
-            try w.print("custom_shader_animation = true\n", .{});
-        if (!eqColor(self.background_gradient_from, .{ 0, 0, 0, 0 }))
-            try writeColor(w, "background_gradient_from", self.background_gradient_from);
-        if (!eqColor(self.background_gradient_to, .{ 0, 0, 0, 0 }))
-            try writeColor(w, "background_gradient_to", self.background_gradient_to);
-        if (self.background_gradient_angle != 90)
-            try w.print("background_gradient_angle = {d:.1}\n", .{self.background_gradient_angle});
-
-        // Per-pane titlebar.
-        if (self.show_titlebar) try w.writeAll("show_titlebar = true\n");
-        if (!std.mem.eql(u8, self.tab_title_template, default_tab_title))
-            try w.print("tab_title_template = {s}\n", .{self.tab_title_template});
-        if (self.window_title_template.len > 0)
-            try w.print("window_title_template = {s}\n", .{self.window_title_template});
-        if (!self.show_tab_bar) try w.writeAll("show_tab_bar = false\n");
-        if (self.show_tab_sidebar) try w.writeAll("show_tab_sidebar = true\n");
-        if (self.tab_sidebar_width != 240)
-            try w.print("tab_sidebar_width = {d}\n", .{self.tab_sidebar_width});
-        if (self.web_store_socket.len > 0)
-            try w.print("web_store_socket = {s}\n", .{self.web_store_socket});
-        for (self.filter_lists.items) |u| try w.print("filter_list = {s}\n", .{u});
-        if (self.filter_update_hours != 24)
-            try w.print("filter_update_hours = {d}\n", .{self.filter_update_hours});
-        if (self.tab_close_parent != .promote) try w.writeAll("tab_close_parent = close-subtree\n");
-        if (self.tab_child_insert != .last) try w.writeAll("tab_child_insert = first\n");
-        const default_taf: [4]f32 = .{ 1.0, 1.0, 1.0, 1.0 };
-        const default_tab: [4]f32 = .{ 200.0/255.0, 0.0/255.0, 3.0/255.0, 1.0 };
-        const default_tif: [4]f32 = .{ 0.0, 0.0, 0.0, 1.0 };
-        const default_tib: [4]f32 = .{ 192.0/255.0, 190.0/255.0, 191.0/255.0, 1.0 };
-        if (!eqColor(self.title_active_fg, default_taf))
-            try writeColor(w, "title_active_fg", self.title_active_fg);
-        if (!eqColor(self.title_active_bg, default_tab))
-            try writeColor(w, "title_active_bg", self.title_active_bg);
-        if (!eqColor(self.title_inactive_fg, default_tif))
-            try writeColor(w, "title_inactive_fg", self.title_inactive_fg);
-        if (!eqColor(self.title_inactive_bg, default_tib))
-            try writeColor(w, "title_inactive_bg", self.title_inactive_bg);
-
-        // Shell exit.
-        if (self.exit_action != .close) try w.print("exit_action = {s}\n", .{@tagName(self.exit_action)});
-
-        // Default profile name, then each [profile.name] section.
-        // Profile keys diff against the Default settings, matching
-        // the parse-time seed — so the round-trip is exact.
-        if (self.default_profile.len > 0)
-            try w.print("default_profile = {s}\n", .{self.default_profile});
+        // pre-profile configs), then the app-level keys.
+        try serialiseSettings(&self.settings, &profile_defaults, w);
+        try writeRows(app_keys, self, &app_defaults, w);
 
         // Platform sections go BEFORE the profile sections, because a
         // profile is seeded from the Default settings as parsed so far
@@ -2441,9 +1999,10 @@ fn parseInto(cfg: *Config, body: []const u8) !void {
         const line = trim(stripComment(raw));
         if (line.len == 0) continue;
 
-        // Section header: [profile.<name>] only for now. Unknown
-        // sections log a warning and behave as no-section pass-through
-        // — that way unknown future sections don't strip user data.
+        // Section header: [platform.<name>], [profile.<name>],
+        // [domain.<name>], [lsp.<name>], [mcp] or [mcp.<name>]. An
+        // unknown section logs a warning and behaves as no-section
+        // pass-through, so a future section does not strip user data.
         if (line.len >= 2 and line[0] == '[' and line[line.len - 1] == ']') {
             const inside = trim(line[1 .. line.len - 1]);
             current_settings = null;
@@ -2777,566 +2336,895 @@ fn expandTilde(arena: std.mem.Allocator, value: []const u8) ![]const u8 {
     return std.fmt.allocPrint(arena, "{s}{s}", .{ home, value[1..] });
 }
 
-/// Apply one (key, value) line to a settings bundle — the shared
-/// pane-level key set used both at top level (Default settings) and
-/// inside [profile.<name>] sections. Returns false when the key is
-/// not a pane-level key (the caller decides whether that's an
-/// app-level key or an unknown one).
-fn applySettingsKv(s: *ProfileSettings, arena: std.mem.Allocator, key: []const u8, value: []const u8) !bool {
-    // `light.<key>` / `dark.<key>` are prefix-keyed families like
-    // `keybind.<action>`, and work identically at top level and
-    // inside a [profile.<name>] section.
-    if (std.mem.startsWith(u8, key, "light."))
-        return applyColorSetKv(&s.light, arena, key["light.".len..], value);
-    if (std.mem.startsWith(u8, key, "dark."))
-        return applyColorSetKv(&s.dark, arena, key["dark.".len..], value);
-    if (std.mem.eql(u8, key, "shell")) {
-        s.shell = try expandTilde(arena, value);
-    } else if (std.mem.eql(u8, key, "font") or std.mem.eql(u8, key, "font_path")) {
-        s.font_path = try expandTilde(arena, value);
-    } else if (std.mem.eql(u8, key, "font_family")) {
-        s.font_family = try arena.dupe(u8, value);
-    } else if (std.mem.eql(u8, key, "font_family_bold")) {
-        s.font_family_bold = try arena.dupe(u8, value);
-    } else if (std.mem.eql(u8, key, "font_family_italic")) {
-        s.font_family_italic = try arena.dupe(u8, value);
-    } else if (std.mem.eql(u8, key, "font_family_bold_italic")) {
-        s.font_family_bold_italic = try arena.dupe(u8, value);
-    } else if (std.mem.eql(u8, key, "font_weight")) {
-        s.font_weight = try parseWeight(value);
-    } else if (std.mem.eql(u8, key, "font_weight_bold")) {
-        s.font_weight_bold = try parseWeight(value);
-    } else if (std.mem.eql(u8, key, "builtin_box_drawing")) {
-        s.builtin_box_drawing = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "font_features")) {
-        s.font_features = try arena.dupe(u8, value);
-    } else if (std.mem.eql(u8, key, "font_size")) {
-        s.font_size = try parseU16(value);
-    } else if (std.mem.eql(u8, key, "editor_font_family")) {
-        s.editor_font_family = try arena.dupe(u8, value);
-    } else if (std.mem.eql(u8, key, "editor_font_size")) {
-        s.editor_font_size = try parseU16(value);
-    } else if (std.mem.eql(u8, key, "line_pad_px") or std.mem.eql(u8, key, "line_spacing")) {
-        s.line_pad_px = try parseI16(value);
-    } else if (std.mem.eql(u8, key, "padding")) {
-        s.padding = try parseFloat(value);
-    } else if (std.mem.eql(u8, key, "pane_border_width")) {
-        s.pane_border_width = std.math.clamp(try parseFloat(value), 0.0, 32.0);
-    } else if (std.mem.eql(u8, key, "pane_border_color_active")) {
-        s.pane_border_color_active = try parseColor(value);
-    } else if (std.mem.eql(u8, key, "pane_border_color")) {
-        s.pane_border_color = try parseColor(value);
-    } else if (std.mem.eql(u8, key, "pane_corner_radius")) {
-        s.pane_corner_radius = std.math.clamp(try parseFloat(value), 0.0, 64.0);
-    } else if (std.mem.eql(u8, key, "default_fg")) {
-        s.default_fg = try parseColor(value);
-    } else if (std.mem.eql(u8, key, "default_bg")) {
-        s.default_bg = try parseColor(value);
-    } else if (std.mem.eql(u8, key, "cursor_color")) {
-        s.cursor_color = try parseColor(value);
-    } else if (std.mem.eql(u8, key, "cursor_color_default")) {
-        s.cursor_color_default = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "scheme")) {
-        s.scheme = try arena.dupe(u8, value);
-    } else if (std.mem.eql(u8, key, "palette")) {
-        s.palette = try parsePalette16(value);
-    } else if (std.mem.eql(u8, key, "term") or std.mem.eql(u8, key, "term_env")) {
-        s.term_env = try arena.dupe(u8, value);
-    } else if (std.mem.eql(u8, key, "color_term") or std.mem.eql(u8, key, "color_term_env")) {
-        s.color_term_env = try arena.dupe(u8, value);
-    } else if (std.mem.eql(u8, key, "scrollback")) {
-        s.scrollback = try parseU32(value);
-    } else if (std.mem.eql(u8, key, "login_shell")) {
-        s.login_shell = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "custom_shader")) {
-        s.custom_shader = try expandTilde(arena, value);
-    } else {
-        return false;
+// ── The key table ────────────────────────────────────────────────
+//
+// Every flat `key = value` the file accepts is ONE row here: its name,
+// the field it writes, its scope and its codec. The parser, the
+// serialiser, `cloneInto` and the round-trip tests all walk this table
+// at comptime, so a key in it cannot be parsed but not written, written
+// but not cloned, or shipped untested, and a `Config`/`ProfileSettings`
+// field with no row fails the build (the comptime block after the
+// table). Row order is FILE order: the serialiser writes rows top to
+// bottom, and that order is what older builds already read back, so
+// append rather than reorder.
+//
+// Adding a key is a field on the struct, one row here and a row in
+// docs/config.md. An alias is `.{ .name = "old", .scope = <same>,
+// .codec = .{ .alias = "new" } }`; a retired key is
+// `.{ .name = "old", .codec = .retired }`. Prefix families
+// (`keybind.`, `light.`, ...) are rows too, with a handler each in
+// `applyFamily`, `writeRow` and `cloneRow`.
+
+pub const Scope = enum { app, profile };
+
+/// A key's value grammar: how the text is parsed, which field types it
+/// fits and how a value is written back.
+pub const Codec = union(enum) {
+    bool,
+    /// A bool that also accepts a word pair (`allow`/`deny`); the word,
+    /// never `true`/`false`, is what the serialiser writes.
+    bool_words: Words,
+    int: Int,
+    float: Float,
+    /// `#rrggbb`; the alpha channel is dropped on write.
+    color,
+    /// `#rrggbbaa`.
+    color_a,
+    palette16,
+    /// Tag names, with `-` and `_` interchangeable on read.
+    enum_: Enum,
+    string,
+    /// String with a leading `~` expanded to `$HOME`.
+    path,
+    /// String stored only when `check` accepts it.
+    validated: Validated,
+    /// A title template: a bad one WARNS and falls back to the default
+    /// instead of failing the line, because the placeholder set is
+    /// closed and a typo must not blank every title.
+    template,
+    /// Repeated key: every line appends one checked entry to a list.
+    string_list: Validated,
+    /// Another spelling of the named row.
+    alias: []const u8,
+    /// Accepted and ignored, so an old file loads without a warning.
+    retired,
+    // Prefix families: the row's name is the prefix (`keybind.`) and
+    // the field is the list the family fills.
+    keybinds,
+    hint_rules,
+    symbol_maps,
+    shader_params,
+    color_set,
+
+    pub const Words = struct { yes: []const u8, no: []const u8 };
+
+    pub const Int = struct {
+        min: ?i64 = null,
+        max: ?i64 = null,
+        /// Zero passes the range check: an "off" value below `min`.
+        zero_ok: bool = false,
+
+        fn allows(self: Int, n: i64) bool {
+            if (self.zero_ok and n == 0) return true;
+            if (self.min) |m| if (n < m) return false;
+            if (self.max) |m| if (n > m) return false;
+            return true;
+        }
+    };
+
+    pub const Float = struct {
+        /// Present bounds CLAMP rather than reject.
+        min: ?f32 = null,
+        max: ?f32 = null,
+        /// Decimals written back.
+        precision: u8 = 2,
+    };
+
+    pub const Enum = struct {
+        /// What the serialiser writes: the tag, or the tag with `_` as `-`.
+        spelling: enum { tag, hyphen } = .tag,
+    };
+
+    pub const Validated = struct {
+        check: *const fn ([]const u8) anyerror!void,
+        /// A value `check` accepts, for the round-trip test.
+        sample: []const u8,
+    };
+
+    pub fn isFamily(self: Codec) bool {
+        return switch (self) {
+            .keybinds, .hint_rules, .symbol_maps, .shader_params, .color_set => true,
+            else => false,
+        };
+    }
+
+    /// One field holding one value: what the generic parse, write and
+    /// sample paths handle (lists, aliases, retired keys and families
+    /// each have their own).
+    pub fn isScalar(self: Codec) bool {
+        return switch (self) {
+            .string_list, .alias, .retired => false,
+            else => !self.isFamily(),
+        };
+    }
+};
+
+pub const Key = struct {
+    /// The key as written in the file; for a family, its prefix.
+    name: []const u8,
+    /// The field written; defaults to `name`. Unused by alias/retired rows.
+    field: ?[]const u8 = null,
+    scope: Scope = .app,
+    codec: Codec,
+
+    pub fn fieldName(self: Key) []const u8 {
+        return self.field orelse self.name;
+    }
+};
+
+fn checkWebSearchEngine(v: []const u8) anyerror!void {
+    // An engine that cannot take a query, or is not a web URL at all,
+    // would turn every search into a broken navigation.
+    if (std.mem.indexOf(u8, v, "{q}") == null or
+        !(std.mem.startsWith(u8, v, "https://") or std.mem.startsWith(u8, v, "http://")))
+        return error.BadWebSearchEngine;
+}
+
+/// Validated by SHAPE only: the Tor endpoint may itself be a later line.
+fn checkWebRoute(v: []const u8) anyerror!void {
+    if (!webroute.Spec.validText(v)) return error.BadWebRoute;
+}
+
+/// `lo:hi`, checked here so a typo warns at load, not mid-ssh.
+fn checkUdpPortRange(v: []const u8) anyerror!void {
+    const colon = std.mem.indexOfScalar(u8, v, ':') orelse return error.BadPortRange;
+    const lo = try std.fmt.parseInt(u16, v[0..colon], 10);
+    const hi = try std.fmt.parseInt(u16, v[colon + 1 ..], 10);
+    if (lo == 0 or hi < lo) return error.BadPortRange;
+}
+
+fn checkTorSocksEndpoint(v: []const u8) anyerror!void {
+    _ = socks5_client.Endpoint.parse(v) catch return error.BadTorSocksEndpoint;
+}
+
+fn checkFilterListUrl(v: []const u8) anyerror!void {
+    if (!filtersub.validUrl(v)) return error.BadFilterListUrl;
+}
+
+pub const keys = [_]Key{
+    // ── Profile-level (ProfileSettings) ──────────────────────────
+    // Font.
+    .{ .name = "font", .field = "font_path", .scope = .profile, .codec = .path },
+    .{ .name = "font_path", .scope = .profile, .codec = .{ .alias = "font" } },
+    .{ .name = "font_family", .scope = .profile, .codec = .string },
+    .{ .name = "font_family_bold", .scope = .profile, .codec = .string },
+    .{ .name = "font_family_italic", .scope = .profile, .codec = .string },
+    .{ .name = "font_family_bold_italic", .scope = .profile, .codec = .string },
+    .{ .name = "builtin_box_drawing", .scope = .profile, .codec = .bool },
+    // CSS weights; 0 is "the font's own default", so a profile can say
+    // so even when the Default profile pins a weight.
+    .{ .name = "font_weight", .scope = .profile, .codec = .{ .int = .{ .min = 100, .max = 900, .zero_ok = true } } },
+    .{ .name = "font_weight_bold", .scope = .profile, .codec = .{ .int = .{ .min = 100, .max = 900, .zero_ok = true } } },
+    .{ .name = "font_features", .scope = .profile, .codec = .string },
+    .{ .name = "font_size", .scope = .profile, .codec = .{ .int = .{} } },
+    .{ .name = "editor_font_family", .scope = .profile, .codec = .string },
+    .{ .name = "editor_font_size", .scope = .profile, .codec = .{ .int = .{} } },
+    .{ .name = "line_pad_px", .scope = .profile, .codec = .{ .int = .{} } },
+    .{ .name = "line_spacing", .scope = .profile, .codec = .{ .alias = "line_pad_px" } },
+    .{ .name = "padding", .scope = .profile, .codec = .{ .float = .{} } },
+    // Pane presentation.
+    .{ .name = "pane_border_width", .scope = .profile, .codec = .{ .float = .{ .min = 0, .max = 32 } } },
+    .{ .name = "pane_border_color_active", .scope = .profile, .codec = .color_a },
+    .{ .name = "pane_border_color", .scope = .profile, .codec = .color_a },
+    .{ .name = "pane_corner_radius", .scope = .profile, .codec = .{ .float = .{ .min = 0, .max = 64 } } },
+    // Colours. These six are also the `light.`/`dark.` sub-keys (see
+    // `color_set_keys`), in this order.
+    .{ .name = "default_fg", .scope = .profile, .codec = .color },
+    .{ .name = "default_bg", .scope = .profile, .codec = .color },
+    .{ .name = "cursor_color", .scope = .profile, .codec = .color },
+    .{ .name = "cursor_color_default", .scope = .profile, .codec = .bool },
+    .{ .name = "scheme", .scope = .profile, .codec = .string },
+    .{ .name = "palette", .scope = .profile, .codec = .palette16 },
+    .{ .name = "light.", .field = "light", .scope = .profile, .codec = .color_set },
+    .{ .name = "dark.", .field = "dark", .scope = .profile, .codec = .color_set },
+    // Shell + child env.
+    .{ .name = "shell", .scope = .profile, .codec = .path },
+    .{ .name = "term", .field = "term_env", .scope = .profile, .codec = .string },
+    .{ .name = "term_env", .scope = .profile, .codec = .{ .alias = "term" } },
+    .{ .name = "color_term", .field = "color_term_env", .scope = .profile, .codec = .string },
+    .{ .name = "color_term_env", .scope = .profile, .codec = .{ .alias = "color_term" } },
+    .{ .name = "login_shell", .scope = .profile, .codec = .bool },
+    .{ .name = "scrollback", .scope = .profile, .codec = .{ .int = .{} } },
+    .{ .name = "custom_shader", .scope = .profile, .codec = .path },
+    .{ .name = "predictive_echo", .scope = .profile, .codec = .{ .enum_ = .{} } },
+
+    // ── App-level (Config) ───────────────────────────────────────
+    // Cursor.
+    .{ .name = "cursor_shape", .codec = .{ .enum_ = .{} } },
+    .{ .name = "cursor_blink", .codec = .bool },
+    .{ .name = "cursor_blink_ms", .codec = .{ .int = .{} } },
+    .{ .name = "cursor_trail", .codec = .bool },
+    .{ .name = "cursor_trail_ms", .codec = .{ .int = .{ .min = 30, .max = 2000 } } },
+    // Behaviour.
+    .{ .name = "bracketed_paste", .codec = .bool },
+    .{ .name = "modify_other_keys", .codec = .{ .int = .{ .max = 2 } } },
+    // Rendering + browser.
+    .{ .name = "ligatures", .codec = .bool },
+    .{ .name = "bidi", .codec = .bool },
+    .{ .name = "auto_theme", .codec = .bool },
+    .{ .name = "graphics_offload", .codec = .bool },
+    .{ .name = "browser_max_fps", .codec = .{ .int = .{ .min = 5, .max = 1000, .zero_ok = true } } },
+    .{ .name = "web_discard_minutes", .codec = .{ .int = .{} } },
+    .{ .name = "web_download_ask", .codec = .bool },
+    .{ .name = "web_popup_policy", .codec = .{ .enum_ = .{ .spelling = .hyphen } } },
+    .{ .name = "web_search_engine", .codec = .{ .validated = .{ .check = checkWebSearchEngine, .sample = "https://example.test/search?q={q}" } } },
+    .{ .name = "web_route", .codec = .{ .validated = .{ .check = checkWebRoute, .sample = "tor" } } },
+    // Shell integration + bells.
+    .{ .name = "shell_integration", .codec = .{ .bool_words = .{ .yes = "auto", .no = "off" } } },
+    .{ .name = "bell_audible", .codec = .bool },
+    .{ .name = "bell_visible", .codec = .bool },
+    .{ .name = "bell_urgent", .codec = .bool },
+    .{ .name = "notify_command_secs", .codec = .{ .int = .{} } },
+    // Behavioural extras.
+    .{ .name = "scroll_on_output", .codec = .bool },
+    .{ .name = "track_tab_activity", .codec = .bool },
+    .{ .name = "inactive_warn_secs", .codec = .{ .int = .{} } },
+    .{ .name = "tab_ack_delay_secs", .codec = .{ .float = .{ .min = 0, .max = 6 } } },
+    .{ .name = "image_memory_mb", .codec = .{ .int = .{} } },
+    .{ .name = "smart_copy", .codec = .bool },
+    .{ .name = "config_auto_reload", .codec = .bool },
+    .{ .name = "word_chars", .codec = .string },
+    .{ .name = "gtk_theme", .codec = .string },
+    .{ .name = "app_keyboard_layout", .codec = .string },
+    .{ .name = "app_view", .codec = .{ .enum_ = .{} } },
+    .{ .name = "input_method", .codec = .{ .enum_ = .{} } },
+    .{ .name = "gpu_apps", .codec = .string },
+    .{ .name = "mux_udp_port_range", .codec = .{ .validated = .{ .check = checkUdpPortRange, .sample = "60000:61000" } } },
+    .{ .name = "mux_tor_socks_endpoint", .codec = .{ .validated = .{ .check = checkTorSocksEndpoint, .sample = "127.0.0.1:9150" } } },
+    // File browser.
+    .{ .name = "files_default_view", .codec = .{ .enum_ = .{} } },
+    .{ .name = "files_show_hidden", .codec = .bool },
+    .{ .name = "files_confirm_delete", .codec = .bool },
+    .{ .name = "files_verify_copy", .codec = .bool },
+    .{ .name = "files_remote_video", .codec = .{ .enum_ = .{} } },
+    // Text editor.
+    .{ .name = "editor_tab_width", .codec = .{ .int = .{ .min = 1, .max = 16 } } },
+    .{ .name = "editor_insert_spaces", .codec = .bool },
+    .{ .name = "editor_soft_wrap", .codec = .bool },
+    .{ .name = "editor_wrap_words", .codec = .bool },
+    .{ .name = "editor_line_numbers", .codec = .bool },
+    .{ .name = "editor_highlight_current_line", .codec = .bool },
+    .{ .name = "editor_syntax", .codec = .bool },
+    .{ .name = "editor_bracket_match", .codec = .bool },
+    .{ .name = "editor_folding", .codec = .bool },
+    .{ .name = "editor_fold_indent_fallback", .codec = .bool },
+    .{ .name = "editor_crash_recovery", .codec = .bool },
+    .{ .name = "editor_lsp", .codec = .bool },
+    .{ .name = "editor_lsp_diagnostics", .codec = .bool },
+    .{ .name = "editor_lsp_debounce_ms", .codec = .{ .int = .{} } },
+    .{ .name = "editor_lsp_inlay_hints", .codec = .bool },
+    .{ .name = "editor_lsp_semantic_tokens", .codec = .bool },
+    .{ .name = "editor_lsp_signature_help", .codec = .bool },
+    .{ .name = "editor_lsp_hover_delay_ms", .codec = .{ .int = .{} } },
+    .{ .name = "editor_theme", .codec = .string },
+    .{ .name = "editor_project_markers", .codec = .string },
+    .{ .name = "editor_git_gutter", .codec = .bool },
+    .{ .name = "editor_outline", .codec = .bool },
+    .{ .name = "editor_project_search_max_files", .codec = .{ .int = .{} } },
+    .{ .name = "editor_auto_indent", .codec = .bool },
+    .{ .name = "editor_auto_close_pairs", .codec = .bool },
+    .{ .name = "editor_smart_backspace", .codec = .bool },
+    // Window.
+    .{ .name = "tab_position", .codec = .{ .enum_ = .{} } },
+    .{ .name = "close_button_on_tab", .codec = .bool },
+    .{ .name = "always_on_top", .codec = .bool },
+    .{ .name = "new_tab_after_current", .codec = .bool },
+    .{ .name = "confirm_close", .codec = .{ .enum_ = .{} } },
+    // Mouse + hints.
+    .{ .name = "mouse_autohide", .codec = .bool },
+    .{ .name = "copy_on_selection", .codec = .bool },
+    .{ .name = "clear_select_on_copy", .codec = .bool },
+    .{ .name = "disable_mouse_paste", .codec = .bool },
+    .{ .name = "clipboard_read", .codec = .{ .bool_words = .{ .yes = "allow", .no = "deny" } } },
+    .{ .name = "hint_editor", .codec = .string },
+    .{ .name = "hint_alphabet", .codec = .string },
+    .{ .name = "hint_multiple", .codec = .bool },
+    .{ .name = "symbol_map.", .field = "symbol_maps", .codec = .symbol_maps },
+    .{ .name = "hint.", .field = "hint_rules", .codec = .hint_rules },
+    .{ .name = "mouse_middle_click", .codec = .{ .enum_ = .{} } },
+    .{ .name = "mouse_right_click", .codec = .{ .enum_ = .{} } },
+    .{ .name = "disable_mousewheel_zoom", .codec = .bool },
+    .{ .name = "link_single_click", .codec = .bool },
+    // Search, bold, URLs.
+    .{ .name = "search_case_sensitive", .codec = .bool },
+    .{ .name = "allow_bold", .codec = .bool },
+    .{ .name = "bold_is_bright", .codec = .bool },
+    .{ .name = "auto_url_detect", .codec = .bool },
+    // Keybindings + shader params.
+    .{ .name = "keybind.", .field = "keybinds", .codec = .keybinds },
+    .{ .name = "editor_keybind.", .field = "editor_keybinds", .codec = .keybinds },
+    .{ .name = "shader_param.", .field = "shader_params", .codec = .shader_params },
+    // Background opacity, scrollbar, split separators.
+    .{ .name = "background_opacity", .codec = .{ .float = .{ .min = 0, .max = 1 } } },
+    .{ .name = "scrollbar", .codec = .{ .enum_ = .{} } },
+    .{ .name = "scrollbar_width", .codec = .{ .float = .{ .min = 0, .max = 64 } } },
+    .{ .name = "scrollbar_trough_color", .codec = .color_a },
+    .{ .name = "scrollbar_thumb_color", .codec = .color_a },
+    .{ .name = "scrollbar_thumb_active_color", .codec = .color_a },
+    .{ .name = "pane_gap", .codec = .{ .float = .{ .min = 1, .max = 64 } } },
+    .{ .name = "pane_gap_color", .codec = .color_a },
+    // Quake mode.
+    .{ .name = "quake_enabled", .codec = .bool },
+    .{ .name = "quake_monitor", .codec = .string },
+    .{ .name = "quake_edge", .codec = .{ .enum_ = .{} } },
+    .{ .name = "quake_width_percent", .codec = .{ .float = .{ .min = 1, .max = 100 } } },
+    .{ .name = "quake_height_percent", .codec = .{ .float = .{ .min = 1, .max = 100 } } },
+    // Inactive pane dimming, contrast, blending.
+    .{ .name = "inactive_darken", .codec = .{ .float = .{ .min = 0, .max = 1 } } },
+    .{ .name = "inactive_desaturate", .codec = .{ .float = .{ .min = 0, .max = 1 } } },
+    // Retired per-cell dim keys: use inactive_darken instead.
+    .{ .name = "inactive_fg_dim", .codec = .retired },
+    .{ .name = "inactive_bg_dim", .codec = .retired },
+    .{ .name = "minimum_contrast", .codec = .{ .float = .{ .min = 1, .max = 21 } } },
+    .{ .name = "text_blending", .codec = .{ .enum_ = .{} } },
+    // Background layer.
+    .{ .name = "background_image", .codec = .path },
+    .{ .name = "background_image_opacity", .codec = .{ .float = .{ .min = 0, .max = 1 } } },
+    .{ .name = "custom_shader_animation", .codec = .bool },
+    .{ .name = "background_gradient_from", .codec = .color },
+    .{ .name = "background_gradient_to", .codec = .color },
+    .{ .name = "background_gradient_angle", .codec = .{ .float = .{ .precision = 1 } } },
+    // Per-pane titlebar, titles, tab chrome, browser store.
+    .{ .name = "show_titlebar", .codec = .bool },
+    .{ .name = "tab_title_template", .codec = .template },
+    .{ .name = "window_title_template", .codec = .template },
+    .{ .name = "show_tab_bar", .codec = .bool },
+    .{ .name = "show_tab_sidebar", .codec = .bool },
+    .{ .name = "tab_sidebar_width", .codec = .{ .int = .{ .min = 120, .max = 800 } } },
+    .{ .name = "web_store_socket", .codec = .path },
+    .{ .name = "filter_list", .field = "filter_lists", .codec = .{ .string_list = .{ .check = checkFilterListUrl, .sample = "https://example.test/list.txt" } } },
+    .{ .name = "filter_update_hours", .codec = .{ .int = .{} } },
+    .{ .name = "tab_close_parent", .codec = .{ .enum_ = .{ .spelling = .hyphen } } },
+    .{ .name = "tab_child_insert", .codec = .{ .enum_ = .{} } },
+    .{ .name = "title_active_fg", .codec = .color },
+    .{ .name = "title_active_bg", .codec = .color },
+    .{ .name = "title_inactive_fg", .codec = .color },
+    .{ .name = "title_inactive_bg", .codec = .color },
+    // Shell exit, profile selection.
+    .{ .name = "exit_action", .codec = .{ .enum_ = .{} } },
+    .{ .name = "default_profile", .codec = .string },
+};
+
+/// The rows of one scope, in table order.
+fn scopeRows(comptime scope: Scope) []const Key {
+    return comptime blk: {
+        var n: usize = 0;
+        for (keys) |row| {
+            if (row.scope == scope) n += 1;
+        }
+        var out: [n]Key = undefined;
+        var i: usize = 0;
+        for (keys) |row| {
+            if (row.scope == scope) {
+                out[i] = row;
+                i += 1;
+            }
+        }
+        const final = out;
+        break :blk &final;
+    };
+}
+
+/// The `light.<key>` / `dark.<key>` sub-keys: the profile rows whose
+/// field `ColorSet` mirrors, so the variant vocabulary IS the flat one.
+fn colorSetRows() []const Key {
+    return comptime blk: {
+        var n: usize = 0;
+        for (keys) |row| {
+            if (row.scope == .profile and row.codec.isScalar() and @hasField(ColorSet, row.fieldName())) n += 1;
+        }
+        var out: [n]Key = undefined;
+        var i: usize = 0;
+        for (keys) |row| {
+            if (row.scope == .profile and row.codec.isScalar() and @hasField(ColorSet, row.fieldName())) {
+                out[i] = row;
+                i += 1;
+            }
+        }
+        const final = out;
+        break :blk &final;
+    };
+}
+
+const profile_keys = scopeRows(.profile);
+const app_keys = scopeRows(.app);
+const color_set_keys = colorSetRows();
+
+const app_defaults = Config{};
+const profile_defaults = ProfileSettings{};
+
+/// `Config` fields that are sections or bookkeeping rather than keys;
+/// `parseInto`, `serialise` and `cloneInto` handle them by hand.
+const config_non_keys = [_][]const u8{
+    "settings",
+    "arena",
+    "profiles",
+    "domains",
+    "lsp_servers",
+    "mcp",
+    "mcp_profiles",
+    "platform_sections",
+};
+
+fn StructOf(comptime scope: Scope) type {
+    return switch (scope) {
+        .app => Config,
+        .profile => ProfileSettings,
+    };
+}
+
+fn defaultsOf(comptime T: type) *const T {
+    return switch (T) {
+        Config => &app_defaults,
+        ProfileSettings => &profile_defaults,
+        else => @compileError("no config defaults for " ++ @typeName(T)),
+    };
+}
+
+fn rowNamed(comptime name: []const u8) Key {
+    for (keys) |row| {
+        if (std.mem.eql(u8, row.name, name)) return row;
+    }
+    @compileError("config key table: no row named '" ++ name ++ "'");
+}
+
+/// Rows of `rows` that write `field` (aliases and retired keys write none).
+fn rowsClaiming(comptime rows: []const Key, comptime field: []const u8) usize {
+    var n: usize = 0;
+    for (rows) |row| {
+        if (row.codec == .alias or row.codec == .retired) continue;
+        if (std.mem.eql(u8, row.fieldName(), field)) n += 1;
+    }
+    return n;
+}
+
+comptime {
+    @setEvalBranchQuota(400_000);
+    for (keys, 0..) |row, i| {
+        for (keys[0..i]) |prev| {
+            if (std.mem.eql(u8, prev.name, row.name))
+                @compileError("config key table: '" ++ row.name ++ "' is listed twice");
+        }
+        switch (row.codec) {
+            .alias => |canon| {
+                const target = rowNamed(canon);
+                if (target.scope != row.scope)
+                    @compileError("config key table: alias '" ++ row.name ++ "' is not in the scope of '" ++ canon ++ "'");
+                if (!target.codec.isScalar())
+                    @compileError("config key table: alias '" ++ row.name ++ "' must name a scalar row");
+            },
+            .retired => {},
+            else => {
+                if (row.codec.isFamily() and row.name[row.name.len - 1] != '.')
+                    @compileError("config key table: family prefix '" ++ row.name ++ "' must end in '.'");
+                const S = StructOf(row.scope);
+                if (!@hasField(S, row.fieldName()))
+                    @compileError("config key table: '" ++ row.name ++ "' writes " ++ @typeName(S) ++ "." ++ row.fieldName() ++ ", which does not exist");
+            },
+        }
+    }
+    for (std.meta.fields(ProfileSettings)) |f| {
+        if (rowsClaiming(profile_keys, f.name) != 1)
+            @compileError("ProfileSettings." ++ f.name ++ " needs exactly one profile-scope row in config.zig's key table");
+    }
+    for (std.meta.fields(Config)) |f| {
+        var section = false;
+        for (config_non_keys) |n| {
+            if (std.mem.eql(u8, n, f.name)) section = true;
+        }
+        if (section) continue;
+        if (rowsClaiming(app_keys, f.name) != 1)
+            @compileError("Config." ++ f.name ++ " needs exactly one app-scope row in config.zig's key table (or a config_non_keys entry)");
+    }
+    for (std.meta.fields(ColorSet)) |f| {
+        if (rowsClaiming(color_set_keys, f.name) != 1)
+            @compileError("ColorSet." ++ f.name ++ " has no profile row of that name in config.zig's key table");
+    }
+}
+
+// ── Table-driven parse / write / clone ───────────────────────────
+
+/// The tag with `_` written as `-` (`block-gestureless`).
+fn hyphenated(comptime name: []const u8) []const u8 {
+    return comptime blk: {
+        var buf: [name.len]u8 = undefined;
+        for (name, 0..) |ch, i| buf[i] = if (ch == '_') '-' else ch;
+        const final = buf;
+        break :blk &final;
+    };
+}
+
+/// Enum member for `text`, accepting `-` and `_` interchangeably.
+fn parseEnum(comptime E: type, text: []const u8) ?E {
+    inline for (@typeInfo(E).@"enum".fields) |f| {
+        if (std.mem.eql(u8, text, f.name) or std.mem.eql(u8, text, hyphenated(f.name))) return @field(E, f.name);
+    }
+    return null;
+}
+
+/// One value of a scalar codec as field type `T` (an optional parses as
+/// its child).
+fn parseScalar(comptime codec: Codec, comptime T: type, arena: std.mem.Allocator, value: []const u8) !T {
+    const info = @typeInfo(T);
+    if (info == .optional) return try parseScalar(codec, info.optional.child, arena, value);
+    return switch (codec) {
+        .bool => try parseBool(value),
+        .bool_words => |words| if (std.mem.eql(u8, value, words.yes))
+            true
+        else if (std.mem.eql(u8, value, words.no))
+            false
+        else
+            try parseBool(value),
+        .int => |spec| blk: {
+            const n = try std.fmt.parseInt(i64, value, 10);
+            if (!spec.allows(n)) return error.OutOfRange;
+            break :blk std.math.cast(T, n) orelse return error.OutOfRange;
+        },
+        .float => |spec| blk: {
+            var f = try std.fmt.parseFloat(f32, value);
+            if (spec.min) |m| f = @max(f, m);
+            if (spec.max) |m| f = @min(f, m);
+            break :blk f;
+        },
+        .color, .color_a => try parseColor(value),
+        .palette16 => try parsePalette16(value),
+        .enum_ => parseEnum(T, value) orelse return error.BadEnumValue,
+        .string => try arena.dupe(u8, value),
+        .path => try expandTilde(arena, value),
+        .validated => |spec| blk: {
+            try spec.check(value);
+            break :blk try arena.dupe(u8, value);
+        },
+        else => @compileError("codec " ++ @tagName(codec) ++ " is not a scalar"),
+    };
+}
+
+/// Apply `key = value` through `rows`; false when no row claims the key.
+fn applyRows(comptime rows: []const Key, target: anytype, arena: std.mem.Allocator, key: []const u8, value: []const u8) !bool {
+    @setEvalBranchQuota(20_000);
+    inline for (rows) |row| {
+        if (comptime row.codec.isFamily()) {
+            if (std.mem.startsWith(u8, key, row.name))
+                return applyFamily(row, target, arena, key[row.name.len..], value);
+        } else if (std.mem.eql(u8, key, row.name)) {
+            try applyRow(row, target, arena, value);
+            return true;
+        }
+    }
+    return false;
+}
+
+fn applyRow(comptime row: Key, target: anytype, arena: std.mem.Allocator, value: []const u8) !void {
+    const T = @TypeOf(target.*);
+    switch (row.codec) {
+        .retired => {},
+        .alias => |canon| try applyRow(comptime rowNamed(canon), target, arena, value),
+        .template => {
+            const fallback = @field(defaultsOf(T), row.fieldName());
+            @field(target, row.fieldName()) = try parseTitleTemplate(arena, row.name, value, fallback);
+        },
+        .string_list => |spec| {
+            try spec.check(value);
+            try @field(target, row.fieldName()).append(arena, try arena.dupe(u8, value));
+        },
+        else => @field(target, row.fieldName()) = try parseScalar(row.codec, @FieldType(T, row.fieldName()), arena, value),
+    }
+}
+
+/// `rest` is the key with the family prefix stripped. False for a
+/// `light.`/`dark.` sub-key nobody claims, which the caller reports as
+/// unknown.
+fn applyFamily(comptime row: Key, target: anytype, arena: std.mem.Allocator, rest: []const u8, value: []const u8) !bool {
+    const slot = &@field(target, row.fieldName());
+    switch (row.codec) {
+        // `<prefix><action> = <accel>`: dup name+value into the config
+        // arena and append; a later line for the same action replaces
+        // the earlier one. Consumers translate to `[]Binding` at apply.
+        .keybinds => {
+            if (rest.len == 0) return error.BadKeybindName;
+            const accel = try arena.dupe(u8, value);
+            for (slot.items) |*entry| {
+                if (std.mem.eql(u8, entry.name, rest)) {
+                    entry.accel = accel;
+                    return true;
+                }
+            }
+            try slot.append(arena, .{ .name = try arena.dupe(u8, rest), .accel = accel });
+        },
+        // `hint.<name>.<field> = <value>`: the fields of one rule can
+        // appear in any order and on any line; the rule is created by
+        // whichever mentions it first, which is also the order rules
+        // are scanned in.
+        .hint_rules => {
+            const dot = std.mem.lastIndexOfScalar(u8, rest, '.') orelse return error.BadHintRule;
+            const name = rest[0..dot];
+            const field = rest[dot + 1 ..];
+            if (name.len == 0 or field.len == 0) return error.BadHintRule;
+            const rule: *HintRule = blk: {
+                for (slot.items) |*entry| {
+                    if (std.mem.eql(u8, entry.name, name)) break :blk entry;
+                }
+                try slot.append(arena, .{ .name = try arena.dupe(u8, name) });
+                break :blk &slot.items[slot.items.len - 1];
+            };
+            if (std.mem.eql(u8, field, "regex") or std.mem.eql(u8, field, "pattern")) {
+                rule.pattern = try arena.dupe(u8, value);
+            } else if (std.mem.eql(u8, field, "action")) {
+                rule.action = parseEnum(HintAction, value) orelse return error.BadHintAction;
+            } else if (std.mem.eql(u8, field, "command")) {
+                rule.command = try arena.dupe(u8, value);
+            } else {
+                return error.BadHintRule;
+            }
+        },
+        // `symbol_map.<name> = U+E0A0-U+E0A3 <family>`.
+        .symbol_maps => {
+            if (rest.len == 0) return error.BadSymbolMap;
+            var entry = try parseSymbolMap(try arena.dupe(u8, rest), value);
+            entry.family = try arena.dupe(u8, entry.family);
+            for (slot.items) |*existing| {
+                if (std.mem.eql(u8, existing.name, rest)) {
+                    existing.* = entry;
+                    return true;
+                }
+            }
+            try slot.append(arena, entry);
+        },
+        // `shader_param.<name> = <float | #rrggbb>`.
+        .shader_params => {
+            if (rest.len == 0 or rest.len > 31) return error.BadShaderParam;
+            var val: f32 = 0;
+            var col: ?[3]f32 = null;
+            if (value.len > 0 and value[0] == '#') {
+                const rgba = try parseColor(value);
+                col = .{ rgba[0], rgba[1], rgba[2] };
+            } else {
+                val = try std.fmt.parseFloat(f32, value);
+            }
+            for (slot.items) |*entry| {
+                if (std.mem.eql(u8, entry.name, rest)) {
+                    entry.value = val;
+                    entry.color = col;
+                    return true;
+                }
+            }
+            try slot.append(arena, .{ .name = try arena.dupe(u8, rest), .value = val, .color = col });
+        },
+        .color_set => {
+            inline for (color_set_keys) |sub| {
+                if (std.mem.eql(u8, rest, sub.name)) {
+                    @field(slot, sub.fieldName()) = try parseScalar(sub.codec, @FieldType(ColorSet, sub.fieldName()), arena, value);
+                    return true;
+                }
+            }
+            return false;
+        },
+        else => unreachable,
     }
     return true;
 }
 
-/// Apply one `light.`/`dark.`-stripped key to a variant. Returns
-/// false for a sub-key that is not a colour key, which the caller
-/// reports as unknown.
-fn applyColorSetKv(set: *ColorSet, arena: std.mem.Allocator, key: []const u8, value: []const u8) !bool {
-    if (std.mem.eql(u8, key, "default_fg")) {
-        set.default_fg = try parseColor(value);
-    } else if (std.mem.eql(u8, key, "default_bg")) {
-        set.default_bg = try parseColor(value);
-    } else if (std.mem.eql(u8, key, "cursor_color")) {
-        set.cursor_color = try parseColor(value);
-    } else if (std.mem.eql(u8, key, "cursor_color_default")) {
-        set.cursor_color_default = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "scheme")) {
-        set.scheme = try arena.dupe(u8, value);
-    } else if (std.mem.eql(u8, key, "palette")) {
-        set.palette = try parsePalette16(value);
-    } else {
-        return false;
+fn eqValue(a: anytype, b: @TypeOf(a)) bool {
+    return switch (@typeInfo(@TypeOf(a))) {
+        .bool, .int, .float, .@"enum" => a == b,
+        .pointer => std.mem.eql(u8, a, b),
+        .array => std.meta.eql(a, b),
+        else => @compileError("no equality for config value type " ++ @typeName(@TypeOf(a))),
+    };
+}
+
+/// Whether `v` earns a line against `base`. Clearing an optional back
+/// to null is not expressible in the file, so a null never writes.
+fn differs(v: anytype, base: @TypeOf(v)) bool {
+    if (@typeInfo(@TypeOf(v)) == .optional) {
+        const cur = v orelse return false;
+        const b = base orelse return true;
+        return !eqValue(cur, b);
     }
-    return true;
+    return !eqValue(v, base);
+}
+
+fn Present(comptime T: type) type {
+    return if (@typeInfo(T) == .optional) @typeInfo(T).optional.child else T;
+}
+
+/// The value inside an optional the caller has checked, else the value.
+fn present(v: anytype) Present(@TypeOf(v)) {
+    return if (@typeInfo(@TypeOf(v)) == .optional) v.? else v;
+}
+
+fn writeRows(comptime rows: []const Key, cur: anytype, base: @TypeOf(cur), w: *std.Io.Writer) !void {
+    @setEvalBranchQuota(20_000);
+    inline for (rows) |row| try writeRow(row, cur, base, w);
+}
+
+fn writeRow(comptime row: Key, cur: anytype, base: @TypeOf(cur), w: *std.Io.Writer) !void {
+    switch (row.codec) {
+        .alias, .retired => {},
+        .string_list => for (@field(cur, row.fieldName()).items) |item| {
+            try w.print("{s} = {s}\n", .{ row.name, item });
+        },
+        .keybinds => for (@field(cur, row.fieldName()).items) |kb| {
+            try w.print("{s}{s} = {s}\n", .{ row.name, kb.name, kb.accel });
+        },
+        .hint_rules => for (@field(cur, row.fieldName()).items) |hr| {
+            if (hr.pattern.len > 0) try w.print("{s}{s}.regex = {s}\n", .{ row.name, hr.name, hr.pattern });
+            try w.print("{s}{s}.action = {s}\n", .{ row.name, hr.name, @tagName(hr.action) });
+            if (hr.command.len > 0) try w.print("{s}{s}.command = {s}\n", .{ row.name, hr.name, hr.command });
+        },
+        .symbol_maps => for (@field(cur, row.fieldName()).items) |sm| {
+            // A map with no family routes nothing (the atlas skips it)
+            // and would serialise as a trailing-space line the parser
+            // then rejects on the next load. Skipping it keeps the file
+            // reloadable; the Preferences dialog flags such an entry.
+            if (sm.family.len == 0) continue;
+            if (sm.lo == sm.hi) {
+                try w.print("{s}{s} = U+{X} {s}\n", .{ row.name, sm.name, sm.lo, sm.family });
+            } else {
+                try w.print("{s}{s} = U+{X}-U+{X} {s}\n", .{ row.name, sm.name, sm.lo, sm.hi, sm.family });
+            }
+        },
+        .shader_params => for (@field(cur, row.fieldName()).items) |sp| {
+            if (sp.color) |col| {
+                try w.print("{s}{s} = #{x:0>2}{x:0>2}{x:0>2}\n", .{ row.name, sp.name, shaderByte(col[0]), shaderByte(col[1]), shaderByte(col[2]) });
+            } else {
+                try w.print("{s}{s} = {d}\n", .{ row.name, sp.name, sp.value });
+            }
+        },
+        .color_set => try writeColorSet(&@field(cur, row.fieldName()), &@field(base, row.fieldName()), row.name, w),
+        else => {
+            const v = @field(cur, row.fieldName());
+            if (!differs(v, @field(base, row.fieldName()))) return;
+            try writeScalar(row.codec, row.name, present(v), w);
+        },
+    }
+}
+
+/// Shader colour channels truncate rather than round: what every file
+/// written so far carries.
+fn shaderByte(v: f32) u8 {
+    return @intFromFloat(std.math.clamp(v, 0.0, 1.0) * 255.0);
+}
+
+/// Emit the `<prefix><key>` lines of a light/dark variant whose value
+/// differs from `base`'s same-prefix variant.
+fn writeColorSet(set: *const ColorSet, base: *const ColorSet, prefix: []const u8, w: *std.Io.Writer) !void {
+    var key_buf: [64]u8 = undefined;
+    inline for (color_set_keys) |sub| {
+        const v = @field(set, sub.fieldName());
+        if (differs(v, @field(base, sub.fieldName()))) {
+            const key = std.fmt.bufPrint(&key_buf, "{s}{s}", .{ prefix, sub.name }) catch unreachable;
+            try writeScalar(sub.codec, key, present(v), w);
+        }
+    }
+}
+
+/// One `key = value` line in the codec's canonical spelling.
+fn writeScalar(comptime codec: Codec, key: []const u8, v: anytype, w: *std.Io.Writer) !void {
+    switch (codec) {
+        .bool => try w.print("{s} = {s}\n", .{ key, if (v) "true" else "false" }),
+        .bool_words => |words| try w.print("{s} = {s}\n", .{ key, if (v) words.yes else words.no }),
+        .int => try w.print("{s} = {d}\n", .{ key, v }),
+        .float => |spec| try w.print(comptime std.fmt.comptimePrint("{{s}} = {{d:.{d}}}\n", .{spec.precision}), .{ key, v }),
+        .color => try writeColor(w, key, v),
+        .color_a => try writeColorA(w, key, v),
+        .palette16 => try writePalette16(w, key, v),
+        .enum_ => |spec| switch (spec.spelling) {
+            .tag => try w.print("{s} = {s}\n", .{ key, @tagName(v) }),
+            .hyphen => switch (v) {
+                inline else => |t| try w.print("{s} = {s}\n", .{ key, comptime hyphenated(@tagName(t)) }),
+            },
+        },
+        .string, .path, .validated, .template => try w.print("{s} = {s}\n", .{ key, v }),
+        else => @compileError("codec " ++ @tagName(codec) ++ " is not a scalar"),
+    }
+}
+
+/// Re-point every heap-backed value of `rows` on `out` (a struct copy
+/// of the source) at fresh copies in `arena`.
+fn cloneRows(comptime rows: []const Key, out: anytype, arena: std.mem.Allocator) error{OutOfMemory}!void {
+    @setEvalBranchQuota(20_000);
+    inline for (rows) |row| try cloneRow(row, out, arena);
+}
+
+fn cloneRow(comptime row: Key, out: anytype, arena: std.mem.Allocator) error{OutOfMemory}!void {
+    switch (row.codec) {
+        .string, .path, .validated, .template => {
+            const slot = &@field(out, row.fieldName());
+            if (@typeInfo(@TypeOf(slot.*)) == .optional) {
+                if (slot.*) |s| slot.* = try arena.dupe(u8, s);
+            } else {
+                slot.* = try arena.dupe(u8, slot.*);
+            }
+        },
+        .string_list => {
+            const slot = &@field(out, row.fieldName());
+            var fresh: @TypeOf(slot.*) = .empty;
+            try fresh.ensureTotalCapacity(arena, slot.items.len);
+            for (slot.items) |s| fresh.appendAssumeCapacity(try arena.dupe(u8, s));
+            slot.* = fresh;
+        },
+        .keybinds => {
+            const slot = &@field(out, row.fieldName());
+            var fresh: @TypeOf(slot.*) = .empty;
+            try fresh.ensureTotalCapacity(arena, slot.items.len);
+            for (slot.items) |kb| fresh.appendAssumeCapacity(.{
+                .name = try arena.dupe(u8, kb.name),
+                .accel = try arena.dupe(u8, kb.accel),
+            });
+            slot.* = fresh;
+        },
+        .hint_rules => {
+            const slot = &@field(out, row.fieldName());
+            var fresh: @TypeOf(slot.*) = .empty;
+            try fresh.ensureTotalCapacity(arena, slot.items.len);
+            for (slot.items) |hr| fresh.appendAssumeCapacity(.{
+                .name = try arena.dupe(u8, hr.name),
+                .pattern = try arena.dupe(u8, hr.pattern),
+                .action = hr.action,
+                .command = try arena.dupe(u8, hr.command),
+            });
+            slot.* = fresh;
+        },
+        .symbol_maps => {
+            const slot = &@field(out, row.fieldName());
+            var fresh: @TypeOf(slot.*) = .empty;
+            try fresh.ensureTotalCapacity(arena, slot.items.len);
+            for (slot.items) |sm| fresh.appendAssumeCapacity(.{
+                .name = try arena.dupe(u8, sm.name),
+                .lo = sm.lo,
+                .hi = sm.hi,
+                .family = try arena.dupe(u8, sm.family),
+            });
+            slot.* = fresh;
+        },
+        .shader_params => {
+            const slot = &@field(out, row.fieldName());
+            var fresh: @TypeOf(slot.*) = .empty;
+            try fresh.ensureTotalCapacity(arena, slot.items.len);
+            for (slot.items) |sp| fresh.appendAssumeCapacity(.{
+                .name = try arena.dupe(u8, sp.name),
+                .value = sp.value,
+                .color = sp.color,
+            });
+            slot.* = fresh;
+        },
+        .color_set => {
+            const slot = &@field(out, row.fieldName());
+            slot.* = try slot.cloneInto(arena);
+        },
+        // Value types, aliases and retired keys own nothing.
+        else => {},
+    }
+}
+
+/// Apply one (key, value) line to a settings bundle — the shared
+/// pane-level key set used both at top level (Default settings) and
+/// inside [profile.<name>] sections. False when the key is not a
+/// pane-level key (the caller decides whether that's an app-level key
+/// or an unknown one).
+fn applySettingsKv(s: *ProfileSettings, arena: std.mem.Allocator, key: []const u8, value: []const u8) !bool {
+    return applyRows(profile_keys, s, arena, key, value);
 }
 
 fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []const u8) !void {
-    // `keybind.<action> = <accel>` is a prefix-keyed family that's
-    // handled separately from the flat one-key-per-field set below.
-    // We dup name+value into the config arena and append; consumers
-    // (Window) translate to `[]Binding` at apply time.
-    if (std.mem.startsWith(u8, key, "keybind.")) {
-        const name = key["keybind.".len..];
-        if (name.len == 0) return error.BadKeybindName;
-        const name_dup = try arena.dupe(u8, name);
-        const accel_dup = try arena.dupe(u8, value);
-        // Replace existing entry for the same name so a later override
-        // wins over an earlier line.
-        for (cfg.keybinds.items) |*entry| {
-            if (std.mem.eql(u8, entry.name, name)) {
-                entry.accel = accel_dup;
-                return;
-            }
-        }
-        try cfg.keybinds.append(arena, .{ .name = name_dup, .accel = accel_dup });
-        return;
-    }
-    // `editor_keybind.<command> = <accel>` — the editor face's own
-    // binding namespace (never consulted by the terminal).
-    if (std.mem.startsWith(u8, key, "editor_keybind.")) {
-        const name = key["editor_keybind.".len..];
-        if (name.len == 0) return error.BadKeybindName;
-        const name_dup = try arena.dupe(u8, name);
-        const accel_dup = try arena.dupe(u8, value);
-        for (cfg.editor_keybinds.items) |*entry| {
-            if (std.mem.eql(u8, entry.name, name)) {
-                entry.accel = accel_dup;
-                return;
-            }
-        }
-        try cfg.editor_keybinds.append(arena, .{ .name = name_dup, .accel = accel_dup });
-        return;
-    }
-    // `hint.<name>.<field> = <value>` — user-defined hint rules. The
-    // fields of one rule can appear in any order and on any line; the
-    // rule is created by whichever mentions it first, which is also
-    // the order rules are scanned in.
-    if (std.mem.startsWith(u8, key, "hint.")) {
-        const rest = key["hint.".len..];
-        const dot = std.mem.lastIndexOfScalar(u8, rest, '.') orelse return error.BadHintRule;
-        const name = rest[0..dot];
-        const field = rest[dot + 1 ..];
-        if (name.len == 0 or field.len == 0) return error.BadHintRule;
-
-        var rule: *HintRule = blk: {
-            for (cfg.hint_rules.items) |*entry| {
-                if (std.mem.eql(u8, entry.name, name)) break :blk entry;
-            }
-            try cfg.hint_rules.append(arena, .{ .name = try arena.dupe(u8, name) });
-            break :blk &cfg.hint_rules.items[cfg.hint_rules.items.len - 1];
-        };
-        if (std.mem.eql(u8, field, "regex") or std.mem.eql(u8, field, "pattern")) {
-            rule.pattern = try arena.dupe(u8, value);
-        } else if (std.mem.eql(u8, field, "action")) {
-            rule.action = std.meta.stringToEnum(HintAction, value) orelse return error.BadHintAction;
-        } else if (std.mem.eql(u8, field, "command")) {
-            rule.command = try arena.dupe(u8, value);
-        } else {
-            return error.BadHintRule;
-        }
-        return;
-    }
-    // `symbol_map.<name> = U+E0A0-U+E0A3 <family>` — route a
-    // codepoint range to a specific font.
-    if (std.mem.startsWith(u8, key, "symbol_map.")) {
-        const name = key["symbol_map.".len..];
-        if (name.len == 0) return error.BadSymbolMap;
-        const parsed = try parseSymbolMap(try arena.dupe(u8, name), value);
-        var entry = parsed;
-        entry.family = try arena.dupe(u8, parsed.family);
-        for (cfg.symbol_maps.items) |*existing| {
-            if (std.mem.eql(u8, existing.name, name)) {
-                existing.* = entry;
-                return;
-            }
-        }
-        try cfg.symbol_maps.append(arena, entry);
-        return;
-    }
-    // `shader_param.<name> = <float | #rrggbb>` — tunable shader
-    // uniforms (floats and vec3 colors).
-    if (std.mem.startsWith(u8, key, "shader_param.")) {
-        const name = key["shader_param.".len..];
-        if (name.len == 0 or name.len > 31) return error.BadShaderParam;
-        var val: f32 = 0;
-        var col: ?[3]f32 = null;
-        if (value.len > 0 and value[0] == '#') {
-            const rgba = try parseColor(value);
-            col = .{ rgba[0], rgba[1], rgba[2] };
-        } else {
-            val = try parseFloat(value);
-        }
-        for (cfg.shader_params.items) |*entry| {
-            if (std.mem.eql(u8, entry.name, name)) {
-                entry.value = val;
-                entry.color = col;
-                return;
-            }
-        }
-        try cfg.shader_params.append(arena, .{
-            .name = try arena.dupe(u8, name),
-            .value = val,
-            .color = col,
-        });
-        return;
-    }
     // Pane-level keys at top level edit the Default settings.
     if (try applySettingsKv(&cfg.settings, arena, key, value)) return;
-    if (std.mem.eql(u8, key, "cursor_shape")) {
-        if (std.mem.eql(u8, value, "block")) cfg.cursor_shape = .block
-        else if (std.mem.eql(u8, value, "underline")) cfg.cursor_shape = .underline
-        else if (std.mem.eql(u8, value, "bar")) cfg.cursor_shape = .bar
-        else return error.BadCursorShape;
-    } else if (std.mem.eql(u8, key, "cursor_blink")) {
-        cfg.cursor_blink = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "cursor_blink_ms")) {
-        cfg.cursor_blink_ms = try parseU32(value);
-    } else if (std.mem.eql(u8, key, "cursor_trail")) {
-        cfg.cursor_trail = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "cursor_trail_ms")) {
-        const ms = try parseU32(value);
-        if (ms < 30 or ms > 2000) return error.BadCursorTrailMs;
-        cfg.cursor_trail_ms = ms;
-    } else if (std.mem.eql(u8, key, "bracketed_paste")) {
-        cfg.bracketed_paste = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "modify_other_keys")) {
-        const n = try parseU16(value);
-        if (n > 2) return error.BadModifyOtherKeys;
-        cfg.modify_other_keys = @intCast(n);
-    } else if (std.mem.eql(u8, key, "ligatures")) {
-        cfg.ligatures = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "bidi")) {
-        cfg.bidi = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "auto_theme")) {
-        cfg.auto_theme = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "browser_max_fps")) {
-        const n = try parseU32(value);
-        if (n != 0 and (n < 5 or n > 1000)) return error.BadBrowserMaxFps;
-        cfg.browser_max_fps = @intCast(n);
-    } else if (std.mem.eql(u8, key, "web_discard_minutes")) {
-        cfg.web_discard_minutes = try parseU32(value);
-    } else if (std.mem.eql(u8, key, "web_download_ask")) {
-        cfg.web_download_ask = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "web_popup_policy")) {
-        cfg.web_popup_policy = if (std.mem.eql(u8, value, "block-gestureless") or
-            std.mem.eql(u8, value, "block_gestureless"))
-            .block_gestureless
-        else if (std.mem.eql(u8, value, "allow"))
-            .allow
-        else if (std.mem.eql(u8, value, "block-all") or std.mem.eql(u8, value, "block_all"))
-            .block_all
-        else
-            return error.BadWebPopupPolicy;
-    } else if (std.mem.eql(u8, key, "web_search_engine")) {
-        // An engine that cannot take a query, or is not a web URL at
-        // all, would turn every search into a broken navigation.
-        if (std.mem.indexOf(u8, value, "{q}") == null or
-            !(std.mem.startsWith(u8, value, "https://") or
-                std.mem.startsWith(u8, value, "http://")))
-            return error.BadWebSearchEngine;
-        cfg.web_search_engine = try arena.dupe(u8, value);
-    } else if (std.mem.eql(u8, key, "web_route")) {
-        // Validated by SHAPE here (the Tor endpoint may itself be a
-        // later line); an unparseable route is a bad line, never a
-        // silent downgrade to direct.
-        if (!webroute.Spec.validText(value)) return error.BadWebRoute;
-        cfg.web_route = try arena.dupe(u8, value);
-    } else if (std.mem.eql(u8, key, "graphics_offload")) {
-        cfg.graphics_offload = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "shell_integration")) {
-        cfg.shell_integration = if (std.mem.eql(u8, value, "auto"))
-            true
-        else if (std.mem.eql(u8, value, "off"))
-            false
-        else
-            try parseBool(value);
-    } else if (std.mem.eql(u8, key, "bell_audible")) {
-        cfg.bell_audible = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "bell_visible")) {
-        cfg.bell_visible = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "bell_urgent")) {
-        cfg.bell_urgent = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "notify_command_secs")) {
-        cfg.notify_command_secs = try parseU32(value);
-    } else if (std.mem.eql(u8, key, "scroll_on_output")) {
-        cfg.scroll_on_output = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "track_tab_activity")) {
-        cfg.track_tab_activity = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "inactive_warn_secs")) {
-        cfg.inactive_warn_secs = try parseU32(value);
-    } else if (std.mem.eql(u8, key, "tab_ack_delay_secs")) {
-        cfg.tab_ack_delay_secs = std.math.clamp(try parseFloat(value), 0.0, 6.0);
-    } else if (std.mem.eql(u8, key, "image_memory_mb")) {
-        cfg.image_memory_mb = try parseU32(value);
-    } else if (std.mem.eql(u8, key, "smart_copy")) {
-        cfg.smart_copy = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "config_auto_reload")) {
-        cfg.config_auto_reload = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "close_button_on_tab")) {
-        cfg.close_button_on_tab = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "word_chars")) {
-        cfg.word_chars = try arena.dupe(u8, value);
-    } else if (std.mem.eql(u8, key, "gtk_theme")) {
-        cfg.gtk_theme = try arena.dupe(u8, value);
-    } else if (std.mem.eql(u8, key, "app_keyboard_layout")) {
-        cfg.app_keyboard_layout = try arena.dupe(u8, value);
-    } else if (std.mem.eql(u8, key, "app_view")) {
-        if (std.mem.eql(u8, value, "window")) cfg.app_view = .window
-        else if (std.mem.eql(u8, value, "tab")) cfg.app_view = .tab
-        else return error.BadAppView;
-    } else if (std.mem.eql(u8, key, "input_method")) {
-        if (std.mem.eql(u8, value, "auto")) cfg.input_method = .auto
-        else if (std.mem.eql(u8, value, "simple")) cfg.input_method = .simple
-        else if (std.mem.eql(u8, value, "multi")) cfg.input_method = .multi
-        else return error.BadInputMethod;
-    } else if (std.mem.eql(u8, key, "gpu_apps")) {
-        cfg.gpu_apps = try arena.dupe(u8, value);
-    } else if (std.mem.eql(u8, key, "mux_udp_port_range")) {
-        // Validate lo:hi here so a typo warns at load, not mid-ssh.
-        const colon = std.mem.indexOfScalar(u8, value, ':') orelse return error.BadPortRange;
-        const lo = try std.fmt.parseInt(u16, value[0..colon], 10);
-        const hi = try std.fmt.parseInt(u16, value[colon + 1 ..], 10);
-        if (lo == 0 or hi < lo) return error.BadPortRange;
-        cfg.mux_udp_port_range = try arena.dupe(u8, value);
-    } else if (std.mem.eql(u8, key, "mux_tor_socks_endpoint")) {
-        _ = socks5_client.Endpoint.parse(value) catch return error.BadTorSocksEndpoint;
-        cfg.mux_tor_socks_endpoint = try arena.dupe(u8, value);
-    } else if (std.mem.eql(u8, key, "exit_action")) {
-        if (std.mem.eql(u8, value, "close")) cfg.exit_action = .close
-        else if (std.mem.eql(u8, value, "restart")) cfg.exit_action = .restart
-        else if (std.mem.eql(u8, value, "hold")) cfg.exit_action = .hold
-        else return error.BadExitAction;
-    } else if (std.mem.eql(u8, key, "tab_position")) {
-        if (std.mem.eql(u8, value, "top")) cfg.tab_position = .top
-        else if (std.mem.eql(u8, value, "bottom")) cfg.tab_position = .bottom
-        else return error.BadTabPosition;
-    } else if (std.mem.eql(u8, key, "always_on_top")) {
-        cfg.always_on_top = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "new_tab_after_current")) {
-        cfg.new_tab_after_current = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "confirm_close")) {
-        if (std.mem.eql(u8, value, "never")) cfg.confirm_close = .never
-        else if (std.mem.eql(u8, value, "multiple")) cfg.confirm_close = .multiple
-        else if (std.mem.eql(u8, value, "always")) cfg.confirm_close = .always
-        else return error.BadConfirmClose;
-    } else if (std.mem.eql(u8, key, "files_default_view")) {
-        cfg.files_default_view = std.meta.stringToEnum(FilesView, value) orelse return error.BadFilesView;
-    } else if (std.mem.eql(u8, key, "files_show_hidden")) {
-        cfg.files_show_hidden = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "files_confirm_delete")) {
-        cfg.files_confirm_delete = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "files_verify_copy")) {
-        cfg.files_verify_copy = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "files_remote_video")) {
-        cfg.files_remote_video = std.meta.stringToEnum(RemoteVideo, value) orelse return error.BadRemoteVideo;
-    } else if (std.mem.eql(u8, key, "editor_tab_width")) {
-        const w = try parseU16(value);
-        if (w == 0 or w > 16) return error.BadEditorTabWidth;
-        cfg.editor_tab_width = w;
-    } else if (std.mem.eql(u8, key, "editor_insert_spaces")) {
-        cfg.editor_insert_spaces = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "editor_soft_wrap")) {
-        cfg.editor_soft_wrap = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "editor_wrap_words")) {
-        cfg.editor_wrap_words = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "editor_line_numbers")) {
-        cfg.editor_line_numbers = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "editor_highlight_current_line")) {
-        cfg.editor_highlight_current_line = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "editor_syntax")) {
-        cfg.editor_syntax = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "editor_bracket_match")) {
-        cfg.editor_bracket_match = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "editor_folding")) {
-        cfg.editor_folding = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "editor_crash_recovery")) {
-        cfg.editor_crash_recovery = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "editor_fold_indent_fallback")) {
-        cfg.editor_fold_indent_fallback = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "editor_lsp")) {
-        cfg.editor_lsp = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "editor_lsp_diagnostics")) {
-        cfg.editor_lsp_diagnostics = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "editor_lsp_debounce_ms")) {
-        cfg.editor_lsp_debounce_ms = try parseU16(value);
-    } else if (std.mem.eql(u8, key, "editor_lsp_inlay_hints")) {
-        cfg.editor_lsp_inlay_hints = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "editor_lsp_semantic_tokens")) {
-        cfg.editor_lsp_semantic_tokens = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "editor_lsp_signature_help")) {
-        cfg.editor_lsp_signature_help = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "editor_lsp_hover_delay_ms")) {
-        cfg.editor_lsp_hover_delay_ms = try parseU16(value);
-    } else if (std.mem.eql(u8, key, "editor_theme")) {
-        cfg.editor_theme = try arena.dupe(u8, value);
-    } else if (std.mem.eql(u8, key, "editor_project_markers")) {
-        cfg.editor_project_markers = try arena.dupe(u8, value);
-    } else if (std.mem.eql(u8, key, "editor_git_gutter")) {
-        cfg.editor_git_gutter = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "editor_outline")) {
-        cfg.editor_outline = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "editor_project_search_max_files")) {
-        cfg.editor_project_search_max_files = try parseU32(value);
-    } else if (std.mem.eql(u8, key, "editor_auto_indent")) {
-        cfg.editor_auto_indent = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "editor_auto_close_pairs")) {
-        cfg.editor_auto_close_pairs = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "editor_smart_backspace")) {
-        cfg.editor_smart_backspace = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "mouse_autohide")) {
-        cfg.mouse_autohide = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "copy_on_selection")) {
-        cfg.copy_on_selection = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "clear_select_on_copy")) {
-        cfg.clear_select_on_copy = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "disable_mouse_paste")) {
-        cfg.disable_mouse_paste = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "mouse_middle_click")) {
-        cfg.mouse_middle_click = std.meta.stringToEnum(MouseAction, value) orelse return error.BadMouseAction;
-    } else if (std.mem.eql(u8, key, "mouse_right_click")) {
-        cfg.mouse_right_click = std.meta.stringToEnum(MouseAction, value) orelse return error.BadMouseAction;
-    } else if (std.mem.eql(u8, key, "hint_editor")) {
-        cfg.hint_editor = try arena.dupe(u8, value);
-    } else if (std.mem.eql(u8, key, "hint_alphabet")) {
-        cfg.hint_alphabet = try arena.dupe(u8, value);
-    } else if (std.mem.eql(u8, key, "hint_multiple")) {
-        cfg.hint_multiple = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "clipboard_read")) {
-        if (std.mem.eql(u8, value, "allow")) {
-            cfg.clipboard_read = true;
-        } else if (std.mem.eql(u8, value, "deny")) {
-            cfg.clipboard_read = false;
-        } else {
-            cfg.clipboard_read = try parseBool(value);
-        }
-    } else if (std.mem.eql(u8, key, "disable_mousewheel_zoom")) {
-        cfg.disable_mousewheel_zoom = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "link_single_click")) {
-        cfg.link_single_click = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "search_case_sensitive")) {
-        cfg.search_case_sensitive = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "allow_bold")) {
-        cfg.allow_bold = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "bold_is_bright")) {
-        cfg.bold_is_bright = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "auto_url_detect")) {
-        cfg.auto_url_detect = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "default_profile")) {
-        cfg.default_profile = try arena.dupe(u8, value);
-    } else if (std.mem.eql(u8, key, "background_opacity")) {
-        cfg.background_opacity = std.math.clamp(try parseFloat(value), 0.0, 1.0);
-    } else if (std.mem.eql(u8, key, "minimum_contrast")) {
-        cfg.minimum_contrast = std.math.clamp(try parseFloat(value), 1.0, 21.0);
-    } else if (std.mem.eql(u8, key, "text_blending")) {
-        // Ghostty spells the third value `linear-corrected`; accept
-        // both so a config copied from its docs just works.
-        if (std.mem.eql(u8, value, "native")) cfg.text_blending = .native
-        else if (std.mem.eql(u8, value, "linear")) cfg.text_blending = .linear
-        else if (std.mem.eql(u8, value, "linear_corrected") or
-            std.mem.eql(u8, value, "linear-corrected")) cfg.text_blending = .linear_corrected
-        else return error.BadTextBlending;
-    } else if (std.mem.eql(u8, key, "tab_title_template")) {
-        cfg.tab_title_template = try parseTitleTemplate(arena, key, value, default_tab_title);
-    } else if (std.mem.eql(u8, key, "window_title_template")) {
-        cfg.window_title_template = try parseTitleTemplate(arena, key, value, "");
-    } else if (std.mem.eql(u8, key, "background_image")) {
-        cfg.background_image = try arena.dupe(u8, value);
-    } else if (std.mem.eql(u8, key, "background_image_opacity")) {
-        cfg.background_image_opacity = std.math.clamp(try parseFloat(value), 0.0, 1.0);
-    } else if (std.mem.eql(u8, key, "custom_shader_animation")) {
-        cfg.custom_shader_animation = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "background_gradient_from")) {
-        cfg.background_gradient_from = try parseColor(value);
-    } else if (std.mem.eql(u8, key, "background_gradient_to")) {
-        cfg.background_gradient_to = try parseColor(value);
-    } else if (std.mem.eql(u8, key, "background_gradient_angle")) {
-        cfg.background_gradient_angle = try parseFloat(value);
-    } else if (std.mem.eql(u8, key, "scrollbar")) {
-        cfg.scrollbar = std.meta.stringToEnum(ScrollbarMode, value) orelse return error.BadScrollbarMode;
-    } else if (std.mem.eql(u8, key, "scrollbar_width")) {
-        cfg.scrollbar_width = std.math.clamp(try parseFloat(value), 0.0, 64.0);
-    } else if (std.mem.eql(u8, key, "scrollbar_trough_color")) {
-        cfg.scrollbar_trough_color = try parseColor(value);
-    } else if (std.mem.eql(u8, key, "scrollbar_thumb_color")) {
-        cfg.scrollbar_thumb_color = try parseColor(value);
-    } else if (std.mem.eql(u8, key, "scrollbar_thumb_active_color")) {
-        cfg.scrollbar_thumb_active_color = try parseColor(value);
-    } else if (std.mem.eql(u8, key, "pane_gap")) {
-        cfg.pane_gap = std.math.clamp(try parseFloat(value), 1.0, 64.0);
-    } else if (std.mem.eql(u8, key, "pane_gap_color")) {
-        cfg.pane_gap_color = try parseColor(value);
-    } else if (std.mem.eql(u8, key, "quake_enabled")) {
-        cfg.quake_enabled = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "quake_monitor")) {
-        cfg.quake_monitor = try arena.dupe(u8, value);
-    } else if (std.mem.eql(u8, key, "quake_edge")) {
-        cfg.quake_edge = std.meta.stringToEnum(QuakeEdge, value) orelse return error.BadQuakeEdge;
-    } else if (std.mem.eql(u8, key, "quake_width_percent")) {
-        cfg.quake_width_percent = std.math.clamp(try parseFloat(value), 1.0, 100.0);
-    } else if (std.mem.eql(u8, key, "quake_height_percent")) {
-        cfg.quake_height_percent = std.math.clamp(try parseFloat(value), 1.0, 100.0);
-    } else if (std.mem.eql(u8, key, "inactive_darken")) {
-        cfg.inactive_darken = std.math.clamp(try parseFloat(value), 0.0, 1.0);
-    } else if (std.mem.eql(u8, key, "inactive_desaturate")) {
-        cfg.inactive_desaturate = std.math.clamp(try parseFloat(value), 0.0, 1.0);
-    } else if (std.mem.eql(u8, key, "inactive_fg_dim") or std.mem.eql(u8, key, "inactive_bg_dim")) {
-        // Retired per-cell dim keys — accepted (and ignored) so old
-        // config files don't error. Use inactive_darken instead.
-        _ = parseFloat(value) catch {};
-    } else if (std.mem.eql(u8, key, "show_titlebar")) {
-        cfg.show_titlebar = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "show_tab_bar")) {
-        cfg.show_tab_bar = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "show_tab_sidebar")) {
-        cfg.show_tab_sidebar = try parseBool(value);
-    } else if (std.mem.eql(u8, key, "web_store_socket")) {
-        cfg.web_store_socket = try arena.dupe(u8, value);
-    } else if (std.mem.eql(u8, key, "filter_list")) {
-        // Repeated key: every line adds one subscription, in file order.
-        if (!filtersub.validUrl(value)) return error.BadFilterListUrl;
-        try cfg.filter_lists.append(arena, try arena.dupe(u8, value));
-    } else if (std.mem.eql(u8, key, "filter_update_hours")) {
-        cfg.filter_update_hours = try parseU32(value);
-    } else if (std.mem.eql(u8, key, "tab_sidebar_width")) {
-        const w = try parseU16(value);
-        if (w < 120 or w > 800) return error.BadTabSidebarWidth;
-        cfg.tab_sidebar_width = w;
-    } else if (std.mem.eql(u8, key, "tab_close_parent")) {
-        cfg.tab_close_parent = if (std.mem.eql(u8, value, "promote"))
-            .promote
-        else if (std.mem.eql(u8, value, "close-subtree") or std.mem.eql(u8, value, "close_subtree"))
-            .close_subtree
-        else
-            return error.BadTabCloseParent;
-    } else if (std.mem.eql(u8, key, "tab_child_insert")) {
-        cfg.tab_child_insert = if (std.mem.eql(u8, value, "last"))
-            .last
-        else if (std.mem.eql(u8, value, "first"))
-            .first
-        else
-            return error.BadTabChildInsert;
-    } else if (std.mem.eql(u8, key, "title_active_fg")) {
-        cfg.title_active_fg = try parseColor(value);
-    } else if (std.mem.eql(u8, key, "title_active_bg")) {
-        cfg.title_active_bg = try parseColor(value);
-    } else if (std.mem.eql(u8, key, "title_inactive_fg")) {
-        cfg.title_inactive_fg = try parseColor(value);
-    } else if (std.mem.eql(u8, key, "title_inactive_bg")) {
-        cfg.title_inactive_bg = try parseColor(value);
-    } else {
-        // Unknown key. Reported (never fatal) by the caller, which
-        // also gets to say WHERE — the same line may be a platform
-        // section's, checked against a throwaway config.
-        return error.UnknownKey;
-    }
+    if (try applyRows(app_keys, cfg, arena, key, value)) return;
+    // Unknown key. Reported (never fatal) by the caller, which also
+    // gets to say WHERE — the same line may be a platform section's,
+    // checked against a throwaway config.
+    return error.UnknownKey;
 }
 
 /// Parse `#RRGGBB:#RRGGBB:…:#RRGGBB` (16 entries, colon-separated).
@@ -3372,18 +3260,6 @@ fn stripComment(line: []const u8) []const u8 {
 
 fn parseU16(s: []const u8) !u16 {
     return std.fmt.parseInt(u16, s, 10);
-}
-
-fn parseI16(s: []const u8) !i16 {
-    return std.fmt.parseInt(i16, s, 10);
-}
-
-fn parseU32(s: []const u8) !u32 {
-    return std.fmt.parseInt(u32, s, 10);
-}
-
-fn parseFloat(s: []const u8) !f32 {
-    return std.fmt.parseFloat(f32, s);
 }
 
 /// The one boolean vocabulary (true/1/yes/on, false/0/no/off, case
@@ -4197,9 +4073,13 @@ test "config: malformed symbol maps and weights are rejected" {
     try std.testing.expectError(error.BadSymbolMap, parseSymbolMap("x", "U+E0A0"));
     try std.testing.expectError(error.BadSymbolMap, parseSymbolMap("x", "U+E0A3-U+E0A0 Fam"));
     try std.testing.expectError(error.BadSymbolMap, parseSymbolMap("x", "notahex Fam"));
-    try std.testing.expectError(error.BadFontWeight, parseWeight("12"));
-    try std.testing.expectError(error.BadFontWeight, parseWeight("1000"));
-    try std.testing.expectEqual(@as(u16, 350), try parseWeight("350"));
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.OutOfRange, validateTopLevelKv(alloc, "font_weight", "12"));
+    try std.testing.expectError(error.OutOfRange, validateTopLevelKv(alloc, "font_weight", "1000"));
+    try validateTopLevelKv(alloc, "font_weight", "350");
+    // 0 is "the font's own default", so a profile can say so even when
+    // the Default profile pins a weight.
+    try validateTopLevelKv(alloc, "font_weight_bold", "0");
 }
 
 test "config: hint rules parse, keep file order and round-trip" {
@@ -5101,7 +4981,7 @@ test "config: keys of a non-matching platform are validated, not skipped" {
     const alloc = std.testing.allocator;
     try validateTopLevelKv(alloc, "font_size", "20");
     try std.testing.expectError(error.UnknownKey, validateTopLevelKv(alloc, "font_sizee", "20"));
-    try std.testing.expectError(error.BadCursorShape, validateTopLevelKv(alloc, "cursor_shape", "wedge"));
+    try std.testing.expectError(error.BadEnumValue, validateTopLevelKv(alloc, "cursor_shape", "wedge"));
     try std.testing.expectError(error.UnknownKey, validateTopLevelKv(alloc, "host", "devbox"));
 
     // And through the parser: a broken line in the other platform's
@@ -5478,4 +5358,375 @@ test "config: filter subscriptions round-trip, repeat and clone" {
         "filter_list = file:///tmp/local.txt\nfilter_list = https:///missing-host.txt\n");
     defer bad.deinit();
     try std.testing.expectEqual(@as(usize, 0), bad.filter_lists.items.len);
+}
+
+// -- Table-driven round trips ---------------------------------------
+//
+// These enumerate the key table, so a new row is covered without a
+// test being written for it: a sample value per codec, serialised,
+// parsed back and compared field by field.
+
+const rt_palette: [16][3]u8 = .{
+    .{ 0x07, 0x36, 0x42 }, .{ 0xdc, 0x32, 0x2f }, .{ 0x85, 0x99, 0x00 }, .{ 0xb5, 0x89, 0x00 },
+    .{ 0x26, 0x8b, 0xd2 }, .{ 0xd3, 0x36, 0x82 }, .{ 0x2a, 0xa1, 0x98 }, .{ 0xee, 0xe8, 0xd5 },
+    .{ 0x00, 0x2b, 0x36 }, .{ 0xcb, 0x4b, 0x16 }, .{ 0x58, 0x6e, 0x75 }, .{ 0x65, 0x7b, 0x83 },
+    .{ 0x83, 0x94, 0x96 }, .{ 0x6c, 0x71, 0xc4 }, .{ 0x93, 0xa1, 0xa1 }, .{ 0xfd, 0xf6, 0xe3 },
+};
+
+/// A value of field type `T` that differs from `base` and survives
+/// serialise + parse (colours land on a byte, floats on the written
+/// precision, ints inside the row's range).
+fn sampleFor(comptime row: Key, comptime T: type, base: T) T {
+    if (@typeInfo(T) == .optional) return sampleChild(row, @typeInfo(T).optional.child, base);
+    return sampleChild(row, T, base);
+}
+
+fn sampleChild(comptime row: Key, comptime C: type, base: ?C) C {
+    switch (row.codec) {
+        .bool, .bool_words => return !(base orelse false),
+        .int => |spec| {
+            const b: i64 = if (base) |x| @intCast(x) else 0;
+            const candidates = [_]i64{ b + 1, b - 1, spec.min orelse 1, spec.max orelse 1 };
+            for (candidates) |n| {
+                if (n == b or !spec.allows(n)) continue;
+                if (std.math.cast(C, n)) |v| return v;
+            }
+            unreachable;
+        },
+        .float => |spec| {
+            const b: f32 = base orelse 0;
+            const candidates = [_]f32{ b + 0.5, b - 0.5 };
+            for (candidates) |f| {
+                if (spec.min) |m| if (f < m) continue;
+                if (spec.max) |m| if (f > m) continue;
+                return f;
+            }
+            unreachable;
+        },
+        .color => return .{ 0x12.0 / 255.0, 0x34.0 / 255.0, 0x56.0 / 255.0, 1.0 },
+        .color_a => return .{ 0x12.0 / 255.0, 0x34.0 / 255.0, 0x56.0 / 255.0, 0x78.0 / 255.0 },
+        .palette16 => return rt_palette,
+        .enum_ => {
+            inline for (@typeInfo(C).@"enum".fields) |f| {
+                const v = @field(C, f.name);
+                if (base == null or v != base.?) return v;
+            }
+            unreachable;
+        },
+        .string => return "rt-" ++ row.name,
+        .path => return "/tmp/rt-" ++ row.name,
+        .validated => |spec| return spec.sample,
+        .template => return "{{ PROGRAM }}",
+        else => @compileError("no sample for codec " ++ @tagName(row.codec)),
+    }
+}
+
+/// Field-wise equality with the slack a text round trip has: floats to
+/// their written precision, colour channels to one byte.
+fn expectValue(expected: anytype, actual: @TypeOf(expected)) !void {
+    const T = @TypeOf(expected);
+    switch (@typeInfo(T)) {
+        .optional => {
+            if (expected == null) return std.testing.expect(actual == null);
+            try std.testing.expect(actual != null);
+            return expectValue(expected.?, actual.?);
+        },
+        .float => try std.testing.expectApproxEqAbs(expected, actual, 0.01),
+        .array => |arr| if (arr.child == f32) {
+            for (expected, actual) |e, a| try std.testing.expectApproxEqAbs(e, a, 0.005);
+        } else {
+            try std.testing.expect(std.meta.eql(expected, actual));
+        },
+        .pointer => try std.testing.expectEqualStrings(expected, actual),
+        else => try std.testing.expectEqual(expected, actual),
+    }
+}
+
+/// Every scalar row of `rows` set to its sample on `target`.
+fn fillSamples(comptime rows: []const Key, target: anytype) void {
+    @setEvalBranchQuota(20_000);
+    const T = @TypeOf(target.*);
+    inline for (rows) |row| {
+        if (comptime row.codec.isScalar()) {
+            const F = @FieldType(T, row.fieldName());
+            @field(target, row.fieldName()) = sampleFor(row, F, @field(defaultsOf(T), row.fieldName()));
+        }
+    }
+}
+
+/// Every scalar row of `rows` on `actual` holds its sample.
+fn expectSamples(comptime rows: []const Key, actual: anytype) !void {
+    @setEvalBranchQuota(20_000);
+    const T = @TypeOf(actual.*);
+    inline for (rows) |row| {
+        if (comptime row.codec.isScalar()) {
+            const F = @FieldType(T, row.fieldName());
+            const want = sampleFor(row, F, @field(defaultsOf(T), row.fieldName()));
+            expectValue(want, @field(actual, row.fieldName())) catch |err| {
+                std.debug.print("config key '{s}' did not round-trip\n", .{row.name});
+                return err;
+            };
+        }
+    }
+}
+
+/// Lines of `text` starting with `prefix`.
+fn countLines(text: []const u8, prefix: []const u8) usize {
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |line| {
+        if (std.mem.startsWith(u8, line, prefix)) n += 1;
+    }
+    return n;
+}
+
+/// Lines of `text` equal to `line`.
+fn countExactLines(text: []const u8, line: []const u8) usize {
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |l| {
+        if (std.mem.eql(u8, l, line)) n += 1;
+    }
+    return n;
+}
+
+fn scopeHolder(comptime scope: Scope, cfg: *Config) *StructOf(scope) {
+    return switch (scope) {
+        .app => cfg,
+        .profile => &cfg.settings,
+    };
+}
+
+test "config: the default Config serialises to the header line alone" {
+    var cfg = Config{};
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try cfg.serialise(&w);
+    try std.testing.expectEqualStrings("# sketerm config (auto-saved by Preferences dialog)\n", w.buffered());
+}
+
+test "config: every table key round-trips through serialise and parse" {
+    var cfg = Config{};
+    fillSamples(app_keys, &cfg);
+    fillSamples(profile_keys, &cfg.settings);
+    var lists = [_][]const u8{ "https://example.test/a.txt", "https://example.test/b.txt" };
+    cfg.filter_lists = .{ .items = &lists, .capacity = lists.len };
+
+    var buf: [MAX_FILE_BYTES]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try cfg.serialise(&w);
+    const text = w.buffered();
+
+    // Every scalar key is written exactly once under its own name, the
+    // list key once per entry, and an alias or retired name never.
+    inline for (keys) |row| {
+        const want: usize = switch (row.codec) {
+            .alias, .retired => 0,
+            .string_list => lists.len,
+            else => if (row.codec.isFamily()) 0 else 1,
+        };
+        const got = countLines(text, row.name ++ " = ");
+        if (got != want) {
+            std.debug.print("config key '{s}' written {d} times, expected {d}\n", .{ row.name, got, want });
+            return error.TestUnexpectedResult;
+        }
+    }
+
+    var parsed = try Config.loadFromBytes(std.testing.allocator, text);
+    defer parsed.deinit();
+    try expectSamples(app_keys, &parsed);
+    try expectSamples(profile_keys, &parsed.settings);
+    try std.testing.expectEqual(lists.len, parsed.filter_lists.items.len);
+    try std.testing.expectEqualStrings(lists[1], parsed.filter_lists.items[1]);
+
+    // The serialiser is a fixed point of parse.
+    var buf2: [MAX_FILE_BYTES]u8 = undefined;
+    var w2 = std.Io.Writer.fixed(&buf2);
+    try parsed.serialise(&w2);
+    try std.testing.expectEqualStrings(text, w2.buffered());
+
+    // The clone every reload goes through carries all of it, with its
+    // own copies: the source arena is freed under applyConfigChange.
+    var cloned = try parsed.clone(std.testing.allocator);
+    defer cloned.deinit();
+    parsed.deinit();
+    try expectSamples(app_keys, &cloned);
+    try expectSamples(profile_keys, &cloned.settings);
+    try std.testing.expectEqualStrings(lists[0], cloned.filter_lists.items[0]);
+}
+
+test "config: every profile key round-trips inside a [profile.<name>] section" {
+    var cfg = Config{};
+    var profs = [_]Profile{.{ .name = "rt" }};
+    fillSamples(profile_keys, &profs[0].settings);
+    cfg.profiles = .{ .items = &profs, .capacity = profs.len };
+
+    var buf: [MAX_FILE_BYTES]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try cfg.serialise(&w);
+    const text = w.buffered();
+    const section = std.mem.indexOf(u8, text, "\n[profile.rt]\n") orelse return error.TestUnexpectedResult;
+
+    // Every profile key lands inside the section and none at top level.
+    inline for (profile_keys) |row| {
+        if (comptime row.codec.isScalar()) {
+            try std.testing.expectEqual(@as(usize, 0), countLines(text[0..section], row.name ++ " = "));
+            try std.testing.expectEqual(@as(usize, 1), countLines(text[section..], row.name ++ " = "));
+        }
+    }
+
+    var parsed = try Config.loadFromBytes(std.testing.allocator, text);
+    defer parsed.deinit();
+    try expectSamples(profile_keys, parsed.profileSettings("rt"));
+    // The Default profile stayed at the schema defaults.
+    inline for (profile_keys) |row| {
+        if (comptime row.codec.isScalar()) {
+            try expectValue(@field(profile_defaults, row.fieldName()), @field(parsed.settings, row.fieldName()));
+        }
+    }
+}
+
+test "config: every alias parses as its canonical key" {
+    inline for (keys) |row| {
+        switch (row.codec) {
+            .alias => |canon| {
+                const target = comptime rowNamed(canon);
+                const S = StructOf(target.scope);
+                const F = @FieldType(S, target.fieldName());
+                const want = sampleFor(target, F, @field(defaultsOf(S), target.fieldName()));
+                var line_buf: [1024]u8 = undefined;
+                var lw = std.Io.Writer.fixed(&line_buf);
+                try writeScalar(target.codec, row.name, present(want), &lw);
+                var cfg = try Config.loadFromBytes(std.testing.allocator, lw.buffered());
+                defer cfg.deinit();
+                try expectValue(want, @field(scopeHolder(target.scope, &cfg), target.fieldName()));
+            },
+            else => {},
+        }
+    }
+}
+
+test "config: every retired key is accepted and ignored" {
+    inline for (keys) |row| {
+        if (row.codec == .retired) {
+            var cfg = try Config.loadFromBytes(std.testing.allocator, row.name ++ " = 0.5\n");
+            defer cfg.deinit();
+            var buf: [4096]u8 = undefined;
+            var w = std.Io.Writer.fixed(&buf);
+            try cfg.serialise(&w);
+            try std.testing.expectEqualStrings("# sketerm config (auto-saved by Preferences dialog)\n", w.buffered());
+        }
+    }
+}
+
+test "config: enum keys accept the hyphen and underscore spellings" {
+    var cfg = try Config.loadFromBytes(std.testing.allocator,
+        \\web_popup_policy = block_all
+        \\tab_close_parent = close_subtree
+        \\text_blending = linear-corrected
+        \\mouse_middle_click = paste-clipboard
+        \\
+    );
+    defer cfg.deinit();
+    try std.testing.expectEqual(WebPopupPolicy.block_all, cfg.web_popup_policy);
+    try std.testing.expectEqual(TabCloseParent.close_subtree, cfg.tab_close_parent);
+    try std.testing.expectEqual(TextBlending.linear_corrected, cfg.text_blending);
+    try std.testing.expectEqual(MouseAction.paste_clipboard, cfg.mouse_middle_click);
+    // The written spelling is a per-key fact older builds already read.
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try cfg.serialise(&w);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "web_popup_policy = block-all\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "tab_close_parent = close-subtree\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "text_blending = linear_corrected\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "mouse_middle_click = paste_clipboard\n") != null);
+}
+
+test "config: every prefix family and list key round-trips" {
+    var body_buf: [4096]u8 = undefined;
+    inline for (keys) |row| {
+        var bw = std.Io.Writer.fixed(&body_buf);
+        // Exhaustive on purpose: a new family codec must add its sample.
+        switch (row.codec) {
+            .keybinds => try bw.print("{s}new_tab = <Control>t\n{s}copy = \n", .{ row.name, row.name }),
+            .hint_rules => try bw.print(
+                "{s}x.regex = [0-9]+\n{s}x.action = paste\n{s}x.command = echo {{match}}\n",
+                .{ row.name, row.name, row.name },
+            ),
+            .symbol_maps => try bw.print("{s}pl = U+E0A0-U+E0A3 Some Font\n", .{row.name}),
+            .shader_params => try bw.print("{s}glow = 0.5\n{s}tint = #ff0000\n", .{ row.name, row.name }),
+            .color_set => {
+                inline for (color_set_keys) |sub| {
+                    const F = @FieldType(ColorSet, sub.fieldName());
+                    var key_buf: [64]u8 = undefined;
+                    const key = try std.fmt.bufPrint(&key_buf, "{s}{s}", .{ row.name, sub.name });
+                    try writeScalar(sub.codec, key, present(sampleFor(sub, F, null)), &bw);
+                }
+            },
+            .string_list => |spec| try bw.print("{s} = {s}\n{s} = {s}/2\n", .{ row.name, spec.sample, row.name, spec.sample }),
+            .bool, .bool_words, .int, .float, .color, .color_a, .palette16, .enum_, .string, .path, .validated, .template, .alias, .retired => {},
+        }
+        const body = bw.buffered();
+        if (body.len > 0) {
+            var cfg = try Config.loadFromBytes(std.testing.allocator, body);
+            defer cfg.deinit();
+            var out_buf: [4096]u8 = undefined;
+            var ow = std.Io.Writer.fixed(&out_buf);
+            try cfg.serialise(&ow);
+            // Every line written in comes back out, verbatim, once.
+            var lines = std.mem.splitScalar(u8, body, '\n');
+            while (lines.next()) |line| {
+                if (line.len == 0) continue;
+                if (countExactLines(ow.buffered(), line) != 1) {
+                    std.debug.print("family line '{s}' did not round-trip:\n{s}\n", .{ line, ow.buffered() });
+                    return error.TestUnexpectedResult;
+                }
+            }
+        }
+    }
+}
+
+test "config: loadFromPath refuses a file over the size cap" {
+    const c = @import("c.zig").c;
+    var tmpl = "/tmp/sketerm-cfgbig-XXXXXX".*;
+    const dir = c.mkdtemp(&tmpl) orelse return error.SkipZigTest;
+    const base = std.mem.span(@as([*:0]u8, @ptrCast(dir)));
+    var path_buf: [512:0]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "{s}/config.conf", .{base});
+    defer _ = c.rmdir(dir);
+    defer _ = c.unlink(path.ptr);
+    {
+        const fp = c.fopen(path.ptr, "wb") orelse return error.SkipZigTest;
+        defer _ = c.fclose(fp);
+        // A valid key first, then comments past the cap: a truncating
+        // reader would happily return font_size = 21 here.
+        const head = "font_size = 21\n";
+        _ = c.fwrite(head.ptr, 1, head.len, fp);
+        var line: [64]u8 = undefined;
+        @memset(&line, '#');
+        line[line.len - 1] = '\n';
+        var written: usize = head.len;
+        while (written <= MAX_FILE_BYTES) : (written += line.len) {
+            _ = c.fwrite(&line, 1, line.len, fp);
+        }
+    }
+    try std.testing.expectError(error.TooLarge, Config.loadFromPath(std.testing.allocator, path));
+    // Startup falls back to the defaults rather than a partial file.
+    var cfg = Config.loadWithOverride(std.testing.allocator, path);
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(u16, 14), cfg.settings.font_size);
+}
+
+test "config: every table key is documented in docs/config.md" {
+    // Embedded by build.zig, so the gate cannot skip and does not
+    // depend on the directory the test runner starts in.
+    const doc = @embedFile("docs_config_md");
+    inline for (keys) |row| {
+        // A family is documented as `prefix.<name>`, a key as `key`.
+        const needle: []const u8 = comptime if (row.codec.isFamily()) "`" ++ row.name else "`" ++ row.name ++ "`";
+        if (std.mem.indexOf(u8, doc, needle) == null) {
+            std.debug.print("docs/config.md does not mention `{s}`\n", .{row.name});
+            return error.TestUnexpectedResult;
+        }
+    }
 }

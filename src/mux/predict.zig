@@ -35,6 +35,21 @@ pub const CellReader = struct {
     cpAt: *const fn (ctx: ?*anyopaque, row: u16, col: u16) u21,
 };
 
+/// Whether the display gate follows the RTT/confirmation heuristics
+/// (`auto`) or is forced on or off; the config key `predictive_echo`
+/// and the SKETERM_PREDICT env override both speak this.
+pub const Mode = enum { auto, always, never };
+
+/// The mode a pane runs with: `never` on a local-echo session, else a
+/// valid SKETERM_PREDICT value (`env`), else `configured`.
+pub fn resolveMode(local_echo: bool, env: ?[]const u8, configured: Mode) Mode {
+    if (local_echo) return .never;
+    if (env) |v| {
+        if (std.meta.stringToEnum(Mode, v)) |m| return m;
+    }
+    return configured;
+}
+
 pub const Tuning = struct {
     /// Don't display predictions below this smoothed RTT — on a fast
     /// link the real echo beats the next frame anyway.
@@ -62,8 +77,8 @@ pub const Predictor = struct {
     /// cleared on mispredict or timeout. Gates display.
     confident: bool = false,
     paused_until_ms: i64 = 0,
-    /// Env override (SKETERM_PREDICT): show always / never.
-    force: enum { auto, always, never } = .auto,
+    /// Display override (config `predictive_echo`, env SKETERM_PREDICT).
+    force: Mode = .auto,
 
     pub fn init(allocator: std.mem.Allocator) Predictor {
         return .{ .allocator = allocator };
@@ -229,6 +244,15 @@ const FakeScreen = struct {
         return self.cells[row][col];
     }
 };
+
+test "resolveMode: local echo wins, then a valid env value, then config" {
+    try std.testing.expectEqual(Mode.never, resolveMode(true, "always", .always));
+    try std.testing.expectEqual(Mode.always, resolveMode(false, "always", .never));
+    try std.testing.expectEqual(Mode.auto, resolveMode(false, "auto", .never));
+    try std.testing.expectEqual(Mode.never, resolveMode(false, null, .never));
+    // An unknown env value is ignored rather than guessed at.
+    try std.testing.expectEqual(Mode.always, resolveMode(false, "yes", .always));
+}
 
 test "prediction confirmed by echo builds confidence" {
     var p = Predictor.init(std.testing.allocator);
