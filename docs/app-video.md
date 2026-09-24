@@ -59,7 +59,11 @@ those libraries were missing, for testing the fallbacks.
 - The viewer's hello carries `video_codecs`: the codecs it can decode,
   in its preference order (config `app_video_codec`: `auto` = H.264
   then AV1; `h264`/`av1` = that one first; `lossless` = none). It also
-  sets the old `video` bool to "I decode H.264".
+  sets the old `video` bool to "I decode H.264". Only a process that
+  renders forwarded apps probes its decoders for this (`client.zig
+  app_viewer`: the GUI's windows and appdrive set it); a control client
+  such as `sketerm mux list` offers the empty list and never dlopens
+  libavcodec, which cut that command from ~26 ms to ~22 ms here.
 - The daemon keeps that list per client and, per session, picks the
   first codec of the first viewer's list that EVERY native viewer lists
   and this daemon can encode (`vcodec.negotiate`). It re-picks whenever

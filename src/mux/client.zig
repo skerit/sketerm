@@ -21,9 +21,18 @@ pub var video_preference: vcodec.Preference = .auto;
 
 /// This process RENDERS forwarded apps (the GUI, appdrive): its hellos
 /// say `paste_request:true`, i.e. it answers the daemon's paste_request
-/// units with its host clipboard. Plain control clients (the CLI) leave
-/// it false. Set once, before the first connection that views apps.
+/// units with its host clipboard, and list the video codecs it decodes,
+/// which means probing (dlopen'ing) the decoders. Plain control clients
+/// (the CLI, a GUI-less MCP) leave it false and offer no codec, so `mux
+/// list` never loads libavcodec; they never receive app channels, so an
+/// empty offer changes nothing they see. Set once, before the first
+/// connection that views apps.
 pub var app_viewer: bool = false;
+
+/// The codecs a hello offers: probed only in a process that renders apps.
+fn helloDecodable() vcodec.CodecList {
+    return if (app_viewer) vcodec.decodableHere() else .{};
+}
 
 /// The hello's two video fields. `video_codecs` is what a negotiating
 /// daemon reads; `video` is all an OLDER daemon reads, and it encodes
@@ -31,6 +40,22 @@ pub var app_viewer: bool = false;
 pub fn helloVideo(pref: vcodec.Preference, decodable: vcodec.CodecList, names: *[vcodec.CodecList.cap][]const u8) struct { video: bool, video_codecs: []const []const u8 } {
     const offered = vcodec.offer(pref, decodable);
     return .{ .video = offered.contains(.h264), .video_codecs = offered.names(names) };
+}
+
+test "only an app-viewing process probes decoders for its hello" {
+    const t = std.testing;
+    const was = app_viewer;
+    defer app_viewer = was;
+    app_viewer = false;
+    // A control client offers nothing: explicit empty list, video=false,
+    // the same fields a lossless-by-choice viewer sends.
+    try t.expectEqual(@as(u8, 0), helloDecodable().len);
+    var names: [vcodec.CodecList.cap][]const u8 = undefined;
+    const vf = helloVideo(video_preference, helloDecodable(), &names);
+    try t.expect(!vf.video);
+    try t.expectEqual(@as(usize, 0), vf.video_codecs.len);
+    app_viewer = true;
+    try t.expectEqual(vcodec.decodableHere().len, helloDecodable().len);
 }
 
 test "a new GUI's hello keeps an old daemon on x264 (or lossless)" {
@@ -482,7 +507,7 @@ pub const Conn = struct {
 
     fn hello(self: *Conn, comptime queue_only: bool, deadline_ms: ?i64) !void {
         var names: [vcodec.CodecList.cap][]const u8 = undefined;
-        const vf = helloVideo(video_preference, vcodec.decodableHere(), &names);
+        const vf = helloVideo(video_preference, helloDecodable(), &names);
         const value = .{
             .proto = wire.PROTO_VERSION,
             .min_proto = @as(u32, 1),
