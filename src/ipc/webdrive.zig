@@ -1287,7 +1287,7 @@ pub const Engine = struct {
         // session (the engine must outlive every client, and the
         // session env was minted per client); SKETERM_WEB_BROKER_ENGINE=0
         // is the escape hatch back to the client-spawn lane, session
-        // included — the SKETERM_NO_BROKER precedent.
+        // included.
         // A routed engine never takes this lane: the broker's engine is
         // the instance's DIRECT one (its own socket, no `--proxy`), so
         // adopting it for a route would browse direct under a route.

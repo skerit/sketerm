@@ -3,9 +3,9 @@
 //!
 //! The remote `sketerm-mux` daemon hosts the app and forwards its
 //! Wayland protocol (parsed, never re-encoded) over the mux
-//! connection; the running sketerm GUI is the compositor brain that
-//! renders each window locally. There is therefore one hard
-//! requirement: a sketerm window must already be open on this desktop.
+//! connection; a running sketerm GUI renders each window locally. No
+//! window open (or `--headless`) is not an error: the app runs against
+//! the daemon's display and a viewer attaches later.
 //!
 //! Transports mirror `sketerm mux`: automatic UDP with SSH fallback or forced Tor;
 //! `-u` forces roaming UDP. `$SKETERM_SSH` overrides the ssh binary (tests fake
@@ -50,8 +50,9 @@ const USAGE =
     \\        audio / notifications / portals.
     \\  --gpu render on the host's real GPU: the session compositor
     \\        announces linux-dmabuf and the app keeps its hardware GL
-    \\        driver (default is software GL). LINEAR buffers use mmap;
-    \\        tiled/modifier buffers use runtime EGL/GLES import.
+    \\        driver (default is software GL). Real LINEAR dma-bufs are
+    \\        mapped, file-backed ones read per commit, and tiled/modifier
+    \\        buffers go through runtime EGL/GLES import.
     \\
     \\  sketerm app devbox gnome-calculator
     \\  sketerm app -u flaky-wifi-box firefox --new-window

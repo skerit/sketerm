@@ -4,10 +4,36 @@ Status: **historical design draft — SHIPPED and since evolved.** This is
 the document that argued for the mux, kept for its rationale. It is not
 a description of the current system, and where the two disagree the code
 wins. For what actually exists, read `docs/architecture.md`, `REMOTE.md`
-and `src/mux/CLAUDE.md`. The largest divergence: the design speaks of an
-optional daemon alongside an in-process terminal path, and the shipped
-architecture has no in-process path at all — the GUI is ALWAYS a mux
-client, and the per-pane worker thread and its event ring are gone.
+and `src/mux/CLAUDE.md`. Where the shipped system left this text behind:
+
+- There is no in-process terminal path. The GUI is ALWAYS a mux client;
+  the per-pane worker thread and its event ring described below are
+  gone.
+- "One process per user per host" became one BROKER per user per host
+  that forks one worker process per session; the broker holds no
+  session and hands client sockets to workers on attach.
+- `--stdio-session <name>` never shipped. The SSH transport is
+  `ssh host sketerm-mux --proxy`, a byte pump between the SSH pipe and
+  the remote daemon's socket; the session is chosen by the client's own
+  `.attach`.
+- The UDP transport is not "later": `--udp-listen` / `--udp-connect`
+  carry a ChaCha20-Poly1305 go-back-N stream with roaming, hole
+  punching and connection tickets, and predictive local echo shipped
+  with it (`src/mux/predict.zig`). Neither uses the state-sync mode
+  sketched below; the stream stays an event stream over a reliable
+  channel.
+- The CLI is `sketerm ssh [-u] <host>`, `sketerm mux [host] [list|attach
+  <name>|new|kill <name>]` (bare `sketerm mux` is a TUI picker) and
+  `sketerm app`, not `sketerm cli new-tab --durable` /
+  `list-sessions`.
+- The hello/welcome carry a negotiated protocol version, a snapshot
+  version and a table of boolean capabilities (`src/mux/capabilities.zig`)
+  rather than a single `proto_ver`; old and new peers interoperate
+  instead of refusing each other.
+- Daemon replacement without session loss, listed as a non-goal, is
+  still not done; what exists is the idle upgrade (`quit_idle`): a stale
+  daemon holding nothing retires so the next connect autostarts the new
+  binary.
 
 ## Why
 

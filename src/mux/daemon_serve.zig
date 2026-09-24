@@ -1,7 +1,7 @@
 //! Client serving: reading and writing client sockets, the per-frame
 //! dispatch (`handleFrame`) that routes every wire frame to its
-//! service module, and the daemon's own retirement (`shutdown`).
-//! The services themselves live in their own modules
+//! service module, and the daemon's own retirement (`shutdown`,
+//! `quit_idle`). The services themselves live in their own modules
 //! (daemon_control, daemon_udp, daemon_transfer, daemon_apps,
 //! daemon_browse, daemon_fsops, daemon_web, daemon_webengine);
 //! functions take the owning *Daemon and are aliased back into Daemon.
@@ -318,6 +318,7 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
             retire(self, cl);
             cl.queueJson(.ok, .{ .ok = true });
         },
+        .quit_idle => handleQuitIdle(self, cl),
         .udp_ticket_req => handleUdpTicketReq(self, cl, frame.payload),
         .fs_op => handleFsOp(self, cl, frame.payload),
         // NOT attach-scoped (like fs_op): the web store belongs to the
@@ -424,6 +425,104 @@ fn retire(self: *Daemon, cl: *Client) void {
         if (!w.dead) _ = controlSend(w.control_fd, "K", -1);
     }
     self.running = false;
+}
+
+/// Why this daemon may not retire right now, or null when it holds
+/// nothing anyone would lose. Clients merely connected do not count:
+/// they get `.gone` and reconnect to the replacement.
+fn busyReason(self: *Daemon, buf: []u8) ?[]const u8 {
+    var workers: usize = 0;
+    for (self.workers.items) |w| {
+        if (!w.dead) workers += 1;
+    }
+    var jobs: usize = 0;
+    for (self.fs_jobs.items) |j| {
+        if (j.state == .running or j.state == .paused) jobs += 1;
+    }
+    const sessions = self.sessions.items.len + workers;
+    const transfers = self.uploads.items.len + self.downloads.items.len;
+    if (sessions == 0 and jobs == 0 and transfers == 0 and self.debug_jobs.items.len == 0 and self.channels.items.len == 0)
+        return null;
+    return std.fmt.bufPrint(buf, "busy: {d} session(s), {d} running job(s), {d} transfer(s), {d} debugger job(s), {d} open channel(s)", .{
+        sessions, jobs, transfers, self.debug_jobs.items.len, self.channels.items.len,
+    }) catch "busy";
+}
+
+/// `quit_idle`: retire ONLY if nothing is held at this very moment. The
+/// check and the exit happen in one frame dispatch, so a session
+/// spawned between a client's probe and its request is refused rather
+/// than killed (the `.shutdown` path old daemons need is unconditional).
+pub fn handleQuitIdle(self: *Daemon, cl: *Client) void {
+    if (self.isWorker()) {
+        cl.queueJson(.ok, .{ .ok = false, .@"error" = "a session worker never retires on request; ask the broker" });
+        return;
+    }
+    var buf: [192]u8 = undefined;
+    if (busyReason(self, &buf)) |reason| {
+        cl.queueJson(.ok, .{ .ok = false, .@"error" = reason });
+        return;
+    }
+    retire(self, cl);
+    cl.queueJson(.ok, .{ .ok = true });
+}
+
+test "quit_idle retires an idle daemon in one step and refuses a busy one" {
+    const t = std.testing;
+    const a = t.allocator;
+    var empty: [0]u8 = .{};
+    var d = Daemon{ .allocator = a, .listen_fd = -1, .sock_path = empty[0..] };
+    defer d.clients.deinit(a);
+    defer d.workers.deinit(a);
+    var requester = Client{ .allocator = a, .fd = -1, .id = 1 };
+    defer requester.rbuf.deinit(a);
+    defer requester.wbuf.deinit(a);
+    defer requester.audio_wbuf.deinit(a);
+    var bystander = Client{ .allocator = a, .fd = -1, .id = 2 };
+    defer bystander.rbuf.deinit(a);
+    defer bystander.wbuf.deinit(a);
+    defer bystander.audio_wbuf.deinit(a);
+    try d.clients.append(a, &requester);
+    try d.clients.append(a, &bystander);
+
+    // A live worker (the broker's view of a session) is the race the
+    // frame exists to close: refused, and the daemon keeps running.
+    var worker = Worker{
+        .allocator = a,
+        .name = @constCast("late"),
+        .origin_name = @constCast("late"),
+        .origin_id = "10000000000000000000000000000001".*,
+        .pid = 123,
+        .control_fd = -1,
+    };
+    try d.workers.append(a, &worker);
+    handleQuitIdle(&d, &requester);
+    try t.expect(d.running);
+    var reply = (try wire.peelFrame(requester.wbuf.items)) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(wire.FrameType.ok, reply.frame.ftype);
+    try t.expect(std.mem.indexOf(u8, reply.frame.payload, "\"ok\":false") != null);
+    try t.expect(std.mem.indexOf(u8, reply.frame.payload, "1 session(s)") != null);
+    try t.expectEqual(@as(usize, 0), bystander.wbuf.items.len);
+
+    // A dead worker is on its way out and holds nothing.
+    worker.dead = true;
+    requester.wbuf.clearRetainingCapacity();
+    handleQuitIdle(&d, &requester);
+    try t.expect(!d.running);
+    reply = (try wire.peelFrame(requester.wbuf.items)) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(wire.FrameType.ok, reply.frame.ftype);
+    try t.expect(std.mem.indexOf(u8, reply.frame.payload, "\"ok\":true") != null);
+    // The other client learns the exit is intentional.
+    const gone = (try wire.peelFrame(bystander.wbuf.items)) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(wire.FrameType.gone, gone.frame.ftype);
+
+    // A worker never answers for its broker.
+    d.running = true;
+    d.role = .worker;
+    requester.wbuf.clearRetainingCapacity();
+    handleQuitIdle(&d, &requester);
+    try t.expect(d.running);
+    reply = (try wire.peelFrame(requester.wbuf.items)) orelse return error.TestUnexpectedResult;
+    try t.expect(std.mem.indexOf(u8, reply.frame.payload, "\"ok\":false") != null);
 }
 
 pub fn findChannel(self: *Daemon, id: u32) ?*Channel {

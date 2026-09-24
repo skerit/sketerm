@@ -378,9 +378,11 @@ drag-and-drop onto a remote pane or "Upload File…", and download from
 "Download File…" (which opens the `src/ui/remote_browser.zig` picker); a
 tab progress ring + `AdwToastOverlay` report both.
 
-**Broker and workers.** The default local daemon is a BROKER plus
-one WORKER process per session (`SKETERM_NO_BROKER=1` selects the
-single-process monolith). The broker holds no session state: it
+**Broker and workers.** Every daemon, local or remote, is a BROKER
+plus one WORKER process per session; there is no single-process mode
+(`--broker` is still accepted and changes nothing, and clients keep
+working against an older single-process daemon, whose wire is the
+same). The broker holds no session state: it
 listens, accepts, spawns, answers `list` from metadata the workers
 push, is the authority for renames, and routes attaches. A worker is
 the same `Daemon` machinery with exactly one session (its PTY,

@@ -30,7 +30,22 @@ isolation and session durability as bonuses.
 What survived under a similar name is `DrainHandle`, which is not a
 drain any more but a liveness fence (see below).
 
-## PTY spawn (daemon side)
+## Daemon processes: one broker, one worker per session
+
+The listening `sketerm-mux` is a BROKER. It holds no session: a
+`.spawn` forks a WORKER process that owns exactly one session (PTY,
+parser, authoritative `Screen`, the session's Wayland and audio hubs),
+and an `.attach` for that session hands the client's socket to the
+worker over the broker<->worker control socketpair (`SCM_RIGHTS`), after
+which the worker serves that connection directly. `list`, `kill` and
+`rename` are answered by the broker from metadata the workers push.
+A worker exits when its session ends (the broker reaps it and drops it
+from `list`); a worker that crashes takes only its own session with it.
+`--idle-exit` retires a broker that has held no worker and no client for
+that long. There is no single-process mode any more; `--broker` is
+accepted for older clients that still pass it and changes nothing.
+
+## PTY spawn (worker side)
 
 `Pty.spawn` in `src/pty.zig` is called only from
 `src/mux/daemon_sessions.zig` when a session is created. `src/pty.zig`
@@ -85,19 +100,24 @@ The GUI does not `ioctl` anything: it owns no master fd. The chain is
    sends a `.resize` frame (4 bytes, little-endian u16 pair). If the
    transport is down the values stay pending and `sendPendingResize`
    replays them from `installReattachedConn` after a reconnect.
-3. The daemon (`src/mux/daemon_serve.zig`, `.resize` case) validates the
-   pair (nonzero, <= 1000), calls `Screen.resize` on the authoritative
-   screen, `pty.setSize` (which is the `TIOCSWINSZ`), tells the cast
-   recorder, and then **broadcasts a fresh snapshot to every attached
-   client** because event streams assume a fixed grid.
+3. The worker (`src/mux/daemon_serve.zig`, `.resize` case) validates the
+   pair with `wire.validateTerminalSize` (each axis 1..4096 and at most
+   1024*1024 cells; a rejection is answered with a tagged `.err`), calls
+   `Screen.resize` on the authoritative screen, `pty.setSize` (which is
+   the `TIOCSWINSZ`), tells the cast recorder, and then **broadcasts a
+   fresh snapshot to every attached client** because event streams
+   assume a fixed grid.
 4. The kernel delivers `SIGWINCH` to the pty's foreground process group.
 
 Consequence worth remembering: the GUI deliberately does NOT resize its
 mirror `Screen` locally. The snapshot that comes back replaces the grid
 wholesale, so a local reflow would only be thrown away.
 
-Neither binary installs a `SIGWINCH` handler. The GUI is not a tty
-client, and the daemon's sizes are pushed to it, not signalled.
+The GUI window and the daemon install no `SIGWINCH` handler: the GUI is
+not a tty client, and the daemon's sizes are pushed to it, not
+signalled. The one place that does is `sketerm mux attach` on a foreign
+terminal (`src/ipc/mux_tty.zig`), which IS a tty client and turns the
+signal into a `.resize` frame.
 
 ## Pane creation (GUI side)
 
@@ -182,9 +202,11 @@ session, falling back to the bare pid when the group is gone, and
 `closeAndReap` escalates nothing -> SIGTERM -> SIGKILL with a final
 group sweep after the leader is reaped.
 
-(`src/pty.zig`'s `decodeStatus` docblock still refers to a
-`Terminal.reapStatus` to keep in lockstep with. That function no longer
-exists - see "Known drift" at the end.)
+Once its session is gone a worker drains what it still owes its
+clients (the post-mortem log push and `.exit` can sit behind an MCP
+client's between-tool-calls backlog; bounded by a 10 s grace) and then
+leaves its poll loop, which the broker sees as control-channel EOF and
+reaps.
 
 ## What the GUI does when a session ends
 
@@ -330,19 +352,34 @@ The GUI's only threads are short-lived DETACHED workers doing blocking
 IO that touches no GTK, GL, `Screen` or `ImageStore` state:
 
 - reconnect / transport upgrade (`src/terminal.zig`),
-- panel transport setup and panel asset reads (`src/ui/panelhost.zig`),
+- panel transport setup, panel asset reads and cache jobs, panel
+  session opens (`src/ui/panelhost.zig`), panel picker store jobs
+  (`src/ui/panelpicker.zig`),
 - gdk-pixbuf decode and file-browser thumbnailing
   (`src/ui/browser/preview.zig`),
 - browser-connection setup (`src/ui/browser/conn.zig`),
-- the LSP link thread (`src/ui/editorlsp.zig`).
+- the LSP link thread (`src/ui/editorlsp.zig`),
+- editor file load, save and remote-host probes (`src/ui/editorview.zig`),
+- viewer file loads (`src/ui/viewer.zig`),
+- durable-tab restore and mux tab listing (`src/ui/muxtabs.zig`),
+- the app switcher's session operations (`src/ui/app_switcher.zig`),
+- assistant roster fetches (`src/ui/assistants.zig`),
+- the remote-browser bridge worker (`src/ui/webremote.zig`) and the
+  web face's AT-SPI connect (`src/ui/webface.zig`).
 
 Every one of them hands back through `g_idle_add`, and **only the idle
 handback frees the job**, so a cancelled worker can never race its own
-teardown. A worker that needs GTK is a bug, not a pattern to copy.
+teardown. A worker that needs GTK is a bug, not a pattern to copy. The
+list above is what a grep for `std.Thread.spawn` outside tests finds;
+add to it when adding a worker.
 
-The daemon is single-threaded: one `poll()` loop
+The daemon is single-threaded per process: one `poll()` loop
 (`Daemon.run` -> `tick`) drives PTY reads, parsing, client IO, channels
-and timers.
+and timers in each worker, and client accept, worker control channels
+and file jobs in the broker. Nothing in `src/mux` may start a thread:
+the broker forks, and a fork from a process with other threads is a
+latent deadlock (the smoke rigs host their daemon as a separate process
+for exactly that reason, `src/smoke/muxrig.zig`).
 
 ## Signal handling
 
@@ -371,7 +408,12 @@ Daemon (`src/mux_main.zig`): `SIGTERM`/`SIGINT` set the run loop's
 `running = false` for a clean shutdown (socket unlink, child reap);
 `SIGPIPE` gets the same no-op handler, so writing to a client that
 vanished cannot kill the daemon. It installs no `SIGCHLD` handler
-either - children are reaped from the poll loop.
+either - children (session shells in a worker, workers and file jobs in
+the broker) are reaped from the poll loop. A broker asked to shut down
+sends each worker a graceful control byte first, so the workers flush
+`.gone` to their own clients before exiting; a `quit_idle` frame is the
+same exit, granted only when the broker holds no worker, job, transfer
+or channel at that instant.
 
 ## Browser helper (optional)
 
@@ -509,13 +551,5 @@ auto-loaded when no flag is given. `--no-save` suppresses the exit save;
 | A stale reconnect cannot install its connection | `reconnect_generation` + `origin_id` checks in `reconnectDone` |
 | GL resources are created and destroyed on the main thread | `realize` / `unrealize` on the `GtkGLArea` |
 | `TIOCSWINSZ` follows every grid geometry change | daemon `.resize` handler calls `pty.setSize` unconditionally |
-
-## Known drift in the code
-
-One stale reference to the pre-mux design survives in comments, and is
-worth knowing about when grepping:
-
-- `src/pty.zig`'s `decodeStatus` docblock tells you to keep it in
-  lockstep with `Terminal.reapStatus`. That function no longer exists;
-  the guard it described now lives in `Pty.reap` / `Pty.closeAndReap`.
-  `src/mux/CLAUDE.md` repeats the same stale name.
+| A session never shares a process with another session | `Daemon.role`: the listening broker forks a worker per `.spawn`; a worker refuses `.spawn` |
+| A rig never forks a daemon from a threaded process | `src/smoke/muxrig.zig` forks the broker before any thread exists |

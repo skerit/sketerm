@@ -79,8 +79,18 @@ In GPU mode, `unset_environment` includes `LIBGL_ALWAYS_SOFTWARE`; merely
 omitting that variable would leave a caller's inherited software override in
 effect. With `--isolated`, it also includes `DBUS_SESSION_BUS_ADDRESS`.
 
-Do not derive the Wayland or PulseAudio socket names. Broker and monolith
-daemons intentionally use different internal naming schemes.
+Do not derive the Wayland or PulseAudio socket names: they are named
+after the session's worker process, which a client cannot know. The
+create/list/inspect replies and `sketerm-mux display run`'s environment
+are the only sources.
+
+`--kb-layout NAME` picks the session seat's xkb layout at creation
+(default `us`; `gb`, `fr`, `be`, `de` are bundled). A session's keymap is
+fixed for its lifetime, so a test that needs dead keys creates its own
+display with the layout it types on. `--isolated` gives the display a
+private `XDG_RUNTIME_DIR` with the inherited D-Bus session bus dropped,
+which is what keeps single-instance applications from handing off to a
+copy already running elsewhere.
 
 ## Rootless X11
 

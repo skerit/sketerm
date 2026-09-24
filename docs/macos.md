@@ -50,6 +50,16 @@ Remaining gaps are listed at the bottom.
   (kind 3), so `sketerm app <mac-host> <binary>` works. It is only
   Wayland *forwarding* that a Mac cannot do; the session carries
   `wl_display = "-"` there and the client renders captured pixels.
+- **VideoToolbox H.264 encode**: a native macOS toolchain compiles
+  `vendor/vtenc_shim.c` plus the VideoToolbox/CoreMedia/CoreVideo
+  frameworks into the daemon and the GUI (`have_vtenc = native_macos`
+  in build.zig, no option to pass), so a Mac daemon can produce video
+  tiles for a `-Dvideo` client without libx264. It only activates when
+  such a client attaches; `mux-portable` never carries it.
+- **Daemon process model** is the same as on Linux: the listening
+  daemon is a broker that forks one worker per session over a
+  `SOCK_DGRAM` control socketpair (Darwin has no `SOCK_SEQPACKET`; see
+  the re-verification notes below for the two consequences).
 
 ## Real-hardware friction found (and fixed)
 
@@ -74,11 +84,14 @@ Remaining gaps are listed at the bottom.
 5. **zsh OSC 7 trailing `%`** — `${PWD//%/%25}` in zsh anchors an
    empty match at the END (it doesn't escape `%`), appending `%25` to
    every reported cwd. All-platform bug, surfaced by cwd checks here.
-6. **`zig build mux` requires the full GTK dev set installed** even
-   though the daemon doesn't use GTK: build.zig resolves pkg-config
-   for every package eagerly at configure time. On a GTK-less host
-   the daemon can't be built from source (cross-compile mux-portable
-   from elsewhere instead). Known wart, not yet fixed.
+6. **`zig build mux` used to require the full GTK dev set installed**
+   even though the daemon doesn't use GTK, because build.zig resolved
+   pkg-config for every package eagerly at configure time. Fixed:
+   GUI package resolution is attached to the GUI's own compile and
+   TranslateC steps, so `zig build mux` on a GTK-less host works
+   (`dist/test-mux-build.sh` proves it with a pkg-config that rejects
+   every GUI package). The two configure-time fribidi probes are the
+   deliberate exception, fribidi being in every target's dep set.
 
 ## Behavioural bugs found on the 2026-08 re-verification
 
@@ -447,8 +460,12 @@ was needed — pkgconf's defaults cover the brew prefix.
   preserve the runtime dir (it is `removeTreeBestEffort`'d on exit) so
   `mux.log` survives a failing run. Also worth checking fd exhaustion
   across repeated denied captures.
-- `.app` bundle / packaging not started (run from zig-out/bin).
-- Cmd-vs-Ctrl keybinding conventions not started.
+- The GUI itself runs from `zig-out/bin` (no `.app` bundle or
+  packaging for it yet). The CEF helper IS assembled as
+  `zig-out/sketerm-webengine.app`, because Chromium launches its
+  renderer/GPU helpers from a bundle (`docs/cef-macos.md`).
+- Cmd-vs-Ctrl: done in the second wave above (app chords on Command,
+  Ctrl left to the shell); the AZERTY digit gap is the remaining item.
 - **VoiceOver reaches the terminal pane ONLY.** `nsax` is attached by
   `pane.zig` on the GL area's map; the editor and the browser route
   their a11y through `GtkAccessibleText`/AT-SPI, and GTK4's atspi
@@ -465,13 +482,11 @@ was needed — pkgconf's defaults cover the brew prefix.
   conformance test asserts the degraded form off Linux and says so;
   **do not "fix" it by faking a codepoint** — teaching
   `baseLayoutCodepoint` the macOS keycode space is the real fix.
-- **The browser (`src/web`) has no macOS story.** CEF is pinned to a
-  linux64 tarball, and the helper's startup path is Linux by
-  construction (`LD_PRELOAD` re-exec, ozone platforms). The GUI
-  degrades with an explicit "browser helper is not installed" message,
-  so this is absent-by-construction rather than broken — but a macOS
-  browser needs the CEF macOS framework bundle and a different startup
-  sequence.
+- **The browser works on macOS** (second wave above: `smoke-web` green
+  with the CEF macOS framework bundle, the variant helper bundles and
+  `--use-mock-keychain`; `docs/cef-macos.md`). Still open there:
+  `zig build test-web` staging, headless (SSH, no WindowServer) use,
+  and GPU frame parity (an IOSurface frame family).
 - **`watch_limit` reaches the wire and the daemon log, but no UI.**
   `fsdrive.Listing` and the file browser's `WireReply` have no such
   field; clients parse with `ignore_unknown_fields = true`, so nothing

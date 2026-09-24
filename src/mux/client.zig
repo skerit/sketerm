@@ -512,16 +512,27 @@ pub const Conn = struct {
         return !std.mem.eql(u8, self.serverBuild(), mine);
     }
 
-    /// Ask a STALE and provably IDLE daemon (no sessions, no live fs
-    /// jobs — both probed over verbs old daemons answer) to shut down
-    /// so the caller's reconnect autostarts the freshly deployed
-    /// binary. True = the daemon agreed and this connection is spent;
-    /// reconnect. Any refusal or uncertainty leaves the connection
-    /// usable and returns false. Interrupted fs jobs would not even
-    /// be lost (journal respawn), but a running one is a reason not
-    /// to bounce the daemon under someone.
+    /// Ask a STALE and IDLE daemon to shut down so the caller's
+    /// reconnect autostarts the freshly deployed binary. True = the
+    /// daemon agreed and this connection is spent; reconnect. Any
+    /// refusal or uncertainty leaves the connection usable and returns
+    /// false. A daemon advertising `quit_idle` decides atomically
+    /// (a session it holds at that instant refuses the request); one
+    /// that predates the flag gets the old probe-then-`.shutdown`
+    /// sequence, which is racy by construction and kept only for it.
     pub fn upgradeStaleIdle(self: *Conn, allocator: std.mem.Allocator) bool {
         if (!self.buildStale()) return false;
+        if (self.caps.quit_idle) {
+            self.sendJson(.quit_idle, .{}) catch return false;
+            const f = self.recvExpectFor(&.{.ok}, 5_000) catch return false;
+            defer f.deinit(allocator);
+            const Reply = struct { ok: bool = false };
+            const parsed = std.json.parseFromSlice(Reply, allocator, f.payload, .{
+                .ignore_unknown_fields = true,
+            }) catch return false;
+            defer parsed.deinit();
+            return parsed.value.ok;
+        }
         // Sessions? `.list` answers with a welcome-shaped frame
         // carrying `sessions` (the mux CLI's own list path).
         self.sendFrame(.list, "") catch return false;
@@ -2662,6 +2673,54 @@ test "fenced kill refuses old daemons before sending bytes" {
     var parsed = try std.json.parseFromSlice(wire.KillReq, t.allocator, frame.payload, .{});
     defer parsed.deinit();
     try t.expectEqualStrings(req.origin_id, parsed.value.origin_id);
+}
+
+test "stale-idle upgrade asks quit_idle when advertised and probes old daemons otherwise" {
+    const t = std.testing;
+    const a = t.allocator;
+    if (std.mem.eql(u8, @import("build_options").commit, "unknown")) return error.SkipZigTest;
+    var pair: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), @import("../util/platform.zig").socketpairCloexec(&pair));
+    var conn = Conn{ .allocator = a, .fd = pair[0], .proto = wire.PROTO_VERSION };
+    defer conn.deinit();
+    var peer = Conn{ .allocator = a, .fd = pair[1], .proto = wire.PROTO_VERSION };
+    defer peer.deinit();
+    // A daemon announcing a different build is stale by definition.
+    @memcpy(conn.server_build[0..5], "other");
+    conn.server_build_len = 5;
+    try t.expect(conn.buildStale());
+
+    // Advertised: one atomic frame, and the daemon's answer is final.
+    conn.caps.quit_idle = true;
+    try peer.sendJson(.ok, .{ .ok = false, .@"error" = "busy: 1 session(s)" });
+    try t.expect(!conn.upgradeStaleIdle(a));
+    var req = try peer.recvExpectFor(&.{.quit_idle}, 1_000);
+    req.deinit(a);
+    try peer.sendJson(.ok, .{ .ok = true });
+    try t.expect(conn.upgradeStaleIdle(a));
+    req = try peer.recvExpectFor(&.{.quit_idle}, 1_000);
+    req.deinit(a);
+
+    // Not advertised (an older daemon): the probe sequence, and a
+    // listed session stops it before any shutdown is sent.
+    conn.caps.quit_idle = false;
+    try peer.sendJson(.welcome, .{ .sessions = [_]struct { name: []const u8 }{.{ .name = "held" }} });
+    try t.expect(!conn.upgradeStaleIdle(a));
+    req = try peer.recvExpectFor(&.{.list}, 1_000);
+    req.deinit(a);
+    var pfd = c.struct_pollfd{ .fd = peer.fd, .events = c.POLLIN, .revents = 0 };
+    try t.expectEqual(@as(c_int, 0), c.poll(&pfd, 1, 0));
+    // Idle by both probes: the old unconditional shutdown verb goes out.
+    try peer.sendJson(.welcome, .{ .sessions = [_]struct { name: []const u8 }{} });
+    try peer.sendJson(.fs_reply, .{ .req = @as(u32, 0x5f757067), .ok = true, .jobs = [_]struct { state: []const u8 }{} });
+    try peer.sendJson(.ok, .{ .ok = true });
+    try t.expect(conn.upgradeStaleIdle(a));
+    req = try peer.recvExpectFor(&.{.list}, 1_000);
+    req.deinit(a);
+    req = try peer.recvExpectFor(&.{.fs_op}, 1_000);
+    req.deinit(a);
+    req = try peer.recvExpectFor(&.{.shutdown}, 1_000);
+    req.deinit(a);
 }
 
 test "identity-first GUI attach survives loss before trailing metadata and fences reincarnation" {

@@ -76,6 +76,13 @@ pub const Flag = enum {
     /// The daemon can put immutable session identity before the
     /// initial GUI snapshot when a panel-capable attach asks for it.
     attach_identity,
+    /// The daemon answers `quit_idle` atomically: it exits only if it
+    /// holds no session, worker or running job at the moment the
+    /// frame is handled, else replies `ok:false`. Absent = the client
+    /// falls back to probing `.list` + `job_list` and then sending the
+    /// unconditional `.shutdown` (racy: a session started in between
+    /// dies).
+    quit_idle,
 };
 
 /// One bool per flag, keyed by wire name; the parsed form on the

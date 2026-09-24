@@ -356,6 +356,19 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     }
     std.debug.print("smoke-broker: post-mortem log outlives worker teardown ok\n", .{});
 
+    // ── quit_idle vs a session spawned in the upgrade window (the
+    //    broker answers from its worker table, so the race lives here).
+    //    The survivor has proved its point; retire it so the stage
+    //    starts from an idle broker. ──
+    {
+        var conn = client_mod.Conn.connect(allocator, sock_path) catch fail("survivor kill connect");
+        defer conn.deinit();
+        helloOk(allocator, &conn);
+        conn.sendJson(.kill, .{ .name = survivor }) catch fail("survivor kill send");
+        (conn.recvExpect(&.{.ok}) catch fail("survivor kill ok")).deinit(allocator);
+    }
+    @import("smoke_quit_idle.zig").run(allocator, sock_path);
+
     // ── clean shutdown ──
     //
     // The shutdown FRAME must be what retires the broker, and it must

@@ -2508,6 +2508,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     (conn2.recvExpect(&.{.ok}) catch fail("kill ok")).deinit(allocator);
     (conn.recvExpect(&.{.gone}) catch fail("gone")).deinit(allocator);
 
+    // The daemon is idle now: a session spawned inside an upgrader's
+    // probe window must refuse `quit_idle` (shared stage, also run
+    // against a real broker by smoke-broker).
+    @import("smoke_quit_idle.zig").run(allocator, sock_path);
+
     // Shutdown; the broker retires (reaping its workers), unlinks its
     // socket and reports the daemon-side leak verdict as its exit status.
     conn2.sendFrame(.shutdown, "") catch fail("shutdown send");

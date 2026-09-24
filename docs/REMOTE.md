@@ -88,8 +88,14 @@ sketerm ssh server          # automatic UDP, with SSH fallback
 sketerm ssh -u server       # force encrypted UDP (mosh-style)
 sketerm mux server          # TUI picker: list/attach/create/kill sessions
 sketerm mux ssh:server      # force the SSH-pipe transport
+sketerm mux tor:server      # force an SSH leg routed through Tor (below)
 sketerm mux server list     # scriptable variants: list | attach <name> | new | kill <name>
 ```
+
+The remote daemon is one process per user per host, started on demand by
+the first `ssh server sketerm-mux --proxy`; every session then runs in a
+worker process it forks, so one crashing shell or app never takes down
+the others.
 
 Closing the tab, killing the GUI, or losing the network leaves the
 session running; reattach with `sketerm mux server` and the screen
@@ -100,7 +106,7 @@ Named endpoints go in `~/.config/sketerm/config.conf`:
 ```
 [domain.devbox]
 host = user@192.168.1.2
-transport = auto       # auto (default) | ssh | udp
+transport = auto       # auto (default) | ssh | udp | tor
 ```
 
 after which `sketerm ssh devbox` works, and the command palette
@@ -177,6 +183,16 @@ predictively (underlined until the server confirms), mosh-style.
 This activates only when measured RTT exceeds ~60 ms and never at
 echo-off prompts (passwords).
 
+## Tor routes
+
+`tor:<host>` (and `transport = tor` in a `[domain.<name>]` section) forces
+every SSH leg of a connection, deployment included, through the built-in
+SOCKS5 ProxyCommand with proxy-side destination DNS, so the host name
+never leaves the Tor circuit. A Tor route never probes UDP, never uses a
+UDP ticket, never reuses a direct ControlMaster and never falls back to
+direct SSH; the proxy endpoint is numeric-only (`mux_tor_socks_endpoint`,
+default `127.0.0.1:9050`).
+
 ## Lifecycle and limits
 
 - Sessions live in the remote daemon. They survive everything on
@@ -202,21 +218,45 @@ on either end**: the daemon is the display server, the sketerm GUI
 is the compositor.
 
 Supported today: windows (resizable, titled, with the app's icon),
-keyboard + mouse, menus/popups, text clipboard both ways. Damage
-tracking + zstd keep buffer traffic reasonable over a network.
-Pixel transport accepts shm and opt-in linux-dmabuf (`--gpu`): LINEAR
-buffers use direct mmap, while tiled/modifier-backed buffers are
-imported through runtime-loaded EGL/GLES and normalized to BGRA before
-crossing the mux transport. Missing runtime GPU import support leaves
-the safe software/shm default unchanged. The current v3 path accepts
-ARGB8888/XRGB8888 plus modifier-defined auxiliary planes; importability
-still depends on the app and mux worker selecting compatible GPUs.
+keyboard + mouse, menus/popups, text clipboard both ways, within-app
+drag and drop, fractional scaling. Damage tracking + zstd keep buffer
+traffic reasonable over a network.
+
+Pixel transport accepts shm and opt-in linux-dmabuf (`--gpu`, or the
+`gpu_apps` config list). The daemon never maps memory the app can
+shrink: shm pools are copied out with `pread` at each commit, a LINEAR
+plane that is a real dma-buf (its size is immutable) is mapped, a
+file-backed object posted as one (a memfd) is read per commit like a
+pool, and tiled/modifier-backed buffers are imported through
+runtime-loaded EGL/GLES (`-Ddmabuf-import`, off in the portable build)
+and normalized to BGRA before crossing the mux transport. Missing
+runtime GPU import support leaves the safe software/shm default
+unchanged. Formats are ARGB8888/XRGB8888 plus modifier-defined
+auxiliary planes; when the daemon host has a readable render node the
+compositor speaks linux-dmabuf v4 with format feedback (mpv and Mesa
+learn formats only that way), otherwise v3. Importability still depends
+on the app and the session worker selecting compatible GPUs.
 `SKETERM_MUX_NO_WAYLAND=1` disables forwarding entirely.
 
-`sketerm app [-u] [-i] <host> <cmd>` is the one-shot form: it spawns
-the app in a fresh durable session and hands it to the running sketerm
-window to render. A sketerm window must already be open on this
-desktop — it is the compositor.
+`sketerm app [-u] [-i] [--headless] [--gpu] <host> <cmd>` is the
+one-shot form: it spawns the app in a fresh durable session and hands it
+to a running sketerm window to render. Without a window open, or with
+`--headless`, the app still runs against the daemon's display; the
+command prints the session name and `sketerm mux <host> attach <name>`
+shows its windows later.
+
+## Remote audio
+
+The daemon is also each session's PulseAudio server: `PULSE_SERVER` in a
+forwarded session points at a per-session socket the daemon serves
+itself (native protocol, no PulseAudio installed on the host), and every
+stream an app plays reaches the attached viewer as PCM units on the same
+mux connection, so audio roams with UDP and survives reattach like
+everything else. Playback only, no capture. When both ends have libopus
+the streams are Opus-compressed (about 12x); otherwise raw PCM.
+`SKETERM_MUX_NO_AUDIO=1` on the daemon host, or `launch_app audio:"none"`
+through MCP, opts a session out. On a macOS client the
+audio is currently consumed but not played (no CoreAudio sink yet).
 
 `-i` (isolate) runs the session under a private `XDG_RUNTIME_DIR` with
 the inherited D-Bus session bus dropped. Use it for **single-instance**
