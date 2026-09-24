@@ -188,10 +188,20 @@ Overridable sub-keys: `default_fg`, `default_bg`, `cursor_color`,
 falls through to the flat value, which is why a config written before
 variants existed behaves identically.
 
-Under `light` / `dark` there is also a built-in bottom layer -- the
+Under `light` / `dark` there is also a built-in layer -- the
 `#1a1a1a` / `#ebebeb` pair `auto_theme` has always substituted -- so
 a variant that sets only, say, `dark.default_bg` still gets the
 built-in dark foreground rather than the flat one.
+
+That built-in pair only stands in for colours nobody wrote. A flat
+`default_fg` / `default_bg` that the profile (or the top level) sets to
+anything but its default outranks it under both halves, so a
+`[profile.prod]` with `default_bg = #400000` stays red in light and
+dark mode alike. The pair steps aside for fg and bg together, so a
+profile that only tints its background keeps the flat foreground
+instead of the other theme's. Precedence, highest first: the variant
+key (`dark.default_bg`), the flat colour the file wrote, the built-in
+pair, the flat default.
 
 Both variants live in every profile, so a per-pane profile survives a
 theme switch:

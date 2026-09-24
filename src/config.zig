@@ -501,12 +501,25 @@ pub const ProfileSettings = struct {
     /// the serialiser and the prefs dialog keep reading and writing
     /// what the user actually put in the file rather than whatever
     /// half of the pair happened to be showing.
+    ///
+    /// Precedence, highest first: the variant's own key
+    /// (`dark.default_bg`), then a flat fg/bg the profile wrote itself,
+    /// then the built-in light/dark pair, then the flat value. A flat
+    /// colour counts as written when it differs from the schema
+    /// default, which is exactly when the serialiser emits it. The
+    /// built-in layer covers fg and bg as a PAIR: once either is
+    /// written it steps aside for both, so a profile that only tints
+    /// its background never gets the other theme's foreground on it.
     pub fn forScheme(self: *const ProfileSettings, scheme: ?ColorScheme) ProfileSettings {
         const which = scheme orelse return self.*;
-        const set = switch (which) {
-            .light => builtin_light.overlay(self.light),
-            .dark => builtin_dark.overlay(self.dark),
+        const base: ColorSet = if (self.hasOwnFgBg()) .{} else switch (which) {
+            .light => builtin_light,
+            .dark => builtin_dark,
         };
+        const set = base.overlay(switch (which) {
+            .light => self.light,
+            .dark => self.dark,
+        });
         var out = self.*;
         if (set.default_fg) |v| out.default_fg = v;
         if (set.default_bg) |v| out.default_bg = v;
@@ -515,6 +528,13 @@ pub const ProfileSettings = struct {
         if (set.palette) |v| out.palette = v;
         if (set.scheme) |v| out.scheme = v;
         return out;
+    }
+
+    /// True when the flat default_fg or default_bg is one the user
+    /// wrote (differs from the schema default). See `forScheme`.
+    pub fn hasOwnFgBg(self: *const ProfileSettings) bool {
+        const d = ProfileSettings{};
+        return !eqColor(self.default_fg, d.default_fg) or !eqColor(self.default_bg, d.default_bg);
     }
 
     /// The variant a `light.`/`dark.` write lands in.
@@ -3445,27 +3465,26 @@ test "config: light/dark variants parse and fall back to flat values" {
     try std.testing.expectEqual(true, lt.cursor_color_default);
 
     // Dark: only bg + cursor_color_default set. fg falls through to
-    // the BUILT-IN dark fg (what auto_theme has always substituted),
-    // and scheme falls back to the flat one.
+    // the flat #cccccc the file wrote (a written flat pair outranks
+    // the built-in one), and scheme falls back to the flat one.
     const dk = s.forScheme(.dark);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), dk.default_bg[0], 0.005);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.92), dk.default_fg[0], 0.005);
+    try std.testing.expectApproxEqAbs(@as(f32, 0xcc) / 255.0, dk.default_fg[0], 0.005);
     try std.testing.expectEqualStrings("tango", dk.scheme);
     try std.testing.expectEqual(false, dk.cursor_color_default);
 }
 
 test "config: no variants keeps the pre-variant auto_theme behaviour" {
+    // Colours left at the schema default: the built-in pair is exactly
+    // what resolveColorsFor hardcoded before variants existed;
+    // palette/scheme/cursor still come from the flat fields under both
+    // halves.
     const body =
-        \\default_fg = #cccccc
-        \\default_bg = #111111
         \\scheme = tango
     ;
     var cfg = try Config.loadFromBytes(std.testing.allocator, body);
     defer cfg.deinit();
     const s = &cfg.settings;
-    // The built-in pair is exactly what resolveColorsFor hardcoded
-    // before variants existed; palette/scheme/cursor still come from
-    // the flat fields under both halves.
     inline for (.{ .{ ColorScheme.light, builtin_light }, .{ ColorScheme.dark, builtin_dark } }) |pair| {
         const eff = s.forScheme(pair[0]);
         try std.testing.expect(eqColor(eff.default_fg, pair[1].default_fg.?));
@@ -3474,6 +3493,44 @@ test "config: no variants keeps the pre-variant auto_theme behaviour" {
         try std.testing.expectEqual(true, eff.cursor_color_default);
         try std.testing.expect(eff.palette == null);
     }
+}
+
+test "config: a profile's own flat default_bg outranks the auto_theme pair" {
+    // The bug: `[profile.prod] default_bg = ...` rendered the built-in
+    // dark/light background instead, so a profile could not mark its
+    // panes at all while auto_theme (the default) was on.
+    const body =
+        \\dark.default_fg = #dddddd
+        \\
+        \\[profile.prod]
+        \\default_bg = #400000
+        \\
+        \\[profile.paper]
+        \\default_bg = #400000
+        \\light.default_bg = #fffff0
+    ;
+    var cfg = try Config.loadFromBytes(std.testing.allocator, body);
+    defer cfg.deinit();
+
+    const prod = cfg.profileSettings("prod");
+    inline for (.{ ColorScheme.light, ColorScheme.dark }) |sc| {
+        const eff = prod.forScheme(sc);
+        // Its own bg wins over the built-in one under both halves...
+        try std.testing.expectApproxEqAbs(@as(f32, 0x40) / 255.0, eff.default_bg[0], 0.005);
+        try std.testing.expectApproxEqAbs(@as(f32, 0.0), eff.default_bg[1], 0.005);
+        // ...and the built-in pair steps aside for fg too, so light
+        // mode never paints the built-in DARK text on the red bg.
+        const want_fg: f32 = if (sc == .dark) @as(f32, 0xdd) / 255.0 else prod.default_fg[0];
+        try std.testing.expectApproxEqAbs(want_fg, eff.default_fg[0], 0.005);
+    }
+    // An explicit variant key still outranks the flat colour.
+    const paper = cfg.profileSettings("paper");
+    try std.testing.expectApproxEqAbs(@as(f32, 0xff) / 255.0, paper.forScheme(.light).default_bg[0], 0.005);
+    try std.testing.expectApproxEqAbs(@as(f32, 0x40) / 255.0, paper.forScheme(.dark).default_bg[0], 0.005);
+    // auto_theme off renders the flat colour untouched.
+    try std.testing.expectApproxEqAbs(@as(f32, 0x40) / 255.0, prod.forScheme(null).default_bg[0], 0.005);
+    // The Default profile wrote no flat colour: built-in pair applies.
+    try std.testing.expect(eqColor(cfg.settings.forScheme(.light).default_bg, builtin_light.default_bg.?));
 }
 
 test "config: light/dark variants round-trip through serialise + clone" {
@@ -3561,9 +3618,15 @@ test "config: variant colour rows show the effective value" {
 
     // Variant field set -> the variant wins.
     try std.testing.expect(eqColor(s.variantColor(.light, .default_bg), .{ 0.9, 0.8, 0.7, 1.0 }));
-    // Unset but covered by the built-in variant -> the built-in.
-    try std.testing.expect(eqColor(s.variantColor(.light, .default_fg), builtin_light.default_fg.?));
-    try std.testing.expect(eqColor(s.variantColor(.dark, .default_bg), builtin_dark.default_bg.?));
+    // Unset, and the flat fg is one this profile wrote -> the flat
+    // pair, never the built-in variant.
+    try std.testing.expect(eqColor(s.variantColor(.light, .default_fg), s.default_fg));
+    try std.testing.expect(eqColor(s.variantColor(.dark, .default_bg), s.default_bg));
+    // Flat pair at the schema default -> covered by the built-in.
+    var plain = ProfileSettings{};
+    plain.light.default_bg = .{ 0.9, 0.8, 0.7, 1.0 };
+    try std.testing.expect(eqColor(plain.variantColor(.light, .default_fg), builtin_light.default_fg.?));
+    try std.testing.expect(eqColor(plain.variantColor(.dark, .default_bg), builtin_dark.default_bg.?));
     // Unset and not covered by the built-in -> the flat base.
     try std.testing.expect(eqColor(s.variantColor(.dark, .cursor_color), s.cursor_color));
 
