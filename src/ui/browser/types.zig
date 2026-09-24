@@ -16,6 +16,7 @@ const BrowserView = @import("view.zig").BrowserView;
 const TabQuery = @import("search.zig").TabQuery;
 const TabSel = @import("selection.zig").TabSel;
 const TabView = @import("views.zig").TabView;
+const templates_mod = @import("templates.zig");
 const DiskUsageState = @import("diskusage.zig").State;
 const paths = @import("../../filebrowser/paths.zig");
 const fsserve = @import("../../mux/fsserve.zig");
@@ -162,6 +163,10 @@ pub const HostConn = struct {
     /// The host's trash `files` directory as its daemon reported it
     /// (null from a daemon too old to say; see `trashFilesDir`).
     trash_dir: ?[]u8 = null,
+    /// The host's Templates directory listing, refreshed through its
+    /// daemon (templates.zig), so the New menu lists local templates
+    /// without the GUI reading the disk.
+    templates_cache: templates_mod.Cache = .{},
     /// The host's existing user directories (same reply), in the
     /// daemon's table order.
     user_dirs: []UserDirEntry = &.{},
@@ -217,6 +222,7 @@ pub const HostConn = struct {
         if (self.templates_dir) |td| allocator.free(td);
         if (self.home_dir) |hd| allocator.free(hd);
         if (self.trash_dir) |td| allocator.free(td);
+        self.templates_cache.deinit(allocator);
         for (self.user_dirs) |d| {
             allocator.free(d.label);
             allocator.free(d.path);

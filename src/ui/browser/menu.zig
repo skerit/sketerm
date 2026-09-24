@@ -748,10 +748,15 @@ fn buildCreateNew(self: *BrowserView, ctx: *MenuCtx, m: classicmenu.Menu, in_sub
         m.section()
     else
         m.submenuIcon("Create New Document", .{ .name = "document-new-symbolic" });
+    const hc = ctx.tab.hc;
     const listed = appendTemplateItems(self, ctx, docs);
-    if (ctx.tab.hc.host != null)
+    // The listing has not landed yet (a fresh connection): the async
+    // popover fills itself in when it does. Once the host has answered
+    // -- even "no templates" -- there is nothing to wait for.
+    const may_exist = !hc.templates_cache.warm and !(hc.dirs_known and hc.templates_dir == null);
+    if (!listed and may_exist)
         docs.item("From Template…", &onMenuNewFromTemplate, ctx);
-    const tail = if (listed or ctx.tab.hc.host != null) docs.section() else docs;
+    const tail = if (listed or may_exist) docs.section() else docs;
     tail.itemIcon("Empty Document…", .{ .name = "document-new-symbolic" }, &onMenuNewEmptyFile, ctx);
 }
 
@@ -778,13 +783,68 @@ fn onTemplateItemActivated(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void 
     @import("templates.zig").instantiate(t.view, t.tab, t.source);
 }
 
-/// List the LOCAL Templates directory straight into the submenu,
-/// Nemo-style: each template is one row with its type's icon. Remote
-/// tabs keep the async "From Template…" popover instead (that
-/// listing is a round trip; a hover submenu cannot wait for it).
+/// List the host's Templates directory straight into the submenu,
+/// Nemo-style: each template is one row with its type's icon. The
+/// names come from the daemon's listing cached on the connection
+/// (templates.zig), for the local host as for a remote one; the menu
+/// also kicks a refresh so the NEXT open sees an edited folder. The
+/// only time the GUI reads the directory itself is the fallback for a
+/// daemon too old to report a Templates directory at all.
 /// @return true when at least one template row was added.
 fn appendTemplateItems(self: *BrowserView, ctx: *MenuCtx, docs: classicmenu.Menu) bool {
-    if (ctx.tab.hc.host != null) return false;
+    const hc = ctx.tab.hc;
+    if (hc.templates_cache.warm) {
+        @import("templates.zig").refreshCache(self, hc);
+        const dir = hc.templates_dir orelse return false;
+        var count: usize = 0;
+        for (hc.templates_cache.names.items) |name| {
+            if (!appendTemplateRow(self, ctx, docs, dir, name)) break;
+            count += 1;
+        }
+        return count > 0;
+    }
+    if (hc.host != null or !hc.dirs_known or hc.templates_dir != null) return false;
+    return appendLocalTemplatesFallback(self, ctx, docs);
+}
+
+/// One template row: the name without its extension, the type's icon.
+/// @return false when the row could not be allocated.
+fn appendTemplateRow(self: *BrowserView, ctx: *MenuCtx, docs: classicmenu.Menu, dir: []const u8, name: []const u8) bool {
+    const t = self.allocator.create(TemplateItemCtx) catch return false;
+    const source = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ if (dir.len == 1) "" else dir, name }) catch {
+        self.allocator.destroy(t);
+        return false;
+    };
+    t.* = .{ .allocator = self.allocator, .view = self, .tab = ctx.tab, .source = @constCast(source) };
+    docs.root.own(&templateItemCleanup, @ptrCast(t));
+    // Label without the extension, with the type's icon -- the way
+    // Nemo presents templates.
+    const stem = if (std.mem.lastIndexOfScalar(u8, name, '.')) |i| name[0..i] else name;
+    var lz: [300]u8 = undefined;
+    const label = classicmenu.escapeLabel(stem, &lz);
+    var nz: [256:0]u8 = undefined;
+    const n = @min(name.len, nz.len - 1);
+    @memcpy(nz[0..n], name[0..n]);
+    nz[n] = 0;
+    var uncertain: c.gboolean = 0;
+    const ctype = c.g_content_type_guess(&nz, null, 0, &uncertain);
+    if (ctype != null) {
+        defer c.g_free(ctype);
+        if (c.g_content_type_get_icon(ctype)) |gicon| {
+            defer c.g_object_unref(gicon);
+            docs.itemIcon(label, .{ .gicon = @ptrCast(gicon) }, &onTemplateItemActivated, @ptrCast(t));
+            return true;
+        }
+    }
+    docs.item(label, &onTemplateItemActivated, @ptrCast(t));
+    return true;
+}
+
+/// A daemon that predates the `templates` answer cannot list the
+/// directory for us; the LOCAL host's is read here instead, so an old
+/// daemon costs no feature. Remote tabs on such a daemon get nothing,
+/// as before.
+fn appendLocalTemplatesFallback(self: *BrowserView, ctx: *MenuCtx, docs: classicmenu.Menu) bool {
     var dbuf: [4096]u8 = undefined;
     const dir = localTemplatesDir(&dbuf) orelse return false;
     var dz: [4096:0]u8 = undefined;
@@ -811,37 +871,12 @@ fn appendTemplateItems(self: *BrowserView, ctx: *MenuCtx, docs: classicmenu.Menu
             return std.ascii.lessThanIgnoreCase(a, b);
         }
     }.lt);
-
+    var added: usize = 0;
     for (names[0..count]) |name| {
-        const t = self.allocator.create(TemplateItemCtx) catch return count > 0;
-        const source = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir, name }) catch {
-            self.allocator.destroy(t);
-            return count > 0;
-        };
-        t.* = .{ .allocator = self.allocator, .view = self, .tab = ctx.tab, .source = @constCast(source) };
-        docs.root.own(&templateItemCleanup, @ptrCast(t));
-        // Label without the extension, with the type's icon -- the
-        // way Nemo presents templates.
-        const stem = if (std.mem.lastIndexOfScalar(u8, name, '.')) |i| name[0..i] else name;
-        var lz: [300]u8 = undefined;
-        const label = classicmenu.escapeLabel(stem, &lz);
-        var nz: [256:0]u8 = undefined;
-        const n = @min(name.len, nz.len - 1);
-        @memcpy(nz[0..n], name[0..n]);
-        nz[n] = 0;
-        var uncertain: c.gboolean = 0;
-        const ctype = c.g_content_type_guess(&nz, null, 0, &uncertain);
-        if (ctype != null) {
-            defer c.g_free(ctype);
-            if (c.g_content_type_get_icon(ctype)) |gicon| {
-                defer c.g_object_unref(gicon);
-                docs.itemIcon(label, .{ .gicon = @ptrCast(gicon) }, &onTemplateItemActivated, @ptrCast(t));
-                continue;
-            }
-        }
-        docs.item(label, &onTemplateItemActivated, @ptrCast(t));
+        if (!appendTemplateRow(self, ctx, docs, dir, name)) break;
+        added += 1;
     }
-    return count > 0;
+    return added > 0;
 }
 
 /// The local freedesktop Templates directory (XDG special dir with

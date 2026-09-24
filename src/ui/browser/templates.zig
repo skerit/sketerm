@@ -21,7 +21,79 @@ const cast = @import("../../util/cast.zig");
 
 /// Cap on the entries a template menu shows. A Templates directory is
 /// a hand-curated place; a huge one is a mistake, not a use case.
-const MAX_TEMPLATES: usize = 64;
+pub const MAX_TEMPLATES: usize = 64;
+
+/// The names in a host's Templates directory as its daemon last
+/// listed them: what the inline Create New Document rows render
+/// synchronously, for the local host exactly as for a remote one (the
+/// GUI never reads the directory itself). A refresh accumulates into
+/// `pending` and swaps in on the terminator, so a menu opened while a
+/// chunked listing is still landing never shows half a list.
+pub const Cache = struct {
+    names: std.ArrayList([]u8) = .empty,
+    pending: std.ArrayList([]u8) = .empty,
+    /// The host has answered at least once (an empty or refused
+    /// listing counts: it means "no templates", not "unknown").
+    warm: bool = false,
+    /// The in-flight refresh (0 = none).
+    req: u32 = 0,
+
+    pub fn deinit(self: *Cache, allocator: std.mem.Allocator) void {
+        freeNames(allocator, &self.names);
+        freeNames(allocator, &self.pending);
+    }
+
+    fn freeNames(allocator: std.mem.Allocator, list: *std.ArrayList([]u8)) void {
+        for (list.items) |n| allocator.free(n);
+        list.deinit(allocator);
+        list.* = .empty;
+    }
+
+    /// The finished refresh becomes the list, sorted the way the
+    /// menu shows it.
+    fn swapIn(self: *Cache, allocator: std.mem.Allocator) void {
+        freeNames(allocator, &self.names);
+        self.names = self.pending;
+        self.pending = .empty;
+        std.mem.sort([]u8, self.names.items, {}, struct {
+            fn lt(_: void, a: []u8, b: []u8) bool {
+                return std.ascii.lessThanIgnoreCase(a, b);
+            }
+        }.lt);
+        self.warm = true;
+        self.req = 0;
+    }
+};
+
+/// Ask the host for a fresh listing of its Templates directory unless
+/// one is already on its way. Called when the directory becomes known
+/// and again whenever the New menu opens, so an edited Templates
+/// folder shows on the next open.
+pub fn refreshCache(self: *BrowserView, hc: *HostConn) void {
+    const dir = hc.templates_dir orelse return;
+    if (hc.state != .ready or hc.templates_cache.req != 0) return;
+    hc.templates_cache.req = self.nextReq();
+    self.sendOp(hc, .{ .req = hc.templates_cache.req, .op = "list", .path = dir });
+}
+
+/// @return true when the reply was a cache refresh chunk.
+fn feedCache(self: *BrowserView, hc: *HostConn, rep: WireReply) bool {
+    const cache = &hc.templates_cache;
+    if (cache.req == 0 or rep.req != cache.req) return false;
+    if (!rep.ok) {
+        Cache.freeNames(self.allocator, &cache.pending);
+        cache.swapIn(self.allocator);
+        return true;
+    }
+    for (rep.entries) |e| {
+        if (cache.pending.items.len >= MAX_TEMPLATES) break;
+        if (e.name.len == 0 or e.name[0] == '.') continue;
+        const owned = self.allocator.dupe(u8, e.name) catch continue;
+        cache.pending.append(self.allocator, owned) catch self.allocator.free(owned);
+    }
+    if (!rep.more) cache.swapIn(self.allocator);
+    return true;
+}
 
 /// The one in-flight template lookup and the popover it fills. At most
 /// one is open, so this is a single optional rather than a list. The
@@ -106,6 +178,7 @@ pub fn showTemplateMenu(self: *BrowserView, tab: *BTab) void {
 /// The connection's `homedir` reply landed: continue a menu that was
 /// waiting for this host's Templates directory.
 pub fn onHostDirs(self: *BrowserView, hc: *HostConn) void {
+    refreshCache(self, hc);
     const state = &self.templates;
     if (!state.awaiting_dirs or state.hc != hc) return;
     state.awaiting_dirs = false;
@@ -144,6 +217,7 @@ fn setMessage(self: *BrowserView, text: [*:0]const u8) void {
 /// here as onHostDirs.
 /// @return true when the reply was ours.
 pub fn feedTemplates(self: *BrowserView, hc: *HostConn, rep: WireReply) bool {
+    if (feedCache(self, hc, rep)) return true;
     const state = &self.templates;
     if (state.hc != hc) return false;
     if (state.list_req != 0 and state.list_req == rep.req) {
