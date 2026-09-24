@@ -1248,53 +1248,6 @@ pub fn findEntryTags(tab: *BTab, path: []const u8) []const u8 {
     return dir.entries.items[i].tags;
 }
 
-pub fn onMenuTags(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx = cast.userData(MenuCtx, user);
-    const self = ctx.view;
-    const path = ctx.path orelse return menuDone(ctx);
-    const popover = c.gtk_popover_new();
-    const entry = c.gtk_entry_new();
-    c.gtk_entry_set_placeholder_text(@ptrCast(entry), "comma,separated,tags (empty clears)");
-    const cur = findEntryTags(ctx.tab, path);
-    if (cur.len > 0) {
-        var z: [256:0]u8 = undefined;
-        const n = @min(cur.len, z.len - 1);
-        @memcpy(z[0..n], cur[0..n]);
-        z[n] = 0;
-        c.gtk_editable_set_text(@ptrCast(entry), &z);
-    }
-    const tctx = self.allocator.create(MenuCtx) catch return menuDone(ctx);
-    tctx.* = .{
-        .allocator = self.allocator,
-        .view = self,
-        .tab = ctx.tab,
-        .path = self.allocator.dupe(u8, path) catch null,
-        .name = null,
-        .is_dir = ctx.is_dir,
-        .popover = popover,
-        .mode = .tags,
-        .entry = entry,
-    };
-    c.g_object_set_data_full(@ptrCast(popover), "sketerm-menu", @ptrCast(tctx), @ptrCast(&MenuCtx.free));
-    _ = c.g_signal_connect_data(entry, "activate", @ptrCast(&onTagsActivate), @ptrCast(tctx), null, c.G_CONNECT_DEFAULT);
-    c.gtk_popover_set_child(@ptrCast(popover), entry);
-    c.gtk_widget_set_parent(popover, ctx.tab.page);
-    connectPopoverAutoUnparent(popover);
-    c.gtk_popover_popup(@ptrCast(popover));
-    _ = c.gtk_widget_grab_focus(entry);
-    menuDone(ctx);
-}
-
-pub fn onTagsActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
-    const ctx = cast.userData(MenuCtx, user);
-    const self = ctx.view;
-    const path = ctx.path orelse return menuDone(ctx);
-    const txt = c.gtk_editable_get_text(@ptrCast(entry));
-    const tags = std.mem.span(@as([*:0]const u8, @ptrCast(txt)));
-    self.sendOp(ctx.tab.hc, .{ .req = self.nextReq(), .op = "tag_set", .path = path, .to = tags });
-    menuDone(ctx);
-}
-
 pub fn onMenuExportSel(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const ctx = cast.userData(MenuCtx, user);
     const self = ctx.view;
@@ -1510,93 +1463,6 @@ pub fn onEditorRenameDone(
         renamed += 1;
     }
     self.setStatusFmt("editor rename: {d} file(s) renamed", .{renamed});
-}
-
-pub fn onMenuBatchRename(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx = cast.userData(MenuCtx, user);
-    const self = ctx.view;
-    const tab = ctx.tab;
-    const popover = c.gtk_popover_new();
-    const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 4);
-    const find_e = c.gtk_entry_new();
-    c.gtk_entry_set_placeholder_text(@ptrCast(find_e), "find (substring)");
-    const repl_e = c.gtk_entry_new();
-    c.gtk_entry_set_placeholder_text(@ptrCast(repl_e), "replace with");
-    const apply = c.gtk_button_new_with_label("Rename selected");
-    c.gtk_box_append(@ptrCast(box), find_e);
-    c.gtk_box_append(@ptrCast(box), repl_e);
-    c.gtk_box_append(@ptrCast(box), apply);
-    const bctx = self.allocator.create(MenuCtx) catch return menuDone(ctx);
-    bctx.* = .{
-        .allocator = self.allocator,
-        .view = self,
-        .tab = tab,
-        .path = null,
-        .name = null,
-        .is_dir = false,
-        .popover = popover,
-        .entry = find_e,
-        .entry2 = repl_e,
-    };
-    c.g_object_set_data_full(@ptrCast(popover), "sketerm-menu", @ptrCast(bctx), @ptrCast(&MenuCtx.free));
-    _ = c.g_signal_connect_data(apply, "clicked", @ptrCast(&onBatchRenameApply), @ptrCast(bctx), null, c.G_CONNECT_DEFAULT);
-    c.gtk_popover_set_child(@ptrCast(popover), box);
-    c.gtk_widget_set_parent(popover, tab.page);
-    connectPopoverAutoUnparent(popover);
-    c.gtk_popover_popup(@ptrCast(popover));
-    menuDone(ctx);
-}
-
-pub fn onBatchRenameApply(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx = cast.userData(MenuCtx, user);
-    const self = ctx.view;
-    const tab = ctx.tab;
-    if (!tab.hc.io().copy_no_replace) {
-        self.setStatusFmt("batch rename not started: {s} lacks safe no-replace support", .{tab.hc.label()});
-        return menuDone(ctx);
-    }
-    const find_txt = std.mem.span(@as([*:0]const u8, @ptrCast(c.gtk_editable_get_text(@ptrCast(ctx.entry.?)))));
-    const repl_txt = std.mem.span(@as([*:0]const u8, @ptrCast(c.gtk_editable_get_text(@ptrCast(ctx.entry2.?)))));
-    if (find_txt.len == 0 or std.mem.indexOfScalar(u8, repl_txt, '/') != null) {
-        self.setStatus("batch rename: bad pattern");
-        return menuDone(ctx);
-    }
-    var renamed: usize = 0;
-    // The path mirror IS the selection (synced from the model on
-    // every change), so the batch reads it directly. Deepest first:
-    // renaming a selected parent before its selected child would leave
-    // the child's queued path pointing at a directory that moved.
-    const order = oproots.deepestFirst(self.allocator, tab.selected.items) catch {
-        self.setStatus("batch rename not started: out of memory");
-        return menuDone(ctx);
-    };
-    defer self.allocator.free(order);
-    for (order) |sel_index| {
-        const sel_path = tab.selected.items[sel_index];
-        const base = std.fs.path.basename(sel_path);
-        const parent = std.fs.path.dirname(sel_path) orelse continue;
-        // Replace ALL occurrences of `find` in the basename.
-        var nb: [1024]u8 = undefined;
-        var w = std.Io.Writer.fixed(&nb);
-        var rest = base;
-        var changed = false;
-        while (std.mem.indexOf(u8, rest, find_txt)) |i| {
-            w.writeAll(rest[0..i]) catch break;
-            w.writeAll(repl_txt) catch break;
-            rest = rest[i + find_txt.len ..];
-            changed = true;
-        }
-        w.writeAll(rest) catch continue;
-        if (!changed or w.buffered().len == 0) continue;
-        var full: [4096]u8 = undefined;
-        const to = std.fmt.bufPrint(&full, "{s}/{s}", .{
-            if (parent.len == 1) "" else parent, w.buffered(),
-        }) catch continue;
-        if (self.sendOpOk(tab.hc, .{ .req = self.nextReq(), .op = "rename", .path = sel_path, .to = to, .no_replace = true }))
-            renamed += 1;
-    }
-    self.setStatusFmt("batch rename: {d} rename(s) sent", .{renamed});
-    menuDone(ctx);
 }
 
 pub fn setMountXattr(ctx: *MenuCtx, comptime attr: [:0]const u8, comptime okmsg: []const u8) void {
@@ -1870,81 +1736,79 @@ fn onDeleteChosen(user: ?*anyopaque, resp: []const u8) void {
     if (req.paths.len > 1) self.setStatusFmt("deleting {d} items", .{req.paths.len});
 }
 
-/// One-entry popover shared by Rename (target = old full path)
-/// and New Folder (target = null → current dir).
-pub fn entryDialog(self: *BrowserView, tab: *BTab, mode: @TypeOf(@as(MenuCtx, undefined).mode), rename_path: ?[]const u8) void {
-    const popover = c.gtk_popover_new();
-    const entry = c.gtk_entry_new();
-    c.gtk_entry_set_placeholder_text(@ptrCast(entry), switch (mode) {
-        .mkdir => "folder name",
-        .newfile => "file name",
-        else => "new name",
-    });
-    if (rename_path) |rp| {
-        var z: [512:0]u8 = undefined;
-        const base = std.fs.path.basename(rp);
-        const n = @min(base.len, z.len - 1);
-        @memcpy(z[0..n], base[0..n]);
-        z[n] = 0;
-        c.gtk_editable_set_text(@ptrCast(entry), &z);
-        c.gtk_editable_select_region(@ptrCast(entry), 0, -1);
+pub const NewEntryKind = enum { directory, file };
+
+/// Create `name` in the tab's directory, with its undo record queued
+/// against the reply.
+pub fn createEntry(self: *BrowserView, tab: *BTab, kind: NewEntryKind, name: []const u8) void {
+    var buf: [4096]u8 = undefined;
+    const dir = tab.root.path;
+    const path = std.fmt.bufPrint(&buf, "{s}/{s}", .{ if (dir.len == 1) "" else dir, name }) catch return;
+    const req = self.nextReq();
+    switch (kind) {
+        .directory => {
+            self.deferUndo(req, self.makeUndo(tab.hc.host, .rmdir_created, path, "", ""));
+            self.sendOp(tab.hc, .{ .req = req, .op = "mkdir", .path = path });
+        },
+        .file => {
+            self.deferUndo(req, self.makeUndo(tab.hc.host, .delete_created, path, "", ""));
+            self.sendOp(tab.hc, .{ .req = req, .op = "create", .path = path });
+        },
     }
-    const ctx = self.allocator.create(MenuCtx) catch return;
-    ctx.* = .{
-        .allocator = self.allocator,
-        .view = self,
-        .tab = tab,
-        .path = if (rename_path) |rp| (self.allocator.dupe(u8, rp) catch null) else null,
-        .name = null,
-        .is_dir = false,
-        .popover = popover,
-        .mode = mode,
-        .entry = entry,
-    };
-    c.g_object_set_data_full(@ptrCast(popover), "sketerm-menu", @ptrCast(ctx), @ptrCast(&MenuCtx.free));
-    _ = c.g_signal_connect_data(entry, "activate", @ptrCast(&onEntryDialogActivate), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
-    c.gtk_popover_set_child(@ptrCast(popover), entry);
-    c.gtk_widget_set_parent(popover, tab.page);
-    connectPopoverAutoUnparent(popover);
-    c.gtk_popover_popup(@ptrCast(popover));
-    _ = c.gtk_widget_grab_focus(entry);
 }
 
-pub fn onEntryDialogActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
-    const ctx = cast.userData(MenuCtx, user);
-    const self = ctx.view;
-    const txt = c.gtk_editable_get_text(@ptrCast(entry));
-    const name = std.mem.span(@as([*:0]const u8, @ptrCast(txt)));
-    if (name.len == 0 or std.mem.indexOfScalar(u8, name, '/') != null) {
-        self.setStatus("invalid name");
-        return menuDone(ctx);
+/// Replace the entry's tag list (comma-separated; empty clears).
+pub fn setTags(self: *BrowserView, hc: *HostConn, path: []const u8, tags: []const u8) void {
+    self.sendOp(hc, .{ .req = self.nextReq(), .op = "tag_set", .path = path, .to = tags });
+}
+
+/// Replace every occurrence of `find_txt` in each selected entry's
+/// basename. Deepest first: renaming a selected parent before its
+/// selected child would leave the child's queued path pointing at a
+/// directory that moved. Refused with a status line against a daemon
+/// without safe no-replace renames or for an unusable pattern.
+pub fn batchRenameSelected(self: *BrowserView, tab: *BTab, find_txt: []const u8, repl_txt: []const u8) void {
+    if (!tab.hc.io().copy_no_replace) {
+        self.setStatusFmt("batch rename not started: {s} lacks safe no-replace support", .{tab.hc.label()});
+        return;
     }
-    switch (ctx.mode) {
-        .mkdir => {
-            var buf: [4096]u8 = undefined;
-            var w = std.Io.Writer.fixed(&buf);
-            const dir = ctx.tab.root.path;
-            w.print("{s}/{s}", .{ if (dir.len == 1) "" else dir, name }) catch return menuDone(ctx);
-            const req = self.nextReq();
-            self.deferUndo(req, self.makeUndo(ctx.tab.hc.host, .rmdir_created, w.buffered(), "", ""));
-            self.sendOp(ctx.tab.hc, .{ .req = req, .op = "mkdir", .path = w.buffered() });
-        },
-        .newfile => {
-            var buf: [4096]u8 = undefined;
-            var w = std.Io.Writer.fixed(&buf);
-            const dir = ctx.tab.root.path;
-            w.print("{s}/{s}", .{ if (dir.len == 1) "" else dir, name }) catch return menuDone(ctx);
-            const req = self.nextReq();
-            self.deferUndo(req, self.makeUndo(ctx.tab.hc.host, .delete_created, w.buffered(), "", ""));
-            self.sendOp(ctx.tab.hc, .{ .req = req, .op = "create", .path = w.buffered() });
-        },
-        .rename => {
-            const old = ctx.path orelse return menuDone(ctx);
-            commitRename(self, ctx.tab, old, name);
-        },
-        .none, .tags => {},
+    if (find_txt.len == 0 or std.mem.indexOfScalar(u8, repl_txt, '/') != null) {
+        self.setStatus("batch rename: bad pattern");
+        return;
     }
-    menuDone(ctx);
+    var renamed: usize = 0;
+    // The path mirror IS the selection (synced from the model on
+    // every change), so the batch reads it directly.
+    const order = oproots.deepestFirst(self.allocator, tab.selected.items) catch {
+        self.setStatus("batch rename not started: out of memory");
+        return;
+    };
+    defer self.allocator.free(order);
+    for (order) |sel_index| {
+        const sel_path = tab.selected.items[sel_index];
+        const base = std.fs.path.basename(sel_path);
+        const parent = std.fs.path.dirname(sel_path) orelse continue;
+        // Replace ALL occurrences of `find` in the basename.
+        var nb: [1024]u8 = undefined;
+        var w = std.Io.Writer.fixed(&nb);
+        var rest = base;
+        var changed = false;
+        while (std.mem.indexOf(u8, rest, find_txt)) |i| {
+            w.writeAll(rest[0..i]) catch break;
+            w.writeAll(repl_txt) catch break;
+            rest = rest[i + find_txt.len ..];
+            changed = true;
+        }
+        w.writeAll(rest) catch continue;
+        if (!changed or w.buffered().len == 0) continue;
+        var full: [4096]u8 = undefined;
+        const to = std.fmt.bufPrint(&full, "{s}/{s}", .{
+            if (parent.len == 1) "" else parent, w.buffered(),
+        }) catch continue;
+        if (self.sendOpOk(tab.hc, .{ .req = self.nextReq(), .op = "rename", .path = sel_path, .to = to, .no_replace = true }))
+            renamed += 1;
+    }
+    self.setStatusFmt("batch rename: {d} rename(s) sent", .{renamed});
 }
 
 /// Send the rename wire op for `old` → same directory, `name`; with
@@ -2719,10 +2583,6 @@ pub fn dropValueIntoAction(self: *BrowserView, tab: *BTab, value: *c.GValue, dst
 /// cross-host = copy); modifiers override it. Shared by the listing,
 /// the breadcrumb segments and the tab labels.
 /// @return false when the spec is unusable or the drop is a no-op.
-pub fn dropSpecInto(self: *BrowserView, tab: *BTab, spec: []const u8, dst_dir: []const u8) bool {
-    return dropSpecIntoAction(self, tab, spec, dst_dir, .auto);
-}
-
 pub fn dropSpecIntoAction(self: *BrowserView, tab: *BTab, spec: []const u8, dst_dir: []const u8, action: DropAction) bool {
     return dropSpecIntoActionBatch(self, tab, spec, dst_dir, action, 0, 0, null, null);
 }
