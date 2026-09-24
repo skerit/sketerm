@@ -176,6 +176,8 @@ comptime {
     // these modules silently never runs unless the file is referenced
     // here by name. Proven with a deliberately failing canary.
     _ = @import("ui/webface.zig");
+    _ = @import("ui/webface/containers.zig");
+    _ = @import("ui/webface/cookiesync.zig");
     _ = @import("ui/webaction.zig");
     _ = @import("ui/webext.zig");
     _ = @import("ui/webremote.zig");

@@ -12,6 +12,38 @@ libcef needs GTK3 — `ldd libcef.so` shows no GTK at all, in both the
 upstream and the distro build. That claim was wrong and cost a design
 argument; do not repeat it.
 
+## Where the CEF code lives
+
+CEF types are confined to `cefhost.zig` and the modules under `cefhost/`;
+nothing else in `src/web/` sees one. `cefhost.zig` keeps the `View`
+record, the `Host` core (contexts and routes, view create/destroy/revive,
+popups, devtools, print, input, navigation, the outbound `post`/`fanout`
+routing), the static handler set, the render-process half of the
+semantic bridge and the process bootstrap. Feature code moved out
+(2026-09, a pure move) into:
+
+| module | what |
+|---|---|
+| `cefhost/semlayer.zig` | semantic layer, browser-process half (`sem_*`, `onScriptMessage`) |
+| `cefhost/webext.zig` | WebExtensions hosting, `browser.*` bridge, Ports, `chrome-extension://` |
+| `cefhost/webrequest.zig` | blocking webRequest: IO-thread holds + main-thread pump |
+| `cefhost/intercept.zig` | interception, 0x86 net policy, filter-list subscription fetches |
+| `cefhost/cookies.zig` | sitedata + cookie-sync (`CookieJob` and friends) |
+| `cefhost/downloads.zig` | downloads (Host half + download handler) |
+| `cefhost/security.zig` | held cert and permission decisions |
+| `cefhost/usercontent.zig` | userscripts/userstyles injection, GM_* calls |
+| `cefhost/observe.zig` | presenter + observer subscriptions |
+| `cefhost/a11y.zig` | AX tree/location decoding |
+
+The moved `Host` methods are free functions taking `*Host`, and `Host`
+re-exports each one under its old name (`pub const x = host_mod.x;`), so
+`host.cookiesReq(...)` and every call site in `server.zig` stand as
+they were. Add a new method next to its feature, then alias it in
+`Host` if something outside that module calls it. Test blocks in a
+`cefhost/` module are imported by `src/webengine.zig` only (the
+`test-web` root); `dist/test-test-roots.sh` classifies `web/cefhost/*`
+as CEF-only.
+
 ## Startup order is not negotiable
 
 `main.zig` does these in this exact order, and each step exists because
@@ -731,7 +763,7 @@ that did not ask cannot listen. Per REQUEST, a url must satisfy the
 extension's HOST permissions as well as the listener's own
 `RequestFilter`, which is why `Registry.hosts` compiles
 `permissions` + `host_permissions` once. And a CONTENT SCRIPT may not
-register at all — that gate lives in `cefhost.extApiCall`, because only
+register at all — that gate lives in `extApiCall` (`cefhost/webext.zig`), because only
 the engine side knows which frame a call arrived on, and a content script
 runs in a page's main world where the page could reach it.
 
@@ -1004,8 +1036,9 @@ Facts that bound the design, each measured:
   cookies and spare DOMAIN cookies, so "clear this site's cookies"
   would silently leave the `.example.com` ones behind. Visiting with
   `deleteCookie = 1` deletes both and yields an exact removed count.
-- **`CookieJob` and subscription `FilterFetch` are the REALLY refcounted
-  client-side structs in `cefhost.zig`** (everything else is a
+- **`CookieJob` (`cefhost/cookies.zig`) and subscription `FilterFetch`
+  (`cefhost/intercept.zig`) are the REALLY refcounted client-side
+  structs of the helper** (everything else is a
   process-lifetime static with a no-op refcount). `visit_url_cookies`
   TAKES ownership of the visitor
   reference — CEF's CToCpp wrappers transfer, they never add — and may

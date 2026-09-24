@@ -1,10 +1,16 @@
-//! CEF containment: the ONLY file in sketerm-web that sees a CEF type.
+//! CEF containment: this file and the modules under `cefhost/` are the
+//! ONLY code in sketerm-web that sees a CEF type.
 //!
 //! It owns the browser fleet (one windowless browser per protocol view),
 //! turns OnPaint into memfd + `frame_damage`, turns CEF notifications
 //! into protocol events, and turns protocol input frames into trusted
 //! CEF input. Everything crosses the boundary as `protocol.zig` values,
-//! so swapping engines means replacing this file and nothing else.
+//! so swapping engines means replacing this file and `cefhost/` and
+//! nothing else. Feature sections of `Host` (semantic layer, webext,
+//! webRequest, interception, cookies, downloads, prompts, user content,
+//! observers, a11y) live in `cefhost/*.zig` as free functions taking
+//! `*Host`; `Host` re-exports each under its old name. The table is in
+//! src/web/CLAUDE.md ("Where the CEF code lives").
 //!
 //! THREADING: `multi_threaded_message_loop = 0` and
 //! `external_message_pump = 0`, so every callback below arrives on the
