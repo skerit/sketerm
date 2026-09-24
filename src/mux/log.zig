@@ -63,10 +63,6 @@ pub fn init() void {
     if (path) |p| g.fd = openLog(p);
 }
 
-pub fn debugOn() bool {
-    return g.debug_on;
-}
-
 /// Return the append-only descriptor workers intentionally inherit.
 pub fn inheritedFd() c_int {
     return g.fd;

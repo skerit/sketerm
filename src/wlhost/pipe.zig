@@ -181,17 +181,6 @@ pub fn appendPoolUpdate(out: *std.ArrayList(u8), allocator: std.mem.Allocator, p
     try out.appendSlice(allocator, bytes);
 }
 
-/// Deflated pool update; `raw_len` is the inflated size.
-pub fn appendPoolUpdateZ(out: *std.ArrayList(u8), allocator: std.mem.Allocator, pool: u32, offset: u32, raw_len: u32, z: []const u8) !void {
-    var hdr: [header_size + 12]u8 = undefined;
-    Framing.writeHeader(hdr[0..header_size], Tag.pool_update_z, 12 + z.len);
-    std.mem.writeInt(u32, hdr[5..9], pool, .little);
-    std.mem.writeInt(u32, hdr[9..13], offset, .little);
-    std.mem.writeInt(u32, hdr[13..17], raw_len, .little);
-    try out.appendSlice(allocator, &hdr);
-    try out.appendSlice(allocator, z);
-}
-
 /// Codec-tagged pool update. `enc` is the chosen encoding from
 /// pixcodec.encodeRegion; `raw_len` is its decoded size and `row_stride`
 /// the buffer's bytes-per-row (for the predictor's inverse on the GUI).
