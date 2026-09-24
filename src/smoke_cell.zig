@@ -198,42 +198,47 @@ pub fn main() !u8 {
     // unbroken run of lit pixel rows: a gap there is exactly the seam
     // the built-in drawing exists to remove, and it is invisible to
     // every other assertion in this file. The line is found by
-    // scanning for the tallest lit column rather than by computing
-    // where it should be, so grid padding cannot make this pass or
-    // fail for the wrong reason.
+    // scanning for the longest UNBROKEN run of lit pixels in any
+    // column rather than by computing where it should be, so grid
+    // padding cannot make this pass or fail for the wrong reason.
+    // (The first version picked the column with the most lit pixels,
+    // first one winning a tie: a text column whose glyphs happened to
+    // light exactly two cells' worth of rows beat the vertical to it
+    // and read as a "gap", on every commit since the check landed.)
     {
         const ch: usize = atlas.?.cell_h;
         const wu: usize = @intCast(W);
         const hu: usize = @intCast(H);
         // The focus border runs along all four edges.
         const border: usize = 3;
+        var best_run: usize = 0;
         var best_rows: usize = 0;
-        var best_span: usize = 0;
         var x: usize = border;
         while (x < wu - border) : (x += 1) {
             var rows: usize = 0;
-            var first: ?usize = null;
-            var last: usize = 0;
+            var run: usize = 0;
+            var longest: usize = 0;
             var y: usize = border;
             while (y < hu - border) : (y += 1) {
                 const o = (y * wu + x) * 4;
                 const sum: u32 = @as(u32, fb[o]) + fb[o + 1] + fb[o + 2];
-                if (sum <= 260) continue; // background is ~0.05,0.05,0.10
+                if (sum <= 260) { // background is ~0.05,0.05,0.10
+                    run = 0;
+                    continue;
+                }
                 rows += 1;
-                if (first == null) first = y;
-                last = y;
+                run += 1;
+                longest = @max(longest, run);
             }
-            if (rows > best_rows) {
-                best_rows = rows;
-                best_span = if (first) |f| last - f + 1 else 0;
-            }
+            best_run = @max(best_run, longest);
+            best_rows = @max(best_rows, rows);
         }
-        std.debug.print("smoke-cell: tallest lit column rows={d} span={d} (2 cells = {d}px)\n", .{ best_rows, best_span, ch * 2 });
+        std.debug.print("smoke-cell: longest unbroken lit column run={d}, most lit rows in a column={d} (2 cells = {d}px)\n", .{ best_run, best_rows, ch * 2 });
         if (best_rows + 2 < ch * 2) {
             std.debug.print("smoke-cell: FAIL — the stacked box-drawing verticals do not span both cells\n", .{});
             return 27;
         }
-        if (best_span != best_rows) {
+        if (best_run + 2 < ch * 2) {
             std.debug.print("smoke-cell: FAIL — the box-drawing vertical has a gap at the cell boundary\n", .{});
             return 28;
         }
