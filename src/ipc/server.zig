@@ -195,17 +195,17 @@ fn onLine(source: ?*c.GObject, res: ?*c.GAsyncResult, user: ?*anyopaque) callcon
 
 fn handleLine(server: *Server, line: []const u8, out: *std.ArrayList(u8)) void {
     if (line.len == 0 or line.len > protocol.MAX_LINE) {
-        protocol.writeErr(out, server.allocator, "bad request") catch {};
+        protocol.writeErr(out, server.allocator, .invalid_request, "bad request") catch {};
         return;
     }
     var parsed = protocol.parseRequest(server.allocator, line) catch {
-        protocol.writeErr(out, server.allocator, "invalid JSON request") catch {};
+        protocol.writeErr(out, server.allocator, .invalid_request, "invalid JSON request") catch {};
         return;
     };
     defer parsed.deinit();
     server.dispatch(server.dispatch_ctx, parsed.value, out, server.allocator);
     // Dispatch must always answer; guard against a silent fallthrough.
     if (out.items.len == 0) {
-        protocol.writeErr(out, server.allocator, "internal: no response") catch {};
+        protocol.writeErr(out, server.allocator, .failed, "internal: no response") catch {};
     }
 }

@@ -240,31 +240,56 @@ pub fn writeOkFlat(out: *std.ArrayList(u8), allocator: std.mem.Allocator, payloa
     try out.appendSlice(allocator, "}\n");
 }
 
-pub fn writeErr(out: *std.ArrayList(u8), allocator: std.mem.Allocator, msg: []const u8) !void {
+/// Why a request failed: the machine half of every `{"ok":false}` reply,
+/// sent as `error_code` beside the prose `error`. Append-only and never
+/// renamed: a client meets codes newer than itself, and a GUI older
+/// than this vocabulary sends none, so clients keep a text fallback.
+pub const ErrorCode = enum {
+    /// A required argument is missing or malformed.
+    invalid_request,
+    /// The addressed pane, tab, panel, container, token or row does not exist.
+    not_found,
+    /// This GUI does not know the command word.
+    unknown_command,
+    /// The target exists but cannot do this (no daemon session, no editor or web face).
+    unsupported,
+    /// A subsystem the request needs is absent or unreachable right now.
+    unavailable,
+    /// The target's current state refuses the request.
+    conflict,
+    /// The operation ran and failed.
+    failed,
+    /// panel-events-reliable: a nonzero ack came without the epoch it acknowledges.
+    event_epoch_required,
+    /// panel-events-reliable: the epoch is malformed.
+    invalid_event_epoch,
+    /// panel-events-reliable: the panel's event epoch changed; the ack was not applied.
+    event_epoch_mismatch,
+    /// panel-open-session: the request token is malformed.
+    invalid_request_token,
+    /// panel-open-session: the request token was already used for another target.
+    request_token_conflict,
+};
+
+pub fn writeErr(out: *std.ArrayList(u8), allocator: std.mem.Allocator, code: ErrorCode, msg: []const u8) !void {
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
     const w = &aw.writer;
     try w.writeAll("{\"ok\":false,\"error\":");
     try std.json.Stringify.value(msg, .{}, w);
-    try w.writeAll("}\n");
+    try w.writeAll(",\"error_code\":\"");
+    try w.writeAll(@tagName(code));
+    try w.writeAll("\"}\n");
     try out.appendSlice(allocator, aw.written());
 }
 
-pub fn writeErrCode(
-    out: *std.ArrayList(u8),
-    allocator: std.mem.Allocator,
-    code: []const u8,
-    msg: []const u8,
-) !void {
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    defer aw.deinit();
-    const w = &aw.writer;
-    try w.writeAll("{\"ok\":false,\"error\":");
-    try std.json.Stringify.value(msg, .{}, w);
-    try w.writeAll(",\"error_code\":");
-    try std.json.Stringify.value(code, .{}, w);
-    try w.writeAll("}\n");
-    try out.appendSlice(allocator, aw.written());
+/// The `error_code` of a failure reply; null when absent (an older GUI)
+/// or naming a code newer than this build.
+pub fn errorCodeOf(reply: std.json.Value) ?ErrorCode {
+    if (reply != .object) return null;
+    const v = reply.object.get("error_code") orelse return null;
+    if (v != .string) return null;
+    return std.meta.stringToEnum(ErrorCode, v.string);
 }
 
 test "parseRequest: minimal + addressed" {
@@ -352,6 +377,21 @@ test "panel submit event serializes a 4096-byte value without truncation" {
     try std.testing.expectEqualStrings(submitted, event.get("value").?.string);
 }
 
+test "error codes are append-only wire tokens" {
+    // Clients match these spellings; a rename strands every older client,
+    // so the list below may only ever grow at its end.
+    const pinned = [_][]const u8{
+        "invalid_request",       "not_found",           "unknown_command",
+        "unsupported",           "unavailable",         "conflict",
+        "failed",                "event_epoch_required", "invalid_event_epoch",
+        "event_epoch_mismatch",  "invalid_request_token", "request_token_conflict",
+    };
+    const fields = @typeInfo(ErrorCode).@"enum".fields;
+    try std.testing.expect(fields.len >= pinned.len);
+    for (pinned, 0..) |name, i| try std.testing.expectEqualStrings(name, fields[i].name);
+    try std.testing.expect(errorCodeOf(.null) == null);
+}
+
 test "parseRequest: unknown fields ignored, junk rejected" {
     const a = std.testing.allocator;
     var p = try parseRequest(a, "{\"cmd\":\"list\",\"future_field\":42}");
@@ -374,8 +414,11 @@ test "writeOk / writeErr shapes" {
     try std.testing.expectEqualStrings("{\"ok\":true,\"text\":\"hi\\n\"}\n", out.items);
 
     out.clearRetainingCapacity();
-    try writeErr(&out, a, "no such pane");
-    try std.testing.expectEqualStrings("{\"ok\":false,\"error\":\"no such pane\"}\n", out.items);
+    try writeErr(&out, a, .not_found, "no such pane");
+    try std.testing.expectEqualStrings("{\"ok\":false,\"error\":\"no such pane\",\"error_code\":\"not_found\"}\n", out.items);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, out.items, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(ErrorCode.not_found, errorCodeOf(parsed.value).?);
 
     // Round-trip a TabInfo tree through Stringify.
     out.clearRetainingCapacity();

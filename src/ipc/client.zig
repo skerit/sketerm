@@ -7,6 +7,12 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const platform = @import("../util/platform.zig");
 const protocol = @import("protocol.zig");
+const ctlclient = @import("ctlclient.zig");
+const clock = @import("../util/clock.zig");
+
+/// Bound on one command's exchange. Generous: a synchronous attach may
+/// spend a while in SSH, but a wedged GUI must still end the command.
+const CLI_TIMEOUT_MS: i64 = 120_000;
 
 const CLI_HELP =
     \\Usage: sketerm cli [--socket PATH] <command> [options]
@@ -363,11 +369,8 @@ fn watchPane(allocator: std.mem.Allocator, sock_path: [:0]u8, pane: ?u32, sessio
     };
     defer c.g_regex_unref(regex);
 
-    const conn = connectCtl(sock_path) orelse return 1;
-    defer c.g_object_unref(conn);
-    const out_stream = c.g_io_stream_get_output_stream(@ptrCast(conn));
-    const din = c.g_data_input_stream_new(c.g_io_stream_get_input_stream(@ptrCast(conn)));
-    defer c.g_object_unref(din);
+    var conn = connectCtl(sock_path) orelse return 1;
+    defer conn.close(allocator);
 
     const start_us = c.g_get_monotonic_time();
     while (true) {
@@ -381,30 +384,16 @@ fn watchPane(allocator: std.mem.Allocator, sock_path: [:0]u8, pane: ?u32, sessio
             .scrollback = 100,
         };
         std.json.Stringify.value(poll_req, .{}, &aw.writer) catch return 1;
-        aw.writer.writeAll("\n") catch return 1;
-        const line = aw.written();
-        var written: c.gsize = 0;
-        if (c.g_output_stream_write_all(out_stream, line.ptr, line.len, &written, null, &gerr) == 0) {
-            if (gerr != null) c.g_error_free(gerr);
-            _ = c.fprintf(platform.stderr(), "sketerm cli: write failed\n");
-            return 1;
-        }
-        var rlen: c.gsize = 0;
-        const resp = c.g_data_input_stream_read_line(din, &rlen, null, &gerr);
-        if (resp == null) {
-            if (gerr != null) c.g_error_free(gerr);
-            _ = c.fprintf(platform.stderr(), "sketerm cli: connection closed\n");
-            return 1;
-        }
-        defer c.g_free(resp);
+        const resp = exchangeOrReport(allocator, &conn, aw.written()) orelse return 1;
+        defer allocator.free(resp);
 
         const Reply = struct { ok: bool = false, text: []const u8 = "" };
-        const parsed = std.json.parseFromSlice(Reply, allocator, resp[0..rlen], .{
+        const parsed = std.json.parseFromSlice(Reply, allocator, resp, .{
             .ignore_unknown_fields = true,
         }) catch return 1;
         defer parsed.deinit();
         if (!parsed.value.ok) {
-            _ = c.fwrite(resp, 1, rlen, platform.stderr());
+            _ = c.fwrite(resp.ptr, 1, resp.len, platform.stderr());
             _ = c.fputc('\n', platform.stderr());
             return 1;
         }
@@ -439,11 +428,8 @@ fn typeText(allocator: std.mem.Allocator, sock_path: [:0]u8, pane: ?u32, session
     defer allocator.free(sock_path);
     const humantype = @import("../util/humantype.zig");
 
-    const conn = connectCtl(sock_path) orelse return 1;
-    defer c.g_object_unref(conn);
-    const out_stream = c.g_io_stream_get_output_stream(@ptrCast(conn));
-    const din = c.g_data_input_stream_new(c.g_io_stream_get_input_stream(@ptrCast(conn)));
-    defer c.g_object_unref(din);
+    var conn = connectCtl(sock_path) orelse return 1;
+    defer conn.close(allocator);
 
     var seed: u64 = 0;
     {
@@ -469,29 +455,12 @@ fn typeText(allocator: std.mem.Allocator, sock_path: [:0]u8, pane: ?u32, session
         defer aw.deinit();
         const line_req: protocol.Request = .{ .cmd = "send-text", .pane = pane, .session = session, .data = chunk };
         std.json.Stringify.value(line_req, .{}, &aw.writer) catch return 1;
-        aw.writer.writeAll("\n") catch return 1;
-        const line = aw.written();
-
-        var written: c.gsize = 0;
-        var werr: [*c]c.GError = null;
-        if (c.g_output_stream_write_all(out_stream, line.ptr, line.len, &written, null, &werr) == 0) {
-            if (werr != null) c.g_error_free(werr);
-            _ = c.fprintf(platform.stderr(), "sketerm cli: write failed\n");
-            return 1;
-        }
         // One response line per request keeps us in lockstep — and
         // surfaces "no such pane" on the first keystroke, not never.
-        var rlen: c.gsize = 0;
-        var rerr: [*c]c.GError = null;
-        const resp = c.g_data_input_stream_read_line(din, &rlen, null, &rerr);
-        if (resp == null) {
-            if (rerr != null) c.g_error_free(rerr);
-            _ = c.fprintf(platform.stderr(), "sketerm cli: no response\n");
-            return 1;
-        }
-        defer c.g_free(resp);
-        if (std.mem.indexOf(u8, resp[0..rlen], "\"ok\":true") == null) {
-            _ = c.fwrite(resp, 1, rlen, platform.stdout());
+        const resp = exchangeOrReport(allocator, &conn, aw.written()) orelse return 1;
+        defer allocator.free(resp);
+        if (std.mem.indexOf(u8, resp, "\"ok\":true") == null) {
+            _ = c.fwrite(resp.ptr, 1, resp.len, platform.stdout());
             _ = c.fputc('\n', platform.stdout());
             return 1;
         }
@@ -592,36 +561,34 @@ pub fn discoverGuiSocket(allocator: std.mem.Allocator, how: Discover) ?[:0]u8 {
 }
 
 /// Connect to a control socket, reporting a refusal the way every
-/// `sketerm cli` path reports it. Caller unrefs the connection.
-fn connectCtl(sock_path: [:0]const u8) ?*c.GSocketConnection {
-    const client = c.g_socket_client_new();
-    defer c.g_object_unref(client);
-    const addr = c.g_unix_socket_address_new(sock_path.ptr);
-    defer c.g_object_unref(addr);
-    var gerr: [*c]c.GError = null;
-    const conn = c.g_socket_client_connect(client, @ptrCast(@alignCast(addr)), null, &gerr);
-    if (conn == null) {
-        const msg: [*c]const u8 = if (gerr != null) gerr.*.message else "unknown";
-        _ = c.fprintf(platform.stderr(), "sketerm cli: connect failed: %s\n", msg);
-        if (gerr != null) c.g_error_free(gerr);
+/// `sketerm cli` path reports it.
+fn connectCtl(sock_path: [:0]const u8) ?ctlclient.Conn {
+    return ctlclient.Conn.open(sock_path, clock.nowMs() + CLI_TIMEOUT_MS) catch |err| {
+        _ = c.fprintf(platform.stderr(), "sketerm cli: connect failed: %s\n", @errorName(err).ptr);
         return null;
-    }
-    return conn;
+    };
+}
+
+/// One request/reply on an open connection, a failure reported on
+/// stderr. Caller frees the reply.
+fn exchangeOrReport(allocator: std.mem.Allocator, conn: *ctlclient.Conn, line: []const u8) ?[]u8 {
+    return switch (conn.exchange(allocator, line, clock.nowMs() + CLI_TIMEOUT_MS)) {
+        .reply => |reply| reply,
+        .failure => |f| {
+            const what: [*:0]const u8 = switch (f.delivery) {
+                .pre_delivery => "request not sent",
+                .uncertain_delivery => "no response",
+            };
+            _ = c.fprintf(platform.stderr(), "sketerm cli: %s (%s)\n", what, @errorName(f.err).ptr);
+            return null;
+        },
+    };
 }
 
 /// True when a Unix socket path has a listener accepting connections.
 /// A stale file from a crashed instance refuses the connect.
 pub fn socketAlive(path_z: [:0]const u8) bool {
-    const client = c.g_socket_client_new();
-    defer c.g_object_unref(client);
-    const addr = c.g_unix_socket_address_new(path_z.ptr);
-    defer c.g_object_unref(addr);
-    var gerr: [*c]c.GError = null;
-    const conn = c.g_socket_client_connect(client, @ptrCast(@alignCast(addr)), null, &gerr);
-    if (gerr != null) c.g_error_free(gerr);
-    if (conn == null) return false;
-    c.g_object_unref(conn);
-    return true;
+    return ctlclient.alive(path_z);
 }
 
 /// `quiet` = say nothing on success (for user-facing commands like
@@ -634,46 +601,27 @@ fn talk(allocator: std.mem.Allocator, sock_path: [:0]u8, req: protocol.Request, 
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
     std.json.Stringify.value(req, .{}, &aw.writer) catch return 1;
-    aw.writer.writeAll("\n") catch return 1;
-    const line = aw.written();
 
-    var gerr: [*c]c.GError = null;
-    const conn = connectCtl(sock_path) orelse return 1;
-    defer c.g_object_unref(conn);
-
-    const out_stream = c.g_io_stream_get_output_stream(@ptrCast(conn));
-    var written: c.gsize = 0;
-    if (c.g_output_stream_write_all(out_stream, line.ptr, line.len, &written, null, &gerr) == 0) {
-        if (gerr != null) c.g_error_free(gerr);
-        _ = c.fprintf(platform.stderr(), "sketerm cli: write failed\n");
-        return 1;
-    }
-
-    const din = c.g_data_input_stream_new(c.g_io_stream_get_input_stream(@ptrCast(conn)));
-    defer c.g_object_unref(din);
-    var rlen: c.gsize = 0;
-    const resp = c.g_data_input_stream_read_line(din, &rlen, null, &gerr);
-    if (resp == null) {
-        if (gerr != null) c.g_error_free(gerr);
-        _ = c.fprintf(platform.stderr(), "sketerm cli: no response\n");
-        return 1;
-    }
-    defer c.g_free(resp);
+    var conn = connectCtl(sock_path) orelse return 1;
+    defer conn.close(allocator);
+    const resp = exchangeOrReport(allocator, &conn, aw.written()) orelse return 1;
+    defer allocator.free(resp);
+    const rlen = resp.len;
 
     // Exit code mirrors the ok field.
     const Ok = struct { ok: bool = false, @"error": []const u8 = "" };
-    const parsed = std.json.parseFromSlice(Ok, allocator, resp[0..rlen], .{
+    const parsed = std.json.parseFromSlice(Ok, allocator, resp, .{
         .ignore_unknown_fields = true,
     }) catch {
         if (!quiet) {
-            _ = c.fwrite(resp, 1, rlen, platform.stdout());
+            _ = c.fwrite(resp.ptr, 1, rlen, platform.stdout());
             _ = c.fputc('\n', platform.stdout());
         }
         return 1;
     };
     defer parsed.deinit();
     if (!quiet) {
-        _ = c.fwrite(resp, 1, rlen, platform.stdout());
+        _ = c.fwrite(resp.ptr, 1, rlen, platform.stdout());
         _ = c.fputc('\n', platform.stdout());
     } else if (!parsed.value.ok) {
         const msg_z = allocator.dupeZ(u8, parsed.value.@"error") catch return 1;

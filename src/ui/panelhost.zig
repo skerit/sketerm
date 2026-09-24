@@ -676,7 +676,7 @@ pub fn dispatchRelay(
 ) void {
     var parsed = protocol.parseRequest(self.allocator, request) catch |err| {
         const message = if (err == error.LineTooLong) "panel request is too large" else "invalid panel request JSON";
-        return relayError(terminal, request_id, message);
+        return relayError(terminal, request_id, .invalid_request, message);
     };
     defer parsed.deinit();
     if (std.mem.eql(u8, parsed.value.cmd, "panel-open-session")) {
@@ -687,13 +687,13 @@ pub fn dispatchRelay(
                 "invalid panel-open-session request: {s}",
                 .{@errorName(err)},
             ) catch "invalid panel-open-session request";
-            return relayError(terminal, request_id, message);
+            return relayError(terminal, request_id, .invalid_request, message);
         };
         exact.deinit();
     }
-    const remote = terminal.remote orelse return relayError(terminal, request_id, "panel presenter is not attached");
+    const remote = terminal.remote orelse return relayError(terminal, request_id, .unavailable, "panel presenter is not attached");
     const scope = relayScopeForTerminal(terminal) orelse
-        return relayError(terminal, request_id, "panel presenter has no session scope");
+        return relayError(terminal, request_id, .unavailable, "panel presenter has no session scope");
     const relay = Relay{
         .terminal = terminal,
         .scope = scope,
@@ -717,10 +717,10 @@ pub fn dispatchRelay(
     preparePanelOperation(self, terminal, pane, request_id, request, parsed.value, relay, remote.host != null);
 }
 
-fn relayError(terminal: *Terminal, request_id: u64, message: []const u8) void {
+fn relayError(terminal: *Terminal, request_id: u64, code: protocol.ErrorCode, message: []const u8) void {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(terminal.allocator);
-    protocol.writeErr(&out, terminal.allocator, message) catch return;
+    protocol.writeErr(&out, terminal.allocator, code, message) catch return;
     terminal.replyPanelRequest(request_id, out.items);
 }
 
@@ -737,7 +737,7 @@ fn dispatchRelayNow(
     defer out.deinit(self.allocator);
     const outcome = dispatchRequest(self, req, &out, self.allocator, relay, resolver, report) catch {
         out.clearRetainingCapacity();
-        protocol.writeErr(&out, self.allocator, "panel dispatch failed") catch return .complete;
+        protocol.writeErr(&out, self.allocator, .failed, "panel dispatch failed") catch return .complete;
         terminal.replyPanelRequest(request_id, out.items);
         return .complete;
     };
@@ -775,7 +775,7 @@ fn dispatchRequest(
     } else if (eql(u8, req.cmd, "panel-open-session")) {
         return panelOpenSession(out, allocator, req, relay);
     } else {
-        try protocol.writeErr(out, allocator, "unknown panel command");
+        try protocol.writeErr(out, allocator, .unknown_command, "unknown panel command");
     }
     return .complete;
 }
@@ -800,7 +800,7 @@ fn preparePanelOperation(
 ) void {
     if (hydrations.items.len + queued_panel_operations.items.len + panel_tab_jobs.items.len +
         panel_open_session_jobs.items.len >= MAX_PENDING_PANEL_OPERATIONS)
-        return relayError(terminal, request_id, "too many panel operations are pending");
+        return relayError(terminal, request_id, .conflict, "too many panel operations are pending");
     var origin_pending: usize = 0;
     for (hydrations.items) |pending| if (pending.relay_scope == relay.scope) {
         origin_pending += 1;
@@ -812,7 +812,7 @@ fn preparePanelOperation(
         origin_pending += 1;
     };
     if (origin_pending >= MAX_PENDING_PER_ORIGIN)
-        return relayError(terminal, request_id, "too many panel operations are pending for this session");
+        return relayError(terminal, request_id, .conflict, "too many panel operations are pending for this session");
 
     const deadline_ms = @import("../util/clock.zig").nowMs() + assets.HYDRATION_DEADLINE_MS;
     if (origin_pending == 0) {
@@ -822,10 +822,10 @@ fn preparePanelOperation(
     }
 
     const queued = self.allocator.create(QueuedPanelOperation) catch
-        return relayError(terminal, request_id, "out of memory queueing the panel operation");
+        return relayError(terminal, request_id, .failed, "out of memory queueing the panel operation");
     const request_copy = self.allocator.dupe(u8, request) catch {
         self.allocator.destroy(queued);
-        return relayError(terminal, request_id, "out of memory queueing the panel operation");
+        return relayError(terminal, request_id, .failed, "out of memory queueing the panel operation");
     };
     queued.* = .{
         .allocator = self.allocator,
@@ -839,7 +839,7 @@ fn preparePanelOperation(
     };
     queued_panel_operations.append(self.allocator, queued) catch {
         queued.deinit();
-        return relayError(terminal, request_id, "out of memory queueing the panel operation");
+        return relayError(terminal, request_id, .failed, "out of memory queueing the panel operation");
     };
 }
 
@@ -867,28 +867,28 @@ fn preparePanelOperationNow(
     defer if (changed_paths) |*paths| paths.deinit();
 
     if (std.mem.eql(u8, req.cmd, "panel-show")) {
-        const document = req.document orelse return relayError(terminal, request_id, "panel-show requires a document (JSON string)");
+        const document = req.document orelse return relayError(terminal, request_id, .invalid_request, "panel-show requires a document (JSON string)");
         candidate = Doc.Document.parse(self.allocator, document, &diag) catch |err| {
             const message = if (diag.len > 0) diag.msg() else @errorName(err);
-            return relayError(terminal, request_id, message);
+            return relayError(terminal, request_id, .invalid_request, message);
         };
         have_candidate = true;
     } else {
-        const id = req.panel_id orelse return relayError(terminal, request_id, "panel-patch requires panel_id");
-        const patch = req.patch orelse return relayError(terminal, request_id, "panel-patch requires patch (JSON array of ops)");
-        const entry = byId(id, .{ .relay = relay.scope }) orelse return relayError(terminal, request_id, "no such panel");
+        const id = req.panel_id orelse return relayError(terminal, request_id, .invalid_request, "panel-patch requires panel_id");
+        const patch = req.patch orelse return relayError(terminal, request_id, .invalid_request, "panel-patch requires patch (JSON array of ops)");
+        const entry = byId(id, .{ .relay = relay.scope }) orelse return relayError(terminal, request_id, .not_found, "no such panel");
         current_view = entry.view;
         const current = (entry.view.documentJson(self.allocator) catch null) orelse
-            return relayError(terminal, request_id, "panel has no document");
+            return relayError(terminal, request_id, .conflict, "panel has no document");
         defer self.allocator.free(current);
         candidate = Doc.Document.parse(self.allocator, current, &diag) catch |err| {
             const message = if (diag.len > 0) diag.msg() else @errorName(err);
-            return relayError(terminal, request_id, message);
+            return relayError(terminal, request_id, .invalid_request, message);
         };
         have_candidate = true;
         var applied = candidate.applyPatch(patch, &diag) catch |err| {
             const message = if (diag.len > 0) diag.msg() else @errorName(err);
-            return relayError(terminal, request_id, message);
+            return relayError(terminal, request_id, .invalid_request, message);
         };
         changed_paths = assets.collectComponentPaths(self.allocator, &candidate, applied.set) catch |err| {
             applied.deinit();
@@ -896,7 +896,7 @@ fn preparePanelOperationNow(
                 "panel patch resets more than 64 unique image assets"
             else
                 "could not allocate the changed panel asset list";
-            return relayError(terminal, request_id, message);
+            return relayError(terminal, request_id, if (err == error.TooMany) .invalid_request else .failed, message);
         };
         applied.deinit();
     }
@@ -906,7 +906,7 @@ fn preparePanelOperationNow(
             "panel operation references more than 64 unique image assets"
         else
             "could not allocate the panel asset list";
-        return relayError(terminal, request_id, message);
+        return relayError(terminal, request_id, if (err == error.TooMany) .invalid_request else .failed, message);
     };
     defer paths.deinit();
 
@@ -919,7 +919,7 @@ fn preparePanelOperationNow(
         if (changed_paths) |*changed| changed else null,
         current_view,
         &resolver,
-    ) catch return relayError(terminal, request_id, "out of memory preparing panel assets");
+    ) catch return relayError(terminal, request_id, .failed, "out of memory preparing panel assets");
     defer self.allocator.free(plan.flags);
     if (plan.count == 0) {
         // This also handles a zero-image document: replacing with the explicit
@@ -941,7 +941,7 @@ fn preparePanelOperationNow(
         plan.flags,
         plan.count,
         deadline_ms,
-    ) catch return relayError(terminal, request_id, "out of memory preparing panel assets");
+    ) catch return relayError(terminal, request_id, .failed, "out of memory preparing panel assets");
 }
 
 const HydrationPlan = struct {
@@ -1157,12 +1157,12 @@ fn startNextQueuedPanelOperation(scope: *RelayScope) void {
             continue;
         }
         if (@import("../util/clock.zig").nowMs() >= queued.deadline_ms) {
-            relayError(term, queued.request_id, "panel operation expired while waiting for an earlier operation");
+            relayError(term, queued.request_id, .failed, "panel operation expired while waiting for an earlier operation");
             queued.deinit();
             continue;
         }
         var parsed = protocol.parseRequest(queued.allocator, queued.request) catch {
-            relayError(term, queued.request_id, "queued panel request became invalid");
+            relayError(term, queued.request_id, .conflict, "queued panel request became invalid");
             queued.deinit();
             continue;
         };
@@ -1797,12 +1797,12 @@ fn completeHydration(pending: *Hydration) void {
                 asset.bytes,
                 asset.prepared_lease.?,
             ) catch {
-                relayError(term, pending.request_id, "out of memory committing panel asset mappings");
+                relayError(term, pending.request_id, .failed, "out of memory committing panel asset mappings");
                 return;
             };
         } else {
             pending.resolver.addFailure(asset.logical, asset.failure orelse "panel asset hydration failed") catch {
-                relayError(term, pending.request_id, "out of memory committing panel asset failures");
+                relayError(term, pending.request_id, .failed, "out of memory committing panel asset failures");
                 return;
             };
         }
@@ -1819,12 +1819,12 @@ fn completeHydration(pending: *Hydration) void {
         return;
     }
     const report = hydrationReports(pending) catch {
-        relayError(term, pending.request_id, "out of memory reporting panel asset hydration");
+        relayError(term, pending.request_id, .failed, "out of memory reporting panel asset hydration");
         return;
     };
     defer pending.allocator.free(report);
     var parsed = protocol.parseRequest(pending.allocator, pending.request) catch {
-        relayError(term, pending.request_id, "panel request became invalid during hydration");
+        relayError(term, pending.request_id, .conflict, "panel request became invalid during hydration");
         return;
     };
     defer parsed.deinit();
@@ -1936,10 +1936,10 @@ fn diagErr(
     err: anyerror,
 ) !void {
     const msg = diag.msg();
-    if (msg.len > 0) return protocol.writeErr(out, allocator, msg);
+    if (msg.len > 0) return protocol.writeErr(out, allocator, .invalid_request, msg);
     var buf: [64]u8 = undefined;
     const fallback = std.fmt.bufPrint(&buf, "panel rejected: {s}", .{@errorName(err)}) catch "panel rejected";
-    return protocol.writeErr(out, allocator, fallback);
+    return protocol.writeErr(out, allocator, .invalid_request, fallback);
 }
 
 /// Give up on a half-built panel: free the entry and the view it
@@ -1965,23 +1965,23 @@ fn panelOpenSession(
     relay: ?Relay,
 ) !DispatchOutcome {
     const source = relay orelse {
-        try protocol.writeErr(out, allocator, "panel-open-session is relay-only and cannot use a direct GUI socket");
+        try protocol.writeErr(out, allocator, .unsupported, "panel-open-session is relay-only and cannot use a direct GUI socket");
         return .complete;
     };
     const target_session = req.mux_session orelse {
-        try protocol.writeErr(out, allocator, "panel-open-session requires mux_session");
+        try protocol.writeErr(out, allocator, .invalid_request, "panel-open-session requires mux_session");
         return .complete;
     };
     const target_origin_id = req.mux_origin_id orelse {
-        try protocol.writeErr(out, allocator, "panel-open-session requires mux_origin_id");
+        try protocol.writeErr(out, allocator, .invalid_request, "panel-open-session requires mux_origin_id");
         return .complete;
     };
     const request_token = req.request_token orelse {
-        try protocol.writeErr(out, allocator, "panel-open-session requires request_token");
+        try protocol.writeErr(out, allocator, .invalid_request, "panel-open-session requires request_token");
         return .complete;
     };
     if (!panelrpc.validRequestToken(request_token)) {
-        try protocol.writeErrCode(out, allocator, "invalid_request_token", "panel-open-session request_token is invalid");
+        try protocol.writeErr(out, allocator, .invalid_request_token, "panel-open-session request_token is invalid");
         return .complete;
     }
 
@@ -1989,10 +1989,10 @@ fn panelOpenSession(
         if (!std.mem.eql(u8, existing.target_session, target_session) or
             !std.mem.eql(u8, &existing.target_origin_id, target_origin_id))
         {
-            try protocol.writeErrCode(
+            try protocol.writeErr(
                 out,
                 allocator,
-                "request_token_conflict",
+                .request_token_conflict,
                 "panel-open-session request_token was already used for a different target",
             );
             return .complete;
@@ -2002,7 +2002,7 @@ fn panelOpenSession(
             return .complete;
         }
         addOpenSessionWaiter(existing, source) catch {
-            try protocol.writeErr(out, allocator, "too many retries are waiting for this panel-open-session request");
+            try protocol.writeErr(out, allocator, .conflict, "too many retries are waiting for this panel-open-session request");
             return .complete;
         };
         return .pending;
@@ -2012,7 +2012,7 @@ fn panelOpenSession(
         var buf: [160]u8 = undefined;
         const message = std.fmt.bufPrint(&buf, "panel-open-session could not reserve request_token: {s}", .{@errorName(err)}) catch
             "panel-open-session could not reserve request_token";
-        try protocol.writeErr(out, allocator, message);
+        try protocol.writeErr(out, allocator, .failed, message);
         return .complete;
     };
     addOpenSessionWaiter(token, source) catch |err| {
@@ -2020,14 +2020,14 @@ fn panelOpenSession(
         var buf: [160]u8 = undefined;
         const message = std.fmt.bufPrint(&buf, "panel-open-session could not reserve reply waiter: {s}", .{@errorName(err)}) catch
             "panel-open-session could not reserve reply waiter";
-        try protocol.writeErr(out, allocator, message);
+        try protocol.writeErr(out, allocator, .failed, message);
         return .complete;
     };
     startPanelOpenSession(source, token, target_session, target_origin_id) catch |err| {
         var buf: [160]u8 = undefined;
         const message = std.fmt.bufPrint(&buf, "panel-open-session could not start: {s}", .{@errorName(err)}) catch
             "panel-open-session could not start";
-        try protocol.writeErr(out, allocator, message);
+        try protocol.writeErr(out, allocator, .failed, message);
         token.waiters.clearRetainingCapacity();
         cacheOpenSessionReply(source.scope, token, out.items) catch
             removeOpenSessionToken(source.scope, token);
@@ -2120,7 +2120,7 @@ fn openSessionWaiterTerminal(scope: *RelayScope, waiter: OpenSessionWaiter) ?*Te
 fn completeOpenSessionToken(scope: *RelayScope, token: *OpenSessionToken, reply: []const u8) void {
     cacheOpenSessionReply(scope, token, reply) catch {
         for (token.waiters.items) |waiter| if (openSessionWaiterTerminal(scope, waiter)) |terminal| {
-            relayError(terminal, waiter.request_id, "panel-open-session could not cache its completed reply");
+            relayError(terminal, waiter.request_id, .failed, "panel-open-session could not cache its completed reply");
         };
         removeOpenSessionToken(scope, token);
         return;
@@ -2261,15 +2261,15 @@ fn panelOpenSessionDone(user: ?*anyopaque) callconv(.c) c.gboolean {
         releaseRelayScopeIfIdle(scope);
     }
     const source = panelOpenSessionCommitSource(job) orelse {
-        finishOpenSessionError(job, "panel-open-session source scope is no longer available");
+        finishOpenSessionError(job, .unavailable, "panel-open-session source scope is no longer available");
         return 0;
     };
     if (job.conn == null or job.snapshot == null) {
-        finishOpenSessionError(job, job.failureMessage());
+        finishOpenSessionError(job, .failed, job.failureMessage());
         return 0;
     }
     if (@import("../util/clock.zig").nowMs() >= job.deadline_ms) {
-        finishOpenSessionError(job, "panel-open-session deadline exceeded");
+        finishOpenSessionError(job, .failed, "panel-open-session deadline exceeded");
         return 0;
     }
 
@@ -2290,11 +2290,11 @@ fn panelOpenSessionDone(user: ?*anyopaque) callconv(.c) c.gboolean {
         var buf: [160]u8 = undefined;
         const message = std.fmt.bufPrint(&buf, "panel-open-session tab commit failed: {s}", .{@errorName(err)}) catch
             "panel-open-session tab commit failed";
-        finishOpenSessionError(job, message);
+        finishOpenSessionError(job, .failed, message);
         return 0;
     };
     const target = attached.pane.terminal.remote orelse {
-        finishOpenSessionError(job, "panel-open-session target has no mux identity");
+        finishOpenSessionError(job, .unsupported, "panel-open-session target has no mux identity");
         return 0;
     };
 
@@ -2308,17 +2308,17 @@ fn panelOpenSessionDone(user: ?*anyopaque) callconv(.c) c.gboolean {
     }) catch {
         // The token must always resolve; a stuck-pending token would make
         // every retry of this idempotent request permanently unanswerable.
-        finishOpenSessionError(job, "panel-open-session reply could not be rendered");
+        finishOpenSessionError(job, .failed, "panel-open-session reply could not be rendered");
         return 0;
     };
     completeOpenSessionToken(job.scope, job.token, out.items);
     return 0;
 }
 
-fn finishOpenSessionError(job: *PanelOpenSessionJob, message: []const u8) void {
+fn finishOpenSessionError(job: *PanelOpenSessionJob, code: protocol.ErrorCode, message: []const u8) void {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(job.allocator);
-    protocol.writeErr(&out, job.allocator, message) catch return;
+    protocol.writeErr(&out, job.allocator, code, message) catch return;
     completeOpenSessionToken(job.scope, job.token, out.items);
 }
 
@@ -2519,11 +2519,11 @@ fn panelTabDone(user: ?*anyopaque) callconv(.c) c.gboolean {
     const terminal = panelTabCommitTerminal(job) orelse return 0;
     const remote = terminal.remote.?;
     if (job.conn == null or job.snapshot == null) {
-        relayError(terminal, job.request_id, job.failure);
+        relayError(terminal, job.request_id, .failed, job.failure);
         return 0;
     }
     if (@import("../util/clock.zig").nowMs() >= job.deadline_ms) {
-        relayError(terminal, job.request_id, "panel tab setup deadline exceeded");
+        relayError(terminal, job.request_id, .failed, "panel tab setup deadline exceeded");
         return 0;
     }
 
@@ -2549,7 +2549,7 @@ fn panelTabDone(user: ?*anyopaque) callconv(.c) c.gboolean {
         var msg_buf: [160]u8 = undefined;
         const message = std.fmt.bufPrint(&msg_buf, "panel tab pane setup failed: {s}", .{@errorName(err)}) catch
             "panel tab pane setup failed";
-        relayError(terminal, job.request_id, message);
+        relayError(terminal, job.request_id, .failed, message);
         return 0;
     };
     pane.terminal.markLocalEcho();
@@ -2557,7 +2557,7 @@ fn panelTabDone(user: ?*anyopaque) callconv(.c) c.gboolean {
     const reports = if (job.report_assets)
         job.resolver.reports(host.allocator) catch {
             host.unlistPane(pane);
-            relayError(terminal, job.request_id, "out of memory reporting panel asset hydration");
+            relayError(terminal, job.request_id, .failed, "out of memory reporting panel asset hydration");
             return 0;
         }
     else
@@ -2579,7 +2579,7 @@ fn panelTabDone(user: ?*anyopaque) callconv(.c) c.gboolean {
     ) catch |err| {
         host.unlistPane(pane);
         const message = if (diag.len > 0) diag.msg() else @errorName(err);
-        relayError(terminal, job.request_id, message);
+        relayError(terminal, job.request_id, .invalid_request, message);
         return 0;
     };
 
@@ -2648,19 +2648,19 @@ fn panelShow(
     report: ?[]const assets.Report,
 ) !DispatchOutcome {
     const name = req.name orelse {
-        try protocol.writeErr(out, allocator, "panel-show requires a name");
+        try protocol.writeErr(out, allocator, .invalid_request, "panel-show requires a name");
         return .complete;
     };
     if (name.len == 0 or name.len > 128) {
-        try protocol.writeErr(out, allocator, "panel name must be 1..128 bytes");
+        try protocol.writeErr(out, allocator, .invalid_request, "panel name must be 1..128 bytes");
         return .complete;
     }
     const document = req.document orelse {
-        try protocol.writeErr(out, allocator, "panel-show requires a document (JSON string)");
+        try protocol.writeErr(out, allocator, .invalid_request, "panel-show requires a document (JSON string)");
         return .complete;
     };
     const target = Target.fromName(req.target) orelse {
-        try protocol.writeErr(out, allocator, "target must be \"pane\", \"tab\" or \"window\"");
+        try protocol.writeErr(out, allocator, .invalid_request, "target must be \"pane\", \"tab\" or \"window\"");
         return .complete;
     };
 
@@ -2686,7 +2686,7 @@ fn panelShow(
             var msg_buf: [160]u8 = undefined;
             const msg = std.fmt.bufPrint(&msg_buf, "panel tab setup could not start: {s}", .{@errorName(err)}) catch
                 "panel tab setup could not start";
-            try protocol.writeErr(out, allocator, msg);
+            try protocol.writeErr(out, allocator, .failed, msg);
             return .complete;
         };
         return .pending;
@@ -2962,11 +2962,11 @@ fn panelPatch(
     report: ?[]const assets.Report,
 ) !void {
     const id = req.panel_id orelse
-        return protocol.writeErr(out, allocator, "panel-patch requires panel_id");
+        return protocol.writeErr(out, allocator, .invalid_request, "panel-patch requires panel_id");
     const patch = req.patch orelse
-        return protocol.writeErr(out, allocator, "panel-patch requires patch (JSON array of ops)");
+        return protocol.writeErr(out, allocator, .invalid_request, "panel-patch requires patch (JSON array of ops)");
     const entry = byRequestId(self, req, id, scope) orelse
-        return protocol.writeErr(out, allocator, "no such panel");
+        return protocol.writeErr(out, allocator, .not_found, "no such panel");
     var diag = Doc.Diag{};
     var direct_changed_paths: ?assets.Paths = null;
     var direct_resolver: ?assets.Resolver = null;
@@ -2979,7 +2979,7 @@ fn panelPatch(
         .relay => false,
     }) {
         const current = (entry.view.documentJson(allocator) catch null) orelse
-            return protocol.writeErr(out, allocator, "panel has no document");
+            return protocol.writeErr(out, allocator, .conflict, "panel has no document");
         defer allocator.free(current);
         var candidate = Doc.Document.parse(allocator, current, &diag) catch |err|
             return diagErr(out, allocator, &diag, err);
@@ -3012,9 +3012,9 @@ fn panelPatch(
             error.AssetOriginUnavailable => return protocol.writeErr(
                 out,
                 allocator,
-                "panel asset origin is no longer available; new image sources cannot be hydrated and the patch was not committed",
+                .unavailable, "panel asset origin is no longer available; new image sources cannot be hydrated and the patch was not committed",
             ),
-            else => return protocol.writeErr(out, allocator, "out of memory composing the direct panel asset transaction"),
+            else => return protocol.writeErr(out, allocator, .failed, "out of memory composing the direct panel asset transaction"),
         };
     }
     if (resolver) |prepared|
@@ -3056,11 +3056,11 @@ fn panelGet(
     scope: Scope,
 ) !void {
     const id = req.panel_id orelse
-        return protocol.writeErr(out, allocator, "panel-get requires panel_id");
+        return protocol.writeErr(out, allocator, .invalid_request, "panel-get requires panel_id");
     const entry = byRequestId(self, req, id, scope) orelse
-        return protocol.writeErr(out, allocator, "no such panel");
+        return protocol.writeErr(out, allocator, .not_found, "no such panel");
     const json = (entry.view.documentJson(allocator) catch null) orelse
-        return protocol.writeErr(out, allocator, "panel has no document");
+        return protocol.writeErr(out, allocator, .conflict, "panel has no document");
     defer allocator.free(json);
     try protocol.writeOkFlat(out, allocator, .{
         .document = json,
@@ -3082,23 +3082,23 @@ fn panelEvents(
     reliable: bool,
 ) !void {
     const id = req.panel_id orelse
-        return protocol.writeErr(out, allocator, if (reliable)
+        return protocol.writeErr(out, allocator, .invalid_request, if (reliable)
             "panel-events-reliable requires panel_id"
         else
             "panel-events requires panel_id");
     const entry = byRequestId(self, req, id, scope) orelse
-        return protocol.writeErr(out, allocator, "no such panel");
+        return protocol.writeErr(out, allocator, .not_found, "no such panel");
     if (reliable) panelrpc.validateReliableEventsRequest(
         req.ack,
         req.event_epoch,
         &entry.event_epoch,
-    ) catch |err| return protocol.writeErrCode(
+    ) catch |err| return protocol.writeErr(
         out,
         allocator,
         switch (err) {
-            error.MissingEventEpoch => "event_epoch_required",
-            error.InvalidEventEpoch => "invalid_event_epoch",
-            error.EventEpochMismatch => "event_epoch_mismatch",
+            error.MissingEventEpoch => .event_epoch_required,
+            error.InvalidEventEpoch => .invalid_event_epoch,
+            error.EventEpochMismatch => .event_epoch_mismatch,
         },
         switch (err) {
             error.MissingEventEpoch => "panel-events-reliable requires event_epoch when ack is nonzero",
@@ -3226,9 +3226,9 @@ fn panelClose(
     scope: Scope,
 ) !void {
     const id = req.panel_id orelse
-        return protocol.writeErr(out, allocator, "panel-close requires panel_id");
+        return protocol.writeErr(out, allocator, .invalid_request, "panel-close requires panel_id");
     const entry = byRequestId(self, req, id, scope) orelse
-        return protocol.writeErr(out, allocator, "no such panel");
+        return protocol.writeErr(out, allocator, .not_found, "no such panel");
     closeEntry(self, entry);
     try protocol.writeOkFlat(out, allocator, .{});
 }

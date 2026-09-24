@@ -526,7 +526,7 @@ pub fn ipcDispatchTrampoline(ctx: *anyopaque, req: ipc_protocol.Request, out: *s
         out.clearRetainingCapacity();
         var msg_buf: [128]u8 = undefined;
         const msg = std.fmt.bufPrint(&msg_buf, "internal error: {s}", .{@errorName(err)}) catch "internal error";
-        ipc_protocol.writeErr(out, allocator, msg) catch {};
+        ipc_protocol.writeErr(out, allocator, .failed, msg) catch {};
     };
 }
 
@@ -548,14 +548,14 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
     if (eql(u8, req.cmd, "list")) {
         try ipcList(self, out, allocator);
     } else if (eql(u8, req.cmd, "send-text")) {
-        const data = req.data orelse return ipc_protocol.writeErr(out, allocator, "send-text requires data");
-        const pane = reqPane(self, req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
+        const data = req.data orelse return ipc_protocol.writeErr(out, allocator, .invalid_request, "send-text requires data");
+        const pane = reqPane(self, req) orelse return ipc_protocol.writeErr(out, allocator, .not_found, "no such pane");
         // An editor-visible pane receives text into its document (at
         // every caret), not into the hidden shell underneath.
         if (pane.editorFaceVisible()) {
             if (@import("editorview.zig").EditorView.fromPane(pane)) |ev| {
                 if (!ev.ipcInsertText(data))
-                    return ipc_protocol.writeErr(out, allocator, "editor has no open document");
+                    return ipc_protocol.writeErr(out, allocator, .conflict, "editor has no open document");
                 return ipc_protocol.writeOk(out, allocator, null, {});
             }
         }
@@ -565,28 +565,28 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
             pane.terminal.writeUserInput(data);
         try ipc_protocol.writeOk(out, allocator, null, {});
     } else if (eql(u8, req.cmd, "send-keys")) {
-        const data = req.data orelse return ipc_protocol.writeErr(out, allocator, "send-keys requires data (chords like \"ctrl+c up enter\")");
-        const pane = reqPane(self, req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
+        const data = req.data orelse return ipc_protocol.writeErr(out, allocator, .invalid_request, "send-keys requires data (chords like \"ctrl+c up enter\")");
+        const pane = reqPane(self, req) orelse return ipc_protocol.writeErr(out, allocator, .not_found, "no such pane");
         // Editor-visible pane: a small editor chord set (enter, tab,
         // backspace, delete, escape, ctrl+s, ctrl+z, ctrl+y) instead
         // of PTY byte encoding.
         if (pane.editorFaceVisible()) {
             if (@import("editorview.zig").EditorView.fromPane(pane)) |ev| {
                 if (!ev.ipcSendKeys(data))
-                    return ipc_protocol.writeErr(out, allocator, "unsupported editor chord (supported: enter tab backspace delete escape ctrl+s ctrl+z ctrl+y)");
+                    return ipc_protocol.writeErr(out, allocator, .unsupported, "unsupported editor chord (supported: enter tab backspace delete escape ctrl+s ctrl+z ctrl+y)");
                 return ipc_protocol.writeOk(out, allocator, null, {});
             }
         }
         var bytes: std.ArrayList(u8) = .empty;
         defer bytes.deinit(allocator);
         @import("../ipc/keys.zig").encode(&bytes, allocator, data, pane.terminal.screen.app_cursor_keys) catch |err| switch (err) {
-            error.UnknownKey => return ipc_protocol.writeErr(out, allocator, "unknown key chord"),
+            error.UnknownKey => return ipc_protocol.writeErr(out, allocator, .invalid_request, "unknown key chord"),
             error.OutOfMemory => return err,
         };
         pane.terminal.writeUserInput(bytes.items);
         try ipc_protocol.writeOk(out, allocator, null, {});
     } else if (eql(u8, req.cmd, "screen-info")) {
-        const pane = reqPane(self, req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
+        const pane = reqPane(self, req) orelse return ipc_protocol.writeErr(out, allocator, .not_found, "no such pane");
         const scr = pane.terminal.screen;
         try ipc_protocol.writeOk(out, allocator, "screen", .{
             .rows = scr.rows,
@@ -602,25 +602,25 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
         });
     } else if (eql(u8, req.cmd, "editor-atlas-stats")) {
         if (c.getenv("SKETERM_VERIFY_EDITOR_ATLAS_GL") == null)
-            return ipc_protocol.writeErr(out, allocator, "editor atlas verification is not enabled");
-        const pane = reqPane(self, req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
+            return ipc_protocol.writeErr(out, allocator, .unavailable, "editor atlas verification is not enabled");
+        const pane = reqPane(self, req) orelse return ipc_protocol.writeErr(out, allocator, .not_found, "no such pane");
         const view = @import("editorview.zig").EditorView.fromPane(pane) orelse
-            return ipc_protocol.writeErr(out, allocator, "pane has no editor face");
+            return ipc_protocol.writeErr(out, allocator, .unsupported, "pane has no editor face");
         try ipc_protocol.writeOk(out, allocator, "atlas", view.atlasTextureStats());
     } else if (eql(u8, req.cmd, "editor-atlas-fail-next")) {
         if (c.getenv("SKETERM_VERIFY_EDITOR_ATLAS_GL") == null)
-            return ipc_protocol.writeErr(out, allocator, "editor atlas verification is not enabled");
-        const pane = reqPane(self, req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
+            return ipc_protocol.writeErr(out, allocator, .unavailable, "editor atlas verification is not enabled");
+        const pane = reqPane(self, req) orelse return ipc_protocol.writeErr(out, allocator, .not_found, "no such pane");
         const view = @import("editorview.zig").EditorView.fromPane(pane) orelse
-            return ipc_protocol.writeErr(out, allocator, "pane has no editor face");
+            return ipc_protocol.writeErr(out, allocator, .unsupported, "pane has no editor face");
         view.failNextAtlasRebuildForTest();
         try ipc_protocol.writeOk(out, allocator, null, {});
     } else if (eql(u8, req.cmd, "editor-atlas-break-next")) {
         if (c.getenv("SKETERM_VERIFY_EDITOR_ATLAS_GL") == null)
-            return ipc_protocol.writeErr(out, allocator, "editor atlas verification is not enabled");
-        const pane = reqPane(self, req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
+            return ipc_protocol.writeErr(out, allocator, .unavailable, "editor atlas verification is not enabled");
+        const pane = reqPane(self, req) orelse return ipc_protocol.writeErr(out, allocator, .not_found, "no such pane");
         const view = @import("editorview.zig").EditorView.fromPane(pane) orelse
-            return ipc_protocol.writeErr(out, allocator, "pane has no editor face");
+            return ipc_protocol.writeErr(out, allocator, .unsupported, "pane has no editor face");
         view.breakNextAtlasReleaseForTest();
         try ipc_protocol.writeOk(out, allocator, null, {});
     } else if (eql(u8, req.cmd, "editor-lang")) {
@@ -628,11 +628,11 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
         // effective indentation and its source, comment tokens), plus
         // the highlight kind and bracket pair at the byte offset in
         // `data` when one is given.
-        const pane = reqPane(self, req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
+        const pane = reqPane(self, req) orelse return ipc_protocol.writeErr(out, allocator, .not_found, "no such pane");
         const view = @import("editorview.zig").EditorView.fromPane(pane) orelse
-            return ipc_protocol.writeErr(out, allocator, "pane has no editor face");
+            return ipc_protocol.writeErr(out, allocator, .unsupported, "pane has no editor face");
         const info = @import("editorlang.zig").inspect(view, req.data) orelse
-            return ipc_protocol.writeErr(out, allocator, "editor has no loaded document");
+            return ipc_protocol.writeErr(out, allocator, .conflict, "editor has no loaded document");
         try ipc_protocol.writeOk(out, allocator, "lang", info);
     } else if (eql(u8, req.cmd, "im-probe")) {
         // Debug hook: push hardware keycodes (GDK code = evdev + 8,
@@ -642,9 +642,9 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
         // "does this face still compose dead keys?" — the answer
         // differs per face and per compositor, and it is invisible to
         // send-text/send-keys, which bypass the IM entirely.
-        const data = req.data orelse return ipc_protocol.writeErr(out, allocator, "im-probe requires data (comma-separated hardware keycodes)");
+        const data = req.data orelse return ipc_protocol.writeErr(out, allocator, .invalid_request, "im-probe requires data (comma-separated hardware keycodes)");
         const im = @import("imhost.zig").focusedHost(null) orelse
-            return ipc_protocol.writeErr(out, allocator, "no focused face with an IM context");
+            return ipc_protocol.writeErr(out, allocator, .unavailable, "no focused face with an IM context");
         im.probeReset();
         var consumed_all = true;
         var it = std.mem.splitScalar(u8, data, ',');
@@ -652,7 +652,7 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
             const t = std.mem.trim(u8, tok, " \t");
             if (t.len == 0) continue;
             const hw = std.fmt.parseInt(u32, t, 10) catch
-                return ipc_protocol.writeErr(out, allocator, "im-probe keycodes must be decimal");
+                return ipc_protocol.writeErr(out, allocator, .invalid_request, "im-probe keycodes must be decimal");
             if (!im.probeFeed(hw)) consumed_all = false;
         }
         try ipc_protocol.writeOk(out, allocator, "im", .{
@@ -663,8 +663,8 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
         });
         im.probeReset();
     } else if (eql(u8, req.cmd, "screenshot")) {
-        const path = req.data orelse return ipc_protocol.writeErr(out, allocator, "screenshot requires data (output .png path)");
-        const pane = reqPane(self, req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
+        const path = req.data orelse return ipc_protocol.writeErr(out, allocator, .invalid_request, "screenshot requires data (output .png path)");
+        const pane = reqPane(self, req) orelse return ipc_protocol.writeErr(out, allocator, .not_found, "no such pane");
         // A pane showing a web page must be photographed as the PAGE:
         // the terminal surface underneath it is the hidden shell.
         const bytes = blk: {
@@ -674,7 +674,7 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
                 }
             }
             break :blk pane.screenshotPng() orelse
-                return ipc_protocol.writeErr(out, allocator, "screenshot failed (pane not mapped/realized yet)");
+                return ipc_protocol.writeErr(out, allocator, .failed, "screenshot failed (pane not mapped/realized yet)");
         };
         defer c.g_bytes_unref(bytes);
         var sz: c.gsize = 0;
@@ -685,6 +685,7 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
             return ipc_protocol.writeErr(
                 out,
                 allocator,
+                .failed,
                 std.fmt.bufPrint(&msg, "cannot save screenshot: {s}", .{@errorName(err)}) catch
                     "cannot save screenshot",
             );
@@ -693,25 +694,25 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
     } else if (eql(u8, req.cmd, "record-start")) {
         // The daemon writes the file (on ITS host); the OK here
         // acknowledges the request, not the daemon's ack.
-        const path = req.data orelse return ipc_protocol.writeErr(out, allocator, "record-start requires data (output .cast path)");
-        if (path.len == 0 or path[0] != '/') return ipc_protocol.writeErr(out, allocator, "record-start path must be absolute");
-        const pane = reqPane(self, req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
-        if (pane.terminal.remote == null) return ipc_protocol.writeErr(out, allocator, "pane has no daemon session");
+        const path = req.data orelse return ipc_protocol.writeErr(out, allocator, .invalid_request, "record-start requires data (output .cast path)");
+        if (path.len == 0 or path[0] != '/') return ipc_protocol.writeErr(out, allocator, .invalid_request, "record-start path must be absolute");
+        const pane = reqPane(self, req) orelse return ipc_protocol.writeErr(out, allocator, .not_found, "no such pane");
+        if (pane.terminal.remote == null) return ipc_protocol.writeErr(out, allocator, .unsupported, "pane has no daemon session");
         pane.terminal.requestRecordStart(path);
         try ipc_protocol.writeOk(out, allocator, "record", .{ .path = path, .recording = true });
     } else if (eql(u8, req.cmd, "record-stop")) {
-        const pane = reqPane(self, req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
-        if (pane.terminal.remote == null) return ipc_protocol.writeErr(out, allocator, "pane has no daemon session");
+        const pane = reqPane(self, req) orelse return ipc_protocol.writeErr(out, allocator, .not_found, "no such pane");
+        if (pane.terminal.remote == null) return ipc_protocol.writeErr(out, allocator, .unsupported, "pane has no daemon session");
         pane.terminal.requestRecordStop();
         try ipc_protocol.writeOk(out, allocator, "record", .{ .recording = false });
     } else if (eql(u8, req.cmd, "get-text")) {
-        const pane = reqPane(self, req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
+        const pane = reqPane(self, req) orelse return ipc_protocol.writeErr(out, allocator, .not_found, "no such pane");
         // An editor-visible pane answers with its DOCUMENT: the shell
         // grid underneath is not what the caller is looking at.
         if (pane.editorFaceVisible()) {
             if (@import("editorview.zig").EditorView.fromPane(pane)) |ev| {
                 const doc_text = ev.ipcGetText(allocator) orelse
-                    return ipc_protocol.writeErr(out, allocator, "editor has no open document");
+                    return ipc_protocol.writeErr(out, allocator, .conflict, "editor has no open document");
                 defer allocator.free(doc_text);
                 return ipc_protocol.writeOk(out, allocator, "text", doc_text);
             }
@@ -721,7 +722,7 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
             // A completed zone with no output (e.g. `true`) is
             // still an answer — its exit code matters.
             if (screen.last_output_start_id == 0 or screen.last_output_end_id == 0)
-                return ipc_protocol.writeErr(out, allocator, "no completed command zone (shell integration not active?)");
+                return ipc_protocol.writeErr(out, allocator, .not_found, "no completed command zone (shell integration not active?)");
             const text = (try screen.extractLastCommandOutput(allocator)) orelse
                 try allocator.dupe(u8, "");
             defer allocator.free(text);
@@ -765,7 +766,7 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
         // window and starts at its host-qualified location. No
         // address = the window in front, like new-tab.
         const origin: ?*Pane = if (req.pane != null or req.session != null)
-            reqPaneExact(self, req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane")
+            reqPaneExact(self, req) orelse return ipc_protocol.writeErr(out, allocator, .not_found, "no such pane")
         else
             null;
         const target = if (origin) |p| ownerWindow(self, p) else activeOrSelf(self);
@@ -786,7 +787,7 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
         // editor tab in THAT pane's window"; no address = the window
         // in front. `data` is an optional file spec to open.
         const origin: ?*Pane = if (req.pane != null or req.session != null)
-            reqPaneExact(self, req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane")
+            reqPaneExact(self, req) orelse return ipc_protocol.writeErr(out, allocator, .not_found, "no such pane")
         else
             null;
         const target = if (origin) |p| ownerWindow(self, p) else activeOrSelf(self);
@@ -806,13 +807,13 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
         // pane is exactly the surprise this guards against. A pane
         // already wearing the face gains a document tab.
         if (req.pane == null and req.session == null)
-            return ipc_protocol.writeErr(out, allocator, "editor-here requires a pane (--pane N or a session name)");
-        const pane = reqPaneExact(self, req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
+            return ipc_protocol.writeErr(out, allocator, .invalid_request, "editor-here requires a pane (--pane N or a session name)");
+        const pane = reqPaneExact(self, req) orelse return ipc_protocol.writeErr(out, allocator, .not_found, "no such pane");
         const win = ownerWindow(self, pane);
         win.openEditorOn(pane, req.data) catch |err| {
             var msg_buf: [128]u8 = undefined;
             const msg = std.fmt.bufPrint(&msg_buf, "editor attach failed: {s}", .{@errorName(err)}) catch "editor attach failed";
-            return ipc_protocol.writeErr(out, allocator, msg);
+            return ipc_protocol.writeErr(out, allocator, .failed, msg);
         };
         if (winmod.tabPageForPane(win, pane)) |page| c.adw_tab_view_set_selected_page(win.tab_view, page);
         c.gtk_window_present(@ptrCast(win.app_window));
@@ -823,19 +824,19 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
         // silently converting some other pane is the bug this
         // command exists to avoid.
         if (req.pane == null and req.session == null)
-            return ipc_protocol.writeErr(out, allocator, "browser-here requires a pane (--pane N or a session name)");
-        const pane = reqPaneExact(self, req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
+            return ipc_protocol.writeErr(out, allocator, .invalid_request, "browser-here requires a pane (--pane N or a session name)");
+        const pane = reqPaneExact(self, req) orelse return ipc_protocol.writeErr(out, allocator, .not_found, "no such pane");
         const win = ownerWindow(self, pane);
         win.openBrowserHere(pane, req.data) catch |err| {
             var msg_buf: [128]u8 = undefined;
             const msg = std.fmt.bufPrint(&msg_buf, "browser attach failed: {s}", .{@errorName(err)}) catch "browser attach failed";
-            return ipc_protocol.writeErr(out, allocator, msg);
+            return ipc_protocol.writeErr(out, allocator, .failed, msg);
         };
         if (winmod.tabPageForPane(win, pane)) |page| c.adw_tab_view_set_selected_page(win.tab_view, page);
         c.gtk_window_present(@ptrCast(win.app_window));
         try ipc_protocol.writeOk(out, allocator, "pane", pane.id);
     } else if (eql(u8, req.cmd, "split")) {
-        const pane = reqPane(self, req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
+        const pane = reqPane(self, req) orelse return ipc_protocol.writeErr(out, allocator, .not_found, "no such pane");
         const win = ownerWindow(self, pane);
         const dir = req.direction orelse "h";
         const orient: c_uint = if (eql(u8, dir, "v"))
@@ -854,32 +855,32 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
         });
     } else if (eql(u8, req.cmd, "focus")) {
         if (req.pane != null or req.session != null) {
-            const pane = reqPane(self, req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
+            const pane = reqPane(self, req) orelse return ipc_protocol.writeErr(out, allocator, .not_found, "no such pane");
             const win = ownerWindow(self, pane);
             if (winmod.tabPageForPane(win, pane)) |page| c.adw_tab_view_set_selected_page(win.tab_view, page);
             c.gtk_window_present(@ptrCast(win.app_window));
             focusPaneFace(pane);
             try ipc_protocol.writeOk(out, allocator, null, {});
         } else if (req.tab != null) {
-            const ref = tabRefById(self, req.tab) orelse return ipc_protocol.writeErr(out, allocator, "no such tab");
+            const ref = tabRefById(self, req.tab) orelse return ipc_protocol.writeErr(out, allocator, .not_found, "no such tab");
             c.adw_tab_view_set_selected_page(ref.win.tab_view, ref.page);
             c.gtk_window_present(@ptrCast(ref.win.app_window));
             try ipc_protocol.writeOk(out, allocator, null, {});
         } else {
-            try ipc_protocol.writeErr(out, allocator, "focus requires pane or tab");
+            try ipc_protocol.writeErr(out, allocator, .invalid_request, "focus requires pane or tab");
         }
     } else if (eql(u8, req.cmd, "close-pane")) {
-        const pane = reqPane(self, req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
+        const pane = reqPane(self, req) orelse return ipc_protocol.writeErr(out, allocator, .not_found, "no such pane");
         ownerWindow(self, pane).closePane(pane);
         try ipc_protocol.writeOk(out, allocator, null, {});
     } else if (eql(u8, req.cmd, "set-title")) {
-        const text = req.title orelse req.data orelse return ipc_protocol.writeErr(out, allocator, "set-title requires title");
+        const text = req.title orelse req.data orelse return ipc_protocol.writeErr(out, allocator, .invalid_request, "set-title requires title");
         var z_buf: [512:0]u8 = undefined;
-        const z = std.fmt.bufPrintZ(&z_buf, "{s}", .{text}) catch return ipc_protocol.writeErr(out, allocator, "title too long");
+        const z = std.fmt.bufPrintZ(&z_buf, "{s}", .{text}) catch return ipc_protocol.writeErr(out, allocator, .invalid_request, "title too long");
         const page = if (req.pane != null or req.session != null) pg: {
-            const pane = reqPane(self, req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
-            break :pg winmod.tabPageForPane(ownerWindow(self, pane), pane) orelse return ipc_protocol.writeErr(out, allocator, "pane has no tab");
-        } else (tabRefById(self, req.tab) orelse return ipc_protocol.writeErr(out, allocator, "no such tab")).page;
+            const pane = reqPane(self, req) orelse return ipc_protocol.writeErr(out, allocator, .not_found, "no such pane");
+            break :pg winmod.tabPageForPane(ownerWindow(self, pane), pane) orelse return ipc_protocol.writeErr(out, allocator, .unsupported, "pane has no tab");
+        } else (tabRefById(self, req.tab) orelse return ipc_protocol.writeErr(out, allocator, .not_found, "no such tab")).page;
         c.adw_tab_page_set_title(page, z.ptr);
         c.adw_tab_page_set_tooltip(page, z.ptr);
         try ipc_protocol.writeOk(out, allocator, null, {});
@@ -896,11 +897,11 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
             null;
         const win = if (takeover) |p| ownerWindow(self, p) else self;
         win.newDurableSession(req.host, takeover) catch {
-            return ipc_protocol.writeErr(out, allocator, "durable spawn failed (ssh/key auth?)");
+            return ipc_protocol.writeErr(out, allocator, .failed, "durable spawn failed (ssh/key auth?)");
         };
         try ipc_protocol.writeOk(out, allocator, "pane", next_pane_id - 1);
     } else if (eql(u8, req.cmd, "attach-session")) {
-        const name = req.data orelse return ipc_protocol.writeErr(out, allocator, "attach-session requires data (session name)");
+        const name = req.data orelse return ipc_protocol.writeErr(out, allocator, .invalid_request, "attach-session requires data (session name)");
         // Take over the pane it ran in (never fails to a new tab when a
         // pane exists), in that pane's own window. See new-durable-tab.
         const takeover: ?*Pane = if (req.session != null or req.pane != null)
@@ -922,13 +923,13 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
                     else
                         .policy;
                     if (!muxtabs.AttachJob.start(win, host, name, "", lease, placement, null, onIpcAttachReady, null))
-                        return ipc_protocol.writeErr(out, allocator, "could not start the background mux attach");
+                        return ipc_protocol.writeErr(out, allocator, .failed, "could not start the background mux attach");
                     return ipc_protocol.writeOkFlat(out, allocator, .{ .queued = true, .session = name });
                 }
             }
         }
         const conn = muxtabs.muxConnect(win, req.host) catch {
-            return ipc_protocol.writeErr(out, allocator, "mux daemon unreachable");
+            return ipc_protocol.writeErr(out, allocator, .unavailable, "mux daemon unreachable");
         };
         muxtabs.attachMuxLease(win, conn, name, req.host, takeover, null, lease) catch |err| {
             // Prefer the daemon's own reason ("no such session", …)
@@ -939,7 +940,7 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
                 @errorName(err);
             var msg_buf: [256]u8 = undefined;
             const msg = std.fmt.bufPrint(&msg_buf, "attach failed: {s}", .{detail}) catch "attach failed";
-            return ipc_protocol.writeErr(out, allocator, msg);
+            return ipc_protocol.writeErr(out, allocator, .failed, msg);
         };
         try ipc_protocol.writeOk(out, allocator, null, {});
     } else if (eql(u8, req.cmd, "attach-all")) {
@@ -948,15 +949,15 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
         const n = activeOrSelf(self).attachAllSessions(req.host);
         try ipc_protocol.writeOk(out, allocator, "attached", n);
     } else if (eql(u8, req.cmd, "set-tab-color")) {
-        const ref = tabRefById(self, req.tab) orelse return ipc_protocol.writeErr(out, allocator, "no such tab");
+        const ref = tabRefById(self, req.tab) orelse return ipc_protocol.writeErr(out, allocator, .not_found, "no such tab");
         const page = ref.page;
-        const spec = req.data orelse return ipc_protocol.writeErr(out, allocator, "set-tab-color requires data (#RRGGBB or none)");
+        const spec = req.data orelse return ipc_protocol.writeErr(out, allocator, .invalid_request, "set-tab-color requires data (#RRGGBB or none)");
         if (eql(u8, spec, "none")) {
             ref.win.setTabColor(page, null);
         } else if (Window.parseHexRGB(spec)) |col| {
             ref.win.setTabColor(page, col);
         } else {
-            return ipc_protocol.writeErr(out, allocator, "bad color (want #RRGGBB or none)");
+            return ipc_protocol.writeErr(out, allocator, .invalid_request, "bad color (want #RRGGBB or none)");
         }
         try ipc_protocol.writeOk(out, allocator, null, {});
     } else if (std.mem.startsWith(u8, req.cmd, "panel-")) {
@@ -970,17 +971,17 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
         // Dispatch any bindable action by name — the scripting
         // equivalent of pressing its keybind ("zoom_pane",
         // "copy_mode", "split_h", …; names as in `keybind.*`).
-        const name = req.data orelse return ipc_protocol.writeErr(out, allocator, "action needs data=<name>");
+        const name = req.data orelse return ipc_protocol.writeErr(out, allocator, .invalid_request, "action needs data=<name>");
         const action = input.actionFromName(name) orelse
-            return ipc_protocol.writeErr(out, allocator, "unknown action");
+            return ipc_protocol.writeErr(out, allocator, .invalid_request, "unknown action");
         if (req.pane != null or req.session != null) {
             // An address that does not resolve is an error here:
             // `reqPane`'s focused-pane fallback would run the action on
             // a pane the caller never named. See `runPaneAction` for
             // how the named pane is then reached.
-            const pane = reqPaneExact(self, req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
+            const pane = reqPaneExact(self, req) orelse return ipc_protocol.writeErr(out, allocator, .not_found, "no such pane");
             if (try runPaneAction(ownerWindow(self, pane), pane, action)) |msg|
-                return ipc_protocol.writeErr(out, allocator, msg);
+                return ipc_protocol.writeErr(out, allocator, .unsupported, msg);
         } else {
             winmod.dispatchAction(activeOrSelf(self), action);
         }
@@ -988,7 +989,7 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
     } else if (std.mem.startsWith(u8, req.cmd, "web-")) {
         try webCmd(self, req, out, allocator);
     } else {
-        try ipc_protocol.writeErr(out, allocator, "unknown command");
+        try ipc_protocol.writeErr(out, allocator, .unknown_command, "unknown command");
     }
 }
 
@@ -1352,19 +1353,19 @@ fn webCmd(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList(u8), all
         // + remote = on:) so old callers keep working. Process-wide
         // state, so it takes the WINDOW's long-lived allocator.
         const name = req.name orelse
-            return ipc_protocol.writeErr(out, allocator, "web-container requires a name");
+            return ipc_protocol.writeErr(out, allocator, .invalid_request, "web-container requires a name");
         var rbuf: [512]u8 = undefined;
         const route_text: []const u8 = if (req.route) |r| r else blk: {
             const host_arg = req.host orelse "";
             if (host_arg.len == 0) break :blk "direct";
             break :blk std.fmt.bufPrint(&rbuf, "{s}:{s}", .{ if (req.remote) "on" else "via", host_arg }) catch
-                return ipc_protocol.writeErr(out, allocator, "host too long");
+                return ipc_protocol.writeErr(out, allocator, .invalid_request, "host too long");
         };
         const spec = webroute.Spec.parse(route_text, webface.torEndpoint()) orelse
-            return ipc_protocol.writeErr(out, allocator, "route must be direct | tor | via:<host> | on:<host>");
+            return ipc_protocol.writeErr(out, allocator, .invalid_request, "route must be direct | tor | via:<host> | on:<host>");
         const id = webface.createContainer(self.allocator, name, req.ephemeral, spec);
         if (id == 0)
-            return ipc_protocol.writeErr(out, allocator, "container creation failed");
+            return ipc_protocol.writeErr(out, allocator, .failed, "container creation failed");
         return ipc_protocol.writeOkFlat(out, allocator, .{ .container = id });
     }
 
@@ -1374,7 +1375,7 @@ fn webCmd(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList(u8), all
         // after the pane exists would leave a blank tab behind.
         const route_spec: ?webroute.Spec = if (req.route) |r|
             webroute.Spec.parse(r, webface.torEndpoint()) orelse
-                return ipc_protocol.writeErr(out, allocator, "route must be direct | tor | via:<host> | on:<host>")
+                return ipc_protocol.writeErr(out, allocator, .invalid_request, "route must be direct | tor | via:<host> | on:<host>")
         else
             null;
         // A named pane pins the window: splitting it from another
@@ -1385,7 +1386,7 @@ fn webCmd(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList(u8), all
         const before = win.panes.items.len;
         if (req.container) |ctn| {
             if (webface.findContainer(ctn) == null)
-                return ipc_protocol.writeErr(out, allocator, "no such container (web-container creates one)");
+                return ipc_protocol.writeErr(out, allocator, .not_found, "no such container (web-container creates one)");
             try win.newWebTabInContainer(ctn, null);
         } else if (eql(u8, where, "split")) {
             // The pane the caller named, else the one the user is
@@ -1395,7 +1396,7 @@ fn webCmd(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList(u8), all
             const source = named orelse
                 win.focusedPane() orelse
                 win.selectedTabPane() orelse
-                return ipc_protocol.writeErr(out, allocator, "no pane to split");
+                return ipc_protocol.writeErr(out, allocator, .not_found, "no pane to split");
             try win.newWebSplitOn(source, c.GTK_ORIENTATION_HORIZONTAL);
         } else if (eql(u8, where, "window")) {
             host = try win.openWebWindow(&.{}, null);
@@ -1403,12 +1404,12 @@ fn webCmd(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList(u8), all
             try win.newWebTabAt(null);
         }
         if (host == win and win.panes.items.len <= before)
-            return ipc_protocol.writeErr(out, allocator, "could not open a web view");
+            return ipc_protocol.writeErr(out, allocator, .failed, "could not open a web view");
         if (host.panes.items.len == 0)
-            return ipc_protocol.writeErr(out, allocator, "could not open a web view");
+            return ipc_protocol.writeErr(out, allocator, .failed, "could not open a web view");
         const pane = host.panes.items[host.panes.items.len - 1];
         const face = webface.WebFace.fromPane(pane) orelse
-            return ipc_protocol.writeErr(out, allocator, "the new pane has no web face");
+            return ipc_protocol.writeErr(out, allocator, .unsupported, "the new pane has no web face");
         // SELECT the new tab. The point of these tools is that the
         // assistant drives what the user is looking at; an unselected
         // tab is also never allocated, so the view would lay out at
@@ -1420,7 +1421,7 @@ fn webCmd(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList(u8), all
         pane.setWebVisible(true);
         focusPaneFace(pane);
         // Route first: the page must load on the right instance.
-        if (route_spec) |spec| face.setRoute(spec) catch |e| return ipc_protocol.writeErr(out, allocator, switch (e) {
+        if (route_spec) |spec| face.setRoute(spec) catch |e| return ipc_protocol.writeErr(out, allocator, .invalid_request, switch (e) {
             error.InvalidRoute => "route must be direct | tor | via:<host> | on:<host>",
             error.AttachedView => "an attached (inspector) view cannot be routed",
             error.RouteUnavailable => "no browser instance could be started for that route",
@@ -1432,16 +1433,16 @@ fn webCmd(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList(u8), all
     }
 
     if (eql(u8, req.cmd, "web-close")) {
-        const pane = reqPaneExact(self, req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
+        const pane = reqPaneExact(self, req) orelse return ipc_protocol.writeErr(out, allocator, .not_found, "no such pane");
         const g = @import("webgroup.zig").Group.fromPane(pane) orelse
-            return ipc_protocol.writeErr(out, allocator, "no web view on that pane (web_tabs lists them; web_open makes one)");
+            return ipc_protocol.writeErr(out, allocator, .unsupported, "no web view on that pane (web_tabs lists them; web_open makes one)");
         const closed = g.closeByView(ownerWindow(self, pane), req.view) orelse
-            return ipc_protocol.writeErr(out, allocator, "no such page on that pane (web-list names each page's view)");
+            return ipc_protocol.writeErr(out, allocator, .not_found, "no such page on that pane (web-list names each page's view)");
         return ipc_protocol.writeOkFlat(out, allocator, .{ .view = closed.view, .pane_closed = closed.pane_closed });
     }
 
     const face = webFaceOf(self, req) orelse
-        return ipc_protocol.writeErr(out, allocator, "no web view on that pane (web_tabs lists them; web_open makes one)");
+        return ipc_protocol.writeErr(out, allocator, .not_found, "no web view on that pane (web_tabs lists them; web_open makes one)");
 
     if (eql(u8, req.cmd, "web-navigate")) {
         if (req.data) |url| {
@@ -1451,7 +1452,7 @@ fn webCmd(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList(u8), all
             }
         }
         const act = req.action orelse
-            return ipc_protocol.writeErr(out, allocator, "web-navigate needs data=<url> or action=back|forward|reload|stop");
+            return ipc_protocol.writeErr(out, allocator, .invalid_request, "web-navigate needs data=<url> or action=back|forward|reload|stop");
         const nav: web_proto.NavAct = if (eql(u8, act, "back"))
             .back
         else if (eql(u8, act, "forward"))
@@ -1461,14 +1462,14 @@ fn webCmd(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList(u8), all
         else if (eql(u8, act, "stop"))
             .stop
         else
-            return ipc_protocol.writeErr(out, allocator, "unknown navigation action");
+            return ipc_protocol.writeErr(out, allocator, .invalid_request, "unknown navigation action");
         face.navAction(nav);
         return ipc_protocol.writeOkFlat(out, allocator, .{});
     }
 
     if (eql(u8, req.cmd, "web-scroll")) {
         if (!face.autoScroll(req.dx orelse 0, req.dy orelse 0))
-            return ipc_protocol.writeErr(out, allocator, "the web view is not live yet");
+            return ipc_protocol.writeErr(out, allocator, .unavailable, "the web view is not live yet");
         return ipc_protocol.writeOkFlat(out, allocator, .{});
     }
 
@@ -1478,22 +1479,22 @@ fn webCmd(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList(u8), all
     // started is visible (and cancellable) to the person watching.
     if (eql(u8, req.cmd, "web-download")) {
         const url = req.data orelse
-            return ipc_protocol.writeErr(out, allocator, "web-download needs data=<url>");
+            return ipc_protocol.writeErr(out, allocator, .invalid_request, "web-download needs data=<url>");
         const path = req.path orelse
-            return ipc_protocol.writeErr(out, allocator, "web-download needs path=<absolute local path>");
-        if (url.len == 0) return ipc_protocol.writeErr(out, allocator, "web-download needs a non-empty url");
+            return ipc_protocol.writeErr(out, allocator, .invalid_request, "web-download needs path=<absolute local path>");
+        if (url.len == 0) return ipc_protocol.writeErr(out, allocator, .invalid_request, "web-download needs a non-empty url");
         if (path.len == 0 or path[0] != '/')
-            return ipc_protocol.writeErr(out, allocator, "web-download needs an ABSOLUTE local path");
+            return ipc_protocol.writeErr(out, allocator, .invalid_request, "web-download needs an ABSOLUTE local path");
         const id = face.webDownloadStart(url, path) orelse
-            return ipc_protocol.writeErr(out, allocator, face.webDownloadRefusal());
+            return ipc_protocol.writeErr(out, allocator, .unavailable, face.webDownloadRefusal());
         return ipc_protocol.writeOkFlat(out, allocator, .{ .req = id });
     }
 
     if (eql(u8, req.cmd, "web-download-cancel")) {
         const id = req.req orelse
-            return ipc_protocol.writeErr(out, allocator, "web-download-cancel needs req");
+            return ipc_protocol.writeErr(out, allocator, .invalid_request, "web-download-cancel needs req");
         if (!face.webDownloadCancel(id))
-            return ipc_protocol.writeErr(out, allocator, "no running download with that request id");
+            return ipc_protocol.writeErr(out, allocator, .not_found, "no running download with that request id");
         return ipc_protocol.writeOkFlat(out, allocator, .{});
     }
 
@@ -1501,9 +1502,9 @@ fn webCmd(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList(u8), all
     // row once it is done or failed.
     if (eql(u8, req.cmd, "web-download-dismiss")) {
         const id = req.req orelse
-            return ipc_protocol.writeErr(out, allocator, "web-download-dismiss needs req");
+            return ipc_protocol.writeErr(out, allocator, .invalid_request, "web-download-dismiss needs req");
         if (!face.webDownloadDismiss(id))
-            return ipc_protocol.writeErr(out, allocator, "no download row with that request id");
+            return ipc_protocol.writeErr(out, allocator, .not_found, "no download row with that request id");
         return ipc_protocol.writeOkFlat(out, allocator, .{});
     }
 
@@ -1515,7 +1516,7 @@ fn webCmd(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList(u8), all
     // the code to see the rest would run it twice.
     if (eql(u8, req.cmd, "web-eval-text")) {
         const text = face.lastEval() orelse
-            return ipc_protocol.writeErr(out, allocator, "no eval result to expand on this pane");
+            return ipc_protocol.writeErr(out, allocator, .not_found, "no eval result to expand on this pane");
         const off: usize = @min(req.offset orelse 0, text.len);
         const len: usize = @min(req.length orelse 60_000, text.len - off);
         return ipc_protocol.writeOkFlat(out, allocator, .{
@@ -1539,7 +1540,7 @@ fn webCmd(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList(u8), all
             } else if (eql(u8, act, "toggle")) {
                 face.setNetwork(!face.net_enabled);
             } else if (!eql(u8, act, "status")) {
-                return ipc_protocol.writeErr(out, allocator, "web-network action must be enable|disable|toggle|status");
+                return ipc_protocol.writeErr(out, allocator, .invalid_request, "web-network action must be enable|disable|toggle|status");
             }
             const st = face.netCounters();
             return ipc_protocol.writeOkFlat(out, allocator, .{
@@ -1550,7 +1551,7 @@ fn webCmd(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList(u8), all
             });
         }
         const token = face.autoNetworkLog(req.offset orelse 0, @intCast(@min(req.length orelse 128, 128))) orelse
-            return ipc_protocol.writeErr(out, allocator, "the web view cannot take that request now (helper not connected, or a network log pull is still in flight)");
+            return ipc_protocol.writeErr(out, allocator, .unavailable, "the web view cannot take that request now (helper not connected, or a network log pull is still in flight)");
         const st = face.netCounters();
         return ipc_protocol.writeOkFlat(out, allocator, .{
             .token = token,
@@ -1563,7 +1564,7 @@ fn webCmd(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList(u8), all
 
     if (eql(u8, req.cmd, "web-result")) {
         const token = req.token orelse
-            return ipc_protocol.writeErr(out, allocator, "web-result needs token");
+            return ipc_protocol.writeErr(out, allocator, .invalid_request, "web-result needs token");
         if (face.autoTake(token)) |res| {
             defer allocator.free(res.text);
             return ipc_protocol.writeOkFlat(out, allocator, .{
@@ -1581,14 +1582,14 @@ fn webCmd(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList(u8), all
         }
         if (face.autoPending(token))
             return ipc_protocol.writeOkFlat(out, allocator, .{ .done = false });
-        return ipc_protocol.writeErr(out, allocator, "unknown token (already collected, or dropped when the helper restarted)");
+        return ipc_protocol.writeErr(out, allocator, .not_found, "unknown token (already collected, or dropped when the helper restarted)");
     }
 
     if (!eql(u8, req.cmd, "web-request"))
-        return ipc_protocol.writeErr(out, allocator, "unknown command");
+        return ipc_protocol.writeErr(out, allocator, .unknown_command, "unknown command");
 
     const op = req.op orelse
-        return ipc_protocol.writeErr(out, allocator, "web-request needs op");
+        return ipc_protocol.writeErr(out, allocator, .invalid_request, "web-request needs op");
     const token: ?u32 = blk: {
         if (eql(u8, op, "snapshot")) {
             const mode: web_proto.SnapMode = if (req.mode) |m|
@@ -1600,7 +1601,7 @@ fn webCmd(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList(u8), all
         }
         if (eql(u8, op, "act")) {
             const id = req.node orelse
-                return ipc_protocol.writeErr(out, allocator, "act needs node=<snapshot id>");
+                return ipc_protocol.writeErr(out, allocator, .invalid_request, "act needs node=<snapshot id>");
             const act = req.action orelse "click";
             const semact: web_proto.SemAct = if (eql(u8, act, "click"))
                 .click
@@ -1613,31 +1614,31 @@ fn webCmd(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList(u8), all
             else if (eql(u8, act, "hover"))
                 .hover
             else
-                return ipc_protocol.writeErr(out, allocator, "unknown act action");
+                return ipc_protocol.writeErr(out, allocator, .invalid_request, "unknown act action");
             break :blk face.autoAct(id, @intFromEnum(semact), req.data orelse "");
         }
         if (eql(u8, op, "expand")) {
             const id = req.node orelse
-                return ipc_protocol.writeErr(out, allocator, "expand needs node=<snapshot id>");
+                return ipc_protocol.writeErr(out, allocator, .invalid_request, "expand needs node=<snapshot id>");
             break :blk face.autoExpand(id, req.offset orelse 0, req.length orelse 4096);
         }
         if (eql(u8, op, "query")) {
             const qk = web_proto.SemQuery.fromOperationName(req.action orelse "find_text") orelse
-                return ipc_protocol.writeErr(out, allocator, "unknown query kind");
+                return ipc_protocol.writeErr(out, allocator, .invalid_request, "unknown query kind");
             break :blk face.autoQuery(@intFromEnum(qk), req.data orelse "");
         }
         if (eql(u8, op, "read")) break :blk face.autoRead();
         if (eql(u8, op, "eval")) {
             const code = req.data orelse
-                return ipc_protocol.writeErr(out, allocator, "eval needs data=<javascript>");
+                return ipc_protocol.writeErr(out, allocator, .invalid_request, "eval needs data=<javascript>");
             break :blk face.autoEval(code, req.await_promise, req.timeout_ms orelse 10_000, req.max_chars orelse 0);
         }
-        return ipc_protocol.writeErr(out, allocator, "unknown web-request op");
+        return ipc_protocol.writeErr(out, allocator, .invalid_request, "unknown web-request op");
     };
     const t = token orelse return ipc_protocol.writeErr(
         out,
         allocator,
-        "the web view cannot take that request now (helper not connected, or one of the same kind is still in flight)",
+        .unavailable, "the web view cannot take that request now (helper not connected, or one of the same kind is still in flight)",
     );
     return ipc_protocol.writeOkFlat(out, allocator, .{ .token = t });
 }

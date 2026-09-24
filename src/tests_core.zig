@@ -125,6 +125,7 @@ comptime {
     _ = @import("ipc/panelstore.zig");
     _ = @import("ipc/paneldrive.zig");
     _ = @import("ipc/protocol.zig");
+    _ = @import("ipc/ctlclient.zig");
     _ = @import("ipc/termdrive.zig");
     _ = @import("ipc/launch_cleanup.zig");
     _ = @import("ipc/webdrive.zig");
