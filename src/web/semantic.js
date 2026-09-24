@@ -2189,6 +2189,146 @@
     send({ op: "ext-exec-result", ext: m.ext, cap: m.cap, gid: m.gid, ok: ok, err: err, result: out });
   }
 
+  // -- userscripts: the GM_* API ---------------------------------------
+  //
+  // The browser process hands each matching userscript over as an
+  // OBJECT command whose `fn` is the script's source compiled as a
+  // function body (CSP-safe: nothing is eval'd). Only the functions the
+  // script `@grant`ed are passed; an ungranted GM_* name is undefined
+  // inside it, so calling one fails loudly. `@grant none` gets GM_info
+  // alone. Values are an inlined snapshot (the GM value API is
+  // SYNCHRONOUS) and writes go back to the helper, which persists them.
+  // This is the page's main world, like content scripts: a hostile page
+  // can observe the objects the script builds; `@connect` bounds what
+  // GM_xmlhttpRequest can reach even then.
+  var usXhr = {};
+  var usXhrSeq = 1;
+
+  function usClone(v) {
+    return v === undefined ? undefined : JSON.parse(JSON.stringify(v));
+  }
+
+  function usRun(m) {
+    var grants = m.grants || [];
+    function has(n) {
+      var tail = n.slice(3).toLowerCase();
+      for (var i = 0; i < grants.length; i++) {
+        var g = String(grants[i]);
+        if (g === n) return true;
+        if ((g.indexOf("GM.") === 0 || g.indexOf("GM_") === 0) && g.slice(3).toLowerCase() === tail) return true;
+      }
+      return false;
+    }
+    var vals = m.values || {};
+    var info = m.info || {};
+    function call(msg) {
+      msg.op = "us-call";
+      msg.sid = m.sid;
+      msg.cap = m.cap;
+      send(msg);
+    }
+    var getValue = function (k, def) {
+      return Object.prototype.hasOwnProperty.call(vals, k) ? usClone(vals[k]) : def;
+    };
+    var setValue = function (k, v) {
+      vals[k] = usClone(v);
+      call({ method: "setValue", key: String(k), value: v === undefined ? null : v });
+    };
+    var deleteValue = function (k) {
+      delete vals[k];
+      call({ method: "deleteValue", key: String(k) });
+    };
+    var listValues = function () {
+      return Object.keys(vals);
+    };
+    var addStyle = function (css) {
+      var s = document.createElement("style");
+      s.textContent = String(css);
+      (document.head || document.documentElement).appendChild(s);
+      return s;
+    };
+    var xhr = function (d) {
+      d = d || {};
+      var req = usXhrSeq++;
+      var url;
+      try {
+        url = String(new URL(d.url, location.href));
+      } catch (e) {
+        url = String(d.url);
+      }
+      usXhr[req] = d;
+      call({ method: "xhr", req: req, url: url, xmethod: d.method || "GET",
+        headers: d.headers || {}, data: d.data == null ? null : String(d.data) });
+      return { abort: function () { delete usXhr[req]; } };
+    };
+    var GM = { info: info };
+    if (has("GM_getValue")) GM.getValue = function (k, d) { return Promise.resolve(getValue(k, d)); };
+    if (has("GM_setValue")) GM.setValue = function (k, v) { setValue(k, v); return Promise.resolve(); };
+    if (has("GM_deleteValue")) GM.deleteValue = function (k) { deleteValue(k); return Promise.resolve(); };
+    if (has("GM_listValues")) GM.listValues = function () { return Promise.resolve(listValues()); };
+    if (has("GM_addStyle")) GM.addStyle = function (c) { return Promise.resolve(addStyle(c)); };
+    if (has("GM_xmlhttpRequest")) {
+      GM.xmlHttpRequest = function (d) {
+        return new Promise(function (res, rej) {
+          var dd = {};
+          for (var k in d) dd[k] = d[k];
+          dd.onload = function (r) { if (d.onload) d.onload(r); res(r); };
+          dd.onerror = function (r) { if (d.onerror) d.onerror(r); rej(r); };
+          xhr(dd);
+        });
+      };
+    }
+    function run() {
+      try {
+        m.fn(
+          info,
+          has("GM_getValue") ? getValue : undefined,
+          has("GM_setValue") ? setValue : undefined,
+          has("GM_deleteValue") ? deleteValue : undefined,
+          has("GM_listValues") ? listValues : undefined,
+          has("GM_addStyle") ? addStyle : undefined,
+          has("GM_xmlhttpRequest") ? xhr : undefined,
+          grants.length ? GM : { info: info },
+          window
+        );
+      } catch (e) {
+        try { console.error("[sketerm userscript]", m.name, e); } catch (e2) {}
+      }
+    }
+    if (typeof m.fn !== "function") return;
+    if (m.run === "start") run();
+    else if (m.run === "idle") {
+      if (document.readyState === "complete") run();
+      else window.addEventListener("load", run);
+    } else if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", run);
+    else run();
+  }
+
+  function usXhrDone(m) {
+    var d = usXhr[m.req];
+    if (!d) return;
+    delete usXhr[m.req];
+    var r = {
+      readyState: 4,
+      status: m.status || 0,
+      statusText: m.statusText || "",
+      responseHeaders: m.headers || "",
+      responseText: m.body || "",
+      response: m.body || "",
+      finalUrl: m.finalUrl || "",
+      error: m.error || undefined
+    };
+    try {
+      if (m.error) {
+        if (d.onerror) d.onerror(r);
+      } else {
+        if (d.onreadystatechange) d.onreadystatechange(r);
+        if (d.onload) d.onload(r);
+      }
+      if (d.onloadend) d.onloadend(r);
+    } catch (e) {}
+  }
+
   // A namespace event pushed from the browser process
   // (`webNavigation.on*`, ...).
   function extNsEvent(m) {
@@ -2919,6 +3059,12 @@
         break;
       case "ext-exec":
         extExec(m);
+        break;
+      case "us-run":
+        usRun(m);
+        break;
+      case "us-xhr":
+        usXhrDone(m);
         break;
       case "ext-action-clicked":
         extActionClicked(m);

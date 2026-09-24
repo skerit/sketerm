@@ -3992,6 +3992,140 @@ fn runExtApiStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
     reapHelperTimeout(pid, "stage 43 helper", 30_000);
 }
 
+// ---------------------------------------------------------------------
+// Stage 44: userscripts get a real GM_* API, CSP-safe
+// ---------------------------------------------------------------------
+
+const GmServer = struct {
+    lis: tcpserver.Listener = .{ .backlog = 64, .poll_ms = 100 },
+
+    fn start(self: *GmServer) bool {
+        return self.lis.start(self, &onConn);
+    }
+
+    fn onConn(ctx: ?*anyopaque, afd: c_int) bool {
+        _ = ctx;
+        var req: [8192]u8 = undefined;
+        var pfd = c.struct_pollfd{ .fd = afd, .events = c.POLLIN, .revents = 0 };
+        if (c.poll(@ptrCast(&pfd), 1, 3000) <= 0) return false;
+        const n = c.read(afd, &req, req.len);
+        if (n <= 0) return false;
+        const raw = req[0..@intCast(n)];
+        if (std.mem.indexOf(u8, raw, "GET /g/data") != null) {
+            tcpserver.respondOk(afd, "text/plain", "GDATA", "X-G: 1\r\n");
+        } else {
+            // The strictest script CSP there is: no page script, no
+            // eval. Only an injection that never evals can run here.
+            tcpserver.respondOk(afd, "text/html",
+                \\<!doctype html><html><head><title>gm-start</title></head><body><p>gm</p></body></html>
+            , "Content-Security-Policy: script-src 'none'\r\n");
+        }
+        return false;
+    }
+
+    fn deinit(self: *GmServer) void {
+        self.lis.deinit();
+    }
+};
+
+const gm_script =
+    \\// ==UserScript==
+    \\// @name        gm-test
+    \\// @namespace   sketerm.smoke
+    \\// @match       http://127.0.0.1/*
+    \\// @grant       GM_getValue
+    \\// @grant       GM_setValue
+    \\// @grant       GM_listValues
+    \\// @grant       GM_addStyle
+    \\// @grant       GM_xmlhttpRequest
+    \\// @run-at      document-end
+    \\// ==/UserScript==
+    \\var n = (GM_getValue("runs", 0) || 0) + 1;
+    \\GM_setValue("runs", n);
+    \\GM_addStyle("body{background-color:rgb(4, 5, 6) !important}");
+    \\var out = ["runs=" + n, "info=" + GM_info.script.name, "list=" + GM_listValues().join("+"),
+    \\  "del=" + (typeof GM_deleteValue), "bg=" + getComputedStyle(document.body).backgroundColor];
+    \\GM_xmlhttpRequest({ url: "/g/data", onload: function (r) {
+    \\  out.push("xhr=" + r.status + ":" + r.responseText + ":" + (r.responseHeaders.toLowerCase().indexOf("x-g: 1") >= 0));
+    \\  GM_xmlhttpRequest({ url: "http://denied.invalid/x",
+    \\    onload: function () { out.push("deny=LOADED"); document.title = "gm:" + out.join(","); },
+    \\    onerror: function (r2) { out.push("deny=" + (String(r2.error).indexOf("@connect") >= 0)); document.title = "gm:" + out.join(","); } });
+    \\}, onerror: function (r) { out.push("xhr=ERR:" + r.error); document.title = "gm:" + out.join(","); } });
+;
+
+fn runGmStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) void {
+    var data_buf: [4096]u8 = undefined;
+    const data_dir = std.fmt.bufPrintZ(&data_buf, "{s}/gmdata", .{dir}) catch fail("stage 44 data path");
+    mkdirZ(data_dir);
+    _ = c.setenv("XDG_DATA_HOME", data_dir.ptr, 1);
+    var cache_buf: [4096]u8 = undefined;
+    const cache_dir = std.fmt.bufPrintZ(&cache_buf, "{s}/gmcache", .{dir}) catch fail("stage 44 cache path");
+    mkdirZ(cache_dir);
+    var srv = GmServer{};
+    if (!srv.start()) fail("stage 44: loopback HTTP server would not start");
+    defer srv.deinit();
+    var url_buf: [96]u8 = undefined;
+    const page = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/g/page", .{srv.lis.port}) catch fail("url");
+
+    // Two helper runs over one data dir: values survive a reload in one
+    // helper AND a helper restart.
+    var runs: u32 = 0;
+    for ([_][]const u8{ "gm1.sock", "gm2.sock" }) |sock_name| {
+        var sock_buf: [96]u8 = undefined;
+        const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/{s}", .{ dir, sock_name }) catch fail("stage 44 sock");
+        const pid = spawnHelper(exe, sock.ptr, cache_dir.ptr, "--ozone-platform=headless", null, false);
+        var cl = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
+        cl.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web" });
+        {
+            const d = nowMs() + 15_000;
+            while (cl.ack_proto == 0 and nowMs() < d) cl.pump(100);
+        }
+        if (!cl.acks(.userscripts_gm)) fail("stage 44: hello_ack lacks the userscripts-gm capability");
+        const scripts = [_]proto.UsScript{.{ .id = 7, .source = .{ .s = gm_script } }};
+        cl.send(proto.UsScriptSet{ .scripts = &scripts });
+        cl.send(proto.ViewCreate{ .view = view_id, .w = 640, .h = 480, .scale_x1000 = 1000, .context = 0 });
+        if (!cl.waitBufferAfter(0, 20_000)) fail("stage 44: no frame_buffer for the page view");
+        const loads: u32 = if (runs == 0) 2 else 1;
+        var i: u32 = 0;
+        while (i < loads) : (i += 1) {
+            runs += 1;
+            cl.resetTitle();
+            cl.send(proto.Navigate{ .view = view_id, .url = page });
+            if (!cl.waitTitle("gm:", 20_000)) {
+                std.debug.print("stage 44: title was \"{s}\"\n", .{cl.titleSlice()});
+                fail("stage 44: the userscript never reported (did it run under script-src 'none'?)");
+            }
+            const res = cl.titleSlice();
+            std.debug.print("stage 44: {s}\n", .{res});
+            var want_buf: [32]u8 = undefined;
+            const want_runs = std.fmt.bufPrint(&want_buf, "runs={d},", .{runs}) catch fail("fmt");
+            const wants = [_][]const u8{
+                want_runs,                     "info=gm-test", "list=runs", "del=undefined",
+                "bg=rgb(4, 5, 6)",             "xhr=200:GDATA:true",
+                "deny=true",
+            };
+            for (wants) |w| {
+                if (std.mem.indexOf(u8, res, w) == null) {
+                    std.debug.print("stage 44: missing \"{s}\" in \"{s}\"\n", .{ w, res });
+                    fail("stage 44: a GM_* answer was wrong");
+                }
+            }
+            // Let the coalesced value write land before the next load
+            // (and, for the last load, before the helper goes away).
+            const d = nowMs() + 800;
+            while (nowMs() < d) cl.pump(50);
+        }
+        cl.send(proto.ViewDestroy{ .view = view_id });
+        {
+            const d = nowMs() + 1500;
+            while (nowMs() < d) cl.pump(50);
+        }
+        cl.deinit();
+        reapHelperTimeout(pid, "stage 44 helper", 30_000);
+    }
+    pass("stage 44 userscripts: GM values persist across reload and helper restart, GM_addStyle/GM_info/@grant gate, GM_xmlhttpRequest with @connect enforced, all under script-src 'none'");
+}
+
 /// Stage 28: the WebExtensions foundation, end to end against real CEF.
 /// Run 1 proves content-script injection at document_end (a DOM mutation
 /// and a title change) and runtime.sendMessage to the background with a
@@ -6964,6 +7098,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         runActionStage(gpa, exe, dir);
         runWebrequestStage(gpa, exe, dir);
         runExtApiStage(gpa, exe, dir);
+        runGmStage(gpa, exe, dir);
         runShapeStage(gpa, exe, dir);
         runUboStage(gpa, exe, dir, ubo_xpi);
         cleanup();
@@ -10033,6 +10168,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     runWebextStage(gpa, exe, dir);
     runActionStage(gpa, exe, dir);
     runWebrequestStage(gpa, exe, dir);
+    runExtApiStage(gpa, exe, dir);
+    runGmStage(gpa, exe, dir);
     runDownloadHoldStage(gpa, exe, dir);
     runNetChangeStage(gpa, exe, dir);
     // ── Stage 35: real MV2 extensions ─────────────────────────────

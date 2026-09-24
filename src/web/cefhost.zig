@@ -61,6 +61,7 @@ const netpolicy = @import("netpolicy.zig");
 const pathz = @import("../util/pathz.zig");
 const atomicwrite = @import("../util/atomicwrite.zig");
 const userscript = @import("userscript.zig");
+const gmvalues = @import("gmvalues.zig");
 const webexthost = @import("webext/host.zig");
 const extinstall = @import("webext/install.zig");
 const extmatch = @import("webext/match.zig");
@@ -1076,6 +1077,8 @@ pub const Host = struct {
     /// without invalidating the other's slices.
     us_script_arena: ?std.heap.ArenaAllocator = null,
     us_scripts: std.ArrayList(ScriptRec) = .empty,
+    /// GM_setValue storage (see `gmvalues.zig`).
+    gm_values: gmvalues.Values = undefined,
     us_style_arena: ?std.heap.ArenaAllocator = null,
     us_styles: std.ArrayList(StyleRec) = .empty,
 
@@ -1103,6 +1106,11 @@ pub const Host = struct {
         id: u32,
         meta: userscript.Meta,
         source: []const u8,
+        /// Random per `us_script_set`: what a `us-call` must present.
+        /// The id alone is guessable by any page.
+        cap: [32]u8 = @splat('0'),
+        /// `gmvalues.keyFor(@namespace, @name)`.
+        key: [16]u8 = @splat('0'),
     };
     const StyleRec = struct {
         id: u32,
@@ -1280,7 +1288,7 @@ pub const Host = struct {
     const DlPending = struct { view: u32, req: u32, at_ms: i64 };
 
     pub fn init(gpa: std.mem.Allocator, out: *proto.Outbox) Host {
-        return .{ .gpa = gpa, .out = out, .webext = webexthost.Host.init(gpa) };
+        return .{ .gpa = gpa, .out = out, .webext = webexthost.Host.init(gpa), .gm_values = gmvalues.Values.init(gpa) };
     }
 
     pub fn deinit(self: *Host) void {
@@ -1293,6 +1301,7 @@ pub const Host = struct {
         self.subs.deinit(self.gpa);
         self.observers.deinit(self.gpa);
         self.webext.deinit();
+        self.gm_values.deinit();
         for (self.webext_replies.items) |r| self.gpa.free(r.ext);
         self.webext_replies.deinit(self.gpa);
         for (self.webext_ports.items) |p| self.gpa.free(p.ext);
@@ -4026,7 +4035,12 @@ pub const Host = struct {
         for (req.scripts) |s| {
             const src = arena.dupe(u8, s.source.s) catch continue;
             const meta = (userscript.parseMeta(arena, src) catch continue) orelse continue;
-            self.us_scripts.append(self.gpa, .{ .id = s.id, .meta = meta, .source = src }) catch {};
+            var rec: ScriptRec = .{ .id = s.id, .meta = meta, .source = src };
+            var raw: [16]u8 = undefined;
+            if (c.getentropy(&raw, raw.len) != 0) continue;
+            rec.cap = std.fmt.bytesToHex(raw, .lower);
+            _ = gmvalues.keyFor(meta.namespace, meta.name, &rec.key);
+            self.us_scripts.append(self.gpa, rec) catch {};
         }
     }
 
@@ -4129,38 +4143,159 @@ pub const Host = struct {
             w.writeAll(",'data-sketerm-us');") catch return;
         }
 
-        var scripts = false;
+        if (any) {
+            w.writeAll("})();") catch return;
+            runJs(frame, code.written());
+        }
         for (self.us_scripts.items) |*sc| {
             if (!userscript.applies(&sc.meta, url)) continue;
-            if (!scripts) {
-                scripts = true;
-                any = true;
-                w.writeAll("var S=[],E=[],I=[];") catch return;
-            }
-            const arr: []const u8 = switch (sc.meta.run_at) {
-                .document_start => "S",
-                .document_end => "E",
-                .document_idle => "I",
-            };
-            w.writeAll(arr) catch return;
-            w.writeAll(".push([") catch return;
-            jsonStr(w, sc.meta.name) catch return;
-            w.writeAll(",") catch return;
-            jsonStr(w, sc.source) catch return;
-            w.writeAll("]);") catch return;
+            self.injectUserscript(v, frame, sc, host);
         }
-        if (scripts) {
-            w.writeAll("function R(p){for(var i=0;i<p.length;i++){" ++
-                "try{(new Function('GM_info',p[i][1]))" ++
-                "({script:{name:p[i][0]},scriptHandler:'sketerm'});}" ++
-                "catch(e){console.error('[sketerm userscript]',p[i][0],e);}}}" ++
-                "R(S);" ++
-                "if(d.readyState==='loading')d.addEventListener('DOMContentLoaded',function(){R(E);});else R(E);" ++
-                "if(d.readyState==='complete')R(I);else window.addEventListener('load',function(){R(I);});") catch return;
+    }
+
+    /// One userscript into one document, CSP-SAFE: its source is spliced
+    /// into the command as the body of a function literal and handed to
+    /// the semantic slot (`us-run`), so no `eval`/`new Function` ever
+    /// runs — a page whose CSP forbids eval still gets its scripts (the
+    /// old `new Function` path silently ran nothing there). One
+    /// `execute_java_script` per script: a syntax error in one cannot
+    /// take the others down. The GM API is built in `semantic.js`
+    /// (`usRun`) and holds only what `@grant` asked for.
+    fn injectUserscript(self: *Host, v: *View, frame: *cef.cef_frame_t, sc: *const ScriptRec, page_host: []const u8) void {
+        _ = page_host;
+        if (!sem_secret.ok) return;
+        var code: std.Io.Writer.Allocating = .init(self.gpa);
+        defer code.deinit();
+        const w = &code.writer;
+        const slot: []const u8 = &sem_secret.slot;
+        w.print("window[\"{s}\"]&&window[\"{s}\"]({{\"op\":\"us-run\",\"sid\":{d},\"cap\":\"{s}\",\"run\":\"{s}\",\"name\":", .{
+            slot, slot, sc.id, &sc.cap, switch (sc.meta.run_at) {
+                .document_start => "start",
+                .document_end => "end",
+                .document_idle => "idle",
+            },
+        }) catch return;
+        jsonStr(w, sc.meta.name) catch return;
+        w.writeAll(",\"grants\":[") catch return;
+        for (sc.meta.grants, 0..) |g, i| {
+            if (i != 0) w.writeByte(',') catch return;
+            jsonStr(w, g) catch return;
         }
-        if (!any) return;
-        w.writeAll("})();") catch return;
+        w.writeAll("],\"info\":{\"scriptHandler\":\"sketerm\",\"version\":\"1\",\"script\":{\"name\":") catch return;
+        jsonStr(w, sc.meta.name) catch return;
+        w.writeAll(",\"namespace\":") catch return;
+        jsonStr(w, sc.meta.namespace) catch return;
+        w.writeAll(",\"version\":") catch return;
+        jsonStr(w, sc.meta.version) catch return;
+        w.writeAll(",\"description\":") catch return;
+        jsonStr(w, sc.meta.description) catch return;
+        w.writeAll(",\"runAt\":") catch return;
+        jsonStr(w, switch (sc.meta.run_at) {
+            .document_start => "document-start",
+            .document_end => "document-end",
+            .document_idle => "document-idle",
+        }) catch return;
+        w.writeAll(",\"grant\":[") catch return;
+        for (sc.meta.grants, 0..) |g, i| {
+            if (i != 0) w.writeByte(',') catch return;
+            jsonStr(w, g) catch return;
+        }
+        w.writeAll("]}},\"values\":") catch return;
+        const has_values = userscript.granted(&sc.meta, "GM_getValue") or userscript.granted(&sc.meta, "GM_listValues");
+        if (has_values) {
+            if (self.gm_values.get(&sc.key)) |st| {
+                const bytes = st.serialize(self.gpa) catch return;
+                defer self.gpa.free(bytes);
+                w.writeAll(bytes) catch return;
+            } else w.writeAll("{}") catch return;
+        } else w.writeAll("{}") catch return;
+        w.writeAll(",\"fn\":function(GM_info,GM_getValue,GM_setValue,GM_deleteValue,GM_listValues," ++
+            "GM_addStyle,GM_xmlhttpRequest,GM,unsafeWindow){\n") catch return;
+        w.writeAll(sc.source) catch return;
+        w.writeAll("\n}},0)") catch return;
+        _ = v;
         runJs(frame, code.written());
+    }
+
+    /// A `GM_*` call from a userscript (`us-call`): the value store and
+    /// `GM_xmlhttpRequest`. Authorised by the script's capability.
+    fn usCall(self: *Host, v: *View, json: []const u8) void {
+        const R = struct {
+            sid: u32 = 0,
+            cap: []const u8 = "",
+            method: []const u8 = "",
+            key: []const u8 = "",
+            value: std.json.Value = .null,
+            req: u32 = 0,
+            url: []const u8 = "",
+            xmethod: []const u8 = "GET",
+            headers: std.json.Value = .null,
+            data: ?[]const u8 = null,
+        };
+        const parsed = std.json.parseFromSlice(R, self.gpa, json, .{ .ignore_unknown_fields = true }) catch return;
+        defer parsed.deinit();
+        const r = parsed.value;
+        const sc = for (self.us_scripts.items) |*s| {
+            if (s.id == r.sid and std.mem.eql(u8, &s.cap, r.cap)) break s;
+        } else return;
+        if (std.mem.eql(u8, r.method, "setValue") or std.mem.eql(u8, r.method, "deleteValue")) {
+            if (!userscript.granted(&sc.meta, if (r.method[0] == 's') "GM_setValue" else "GM_deleteValue")) return;
+            const st = self.gm_values.get(&sc.key) orelse return;
+            if (r.method[0] == 's') {
+                var aw: std.Io.Writer.Allocating = .init(self.gpa);
+                defer aw.deinit();
+                aw.writer.writeByte('{') catch return;
+                jsonStr(&aw.writer, r.key) catch return;
+                aw.writer.writeByte(':') catch return;
+                std.json.Stringify.value(r.value, .{}, &aw.writer) catch return;
+                aw.writer.writeByte('}') catch return;
+                const ch = st.set(self.gpa, aw.written()) catch return;
+                self.gpa.free(ch);
+            } else {
+                const ch = st.remove(self.gpa, &.{r.key}) catch return;
+                self.gpa.free(ch);
+            }
+            self.gm_values.touch(&sc.key);
+            return;
+        }
+        if (!std.mem.eql(u8, r.method, "xhr")) return;
+        if (!userscript.granted(&sc.meta, "GM_xmlhttpRequest")) {
+            self.usXhrReply(v, r.req, 0, "", "", "", r.url, "GM_xmlhttpRequest is not granted (@grant)");
+            return;
+        }
+        var pf: [2048]u8 = undefined;
+        var tf: [2048]u8 = undefined;
+        const page_host = filter.hostOf(filter.foldUrl(&pf, v.url));
+        const target_host = filter.hostOf(filter.foldUrl(&tf, r.url));
+        const scheme_ok = std.mem.startsWith(u8, r.url, "http://") or std.mem.startsWith(u8, r.url, "https://");
+        if (!scheme_ok or !userscript.connectAllowed(&sc.meta, page_host, target_host)) {
+            var msg_buf: [300]u8 = undefined;
+            const msg = std.fmt.bufPrint(&msg_buf, "blocked by @connect: {s} is not declared", .{target_host}) catch "blocked by @connect";
+            self.usXhrReply(v, r.req, 0, "", "", "", r.url, msg);
+            return;
+        }
+        if (!gmXhrStart(self, v, r.req, r.url, r.xmethod, r.headers, r.data)) {
+            self.usXhrReply(v, r.req, 0, "", "", "", r.url, "the request could not be started");
+        }
+    }
+
+    /// The answer to one `GM_xmlhttpRequest`, to the page's main frame.
+    fn usXhrReply(self: *Host, v: *View, req: u32, status: i32, status_text: []const u8, headers: []const u8, body: []const u8, final_url: []const u8, err: []const u8) void {
+        var cmd: std.Io.Writer.Allocating = .init(self.gpa);
+        defer cmd.deinit();
+        const w = &cmd.writer;
+        w.print("{{\"op\":\"us-xhr\",\"req\":{d},\"status\":{d},\"statusText\":", .{ req, status }) catch return;
+        jsonStr(w, status_text) catch return;
+        w.writeAll(",\"headers\":") catch return;
+        jsonStr(w, headers) catch return;
+        w.writeAll(",\"body\":") catch return;
+        jsonStr(w, body) catch return;
+        w.writeAll(",\"finalUrl\":") catch return;
+        jsonStr(w, final_url) catch return;
+        w.writeAll(",\"error\":") catch return;
+        jsonStr(w, err) catch return;
+        w.writeByte('}') catch return;
+        self.sendScript(v, cmd.written());
     }
 
     // -- downloads -----------------------------------------------------
@@ -6217,6 +6352,7 @@ pub const Host = struct {
         // Debounced storage.local writes land here, one loop iteration
         // after their window expires.
         self.webext.flushStores(nowMs());
+        self.gm_values.flush(nowMs());
         if (self.webext_reload.items.len == 0) return;
         const pending = self.webext_reload.toOwnedSlice(self.gpa) catch return;
         defer {
@@ -8372,6 +8508,12 @@ pub const Host = struct {
         // route every `ext-*` op to the webext handler.
         if (op.len > 4 and std.mem.eql(u8, op[0..4], "ext-")) {
             self.onExtMessage(v, op, json);
+            return;
+        }
+        // Userscript GM_* calls ride it too, authorised by the script's
+        // own capability rather than by navigation generation.
+        if (std.mem.eql(u8, op, "us-call")) {
+            self.usCall(v, json);
             return;
         }
         if (head.value.gen != v.sem_nav.generation) return;
@@ -10978,8 +11120,19 @@ const FilterFetch = struct {
     /// written, because half a filter list is a working filter list
     /// that silently stops blocking half of what it used to.
     lost: bool = false,
+    /// A userscript `GM_xmlhttpRequest` riding the same URLRequest
+    /// machinery (same two-reference rule): the page view and the
+    /// script's request id to answer, and the response to answer with.
+    gm: bool = false,
+    gm_view: u32 = 0,
+    gm_req: u32 = 0,
+    status_code: i32 = 0,
+    status_text: []u8 = &.{},
+    resp_headers: []u8 = &.{},
 
     fn destroyOwned(self: *FilterFetch) void {
+        if (self.status_text.len != 0) self.gpa.free(self.status_text);
+        if (self.resp_headers.len != 0) self.gpa.free(self.resp_headers);
         self.body.deinit(self.gpa);
         self.gpa.free(self.dest);
         self.gpa.free(self.url);
@@ -11033,6 +11186,7 @@ fn subOnComplete(
                 defer release(&resp.*.base);
                 const code = if (resp.*.get_status) |gs| gs(resp) else 0;
                 f.response_ok = code >= 200 and code < 300;
+                if (f.gm) gmCaptureResponse(f, resp, code);
             }
         }
     }
@@ -11137,6 +11291,124 @@ fn filterSubFetch(host: *Host, url: []const u8, dest: []const u8, serial: u32) b
 }
 
 const filter_list_max: usize = 16 * 1024 * 1024;
+
+/// Keep what a `GM_xmlhttpRequest` answer needs from the response: the
+/// status line and the headers as `Name: value\r\n` lines (the shape
+/// `responseHeaders` has in every userscript manager).
+fn gmCaptureResponse(f: *FilterFetch, resp: *cef.cef_response_t, code: i32) void {
+    f.status_code = code;
+    var tb: [256]u8 = undefined;
+    const text = if (resp.get_status_text) |gt| userfreeInto(gt(resp), &tb) else "";
+    f.status_text = f.gpa.dupe(u8, text) catch &.{};
+    const gh = resp.get_header_map orelse return;
+    const map = cef.cef_string_multimap_alloc() orelse return;
+    defer cef.cef_string_multimap_free(map);
+    gh(resp, map);
+    var out: std.ArrayList(u8) = .empty;
+    const n = cef.cef_string_multimap_size(map);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        var key = std.mem.zeroes(cef.cef_string_t);
+        var val = std.mem.zeroes(cef.cef_string_t);
+        defer cef.cef_string_utf16_clear(&key);
+        defer cef.cef_string_utf16_clear(&val);
+        if (cef.cef_string_multimap_key(map, i, &key) == 0) continue;
+        _ = cef.cef_string_multimap_value(map, i, &val);
+        var kbuf: [256]u8 = undefined;
+        var vbuf: [2048]u8 = undefined;
+        out.print(f.gpa, "{s}: {s}\r\n", .{ utf16Into(&key, &kbuf), utf16Into(&val, &vbuf) }) catch break;
+    }
+    f.resp_headers = out.toOwnedSlice(f.gpa) catch &.{};
+}
+
+/// Start one `GM_xmlhttpRequest` through the PAGE VIEW's request
+/// context, so it carries that page's cookies and leaves by its route.
+/// Returns false when nothing was started (the caller answers).
+fn gmXhrStart(host: *Host, v: *View, req_id: u32, url: []const u8, method: []const u8, headers: std.json.Value, data: ?[]const u8) bool {
+    if (host.route_refusal.len != 0) return false;
+    const req = cef.cef_request_create() orelse return false;
+    var request_transferred = false;
+    defer if (!request_transferred) release(&req.*.base);
+    var u = std.mem.zeroes(cef.cef_string_t);
+    setStr(url, &u);
+    defer cef.cef_string_utf16_clear(&u);
+    if (req.*.set_url) |set| set(req, &u);
+    var m = std.mem.zeroes(cef.cef_string_t);
+    setStr(if (method.len == 0) "GET" else method, &m);
+    defer cef.cef_string_utf16_clear(&m);
+    if (req.*.set_method) |set| set(req, &m);
+    if (req.*.set_flags) |set| set(req, cef.UR_FLAG_ALLOW_STORED_CREDENTIALS);
+    if (headers == .object) {
+        var it = headers.object.iterator();
+        while (it.next()) |kv| {
+            if (kv.value_ptr.* != .string) continue;
+            var nk = std.mem.zeroes(cef.cef_string_t);
+            var nv = std.mem.zeroes(cef.cef_string_t);
+            setStr(kv.key_ptr.*, &nk);
+            setStr(kv.value_ptr.*.string, &nv);
+            defer cef.cef_string_utf16_clear(&nk);
+            defer cef.cef_string_utf16_clear(&nv);
+            if (req.*.set_header_by_name) |seth| seth(req, &nk, &nv, 1);
+        }
+    }
+    if (data) |body| if (body.len != 0) {
+        const pd = cef.cef_post_data_create() orelse return false;
+        const el = cef.cef_post_data_element_create() orelse {
+            release(&pd.*.base);
+            return false;
+        };
+        if (el.*.set_to_bytes) |stb| stb(el, body.len, body.ptr);
+        // Both are CONSUMED by the calls they are passed to.
+        if (pd.*.add_element) |ae| _ = ae(pd, el) else release(&el.*.base);
+        if (req.*.set_post_data) |spd| spd(req, pd) else release(&pd.*.base);
+    };
+
+    host.filter_fetches.ensureUnusedCapacity(host.gpa, 1) catch return false;
+    const f = host.gpa.create(FilterFetch) catch return false;
+    const dest_owned = host.gpa.dupe(u8, "") catch {
+        host.gpa.destroy(f);
+        return false;
+    };
+    const url_owned = host.gpa.dupe(u8, url) catch {
+        host.gpa.free(dest_owned);
+        host.gpa.destroy(f);
+        return false;
+    };
+    f.* = .{
+        .client = .{
+            .base = SubRef.base(),
+            .on_request_complete = subOnComplete,
+            .on_upload_progress = subOnUploadProgress,
+            .on_download_progress = subOnDownloadProgress,
+            .on_download_data = subOnDownloadData,
+            .get_auth_credentials = subGetAuthCredentials,
+        },
+        .gpa = host.gpa,
+        .dest = dest_owned,
+        .url = url_owned,
+        .serial = 0,
+        .gm = true,
+        .gm_view = v.id,
+        .gm_req = req_id,
+    };
+    // The page's context: the returned reference is ours and the create
+    // call CONSUMES it (CToCpp transfers), exactly like the request.
+    var rc: ?*cef.cef_request_context_t = null;
+    if (browserHost(v)) |bh| {
+        defer release(&bh.base);
+        if (bh.get_request_context) |grc| rc = grc(bh);
+    }
+    f.refs.store(2, .release);
+    request_transferred = true;
+    const handle = cef.cef_urlrequest_create(req, &f.client, rc);
+    if (handle) |h| {
+        f.request = h;
+        host.filter_fetches.appendAssumeCapacity(f);
+        return true;
+    }
+    _ = SubRef.release(&f.client.base);
+    return false;
+}
 
 fn subRules() u32 {
     g_int.acquire();
@@ -11313,6 +11585,17 @@ fn filterSubPump(self: *Host, now_ms: i64) void {
         const f = self.filter_fetches.items[i];
         if (!f.completed) {
             i += 1;
+            continue;
+        }
+        if (f.gm) {
+            if (self.find(f.gm_view)) |v| {
+                if (f.status_ok and !f.lost) {
+                    self.usXhrReply(v, f.gm_req, f.status_code, f.status_text, f.resp_headers, f.body.items, f.url, "");
+                } else {
+                    self.usXhrReply(v, f.gm_req, f.status_code, f.status_text, f.resp_headers, "", f.url, "network error");
+                }
+            }
+            retireFilterFetch(self, i);
             continue;
         }
         const current = self.filter_sub_batch_open and f.serial == self.filter_sub_serial;

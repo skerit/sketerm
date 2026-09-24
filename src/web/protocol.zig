@@ -151,6 +151,15 @@ pub const CAP_A11Y_CARET = "a11y-caret";
 /// set after any edit and the helper holds no partial state. An older
 /// helper skips the frames and pages simply get no user content.
 pub const CAP_USERSCRIPTS = "userscripts";
+/// Userscripts get a real GM_* API — GM_getValue/setValue/deleteValue/
+/// listValues (persisted by the helper, merged across route instances),
+/// GM_addStyle, GM_info, GM_xmlhttpRequest through the page's own
+/// request context with `@connect` enforced, and the `GM.*` promise
+/// forms — each only when `@grant`ed, and injected CSP-SAFE (the source
+/// travels compiled into the command; nothing is eval'd). Same frames
+/// as `userscripts`; an older helper runs scripts with `GM_info` only,
+/// and not at all on a page whose CSP forbids eval.
+pub const CAP_USERSCRIPTS_GM = "userscripts-gm";
 /// The helper accepts `context_create`/`context_destroy`: per-tab
 /// identity contexts (separate cookie jars / caches), each optionally
 /// pointed at a proxy. A view's `context` field then selects one
@@ -361,6 +370,7 @@ pub const Cap = enum {
     a11y,
     a11y_caret,
     userscripts,
+    userscripts_gm,
     contexts,
     contexts_fail_closed,
     sitedata,

@@ -1624,7 +1624,20 @@ costs the caller its entire 120s deadline and explains nothing.
   applied instantly to live views. Injection is browser-side
   `execute_java_script` at load start (`injectUserContent`), so
   "document-start" means AT COMMIT, cosmetic hiding can flash, and
-  scripts run wrapped in the page's MAIN world — no isolated world
-  exists on this path, and GM_* is a no-op `GM_info` only. Cosmetic
+  scripts run in the page's MAIN world — no isolated world exists on
+  this path. **GM_* is real (capability `userscripts-gm`, smoke-web
+  stage 44):** each script is its own object command to the semantic
+  slot (`us-run`) with its SOURCE spliced in as a function literal, so
+  a page with `script-src 'none'` still runs it (the old `new Function`
+  path ran nothing there, silently). `semantic.js usRun` builds only the
+  `@grant`ed functions (an ungranted `GM_x` is `undefined` inside the
+  script): values are an inlined snapshot with writes sent back as
+  `us-call` and persisted by `gmvalues.zig` (per `@namespace`+`@name`,
+  journal+flock merge like `storage.local`); `GM_xmlhttpRequest` is a
+  `cef_urlrequest` in the PAGE VIEW's request context (its cookies, its
+  route; the `FilterFetch` machinery with `gm` set) and is refused
+  unless the target is the page's own host or a `@connect` covers it
+  (`userscript.connectAllowed`, strict when `@connect` is absent). A
+  `us-call` carries the script's per-set random capability. Cosmetic
   hiding (`filter.zig cosmeticFor`) obeys the SAME per-view shield
   gate as network verdicts. Smoke stages 28-30 assert all of it.

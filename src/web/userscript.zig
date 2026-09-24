@@ -11,10 +11,11 @@
 //! counted in `dropped_patterns` — the script then simply never
 //! matches through that pattern), `@run-at` (`document-start` /
 //! `document-end` / `document-idle`; anything else falls back to the
-//! Violentmonkey default `document-end`), `@grant` (recorded; the
-//! injector provides no GM_* API beyond a no-op `GM_info` regardless —
-//! that limitation is deliberate and documented at the injection site
-//! in cefhost.zig). Unknown keys are ignored.
+//! Violentmonkey default `document-end`), `@grant` (the GM_* functions
+//! the injector hands the script — `granted`), `@connect` (the hosts
+//! GM_xmlhttpRequest may reach — `connectAllowed`), `@namespace`,
+//! `@version`, `@description` (GM_info, and the value-store key).
+//! Unknown keys are ignored.
 //!
 //! A script with NO match/include patterns applies to every page
 //! (Violentmonkey's rule); `@exclude` always wins over both.
@@ -38,6 +39,16 @@ pub const Meta = struct {
     excludes: []const []const u8 = &.{},
     /// True when every `@grant` value is `none` (or none was given).
     grant_none: bool = true,
+    /// `@grant` values other than `none`, verbatim (`GM_getValue`,
+    /// `GM.xmlHttpRequest`, `unsafeWindow`, ...). Only these GM
+    /// functions are handed to the script.
+    grants: []const []const u8 = &.{},
+    /// `@connect` values: the hosts `GM_xmlhttpRequest` may reach
+    /// besides the page's own (`*` = any, `self` = the page's host).
+    connects: []const []const u8 = &.{},
+    namespace: []const u8 = "",
+    version: []const u8 = "",
+    description: []const u8 = "",
     /// `/regex/` include/exclude patterns this parser refuses.
     dropped_patterns: u32 = 0,
 };
@@ -58,6 +69,10 @@ pub fn parseMeta(gpa: std.mem.Allocator, source: []const u8) !?Meta {
     errdefer matches.deinit(gpa);
     errdefer includes.deinit(gpa);
     errdefer excludes.deinit(gpa);
+    var grants: std.ArrayList([]const u8) = .empty;
+    errdefer grants.deinit(gpa);
+    var connects: std.ArrayList([]const u8) = .empty;
+    errdefer connects.deinit(gpa);
 
     var lines = std.mem.splitScalar(u8, block, '\n');
     while (lines.next()) |raw| {
@@ -94,7 +109,18 @@ pub fn parseMeta(gpa: std.mem.Allocator, source: []const u8) !?Meta {
                 meta.run_at = .document_idle;
             }
         } else if (std.mem.eql(u8, key, "@grant")) {
-            if (!std.mem.eql(u8, val, "none")) meta.grant_none = false;
+            if (!std.mem.eql(u8, val, "none")) {
+                meta.grant_none = false;
+                try grants.append(gpa, val);
+            }
+        } else if (std.mem.eql(u8, key, "@connect")) {
+            try connects.append(gpa, val);
+        } else if (std.mem.eql(u8, key, "@namespace")) {
+            if (meta.namespace.len == 0) meta.namespace = val;
+        } else if (std.mem.eql(u8, key, "@version")) {
+            if (meta.version.len == 0) meta.version = val;
+        } else if (std.mem.eql(u8, key, "@description")) {
+            if (meta.description.len == 0) meta.description = val;
         }
     }
     meta.matches = try matches.toOwnedSlice(gpa);
@@ -102,6 +128,10 @@ pub fn parseMeta(gpa: std.mem.Allocator, source: []const u8) !?Meta {
     meta.includes = try includes.toOwnedSlice(gpa);
     errdefer gpa.free(meta.includes);
     meta.excludes = try excludes.toOwnedSlice(gpa);
+    errdefer gpa.free(meta.excludes);
+    meta.grants = try grants.toOwnedSlice(gpa);
+    errdefer gpa.free(meta.grants);
+    meta.connects = try connects.toOwnedSlice(gpa);
     return meta;
 }
 
@@ -109,6 +139,76 @@ pub fn freeMeta(gpa: std.mem.Allocator, meta: *const Meta) void {
     gpa.free(meta.matches);
     gpa.free(meta.includes);
     gpa.free(meta.excludes);
+    gpa.free(meta.grants);
+    gpa.free(meta.connects);
+}
+
+/// Whether the script declared `@grant name`. `GM_foo` and its
+/// promise-API spelling `GM.foo` grant each other, as in
+/// Violentmonkey/Tampermonkey.
+pub fn granted(meta: *const Meta, name: []const u8) bool {
+    for (meta.grants) |g| {
+        if (std.mem.eql(u8, g, name)) return true;
+        if (std.mem.startsWith(u8, g, "GM.") and std.mem.startsWith(u8, name, "GM_") and
+            std.ascii.eqlIgnoreCase(g[3..], name[3..])) return true;
+        if (std.mem.startsWith(u8, g, "GM_") and std.mem.startsWith(u8, name, "GM.") and
+            std.ascii.eqlIgnoreCase(g[3..], name[3..])) return true;
+    }
+    return false;
+}
+
+/// `@connect` enforcement for `GM_xmlhttpRequest`: the page's own host
+/// is always reachable; beyond it a request needs a `@connect` naming
+/// the target host or a parent domain of it, `*` (anything), `self`
+/// (the page host again) or `localhost` (loopback names). With no
+/// `@connect` at all only the page's host is reachable — the strict
+/// reading, because an undeclared cross-origin request with the user's
+/// cookies is exactly what the key exists to prevent.
+pub fn connectAllowed(meta: *const Meta, page_host: []const u8, target_host: []const u8) bool {
+    if (target_host.len == 0) return false;
+    if (page_host.len != 0 and std.ascii.eqlIgnoreCase(page_host, target_host)) return true;
+    for (meta.connects) |cn| {
+        if (std.mem.eql(u8, cn, "*")) return true;
+        if (std.mem.eql(u8, cn, "self")) {
+            if (std.ascii.eqlIgnoreCase(page_host, target_host)) return true;
+            continue;
+        }
+        if (std.mem.eql(u8, cn, "localhost")) {
+            if (std.mem.eql(u8, target_host, "localhost") or std.mem.eql(u8, target_host, "127.0.0.1") or
+                std.mem.eql(u8, target_host, "[::1]")) return true;
+            continue;
+        }
+        if (std.ascii.eqlIgnoreCase(cn, target_host)) return true;
+        // A parent domain covers its subdomains.
+        if (target_host.len > cn.len + 1 and target_host[target_host.len - cn.len - 1] == '.' and
+            std.ascii.eqlIgnoreCase(target_host[target_host.len - cn.len ..], cn)) return true;
+    }
+    return false;
+}
+
+test "connectAllowed: page host, declared hosts and parents, star, and nothing else" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\// ==UserScript==
+        \\// @name c
+        \\// @grant GM_xmlhttpRequest
+        \\// @grant GM.getValue
+        \\// @connect example.com
+        \\// @connect localhost
+        \\// ==/UserScript==
+    ;
+    const meta = (try parseMeta(gpa, src)).?;
+    defer freeMeta(gpa, &meta);
+    try std.testing.expect(connectAllowed(&meta, "page.test", "page.test"));
+    try std.testing.expect(connectAllowed(&meta, "page.test", "example.com"));
+    try std.testing.expect(connectAllowed(&meta, "page.test", "api.example.com"));
+    try std.testing.expect(!connectAllowed(&meta, "page.test", "badexample.com"));
+    try std.testing.expect(connectAllowed(&meta, "page.test", "127.0.0.1"));
+    try std.testing.expect(!connectAllowed(&meta, "page.test", "evil.test"));
+    try std.testing.expect(granted(&meta, "GM_xmlhttpRequest"));
+    try std.testing.expect(granted(&meta, "GM_getValue"));
+    try std.testing.expect(!granted(&meta, "GM_setValue"));
+    try std.testing.expect(!meta.grant_none);
 }
 
 /// Does the script run on `url`? Patterns win in Violentmonkey order:

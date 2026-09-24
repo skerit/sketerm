@@ -132,6 +132,7 @@ const unconditional_caps = [_]proto.Cap{
     .contexts,
     .contexts_fail_closed,
     .userscripts,
+    .userscripts_gm,
     .sitedata,
     .flush,
     .frames_inline,
