@@ -311,11 +311,7 @@ pub fn launchViewer(self: *BrowserView, tab: *BTab, current: []const u8) void {
     const allocator = self.allocator;
     var walk: SpecWalk = .{};
     defer walk.deinit(allocator);
-    const selected_only = tab.selected.items.len > 1 and blk: {
-        for (tab.selected.items) |path| if (std.mem.eql(u8, path, current)) break :blk true;
-        break :blk false;
-    };
-    if (selected_only) {
+    if (tab.selected.actsOnAll(current)) {
         for (tab.selected.items) |path| {
             if (!paths.isViewerName(path)) continue;
             if (!walk.add(allocator, tab.hc.host, path, current)) break;

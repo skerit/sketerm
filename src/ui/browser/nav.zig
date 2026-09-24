@@ -18,6 +18,7 @@ const Entry = @import("types.zig").Entry;
 const HostConn = @import("types.zig").HostConn;
 const NavigationIntent = @import("types.zig").NavigationIntent;
 const Pending = @import("types.zig").Pending;
+const SelectionSet = @import("types.zig").SelectionSet;
 const colview = @import("colview.zig");
 const render_mod = @import("render.zig");
 const selection = @import("selection.zig");
@@ -462,8 +463,7 @@ pub fn commitNavigation(self: *BrowserView, tab: *BTab, hc: *HostConn, candidate
     tab.clearNavError();
     self.applyHistoryIntent(tab, intent);
     mountbypass.onNavigated(self, tab, hc.host, candidate.path);
-    for (tab.selected.items) |value| self.allocator.free(value);
-    tab.selected.clearRetainingCapacity();
+    tab.selected.clear(self.allocator);
     // The rows the visual range was anchored in are about to go.
     self.visualForget(tab);
     self.ta_len = 0;
@@ -1471,8 +1471,6 @@ pub fn selectPattern(self: *BrowserView, pattern: []const u8, invert: bool) void
 pub fn selectPatternDirs(self: *BrowserView, tab: *BTab, pattern: []const u8, invert: bool) void {
     var arena = std.heap.ArenaAllocator.init(self.allocator);
     defer arena.deinit();
-    var existing = std.StringHashMap(void).init(arena.allocator());
-    for (tab.selected.items) |path| existing.put(arena.allocator().dupe(u8, path) catch continue, {}) catch {};
     // Several content hits can name one file. Match any visible hit,
     // then select or invert that file once, using its real identity.
     var matches: std.array_hash_map.String(bool) = .{};
@@ -1490,14 +1488,16 @@ pub fn selectPatternDirs(self: *BrowserView, tab: *BTab, pattern: []const u8, in
             match.value_ptr.* = match.value_ptr.* or fsjob.nameMatches(pattern, entry.name);
         }
     }
-    for (tab.selected.items) |path| self.allocator.free(path);
-    tab.selected.clearRetainingCapacity();
+    // The new selection is decided against the OLD one, so it is
+    // built aside and swapped in.
+    var next: SelectionSet = .empty;
     for (matches.keys(), matches.values()) |path, matched| {
-        const selected = if (invert) (existing.contains(path) != matched) else matched;
-        if (!selected) continue;
-        const owned = self.allocator.dupe(u8, path) catch continue;
-        tab.selected.append(self.allocator, owned) catch self.allocator.free(owned);
+        const selected = if (invert) (tab.selected.contains(path) != matched) else matched;
+        if (selected) _ = next.add(self.allocator, path);
     }
+    tab.selected.deinit(self.allocator);
+    tab.selected = next;
+    tab.selected.generation +%= 1;
 }
 
 /// Idle gap after which the next keystroke starts a fresh prefix.
@@ -1728,10 +1728,7 @@ test "pattern selection uses real paths and inverts duplicate content hits once"
         .colview = undefined,
         .tab_label = undefined,
     };
-    defer {
-        for (tab.selected.items) |p| a.free(p);
-        tab.selected.deinit(a);
-    }
+    defer tab.selected.deinit(a);
 
     selectPatternDirs(&view, &tab, "*", false);
     try t.expectEqual(@as(usize, 2), tab.selected.items.len);

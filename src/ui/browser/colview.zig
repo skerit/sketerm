@@ -536,8 +536,7 @@ fn onSelectionChanged(_: *c.GtkSelectionModel, _: c.guint, _: c.guint, user: ?*a
 /// the GTK selection.
 pub fn syncSelectedMirror(tab: *BTab) void {
     const a = tab.view.allocator;
-    for (tab.selected.items) |p| a.free(p);
-    tab.selected.clearRetainingCapacity();
+    tab.selected.clear(a);
     const bs = c.gtk_selection_model_get_selection(selModel(tab));
     defer c.gtk_bitset_unref(bs);
     var iter: c.GtkBitsetIter = undefined;
@@ -545,10 +544,7 @@ pub fn syncSelectedMirror(tab: *BTab) void {
     if (c.gtk_bitset_iter_init_first(&iter, bs, &pos) == 0) return;
     while (true) {
         if (itemDataAt(tab, pos)) |d| {
-            if (d.kind == .entry) {
-                const owned = a.dupe(u8, d.path) catch break;
-                tab.selected.append(a, owned) catch a.free(owned);
-            }
+            if (d.kind == .entry) _ = tab.selected.add(a, d.path);
         }
         if (c.gtk_bitset_iter_next(&iter, &pos) == 0) break;
     }
@@ -1497,13 +1493,7 @@ pub fn syncSelectionFromPaths(tab: *BTab) void {
     var i: c.guint = 0;
     while (i < n) : (i += 1) {
         const d = itemDataAt(tab, i) orelse continue;
-        if (d.kind != .entry) continue;
-        for (tab.selected.items) |path| {
-            if (std.mem.eql(u8, path, d.path)) {
-                _ = c.gtk_bitset_add(want, i);
-                break;
-            }
-        }
+        if (d.kind == .entry and tab.selected.contains(d.path)) _ = c.gtk_bitset_add(want, i);
     }
     setSelection(tab, want);
 }
@@ -1604,11 +1594,10 @@ test "visual render boundary commits structural changes but keeps content refres
         for ([_][]const u8{ "A", "B", "C" }) |name|
             try root.entries.append(a, try types.testEntry(a, name, null));
         tab.vs.grouped = false;
-        for (tab.selected.items) |p| a.free(p);
-        tab.selected.clearRetainingCapacity();
+        tab.selected.clear(a);
         renderList(&view, &tab);
-        try tab.selected.append(a, try a.dupe(u8, "/data/B"));
-        try tab.selected.append(a, try a.dupe(u8, "/data/C"));
+        _ = tab.selected.add(a, "/data/B");
+        _ = tab.selected.add(a, "/data/C");
         try tab.sel.saved.append(a, try a.dupe(u8, "/data/A"));
         tab.sel.anchor = 1;
         syncSelectionFromPaths(&tab);

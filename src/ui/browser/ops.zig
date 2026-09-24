@@ -137,10 +137,7 @@ pub fn copyToClip(ctx: *MenuCtx, cut: bool) void {
     const path = ctx.path orelse return menuDone(ctx);
     // A multi-selection that includes the clicked row copies the
     // whole selection; otherwise just the clicked entry.
-    const in_selection = for (ctx.tab.selected.items) |sp| {
-        if (std.mem.eql(u8, sp, path)) break true;
-    } else false;
-    if (in_selection and ctx.tab.selected.items.len > 1) {
+    if (ctx.tab.selected.actsOnAll(path)) {
         clipStore(self, ctx.tab, ctx.tab.selected.items, cut);
     } else {
         clipStore(self, ctx.tab, (&[_][]u8{path})[0..], cut);
@@ -1492,11 +1489,7 @@ pub fn setMountXattr(ctx: *MenuCtx, comptime attr: [:0]const u8, comptime okmsg:
 /// the single-target case.
 fn menuTargets(ctx: *MenuCtx, one: *[1][]u8) []const []u8 {
     const path = ctx.path orelse return &.{};
-    const in_selection = for (ctx.tab.selected.items) |sp| {
-        if (std.mem.eql(u8, sp, path)) break true;
-    } else false;
-    if (in_selection and ctx.tab.selected.items.len > 1)
-        return ctx.tab.selected.items;
+    if (ctx.tab.selected.actsOnAll(path)) return ctx.tab.selected.items;
     one[0] = path;
     return one;
 }
@@ -2743,10 +2736,7 @@ pub fn sendToPeer(self: *BrowserView, move: bool, clicked: ?[]const u8) void {
     var one: [1][]u8 = undefined;
     var sources: []const []u8 = tab.selected.items;
     if (clicked) |path| {
-        const in_selection = for (tab.selected.items) |sp| {
-            if (std.mem.eql(u8, sp, path)) break true;
-        } else false;
-        if (!in_selection or tab.selected.items.len <= 1) {
+        if (!tab.selected.actsOnAll(path)) {
             one[0] = @constCast(path);
             sources = one[0..];
         }

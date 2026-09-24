@@ -22,6 +22,7 @@ const paths = @import("../../filebrowser/paths.zig");
 const fsserve = @import("../../mux/fsserve.zig");
 const formatSpec = paths.formatSpec;
 const naturalLess = @import("../../filebrowser/format.zig").naturalLess;
+pub const SelectionSet = @import("../../filebrowser/selection_set.zig").SelectionSet;
 pub const JobOp = @import("../../filebrowser/jobop.zig").JobOp;
 
 /// One owned directory entry (strings owned by the Dir's allocator).
@@ -666,7 +667,9 @@ pub const BTab = struct {
     navigation_generation: u64 = 0,
     /// Set while this tab browses a mount through its source host.
     bypass: ?BypassLink = null,
-    selected: std.ArrayList([]u8) = .empty,
+    /// THE selection: every verb reads it, the GTK selection models
+    /// are derived from it (filebrowser/selection_set.zig).
+    selected: SelectionSet = .empty,
     /// Full path selected once it appears in a streamed listing.
     pending_reveal: ?[]u8 = null,
     pending_reveal_host: ?[]u8 = null,
@@ -1000,7 +1003,6 @@ pub const BTab = struct {
         self.back.deinit(a);
         for (self.fwd.items) |p| a.free(p);
         self.fwd.deinit(a);
-        for (self.selected.items) |p| a.free(p);
         self.selected.deinit(a);
         if (self.pending_reveal) |path| a.free(path);
         if (self.pending_reveal_host) |host| a.free(host);

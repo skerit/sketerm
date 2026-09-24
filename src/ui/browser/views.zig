@@ -145,12 +145,11 @@ pub fn pruneSelectionToVisible(tab: *BTab) void {
             hit.* = (hit.* orelse false) or entryVisible(tab, e);
         }
     }
-    i = 0;
-    while (i < tab.selected.items.len) {
-        if (visible.get(tab.selected.items[i]).? == false) {
-            a.free(tab.selected.orderedRemove(i));
-        } else i += 1;
-    }
+    tab.selected.retain(a, &visible, struct {
+        fn keep(known: *const std.StringHashMap(?bool), path: []const u8) bool {
+            return known.get(path).? != false;
+        }
+    }.keep);
 }
 
 test "visibility pruning keeps any visible content hit and unknown paths" {
@@ -179,8 +178,8 @@ test "visibility pruning keeps any visible content hit and unknown paths" {
         // with both visible-first and hidden-first duplicate ordering.
         @import("nav.zig").selectPatternDirs(&view, &tab, "*", false);
         try t.expectEqual(@as(usize, 1), tab.selected.items.len);
-        try tab.selected.append(a, try a.dupe(u8, "/data/.first"));
-        try tab.selected.append(a, try a.dupe(u8, "/not-yet-listed"));
+        _ = tab.selected.add(a, "/data/.first");
+        _ = tab.selected.add(a, "/not-yet-listed");
         pruneSelectionToVisible(&tab);
         try t.expectEqual(@as(usize, 2), tab.selected.items.len);
         try t.expectEqualStrings("/data/hit.txt", tab.selected.items[0]);

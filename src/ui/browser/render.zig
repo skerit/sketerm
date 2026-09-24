@@ -304,18 +304,8 @@ pub fn applyPendingSelect(self: *BrowserView, tab: *BTab) void {
             continue;
         }
         const landed = tab.pending_select.orderedRemove(i);
-        const already = for (tab.selected.items) |sp| {
-            if (std.mem.eql(u8, sp, landed)) break true;
-        } else false;
-        if (already) {
-            a.free(landed);
-            continue;
-        }
-        tab.selected.append(a, landed) catch {
-            a.free(landed);
-            continue;
-        };
-        if (first_landed == null) first_landed = tab.selected.items[tab.selected.items.len - 1];
+        if (!tab.selected.adopt(a, landed)) continue;
+        if (first_landed == null) first_landed = tab.selected.last();
     }
     // Pushing the selection re-syncs the mirror (selection-changed ->
     // syncSelectedMirror rebuilds `tab.selected`), so the landed path
@@ -338,10 +328,7 @@ pub fn applyPendingSelect(self: *BrowserView, tab: *BTab) void {
             while (c.gtk_flow_box_get_child_at_index(flowbox, index)) |child| : (index += 1) {
                 const data = c.g_object_get_data(@ptrCast(child), "sketerm-row") orelse continue;
                 const row: *RowCtx = @ptrCast(@alignCast(data));
-                const wanted = for (tab.selected.items) |sp| {
-                    if (std.mem.eql(u8, sp, row.path)) break true;
-                } else false;
-                if (wanted) {
+                if (tab.selected.contains(row.path)) {
                     c.gtk_flow_box_select_child(flowbox, child);
                 } else {
                     c.gtk_flow_box_unselect_child(flowbox, child);
@@ -1114,14 +1101,7 @@ pub fn renderGrid(self: *BrowserView, tab: *BTab) void {
     while (c.gtk_flow_box_get_child_at_index(fb, i)) |child| : (i += 1) {
         const data = c.g_object_get_data(@ptrCast(child), "sketerm-row") orelse continue;
         const ctx: *RowCtx = @ptrCast(@alignCast(data));
-        var selected = false;
-        for (tab.selected.items) |path| {
-            if (std.mem.eql(u8, path, ctx.path)) {
-                selected = true;
-                break;
-            }
-        }
-        if (selected) c.gtk_flow_box_select_child(fb, child) else c.gtk_flow_box_unselect_child(fb, child);
+        if (tab.selected.contains(ctx.path)) c.gtk_flow_box_select_child(fb, child) else c.gtk_flow_box_unselect_child(fb, child);
     }
 }
 
@@ -1306,16 +1286,14 @@ pub fn onGridSelectionChanged(fb: *c.GtkFlowBox, user: ?*anyopaque) callconv(.c)
     const tab = cast.userData(BTab, user);
     if (tab.rendering) return;
     const a = tab.view.allocator;
-    for (tab.selected.items) |p| a.free(p);
-    tab.selected.clearRetainingCapacity();
+    tab.selected.clear(a);
     var children = c.gtk_flow_box_get_selected_children(fb);
     const head = children;
     while (children != null) : (children = children.*.next) {
         const child: *c.GtkWidget = @ptrCast(@alignCast(children.*.data orelse continue));
         const data = c.g_object_get_data(@ptrCast(child), "sketerm-row") orelse continue;
         const ctx: *RowCtx = @ptrCast(@alignCast(data));
-        const owned = a.dupe(u8, ctx.path) catch continue;
-        tab.selected.append(a, owned) catch a.free(owned);
+        _ = tab.selected.add(a, ctx.path);
     }
     if (head != null) c.g_list_free(head);
     tab.view.updatePreview();

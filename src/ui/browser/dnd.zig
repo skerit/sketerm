@@ -37,7 +37,7 @@ pub fn clearDragSelection(tab: *BTab) void {
 /// Snapshot a selected row before GtkMultiSelection handles the press.
 pub fn armSelection(tab: *BTab, dragged: []const u8) void {
     clearDragSelection(tab);
-    if (!useSelection(tab.selected.items, dragged)) return;
+    if (!tab.selected.actsOnAll(dragged)) return;
     for (tab.selected.items) |path| {
         const copy = tab.view.allocator.dupe(u8, path) catch {
             clearDragSelection(tab);

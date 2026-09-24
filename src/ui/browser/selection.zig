@@ -507,7 +507,8 @@ pub fn visualForget(self: *BrowserView, tab: *BTab) void {
 /// Only authoritative deletion events may disarm absent paths: an
 /// incomplete listing or a collapsed subtree is not evidence of deletion.
 pub fn forgetDeleted(tab: *BTab, path: []const u8) void {
-    for ([_]*std.ArrayList([]u8){ &tab.selected, &tab.sel.saved, &tab.pending_select }) |paths| {
+    tab.selected.removeWithin(tab.view.allocator, path);
+    for ([_]*std.ArrayList([]u8){ &tab.sel.saved, &tab.pending_select }) |paths| {
         var i: usize = 0;
         while (i < paths.items.len) {
             if (@import("../../filebrowser/paths.zig").dirWithin(paths.items[i], path)) {
@@ -526,9 +527,7 @@ pub fn forgetDeleted(tab: *BTab, path: []const u8) void {
 fn markTargets(ctx: *MenuCtx, one: *[1][]u8) []const []u8 {
     const tab = ctx.tab;
     const p = ctx.path orelse return tab.selected.items;
-    for (tab.selected.items) |sp| {
-        if (std.mem.eql(u8, sp, p)) return tab.selected.items;
-    }
+    if (tab.selected.contains(p)) return tab.selected.items;
     one[0] = p;
     return one[0..1];
 }
@@ -1165,13 +1164,12 @@ test "committing visual mode preserves selected paths and releases the old ancho
     };
     defer {
         tab.sel.deinit(a);
-        for (tab.selected.items) |p| a.free(p);
         tab.selected.deinit(a);
     }
     tab.sel.anchor = 1;
     try tab.sel.saved.append(a, try a.dupe(u8, "/data/B"));
-    try tab.selected.append(a, try a.dupe(u8, "/data/B"));
-    try tab.selected.append(a, try a.dupe(u8, "/data/C"));
+    _ = tab.selected.add(a, "/data/B");
+    _ = tab.selected.add(a, "/data/C");
 
     commitVisual(&view, &tab);
     try t.expect(tab.sel.anchor == null);

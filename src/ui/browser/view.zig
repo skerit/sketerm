@@ -1160,8 +1160,7 @@ pub const BrowserView = struct {
                 tab.pending_select_batch = batch;
                 for (tab.pending_select.items) |p| self.allocator.free(p);
                 tab.pending_select.clearRetainingCapacity();
-                for (tab.selected.items) |p| self.allocator.free(p);
-                tab.selected.clearRetainingCapacity();
+                tab.selected.clear(self.allocator);
             }
             const owned = self.allocator.dupe(u8, path) catch continue;
             tab.pending_select.append(self.allocator, owned) catch {
@@ -1331,8 +1330,7 @@ pub const BrowserView = struct {
         for (state.forward) |ref| self.appendHistoryRef(&tab.fwd, ref);
         for (state.selected) |ref| {
             if (!std.mem.eql(u8, ref.host, tab.hc.host orelse "")) continue;
-            const p = self.allocator.dupe(u8, ref.path) catch continue;
-            tab.selected.append(self.allocator, p) catch self.allocator.free(p);
+            _ = tab.selected.add(self.allocator, ref.path);
         }
         tab.show_hidden = state.show_hidden;
         tab.view_mode = state.view;

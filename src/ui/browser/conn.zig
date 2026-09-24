@@ -1983,8 +1983,9 @@ test "authoritative delta deletion disarms selected paths and saved descendants 
         .tab_label = undefined,
     };
     try view.tabs.append(a, &tab);
-    for ([_]*std.ArrayList([]u8){ &tab.selected, &tab.sel.saved, &tab.pending_select }) |paths| {
-        for ([_][]const u8{ "/data/B", "/data/B/child", "/data/B/deep/child", "/data/BB/keep", "/not-yet-listed" }) |path|
+    for ([_][]const u8{ "/data/B", "/data/B/child", "/data/B/deep/child", "/data/BB/keep", "/not-yet-listed" }) |path| {
+        _ = tab.selected.add(a, path);
+        for ([_]*std.ArrayList([]u8){ &tab.sel.saved, &tab.pending_select }) |paths|
             try paths.append(a, try a.dupe(u8, path));
     }
     // A partial listing/upsert must not prune identities absent from it.
@@ -1998,11 +1999,13 @@ test "authoritative delta deletion disarms selected paths and saved descendants 
     ;
     try t.expect(onDelta(&view, &hc, deletion));
     try t.expect(onDelta(&view, &hc, deletion));
-    for ([_]*std.ArrayList([]u8){ &tab.selected, &tab.sel.saved, &tab.pending_select }) |paths| {
-        try t.expectEqual(@as(usize, 2), paths.items.len);
-        try t.expectEqualStrings("/data/BB/keep", paths.items[0]);
-        try t.expectEqualStrings("/not-yet-listed", paths.items[1]);
+    for ([_][]const []u8{ tab.selected.items, tab.sel.saved.items, tab.pending_select.items }) |paths| {
+        try t.expectEqual(@as(usize, 2), paths.len);
+        try t.expectEqualStrings("/data/BB/keep", paths[0]);
+        try t.expectEqualStrings("/not-yet-listed", paths[1]);
     }
+    try t.expect(tab.selected.contains("/data/BB/keep"));
+    try t.expect(!tab.selected.contains("/data/B/child"));
     try t.expect(onDelta(&view, &hc,
         \\{"view":1,"changes":[{"op":"upsert","entry":{"name":"B","kind":"dir"}}]}
     ));
@@ -2013,7 +2016,7 @@ test "authoritative delta deletion disarms selected paths and saved descendants 
     // never its target.
     root.path = @constCast("/");
     try root.entries.append(a, try types.testEntry(a, "link", "/not-yet-listed"));
-    try tab.selected.append(a, try a.dupe(u8, "/link"));
+    _ = tab.selected.add(a, "/link");
     try t.expect(onDelta(&view, &hc,
         \\{"view":1,"changes":[{"op":"del","name":"link"}]}
     ));
