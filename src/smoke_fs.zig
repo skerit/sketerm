@@ -3,9 +3,9 @@
 //! runs), live directory views (inotify deltas for external create /
 //! write / rename / delete), the mutation verbs, ranged read/write,
 //! stat, view teardown (close, dir-gone, client death), error paths,
-//! and a broker-mode pass (fs frames are served by the process owning
-//! the client connection — the broker-handoff lesson says: never
-//! trust a single-daemon green). `zig build smoke-fs`.
+//! and cross-daemon transfers. Every daemon is a broker, so the fs
+//! frames are served by the broker owning the client connection.
+//! `zig build smoke-fs`.
 
 const std = @import("std");
 const c = @import("c.zig").c;
@@ -4686,20 +4686,23 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     };
     const allocator = gpa_state.allocator();
 
-    // ── first daemon pass ──────────────────────────────────────
+    // ── fs surface pass ──────────────────────────────────────
+    // One pass: every daemon is a broker now (the monolith role is
+    // gone), so the separate "broker" pass this used to repeat ran the
+    // identical stages against an identical second broker.
     var path_buf: [128]u8 = undefined;
     const sock_path = std.fmt.bufPrint(&path_buf, "/tmp/sketerm-smoke-fs-{d}/mux.sock", .{c.getpid()}) catch unreachable;
     registerTmpRoot(std.fs.path.dirname(sock_path).?);
     const d = daemon_mod.Daemon.init(allocator, sock_path) catch fail("daemon init");
     const th = std.Thread.spawn(.{}, daemonMain, .{d}) catch fail("thread spawn");
-    fsStage(allocator, sock_path, "mono");
-    jobStage(allocator, sock_path, "mono");
-    policyStage(allocator, sock_path, "mono");
-    mediaStage(allocator, sock_path, "mono");
-    queryStage(allocator, sock_path, "mono");
-    saveStage(allocator, sock_path, "mono");
-    probeStage(allocator, sock_path, "mono");
-    jobVerbStage(allocator, sock_path, "mono");
+    fsStage(allocator, sock_path, "broker");
+    jobStage(allocator, sock_path, "broker");
+    policyStage(allocator, sock_path, "broker");
+    mediaStage(allocator, sock_path, "broker");
+    queryStage(allocator, sock_path, "broker");
+    saveStage(allocator, sock_path, "broker");
+    probeStage(allocator, sock_path, "broker");
+    jobVerbStage(allocator, sock_path, "broker");
     {
         var conn = client_mod.Conn.connect(allocator, sock_path) catch fail("shutdown connect");
         defer conn.deinit();
@@ -4749,30 +4752,6 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     da.deinit();
     thb.join();
     db.deinit();
-
-    // ── broker pass (same fs surface served by a broker-mode
-    // daemon: fs clients never attach, so the broker itself must
-    // answer — one pass alone would hide a handoff bug) ──
-    var bpath_buf: [128]u8 = undefined;
-    const bsock = std.fmt.bufPrint(&bpath_buf, "/tmp/sketerm-smoke-fs-b{d}/mux.sock", .{c.getpid()}) catch unreachable;
-    registerTmpRoot(std.fs.path.dirname(bsock).?);
-    const bd = daemon_mod.Daemon.init(allocator, bsock) catch fail("broker init");
-    const bth = std.Thread.spawn(.{}, daemonMain, .{bd}) catch fail("broker thread");
-    fsStage(allocator, bsock, "broker");
-    jobStage(allocator, bsock, "broker");
-    policyStage(allocator, bsock, "broker");
-    mediaStage(allocator, bsock, "broker");
-    queryStage(allocator, bsock, "broker");
-    saveStage(allocator, bsock, "broker");
-    probeStage(allocator, bsock, "broker");
-    jobVerbStage(allocator, bsock, "broker");
-    {
-        var conn = client_mod.Conn.connect(allocator, bsock) catch fail("broker shutdown connect");
-        defer conn.deinit();
-        conn.sendFrame(.shutdown, "") catch fail("broker shutdown send");
-    }
-    bth.join();
-    bd.deinit();
 
     cleanupTmpRoots(false);
     std.debug.print("smoke-fs: OK\n", .{});
