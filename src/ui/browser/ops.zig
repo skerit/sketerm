@@ -2304,6 +2304,12 @@ pub fn deferHistory(self: *BrowserView, req: u32, hc: *HostConn, op: *UndoOp, di
 
 pub fn finishHistory(self: *BrowserView, op: *UndoOp, direction: HistoryDirection) void {
     self.history_busy = false;
+    // The restored/recreated entry is selected, so the next verb (a
+    // Ctrl+C right after Ctrl+Z) acts on it instead of on nothing.
+    if (op.produced(direction == .undo)) |path| {
+        if (self.hostConnFor(if (op.host) |h| @as(?[]const u8, h) else null)) |hc|
+            self.queueSelectOnHost(hc, path, @intFromPtr(op));
+    }
     self.pushHistoryStack(if (direction == .undo) &self.redo_stack else &self.undo_stack, op);
     self.setStatus(if (direction == .undo) "undo complete" else "redo complete");
 }

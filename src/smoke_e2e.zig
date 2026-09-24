@@ -7920,6 +7920,14 @@ fn secondGuiBrowserStage(
 /// Occurrences of `needle` in one OCR pass over the window, the most
 /// any of the recognizer's modes finds. Null when tesseract is absent.
 fn ocrCount(allocator: std.mem.Allocator, app: *appdrive.App, win_id: u32, needle: []const u8) ?usize {
+    return ocrCountScaled(allocator, app, win_id, needle, 1);
+}
+
+/// `ocrCount` over native scale and, with `max_scale` 2, a 2x upscale
+/// too (the best read wins): the information panel's small dim labels
+/// (its "Permissions" row, its name head) only read upscaled, and a
+/// count that misses them reports an open panel as absent.
+fn ocrCountScaled(allocator: std.mem.Allocator, app: *appdrive.App, win_id: u32, needle: []const u8, max_scale: u32) ?usize {
     const ocr = @import("util/ocr.zig");
     if (!ocr.available()) return null;
     // The live head, not a stale replica: an mcp-kind viewer's frame
@@ -7930,9 +7938,16 @@ fn ocrCount(allocator: std.mem.Allocator, app: *appdrive.App, win_id: u32, needl
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     var best: usize = 0;
-    for ([_]i32{ 6, 11 }) |psm| {
-        const res = ocr.recognize(arena.allocator(), shot.px, shot.w, shot.h, .{ .psm = psm }) catch continue;
-        best = @max(best, std.mem.count(u8, res.text, needle));
+    for ([_]u32{ 1, 2 }) |scale| {
+        if (scale > max_scale) break;
+        const px = if (scale == 1)
+            shot.px
+        else
+            @import("util/png.zig").upscaleRgba(arena.allocator(), shot.px, shot.w, shot.h, scale) catch continue;
+        for ([_]i32{ 6, 11 }) |psm| {
+            const res = ocr.recognize(arena.allocator(), px, shot.w * scale, shot.h * scale, .{ .psm = psm }) catch continue;
+            best = @max(best, std.mem.count(u8, res.text, needle));
+        }
     }
     return best;
 }
@@ -8547,7 +8562,10 @@ fn filesMutationSelectStage(
 /// Centre of the listing ROW word `needle`, in window coordinates.
 /// Row names are set in the list's small font, which tesseract reads
 /// at native scale only sometimes; like viewerWaitOcr this retries the
-/// frame at 2x and maps the box back.
+/// frame upscaled and maps the box back. 3x as well as 2x: the upscale
+/// is nearest-neighbour, and at 2x tesseract reads a row starting "ZA"
+/// as "zaBROW.D" and misses "ZAAROW.txt" entirely (the FILES_SELECTION
+/// "filtered listing shows no ZAAROW row" red, with the row on screen).
 fn ocrRowCenter(allocator: std.mem.Allocator, app: *appdrive.App, win_id: u32, needle: []const u8, timeout_ms: i64) ?Point {
     const ocr = @import("util/ocr.zig");
     const png_util = @import("util/png.zig");
@@ -8562,7 +8580,7 @@ fn ocrRowCenter(allocator: std.mem.Allocator, app: *appdrive.App, win_id: u32, n
         defer allocator.free(shot.px);
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
-        for ([_]u32{ 1, 2 }) |scale| {
+        for ([_]u32{ 1, 2, 3 }) |scale| {
             const px = if (scale == 1)
                 shot.px
             else
@@ -8577,7 +8595,10 @@ fn ocrRowCenter(allocator: std.mem.Allocator, app: *appdrive.App, win_id: u32, n
                     // Rows only: the places sidebar's Recent entries end
                     // in the same folder names ("…g/DEEPER"), and the
                     // information panel names the selected one.
-                    if (x < 215 or x > 700 or y < 230) continue;
+                    if (x < 215 or x > 700 or y < 230) {
+                        _ = c.fprintf(platform.stderr(), "smoke-e2e: ocrRowCenter: %.*s at (%.0f,%.0f) is outside the listing band\n", @as(c_int, @intCast(w.text.len)), w.text.ptr, x, y);
+                        continue;
+                    }
                     return .{ .x = x, .y = y };
                 }
             }
@@ -8758,7 +8779,7 @@ fn filesBrowserBugsStage(
     // The panel carries its own "Permissions" row under the column
     // header of the same name: two reads once it is up.
     pumpRenameFor(app, 1_000);
-    if ((ocrCount(allocator, app, child.win, "Permissions") orelse 0) < 2) {
+    if ((ocrCountScaled(allocator, app, child.win, "Permissions", 2) orelse 0) < 2) {
         viewerShot(allocator, app, child.win, "files-bugs-infotoggle");
         return "files bugs: the Information toggle opened no panel";
     }
@@ -8767,7 +8788,7 @@ fn filesBrowserBugsStage(
     pumpRenameFor(app, 1_000);
     // The panel names the selected entry: AAAROW now reads three
     // times (the two rows + the panel head).
-    const before = ocrCount(allocator, app, child.win, "AAAROW") orelse 0;
+    const before = ocrCountScaled(allocator, app, child.win, "AAAROW", 2) orelse 0;
     if (before < 3) {
         viewerShot(allocator, app, child.win, "files-bugs-panel");
         return "files bugs: the information panel did not show the selected entry";
@@ -8775,7 +8796,7 @@ fn filesBrowserBugsStage(
     app.pressKey(child.win, "alt+Up") catch return "files bugs: alt+Up failed";
     if (!viewerWaitOcr(allocator, app, child.win, "fbug", 20_000)) return "files bugs: the parent never rendered";
     pumpRenameFor(app, 1_500);
-    const after = ocrCount(allocator, app, child.win, "AAAROW") orelse 0;
+    const after = ocrCountScaled(allocator, app, child.win, "AAAROW", 2) orelse 0;
     if (after != 0) {
         viewerShot(allocator, app, child.win, "files-bugs-panel-stale");
         return "files bugs: the information panel kept the entry selected in the folder just left";

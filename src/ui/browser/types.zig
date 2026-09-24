@@ -1434,6 +1434,19 @@ pub const UndoOp = struct {
         allocator.destroy(self);
     }
 
+    /// The entry an undo (or redo) of this record leaves on disk, which
+    /// becomes the selection like every other mutation's product
+    /// ("a mutation selects what it produced"): an undone trash is the
+    /// restored file, a redone copy is the copy again. Null when the
+    /// step only removes something.
+    pub fn produced(self: *const UndoOp, undo: bool) ?[]const u8 {
+        return switch (self.kind) {
+            .rename_back => if (undo) self.b else self.a,
+            .trash_restore => if (undo) self.b else null,
+            .delete_created, .rmdir_created, .link_created => if (undo) null else self.a,
+        };
+    }
+
     pub fn describe(self: *const UndoOp) []const u8 {
         return switch (self.kind) {
             .rename_back => "undo rename/move",
