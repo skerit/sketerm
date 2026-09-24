@@ -6,6 +6,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const c = @import("../c.zig").c;
 const model = @import("model.zig");
+const fsserve = @import("../mux/fsserve.zig");
 const mounts = @import("../util/mounts.zig");
 const strz = @import("../util/strz.zig");
 
@@ -313,15 +314,7 @@ pub fn isSketermMount(path: []const u8) bool {
 
 /// The local freedesktop trash "files" directory.
 pub fn trashFilesDir(buf: []u8) ?[]const u8 {
-    if (c.getenv("XDG_DATA_HOME")) |xd| {
-        const s = std.mem.span(@as([*:0]const u8, @ptrCast(xd)));
-        return std.fmt.bufPrint(buf, "{s}/Trash/files", .{s}) catch null;
-    }
-    if (c.getenv("HOME")) |h| {
-        const s = std.mem.span(@as([*:0]const u8, @ptrCast(h)));
-        return std.fmt.bufPrint(buf, "{s}/.local/share/Trash/files", .{s}) catch null;
-    }
-    return null;
+    return fsserve.trashFilesDir(fsserve.envOpt("XDG_DATA_HOME"), fsserve.envOpt("HOME"), buf);
 }
 
 /// True when `path` is inside a freedesktop trash "files" dir —

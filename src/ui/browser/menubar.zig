@@ -489,12 +489,11 @@ fn goHome(v: *BrowserView) void {
     v.navigateSpec(tab, spec);
 }
 
+/// Go > Trash opens the trash of the host the tab shows: a remote
+/// tab's is that machine's, resolved by its daemon.
 fn goTrash(v: *BrowserView) void {
     const tab = v.currentTab() orelse return;
-    var buf: [4200]u8 = undefined;
-    const td = @import("../../filebrowser/paths.zig").trashFilesDir(&buf) orelse return;
-    var spec_buf: [4300]u8 = undefined;
-    if (spec_buf.len < td.len) return;
-    @memcpy(spec_buf[0..td.len], td);
-    v.navigateSpec(tab, spec_buf[0..td.len]);
+    var spec_buf: [@import("../../filebrowser/paths.zig").SPEC_BUF_LEN]u8 = undefined;
+    const spec = tab.hc.trashSpec(&spec_buf) orelse return;
+    v.navigateSpec(tab, spec);
 }

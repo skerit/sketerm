@@ -1771,6 +1771,8 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
             hc.templates_dir = self.allocator.dupe(u8, rep.templates) catch null;
         if (rep.ok and rep.home.len > 0 and hc.home_dir == null)
             hc.home_dir = self.allocator.dupe(u8, rep.home) catch null;
+        if (rep.ok and rep.trash.len > 0 and hc.trash_dir == null)
+            hc.trash_dir = self.allocator.dupe(u8, rep.trash) catch null;
         if (rep.ok and rep.dirs.len > 0 and hc.user_dirs.len == 0) adoptUserDirs(self, hc, rep.dirs);
         self.templatesHostDirs(hc);
         // The sidebar shows this host's Home and user directories once

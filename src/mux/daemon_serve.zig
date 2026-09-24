@@ -2266,12 +2266,17 @@ pub fn handleFsOp(self: *Daemon, cl: *Client, payload: []const u8) void {
             dirs[ndirs] = .{ .label = d.label, .path = p };
             ndirs += 1;
         }
+        // The trash is THIS user's on THIS host: a remote tab's Trash
+        // place must open it, never the client user's path here.
+        var trash_buf: [4096]u8 = undefined;
+        const trash = fsserve.trashFilesDir(fsserve.envOpt("XDG_DATA_HOME"), home, &trash_buf) orelse "";
         cl.queueJson(.fs_reply, .{
             .req = r.req,
             .ok = true,
             .home = home,
             .cache = cache,
             .templates = templates,
+            .trash = trash,
             .dirs = dirs[0..ndirs],
         });
     } else if (std.mem.eql(u8, r.op, "mkdir")) {

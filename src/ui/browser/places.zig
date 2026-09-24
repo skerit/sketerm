@@ -16,7 +16,6 @@ const paths = @import("../../filebrowser/paths.zig");
 const query_mod = @import("../../filebrowser/query.zig");
 
 const BrowserView = @import("view.zig").BrowserView;
-const trashFilesDir = @import("../../filebrowser/paths.zig").trashFilesDir;
 const classicmenu = @import("classicmenu.zig");
 const iconload = @import("../iconload.zig");
 const sidewidgets = @import("sidewidgets.zig");
@@ -1011,10 +1010,23 @@ fn renderLocalSection(self: *BrowserView) void {
         self.placeRow("user-home-symbolic", "Home", hs, false)
     else |_|
         self.placeRow("user-home-symbolic", "Home", home, false);
-    if (knownHostConn(self, null)) |hc| renderUserDirRows(self, hc, "local");
+    const local = knownHostConn(self, null);
+    if (local) |hc| renderUserDirRows(self, hc, "local");
     self.placeRow("drive-harddisk-symbolic", "File System", "local:/", false);
-    var trash_buf: [4200]u8 = undefined;
-    if (trashFilesDir(&trash_buf)) |td| self.placeRow("user-trash-symbolic", "Trash", td, false);
+    renderTrashRow(self, local);
+}
+
+/// The Trash row of a host section. Without a connection yet (the
+/// local section renders before the local daemon has answered) the
+/// local rule stands in, spelled "local:" like every other row here.
+fn renderTrashRow(self: *BrowserView, hc: ?*HostConn) void {
+    var spec_buf: [paths.SPEC_BUF_LEN]u8 = undefined;
+    const spec = if (hc) |h| h.trashSpec(&spec_buf) else blk: {
+        var dir_buf: [4096]u8 = undefined;
+        const dir = paths.trashFilesDir(&dir_buf) orelse break :blk null;
+        break :blk std.fmt.bufPrint(&spec_buf, "local:{s}", .{dir}) catch null;
+    };
+    if (spec) |s| self.placeRow("user-trash-symbolic", "Trash", s, false);
 }
 
 /// An existing connection for `host` (null = local) without creating one.
@@ -1059,6 +1071,7 @@ fn renderRemoteSection(self: *BrowserView) void {
     if (std.fmt.bufPrint(&spec_buf, "{s}:/", .{host})) |rs|
         self.placeRow("drive-harddisk-symbolic", "File System", rs, false)
     else |_| {}
+    renderTrashRow(self, tab.hc);
 }
 
 fn renderRegistersSection(self: *BrowserView) void {

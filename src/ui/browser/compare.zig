@@ -3,8 +3,11 @@
 //! Both trees are scanned HOST-SIDE (find jobs streaming
 //! path+kind+size+mtime digests -- only digests cross the wire),
 //! diffed client-side, and reconciled with per-row direction choices
-//! executed as jobs/transfers. Copy-only: no deletes, so a wrong
-//! direction cannot destroy data.
+//! executed as jobs/transfers. Copies never replace a newer file
+//! without the row saying so, and a row set to "Delete" is a MIRROR
+//! deletion: every such path is listed in one confirmation before
+//! anything runs, and a confirmed one goes to that host's trash,
+//! never through a permanent delete.
 
 const std = @import("std");
 const c = @import("../../c.zig").c;
@@ -16,21 +19,49 @@ const HostConn = @import("types.zig").HostConn;
 const MenuCtx = @import("menu.zig").MenuCtx;
 const WireJobEv = @import("types.zig").WireJobEv;
 const WireReply = @import("types.zig").WireReply;
+const confirm = @import("../confirm.zig");
 const fmtSize = @import("../../filebrowser/format.zig").fmtSize;
 const hostEq = @import("../../filebrowser/paths.zig").hostEq;
 const menuDone = @import("menu.zig").menuDone;
 const cast = @import("../../util/cast.zig");
 
-/// Two-tree compare/sync: both trees are scanned HOST-SIDE (find
-/// jobs streaming path+kind+size+mtime digests — only digests cross
-/// the wire), diffed client-side, and reconciled with per-row
-/// direction choices executed as jobs/transfers. Copy-only: no
-/// deletes, so a wrong direction cannot destroy data.
+/// Mirror deletions a Sync will run once the user has seen the list.
+/// Paths are owned copies: the rows they came from can be rebuilt
+/// while the dialog is up.
+const MirrorDelete = struct {
+    left: bool,
+    path: []u8,
+};
+
+/// Lines of the confirmation body before it says "and N more".
+const CONFIRM_LIST_MAX = 12;
+
+/// The Execute the confirmation dialog is holding back. The compare
+/// window can be closed while the dialog is up, so the window is
+/// re-resolved through the view by serial, never by pointer.
+const PendingExecute = struct {
+    allocator: std.mem.Allocator,
+    view: *BrowserView,
+    serial: u64,
+    deletes: []MirrorDelete,
+
+    fn destroy(self: *PendingExecute) void {
+        for (self.deletes) |d| self.allocator.free(d.path);
+        self.allocator.free(self.deletes);
+        self.allocator.destroy(self);
+    }
+};
+
+var compare_serial: u64 = 0;
+
+/// The one open compare/sync window per view.
 pub const CompareCtx = struct {
     allocator: std.mem.Allocator,
     view: *BrowserView,
     left: CmpSide,
     right: CmpSide,
+    /// Identity across the deletion confirmation (see PendingExecute).
+    serial: u64 = 0,
     window: ?*c.GtkWidget = null,
     listbox: *c.GtkListBox = undefined,
     info_label: *c.GtkLabel = undefined,
@@ -181,7 +212,7 @@ pub const CompareCtx = struct {
         c.gtk_label_set_ellipsize(@ptrCast(lab), c.PANGO_ELLIPSIZE_MIDDLE);
         c.gtk_box_append(@ptrCast(hbox), lab);
 
-        const options = [_:null]?[*:0]const u8{ "Skip", "Copy to target", "Copy to source", "Delete (from the side that has it)" };
+        const options = [_:null]?[*:0]const u8{ "Skip", "Copy to target", "Copy to source", "Trash (on the side that has it)" };
         const dd = c.gtk_drop_down_new_from_strings(@ptrCast(&options));
         c.gtk_drop_down_set_selected(@ptrCast(dd), @intFromEnum(action));
         c.gtk_box_append(@ptrCast(hbox), dd);
@@ -263,33 +294,135 @@ pub const CompareCtx = struct {
         return false;
     }
 
+    fn actionOf(row: *const DiffRow) Action {
+        return switch (c.gtk_drop_down_get_selected(@ptrCast(row.dd))) {
+            1 => .to_right,
+            2 => .to_left,
+            3 => .delete,
+            else => .skip,
+        };
+    }
+
+    /// The side a mirror deletion removes from: only a row that
+    /// exists on exactly one side can be deleted.
+    fn deleteSide(self: *CompareCtx, row: *const DiffRow) ?*CmpSide {
+        if (row.l != null and row.r == null) return &self.left;
+        if (row.r != null and row.l == null) return &self.right;
+        return null;
+    }
+
+    /// Execute: the deletions are gathered first and shown in full
+    /// before anything at all runs, because a mirror deletion is the
+    /// one direction choice that cannot be undone by another sync.
     pub fn execute(self: *CompareCtx) void {
+        var deletes: std.ArrayList(MirrorDelete) = .empty;
+        var failed = false;
+        for (self.rows.items) |row| {
+            if (actionOf(row) != .delete or self.excluded(row.rel)) continue;
+            const side = self.deleteSide(row) orelse continue;
+            const path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ side.root, row.rel }) catch {
+                failed = true;
+                break;
+            };
+            deletes.append(self.allocator, .{ .left = side == &self.left, .path = path }) catch {
+                self.allocator.free(path);
+                failed = true;
+                break;
+            };
+        }
+        if (failed) {
+            for (deletes.items) |d| self.allocator.free(d.path);
+            deletes.deinit(self.allocator);
+            self.view.setStatus("sync not started: out of memory");
+            return;
+        }
+        if (deletes.items.len == 0) {
+            deletes.deinit(self.allocator);
+            self.runCopies(0);
+            return;
+        }
+        const pending = self.allocator.create(PendingExecute) catch {
+            for (deletes.items) |d| self.allocator.free(d.path);
+            deletes.deinit(self.allocator);
+            return;
+        };
+        pending.* = .{
+            .allocator = self.allocator,
+            .view = self.view,
+            .serial = self.serial,
+            .deletes = deletes.toOwnedSlice(self.allocator) catch {
+                for (deletes.items) |d| self.allocator.free(d.path);
+                deletes.deinit(self.allocator);
+                self.allocator.destroy(pending);
+                return;
+            },
+        };
+        var heading: [96:0]u8 = undefined;
+        const head = std.fmt.bufPrintZ(&heading, "Move {d} item{s} to the Trash?", .{
+            pending.deletes.len, if (pending.deletes.len == 1) "" else "s",
+        }) catch "Move items to the Trash?";
+        const body = self.confirmBody(pending.deletes) orelse {
+            pending.destroy();
+            return;
+        };
+        defer self.allocator.free(body);
+        const root = c.gtk_widget_get_root(self.view.root_box);
+        if (confirm.present(@ptrCast(@alignCast(root)), .{
+            .heading = head.ptr,
+            .body = body.ptr,
+            .responses = &.{
+                .{ .id = "cancel", .label = "Cancel", .is_default = true, .is_close = true },
+                .{ .id = "trash", .label = "Move to Trash and Sync", .appearance = .destructive },
+            },
+        }, .{ .allocator = self.allocator, .cb = &onDeleteConfirmed, .ctx = @ptrCast(pending) }) == null) pending.destroy();
+    }
+
+    /// One line per doomed path, host-qualified, capped.
+    fn confirmBody(self: *CompareCtx, deletes: []const MirrorDelete) ?[:0]u8 {
+        var text: std.Io.Writer.Allocating = .init(self.allocator);
+        defer text.deinit();
+        const w = &text.writer;
+        w.writeAll("These will be moved to the trash of the host that has them; the copies run afterwards.\n") catch return null;
+        for (deletes, 0..) |d, i| {
+            if (i == CONFIRM_LIST_MAX) {
+                w.print("... and {d} more", .{deletes.len - i}) catch return null;
+                break;
+            }
+            const hc = if (d.left) self.left.hc else self.right.hc;
+            w.print("\n{s}:{s}", .{ hc.label(), d.path }) catch return null;
+        }
+        return text.toOwnedSliceSentinel(0) catch null;
+    }
+
+    fn onDeleteConfirmed(user: ?*anyopaque, resp: []const u8) void {
+        const pending = cast.userData(PendingExecute, user);
+        defer pending.destroy();
+        const view = pending.view;
+        if (view.widgets_dead) return;
+        const self = view.compare orelse return;
+        if (self.serial != pending.serial) return;
+        if (!std.mem.eql(u8, resp, "trash")) return;
+        for (pending.deletes) |d| {
+            const hc = if (d.left) self.left.hc else self.right.hc;
+            var lbl: [160]u8 = undefined;
+            const label = std.fmt.bufPrint(&lbl, "mirror trash {s}", .{std.fs.path.basename(d.path)}) catch "mirror trash";
+            view.startDaemonJob(hc, "trash", d.path, "", label);
+        }
+        self.runCopies(pending.deletes.len);
+    }
+
+    /// The copy half of Execute, then close. `trashed` is what the
+    /// confirmation already started, for the status line.
+    fn runCopies(self: *CompareCtx, trashed: usize) void {
         const view = self.view;
         const same_host = hostEq(self.left.hc.host, self.right.hc.host);
-        var started: usize = 0;
+        var started: usize = trashed;
         var excluded_n: usize = 0;
         for (self.rows.items) |row| {
-            const action: Action = switch (c.gtk_drop_down_get_selected(@ptrCast(row.dd))) {
-                1 => .to_right,
-                2 => .to_left,
-                3 => .delete,
-                else => .skip,
-            };
-            if (action == .skip) continue;
+            const action = actionOf(row);
+            if (action == .skip or action == .delete) continue;
             if (self.excluded(row.rel)) {
                 excluded_n += 1;
-                continue;
-            }
-            if (action == .delete) {
-                // Mirror deletion: remove the row's entry from the
-                // side that has it (only-one-side rows).
-                const del_side = if (row.l != null and row.r == null) &self.left else if (row.r != null and row.l == null) &self.right else continue;
-                var del_buf: [4096]u8 = undefined;
-                const dp = std.fmt.bufPrint(&del_buf, "{s}/{s}", .{ del_side.root, row.rel }) catch continue;
-                var dlbl: [128]u8 = undefined;
-                const dl = std.fmt.bufPrint(&dlbl, "mirror delete {s}", .{std.fs.path.basename(row.rel)}) catch "mirror delete";
-                view.startDaemonJob(del_side.hc, "delete_tree", dp, "", dl);
-                started += 1;
                 continue;
             }
             const src_side = if (action == .to_right) &self.left else &self.right;
@@ -444,7 +577,7 @@ pub const CompareCtx = struct {
                 n += 1;
             }
         }
-        self.view.setStatusFmt("mirror: {d} target-only row(s) marked for deletion — review, then Execute", .{n});
+        self.view.setStatusFmt("mirror: {d} target-only row(s) marked for the trash — review, then Execute (it lists them first)", .{n});
     }
     pub fn onCloseClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         const self = cast.userData(CompareCtx, user);
@@ -494,9 +627,11 @@ pub fn startCompare(self: *BrowserView, tab: *BTab, right_path: []const u8) void
     }
 
     const cmp = self.allocator.create(CompareCtx) catch return;
+    compare_serial += 1;
     cmp.* = .{
         .allocator = self.allocator,
         .view = self,
+        .serial = compare_serial,
         .left = .{ .hc = left_hc, .root = self.allocator.dupe(u8, src_path) catch {
             self.allocator.destroy(cmp);
             return;
@@ -546,13 +681,13 @@ pub fn startCompare(self: *BrowserView, tab: *BTab, right_path: []const u8) void
     const hashb = c.gtk_button_new_with_label("Hash-verify equal-size rows");
     _ = c.g_signal_connect_data(hashb, "clicked", @ptrCast(&CompareCtx.onHashVerifyClicked), @ptrCast(cmp), null, c.G_CONNECT_DEFAULT);
     c.gtk_box_append(@ptrCast(btns), hashb);
-    const mirrorb = c.gtk_button_new_with_label("Mirror: mark target-only rows for deletion");
+    const mirrorb = c.gtk_button_new_with_label("Mirror: mark target-only rows for the trash");
     _ = c.g_signal_connect_data(mirrorb, "clicked", @ptrCast(&CompareCtx.onMirrorClicked), @ptrCast(cmp), null, c.G_CONNECT_DEFAULT);
     c.gtk_box_append(@ptrCast(btns), mirrorb);
     const closeb = c.gtk_button_new_with_label("Close");
     _ = c.g_signal_connect_data(closeb, "clicked", @ptrCast(&CompareCtx.onCloseClicked), @ptrCast(cmp), null, c.G_CONNECT_DEFAULT);
     c.gtk_box_append(@ptrCast(btns), closeb);
-    const execb = c.gtk_button_new_with_label("Execute Sync (copy only, no deletes)");
+    const execb = c.gtk_button_new_with_label("Execute Sync");
     c.gtk_widget_add_css_class(execb, "suggested-action");
     _ = c.g_signal_connect_data(execb, "clicked", @ptrCast(&CompareCtx.onExecuteClicked), @ptrCast(cmp), null, c.G_CONNECT_DEFAULT);
     c.gtk_box_append(@ptrCast(btns), execb);

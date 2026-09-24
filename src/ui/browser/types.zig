@@ -17,7 +17,9 @@ const TabQuery = @import("search.zig").TabQuery;
 const TabSel = @import("selection.zig").TabSel;
 const TabView = @import("views.zig").TabView;
 const DiskUsageState = @import("diskusage.zig").State;
-const formatSpec = @import("../../filebrowser/paths.zig").formatSpec;
+const paths = @import("../../filebrowser/paths.zig");
+const fsserve = @import("../../mux/fsserve.zig");
+const formatSpec = paths.formatSpec;
 const naturalLess = @import("../../filebrowser/format.zig").naturalLess;
 pub const JobOp = @import("../../filebrowser/jobop.zig").JobOp;
 
@@ -157,6 +159,9 @@ pub const HostConn = struct {
     /// The host's home directory (same `homedir` reply); what the
     /// sidebar's per-host places section navigates to.
     home_dir: ?[]u8 = null,
+    /// The host's trash `files` directory as its daemon reported it
+    /// (null from a daemon too old to say; see `trashFilesDir`).
+    trash_dir: ?[]u8 = null,
     /// The host's existing user directories (same reply), in the
     /// daemon's table order.
     user_dirs: []UserDirEntry = &.{},
@@ -181,6 +186,27 @@ pub const HostConn = struct {
         return &self.conn;
     }
 
+    /// Where THIS host's Trash place opens: the daemon's own answer,
+    /// else the daemon's rule applied to the home it did report (a
+    /// daemon too old to name its trash), else the local rule for the
+    /// local host. A remote host's trash is never the local user's.
+    pub fn trashFilesDir(self: *const HostConn, buf: []u8) ?[]const u8 {
+        if (self.trash_dir) |t| return std.fmt.bufPrint(buf, "{s}", .{t}) catch null;
+        if (self.host == null) return paths.trashFilesDir(buf);
+        return fsserve.trashFilesDir(null, self.home_dir, buf);
+    }
+
+    /// `trashFilesDir` as a host-qualified location spec.
+    pub fn trashSpec(self: *const HostConn, buf: []u8) ?[]const u8 {
+        var dir_buf: [4096]u8 = undefined;
+        const dir = self.trashFilesDir(&dir_buf) orelse return null;
+        const spec = formatSpec(buf, self.host, dir);
+        // formatSpec falls back to the bare path when `buf` is too
+        // small, and a bare path would mean "current host".
+        if (spec.ptr == dir_buf[0..].ptr) return null;
+        return spec;
+    }
+
     pub fn destroy(self: *HostConn, allocator: std.mem.Allocator) void {
         if (self.watch_id != 0) _ = c.g_source_remove(self.watch_id);
         if (self.write_watch_id != 0) _ = c.g_source_remove(self.write_watch_id);
@@ -190,6 +216,7 @@ pub const HostConn = struct {
         } else if (self.state == .ready) self.conn.deinit();
         if (self.templates_dir) |td| allocator.free(td);
         if (self.home_dir) |hd| allocator.free(hd);
+        if (self.trash_dir) |td| allocator.free(td);
         for (self.user_dirs) |d| {
             allocator.free(d.label);
             allocator.free(d.path);
