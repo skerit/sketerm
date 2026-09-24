@@ -350,11 +350,6 @@ pub const Conn = struct {
             return probe(allocator, conn);
         } else |_| {}
 
-        // Process-isolation broker by default: each session runs in its own
-        // worker process, so one shell's crash/OOM can't take down the daemon
-        // or its siblings. SKETERM_NO_BROKER=1 falls back to the single-process
-        // monolith (escape hatch if the broker ever misbehaves in the field).
-        const use_broker = c.getenv("SKETERM_NO_BROKER") == null;
         // NUL-terminated socket arg for the child; prepared before fork
         // (no allocation between fork and exec).
         var sock_z_buf: [4096:0]u8 = undefined;
@@ -396,10 +391,11 @@ pub const Conn = struct {
             const bin = findMuxBinary(&bin_buf);
             var argv: [7:null]?[*:0]const u8 = .{ bin, null, null, null, null, null, null };
             var n: usize = 1;
-            if (use_broker) {
-                argv[n] = selfexec.BROKER_FLAG;
-                n += 1;
-            }
+            // Every current daemon is a broker regardless; the flag is
+            // for an OLDER installed binary, which still had a
+            // single-process mode and must come up isolated too.
+            argv[n] = selfexec.BROKER_FLAG;
+            n += 1;
             if (sock_z) |z| {
                 argv[n] = selfexec.SOCKET_FLAG;
                 argv[n + 1] = z;

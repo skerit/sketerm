@@ -46,7 +46,7 @@ test "panel relay selects the earliest panel-capable attachment, isolates caller
     const t = std.testing;
     const a = t.allocator;
     var empty: [0]u8 = .{};
-    var daemon = Daemon{ .allocator = a, .listen_fd = -1, .sock_path = empty[0..] };
+    var daemon = Daemon{ .allocator = a, .listen_fd = -1, .sock_path = empty[0..], .role = .worker };
     defer daemon.clients.deinit(a);
     defer daemon.panel_routes.deinit(a);
 
@@ -303,7 +303,7 @@ test "panel relay cancellation removes exact queued frames and rebases later rou
     const t = std.testing;
     const a = t.allocator;
     var empty: [0]u8 = .{};
-    var daemon = Daemon{ .allocator = a, .listen_fd = -1, .sock_path = empty[0..] };
+    var daemon = Daemon{ .allocator = a, .listen_fd = -1, .sock_path = empty[0..], .role = .worker };
     defer daemon.clients.deinit(a);
     defer daemon.panel_routes.deinit(a);
     var session: Session = undefined;
@@ -388,7 +388,7 @@ test "panel relay uses each requester's v1 or v2 presenter requirement" {
     const t = std.testing;
     const a = t.allocator;
     var empty: [0]u8 = .{};
-    var daemon = Daemon{ .allocator = a, .listen_fd = -1, .sock_path = empty[0..] };
+    var daemon = Daemon{ .allocator = a, .listen_fd = -1, .sock_path = empty[0..], .role = .worker };
     defer daemon.clients.deinit(a);
     defer daemon.panel_routes.deinit(a);
     var session: Session = undefined;
@@ -485,7 +485,7 @@ test "duplicate presenter attachment takes concurrent work after detach" {
     const t = std.testing;
     const a = t.allocator;
     var empty: [0]u8 = .{};
-    var daemon = Daemon{ .allocator = a, .listen_fd = -1, .sock_path = empty[0..] };
+    var daemon = Daemon{ .allocator = a, .listen_fd = -1, .sock_path = empty[0..], .role = .worker };
     defer daemon.clients.deinit(a);
     defer daemon.panel_routes.deinit(a);
     var session: Session = undefined;
@@ -571,7 +571,7 @@ test "panel relay reports no compatible GUI with the caller id" {
     const t = std.testing;
     const a = t.allocator;
     var empty: [0]u8 = .{};
-    var daemon = Daemon{ .allocator = a, .listen_fd = -1, .sock_path = empty[0..] };
+    var daemon = Daemon{ .allocator = a, .listen_fd = -1, .sock_path = empty[0..], .role = .worker };
     defer daemon.clients.deinit(a);
     defer daemon.panel_routes.deinit(a);
     var session: Session = undefined;
@@ -605,7 +605,7 @@ test "panel route caps report explicit pre-delivery resend safety" {
     const t = std.testing;
     const a = t.allocator;
     var empty: [0]u8 = .{};
-    var daemon = Daemon{ .allocator = a, .listen_fd = -1, .sock_path = empty[0..] };
+    var daemon = Daemon{ .allocator = a, .listen_fd = -1, .sock_path = empty[0..], .role = .worker };
     defer daemon.clients.deinit(a);
     defer daemon.panel_routes.deinit(a);
     var session: Session = undefined;
@@ -671,7 +671,7 @@ test "panel-only reattach clears viewer replay and audio subscription state" {
     const t = std.testing;
     const a = t.allocator;
     var empty: [0]u8 = .{};
-    var daemon = Daemon{ .allocator = a, .listen_fd = -1, .sock_path = empty[0..] };
+    var daemon = Daemon{ .allocator = a, .listen_fd = -1, .sock_path = empty[0..], .role = .worker };
     defer daemon.sessions.deinit(a);
     defer daemon.clients.deinit(a);
     defer daemon.panel_routes.deinit(a);
@@ -742,7 +742,7 @@ test "same-name replacement rejects reconnect with the prior lifetime origin" {
     const t = std.testing;
     const a = t.allocator;
     var empty: [0]u8 = .{};
-    var daemon = Daemon{ .allocator = a, .listen_fd = -1, .sock_path = empty[0..] };
+    var daemon = Daemon{ .allocator = a, .listen_fd = -1, .sock_path = empty[0..], .role = .worker };
     defer daemon.sessions.deinit(a);
     var replacement: Session = undefined;
     replacement.name = @constCast("same");
@@ -770,7 +770,7 @@ test "session teardown signals panel-only clients before clearing attachment ide
     const t = std.testing;
     const a = t.allocator;
     var empty: [0]u8 = .{};
-    var daemon = Daemon{ .allocator = a, .listen_fd = -1, .sock_path = empty[0..] };
+    var daemon = Daemon{ .allocator = a, .listen_fd = -1, .sock_path = empty[0..], .role = .worker };
     defer daemon.clients.deinit(a);
     defer daemon.channels.deinit(a);
     defer daemon.panel_routes.deinit(a);

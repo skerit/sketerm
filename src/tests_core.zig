@@ -186,6 +186,14 @@ comptime {
     _ = @import("mux/daemon_fsjobs.zig");
     _ = @import("mux/daemon_native.zig");
     _ = @import("mux/daemon_serve.zig");
+    _ = @import("mux/daemon_apps.zig");
+    _ = @import("mux/daemon_browse.zig");
+    _ = @import("mux/daemon_control.zig");
+    _ = @import("mux/daemon_fsops.zig");
+    _ = @import("mux/daemon_transfer.zig");
+    _ = @import("mux/daemon_udp.zig");
+    _ = @import("mux/daemon_web.zig");
+    _ = @import("mux/daemon_webengine.zig");
     _ = @import("mux/daemon_sessions.zig");
     _ = @import("mux/log.zig");
     _ = @import("mux/logring.zig");

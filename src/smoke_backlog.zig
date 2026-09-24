@@ -8,8 +8,8 @@
 //! a replay of the LIVE pool mirror terminated by `native_sync`, so
 //! its next capture shows "now", not a whole-screens-old frame.
 //!
-//! Run by BOTH smoke-mux (monolith daemon) AND smoke-broker (real
-//! broker process): the original fix tested clean in monolith while
+//! Run by BOTH smoke-mux AND smoke-broker (a real broker process,
+//! exec'd or forked): the original fix tested clean in-process while
 //! broker mode — the mode `sketerm mcp` isolation actually uses —
 //! dropped the client's attach kind in the worker handoff, so the
 //! whole mcp-gated policy silently never engaged.
@@ -19,6 +19,7 @@ const c = @import("c.zig").c;
 const sendWithFd = @import("smoke/unixsock.zig").sendWithFd;
 const daemon_mod = @import("mux/daemon.zig");
 const client_mod = @import("mux/client.zig");
+const muxrig = @import("smoke/muxrig.zig");
 const wire = @import("mux/wire.zig");
 const wlwire = @import("wlhost/wire.zig");
 const wlpipe = @import("wlhost/pipe.zig");
@@ -74,46 +75,6 @@ fn registryBarrier(allocator: std.mem.Allocator, app_fd: c_int, new_id: u32) voi
     fail("barrier: registry reply never arrived");
 }
 
-/// The newest wl-* display socket in the daemon's runtime dir: works
-/// for monolith (wl-N) AND broker (wl-w<pid>) session naming, as long
-/// as the caller's session is the most recently spawned.
-fn newestWlDisplay(sock_path: []const u8, out: *[256]u8) []const u8 {
-    const dir_end = std.mem.lastIndexOfScalar(u8, sock_path, '/').?;
-    var dbuf: [192]u8 = undefined;
-    if (sock_path[0..dir_end].len >= dbuf.len) fail("socket dir path too long");
-    @memcpy(dbuf[0..dir_end], sock_path[0..dir_end]);
-    dbuf[dir_end] = 0;
-    const dirp = c.opendir(dbuf[0..dir_end :0].ptr) orelse fail("opendir runtime dir");
-    defer _ = c.closedir(dirp);
-    // Nanoseconds matter: both sessions are spawned back to back, so on
-    // a fast host their display sockets share an st_mtim.tv_sec and a
-    // seconds-only comparison silently keeps whichever one readdir
-    // returned first -- pointing the fake app at the wrong session.
-    var best_sec: i64 = -1;
-    var best_nsec: i64 = -1;
-    var best_len: usize = 0;
-    while (c.readdir(dirp)) |ent| {
-        const name = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&ent.*.d_name)), 0);
-        if (!std.mem.startsWith(u8, name, "wl-")) continue;
-        if (std.mem.endsWith(u8, name, ".lock")) continue;
-        var pbuf: [256]u8 = undefined;
-        const full = std.fmt.bufPrintZ(&pbuf, "{s}/{s}", .{ sock_path[0..dir_end], name }) catch continue;
-        var st: c.struct_stat = undefined;
-        if (c.stat(full.ptr, &st) != 0) continue;
-        const mts = if (@hasField(c.struct_stat, "st_mtim")) st.st_mtim else st.st_mtimespec;
-        const sec: i64 = mts.tv_sec;
-        const nsec: i64 = mts.tv_nsec;
-        if (sec > best_sec or (sec == best_sec and nsec > best_nsec)) {
-            best_sec = sec;
-            best_nsec = nsec;
-            const w = std.fmt.bufPrint(out, "{s}/{s}", .{ sock_path[0..dir_end], name }) catch continue;
-            best_len = w.len;
-        }
-    }
-    if (best_len == 0) fail("no wl-* display socket found after app spawn");
-    return out[0..best_len];
-}
-
 pub fn run(allocator: std.mem.Allocator, sock_path: []const u8) void {
     var conn = client_mod.Conn.connect(allocator, sock_path) catch fail("connect");
     defer conn.deinit();
@@ -137,7 +98,7 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8) void {
 
     // Fake Wayland app on the session's display socket.
     var disp_buf: [256]u8 = undefined;
-    const disp = newestWlDisplay(sock_path, &disp_buf);
+    const disp = muxrig.sessionWlDisplay("smoke-backlog", allocator, sock_path, "bkapp", &disp_buf);
     const app_fd = @import("util/platform.zig").socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
     if (app_fd < 0) fail("app socket");
     var addr: c.struct_sockaddr_un = undefined;

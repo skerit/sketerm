@@ -5,8 +5,8 @@
 //! display session and had a byte-identical copy of this. The capture
 //! swaps fd 1 for a pipe rather than shelling out, which is the point:
 //! the rig parses exactly the bytes an external caller would see, so it
-//! never re-derives `wl-*` socket paths itself (CLAUDE.md forbids that,
-//! because their naming differs between monolith and broker mode).
+//! never re-derives `wl-*` socket paths itself (CLAUDE.md forbids that:
+//! they are named by the owning worker's pid, which a client cannot know).
 
 const std = @import("std");
 const c = @import("../c.zig").c;

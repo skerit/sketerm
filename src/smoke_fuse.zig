@@ -1,12 +1,14 @@
-//! FUSE-mount end-to-end smoke (headless): daemon thread + fsmount
-//! serve thread + libc file ops through the kernel on the mountpoint.
+//! FUSE-mount end-to-end smoke (headless): a real broker forked by the
+//! rig (`muxrig.forkBroker`, before any thread) + fsmount serve thread
+//! + libc file ops through the kernel on the mountpoint.
 //! `zig build smoke-fuse`. SKIPs (exit 0) when fusermount3 or
 //! /dev/fuse is unavailable (containers, CI).
 
 const std = @import("std");
 const builtin = @import("builtin");
 const c = @import("c.zig").c;
-const daemon_mod = @import("mux/daemon.zig");
+const lifetime = @import("util/lifetime.zig");
+const muxrig = @import("smoke/muxrig.zig");
 const client_mod = @import("mux/client.zig");
 const fsdrive = @import("ipc/fsdrive.zig");
 const fsmount = @import("fsmount.zig");
@@ -15,12 +17,6 @@ const pathz = @import("util/pathz.zig");
 fn fail(comptime msg: []const u8) noreturn {
     std.debug.print("smoke-fuse: FAIL: " ++ msg ++ "\n", .{});
     std.process.exit(1);
-}
-
-fn daemonMain(d: *daemon_mod.Daemon) void {
-    d.run() catch |err| {
-        std.debug.print("smoke-fuse: daemon error: {s}\n", .{@errorName(err)});
-    };
 }
 
 fn serveMain(allocator: std.mem.Allocator, fs: *fsdrive.Fs, root: []const u8, fuse_fd: c_int) void {
@@ -103,8 +99,8 @@ pub fn main() u8 {
     // Daemon + source tree.
     var path_buf: [128]u8 = undefined;
     const sock = std.fmt.bufPrint(&path_buf, "/tmp/sketerm-smoke-fuse-{d}/mux.sock", .{c.getpid()}) catch unreachable;
-    const d = daemon_mod.Daemon.init(allocator, sock) catch fail("daemon init");
-    const th = std.Thread.spawn(.{}, daemonMain, .{d}) catch fail("daemon thread");
+    if (!lifetime.arm()) fail("lifetime fence");
+    const bpid = muxrig.forkBroker("smoke-fuse", sock);
 
     var sbuf: [64]u8 = undefined;
     const src = mkTmp(&sbuf, "src");
@@ -242,8 +238,7 @@ pub fn main() u8 {
         defer sconn.deinit();
         sconn.sendFrame(.shutdown, "") catch fail("shutdown send");
     }
-    th.join();
-    d.deinit();
+    muxrig.waitBroker("smoke-fuse", bpid, 10_000);
 
     std.debug.print("smoke-fuse: OK\n", .{});
     return 0;

@@ -1,6 +1,7 @@
 //! End-to-end smoke for the UDP transport + NAT hole punch.
 //!
-//! Runs the REAL pieces against an isolated in-process daemon: a fake
+//! Runs the REAL pieces against an isolated broker forked by the rig
+//! (`muxrig.forkBroker`, the process shape every daemon has): a fake
 //! ssh (SKETERM_SSH) execs the freshly built `sketerm-mux --udp-listen`
 //! (argv[1], via SKETERM_MUX_BIN) with a loopback $SSH_CONNECTION, and
 //! `Conn.connectUdp` drives the whole bootstrap — punch line on ssh
@@ -11,12 +12,16 @@
 //! what a NAT that drops unsolicited inbound looks like. The connect
 //! can then only succeed via the server's pre-aimed authenticated
 //! probe plus client-side roaming. Before the punch existed this
-//! scenario timed out. `zig build smoke-udp`.
+//! scenario timed out. A session is then spawned, attached and typed
+//! into over the UDP connection itself, so the broker's fd handoff to
+//! the session worker is proven for a bridged transport too.
+//! `zig build smoke-udp`.
 
 const std = @import("std");
 const c = @import("c.zig").c;
-const daemon_mod = @import("mux/daemon.zig");
 const client_mod = @import("mux/client.zig");
+const lifetime = @import("util/lifetime.zig");
+const muxrig = @import("smoke/muxrig.zig");
 
 fn fail(msg: []const u8) noreturn {
     std.debug.print("smoke-udp: FAIL: {s}\n", .{msg});
@@ -24,12 +29,6 @@ fn fail(msg: []const u8) noreturn {
 }
 
 fn sigNoop(_: c_int) callconv(.c) void {}
-
-fn daemonMain(d: *daemon_mod.Daemon) void {
-    d.run() catch |err| {
-        std.debug.print("smoke-udp: daemon error: {s}\n", .{@errorName(err)});
-    };
-}
 
 fn writeScript(path: [:0]const u8, body: []const u8) void {
     const f = c.fopen(path.ptr, "w") orelse fail("script open");
@@ -89,8 +88,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var sock_buf: [200]u8 = undefined;
     const sock_path = std.fmt.bufPrint(&sock_buf, "{s}/mux.sock", .{sub}) catch unreachable;
 
-    const d = daemon_mod.Daemon.init(allocator, sock_path) catch fail("daemon init");
-    const th = std.Thread.spawn(.{}, daemonMain, .{d}) catch fail("thread spawn");
+    // Every process below the rig (the broker, its workers, each
+    // --udp-listen bridge) retires when the rig dies by any path.
+    if (!lifetime.arm()) fail("lifetime fence");
+    const bpid = muxrig.forkBroker("smoke-udp", sock_path);
 
     // Fake ssh #1: straight pass-through. -G answers like OpenSSH so
     // the config-resolution step targets loopback; the bootstrap execs
@@ -149,6 +150,24 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     _ = c.setenv("SKETERM_SSH", ssh2.ptr, 1);
     connectStage(allocator, "hole-punched connect (wrong announced port)");
 
+    // A session over UDP: the broker forks its worker and hands the
+    // bridge's connection over; input typed through the sealed channel
+    // must echo back from the worker.
+    {
+        _ = c.setenv("SKETERM_SSH", ssh1.ptr, 1);
+        var conn = client_mod.Conn.connectUdp(allocator, "smoke-udp-host", null) catch fail("session stage connect");
+        defer conn.deinit();
+        muxrig.spawnCat("smoke-udp", allocator, &conn, "udp-echo");
+        muxrig.attachAndEcho("smoke-udp", allocator, &conn, "udp-echo", "UDP-ECHO-31");
+        // The UDP connection now belongs to the session's worker; the
+        // session is killed through the broker like any other.
+        var kc = client_mod.Conn.connectProbed(allocator, sock_path) catch fail("session stage kill connect");
+        defer kc.deinit();
+        kc.sendJson(.kill, .{ .name = "udp-echo" }) catch fail("session stage kill send");
+        (kc.recvExpectFor(&.{.ok}, 10_000) catch fail("session stage kill")).deinit(allocator);
+        std.debug.print("smoke-udp: session spawn/attach/echo over UDP via a worker ok\n", .{});
+    }
+
     _ = c.setenv("SKETERM_SSH", ssh3.ptr, 1);
     _ = c.setenv("SKETERM_MUX_PORTABLE", argv[1], 1);
     connectStage(allocator, "auto-deployed connect (emulated login shell)");
@@ -196,12 +215,12 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         std.debug.print("smoke-udp: brokered ticket connect (no ssh bootstrap) ok\n", .{});
     }
 
-    // Clean daemon shutdown so the leak check means something.
+    // Clean broker shutdown so its (and every worker's) leak check
+    // means something: waitBroker fails on any nonzero exit.
     var conn = client_mod.Conn.connect(allocator, sock_path) catch fail("shutdown connect");
     conn.sendFrame(.shutdown, "") catch fail("shutdown send");
     conn.deinit();
-    th.join();
-    d.deinit();
+    muxrig.waitBroker("smoke-udp", bpid, 10_000);
 
     _ = c.unlink(ssh1.ptr);
     _ = c.unlink(ssh2.ptr);

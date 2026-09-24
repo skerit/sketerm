@@ -693,12 +693,12 @@ test "doctor process rows nest by depth and name what a daemon serves" {
     try std.testing.expectEqual(@as(?usize, null), std.mem.indexOfScalar(u8, plain.written(), 0x1b));
     try std.testing.expectEqual(@as(u32, 0), probeWarns(&worker, .{}));
 
-    const broker = procinv.Proc{ .pid = 100, .ppid = 1, .age_ms = 90_000_000, .argv = "sketerm-mux\x00--broker", .name = "sketerm-mux", .replaced = true, .role = .broker, .mode = .daemon };
+    const broker = procinv.Proc{ .pid = 100, .ppid = 1, .age_ms = 90_000_000, .argv = "sketerm-mux\x00--broker", .name = "sketerm-mux", .replaced = true, .role = .daemon, .mode = .daemon };
     const gone = DaemonProbe{ .path = "/run/user/1000/sketerm/mux.sock", .state = .gone };
     var warned: std.Io.Writer.Allocating = .init(allocator);
     defer warned.deinit();
     try writeProcRow(&warned.writer, Palette.init(false), &broker, gone, &.{});
-    try contains(warned.written(), "daemon (broker)");
+    try contains(warned.written(), " daemon ");
     try contains(warned.written(), "up 1d1h");
     try contains(warned.written(), "socket gone: /run/user/1000/sketerm/mux.sock");
     try contains(warned.written(), "[binary replaced since start]");

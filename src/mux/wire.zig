@@ -223,9 +223,9 @@ pub const FrameType = enum(u8) {
     /// headless browser-profile store's flock and id allocation into
     /// the daemon, so N concurrent MCP clients of one instance share
     /// one store instead of the second being refused. Served ONLY by
-    /// the broker (or a monolith daemon) — a worker answers with a
-    /// described error, because the store is process-exclusive and the
-    /// broker is the process that outlives every client.
+    /// the broker — a worker answers with a described error, because
+    /// the store is process-exclusive and the broker is the process
+    /// that outlives every client.
     web_op = 32,
     /// Open a TCP stream to an ARBITRARY host:port FROM the daemon's
     /// host, with the hostname resolved at the daemon's end (remote

@@ -22,8 +22,12 @@ const HELP =
     \\Runs in the foreground, listening on PATH (default
     \\$XDG_RUNTIME_DIR/sketerm/mux.sock). Clients (the sketerm GUI or
     \\`sketerm mux ...`) connect over the socket to spawn, attach,
-    \\and control sessions. Shells keep running while no client is
-    \\attached; SIGTERM shuts down (and kills the sessions).
+    \\and control sessions. The listening process is a BROKER: it
+    \\holds no session itself and forks one worker process per
+    \\session, so a crashing shell or app takes down only its own
+    \\worker. Shells keep running while no client is attached; SIGTERM
+    \\shuts down (and kills the sessions). `--broker` is accepted for
+    \\clients that still pass it and changes nothing.
     \\--idle-exit SECS makes the daemon exit by itself once it has held
     \\no session and no client for that long (private MCP instances).
     \\$SKETERM_MUX_LIFETIME_FD=N names an inherited pipe read end; the
@@ -59,7 +63,6 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     const allocator = gpa_state.allocator();
 
     var sock_path: ?[]const u8 = null;
-    var broker_mode = false;
     var idle_exit_ms: i64 = 0;
     const argv = init.args.vector;
     // Self-spawns exec /proc/self/exe, which the kernel would name "exe".
@@ -80,9 +83,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             i += 1;
             sock_path = std.mem.span(argv[i]);
         } else if (std.mem.eql(u8, a, selfexec.BROKER_FLAG)) {
-            // Process-isolation mode: hold no sessions; fork one worker per
-            // session and hand client fds to workers (Firefox-style).
-            broker_mode = true;
+            // Every listening daemon is a broker; the flag stays accepted
+            // because the client autostart passes it so that an OLDER
+            // installed binary, which still had a single-process mode,
+            // comes up as a broker too.
         } else if (std.mem.eql(u8, a, "--idle-exit") and i + 1 < argv.len) {
             // Exit once no session and no client has existed for this many
             // seconds. Opt-in: a per-user daemon lives client-less for days
@@ -189,7 +193,6 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         std.debug.print("sketerm-mux: bind {s} failed: {s}\n", .{ path, @errorName(err) });
         return 1;
     };
-    d.is_broker = broker_mode;
     d.idle_exit_ms = idle_exit_ms;
     d.lifetime_fd = lifetime_fd;
     // The autostart knob travelled in OUR environment; the shells and
@@ -653,8 +656,9 @@ fn connectDaemonRetry(allocator: std.mem.Allocator, sock_path: ?[]const u8) ?c_i
     return null;
 }
 
-/// Start the default daemon from our own image, detached by a double fork so it reparents to
-/// init and outlives the ssh session that asked for it. Returns once the middle child is reaped.
+/// Start the default daemon (a broker, like every daemon this image runs) from our own
+/// image, detached by a double fork so it reparents to init and outlives the ssh session
+/// that asked for it. Returns once the middle child is reaped.
 fn autostartDaemon() void {
     const cc = @import("c.zig").c;
     const pid = cc.fork();

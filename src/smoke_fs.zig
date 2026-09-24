@@ -5,7 +5,7 @@
 //! stat, view teardown (close, dir-gone, client death), error paths,
 //! and a broker-mode pass (fs frames are served by the process owning
 //! the client connection — the broker-handoff lesson says: never
-//! trust a monolith-only green). `zig build smoke-fs`.
+//! trust a single-daemon green). `zig build smoke-fs`.
 
 const std = @import("std");
 const c = @import("c.zig").c;
@@ -4686,7 +4686,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     };
     const allocator = gpa_state.allocator();
 
-    // ── monolith pass ──────────────────────────────────────────
+    // ── first daemon pass ──────────────────────────────────────
     var path_buf: [128]u8 = undefined;
     const sock_path = std.fmt.bufPrint(&path_buf, "/tmp/sketerm-smoke-fs-{d}/mux.sock", .{c.getpid()}) catch unreachable;
     registerTmpRoot(std.fs.path.dirname(sock_path).?);
@@ -4752,12 +4752,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
     // ── broker pass (same fs surface served by a broker-mode
     // daemon: fs clients never attach, so the broker itself must
-    // answer — a monolith-only green would hide a handoff bug) ──
+    // answer — one pass alone would hide a handoff bug) ──
     var bpath_buf: [128]u8 = undefined;
     const bsock = std.fmt.bufPrint(&bpath_buf, "/tmp/sketerm-smoke-fs-b{d}/mux.sock", .{c.getpid()}) catch unreachable;
     registerTmpRoot(std.fs.path.dirname(bsock).?);
     const bd = daemon_mod.Daemon.init(allocator, bsock) catch fail("broker init");
-    bd.is_broker = true;
     const bth = std.Thread.spawn(.{}, daemonMain, .{bd}) catch fail("broker thread");
     fsStage(allocator, bsock, "broker");
     jobStage(allocator, bsock, "broker");

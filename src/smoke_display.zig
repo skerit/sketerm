@@ -3,7 +3,7 @@
 //! Shared stage: `smoke-mux` runs it against a MONOLITH daemon and
 //! `smoke-broker` against a real broker (whose per-session workers make
 //! the 'Y'/'A' control datagrams load-bearing). Broker-only regressions
-//! in exactly that hop have shipped before while monolith smokes stayed
+//! in exactly that hop have shipped before while single-process smokes stayed
 //! green, so both is not redundancy — it is the point.
 //!
 //! Covered: `display create` returns a usable environment and output mode;

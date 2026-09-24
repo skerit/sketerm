@@ -1,4 +1,4 @@
-//! Spawn-dimension validation shared by the monolith and broker smoke rigs.
+//! Spawn-dimension validation shared by the smoke-mux and smoke-broker rigs.
 
 const std = @import("std");
 const c = @import("c.zig").c;

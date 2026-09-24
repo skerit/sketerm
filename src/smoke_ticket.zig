@@ -1,12 +1,12 @@
-//! UDP connection-ticket brokering stage, run against a monolith
-//! (smoke-mux) AND a real broker (smoke-broker). The broker run is
-//! load-bearing: an ATTACHED client's frames are served by the
+//! UDP connection-ticket brokering stage, run by smoke-mux AND
+//! smoke-broker (both against a real broker process). The attached
+//! case is load-bearing: an ATTACHED client's frames are served by the
 //! WORKER, whose Daemon has an empty `sock_path` and must mint
-//! through `broker_sock` — monolith-only coverage would miss exactly
-//! that hop (the native-backlog lesson). Requires $SKETERM_MUX_BIN:
-//! the daemon spawns the ticket listener and the client spawns the
-//! --udp-connect bridge from it (both rigs host the Daemon inside a
-//! smoke binary that answers neither).
+//! through `broker_sock` — covering the listening process alone would
+//! miss exactly that hop (the native-backlog lesson). Requires
+//! $SKETERM_MUX_BIN: the daemon spawns the ticket listener and the
+//! client spawns the --udp-connect bridge from it (both rigs host the
+//! Daemon inside a smoke binary that answers neither).
 
 const std = @import("std");
 const c = @import("c.zig").c;

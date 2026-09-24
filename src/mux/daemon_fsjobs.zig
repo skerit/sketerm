@@ -16,10 +16,10 @@ const Daemon = dmod.Daemon;
 const Client = dmod.Client;
 const Session = dmod.Session;
 const FsJob = dmod.FsJob;
-const FsOpReq = @import("daemon_serve.zig").FsOpReq;
+const FsOpReq = @import("daemon_fsops.zig").FsOpReq;
 const nowMs = @import("../util/clock.zig").nowMs;
 const wallMs = @import("../util/clock.zig").wallMs;
-const fsReplyErr = @import("daemon_serve.zig").fsReplyErr;
+const fsReplyErr = @import("daemon_fsops.zig").fsReplyErr;
 
 // ── subprocess file jobs (copy / delete_tree / hash) ────────────
 
@@ -33,7 +33,7 @@ const PREVIEW_ASSET_TTL_MS: i64 = 300_000;
 
 /// Wire verb -> job op. The wire names ARE the FsJob.Op tag names, so
 /// this is the single source of truth for "is this verb a job?" --
-/// daemon_serve's routing asks here rather than keeping its own list.
+/// daemon_fsops's routing asks here rather than keeping its own list.
 pub fn jobOpFor(op: []const u8) ?FsJob.Op {
     return std.meta.stringToEnum(FsJob.Op, op);
 }

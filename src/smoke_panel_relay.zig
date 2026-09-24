@@ -1,4 +1,4 @@
-//! Native-panel mux relay stage shared by monolith and broker smoke rigs.
+//! Native-panel mux relay stage shared by the smoke-mux and smoke-broker rigs.
 
 const std = @import("std");
 const c = @import("c.zig").c;
@@ -309,8 +309,8 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8) void {
 
     // The requester attachment's negotiated requirement selects presenters:
     // v1 remains compatible with both generations, while v2 can never route
-    // its reliable operation to a v1 GUI. This shared stage runs against the
-    // monolith and the broker/worker handoff.
+    // its reliable operation to a v1 GUI. This shared stage runs in both
+    // rigs, through the broker's handoff to the session worker.
     var presenter_v1 = attachPresenterVersion(allocator, sock_path, "panel-stage", 1);
     var presenter_v2 = attachPresenterVersion(allocator, sock_path, "panel-stage", 2);
     var requester_v1 = attachRequesterVersion(allocator, sock_path, "panel-stage", 1);
@@ -600,7 +600,7 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8) void {
     if (listHas(allocator, &owner, "panel-ttl", null)) fail("panel-only requester kept display TTL occupied");
 
     // Session teardown after presenter delivery must resolve the route before
-    // worker/monolith teardown closes the requester connection.
+    // worker teardown closes the requester connection.
     requester_a.sendPanelRequest(92, "{\"cmd\":\"smoke\",\"op\":\"session-teardown\"}") catch fail("teardown panel request");
     const teardown_call = recvEnvelope(allocator, &newer_gui, .panel_request, 5_000);
     defer allocator.free(teardown_call.json);

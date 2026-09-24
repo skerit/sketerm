@@ -30,11 +30,11 @@ const pathZ = @import("../util/pathz.zig").pathZ;
 const SessionInfo = dmod.SessionInfo;
 const RenameReq = dmod.RenameReq;
 const SessionOriginId = dmod.SessionOriginId;
-const daemon_serve = @import("daemon_serve.zig");
-const controlSend = daemon_serve.controlSend;
-const PassedClient = daemon_serve.PassedClient;
-const WORKER_META_BUF = daemon_serve.WORKER_META_BUF;
-const runWorker = daemon_serve.runWorker;
+const daemon_control = @import("daemon_control.zig");
+const controlSend = daemon_control.controlSend;
+const PassedClient = daemon_control.PassedClient;
+const WORKER_META_BUF = daemon_control.WORKER_META_BUF;
+const runWorker = daemon_control.runWorker;
 const version = @import("../version.zig");
 const a11yhub = @import("a11yhub.zig");
 const fillSockaddrUn = dmod.fillSockaddrUn;
@@ -138,9 +138,7 @@ fn normalizeSpawnRequest(
     };
 }
 
-const SpawnEntry = enum { monolith, broker };
-
-/// Owns a normalized request and records the entry path's namespace lookup.
+/// Owns a normalized request and records the broker's namespace lookup.
 const PreparedSpawnRequest = struct {
     normalized: NormalizedSpawnRequest,
     name_exists: bool,
@@ -153,15 +151,11 @@ const PreparedSpawnRequest = struct {
 fn prepareSpawnRequest(
     self: *Daemon,
     payload: []const u8,
-    entry: SpawnEntry,
     account_shell: *const fn () []const u8,
 ) SpawnNormalizeError!PreparedSpawnRequest {
     var normalized = try normalizeSpawnRequest(self.allocator, payload, account_shell);
     errdefer normalized.deinit();
-    const name_exists = switch (entry) {
-        .monolith => findSession(self, normalized.req.name) != null,
-        .broker => brokerNameInUse(self, normalized.req.name, null),
-    };
+    const name_exists = brokerNameInUse(self, normalized.req.name, null);
     return .{ .normalized = normalized, .name_exists = name_exists };
 }
 
@@ -193,50 +187,35 @@ pub fn handleSpawn(self: *Daemon, cl: *Client, payload: []const u8) void {
         cl.queueErr("no shared terminal profile; daemon and sessions preserved");
         return;
     }
-    if (self.is_broker) return brokerSpawn(self, cl, payload);
     if (self.isWorker()) {
         cl.queueErr("session workers cannot spawn another session");
         return;
     }
-    var prepared = prepareSpawnRequest(self, payload, .monolith, shell_util.accountLoginShell) catch |err| {
-        queueSpawnNormalizeError(cl, err);
-        return;
-    };
-    defer prepared.deinit();
-    const req = prepared.normalized.req;
-    if (prepared.name_exists) {
-        queueNameExists(cl, req.name);
-        return;
-    }
-    const s = spawnSession(self, req) catch |err| {
-        var ebuf: [192]u8 = undefined;
-        const msg = std.fmt.bufPrint(&ebuf, "spawn failed: {s}", .{@errorName(err)}) catch "spawn failed";
-        cl.queueErr(msg);
-        return;
-    };
-    self.sessions.append(self.allocator, s) catch {
-        s.deinit();
-        cl.queueErr("oom");
-        return;
-    };
-    cl.queueJson(.ok, .{
-        .ok = true,
-        .name = s.name,
-        .origin_name = s.origin_name,
-        .origin_id = &s.origin_id,
-        .pid = s.childPid(),
-        // The session's environment: an external renderer must be
-        // handed these, never left to derive a wl-w<pid> path.
-        .wl_display = if (s.wl_display_path) |p| p else "",
-        .pulse_server = if (s.pa_socket_path) |p| p else "",
-        .runtime_dir = if (s.runtime_dir_path) |p| p else "",
-        .xwayland = s.xwayland != null,
-        .x_display = if (s.xwayland) |*xwl| xwl.display_name else "",
-        .xauthority = if (s.xwayland) |*xwl| xwl.auth_path else "",
-        .gpu = s.gpu,
-        .output_width = s.output_width,
-        .output_height = s.output_height,
-    });
+    brokerSpawn(self, cl, payload);
+}
+
+/// The forked worker child's whole life: serve the one session over
+/// `control_fd`, return the process exit status. `req` is the broker's
+/// copy-on-write request and is only read.
+pub const WorkerEntry = *const fn (
+    allocator: std.mem.Allocator,
+    control_fd: c_int,
+    req: SpawnReq,
+    origin_id: SessionOriginId,
+    base_dir: []const u8,
+    broker_sock: []const u8,
+) u8;
+
+/// Production entry: the worker runs on the broker's (inherited) allocator.
+pub fn defaultWorkerEntry(
+    allocator: std.mem.Allocator,
+    control_fd: c_int,
+    req: SpawnReq,
+    origin_id: SessionOriginId,
+    base_dir: []const u8,
+    broker_sock: []const u8,
+) u8 {
+    return runWorker(allocator, control_fd, req, origin_id, base_dir, broker_sock);
 }
 
 pub fn brokerFindWorker(self: *Daemon, name: []const u8) ?*Worker {
@@ -339,7 +318,7 @@ pub fn closeInheritedBrokerFds(self: *Daemon, control_fd: c_int) void {
 /// fork-without-exec — the child runs `runWorker` against an inherited
 /// (COW) copy of the SpawnReq; it first drops every broker fd it inherited.
 pub fn brokerSpawn(self: *Daemon, cl: *Client, payload: []const u8) void {
-    var prepared = prepareSpawnRequest(self, payload, .broker, shell_util.accountLoginShell) catch |err| {
+    var prepared = prepareSpawnRequest(self, payload, shell_util.accountLoginShell) catch |err| {
         queueSpawnNormalizeError(cl, err);
         return;
     };
@@ -382,8 +361,7 @@ pub fn brokerSpawn(self: *Daemon, cl: *Client, payload: []const u8) void {
         // isolated-rt sockets land in the right runtime dir (the worker has
         // no listen socket of its own to derive it from). COW-valid here.
         const dir_end = std.mem.lastIndexOfScalar(u8, self.sock_path, '/') orelse self.sock_path.len;
-        runWorker(self.allocator, sp[1], req, origin_id, self.sock_path[0..dir_end], self.sock_path) catch {};
-        c._exit(0);
+        c._exit(self.worker_entry(self.allocator, sp[1], req, origin_id, self.sock_path[0..dir_end], self.sock_path));
     }
     // Broker parent.
     _ = c.close(sp[1]);
@@ -465,7 +443,6 @@ test "a worker the broker cannot record is killed, reaped and answered" {
         .allocator = failing.allocator(),
         .listen_fd = -1,
         .sock_path = empty[0..],
-        .is_broker = true,
     };
     defer broker.workers.deinit(a);
     var cl = Client{ .allocator = a, .fd = -1 };
@@ -505,7 +482,7 @@ fn testAccountLoginShell() []const u8 {
     return "/test/account-shell";
 }
 
-test "spawn preparation normalizes monolith and broker requests identically" {
+test "spawn preparation normalizes requests and detects live-worker name collisions" {
     const t = std.testing;
     const account_shell = testAccountLoginShell();
     const ExpectedArgv = enum { command, shell, empty };
@@ -651,18 +628,8 @@ test "spawn preparation normalizes monolith and broker requests identically" {
         },
     };
 
-    var monolith_empty: [0]u8 = .{};
     var broker_empty: [0]u8 = .{};
-    var monolith = Daemon{ .allocator = t.allocator, .listen_fd = -1, .sock_path = monolith_empty[0..] };
-    var broker = Daemon{ .allocator = t.allocator, .listen_fd = -1, .sock_path = broker_empty[0..], .is_broker = true };
-
-    var monolith_current = "taken".*;
-    var monolith_origin = "spawned-as".*;
-    var collision_session: Session = undefined;
-    collision_session.name = monolith_current[0..];
-    collision_session.origin_name = monolith_origin[0..];
-    var session_items = [_]*Session{&collision_session};
-    monolith.sessions = .{ .items = &session_items, .capacity = session_items.len };
+    var broker = Daemon{ .allocator = t.allocator, .listen_fd = -1, .sock_path = broker_empty[0..] };
 
     var broker_current = "taken".*;
     var broker_origin = "spawned-as".*;
@@ -683,43 +650,24 @@ test "spawn preparation normalizes monolith and broker requests identically" {
     }
 
     for (cases) |case| {
-        var monolith_prepared: ?PreparedSpawnRequest = null;
-        var monolith_error: ?SpawnNormalizeError = null;
-        monolith_prepared = prepareSpawnRequest(&monolith, case.payload, .monolith, testAccountLoginShell) catch |err| blk: {
-            monolith_error = err;
-            break :blk null;
-        };
-        defer if (monolith_prepared) |*prepared| prepared.deinit();
-
         var broker_prepared: ?PreparedSpawnRequest = null;
         var broker_error: ?SpawnNormalizeError = null;
-        broker_prepared = prepareSpawnRequest(&broker, case.payload, .broker, testAccountLoginShell) catch |err| blk: {
+        broker_prepared = prepareSpawnRequest(&broker, case.payload, testAccountLoginShell) catch |err| blk: {
             broker_error = err;
             break :blk null;
         };
         defer if (broker_prepared) |*prepared| prepared.deinit();
 
-        try t.expectEqual(monolith_error, broker_error);
-        try t.expectEqual(case.expected_error, monolith_error);
-        if (monolith_error) |err| {
+        try t.expectEqual(case.expected_error, broker_error);
+        if (broker_error) |err| {
             try t.expectEqualStrings(case.expected_error_text, spawnNormalizeErrorText(err));
             continue;
         }
 
-        const monolith_ready = &monolith_prepared.?;
         const broker_ready = &broker_prepared.?;
-        try t.expectEqual(monolith_ready.name_exists, broker_ready.name_exists);
-        try t.expectEqual(case.expected_collision, monolith_ready.name_exists);
+        try t.expectEqual(case.expected_collision, broker_ready.name_exists);
 
-        var monolith_json: std.Io.Writer.Allocating = .init(t.allocator);
-        defer monolith_json.deinit();
-        var broker_json: std.Io.Writer.Allocating = .init(t.allocator);
-        defer broker_json.deinit();
-        try std.json.Stringify.value(monolith_ready.normalized.req, .{}, &monolith_json.writer);
-        try std.json.Stringify.value(broker_ready.normalized.req, .{}, &broker_json.writer);
-        try t.expectEqualStrings(monolith_json.written(), broker_json.written());
-
-        const req = monolith_ready.normalized.req;
+        const req = broker_ready.normalized.req;
         try t.expectEqual(case.expected_login_shell, req.login_shell);
         try t.expectEqual(case.expected_rows, req.rows);
         try t.expectEqual(case.expected_cols, req.cols);
@@ -739,12 +687,9 @@ test "spawn preparation normalizes monolith and broker requests identically" {
             .empty => try t.expectEqual(@as(usize, 0), req.argv.len),
         }
         if (case.expected_collision) {
-            var monolith_buf: [192]u8 = undefined;
             var broker_buf: [192]u8 = undefined;
-            const monolith_text = nameExistsText(&monolith_buf, monolith_ready.normalized.req.name);
             const broker_text = nameExistsText(&broker_buf, broker_ready.normalized.req.name);
-            try t.expectEqualStrings(monolith_text, broker_text);
-            try t.expectEqualStrings(case.expected_collision_text, monolith_text);
+            try t.expectEqualStrings(case.expected_collision_text, broker_text);
         }
     }
 }
@@ -753,37 +698,34 @@ test "spawn preparation owns login shell allocations failure-atomically" {
     const t = std.testing;
     const payload = "{\"name\":\"shell-oom\"}";
 
-    for ([_]SpawnEntry{ .monolith, .broker }) |entry| {
-        var empty: [0]u8 = .{};
-        var baseline_allocator = t.FailingAllocator.init(t.allocator, .{});
-        var daemon = Daemon{
-            .allocator = baseline_allocator.allocator(),
-            .listen_fd = -1,
-            .sock_path = empty[0..],
-            .is_broker = entry == .broker,
-        };
-        var prepared = try prepareSpawnRequest(&daemon, payload, entry, testAccountLoginShell);
-        prepared.deinit();
-        const allocations = baseline_allocator.alloc_index;
-        try t.expect(allocations >= 2);
+    var empty: [0]u8 = .{};
+    var baseline_allocator = t.FailingAllocator.init(t.allocator, .{});
+    var daemon = Daemon{
+        .allocator = baseline_allocator.allocator(),
+        .listen_fd = -1,
+        .sock_path = empty[0..],
+    };
+    var prepared = try prepareSpawnRequest(&daemon, payload, testAccountLoginShell);
+    prepared.deinit();
+    const allocations = baseline_allocator.alloc_index;
+    try t.expect(allocations >= 2);
 
-        var parse_oom = t.FailingAllocator.init(t.allocator, .{ .fail_index = 0 });
-        daemon.allocator = parse_oom.allocator();
-        try t.expectError(error.BadSpawnRequest, prepareSpawnRequest(&daemon, payload, entry, testAccountLoginShell));
-        try t.expect(parse_oom.has_induced_failure);
-        try t.expectEqualStrings("bad spawn request", spawnNormalizeErrorText(error.BadSpawnRequest));
+    var parse_oom = t.FailingAllocator.init(t.allocator, .{ .fail_index = 0 });
+    daemon.allocator = parse_oom.allocator();
+    try t.expectError(error.BadSpawnRequest, prepareSpawnRequest(&daemon, payload, testAccountLoginShell));
+    try t.expect(parse_oom.has_induced_failure);
+    try t.expectEqualStrings("bad spawn request", spawnNormalizeErrorText(error.BadSpawnRequest));
 
-        for (allocations - 2..allocations) |fail_index| {
-            var shell_oom = t.FailingAllocator.init(t.allocator, .{ .fail_index = fail_index });
-            daemon.allocator = shell_oom.allocator();
-            try t.expectError(error.OutOfMemory, prepareSpawnRequest(&daemon, payload, entry, testAccountLoginShell));
-            try t.expect(shell_oom.has_induced_failure);
-            try t.expectEqualStrings("oom", spawnNormalizeErrorText(error.OutOfMemory));
+    for (allocations - 2..allocations) |fail_index| {
+        var shell_oom = t.FailingAllocator.init(t.allocator, .{ .fail_index = fail_index });
+        daemon.allocator = shell_oom.allocator();
+        try t.expectError(error.OutOfMemory, prepareSpawnRequest(&daemon, payload, testAccountLoginShell));
+        try t.expect(shell_oom.has_induced_failure);
+        try t.expectEqualStrings("oom", spawnNormalizeErrorText(error.OutOfMemory));
 
-            daemon.allocator = t.allocator;
-            var retry = try prepareSpawnRequest(&daemon, payload, entry, testAccountLoginShell);
-            retry.deinit();
-        }
+        daemon.allocator = t.allocator;
+        var retry = try prepareSpawnRequest(&daemon, payload, testAccountLoginShell);
+        retry.deinit();
     }
 }
 
@@ -797,7 +739,6 @@ test "new workers close every broker descriptor and release stale listeners" {
     var path_buf: [160]u8 = undefined;
     const socket_path = try std.fmt.bufPrint(&path_buf, "{s}/mux.sock", .{dir});
     const broker = try Daemon.init(a, socket_path);
-    broker.is_broker = true;
     defer broker.deinit();
 
     var client_pair: [2]c_int = undefined;
@@ -947,14 +888,7 @@ pub fn brokerAttach(self: *Daemon, cl: *Client, payload: []const u8) void {
         cl.queueErr("session origin identity changed");
         return;
     }
-    const kind: Client.Kind = if (std.mem.eql(u8, parsed.value.kind, "gui"))
-        .gui
-    else if (std.mem.eql(u8, parsed.value.kind, "cli"))
-        .cli
-    else if (std.mem.eql(u8, parsed.value.kind, "mcp"))
-        .mcp
-    else
-        .unknown;
+    const kind = clientKindNamed(parsed.value.kind);
     const encoded = (PassedClient{
         .proto = cl.proto,
         .video = cl.video,
@@ -1051,7 +985,6 @@ test "broker list answers an allocation failure instead of dropping the reply" {
         .allocator = failing.allocator(),
         .listen_fd = -1,
         .sock_path = empty[0..],
-        .is_broker = true,
     };
     defer broker.workers.deinit(a);
     var requester = Client{ .allocator = a, .fd = -1 };
@@ -1132,7 +1065,7 @@ test "broker kill origin fence preserves replacements and accepts exact or absen
     defer _ = c.close(control[1]);
 
     var empty: [0]u8 = .{};
-    var broker = Daemon{ .allocator = a, .listen_fd = -1, .sock_path = empty[0..], .is_broker = true };
+    var broker = Daemon{ .allocator = a, .listen_fd = -1, .sock_path = empty[0..] };
     defer broker.workers.deinit(a);
     var requester = Client{ .allocator = a, .fd = -1 };
     defer requester.rbuf.deinit(a);
@@ -1279,7 +1212,7 @@ test "broker rename renames the worker record and forwards one authoritative nam
     defer _ = c.close(control[1]);
 
     var empty: [0]u8 = .{};
-    var broker = Daemon{ .allocator = a, .listen_fd = -1, .sock_path = empty[0..], .is_broker = true };
+    var broker = Daemon{ .allocator = a, .listen_fd = -1, .sock_path = empty[0..] };
     defer broker.clients.deinit(a);
     defer broker.workers.deinit(a);
     var requester = Client{ .allocator = a, .fd = -1, .id = 77 };
@@ -1314,7 +1247,7 @@ test "broker rename renames the worker record and forwards one authoritative nam
 
     var buf: [128]u8 = undefined;
     var passed: c_int = -1;
-    const n = daemon_serve.controlRecv(control[1], &buf, &passed);
+    const n = daemon_control.controlRecv(control[1], &buf, &passed);
     try t.expect(n > 1);
     try t.expectEqual(@as(u8, 'R'), buf[0]);
     try t.expectEqualStrings("fresh", buf[1..@intCast(n)]);
@@ -1355,15 +1288,15 @@ pub const WaylandHub = struct {
 /// at. Null on any failure (the session still spawns, just without
 /// Wayland forwarding).
 /// True in a forked session worker (owns one session over a control_fd,
-/// no listen socket). Broker and monolith both have control_fd == -1.
+/// no listen socket); false in the listening broker.
 pub inline fn isWorker(self: *const Daemon) bool {
-    return self.control_fd >= 0;
+    return self.role == .worker;
 }
 
 /// Directory the session's auxiliary sockets (Wayland display, isolated rt
-/// dir) live in. The monolith/broker derive it from their listen socket
-/// path; a worker was handed it at fork (it has no listen socket). Null if
-/// neither is available.
+/// dir) live in. The broker derives it from its listen socket path; a
+/// worker was handed it at fork (it has no listen socket). Null if neither
+/// is available.
 pub fn runtimeBaseDir(self: *const Daemon) ?[]const u8 {
     if (self.base_dir) |d| return d;
     const dir_end = std.mem.lastIndexOfScalar(u8, self.sock_path, '/') orelse return null;
@@ -1371,35 +1304,27 @@ pub fn runtimeBaseDir(self: *const Daemon) ?[]const u8 {
 }
 
 pub fn setupWaylandHub(self: *Daemon) ?WaylandHub {
-    const id = if (self.isWorker()) 0 else blk: {
-        const v = self.next_wl_id;
-        self.next_wl_id += 1;
-        break :blk v;
-    };
-    return setupHubSocket(self, "wl", id);
+    return setupHubSocket(self, "wl");
 }
 
-/// PulseAudio hub: same listener shape, "pa-N" socket (its own
-/// counter — the rigs rely on sequential "wl-N"). Each app
+/// PulseAudio hub: same listener shape, "pa-w<pid>" socket. Each app
 /// connection becomes an `audio` channel (mux/pulse.zig server).
 pub fn setupAudioHub(self: *Daemon) ?WaylandHub {
-    const id = if (self.isWorker()) 0 else blk: {
-        const v = self.next_pa_id;
-        self.next_pa_id += 1;
-        break :blk v;
-    };
-    return setupHubSocket(self, "pa", id);
+    return setupHubSocket(self, "pa");
 }
 
-pub fn setupHubSocket(self: *Daemon, comptime prefix: []const u8, id: u32) ?WaylandHub {
+/// Per-session sockets are named by the OWNING PROCESS: workers share
+/// the runtime dir, one session each, so the pid is the unique and
+/// path-safe key (session names are user input). Clients never derive
+/// these names; the spawn `.ok` and `list` carry them.
+pub fn hubSocketName(buf: []u8, comptime prefix: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, prefix ++ "-w{d}", .{c.getpid()}) catch unreachable;
+}
+
+pub fn setupHubSocket(self: *Daemon, comptime prefix: []const u8) ?WaylandHub {
     const dir = runtimeBaseDir(self) orelse return null;
-    // Workers share the runtime dir, each with one session, so a per-worker
-    // counter would collide ("wl-1" in every worker) — name by pid instead.
-    // The monolith keeps the sequential "wl-N" the rigs expect.
-    const display_path = if (self.isWorker())
-        std.fmt.allocPrint(self.allocator, "{s}/" ++ prefix ++ "-w{d}", .{ dir, c.getpid() }) catch return null
-    else
-        std.fmt.allocPrint(self.allocator, "{s}/" ++ prefix ++ "-{d}", .{ dir, id }) catch return null;
+    var name_buf: [32]u8 = undefined;
+    const display_path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir, hubSocketName(&name_buf, prefix) }) catch return null;
     var ok = false;
     defer if (!ok) self.allocator.free(display_path);
 
@@ -1476,7 +1401,6 @@ pub fn spawnSessionWithOrigin(self: *Daemon, req_in: SpawnReq, origin_id: Sessio
     const allocator = self.allocator;
 
     // Cast playback: no child, no hubs, no PTY — its own spawn path.
-    // Works identically in monolith and (via runWorker) broker mode.
     if (req_in.cast_path.len > 0) return self.spawnCastSessionWithOrigin(req_in, origin_id);
 
     // External display session: the child is OUR OWN binary in
@@ -1571,13 +1495,8 @@ pub fn spawnSessionWithOrigin(self: *Daemon, req_in: SpawnReq, origin_id: Sessio
     };
     if (req.isolated) {
         const dir = runtimeBaseDir(self) orelse "";
-        const p = if (self.isWorker())
-            try std.fmt.allocPrint(allocator, "{s}/rt-w{d}", .{ dir, c.getpid() })
-        else blk: {
-            const id = self.next_rt_id;
-            self.next_rt_id += 1;
-            break :blk try std.fmt.allocPrint(allocator, "{s}/rt-{d}", .{ dir, id });
-        };
+        var name_buf: [32]u8 = undefined;
+        const p = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, hubSocketName(&name_buf, "rt") });
         rt_dir_owned = p;
         var z_buf: [4096]u8 = undefined;
         _ = c.mkdir(try pathZ(&z_buf, p), 0o700);
@@ -1609,12 +1528,7 @@ pub fn spawnSessionWithOrigin(self: *Daemon, req_in: SpawnReq, origin_id: Sessio
     if (req.app and c.getenv("SKETERM_NO_A11Y") == null) {
         if (runtimeBaseDir(self)) |dir| {
             var idbuf: [32]u8 = undefined;
-            const idstr = if (self.isWorker())
-                std.fmt.bufPrint(&idbuf, "w{d}", .{c.getpid()}) catch "app"
-            else blk: {
-                const id = self.next_wl_id;
-                break :blk std.fmt.bufPrint(&idbuf, "{d}", .{id}) catch "app";
-            };
+            const idstr = std.fmt.bufPrint(&idbuf, "w{d}", .{c.getpid()}) catch "app";
             a11y_hub = a11yhub.Hub.setup(allocator, dir, idstr);
             if (a11y_hub == null)
                 log.warn("a11y hub setup failed for session '{s}' — app_a11y_tree will be empty (dbus-daemon / at-spi2-registryd missing?)", .{req.name});
@@ -1820,8 +1734,80 @@ pub fn spawnSessionWithOrigin(self: *Daemon, req_in: SpawnReq, origin_id: Sessio
     return s;
 }
 
+/// The attach kind a client declares, by its wire name.
+pub fn clientKindNamed(name: []const u8) Client.Kind {
+    if (std.mem.eql(u8, name, "gui")) return .gui;
+    if (std.mem.eql(u8, name, "cli")) return .cli;
+    if (std.mem.eql(u8, name, "mcp")) return .mcp;
+    return .unknown;
+}
+
+/// Attach-time client properties, whichever way the client arrived:
+/// parsed from its own `.attach` on a worker-owned connection, or
+/// decoded from the broker's handoff datagram.
+pub const AttachSpec = struct {
+    kind: Client.Kind,
+    read_only: bool,
+    want_control: bool,
+    panel_only: bool,
+    panel_rpc: u8,
+    identity_first: bool,
+};
+
+/// Bind `cl` to `s` and send it everything an attach owes; the ONE tail
+/// both arrival paths share, so a step added here reaches a re-attach
+/// on a worker connection and a broker handoff alike.
+pub fn attachClientToSession(self: *Daemon, cl: *Client, s: *Session, spec: AttachSpec, how: []const u8) void {
+    cl.attached = s;
+    cl.panel_only = spec.panel_only;
+    cl.panel_rpc = spec.panel_rpc;
+    cl.read_only = spec.read_only or spec.panel_only;
+    cl.kind = spec.kind;
+    log.info("client attached session='{s}' kind={s} proto={d} video={} panel_only={} panel_rpc={d} ({s})", .{
+        s.name, @tagName(spec.kind), cl.proto, cl.video, cl.panel_only, cl.panel_rpc, how,
+    });
+    if (cl.panel_only) {
+        cl.queueJson(.ok, .{
+            .ok = true,
+            .panel_only = true,
+            .name = s.name,
+            .origin_name = s.origin_name,
+            .origin_id = &s.origin_id,
+        });
+        self.broadcastPeerInfo(s);
+        return;
+    }
+    if (spec.identity_first and spec.panel_rpc > 0 and cl.kind == .gui)
+        self.queueAttachIdentity(cl, s);
+    // A (re)attaching client has no prior video reference frames, so
+    // force the next video tile on every live surface to be a
+    // keyframe. No-op unless video is active (vstate is otherwise
+    // empty). rudp makes the transport reliable, so this — not
+    // loss-recovery — is the only keyframe trigger needed.
+    for (self.channels.items) |ch| {
+        if (ch.session == s) {
+            if (ch.native) |nv| {
+                var vit = nv.vstate.valueIterator();
+                while (vit.next()) |v| v.needs_kf = true;
+            }
+        }
+    }
+    self.queueSnapshot(cl, s);
+    // Cast playback auto-starts once its first viewer arrives.
+    self.castOnAttach(s, nowMs());
+    if (cl.winstream_channels and s.winstream != null) self.openWinstreamChan(s, cl);
+    if (cl.native_state_max >= wire.LEGACY_NATIVE_STATE_VERSION or cl.audio_channels) self.replayNativeChannels(cl, s);
+    self.refreshVideoGates();
+    _ = self.acquireControl(s, cl, spec.want_control);
+    self.broadcastControlState(s);
+    self.broadcastPeerInfo(s);
+}
+
+/// `.attach` on a connection this process already owns: the broker hands
+/// the client over to the session's worker; a worker (re)attaches it to
+/// its one session.
 pub fn handleAttach(self: *Daemon, cl: *Client, payload: []const u8) void {
-    if (self.is_broker) return brokerAttach(self, cl, payload);
+    if (!self.isWorker()) return brokerAttach(self, cl, payload);
     var parsed = std.json.parseFromSlice(AttachReq, self.allocator, payload, .{
         .ignore_unknown_fields = true,
     }) catch {
@@ -1862,56 +1848,13 @@ pub fn handleAttach(self: *Daemon, cl: *Client, payload: []const u8) void {
         cl.queueErr("session has exited");
         return;
     }
-    const kind: Client.Kind = if (std.mem.eql(u8, parsed.value.kind, "gui"))
-        .gui
-    else if (std.mem.eql(u8, parsed.value.kind, "cli"))
-        .cli
-    else if (std.mem.eql(u8, parsed.value.kind, "mcp"))
-        .mcp
-    else
-        .unknown;
     self.detachClientAttachment(cl, "panel presenter reattached after request delivery; delivery is uncertain, the mutation may have applied, and the request was NOT resent");
-    cl.attached = s;
-    cl.panel_only = parsed.value.panel_only;
-    cl.panel_rpc = panel_rpc;
-    cl.read_only = parsed.value.read_only or parsed.value.panel_only;
-    cl.kind = kind;
-    log.info("client attach session='{s}' kind={s} proto={d} panel_only={} panel_rpc={d}", .{
-        s.name, parsed.value.kind, cl.proto, cl.panel_only, cl.panel_rpc,
-    });
-    if (cl.panel_only) {
-        cl.queueJson(.ok, .{
-            .ok = true,
-            .panel_only = true,
-            .name = s.name,
-            .origin_name = s.origin_name,
-            .origin_id = &s.origin_id,
-        });
-        self.broadcastPeerInfo(s);
-        return;
-    }
-    if (parsed.value.identity_first and panel_rpc > 0 and cl.kind == .gui)
-        self.queueAttachIdentity(cl, s);
-    // A (re)attaching client has no prior video reference frames, so
-    // force the next video tile on every live surface to be a
-    // keyframe. No-op unless video is active (vstate is otherwise
-    // empty). rudp makes the transport reliable, so this — not
-    // loss-recovery — is the only keyframe trigger needed.
-    for (self.channels.items) |ch| {
-        if (ch.session == s) {
-            if (ch.native) |nv| {
-                var vit = nv.vstate.valueIterator();
-                while (vit.next()) |v| v.needs_kf = true;
-            }
-        }
-    }
-    self.queueSnapshot(cl, s);
-    // Cast playback auto-starts once its first viewer arrives.
-    self.castOnAttach(s, nowMs());
-    if (cl.winstream_channels and s.winstream != null) self.openWinstreamChan(s, cl);
-    if (cl.native_state_max >= wire.LEGACY_NATIVE_STATE_VERSION or cl.audio_channels) self.replayNativeChannels(cl, s);
-    self.refreshVideoGates();
-    _ = self.acquireControl(s, cl, parsed.value.control);
-    self.broadcastControlState(s);
-    self.broadcastPeerInfo(s);
+    attachClientToSession(self, cl, s, .{
+        .kind = clientKindNamed(parsed.value.kind),
+        .read_only = parsed.value.read_only,
+        .want_control = parsed.value.control,
+        .panel_only = parsed.value.panel_only,
+        .panel_rpc = panel_rpc,
+        .identity_first = parsed.value.identity_first,
+    }, "worker connection");
 }

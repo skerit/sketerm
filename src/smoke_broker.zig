@@ -1,8 +1,8 @@
 //! Broker (process-isolation) end-to-end smoke — `zig build smoke-broker`.
 //!
-//! Unlike smoke-mux (which runs the daemon in a thread), this forks a REAL
-//! broker process so per-session worker forks are genuine child processes.
-//! It then drives the broker as a client over the socket and checks:
+//! Drives a REAL broker process (forked in-process, or the binary named
+//! by SKETERM_SMOKE_BROKER_BIN, e.g. the static-musl build) as a client
+//! over the socket, with a worker-pid scan on the side, and checks:
 //!   - spawn forks a worker; attach routes the client fd to it (SCM_RIGHTS);
 //!   - input typed at the client echoes back through the worker (fd-passing);
 //!   - list reflects the workers' pushed metadata; rename + kill work;
@@ -14,51 +14,15 @@
 
 const std = @import("std");
 const c = @import("c.zig").c;
-const platform = @import("util/platform.zig");
-const daemon_mod = @import("mux/daemon.zig");
 const lifetime = @import("util/lifetime.zig");
+const muxrig = @import("smoke/muxrig.zig");
 const client_mod = @import("mux/client.zig");
 const wire = @import("mux/wire.zig");
-const snapshot = @import("mux/snapshot.zig");
-const Screen = @import("grid/screen.zig").Screen;
-const Pool = @import("grid/style_pool.zig").Pool;
 
 fn fail(comptime msg: []const u8) noreturn {
     std.debug.print("smoke-broker: FAIL: " ++ msg ++ "\n", .{});
     std.process.exit(1);
 }
-
-/// Client-side mirror: snapshot restore + event application, so we can read
-/// the worker's screen text and confirm typed input echoed.
-const Mirror = struct {
-    allocator: std.mem.Allocator,
-    pool: *Pool,
-    screen: ?*Screen = null,
-
-    fn applySnapshot(self: *Mirror, payload: []const u8) !void {
-        if (payload.len < 9) return error.Truncated; // [seq:u64][app:u8] header
-        if (self.screen) |s| s.deinit();
-        self.screen = null;
-        self.pool.deinit();
-        self.pool.* = try Pool.init(self.allocator);
-        self.screen = try snapshot.restore(self.allocator, self.pool, (try snapshot.peelEnvelope(payload)).body);
-    }
-
-    fn applyEvents(self: *Mirror, payload: []const u8) !void {
-        const screen = self.screen orelse return error.NoScreen;
-        if (payload.len < 12) return error.Truncated;
-        var r = wire.Reader.init(payload[12..]);
-        while (!r.atEnd()) {
-            var ev = try r.getEvent(self.allocator);
-            screen.apply(ev);
-            ev.deinit(self.allocator);
-        }
-    }
-
-    fn text(self: *Mirror) ![]u8 {
-        return (self.screen orelse return error.NoScreen).extractScreen(self.allocator);
-    }
-};
 
 fn helloOk(allocator: std.mem.Allocator, conn: *client_mod.Conn) void {
     conn.sendJson(.hello, .{ .proto = wire.PROTO_VERSION }) catch fail("hello send");
@@ -66,13 +30,7 @@ fn helloOk(allocator: std.mem.Allocator, conn: *client_mod.Conn) void {
 }
 
 fn spawnCat(allocator: std.mem.Allocator, conn: *client_mod.Conn, name: []const u8) void {
-    conn.sendJson(.spawn, .{
-        .name = name,
-        .argv = [_][]const u8{"cat"},
-        .rows = @as(u16, 24),
-        .cols = @as(u16, 80),
-    }) catch fail("spawn send");
-    (conn.recvExpect(&.{.ok}) catch fail("spawn ok")).deinit(allocator);
+    muxrig.spawnCat("smoke-broker", allocator, conn, name);
 }
 
 /// Attach, type `token`, and confirm it echoes back on the session's screen
@@ -81,39 +39,7 @@ fn attachAndEcho(allocator: std.mem.Allocator, sock_path: []const u8, name: []co
     var conn = client_mod.Conn.connect(allocator, sock_path) catch fail("echo connect");
     defer conn.deinit();
     helloOk(allocator, &conn);
-    conn.sendJson(.attach, .{ .name = name }) catch fail("echo attach");
-    const snap = conn.recvExpect(&.{.snapshot}) catch fail("echo snapshot");
-
-    var mirror = Mirror{ .allocator = allocator, .pool = allocator.create(Pool) catch fail("echo pool") };
-    mirror.pool.* = Pool.init(allocator) catch fail("echo pool init");
-    defer {
-        if (mirror.screen) |s| s.deinit();
-        mirror.pool.deinit();
-        allocator.destroy(mirror.pool);
-    }
-    mirror.applySnapshot(snap.payload) catch fail("echo snap apply");
-    snap.deinit(allocator);
-
-    var line_buf: [128]u8 = undefined;
-    const line = std.fmt.bufPrint(&line_buf, "{s}\n", .{token}) catch unreachable;
-    conn.sendFrame(.input, line) catch fail("echo input");
-
-    const tv = c.struct_timeval{ .tv_sec = 5, .tv_usec = 0 };
-    _ = c.setsockopt(conn.fd, c.SOL_SOCKET, c.SO_RCVTIMEO, &tv, @sizeOf(c.struct_timeval));
-    var tries: usize = 0;
-    while (tries < 200) : (tries += 1) {
-        const f = conn.recvFrame() catch fail("echo stream read");
-        defer f.deinit(allocator);
-        if (f.ftype == .events) mirror.applyEvents(f.payload) catch fail("echo events apply");
-        const txt = mirror.text() catch fail("echo extract");
-        defer allocator.free(txt);
-        if (std.mem.indexOf(u8, txt, token) != null) {
-            conn.sendJson(.detach, .{}) catch {};
-            (conn.recvExpect(&.{.ok}) catch fail("echo detach ok")).deinit(allocator);
-            return;
-        }
-    }
-    fail("echo: token never appeared on the session screen");
+    muxrig.attachAndEcho("smoke-broker", allocator, &conn, name, token);
 }
 
 const SessList = struct {
@@ -192,19 +118,6 @@ fn firstChildOf(ppid: c.pid_t) c.pid_t {
     return -1;
 }
 
-fn waitForSocket(sock_path: []const u8, allocator: std.mem.Allocator) void {
-    var tries: usize = 0;
-    while (tries < 100) : (tries += 1) {
-        if (client_mod.Conn.connect(allocator, sock_path)) |conn| {
-            var cc = conn;
-            cc.deinit();
-            return;
-        } else |_| {}
-        _ = c.usleep(20_000);
-    }
-    fail("broker socket never came up");
-}
-
 pub fn main(init: std.process.Init.Minimal) u8 {
     // This binary HOSTS a daemon (forked broker + its workers), so a
     // display session's keeper is /proc/self/exe --keep = us. Answer it,
@@ -228,33 +141,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var path_buf: [128]u8 = undefined;
     const sock_path = std.fmt.bufPrint(&path_buf, "/tmp/sketerm-broker-smoke-{d}/mux.sock", .{c.getpid()}) catch unreachable;
 
-    const bpid = c.fork();
-    if (bpid < 0) fail("fork broker");
-    if (bpid == 0) {
-        // Broker child: a real process that forks one worker per session.
-        // No exec, so it inherited the fence's WRITE end too: drop it, or
-        // this child would keep its own fence alive.
-        lifetime.dropWriteEnd();
-        // Every real daemon entry point neuters SIGPIPE; a forked broker
-        // that skips it dies of signal 13 the first time a worker or a
-        // client drops its socket mid-write, which the shutdown stage
-        // now reports instead of excusing.
-        platform.ignoreSigpipe();
-        const child_alloc = std.heap.page_allocator;
-        const d = daemon_mod.Daemon.init(child_alloc, sock_path) catch c._exit(3);
-        d.is_broker = true;
-        d.lifetime_fd = lifetime.inherited() catch c._exit(3);
-        // A `run()` that RETURNED AN ERROR is a broker failure and must be
-        // distinguishable from the clean shutdown the last stage asserts;
-        // exiting 0 here made the two identical.
-        d.run() catch |err| {
-            std.debug.print("smoke-broker: broker run error: {s}\n", .{@errorName(err)});
-            c._exit(4);
-        };
-        c._exit(0);
-    }
-
-    waitForSocket(sock_path, allocator);
+    // A real broker process that forks one worker per session (or, under
+    // SKETERM_SMOKE_BROKER_BIN, an exec'd daemon binary such as the
+    // static-musl build). Its exit status at the end carries the
+    // daemon-side leak verdict and any worker failure.
+    const bpid = muxrig.forkBroker("smoke-broker", sock_path);
     {
         var initial = listSessions(allocator, sock_path);
         defer initial.deinit();
@@ -400,7 +291,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // ── external display sessions + the controller lease THROUGH THE
     // BROKER. The hub paths ride the worker's 'Y' datagram and the
     // lease intent rides the 'A' handoff; either omitted and this is
-    // silently broken while the monolith stage passes. ──
+    // silently broken while a unit test of either half passes. ──
     @import("smoke_display.zig").run(allocator, sock_path);
     std.debug.print("smoke-broker: display sessions + controller lease via worker ok\n", .{});
 
@@ -412,8 +303,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // ── UDP connection tickets THROUGH THE BROKER: an attached
     // client's mint is served by the WORKER, whose Daemon has an
     // empty sock_path and must aim the listener via `broker_sock` —
-    // omitted, and the monolith stage stays green while the real GUI
-    // path fails. ──
+    // omitted, and the worker-side unit tests stay green while the real
+    // GUI path fails. ──
     @import("smoke_ticket.zig").run(allocator, sock_path);
     std.debug.print("smoke-broker: udp connection tickets via worker ok\n", .{});
 
@@ -468,41 +359,18 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // ── clean shutdown ──
     //
     // The shutdown FRAME must be what retires the broker, and it must
-    // retire cleanly: no signal, exit code 0. The SIGKILL below stays as
-    // a backstop so a wedged broker cannot hang the rig, but reaching it
-    // is itself a failure — this stage used to kill unconditionally and
-    // never look at `status`, so it could not fail at all. Now that it
-    // fails, the budget is 10s rather than 2s: retiring means reaping
-    // every worker, and on a loaded CI host that is slow, not wedged.
+    // retire cleanly: no signal, exit code 0 (muxrig.waitBroker decodes
+    // the rest: init failure, run() error, a leak in the broker or a
+    // worker). The SIGKILL backstop inside it stops a wedged broker from
+    // hanging the rig, but reaching it is itself a failure. The budget is
+    // 10s: retiring means reaping every worker, and on a loaded CI host
+    // that is slow, not wedged.
     {
         var conn = client_mod.Conn.connect(allocator, sock_path) catch fail("shutdown connect");
         defer conn.deinit();
         conn.sendFrame(.shutdown, "") catch fail("shutdown: the shutdown frame could not be sent");
     }
-    var status: c_int = 0;
-    var exited = false;
-    var waited: usize = 0;
-    while (waited < 500) : (waited += 1) {
-        if (c.waitpid(bpid, &status, c.WNOHANG) == bpid) {
-            exited = true;
-            break;
-        }
-        _ = c.usleep(20_000);
-    }
-    if (!exited) {
-        _ = c.kill(bpid, c.SIGKILL);
-        var killed: c_int = 0;
-        _ = c.waitpid(bpid, &killed, 0);
-        fail("shutdown: broker still alive 10s after the shutdown frame (the SIGKILL backstop was needed)");
-    }
-    if (status & 0x7f != 0) {
-        std.debug.print("smoke-broker: broker died on signal {d}\n", .{status & 0x7f});
-        fail("shutdown: broker died on a signal instead of shutting down");
-    }
-    if ((status >> 8) & 0xff != 0) {
-        std.debug.print("smoke-broker: broker exit code {d}\n", .{(status >> 8) & 0xff});
-        fail("shutdown: broker exited nonzero (3 = init/lifetime, 4 = run() returned an error)");
-    }
+    muxrig.waitBroker("smoke-broker", bpid, 10_000);
 
     std.debug.print("smoke-broker: PASS\n", .{});
     return 0;

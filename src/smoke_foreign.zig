@@ -11,6 +11,8 @@ const std = @import("std");
 const c = @import("c.zig").c;
 const daemon_mod = @import("mux/daemon.zig");
 const client_mod = @import("mux/client.zig");
+const muxrig = @import("smoke/muxrig.zig");
+const lifetime = @import("util/lifetime.zig");
 const wire = @import("mux/wire.zig");
 const wlwire = @import("wlhost/wire.zig");
 const wlpipe = @import("wlhost/pipe.zig");
@@ -20,12 +22,6 @@ const platform = @import("util/platform.zig");
 fn fail(comptime msg: []const u8) noreturn {
     std.debug.print("smoke-foreign: FAIL: " ++ msg ++ "\n", .{});
     std.process.exit(1);
-}
-
-fn daemonMain(d: *daemon_mod.Daemon) void {
-    d.run() catch |err| {
-        std.debug.print("smoke-foreign: daemon error: {s}\n", .{@errorName(err)});
-    };
 }
 
 /// Every socket gets this receive timeout, so any stall in the foreign
@@ -40,13 +36,9 @@ const App = struct {
     fd: c_int,
     buf: std.ArrayList(u8) = .empty,
 
-    /// `ordinal` is the daemon's sequential display counter ("wl-N",
-    /// monolith mode) — 1 for the first session spawned, 2 for the
-    /// second.
-    fn connect(allocator: std.mem.Allocator, sock_path: []const u8, ordinal: usize) App {
-        const dir_end = std.mem.lastIndexOfScalar(u8, sock_path, '/').?;
-        var disp_buf: [128]u8 = undefined;
-        const disp_path = std.fmt.bufPrint(&disp_buf, "{s}/wl-{d}", .{ sock_path[0..dir_end], ordinal }) catch unreachable;
+    /// `disp_path` is the session's display socket as the daemon lists
+    /// it (`muxrig.sessionWlDisplay`); a rig never derives the name.
+    fn connect(allocator: std.mem.Allocator, disp_path: []const u8) App {
         const fd = platform.socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
         if (fd < 0) fail("app socket");
         var addr: c.struct_sockaddr_un = undefined;
@@ -363,13 +355,17 @@ fn spawnSession(allocator: std.mem.Allocator, conn: *client_mod.Conn, name: []co
 }
 
 pub fn main() u8 {
+    // The broker below is a real process; the fence retires it and its
+    // workers when this harness is gone, by any exit path.
+    if (!lifetime.arm()) fail("lifetime fence");
     // safety=true forces allocation tracking even in ReleaseFast so
-    // the leak check below actually runs (same rationale as smoke-mux:
-    // the daemon and both replicas are fully deinit'd, so a clean run
-    // leaves ZERO outstanding allocations).
+    // the leak check below actually runs. It covers this process (both
+    // replicas and every connection); the daemon side is checked by
+    // the broker process and its workers, and surfaces as the broker's
+    // exit status at the end (muxrig.waitBroker).
     var gpa_state: std.heap.DebugAllocator(.{ .safety = true }) = .{};
     defer if (gpa_state.deinit() == .leak) {
-        std.debug.print("smoke-foreign: FAIL — leaked memory (see GPA report above)\n", .{});
+        std.debug.print("smoke-foreign: FAIL — the rig leaked memory (see GPA report above)\n", .{});
         std.process.exit(1);
     };
     const allocator = gpa_state.allocator();
@@ -381,8 +377,7 @@ pub fn main() u8 {
     var path_buf: [128]u8 = undefined;
     const sock_path = std.fmt.bufPrint(&path_buf, "/tmp/sketerm-foreign-smoke-{d}/mux.sock", .{c.getpid()}) catch unreachable;
 
-    const d = daemon_mod.Daemon.init(allocator, sock_path) catch fail("daemon init");
-    const th = std.Thread.spawn(.{}, daemonMain, .{d}) catch fail("thread spawn");
+    const bpid = muxrig.forkBroker("smoke-foreign", sock_path);
 
     // Viewer V1: attached BEFORE any app connects, so chan_open frames
     // arrive live. A plain current-proto hello negotiates the full
@@ -392,11 +387,13 @@ pub fn main() u8 {
     v1.sendJson(.hello, .{ .proto = wire.PROTO_VERSION }) catch fail("v1 hello");
     (v1.recvExpect(&.{.welcome}) catch fail("v1 welcome")).deinit(allocator);
     spawnSession(allocator, &v1, "one");
+    var one_buf: [256]u8 = undefined;
+    const one_disp = muxrig.sessionWlDisplay("smoke-foreign", allocator, sock_path, "one", &one_buf);
     v1.sendJson(.attach, .{ .name = "one" }) catch fail("v1 attach");
     (v1.recvExpect(&.{.snapshot}) catch fail("v1 snapshot")).deinit(allocator);
 
     // ── Exporter A: one toplevel, exported ──────────────────────
-    var a = App.connect(allocator, sock_path, 1);
+    var a = App.connect(allocator, one_disp);
     defer a.deinit();
     const chan_a = awaitChanOpen(allocator, &v1, null);
     setupBase(&a, 6, 7, 8);
@@ -405,7 +402,7 @@ pub fn main() u8 {
     const h1 = exportToplevel(&a, 5, 9, 6, &h1_buf);
 
     // ── Importer B: a DIFFERENT connection parents onto A ───────
-    var b = App.connect(allocator, sock_path, 1);
+    var b = App.connect(allocator, one_disp);
     defer b.deinit();
     var watch = Watch.init(allocator, 0);
     defer watch.deinit();
@@ -504,7 +501,7 @@ pub fn main() u8 {
     // then the exporter's socket just closes, no destructors. The
     // idle importer must still be told, again via the sweep.
     {
-        var a2 = App.connect(allocator, sock_path, 1);
+        var a2 = App.connect(allocator, one_disp);
         const chan_a2 = awaitChanOpen(allocator, &v1, &watch);
         setupBase(&a2, 6, 7, 8);
         bindGlobal(&a2, 25, "zxdg_exporter_v2", 1, 5);
@@ -545,12 +542,14 @@ pub fn main() u8 {
         ctl.sendJson(.hello, .{ .proto = wire.PROTO_VERSION }) catch fail("ctl hello");
         (ctl.recvExpect(&.{.welcome}) catch fail("ctl welcome")).deinit(allocator);
         spawnSession(allocator, &ctl, "two");
+        var two_buf: [256]u8 = undefined;
+        const two_disp = muxrig.sessionWlDisplay("smoke-foreign", allocator, sock_path, "two", &two_buf);
 
         bindGlobal(&b, 25, "zxdg_exporter_v2", 1, 12);
         var h3_buf: [wlcomp.foreign_handle_len]u8 = undefined;
         const h3 = exportToplevel(&b, 12, 13, 16, &h3_buf);
 
-        var cc = App.connect(allocator, sock_path, 2);
+        var cc = App.connect(allocator, two_disp);
         defer cc.deinit();
         setupBase(&cc, 6, 7, 8);
         addToplevel(&cc, 30, 31, 32);
@@ -590,11 +589,10 @@ pub fn main() u8 {
         }
         if (!gone) fail("kill never surfaced as GONE on the attached viewer");
         ctl.sendFrame(.shutdown, "") catch fail("shutdown send");
-        th.join();
         ctl.deinit();
     }
     v1.deinit();
-    d.deinit();
+    muxrig.waitBroker("smoke-foreign", bpid, 10_000);
 
     std.debug.print("smoke-foreign: PASS\n", .{});
     return 0;

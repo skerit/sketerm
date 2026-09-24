@@ -10,6 +10,8 @@ const platform = @import("util/platform.zig");
 const sendWithFd = @import("smoke/unixsock.zig").sendWithFd;
 const daemon_mod = @import("mux/daemon.zig");
 const client_mod = @import("mux/client.zig");
+const muxrig = @import("smoke/muxrig.zig");
+const lifetime = @import("util/lifetime.zig");
 const wire = @import("mux/wire.zig");
 const wlwire = @import("wlhost/wire.zig");
 const wlpipe = @import("wlhost/pipe.zig");
@@ -202,10 +204,8 @@ fn nativePipeStage(allocator: std.mem.Allocator, conn: *client_mod.Conn, sock_pa
     // Hang guard: any stall in the pipe machinery fails the stage.
     const tv = c.struct_timeval{ .tv_sec = 15, .tv_usec = 0 };
     _ = c.setsockopt(conn.fd, c.SOL_SOCKET, c.SO_RCVTIMEO, &tv, @sizeOf(c.struct_timeval));
-    const dir_end = std.mem.lastIndexOfScalar(u8, sock_path, '/').?;
-    var disp_buf: [128]u8 = undefined;
-    // First session spawned ever → wl-1.
-    const disp_path = std.fmt.bufPrint(&disp_buf, "{s}/wl-1", .{sock_path[0..dir_end]}) catch unreachable;
+    var disp_buf: [256]u8 = undefined;
+    const disp_path = muxrig.sessionWlDisplay("smoke-mux", allocator, sock_path, "smoke", &disp_buf);
 
     // The shm "pool": a regular temp file works like a memfd here.
     var pool_bytes: [64]u8 = undefined;
@@ -937,9 +937,8 @@ fn dmabufStage(allocator: std.mem.Allocator, conn: *client_mod.Conn, sock_path: 
     const tv = c.struct_timeval{ .tv_sec = 15, .tv_usec = 0 };
     _ = c.setsockopt(conn.fd, c.SOL_SOCKET, c.SO_RCVTIMEO, &tv, @sizeOf(c.struct_timeval));
 
-    const dir_end = std.mem.lastIndexOfScalar(u8, sock_path, '/').?;
-    var disp_buf: [128]u8 = undefined;
-    const disp_path = std.fmt.bufPrint(&disp_buf, "{s}/wl-1", .{sock_path[0..dir_end]}) catch unreachable;
+    var disp_buf: [256]u8 = undefined;
+    const disp_path = muxrig.sessionWlDisplay("smoke-mux", allocator, sock_path, "smoke", &disp_buf);
     const app_fd = @import("util/platform.zig").socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
     if (app_fd < 0) fail("dmabuf app socket");
     defer _ = c.close(app_fd);
@@ -1627,7 +1626,7 @@ fn appFlagStage(allocator: std.mem.Allocator, sock_path: []const u8) void {
 /// an app with ZERO clients attached; a later attach must replay
 /// chan_open + pool bytes + state_sync so a replica rebuilds the
 /// window with pixels; and the app must survive its client dying.
-fn pendingAppStage(allocator: std.mem.Allocator, sock_path: []const u8, wl_id: usize) void {
+fn pendingAppStage(allocator: std.mem.Allocator, sock_path: []const u8) void {
     const compositor_mod = @import("wlhost/compositor.zig");
     var conn = client_mod.Conn.connect(allocator, sock_path) catch fail("pend connect");
     defer conn.deinit();
@@ -1645,9 +1644,8 @@ fn pendingAppStage(allocator: std.mem.Allocator, sock_path: []const u8, wl_id: u
 
     // The scripted app connects BEFORE anyone attached and runs the
     // full xdg dance. The daemon brain must answer immediately.
-    const dir_end = std.mem.lastIndexOfScalar(u8, sock_path, '/').?;
-    var disp_buf: [128]u8 = undefined;
-    const disp = std.fmt.bufPrint(&disp_buf, "{s}/wl-{d}", .{ sock_path[0..dir_end], wl_id }) catch unreachable;
+    var disp_buf: [256]u8 = undefined;
+    const disp = muxrig.sessionWlDisplay("smoke-mux", allocator, sock_path, "pend", &disp_buf);
     const app_fd = @import("util/platform.zig").socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
     var addr: c.struct_sockaddr_un = undefined;
     daemon_mod.fillSockaddrUn(&addr, disp) catch fail("pend sockaddr");
@@ -1881,6 +1879,10 @@ fn pendingAppStage(allocator: std.mem.Allocator, sock_path: []const u8, wl_id: u
     conn3.sendJson(.hello, .{ .proto = wire.PROTO_VERSION }) catch fail("pend hello3");
     (conn3.recvExpect(&.{.welcome}) catch fail("pend welcome3")).deinit(allocator);
     conn3.sendJson(.attach, .{ .name = "pend" }) catch fail("pend attach3");
+    // The broker hands this connection to the session's worker
+    // asynchronously; the attach is complete (and fan-out reaches it)
+    // once the worker's snapshot arrives. Act on the app only then.
+    (conn3.recvExpect(&.{.snapshot}) catch fail("pend attach3 snapshot")).deinit(allocator);
     var needle_buf: [32]u8 = undefined;
     const needle = blk: {
         var b = wlwire.Builder.init(&needle_buf, 8, 2); // set_title("BOTH")
@@ -1956,12 +1958,6 @@ fn recvWithFd(sock: c_int) ?struct { fd: c_int, obj: u32 = 0, opcode: u16 = 0 } 
     return .{ .fd = -1, .obj = obj, .opcode = opcode };
 }
 
-
-fn daemonMain(d: *daemon_mod.Daemon) void {
-    d.run() catch |err| {
-        std.debug.print("smoke-mux: daemon error: {s}\n", .{@errorName(err)});
-    };
-}
 
 /// Isolated app session (`sketerm app -i`): the child must run under a
 /// private XDG_RUNTIME_DIR with the inherited D-Bus session bus dropped,
@@ -2212,18 +2208,22 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // which this smoke binary cannot answer itself.
     if (init.args.vector.len > 1)
         _ = c.setenv("SKETERM_MUX_BIN", init.args.vector[1], 1);
+    // The broker below is a real process with no exec and no PDEATHSIG,
+    // and `fail` exits past every kill: the fence is what retires it and
+    // its workers when this harness is gone, by any exit path.
+    if (!lifetime.arm()) fail("lifetime fence");
     // safety=true forces allocation tracking even in ReleaseFast (the
     // repo's default optimize mode), where it is off by default — so
-    // the leak check below actually runs.
+    // the leak check below actually runs. It covers this process: the
+    // client-side mirrors, replicas and connections. The DAEMON side
+    // (unreclaimed pool mirrors, the per-commit pixel-encode scratch
+    // that once ballooned an animated forwarded app to 15GB — both
+    // exercised by realAppStage) is checked by the broker process and
+    // every worker it forks, and surfaces as the broker's exit status
+    // at the end (muxrig.waitBroker).
     var gpa_state: std.heap.DebugAllocator(.{ .safety = true }) = .{};
-    // The daemon is fully deinit'd before we return (thread joined,
-    // d.deinit called), so a clean run must leave ZERO outstanding
-    // allocations. Failing on a leak here is the regression guard for
-    // the daemon-side memory leaks (unreclaimed pool mirrors, and the
-    // per-commit pixel-encode scratch that ballooned an animated
-    // forwarded app to 15GB) — both exercised by realAppStage.
     defer if (gpa_state.deinit() == .leak) {
-        std.debug.print("smoke-mux: FAIL — daemon leaked memory (see GPA report above)\n", .{});
+        std.debug.print("smoke-mux: FAIL — the rig leaked memory (see GPA report above)\n", .{});
         std.process.exit(1);
     };
     const allocator = gpa_state.allocator();
@@ -2246,10 +2246,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var path_buf: [128]u8 = undefined;
     const sock_path = std.fmt.bufPrint(&path_buf, "/tmp/sketerm-mux-smoke-{d}/mux.sock", .{c.getpid()}) catch unreachable;
 
-    const d = daemon_mod.Daemon.init(allocator, sock_path) catch fail("daemon init");
-    // d.deinit() runs after the thread joins, below.
-
-    const th = std.Thread.spawn(.{}, daemonMain, .{d}) catch fail("thread spawn");
+    // A real broker process, forked before any thread exists (its
+    // per-session workers fork from it); reaped after the shutdown
+    // frame below, where its exit status carries the daemon-side leak
+    // verdict.
+    const bpid = muxrig.forkBroker("smoke-mux", sock_path);
 
     var conn = client_mod.Conn.connect(allocator, sock_path) catch fail("connect");
 
@@ -2422,13 +2423,13 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     @import("smoke_backlog.zig").run(allocator, sock_path);
 
     // Native pipe with a REAL Wayland app + the compositor brain.
-    const wlapp_ran = realAppStage(allocator, sock_path);
+    _ = realAppStage(allocator, sock_path);
 
     // Window-stream pipeline (stub capture source).
     winstreamStage(allocator, sock_path);
 
     // Apps that connect before a renderer attaches are parked.
-    pendingAppStage(allocator, sock_path, if (wlapp_ran) 4 else 3);
+    pendingAppStage(allocator, sock_path);
 
     // Snapshot header carries the app flag (drives GUI hold-on-exit).
     appFlagStage(allocator, sock_path);
@@ -2507,12 +2508,12 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     (conn2.recvExpect(&.{.ok}) catch fail("kill ok")).deinit(allocator);
     (conn.recvExpect(&.{.gone}) catch fail("gone")).deinit(allocator);
 
-    // Shutdown; daemon thread exits; socket unlinked by deinit.
+    // Shutdown; the broker retires (reaping its workers), unlinks its
+    // socket and reports the daemon-side leak verdict as its exit status.
     conn2.sendFrame(.shutdown, "") catch fail("shutdown send");
-    th.join();
     conn.deinit();
     conn2.deinit();
-    d.deinit();
+    muxrig.waitBroker("smoke-mux", bpid, 10_000);
 
     std.debug.print("smoke-mux: PASS\n", .{});
     return 0;

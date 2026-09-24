@@ -18,7 +18,7 @@
 //! the child floods its terminal and the client reads slowly must still
 //! reach the child promptly.
 //!
-//! Run by BOTH smoke-mux (monolith) and smoke-broker (the worker owns
+//! Run by BOTH smoke-mux and smoke-broker (the worker owns
 //! the PTY there; same poll loop, different process).
 
 const std = @import("std");

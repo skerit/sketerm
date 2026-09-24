@@ -1323,9 +1323,8 @@ test "--idle-exit retires a daemon holding nothing; 0 never does" {
     try t.expectEqual(@as(i64, 0), d.idle_since_ms);
 
     // Armed: the first idle tick starts the clock, a later one past the
-    // budget clears `running`. Broker mode counts workers the same way.
+    // budget clears `running`.
     d.idle_exit_ms = 1;
-    d.is_broker = true;
     d.reap();
     try t.expect(d.running);
     try t.expect(d.idle_since_ms != 0);
@@ -1336,7 +1335,6 @@ test "--idle-exit retires a daemon holding nothing; 0 never does" {
     // Something held resets the clock rather than letting it run on.
     d.running = true;
     d.idle_since_ms = nowMs() - 10_000;
-    d.is_broker = false;
     var a_client = try t.allocator.create(Client);
     a_client.* = .{ .fd = -1, .allocator = t.allocator, .id = 1 };
     try d.clients.append(t.allocator, a_client);
@@ -2703,15 +2701,6 @@ pub const Daemon = struct {
     lsp_reaps: std.ArrayList(LspReap) = .empty,
     /// Monotonic client-connection id (controller labels + viewer age).
     next_client_id: u32 = 1,
-    /// Monotonic id for per-session Wayland socket paths (session
-    /// names are user input — not path-safe).
-    next_wl_id: u32 = 1,
-    /// Audio hub sockets ("pa-N") — separate counter so wl-N naming
-    /// stays sequential (the smoke rigs derive it).
-    next_pa_id: u32 = 1,
-    /// Monotonic id for isolated sessions' private runtime dirs (same
-    /// path-safety reason as next_wl_id).
-    next_rt_id: u32 = 1,
     running: bool = true,
     /// Opt-in self-retirement (`--idle-exit N`): once no session (broker:
     /// no worker) and no client has existed for this long, `running`
@@ -2725,15 +2714,24 @@ pub const Daemon = struct {
     /// is gone by whatever path, and `running` clears. -1 = unfenced,
     /// the per-user daemon's permanent state.
     lifetime_fd: c_int = -1,
-    /// Process-isolation mode (Firefox-style). A WORKER process owns exactly
-    /// one session and has `control_fd` >= 0 (a socketpair to the broker)
-    /// instead of a listen socket — new clients arrive as passed fds, not via
-    /// accept(). A BROKER process listens, holds NO sessions, and forks one
-    /// worker per session, handing client fds to workers on attach. The
-    /// default (both -1 / false) is the legacy monolith — kept working until
-    /// the broker path is the proven default.
+    /// Which of the two roles this process plays. The LISTENING process is
+    /// the broker: it holds no session, forks one worker per session and
+    /// hands client fds to workers on attach. A WORKER owns exactly one
+    /// session and receives its clients as passed fds over `control_fd`,
+    /// never via accept(). There is no third role: session-hosting logic
+    /// runs in workers only.
+    role: Role = .broker,
+    /// Worker only: the socketpair to the broker (passed client fds,
+    /// kill/rename control bytes, metadata pushes). -1 in the broker.
     control_fd: c_int = -1,
-    is_broker: bool = false,
+    /// What the forked worker child runs; the default serves the session
+    /// on the broker's allocator. A rig substitutes an entry that runs the
+    /// same worker on a leak-checked allocator of its own.
+    worker_entry: WorkerEntry = daemon_sessions.defaultWorkerEntry,
+    /// Broker only: workers that exited with a NONZERO status. A signal
+    /// death is logged but not counted, since rigs SIGKILL workers on
+    /// purpose and the OOM killer is not the worker's fault.
+    worker_failures: u32 = 0,
     /// Broker only: forked session workers, by session name.
     workers: std.ArrayList(*Worker) = .empty,
     /// Worker only: an attached client's rename forwarded to the broker (the
@@ -2745,13 +2743,13 @@ pub const Daemon = struct {
     wpush: WorkerPush = .{},
     /// Worker only: runtime dir (owned) for the session's Wayland display /
     /// isolated rt sockets. A worker has no listen socket, so it can't derive
-    /// the dir from `sock_path` ("") the way the monolith/broker does — the
-    /// broker hands it the dir at fork time. null in monolith/broker.
+    /// the dir from `sock_path` ("") the way the broker does — the broker
+    /// hands it the dir at fork time. null in the broker.
     base_dir: ?[]u8 = null,
     /// Worker only: the broker's full listen-socket path (owned). Kept
     /// separately from `sock_path` (empty in workers so deinit never
     /// unlinks the broker's socket); the udp-ticket listener uses it to
-    /// aim its bridge back at this daemon instance. null in monolith/broker.
+    /// aim its bridge back at this daemon instance. null in the broker.
     broker_sock: ?[]u8 = null,
     /// One EGL display/context owner per process. EGL displays are commonly
     /// shared handles, so terminating a per-channel importer could invalidate
@@ -2768,14 +2766,14 @@ pub const Daemon = struct {
     /// serving until everything drained or this deadline passes.
     drain_deadline_ms: i64 = 0,
     /// Lazily-opened web store (history/bookmarks/site settings) under
-    /// $XDG_STATE_HOME/sketerm/web — see daemon_serve.handleWebOp.
+    /// $XDG_STATE_HOME/sketerm/web — see daemon_web.handleWebOp.
     web_store: ?@import("webstore.zig").WebStore = null,
     /// Headless browser-profile stores this daemon OWNS, one per
     /// instance key, opened on the first web_op profile op naming that
     /// key and held (flock included) for the daemon's lifetime — the
     /// whole point: the store's owner must outlive every MCP client so
-    /// N of them can share one profile namespace. Broker/monolith only;
-    /// workers refuse the ops (daemon_serve.handleWebProfileOp).
+    /// N of them can share one profile namespace. Broker only; workers
+    /// refuse the ops (daemon_web.handleWebProfileOp).
     web_profile_stores: std.ArrayList(NamedProfileStore) = .empty,
     /// Browser engines this broker SPAWNED (web_op engine_open). The
     /// engine reaps ITSELF through its linger TTL; this list exists to
@@ -2784,6 +2782,9 @@ pub const Daemon = struct {
     /// killed at daemon teardown: a lingering engine keeps serving its
     /// clients without the broker (it is reparented and self-reaps).
     web_engines: std.ArrayList(WebEngine) = .empty,
+
+    pub const Role = enum { broker, worker };
+    pub const WorkerEntry = daemon_sessions.WorkerEntry;
 
     pub const NamedProfileStore = struct {
         /// Owned copy of the instance key the client sent.
@@ -3079,7 +3080,7 @@ pub const Daemon = struct {
         self.restoreFsJobs();
         log.info("daemon up v{s} mode={s} socket={s}", .{
             version.string,
-            if (self.is_broker) "broker" else if (self.isWorker()) "worker" else "monolith",
+            @tagName(self.role),
             if (self.sock_path.len > 0) self.sock_path else "-",
         });
         while (self.running) try self.tick(500);
@@ -3163,7 +3164,7 @@ pub const Daemon = struct {
 
         try fds.append(self.allocator, .{ .fd = self.listen_fd, .events = c.POLLIN, .revents = 0 });
         // Worker: the broker↔worker control channel (passed client fds + kill/
-        // rename/metadata). -1 in broker/monolith → ignored by poll.
+        // rename/metadata). -1 in the broker → ignored by poll.
         const control_idx = fds.items.len;
         try fds.append(self.allocator, .{ .fd = self.control_fd, .events = c.POLLIN, .revents = 0 });
         // Lifetime fence: EOF means the owning harness is gone. -1 when
@@ -3482,7 +3483,7 @@ pub const Daemon = struct {
         self.pumpDownloads();
         self.pumpFsListings();
         // Worker: tell the broker our latest metadata (throttled).
-        if (self.control_fd >= 0 and !self.is_broker) self.maybePushMeta();
+        if (self.isWorker()) self.maybePushMeta();
         self.refreshDetachedFsJobs();
         self.reap();
         self.flushPendingBrains();
@@ -3509,56 +3510,66 @@ pub const Daemon = struct {
         };
     }
 
-    // ── Client serving (broker/worker, frames, fs ops): split out to daemon_serve.zig ──
+    // ── Client serving, split by service: dispatch in daemon_serve.zig, the
+    // control channel, tickets, transfers, apps, browse, fs ops and web in
+    // their own modules ──
+    const daemon_apps = @import("daemon_apps.zig");
+    const daemon_browse = @import("daemon_browse.zig");
+    const daemon_control = @import("daemon_control.zig");
+    const daemon_fsops = @import("daemon_fsops.zig");
     const daemon_serve = @import("daemon_serve.zig");
-    pub const initWorker = daemon_serve.initWorker;
-    pub const runWorker = daemon_serve.runWorker;
-    const workerOnControl = daemon_serve.workerOnControl;
-    const PassedClient = daemon_serve.PassedClient;
-    const addPassedClient = daemon_serve.addPassedClient;
-    const brokerOnWorkerControl = daemon_serve.brokerOnWorkerControl;
-    const workerRequestRename = daemon_serve.workerRequestRename;
-    const applyWorkerReady = daemon_serve.applyWorkerReady;
-    const replyPendingSpawn = daemon_serve.replyPendingSpawn;
-    const maybePushMeta = daemon_serve.maybePushMeta;
-    const controlRecv = daemon_serve.controlRecv;
+    const daemon_transfer = @import("daemon_transfer.zig");
+    const daemon_udp = @import("daemon_udp.zig");
+    const daemon_web = @import("daemon_web.zig");
+    const daemon_webengine = @import("daemon_webengine.zig");
+    pub const initWorker = daemon_control.initWorker;
+    pub const runWorker = daemon_control.runWorker;
+    const workerOnControl = daemon_control.workerOnControl;
+    const PassedClient = daemon_control.PassedClient;
+    const addPassedClient = daemon_control.addPassedClient;
+    const brokerOnWorkerControl = daemon_control.brokerOnWorkerControl;
+    const workerRequestRename = daemon_control.workerRequestRename;
+    const applyWorkerReady = daemon_control.applyWorkerReady;
+    const replyPendingSpawn = daemon_control.replyPendingSpawn;
+    const maybePushMeta = daemon_control.maybePushMeta;
+    const controlRecv = daemon_control.controlRecv;
     const clientReadable = daemon_serve.clientReadable;
-    const pumpFsListings = daemon_serve.pumpFsListings;
+    const pumpFsListings = daemon_fsops.pumpFsListings;
     const clientWritable = daemon_serve.clientWritable;
     const handleFrame = daemon_serve.handleFrame;
     const findChannel = daemon_serve.findChannel;
-    const findUpload = daemon_serve.findUpload;
-    const fileReply = daemon_serve.fileReply;
-    const dropUpload = daemon_serve.dropUpload;
-    const uploadBaseName = daemon_serve.uploadBaseName;
-    const openUploadDest = daemon_serve.openUploadDest;
-    const handleFileOpen = daemon_serve.handleFileOpen;
-    const handleFileData = daemon_serve.handleFileData;
-    const handleFileClose = daemon_serve.handleFileClose;
-    const dropDownload = daemon_serve.dropDownload;
-    const handleFileGet = daemon_serve.handleFileGet;
-    const handleAppList = daemon_serve.handleAppList;
+    const findUpload = daemon_transfer.findUpload;
+    const fileReply = daemon_transfer.fileReply;
+    const dropUpload = daemon_transfer.dropUpload;
+    const uploadBaseName = daemon_transfer.uploadBaseName;
+    const openUploadDest = daemon_transfer.openUploadDest;
+    const handleFileOpen = daemon_transfer.handleFileOpen;
+    const handleFileData = daemon_transfer.handleFileData;
+    const handleFileClose = daemon_transfer.handleFileClose;
+    const dropDownload = daemon_transfer.dropDownload;
+    const handleFileGet = daemon_transfer.handleFileGet;
+    const handleAppList = daemon_apps.handleAppList;
     const handleAppA11y = daemon_serve.handleAppA11y;
-    const handleRecStart = daemon_serve.handleRecStart;
-    const ListEntry = daemon_serve.ListEntry;
-    const listingError = daemon_serve.listingError;
-    const handleFileList = daemon_serve.handleFileList;
-    const FsOpReq = daemon_serve.FsOpReq;
-    const FsChange = daemon_serve.FsChange;
-    const fsReplyErr = daemon_serve.fsReplyErr;
-    const handleFsOp = daemon_serve.handleFsOp;
-    const millisTimespec = daemon_serve.millisTimespec;
-    const fsOpenView = daemon_serve.fsOpenView;
-    const fsCloseView = daemon_serve.fsCloseView;
-    const dropFsViewAt = daemon_serve.dropFsViewAt;
-    const splitAttrs = daemon_serve.splitAttrs;
-    const fsStartListing = daemon_serve.fsStartListing;
-    const fsStat = daemon_serve.fsStat;
-    const fsRead = daemon_serve.fsRead;
-    const AppEntry = daemon_serve.AppEntry;
-    const fsApps = daemon_serve.fsApps;
-    const handleFsWrite = daemon_serve.handleFsWrite;
-    const fsWatchReadable = daemon_serve.fsWatchReadable;
+    const handleRecStart = daemon_apps.handleRecStart;
+    const ListEntry = daemon_browse.ListEntry;
+    const listingError = daemon_browse.listingError;
+    const handleFileList = daemon_browse.handleFileList;
+    const FsOpReq = daemon_fsops.FsOpReq;
+    const FsChange = daemon_fsops.FsChange;
+    const fsReplyErr = daemon_fsops.fsReplyErr;
+    const handleFsOp = daemon_fsops.handleFsOp;
+    const millisTimespec = daemon_fsops.millisTimespec;
+    const fsOpenView = daemon_fsops.fsOpenView;
+    const fsCloseView = daemon_fsops.fsCloseView;
+    const dropFsViewAt = daemon_fsops.dropFsViewAt;
+    const splitAttrs = daemon_fsops.splitAttrs;
+    const fsStartListing = daemon_fsops.fsStartListing;
+    const fsStat = daemon_fsops.fsStat;
+    const fsRead = daemon_fsops.fsRead;
+    const AppEntry = daemon_fsops.AppEntry;
+    const fsApps = daemon_fsops.fsApps;
+    const handleFsWrite = daemon_fsops.handleFsWrite;
+    const fsWatchReadable = daemon_fsops.fsWatchReadable;
 
     // ── File jobs: split out to daemon_fsjobs.zig ──
     const daemon_fsjobs = @import("daemon_fsjobs.zig");
@@ -4186,14 +4197,10 @@ pub const Daemon = struct {
         ) catch return &dmabuf.linear_capabilities;
         self.dmabuf_initialized = true;
 
-        // EGL vendors may own background threads and internal locks. A
-        // monolith can fork another PTY after this app connects, which makes
-        // child-side pre-exec work unsafe; workers never fork another session.
-        if (!self.isWorker()) {
-            log.info("dmabuf import: modifier path disabled outside an isolated worker", .{});
-            return self.dmabuf_capabilities.items;
-        }
-
+        // EGL vendors may own background threads and internal locks, which
+        // would make child-side pre-exec work unsafe after a fork. App
+        // channels only ever live in a worker, and a worker never forks
+        // another session, so the importer is safe to bring up here.
         if (dmabuf_egl.Importer.init(self.allocator)) |importer_value| {
             var importer = importer_value;
             self.dmabuf_capabilities.ensureTotalCapacity(
@@ -4458,6 +4465,7 @@ pub const Daemon = struct {
     pub const spawnSession = daemon_sessions.spawnSession;
     pub const spawnSessionWithOrigin = daemon_sessions.spawnSessionWithOrigin;
     pub const handleAttach = daemon_sessions.handleAttach;
+    pub const attachClientToSession = daemon_sessions.attachClientToSession;
     const findSession = daemon_sessions.findSession;
     const brokerFindWorker = daemon_sessions.brokerFindWorker;
     const applyWorkerLimits = daemon_sessions.applyWorkerLimits;
@@ -4485,7 +4493,7 @@ pub const Daemon = struct {
     // human operator sharing one app.
 
     /// Label for the current controller ("<kind>#<id>"), written into
-    /// `buf`. Empty when nobody holds the lease. Same shape in monolith
+    /// `buf`. Empty when nobody holds the lease. Same shape in the broker
     /// and worker so the broker can pass it through verbatim.
     pub fn controllerLabel(self: *const Daemon, s: *const Session, buf: []u8) []const u8 {
         _ = self;
@@ -5495,7 +5503,7 @@ pub const Daemon = struct {
     }
 
     pub fn handleList(self: *Daemon, cl: *Client) void {
-        if (self.is_broker) return self.brokerList(cl);
+        if (!self.isWorker()) return self.brokerList(cl);
         var infos: std.ArrayList(SessionInfo) = .empty;
         defer infos.deinit(self.allocator);
         // Per-session cwd strings, owned for the life of this call (the
@@ -5647,6 +5655,71 @@ pub const Daemon = struct {
         };
         var ob: [5]u8 = undefined;
         cl.queueFrame(.chan_open, wire.encodeChanOpen(&ob, ch.id, .tcp_forward));
+    }
+
+    test "forward_open dials loopback, answers chan_open and refuses bad requests" {
+        const t = std.testing;
+        const a = t.allocator;
+        // A loopback listener stands in for the forwarded service.
+        const lfd = platform.socketCloexec(c.AF_INET, c.SOCK_STREAM, 0);
+        try t.expect(lfd >= 0);
+        defer _ = c.close(lfd);
+        var sa = std.mem.zeroes(c.struct_sockaddr_in);
+        sa.sin_family = c.AF_INET;
+        sa.sin_addr.s_addr = std.mem.nativeToBig(u32, c.INADDR_LOOPBACK);
+        try t.expectEqual(@as(c_int, 0), c.bind(lfd, @ptrCast(&sa), @sizeOf(c.struct_sockaddr_in)));
+        try t.expectEqual(@as(c_int, 0), c.listen(lfd, 1));
+        var sa_len: c.socklen_t = @sizeOf(c.struct_sockaddr_in);
+        try t.expectEqual(@as(c_int, 0), c.getsockname(lfd, @ptrCast(&sa), &sa_len));
+        const port = std.mem.bigToNative(u16, sa.sin_port);
+
+        var empty: [0]u8 = .{};
+        var d = Daemon{ .allocator = a, .listen_fd = -1, .sock_path = empty[0..] };
+        defer {
+            for (d.channels.items) |ch| ch.deinit();
+            d.channels.deinit(a);
+        }
+        var cl = Client{ .allocator = a, .fd = -1 };
+        defer cl.rbuf.deinit(a);
+        defer cl.wbuf.deinit(a);
+        defer cl.audio_wbuf.deinit(a);
+
+        var req_buf: [64]u8 = undefined;
+        d.handleForward(&cl, try std.fmt.bufPrint(&req_buf, "{{\"port\":{d}}}", .{port}));
+        try t.expectEqual(@as(usize, 1), d.channels.items.len);
+        const ch = d.channels.items[0];
+        try t.expect(ch.tcp);
+        try t.expect(ch.session == null);
+        try t.expectEqual(@as(?*Client, &cl), ch.client);
+        const reply = (try wire.peelFrame(cl.wbuf.items)) orelse return error.TestUnexpectedResult;
+        try t.expectEqual(wire.FrameType.chan_open, reply.frame.ftype);
+        const open = wire.decodeChanOpen(reply.frame.payload) orelse return error.TestUnexpectedResult;
+        try t.expectEqual(ch.id, open.id);
+        try t.expectEqual(wire.ChannelKind.tcp_forward, open.kind);
+        // The nonblocking connect lands on the listener: the channel's
+        // fd IS the forwarded connection.
+        var pfd = c.struct_pollfd{ .fd = lfd, .events = c.POLLIN, .revents = 0 };
+        try t.expect(c.poll(&pfd, 1, 2_000) > 0);
+        const peer = c.accept(lfd, null, null);
+        try t.expect(peer >= 0);
+        defer _ = c.close(peer);
+        try t.expectEqual(@as(isize, 2), c.send(peer, "hi", 2, 0));
+        var got: [2]u8 = undefined;
+        var cfd = c.struct_pollfd{ .fd = ch.fd, .events = c.POLLIN, .revents = 0 };
+        try t.expect(c.poll(&cfd, 1, 2_000) > 0);
+        try t.expectEqual(@as(isize, 2), c.recv(ch.fd, &got, 2, 0));
+        try t.expectEqualStrings("hi", &got);
+
+        // Port 0 and malformed JSON are answered, never dialed.
+        cl.wbuf.clearRetainingCapacity();
+        d.handleForward(&cl, "{\"port\":0}");
+        var refusal = (try wire.peelFrame(cl.wbuf.items)) orelse return error.TestUnexpectedResult;
+        try t.expectEqual(wire.FrameType.err, refusal.frame.ftype);
+        cl.wbuf.clearRetainingCapacity();
+        d.handleForward(&cl, "{");
+        refusal = (try wire.peelFrame(cl.wbuf.items)) orelse return error.TestUnexpectedResult;
+        try t.expectEqual(wire.FrameType.err, refusal.frame.ftype);
+        try t.expectEqual(@as(usize, 1), d.channels.items.len);
     }
 
     const StreamReq = struct { req: u32 = 0, host: []const u8 = "", port: u16 = 0 };
@@ -6081,7 +6154,7 @@ pub const Daemon = struct {
     }
 
     pub fn handleKill(self: *Daemon, cl: *Client, payload: []const u8) void {
-        if (self.is_broker) return self.brokerKill(cl, payload);
+        if (!self.isWorker()) return self.brokerKill(cl, payload);
         var parsed = std.json.parseFromSlice(KillReq, self.allocator, payload, .{
             .ignore_unknown_fields = true,
         }) catch {
@@ -6122,7 +6195,7 @@ pub const Daemon = struct {
         const t = std.testing;
         const a = t.allocator;
         var empty: [0]u8 = .{};
-        var daemon = Daemon{ .allocator = a, .listen_fd = -1, .sock_path = empty[0..] };
+        var daemon = Daemon{ .allocator = a, .listen_fd = -1, .sock_path = empty[0..], .role = .worker };
         defer daemon.sessions.deinit(a);
         defer daemon.clients.deinit(a);
         defer daemon.channels.deinit(a);
@@ -6165,8 +6238,10 @@ pub const Daemon = struct {
         try t.expectEqual(wire.FrameType.ok, reply.frame.ftype);
     }
 
+    /// A worker owns one session, so `name` can only be that one; the
+    /// broker is the rename authority and answers through the worker.
     pub fn handleRename(self: *Daemon, cl: *Client, payload: []const u8) void {
-        if (self.is_broker) return self.brokerRename(cl, payload);
+        if (!self.isWorker()) return self.brokerRename(cl, payload);
         var parsed = std.json.parseFromSlice(RenameReq, self.allocator, payload, .{
             .ignore_unknown_fields = true,
         }) catch {
@@ -6179,26 +6254,11 @@ pub const Daemon = struct {
             cl.queueErr("rename needs a name (1-64 chars)");
             return;
         }
-        const s = self.findSession(req.name) orelse {
+        if (self.findSession(req.name) == null) {
             cl.queueErr("no such session");
             return;
-        };
-        if (self.findSession(req.new_name)) |other| {
-            if (other != s) {
-                cl.queueErr("session name already exists");
-                return;
-            }
         }
-        if (self.isWorker()) {
-            self.workerRequestRename(cl, req.new_name);
-            return;
-        }
-        s.renameTo(req.new_name) catch {
-            cl.queueErr("oom");
-            return;
-        };
-        self.broadcastSessionIdentity(s);
-        cl.queueJson(.ok, .{ .ok = true, .name = s.name });
+        self.workerRequestRename(cl, req.new_name);
     }
 
     pub fn removeSession(self: *Daemon, s: *Session) void {
@@ -6798,8 +6858,8 @@ pub const Daemon = struct {
         // reason to live — tear it down so the broker sees control EOF and
         // reaps it (otherwise it polls forever, orphaned, and `list` keeps a
         // stale entry). The `.exit`/`.gone` already queued to the client is
-        // delivered by run()'s flushClientsFinal before we close. The monolith
-        // (no control_fd) keeps running client-less — that's its whole point.
+        // delivered by run()'s flushClientsFinal before we close. The broker
+        // keeps running client-less — that's its whole point.
         if (self.isWorker() and self.sessions.items.len == 0) {
             // Don't exit while a live client still has queued bytes: the
             // post-mortem log push + `.exit` may sit behind megabytes of
@@ -6835,6 +6895,7 @@ pub const Daemon = struct {
                     i += 1; // still alive; check again next tick
                     continue;
                 }
+                if (r == w.pid) self.noteWorkerExit(w, status);
                 _ = self.workers.swapRemove(i);
                 w.deinit();
                 continue;
@@ -6844,13 +6905,27 @@ pub const Daemon = struct {
         self.idleExitCheck();
     }
 
-    /// `--idle-exit`: retire a daemon that has held nothing for anyone
+    /// A clean worker exits 0; anything else is worth a line in the log
+    /// (a signal is usually someone else's doing, a nonzero status the
+    /// worker's own verdict, so only the latter counts as a failure).
+    fn noteWorkerExit(self: *Daemon, w: *Worker, status: c_int) void {
+        if (c.WIFEXITED(status)) {
+            const code = c.WEXITSTATUS(status);
+            if (code == 0) return;
+            self.worker_failures += 1;
+            log.warn("worker pid={d} session='{s}' exited with status {d}", .{ w.pid, w.name, code });
+        } else if (c.WIFSIGNALED(status)) {
+            log.warn("worker pid={d} session='{s}' killed by signal {d}", .{ w.pid, w.name, c.WTERMSIG(status) });
+        }
+    }
+
+    /// `--idle-exit`: retire a broker that has held nothing for anyone
     /// long enough. Counts are taken AFTER the reaps above, so a session
     /// exiting and its viewer leaving in the same tick start the clock
     /// together.
     fn idleExitCheck(self: *Daemon) void {
         if (self.idle_exit_ms <= 0 or self.isWorker()) return;
-        const held = if (self.is_broker) self.workers.items.len else self.sessions.items.len;
+        const held = self.workers.items.len;
         if (held > 0 or self.clients.items.len > 0) {
             self.idle_since_ms = 0;
             return;
@@ -7095,7 +7170,7 @@ const EventIngestTestHarness = struct {
             .screen = self.screen,
             .log = logring.LogRing.init(allocator),
         };
-        self.daemon = .{ .allocator = allocator, .listen_fd = -1, .sock_path = &.{} };
+        self.daemon = .{ .allocator = allocator, .listen_fd = -1, .sock_path = &.{}, .role = .worker };
         self.clients = .{
             .{ .allocator = allocator, .fd = -1, .attached = &self.session },
             .{ .allocator = allocator, .fd = -1, .attached = &self.session },

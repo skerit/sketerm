@@ -15,11 +15,11 @@ const sockpath = @import("mux/sockpath.zig");
 const findbin = @import("web/findbin.zig");
 
 pub const Role = enum {
-    /// Daemon in process-isolation mode: holds no session, forks a worker per session.
-    broker,
-    /// Daemon holding every session in its own process.
-    monolith,
-    /// A broker's fork holding exactly one session.
+    /// A listening mux daemon: the broker that forks a worker per session, or a daemon
+    /// from a build that still held every session itself (recognised the same way, so
+    /// `sketerm doctor` lists it and its sessions resolve to it as their holder).
+    daemon,
+    /// A daemon's fork holding exactly one session.
     worker,
     /// Any other sketerm-mux invocation; `Proc.mode` says which.
     mux_helper,
@@ -72,8 +72,7 @@ pub const Proc = struct {
     /// Operator-facing role; a sketerm process is named by its binary and subcommand word.
     pub fn label(self: *const Proc, buf: []u8) []const u8 {
         return switch (self.role) {
-            .broker => "daemon (broker)",
-            .monolith => "daemon",
+            .daemon => "daemon",
             .worker => "session worker",
             .mux_helper => self.mode.label(),
             .webengine => "browser helper",
@@ -86,9 +85,9 @@ pub const Proc = struct {
         };
     }
 
-    /// True for the roles that listen on a mux socket.
+    /// True for the role that listens on a mux socket.
     pub fn isDaemon(self: *const Proc) bool {
-        return self.role == .broker or self.role == .monolith;
+        return self.role == .daemon;
     }
 };
 
@@ -112,7 +111,7 @@ fn isSketermName(base: []const u8) bool {
     return std.mem.eql(u8, base, "sketerm") or std.mem.startsWith(u8, base, "sketerm-");
 }
 
-/// Classify one process, or null when it is not sketerm's. A worker reads as a broker here:
+/// Classify one process, or null when it is not sketerm's. A worker reads as a daemon here:
 /// it is a fork of one, argv included, and only `build` sees the parent that tells them apart.
 pub fn identify(exe: []const u8, argv: []const u8) ?Identity {
     const replaced = std.mem.endsWith(u8, exe, platform.deleted_exe_suffix);
@@ -130,13 +129,7 @@ pub fn identify(exe: []const u8, argv: []const u8) ?Identity {
     const args = splitArgs(argv, &args_buf);
     if (selfexec.isBinaryName(name) or selfexec.isBinaryName(argv0_name)) {
         const mode = selfexec.modeOf(args);
-        const role: Role = if (mode != .daemon)
-            .mux_helper
-        else if (hasArg(args, selfexec.BROKER_FLAG))
-            .broker
-        else
-            .monolith;
-        return .{ .name = name, .replaced = replaced, .role = role, .mode = mode };
+        return .{ .name = name, .replaced = replaced, .role = if (mode != .daemon) .mux_helper else .daemon, .mode = mode };
     }
     if (std.mem.eql(u8, name, findbin.HELPER_NAME)) {
         const subprocess = for (args) |a| {
@@ -159,13 +152,6 @@ fn splitArgs(argv: []const u8, buf: [][]const u8) []const []const u8 {
     return buf[0..n];
 }
 
-fn hasArg(args: []const []const u8, want: []const u8) bool {
-    for (args[@min(args.len, 1)..]) |a| {
-        if (std.mem.eql(u8, a, want)) return true;
-    }
-    return false;
-}
-
 pub const Inventory = struct {
     arena: std.heap.ArenaAllocator,
     /// sketerm processes in display order: each directly after its nearest listed ancestor.
@@ -185,7 +171,7 @@ pub const Inventory = struct {
     }
 
     /// The listed process holding the session whose child is `child_pid`: the child's parent,
-    /// which is the worker under a broker and the daemon itself in a monolith.
+    /// which is the worker under a current daemon and the daemon itself for an old build.
     pub fn sessionHolder(self: *const Inventory, child_pid: c.pid_t) ?*const Proc {
         if (child_pid <= 0) return null;
         return self.find(self.parents.get(child_pid) orelse return null);
@@ -267,10 +253,12 @@ pub fn build(allocator: std.mem.Allocator, raws: []const Raw) !Inventory {
     const procs = found.items;
     const b = Builder{ .procs = procs, .index = &index, .parents = &inv.parents };
 
+    // A daemon-mode process forked by a daemon-mode process is a session
+    // worker: a daemon's other children are shells, apps and helpers.
     for (procs) |*p| {
-        if (p.role != .broker) continue;
+        if (p.role != .daemon) continue;
         const parent = index.get(p.ppid) orelse continue;
-        if (procs[parent].role == .broker) p.role = .worker;
+        if (procs[parent].role == .daemon) p.role = .worker;
     }
 
     const keep = try a.alloc(bool, procs.len);
@@ -377,7 +365,7 @@ pub fn daemonSocket(allocator: std.mem.Allocator, p: *const Proc, environ: ?[]co
 const t = std.testing;
 
 test "daemonSocket prefers the socket option, then the process's own runtime dir" {
-    var p = Proc{ .pid = 1, .ppid = 0, .age_ms = 0, .argv = "sketerm-mux\x00--socket\x00/tmp/a/mux.sock", .name = "sketerm-mux", .replaced = false, .role = .monolith, .mode = .daemon };
+    var p = Proc{ .pid = 1, .ppid = 0, .age_ms = 0, .argv = "sketerm-mux\x00--socket\x00/tmp/a/mux.sock", .name = "sketerm-mux", .replaced = false, .role = .daemon, .mode = .daemon };
     const explicit = (try daemonSocket(t.allocator, &p, "XDG_RUNTIME_DIR=/run/user/7")).?;
     defer t.allocator.free(explicit);
     try t.expectEqualStrings("/tmp/a/mux.sock", explicit);
@@ -400,12 +388,12 @@ test "identify recognises every sketerm process shape and nothing else" {
     try t.expectEqualStrings("sketerm-files", identify("/usr/bin/sketerm-files", "sketerm-files").?.name);
 
     const deployed = identify("/home/u/.cache/sketerm/mux/sketerm-mux-ab12 (deleted)", "sketerm-mux\x00--broker").?;
-    try t.expectEqual(Role.broker, deployed.role);
+    try t.expectEqual(Role.daemon, deployed.role);
     try t.expect(deployed.replaced);
     try t.expectEqualStrings("sketerm-mux-ab12", deployed.name);
 
     // A daemon started before argv[0] was named still classifies by its executable.
-    try t.expectEqual(Role.monolith, identify("/usr/bin/sketerm-mux", "/proc/self/exe").?.role);
+    try t.expectEqual(Role.daemon, identify("/usr/bin/sketerm-mux", "/proc/self/exe").?.role);
 
     // A keeper forked by a test rig's in-process daemon: only argv[0] says what it is.
     const keeper = identify("/tmp/zig-cache/o/1/smoke-broker", "sketerm-mux\x00--keep").?;
@@ -416,7 +404,7 @@ test "identify recognises every sketerm process shape and nothing else" {
     try t.expectEqual(Role.cef_subprocess, identify("/usr/bin/sketerm-webengine", "/usr/bin/sketerm-webengine\x00--type=renderer").?.role);
 }
 
-test "build nests, folds browser subprocesses and tells workers from brokers" {
+test "build nests, folds browser subprocesses and tells workers from daemons" {
     const raws = [_]Raw{
         .{ .pid = 1, .ppid = 0, .exe = "/usr/lib/systemd/systemd", .argv = "systemd" },
         .{ .pid = 100, .ppid = 1, .age_ms = 5_000, .exe = "/usr/bin/sketerm-mux", .argv = "sketerm-mux\x00--broker" },
@@ -436,7 +424,7 @@ test "build nests, folds browser subprocesses and tells workers from brokers" {
 
     const Want = struct { pid: c.pid_t, depth: u16, role: Role };
     const want = [_]Want{
-        .{ .pid = 100, .depth = 0, .role = .broker },
+        .{ .pid = 100, .depth = 0, .role = .daemon },
         .{ .pid = 101, .depth = 1, .role = .worker },
         .{ .pid = 103, .depth = 2, .role = .sketerm },
         .{ .pid = 105, .depth = 2, .role = .mux_helper },
@@ -465,6 +453,23 @@ test "build nests, folds browser subprocesses and tells workers from brokers" {
     try t.expectEqualStrings("session worker", inv.find(104).?.label(&buf));
 }
 
+test "an old single-process daemon still lists as a daemon holding its sessions" {
+    // Builds before broker-everywhere ran without `--broker` and held
+    // every shell themselves; such a daemon may still be running.
+    const raws = [_]Raw{
+        .{ .pid = 1, .ppid = 0, .exe = "/usr/lib/systemd/systemd", .argv = "systemd" },
+        .{ .pid = 300, .ppid = 1, .exe = "/usr/bin/sketerm-mux", .argv = "sketerm-mux\x00--socket\x00/run/user/1/sketerm/mux.sock" },
+        .{ .pid = 301, .ppid = 300, .exe = "/usr/bin/bash", .argv = "-bash" },
+        .{ .pid = 302, .ppid = 300, .exe = "/usr/bin/sketerm-mux", .argv = "sketerm-mux\x00--keep" },
+    };
+    var inv = try build(t.allocator, &raws);
+    defer inv.deinit();
+    try t.expectEqual(Role.daemon, inv.find(300).?.role);
+    try t.expect(inv.find(300).?.isDaemon());
+    try t.expectEqual(Role.mux_helper, inv.find(302).?.role);
+    try t.expectEqual(@as(c.pid_t, 300), inv.sessionHolder(301).?.pid);
+}
+
 test "build survives a parent cycle and duplicate pids" {
     const raws = [_]Raw{
         .{ .pid = 10, .ppid = 11, .exe = "/usr/bin/sketerm", .argv = "sketerm" },
@@ -477,7 +482,7 @@ test "build survives a parent cycle and duplicate pids" {
 }
 
 test "option reads the value after a flag" {
-    const p = Proc{ .pid = 1, .ppid = 0, .age_ms = 0, .argv = "sketerm-mux\x00--broker\x00--socket\x00/tmp/a/mux.sock", .name = "sketerm-mux", .replaced = false, .role = .broker, .mode = .daemon };
+    const p = Proc{ .pid = 1, .ppid = 0, .age_ms = 0, .argv = "sketerm-mux\x00--broker\x00--socket\x00/tmp/a/mux.sock", .name = "sketerm-mux", .replaced = false, .role = .daemon, .mode = .daemon };
     try t.expectEqualStrings("/tmp/a/mux.sock", p.option(selfexec.SOCKET_FLAG).?);
     try t.expect(p.option("--idle-exit") == null);
 }

@@ -38,8 +38,8 @@ const READ_BATCH: usize = 512 * 1024;
 /// ticks instead of blocking the poll loop.
 const SEEK_BATCH: usize = 1024 * 1024;
 /// File bytes the background duration scan reads per tick: a seek
-/// replay's budget, so a scan tick costs the poll loop what a seek tick
-/// does (in monolith mode that loop is shared with every session).
+/// replay's budget, so a scan tick costs the worker's poll loop what a
+/// seek tick does.
 const SCAN_BATCH: usize = SEEK_BATCH;
 /// With `skip_silence` on, any longer pause is cut down to this.
 const SILENCE_MS: u64 = 500;
@@ -866,7 +866,7 @@ const daemon_serve = @import("daemon_serve.zig");
 /// uses (listen_fd -1), enough for spawn/ingest/broadcast logic.
 fn newTestDaemon(a: std.mem.Allocator) !*Daemon {
     const d = try a.create(Daemon);
-    d.* = .{ .allocator = a, .listen_fd = -1, .sock_path = try a.dupe(u8, "") };
+    d.* = .{ .allocator = a, .listen_fd = -1, .sock_path = try a.dupe(u8, ""), .role = .worker };
     return d;
 }
 
