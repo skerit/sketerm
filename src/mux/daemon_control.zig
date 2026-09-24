@@ -185,8 +185,11 @@ pub const PassedClient = struct {
     panel_only: bool = false,
     panel_rpc: u8 = 0,
     identity_first: bool = false,
+    /// Hello `paste_request`: the client answers paste_request units.
+    answers_paste: bool = false,
 
-    pub const WIRE_SIZE: usize = 12 + wlvcodec.CodecList.wire_size;
+    const CODECS_END: usize = 12 + wlvcodec.CodecList.wire_size;
+    pub const WIRE_SIZE: usize = CODECS_END + 1;
 
     /// Append-only broker handoff encoding; old workers ignore tail bytes.
     pub fn encode(self: PassedClient) [WIRE_SIZE]u8 {
@@ -203,7 +206,8 @@ pub const PassedClient = struct {
         out[9] = @intFromBool(self.panel_only);
         out[10] = self.panel_rpc;
         out[11] = @intFromBool(self.identity_first);
-        out[12..].* = self.video_codecs.encode();
+        out[12..CODECS_END].* = self.video_codecs.encode();
+        out[CODECS_END] = @intFromBool(self.answers_paste);
         return out;
     }
 
@@ -237,6 +241,7 @@ pub const PassedClient = struct {
             .panel_only = bytes.len >= 10 and bytes[9] != 0,
             .panel_rpc = if (bytes.len >= 11) @min(bytes[10], wire.PANEL_RPC_VERSION) else 0,
             .identity_first = bytes.len >= 12 and bytes[11] != 0,
+            .answers_paste = bytes.len > CODECS_END and bytes[CODECS_END] != 0,
         };
     }
 };
@@ -256,6 +261,7 @@ test "broker attach handoff preserves panel-only capability fields" {
         .panel_only = true,
         .panel_rpc = wire.PANEL_RPC_VERSION,
         .identity_first = true,
+        .answers_paste = true,
     };
     const encoded = original.encode();
     const decoded = PassedClient.decode(&encoded);
@@ -271,6 +277,9 @@ test "broker attach handoff preserves panel-only capability fields" {
     try t.expectEqual(original.panel_only, decoded.panel_only);
     try t.expectEqual(original.panel_rpc, decoded.panel_rpc);
     try t.expectEqual(original.identity_first, decoded.identity_first);
+    try t.expectEqual(original.answers_paste, decoded.answers_paste);
+    // A handoff from before the paste byte never claims it.
+    try t.expect(!PassedClient.decode(encoded[0 .. PassedClient.WIRE_SIZE - 1]).answers_paste);
 
     const historical = PassedClient.decode(encoded[0..9]);
     try t.expect(!historical.panel_only);
@@ -316,6 +325,7 @@ pub fn addPassedClient(self: *Daemon, fd: c_int, req: PassedClient) void {
         .winstream_channels = req.winstream_channels,
         .video_codecs = req.video_codecs,
         .panel_rpc_support = req.panel_rpc,
+        .answers_paste = req.answers_paste,
     };
     self.next_client_id += 1;
     self.clients.append(self.allocator, cl) catch {

@@ -737,6 +737,7 @@ pub fn request(self: *Compositor, hdr: wire.Header, body: []const u8) Error!void
                 _ = self.data_sources.remove(hdr.object);
             }
             _ = self.source_actions.remove(hdr.object);
+            self.forgetSource(hdr.object);
             if (self.drag.source == hdr.object) {
                 if (self.drag.active) try self.dragLeave();
                 self.drag = .{};
@@ -771,6 +772,7 @@ pub fn request(self: *Compositor, hdr: wire.Header, body: []const u8) Error!void
         },
         1 => { // set_selection(?source, serial)
             const source = (try it.next()).?.object;
+            try self.takeSelection(&self.selection_source, source);
             if (source != 0) {
                 if (self.bestTextMime(source)) |mime| {
                     if (self.view.clipboard_offer) |cb| cb(self.view.ctx, source, mime);
@@ -822,7 +824,9 @@ pub fn request(self: *Compositor, hdr: wire.Header, body: []const u8) Error!void
                 try payload.appendSlice(self.allocator, &idb);
                 try payload.appendSlice(self.allocator, mime);
                 try pipe.appendUnit(&self.out, self.allocator, .dnd_send, payload.items);
-            } else if (self.view.clipboard_read) |cb| cb(self.view.ctx, mime);
+            } else if (!self.paste_by_request) {
+                if (self.view.clipboard_read) |cb| cb(self.view.ctx, mime);
+            }
         },
         2 => { // destroy
             if (hdr.object == self.host_drag.offer) self.host_drag.free(self.allocator);
@@ -899,12 +903,14 @@ pub fn request(self: *Compositor, hdr: wire.Header, body: []const u8) Error!void
                 mimes.deinit(self.allocator);
                 _ = self.data_sources.remove(hdr.object);
             }
+            self.forgetSource(hdr.object);
             try self.destroyObject(hdr.object);
         },
         else => return Error.Protocol,
     } else if (iface == &protocol.zwlr_data_control_device_v1) switch (hdr.opcode) {
         0 => { // set_selection(?source) — no serial, unlike wl
             const source = (try it.next()).?.object;
+            try self.takeSelection(&self.selection_source, source);
             if (source != 0) {
                 if (self.bestTextMime(source)) |mime| {
                     if (self.view.clipboard_offer) |cb| cb(self.view.ctx, source, mime);
@@ -919,7 +925,9 @@ pub fn request(self: *Compositor, hdr: wire.Header, body: []const u8) Error!void
     } else if (iface == &protocol.zwlr_data_control_offer_v1) switch (hdr.opcode) {
         0 => { // receive(mime, fd) — same paste path as wl_data_offer
             const mime = (try it.next()).?.string orelse return Error.Protocol;
-            if (self.view.clipboard_read) |cb| cb(self.view.ctx, mime);
+            if (!self.paste_by_request) {
+                if (self.view.clipboard_read) |cb| cb(self.view.ctx, mime);
+            }
         },
         1 => try self.destroyObject(hdr.object), // destroy
         else => return Error.Protocol,
@@ -1064,12 +1072,14 @@ pub fn request(self: *Compositor, hdr: wire.Header, body: []const u8) Error!void
                 mimes.deinit(self.allocator);
                 _ = self.data_sources.remove(hdr.object);
             }
+            self.forgetSource(hdr.object);
             try self.destroyObject(hdr.object);
         },
         else => return Error.Protocol,
     } else if (iface == &protocol.zwp_primary_selection_device_v1) switch (hdr.opcode) {
         0 => { // set_selection(?source, serial)
             const source = (try it.next()).?.object;
+            try self.takeSelection(&self.primary_source, source);
             if (source != 0) {
                 if (self.bestTextMime(source)) |mime| {
                     if (self.view.primary_offer) |cb| cb(self.view.ctx, source, mime);
@@ -1084,7 +1094,9 @@ pub fn request(self: *Compositor, hdr: wire.Header, body: []const u8) Error!void
     } else if (iface == &protocol.zwp_primary_selection_offer_v1) switch (hdr.opcode) {
         0 => { // receive(mime, fd) — host PRIMARY selection paste
             const mime = (try it.next()).?.string orelse return Error.Protocol;
-            if (self.view.primary_read) |cb| cb(self.view.ctx, mime);
+            if (!self.paste_by_request) {
+                if (self.view.primary_read) |cb| cb(self.view.ctx, mime);
+            }
         },
         1 => try self.destroyObject(hdr.object), // destroy
         else => return Error.Protocol,

@@ -19,6 +19,12 @@ const vcodec = @import("../wlhost/vcodec.zig");
 /// a live connection keeps what it negotiated until it reconnects.
 pub var video_preference: vcodec.Preference = .auto;
 
+/// This process RENDERS forwarded apps (the GUI, appdrive): its hellos
+/// say `paste_request:true`, i.e. it answers the daemon's paste_request
+/// units with its host clipboard. Plain control clients (the CLI) leave
+/// it false. Set once, before the first connection that views apps.
+pub var app_viewer: bool = false;
+
 /// The hello's two video fields. `video_codecs` is what a negotiating
 /// daemon reads; `video` is all an OLDER daemon reads, and it encodes
 /// x264 when that is set, so it must mean exactly "I decode H.264".
@@ -488,6 +494,7 @@ pub const Conn = struct {
             .video = vf.video,
             .video_codecs = vf.video_codecs,
             .panel_rpc = wire.PANEL_RPC_VERSION,
+            .paste_request = app_viewer,
         };
         if (queue_only)
             try self.queueJsonUntil(.hello, value, deadline_ms.?)

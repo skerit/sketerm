@@ -647,6 +647,9 @@ pub const App = struct {
         opts: LaunchOpts,
     ) Error!*App {
         launch_err_len = 0;
+        // A viewer of forwarded apps: its hellos say it answers host
+        // pastes (onClipRead serves `paste_data`).
+        muxclient.app_viewer = true;
         const layout_name = opts.kb_layout orelse "";
         const blob = keymaps.get(layout_name) orelse return Error.BadLayout;
         var layout: ?xkblayout.Layout = xkblayout.parse(allocator, blob) catch null;
@@ -833,6 +836,7 @@ pub const App = struct {
         role: AttachRole,
     ) Error!*App {
         launch_err_len = 0;
+        muxclient.app_viewer = true;
         const layout_name = kb_layout orelse "";
         const blob = keymaps.get(layout_name) orelse return Error.BadLayout;
         var layout: ?xkblayout.Layout = xkblayout.parse(allocator, blob) catch null;
@@ -1325,6 +1329,7 @@ pub const App = struct {
                 self.chans.put(self.allocator, open.id, ch) catch {
                     ch.deinit();
                     self.allocator.destroy(ch);
+                    return;
                 };
             },
             .chan_close => {
@@ -1722,6 +1727,9 @@ pub const App = struct {
             .primary_read = onPrimaryRead,
         });
         comp.lenient = true;
+        // A daemon that asks for host pastes (paste_request) is answered
+        // only when it asks; the replayed receive must not answer twice.
+        comp.paste_by_request = self.conn.caps.app_paste_request;
         return comp;
     }
 

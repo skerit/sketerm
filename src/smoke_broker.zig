@@ -298,6 +298,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // lease intent rides the 'A' handoff; either omitted and this is
     // silently broken while a unit test of either half passes. ──
     @import("smoke_display.zig").run(allocator, sock_path);
+    // Host-clipboard paste into real wl-clipboard apps: the paste_request
+    // ask rides the 'A' handoff's paste byte to the worker.
+    @import("smoke_paste.zig").run(allocator, sock_path);
     std.debug.print("smoke-broker: display sessions + controller lease via worker ok\n", .{});
 
     // ── correlated native-panel relay THROUGH THE BROKER. Both

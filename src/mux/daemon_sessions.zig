@@ -907,6 +907,7 @@ pub fn brokerAttach(self: *Daemon, cl: *Client, payload: []const u8) void {
         .panel_rpc = panel_rpc,
         .identity_first = parsed.value.identity_first and panel_rpc > 0 and kind == .gui and
             !parsed.value.panel_only,
+        .answers_paste = cl.answers_paste,
     }).encode();
     var msg: [1 + PassedClient.WIRE_SIZE]u8 = undefined;
     msg[0] = 'A';

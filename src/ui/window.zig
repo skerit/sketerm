@@ -708,6 +708,9 @@ pub const Window = struct {
         // Forwarded-app video codecs every mux hello offers (app-level,
         // module-level in mux/client.zig; set before any pane connects).
         @import("../mux/client.zig").video_preference = self.config.app_video_codec;
+        // This process renders forwarded apps: its hellos say it answers
+        // the daemon's host-paste requests (wlapp.zig).
+        @import("../mux/client.zig").app_viewer = true;
 
         // Browser frame cap: app-level like the IM strategy below, and
         // module-level in webface, which owns the one helper client.

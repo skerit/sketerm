@@ -210,6 +210,9 @@ pub const HelloReq = struct {
     /// chose lossless); absent = an older client, fall back to `video`.
     video_codecs: ?[]const []const u8 = null,
     panel_rpc: u8 = 0,
+    /// The client renders forwarded apps and answers the daemon's
+    /// paste_request units with its host clipboard.
+    paste_request: bool = false,
 
     pub fn videoCodecs(self: HelloReq) wlvcodec.CodecList {
         if (self.video_codecs) |names| return wlvcodec.CodecList.fromNames(names);
@@ -288,6 +291,7 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
                 cl.winstream_channels = cl.proto != 0 and if (negotiated) p.value.winstream else cl.proto >= wire.WINSTREAM_PROTO_VERSION;
                 cl.video_codecs = p.value.videoCodecs();
                 cl.panel_rpc_support = @min(p.value.panel_rpc, wire.PANEL_RPC_VERSION);
+                cl.answers_paste = cl.proto != 0 and p.value.paste_request;
                 p.deinit();
             } else |_| {}
             // Every boolean capability rides `capabilities.all`: one

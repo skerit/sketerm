@@ -2453,6 +2453,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // External display sessions + the controller lease (shared stage,
     // also run against a real broker by smoke-broker).
     @import("smoke_display.zig").run(allocator, sock_path);
+    @import("smoke_paste.zig").run(allocator, sock_path);
 
     // Correlated native-panel relay + panel-only attach isolation. The
     // shared broker run proves the capability fields survive fd handoff.

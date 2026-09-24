@@ -89,6 +89,13 @@ pub const Flag = enum {
     /// a busy daemon is never replaced (the field would be ignored and
     /// the request refused, so sending it is harmless but pointless).
     worker_handover,
+    /// The daemon brain asks a viewer for the HOST clipboard when a
+    /// forwarded app pastes (`paste_request` pipe unit, answered with
+    /// clip_data / primary_data) and honors the viewer's `viewer_caps`.
+    /// A viewer then answers pastes only on request. Absent = the old
+    /// daemon never asks; the viewer keeps answering what its replica
+    /// resolves itself.
+    app_paste_request,
 };
 
 /// One bool per flag, keyed by wire name; the parsed form on the

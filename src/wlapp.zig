@@ -96,6 +96,13 @@ pub const AppHost = struct {
     /// Surface that last got a clipboard offer — re-offer happens
     /// per keyboard-focus change, not per keystroke.
     offered_focus: u32 = 0,
+    /// Content providers this host last put on the host clipboard /
+    /// primary selection while mirroring the APP's selection. Identity
+    /// only, never dereferenced: while the host selection is still that
+    /// mirror, offering it back would cancel the app's own (possibly
+    /// richer than text) selection for a copy of itself.
+    clip_mirror: ?*anyopaque = null,
+    primary_mirror: ?*anyopaque = null,
     /// Kinds of in-flight clip_send fetches, FIFO-paired with the
     /// clip_data answers (0 = clipboard, 1 = primary) — the wire
     /// carries no kind, so ordering routes the result.
@@ -762,6 +769,29 @@ pub const AppHost = struct {
 
     fn requestCloseIntent(self: *AppHost, sid: u32) void {
         wlpipe.appendRequestClose(&self.intents, self.allocator, sid) catch {};
+    }
+
+    /// The daemon asks this viewer for the host selection on every app
+    /// paste (paste_request units; daemon welcome `app_paste_request`),
+    /// so the replica must stop answering receives itself.
+    pub fn enablePasteRequests(self: *AppHost) void {
+        self.comp.paste_by_request = true;
+    }
+
+    /// Announce the host clipboard and primary selection to the app,
+    /// skipping one that still holds this host's mirror of the app's
+    /// own selection.
+    fn offerHostSelections(self: *AppHost) void {
+        if (!holdsMirror(gdkClipboard(), self.clip_mirror))
+            self.offerSelectionIntent("text/plain;charset=utf-8");
+        if (!holdsMirror(gdkPrimary(), self.primary_mirror))
+            self.offerPrimaryIntent("text/plain;charset=utf-8");
+    }
+
+    fn holdsMirror(cb: ?*c.GdkClipboard, mirror: ?*anyopaque) bool {
+        const m = mirror orelse return false;
+        const content = c.gdk_clipboard_get_content(cb orelse return false) orelse return false;
+        return @as(*anyopaque, @ptrCast(content)) == m;
     }
 
     fn offerSelectionIntent(self: *AppHost, mime: []const u8) void {
@@ -1999,8 +2029,7 @@ pub const AppHost = struct {
         // controller alone is unreliable under bare X).
         if (win.host.offered_focus != win.host.comp.keyboard_focus) {
             win.host.offered_focus = win.host.comp.keyboard_focus;
-            win.host.offerSelectionIntent("text/plain;charset=utf-8");
-            win.host.offerPrimaryIntent("text/plain;charset=utf-8");
+            win.host.offerHostSelections();
         }
         // GDK's low modifier bits are the X11/xkb mod order the
         // pc105/us keymap uses (shift, lock, ctrl, mod1…).
@@ -2033,8 +2062,7 @@ pub const AppHost = struct {
         // while the app was unfocused. Empty clipboards just paste
         // empty (the async read answers honestly either way).
         win.host.offered_focus = win.host.comp.keyboard_focus;
-        win.host.offerSelectionIntent("text/plain;charset=utf-8");
-        win.host.offerPrimaryIntent("text/plain;charset=utf-8");
+        win.host.offerHostSelections();
         win.host.flushHost();
     }
 
@@ -2383,7 +2411,10 @@ pub const AppHost = struct {
             self.fetch_kinds.orderedRemove(0)
         else
             0;
-        clipmod.copyTextTo(self.allocator, if (kind == 1) gdkPrimary() else gdkClipboard(), bytes);
+        const target = if (kind == 1) gdkPrimary() else gdkClipboard();
+        clipmod.copyTextTo(self.allocator, target, bytes);
+        const provider: ?*anyopaque = if (target) |cb| @ptrCast(c.gdk_clipboard_get_content(cb)) else null;
+        if (kind == 1) self.primary_mirror = provider else self.clip_mirror = provider;
     }
 
     /// App wants to paste: async-read the host clipboard; ALWAYS

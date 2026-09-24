@@ -2775,6 +2775,8 @@ pub const Terminal = struct {
         host.on_first_window = nappFirstWindow;
         host.first_window_ctx = na;
         host.setDriven(self.peer_drivers > 0);
+        // A daemon that asks for host pastes gets them only on request.
+        if (remote.conn.caps.app_paste_request) host.enablePasteRequests();
         // Append BEFORE firing on_app_view: the callback reads napps.items[0],
         // which dereferences the empty-slice sentinel (addr 0x8) on the first
         // app if the list is still empty.

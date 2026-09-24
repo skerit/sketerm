@@ -154,6 +154,15 @@ pub const Tag = enum(u8) {
     /// reattach. An older viewer skips the unknown tag and simply
     /// keeps today's behaviour (no cross-connection parenting).
     foreign_parent = 38,
+    /// Daemon -> ONE viewer: the app asked to paste a HOST selection.
+    /// u8 kind (0 clipboard, 1 primary), then the mime string. The
+    /// viewer reads its host selection and ALWAYS answers, even with
+    /// nothing: clip_data for kind 0, primary_data for kind 1 (the
+    /// daemon holds the app's receive fd until then). Sent only to a
+    /// viewer whose hello said `paste_request:true`; with no viewer
+    /// attached at all the daemon answers empty itself, so the app's
+    /// paste completes instead of hanging.
+    paste_request = 39,
     _,
 };
 

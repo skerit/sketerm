@@ -765,6 +765,17 @@ pub const Compositor = struct {
     /// brain is authoritative and its server-created object ids are
     /// invisible to replicas. Never set on the brain itself.
     lenient: bool = false,
+    /// The app's current clipboard / primary selection source (0 =
+    /// none, or the host owns it). Replaced or overridden by the host
+    /// (offerSelection/offerPrimary), the old source is `cancelled`.
+    selection_source: u32 = 0,
+    primary_source: u32 = 0,
+    /// Replica answering host pastes ONLY on the daemon's
+    /// paste_request units (the daemon advertises app_paste_request):
+    /// a receive seen in the replayed request stream must not also
+    /// answer, or one paste gets two answers and the second lands in
+    /// the NEXT paste's pipe.
+    paste_by_request: bool = false,
     /// Announce zwp_linux_dmabuf_v1 in get_registry. The daemon
     /// brain sets this from SKETERM_MUX_DMABUF; replicas leave it
     /// false (their announcements are discarded, and binds validate
@@ -1316,11 +1327,48 @@ pub const Compositor = struct {
         try pipe.appendUnit(&self.out, self.allocator, .clip_data, bytes);
     }
 
+    /// The app made `source` its selection (`slot` is the clipboard or
+    /// the primary one). A source the app replaced loses the selection,
+    /// and the protocol says it hears `cancelled`.
+    pub fn takeSelection(self: *Compositor, slot: *u32, source: u32) Error!void {
+        const old = slot.*;
+        slot.* = source;
+        if (old != 0 and old != source) try self.cancelSource(old);
+    }
+
+    /// Tell a data source it is no longer the selection. Only a live
+    /// object of a source interface is told: `forgetSource` clears the
+    /// slots on destroy, so a recycled id is never mistaken for one.
+    fn cancelSource(self: *Compositor, source: u32) Error!void {
+        const iface = self.objects.get(source) orelse return;
+        const op: u16 = if (iface == &protocol.wl_data_source)
+            2
+        else if (iface == &protocol.zwlr_data_control_source_v1 or iface == &protocol.zwp_primary_selection_source_v1)
+            1
+        else
+            return;
+        var buf: [8]u8 = undefined;
+        var b = wire.Builder.init(&buf, source, op); // cancelled
+        try self.send(try b.finish());
+    }
+
+    /// A data source was destroyed: it holds no selection any more.
+    pub fn forgetSource(self: *Compositor, source: u32) void {
+        if (self.selection_source == source) self.selection_source = 0;
+        if (self.primary_source == source) self.primary_source = 0;
+    }
+
     /// View → client: announce the HOST clipboard to the app so it
     /// can paste: a fresh server-created data offer per call, sent
     /// to every bound data device (both wl_data_device and the
-    /// surface-less wlr-data-control devices).
+    /// surface-less wlr-data-control devices). The host now owns the
+    /// clipboard, so the app's own selection source (if any) is
+    /// cancelled first: without that a toolkit that still believes it
+    /// owns the selection pastes its OWN old data and never asks.
     pub fn offerSelection(self: *Compositor, mime: []const u8) Error!void {
+        const old = self.selection_source;
+        self.selection_source = 0;
+        if (old != 0) try self.cancelSource(old);
         for (self.data_devices.items) |dev| try self.offerToDevice(dev, mime, false);
         for (self.data_control_devices.items) |dev| try self.offerToDevice(dev, mime, true);
     }
@@ -1362,6 +1410,9 @@ pub const Compositor = struct {
     /// View → client: announce the HOST primary selection so the
     /// app can middle-click paste.
     pub fn offerPrimary(self: *Compositor, mime: []const u8) Error!void {
+        const old = self.primary_source;
+        self.primary_source = 0;
+        if (old != 0) try self.cancelSource(old);
         for (self.primary_devices.items) |dev| {
             const id = self.next_server_id;
             self.next_server_id += 1;
@@ -1787,6 +1838,14 @@ pub const Compositor = struct {
             .clip_data => {
                 // Fetched app clipboard content (answer to clip_send).
                 if (self.view.clipboard_data) |cb| cb(self.view.ctx, payload);
+            },
+            .paste_request => if (payload.len >= 1) {
+                // The daemon brain's app pastes a host selection; the
+                // view reads it and answers clip_data / primary_data.
+                const mime = payload[1..];
+                if (payload[0] == 1) {
+                    if (self.view.primary_read) |cb| cb(self.view.ctx, mime);
+                } else if (self.view.clipboard_read) |cb| cb(self.view.ctx, mime);
             },
             .state_sync => try self.restoreState(payload),
             .toplevel_icon => {
@@ -2315,6 +2374,10 @@ pub const Compositor = struct {
     pub fn deleteId(self: *Compositor, id: u32) Error!void {
         _ = self.objects.remove(id);
         _ = self.obj_versions.remove(id);
+        // delete_id acknowledges CLIENT-allocated ids only; a destroyed
+        // server-created object (a clipboard offer, 0xff000000 and up)
+        // gets none, and libwayland logs "delete_id for unknown id".
+        if (id >= 0xff000000) return;
         var buf: [16]u8 = undefined;
         var b = wire.Builder.init(&buf, 1, 1); // wl_display.delete_id
         b.putUint(id);
@@ -4241,17 +4304,20 @@ test "clipboard: copy offer, fetch, paste offer, receive answer" {
     }
     try t.expectEqualStrings("COPIED", tv.clip_data[0..tv.clip_data_len]);
 
-    // offerSelection → data_offer/offer/selection toward device 5,
-    // then receive on the server-created offer → clipboard_read.
+    // offerSelection → the app's own source 4 loses the selection
+    // (cancelled), then data_offer/offer/selection toward device 5;
+    // receive on the server-created offer → clipboard_read.
     comp.clearOut();
     try comp.offerSelection("text/plain;charset=utf-8");
     var evs: std.ArrayList([2]u32) = .empty;
     defer evs.deinit(t.allocator);
     try drainEvents(&comp, &evs);
-    try t.expectEqual(@as(usize, 3), evs.items.len);
-    try t.expectEqual([2]u32{ 5, 0 }, evs.items[0]); // data_offer
-    try t.expectEqual([2]u32{ 0xff000000, 0 }, .{ evs.items[1][0], evs.items[1][1] }); // offer(mime)
-    try t.expectEqual([2]u32{ 5, 5 }, evs.items[2]); // selection
+    try t.expectEqual(@as(usize, 4), evs.items.len);
+    try t.expectEqual([2]u32{ 4, 2 }, evs.items[0]); // source.cancelled
+    try t.expectEqual([2]u32{ 5, 0 }, evs.items[1]); // data_offer
+    try t.expectEqual([2]u32{ 0xff000000, 0 }, .{ evs.items[2][0], evs.items[2][1] }); // offer(mime)
+    try t.expectEqual([2]u32{ 5, 5 }, evs.items[3]); // selection
+    try t.expectEqual(@as(u32, 0), comp.selection_source);
 
     // Wayland strings are not limited to the old fixed 128/256-byte
     // scratch buffers. A long but legal MIME must remain a normal offer.
@@ -4275,6 +4341,114 @@ test "clipboard: copy offer, fetch, paste offer, receive answer" {
         try t.expectEqual(pipe.Tag.clip_data, p.unit.tag);
         try t.expectEqualStrings("PASTED", p.unit.payload);
     }
+}
+
+test "clipboard: a replaced or host-overridden app selection is cancelled once" {
+    var tv = TestView{};
+    var comp = try Compositor.init(t.allocator, tv.view());
+    defer comp.deinit();
+    var buf: [80]u8 = undefined;
+    { // registry(2) + wl_data_device_manager(3), sources 4 and 6, device 5
+        var b = wire.Builder.init(&buf, 1, 1);
+        b.putNewId(2);
+        try req(&comp, try b.finish());
+        var b1 = wire.Builder.init(&buf, 2, 0);
+        b1.putUint(6);
+        b1.putString("wl_data_device_manager");
+        b1.putUint(1);
+        b1.putNewId(3);
+        try req(&comp, try b1.finish());
+        for ([_]u32{ 4, 6 }) |id| {
+            var bs = wire.Builder.init(&buf, 3, 0);
+            bs.putNewId(id);
+            try req(&comp, try bs.finish());
+        }
+        var bd = wire.Builder.init(&buf, 3, 1);
+        bd.putNewId(5);
+        bd.putObject(0);
+        try req(&comp, try bd.finish());
+    }
+    var evs: std.ArrayList([2]u32) = .empty;
+    defer evs.deinit(t.allocator);
+    // Source 4 takes the selection: nobody is cancelled.
+    comp.clearOut();
+    {
+        var b = wire.Builder.init(&buf, 5, 1);
+        b.putObject(4);
+        b.putUint(1);
+        try req(&comp, try b.finish());
+    }
+    try drainEvents(&comp, &evs);
+    try t.expectEqual(@as(usize, 0), evs.items.len);
+    // Source 6 replaces it: 4 hears cancelled.
+    {
+        var b = wire.Builder.init(&buf, 5, 1);
+        b.putObject(6);
+        b.putUint(2);
+        try req(&comp, try b.finish());
+    }
+    try drainEvents(&comp, &evs);
+    try t.expectEqual(@as(usize, 1), evs.items.len);
+    try t.expectEqual([2]u32{ 4, 2 }, evs.items[0]);
+    // A destroyed source holds nothing: the host override cancels no one.
+    evs.clearRetainingCapacity();
+    {
+        var b = wire.Builder.init(&buf, 6, 1); // wl_data_source.destroy
+        try req(&comp, try b.finish());
+    }
+    comp.clearOut();
+    try comp.offerSelection("text/plain;charset=utf-8");
+    try drainEvents(&comp, &evs);
+    try t.expectEqual(@as(usize, 3), evs.items.len); // offer only, no cancel
+}
+
+test "clipboard: a replica answers host pastes only on paste_request" {
+    var tv = TestView{};
+    var comp = try Compositor.init(t.allocator, tv.view());
+    defer comp.deinit();
+    comp.lenient = true;
+    var buf: [80]u8 = undefined;
+    { // registry(2) + wl_data_device_manager(3) + device 5 + a host offer
+        var b = wire.Builder.init(&buf, 1, 1);
+        b.putNewId(2);
+        try req(&comp, try b.finish());
+        var b1 = wire.Builder.init(&buf, 2, 0);
+        b1.putUint(6);
+        b1.putString("wl_data_device_manager");
+        b1.putUint(1);
+        b1.putNewId(3);
+        try req(&comp, try b1.finish());
+        var bd = wire.Builder.init(&buf, 3, 1);
+        bd.putNewId(5);
+        bd.putObject(0);
+        try req(&comp, try bd.finish());
+    }
+    try comp.offerSelection("text/plain;charset=utf-8");
+    comp.clearOut();
+    // A daemon that asks: the replayed receive must NOT answer...
+    comp.paste_by_request = true;
+    {
+        var b = wire.Builder.init(&buf, 0xff000000, 1); // receive
+        b.putString("text/plain;charset=utf-8");
+        try req(&comp, try b.finish());
+    }
+    try t.expectEqual(@as(usize, 0), tv.clip_reads);
+    // ...the daemon's ask does, per kind.
+    var unit: std.ArrayList(u8) = .empty;
+    defer unit.deinit(t.allocator);
+    try pipe.appendUnit(&unit, t.allocator, .paste_request, "\x00text/plain;charset=utf-8");
+    try pipe.appendUnit(&unit, t.allocator, .paste_request, "\x01text/plain");
+    try comp.feed(unit.items);
+    try t.expectEqual(@as(usize, 1), tv.clip_reads);
+    try t.expectEqual(@as(usize, 1), tv.primary_reads);
+    // An old daemon never asks, so the replica keeps answering itself.
+    comp.paste_by_request = false;
+    {
+        var b = wire.Builder.init(&buf, 0xff000000, 1);
+        b.putString("text/plain;charset=utf-8");
+        try req(&comp, try b.finish());
+    }
+    try t.expectEqual(@as(usize, 2), tv.clip_reads);
 }
 
 test "wlr-data-control: surfaceless copy + paste, distinct opcodes" {
@@ -5935,6 +6109,7 @@ test "primary selection: offer both ways + receive routing" {
     try drainEvents(&comp, &evs);
     const offer_id = comp.next_server_id - 1;
     const offer_expect = [_][2]u32{
+        .{ 4, 1 }, // the app's own source 4: cancelled
         .{ 5, 0 }, // data_offer
         .{ offer_id, 0 }, // offer(mime)
         .{ 5, 1 }, // selection

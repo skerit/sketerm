@@ -950,6 +950,99 @@ pub fn queueUnitsToLane(self: *Daemon, cl: *Client, ch: *Channel, bytes: []const
     }
 }
 
+/// The app asked the brain to paste a HOST selection (`kind` 0 =
+/// clipboard, 1 = primary); its receive fd is already queued. Ask one
+/// viewer that answers paste_request units -- the lease holder first,
+/// since it is the one the user is typing into -- and remember whom.
+/// With NO viewer attached the paste is answered EMPTY right away: an
+/// app blocked on a pipe nobody will ever write is a hung app. A viewer
+/// from before the unit is left to its old path (its replica may still
+/// answer this receive itself; answering here too would hand its late
+/// answer to the NEXT paste).
+pub fn requestHostPaste(self: *Daemon, ch: *Channel, kind: u8, mime: []const u8) void {
+    const nv = ch.native orelse return;
+    var target: ?*Client = null;
+    var legacy = false;
+    if (ch.session) |s| {
+        for (self.clients.items) |cl| {
+            if (cl.dead or !Daemon.nativeViewer(cl, s)) continue;
+            if (!cl.answers_paste) {
+                legacy = true;
+                continue;
+            }
+            if (Daemon.isController(cl, s)) {
+                target = cl;
+                break;
+            }
+            if (target == null) target = cl;
+        }
+    }
+    const cl = target orelse {
+        if (!legacy) answerPasteEmpty(nv, kind);
+        return;
+    };
+    var units: std.ArrayList(u8) = .empty;
+    defer units.deinit(self.allocator);
+    var pl: std.ArrayList(u8) = .empty;
+    defer pl.deinit(self.allocator);
+    pl.append(self.allocator, kind) catch return answerPasteEmpty(nv, kind);
+    pl.appendSlice(self.allocator, mime[0..@min(mime.len, 256)]) catch return answerPasteEmpty(nv, kind);
+    wlpipe.appendUnit(&units, self.allocator, .paste_request, pl.items) catch return answerPasteEmpty(nv, kind);
+    nv.paste_waits.append(nv.allocator, .{ .client_id = cl.id, .kind = kind }) catch return answerPasteEmpty(nv, kind);
+    queueUnitsTo(self, cl, ch, units.items);
+}
+
+/// Complete the oldest held paste of `kind` with no bytes (EOF).
+fn answerPasteEmpty(nv: *Native, kind: u8) void {
+    if (kind == 1) {
+        if (nv.primary_paste_fds.items.len > 0) pasteWrite(nv, nv.primary_paste_fds.orderedRemove(0), "");
+    } else if (nv.clip_paste_fds.items.len > 0) {
+        pasteWrite(nv, nv.clip_paste_fds.orderedRemove(0).fd, "");
+    }
+}
+
+/// A viewer answered: forget one outstanding request of that kind,
+/// preferring the viewer's own.
+fn settlePasteWait(nv: *Native, client_id: u32, tag: wlpipe.Tag) void {
+    const kind: u8 = switch (tag) {
+        .clip_data => 0,
+        .primary_data => 1,
+        else => return,
+    };
+    var any: ?usize = null;
+    for (nv.paste_waits.items, 0..) |w, i| {
+        if (w.kind != kind) continue;
+        if (w.client_id == client_id) {
+            _ = nv.paste_waits.orderedRemove(i);
+            return;
+        }
+        if (any == null) any = i;
+    }
+    if (any) |i| _ = nv.paste_waits.orderedRemove(i);
+}
+
+/// Answer (empty) every paste a viewer was asked for and can no longer
+/// give: it died, detached, or stopped viewing the session.
+pub fn abandonPasteWaits(self: *Daemon) void {
+    for (self.channels.items) |ch| {
+        const nv = ch.native orelse continue;
+        const s = ch.session orelse continue;
+        var i: usize = 0;
+        while (i < nv.paste_waits.items.len) {
+            const w = nv.paste_waits.items[i];
+            const alive = for (self.clients.items) |cl| {
+                if (cl.id == w.client_id) break !cl.dead and Daemon.nativeViewer(cl, s);
+            } else false;
+            if (alive) {
+                i += 1;
+                continue;
+            }
+            _ = nv.paste_waits.orderedRemove(i);
+            answerPasteEmpty(nv, w.kind);
+        }
+    }
+}
+
 /// One clipboard-fetch pipe is readable: drain it; on EOF ship
 /// the collected bytes up as a clip_data unit and drop the
 /// entry. Returns true when the entry was removed.
@@ -1054,6 +1147,7 @@ pub fn viewerUnitKind(tag: wlpipe.Tag) ViewerUnit {
         .pool_update_s,
         .dmabuf_feedback,
         .foreign_parent,
+        .paste_request,
         => .daemon_only,
         // `Tag` is non-exhaustive on the wire; a value this build has no
         // name for is fail-closed: never an intent, never dispatched.
@@ -1085,7 +1179,10 @@ pub fn nativeClientData(self: *Daemon, cl: *Client, ch: *Channel, bytes: []const
             // worse than never having been sent.
             .intent => if (drives) nv.brain.applyIntent(peeled.unit.tag, peeled.unit.payload),
             .describe => nv.brain.applyIntent(peeled.unit.tag, peeled.unit.payload),
-            .transfer => applyAppUnit(self, ch, peeled.unit.tag, peeled.unit.payload),
+            .transfer => {
+                settlePasteWait(ch.native.?, cl.id, peeled.unit.tag);
+                applyAppUnit(self, ch, peeled.unit.tag, peeled.unit.payload);
+            },
             .daemon_only => {},
         }
         pos += peeled.consumed;

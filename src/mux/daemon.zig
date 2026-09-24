@@ -756,6 +756,10 @@ pub const Client = struct {
     snapshot_version: u8 = snapshot.LEGACY_SNAPSHOT_VERSION,
     /// Highest daemon-compositor state version the peer can restore.
     native_state_max: u8 = 0,
+    /// The viewer's hello said `paste_request:true`: it answers
+    /// paste_request units, so a forwarded app can paste its host
+    /// clipboard. Carried to workers in the 'A' handoff.
+    answers_paste: bool = false,
     audio_channels: bool = false,
     winstream_channels: bool = false,
     /// The client sent an audio `subscribe` unit: it drains PCM.
@@ -1778,6 +1782,10 @@ pub const Native = struct {
     /// PRIMARY-selection paste fds, FIFO-paired with primary_data
     /// units (separate queue so interleaved pastes can't swap).
     primary_paste_fds: std.ArrayList(c_int) = .empty,
+    /// paste_request units sent and not yet answered, by the viewer
+    /// asked (daemon_native.requestHostPaste). A viewer that goes away
+    /// owing one has it answered empty for it (abandonPasteWaits).
+    paste_waits: std.ArrayList(PasteWait) = .empty,
     /// Copy: read-ends of pipes whose write-ends went to the app
     /// via wl_data_source.send; EOF ships a clip_data unit up.
     clip_reads: std.ArrayList(ClipRead) = .empty,
@@ -1889,6 +1897,8 @@ pub const Native = struct {
         buf: std.ArrayList(u8) = .empty,
         off: usize = 0,
     };
+
+    pub const PasteWait = struct { client_id: u32, kind: u8 };
 
     const PasteFd = struct {
         offer: u32,
@@ -2060,6 +2070,7 @@ pub const Native = struct {
         self.clip_paste_fds.deinit(self.allocator);
         for (self.primary_paste_fds.items) |fd| _ = c.close(fd);
         self.primary_paste_fds.deinit(self.allocator);
+        self.paste_waits.deinit(self.allocator);
         for (self.clip_reads.items) |*cr| {
             _ = c.close(cr.fd);
             cr.buf.deinit(self.allocator);
@@ -4067,6 +4078,20 @@ pub const Daemon = struct {
     /// Brain saw the app announce its app_id: resolve the app's icon
     /// on THIS host (works for remote apps — the client can't) and
     /// ship the bytes to attached clients + stash for reattach.
+    /// The app pastes the host clipboard / primary selection: the brain
+    /// cannot read it, a viewer can (daemon_native.requestHostPaste).
+    fn onBrainClipRead(ctx: ?*anyopaque, mime: []const u8) void {
+        const nv: *Native = @ptrCast(@alignCast(ctx.?));
+        const d = nv.daemon orelse return;
+        d.requestHostPaste(nv.chan orelse return, 0, mime);
+    }
+
+    fn onBrainPrimaryRead(ctx: ?*anyopaque, mime: []const u8) void {
+        const nv: *Native = @ptrCast(@alignCast(ctx.?));
+        const d = nv.daemon orelse return;
+        d.requestHostPaste(nv.chan orelse return, 1, mime);
+    }
+
     fn onBrainAppId(ctx: ?*anyopaque, sid: u32, app_id: []const u8) void {
         const nv: *Native = @ptrCast(@alignCast(ctx.?));
         const self = nv.daemon orelse return;
@@ -4264,6 +4289,7 @@ pub const Daemon = struct {
             self.discardQueuedAttachmentFrames(s, &cl.wbuf, active_prefix);
         }
         clearClientAttachment(cl);
+        if (was != null) self.abandonPasteWaits();
         if (was) |s| {
             // Clear attachment first so controller handover cannot select it.
             if (self.releaseControl(s, cl)) self.broadcastControlState(s);
@@ -4485,6 +4511,8 @@ pub const Daemon = struct {
             .toplevel_parent = onBrainParent,
             .toplevel_foreign_parent = onBrainForeignParent,
             .toplevel_modal = onBrainModal,
+            .clipboard_read = onBrainClipRead,
+            .primary_read = onBrainPrimaryRead,
         };
         self.next_chan_id += 1;
         self.channels.append(self.allocator, ch) catch {
@@ -4588,6 +4616,8 @@ pub const Daemon = struct {
     const queueAudioUnitsTo = daemon_native.queueAudioUnitsTo;
     const queueUnitsToLane = daemon_native.queueUnitsToLane;
     const clipReadable = daemon_native.clipReadable;
+    pub const requestHostPaste = daemon_native.requestHostPaste;
+    pub const abandonPasteWaits = daemon_native.abandonPasteWaits;
     const isSeatIntent = daemon_native.isSeatIntent;
     const takePasteFd = daemon_native.takePasteFd;
     const applyAppUnit = daemon_native.applyAppUnit;
@@ -6823,6 +6853,8 @@ pub const Daemon = struct {
                 if (cl.dead) ch.dead = true;
             }
         }
+        // A dying viewer's unanswered host pastes complete empty.
+        self.abandonPasteWaits();
         // Client churn changes the video-decode consensus.
         var any_client_died = false;
         for (self.clients.items) |cl| {
