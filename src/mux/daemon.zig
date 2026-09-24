@@ -47,6 +47,7 @@ const wssource = @import("../winstream/source.zig");
 const WsSource = wssource.Source;
 const snapshot = @import("snapshot.zig");
 const lsp_proc = @import("../lsp/proc.zig");
+const stderrtail = @import("../lsp/stderrtail.zig");
 const lsp_servers = @import("../lsp/servers.zig");
 const webfindbin = @import("../web/findbin.zig");
 const webpresence = @import("../web/webpresence.zig");
@@ -1022,6 +1023,12 @@ pub const Channel = struct {
     /// daemon SIGTERMs the group when the channel drops (client
     /// disconnect included) and escalates to SIGKILL via `lsp_reaps`.
     child_pid: c.pid_t = -1,
+    /// LSP channels only: the server's stderr pipe (-1 = none or EOF),
+    /// drained every tick into `lsp_tail`, whose bytes ride the
+    /// channel's `chan_close` after the id (clients that predate it read
+    /// the id and ignore the rest).
+    lsp_err_fd: c_int = -1,
+    lsp_tail: ?*stderrtail.Tail = null,
     /// Infrastructure client (currently xwayland-satellite): its surfaces
     /// are forwarded normally, but its persistent connection does not keep
     /// an external display's no-viewer TTL occupied.
@@ -1052,6 +1059,8 @@ pub const Channel = struct {
         while (cap_it.next()) |w| w.close();
         self.caps.deinit(self.allocator);
         _ = c.close(self.fd);
+        if (self.lsp_err_fd >= 0) _ = c.close(self.lsp_err_fd);
+        if (self.lsp_tail) |tail| self.allocator.destroy(tail);
         self.pending.deinit(self.allocator);
         self.allocator.destroy(self);
     }
@@ -1536,6 +1545,60 @@ test "lsp_open resolves the root remotely, bridges stdio bytes, and reaps on clo
         try t.expectEqual(@as(usize, 0), d.channels.items.len);
         try t.expectEqual(@as(usize, 0), d.lsp_reaps.items.len);
     }
+}
+
+test "a remote language server's stderr tail rides its chan_close" {
+    const t = std.testing;
+    const muxclient = @import("client.zig");
+    var path_buf: [256:0]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-daemon-lsperr-{d}.sock", .{c.getpid()});
+    var lock_buf: [280:0]u8 = undefined;
+    const lock_path = try std.fmt.bufPrintZ(&lock_buf, "{s}.lock", .{path});
+    var script_buf: [256:0]u8 = undefined;
+    const script = try std.fmt.bufPrintZ(&script_buf, "/tmp/sketerm-lsperr-{d}.sh", .{c.getpid()});
+    _ = c.unlink(path.ptr);
+    _ = c.unlink(lock_path.ptr);
+    defer {
+        _ = c.unlink(path.ptr);
+        _ = c.unlink(lock_path.ptr);
+        _ = c.unlink(script.ptr);
+    }
+    {
+        // A server that explains itself on stderr, floods past the tail's
+        // window first, and dies.
+        const f = c.fopen(script.ptr, "wb") orelse return error.TestSetupFailed;
+        const body = "#!/bin/sh\ni=0; while [ $i -lt 200 ]; do echo \"noise line $i\" >&2; i=$((i+1)); done\n" ++
+            "echo 'fatal: toolchain not found' >&2\nexit 3\n";
+        _ = c.fwrite(body.ptr, 1, body.len, f);
+        _ = c.fclose(f);
+        _ = c.chmod(script.ptr, 0o755);
+    }
+    var d = try Daemon.init(t.allocator, path);
+    defer d.deinit();
+    var conn = try muxclient.Conn.connect(t.allocator, path);
+    defer conn.deinit();
+    try conn.sendJson(.lsp_open, .{
+        .req = @as(u32, 1),
+        .dir = @as([]const u8, "/tmp"),
+        .servers = [_]Daemon.LspOpenSrv{.{ .name = "broken", .command = script }},
+    });
+    var tail: ?[]u8 = null;
+    defer if (tail) |b| t.allocator.free(b);
+    var spins: usize = 0;
+    while (tail == null and spins < 4000) : (spins += 1) {
+        try d.tick(0);
+        if (!conn.fillAvailable()) return error.Disconnected;
+        while (try conn.takeFrame()) |f| {
+            defer f.deinit(t.allocator);
+            if (f.ftype == .chan_close) tail = try t.allocator.dupe(u8, f.payload[4..]);
+        }
+        _ = c.usleep(1000);
+    }
+    const got = tail orelse return error.NoChanClose;
+    // The last words survive the flood; the window stays bounded.
+    try t.expect(std.mem.indexOf(u8, got, "fatal: toolchain not found") != null);
+    try t.expect(got.len <= stderrtail.CAPACITY);
+    try t.expect(std.mem.indexOf(u8, got, "noise line 0\n") == null);
 }
 
 test "web_helper_open: missing helper is a described refusal, a spawn bridges a channel" {
@@ -3475,6 +3538,16 @@ pub const Daemon = struct {
                 .revents = 0,
             });
         }
+        // Language-server stderr pipes (LSP channels only; -1 otherwise).
+        // Drained every tick: a pipe nobody reads stalls a chatty server.
+        const lsperr_base = fds.items.len;
+        for (self.channels.items[0..n_channels_built]) |ch| {
+            try fds.append(self.allocator, .{
+                .fd = if (ch.dead) -1 else ch.lsp_err_fd,
+                .events = c.POLLIN,
+                .revents = 0,
+            });
+        }
         // A debugger job that never speaks still has to hit its
         // deadline, so don't sleep the loop out past it.
         if (self.debug_jobs.items.len > 0 and (poll_timeout < 0 or poll_timeout > 250)) poll_timeout = 250;
@@ -3639,6 +3712,13 @@ pub const Daemon = struct {
             }
             for (ready[0..n_ready]) |j| self.debugJobReadable(j);
             self.debugJobsTick();
+        }
+
+        i = 0;
+        while (i < n_channels_built) : (i += 1) {
+            const ch = self.channels.items[i];
+            if (ch.lsp_err_fd < 0) continue;
+            if (fds.items[lsperr_base + i].revents & (c.POLLIN | c.POLLHUP | c.POLLERR) != 0) drainLspStderr(ch);
         }
 
         self.pumpWinstreams();
@@ -4622,6 +4702,24 @@ pub const Daemon = struct {
     const takePasteFd = daemon_native.takePasteFd;
     const applyAppUnit = daemon_native.applyAppUnit;
 
+    /// Read what a language server wrote to stderr into its channel's
+    /// tail; close the pipe at EOF. Never blocks.
+    pub fn drainLspStderr(ch: *Channel) void {
+        const tail = ch.lsp_tail orelse return;
+        while (ch.lsp_err_fd >= 0) {
+            var buf: [1024]u8 = undefined;
+            const n = c.read(ch.lsp_err_fd, &buf, buf.len);
+            if (n > 0) {
+                tail.feed(buf[0..@intCast(n)]);
+                continue;
+            }
+            if (n < 0 and std.posix.errno(n) == .AGAIN) return;
+            if (n < 0 and std.posix.errno(n) == .INTR) continue;
+            _ = c.close(ch.lsp_err_fd);
+            ch.lsp_err_fd = -1;
+        }
+    }
+
     pub fn closeChannel(self: *Daemon, ch: *Channel, notify: bool) void {
         if (ch.dead) return;
         ch.dead = true;
@@ -4630,6 +4728,21 @@ pub const Daemon = struct {
         if (!notify) return;
         var hdr: [4]u8 = undefined;
         const frame = wire.putChanHeader(&hdr, ch.id);
+        if (ch.lsp_tail) |tail| {
+            // A language server's last words: whatever stderr still holds,
+            // then its kept tail after the channel id.
+            drainLspStderr(ch);
+            if (ch.client) |cl| {
+                if (!cl.dead) {
+                    var buf: [4 + stderrtail.CAPACITY]u8 = undefined;
+                    @memcpy(buf[0..4], frame);
+                    const bytes = tail.bytes();
+                    @memcpy(buf[4..][0..bytes.len], bytes);
+                    cl.queueFrame(.chan_close, buf[0 .. 4 + bytes.len]);
+                }
+            }
+            return;
+        }
         if (ch.native != null or ch.pa != null) {
             for (self.clients.items) |cl| {
                 const viewer = if (ch.pa != null) audioViewer(cl, ch.session.?) else nativeViewer(cl, ch.session.?);
@@ -6055,7 +6168,14 @@ pub const Daemon = struct {
                 log.warn("lsp_open: spawn of '{s}' failed", .{srv.command});
                 continue;
             };
-            const ch = self.allocator.create(Channel) catch {
+            const tail = self.allocator.create(stderrtail.Tail) catch null;
+            if (tail) |tl| tl.* = .{};
+            const ch: *Channel = blk: {
+                if (tail != null) {
+                    if (self.allocator.create(Channel)) |p| break :blk p else |_| {}
+                }
+                if (tail) |tl| self.allocator.destroy(tl);
+                if (child.err_fd >= 0) _ = c.close(child.err_fd);
                 _ = c.kill(-child.pid, c.SIGKILL);
                 _ = c.close(child.fd);
                 var st: c_int = 0;
@@ -6071,6 +6191,8 @@ pub const Daemon = struct {
                 .client = cl,
                 .tcp = true,
                 .child_pid = child.pid,
+                .lsp_err_fd = child.err_fd,
+                .lsp_tail = tail,
             };
             self.next_chan_id += 1;
             self.channels.append(self.allocator, ch) catch {

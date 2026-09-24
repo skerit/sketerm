@@ -192,13 +192,17 @@ pub fn spawn(
 
 /// A child whose stdin AND stdout are one socketpair end — the shape
 /// the mux daemon's byte channels want (a `Channel` owns exactly one
-/// fd). stderr goes to /dev/null: the daemon has nobody to show it to,
-/// and /dev/null trivially satisfies "stderr must be drained or the
-/// server stalls".
+/// fd). stderr is a pipe of its own: the daemon keeps its tail
+/// (`stderrtail.zig`) and ships it with the channel's close, so a remote
+/// server that fails can say why. The caller MUST keep draining `err_fd`
+/// or a chatty server stalls on a full pipe.
 pub const SockChild = struct {
     pid: c.pid_t = -1,
     /// Our socketpair end (server stdio, both directions). Non-blocking.
     fd: c_int = -1,
+    /// Read end of the server's stderr. Non-blocking; -1 when the pipe
+    /// could not be made (stderr then goes to /dev/null).
+    err_fd: c_int = -1,
 };
 
 /// Fork+exec `command` with stdio bridged over a socketpair, for the
@@ -237,23 +241,39 @@ pub fn spawnSock(
     argv.append(alloc, null) catch return Error.OutOfMemory;
     const cwd_z = alloc.dupeZ(u8, cwd) catch return Error.OutOfMemory;
     defer alloc.free(cwd_z);
+    // stderr: a CLOEXEC pipe (the dup2 below clears CLOEXEC on fd 2 only).
+    var errp: [2]c_int = .{ -1, -1 };
+    if (c.pipe(&errp) == 0) {
+        _ = c.fcntl(errp[0], c.F_SETFD, c.FD_CLOEXEC);
+        _ = c.fcntl(errp[1], c.F_SETFD, c.FD_CLOEXEC);
+    } else errp = .{ -1, -1 };
 
     const pid = c.fork();
-    if (pid < 0) return Error.ForkFailed;
+    if (pid < 0) {
+        if (errp[0] >= 0) _ = c.close(errp[0]);
+        if (errp[1] >= 0) _ = c.close(errp[1]);
+        return Error.ForkFailed;
+    }
     if (pid == 0) {
         _ = c.setpgid(0, 0);
         _ = c.chdir(cwd_z.ptr);
         _ = c.dup2(pair[1], 0);
         _ = c.dup2(pair[1], 1);
-        const devnull = c.open("/dev/null", c.O_WRONLY);
-        if (devnull >= 0) _ = c.dup2(devnull, 2);
+        if (errp[1] >= 0) {
+            _ = c.dup2(errp[1], 2);
+        } else {
+            const devnull = c.open("/dev/null", c.O_WRONLY);
+            if (devnull >= 0) _ = c.dup2(devnull, 2);
+        }
         _ = c.execvp(cmd_z.ptr, @ptrCast(argv.items.ptr));
         c._exit(127);
     }
     _ = c.setpgid(pid, pid);
     _ = c.close(pair[1]);
     setNonBlocking(pair[0]);
-    return .{ .pid = pid, .fd = pair[0] };
+    if (errp[1] >= 0) _ = c.close(errp[1]);
+    if (errp[0] >= 0) setNonBlocking(errp[0]);
+    return .{ .pid = pid, .fd = pair[0], .err_fd = errp[0] };
 }
 
 /// Full path `command` resolves to, or null. Caller frees.
@@ -343,6 +363,7 @@ test "proc: spawnSock round-trips bytes over one socketpair fd" {
     defer {
         if (child.pid > 0) _ = c.kill(-child.pid, c.SIGKILL);
         if (child.fd >= 0) _ = c.close(child.fd);
+        if (child.err_fd >= 0) _ = c.close(child.err_fd);
         var status: c_int = 0;
         _ = c.waitpid(child.pid, &status, 0);
     }
@@ -362,6 +383,7 @@ test "proc: spawnSock of a missing binary yields immediate EOF" {
     const child = try spawnSock(testing.allocator, "sketerm-no-such-binary-xyz", &.{}, "/");
     defer {
         if (child.fd >= 0) _ = c.close(child.fd);
+        if (child.err_fd >= 0) _ = c.close(child.err_fd);
         var status: c_int = 0;
         _ = c.waitpid(child.pid, &status, 0);
     }
