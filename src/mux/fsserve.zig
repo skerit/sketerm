@@ -550,6 +550,41 @@ pub fn userDirPath(body: []const u8, dir: UserDir, home: []const u8, buf: []u8) 
     return std.fmt.bufPrint(buf, "{s}/{s}", .{ home, dir.default }) catch null;
 }
 
+/// The freedesktop home trash root for a user: `$XDG_DATA_HOME/Trash`,
+/// else `$HOME/.local/share/Trash`. THE one rule: the daemon trashes
+/// into it, reports it in `homedir`, and the GUI's local fallback for
+/// a daemon too old to report it derives the same answer.
+/// @return null when neither variable names a directory.
+pub fn trashRoot(data_home: ?[]const u8, home: ?[]const u8, buf: []u8) ?[]const u8 {
+    if (data_home) |d| if (d.len > 0) return std.fmt.bufPrint(buf, "{s}/Trash", .{d}) catch null;
+    const h = home orelse return null;
+    if (h.len == 0) return null;
+    return std.fmt.bufPrint(buf, "{s}/.local/share/Trash", .{h}) catch null;
+}
+
+/// The `files` directory of `trashRoot`: what a Trash place opens.
+pub fn trashFilesDir(data_home: ?[]const u8, home: ?[]const u8, buf: []u8) ?[]const u8 {
+    var root_buf: [4096]u8 = undefined;
+    const root = trashRoot(data_home, home, &root_buf) orelse return null;
+    return std.fmt.bufPrint(buf, "{s}/files", .{root}) catch null;
+}
+
+/// `getenv` as an optional slice, for the env-fed callers of the
+/// pure path rules above.
+pub fn envOpt(name: [*:0]const u8) ?[]const u8 {
+    const raw = c.getenv(name) orelse return null;
+    return std.mem.span(@as([*:0]const u8, @ptrCast(raw)));
+}
+
+test "trashRoot prefers XDG_DATA_HOME and needs at least a home" {
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("/d/Trash", trashRoot("/d", "/home/u", &buf).?);
+    try std.testing.expectEqualStrings("/home/u/.local/share/Trash", trashRoot(null, "/home/u", &buf).?);
+    try std.testing.expectEqualStrings("/home/u/.local/share/Trash", trashRoot("", "/home/u", &buf).?);
+    try std.testing.expect(trashRoot(null, null, &buf) == null);
+    try std.testing.expectEqualStrings("/d/Trash/files", trashFilesDir("/d", null, &buf).?);
+}
+
 /// This host's template directory: `XDG_TEMPLATES_DIR` when
 /// user-dirs.dirs sets it, else `$HOME/Templates`. The directory need
 /// not exist; the caller lists it and reports an empty menu.
@@ -1037,7 +1072,6 @@ pub const EventIter = struct {
 };
 
 // ── tests ───────────────────────────────────────────────────────
-
 
 fn touch(dir: []const u8, name: []const u8, content: []const u8) !void {
     var z: [4096]u8 = undefined;

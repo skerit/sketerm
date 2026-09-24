@@ -642,8 +642,8 @@ fn startCopy(fs: *fsdrive.Fs, args: std.json.Value) JobStart {
         .exists => return .{ .exists = dst },
         .unknown => return .{ .failed = fsdrive.Error.FsOpFailed },
     };
-    if (guard == .atomic) return .of(fs.startCopyMode(src, dst, .{ .no_replace = true }));
-    return .of(fs.startCopy(src, dst, resumable));
+    if (guard == .atomic) return .of(fs.startCopy(src, dst, .{ .no_replace = true }));
+    return .of(fs.startCopy(src, dst, .{ .resumable = resumable }));
 }
 
 fn startDeleteTree(fs: *fsdrive.Fs, args: std.json.Value) JobStart {

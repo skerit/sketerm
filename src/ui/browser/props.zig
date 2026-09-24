@@ -139,7 +139,7 @@ pub fn feedProbes(self: *BrowserView, hc: *HostConn, ftype: wire.FrameType, payl
                         renderMediaFields(probe, ev);
                         return true;
                     }
-                    if (ev.terminalEv()) {
+                    if (ev.terminal()) {
                         if (!done or c.gtk_widget_get_first_child(probe.label) == null)
                             setProbeText(probe.*, if (done) "no metadata found" else "unavailable");
                         self.endProbe(i);
@@ -147,7 +147,7 @@ pub fn feedProbes(self: *BrowserView, hc: *HostConn, ftype: wire.FrameType, payl
                     return true;
                 }
                 if (!done and !std.mem.eql(u8, ev.ev, "progress")) {
-                    if (ev.terminalEv()) {
+                    if (ev.terminal()) {
                         setProbeText(probe.*, "unavailable");
                         self.endProbe(i);
                     }

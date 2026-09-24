@@ -408,7 +408,7 @@ pub fn queryConsumeEvent(self: *BrowserView, hc: *HostConn, e: WireJobEv) bool {
         self.setStatus("live query watcher overflowed; reopen the query to resync");
         return true;
     }
-    if (e.terminalEv()) {
+    if (e.terminal()) {
         tab.root.loaded = true;
         tq.ended = true;
         if (std.mem.eql(u8, e.ev, "done")) {

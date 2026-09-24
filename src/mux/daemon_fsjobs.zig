@@ -249,7 +249,7 @@ fn restartFsJobFromJournal(self: *Daemon, cl: *Client, existing: *FsJob, client_
     const parsed = fsjournal.load(arena.allocator(), path) catch return null;
     defer parsed.deinit();
     const rec = parsed.value;
-    const op = fsOpFromName(rec.op) orelse return null;
+    const op = jobOpFor(rec.op) orelse return null;
     const replacement = spawnFsJob(self, cl, op, rec.id, .{
         .src = rec.src,
         .dst = rec.dst,
@@ -526,13 +526,6 @@ pub fn spawnFsJob(self: *Daemon, owner: ?*Client, op: FsJob.Op, id: u64, args: F
     }
     job_owned = false;
     return job;
-}
-
-pub fn fsOpFromName(name: []const u8) ?FsJob.Op {
-    inline for (std.meta.fields(FsJob.Op)) |field| {
-        if (std.mem.eql(u8, name, field.name)) return @enumFromInt(field.value);
-    }
-    return null;
 }
 
 fn moveHelperOwnsJournal(job: *const FsJob) bool {
@@ -867,7 +860,7 @@ pub fn restoreFsJobs(self: *Daemon) void {
         const parsed = fsjournal.load(arena_state.allocator(), path) catch continue;
         defer parsed.deinit();
         const rec = parsed.value;
-        const op = fsOpFromName(rec.op) orelse continue;
+        const op = jobOpFor(rec.op) orelse continue;
         self.next_fs_job_id = @max(self.next_fs_job_id, rec.id +| 1);
         const state: FsJob.State = if (std.mem.eql(u8, rec.state, "done"))
             .done

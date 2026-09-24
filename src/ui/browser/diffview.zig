@@ -88,7 +88,7 @@ pub fn feedDiff(self: *BrowserView, hc: *HostConn, ftype: wire.FrameType, payloa
                 }
                 return true;
             }
-            if (ev.terminalEv()) {
+            if (ev.terminal()) {
                 st.job = 0;
                 st.hc = null;
                 if (std.mem.eql(u8, ev.ev, "done")) {

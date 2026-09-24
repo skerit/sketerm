@@ -92,69 +92,16 @@ pub fn extensionOf(name: []const u8) []const u8 {
     return name[dot + 1 ..];
 }
 
-/// Wire mirror of the fs_reply fields the browser consumes.
-pub const WireEntry = struct {
-    name: []const u8 = "",
-    kind: []const u8 = "",
-    size: u64 = 0,
-    mode: u32 = 0,
-    mtime_ms: i64 = 0,
-    atime_ms: i64 = 0,
-    ctime_ms: i64 = 0,
-    uid: u32 = 0,
-    gid: u32 = 0,
-    owner: []const u8 = "",
-    group: []const u8 = "",
-    btime_ms: i64 = 0,
-    nlink: u64 = 1,
-    blocks: u64 = 0,
-    children: i64 = -1,
-    target: ?[]const u8 = null,
-    tdir: bool = false,
-    tags: []const u8 = "",
-    attrs: []const []const u8 = &.{},
-};
-
-pub const WireReply = struct {
-    req: u32 = 0,
-    ok: bool = false,
-    @"error": []const u8 = "",
-    kind: []const u8 = "",
-    path: []const u8 = "",
-    entries: []WireEntry = &.{},
-    /// `stat` answers with ONE entry rather than a listing.
-    entry: ?WireEntry = null,
-    /// Device id of a listed directory: the hard-link pre-check.
-    dev: u64 = 0,
-    more: bool = false,
-    truncated: bool = false,
-    /// This live view holds NO filesystem watch, because the host ran
-    /// out of watch capacity (kqueue descriptors, inotify slots). The
-    /// rows are real; nothing will update them.
-    watch_limit: bool = false,
-    job: u64 = 0,
-    state: []const u8 = "",
-    done: u64 = 0,
-    total: u64 = 0,
-    resumed_from: u64 = 0,
-    file: []const u8 = "",
-    files_done: u64 = 0,
-    files_total: u64 = 0,
-    size: u64 = 0,
-    eof: bool = false,
-    apps: []WireApp = &.{},
-    home: []const u8 = "",
-    cache: []const u8 = "",
-    /// The HOST's freedesktop template directory (XDG_TEMPLATES_DIR),
-    /// resolved by the daemon that owns the files.
-    templates: []const u8 = "",
-    /// The HOST's existing freedesktop user directories (Downloads,
-    /// Pictures, ...) for the sidebar; same `homedir` reply.
-    dirs: []WireUserDir = &.{},
-    /// statfs: free space = bavail * frsize.
-    bavail: u64 = 0,
-    frsize: u64 = 0,
-};
+/// The fs wire shapes are declared ONCE, in fsdrive: the same daemon
+/// answers the browser, the MCP server and the smoke rigs, so the
+/// browser reads the shared structs rather than keeping mirrors that
+/// could drift from them.
+pub const WireEntry = fsdrive.Entry;
+pub const WireReply = fsdrive.Reply;
+pub const WireUserDir = fsdrive.WireUserDir;
+pub const WireApp = fsdrive.WireApp;
+pub const WireDelta = fsdrive.DeltaWire;
+pub const WireJobEv = fsdrive.JobEventWire;
 
 test "filesystem refusal keeps its structured failure kind" {
     const parsed = try std.json.parseFromSlice(WireReply, std.testing.allocator,
@@ -173,106 +120,10 @@ test "a watch-limited listing reply reaches the browser as such" {
     try std.testing.expect(parsed.value.watch_limit);
 }
 
-pub const WireUserDir = struct {
-    label: []const u8 = "",
-    path: []const u8 = "",
-};
-
 /// A host's user directory as the sidebar keeps it (both slices owned).
 pub const UserDirEntry = struct {
     label: []u8,
     path: []u8,
-};
-
-/// One host-side application (daemon `apps` op reply).
-pub const WireApp = struct {
-    name: []const u8 = "",
-    exec: []const u8 = "",
-    mimes: []const u8 = "",
-};
-
-pub const WireDelta = struct {
-    view: u32 = 0,
-    gone: bool = false,
-    resync: bool = false,
-    changes: []struct {
-        op: []const u8 = "",
-        name: []const u8 = "",
-        entry: ?WireEntry = null,
-    } = &.{},
-};
-
-pub const WireJobEv = struct {
-    job: u64 = 0,
-    ev: []const u8 = "",
-    state: []const u8 = "",
-    done: u64 = 0,
-    total: u64 = 0,
-    message: []const u8 = "",
-    path: []const u8 = "",
-    line: u64 = 0,
-    text: []const u8 = "",
-    kind: []const u8 = "",
-    size: u64 = 0,
-    /// disk_usage keeps logical and filesystem-allocated bytes
-    /// separate; `size` remains apparent bytes.
-    allocated: u64 = 0,
-    items: u64 = 0,
-    errors: u64 = 0,
-    skipped: u64 = 0,
-    mtime_ms: i64 = 0,
-    /// Permission bits of a match (find/live/panelize rows), so a
-    /// result row shows them like a listing row does.
-    mode: u32 = 0,
-    matches: u64 = 0,
-    truncated: bool = false,
-    /// done: `path` is a persistent host-side cache file — the
-    /// consumer must NOT unlink it after reading.
-    keep: bool = false,
-    /// Live-query status detail (ev == "ready").
-    watches: u64 = 0,
-    watch_limit: bool = false,
-    /// panelize: output lines that named nothing on disk, and the
-    /// command's own exit status (both on the done event).
-    rejected: u64 = 0,
-    exit_status: i64 = 0,
-    hash: []const u8 = "",
-    /// Bytes a staged partial contributed. Sticky: the helper reports
-    /// it once and the daemon repeats it on every later event.
-    resumed_from: u64 = 0,
-    /// media_meta match payload: one file's extracted fields, plus
-    /// whether the host served them from its own cache.
-    meta: []const fsdrive.MediaField = &.{},
-    cached: bool = false,
-    /// The entry the job is working on right now, and how far through
-    /// its entry count it is (tree operations; 0 total = not counted).
-    file: []const u8 = "",
-    files_done: u64 = 0,
-    files_total: u64 = 0,
-    /// git_status match detail: the two porcelain-v2 columns and a
-    /// rename/copy source. Empty from a daemon too old to send them,
-    /// which is exactly what makes `text` still load-bearing.
-    xy: []const u8 = "",
-    orig: []const u8 = "",
-    /// git_status `repo` event: the branch header of the browsed root,
-    /// and the only way to tell a clean repository from a directory
-    /// that is no repository at all.
-    repo: bool = false,
-    branch: []const u8 = "",
-    upstream: []const u8 = "",
-    ahead: i64 = 0,
-    behind: i64 = 0,
-    have_ab: bool = false,
-    detached: bool = false,
-    initial: bool = false,
-    root: bool = false,
-
-    /// True for the events that end a job.
-    pub fn terminalEv(self: WireJobEv) bool {
-        return std.mem.eql(u8, self.ev, "done") or
-            std.mem.eql(u8, self.ev, "error") or
-            std.mem.eql(u8, self.ev, "canceled");
-    }
 };
 
 /// One shared connection to a host's daemon. Referenced by tabs and

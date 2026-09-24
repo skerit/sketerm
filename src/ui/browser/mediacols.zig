@@ -617,7 +617,7 @@ pub fn feed(self: *BrowserView, hc: *HostConn, ftype: wire.FrameType, payload: [
                 store(self, ev);
                 return true;
             }
-            if (ev.terminalEv()) {
+            if (ev.terminal()) {
                 const completed = std.mem.eql(u8, ev.ev, "done");
                 finishBatch(self, completed);
                 if (self.currentTab()) |tab| {

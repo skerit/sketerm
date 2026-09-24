@@ -27,6 +27,7 @@ const c = @import("../c.zig").c;
 const client = @import("../mux/client.zig");
 const wire = @import("../mux/wire.zig");
 const fsserve = @import("../mux/fsserve.zig");
+const fsjob = @import("../mux/fsjob.zig");
 const errorPhrase = @import("../filebrowser/format.zig").errorPhrase;
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -166,7 +167,7 @@ pub const Transfer = struct {
         errdefer allocator.free(sp);
         const dp = try allocator.dupe(u8, dst_path);
         errdefer allocator.free(dp);
-        const st = try std.fmt.allocPrint(allocator, "{s}.skpart", .{dst_path});
+        const st = try std.fmt.allocPrint(allocator, "{s}" ++ fsjob.PART_SUFFIX, .{dst_path});
         self.* = .{
             .allocator = allocator,
             .src = src,

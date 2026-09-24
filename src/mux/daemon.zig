@@ -2245,7 +2245,8 @@ pub const FsView = struct {
 pub const DebugJob = @import("daemon_debug.zig").DebugJob;
 
 pub const FsJob = struct {
-    pub const Op = enum { copy, delete_tree, hash, find, grep, extract, archive_create, archive_list, archive_extract, trash, trash_restore, cross_copy, panelize, live_find, thumbnail, preview, dir_size, perm_tree, media_meta, preview_transport, preview_stream, git_status, diff, split, combine, secure_delete, git_diff, disk_usage };
+    /// The job verb vocabulary lives with the helper that runs it.
+    pub const Op = @import("fsjob.zig").Op;
 
     /// Ops whose result is a daemon-owned scratch file (the `asset`
     /// path) that is unlinked when the job is dropped -- the ONE list
@@ -3437,7 +3438,6 @@ pub const Daemon = struct {
     const CopyArgs = daemon_fsjobs.CopyArgs;
     const FsJobArgs = daemon_fsjobs.FsJobArgs;
     const spawnFsJob = daemon_fsjobs.spawnFsJob;
-    const fsOpFromName = daemon_fsjobs.fsOpFromName;
     const journalFsJob = daemon_fsjobs.journalFsJob;
     const saveFsJob = daemon_fsjobs.saveFsJob;
     const deleteFsJobJournal = daemon_fsjobs.deleteFsJobJournal;

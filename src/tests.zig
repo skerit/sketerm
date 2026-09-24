@@ -264,6 +264,7 @@ comptime {
     _ = @import("mux/fsserve.zig");
     _ = @import("mux/disk_usage.zig");
     _ = @import("mux/fsjob.zig");
+    _ = @import("mux/crosscopy.zig");
     _ = @import("mux/mediameta.zig");
     _ = @import("mux/mediameta_test.zig");
     _ = @import("mux/fsjournal.zig");

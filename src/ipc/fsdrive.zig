@@ -85,6 +85,15 @@ pub const Listing = struct {
     }
 };
 
+/// The `fs_delta` frame as the daemon writes it: THE declaring home of
+/// that shape, parsed by every client (the browser included).
+pub const DeltaWire = struct {
+    view: u32 = 0,
+    gone: bool = false,
+    resync: bool = false,
+    changes: []Delta.Change = &.{},
+};
+
 /// One pushed view delta. Owned by its arena; free via deinit.
 pub const Delta = struct {
     arena: std.heap.ArenaAllocator,
@@ -179,32 +188,76 @@ pub const JobRow = struct {
 
 /// Superset JSON shape of every fs_reply; absent fields keep their
 /// defaults, unknown (future) fields are ignored.
-const Reply = struct {
+/// One host-side application (the `apps` op).
+pub const WireApp = struct {
+    name: []const u8 = "",
+    exec: []const u8 = "",
+    mimes: []const u8 = "",
+};
+
+/// One freedesktop user directory the host reports (`homedir`).
+pub const WireUserDir = struct {
+    label: []const u8 = "",
+    path: []const u8 = "",
+};
+
+/// The `fs_reply` frame: THE declaring home of every field any client
+/// reads from it. Every op answers with a subset; the rest keep their
+/// defaults, so one struct serves listings, stats, job starts, host
+/// identities and statfs alike.
+pub const Reply = struct {
     req: u32 = 0,
     ok: bool = false,
     @"error": []const u8 = "",
+    /// Failure class of a refusal: only "transport"/"unreachable" earn
+    /// automatic retries.
+    kind: []const u8 = "",
     path: []const u8 = "",
     entries: []Entry = &.{},
     more: bool = false,
     truncated: bool = false,
+    /// This live view holds NO filesystem watch, because the host ran
+    /// out of watch capacity (kqueue descriptors, inotify slots). The
+    /// rows are real; nothing will update them.
     watch_limit: bool = false,
+    /// `stat` answers with ONE entry rather than a listing.
     entry: ?Entry = null,
     size: u64 = 0,
     eof: bool = false,
     written: u64 = 0,
     job: u64 = 0,
+    /// A job start echoes the job's current progress (a restarted job
+    /// is already under way).
+    state: []const u8 = "",
+    done: u64 = 0,
+    total: u64 = 0,
+    resumed_from: u64 = 0,
+    file: []const u8 = "",
+    files_done: u64 = 0,
+    files_total: u64 = 0,
     jobs: []JobRow = &.{},
+    apps: []WireApp = &.{},
     bsize: u64 = 0,
     frsize: u64 = 0,
     blocks: u64 = 0,
     bfree: u64 = 0,
+    /// statfs: free space = bavail * frsize.
     bavail: u64 = 0,
     files: u64 = 0,
     ffree: u64 = 0,
     namemax: u64 = 255,
     home: []const u8 = "",
     cache: []const u8 = "",
+    /// The HOST's freedesktop template directory (XDG_TEMPLATES_DIR),
+    /// resolved by the daemon that owns the files.
     templates: []const u8 = "",
+    /// The HOST's home trash `files` directory (same reply); empty
+    /// from a daemon too old to report it.
+    trash: []const u8 = "",
+    /// The HOST's existing freedesktop user directories (Downloads,
+    /// Pictures, ...) for the sidebar; same `homedir` reply.
+    dirs: []WireUserDir = &.{},
+    /// Device id of a listed directory: the hard-link pre-check.
     dev: u64 = 0,
     mtime_ns: i64 = 0,
     ino: u64 = 0,
@@ -216,6 +269,8 @@ pub const HostDirs = struct {
     home: []const u8 = "",
     cache: []const u8 = "",
     templates: []const u8 = "",
+    /// Home trash `files` directory; "" from a daemon that predates it.
+    trash: []const u8 = "",
 };
 
 // ── batched media metadata ──────────────────────────────────────
@@ -251,6 +306,72 @@ pub const MediaResult = struct {
         return null;
     }
 };
+
+/// The `fs_job` frame as the daemon writes it: THE declaring home of
+/// a job event's shape. `JobEvent` is this plus an owning arena, and a
+/// comptime check below keeps the two field sets identical.
+pub const JobEventWire = struct {
+    job: u64 = 0,
+    ev: []const u8 = "",
+    state: []const u8 = "",
+    done: u64 = 0,
+    total: u64 = 0,
+    resumed_from: u64 = 0,
+    hash: []const u8 = "",
+    message: []const u8 = "",
+    path: []const u8 = "",
+    line: u64 = 0,
+    text: []const u8 = "",
+    kind: []const u8 = "",
+    size: u64 = 0,
+    allocated: u64 = 0,
+    items: u64 = 0,
+    errors: u64 = 0,
+    skipped: u64 = 0,
+    mtime_ms: i64 = 0,
+    mode: u32 = 0,
+    matches: u64 = 0,
+    truncated: bool = false,
+    watches: u64 = 0,
+    watch_limit: bool = false,
+    rejected: u64 = 0,
+    exit_status: i64 = 0,
+    duration_ms: u64 = 0,
+    encoder: []const u8 = "",
+    file: []const u8 = "",
+    files_done: u64 = 0,
+    files_total: u64 = 0,
+    meta: []const MediaField = &.{},
+    cached: bool = false,
+    keep: bool = false,
+    xy: []const u8 = "",
+    orig: []const u8 = "",
+    repo: bool = false,
+    tracked: bool = false,
+    branch: []const u8 = "",
+    upstream: []const u8 = "",
+    ahead: i64 = 0,
+    behind: i64 = 0,
+    have_ab: bool = false,
+    detached: bool = false,
+    initial: bool = false,
+    root: bool = false,
+
+    /// True for the events that end a job.
+    pub fn terminal(self: *const JobEventWire) bool {
+        return std.mem.eql(u8, self.ev, "done") or std.mem.eql(u8, self.ev, "error") or
+            std.mem.eql(u8, self.ev, "canceled");
+    }
+};
+
+comptime {
+    for (std.meta.fields(JobEventWire)) |f| {
+        if (!@hasField(JobEvent, f.name)) @compileError("JobEvent lacks wire field " ++ f.name);
+        if (@FieldType(JobEvent, f.name) != f.type) @compileError("JobEvent field type drifted from the wire: " ++ f.name);
+    }
+    if (std.meta.fields(JobEvent).len != std.meta.fields(JobEventWire).len + 1)
+        @compileError("JobEvent carries a field the wire shape does not declare");
+}
 
 /// One pushed fs_job event, arena-owned.
 pub const JobEvent = struct {
@@ -443,15 +564,9 @@ pub const Fs = struct {
     fn stashDelta(self: *Fs, payload: []const u8) void {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         const a = arena.allocator();
-        const Wire = struct {
-            view: u32 = 0,
-            gone: bool = false,
-            resync: bool = false,
-            changes: []Delta.Change = &.{},
-        };
         // alloc_always: the frame payload dies with the caller's scope —
         // parsed strings must never alias it.
-        const parsed = std.json.parseFromSliceLeaky(Wire, a, payload, .{
+        const parsed = std.json.parseFromSliceLeaky(DeltaWire, a, payload, .{
             .ignore_unknown_fields = true,
             .allocate = .alloc_always,
         }) catch {
@@ -469,108 +584,16 @@ pub const Fs = struct {
 
     fn stashJobEvent(self: *Fs, payload: []const u8) void {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
-        const Wire = struct {
-            job: u64 = 0,
-            ev: []const u8 = "",
-            state: []const u8 = "",
-            done: u64 = 0,
-            total: u64 = 0,
-            resumed_from: u64 = 0,
-            hash: []const u8 = "",
-            message: []const u8 = "",
-            path: []const u8 = "",
-            line: u64 = 0,
-            text: []const u8 = "",
-            kind: []const u8 = "",
-            size: u64 = 0,
-            allocated: u64 = 0,
-            items: u64 = 0,
-            errors: u64 = 0,
-            skipped: u64 = 0,
-            mtime_ms: i64 = 0,
-            mode: u32 = 0,
-            matches: u64 = 0,
-            truncated: bool = false,
-            watches: u64 = 0,
-            watch_limit: bool = false,
-            rejected: u64 = 0,
-            exit_status: i64 = 0,
-            duration_ms: u64 = 0,
-            encoder: []const u8 = "",
-            file: []const u8 = "",
-            files_done: u64 = 0,
-            files_total: u64 = 0,
-            meta: []const MediaField = &.{},
-            cached: bool = false,
-            keep: bool = false,
-            xy: []const u8 = "",
-            orig: []const u8 = "",
-            repo: bool = false,
-            tracked: bool = false,
-            branch: []const u8 = "",
-            upstream: []const u8 = "",
-            ahead: i64 = 0,
-            behind: i64 = 0,
-            have_ab: bool = false,
-            detached: bool = false,
-            initial: bool = false,
-            root: bool = false,
-        };
-        const parsed = std.json.parseFromSliceLeaky(Wire, arena.allocator(), payload, .{
+        const parsed = std.json.parseFromSliceLeaky(JobEventWire, arena.allocator(), payload, .{
             .ignore_unknown_fields = true,
             .allocate = .alloc_always,
         }) catch {
             arena.deinit();
             return;
         };
-        self.job_events.append(self.allocator, .{
-            .arena = arena,
-            .job = parsed.job,
-            .ev = parsed.ev,
-            .state = parsed.state,
-            .done = parsed.done,
-            .total = parsed.total,
-            .resumed_from = parsed.resumed_from,
-            .hash = parsed.hash,
-            .message = parsed.message,
-            .path = parsed.path,
-            .line = parsed.line,
-            .text = parsed.text,
-            .kind = parsed.kind,
-            .size = parsed.size,
-            .allocated = parsed.allocated,
-            .items = parsed.items,
-            .errors = parsed.errors,
-            .skipped = parsed.skipped,
-            .mtime_ms = parsed.mtime_ms,
-            .mode = parsed.mode,
-            .matches = parsed.matches,
-            .truncated = parsed.truncated,
-            .watches = parsed.watches,
-            .watch_limit = parsed.watch_limit,
-            .rejected = parsed.rejected,
-            .exit_status = parsed.exit_status,
-            .duration_ms = parsed.duration_ms,
-            .encoder = parsed.encoder,
-            .file = parsed.file,
-            .files_done = parsed.files_done,
-            .files_total = parsed.files_total,
-            .meta = parsed.meta,
-            .cached = parsed.cached,
-            .keep = parsed.keep,
-            .xy = parsed.xy,
-            .orig = parsed.orig,
-            .repo = parsed.repo,
-            .tracked = parsed.tracked,
-            .branch = parsed.branch,
-            .upstream = parsed.upstream,
-            .ahead = parsed.ahead,
-            .behind = parsed.behind,
-            .have_ab = parsed.have_ab,
-            .detached = parsed.detached,
-            .initial = parsed.initial,
-            .root = parsed.root,
-        }) catch arena.deinit();
+        var ev: JobEvent = .{ .arena = arena };
+        inline for (std.meta.fields(JobEventWire)) |f| @field(ev, f.name) = @field(parsed, f.name);
+        self.job_events.append(self.allocator, ev) catch arena.deinit();
     }
 
     /// Route any pushed frame to its stash. Every receive loop calls
@@ -992,6 +1015,7 @@ pub const Fs = struct {
             .home = arena.dupe(u8, rep.home) catch return Error.OutOfMemory,
             .cache = arena.dupe(u8, rep.cache) catch return Error.OutOfMemory,
             .templates = arena.dupe(u8, rep.templates) catch return Error.OutOfMemory,
+            .trash = arena.dupe(u8, rep.trash) catch return Error.OutOfMemory,
         };
     }
 
@@ -1347,41 +1371,34 @@ pub const Fs = struct {
         return rep.job;
     }
 
-    /// Start a copy job (file or tree). `resumable` allows continuing
-    /// a previous interrupted copy's hash-verified partial.
-    pub fn startCopy(self: *Fs, src: []const u8, dst: []const u8, resumable: bool) Error!u64 {
-        return self.startJob("copy", .{ .path = src, .to = dst, .@"resume" = resumable });
-    }
-
-    pub fn startCopyToken(self: *Fs, src: []const u8, dst: []const u8, resumable: bool, client_token: []const u8) Error!u64 {
-        return self.startJob("copy", .{ .path = src, .to = dst, .@"resume" = resumable, .client_token = client_token });
-    }
-
-    pub fn startCopyTokenMode(self: *Fs, src: []const u8, dst: []const u8, resumable: bool, client_token: []const u8, mode: CopyMode) Error!u64 {
-        if (mode.no_replace and !self.conn.copy_no_replace) return Error.BadRequest;
-        return self.startJob("copy", .{
-            .path = src,
-            .to = dst,
-            .@"resume" = resumable,
-            .client_token = client_token,
-            .conflict = mode.conflict,
-            .dir_mode = mode.dir_mode,
-            .no_replace = mode.no_replace,
-        });
-    }
-
-    /// How a copy resolves names that already exist at the
-    /// destination. `dir_mode` applies to the top-level directory
-    /// only; `conflict` governs every entry inside the tree.
-    pub const CopyMode = struct {
+    /// Everything a same-host copy job can be asked for. `dir_mode`
+    /// applies to the top-level directory only; `conflict` governs
+    /// every entry inside the tree; `resumable` continues a previous
+    /// interrupted copy's hash-verified partial; reusing
+    /// `client_token` claims the original job instead of starting a
+    /// duplicate.
+    pub const CopyOpts = struct {
+        resumable: bool = false,
+        client_token: []const u8 = "",
         conflict: []const u8 = "",
         dir_mode: []const u8 = "",
         no_replace: bool = false,
     };
 
-    pub fn startCopyMode(self: *Fs, src: []const u8, dst: []const u8, mode: CopyMode) Error!u64 {
-        if (mode.no_replace and !self.conn.copy_no_replace) return Error.BadRequest;
-        return self.startJob("copy", .{ .path = src, .to = dst, .conflict = mode.conflict, .dir_mode = mode.dir_mode, .no_replace = mode.no_replace });
+    /// Start a copy job (file or tree). `no_replace` is refused
+    /// client-side against a daemon that did not announce it, because
+    /// such a daemon would silently run the weaker semantics.
+    pub fn startCopy(self: *Fs, src: []const u8, dst: []const u8, opts: CopyOpts) Error!u64 {
+        if (opts.no_replace and !self.conn.copy_no_replace) return Error.BadRequest;
+        return self.startJob("copy", .{
+            .path = src,
+            .to = dst,
+            .@"resume" = opts.resumable,
+            .client_token = opts.client_token,
+            .conflict = opts.conflict,
+            .dir_mode = opts.dir_mode,
+            .no_replace = opts.no_replace,
+        });
     }
 
     pub fn startDeleteTree(self: *Fs, path: []const u8) Error!u64 {
@@ -1614,10 +1631,6 @@ pub const Fs = struct {
         }
     }
 
-    pub fn startThumbnail(self: *Fs, path: []const u8) Error!u64 {
-        return self.startJob("thumbnail", .{ .path = path });
-    }
-
     pub fn startPreview(self: *Fs, path: []const u8) Error!u64 {
         return self.startJob("preview", .{ .path = path });
     }
@@ -1683,35 +1696,29 @@ pub const Fs = struct {
         return self.startJob("trash_restore", .{ .path = trashed, .to = original, .pattern = info_path });
     }
 
+    /// Everything a cross-host copy job can be asked for. Reusing
+    /// `client_token` claims the original job instead of starting a
+    /// duplicate; `transfer_token` is the stable per-transfer identity
+    /// that survives attempt boundaries (see sendOp.transfer_token).
+    pub const CrossOpts = struct {
+        resumable: bool = false,
+        client_token: []const u8 = "",
+        /// Delete the verified source afterwards — a move.
+        delete_src: bool = false,
+        no_replace: bool = false,
+        /// Cap the initial dial attempts per side (0 = full budget).
+        dial_tries: u32 = 0,
+        transfer_token: []const u8 = "",
+    };
+
+    /// Start a cross-host copy job on this daemon as the coordinator.
+    /// Host strings are coordinator-relative ("" = its own disk).
     pub fn startCrossCopy(
         self: *Fs,
         src_host: []const u8,
         src: []const u8,
         dst_host: []const u8,
         dst: []const u8,
-        resumable: bool,
-    ) Error!u64 {
-        return self.startCrossCopyOpts(src_host, src, dst_host, dst, resumable, .{});
-    }
-
-    pub const CrossOpts = struct {
-        /// Delete the verified source afterwards — a move.
-        delete_src: bool = false,
-        no_replace: bool = false,
-        /// Cap the initial dial attempts per side (0 = full budget).
-        dial_tries: u32 = 0,
-        /// Stable per-transfer identity that survives attempt
-        /// boundaries (see sendOp.transfer_token).
-        transfer_token: []const u8 = "",
-    };
-
-    pub fn startCrossCopyOpts(
-        self: *Fs,
-        src_host: []const u8,
-        src: []const u8,
-        dst_host: []const u8,
-        dst: []const u8,
-        resumable: bool,
         opts: CrossOpts,
     ) Error!u64 {
         if (opts.no_replace and !self.conn.copy_no_replace) return Error.BadRequest;
@@ -1720,53 +1727,8 @@ pub const Fs = struct {
             .to = dst,
             .src_host = src_host,
             .dst_host = dst_host,
-            .@"resume" = resumable,
-            .transfer_token = opts.transfer_token,
-            .delete_src = opts.delete_src,
-            .no_replace = opts.no_replace,
-            .dial_tries = opts.dial_tries,
-        });
-    }
-
-    /// Idempotent durable copy. Reusing `client_token` returns and
-    /// claims the original job instead of starting a duplicate.
-    pub fn startCrossCopyToken(
-        self: *Fs,
-        src_host: []const u8,
-        src: []const u8,
-        dst_host: []const u8,
-        dst: []const u8,
-        resumable: bool,
-        client_token: []const u8,
-    ) Error!u64 {
-        return self.startJob("cross_copy", .{
-            .path = src,
-            .to = dst,
-            .src_host = src_host,
-            .dst_host = dst_host,
-            .@"resume" = resumable,
-            .client_token = client_token,
-        });
-    }
-
-    pub fn startCrossCopyTokenOpts(
-        self: *Fs,
-        src_host: []const u8,
-        src: []const u8,
-        dst_host: []const u8,
-        dst: []const u8,
-        resumable: bool,
-        client_token: []const u8,
-        opts: CrossOpts,
-    ) Error!u64 {
-        if (opts.no_replace and !self.conn.copy_no_replace) return Error.BadRequest;
-        return self.startJob("cross_copy", .{
-            .path = src,
-            .to = dst,
-            .src_host = src_host,
-            .dst_host = dst_host,
-            .@"resume" = resumable,
-            .client_token = client_token,
+            .@"resume" = opts.resumable,
+            .client_token = opts.client_token,
             .transfer_token = opts.transfer_token,
             .delete_src = opts.delete_src,
             .no_replace = opts.no_replace,

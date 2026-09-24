@@ -248,7 +248,7 @@ pub fn feedGit(self: *BrowserView, hc: *HostConn, ftype: wire.FrameType, payload
                 });
                 return true;
             }
-            if (ev.terminalEv()) {
+            if (ev.terminal()) {
                 self.git_rjob = 0;
                 self.git_rhc = null;
                 notePollCost(self);
