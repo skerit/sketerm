@@ -190,7 +190,7 @@ const Guard = enum { overwrite, atomic, checked };
 /// destination already exists (or cannot be checked).
 fn guardFor(fs: *fsdrive.Fs, args: std.json.Value, dst: []const u8) union(enum) { guard: Guard, exists, unknown } {
     if (argBool(args, "overwrite")) return .{ .guard = .overwrite };
-    if (fs.conn.copy_no_replace) return .{ .guard = .atomic };
+    if (fs.conn.caps.copy_no_replace) return .{ .guard = .atomic };
     return switch (pathExists(fs, dst) orelse return .unknown) {
         true => .exists,
         false => .{ .guard = .checked },

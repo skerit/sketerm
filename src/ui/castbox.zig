@@ -95,7 +95,7 @@ pub const CastPlayerBox = struct {
         var conn = connectFor(allocator, loc.host, log_prefix) orelse return error.ConnectFailed;
         var conn_owned = true;
         errdefer if (conn_owned) conn.deinit();
-        if (!conn.cast_playback) {
+        if (!conn.caps.cast_playback) {
             _ = c.fprintf(platform.stderr(), "%s: the daemon is too old for cast playback (update sketerm-mux%s)\n", log_prefix, @as([*:0]const u8, if (loc.host != null) " on the remote host" else ""));
             return error.DaemonTooOld;
         }

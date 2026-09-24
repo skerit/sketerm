@@ -1092,9 +1092,9 @@ pub const TransferOpts = struct {
 /// which for a MOVE must itself advertise cross_move.
 fn coordinatorSupports(hc: *HostConn, move: bool, no_replace: bool) bool {
     const link = hc.io();
-    return hc.state == .ready and link.durable_copy and link.durable_copy_v2 and
-        (!move or link.cross_move) and
-        (!no_replace or link.copy_no_replace);
+    return hc.state == .ready and link.caps.durable_copy and link.caps.durable_copy_v2 and
+        (!move or link.caps.cross_move) and
+        (!no_replace or link.caps.copy_no_replace);
 }
 
 test "durable coordinator requires install and cancellation election support" {
@@ -1109,13 +1109,15 @@ test "durable coordinator requires install and cancellation election support" {
         .conn = .{
             .allocator = std.testing.allocator,
             .fd = -1,
-            .durable_copy = true,
-            .cross_move = true,
-            .copy_no_replace = true,
+            .caps = .{
+                .durable_copy = true,
+                .cross_move = true,
+                .copy_no_replace = true,
+            },
         },
     };
     try std.testing.expect(!coordinatorSupports(&hc, false, false));
-    hc.conn.durable_copy_v2 = true;
+    hc.conn.caps.durable_copy_v2 = true;
     try std.testing.expect(coordinatorSupports(&hc, false, false));
     try std.testing.expect(coordinatorSupports(&hc, true, true));
 }
@@ -1405,7 +1407,7 @@ fn startTransferImpl(
         deferTransfer(self, src_hc, src_path, dst_hc, dst_path, opts, user_token, initial_coordinator, false);
         return;
     }
-    if (opts.no_replace and !dst_hc.io().copy_no_replace) {
+    if (opts.no_replace and !dst_hc.io().caps.copy_no_replace) {
         self.setStatusFmt("transfer not queued: {s} lacks safe no-replace support", .{dst_hc.label()});
         if (user_token) |token| if (self.transfer_service) |service| service.abandonMediated(token);
         return;
@@ -2083,7 +2085,7 @@ pub fn startDaemonJobUndo(self: *BrowserView, hc: *HostConn, comptime op: []cons
         if (undo) |u| u.destroy(self.allocator);
         return false;
     }
-    if (mode.no_replace and !hc.io().copy_no_replace) {
+    if (mode.no_replace and !hc.io().caps.copy_no_replace) {
         self.setStatusFmt("operation not queued: {s} lacks safe no-replace support", .{hc.label()});
         if (undo) |u| u.destroy(self.allocator);
         return false;
@@ -2141,7 +2143,7 @@ pub fn verifyCopies(self: *BrowserView) bool {
 }
 
 pub fn startHistoryJob(self: *BrowserView, hc: *HostConn, op_name: []const u8, path: []const u8, to: []const u8, pattern: []const u8, label: []const u8, op: *UndoOp, direction: HistoryDirection, no_replace: bool) void {
-    if (no_replace and !hc.io().copy_no_replace) {
+    if (no_replace and !hc.io().caps.copy_no_replace) {
         self.setStatusFmt("history operation retained: {s} lacks safe no-replace support", .{hc.label()});
         return self.restoreHistory(op, direction);
     }

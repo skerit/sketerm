@@ -672,7 +672,7 @@ pub const App = struct {
             setStepErr("hello handshake", &conn, err);
             return Error.SpawnFailed;
         }).deinit(allocator);
-        if (!conn.kill_origin_fence) {
+        if (!conn.caps.kill_origin_fence) {
             setLaunchErr("spawn: daemon does not support lifetime-fenced cleanup", .{});
             return Error.SpawnFailed;
         }

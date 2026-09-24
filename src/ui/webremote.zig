@@ -205,11 +205,11 @@ pub const Bridge = struct {
         })) return;
         defer self.cancel.release();
         if (self.connect_mode) {
-            if (!self.conn.web_helper_connect) {
+            if (!self.conn.caps.web_helper_connect) {
                 self.failWith("The daemon on that host is too old to watch an assistant's browser (no web_helper_connect capability).");
                 return;
             }
-        } else if (!self.conn.web_helper) {
+        } else if (!self.conn.caps.web_helper) {
             self.failWith("The daemon on that host is too old for remote browsing (no web_helper capability).");
             return;
         }

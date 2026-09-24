@@ -34,7 +34,7 @@ const DrainHandle = @import("../terminal.zig").DrainHandle;
 /// the service, and its absence costs at most a week of daemons the
 /// older listing window instead.
 pub fn hasFileService(conn: *const mux_client.Conn) bool {
-    return conn.udp_tickets;
+    return conn.caps.udp_ticket;
 }
 
 /// Open the download picker for `pane` (a pane whose session lives on

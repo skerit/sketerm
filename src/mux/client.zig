@@ -10,6 +10,7 @@ const deploy = @import("deploy.zig");
 const rudp = @import("rudp.zig");
 const sshroute = @import("sshroute.zig");
 const selfexec = @import("selfexec.zig");
+const capabilities = @import("capabilities.zig");
 /// The one publish/stop/release mechanism for interrupting a blocking
 /// socket from another thread; re-exported so SDK consumers can declare
 /// the slot these connect helpers take.
@@ -282,74 +283,18 @@ pub const Conn = struct {
     proto: u32 = 1,
     server_proto: u32 = 1,
     snapshot_version: u8 = @import("snapshot.zig").LEGACY_SNAPSHOT_VERSION,
-    /// Daemon's cross_copy honors delete_src/dial_tries and stamps
-    /// dial failures kind:"unreachable" (welcome capability). Gates
-    /// daemon-owned moves and direct remote-to-remote coordination.
-    cross_move: bool = false,
-    /// cross_copy honors client_token and retains terminal jobs until
-    /// job_ack, so browser-owned intents can survive view handoff.
-    durable_copy: bool = false,
-    copy_no_replace: bool = false,
-    /// cross_copy serializes cancellation against final installation
-    /// and source deletion, including restart recovery.
-    durable_copy_v2: bool = false,
+    /// The daemon's advertised boolean capabilities (`capabilities.Flag`
+    /// documents each one and the fallback for its absence). All false
+    /// until a welcome is applied, and reset by every welcome, so an
+    /// older daemon reached after a reconnect never inherits a newer
+    /// one's flags.
+    caps: capabilities.Set = .{},
     /// The daemon's announced build id (git describe). Empty = a
     /// daemon that predates the announce — stale by definition.
     server_build: [72]u8 = undefined,
     server_build_len: usize = 0,
-    /// Daemon answers `udp_ticket_req` (welcome capability). Gates the
-    /// request — an older daemon would answer `.err`, which a
-    /// multiplexed GUI connection could misattribute.
-    udp_tickets: bool = false,
-    /// Display output geometry and guarded display-only kill requests.
-    display_v2: bool = false,
-    /// Daemon enforces KillReq.origin_id before resolving a destructive kill.
-    /// Older daemons silently ignore that additive field, so fenced callers
-    /// must refuse unless this welcome capability is present.
-    kill_origin_fence: bool = false,
-    /// Daemon answers `lsp_open` (welcome capability): it can spawn a
-    /// language server near the files and bridge its stdio as a byte
-    /// channel. Absent = degrade silently, like a missing server.
-    lsp_support: bool = false,
-    /// Daemon supports cast-playback sessions (SpawnReq.cast_path +
-    /// play_control frames). Gates both — an old daemon would spawn a
-    /// login shell for the request and `.err` on the control frame.
-    cast_playback: bool = false,
-    /// Daemon serves `web_op` (welcome capability): history, bookmarks
-    /// and per-site settings stored on the daemon's host. Absent =
-    /// never send the frame; the client degrades to no persistence.
-    web_store: bool = false,
-    /// Daemon serves the web_op PROFILE ops (welcome capability): the
-    /// headless browser-profile store's flock and id allocation live in
-    /// the broker, so several MCP clients of one instance share one
-    /// store. Absent = the client falls back to taking the flock
-    /// itself, i.e. exactly the old single-owner behavior.
-    web_profiles: bool = false,
-    /// Daemon serves `web_op engine_open` (welcome capability): the
-    /// broker spawns and owns the instance's browser ENGINE (linger
-    /// lifecycle) and answers with its listening socket path; the
-    /// daemon never relays web bytes. Absent = the client spawns the
-    /// helper itself, i.e. the Phase 2 shape.
-    web_engine: bool = false,
-    /// Daemon answers `stream_open` (welcome capability): it can open an
-    /// arbitrary-host TCP stream with DNS resolved on the daemon host.
-    /// Absent = never send the frame; an old daemon's generic `.err`
-    /// cannot be correlated to one of several pending CONNECT requests.
-    stream_open: bool = false,
-    /// Daemon answers `web_helper_open` (welcome capability): it can
-    /// spawn a sketerm-webengine browser helper on ITS host and bridge
-    /// the protocol socket as a byte channel. Absent = remote browsing
-    /// on this host gets a described "daemon too old" error.
-    web_helper: bool = false,
-    /// Daemon answers `web_helper_connect` (welcome capability): it
-    /// bridges a helper already serving beside its socket, which is
-    /// how a remote assistant's browser is watched.
-    web_helper_connect: bool = false,
     /// Independent panel relay capability advertised by the daemon.
     panel_rpc: u8 = 0,
-    /// The daemon can put immutable session identity before the initial GUI
-    /// snapshot when explicitly requested by a panel-capable attachment.
-    attach_identity: bool = false,
     attach_identity_pending: bool = false,
     /// Immutable spawn name returned for legacy migration/display metadata.
     panel_origin_name: [64]u8 = undefined,
@@ -521,23 +466,10 @@ pub const Conn = struct {
         self.proto = 0;
         self.server_proto = 0;
         self.snapshot_version = 0;
-        self.udp_tickets = false;
-        self.cross_move = false;
-        self.durable_copy = false;
-        self.copy_no_replace = false;
-        self.durable_copy_v2 = false;
-        self.display_v2 = false;
-        self.kill_origin_fence = false;
-        self.lsp_support = false;
-        self.cast_playback = false;
-        self.web_store = false;
-        self.web_profiles = false;
-        self.web_engine = false;
-        self.stream_open = false;
-        self.web_helper = false;
-        self.web_helper_connect = false;
+        // Parsed apart from the profile fields: a malformed flag value
+        // costs the flags, never the negotiated profile.
+        self.caps = capabilities.parse(allocator, payload);
         self.panel_rpc = 0;
-        self.attach_identity = false;
         self.attach_identity_pending = false;
         self.server_build_len = 0;
         const Probe = struct {
@@ -545,23 +477,7 @@ pub const Conn = struct {
             server_proto: ?u32 = null,
             negotiation: u8 = 0,
             snapshot: u8 = 0,
-            udp_ticket: bool = false,
-            cross_move: bool = false,
-            durable_copy: bool = false,
-            copy_no_replace: bool = false,
-            durable_copy_v2: bool = false,
-            display_v2: bool = false,
-            kill_origin_fence: bool = false,
-            lsp: bool = false,
-            cast_playback: bool = false,
-            web_store: bool = false,
-            web_profiles: bool = false,
-            web_engine: bool = false,
-            stream_open: bool = false,
-            web_helper: bool = false,
-            web_helper_connect: bool = false,
             panel_rpc: u8 = 0,
-            attach_identity: bool = false,
             build: []const u8 = "",
         };
         if (std.json.parseFromSlice(Probe, allocator, payload, .{ .ignore_unknown_fields = true })) |parsed| {
@@ -574,23 +490,7 @@ pub const Conn = struct {
             else
                 0;
             self.server_proto = parsed.value.server_proto orelse reported;
-            self.udp_tickets = parsed.value.udp_ticket;
-            self.cross_move = parsed.value.cross_move;
-            self.durable_copy = parsed.value.durable_copy;
-            self.copy_no_replace = parsed.value.copy_no_replace;
-            self.durable_copy_v2 = parsed.value.durable_copy_v2;
-            self.display_v2 = parsed.value.display_v2;
-            self.kill_origin_fence = parsed.value.kill_origin_fence;
-            self.lsp_support = parsed.value.lsp;
-            self.cast_playback = parsed.value.cast_playback;
-            self.web_store = parsed.value.web_store;
-            self.web_profiles = parsed.value.web_profiles;
-            self.web_engine = parsed.value.web_engine;
-            self.stream_open = parsed.value.stream_open;
-            self.web_helper = parsed.value.web_helper;
-            self.web_helper_connect = parsed.value.web_helper_connect;
             self.panel_rpc = @min(parsed.value.panel_rpc, wire.PANEL_RPC_VERSION);
-            self.attach_identity = parsed.value.attach_identity;
             self.server_build_len = @min(parsed.value.build.len, self.server_build.len);
             @memcpy(self.server_build[0..self.server_build_len], parsed.value.build[0..self.server_build_len]);
             self.snapshot_version = if (parsed.value.snapshot > 0)
@@ -1127,7 +1027,7 @@ pub const Conn = struct {
     /// during the wait are discarded (recvExpectFor) — a GUI terminal
     /// connection must use its async frame dispatch instead.
     pub fn requestUdpTicket(self: *Conn, port_range: ?[]const u8, timeout_ms: i64) !UdpTicket {
-        if (!self.udp_tickets) return error.TicketsUnsupported;
+        if (!self.caps.udp_ticket) return error.TicketsUnsupported;
         try self.sendJson(.udp_ticket_req, .{ .range = port_range });
         const f = try self.recvExpectFor(&.{.udp_ticket}, timeout_ms);
         defer f.deinit(self.allocator);
@@ -1431,7 +1331,7 @@ pub const Conn = struct {
     pub fn sendKill(self: *Conn, req: wire.KillReq) !void {
         if (req.origin_id.len > 0) {
             if (!wire.validSessionOriginId(req.origin_id)) return error.InvalidSessionOriginId;
-            if (!self.kill_origin_fence) return error.KillOriginFenceUnsupported;
+            if (!self.caps.kill_origin_fence) return error.KillOriginFenceUnsupported;
         }
         try self.sendJson(.kill, req);
     }
@@ -1440,7 +1340,7 @@ pub const Conn = struct {
     pub fn queueKill(self: *Conn, req: wire.KillReq) !void {
         if (req.origin_id.len > 0) {
             if (!wire.validSessionOriginId(req.origin_id)) return error.InvalidSessionOriginId;
-            if (!self.kill_origin_fence) return error.KillOriginFenceUnsupported;
+            if (!self.caps.kill_origin_fence) return error.KillOriginFenceUnsupported;
         }
         try self.queueJson(.kill, req);
     }
@@ -1476,7 +1376,7 @@ pub const Conn = struct {
     pub fn sendAttach(self: *Conn, name: []const u8, opts: AttachOptions) !void {
         if (opts.panel_rpc > self.panel_rpc) return error.PanelRpcUnsupported;
         if (opts.panel_only and opts.panel_rpc == 0) return error.PanelRpcUnsupported;
-        const identity_first = self.attach_identity and !opts.panel_only and
+        const identity_first = self.caps.attach_identity and !opts.panel_only and
             opts.panel_rpc > 0 and std.mem.eql(u8, opts.kind, "gui");
         try self.sendJson(.attach, .{
             .name = name,
@@ -2691,24 +2591,24 @@ test "welcome records older and future daemon profiles without rejecting either"
     conn.applyWelcome(a, "{\"proto\":6,\"server_proto\":9,\"negotiation\":1}");
     try std.testing.expectEqual(@as(u32, 6), conn.proto);
     try std.testing.expectEqual(@as(u32, 9), conn.server_proto);
-    try std.testing.expect(!conn.durable_copy);
-    try std.testing.expect(!conn.kill_origin_fence);
+    try std.testing.expect(!conn.caps.durable_copy);
+    try std.testing.expect(!conn.caps.kill_origin_fence);
     conn.applyWelcome(a, "{\"proto\":6,\"server_proto\":9,\"negotiation\":1,\"durable_copy\":true,\"copy_no_replace\":true,\"durable_copy_v2\":true}");
-    try std.testing.expect(conn.durable_copy);
-    try std.testing.expect(conn.copy_no_replace);
-    try std.testing.expect(conn.durable_copy_v2);
+    try std.testing.expect(conn.caps.durable_copy);
+    try std.testing.expect(conn.caps.copy_no_replace);
+    try std.testing.expect(conn.caps.durable_copy_v2);
     conn.applyWelcome(a, "{\"proto\":6,\"server_proto\":9,\"negotiation\":1,\"kill_origin_fence\":true}");
-    try std.testing.expect(conn.kill_origin_fence);
+    try std.testing.expect(conn.caps.kill_origin_fence);
     conn.applyWelcome(a, "{\"proto\":0,\"server_proto\":9,\"negotiation\":1}");
     try std.testing.expectEqual(@as(u32, 0), conn.proto);
     try std.testing.expectEqual(@as(u8, 0), conn.panel_rpc);
     conn.applyWelcome(a, "{\"proto\":0,\"server_proto\":9,\"negotiation\":1,\"panel_rpc\":1,\"attach_identity\":true}");
     try std.testing.expectEqual(@as(u32, 0), conn.proto);
     try std.testing.expectEqual(@as(u8, 1), conn.panel_rpc);
-    try std.testing.expect(conn.attach_identity);
+    try std.testing.expect(conn.caps.attach_identity);
     conn.applyWelcome(a, "{\"proto\":0,\"server_proto\":9,\"negotiation\":1,\"panel_rpc\":2,\"attach_identity\":true}");
     try std.testing.expectEqual(wire.PANEL_RPC_VERSION, conn.panel_rpc);
-    try std.testing.expect(conn.attach_identity);
+    try std.testing.expect(conn.caps.attach_identity);
     conn.applyWelcome(a, "{\"proto\":9}");
     try std.testing.expectEqual(@as(u32, 0), conn.proto);
     try std.testing.expectEqual(@as(u32, 9), conn.server_proto);
@@ -2724,21 +2624,22 @@ test "stream_open welcome capability is strict and resets across reconnects" {
     var conn = Conn{ .allocator = a, .fd = -1 };
 
     conn.applyWelcome(a, "{\"proto\":6,\"negotiation\":1}");
-    try t.expect(!conn.stream_open);
+    try t.expect(!conn.caps.stream_open);
     conn.applyWelcome(a, "{\"proto\":6,\"negotiation\":1,\"stream_open\":true}");
-    try t.expect(conn.stream_open);
+    try t.expect(conn.caps.stream_open);
     conn.applyWelcome(a, "{\"proto\":6,\"negotiation\":1,\"stream_open\":false}");
-    try t.expect(!conn.stream_open);
+    try t.expect(!conn.caps.stream_open);
 
-    // A malformed capability invalidates the welcome rather than being
-    // interpreted as support, and a later reconnect starts from false.
+    // A malformed capability is never interpreted as support: it costs
+    // every flag, but not the negotiated profile, which is parsed apart.
+    // A later reconnect starts from false.
     conn.applyWelcome(a, "{\"proto\":6,\"negotiation\":1,\"stream_open\":\"yes\"}");
-    try t.expect(!conn.stream_open);
-    try t.expectEqual(@as(u32, 0), conn.proto);
+    try t.expect(!conn.caps.stream_open);
+    try t.expectEqual(@as(u32, 6), conn.proto);
     conn.applyWelcome(a, "{\"proto\":6,\"negotiation\":1,\"stream_open\":true}");
-    try t.expect(conn.stream_open);
+    try t.expect(conn.caps.stream_open);
     conn.applyWelcome(a, "{\"proto\":6,\"negotiation\":1}");
-    try t.expect(!conn.stream_open);
+    try t.expect(!conn.caps.stream_open);
 }
 
 test "fenced kill refuses old daemons before sending bytes" {
@@ -2758,7 +2659,7 @@ test "fenced kill refuses old daemons before sending bytes" {
     var pfd = c.struct_pollfd{ .fd = peer.fd, .events = c.POLLIN, .revents = 0 };
     try t.expectEqual(@as(c_int, 0), c.poll(&pfd, 1, 0));
 
-    conn.kill_origin_fence = true;
+    conn.caps.kill_origin_fence = true;
     try conn.sendKill(req);
     const frame = try peer.recvExpectFor(&.{.kill}, 1_000);
     defer frame.deinit(t.allocator);
@@ -2778,7 +2679,7 @@ test "identity-first GUI attach survives loss before trailing metadata and fence
         .fd = pair[0],
         .proto = wire.PROTO_VERSION,
         .panel_rpc = wire.PANEL_RPC_VERSION,
-        .attach_identity = true,
+        .caps = .{ .attach_identity = true },
         .attach_identity_pending = true,
     };
     defer conn.deinit();
@@ -2802,7 +2703,7 @@ test "identity-first GUI attach survives loss before trailing metadata and fence
         .fd = reconnect_pair[0],
         .proto = wire.PROTO_VERSION,
         .panel_rpc = wire.PANEL_RPC_VERSION,
-        .attach_identity = true,
+        .caps = .{ .attach_identity = true },
     };
     defer reconnect.deinit();
     var replacement = Conn{ .allocator = a, .fd = reconnect_pair[1], .proto = wire.PROTO_VERSION };

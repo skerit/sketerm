@@ -123,7 +123,7 @@ pub const Guard = struct {
     }
 
     fn killOn(self: *const Guard, conn: *muxclient.Conn) bool {
-        if (!conn.kill_origin_fence) return false;
+        if (!conn.caps.kill_origin_fence) return false;
         conn.write_timeout_ms = @intCast(@min(self.timeout_ms, std.math.maxInt(c_int)));
         conn.sendKill(.{
             .name = self.name,

@@ -312,7 +312,7 @@ fn findUdpTicketTerminal(self: *Window, bare_host: []const u8) ?*term_mod.Termin
             for (w.panes.items) |p| {
                 const r = p.terminal.remote orelse continue;
                 if (!r.canSend() or r.destroying) continue;
-                if (r.conn.transport != .udp or !r.conn.udp_tickets) continue;
+                if (r.conn.transport != .udp or !r.conn.caps.udp_ticket) continue;
                 if (r.pending_ticket_cb != null) continue;
                 const h = r.host orelse continue;
                 if (std.mem.eql(u8, mux_client.RemoteSpec.parse(h).host, host)) return p;

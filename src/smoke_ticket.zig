@@ -39,7 +39,7 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8) void {
     //    (non-empty sock_path branch).
     var conn = client_mod.Conn.connectProbed(allocator, sock_path) catch fail("connect");
     defer conn.deinit();
-    if (!conn.udp_tickets) fail("welcome does not advertise udp_ticket");
+    if (!conn.caps.udp_ticket) fail("welcome does not advertise udp_ticket");
     const t1 = conn.requestUdpTicket(null, 15_000) catch fail("unattached mint");
     dialTicket(allocator, t1, "unattached (broker-served) ticket");
 

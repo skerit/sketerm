@@ -559,7 +559,7 @@ pub const Term = struct {
         conn.setNonBlocking();
         conn.sendJson(.hello, .{ .proto = wire.PROTO_VERSION }) catch return Error.SpawnFailed;
         (conn.recvExpectFor(&.{.welcome}, 15_000) catch return Error.SpawnFailed).deinit(allocator);
-        if (!conn.kill_origin_fence) return Error.SpawnFailed;
+        if (!conn.caps.kill_origin_fence) return Error.SpawnFailed;
 
         name_counter += 1;
         const name = std.fmt.allocPrint(allocator, "mcpterm-{d}-{d}", .{ c.getpid(), name_counter }) catch
@@ -615,7 +615,7 @@ pub const Term = struct {
         errdefer conn.deinit();
         // connectSsh already proved hello → welcome; just bound reads.
         conn.setNonBlocking();
-        if (!conn.kill_origin_fence) return Error.SpawnFailed;
+        if (!conn.caps.kill_origin_fence) return Error.SpawnFailed;
 
         name_counter += 1;
         const name = std.fmt.allocPrint(allocator, "mcpterm-{d}-{d}", .{ c.getpid(), name_counter }) catch

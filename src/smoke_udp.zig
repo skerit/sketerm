@@ -174,7 +174,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         _ = c.setenv("SKETERM_SSH", ssh1.ptr, 1);
         var conn = client_mod.Conn.connectUdp(allocator, "smoke-udp-host", null) catch fail("ticket stage connect");
         defer conn.deinit();
-        if (!conn.udp_tickets) fail("welcome does not advertise udp_ticket");
+        if (!conn.caps.udp_ticket) fail("welcome does not advertise udp_ticket");
         const ticket = conn.requestUdpTicket(null, 15_000) catch fail("ticket mint over live UDP conn");
 
         var ssh4_buf: [176:0]u8 = undefined;

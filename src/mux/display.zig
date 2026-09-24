@@ -482,7 +482,7 @@ pub fn destroySession(
     pid: i32,
     wl_path: []const u8,
 ) bool {
-    if (!conn.display_v2 or !conn.kill_origin_fence or !wire.validSessionOriginId(origin_id)) {
+    if (!conn.caps.display_v2 or !conn.caps.kill_origin_fence or !wire.validSessionOriginId(origin_id)) {
         errPrint("daemon is too old for safe display destruction; upgrade sketerm-mux", .{});
         return false;
     }
@@ -514,7 +514,7 @@ pub fn destroySession(
 /// Spawn a Wayland-hosting display session and return its identity +
 /// environment; errors are reported on stderr and rolled back.
 pub fn spawnSession(allocator: std.mem.Allocator, conn: *client.Conn, a: SpawnOpts, name: []const u8) ?Created {
-    if (!conn.display_v2 or !conn.kill_origin_fence) {
+    if (!conn.caps.display_v2 or !conn.caps.kill_origin_fence) {
         errPrint("daemon is too old for display lifecycle safety; upgrade sketerm-mux", .{});
         return null;
     }
@@ -750,7 +750,7 @@ fn writeSessJson(w: *std.Io.Writer, s: Sess) !void {
 fn inspect(allocator: std.mem.Allocator, a: Args) u8 {
     var conn = connect(allocator, a.socket) orelse return 1;
     defer conn.deinit();
-    if (!conn.display_v2 or !conn.kill_origin_fence) {
+    if (!conn.caps.display_v2 or !conn.caps.kill_origin_fence) {
         errPrint("daemon is too old to report reliable display metadata; upgrade sketerm-mux", .{});
         return 1;
     }
@@ -785,7 +785,7 @@ fn inspect(allocator: std.mem.Allocator, a: Args) u8 {
 fn list(allocator: std.mem.Allocator, a: Args) u8 {
     var conn = connect(allocator, a.socket) orelse return 1;
     defer conn.deinit();
-    if (!conn.display_v2) {
+    if (!conn.caps.display_v2) {
         errPrint("daemon is too old to report reliable display metadata; upgrade sketerm-mux", .{});
         return 1;
     }
@@ -819,7 +819,7 @@ fn list(allocator: std.mem.Allocator, a: Args) u8 {
 fn destroy(allocator: std.mem.Allocator, a: Args) u8 {
     var conn = connect(allocator, a.socket) orelse return 1;
     defer conn.deinit();
-    if (!conn.display_v2) {
+    if (!conn.caps.display_v2) {
         errPrint("daemon is too old for safe display destruction; upgrade sketerm-mux", .{});
         return 1;
     }
@@ -958,7 +958,7 @@ fn runCommand(allocator: std.mem.Allocator, a_in: Args) u8 {
     const name = if (a.name.len > 0) a.name else generatedName(&name_buf);
     var conn = connect(allocator, a.socket) orelse return 125;
     defer conn.deinit();
-    if (!conn.display_v2) {
+    if (!conn.caps.display_v2) {
         errPrint("daemon is too old for display run; upgrade sketerm-mux", .{});
         return 125;
     }

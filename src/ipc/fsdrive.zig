@@ -974,7 +974,7 @@ pub const Fs = struct {
     }
 
     pub fn renameNoReplace(self: *Fs, from: []const u8, to: []const u8) Error!void {
-        if (!self.conn.copy_no_replace) return Error.BadRequest;
+        if (!self.conn.caps.copy_no_replace) return Error.BadRequest;
         try self.simpleOp("rename", .{ .path = from, .to = to, .no_replace = true });
     }
 
@@ -1389,7 +1389,7 @@ pub const Fs = struct {
     /// client-side against a daemon that did not announce it, because
     /// such a daemon would silently run the weaker semantics.
     pub fn startCopy(self: *Fs, src: []const u8, dst: []const u8, opts: CopyOpts) Error!u64 {
-        if (opts.no_replace and !self.conn.copy_no_replace) return Error.BadRequest;
+        if (opts.no_replace and !self.conn.caps.copy_no_replace) return Error.BadRequest;
         return self.startJob("copy", .{
             .path = src,
             .to = dst,
@@ -1721,7 +1721,7 @@ pub const Fs = struct {
         dst: []const u8,
         opts: CrossOpts,
     ) Error!u64 {
-        if (opts.no_replace and !self.conn.copy_no_replace) return Error.BadRequest;
+        if (opts.no_replace and !self.conn.caps.copy_no_replace) return Error.BadRequest;
         return self.startJob("cross_copy", .{
             .path = src,
             .to = dst,

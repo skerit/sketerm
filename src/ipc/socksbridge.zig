@@ -402,7 +402,7 @@ pub const Bridge = struct {
             // The wire contract forbids probing an old daemon with an
             // unknown frame. Keep the listener fail-closed and answer the
             // browser in SOCKS terms instead of leaving CONNECT pending.
-            if (!conn.stream_open) {
+            if (!conn.caps.stream_open) {
                 self.queueSession(s, s.socks.failedReply(), true);
                 return;
             }
@@ -566,7 +566,7 @@ pub const Egress = struct {
         if (self.connectFn(self.allocator, h)) |conn| {
             self.conn = conn;
             self.conn_ok = true;
-            if (!self.conn.stream_open) {
+            if (!self.conn.caps.stream_open) {
                 _ = c.fprintf(
                     platform.stderr(),
                     "sketerm web: egress through %.*s is unavailable: that host's sketerm-mux is too old (welcome lacks stream_open:true); SOCKS requests will fail closed\n",
@@ -1038,7 +1038,7 @@ test "transport: old daemon capability fails SOCKS CONNECT without stream_open" 
     const t = std.testing;
     var mux = try TestMuxPair.init("{\"proto\":6,\"negotiation\":1}");
     defer mux.deinit();
-    try t.expect(!mux.conn.stream_open);
+    try t.expect(!mux.conn.caps.stream_open);
 
     var bridge = Bridge.init(t.allocator);
     defer bridge.deinit();
@@ -1074,7 +1074,7 @@ test "transport: generic daemon error fails the pending SOCKS CONNECT" {
     const t = std.testing;
     var mux = try TestMuxPair.init("{\"proto\":6,\"negotiation\":1,\"stream_open\":true}");
     defer mux.deinit();
-    try t.expect(mux.conn.stream_open);
+    try t.expect(mux.conn.caps.stream_open);
 
     var bridge = Bridge.init(t.allocator);
     defer bridge.deinit();
@@ -1113,7 +1113,7 @@ test "transport: capable daemon opens a successful stream" {
     const t = std.testing;
     var mux = try TestMuxPair.init("{\"proto\":6,\"negotiation\":1,\"stream_open\":true}");
     defer mux.deinit();
-    try t.expect(mux.conn.stream_open);
+    try t.expect(mux.conn.caps.stream_open);
 
     var bridge = Bridge.init(t.allocator);
     defer bridge.deinit();
@@ -1310,7 +1310,7 @@ const TestEgressConnector = struct {
     fn connect(allocator: std.mem.Allocator, _: ?[]const u8) ?client.Conn {
         const owned = fd.swap(-1, .acq_rel);
         if (owned < 0) return null;
-        return .{ .allocator = allocator, .fd = owned, .stream_open = true };
+        return .{ .allocator = allocator, .fd = owned, .caps = .{ .stream_open = true } };
     }
 };
 

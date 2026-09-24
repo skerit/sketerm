@@ -213,7 +213,7 @@ pub const Remote = struct {
                 error.Unsupported => error.Unsupported,
                 else => error.Io,
             };
-            if (!cn.web_engine) return error.Unsupported;
+            if (!cn.caps.web_engine) return error.Unsupported;
         }
         const Reply = struct {
             req: u32 = 0,
@@ -248,7 +248,7 @@ pub const Remote = struct {
     /// Daemon advertises `web_engine` (it will answer engine_open).
     pub fn engineSupported(self: *Remote) bool {
         const cn = self.ensureConn() catch return false;
-        return cn.web_engine;
+        return cn.caps.web_engine;
     }
 
     fn dropConn(self: *Remote) void {
@@ -261,7 +261,7 @@ pub const Remote = struct {
     fn ensureConn(self: *Remote) error{ Unsupported, Io }!*muxclient.Conn {
         if (self.conn) |*cn| return cn;
         var cn = muxclient.Conn.connectLocalAutostartAt(self.gpa, self.sock) catch return error.Io;
-        if (!cn.web_profiles) {
+        if (!cn.caps.web_profiles) {
             cn.deinit();
             return error.Unsupported;
         }

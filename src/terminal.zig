@@ -2424,7 +2424,7 @@ pub const Terminal = struct {
     ) bool {
         const remote = self.remote orelse return false;
         if (!remote.canSend() or remote.destroying) return false;
-        if (remote.conn.transport != .udp or !remote.conn.udp_tickets) return false;
+        if (remote.conn.transport != .udp or !remote.conn.caps.udp_ticket) return false;
         if (remote.pending_ticket_cb != null) return false;
         const range: ?[]const u8 = if (remote.port_range.len > 0) remote.port_range else null;
         remote.pending_ticket_cb = cb;
@@ -2561,7 +2561,7 @@ pub const Terminal = struct {
     pub fn sendPlayControl(self: *Terminal, cmd: PlayCommand) void {
         const remote = self.remote orelse return;
         if (!remote.canSend()) return;
-        if (!remote.conn.cast_playback) return;
+        if (!remote.conn.caps.cast_playback) return;
         var buf: [96]u8 = undefined;
         const payload = cmd.encode(&buf) orelse return;
         remote.conn.sendFrame(.play_control, payload) catch {

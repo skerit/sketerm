@@ -197,6 +197,7 @@ comptime {
     _ = @import("mux/predict.zig");
     _ = @import("mux/pulse.zig");
     _ = @import("mux/client.zig");
+    _ = @import("mux/capabilities.zig");
     _ = @import("mux/punch.zig");
     _ = @import("mux/rudp.zig");
     _ = @import("mux/selfexec.zig");

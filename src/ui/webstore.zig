@@ -84,7 +84,7 @@ fn ensure(gpa: std.mem.Allocator) bool {
         markDeadNoConn();
         return false;
     };
-    if (!s.conn.web_store) {
+    if (!s.conn.caps.web_store) {
         // A stale daemon predating the store; it may be upgraded any
         // time, so retry on the normal backoff.
         s.conn.deinit();

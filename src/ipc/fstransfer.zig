@@ -700,7 +700,7 @@ pub const Xfer = struct {
     }
 
     pub fn start(self: *Xfer) void {
-        if (self.no_replace and !self.dst.copy_no_replace) {
+        if (self.no_replace and !self.dst.caps.copy_no_replace) {
             self.fail("destination daemon lacks safe no-replace support");
             return;
         }

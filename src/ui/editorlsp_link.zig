@@ -394,7 +394,7 @@ fn linkThread(data: ?*anyopaque) callconv(.c) ?*anyopaque {
         const conn = muxclient.Conn.connectRemote(a, job.host, config.muxConnectOptions()) catch break :run;
         job.conn = conn;
         job.ok = true;
-        job.lsp = conn.lsp_support;
+        job.lsp = conn.caps.lsp;
     }
     _ = c.g_idle_add(@ptrCast(&linkIdle), @ptrCast(job));
     return null;

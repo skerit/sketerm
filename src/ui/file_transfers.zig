@@ -1631,14 +1631,14 @@ pub const Service = struct {
             self.connect();
             return;
         };
-        const current_durable_copy = conn.durable_copy and conn.durable_copy_v2;
+        const current_durable_copy = conn.caps.durable_copy and conn.caps.durable_copy_v2;
         if (!current_durable_copy) {
             if (!self.pumpAcks(conn)) return;
             var changed = false;
             var legacy_work = false;
             for (self.intents.items) |it| {
                 if (it.retired or it.ack_job != 0 or it.mediated) continue;
-                if (it.record_version < store.VERSION and conn.durable_copy) {
+                if (it.record_version < store.VERSION and conn.caps.durable_copy) {
                     // v2 service jobs already used their ledger token
                     // as an idempotency key and remain safe to reown on
                     // the daemon that created them.
@@ -1713,7 +1713,7 @@ pub const Service = struct {
         const req = self.next_req;
         self.next_req +%= 1;
         if (self.next_req == 0) self.next_req = 1;
-        if (conn.durable_copy_v2) it.record_version = store.VERSION;
+        if (conn.caps.durable_copy_v2) it.record_version = store.VERSION;
         self.pending.append(self.allocator, .{ .req = req, .intent = it }) catch {
             self.setState(it, .failed);
             it.submission_uncertain = false;

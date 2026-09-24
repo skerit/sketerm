@@ -140,7 +140,7 @@ fn conn(allocator: std.mem.Allocator, fd: c_int) muxclient.Conn {
         .proto = wire.PROTO_VERSION,
         .server_proto = wire.PROTO_VERSION,
         .snapshot_version = snapshot.SNAPSHOT_VERSION,
-        .kill_origin_fence = true,
+        .caps = .{ .kill_origin_fence = true },
     };
 }
 

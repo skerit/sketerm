@@ -260,6 +260,7 @@ comptime {
     _ = @import("render/bg_pass.zig");
     _ = @import("render/shader_pass.zig");
     _ = @import("mux/wire.zig");
+    _ = @import("mux/capabilities.zig");
     _ = @import("mux/webstore.zig");
     _ = @import("mux/fsserve.zig");
     _ = @import("mux/disk_usage.zig");

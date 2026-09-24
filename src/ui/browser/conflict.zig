@@ -756,7 +756,7 @@ const DecisionTest = struct {
         var pair: [2]c_int = undefined;
         try std.testing.expectEqual(@as(c_int, 0), c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &pair));
         self.peer = pair[1];
-        self.hc.conn = .{ .allocator = self.view.allocator, .fd = pair[0], .copy_no_replace = true };
+        self.hc.conn = .{ .allocator = self.view.allocator, .fd = pair[0], .caps = .{ .copy_no_replace = true } };
         self.hc.conn.setNonBlocking();
         self.hc.state = .ready;
     }
