@@ -42,6 +42,8 @@ const webdrive = @import("webdrive.zig");
 const navfault = @import("../web/navfault.zig");
 const web_proto = @import("../web/protocol.zig");
 const netpolicy = @import("../web/netpolicy.zig");
+const capture = @import("../web/capture.zig");
+const pathz = @import("../util/pathz.zig");
 const filter = @import("../web/filter.zig");
 const urlhost = @import("../web/urlhost.zig");
 const webprofiles = @import("webprofiles.zig");
@@ -511,6 +513,10 @@ pub const View = struct {
     policy_bytes: u64 = 0,
     policy_navigations: u32 = 0,
     policy_ms_left: u32 = 0,
+    /// Response-body capture (headless only): installed at open, and
+    /// whether the helper refused to hold it.
+    capture_active: bool = false,
+    capture_install_failed: bool = false,
     /// Certificate verdict on the current navigation (`ev_cert_error`);
     /// null when none was raised. GUI: "pending" while the user's
     /// interstitial waits. Headless: "refused" (the default, fail
@@ -858,6 +864,8 @@ fn appendEngineViews(
             .policy_bytes = v.pol_bytes,
             .policy_navigations = v.pol_navigations,
             .policy_ms_left = v.pol_ms_left,
+            .capture_active = v.cap != null and !v.cap_disabled,
+            .capture_install_failed = v.cap_install_failed,
             .cert = if (v.cert) |*rec| try dupeCert(arena, rec.wire()) else null,
             .load_error = if (v.load_error) |*rec| try dupeLoadErr(arena, rec.wire()) else null,
             .load_retry = if (v.load_retry) |*rec| try dupeLoadErr(arena, rec.wire()) else null,
@@ -1165,9 +1173,10 @@ fn headlessRouteEngine(arena: std.mem.Allocator, text: []const u8) RouteEngineOu
     return .{ .engine = e };
 }
 
-fn openView(drv: Driver, arena: std.mem.Allocator, url: ?[]const u8, where: []const u8, w: u16, h: u16, spec: webdrive.ProfileSpec, policy: ?*const webdrive.NetPolicy, route: ?[]const u8) !OpenOutcome {
+fn openView(drv: Driver, arena: std.mem.Allocator, url: ?[]const u8, where: []const u8, w: u16, h: u16, spec: webdrive.ProfileSpec, policy: ?*const webdrive.NetPolicy, cap: ?*const webdrive.CaptureFilter, route: ?[]const u8) !OpenOutcome {
     if (drv == .gui and spec != .default) return .{ .err = fail(.invalid_args, GUI_PROFILE_REFUSAL) };
     if (drv == .gui and policy != null) return .{ .err = fail(.unavailable, GUI_POLICY_REFUSAL) };
+    if (drv == .gui and cap != null) return .{ .err = fail(.unavailable, GUI_CAPTURE_REFUSAL) };
     switch (drv) {
         .gui => |backend| {
             const opened = mcp.ipcParsed(arena, backend, .{
@@ -1198,7 +1207,7 @@ fn openView(drv: Driver, arena: std.mem.Allocator, url: ?[]const u8, where: []co
                     }
                 }
             }
-            const v = e.openViewIn(url orelse "", w, h, spec, policy) catch |err| {
+            const v = e.openViewWith(url orelse "", w, h, spec, policy, cap) catch |err| {
                 const name: []const u8 = if (spec == .named) spec.named else "";
                 return .{ .err = switch (err) {
                     error.RouteRefused => fail(.unavailable, try std.fmt.allocPrint(
@@ -1210,6 +1219,12 @@ fn openView(drv: Driver, arena: std.mem.Allocator, url: ?[]const u8, where: []co
                     error.PolicyTooManyViews => fail(.conflict, try std.fmt.allocPrint(
                         arena,
                         "too many concurrent web views for another POLICIED one (the helper can enforce {d}); close one with web_close first — an unpoliced open past the cap is refused rather than silently unenforced",
+                        .{web_proto.MAX_POLICY_VIEWS},
+                    )),
+                    error.CaptureUnsupported => fail(.unavailable, "this browser helper does not advertise the capture capability, so response bodies cannot be captured. Nothing was opened: there is deliberately no uncaptured fallback (capabilities reports web_capture)."),
+                    error.CaptureTooManyViews => fail(.conflict, try std.fmt.allocPrint(
+                        arena,
+                        "too many concurrent web views for another CAPTURED one (the helper can hold {d}); close one with web_close first — a view past the cap would silently record nothing, so it is refused",
                         .{web_proto.MAX_POLICY_VIEWS},
                     )),
                     else => try profileFail(arena, e, name, err),
@@ -1494,6 +1509,7 @@ fn tabsResult(arena: std.mem.Allocator, mode: Mode, vs: Views) ![]const u8 {
             try std.json.Stringify.value(v.profile, .{}, w);
             try w.print(",\"profile_kind\":\"{s}\",\"context\":{d}", .{ v.profile_kind, v.context });
             if (v.policy_active) try w.print(",\"policy_active\":true,\"policy_exhausted\":{}", .{v.policy_exhausted.len > 0});
+            if (v.capture_active) try w.writeAll(",\"capture_active\":true");
         }
         try w.print(",\"current\":{}}}", .{v.focused});
     }
@@ -1568,6 +1584,7 @@ fn openResult(
     snap_err: ?[]const u8,
     policy: ?*const webdrive.NetPolicy,
     policy_source: []const u8,
+    cap: ?*const webdrive.CaptureFilter,
     open_views: usize,
 ) ![]const u8 {
     var res = mcp.Res.init(arena);
@@ -1596,6 +1613,11 @@ fn openResult(
             try res.fact("policy_serial", v.policy_serial);
             try res.raw("policy", try policyJson(arena, p));
             try res.textf("policy: enforced from the first request ({s}; web_policy reports the accounting)", .{policy_source});
+        }
+        try res.fact("capture_active", cap != null);
+        if (cap) |f| {
+            try res.raw("capture", try captureJson(arena, f));
+            try res.text("capture: recording matching responses from the first request (web_capture lists and reads them, web_wait for:\"response\" waits for one)");
         }
     }
     try res.field("settled", settled);
@@ -2851,6 +2873,12 @@ pub fn webTool(
         } else if (drv == .headless and profile != null) {
             if (drv.headless.profilePolicy(profile.?) != null) policy_source = "profile_default";
         }
+        const cap: ?webdrive.CaptureFilter = switch (try parseCapture(arena, if (args == .object) args.object.get("capture") else null, "capture", .open)) {
+            .none => null,
+            .err => |f| return failRes(arena, f),
+            .parsed => |p| p.filter,
+        };
+        if (cap != null and drv == .gui) return mcp.errRes(arena, .unavailable, GUI_CAPTURE_REFUSAL);
         // `accept_cert`: one fingerprint this view may proceed on. The
         // GUI answers certificate errors through the user's own
         // interstitial, so there it is a category error, not ignored.
@@ -2859,7 +2887,7 @@ pub fn webTool(
             if (drv == .gui) return mcp.errRes(arena, .invalid_args, "accept_cert is headless only: with a GUI attached the user answers certificate errors in the pane's interstitial");
             if (!navfault.validFingerprint(fp)) return mcp.errRes(arena, .invalid_args, "accept_cert must be the certificate's SHA-256 as 64 hex digits (the 'cert.fingerprint' a refused open reported)");
         }
-        const new_handle: u32 = switch (try openView(drv, arena, url, where, vw, vh, spec, if (policy) |*p| p else null, route)) {
+        const new_handle: u32 = switch (try openView(drv, arena, url, where, vw, vh, spec, if (policy) |*p| p else null, if (cap) |*f| f else null, route)) {
             .err => |e| return failRes(arena, e),
             .opened => |p| p,
         };
@@ -2922,6 +2950,12 @@ pub fn webTool(
                         if (drv == .headless) drv.headless.closeView(new_handle);
                         return mcp.errRes(arena, .conflict, "the browser helper could not hold the requested network policy (its policy table is full); the view was closed un-navigated — close other views with web_close and retry");
                     }
+                    // Likewise for the capture: a view that would record
+                    // nothing must not run as if it did.
+                    if (found.capture_install_failed) {
+                        if (drv == .headless) drv.headless.closeView(new_handle);
+                        return mcp.errRes(arena, .conflict, "the browser helper could not hold the requested capture (its view table is full); the view was closed - close other views with web_close and retry");
+                    }
                     // A held certificate or a failed load: the page is
                     // not coming, and the reply must say so NOW rather
                     // than after the whole timeout with "not settled".
@@ -2948,7 +2982,7 @@ pub fn webTool(
             // is empty", which is the wrong conclusion.
             snap_err = "skipped: the requested page did not load";
             const echo: ?*const webdrive.NetPolicy = if (policy) |*p| p else if (drv == .headless and std.mem.eql(u8, policy_source, "profile_default")) drv.headless.profilePolicy(profile.?) else null;
-            return openResult(arena, drv.mode(), v, false, drv == .headless and !eql(u8, where, "tab"), null, snap_err, echo, policy_source, open_views);
+            return openResult(arena, drv.mode(), v, false, drv == .headless and !eql(u8, where, "tab"), null, snap_err, echo, policy_source, if (cap) |*f| f else null, open_views);
         }
         // `snapshot:"none"` skips the tree for opens that only need a
         // view (a screenshot, a viewport): the full tree of a page the
@@ -2967,6 +3001,7 @@ pub fn webTool(
             "skipped by request (snapshot:\"none\"); call web_snapshot when you need the tree",
             if (policy) |*p| p else if (drv == .headless and std.mem.eql(u8, policy_source, "profile_default")) drv.headless.profilePolicy(profile.?) else null,
             policy_source,
+            if (cap) |*f| f else null,
             open_views,
         );
         switch (try runOp(drv, arena, new_handle, .{
@@ -3004,6 +3039,7 @@ pub fn webTool(
             snap_err,
             echo_policy,
             policy_source,
+            if (cap) |*f| f else null,
             open_views,
         );
     }
@@ -3478,6 +3514,8 @@ pub fn webTool(
     if (eql(u8, name, "web_inspect") or eql(u8, name, "web_checkpoint"))
         return @import("mcp_web_review.zig").tool(drv, arena, name, args, view);
     if (eql(u8, name, "web_wait")) return waitTool(drv, arena, args, view);
+    if (eql(u8, name, "web_capture")) return captureTool(drv, arena, args, view);
+    if (eql(u8, name, "web_capture_set")) return captureSetTool(drv, arena, args, view);
     if (eql(u8, name, "web_network")) return networkTool(drv, arena, args, view);
     if (eql(u8, name, "web_download")) return downloadTool(drv, arena, args, view);
 
@@ -3889,6 +3927,730 @@ fn nameListJson(arena: std.mem.Allocator, names: []const []const u8) ![]const u8
     }
     try w.writeByte(']');
     return aw.written();
+}
+
+// ---------------------------------------------------------------------
+// Response-body capture (headless only)
+// ---------------------------------------------------------------------
+//
+// A view opened with `web_open capture:{...}` keeps the responses its
+// page receives (the filter and the bounded store live in
+// `web/capture.zig`, inside the browser engine). The exchanges are
+// PULLED here, never streamed: `web_capture` pages metadata and reads
+// bodies, `web_capture_set` narrows, `web_wait for:"response"` waits.
+
+/// The GUI drives the user's real tabs; recording what a person's
+/// browsing receives from an MCP call would be wrong.
+const GUI_CAPTURE_REFUSAL =
+    "a sketerm GUI is attached, so web tools drive the user's real tabs; response-body capture is a headless-only feature. Run this MCP server without " ++ GUI_ATTACH_WAYS ++ " for it.";
+
+const NO_CAPTURE =
+    "this view was opened without a capture; web_open's 'capture' object installs one, and only at open (a capture added later would miss the requests that already ran)";
+
+/// What `capabilities` reports about capture. Never spawns the helper:
+/// before one exists this is what the code supports.
+pub fn captureCapability() struct { supported: bool, started: bool } {
+    if (guiDrivesWeb()) return .{ .supported = false, .started = true };
+    const e = headlessEngine() orelse return .{ .supported = false, .started = false };
+    if (e.state != .ready) return .{ .supported = true, .started = false };
+    return .{ .supported = e.has(.capture), .started = true };
+}
+
+/// A parsed capture object: `web_open`'s filter, or `web_wait`'s
+/// response filter (which adds `status`).
+const ParsedCapture = struct {
+    filter: webdrive.CaptureFilter,
+    /// `web_wait` only; 0 = any status.
+    status: u16 = 0,
+};
+
+const CaptureParse = union(enum) { none, parsed: ParsedCapture, err: Fail };
+
+const CaptureKey = enum {
+    hosts,
+    url_contains,
+    url_regex,
+    types,
+    methods,
+    mime_prefixes,
+    max_body_bytes,
+    max_total_bytes,
+    status,
+};
+
+const MAX_CAPTURE_STR = 1024;
+
+/// Parse a capture object. Fail closed on every unknown name and every
+/// out-of-range value: a typo must never become a capture that keeps
+/// more, or silently less, than the caller asked for.
+fn parseCapture(arena: std.mem.Allocator, value: ?std.json.Value, comptime what: []const u8, comptime mode: enum { open, wait }) !CaptureParse {
+    const val = value orelse return .none;
+    if (val == .null) return .none;
+    if (val != .object) return .{ .err = fail(.invalid_args, "'" ++ what ++ "' must be an object") };
+    var out = ParsedCapture{ .filter = .{ .types = if (mode == .open) capture.DEFAULT_TYPES else 0 } };
+    const f = &out.filter;
+    var it = val.object.iterator();
+    while (it.next()) |kv| {
+        const name = kv.key_ptr.*;
+        const v = kv.value_ptr.*;
+        const key = std.meta.stringToEnum(CaptureKey, name) orelse return .{ .err = fail(.invalid_args, try std.fmt.allocPrint(
+            arena,
+            "'{s}.{s}' is not a capture field ({s})",
+            .{ what, name, if (mode == .open) "hosts, url_contains, url_regex, types, methods, mime_prefixes, max_body_bytes, max_total_bytes" else "hosts, url_contains, url_regex, types, methods, mime_prefixes, status" },
+        )) };
+        switch (key) {
+            .hosts => {
+                const hosts = switch (try captureStrList(arena, v, what ++ ".hosts", capture.MAX_HOSTS, .lower)) {
+                    .ok => |l| l,
+                    .err => |e| return .{ .err = e },
+                };
+                for (hosts) |h| {
+                    if (!netpolicy.validHostEntry(h)) return .{ .err = fail(.invalid_args, try std.fmt.allocPrint(arena, "'{s}' is not a usable host: bare host names or IP literals only (subdomains are included), no '*', scheme, port or path", .{h})) };
+                }
+                f.hosts = hosts;
+            },
+            .methods => {
+                const methods = switch (try captureStrList(arena, v, what ++ ".methods", capture.MAX_METHODS, .upper)) {
+                    .ok => |l| l,
+                    .err => |e| return .{ .err = e },
+                };
+                for (methods) |m| {
+                    const ok = m.len > 0 and m.len <= 16 and for (m) |ch| {
+                        if (!std.ascii.isAlphabetic(ch)) break false;
+                    } else true;
+                    if (!ok) return .{ .err = fail(.invalid_args, try std.fmt.allocPrint(arena, "'{s}' is not an HTTP method", .{m})) };
+                }
+                f.methods = methods;
+            },
+            .mime_prefixes => {
+                const mimes = switch (try captureStrList(arena, v, what ++ ".mime_prefixes", capture.MAX_MIMES, .lower)) {
+                    .ok => |l| l,
+                    .err => |e| return .{ .err = e },
+                };
+                for (mimes) |m| {
+                    if (m.len == 0 or m.len > 127 or std.mem.indexOfAny(u8, m, " \t;,") != null)
+                        return .{ .err = fail(.invalid_args, try std.fmt.allocPrint(arena, "'{s}' is not a mime prefix (e.g. application/json, text/)", .{m})) };
+                }
+                f.mime_prefixes = mimes;
+            },
+            .types => {
+                if (v != .array) return .{ .err = fail(.invalid_args, what ++ ".types must be an array of resource-class names") };
+                if (v.array.items.len == 0) return .{ .err = fail(.invalid_args, what ++ ".types must not be empty (omit it for " ++ (if (mode == .open) "the xhr default" else "any class") ++ ")") };
+                var mask: u16 = 0;
+                for (v.array.items) |item| {
+                    if (item != .string) return .{ .err = fail(.invalid_args, what ++ ".types entries must be strings") };
+                    if (std.mem.eql(u8, item.string, "fetch"))
+                        return .{ .err = fail(.invalid_args, "'fetch' is not a class of its own: the engine reports fetch() and XMLHttpRequest as one class, \"xhr\"") };
+                    mask |= netpolicy.typeBit(item.string) orelse return .{ .err = fail(.invalid_args, try std.fmt.allocPrint(
+                        arena,
+                        "'{s}' is not a resource class (other|document|subdocument|stylesheet|script|image|font|xhr|media|websocket|ping)",
+                        .{item.string},
+                    )) };
+                }
+                f.types = mask;
+            },
+            .url_contains, .url_regex => {
+                if (v != .string or v.string.len == 0 or v.string.len > MAX_CAPTURE_STR)
+                    return .{ .err = fail(.invalid_args, try std.fmt.allocPrint(arena, "{s}.{s} must be a non-empty string of at most {d} bytes", .{ what, name, MAX_CAPTURE_STR })) };
+                if (key == .url_contains) f.url_contains = v.string else f.url_regex = v.string;
+            },
+            .max_body_bytes, .max_total_bytes => {
+                if (mode != .open) return .{ .err = fail(.invalid_args, try std.fmt.allocPrint(arena, "'{s}.{s}' is a capture setting, not a response filter field", .{ what, name })) };
+                const limit: u64 = if (key == .max_body_bytes) capture.MAX_BODY_LIMIT else capture.MAX_TOTAL_LIMIT;
+                if (v != .integer or v.integer < 1 or v.integer > limit)
+                    return .{ .err = fail(.invalid_args, try std.fmt.allocPrint(arena, "{s}.{s} must be an integer from 1 to {d} (refused, never clamped)", .{ what, name, limit })) };
+                if (key == .max_body_bytes) f.max_body = @intCast(v.integer) else f.max_total = @intCast(v.integer);
+            },
+            .status => {
+                if (mode != .wait) return .{ .err = fail(.invalid_args, "'" ++ what ++ ".status' only filters a web_wait; a capture keeps every status") };
+                if (v != .integer or v.integer < 100 or v.integer > 999) return .{ .err = fail(.invalid_args, what ++ ".status must be an HTTP status code") };
+                out.status = @intCast(v.integer);
+            },
+        }
+    }
+    if (f.max_body > f.max_total)
+        return .{ .err = fail(.invalid_args, try std.fmt.allocPrint(arena, "{s}.max_body_bytes ({d}) cannot exceed max_total_bytes ({d})", .{ what, f.max_body, f.max_total })) };
+    // Compiled exactly as the engine will compile it, so a pattern the
+    // engine would refuse is refused HERE, before anything is opened.
+    _ = capture.Filter.build(arena, captureSetOf(f)) catch |e| switch (e) {
+        error.BadPattern => return .{ .err = fail(.invalid_args, what ++ ".url_regex is not a supported pattern: literal text, '.', [a-z] / [^x] classes, the * + ? quantifiers, ^ and $ anchors and top-level '|'; there are no groups, so ( and ) are literal") },
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    return .{ .parsed = out };
+}
+
+/// A filter as the engine's install frame would carry it.
+fn captureSetOf(f: *const webdrive.CaptureFilter) web_proto.CaptureSet {
+    return .{
+        .view = 0,
+        .serial = 0,
+        .op = @intFromEnum(web_proto.CaptureOp.install),
+        .upto = 0,
+        .types = f.types,
+        .max_body = f.max_body,
+        .max_total = f.max_total,
+        .url_contains = f.url_contains,
+        .url_regex = f.url_regex,
+        .hosts = f.hosts,
+        .methods = f.methods,
+        .mime_prefixes = f.mime_prefixes,
+    };
+}
+
+const StrListParse = union(enum) { ok: []const []const u8, err: Fail };
+
+fn captureStrList(arena: std.mem.Allocator, v: std.json.Value, comptime what: []const u8, max: usize, comptime case: enum { lower, upper }) !StrListParse {
+    if (v != .array) return .{ .err = fail(.invalid_args, what ++ " must be an array of strings") };
+    if (v.array.items.len == 0) return .{ .err = fail(.invalid_args, what ++ " must not be empty (omit it for no restriction)") };
+    if (v.array.items.len > max)
+        return .{ .err = fail(.invalid_args, try std.fmt.allocPrint(arena, what ++ " lists {d} entries; the cap is {d} (never silently truncated)", .{ v.array.items.len, max })) };
+    const out = try arena.alloc([]const u8, v.array.items.len);
+    for (v.array.items, out) |item, *o| {
+        if (item != .string or item.string.len > MAX_CAPTURE_STR) return .{ .err = fail(.invalid_args, what ++ " entries must be strings of at most 1024 bytes") };
+        o.* = switch (case) {
+            .lower => try std.ascii.allocLowerString(arena, item.string),
+            .upper => try std.ascii.allocUpperString(arena, item.string),
+        };
+    }
+    return .{ .ok = out };
+}
+
+/// The capture echo every captured result carries: names, not masks.
+fn captureJson(arena: std.mem.Allocator, f: *const webdrive.CaptureFilter) ![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    try w.writeAll("{\"types\":[");
+    var first = true;
+    inline for (std.meta.fields(filter.RType)) |fld| {
+        if (f.types == 0 or f.types & (@as(filter.RType, @enumFromInt(fld.value))).bit() != 0) {
+            if (!first) try w.writeByte(',');
+            try w.print("\"{s}\"", .{fld.name});
+            first = false;
+        }
+    }
+    try w.writeAll("],\"hosts\":");
+    try hostListJson(w, f.hosts);
+    try w.writeAll(",\"methods\":");
+    try hostListJson(w, f.methods);
+    try w.writeAll(",\"mime_prefixes\":");
+    try hostListJson(w, f.mime_prefixes);
+    try w.writeAll(",\"url_contains\":");
+    try std.json.Stringify.value(f.url_contains, .{}, w);
+    try w.writeAll(",\"url_regex\":");
+    try std.json.Stringify.value(f.url_regex, .{}, w);
+    try w.print(",\"max_body_bytes\":{d},\"max_total_bytes\":{d}}}", .{ f.max_body, f.max_total });
+    return aw.written();
+}
+
+fn truncName(t: u8) []const u8 {
+    return switch (@as(web_proto.CaptureTrunc, @enumFromInt(t))) {
+        .none, .body_cap, .total_cap, .no_memory => |k| @tagName(k),
+        _ => "unknown",
+    };
+}
+
+fn stateName(s: u8) []const u8 {
+    return switch (@as(web_proto.CaptureState, @enumFromInt(s))) {
+        .none, .active, .disabled, .refused => |k| @tagName(k),
+        _ => "unknown",
+    };
+}
+
+fn rtypeName(t: u8) []const u8 {
+    const rt = std.enums.fromInt(filter.RType, t) orelse return "other";
+    return @tagName(rt);
+}
+
+/// Where one exchange's body was written by `out_dir`.
+const Written = struct { path: []const u8, bytes: usize, sha256: []const u8, encoding: []const u8 };
+
+fn exchangeJson(w: *std.Io.Writer, e: web_proto.CaptureEntry, written: ?Written) !void {
+    try w.print("{{\"seq\":{d},\"cursor\":{d},\"url\":", .{ e.seq, e.cursor });
+    try std.json.Stringify.value(e.url.s, .{}, w);
+    try w.writeAll(",\"method\":");
+    try std.json.Stringify.value(e.method, .{}, w);
+    try w.print(",\"status\":{d},\"type\":\"{s}\",\"mime\":", .{ e.status, rtypeName(e.rtype) });
+    try std.json.Stringify.value(e.mime, .{}, w);
+    try w.writeAll(",\"charset\":");
+    try std.json.Stringify.value(e.charset, .{}, w);
+    const complete = e.flags & web_proto.CaptureEntry.flag_complete != 0;
+    const failed = e.flags & web_proto.CaptureEntry.flag_failed != 0;
+    try w.print(",\"started_ms\":{d},\"duration_ms\":{d},\"complete\":{},\"failed\":{},\"error\":{d}", .{ e.started_ms, e.dur_ms, complete, failed, e.err });
+    try w.print(",\"body_bytes\":{d},\"body_delivered_bytes\":{d},\"body_truncated\":{},\"body_truncated_reason\":\"{s}\"", .{
+        e.body_len, e.body_seen, e.trunc != 0, truncName(e.trunc),
+    });
+    try w.print(",\"request_body_bytes\":{d},\"request_body_total_bytes\":{d},\"request_body_truncated\":{},\"request_body_truncated_reason\":\"{s}\",\"request_body_nonbytes\":{},\"headers_truncated\":{}", .{
+        e.req_len,
+        e.req_total,
+        e.req_trunc != 0,
+        truncName(e.req_trunc),
+        e.flags & web_proto.CaptureEntry.flag_req_nonbytes != 0,
+        e.flags & web_proto.CaptureEntry.flag_headers_truncated != 0,
+    });
+    if (written) |wr| {
+        try w.writeAll(",\"path\":");
+        try std.json.Stringify.value(wr.path, .{}, w);
+        try w.print(",\"file_bytes\":{d},\"sha256\":\"{s}\",\"encoding\":\"{s}\"", .{ wr.bytes, wr.sha256, wr.encoding });
+    }
+    try w.writeByte('}');
+}
+
+/// One whole body, read chunk by chunk.
+const WholeBody = struct {
+    data: []const u8,
+    total: u64,
+    seen: u64,
+    trunc: u8,
+    complete: bool,
+    status: u16,
+    mime: []const u8,
+    charset: []const u8,
+    headers: []const u8,
+};
+
+const BodyRead = union(enum) { ok: WholeBody, err: Fail };
+
+fn readWholeBody(e: *webdrive.Engine, arena: std.mem.Allocator, view: u32, seq: u32, part: web_proto.CapturePart, deadline: i64) !BodyRead {
+    var out: std.ArrayList(u8) = .empty;
+    var first: ?web_proto.CaptureBody = null;
+    var last: web_proto.CaptureBody = undefined;
+    while (true) {
+        const left = deadline - clock.nowMs();
+        if (left <= 0) return .{ .err = fail(.timeout, "the body did not arrive inside the timeout") };
+        const b = e.captureBody(arena, view, seq, part, out.items.len, web_proto.MAX_CAPTURE_CHUNK, left) catch |err| return .{ .err = switch (err) {
+            error.NoCapture => fail(.conflict, NO_CAPTURE),
+            error.NoView => fail(.not_found, "that web view is gone"),
+            error.Timeout => fail(.timeout, "the browser engine did not answer the body read inside the timeout"),
+            else => try headlessFail(arena, e, err),
+        } };
+        if (b.found == 0) return .{ .err = fail(.not_found, try std.fmt.allocPrint(
+            arena,
+            "no captured exchange has seq {d}: it was never captured, or web_capture_set clear freed it (web_capture lists what is held)",
+            .{seq},
+        )) };
+        if (first == null) first = b;
+        last = b;
+        try out.appendSlice(arena, b.data.s);
+        if (b.data.s.len == 0 or out.items.len >= b.total) break;
+    }
+    const f = first.?;
+    return .{ .ok = .{
+        .data = out.items,
+        .total = last.total,
+        .seen = last.seen,
+        .trunc = last.trunc,
+        .complete = last.complete != 0,
+        .status = f.status,
+        .mime = f.mime,
+        .charset = f.charset,
+        .headers = f.headers.s,
+    } };
+}
+
+/// A body as a reader gets it: UTF-8 text (transcoded when its charset
+/// said so) or the raw bytes of a binary.
+const Presented = struct {
+    bytes: []const u8,
+    /// "utf8" or "binary".
+    kind: []const u8,
+    /// The single-byte charset the text was transcoded from, "" when it
+    /// arrived as UTF-8.
+    transcoded_from: []const u8 = "",
+};
+
+fn present(arena: std.mem.Allocator, mime: []const u8, charset: []const u8, raw: []const u8) !Presented {
+    return switch (capture.classify(mime, charset, raw)) {
+        .utf8 => .{ .bytes = raw, .kind = "utf8" },
+        .latin1, .windows1252 => |enc| .{ .bytes = try capture.toUtf8(arena, enc, raw), .kind = "utf8", .transcoded_from = charset },
+        .binary => .{ .bytes = raw, .kind = "binary" },
+    };
+}
+
+fn extensionFor(mime: []const u8, kind: []const u8) []const u8 {
+    if (std.mem.eql(u8, kind, "binary")) return ".bin";
+    const pairs = [_][2][]const u8{
+        .{ "json", ".json" }, .{ "html", ".html" }, .{ "xml", ".xml" },
+        .{ "javascript", ".js" }, .{ "css", ".css" },
+    };
+    for (pairs) |p| {
+        if (std.ascii.indexOfIgnoreCase(mime, p[0]) != null) return p[1];
+    }
+    return ".txt";
+}
+
+fn writeBodyFile(arena: std.mem.Allocator, path: []const u8, bytes: []const u8) !union(enum) { sha: []const u8, err: Fail } {
+    atomicwrite.writeFileExact(path, bytes, 0o600) catch |e| return .{ .err = fail(.io_failed, try std.fmt.allocPrint(arena, "could not write {s} ({s})", .{ path, @errorName(e) })) };
+    const hex = mcp_term.sha256File(path) orelse return .{ .sha = "" };
+    return .{ .sha = try arena.dupe(u8, &hex) };
+}
+
+/// The live capture and view, or the refusal to answer with.
+fn captureTarget(drv: Driver, arena: std.mem.Allocator, view: View) !union(enum) { ok: *webdrive.Engine, err: []const u8 } {
+    const e = switch (drv) {
+        .gui => return .{ .err = try mcp.errRes(arena, .unavailable, GUI_CAPTURE_REFUSAL) },
+        .headless => |eng| eng,
+    };
+    const v = e.findView(view.pane) orelse return .{ .err = try mcp.errRes(arena, .not_found, "that web view is gone") };
+    if (v.cap == null) return .{ .err = try mcp.errRes(arena, .conflict, NO_CAPTURE) };
+    return .{ .ok = e };
+}
+
+/// `web_capture`: page the captured exchanges, or read one body.
+fn captureTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view: View) ![]const u8 {
+    const e = switch (try captureTarget(drv, arena, view)) {
+        .ok => |eng| eng,
+        .err => |r| return r,
+    };
+    const deadline = clock.nowMs() + timeoutOf(args, 30_000);
+    if (mcp.argInt(args, "seq") != null) return captureBodyTool(e, arena, args, view, deadline);
+
+    const since: u32 = switch (try argU32(arena, args, "since")) {
+        .absent => 0,
+        .err => |f| return failRes(arena, f),
+        .value => |v| v,
+    };
+    const max: u16 = @intCast(std.math.clamp(mcp.argInt(args, "max") orelse 50, 1, 500));
+    const out_dir = mcp.argStr(args, "out_dir");
+    if (out_dir) |d| {
+        if (d.len == 0 or d[0] != '/') return mcp.errRes(arena, .invalid_args, "out_dir must be an ABSOLUTE directory on the machine running this MCP server");
+    }
+    const list = e.captureList(arena, view.pane, since, max, mcp.argBool(args, "include_in_flight"), deadline - clock.nowMs()) catch |err| return failRes(arena, switch (err) {
+        error.Timeout => fail(.timeout, "the browser engine did not answer the capture listing inside the timeout"),
+        else => try headlessFail(arena, e, err),
+    });
+    var written: []?Written = try arena.alloc(?Written, list.entries.len);
+    @memset(written, null);
+    if (out_dir) |dir| {
+        pathz.makeDirs(dir, 0o700) catch |err| return mcp.errRes(arena, .io_failed, try std.fmt.allocPrint(arena, "could not create {s} ({s})", .{ dir, @errorName(err) }));
+        for (list.entries, 0..) |ent, i| {
+            const body = switch (try readWholeBody(e, arena, view.pane, ent.seq, .response, deadline)) {
+                .ok => |b| b,
+                .err => |f| return failRes(arena, f),
+            };
+            const shown = try present(arena, body.mime, body.charset, body.data);
+            const path = try std.fmt.allocPrint(arena, "{s}/{d}{s}", .{ std.mem.trimEnd(u8, dir, "/"), ent.seq, extensionFor(body.mime, shown.kind) });
+            const sha = switch (try writeBodyFile(arena, path, shown.bytes)) {
+                .sha => |s| s,
+                .err => |f| return failRes(arena, f),
+            };
+            written[i] = .{ .path = path, .bytes = shown.bytes.len, .sha256 = sha, .encoding = shown.kind };
+        }
+    }
+    return captureListResult(arena, view, e.findView(view.pane).?.cap.?, list, since, written);
+}
+
+/// Pure builder over one listed page (unit-testable).
+fn captureListResult(
+    arena: std.mem.Allocator,
+    view: View,
+    filt: webdrive.CaptureFilter,
+    list: web_proto.CaptureList,
+    since: u32,
+    written: []const ?Written,
+) ![]const u8 {
+    var res = mcp.Res.init(arena);
+    try head(&res, arena, .headless, view);
+    try res.fact("capture_state", stateName(list.state));
+    try res.raw("capture", try captureJson(arena, &filt));
+    try res.fact("since", since);
+    try res.fact("next_since", list.next_cursor);
+    try res.fact("head_cursor", list.head_cursor);
+    try res.fact("more", list.more != 0);
+    try res.fact("count", list.entries.len);
+    try res.fact("in_flight", list.in_flight);
+    try res.fact("stored_bytes", list.stored);
+    try res.fact("max_body_bytes", list.max_body);
+    try res.fact("max_total_bytes", list.max_total);
+    var dropped_total: u64 = 0;
+    for (list.dropped) |d| dropped_total += d;
+    try res.raw("dropped", try std.fmt.allocPrint(arena, "{{\"pending_full\":{d},\"total_full\":{d},\"entries_full\":{d},\"no_memory\":{d}}}", .{
+        list.dropped[0], list.dropped[1], list.dropped[2], list.dropped[3],
+    }));
+    try res.fact("dropped_total", dropped_total);
+
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    try w.writeByte('[');
+    var truncated: usize = 0;
+    var lines: std.Io.Writer.Allocating = .init(arena);
+    for (list.entries, 0..) |ent, i| {
+        if (i != 0) try w.writeByte(',');
+        try exchangeJson(w, ent, if (i < written.len) written[i] else null);
+        if (ent.trunc != 0 or ent.req_trunc != 0) truncated += 1;
+        try lines.writer.print("[{d}] seq {d} {s} {d} {s} {d} B{s} {s}\n", .{
+            ent.cursor,
+            ent.seq,
+            ent.method,
+            ent.status,
+            if (ent.mime.len > 0) ent.mime else "-",
+            ent.body_len,
+            if (ent.trunc != 0) " TRUNCATED" else "",
+            ent.url.s,
+        });
+    }
+    try w.writeByte(']');
+    try res.raw("exchanges", aw.written());
+
+    try res.textf("{d} captured exchange(s) past cursor {d} (capture {s}); next_since {d}{s}", .{
+        list.entries.len,
+        since,
+        stateName(list.state),
+        list.next_cursor,
+        if (list.more != 0) ", MORE are held: page on with since=next_since" else "",
+    });
+    try res.textf("{d} byte(s) held of {d}; {d} exchange(s) still in flight{s}", .{
+        list.stored,
+        list.max_total,
+        list.in_flight,
+        if (list.in_flight > 0) " (listed after the finished ones only with include_in_flight:true, cursor 0; a body the page never reads keeps its load open)" else "",
+    });
+    if (truncated > 0) try res.textf("{d} exchange(s) here were TRUNCATED at a cap (body_truncated_reason says which)", .{truncated});
+    if (dropped_total > 0)
+        try res.textf("{d} matching exchange(s) were DROPPED, never recorded (dropped says why); free what you have read with web_capture_set action:\"clear\"", .{dropped_total});
+    if (written.len > 0 and written[0] != null) try res.text("bodies written to out_dir; each exchange carries its path, file_bytes and sha256");
+    if (list.entries.len > 0) try section(&res, "exchanges", lines.written());
+    try res.text(TRUST_LINE);
+    return res.finish();
+}
+
+/// Inline body budget, in output bytes (text as-is, binary as base64).
+const CAPTURE_INLINE_DEFAULT: usize = 64 * 1024;
+const CAPTURE_INLINE_MAX: usize = 1024 * 1024;
+
+fn captureBodyTool(e: *webdrive.Engine, arena: std.mem.Allocator, args: std.json.Value, view: View, deadline: i64) ![]const u8 {
+    const seq: u32 = switch (try argU32(arena, args, "seq")) {
+        .absent => unreachable,
+        .err => |f| return failRes(arena, f),
+        .value => |v| v,
+    };
+    const part_name = mcp.argStr(args, "part") orelse "response";
+    const part: web_proto.CapturePart = if (std.mem.eql(u8, part_name, "response"))
+        .response
+    else if (std.mem.eql(u8, part_name, "request"))
+        .request
+    else
+        return mcp.errRes(arena, .invalid_args, "part must be \"response\" (default) or \"request\"");
+    const out_file = mcp.argStr(args, "out_file");
+    if (out_file) |p| {
+        if (p.len == 0 or p[0] != '/') return mcp.errRes(arena, .invalid_args, "out_file must be an ABSOLUTE path on the machine running this MCP server");
+    }
+    const inline_max: usize = @intCast(std.math.clamp(mcp.argInt(args, "max_bytes") orelse CAPTURE_INLINE_DEFAULT, 1, CAPTURE_INLINE_MAX));
+    const body = switch (try readWholeBody(e, arena, view.pane, seq, part, deadline)) {
+        .ok => |b| b,
+        .err => |f| return failRes(arena, f),
+    };
+    // A request body carries the request's own type, which the exchange
+    // does not record; its bytes decide.
+    const shown = if (part == .response)
+        try present(arena, body.mime, body.charset, body.data)
+    else
+        try present(arena, "", "", body.data);
+    var file: ?Written = null;
+    if (out_file) |path| {
+        const sha = switch (try writeBodyFile(arena, path, shown.bytes)) {
+            .sha => |s| s,
+            .err => |f| return failRes(arena, f),
+        };
+        file = .{ .path = path, .bytes = shown.bytes.len, .sha256 = sha, .encoding = shown.kind };
+    }
+    return captureBodyResult(arena, view, seq, part_name, body, shown, file, inline_max);
+}
+
+/// Pure builder for one body (unit-testable).
+fn captureBodyResult(
+    arena: std.mem.Allocator,
+    view: View,
+    seq: u32,
+    part: []const u8,
+    body: WholeBody,
+    shown: Presented,
+    file: ?Written,
+    inline_max: usize,
+) ![]const u8 {
+    var res = mcp.Res.init(arena);
+    try head(&res, arena, .headless, view);
+    const is_response = std.mem.eql(u8, part, "response");
+    try res.fact("seq", seq);
+    try res.fact("part", part);
+    try res.fact("complete", body.complete);
+    try res.fact("status", body.status);
+    try res.fact("mime", body.mime);
+    try res.fact("charset", body.charset);
+    try res.fact("stored_bytes", body.total);
+    try res.fact("delivered_bytes", body.seen);
+    try res.fact("capture_truncated", body.trunc != 0);
+    try res.fact("capture_truncated_reason", truncName(body.trunc));
+    try res.fact("encoding", if (std.mem.eql(u8, shown.kind, "binary")) (if (file != null) "binary" else "base64") else "utf8");
+    if (shown.transcoded_from.len > 0) try res.fact("transcoded_from", shown.transcoded_from);
+    if (is_response) {
+        // The engine's own header list, verbatim JSON.
+        const headers = if (body.headers.len > 0 and std.json.validate(arena, body.headers) catch false) body.headers else "[]";
+        try res.raw("headers", headers);
+    }
+    if (!body.complete)
+        try res.text("the exchange has NOT finished: this body may still grow (web_wait for:\"response\" waits for it)");
+    if (body.trunc != 0)
+        try res.textf("the CAPTURE cut this body at a cap ({s}): {d} of the {d} bytes the page received are held", .{ truncName(body.trunc), body.total, body.seen });
+    if (shown.transcoded_from.len > 0) try res.textf("transcoded to UTF-8 from {s}", .{shown.transcoded_from});
+    if (file) |f| {
+        try res.fact("out_file", f.path);
+        try res.fact("bytes", f.bytes);
+        try res.fact("sha256", f.sha256);
+        try res.textf("wrote {d} bytes ({s}) to {s}; the body is not in this reply", .{ f.bytes, f.encoding, f.path });
+        return res.finish();
+    }
+    const binary = std.mem.eql(u8, shown.kind, "binary");
+    var out: []const u8 = shown.bytes;
+    var cut = false;
+    if (binary) {
+        // Whole base64 groups only, so the prefix still decodes.
+        const enc = std.base64.standard.Encoder;
+        var raw_len = shown.bytes.len;
+        if (enc.calcSize(raw_len) > inline_max) {
+            raw_len = (inline_max / 4) * 3;
+            cut = true;
+        }
+        const buf = try arena.alloc(u8, enc.calcSize(raw_len));
+        out = enc.encode(buf, shown.bytes[0..raw_len]);
+    } else if (out.len > inline_max) {
+        var n = inline_max;
+        while (n > 0 and (out[n] & 0xC0) == 0x80) n -= 1;
+        out = out[0..n];
+        cut = true;
+    }
+    try res.fact("bytes", shown.bytes.len);
+    try res.fact("inline_truncated", cut);
+    try res.fact("body", out);
+    if (cut) try res.textf("INLINE limit: {d} of {d} bytes are in 'body'; pass out_file for the whole body, or a larger max_bytes (at most {d})", .{ out.len, shown.bytes.len, CAPTURE_INLINE_MAX });
+    try res.textf("{s} body of exchange {d}: {d} bytes as {s}", .{ part, seq, shown.bytes.len, if (binary) "base64" else "UTF-8 text" });
+    try section(&res, "body", if (binary) "(binary: the base64 is in structuredContent.body)" else out);
+    try res.text(TRUST_LINE);
+    return res.finish();
+}
+
+/// `web_capture_set`: NARROW a live capture. There is no install and
+/// no widening here, the same rule a live policy follows.
+fn captureSetTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view: View) ![]const u8 {
+    const e = switch (try captureTarget(drv, arena, view)) {
+        .ok => |eng| eng,
+        .err => |r| return r,
+    };
+    const action = mcp.argStr(args, "action") orelse
+        return mcp.errRes(arena, .invalid_args, "web_capture_set needs 'action': \"clear\" or \"disable\"");
+    const op: web_proto.CaptureOp = if (std.mem.eql(u8, action, "clear"))
+        .clear
+    else if (std.mem.eql(u8, action, "disable"))
+        .disable
+    else
+        return mcp.errRes(arena, .refused, try std.fmt.allocPrint(
+            arena,
+            "'{s}' is not a narrowing: a live capture can only be cleared or disabled; a wider or new one needs a new view (web_open capture:...)",
+            .{action},
+        ));
+    const upto: u32 = switch (try argU32(arena, args, "upto")) {
+        .absent => 0,
+        .err => |f| return failRes(arena, f),
+        .value => |v| v,
+    };
+    if (op == .disable and upto != 0) return mcp.errRes(arena, .invalid_args, "'upto' belongs to action \"clear\"");
+    e.captureNarrow(view.pane, op, upto) catch |err| return failRes(arena, try headlessFail(arena, e, err));
+    // Read the result back: frame order puts the list after the change.
+    const after = e.captureList(arena, view.pane, std.math.maxInt(u32), 1, false, timeoutOf(args, 5_000)) catch |err| return failRes(arena, try headlessFail(arena, e, err));
+    var res = mcp.Res.init(arena);
+    try head(&res, arena, .headless, view);
+    try res.fact("action", action);
+    if (op == .clear) try res.fact("upto", upto);
+    try res.fact("capture_state", stateName(after.state));
+    try res.fact("stored_bytes", after.stored);
+    try res.fact("in_flight", after.in_flight);
+    try res.fact("head_cursor", after.head_cursor);
+    if (op == .clear) {
+        if (upto == 0)
+            try res.textf("cleared every captured exchange, in-flight ones included; {d} byte(s) held now", .{after.stored})
+        else
+            try res.textf("cleared the finished exchanges up to cursor {d}; {d} byte(s) held now", .{ upto, after.stored });
+    } else {
+        try res.text("capture disabled: nothing new is recorded; what is held stays readable with web_capture");
+    }
+    return res.finish();
+}
+
+/// `web_wait for:"response"`: a captured exchange matching `response`
+/// finished after cursor `since` (default: now), or, with `after_seq`,
+/// one whose request came after that network-log seq.
+fn waitResponse(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view: View) ![]const u8 {
+    const e = switch (try captureTarget(drv, arena, view)) {
+        .ok => |eng| eng,
+        .err => |r| return r,
+    };
+    const parsed: ParsedCapture = switch (try parseCapture(arena, if (args == .object) args.object.get("response") else null, "response", .wait)) {
+        .none => .{ .filter = .{ .types = 0 } },
+        .err => |f| return failRes(arena, f),
+        .parsed => |p| p,
+    };
+    var matcher = try capture.Filter.build(arena, captureSetOf(&parsed.filter));
+    _ = &matcher;
+    const after_seq: ?u32 = switch (try argU32(arena, args, "after_seq")) {
+        .absent => null,
+        .err => |f| return failRes(arena, f),
+        .value => |v| v,
+    };
+    const budget = @min(timeoutOf(args, 15_000), mcp.WAIT_CAP_MS);
+    const deadline = clock.nowMs() + budget;
+    var cursor: u32 = switch (try argU32(arena, args, "since")) {
+        .err => |f| return failRes(arena, f),
+        .value => |v| v,
+        // "After now", unless the caller named a request seq: then an
+        // exchange that already finished counts too.
+        .absent => if (after_seq != null) 0 else blk: {
+            const now = e.captureList(arena, view.pane, std.math.maxInt(u32), 1, false, budget) catch |err| return failRes(arena, try headlessFail(arena, e, err));
+            break :blk now.head_cursor;
+        },
+    };
+    const start = cursor;
+    var in_flight: u32 = 0;
+    while (true) {
+        const left = deadline - clock.nowMs();
+        if (left <= 0) break;
+        const list = e.captureList(arena, view.pane, cursor, 100, false, left) catch |err| switch (err) {
+            error.Timeout => break,
+            else => return failRes(arena, try headlessFail(arena, e, err)),
+        };
+        in_flight = list.in_flight;
+        for (list.entries) |ent| {
+            cursor = ent.cursor;
+            if (after_seq) |s| {
+                if (ent.seq <= s) continue;
+            }
+            if (parsed.status != 0 and ent.status != parsed.status) continue;
+            const host = try std.ascii.allocLowerString(arena, urlhost.hostOf(ent.url.s, urlhost.filtering));
+            const rt = std.enums.fromInt(filter.RType, ent.rtype) orelse .other;
+            if (!matcher.matchRequest(ent.url.s, host, rt, ent.method) or !matcher.matchMime(ent.mime)) continue;
+            return waitResponseResult(arena, view, ent, list.next_cursor);
+        }
+        if (list.more != 0) continue;
+        drv.sleep(150);
+    }
+    return mcp.errRes(arena, .timeout, try std.fmt.allocPrint(
+        arena,
+        "web_wait for response never held: no captured exchange matching the filter finished after cursor {d}{s} inside the timeout ({d} still in flight - a body the page never reads keeps its load open; web_capture include_in_flight:true lists those, and their bodies are readable)",
+        .{ start, if (after_seq) |s| try std.fmt.allocPrint(arena, " with a seq above {d}", .{s}) else "", in_flight },
+    ));
+}
+
+fn waitResponseResult(arena: std.mem.Allocator, view: View, ent: web_proto.CaptureEntry, next_since: u32) ![]const u8 {
+    var res = mcp.Res.init(arena);
+    try head(&res, arena, .headless, view);
+    try res.fact("waited_for", "response");
+    try res.field("settled", true);
+    try res.fact("detail", "a captured response matching the filter finished");
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    try exchangeJson(&aw.writer, ent, null);
+    try res.raw("response", aw.written());
+    try res.fact("next_since", next_since);
+    try res.textf("response finished: seq {d}, cursor {d}, status {d}, {d} body bytes (web_capture seq:{d} reads it)", .{ ent.seq, ent.cursor, ent.status, ent.body_len, ent.seq });
+    try section(&res, "url", ent.url.s);
+    return res.finish();
 }
 
 /// One eval that reports where the page is scrolled to, so "nothing
@@ -4667,6 +5429,7 @@ fn downloadListResult(drv: Driver, arena: std.mem.Allocator, view: View) ![]cons
 
 fn waitTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view: View) ![]const u8 {
     const what = mcp.argStr(args, "for") orelse "load";
+    if (std.mem.eql(u8, what, "response")) return waitResponse(drv, arena, args, view);
     const arg = mcp.argStr(args, "arg") orelse "";
     // Waiting for a load that policy will refuse would just burn the
     // whole timeout; the other waits read state that already exists.
@@ -4758,7 +5521,7 @@ fn waitTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view: V
                 },
             }
         } else {
-            return mcp.errRes(arena, .invalid_args, "web_wait 'for' must be load, title, text or idle");
+            return mcp.errRes(arena, .invalid_args, "web_wait 'for' must be load, title, text, idle or response");
         }
         if (drv.now() >= deadline) break;
         drv.sleep(150);
@@ -4912,7 +5675,7 @@ test "a refused certificate is a fact and a sentence on every result, and web_op
     v.load_error = .{ .code = -202, .url = "https://10.47.0.1/", .msg = "ERR_CERT_AUTHORITY_INVALID" };
     try t.expect(v.loadBlocked());
 
-    const opened = try openResult(arena, .headless, v, false, false, null, "skipped: the requested page did not load", null, "none", 1);
+    const opened = try openResult(arena, .headless, v, false, false, null, "skipped: the requested page did not load", null, "none", null, 1);
     const parsed = try mcp.expectToolResultShape(arena, "web_open", opened);
     const sc = parsed.object.get("structuredContent").?.object;
     try t.expect(!sc.get("settled").?.bool);
@@ -4960,7 +5723,7 @@ test "a network-change retry is a fact and a sentence, and does not block the lo
     v.load_retry = .{ .code = -21, .url = "https://planet.test/", .msg = "ERR_NETWORK_CHANGED" };
     try t.expect(!v.loadBlocked());
 
-    const opened = try openResult(arena, .headless, v, true, false, null, "", null, "none", 1);
+    const opened = try openResult(arena, .headless, v, true, false, null, "", null, "none", null, 1);
     const parsed = try mcp.expectToolResultShape(arena, "web_open", opened);
     const sc = parsed.object.get("structuredContent").?.object;
     try t.expect(sc.get("settled").?.bool);
@@ -4990,7 +5753,7 @@ test "web_open: the snapshot rides both lanes, situational notes only in text" {
         .document = 1,
         .revision = 4,
         .tree = tree,
-    }, null, null, "none", 1);
+    }, null, null, "none", null, 1);
     const parsed = try mcp.expectToolResultShape(arena, "web_open", settled);
     const sc = parsed.object.get("structuredContent").?.object;
     try t.expect(sc.get("settled").?.bool);
@@ -5011,7 +5774,7 @@ test "web_open: the snapshot rides both lanes, situational notes only in text" {
 
     // Unsettled + an ignored 'where': one short line each, and the
     // ignored placement is also a machine fact.
-    const rough = try openResult(arena, .headless, EXAMPLE, false, true, null, "the page did not answer a first snapshot in time", null, "none", 3);
+    const rough = try openResult(arena, .headless, EXAMPLE, false, true, null, "the page did not answer a first snapshot in time", null, "none", null, 3);
     const rp = try mcp.expectToolResultShape(arena, "web_open", rough);
     const rsc = rp.object.get("structuredContent").?.object;
     try t.expect(!rsc.get("settled").?.bool);
@@ -5215,6 +5978,228 @@ test "web_eval body is wrapped in an ASYNC function and asks for a real page bud
     try t.expect(std.mem.indexOf(u8, req, "(async () =>") != null);
     try t.expect(std.mem.indexOf(u8, req, "\"await_promise\":true") != null);
     try t.expect(std.mem.indexOf(u8, req, "\"max_chars\":256000") != null);
+}
+
+fn parseCaptureJson(arena: std.mem.Allocator, json: []const u8, comptime mode: @TypeOf(.open)) !CaptureParse {
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, arena, json, .{});
+    return parseCapture(arena, v, "capture", mode);
+}
+
+fn parseCaptureWait(arena: std.mem.Allocator, json: []const u8) !CaptureParse {
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, arena, json, .{});
+    return parseCapture(arena, v, "response", .wait);
+}
+
+test "capture parse: defaults, folding, and every refusal names what was wrong" {
+    var arena_state = testArena();
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const t = std.testing;
+
+    const ok = (try parseCaptureJson(arena,
+        \\{"hosts":["Spotify.com"],"methods":["post","get"],"mime_prefixes":["Application/JSON"],"url_contains":"/pathfinder/","url_regex":"operationName=fetch","max_body_bytes":1024,"max_total_bytes":4096}
+    , .open)).parsed.filter;
+    try t.expectEqual(capture.DEFAULT_TYPES, ok.types);
+    try t.expectEqualStrings("spotify.com", ok.hosts[0]);
+    try t.expectEqualStrings("POST", ok.methods[0]);
+    try t.expectEqualStrings("application/json", ok.mime_prefixes[0]);
+    try t.expectEqual(@as(u32, 1024), ok.max_body);
+    try t.expectEqual(@as(u64, 4096), ok.max_total);
+    const empty = (try parseCaptureJson(arena, "{}", .open)).parsed.filter;
+    try t.expectEqual(capture.DEFAULT_MAX_BODY, empty.max_body);
+    try t.expectEqual(capture.DEFAULT_MAX_TOTAL, empty.max_total);
+
+    const cases = [_]struct { json: []const u8, needle: []const u8 }{
+        .{ .json = "{\"types\":[\"fetch\"]}", .needle = "\"xhr\"" },
+        .{ .json = "{\"types\":[\"xhrs\"]}", .needle = "not a resource class" },
+        .{ .json = "{\"typs\":[\"xhr\"]}", .needle = "'capture.typs' is not a capture field" },
+        .{ .json = "{\"url_regex\":\"(unclosed[\"}", .needle = "not a supported pattern" },
+        .{ .json = "{\"hosts\":[\"*.spotify.com\"]}", .needle = "not a usable host" },
+        .{ .json = "{\"methods\":[\"GET /\"]}", .needle = "not an HTTP method" },
+        .{ .json = "{\"max_body_bytes\":0}", .needle = "refused, never clamped" },
+        .{ .json = "{\"max_total_bytes\":99999999999}", .needle = "refused, never clamped" },
+        .{ .json = "{\"max_body_bytes\":8192,\"max_total_bytes\":4096}", .needle = "cannot exceed" },
+        .{ .json = "{\"hosts\":[]}", .needle = "must not be empty" },
+        .{ .json = "{\"status\":200}", .needle = "only filters a web_wait" },
+        .{ .json = "[]", .needle = "must be an object" },
+    };
+    for (cases) |cs| {
+        switch (try parseCaptureJson(arena, cs.json, .open)) {
+            .err => |f| {
+                if (std.mem.indexOf(u8, f.text, cs.needle) == null) {
+                    std.debug.print("{s}: got '{s}'\n", .{ cs.json, f.text });
+                    return error.WrongRefusal;
+                }
+                try t.expectEqual(mcp.ErrCode.invalid_args, f.code);
+            },
+            else => {
+                std.debug.print("{s}: was accepted\n", .{cs.json});
+                return error.NotRefused;
+            },
+        }
+    }
+
+    // The wait filter: any class by default, status allowed, caps not.
+    const w = (try parseCaptureWait(arena, "{\"url_contains\":\"/api/\",\"status\":200}")).parsed;
+    try t.expectEqual(@as(u16, 0), w.filter.types);
+    try t.expectEqual(@as(u16, 200), w.status);
+    switch (try parseCaptureWait(arena, "{\"max_body_bytes\":10}")) {
+        .err => |f| try t.expect(std.mem.indexOf(u8, f.text, "not a response filter field") != null),
+        else => return error.NotRefused,
+    }
+}
+
+const CAP_ENTRY = web_proto.CaptureEntry{
+    .seq = 41,
+    .cursor = 3,
+    .rtype = @intFromEnum(filter.RType.xhr),
+    .flags = web_proto.CaptureEntry.flag_complete,
+    .status = 200,
+    .err = 0,
+    .trunc = @intFromEnum(web_proto.CaptureTrunc.body_cap),
+    .req_trunc = 0,
+    .body_len = 1024,
+    .body_seen = 4096,
+    .req_len = 20,
+    .req_total = 20,
+    .started_ms = 1_790_000_000_000,
+    .dur_ms = 55,
+    .method = "POST",
+    .mime = "application/json",
+    .charset = "utf-8",
+    .url = .{ .s = "https://api.example/{pathfinder}/v1?x=1" },
+};
+
+test "web_capture list: exchanges are facts, truncation and drops are said, urls stay out of the prose" {
+    var arena_state = testArena();
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const t = std.testing;
+
+    const list = web_proto.CaptureList{
+        .view = 12,
+        .serial = 1,
+        .state = @intFromEnum(web_proto.CaptureState.active),
+        .more = 1,
+        .max_body = 1024,
+        .max_total = 1 << 20,
+        .stored = 1044,
+        .in_flight = 2,
+        .next_cursor = 3,
+        .head_cursor = 7,
+        .dropped = .{ 0, 5, 0, 0 },
+        .entries = &.{CAP_ENTRY},
+    };
+    const written = [_]?Written{.{ .path = "/tmp/x/41.json", .bytes = 1024, .sha256 = "ab" ** 32, .encoding = "utf8" }};
+    const out = try captureListResult(arena, EXAMPLE, .{ .mime_prefixes = &.{"application/json"} }, list, 0, &written);
+    const parsed = try mcp.expectToolResultShape(arena, "web_capture", out);
+    const sc = parsed.object.get("structuredContent").?.object;
+    try t.expectEqualStrings("active", sc.get("capture_state").?.string);
+    try t.expect(sc.get("more").?.bool);
+    try t.expectEqual(@as(i64, 3), sc.get("next_since").?.integer);
+    try t.expectEqual(@as(i64, 7), sc.get("head_cursor").?.integer);
+    try t.expectEqual(@as(i64, 5), sc.get("dropped_total").?.integer);
+    try t.expectEqual(@as(i64, 5), sc.get("dropped").?.object.get("total_full").?.integer);
+    const ex = sc.get("exchanges").?.array.items[0].object;
+    try t.expectEqual(@as(i64, 41), ex.get("seq").?.integer);
+    try t.expectEqualStrings("xhr", ex.get("type").?.string);
+    try t.expect(ex.get("body_truncated").?.bool);
+    try t.expectEqualStrings("body_cap", ex.get("body_truncated_reason").?.string);
+    try t.expectEqual(@as(i64, 4096), ex.get("body_delivered_bytes").?.integer);
+    try t.expectEqualStrings("/tmp/x/41.json", ex.get("path").?.string);
+    try t.expectEqualStrings("application/json", sc.get("capture").?.object.get("mime_prefixes").?.array.items[0].string);
+    const text = parsed.object.get("content").?.array.items[0].object.get("text").?.string;
+    try t.expect(std.mem.indexOf(u8, text, "TRUNCATED at a cap") != null);
+    try t.expect(std.mem.indexOf(u8, text, "DROPPED") != null);
+    try t.expect(std.mem.indexOf(u8, text, "MORE are held") != null);
+}
+
+test "web_capture body: text inline with a flagged prefix, binary as whole base64 groups, a file keeps it out" {
+    var arena_state = testArena();
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const t = std.testing;
+
+    const body = WholeBody{
+        .data = "{\"a\":\"caf\u{00e9}\"}",
+        .total = 15,
+        .seen = 15,
+        .trunc = 0,
+        .complete = true,
+        .status = 200,
+        .mime = "application/json",
+        .charset = "",
+        .headers = "[{\"name\":\"content-type\",\"value\":\"application/json\"}]",
+    };
+    const text = try present(arena, body.mime, body.charset, body.data);
+    const whole = try captureBodyResult(arena, EXAMPLE, 41, "response", body, text, null, 1024);
+    var sc = (try mcp.expectToolResultShape(arena, "web_capture", whole)).object.get("structuredContent").?.object;
+    try t.expectEqualStrings("utf8", sc.get("encoding").?.string);
+    try t.expectEqualStrings(body.data, sc.get("body").?.string);
+    try t.expect(!sc.get("inline_truncated").?.bool);
+    try t.expectEqualStrings("content-type", sc.get("headers").?.array.items[0].object.get("name").?.string);
+
+    // A prefix is cut on a UTF-8 boundary and says so.
+    const cut = try captureBodyResult(arena, EXAMPLE, 41, "response", body, text, null, 12);
+    sc = (try mcp.expectToolResultShape(arena, "web_capture", cut)).object.get("structuredContent").?.object;
+    try t.expect(sc.get("inline_truncated").?.bool);
+    try t.expect(std.unicode.utf8ValidateSlice(sc.get("body").?.string));
+    try t.expect(sc.get("body").?.string.len <= 12);
+
+    // Binary: base64, cut only at whole groups.
+    var png = body;
+    png.mime = "image/png";
+    png.data = "\x89PNG\r\n\x1a\n\x00\x00";
+    const bin = try present(arena, png.mime, png.charset, png.data);
+    const b64 = try captureBodyResult(arena, EXAMPLE, 42, "response", png, bin, null, 8);
+    sc = (try mcp.expectToolResultShape(arena, "web_capture", b64)).object.get("structuredContent").?.object;
+    try t.expectEqualStrings("base64", sc.get("encoding").?.string);
+    try t.expectEqualStrings("iVBORw0K", sc.get("body").?.string);
+    try t.expect(sc.get("inline_truncated").?.bool);
+
+    // Latin-1 text is transcoded and says from what.
+    var lat = body;
+    lat.mime = "text/plain";
+    lat.charset = "iso-8859-1";
+    lat.data = "caf\xe9";
+    const shown = try present(arena, lat.mime, lat.charset, lat.data);
+    const l = try captureBodyResult(arena, EXAMPLE, 43, "response", lat, shown, null, 1024);
+    sc = (try mcp.expectToolResultShape(arena, "web_capture", l)).object.get("structuredContent").?.object;
+    try t.expectEqualStrings("caf\u{00e9}", sc.get("body").?.string);
+    try t.expectEqualStrings("iso-8859-1", sc.get("transcoded_from").?.string);
+
+    // out_file: identity only, no body.
+    const f = try captureBodyResult(arena, EXAMPLE, 41, "response", body, text, .{ .path = "/tmp/b.json", .bytes = 15, .sha256 = "cd" ** 32, .encoding = "utf8" }, 1024);
+    sc = (try mcp.expectToolResultShape(arena, "web_capture", f)).object.get("structuredContent").?.object;
+    try t.expect(sc.get("body") == null);
+    try t.expectEqualStrings("/tmp/b.json", sc.get("out_file").?.string);
+}
+
+test "web_wait for:response reports the exchange and the cursor to wait on next" {
+    var arena_state = testArena();
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const t = std.testing;
+    const out = try waitResponseResult(arena, EXAMPLE, CAP_ENTRY, 3);
+    const sc = (try mcp.expectToolResultShape(arena, "web_wait", out)).object.get("structuredContent").?.object;
+    try t.expectEqualStrings("response", sc.get("waited_for").?.string);
+    try t.expectEqual(@as(i64, 41), sc.get("response").?.object.get("seq").?.integer);
+    try t.expectEqual(@as(i64, 3), sc.get("next_since").?.integer);
+}
+
+test "web_open echoes the installed capture" {
+    var arena_state = testArena();
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const t = std.testing;
+    const f = webdrive.CaptureFilter{ .mime_prefixes = &.{"application/json"}, .types = 0 };
+    const out = try openResult(arena, .headless, EXAMPLE, true, false, null, null, null, "none", &f, 1);
+    const sc = (try mcp.expectToolResultShape(arena, "web_open", out)).object.get("structuredContent").?.object;
+    try t.expect(sc.get("capture_active").?.bool);
+    const cap = sc.get("capture").?.object;
+    // types 0 = every class, spelled out.
+    try t.expectEqual(@as(usize, 11), cap.get("types").?.array.items.len);
+    try t.expectEqual(@as(i64, capture.DEFAULT_MAX_BODY), cap.get("max_body_bytes").?.integer);
 }
 
 test "web_eval out_file writes the whole result and keeps it out of the reply" {
@@ -5767,7 +6752,7 @@ test "web_open routes: the GUI is told, a bad grammar is refused, headless says 
     // served on the direct path.
     var engine = webdrive.Engine{ .gpa = arena, .dir = @constCast(""), .client_name = @constCast("") };
     const headless = Driver{ .headless = &engine };
-    const no = try openView(headless, arena, "https://example.com/", "tab", 800, 600, .default, null, "on:box");
+    const no = try openView(headless, arena, "https://example.com/", "tab", 800, 600, .default, null, null, "on:box");
     try t.expectEqual(mcp.ErrCode.unavailable, no.err.code);
     try t.expect(std.mem.indexOf(u8, no.err.text, "web_backend") != null);
     try t.expect(std.mem.indexOf(u8, no.err.text, "never silently browse direct") != null);
@@ -6003,13 +6988,13 @@ test "a GUI-attached server refuses profiles before it opens anything" {
     // Named AND ephemeral: both are identity requests the GUI's own
     // containers already answer, so both are refused here.
     for ([_]webdrive.ProfileSpec{ .{ .named = "work" }, .ephemeral }) |spec| {
-        const out = try openView(drv, arena, "https://example.com/", "tab", 800, 600, spec, null, null);
+        const out = try openView(drv, arena, "https://example.com/", "tab", 800, 600, spec, null, null, null);
         try t.expectEqual(mcp.ErrCode.invalid_args, out.err.code);
         try t.expect(std.mem.indexOf(u8, out.err.text, "headless-only") != null);
     }
     // The default identity still goes through to the (exploding) GUI,
     // proving the refusal is about the profile and nothing else.
-    const plain = try openView(drv, arena, "https://example.com/", "tab", 800, 600, .default, null, null);
+    const plain = try openView(drv, arena, "https://example.com/", "tab", 800, 600, .default, null, null, null);
     try t.expectEqual(mcp.ErrCode.unavailable, plain.err.code);
 }
 
@@ -6155,7 +7140,7 @@ test "web_open and web_tabs carry the identity a view lives in" {
     in_profile.profile = "work";
     in_profile.profile_kind = "named";
     in_profile.context = 3;
-    const opened = try openResult(arena, .headless, in_profile, true, false, null, null, null, "none", 1);
+    const opened = try openResult(arena, .headless, in_profile, true, false, null, null, null, "none", null, 1);
     const op = try mcp.expectToolResultShape(arena, "web_open", opened);
     const osc = op.object.get("structuredContent").?.object;
     try t.expectEqualStrings("work", osc.get("profile").?.string);
@@ -6168,7 +7153,7 @@ test "web_open and web_tabs carry the identity a view lives in" {
     ) != null);
 
     // The default jar spends no words and no keys beyond the honest ones.
-    const plain = try openResult(arena, .headless, EXAMPLE, true, false, null, null, null, "none", 1);
+    const plain = try openResult(arena, .headless, EXAMPLE, true, false, null, null, null, "none", null, 1);
     const psc = (try mcp.expectToolResultShape(arena, "web_open", plain)).object.get("structuredContent").?.object;
     try t.expectEqualStrings("", psc.get("profile").?.string);
     try t.expectEqualStrings("default", psc.get("profile_kind").?.string);
@@ -6207,7 +7192,7 @@ test "every tool this module serves declares an output schema" {
             return error.MissingOutputSchema;
         }
     }
-    try std.testing.expectEqual(@as(usize, 25), seen);
+    try std.testing.expectEqual(@as(usize, 27), seen);
 }
 
 test "parsePolicy fails closed on every unknown name, wildcard and port" {
@@ -6344,7 +7329,7 @@ test "GUI mode refuses a policy outright: the tabs are the user's" {
 
     const pol = webdrive.NetPolicy{ .allow_top = &.{"site.example"} };
     const drv = Driver{ .gui = unusedBackend() };
-    const out = try openView(drv, arena, "https://site.example/", "tab", 800, 600, .default, &pol, null);
+    const out = try openView(drv, arena, "https://site.example/", "tab", 800, 600, .default, &pol, null, null);
     try t.expectEqual(mcp.ErrCode.unavailable, out.err.code);
     try t.expect(std.mem.indexOf(u8, out.err.text, "headless-only") != null);
 }

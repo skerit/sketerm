@@ -290,6 +290,20 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
                 "web_download is available once the browser engine starts; it fetches a url INSIDE a view's browser (its cookies and session) straight to a file")
         else
             try res.text("this browser helper cannot download through a view (capabilities 'downloads' + 'download-start')");
+        // Response-body capture: a fail-closed open option, so a
+        // consumer must be able to preflight it rather than trip over
+        // the refusal.
+        const cp = @import("mcp_web.zig").captureCapability();
+        try res.fact("web_capture", cp.supported);
+        if (cp.supported)
+            try res.text(if (cp.started)
+                "web_open capture:{...} records the response bodies a headless view's page receives; web_capture reads them, web_wait for:\"response\" waits for the next one"
+            else
+                "response-body capture (web_open capture:{...}) is available once the browser engine starts")
+        else if (gui_web)
+            try res.text("response-body capture is headless only: the web tools drive the user's own tabs here")
+        else
+            try res.text("this browser helper cannot capture response bodies (capability 'capture'); a captured web_open is refused");
         try res.fact("web_accept_cert", !gui_web);
         try res.text(if (gui_web)
             "certificate errors: the user's interstitial decides; results carry cert facts while a load is held"

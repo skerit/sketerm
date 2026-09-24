@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const c = @import("c.zig").c;
+const tcpserver = @import("smoke/tcpserver.zig");
 const pathz = @import("util/pathz.zig");
 const lifetime = @import("util/lifetime.zig");
 const muxclient = @import("mux/client.zig");
@@ -669,6 +670,17 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         defer _ = c.unsetenv("SKETERM_WEB_BIN");
         webSharedProfileStage(allocator, exe, rt);
         say("smoke-mcp: focused shared-profile stage ok");
+        return 0;
+    }
+    if (c.getenv("SKETERM_SMOKE_MCP_WEBCAPTURE_ONLY") != null) {
+        var bin_buf: [4096:0]u8 = undefined;
+        const web_bin = resolveWebBin(&bin_buf) orelse fail("sketerm-webengine not built for the capture stage");
+        _ = c.setenv("SKETERM_WEB_BIN", web_bin, 1);
+        defer _ = c.unsetenv("SKETERM_WEB_BIN");
+        _ = c.setenv("SKETERM_WEB_BROKER_ENGINE", "0", 1);
+        defer _ = c.unsetenv("SKETERM_WEB_BROKER_ENGINE");
+        webCaptureStage(allocator, exe, rt);
+        say("smoke-mcp: focused response-body capture ok");
         return 0;
     }
     if (c.getenv("SKETERM_SMOKE_MCP_WEBPRESENTER_ONLY") != null) {
@@ -2199,6 +2211,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             say("smoke-mcp: headless web tools ok");
             webPolicyStage(allocator, exe, rt);
             say("smoke-mcp: enforced network policy (real CEF) ok");
+            webCaptureStage(allocator, exe, rt);
+            say("smoke-mcp: response-body capture (real CEF) ok");
             _ = c.unsetenv("SKETERM_WEB_BROKER_ENGINE");
             webSharedProfileStage(allocator, exe, rt);
             say("smoke-mcp: broker-owned shared profiles (real CEF) ok");
@@ -3670,6 +3684,251 @@ fn webStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) vo
 /// Real-CEF proof of the ENFORCED network policy: every assertion here
 /// is a server-side HIT COUNTER, because the whole point is that a
 /// refused request never touches a socket.
+// -- response-body capture, end to end through the MCP tools ----------
+
+/// The page, its fetches, and a JSON a request body round-trips through.
+const CapHttp = struct {
+    lis: tcpserver.Listener = .{ .backlog = 32, .poll_ms = 100 },
+
+    const page =
+        \\<!doctype html><html><head><title>cap-mcp</title></head><body>
+        \\<script>
+        \\fetch("/api/first").then(r => r.text()).then(() => fetch("/api/gql", { method: "POST",
+        \\  headers: { "content-type": "application/json" },
+        \\  body: JSON.stringify({ operationName: "fetchPlaylist", variables: { offset: 25 } }) }))
+        \\  .then(r => r.text()).then(() => fetch("/api/raw.bin")).then(r => r.text())
+        \\  .then(() => { document.title = "cap-mcp-done"; });
+        \\</script></body></html>
+    ;
+    const first = "{\"items\":[\"one\",\"two\"],\"next\":25}";
+    const gql = "{\"data\":{\"playlist\":{\"tracks\":[\"A\",\"B\"]}}}";
+    const later = "{\"items\":[\"three\"],\"next\":null}";
+
+    fn start(self: *CapHttp) bool {
+        return self.lis.start(self, &onConn);
+    }
+
+    fn onConn(_: ?*anyopaque, afd: c_int) bool {
+        var buf: [8192]u8 = undefined;
+        var n: usize = 0;
+        // Headers, then a Content-Length body: a POST's body may come in
+        // its own packet.
+        while (n < buf.len) {
+            var pfd = c.struct_pollfd{ .fd = afd, .events = c.POLLIN, .revents = 0 };
+            if (c.poll(@ptrCast(&pfd), 1, 3000) <= 0) break;
+            const r = c.read(afd, &buf[n], buf.len - n);
+            if (r <= 0) break;
+            n += @intCast(r);
+            const end = std.mem.indexOf(u8, buf[0..n], "\r\n\r\n") orelse continue;
+            const cl_at = std.ascii.indexOfIgnoreCase(buf[0..end], "content-length:") orelse break;
+            const line_end = std.mem.indexOfPos(u8, buf[0..end], cl_at, "\r\n") orelse end;
+            const want = std.fmt.parseInt(usize, std.mem.trim(u8, buf[cl_at + 15 .. line_end], " "), 10) catch 0;
+            if (n >= end + 4 + want) break;
+        }
+        const raw = buf[0..n];
+        const path_start = (std.mem.indexOfScalar(u8, raw, ' ') orelse return false) + 1;
+        const path_end = std.mem.indexOfScalarPos(u8, raw, path_start, ' ') orelse return false;
+        const path = raw[path_start..path_end];
+        const eq = std.mem.eql;
+        if (eq(u8, path, "/page")) tcpserver.respondOk(afd, "text/html", page, "") else if (std.mem.startsWith(u8, path, "/api/first")) tcpserver.respondOk(afd, "application/json", first, "") else if (eq(u8, path, "/api/gql")) tcpserver.respondOk(afd, "application/json", gql, "") else if (eq(u8, path, "/api/later")) tcpserver.respondOk(afd, "application/json", later, "") else if (eq(u8, path, "/api/raw.bin")) tcpserver.respondOk(afd, "application/octet-stream", "\x00\x01\x02", "") else tcpserver.respondOk(afd, "text/plain", "?", "");
+        return false;
+    }
+};
+
+/// structuredContent of one tools/call reply line; fails the stage on an
+/// error result unless `want_error`.
+fn capSc(arena: std.mem.Allocator, line: []const u8, comptime what: []const u8, comptime want_error: bool) std.json.ObjectMap {
+    const v = std.json.parseFromSliceLeaky(std.json.Value, arena, line, .{}) catch fail(what ++ ": reply is not JSON");
+    const result = v.object.get("result") orelse fail(what ++ ": no result");
+    const is_err = if (result.object.get("isError")) |e| e == .bool and e.bool else false;
+    if (is_err != want_error) {
+        say(line);
+        fail(what ++ (if (want_error) ": expected an error result" else ": unexpected error result"));
+    }
+    return result.object.get("structuredContent").?.object;
+}
+
+fn capInt(o: std.json.ObjectMap, key: []const u8) i64 {
+    const v = o.get(key) orelse return -1;
+    return if (v == .integer) v.integer else -1;
+}
+
+/// Stage wc: web_open capture, web_capture (list, body, out_file,
+/// out_dir), web_wait for:"response", web_capture_set, the web_network
+/// join and the capabilities fact, against the real helper; then the
+/// fail-closed refusal against a helper that withholds the capability.
+fn webCaptureStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) void {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var http = CapHttp{};
+    if (!http.start()) fail("could not bind the loopback capture fixture");
+    defer http.lis.deinit();
+    var args_buf: [2048]u8 = undefined;
+
+    var m = Mcp.spawn(allocator, exe, &.{});
+    m.initialize();
+
+    {
+        const caps = capSc(arena, m.callTool("capabilities", "{}"), "capabilities", false);
+        const f = caps.get("web_capture") orelse fail("capabilities has no web_capture fact");
+        if (f != .bool or !f.bool) fail("capabilities reports web_capture false on a headless server with a capable helper");
+    }
+
+    // A bad pattern is refused before anything is opened.
+    {
+        const bad = capSc(arena, m.callTool("web_open", "{\"url\":\"about:blank\",\"capture\":{\"url_regex\":\"(x[\"}}"), "bad capture", true);
+        _ = bad;
+        const tabs = capSc(arena, m.callTool("web_tabs", "{}"), "web_tabs", false);
+        if (capInt(tabs, "count") != 0) fail("a refused captured open still opened a view");
+    }
+
+    m.sendTool("web_open", std.fmt.bufPrint(&args_buf, "{{\"url\":\"http://127.0.0.1:{d}/page\",\"snapshot\":\"none\",\"timeout_ms\":20000,\"capture\":{{\"url_contains\":\"/api/\",\"mime_prefixes\":[\"application/json\"],\"max_body_bytes\":65536,\"max_total_bytes\":1048576}}}}", .{http.lis.port}) catch unreachable);
+    const opened = capSc(arena, m.recvLine(60_000), "captured web_open", false);
+    if (opened.get("capture_active").? != .bool or !opened.get("capture_active").?.bool) fail("web_open does not report capture_active");
+    const echo = opened.get("capture").?.object;
+    if (echo.get("types").?.array.items.len != 1 or !std.mem.eql(u8, echo.get("types").?.array.items[0].string, "xhr"))
+        fail("the capture echo does not show the xhr default");
+
+    // The page's own POST, waited for from the start of the view.
+    m.sendTool("web_wait", "{\"for\":\"response\",\"since\":0,\"response\":{\"url_contains\":\"/api/gql\",\"methods\":[\"POST\"]},\"timeout_ms\":20000}");
+    const gql = capSc(arena, m.recvLine(40_000), "web_wait for the gql response", false);
+    const gql_ex = gql.get("response").?.object;
+    const gql_seq = capInt(gql_ex, "seq");
+    if (!gql_ex.get("complete").?.bool) fail("the waited-for response is not complete");
+
+    {
+        const body = capSc(arena, m.callTool("web_capture", std.fmt.bufPrint(&args_buf, "{{\"seq\":{d}}}", .{gql_seq}) catch unreachable), "gql body", false);
+        if (!std.mem.eql(u8, body.get("body").?.string, CapHttp.gql)) fail("web_capture does not return the gql response body the page received");
+        if (!std.mem.eql(u8, body.get("encoding").?.string, "utf8")) fail("a JSON body is not reported as utf8 text");
+        if (body.get("headers").?.array.items.len == 0) fail("the response headers are missing");
+        const req = capSc(arena, m.callTool("web_capture", std.fmt.bufPrint(&args_buf, "{{\"seq\":{d},\"part\":\"request\"}}", .{gql_seq}) catch unreachable), "gql request body", false);
+        if (!std.mem.eql(u8, req.get("body").?.string, "{\"operationName\":\"fetchPlaylist\",\"variables\":{\"offset\":25}}"))
+            fail("web_capture part:request does not return the POST body the page sent");
+    }
+
+    // The listing: exactly the two json /api/ fetches (raw.bin is
+    // octet-stream, the document is not xhr).
+    {
+        // raw.bin finishes last; wait for the page to say it is done.
+        _ = capSc(arena, m.callTool("web_wait", "{\"for\":\"title\",\"arg\":\"cap-mcp-done\",\"timeout_ms\":15000}"), "page done", false);
+        const list = capSc(arena, m.callTool("web_capture", "{}"), "web_capture list", false);
+        const ex = list.get("exchanges").?.array.items;
+        if (ex.len != 2) {
+            say(m.callTool("web_capture", "{}"));
+            fail("the capture did not keep exactly the two JSON /api/ fetches");
+        }
+        if (!std.mem.eql(u8, list.get("capture_state").?.string, "active")) fail("capture_state is not active");
+        // Every seq joins its web_network row.
+        const net = m.callTool("web_network", "{\"max\":128}");
+        for (ex) |e| {
+            const want = std.fmt.allocPrint(arena, "\"seq\":{d},", .{capInt(e.object, "seq")}) catch fail("oom");
+            const at = std.mem.indexOf(u8, net, want) orelse fail("a captured seq has no web_network row");
+            const row_end = std.mem.indexOfScalarPos(u8, net, at, '}') orelse fail("web_network row");
+            if (std.mem.indexOf(u8, net[at..row_end], e.object.get("url").?.string) == null) fail("a captured seq names a different web_network url");
+        }
+
+        // out_file and out_dir.
+        const first_seq = capInt(ex[0].object, "seq");
+        const path = std.fmt.allocPrint(arena, "{s}/cap-first.json", .{rt}) catch fail("oom");
+        const wrote = capSc(arena, m.callTool("web_capture", std.fmt.bufPrint(&args_buf, "{{\"seq\":{d},\"out_file\":\"{s}\"}}", .{ first_seq, path }) catch unreachable), "out_file", false);
+        if (wrote.get("body") != null) fail("an out_file read also returned the body inline");
+        if (capInt(wrote, "bytes") != CapHttp.first.len) fail("out_file reports the wrong size");
+        const on_disk = readFileAlloc(arena, path) orelse fail("out_file was not written");
+        if (!std.mem.eql(u8, on_disk, CapHttp.first)) fail("out_file does not hold the body");
+        const dir = std.fmt.allocPrint(arena, "{s}/cap-bodies", .{rt}) catch fail("oom");
+        const dumped = capSc(arena, m.callTool("web_capture", std.fmt.bufPrint(&args_buf, "{{\"out_dir\":\"{s}\"}}", .{dir}) catch unreachable), "out_dir", false);
+        for (dumped.get("exchanges").?.array.items) |e| {
+            const p = e.object.get("path") orelse fail("an out_dir exchange lacks its path");
+            const bytes = readFileAlloc(arena, p.string) orelse fail("an out_dir body file is missing");
+            if (bytes.len != @as(usize, @intCast(capInt(e.object, "body_bytes")))) fail("an out_dir file does not hold the whole body");
+        }
+    }
+
+    // Scroll-then-wait: something the page fetches LATER is what a
+    // default (after-now) wait sees.
+    {
+        _ = capSc(arena, m.callTool("web_eval", "{\"code\":\"setTimeout(() => fetch('/api/later').then(r => r.text()), 1500), 1\"}"), "schedule a later fetch", false);
+        m.sendTool("web_wait", "{\"for\":\"response\",\"response\":{\"url_contains\":\"/api/later\"},\"timeout_ms\":15000}");
+        const later = capSc(arena, m.recvLine(30_000), "web_wait after now", false);
+        if (!std.mem.endsWith(u8, later.get("response").?.object.get("url").?.string, "/api/later")) fail("the after-now wait returned the wrong exchange");
+        const nothing = m.callTool("web_wait", "{\"for\":\"response\",\"response\":{\"url_contains\":\"/api/never\"},\"timeout_ms\":1500}");
+        const err = capSc(arena, nothing, "a wait that never holds", true);
+        if (!std.mem.eql(u8, err.get("error").?.object.get("code").?.string, "timeout")) fail("a response wait that never held is not a timeout");
+
+        // A body the page never reads: in flight, listed on request.
+        _ = capSc(arena, m.callTool("web_eval", "{\"code\":\"fetch('/api/first?unread=1'), 1\"}"), "an unread fetch", false);
+        var seen = false;
+        var tries: u32 = 0;
+        while (!seen and tries < 50) : (tries += 1) {
+            const lst = capSc(arena, m.callTool("web_capture", "{\"include_in_flight\":true}"), "include_in_flight", false);
+            for (lst.get("exchanges").?.array.items) |e| {
+                if (!std.mem.endsWith(u8, e.object.get("url").?.string, "unread=1")) continue;
+                if (capInt(e.object, "cursor") != 0 or e.object.get("complete").?.bool) fail("an unread exchange is listed as finished");
+                if (capInt(e.object, "body_bytes") == CapHttp.first.len) seen = true;
+            }
+            if (!seen) _ = c.usleep(100_000);
+        }
+        if (!seen) fail("include_in_flight never listed the unread exchange with its whole body");
+    }
+
+    // Narrowing only.
+    {
+        const refused = capSc(arena, m.callTool("web_capture_set", "{\"action\":\"enable\"}"), "a widening", true);
+        if (!std.mem.eql(u8, refused.get("error").?.object.get("code").?.string, "refused")) fail("a widening was not refused");
+        const before = capSc(arena, m.callTool("web_capture", "{}"), "list before clear", false);
+        const cleared = capSc(arena, m.callTool("web_capture_set", "{\"action\":\"clear\",\"upto\":1}"), "clear upto 1", false);
+        if (capInt(cleared, "stored_bytes") >= capInt(before, "stored_bytes")) fail("clear did not give bytes back");
+        const after = capSc(arena, m.callTool("web_capture", "{}"), "list after clear", false);
+        if (after.get("exchanges").?.array.items.len + 1 != before.get("exchanges").?.array.items.len) fail("clear upto 1 did not free exactly one exchange");
+        const disabled = capSc(arena, m.callTool("web_capture_set", "{\"action\":\"disable\"}"), "disable", false);
+        if (!std.mem.eql(u8, disabled.get("capture_state").?.string, "disabled")) fail("disable did not report state disabled");
+    }
+    _ = m.callTool("web_close", "{}");
+
+    // A view without a capture says so.
+    {
+        m.sendTool("web_open", std.fmt.bufPrint(&args_buf, "{{\"url\":\"http://127.0.0.1:{d}/page\",\"snapshot\":\"none\"}}", .{http.lis.port}) catch unreachable);
+        _ = capSc(arena, m.recvLine(60_000), "plain web_open", false);
+        const none = capSc(arena, m.callTool("web_capture", "{}"), "web_capture without a capture", true);
+        if (!std.mem.eql(u8, none.get("error").?.object.get("code").?.string, "conflict")) fail("web_capture on an uncaptured view is not a conflict");
+        _ = m.callTool("web_close", "{}");
+    }
+    m.closeStdinWait();
+
+    // Fail closed: a helper that withholds the capability opens nothing.
+    {
+        _ = c.setenv("SKETERM_WEB_DISABLE_CAPTURE", "1", 1);
+        defer _ = c.unsetenv("SKETERM_WEB_DISABLE_CAPTURE");
+        _ = c.setenv("SKETERM_WEB_BROKER_ENGINE", "0", 1);
+        var w = Mcp.spawn(allocator, exe, &.{});
+        w.initialize();
+        w.sendTool("web_open", std.fmt.bufPrint(&args_buf, "{{\"url\":\"http://127.0.0.1:{d}/page\",\"capture\":{{}}}}", .{http.lis.port}) catch unreachable);
+        const refused = capSc(arena, w.recvLine(60_000), "captured open on a helper without capture", true);
+        if (!std.mem.eql(u8, refused.get("error").?.object.get("code").?.string, "unavailable")) fail("the capture refusal is not 'unavailable'");
+        const tabs = capSc(arena, w.callTool("web_tabs", "{}"), "web_tabs after refusal", false);
+        if (capInt(tabs, "count") != 0) fail("a refused captured open left a view behind");
+        const caps = capSc(arena, w.callTool("capabilities", "{}"), "capabilities after", false);
+        if (caps.get("web_capture").?.bool) fail("capabilities reports web_capture on a helper that withholds it");
+        w.closeStdinWait();
+    }
+}
+
+fn readFileAlloc(arena: std.mem.Allocator, path: []const u8) ?[]u8 {
+    var pbuf: [4096]u8 = undefined;
+    const z = std.fmt.bufPrintZ(&pbuf, "{s}", .{path}) catch return null;
+    const f = c.fopen(z.ptr, "rb") orelse return null;
+    defer _ = c.fclose(f);
+    var out: std.ArrayList(u8) = .empty;
+    var buf: [65536]u8 = undefined;
+    while (true) {
+        const n = c.fread(&buf, 1, buf.len, f);
+        if (n == 0) break;
+        out.appendSlice(arena, buf[0..n]) catch return null;
+    }
+    return out.items;
+}
+
 fn webPolicyStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) void {
     _ = rt;
     var http = PolicyHttp.start() orelse fail("could not bind the loopback policy fixture");
@@ -5110,6 +5369,8 @@ fn webOnly(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: [:0]const u8) u
     say("smoke-mcp: focused headless web tools ok");
     webPolicyStage(allocator, exe, rt);
     say("smoke-mcp: focused enforced network policy ok");
+    webCaptureStage(allocator, exe, rt);
+    say("smoke-mcp: focused response-body capture ok");
     killDaemonsUnderRt(rt, allocator);
     _ = c.usleep(500_000);
     g_rt = null;

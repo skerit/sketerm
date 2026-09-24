@@ -140,6 +140,9 @@ comptime {
     // Enforced network policy: std-only decision half of the web
     // helper's request gate, shared with the GUI-side client.
     _ = @import("web/netpolicy.zig");
+    // Response-body capture: the filter and the bounded store the
+    // helper's IO thread records into.
+    _ = @import("web/capture.zig");
     _ = @import("web/route.zig");
     // ui/panel data layer: under ui/ by home. canary/doc/events are GTK-free by
     // contract; assets.zig is GTK-free by BUILD GATE — its gdk-pixbuf work sits

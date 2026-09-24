@@ -1388,6 +1388,45 @@ request was wrong":
   then the -21 error, nothing reached the server, and the next client
   navigation loads.
 
+## Response-body capture (0x8B-0x8F, capability "capture")
+
+`capture_set` installs a per-view filter + bounded store; the client pulls
+metadata (`capture_list_req`) and body chunks (`capture_body_req`), nothing
+is streamed. The store is `web/capture.zig` (pure, both test roots); the
+engine half is `cefhost/capture.zig`. It hangs off the intercept slot
+(`ISlot.cap`), so it shares the log's `seq`, survives navigations and
+discards (only `freeView` unregisters the slot), and is found-or-created so
+the install can precede `view_create*`. Facts that shaped it, each MEASURED
+on CEF 151 by smoke-web stage cap:
+
+- **The response filter sees the DECODED body.** A gzip response arrives
+  decompressed, which is exactly "what the page received". The filter is
+  pass-through (it never changes a byte) and is handed out only for an
+  exchange the capture already matched; every other response gets NO filter.
+- **The request body is still readable in `get_resource_response_filter`**,
+  so it is read there, after the mime test: nothing an unmatched exchange
+  carries is ever buffered.
+- **The stream ends BEFORE `on_resource_load_complete`**, and an exchange is
+  listed only once BOTH have happened (`Store.settle`), so "complete" is never
+  claimed for a body that may still grow, and a failure that cuts a stream
+  still arrives as a failure.
+- **A body the page never reads keeps its load open**: the filter has seen
+  every byte and been released, but load-complete does not fire until the
+  renderer drains the body (or the page leaves, which settles it). Such an
+  exchange stays in flight, listed only with `flag_in_flight`, its bytes
+  readable. Do not "fix" this by finishing on stream end alone.
+- **Cursor, not seq, pages the list.** The cursor is assigned at finish, so
+  a slow response whose seq sits below one already listed is not skipped;
+  `seq` stays the `web_network` join key (the newest ring entry for a
+  redirected request, the one whose url is the response's).
+
+Concurrency follows `util/spinlock.zig`: the IO thread takes a store
+reference under the intercept lock and works outside it; the store's own
+lock never covers an allocation or a big copy (reserve, copy, then link).
+Entries and chunks are freed only on the main thread, which is what lets it
+read immutable parts outside the lock. A `RespFilter` owns a store reference,
+so a reinstall or view destroy never frees memory under a streaming body.
+
 ## Eval result size: the cut must be visible
 
 `semantic.js`'s serializer cut every STRING at `EVAL_MAXSTR` (4000)

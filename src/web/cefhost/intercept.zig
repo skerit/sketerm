@@ -13,6 +13,7 @@ const cef = @import("cef");
 const filter = @import("../filter.zig");
 const filtersub = @import("../filtersub.zig");
 const netpolicy = @import("../netpolicy.zig");
+const capture = @import("../capture.zig");
 const nowMs = @import("../../util/clock.zig").nowMs;
 const pathz = @import("../../util/pathz.zig");
 const proto = @import("../protocol.zig");
@@ -1086,6 +1087,11 @@ pub const ISlot = struct {
     pol_dirty: bool = false,
     /// The deadline sweep already issued its one `stop_load`.
     deadline_stopped: bool = false,
+    /// Response-body capture (`cefhost/capture.zig`), or null. The slot
+    /// owns one reference; the IO thread takes its own under the lock
+    /// before using it outside, so a reinstall or unregister never frees
+    /// a store a callback is still writing into.
+    cap: ?*capture.Store = null,
 };
 
 pub const Intercept = struct {
@@ -1216,6 +1222,7 @@ pub fn interceptSlotFor(gpa: std.mem.Allocator, view_id: u32) ?*ISlot {
 pub fn interceptUnregister(gpa: std.mem.Allocator, view_id: u32) void {
     var ring: ?*[NLOG]LogEntry = null;
     var pol: ?*netpolicy.Policy = null;
+    var cap: ?*capture.Store = null;
     {
         g_int.acquire();
         defer g_int.release();
@@ -1223,6 +1230,7 @@ pub fn interceptUnregister(gpa: std.mem.Allocator, view_id: u32) void {
             if (!s.used or s.view_id != view_id) continue;
             ring = s.ring;
             pol = s.pol;
+            cap = s.cap;
             s.* = .{};
             break;
         }
@@ -1231,6 +1239,7 @@ pub fn interceptUnregister(gpa: std.mem.Allocator, view_id: u32) void {
     // IO thread re-resolves its slot on every callback.
     if (ring) |r| gpa.destroy(r);
     if (pol) |p| p.deinit(gpa);
+    if (cap) |s| s.release();
 }
 
 /// Read one file whole (bounded); caller frees.
@@ -1350,6 +1359,7 @@ pub fn interceptDeinit(gpa: std.mem.Allocator) void {
     var old: ?*filter.Engine = null;
     var pols: [MAX_ISLOTS]?*netpolicy.Policy = @splat(null);
     var rings: [MAX_ISLOTS]?*[NLOG]LogEntry = @splat(null);
+    var caps: [MAX_ISLOTS]?*capture.Store = @splat(null);
     {
         g_int.acquire();
         defer g_int.release();
@@ -1360,9 +1370,13 @@ pub fn interceptDeinit(gpa: std.mem.Allocator) void {
             if (s.used) {
                 rings[i] = s.ring;
                 pols[i] = s.pol;
+                caps[i] = s.cap;
                 s.* = .{};
             }
         }
+    }
+    for (caps) |cp| {
+        if (cp) |s| s.release();
     }
     // Detached under the lock, freed outside it: an allocator call is
     // not spinlock work, and nothing can reach a ring once its slot
@@ -1517,6 +1531,12 @@ pub fn onBeforeResourceLoad(
     var verdict = false;
     var shield_on = true;
     var view_id: u32 = 0;
+    // The view's capture and the log seq this request was given, taken
+    // under the lock and used after it (the filter match can run a
+    // regex, far too long for a spinlock).
+    var cap_store: ?*capture.Store = null;
+    var cap_seq: u32 = 0;
+    defer if (cap_store) |cs| cs.release();
     // The filter match runs OUTSIDE the lock against a pinned engine:
     // it is a linear scan over every generic rule, and the main thread
     // would spin for the whole of it. The slot is looked up again for
@@ -1584,6 +1604,12 @@ pub fn onBeforeResourceLoad(
             if (verdict) s.blocked +%= 1;
             s.dirty = true;
             if (s.ring) |ring| {
+                if (!verdict) {
+                    if (s.cap) |cs| {
+                        cap_store = cs.retain();
+                        cap_seq = s.next_seq;
+                    }
+                }
                 const e = &ring[s.widx];
                 s.widx = (s.widx + 1) % NLOG;
                 e.* = .{
@@ -1610,6 +1636,9 @@ pub fn onBeforeResourceLoad(
             }
         }
     }
+    // Only a request that will reach the network can have a response to
+    // capture; a refused one never took a store reference above.
+    if (cap_store) |cs| cs.admitRequest(req_id, cap_seq, url_unf, host, rtype, method, now);
     // PRECEDENCE, step 1: the native engine's cancel is FINAL, and a
     // policy denial is equally final. An extension is never asked about
     // a request either already refused, and never asked at all while
@@ -1808,6 +1837,7 @@ pub fn onResourceLoadComplete(
         if (resp.*.get_status) |gs| status = @intCast(std.math.clamp(gs(resp), 0, 999));
     }
     const now = nowMs();
+    captureFinish(cef_id, req_id, response, ur_status, status, now);
 
     g_int.acquire();
     defer g_int.release();
@@ -1835,6 +1865,41 @@ pub fn onResourceLoadComplete(
         }
         return;
     }
+}
+
+/// IO THREAD. Tell the view's capture, if any, that `req_id` finished.
+fn captureFinish(
+    cef_id: c_int,
+    req_id: u64,
+    response: ?*cef.cef_response_t,
+    ur_status: cef.cef_urlrequest_status_t,
+    status: u16,
+    now: i64,
+) void {
+    const store = captureOf(cef_id) orelse return;
+    defer store.release();
+    const ok = ur_status == @as(cef.cef_urlrequest_status_t, @intCast(cef.UR_SUCCESS));
+    var err: i32 = 0;
+    if (!ok) {
+        err = if (ur_status == @as(cef.cef_urlrequest_status_t, @intCast(cef.UR_CANCELED))) -3 else -2;
+        if (response) |resp| {
+            if (resp.get_error) |ge| {
+                const e: i32 = @intCast(ge(resp));
+                if (e != 0) err = e;
+            }
+        }
+    }
+    store.finish(req_id, ok, err, status, now);
+}
+
+/// IO THREAD. The capture of the view browser `cef_id` belongs to, with
+/// a reference the caller releases; null when it has none.
+pub fn captureOf(cef_id: c_int) ?*capture.Store {
+    g_int.acquire();
+    defer g_int.release();
+    const s = g_int.slotByCef(cef_id) orelse return null;
+    const cs = s.cap orelse return null;
+    return cs.retain();
 }
 
 /// Copy a ring `LogEntry` into a `proto.NetEntry`, with its strings

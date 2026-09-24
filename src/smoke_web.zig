@@ -65,6 +65,7 @@ const socks5 = @import("ipc/socks5.zig");
 const socks5relay = @import("smoke/socks5relay.zig");
 const zip = @import("web/webext/zip.zig");
 const filtersub = @import("web/filtersub.zig");
+const webfilter = @import("web/filter.zig");
 const extmanifest = @import("web/webext/manifest.zig");
 
 /// `SKETERM_SMOKE_WEB_CONSOLE=1` echoes every page console message.
@@ -1463,8 +1464,19 @@ const Client = struct {
     /// after the last context-backed browser closes, which the stage's
     /// tolerant reaper already accepts.
     teardown_allow_close: bool = false,
+    /// Stage cap: the last `capture_list` / `capture_body` / `net_log`
+    /// payloads, raw, and a counter per kind to wait on.
+    cap_list_raw: std.ArrayList(u8) = .empty,
+    cap_list_seq: u32 = 0,
+    cap_body_raw: std.ArrayList(u8) = .empty,
+    cap_body_seq: u32 = 0,
+    net_log_raw: std.ArrayList(u8) = .empty,
+    net_log_seq: u32 = 0,
 
     fn deinit(self: *Client) void {
+        self.cap_list_raw.deinit(self.gpa);
+        self.cap_body_raw.deinit(self.gpa);
+        self.net_log_raw.deinit(self.gpa);
         if (self.ax_mirror_live) {
             self.ax_mirror.deinit();
             self.ax_mirror_live = false;
@@ -2251,6 +2263,21 @@ const Client = struct {
                 self.int_log_len = @min(json.len, self.int_log.len);
                 @memcpy(self.int_log[0..self.int_log_len], json[0..self.int_log_len]);
                 self.int_log_seq += 1;
+            },
+            .capture_list => {
+                self.cap_list_raw.clearRetainingCapacity();
+                self.cap_list_raw.appendSlice(self.gpa, frame.payload) catch fail("oom");
+                self.cap_list_seq += 1;
+            },
+            .capture_body => {
+                self.cap_body_raw.clearRetainingCapacity();
+                self.cap_body_raw.appendSlice(self.gpa, frame.payload) catch fail("oom");
+                self.cap_body_seq += 1;
+            },
+            .net_log => {
+                self.net_log_raw.clearRetainingCapacity();
+                self.net_log_raw.appendSlice(self.gpa, frame.payload) catch fail("oom");
+                self.net_log_seq += 1;
             },
             .ev_intercept_subscribe_done => {
                 const d = proto.decode(proto.EvInterceptSubscribeDone, frame.payload) catch fail("ev_intercept_subscribe_done decode");
@@ -3424,6 +3451,444 @@ fn runNetChangeStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8
         cl.deinit();
         reapHelper(pid, "stage nc (two blinks)");
     }
+}
+
+// ---------------------------------------------------------------------
+// Stage cap: response-body capture (0x8B block, capability "capture")
+// ---------------------------------------------------------------------
+
+/// `{"kind":"gzipped",...}` (CAP_GZ_PLAIN) gzip-compressed, served with
+/// `Content-Encoding: gzip`: the capture must hold what the PAGE got,
+/// the decompressed JSON.
+const CAP_GZ = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\xab\x56\xca\xce\xcc\x4b\x51\xb2\x52\x4a\xaf\xca\x2c\x28\x48\x4d\x51\xd2\x51\x2a\x29\x4a\x4c\xce\x2e\x56\xb2\x8a\xae\x56\xca\x04\xc9\x94\x18\x02\x05\xf3\x12\x73\x53\x81\x6c\xe7\xc4\xb4\xc3\x2b\x15\x52\x52\x73\x14\x7c\x13\x8b\x94\x6a\x75\x60\x4a\x8c\x10\x4a\x82\x53\x93\xf3\x81\x26\xd6\xc6\xea\x28\x15\x24\x82\x24\x13\x93\x92\x53\x52\xd3\xd2\x33\x46\xe9\x91\x49\x2b\xd5\x02\x00\xb9\x79\x4c\xbe\x65\x02\x00\x00";
+const CAP_GZ_PLAIN = "{\"kind\":\"gzipped\",\"tracks\":[{\"id\":\"t1\",\"name\":\"Caf\u{00e9} del Mar\"},{\"id\":\"t2\",\"name\":\"Second\"}],\"pad\":\"" ++ "abcdefgh" ** 64 ++ "\"}";
+const CAP_GQL_BODY = "{\"operationName\":\"fetchPlaylist\",\"variables\":{\"offset\":0,\"limit\":25}}";
+/// Bigger than the stage's per-body cap, so it must arrive truncated.
+const CAP_BIG_LEN = 3 * 1024 * 1024;
+const CAP_MAX_BODY = 2 * 1024 * 1024;
+
+/// The page fetches everything the filter must keep and everything it
+/// must refuse, in one run, the first fetch at document start (the
+/// capture has to be live before the first request).
+const cap_page =
+    \\<!doctype html><html><head><title>cap-start</title></head><body>
+    \\<img src="/api/img.png">
+    \\<script>
+    \\(async function () {
+    \\  const t = async (u, o) => { try { const r = await fetch(u, o); return await r.text(); } catch (e) { return "ERR"; } };
+    \\  await t("/api/items?page=1");
+    \\  await t("/api/graphql", { method: "POST", headers: { "content-type": "application/json" },
+    \\    body: JSON.stringify({ operationName: "fetchPlaylist", variables: { offset: 0, limit: 25 } }) });
+    \\  const gz = await t("/api/gz");
+    \\  await t("/api/big");
+    \\  await t("/api/latin1");
+    \\  await t("/api/page.css");
+    \\  await t("/notapi/items");
+    \\  fetch("/api/items?page=9");
+    \\  history.pushState({}, "", "/cap/route2");
+    \\  await t("/api/items?page=2");
+    \\  document.title = "cap-done:" + (gz.indexOf("gzipped") >= 0 ? "gz" : "nogz");
+    \\})();
+    \\</script></body></html>
+;
+
+const cap_page2 =
+    \\<!doctype html><html><head><title>cap2-start</title></head><body><script>
+    \\fetch("/api/items?page=3").then(r => r.text()).then(() => { document.title = "cap2-done"; });
+    \\</script></body></html>
+;
+
+const CapServer = struct {
+    lis: tcpserver.Listener = .{ .backlog = 64, .poll_ms = 100 },
+    big: []u8 = &.{},
+    /// The graphql POST body as the SERVER received it.
+    gql_seen: [256]u8 = undefined,
+    gql_len: std.atomic.Value(usize) = .init(0),
+
+    fn start(self: *CapServer) bool {
+        return self.lis.start(self, &onConn);
+    }
+
+    fn onConn(ctx: ?*anyopaque, afd: c_int) bool {
+        const self: *CapServer = @ptrCast(@alignCast(ctx.?));
+        self.handle(afd);
+        return false;
+    }
+
+    /// Read a whole request: headers, then a Content-Length body.
+    fn readAll(afd: c_int, buf: []u8) []const u8 {
+        var n: usize = 0;
+        while (n < buf.len) {
+            var pfd = c.struct_pollfd{ .fd = afd, .events = c.POLLIN, .revents = 0 };
+            if (c.poll(@ptrCast(&pfd), 1, 3000) <= 0) break;
+            const r = c.read(afd, buf.ptr + n, buf.len - n);
+            if (r <= 0) break;
+            n += @intCast(r);
+            const got = buf[0..n];
+            const end = std.mem.indexOf(u8, got, "\r\n\r\n") orelse continue;
+            var want: usize = 0;
+            var lines = std.mem.splitSequence(u8, got[0..end], "\r\n");
+            while (lines.next()) |l| {
+                if (l.len > 15 and std.ascii.eqlIgnoreCase(l[0..15], "content-length:"))
+                    want = std.fmt.parseInt(usize, std.mem.trim(u8, l[15..], " "), 10) catch 0;
+            }
+            if (n >= end + 4 + want) break;
+        }
+        return buf[0..n];
+    }
+
+    fn respond(afd: c_int, ctype: []const u8, extra: []const u8, body: []const u8) void {
+        var head: [512]u8 = undefined;
+        const hdr = std.fmt.bufPrint(&head, "HTTP/1.1 200 OK\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nCache-Control: no-store\r\n{s}Connection: close\r\n\r\n", .{ ctype, body.len, extra }) catch return;
+        writeLoop(afd, hdr);
+        writeLoop(afd, body);
+    }
+
+    fn writeLoop(fd: c_int, data: []const u8) void {
+        var off: usize = 0;
+        while (off < data.len) {
+            const n = c.write(fd, data.ptr + off, data.len - off);
+            if (n <= 0) {
+                if (n < 0 and std.c._errno().* == c.EINTR) continue;
+                return;
+            }
+            off += @intCast(n);
+        }
+    }
+
+    fn handle(self: *CapServer, afd: c_int) void {
+        var req_buf: [16 * 1024]u8 = undefined;
+        const raw = readAll(afd, &req_buf);
+        const eq = std.mem.startsWith;
+        const line_end = std.mem.indexOf(u8, raw, "\r\n") orelse return;
+        const line = raw[0..line_end];
+        var parts = std.mem.splitScalar(u8, line, ' ');
+        _ = parts.next();
+        const path = parts.next() orelse return;
+        if (eq(u8, path, "/cap2")) return respond(afd, "text/html", "", cap_page2);
+        if (eq(u8, path, "/cap")) return respond(afd, "text/html", "", cap_page);
+        if (eq(u8, path, "/api/items?page=")) {
+            var b: [96]u8 = undefined;
+            const body = std.fmt.bufPrint(&b, "{{\"page\":{s},\"items\":[\"a\",\"b\",\"c\"]}}", .{path["/api/items?page=".len..]}) catch return;
+            return respond(afd, "application/json", "", body);
+        }
+        if (eq(u8, path, "/api/graphql")) {
+            if (std.mem.indexOf(u8, raw, "\r\n\r\n")) |hdr_end| {
+                const body = raw[hdr_end + 4 ..];
+                const n = @min(body.len, self.gql_seen.len);
+                @memcpy(self.gql_seen[0..n], body[0..n]);
+                self.gql_len.store(n, .release);
+            }
+            return respond(afd, "application/json; charset=utf-8", "", "{\"data\":{\"playlist\":{\"name\":\"Mix\"}}}");
+        }
+        if (eq(u8, path, "/api/gz")) return respond(afd, "application/json", "Content-Encoding: gzip\r\n", CAP_GZ);
+        if (eq(u8, path, "/api/big")) return respond(afd, "application/json", "", self.big);
+        if (eq(u8, path, "/api/latin1")) return respond(afd, "text/plain; charset=iso-8859-1", "", "caf\xe9");
+        if (eq(u8, path, "/api/page.css")) return respond(afd, "text/css", "", "body{}");
+        // Served as JSON on purpose: only the resource TYPE (an image)
+        // keeps it out of the capture.
+        if (eq(u8, path, "/api/img.png")) return respond(afd, "application/json", "", "{\"img\":true}");
+        if (eq(u8, path, "/notapi/items")) return respond(afd, "application/json", "", "{\"not\":\"api\"}");
+        respond(afd, "text/plain", "", "unknown");
+    }
+
+    fn deinit(self: *CapServer, gpa: std.mem.Allocator) void {
+        self.lis.deinit();
+        gpa.free(self.big);
+    }
+};
+
+/// Pull one metadata page. The entries borrow from the client's reply
+/// buffer: valid until the next capture_list.
+fn capList(cl: *Client, view: u32, since: u32, max: u16) proto.CaptureList {
+    return capListWith(cl, view, since, max, 0);
+}
+
+fn capListWith(cl: *Client, view: u32, since: u32, max: u16, flags: u8) proto.CaptureList {
+    const before = cl.cap_list_seq;
+    cl.send(proto.CaptureListReq{ .view = view, .since = since, .max = max, .flags = flags });
+    if (!cl.waitSeq(&cl.cap_list_seq, before, 10_000)) fail("stage cap: no capture_list reply");
+    return proto.CaptureList.decodeAlloc(cl.cap_list_raw.items, cl.gpa) catch fail("stage cap: capture_list decode");
+}
+
+const CapBody = struct { bytes: []u8, total: u64, trunc: proto.CaptureTrunc, complete: bool, headers: []u8, chunks: u32 };
+
+/// A whole body, paged in `chunk`-byte reads. Caller frees both slices.
+fn capBody(cl: *Client, view: u32, seq: u32, part: proto.CapturePart, chunk: u32) CapBody {
+    var out: std.ArrayList(u8) = .empty;
+    var headers: []u8 = &.{};
+    var total: u64 = 0;
+    var trunc: proto.CaptureTrunc = .none;
+    var complete = false;
+    var chunks: u32 = 0;
+    while (true) {
+        const before = cl.cap_body_seq;
+        cl.send(proto.CaptureBodyReq{ .view = view, .seq = seq, .part = @intFromEnum(part), .offset = out.items.len, .max = chunk });
+        if (!cl.waitSeq(&cl.cap_body_seq, before, 10_000)) fail("stage cap: no capture_body reply");
+        const b = proto.decode(proto.CaptureBody, cl.cap_body_raw.items) catch fail("stage cap: capture_body decode");
+        if (b.found == 0) fail("stage cap: a listed exchange's body was not found");
+        if (b.offset != out.items.len) fail("stage cap: capture_body answered for another offset");
+        if (out.items.len == 0 and part == .response) headers = cl.gpa.dupe(u8, b.headers.s) catch fail("oom");
+        total = b.total;
+        trunc = @enumFromInt(b.trunc);
+        complete = b.complete != 0;
+        out.appendSlice(cl.gpa, b.data.s) catch fail("oom");
+        chunks += 1;
+        if (b.data.s.len == 0 or out.items.len >= total) break;
+    }
+    return .{ .bytes = out.toOwnedSlice(cl.gpa) catch fail("oom"), .total = total, .trunc = trunc, .complete = complete, .headers = headers, .chunks = chunks };
+}
+
+fn capFind(entries: []const proto.CaptureEntry, url_suffix: []const u8) ?proto.CaptureEntry {
+    for (entries) |e| {
+        if (std.mem.endsWith(u8, e.url.s, url_suffix)) return e;
+    }
+    return null;
+}
+
+/// Stage cap: response-body capture against real CEF.
+///
+///   the capture is installed BEFORE `view_create_url`, so the page's
+///   first fetch is kept; exactly the exchanges the filter names are
+///   kept (a mime mismatch, a url mismatch and an image served as JSON
+///   are not); a POST's request body, response headers and a gzip
+///   body DECODED as the page saw it; each exchange's seq is its
+///   net_log row; a body past the per-body cap is cut with the reason
+///   and the delivered size; bodies page in chunks; the capture
+///   survives an SPA route change and a full navigation; clear and
+///   disable narrow it.
+fn runCaptureStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) void {
+    var srv = CapServer{};
+    srv.big = gpa.alloc(u8, CAP_BIG_LEN) catch fail("oom");
+    @memcpy(srv.big[0..8], "{\"big\":\"");
+    @memset(srv.big[8 .. CAP_BIG_LEN - 2], 'x');
+    @memcpy(srv.big[CAP_BIG_LEN - 2 ..], "\"}");
+    if (!srv.start()) fail("stage cap: loopback HTTP server would not start");
+    defer srv.deinit(gpa);
+
+    var cache_buf: [4096]u8 = undefined;
+    const cache_dir = std.fmt.bufPrintZ(&cache_buf, "{s}/cap-cache", .{dir}) catch fail("stage cap cache path");
+    mkdirZ(cache_dir);
+    var sock_buf: [96]u8 = undefined;
+    const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/cap.sock", .{dir}) catch fail("stage cap sock");
+    const pid = spawnHelper(exe, sock.ptr, cache_dir.ptr, "--ozone-platform=headless", null, false);
+    var cl = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
+    cl.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web" });
+    {
+        const d = nowMs() + 15_000;
+        while (cl.ack_proto == 0 and nowMs() < d) cl.pump(100);
+    }
+    if (!cl.acks(.capture)) fail("stage cap: hello_ack lacks the capture capability");
+
+    var page_buf: [96]u8 = undefined;
+    const page_url = std.fmt.bufPrint(&page_buf, "http://127.0.0.1:{d}/cap", .{srv.lis.port}) catch fail("stage cap url");
+    cl.send(proto.CaptureSet{
+        .view = view_id,
+        .serial = 1,
+        .op = @intFromEnum(proto.CaptureOp.install),
+        .upto = 0,
+        .types = webfilter.RType.xhr.bit(),
+        .max_body = CAP_MAX_BODY,
+        .max_total = 64 * 1024 * 1024,
+        .url_contains = "/api/",
+        .url_regex = "",
+        .hosts = &.{"127.0.0.1"},
+        .methods = &.{},
+        .mime_prefixes = &.{ "application/json", "text/plain" },
+    });
+    cl.resetTitle();
+    cl.send(proto.ViewCreateUrl{ .view = view_id, .w = 640, .h = 480, .scale_x1000 = 1000, .context = 0, .url = page_url });
+    if (!cl.waitTitle("cap-done", 30_000)) fail("stage cap: the capture page never finished its fetches");
+    if (std.mem.indexOf(u8, cl.titleSlice(), "cap-done:gz") == null) fail("stage cap: the page itself did not get the gzip body decoded");
+
+    // A finished fetch is not yet a finished exchange on the IO thread:
+    // wait for the six. The seventh (page=9) is a fetch whose body the
+    // page never reads, and the engine keeps that load open.
+    var l = capList(&cl, view_id, 0, 100);
+    {
+        const d = nowMs() + 10_000;
+        while ((l.in_flight != 1 or l.entries.len < 6) and nowMs() < d) {
+            gpa.free(l.entries);
+            cl.pump(100);
+            l = capList(&cl, view_id, 0, 100);
+        }
+    }
+    defer gpa.free(l.entries);
+    if (l.state != @intFromEnum(proto.CaptureState.active)) fail("stage cap: the capture is not active");
+    if (l.in_flight != 1) fail("stage cap: the unread fetch is not the one exchange left in flight");
+    if (l.entries.len != 6) {
+        for (l.entries) |e| say(e.url.s);
+        fail("stage cap: the filter did not keep exactly the six /api/ json/text fetches (css, /notapi/, the <img>, the documents must stay out)");
+    }
+    for (l.entries, 0..) |e, i| {
+        if (e.flags & proto.CaptureEntry.flag_complete == 0) fail("stage cap: an exchange is listed but not complete");
+        if (e.cursor != i + 1) fail("stage cap: cursors are not the finish order 1..n");
+    }
+    const p1 = capFind(l.entries, "/api/items?page=1") orelse fail("stage cap: the page's FIRST fetch was not captured (capture not live before the first request)");
+    const gql = capFind(l.entries, "/api/graphql") orelse fail("stage cap: the graphql POST was not captured");
+    const gz = capFind(l.entries, "/api/gz") orelse fail("stage cap: the gzip response was not captured");
+    const big = capFind(l.entries, "/api/big") orelse fail("stage cap: the big response was not captured");
+    const lat = capFind(l.entries, "/api/latin1") orelse fail("stage cap: the latin-1 text response was not captured");
+    _ = capFind(l.entries, "/api/items?page=2") orelse fail("stage cap: a fetch after an SPA route change was not captured");
+    pass("stage cap-a the capture is live before the first request and keeps exactly what the filter names");
+
+    // The unread body: listed only on request, cursor 0, not complete,
+    // and every byte already readable.
+    var unread_seq: u32 = 0;
+    {
+        const withf = capListWith(&cl, view_id, 0, 100, proto.CaptureListReq.flag_in_flight);
+        defer gpa.free(withf.entries);
+        if (withf.entries.len != 7) fail("stage cap: in-flight listing did not add the unread exchange after the six");
+        const u = withf.entries[6];
+        if (!std.mem.endsWith(u8, u.url.s, "/api/items?page=9") or u.cursor != 0 or u.flags & proto.CaptureEntry.flag_complete != 0)
+            fail("stage cap: the in-flight entry is not the unread page=9, cursor 0, incomplete");
+        if (withf.next_cursor != l.next_cursor) fail("stage cap: listing in-flight exchanges moved the cursor");
+        unread_seq = u.seq;
+        const b = capBody(&cl, view_id, u.seq, .response, proto.MAX_CAPTURE_CHUNK);
+        defer gpa.free(b.bytes);
+        defer gpa.free(b.headers);
+        if (!std.mem.eql(u8, b.bytes, "{\"page\":9,\"items\":[\"a\",\"b\",\"c\"]}")) fail("stage cap: the unread body was not held whole");
+        if (b.complete) fail("stage cap: an unfinished exchange's body reads complete");
+    }
+    pass("stage cap-a2 a body the page never reads stays in flight (the engine keeps its load open), listed on request and readable whole");
+
+    // Each exchange joins its net_log row by seq.
+    {
+        const before = cl.net_log_seq;
+        cl.send(proto.NetLogReq{ .view = view_id, .since = 0, .max = 128 });
+        if (!cl.waitSeq(&cl.net_log_seq, before, 10_000)) fail("stage cap: no net_log reply");
+        const log = proto.NetLog.decodeAlloc(cl.net_log_raw.items, gpa) catch fail("stage cap: net_log decode");
+        defer gpa.free(log.entries);
+        for (l.entries) |e| {
+            var joined = false;
+            for (log.entries) |row| {
+                if (row.entry.seq == e.seq and std.mem.eql(u8, row.entry.url, e.url.s)) joined = true;
+            }
+            if (!joined) fail("stage cap: a captured exchange's seq does not name its net_log row");
+        }
+    }
+    pass("stage cap-b every captured exchange's seq is its web_network row");
+
+    {
+        const b = capBody(&cl, view_id, p1.seq, .response, proto.MAX_CAPTURE_CHUNK);
+        defer gpa.free(b.bytes);
+        defer gpa.free(b.headers);
+        if (!std.mem.eql(u8, b.bytes, "{\"page\":1,\"items\":[\"a\",\"b\",\"c\"]}")) fail("stage cap: the page-1 body differs from what was served");
+        if (!b.complete) fail("stage cap: a finished exchange's body reads incomplete");
+        if (std.mem.indexOf(u8, b.headers, "\"content-type\"") == null and std.mem.indexOf(u8, b.headers, "\"Content-Type\"") == null)
+            fail("stage cap: the response headers were not kept");
+    }
+    {
+        if (!std.mem.eql(u8, gql.method, "POST")) fail("stage cap: the graphql exchange lost its method");
+        const rq = capBody(&cl, view_id, gql.seq, .request, proto.MAX_CAPTURE_CHUNK);
+        defer gpa.free(rq.bytes);
+        const seen = srv.gql_seen[0..srv.gql_len.load(.acquire)];
+        if (!std.mem.eql(u8, rq.bytes, CAP_GQL_BODY) or !std.mem.eql(u8, rq.bytes, seen)) {
+            say(rq.bytes);
+            fail("stage cap: the POST request body is not what the page sent and the server got");
+        }
+        if (!std.mem.eql(u8, gql.charset, "utf-8")) fail("stage cap: the response charset was not kept");
+    }
+    pass("stage cap-c a POST keeps its request body, the response its headers and charset");
+
+    {
+        const b = capBody(&cl, view_id, gz.seq, .response, proto.MAX_CAPTURE_CHUNK);
+        defer gpa.free(b.bytes);
+        defer gpa.free(b.headers);
+        if (!std.mem.eql(u8, b.bytes, CAP_GZ_PLAIN)) {
+            if (std.mem.startsWith(u8, b.bytes, "\x1f\x8b")) fail("stage cap: the gzip body was kept COMPRESSED, not as the page decoded it");
+            fail("stage cap: the gzip body differs from its decompressed form");
+        }
+        if (std.mem.indexOf(u8, b.headers, "gzip") == null) fail("stage cap: the Content-Encoding header was not kept beside the decoded body");
+    }
+    pass("stage cap-d a gzip response is kept DECODED, with its Content-Encoding header");
+
+    {
+        if (big.trunc != @intFromEnum(proto.CaptureTrunc.body_cap)) fail("stage cap: the over-cap body is not marked body_cap");
+        if (big.body_len != CAP_MAX_BODY) fail("stage cap: the over-cap body was not kept up to the cap exactly");
+        if (big.body_seen != CAP_BIG_LEN) fail("stage cap: the over-cap body does not report the size the engine delivered");
+        const b = capBody(&cl, view_id, big.seq, .response, 512 * 1024);
+        defer gpa.free(b.bytes);
+        defer gpa.free(b.headers);
+        if (b.chunks != 4) fail("stage cap: a 2 MiB body did not page as four 512 KiB chunks");
+        if (!std.mem.eql(u8, b.bytes, srv.big[0..CAP_MAX_BODY])) fail("stage cap: the paged body is not the served prefix");
+    }
+    pass("stage cap-e a body past the per-body cap is cut with its reason and delivered size, and pages in chunks");
+
+    {
+        const b = capBody(&cl, view_id, lat.seq, .response, proto.MAX_CAPTURE_CHUNK);
+        defer gpa.free(b.bytes);
+        defer gpa.free(b.headers);
+        if (!std.mem.eql(u8, b.bytes, "caf\xe9")) fail("stage cap: the latin-1 body is not its raw bytes");
+        if (!std.ascii.eqlIgnoreCase(lat.charset, "iso-8859-1")) fail("stage cap: the latin-1 charset was not kept");
+    }
+
+    // A full navigation: the capture belongs to the view, not the page.
+    var p2_buf: [96]u8 = undefined;
+    const page2 = std.fmt.bufPrint(&p2_buf, "http://127.0.0.1:{d}/cap2", .{srv.lis.port}) catch fail("stage cap url2");
+    cl.resetTitle();
+    cl.send(proto.Navigate{ .view = view_id, .url = page2 });
+    if (!cl.waitTitle("cap2-done", 20_000)) fail("stage cap: the second page never finished");
+    // Leaving the page ends the unread load, so it settles too.
+    var after_nav = capList(&cl, view_id, l.next_cursor, 100);
+    {
+        const d = nowMs() + 10_000;
+        while ((after_nav.entries.len < 2 or after_nav.in_flight != 0) and nowMs() < d) {
+            gpa.free(after_nav.entries);
+            cl.pump(100);
+            after_nav = capList(&cl, view_id, l.next_cursor, 100);
+        }
+    }
+    if (after_nav.entries.len != 2 or capFind(after_nav.entries, "/api/items?page=3") == null)
+        fail("stage cap: the capture did not survive a full navigation");
+    const settled = capFind(after_nav.entries, "/api/items?page=9") orelse fail("stage cap: leaving the page did not settle the unread exchange");
+    if (settled.seq != unread_seq) fail("stage cap: the settled unread exchange changed seq");
+    var nav_cursor: u32 = 0;
+    for (after_nav.entries) |e| nav_cursor = @max(nav_cursor, e.cursor);
+    const finished_total = l.entries.len + after_nav.entries.len;
+    gpa.free(after_nav.entries);
+    pass("stage cap-f the capture survives an SPA route change and a full navigation");
+
+    // Paging, clear, disable.
+    {
+        const first = capList(&cl, view_id, 0, 3);
+        defer gpa.free(first.entries);
+        if (first.entries.len != 3 or first.more == 0 or first.next_cursor != 3) fail("stage cap: a 3-entry page did not report more and its cursor");
+        const stored_before = first.stored;
+        cl.send(proto.CaptureSet{
+            .view = view_id, .serial = 1, .op = @intFromEnum(proto.CaptureOp.clear), .upto = first.next_cursor,
+            .types = 0, .max_body = 0, .max_total = 0, .url_contains = "", .url_regex = "",
+            .hosts = &.{}, .methods = &.{}, .mime_prefixes = &.{},
+        });
+        const rest = capList(&cl, view_id, 0, 100);
+        defer gpa.free(rest.entries);
+        if (rest.entries.len != finished_total - 3 or rest.entries[0].cursor != 4) fail("stage cap: clear up to a cursor did not free exactly those exchanges");
+        if (rest.stored >= stored_before) fail("stage cap: clear did not give the bytes back");
+    }
+    cl.send(proto.CaptureSet{
+        .view = view_id, .serial = 1, .op = @intFromEnum(proto.CaptureOp.disable), .upto = 0,
+        .types = 0, .max_body = 0, .max_total = 0, .url_contains = "", .url_regex = "",
+        .hosts = &.{}, .methods = &.{}, .mime_prefixes = &.{},
+    });
+    cl.resetTitle();
+    cl.send(proto.NavAction{ .view = view_id, .action = @intFromEnum(proto.NavAct.reload) });
+    if (!cl.waitTitle("cap2-done", 20_000)) fail("stage cap: the reload after disable never finished");
+    cl.pump(500);
+    {
+        const d = capList(&cl, view_id, nav_cursor, 100);
+        defer gpa.free(d.entries);
+        if (d.state != @intFromEnum(proto.CaptureState.disabled)) fail("stage cap: disable did not report state disabled");
+        if (d.entries.len != 0) fail("stage cap: a disabled capture recorded a new exchange");
+        const all = capList(&cl, view_id, 0, 100);
+        defer gpa.free(all.entries);
+        if (all.entries.len != finished_total - 3) fail("stage cap: disable dropped exchanges it should have kept");
+    }
+    pass("stage cap-g clear frees up to a cursor and gives the bytes back; disable keeps what is held and records nothing new");
+
+    cl.send(proto.ViewDestroy{ .view = view_id });
+    cl.pump(500);
+    cl.deinit();
+    reapHelper(pid, "stage cap");
 }
 
 /// Stage 22j3: an offer nobody answers expires (`download_hold_ms`,
@@ -7109,6 +7574,16 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         say("smoke-web: PASS (webext only)");
         return 0;
     }
+    if (c.getenv("SKETERM_SMOKE_WEB_CAPTURE_ONLY") != null) {
+        runCaptureStage(gpa, exe, dir);
+        cleanup();
+        if (gpa_state.deinit() == .leak) {
+            say("smoke-web: FAIL leaked memory (see GPA report above)");
+            return 1;
+        }
+        say("smoke-web: PASS (capture only)");
+        return 0;
+    }
     if (c.getenv("SKETERM_SMOKE_WEB_OBSERVE_ONLY") != null) {
         runObserveStage(gpa, exe, dir);
         cleanup();
@@ -10172,6 +10647,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     runGmStage(gpa, exe, dir);
     runDownloadHoldStage(gpa, exe, dir);
     runNetChangeStage(gpa, exe, dir);
+    runCaptureStage(gpa, exe, dir);
     // ── Stage 35: real MV2 extensions ─────────────────────────────
     runShapeStage(gpa, exe, dir);
     runUboStage(gpa, exe, dir, ubo_xpi);

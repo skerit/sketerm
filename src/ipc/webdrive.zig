@@ -89,6 +89,7 @@ const clock = @import("../util/clock.zig");
 const webprofiles = @import("webprofiles.zig");
 const webremote = @import("webprofilesremote.zig");
 const netpolicy = @import("../web/netpolicy.zig");
+const capture = @import("../web/capture.zig");
 const webroute = @import("../web/route.zig");
 const socksbridge = @import("socksbridge.zig");
 const mux_cli = @import("mux_cli.zig");
@@ -261,6 +262,18 @@ pub const View = struct {
     pol_ms_left: u32 = 0,
     pol_denied: [proto.NREASONS]u32 = @splat(0),
 
+    // Response-body capture (capability "capture"). The filter the view
+    // was opened with (owned), and the last capture_list / capture_body
+    // payloads, parked raw (owned) for the synchronous verbs.
+    cap: ?CaptureFilter = null,
+    cap_serial: u32 = 0,
+    /// The helper answered `refused` for our serial: it could not hold
+    /// the capture. The open must fail closed.
+    cap_install_failed: bool = false,
+    cap_disabled: bool = false,
+    cap_list: ?[]u8 = null,
+    cap_body: ?[]u8 = null,
+
     /// Bounded mirror of the page's `ev_console` stream, so a tool can
     /// answer "what did the page log" after the fact. Drop-oldest; ids
     /// keep increasing so a reader can page with `since`.
@@ -302,6 +315,9 @@ pub const View = struct {
         if (self.create_failed) |f| gpa.free(f);
         if (self.last_eval) |e| gpa.free(e);
         if (self.pol) |*p| freePolicy(gpa, p);
+        if (self.cap) |*f| freeCapture(gpa, f);
+        if (self.cap_list) |b| gpa.free(b);
+        if (self.cap_body) |b| gpa.free(b);
         self.reader_guards.deinit(gpa);
         if (self.net_log) |e| gpa.free(e);
         if (self.buf_fd >= 0) _ = c.close(self.buf_fd);
@@ -537,6 +553,47 @@ pub const NetPolicyError = error{
 };
 
 /// Deep-copy a policy so a stored one outlives its caller's arena.
+/// A response-body CAPTURE as the client speaks it: what `web_open`
+/// parsed and what `capture_set` serializes. Field semantics live in
+/// `web/capture.zig` (the filter's home); this is the transportable
+/// value. Empty lists and strings mean "no restriction"; `types` 0
+/// means every resource class.
+pub const CaptureFilter = struct {
+    types: u16 = capture.DEFAULT_TYPES,
+    hosts: []const []const u8 = &.{},
+    methods: []const []const u8 = &.{},
+    mime_prefixes: []const []const u8 = &.{},
+    url_contains: []const u8 = "",
+    url_regex: []const u8 = "",
+    max_body: u32 = capture.DEFAULT_MAX_BODY,
+    max_total: u64 = capture.DEFAULT_MAX_TOTAL,
+};
+
+/// Deep-copy a capture filter so the view's copy outlives the caller's
+/// arena.
+fn dupeCapture(gpa: std.mem.Allocator, f: CaptureFilter) !CaptureFilter {
+    var out = f;
+    out.hosts = try dupeHostList(gpa, f.hosts);
+    errdefer freeHostList(gpa, out.hosts);
+    out.methods = try dupeHostList(gpa, f.methods);
+    errdefer freeHostList(gpa, out.methods);
+    out.mime_prefixes = try dupeHostList(gpa, f.mime_prefixes);
+    errdefer freeHostList(gpa, out.mime_prefixes);
+    out.url_contains = try gpa.dupe(u8, f.url_contains);
+    errdefer gpa.free(out.url_contains);
+    out.url_regex = try gpa.dupe(u8, f.url_regex);
+    return out;
+}
+
+fn freeCapture(gpa: std.mem.Allocator, f: *CaptureFilter) void {
+    freeHostList(gpa, f.hosts);
+    freeHostList(gpa, f.methods);
+    freeHostList(gpa, f.mime_prefixes);
+    gpa.free(f.url_contains);
+    gpa.free(f.url_regex);
+    f.* = .{};
+}
+
 fn dupePolicy(gpa: std.mem.Allocator, p: NetPolicy) !NetPolicy {
     var out = p;
     out.allow_top = try dupeHostList(gpa, p.allow_top);
@@ -700,6 +757,8 @@ pub const Engine = struct {
     /// Stamps every `net_policy_set`; `ev_net_policy` echoes it so a
     /// stale event for a replaced policy is ignorable.
     next_policy_serial: u32 = 1,
+    /// Stamps every capture install; a `refused` answer names it.
+    next_capture_serial: u32 = 1,
     /// Session defaults per profile NAME, applied by `openViewIn` when
     /// the caller names the profile and passes no explicit policy.
     /// Deliberately NOT persisted: the store's corrupt-rebuild path
@@ -1591,6 +1650,14 @@ pub const Engine = struct {
     /// behind and — crucially — never loads the requested page into the
     /// shared jar, and never loads it UNPOLICED.
     pub fn openViewIn(self: *Engine, url: []const u8, w: u16, h: u16, spec: ProfileSpec, policy_arg: ?*const NetPolicy) !*View {
+        return self.openViewWith(url, w, h, spec, policy_arg, null);
+    }
+
+    /// As `openViewIn`, optionally with a response-body CAPTURE, which
+    /// is installed before the view's first request exactly like a
+    /// policy, and refused (nothing opened) on a helper that cannot
+    /// honour it.
+    pub fn openViewWith(self: *Engine, url: []const u8, w: u16, h: u16, spec: ProfileSpec, policy_arg: ?*const NetPolicy, capture_arg: ?*const CaptureFilter) !*View {
         if (!self.ensure()) return error.Unavailable;
         // A routed helper that refused its route says so right after
         // the handshake; read that before minting a view it would refuse.
@@ -1609,6 +1676,13 @@ pub const Engine = struct {
             // The helper can hold this many policies; past it a policied
             // view would silently run unpoliced, so refuse instead.
             if (self.views.items.len >= proto.MAX_POLICY_VIEWS) return error.PolicyTooManyViews;
+        }
+        if (capture_arg != null) {
+            if (!self.has(.capture)) return error.CaptureUnsupported;
+            // The capture lives in the same per-view helper slot a policy
+            // does; past the table a captured view would silently record
+            // nothing.
+            if (self.views.items.len >= proto.MAX_POLICY_VIEWS) return error.CaptureTooManyViews;
         }
 
         var ctx_id: u32 = 0;
@@ -1631,6 +1705,8 @@ pub const Engine = struct {
         // never arrives.
         var owned_pol: ?NetPolicy = if (policy) |p| try dupePolicy(self.gpa, p.*) else null;
         errdefer if (owned_pol) |*p| freePolicy(self.gpa, p);
+        var owned_cap: ?CaptureFilter = if (capture_arg) |f| try dupeCapture(self.gpa, f.*) else null;
+        errdefer if (owned_cap) |*f| freeCapture(self.gpa, f);
         const new_id = nextViewId();
         var pol_serial: u32 = 0;
         if (policy) |p| {
@@ -1640,6 +1716,12 @@ pub const Engine = struct {
             if (p.block_ads) |on| {
                 self.send(proto.InterceptSet{ .view = new_id, .enabled = if (on) 1 else 0 }) catch return error.Unavailable;
             }
+        }
+        var cap_serial: u32 = 0;
+        if (capture_arg) |f| {
+            cap_serial = self.next_capture_serial;
+            self.next_capture_serial += 1;
+            self.send(captureInstallFrame(new_id, cap_serial, f)) catch return error.Unavailable;
         }
 
         const v = try self.gpa.create(View);
@@ -1658,10 +1740,13 @@ pub const Engine = struct {
             .pol = owned_pol,
             .pol_serial = pol_serial,
             .pol_active = policy != null,
+            .cap = owned_cap,
+            .cap_serial = cap_serial,
         };
-        // Ownership moved into the view; the errdefer above must not
-        // double-free through the local.
+        // Ownership moved into the view; the errdefers above must not
+        // double-free through the locals.
         owned_pol = null;
+        owned_cap = null;
         try self.views.append(self.gpa, v);
         if (url.len > 0 and self.has(.view_create_url)) {
             self.send(proto.ViewCreateUrl{
@@ -1787,6 +1872,23 @@ pub const Engine = struct {
                 return .{ .id = id, .ephemeral = false };
             },
         }
+    }
+
+    fn captureInstallFrame(view_id: u32, serial: u32, f: *const CaptureFilter) proto.CaptureSet {
+        return .{
+            .view = view_id,
+            .serial = serial,
+            .op = @intFromEnum(proto.CaptureOp.install),
+            .upto = 0,
+            .types = f.types,
+            .max_body = f.max_body,
+            .max_total = f.max_total,
+            .url_contains = f.url_contains,
+            .url_regex = f.url_regex,
+            .hosts = f.hosts,
+            .methods = f.methods,
+            .mime_prefixes = f.mime_prefixes,
+        };
     }
 
     fn policyFrame(view_id: u32, serial: u32, p: *const NetPolicy) proto.NetPolicySet {
@@ -2624,6 +2726,95 @@ pub const Engine = struct {
         return error.Timeout;
     }
 
+    // ---- response-body capture ---------------------------------------
+
+    /// One metadata page of the view's finished exchanges (and, with
+    /// `in_flight`, the unfinished ones after them). The entries and
+    /// their strings live in `arena`.
+    pub fn captureList(self: *Engine, arena: std.mem.Allocator, id: u32, since: u32, max: u16, in_flight: bool, budget_ms: i64) !proto.CaptureList {
+        if (!self.ensure()) return error.Unavailable;
+        const v = self.findView(id) orelse return error.NoView;
+        if (v.cap == null) return error.NoCapture;
+        if (v.cap_list) |old| {
+            self.gpa.free(old);
+            v.cap_list = null;
+        }
+        self.send(proto.CaptureListReq{
+            .view = id,
+            .since = since,
+            .max = max,
+            .flags = if (in_flight) proto.CaptureListReq.flag_in_flight else 0,
+        }) catch return error.Unavailable;
+        const deadline = clock.nowMs() + @max(budget_ms, 100);
+        while (clock.nowMs() < deadline) {
+            const vv = self.findView(id) orelse return error.NoView;
+            if (vv.cap_list) |raw| {
+                // Owned by the arena from here: the view's copy is
+                // replaced by the next reply.
+                const mine = try arena.dupe(u8, raw);
+                return proto.CaptureList.decodeAlloc(mine, arena) catch error.Unavailable;
+            }
+            if (self.state != .ready) return error.Unavailable;
+            self.pumpOnce(40);
+        }
+        return error.Timeout;
+    }
+
+    /// One chunk of one captured body. The reply must name the same
+    /// exchange, part and offset; a late answer to an abandoned read is
+    /// skipped rather than taken for this one. Strings live in `arena`.
+    pub fn captureBody(self: *Engine, arena: std.mem.Allocator, id: u32, seq: u32, part: proto.CapturePart, offset: u64, max: u32, budget_ms: i64) !proto.CaptureBody {
+        if (!self.ensure()) return error.Unavailable;
+        const v = self.findView(id) orelse return error.NoView;
+        if (v.cap == null) return error.NoCapture;
+        if (v.cap_body) |old| {
+            self.gpa.free(old);
+            v.cap_body = null;
+        }
+        self.send(proto.CaptureBodyReq{ .view = id, .seq = seq, .part = @intFromEnum(part), .offset = offset, .max = max }) catch return error.Unavailable;
+        const deadline = clock.nowMs() + @max(budget_ms, 100);
+        while (clock.nowMs() < deadline) {
+            const vv = self.findView(id) orelse return error.NoView;
+            if (vv.cap_body) |raw| {
+                const mine = try arena.dupe(u8, raw);
+                self.gpa.free(raw);
+                vv.cap_body = null;
+                const b = proto.decode(proto.CaptureBody, mine) catch return error.Unavailable;
+                if (b.seq == seq and b.part == @intFromEnum(part) and b.offset == offset) return b;
+                continue;
+            }
+            if (self.state != .ready) return error.Unavailable;
+            self.pumpOnce(40);
+        }
+        return error.Timeout;
+    }
+
+    /// Narrow a live view's capture: `clear` frees exchanges up to a
+    /// cursor (0 = all), `disable` stops recording. There is no
+    /// install here — a capture added to a live view would miss the
+    /// requests that already ran, so it only ever rides the open.
+    pub fn captureNarrow(self: *Engine, id: u32, op: proto.CaptureOp, upto: u32) !void {
+        if (!self.ensure()) return error.Unavailable;
+        const v = self.findView(id) orelse return error.NoView;
+        if (v.cap == null) return error.NoCapture;
+        std.debug.assert(op == .clear or op == .disable);
+        self.send(proto.CaptureSet{
+            .view = id,
+            .serial = v.cap_serial,
+            .op = @intFromEnum(op),
+            .upto = upto,
+            .types = 0,
+            .max_body = 0,
+            .max_total = 0,
+            .url_contains = "",
+            .url_regex = "",
+            .hosts = &.{},
+            .methods = &.{},
+            .mime_prefixes = &.{},
+        }) catch return error.Unavailable;
+        if (op == .disable) v.cap_disabled = true;
+    }
+
     // ---- semantic round trips ---------------------------------------
 
     /// Wait, bounded, for the view's FIRST composited frame.
@@ -3150,6 +3341,25 @@ pub const Engine = struct {
                 if (v.net_log) |old| self.gpa.free(old);
                 v.net_log = json;
                 v.net_log_waiting = false;
+            },
+            .capture_list => {
+                const ev = proto.CaptureList.decodeAlloc(frame.payload, self.gpa) catch return;
+                defer self.gpa.free(ev.entries);
+                const v = self.findView(ev.view) orelse return;
+                // The unsolicited refusal of OUR install: the open must
+                // fail closed rather than run uncaptured.
+                if (ev.state == @intFromEnum(proto.CaptureState.refused) and v.cap_serial != 0 and ev.serial == v.cap_serial)
+                    v.cap_install_failed = true;
+                const copy = self.gpa.dupe(u8, frame.payload) catch return;
+                if (v.cap_list) |old| self.gpa.free(old);
+                v.cap_list = copy;
+            },
+            .capture_body => {
+                const ev = proto.decode(proto.CaptureBody, frame.payload) catch return;
+                const v = self.findView(ev.view) orelse return;
+                const copy = self.gpa.dupe(u8, frame.payload) catch return;
+                if (v.cap_body) |old| self.gpa.free(old);
+                v.cap_body = copy;
             },
             .ev_net_policy => {
                 const ev = proto.decode(proto.EvNetPolicy, frame.payload) catch return;
@@ -4024,6 +4234,174 @@ test "net_policy_set travels strictly before view_create_url, naming the same vi
     try std.testing.expectEqual(proto.Tag.view_create_url, f3.tag);
     const create = try proto.decode(proto.ViewCreateUrl, f3.payload);
     try std.testing.expectEqual(v.id, create.view);
+}
+
+test "a captured open is refused, opening nothing, without the capture capability" {
+    const gpa = std.testing.allocator;
+    var p = try Pair.init(gpa);
+    defer p.deinit();
+    var buf: [8192]u8 = undefined;
+
+    const f = CaptureFilter{ .mime_prefixes = &.{"application/json"} };
+    try std.testing.expect(!p.eng.has(.capture));
+    try std.testing.expectError(error.CaptureUnsupported, p.eng.openViewWith("https://site.example/", 800, 600, .default, null, &f));
+    // Fail closed: no view, and not one byte on the wire — the page was
+    // never loaded uncaptured.
+    try std.testing.expectEqual(@as(usize, 0), p.eng.views.items.len);
+    try std.testing.expectEqual(@as(usize, 0), p.drain(&buf).len);
+}
+
+test "capture_set travels strictly before view_create_url, carrying the whole filter" {
+    const gpa = std.testing.allocator;
+    var p = try Pair.init(gpa);
+    defer p.deinit();
+    p.eng.caps.setPresent(.capture, true);
+    var buf: [16384]u8 = undefined;
+
+    const f = CaptureFilter{
+        .hosts = &.{"spotify.com"},
+        .methods = &.{"POST"},
+        .mime_prefixes = &.{"application/json"},
+        .url_contains = "/pathfinder/",
+        .url_regex = "operationName=fetch",
+        .max_body = 1 << 20,
+        .max_total = 1 << 24,
+    };
+    const v = try p.eng.openViewWith("https://open.spotify.com/playlist/x", 800, 600, .default, null, &f);
+    try std.testing.expect(v.cap != null);
+    try std.testing.expect(v.cap_serial != 0);
+
+    const bytes = p.drain(&buf);
+    var reader = proto.Reader.init(bytes);
+    const f1 = (try reader.next()).?;
+    try std.testing.expectEqual(proto.Tag.capture_set, f1.tag);
+    const set = try proto.CaptureSet.decodeAlloc(f1.payload, gpa);
+    defer set.freeLists(gpa);
+    try std.testing.expectEqual(v.id, set.view);
+    try std.testing.expectEqual(v.cap_serial, set.serial);
+    try std.testing.expectEqual(proto.CaptureOp.install, @as(proto.CaptureOp, @enumFromInt(set.op)));
+    try std.testing.expectEqual(capture.DEFAULT_TYPES, set.types);
+    try std.testing.expectEqualStrings("spotify.com", set.hosts[0]);
+    try std.testing.expectEqualStrings("POST", set.methods[0]);
+    try std.testing.expectEqualStrings("operationName=fetch", set.url_regex);
+    try std.testing.expectEqual(@as(u64, 1 << 24), set.max_total);
+    const f2 = (try reader.next()).?;
+    try std.testing.expectEqual(proto.Tag.view_create_url, f2.tag);
+    try std.testing.expectEqual(v.id, (try proto.decode(proto.ViewCreateUrl, f2.payload)).view);
+}
+
+test "a refused capture install for OUR serial fails the open; another serial does not" {
+    const gpa = std.testing.allocator;
+    var p = try Pair.init(gpa);
+    defer p.deinit();
+    p.eng.caps.setPresent(.capture, true);
+    var buf: [16384]u8 = undefined;
+    const f = CaptureFilter{};
+    const v = try p.eng.openViewWith("https://site.example/", 800, 600, .default, null, &f);
+    _ = p.drain(&buf);
+
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(gpa);
+    const refused = proto.CaptureList{
+        .view = v.id,
+        .serial = v.cap_serial + 7,
+        .state = @intFromEnum(proto.CaptureState.refused),
+        .more = 0,
+        .max_body = 0,
+        .max_total = 0,
+        .stored = 0,
+        .in_flight = 0,
+        .next_cursor = 0,
+        .head_cursor = 0,
+        .dropped = @splat(0),
+        .entries = &.{},
+    };
+    try proto.encodePayload(gpa, &payload, refused);
+    p.eng.dispatch(.{ .tag = .capture_list, .payload = payload.items });
+    try std.testing.expect(!v.cap_install_failed);
+
+    payload.clearRetainingCapacity();
+    var ours = refused;
+    ours.serial = v.cap_serial;
+    try proto.encodePayload(gpa, &payload, ours);
+    p.eng.dispatch(.{ .tag = .capture_list, .payload = payload.items });
+    try std.testing.expect(v.cap_install_failed);
+}
+
+test "captureBody skips a late answer for another offset and takes the matching one" {
+    const gpa = std.testing.allocator;
+    var p = try Pair.init(gpa);
+    defer p.deinit();
+    p.eng.caps.setPresent(.capture, true);
+    var buf: [16384]u8 = undefined;
+    const f = CaptureFilter{};
+    const v = try p.eng.openViewWith("https://site.example/", 800, 600, .default, null, &f);
+    _ = p.drain(&buf);
+
+    var frames: std.ArrayList(u8) = .empty;
+    defer frames.deinit(gpa);
+    const reply = proto.CaptureBody{
+        .view = v.id,
+        .seq = 9,
+        .part = 0,
+        .found = 1,
+        .complete = 1,
+        .trunc = 0,
+        .total = 10,
+        .seen = 10,
+        .offset = 4,
+        .status = 200,
+        .mime = "application/json",
+        .charset = "",
+        .headers = .{ .s = "" },
+        .data = .{ .s = "STALE" },
+    };
+    try proto.encode(gpa, &frames, reply);
+    var right = reply;
+    right.offset = 0;
+    right.data = .{ .s = "0123456789" };
+    try proto.encode(gpa, &frames, right);
+    // Both arrive AFTER the request goes out, as a helper's would:
+    // anything already queued is drained by `ensure` before the send.
+    const writer = try std.Thread.spawn(.{}, struct {
+        fn run(fd: c_int, bytes: []const u8) void {
+            var ts = c.struct_timespec{ .tv_sec = 0, .tv_nsec = 100 * std.time.ns_per_ms };
+            _ = c.nanosleep(&ts, null);
+            _ = c.write(fd, bytes.ptr, bytes.len);
+        }
+    }.run, .{ p.peer, frames.items });
+    defer writer.join();
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const got = try p.eng.captureBody(arena_state.allocator(), v.id, 9, .response, 0, 64, 2000);
+    try std.testing.expectEqualStrings("0123456789", got.data.s);
+    try std.testing.expectEqual(@as(u64, 0), got.offset);
+}
+
+test "capture verbs on a view without a capture say so, and disable is remembered" {
+    const gpa = std.testing.allocator;
+    var p = try Pair.init(gpa);
+    defer p.deinit();
+    p.eng.caps.setPresent(.capture, true);
+    var buf: [16384]u8 = undefined;
+    const plain = try p.eng.openViewWith("https://site.example/", 800, 600, .default, null, null);
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    try std.testing.expectError(error.NoCapture, p.eng.captureList(arena_state.allocator(), plain.id, 0, 10, false, 100));
+    try std.testing.expectError(error.NoCapture, p.eng.captureNarrow(plain.id, .clear, 0));
+
+    const f = CaptureFilter{};
+    const v = try p.eng.openViewWith("https://site.example/", 800, 600, .default, null, &f);
+    _ = p.drain(&buf);
+    try p.eng.captureNarrow(v.id, .disable, 0);
+    try std.testing.expect(v.cap_disabled);
+    var reader = proto.Reader.init(p.drain(&buf));
+    const frame = (try reader.next()).?;
+    try std.testing.expectEqual(proto.Tag.capture_set, frame.tag);
+    const set = try proto.CaptureSet.decodeAlloc(frame.payload, gpa);
+    defer set.freeLists(gpa);
+    try std.testing.expectEqual(proto.CaptureOp.disable, @as(proto.CaptureOp, @enumFromInt(set.op)));
 }
 
 test "ev_net_policy: a stale serial is ignored, the live one updates, active=0 fails the install" {

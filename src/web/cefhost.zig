@@ -47,6 +47,7 @@ const host_sec = @import("cefhost/security.zig");
 const host_dl = @import("cefhost/downloads.zig");
 const host_a11y = @import("cefhost/a11y.zig");
 const host_icpt = @import("cefhost/intercept.zig");
+const host_cap = @import("cefhost/capture.zig");
 const host_sem = @import("cefhost/semlayer.zig");
 const host_wreq = @import("cefhost/webrequest.zig");
 const host_webext = @import("cefhost/webext.zig");
@@ -2837,6 +2838,9 @@ pub const Host = struct {
     pub const netPolicySet = host_icpt.netPolicySet;
     pub const netPolicyStatus = host_icpt.netPolicyStatus;
     pub const netLog = host_icpt.netLog;
+    pub const captureSet = host_cap.captureSet;
+    pub const captureList = host_cap.captureList;
+    pub const captureBody = host_cap.captureBody;
     pub const flushNetPolicy = host_icpt.flushNetPolicy;
     pub const flushInterceptStatus = host_icpt.flushInterceptStatus;
     pub const usScriptSet = host_us.usScriptSet;
@@ -5132,6 +5136,9 @@ fn installHandlers() void {
     resource_request_handler.get_resource_handler = onGetResourceHandler;
     readFaultEnv();
     resource_request_handler.on_resource_response = onResourceResponse;
+    // Response-body capture: a filter only for exchanges a view's
+    // capture matched, NULL (no filter at all) for everything else.
+    resource_request_handler.get_resource_response_filter = host_cap.onGetResourceResponseFilter;
     resource_request_handler.on_resource_load_complete = onResourceLoadComplete;
     request_handler.on_certificate_error = onCertificateError;
 

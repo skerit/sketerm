@@ -90,6 +90,18 @@ pub const CAP_INTERCEPT = "intercept";
 /// helper without this capability REFUSES a policied open rather than
 /// opening an unpoliced view.
 pub const CAP_NET_POLICY = "net-policy";
+/// The helper captures response BODIES per view (0x8B block): a
+/// `capture_set` installs a filter (hosts, url substring/regex,
+/// resource types, methods, mime prefixes) and byte caps, and matching
+/// exchanges are kept with their request body, response headers and the
+/// decoded body the page received. Nothing is streamed: the client
+/// pages metadata with `capture_list_req` and pulls bodies in chunks
+/// with `capture_body_req`. Like `net_policy_set`, the install must
+/// travel BEFORE the `view_create*` naming the view, so the capture is
+/// live for the view's first request; a client on a helper without this
+/// capability refuses a captured open rather than opening an uncaptured
+/// view.
+pub const CAP_CAPTURE = "capture";
 /// The helper can REALLY open a popup — a child browser that keeps its
 /// `window.opener` relationship — instead of cancelling it and asking
 /// the client to open an unrelated tab.
@@ -360,6 +372,7 @@ pub const Cap = enum {
     context_menu,
     intercept,
     net_policy,
+    capture,
     popup_open,
     tls,
     permissions,
@@ -619,6 +632,12 @@ pub const Tag = enum(u8) {
     ev_net_policy = 0x88,
     net_log_req = 0x89,
     net_log = 0x8A,
+    // Response-body capture, capability "capture" (see CAP_CAPTURE).
+    capture_set = 0x8B,
+    capture_list_req = 0x8C,
+    capture_list = 0x8D,
+    capture_body_req = 0x8E,
+    capture_body = 0x8F,
     context_create = 0x90,
     context_destroy = 0x91,
     ev_view_create_failed = 0x92,
@@ -2869,6 +2888,334 @@ pub const NetLog = struct {
         }
         return .{ .view = view, .next_seq = next_seq, .entries = entries };
     }
+};
+
+// -- response-body capture (0x8B block, capability "capture") --------
+
+/// What one `capture_set` does to a view's capture.
+pub const CaptureOp = enum(u8) {
+    /// Install (or replace) the capture. Anything held is discarded.
+    install = 1,
+    /// Free held exchanges: every one whose list cursor is at or below
+    /// `upto`, or everything (in-flight ones included) when `upto` is 0.
+    clear = 2,
+    /// Stop capturing new exchanges; what is held stays readable.
+    disable = 3,
+    _,
+};
+
+/// Install, clear or disable a view's capture. An install travels
+/// BEFORE the `view_create*` naming the view (frame order is the
+/// guarantee, as for `net_policy_set`); the helper answers a refused
+/// install (no free slot) with an unsolicited `capture_list` whose state
+/// is `refused`. Empty lists and strings mean "no restriction" and a
+/// zero `types` means every resource class; the client sends explicit
+/// defaults.
+pub const CaptureSet = struct {
+    pub const tag: Tag = .capture_set;
+    view: u32,
+    serial: u32,
+    /// `CaptureOp` byte.
+    op: u8,
+    /// `clear` only.
+    upto: u32,
+    /// `filter.RType`-indexed bit mask.
+    types: u16,
+    max_body: u32,
+    max_total: u64,
+    url_contains: []const u8,
+    /// `util/pattern.zig` syntax, compiled helper-side.
+    url_regex: []const u8,
+    hosts: []const []const u8,
+    methods: []const []const u8,
+    mime_prefixes: []const []const u8,
+
+    pub fn encodeTo(self: CaptureSet, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        try putU32(gpa, out, self.view);
+        try putU32(gpa, out, self.serial);
+        try putU8(gpa, out, self.op);
+        try putU32(gpa, out, self.upto);
+        try putU16(gpa, out, self.types);
+        try putU32(gpa, out, self.max_body);
+        try putU64(gpa, out, self.max_total);
+        try putStr(gpa, out, self.url_contains);
+        try putStr(gpa, out, self.url_regex);
+        inline for (.{ self.hosts, self.methods, self.mime_prefixes }) |list| {
+            // Clamped, never wrapped: a silent `@intCast` wrap would send
+            // a short count and a payload the reader walks off the end of.
+            const n: u16 = @intCast(@min(list.len, std.math.maxInt(u16)));
+            try putU16(gpa, out, n);
+            for (list[0..n]) |s| try putStr(gpa, out, s);
+        }
+    }
+
+    /// Caller frees `hosts`, `methods` and `mime_prefixes` (strings
+    /// borrow from `payload`).
+    pub fn decodeAlloc(payload: []const u8, gpa: std.mem.Allocator) !CaptureSet {
+        var cur = Cur{ .buf = payload };
+        var out: CaptureSet = undefined;
+        out.view = try cur.readU32();
+        out.serial = try cur.readU32();
+        out.op = try cur.readU8();
+        out.upto = try cur.readU32();
+        out.types = try cur.readU16();
+        out.max_body = try cur.readU32();
+        out.max_total = try cur.readU64();
+        out.url_contains = try cur.readStr();
+        out.url_regex = try cur.readStr();
+        out.hosts = try readStrList(&cur, gpa);
+        errdefer gpa.free(out.hosts);
+        out.methods = try readStrList(&cur, gpa);
+        errdefer gpa.free(out.methods);
+        out.mime_prefixes = try readStrList(&cur, gpa);
+        return out;
+    }
+
+    pub fn freeLists(self: CaptureSet, gpa: std.mem.Allocator) void {
+        gpa.free(self.hosts);
+        gpa.free(self.methods);
+        gpa.free(self.mime_prefixes);
+    }
+};
+
+fn readStrList(cur: *Cur, gpa: std.mem.Allocator) ![]const []const u8 {
+    const n = try cur.readU16();
+    const list = try gpa.alloc([]const u8, n);
+    errdefer gpa.free(list);
+    for (list) |*s| s.* = try cur.readStr();
+    return list;
+}
+
+/// Page through a view's FINISHED exchanges: those whose list cursor is
+/// above `since`, oldest cursor first, at most `max`. With
+/// `flag_in_flight` the unfinished ones follow them (cursor 0), which
+/// never moves the cursor.
+pub const CaptureListReq = struct {
+    pub const tag: Tag = .capture_list_req;
+    pub const flag_in_flight: u8 = 1;
+    view: u32,
+    since: u32,
+    max: u16,
+    flags: u8,
+};
+
+/// A view's capture as a whole.
+pub const CaptureState = enum(u8) {
+    none = 0,
+    active = 1,
+    disabled = 2,
+    /// The helper could not hold the capture (its slot table is full).
+    refused = 3,
+    _,
+};
+
+/// Why an exchange that matched the filter was not recorded at all.
+/// Indexes `CaptureList.dropped`.
+pub const CaptureDrop = enum(u8) {
+    /// Too many matching requests awaited their response at once.
+    pending_full = 0,
+    /// `max_total` was already spent when the response began.
+    total_full = 1,
+    /// The per-view exchange table was full.
+    entries_full = 2,
+    no_memory = 3,
+};
+pub const NCAPTURE_DROPS = 4;
+
+/// Why a stored body is shorter than what the engine delivered.
+pub const CaptureTrunc = enum(u8) {
+    none = 0,
+    body_cap = 1,
+    total_cap = 2,
+    no_memory = 3,
+    _,
+};
+
+/// One recorded exchange's metadata. `seq` is the view's network-log
+/// seq for the same request (the `web_network` join key); `cursor` is
+/// the list position, assigned when the exchange FINISHED, because
+/// responses finish out of request order and a seq cursor would skip a
+/// slow one.
+pub const CaptureEntry = struct {
+    pub const flag_complete: u8 = 1;
+    pub const flag_failed: u8 = 2;
+    /// The request body had parts that are not bytes (a file upload);
+    /// only the byte parts were kept.
+    pub const flag_req_nonbytes: u8 = 4;
+    pub const flag_headers_truncated: u8 = 8;
+
+    seq: u32,
+    cursor: u32,
+    rtype: u8,
+    flags: u8,
+    status: u16,
+    /// Engine net error (0 = none), for a failed exchange.
+    err: i32,
+    /// `CaptureTrunc` bytes for the response and request bodies.
+    trunc: u8,
+    req_trunc: u8,
+    body_len: u64,
+    /// Bytes the engine delivered, stored or not.
+    body_seen: u64,
+    req_len: u32,
+    req_total: u32,
+    /// Wall clock, ms since the epoch.
+    started_ms: u64,
+    dur_ms: u32,
+    method: []const u8,
+    mime: []const u8,
+    charset: []const u8,
+    url: Text,
+};
+
+pub const CaptureList = struct {
+    pub const tag: Tag = .capture_list;
+    view: u32,
+    serial: u32,
+    /// `CaptureState` byte.
+    state: u8,
+    /// More finished exchanges past the last one listed: page on from
+    /// `next_cursor`.
+    more: u8,
+    max_body: u32,
+    max_total: u64,
+    /// Body bytes held right now, request bodies included.
+    stored: u64,
+    /// Exchanges whose response began and has not finished.
+    in_flight: u32,
+    /// The cursor of the last entry listed (or `since` when none): the
+    /// next request's `since`.
+    next_cursor: u32,
+    /// The newest cursor assigned so far (0 = none): what "after now"
+    /// means to a waiter.
+    head_cursor: u32,
+    dropped: [NCAPTURE_DROPS]u32,
+    entries: []const CaptureEntry,
+
+    pub fn encodeTo(self: CaptureList, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        try putU32(gpa, out, self.view);
+        try putU32(gpa, out, self.serial);
+        try putU8(gpa, out, self.state);
+        try putU8(gpa, out, self.more);
+        try putU32(gpa, out, self.max_body);
+        try putU64(gpa, out, self.max_total);
+        try putU64(gpa, out, self.stored);
+        try putU32(gpa, out, self.in_flight);
+        try putU32(gpa, out, self.next_cursor);
+        try putU32(gpa, out, self.head_cursor);
+        for (self.dropped) |d| try putU32(gpa, out, d);
+        try putU16(gpa, out, @intCast(self.entries.len));
+        for (self.entries) |e| {
+            try putU32(gpa, out, e.seq);
+            try putU32(gpa, out, e.cursor);
+            try putU8(gpa, out, e.rtype);
+            try putU8(gpa, out, e.flags);
+            try putU16(gpa, out, e.status);
+            try putI32(gpa, out, e.err);
+            try putU8(gpa, out, e.trunc);
+            try putU8(gpa, out, e.req_trunc);
+            try putU64(gpa, out, e.body_len);
+            try putU64(gpa, out, e.body_seen);
+            try putU32(gpa, out, e.req_len);
+            try putU32(gpa, out, e.req_total);
+            try putU64(gpa, out, e.started_ms);
+            try putU32(gpa, out, e.dur_ms);
+            try putStr(gpa, out, e.method);
+            try putStr(gpa, out, e.mime);
+            try putStr(gpa, out, e.charset);
+            try putText(gpa, out, e.url);
+        }
+    }
+
+    /// Caller owns the returned `entries` slice (strings borrow from
+    /// `payload`).
+    pub fn decodeAlloc(payload: []const u8, gpa: std.mem.Allocator) !CaptureList {
+        var cur = Cur{ .buf = payload };
+        var out: CaptureList = undefined;
+        out.view = try cur.readU32();
+        out.serial = try cur.readU32();
+        out.state = try cur.readU8();
+        out.more = try cur.readU8();
+        out.max_body = try cur.readU32();
+        out.max_total = try cur.readU64();
+        out.stored = try cur.readU64();
+        out.in_flight = try cur.readU32();
+        out.next_cursor = try cur.readU32();
+        out.head_cursor = try cur.readU32();
+        for (&out.dropped) |*d| d.* = try cur.readU32();
+        const n = try cur.readU16();
+        const entries = try gpa.alloc(CaptureEntry, n);
+        errdefer gpa.free(entries);
+        for (entries) |*e| {
+            e.seq = try cur.readU32();
+            e.cursor = try cur.readU32();
+            e.rtype = try cur.readU8();
+            e.flags = try cur.readU8();
+            e.status = try cur.readU16();
+            e.err = try cur.readI32();
+            e.trunc = try cur.readU8();
+            e.req_trunc = try cur.readU8();
+            e.body_len = try cur.readU64();
+            e.body_seen = try cur.readU64();
+            e.req_len = try cur.readU32();
+            e.req_total = try cur.readU32();
+            e.started_ms = try cur.readU64();
+            e.dur_ms = try cur.readU32();
+            e.method = try cur.readStr();
+            e.mime = try cur.readStr();
+            e.charset = try cur.readStr();
+            e.url = try cur.readText();
+        }
+        out.entries = entries;
+        return out;
+    }
+};
+
+/// Which body of an exchange a `capture_body_req` reads.
+pub const CapturePart = enum(u8) { response = 0, request = 1, _ };
+
+/// Largest body chunk one `capture_body` carries; a client pages on with
+/// `offset` past it.
+pub const MAX_CAPTURE_CHUNK: u32 = 4 * 1024 * 1024;
+
+/// Read up to `max` bytes (clamped to `MAX_CAPTURE_CHUNK`) of one body,
+/// starting at `offset`.
+pub const CaptureBodyReq = struct {
+    pub const tag: Tag = .capture_body_req;
+    view: u32,
+    seq: u32,
+    /// `CapturePart` byte.
+    part: u8,
+    offset: u64,
+    max: u32,
+};
+
+/// One chunk of one body. `found = 0` means the exchange is not held
+/// (never captured, cleared, or the view has no capture). `headers` is
+/// the response's header list as JSON (`[{"name":..,"value":..}]`), sent
+/// with a response chunk at offset 0 only.
+pub const CaptureBody = struct {
+    pub const tag: Tag = .capture_body;
+    view: u32,
+    seq: u32,
+    part: u8,
+    found: u8,
+    /// The exchange finished; while 0 the body may still grow.
+    complete: u8,
+    /// `CaptureTrunc` byte for this part.
+    trunc: u8,
+    /// Stored length of this part.
+    total: u64,
+    /// Bytes of this part the engine delivered, stored or not.
+    seen: u64,
+    offset: u64,
+    status: u16,
+    /// The response's mime type and charset, whichever part is read:
+    /// how the body is presented depends on them.
+    mime: []const u8,
+    charset: []const u8,
+    headers: Text,
+    data: Text,
 };
 
 // -- devtools (0xA2 block, capability "devtools") ---------------------
@@ -5296,6 +5643,117 @@ test "round-trip: net_log carries the reason the old frame cannot" {
     const lifted = try netLogJson(gpa, 2, &legacy);
     defer gpa.free(lifted);
     try std.testing.expect(std.mem.indexOf(u8, lifted, "\"reason\":\"filter_list\"") != null);
+}
+
+test "round-trip: capture_set carries the whole filter, lists clamped not wrapped" {
+    const gpa = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try encode(gpa, &buf, CaptureSet{
+        .view = 5,
+        .serial = 2,
+        .op = @intFromEnum(CaptureOp.install),
+        .upto = 0,
+        .types = 0x80,
+        .max_body = 1 << 20,
+        .max_total = 1 << 26,
+        .url_contains = "/pathfinder/",
+        .url_regex = "operationName=fetch.*",
+        .hosts = &.{ "spotify.com", "spclient.wg.spotify.com" },
+        .methods = &.{ "GET", "POST" },
+        .mime_prefixes = &.{"application/json"},
+    });
+    var r = Reader.init(buf.items);
+    const frame = (try r.next()).?;
+    try std.testing.expectEqual(Tag.capture_set, frame.tag);
+    const got = try CaptureSet.decodeAlloc(frame.payload, gpa);
+    defer got.freeLists(gpa);
+    try std.testing.expectEqual(@as(u32, 5), got.view);
+    try std.testing.expectEqual(CaptureOp.install, @as(CaptureOp, @enumFromInt(got.op)));
+    try std.testing.expectEqual(@as(u64, 1 << 26), got.max_total);
+    try std.testing.expectEqualStrings("operationName=fetch.*", got.url_regex);
+    try std.testing.expectEqual(@as(usize, 2), got.hosts.len);
+    try std.testing.expectEqualStrings("spclient.wg.spotify.com", got.hosts[1]);
+    try std.testing.expectEqualStrings("POST", got.methods[1]);
+    try std.testing.expectEqualStrings("application/json", got.mime_prefixes[0]);
+
+    // A truncated payload is an error, never a read past the frame.
+    try std.testing.expectError(error.Truncated, CaptureSet.decodeAlloc(frame.payload[0 .. frame.payload.len - 3], gpa));
+    try roundTrip(CaptureListReq, .{ .view = 5, .since = 9, .max = 100, .flags = CaptureListReq.flag_in_flight });
+    try roundTrip(CaptureBodyReq, .{ .view = 5, .seq = 41, .part = 1, .offset = 4096, .max = MAX_CAPTURE_CHUNK });
+}
+
+test "round-trip: capture_list entries and capture_body chunks" {
+    const gpa = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    const long_url = "https://api.example/v1/items?" ++ "q=" ** 40000;
+    const entries = [_]CaptureEntry{.{
+        .seq = 41,
+        .cursor = 3,
+        .rtype = 7,
+        .flags = CaptureEntry.flag_complete | CaptureEntry.flag_headers_truncated,
+        .status = 200,
+        .err = 0,
+        .trunc = @intFromEnum(CaptureTrunc.body_cap),
+        .req_trunc = 0,
+        .body_len = 1 << 20,
+        .body_seen = 3 << 20,
+        .req_len = 17,
+        .req_total = 17,
+        .started_ms = 1_790_000_000_000,
+        .dur_ms = 120,
+        .method = "POST",
+        .mime = "application/json",
+        .charset = "utf-8",
+        // Past u16: a url is Text, so a long query string still frames.
+        .url = .{ .s = long_url },
+    }};
+    try encode(gpa, &buf, CaptureList{
+        .view = 5,
+        .serial = 2,
+        .state = @intFromEnum(CaptureState.active),
+        .more = 1,
+        .max_body = 1 << 20,
+        .max_total = 1 << 26,
+        .stored = 1 << 20,
+        .in_flight = 2,
+        .next_cursor = 3,
+        .head_cursor = 5,
+        .dropped = .{ 0, 4, 0, 0 },
+        .entries = &entries,
+    });
+    var r = Reader.init(buf.items);
+    const frame = (try r.next()).?;
+    try std.testing.expectEqual(Tag.capture_list, frame.tag);
+    const got = try CaptureList.decodeAlloc(frame.payload, gpa);
+    defer gpa.free(got.entries);
+    try std.testing.expectEqual(@as(u32, 2), got.in_flight);
+    try std.testing.expectEqual(@as(u32, 5), got.head_cursor);
+    try std.testing.expectEqual(@as(u32, 4), got.dropped[@intFromEnum(CaptureDrop.total_full)]);
+    try std.testing.expectEqual(@as(usize, 1), got.entries.len);
+    const e = got.entries[0];
+    try std.testing.expectEqual(@as(u32, 41), e.seq);
+    try std.testing.expectEqual(@as(u64, 3 << 20), e.body_seen);
+    try std.testing.expectEqualStrings(long_url, e.url.s);
+    try std.testing.expectEqualStrings("utf-8", e.charset);
+
+    try roundTrip(CaptureBody, .{
+        .view = 5,
+        .seq = 41,
+        .part = 0,
+        .found = 1,
+        .complete = 1,
+        .trunc = 0,
+        .total = 9,
+        .seen = 9,
+        .offset = 0,
+        .status = 200,
+        .mime = "application/json",
+        .charset = "",
+        .headers = .{ .s = "[{\"name\":\"content-type\",\"value\":\"application/json\"}]" },
+        .data = .{ .s = "{\"a\":[1]}" },
+    });
 }
 
 test "round-trip: devtools and print-to-pdf frames" {

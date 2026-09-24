@@ -115,6 +115,7 @@ const unconditional_caps = [_]proto.Cap{
     .context_menu,
     .intercept,
     .net_policy,
+    .capture,
     .tls,
     .permissions,
     .scroll,
@@ -159,6 +160,7 @@ fn withheld(cap: proto.Cap) bool {
         .reader_ids => "SKETERM_WEB_DISABLE_READER_IDS",
         .semantic_request_ids => "SKETERM_WEB_DISABLE_SEMANTIC_REQUEST_IDS",
         .net_policy => "SKETERM_WEB_DISABLE_NET_POLICY",
+        .capture => "SKETERM_WEB_DISABLE_CAPTURE",
         else => return false,
     };
     return c.getenv(env) != null;
@@ -920,6 +922,14 @@ pub const Server = struct {
             },
             .net_policy_req => self.host.netPolicyStatus(try self.dec(cn, proto.NetPolicyReq, frame.payload)),
             .net_log_req => self.host.netLog(try self.dec(cn, proto.NetLogReq, frame.payload)),
+            .capture_set => {
+                var req = try proto.CaptureSet.decodeAlloc(frame.payload, self.gpa);
+                defer req.freeLists(self.gpa);
+                try self.xlateIn(cn, proto.CaptureSet, &req);
+                self.host.captureSet(req);
+            },
+            .capture_list_req => self.host.captureList(try self.dec(cn, proto.CaptureListReq, frame.payload)),
+            .capture_body_req => self.host.captureBody(try self.dec(cn, proto.CaptureBodyReq, frame.payload)),
             .download_decide => self.host.downloadDecide(try self.dec(cn, proto.DownloadDecide, frame.payload)),
             .download_cancel => self.host.downloadCancel(try self.dec(cn, proto.DownloadCancel, frame.payload)),
             .download_start => self.host.downloadStart(try self.dec(cn, proto.DownloadStart, frame.payload)),
