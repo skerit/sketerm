@@ -3,6 +3,7 @@
 //! the module that owns the behavior.
 
 const std = @import("std");
+const useractions = @import("../../filebrowser/useractions.zig");
 const c = @import("../../c.zig").c;
 const clipboard = @import("../clipboard.zig");
 const browser_model = @import("../../filebrowser/model.zig");
@@ -247,7 +248,7 @@ pub fn showEntryMenu(
         viewsec.check("Show Hidden Files", tab.show_hidden, &onMenuToggleHidden, ctx);
         const term = m.section();
         term.itemIcon("Analyze Disk Usage", .{ .name = "drive-harddisk-symbolic" }, &onMenuAnalyzeUsage, ctx);
-        if (is_local) term.itemIcon("Open in Terminal", .{ .name = "sketerm-terminal-symbolic" }, &onMenuTerminalHere, ctx);
+        if (@import("ops.zig").shellVerdict(self, tab) != .other_host) term.itemIcon("Open in Terminal", .{ .name = "sketerm-terminal-symbolic" }, &onMenuTerminalHere, ctx);
         if (self.on_host_term != null) term.item("Open Terminal Tab Here", &onMenuTermTab, ctx);
         const acts = m.section();
         self.appendActionItems(acts, ctx);
@@ -935,18 +936,22 @@ pub fn onMenuTerminalHere(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void 
     // Entry menus target the clicked directory; the background menu
     // (no path) targets the folder being shown.
     const path = ctx.path orelse ctx.tab.root.path;
-    // cd the pane's shell into the target (single-quoted; embedded
-    // quotes escaped) and flip to the terminal face.
-    var buf: [4600]u8 = undefined;
-    var w = std.Io.Writer.fixed(&buf);
-    w.writeAll("cd '") catch return menuDone(ctx);
-    for (path) |ch| {
-        if (ch == '\'') w.writeAll("'\\''") catch return menuDone(ctx) else w.writeByte(ch) catch return menuDone(ctx);
+    // cd the pane's shell into the target and flip to the terminal
+    // face -- when that shell is on the tab's host and at a prompt.
+    // Otherwise a fresh terminal opens on the tab's host, in the
+    // folder (a local shell cannot cd into a remote path).
+    const ops = @import("ops.zig");
+    if (ops.shellVerdict(ctx.view, ctx.tab) == .other_host) {
+        if (ctx.view.on_host_term) |cb| {
+            if (ctx.view.hooks_ctx) |hctx| {
+                cb(hctx, ctx.tab.hc.host orelse "", path);
+                return menuDone(ctx);
+            }
+        }
     }
-    w.writeAll("'\n") catch return menuDone(ctx);
-    const pane = ctx.view.pane orelse return menuDone(ctx);
-    pane.terminal.writeRaw(w.buffered());
-    pane.setBrowserVisible(false);
+    const line = @import("../../filebrowser/shellverb.zig").cdLine(ctx.allocator, path) catch return menuDone(ctx);
+    defer ctx.allocator.free(line);
+    _ = ops.typeIntoShell(ctx.view, ctx.tab, line);
     menuDone(ctx);
 }
 
@@ -1443,22 +1448,22 @@ pub const ActionCtx = struct {
     }
 };
 
-/// User actions from $XDG_CONFIG_HOME/sketerm/actions/*.action:
-/// Name= / Exec= (%f = quoted path) / Ext=csv / RunsOnHost=true.
-/// Local-only actions hide on remote tabs (a local command cannot
-/// reach a remote path); RunsOnHost actions run as app sessions
-/// on the file's host (windows forward here).
+/// User actions from $XDG_CONFIG_HOME/sketerm/actions/*.action (our
+/// own configuration, like config.conf -- not a browsed disk). The
+/// format, its conditions (Kind / Selection / Match / Ext / Hosts)
+/// and its tokens (%f %F %n %d %h) live in
+/// `filebrowser/useractions.zig`. A right-click inside a multi-row
+/// selection targets the whole selection (the same rule as copy and
+/// trash); RunsOnHost actions run as app sessions on the file's host.
 pub fn appendActionItems(self: *BrowserView, m: classicmenu.Menu, ctx: *MenuCtx) void {
-    // Background menus run actions against the folder itself.
-    const path = ctx.path orelse ctx.tab.root.path;
     var dirbuf: [4096:0]u8 = undefined;
     const cfg = c.g_get_user_config_dir();
     const adir = std.fmt.bufPrintZ(&dirbuf, "{s}/sketerm/actions", .{cfg}) catch return;
     const d = c.opendir(adir.ptr) orelse return;
     defer _ = c.closedir(d);
     const remote = ctx.tab.hc.host != null;
-    const base = std.fs.path.basename(path);
-    const ext = if (std.mem.lastIndexOfScalar(u8, base, '.')) |i| base[i + 1 ..] else "";
+    const targets = actionTargets(self, ctx) orelse return;
+    defer self.allocator.free(targets);
 
     while (c.readdir(d)) |de| {
         const fname = std.mem.span(@as([*:0]const u8, @ptrCast(&de.*.d_name)));
@@ -1469,55 +1474,20 @@ pub fn appendActionItems(self: *BrowserView, m: classicmenu.Menu, ctx: *MenuCtx)
         var content: [4096]u8 = undefined;
         const n = c.fread(&content, 1, content.len, f);
         _ = c.fclose(f);
-        var name: []const u8 = "";
-        var exec: []const u8 = "";
-        var exts: []const u8 = "";
-        var on_host = false;
-        var it = std.mem.tokenizeScalar(u8, content[0..n], '\n');
-        while (it.next()) |line_raw| {
-            const line = std.mem.trim(u8, line_raw, " \t\r");
-            if (std.mem.startsWith(u8, line, "Name=")) name = line[5..];
-            if (std.mem.startsWith(u8, line, "Exec=")) exec = line[5..];
-            if (std.mem.startsWith(u8, line, "Ext=")) exts = line[4..];
-            if (std.mem.startsWith(u8, line, "RunsOnHost=")) on_host = std.mem.eql(u8, line[11..], "true");
-        }
-        if (name.len == 0 or exec.len == 0) continue;
-        if (remote and !on_host) continue;
-        if (exts.len > 0) {
-            var matched = false;
-            var eit = std.mem.tokenizeScalar(u8, exts, ',');
-            while (eit.next()) |e| {
-                if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, e, " "), ext)) matched = true;
-            }
-            if (!matched) continue;
-        }
-        // %f -> single-quoted path, substituted now.
-        var cmd: std.ArrayList(u8) = .empty;
-        defer cmd.deinit(self.allocator);
-        var rest = exec;
-        while (std.mem.indexOf(u8, rest, "%f")) |i| {
-            cmd.appendSlice(self.allocator, rest[0..i]) catch return;
-            cmd.append(self.allocator, '\'') catch return;
-            for (path) |ch| {
-                if (ch == '\'') {
-                    cmd.appendSlice(self.allocator, "'\\''") catch return;
-                } else cmd.append(self.allocator, ch) catch return;
-            }
-            cmd.append(self.allocator, '\'') catch return;
-            rest = rest[i + 2 ..];
-        }
-        cmd.appendSlice(self.allocator, rest) catch return;
+        const action = useractions.parse(content[0..n]) orelse continue;
+        if (!useractions.applies(action, targets, remote)) continue;
+        const cmdline = useractions.expand(self.allocator, action.exec, targets, ctx.tab.hc.host orelse "") catch return;
 
-        const actx = self.allocator.create(ActionCtx) catch return;
+        const actx = self.allocator.create(ActionCtx) catch {
+            self.allocator.free(cmdline);
+            return;
+        };
         actx.* = .{
             .allocator = self.allocator,
             .view = self,
             .host = if (ctx.tab.hc.host) |h| (self.allocator.dupe(u8, h) catch null) else null,
-            .cmdline = self.allocator.dupe(u8, cmd.items) catch {
-                self.allocator.destroy(actx);
-                return;
-            },
-            .runs_on_host = on_host,
+            .cmdline = cmdline,
+            .runs_on_host = action.runs_on_host,
         };
         // The item's ctx is not the popover-owned MenuCtx, so the
         // menu root owns its release.
@@ -1525,10 +1495,39 @@ pub fn appendActionItems(self: *BrowserView, m: classicmenu.Menu, ctx: *MenuCtx)
         var lbl: [128]u8 = undefined;
         var ebuf: [200]u8 = undefined;
         const ltxt = std.fmt.bufPrint(&lbl, "{s}{s}", .{
-            name, if (on_host) " (on host)" else "",
+            action.name, if (action.runs_on_host) " (on host)" else "",
         }) catch continue;
         m.item(classicmenu.escapeLabel(ltxt, &ebuf), &onActionActivated, @ptrCast(actx));
     }
+}
+
+/// What a user action acts on: the whole selection when the clicked
+/// row is part of a multi-row one, else the clicked row, else (a
+/// background click) the folder itself. Caller frees the slice; the
+/// paths borrow the tab's model.
+fn actionTargets(self: *BrowserView, ctx: *MenuCtx) ?[]useractions.Target {
+    const tab = ctx.tab;
+    if (ctx.path) |clicked| {
+        if (tab.selected.actsOnAll(clicked)) {
+            const out = self.allocator.alloc(useractions.Target, tab.selected.items.len) catch return null;
+            for (tab.selected.items, out) |p, *slot| slot.* = .{ .path = p, .is_dir = entryIsDir(tab, p) };
+            return out;
+        }
+        const out = self.allocator.alloc(useractions.Target, 1) catch return null;
+        out[0] = .{ .path = clicked, .is_dir = ctx.is_dir };
+        return out;
+    }
+    const out = self.allocator.alloc(useractions.Target, 1) catch return null;
+    out[0] = .{ .path = tab.root.path, .is_dir = true };
+    return out;
+}
+
+fn entryIsDir(tab: *BTab, path: []const u8) bool {
+    const parent = std.fs.path.dirname(path) orelse return true;
+    const dir = if (std.mem.eql(u8, tab.root.path, parent)) tab.root else tab.subdirByPath(parent) orelse return false;
+    const i = dir.find(std.fs.path.basename(path)) orelse return false;
+    const e = dir.entries.items[i];
+    return std.mem.eql(u8, e.kind, "dir") or e.tdir;
 }
 
 fn actionCtxCleanup(user: ?*anyopaque) callconv(.c) void {

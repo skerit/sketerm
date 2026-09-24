@@ -32,6 +32,7 @@ const dirWithin = @import("../../filebrowser/paths.zig").dirWithin;
 const uniqueName = @import("../../filebrowser/paths.zig").uniqueName;
 const urlUnescape = @import("../../filebrowser/paths.zig").urlUnescape;
 const cast = @import("../../util/cast.zig");
+const shellverb = @import("../../filebrowser/shellverb.zig");
 
 /// One in-flight .trashinfo fetch for Restore from Trash.
 pub const RestoreRead = struct {
@@ -1245,34 +1246,48 @@ pub fn findEntryTags(tab: *BTab, path: []const u8) []const u8 {
     return dir.entries.items[i].tags;
 }
 
+/// Why the pane's shell cannot take typed text for `tab` right now
+/// (`filebrowser/shellverb.zig` decides), or .ok.
+pub fn shellVerdict(self: *BrowserView, tab: *BTab) shellverb.Verdict {
+    const pane = self.pane orelse return .no_shell;
+    const remote = pane.terminal.remote orelse return .no_shell;
+    return shellverb.verdict(
+        remote.canSend(),
+        @import("../../filebrowser/paths.zig").browserHost(remote.host),
+        tab.hc.host,
+        pane.terminal.screen.use_alt,
+    );
+}
+
+/// THE way a browser verb types into the pane's shell: refused (with
+/// the reason on the status line) unless that shell runs on the tab's
+/// host and is at a prompt, then typed and the shell face raised.
+pub fn typeIntoShell(self: *BrowserView, tab: *BTab, line: []const u8) bool {
+    const v = shellVerdict(self, tab);
+    if (v != .ok) {
+        self.setStatusFmt("not typed into the shell: {s}", .{v.phrase()});
+        return false;
+    }
+    const pane = self.pane.?;
+    pane.terminal.writeRaw(line);
+    pane.setBrowserVisible(false);
+    return true;
+}
+
 pub fn onMenuExportSel(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const ctx = cast.userData(MenuCtx, user);
     const self = ctx.view;
     const tab = ctx.tab;
-    var cmd: std.ArrayList(u8) = .empty;
-    defer cmd.deinit(self.allocator);
-    const paths: []const []u8 = if (tab.selected.items.len > 0)
+    const paths: []const []const u8 = if (tab.selected.items.len > 0)
         tab.selected.items
     else if (ctx.path) |pp|
-        (&[_][]u8{pp})[0..]
+        (&[_][]const u8{pp})[0..]
     else
         return menuDone(ctx);
-    cmd.appendSlice(self.allocator, "SK_SEL=") catch return menuDone(ctx);
-    appendQuoted(&cmd, self.allocator, paths[0]) catch return menuDone(ctx);
-    cmd.appendSlice(self.allocator, "; SK_SEL_ALL='") catch return menuDone(ctx);
-    for (paths, 0..) |sp, i| {
-        if (i > 0) cmd.append(self.allocator, ' ') catch return menuDone(ctx);
-        for (sp) |ch| {
-            if (ch == '\'') {
-                cmd.appendSlice(self.allocator, "'\\''") catch return menuDone(ctx);
-            } else cmd.append(self.allocator, ch) catch return menuDone(ctx);
-        }
-    }
-    cmd.appendSlice(self.allocator, "'\n") catch return menuDone(ctx);
-    const pane = self.pane orelse return menuDone(ctx);
-    pane.terminal.writeRaw(cmd.items);
-    pane.setBrowserVisible(false);
-    self.setStatusFmt("exported {d} path(s) as $SK_SEL / $SK_SEL_ALL", .{paths.len});
+    const line = shellverb.exportLine(self.allocator, paths) catch return menuDone(ctx);
+    defer self.allocator.free(line);
+    if (typeIntoShell(self, tab, line))
+        self.setStatusFmt("exported {d} path(s) as $SK_SEL / $SK_SEL_ALL", .{paths.len});
     menuDone(ctx);
 }
 
@@ -1313,6 +1328,16 @@ pub fn onMenuEditorRename(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void 
     const self = ctx.view;
     const tab = ctx.tab;
     if (tab.selected.items.len < 2) return menuDone(ctx);
+    // The list file and its "done" sentinel live on THIS machine, so
+    // the shell that edits them must too (and be at a prompt).
+    if (tab.hc.host != null) {
+        self.setStatus("Batch Rename in $EDITOR works on this computer's files; use Batch Rename Selected on a remote tab");
+        return menuDone(ctx);
+    }
+    if (shellVerdict(self, tab) != .ok) {
+        self.setStatusFmt("not typed into the shell: {s}", .{shellVerdict(self, tab).phrase()});
+        return menuDone(ctx);
+    }
     if (self.editor_rename) |er| {
         er.destroy(self.allocator);
         self.editor_rename = null;
@@ -1380,17 +1405,10 @@ pub fn onMenuEditorRename(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void 
 
     // Run $EDITOR in the pane's shell; touching the done file
     // fires the monitor.
-    var cmd: std.ArrayList(u8) = .empty;
-    defer cmd.deinit(self.allocator);
-    cmd.appendSlice(self.allocator, "\"${EDITOR:-vi}\" ") catch return menuDone(ctx);
-    appendQuoted(&cmd, self.allocator, tmp) catch return menuDone(ctx);
-    cmd.appendSlice(self.allocator, " && touch ") catch return menuDone(ctx);
-    appendQuoted(&cmd, self.allocator, done) catch return menuDone(ctx);
-    cmd.append(self.allocator, '\n') catch return menuDone(ctx);
-    const pane = self.pane orelse return menuDone(ctx);
-    pane.terminal.writeRaw(cmd.items);
-    pane.setBrowserVisible(false);
-    self.setStatus("edit the names, save, and quit the editor to apply");
+    const line = shellverb.editorLine(self.allocator, tmp, done) catch return menuDone(ctx);
+    defer self.allocator.free(line);
+    if (typeIntoShell(self, tab, line))
+        self.setStatus("edit the names, save, and quit the editor to apply");
     menuDone(ctx);
 }
 
