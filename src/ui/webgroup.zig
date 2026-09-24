@@ -35,7 +35,7 @@
 //!
 //! ## Lifetime
 //!
-//! The group is what the Pane holds (`Pane.web_ctx`), so it owns the
+//! The group is what the Pane holds (`Pane.faces.web.ctx`), so it owns the
 //! pane's five-pointer face contract and fans prepare-destroy / deinit
 //! out to its pages. `WebFace.fromPane` answers with the ACTIVE page,
 //! which is what every existing caller means by "the browser on this
@@ -92,7 +92,7 @@ pub const Group = struct {
 
     /// The group on `pane`, if it wears a web face at all.
     pub fn fromPane(pane: *Pane) ?*Group {
-        const ctx = pane.web_ctx orelse return null;
+        const ctx = pane.faces.web.ctx orelse return null;
         return @ptrCast(@alignCast(ctx));
     }
 

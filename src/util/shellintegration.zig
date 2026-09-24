@@ -83,6 +83,56 @@ pub fn resolve(allocator: std.mem.Allocator, argv0: []const u8) ?Resolved {
     return .{ .kind = setup.kind, .script = script, .shim = shim };
 }
 
+/// Every shell's injection paths, resolved once. The GUI keeps one per
+/// Window so a spawn does no filesystem probing. All null when the
+/// script directory was not found. Strings are allocated; free with
+/// `deinit`.
+pub const Cache = struct {
+    zsh_script: ?[:0]u8 = null,
+    fish_script: ?[:0]u8 = null,
+    bash_script: ?[:0]u8 = null,
+    zsh_shim: ?[:0]u8 = null,
+    fish_shim: ?[:0]u8 = null,
+    bash_shim: ?[:0]u8 = null,
+
+    pub const Kind = enum { zsh, fish, bash };
+    pub const Pick = struct { kind: Kind, script: [:0]const u8, shim: [:0]const u8 };
+
+    pub fn init(allocator: std.mem.Allocator) Cache {
+        var buf: [4096]u8 = undefined;
+        const base = baseDir(&buf) orelse return .{};
+        return .{
+            .zsh_script = std.fmt.allocPrintSentinel(allocator, "{s}/sketerm.zsh", .{base}, 0) catch null,
+            .fish_script = std.fmt.allocPrintSentinel(allocator, "{s}/sketerm.fish", .{base}, 0) catch null,
+            .bash_script = std.fmt.allocPrintSentinel(allocator, "{s}/sketerm.bash", .{base}, 0) catch null,
+            .zsh_shim = std.fmt.allocPrintSentinel(allocator, "{s}/zsh", .{base}, 0) catch null,
+            .fish_shim = std.fmt.allocPrintSentinel(allocator, "{s}/fish-xdg", .{base}, 0) catch null,
+            .bash_shim = std.fmt.allocPrintSentinel(allocator, "{s}/bash/sketerm-rc.bash", .{base}, 0) catch null,
+        };
+    }
+
+    pub fn deinit(self: *Cache, allocator: std.mem.Allocator) void {
+        inline for (.{ "zsh_script", "fish_script", "bash_script", "zsh_shim", "fish_shim", "bash_shim" }) |f| {
+            if (@field(self, f)) |v| allocator.free(v);
+        }
+        self.* = .{};
+    }
+
+    /// The injection setup for the program `argv0` names, or null (no
+    /// injection) for shells we don't auto-integrate.
+    pub fn pick(self: *const Cache, argv0: []const u8) ?Pick {
+        const base = std.fs.path.basename(argv0);
+        inline for (.{ .{ "zsh", Kind.zsh }, .{ "fish", Kind.fish }, .{ "bash", Kind.bash } }) |e| {
+            if (std.mem.eql(u8, base, e[0])) {
+                const script = @field(self, e[0] ++ "_script") orelse return null;
+                const shim = @field(self, e[0] ++ "_shim") orelse return null;
+                return .{ .kind = e[1], .script = script, .shim = shim };
+            }
+        }
+        return null;
+    }
+};
+
 test "resolve picks per-shell setups and rejects unknown shells" {
     const t = std.testing;
     // The dev tree ships the scripts, so resolution succeeds here.

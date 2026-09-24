@@ -459,10 +459,10 @@ pub fn takeoverPane(self: *Window, req: ipc_protocol.Request) ?*Pane {
     return globallyFocusedPane(self);
 }
 
-/// The Window that owns `pane` (set as `win_clip_ctx` when the pane is
+/// The Window that owns `pane` (set as `sinks.ctx` when the pane is
 /// listed). Falls back to `self` if somehow unset.
 pub fn ownerWindow(self: *Window, pane: *Pane) *Window {
-    if (pane.win_clip_ctx) |w| return @ptrCast(@alignCast(w));
+    if (pane.sinks.ctx) |w| return @ptrCast(@alignCast(w));
     return self;
 }
 

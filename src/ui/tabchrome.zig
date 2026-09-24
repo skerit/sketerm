@@ -166,14 +166,21 @@ pub fn onTabMenuToggled(check: *c.GtkCheckButton, user: ?*anyopaque) callconv(.c
     }
 }
 
+/// Pending delayed tab-acknowledge: clears the inactivity warning only
+/// after the tab has stayed selected for `tab_ack_delay_secs`.
+pub const TabAck = struct {
+    timer_id: c.guint = 0,
+    page: ?*c.AdwTabPage = null,
+};
+
 /// Arm (or, with a zero delay, immediately run) the delayed acknowledge
 /// for the now-selected `page`. Any previous pending acknowledge is
 /// cancelled, so flicking through tabs never acknowledges the ones merely
 /// passed over — only the tab dwelt on long enough.
 pub fn scheduleTabAck(self: *Window, page: *c.AdwTabPage) void {
-    if (self.ack_timer_id != 0) {
-        _ = c.g_source_remove(self.ack_timer_id);
-        self.ack_timer_id = 0;
+    if (self.tab_ack.timer_id != 0) {
+        _ = c.g_source_remove(self.tab_ack.timer_id);
+        self.tab_ack.timer_id = 0;
     }
     const delay = self.config.tab_ack_delay_secs;
     if (delay <= 0) {
@@ -181,9 +188,9 @@ pub fn scheduleTabAck(self: *Window, page: *c.AdwTabPage) void {
         self.tabbar.armWarn(page);
         return;
     }
-    self.ack_timer_page = page;
+    self.tab_ack.page = page;
     const ms: c.guint = @intFromFloat(delay * 1000.0);
-    self.ack_timer_id = c.g_timeout_add(ms, @ptrCast(&onTabAckTimer), self);
+    self.tab_ack.timer_id = c.g_timeout_add(ms, @ptrCast(&onTabAckTimer), self);
 }
 
 /// Wrap a 64×64 RGBA buffer in a GdkTexture for tab iconography
@@ -554,9 +561,9 @@ pub fn onSelectedPageChanged(view: *c.AdwTabView, _: ?*anyopaque, user: ?*anyopa
 /// selected one (the user stayed on it rather than scrolling past).
 pub fn onTabAckTimer(user: ?*anyopaque) callconv(.c) c.gboolean {
     const self = cast.userData(Window, user);
-    self.ack_timer_id = 0;
-    const page = self.ack_timer_page orelse return 0;
-    self.ack_timer_page = null;
+    self.tab_ack.timer_id = 0;
+    const page = self.tab_ack.page orelse return 0;
+    self.tab_ack.page = null;
     if (page == c.adw_tab_view_get_selected_page(self.tab_view)) {
         tab_effects.markAck(page);
         // Acknowledged → drop this tab's pending silence wake-up (warnDeadline

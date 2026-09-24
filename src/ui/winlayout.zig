@@ -270,14 +270,27 @@ pub fn buildTreeWidget(self: *Window, tree: @import("../layout.zig").Tree, node_
     }
 }
 
+/// Recently-closed tab ring: newest entry at the end, capped at
+/// `MAX_CLOSED_TABS`. The entries' strings live in `arena`.
+pub const ClosedTabs = struct {
+    ring: std.ArrayList(winmod.ClosedTab) = .empty,
+    arena: ?std.heap.ArenaAllocator = null,
+
+    pub fn deinit(self: *ClosedTabs, gpa: std.mem.Allocator) void {
+        self.ring.deinit(gpa);
+        if (self.arena) |*a| a.deinit();
+        self.* = .{};
+    }
+};
+
 /// Snapshot a tab into the recently-closed ring before its panes
 /// are torn down. Stores title + first-pane cwd + active profile.
 /// Splits aren't preserved — the restore spawns a single shell.
 pub fn captureClosedTab(self: *Window, page: *c.AdwTabPage, root: *c.GtkWidget) void {
-    if (self.closed_arena == null) {
-        self.closed_arena = std.heap.ArenaAllocator.init(self.allocator);
+    if (self.closed.arena == null) {
+        self.closed.arena = std.heap.ArenaAllocator.init(self.allocator);
     }
-    const arena = self.closed_arena.?.allocator();
+    const arena = self.closed.arena.?.allocator();
 
     // Title (AdwTabPage owns the string; dup into our arena).
     const title_c = c.adw_tab_page_get_title(page);
@@ -303,7 +316,7 @@ pub fn captureClosedTab(self: *Window, page: *c.AdwTabPage, root: *c.GtkWidget) 
         .cwd = snap_cwd,
         .profile_name = snap_profile,
     };
-    pushClosed(&self.closed_tabs, self.allocator, entry);
+    pushClosed(&self.closed.ring, self.allocator, entry);
 }
 
 /// How many closed tabs the restore ring remembers.
@@ -319,15 +332,15 @@ pub fn pushClosed(ring: *std.ArrayList(winmod.ClosedTab), gpa: std.mem.Allocator
 /// Pop the most-recently-closed tab and respawn it with its
 /// captured title / cwd / profile. No-op when the ring is empty.
 pub fn restoreLastClosed(self: *Window) void {
-    if (self.closed_tabs.items.len == 0) return;
-    const entry = self.closed_tabs.pop().?;
+    if (self.closed.ring.items.len == 0) return;
+    const entry = self.closed.ring.pop().?;
     // newShellTabWithProfile takes a NUL-terminated title.
     var title_buf: [256:0]u8 = undefined;
     const n = @min(entry.title.len, title_buf.len);
     @memcpy(title_buf[0..n], entry.title[0..n]);
     title_buf[n] = 0;
     const title_z: ?[*:0]const u8 = if (entry.title.len > 0) @ptrCast(&title_buf) else null;
-    // The captured cwd is owned by closed_arena; the spawn path
+    // The captured cwd is owned by closed.arena; the spawn path
     // dups it into the child PTY's env briefly so it's safe.
     const pane = self.spawnShellPaneOpts(entry.cwd, entry.profile_name) catch |err| {
         std.debug.print("sketerm: restore-closed-tab spawn failed: {s}\n", .{@errorName(err)});

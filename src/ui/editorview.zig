@@ -1617,7 +1617,7 @@ pub const EditorView = struct {
     /// by Window); a paneless standalone editor reads the config
     /// directly.
     fn mousewheelZoomDisabled(self: *EditorView) bool {
-        if (self.pane) |p| return p.disable_mousewheel_zoom;
+        if (self.pane) |p| return p.mouse.disable_mousewheel_zoom;
         const cfg = self.standalone_config orelse return false;
         return cfg.disable_mousewheel_zoom;
     }
@@ -1715,7 +1715,7 @@ pub const EditorView = struct {
 
     /// The EditorView riding `pane`, if any.
     pub fn fromPane(pane: *Pane) ?*EditorView {
-        const ctx = pane.editor_ctx orelse return null;
+        const ctx = pane.faces.editor.ctx orelse return null;
         return @ptrCast(@alignCast(ctx));
     }
 

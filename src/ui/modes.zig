@@ -15,18 +15,77 @@ const Screen = @import("../grid/screen.zig").Screen;
 const Selection = @import("../grid/selection.zig").Selection;
 const hints = @import("hints.zig");
 
+/// Scrollback search (Ctrl+F): the bottom bar's widgets and the live
+/// query against `pane`.
+pub const Search = struct {
+    bar: ?*c.GtkWidget = null,
+    entry: ?*c.GtkWidget = null,
+    label: ?*c.GtkWidget = null,
+    pane: ?*Pane = null,
+    matches: std.ArrayList(Screen.SearchMatch) = .empty,
+    idx: usize = 0,
+    /// Case-insensitive search toggle. Defaults to smart-case
+    /// (lower-only needle implies CI; mixed-case implies CS).
+    case_insensitive: bool = false,
+    case_button: ?*c.GtkWidget = null,
+    /// When set, skip the smart-case heuristic — every search is
+    /// case-sensitive by default. Mirrors Config.search_case_sensitive.
+    /// Ctrl+I still toggles per-search override.
+    force_cs: bool = false,
+    /// Regex-mode toggle (Ctrl+R inside the search bar). When on,
+    /// the entry text is treated as POSIX Extended Regular Expression.
+    regex: bool = false,
+};
+
+/// Keyboard-hints (quick-select) mode. `pane` non-null = mode active on
+/// that pane; its input Ctx then routes keys to `onHintKey`. `matches`
+/// owns the extracted texts.
+pub const Hints = struct {
+    pane: ?*Pane = null,
+    matches: []hints.Match = &.{},
+    typed: [2]u8 = .{ 0, 0 },
+    typed_len: u8 = 0,
+    overlay_buf: std.ArrayList(Screen.HintOverlay) = .empty,
+    /// Hint mode keeps going after each pick, collecting matches
+    /// instead of activating them; Enter copies the lot. Seeded from
+    /// `Config.hint_multiple`, toggled in-mode with Tab.
+    multi: bool = false,
+    /// Newline-joined text collected in multi-select mode.
+    collected: std.ArrayList(u8) = .empty,
+};
+
+/// Copy mode (keyboard-driven selection). Raw pane pointer — MUST be
+/// cleared on pane close, same rule as `Search.pane`. Cursor uses
+/// display-buffer coords (negative row = scrollback), the
+/// Screen.SearchMatch / Selection convention.
+pub const CopyMode = struct {
+    pane: ?*Pane = null,
+    row: i32 = 0,
+    col: u16 = 0,
+    /// Active selection kind + the cell where the anchor was dropped.
+    sel: winmod.CopyModeSel = .none,
+    anchor_row: i32 = 0,
+    anchor_col: u16 = 0,
+    /// f/F/t/T have eaten their key and are waiting for the character
+    /// to search for. 0 when no motion is pending.
+    find_pending: u8 = 0,
+    /// The last f/F/t/T, for `;` and `,` to repeat and reverse.
+    find_kind: u8 = 0,
+    find_char: u32 = 0,
+};
+
 // ── Keyboard hints (quick-select) ───────────────────────────
 
 /// Enter hint mode on the focused pane: scan the visible screen
 /// for URLs / paths / hashes, overlay labels, route keys to
 /// `onHintKey` until a label is completed or Esc.
 pub fn openHints(self: *Window) void {
-    if (self.hints_pane != null) {
+    if (self.hints.pane != null) {
         self.exitHints();
         return;
     }
     // Modes are mutually exclusive — both intercept all keys.
-    if (self.copymode_pane != null) self.exitCopyMode();
+    if (self.copymode.pane != null) self.exitCopyMode();
     const pane = self.focusedPane() orelse return;
     const hints_mod = @import("hints.zig");
 
@@ -61,11 +120,11 @@ pub fn openHints(self: *Window) void {
         self.allocator.free(matches);
         return;
     }
-    self.hint_matches = matches;
-    self.hints_pane = pane;
-    self.hints_typed_len = 0;
-    self.hints_multi = self.config.hint_multiple;
-    self.hints_collected.clearRetainingCapacity();
+    self.hints.matches = matches;
+    self.hints.pane = pane;
+    self.hints.typed_len = 0;
+    self.hints.multi = self.config.hint_multiple;
+    self.hints.collected.clearRetainingCapacity();
     if (pane.input_ctx) |ictx| {
         ictx.hint_sink = onHintKey;
         ictx.hint_ctx = @ptrCast(self);
@@ -75,8 +134,8 @@ pub fn openHints(self: *Window) void {
 }
 
 pub fn exitHints(self: *Window) void {
-    const pane = self.hints_pane orelse return;
-    self.hints_pane = null;
+    const pane = self.hints.pane orelse return;
+    self.hints.pane = null;
     if (pane.input_ctx) |ictx| {
         ictx.hint_sink = null;
         ictx.hint_ctx = null;
@@ -85,30 +144,30 @@ pub fn exitHints(self: *Window) void {
     pane.terminal.screen.hints_overlay = &.{};
     pane.terminal.screen.dirty = true;
     c.gtk_gl_area_queue_render(@ptrCast(pane.surface.area));
-    @import("hints.zig").freeMatches(self.allocator, self.hint_matches);
-    self.allocator.free(self.hint_matches);
-    self.hint_matches = &.{};
-    self.hints_overlay_buf.clearRetainingCapacity();
+    @import("hints.zig").freeMatches(self.allocator, self.hints.matches);
+    self.allocator.free(self.hints.matches);
+    self.hints.matches = &.{};
+    self.hints.overlay_buf.clearRetainingCapacity();
 }
 
 /// Rebuild the overlay slice from matches whose label starts with
 /// the typed prefix, then queue a redraw.
 pub fn refreshHintOverlay(self: *Window) void {
-    const pane = self.hints_pane orelse return;
-    self.hints_overlay_buf.clearRetainingCapacity();
-    const typed = self.hints_typed[0..self.hints_typed_len];
-    for (self.hint_matches) |m| {
+    const pane = self.hints.pane orelse return;
+    self.hints.overlay_buf.clearRetainingCapacity();
+    const typed = self.hints.typed[0..self.hints.typed_len];
+    for (self.hints.matches) |m| {
         if (!labelHasPrefix(m, typed)) continue;
-        self.hints_overlay_buf.append(self.allocator, .{
+        self.hints.overlay_buf.append(self.allocator, .{
             .row = m.row,
             .col_start = m.col_start,
             .col_end = m.col_end,
             .label = m.label,
             .label_len = m.label_len,
-            .typed = self.hints_typed_len,
+            .typed = self.hints.typed_len,
         }) catch break;
     }
-    pane.terminal.screen.hints_overlay = self.hints_overlay_buf.items;
+    pane.terminal.screen.hints_overlay = self.hints.overlay_buf.items;
     pane.terminal.screen.dirty = true;
     c.gtk_gl_area_queue_render(@ptrCast(pane.surface.area));
 }
@@ -122,7 +181,7 @@ pub fn activateHint(self: *Window, m: @import("hints.zig").Match) void {
 /// Run one hint match under an explicit action, which is how the
 /// modifier overrides reach the same code path as the default.
 pub fn activateHintAs(self: *Window, m: @import("hints.zig").Match, action: @import("hints.zig").Action) void {
-    const pane = self.hints_pane orelse return;
+    const pane = self.hints.pane orelse return;
     if (m.text.len == 0) return;
     switch (action) {
         .open => switch (m.kind) {
@@ -274,25 +333,25 @@ pub fn openPathInEditor(self: *Window, pane: *Pane, text: []const u8) bool {
 /// Open the scrollback search bar against the focused pane.
 pub fn openSearch(self: *Window) void {
     const pane = self.focusedPane() orelse return;
-    self.search_pane = pane;
-    if (self.search_bar) |w| c.gtk_widget_set_visible(w, 1);
-    if (self.search_entry) |w| {
+    self.search.pane = pane;
+    if (self.search.bar) |w| c.gtk_widget_set_visible(w, 1);
+    if (self.search.entry) |w| {
         c.gtk_editable_set_text(@ptrCast(w), "");
         _ = c.gtk_widget_grab_focus(w);
     }
-    self.search_matches.clearRetainingCapacity();
-    self.search_idx = 0;
+    self.search.matches.clearRetainingCapacity();
+    self.search.idx = 0;
     // Stale highlights from a previous open should not bleed into
     // this fresh session.
     pane.terminal.screen.search_highlights = &.{};
     pane.terminal.screen.search_active_idx = -1;
-    if (self.search_label) |l| c.gtk_label_set_text(@ptrCast(l), "");
+    if (self.search.label) |l| c.gtk_label_set_text(@ptrCast(l), "");
 }
 
 /// Close the search bar and clear any selection used as highlight.
 pub fn closeSearch(self: *Window) void {
-    if (self.search_bar) |w| c.gtk_widget_set_visible(w, 0);
-    if (self.search_pane) |p| {
+    if (self.search.bar) |w| c.gtk_widget_set_visible(w, 0);
+    if (self.search.pane) |p| {
         p.terminal.screen.selection.clear();
         // Clear borrowed highlight slice BEFORE freeing the
         // backing storage — otherwise renderer reads dangling.
@@ -301,33 +360,33 @@ pub fn closeSearch(self: *Window) void {
         p.terminal.screen.dirty = true;
         _ = c.gtk_widget_grab_focus(@ptrCast(p.surface.area));
     }
-    self.search_pane = null;
-    self.search_matches.clearRetainingCapacity();
-    self.search_idx = 0;
+    self.search.pane = null;
+    self.search.matches.clearRetainingCapacity();
+    self.search.idx = 0;
 }
 
 pub fn updateSearch(self: *Window, query: []const u8) void {
-    const pane = self.search_pane orelse return;
-    self.search_matches.deinit(self.allocator);
-    self.search_matches = .empty;
-    self.search_idx = 0;
+    const pane = self.search.pane orelse return;
+    self.search.matches.deinit(self.allocator);
+    self.search.matches = .empty;
+    self.search.idx = 0;
     if (query.len > 0) {
-        const ci = searchIgnoresCase(query, self.search_case_insensitive, self.search_force_cs);
-        const matches = if (self.search_regex)
+        const ci = searchIgnoresCase(query, self.search.case_insensitive, self.search.force_cs);
+        const matches = if (self.search.regex)
             pane.terminal.screen.searchOptsRegex(self.allocator, query, ci) catch return
         else
             pane.terminal.screen.searchOpts(self.allocator, query, ci) catch return;
         defer self.allocator.free(matches);
-        self.search_matches.appendSlice(self.allocator, matches) catch return;
+        self.search.matches.appendSlice(self.allocator, matches) catch return;
     }
     // Publish to the renderer — every match gets a translucent
     // overlay; the active one is brighter.
-    pane.terminal.screen.search_highlights = self.search_matches.items;
+    pane.terminal.screen.search_highlights = self.search.matches.items;
     refreshSearchLabel(self);
-    if (self.search_matches.items.len > 0) {
+    if (self.search.matches.items.len > 0) {
         // Jump to the last (most-recent) match — usually what users want.
-        self.search_idx = self.search_matches.items.len - 1;
-        pane.terminal.screen.search_active_idx = @intCast(self.search_idx);
+        self.search.idx = self.search.matches.items.len - 1;
+        pane.terminal.screen.search_active_idx = @intCast(self.search.idx);
         applyCurrentMatch(self);
     } else {
         pane.terminal.screen.selection.clear();
@@ -340,9 +399,9 @@ pub fn updateSearch(self: *Window, query: []const u8) void {
 }
 
 pub fn refreshSearchLabel(self: *Window) void {
-    const lab = self.search_label orelse return;
+    const lab = self.search.label orelse return;
     var buf: [64]u8 = undefined;
-    c.gtk_label_set_text(@ptrCast(lab), matchCountLabel(&buf, self.search_idx, self.search_matches.items.len).ptr);
+    c.gtk_label_set_text(@ptrCast(lab), matchCountLabel(&buf, self.search.idx, self.search.matches.items.len).ptr);
 }
 
 /// Smart case: a needle without an ASCII capital searches
@@ -379,11 +438,11 @@ pub fn matchViewOffset(row: i32, scrollback: u32) u32 {
 }
 
 pub fn applyCurrentMatch(self: *Window) void {
-    const pane = self.search_pane orelse return;
-    if (self.search_matches.items.len == 0) return;
-    const m = self.search_matches.items[self.search_idx];
+    const pane = self.search.pane orelse return;
+    if (self.search.matches.items.len == 0) return;
+    const m = self.search.matches.items[self.search.idx];
     const screen = pane.terminal.screen;
-    screen.search_active_idx = @intCast(self.search_idx);
+    screen.search_active_idx = @intCast(self.search.idx);
     screen.view_offset = matchViewOffset(m.row, screen.scrollbackCount());
     screen.dirty = true;
     // Search interactions happen with the search bar focused,
@@ -396,14 +455,14 @@ pub fn applyCurrentMatch(self: *Window) void {
 }
 
 pub fn nextMatch(self: *Window) void {
-    if (self.search_matches.items.len == 0) return;
-    self.search_idx = stepMatch(self.search_idx, self.search_matches.items.len, true);
+    if (self.search.matches.items.len == 0) return;
+    self.search.idx = stepMatch(self.search.idx, self.search.matches.items.len, true);
     applyCurrentMatch(self);
 }
 
 pub fn prevMatch(self: *Window) void {
-    if (self.search_matches.items.len == 0) return;
-    self.search_idx = stepMatch(self.search_idx, self.search_matches.items.len, false);
+    if (self.search.matches.items.len == 0) return;
+    self.search.idx = stepMatch(self.search.idx, self.search.matches.items.len, false);
     applyCurrentMatch(self);
 }
 
@@ -452,18 +511,18 @@ pub fn isBareModifier(keyval: c_uint) bool {
 /// the terminal cursor; every key press is routed through the
 /// pane input ctx's `copymode_sink` until exit (Esc/q/y/Enter).
 pub fn openCopyMode(self: *Window) void {
-    if (self.copymode_pane != null) self.exitCopyMode();
+    if (self.copymode.pane != null) self.exitCopyMode();
     // Modes are mutually exclusive — both intercept all keys.
-    if (self.hints_pane != null) self.exitHints();
+    if (self.hints.pane != null) self.exitHints();
     const pane = self.focusedPane() orelse return;
     const ictx = pane.input_ctx orelse return;
     const screen = pane.terminal.screen;
-    self.copymode_pane = pane;
-    self.copymode_sel = .none;
-    self.copymode_find_pending = 0;
-    self.copymode_find_kind = 0;
-    self.copymode_row = @intCast(@min(screen.row, screen.rows -| 1));
-    self.copymode_col = @min(screen.col, screen.cols -| 1);
+    self.copymode.pane = pane;
+    self.copymode.sel = .none;
+    self.copymode.find_pending = 0;
+    self.copymode.find_kind = 0;
+    self.copymode.row = @intCast(@min(screen.row, screen.rows -| 1));
+    self.copymode.col = @min(screen.col, screen.cols -| 1);
     ictx.copymode_sink = onCopyModeKey;
     ictx.copymode_ctx = @ptrCast(self);
     imBypass(pane, true);
@@ -473,10 +532,10 @@ pub fn openCopyMode(self: *Window) void {
 /// Leave copy mode: uninstall the key sink, drop the overlay
 /// cursor and any in-progress selection, repaint.
 pub fn exitCopyMode(self: *Window) void {
-    const pane = self.copymode_pane orelse return;
-    self.copymode_pane = null;
-    self.copymode_sel = .none;
-    self.copymode_find_pending = 0;
+    const pane = self.copymode.pane orelse return;
+    self.copymode.pane = null;
+    self.copymode.sel = .none;
+    self.copymode.find_pending = 0;
     if (pane.input_ctx) |ictx| {
         ictx.copymode_sink = null;
         ictx.copymode_ctx = null;
@@ -493,22 +552,22 @@ pub fn exitCopyMode(self: *Window) void {
 /// consumed; bare modifier presses return false so chords (e.g.
 /// Ctrl+v) can still assemble in GTK's modifier tracking.
 pub fn handleCopyModeKey(self: *Window, keyval: c_uint, state: c.GdkModifierType) bool {
-    const pane = self.copymode_pane orelse return false;
+    const pane = self.copymode.pane orelse return false;
     const screen = pane.terminal.screen;
     const ctrl = (state & c.GDK_CONTROL_MASK) != 0;
-    const row = self.copymode_row;
-    const col: i32 = self.copymode_col;
+    const row = self.copymode.row;
+    const col: i32 = self.copymode.col;
     if (isBareModifier(keyval)) return false;
 
     // f/F/t/T ate the previous key and this one names the target.
-    if (self.copymode_find_pending != 0) {
-        const kind = self.copymode_find_pending;
-        self.copymode_find_pending = 0;
+    if (self.copymode.find_pending != 0) {
+        const kind = self.copymode.find_pending;
+        self.copymode.find_pending = 0;
         if (keyval == c.GDK_KEY_Escape) return true;
         const ch = c.gdk_keyval_to_unicode(keyval);
         if (ch == 0) return true;
-        self.copymode_find_kind = kind;
-        self.copymode_find_char = ch;
+        self.copymode.find_kind = kind;
+        self.copymode.find_char = ch;
         copyModeFind(self, kind, ch);
         return true;
     }
@@ -540,7 +599,7 @@ pub fn handleCopyModeKey(self: *Window, keyval: c_uint, state: c.GdkModifierType
             if (ctrl) {
                 copyModeMoveTo(self, row + @as(i32, @intCast(screen.rows)), col);
             } else {
-                self.copymode_find_pending = 'f';
+                self.copymode.find_pending = 'f';
             }
         },
         c.GDK_KEY_b => {
@@ -569,14 +628,14 @@ pub fn handleCopyModeKey(self: *Window, keyval: c_uint, state: c.GdkModifierType
         // % — the bracket matching the one under the cursor.
         c.GDK_KEY_percent => copyModeMatchBracket(self),
         // F / T and their repeats.
-        c.GDK_KEY_F => self.copymode_find_pending = 'F',
-        c.GDK_KEY_t => self.copymode_find_pending = 't',
-        c.GDK_KEY_T => self.copymode_find_pending = 'T',
+        c.GDK_KEY_F => self.copymode.find_pending = 'F',
+        c.GDK_KEY_t => self.copymode.find_pending = 't',
+        c.GDK_KEY_T => self.copymode.find_pending = 'T',
         c.GDK_KEY_semicolon => {
-            if (self.copymode_find_kind != 0) copyModeFind(self, self.copymode_find_kind, self.copymode_find_char);
+            if (self.copymode.find_kind != 0) copyModeFind(self, self.copymode.find_kind, self.copymode.find_char);
         },
         c.GDK_KEY_comma => {
-            if (self.copymode_find_kind != 0) copyModeFind(self, findReverse(self.copymode_find_kind), self.copymode_find_char);
+            if (self.copymode.find_kind != 0) copyModeFind(self, findReverse(self.copymode.find_kind), self.copymode.find_char);
         },
         // n / N — walk the search bar's matches without leaving copy
         // mode, so a search can be refined into a selection.
@@ -629,9 +688,9 @@ fn findReverse(kind: u8) u8 {
 /// f/F/t/T — jump to `ch` on the cursor's own line. Line-local, like
 /// vim: running off the end is a no-op rather than a wrap.
 pub fn copyModeFind(self: *Window, kind: u8, ch: u32) void {
-    const pane = self.copymode_pane orelse return;
-    const hit = findTarget(pane.terminal.screen, self.copymode_row, self.copymode_col, kind, ch) orelse return;
-    copyModeMoveTo(self, self.copymode_row, hit);
+    const pane = self.copymode.pane orelse return;
+    const hit = findTarget(pane.terminal.screen, self.copymode.row, self.copymode.col, kind, ch) orelse return;
+    copyModeMoveTo(self, self.copymode.row, hit);
 }
 
 /// Column an f/F/t/T motion for `ch` lands on, or null when `ch` is
@@ -650,8 +709,8 @@ pub fn findTarget(screen: *const Screen, row: i32, col: u16, kind: u8, ch: u32) 
 
 /// { / } — the next blank line in `dir`, or the buffer edge.
 pub fn copyModeParagraph(self: *Window, dir: i32) void {
-    const pane = self.copymode_pane orelse return;
-    copyModeMoveTo(self, paragraphTarget(pane.terminal.screen, self.copymode_row, dir), 0);
+    const pane = self.copymode.pane orelse return;
+    copyModeMoveTo(self, paragraphTarget(pane.terminal.screen, self.copymode.row, dir), 0);
 }
 
 /// Row a { / } motion from `from` lands on: the first blank row in
@@ -682,21 +741,21 @@ fn copyModeRowBlank(screen: *const Screen, row: i32) bool {
 /// scrollback cannot turn one keystroke into a full-buffer scan on
 /// the main loop.
 pub fn copyModeMatchBracket(self: *Window) void {
-    const pane = self.copymode_pane orelse return;
+    const pane = self.copymode.pane orelse return;
     const screen = pane.terminal.screen;
-    const hit = bracket.matchAt(screen, self.copymode_row, self.copymode_col, @intCast(screen.rows)) orelse return;
+    const hit = bracket.matchAt(screen, self.copymode.row, self.copymode.col, @intCast(screen.rows)) orelse return;
     copyModeMoveTo(self, hit.row, hit.col);
 }
 
 /// n / N — move the copy cursor onto the next search match. Needs the
 /// search bar to have been used; without matches it does nothing.
 pub fn copyModeSearchStep(self: *Window, dir: i32) void {
-    const pane = self.copymode_pane orelse return;
-    if (self.search_pane != pane) return;
-    const matches = self.search_matches.items;
+    const pane = self.copymode.pane orelse return;
+    if (self.search.pane != pane) return;
+    const matches = self.search.matches.items;
     if (matches.len == 0) return;
-    const i = nearestMatch(matches, self.copymode_row, self.copymode_col, dir > 0);
-    self.search_idx = i;
+    const i = nearestMatch(matches, self.copymode.row, self.copymode.col, dir > 0);
+    self.search.idx = i;
     copyModeMoveTo(self, matches[i].row, @intCast(matches[i].col));
 }
 
@@ -724,13 +783,13 @@ pub fn nearestMatch(matches: []const Screen.SearchMatch, row: i32, col: u16, for
 /// the anchor; switching kinds keeps the existing anchor cell.
 pub fn copyModeToggleSel(self: *Window, kind: winmod.CopyModeSel) void {
     const next = toggledSel(.{
-        .kind = self.copymode_sel,
-        .anchor_row = self.copymode_anchor_row,
-        .anchor_col = self.copymode_anchor_col,
-    }, kind, self.copymode_row, self.copymode_col);
-    self.copymode_sel = next.kind;
-    self.copymode_anchor_row = next.anchor_row;
-    self.copymode_anchor_col = next.anchor_col;
+        .kind = self.copymode.sel,
+        .anchor_row = self.copymode.anchor_row,
+        .anchor_col = self.copymode.anchor_col,
+    }, kind, self.copymode.row, self.copymode.col);
+    self.copymode.sel = next.kind;
+    self.copymode.anchor_row = next.anchor_row;
+    self.copymode.anchor_col = next.anchor_col;
     copyModeRefresh(self);
 }
 
@@ -752,11 +811,11 @@ pub fn toggledSel(state: SelState, kind: winmod.CopyModeSel, row: i32, col: u16)
 /// Move the copy cursor, clamping into the buffer (scrollback top
 /// .. live bottom) and scrolling the view so it stays visible.
 pub fn copyModeMoveTo(self: *Window, row: i32, col: i32) void {
-    const pane = self.copymode_pane orelse return;
+    const pane = self.copymode.pane orelse return;
     const screen = pane.terminal.screen;
     const to = clampMove(screen, row, col);
-    self.copymode_row = to.row;
-    self.copymode_col = to.col;
+    self.copymode.row = to.row;
+    self.copymode.col = to.col;
     if (to.view_offset) |vo| screen.view_offset = vo;
     copyModeRefresh(self);
 }
@@ -794,8 +853,8 @@ pub const WordDir = enum { next, prev, next_end, prev_end };
 /// picks the alphabet: the word_chars set, or vim's blank-delimited
 /// WORD for the upper-case motions.
 pub fn copyModeWord(self: *Window, dir: WordDir, kind: wm.Kind) void {
-    const pane = self.copymode_pane orelse return;
-    const to = wordTarget(pane.terminal.screen, self.copymode_row, self.copymode_col, dir, kind) orelse return;
+    const pane = self.copymode.pane orelse return;
+    const to = wordTarget(pane.terminal.screen, self.copymode.row, self.copymode.col, dir, kind) orelse return;
     copyModeMoveTo(self, to.row, to.col);
 }
 
@@ -832,7 +891,7 @@ pub fn wordTarget(screen: *const Screen, row: i32, col: u16, dir: WordDir, kind:
 /// y / Enter — copy the active selection to CLIPBOARD + PRIMARY
 /// and leave copy mode. No selection → just exits.
 pub fn copyModeYank(self: *Window) void {
-    const pane = self.copymode_pane orelse return;
+    const pane = self.copymode.pane orelse return;
     const screen = pane.terminal.screen;
     if (screen.selection.isActive()) blk: {
         const text = screen.extractSelection(self.allocator) catch break :blk;
@@ -850,14 +909,14 @@ pub fn copyModeYank(self: *Window) void {
 /// Re-derive `screen.selection` from anchor + cursor, publish the
 /// overlay cursor, repaint. Called after every copy-mode change.
 pub fn copyModeRefresh(self: *Window) void {
-    const pane = self.copymode_pane orelse return;
+    const pane = self.copymode.pane orelse return;
     const screen = pane.terminal.screen;
-    const row = self.copymode_row;
-    const col = self.copymode_col;
+    const row = self.copymode.row;
+    const col = self.copymode.col;
     applyCopySelection(&screen.selection, .{
-        .kind = self.copymode_sel,
-        .anchor_row = self.copymode_anchor_row,
-        .anchor_col = self.copymode_anchor_col,
+        .kind = self.copymode.sel,
+        .anchor_row = self.copymode.anchor_row,
+        .anchor_col = self.copymode.anchor_col,
     }, row, col, screen.cols);
     screen.copy_cursor = .{ .row = row, .col = col };
     screen.dirty = true;
@@ -979,8 +1038,8 @@ pub fn onSearchKeyPressed(
     if ((keyval == c.GDK_KEY_i or keyval == c.GDK_KEY_I) and
         (state & c.GDK_CONTROL_MASK) != 0)
     {
-        self.search_case_insensitive = !self.search_case_insensitive;
-        if (self.search_entry) |w| {
+        self.search.case_insensitive = !self.search.case_insensitive;
+        if (self.search.entry) |w| {
             const txt = c.gtk_editable_get_text(@ptrCast(w));
             if (txt != null) {
                 const slice = std.mem.span(txt);
@@ -995,9 +1054,9 @@ pub fn onSearchKeyPressed(
     if ((keyval == c.GDK_KEY_r or keyval == c.GDK_KEY_R) and
         (state & c.GDK_CONTROL_MASK) != 0)
     {
-        self.search_regex = !self.search_regex;
-        if (self.search_entry) |w| {
-            const placeholder: [*:0]const u8 = if (self.search_regex)
+        self.search.regex = !self.search.regex;
+        if (self.search.entry) |w| {
+            const placeholder: [*:0]const u8 = if (self.search.regex)
                 "Search regex (Ctrl+R)"
             else
                 "Search (Ctrl+R for regex)";
@@ -1019,7 +1078,7 @@ pub fn onSearchKeyPressed(
 /// stays sane.
 pub fn onHintKey(ctx: ?*anyopaque, keyval: c_uint, state: c.GdkModifierType) bool {
     const self = cast.userData(Window, ctx);
-    if (self.hints_pane == null) return false;
+    if (self.hints.pane == null) return false;
     const hints_mod = @import("hints.zig");
     const shift = (state & c.GDK_SHIFT_MASK) != 0;
     const alt = (state & c.GDK_ALT_MASK) != 0;
@@ -1030,7 +1089,7 @@ pub fn onHintKey(ctx: ?*anyopaque, keyval: c_uint, state: c.GdkModifierType) boo
         },
         // Tab toggles multi-select; Enter finishes it.
         c.GDK_KEY_Tab, c.GDK_KEY_ISO_Left_Tab => {
-            self.hints_multi = !self.hints_multi;
+            self.hints.multi = !self.hints.multi;
             return true;
         },
         c.GDK_KEY_Return, c.GDK_KEY_KP_Enter => {
@@ -1039,8 +1098,8 @@ pub fn onHintKey(ctx: ?*anyopaque, keyval: c_uint, state: c.GdkModifierType) boo
             return true;
         },
         c.GDK_KEY_BackSpace => {
-            if (self.hints_typed_len > 0) {
-                self.hints_typed_len -= 1;
+            if (self.hints.typed_len > 0) {
+                self.hints.typed_len -= 1;
                 refreshHintOverlay(self);
             }
             return true;
@@ -1049,21 +1108,21 @@ pub fn onHintKey(ctx: ?*anyopaque, keyval: c_uint, state: c.GdkModifierType) boo
     }
     const alphabet = hints_mod.validAlphabet(self.config.hint_alphabet) orelse hints_mod.ALPHABET;
     const ch = labelChar(c.gdk_keyval_to_unicode(keyval), alphabet) orelse return true;
-    if (self.hints_typed_len >= self.hints_typed.len) return true;
-    const candidate_len = self.hints_typed_len + 1;
-    self.hints_typed[self.hints_typed_len] = ch;
-    switch (pickHint(self.hint_matches, self.hints_typed[0..candidate_len])) {
+    if (self.hints.typed_len >= self.hints.typed.len) return true;
+    const candidate_len = self.hints.typed_len + 1;
+    self.hints.typed[self.hints.typed_len] = ch;
+    switch (pickHint(self.hints.matches, self.hints.typed[0..candidate_len])) {
         // A stray key: the typed prefix stays what it was.
         .none => return true,
         .partial => {
-            self.hints_typed_len = candidate_len;
+            self.hints.typed_len = candidate_len;
             refreshHintOverlay(self);
             return true;
         },
         .full => |m| {
-            if (self.hints_multi) {
+            if (self.hints.multi) {
                 collectHint(self, m);
-                self.hints_typed_len = 0;
+                self.hints.typed_len = 0;
                 refreshHintOverlay(self);
                 return true;
             }
@@ -1123,7 +1182,7 @@ pub fn hintAction(rule: hints.Action, shift: bool, alt: bool) hints.Action {
 /// Multi-select: append a picked match to the collection instead of
 /// acting on it.
 fn collectHint(self: *Window, m: @import("hints.zig").Match) void {
-    appendCollected(&self.hints_collected, self.allocator, m.text) catch return;
+    appendCollected(&self.hints.collected, self.allocator, m.text) catch return;
 }
 
 /// Add one pick to the multi-select collection, newline-separated.
@@ -1135,9 +1194,9 @@ pub fn appendCollected(out: *std.ArrayList(u8), gpa: std.mem.Allocator, text: []
 /// Enter in multi-select mode: copy everything collected, as one
 /// newline-separated block. Nothing collected = nothing copied.
 fn finishHintCollection(self: *Window) void {
-    const pane = self.hints_pane orelse return;
-    if (self.hints_collected.items.len == 0) return;
-    copyHintText(self, pane, self.hints_collected.items);
+    const pane = self.hints.pane orelse return;
+    if (self.hints.collected.items.len == 0) return;
+    copyHintText(self, pane, self.hints.collected.items);
 }
 
 // -- tests --------------------------------------------------------------

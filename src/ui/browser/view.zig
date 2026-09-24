@@ -1278,10 +1278,10 @@ pub const BrowserView = struct {
         return clipboard_mod.shared(self.allocator);
     }
 
-    /// The BrowserView riding `pane`, if any. Safe cast: browser_ctx
+    /// The BrowserView riding `pane`, if any. Safe cast: faces.browser.ctx
     /// is only ever set by attach().
     pub fn fromPane(pane: *Pane) ?*BrowserView {
-        const ctx = pane.browser_ctx orelse return null;
+        const ctx = pane.faces.browser.ctx orelse return null;
         return @ptrCast(@alignCast(ctx));
     }
 

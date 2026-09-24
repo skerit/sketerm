@@ -15,7 +15,7 @@
 //! read its header before changing anything here that touches the pane.
 //! Two consequences for this file:
 //!
-//! - `Pane.web_ctx` is the GROUP, not a face. `fromPane` answers with
+//! - `Pane.faces.web.ctx` is the GROUP, not a face. `fromPane` answers with
 //!   the group's ACTIVE page, which is what every pane-scoped verb
 //!   means by "the browser on this pane"; `face.group()` goes the other
 //!   way.

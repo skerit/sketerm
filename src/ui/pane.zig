@@ -44,6 +44,8 @@ else
         }
     };
 const menu = @import("menu.zig");
+const paneface = @import("paneface.zig");
+const panetitlebar = @import("panetitlebar.zig");
 const clipboard = @import("clipboard.zig");
 const MouseAction = @import("../config.zig").MouseAction;
 pub const InputCtx = input.Ctx;
@@ -55,6 +57,76 @@ pub const FONT_CANDIDATES = @import("terminal_surface.zig").FONT_CANDIDATES;
 /// face is deliberately not tracked — it is never the thing an editor
 /// is opened on top of, so it folds into `terminal`.
 pub const PrevFace = enum { terminal, browser };
+
+/// Everything a Pane forwards to the Window that lists it. `ctx` is
+/// that Window, erased (pane.zig must not import window.zig); there is
+/// exactly one owner, so there is exactly one context -- it used to be
+/// thirteen `win_*_ctx` copies of the same pointer, set side by side.
+/// Every callback is optional: a pane outside a Window (tests, the
+/// panel host's staging) forwards nothing.
+pub const WindowSinks = struct {
+    /// The owning `*Window`. Also how code holding only a pane finds
+    /// its window (`remotectl.windowOwning`, the panel relay).
+    ctx: ?*anyopaque = null,
+    on_title: ?*const fn (ctx: ?*anyopaque, pane: *Pane, title: []const u8) void = null,
+    on_clipboard: ?*const fn (ctx: ?*anyopaque, text: []const u8) void = null,
+    /// Desktop notifications (OSC 9 / 99 / 777 / 1337).
+    on_notification: ?*const fn (ctx: ?*anyopaque, pane: *Pane, ev: Screen.NotificationEvent) void = null,
+    /// OSC 9;4 progress, so Window can drive tab + taskbar.
+    on_progress: ?*const fn (ctx: ?*anyopaque, pane: *Pane, state: u8, percent: u8) void = null,
+    /// Remote file-transfer lifecycle (upload + download): tab ring +
+    /// completion toast.
+    on_transfer: ?*const fn (ctx: ?*anyopaque, pane: *Pane, ev: Terminal.TransferEvent) void = null,
+    /// OSC 133 command lifecycle: tab status dot + finished notices.
+    on_cmd_status: ?*const fn (ctx: ?*anyopaque, pane: *Pane, running: bool, exit: i32, duration_ms: i64) void = null,
+    /// OSC 7 cwd updates (tab tooltip).
+    on_cwd: ?*const fn (ctx: ?*anyopaque, pane: *Pane, cwd: []const u8) void = null,
+    /// The daemon-sampled foreground process name, for a
+    /// `{{ PROGRAM }}` title template.
+    on_program: ?*const fn (ctx: ?*anyopaque, pane: *Pane, program: []const u8) void = null,
+    /// A resize changed the column/row COUNT, so a `{{ COLUMNS }}` /
+    /// `{{ LINES }}` title can follow.
+    on_geometry: ?*const fn (ctx: ?*anyopaque, pane: *Pane) void = null,
+    /// OSC 1337 ; SetProfile, so Window can restyle this pane.
+    on_set_profile: ?*const fn (ctx: ?*anyopaque, pane: *Pane, name: []const u8) void = null,
+    /// The titlebar lease chip was clicked (Window opens the assistant
+    /// surface for this pane's session).
+    on_chip: ?*const fn (ctx: ?*anyopaque, pane: *Pane) void = null,
+    /// BEL, for tab-bar attention.
+    on_bell: ?*const fn (ctx: ?*anyopaque, pane: *Pane) void = null,
+    /// The pane gained keyboard focus: Window records it as its tab's
+    /// last-focused pane (restored on tab switch).
+    on_focus_enter: ?*const fn (ctx: ?*anyopaque, pane: *Pane) void = null,
+    /// The visible grid changed (tab-activity signal).
+    on_activity: ?*const fn (ctx: ?*anyopaque, pane: *Pane) void = null,
+    /// Fired exactly once when the PTY child exits. Window decides
+    /// what to do (close pane / restart shell / hold).
+    on_child_exit: ?*const fn (ctx: ?*anyopaque, pane: *Pane, status: i32) void = null,
+    /// Continuous rendering changed; Window re-evaluates offload for
+    /// every pane because one frame clock drives the whole toplevel.
+    /// Cleared before a pane is dropped (`Window.dropPaneRefs`).
+    on_continuous_frames: ?*const fn (ctx: ?*anyopaque, pane: *Pane) void = null,
+    /// The session died unexpectedly (crash/OOM): crashed-tab overlay.
+    on_crashed: ?*const fn (ctx: ?*anyopaque, pane: *Pane) void = null,
+    /// A mux session rename was confirmed; Window retitles the tab.
+    on_session_renamed: ?*const fn (ctx: ?*anyopaque, pane: *Pane, name: []const u8) void = null,
+};
+
+/// Mouse / link behaviour mirrored from Window.config and pushed down on
+/// every config change, so each event's hot path reads the local Pane
+/// instead of dereferencing through Window.
+pub const MousePrefs = struct {
+    copy_on_selection: bool = false,
+    clear_select_on_copy: bool = false,
+    disable_mouse_paste: bool = false,
+    disable_mousewheel_zoom: bool = false,
+    link_single_click: bool = false,
+    /// Rebindable click actions (config mouse_middle_click /
+    /// mouse_right_click). Only consulted when mouse_mode == 0.
+    middle_click_action: MouseAction = .paste_primary,
+    right_click_action: MouseAction = .menu,
+    mouse_autohide: bool = true,
+};
 
 pub const Pane = struct {
     /// Stable monotonic id for remote-control addressing. Assigned
@@ -74,66 +146,9 @@ pub const Pane = struct {
     ax_selfcheck_done: bool = false,
     allocator: std.mem.Allocator,
     input_ctx: ?*input.Ctx = null,
-    /// Window-level forwarding for terminal sinks.
-    win_title_ctx: ?*anyopaque = null,
-    win_on_title: ?*const fn (ctx: ?*anyopaque, pane: *Pane, title: []const u8) void = null,
-    win_clip_ctx: ?*anyopaque = null,
-    win_on_clipboard: ?*const fn (ctx: ?*anyopaque, text: []const u8) void = null,
-    /// Forward desktop notifications (OSC 9 / 99 / 777 / 1337).
-    win_notify_ctx: ?*anyopaque = null,
-    win_on_notification: ?*const fn (ctx: ?*anyopaque, pane: *Pane, ev: Screen.NotificationEvent) void = null,
-    /// Forward OSC 9;4 progress so Window can drive tab + taskbar.
-    win_progress_ctx: ?*anyopaque = null,
-    win_on_progress: ?*const fn (ctx: ?*anyopaque, pane: *Pane, state: u8, percent: u8) void = null,
-    /// Forward remote file-transfer lifecycle (upload + download) so
-    /// Window can drive the tab ring + a completion toast. Reuses
-    /// win_progress_ctx.
-    win_on_transfer: ?*const fn (ctx: ?*anyopaque, pane: *Pane, ev: Terminal.TransferEvent) void = null,
-    /// Forward OSC 133 command lifecycle so Window can drive the tab
-    /// status dot + finished notifications. Reuses win_progress_ctx.
-    win_on_cmd_status: ?*const fn (ctx: ?*anyopaque, pane: *Pane, running: bool, exit: i32, duration_ms: i64) void = null,
-    /// Forward OSC 7 cwd updates so Window can rewrite the tab tooltip.
-    win_cwd_ctx: ?*anyopaque = null,
-    win_on_cwd: ?*const fn (ctx: ?*anyopaque, pane: *Pane, cwd: []const u8) void = null,
-    /// Forward the daemon-sampled foreground process name so Window
-    /// can re-render a `{{ PROGRAM }}` title template. Reuses
-    /// win_cwd_ctx — same owner, same lifetime.
-    win_on_program: ?*const fn (ctx: ?*anyopaque, pane: *Pane, program: []const u8) void = null,
-    /// Fires when a resize changed the pane's column/row COUNT, so a
-    /// `{{ COLUMNS }}`/`{{ LINES }}` title can follow. Reuses
-    /// win_cwd_ctx.
-    win_on_geometry: ?*const fn (ctx: ?*anyopaque, pane: *Pane) void = null,
-    /// Forward OSC 1337 ; SetProfile so Window can restyle this pane.
-    win_setprofile_ctx: ?*anyopaque = null,
-    win_on_set_profile: ?*const fn (ctx: ?*anyopaque, pane: *Pane, name: []const u8) void = null,
-    /// Forward BEL events for tab-bar attention.
-    win_bell_ctx: ?*anyopaque = null,
-    /// The titlebar lease chip was clicked (Window opens the assistant
-    /// surface for this pane's session).
-    win_chip_ctx: ?*anyopaque = null,
-    win_on_chip: ?*const fn (ctx: ?*anyopaque, pane: *Pane) void = null,
-    win_child_ctx: ?*anyopaque = null,
-    win_on_bell: ?*const fn (ctx: ?*anyopaque, pane: *Pane) void = null,
-    /// Fired when this pane gains keyboard focus, so the Window can
-    /// record it as its tab's last-focused pane (restored on tab switch).
-    win_focus_ctx: ?*anyopaque = null,
-    win_on_focus_enter: ?*const fn (ctx: ?*anyopaque, pane: *Pane) void = null,
-    /// Fired when this pane's visible grid changed (tab-activity signal).
-    win_activity_ctx: ?*anyopaque = null,
-    win_on_activity: ?*const fn (ctx: ?*anyopaque, pane: *Pane) void = null,
-    /// Fired exactly once when the PTY child exits. Window decides
-    /// what to do (close pane / restart shell / hold).
-    win_on_child_exit: ?*const fn (ctx: ?*anyopaque, pane: *Pane, status: i32) void = null,
-    /// Continuous rendering changed; Window re-evaluates offload for
-    /// every pane because one frame clock drives the whole toplevel.
-    win_on_continuous_frames: ?*const fn (ctx: ?*anyopaque, pane: *Pane) void = null,
-    /// Fired when the session died unexpectedly (crash/OOM). Window shows the
-    /// crashed-tab overlay (sad face + "Start new session").
-    win_crash_ctx: ?*anyopaque = null,
-    win_on_crashed: ?*const fn (ctx: ?*anyopaque, pane: *Pane) void = null,
-    /// Forward mux session renames so Window can retitle the tab.
-    win_session_rename_ctx: ?*anyopaque = null,
-    win_on_session_renamed: ?*const fn (ctx: ?*anyopaque, pane: *Pane, name: []const u8) void = null,
+    /// Pane -> Window forwarding (terminal sinks, focus, child exit).
+    /// One owner, wired in one place: `Window.wirePaneSinks`.
+    sinks: WindowSinks = .{},
     /// Last reported mouse-motion cell, to suppress duplicates.
     last_motion_row: i32 = -2,
     last_motion_col: i32 = -2,
@@ -149,19 +164,9 @@ pub const Pane = struct {
     /// when the click landed on an OSC 8 hyperlink cell; the
     /// "copy-link" action reads it on activate.
     menu_link_uri: ?[]u8 = null,
-    /// Mouse / link / search behaviour mirrors Window.config and is
-    /// pushed down via applyConfigChange so each frame's hot path
-    /// reads from the local Pane instead of dereffing through Window.
-    copy_on_selection: bool = false,
-    clear_select_on_copy: bool = false,
-    disable_mouse_paste: bool = false,
-    disable_mousewheel_zoom: bool = false,
-    link_single_click: bool = false,
-    /// Rebindable click actions (config mouse_middle_click /
-    /// mouse_right_click). Only consulted when mouse_mode == 0.
-    middle_click_action: MouseAction = .paste_primary,
-    right_click_action: MouseAction = .menu,
-    mouse_autohide: bool = true,
+    /// Mouse / link behaviour mirrored from Window.config
+    /// (`winconfig.applyPaneMouseFlags`).
+    mouse: MousePrefs = .{},
     /// True while mouse_autohide has set the pointer to "none". The
     /// motion handler restores the default cursor on any movement.
     cursor_hidden: bool = false,
@@ -183,35 +188,12 @@ pub const Pane = struct {
     /// can run after the widget tree is gone — this fence is what
     /// tells it the GtkWidget pointers above are no longer callable.
     widgets_dead: bool = false,
-    /// File-browser face (src/ui/browser.zig): a second widget in the
-    /// wrapper box, toggled against the GL area. The pane runs
-    /// `browser_deinit(browser_ctx)` in detachBrowser — the browser's
-    /// fd watch must never outlive the pane.
-    browser_widget: ?*c.GtkWidget = null,
-    browser_ctx: ?*anyopaque = null,
-    /// Same `widgets_dead` contract as `editor_prepare_destroy`: the
-    /// last-resort call from `Pane.deinit` arrives after GTK finalized
-    /// the subtree, and the face must be told rather than infer it.
-    browser_prepare_destroy: ?*const fn (*anyopaque, widgets_dead: bool) void = null,
-    browser_deinit: ?*const fn (*anyopaque) void = null,
-    /// Put GTK focus inside the browser face (its listing). Called
-    /// whenever that face becomes the visible one.
-    browser_focus: ?*const fn (*anyopaque) void = null,
-
-    /// Editor face (src/ui/editorview.zig), same five-pointer contract
-    /// and two-phase teardown as the browser face above.
-    editor_widget: ?*c.GtkWidget = null,
-    editor_ctx: ?*anyopaque = null,
-    /// `widgets_dead` tells the face whether its widget subtree is
-    /// still alive: the ordinary path (severFaces) calls it with the
-    /// widgets up, the last-resort path from `Pane.deinit` calls it
-    /// after GTK has already finalized them. Passing it is not
-    /// optional — the editor face restores window-level shortcuts
-    /// through its root widget, which is a use-after-free on the late
-    /// path.
-    editor_prepare_destroy: ?*const fn (*anyopaque, widgets_dead: bool) void = null,
-    editor_deinit: ?*const fn (*anyopaque) void = null,
-    editor_focus: ?*const fn (*anyopaque) void = null,
+    /// The browser / editor / panel / web faces (src/ui/paneface.zig):
+    /// widgets in the wrapper box, toggled against the GL area. The
+    /// pane owns each face's teardown (`detach*`, reached from
+    /// `severFaces`); a face's fd watch or helper must never outlive
+    /// the pane.
+    faces: paneface.Faces = .{},
     /// Font-zoom hook for the editor face: font_inc/font_dec/
     /// font_reset (and Ctrl+wheel routed via Window) land here while
     /// that face is visible. delta is in points; reset=true returns to
@@ -227,24 +209,6 @@ pub const Pane = struct {
     /// only on a raise, and cleared by detachBrowser/detachEditor so a
     /// dead face can never be resurrected.
     editor_prev_face: PrevFace = .terminal,
-
-    /// Panel face (src/ui/panel/view.zig, hosted by ui/panelhost.zig):
-    /// a declarative document an assistant authored, rendered as real
-    /// widgets. Same five-pointer contract and two-phase teardown as
-    /// the editor face above.
-    panel_widget: ?*c.GtkWidget = null,
-    panel_ctx: ?*anyopaque = null,
-    panel_prepare_destroy: ?*const fn (*anyopaque, widgets_dead: bool) void = null,
-    panel_deinit: ?*const fn (*anyopaque) void = null,
-    panel_focus: ?*const fn (*anyopaque) void = null,
-    /// Web face (src/ui/webface.zig): a browser view rendered from the
-    /// `sketerm-webengine` helper. Same five-pointer contract and two-phase
-    /// teardown as the editor and panel faces above.
-    web_widget: ?*c.GtkWidget = null,
-    web_ctx: ?*anyopaque = null,
-    web_prepare_destroy: ?*const fn (*anyopaque, widgets_dead: bool) void = null,
-    web_deinit: ?*const fn (*anyopaque) void = null,
-    web_focus: ?*const fn (*anyopaque) void = null,
     /// True only while the pane-wide teardown choke point is detaching faces.
     /// Panelhost uses it to distinguish viewer loss from an explicit close.
     severing_faces: bool = false,
@@ -275,28 +239,8 @@ pub const Pane = struct {
     /// Config reapply must not re-derive `app_view_tab` over it, or a
     /// preference save silently pops the watched view back out.
     app_view_tab_forced: bool = false,
-    titlebar_box: ?*c.GtkWidget = null,
-    titlebar_label: ?*c.GtkLabel = null,
-    titlebar_visible: bool = false,
-    titlebar_active: bool = false,
-    /// Baseline titlebar visibility pushed by the Window (config
-    /// show_titlebar). The effective state ORs in titlebar_auto, so
-    /// session activity can surface the bar on panes that keep it
-    /// hidden otherwise.
-    titlebar_config_visible: bool = false,
-    /// Activity wants the titlebar shown: floating app windows, a
-    /// view-only lease, or an attached assistant. Replaces the old
-    /// "App window open — click to raise" banner.
-    titlebar_auto: bool = false,
-    /// Per-window taskbar buttons for the session's floating app
-    /// windows, inside the titlebar.
-    titlebar_apps_box: ?*c.GtkWidget = null,
-    /// True while titlebar_apps_box has at least one button.
-    titlebar_apps_shown: bool = false,
-    /// Lease/roster chip: "AI attached" / "View only — holder".
-    titlebar_chip: ?*c.GtkWidget = null,
-    titlebar_chip_label: ?*c.GtkLabel = null,
-    titlebar_take_btn: ?*c.GtkWidget = null,
+    /// The per-pane title bar (src/ui/panetitlebar.zig).
+    titlebar: panetitlebar.Titlebar = .{},
     /// Any floating (non-embedded) app window is open across the
     /// session's app channels.
     app_windows_open: bool = false,
@@ -498,12 +442,12 @@ pub const Pane = struct {
 
         self.wrapper_box = wrap;
         self.offload_widget = offload;
-        self.titlebar_box = tb_box;
-        self.titlebar_label = @ptrCast(@alignCast(tb_label_w));
-        self.titlebar_apps_box = tb_apps;
-        self.titlebar_chip = tb_chip;
-        self.titlebar_chip_label = @ptrCast(@alignCast(tb_chip_label));
-        self.titlebar_take_btn = tb_take;
+        self.titlebar.box = tb_box;
+        self.titlebar.label = @ptrCast(@alignCast(tb_label_w));
+        self.titlebar.apps_box = tb_apps;
+        self.titlebar.chip = tb_chip;
+        self.titlebar.chip_label = @ptrCast(@alignCast(tb_chip_label));
+        self.titlebar.take_btn = tb_take;
 
         // The widgets-dead fence: closing a pane destroys its widget
         // subtree immediately while Pane.deinit is deferred, so late
@@ -665,7 +609,7 @@ pub const Pane = struct {
     pub fn faceZoom(self: *Pane, delta: i32, reset: bool) bool {
         if (self.editorFaceVisible()) {
             if (self.editor_zoom) |zoom| {
-                if (self.editor_ctx) |ctx| {
+                if (self.faces.editor.ctx) |ctx| {
                     zoom(ctx, delta, reset);
                     return true;
                 }
@@ -739,7 +683,7 @@ pub const Pane = struct {
         defer self.allocator.free(cstr);
         @memcpy(cstr, text);
         clipboard.copyToPrimary(@ptrCast(self.surface.area), cstr);
-        if (self.copy_on_selection) {
+        if (self.mouse.copy_on_selection) {
             clipboard.copyToClipboard(@ptrCast(self.surface.area), cstr);
         }
     }
@@ -755,7 +699,7 @@ pub const Pane = struct {
         const n = @min(uri.len, 4095);
         @memcpy(buf[0..n], uri[0..n]);
         var end = n;
-        if (!self.link_single_click) {
+        if (!self.mouse.link_single_click) {
             @memcpy(buf[end .. end + hint.len], hint);
             end += hint.len;
         }
@@ -884,14 +828,7 @@ pub const Pane = struct {
     ) void {
         const wrap = self.wrapper_box orelse return;
         self.detachBrowser();
-        self.browser_widget = face;
-        self.browser_ctx = ctx;
-        self.browser_prepare_destroy = prepare_destroy_cb;
-        self.browser_deinit = deinit_cb;
-        self.browser_focus = focus_cb;
-        c.gtk_widget_set_vexpand(face, 1);
-        c.gtk_widget_set_hexpand(face, 1);
-        c.gtk_box_append(@ptrCast(wrap), face);
+        self.faces.browser.install(wrap, face, ctx, prepare_destroy_cb, deinit_cb, focus_cb);
         self.setBrowserVisible(true);
     }
 
@@ -899,7 +836,7 @@ pub const Pane = struct {
     /// browser raises the strip that flips back: the terminal face has
     /// no browser toolbar to click, so without it the trip is one-way.
     pub fn setBrowserVisible(self: *Pane, show: bool) void {
-        const bw = self.browser_widget orelse return;
+        const bw = self.faces.browser.widget orelse return;
         c.gtk_widget_set_visible(bw, if (show) @as(c_int, 1) else 0);
         // The face title belongs to whichever face is raised: drop it
         // on every flip; the focus callback below re-asserts it.
@@ -907,9 +844,7 @@ pub const Pane = struct {
         if (show) {
             // Faces are exclusive: raising the browser hides an
             // editor, panel or web face too.
-            if (self.editor_widget) |ew| c.gtk_widget_set_visible(ew, 0);
-            if (self.panel_widget) |pw| c.gtk_widget_set_visible(pw, 0);
-            if (self.web_widget) |ww| c.gtk_widget_set_visible(ww, 0);
+            self.faces.hideAllBut(.browser);
         }
         if (self.offload_widget) |ow|
             c.gtk_widget_set_visible(ow, if (show) @as(c_int, 0) else 1);
@@ -919,9 +854,7 @@ pub const Pane = struct {
         // while the browser shows left the keyboard talking to nothing:
         // no chord, no type-ahead, and no way back by keyboard either.
         if (show) {
-            if (self.browser_focus) |focus| {
-                if (self.browser_ctx) |ctx| focus(ctx);
-            }
+            self.faces.browser.grabFocus();
         } else {
             _ = c.gtk_widget_grab_focus(@ptrCast(self.surface.area));
         }
@@ -929,13 +862,12 @@ pub const Pane = struct {
 
     /// True when this pane has a browser face at all (visible or not).
     pub fn hasBrowserFace(self: *Pane) bool {
-        return self.browser_widget != null;
+        return self.faces.browser.present();
     }
 
     /// True while the browser face is the one showing.
     pub fn browserFaceVisible(self: *Pane) bool {
-        const bw = self.browser_widget orelse return false;
-        return c.gtk_widget_get_visible(bw) != 0;
+        return self.faces.browser.visible();
     }
 
     /// Swap the pane's two faces. @return false when there is no
@@ -949,37 +881,16 @@ pub const Pane = struct {
 
     /// Tear the browser face down without freeing its state during GTK destruction signals.
     pub fn detachBrowser(self: *Pane) void {
-        const ctx = self.browser_ctx;
-        const prepare_destroy_cb = self.browser_prepare_destroy;
-        const deinit_cb = self.browser_deinit;
-        const face = self.browser_widget;
         // Clear pane ownership first so widget-destruction signals cannot
         // re-enter through the pane and try to detach the same face again.
-        self.browser_ctx = null;
-        self.browser_prepare_destroy = null;
-        self.browser_deinit = null;
-        self.browser_focus = null;
-        self.browser_widget = null;
+        const old = self.faces.browser.take();
         // No browser face left to return to.
         self.editor_prev_face = .terminal;
         self.clearFaceTitle();
-        if (ctx) |browser_ctx| {
-            if (prepare_destroy_cb) |cb| cb(browser_ctx, self.widgets_dead);
-        }
-        if (face) |bw| {
-            // After the widget tree's destroy these pointers are no
-            // longer widgets; GTK already removed everything itself.
-            if (!self.widgets_dead) {
-                if (self.wrapper_box) |wrap| c.gtk_box_remove(@ptrCast(wrap), bw);
-                if (self.offload_widget) |ow| c.gtk_widget_set_visible(ow, 1);
-            }
-        }
         // Unparenting synchronously emits sorter and selection signals that
         // still use BrowserView. Free it, and remove its mux watch, only
-        // after that GTK destruction chain has completed.
-        if (ctx) |browser_ctx| {
-            if (deinit_cb) |cb| cb(browser_ctx);
-        }
+        // after that GTK destruction chain has completed (Slot.teardown).
+        old.teardown(self.widgets_dead, self.wrapper_box, self.offload_widget);
         // No face left to go back to.
         if (!self.widgets_dead) setBrowserBanner(self, false);
     }
@@ -997,14 +908,7 @@ pub const Pane = struct {
     ) void {
         const wrap = self.wrapper_box orelse return;
         self.detachEditor();
-        self.editor_widget = face;
-        self.editor_ctx = ctx;
-        self.editor_prepare_destroy = prepare_destroy_cb;
-        self.editor_deinit = deinit_cb;
-        self.editor_focus = focus_cb;
-        c.gtk_widget_set_vexpand(face, 1);
-        c.gtk_widget_set_hexpand(face, 1);
-        c.gtk_box_append(@ptrCast(wrap), face);
+        self.faces.editor.install(wrap, face, ctx, prepare_destroy_cb, deinit_cb, focus_cb);
         self.setEditorVisible(true);
     }
 
@@ -1013,7 +917,7 @@ pub const Pane = struct {
     /// Hiding it returns to whichever face the raise displaced, so a
     /// pane converted from the file browser goes back to the browser.
     pub fn setEditorVisible(self: *Pane, show: bool) void {
-        const ew = self.editor_widget orelse return;
+        const ew = self.faces.editor.widget orelse return;
         // Record the displaced face on the RAISE only. A raise over a
         // visible browser is the interesting case; `terminal` is only
         // recorded when the editor was actually down, so a redundant
@@ -1038,13 +942,9 @@ pub const Pane = struct {
             return;
         }
         if (show) {
-            if (self.browser_widget) |bw| c.gtk_widget_set_visible(bw, 0);
-            if (self.panel_widget) |pw| c.gtk_widget_set_visible(pw, 0);
-            if (self.web_widget) |ww| c.gtk_widget_set_visible(ww, 0);
+            self.faces.hideAllBut(.editor);
             if (self.offload_widget) |ow| c.gtk_widget_set_visible(ow, 0);
-            if (self.editor_focus) |focus| {
-                if (self.editor_ctx) |ctx| focus(ctx);
-            }
+            self.faces.editor.grabFocus();
         } else {
             if (self.offload_widget) |ow| c.gtk_widget_set_visible(ow, 1);
             _ = c.gtk_widget_grab_focus(@ptrCast(self.surface.area));
@@ -1052,7 +952,7 @@ pub const Pane = struct {
     }
 
     pub fn hasEditorFace(self: *Pane) bool {
-        return self.editor_widget != null;
+        return self.faces.editor.present();
     }
 
     /// True when hiding the editor face will raise the file browser
@@ -1063,8 +963,7 @@ pub const Pane = struct {
     }
 
     pub fn editorFaceVisible(self: *Pane) bool {
-        const ew = self.editor_widget orelse return false;
-        return c.gtk_widget_get_visible(ew) != 0;
+        return self.faces.editor.visible();
     }
 
     /// Swap editor face and shell. @return false when there is no
@@ -1078,30 +977,11 @@ pub const Pane = struct {
     /// Two-phase editor teardown, tolerant of dead widgets — mirror
     /// of detachBrowser.
     pub fn detachEditor(self: *Pane) void {
-        const ctx = self.editor_ctx;
-        const prepare_destroy_cb = self.editor_prepare_destroy;
-        const deinit_cb = self.editor_deinit;
-        const face = self.editor_widget;
-        self.editor_ctx = null;
-        self.editor_prepare_destroy = null;
-        self.editor_deinit = null;
-        self.editor_focus = null;
+        const old = self.faces.editor.take();
         self.editor_zoom = null;
-        self.editor_widget = null;
         self.editor_prev_face = .terminal;
         self.clearFaceTitle();
-        if (ctx) |editor_ctx| {
-            if (prepare_destroy_cb) |cb| cb(editor_ctx, self.widgets_dead);
-        }
-        if (face) |ew| {
-            if (!self.widgets_dead) {
-                if (self.wrapper_box) |wrap| c.gtk_box_remove(@ptrCast(wrap), ew);
-                if (self.offload_widget) |ow| c.gtk_widget_set_visible(ow, 1);
-            }
-        }
-        if (ctx) |editor_ctx| {
-            if (deinit_cb) |cb| cb(editor_ctx);
-        }
+        old.teardown(self.widgets_dead, self.wrapper_box, self.offload_widget);
     }
 
     /// Attach a panel face (src/ui/panel/view.zig): the widget joins
@@ -1119,21 +999,14 @@ pub const Pane = struct {
     ) bool {
         const wrap = self.wrapper_box orelse return false;
         self.detachPanel();
-        self.panel_widget = face;
-        self.panel_ctx = ctx;
-        self.panel_prepare_destroy = prepare_destroy_cb;
-        self.panel_deinit = deinit_cb;
-        self.panel_focus = focus_cb;
-        c.gtk_widget_set_vexpand(face, 1);
-        c.gtk_widget_set_hexpand(face, 1);
-        c.gtk_box_append(@ptrCast(wrap), face);
+        self.faces.panel.install(wrap, face, ctx, prepare_destroy_cb, deinit_cb, focus_cb);
         self.setPanelVisible(true);
         return true;
     }
 
     pub fn canAdoptPanelFace(self: *const Pane) bool {
         return !self.widgets_dead and !self.severing_faces and
-            self.wrapper_box != null and self.panel_ctx == null;
+            self.wrapper_box != null and self.faces.panel.ctx == null;
     }
 
     pub fn isSeveringFaces(self: *const Pane) bool {
@@ -1143,19 +1016,15 @@ pub const Pane = struct {
     /// Flip between the panel face and whatever else the pane shows
     /// (terminal, browser or editor — showing the panel hides them all).
     pub fn setPanelVisible(self: *Pane, show: bool) void {
-        const pw = self.panel_widget orelse return;
+        const pw = self.faces.panel.widget orelse return;
         c.gtk_widget_set_visible(pw, if (show) @as(c_int, 1) else 0);
         // The panel face carries no title of its own; drop any other
         // face's leftover so the OSC title shows underneath.
         self.clearFaceTitle();
         if (show) {
-            if (self.browser_widget) |bw| c.gtk_widget_set_visible(bw, 0);
-            if (self.editor_widget) |ew| c.gtk_widget_set_visible(ew, 0);
-            if (self.web_widget) |ww| c.gtk_widget_set_visible(ww, 0);
+            self.faces.hideAllBut(.panel);
             if (self.offload_widget) |ow| c.gtk_widget_set_visible(ow, 0);
-            if (self.panel_focus) |focus| {
-                if (self.panel_ctx) |ctx| focus(ctx);
-            }
+            self.faces.panel.grabFocus();
         } else {
             if (self.offload_widget) |ow| c.gtk_widget_set_visible(ow, 1);
             _ = c.gtk_widget_grab_focus(@ptrCast(self.surface.area));
@@ -1163,12 +1032,11 @@ pub const Pane = struct {
     }
 
     pub fn hasPanelFace(self: *Pane) bool {
-        return self.panel_widget != null;
+        return self.faces.panel.present();
     }
 
     pub fn panelFaceVisible(self: *Pane) bool {
-        const pw = self.panel_widget orelse return false;
-        return c.gtk_widget_get_visible(pw) != 0;
+        return self.faces.panel.visible();
     }
 
     /// Swap panel face and shell. @return false when there is no panel
@@ -1182,28 +1050,9 @@ pub const Pane = struct {
     /// Two-phase panel teardown, tolerant of dead widgets — mirror of
     /// detachEditor. Reached from `severFaces`, never from a call site.
     pub fn detachPanel(self: *Pane) void {
-        const ctx = self.panel_ctx;
-        const prepare_destroy_cb = self.panel_prepare_destroy;
-        const deinit_cb = self.panel_deinit;
-        const face = self.panel_widget;
-        self.panel_ctx = null;
-        self.panel_prepare_destroy = null;
-        self.panel_deinit = null;
-        self.panel_focus = null;
-        self.panel_widget = null;
+        const old = self.faces.panel.take();
         self.clearFaceTitle();
-        if (ctx) |panel_ctx| {
-            if (prepare_destroy_cb) |cb| cb(panel_ctx, self.widgets_dead);
-        }
-        if (face) |pw| {
-            if (!self.widgets_dead) {
-                if (self.wrapper_box) |wrap| c.gtk_box_remove(@ptrCast(wrap), pw);
-                if (self.offload_widget) |ow| c.gtk_widget_set_visible(ow, 1);
-            }
-        }
-        if (ctx) |panel_ctx| {
-            if (deinit_cb) |cb| cb(panel_ctx);
-        }
+        old.teardown(self.widgets_dead, self.wrapper_box, self.offload_widget);
     }
 
     /// Attach a web face (src/ui/webface.zig): the widget joins the
@@ -1219,14 +1068,7 @@ pub const Pane = struct {
     ) bool {
         const wrap = self.wrapper_box orelse return false;
         self.detachWeb();
-        self.web_widget = face;
-        self.web_ctx = ctx;
-        self.web_prepare_destroy = prepare_destroy_cb;
-        self.web_deinit = deinit_cb;
-        self.web_focus = focus_cb;
-        c.gtk_widget_set_vexpand(face, 1);
-        c.gtk_widget_set_hexpand(face, 1);
-        c.gtk_box_append(@ptrCast(wrap), face);
+        self.faces.web.install(wrap, face, ctx, prepare_destroy_cb, deinit_cb, focus_cb);
         self.setWebVisible(true);
         return true;
     }
@@ -1234,7 +1076,7 @@ pub const Pane = struct {
     /// Flip between the web face and whatever else the pane shows
     /// (terminal, browser, editor or panel — showing it hides them all).
     pub fn setWebVisible(self: *Pane, show: bool) void {
-        const ww = self.web_widget orelse return;
+        const ww = self.faces.web.widget orelse return;
         c.gtk_widget_set_visible(ww, if (show) @as(c_int, 1) else 0);
         // The tab sidebar lists this pane's browser PAGES only while
         // the web face is visible; flipping the face flips what the
@@ -1247,13 +1089,9 @@ pub const Pane = struct {
         // re-asserts the web face's page title.
         self.clearFaceTitle();
         if (show) {
-            if (self.browser_widget) |bw| c.gtk_widget_set_visible(bw, 0);
-            if (self.editor_widget) |ew| c.gtk_widget_set_visible(ew, 0);
-            if (self.panel_widget) |pw| c.gtk_widget_set_visible(pw, 0);
+            self.faces.hideAllBut(.web);
             if (self.offload_widget) |ow| c.gtk_widget_set_visible(ow, 0);
-            if (self.web_focus) |focus| {
-                if (self.web_ctx) |ctx| focus(ctx);
-            }
+            self.faces.web.grabFocus();
         } else {
             if (self.offload_widget) |ow| c.gtk_widget_set_visible(ow, 1);
             _ = c.gtk_widget_grab_focus(@ptrCast(self.surface.area));
@@ -1261,39 +1099,19 @@ pub const Pane = struct {
     }
 
     pub fn hasWebFace(self: *Pane) bool {
-        return self.web_widget != null;
+        return self.faces.web.present();
     }
 
     pub fn webFaceVisible(self: *Pane) bool {
-        const ww = self.web_widget orelse return false;
-        return c.gtk_widget_get_visible(ww) != 0;
+        return self.faces.web.visible();
     }
 
     /// Two-phase web teardown, tolerant of dead widgets — mirror of
     /// detachPanel. Reached from `severFaces`, never from a call site.
     pub fn detachWeb(self: *Pane) void {
-        const ctx = self.web_ctx;
-        const prepare_destroy_cb = self.web_prepare_destroy;
-        const deinit_cb = self.web_deinit;
-        const face = self.web_widget;
-        self.web_ctx = null;
-        self.web_prepare_destroy = null;
-        self.web_deinit = null;
-        self.web_focus = null;
-        self.web_widget = null;
+        const old = self.faces.web.take();
         self.clearFaceTitle();
-        if (ctx) |web_ctx| {
-            if (prepare_destroy_cb) |cb| cb(web_ctx, self.widgets_dead);
-        }
-        if (face) |ww| {
-            if (!self.widgets_dead) {
-                if (self.wrapper_box) |wrap| c.gtk_box_remove(@ptrCast(wrap), ww);
-                if (self.offload_widget) |ow| c.gtk_widget_set_visible(ow, 1);
-            }
-        }
-        if (ctx) |web_ctx| {
-            if (deinit_cb) |cb| cb(web_ctx);
-        }
+        old.teardown(self.widgets_dead, self.wrapper_box, self.offload_widget);
     }
 
     fn onWrapperDestroy(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
@@ -1525,7 +1343,7 @@ pub const Pane = struct {
     /// it does for an OSC title, whose text it likewise ignores.
     fn notifyTitleFact(self: *Pane) void {
         if (self.widgets_dead) return;
-        if (self.win_on_title) |f| f(self.win_title_ctx, self, self.face_title orelse "");
+        if (self.sinks.on_title) |f| f(self.sinks.ctx, self, self.face_title orelse "");
     }
 
     /// True while a non-terminal face covers the terminal face.
@@ -1538,7 +1356,7 @@ pub const Pane = struct {
     /// manual lock > visible face title > OSC title.
     fn refreshTitlebarLabel(self: *Pane) void {
         if (self.widgets_dead) return;
-        const lbl = self.titlebar_label orelse return;
+        const lbl = self.titlebar.label orelse return;
         const text: []const u8 = pick: {
             if (!self.title_locked) {
                 if (self.face_title) |ft| {
@@ -1576,31 +1394,17 @@ pub const Pane = struct {
     /// attached assistant) can still force the bar visible on top of
     /// a hidden baseline — the bar doubles as the activity strip.
     pub fn setTitlebarVisible(self: *Pane, visible: bool) void {
-        self.titlebar_config_visible = visible;
-        self.applyTitlebarVisibility();
+        self.titlebar.setConfigVisible(visible);
     }
 
     fn applyTitlebarVisibility(self: *Pane) void {
-        const tb = self.titlebar_box orelse return;
-        const effective = self.titlebar_config_visible or self.titlebar_auto;
-        if (self.titlebar_visible == effective) return;
-        self.titlebar_visible = effective;
-        c.gtk_widget_set_visible(tb, if (effective) 1 else 0);
+        self.titlebar.applyVisibility();
     }
 
     /// Toggle active / inactive CSS class on the title bar. The
     /// Window-level CSS provider supplies the actual rgba colours.
     pub fn setTitlebarActive(self: *Pane, active: bool) void {
-        const tb = self.titlebar_box orelse return;
-        if (self.titlebar_active == active) return;
-        self.titlebar_active = active;
-        if (active) {
-            c.gtk_widget_remove_css_class(tb, "sketerm-titlebar-inactive");
-            c.gtk_widget_add_css_class(tb, "sketerm-titlebar-active");
-        } else {
-            c.gtk_widget_remove_css_class(tb, "sketerm-titlebar-active");
-            c.gtk_widget_add_css_class(tb, "sketerm-titlebar-inactive");
-        }
+        self.titlebar.setActive(active);
     }
 };
 
@@ -1613,12 +1417,12 @@ pub const Pane = struct {
 /// shell / hold) and may tear the pane down from inside the call.
 fn onSurfaceChildExit(ctx: ?*anyopaque, status: i32) void {
     const self = cast.userData(Pane, ctx);
-    if (self.win_on_child_exit) |f| f(self.win_child_ctx, self, status);
+    if (self.sinks.on_child_exit) |f| f(self.sinks.ctx, self, status);
 }
 
 fn onSurfaceContinuousFrames(ctx: ?*anyopaque) void {
     const self = cast.userData(Pane, ctx);
-    if (self.win_on_continuous_frames) |callback| callback(self.win_clip_ctx, self);
+    if (self.sinks.on_continuous_frames) |callback| callback(self.sinks.ctx, self);
 }
 
 /// A dirty redraw is about to be queued: update the IME cursor
@@ -1643,7 +1447,7 @@ fn onSurfaceBeforeRedraw(ctx: ?*anyopaque) void {
 /// `{{ COLUMNS }}`/`{{ LINES }}` title can follow.
 fn onSurfaceGridGeometry(ctx: ?*anyopaque) void {
     const self = cast.userData(Pane, ctx);
-    if (self.win_on_geometry) |f| f(self.win_cwd_ctx, self);
+    if (self.sinks.on_geometry) |f| f(self.sinks.ctx, self);
 }
 
 fn onImageEvent(ctx: ?*anyopaque, img: Screen.ImageEvent) void {
@@ -1666,17 +1470,17 @@ fn onImageAnimationEvent(ctx: ?*anyopaque) void {
 fn onTitleEvent(ctx: ?*anyopaque, title: []const u8) void {
     const self = cast.userData(Pane, ctx);
     self.setTitle(title);
-    if (self.win_on_title) |f| f(self.win_title_ctx, self, title);
+    if (self.sinks.on_title) |f| f(self.sinks.ctx, self, title);
 }
 
 fn onCwdEvent(ctx: ?*anyopaque, cwd: []const u8) void {
     const self = cast.userData(Pane, ctx);
-    if (self.win_on_cwd) |f| f(self.win_cwd_ctx, self, cwd);
+    if (self.sinks.on_cwd) |f| f(self.sinks.ctx, self, cwd);
 }
 
 fn onProgramEvent(ctx: ?*anyopaque, program: []const u8) void {
     const self = cast.userData(Pane, ctx);
-    if (self.win_on_program) |f| f(self.win_cwd_ctx, self, program);
+    if (self.sinks.on_program) |f| f(self.sinks.ctx, self, program);
 }
 
 /// Drain finished a batch with screen.dirty set — schedule a GL
@@ -1773,12 +1577,12 @@ fn selfCheckA11y(self: *Pane) void {
 
 fn onActivityEvent(ctx: ?*anyopaque) void {
     const self = cast.userData(Pane, ctx);
-    if (self.win_on_activity) |f| f(self.win_activity_ctx, self);
+    if (self.sinks.on_activity) |f| f(self.sinks.ctx, self);
 }
 
 fn onCrashEvent(ctx: ?*anyopaque) void {
     const self = cast.userData(Pane, ctx);
-    if (self.win_on_crashed) |f| f(self.win_crash_ctx, self);
+    if (self.sinks.on_crashed) |f| f(self.sinks.ctx, self);
 }
 
 fn onConnectionStateEvent(ctx: ?*anyopaque, state: Terminal.ConnectionState, retry_seconds: u32) void {
@@ -1821,7 +1625,7 @@ fn onConnectionBannerClick(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void
 
 fn onClipboardEvent(ctx: ?*anyopaque, text: []const u8) void {
     const self = cast.userData(Pane, ctx);
-    if (self.win_on_clipboard) |f| f(self.win_clip_ctx, text);
+    if (self.sinks.on_clipboard) |f| f(self.sinks.ctx, text);
 }
 
 /// OSC 52 read query (config-gated upstream). GDK clipboard reads
@@ -1880,27 +1684,27 @@ fn onClipReadDone(user: ?*anyopaque, text_opt: ?[]const u8) void {
 
 fn onProgressEvent(ctx: ?*anyopaque, state: u8, percent: u8) void {
     const self = cast.userData(Pane, ctx);
-    if (self.win_on_progress) |f| f(self.win_progress_ctx, self, state, percent);
+    if (self.sinks.on_progress) |f| f(self.sinks.ctx, self, state, percent);
 }
 
 fn onTransferEvent(ctx: ?*anyopaque, ev: Terminal.TransferEvent) void {
     const self = cast.userData(Pane, ctx);
-    if (self.win_on_transfer) |f| f(self.win_progress_ctx, self, ev);
+    if (self.sinks.on_transfer) |f| f(self.sinks.ctx, self, ev);
 }
 
 fn onCmdStatusEvent(ctx: ?*anyopaque, running: bool, exit: i32, duration_ms: i64) void {
     const self = cast.userData(Pane, ctx);
-    if (self.win_on_cmd_status) |f| f(self.win_progress_ctx, self, running, exit, duration_ms);
+    if (self.sinks.on_cmd_status) |f| f(self.sinks.ctx, self, running, exit, duration_ms);
 }
 
 fn onNotificationEvent(ctx: ?*anyopaque, ev: Screen.NotificationEvent) void {
     const self = cast.userData(Pane, ctx);
-    if (self.win_on_notification) |f| f(self.win_notify_ctx, self, ev);
+    if (self.sinks.on_notification) |f| f(self.sinks.ctx, self, ev);
 }
 
 fn onSessionRenamedEvent(ctx: ?*anyopaque, name: []const u8) void {
     const self = cast.userData(Pane, ctx);
-    if (self.win_on_session_renamed) |f| f(self.win_session_rename_ctx, self, name);
+    if (self.sinks.on_session_renamed) |f| f(self.sinks.ctx, self, name);
 }
 
 /// The session's primary app host changed (fires at channel open —
@@ -2075,7 +1879,7 @@ fn updateTitlebarActivity(self: *Pane) void {
     if (self.widgets_dead) return;
     rebuildTitlebarApps(self);
     const view_only = updateControlChip(self);
-    self.titlebar_auto = self.titlebar_apps_shown or view_only or
+    self.titlebar.auto = self.titlebar.apps_shown or view_only or
         self.terminal.peer_drivers > 0;
     self.applyTitlebarVisibility();
 }
@@ -2084,7 +1888,7 @@ fn updateTitlebarActivity(self: *Pane) void {
 /// labelled with the window title. Rebuilt from ground truth on every
 /// windows-changed event; contexts are owned by their buttons.
 fn rebuildTitlebarApps(self: *Pane) void {
-    const box = self.titlebar_apps_box orelse return;
+    const box = self.titlebar.apps_box orelse return;
     while (c.gtk_widget_get_first_child(box)) |child| c.gtk_box_remove(@ptrCast(box), child);
     var buttons: usize = 0;
     if (self.app_windows_open) {
@@ -2131,14 +1935,14 @@ fn rebuildTitlebarApps(self: *Pane) void {
             }
         }
     }
-    self.titlebar_apps_shown = buttons > 0;
+    self.titlebar.apps_shown = buttons > 0;
     c.gtk_widget_set_visible(box, @intFromBool(buttons > 0));
 }
 
 /// Refresh the lease/roster chip from Terminal state. Returns true
 /// when this client is a view-only attach (lease not held).
 fn updateControlChip(self: *Pane) bool {
-    const chip = self.titlebar_chip orelse return false;
+    const chip = self.titlebar.chip orelse return false;
     // A browser watching an assistant: the chip is the watch's lease
     // (`webwatch.zig`), and Take control escalates it there.
     if (@import("webgroup.zig").Group.fromPane(self)) |g| {
@@ -2146,9 +1950,9 @@ fn updateControlChip(self: *Pane) bool {
         if (@import("webwatch.zig").chipText(g, &wbuf)) |ct| {
             var z: [200:0]u8 = undefined;
             const tz = std.fmt.bufPrintZ(&z, "{s}", .{ct.text}) catch "View only";
-            if (self.titlebar_chip_label) |lbl| c.gtk_label_set_text(lbl, tz.ptr);
+            if (self.titlebar.chip_label) |lbl| c.gtk_label_set_text(lbl, tz.ptr);
             c.gtk_widget_set_tooltip_text(chip, "This browser shows an assistant's pages");
-            if (self.titlebar_take_btn) |btn| c.gtk_widget_set_visible(btn, @intFromBool(ct.view_only));
+            if (self.titlebar.take_btn) |btn| c.gtk_widget_set_visible(btn, @intFromBool(ct.view_only));
             c.gtk_widget_set_visible(chip, 1);
             return true;
         }
@@ -2169,11 +1973,11 @@ fn updateControlChip(self: *Pane) bool {
             std.fmt.bufPrintZ(&buf, "View only", .{}) catch "View only")
     else
         std.fmt.bufPrintZ(&buf, "AI attached", .{}) catch "AI attached";
-    if (self.titlebar_chip_label) |lbl| c.gtk_label_set_text(lbl, text.ptr);
+    if (self.titlebar.chip_label) |lbl| c.gtk_label_set_text(lbl, text.ptr);
     var tip: [160:0]u8 = undefined;
     const tip_z = std.fmt.bufPrintZ(&tip, "{d} viewer(s) attached to this session", .{term.peer_viewers}) catch null;
     c.gtk_widget_set_tooltip_text(chip, if (tip_z) |t| t.ptr else null);
-    if (self.titlebar_take_btn) |btn| c.gtk_widget_set_visible(btn, @intFromBool(view_only));
+    if (self.titlebar.take_btn) |btn| c.gtk_widget_set_visible(btn, @intFromBool(view_only));
     c.gtk_widget_set_visible(chip, 1);
     return view_only;
 }
@@ -2185,7 +1989,7 @@ fn onChipClicked(gesture: ?*c.GtkGestureClick, _: c_int, _: f64, _: f64, user: ?
     const self = cast.userData(Pane, user);
     if (self.widgets_dead) return;
     if (gesture) |g| _ = c.gtk_gesture_set_state(@ptrCast(g), c.GTK_EVENT_SEQUENCE_CLAIMED);
-    if (self.win_on_chip) |f| f(self.win_chip_ctx, self);
+    if (self.sinks.on_chip) |f| f(self.sinks.ctx, self);
 }
 
 /// Titlebar "Take control": acquire the lease if free, evict the
@@ -2233,12 +2037,12 @@ fn onPeersChanged(ctx: ?*anyopaque) void {
 
 fn onSetProfileEvent(ctx: ?*anyopaque, name: []const u8) void {
     const self = cast.userData(Pane, ctx);
-    if (self.win_on_set_profile) |f| f(self.win_setprofile_ctx, self, name);
+    if (self.sinks.on_set_profile) |f| f(self.sinks.ctx, self, name);
 }
 
 fn onBellEvent(ctx: ?*anyopaque) void {
     const self = cast.userData(Pane, ctx);
-    if (self.win_on_bell) |f| f(self.win_bell_ctx, self);
+    if (self.sinks.on_bell) |f| f(self.sinks.ctx, self);
     // Visual bell flash: the surface drives the 200 ms fade.
     self.surface.flashBell();
 }
@@ -2381,9 +2185,9 @@ fn paneMenuPrePopup(ctx: ?*anyopaque, group: *c.GSimpleActionGroup, x: f64, y: f
     // Right-click rebound away from the menu: run the bound action
     // instead (only when the running app isn't consuming the mouse;
     // with mouse_mode on, the click already reached it via SGR 1006).
-    if (self.right_click_action != .menu) {
+    if (self.mouse.right_click_action != .menu) {
         if (screen.mouse_mode == 0) {
-            switch (self.right_click_action) {
+            switch (self.mouse.right_click_action) {
                 .paste_primary => clipboard.pastePrimaryFromClipboard(@ptrCast(self.surface.area), self.terminal),
                 .paste_clipboard => clipboard.pasteFromClipboard(@ptrCast(self.surface.area), self.terminal),
                 .menu, .none => {},
@@ -2596,7 +2400,7 @@ fn onFocusEnter(_: *c.GtkEventControllerFocus, user: ?*anyopaque) callconv(.c) v
     // Inactive-pane dimming: full brightness now.
     self.surface.setFocused(true);
     // Record this pane as its tab's last-focused, for tab-switch restore.
-    if (self.win_on_focus_enter) |f| f(self.win_focus_ctx, self);
+    if (self.sinks.on_focus_enter) |f| f(self.sinks.ctx, self);
     // Cursor blink starts now (timer self-removes on focus loss).
     self.surface.ensureBlinkTimer();
 }
@@ -2815,8 +2619,8 @@ fn onMousePressed(g: *c.GtkGestureClick, n_press: c_int, x: f64, y: f64, user: ?
     // for mouse reports. With mouse_mode > 0 the app sees the click.
     // `disable_mouse_paste` opts out of this entirely.
     if (button == 2 and self.terminal.screen.mouse_mode == 0) {
-        if (self.disable_mouse_paste) return;
-        switch (self.middle_click_action) {
+        if (self.mouse.disable_mouse_paste) return;
+        switch (self.mouse.middle_click_action) {
             .paste_primary => clipboard.pastePrimaryFromClipboard(@ptrCast(self.surface.area), self.terminal),
             .paste_clipboard => clipboard.pasteFromClipboard(@ptrCast(self.surface.area), self.terminal),
             .menu, .none => {},
@@ -3050,7 +2854,7 @@ fn onDragEnd(g: *c.GtkGestureDrag, dx: f64, dy: f64, user: ?*anyopaque) callconv
     const mods = c.gdk_event_get_modifier_state(event);
     // Plain click activates links when `link_single_click` is set;
     // otherwise require Ctrl.
-    if (!self.link_single_click and (mods & c.GDK_CONTROL_MASK) == 0) return;
+    if (!self.mouse.link_single_click and (mods & c.GDK_CONTROL_MASK) == 0) return;
 
     var sx: f64 = 0;
     var sy: f64 = 0;
@@ -3098,7 +2902,7 @@ fn onScroll(g: *c.GtkEventControllerScroll, _: f64, dy: f64, user: ?*anyopaque) 
     // Ctrl+wheel = font-size zoom (Terminator/gnome-terminal/iTerm
     // convention). Only active when not disabled and not currently
     // captured by a TUI's mouse model.
-    if (!self.disable_mousewheel_zoom and screen.mouse_mode == 0) {
+    if (!self.mouse.disable_mousewheel_zoom and screen.mouse_mode == 0) {
         const ev_z = c.gtk_event_controller_get_current_event(@ptrCast(g));
         if (ev_z != null) {
             const mods_z = c.gdk_event_get_modifier_state(ev_z);

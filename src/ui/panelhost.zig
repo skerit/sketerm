@@ -3294,7 +3294,7 @@ fn closeDetachedPanelTab(user: ?*anyopaque) callconv(.c) c.gboolean {
     const terminal = pending.drain.terminal orelse return 0;
     const pane = pending.pane;
     if (pane.terminal != terminal) return 0;
-    const owner_ctx = pane.win_clip_ctx orelse return 0;
+    const owner_ctx = pane.sinks.ctx orelse return 0;
     const owner: *Window = @ptrCast(@alignCast(owner_ctx));
     if (!owner.destroying) owner.closePane(pane);
     return 0;
@@ -3840,7 +3840,7 @@ test "AppSession adoption rebinds hydration queue and panel-tab ownership" {
     var source: Window = undefined;
     var destination: Window = undefined;
     var pane: Pane = undefined;
-    pane.win_clip_ctx = @ptrCast(&destination);
+    pane.sinks.ctx = @ptrCast(&destination);
     var drain = DrainHandle{};
     var terminal: Terminal = undefined;
     terminal.drain = &drain;

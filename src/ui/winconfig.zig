@@ -799,14 +799,16 @@ pub fn applyPaneMouseFlags(self: *Window, p: *Pane) void {
         ictx.clear_select_on_copy = self.config.clear_select_on_copy;
         ictx.mouse_autohide = self.config.mouse_autohide;
     }
-    p.copy_on_selection = self.config.copy_on_selection;
-    p.clear_select_on_copy = self.config.clear_select_on_copy;
-    p.disable_mouse_paste = self.config.disable_mouse_paste;
-    p.disable_mousewheel_zoom = self.config.disable_mousewheel_zoom;
-    p.link_single_click = self.config.link_single_click;
-    p.mouse_autohide = self.config.mouse_autohide;
-    p.middle_click_action = self.config.mouse_middle_click;
-    p.right_click_action = self.config.mouse_right_click;
+    p.mouse = .{
+        .copy_on_selection = self.config.copy_on_selection,
+        .clear_select_on_copy = self.config.clear_select_on_copy,
+        .disable_mouse_paste = self.config.disable_mouse_paste,
+        .disable_mousewheel_zoom = self.config.disable_mousewheel_zoom,
+        .link_single_click = self.config.link_single_click,
+        .mouse_autohide = self.config.mouse_autohide,
+        .middle_click_action = self.config.mouse_middle_click,
+        .right_click_action = self.config.mouse_right_click,
+    };
 }
 
 pub const ApplyOpts = struct {
@@ -1036,7 +1038,7 @@ pub fn applyConfigChangeOpts(self: *Window, new_cfg: *const Config, opts: ApplyO
     self.tabbar.refreshCloseButtons();
 
     // Window-level flags.
-    self.search_force_cs = self.config.search_case_sensitive;
+    self.search.force_cs = self.config.search_case_sensitive;
     self.setAlwaysOnTop(self.config.always_on_top);
     self.refreshOpaqueRegion();
     self.refreshBindings();

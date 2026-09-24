@@ -30,6 +30,7 @@ const tab_effects = @import("tab_effects.zig");
 const file_transfers = @import("file_transfers.zig");
 const files_entry = @import("../filebrowser/entry.zig");
 const crashlog = @import("../util/crashlog.zig");
+const shellintegration = @import("../util/shellintegration.zig");
 
 /// Toolkit-free pane-tree model — one per tab, attached to the
 /// AdwTabPage as qdata (travels with cross-window tab drags). The
@@ -104,7 +105,7 @@ pub const GroupSend = enum { off, group, all };
 pub const CopyModeSel = enum { none, cell, line, rect };
 
 /// Snapshot of a closed tab's restorable state. Owned strings live
-/// in `Window.closed_arena`. Recent ring grows up to 16 entries.
+/// in `Window.closed.arena`. Recent ring grows up to 16 entries.
 pub const ClosedTab = struct {
     title: []const u8,
     cwd: ?[]const u8 = null,
@@ -354,12 +355,7 @@ pub const Window = struct {
     /// Resolved auto shell-integration paths (allocator-owned,
     /// sentinel-terminated). All null when the script dir wasn't
     /// found; gated on Config.shell_integration at spawn time.
-    si_zsh_script: ?[:0]u8 = null,
-    si_fish_script: ?[:0]u8 = null,
-    si_bash_script: ?[:0]u8 = null,
-    si_zsh_shim: ?[:0]u8 = null,
-    si_fish_shim: ?[:0]u8 = null,
-    si_bash_shim: ?[:0]u8 = null,
+    shell_integration: shellintegration.Cache = .{},
     /// Socket path, computed at init (before any spawn) so every
     /// child gets SKETERM_SOCKET even if the listener starts later.
     ipc_path: ?[:0]u8 = null,
@@ -401,33 +397,11 @@ pub const Window = struct {
     /// Live watches on assistants' browsers (`webwatch.zig`), one per
     /// assistant browser; each frees itself with its last page.
     web_watches: std.ArrayList(*@import("webwatch.zig").Watch) = .empty,
-    /// Scrollback search (Ctrl+F).
-    search_bar: ?*c.GtkWidget = null,
-    search_entry: ?*c.GtkWidget = null,
-    search_label: ?*c.GtkWidget = null,
-    search_pane: ?*Pane = null,
-    search_matches: std.ArrayList(@import("../grid/screen.zig").Screen.SearchMatch) = .empty,
-
-    /// Keyboard-hints (quick-select) mode state. `hints_pane` non-null
-    /// = mode active on that pane; its input Ctx then routes keys to
-    /// `onHintKey`. `hint_matches` owns the extracted texts.
-    hints_pane: ?*Pane = null,
-    hint_matches: []@import("hints.zig").Match = &.{},
-    hints_typed: [2]u8 = .{ 0, 0 },
-    hints_typed_len: u8 = 0,
-    hints_overlay_buf: std.ArrayList(@import("../grid/screen.zig").Screen.HintOverlay) = .empty,
-    search_idx: usize = 0,
-    /// Case-insensitive search toggle. Defaults to smart-case
-    /// (lower-only needle implies CI; mixed-case implies CS).
-    search_case_insensitive: bool = false,
-    search_case_button: ?*c.GtkWidget = null,
-    /// When set, skip the smart-case heuristic — every search is
-    /// case-sensitive by default. Mirrors Config.search_case_sensitive.
-    /// Ctrl+I still toggles per-search override.
-    search_force_cs: bool = false,
-    /// Regex-mode toggle (Ctrl+R inside the search bar). When on,
-    /// the entry text is treated as POSIX Extended Regular Expression.
-    search_regex: bool = false,
+    /// Interactive overlay modes (src/ui/modes.zig). Each holds a raw
+    /// pane pointer that `dropPaneRefs` clears on pane close.
+    search: modes_mod.Search = .{},
+    hints: modes_mod.Hints = .{},
+    copymode: modes_mod.CopyMode = .{},
     /// Resolved custom keybinding table. Built from
     /// `Config.keybinds` overlaid on `input.default_bindings`, sorted
     /// for first-match dispatch in `onKeyPressed`. Re-resolved on
@@ -444,10 +418,8 @@ pub const Window = struct {
     /// Touchpads emit many small dy events per gesture; we sum them
     /// and only flip a tab once |accum| crosses 1.0.
     tab_scroll_accum: f64 = 0,
-    /// Pending delayed tab-acknowledge (clears the inactivity warning only
-    /// after the tab has stayed selected for `tab_ack_delay_secs`).
-    ack_timer_id: c.guint = 0,
-    ack_timer_page: ?*c.AdwTabPage = null,
+    /// Pending delayed tab-acknowledge (tabchrome.zig).
+    tab_ack: tabchrome_mod.TabAck = .{},
     /// Most recent page created via appendOrInsertTab — the tab
     /// overview's create-tab callback returns it.
     last_created_page: ?*c.AdwTabPage = null,
@@ -459,40 +431,14 @@ pub const Window = struct {
     /// (default). Group = fan out to every pane sharing the source's
     /// `group` name. All = fan out to every pane in this window.
     groupsend: GroupSend = .off,
-    /// Recently-closed tab ring. Newest entry at the end; cap at 16.
-    /// Strings owned by `closed_arena`.
-    closed_tabs: std.ArrayList(ClosedTab) = .empty,
-    closed_arena: ?std.heap.ArenaAllocator = null,
+    /// Recently-closed tab ring (winlayout.zig).
+    closed: winlayout_mod.ClosedTabs = .{},
 
-    /// Copy mode (keyboard-driven selection). Raw pane pointer —
-    /// MUST be cleared on pane close, same rule as `search_pane`.
-    /// Cursor uses display-buffer coords (negative row = scrollback),
-    /// the Screen.SearchMatch / Selection convention.
-    copymode_pane: ?*Pane = null,
-    copymode_row: i32 = 0,
-    copymode_col: u16 = 0,
-    /// Active selection kind + the cell where the anchor was dropped.
-    copymode_sel: CopyModeSel = .none,
-    copymode_anchor_row: i32 = 0,
-    copymode_anchor_col: u16 = 0,
     /// The config's symbol maps in the atlas's own type, rebuilt once
     /// per config generation (`winconfig.rebuildSymbolSpecs`). Panes
     /// borrow this slice, so nothing else may reallocate it.
     symbol_specs: std.ArrayList(@import("../render/atlas.zig").Atlas.SymbolMapSpec) = .empty,
 
-    /// Hint mode keeps going after each pick, collecting matches
-    /// instead of activating them; Enter copies the lot. Seeded from
-    /// `Config.hint_multiple`, toggled in-mode with Tab.
-    hints_multi: bool = false,
-    /// Newline-joined text collected in multi-select mode.
-    hints_collected: std.ArrayList(u8) = .empty,
-
-    /// f/F/t/T have eaten their key and are waiting for the character
-    /// to search for. 0 when no motion is pending.
-    copymode_find_pending: u8 = 0,
-    /// The last f/F/t/T, for `;` and `,` to repeat and reverse.
-    copymode_find_kind: u8 = 0,
-    copymode_find_char: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator, app: ?*c.GtkApplication) !*Window {
         return initWithConfig(allocator, app, null, true);
@@ -699,9 +645,7 @@ pub const Window = struct {
             .is_primary = is_primary,
             .id = next_window_id,
             .title_base = if (files_identity) FILES_TITLE else if (web_identity) WEB_TITLE else "sketerm",
-            .search_bar = search_bar,
-            .search_entry = search_entry,
-            .search_label = search_label,
+            .search = .{ .bar = search_bar, .entry = search_entry, .label = search_label },
         };
         next_window_id += 1;
 
@@ -1015,7 +959,7 @@ pub const Window = struct {
         }
 
         // Persisted search default + always-on-top advisory.
-        self.search_force_cs = self.config.search_case_sensitive;
+        self.search.force_cs = self.config.search_case_sensitive;
         self.setAlwaysOnTop(self.config.always_on_top);
 
         // Per-pane titlebar CSS — install once at startup. Pane init
@@ -1111,9 +1055,9 @@ pub const Window = struct {
         //
         // Reversing #2 and #3 — the obvious order — would let a
         // late queued callback dispatch into a freed Pane.
-        if (self.ack_timer_id != 0) {
-            _ = c.g_source_remove(self.ack_timer_id);
-            self.ack_timer_id = 0;
+        if (self.tab_ack.timer_id != 0) {
+            _ = c.g_source_remove(self.tab_ack.timer_id);
+            self.tab_ack.timer_id = 0;
         }
         // Before anything else: a pending debounce timer would fire
         // into a half-torn-down window.
@@ -1149,7 +1093,7 @@ pub const Window = struct {
             // window-wide offload notification before freeing any pane,
             // because the remaining array entries otherwise include
             // panes already destroyed earlier in the loop below.
-            p.win_on_continuous_frames = null;
+            p.sinks.on_continuous_frames = null;
             // Sever every face NOW, while each pane's Terminal is still
             // alive — the same order the tab-close sweep uses. Leaving it
             // to Pane.deinit's last-resort call ran face teardown (e.g.
@@ -1182,25 +1126,19 @@ pub const Window = struct {
         self.zoom_hidden.deinit(self.allocator);
         for (self.notify_slots.items) |slot| self.allocator.free(slot.id);
         self.notify_slots.deinit(self.allocator);
-        self.search_matches.deinit(self.allocator);
-        @import("hints.zig").freeMatches(self.allocator, self.hint_matches);
-        self.allocator.free(self.hint_matches);
-        self.hints_overlay_buf.deinit(self.allocator);
-        self.hints_collected.deinit(self.allocator);
+        self.search.matches.deinit(self.allocator);
+        @import("hints.zig").freeMatches(self.allocator, self.hints.matches);
+        self.allocator.free(self.hints.matches);
+        self.hints.overlay_buf.deinit(self.allocator);
+        self.hints.collected.deinit(self.allocator);
         self.symbol_specs.deinit(self.allocator);
         self.bindings.deinit(self.allocator);
-        self.closed_tabs.deinit(self.allocator);
-        if (self.closed_arena) |*a| a.deinit();
+        self.closed.deinit(self.allocator);
         if (self.ipc) |srv| srv.deinit(); // frees ipc_path (server owns it)
         if (self.bg_source.pixels) |px| c.stbi_image_free(px);
         if (self.shader_source.src) |s| self.allocator.free(s);
         if (self.shader_source.dir) |d| self.allocator.free(d);
-        if (self.si_zsh_script) |s| self.allocator.free(s);
-        if (self.si_fish_script) |s| self.allocator.free(s);
-        if (self.si_bash_script) |s| self.allocator.free(s);
-        if (self.si_zsh_shim) |s| self.allocator.free(s);
-        if (self.si_fish_shim) |s| self.allocator.free(s);
-        if (self.si_bash_shim) |s| self.allocator.free(s);
+        self.shell_integration.deinit(self.allocator);
         self.tabbar.deinit();
         self.tab_forest.deinit();
         self.config.deinit();
@@ -2431,41 +2369,31 @@ pub const Window = struct {
         pane.terminal.on_panel_origin_renamed = @import("panelhost.zig").renameOrigin;
         pane.terminal.on_panel_work_cancel = @import("panelhost.zig").cancelPanelWork;
         @import("panelhost.zig").attachOrigin(pane.terminal, pane);
-        pane.win_clip_ctx = @ptrCast(self);
-        pane.win_on_clipboard = termsinks_mod.onTermClipboardSet;
-        pane.win_notify_ctx = @ptrCast(self);
-        pane.win_on_notification = termsinks_mod.onTermNotification;
-        pane.win_progress_ctx = @ptrCast(self);
-        pane.win_on_progress = termsinks_mod.onTermProgress;
-        pane.win_on_transfer = termsinks_mod.onTermTransfer;
-        pane.win_on_cmd_status = termsinks_mod.onTermCmdStatus;
-        pane.win_bell_ctx = @ptrCast(self);
-        pane.win_on_bell = termsinks_mod.onTermBell;
-        pane.win_chip_ctx = @ptrCast(self);
-        pane.win_on_chip = onPaneChipClicked;
-        pane.win_child_ctx = @ptrCast(self);
-        pane.win_on_child_exit = termsinks_mod.onTermChildExit;
-        pane.win_on_continuous_frames = onPaneContinuousFrames;
-        pane.win_crash_ctx = @ptrCast(self);
-        pane.win_on_crashed = onPaneCrashed;
-        pane.win_cwd_ctx = @ptrCast(self);
-        pane.win_on_cwd = termsinks_mod.onTermCwdChanged;
-        pane.win_setprofile_ctx = @ptrCast(self);
-        pane.win_on_set_profile = termsinks_mod.onTermSetProfile;
-        pane.win_focus_ctx = @ptrCast(self);
-        pane.win_on_focus_enter = termsinks_mod.onPaneFocused;
-        pane.win_activity_ctx = @ptrCast(self);
-        pane.win_on_activity = termsinks_mod.onTermActivity;
-        // OSC 0/1/2 titles drive the AdwTabPage title — but only
-        // until the user explicitly renames the tab (which sets the
-        // "user-locked" flag on the page). Renaming with an empty
-        // string clears the lock and lets OSC tracking resume.
-        pane.win_title_ctx = @ptrCast(self);
-        pane.win_on_title = termsinks_mod.onTermTitleChanged;
-        pane.win_on_program = termsinks_mod.onTermProgramChanged;
-        pane.win_on_geometry = termsinks_mod.onPaneGeometryChanged;
-        pane.win_session_rename_ctx = @ptrCast(self);
-        pane.win_on_session_renamed = termsinks_mod.onTermSessionRenamed;
+        pane.sinks = .{
+            .ctx = @ptrCast(self),
+            .on_clipboard = termsinks_mod.onTermClipboardSet,
+            .on_notification = termsinks_mod.onTermNotification,
+            .on_progress = termsinks_mod.onTermProgress,
+            .on_transfer = termsinks_mod.onTermTransfer,
+            .on_cmd_status = termsinks_mod.onTermCmdStatus,
+            .on_bell = termsinks_mod.onTermBell,
+            .on_chip = onPaneChipClicked,
+            .on_child_exit = termsinks_mod.onTermChildExit,
+            .on_continuous_frames = onPaneContinuousFrames,
+            .on_crashed = onPaneCrashed,
+            .on_cwd = termsinks_mod.onTermCwdChanged,
+            .on_set_profile = termsinks_mod.onTermSetProfile,
+            .on_focus_enter = termsinks_mod.onPaneFocused,
+            .on_activity = termsinks_mod.onTermActivity,
+            // OSC 0/1/2 titles drive the AdwTabPage title -- but only
+            // until the user explicitly renames the tab (which sets the
+            // "user-locked" flag on the page). Renaming with an empty
+            // string clears the lock and lets OSC tracking resume.
+            .on_title = termsinks_mod.onTermTitleChanged,
+            .on_program = termsinks_mod.onTermProgramChanged,
+            .on_geometry = termsinks_mod.onPaneGeometryChanged,
+            .on_session_renamed = termsinks_mod.onTermSessionRenamed,
+        };
     }
 
     fn onPanePanelRequest(
@@ -2475,7 +2403,7 @@ pub const Window = struct {
         request: []const u8,
     ) void {
         const pane = cast.userData(Pane, ctx);
-        const owner: *Window = if (pane.win_clip_ctx) |win| @ptrCast(@alignCast(win)) else {
+        const owner: *Window = if (pane.sinks.ctx) |win| @ptrCast(@alignCast(win)) else {
             terminal.replyPanelRequest(request_id, "{\"ok\":false,\"error\":\"panel pane has no window\"}");
             return;
         };
@@ -2506,10 +2434,10 @@ pub const Window = struct {
     /// applyCurrentMatch / nextMatch would deref the dead Pane, and
     /// `search_highlights` would dangle into freed Window memory.
     fn dropPaneRefs(self: *Window, pane: *Pane, opts: DropPaneOpts) void {
-        pane.win_on_continuous_frames = null;
-        if (self.search_pane == pane) self.closeSearch();
-        if (self.hints_pane == pane) self.exitHints();
-        if (self.copymode_pane == pane) self.exitCopyMode();
+        pane.sinks.on_continuous_frames = null;
+        if (self.search.pane == pane) self.closeSearch();
+        if (self.hints.pane == pane) self.exitHints();
+        if (self.copymode.pane == pane) self.exitCopyMode();
         if (opts.unzoom_always or self.zoom_pane == pane) self.unzoomPane();
         self.dropNotifySlotsForPane(pane);
         for (self.panes.items, 0..) |p, idx| {
@@ -2698,7 +2626,7 @@ pub const Window = struct {
     /// tab drag-out/drag-in: unhook it there, list it here, rewire
     /// every sink and config-derived field against this window.
     fn adoptPane(self: *Window, pane: *Pane) void {
-        const src_any = pane.win_clip_ctx orelse return;
+        const src_any = pane.sinks.ctx orelse return;
         const src: *Window = @ptrCast(@alignCast(src_any));
         if (src == self) return;
         // Reserve here, before unhooking the source. transferPageFrom and
@@ -2777,7 +2705,7 @@ pub const Window = struct {
     fn foreignPaneCount(self: *Window, w: *c.GtkWidget) usize {
         if (c.g_object_get_data(@ptrCast(@alignCast(w)), "sketerm-pane")) |data| {
             const pane: *Pane = @ptrCast(@alignCast(data));
-            const src_any = pane.win_clip_ctx orelse return 0;
+            const src_any = pane.sinks.ctx orelse return 0;
             const src: *Window = @ptrCast(@alignCast(src_any));
             return @intFromBool(src != self);
         }
@@ -3163,7 +3091,7 @@ pub const Window = struct {
         // the natural visual anchor for "set pane title". Falls back
         // to a thin rect at the top of the GLArea so the popover
         // lands at the top of the pane instead of dropping below it.
-        if (pane.titlebar_box) |tb| {
+        if (pane.titlebar.box) |tb| {
             c.gtk_widget_set_parent(popover, tb);
         } else {
             c.gtk_widget_set_parent(popover, @ptrCast(pane.surface.area));
@@ -3640,7 +3568,7 @@ pub const Window = struct {
         }
         // Drop the per-pane titlebar too (if any): its stale session title
         // above a "session crashed" panel reads as a contradiction.
-        if (pane.titlebar_box) |tb| c.gtk_widget_set_visible(tb, 0);
+        if (pane.titlebar.box) |tb| c.gtk_widget_set_visible(tb, 0);
         const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 12) orelse return;
         c.gtk_widget_set_hexpand(box, 1);
         c.gtk_widget_set_vexpand(box, 1);
@@ -3667,39 +3595,24 @@ pub const Window = struct {
     /// per-shell script + shim paths. Missing dir = feature
     /// silently off.
     pub fn resolveShellIntegration(self: *Window) void {
-        const ally = self.allocator;
-        var base_buf: [4096]u8 = undefined;
-        const base = @import("../util/shellintegration.zig").baseDir(&base_buf) orelse return;
-        self.si_zsh_script = std.fmt.allocPrintSentinel(ally, "{s}/sketerm.zsh", .{base}, 0) catch null;
-        self.si_fish_script = std.fmt.allocPrintSentinel(ally, "{s}/sketerm.fish", .{base}, 0) catch null;
-        self.si_bash_script = std.fmt.allocPrintSentinel(ally, "{s}/sketerm.bash", .{base}, 0) catch null;
-        self.si_zsh_shim = std.fmt.allocPrintSentinel(ally, "{s}/zsh", .{base}, 0) catch null;
-        self.si_fish_shim = std.fmt.allocPrintSentinel(ally, "{s}/fish-xdg", .{base}, 0) catch null;
-        self.si_bash_shim = std.fmt.allocPrintSentinel(ally, "{s}/bash/sketerm-rc.bash", .{base}, 0) catch null;
+        self.shell_integration.deinit(self.allocator);
+        self.shell_integration = shellintegration.Cache.init(self.allocator);
     }
 
     /// Pick the injection setup for the program being spawned, or
     /// null (no injection) for shells we don't auto-integrate.
     pub fn shellIntegrationFor(self: *const Window, argv0: [*:0]const u8) ?@import("../pty.zig").ShellIntegration {
         if (!self.config.shell_integration) return null;
-        const prog = std.mem.span(argv0);
-        const base = std.fs.path.basename(prog);
-        if (std.mem.eql(u8, base, "zsh")) {
-            const script = self.si_zsh_script orelse return null;
-            const shim = self.si_zsh_shim orelse return null;
-            return .{ .kind = .zsh, .script = script.ptr, .shim_dir = shim.ptr };
-        }
-        if (std.mem.eql(u8, base, "fish")) {
-            const script = self.si_fish_script orelse return null;
-            const shim = self.si_fish_shim orelse return null;
-            return .{ .kind = .fish, .script = script.ptr, .shim_dir = shim.ptr };
-        }
-        if (std.mem.eql(u8, base, "bash")) {
-            const script = self.si_bash_script orelse return null;
-            const shim = self.si_bash_shim orelse return null;
-            return .{ .kind = .bash, .script = script.ptr, .shim_dir = shim.ptr };
-        }
-        return null;
+        const got = self.shell_integration.pick(std.mem.span(argv0)) orelse return null;
+        return .{
+            .kind = switch (got.kind) {
+                .zsh => .zsh,
+                .fish => .fish,
+                .bash => .bash,
+            },
+            .script = got.script.ptr,
+            .shim_dir = got.shim.ptr,
+        };
     }
 
     // ── Per-tab colours ──────────────────────────────────────────
@@ -3824,7 +3737,7 @@ pub const Window = struct {
     }
 
     pub fn applyBroadcastCss(self: *Window, p: *Pane) void {
-        if (p.titlebar_box) |tb| {
+        if (p.titlebar.box) |tb| {
             const w: *c.GtkWidget = @ptrCast(@alignCast(tb));
             if (self.groupsend != .off) {
                 c.gtk_widget_add_css_class(w, "sketerm-broadcast");

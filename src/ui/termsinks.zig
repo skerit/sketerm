@@ -59,7 +59,7 @@ pub fn onTermTransfer(ctx: ?*anyopaque, pane: *Pane, ev: Terminal.TransferEvent)
     }
 }
 
-/// Wired from `Pane.win_on_session_renamed` — the daemon confirmed a
+/// Wired from `Pane.sinks.on_session_renamed` — the daemon confirmed a
 /// session rename; rebuild the "⌁ name [@ host]" tab title.
 pub fn onTermSessionRenamed(ctx: ?*anyopaque, pane: *Pane, name: []const u8) void {
     const self = cast.userData(Window, ctx);
@@ -368,7 +368,7 @@ pub fn refreshAllTitles(self: *Window) void {
     refreshWindowTitleTemplate(self);
 }
 
-/// Wired from `Pane.win_on_title`. Updates the AdwTabPage's title from
+/// Wired from `Pane.sinks.on_title`. Updates the AdwTabPage's title from
 /// OSC 0/1/2 events emitted by the shell, but only while the page
 /// hasn't been user-renamed. The "user-locked" flag lives on the
 /// page as `g_object_set_data(page, "sketerm-title-locked")`.
@@ -380,13 +380,13 @@ pub fn onTermTitleChanged(ctx: ?*anyopaque, pane: *Pane, _: []const u8) void {
     titleFactChanged(self, pane, .title);
 }
 
-/// Wired from `Pane.win_on_program`.
+/// Wired from `Pane.sinks.on_program`.
 pub fn onTermProgramChanged(ctx: ?*anyopaque, pane: *Pane, _: []const u8) void {
     const self = cast.userData(Window, ctx);
     titleFactChanged(self, pane, .program);
 }
 
-/// Wired from `Pane.win_on_geometry` — the pane's column/row count
+/// Wired from `Pane.sinks.on_geometry` — the pane's column/row count
 /// changed.
 pub fn onPaneGeometryChanged(ctx: ?*anyopaque, pane: *Pane) void {
     const self = cast.userData(Window, ctx);
