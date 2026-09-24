@@ -11,8 +11,10 @@
 //!
 //! This is the macOS analog of the Linux side's "plain AT-SPI client
 //! reading char_count / caret_offset / contents / caret line" check.
-//! It does not need a window, NSApplication, or the (not-yet-built)
-//! AppKit pane frontend: the accessibility methods are plain calls.
+//! It does not need a window or NSApplication: the accessibility
+//! methods are plain calls. The GUI's per-pane `attach` path (a
+//! content-view child element, `ui/pane.zig attachA11y`) needs a real
+//! GdkMacos window and is exercised by the GUI itself, not here.
 
 const std = @import("std");
 const Screen = @import("grid/screen.zig").Screen;

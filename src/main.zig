@@ -10,8 +10,8 @@ const viewer = @import("viewer.zig");
 comptime {
     // macOS: emit the NSAccessibility bridge's export callbacks into the
     // GUI binary so the ObjC shim (linked via build.zig addNsaxBridge)
-    // resolves them. The AppKit pane frontend then calls a11y/nsax.zig's
-    // newView/notifyChanged with no further build wiring. No-op on Linux,
+    // resolves them; ui/pane.zig attachA11y attaches a per-pane element
+    // through a11y/nsax.zig on every macOS window. No-op on Linux,
     // where panes use the GtkAccessibleText (atspi.zig) bridge instead.
     if (builtin.os.tag == .macos) _ = @import("a11y/nsax.zig");
 }

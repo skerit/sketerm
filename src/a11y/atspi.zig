@@ -74,6 +74,12 @@ pub const VTable = struct {
     /// The diff region for change notifications; null = this burst
     /// cannot be localized, so no text-changed event is emitted.
     region: *const fn (ctx: *anyopaque, alloc: std.mem.Allocator) ?Region,
+    /// The run of identically-looking characters around `off`, for
+    /// `GetAttributeRun`; null (the default) = the source reports no
+    /// text attributes.
+    attributes: ?*const fn (ctx: *anyopaque, off: u32) ?view.AttrRun = null,
+    /// The canvas's plain look, for `GetDefaultAttributes`.
+    default_attributes: ?*const fn (ctx: *anyopaque) ?view.TextAttrs = null,
 };
 
 pub const Source = struct { ctx: *anyopaque, vtable: *const VTable };
@@ -505,24 +511,68 @@ fn getSelection(
     return 1;
 }
 
+/// Every attribute of the run at `offset`, each over the run's range:
+/// GTK intersects the ranges into the AT-SPI attribute run.
 fn getAttributes(
-    _: ?*c.GtkAccessibleText,
-    _: c_uint,
+    self: ?*c.GtkAccessibleText,
+    offset: c_uint,
     n_ranges: [*c]c.gsize,
-    _: [*c][*c]c.GtkAccessibleTextRange,
-    _: [*c][*c][*c]u8,
-    _: [*c][*c][*c]u8,
+    ranges: [*c][*c]c.GtkAccessibleTextRange,
+    attribute_names: [*c][*c][*c]u8,
+    attribute_values: [*c][*c][*c]u8,
 ) callconv(.c) c.gboolean {
     n_ranges.* = 0;
-    return 0;
+    const st = active(self) orelse return 0;
+    const src = st.source.?;
+    const f = src.vtable.attributes orelse return 0;
+    const run = f(src.ctx, offset) orelse return 0;
+    var fg_buf: [16]u8 = undefined;
+    var bg_buf: [16]u8 = undefined;
+    const pairs = view.attrPairs(run.attrs, &fg_buf, &bg_buf);
+    if (ranges != null) {
+        // (transfer container): GTK g_free()s the array.
+        const arr: [*c]c.GtkAccessibleTextRange = @ptrCast(@alignCast(c.g_malloc0(@sizeOf(c.GtkAccessibleTextRange) * pairs.len)));
+        for (0..pairs.len) |i| arr[i] = .{ .start = run.start, .length = run.end - run.start };
+        ranges.* = arr;
+    }
+    writePairs(&pairs, attribute_names, attribute_values);
+    n_ranges.* = pairs.len;
+    return 1;
 }
 
 fn getDefaultAttributes(
-    _: ?*c.GtkAccessibleText,
+    self: ?*c.GtkAccessibleText,
     attribute_names: [*c][*c][*c]u8,
     attribute_values: [*c][*c][*c]u8,
 ) callconv(.c) void {
+    const defaults: ?view.TextAttrs = blk: {
+        const st = active(self) orelse break :blk null;
+        const f = st.source.?.vtable.default_attributes orelse break :blk null;
+        break :blk f(st.source.?.ctx);
+    };
+    if (defaults) |d| {
+        var fg_buf: [16]u8 = undefined;
+        var bg_buf: [16]u8 = undefined;
+        const pairs = view.attrPairs(d, &fg_buf, &bg_buf);
+        writePairs(&pairs, attribute_names, attribute_values);
+        return;
+    }
     // Empty, NULL-terminated arrays (GTK frees them with g_strfreev).
-    attribute_names.* = @ptrCast(@alignCast(c.g_malloc0(@sizeOf(?*u8))));
-    attribute_values.* = @ptrCast(@alignCast(c.g_malloc0(@sizeOf(?*u8))));
+    if (attribute_names != null) attribute_names.* = @ptrCast(@alignCast(c.g_malloc0(@sizeOf(?*u8))));
+    if (attribute_values != null) attribute_values.* = @ptrCast(@alignCast(c.g_malloc0(@sizeOf(?*u8))));
+}
+
+/// Names and values as the NULL-terminated, g_strdup'd arrays GTK
+/// frees with g_strfreev. Either out-parameter may be NULL.
+fn writePairs(pairs: []const view.AttrPair, names: [*c][*c][*c]u8, values: [*c][*c][*c]u8) void {
+    if (names != null) {
+        const arr: [*c][*c]u8 = @ptrCast(@alignCast(c.g_malloc0(@sizeOf(?*u8) * (pairs.len + 1))));
+        for (pairs, 0..) |p, i| arr[i] = c.g_strdup(p.name.ptr);
+        names.* = arr;
+    }
+    if (values != null) {
+        const arr: [*c][*c]u8 = @ptrCast(@alignCast(c.g_malloc0(@sizeOf(?*u8) * (pairs.len + 1))));
+        for (pairs, 0..) |p, i| arr[i] = c.g_strdup(p.value.ptr);
+        values.* = arr;
+    }
 }

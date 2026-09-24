@@ -389,6 +389,32 @@ pub fn main() u8 {
         say("selection cleared on click");
     }
 
+    // ── 4b. SGR styling reaches the reader as text attributes ───────
+    {
+        const req = "{\"cmd\":\"send-text\",\"pane\":1,\"data\":\"\\u0015printf '\\\\033[1mBOLDRUN\\\\033[0m\\\\n'\\r\"}\n";
+        const resp = roundtrip(allocator, sock_path, req) orelse return fail("send-text (bold run) roundtrip");
+        defer allocator.free(resp);
+        if (std.mem.indexOf(u8, resp, "\"ok\":true") == null) return fail("send-text (bold run) not ok");
+        var tries: u32 = 0;
+        var ok = false;
+        while (tries < 100 and !ok) : (tries += 1) {
+            if (drive) |app| app.drain();
+            defer _ = c.usleep(200_000);
+            const ts = hub.?.textState(allocator, term_id) orelse continue;
+            defer allocator.free(ts.text);
+            // The printed line, not the echoed command: it starts a line.
+            const line_at = std.mem.indexOf(u8, ts.text, "\nBOLDRUN") orelse continue;
+            const at: i32 = @intCast(std.unicode.utf8CountCodepoints(ts.text[0 .. line_at + 1]) catch continue);
+            const run = hub.?.textAttributeRun(allocator, term_id, at + 2, "weight") orelse continue;
+            defer allocator.free(run.value);
+            if (!std.mem.eql(u8, run.value, "700")) return fail("a bold SGR run did not read back as weight 700");
+            if (run.start != at or run.end != at + 7) return fail("the bold attribute run does not span exactly the bold text");
+            ok = true;
+        }
+        if (!ok) return fail("Text.GetAttributeRun never answered for the bold run");
+    }
+    say("SGR bold readable as a text attribute run over Text.GetAttributeRun");
+
     // ── 5. the pane's context menu, over the same bridge ─────────────
     if (contextMenuStage(allocator, sock_path)) |msg| {
         _ = c.fprintf(platform.stderr(), "smoke-atspi: FAIL: %.*s\n", @as(c_int, @intCast(msg.len)), msg.ptr);

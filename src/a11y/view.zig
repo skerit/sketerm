@@ -14,6 +14,7 @@ const std = @import("std");
 const cell_mod = @import("../grid/cell.zig");
 const Screen = @import("../grid/screen.zig").Screen;
 const Cell = @import("../grid/cell.zig").Cell;
+const StyleColor = @import("../grid/style_pool.zig").Color;
 
 /// Cell flag bits (mirrors the grid's `Cell.flags`).
 const FLAG_WIDE: u8 = cell_mod.FLAG_WIDE_LEFT;
@@ -37,6 +38,10 @@ pub const Snapshot = struct {
     /// UTF-16 units (astral chars — emoji — count as 2; BMP, incl. Nerd-font
     /// glyphs, as 1). Pure arithmetic, so it stays in the neutral core.
     char_to_utf16: []u32,
+    /// Grid cell of each character; len == n_chars. A row's newline maps
+    /// to the column just past that row's last character. Text
+    /// attributes and on-screen range frames are cell questions.
+    char_to_cell: []CellPos,
     /// Selection as a character range [sel_start, sel_end), when the
     /// screen has one that maps to a CONTIGUOUS run of this text
     /// (`.normal` / `.line_select`). `.rectangular` stays null: a block
@@ -51,6 +56,40 @@ pub const Snapshot = struct {
         self.allocator.free(self.line_starts);
         self.allocator.free(self.char_to_byte);
         self.allocator.free(self.char_to_utf16);
+        self.allocator.free(self.char_to_cell);
+    }
+
+    /// The grid cell of character `ch` (clamped to the last character;
+    /// an empty snapshot answers the origin).
+    pub fn cellOf(self: *const Snapshot, ch: u32) CellPos {
+        if (self.n_chars == 0) return .{ .row = 0, .col = 0 };
+        return self.char_to_cell[@min(ch, self.n_chars - 1)];
+    }
+
+    /// The cells a character range covers, as a rectangle in cell
+    /// units: one row's span, or (across rows) full-width rows from the
+    /// first to the last. The platform bridge scales it by the cell size
+    /// to answer "where is this text" (NSAccessibility range frames,
+    /// AT-SPI range extents). `cols` is the grid width.
+    pub fn cellRect(self: *const Snapshot, c0: u32, c1: u32, cols: u16) CellRect {
+        if (self.n_chars == 0 or c1 <= c0) {
+            const at = self.cellOf(c0);
+            return .{ .col = at.col, .row = at.row, .cols = 0, .rows = 1 };
+        }
+        const a = self.cellOf(c0);
+        const b = self.cellOf(c1 - 1);
+        if (a.row == b.row) {
+            const wide: u16 = if (self.charIsWide(c1 - 1)) 2 else 1;
+            return .{ .col = a.col, .row = a.row, .cols = b.col + wide - a.col, .rows = 1 };
+        }
+        return .{ .col = 0, .row = a.row, .cols = cols, .rows = b.row - a.row + 1 };
+    }
+
+    fn charIsWide(self: *const Snapshot, ch: u32) bool {
+        if (ch + 1 >= self.n_chars) return false;
+        const here = self.char_to_cell[ch];
+        const next = self.char_to_cell[ch + 1];
+        return next.row == here.row and next.col == here.col + 2;
     }
 
     /// UTF-16 code-unit offset of character `c` (clamped). For mapping the
@@ -105,6 +144,123 @@ pub const Snapshot = struct {
     }
 };
 
+pub const CellPos = struct { row: u16, col: u16 };
+
+/// A rectangle of cells: origin plus size, in cell units.
+pub const CellRect = struct { col: u16, row: u16, cols: u16, rows: u16 };
+
+/// A run's presentation, platform-neutral: what a screen reader or
+/// braille display can report about the text's look.
+pub const TextAttrs = struct {
+    bold: bool = false,
+    italic: bool = false,
+    underline: Underline = .none,
+    strikethrough: bool = false,
+    fg: [3]u8,
+    bg: [3]u8,
+
+    pub const Underline = enum { none, single, double, @"error" };
+
+    pub fn eql(a: TextAttrs, b: TextAttrs) bool {
+        return a.bold == b.bold and a.italic == b.italic and a.underline == b.underline and
+            a.strikethrough == b.strikethrough and std.mem.eql(u8, &a.fg, &b.fg) and std.mem.eql(u8, &a.bg, &b.bg);
+    }
+};
+
+/// The attributes of one character range [start, end), every character
+/// of which looks the same.
+pub const AttrRun = struct { start: u32, end: u32, attrs: TextAttrs };
+
+fn rgb8(v: [4]f32) [3]u8 {
+    var out: [3]u8 = undefined;
+    for (0..3) |i| out[i] = @intFromFloat(std.math.clamp(v[i], 0, 1) * 255 + 0.5);
+    return out;
+}
+
+fn resolveColor(screen: *const Screen, col: StyleColor, default: [4]f32) [3]u8 {
+    return switch (col) {
+        .default => rgb8(default),
+        .palette => |i| screen.palette[i],
+        .rgb => |v| .{ v.r, v.g, v.b },
+    };
+}
+
+/// The screen's plain look: default colours, no emphasis. Reverse
+/// video (DECSCNM) swaps the defaults, as the renderer does.
+pub fn defaultAttrs(screen: *const Screen) TextAttrs {
+    const fg = if (screen.reverse_screen) screen.default_bg else screen.default_fg;
+    const bg = if (screen.reverse_screen) screen.default_fg else screen.default_bg;
+    return .{ .fg = rgb8(fg), .bg = rgb8(bg) };
+}
+
+/// How one cell looks. SGR 7 (reverse) swaps its resolved colours; a
+/// curly underline is what terminals use for errors (spell-check,
+/// diagnostics), so it is reported as the `error` underline.
+pub fn cellAttrs(screen: *const Screen, cell: Cell) TextAttrs {
+    const entry = screen.pool.get(cell.style_ref);
+    const dfg: [4]f32 = if (screen.reverse_screen) screen.default_bg else screen.default_fg;
+    const dbg: [4]f32 = if (screen.reverse_screen) screen.default_fg else screen.default_bg;
+    var fg = resolveColor(screen, entry.fg, dfg);
+    var bg = resolveColor(screen, entry.bg, dbg);
+    if (entry.attrs.reverse) std.mem.swap([3]u8, &fg, &bg);
+    return .{
+        .bold = entry.attrs.bold,
+        .italic = entry.attrs.italic,
+        .underline = switch (entry.attrs.underlineStyle()) {
+            .none => .none,
+            .double => .double,
+            .curly => .@"error",
+            else => .single,
+        },
+        .strikethrough = entry.attrs.strikethrough,
+        .fg = fg,
+        .bg = bg,
+    };
+}
+
+/// The run of identically-styled characters around character `off` on
+/// its row. A newline has the screen's default look and is a run of its
+/// own; the run never crosses a row.
+pub fn attrRun(snap: *const Snapshot, screen: *const Screen, off: u32) ?AttrRun {
+    if (snap.n_chars == 0) return null;
+    const ch = @min(off, snap.n_chars - 1);
+    const line = snap.lineRange(ch);
+    const text_end = if (line.end > line.start and snap.byteRange(line.end - 1, line.end)[0] == '\n') line.end - 1 else line.end;
+    if (ch >= text_end) return .{ .start = ch, .end = ch + 1, .attrs = defaultAttrs(screen) };
+    const at = attrsOfChar(snap, screen, ch);
+    var start = ch;
+    while (start > line.start and attrsOfChar(snap, screen, start - 1).eql(at)) start -= 1;
+    var end = ch + 1;
+    while (end < text_end and attrsOfChar(snap, screen, end).eql(at)) end += 1;
+    return .{ .start = start, .end = end, .attrs = at };
+}
+
+fn attrsOfChar(snap: *const Snapshot, screen: *const Screen, ch: u32) TextAttrs {
+    const pos = snap.char_to_cell[ch];
+    const cells = screen.lineCellsAtPub(pos.row) orelse return defaultAttrs(screen);
+    if (pos.col >= cells.len) return defaultAttrs(screen);
+    return cellAttrs(screen, cells[pos.col]);
+}
+
+/// One attribute as the (name, value) pair GTK's accessible-text
+/// vocabulary spells (`GTK_ACCESSIBLE_ATTRIBUTE_*`). Values are
+/// NUL-terminated inside `buf`.
+pub const AttrPair = struct { name: [:0]const u8, value: [:0]const u8 };
+
+/// Every attribute of `a` as GTK names it, colours as `r,g,b`.
+pub fn attrPairs(a: TextAttrs, fg_buf: *[16]u8, bg_buf: *[16]u8) [6]AttrPair {
+    const fg = std.fmt.bufPrintZ(fg_buf, "{d},{d},{d}", .{ a.fg[0], a.fg[1], a.fg[2] }) catch "0,0,0";
+    const bg = std.fmt.bufPrintZ(bg_buf, "{d},{d},{d}", .{ a.bg[0], a.bg[1], a.bg[2] }) catch "0,0,0";
+    return .{
+        .{ .name = "weight", .value = if (a.bold) "700" else "400" },
+        .{ .name = "style", .value = if (a.italic) "italic" else "normal" },
+        .{ .name = "underline", .value = @tagName(a.underline) },
+        .{ .name = "strikethrough", .value = if (a.strikethrough) "true" else "false" },
+        .{ .name = "fg-color", .value = fg },
+        .{ .name = "bg-color", .value = bg },
+    };
+}
+
 fn isWordBoundary(cp: u21) bool {
     return cp == ' ' or cp == '\n' or cp == '\t';
 }
@@ -117,6 +273,8 @@ pub fn build(screen: *const Screen, allocator: std.mem.Allocator) !Snapshot {
     errdefer c2b.deinit(allocator);
     var c2u16: std.ArrayList(u32) = .empty;
     errdefer c2u16.deinit(allocator);
+    var c2cell: std.ArrayList(CellPos) = .empty;
+    errdefer c2cell.deinit(allocator);
 
     const nrows: usize = screen.rows;
     var line_starts = try allocator.alloc(u32, nrows);
@@ -175,6 +333,7 @@ pub fn build(screen: *const Screen, allocator: std.mem.Allocator) !Snapshot {
         const is_sel_a_row = sel_a != null and sel_a.?.row == @as(i64, @intCast(r));
         const is_sel_b_row = sel_b != null and sel_b.?.row == @as(i64, @intCast(r));
         var row_chars: u32 = 0;
+        var last_col_end: u16 = 0;
         var ci: usize = 0;
         while (ci < cells.len) : (ci += 1) {
             if (is_cursor_row and ci == screen.col) cursor_char_in_row = row_chars;
@@ -191,6 +350,8 @@ pub fn build(screen: *const Screen, allocator: std.mem.Allocator) !Snapshot {
             };
             try c2b.append(allocator, @intCast(text.items.len));
             try c2u16.append(allocator, n_utf16);
+            try c2cell.append(allocator, .{ .row = @intCast(r), .col = @intCast(ci) });
+            last_col_end = @intCast(ci + (if (cell.flags & FLAG_WIDE != 0) @as(usize, 2) else 1));
             try text.appendSlice(allocator, enc[0..n]);
             n_chars += 1;
             n_utf16 += if (cp >= 0x10000) 2 else 1; // surrogate pair for astral
@@ -210,6 +371,7 @@ pub fn build(screen: *const Screen, allocator: std.mem.Allocator) !Snapshot {
         if (r + 1 < nrows) {
             try c2b.append(allocator, @intCast(text.items.len));
             try c2u16.append(allocator, n_utf16);
+            try c2cell.append(allocator, .{ .row = @intCast(r), .col = last_col_end });
             try text.append(allocator, '\n');
             n_chars += 1;
             n_utf16 += 1;
@@ -242,6 +404,7 @@ pub fn build(screen: *const Screen, allocator: std.mem.Allocator) !Snapshot {
         .line_starts = line_starts,
         .char_to_byte = try c2b.toOwnedSlice(allocator),
         .char_to_utf16 = try c2u16.toOwnedSlice(allocator),
+        .char_to_cell = try c2cell.toOwnedSlice(allocator),
         .sel_start = sel_s,
         .sel_end = sel_e,
     };
@@ -456,4 +619,102 @@ test "snapshot: UTF-16 offsets count astral chars as surrogate pairs" {
     try testing.expectEqual(@as(u32, 1), snap.utf16At(1)); // emoji starts at 1
     try testing.expectEqual(@as(u32, 3), snap.utf16At(2)); // 'b' after the pair
     try testing.expectEqual(@as(u32, 4), snap.utf16At(3)); // total UTF-16 length
+}
+
+const VtParser = @import("../parser/vt.zig").Parser;
+const VtEvent = @import("../parser/event.zig").Event;
+
+/// Run real escape sequences (SGR included) through the parser.
+fn feedVt(screen: *Screen, bytes: []const u8) void {
+    const Ctx = struct {
+        screen: *Screen,
+        fn emit(user: ?*anyopaque, ev: VtEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(user.?));
+            var mut = ev;
+            self.screen.apply(ev);
+            mut.deinit(std.testing.allocator);
+        }
+    };
+    var parser = VtParser.init(std.testing.allocator);
+    defer parser.deinit();
+    var ctx: Ctx = .{ .screen = screen };
+    parser.advance(bytes, Ctx.emit, @ptrCast(&ctx));
+}
+
+test "text attributes: runs follow the SGR style and stop at the row" {
+    const testing = std.testing;
+    var pool = try Pool.init(testing.allocator);
+    defer pool.deinit();
+    const screen = try Screen.init(testing.allocator, &pool, 20, 2);
+    defer screen.deinit();
+    feedVt(screen, "ab\x1b[1;31mRED\x1b[0m cd\r\n\x1b[4:3mcurl\x1b[0m");
+    var snap = try build(screen, testing.allocator);
+    defer snap.deinit();
+    try testing.expectEqualStrings("abRED cd\ncurl", snap.text);
+
+    const plain = attrRun(&snap, screen, 0).?;
+    try testing.expectEqual(@as(u32, 0), plain.start);
+    try testing.expectEqual(@as(u32, 2), plain.end);
+    try testing.expect(!plain.attrs.bold);
+
+    const red = attrRun(&snap, screen, 3).?;
+    try testing.expectEqual(@as(u32, 2), red.start);
+    try testing.expectEqual(@as(u32, 5), red.end);
+    try testing.expect(red.attrs.bold);
+    try testing.expectEqualSlices(u8, &screen.palette[1], &red.attrs.fg);
+
+    // The newline is a default-looking run of its own.
+    const nl = attrRun(&snap, screen, 8).?;
+    try testing.expectEqual(@as(u32, 8), nl.start);
+    try testing.expectEqual(@as(u32, 9), nl.end);
+
+    // A curly underline reads as the error underline, on its own row.
+    const curl = attrRun(&snap, screen, 10).?;
+    try testing.expectEqual(@as(u32, 9), curl.start);
+    try testing.expectEqual(@as(u32, 13), curl.end);
+    try testing.expectEqual(TextAttrs.Underline.@"error", curl.attrs.underline);
+
+    var fg_buf: [16]u8 = undefined;
+    var bg_buf: [16]u8 = undefined;
+    const pairs = attrPairs(red.attrs, &fg_buf, &bg_buf);
+    try testing.expectEqualStrings("weight", pairs[0].name);
+    try testing.expectEqualStrings("700", pairs[0].value);
+    var want_fg: [16]u8 = undefined;
+    const fg_text = try std.fmt.bufPrint(&want_fg, "{d},{d},{d}", .{ screen.palette[1][0], screen.palette[1][1], screen.palette[1][2] });
+    try testing.expectEqualStrings(fg_text, pairs[4].value);
+}
+
+test "reverse video swaps a cell's resolved colours" {
+    const testing = std.testing;
+    var pool = try Pool.init(testing.allocator);
+    defer pool.deinit();
+    const screen = try Screen.init(testing.allocator, &pool, 10, 1);
+    defer screen.deinit();
+    feedVt(screen, "\x1b[7mX");
+    var snap = try build(screen, testing.allocator);
+    defer snap.deinit();
+    const run = attrRun(&snap, screen, 0).?;
+    const plain = defaultAttrs(screen);
+    try testing.expectEqualSlices(u8, &plain.bg, &run.attrs.fg);
+    try testing.expectEqualSlices(u8, &plain.fg, &run.attrs.bg);
+}
+
+test "cell rects: one row's span, wide chars, and multi-row ranges" {
+    const testing = std.testing;
+    var pool = try Pool.init(testing.allocator);
+    defer pool.deinit();
+    const screen = try Screen.init(testing.allocator, &pool, 12, 3);
+    defer screen.deinit();
+    feedVt(screen, "ab\xe4\xb8\xadcd\r\nxyz");
+    var snap = try build(screen, testing.allocator);
+    defer snap.deinit();
+    try testing.expectEqualStrings("ab\xe4\xb8\xadcd\nxyz\n", snap.text);
+    // "中" is char 2 at col 2 and covers two cells; "c" sits at col 4.
+    try testing.expectEqual(CellPos{ .row = 0, .col = 4 }, snap.cellOf(3));
+    try testing.expectEqual(CellRect{ .col = 2, .row = 0, .cols = 2, .rows = 1 }, snap.cellRect(2, 3, 12));
+    try testing.expectEqual(CellRect{ .col = 0, .row = 0, .cols = 6, .rows = 1 }, snap.cellRect(0, 5, 12));
+    // Across the newline: full-width rows from the first to the last.
+    try testing.expectEqual(CellRect{ .col = 0, .row = 0, .cols = 12, .rows = 2 }, snap.cellRect(1, 8, 12));
+    // An empty range is a caret-width rect at its position.
+    try testing.expectEqual(CellRect{ .col = 1, .row = 1, .cols = 0, .rows = 1 }, snap.cellRect(7, 7, 12));
 }

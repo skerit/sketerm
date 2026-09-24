@@ -457,6 +457,75 @@ pub const Hub = struct {
         return .{ a, b };
     }
 
+    /// org.a11y.atspi.Component.GetAccessibleAtPoint(x, y, coord) on
+    /// node `id`: the object path of the hit (owned by the caller; the
+    /// null path when nothing is there). Null on failure.
+    pub fn accessibleAtPoint(self: *Hub, allocator: std.mem.Allocator, id: []const u8, x: i32, y: i32, coord: u32) ?[]u8 {
+        var path_buf: [256]u8 = undefined;
+        const ref = splitId(id, &path_buf) orelse return null;
+        var bus = self.openA11yBus(allocator) orelse return null;
+        defer bus.deinit();
+        var bw = dbus.Writer.init(allocator);
+        defer bw.deinit();
+        bw.putI32(x) catch return null;
+        bw.putI32(y) catch return null;
+        bw.putU32(coord) catch return null;
+        const r = bus.call(.{
+            .mtype = .method_call,
+            .path = ref.path,
+            .interface = "org.a11y.atspi.Component",
+            .member = "GetAccessibleAtPoint",
+            .destination = ref.dest,
+            .signature = "iiu",
+            .body = bw.buf.items,
+        }) catch return null;
+        defer allocator.free(r.body);
+        var rd = dbus.Reader.init(r.body);
+        rd.structStart() catch return null;
+        _ = rd.string() catch return null;
+        const path = rd.string() catch return null;
+        return allocator.dupe(u8, path) catch null;
+    }
+
+    /// org.a11y.atspi.Text.GetAttributeRun(offset, false) on node `id`:
+    /// the run [start, end) around `offset` and the value of attribute
+    /// `name` in it ("" when the run does not carry it). The value is
+    /// owned by the caller. Null on failure.
+    pub const AttrRun = struct { start: i32, end: i32, value: []u8 };
+
+    pub fn textAttributeRun(self: *Hub, allocator: std.mem.Allocator, id: []const u8, offset: i32, name: []const u8) ?AttrRun {
+        var path_buf: [256]u8 = undefined;
+        const ref = splitId(id, &path_buf) orelse return null;
+        var bus = self.openA11yBus(allocator) orelse return null;
+        defer bus.deinit();
+        var bw = dbus.Writer.init(allocator);
+        defer bw.deinit();
+        bw.putI32(offset) catch return null;
+        bw.putBool(false) catch return null;
+        const r = bus.call(.{
+            .mtype = .method_call,
+            .path = ref.path,
+            .interface = "org.a11y.atspi.Text",
+            .member = "GetAttributeRun",
+            .destination = ref.dest,
+            .signature = "ib",
+            .body = bw.buf.items,
+        }) catch return null;
+        defer allocator.free(r.body);
+        var rd = dbus.Reader.init(r.body);
+        var value: []const u8 = "";
+        var sub = rd.array(8) catch return null; // a{ss}
+        while (!sub.atEnd()) {
+            sub.structStart() catch return null;
+            const k = sub.string() catch return null;
+            const v = sub.string() catch return null;
+            if (std.mem.eql(u8, k, name)) value = v;
+        }
+        const start = rd.i32v() catch return null;
+        const end = rd.i32v() catch return null;
+        return .{ .start = start, .end = end, .value = allocator.dupe(u8, value) catch return null };
+    }
+
     /// Listen for AT-SPI object events on the a11y bus. This is the
     /// only way to prove a provider EMITTED something rather than
     /// merely being willing to answer a poll, which is the whole

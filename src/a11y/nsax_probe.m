@@ -6,7 +6,7 @@
 // marshals the answers back to Zig so the smoke can assert them. This
 // exercises the full stack: ObjC method dispatch → a11y/nsax.zig
 // callbacks → view.zig snapshot, including the codepoint↔UTF-16
-// boundary, without needing a running app or the AppKit pane frontend.
+// boundary, without needing a running app or a window.
 
 #import <Cocoa/Cocoa.h>
 #include <stdlib.h>

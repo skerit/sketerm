@@ -149,10 +149,10 @@ pub fn build(b: *std.Build) void {
     });
     configureSysDeps(b, exe_mod, cbindings_mod);
     exe_mod.addImport("build_options", glib_opts_mod);
-    // NSAccessibility bridge for the (nascent) AppKit pane: link the
-    // ObjC shim so the future frontend can call a11y/nsax.zig. main.zig
-    // force-includes nsax.zig on macOS so its export callbacks are
-    // present for the shim to resolve.
+    // NSAccessibility bridge (live on macOS: GTK4 has no NSAccessibility
+    // backend, so every pane hangs an element on the window's content
+    // view through a11y/nsax.zig). main.zig force-includes nsax.zig on
+    // macOS so its export callbacks are present for the shim to resolve.
     if (native_macos) addNsaxBridge(b, exe_mod);
     if (have_x264) addVideo(b, exe_mod); // GUI-side H.264 decode (-Dvideo)
     if (have_vtenc) addVtEnc(b, exe_mod); // VideoToolbox H.264 encode (macOS)

@@ -315,6 +315,24 @@ pub fn main() !void {
             fail("the press was not aimed at the node's centre");
         }
         say("Action press routed to the trusted-input hook at the node's centre");
+
+        // Hit testing from the document: the button's centre names the
+        // button, and a point on no child names nothing.
+        var doc_buf: [128]u8 = undefined;
+        const doc_id = std.fmt.bufPrint(&doc_buf, "{s}#{d}", .{ proj.uniqueName(), 1 }) catch unreachable;
+        const hit = hub.accessibleAtPoint(gpa, doc_id, 57, 79, 1) orelse
+            fail("Component.GetAccessibleAtPoint was not answered");
+        defer gpa.free(hit);
+        if (!std.mem.endsWith(u8, hit, "/accessible/4")) {
+            std.debug.print("smoke-webax: hit at the button centre was {s}\n", .{hit});
+            fail("GetAccessibleAtPoint at the button's centre did not name the button");
+        }
+        const miss = hub.accessibleAtPoint(gpa, doc_id, 700, 500, 1) orelse
+            fail("Component.GetAccessibleAtPoint (miss) was not answered");
+        defer gpa.free(miss);
+        if (std.mem.endsWith(u8, miss, "/accessible/4") or std.mem.endsWith(u8, miss, "/accessible/1"))
+            fail("GetAccessibleAtPoint on empty page space named a node");
+        say("GetAccessibleAtPoint hit-tests the page tree");
     }
 
     // ── Text: caret offset and selection for a braille display ────

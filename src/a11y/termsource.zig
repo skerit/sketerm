@@ -31,6 +31,8 @@ const vtable: atspi.VTable = .{
     .caret = caret,
     .selections = selections,
     .region = region,
+    .attributes = attributes,
+    .default_attributes = defaultAttributes,
 };
 
 fn snap(ctx: *anyopaque) ?view.Snapshot {
@@ -85,6 +87,20 @@ fn selections(ctx: *anyopaque, alloc: std.mem.Allocator) []atspi.Range {
     const out = alloc.alloc(atspi.Range, 1) catch return &.{};
     out[0] = .{ .start = a, .end = b };
     return out;
+}
+
+/// SGR styling as text attributes: bold, italic, underline (a curly one
+/// as the error underline), strikethrough and the resolved colours.
+fn attributes(ctx: *anyopaque, off: u32) ?view.AttrRun {
+    const term: *Terminal = @ptrCast(@alignCast(ctx));
+    var s = snap(ctx) orelse return null;
+    defer s.deinit();
+    return view.attrRun(&s, term.screen, off);
+}
+
+fn defaultAttributes(ctx: *anyopaque) ?view.TextAttrs {
+    const term: *Terminal = @ptrCast(@alignCast(ctx));
+    return view.defaultAttrs(term.screen);
 }
 
 fn region(ctx: *anyopaque, alloc: std.mem.Allocator) ?atspi.Region {

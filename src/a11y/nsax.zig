@@ -18,11 +18,13 @@
 //! (forward via `utf16At`, inverse via `charForUtf16`). The shim only
 //! ever sees UTF-16 offsets and UTF-8 bytes.
 //!
-//! Wiring (when the native AppKit frontend lands): create the pane's
-//! view with `newView(term)`, drop the bridge's owning reference with
-//! `releaseView` once it is in the view hierarchy, and call
-//! `notifyChanged(view)` from the pane's render-on-change path — the
-//! macOS analog of `pane.zig`'s `a11y.notifyChanged` (atspi) call.
+//! Wiring: this bridge is LIVE in the GTK GUI on macOS. GTK4 has no
+//! NSAccessibility backend, so `ui/pane.zig attachA11y` hangs an element
+//! on the window's GdkMacos content view per pane (`attach`, positioned
+//! with `setFrameInParent`, removed with `detach`) and calls
+//! `notifyChanged` from the render-on-change path, the macOS analog of
+//! the atspi bridge's notification. `newView`/`releaseView` build a
+//! standalone `NSView` for hosts that own an AppKit view hierarchy.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -271,6 +273,56 @@ export fn sketerm_nsax_range_for_line(
     return 1;
 }
 
+/// The selected range as a UTF-16 NSRange: the selection when the
+/// screen has a flat one, else the caret as a zero-length range.
+pub const Utf16Range = struct { loc: usize, len: usize };
+
+fn selectedUtf16(s: *const view.Snapshot) Utf16Range {
+    if (s.sel_start) |a| if (s.sel_end) |b| {
+        const a16 = s.utf16At(a);
+        return .{ .loc = a16, .len = s.utf16At(b) - a16 };
+    };
+    return .{ .loc = s.utf16At(s.caret), .len = 0 };
+}
+
+/// The cells a UTF-16 range covers (see `Snapshot.cellRect`).
+fn rangeCells(s: *const view.Snapshot, loc: usize, len: usize, cols: u16) view.CellRect {
+    return s.cellRect(charForUtf16(s, loc), charForUtf16(s, loc +| len), cols);
+}
+
+/// accessibilitySelectedTextRange: the selection as a UTF-16 range, or
+/// the caret as a zero-length one.
+export fn sketerm_nsax_selected_range(term_p: ?*anyopaque, out_loc: *usize, out_len: *usize) callconv(.c) void {
+    out_loc.* = 0;
+    out_len.* = 0;
+    const term = termOf(term_p) orelse return;
+    var s = snap(term) orelse return;
+    defer s.deinit();
+    const r = selectedUtf16(&s);
+    out_loc.* = r.loc;
+    out_len.* = r.len;
+}
+
+/// accessibilityFrameForRange, in CELL units: the rectangle (origin
+/// column/row, width/height in cells) a UTF-16 range covers, plus the
+/// grid size so the shim can scale it to the element's frame. Returns 1
+/// and fills every out-parameter, or 0 with none meaningful.
+export fn sketerm_nsax_range_cells(
+    term_p: ?*anyopaque,
+    loc: usize,
+    len: usize,
+    out_rect: *[4]u16,
+    out_grid: *[2]u16,
+) callconv(.c) c_int {
+    const term = termOf(term_p) orelse return 0;
+    var s = snap(term) orelse return 0;
+    defer s.deinit();
+    const r = rangeCells(&s, loc, len, term.screen.cols);
+    out_rect.* = .{ r.col, r.row, r.cols, r.rows };
+    out_grid.* = .{ term.screen.cols, term.screen.rows };
+    return 1;
+}
+
 // ── tests ────────────────────────────────────────────────────────────
 // Exercise the codepoint↔UTF-16 boundary math (the macOS-specific risk)
 // against the neutral snapshot. The ObjC shim is verified by `zig build
@@ -369,4 +421,47 @@ test "line/range mapping over a multi-row screen in UTF-16" {
     const end = s.line_starts[2];
     try testing.expectEqual(@as(u32, 3), s.utf16At(start));
     try testing.expectEqual(@as(u32, 4), s.utf16At(end) - s.utf16At(start));
+}
+
+test "the selected range is the selection in UTF-16, else the caret" {
+    const testing = std.testing;
+    var pool = try Pool.init(testing.allocator);
+    defer pool.deinit();
+    const screen = try Screen.init(testing.allocator, &pool, 8, 2);
+    defer screen.deinit();
+    // "a😀bc": the emoji is two UTF-16 units, so offsets after it shift.
+    screen.apply(.{ .print = 'a' });
+    screen.apply(.{ .print = 0x1F600 });
+    screen.apply(.{ .print = 'b' });
+    screen.apply(.{ .print = 'c' });
+    {
+        var s = try view.build(screen, testing.allocator);
+        defer s.deinit();
+        try testing.expectEqual(Utf16Range{ .loc = 5, .len = 0 }, selectedUtf16(&s));
+    }
+    // Select "😀b": cells [1, 4) (the emoji is wide).
+    screen.selection.start(0, 1, .normal);
+    screen.selection.extend(0, 4);
+    var s = try view.build(screen, testing.allocator);
+    defer s.deinit();
+    try testing.expectEqual(Utf16Range{ .loc = 1, .len = 3 }, selectedUtf16(&s));
+}
+
+test "a range frame covers the cells its UTF-16 range spans" {
+    const testing = std.testing;
+    var pool = try Pool.init(testing.allocator);
+    defer pool.deinit();
+    const screen = try Screen.init(testing.allocator, &pool, 10, 3);
+    defer screen.deinit();
+    screen.apply(.{ .print = 'a' });
+    screen.apply(.{ .print = 0x1F600 });
+    screen.apply(.{ .print = 'b' });
+    feed(screen, "\r\nxy");
+    var s = try view.build(screen, testing.allocator);
+    defer s.deinit();
+    // UTF-16: a=0, emoji=1..2, b=3, newline=4, x=5, y=6.
+    try testing.expectEqual(view.CellRect{ .col = 1, .row = 0, .cols = 2, .rows = 1 }, rangeCells(&s, 1, 2, 10));
+    try testing.expectEqual(view.CellRect{ .col = 3, .row = 0, .cols = 1, .rows = 1 }, rangeCells(&s, 3, 1, 10));
+    try testing.expectEqual(view.CellRect{ .col = 0, .row = 0, .cols = 10, .rows = 2 }, rangeCells(&s, 0, 6, 10));
+    try testing.expectEqual(view.CellRect{ .col = 1, .row = 1, .cols = 0, .rows = 1 }, rangeCells(&s, 6, 0, 10));
 }

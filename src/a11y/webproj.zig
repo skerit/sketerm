@@ -871,8 +871,15 @@ pub const Proj = struct {
                 return true;
             }
             if (std.mem.eql(u8, member, "GetAccessibleAtPoint")) {
+                var rd = dbus.Reader.init(body);
+                const px = try rd.i32v();
+                const py = try rd.i32v();
+                const coord = try rd.u32v();
                 sig.* = "(so)";
-                try self.putNullRef(bw); // hit testing: later, with focus
+                if (self.hitTest(node, px, py, coord)) |id|
+                    try self.putNodeRef(bw, id)
+                else
+                    try self.putNullRef(bw);
                 return true;
             }
             if (std.mem.eql(u8, member, "GrabFocus")) {
@@ -1341,6 +1348,31 @@ pub const Proj = struct {
         return -1;
     }
 
+    /// The deepest descendant of `node` (never `node` itself, per
+    /// AT-SPI: the point names a CHILD) whose extents contain the
+    /// point. Later siblings win, as they paint over earlier ones; a
+    /// zero-sized node (a wrapper the engine did not lay out) is walked
+    /// through rather than matched. Null when no descendant is hit.
+    fn hitTest(self: *Proj, node: ?*const axtree.Node, px: i32, py: i32, coord: u32) ?u32 {
+        return self.hitIn(self.childIds(node), px, py, coord, 0);
+    }
+
+    fn hitIn(self: *Proj, kids: []const u32, px: i32, py: i32, coord: u32, depth: u32) ?u32 {
+        if (depth >= 64) return null;
+        var i = kids.len;
+        while (i > 0) {
+            i -= 1;
+            const kid = self.tree.get(kids[i]) orelse continue;
+            const r = self.extents(kid, coord);
+            if (r[2] > 0 and r[3] > 0) {
+                if (px < r[0] or py < r[1] or px >= r[0] + r[2] or py >= r[1] + r[3]) continue;
+                return self.hitIn(kid.children, px, py, coord, depth + 1) orelse kids[i];
+            }
+            if (self.hitIn(kid.children, px, py, coord, depth + 1)) |hit| return hit;
+        }
+        return null;
+    }
+
     /// Absolute rect: the wire's rects are relative to their offset
     /// container, so absolute = the chain's sum. coord 0 (screen) adds
     /// the view origin the GUI supplied; anything else is window/view
@@ -1747,4 +1779,48 @@ test "node paths round-trip through the AT-SPI prefix" {
     try t.expectEqualStrings(PATH_PREFIX ++ "42", nodePath(&buf, 42));
     try t.expectEqual(@as(?usize, 1), indexOfId(&.{ 7, 9, 11 }, 9));
     try t.expectEqual(@as(?usize, null), indexOfId(&.{ 7, 9, 11 }, 8));
+}
+
+test "GetAccessibleAtPoint hit-tests the deepest laid-out descendant" {
+    const gpa = t.allocator;
+    var tree = axtree.Tree.init(gpa);
+    defer tree.deinit();
+    const Spec = struct { id: u32, x: i32, y: i32, w: i32, h: i32, oc: u32 = 0, kids: []const u32 = &.{} };
+    const specs = [_]Spec{
+        .{ .id = 1, .x = 0, .y = 0, .w = 800, .h = 600, .kids = &.{ 2, 3, 4 } },
+        .{ .id = 2, .x = 10, .y = 10, .w = 100, .h = 50, .kids = &.{5} },
+        // Relative to its offset container (2): absolute (15,15).
+        .{ .id = 5, .x = 5, .y = 5, .w = 20, .h = 20, .oc = 2 },
+        // A wrapper the engine never laid out: walked through, not hit.
+        .{ .id = 3, .x = 0, .y = 0, .w = 0, .h = 0, .kids = &.{6} },
+        .{ .id = 6, .x = 300, .y = 300, .w = 50, .h = 50 },
+        .{ .id = 4, .x = 500, .y = 10, .w = 50, .h = 50 },
+    };
+    for (specs) |sp| {
+        try tree.nodes.put(gpa, sp.id, .{
+            .id = sp.id,
+            .x = sp.x,
+            .y = sp.y,
+            .w = sp.w,
+            .h = sp.h,
+            .offset_container = sp.oc,
+            .children = try gpa.dupe(u32, sp.kids),
+        });
+    }
+    tree.root_id = 1;
+    var proj = try Proj.init(gpa, &tree, "hit");
+    defer proj.deinit();
+    const root = tree.get(1);
+    try t.expectEqual(@as(?u32, 5), proj.hitTest(root, 20, 20, 1));
+    try t.expectEqual(@as(?u32, 2), proj.hitTest(root, 12, 12, 1));
+    try t.expectEqual(@as(?u32, 6), proj.hitTest(root, 310, 310, 1));
+    try t.expectEqual(@as(?u32, 4), proj.hitTest(root, 520, 20, 1));
+    // The point must name a CHILD: the root itself is never the answer.
+    try t.expectEqual(@as(?u32, null), proj.hitTest(root, 700, 500, 1));
+    // Screen coordinates are offset by the view's origin.
+    proj.setOrigin(100, 100);
+    try t.expectEqual(@as(?u32, 5), proj.hitTest(root, 120, 120, 0));
+    try t.expectEqual(@as(?u32, null), proj.hitTest(root, 20, 20, 0));
+    // From a leaf: nothing below it.
+    try t.expectEqual(@as(?u32, null), proj.hitTest(tree.get(5), 20, 20, 1));
 }
