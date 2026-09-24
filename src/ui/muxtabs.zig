@@ -954,8 +954,8 @@ fn attachMuxPreparedMode(self: *Window, conn_in: @import("../mux/client.zig").Co
     // either, a Watch under app_view=window gave a placeholder tab
     // plus a free-floating chrome-less window.
     if (force_tab) {
-        pane.app_view_tab = true;
-        pane.app_view_tab_forced = true;
+        pane.app.view_tab = true;
+        pane.app.view_tab_forced = true;
     }
     self.applyPaneConfig(pane, .{ .profile = profile });
     // A host that opened during the snapshot replay (before the sinks
@@ -1067,8 +1067,8 @@ fn materializeAppSession(win: *Window, as: *Window.AppSession) ?*Pane {
     const pane = adoptAppSessionIntoTab(win, as) orelse return null;
     // The user asked for this tab explicitly; app_view policy must not
     // pop it back out on the next config reapply.
-    pane.app_view_tab = true;
-    pane.app_view_tab_forced = true;
+    pane.app.view_tab = true;
+    pane.app.view_tab_forced = true;
     const remote = term.remote orelse return pane;
     if (remote.napps.items.len > 0)
         pane.adoptAppHost(@ptrCast(remote.napps.items[0].host));

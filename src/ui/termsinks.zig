@@ -296,7 +296,7 @@ pub fn paneFacts(self: *Window, pane: *Pane, rel_buf: []u8) titlefmt.Facts {
         .columns = term.screen.cols,
         .lines = term.screen.rows,
         .profile = if (pane.active_profile) |p| p else "",
-        .zoomed = self.zoom_pane == pane,
+        .zoomed = self.zoom.pane == pane,
     };
     if (term.remote) |r| facts.session = r.session;
     if (tabPageForPane(self, pane)) |page| {

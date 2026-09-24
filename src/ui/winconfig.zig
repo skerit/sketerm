@@ -346,7 +346,7 @@ pub fn applyPaneConfig(self: *Window, pane: *Pane, opts: Window.PaneConfigOpts) 
     pane.surface.cursor_blink_us = @as(i64, @intCast(self.config.cursor_blink_ms)) * 1000;
     pane.restartBlinkTimer();
     pane.applyTrailConfig(self.config.cursor_trail, self.config.cursor_trail_ms);
-    if (!pane.app_view_tab_forced) pane.app_view_tab = self.config.app_view == .tab;
+    if (!pane.app.view_tab_forced) pane.app.view_tab = self.config.app_view == .tab;
     pane.surface.line_pad_px = s.line_pad_px;
     pane.surface.grid_pass.pad = s.padding;
     pane.surface.cell_pass.pad = s.padding;
@@ -934,7 +934,7 @@ pub fn applyConfigChangeOpts(self: *Window, new_cfg: *const Config, opts: ApplyO
         // Rendering.
         // Affects the next app launch; live views keep their mode
         // (pop in/out via the window's host menu).
-        if (!p.app_view_tab_forced) p.app_view_tab = self.config.app_view == .tab;
+        if (!p.app.view_tab_forced) p.app.view_tab = self.config.app_view == .tab;
         p.surface.grid_pass.enable_ligatures = self.config.ligatures;
         p.surface.grid_pass.enable_bidi = self.config.bidi;
         p.surface.grid_pass.enable_url_underline = self.config.auto_url_detect;
@@ -1092,6 +1092,21 @@ test "continuous shader animation suppresses graphics offload" {
     config.custom_shader_animation = false;
     config.graphics_offload = false;
     try std.testing.expect(!graphicsOffloadEnabled(&config, false, true));
+}
+
+/// Arm (or re-arm) the debounced config.conf write. The single
+/// entry point for every in-app config mutation that persists.
+pub fn scheduleConfigSave(self: *Window) void {
+    if (self.config_save.source != 0)
+        _ = c.g_source_remove(self.config_save.source);
+    const source = c.g_timeout_add(400, @ptrCast(&onConfigSaveTick), @ptrCast(self));
+    self.config_save.scheduled(source);
+}
+
+fn onConfigSaveTick(user: ?*anyopaque) callconv(.c) c.gboolean {
+    const self = cast.userData(Window, user);
+    if (self.config_save.fired()) persistConfig(self);
+    return 0; // G_SOURCE_REMOVE
 }
 
 /// Write the live config back to the file the process reads — the

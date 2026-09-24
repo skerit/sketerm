@@ -3,7 +3,7 @@
 //!
 //! Pure -- no GTK, no GDK -- so the arithmetic is unit-testable. The
 //! GDK half (resolving a spec to a `GdkMonitor`, driving the layer
-//! surface or the toplevel) lives in the quake region of `window.zig`.
+//! surface or the toplevel) lives in `winquake.zig`.
 //!
 //! Two paths consume one `Placement`. With wlr-layer-shell (KWin,
 //! wlroots compositors; `gtk_layer_is_supported` decides at runtime)

@@ -112,6 +112,16 @@ pub const ClosedTab = struct {
     profile_name: ?[]const u8 = null,
 };
 
+/// Zoomed pane (tmux z): `pane` is non-null while one pane fills its
+/// tab. `hidden` holds the sibling subtrees we hid, each with a strong
+/// ref so the pointers stay valid for the restore even if GTK
+/// re-shuffles the tree in between. Zoom only hides widgets; the tab's
+/// tree model is untouched.
+pub const Zoom = struct {
+    pane: ?*Pane = null,
+    hidden: std.ArrayList(*c.GtkWidget) = .empty,
+};
+
 /// One OSC 99 notification that may still be activated from the
 /// desktop. `id` is the sanitized protocol identifier (owned),
 /// echoed back in the activation report.
@@ -321,12 +331,8 @@ pub const Window = struct {
     /// originating pane + sanitized id (owned). Bounded ring — oldest
     /// evicted at 32; entries for closing panes dropped in unlistPane.
     notify_slots: std.ArrayList(NotifySlot) = .empty,
-    /// Zoomed pane (tmux z): non-null while one pane fills its tab.
-    /// `zoom_hidden` holds the sibling subtrees we hid, each with a
-    /// strong ref so the pointers stay valid for the restore even if
-    /// GTK re-shuffles the tree in between.
-    zoom_pane: ?*Pane = null,
-    zoom_hidden: std.ArrayList(*c.GtkWidget) = .empty,
+    /// tmux-style pane zoom (`toggleZoomPane`).
+    zoom: Zoom = .{},
     /// Shared background-layer source (one image decode for every
     /// pane). Panes hold a pointer; refreshBgSource mutates + bumps
     /// the generation.
@@ -1122,8 +1128,8 @@ pub const Window = struct {
         // (each idle frees its own job).
         for (self.mux_restore_jobs.items) |job| job.canceled = true;
         self.mux_restore_jobs.deinit(self.allocator);
-        for (self.zoom_hidden.items) |w| c.g_object_unref(w);
-        self.zoom_hidden.deinit(self.allocator);
+        for (self.zoom.hidden.items) |w| c.g_object_unref(w);
+        self.zoom.hidden.deinit(self.allocator);
         for (self.notify_slots.items) |slot| self.allocator.free(slot.id);
         self.notify_slots.deinit(self.allocator);
         self.search.matches.deinit(self.allocator);
@@ -1158,7 +1164,7 @@ pub const Window = struct {
         if (sidebar_flush.persist) winconfig_mod.persistConfig(self);
     }
 
-    fn destroyToplevel(self: *Window) void {
+    pub fn destroyToplevel(self: *Window) void {
         self.beginDestroy();
         c.gtk_window_destroy(@ptrCast(self.app_window));
     }
@@ -1239,6 +1245,7 @@ pub const Window = struct {
         }
     }
     pub const refreshBindings = winconfig.refreshBindings;
+    pub const scheduleConfigSave = winconfig.scheduleConfigSave;
     pub const reloadConfigFromDisk = winconfig.reloadConfigFromDisk;
     const pickPaneShader = winconfig.pickPaneShader;
     const shaderPresetDirZ = winconfig.shaderPresetDirZ;
@@ -1277,7 +1284,7 @@ pub const Window = struct {
     const modelTreeToLayout = winlayout.modelTreeToLayout;
     const verifyTreeModel = winlayout.verifyTreeModel;
     const verifyAllTabs = winlayout.verifyAllTabs;
-    const verifyTabForest = winlayout.verifyTabForest;
+    pub const verifyTabForest = winlayout.verifyTabForest;
     const widgetMatchesNode = winlayout.widgetMatchesNode;
     const saveLayoutToDefault = winlayout.saveLayoutToDefault;
 
@@ -1323,182 +1330,10 @@ pub const Window = struct {
         @import("welcome.zig").open(self);
     }
 
-    /// Quake-mode toggle (`sketerm --toggle`): hide when shown and
-    /// focused, else show and present. Hide rather than minimize: a
-    /// layer surface has no minimize at all, and Wayland has no
-    /// unminimize request either, so a reveal from a minimized
-    /// xdg-toplevel hung on an activation token the `--toggle` process
-    /// never holds, while a fresh map is honoured everywhere. Hiding
-    /// keeps the widget tree, the panes and their sessions; only the
-    /// wl_surface goes, and `TerminalSurface` treats a re-realize as
-    /// routine.
-    pub fn toggleQuake(self: *Window) void {
-        const window: *c.GtkWindow = @ptrCast(@alignCast(self.app_window));
-        // gtk_window_is_active is "has focus AND is visible", so a
-        // shown-but-unfocused window is raised, not hidden.
-        const mapped = c.gtk_widget_get_mapped(self.app_window) != 0;
-        const active = c.gtk_window_is_active(window) != 0;
-        if (mapped and active) {
-            c.gtk_widget_set_visible(self.app_window, 0);
-            return;
-        }
-        // Re-resolve on every reveal: with `quake_monitor = active`
-        // the target follows the user, and monitors come and go.
-        self.applyQuakeGeometry();
-        c.gtk_widget_set_visible(self.app_window, 1);
-        c.gtk_window_present(window);
-    }
-
-    /// Whether this build has gtk4-layer-shell at all (`-Dlayer-shell`,
-    /// Linux only): the decls exist exactly when the TranslateC step
-    /// included its header, so every layer call sits behind this.
-    const quake_layer_shell = @hasDecl(c, "gtk_layer_init_for_window");
-
-    /// Place the primary window per the `quake_*` config: through the
-    /// layer surface when the compositor has wlr-layer-shell, else the
-    /// xdg-toplevel fallback (size, plus `fullscreen_on_monitor` at
-    /// full coverage -- the one GTK4 call that names a monitor; the
-    /// edge cannot be applied there at all, see `ui/quake.zig`). Runs
-    /// from `init` before the first map, on every reveal, and on a
-    /// config apply that moved a quake key. With quake switched off
-    /// the fallback window is unfullscreened; a window that already
-    /// became a layer surface stays one until the next start, which
-    /// is said on stderr.
-    pub fn applyQuakeGeometry(self: *Window) void {
-        if (!self.is_primary) return;
-        const window: *c.GtkWindow = @ptrCast(@alignCast(self.app_window));
-        if (!self.config.quake_enabled) {
-            if (quakeIsLayerWindow(window)) {
-                std.debug.print("sketerm: quake_enabled = false takes effect at the next start (the window is a layer surface)\n", .{});
-                return;
-            }
-            c.gtk_window_unfullscreen(window);
-            return;
-        }
-        const monitor = self.quakeMonitor();
-        var geo: c.GdkRectangle = .{ .x = 0, .y = 0, .width = 0, .height = 0 };
-        if (monitor) |m| c.gdk_monitor_get_geometry(m, &geo);
-        if (geo.width <= 0 or geo.height <= 0) return;
-        const placement = quake.place(
-            .{ .x = geo.x, .y = geo.y, .w = geo.width, .h = geo.height },
-            self.config.quake_width_percent,
-            self.config.quake_height_percent,
-            self.config.quake_edge,
-        );
-        if (self.quakeLayerApply(window, monitor, placement)) return;
-
-        if (placement.coversMonitor()) {
-            if (monitor) |m| {
-                c.gtk_window_fullscreen_on_monitor(window, m);
-                return;
-            }
-            c.gtk_window_fullscreen(window);
-            return;
-        }
-        c.gtk_window_unfullscreen(window);
-        c.gtk_window_set_default_size(window, placement.rect.w, placement.rect.h);
-    }
-
-    /// True when the window has been initialised as a layer surface.
-    fn quakeIsLayerWindow(window: *c.GtkWindow) bool {
-        if (comptime !quake_layer_shell) return false;
-        return c.gtk_layer_is_layer_window(window) != 0;
-    }
-
-    /// Layer-shell half of `applyQuakeGeometry`: true when the window
-    /// is (or just became) a layer surface and `placement` went through
-    /// it. False on a build without gtk4-layer-shell, on X11, and on a
-    /// compositor without zwlr_layer_shell_v1 (`gtk_layer_is_supported`
-    /// is the runtime check; it also comes back false when the library
-    /// was linked behind libwayland-client, which build.zig's link
-    /// order prevents).
-    ///
-    /// The role is taken when GTK asks for the surface's xdg role at
-    /// map time, so a window that is already mapped when quake is
-    /// switched on (config apply) is hidden around the init and shown
-    /// again once the placement is set. The reverse has no API: once a
-    /// layer surface, always one, until the next start.
-    ///
-    /// Layer OVERLAY, not TOP: a drop-down summoned by a hotkey must
-    /// show over a fullscreen window too, and it is unmapped when not
-    /// in use, so it never permanently covers anything. Keyboard mode
-    /// ON_DEMAND, not EXCLUSIVE: the surface takes focus when it maps
-    /// and gives it up when the user clicks elsewhere, so a half-height
-    /// terminal does not lock the keyboard away from the window under
-    /// it. No exclusive zone: nothing gets pushed aside.
-    fn quakeLayerApply(self: *Window, window: *c.GtkWindow, monitor: ?*c.GdkMonitor, placement: quake.Placement) bool {
-        if (comptime !quake_layer_shell) return false;
-        var remap = false;
-        if (c.gtk_layer_is_layer_window(window) == 0) {
-            if (c.gtk_layer_is_supported() == 0) return false;
-            remap = c.gtk_widget_get_mapped(self.app_window) != 0;
-            if (remap) c.gtk_widget_set_visible(self.app_window, 0);
-            c.gtk_layer_init_for_window(window);
-            c.gtk_layer_set_namespace(window, "sketerm-quake");
-            c.gtk_layer_set_layer(window, c.GTK_LAYER_SHELL_LAYER_OVERLAY);
-            c.gtk_layer_set_keyboard_mode(window, c.GTK_LAYER_SHELL_KEYBOARD_MODE_ON_DEMAND);
-            c.gtk_layer_set_exclusive_zone(window, 0);
-        }
-        // `active` is the compositor's choice (null output = the
-        // focused output on KWin and wlroots), which is what a
-        // drop-down that follows the user means; the pixel size still
-        // came from the best-known monitor. Only a CHANGED monitor is
-        // set: the library remaps a mapped surface on every set.
-        const spec = quake.parseMonitor(self.config.quake_monitor);
-        const want: ?*c.GdkMonitor = if (spec == .active) null else monitor;
-        const have: ?*c.GdkMonitor = c.gtk_layer_get_monitor(window);
-        if (have != want) c.gtk_layer_set_monitor(window, want);
-        c.gtk_layer_set_anchor(window, c.GTK_LAYER_SHELL_EDGE_LEFT, @intFromBool(placement.anchors.left));
-        c.gtk_layer_set_anchor(window, c.GTK_LAYER_SHELL_EDGE_RIGHT, @intFromBool(placement.anchors.right));
-        c.gtk_layer_set_anchor(window, c.GTK_LAYER_SHELL_EDGE_TOP, @intFromBool(placement.anchors.top));
-        c.gtk_layer_set_anchor(window, c.GTK_LAYER_SHELL_EDGE_BOTTOM, @intFromBool(placement.anchors.bottom));
-        // Centring on the unpinned axis is the protocol's own rule for
-        // a single anchored edge, so no margins are needed for it.
-        c.gtk_window_set_default_size(window, placement.layer_w, placement.layer_h);
-        if (remap) {
-            c.gtk_widget_set_visible(self.app_window, 1);
-            c.gtk_window_present(window);
-        }
-        return true;
-    }
-
-    /// The `GdkMonitor` `quake_monitor` names, or null when the
-    /// display has none. Ownership: `g_list_model_get_item` returns a
-    /// ref we drop immediately — the display owns its monitors and
-    /// outlives any use here.
-    fn quakeMonitor(self: *Window) ?*c.GdkMonitor {
-        const display = c.gtk_widget_get_display(self.app_window) orelse return null;
-        const spec = quake.parseMonitor(self.config.quake_monitor);
-        if (spec == .active) {
-            if (c.gtk_native_get_surface(@ptrCast(@alignCast(self.app_window)))) |surface| {
-                if (c.gdk_display_get_monitor_at_surface(display, surface)) |m| return m;
-            }
-        }
-        const monitors = c.gdk_display_get_monitors(display) orelse return null;
-        const n = c.g_list_model_get_n_items(@ptrCast(@alignCast(monitors)));
-        if (n == 0) return null;
-        const wanted: u32 = switch (spec) {
-            .index => |i| i,
-            .connector => |name| blk: {
-                var i: u32 = 0;
-                while (i < n) : (i += 1) {
-                    const item = c.g_list_model_get_item(@ptrCast(@alignCast(monitors)), i) orelse continue;
-                    defer c.g_object_unref(item);
-                    const conn = c.gdk_monitor_get_connector(@ptrCast(@alignCast(item)));
-                    if (conn != null and std.mem.eql(u8, std.mem.span(conn), name)) break :blk i;
-                }
-                break :blk 0;
-            },
-            // `active` only lands here when the window has no surface
-            // yet (first show), where the first monitor is the best
-            // guess available.
-            .active, .primary => 0,
-        };
-        const idx = if (wanted < n) wanted else 0;
-        const item = c.g_list_model_get_item(@ptrCast(@alignCast(monitors)), idx) orelse return null;
-        c.g_object_unref(item);
-        return @ptrCast(@alignCast(item));
-    }
+    // ── Quake mode: winquake.zig ─────────────────────────────────
+    const winquake = @import("winquake.zig");
+    pub const toggleQuake = winquake.toggleQuake;
+    pub const applyQuakeGeometry = winquake.applyQuakeGeometry;
 
     /// Spawn a new shell pane and add it as a tab.
     /// If title == null, a "Tab N" default is used.
@@ -1506,439 +1341,32 @@ pub const Window = struct {
         return self.newShellTabWithProfile(title_opt, null);
     }
 
-    /// New tab whose pane wears the file-browser face (the shell
-    /// session underneath stays one toolbar click away).
-    pub fn newBrowserTab(self: *Window) !void {
-        try self.newBrowserTabAt(null);
-    }
-
-    /// Browser tab starting at `spec` (host-qualified allowed); null
-    /// = the focused pane's location.
-    pub fn newBrowserTabAt(self: *Window, spec: ?[]const u8) !void {
-        try self.newBrowserTabFrom(self.focusedPane(), spec);
-    }
-
-    /// Browser tab starting at `spec`, else at `origin`'s host-qualified
-    /// location. `origin` is the pane the request came FROM (the
-    /// invoking pane for `sketerm files --tab`), never the pane that
-    /// ends up wearing the browser face.
-    pub fn newBrowserTabFrom(self: *Window, origin: ?*Pane, spec: ?[]const u8) !void {
-        return self.newBrowserTabFromReveal(origin, spec, null);
-    }
-
-    pub fn newBrowserTabFromReveal(self: *Window, origin: ?*Pane, spec: ?[]const u8, reveal: ?[]const u8) !void {
-        var spec_buf: [@import("browser.zig").SPEC_BUF_LEN]u8 = undefined;
-        const start_spec: ?[]const u8 = if (spec) |s|
-            files_entry.startLocation(&spec_buf, s)
-        else if (origin) |p|
-            paneBrowserSpec(p, &spec_buf)
-        else
-            null;
-        // Take the pane the tab spawn APPENDED, exactly like
-        // newBrowserSplit: focus does not reliably sit on the fresh
-        // pane, and attaching to the focused one turned a PRE-EXISTING
-        // pane into a browser while the new tab kept an unused shell.
-        const before = self.panes.items.len;
-        try self.newShellTab("Files");
-        if (self.panes.items.len <= before) return error.TabSpawnFailed;
-        const pane = self.panes.items[self.panes.items.len - 1];
-        const bv = @import("browser.zig").BrowserView.attach(self.allocator, pane, start_spec) catch |err| {
-            logActionError("new_browser_tab attach", err);
-            return err;
-        };
-        self.installBrowserHooks(bv);
-        if (reveal) |target| bv.queueReveal(target);
-    }
-
-    /// New tab whose pane wears the WEB face (src/ui/webface.zig): a
-    /// browser view served by the `sketerm-webengine` helper. The shell
-    /// session underneath stays one toolbar click away, exactly like
-    /// the file-browser and editor faces.
-    pub fn newWebTab(self: *Window) !void {
-        try self.newWebTabAt(null);
-    }
-
-    /// Web tab opening `url`; null = an empty address bar. Also the
-    /// landing point for a page's popup request (target=_blank).
-    pub fn newWebTabAt(self: *Window, url: ?[]const u8) !void {
-        // "Always open this site in X" applies to a fresh tab too — a
-        // popup or an external link to an assigned site must land in its
-        // identity, not in the default jar.
-        const assigned = @import("webface.zig").containerForUrl(url, 0);
-        if (assigned != 0) return self.newWebTabInContainer(assigned, url);
-        // Same appended-pane rule as newBrowserTabFromReveal: focus
-        // does not reliably sit on the fresh pane.
-        const before = self.panes.items.len;
-        try self.newShellTab("Web");
-        if (self.panes.items.len <= before) return error.TabSpawnFailed;
-        const pane = self.panes.items[self.panes.items.len - 1];
-        _ = @import("webface.zig").WebFace.attach(self.allocator, pane, url) catch |err| {
-            logActionError("new_web_tab attach", err);
-            return err;
-        };
-    }
-
-    /// Web tab created inside an identity container (`container` = 0 is
-    /// the default context). The container's accent colors the tab.
-    pub fn newWebTabInContainer(self: *Window, container: u32, url: ?[]const u8) !void {
-        const webface = @import("webface.zig");
-        const before = self.panes.items.len;
-        try self.newShellTab("Web");
-        if (self.panes.items.len <= before) return error.TabSpawnFailed;
-        const pane = self.panes.items[self.panes.items.len - 1];
-        _ = webface.WebFace.attachContainer(self.allocator, pane, url, container) catch |err| {
-            logActionError("new_web_tab_in_container attach", err);
-            return err;
-        };
-        // Accent the tab with the container color.
-        if (webface.containerColor(container)) |rgb| {
-            if (tabPageForPane(self, pane)) |page| self.setTabColor(page, rgb);
-        }
-    }
-
-    /// Open a web tab in a fresh throwaway incognito container.
-    pub fn newIncognitoWebTab(self: *Window) !void {
-        const webface = @import("webface.zig");
-        const id = webface.createIncognito(self.allocator);
-        if (id == 0) return error.ContainerCreateFailed;
-        try self.newWebTabInContainer(id, null);
-    }
-
-    /// Web tab born on `route` (src/web/route.zig), `url` loaded in
-    /// that route's instance from the first request on. Unlike opening
-    /// a tab and then moving it, no request ever takes the direct path.
-    pub fn newWebTabRouted(self: *Window, url: ?[]const u8, route: @import("../web/route.zig").Spec) !void {
-        const before = self.panes.items.len;
-        try self.newShellTab("Web");
-        if (self.panes.items.len <= before) return error.TabSpawnFailed;
-        const pane = self.panes.items[self.panes.items.len - 1];
-        _ = @import("webface.zig").WebFace.attachRouted(self.allocator, pane, url, route) catch |err| {
-            logActionError("new_web_tab_routed attach", err);
-            return err;
-        };
-    }
-
-    /// `new_tor_web_tab`: a blank tab on the Tor route. A missing or
-    /// malformed `mux_tor_socks_endpoint` is said in a toast rather
-    /// than becoming a direct tab.
-    pub fn newTorWebTab(self: *Window) !void {
-        const webface = @import("webface.zig");
-        const spec = @import("../web/route.zig").Choice.tor.spec("", webface.torEndpoint()) orelse {
-            showToast(self, "Tor is not configured: mux_tor_socks_endpoint must be a host:port.");
-            return error.InvalidRoute;
-        };
-        try self.newWebTabRouted(null, spec);
-    }
-
-    /// Fill this window with the web tabs a `sketerm web [urls...]`
-    /// invocation asked for: one tab per address, or a single blank tab
-    /// (address entry focused) when none were given. `route` is the
-    /// `--route` text every tab is born on; null = the configured
-    /// default. Text outside the grammar was refused by the CLI parser,
-    /// so a null here after a non-null text can only be a Tor endpoint
-    /// that stopped being valid, and that is refused too.
-    pub fn openWebTabs(self: *Window, urls: []const []u8, route: ?[]const u8) !void {
-        const webroute = @import("../web/route.zig");
-        const spec: ?webroute.Spec = if (route) |r|
-            webroute.Spec.parse(r, @import("webface.zig").torEndpoint()) orelse {
-                showToast(self, "That --route cannot be started: check mux_tor_socks_endpoint.");
-                return error.InvalidRoute;
-            }
-        else
-            null;
-        if (urls.len == 0) {
-            if (spec) |s| return self.newWebTabRouted(null, s);
-            return self.newWebTabAt(null);
-        }
-        for (urls) |url| {
-            if (spec) |s| try self.newWebTabRouted(url, s) else try self.newWebTabAt(url);
-        }
-    }
-
-    /// A repeat launch of the browser identity (`sketerm web` again):
-    /// another web window, the way a browser behaves.
-    pub fn openWebWindow(self: *Window, urls: []const []u8, route: ?[]const u8) !*Window {
-        const win = self.spawnSecondaryWindow() orelse return error.WindowSpawnFailed;
-        try win.openWebTabs(urls, route);
-        return win;
-    }
-
-    /// Split the focused pane and give the new pane a web face.
-    pub fn newWebSplit(self: *Window, orient: c_uint) !void {
-        const source = self.focusedPane() orelse return error.SplitFailed;
-        try self.newWebSplitOn(source, orient);
-    }
-
-    /// Split a SPECIFIC pane and give the new pane a web face. Remote
-    /// callers (`web-open` where=split) name the pane, or resolve one
-    /// deterministically, rather than trusting wherever GTK focus sits
-    /// at the moment a socket request lands.
-    pub fn newWebSplitOn(self: *Window, source: *Pane, orient: c_uint) !void {
-        const before = self.panes.items.len;
-        try self.splitPane(source, orient);
-        if (self.panes.items.len <= before) return error.SplitFailed;
-        const pane = self.panes.items[self.panes.items.len - 1];
-        _ = @import("webface.zig").WebFace.attach(self.allocator, pane, null) catch |err| {
-            logActionError("new_web_split attach", err);
-            return err;
-        };
-    }
-
-    /// `web_discard_background`: let go of every web page that is not
-    /// on screen, right now. The panes keep their last frame; each
-    /// reloads when it is next looked at.
-    pub fn discardBackgroundWebTabs(self: *Window) void {
-        const webface = @import("webface.zig");
-        if (!webface.discardSupported()) {
-            showToast(self, "The browser helper in use cannot discard pages.");
-            return;
-        }
-        const n = webface.discardBackground();
-        if (n == 0) {
-            showToast(self, "No background web pages to discard.");
-            return;
-        }
-        var buf: [96]u8 = undefined;
-        const msg = std.fmt.bufPrintZ(&buf, "Discarded {d} background web page{s}.", .{
-            n,
-            if (n == 1) "" else "s",
-        }) catch return;
-        showToast(self, msg);
-    }
-
-    /// A palette verb that only means something on a pane wearing the
-    /// WEB face. A pane without one is told so, rather than left
-    /// wondering why the action did nothing.
-    pub fn webFaceAction(self: *Window, what: enum { devtools, print_pdf, fill_password, site_info, route_menu, route_direct, route_tor }) void {
-        const pane = self.focusedPane() orelse return;
-        const face = @import("webface.zig").WebFace.fromPane(pane) orelse {
-            showToast(self, "This pane has no web page. Use New Web Tab.");
-            return;
-        };
-        switch (what) {
-            .devtools => face.openDevTools(),
-            .print_pdf => face.printToPdf(),
-            .fill_password => face.fillPassword(),
-            .site_info => face.showSiteInfo(),
-            .route_menu => face.showRouteMenu(face.route_btn),
-            .route_direct => face.chooseRoute(.direct),
-            .route_tor => face.chooseRoute(.tor),
-        }
-    }
-
-    /// Split `source` and give the new pane a web face bound to an
-    /// EXISTING helper-side view — the inspector `devtools_show`
-    /// minted for the page in `source` (src/ui/webface.zig).
-    ///
-    /// `splitPane`, not `splitFocused`: the reply that brings the view
-    /// id arrives from the socket, by which time focus may sit
-    /// anywhere, and splitting the wrong pane would put DevTools
-    /// beside a page it does not inspect.
-    pub fn openDevToolsSplit(self: *Window, source: *Pane, view: u32) !void {
-        // The inspector view lives on the SOURCE face's helper (which
-        // may be a remote one); the new face must attach to that same
-        // client or its frames would never find it.
-        const src_face = @import("webface.zig").WebFace.fromPane(source) orelse return error.NoWebFace;
-        const before = self.panes.items.len;
-        try self.splitPane(source, @intCast(c.GTK_ORIENTATION_HORIZONTAL));
-        if (self.panes.items.len <= before) return error.SplitFailed;
-        const pane = self.panes.items[self.panes.items.len - 1];
-        _ = @import("webface.zig").WebFace.attachView(self.allocator, pane, view, src_face.cl) catch |err| {
-            logActionError("web_devtools attach", err);
-            return err;
-        };
-    }
-
-    /// New tab whose pane wears the text-editor face (the shell
-    /// session underneath stays one toolbar click away).
-    pub fn newEditorTab(self: *Window) !void {
-        try self.newEditorTabAt(null);
-    }
-
-    /// Editor tab opening `spec` (host-qualified allowed); null = an
-    /// empty Untitled buffer.
-    pub fn newEditorTabAt(self: *Window, spec: ?[]const u8) !void {
-        // Same appended-pane rule as newBrowserTabFromReveal.
-        const before = self.panes.items.len;
-        try self.newShellTab("Editor");
-        if (self.panes.items.len <= before) return error.TabSpawnFailed;
-        const pane = self.panes.items[self.panes.items.len - 1];
-        _ = @import("editorview.zig").EditorView.attach(self.allocator, pane, spec) catch |err| {
-            logActionError("new_editor_tab attach", err);
-            return err;
-        };
-    }
-
-    /// Split the focused pane and give the new pane an editor face,
-    /// on the same empty Untitled buffer `new_editor_tab` starts from.
-    pub fn newEditorSplit(self: *Window, orient: c_uint) !void {
-        // Take the pane the split APPENDED: focus may still sit on the
-        // source pane, and attaching there would turn an existing pane
-        // into an editor instead of the new one.
-        const before = self.panes.items.len;
-        try self.splitFocused(orient);
-        if (self.panes.items.len <= before) return error.SplitFailed;
-        const pane = self.panes.items[self.panes.items.len - 1];
-        _ = @import("editorview.zig").EditorView.attach(self.allocator, pane, null) catch |err| {
-            logActionError("new_editor_split attach", err);
-            return err;
-        };
-    }
-
-    /// Put an editor face on `pane` itself (the browser's "Edit in
-    /// Sketerm Editor"). A pane already wearing one gains a document
-    /// tab instead (attach handles that).
-    pub fn openEditorOn(self: *Window, pane: *Pane, spec: ?[]const u8) !void {
-        _ = try @import("editorview.zig").EditorView.attach(self.allocator, pane, spec);
-    }
-
-    /// Unsaved editor tabs across every pane of this window.
-    pub fn editorDirtyTotal(self: *Window) usize {
-        var n: usize = 0;
-        for (self.panes.items) |p| {
-            if (@import("editorview.zig").EditorView.fromPane(p)) |ev| n += ev.dirtyCount();
-        }
-        return n;
-    }
-
-    /// Put a browser face on `pane` itself (`sketerm files --here`):
-    /// the pane's shell stays alive underneath, one toolbar click away.
-    /// A pane that ALREADY wears a browser face gains a browser tab
-    /// instead -- re-attaching is a no-op that would silently drop the
-    /// requested location.
-    pub fn openBrowserHere(self: *Window, pane: *Pane, spec: ?[]const u8) !void {
-        const browser_mod = @import("browser.zig");
-        var spec_buf: [browser_mod.SPEC_BUF_LEN]u8 = undefined;
-        const start_spec: ?[]const u8 = if (spec) |s|
-            files_entry.startLocation(&spec_buf, s)
-        else
-            paneBrowserSpec(pane, &spec_buf);
-        if (browser_mod.BrowserView.fromPane(pane)) |bv| {
-            if (start_spec) |s| _ = bv.newTabSpec(s);
-            return;
-        }
-        const bv = try browser_mod.BrowserView.attach(self.allocator, pane, start_spec);
-        self.installBrowserHooks(bv);
-    }
-
-    /// Split the focused pane and give the new pane a browser face:
-    /// the way a dual-pane (source/target) layout is created.
-    pub fn newBrowserSplit(self: *Window, orient: c_uint) !void {
-        // Outlives the block: currentSpec writes into the caller's buffer.
-        var spec_buf: [@import("browser.zig").SPEC_BUF_LEN]u8 = undefined;
-        const start_cwd: ?[]const u8 = blk: {
-            const focused = self.focusedPane() orelse break :blk null;
-            if (@import("browser.zig").BrowserView.fromPane(focused)) |bv| break :blk bv.currentSpec(&spec_buf);
-            break :blk paneBrowserSpec(focused, &spec_buf);
-        };
-        // Take the pane the split APPENDED: focus may still sit on the
-        // source pane's browser widget, and attaching there would be a
-        // no-op on the pane that already has a browser.
-        const before = self.panes.items.len;
-        try self.splitFocused(orient);
-        if (self.panes.items.len <= before) return error.SplitFailed;
-        const pane = self.panes.items[self.panes.items.len - 1];
-        const bv = @import("browser.zig").BrowserView.attach(self.allocator, pane, start_cwd) catch |err| {
-            logActionError("new_browser_split attach", err);
-            return err;
-        };
-        self.installBrowserHooks(bv);
-    }
-
-    /// The process-shared durable transfer service, acquired on first
-    /// use. Null only when the ledger directory is unusable.
-    pub fn transferService(self: *Window) ?*file_transfers.Service {
-        if (self.file_transfer_service == null) {
-            self.file_transfer_service = file_transfers.acquire(
-                self.allocator,
-                @ptrCast(self),
-                &browserTransferNotify,
-            ) catch null;
-        }
-        return self.file_transfer_service;
-    }
-
-    /// Give a browser face its window-level abilities: durable
-    /// terminal tabs on any host, and app-forwarded remote opens.
-    pub fn installBrowserHooks(self: *Window, bv: *@import("browser.zig").BrowserView) void {
-        bv.transfer_service = self.transferService();
-        // Client-mediated transfers need a browser face with both host
-        // connections; the service hands over any whose owner is gone.
-        if (self.file_transfer_service) |service|
-            service.addMediatedDriver(
-                @ptrCast(bv),
-                &@import("browser/jobs.zig").adoptMediated,
-                &@import("browser/ops.zig").adoptPasteBatch,
-                &@import("browser/jobs.zig").refreshJobsPanel,
-            );
-        bv.hooks_ctx = @ptrCast(self);
-        bv.on_peer = &browserPeerCb;
-        bv.on_host_term = &browserHostTermCb;
-        bv.on_host_open = &browserHostOpenCb;
-        bv.on_host_exec = &browserHostExecCb;
-    }
-
-    /// The other browser face in `pane`'s tab, from the pane-tree
-    /// MODEL (correct while a pane is zoomed). Exactly two browser
-    /// faces make a dual-pane pair; with more, the first other one
-    /// wins so the destination stays deterministic.
-    fn browserPeerCb(ctx: *anyopaque, pane: *Pane) ?*@import("browser.zig").BrowserView {
-        const self: *Window = @ptrCast(@alignCast(ctx));
-        const page = tabPageForPane(self, pane) orelse return null;
-        const tree = Window.tabTreeOf(page) orelse return null;
-        var leaves: std.ArrayList(*Pane) = .empty;
-        defer leaves.deinit(self.allocator);
-        tree.appendLeaves(self.allocator, &leaves) catch return null;
-        for (leaves.items) |leaf| {
-            if (leaf == pane) continue;
-            if (@import("browser.zig").BrowserView.fromPane(leaf)) |bv| return bv;
-        }
-        return null;
-    }
-
-    fn browserTransferNotify(ctx: *anyopaque, text: []const u8) void {
-        const self: *Window = @ptrCast(@alignCast(ctx));
-        showToast(self, text);
-    }
-
-    fn browserHostTermCb(ctx: *anyopaque, host: []const u8, path: []const u8) void {
-        const self: *Window = @ptrCast(@alignCast(ctx));
-        const h: ?[]const u8 = if (host.len > 0) host else null;
-        self.newDurableSessionAt(h, path) catch |err|
-            logActionError("browser terminal-here", err);
-    }
-
-    fn browserHostExecCb(ctx: *anyopaque, host: []const u8, cmdline: []const u8) void {
-        const self: *Window = @ptrCast(@alignCast(ctx));
-        const h: ?[]const u8 = if (host.len > 0) host else null;
-        const argv = [_][]const u8{ "/bin/sh", "-c", cmdline };
-        self.launchRemoteAppSession(h, &argv, false) catch |err|
-            logActionError("browser action-exec", err);
-    }
-
-    /// Open a path with the HOST's desktop opener. Which opener that is
-    /// can only be decided on the host: `host` may be a Mac (`open`) or
-    /// a Linux box (`xdg-open`), and so may this machine, so the choice
-    /// cannot be made from our own `builtin.os.tag`. Hardcoding
-    /// `xdg-open` made this menu item do nothing at all, silently,
-    /// against every macOS host including localhost.
-    ///
-    /// The last branch exists so a host with NEITHER opener says so on
-    /// stderr and exits non-zero, rather than looking like a success.
-    const host_open_sh =
-        \\if command -v xdg-open >/dev/null 2>&1; then exec xdg-open "$1"; fi
-        \\if command -v open >/dev/null 2>&1; then exec open "$1"; fi
-        \\echo "sketerm: no xdg-open or open on this host" >&2
-        \\exit 127
-    ;
-
-    fn browserHostOpenCb(ctx: *anyopaque, host: []const u8, path: []const u8) void {
-        const self: *Window = @ptrCast(@alignCast(ctx));
-        const h: ?[]const u8 = if (host.len > 0) host else null;
-        const argv = [_][]const u8{ "/bin/sh", "-c", host_open_sh, "sketerm-open", path };
-        self.launchRemoteAppSession(h, &argv, false) catch |err|
-            logActionError("browser open-on-host", err);
-    }
+    // ── Face tabs and splits: winfaces.zig ─────────────────────────
+    const winfaces = @import("winfaces.zig");
+    pub const newBrowserTab = winfaces.newBrowserTab;
+    pub const newBrowserTabFrom = winfaces.newBrowserTabFrom;
+    pub const newBrowserTabFromReveal = winfaces.newBrowserTabFromReveal;
+    pub const newWebTab = winfaces.newWebTab;
+    pub const newWebTabAt = winfaces.newWebTabAt;
+    pub const newWebTabInContainer = winfaces.newWebTabInContainer;
+    pub const newIncognitoWebTab = winfaces.newIncognitoWebTab;
+    pub const newTorWebTab = winfaces.newTorWebTab;
+    pub const openWebTabs = winfaces.openWebTabs;
+    pub const openWebWindow = winfaces.openWebWindow;
+    pub const newWebSplit = winfaces.newWebSplit;
+    pub const newWebSplitOn = winfaces.newWebSplitOn;
+    pub const discardBackgroundWebTabs = winfaces.discardBackgroundWebTabs;
+    pub const webFaceAction = winfaces.webFaceAction;
+    pub const openDevToolsSplit = winfaces.openDevToolsSplit;
+    pub const newEditorTab = winfaces.newEditorTab;
+    pub const newEditorTabAt = winfaces.newEditorTabAt;
+    pub const newEditorSplit = winfaces.newEditorSplit;
+    pub const openEditorOn = winfaces.openEditorOn;
+    pub const editorDirtyTotal = winfaces.editorDirtyTotal;
+    pub const openBrowserHere = winfaces.openBrowserHere;
+    pub const newBrowserSplit = winfaces.newBrowserSplit;
+    pub const transferService = winfaces.transferService;
+    pub const installBrowserHooks = winfaces.installBrowserHooks;
 
     pub fn newShellTabWithProfile(self: *Window, title_opt: ?[*:0]const u8, profile_name: ?[]const u8) !void {
         var num_buf: [32]u8 = undefined;
@@ -2438,7 +1866,7 @@ pub const Window = struct {
         if (self.search.pane == pane) self.closeSearch();
         if (self.hints.pane == pane) self.exitHints();
         if (self.copymode.pane == pane) self.exitCopyMode();
-        if (opts.unzoom_always or self.zoom_pane == pane) self.unzoomPane();
+        if (opts.unzoom_always or self.zoom.pane == pane) self.unzoomPane();
         self.dropNotifySlotsForPane(pane);
         for (self.panes.items, 0..) |p, idx| {
             if (p == pane) {
@@ -2757,7 +2185,7 @@ pub const Window = struct {
     /// splits collapse cleanly with NO reparenting (reparenting would
     /// unrealize the GLArea and tear down its GL context).
     pub fn toggleZoomPane(self: *Window) void {
-        if (self.zoom_pane != null) {
+        if (self.zoom.pane != null) {
             self.unzoomPane();
             return;
         }
@@ -2777,7 +2205,7 @@ pub const Window = struct {
                     // matter what happens to the tree in between.
                     _ = c.g_object_ref(sib);
                     c.gtk_widget_set_visible(sib, 0);
-                    self.zoom_hidden.append(self.allocator, sib) catch {
+                    self.zoom.hidden.append(self.allocator, sib) catch {
                         c.gtk_widget_set_visible(sib, 1);
                         c.g_object_unref(sib);
                     };
@@ -2785,21 +2213,21 @@ pub const Window = struct {
             }
             w = parent;
         }
-        if (self.zoom_hidden.items.len == 0) return; // single pane — nothing to zoom
-        self.zoom_pane = pane;
+        if (self.zoom.hidden.items.len == 0) return; // single pane — nothing to zoom
+        self.zoom.pane = pane;
         termsinks_mod.titleFactChanged(self, pane, .zoom);
         _ = c.gtk_widget_grab_focus(@ptrCast(pane.surface.area));
     }
 
     pub fn unzoomPane(self: *Window) void {
-        const pane = self.zoom_pane orelse return;
-        self.zoom_pane = null;
+        const pane = self.zoom.pane orelse return;
+        self.zoom.pane = null;
         termsinks_mod.titleFactChanged(self, pane, .zoom);
-        for (self.zoom_hidden.items) |w| {
+        for (self.zoom.hidden.items) |w| {
             c.gtk_widget_set_visible(w, 1);
             c.g_object_unref(w);
         }
-        self.zoom_hidden.clearRetainingCapacity();
+        self.zoom.hidden.clearRetainingCapacity();
         _ = c.gtk_widget_grab_focus(@ptrCast(pane.surface.area));
     }
 
@@ -4003,356 +3431,32 @@ pub const Window = struct {
         c.adw_tab_view_set_page_pinned(self.tab_view, page, if (is_pinned) 0 else 1);
     }
 
-    // ── Tree-style tabs (model: src/ui/tabforest.zig, sidebar:
-    //    src/ui/tabsidebar.zig) ──────────────────────────────────────
+    // ── Tree-style tabs: wintabforest.zig ────────────────────────
+    const wintabforest = @import("wintabforest.zig");
+    pub const childInsertPos = wintabforest.childInsertPos;
+    pub const forestChanged = wintabforest.forestChanged;
+    pub const setTabCollapsed = wintabforest.setTabCollapsed;
+    pub const closeTabSubtree = wintabforest.closeTabSubtree;
+    pub const moveTabToNewWindow = wintabforest.moveTabToNewWindow;
+    pub const tabForestReparent = wintabforest.tabForestReparent;
+    pub const tabForestMoveNextTo = wintabforest.tabForestMoveNextTo;
+    pub const toggleTabSidebarVisibility = wintabforest.toggleTabSidebarVisibility;
+    pub const setTabSidebarVisible = wintabforest.setTabSidebarVisible;
+    pub const browserPagesInSidebar = wintabforest.browserPagesInSidebar;
+    pub const selectedTabPane = wintabforest.selectedTabPane;
+    pub const sidebarGroup = wintabforest.sidebarGroup;
+    pub const sidebarListsGroup = wintabforest.sidebarListsGroup;
+    pub const webGroupChanged = wintabforest.webGroupChanged;
+    pub const sidebarRefresh = wintabforest.sidebarRefresh;
+    pub const sidebarRefreshSelection = wintabforest.sidebarRefreshSelection;
+    pub const sidebarNoteWebTitle = wintabforest.sidebarNoteWebTitle;
+    pub const newTabInBrowser = wintabforest.newTabInBrowser;
+    pub const collapseCurrentTab = wintabforest.collapseCurrentTab;
+    pub const tabTreeStep = wintabforest.tabTreeStep;
+    pub const newWebTabFrom = wintabforest.newWebTabFrom;
+    pub const newWebTabObserving = wintabforest.newWebTabObserving;
+    pub const newWebTabForView = wintabforest.newWebTabForView;
 
-    fn childInsertPos(self: *const Window) tabforest_mod.InsertPos {
-        return switch (self.config.tab_child_insert) {
-            .last => .last,
-            .first => .first,
-        };
-    }
-
-    /// Refresh every view of the tab forest after a mutation: the
-    /// strip's hidden state, the sidebar rows, and (under
-    /// SKETERM_VERIFY_TREE) the model/view cross-check.
-    pub fn forestChanged(self: *Window) void {
-        if (self.destroying) return;
-        self.tabbar.refreshHidden();
-        if (self.tab_sidebar) |sb| {
-            if (c.gtk_widget_get_visible(sb.root) != 0) sb.rebuild();
-        }
-        // Forest-only verify: forestChanged fires from page-attached,
-        // BEFORE appendOrInsertTab has attached the new page's
-        // PaneTree — the pane-tree check would warn spuriously there.
-        self.verifyTabForest();
-    }
-
-    /// Collapse / expand a tab's subtree. Collapsing pulls the
-    /// selection up to the collapsed tab if it sat inside the hidden
-    /// subtree (TST behaviour), and offers the newly hidden WEB panes
-    /// to the discard path — a collapsed subtree is the natural
-    /// unload candidate.
-    pub fn setTabCollapsed(self: *Window, page: *c.AdwTabPage, collapsed: bool) void {
-        self.tab_forest.setCollapsed(page, collapsed);
-        if (collapsed) {
-            if (c.adw_tab_view_get_selected_page(self.tab_view)) |sel| {
-                if (self.tab_forest.isHidden(sel))
-                    c.adw_tab_view_set_selected_page(self.tab_view, page);
-            }
-            self.discardCollapsedWebPanes(page);
-        }
-        self.forestChanged();
-    }
-
-    /// Close a tab and its whole subtree, regardless of the
-    /// `tab_close_parent` setting (the context menu's explicit verb).
-    /// Deepest-first so each close only ever promotes an empty child
-    /// list; every member still gets its own dirty-editor veto.
-    pub fn closeTabSubtree(self: *Window, page: *c.AdwTabPage) void {
-        var subtree: std.ArrayList(*c.AdwTabPage) = .empty;
-        defer subtree.deinit(self.allocator);
-        self.tab_forest.appendSubtree(self.allocator, page, &subtree) catch return;
-        self.closing_subtree = true;
-        defer self.closing_subtree = false;
-        var i = subtree.items.len;
-        while (i > 0) {
-            i -= 1;
-            _ = c.adw_tab_view_close_page(self.tab_view, subtree.items[i]);
-        }
-    }
-
-    /// Move one tab into a fresh window (the strip drag-out, as a
-    /// menu verb). The PaneTree travels with the page as qdata.
-    pub fn moveTabToNewWindow(self: *Window, page: *c.AdwTabPage) void {
-        if (c.adw_tab_view_get_n_pages(self.tab_view) <= 1) return;
-        const win = self.spawnSecondaryWindow() orelse return;
-        if (!win.transferPageFrom(self.tab_view, page, 0))
-            win.destroyToplevel();
-    }
-
-    /// Discard the web pages of every pane hidden by collapsing
-    /// `page`'s subtree (the descendants, not the collapsed tab
-    /// itself). Panes without a web face are untouched; discard keeps
-    /// the last frame and revives on next look, so this is free.
-    fn discardCollapsedWebPanes(self: *Window, page: *c.AdwTabPage) void {
-        const webface = @import("webface.zig");
-        if (!webface.discardSupported()) return;
-        var subtree: std.ArrayList(*c.AdwTabPage) = .empty;
-        defer subtree.deinit(self.allocator);
-        self.tab_forest.appendSubtree(self.allocator, page, &subtree) catch return;
-        if (subtree.items.len <= 1) return;
-        for (subtree.items[1..]) |desc| {
-            const t = tabTreeOf(desc) orelse continue;
-            var leaves: std.ArrayList(*Pane) = .empty;
-            defer leaves.deinit(self.allocator);
-            t.appendLeaves(self.allocator, &leaves) catch continue;
-            for (leaves.items) |pane| {
-                if (webface.WebFace.fromPane(pane)) |face| _ = face.discardNow();
-            }
-        }
-    }
-
-    /// Reparent `page` (subtree and all) under `new_parent`, or to
-    /// the root level when null — the sidebar drag-drop entry point.
-    pub fn tabForestReparent(self: *Window, page: *c.AdwTabPage, new_parent: ?*c.AdwTabPage) void {
-        self.tab_forest.reparent(page, new_parent, self.childInsertPos()) catch |err| {
-            if (err == error.WouldCycle)
-                showToast(self, "Cannot drop a tab into its own subtree.");
-            return;
-        };
-        self.forestChanged();
-    }
-
-    /// Move `page` next to `anchor` among the anchor's siblings — the
-    /// sidebar's drop-between-rows gesture. Only the FOREST order moves;
-    /// the AdwTabView strip keeps its own flat order (see tabforest.zig).
-    pub fn tabForestMoveNextTo(self: *Window, page: *c.AdwTabPage, anchor: *c.AdwTabPage, after: bool) void {
-        self.tab_forest.moveNextTo(page, anchor, after) catch |err| {
-            if (err == error.WouldCycle)
-                showToast(self, "Cannot drop a tab into its own subtree.");
-            return;
-        };
-        self.forestChanged();
-    }
-
-    /// Show / hide the vertical tree-style tab sidebar
-    /// (toggle_tab_sidebar action; startup state = show_tab_sidebar).
-    pub fn toggleTabSidebarVisibility(self: *Window) void {
-        const sb = self.tab_sidebar orelse return;
-        const visible = c.gtk_widget_get_visible(sb.root) != 0;
-        self.sidebar_user_set = true;
-        self.applyTabSidebarVisible(!visible);
-    }
-
-    /// The sidebar's visibility is also its MODE switch: while it is
-    /// showing, a browser's pages live in it and new tabs go there;
-    /// while it is hidden, a browser falls back to its own in-pane tab
-    /// strip and new tabs are window tabs. So every show/hide has to
-    /// re-ask each browser to redraw its chrome.
-    /// Follow the configured default. A window whose sidebar the user
-    /// set by hand keeps its own state, so editing the preference (or
-    /// any other config write triggering a reload) never overrides a
-    /// deliberate per-window choice.
-    pub fn setTabSidebarVisible(self: *Window, show: bool) void {
-        if (self.sidebar_user_set) return;
-        self.applyTabSidebarVisible(show);
-    }
-
-    /// Apply visibility to THIS window only. Never writes
-    /// `show_tab_sidebar` back to config: that key is the new-window
-    /// default, and persisting a runtime toggle into it is what used to
-    /// flip the sidebar in every other window on the next reload.
-    pub fn applyTabSidebarVisible(self: *Window, show: bool) void {
-        const sb = self.tab_sidebar orelse return;
-        c.gtk_widget_set_visible(sb.root, @intFromBool(show));
-        if (show) {
-            // A GtkPaned forgets a position set while its start child
-            // was hidden (the file browser's places sidebar hit this
-            // too) — re-assert the saved width as it comes back.
-            c.gtk_paned_set_position(@ptrCast(self.content_box), self.config.tab_sidebar_width);
-            // Rows are not rebuilt while hidden; catch up on reveal.
-            sb.rebuild();
-        }
-        self.refreshWebGroupChrome();
-        @import("prefs.zig").noteTabSidebarVisibility(@ptrCast(self), show);
-    }
-
-    /// Arm (or re-arm) the debounced config.conf write. The single
-    /// entry point for every in-app config mutation that persists.
-    pub fn scheduleConfigSave(self: *Window) void {
-        if (self.config_save.source != 0)
-            _ = c.g_source_remove(self.config_save.source);
-        const source = c.g_timeout_add(400, @ptrCast(&onConfigSaveTick), @ptrCast(self));
-        self.config_save.scheduled(source);
-    }
-
-    /// True while the tree sidebar is the tab surface for browsers:
-    /// pages of a browser are listed there, and "new tab" inside a
-    /// browser means a new page rather than a new window tab.
-    pub fn browserPagesInSidebar(self: *Window) bool {
-        // A popup window has no tab surface at all: its one page is
-        // the whole window.
-        if (self.popup_window) return false;
-        const sb = self.tab_sidebar orelse return false;
-        return c.gtk_widget_get_visible(sb.root) != 0;
-    }
-
-    /// The pane the selected tab is focused on — which face the sidebar
-    /// and the new-tab action are talking about. `last_focused` is
-    /// validated the way tabchrome does it: a closed pane's address can
-    /// be reused, so the pointer must still be a live pane of THIS tab.
-    pub fn selectedTabPane(self: *Window) ?*Pane {
-        const page = c.adw_tab_view_get_selected_page(self.tab_view) orelse return null;
-        const child = c.adw_tab_page_get_child(page) orelse return null;
-        if (tabTreeOf(page)) |t| {
-            if (t.last_focused) |lf| {
-                for (self.panes.items) |p| {
-                    if (p == lf and widgetIsAncestor(@ptrCast(child), p.widget())) return p;
-                }
-            }
-        }
-        for (self.panes.items) |p| {
-            if (widgetIsAncestor(@ptrCast(child), p.widget())) return p;
-        }
-        return null;
-    }
-
-    /// The browser whose pages the sidebar should be listing, or null
-    /// when the selected tab is not a browser (then the sidebar shows
-    /// the window's own tab tree, as before).
-    pub fn sidebarGroup(self: *Window) ?*webgroup.Group {
-        if (self.destroying) return null;
-        if (!self.browserPagesInSidebar()) return null;
-        const pane = self.selectedTabPane() orelse return null;
-        if (!pane.webFaceVisible()) return null;
-        return webgroup.Group.fromPane(pane);
-    }
-
-    /// Is `g` the group the sidebar is currently listing? A group that
-    /// is answers with rows in the sidebar and hides its own strip.
-    pub fn sidebarListsGroup(self: *Window, g: *webgroup.Group) bool {
-        if (!self.browserPagesInSidebar()) return false;
-        const cur = self.sidebarGroup() orelse return false;
-        return cur == g;
-    }
-
-    /// A browser's page list changed (page opened, closed, reordered).
-    pub fn webGroupChanged(self: *Window, g: *webgroup.Group) void {
-        if (self.destroying) return;
-        if (self.sidebarListsGroup(g)) {
-            if (self.tab_sidebar) |sb| sb.rebuild();
-        }
-        g.refreshChrome();
-    }
-
-    /// Re-resolve what the sidebar should be showing. Called when the
-    /// selected tab or the focused pane changes — either can swap the
-    /// sidebar between the window tree and a browser's pages.
-    pub fn sidebarRefresh(self: *Window) void {
-        if (self.destroying) return;
-        const sb = self.tab_sidebar orelse return;
-        if (c.gtk_widget_get_visible(sb.root) == 0) return;
-        sb.rebuild();
-        self.refreshWebGroupChrome();
-    }
-
-    pub fn sidebarRefreshSelection(self: *Window) void {
-        if (self.destroying) return;
-        const sb = self.tab_sidebar orelse return;
-        if (c.gtk_widget_get_visible(sb.root) == 0) return;
-        sb.refreshSelection();
-    }
-
-    /// One page's title changed: update just its row rather than
-    /// rebuilding the list under the user's pointer.
-    pub fn sidebarNoteWebTitle(self: *Window, face: *@import("webface.zig").WebFace) void {
-        if (self.destroying) return;
-        const sb = self.tab_sidebar orelse return;
-        if (c.gtk_widget_get_visible(sb.root) == 0) return;
-        sb.noteWebTitle(face);
-    }
-
-    /// Every browser in this window re-decides whether to draw its own
-    /// tab strip (it does when the sidebar is not listing it).
-    fn refreshWebGroupChrome(self: *Window) void {
-        for (self.panes.items) |p| {
-            if (webgroup.Group.fromPane(p)) |g| g.refreshChrome();
-        }
-    }
-
-    /// "New tab" while a browser owns the sidebar means a new PAGE in
-    /// that browser. Answers true when it handled the request.
-    pub fn newTabInBrowser(self: *Window) bool {
-        if (!self.browserPagesInSidebar()) return false;
-        const g = self.sidebarGroup() orelse return false;
-        _ = g.newPage(null, g.active()) catch return false;
-        return true;
-    }
-
-    /// tab_collapse / tab_expand on the selected tab. Collapsing a
-    /// tab without children is a no-op rather than a surprise.
-    pub fn collapseCurrentTab(self: *Window, collapse: bool) void {
-        // Act on the tree the user can SEE. While the sidebar lists a
-        // browser's pages, folding the window's tab tree instead would
-        // move something invisible.
-        if (self.sidebarGroup()) |g| {
-            const face = g.active() orelse return;
-            if (g.forest.find(face) == null) return;
-            if (collapse and !g.forest.hasChildren(face)) return;
-            g.forest.setCollapsed(face, collapse);
-            if (self.tab_sidebar) |sb| sb.rebuild();
-            return;
-        }
-        const page = c.adw_tab_view_get_selected_page(self.tab_view) orelse return;
-        if (collapse and !self.tab_forest.hasChildren(page)) return;
-        self.setTabCollapsed(page, collapse);
-    }
-
-    /// tab_tree_next / tab_tree_prev: walk the VISIBLE tree order
-    /// (collapsed subtrees skipped), wrapping at the ends.
-    pub fn tabTreeStep(self: *Window, forward: bool) void {
-        // Same rule as collapseCurrentTab: step through whichever tree
-        // the sidebar is showing.
-        if (self.sidebarGroup()) |g| {
-            const face = g.active() orelse return;
-            const next = (g.forest.stepVisible(self.allocator, face, forward) catch return) orelse return;
-            g.setActive(next);
-            return;
-        }
-        const page = c.adw_tab_view_get_selected_page(self.tab_view) orelse return;
-        const next = (self.tab_forest.stepVisible(self.allocator, page, forward) catch return) orelse return;
-        c.adw_tab_view_set_selected_page(self.tab_view, next);
-    }
-
-    /// Web tab nested under `opener` in the tab tree (a page popup or
-    /// an open-link-in-new-tab from that tab). The pending parent is
-    /// consumed by the page-attached handler minting the forest node.
-    pub fn newWebTabFrom(self: *Window, url: ?[]const u8, opener: ?*c.AdwTabPage) !void {
-        self.forest_pending_parent = opener;
-        defer self.forest_pending_parent = null;
-        try self.newWebTabAt(url);
-    }
-
-    /// Web tab PRESENTING an assistant's page (`webwatch.zig`): the
-    /// first page of a watch, its face observing alias `view` on the
-    /// watch's client. Returns the pane the tab was built around.
-    pub fn newWebTabObserving(self: *Window, watch: *@import("webwatch.zig").Watch, view: u32) !*Pane {
-        const before = self.panes.items.len;
-        try self.newShellTab("Web");
-        if (self.panes.items.len <= before) return error.TabSpawnFailed;
-        const pane = self.panes.items[self.panes.items.len - 1];
-        _ = @import("webface.zig").WebFace.attachObserved(self.allocator, pane, view, watch.cl, @ptrCast(watch)) catch |err| {
-            logActionError("watch attach", err);
-            return err;
-        };
-        if (@import("webgroup.zig").Group.fromPane(pane)) |g| g.watch = @ptrCast(watch);
-        pane.refreshLeaseChip();
-        return pane;
-    }
-
-    /// Web tab PRESENTING a view the helper already created -- a real
-    /// popup, whose page is already loading with its opener intact.
-    /// Nothing is navigated here: navigating would replace the document
-    /// the engine opened and, with it, the relationship it exists for.
-    pub fn newWebTabForView(
-        self: *Window,
-        view: u32,
-        on: *@import("webface.zig").Client,
-        opener: ?*c.AdwTabPage,
-        how: @import("webface.zig").WebFace.PopupPresentation,
-    ) !void {
-        self.forest_pending_parent = opener;
-        defer self.forest_pending_parent = null;
-        const before = self.panes.items.len;
-        try self.newShellTab("Web");
-        if (self.panes.items.len <= before) return error.TabSpawnFailed;
-        const pane = self.panes.items[self.panes.items.len - 1];
-        _ = @import("webface.zig").WebFace.attachPopupView(self.allocator, pane, view, on, how) catch |err| {
-            logActionError("popup attach", err);
-            return err;
-        };
-    }
 };
 
 fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
@@ -4537,180 +3641,11 @@ pub fn dispatchAction(window: *Window, action: @import("input.zig").Action) void
     onShortcut(@ptrCast(window), action);
 }
 
-/// Carries its own allocator: the picker's cancel callback can fire
-/// during window teardown, and freeing must not go through `win`.
-const ScreenshotCtx = struct {
-    win: *Window,
-    pane: *Pane,
-    allocator: std.mem.Allocator,
-};
-
-/// "Record Session (asciicast)…" — pick a .cast destination, then ask
-/// the daemon to start recording the focused pane's session. The file
-/// is written by the daemon: for SSH/UDP sessions the picked path is
-/// interpreted on the REMOTE host.
-fn recordFocusedSession(self: *Window) void {
-    const pane = self.focusedPane() orelse return;
-    if (pane.terminal.remote == null) return;
-    const ctx = self.allocator.create(ScreenshotCtx) catch return;
-    ctx.* = .{ .win = self, .pane = pane, .allocator = self.allocator };
-    _ = picker.PickerWindow.open(
-        self.allocator,
-        @ptrCast(self.app_window),
-        .{
-            .mode = .save_file,
-            .title = "Record Session As",
-            .suggested_name = "session.cast",
-            .filters = &.{.{ .label = "Asciicasts", .patterns = &.{"*.cast"} }},
-        },
-        &onRecordPicked,
-        @ptrCast(ctx),
-    ) catch {
-        self.allocator.destroy(ctx);
-        return;
-    };
-}
-
-fn onRecordPicked(user: ?*anyopaque, result: ?fpicker.Result) void {
-    const ctx = cast.userData(ScreenshotCtx, user);
-    defer ctx.allocator.destroy(ctx);
-    const res = result orelse return;
-    if (res.specs.len == 0) return;
-
-    // The pane may have closed while the dialog was up.
-    var alive = false;
-    for (ctx.win.panes.items) |p| {
-        if (p == ctx.pane) {
-            alive = true;
-            break;
-        }
-    }
-    if (!alive) return;
-    // The wire carries a BARE path the session's own daemon resolves,
-    // with no way to say "on host X" — so a pick from some third host
-    // has no meaning here and is refused rather than silently written
-    // somewhere else. A plain path keeps the pre-picker behaviour.
-    const path = picker.localPathOrRefuse(
-        @ptrCast(ctx.win.app_window),
-        res.specs[0],
-        "A recording path is resolved by the session's own host — pick a plain path instead.",
-    ) orelse return;
-    ctx.pane.terminal.requestRecordStart(path);
-}
-
-/// "Screenshot Pane…" — render the focused pane to a PNG the user
-/// picks a destination for.
-fn screenshotFocusedPane(self: *Window) void {
-    const pane = self.focusedPane() orelse return;
-    const ctx = self.allocator.create(ScreenshotCtx) catch return;
-    ctx.* = .{ .win = self, .pane = pane, .allocator = self.allocator };
-    _ = picker.PickerWindow.open(
-        self.allocator,
-        @ptrCast(self.app_window),
-        .{
-            .mode = .save_file,
-            .title = "Save Pane Screenshot",
-            .suggested_name = "sketerm.png",
-            .filters = &.{.{ .label = "PNG images", .patterns = &.{"*.png"} }},
-        },
-        &onScreenshotPicked,
-        @ptrCast(ctx),
-    ) catch {
-        self.allocator.destroy(ctx);
-        return;
-    };
-}
-
-fn onScreenshotPicked(user: ?*anyopaque, result: ?fpicker.Result) void {
-    const ctx = cast.userData(ScreenshotCtx, user);
-    defer ctx.allocator.destroy(ctx);
-    const res = result orelse return;
-    if (res.specs.len == 0) return;
-
-    // The pane may have closed while the dialog was up.
-    var alive = false;
-    for (ctx.win.panes.items) |p| {
-        if (p == ctx.pane) {
-            alive = true;
-            break;
-        }
-    }
-    if (!alive) return;
-    // The PNG bytes are written by this process — a remote pick has
-    // no local file to write to.
-    const path = picker.localPathOrRefuse(
-        @ptrCast(ctx.win.app_window),
-        res.specs[0],
-        "Sketerm writes the screenshot itself — pick a location on this machine.",
-    ) orelse return;
-    const bytes = ctx.pane.screenshotPng() orelse return;
-    defer c.g_bytes_unref(bytes);
-    var pz: [4096]u8 = undefined;
-    const path_z = pathZ(&pz, path) catch return;
-    const file = c.g_file_new_for_path(path_z) orelse return;
-    defer c.g_object_unref(file);
-    var gerr: [*c]c.GError = null;
-    // g_file_replace_contents wants the raw buffer; pull it from GBytes.
-    var sz: c.gsize = 0;
-    const ptr = c.g_bytes_get_data(bytes, &sz);
-    _ = c.g_file_replace_contents(file, @ptrCast(ptr), sz, null, 0, c.G_FILE_CREATE_NONE, null, null, &gerr);
-    if (gerr != null) c.g_error_free(gerr);
-}
-
-/// Carries its own allocator for the same reason ScreenshotCtx does.
-const UploadPickCtx = struct {
-    win: *Window,
-    pane: *Pane,
-    allocator: std.mem.Allocator,
-};
-
-/// "Upload File…" — pick a local file, then stream it to the focused
-/// remote pane's session (which writes it into the shell's cwd).
-fn openUploadDialog(self: *Window) void {
-    const pane = self.focusedPane() orelse return;
-    if (pane.terminal.remote == null) return; // remote panes only
-    const ctx = self.allocator.create(UploadPickCtx) catch return;
-    ctx.* = .{ .win = self, .pane = pane, .allocator = self.allocator };
-    _ = picker.PickerWindow.open(
-        self.allocator,
-        @ptrCast(self.app_window),
-        .{
-            .mode = .open_file,
-            .title = "Upload File to Remote",
-            .accept_label = "Upload",
-        },
-        &onUploadFilePicked,
-        @ptrCast(ctx),
-    ) catch {
-        self.allocator.destroy(ctx);
-        return;
-    };
-}
-
-fn onUploadFilePicked(user: ?*anyopaque, result: ?fpicker.Result) void {
-    const ctx = cast.userData(UploadPickCtx, user);
-    defer ctx.allocator.destroy(ctx);
-    const res = result orelse return;
-    if (res.specs.len == 0) return;
-
-    // The pane may have closed while the dialog was up.
-    var alive = false;
-    for (ctx.win.panes.items) |p| {
-        if (p == ctx.pane) {
-            alive = true;
-            break;
-        }
-    }
-    if (!alive) return;
-    // startUpload reads the bytes HERE and streams them to the pane's
-    // session; there is no local file behind a remote pick.
-    const path = picker.localPathOrRefuse(
-        @ptrCast(ctx.win.app_window),
-        res.specs[0],
-        "The upload reads the file from this machine — pick a local file.",
-    ) orelse return;
-    ctx.pane.terminal.startUpload(&[_][]const u8{path});
-}
+// ── Destination/source pickers: winpickers.zig ────────────────
+const winpickers = @import("winpickers.zig");
+const recordFocusedSession = winpickers.recordFocusedSession;
+const screenshotFocusedPane = winpickers.screenshotFocusedPane;
+const openUploadDialog = winpickers.openUploadDialog;
 
 /// Float a transient toast over the grid (transfer finished / failed).
 pub fn showToast(self: *Window, text: []const u8) void {
@@ -5475,12 +4410,6 @@ fn onSidebarPosition(_: *c.GObject, _: ?*anyopaque, user: ?*anyopaque) callconv(
     if (w == self.config.tab_sidebar_width) return;
     self.config.tab_sidebar_width = w;
     self.scheduleConfigSave();
-}
-
-fn onConfigSaveTick(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const self = cast.userData(Window, user);
-    if (self.config_save.fired()) @import("winconfig.zig").persistConfig(self);
-    return 0; // G_SOURCE_REMOVE
 }
 
 pub fn widgetIsAncestor(ancestor: *c.GtkWidget, w: *c.GtkWidget) bool {

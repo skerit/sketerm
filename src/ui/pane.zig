@@ -128,6 +128,39 @@ pub const MousePrefs = struct {
     mouse_autohide: bool = true,
 };
 
+/// macOS only: the SketermTermAXElement exposing this pane's text to
+/// VoiceOver, and the GdkMacos content NSView it is attached to.
+/// Attached on map, detached on unmap/close. Opaque `NSObject *`.
+pub const MacAx = struct {
+    element: ?*anyopaque = null,
+    content_view: ?*anyopaque = null,
+    /// One-shot SKETERM_A11Y_SELFCHECK reporting guard.
+    selfcheck_done: bool = false,
+};
+
+/// How a pane presents its session's forwarded app windows.
+pub const AppView = struct {
+    /// Current primary AppHost of an app session (erased *AppHost;
+    /// pane installs its embed box + callbacks on it).
+    host: ?*anyopaque = null,
+    /// Container hosting the embedded (in-tab, interactive) app view
+    /// — the AppHost reparents its window overlay into this.
+    embed_box: ?*c.GtkWidget = null,
+    /// True while the embedded view is showing (terminal hidden).
+    embed_active: bool = false,
+    /// Config app_view pushed by the Window: embed apps in the tab
+    /// (true) or float them with a banner tab (false, default).
+    view_tab: bool = false,
+    /// This pane was placed in a tab by an EXPLICIT request (assistant
+    /// Watch / Take control, "Show in Tab"), not by app_view policy.
+    /// Config reapply must not re-derive `view_tab` over it, or a
+    /// preference save silently pops the watched view back out.
+    view_tab_forced: bool = false,
+    /// Any floating (non-embedded) app window is open across the
+    /// session's app channels.
+    windows_open: bool = false,
+};
+
 pub const Pane = struct {
     /// Stable monotonic id for remote-control addressing. Assigned
     /// by Window before the PTY spawn so the child env can carry it.
@@ -137,13 +170,8 @@ pub const Pane = struct {
     /// heap-allocated Pane) and drives it through its public API.
     surface: TerminalSurface,
     terminal: *Terminal,
-    /// macOS only: the SketermTermAXElement exposing this pane's text to
-    /// VoiceOver, and the GdkMacos content NSView it is attached to.
-    /// Attached on map, detached on unmap/close. Opaque `NSObject *`.
-    ax_element: ?*anyopaque = null,
-    ax_content_view: ?*anyopaque = null,
-    /// One-shot SKETERM_A11Y_SELFCHECK reporting guard.
-    ax_selfcheck_done: bool = false,
+    /// macOS NSAccessibility attachment (`attachA11y`).
+    ax: MacAx = .{},
     allocator: std.mem.Allocator,
     input_ctx: ?*input.Ctx = null,
     /// Pane -> Window forwarding (terminal sinks, focus, child exit).
@@ -223,27 +251,10 @@ pub const Pane = struct {
     /// view (mirror of the session's forwarded windows) is shown.
     offload_widget: ?*c.GtkWidget = null,
     offload_guard: @import("offload.zig").Guard = .{},
-    /// Current primary AppHost of an app session (erased *AppHost;
-    /// pane installs its embed box + callbacks on it).
-    app_host: ?*anyopaque = null,
-    /// Container hosting the embedded (in-tab, interactive) app view
-    /// — the AppHost reparents its window overlay into this.
-    app_embed_box: ?*c.GtkWidget = null,
-    /// True while the embedded view is showing (terminal hidden).
-    app_embed_active: bool = false,
-    /// Config app_view pushed by the Window: embed apps in the tab
-    /// (true) or float them with a banner tab (false, default).
-    app_view_tab: bool = false,
-    /// This pane was placed in a tab by an EXPLICIT request (assistant
-    /// Watch / Take control, "Show in Tab"), not by app_view policy.
-    /// Config reapply must not re-derive `app_view_tab` over it, or a
-    /// preference save silently pops the watched view back out.
-    app_view_tab_forced: bool = false,
+    /// Forwarded-app presentation (embedded view, app_view policy).
+    app: AppView = .{},
     /// The per-pane title bar (src/ui/panetitlebar.zig).
     titlebar: panetitlebar.Titlebar = .{},
-    /// Any floating (non-embedded) app window is open across the
-    /// session's app channels.
-    app_windows_open: bool = false,
     /// User-locked title — when true, on_title sink drops incoming
     /// OSC 0/1/2 updates so the manual string sticks. Cleared via
     /// the menu's "Set Pane Title…" → empty input.
@@ -806,7 +817,7 @@ pub const Pane = struct {
     pub fn adoptAppHost(self: *Pane, host_opaque: *anyopaque) void {
         const AppHost = @import("../wlapp.zig").AppHost;
         const h: *AppHost = @ptrCast(@alignCast(host_opaque));
-        self.app_host = host_opaque;
+        self.app.host = host_opaque;
         h.embed_ctx = @ptrCast(self);
         h.on_embed = onAppEmbedChanged;
         h.on_request_embed = onAppRequestEmbed;
@@ -1125,12 +1136,12 @@ pub const Pane = struct {
     /// overlay lives inside it). Idempotent.
     pub fn detachAppHost(self: *Pane) void {
         const AppHost = @import("../wlapp.zig").AppHost;
-        if (self.app_host) |hp| {
+        if (self.app.host) |hp| {
             const h: *AppHost = @ptrCast(@alignCast(hp));
             h.releaseEmbed();
         }
-        self.app_host = null;
-        self.app_embed_active = false;
+        self.app.host = null;
+        self.app.embed_active = false;
     }
 
     /// Sever the terminal face's IM context NOW. Prefer `severFaces`;
@@ -1506,7 +1517,7 @@ fn onRenderRequest(ctx: ?*anyopaque) void {
     // activates its AT-SPI backend on demand. On macOS GTK has no
     // NSAccessibility backend, so poke our own element instead.
     if (platform.is_macos) {
-        if (self.ax_element) |el| {
+        if (self.ax.element) |el| {
             nsax.notifyChanged(el);
             updateA11yFrame(self);
             selfCheckA11y(self);
@@ -1525,14 +1536,14 @@ fn onRenderRequest(ctx: ?*anyopaque) void {
 /// the GdkMacosSurface has its NSWindow.
 fn attachA11y(self: *Pane) void {
     if (!platform.is_macos) return;
-    if (self.ax_element != null) return;
+    if (self.ax.element != null) return;
     const native = c.gtk_widget_get_native(@ptrCast(self.surface.area)) orelse return;
     const surface = c.gtk_native_get_surface(native) orelse return;
     const cv = nsax.contentView(@ptrCast(surface)) orelse return;
     const el = nsax.attach(cv, self.terminal) orelse return;
-    self.ax_content_view = cv;
-    self.ax_element = el;
-    self.ax_selfcheck_done = false;
+    self.ax.content_view = cv;
+    self.ax.element = el;
+    self.ax.selfcheck_done = false;
     updateA11yFrame(self);
 }
 
@@ -1540,17 +1551,17 @@ fn attachA11y(self: *Pane) void {
 /// next map re-attaches against the (possibly new) window.
 fn detachA11y(self: *Pane) void {
     if (!platform.is_macos) return;
-    const el = self.ax_element orelse return;
-    if (self.ax_content_view) |cv| nsax.detach(cv, el);
-    self.ax_element = null;
-    self.ax_content_view = null;
+    const el = self.ax.element orelse return;
+    if (self.ax.content_view) |cv| nsax.detach(cv, el);
+    self.ax.element = null;
+    self.ax.content_view = null;
 }
 
 /// Re-point the element's frame at the pane's on-screen rect (GTK
 /// widget coords relative to the window; the shim handles AppKit's flip).
 fn updateA11yFrame(self: *Pane) void {
     if (!platform.is_macos) return;
-    const el = self.ax_element orelse return;
+    const el = self.ax.element orelse return;
     const native = c.gtk_widget_get_native(@ptrCast(self.surface.area)) orelse return;
     var r: c.graphene_rect_t = undefined;
     const native_widget: *c.GtkWidget = @ptrCast(@alignCast(native));
@@ -1562,15 +1573,15 @@ fn updateA11yFrame(self: *Pane) void {
 /// find this pane's text via window→contentView→child. No TCC needed.
 fn selfCheckA11y(self: *Pane) void {
     if (!platform.is_macos) return;
-    if (self.ax_selfcheck_done) return;
+    if (self.ax.selfcheck_done) return;
     if (c.getenv("SKETERM_A11Y_SELFCHECK") == null) return;
-    const cv = self.ax_content_view orelse return;
-    const el = self.ax_element orelse return;
+    const cv = self.ax.content_view orelse return;
+    const el = self.ax.element orelse return;
     // Retry across renders until the screen has content (bit2), so a
     // first render that beats the shell prompt isn't a false FAIL.
     const bits = nsax.selfCheck(cv, el);
     if (bits == 7) {
-        self.ax_selfcheck_done = true;
+        self.ax.selfcheck_done = true;
         std.debug.print("A11Y-SELFCHECK: pane={d} bits={d} (PASS)\n", .{ self.id, bits });
     }
 }
@@ -1723,18 +1734,18 @@ fn onAppViewEvent(ctx: ?*anyopaque, host_opaque: ?*anyopaque) void {
         updateAppBanner(self);
         return;
     }
-    const old: ?*AppHost = @ptrCast(@alignCast(self.app_host));
+    const old: ?*AppHost = @ptrCast(@alignCast(self.app.host));
     const new: ?*AppHost = @ptrCast(@alignCast(host_opaque));
     if (old == new) return;
     if (old) |h| h.releaseEmbed();
-    self.app_host = host_opaque;
+    self.app.host = host_opaque;
     setAppEmbedActive(self, false);
     if (new) |h| {
         h.embed_ctx = @ptrCast(self);
         h.on_embed = onAppEmbedChanged;
         h.on_request_embed = onAppRequestEmbed;
         h.on_windows_changed = onAppWindowsChanged;
-        if (self.app_view_tab) installEmbedBox(self, h);
+        if (self.app.view_tab) installEmbedBox(self, h);
     } else {
         setAppBanner(self, false);
     }
@@ -1760,7 +1771,7 @@ fn onAppEmbedChanged(ctx: ?*anyopaque, active: bool) void {
 fn onAppRequestEmbed(ctx: ?*anyopaque) void {
     const self = cast.userData(Pane, ctx);
     const AppHost = @import("../wlapp.zig").AppHost;
-    const h: *AppHost = @ptrCast(@alignCast(self.app_host orelse return));
+    const h: *AppHost = @ptrCast(@alignCast(self.app.host orelse return));
     installEmbedBox(self, h);
     h.popIn();
 }
@@ -1811,28 +1822,28 @@ fn updateAppBanner(self: *Pane) void {
             open += na.host.windowCount();
         }
     }
-    setAppBanner(self, open > 0 and !self.app_embed_active);
+    setAppBanner(self, open > 0 and !self.app.embed_active);
 }
 
 /// Ensure the embed container exists and hand it to the host (the
 /// AppHost reparents its window overlay into it on the next embed).
 fn installEmbedBox(self: *Pane, host: *@import("../wlapp.zig").AppHost) void {
-    if (self.app_embed_box == null) {
+    if (self.app.embed_box == null) {
         const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
         c.gtk_widget_set_hexpand(box, 1);
         c.gtk_widget_set_vexpand(box, 1);
         c.gtk_widget_set_visible(box, 0);
         if (self.wrapper_box) |wrap| c.gtk_box_append(@ptrCast(wrap), box);
-        self.app_embed_box = box;
+        self.app.embed_box = box;
     }
-    host.embed_box = self.app_embed_box;
+    host.embed_box = self.app.embed_box;
 }
 
 /// Swap the embedded app view against the terminal (app log).
 fn setAppEmbedActive(self: *Pane, active: bool) void {
-    if (self.app_embed_active == active) return;
-    self.app_embed_active = active;
-    if (self.app_embed_box) |box| c.gtk_widget_set_visible(box, @intFromBool(active));
+    if (self.app.embed_active == active) return;
+    self.app.embed_active = active;
+    if (self.app.embed_box) |box| c.gtk_widget_set_visible(box, @intFromBool(active));
     if (self.offload_widget) |o| c.gtk_widget_set_visible(o, @intFromBool(!active));
 }
 
@@ -1868,7 +1879,7 @@ fn onBrowserBannerClick(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 /// (Absorbed the old "App window open — click to raise" banner; the
 /// strip's per-window buttons are the click-to-raise now.)
 fn setAppBanner(self: *Pane, show: bool) void {
-    self.app_windows_open = show;
+    self.app.windows_open = show;
     updateTitlebarActivity(self);
 }
 
@@ -1891,7 +1902,7 @@ fn rebuildTitlebarApps(self: *Pane) void {
     const box = self.titlebar.apps_box orelse return;
     while (c.gtk_widget_get_first_child(box)) |child| c.gtk_box_remove(@ptrCast(box), child);
     var buttons: usize = 0;
-    if (self.app_windows_open) {
+    if (self.app.windows_open) {
         if (self.terminal.remote) |remote| {
             for (remote.napps.items) |na| {
                 const infos = na.host.windowInfos(self.allocator);

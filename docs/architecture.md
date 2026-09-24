@@ -183,8 +183,8 @@ Summarized here; full detail in `docs/gpu.md`.
   `glUseProgram` silently renders nothing.
 - Surface GL resources (per-pane VBOs) are released in `unrealize`.
 - **Pane vs TerminalSurface.** `Pane` (src/ui/pane.zig) is the
-  interactive workspace cell: input, menus, faces, Window sinks,
-  split-tree participation. The rendering half — GtkGLArea +
+  interactive workspace cell: input, menus, faces (`Pane.faces`),
+  Window sinks (`Pane.sinks`), split-tree participation. The rendering half — GtkGLArea +
   lifecycle, all render passes, ImageStore, visual timers — is
   `TerminalSurface` (src/ui/terminal_surface.zig), composed by value
   inside Pane and reusable without it (e.g. a cast-playback viewer).
@@ -459,10 +459,26 @@ taskbar application and can be set as the system default browser.
 - `main.zig` — owns the `AdwApplication` and spawns windows.
 - `ui/window.zig` — owns `AdwApplicationWindow`, `AdwTabView`, and
   one `PaneTree` model per tab (`ui/tree.zig`, attached to its
-  `AdwTabPage` as qdata so it travels with a dragged tab).
+  `AdwTabPage` as qdata so it travels with a dragged tab). Window's
+  methods are split by responsibility into sibling modules that keep
+  the `*Window` receiver and are aliased back into the struct:
+  `winconfig.zig` (config apply, profiles, shaders, the debounced
+  config save), `winlayout.zig` (layout save/restore, tree
+  verification, the closed-tab ring `ClosedTabs`), `wintabforest.zig`
+  (tree-style tabs and the sidebar), `winfaces.zig` (tabs/splits that
+  open on a browser, web or editor face), `winquake.zig` (quake
+  placement), `winpickers.zig` (record / screenshot / upload pickers), `modes.zig` (search / hints / copy mode, each owning a
+  state struct: `Window.search`, `.hints`, `.copymode`), `muxtabs.zig`,
+  `remotectl.zig`, `tabchrome.zig` and `termsinks.zig`.
 - `ui/pane.zig` — owns one `Terminal`, one `TerminalSurface` (by
   value), and the pane's faces (file browser, editor, panel,
-  app embed, web).
+  app embed, web) as `Pane.faces` slots (`ui/paneface.zig`, which
+  also owns the two-phase face teardown `severFaces` drives). What the
+  pane forwards to its Window goes through ONE `Pane.sinks`
+  (`WindowSinks`: the owning Window plus the callbacks
+  `Window.wirePaneSinks` installs); the title bar is
+  `Pane.titlebar` (`ui/panetitlebar.zig`); forwarded-app presentation
+  is `Pane.app`, config-mirrored mouse flags `Pane.mouse`.
 - `ui/terminal_surface.zig` — owns the pane's `GtkGLArea` and its
   GL lifecycle, its `Atlas`, the render passes, one `ImageStore`,
   and the visual timers (cursor blink, trail, bell).

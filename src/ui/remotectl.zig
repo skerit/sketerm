@@ -1699,7 +1699,7 @@ pub fn appendTabInfos(
                 .rows = scr.rows,
                 .cols = scr.cols,
                 .focused = (p == focused),
-                .zoomed = (p == self.zoom_pane),
+                .zoomed = (p == self.zoom.pane),
             });
         }
         const title_c = c.adw_tab_page_get_title(page);

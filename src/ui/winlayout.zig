@@ -720,7 +720,7 @@ pub fn verifyTreeModel(self: *Window, page: *c.AdwTabPage, root_widget: *c.GtkWi
     };
     if (S.enabled == null) S.enabled = c.getenv("SKETERM_VERIFY_TREE") != null;
     if (!S.enabled.?) return;
-    if (self.zoom_pane != null) return;
+    if (self.zoom.pane != null) return;
     const t = Window.tabTreeOf(page) orelse {
         std.debug.print("sketerm: VERIFY: page has no tree model\n", .{});
         return;
