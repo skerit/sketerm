@@ -1119,12 +1119,12 @@ pub const TOOLS = [_]ToolDef{
         .group = .files,
         .mutates = true,
         .description =
-        \\Rename/move a file or directory on the same filesystem (rename(2) semantics). Cross-device moves: file_copy then file_delete_tree.
+        \\Rename/move a file or directory on the same filesystem. An existing destination is REFUSED (conflict) unless overwrite:true; the refusal is atomic on a current daemon. Cross-device moves: file_copy then file_delete_tree.
         ,
         .input_schema =
-        \\{"type":"object","properties":{"from":{"type":"string"},"to":{"type":"string"}},"required":["from","to"]}
+        \\{"type":"object","properties":{"from":{"type":"string"},"to":{"type":"string"},"overwrite":{"type":"boolean","description":"Replace an existing destination (default false: refused as a conflict)"}},"required":["from","to"]}
         ,
-        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"from\":{\"type\":\"string\"},\"to\":{\"type\":\"string\"},\"renamed\":{\"type\":\"boolean\"}" ++ "},\"required\":[\"from\",\"to\",\"renamed\"]}",
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"from\":{\"type\":\"string\"},\"to\":{\"type\":\"string\"},\"renamed\":{\"type\":\"boolean\"},\"overwrite\":{\"type\":\"boolean\",\"description\":\"Whether an existing destination could be replaced\"}" ++ "},\"required\":[\"from\",\"to\",\"renamed\"]}",
     },
     .{
         .name = "file_delete",
@@ -1143,10 +1143,10 @@ pub const TOOLS = [_]ToolDef{
         .group = .files,
         .mutates = true,
         .description =
-        \\Copy a file or a whole directory tree as a daemon-side JOB: runs in its own process, survives this MCP server, and is RESUMABLE — resume=true continues a previous interrupted copy from its hash-verified partial (a corrupted partial honestly restarts from zero; the reply's resumed_from says which happened). By default the call waits for completion (bounded); on timeout the job KEEPS RUNNING — check file_jobs, or cancel with file_job.
+        \\Copy a file or a whole directory tree as a daemon-side JOB: runs in its own process, survives this MCP server, and is RESUMABLE — resume=true continues a previous interrupted copy from its hash-verified partial (a corrupted partial honestly restarts from zero; the reply's resumed_from says which happened). An existing destination is REFUSED (conflict) unless overwrite:true. By default the call waits for completion (bounded); on timeout the job KEEPS RUNNING — check file_jobs, or cancel with file_job.
         ,
         .input_schema =
-        \\{"type":"object","properties":{"src":{"type":"string"},"dst":{"type":"string"},"resume":{"type":"boolean","description":"Continue from a previous interrupted copy's staged partial (content-verified)"},"wait":{"type":"boolean","description":"Wait for completion (default true; false returns the job id immediately)"},"timeout_ms":{"type":"integer","description":"Wait bound (default 60000, max 120000)"}},"required":["src","dst"]}
+        \\{"type":"object","properties":{"src":{"type":"string"},"dst":{"type":"string"},"overwrite":{"type":"boolean","description":"Replace an existing destination (default false: refused as a conflict before anything is copied)"},"resume":{"type":"boolean","description":"Continue from a previous interrupted copy's staged partial (content-verified)"},"wait":{"type":"boolean","description":"Wait for completion (default true; false returns the job id immediately)"},"timeout_ms":{"type":"integer","description":"Wait bound (default 60000, max 120000)"}},"required":["src","dst"]}
         ,
         .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"op\":{\"type\":\"string\"},\"job\":{\"type\":\"integer\"},\"status\":{\"type\":\"string\"},\"timed_out\":{\"type\":\"boolean\"},\"bytes\":{\"type\":\"integer\"},\"resumed_from\":{\"type\":\"integer\"},\"sha256\":{\"type\":\"string\"}" ++ "},\"required\":[\"op\",\"job\",\"status\"]}",
     },

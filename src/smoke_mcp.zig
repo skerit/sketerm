@@ -866,6 +866,21 @@ pub fn main(init: std.process.Init.Minimal) u8 {
                 fail("copy hash mismatch");
             const jl = m.callTool("file_jobs", "{}");
             if (std.mem.indexOf(u8, jl, "copy done") == null) fail("file_jobs missing the finished copy");
+            // Existing destinations are refused unless overwrite:true.
+            _ = m.callTool("file_write", std.fmt.bufPrint(&jb, "{{\"path\":\"{s}/c.txt\",\"content\":\"KEEP\"}}", .{fsd}) catch unreachable);
+            const cp_again = m.callTool("file_copy", std.fmt.bufPrint(&jb, "{{\"src\":\"{s}/a.txt\",\"dst\":\"{s}/c.txt\"}}", .{ fsd, fsd }) catch unreachable);
+            if (std.mem.indexOf(u8, cp_again, "\"code\":\"conflict\"") == null) {
+                std.debug.print("smoke-mcp: file_copy reply: {s}\n", .{cp_again});
+                fail("file_copy onto an existing file was not refused");
+            }
+            const mv_onto = m.callTool("file_rename", std.fmt.bufPrint(&jb, "{{\"from\":\"{s}/b.txt\",\"to\":\"{s}/c.txt\"}}", .{ fsd, fsd }) catch unreachable);
+            if (std.mem.indexOf(u8, mv_onto, "\"code\":\"conflict\"") == null) fail("file_rename onto an existing file was not refused");
+            const kept = m.callTool("file_read", std.fmt.bufPrint(&jb, "{{\"path\":\"{s}/c.txt\"}}", .{fsd}) catch unreachable);
+            if (std.mem.indexOf(u8, kept, "KEEP") == null) fail("a refused copy/rename changed the destination");
+            const cp_over = m.callTool("file_copy", std.fmt.bufPrint(&jb, "{{\"src\":\"{s}/a.txt\",\"dst\":\"{s}/c.txt\",\"overwrite\":true}}", .{ fsd, fsd }) catch unreachable);
+            if (std.mem.indexOf(u8, cp_over, "done: 14 bytes") == null) fail("file_copy overwrite:true failed");
+            const mv_over = m.callTool("file_rename", std.fmt.bufPrint(&jb, "{{\"from\":\"{s}/c.txt\",\"to\":\"{s}/b.txt\",\"overwrite\":true}}", .{ fsd, fsd }) catch unreachable);
+            if (std.mem.indexOf(u8, mv_over, "\"renamed\":true") == null) fail("file_rename overwrite:true failed");
             const del = m.callTool("file_delete", std.fmt.bufPrint(&jb, "{{\"path\":\"{s}/b.txt\"}}", .{fsd}) catch unreachable);
             if (std.mem.indexOf(u8, del, "deleted") == null) fail("file_delete failed");
             // Error honesty: missing path is an isError reply, not a lie.

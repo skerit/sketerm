@@ -148,7 +148,60 @@ pub fn fsErrCode(err: fsdrive.Error, detail: []const u8) ErrCode {
         // "NOENT" also matches the "ENOENT" spelling, which contains it.
         fsdrive.Error.FsOpFailed => if (std.mem.indexOf(u8, detail, "No such file") != null or
             std.mem.indexOf(u8, detail, "not found") != null or
-            std.mem.indexOf(u8, detail, "NOENT") != null) .not_found else .io_failed,
+            std.mem.indexOf(u8, detail, "NOENT") != null) .not_found else if (destinationExists(detail)) .conflict else .io_failed,
+    };
+}
+
+/// The daemon's "the destination already exists": EEXIST, the no-clobber
+/// rename's own EXIST, or a no-clobber copy job's "destination exists".
+fn destinationExists(detail: []const u8) bool {
+    return std.mem.indexOf(u8, detail, "EXIST") != null or
+        std.mem.indexOf(u8, detail, "File exists") != null or
+        std.mem.indexOf(u8, detail, "destination exists") != null;
+}
+
+/// Whether `path` exists, for a daemon too old to refuse a clobber
+/// itself. Null when that cannot be told: the caller then refuses
+/// rather than risk overwriting.
+fn pathExists(fs: *fsdrive.Fs, path: []const u8) ?bool {
+    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer scratch.deinit();
+    _ = fs.statPath(scratch.allocator(), path) catch |err| {
+        if (err == fsdrive.Error.FsOpFailed and fsErrCode(err, fs.lastErr()) == .not_found) return false;
+        return null;
+    };
+    return true;
+}
+
+/// The refusal for a destination that exists while `overwrite` is off.
+fn existsRes(arena: std.mem.Allocator, what: []const u8, path: []const u8) ![]const u8 {
+    return errRes(arena, .conflict, try std.fmt.allocPrint(
+        arena,
+        "{s} refused: {s} already exists and overwrite is off (pass overwrite:true to replace it)",
+        .{ what, path },
+    ));
+}
+
+/// How a no-clobber operation is guarded: atomically by the daemon, or,
+/// against a daemon too old for that, by a check made just before.
+const Guard = enum { overwrite, atomic, checked };
+
+/// Decide the guard for writing `dst`, refusing up front when a checked
+/// destination already exists (or cannot be checked).
+fn guardFor(fs: *fsdrive.Fs, args: std.json.Value, dst: []const u8) union(enum) { guard: Guard, exists, unknown } {
+    if (argBool(args, "overwrite")) return .{ .guard = .overwrite };
+    if (fs.conn.copy_no_replace) return .{ .guard = .atomic };
+    return switch (pathExists(fs, dst) orelse return .unknown) {
+        true => .exists,
+        false => .{ .guard = .checked },
+    };
+}
+
+fn guardNote(g: Guard) []const u8 {
+    return switch (g) {
+        .overwrite => "",
+        .atomic => "",
+        .checked => " (this daemon cannot refuse a clobber atomically; the destination was checked just before)",
     };
 }
 
@@ -190,7 +243,8 @@ fn fsAwaitJob(arena: std.mem.Allocator, fs: *fsdrive.Fs, job: u64, opname: []con
         const msg = std.fmt.allocPrint(arena, "{s} job {d} {s}: {s}", .{
             opname, job, if (end.canceled) "canceled" else "FAILED", end.messageText(),
         }) catch return error.OutOfMemory;
-        return errRes(arena, if (end.canceled) .conflict else .io_failed, msg);
+        const code: ErrCode = if (end.canceled or destinationExists(end.messageText())) .conflict else .io_failed;
+        return errRes(arena, code, msg);
     }
     var res = Res.init(arena);
     try res.fact("op", opname);
@@ -364,12 +418,22 @@ fn fileMkdir(arena: std.mem.Allocator, fs: *fsdrive.Fs, args: std.json.Value) ![
 fn fileRename(arena: std.mem.Allocator, fs: *fsdrive.Fs, args: std.json.Value) ![]const u8 {
     const from = argStr(args, "from") orelse return errRes(arena, .invalid_args, "missing from");
     const to = argStr(args, "to") orelse return errRes(arena, .invalid_args, "missing to");
-    fs.rename(from, to) catch |err| return fsFail(arena, fs, "rename", err);
+    const guard = switch (guardFor(fs, args, to)) {
+        .guard => |g| g,
+        .exists => return existsRes(arena, "rename", to),
+        .unknown => return fsFail(arena, fs, "rename (checking the destination)", fsdrive.Error.FsOpFailed),
+    };
+    const done = if (guard == .atomic) fs.renameNoReplace(from, to) else fs.rename(from, to);
+    done catch |err| {
+        if (guard != .overwrite and destinationExists(fs.lastErr())) return existsRes(arena, "rename", to);
+        return fsFail(arena, fs, "rename", err);
+    };
     var res = Res.init(arena);
     try res.fact("from", from);
     try res.fact("to", to);
     try res.fact("renamed", true);
-    try res.textf("renamed {s} to {s}", .{ from, to });
+    try res.fact("overwrite", guard == .overwrite);
+    try res.textf("renamed {s} to {s}{s}", .{ from, to, guardNote(guard) });
     return res.finish();
 }
 
@@ -518,6 +582,8 @@ const JobStart = union(enum) {
     job: u64,
     missing: []const u8,
     failed: fsdrive.Error,
+    /// The destination exists and the call did not ask to overwrite it.
+    exists: []const u8,
 
     fn of(r: fsdrive.Error!u64) JobStart {
         return if (r) |job| .{ .job = job } else |err| .{ .failed = err };
@@ -544,6 +610,7 @@ fn jobTool(comptime opname: []const u8, comptime start: fn (*fsdrive.Fs, std.jso
                 .job => |id| id,
                 .missing => |what| return errRes(arena, .invalid_args, try std.fmt.allocPrint(arena, "missing {s}", .{what})),
                 .failed => |err| return fsFail(arena, fs, opname, err),
+                .exists => |path| return existsRes(arena, opname, path),
             };
             const wait = if (args == .object and args.object.get("wait") != null) argBool(args, "wait") else true;
             if (!wait) {
@@ -562,7 +629,21 @@ fn jobTool(comptime opname: []const u8, comptime start: fn (*fsdrive.Fs, std.jso
 fn startCopy(fs: *fsdrive.Fs, args: std.json.Value) JobStart {
     const src = argStr(args, "src") orelse return .{ .missing = "src" };
     const dst = argStr(args, "dst") orelse return .{ .missing = "dst" };
-    return .of(fs.startCopy(src, dst, argBool(args, "resume")));
+    const resumable = argBool(args, "resume");
+    // The daemon's no-clobber copy never resumes a partial, so a resumed
+    // copy is guarded by the check instead: its destination does not
+    // exist yet (only the staged partial does).
+    const guard: Guard = if (resumable and !argBool(args, "overwrite")) switch (pathExists(fs, dst) orelse
+        return .{ .failed = fsdrive.Error.FsOpFailed }) {
+        true => return .{ .exists = dst },
+        false => .checked,
+    } else switch (guardFor(fs, args, dst)) {
+        .guard => |g| g,
+        .exists => return .{ .exists = dst },
+        .unknown => return .{ .failed = fsdrive.Error.FsOpFailed },
+    };
+    if (guard == .atomic) return .of(fs.startCopyMode(src, dst, .{ .no_replace = true }));
+    return .of(fs.startCopy(src, dst, resumable));
 }
 
 fn startDeleteTree(fs: *fsdrive.Fs, args: std.json.Value) JobStart {
@@ -590,6 +671,14 @@ fn startTrash(fs: *fsdrive.Fs, args: std.json.Value) JobStart {
 fn startHash(fs: *fsdrive.Fs, args: std.json.Value) JobStart {
     const path = argStr(args, "path") orelse return .{ .missing = "path" };
     return .of(fs.startHash(path));
+}
+
+test "an existing destination is a conflict in every spelling the daemon uses" {
+    const t = std.testing;
+    try t.expectEqual(ErrCode.conflict, fsErrCode(fsdrive.Error.FsOpFailed, "EXIST"));
+    try t.expectEqual(ErrCode.conflict, fsErrCode(fsdrive.Error.FsOpFailed, "EEXIST"));
+    try t.expect(destinationExists("copy job 3 FAILED: destination exists"));
+    try t.expect(!destinationExists("does not exist"));
 }
 
 test "fs failures carry the code their cause deserves" {
