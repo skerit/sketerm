@@ -1768,6 +1768,7 @@ pub const Terminal = struct {
         fresh.mute_responses = self.screen.mute_responses;
         fresh.allow_clipboard_read = self.screen.allow_clipboard_read;
         fresh.color_scheme_dark = self.screen.color_scheme_dark;
+        mux_snapshot.keepViewerColors(fresh, self.screen);
         restored.commitReplacing(&self.screen);
         self.wireScreenSink();
         if (self.debug_to_stderr) std.debug.print("sketerm: [{s}] snapshot {d}x{d} seq={d}\n", .{

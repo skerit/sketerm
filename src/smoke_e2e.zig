@@ -1169,6 +1169,14 @@ pub fn main() u8 {
         teardown();
         return 0;
     }
+    if (c.getenv("SKETERM_SMOKE_E2E_BORDER_ONLY") != null) {
+        const app = drive orelse return fail("the border stage needs the display session driver");
+        const win = wsMainWindow(app) orelse return fail("border: no GUI window");
+        if (wsBorderReload(allocator, app, win, sock_path)) |why| return failMsg(why);
+        say("border: the focused pane's border keeps its shade across a config reload");
+        teardown();
+        return 0;
+    }
     if (c.getenv("SKETERM_SMOKE_E2E_CONFIG_ONLY") != null) {
         if (configReloadStage(allocator, sock_path, rt)) |why| return failMsg(why);
         say("config: focused live in-place, rename-over, watcher, and repeated reload stage passed");
@@ -15840,8 +15848,6 @@ fn wsConfig(buf: []u8, close_buttons: bool, font_size: u32) ?[]const u8 {
         \\
         \\[profile.{s}]
         \\default_bg = #c80000
-        \\light.default_bg = #c80000
-        \\dark.default_bg = #c80000
         \\
     , .{ font_size, if (close_buttons) "true" else "false", ws_profile }) catch null;
 }
@@ -16452,6 +16458,59 @@ fn wsChromeHeight(allocator: std.mem.Allocator, app: *appdrive.App, win: u32) ?u
     return null;
 }
 
+/// One pixel of the focused pane's top border: the row just above the
+/// first full row of terminal background, sampled mid-width.
+const BorderSample = struct { y: u32, rgb: [3]u8 };
+
+fn wsBorderSample(allocator: std.mem.Allocator, app: *appdrive.App, win: u32) ?BorderSample {
+    const shot = app.snapshotRgba(win, null) catch return null;
+    defer allocator.free(shot.px);
+    const chrome = wsChromeHeight(allocator, app, win) orelse return null;
+    // The default active border is blue-dominant (0.40, 0.55, 0.85 at
+    // 0.75 alpha) over a grey background, so its rows are the only
+    // ones just above the grid where blue clearly beats red.
+    var dy: u32 = 1;
+    while (dy <= 12 and dy <= chrome) : (dy += 1) {
+        const y = chrome - dy;
+        const i = (y * shot.w + shot.w / 2) * 4;
+        const px = shot.px[i .. i + 3];
+        if (@as(i32, px[2]) - @as(i32, px[0]) > 40) return .{ .y = y, .rgb = .{ px[0], px[1], px[2] } };
+    }
+    return null;
+}
+
+/// The focused pane's top border kept one shade in a fresh tab and
+/// another after any config reload (TERM-2). Both captures are of the
+/// same pane, focused, with nothing on screen changing but the reload.
+fn wsBorderReload(allocator: std.mem.Allocator, app: *appdrive.App, win: u32, sock_path: [:0]const u8) ?[]const u8 {
+    const extra = wsNewTab(allocator, sock_path) orelse return "border: new-tab failed";
+    defer _ = wsClosePane(allocator, sock_path, extra);
+    if (!wsFocus(allocator, sock_path, extra)) return "border: focus the new tab";
+    if (!wsSendText(allocator, sock_path, extra, "clear\\n")) return "border: clear";
+    _ = app.waitVisualSettle(win, 600, 8_000, 0.001, null);
+    const before = wsBorderSample(allocator, app, win) orelse {
+        wsShot(allocator, app, win, "border-before");
+        return "border: no focus border found above the fresh tab's grid";
+    };
+    if (!wsAction(allocator, sock_path, "reload_config", null)) return "border: reload_config failed";
+    _ = c.usleep(500_000);
+    _ = app.waitVisualSettle(win, 600, 8_000, 0.001, null);
+    const after = wsBorderSample(allocator, app, win) orelse {
+        wsShot(allocator, app, win, "border-after");
+        return "border: the focus border vanished after a config reload";
+    };
+    _ = c.fprintf(platform.stderr(), "smoke-e2e: border: y=%u rgb=%u,%u,%u before, y=%u rgb=%u,%u,%u after reload\n", before.y, @as(c_uint, before.rgb[0]), @as(c_uint, before.rgb[1]), @as(c_uint, before.rgb[2]), after.y, @as(c_uint, after.rgb[0]), @as(c_uint, after.rgb[1]), @as(c_uint, after.rgb[2]));
+    if (before.y != after.y) return "border: the focus border moved on a config reload";
+    for (before.rgb, after.rgb) |a, b| {
+        const d = @as(i32, a) - @as(i32, b);
+        if (d < -3 or d > 3) {
+            wsShot(allocator, app, win, "border-after");
+            return "border: the focused pane's top border changed shade on a config reload";
+        }
+    }
+    return null;
+}
+
 /// Pixels whose red+green moved by more than 60 between two captures.
 fn wsChangedPixels(a: []const u8, b: []const u8) usize {
     if (a.len != b.len) return std.math.maxInt(usize);
@@ -16481,9 +16540,7 @@ fn wsCloseButtons(allocator: std.mem.Allocator, app: *appdrive.App, win: u32, so
     // activity glow the teardown verifier arms on every tab), so it has
     // to hold still before the baseline is taken; the stage config keeps
     // output activity and the 60s inactivity wash out of it. The last
-    // rows above the terminal are the pane's own border, not the strip:
-    // its shade changes on a config reload (it blends over a dark
-    // backdrop in a fresh tab, over the terminal bg after the reload).
+    // rows above the terminal are the pane's own border, not the strip.
     const strip: appdrive.App.Region = .{ .x = 0, .y = 0, .w = @intCast(size.w), .h = chrome -| 6 };
     _ = app.waitVisualSettle(win, 1_000, 15_000, 0.0001, strip);
     const on = app.snapshotRgba(win, strip) catch return "close button: first strip capture";
@@ -16562,6 +16619,7 @@ fn workspaceStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [
         .{ "cross-session search", wsCrossSearch },
         .{ "apply_profile", wsApplyProfile },
         .{ "toggle_panel_face", wsPanelFace },
+        .{ "focus border across a reload", wsBorderReload },
     };
     // Every step cleans up after itself; a leaked tab would change the
     // tab strip the close-button step measures, so it fails here, named.

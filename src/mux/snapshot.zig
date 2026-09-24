@@ -40,6 +40,7 @@ const Cell = @import("../grid/cell.zig").Cell;
 const style_pool = @import("../grid/style_pool.zig");
 const wire = @import("wire.zig");
 const Pool = style_pool.Pool;
+const palette_default_256 = @import("../grid/palette.zig").default_256;
 
 pub const SNAPSHOT_VERSION = 11;
 pub const LEGACY_SNAPSHOT_VERSION = 3;
@@ -842,6 +843,33 @@ fn validateLinkState(screen: *const Screen) !void {
         return error.BadSnapshot;
     if (screen.saved_link_id != 0 and !screen.links.contains(screen.saved_link_id))
         return error.BadSnapshot;
+}
+
+/// Hand a viewer's configured colours to a screen fresh out of a
+/// snapshot. The daemon never learns them: its `default_fg`/`default_bg`
+/// are its own built-ins unless an app moved them (OSC 10/11), yet they
+/// are carried, so every attach or resize snapshot used to repaint the
+/// pane in the daemon's colours until the next config push (a reload
+/// "changed" the pane: its bg, and the focus border blended over it).
+/// Where the daemon is still on its configured default the viewer's
+/// wins; an app's OSC 10/11 colour is kept. `configured_*` is
+/// transient, so it comes from the viewer too, and OSC 110/111 keep
+/// resetting to the viewer's theme.
+///
+/// The palette and the cursor colour are the same class: the config's
+/// scheme/palette and `cursor_color` are pushed to the viewer's screen
+/// only. A daemon palette entry still at its built-in value, and a
+/// cursor colour still unset, take the viewer's; an app's OSC 4 / OSC 12
+/// colour (the daemon moved it) is kept.
+pub fn keepViewerColors(fresh: *Screen, viewer: *const Screen) void {
+    if (std.mem.eql(f32, &fresh.default_fg, &fresh.configured_fg)) fresh.default_fg = viewer.configured_fg;
+    if (std.mem.eql(f32, &fresh.default_bg, &fresh.configured_bg)) fresh.default_bg = viewer.configured_bg;
+    fresh.configured_fg = viewer.configured_fg;
+    fresh.configured_bg = viewer.configured_bg;
+    for (&fresh.palette, viewer.palette, palette_default_256) |*entry, theirs, builtin| {
+        if (std.mem.eql(u8, entry, &builtin)) entry.* = theirs;
+    }
+    if (fresh.cursor_color[3] == 0) fresh.cursor_color = viewer.cursor_color;
 }
 
 pub const StagedRestore = struct {
@@ -1766,6 +1794,83 @@ test "restore rebuilds the pool index: colours don't swap after a resize" {
     try testing.expect(Entry.equal(p.get(try p.intern(green)), green));
     try testing.expect(Entry.equal(p.get(try p.intern(red)), red));
     try testing.expectEqual(h.pool.entries.items.len, p.entries.items.len);
+}
+
+test "snapshot: a restore keeps the viewer's configured colours" {
+    const a = testing.allocator;
+    // The daemon's screen: built-in colours, except that in the second
+    // case an app set its own background with OSC 11.
+    inline for (.{ false, true }) |app_set_bg| {
+        var h = try Harness.init(a, 10, 2);
+        defer h.deinit();
+        if (app_set_bg) h.feed("\x1b]11;rgb:40/00/00\x1b\\");
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(a);
+        try serialize(h.screen, &buf, a);
+
+        // The viewer: a light theme pushed by its config.
+        var vh = try Harness.init(a, 10, 2);
+        defer vh.deinit();
+        const light_fg: [4]f32 = .{ 0.10, 0.10, 0.10, 1.0 };
+        const light_bg: [4]f32 = .{ 0.97, 0.97, 0.97, 0.9 };
+        vh.screen.configured_fg = light_fg;
+        vh.screen.configured_bg = light_bg;
+
+        var p = try Pool.init(a);
+        defer p.deinit();
+        const back = try restore(a, &p, buf.items);
+        defer back.deinit();
+        keepViewerColors(back, vh.screen);
+
+        try testing.expectEqual(light_fg, back.default_fg);
+        try testing.expectEqual(light_fg, back.configured_fg);
+        try testing.expectEqual(light_bg, back.configured_bg);
+        if (app_set_bg) {
+            try testing.expectApproxEqAbs(@as(f32, 0x40) / 255.0, back.default_bg[0], 0.005);
+            try testing.expectApproxEqAbs(@as(f32, 0.0), back.default_bg[1], 0.005);
+        } else {
+            try testing.expectEqual(light_bg, back.default_bg);
+        }
+    }
+}
+
+test "snapshot: a restore keeps the viewer's configured palette and cursor colour" {
+    const a = testing.allocator;
+    // The daemon's screen: the built-in palette and no cursor colour,
+    // except that in the second case an app set palette 2 (OSC 4) and
+    // the cursor colour (OSC 12) itself.
+    inline for (.{ false, true }) |app_set| {
+        var h = try Harness.init(a, 10, 2);
+        defer h.deinit();
+        if (app_set) h.feed("\x1b]4;2;rgb:12/34/56\x1b\\\x1b]12;rgb:ff/00/ff\x1b\\");
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(a);
+        try serialize(h.screen, &buf, a);
+
+        // The viewer: a scheme and a cursor colour pushed by its config.
+        var vh = try Harness.init(a, 10, 2);
+        defer vh.deinit();
+        vh.screen.palette[1] = .{ 0xaa, 0x11, 0x22 };
+        vh.screen.palette[2] = .{ 0x33, 0xbb, 0x44 };
+        const cursor: [4]f32 = .{ 0.9, 0.5, 0.1, 1.0 };
+        vh.screen.cursor_color = cursor;
+
+        var p = try Pool.init(a);
+        defer p.deinit();
+        const back = try restore(a, &p, buf.items);
+        defer back.deinit();
+        keepViewerColors(back, vh.screen);
+
+        try testing.expectEqual([3]u8{ 0xaa, 0x11, 0x22 }, back.palette[1]);
+        try testing.expectEqual(palette_default_256[200], back.palette[200]);
+        if (app_set) {
+            try testing.expectEqual([3]u8{ 0x12, 0x34, 0x56 }, back.palette[2]);
+            try testing.expectEqual([4]f32{ 1.0, 0.0, 1.0, 1.0 }, back.cursor_color);
+        } else {
+            try testing.expectEqual([3]u8{ 0x33, 0xbb, 0x44 }, back.palette[2]);
+            try testing.expectEqual(cursor, back.cursor_color);
+        }
+    }
 }
 
 test "snapshot: populated screen round-trips" {
