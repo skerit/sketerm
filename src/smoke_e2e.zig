@@ -954,6 +954,10 @@ pub fn main() u8 {
     if (c.getenv("SKETERM_SMOKE_E2E_TWO_GUIS_ONLY") != null) {
         const app = drive orelse return fail("focused two-GUI smoke has no display driver");
         if (!have_wl) return fail("focused two-GUI smoke is GTK/Wayland-only");
+        // Both GUIs browse a web page: without the CEF helper the second
+        // window's page never loads and the stage failed on a timeout
+        // that did not say why.
+        if (!have_web_action) return fail("focused two-GUI smoke needs zig-out/bin/sketerm-webengine (run `zig build web` first)");
         if (secondGuiBrowserStage(allocator, app, rt, sock_path, &wl_z)) |why| return failMsg(why);
         say("two GUIs: a second sketerm window browsed the same profile while the first held a page");
         teardown();
@@ -1598,8 +1602,12 @@ pub fn main() u8 {
         if (mcpWebReaderStage(allocator, sock_path, rt)) |why| return failMsg(why);
         say("mcp GUI web adapter: web_read IDs acted through the visible browser and a retargeted entity was refused stale");
 
-        if (secondGuiBrowserStage(allocator, app, rt, sock_path, &wl_z)) |why| return failMsg(why);
-        say("two GUIs: a second sketerm window browsed the same profile while the first held a page");
+        if (have_web_action) {
+            if (secondGuiBrowserStage(allocator, app, rt, sock_path, &wl_z)) |why| return failMsg(why);
+            say("two GUIs: a second sketerm window browsed the same profile while the first held a page");
+        } else {
+            say("SKIP two-GUI browser stage (sketerm-webengine is not built; run `zig build web` first)");
+        }
 
         if (remotePanelAssetStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
         say("remote panel asset: fake-SSH panel images hydrated into the GUI cache, repainted after a same-path rewrite, and kept their logical path through panel-get/save/load");
