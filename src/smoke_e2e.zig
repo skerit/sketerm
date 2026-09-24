@@ -625,6 +625,9 @@ pub fn main() u8 {
             _ = c.setenv("XDG_RUNTIME_DIR", rrt.ptr, 1);
             _ = c.setenv("XDG_STATE_HOME", rrt.ptr, 1);
             _ = c.setenv("XDG_CONFIG_HOME", rrt.ptr, 1);
+            // Its own data home, so ITS trash is not the local one
+            // (FILES_REMOTE_TRASH tells them apart).
+            _ = c.setenv("XDG_DATA_HOME", rrt.ptr, 1);
             const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm-mux", null };
             _ = c.execv("zig-out/bin/sketerm-mux", @ptrCast(@constCast(&argv)));
             c._exit(127);
@@ -977,6 +980,38 @@ pub fn main() u8 {
         if (!have_wl) return fail("focused files-bugs smoke is GTK/Wayland-only");
         if (filesBrowserBugsStage(allocator, app, rt, &wl_z)) |why| return failMsg(why);
         say("files bugs: hidden count, trash strip, Keep Both naming, location-entry focus, panel after Up and row drag all held");
+        teardown();
+        return 0;
+    }
+    if (c.getenv("SKETERM_SMOKE_E2E_FILES_FEATURES_ONLY") != null) {
+        const app = drive orelse return fail("focused files-features smoke has no display driver");
+        if (!have_wl) return fail("focused files-features smoke is GTK/Wayland-only");
+        if (filesFeaturesStage(allocator, app, rt, &wl_z)) |why| return failMsg(why);
+        say("files features: batch rename (preview, count, one undo), a conditioned user action and Open in Terminal all held");
+        teardown();
+        return 0;
+    }
+    if (c.getenv("SKETERM_SMOKE_E2E_FILES_REMOTE_TRASH_ONLY") != null) {
+        const app = drive orelse return fail("focused files-remote-trash smoke has no display driver");
+        if (!have_wl) return fail("focused files-remote-trash smoke is GTK/Wayland-only");
+        if (filesRemoteTrashStage(allocator, app, rt, &wl_z)) |why| return failMsg(why);
+        say("files remote trash: a remote row went to its host's trash, and Go > Trash listed it there");
+        teardown();
+        return 0;
+    }
+    if (c.getenv("SKETERM_SMOKE_E2E_FILES_TRANSFERS_ONLY") != null) {
+        const app = drive orelse return fail("focused files-transfers smoke has no display driver");
+        if (!have_wl) return fail("focused files-transfers smoke is GTK/Wayland-only");
+        if (filesTransfersStage(allocator, app, rt, &wl_z)) |why| return failMsg(why);
+        say("files transfers: the conflict dialog's Replace and Skip and the Transfer Center all held");
+        teardown();
+        return 0;
+    }
+    if (c.getenv("SKETERM_SMOKE_E2E_FILES_COMPARE_ONLY") != null) {
+        const app = drive orelse return fail("focused files-compare smoke has no display driver");
+        if (!have_wl) return fail("focused files-compare smoke is GTK/Wayland-only");
+        if (filesCompareSyncStage(allocator, app, rt, &wl_z)) |why| return failMsg(why);
+        say("files compare: a mirror deletion waited for its confirmation, a cancel deleted nothing, a confirm trashed it");
         teardown();
         return 0;
     }
@@ -1602,6 +1637,26 @@ pub fn main() u8 {
             // permissions and a folder dropped into itself.
             if (filesSelectionBugsStage(allocator, app, rt, &wl_z)) |why| return failMsg(why);
             say("files selection: Select All, the narrowed mirror, a link's permissions and a folder dropped into itself all held");
+
+            // 6c-10e. The file manager's own verbs through their
+            // entries: F2 batch rename + one undo, a conditioned user
+            // action, Open in Terminal.
+            if (filesFeaturesStage(allocator, app, rt, &wl_z)) |why| return failMsg(why);
+            say("files features: batch rename (preview, count, one undo), a conditioned user action and Open in Terminal all held");
+
+            // 6c-10f. Compare / Sync never deletes without the listed
+            // confirmation, and a confirmed deletion goes to the trash.
+            if (filesCompareSyncStage(allocator, app, rt, &wl_z)) |why| return failMsg(why);
+            say("files compare: a mirror deletion waited for its confirmation, a cancel deleted nothing, a confirm trashed it");
+
+            // 6c-10g. The conflict dialog (Replace / Skip per item) and
+            // the Transfer Center behind Ctrl+Shift+J.
+            if (filesTransfersStage(allocator, app, rt, &wl_z)) |why| return failMsg(why);
+            say("files transfers: the conflict dialog's Replace and Skip and the Transfer Center all held");
+
+            // 6c-10h. A remote tab's Trash is that host's trash.
+            if (filesRemoteTrashStage(allocator, app, rt, &wl_z)) |why| return failMsg(why);
+            say("files remote trash: a remote row went to its host's trash, and Go > Trash listed it there");
 
             // 6c-11. A remote Files tab whose daemon died: the
             // reconnect re-subscribes every directory under a FRESH
@@ -7964,6 +8019,7 @@ fn respawnRemoteMux(rt: []const u8) bool {
         _ = c.setenv("XDG_RUNTIME_DIR", rrt.ptr, 1);
         _ = c.setenv("XDG_STATE_HOME", rrt.ptr, 1);
         _ = c.setenv("XDG_CONFIG_HOME", rrt.ptr, 1);
+        _ = c.setenv("XDG_DATA_HOME", rrt.ptr, 1);
         const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm-mux", null };
         _ = c.execv("zig-out/bin/sketerm-mux", @ptrCast(@constCast(&argv)));
         c._exit(127);
@@ -8605,6 +8661,660 @@ fn ocrRowCenter(allocator: std.mem.Allocator, app: *appdrive.App, win_id: u32, n
         }
         pumpFor(app, 300);
     }
+    // Keep the exact frame OCR was given (the failure screenshot is a
+    // later, rescaled capture and can disagree with it).
+    if (app.snapshotRgba(win_id, null)) |shot| {
+        defer allocator.free(shot.px);
+        if (png_util.encodeRgba(allocator, shot.px, shot.w, shot.h)) |bytes| {
+            defer allocator.free(bytes);
+            writePng("/tmp/sketerm-e2e-ocrrow-frame.png", bytes);
+            _ = c.fprintf(platform.stderr(), "smoke-e2e: ocrRowCenter: no %.*s; frame %ux%u kept at /tmp/sketerm-e2e-ocrrow-frame.png\n", @as(c_int, @intCast(needle.len)), needle.ptr, shot.w, shot.h);
+        } else |_| {}
+    } else |_| {}
+    return null;
+}
+
+/// The file manager's own verbs, each through the entry a user
+/// reaches: Batch Rename (F2 over a multi-row selection, previewed,
+/// undone by ONE Ctrl+Z), a user action whose conditions and tokens
+/// decide what the menu offers and what runs, Open in Terminal typing
+/// into the pane's shell, and a `#tag` search.
+fn filesFeaturesStage(
+    allocator: std.mem.Allocator,
+    app: *appdrive.App,
+    rt: []const u8,
+    wl: [*:0]const u8,
+) ?[]const u8 {
+    const ocr = @import("util/ocr.zig");
+    if (!ocr.available()) {
+        say("files features: tesseract unavailable; skipping");
+        return null;
+    }
+    var dir_buf: [512:0]u8 = undefined;
+    const dir = std.fmt.bufPrintZ(&dir_buf, "{s}/ffeat", .{rt}) catch return "files features: dir path";
+    _ = c.mkdir(dir.ptr, 0o700);
+    var p: [10][600:0]u8 = undefined;
+    const one = std.fmt.bufPrintZ(&p[0], "{s}/AAONE.txt", .{dir}) catch return "files features: path";
+    const two = std.fmt.bufPrintZ(&p[1], "{s}/AATWO.txt", .{dir}) catch return "files features: path";
+    const keep = std.fmt.bufPrintZ(&p[2], "{s}/ZKEEP.txt", .{dir}) catch return "files features: path";
+    const b_one = std.fmt.bufPrintZ(&p[3], "{s}/BBONE.txt", .{dir}) catch return "files features: path";
+    const b_two = std.fmt.bufPrintZ(&p[4], "{s}/BBTWO.txt", .{dir}) catch return "files features: path";
+    const stamped = std.fmt.bufPrintZ(&p[5], "{s}/STAMPED-AAONE.txt", .{dir}) catch return "files features: path";
+    const shell_mark = std.fmt.bufPrintZ(&p[6], "{s}/SHELLHERE", .{dir}) catch return "files features: path";
+    if (!writeFile(one, "1\n") or !writeFile(two, "2\n") or !writeFile(keep, "k\n")) return "files features: seed";
+
+    // User actions live in the (isolated) config home the GUI child
+    // inherits. One applies to a single file and uses two tokens; the
+    // other is directory-only and must NOT be offered on a file row.
+    const cfg = std.mem.span(c.getenv("XDG_CONFIG_HOME") orelse return "files features: no isolated XDG_CONFIG_HOME");
+    const adir = std.fmt.bufPrintZ(&p[7], "{s}/sketerm/actions", .{cfg}) catch return "files features: path";
+    @import("util/pathz.zig").makeDirs(adir, 0o700) catch return "files features: actions dir";
+    const stamp_file = std.fmt.bufPrintZ(&p[8], "{s}/stamp.action", .{adir}) catch return "files features: path";
+    const dironly_file = std.fmt.bufPrintZ(&p[9], "{s}/dironly.action", .{adir}) catch return "files features: path";
+    if (!writeFile(stamp_file, "Name=Stamp Row\nExec=touch %d/STAMPED-%n\nKind=file\nSelection=single\n") or
+        !writeFile(dironly_file, "Name=Folder Verb\nExec=true %f\nKind=dir\n"))
+        return "files features: seed actions";
+    defer _ = c.unlink(stamp_file.ptr);
+    defer _ = c.unlink(dironly_file.ptr);
+
+    const child = launchRenameFiles(app, dir, "ffeat", "", wl) orelse
+        return "files features: the Files window never appeared";
+    defer if (renamefiles_pid > 0) reap(renamefiles_pid, c.SIGTERM, 3000);
+    if (!viewerWaitOcr(allocator, app, child.win, "AAONE", 40_000))
+        return "files features: the listing never rendered";
+    _ = app.waitVisualSettle(child.win, 400, 10_000, 0.002, null);
+    const win = app.winById(child.win) orelse return "files features: window vanished";
+    const w = @as(f64, @floatFromInt(win.w));
+    const h = @as(f64, @floatFromInt(win.h));
+
+    // -- 1. Batch Rename: F2 over the selection, previewed --
+    app.pressKey(child.win, "ctrl+a") catch return "files features: ctrl+a failed";
+    pumpRenameFor(app, 400);
+    app.pressKey(child.win, "F2") catch return "files features: F2 failed";
+    const pop = waitPopup(app, true, 10_000) orelse {
+        viewerShot(allocator, app, child.win, "files-feat-nobatch");
+        return "files features: F2 over three rows opened no Batch Rename";
+    };
+    app.typeText(null, "AA") catch return "files features: typing the pattern failed";
+    app.pressKey(null, "Tab") catch return "files features: Tab failed";
+    app.typeText(null, "BB") catch return "files features: typing the replacement failed";
+    pumpRenameFor(app, 600);
+    // The preview counts BEFORE anything is sent: two of the three.
+    if (!viewerWaitOcr(allocator, app, pop, "2 of 3", 10_000)) {
+        viewerShot(allocator, app, pop, "files-feat-preview");
+        return "files features: the Batch Rename preview did not say \"2 of 3\"";
+    }
+    app.pressKey(null, "Enter") catch return "files features: Enter failed";
+    if (!waitPathState(b_one, true, 15_000, app) or !waitPathState(b_two, true, 5_000, app)) {
+        viewerShot(allocator, app, child.win, "files-feat-batch");
+        return "files features: Batch Rename did not rename both AA entries";
+    }
+    if (c.access(keep.ptr, c.F_OK) != 0) return "files features: Batch Rename touched an entry the pattern does not match";
+    if (!viewerWaitOcr(allocator, app, child.win, "2 renamed", 10_000)) {
+        viewerShot(allocator, app, child.win, "files-feat-count");
+        return "files features: the status line did not report the real count";
+    }
+    say("files features: F2 batch-renamed the two matching rows, previewed and counted");
+
+    // -- 2. ONE Ctrl+Z undoes the whole batch --
+    _ = waitPopup(app, false, 5_000);
+    app.clickEx(child.win, w * 0.58, h * 0.8, 1, 60, 1) catch return "files features: focusing the listing failed";
+    pumpRenameFor(app, 300);
+    app.pressKey(child.win, "ctrl+z") catch return "files features: ctrl+z failed";
+    if (!waitPathState(one, true, 15_000, app) or !waitPathState(two, true, 5_000, app)) {
+        viewerShot(allocator, app, child.win, "files-feat-undo");
+        return "files features: one Ctrl+Z did not put the whole batch back";
+    }
+    if (c.access(b_one.ptr, c.F_OK) == 0 or c.access(b_two.ptr, c.F_OK) == 0)
+        return "files features: the undone batch left a renamed entry behind";
+    say("files features: one Ctrl+Z undid the whole batch");
+    pumpRenameFor(app, 1_000);
+
+    // -- 3. a user action: conditions pick the rows, tokens fill in --
+    const row = ocrRowCenter(allocator, app, child.win, "AAONE", 10_000) orelse return "files features: AAONE row not found";
+    app.clickEx(child.win, row.x, row.y, 1, 60, 1) catch return "files features: selecting AAONE failed";
+    pumpRenameFor(app, 400);
+    app.clickEx(child.win, row.x, row.y, 3, 60, 1) catch return "files features: right-click failed";
+    const menu = waitPopup(app, true, 10_000) orelse return "files features: the row menu never opened";
+    _ = app.waitVisualSettle(menu, 400, 5_000, 0.002, null);
+    if ((ocrCountScaled(allocator, app, menu, "Folder Verb", 2) orelse 0) != 0) {
+        viewerShot(allocator, app, menu, "files-feat-dironly");
+        return "files features: a Kind=dir action was offered on a file";
+    }
+    if (!clickOcrWordScaled(allocator, app, menu, "Stamp", 1, 8_000)) {
+        viewerShot(allocator, app, menu, "files-feat-noaction");
+        return "files features: the Kind=file action was not offered on a file";
+    }
+    if (!waitPathState(stamped, true, 15_000, app)) return "files features: the action did not run with %d/%n filled in";
+    say("files features: the file-only action ran with its tokens; the folder-only one stayed hidden");
+    _ = waitPopup(app, false, 5_000);
+
+    // -- 4. `#tag` in the search bar finds a tagged file --
+    // The tag is written straight into the xattr (as a copy from
+    // another host or another tool would leave it): the search walks
+    // the xattrs, it does not only consult an index.
+    var tz: [600:0]u8 = undefined;
+    const two_z = std.fmt.bufPrintZ(&tz, "{s}", .{two}) catch return "files features: path";
+    if (platform.lsetxattr(two_z, "user.sketerm.tags", "urgent,later")) {
+        // The keyboard back on the listing (the action menu had it).
+        _ = waitPopup(app, false, 5_000);
+        app.clickEx(child.win, w * 0.58, h * 0.8, 1, 60, 1) catch return "files features: focusing the listing failed";
+        _ = app.waitVisualSettle(child.win, 400, 5_000, 0.002, null);
+        app.pressKey(child.win, "ctrl+f") catch return "files features: ctrl+f failed";
+        pumpRenameFor(app, 500);
+        app.typeText(null, "#urgent") catch return "files features: typing the tag query failed";
+        app.pressKey(null, "Enter") catch return "files features: running the tag query failed";
+        // The results tab lists the tagged row (read up to 3x, like
+        // every small row) and none of the folder's other rows.
+        if (ocrRowCenter(allocator, app, child.win, "AATWO", 20_000) == null) {
+            viewerShot(allocator, app, child.win, "files-feat-tag");
+            return "files features: #urgent opened no tag results tab";
+        }
+        pumpRenameFor(app, 1_000);
+        if ((ocrCountScaled(allocator, app, child.win, "ZKEEP", 2) orelse 0) != 0 or
+            (ocrCountScaled(allocator, app, child.win, "AAONE", 2) orelse 0) != 0)
+        {
+            viewerShot(allocator, app, child.win, "files-feat-tag-extra");
+            return "files features: the #urgent results listed an untagged file";
+        }
+        say("files features: #urgent in the search bar found the tagged file and nothing else");
+        // The results tab is rooted at the same folder, so the shell
+        // check below runs from it unchanged.
+    } else say("files features: this filesystem refuses user xattrs; the tag search check is skipped");
+
+    // -- 5. Open in Terminal types into the pane's shell --
+    app.clickEx(child.win, w * 0.58, h * 0.8, 3, 60, 1) catch return "files features: background right-click failed";
+    const bg = waitPopup(app, true, 10_000) orelse return "files features: the background menu never opened";
+    _ = app.waitVisualSettle(bg, 400, 5_000, 0.002, null);
+    if (!clickOcrWordScaled(allocator, app, bg, "Open in Terminal", 1, 8_000) and !clickOcrWordScaled(allocator, app, bg, "Terminal", 1, 4_000)) {
+        viewerShot(allocator, app, bg, "files-feat-noterm");
+        return "files features: the background menu offered no Open in Terminal";
+    }
+    pumpRenameFor(app, 1_500);
+    app.typeText(child.win, "touch SHELLHERE\n") catch return "files features: typing into the shell failed";
+    if (!waitPathState(shell_mark, true, 15_000, app)) {
+        viewerShot(allocator, app, child.win, "files-feat-shell");
+        return "files features: Open in Terminal did not leave the shell in the folder";
+    }
+    say("files features: Open in Terminal cd'd the pane's shell into the folder");
+
+    if (!closeRenameFiles(app, child)) return "files features: the Files window did not close cleanly";
+    return null;
+}
+
+/// `clickOcrWord` that also reads the frame upscaled 2x and 3x (and
+/// maps the box back): short bold button labels in popovers ("Skip")
+/// often do not read at native scale.
+fn clickOcrWordScaled(allocator: std.mem.Allocator, app: *appdrive.App, win_id: u32, needle: []const u8, button: u32, timeout_ms: i64) bool {
+    const ocr = @import("util/ocr.zig");
+    const png_util = @import("util/png.zig");
+    const deadline = clock.nowMs() + timeout_ms;
+    while (clock.nowMs() < deadline) {
+        _ = app.drainLive(2_000);
+        const shot = app.snapshotRgba(win_id, null) catch {
+            pumpFor(app, 300);
+            continue;
+        };
+        defer allocator.free(shot.px);
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        for ([_]u32{ 1, 2, 3 }) |scale| {
+            const px = if (scale == 1)
+                shot.px
+            else
+                png_util.upscaleRgba(arena.allocator(), shot.px, shot.w, shot.h, scale) catch continue;
+            for ([_]i32{ 11, 6 }) |psm| {
+                const res = ocr.recognize(arena.allocator(), px, shot.w * scale, shot.h * scale, .{ .psm = psm }) catch continue;
+                for (res.words) |w| {
+                    if (std.mem.indexOf(u8, w.text, needle) == null) continue;
+                    const s = @as(f64, @floatFromInt(scale));
+                    const x = (@as(f64, @floatFromInt(w.x)) + @as(f64, @floatFromInt(w.w)) / 2) / s;
+                    const y = (@as(f64, @floatFromInt(w.y)) + @as(f64, @floatFromInt(w.h)) / 2) / s;
+                    app.clickEx(win_id, x, y, button, 80, 1) catch return false;
+                    return true;
+                }
+            }
+        }
+        pumpFor(app, 300);
+    }
+    return false;
+}
+
+/// The newest mapped popup other than `not`, if any (a submenu opens
+/// as a second popup beside its parent menu).
+fn newestPopupExcept(app: *appdrive.App, not: u32) ?u32 {
+    pumpFor(app, 120);
+    var found: ?u32 = null;
+    for (app.windows.items) |w| {
+        if (w.popup and w.frames > 0 and w.id != not) found = w.id;
+    }
+    return found;
+}
+
+/// Centre of the OCR word `first` that is immediately followed by the
+/// word `second` (a button label whose words also occur elsewhere on
+/// screen: "Move to Trash and Sync" under the heading "... Trash?").
+fn ocrPairCenter(allocator: std.mem.Allocator, app: *appdrive.App, win_id: u32, first: []const u8, second: []const u8, timeout_ms: i64) ?Point {
+    const ocr = @import("util/ocr.zig");
+    const deadline = clock.nowMs() + timeout_ms;
+    while (clock.nowMs() < deadline) {
+        _ = app.drainLive(2_000);
+        const shot = app.snapshotRgba(win_id, null) catch {
+            pumpFor(app, 300);
+            continue;
+        };
+        defer allocator.free(shot.px);
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        for ([_]u32{ 1, 2 }) |scale| {
+            const px = if (scale == 1)
+                shot.px
+            else
+                @import("util/png.zig").upscaleRgba(arena.allocator(), shot.px, shot.w, shot.h, scale) catch continue;
+            for ([_]i32{ 11, 6 }) |psm| {
+                const res = ocr.recognize(arena.allocator(), px, shot.w * scale, shot.h * scale, .{ .psm = psm }) catch continue;
+                for (res.words, 0..) |w, i| {
+                    if (i + 1 >= res.words.len) break;
+                    if (!std.mem.eql(u8, w.text, first) or !std.mem.eql(u8, res.words[i + 1].text, second)) continue;
+                    const s = @as(f64, @floatFromInt(scale));
+                    return .{
+                        .x = (@as(f64, @floatFromInt(w.x)) + @as(f64, @floatFromInt(w.w)) / 2) / s,
+                        .y = (@as(f64, @floatFromInt(w.y)) + @as(f64, @floatFromInt(w.h)) / 2) / s,
+                    };
+                }
+            }
+        }
+        pumpFor(app, 300);
+    }
+    return null;
+}
+
+/// A remote tab's Trash is THAT host's trash: Delete on a remote row
+/// lands in the remote daemon's trash (its own data home, not this
+/// machine's), and Go > Trash on the remote tab lists it there.
+fn filesRemoteTrashStage(
+    allocator: std.mem.Allocator,
+    app: *appdrive.App,
+    rt: []const u8,
+    wl: [*:0]const u8,
+) ?[]const u8 {
+    const ocr = @import("util/ocr.zig");
+    if (!ocr.available()) {
+        say("files remote trash: tesseract unavailable; skipping");
+        return null;
+    }
+    if (remote_mux_pid <= 0) return "files remote trash: the fake-SSH daemon is not running";
+    var p: [5][600:0]u8 = undefined;
+    const dir = std.fmt.bufPrintZ(&p[0], "{s}/rtr", .{rt}) catch return "files remote trash: path";
+    _ = c.mkdir(dir.ptr, 0o700);
+    const victim = std.fmt.bufPrintZ(&p[1], "{s}/RTRASHME.txt", .{dir}) catch return "files remote trash: path";
+    const keep = std.fmt.bufPrintZ(&p[2], "{s}/ZSTAYS.txt", .{dir}) catch return "files remote trash: path";
+    const remote_trashed = std.fmt.bufPrintZ(&p[3], "{s}/r/Trash/files/RTRASHME.txt", .{rt}) catch return "files remote trash: path";
+    const local_trashed = std.fmt.bufPrintZ(&p[4], "{s}/Trash/files/RTRASHME.txt", .{rt}) catch return "files remote trash: path";
+    if (!writeFile(victim, "remote\n") or !writeFile(keep, "stays\n")) return "files remote trash: seed";
+    var spec_buf: [600:0]u8 = undefined;
+    const spec = std.fmt.bufPrintZ(&spec_buf, "localhost:{s}", .{dir}) catch return "files remote trash: spec";
+    const child = launchRenameFiles(app, spec, "rtrash", "", wl) orelse
+        return "files remote trash: the remote Files window never appeared";
+    defer if (renamefiles_pid > 0) reap(renamefiles_pid, c.SIGTERM, 3000);
+    if (!viewerWaitOcr(allocator, app, child.win, "RTRASHME", 40_000)) return "files remote trash: the remote listing never rendered";
+    _ = app.waitVisualSettle(child.win, 400, 10_000, 0.002, null);
+
+    const row = ocrRowCenter(allocator, app, child.win, "RTRASHME", 10_000) orelse return "files remote trash: row not found";
+    app.clickEx(child.win, row.x, row.y, 1, 60, 1) catch return "files remote trash: selecting failed";
+    pumpRenameFor(app, 400);
+    app.pressKey(child.win, "Delete") catch return "files remote trash: Delete failed";
+    if (!waitPathState(victim, false, 15_000, app)) return "files remote trash: Delete did not trash the remote row";
+    if (!waitPathState(remote_trashed, true, 10_000, app)) {
+        if (c.access(local_trashed.ptr, c.F_OK) == 0) return "files remote trash: a remote row went to THIS machine's trash";
+        return "files remote trash: the remote row did not reach the remote host's trash";
+    }
+    say("files remote trash: a remote row went to the remote host's trash");
+
+    // Go > Trash from the remote tab opens the remote trash.
+    pumpRenameFor(app, 1_200);
+    if (!clickOcrWordScaled(allocator, app, child.win, "Go", 1, 8_000)) return "files remote trash: no Go menu";
+    const menu = waitPopup(app, true, 10_000) orelse return "files remote trash: the Go menu never opened";
+    _ = app.waitVisualSettle(menu, 300, 5_000, 0.002, null);
+    if (!clickOcrWordScaled(allocator, app, menu, "Trash", 1, 8_000)) {
+        viewerShot(allocator, app, menu, "files-rtrash-go");
+        return "files remote trash: the Go menu has no Trash";
+    }
+    if (!viewerWaitOcr(allocator, app, child.win, "RTRASHME", 20_000) or
+        (ocrCountScaled(allocator, app, child.win, "ZSTAYS", 2) orelse 0) != 0)
+    {
+        viewerShot(allocator, app, child.win, "files-rtrash-list");
+        return "files remote trash: Go > Trash on the remote tab did not list the remote trash";
+    }
+    say("files remote trash: Go > Trash on the remote tab listed the remote host's trash");
+    if (!closeRenameFiles(app, child)) return "files remote trash: the Files window did not close cleanly";
+    return null;
+}
+
+fn fileHas(path: [:0]const u8, want: []const u8) bool {
+    const f = c.fopen(path.ptr, "rb") orelse return false;
+    defer _ = c.fclose(f);
+    var buf: [256]u8 = undefined;
+    const n = c.fread(&buf, 1, buf.len, f);
+    return std.mem.eql(u8, buf[0..n], want);
+}
+
+/// The conflict dialog and the Transfer Center, driven as a user
+/// does: a two-file paste onto two existing names asks per item,
+/// Replace overwrites exactly that one and Skip leaves the other
+/// alone; Ctrl+Shift+J then opens the Transfer Center with the copy's
+/// card in it, and closes it again.
+fn filesTransfersStage(
+    allocator: std.mem.Allocator,
+    app: *appdrive.App,
+    rt: []const u8,
+    wl: [*:0]const u8,
+) ?[]const u8 {
+    const ocr = @import("util/ocr.zig");
+    if (!ocr.available()) {
+        say("files transfers: tesseract unavailable; skipping");
+        return null;
+    }
+    var p: [7][600:0]u8 = undefined;
+    const top = std.fmt.bufPrintZ(&p[0], "{s}/ftx", .{rt}) catch return "files transfers: path";
+    const src = std.fmt.bufPrintZ(&p[1], "{s}/SRCF", .{top}) catch return "files transfers: path";
+    const dst = std.fmt.bufPrintZ(&p[2], "{s}/DSTF", .{top}) catch return "files transfers: path";
+    _ = c.mkdir(top.ptr, 0o700);
+    _ = c.mkdir(src.ptr, 0o700);
+    _ = c.mkdir(dst.ptr, 0o700);
+    const s_pay = std.fmt.bufPrintZ(&p[3], "{s}/PAYLOAD.txt", .{src}) catch return "files transfers: path";
+    const s_skip = std.fmt.bufPrintZ(&p[4], "{s}/SKIPME.txt", .{src}) catch return "files transfers: path";
+    const d_pay = std.fmt.bufPrintZ(&p[5], "{s}/PAYLOAD.txt", .{dst}) catch return "files transfers: path";
+    const d_skip = std.fmt.bufPrintZ(&p[6], "{s}/SKIPME.txt", .{dst}) catch return "files transfers: path";
+    if (!writeFile(s_pay, "new payload\n") or !writeFile(s_skip, "new skip\n") or
+        !writeFile(d_pay, "old payload\n") or !writeFile(d_skip, "old skip\n"))
+        return "files transfers: seed";
+
+    const child = launchRenameFiles(app, src, "ftx", "", wl) orelse
+        return "files transfers: the Files window never appeared";
+    defer if (renamefiles_pid > 0) reap(renamefiles_pid, c.SIGTERM, 3000);
+    if (!viewerWaitOcr(allocator, app, child.win, "PAYLOAD", 40_000)) return "files transfers: the listing never rendered";
+    _ = app.waitVisualSettle(child.win, 400, 10_000, 0.002, null);
+    const win = app.winById(child.win) orelse return "files transfers: window vanished";
+    const w = @as(f64, @floatFromInt(win.w));
+    const h = @as(f64, @floatFromInt(win.h));
+
+    app.pressKey(child.win, "ctrl+a") catch return "files transfers: ctrl+a failed";
+    pumpRenameFor(app, 300);
+    app.pressKey(child.win, "ctrl+c") catch return "files transfers: ctrl+c failed";
+    pumpRenameFor(app, 300);
+    app.pressKey(child.win, "ctrl+l") catch return "files transfers: ctrl+l failed";
+    pumpRenameFor(app, 500);
+    app.pressKey(null, "ctrl+a") catch return "files transfers: select-all in the location bar failed";
+    app.typeText(null, dst) catch return "files transfers: typing the folder failed";
+    pumpRenameFor(app, 200);
+    app.pressKey(null, "Enter") catch return "files transfers: navigating failed";
+    if (!viewerWaitOcr(allocator, app, child.win, "DSTF", 20_000)) return "files transfers: the destination never rendered";
+    pumpRenameFor(app, 1_000);
+    app.clickEx(child.win, w * 0.58, h * 0.8, 1, 60, 1) catch return "files transfers: focusing the listing failed";
+    pumpRenameFor(app, 300);
+    app.pressKey(child.win, "ctrl+v") catch return "files transfers: paste failed";
+
+    // Two conflicts, answered one at a time: Replace for PAYLOAD, Skip
+    // for SKIPME, whichever the dialog asks about first.
+    var answered: u32 = 0;
+    var round: u32 = 0;
+    while (answered < 2 and round < 6) : (round += 1) {
+        const pop = waitPopup(app, true, 15_000) orelse break;
+        // The popover grows when the two stat replies fill its detail
+        // rows ("modified ..." under each side), which moves the
+        // buttons: aim only once both are in and the frame is still.
+        const filled_deadline = clock.nowMs() + 8_000;
+        while (clock.nowMs() < filled_deadline and
+            (ocrCountScaled(allocator, app, pop, "modified", 2) orelse 0) < 2) pumpRenameFor(app, 300);
+        _ = app.waitVisualSettle(pop, 600, 8_000, 0.002, null);
+        const about_skip = (ocrCountScaled(allocator, app, pop, "SKIPME", 2) orelse 0) > 0;
+        const about_pay = (ocrCountScaled(allocator, app, pop, "PAYLOAD", 2) orelse 0) > 0;
+        if (!about_skip and !about_pay) {
+            pumpRenameFor(app, 500);
+            continue;
+        }
+        const verb = if (about_skip) "Skip" else "Replace";
+        if (!clickOcrWordScaled(allocator, app, pop, verb, 1, 8_000)) {
+            viewerShot(allocator, app, pop, "files-tx-conflict");
+            return "files transfers: the conflict dialog lacks Replace or Skip";
+        }
+        // The decision must take: the dialog closes or moves on to the
+        // other name. A click that did not land fails here, rather than
+        // being counted and surfacing later as a stuck conflict row.
+        const name = if (about_skip) "SKIPME" else "PAYLOAD";
+        var moved_on = false;
+        const move_deadline = clock.nowMs() + 6_000;
+        while (!moved_on and clock.nowMs() < move_deadline) {
+            pumpRenameFor(app, 400);
+            const still = openPopup(app) orelse {
+                moved_on = true;
+                break;
+            };
+            moved_on = (ocrCountScaled(allocator, app, still, name, 2) orelse 0) == 0;
+        }
+        if (!moved_on) {
+            viewerShot(allocator, app, pop, "files-tx-stuck");
+            return "files transfers: a conflict decision click did not take";
+        }
+        answered += 1;
+        pumpRenameFor(app, 800);
+    }
+    if (answered < 2) {
+        viewerShot(allocator, app, child.win, "files-tx-noconflict");
+        return "files transfers: pasting onto two existing names did not ask about both";
+    }
+    const deadline = clock.nowMs() + 20_000;
+    while (clock.nowMs() < deadline and !fileHas(d_pay, "new payload\n")) pumpRenameFor(app, 200);
+    if (!fileHas(d_pay, "new payload\n")) return "files transfers: Replace did not overwrite PAYLOAD.txt";
+    if (!fileHas(d_skip, "old skip\n")) return "files transfers: Skip still overwrote SKIPME.txt";
+    say("files transfers: the conflict dialog replaced one item and skipped the other");
+
+    // The Transfer Center: a click on the transfers strip opens it
+    // (its documented entry beside Ctrl+Shift+J), with the paste's
+    // card; a second click closes it.
+    _ = waitPopup(app, false, 5_000);
+    _ = app.waitVisualSettle(child.win, 400, 5_000, 0.002, null);
+    if (!clickOcrWordScaled(allocator, app, child.win, "Copied", 1, 4_000) and
+        !clickOcrWordScaled(allocator, app, child.win, "queued", 1, 4_000))
+        return "files transfers: no transfers strip to open the Transfer Center from";
+    pumpRenameFor(app, 1_000);
+    if (!viewerWaitOcr(allocator, app, child.win, "Transfers", 10_000)) {
+        viewerShot(allocator, app, child.win, "files-tx-center");
+        return "files transfers: the strip opened no Transfer Center";
+    }
+    // The paste is one batch card ("Copy 2 items"; the strip says
+    // "Copied"), finished, with nothing left active or queued once the
+    // skipped member has settled.
+    var settled = false;
+    const settle_deadline = clock.nowMs() + 20_000;
+    while (!settled and clock.nowMs() < settle_deadline) {
+        settled = (ocrCountScaled(allocator, app, child.win, "0 queued", 2) orelse 0) > 0;
+        if (!settled) pumpRenameFor(app, 1_000);
+    }
+    if (!viewerWaitOcr(allocator, app, child.win, "Copy 2", 10_000) or !settled) {
+        // Expand the batch card so the failure shot names its members.
+        if (ocrWordCenter(allocator, app, child.win, "Copy")) |cp| {
+            app.clickEx(child.win, cp.x - 45, cp.y, 1, 60, 1) catch {};
+            pumpRenameFor(app, 800);
+            viewerShot(allocator, app, child.win, "files-tx-expanded");
+        }
+        viewerShot(allocator, app, child.win, "files-tx-card");
+        return "files transfers: the Transfer Center shows no card for the copy";
+    }
+    // The strip sits under the open center; its sentence is the last
+    // "Copied"/"queued" on screen.
+    if (!clickOcrWordScaled(allocator, app, child.win, "Copied", 1, 4_000) and
+        !clickOcrWordScaled(allocator, app, child.win, "waiting to", 1, 4_000))
+        return "files transfers: no strip to close the Transfer Center with";
+    pumpRenameFor(app, 1_000);
+    if ((ocrCountScaled(allocator, app, child.win, "Transfers", 2) orelse 0) != 0) {
+        viewerShot(allocator, app, child.win, "files-tx-close");
+        return "files transfers: the strip did not close the Transfer Center";
+    }
+    say("files transfers: the strip opened the Transfer Center with the paste's card and closed it");
+
+    if (!closeRenameFiles(app, child)) return "files transfers: the Files window did not close cleanly";
+    return null;
+}
+
+/// Tab from the focused Mirror button over Close to Execute Sync and
+/// activate it.
+fn executeSyncByKeyboard(app: *appdrive.App, cw: u32) bool {
+    app.pressKey(cw, "Tab") catch return false;
+    pumpRenameFor(app, 150);
+    app.pressKey(cw, "Tab") catch return false;
+    pumpRenameFor(app, 150);
+    app.pressKey(cw, "space") catch return false;
+    pumpRenameFor(app, 400);
+    return true;
+}
+
+/// Where a confirmation raised from `parent` shows up: inside it (an
+/// Adw window hosts its dialogs), or as a toplevel of its own (a plain
+/// GtkWindow parent gets a floating dialog window). @return the window
+/// holding the words `first second` and their centre.
+fn findConfirm(allocator: std.mem.Allocator, app: *appdrive.App, parent: u32, known: []const u32, first: []const u8, second: []const u8, timeout_ms: i64) ?struct { win: u32, at: Point } {
+    const deadline = clock.nowMs() + timeout_ms;
+    while (clock.nowMs() < deadline) {
+        if (hasToplevelOtherThan(app, known)) |d| {
+            if (ocrPairCenter(allocator, app, d, first, second, 1_500)) |pt| return .{ .win = d, .at = pt };
+        }
+        if (ocrPairCenter(allocator, app, parent, first, second, 1_000)) |pt| return .{ .win = parent, .at = pt };
+    }
+    return null;
+}
+
+/// Compare / Sync with Copied (the background menu's Paste Special):
+/// a mirror deletion is NEVER carried out without the confirmation
+/// that lists it -- cancelling leaves the target untouched -- and a
+/// confirmed one goes to the host's trash, not to unlink, while the
+/// source-only file is copied across.
+fn filesCompareSyncStage(
+    allocator: std.mem.Allocator,
+    app: *appdrive.App,
+    rt: []const u8,
+    wl: [*:0]const u8,
+) ?[]const u8 {
+    const ocr = @import("util/ocr.zig");
+    if (!ocr.available()) {
+        say("files compare: tesseract unavailable; skipping");
+        return null;
+    }
+    var p: [9][600:0]u8 = undefined;
+    const top = std.fmt.bufPrintZ(&p[0], "{s}/fcmp", .{rt}) catch return "files compare: path";
+    const src = std.fmt.bufPrintZ(&p[1], "{s}/SRCDIR", .{top}) catch return "files compare: path";
+    const dst = std.fmt.bufPrintZ(&p[2], "{s}/TGTDIR", .{top}) catch return "files compare: path";
+    _ = c.mkdir(top.ptr, 0o700);
+    _ = c.mkdir(src.ptr, 0o700);
+    _ = c.mkdir(dst.ptr, 0o700);
+    const src_same = std.fmt.bufPrintZ(&p[3], "{s}/SAME.txt", .{src}) catch return "files compare: path";
+    const src_only = std.fmt.bufPrintZ(&p[4], "{s}/ONLYSRC.txt", .{src}) catch return "files compare: path";
+    const dst_same = std.fmt.bufPrintZ(&p[5], "{s}/SAME.txt", .{dst}) catch return "files compare: path";
+    const extra = std.fmt.bufPrintZ(&p[6], "{s}/EXTRA.txt", .{dst}) catch return "files compare: path";
+    const copied = std.fmt.bufPrintZ(&p[7], "{s}/ONLYSRC.txt", .{dst}) catch return "files compare: path";
+    // XDG_DATA_HOME is the rig dir, so the home trash is there.
+    const trashed = std.fmt.bufPrintZ(&p[8], "{s}/Trash/files/EXTRA.txt", .{rt}) catch return "files compare: path";
+    if (!writeFile(src_same, "same\n") or !writeFile(src_only, "only in source\n") or
+        !writeFile(dst_same, "same\n") or !writeFile(extra, "only in target\n"))
+        return "files compare: seed";
+
+    const child = launchRenameFiles(app, top, "fcmp", "", wl) orelse
+        return "files compare: the Files window never appeared";
+    defer if (renamefiles_pid > 0) reap(renamefiles_pid, c.SIGTERM, 3000);
+    if (!viewerWaitOcr(allocator, app, child.win, "SRCDIR", 40_000)) return "files compare: the listing never rendered";
+    _ = app.waitVisualSettle(child.win, 400, 10_000, 0.002, null);
+    const win = app.winById(child.win) orelse return "files compare: window vanished";
+    const w = @as(f64, @floatFromInt(win.w));
+    const h = @as(f64, @floatFromInt(win.h));
+
+    // Copy the source folder, open the target.
+    const src_row = ocrRowCenter(allocator, app, child.win, "SRCDIR", 10_000) orelse return "files compare: SRCDIR row not found";
+    app.clickEx(child.win, src_row.x, src_row.y, 1, 60, 1) catch return "files compare: selecting SRCDIR failed";
+    pumpRenameFor(app, 300);
+    app.pressKey(child.win, "ctrl+c") catch return "files compare: ctrl+c failed";
+    pumpRenameFor(app, 300);
+    const dst_row = ocrRowCenter(allocator, app, child.win, "TGTDIR", 10_000) orelse return "files compare: TGTDIR row not found";
+    app.clickEx(child.win, dst_row.x, dst_row.y, 1, 60, 2) catch return "files compare: opening TGTDIR failed";
+    if (!viewerWaitOcr(allocator, app, child.win, "EXTRA", 20_000)) return "files compare: the target folder never rendered";
+    pumpRenameFor(app, 800);
+
+    // Background menu -> Paste Special -> Compare / Sync with Copied.
+    // Every toplevel already up (the rig's main window included), so
+    // the compare window is the one that appears after this.
+    var known: [32]u32 = undefined;
+    var n_known: usize = 0;
+    _ = app.drainLive(2_000);
+    for (app.windows.items) |kw| {
+        if (kw.popup or n_known >= known.len) continue;
+        known[n_known] = kw.id;
+        n_known += 1;
+    }
+    app.clickEx(child.win, w * 0.58, h * 0.8, 3, 60, 1) catch return "files compare: background right-click failed";
+    const menu = waitPopup(app, true, 10_000) orelse return "files compare: the background menu never opened";
+    _ = app.waitVisualSettle(menu, 400, 5_000, 0.002, null);
+    // "pecial": at native scale tesseract reads the row "Paste special".
+    if (!clickOcrWordScaled(allocator, app, menu, "pecial", 1, 8_000)) {
+        viewerShot(allocator, app, menu, "files-cmp-menu");
+        return "files compare: the background menu has no Paste Special";
+    }
+    var sub: ?u32 = null;
+    const sub_deadline = clock.nowMs() + 8_000;
+    while (sub == null and clock.nowMs() < sub_deadline) sub = newestPopupExcept(app, menu);
+    const submenu = sub orelse return "files compare: Paste Special opened no submenu";
+    _ = app.waitVisualSettle(submenu, 300, 5_000, 0.002, null);
+    if (!clickOcrWordScaled(allocator, app, submenu, "Compare", 1, 8_000)) {
+        viewerShot(allocator, app, submenu, "files-cmp-sub");
+        return "files compare: Paste Special offers no Compare / Sync";
+    }
+    var cmp_win: ?u32 = null;
+    const cmp_deadline = clock.nowMs() + 20_000;
+    while (cmp_win == null and clock.nowMs() < cmp_deadline) cmp_win = hasToplevelOtherThan(app, known[0..n_known]);
+    const cw = cmp_win orelse return "files compare: no Compare / Sync window opened";
+    if (!viewerWaitOcr(allocator, app, cw, "EXTRA", 30_000)) {
+        viewerShot(allocator, app, cw, "files-cmp-scan");
+        return "files compare: the compare never listed the target-only file";
+    }
+    _ = app.waitVisualSettle(cw, 400, 8_000, 0.002, null);
+
+    // Mark target-only rows for the trash, Execute, then CANCEL.
+    if (!clickOcrWordScaled(allocator, app, cw, "Mirror:", 1, 8_000)) return "files compare: no Mirror button";
+    pumpRenameFor(app, 600);
+    // Every toplevel now up, the compare window included: the
+    // confirmation may come as a window of its own.
+    if (n_known < known.len) {
+        known[n_known] = cw;
+        n_known += 1;
+    }
+    // Execute Sync by keyboard: its white-on-blue label does not OCR,
+    // and a bare "Execute" matches the info line ("..., then
+    // Execute."). The Mirror click left focus on Mirror; Close and
+    // Execute Sync follow it in the button row.
+    if (!executeSyncByKeyboard(app, cw)) return "files compare: could not reach Execute Sync";
+    const first_confirm = findConfirm(allocator, app, cw, known[0..n_known], "Trash", "and", 15_000) orelse {
+        viewerShot(allocator, app, cw, "files-cmp-noconfirm");
+        return "files compare: Execute with a mirror deletion asked for no confirmation";
+    };
+    if (c.access(extra.ptr, c.F_OK) != 0) return "files compare: the deletion ran before its confirmation";
+    app.pressKey(first_confirm.win, "Escape") catch return "files compare: Escape failed";
+    pumpRenameFor(app, 2_000);
+    if (c.access(extra.ptr, c.F_OK) != 0) return "files compare: a CANCELLED confirmation still deleted the target-only file";
+    if (c.access(copied.ptr, c.F_OK) == 0) return "files compare: a cancelled sync still copied";
+    say("files compare: cancelling the listed deletion left the target untouched");
+
+    // Execute again, confirm: the target-only file goes to the TRASH.
+    if (!clickOcrWordScaled(allocator, app, cw, "Mirror:", 1, 8_000)) return "files compare: no Mirror button (second time)";
+    pumpRenameFor(app, 600);
+    if (!executeSyncByKeyboard(app, cw)) return "files compare: could not reach Execute Sync (second time)";
+    const confirm2 = findConfirm(allocator, app, cw, known[0..n_known], "Trash", "and", 15_000) orelse
+        return "files compare: the second Execute asked for no confirmation";
+    app.clickEx(confirm2.win, confirm2.at.x, confirm2.at.y, 1, 60, 1) catch return "files compare: confirming failed";
+    if (!waitPathState(extra, false, 20_000, app)) return "files compare: the confirmed mirror deletion never happened";
+    if (!waitPathState(trashed, true, 10_000, app)) return "files compare: the mirror deletion did not go to the trash";
+    if (!waitPathState(copied, true, 20_000, app)) return "files compare: the source-only file was not copied across";
+    say("files compare: the confirmed deletion went to the trash and the source-only file was copied");
+
+    if (!closeRenameFiles(app, child)) return "files compare: the Files window did not close cleanly";
     return null;
 }
 
