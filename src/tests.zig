@@ -163,6 +163,7 @@ comptime {
     _ = @import("ui/editorfind.zig");
     _ = @import("ui/editorkeys.zig");
     _ = @import("ui/editorio.zig");
+    _ = @import("ui/hostlink.zig");
     _ = @import("ui/editorjournal.zig");
     _ = @import("ui/editorlsp_conn.zig");
     _ = @import("ui/editorlsp_link.zig");

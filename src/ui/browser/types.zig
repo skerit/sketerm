@@ -130,8 +130,35 @@ pub const UserDirEntry = struct {
     path: []u8,
 };
 
-/// One shared connection to a host's daemon. Referenced by tabs and
-/// transfers; owned by the BrowserView.
+/// Where a HostConn that did not dial borrows its connection from.
+pub const Lease = union(enum) {
+    pane: @import("../../terminal.zig").Terminal.FsLease,
+    shared: @import("../hostlink.zig").Lessee,
+
+    pub fn conn(self: *Lease) ?*muxclient.Conn {
+        return switch (self.*) {
+            .pane => |*l| l.conn(),
+            .shared => |*l| l.conn(),
+        };
+    }
+
+    pub fn flush(self: *Lease) void {
+        switch (self.*) {
+            .pane => |*l| l.flush(),
+            .shared => |*l| l.flush(),
+        }
+    }
+
+    pub fn release(self: *Lease) void {
+        switch (self.*) {
+            .pane => |*l| l.release(),
+            .shared => |*l| l.release(),
+        }
+    }
+};
+
+/// One connection to a host's daemon as one view sees it. Referenced
+/// by tabs and transfers; owned by the BrowserView.
 pub const HostConn = struct {
     view: *BrowserView,
     /// null = local; otherwise the terminal host-string form.
@@ -139,9 +166,11 @@ pub const HostConn = struct {
     /// The connection this HostConn dialed and owns. A lent HostConn
     /// keeps it inert (no fd) and talks through `lease` instead.
     conn: muxclient.Conn = undefined,
-    /// A pane session's connection lent to this host (`BrowserView.lender`):
-    /// its frames arrive through the Terminal, and its end is `hostDied`.
-    lease: ?@import("../../terminal.zig").Terminal.FsLease = null,
+    /// The connection this host rides when it did not dial one itself:
+    /// a pane session's connection lent to it (`BrowserView.lender`), or
+    /// the process's shared link to the host (`ui/hostlink.zig`). Either
+    /// way its frames arrive through the lender, and its end is `hostDied`.
+    lease: ?Lease = null,
     state: enum { connecting, ready, dead } = .connecting,
     watch_id: c.guint = 0,
     /// POLLOUT watch draining a queued-send backlog (0 = none). Sends
@@ -150,9 +179,6 @@ pub const HostConn = struct {
     /// Idle continuing a budget-cut frame drain (0 = none): one main-
     /// loop dispatch parses at most a few ms of buffered frames.
     drain_idle: c.guint = 0,
-    /// Owning view died while the connect thread was in flight; the
-    /// idle handback frees this struct.
-    orphaned: bool = false,
     /// The host's freedesktop Templates dir, resolved by the daemon
     /// that owns the files: "New from Template" on a remote tab must
     /// offer THAT host's templates, and only its daemon can read its

@@ -132,9 +132,7 @@ pub const BrowserView = struct {
     /// Backoff timers re-dialing hosts whose connection dropped while
     /// tabs were still on them (conn.zig scheduleReconnect).
     reconnects: std.ArrayList(*@import("conn.zig").Reconnect) = .empty,
-    next_req: u32 = 1,
     next_remote_thumb_id: u64 = 1,
-    next_view: u32 = 1,
     tabs: std.ArrayList(*BTab) = .empty,
     pending: std.ArrayList(*Pending) = .empty,
     /// Remote opens whose host mount is still starting.
@@ -1464,6 +1462,7 @@ pub const BrowserView = struct {
         for (self.watches.items) |wt| wt.destroy(self.allocator);
         self.watches.deinit(self.allocator);
         if (self.compare) |cmp| cmp.close();
+        for (self.tabs.items) |t| @import("conn.zig").releaseTabOnLease(self, t);
         for (self.tabs.items) |t| {
             @import("colview.zig").invalidateBackingRefs(t);
             t.deinit();
@@ -1502,15 +1501,10 @@ pub const BrowserView = struct {
         }
         self.jobs.deinit(self.allocator);
         self.shutdownPreviewTransfers();
-        for (self.conns.items) |hc| {
-            if (hc.state == .connecting) {
-                // A worker thread still owns the connect; the idle
-                // handback frees the struct.
-                hc.orphaned = true;
-            } else {
-                hc.destroy(self.allocator);
-            }
-        }
+        // Every HostConn borrows its connection (a shared link or a
+        // pane's lane); a connect still in flight belongs to the link,
+        // so leaving it is enough.
+        for (self.conns.items) |hc| hc.destroy(self.allocator);
         self.conns.deinit(self.allocator);
         // The clipboard is process-wide: closing one pane must not
         // empty it for the others.

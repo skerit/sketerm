@@ -2967,7 +2967,6 @@ test "a silent remote thumbnail is abandoned and the queue moves on" {
     self.remote_thumbs = .empty;
     self.remote_thumb_queue = .empty;
     self.remote_thumb_watch = 0;
-    self.next_req = 1;
     defer {
         var it = self.thumb_failed.iterator();
         while (it.next()) |kv| a.free(kv.key_ptr.*);

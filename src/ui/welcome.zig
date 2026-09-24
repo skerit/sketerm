@@ -237,16 +237,26 @@ fn ctxFree(user: ?*anyopaque) callconv(.c) void {
 
 /// Ask the daemon about its Screen Recording grant.
 ///
-/// A short-lived local connection with a deadline, on the main thread:
-/// the same shape `Window.daemonSpawnPane` already uses for a local
-/// unix socket. It runs only when the permission page is shown or
-/// refreshed, so a user who walks the tour and closes it never causes
-/// a daemon round trip.
+/// One local request with a deadline, on the main thread: the same shape
+/// `Window.daemonSpawnPane` already uses for a local unix socket. It
+/// rides the process's pooled local connection (`editorio.pool`) when
+/// one is idle and hands it back after a clean answer, so refreshing the
+/// page does not dial per click. It runs only when the permission page
+/// is shown or refreshed, so a user who walks the tour and closes it
+/// never causes a daemon round trip.
 fn queryPermission(ctx: *Ctx, do_request: bool) PermState {
     if (comptime !has_permission_step) return .unsupported;
 
-    var conn = muxtabs.muxConnect(ctx.window, null) catch return .unknown;
-    defer conn.deinit();
+    const editorio = @import("editorio.zig");
+    var conn = blk: {
+        if (editorio.pool.acquireIdle(null)) |idle| {
+            var fs = idle;
+            break :blk editorio.takeConn(&fs);
+        }
+        break :blk muxtabs.muxConnect(ctx.window, null) catch return .unknown;
+    };
+    var clean = false;
+    defer if (clean) editorio.returnConn(null, conn) else conn.deinit();
 
     conn.sendJson(.fs_op, .{
         .req = @as(u32, 1),
@@ -254,7 +264,10 @@ fn queryPermission(ctx: *Ctx, do_request: bool) PermState {
     }) catch return .unknown;
 
     const frame = conn.recvExpectFor(&.{.fs_reply}, 3000) catch return .unknown;
-    defer frame.deinit(ctx.allocator);
+    // Frames belong to the connection's allocator (a pooled one is the
+    // C allocator's), not the dialog's.
+    defer frame.deinit(conn.allocator);
+    clean = true;
 
     const Reply = struct {
         ok: bool = false,

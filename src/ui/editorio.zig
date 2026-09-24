@@ -112,6 +112,13 @@ pub fn KeyedPool(comptime Conn: type, comptime Ops: type) type {
 
         /// A healthy idle connection for `host`, else a fresh dial.
         pub fn acquire(self: *Self, host: ?[]const u8) !Lease {
+            if (self.acquireIdle(host)) |conn| return .{ .conn = conn, .reused = true };
+            return .{ .conn = try Ops.dial(host), .reused = false };
+        }
+
+        /// A healthy idle connection for `host`, never a dial: for the
+        /// main thread, which must not block on an ssh bootstrap.
+        pub fn acquireIdle(self: *Self, host: ?[]const u8) ?Conn {
             const key = host orelse "";
             const now = clock.nowMs();
             var stale: std.ArrayList(Conn) = .empty;
@@ -136,8 +143,7 @@ pub fn KeyedPool(comptime Conn: type, comptime Ops: type) type {
                 }
             }
             self.unlock();
-            if (found) |conn| return .{ .conn = conn, .reused = true };
-            return .{ .conn = try Ops.dial(host), .reused = false };
+            return found;
         }
 
         /// Hand a lease back: kept for reuse when it is still usable and
@@ -231,8 +237,32 @@ const FsOps = struct {
 
 pub const FsPool = KeyedPool(fsdrive.Fs, FsOps);
 
-/// The process-wide pool every editor worker draws from.
+/// The process-wide pool of blocking request/reply connections: every
+/// editor worker, the app switcher's list/stop ops and the welcome
+/// tour's permission probe draw from it. (Main-thread clients that
+/// stream, the file manager and the LSP links, share `hostlink.zig`.)
 pub var pool: FsPool = .{ .alloc = std.heap.c_allocator };
+
+/// Take the bare mux connection out of a pooled lease, for a client that
+/// speaks daemon verbs other than the file service. Hand it back with
+/// `returnConn`.
+pub fn takeConn(fs: *fsdrive.Fs) muxclient.Conn {
+    const conn = fs.conn;
+    fs.conn = .{ .allocator = fs.allocator, .fd = -1 };
+    fs.pending_ops.deinit(fs.allocator);
+    for (fs.deltas.items) |*d| d.deinit();
+    fs.deltas.deinit(fs.allocator);
+    for (fs.job_events.items) |*e| e.deinit();
+    fs.job_events.deinit(fs.allocator);
+    return conn;
+}
+
+/// Give a connection taken with `takeConn` (or dialed with the C
+/// allocator) back to the pool for the next user on `host`.
+pub fn returnConn(host: ?[]const u8, conn: muxclient.Conn) void {
+    var lease: FsPool.Lease = .{ .conn = fsdrive.Fs.initConn(std.heap.c_allocator, conn), .reused = false };
+    pool.release(host, &lease);
+}
 
 /// A daemon answer (the connection is fine) versus a transport failure.
 pub fn isTransportError(err: anyerror) bool {

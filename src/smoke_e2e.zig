@@ -876,6 +876,14 @@ pub fn main() u8 {
         teardown();
         return 0;
     }
+    if (c.getenv("SKETERM_SMOKE_E2E_FILES_REUSE_ONLY") != null) {
+        const app = drive orelse return fail("focused files-reuse smoke has no display driver");
+        if (!have_wl) return fail("focused files-reuse smoke is GTK/Wayland-only");
+        if (filesReuseStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
+        say("files reuse: a second file-manager tab on the same host rode the first one's connection");
+        teardown();
+        return 0;
+    }
     if (c.getenv("SKETERM_SMOKE_E2E_VIEWER_ONLY") != null) {
         const app = drive orelse return fail("focused viewer smoke has no display driver");
         if (!have_wl) return fail("focused viewer smoke is GTK/Wayland-only");
@@ -7283,6 +7291,75 @@ fn viewerShot(allocator: std.mem.Allocator, app: *appdrive.App, win_id: u32, tag
     defer allocator.free(shot.png);
     writePng(path, shot.png);
     _ = c.fprintf(platform.stderr(), "smoke-e2e: viewer failure screenshot: %s\n", path.ptr);
+}
+
+/// Wait until the fake ssh's dial count holds still for two seconds
+/// (a host mount warm-up dials asynchronously after a listing lands).
+fn settledSshDials(allocator: std.mem.Allocator, app: *appdrive.App, rt: [:0]const u8) usize {
+    var last = sshDials(allocator, rt);
+    var still: u32 = 0;
+    const deadline = clock.nowMs() + 20_000;
+    while (still < 2 and clock.nowMs() < deadline) {
+        pumpFor(app, 1000);
+        const now = sshDials(allocator, rt);
+        if (now == last) still += 1 else still = 0;
+        last = now;
+    }
+    return last;
+}
+
+/// A second file-manager tab on a host the process already reaches
+/// joins that connection (ui/hostlink.zig): opening it must not dial
+/// the fake-SSH host again. It used to dial once per view.
+fn filesReuseStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]const u8, rt: [:0]const u8) ?[]const u8 {
+    if (!@import("util/ocr.zig").available()) {
+        say("files reuse: tesseract unavailable; skipping");
+        return null;
+    }
+    if (remote_mux_pid <= 0) return "files reuse: the fake-SSH daemon is not running";
+    var dir_buf: [512:0]u8 = undefined;
+    const dir = std.fmt.bufPrintZ(&dir_buf, "{s}/freuse", .{rt}) catch return "files reuse: dir path";
+    _ = c.mkdir(dir.ptr, 0o700);
+    var sub_buf: [540:0]u8 = undefined;
+    const sub = std.fmt.bufPrintZ(&sub_buf, "{s}/sub", .{dir}) catch return "files reuse: sub path";
+    _ = c.mkdir(sub.ptr, 0o700);
+    var seed_buf: [600:0]u8 = undefined;
+    if (!writeFile(std.fmt.bufPrintZ(&seed_buf, "{s}/firstentry.txt", .{dir}) catch return "files reuse: seed", "1\n"))
+        return "files reuse: seed first";
+    if (!writeFile(std.fmt.bufPrintZ(&seed_buf, "{s}/secondentry.txt", .{sub}) catch return "files reuse: seed", "2\n"))
+        return "files reuse: seed second";
+
+    var panes: [2]u32 = .{ 0, 0 };
+    defer for (panes) |p| {
+        if (p != 0) _ = closePaneGone(allocator, sock, p);
+    };
+    var dials_after_first: usize = 0;
+    for ([_][:0]const u8{ dir, sub }, [_][]const u8{ "firstentry", "secondentry" }, 0..) |path, word, i| {
+        var req_buf: [700]u8 = undefined;
+        const req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"new-browser-tab\",\"data\":\"localhost:{s}\"}}\n", .{path}) catch
+            return "files reuse: request";
+        const resp = roundtrip(allocator, sock, req) orelse return "files reuse: new-browser-tab failed";
+        defer allocator.free(resp);
+        panes[i] = parseNumAfter(resp, "\"pane\":") orelse return "files reuse: new-browser-tab named no pane";
+        var seen = false;
+        const deadline = clock.nowMs() + 40_000;
+        while (!seen and clock.nowMs() < deadline) {
+            seen = (ocrCountScaled(allocator, app, mainWin(app).id, word, 2) orelse 0) > 0;
+            if (!seen) pumpFor(app, 500);
+        }
+        if (!seen) {
+            viewerShot(allocator, app, mainWin(app).id, "files-reuse-listing");
+            return "files reuse: the remote listing never rendered";
+        }
+        const dials = settledSshDials(allocator, app, rt);
+        if (i == 0) {
+            dials_after_first = dials;
+        } else if (dials != dials_after_first) {
+            _ = c.fprintf(platform.stderr(), "smoke-e2e: files reuse: the second tab made %zu ssh dial(s)\n", dials - dials_after_first);
+            return "files reuse: a second file-manager tab on the same host dialed it again";
+        }
+    }
+    return null;
 }
 
 /// Quick Look / `sketerm view` over a REMOTE batch keeps the daemon

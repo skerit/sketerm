@@ -15,6 +15,7 @@ const mux_cli = @import("../ipc/mux_cli.zig");
 const muxtabs = @import("muxtabs.zig");
 const assistants = @import("assistants.zig");
 const webwatch = @import("webwatch.zig");
+const editorio = @import("editorio.zig");
 
 /// The assistant label behind a `sock:` daemon host, from the window's
 /// registry watcher; the host spec itself when it is unknown.
@@ -71,11 +72,11 @@ const DaemonState = struct {
     host: ?[]u8,
     origin: []u8,
     listing: ?std.json.Parsed(mux_cli.Welcome) = null,
-    /// Idle persistent connection, reused by every poll/stop/attach for
-    /// this daemon — dialing fresh per poll spawned ssh every 5s.
-    conn: ?mux_client.Conn = null,
-    /// A worker thread currently owns the connection; ops are strictly
-    /// serialized per daemon.
+    /// A worker thread is running an op for this daemon; ops are
+    /// strictly serialized per daemon. Between ops the connection idles
+    /// in the process-wide pool (`editorio.pool`), so every poll, stop
+    /// and attach -- and the next switcher opened -- reuses it: dialing
+    /// fresh per poll spawned ssh every 5s.
     busy: bool = false,
     /// At most one stop request queued while busy (switcher allocator).
     pending_kill: ?[]u8 = null,
@@ -88,7 +89,6 @@ const DaemonState = struct {
         if (self.host) |host| allocator.free(host);
         allocator.free(self.origin);
         if (self.listing) |*listing| listing.deinit();
-        if (self.conn) |*conn| conn.deinit();
         if (self.pending_kill) |session| allocator.free(session);
         if (self.pending_kill_origin) |origin_id| allocator.free(origin_id);
     }
@@ -1138,7 +1138,7 @@ fn discoverDaemons(self: *Switcher) void {
 }
 
 /// One serialized daemon operation (list poll or session stop). It
-/// borrows the daemon's persistent connection for the thread's lifetime
+/// borrows the host's idle pooled connection for the thread's lifetime
 /// and hands it back on success; a failed op drops the connection (its
 /// stream may hold a half-consumed reply) and the next op redials once.
 const Op = struct {
@@ -1242,10 +1242,7 @@ fn startOp(
         }
         self.markKilling(daemon_host, session);
     }
-    if (daemon.conn) |conn| {
-        ctx.conn = conn;
-        daemon.conn = null;
-    }
+    ctx.conn = takeIdle(daemon_host);
     daemon.busy = true;
     self.pending_ops += 1;
     // First dial to a remote host: a UDP ticket minted over an already
@@ -1285,6 +1282,12 @@ fn opFailedLocally(ctx: *Op) void {
     }
     ctx.destroy();
     if (self.opDone() and !self.dead) self.updateStatus();
+}
+
+/// The host's idle pooled connection, never a dial (main thread).
+fn takeIdle(host: ?[]const u8) ?mux_client.Conn {
+    var fs = editorio.pool.acquireIdle(host) orelse return null;
+    return editorio.takeConn(&fs);
 }
 
 fn opConnect(ctx: *Op) ?mux_client.Conn {
@@ -1385,7 +1388,7 @@ fn onOpIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
             // op redials once.
             if (ctx.ok) {
                 if (ctx.conn) |conn| {
-                    daemon.conn = conn;
+                    editorio.returnConn(host, conn);
                     ctx.conn = null;
                 }
             }
@@ -1465,12 +1468,7 @@ fn startAttach(self: *Switcher, target: SessionTarget, lease: muxtabs.Lease, pla
     // (on a remote host a fresh dial is an ssh spawn).
     var reuse: ?mux_client.Conn = null;
     if (findDaemon(self, target_host)) |daemon| {
-        if (!daemon.busy) {
-            if (daemon.conn) |conn| {
-                reuse = conn;
-                daemon.conn = null;
-            }
-        }
+        if (!daemon.busy) reuse = takeIdle(target_host);
     }
     if (!muxtabs.AttachJob.start(self.win, target_host, target.session, target.origin_id orelse "", lease, placement, reuse, onAttachReady, @ptrCast(self))) {
         if (reuse) |*conn| conn.deinit();

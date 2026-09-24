@@ -519,8 +519,7 @@ pub fn stopFlat(self: *BrowserView, tab: *BTab) void {
     tab.root.flat = false;
     tab.root.loaded = false;
     // A closed view id is spent; the fresh subscription needs its own.
-    tab.root.view_id = self.next_view;
-    self.next_view += 1;
+    tab.root.view_id = self.mintViewId();
     self.openDir(tab, tab.root);
     self.setStatusFmt("flat view off: {s}", .{tab.root.path});
     self.renderTab(tab);

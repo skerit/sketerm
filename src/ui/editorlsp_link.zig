@@ -1,17 +1,19 @@
-//! Remote LSP transport: one dedicated mux connection per host, carrying
-//! language servers' raw JSON-RPC as byte channels.
+//! Remote LSP transport: one link per host, carrying language servers'
+//! raw JSON-RPC as byte channels.
 //!
 //! The daemon on the file's host spawns the server near the files
 //! (`lsp_open`) and relays its stdio; this side relays those bytes into
 //! an ordinary `Session`. Only `Conn.pumpWrite` and `handleFrame` know the
-//! transport is not a pipe. The link is separate from the editor's file
-//! connections on purpose: those are short request/reply pumps that
-//! would tangle with a long-lived multiplexed frame stream.
+//! transport is not a pipe. The link rides the process's shared
+//! connection to the host (`hostlink.zig`, the one file-manager panes
+//! and pickers on that host use too) rather than dialing its own; it is
+//! separate only from the editor's file pool, whose short blocking
+//! request/reply pumps would tangle with a long-lived frame stream.
 //!
 //! ## A dead link is redialed on demand, with backoff
 //!
-//! The connect runs on a worker (the ssh bootstrap blocks) and hands
-//! back through `g_idle_add`. A link that failed, or whose daemon
+//! The shared link's connect runs on a worker (the ssh bootstrap blocks)
+//! and hands back through `g_idle_add`. A link that failed, or whose daemon
 //! predates `lsp:true`, stays listed as `.dead` with a retry time; the
 //! next attach that needs the host (a feature request, an edit, a newly
 //! opened document) redials once that time has passed, doubling the wait
@@ -35,6 +37,7 @@ const wire = @import("../mux/wire.zig");
 const servers = @import("../lsp/servers.zig");
 const paths = @import("../filebrowser/paths.zig");
 const Config = @import("../config.zig").Config;
+const hostlink = @import("hostlink.zig");
 const dbg = editorlsp.dbg;
 
 /// First wait before redialing a failed host, and the ceiling the
@@ -52,10 +55,9 @@ pub const RemoteLink = struct {
     /// Host part of the spec ("box", "user@box", "udp:box"), owned.
     host: []u8,
     state: enum { connecting, up, dead } = .connecting,
-    /// Valid only while `.up`.
-    conn: muxclient.Conn = undefined,
-    watch_in: c_uint = 0,
-    watch_out: c_uint = 0,
+    /// This link's place on the host's shared connection; joined by
+    /// `dial`, left when the link dies or is dropped.
+    lessee: hostlink.Lessee = undefined,
     next_req: u32 = 1,
     /// lsp_open requests in flight.
     pending: std.ArrayList(Pending) = .empty,
@@ -69,8 +71,7 @@ pub const RemoteLink = struct {
     const Pending = struct { req: u32, tab_id: u64 };
 
     pub fn destroyLink(self: *RemoteLink) void {
-        self.dropLinkWatches();
-        if (self.state == .up) self.conn.deinit();
+        if (self.state != .dead) self.lessee.release();
         self.state = .dead;
         const a = registry.alloc;
         self.pending.deinit(a);
@@ -79,11 +80,9 @@ pub const RemoteLink = struct {
         a.destroy(self);
     }
 
-    fn dropLinkWatches(self: *RemoteLink) void {
-        for ([_]*c_uint{ &self.watch_in, &self.watch_out }) |w| {
-            if (w.* != 0) _ = c.g_source_remove(w.*);
-            w.* = 0;
-        }
+    /// The shared connection; valid only while `.up`.
+    pub fn io(self: *RemoteLink) *muxclient.Conn {
+        return self.lessee.conn().?;
     }
 
     /// Whether a dead link may be redialed now.
@@ -91,24 +90,66 @@ pub const RemoteLink = struct {
         return self.state == .dead and now_ms >= self.retry_at_ms;
     }
 
-    /// Start (or restart) the connect worker. The link is `.connecting`
-    /// from here on, so attaches park on it.
+    /// Join (or open) the host's shared connection. The link is
+    /// `.connecting` until it is up, so attaches park on it.
     pub fn dial(self: *RemoteLink) void {
         self.state = .connecting;
-        const a = std.heap.c_allocator;
-        const job = a.create(LinkJob) catch return self.failed();
-        const job_host = a.dupe(u8, self.host) catch {
-            a.destroy(job);
-            return self.failed();
+        self.lessee = .{
+            .ctx = @ptrCast(self),
+            .on_frame = onLinkFrame,
+            .on_lost = onLinkLost,
+            .on_ready = onLinkReady,
+            .on_failed = onLinkFailed,
         };
-        job.* = .{ .host = job_host };
-        const th = c.g_thread_new("sketerm-lsplink", @ptrCast(&linkThread), @ptrCast(job));
-        if (th == null) {
-            job.destroy();
-            return self.failed();
+        var config = Config.load(std.heap.c_allocator);
+        defer config.deinit();
+        const opts: hostlink.DialOptions = .{
+            .port_range = config.udpRange() orelse "",
+            .tor_socks_endpoint = config.mux_tor_socks_endpoint,
+        };
+        switch (hostlink.lease(self.host, &self.lessee, opts)) {
+            .ready => self.linkUp(),
+            .connecting => dbg("link {s}: connecting", .{self.host}),
+            .dead => self.failed(),
         }
-        c.g_thread_unref(th);
-        dbg("link {s}: connecting", .{self.host});
+    }
+
+    /// The shared connection is up: serve LSP on it, when its daemon can.
+    fn linkUp(self: *RemoteLink) void {
+        if (!self.io().caps.lsp) {
+            dbg("link {s}: daemon has no lsp support", .{self.host});
+            self.lessee.release();
+            self.failed();
+            return;
+        }
+        self.state = .up;
+        self.backoff_ms = 0;
+        dbg("link {s}: up", .{self.host});
+        registry.onLinkUp(self);
+    }
+
+    fn onLinkReady(ctx: *anyopaque) void {
+        const self: *RemoteLink = @ptrCast(@alignCast(ctx));
+        if (self.state == .connecting) self.linkUp();
+    }
+
+    fn onLinkFailed(ctx: *anyopaque) void {
+        const self: *RemoteLink = @ptrCast(@alignCast(ctx));
+        dbg("link {s}: connect failed", .{self.host});
+        if (self.state == .connecting) self.failed();
+    }
+
+    fn onLinkLost(ctx: *anyopaque) void {
+        const self: *RemoteLink = @ptrCast(@alignCast(ctx));
+        self.markDead();
+    }
+
+    fn onLinkFrame(ctx: *anyopaque, ftype: wire.FrameType, payload: []const u8) void {
+        const self: *RemoteLink = @ptrCast(@alignCast(ctx));
+        if (self.state != .up) return;
+        self.handleFrame(ftype, payload);
+        // Handlers may have queued replies (didOpen after ready, ...).
+        if (self.state == .up) self.armWriteWatch();
     }
 
     /// A dial did not produce a usable link: stay dead until the backoff
@@ -126,8 +167,10 @@ pub const RemoteLink = struct {
         if (self.state == .dead) return;
         const was_up = self.state == .up;
         dbg("link {s}: dead", .{self.host});
-        self.dropLinkWatches();
-        if (was_up) self.conn.deinit();
+        // Leaving is a no-op when the link itself died (it let go of
+        // every lessee first); otherwise the shared connection stays up
+        // for its other users.
+        if (was_up or self.state == .connecting) self.lessee.release();
         self.pending.clearRetainingCapacity();
         self.failed();
         for (registry.conns.items) |cn| {
@@ -140,80 +183,11 @@ pub const RemoteLink = struct {
         }
     }
 
-    /// Non-blocking flush; a short write leaves the rest in the mux
-    /// Conn's wbuf and a G_IO_OUT watch drains it.
+    /// Deliver what was queued; the shared link's writable watch drains
+    /// a short write.
     pub fn armWriteWatch(self: *RemoteLink) void {
         if (self.state != .up) return;
-        self.conn.flushQueued() catch {
-            self.markDead();
-            return;
-        };
-        if (self.conn.wbuf.items.len > 0 and self.watch_out == 0) {
-            self.watch_out = c.g_unix_fd_add(
-                self.conn.fd,
-                c.G_IO_OUT | c.G_IO_ERR | c.G_IO_HUP,
-                @ptrCast(&onLinkWritable),
-                @ptrCast(self),
-            );
-        }
-    }
-
-    fn onLinkWritable(_: c_int, cond: c.GIOCondition, user: ?*anyopaque) callconv(.c) c.gboolean {
-        const self = cast.userData(RemoteLink, user);
-        if (self.state != .up) {
-            self.watch_out = 0;
-            return 0;
-        }
-        if ((cond & (c.G_IO_ERR | c.G_IO_HUP)) != 0) {
-            self.watch_out = 0;
-            self.markDead();
-            return 0;
-        }
-        self.conn.flushQueued() catch {
-            self.watch_out = 0;
-            self.markDead();
-            return 0;
-        };
-        if (self.conn.wbuf.items.len == 0) {
-            self.watch_out = 0;
-            return 0;
-        }
-        return 1;
-    }
-
-    fn onLinkReadable(_: c_int, cond: c.GIOCondition, user: ?*anyopaque) callconv(.c) c.gboolean {
-        const self = cast.userData(RemoteLink, user);
-        if (self.state != .up) {
-            self.watch_in = 0;
-            return 0;
-        }
-        if (!self.conn.fillAvailable()) {
-            self.watch_in = 0;
-            self.markDead();
-            return 0;
-        }
-        while (true) {
-            const maybe = self.conn.takeFrame() catch {
-                self.watch_in = 0;
-                self.markDead();
-                return 0;
-            };
-            const f = maybe orelse break;
-            defer f.deinit(self.conn.allocator);
-            self.handleFrame(f);
-            if (self.state != .up) {
-                self.watch_in = 0;
-                return 0;
-            }
-        }
-        if ((cond & (c.G_IO_ERR | c.G_IO_HUP)) != 0) {
-            self.watch_in = 0;
-            self.markDead();
-            return 0;
-        }
-        // Handlers may have queued replies (didOpen after ready, ...).
-        self.armWriteWatch();
-        return 1;
+        self.lessee.flush();
     }
 
     fn connByChan(self: *RemoteLink, chan: u32) ?*Conn {
@@ -226,8 +200,9 @@ pub const RemoteLink = struct {
         return null;
     }
 
-    fn handleFrame(self: *RemoteLink, f: muxclient.Conn.OwnedFrame) void {
-        switch (f.ftype) {
+    fn handleFrame(self: *RemoteLink, ftype: wire.FrameType, payload: []const u8) void {
+        const f = struct { payload: []const u8 }{ .payload = payload };
+        switch (ftype) {
             .lsp_reply => self.onLspReply(f.payload),
             .chan_data => {
                 const id = wire.decodeChanId(f.payload) orelse return;
@@ -245,8 +220,9 @@ pub const RemoteLink = struct {
                 // Same as a local server's stdout EOF.
                 cn.sess.markDead();
             },
-            // Anything else on this dedicated connection (peer_info,
-            // marker pushes, ...) is not for us.
+            // Anything else on the shared connection (file-service
+            // frames of the host's other users, peer_info, ...) is not
+            // for us.
             else => {},
         }
     }
@@ -271,7 +247,7 @@ pub const RemoteLink = struct {
         self.next_req += 1;
         self.pending.append(a, .{ .req = req, .tab_id = tab.id }) catch return;
         dbg("link {s}: lsp_open req={d} dir={s} ({d} candidates)", .{ self.host, req, servers.dirnameOf(loc.path), candidates.len });
-        self.conn.queueJson(.lsp_open, .{
+        self.io().queueJson(.lsp_open, .{
             .req = req,
             .dir = servers.dirnameOf(loc.path),
             .servers = candidates,
@@ -306,7 +282,7 @@ pub const RemoteLink = struct {
     pub fn discardChannel(self: *RemoteLink, chan: u32) void {
         if (self.state != .up) return;
         var hdr: [4]u8 = undefined;
-        self.conn.queueFrame(.chan_close, wire.putChanHeader(&hdr, chan)) catch {
+        self.io().queueFrame(.chan_close, wire.putChanHeader(&hdr, chan)) catch {
             self.markDead();
             return;
         };
@@ -366,71 +342,6 @@ pub const RemoteLink = struct {
         mgr.bindTabToConn(tab, cn);
     }
 };
-
-/// The blocking half of a link connect: ssh bootstrap + hello/welcome
-/// on a g_thread, handed back to the GLib loop via idle. The registry is
-/// process-lived, so the handback needs no liveness fence: it finds the
-/// link by host or drops the connection.
-const LinkJob = struct {
-    /// Owned by the job (the link's copy may be freed while we run).
-    host: []u8,
-    conn: muxclient.Conn = undefined,
-    ok: bool = false,
-    lsp: bool = false,
-
-    fn destroy(self: *LinkJob) void {
-        const a = std.heap.c_allocator;
-        a.free(self.host);
-        a.destroy(self);
-    }
-};
-
-fn linkThread(data: ?*anyopaque) callconv(.c) ?*anyopaque {
-    const job = cast.userData(LinkJob, data);
-    const a = std.heap.c_allocator;
-    run: {
-        var config = Config.load(a);
-        defer config.deinit();
-        const conn = muxclient.Conn.connectRemote(a, job.host, config.muxConnectOptions()) catch break :run;
-        job.conn = conn;
-        job.ok = true;
-        job.lsp = conn.caps.lsp;
-    }
-    _ = c.g_idle_add(@ptrCast(&linkIdle), @ptrCast(job));
-    return null;
-}
-
-fn linkIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const job = cast.userData(LinkJob, user);
-    defer job.destroy();
-    const link = registry.findLink(job.host) orelse {
-        if (job.ok) job.conn.deinit();
-        return 0;
-    };
-    if (link.state != .connecting) {
-        if (job.ok) job.conn.deinit();
-        return 0;
-    }
-    if (!job.ok or !job.lsp) {
-        dbg("link {s}: {s}", .{ link.host, if (!job.ok) "connect failed" else "daemon has no lsp support" });
-        if (job.ok) job.conn.deinit();
-        link.failed();
-        return 0;
-    }
-    link.conn = job.conn;
-    link.conn.setNonBlocking();
-    link.state = .up;
-    link.backoff_ms = 0;
-    link.watch_in = c.g_unix_fd_add(
-        link.conn.fd,
-        c.G_IO_IN | c.G_IO_ERR | c.G_IO_HUP,
-        @ptrCast(&RemoteLink.onLinkReadable),
-        @ptrCast(link),
-    );
-    dbg("link {s}: up", .{link.host});
-    registry.onLinkUp(link);
-    return 0;
-}
 
 // ======================================================================
 // Tests

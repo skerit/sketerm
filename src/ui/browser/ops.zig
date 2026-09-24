@@ -3045,11 +3045,13 @@ const ExternalPasteTest = struct {
     status: ?*c.GtkWidget = null,
     clip: ?*c.GdkClipboard = null,
     window: ?*c.GtkWidget = null,
+    /// The process-wide request counter when the test began.
+    req_mark: u32 = 0,
 
     fn init(self: *ExternalPasteTest) !void {
         if (c.getenv("SKETERM_TEST_FILE_CLIPBOARD") == null) return error.SkipZigTest;
         try std.testing.expect(c.gtk_init_check() != 0);
-        self.* = .{};
+        self.* = .{ .req_mark = @import("conn.zig").shared_next_req };
         errdefer self.deinit();
         self.column = c.gtk_column_view_new(null).?;
         _ = c.g_object_ref_sink(self.column);
@@ -3181,7 +3183,7 @@ const ExternalPasteTest = struct {
 
     fn noTransfers(self: *ExternalPasteTest) !void {
         const t = std.testing;
-        try t.expectEqual(@as(u32, 1), self.view.next_req);
+        try t.expectEqual(self.req_mark, @import("conn.zig").shared_next_req);
         try t.expectEqual(@as(usize, 2), self.view.conns.items.len);
         try t.expect(self.view.transfer_service == null);
         try t.expectEqual(@as(usize, 0), self.view.pending.items.len);

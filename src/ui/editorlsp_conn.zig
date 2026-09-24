@@ -175,7 +175,7 @@ pub const Conn = struct {
                 defer registry.alloc.free(payload);
                 std.mem.writeInt(u32, payload[0..4], rm.chan, .little);
                 @memcpy(payload[4..], bytes[off..end]);
-                rm.link.conn.queueFrame(.chan_data, payload) catch {
+                rm.link.io().queueFrame(.chan_data, payload) catch {
                     rm.link.markDead();
                     return;
                 };
@@ -340,7 +340,7 @@ pub const Conn = struct {
             // the channel and its child daemon-side.
             if (rm.open and rm.link.state == .up) {
                 var hdr: [4]u8 = undefined;
-                rm.link.conn.queueFrame(.chan_close, wire.putChanHeader(&hdr, rm.chan)) catch {};
+                rm.link.io().queueFrame(.chan_close, wire.putChanHeader(&hdr, rm.chan)) catch {};
                 rm.link.armWriteWatch();
             }
             rm.open = false;

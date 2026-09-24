@@ -31,30 +31,17 @@ const DeferredDeltas = @import("../../mux/fs_boundary.zig").Deferred;
 const errorPhrase = @import("../../filebrowser/format.zig").errorPhrase;
 const hostEq = @import("../../filebrowser/paths.zig").hostEq;
 const cast = @import("../../util/cast.zig");
-
-/// Heap context handed to the connect worker thread. The thread only
-/// touches this struct (its own allocator for the Conn); the idle
-/// handback runs on the main thread.
-pub const ConnectCtx = struct {
-    allocator: std.mem.Allocator,
-    hc: *HostConn,
-    host: []u8,
-    /// Owned copy of Config.mux_udp_port_range (empty = unset); the
-    /// worker cannot touch the config arena, which may be swapped
-    /// by a reload while the connect is in flight.
-    port_range: []u8 = &.{},
-    /// Owned numeric Tor proxy endpoint for the same config-arena reason.
-    tor_socks_endpoint: []u8 = &.{},
-    /// Brokered UDP connection ticket (env from the spawning GUI, or
-    /// minted in-process over a live terminal connection). The worker
-    /// tries it first and falls back to the normal transports.
-    ticket: ?muxclient.UdpTicket = null,
-    result: ?muxclient.Conn = null,
-};
+const hostlink = @import("../hostlink.zig");
 
 /// The live (ready or connecting) connection for `host`, creating
 /// one when needed. Dead connections are skipped, so navigating
 /// again after a drop reconnects. null on immediate failure.
+///
+/// A view never dials for itself: it rides a lending pane's session
+/// connection to that pane's host, else the process's shared link to
+/// the host (`ui/hostlink.zig`), which a second file-manager pane, a
+/// picker or a reopened picker on the same host joins instead of
+/// dialing again.
 pub fn hostConnFor(self: *BrowserView, host: ?[]const u8) ?*HostConn {
     for (self.conns.items) |hc| {
         if (hc.state != .dead and hostEq(hc.host, host)) return hc;
@@ -62,94 +49,11 @@ pub fn hostConnFor(self: *BrowserView, host: ?[]const u8) ?*HostConn {
     if (self.lender) |lender| {
         if (hostEq(lender.host, host)) return leaseHostConn(self, lender.drain, host);
     }
-    const hc = self.allocator.create(HostConn) catch return null;
-    hc.* = .{
-        .view = self,
-        .host = if (host) |h| (self.allocator.dupe(u8, h) catch {
-            self.allocator.destroy(hc);
-            return null;
-        }) else null,
-    };
-    self.conns.append(self.allocator, hc) catch {
-        if (hc.host) |h| self.allocator.free(h);
-        self.allocator.destroy(hc);
-        return null;
-    };
-
-    if (host == null) {
-        // Local: synchronous autostart connect (fast; existing
-        // GUI behavior for local panes).
-        hc.conn = muxclient.Conn.connectLocalAutostart(self.allocator) catch {
-            hc.state = .dead;
-            self.setStatus("local daemon unreachable");
-            return hc;
-        };
-        // A leftover daemon from before an upgrade keeps serving old
-        // code forever; when it is idle, replace it now.
-        if (hc.conn.upgradeStaleIdle(self.allocator)) {
-            hc.conn.deinit();
-            hc.conn = muxclient.Conn.connectLocalAutostart(self.allocator) catch {
-                hc.state = .dead;
-                self.setStatus("local daemon unreachable");
-                return hc;
-            };
-        }
-        self.wireReady(hc);
-        return hc;
-    }
-
-    // Remote: worker thread; Conn buffers use the C allocator
-    // (thread-safe) since the connect runs off-main.
-    const ctx = self.allocator.create(ConnectCtx) catch return hc;
-    ctx.* = .{
-        .allocator = self.allocator,
-        .hc = hc,
-        .host = self.allocator.dupe(u8, host.?) catch {
-            self.allocator.destroy(ctx);
-            return hc;
-        },
-    };
-    var cfg = @import("../../config.zig").Config.load(self.allocator);
-    defer cfg.deinit();
-    if (cfg.udpRange()) |range| {
-        ctx.port_range = self.allocator.dupe(u8, range) catch &.{};
-    }
-    ctx.tor_socks_endpoint = self.allocator.dupe(u8, cfg.mux_tor_socks_endpoint) catch {
-        if (ctx.port_range.len > 0) self.allocator.free(ctx.port_range);
-        self.allocator.free(ctx.host);
-        self.allocator.destroy(ctx);
-        hc.state = .dead;
-        self.setStatus("cannot allocate remote route");
-        return hc;
-    };
-    // Connection-ticket brokering: reach a UDP host's daemon over a
-    // pre-minted single-use listener instead of a fresh ssh bootstrap.
-    // A spawned files process gets its ticket from the GUI via env; a
-    // browser pane inside the terminal GUI mints one over a live UDP
-    // terminal connection to the same host (async — the worker thread
-    // starts when the mint resolves, ticket or not).
-    const remote_spec = muxclient.RemoteSpec.parse(ctx.host);
-    if (muxclient.udpTicketEligible(ctx.host)) {
-        if (muxclient.takeTicketFromEnv(ctx.host)) |ticket| {
-            ctx.ticket = ticket;
-        } else if (self.ownerWindow()) |win| {
-            const remotectl = @import("../remotectl.zig");
-            if (remotectl.mintUdpTicket(win, remote_spec.host, @ptrCast(ctx), onMintForConnect)) {
-                self.setStatusFmt("connecting to {s}…", .{host.?});
-                return hc;
-            }
-        }
-    }
-    startConnectThread(ctx);
-    self.setStatusFmt("connecting to {s}…", .{host.?});
-    return hc;
+    return sharedHostConn(self, host);
 }
 
-/// A HostConn riding the lender pane's session connection instead of a
-/// dial of its own. While the lane cannot be lent (the session is
-/// reconnecting, or another view holds it) the host is dead and the
-/// reconnect timer asks again; this view never dials the lender's host.
-fn leaseHostConn(self: *BrowserView, drain: *DrainHandle, host: ?[]const u8) ?*HostConn {
+/// A HostConn with no connection yet, listed on the view.
+fn newHostConn(self: *BrowserView, host: ?[]const u8) ?*HostConn {
     const hc = self.allocator.create(HostConn) catch return null;
     hc.* = .{
         .view = self,
@@ -158,14 +62,99 @@ fn leaseHostConn(self: *BrowserView, drain: *DrainHandle, host: ?[]const u8) ?*H
             return null;
         }) else null,
         .conn = .{ .allocator = self.allocator, .fd = -1 },
-        .lease = .{ .ctx = @ptrCast(hc), .on_frame = &onLentFrame, .on_lost = &onLentLost },
     };
     self.conns.append(self.allocator, hc) catch {
         if (hc.host) |h| self.allocator.free(h);
         self.allocator.destroy(hc);
         return null;
     };
-    const lent = if (!drain.alive.load(.acquire)) false else if (drain.terminal) |t| t.lendFsLane(&hc.lease.?) else false;
+    return hc;
+}
+
+/// A HostConn on the process's shared link to `host`.
+fn sharedHostConn(self: *BrowserView, host: ?[]const u8) ?*HostConn {
+    const hc = newHostConn(self, host) orelse return null;
+    hc.lease = .{ .shared = .{
+        .ctx = @ptrCast(hc),
+        .on_frame = &onLentFrame,
+        .on_lost = &onLentLost,
+        .on_ready = &onSharedReady,
+        .on_failed = &onSharedFailed,
+    } };
+    var opts: hostlink.DialOptions = .{ .window = self.ownerWindow() };
+    var cfg: ?@import("../../config.zig").Config = null;
+    defer if (cfg) |*loaded| loaded.deinit();
+    if (host != null) {
+        // Only a remote dial reads the transport settings; the options
+        // are copied by the link before the config goes away.
+        cfg = @import("../../config.zig").Config.load(self.allocator);
+        if (cfg.?.udpRange()) |range| opts.port_range = range;
+        opts.tor_socks_endpoint = cfg.?.mux_tor_socks_endpoint;
+    }
+    switch (hostlink.lease(host, &hc.lease.?.shared, opts)) {
+        .ready => self.wireReady(hc),
+        .connecting => self.setStatusFmt("connecting to {s}…", .{hc.label()}),
+        .dead => {
+            hc.state = .dead;
+            if (host == null) {
+                self.setStatus("local daemon unreachable");
+            } else {
+                self.setStatusFmt("cannot start connection to {s}", .{hc.label()});
+                self.scheduleReconnect(host.?);
+            }
+        },
+    }
+    return hc;
+}
+
+/// The shared link to a connecting host came up.
+fn onSharedReady(ctx: *anyopaque) void {
+    const hc: *HostConn = @ptrCast(@alignCast(ctx));
+    const view = hc.view;
+    if (view.widgets_dead or hc.state != .connecting) return;
+    view.wireReady(hc);
+    const conn = hc.io();
+    const remote = muxclient.RemoteSpec.parse(hc.host orelse return);
+    if (conn.buildStale()) {
+        // Busy daemons cannot be bounced (their sessions are the
+        // user's running work) — but serving old code silently is
+        // how "the fix didn't work" happens. Say it.
+        view.setStatusFmt(
+            "{s}: daemon runs an older sketerm build (busy; upgrades when its sessions end)",
+            .{remote.host},
+        );
+    } else if (remote.mode == .auto and conn.transport == .ssh) {
+        view.setStatusFmt("UDP unavailable; connected to {s} over SSH", .{remote.host});
+    } else {
+        view.setStatusFmt("connected to {s} over {s}", .{ remote.host, @tagName(conn.transport) });
+    }
+}
+
+/// The shared link's dial failed.
+fn onSharedFailed(ctx: *anyopaque) void {
+    const hc: *HostConn = @ptrCast(@alignCast(ctx));
+    const view = hc.view;
+    hc.state = .dead;
+    if (view.widgets_dead) return;
+    view.setStatusFmt("cannot connect to {s}", .{hc.label()});
+    if (hc.host) |h| view.scheduleReconnect(h);
+    view.pumpCopyAcks();
+    // The listings queued while connecting will never be answered.
+    // Without this the tabs that asked for them sit at "Listing..."
+    // for good, which reads like a slow host rather than a dead one.
+    var buf: [256]u8 = undefined;
+    const why = std.fmt.bufPrint(&buf, "cannot connect to {s}", .{hc.label()}) catch "cannot connect";
+    view.failPendingListings(hc, why);
+}
+
+/// A HostConn riding the lender pane's session connection instead of a
+/// dial of its own. While the lane cannot be lent (the session is
+/// reconnecting, or another view holds it) the host is dead and the
+/// reconnect timer asks again; this view never dials the lender's host.
+fn leaseHostConn(self: *BrowserView, drain: *DrainHandle, host: ?[]const u8) ?*HostConn {
+    const hc = newHostConn(self, host) orelse return null;
+    hc.lease = .{ .pane = .{ .ctx = @ptrCast(hc), .on_frame = &onLentFrame, .on_lost = &onLentLost } };
+    const lent = if (!drain.alive.load(.acquire)) false else if (drain.terminal) |t| t.lendFsLane(&hc.lease.?.pane) else false;
     if (!lent) {
         hc.state = .dead;
         self.setStatusFmt("waiting for the session's connection to {s}", .{hc.label()});
@@ -197,165 +186,18 @@ fn onLentLost(ctx: *anyopaque) void {
     hc.view.hostDied(hc);
 }
 
-/// Ticket mint resolved (ticket or null) — start the connect worker.
-/// The view may have moved on during the wait: mirror onConnectIdle's
-/// orphan/dead handling, because with no thread spawned yet nobody
-/// else will free this HostConn.
-fn onMintForConnect(user: ?*anyopaque, ticket: ?muxclient.UdpTicket) void {
-    const ctx = cast.userData(ConnectCtx, user);
-    const hc = ctx.hc;
-    const allocator = ctx.allocator;
-    if (hc.orphaned) {
-        if (ctx.port_range.len > 0) allocator.free(ctx.port_range);
-        if (ctx.tor_socks_endpoint.len > 0) allocator.free(ctx.tor_socks_endpoint);
-        allocator.free(ctx.host);
-        allocator.destroy(ctx);
-        if (hc.host) |h| allocator.free(h);
-        allocator.destroy(hc);
-        return;
-    }
-    if (hc.view.widgets_dead) {
-        hc.state = .dead;
-        if (ctx.port_range.len > 0) allocator.free(ctx.port_range);
-        if (ctx.tor_socks_endpoint.len > 0) allocator.free(ctx.tor_socks_endpoint);
-        allocator.free(ctx.host);
-        allocator.destroy(ctx);
-        return;
-    }
-    ctx.ticket = ticket;
-    startConnectThread(ctx);
-}
-
-/// Spawn the connect worker, taking ownership of `ctx`. On spawn
-/// failure the HostConn dies and every listing queued on it is
-/// refused (they would otherwise sit at "Listing…" forever).
-fn startConnectThread(ctx: *ConnectCtx) void {
-    const hc = ctx.hc;
-    const view = hc.view;
-    const allocator = ctx.allocator;
-    const th = std.Thread.spawn(.{}, connectThreadMain, .{ctx}) catch {
-        hc.state = .dead;
-        view.setStatusFmt("cannot start connection to {s}", .{hc.label()});
-        var buf: [256]u8 = undefined;
-        const why = std.fmt.bufPrint(&buf, "cannot connect to {s}", .{hc.label()}) catch "cannot connect";
-        view.failPendingListings(hc, why);
-        if (ctx.port_range.len > 0) allocator.free(ctx.port_range);
-        if (ctx.tor_socks_endpoint.len > 0) allocator.free(ctx.tor_socks_endpoint);
-        allocator.free(ctx.host);
-        allocator.destroy(ctx);
-        return;
-    };
-    th.detach();
-}
-
-pub fn connectThreadMain(ctx: *ConnectCtx) void {
-    const alloc = std.heap.c_allocator;
-    if (ctx.ticket) |ticket| {
-        if (muxclient.Conn.connectUdpTicket(alloc, ctx.host, ticket)) |conn| {
-            ctx.result = upgradeReconnect(alloc, ctx, conn);
-            _ = c.g_idle_add(@ptrCast(&onConnectIdle), @ptrCast(ctx));
-            return;
-        } else |_| {}
-        // Ticket didn't carry (listener expired, filtered UDP): the
-        // normal transports below are the unchanged fallback.
-    }
-    const result = muxclient.Conn.connectRemote(
-        alloc,
-        ctx.host,
-        connectOptions(ctx),
-    );
-    if (result) |conn| {
-        ctx.result = upgradeReconnect(alloc, ctx, conn);
-    } else |_| {
-        ctx.result = null;
-    }
-    _ = c.g_idle_add(@ptrCast(&onConnectIdle), @ptrCast(ctx));
-}
-
-/// Stale-daemon upgrade, on the worker thread where blocking is
-/// cheap: an idle daemon of a different build is asked to exit and
-/// the reconnect autostarts the freshly deployed binary. One attempt;
-/// any failure keeps or replaces the connection best-effort — a
-/// still-stale daemon is served as-is (and the status line says so).
-fn upgradeReconnect(alloc: std.mem.Allocator, ctx: *ConnectCtx, conn: muxclient.Conn) ?muxclient.Conn {
-    var live = conn;
-    if (!live.upgradeStaleIdle(alloc)) return live;
-    live.deinit();
-    if (muxclient.Conn.connectRemote(
-        alloc,
-        ctx.host,
-        connectOptions(ctx),
-    )) |fresh| {
-        return fresh;
-    } else |_| {
-        return null;
-    }
-}
-
-pub fn onConnectIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const ctx = cast.userData(ConnectCtx, user);
-    const hc = ctx.hc;
-    const allocator = ctx.allocator;
-    defer {
-        if (ctx.port_range.len > 0) allocator.free(ctx.port_range);
-        if (ctx.tor_socks_endpoint.len > 0) allocator.free(ctx.tor_socks_endpoint);
-        allocator.free(ctx.host);
-        allocator.destroy(ctx);
-    }
-    if (hc.orphaned) {
-        if (ctx.result) |conn| {
-            var mut = conn;
-            mut.deinit();
-        }
-        if (hc.host) |h| allocator.free(h);
-        allocator.destroy(hc);
-        return 0;
-    }
-    const view = hc.view;
-    if (view.widgets_dead) {
-        if (ctx.result) |conn| {
-            var mut = conn;
-            mut.deinit();
-        }
-        hc.state = .dead;
-        return 0;
-    }
-    if (ctx.result) |conn| {
-        hc.conn = conn;
-        view.wireReady(hc);
-        const remote = muxclient.RemoteSpec.parse(ctx.host);
-        if (conn.buildStale()) {
-            // Busy daemons cannot be bounced (their sessions are the
-            // user's running work) — but serving old code silently is
-            // how "the fix didn't work" happens. Say it.
-            view.setStatusFmt(
-                "{s}: daemon runs an older sketerm build (busy; upgrades when its sessions end)",
-                .{remote.host},
-            );
-        } else if (remote.mode == .auto and conn.transport == .ssh) {
-            view.setStatusFmt("UDP unavailable; connected to {s} over SSH", .{remote.host});
-        } else {
-            view.setStatusFmt("connected to {s} over {s}", .{ remote.host, @tagName(conn.transport) });
-        }
-    } else {
-        hc.state = .dead;
-        view.setStatusFmt("cannot connect to {s}", .{hc.label()});
-        view.scheduleReconnect(ctx.host);
-        view.pumpCopyAcks();
-        // The listings queued while connecting will never be answered.
-        // Without this the tabs that asked for them sit at "Listing..."
-        // for good, which reads like a slow host rather than a dead one.
-        var buf: [256]u8 = undefined;
-        const why = std.fmt.bufPrint(&buf, "cannot connect to {s}", .{hc.label()}) catch "cannot connect";
-        view.failPendingListings(hc, why);
-    }
-    return 0;
-}
-
-fn connectOptions(ctx: *const ConnectCtx) muxclient.ConnectOptions {
-    return .{
-        .udp_port_range = if (ctx.port_range.len > 0) ctx.port_range else null,
-        .tor_socks_endpoint = ctx.tor_socks_endpoint,
+/// A view on a borrowed connection is going away while the connection
+/// stays up for others: end what it holds on the daemon (directory
+/// subscriptions, a streaming query), which a socket close used to end.
+pub fn releaseTabOnLease(self: *BrowserView, tab: *BTab) void {
+    const hc = tab.hc;
+    if (hc.lease == null or hc.state != .ready) return;
+    closeViewOf(self, hc, tab.root);
+    for (tab.subdirs.items) |d| closeViewOf(self, hc, d);
+    for (tab.ancestors.items) |d| closeViewOf(self, hc, d);
+    if (tab.query) |tq| if (tq.job != 0 and tq.hc.state == .ready) {
+        tq.hc.io().queueJson(.fs_op, .{ .req = nextReq(self), .op = "job_cancel", .job = tq.job }) catch {};
+        self.ensureWriteFlush(tq.hc);
     };
 }
 
@@ -1224,10 +1066,25 @@ pub fn queueListing(self: *BrowserView, tab: *BTab, dir: *Dir, op: @FieldType(Pe
     }
 }
 
+/// The request counter every view in the process mints from. Views on
+/// one host share its connection (`ui/hostlink.zig`) and every frame
+/// reaches all of them, so an id must mean one request process-wide.
+/// It stays below 0x80000000, the range a lending Terminal's own ranged
+/// reads use on the same lane.
+pub var shared_next_req: u32 = 1;
+/// The same for directory subscriptions (`open_view` ids).
+var shared_next_view: u32 = 1;
+
 pub fn nextReq(self: *BrowserView) u32 {
-    const r = self.next_req;
-    self.next_req +%= 1;
-    if (self.next_req == 0) self.next_req = 1;
+    _ = self;
+    return takeReq(&shared_next_req);
+}
+
+/// Take one id from `counter`, skipping 0 and the lender's range.
+pub fn takeReq(counter: *u32) u32 {
+    if (counter.* == 0 or counter.* >= 0x80000000) counter.* = 1;
+    const r = counter.*;
+    counter.* += 1;
     return r;
 }
 
@@ -2076,11 +1933,14 @@ pub fn makeDir(self: *BrowserView, path: []const u8) ?*Dir {
     return d;
 }
 
-/// The one place a view id comes from: ids are per connection and
-/// must never repeat within one, so every subscription mints a new one.
+/// The one place a view id comes from: ids must never repeat within a
+/// connection, and connections are shared by every view in the process
+/// (`shared_next_req`), so every subscription mints a process-wide one.
 pub fn mintViewId(self: *BrowserView) u32 {
-    const v = self.next_view;
-    self.next_view += 1;
+    _ = self;
+    if (shared_next_view == 0) shared_next_view = 1;
+    const v = shared_next_view;
+    shared_next_view +%= 1;
     return v;
 }
 
