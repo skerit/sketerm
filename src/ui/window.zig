@@ -210,9 +210,32 @@ fn onPaneContinuousFrames(ctx: ?*anyopaque, _: *Pane) void {
     self.syncWindowGraphicsOffload();
 }
 
-/// Wire the per-open unparent-on-close for a manually-parented
-/// popover. Call once, right after gtk_widget_set_parent.
-pub fn connectManualPopoverClose(popover: *c.GtkWidget) void {
+const MANUAL_POPOVER_KEY = "sketerm-manual-popover";
+
+/// Parent a per-open popover on `parent` and unparent it on close.
+/// Any manual popover still open on `parent` is closed first: reopening
+/// would otherwise stack a second grabbing popup on a non-topmost parent,
+/// which GDK warns about on every open.
+pub fn parentManualPopover(popover: *c.GtkWidget, parent: *c.GtkWidget) void {
+    // Collected first: closing one unparents it mid-walk.
+    var stale: [8]*c.GtkWidget = undefined;
+    var n: usize = 0;
+    var child = c.gtk_widget_get_first_child(parent);
+    while (child) |w| : (child = c.gtk_widget_get_next_sibling(w)) {
+        if (n == stale.len) break;
+        if (c.g_object_get_data(@ptrCast(@alignCast(w)), MANUAL_POPOVER_KEY) != null) {
+            stale[n] = w;
+            n += 1;
+        }
+    }
+    for (stale[0..n]) |old| {
+        c.gtk_popover_popdown(@ptrCast(@alignCast(old)));
+        // A popover that was never mapped emits no "closed".
+        if (c.gtk_widget_get_parent(old) != null) c.gtk_widget_unparent(old);
+    }
+
+    c.gtk_widget_set_parent(popover, parent);
+    c.g_object_set_data(@ptrCast(@alignCast(popover)), MANUAL_POPOVER_KEY, @ptrCast(popover));
     _ = c.g_signal_connect_data(
         popover,
         "closed",
@@ -2451,8 +2474,7 @@ pub const Window = struct {
         // strip, not beneath the whole window. Pointing_to narrows the
         // anchor point to the click location when known; otherwise we
         // anchor the popover under the visual center of the tab bar.
-        c.gtk_widget_set_parent(popover, self.tab_bar);
-        connectManualPopoverClose(popover);
+        parentManualPopover(popover, self.tab_bar);
         var alloc_w: c_int = 0;
         var alloc_h: c_int = 0;
         if (click) |pt| {
@@ -2534,9 +2556,9 @@ pub const Window = struct {
         // to a thin rect at the top of the GLArea so the popover
         // lands at the top of the pane instead of dropping below it.
         if (pane.titlebar.box) |tb| {
-            c.gtk_widget_set_parent(popover, tb);
+            parentManualPopover(popover, tb);
         } else {
-            c.gtk_widget_set_parent(popover, @ptrCast(pane.surface.area));
+            parentManualPopover(popover, @ptrCast(pane.surface.area));
             const w = c.gtk_widget_get_width(@ptrCast(pane.surface.area));
             const rect = c.GdkRectangle{
                 .x = @divFloor(w, 2),
@@ -2546,7 +2568,6 @@ pub const Window = struct {
             };
             c.gtk_popover_set_pointing_to(@ptrCast(popover), &rect);
         }
-        connectManualPopoverClose(popover);
 
         const ctx = self.allocator.create(PaneTitleCtx) catch return;
         ctx.* = .{
@@ -2598,8 +2619,7 @@ pub const Window = struct {
         }
 
         c.gtk_popover_set_child(@ptrCast(popover), entry);
-        c.gtk_widget_set_parent(popover, @ptrCast(pane.surface.area));
-        connectManualPopoverClose(popover);
+        parentManualPopover(popover, @ptrCast(pane.surface.area));
         const w = c.gtk_widget_get_width(@ptrCast(pane.surface.area));
         const rect = c.GdkRectangle{
             .x = @divFloor(w, 2),

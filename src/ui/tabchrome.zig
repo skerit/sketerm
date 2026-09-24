@@ -12,7 +12,7 @@ const Pane = @import("pane.zig").Pane;
 const winmod = @import("window.zig");
 const Window = winmod.Window;
 const tab_effects = @import("tab_effects.zig");
-const connectManualPopoverClose = winmod.connectManualPopoverClose;
+const parentManualPopover = winmod.parentManualPopover;
 
 /// What a tab-strip menu row does: a shared `action.zig` verb, run
 /// on the selected page (the right-click already selected it) through
@@ -56,11 +56,10 @@ pub fn onTabContextMenu(ctx: ?*anyopaque, page: *c.AdwTabPage, anchor: *c.GtkWid
     const self = cast.userData(Window, ctx);
 
     const popover = c.gtk_popover_new();
-    c.gtk_widget_set_parent(popover, anchor);
+    parentManualPopover(popover, anchor);
     c.gtk_popover_set_has_arrow(@ptrCast(popover), 0);
     const rect = c.GdkRectangle{ .x = @intFromFloat(x), .y = @intFromFloat(y), .width = 1, .height = 1 };
     c.gtk_popover_set_pointing_to(@ptrCast(popover), &rect);
-    connectManualPopoverClose(popover);
 
     const list = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
 

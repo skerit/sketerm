@@ -15,7 +15,7 @@ const Window = winmod.Window;
 const shader_preset_mod = @import("../shader_preset.zig");
 const terminal_surface_mod = @import("terminal_surface.zig");
 const logActionError = winmod.logActionError;
-const connectManualPopoverClose = winmod.connectManualPopoverClose;
+const parentManualPopover = winmod.parentManualPopover;
 const isDarkBg = winmod.isDarkBg;
 const ProfileSettings = @import("../config.zig").ProfileSettings;
 const ColorScheme = @import("../config.zig").ColorScheme;
@@ -539,8 +539,7 @@ pub fn presentPanePopover(pane: *Pane, popover: *c.GtkWidget, content: ?*c.GtkWi
     c.gtk_scrolled_window_set_propagate_natural_width(@ptrCast(scroller), 1);
     c.gtk_scrolled_window_set_child(@ptrCast(scroller), content);
     c.gtk_popover_set_child(@ptrCast(popover), scroller);
-    c.gtk_widget_set_parent(popover, @ptrCast(pane.surface.area));
-    connectManualPopoverClose(popover);
+    parentManualPopover(popover, @ptrCast(pane.surface.area));
     var rect = c.GdkRectangle{
         .x = @divTrunc(c.gtk_widget_get_width(@ptrCast(pane.surface.area)), 2),
         .y = @divTrunc(c.gtk_widget_get_height(@ptrCast(pane.surface.area)), 2),
