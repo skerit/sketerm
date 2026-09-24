@@ -23,7 +23,8 @@ const REVIEW_OUTPUT =
 /// Tool exposure groups. The declaring home for the policy vocabulary
 /// (`mcpfilter` re-exports it), so a group exists exactly once.
 pub const Group = enum {
-    /// Tabs and panes of a running GUI.
+    /// Terminal panes: the running GUI's tabs and panes, or the
+    /// headless daemon sessions standing in for them without a GUI.
     panes,
     /// Forwarded Wayland apps (launch, drive, screenshot).
     app,
@@ -33,7 +34,8 @@ pub const Group = enum {
     files,
     /// Port forwarding.
     net,
-    /// Browser automation over CDP.
+    /// Web views: the GUI's own browser panes, or the headless
+    /// sketerm-webengine helper.
     browser,
     /// Agent-authored UI panels.
     ui,
@@ -85,11 +87,43 @@ const SHOT_PROPS =
     \\"frame":{"type":"integer"},"image_w":{"type":"integer"},"image_h":{"type":"integer"},"image_scale":{"type":"number"},"crop_x":{"type":"integer"},"crop_y":{"type":"integer"}
 ;
 
-/// The screen-info vocabulary `mcp.addScreenFacts` writes, declared
-/// ONCE: read_screen and run_command both report a pane's grid.
+/// The grid vocabulary `mcp_panes.addGrid` writes, declared ONCE for
+/// read_screen and term_read.
 const SCREEN_PROPS =
-    \\"rows":{"type":"integer"},"cols":{"type":"integer"},"cursor_row":{"type":"integer"},"cursor_col":{"type":"integer"},"alt_screen":{"type":"boolean"},"view_offset":{"type":"integer"},"app_cursor_keys":{"type":"boolean"},"sync_output":{"type":"boolean"},"title":{"type":"string"},"seq":{"type":"integer"},"scrollback":{"type":"integer"}
+    \\"rows":{"type":"integer"},"cols":{"type":"integer"},"cursor_row":{"type":"integer"},"cursor_col":{"type":"integer"},"alt_screen":{"type":"boolean"},"view_offset":{"type":"integer"},"app_cursor_keys":{"type":"boolean"},"sync_output":{"type":"boolean"},"title":{"type":"string"},"seq":{"type":"integer"},"scrollback":{"type":"boolean"}
 ;
+
+/// Where a terminal-content result was delivered. The pane tools and their
+/// term_* twins share one implementation (`mcp_panes.zig`); only the
+/// address differs, so the facts below are declared once for both names.
+const PANE_ADDR_PROPS =
+    \\"pane":{"type":"integer"},"headless":{"type":"boolean","description":"true: no GUI socket is attached, so this is a headless terminal addressed by the same id the term_* tools take"}
+;
+const TERM_ADDR_PROPS =
+    \\"term":{"type":"integer"}
+;
+const SEND_TEXT_PROPS =
+    \\"bytes":{"type":"integer","description":"Bytes written, including the appended carriage return"},"enter":{"type":"boolean"}
+;
+const SEND_KEYS_PROPS =
+    \\"keys":{"type":"string"},"sent":{"type":"boolean"}
+;
+const READ_PROPS = SCREEN_PROPS ++ "," ++
+    \\"exited":{"type":"boolean"},"exit_status":{"type":"integer","description":"The last command's exit status (last_command), or a headless terminal's process exit status"},"text":{"type":"string"},"last_command":{"type":"boolean"},"output":{"type":"string"},"completion_seq":{"type":"integer","description":"The zone's identity: the count of completed command zones"}
+;
+const WAIT_IDLE_PROPS =
+    \\"settled":{"type":"boolean"},"timed_out":{"type":"boolean"},"timeout_ms":{"type":"integer"},"quiet_ms":{"type":"integer"},"desynced":{"type":"boolean","description":"The mirror lost sync: quiescence cannot be observed"},"foreground_running":{"type":"boolean","description":"Output is quiet but a foreground command is still running (present only when shell integration can tell)"}
+;
+const RUN_PROPS =
+    \\"command":{"type":"string"},"wait_for":{"type":"string","enum":["idle"],"description":"Idle mode; command mode reports state/completion_source instead"},"command_sent":{"type":"boolean"},"settled":{"type":"boolean","description":"Idle mode: output went quiet before the timeout"},"went_to_foreground_stdin":{"type":"boolean","description":"Idle mode: a foreground command was already running, so the text was NOT a new shell command"},"output_kind":{"type":"string","enum":["screen","command"]},"output":{"type":"string"},"exit_status":{"type":["integer","null"]},"output_only_unavailable":{"type":"boolean","description":"output_only was asked for but no command zone completed after this command was sent; reason says why"},"reason":{"type":"string"},"state":{"type":"string","enum":["unsupported","running","completed","unknown"]},"timed_out":{"type":"boolean"},"completion_source":{"type":"string","enum":["none","shell_integration","process_tracking"]}
+;
+const TERMINAL_ITEM =
+    \\{"type":"object","description":"A GUI pane (pane, tab, window, rows, cols, focused, zoomed, tab_selected, title, tab_title, cwd) or a headless terminal (its id, headless, exited, rows, cols, shell, integration, transport, host, exit_status, pending_command, pending_exec, last_line, recording)"}
+;
+
+fn contentSchema(comptime addr: []const u8, comptime props: []const u8, comptime required: []const u8) []const u8 {
+    return "{\"type\":\"object\",\"properties\":{" ++ addr ++ "," ++ props ++ "},\"required\":[" ++ required ++ "]}";
+}
 
 const INPUT_PROPS =
     \\"window":{"type":"integer"},"frame_at_input":{"type":"integer"},"frame_now":{"type":"integer"},"repainted":{"type":"boolean"},"screenshot_failed":{"type":"boolean"}
@@ -122,31 +156,31 @@ pub const TOOLS = [_]ToolDef{
         .group = .panes,
         .mutates = false,
         .description =
-        \\List all sketerm tabs and panes (ids, titles, sizes, cwd, focus). Pane ids address every other tool.
+        \\List the terminals the pane tools address: every GUI tab and pane (ids, titles, sizes, cwd, focus), or, with no GUI socket attached, the headless terminals this server opened (headless:true; each id is the `pane` every pane tool takes and the `term` every term_* tool takes).
         ,
         .input_schema =
         \\{"type":"object","properties":{}}
         ,
-        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"terminals\":{\"type\":\"array\",\"items\":{\"type\":\"object\"}},\"count\":{\"type\":\"integer\"},\"tabs\":{\"type\":\"integer\"}" ++ "},\"required\":[\"terminals\",\"count\",\"tabs\"]}",
+        .output_schema = "{\"type\":\"object\",\"properties\":{\"terminals\":{\"type\":\"array\",\"items\":" ++ TERMINAL_ITEM ++ "},\"count\":{\"type\":\"integer\"},\"tabs\":{\"type\":\"integer\"},\"headless\":{\"type\":\"boolean\"}},\"required\":[\"terminals\",\"count\",\"headless\"]}",
     },
     .{
         .name = "read_screen",
         .group = .panes,
         .mutates = false,
         .description =
-        \\Read a pane's rendered screen: text content plus cursor position, size and flags. This is the parsed terminal grid (what a human sees), not raw output. Pass last_command=true to get ONLY the last completed command's output and exit code (precise — no prompt noise; requires shell integration, which sketerm injects by default).
+        \\Read a pane's rendered screen: text plus cursor position, size and flags. This is the parsed terminal grid (what a human sees), not raw output; scrollback adds the history above it. Pass last_command=true to get ONLY the last completed command's output and exit code (precise, no prompt noise; needs shell integration, which sketerm injects by default). Without a GUI socket, `pane` addresses the headless terminals this server opened (the ids term_* tools take; new_tab opens one).
         ,
         .input_schema =
-        \\{"type":"object","properties":{"pane":{"type":"integer","description":"Pane id (omit = focused pane)"},"scrollback":{"type":"integer","description":"Also include up to N scrollback lines"},"last_command":{"type":"boolean","description":"Return only the last completed command's output + exit code"}}}
+        \\{"type":"object","properties":{"pane":{"type":"integer","description":"Pane id (omit = focused pane)"},"scrollback":{"type":["boolean","integer"],"description":"Include the scrollback history too (true, or any positive number)"},"last_command":{"type":"boolean","description":"Return only the last completed command's output + exit code"}}}
         ,
-        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ SCREEN_PROPS ++ "," ++ "\"pane\":{\"type\":\"integer\"},\"text\":{\"type\":\"string\"},\"last_command\":{\"type\":\"boolean\"},\"exit_status\":{\"type\":\"integer\"},\"output\":{\"type\":\"string\"}" ++ "}}",
+        .output_schema = contentSchema(PANE_ADDR_PROPS, READ_PROPS, "\"headless\""),
     },
     .{
         .name = "screenshot_pane",
         .group = .panes,
         .mutates = false,
         .description =
-        \\Screenshot a terminal pane as a lossless PNG (inline image) exactly as rendered, including colours, cursor and any shader. Needs a running sketerm window.
+        \\Screenshot a terminal pane as a lossless PNG (inline image) exactly as rendered, including colours, cursor and any shader. Needs a GUI socket: without one it answers `unavailable` (headless terminals have no GUI pane).
         ,
         .input_schema =
         \\{"type":"object","properties":{"pane":{"type":"integer","description":"Pane id (omit = focused pane)"}}}
@@ -158,79 +192,79 @@ pub const TOOLS = [_]ToolDef{
         .group = .panes,
         .mutates = true,
         .description =
-        \\Start recording a terminal pane's session as an asciicast v2 (.cast) file — raw output with timestamps, playable with asciinema. Recorded by the session daemon (no wrapper); a remote session records to a path on ITS host.
+        \\Start recording a terminal pane's session as an asciicast v2 (.cast) file: raw output with timestamps, playable with asciinema. Recorded by the session daemon (no wrapper); a remote session records to a path on ITS host. It replaces the session's current recording, including the automatic one of a headless terminal. Without a GUI socket, `pane` addresses the headless terminals this server opened (the ids term_* tools take; new_tab opens one).
         ,
         .input_schema =
         \\{"type":"object","properties":{"pane":{"type":"integer","description":"Pane id (omit = focused pane)"},"path":{"type":"string","description":"Absolute output path ending in .cast"}},"required":["path"]}
         ,
-        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"pane\":{\"type\":\"integer\"},\"path\":{\"type\":\"string\"},\"recording\":{\"type\":\"boolean\"}" ++ "},\"required\":[\"path\",\"recording\"]}",
+        .output_schema = contentSchema(PANE_ADDR_PROPS, "\"path\":{\"type\":\"string\"},\"recording\":{\"type\":\"boolean\"}", "\"headless\",\"path\",\"recording\""),
     },
     .{
         .name = "record_pane_stop",
         .group = .panes,
         .mutates = true,
         .description =
-        \\Stop the asciicast recording of a terminal pane's session.
+        \\Stop the asciicast recording of a terminal pane's session. Without a GUI socket, `pane` addresses the headless terminals this server opened (the ids term_* tools take; new_tab opens one).
         ,
         .input_schema =
         \\{"type":"object","properties":{"pane":{"type":"integer","description":"Pane id (omit = focused pane)"}}}
         ,
-        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"pane\":{\"type\":\"integer\"},\"recording\":{\"type\":\"boolean\"}" ++ "},\"required\":[\"recording\"]}",
+        .output_schema = contentSchema(PANE_ADDR_PROPS, "\"recording\":{\"type\":\"boolean\"}", "\"headless\",\"recording\""),
     },
     .{
         .name = "send_text",
         .group = .panes,
         .mutates = true,
         .description =
-        \\Type literal text into a pane's terminal. Set enter=true to press Enter afterwards. Use send_keys for control keys.
+        \\Type literal text into a pane's terminal. Set enter=true to press Enter afterwards. Use send_keys for control keys. Without a GUI socket, `pane` addresses the headless terminals this server opened (the ids term_* tools take; new_tab opens one).
         ,
         .input_schema =
         \\{"type":"object","properties":{"pane":{"type":"integer"},"text":{"type":"string"},"enter":{"type":"boolean","description":"Press Enter after the text"}},"required":["text"]}
         ,
-        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"pane\":{\"type\":\"integer\"},\"bytes\":{\"type\":\"integer\"},\"enter\":{\"type\":\"boolean\"}" ++ "},\"required\":[\"bytes\",\"enter\"]}",
+        .output_schema = contentSchema(PANE_ADDR_PROPS, SEND_TEXT_PROPS, "\"headless\",\"bytes\",\"enter\""),
     },
     .{
         .name = "send_keys",
         .group = .panes,
         .mutates = true,
         .description =
-        \\Press named keys in a pane: space-separated chords like 'ctrl+c', 'enter', 'up', 'escape', 'f5', 'alt+x', 'shift+tab', 'pagedown'. Single characters are typed literally.
+        \\Press named keys in a pane: space-separated chords like 'ctrl+c', 'enter', 'up', 'escape', 'f5', 'alt+x', 'shift+tab', 'pagedown'. Single characters are typed literally. Without a GUI socket, `pane` addresses the headless terminals this server opened (the ids term_* tools take; new_tab opens one).
         ,
         .input_schema =
         \\{"type":"object","properties":{"pane":{"type":"integer"},"keys":{"type":"string"}},"required":["keys"]}
         ,
-        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"pane\":{\"type\":\"integer\"},\"keys\":{\"type\":\"string\"},\"sent\":{\"type\":\"boolean\"}" ++ "},\"required\":[\"keys\",\"sent\"]}",
+        .output_schema = contentSchema(PANE_ADDR_PROPS, SEND_KEYS_PROPS, "\"headless\",\"keys\",\"sent\""),
     },
     .{
         .name = "run_command",
         .group = .panes,
         .mutates = true,
         .description =
-        \\Type a shell command, press Enter, wait until OUTPUT settles, and return the resulting screen text. Output idle does not imply that a silent foreground command exited. Pass output_only=true to get ONLY a completed OSC 133 command zone when one is already available. For reliable headless completion use term_run with wait_for=command; for interactive programs prefer send_text/send_keys + read_screen.
+        \\Type a shell command, press Enter, wait until OUTPUT settles (quiet_ms of no output), and return the resulting screen. Output going quiet does not mean a silent foreground command exited. output_only=true returns only THIS command's completed OSC 133 zone (its output and exit status): a zone is reported only when it completed after the command was sent, otherwise the screen comes back with output_only_unavailable and the reason, never an earlier command's output. wait_for=command waits for the shell's own completion mark with an exact exit status; it needs a headless terminal (term_run is the same tool for term ids). For interactive programs prefer send_text/send_keys + read_screen. Without a GUI socket, `pane` addresses the headless terminals this server opened (the ids term_* tools take; new_tab opens one).
         ,
         .input_schema =
-        \\{"type":"object","properties":{"pane":{"type":"integer"},"command":{"type":"string"},"timeout_ms":{"type":"integer","description":"Max output-idle wait (default 15000, max 120000 - larger values are clamped)"},"quiet_ms":{"type":"integer","description":"No-output window that counts as idle (default 400)"},"output_only":{"type":"boolean","description":"Return just a completed command zone and exit code instead of the whole screen"}},"required":["command"]}
+        \\{"type":"object","properties":{"pane":{"type":"integer"},"command":{"type":"string"},"wait_for":{"type":"string","enum":["idle","command"],"description":"idle (default) waits for output quiescence; command waits for the shell's completion mark (headless terminals)"},"timeout_ms":{"type":"integer","description":"Max wait (default 30000, max 120000 - larger values are clamped)"},"quiet_ms":{"type":"integer","description":"Idle mode: no-output window that counts as idle (default 400)"},"output_only":{"type":"boolean","description":"Return just this command's completed zone and exit code instead of the whole screen"}},"required":["command"]}
         ,
-        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ SCREEN_PROPS ++ "," ++ "\"pane\":{\"type\":\"integer\"},\"command\":{\"type\":\"string\"},\"source\":{\"type\":\"string\"},\"settled\":{\"type\":\"boolean\"},\"timed_out\":{\"type\":\"boolean\"},\"exit_status\":{\"type\":\"integer\"},\"output\":{\"type\":\"string\"}" ++ "},\"required\":[\"command\",\"source\",\"settled\",\"timed_out\",\"output\"]}",
+        .output_schema = contentSchema(PANE_ADDR_PROPS, RUN_PROPS, "\"command_sent\""),
     },
     .{
         .name = "wait_idle",
         .group = .panes,
         .mutates = false,
         .description =
-        \\Wait until a pane produced no output for quiet_ms (or timeout_ms elapsed). Output idle does NOT imply that the foreground command exited.
+        \\Wait until a pane produced no output for quiet_ms (or timeout_ms elapsed). Output idle does NOT imply that the foreground command exited; where shell integration can tell, the reply distinguishes 'idle at shell prompt' from 'idle, but a foreground command is still RUNNING'. Without a GUI socket, `pane` addresses the headless terminals this server opened (the ids term_* tools take; new_tab opens one).
         ,
         .input_schema =
-        \\{"type":"object","properties":{"pane":{"type":"integer"},"timeout_ms":{"type":"integer","description":"Max wait (default 15000, max 120000 - larger values are clamped)"},"quiet_ms":{"type":"integer"}}}
+        \\{"type":"object","properties":{"pane":{"type":"integer"},"timeout_ms":{"type":"integer","description":"Max wait (default 30000, max 120000 - larger values are clamped)"},"quiet_ms":{"type":"integer","description":"No-output window that counts as idle (default 400)"}}}
         ,
-        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"pane\":{\"type\":\"integer\"},\"settled\":{\"type\":\"boolean\"},\"timed_out\":{\"type\":\"boolean\"},\"timeout_ms\":{\"type\":\"integer\"},\"quiet_ms\":{\"type\":\"integer\"}" ++ "},\"required\":[\"settled\",\"timed_out\"]}",
+        .output_schema = contentSchema(PANE_ADDR_PROPS, WAIT_IDLE_PROPS, "\"headless\",\"settled\",\"timed_out\""),
     },
     .{
         .name = "new_tab",
         .group = .panes,
         .mutates = true,
         .description =
-        \\Open a new shell tab in the GUI. Returns the new tab and pane ids. With no GUI running it falls back to opening a HEADLESS terminal and returns its term id instead (drive that one with term_* tools).
+        \\Open a new shell tab in the GUI. Returns the new tab and pane ids. With no GUI socket attached it opens a HEADLESS terminal instead and returns its id as `pane` (and `term`): every pane tool and every term_* tool addresses it by that id.
         ,
         .input_schema =
         \\{"type":"object","properties":{"cwd":{"type":"string"},"title":{"type":"string"}}}
@@ -242,7 +276,7 @@ pub const TOOLS = [_]ToolDef{
         .group = .panes,
         .mutates = true,
         .description =
-        \\Split a pane. direction 'h' = side by side, 'v' = stacked. Returns the new pane id.
+        \\Split a pane. direction 'h' = side by side, 'v' = stacked. Returns the new pane id. Needs a GUI socket: without one it answers `unavailable` (headless terminals have no GUI pane).
         ,
         .input_schema =
         \\{"type":"object","properties":{"pane":{"type":"integer"},"direction":{"type":"string","enum":["h","v"]}}}
@@ -254,7 +288,7 @@ pub const TOOLS = [_]ToolDef{
         .group = .panes,
         .mutates = true,
         .description =
-        \\Focus a pane (selects its tab and grabs keyboard focus).
+        \\Focus a pane (selects its tab and grabs keyboard focus). Needs a GUI socket: without one it answers `unavailable` (headless terminals have no GUI pane).
         ,
         .input_schema =
         \\{"type":"object","properties":{"pane":{"type":"integer"}},"required":["pane"]}
@@ -266,7 +300,7 @@ pub const TOOLS = [_]ToolDef{
         .group = .panes,
         .mutates = true,
         .description =
-        \\Close a pane. Destructive: the shell and any running process in it are terminated.
+        \\Close a pane. Destructive: the shell and any running process in it are terminated. Needs a GUI socket: without one it answers `unavailable` (headless terminals have no GUI pane). Close a headless terminal with term_close.
         ,
         .input_schema =
         \\{"type":"object","properties":{"pane":{"type":"integer"}},"required":["pane"]}
@@ -783,9 +817,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{}}
         ,
-        .output_schema =
-        \\{"type":"object","properties":{"terms":{"type":"array","items":{"type":"object","properties":{"term":{"type":"integer"},"exited":{"type":"boolean"},"shell":{"type":"string"},"integration":{"type":"boolean"},"transport":{"type":"string"},"host":{"type":"string"},"exit_status":{"type":"integer"},"pending_command":{"type":"boolean"},"pending_exec":{"type":"boolean"},"last_line":{"type":"string"},"recording":{"type":"string"}},"required":["term","exited"]}},"count":{"type":"integer"}},"required":["terms","count"]}
-        ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{\"terms\":{\"type\":\"array\",\"items\":" ++ TERMINAL_ITEM ++ "},\"count\":{\"type\":\"integer\"}},\"required\":[\"terms\",\"count\"]}",
     },
     .{
         .name = "term_run",
@@ -797,9 +829,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"term":{"type":"integer"},"command":{"type":"string"},"wait_for":{"type":"string","enum":["idle","command"],"description":"idle (default) waits for output quiescence; command waits for actual shell-command completion"},"quiet_ms":{"type":"integer","description":"Idle mode only: no-output window (default 400)"},"timeout_ms":{"type":"integer","description":"Default 30000"},"output_only":{"type":"boolean","description":"Return just the command's output instead of the whole screen"}},"required":["command"]}
         ,
-        .output_schema =
-        \\{"type":"object","properties":{"term":{"type":"integer"},"wait_for":{"type":"string","enum":["idle"],"description":"Idle mode only; command mode reports state/completion_source instead"},"command_sent":{"type":"boolean"},"settled":{"type":"boolean","description":"Idle mode: output went quiet before the timeout"},"went_to_foreground_stdin":{"type":"boolean","description":"Idle mode: a foreground command was already running, so the text was NOT a new shell command"},"output_kind":{"type":"string","enum":["screen","command"]},"output":{"type":"string"},"exit_status":{"type":["integer","null"]},"output_only_unavailable":{"type":"boolean","description":"output_only was asked for but no OSC 133 command zone had completed"},"state":{"type":"string","enum":["unsupported","running","completed","unknown"]},"timed_out":{"type":"boolean"},"completion_source":{"type":"string","enum":["none","shell_integration","process_tracking"]},"reason":{"type":"string"}},"required":["command_sent"]}
-        ,
+        .output_schema = contentSchema(TERM_ADDR_PROPS, RUN_PROPS, "\"command_sent\""),
     },
     .{
         .name = "term_send_text",
@@ -811,9 +841,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"term":{"type":"integer"},"text":{"type":"string"},"enter":{"type":"boolean"}},"required":["text"]}
         ,
-        .output_schema =
-        \\{"type":"object","properties":{"term":{"type":"integer"},"bytes":{"type":"integer","description":"Bytes written, including the appended carriage return"},"enter":{"type":"boolean"}},"required":["term","bytes","enter"]}
-        ,
+        .output_schema = contentSchema(TERM_ADDR_PROPS, SEND_TEXT_PROPS, "\"term\",\"bytes\",\"enter\""),
     },
     .{
         .name = "term_send_keys",
@@ -825,23 +853,19 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"term":{"type":"integer"},"keys":{"type":"string"}},"required":["keys"]}
         ,
-        .output_schema =
-        \\{"type":"object","properties":{"term":{"type":"integer"},"keys":{"type":"string"}},"required":["term","keys"]}
-        ,
+        .output_schema = contentSchema(TERM_ADDR_PROPS, SEND_KEYS_PROPS, "\"term\",\"keys\",\"sent\""),
     },
     .{
         .name = "term_read",
         .group = .term,
         .mutates = false,
         .description =
-        \\Read a headless terminal's rendered screen text. 'scrollback' true dumps the scrollback too.
+        \\Read a headless terminal's rendered screen with its cursor/size facts. scrollback adds the history above it; last_command=true returns only the last completed command's output and exit code. On an exited terminal the reply carries the exit status and the final frame.
         ,
         .input_schema =
-        \\{"type":"object","properties":{"term":{"type":"integer"},"scrollback":{"type":"boolean"}}}
+        \\{"type":"object","properties":{"term":{"type":"integer"},"scrollback":{"type":["boolean","integer"],"description":"Include the scrollback history too (true, or any positive number)"},"last_command":{"type":"boolean","description":"Return only the last completed command's output + exit code"}}}
         ,
-        .output_schema =
-        \\{"type":"object","properties":{"term":{"type":"integer"},"exited":{"type":"boolean"},"scrollback":{"type":"boolean"},"screen":{"type":"string"},"exit_status":{"type":"integer","description":"Only when the process exited with a known status"}},"required":["term","exited","scrollback","screen"]}
-        ,
+        .output_schema = contentSchema(TERM_ADDR_PROPS, READ_PROPS, "\"term\""),
     },
     .{
         .name = "term_wait_idle",
@@ -851,11 +875,9 @@ pub const TOOLS = [_]ToolDef{
         \\Wait until a headless terminal's output stops changing (or timeout). Output idle does NOT imply that the foreground command exited; when shell integration is active the reply distinguishes 'idle at shell prompt' from 'idle, but a foreground command is still RUNNING'.
         ,
         .input_schema =
-        \\{"type":"object","properties":{"term":{"type":"integer"},"quiet_ms":{"type":"integer"},"timeout_ms":{"type":"integer"}}}
+        \\{"type":"object","properties":{"term":{"type":"integer"},"timeout_ms":{"type":"integer","description":"Max wait (default 30000, max 120000 - larger values are clamped)"},"quiet_ms":{"type":"integer","description":"No-output window that counts as idle (default 400)"}}}
         ,
-        .output_schema =
-        \\{"type":"object","properties":{"term":{"type":"integer"},"idle":{"type":"boolean"},"timed_out":{"type":"boolean"},"desynced":{"type":"boolean","description":"The mirror lost sync: quiescence cannot be observed"},"foreground_running":{"type":"boolean","description":"Idle but a foreground command is still running"}},"required":["term","idle","timed_out","desynced","foreground_running"]}
-        ,
+        .output_schema = contentSchema(TERM_ADDR_PROPS, WAIT_IDLE_PROPS, "\"term\",\"settled\",\"timed_out\",\"desynced\""),
     },
     .{
         .name = "term_wait_command",
@@ -1293,12 +1315,12 @@ pub const TOOLS = [_]ToolDef{
         .group = .ui,
         .mutates = false,
         .description =
-        \\Block until the user interacts with a panel, then return queued interactions with component id and monotonic timestamp: button click values are actions, slider/select changes carry their new value, and text_input submit carries up to 4096 UTF-8 bytes. Returns as soon as anything is queued, including interactions before the call, because the queue is drained rather than sampled. A lost delivered drain reply reports that events may already have been drained and is not retried. timeout_ms defaults to 30000 and is capped at 120000. Queue capacity remains 64; overflow reports how many older events were dropped. A panel closed by the user ends the wait immediately.
+        \\Block until the user interacts with a panel, then return queued interactions with component id and monotonic timestamp: button click values are actions, slider/select changes carry their new value, and text_input submit carries up to 4096 UTF-8 bytes. Returns as soon as anything is queued, including interactions before the call. The read is ACKNOWLEDGED (reliable:true): what one call returns is acknowledged by the next, so a reply lost on the way back is re-read rather than lost; only a GUI too old for it falls back to the destructive drain (reliable:false), where a lost reply may already have drained events and says so. timeout_ms defaults to 30000 and is capped at 120000. Queue capacity is 64; overflow reports how many older events were dropped. A panel closed by the user ends the wait immediately.
         ,
         .input_schema =
         \\{"type":"object","properties":{"name":{"type":"string","description":"Panel name (in 'session')"},"panel_id":{"type":"integer","description":"Handle from ui_show, instead of 'name'"},"timeout_ms":{"type":"integer","description":"Wait budget, default 30000, clamped to 120000"},"session":{"type":"string"}}}
         ,
-        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"panel_id\":{\"type\":\"integer\"},\"waited_ms\":{\"type\":\"integer\"},\"dropped\":{\"type\":\"integer\"},\"events\":{\"type\":\"array\",\"items\":{\"type\":\"object\"}},\"count\":{\"type\":\"integer\"},\"timed_out\":{\"type\":\"boolean\"}" ++ "},\"required\":[\"panel_id\",\"waited_ms\",\"events\",\"count\",\"timed_out\",\"dropped\"]}",
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"panel_id\":{\"type\":\"integer\"},\"waited_ms\":{\"type\":\"integer\"},\"dropped\":{\"type\":\"integer\"},\"reliable\":{\"type\":\"boolean\",\"description\":\"false: this GUI predates the acknowledged read, so events were drained\"},\"events\":{\"type\":\"array\",\"items\":{\"type\":\"object\"}},\"count\":{\"type\":\"integer\"},\"timed_out\":{\"type\":\"boolean\"}" ++ "},\"required\":[\"panel_id\",\"waited_ms\",\"events\",\"count\",\"timed_out\",\"dropped\",\"reliable\"]}",
     },
     .{
         .name = "ui_panels",
@@ -1816,6 +1838,52 @@ pub fn find(name: []const u8) ?ToolDef {
     return null;
 }
 
+/// The tools of one group as an exhaustive enum in table order: a group
+/// handler switches over it, so a table entry without a handler prong
+/// is a compile error rather than an `unknown_tool` at runtime.
+pub fn GroupTool(comptime g: Group) type {
+    comptime {
+        @setEvalBranchQuota(200_000);
+        var n: usize = 0;
+        for (TOOLS) |t| {
+            if (t.group == g) n += 1;
+        }
+        var names: [n][]const u8 = undefined;
+        var i: usize = 0;
+        for (TOOLS) |t| {
+            if (t.group != g) continue;
+            names[i] = t.name;
+            i += 1;
+        }
+        const IntTag = std.math.IntFittingRange(0, n -| 1);
+        const frozen = names;
+        return @Enum(IntTag, .exhaustive, &frozen, &std.simd.iota(IntTag, n));
+    }
+}
+
+/// One tool resolved to its group's enum: what the dispatcher switches on.
+pub const Routed = blk: {
+    const groups = std.enums.values(Group);
+    var names: [groups.len][]const u8 = undefined;
+    var types: [groups.len]type = undefined;
+    for (groups, 0..) |g, i| {
+        names[i] = @tagName(g);
+        types[i] = GroupTool(g);
+    }
+    break :blk @Union(.auto, Group, &names, &types, &@splat(.{}));
+};
+
+/// Resolve `name` through the table; null when no entry declares it.
+pub fn route(name: []const u8) ?Routed {
+    const def = find(name) orelse return null;
+    switch (def.group) {
+        inline else => |g| {
+            const tool = std.meta.stringToEnum(GroupTool(g), name) orelse unreachable;
+            return @unionInit(Routed, @tagName(g), tool);
+        },
+    }
+}
+
 // ── tests ─────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -1882,6 +1950,26 @@ test "every tool is uniquely named, described and grouped" {
     }
     try testing.expect(find("capabilities") != null);
     try testing.expect(find("no_such_tool") == null);
+}
+
+test "every table entry routes to exactly its own group's handler enum" {
+    // The dispatcher switches on `route(name)` and every group handler
+    // switches exhaustively over its GroupTool enum, so this plus the
+    // compiler is the proof that each entry reaches a handler.
+    var per_group = std.EnumArray(Group, usize).initFill(0);
+    for (TOOLS) |t| {
+        const routed = route(t.name) orelse return error.Unrouted;
+        try testing.expectEqual(t.group, std.meta.activeTag(routed));
+        switch (routed) {
+            inline else => |tool| try testing.expectEqualStrings(t.name, @tagName(tool)),
+        }
+        per_group.getPtr(t.group).* += 1;
+    }
+    inline for (comptime std.enums.values(Group)) |g| {
+        try testing.expectEqual(per_group.get(g), @typeInfo(GroupTool(g)).@"enum".fields.len);
+    }
+    try testing.expect(route("no_such_tool") == null);
+    try testing.expect(route("") == null);
 }
 
 test "every tool of every group declares an output schema" {

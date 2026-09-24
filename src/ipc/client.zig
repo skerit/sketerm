@@ -630,3 +630,10 @@ fn talk(allocator: std.mem.Allocator, sock_path: [:0]u8, req: protocol.Request, 
     }
     return if (parsed.value.ok) 0 else 1;
 }
+
+test "the cli entry points are analyzed by the unit build" {
+    // Reached only from main.zig, which the test roots never compile.
+    _ = &run;
+    _ = &editorInPane;
+    _ = &browserInPane;
+}

@@ -294,10 +294,6 @@ pub fn socketPath() ?[]const u8 {
     return if (g_state) |s| s.sock else null;
 }
 
-pub fn spawnCount() u32 {
-    return if (g_state) |s| s.spawns else 0;
-}
-
 /// The sentence the last failed `ensureBackend` left.
 pub fn reason() []const u8 {
     return if (g_state) |s| s.reason else "";

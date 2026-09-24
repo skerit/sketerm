@@ -220,6 +220,7 @@ comptime {
     _ = @import("a11y/detect.zig");
     _ = @import("ipc/protocol.zig");
     _ = @import("ipc/ctlclient.zig");
+    _ = @import("ipc/client.zig");
     _ = @import("mux/channel_pump.zig");
     _ = @import("ipc/mux_cli.zig");
     _ = @import("ipc/mux_tty.zig");
@@ -235,7 +236,10 @@ comptime {
     _ = @import("ipc/webprofiles.zig");
     _ = @import("ipc/mcp.zig");
     _ = @import("ipc/mcp_app.zig");
+    _ = @import("ipc/mcp_files.zig");
+    _ = @import("ipc/mcp_panes.zig");
     _ = @import("ipc/mcp_term.zig");
+    _ = @import("ipc/mcp_ui.zig");
     _ = @import("ipc/mcp_web.zig");
     _ = @import("ipc/mcp_webgui.zig");
     _ = @import("ipc/paneldrive.zig");

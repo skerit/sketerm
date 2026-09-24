@@ -534,8 +534,15 @@ test "paneldrive origin prefers exact environment and otherwise names only the d
     defer t.allocator.free(want_exact);
     try t.expectEqualStrings(want_exact, exact.socket);
 
+    // A relative socket resolves against the cwd; root it in /tmp so a
+    // deep checkout cannot push the result past sockaddr_un's ~108 bytes.
+    var cwd_buf: [4096]u8 = undefined;
+    if (c.getcwd(&cwd_buf, cwd_buf.len) == null) return error.SkipZigTest;
+    try t.expectEqual(@as(c_int, 0), c.chdir("/tmp"));
     _ = c.setenv("SKETERM_MUX_SOCKET", "relative-panel-origin.sock", 1);
-    var relative = try Origin.resolve(t.allocator, "session-a");
+    const relative_result = Origin.resolve(t.allocator, "session-a");
+    _ = c.chdir(&cwd_buf);
+    var relative = try relative_result;
     defer relative.deinit(t.allocator);
     try t.expect(relative.socket.len > "relative-panel-origin.sock".len);
     try t.expect(relative.socket[0] == '/');

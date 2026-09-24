@@ -900,6 +900,12 @@ pub const Term = struct {
         self.conn.sendJson(.rec_start, .{ .path = path }) catch {};
     }
 
+    /// Stop the session's recording; fire-and-forget like `startRecording`.
+    pub fn stopRecording(self: *Term) void {
+        if (self.exited) return;
+        self.conn.sendFrame(.rec_stop, "") catch {};
+    }
+
     pub fn resize(self: *Term, cols: u16, rows: u16) Error!void {
         if (self.exited) return Error.NotConnected;
         var buf: [4]u8 = undefined;

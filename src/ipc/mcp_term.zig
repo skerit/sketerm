@@ -7,17 +7,17 @@ const c = @import("../c.zig").c;
 const atomicwrite = @import("../util/atomicwrite.zig");
 const termdrive = @import("termdrive.zig");
 const mcp = @import("mcp.zig");
-const termIdOf = mcp.termIdOf;
-const commandCompletionResult = mcp.commandCompletionResult;
+const mcp_panes = @import("mcp_panes.zig");
+const mcp_tools = @import("mcp_tools.zig");
+const eql = std.mem.eql;
+const McpLog = mcp.McpLog;
+const Res = mcp.Res;
+const expectToolResultShape = mcp.expectToolResultShape;
+const run = mcp.run;
 const argBool = mcp.argBool;
-const forwardFromArgs = mcp.forwardFromArgs;
-const Forward = mcp.Forward;
-const termFromArgs = mcp.termFromArgs;
 const argInt = mcp.argInt;
 const argStr = mcp.argStr;
 const appErr = mcp.appErr;
-const recordAuxTerm = mcp.recordAuxTerm;
-const recordRegisteredTerm = mcp.recordRegisteredTerm;
 const tailLines = mcp.tailLines;
 const nowMs = @import("../util/clock.zig").nowMs;
 const shellquote = mcp.shellquote;
@@ -30,11 +30,11 @@ const Config = @import("../config.zig").Config;
 /// daemon. No local asciicast: rec_start writes on the daemon's host,
 /// which would litter the remote box.
 pub fn spawnRegisteredRemoteTerm(host: []const u8, argv: []const []const u8, cols: u16, rows: u16) !u32 {
-    const t = termdrive.Term.spawnRemoteMux(mcp.term_state.allocator, host, argv, cols, rows) catch
+    const t = termdrive.Term.spawnRemoteMux(term_state.allocator, host, argv, cols, rows) catch
         return error.SpawnFailed;
-    const id = mcp.term_state.next_id;
-    mcp.term_state.next_id += 1;
-    mcp.term_state.terms.put(mcp.term_state.allocator, id, t) catch {
+    const id = term_state.next_id;
+    term_state.next_id += 1;
+    term_state.terms.put(term_state.allocator, id, t) catch {
         t.deinit();
         return error.OutOfMemory;
     };
@@ -43,11 +43,11 @@ pub fn spawnRegisteredRemoteTerm(host: []const u8, argv: []const []const u8, col
 
 /// Spawn + register a headless terminal; returns its id.
 pub fn spawnRegisteredTerm(argv: ?[]const []const u8, cols: u16, rows: u16) !u32 {
-    const t = termdrive.Term.spawn(mcp.term_state.allocator, argv, cols, rows, mcp.term_state.mux_sock) catch
+    const t = termdrive.Term.spawn(term_state.allocator, argv, cols, rows, term_state.mux_sock) catch
         return error.SpawnFailed;
-    const id = mcp.term_state.next_id;
-    mcp.term_state.next_id += 1;
-    mcp.term_state.terms.put(mcp.term_state.allocator, id, t) catch {
+    const id = term_state.next_id;
+    term_state.next_id += 1;
+    term_state.terms.put(term_state.allocator, id, t) catch {
         t.deinit();
         return error.OutOfMemory;
     };
@@ -59,7 +59,7 @@ pub fn spawnRegisteredTerm(argv: ?[]const []const u8, cols: u16, rows: u16) !u32
 /// "". Arena-owned.
 pub fn termLastLine(arena: std.mem.Allocator, t: *termdrive.Term) []const u8 {
     const text = t.readScreen(false) catch return "";
-    defer mcp.term_state.allocator.free(text);
+    defer term_state.allocator.free(text);
     var it = std.mem.splitBackwardsScalar(u8, text, '\n');
     while (it.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \r\t");
@@ -83,7 +83,7 @@ pub fn execResultJson(arena: std.mem.Allocator, r: termdrive.ExecOutcome, t: *te
     var screen_tail: ?[]const u8 = null;
     if (r.pending) {
         if (t.readScreen(false)) |screen_text| {
-            defer mcp.term_state.allocator.free(screen_text);
+            defer term_state.allocator.free(screen_text);
             screen_tail = try arena.dupe(u8, tailLines(screen_text, 20));
         } else |_| {}
     }
@@ -230,544 +230,375 @@ test "term output files are created private and keep the user's mode" {
     try t.expectEqual(@as(c_uint, 0o644), @as(c_uint, @intCast(st.st_mode & 0o777)));
 }
 
-pub fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]const u8 {
-    const eql = std.mem.eql;
-    if (mcp.term_state.mux_sock == null)
+pub const Tool = mcp_tools.GroupTool(.term);
+
+pub fn termTool(arena: std.mem.Allocator, tool: Tool, args: std.json.Value) ![]const u8 {
+    if (term_state.mux_sock == null)
         return mcp.errRes(arena, .unavailable, "headless terminal tools need isolated mode; in --shared mode use the GUI-backed terminal tools (list_terminals, run_command, ...)");
+    return switch (tool) {
+        .term_open => termOpen(arena, args),
+        // The terminal-content twins share one implementation with the
+        // pane tools (mcp_panes.zig); `term` addresses the same sessions.
+        .term_list => mcp_panes.listTerminals(arena, .term, null, args),
+        .term_send_text => mcp_panes.sendText(arena, .term, null, args),
+        .term_send_keys => mcp_panes.sendKeys(arena, .term, null, args),
+        .term_read => mcp_panes.readScreen(arena, .term, null, args),
+        .term_exec => withTerm(arena, args, termExec),
+        .term_exec_wait => withTerm(arena, args, termExecWait),
+        .term_wait_exit => withTerm(arena, args, termWaitExit),
+        .term_run => mcp_panes.runCommand(arena, .term, null, args),
+        .term_wait_command => withTerm(arena, args, termWaitCommand),
+        .term_wait_idle => mcp_panes.waitIdle(arena, .term, null, args),
+        .term_resize => withTerm(arena, args, termResize),
+        .term_close => withTerm(arena, args, termClose),
+    };
+}
 
-    if (eql(u8, name, "term_open")) {
-        const cols: u16 = @intCast(std.math.clamp(argInt(args, "cols") orelse 120, 10, 500));
-        const rows: u16 = @intCast(std.math.clamp(argInt(args, "rows") orelse 40, 4, 300));
-        const host = argStr(args, "host");
-        var cmd_string: ?[]const u8 = null;
-        var cmd_array: ?[]const []const u8 = null;
-        if (args == .object) {
-            if (args.object.get("command")) |cmd| switch (cmd) {
-                .string => cmd_string = cmd.string,
-                .array => {
-                    const items = try arena.alloc([]const u8, cmd.array.items.len);
-                    for (cmd.array.items, 0..) |item, i| {
-                        if (item != .string) return mcp.errRes(arena, .invalid_args, "command array must be strings");
-                        items[i] = item.string;
-                    }
-                    if (items.len > 0) cmd_array = items;
-                },
-                else => {},
-            };
-        }
-        const has_cmd = cmd_string != null or cmd_array != null;
-        // Remote SHELL sessions get OSC 133 integration bootstrapped
-        // into the remote bash/zsh so term_run wait_for=command works
-        // on stock remotes. An explicit remote command,
-        // integration:false, or a missing script dir keeps the plain
-        // behavior.
-        const want_integration = if (args == .object) blk: {
-            const v = args.object.get("integration") orelse break :blk true;
-            break :blk !(v == .bool and !v.bool);
-        } else true;
-        const transport = argStr(args, "transport") orelse "auto";
-        if (!eql(u8, transport, "auto") and !eql(u8, transport, "mux") and !eql(u8, transport, "ssh"))
-            return mcp.errRes(arena, .invalid_args, "transport must be 'auto', 'mux' or 'ssh'");
+/// Resolve the addressed headless terminal, then run one term-scoped tool on it.
+fn withTerm(
+    arena: std.mem.Allocator,
+    args: std.json.Value,
+    comptime body: fn (std.mem.Allocator, std.json.Value, *termdrive.Term, u32) anyerror![]const u8,
+) ![]const u8 {
+    const t = termFromArgs(args, "term") orelse
+        return mcp.errRes(arena, .not_found, "no such terminal (pass 'term' id, or omit it when only one is open)");
+    return body(arena, args, t, termIdOf(t));
+}
 
-        var remote_integration = false;
-        var via_mux = false;
-        var id: u32 = 0;
-        // Transparent transport upgrade: when the remote host has
-        // sketerm-mux in PATH (key auth), the session lives on ITS
-        // daemon — it survives connection drops (termdrive reattaches)
-        // and the bootstrap rides the spawn argv instead of a typed
-        // ssh forced command. Absent binary / password auth / any
-        // failure falls back to plain interactive ssh below; the
-        // assistant never chooses.
-        if (host != null and !eql(u8, transport, "ssh")) mux: {
-            var margv: []const []const u8 = undefined;
-            if (cmd_array) |a| {
-                margv = a;
-            } else if (cmd_string) |s| {
+fn termOpen(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
+    const cols: u16 = @intCast(std.math.clamp(argInt(args, "cols") orelse 120, 10, 500));
+    const rows: u16 = @intCast(std.math.clamp(argInt(args, "rows") orelse 40, 4, 300));
+    const host = argStr(args, "host");
+    var cmd_string: ?[]const u8 = null;
+    var cmd_array: ?[]const []const u8 = null;
+    if (args == .object) {
+        if (args.object.get("command")) |cmd| switch (cmd) {
+            .string => cmd_string = cmd.string,
+            .array => {
+                const items = try arena.alloc([]const u8, cmd.array.items.len);
+                for (cmd.array.items, 0..) |item, i| {
+                    if (item != .string) return mcp.errRes(arena, .invalid_args, "command array must be strings");
+                    items[i] = item.string;
+                }
+                if (items.len > 0) cmd_array = items;
+            },
+            else => {},
+        };
+    }
+    const has_cmd = cmd_string != null or cmd_array != null;
+    // Remote SHELL sessions get OSC 133 integration bootstrapped
+    // into the remote bash/zsh so term_run wait_for=command works
+    // on stock remotes. An explicit remote command,
+    // integration:false, or a missing script dir keeps the plain
+    // behavior.
+    const want_integration = if (args == .object) blk: {
+        const v = args.object.get("integration") orelse break :blk true;
+        break :blk !(v == .bool and !v.bool);
+    } else true;
+    const transport = argStr(args, "transport") orelse "auto";
+    if (!eql(u8, transport, "auto") and !eql(u8, transport, "mux") and !eql(u8, transport, "ssh"))
+        return mcp.errRes(arena, .invalid_args, "transport must be 'auto', 'mux' or 'ssh'");
+
+    var remote_integration = false;
+    var via_mux = false;
+    var id: u32 = 0;
+    // Transparent transport upgrade: when the remote host has
+    // sketerm-mux in PATH (key auth), the session lives on ITS
+    // daemon — it survives connection drops (termdrive reattaches)
+    // and the bootstrap rides the spawn argv instead of a typed
+    // ssh forced command. Absent binary / password auth / any
+    // failure falls back to plain interactive ssh below; the
+    // assistant never chooses.
+    if (host != null and !eql(u8, transport, "ssh")) mux: {
+        var margv: []const []const u8 = undefined;
+        if (cmd_array) |a| {
+            margv = a;
+        } else if (cmd_string) |s| {
+            const trio = try arena.alloc([]const u8, 3);
+            trio[0] = "/bin/sh";
+            trio[1] = "-c";
+            trio[2] = s;
+            margv = trio;
+        } else if (want_integration) {
+            if (termdrive.integrationBootstrapScript(arena)) |script| {
                 const trio = try arena.alloc([]const u8, 3);
                 trio[0] = "/bin/sh";
                 trio[1] = "-c";
-                trio[2] = s;
+                trio[2] = script;
                 margv = trio;
-            } else if (want_integration) {
-                if (termdrive.integrationBootstrapScript(arena)) |script| {
-                    const trio = try arena.alloc([]const u8, 3);
-                    trio[0] = "/bin/sh";
-                    trio[1] = "-c";
-                    trio[2] = script;
-                    margv = trio;
-                    remote_integration = true;
-                } else {
-                    margv = &@import("../mux/shell.zig").remote_login_argv;
-                }
+                remote_integration = true;
             } else {
                 margv = &@import("../mux/shell.zig").remote_login_argv;
             }
-            id = spawnRegisteredRemoteTerm(host.?, margv, cols, rows) catch {
-                remote_integration = false;
-                if (eql(u8, transport, "mux"))
-                    return mcp.errRes(arena, .unavailable, "no reachable sketerm-mux daemon on the remote host (needs key/agent auth and sketerm-mux in the remote PATH; transport 'auto' would fall back to plain ssh)");
-                break :mux;
-            };
-            via_mux = true;
-        }
-        if (!via_mux) {
-            var argv_store: std.ArrayList([]const u8) = .empty;
-            defer argv_store.deinit(arena);
-            if (host) |h| {
-                // Persistent SSH session with keepalives: survives long
-                // provisioning waits; interactive (auth prompts reach
-                // the screen — drive them with term_send_text).
-                try argv_store.appendSlice(arena, &.{
-                    "ssh", "-tt",
-                    "-o",  "ServerAliveInterval=15",
-                    "-o",  "ServerAliveCountMax=4",
-                });
-                // A forced route must survive the fall out of the mux path.
-                const dest = appendRoute(arena, &argv_store, h, false) catch
-                    return mcp.errRes(arena, .refused, "cannot build the forced route for this host");
-                try argv_store.append(arena, dest);
-            }
-            if (cmd_string) |s| {
-                if (host != null) {
-                    try argv_store.append(arena, s);
-                } else {
-                    try argv_store.appendSlice(arena, &.{ "/bin/sh", "-c", s });
-                }
-            } else if (cmd_array) |a| {
-                try argv_store.appendSlice(arena, a);
-            }
-            if (host != null and !has_cmd and want_integration) {
-                if (termdrive.sshIntegrationCommand(arena)) |boot| {
-                    try argv_store.append(arena, boot);
-                    remote_integration = true;
-                }
-            }
-            const argv: ?[]const []const u8 = if (argv_store.items.len > 0) argv_store.items else null;
-            id = spawnRegisteredTerm(argv, cols, rows) catch |err| switch (err) {
-                error.SpawnFailed => return mcp.errRes(arena, .unavailable, "spawn failed (mux daemon unreachable?)"),
-                else => return err,
-            };
-        }
-        const t = mcp.term_state.terms.get(id).?;
-        // The injection claim: command-mode still waits for the first
-        // real prompt mark before trusting it, so an unsupported
-        // remote shell degrades to an honest not-ready refusal.
-        if (remote_integration) t.integration = true;
-        if (host != null) t.setRemoteShellPending(remote_integration);
-        // Let the shell print its first prompt.
-        _ = t.waitIdle(250, 3_000);
-        // SSH: wait (bounded) for the bootstrap's announce line so
-        // THIS reply names the remote shell — bailing early when the
-        // screen sits behind an auth prompt, because the assistant
-        // needs the reply back to answer it.
-        if (host != null and remote_integration and !t.scanShellAnnounce()) {
-            const announce_deadline = nowMs() + 8_000;
-            while (!t.scanShellAnnounce() and nowMs() < announce_deadline and !t.exited) {
-                if (termdrive.looksInteractive(termLastLine(arena, t))) break;
-                _ = t.waitIdle(150, 400);
-            }
-        }
-        const shell_note: []const u8 = blk: {
-            if (t.shell_name) |sn|
-                break :blk try std.fmt.allocPrint(arena, ", shell: {s}, integration: {s}", .{ sn, if (t.integration) "active" else "inactive" });
-            if (host != null and remote_integration)
-                break :blk ", shell: not detected yet (ssh still connecting or auth pending; term_list reports it once the session is up)";
-            if (host != null)
-                break :blk ", shell: unknown (integration disabled; nothing injected to report it)";
-            break :blk "";
-        };
-        const where = if (host) |h| blk: {
-            // Key on the detected OUTCOME: a bootstrap that landed on
-            // dash/fish announces "no integration" and flips
-            // t.integration off — steering to wait_for=command there
-            // would point at a tool that refuses.
-            const drive_note = if (remote_integration and t.integration)
-                "shell integration is auto-injected into a remote bash/zsh — prefer term_run wait_for=command for remote commands (stateful, readable, exact exit status); term_exec when you need isolation or a guaranteed dialect"
-            else
-                "term_exec gives structured remote command results";
-            if (via_mux)
-                break :blk try std.fmt.allocPrint(arena, " durable remote session on {s} via its sketerm-mux daemon (survives connection drops — reattached transparently; {s})", .{ h, drive_note });
-            break :blk try std.fmt.allocPrint(arena, " running ssh to {s} (watch term_read for auth prompts; {s})", .{ h, drive_note });
-        } else "";
-        const rec_note = if (mcp.rec_state.casts.get(id)) |p|
-            try std.fmt.allocPrint(arena, "\nrecording: {s} (asciicast v2, replayable with asciinema)", .{p})
-        else
-            "";
-        var res = mcp.Res.init(arena);
-        try res.fact("term", id);
-        try res.fact("cols", cols);
-        try res.fact("rows", rows);
-        try res.fact("transport", if (via_mux) "sketerm-mux" else if (host != null) "ssh" else "local");
-        if (host) |h| try res.fact("host", h);
-        if (t.shell_name) |sn| try res.fact("shell", sn);
-        try res.fact("integration", t.integration);
-        if (mcp.rec_state.casts.get(id)) |p| try res.fact("recording", p);
-        try res.textf("opened headless terminal {d} ({d}x{d}{s}){s}{s}", .{ id, cols, rows, shell_note, where, rec_note });
-        return res.finish();
-    }
-    if (eql(u8, name, "term_list")) {
-        var res = mcp.Res.init(arena);
-        var aw: std.Io.Writer.Allocating = .init(arena);
-        const w = &aw.writer;
-        try w.writeAll("[");
-        var first = true;
-        var count: usize = 0;
-        var it = mcp.term_state.terms.iterator();
-        while (it.next()) |e| {
-            if (!first) try w.writeAll(",");
-            first = false;
-            count += 1;
-            const t = e.value_ptr.*;
-            t.drain();
-            _ = t.scanShellAnnounce();
-            try w.print("{{\"term\":{d},\"exited\":{}", .{ e.key_ptr.*, t.exited });
-            if (t.shell_name) |sn| {
-                try w.writeAll(",\"shell\":");
-                try std.json.Stringify.value(sn, .{}, w);
-                try w.print(",\"integration\":{}", .{t.integration});
-            }
-            if (t.remote_host) |rh| {
-                try w.writeAll(",\"transport\":\"sketerm-mux\",\"host\":");
-                try std.json.Stringify.value(rh, .{}, w);
-            }
-            if (t.exited and t.exit_status_known) try w.print(",\"exit_status\":{d}", .{t.exit_status});
-            if (t.hasPendingCommand()) try w.writeAll(",\"pending_command\":true");
-            if (t.hasPendingExec()) try w.writeAll(",\"pending_exec\":true");
-            const last = termLastLine(arena, t);
-            if (last.len > 0) {
-                try w.writeAll(",\"last_line\":");
-                try std.json.Stringify.value(last, .{}, w);
-            }
-            if (mcp.rec_state.casts.get(e.key_ptr.*)) |p| {
-                try w.writeAll(",\"recording\":");
-                try std.json.Stringify.value(p, .{}, w);
-            }
-            try w.writeAll("}");
-
-            // One compact human line per terminal, same facts, no JSON.
-            try res.textf("term {d}: {s}", .{ e.key_ptr.*, if (t.exited) "exited" else "running" });
-            if (t.exited and t.exit_status_known) try res.textf("  exit_status: {d}", .{t.exit_status});
-            if (t.shell_name) |sn|
-                try res.textf("  shell: {s}, integration: {}", .{ sn, t.integration });
-            if (t.remote_host) |rh| try res.textf("  host: {s} (sketerm-mux)", .{rh});
-            if (t.hasPendingCommand()) try res.text("  pending_command: true");
-            if (t.hasPendingExec()) try res.text("  pending_exec: true");
-            if (last.len > 0) try res.textf("  last line: {s}", .{last});
-            if (mcp.rec_state.casts.get(e.key_ptr.*)) |p| try res.textf("  recording: {s}", .{p});
-        }
-        try w.writeAll("]");
-        try res.raw("terms", aw.written());
-        try res.fact("count", count);
-        if (count == 0) try res.text("no headless terminals are open");
-        return res.finish();
-    }
-
-    const t = termFromArgs(args) orelse
-        return mcp.errRes(arena, .not_found, "no such terminal (pass 'term' id, or omit it when only one is open)");
-    const term_id = termIdOf(t);
-
-    if (eql(u8, name, "term_send_text")) {
-        const text = argStr(args, "text") orelse return mcp.errRes(arena, .invalid_args, "term_send_text requires 'text'");
-        const enter = argBool(args, "enter");
-        const data = if (enter)
-            try std.fmt.allocPrint(arena, "{s}\r", .{text})
-        else
-            text;
-        t.sendText(data) catch return mcp.errRes(arena, .conflict, "send failed (terminal exited?)");
-        var res = mcp.Res.init(arena);
-        try res.fact("term", term_id);
-        try res.fact("bytes", data.len);
-        try res.fact("enter", enter);
-        try res.textf("sent {d} bytes to terminal {d}{s}", .{ data.len, term_id, if (enter) " (enter pressed)" else "" });
-        return res.finish();
-    }
-    if (eql(u8, name, "term_send_keys")) {
-        const keychords = argStr(args, "keys") orelse return mcp.errRes(arena, .invalid_args, "term_send_keys requires 'keys'");
-        t.sendKeys(keychords) catch |err| return switch (err) {
-            termdrive.Error.BadKey => mcp.errRes(arena, .invalid_args, "unknown key chord"),
-            else => mcp.errRes(arena, .conflict, "send failed (terminal exited?)"),
-        };
-        var res = mcp.Res.init(arena);
-        try res.fact("term", term_id);
-        try res.fact("keys", keychords);
-        try res.textf("sent keys {s} to terminal {d}", .{ keychords, term_id });
-        return res.finish();
-    }
-    if (eql(u8, name, "term_read")) {
-        t.drain();
-        const sb = argBool(args, "scrollback");
-        const text = t.readScreen(sb) catch |err| return switch (err) {
-            termdrive.Error.Desynced => mcp.errRes(arena, .conflict, "this terminal's mirror lost sync with the session and could not be rebuilt; its content is stale. Close it (term_close) and open a new one"),
-            else => mcp.errRes(arena, .conflict, "read failed (terminal exited?)"),
-        };
-        defer mcp.term_state.allocator.free(text);
-        var res = mcp.Res.init(arena);
-        try res.fact("term", term_id);
-        try res.fact("exited", t.exited);
-        try res.fact("scrollback", sb);
-        try res.fact("screen", text);
-        if (t.exited) {
-            // Make an exited terminal's state unambiguous: the final
-            // rendered frame plus the real exit status, so a stale
-            // progress line (scp "1%") cannot be mistaken for truth.
-            if (t.exit_status_known) {
-                try res.fact("exit_status", t.exit_status);
-                try res.textf("[process exited with status {d} - final rendered screen below]", .{t.exit_status});
-            } else {
-                try res.text("[process exited (status unknown) - final rendered screen below]");
-            }
-        }
-        try res.text(text);
-        return res.finish();
-    }
-    if (eql(u8, name, "term_exec")) {
-        const cmd = argStr(args, "command") orelse return mcp.errRes(arena, .invalid_args, "term_exec requires 'command'");
-        // Clamped below the 150s watchdog: one blocked call must never
-        // wedge the single-threaded loop long enough to starve
-        // term_list/term_read or trip the connection-aborting cap.
-        // Longer waits = repeated term_exec_wait calls.
-        const timeout_ms: i64 = std.math.clamp(argInt(args, "timeout_ms") orelse 30_000, 0, 120_000);
-        // Default true: the isolated transport works typed into ANY
-        // shell dialect (fish/zsh/bash, local or remote); false is the
-        // POSIX-only state-persisting mode.
-        const subshell = if (args == .object) blk: {
-            const v = args.object.get("subshell") orelse break :blk true;
-            break :blk v == .bool and v.bool;
-        } else true;
-        const noninteractive = argBool(args, "noninteractive");
-        if (noninteractive and !subshell)
-            return mcp.errRes(arena, .invalid_args, "'noninteractive' needs the default isolated transport (drop subshell:false)");
-        const shell = argStr(args, "shell");
-        if (shell) |sh| {
-            if (!subshell)
-                return mcp.errRes(arena, .invalid_args, "'shell' needs the default isolated transport (drop subshell:false)");
-            if (!validShellName(sh))
-                return mcp.errRes(arena, .invalid_args, "invalid 'shell' (a command name or absolute path: letters, digits, . _ - / only)");
-        }
-        if (t.hasPendingExec()) {
-            // A previously timed-out exec may have finished since;
-            // resolve it silently so the new send is accepted.
-            if (t.waitExecResult(0)) |r0| mcp.term_state.allocator.free(r0.output);
-            if (t.hasPendingExec())
-                return mcp.errRes(arena, .conflict, "a previous term_exec is still running in this terminal; continue it with term_exec_wait (or interrupt with term_send_keys ctrl+c)");
-        }
-        if (t.hasPendingCommand())
-            return mcp.errRes(arena, .conflict, "a term_run wait_for=command command is still tracked; resolve it with term_wait_command first");
-        const r = t.execCommand(cmd, subshell, noninteractive, shell, timeout_ms) catch |err| return switch (err) {
-            termdrive.Error.NotConnected => mcp.errRes(arena, .conflict, "terminal exited"),
-            else => appErr(arena, "exec failed"),
-        };
-        defer mcp.term_state.allocator.free(r.output);
-        return execResultJson(arena, r, t, argStr(args, "output_file"));
-    }
-    if (eql(u8, name, "term_exec_wait")) {
-        const timeout_ms: i64 = std.math.clamp(argInt(args, "timeout_ms") orelse 30_000, 0, 120_000);
-        const r = t.waitExecResult(timeout_ms) orelse
-            return mcp.errRes(arena, .not_found, "no pending term_exec in this terminal");
-        defer mcp.term_state.allocator.free(r.output);
-        return execResultJson(arena, r, t, argStr(args, "output_file"));
-    }
-    if (eql(u8, name, "term_wait_exit")) {
-        const timeout_ms: i64 = std.math.clamp(argInt(args, "timeout_ms") orelse 30_000, 0, 120_000);
-        const exited = t.waitExit(timeout_ms);
-        const tail = blk: {
-            const text = t.readScreen(false) catch break :blk "";
-            defer mcp.term_state.allocator.free(text);
-            break :blk try arena.dupe(u8, tailLines(text, 8));
-        };
-        var res = mcp.Res.init(arena);
-        try res.fact("term", term_id);
-        try res.fact("exited", exited);
-        try res.fact("timed_out", !exited);
-        if (exited and t.exit_status_known) {
-            try res.fact("exit_status", t.exit_status);
-            try res.textf("terminal {d} exited with status {d}", .{ term_id, t.exit_status });
-        } else if (exited) {
-            try res.textf("terminal {d} exited (status unknown)", .{term_id});
         } else {
-            try res.textf("terminal {d} still running at timeout", .{term_id});
+            margv = &@import("../mux/shell.zig").remote_login_argv;
         }
-        if (tail.len > 0) {
-            try res.fact("screen_tail", tail);
-            try res.text("--- screen tail ---");
-            try res.text(tail);
-        }
-        return res.finish();
+        id = spawnRegisteredRemoteTerm(host.?, margv, cols, rows) catch {
+            remote_integration = false;
+            if (eql(u8, transport, "mux"))
+                return mcp.errRes(arena, .unavailable, "no reachable sketerm-mux daemon on the remote host (needs key/agent auth and sketerm-mux in the remote PATH; transport 'auto' would fall back to plain ssh)");
+            break :mux;
+        };
+        via_mux = true;
     }
-    if (eql(u8, name, "term_run")) {
-        const cmd = argStr(args, "command") orelse return mcp.errRes(arena, .invalid_args, "term_run requires 'command'");
-        const quiet_ms: i64 = argInt(args, "quiet_ms") orelse 400;
-        const timeout_ms: i64 = std.math.clamp(argInt(args, "timeout_ms") orelse 30_000, 0, 120_000);
-        const wait_for = argStr(args, "wait_for") orelse "idle";
-        if (!eql(u8, wait_for, "idle") and !eql(u8, wait_for, "command"))
-            return mcp.errRes(arena, .invalid_args, "wait_for must be 'idle' or 'command'");
-        if (eql(u8, wait_for, "command")) {
-            // A tracked command may have completed since its timeout:
-            // one short drain clears it so the new send is accepted.
-            if (t.hasPendingCommand()) _ = t.waitPendingCommand(0);
-            if (t.hasPendingCommand()) {
-                return commandCompletionResult(arena, .{ .state = .running }, false, null, null, "a previously timed-out command is still running; use term_wait_command instead of resending");
-            }
-            // The token wait spends from the same budget as the
-            // completion wait, so the call never outlives timeout_ms.
-            const started = nowMs();
-            const token_res = t.commandToken(@min(timeout_ms, 10_000)) catch return mcp.errRes(arena, .unavailable, "command completion unavailable (terminal exited?)");
-            const token = switch (token_res) {
-                .unsupported => return commandCompletionResult(arena, .{ .state = .unsupported }, false, null, null, "shell integration is unavailable for this shell; command was not sent and no exit status was fabricated"),
-                .not_ready => return commandCompletionResult(arena, .{ .state = .unsupported, .timed_out = true }, false, null, null, "shell integration is injected but no prompt mark has arrived yet (shell still starting, ssh auth still pending, an unsupported remote shell, or rc files broke the injection); command was not sent — retry shortly, or use term_exec"),
-                .busy => return commandCompletionResult(arena, .{ .state = .running }, false, null, null, "a foreground command started outside command mode is still running; its completion would be misattributed. Wait for it (term_wait_idle) before sending in command mode"),
-                .token => |tok| tok,
-            };
-            const line = try std.fmt.allocPrint(arena, "{s}\r", .{cmd});
-            t.sendText(line) catch return mcp.errRes(arena, .conflict, "send failed (terminal exited?)");
-            t.trackCommand(token);
-            const result = t.waitCommand(token, @max(0, timeout_ms - (nowMs() - started)));
-
-            var owned_output: ?[]u8 = null;
-            defer if (owned_output) |text| mcp.term_state.allocator.free(text);
-            var output_kind: []const u8 = "screen";
-            if (result.state == .completed and result.source == .shell_integration and argBool(args, "output_only")) {
-                if (t.lastCommand() catch null) |lc| {
-                    owned_output = lc.text;
-                    output_kind = "command";
-                }
-            }
-            if (owned_output == null) {
-                owned_output = t.readScreen(false) catch null;
-            }
-            return commandCompletionResult(arena, result, true, owned_output, output_kind, switch (result.state) {
-                .running => "timeout expired while the command was still running; output may have been idle",
-                .unknown => "terminal disconnected before a reliable completion status was received",
-                .unsupported => unreachable,
-                .completed => null,
+    if (!via_mux) {
+        var argv_store: std.ArrayList([]const u8) = .empty;
+        defer argv_store.deinit(arena);
+        if (host) |h| {
+            // Persistent SSH session with keepalives: survives long
+            // provisioning waits; interactive (auth prompts reach
+            // the screen — drive them with term_send_text).
+            try argv_store.appendSlice(arena, &.{
+                "ssh", "-tt",
+                "-o",  "ServerAliveInterval=15",
+                "-o",  "ServerAliveCountMax=4",
             });
+            // A forced route must survive the fall out of the mux path.
+            const dest = appendRoute(arena, &argv_store, h, false) catch
+                return mcp.errRes(arena, .refused, "cannot build the forced route for this host");
+            try argv_store.append(arena, dest);
         }
-        // Idle mode must not run a NEW command while a command-mode
-        // token is unresolved: the interloper's OSC 133 D would be
-        // reported by term_wait_command as the tracked command's exit.
-        if (t.hasPendingCommand()) _ = t.waitPendingCommand(0);
-        if (t.hasPendingCommand())
-            return mcp.errRes(arena, .conflict, "a command-mode command is still being tracked; resolve it with term_wait_command before running another command, or its exit status would be misattributed");
-        // Honesty over silent queueing: when integration shows an
-        // open command zone, the typed line goes to the RUNNING
-        // program's stdin (or sits queued by the shell), not to a new
-        // shell command — say so instead of letting a quiet screen
-        // read as "executed".
-        const busy_before = t.integration and t.foregroundRunning();
-        const line = try std.fmt.allocPrint(arena, "{s}\r", .{cmd});
-        t.sendText(line) catch return mcp.errRes(arena, .conflict, "send failed (terminal exited?)");
-        const settled = t.waitIdle(quiet_ms, timeout_ms);
-        var res = mcp.Res.init(arena);
-        try res.fact("term", term_id);
-        try res.fact("wait_for", "idle");
-        try res.fact("command_sent", true);
-        try res.fact("settled", settled);
-        try res.fact("went_to_foreground_stdin", busy_before);
-        var note: []const u8 = if (settled) "" else "\n[note: output still flowing at timeout]";
-        if (busy_before)
-            note = try std.fmt.allocPrint(arena, "{s}\n[note: a foreground command was already running when this text was sent — it went to that program's stdin, or the shell queued it as pending input; it did NOT start as a new shell command. Wait with term_wait_idle, or interrupt with term_send_keys ctrl+c]", .{note});
-        const want_output_only = argBool(args, "output_only");
-        if (want_output_only) {
-            // OSC 133 zone: output + exit code only. Screen-scrape
-            // fallback when no zone completed — announced below,
-            // never a silent shape change.
-            if (t.lastCommand() catch null) |lc| {
-                defer mcp.term_state.allocator.free(lc.text);
-                try res.fact("output_kind", "command");
-                try res.fact("exit_status", lc.exit);
-                try res.fact("output", lc.text);
-                try res.textf("exit: {d}", .{lc.exit});
-                try res.text("---");
-                try res.textf("{s}{s}", .{ lc.text, note });
-                return res.finish();
+        if (cmd_string) |s| {
+            if (host != null) {
+                try argv_store.append(arena, s);
+            } else {
+                try argv_store.appendSlice(arena, &.{ "/bin/sh", "-c", s });
+            }
+        } else if (cmd_array) |a| {
+            try argv_store.appendSlice(arena, a);
+        }
+        if (host != null and !has_cmd and want_integration) {
+            if (termdrive.sshIntegrationCommand(arena)) |boot| {
+                try argv_store.append(arena, boot);
+                remote_integration = true;
             }
         }
-        const text = t.readScreen(false) catch return appErr(arena, "read failed");
-        defer mcp.term_state.allocator.free(text);
-        try res.fact("output_kind", "screen");
-        try res.fact("output", text);
-        if (want_output_only) {
-            try res.fact("output_only_unavailable", true);
-            try res.text("[output_only unavailable: no completed OSC 133 command zone — shell integration is inactive in this terminal (unsupported shell, or the command emitted no marks); returning the rendered screen]");
-        }
-        try res.textf("{s}{s}", .{ text, note });
-        return res.finish();
+        const argv: ?[]const []const u8 = if (argv_store.items.len > 0) argv_store.items else null;
+        id = spawnRegisteredTerm(argv, cols, rows) catch |err| switch (err) {
+            error.SpawnFailed => return mcp.errRes(arena, .unavailable, "spawn failed (mux daemon unreachable?)"),
+            else => return err,
+        };
     }
-    if (eql(u8, name, "term_wait_command")) {
-        const timeout_ms: i64 = std.math.clamp(argInt(args, "timeout_ms") orelse 30_000, 0, 120_000);
-        const result = t.waitPendingCommand(timeout_ms) orelse
-            return mcp.errRes(arena, .not_found, "no timed-out command is being tracked");
-        var owned_output: ?[]u8 = null;
-        defer if (owned_output) |text| mcp.term_state.allocator.free(text);
-        var output_kind: []const u8 = "screen";
-        if (result.state == .completed and result.source == .shell_integration and argBool(args, "output_only")) {
-            if (t.lastCommand() catch null) |lc| {
-                owned_output = lc.text;
-                output_kind = "command";
-            }
+    const t = term_state.terms.get(id).?;
+    // The injection claim: command-mode still waits for the first
+    // real prompt mark before trusting it, so an unsupported
+    // remote shell degrades to an honest not-ready refusal.
+    if (remote_integration) t.integration = true;
+    if (host != null) t.setRemoteShellPending(remote_integration);
+    // Let the shell print its first prompt.
+    _ = t.waitIdle(250, 3_000);
+    // SSH: wait (bounded) for the bootstrap's announce line so
+    // THIS reply names the remote shell — bailing early when the
+    // screen sits behind an auth prompt, because the assistant
+    // needs the reply back to answer it.
+    if (host != null and remote_integration and !t.scanShellAnnounce()) {
+        const announce_deadline = nowMs() + 8_000;
+        while (!t.scanShellAnnounce() and nowMs() < announce_deadline and !t.exited) {
+            if (termdrive.looksInteractive(termLastLine(arena, t))) break;
+            _ = t.waitIdle(150, 400);
         }
-        if (owned_output == null) owned_output = t.readScreen(false) catch null;
-        return commandCompletionResult(arena, result, true, owned_output, output_kind, switch (result.state) {
-            .running => "timeout expired while the command was still running; output may have been idle",
-            .unknown => "terminal disconnected before a reliable completion status was received",
-            .unsupported => unreachable,
-            .completed => null,
-        });
     }
-    if (eql(u8, name, "term_wait_idle")) {
-        const quiet_ms: i64 = argInt(args, "quiet_ms") orelse 500;
-        const timeout_ms: i64 = std.math.clamp(argInt(args, "timeout_ms") orelse 30_000, 0, 120_000);
-        const settled = t.waitIdle(quiet_ms, timeout_ms);
-        // Prompt-aware verdict when integration can tell: "quiet
-        // because sleeping" must not masquerade as "done".
-        const desynced = !settled and t.isDesynced();
-        const foreground = settled and t.integration and t.foregroundRunning();
-        const msg = if (desynced)
-            "NOT idle: this terminal's mirror lost sync with the session and could not be rebuilt, so quiescence cannot be observed. Close it (term_close) and open a new one"
-        else if (!settled)
-            "still active at timeout"
-        else if (foreground)
-            "idle, but a foreground command is still RUNNING (output is quiet, not finished)"
-        else if (t.integration)
-            "idle at shell prompt"
+    const shell_note: []const u8 = blk: {
+        if (t.shell_name) |sn|
+            break :blk try std.fmt.allocPrint(arena, ", shell: {s}, integration: {s}", .{ sn, if (t.integration) "active" else "inactive" });
+        if (host != null and remote_integration)
+            break :blk ", shell: not detected yet (ssh still connecting or auth pending; term_list reports it once the session is up)";
+        if (host != null)
+            break :blk ", shell: unknown (integration disabled; nothing injected to report it)";
+        break :blk "";
+    };
+    const where = if (host) |h| blk: {
+        // Key on the detected OUTCOME: a bootstrap that landed on
+        // dash/fish announces "no integration" and flips
+        // t.integration off — steering to wait_for=command there
+        // would point at a tool that refuses.
+        const drive_note = if (remote_integration and t.integration)
+            "shell integration is auto-injected into a remote bash/zsh — prefer term_run wait_for=command for remote commands (stateful, readable, exact exit status); term_exec when you need isolation or a guaranteed dialect"
         else
-            "idle";
-        var res = mcp.Res.init(arena);
-        try res.fact("term", term_id);
-        try res.fact("idle", settled);
-        try res.fact("timed_out", !settled);
-        try res.fact("desynced", desynced);
-        try res.fact("foreground_running", foreground);
-        try res.text(msg);
-        return res.finish();
+            "term_exec gives structured remote command results";
+        if (via_mux)
+            break :blk try std.fmt.allocPrint(arena, " durable remote session on {s} via its sketerm-mux daemon (survives connection drops — reattached transparently; {s})", .{ h, drive_note });
+        break :blk try std.fmt.allocPrint(arena, " running ssh to {s} (watch term_read for auth prompts; {s})", .{ h, drive_note });
+    } else "";
+    const rec_note = if (rec_state.casts.get(id)) |p|
+        try std.fmt.allocPrint(arena, "\nrecording: {s} (asciicast v2, replayable with asciinema)", .{p})
+    else
+        "";
+    var res = mcp.Res.init(arena);
+    try res.fact("term", id);
+    try res.fact("cols", cols);
+    try res.fact("rows", rows);
+    try res.fact("transport", if (via_mux) "sketerm-mux" else if (host != null) "ssh" else "local");
+    if (host) |h| try res.fact("host", h);
+    if (t.shell_name) |sn| try res.fact("shell", sn);
+    try res.fact("integration", t.integration);
+    if (rec_state.casts.get(id)) |p| try res.fact("recording", p);
+    try res.textf("opened headless terminal {d} ({d}x{d}{s}){s}{s}", .{ id, cols, rows, shell_note, where, rec_note });
+    return res.finish();
+}
+
+
+
+
+
+fn termExec(arena: std.mem.Allocator, args: std.json.Value, t: *termdrive.Term, _: u32) ![]const u8 {
+    const cmd = argStr(args, "command") orelse return mcp.errRes(arena, .invalid_args, "term_exec requires 'command'");
+    // Clamped below the 150s watchdog: one blocked call must never
+    // wedge the single-threaded loop long enough to starve
+    // term_list/term_read or trip the connection-aborting cap.
+    // Longer waits = repeated term_exec_wait calls.
+    const timeout_ms: i64 = std.math.clamp(argInt(args, "timeout_ms") orelse 30_000, 0, 120_000);
+    // Default true: the isolated transport works typed into ANY
+    // shell dialect (fish/zsh/bash, local or remote); false is the
+    // POSIX-only state-persisting mode.
+    const subshell = if (args == .object) blk: {
+        const v = args.object.get("subshell") orelse break :blk true;
+        break :blk v == .bool and v.bool;
+    } else true;
+    const noninteractive = argBool(args, "noninteractive");
+    if (noninteractive and !subshell)
+        return mcp.errRes(arena, .invalid_args, "'noninteractive' needs the default isolated transport (drop subshell:false)");
+    const shell = argStr(args, "shell");
+    if (shell) |sh| {
+        if (!subshell)
+            return mcp.errRes(arena, .invalid_args, "'shell' needs the default isolated transport (drop subshell:false)");
+        if (!validShellName(sh))
+            return mcp.errRes(arena, .invalid_args, "invalid 'shell' (a command name or absolute path: letters, digits, . _ - / only)");
     }
-    if (eql(u8, name, "term_resize")) {
-        const cols: u16 = @intCast(std.math.clamp(argInt(args, "cols") orelse 120, 10, 500));
-        const rows: u16 = @intCast(std.math.clamp(argInt(args, "rows") orelse 40, 4, 300));
-        t.resize(cols, rows) catch return mcp.errRes(arena, .conflict, "resize failed (terminal exited?)");
-        _ = t.waitIdle(200, 2_000);
-        var res = mcp.Res.init(arena);
-        try res.fact("term", term_id);
-        try res.fact("cols", cols);
-        try res.fact("rows", rows);
-        try res.textf("terminal {d} resized to {d}x{d}", .{ term_id, cols, rows });
-        return res.finish();
+    if (t.hasPendingExec()) {
+        // A previously timed-out exec may have finished since;
+        // resolve it silently so the new send is accepted.
+        if (t.waitExecResult(0)) |r0| term_state.allocator.free(r0.output);
+        if (t.hasPendingExec())
+            return mcp.errRes(arena, .conflict, "a previous term_exec is still running in this terminal; continue it with term_exec_wait (or interrupt with term_send_keys ctrl+c)");
     }
-    if (eql(u8, name, "term_close")) {
-        const id = termIdOf(t);
-        _ = mcp.term_state.terms.swapRemove(id);
-        t.deinit();
-        // The daemon finalizes the cast with the session; keep the
-        // path out of future term_list output.
-        if (mcp.rec_state.casts.fetchSwapRemove(id)) |kv| mcp.rec_state.allocator.free(kv.value);
-        var res = mcp.Res.init(arena);
-        try res.fact("term", id);
-        try res.fact("closed", true);
-        try res.textf("terminal {d} closed", .{id});
-        return res.finish();
+    if (t.hasPendingCommand())
+        return mcp.errRes(arena, .conflict, "a term_run wait_for=command command is still tracked; resolve it with term_wait_command first");
+    const r = t.execCommand(cmd, subshell, noninteractive, shell, timeout_ms) catch |err| return switch (err) {
+        termdrive.Error.NotConnected => mcp.errRes(arena, .conflict, "terminal exited"),
+        else => appErr(arena, "exec failed"),
+    };
+    defer term_state.allocator.free(r.output);
+    return execResultJson(arena, r, t, argStr(args, "output_file"));
+}
+
+fn termExecWait(arena: std.mem.Allocator, args: std.json.Value, t: *termdrive.Term, _: u32) ![]const u8 {
+    const timeout_ms: i64 = std.math.clamp(argInt(args, "timeout_ms") orelse 30_000, 0, 120_000);
+    const r = t.waitExecResult(timeout_ms) orelse
+        return mcp.errRes(arena, .not_found, "no pending term_exec in this terminal");
+    defer term_state.allocator.free(r.output);
+    return execResultJson(arena, r, t, argStr(args, "output_file"));
+}
+
+fn termWaitExit(arena: std.mem.Allocator, args: std.json.Value, t: *termdrive.Term, term_id: u32) ![]const u8 {
+    const timeout_ms: i64 = std.math.clamp(argInt(args, "timeout_ms") orelse 30_000, 0, 120_000);
+    const exited = t.waitExit(timeout_ms);
+    const tail = blk: {
+        const text = t.readScreen(false) catch break :blk "";
+        defer term_state.allocator.free(text);
+        break :blk try arena.dupe(u8, tailLines(text, 8));
+    };
+    var res = mcp.Res.init(arena);
+    try res.fact("term", term_id);
+    try res.fact("exited", exited);
+    try res.fact("timed_out", !exited);
+    if (exited and t.exit_status_known) {
+        try res.fact("exit_status", t.exit_status);
+        try res.textf("terminal {d} exited with status {d}", .{ term_id, t.exit_status });
+    } else if (exited) {
+        try res.textf("terminal {d} exited (status unknown)", .{term_id});
+    } else {
+        try res.textf("terminal {d} still running at timeout", .{term_id});
     }
-    return mcp.errRes(arena, .unknown_tool, "unknown tool");
+    if (tail.len > 0) {
+        try res.fact("screen_tail", tail);
+        try res.text("--- screen tail ---");
+        try res.text(tail);
+    }
+    return res.finish();
+}
+
+/// term_run / run_command with wait_for=command on a headless terminal:
+/// wait for the shell's own completion mark (OSC 133 D) of THIS command,
+/// never for output to go quiet.
+pub fn runCommandMode(arena: std.mem.Allocator, t: *termdrive.Term, cmd: []const u8, timeout_ms: i64, output_only: bool) ![]const u8 {
+    // A tracked command may have completed since its timeout: one short
+    // drain clears it so the new send is accepted.
+    if (t.hasPendingCommand()) _ = t.waitPendingCommand(0);
+    if (t.hasPendingCommand()) {
+        return commandCompletionResult(arena, .{ .state = .running }, false, null, null, "a previously timed-out command is still running; use term_wait_command instead of resending");
+    }
+    // The token wait spends from the same budget as the completion wait,
+    // so the call never outlives timeout_ms.
+    const started = nowMs();
+    const token_res = t.commandToken(@min(timeout_ms, 10_000)) catch return mcp.errRes(arena, .unavailable, "command completion unavailable (terminal exited?)");
+    const token = switch (token_res) {
+        .unsupported => return commandCompletionResult(arena, .{ .state = .unsupported }, false, null, null, "shell integration is unavailable for this shell; command was not sent and no exit status was fabricated"),
+        .not_ready => return commandCompletionResult(arena, .{ .state = .unsupported, .timed_out = true }, false, null, null, "shell integration is injected but no prompt mark has arrived yet (shell still starting, ssh auth still pending, an unsupported remote shell, or rc files broke the injection); command was not sent — retry shortly, or use term_exec"),
+        .busy => return commandCompletionResult(arena, .{ .state = .running }, false, null, null, "a foreground command started outside command mode is still running; its completion would be misattributed. Wait for it (term_wait_idle) before sending in command mode"),
+        .token => |tok| tok,
+    };
+    const line = try std.fmt.allocPrint(arena, "{s}\r", .{cmd});
+    t.sendText(line) catch return mcp.errRes(arena, .conflict, "send failed (terminal exited?)");
+    t.trackCommand(token);
+    const result = t.waitCommand(token, @max(0, timeout_ms - (nowMs() - started)));
+    return completionReply(arena, t, result, output_only);
+}
+
+/// A command-mode completion, with the command's own zone as the output
+/// when asked for and the shell reported one, else the screen.
+fn completionReply(arena: std.mem.Allocator, t: *termdrive.Term, result: termdrive.CommandCompletion, output_only: bool) ![]const u8 {
+    var owned_output: ?[]u8 = null;
+    defer if (owned_output) |text| term_state.allocator.free(text);
+    var output_kind: []const u8 = "screen";
+    if (result.state == .completed and result.source == .shell_integration and output_only) {
+        if (t.lastCommand() catch null) |lc| {
+            owned_output = lc.text;
+            output_kind = "command";
+        }
+    }
+    if (owned_output == null) owned_output = t.readScreen(false) catch null;
+    return commandCompletionResult(arena, result, true, owned_output, output_kind, switch (result.state) {
+        .running => "timeout expired while the command was still running; output may have been idle",
+        .unknown => "terminal disconnected before a reliable completion status was received",
+        .unsupported => unreachable,
+        .completed => null,
+    });
+}
+
+fn termWaitCommand(arena: std.mem.Allocator, args: std.json.Value, t: *termdrive.Term, _: u32) ![]const u8 {
+    const timeout_ms: i64 = std.math.clamp(argInt(args, "timeout_ms") orelse 30_000, 0, 120_000);
+    const result = t.waitPendingCommand(timeout_ms) orelse
+        return mcp.errRes(arena, .not_found, "no timed-out command is being tracked");
+    return completionReply(arena, t, result, argBool(args, "output_only"));
+}
+
+
+fn termResize(arena: std.mem.Allocator, args: std.json.Value, t: *termdrive.Term, term_id: u32) ![]const u8 {
+    const cols: u16 = @intCast(std.math.clamp(argInt(args, "cols") orelse 120, 10, 500));
+    const rows: u16 = @intCast(std.math.clamp(argInt(args, "rows") orelse 40, 4, 300));
+    t.resize(cols, rows) catch return mcp.errRes(arena, .conflict, "resize failed (terminal exited?)");
+    _ = t.waitIdle(200, 2_000);
+    var res = mcp.Res.init(arena);
+    try res.fact("term", term_id);
+    try res.fact("cols", cols);
+    try res.fact("rows", rows);
+    try res.textf("terminal {d} resized to {d}x{d}", .{ term_id, cols, rows });
+    return res.finish();
+}
+
+fn termClose(arena: std.mem.Allocator, _: std.json.Value, t: *termdrive.Term, _: u32) ![]const u8 {
+    const id = termIdOf(t);
+    _ = term_state.terms.swapRemove(id);
+    t.deinit();
+    // The daemon finalizes the cast with the session; keep the
+    // path out of future term_list output.
+    if (rec_state.casts.fetchSwapRemove(id)) |kv| rec_state.allocator.free(kv.value);
+    var res = mcp.Res.init(arena);
+    try res.fact("term", id);
+    try res.fact("closed", true);
+    try res.textf("terminal {d} closed", .{id});
+    return res.finish();
 }
 
 // ── File transfer + port forwards ─────────────────────────────────
@@ -914,14 +745,14 @@ fn appendRoute(
 }
 
 pub fn runArgvTerm(arena: std.mem.Allocator, argv: []const []const u8, timeout_ms: i64) !union(enum) { run: ArgvRun, err: []const u8 } {
-    const t = termdrive.Term.spawn(mcp.term_state.allocator, argv, 120, 30, mcp.term_state.mux_sock) catch
+    const t = termdrive.Term.spawn(term_state.allocator, argv, 120, 30, term_state.mux_sock) catch
         return .{ .err = "spawn failed (mux daemon unreachable?)" };
     defer t.deinit();
     recordAuxTerm(t, std.fs.path.basename(argv[0]));
     const exited = t.waitExit(timeout_ms);
     const output = blk: {
         const text = t.readScreen(true) catch break :blk "";
-        defer mcp.term_state.allocator.free(text);
+        defer term_state.allocator.free(text);
         break :blk try arena.dupe(u8, std.mem.trim(u8, text, "\n "));
     };
     return .{ .run = .{
@@ -1052,103 +883,55 @@ pub fn xferOk(arena: std.mem.Allocator, direction: []const u8, path: []const u8,
     return res.finish();
 }
 
-pub fn xferTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]const u8 {
-    const eql = std.mem.eql;
-    if (mcp.term_state.mux_sock == null)
+pub const ForwardTool = mcp_tools.GroupTool(.net);
+
+pub fn forwardTool(arena: std.mem.Allocator, tool: ForwardTool, args: std.json.Value) ![]const u8 {
+    if (term_state.mux_sock == null)
         return mcp.errRes(arena, .unavailable, "file transfer / port forward tools need isolated mode (they run over private headless terminals)");
+    return switch (tool) {
+        .port_forward_open => portForwardOpen(arena, args),
+        .port_forward_list => portForwardList(arena, args),
+        .port_forward_check => withForward(arena, args, portForwardCheck),
+        .port_forward_close => withForward(arena, args, portForwardClose),
+    };
+}
 
-    if (eql(u8, name, "scp_put") or eql(u8, name, "scp_get")) {
-        const upload = eql(u8, name, "scp_put");
-        const local = argStr(args, "local_path") orelse return mcp.errRes(arena, .invalid_args, "requires 'local_path'");
-        const remote = argStr(args, "remote_path") orelse return mcp.errRes(arena, .invalid_args, "requires 'remote_path'");
-        const timeout_ms: i64 = mcp.waitCap(argInt(args, "timeout_ms"), 120_000);
-        // A transfer is TWO ssh legs, and their budgets used to add up
-        // (120s + 60s) past the 150s watchdog, which aborts the call and
-        // leaves the sessions reading as exited. `timeout_ms` bounds the
-        // scp; the checksum leg gets what is left of it, floored so it
-        // is always attempted.
-        const xfer_deadline = nowMs() + timeout_ms;
-        const host = argStr(args, "host");
+pub fn scpTool(arena: std.mem.Allocator, upload: bool, args: std.json.Value) ![]const u8 {
+    if (term_state.mux_sock == null)
+        return mcp.errRes(arena, .unavailable, "file transfer / port forward tools need isolated mode (they run over private headless terminals)");
+    const local = argStr(args, "local_path") orelse return mcp.errRes(arena, .invalid_args, "requires 'local_path'");
+    const remote = argStr(args, "remote_path") orelse return mcp.errRes(arena, .invalid_args, "requires 'remote_path'");
+    const timeout_ms: i64 = mcp.waitCap(argInt(args, "timeout_ms"), 120_000);
+    // A transfer is TWO ssh legs, and their budgets used to add up
+    // (120s + 60s) past the 150s watchdog, which aborts the call and
+    // leaves the sessions reading as exited. `timeout_ms` bounds the
+    // scp; the checksum leg gets what is left of it, floored so it
+    // is always attempted.
+    const xfer_deadline = nowMs() + timeout_ms;
+    const host = argStr(args, "host");
 
-        if (host == null) {
-            const src = if (upload) local else remote;
-            const dst = if (upload) remote else local;
-            switch (try localCopyAtomic(arena, src, dst)) {
-                .ok => |r| return xferOk(arena, if (upload) "upload" else "download", dst, r.bytes, &r.sha),
-                .err => |e| return mcp.errRes(arena, .io_failed, e),
-            }
+    if (host == null) {
+        const src = if (upload) local else remote;
+        const dst = if (upload) remote else local;
+        switch (try localCopyAtomic(arena, src, dst)) {
+            .ok => |r| return xferOk(arena, if (upload) "upload" else "download", dst, r.bytes, &r.sha),
+            .err => |e| return mcp.errRes(arena, .io_failed, e),
         }
-        const h = host.?;
+    }
+    const h = host.?;
 
-        if (upload) {
-            const local_sha = sha256File(local) orelse return mcp.errRes(arena, .io_failed, "cannot read/hash the local file");
-            const bytes = fileSize(local);
-            const tmp = try stagedPartPath(arena, remote);
-            var scp_argv: std.ArrayList([]const u8) = .empty;
-            defer scp_argv.deinit(arena);
-            try scp_argv.appendSlice(arena, &.{ "scp", "-q", "-o", "BatchMode=yes" });
-            const dest = appendRoute(arena, &scp_argv, h, false) catch
-                return mcp.errRes(arena, .refused, "cannot build the forced route for this host");
-            const spec = try std.fmt.allocPrint(arena, "{s}:{s}", .{ dest, tmp });
-            try scp_argv.appendSlice(arena, &.{ local, spec });
-            switch (try runArgvTerm(arena, scp_argv.items, timeout_ms)) {
-                .err => |e| return mcp.errRes(arena, .unavailable, e),
-                .run => |r| {
-                    if (!r.exited) return mcp.errRes(arena, .timeout, "scp still running at timeout; the transfer terminal was killed — retry with a larger timeout_ms");
-                    if (!r.status_known or r.status != 0)
-                        return mcp.errRes(arena, .io_failed, try std.fmt.allocPrint(arena, "scp failed (status {d}):\n{s}", .{ r.status, r.output }));
-                },
-            }
-            // Checksum + optional caller validation + atomic move in
-            // ONE remote script (b64→sh so the remote login shell's
-            // dialect is irrelevant); echo tokens report the branch.
-            var verify_layer: []const u8 = "mv -f \"$SK_TMP\" \"$SK_DST\" && echo SK_MOVED || echo SK_MVFAIL";
-            if (argStr(args, "verify_command")) |vc| {
-                // "{}" marks where the staged path goes; without it
-                // the path is appended as the final argument.
-                const resolved = if (std.mem.indexOf(u8, vc, "{}")) |at|
-                    try std.fmt.allocPrint(arena, "{s}\"$SK_TMP\"{s}", .{ vc[0..at], vc[at + 2 ..] })
-                else
-                    try std.fmt.allocPrint(arena, "{s} \"$SK_TMP\"", .{vc});
-                verify_layer = try std.fmt.allocPrint(
-                    arena,
-                    "if ( {s} ); then mv -f \"$SK_TMP\" \"$SK_DST\" && echo SK_MOVED || echo SK_MVFAIL; else echo \"SK_VERIFYFAIL:$?\"; rm -f \"$SK_TMP\"; fi",
-                    .{resolved},
-                );
-            }
-            const script = try std.fmt.allocPrint(
-                arena,
-                "SK_TMP={s}\nSK_DST={s}\nsha=$(sha256sum \"$SK_TMP\" 2>/dev/null | cut -c1-64) || sha=fail\nif [ \"$sha\" = \"{s}\" ]; then {s}; else echo \"SK_SHA:$sha\"; rm -f \"$SK_TMP\"; fi\n",
-                .{ try quoted(arena, tmp), try quoted(arena, remote), local_sha, verify_layer },
-            );
-            const move_argv = remoteShArgv(arena, h, script) catch
-                return mcp.errRes(arena, .refused, "cannot build the forced route for this host");
-            switch (try runArgvTerm(arena, move_argv, legBudget(xfer_deadline, 60_000))) {
-                .err => |e| return mcp.errRes(arena, .unavailable, e),
-                .run => |r| {
-                    if (std.mem.indexOf(u8, r.output, "SK_MOVED") != null)
-                        return xferOk(arena, "upload", remote, bytes, &local_sha);
-                    if (std.mem.indexOf(u8, r.output, "SK_VERIFYFAIL") != null)
-                        return mcp.errRes(arena, .refused, try std.fmt.allocPrint(arena, "verify_command rejected the staged file — upload discarded, destination untouched:\n{s}", .{r.output}));
-                    if (std.mem.indexOf(u8, r.output, "SK_MVFAIL") != null)
-                        return mcp.errRes(arena, .io_failed, "checksum verified but the atomic move failed on the remote (target dir not writable?)");
-                    if (std.mem.indexOf(u8, r.output, "SK_SHA:fail") != null)
-                        return mcp.errRes(arena, .unavailable, "remote has no usable sha256sum — cannot verify; file left absent (partial removed)");
-                    return mcp.errRes(arena, .io_failed, try std.fmt.allocPrint(arena, "remote checksum mismatch — corrupt transfer discarded:\n{s}", .{r.output}));
-                },
-            }
-        }
-
-        // download
-        const part = try stagedPartPath(arena, local);
-        var dl_argv: std.ArrayList([]const u8) = .empty;
-        defer dl_argv.deinit(arena);
-        try dl_argv.appendSlice(arena, &.{ "scp", "-q", "-o", "BatchMode=yes" });
-        const dl_dest = appendRoute(arena, &dl_argv, h, false) catch
+    if (upload) {
+        const local_sha = sha256File(local) orelse return mcp.errRes(arena, .io_failed, "cannot read/hash the local file");
+        const bytes = fileSize(local);
+        const tmp = try stagedPartPath(arena, remote);
+        var scp_argv: std.ArrayList([]const u8) = .empty;
+        defer scp_argv.deinit(arena);
+        try scp_argv.appendSlice(arena, &.{ "scp", "-q", "-o", "BatchMode=yes" });
+        const dest = appendRoute(arena, &scp_argv, h, false) catch
             return mcp.errRes(arena, .refused, "cannot build the forced route for this host");
-        const spec = try std.fmt.allocPrint(arena, "{s}:{s}", .{ dl_dest, remote });
-        try dl_argv.appendSlice(arena, &.{ spec, part });
-        switch (try runArgvTerm(arena, dl_argv.items, timeout_ms)) {
+        const spec = try std.fmt.allocPrint(arena, "{s}:{s}", .{ dest, tmp });
+        try scp_argv.appendSlice(arena, &.{ local, spec });
+        switch (try runArgvTerm(arena, scp_argv.items, timeout_ms)) {
             .err => |e| return mcp.errRes(arena, .unavailable, e),
             .run => |r| {
                 if (!r.exited) return mcp.errRes(arena, .timeout, "scp still running at timeout; the transfer terminal was killed — retry with a larger timeout_ms");
@@ -1156,143 +939,208 @@ pub fn xferTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value
                     return mcp.errRes(arena, .io_failed, try std.fmt.allocPrint(arena, "scp failed (status {d}):\n{s}", .{ r.status, r.output }));
             },
         }
-        const part_sha = sha256File(part) orelse return mcp.errRes(arena, .io_failed, "downloaded file vanished before hashing");
-        const bytes = fileSize(part);
-        const script = try std.fmt.allocPrint(arena, "sha256sum {s} 2>/dev/null | cut -c1-64\n", .{try quoted(arena, remote)});
-        const verify_argv = remoteShArgv(arena, h, script) catch
+        // Checksum + optional caller validation + atomic move in
+        // ONE remote script (b64→sh so the remote login shell's
+        // dialect is irrelevant); echo tokens report the branch.
+        var verify_layer: []const u8 = "mv -f \"$SK_TMP\" \"$SK_DST\" && echo SK_MOVED || echo SK_MVFAIL";
+        if (argStr(args, "verify_command")) |vc| {
+            // "{}" marks where the staged path goes; without it
+            // the path is appended as the final argument.
+            const resolved = if (std.mem.indexOf(u8, vc, "{}")) |at|
+                try std.fmt.allocPrint(arena, "{s}\"$SK_TMP\"{s}", .{ vc[0..at], vc[at + 2 ..] })
+            else
+                try std.fmt.allocPrint(arena, "{s} \"$SK_TMP\"", .{vc});
+            verify_layer = try std.fmt.allocPrint(
+                arena,
+                "if ( {s} ); then mv -f \"$SK_TMP\" \"$SK_DST\" && echo SK_MOVED || echo SK_MVFAIL; else echo \"SK_VERIFYFAIL:$?\"; rm -f \"$SK_TMP\"; fi",
+                .{resolved},
+            );
+        }
+        const script = try std.fmt.allocPrint(
+            arena,
+            "SK_TMP={s}\nSK_DST={s}\nsha=$(sha256sum \"$SK_TMP\" 2>/dev/null | cut -c1-64) || sha=fail\nif [ \"$sha\" = \"{s}\" ]; then {s}; else echo \"SK_SHA:$sha\"; rm -f \"$SK_TMP\"; fi\n",
+            .{ try quoted(arena, tmp), try quoted(arena, remote), local_sha, verify_layer },
+        );
+        const move_argv = remoteShArgv(arena, h, script) catch
             return mcp.errRes(arena, .refused, "cannot build the forced route for this host");
-        switch (try runArgvTerm(arena, verify_argv, legBudget(xfer_deadline, 30_000))) {
+        switch (try runArgvTerm(arena, move_argv, legBudget(xfer_deadline, 60_000))) {
             .err => |e| return mcp.errRes(arena, .unavailable, e),
             .run => |r| {
-                const remote_sha = findHex64(r.output) orelse
-                    return mcp.errRes(arena, .io_failed, try std.fmt.allocPrint(arena, "remote sha256sum gave no hash — cannot verify (partial kept at {s}):\n{s}", .{ part, r.output }));
-                if (!std.mem.eql(u8, remote_sha, &part_sha)) {
-                    var pbuf: [4096]u8 = undefined;
-                    if (std.fmt.bufPrintZ(&pbuf, "{s}", .{part})) |pz| _ = c.unlink(pz.ptr) else |_| {}
-                    return mcp.errRes(arena, .io_failed, "checksum mismatch — corrupt download discarded");
-                }
+                if (std.mem.indexOf(u8, r.output, "SK_MOVED") != null)
+                    return xferOk(arena, "upload", remote, bytes, &local_sha);
+                if (std.mem.indexOf(u8, r.output, "SK_VERIFYFAIL") != null)
+                    return mcp.errRes(arena, .refused, try std.fmt.allocPrint(arena, "verify_command rejected the staged file — upload discarded, destination untouched:\n{s}", .{r.output}));
+                if (std.mem.indexOf(u8, r.output, "SK_MVFAIL") != null)
+                    return mcp.errRes(arena, .io_failed, "checksum verified but the atomic move failed on the remote (target dir not writable?)");
+                if (std.mem.indexOf(u8, r.output, "SK_SHA:fail") != null)
+                    return mcp.errRes(arena, .unavailable, "remote has no usable sha256sum — cannot verify; file left absent (partial removed)");
+                return mcp.errRes(arena, .io_failed, try std.fmt.allocPrint(arena, "remote checksum mismatch — corrupt transfer discarded:\n{s}", .{r.output}));
             },
         }
-        var pbuf: [4096]u8 = undefined;
-        var dbuf: [4096]u8 = undefined;
-        const part_z = std.fmt.bufPrintZ(&pbuf, "{s}", .{part}) catch return mcp.errRes(arena, .invalid_args, "path too long");
-        const local_z = std.fmt.bufPrintZ(&dbuf, "{s}", .{local}) catch return mcp.errRes(arena, .invalid_args, "path too long");
-        if (c.rename(part_z.ptr, local_z.ptr) != 0)
-            return mcp.errRes(arena, .io_failed, "atomic rename into place failed");
-        return xferOk(arena, "download", local, bytes, &part_sha);
     }
 
-    if (eql(u8, name, "port_forward_open")) {
-        const h = argStr(args, "host") orelse return mcp.errRes(arena, .invalid_args, "port_forward_open requires 'host'");
-        const rp_i = argInt(args, "remote_port") orelse return mcp.errRes(arena, .invalid_args, "port_forward_open requires 'remote_port'");
-        if (rp_i < 1 or rp_i > 65535) return mcp.errRes(arena, .invalid_args, "remote_port out of range");
-        const rp: u16 = @intCast(rp_i);
-        const rh = argStr(args, "remote_host") orelse "127.0.0.1";
-        const lp: u16 = if (argInt(args, "local_port")) |v| blk: {
-            if (v < 1 or v > 65535) return mcp.errRes(arena, .invalid_args, "local_port out of range");
-            break :blk @intCast(v);
-        } else pickFreePort() orelse return mcp.errRes(arena, .unavailable, "could not pick a free local port");
-        const timeout_ms: i64 = mcp.waitCap(argInt(args, "timeout_ms"), 20_000);
-
-        const t = spawnForwardTerm(arena, h, lp, rh, rp) catch
-            return mcp.errRes(arena, .unavailable, "spawn failed (mux daemon unreachable?)");
-        switch (try waitForwardReady(arena, t, lp, timeout_ms)) {
-            .ready => {},
-            .err => |e| {
-                t.deinit();
-                return mcp.errRes(arena, .unavailable, e);
-            },
-        }
-        const a = mcp.forward_state.allocator;
-        const f = a.create(Forward) catch {
-            t.deinit();
-            return error.OutOfMemory;
-        };
-        f.* = .{
-            .id = mcp.forward_state.next_id,
-            .host = a.dupe(u8, h) catch return error.OutOfMemory,
-            .local_port = lp,
-            .remote_host = a.dupe(u8, rh) catch return error.OutOfMemory,
-            .remote_port = rp,
-            .term = t,
-        };
-        mcp.forward_state.next_id += 1;
-        mcp.forward_state.forwards.put(a, f.id, f) catch {
-            t.deinit();
-            return error.OutOfMemory;
-        };
-        var res = mcp.Res.init(arena);
-        try res.fact("forward", f.id);
-        try res.fact("local_port", lp);
-        try res.fact("host", h);
-        try res.fact("remote_host", rh);
-        try res.fact("remote_port", rp);
-        try res.fact("listening", true);
-        try res.textf("forward {d}: 127.0.0.1:{d} -> {s} ({s}:{d}), listening", .{ f.id, lp, h, rh, rp });
-        return res.finish();
+    // download
+    const part = try stagedPartPath(arena, local);
+    var dl_argv: std.ArrayList([]const u8) = .empty;
+    defer dl_argv.deinit(arena);
+    try dl_argv.appendSlice(arena, &.{ "scp", "-q", "-o", "BatchMode=yes" });
+    const dl_dest = appendRoute(arena, &dl_argv, h, false) catch
+        return mcp.errRes(arena, .refused, "cannot build the forced route for this host");
+    const spec = try std.fmt.allocPrint(arena, "{s}:{s}", .{ dl_dest, remote });
+    try dl_argv.appendSlice(arena, &.{ spec, part });
+    switch (try runArgvTerm(arena, dl_argv.items, timeout_ms)) {
+        .err => |e| return mcp.errRes(arena, .unavailable, e),
+        .run => |r| {
+            if (!r.exited) return mcp.errRes(arena, .timeout, "scp still running at timeout; the transfer terminal was killed — retry with a larger timeout_ms");
+            if (!r.status_known or r.status != 0)
+                return mcp.errRes(arena, .io_failed, try std.fmt.allocPrint(arena, "scp failed (status {d}):\n{s}", .{ r.status, r.output }));
+        },
     }
-    if (eql(u8, name, "port_forward_list")) {
-        var res = mcp.Res.init(arena);
-        var aw: std.Io.Writer.Allocating = .init(arena);
-        const w = &aw.writer;
-        try w.writeAll("[");
-        for (mcp.forward_state.forwards.values(), 0..) |f, i| {
-            if (i > 0) try w.writeAll(",");
-            f.term.drain();
-            try forwardElemJson(w, f.id, f.host, f.local_port, f.remote_host, f.remote_port, !f.term.exited, f.reconnects);
-            try res.textf("forward {d}: 127.0.0.1:{d} -> {s} ({s}:{d}), alive: {}, reconnects: {d}", .{ f.id, f.local_port, f.host, f.remote_host, f.remote_port, !f.term.exited, f.reconnects });
-        }
-        try w.writeAll("]");
-        try res.raw("forwards", aw.written());
-        try res.fact("count", mcp.forward_state.forwards.count());
-        if (mcp.forward_state.forwards.count() == 0) try res.text("no port forwards are open");
-        return res.finish();
+    const part_sha = sha256File(part) orelse return mcp.errRes(arena, .io_failed, "downloaded file vanished before hashing");
+    const bytes = fileSize(part);
+    const script = try std.fmt.allocPrint(arena, "sha256sum {s} 2>/dev/null | cut -c1-64\n", .{try quoted(arena, remote)});
+    const verify_argv = remoteShArgv(arena, h, script) catch
+        return mcp.errRes(arena, .refused, "cannot build the forced route for this host");
+    switch (try runArgvTerm(arena, verify_argv, legBudget(xfer_deadline, 30_000))) {
+        .err => |e| return mcp.errRes(arena, .unavailable, e),
+        .run => |r| {
+            const remote_sha = findHex64(r.output) orelse
+                return mcp.errRes(arena, .io_failed, try std.fmt.allocPrint(arena, "remote sha256sum gave no hash — cannot verify (partial kept at {s}):\n{s}", .{ part, r.output }));
+            if (!std.mem.eql(u8, remote_sha, &part_sha)) {
+                var pbuf: [4096]u8 = undefined;
+                if (std.fmt.bufPrintZ(&pbuf, "{s}", .{part})) |pz| _ = c.unlink(pz.ptr) else |_| {}
+                return mcp.errRes(arena, .io_failed, "checksum mismatch — corrupt download discarded");
+            }
+        },
     }
+    var pbuf: [4096]u8 = undefined;
+    var dbuf: [4096]u8 = undefined;
+    const part_z = std.fmt.bufPrintZ(&pbuf, "{s}", .{part}) catch return mcp.errRes(arena, .invalid_args, "path too long");
+    const local_z = std.fmt.bufPrintZ(&dbuf, "{s}", .{local}) catch return mcp.errRes(arena, .invalid_args, "path too long");
+    if (c.rename(part_z.ptr, local_z.ptr) != 0)
+        return mcp.errRes(arena, .io_failed, "atomic rename into place failed");
+    return xferOk(arena, "download", local, bytes, &part_sha);
+}
 
+/// Resolve the addressed port forward, then run one forward-scoped tool on it.
+fn withForward(
+    arena: std.mem.Allocator,
+    args: std.json.Value,
+    comptime body: fn (std.mem.Allocator, std.json.Value, *Forward) anyerror![]const u8,
+) ![]const u8 {
     const f = forwardFromArgs(args) orelse
         return mcp.errRes(arena, .not_found, "no such forward (pass 'forward' from port_forward_open, or omit it when only one is open)");
+    return body(arena, args, f);
+}
 
-    if (eql(u8, name, "port_forward_check")) {
+fn portForwardOpen(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
+    const h = argStr(args, "host") orelse return mcp.errRes(arena, .invalid_args, "port_forward_open requires 'host'");
+    const rp_i = argInt(args, "remote_port") orelse return mcp.errRes(arena, .invalid_args, "port_forward_open requires 'remote_port'");
+    if (rp_i < 1 or rp_i > 65535) return mcp.errRes(arena, .invalid_args, "remote_port out of range");
+    const rp: u16 = @intCast(rp_i);
+    const rh = argStr(args, "remote_host") orelse "127.0.0.1";
+    const lp: u16 = if (argInt(args, "local_port")) |v| blk: {
+        if (v < 1 or v > 65535) return mcp.errRes(arena, .invalid_args, "local_port out of range");
+        break :blk @intCast(v);
+    } else pickFreePort() orelse return mcp.errRes(arena, .unavailable, "could not pick a free local port");
+    const timeout_ms: i64 = mcp.waitCap(argInt(args, "timeout_ms"), 20_000);
+
+    const t = spawnForwardTerm(arena, h, lp, rh, rp) catch
+        return mcp.errRes(arena, .unavailable, "spawn failed (mux daemon unreachable?)");
+    switch (try waitForwardReady(arena, t, lp, timeout_ms)) {
+        .ready => {},
+        .err => |e| {
+            t.deinit();
+            return mcp.errRes(arena, .unavailable, e);
+        },
+    }
+    const a = forward_state.allocator;
+    const f = a.create(Forward) catch {
+        t.deinit();
+        return error.OutOfMemory;
+    };
+    f.* = .{
+        .id = forward_state.next_id,
+        .host = a.dupe(u8, h) catch return error.OutOfMemory,
+        .local_port = lp,
+        .remote_host = a.dupe(u8, rh) catch return error.OutOfMemory,
+        .remote_port = rp,
+        .term = t,
+    };
+    forward_state.next_id += 1;
+    forward_state.forwards.put(a, f.id, f) catch {
+        t.deinit();
+        return error.OutOfMemory;
+    };
+    var res = mcp.Res.init(arena);
+    try res.fact("forward", f.id);
+    try res.fact("local_port", lp);
+    try res.fact("host", h);
+    try res.fact("remote_host", rh);
+    try res.fact("remote_port", rp);
+    try res.fact("listening", true);
+    try res.textf("forward {d}: 127.0.0.1:{d} -> {s} ({s}:{d}), listening", .{ f.id, lp, h, rh, rp });
+    return res.finish();
+}
+
+fn portForwardList(arena: std.mem.Allocator, _: std.json.Value) ![]const u8 {
+    var res = mcp.Res.init(arena);
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    try w.writeAll("[");
+    for (forward_state.forwards.values(), 0..) |f, i| {
+        if (i > 0) try w.writeAll(",");
         f.term.drain();
-        var reconnected = false;
-        if (f.term.exited) {
-            // The ssh process died (network blip, sshd restart):
-            // respawn the same spec — this IS the reconnect behavior.
-            const nt = spawnForwardTerm(arena, f.host, f.local_port, f.remote_host, f.remote_port) catch
-                return mcp.errRes(arena, .unavailable, "forward is dead and respawn failed (mux daemon unreachable?)");
-            switch (try waitForwardReady(arena, nt, f.local_port, mcp.waitCap(argInt(args, "timeout_ms"), 20_000))) {
-                .ready => {
-                    f.term.deinit();
-                    f.term = nt;
-                    f.reconnects += 1;
-                    reconnected = true;
-                },
-                .err => |e| {
-                    nt.deinit();
-                    return mcp.errRes(arena, .unavailable, try std.fmt.allocPrint(arena, "forward is dead and the reconnect failed: {s}", .{e}));
-                },
-            }
+        try forwardElemJson(w, f.id, f.host, f.local_port, f.remote_host, f.remote_port, !f.term.exited, f.reconnects);
+        try res.textf("forward {d}: 127.0.0.1:{d} -> {s} ({s}:{d}), alive: {}, reconnects: {d}", .{ f.id, f.local_port, f.host, f.remote_host, f.remote_port, !f.term.exited, f.reconnects });
+    }
+    try w.writeAll("]");
+    try res.raw("forwards", aw.written());
+    try res.fact("count", forward_state.forwards.count());
+    if (forward_state.forwards.count() == 0) try res.text("no port forwards are open");
+    return res.finish();
+}
+
+fn portForwardCheck(arena: std.mem.Allocator, args: std.json.Value, f: *Forward) ![]const u8 {
+    f.term.drain();
+    var reconnected = false;
+    if (f.term.exited) {
+        // The ssh process died (network blip, sshd restart):
+        // respawn the same spec — this IS the reconnect behavior.
+        const nt = spawnForwardTerm(arena, f.host, f.local_port, f.remote_host, f.remote_port) catch
+            return mcp.errRes(arena, .unavailable, "forward is dead and respawn failed (mux daemon unreachable?)");
+        switch (try waitForwardReady(arena, nt, f.local_port, mcp.waitCap(argInt(args, "timeout_ms"), 20_000))) {
+            .ready => {
+                f.term.deinit();
+                f.term = nt;
+                f.reconnects += 1;
+                reconnected = true;
+            },
+            .err => |e| {
+                nt.deinit();
+                return mcp.errRes(arena, .unavailable, try std.fmt.allocPrint(arena, "forward is dead and the reconnect failed: {s}", .{e}));
+            },
         }
-        const listening = tcpListening(f.local_port, 2_000);
-        var res = mcp.Res.init(arena);
-        try res.fact("forward", f.id);
-        try res.fact("alive", !f.term.exited);
-        try res.fact("listening", listening);
-        try res.fact("reconnected", reconnected);
-        try res.fact("local_port", f.local_port);
-        try res.textf("forward {d} on 127.0.0.1:{d}: alive: {}, listening: {}{s}", .{ f.id, f.local_port, !f.term.exited, listening, if (reconnected) ", reconnected" else "" });
-        return res.finish();
     }
-    if (eql(u8, name, "port_forward_close")) {
-        const closed_id = f.id;
-        mcp.forward_state.removeOne(f);
-        var res = mcp.Res.init(arena);
-        try res.fact("forward", closed_id);
-        try res.fact("closed", true);
-        try res.textf("forward {d} closed", .{closed_id});
-        return res.finish();
-    }
-    return mcp.errRes(arena, .unknown_tool, "unknown tool");
+    const listening = tcpListening(f.local_port, 2_000);
+    var res = mcp.Res.init(arena);
+    try res.fact("forward", f.id);
+    try res.fact("alive", !f.term.exited);
+    try res.fact("listening", listening);
+    try res.fact("reconnected", reconnected);
+    try res.fact("local_port", f.local_port);
+    try res.textf("forward {d} on 127.0.0.1:{d}: alive: {}, listening: {}{s}", .{ f.id, f.local_port, !f.term.exited, listening, if (reconnected) ", reconnected" else "" });
+    return res.finish();
+}
+
+fn portForwardClose(arena: std.mem.Allocator, _: std.json.Value, f: *Forward) ![]const u8 {
+    const closed_id = f.id;
+    forward_state.removeOne(f);
+    var res = mcp.Res.init(arena);
+    try res.fact("forward", closed_id);
+    try res.fact("closed", true);
+    try res.textf("forward {d} closed", .{closed_id});
+    return res.finish();
 }
 
 pub fn spawnForwardTerm(arena: std.mem.Allocator, host: []const u8, lp: u16, rh: []const u8, rp: u16) !*termdrive.Term {
@@ -1310,7 +1158,7 @@ pub fn spawnForwardTerm(arena: std.mem.Allocator, host: []const u8, lp: u16, rh:
     // A forward reconnect must stay on the route its host asked for.
     const dest = appendRoute(arena, &argv, host, false) catch return error.SpawnFailed;
     try argv.appendSlice(arena, &.{ "-L", bindspec, dest });
-    const t = termdrive.Term.spawn(mcp.term_state.allocator, argv.items, 120, 30, mcp.term_state.mux_sock) catch return error.SpawnFailed;
+    const t = termdrive.Term.spawn(term_state.allocator, argv.items, 120, 30, term_state.mux_sock) catch return error.SpawnFailed;
     recordAuxTerm(t, "forward");
     return t;
 }
@@ -1322,7 +1170,7 @@ pub fn waitForwardReady(arena: std.mem.Allocator, t: *termdrive.Term, lp: u16, t
         if (t.exited) {
             const tail = blk: {
                 const text = t.readScreen(false) catch break :blk "";
-                defer mcp.term_state.allocator.free(text);
+                defer term_state.allocator.free(text);
                 break :blk try arena.dupe(u8, tailLines(text, 6));
             };
             return .{ .err = try std.fmt.allocPrint(arena, "ssh exited (status {d}) before the forward came up:\n{s}", .{ t.exit_status, tail }) };
@@ -1331,7 +1179,7 @@ pub fn waitForwardReady(arena: std.mem.Allocator, t: *termdrive.Term, lp: u16, t
         if (nowMs() >= deadline) {
             const tail = blk: {
                 const text = t.readScreen(false) catch break :blk "";
-                defer mcp.term_state.allocator.free(text);
+                defer term_state.allocator.free(text);
                 break :blk try arena.dupe(u8, tailLines(text, 6));
             };
             return .{ .err = try std.fmt.allocPrint(arena, "the local forward port never started listening within the timeout (auth failure? host unreachable?):\n{s}", .{tail}) };
@@ -1499,21 +1347,366 @@ test "remoteShArgv keeps a forced route off the ssh destination" {
     try t.expect(proxied);
 }
 
-test "every tool this module serves declares an output schema" {
-    // The dispatcher routes term_*, upload/download and port_forward_*
-    // here; wave 3a gave all of them structured results, so a new tool
-    // added to this module without a schema fails here rather than
-    // silently shipping a text-only result.
-    const mcp_tools = @import("mcp_tools.zig");
-    for (mcp_tools.TOOLS) |tool| {
-        const mine = std.mem.startsWith(u8, tool.name, "term_") or
-            std.mem.startsWith(u8, tool.name, "port_forward_") or
-            std.mem.eql(u8, tool.name, "scp_put") or
-            std.mem.eql(u8, tool.name, "scp_get");
-        if (!mine) continue;
-        if (tool.output_schema == null) {
-            std.debug.print("{s} has no output schema\n", .{tool.name});
-            return error.MissingOutputSchema;
-        }
+// ── session state: terminals, recordings, forwards ──────────────
+
+/// Registry of headless SHELL sessions (term_*) on the private daemon,
+/// parallel to AppState. Only used in isolated mode; in --shared mode
+/// the GUI-backed terminal tools are used instead.
+const TermState = struct {
+    allocator: std.mem.Allocator,
+    terms: std.AutoArrayHashMapUnmanaged(u32, *termdrive.Term) = .empty,
+    next_id: u32 = 1,
+    /// Isolated daemon socket (null = feature off; term tools then
+    /// error, directing the user to the GUI-backed terminal tools).
+    mux_sock: ?[]const u8 = null,
+
+    pub fn deinit(self: *TermState) void {
+        for (self.terms.values()) |t| t.deinit();
+        self.terms.deinit(self.allocator);
+        self.terms = .empty;
     }
+};
+
+pub var term_state: TermState = .{ .allocator = undefined };
+
+/// Automatic asciicast recording of every headless terminal the MCP
+/// server spawns (term_open, new_tab fallback, transfer/forward
+/// helpers) — the terminal counterpart of the --log message trace.
+/// Daemon-side recording via the rec_start wire frame, finalized with
+/// each session; --no-record disables.
+const RecState = struct {
+    allocator: std.mem.Allocator,
+    enabled: bool = true,
+    /// Created lazily on the first spawn; null until then (and stays
+    /// null when creation fails — recording then silently stays off,
+    /// never blocking terminal work).
+    dir: ?[]u8 = null,
+    aux_counter: u32 = 0,
+    /// term id → cast path, for term_list / term_open replies.
+    casts: std.AutoArrayHashMapUnmanaged(u32, []u8) = .empty,
+
+    pub fn deinit(self: *RecState) void {
+        for (self.casts.values()) |p| self.allocator.free(p);
+        self.casts.deinit(self.allocator);
+        self.casts = .empty;
+        if (self.dir) |d| self.allocator.free(d);
+        self.dir = null;
+    }
+};
+
+pub var rec_state: RecState = .{ .allocator = undefined };
+
+/// The recordings directory, created on first use: the --log session
+/// folder when logging is on (casts sit next to the message trace),
+/// else $XDG_STATE_HOME/sketerm/mcp-casts/<stamp>-<pid>/.
+pub fn recDir() ?[]const u8 {
+    if (!rec_state.enabled) return null;
+    if (rec_state.dir) |d| return d;
+    const a = rec_state.allocator;
+    if (mcp.mcp_log) |l| {
+        rec_state.dir = a.dupe(u8, l.dir) catch return null;
+        return rec_state.dir;
+    }
+    var base_buf: [4096]u8 = undefined;
+    const state_base: []const u8 = if (c.getenv("XDG_STATE_HOME")) |sh|
+        std.mem.span(@as([*:0]const u8, @ptrCast(sh)))
+    else if (c.getenv("HOME")) |home|
+        std.fmt.bufPrint(&base_buf, "{s}/.local/state", .{std.mem.span(@as([*:0]const u8, @ptrCast(home)))}) catch return null
+    else
+        return null;
+    var stamp_buf: [40]u8 = undefined;
+    const stamp = McpLog.stamp(&stamp_buf);
+    const dir = std.fmt.allocPrint(a, "{s}/sketerm/mcp-casts/{s}-{d}", .{ state_base, stamp, c.getpid() }) catch return null;
+    // mkdir -p, leaf included: this call replaced mcp_browser.mkdirs
+    // when the CDP set was deleted — without it recording is silently
+    // off on any fresh state dir.
+    var probe: [4096]u8 = undefined;
+    const dir_z = std.fmt.bufPrintZ(&probe, "{s}", .{dir}) catch {
+        a.free(dir);
+        return null;
+    };
+    var i: usize = 1;
+    while (i <= dir_z.len) : (i += 1) {
+        if (i != dir_z.len and probe[i] != '/') continue;
+        const save = probe[i];
+        probe[i] = 0;
+        _ = c.mkdir(&probe, 0o700);
+        probe[i] = save;
+    }
+    if (c.access(dir_z.ptr, c.W_OK) != 0) {
+        a.free(dir);
+        return null;
+    }
+    rec_state.dir = dir;
+    return rec_state.dir;
+}
+
+/// Start recording a REGISTERED terminal; returns the cast path (kept
+/// in rec_state for term_list) or null when recording is off.
+pub fn recordRegisteredTerm(t: *termdrive.Term, term_id: u32) ?[]const u8 {
+    const dir = recDir() orelse return null;
+    const a = rec_state.allocator;
+    const path = std.fmt.allocPrint(a, "{s}/term-{d}.cast", .{ dir, term_id }) catch return null;
+    t.startRecording(path);
+    rec_state.casts.put(a, term_id, path) catch {
+        a.free(path);
+        return null;
+    };
+    return rec_state.casts.get(term_id);
+}
+
+/// Point a registered terminal's recording at `path`: the daemon
+/// replaces its current recording (the automatic one included), so the
+/// listing reports the file actually being written.
+pub fn recordTermAt(t: *termdrive.Term, term_id: u32, path: []const u8) !void {
+    const a = rec_state.allocator;
+    const owned = try a.dupe(u8, path);
+    errdefer a.free(owned);
+    t.startRecording(path);
+    if (try rec_state.casts.fetchPut(a, term_id, owned)) |old| a.free(old.value);
+}
+
+/// Stop a registered terminal's recording; the listing stops naming it.
+pub fn stopTermRecording(t: *termdrive.Term, term_id: u32) void {
+    t.stopRecording();
+    if (rec_state.casts.fetchSwapRemove(term_id)) |kv| rec_state.allocator.free(kv.value);
+}
+
+/// Record an UNREGISTERED helper terminal (scp/ssh/forward).
+pub fn recordAuxTerm(t: *termdrive.Term, label: []const u8) void {
+    const dir = recDir() orelse return;
+    const a = rec_state.allocator;
+    rec_state.aux_counter += 1;
+    const path = std.fmt.allocPrint(a, "{s}/aux-{d}-{s}.cast", .{ dir, rec_state.aux_counter, label }) catch return;
+    defer a.free(path);
+    t.startRecording(path);
+}
+
+/// One structured SSH port forward: an owned `ssh -N -L` headless
+/// terminal plus its spec, so it can be health-checked and respawned.
+pub const Forward = struct {
+    id: u32,
+    host: []u8,
+    local_port: u16,
+    remote_host: []u8,
+    remote_port: u16,
+    term: *termdrive.Term,
+    reconnects: u32 = 0,
+};
+
+const ForwardState = struct {
+    allocator: std.mem.Allocator,
+    forwards: std.AutoArrayHashMapUnmanaged(u32, *Forward) = .empty,
+    next_id: u32 = 1,
+
+    pub fn removeOne(self: *ForwardState, f: *Forward) void {
+        _ = self.forwards.swapRemove(f.id);
+        f.term.deinit();
+        self.allocator.free(f.host);
+        self.allocator.free(f.remote_host);
+        self.allocator.destroy(f);
+    }
+
+    pub fn deinit(self: *ForwardState) void {
+        for (self.forwards.values()) |f| {
+            f.term.deinit();
+            self.allocator.free(f.host);
+            self.allocator.free(f.remote_host);
+            self.allocator.destroy(f);
+        }
+        self.forwards.deinit(self.allocator);
+        self.forwards = .empty;
+    }
+};
+
+pub var forward_state: ForwardState = .{ .allocator = undefined };
+
+pub fn forwardFromArgs(args: std.json.Value) ?*Forward {
+    if (argInt(args, "forward")) |id| {
+        if (id < 0) return null;
+        return forward_state.forwards.get(@intCast(id));
+    }
+    if (forward_state.forwards.count() == 1) return forward_state.forwards.values()[0];
+    return null;
+}
+
+/// The headless terminal `args` addresses under `key` ("term", or "pane"
+/// when a pane tool runs without a GUI), or the only one open.
+pub fn termFromArgs(args: std.json.Value, key: []const u8) ?*termdrive.Term {
+    if (argInt(args, key)) |id| {
+        if (id < 0) return null;
+        return term_state.terms.get(@intCast(id));
+    }
+    if (term_state.terms.count() == 1) return term_state.terms.values()[0];
+    return null;
+}
+
+pub fn termIdOf(t: *termdrive.Term) u32 {
+    var it = term_state.terms.iterator();
+    while (it.next()) |e| {
+        if (e.value_ptr.* == t) return e.key_ptr.*;
+    }
+    return 0;
+}
+
+pub fn commandCompletionResult(
+    arena: std.mem.Allocator,
+    result: termdrive.CommandCompletion,
+    command_sent: bool,
+    output: ?[]const u8,
+    output_kind: ?[]const u8,
+    reason: ?[]const u8,
+) ![]const u8 {
+    var r = Res.init(arena);
+    try r.fact("state", @tagName(result.state));
+    try r.fact("command_sent", command_sent);
+    try r.fact("exit_status", result.exit_status);
+    try r.fact("timed_out", result.timed_out);
+    try r.fact("completion_source", @tagName(result.source));
+    // A soft failure (running/unsupported/timed out) is a FACT here,
+    // not a tool error: isError stays false and the text lane says so.
+    if (result.exit_status) |status| {
+        try r.textf("{s}: exit {d} ({s})", .{ @tagName(result.state), status, @tagName(result.source) });
+    } else {
+        try r.textf("{s}{s} ({s})", .{
+            @tagName(result.state),
+            if (result.timed_out) ", timed out" else "",
+            @tagName(result.source),
+        });
+    }
+    if (!command_sent) try r.text("the command was NOT sent");
+    if (reason) |text| {
+        try r.fact("reason", text);
+        try r.text(text);
+    }
+    if (output_kind) |kind| try r.fact("output_kind", kind);
+    if (output) |text| {
+        try r.fact("output", text);
+        try r.textf("--- {s} ---", .{output_kind orelse "output"});
+        try r.text(text);
+    }
+    return r.finish();
+}
+
+test "stagedPartPath preserves the extension" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try t.expectEqualStrings("/etc/systemd/system/hohenheim.sketerm-part.service", try @import("mcp_term.zig").stagedPartPath(arena, "/etc/systemd/system/hohenheim.service"));
+    // Last-suffix preservation (what suffix-sensitive validators need).
+    try t.expectEqualStrings("/srv/app.tar.sketerm-part.gz", try @import("mcp_term.zig").stagedPartPath(arena, "/srv/app.tar.gz"));
+    try t.expectEqualStrings("/usr/local/bin/hohenheim.sketerm-part", try @import("mcp_term.zig").stagedPartPath(arena, "/usr/local/bin/hohenheim"));
+    // Dotfiles and trailing dots don't split.
+    try t.expectEqualStrings("/home/x/.bashrc.sketerm-part", try @import("mcp_term.zig").stagedPartPath(arena, "/home/x/.bashrc"));
+    try t.expectEqualStrings("/tmp/weird..sketerm-part", try @import("mcp_term.zig").stagedPartPath(arena, "/tmp/weird."));
+}
+
+test "findHex64 finds standalone sha tokens" {
+    const t = std.testing;
+    const sha = "a" ** 64;
+    try t.expectEqualStrings(sha, @import("mcp_term.zig").findHex64("prefix " ++ sha ++ "  /path/file").?);
+    try t.expect(@import("mcp_term.zig").findHex64("short deadbeef only") == null);
+    // 65 hex chars: not a standalone 64-run.
+    try t.expect(@import("mcp_term.zig").findHex64("f" ** 65) == null);
+}
+
+test "pickFreePort and tcpListening agree" {
+    const t = std.testing;
+    const port = @import("mcp_term.zig").pickFreePort() orelse return error.SkipZigTest;
+    try t.expect(port > 0);
+    // Nothing listens there after the probe socket closed.
+    try t.expect(!@import("mcp_term.zig").tcpListening(port, 200));
+}
+
+test "localCopyAtomic copies, verifies and renames" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var sbuf: [128]u8 = undefined;
+    var dbuf: [128]u8 = undefined;
+    const src = try std.fmt.bufPrintZ(&sbuf, "/tmp/sketerm-xfer-src-{d}", .{c.getpid()});
+    const dst = try std.fmt.bufPrintZ(&dbuf, "/tmp/sketerm-xfer-dst-{d}", .{c.getpid()});
+    const f = c.fopen(src.ptr, "wb") orelse return error.SkipZigTest;
+    _ = c.fwrite("hello transfer", 1, 14, f);
+    _ = c.fclose(f);
+    defer _ = c.unlink(src.ptr);
+    defer _ = c.unlink(dst.ptr);
+    const r = try @import("mcp_term.zig").localCopyAtomic(arena, src, dst);
+    try t.expect(r == .ok);
+    try t.expectEqual(@as(u64, 14), r.ok.bytes);
+    try t.expectEqual(@as(?u64, 14), @import("mcp_term.zig").fileSize(dst));
+    const src_sha = @import("mcp_term.zig").sha256File(src).?;
+    try t.expectEqualStrings(&src_sha, &r.ok.sha);
+    // Missing source is a described error, not a crash.
+    const bad = try @import("mcp_term.zig").localCopyAtomic(arena, "/nonexistent/nope", dst);
+    try t.expect(bad == .err);
+}
+
+test "commandCompletionResult: facts in structuredContent, compact prose in the text lane" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const done = try commandCompletionResult(
+        arena,
+        .{ .state = .completed, .exit_status = 0, .source = .shell_integration },
+        true,
+        "hello world",
+        "command",
+        null,
+    );
+    const parsed = try expectToolResultShape(arena, "term_wait_command", done);
+    const sc = parsed.object.get("structuredContent").?.object;
+    try t.expectEqualStrings("completed", sc.get("state").?.string);
+    try t.expect(sc.get("command_sent").?.bool);
+    try t.expectEqual(@as(i64, 0), sc.get("exit_status").?.integer);
+    try t.expect(!sc.get("timed_out").?.bool);
+    try t.expectEqualStrings("shell_integration", sc.get("completion_source").?.string);
+    try t.expectEqualStrings("hello world", sc.get("output").?.string);
+    const text = parsed.object.get("content").?.array.items[0].object.get("text").?.string;
+    try t.expectEqualStrings("completed: exit 0 (shell_integration)\n--- command ---\nhello world", text);
+    // Soft outcomes are facts, never tool errors.
+    try t.expect(parsed.object.get("isError") == null);
+}
+
+test "commandCompletionResult: a refused send stays a soft failure" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const refused = try commandCompletionResult(
+        arena,
+        .{ .state = .unsupported },
+        false,
+        null,
+        null,
+        "shell integration is unavailable for this shell",
+    );
+    const parsed = try expectToolResultShape(arena, "term_wait_command", refused);
+    const obj = parsed.object;
+    try t.expect(obj.get("isError") == null);
+    const sc = obj.get("structuredContent").?.object;
+    try t.expectEqualStrings("unsupported", sc.get("state").?.string);
+    try t.expect(!sc.get("command_sent").?.bool);
+    try t.expectEqual(std.json.Value{ .null = {} }, sc.get("exit_status").?);
+    const text = obj.get("content").?.array.items[0].object.get("text").?.string;
+    try t.expect(std.mem.indexOf(u8, text, "the command was NOT sent") != null);
+    try t.expect(std.mem.indexOf(u8, text, "shell integration is unavailable") != null);
+
+    // A timed-out still-running command: also isError:false.
+    const running = try commandCompletionResult(
+        arena,
+        .{ .state = .running, .timed_out = true },
+        true,
+        "partial output",
+        "screen",
+        "timeout expired while the command was still running",
+    );
+    const rparsed = try expectToolResultShape(arena, "term_run", running);
+    try t.expect(rparsed.object.get("isError") == null);
+    try t.expect(rparsed.object.get("structuredContent").?.object.get("timed_out").?.bool);
 }

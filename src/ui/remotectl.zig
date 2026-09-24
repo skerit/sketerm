@@ -599,6 +599,10 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
             .sync_output = scr.sync_output,
             .title = scr.last_title orelse "",
             .seq = pane.terminal.activity_seq,
+            // Command-zone identity: a zone reported after a send is that
+            // send's only when this counter moved past its value before it.
+            .completion_seq = scr.cmd_completion_seq,
+            .command_running = scr.pending_output_start_id != 0 or scr.pending_output_awaits_nl,
         });
     } else if (eql(u8, req.cmd, "editor-atlas-stats")) {
         if (c.getenv("SKETERM_VERIFY_EDITOR_ATLAS_GL") == null)
@@ -729,6 +733,7 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
             try ipc_protocol.writeOk(out, allocator, "last", .{
                 .text = text,
                 .exit = screen.last_cmd_exit,
+                .completion_seq = screen.cmd_completion_seq,
             });
             return;
         }

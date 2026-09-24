@@ -567,6 +567,15 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             return fakeGui(std.mem.span(rt_dir));
     }
 
+    // The ssh-tools stage puts THIS binary on PATH as `ssh` and `scp`:
+    // a local stand-in for a remote host, so scp_get/scp_put and the
+    // port forwards are provable with no sshd.
+    if (c.getenv(FAKE_SSH_ENV) != null) {
+        const name = std.fs.path.basename(std.mem.span(init.args.vector[0]));
+        if (std.mem.eql(u8, name, "ssh")) return fakeSsh(init.args.vector[1..]);
+        if (std.mem.eql(u8, name, "scp")) return fakeScp(init.args.vector[1..]);
+    }
+
     // `--web-bin <path>`: the helper THIS build produced, handed over by
     // build.zig. Without it the stages fall back to the installed
     // `zig-out/bin/sketerm-webengine`.
@@ -870,6 +879,31 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         if (std.mem.indexOf(u8, nt, "\"headless\":true") == null or
             std.mem.indexOf(u8, nt, "\"term\":") == null)
             fail("new_tab did not fall back to a headless terminal");
+
+        // ── pane tools without a GUI drive that headless terminal ─
+        {
+            const lt = m.callTool("list_terminals", "{}");
+            if (std.mem.indexOf(u8, lt, "\"headless\":true") == null)
+                fail("list_terminals without a GUI did not list the headless terminals");
+            const st = m.callTool("send_text", "{\"pane\":3,\"text\":\"echo PANE-HEADLESS-$((6*7))\",\"enter\":true}");
+            if (std.mem.indexOf(u8, st, "isError") != null or std.mem.indexOf(u8, st, "\"headless\":true") == null)
+                fail("send_text did not reach the headless terminal by its pane id");
+            _ = m.callTool("wait_idle", "{\"pane\":3,\"quiet_ms\":300,\"timeout_ms\":10000}");
+            var seen = false;
+            var tries: u32 = 0;
+            while (tries < 20 and !seen) : (tries += 1) {
+                const rs = m.callTool("read_screen", "{\"pane\":3}");
+                seen = std.mem.indexOf(u8, rs, "PANE-HEADLESS-42") != null;
+                if (!seen) _ = c.usleep(200_000);
+            }
+            if (!seen) fail("read_screen on the headless pane never showed the command's output");
+            const rc = m.callTool("run_command", "{\"pane\":3,\"command\":\"echo RUN-HEADLESS-$((6*9))\",\"quiet_ms\":300,\"timeout_ms\":15000}");
+            if (std.mem.indexOf(u8, rc, "RUN-HEADLESS-54") == null)
+                fail("run_command on the headless pane did not return the command's output");
+            const shot = m.callTool("screenshot_pane", "{\"pane\":3}");
+            if (std.mem.indexOf(u8, shot, "\"code\":\"unavailable\"") == null)
+                fail("screenshot_pane without a GUI did not answer the unavailable code");
+        }
 
         // ── term_exec: sentinel-based structured exec ─────────────
         const ex1 = m.callTool("term_exec", "{\"term\":3,\"command\":\"echo EXEC-STRUCT; false\"}");
@@ -1421,16 +1455,32 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         // Repeated event polls reuse the same panel-only connection. The
         // first empty reply must not lose the event returned by the next.
         m.sendTool("ui_wait_event", "{\"panel_id\":41,\"timeout_ms\":2000}");
+        // The read is the non-destructive panel-events-reliable: a poll
+        // acknowledges only what an EARLIER reply delivered.
         const poll1 = recvPanelCall(allocator, &presenter, 15_000);
-        replyPanel(&presenter, poll1, "{\"ok\":true,\"events\":[],\"dropped\":1}");
+        if (std.mem.indexOf(u8, poll1.json, "\"cmd\":\"panel-events-reliable\"") == null)
+            fail("ui_wait_event did not use the reliable event read");
+        replyPanel(&presenter, poll1, "{\"ok\":true,\"event_epoch\":\"10000000000000000000000000000001\",\"events\":[],\"cursor\":0,\"dropped_total\":1}");
         poll1.deinit(allocator);
         const poll2 = recvPanelCall(allocator, &presenter, 15_000);
-        replyPanel(&presenter, poll2, "{\"ok\":true,\"events\":[{\"component\":\"t\",\"kind\":\"click\",\"value\":\"ok\",\"ts\":42}],\"dropped\":0}");
+        replyPanel(&presenter, poll2, "{\"ok\":true,\"event_epoch\":\"10000000000000000000000000000001\",\"events\":[{\"seq\":2,\"component\":\"t\",\"kind\":\"click\",\"value\":\"ok\",\"ts\":42}],\"cursor\":2,\"dropped_total\":1}");
         poll2.deinit(allocator);
         const waited = m.recvLine(15_000);
         if (std.mem.indexOf(u8, waited, "\"value\":\"ok\"") == null or
             std.mem.indexOf(u8, waited, "\"dropped\":1") == null)
             fail("repeated relayed ui_wait_event polls lost state");
+        // The next wait acknowledges what that reply handed over.
+        m.sendTool("ui_wait_event", "{\"panel_id\":41,\"timeout_ms\":2000}");
+        const poll3 = recvPanelCall(allocator, &presenter, 15_000);
+        if (std.mem.indexOf(u8, poll3.json, "\"ack\":2") == null or
+            std.mem.indexOf(u8, poll3.json, "10000000000000000000000000000001") == null)
+            fail("ui_wait_event did not acknowledge the events it returned");
+        replyPanel(&presenter, poll3, "{\"ok\":true,\"event_epoch\":\"10000000000000000000000000000001\",\"events\":[{\"seq\":3,\"component\":\"t\",\"kind\":\"click\",\"value\":\"again\",\"ts\":43}],\"cursor\":3,\"dropped_total\":1}");
+        poll3.deinit(allocator);
+        const waited_again = m.recvLine(15_000);
+        if (std.mem.indexOf(u8, waited_again, "\"value\":\"again\"") == null or
+            std.mem.indexOf(u8, waited_again, "\"dropped\":0") == null)
+            fail("the acknowledged ui_wait_event misreported events or drops");
 
         // The daemon can correlate an envelope whose opaque JSON is invalid;
         // MCP must call that uncertain delivery explicitly and never resend.
@@ -2104,6 +2154,14 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // -- the web_gui grant: the user's OWN browser for web_* only --
     webGuiGrantStage(allocator, exe, rt);
     say("smoke-mcp: web_gui grant (discover, spawn, fail closed) ok");
+
+    // -- scp/port forwards through the real ssh tool paths ------------
+    sshToolsStage(allocator, exe, rt);
+    say("smoke-mcp: scp_get/scp_put and port_forward_* over a fake ssh ok");
+
+    // -- app_* against a real GTK app on the private headless display --
+    appToolsStage(allocator, exe, rt);
+    say("smoke-mcp: app_* tools against a real windowed app ok");
 
     // ── web_* headless: isolated mode, NO GUI, no --shared ─────────
     //
@@ -5042,4 +5100,369 @@ fn webOnly(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: [:0]const u8) u
     g_rt = null;
     pathz.removeTree(rt);
     return 0;
+}
+
+// -- ssh tools over a fake ssh ---------------------------------------
+
+/// Env that turns this binary, run as `ssh` or `scp`, into a local
+/// stand-in for a remote host.
+const FAKE_SSH_ENV = "SKETERM_SMOKE_FAKE_SSH";
+
+/// Options of ssh/scp that take a value (the rest are flags).
+fn sshOptTakesValue(opt: []const u8) bool {
+    if (opt.len != 2) return false;
+    return std.mem.indexOfScalar(u8, "oLRDipFJlSWcbeEmOQw", opt[1]) != null;
+}
+
+/// A stand-in `ssh`: `-L lp_spec` with `-N` serves the forward locally;
+/// otherwise the remote command runs here under /bin/sh.
+fn fakeSsh(args: []const [*:0]const u8) u8 {
+    var forward: ?[]const u8 = null;
+    var no_cmd = false;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = std.mem.span(args[i]);
+        if (a.len == 0 or a[0] != '-') break;
+        if (std.mem.eql(u8, a, "-N")) no_cmd = true;
+        if (sshOptTakesValue(a)) {
+            if (i + 1 >= args.len) return 255;
+            if (std.mem.eql(u8, a, "-L")) forward = std.mem.span(args[i + 1]);
+            i += 1;
+        }
+    }
+    if (i >= args.len) return 255; // no host
+    i += 1; // the host: this machine stands in for it
+    if (no_cmd) {
+        const spec = forward orelse return 255;
+        return fakeForward(spec);
+    }
+    var line: std.ArrayList(u8) = .empty;
+    for (args[i..], 0..) |a, k| {
+        if (k > 0) line.append(std.heap.c_allocator, ' ') catch return 255;
+        line.appendSlice(std.heap.c_allocator, std.mem.span(a)) catch return 255;
+    }
+    line.append(std.heap.c_allocator, 0) catch return 255;
+    const argv = [_:null]?[*:0]const u8{ "sh", "-c", @ptrCast(line.items.ptr) };
+    _ = c.execv("/bin/sh", @ptrCast(&argv));
+    return 127;
+}
+
+/// `[bind:]lport:host:rport`: listen on 127.0.0.1:lport and relay each
+/// connection to 127.0.0.1:rport until killed.
+fn fakeForward(spec: []const u8) u8 {
+    var parts: [4][]const u8 = undefined;
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, spec, ':');
+    while (it.next()) |p| {
+        if (n == parts.len) return 255;
+        parts[n] = p;
+        n += 1;
+    }
+    if (n < 3) return 255;
+    const lport = std.fmt.parseInt(u16, parts[n - 3], 10) catch return 255;
+    const rport = std.fmt.parseInt(u16, parts[n - 1], 10) catch return 255;
+    const lfd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
+    if (lfd < 0) return 255;
+    var one: c_int = 1;
+    _ = c.setsockopt(lfd, c.SOL_SOCKET, c.SO_REUSEADDR, &one, @sizeOf(c_int));
+    var addr = loopbackAddr(lport);
+    if (c.bind(lfd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_in)) != 0) return 255;
+    if (c.listen(lfd, 8) != 0) return 255;
+    while (true) {
+        const cfd = c.accept(lfd, null, null);
+        if (cfd < 0) continue;
+        const pid = c.fork();
+        if (pid == 0) {
+            _ = c.close(lfd);
+            relay(cfd, rport);
+            c._exit(0);
+        }
+        _ = c.close(cfd);
+    }
+}
+
+fn loopbackAddr(port: u16) c.struct_sockaddr_in {
+    var addr = std.mem.zeroes(c.struct_sockaddr_in);
+    addr.sin_family = c.AF_INET;
+    addr.sin_port = std.mem.nativeToBig(u16, port);
+    addr.sin_addr.s_addr = std.mem.nativeToBig(u32, 0x7f000001);
+    return addr;
+}
+
+/// Copy bytes both ways between `cfd` and a fresh connection to
+/// 127.0.0.1:`rport` until either side closes.
+fn relay(cfd: c_int, rport: u16) void {
+    const rfd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
+    if (rfd < 0) return;
+    var addr = loopbackAddr(rport);
+    if (c.connect(rfd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_in)) != 0) return;
+    var fds = [2]c.struct_pollfd{
+        .{ .fd = cfd, .events = c.POLLIN, .revents = 0 },
+        .{ .fd = rfd, .events = c.POLLIN, .revents = 0 },
+    };
+    var buf: [16384]u8 = undefined;
+    while (c.poll(&fds, 2, -1) > 0) {
+        for (0..2) |k| {
+            if (fds[k].revents == 0) continue;
+            const n = c.read(fds[k].fd, &buf, buf.len);
+            if (n <= 0) return;
+            const out = fds[1 - k].fd;
+            var off: usize = 0;
+            while (off < @as(usize, @intCast(n))) {
+                const w = c.write(out, buf[off..].ptr, @as(usize, @intCast(n)) - off);
+                if (w <= 0) return;
+                off += @intCast(w);
+            }
+        }
+    }
+}
+
+/// A stand-in `scp`: `host:path` names a path on this machine.
+fn fakeScp(args: []const [*:0]const u8) u8 {
+    var paths: [2][]const u8 = undefined;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = std.mem.span(args[i]);
+        if (a.len > 0 and a[0] == '-') {
+            if (sshOptTakesValue(a)) i += 1;
+            continue;
+        }
+        if (n == paths.len) return 1;
+        paths[n] = if (a.len > 0 and a[0] != '/' and std.mem.indexOfScalar(u8, a, ':') != null)
+            a[std.mem.indexOfScalar(u8, a, ':').? + 1 ..]
+        else
+            a;
+        n += 1;
+    }
+    if (n != 2) return 1;
+    var src_z: [4096]u8 = undefined;
+    var dst_z: [4096]u8 = undefined;
+    const src = std.fmt.bufPrintZ(&src_z, "{s}", .{paths[0]}) catch return 1;
+    const dst = std.fmt.bufPrintZ(&dst_z, "{s}", .{paths[1]}) catch return 1;
+    const in = c.open(src.ptr, c.O_RDONLY);
+    if (in < 0) return 1;
+    defer _ = c.close(in);
+    const out = c.open(dst.ptr, c.O_WRONLY | c.O_CREAT | c.O_TRUNC, @as(c_uint, 0o644));
+    if (out < 0) return 1;
+    defer _ = c.close(out);
+    var buf: [65536]u8 = undefined;
+    while (true) {
+        const r = c.read(in, &buf, buf.len);
+        if (r < 0) return 1;
+        if (r == 0) return 0;
+        if (c.write(out, &buf, @intCast(r)) != r) return 1;
+    }
+}
+
+/// A one-connection TCP service on 127.0.0.1: answers every
+/// connection with a banner the relayed side must read back.
+const Banner = struct {
+    fd: c_int,
+    port: u16,
+
+    fn start() Banner {
+        const fd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
+        if (fd < 0) fail("banner socket");
+        var addr = loopbackAddr(0);
+        if (c.bind(fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_in)) != 0) fail("banner bind");
+        if (c.listen(fd, 8) != 0) fail("banner listen");
+        var len: c.socklen_t = @sizeOf(c.struct_sockaddr_in);
+        if (c.getsockname(fd, @ptrCast(&addr), &len) != 0) fail("banner getsockname");
+        return .{ .fd = fd, .port = std.mem.bigToNative(u16, addr.sin_port) };
+    }
+
+    fn serve(fd: c_int) void {
+        while (true) {
+            const cfd = c.accept(fd, null, null);
+            if (cfd < 0) return;
+            _ = c.write(cfd, "SK-FWD-OK\n", 10);
+            _ = c.close(cfd);
+        }
+    }
+};
+
+/// Read what 127.0.0.1:`port` sends first (bounded).
+fn readBanner(port: u16, out: []u8) []const u8 {
+    const fd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
+    if (fd < 0) return "";
+    defer _ = c.close(fd);
+    var addr = loopbackAddr(port);
+    if (c.connect(fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_in)) != 0) return "";
+    var pfd = c.struct_pollfd{ .fd = fd, .events = c.POLLIN, .revents = 0 };
+    var got: usize = 0;
+    while (got < out.len and c.poll(&pfd, 1, 5_000) > 0) {
+        const n = c.read(fd, out[got..].ptr, out.len - got);
+        if (n <= 0) break;
+        got += @intCast(n);
+        if (std.mem.indexOfScalar(u8, out[0..got], '\n') != null) break;
+    }
+    return out[0..got];
+}
+
+/// scp_get / scp_put with a host, and the port_forward_* lifecycle,
+/// through the real tool paths (a daemon terminal running `ssh`/`scp`),
+/// with THIS binary standing in for both on PATH.
+fn sshToolsStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: [:0]const u8) void {
+    var self_buf: [4096]u8 = undefined;
+    const self_n = c.readlink("/proc/self/exe", &self_buf, self_buf.len - 1);
+    if (self_n <= 0) fail("readlink /proc/self/exe");
+    self_buf[@intCast(self_n)] = 0;
+    var bin_buf: [512]u8 = undefined;
+    const bin = std.fmt.bufPrintZ(&bin_buf, "{s}/fakebin", .{rt}) catch fail("fakebin path");
+    _ = c.mkdir(bin.ptr, 0o700);
+    for ([_][]const u8{ "ssh", "scp" }) |name| {
+        var link_buf: [600]u8 = undefined;
+        const link = std.fmt.bufPrintZ(&link_buf, "{s}/{s}", .{ bin, name }) catch fail("fakebin link");
+        _ = c.unlink(link.ptr);
+        if (c.symlink(@ptrCast(&self_buf), link.ptr) != 0) fail("could not link the fake ssh/scp");
+    }
+    const old_path: []const u8 = if (c.getenv("PATH")) |p| std.mem.span(@as([*:0]const u8, @ptrCast(p))) else "/usr/bin:/bin";
+    var saved_path_buf: [4096]u8 = undefined;
+    const saved_path = std.fmt.bufPrintZ(&saved_path_buf, "{s}", .{old_path}) catch fail("PATH too long");
+    var path_buf: [4700]u8 = undefined;
+    const new_path = std.fmt.bufPrintZ(&path_buf, "{s}:{s}", .{ bin, old_path }) catch fail("PATH too long");
+    _ = c.setenv("PATH", new_path.ptr, 1);
+    _ = c.setenv(FAKE_SSH_ENV, "1", 1);
+    defer {
+        _ = c.setenv("PATH", saved_path.ptr, 1);
+        _ = c.unsetenv(FAKE_SSH_ENV);
+    }
+
+    const banner = Banner.start();
+    const th = std.Thread.spawn(.{}, Banner.serve, .{banner.fd}) catch fail("banner thread");
+    th.detach();
+
+    var m = Mcp.spawn(allocator, exe, &.{});
+    m.initialize();
+    defer m.closeStdinWait();
+
+    // scp_get: remote file -> staged partial -> sha256 verified -> moved.
+    var src_buf: [512]u8 = undefined;
+    const src = std.fmt.bufPrintZ(&src_buf, "{s}/remote-src.txt", .{rt}) catch fail("src path");
+    {
+        const f = c.fopen(src.ptr, "w") orelse fail("could not write the remote-side file");
+        _ = c.fputs("SCP-GET-PAYLOAD\n", f);
+        _ = c.fclose(f);
+    }
+    var jb: [1400]u8 = undefined;
+    const got = m.callTool("scp_get", std.fmt.bufPrint(&jb, "{{\"host\":\"fakehost\",\"remote_path\":\"{s}\",\"local_path\":\"{s}/got.txt\"}}", .{ src, rt }) catch unreachable);
+    if (std.mem.indexOf(u8, got, "\"verified\":true") == null or std.mem.indexOf(u8, got, "isError") != null) {
+        std.debug.print("smoke-mcp: scp_get reply: {s}\n", .{got});
+        fail("scp_get over ssh did not verify and move the download");
+    }
+    const read_back = m.callTool("file_read", std.fmt.bufPrint(&jb, "{{\"path\":\"{s}/got.txt\"}}", .{rt}) catch unreachable);
+    if (std.mem.indexOf(u8, read_back, "SCP-GET-PAYLOAD") == null) fail("scp_get wrote the wrong bytes");
+
+    // scp_put: the upload is verified on the "remote" and moved there.
+    const put = m.callTool("scp_put", std.fmt.bufPrint(&jb, "{{\"host\":\"fakehost\",\"local_path\":\"{s}/got.txt\",\"remote_path\":\"{s}/put.txt\"}}", .{ rt, rt }) catch unreachable);
+    if (std.mem.indexOf(u8, put, "\"verified\":true") == null or std.mem.indexOf(u8, put, "isError") != null) {
+        std.debug.print("smoke-mcp: scp_put reply: {s}\n", .{put});
+        fail("scp_put over ssh did not verify and move the upload");
+    }
+
+    // port_forward_open: readiness is a TCP connect; a connection through
+    // the forward must reach the service behind it.
+    const opened = m.callTool("port_forward_open", std.fmt.bufPrint(&jb, "{{\"host\":\"fakehost\",\"remote_port\":{d}}}", .{banner.port}) catch unreachable);
+    if (std.mem.indexOf(u8, opened, "isError") != null) {
+        std.debug.print("smoke-mcp: port_forward_open reply: {s}\n", .{opened});
+        fail("port_forward_open failed over the fake ssh");
+    }
+    const lp_at = std.mem.indexOf(u8, opened, "\"local_port\":") orelse fail("port_forward_open reported no local_port");
+    var end = lp_at + "\"local_port\":".len;
+    while (end < opened.len and std.ascii.isDigit(opened[end])) end += 1;
+    const lport = std.fmt.parseInt(u16, opened[lp_at + "\"local_port\":".len .. end], 10) catch fail("bad local_port");
+    var banner_buf: [64]u8 = undefined;
+    if (std.mem.indexOf(u8, readBanner(lport, &banner_buf), "SK-FWD-OK") == null)
+        fail("a connection through the forward did not reach the service behind it");
+    const listed = m.callTool("port_forward_list", "{}");
+    if (std.mem.indexOf(u8, listed, "\"alive\":true") == null) fail("port_forward_list did not show the live forward");
+    const checked = m.callTool("port_forward_check", "{\"forward\":1}");
+    if (std.mem.indexOf(u8, checked, "\"listening\":true") == null) fail("port_forward_check did not see the forward listening");
+    const closed = m.callTool("port_forward_close", "{\"forward\":1}");
+    if (std.mem.indexOf(u8, closed, "\"closed\":true") == null) fail("port_forward_close did not close the forward");
+}
+
+/// The app_* tools against a REAL windowed app on the private daemon's
+/// headless display: `sketerm view` on a generated image (no GUI, no
+/// --shared). Launch waits for the first window; the reads, inputs and
+/// waits then run on that live toplevel, and close_app retires it.
+fn appToolsStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: [:0]const u8) void {
+    var png_buf: [512]u8 = undefined;
+    const png = std.fmt.bufPrintZ(&png_buf, "{s}/app-fixture.png", .{rt}) catch fail("fixture path");
+    if (!writeSolidPngFile(png, 0x20, 0xc0, 0x40)) fail("could not write the app fixture image");
+
+    var m = Mcp.spawn(allocator, exe, &.{});
+    m.initialize();
+    defer m.closeStdinWait();
+    var jb: [2048]u8 = undefined;
+    const launch = std.fmt.bufPrint(
+        &jb,
+        "{{\"command\":[\"{s}\",\"view\",\"{s}\"],\"env\":{{\"SKETERM_APP_ID\":\"dev.sker.sketerm.smokemcp\",\"GTK_A11Y\":\"none\"}},\"wait_for\":\"window\",\"wait_ms\":30000,\"stable_ms\":0}}",
+        .{ std.mem.span(exe), png },
+    ) catch fail("launch args");
+    const opened = m.callTool("launch_app", launch);
+    if (std.mem.indexOf(u8, opened, "isError") != null) {
+        std.debug.print("smoke-mcp: launch_app reply: {s}\n", .{opened[0..@min(opened.len, 600)]});
+        fail("launch_app of a real windowed app failed");
+    }
+    if (std.mem.indexOf(u8, opened, "\"type\":\"image\"") == null)
+        fail("launch_app wait_for:window did not reply with the window's screenshot");
+
+    const state = m.callTool("get_app_state", "{\"app\":1}");
+    if (std.mem.indexOf(u8, state, "isError") != null or std.mem.indexOf(u8, state, "\"exited\":false") == null)
+        fail("get_app_state did not report the live app");
+    const shot = m.callTool("screenshot_app", "{\"app\":1}");
+    if (std.mem.indexOf(u8, shot, "\"type\":\"image\"") == null or std.mem.indexOf(u8, shot, "\"image_w\":") == null)
+        fail("screenshot_app returned no image with its size");
+    const win_at = std.mem.indexOf(u8, shot, "\"window\":") orelse fail("screenshot_app named no window");
+    var win_end = win_at + "\"window\":".len;
+    while (win_end < shot.len and std.ascii.isDigit(shot[win_end])) win_end += 1;
+    const win = std.fmt.parseInt(u32, shot[win_at + "\"window\":".len .. win_end], 10) catch fail("bad window id");
+    const probe = m.callTool("screenshot_app", "{\"app\":1,\"stats_only\":true}");
+    if (std.mem.indexOf(u8, probe, "isError") != null) fail("screenshot_app stats_only failed");
+    var ib: [256]u8 = undefined;
+    const clicked = m.callTool("app_click", std.fmt.bufPrint(&ib, "{{\"app\":1,\"window\":{d},\"x\":40,\"y\":40,\"mark\":false,\"settle_ms\":0}}", .{win}) catch unreachable);
+    if (std.mem.indexOf(u8, clicked, "isError") != null) {
+        std.debug.print("smoke-mcp: app_click reply: {s}\n", .{clicked[0..@min(clicked.len, 600)]});
+        fail("app_click on the live window failed");
+    }
+    const moved = m.callTool("app_mouse_move", std.fmt.bufPrint(&ib, "{{\"app\":1,\"window\":{d},\"x\":60,\"y\":60}}", .{win}) catch unreachable);
+    if (std.mem.indexOf(u8, moved, "isError") != null) {
+        std.debug.print("smoke-mcp: app_mouse_move reply: {s}\n", .{moved[0..@min(moved.len, 600)]});
+        fail("app_mouse_move failed");
+    }
+    const keyed = m.callTool("app_key", std.fmt.bufPrint(&ib, "{{\"app\":1,\"window\":{d},\"keys\":\"right\"}}", .{win}) catch unreachable);
+    if (std.mem.indexOf(u8, keyed, "isError") != null) {
+        std.debug.print("smoke-mcp: app_key reply: {s}\n", .{keyed[0..@min(keyed.len, 600)]});
+        fail("app_key failed");
+    }
+    const waited = m.callTool("app_wait", "{\"app\":1,\"quiet_ms\":300,\"timeout_ms\":10000}");
+    if (std.mem.indexOf(u8, waited, "isError") != null) fail("app_wait on the live window failed");
+    const logged = m.callTool("app_log", "{\"app\":1}");
+    if (std.mem.indexOf(u8, logged, "isError") != null) fail("app_log failed");
+    const listed = m.callTool("list_apps", "{}");
+    if (std.mem.indexOf(u8, listed, "\"app\":1") == null) fail("list_apps did not list the running app");
+    const closed = m.callTool("close_app", "{\"app\":1}");
+    if (std.mem.indexOf(u8, closed, "isError") != null) {
+        std.debug.print("smoke-mcp: close_app reply: {s}\n", .{closed[0..@min(closed.len, 600)]});
+        fail("close_app did not retire the app");
+    }
+}
+
+/// A 64x64 opaque PNG of one colour.
+fn writeSolidPngFile(path: [:0]const u8, r: u8, g: u8, b: u8) bool {
+    var px: [64 * 64 * 4]u8 = undefined;
+    var i: usize = 0;
+    while (i < px.len) : (i += 4) {
+        px[i] = r;
+        px[i + 1] = g;
+        px[i + 2] = b;
+        px[i + 3] = 0xff;
+    }
+    const png = @import("util/png.zig").encodeRgba(std.heap.c_allocator, &px, 64, 64) catch return false;
+    defer std.heap.c_allocator.free(png);
+    const f = c.fopen(path.ptr, "wb") orelse return false;
+    defer _ = c.fclose(f);
+    return c.fwrite(png.ptr, 1, png.len, f) == png.len;
 }
