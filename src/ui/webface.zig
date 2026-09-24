@@ -8036,6 +8036,7 @@ pub const WebFace = struct {
         store_section.itemIcon("History", .{ .name = "document-open-recent-symbolic" }, &onMenuHistory, ctx);
         store_section.itemIcon("Bookmarks", .{ .name = "sketerm-starred-symbolic" }, &onMenuBookmarks, ctx);
         store_section.itemIcon("Userscripts…", .{ .name = "application-x-addon-symbolic" }, &onMenuUserscripts, ctx);
+        store_section.itemIcon("Filter Lists…", .{ .name = "security-high-symbolic" }, &onMenuFilterLists, ctx);
         // A style needs a site to be scoped to; about:blank has none.
         store_section.itemIconEnabled(
             "Edit Site Style…",
@@ -8154,7 +8155,7 @@ pub const WebFace = struct {
     fn onMenuExtensions(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
         const face = cast.userData(MenuCtx, user).face;
         const win = face.ownerWindow() orelse return;
-        webext.openManager(face.allocator, @ptrCast(@alignCast(win.app_window)));
+        @import("window.zig").dispatchAction(win, .web_extensions);
     }
 
     fn onMenuOpenInContainer(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
@@ -8344,7 +8345,13 @@ pub const WebFace = struct {
     fn onMenuUserscripts(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
         const face = cast.userData(MenuCtx, user).face;
         const win = face.ownerWindow() orelse return;
-        webuserscripts.openManager(win);
+        @import("window.zig").dispatchAction(win, .web_userscripts);
+    }
+
+    fn onMenuFilterLists(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+        const face = cast.userData(MenuCtx, user).face;
+        const win = face.ownerWindow() orelse return;
+        @import("window.zig").dispatchAction(win, .web_filter_lists);
     }
 
     fn onMenuSiteStyle(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {

@@ -1617,7 +1617,12 @@ costs the caller its entire 120s deadline and explains nothing.
   control request, empty removal, failure-open preservation for HTTP,
   HTML and oversize responses, and cancellation/drain during teardown.
   The feature is inert until `filter_list` is configured, so an
-  unconfigured user runs none of it.
+  unconfigured user runs none of it. The user edits the list in the
+  Filter Lists manager (`src/ui/webfilters.zig`, verb
+  `web_filter_lists`: window menu > Browser, pane menu, page menu,
+  palette), which applies the change like Preferences and writes
+  config.conf; `filtersub.withAdded/withRemoved` refuse invalid and
+  duplicate urls. smoke-e2e `WEB_MANAGERS` drives it from the palette.
 - **User content (0xC0 block, capability "userscripts")** is REPLACE-ALL:
   `us_script_set` carries raw `==UserScript==` sources (the helper
   parses metadata via `userscript.zig`), `us_style_set` per-host CSS

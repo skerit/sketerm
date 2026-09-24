@@ -136,6 +136,11 @@ const MENU = [_]Item{
         .{ .label = "Show Panel / Show Shell", .icon = "view-paged-symbolic", .action = .toggle_panel_face },
         .{ .label = "Close Panel", .icon = "window-close-symbolic", .action = .panel_close },
     } } },
+    .{ .submenu = .{ .label = "Browser", .icon = "web-browser-symbolic", .items = &.{
+        .{ .label = "Extensions…", .icon = "application-x-addon-symbolic", .action = .web_extensions },
+        .{ .label = "Userscripts…", .icon = "text-x-script-symbolic", .action = .web_userscripts },
+        .{ .label = "Filter Lists…", .icon = "security-high-symbolic", .action = .web_filter_lists },
+    } } },
     .separator,
     .{ .bind = .{ .label = "Launch App…", .icon = "application-x-executable-symbolic", .action = .launch_app } },
     .{ .submenu = .{ .label = "Session", .icon = "network-server-symbolic", .remote_only = true, .items = &.{

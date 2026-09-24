@@ -4544,6 +4544,9 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         // new web tab.
         .web_history => @import("webhistory.zig").openHistory(self, self.focusedPane()),
         .web_bookmarks => @import("webhistory.zig").openBookmarks(self, self.focusedPane()),
+        .web_extensions => @import("webext.zig").openManager(self.allocator, @ptrCast(@alignCast(self.app_window))),
+        .web_userscripts => @import("webuserscripts.zig").openManager(self),
+        .web_filter_lists => @import("webfilters.zig").openManager(self),
         .close_pane => self.closeFocusedPane(),
         // Only reached when the focused pane has NO browser face (the
         // pane-local dispatch consumes it otherwise): say so, rather

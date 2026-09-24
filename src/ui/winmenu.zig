@@ -90,6 +90,12 @@ pub fn show(win: *Window, anchor: *c.GtkWidget) void {
     row(panels, win, .panel_open, has_pane);
     row(panels, win, .panel_open_window, has_pane);
 
+    // The browser's own managers: window-level, no pane needed.
+    const browser = m.section().submenu("Browser");
+    row(browser, win, .web_extensions, true);
+    row(browser, win, .web_userscripts, true);
+    row(browser, win, .web_filter_lists, true);
+
     const session = m.section().submenu("Session");
     row(session, win, .mux_detach, durable);
     row(session, win, .mux_rename, durable);

@@ -178,6 +178,45 @@ pub fn looksLikeFilterList(body: []const u8) bool {
 
 const t = std.testing;
 
+pub const EditError = error{ InvalidUrl, AlreadySubscribed, OutOfMemory };
+
+/// The subscription list with `url` added (trimmed), as the manager
+/// writes it back to `filter_list` lines. Refuses an invalid url and a
+/// duplicate rather than storing either: the helper would drop both at
+/// reconcile, and the user would see a list that is not the real one.
+/// Slices borrow `current`/`url`; the outer slice is `arena`'s.
+pub fn withAdded(arena: std.mem.Allocator, current: []const []const u8, raw: []const u8) EditError![]const []const u8 {
+    const url = std.mem.trim(u8, raw, " \t\r\n");
+    if (!validUrl(url)) return error.InvalidUrl;
+    for (current) |u| if (std.mem.eql(u8, u, url)) return error.AlreadySubscribed;
+    const out = try arena.alloc([]const u8, current.len + 1);
+    @memcpy(out[0..current.len], current);
+    out[current.len] = url;
+    return out;
+}
+
+/// The subscription list without `url` (every copy of it).
+pub fn withRemoved(arena: std.mem.Allocator, current: []const []const u8, url: []const u8) error{OutOfMemory}![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for (current) |u| if (!std.mem.eql(u8, u, url)) try out.append(arena, u);
+    return out.items;
+}
+
+test "withAdded refuses invalid and duplicate urls; withRemoved drops one" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const one = try withAdded(a, &.{}, "  https://easylist.to/easylist/easylist.txt\n");
+    try std.testing.expectEqual(@as(usize, 1), one.len);
+    try std.testing.expectEqualStrings("https://easylist.to/easylist/easylist.txt", one[0]);
+    try std.testing.expectError(error.AlreadySubscribed, withAdded(a, one, "https://easylist.to/easylist/easylist.txt"));
+    try std.testing.expectError(error.InvalidUrl, withAdded(a, one, "file:///etc/passwd"));
+    const two = try withAdded(a, one, "http://127.0.0.1:9/l.txt");
+    const back = try withRemoved(a, two, "https://easylist.to/easylist/easylist.txt");
+    try std.testing.expectEqual(@as(usize, 1), back.len);
+    try std.testing.expectEqualStrings("http://127.0.0.1:9/l.txt", back[0]);
+}
+
 test "cacheName is stable, readable and collision-free on the tail" {
     var a: [MAX_NAME]u8 = undefined;
     var b: [MAX_NAME]u8 = undefined;

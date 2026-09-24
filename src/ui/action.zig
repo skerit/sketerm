@@ -215,6 +215,13 @@ pub const Action = enum {
     web_history,
     /// Open the bookmarks window (src/ui/webhistory.zig).
     web_bookmarks,
+    /// Open the browser-extension manager (src/ui/webext.zig).
+    web_extensions,
+    /// Open the userscript manager (src/ui/webuserscripts.zig).
+    web_userscripts,
+    /// Open the filter-list subscription manager (src/ui/webfilters.zig):
+    /// the `filter_list` urls the browser helper keeps current.
+    web_filter_lists,
     /// Close the focused pane, giving its space back to its sibling.
     /// The last pane in a tab closes the tab.
     close_pane,

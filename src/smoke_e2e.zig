@@ -1029,6 +1029,14 @@ pub fn main() u8 {
         teardown();
         return 0;
     }
+    if (c.getenv("SKETERM_SMOKE_E2E_WEB_MANAGERS_ONLY") != null) {
+        const app = drive orelse return fail("focused web managers smoke has no display driver");
+        if (app.windows.items.len == 0) return fail("focused web managers smoke lost its window");
+        if (webManagersStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
+        say("web managers: the palette's Filter Lists row opened the manager and a typed url became a filter_list line; the web_extensions and web_userscripts verbs (the window menu's Browser rows) opened theirs");
+        teardown();
+        return 0;
+    }
     if (c.getenv("SKETERM_SMOKE_E2E_WEB_ROUTE_ONLY") != null) {
         const app = drive orelse return fail("focused web route smoke has no display driver");
         if (!have_web_action) return fail("focused web route smoke needs zig-out/bin/sketerm-webengine (run `zig build web` first)");
@@ -5645,6 +5653,92 @@ fn waitNewToplevel(app: *appdrive.App, known: []const u32, ms: u32) ?u32 {
         pumpFor(app, 200);
         waited += 200;
     }
+}
+
+/// The browser managers are reachable as VERBS (`web_extensions`,
+/// `web_userscripts`, `web_filter_lists`) from the palette, the window
+/// menu's Browser submenu and the pane menu. Driven here through the
+/// PALETTE, the way a user types it: "filter lists" + Return must open
+/// the Filter Lists window, and a url typed into its focused entry +
+/// Return must become a `filter_list` line in config.conf (the manager
+/// applies the change like Preferences and persists it).
+fn webManagersStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]const u8, rt: []const u8) ?[]const u8 {
+    _ = app.drainLive(1_000);
+    const win_id = mainWin(app).id;
+    app.focusWindow(win_id) catch return "activating the window for the palette failed";
+    _ = app.waitIdle(300, 5_000);
+    const toplevels_before = app.windows.items.len;
+    var ref = app.frameRef(win_id, true) orelse return "no baseline frame before the palette";
+    defer ref.deinit(allocator);
+    const opened = roundtrip(allocator, sock_path, "{\"cmd\":\"action\",\"pane\":1,\"data\":\"command_palette\"}\n") orelse
+        return "command_palette action roundtrip failed";
+    allocator.free(opened);
+    if (!app.waitChangeSince(win_id, &ref, 15_000, 0.01, null)) return "the command palette did not open";
+    if (editorlang_stage.paletteQuery(allocator, app, win_id, win_id, "filter lists")) |why| return why;
+
+    // The manager is its own toplevel.
+    var mgr_id: ?u32 = null;
+    var tries: u32 = 0;
+    while (tries < 100) : (tries += 1) {
+        if (app.windows.items.len > toplevels_before) {
+            for (app.windows.items) |w| {
+                const t = w.title orelse continue;
+                if (std.mem.eql(u8, t, "Filter Lists")) mgr_id = w.id;
+            }
+            if (mgr_id != null) break;
+        }
+        pumpFor(app, 100);
+    }
+    const mid = mgr_id orelse return "the palette's Filter Lists row did not open the Filter Lists window";
+    _ = app.waitIdle(300, 5_000);
+    app.focusWindow(mid) catch return "activating the Filter Lists window failed";
+    _ = app.waitIdle(300, 5_000);
+    const url = "http://127.0.0.1:9/e2e-filter-list.txt";
+    app.typeText(mid, url) catch return "typing the list url failed";
+    _ = app.waitIdle(200, 3_000);
+    app.pressKey(mid, "Return") catch return "pressing Return in the Filter Lists entry failed";
+
+    var pbuf: [512:0]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&pbuf, "{s}/sketerm/config.conf", .{rt}) catch return "config path";
+    var found = false;
+    tries = 0;
+    while (tries < 60 and !found) : (tries += 1) {
+        pumpFor(app, 100);
+        const f = c.fopen(path.ptr, "rb") orelse continue;
+        defer _ = c.fclose(f);
+        var buf: [65536]u8 = undefined;
+        const n = c.fread(&buf, 1, buf.len, f);
+        if (std.mem.indexOf(u8, buf[0..n], "filter_list = " ++ url) != null) found = true;
+    }
+    app.closeWindow(mid) catch {};
+    _ = waitToplevelGone(app, mid, 5_000);
+    if (!found) return "the url typed into the Filter Lists manager never became a filter_list line in config.conf";
+
+    // The other two verbs, through `window.dispatchAction` — the path the
+    // window menu's Browser rows and the pane menu's rows take.
+    const Verb = struct { data: []const u8, title: []const u8 };
+    for ([_]Verb{
+        .{ .data = "web_extensions", .title = "Browser Extensions" },
+        .{ .data = "web_userscripts", .title = "Userscripts" },
+    }) |verb| {
+        var req_buf: [128]u8 = undefined;
+        const req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"action\",\"data\":\"{s}\"}}\n", .{verb.data}) catch return "fmt";
+        const r = roundtrip(allocator, sock_path, req) orelse return "manager action roundtrip failed";
+        allocator.free(r);
+        var got: ?u32 = null;
+        tries = 0;
+        while (tries < 100 and got == null) : (tries += 1) {
+            pumpFor(app, 100);
+            for (app.windows.items) |w| {
+                const t = w.title orelse continue;
+                if (std.mem.eql(u8, t, verb.title)) got = w.id;
+            }
+        }
+        const gid = got orelse return "a browser-manager verb did not open its window";
+        app.closeWindow(gid) catch {};
+        _ = waitToplevelGone(app, gid, 5_000);
+    }
+    return null;
 }
 
 fn waitToplevelGone(app: *appdrive.App, id: u32, ms: u32) bool {
