@@ -376,6 +376,74 @@ fn r(tmpl: []const u8, facts: Facts) []const u8 {
     return render(&S.buf, tmpl, facts);
 }
 
+/// The window title when no `window_title_template` is set:
+/// `base | tab | pane`, leaving out a part that is empty or repeats an
+/// earlier one, so a pane whose title the tab already shows is not
+/// listed twice.
+///
+/// Truncates to `out` on a UTF-8 boundary rather than failing.
+pub fn composeWindowTitle(out: []u8, base: []const u8, tab: []const u8, pane: []const u8) []const u8 {
+    const parts = [_][]const u8{ base, tab, pane };
+    var kept: [parts.len][]const u8 = undefined;
+    var n: usize = 0;
+    outer: for (parts) |raw| {
+        const part = std.mem.trim(u8, raw, " \t");
+        if (part.len == 0) continue;
+        for (kept[0..n]) |k| {
+            if (std.mem.eql(u8, k, part)) continue :outer;
+        }
+        kept[n] = part;
+        n += 1;
+    }
+    var len: usize = 0;
+    for (kept[0..n], 0..) |part, i| {
+        if (i > 0 and !appendWhole(out, &len, " | ")) break;
+        if (!appendWhole(out, &len, part)) break;
+    }
+    return out[0..len];
+}
+
+/// Append `s`, or as much of it as fits cut back to a UTF-8 boundary.
+/// @return whether all of `s` fitted.
+fn appendWhole(out: []u8, len: *usize, s: []const u8) bool {
+    var take = @min(out.len - len.*, s.len);
+    if (take < s.len) {
+        while (take > 0 and (s[take] & 0xC0) == 0x80) take -= 1;
+    }
+    @memcpy(out[len.*..][0..take], s[0..take]);
+    len.* += take;
+    return take == s.len;
+}
+
+test "titlefmt: window title joins base, tab and pane" {
+    var buf: [MAX]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "sketerm | Cruiser @ archdev | vim notes.md",
+        composeWindowTitle(&buf, "sketerm", "Cruiser @ archdev", "vim notes.md"),
+    );
+}
+
+test "titlefmt: window title drops a pane title the tab already shows" {
+    var buf: [MAX]u8 = undefined;
+    try std.testing.expectEqualStrings("sketerm | htop", composeWindowTitle(&buf, "sketerm", "htop", "htop"));
+    try std.testing.expectEqualStrings("sketerm | htop", composeWindowTitle(&buf, "sketerm", " htop ", "htop"));
+}
+
+test "titlefmt: window title drops empty parts and repeats of the base" {
+    var buf: [MAX]u8 = undefined;
+    try std.testing.expectEqualStrings("sketerm", composeWindowTitle(&buf, "sketerm", "", ""));
+    try std.testing.expectEqualStrings("sketerm | zsh", composeWindowTitle(&buf, "sketerm", "", "zsh"));
+    try std.testing.expectEqualStrings("sketerm | Tab 1", composeWindowTitle(&buf, "sketerm", "Tab 1", "  "));
+    try std.testing.expectEqualStrings("sketerm", composeWindowTitle(&buf, "sketerm", "sketerm", "sketerm"));
+}
+
+test "titlefmt: window title truncates on a UTF-8 boundary" {
+    var buf: [12]u8 = undefined;
+    const got = composeWindowTitle(&buf, "sketerm", "\u{00e9}\u{00e9}\u{00e9}", "x");
+    try std.testing.expectEqualStrings("sketerm | \u{00e9}", got);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(got));
+}
+
 test "titlefmt: every placeholder resolves" {
     try t.expectEqualStrings("vim README.md", r("{{ TITLE }}", full));
     try t.expectEqualStrings("nvim", r("{{ PROGRAM }}", full));

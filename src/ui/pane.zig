@@ -1363,19 +1363,21 @@ pub const Pane = struct {
             self.panelFaceVisible() or self.webFaceVisible();
     }
 
-    /// Recompute the titlebar label from the precedence chain:
-    /// manual lock > visible face title > OSC title.
+    /// The pane's own title by the precedence chain manual lock >
+    /// visible face title > OSC title; null when it has none yet.
+    pub fn displayTitle(self: *Pane) ?[]const u8 {
+        if (!self.title_locked) {
+            if (self.face_title) |ft| {
+                if (self.faceCoversTerminal()) return ft;
+            }
+        }
+        return self.titlebar_text;
+    }
+
     fn refreshTitlebarLabel(self: *Pane) void {
         if (self.widgets_dead) return;
         const lbl = self.titlebar.label orelse return;
-        const text: []const u8 = pick: {
-            if (!self.title_locked) {
-                if (self.face_title) |ft| {
-                    if (self.faceCoversTerminal()) break :pick ft;
-                }
-            }
-            break :pick self.titlebar_text orelse "Terminal";
-        };
+        const text = self.displayTitle() orelse "Terminal";
         const z = self.allocator.allocSentinel(u8, text.len, 0) catch return;
         defer self.allocator.free(z);
         @memcpy(z, text);
@@ -1390,6 +1392,7 @@ pub const Pane = struct {
         self.title_locked = true;
         self.applyTitle(text);
         self.refreshTitlebarLabel();
+        self.notifyTitleFact();
     }
 
     /// Resume tracking incoming OSC 0/1/2 titles. The current label
@@ -1398,6 +1401,7 @@ pub const Pane = struct {
     pub fn unlockTitle(self: *Pane) void {
         self.title_locked = false;
         self.refreshTitlebarLabel();
+        self.notifyTitleFact();
     }
 
     /// Set the config-driven baseline for the per-pane title bar.

@@ -228,7 +228,7 @@ pub fn onTermCwdChanged(ctx: ?*anyopaque, pane: *Pane, cwd: []const u8) void {
         if (pane == self.focusedPane()) {
             const wm = titlefmt.uses(self.config.window_title_template);
             if (wm.contains(.absolute_path) or wm.contains(.relative_path))
-                refreshWindowTitleTemplate(self);
+                refreshWindowTitle(self);
         }
 
         // Abbreviate $HOME → ~ so the tooltip stays compact for the
@@ -330,17 +330,37 @@ pub fn refreshTabTitle(self: *Window, pane: *Pane) void {
     setTabPageTitleFromUtf8(self.allocator, page, rendered);
 }
 
-/// Re-render the window title from `window_title_template`, using the
-/// focused pane's facts. No-op when the key is unset, which is the
-/// default and keeps sketerm's historical fixed window title.
-pub fn refreshWindowTitleTemplate(self: *Window) void {
-    if (self.config.window_title_template.len == 0) return;
-    const pane = self.focusedPane() orelse return;
-    var rel_buf: [512]u8 = undefined;
+/// Re-render the window title. A `window_title_template` renders from
+/// the focused pane's facts; without one the title is
+/// `base | tab | pane` (`titlefmt.composeWindowTitle`) for the selected
+/// tab and its focused pane.
+pub fn refreshWindowTitle(self: *Window) void {
     var out: [titlefmt.MAX]u8 = undefined;
-    const facts = paneFacts(self, pane, &rel_buf);
-    const rendered = titlefmt.render(&out, self.config.window_title_template, facts);
-    self.setWindowTitleText(rendered);
+    if (self.config.window_title_template.len > 0) {
+        const pane = self.focusedPane() orelse return;
+        var rel_buf: [512]u8 = undefined;
+        const facts = paneFacts(self, pane, &rel_buf);
+        self.setWindowTitleText(titlefmt.render(&out, self.config.window_title_template, facts));
+        return;
+    }
+    const page = c.adw_tab_view_get_selected_page(self.tab_view);
+    const tab: []const u8 = if (page) |pg| std.mem.span(c.adw_tab_page_get_title(pg)) else "";
+    // Focus can briefly sit in another tab while a tab switch settles;
+    // the window's focus-widget notify refreshes again once it lands.
+    const pane_title: []const u8 = blk: {
+        const pane = self.focusedPane() orelse break :blk "";
+        if (page == null or tabPageForPane(self, pane) != page) break :blk "";
+        break :blk pane.displayTitle() orelse "";
+    };
+    self.setWindowTitleText(titlefmt.composeWindowTitle(&out, self.title_base, tab, pane_title));
+}
+
+/// Wired from `TabBar.on_title`: a tab label changed.
+pub fn onTabTitleChanged(ctx: ?*anyopaque, page: *c.AdwTabPage) void {
+    const self = cast.userData(Window, ctx);
+    if (self.config.window_title_template.len > 0) return;
+    if (c.adw_tab_view_get_selected_page(self.tab_view) != page) return;
+    refreshWindowTitle(self);
 }
 
 /// One fact moved for `pane`; refresh the titles that depend on it.
@@ -349,9 +369,12 @@ pub fn refreshWindowTitleTemplate(self: *Window) void {
 pub fn titleFactChanged(self: *Window, pane: *Pane, field: titlefmt.Field) void {
     if (titlefmt.uses(self.config.tab_title_template).contains(field))
         refreshTabTitle(self, pane);
-    if (pane == self.focusedPane() and
-        titlefmt.uses(self.config.window_title_template).contains(field))
-        refreshWindowTitleTemplate(self);
+    // Without a template the default title shows the pane's title.
+    const window_reads = if (self.config.window_title_template.len > 0)
+        titlefmt.uses(self.config.window_title_template).contains(field)
+    else
+        field == .title;
+    if (window_reads and pane == self.focusedPane()) refreshWindowTitle(self);
 }
 
 /// True when either configured template reads `field`.
@@ -365,7 +388,7 @@ pub fn titlefmtUses(self: *Window, field: titlefmt.Field) bool {
 /// reorder (which shifts `{{ INDEX }}`).
 pub fn refreshAllTitles(self: *Window) void {
     for (self.panes.items) |p| refreshTabTitle(self, p);
-    refreshWindowTitleTemplate(self);
+    refreshWindowTitle(self);
 }
 
 /// Wired from `Pane.sinks.on_title`. Updates the AdwTabPage's title from
@@ -597,9 +620,6 @@ pub fn onTermProgress(ctx: ?*anyopaque, pane: *Pane, state: u8, percent: u8) voi
 pub fn onPaneFocused(ctx: ?*anyopaque, pane: *Pane) void {
     const self = cast.userData(Window, ctx);
     @import("webface.zig").tabsChanged();
-    // The window title follows the FOCUSED pane, so moving focus is
-    // itself a fact change. Cheap: a no-op unless the key is set.
-    refreshWindowTitleTemplate(self);
     const page = tabPageForPane(self, pane) orelse return;
     if (Window.tabTreeOf(page)) |t| t.last_focused = pane;
     // The tree sidebar shows the FOCUSED pane's browser pages when that

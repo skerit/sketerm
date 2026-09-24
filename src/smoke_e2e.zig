@@ -1181,6 +1181,13 @@ pub fn main() u8 {
         teardown();
         return 0;
     }
+    if (c.getenv("SKETERM_SMOKE_E2E_WINDOW_TITLE_ONLY") != null) {
+        const app = drive orelse return fail("the window-title stage needs the display session driver");
+        if (windowTitleStage(allocator, app, sock_path)) |why| return failMsg(why);
+        say("window title: sketerm | tab | pane, with a repeated part shown once");
+        teardown();
+        return 0;
+    }
     if (c.getenv("SKETERM_SMOKE_E2E_BORDER_ONLY") != null) {
         const app = drive orelse return fail("the border stage needs the display session driver");
         const win = wsMainWindow(app) orelse return fail("border: no GUI window");
@@ -16567,6 +16574,57 @@ fn wsBorderSample(allocator: std.mem.Allocator, app: *appdrive.App, win: u32) ?B
 /// The focused pane's top border kept one shade in a fresh tab and
 /// another after any config reload (TERM-2). Both captures are of the
 /// same pane, focused, with nothing on screen changing but the reload.
+/// Poll until the GUI's main window carries exactly `want` as its title.
+fn waitMainTitle(app: *appdrive.App, want: []const u8, what: []const u8) ?[]const u8 {
+    var waited: u32 = 0;
+    var last: []const u8 = "";
+    while (waited < 10_000) : (waited += 100) {
+        pumpFor(app, 100);
+        const w = rigwin.mainWindow(app) orelse continue;
+        const t = w.title orelse continue;
+        if (std.mem.eql(u8, t, want)) return null;
+        last = t;
+    }
+    std.debug.print("smoke-e2e window-title: {s}: title is '{s}', want '{s}'\n", .{ what, last, want });
+    return what;
+}
+
+/// Set pane `pane`'s OSC 2 title and hold the shell in `sleep` so no
+/// prompt hook can retitle it afterwards.
+fn wtSetTitle(allocator: std.mem.Allocator, sock_path: [:0]const u8, pane: u32, title: []const u8) bool {
+    var buf: [192]u8 = undefined;
+    const req = std.fmt.bufPrint(&buf, "{{\"cmd\":\"send-text\",\"pane\":{d},\"data\":\"printf '\\\\033]2;{s}\\\\007'; sleep 300\\n\"}}\n", .{ pane, title }) catch return false;
+    const resp = roundtrip(allocator, sock_path, req) orelse return false;
+    defer allocator.free(resp);
+    return std.mem.indexOf(u8, resp, "\"ok\":true") != null;
+}
+
+/// The default window title is `sketerm | <tab> | <pane>`: one pane
+/// whose OSC title the tab also shows is listed once, and after a split
+/// retitles the tab, focusing the first pane shows both.
+fn windowTitleStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]const u8) ?[]const u8 {
+    if (!wtSetTitle(allocator, sock_path, 1, "e2e-wt-one")) return "send-text for pane 1's title failed";
+    if (waitMainTitle(app, "sketerm | e2e-wt-one", "a pane title equal to its tab title was not shown once")) |e| return e;
+
+    const split = roundtrip(allocator, sock_path, "{\"cmd\":\"split\",\"pane\":1,\"direction\":\"h\"}\n") orelse return "split roundtrip failed";
+    defer allocator.free(split);
+    if (std.mem.indexOf(u8, split, "\"ok\":true") == null) return "split was not ok";
+    if (!waitIdCount(allocator, sock_path, 3, false, 10_000)) return "the split did not add a pane";
+    const list = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse return "list roundtrip failed";
+    defer allocator.free(list);
+    const two = otherPaneInSelectedTab(list, 1);
+    if (two == 0) return "the split's new pane is not in the selected tab";
+
+    var buf: [64]u8 = undefined;
+    const focus_two = std.fmt.bufPrint(&buf, "{{\"cmd\":\"focus\",\"pane\":{d}}}\n", .{two}) catch return "fmt";
+    if (roundtrip(allocator, sock_path, focus_two)) |r| allocator.free(r) else return "focusing the new pane failed";
+    if (!wtSetTitle(allocator, sock_path, two, "e2e-wt-two")) return "send-text for the new pane's title failed";
+    if (waitMainTitle(app, "sketerm | e2e-wt-two", "the focused new pane's title did not replace the tab part")) |e| return e;
+
+    if (roundtrip(allocator, sock_path, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r) else return "focusing pane 1 failed";
+    return waitMainTitle(app, "sketerm | e2e-wt-two | e2e-wt-one", "focusing pane 1 did not show the tab and pane titles");
+}
+
 fn wsBorderReload(allocator: std.mem.Allocator, app: *appdrive.App, win: u32, sock_path: [:0]const u8) ?[]const u8 {
     const extra = wsNewTab(allocator, sock_path) orelse return "border: new-tab failed";
     defer _ = wsClosePane(allocator, sock_path, extra);

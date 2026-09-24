@@ -513,7 +513,7 @@ They are still accepted and ignored, so old files do not warn; use
 | Key | Type | Default | Notes |
 | --- | --- | --- | --- |
 | `tab_title_template` | string | `{{ TITLE }}` | Format of a tab label. The default is the OSC 0/2 title verbatim. |
-| `window_title_template` | string | *(empty)* | Format of the window title, from the FOCUSED pane. Empty leaves the window titled `sketerm` (or `Sketerm Files`), which is the historical behaviour. |
+| `window_title_template` | string | *(empty)* | Format of the window title, from the FOCUSED pane. Empty gives `sketerm \| <tab> \| <pane>` (or `Sketerm Files \| ...`): the selected tab's label, then the focused pane's own title, each left out when empty or when it repeats an earlier part. |
 
 Both are app-level, not per-profile: a tab strip mixing two title
 *formats* reads as a bug, and the window title has no profile to

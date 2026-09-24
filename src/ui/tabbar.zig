@@ -419,6 +419,10 @@ pub const TabBar = struct {
     /// is the clicked tab widget and `x`/`y` are click coords within it.
     context_ctx: ?*anyopaque = null,
     on_context: ?*const fn (ctx: ?*anyopaque, page: *c.AdwTabPage, anchor: *c.GtkWidget, x: f64, y: f64) void = null,
+    /// A page's title changed (after the tab label took it). The owning
+    /// Window re-renders its own title from the selected tab.
+    title_ctx: ?*anyopaque = null,
+    on_title: ?*const fn (ctx: ?*anyopaque, page: *c.AdwTabPage) void = null,
     /// Tree-style tabs: pages inside a collapsed subtree are hidden
     /// from the strip. The owning Window supplies the predicate; the
     /// strip stays tree-agnostic. Applied in `rebuild` and on demand
@@ -910,6 +914,8 @@ pub const TabBar = struct {
         self.on_transfer = null;
         self.context_ctx = null;
         self.on_context = null;
+        self.title_ctx = null;
+        self.on_title = null;
         self.hidden_ctx = null;
         self.is_hidden = null;
         self.config = &default_config;
@@ -1017,6 +1023,7 @@ fn onSelection(_: ?*anyopaque, _: ?*anyopaque, user: ?*anyopaque) callconv(.c) v
 fn onTitle(_: ?*anyopaque, _: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
     const t = cast.userData(TabBar.Tab, user);
     c.gtk_label_set_label(@ptrCast(t.label), c.adw_tab_page_get_title(t.page));
+    if (t.bar.on_title) |f| f(t.bar.title_ctx, t.page);
 }
 
 fn onIcon(_: ?*anyopaque, _: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {

@@ -519,6 +519,8 @@ pub fn onSelectedPageChanged(view: *c.AdwTabView, _: ?*anyopaque, user: ?*anyopa
             self.tabbar.ensureTick();
         }
     }
+    // The window title shows the selected tab's label.
+    @import("termsinks.zig").refreshWindowTitle(self);
     // Clear any needs-attention from the now-active tab.
     c.adw_tab_page_set_needs_attention(page, 0);
     // A finished-command dot is acknowledged by viewing the tab; a

@@ -714,6 +714,9 @@ pub const Window = struct {
         // Right-click-a-tab → context menu.
         self.tabbar.context_ctx = @ptrCast(self);
         self.tabbar.on_context = tabchrome_mod.onTabContextMenu;
+        // A relabelled selected tab re-renders the window title.
+        self.tabbar.title_ctx = @ptrCast(self);
+        self.tabbar.on_title = termsinks_mod.onTabTitleChanged;
         // Let the tab effects read this window's live config (gates,
         // thresholds). The Config value is embedded in Window, so its
         // address is stable across applyConfigChange.
@@ -814,6 +817,17 @@ pub const Window = struct {
             "notify::focus-widget",
             @ptrCast(&onWebextFocusChanged),
             null,
+            null,
+            c.G_CONNECT_DEFAULT,
+        );
+        // The window title names the focused pane. `notify::focus-widget`
+        // fires for every focus move, including ones the window is not
+        // active for (IPC and MCP focus), which a pane's focus-enter does not.
+        _ = c.g_signal_connect_data(
+            app_window,
+            "notify::focus-widget",
+            @ptrCast(&onFocusWidgetForTitle),
+            @ptrCast(self),
             null,
             c.G_CONNECT_DEFAULT,
         );
@@ -3121,19 +3135,10 @@ pub const Window = struct {
         self.refreshWindowTitle();
     }
 
-    /// Set the GTK window title based on current state — currently
-    /// just appends a broadcast indicator when groupsend != off.
-    /// Visible regardless of `show_titlebar` (per-pane bars), so
-    /// users always have a cue that typing is being multiplexed.
+    /// Re-render the window title; the broadcast suffix (visible
+    /// regardless of `show_titlebar`) is appended by setWindowTitleText.
     fn refreshWindowTitle(self: *Window) void {
-        // With a window_title_template set, the focused pane owns the
-        // title text; the broadcast suffix is appended to whatever it
-        // renders (setWindowTitleText).
-        if (self.config.window_title_template.len > 0) {
-            termsinks_mod.refreshWindowTitleTemplate(self);
-            return;
-        }
-        self.setWindowTitleText(self.title_base);
+        termsinks_mod.refreshWindowTitle(self);
     }
 
     /// Set the GTK window title to `base` plus the broadcast suffix.
@@ -3628,6 +3633,15 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
 
 fn onWebextFocusChanged(_: *c.GObject, _: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
     @import("webface.zig").tabsChanged();
+}
+
+/// Like the window's other `self`-carrying handlers this relies on the
+/// GtkWindow dying before the Window is freed; `destroying` covers the
+/// focus moves pane teardown itself causes.
+fn onFocusWidgetForTitle(_: *c.GObject, _: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+    const self = cast.userData(Window, user);
+    if (self.destroying) return;
+    termsinks_mod.refreshWindowTitle(self);
 }
 
 /// Run `action` against the focused pane (the palette, the window
