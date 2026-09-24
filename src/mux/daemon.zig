@@ -986,23 +986,28 @@ pub const Channel = struct {
     }
 };
 
-/// Per-channel state of the sketerm-native app pipe: the session's
-/// app connects straight to the daemon. Owns the protocol tracker
-/// and the mmapped shm pool mirrors.
-/// Brackets CPU reads, accepting ENOTTY from coherent memfd exporters.
-fn dmabufSync(fd: c_int, end: bool) bool {
-    const DmaBufSync = extern struct { flags: u64 };
+/// What DMA_BUF_IOCTL_SYNC says about a descriptor an app handed over
+/// as a dma-buf plane. `not_dmabuf` (ENOTTY) is a memfd, shm or plain
+/// file posing as one: readable with pread but NEVER mappable, since
+/// the app can ftruncate it and a shared mapping would SIGBUS the
+/// daemon. A real dma-buf has an immutable size, so mapping it is safe.
+pub const DmabufSync = enum { synced, not_dmabuf, failed };
+
+/// Brackets CPU reads of a real dma-buf; classifies anything else.
+pub fn dmabufSync(fd: c_int, end: bool) DmabufSync {
+    const Req = extern struct { flags: u64 };
     const DMA_BUF_SYNC_READ: u64 = 1;
     const DMA_BUF_SYNC_END: u64 = 1 << 2;
-    var s = DmaBufSync{ .flags = DMA_BUF_SYNC_READ | (if (end) DMA_BUF_SYNC_END else 0) };
+    var s = Req{ .flags = DMA_BUF_SYNC_READ | (if (end) DMA_BUF_SYNC_END else 0) };
     var retries: u8 = 0;
     while (retries < 64) : (retries += 1) {
         const result = c.ioctl(fd, 0x40086200, &s); // DMA_BUF_IOCTL_SYNC = _IOW('b', 0, u64)
-        if (result == 0 or std.posix.errno(result) == .NOTTY) return true;
+        if (result == 0) return .synced;
         const errno = std.posix.errno(result);
-        if (errno != .INTR and errno != .AGAIN) return false;
+        if (errno == .NOTTY) return .not_dmabuf;
+        if (errno != .INTR and errno != .AGAIN) return .failed;
     }
-    return false;
+    return .failed;
 }
 
 /// Copies padded dma-buf storage into a tight top-down staging image.
@@ -1022,6 +1027,78 @@ fn copyDmabufRows(dst: []u8, src: []const u8, width: u32, height: u32, offset: u
         @memcpy(dst[dst_row * row_bytes ..][0..row_bytes], src[src_start..src_end]);
     }
     return true;
+}
+
+/// The pread twin of `copyDmabufRows` for a file-backed LINEAR source:
+/// the daemon never maps the app's object, so a shrunk one costs a
+/// short read here instead of a SIGBUS.
+fn preadDmabufRows(fd: c_int, dst: []u8, width: u32, height: u32, offset: u32, stride: u32, y_invert: bool) error{ BufferShrunk, ReadFailed, BadGeometry }!void {
+    const row_bytes = std.math.mul(usize, width, 4) catch return error.BadGeometry;
+    const staging_size = std.math.mul(usize, row_bytes, height) catch return error.BadGeometry;
+    if (dst.len != staging_size or stride < row_bytes) return error.BadGeometry;
+    for (0..height) |dst_row| {
+        const src_row = if (y_invert) height - 1 - dst_row else dst_row;
+        const src_start = std.math.add(usize, offset, std.math.mul(usize, src_row, stride) catch return error.BadGeometry) catch return error.BadGeometry;
+        const row = dst[dst_row * row_bytes ..][0..row_bytes];
+        var done: usize = 0;
+        while (done < row_bytes) {
+            const n = c.pread(fd, row.ptr + done, row_bytes - done, @intCast(src_start + done));
+            if (n == 0) return error.BufferShrunk;
+            if (n < 0) {
+                if (std.posix.errno(n) == .INTR) continue;
+                return error.ReadFailed;
+            }
+            done += @intCast(n);
+        }
+    }
+}
+
+test "a file-backed LINEAR dmabuf is read, never mapped, and a shrunk one fails the capture" {
+    const t = std.testing;
+    // 2x2 XRGB rows of 8 bytes at stride 12 behind a 4-byte offset.
+    const source = [_]u8{
+        0xa0, 0xa1, 0xa2, 0xa3,
+        0x11, 0x12, 0x13, 0xff,
+        0x21, 0x22, 0x23, 0xff,
+        0xb0, 0xb1, 0xb2, 0xb3,
+        0x31, 0x32, 0x33, 0xff,
+        0x41, 0x42, 0x43, 0xff,
+        0xc0, 0xc1, 0xc2, 0xc3,
+    };
+    const fd = platform.anonFileFd(source.len);
+    try t.expect(fd >= 0);
+    try t.expectEqual(@as(isize, source.len), c.pwrite(fd, &source, source.len, 0));
+    // A memfd is exactly the object the classification must keep off
+    // the mmap path; an unstattable descriptor fails closed.
+    try t.expectEqual(DmabufSync.not_dmabuf, dmabufSync(fd, false));
+    try t.expectEqual(DmabufSync.failed, dmabufSync(-1, false));
+
+    var mirror = Native.DmabufMirror{
+        .allocator = t.allocator,
+        .source_fds = .{ fd, -1, -1, -1 },
+        .linear_file = true,
+        .staging = try t.allocator.alloc(u8, 16),
+        .width = 2,
+        .height = 2,
+        .offset = 4,
+        .stride = 12,
+        .flags = 0,
+    };
+    defer mirror.deinit();
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(t.allocator);
+    try mirror.capture(&scratch);
+    try t.expectEqualSlices(u8, &.{
+        0x11, 0x12, 0x13, 0xff, 0x21, 0x22, 0x23, 0xff,
+        0x31, 0x32, 0x33, 0xff, 0x41, 0x42, 0x43, 0xff,
+    }, mirror.staging);
+
+    // The app truncates its object under a committed buffer: with a
+    // shared mapping this was the SIGBUS that killed every session.
+    try t.expect(c.ftruncate(fd, 8) == 0);
+    try t.expectError(error.BufferShrunk, mirror.capture(&scratch));
+    // The last good pixels are retained for the caller to decide about.
+    try t.expectEqual(@as(u8, 0x11), mirror.staging[0]);
 }
 
 test "dmabuf staging copy removes padding and honors Y_INVERT" {
@@ -1603,6 +1680,9 @@ test "web_helper_connect: bridges a helper serving beside the daemon socket, des
     }
 }
 
+/// Per-channel state of the sketerm-native app pipe: the session's
+/// app connects straight to the daemon. Owns the protocol tracker
+/// and the daemon-owned shm pool mirrors.
 pub const Native = struct {
     allocator: std.mem.Allocator,
     tracker: wltrack.Tracker,
@@ -1779,10 +1859,17 @@ pub const Native = struct {
         }
     };
 
+    /// One imported wl_buffer's pixel source plus the tight BGRA copy
+    /// taken at every commit. Exactly one of three sources: a mapped
+    /// REAL dma-buf (`linear`, size immutable so the mapping cannot
+    /// fault), a file-backed LINEAR object the app can still truncate
+    /// (`linear_file`, read with pread and never mapped, like a wl_shm
+    /// pool), or an EGL import (`imported`).
     pub const DmabufMirror = struct {
         allocator: std.mem.Allocator,
         source_fds: [dmabuf.MAX_PLANES]c_int,
         linear: ?LinearMap = null,
+        linear_file: bool = false,
         imported: ?dmabuf_egl.Buffer = null,
         staging: []u8,
         width: u32,
@@ -1806,12 +1893,16 @@ pub const Native = struct {
             self.allocator.free(self.staging);
         }
 
+        /// Refresh `staging` from the source. `error.BufferShrunk` is the
+        /// app truncating a file-backed object under a committed buffer:
+        /// its protocol violation, and the caller ends its connection.
         pub fn capture(self: *DmabufMirror, scratch: *std.ArrayList(u8)) !void {
+            const y_invert = self.flags & dmabuf.FLAG_Y_INVERT != 0;
             if (self.linear) |mapping| {
                 const fd = self.source_fds[0];
                 if (fd < 0) return error.MissingFd;
                 try scratch.resize(self.allocator, self.staging.len);
-                if (!dmabufSync(fd, false)) return error.SyncFailed;
+                if (dmabufSync(fd, false) != .synced) return error.SyncFailed;
                 const copied = copyDmabufRows(
                     scratch.items,
                     mapping.ptr[0..mapping.size],
@@ -1819,10 +1910,21 @@ pub const Native = struct {
                     self.height,
                     self.offset,
                     self.stride,
-                    self.flags & dmabuf.FLAG_Y_INVERT != 0,
+                    y_invert,
                 );
-                if (!dmabufSync(fd, true)) return error.SyncFailed;
+                if (dmabufSync(fd, true) != .synced) return error.SyncFailed;
                 if (!copied) return error.CaptureFailed;
+                @memcpy(self.staging, scratch.items);
+                return;
+            }
+            if (self.linear_file) {
+                const fd = self.source_fds[0];
+                if (fd < 0) return error.MissingFd;
+                try scratch.resize(self.allocator, self.staging.len);
+                preadDmabufRows(fd, scratch.items, self.width, self.height, self.offset, self.stride, y_invert) catch |err| switch (err) {
+                    error.BufferShrunk => return error.BufferShrunk,
+                    error.ReadFailed, error.BadGeometry => return error.CaptureFailed,
+                };
                 @memcpy(self.staging, scratch.items);
                 return;
             }

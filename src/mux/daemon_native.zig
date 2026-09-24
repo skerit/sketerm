@@ -489,14 +489,27 @@ pub fn nativeAction(self: *Daemon, nv: *Native, units: *std.ArrayList(u8), msgb:
 
             if (dc.info.plane.modifier == dmabuf.DRM_FORMAT_MOD_LINEAR) {
                 if (source_size != null) {
-                    const map_size: usize = @intCast(dc.info.required_size);
-                    const ptr = c.mmap(null, map_size, c.PROT_READ, c.MAP_SHARED, mirror.source_fds[0], 0);
-                    if (ptr != null and ptr != c.MAP_FAILED)
-                        mirror.linear = .{ .ptr = @ptrCast(ptr.?), .size = map_size };
+                    // Only a REAL dma-buf is mapped: its size is immutable,
+                    // so the mapping cannot fault. Anything else that
+                    // answers ENOTTY (a memfd, shm, a plain file) is a
+                    // wl_shm pool in disguise -- the app can ftruncate it
+                    // and a shared mapping would SIGBUS the daemon -- so
+                    // it is read with pread at each commit instead.
+                    switch (dmod.dmabufSync(mirror.source_fds[0], false)) {
+                        .synced => {
+                            _ = dmod.dmabufSync(mirror.source_fds[0], true);
+                            const map_size: usize = @intCast(dc.info.required_size);
+                            const ptr = c.mmap(null, map_size, c.PROT_READ, c.MAP_SHARED, mirror.source_fds[0], 0);
+                            if (ptr != null and ptr != c.MAP_FAILED)
+                                mirror.linear = .{ .ptr = @ptrCast(ptr.?), .size = map_size };
+                        },
+                        .not_dmabuf => mirror.linear_file = true,
+                        .failed => {},
+                    }
                 }
             }
 
-            if (mirror.linear == null) {
+            if (mirror.linear == null and !mirror.linear_file) {
                 const importer = nv.dmabuf_importer orelse {
                     try queueProtocolError(nv, dc.params, 7, "dma-buf import failed");
                     return error.CloseAfterFlush;
@@ -522,6 +535,8 @@ pub fn nativeAction(self: *Daemon, nv: *Native, units: *std.ArrayList(u8), msgb:
                     return error.CloseAfterFlush;
                 };
                 log.debug("dmabuf buffer {d}: EGL modifier import active (modifier=0x{x})", .{ dc.id, dc.info.plane.modifier });
+            } else if (mirror.linear_file) {
+                log.debug("dmabuf buffer {d}: LINEAR file-backed source, read per commit", .{dc.id});
             } else {
                 log.debug("dmabuf buffer {d}: LINEAR mmap active", .{dc.id});
             }
@@ -652,11 +667,23 @@ pub fn nativeAction(self: *Daemon, nv: *Native, units: *std.ArrayList(u8), msgb:
             var dmabuf_mirror: ?*Native.DmabufMirror = null;
             if (cm.info.dmabuf) {
                 const mirror = nv.dmabufs.getPtr(cm.buffer) orelse return error.NoSuchBuffer;
-                mirror.capture(&nv.dmabuf_scratch) catch |err| {
+                mirror.capture(&nv.dmabuf_scratch) catch |err| switch (err) {
+                    error.BufferShrunk => {
+                        // The client shrank the file-backed object under
+                        // a buffer it just committed: the shm rule, the
+                        // same verdict (with a shared mapping this was the
+                        // SIGBUS that took every session on the host).
+                        log.warn("dmabuf buffer {d}: storage shrank under a committed buffer (session '{s}')", .{
+                            cm.buffer,
+                            if (nv.chan) |chan| (if (chan.session) |s| s.name else "?") else "?",
+                        });
+                        try queueProtocolError(nv, cm.buffer, 0, "dma-buf storage shrank under a committed buffer");
+                        return error.CloseAfterFlush;
+                    },
                     // A successfully-created wl_buffer must not become a
                     // protocol error after a later import/readback failure.
                     // Keep its last capture and still commit/release it.
-                    log.warn("dmabuf buffer {d}: capture failed ({s}); retaining previous pixels", .{ cm.buffer, @errorName(err) });
+                    else => log.warn("dmabuf buffer {d}: capture failed ({s}); retaining previous pixels", .{ cm.buffer, @errorName(err) }),
                 };
                 dmabuf_mirror = mirror;
             }
