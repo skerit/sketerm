@@ -32,7 +32,10 @@ const dirWithin = @import("../../filebrowser/paths.zig").dirWithin;
 const uniqueName = @import("../../filebrowser/paths.zig").uniqueName;
 const urlUnescape = @import("../../filebrowser/paths.zig").urlUnescape;
 const cast = @import("../../util/cast.zig");
+const batchrename = @import("../../filebrowser/batchrename.zig");
 const shellverb = @import("../../filebrowser/shellverb.zig");
+const errorPhrase = @import("../../filebrowser/format.zig").errorPhrase;
+const RenameRun = @import("types.zig").RenameRun;
 
 /// One in-flight .trashinfo fetch for Restore from Trash.
 pub const RestoreRead = struct {
@@ -1773,27 +1776,6 @@ pub fn setTags(self: *BrowserView, hc: *HostConn, path: []const u8, tags: []cons
     self.sendOp(hc, .{ .req = self.nextReq(), .op = "tag_set", .path = path, .to = tags });
 }
 
-/// Replace every occurrence of `find_txt` in each selected entry's
-/// basename. Deepest first: renaming a selected parent before its
-/// selected child would leave the child's queued path pointing at a
-/// directory that moved. Refused with a status line against a daemon
-/// without safe no-replace renames or for an unusable pattern.
-pub fn batchRenameSelected(self: *BrowserView, tab: *BTab, find_txt: []const u8, repl_txt: []const u8) void {
-    if (!tab.hc.io().caps.copy_no_replace) {
-        self.setStatusFmt("batch rename not started: {s} lacks safe no-replace support", .{tab.hc.label()});
-        return;
-    }
-    if (find_txt.len == 0 or std.mem.indexOfScalar(u8, repl_txt, '/') != null) {
-        self.setStatus("batch rename: bad pattern");
-        return;
-    }
-    var renamed: usize = 0;
-    // The path mirror IS the selection (synced from the model on
-    // every change), so the batch reads it directly.
-    const order = oproots.deepestFirst(self.allocator, tab.selected.items) catch {
-        self.setStatus("batch rename not started: out of memory");
-        return;
-    };
 /// Ask the host's daemon which tags are in use (its tag index). The
 /// answer lands in `hc.known_tags`; a daemon without the verb answers
 /// an error and the cache simply stays empty.
@@ -1816,32 +1798,193 @@ pub fn storeKnownTags(self: *BrowserView, hc: *HostConn, rep: WireReply) void {
     hc.known_tags = owned;
 }
 
-    defer self.allocator.free(order);
-    for (order) |sel_index| {
-        const sel_path = tab.selected.items[sel_index];
-        const base = std.fs.path.basename(sel_path);
-        const parent = std.fs.path.dirname(sel_path) orelse continue;
-        // Replace ALL occurrences of `find` in the basename.
-        var nb: [1024]u8 = undefined;
-        var w = std.Io.Writer.fixed(&nb);
-        var rest = base;
-        var changed = false;
-        while (std.mem.indexOf(u8, rest, find_txt)) |i| {
-            w.writeAll(rest[0..i]) catch break;
-            w.writeAll(repl_txt) catch break;
-            rest = rest[i + find_txt.len ..];
-            changed = true;
-        }
-        w.writeAll(rest) catch continue;
-        if (!changed or w.buffered().len == 0) continue;
-        var full: [4096]u8 = undefined;
-        const to = std.fmt.bufPrint(&full, "{s}/{s}", .{
-            if (parent.len == 1) "" else parent, w.buffered(),
-        }) catch continue;
-        if (self.sendOpOk(tab.hc, .{ .req = self.nextReq(), .op = "rename", .path = sel_path, .to = to, .no_replace = true }))
-            renamed += 1;
+/// Replace every occurrence of `find_txt` in each selected entry's
+/// basename, as planned by `filebrowser/batchrename.zig` (deepest
+/// first; a plan that collides or empties a name is refused before
+/// anything is sent). The count and the ONE undo record come from the
+/// replies (`noteRenameRunReply`), never from what was sent.
+pub fn batchRenameSelected(self: *BrowserView, tab: *BTab, find_txt: []const u8, repl_txt: []const u8) void {
+    if (!tab.hc.io().caps.copy_no_replace) {
+        self.setStatusFmt("batch rename not started: {s} lacks safe no-replace support", .{tab.hc.label()});
+        return;
     }
-    self.setStatusFmt("batch rename: {d} rename(s) sent", .{renamed});
+    var plan = batchrename.plan(self.allocator, tab.selected.items, find_txt, repl_txt) catch {
+        self.setStatus("batch rename not started: out of memory");
+        return;
+    };
+    defer plan.deinit(self.allocator);
+    if (!plan.ok()) {
+        var buf: [512]u8 = undefined;
+        self.setStatusFmt("batch rename not started: {s}", .{batchrename.describe(&plan, &buf)});
+        return;
+    }
+    const run = self.allocator.create(RenameRun) catch return;
+    run.* = .{ .hc = tab.hc };
+    for (plan.items) |it| {
+        if (!addRenameToRun(self, run, it.from, it.to)) break;
+    }
+    finishRunStart(self, run, "batch rename");
+}
+
+/// Queue one no-replace rename on `run`. False when the op could not
+/// be sent (the run keeps what it already has).
+fn addRenameToRun(self: *BrowserView, run: *RenameRun, from: []const u8, to: []const u8) bool {
+    const f = self.allocator.dupe(u8, from) catch return false;
+    const t2 = self.allocator.dupe(u8, to) catch {
+        self.allocator.free(f);
+        return false;
+    };
+    const req = self.nextReq();
+    run.pairs.append(self.allocator, .{ f, t2 }) catch {
+        self.allocator.free(f);
+        self.allocator.free(t2);
+        return false;
+    };
+    run.reqs.append(self.allocator, req) catch {
+        _ = run.pairs.pop();
+        self.allocator.free(f);
+        self.allocator.free(t2);
+        return false;
+    };
+    run.outcome.append(self.allocator, 0) catch {
+        _ = run.reqs.pop();
+        _ = run.pairs.pop();
+        self.allocator.free(f);
+        self.allocator.free(t2);
+        return false;
+    };
+    if (!self.sendOpOk(run.hc, .{ .req = req, .op = "rename", .path = from, .to = to, .no_replace = true })) {
+        run.outcome.items[run.outcome.items.len - 1] = 2;
+        return false;
+    }
+    return true;
+}
+
+fn finishRunStart(self: *BrowserView, run: *RenameRun, what: []const u8) void {
+    run.select_batch = @intFromPtr(run);
+    if (run.waiting() == 0) {
+        completeRenameRun(self, run);
+        return;
+    }
+    self.rename_runs.append(self.allocator, run) catch {
+        // No tracking means no undo record: say so rather than guess.
+        self.setStatusFmt("{s}: {d} rename(s) sent, outcome untracked", .{ what, run.waiting() });
+        if (run.history_op) |op| {
+            run.history_op = null;
+            self.restoreHistory(op, run.history_direction);
+        }
+        run.destroy(self.allocator);
+        return;
+    };
+    self.setStatusFmt("{s}: renaming {d} entr{s}\u{2026}", .{ what, run.waiting(), if (run.waiting() == 1) "y" else "ies" });
+}
+
+/// A reply for one of a run's renames. True when `req` belonged to a
+/// run (consumed).
+pub fn noteRenameRunReply(self: *BrowserView, req: u32, ok: bool, err: []const u8) bool {
+    for (self.rename_runs.items, 0..) |run, ri| {
+        for (run.reqs.items, 0..) |r, i| {
+            if (r != req or run.outcome.items[i] != 0) continue;
+            run.outcome.items[i] = if (ok) 1 else 2;
+            if (ok) {
+                self.queueSelectOnHost(run.hc, run.pairs.items[i][1], run.select_batch);
+            } else if (run.first_error == null) {
+                run.first_error = self.allocator.dupe(u8, err) catch null;
+            }
+            if (run.waiting() == 0) {
+                _ = self.rename_runs.orderedRemove(ri);
+                completeRenameRun(self, run);
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+/// The host of a run went away: its unanswered renames have an
+/// unknown outcome, so the run settles on what it knows.
+pub fn abandonRenameRuns(self: *BrowserView, hc: *HostConn) void {
+    var i: usize = 0;
+    while (i < self.rename_runs.items.len) {
+        const run = self.rename_runs.items[i];
+        if (run.hc != hc) {
+            i += 1;
+            continue;
+        }
+        _ = self.rename_runs.orderedRemove(i);
+        for (run.outcome.items) |*o| {
+            if (o.* == 0) o.* = 2;
+        }
+        if (run.first_error == null) run.first_error = self.allocator.dupe(u8, "connection lost") catch null;
+        completeRenameRun(self, run);
+    }
+}
+
+/// Every reply is in: report the real count and record the undo (a
+/// forward batch) or settle the history step (an undo/redo replay).
+fn completeRenameRun(self: *BrowserView, run: *RenameRun) void {
+    defer run.destroy(self.allocator);
+    const landed = run.landed();
+    const total = run.outcome.items.len;
+    const err = run.first_error orelse "not sent";
+    if (run.history_op) |op| {
+        run.history_op = null;
+        const direction = run.history_direction;
+        if (landed == total) {
+            self.finishHistory(op, direction);
+        } else {
+            // Partial: what landed stays landed; the record goes back
+            // so the rest can be retried.
+            self.restoreHistory(op, direction);
+            self.setStatusFmt("{s} batch rename: {d} of {d} renamed; {s}", .{ @tagName(direction), landed, total, errorPhrase(err) });
+        }
+        return;
+    }
+    if (landed > 0) {
+        if (self.allocator.alloc([2][]const u8, landed)) |ps| {
+            defer self.allocator.free(ps);
+            var n: usize = 0;
+            for (run.pairs.items, run.outcome.items) |pair, o| {
+                if (o != 1) continue;
+                ps[n] = .{ pair[0], pair[1] };
+                n += 1;
+            }
+            if (batchrename.encodePairs(self.allocator, ps)) |enc| {
+                defer self.allocator.free(enc.current);
+                defer self.allocator.free(enc.original);
+                if (self.makeUndo(run.hc.host, .rename_batch, enc.current, enc.original, "")) |op| self.pushUndo(op);
+            } else |_| {}
+        } else |_| {}
+    }
+    // The status line alone is not enough: the renames' own listing
+    // deltas repaint it with the folder's item count in the same drain.
+    // The count is the answer to the verb, so it is also a toast.
+    var buf: [256]u8 = undefined;
+    const msg = if (landed == total)
+        std.fmt.bufPrint(&buf, "batch rename: {d} renamed", .{landed}) catch "batch rename done"
+    else
+        std.fmt.bufPrint(&buf, "batch rename: {d} of {d} renamed; {s}", .{ landed, total, errorPhrase(err) }) catch "batch rename incomplete";
+    self.setStatus(msg);
+    if (!self.widgets_dead) {
+        if (self.ownerWindow()) |window| @import("../window.zig").showToast(window, msg);
+    }
+}
+
+/// Undo (reverse order, current -> original) or redo (execution
+/// order, original -> current) a whole `rename_batch` record.
+fn replayRenameBatch(self: *BrowserView, hc: *HostConn, op: *UndoOp, direction: HistoryDirection) void {
+    const run = self.allocator.create(RenameRun) catch return self.restoreHistory(op, direction);
+    run.* = .{ .hc = hc, .history_op = op, .history_direction = direction };
+    const n = batchrename.count(op.a);
+    var k: usize = 0;
+    while (k < n) : (k += 1) {
+        const i = if (direction == .undo) n - 1 - k else k;
+        const cur = batchrename.nth(op.a, i) orelse continue;
+        const orig = batchrename.nth(op.b, i) orelse continue;
+        const sent = if (direction == .undo) addRenameToRun(self, run, cur, orig) else addRenameToRun(self, run, orig, cur);
+        if (!sent) break;
+    }
+    finishRunStart(self, run, if (direction == .undo) "undo batch rename" else "redo batch rename");
 }
 
 /// Send the rename wire op for `old` → same directory, `name`; with
@@ -2319,6 +2462,13 @@ pub fn beginHistory(self: *BrowserView, direction: HistoryDirection) void {
             const req = self.nextReq();
             if (!self.deferHistory(req, hc, op, direction)) return;
             self.sendOp(hc, .{ .req = req, .op = if (direction == .undo) "delete" else "mkdir", .path = op.a });
+        },
+        .rename_batch => {
+            if (!hc.io().caps.copy_no_replace) {
+                self.setStatusFmt("history operation retained: {s} lacks safe no-replace support", .{hc.label()});
+                return self.restoreHistory(op, direction);
+            }
+            replayRenameBatch(self, hc, op, direction);
         },
         .link_created => {
             // Undo unlinks the link (never its target); redo recreates

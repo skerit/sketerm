@@ -717,6 +717,7 @@ pub fn hostDied(self: *BrowserView, hc: *HostConn) void {
         _ = self.retry_pending.orderedRemove(i);
         retry.destroy(self.allocator);
     }
+    @import("ops.zig").abandonRenameRuns(self, hc);
     i = 0;
     while (i < self.pending_history.items.len) {
         const ph = self.pending_history.items[i];
@@ -1706,6 +1707,8 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
         }
         return false;
     }
+    // One rename of a batch (or of its undo/redo)?
+    if (@import("ops.zig").noteRenameRunReply(self, rep.req, rep.ok, rep.@"error")) return false;
     // Undo record for a plain op (rename/mkdir/move)?
     for (self.pending_undo.items, 0..) |pu, i| {
         if (pu.req != rep.req) continue;
@@ -1719,7 +1722,7 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
                     if (self.hostConnFor(if (pu.op.host) |h| @as(?[]const u8, h) else null)) |op_hc|
                         self.queueSelectOnHost(op_hc, pu.op.a, rep.req);
                 },
-                .trash_restore => {},
+                .trash_restore, .rename_batch => {},
             }
             self.pushUndo(pu.op);
         } else if (std.mem.eql(u8, rep.@"error", "XDEV") and pu.op.kind == .rename_back) {

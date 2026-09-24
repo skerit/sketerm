@@ -811,9 +811,15 @@ fn chordTransfers(self: *BrowserView) bool {
     return true;
 }
 
-/// F2: inline-rename the focused row, else a single selected entry.
+/// F2: inline-rename the focused row, else a single selected entry;
+/// over a multi-row selection, Batch Rename (as Nautilus and Dolphin
+/// do).
 fn chordRename(self: *BrowserView) bool {
     const tab = self.currentTab() orelse return false;
+    if (tab.selected.items.len > 1) {
+        @import("prompts.zig").openBatchRename(self, tab);
+        return true;
+    }
     var target: ?[]const u8 = null;
     if (colview.focusedItem(tab)) |p| {
         if (p.data.kind == .entry) target = p.data.path;

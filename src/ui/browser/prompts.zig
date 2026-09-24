@@ -8,6 +8,7 @@
 //! chord, a menu row or a test without a popover in the way.
 
 const std = @import("std");
+const batchrename = @import("../../filebrowser/batchrename.zig");
 const c = @import("../../c.zig").c;
 
 const BTab = @import("types.zig").BTab;
@@ -98,7 +99,6 @@ pub fn onMenuTags(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     c.gtk_entry_set_placeholder_text(@ptrCast(entry), "comma,separated,tags (empty clears)");
     const cur = ops.findEntryTags(ctx.tab, path);
     if (cur.len > 0) presetEntry(entry, cur, false);
-    const tctx = self.allocator.create(MenuCtx) catch return menuDone(ctx);
     // What is already in use on this host (its daemon's tag index),
     // and how to find it: `#tag` in the search bar.
     ops.refreshKnownTags(self, ctx.tab.hc);
@@ -113,6 +113,7 @@ pub fn onMenuTags(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     c.gtk_label_set_max_width_chars(@ptrCast(hint), 48);
     c.gtk_widget_add_css_class(hint, "dim-label");
     c.gtk_box_append(@ptrCast(box), hint);
+    const tctx = self.allocator.create(MenuCtx) catch return menuDone(ctx);
     tctx.* = .{
         .allocator = self.allocator,
         .view = self,
@@ -138,19 +139,38 @@ pub fn onTagsActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
 
 pub fn onMenuBatchRename(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const ctx = cast.userData(MenuCtx, user);
-    const self = ctx.view;
-    const tab = ctx.tab;
+    openBatchRename(ctx.view, ctx.tab);
+    menuDone(ctx);
+}
+
+/// The Batch Rename prompt over `tab`'s selection: find/replace
+/// entries, a live preview of the plan, Apply armed only for a plan
+/// that can run. Reached from the entry menu and from F2 on a
+/// multi-row selection.
+pub fn openBatchRename(self: *BrowserView, tab: *BTab) void {
     const popover = c.gtk_popover_new();
     const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 4);
     const find_e = c.gtk_entry_new();
     c.gtk_entry_set_placeholder_text(@ptrCast(find_e), "find (substring)");
     const repl_e = c.gtk_entry_new();
     c.gtk_entry_set_placeholder_text(@ptrCast(repl_e), "replace with");
+    // The plan, spelled out before anything is sent: how many change,
+    // the first change, and what refuses it (a collision, a slash).
+    const preview = c.gtk_label_new("");
+    c.gtk_label_set_xalign(@ptrCast(preview), 0);
+    c.gtk_label_set_wrap(@ptrCast(preview), 1);
+    c.gtk_label_set_max_width_chars(@ptrCast(preview), 48);
+    c.gtk_widget_add_css_class(preview, "dim-label");
     const apply = c.gtk_button_new_with_label("Rename selected");
     c.gtk_box_append(@ptrCast(box), find_e);
     c.gtk_box_append(@ptrCast(box), repl_e);
+    c.gtk_box_append(@ptrCast(box), preview);
     c.gtk_box_append(@ptrCast(box), apply);
-    const bctx = self.allocator.create(MenuCtx) catch return menuDone(ctx);
+    const bctx = self.allocator.create(MenuCtx) catch {
+        _ = c.g_object_ref_sink(popover);
+        c.g_object_unref(popover);
+        return;
+    };
     bctx.* = .{
         .allocator = self.allocator,
         .view = self,
@@ -161,10 +181,41 @@ pub fn onMenuBatchRename(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         .popover = popover,
         .entry = find_e,
         .entry2 = repl_e,
+        .preview = preview,
+        .apply = apply,
     };
     _ = c.g_signal_connect_data(apply, "clicked", @ptrCast(&onBatchRenameApply), @ptrCast(bctx), null, c.G_CONNECT_DEFAULT);
-    popup(self, tab, popover, bctx, box, null);
-    menuDone(ctx);
+    _ = c.g_signal_connect_data(find_e, "changed", @ptrCast(&onBatchRenameChanged), @ptrCast(bctx), null, c.G_CONNECT_DEFAULT);
+    _ = c.g_signal_connect_data(repl_e, "changed", @ptrCast(&onBatchRenameChanged), @ptrCast(bctx), null, c.G_CONNECT_DEFAULT);
+    _ = c.g_signal_connect_data(find_e, "activate", @ptrCast(&onBatchRenameEnter), @ptrCast(bctx), null, c.G_CONNECT_DEFAULT);
+    _ = c.g_signal_connect_data(repl_e, "activate", @ptrCast(&onBatchRenameEnter), @ptrCast(bctx), null, c.G_CONNECT_DEFAULT);
+    refreshBatchPreview(bctx);
+    popup(self, tab, popover, bctx, box, find_e);
+}
+
+/// Re-plan on every keystroke; Apply is sensitive only for a plan
+/// that renames something and collides with nothing.
+fn refreshBatchPreview(ctx: *MenuCtx) void {
+    const find_txt = entryText(@ptrCast(ctx.entry.?));
+    const repl_txt = entryText(@ptrCast(ctx.entry2.?));
+    var plan = batchrename.plan(ctx.allocator, ctx.tab.selected.items, find_txt, repl_txt) catch return;
+    defer plan.deinit(ctx.allocator);
+    var buf: [512]u8 = undefined;
+    var z: [520:0]u8 = undefined;
+    const line = batchrename.describe(&plan, &buf);
+    const zl = std.fmt.bufPrintZ(&z, "{s}", .{line}) catch return;
+    c.gtk_label_set_text(@ptrCast(ctx.preview.?), zl.ptr);
+    c.gtk_widget_set_sensitive(ctx.apply.?, if (plan.ok()) 1 else 0);
+}
+
+fn onBatchRenameChanged(_: *c.GtkEditable, user: ?*anyopaque) callconv(.c) void {
+    refreshBatchPreview(cast.userData(MenuCtx, user));
+}
+
+fn onBatchRenameEnter(_: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
+    const ctx = cast.userData(MenuCtx, user);
+    if (c.gtk_widget_get_sensitive(ctx.apply.?) == 0) return;
+    onBatchRenameApply(@ptrCast(ctx.apply.?), user);
 }
 
 pub fn onBatchRenameApply(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {

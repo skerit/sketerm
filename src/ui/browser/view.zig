@@ -59,6 +59,7 @@ const OwnedAlias = @import("types.zig").OwnedAlias;
 const PathCompletion = @import("nav.zig").PathCompletion;
 const Pending = @import("types.zig").Pending;
 const PendingHistory = @import("types.zig").PendingHistory;
+const RenameRun = @import("types.zig").RenameRun;
 const PendingJob = @import("types.zig").PendingJob;
 const PendingUndo = @import("types.zig").PendingUndo;
 const PreviewRead = @import("preview.zig").PreviewRead;
@@ -197,6 +198,8 @@ pub const BrowserView = struct {
     redo_stack: std.ArrayList(*UndoOp) = .empty,
     pending_undo: std.ArrayList(PendingUndo) = .empty,
     pending_history: std.ArrayList(PendingHistory) = .empty,
+    /// Batch renames (and their undo/redo) waiting for replies.
+    rename_runs: std.ArrayList(*RenameRun) = .empty,
     history_busy: bool = false,
     search_bar: *c.GtkWidget = undefined,
     search_entry: *c.GtkEntry = undefined,
@@ -1553,6 +1556,8 @@ pub const BrowserView = struct {
         self.pending_undo.deinit(self.allocator);
         for (self.pending_history.items) |ph| ph.op.destroy(self.allocator);
         self.pending_history.deinit(self.allocator);
+        for (self.rename_runs.items) |run| run.destroy(self.allocator);
+        self.rename_runs.deinit(self.allocator);
         for (self.bookmarks.items) |b| self.allocator.free(b);
         self.bookmarks.deinit(self.allocator);
         for (self.bookmark_labels.items) |b| self.allocator.free(b);

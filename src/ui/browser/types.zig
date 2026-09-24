@@ -1424,10 +1424,12 @@ pub const FileColor = struct {
 /// trash_restore: a = trashed path, b = original path, p = info file;
 /// rmdir_created: a = the directory mkdir created;
 /// link_created: a = the link created, b = its target, p = the verb
-/// ("symlink" or "hardlink") that redo must repeat.
+/// ("symlink" or "hardlink") that redo must repeat;
+/// rename_batch: a = the renamed paths, b = their originals, both
+/// NUL-separated lists in execution order (`filebrowser/batchrename.zig`).
 pub const UndoOp = struct {
     host: ?[]u8,
-    kind: enum { rename_back, delete_created, trash_restore, rmdir_created, link_created },
+    kind: enum { rename_back, delete_created, trash_restore, rmdir_created, link_created, rename_batch },
     a: []u8,
     b: []u8 = &.{},
     p: []u8 = &.{},
@@ -1450,6 +1452,8 @@ pub const UndoOp = struct {
             .rename_back => if (undo) self.b else self.a,
             .trash_restore => if (undo) self.b else null,
             .delete_created, .rmdir_created, .link_created => if (undo) null else self.a,
+            // Many entries: the run selects each as its rename lands.
+            .rename_batch => null,
         };
     }
 
@@ -1460,6 +1464,7 @@ pub const UndoOp = struct {
             .trash_restore => "undo trash (restore)",
             .rmdir_created => "undo new folder",
             .link_created => "undo link creation",
+            .rename_batch => "undo batch rename",
         };
     }
 };
@@ -1472,6 +1477,53 @@ pub const PendingUndo = struct {
 };
 
 pub const HistoryDirection = enum { undo, redo };
+
+/// A batch of no-replace renames in flight (a Batch Rename, or the
+/// undo/redo of one). Its count and its single undo record come from
+/// the replies, never from what was sent.
+pub const RenameRun = struct {
+    hc: *HostConn,
+    /// Set when this run replays a `rename_batch` record.
+    history_op: ?*UndoOp = null,
+    history_direction: HistoryDirection = .undo,
+    /// Selection batch the landed entries join.
+    select_batch: u64 = 0,
+    reqs: std.ArrayList(u32) = .empty,
+    /// (from, to) per request, parallel to `reqs`; owned.
+    pairs: std.ArrayList([2][]u8) = .empty,
+    /// 0 = waiting, 1 = landed, 2 = failed; parallel to `reqs`.
+    outcome: std.ArrayList(u8) = .empty,
+    first_error: ?[]u8 = null,
+
+    pub fn destroy(self: *RenameRun, allocator: std.mem.Allocator) void {
+        for (self.pairs.items) |pair| {
+            allocator.free(pair[0]);
+            allocator.free(pair[1]);
+        }
+        self.pairs.deinit(allocator);
+        self.reqs.deinit(allocator);
+        self.outcome.deinit(allocator);
+        if (self.first_error) |e| allocator.free(e);
+        if (self.history_op) |op| op.destroy(allocator);
+        allocator.destroy(self);
+    }
+
+    pub fn waiting(self: *const RenameRun) usize {
+        var n: usize = 0;
+        for (self.outcome.items) |o| {
+            if (o == 0) n += 1;
+        }
+        return n;
+    }
+
+    pub fn landed(self: *const RenameRun) usize {
+        var n: usize = 0;
+        for (self.outcome.items) |o| {
+            if (o == 1) n += 1;
+        }
+        return n;
+    }
+};
 
 pub const PendingHistory = struct {
     req: u32,

@@ -54,6 +54,10 @@ pub const MenuCtx = struct {
     mode: enum { none, rename, mkdir, tags, newfile } = .none,
     entry: ?*c.GtkWidget = null,
     entry2: ?*c.GtkWidget = null,
+    /// Batch Rename: the live preview line and the Apply button it
+    /// arms only for a plan that can run.
+    preview: ?*c.GtkWidget = null,
+    apply: ?*c.GtkWidget = null,
 
     pub fn free(user: ?*anyopaque) callconv(.c) void {
         const ctx = cast.userData(MenuCtx, user);
