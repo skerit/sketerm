@@ -1807,7 +1807,7 @@ pub fn spawnSessionWithOrigin(self: *Daemon, req_in: SpawnReq, origin_id: Sessio
         }
         s.winstream = w;
     }
-    screen.sink = .{ .ctx = @ptrCast(s), .on_write_pty = Session.sinkWritePty };
+    s.installScreenSink();
     log.info("session '{s}' spawned kind={s} child_pid={d} {d}x{d} wl={s} a11y={s}", .{
         req.name,
         if (req.app) "app" else "shell",

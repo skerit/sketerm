@@ -341,7 +341,7 @@ pub fn spawnCastSessionWithOrigin(self: *Daemon, req: SpawnReq, origin_id: dmod.
         .log = logring.LogRing.init(allocator),
     };
     cp_owned = null; // session deinit owns it now
-    screen.sink = .{ .ctx = @ptrCast(s), .on_write_pty = Session.sinkWritePty };
+    s.installScreenSink();
     log.info("session '{s}' spawned kind=cast {d}x{d} file={s}", .{
         req.name, h.cols, h.rows, path,
     });
@@ -636,13 +636,13 @@ fn startSeek(self: *Daemon, s: *Session, cp: *CastPlayback, target: CastPlayback
     };
     @import("daemon_sessions.zig").configureImageRetention(screen);
     screen.defer_gui_queries = true;
-    screen.sink = .{ .ctx = @ptrCast(s), .on_write_pty = Session.sinkWritePty };
     if (s.screen.last_title) |t| screen.last_title = allocator.dupe(u8, t) catch null;
     s.screen.deinit();
     s.pool.deinit();
     allocator.destroy(s.pool);
     s.screen = screen;
     s.pool = pool;
+    s.installScreenSink();
     s.parser.deinit();
     s.parser = Parser.init(allocator);
 

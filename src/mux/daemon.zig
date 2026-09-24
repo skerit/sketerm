@@ -355,11 +355,31 @@ pub const Session = struct {
         self.allocator.destroy(self);
     }
 
+    /// Point the session's Screen sink at this session; the one home
+    /// for the wiring, so every spawn path (PTY, cast, cast reseek)
+    /// gets the same callbacks.
+    pub fn installScreenSink(self: *Session) void {
+        self.screen.sink = .{
+            .ctx = @ptrCast(self),
+            .on_write_pty = sinkWritePty,
+            .on_decanm = sinkDecanm,
+        };
+    }
+
     /// Screen sink: DSR/DA replies go straight back to the child.
     /// A cast session has no child — replies are safely discarded.
     pub fn sinkWritePty(ctx: ?*anyopaque, bytes: []const u8) void {
         const self: *Session = @ptrCast(@alignCast(ctx.?));
         self.writeToChild(bytes);
+    }
+
+    /// Screen sink: DECANM (`CSI ? 2 h/l`, and RIS) switches THIS
+    /// parser between ANSI and VT52, since it is the one that parses
+    /// the bytes following the sequence; the GUI only replays events.
+    pub fn sinkDecanm(ctx: ?*anyopaque, ansi: bool) void {
+        const self: *Session = @ptrCast(@alignCast(ctx.?));
+        self.parser.vt52_mode = !ansi;
+        if (ansi) self.parser.vt52_y_state = 0;
     }
 
     /// Hand bytes to the child's PTY: delivered now, or queued for the
@@ -7229,6 +7249,35 @@ test "event collector serialization failure snapshots every client before later 
         try t.expectEqual(@as(usize, 0), summary.snapshots);
         try t.expectEqual(@as(usize, 1), summary.events);
     }
+}
+
+test "DECANM switches the daemon's own parser into and out of VT52" {
+    const t = std.testing;
+    const harness = try EventIngestTestHarness.init(t.allocator);
+    defer harness.deinit();
+    harness.session.installScreenSink();
+    var batch = harness.daemon.ingestBegin(&harness.session);
+    defer harness.daemon.ingestFinish(&harness.session, &batch, false);
+
+    // DECRST 2 leaves ANSI: everything after it is VT52, so the parser
+    // that reads those bytes (this one, not a viewer's) must switch.
+    ingestBytes(&harness.session, &batch, "\x1b[?2l");
+    try t.expect(harness.session.parser.vt52_mode);
+    // VT52 direct cursor address: ESC Y <row+32> <col+32>.
+    ingestBytes(&harness.session, &batch, "\x1bY" ++ [_]u8{ 0x20 + 2, 0x20 + 5 });
+    try t.expectEqual(@as(u16, 2), harness.screen.row);
+    try t.expectEqual(@as(u16, 5), harness.screen.col);
+    // ESC < is VT52's own way back, after which CSI parses again.
+    ingestBytes(&harness.session, &batch, "\x1b<");
+    try t.expect(!harness.session.parser.vt52_mode);
+    ingestBytes(&harness.session, &batch, "\x1b[1;2H");
+    try t.expectEqual(@as(u16, 0), harness.screen.row);
+    try t.expectEqual(@as(u16, 1), harness.screen.col);
+    // A second DECRST 2 re-enters VT52 through the same sink.
+    ingestBytes(&harness.session, &batch, "\x1b[?2l\x1bY" ++ [_]u8{ 0x20 + 1, 0x20 + 3 });
+    try t.expect(harness.session.parser.vt52_mode);
+    try t.expectEqual(@as(u16, 1), harness.screen.row);
+    try t.expectEqual(@as(u16, 3), harness.screen.col);
 }
 
 fn runEventsPayloadAllocationFailure(fail_index: ?usize) !usize {
