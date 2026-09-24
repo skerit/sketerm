@@ -648,7 +648,49 @@ fn collectRows(self: *BrowserView, arena: std.mem.Allocator) []Row {
     copyQueueRows(self, arena, &rows);
     deferredRows(self, arena, &rows);
     daemonRows(self, arena, &rows);
-    return rows.items;
+    return dedupeByToken(rows.items);
+}
+
+/// One row per logical transfer. A ledger token names the transfer
+/// across attempts, so a failed attempt's daemon row and the retry
+/// that replaced it (queued, deferred, or a newer daemon job) are the
+/// SAME transfer and must not show as two cards. The live row wins;
+/// between rows of equal liveness the first collected one does.
+/// Rows without a token are all distinct. Compacts `rows` in place.
+fn dedupeByToken(rows: []Row) []Row {
+    var n: usize = 0;
+    outer: for (rows) |row| {
+        const token = row.batch_item;
+        if (token.len > 0) {
+            for (rows[0..n]) |*kept| {
+                if (!std.mem.eql(u8, kept.batch_item, token)) continue;
+                if (row.active() and !kept.active()) kept.* = row;
+                continue :outer;
+            }
+        }
+        rows[n] = row;
+        n += 1;
+    }
+    return rows[0..n];
+}
+
+test "panel rows collapse to one card per transfer token" {
+    const t = std.testing;
+    var rows = [_]Row{
+        .{ .key = .{ .kind = .daemon, .token = "A" }, .label = "old attempt", .state = .failed, .batch_item = "A" },
+        .{ .key = .{ .kind = .copy }, .label = "untracked", .state = .running },
+        .{ .key = .{ .kind = .daemon, .token = "A" }, .label = "retry", .state = .running, .batch_item = "A" },
+        .{ .key = .{ .kind = .durable, .token = "B" }, .label = "b1", .state = .queued, .batch_item = "B" },
+        .{ .key = .{ .kind = .deferred }, .label = "b2", .state = .queued, .batch_item = "B" },
+        .{ .key = .{ .kind = .copy }, .label = "untracked 2", .state = .finished },
+    };
+    const out = dedupeByToken(&rows);
+    try t.expectEqual(@as(usize, 4), out.len);
+    // The live retry replaced the failed attempt in the first slot.
+    try t.expectEqualStrings("retry", out[0].label);
+    try t.expectEqualStrings("untracked", out[1].label);
+    try t.expectEqualStrings("b1", out[2].label);
+    try t.expectEqualStrings("untracked 2", out[3].label);
 }
 
 const BatchAgg = struct {
