@@ -366,8 +366,11 @@ pub const CompareCtx = struct {
             return;
         };
         defer self.allocator.free(body);
-        const root = c.gtk_widget_get_root(self.view.root_box);
-        if (confirm.present(@ptrCast(@alignCast(root)), .{
+        // On the Compare / Sync window itself: that is where Execute was
+        // pressed, and a confirmation raised on the Files window behind
+        // it was invisible, so the sync looked like it did nothing.
+        const root: ?*c.GtkWidget = self.window orelse @ptrCast(@alignCast(c.gtk_widget_get_root(self.view.root_box)));
+        if (confirm.present(root, .{
             .heading = head.ptr,
             .body = body.ptr,
             .responses = &.{
