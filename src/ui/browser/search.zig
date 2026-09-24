@@ -244,6 +244,7 @@ test "queued queries own their intent, survive dial failure and dispatch only on
         .{ .text = "@7d *.zig", .content = false },
         .{ .text = "needle", .content = true },
         .{ .text = "!printf result", .content = false },
+        .{ .text = "#urgent", .content = false },
     };
     for (cases) |case| {
         hc.state = .connecting;

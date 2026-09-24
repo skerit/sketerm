@@ -71,6 +71,10 @@ pub const Op = enum {
     secure_delete,
     git_diff,
     disk_usage,
+    /// Recursive search for entries carrying a tag (`pattern`), read
+    /// from each entry's tags xattr -- so tags set by another client or
+    /// carried over by a copy are found too, not just indexed ones.
+    tag_find,
 };
 
 /// The staged partial a copy writes beside its destination, and the
@@ -465,6 +469,7 @@ pub fn serve(allocator: std.mem.Allocator) u8 {
         .hash => runHash(spec),
         .find => runSearch(allocator, spec, false),
         .grep => runSearch(allocator, spec, true),
+        .tag_find => runTagFind(allocator, spec),
         .extract => runExtract(spec),
         .archive_create => runArchiveCreate(spec),
         .archive_list => runArchiveList(spec),
@@ -2383,6 +2388,56 @@ fn runSearch(allocator: std.mem.Allocator, spec: Spec, content: bool) u8 {
         .truncated = state.truncated,
     });
     return 0;
+}
+
+fn runTagFind(allocator: std.mem.Allocator, spec: Spec) u8 {
+    const tag = std.mem.trim(u8, spec.pattern, " #");
+    if (tag.len == 0) return emitError("empty tag");
+    var st: c.struct_stat = undefined;
+    if (!statOf(spec.src, &st, true)) return emitErrno("stat root");
+    if ((st.st_mode & c.S_IFMT) != c.S_IFDIR) return emitError("search root is not a directory");
+    var state = SearchState{ .lower_pat = &.{}, .max_matches = matchCapOf(spec) };
+    if (spec.within_ms > 0)
+        state.min_mtime_ms = wallMs() - @as(i64, @intCast(@min(spec.within_ms, 1 << 50)));
+    tagSearchDir(allocator, spec.src, tag, &state);
+    emit(.{
+        .ev = "done",
+        .done = state.scanned,
+        .total = state.scanned,
+        .matches = state.matches,
+        .truncated = state.truncated,
+    });
+    return 0;
+}
+
+fn tagSearchDir(allocator: std.mem.Allocator, dir_path: []const u8, tag: []const u8, state: *SearchState) void {
+    if (state.matches >= state.max_matches) {
+        state.truncated = true;
+        return;
+    }
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const l = fsserve.listDir(arena_state.allocator(), dir_path, fsserve.MAX_ENTRIES) catch return;
+    for (l.entries) |e| {
+        if (state.matches >= state.max_matches) {
+            state.truncated = true;
+            return;
+        }
+        var buf: [4096]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        w.print("{s}/{s}", .{ if (dir_path.len == 1) "" else dir_path, e.name }) catch continue;
+        const full = w.buffered();
+        const fresh = state.min_mtime_ms == 0 or e.mtime_ms >= state.min_mtime_ms;
+        if (fresh and fsserve.hasTag(e.tags, tag)) {
+            state.matches += 1;
+            emit(.{ .ev = "match", .path = full, .kind = e.kind, .size = e.size, .mtime_ms = e.mtime_ms, .mode = e.mode });
+        }
+        state.scanned += 1;
+        if (state.scanned % 512 == 0)
+            emit(.{ .ev = "progress", .done = state.scanned, .total = @as(u64, 0) });
+        if (std.mem.eql(u8, e.kind, "dir"))
+            tagSearchDir(allocator, full, tag, state);
+    }
 }
 
 fn searchDir(allocator: std.mem.Allocator, dir_path: []const u8, pattern: []const u8, content: bool, state: *SearchState) void {

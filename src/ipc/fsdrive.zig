@@ -189,6 +189,12 @@ pub const JobRow = struct {
 /// Superset JSON shape of every fs_reply; absent fields keep their
 /// defaults, unknown (future) fields are ignored.
 /// One host-side application (the `apps` op).
+/// One `tag_list` row (mux/tagindex.zig `TagCount`).
+pub const WireTag = struct {
+    name: []const u8 = "",
+    count: u32 = 0,
+};
+
 pub const WireApp = struct {
     name: []const u8 = "",
     exec: []const u8 = "",
@@ -237,6 +243,8 @@ pub const Reply = struct {
     files_total: u64 = 0,
     jobs: []JobRow = &.{},
     apps: []WireApp = &.{},
+    /// `tag_list`: every tag in use on the host with its entry count.
+    tags: []WireTag = &.{},
     bsize: u64 = 0,
     frsize: u64 = 0,
     blocks: u64 = 0,
@@ -894,6 +902,28 @@ pub const Fs = struct {
     /// Set (or remove, with an empty value) one extended attribute.
     pub fn attrSet(self: *Fs, path: []const u8, name: []const u8, value: []const u8) Error!void {
         try self.simpleOp("attr_set", .{ .path = path, .pattern = name, .to = value });
+    }
+
+    /// Replace an entry's tags (comma-separated; "" clears). The daemon
+    /// also records them in its tag index.
+    pub fn tagSet(self: *Fs, path: []const u8, tags: []const u8) Error!void {
+        try self.simpleOp("tag_set", .{ .path = path, .to = tags });
+    }
+
+    /// Every tag in use on the host (the daemon's verified tag index).
+    /// Rows live in `arena`.
+    pub fn tagList(self: *Fs, arena: std.mem.Allocator) Error![]WireTag {
+        const req = self.nextReq();
+        // Every fs_op names an absolute path; the index is host-wide.
+        try self.sendOp("tag_list", req, .{ .path = "/" });
+        const rep = try self.awaitReply(arena, req, OP_TIMEOUT_MS);
+        return rep.tags;
+    }
+
+    /// Recursive search under `root` for entries carrying `tag`;
+    /// "match" job events like `startFind`.
+    pub fn startTagFind(self: *Fs, root: []const u8, tag: []const u8) Error!u64 {
+        return self.startJob("tag_find", .{ .path = root, .pattern = tag });
     }
 
     /// Refresh an open view: the file browser's reload shape, which

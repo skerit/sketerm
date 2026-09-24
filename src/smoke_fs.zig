@@ -4401,6 +4401,61 @@ fn fileSize(path: []const u8) u64 {
 /// into "unknown fs op": git_status, diff, split, combine,
 /// secure_delete. `startX` failing at all IS the regression — the
 /// routing gap made every one of these an error reply.
+/// Tags: `tag_set` writes the xattr AND the daemon's index, `tag_list`
+/// answers from the index verified against the files (a deleted file
+/// drops out), and the `tag_find` job walks for the tag -- finding a
+/// tag the index never saw, since the xattr is the truth.
+fn tagStage(allocator: std.mem.Allocator, sock_path: []const u8) void {
+    var dbuf: [64]u8 = undefined;
+    const dir = mkTmpDir(&dbuf, "tags");
+    var fs = fsdrive.Fs.connect(allocator, sock_path) catch fail("tags fs connect");
+    defer fs.deinit();
+    var pb: [4][4096]u8 = undefined;
+    const sub = std.fmt.bufPrint(&pb[0], "{s}/deep", .{dir}) catch unreachable;
+    mkdirAt(sub);
+    touch(dir, "red.txt", "r\n");
+    touch(sub, "both.txt", "b\n");
+    touch(dir, "gone.txt", "g\n");
+    touch(dir, "plain.txt", "p\n");
+    const red = std.fmt.bufPrint(&pb[1], "{s}/red.txt", .{dir}) catch unreachable;
+    const both = std.fmt.bufPrint(&pb[2], "{s}/both.txt", .{sub}) catch unreachable;
+    const gone = std.fmt.bufPrint(&pb[3], "{s}/gone.txt", .{dir}) catch unreachable;
+    fs.tagSet(red, "Urgent") catch {
+        std.debug.print("smoke-fs: tags: this filesystem refuses user xattrs ({s}); skipping\n", .{fs.lastErr()});
+        return;
+    };
+    fs.tagSet(both, "urgent, later") catch failErr("tag_set", fs.lastErr());
+    fs.tagSet(gone, "later") catch failErr("tag_set", fs.lastErr());
+    // A tag written behind the daemon's back: absent from the index,
+    // still found by the walk.
+    var zb: [4200:0]u8 = undefined;
+    const plain = std.fmt.bufPrintZ(&zb, "{s}/plain.txt", .{dir}) catch unreachable;
+    if (!@import("util/platform.zig").lsetxattr(plain, fsserve.TAGS_XATTR, "urgent")) fail("direct xattr set");
+    var gz: [4200:0]u8 = undefined;
+    _ = c.unlink((std.fmt.bufPrintZ(&gz, "{s}", .{gone}) catch unreachable).ptr);
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const tags = fs.tagList(arena_state.allocator()) catch failErr("tag_list", fs.lastErr());
+    var urgent: u32 = 0;
+    var later: u32 = 0;
+    for (tags) |t| {
+        if (std.ascii.eqlIgnoreCase(t.name, "urgent")) urgent += t.count;
+        if (std.mem.eql(u8, t.name, "later")) later += t.count;
+    }
+    // red + both (the index never saw plain.txt); gone.txt's line was
+    // dropped because the file is gone.
+    if (urgent != 2) fail("tag_list did not count the two indexed urgent entries");
+    if (later != 1) fail("tag_list kept a deleted file's tag");
+
+    const job = fs.startTagFind(dir, "urgent") catch failErr("tag_find refused", fs.lastErr());
+    const out = collectStream(&fs, job, both, 20_000);
+    if (!out.outcome.is("done")) fail("tag_find outcome");
+    if (out.matches != 3) fail("tag_find did not find exactly the three urgent entries");
+    if (!out.saw_name) fail("tag_find missed the nested entry");
+    std.debug.print("smoke-fs: tags: set, indexed, pruned and found by walk\n", .{});
+}
+
 fn jobVerbStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime tag: []const u8) void {
     var dbuf: [64]u8 = undefined;
     const dir = mkTmpDir(&dbuf, tag ++ "-verbs");
@@ -4703,6 +4758,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     saveStage(allocator, sock_path, "broker");
     probeStage(allocator, sock_path, "broker");
     jobVerbStage(allocator, sock_path, "broker");
+    tagStage(allocator, sock_path);
     {
         var conn = client_mod.Conn.connect(allocator, sock_path) catch fail("shutdown connect");
         defer conn.deinit();

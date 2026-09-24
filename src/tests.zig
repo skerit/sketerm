@@ -281,6 +281,7 @@ comptime {
     _ = @import("filebrowser/transfers.zig");
     _ = @import("filebrowser/transfer.zig");
     _ = @import("filebrowser/selection_set.zig");
+    _ = @import("mux/tagindex.zig");
     _ = @import("filebrowser/paths.zig");
     _ = @import("filebrowser/jobop.zig");
     _ = @import("filebrowser/bypass.zig");

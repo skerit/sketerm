@@ -298,6 +298,9 @@ pub fn statEntryAttrs(arena: std.mem.Allocator, dir: []const u8, name: []const u
 
 /// The xattr backing file tags (comma-separated UTF-8).
 pub const TAGS_XATTR = "user.sketerm.tags";
+/// Whether a comma-separated tag list names a tag (one rule, shared by
+/// the `tag_find` walk and the index).
+pub const hasTag = @import("tagindex.zig").hasTag;
 
 /// Read one extended attribute; null when absent, unreadable, or not
 /// valid UTF-8 (the browser shows attributes as text).

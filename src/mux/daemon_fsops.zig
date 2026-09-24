@@ -11,6 +11,7 @@ const wire = @import("wire.zig");
 const platform = @import("../util/platform.zig");
 const selfexec = @import("selfexec.zig");
 const fsserve = @import("fsserve.zig");
+const tagindex = @import("tagindex.zig");
 const fsjob = @import("fsjob.zig");
 const daemon_fsjobs = @import("daemon_fsjobs.zig");
 const pulse = @import("pulse.zig");
@@ -565,7 +566,32 @@ pub fn handleFsOp(self: *Daemon, cl: *Client, payload: []const u8) void {
         var z: [4096]u8 = undefined;
         const p = pathZ(&z, r.path) catch return fsReplyErr(cl, r.req, "path too long");
         if (!fsserve.setTags(p, r.to)) return fsReplyErr(cl, r.req, "xattr set failed");
+        tagindex.record(self.allocator, r.path, r.to);
         cl.queueJson(.fs_reply, .{ .req = r.req, .ok = true });
+    } else if (std.mem.eql(u8, r.op, "tag_list")) {
+        // Every tag in use on this host, from the index `tag_set`
+        // keeps, each line verified against the file's xattr (an older
+        // daemon answers "unknown op"; the client then shows none).
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const Live = struct {
+            fn get(_: void, arena: std.mem.Allocator, path: []const u8) ?[]const u8 {
+                var zb: [4096]u8 = undefined;
+                const pz = pathZ(&zb, path) catch return null;
+                var buf: [256]u8 = undefined;
+                const n = platform.lgetxattr(pz, fsserve.TAGS_XATTR, &buf);
+                if (n <= 0) {
+                    var st: c.struct_stat = undefined;
+                    return if (c.lstat(pz, &st) == 0) "" else null;
+                }
+                return arena.dupe(u8, buf[0..@intCast(n)]) catch null;
+            }
+        };
+        cl.queueJson(.fs_reply, .{
+            .req = r.req,
+            .ok = true,
+            .tags = tagindex.list(arena_state.allocator(), {}, Live.get),
+        });
     } else if (std.mem.eql(u8, r.op, "symlink")) {
         // `to` is the link TARGET (may be relative by design);
         // `path` is where the link is created.

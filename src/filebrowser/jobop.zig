@@ -32,7 +32,7 @@ pub const JobOp = enum {
             .trash => .trash,
             .trash_restore => .restore,
             .delete_tree, .secure_delete => .delete,
-            .find, .grep, .panelize, .live_find => .query,
+            .find, .grep, .panelize, .live_find, .tag_find => .query,
             .hash,
             .extract,
             .archive_create,

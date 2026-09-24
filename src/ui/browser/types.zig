@@ -158,6 +158,11 @@ pub const HostConn = struct {
     /// offer THAT host's templates, and only its daemon can read its
     /// user-dirs.dirs.
     templates_dir: ?[]u8 = null,
+    /// Tags in use on the host ("name (count), ..."), from its daemon's
+    /// tag index (`tag_list`), refreshed whenever the Tags prompt opens.
+    known_tags: ?[]u8 = null,
+    /// The in-flight `tag_list` request (0 = none).
+    tag_list_req: u32 = 0,
     /// The host's home directory (same `homedir` reply); what the
     /// sidebar's per-host places section navigates to.
     home_dir: ?[]u8 = null,
@@ -221,6 +226,7 @@ pub const HostConn = struct {
             l.release();
         } else if (self.state == .ready) self.conn.deinit();
         if (self.templates_dir) |td| allocator.free(td);
+        if (self.known_tags) |kt| allocator.free(kt);
         if (self.home_dir) |hd| allocator.free(hd);
         if (self.trash_dir) |td| allocator.free(td);
         self.templates_cache.deinit(allocator);

@@ -1776,6 +1776,28 @@ pub fn batchRenameSelected(self: *BrowserView, tab: *BTab, find_txt: []const u8,
         self.setStatus("batch rename not started: out of memory");
         return;
     };
+/// Ask the host's daemon which tags are in use (its tag index). The
+/// answer lands in `hc.known_tags`; a daemon without the verb answers
+/// an error and the cache simply stays empty.
+pub fn refreshKnownTags(self: *BrowserView, hc: *HostConn) void {
+    if (hc.tag_list_req != 0 or hc.state != .ready) return;
+    const req = self.nextReq();
+    if (self.sendOpOk(hc, .{ .req = req, .op = "tag_list", .path = "/" })) hc.tag_list_req = req;
+}
+
+pub fn storeKnownTags(self: *BrowserView, hc: *HostConn, rep: WireReply) void {
+    if (!rep.ok) return;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(self.allocator);
+    for (rep.tags, 0..) |tg, i| {
+        if (i > 0) out.appendSlice(self.allocator, ", ") catch return;
+        out.print(self.allocator, "{s} ({d})", .{ tg.name, tg.count }) catch return;
+    }
+    const owned = out.toOwnedSlice(self.allocator) catch return;
+    if (hc.known_tags) |old| self.allocator.free(old);
+    hc.known_tags = owned;
+}
+
     defer self.allocator.free(order);
     for (order) |sel_index| {
         const sel_path = tab.selected.items[sel_index];

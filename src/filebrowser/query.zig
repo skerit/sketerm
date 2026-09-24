@@ -8,6 +8,7 @@
 //! A query is one of three things, decided by the text itself rather
 //! than by any stored mode flag:
 //!   `!cmd`     a host-side command whose output IS the listing
+//!   `#tag`     a recursive search for a file tag
 //!   `pattern`  a recursive filename query, which runs LIVE
 //!   ...with the content toggle on, a one-shot recursive grep.
 //! A leading `@7d` / `@12h` / `@30m` adds a relative-time predicate.
@@ -26,6 +27,10 @@ pub const Kind = enum {
     content,
     /// Panelize: an arbitrary command run on the session's host.
     command,
+    /// `#tag`: a recursive walk for entries carrying the tag in their
+    /// tags xattr (daemon job `tag_find`; an older daemon answers
+    /// "unknown job op", which the results tab shows as its error).
+    tag,
 
     /// One word for what this kind of query is, for labels and status
     /// lines.
@@ -34,6 +39,7 @@ pub const Kind = enum {
             .live_name => "live",
             .content => "content",
             .command => "command",
+            .tag => "tag",
         };
     }
 };
@@ -56,6 +62,7 @@ pub const Query = struct {
             .live_name => "live_find",
             .content => "grep",
             .command => "panelize",
+            .tag => "tag_find",
         };
     }
 
@@ -107,6 +114,10 @@ pub fn parse(text_in: []const u8, content: bool) ?Query {
         }
     }
     if (rest.len == 0) return null;
+    // `#tag` (a tag has no spaces) asks for the tag, whatever the
+    // content toggle says; a bare `#` stays a filename pattern.
+    if (rest[0] == '#' and rest.len > 1 and std.mem.indexOfScalar(u8, rest, ' ') == null)
+        return .{ .kind = .tag, .pattern = rest[1..], .within_ms = within };
     return .{
         .kind = if (content) .content else .live_name,
         .pattern = rest,
@@ -182,6 +193,18 @@ test "a bang makes it a command, whatever the content toggle says" {
     try t.expectEqualStrings("panelize", q.op());
     // A time prefix inside a command is the command's own text.
     try t.expectEqualStrings("@7d foo", parse("!@7d foo", false).?.pattern);
+}
+
+test "a #word is a tag search" {
+    const t = std.testing;
+    const q = parse("#urgent", true).?;
+    try t.expectEqual(Kind.tag, q.kind);
+    try t.expect(!q.live());
+    try t.expectEqualStrings("urgent", q.pattern);
+    try t.expectEqualStrings("tag_find", q.op());
+    try t.expectEqual(Kind.live_name, parse("#", false).?.kind);
+    try t.expectEqual(Kind.live_name, parse("#a b", false).?.kind);
+    try t.expectEqual(@as(u64, 3600 * 1000), parse("@1h #urgent", false).?.within_ms);
 }
 
 test "nothing to run parses as nothing" {

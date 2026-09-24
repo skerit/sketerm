@@ -99,6 +99,20 @@ pub fn onMenuTags(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const cur = ops.findEntryTags(ctx.tab, path);
     if (cur.len > 0) presetEntry(entry, cur, false);
     const tctx = self.allocator.create(MenuCtx) catch return menuDone(ctx);
+    // What is already in use on this host (its daemon's tag index),
+    // and how to find it: `#tag` in the search bar.
+    ops.refreshKnownTags(self, ctx.tab.hc);
+    const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 4);
+    c.gtk_box_append(@ptrCast(box), entry);
+    var kb: [600:0]u8 = undefined;
+    const known_list: []const u8 = if (ctx.tab.hc.known_tags) |k| (if (k.len > 0) k[0..@min(k.len, 500)] else "none yet") else "none yet";
+    const known = std.fmt.bufPrintZ(&kb, "In use: {s}\nSearch with #tag", .{known_list}) catch "Search with #tag";
+    const hint = c.gtk_label_new(known.ptr);
+    c.gtk_label_set_xalign(@ptrCast(hint), 0);
+    c.gtk_label_set_wrap(@ptrCast(hint), 1);
+    c.gtk_label_set_max_width_chars(@ptrCast(hint), 48);
+    c.gtk_widget_add_css_class(hint, "dim-label");
+    c.gtk_box_append(@ptrCast(box), hint);
     tctx.* = .{
         .allocator = self.allocator,
         .view = self,
@@ -111,7 +125,7 @@ pub fn onMenuTags(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         .entry = entry,
     };
     _ = c.g_signal_connect_data(entry, "activate", @ptrCast(&onTagsActivate), @ptrCast(tctx), null, c.G_CONNECT_DEFAULT);
-    popup(self, ctx.tab, popover, tctx, entry, entry);
+    popup(self, ctx.tab, popover, tctx, box, entry);
     menuDone(ctx);
 }
 

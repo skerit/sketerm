@@ -1363,6 +1363,12 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
     }) catch return false;
     if (rep.req == 0) return false;
 
+    if (hc.tag_list_req != 0 and rep.req == hc.tag_list_req) {
+        hc.tag_list_req = 0;
+        @import("ops.zig").storeKnownTags(self, hc, rep);
+        return false;
+    }
+
     for (self.copy_acks.items, 0..) |ack, i| {
         if (ack.req != rep.req) continue;
         if (!rep.ok and !std.mem.eql(u8, rep.@"error", "no such job")) {

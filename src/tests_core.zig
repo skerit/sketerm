@@ -79,6 +79,7 @@ comptime {
     _ = @import("filebrowser/jobop.zig");
     _ = @import("filebrowser/bypass.zig");
     _ = @import("filebrowser/selection_set.zig");
+    _ = @import("mux/tagindex.zig");
     _ = @import("filebrowser/places.zig");
     _ = @import("filebrowser/previewers.zig");
     _ = @import("filebrowser/progress.zig");
