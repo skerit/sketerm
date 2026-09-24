@@ -19,6 +19,15 @@ pub const Store = struct {
     /// Unmanaged in this Zig, so `arena.allocator()` is threaded through
     /// every mutation.
     obj: std.json.ObjectMap = .empty,
+    /// The keys THIS process wrote or removed since the store last
+    /// matched the file, plus whether it cleared everything. Several
+    /// helper instances (one per browser route) share one storage.json;
+    /// writing the whole in-memory object back used to drop every key
+    /// another instance had written meanwhile (last writer wins). A
+    /// flush therefore re-reads the file and replays only this journal
+    /// onto it (`rebase`), so concurrent instances merge by key.
+    touched: std.StringArrayHashMapUnmanaged(void) = .empty,
+    cleared: bool = false,
 
     pub fn init(gpa: std.mem.Allocator) Store {
         return .{ .arena = std.heap.ArenaAllocator.init(gpa) };
@@ -44,6 +53,54 @@ pub const Store = struct {
         if (parsed != .object) return error.InvalidStorage;
         s.obj = parsed.object;
         return s;
+    }
+
+    /// True when this store holds writes the file has not seen.
+    pub fn hasJournal(self: *const Store) bool {
+        return self.cleared or self.touched.count() != 0;
+    }
+
+    fn note(self: *Store, key: []const u8) !void {
+        const a = self.arena.allocator();
+        if (self.touched.contains(key)) return;
+        try self.touched.put(a, try a.dupe(u8, key), {});
+    }
+
+    /// Replace this store's base with `disk_bytes` (what another
+    /// instance may have written) and replay the local journal on top:
+    /// a local clear first, then every touched key as its local value
+    /// or its local removal. Keys only the other instance wrote
+    /// survive; keys both wrote resolve to THIS process's value (it is
+    /// the later writer). `keep_journal` is false right before the
+    /// merged bytes are written back, true when merging only to read.
+    pub fn rebase(self: *Store, gpa: std.mem.Allocator, disk_bytes: []const u8, keep_journal: bool) !void {
+        var fresh = loadFallible(gpa, disk_bytes) catch Store.init(gpa);
+        errdefer fresh.deinit();
+        const a = fresh.arena.allocator();
+        if (self.cleared) fresh.obj.clearRetainingCapacity();
+        for (self.touched.keys()) |k| {
+            if (self.obj.get(k)) |v| {
+                // Values live in THIS arena, which is about to go:
+                // copy through JSON into the fresh one.
+                var aw: std.Io.Writer.Allocating = .init(gpa);
+                defer aw.deinit();
+                try std.json.Stringify.value(v, .{}, &aw.writer);
+                const copy = try std.json.parseFromSliceLeaky(std.json.Value, a, aw.written(), .{});
+                try fresh.obj.put(a, try a.dupe(u8, k), copy);
+            } else {
+                _ = fresh.obj.orderedRemove(k);
+            }
+            if (keep_journal) try fresh.touched.put(a, try a.dupe(u8, k), {});
+        }
+        if (keep_journal) fresh.cleared = self.cleared;
+        self.arena.deinit();
+        self.* = fresh;
+    }
+
+    /// Forget the journal once the file holds everything it recorded.
+    pub fn settle(self: *Store) void {
+        self.touched = .empty; // arena-owned; freed with the arena
+        self.cleared = false;
     }
 
     /// Deep-copy the store so a disk-backed mutation can commit transactionally.
@@ -133,6 +190,7 @@ pub const Store = struct {
             // it already is; dupe defensively for keys that outlive it).
             const key_owned = try a.dupe(u8, key);
             try self.obj.put(a, key_owned, new_val);
+            try self.note(key_owned);
             try changes.add(key, old_val, new_val);
         }
         return changes.finish();
@@ -146,6 +204,7 @@ pub const Store = struct {
         errdefer changes.deinit();
         for (keys) |k| {
             if (self.obj.fetchOrderedRemove(k)) |kv| {
+                try self.note(k);
                 try changes.add(k, kv.value, null);
             }
         }
@@ -162,6 +221,9 @@ pub const Store = struct {
             try changes.add(e.key_ptr.*, e.value_ptr.*, null);
         }
         self.obj.clearRetainingCapacity();
+        // A clear supersedes every earlier key in the journal.
+        self.touched = .empty;
+        self.cleared = true;
         return changes.finish();
     }
 };
@@ -411,4 +473,48 @@ test "getWithDefaults prefers a stored value over the default" {
     try t.expectEqualStrings("fallback", parsed.value.object.get("unset").?.string);
     // A key not asked for stays out of the answer.
     try t.expect(parsed.value.object.get("extra") == null);
+}
+
+test "rebase merges two instances' writes by key instead of last-writer-wins" {
+    const gpa = t.allocator;
+    // Both instances loaded the same file.
+    var a = Store.load(gpa, "{\"shared\":0,\"gone\":1}");
+    defer a.deinit();
+    var b = Store.load(gpa, "{\"shared\":0,\"gone\":1}");
+    defer b.deinit();
+    gpa.free(try a.set(gpa, "{\"fromA\":1,\"shared\":1}"));
+    gpa.free(try b.set(gpa, "{\"fromB\":2}"));
+    gpa.free(try b.remove(gpa, &.{"gone"}));
+    try t.expect(a.hasJournal() and b.hasJournal());
+
+    // A flushes first: the file holds A's whole view.
+    const disk_a = try a.serialize(gpa);
+    defer gpa.free(disk_a);
+    a.settle();
+    // B flushes second: it must rebase onto A's file, not overwrite it.
+    try b.rebase(gpa, disk_a, false);
+    b.settle();
+    const merged = try b.get(gpa, &.{});
+    defer gpa.free(merged);
+    var p = try std.json.parseFromSlice(std.json.Value, gpa, merged, .{});
+    defer p.deinit();
+    try t.expectEqual(@as(i64, 1), p.value.object.get("fromA").?.integer);
+    try t.expectEqual(@as(i64, 2), p.value.object.get("fromB").?.integer);
+    try t.expectEqual(@as(i64, 1), p.value.object.get("shared").?.integer);
+    try t.expect(p.value.object.get("gone") == null);
+    try t.expect(!b.hasJournal());
+}
+
+test "rebase replays a local clear before the keys written after it" {
+    const gpa = t.allocator;
+    var s = Store.load(gpa, "{\"old\":1}");
+    defer s.deinit();
+    gpa.free(try s.clear(gpa));
+    gpa.free(try s.set(gpa, "{\"after\":2}"));
+    try s.rebase(gpa, "{\"old\":1,\"other\":3}", true);
+    const got = try s.get(gpa, &.{});
+    defer gpa.free(got);
+    try t.expectEqualStrings("{\"after\":2}", got);
+    // Kept for a later flush.
+    try t.expect(s.hasJournal());
 }

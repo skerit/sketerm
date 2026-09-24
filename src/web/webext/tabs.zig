@@ -347,6 +347,74 @@ pub const Table = struct {
         try std.json.Stringify.value(t_.title, .{}, w);
         try w.writeByte('}');
     }
+
+    /// Which windows `writeWindows` lists.
+    pub const WindowPick = union(enum) {
+        all,
+        /// `windows.get(id)`.
+        id: u32,
+        /// `windows.getLastFocused()` / `getCurrent()` from a
+        /// background page: the focused window, else the first.
+        last_focused,
+    };
+
+    /// MV2 `Window` objects derived from the mirrored tab table: a
+    /// window exists exactly while the client reports a tab in it.
+    /// `.all` writes an array; the other picks write one object, and
+    /// return false when there is no such window.
+    pub fn writeWindows(self: *const Table, w: *std.Io.Writer, pick: WindowPick, populate: bool) !bool {
+        var ids: [64]u32 = undefined;
+        var focused: [64]bool = undefined;
+        var n: usize = 0;
+        for (self.tabs.items) |*t_| {
+            const seen = for (ids[0..n], 0..) |id, i| {
+                if (id == t_.window_id) break i;
+            } else null;
+            if (seen) |i| {
+                if (t_.focused_window) focused[i] = true;
+                continue;
+            }
+            if (n == ids.len) continue;
+            ids[n] = t_.window_id;
+            focused[n] = t_.focused_window;
+            n += 1;
+        }
+        const one: ?usize = switch (pick) {
+            .all => null,
+            .id => |want| for (ids[0..n], 0..) |id, i| {
+                if (id == want) break i;
+            } else return false,
+            .last_focused => blk: {
+                if (n == 0) return false;
+                for (focused[0..n], 0..) |f, i| if (f) break :blk i;
+                break :blk 0;
+            },
+        };
+        if (one == null) try w.writeByte('[');
+        var first = true;
+        for (ids[0..n], 0..) |id, i| {
+            if (one) |o| if (o != i) continue;
+            if (!first) try w.writeByte(',');
+            first = false;
+            try w.print("{{\"id\":{d},\"focused\":{s},\"type\":\"normal\",\"state\":\"normal\",\"incognito\":false,\"alwaysOnTop\":false", .{
+                id, if (focused[i]) "true" else "false",
+            });
+            if (populate) {
+                try w.writeAll(",\"tabs\":[");
+                var tfirst = true;
+                for (self.tabs.items) |*t_| {
+                    if (t_.window_id != id) continue;
+                    if (!tfirst) try w.writeByte(',');
+                    tfirst = false;
+                    try writeTab(t_, w);
+                }
+                try w.writeByte(']');
+            }
+            try w.writeByte('}');
+        }
+        if (one == null) try w.writeByte(']');
+        return true;
+    }
 };
 
 fn boolOf(o: std.json.ObjectMap, key: []const u8) ?bool {
@@ -392,6 +460,31 @@ test "replaceOwner: one connection's replace-all leaves the other's tabs alone" 
     try t.expectEqual(@as(usize, 1), gone.len);
     try t.expectEqual(@as(usize, 1), tb.tabs.items.len);
     try t.expect(tb.find(9) != null);
+}
+
+test "writeWindows: windows are the distinct window ids, focus and populate follow the tabs" {
+    const gpa = t.allocator;
+    var tb = Table{};
+    defer tb.deinit(gpa);
+    var d = try tb.replace(gpa, &[_]Incoming{
+        .{ .id = 1, .window_id = 7, .active = true, .url = "https://a.test/" },
+        .{ .id = 2, .window_id = 8, .active = true, .focused_window = true, .url = "https://b.test/" },
+        .{ .id = 3, .window_id = 7, .index = 1, .url = "https://c.test/" },
+    });
+    d.deinit(gpa);
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try t.expect(try tb.writeWindows(&aw.writer, .all, false));
+    try t.expect(std.mem.startsWith(u8, aw.written(), "[{\"id\":7,\"focused\":false"));
+    try t.expect(std.mem.indexOf(u8, aw.written(), "{\"id\":8,\"focused\":true") != null);
+    aw.clearRetainingCapacity();
+    try t.expect(try tb.writeWindows(&aw.writer, .last_focused, false));
+    try t.expect(std.mem.startsWith(u8, aw.written(), "{\"id\":8,"));
+    aw.clearRetainingCapacity();
+    try t.expect(try tb.writeWindows(&aw.writer, .{ .id = 7 }, true));
+    try t.expect(std.mem.indexOf(u8, aw.written(), "\"tabs\":[{\"id\":1,") != null);
+    try t.expect(std.mem.indexOf(u8, aw.written(), "{\"id\":3,") != null);
+    try t.expect(!try tb.writeWindows(&aw.writer, .{ .id = 99 }, false));
 }
 
 test "replace: first fill reports creations and the initial activation" {

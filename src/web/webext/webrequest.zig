@@ -26,18 +26,25 @@ const SpinLock = @import("../../util/spinlock.zig").SpinLock;
 const manifest = @import("manifest.zig");
 const match = @import("match.zig");
 
-/// The three blocking-capable events. MV2 has more (onCompleted,
-/// onErrorOccurred, …) but only these three can change a request, and
-/// only these three are worth a cross-process round trip.
+/// The webRequest events the helper delivers. Only the first three can
+/// change a request (`blockable`); the rest are notifications, delivered
+/// as fire-and-forget mailbox drops that never hold anything.
+/// `onResponseStarted` is among them because uBlock Origin injects its
+/// scriptlets from it.
 pub const Event = enum(u8) {
     before_request = 0,
     before_send_headers = 1,
     headers_received = 2,
+    send_headers = 3,
+    response_started = 4,
+    completed = 5,
+    error_occurred = 6,
 
     pub fn fromStr(s: []const u8) ?Event {
-        if (std.mem.eql(u8, s, "onBeforeRequest")) return .before_request;
-        if (std.mem.eql(u8, s, "onBeforeSendHeaders")) return .before_send_headers;
-        if (std.mem.eql(u8, s, "onHeadersReceived")) return .headers_received;
+        inline for (@typeInfo(Event).@"enum".fields) |f| {
+            const ev: Event = @enumFromInt(f.value);
+            if (std.mem.eql(u8, s, ev.toStr())) return ev;
+        }
         return null;
     }
 
@@ -46,7 +53,51 @@ pub const Event = enum(u8) {
             .before_request => "onBeforeRequest",
             .before_send_headers => "onBeforeSendHeaders",
             .headers_received => "onHeadersReceived",
+            .send_headers => "onSendHeaders",
+            .response_started => "onResponseStarted",
+            .completed => "onCompleted",
+            .error_occurred => "onErrorOccurred",
         };
+    }
+
+    /// Whether MV2 lets this event's listener take `["blocking"]`.
+    pub fn blockable(self: Event) bool {
+        return @intFromEnum(self) <= @intFromEnum(Event.headers_received);
+    }
+};
+
+/// Several extensions' answers for ONE request, folded with Chrome's
+/// precedence: a cancel from anyone wins; otherwise a redirect wins
+/// over header edits (and a LATER extension's redirect replaces an
+/// earlier one, Chrome's "most recently installed wins"); header edits
+/// from every extension apply in order. Pure so the rule is unit-tested.
+pub const Verdict = struct {
+    cancel: bool = false,
+    redirect_len: u16 = 0,
+    redirect: [1024]u8 = @splat(0),
+
+    pub fn redirectUrl(self: *const Verdict) ?[]const u8 {
+        if (self.redirect_len == 0) return null;
+        return self.redirect[0..self.redirect_len];
+    }
+
+    /// Fold one extension's decision in. Returns what the caller must
+    /// still do with it: nothing, or apply its header edits now.
+    pub fn fold(self: *Verdict, d: Decision) enum { done, apply_headers, keep_going } {
+        if (self.cancel) return .done;
+        if (d.cancel) {
+            self.cancel = true;
+            return .done;
+        }
+        if (d.redirect) |u| {
+            if (u.len <= self.redirect.len) {
+                @memcpy(self.redirect[0..u.len], u);
+                self.redirect_len = @intCast(u.len);
+            }
+            return .keep_going;
+        }
+        if (d.headers != null and self.redirect_len == 0) return .apply_headers;
+        return .keep_going;
     }
 };
 
@@ -202,6 +253,8 @@ pub const Registry = struct {
         urls: []const []const u8,
     ) RegisterError!void {
         if (!man.hasPermission("webRequest")) return error.NoWebRequestPermission;
+        // MV2 refuses "blocking" on a notification event outright; so do we.
+        if (extra.blocking and !event.blockable()) return error.BadEvent;
         if (extra.blocking and !man.hasPermission("webRequestBlocking")) return error.NoBlockingPermission;
 
         var l = Listener{ .lid = lid, .event = event, .extra = extra, .types = types };
@@ -575,6 +628,36 @@ test "permission gate: webRequest and webRequestBlocking are both enforced" {
         try reg.add(gpa, &man, 1, .before_request, .{ .blocking = true }, ALL_TYPES, &.{"<all_urls>"});
         try t.expect(reg.summary.hasBlocking(.before_request));
     }
+}
+
+test "notification events: registrable, never blocking, named like MV2" {
+    const gpa = t.allocator;
+    var man = try testManifest(gpa, "[\"webRequest\",\"webRequestBlocking\",\"<all_urls>\"]");
+    defer man.deinit();
+    var reg = Registry{};
+    defer reg.deinit(gpa);
+    reg.buildHosts(gpa, &man);
+    try t.expectEqual(Event.response_started, Event.fromStr("onResponseStarted").?);
+    try t.expectEqual(Event.error_occurred, Event.fromStr("onErrorOccurred").?);
+    try t.expect(Event.fromStr("onAuthRequired") == null);
+    try reg.add(gpa, &man, 1, .response_started, .{}, ALL_TYPES, &.{"<all_urls>"});
+    try t.expect(needFor(&reg, .response_started, "https://x.test/", .main_frame).matched);
+    try t.expectError(error.BadEvent, reg.add(gpa, &man, 2, .completed, .{ .blocking = true }, ALL_TYPES, &.{"<all_urls>"}));
+}
+
+test "verdict: cancel beats redirect beats headers, later redirect replaces earlier" {
+    var v = Verdict{};
+    try t.expectEqual(.apply_headers, v.fold(.{ .headers = &.{} }));
+    try t.expectEqual(.keep_going, v.fold(.{ .redirect = "https://a.test/" }));
+    // Once redirected, header edits are no longer applied.
+    try t.expectEqual(.keep_going, v.fold(.{ .headers = &.{} }));
+    try t.expectEqual(.keep_going, v.fold(.{ .redirect = "https://b.test/" }));
+    try t.expectEqualStrings("https://b.test/", v.redirectUrl().?);
+    try t.expectEqual(.done, v.fold(.{ .cancel = true }));
+    try t.expect(v.cancel);
+    // A cancel is final: nothing after it matters.
+    try t.expectEqual(.done, v.fold(.{ .redirect = "https://c.test/" }));
+    try t.expectEqualStrings("https://b.test/", v.redirectUrl().?);
 }
 
 test "summary short-circuits: no listener for an event costs no matching" {

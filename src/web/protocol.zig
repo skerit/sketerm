@@ -229,6 +229,16 @@ pub const CAP_REVIEW = "review";
 /// request with a client-minted id, and answers with a correlated
 /// `sem_result`. Existing semantic frame layouts remain unchanged.
 pub const CAP_SEMANTIC_REQUEST_IDS = "semantic-request-ids";
+/// The helper's extension host consults EVERY extension whose filters
+/// match a blocking webRequest (folded cancel > redirect > header edits,
+/// Chrome's precedence) instead of the first one only, delivers the
+/// webRequest notifications (`onSendHeaders`, `onResponseStarted`,
+/// `onCompleted`, `onErrorOccurred`) and `webNavigation` events, and
+/// answers `tabs.executeScript`/`insertCSS`/`removeCSS`/`getZoom`,
+/// `webNavigation.getFrame(s)`, `windows.get*`, `permissions` and
+/// `commands.getAll`. Nothing new crosses the wire: a client reports it
+/// and never has to fingerprint an older helper's behaviour.
+pub const CAP_WEBEXT_EVENTS = "webext-events";
 /// The helper reports the enabled browser actions for the active page,
 /// accepts trusted toolbar activations, and presents declared popups as
 /// dedicated extension-page views (0xB7-0xB9).
@@ -364,6 +374,7 @@ pub const Cap = enum {
     review,
     semantic_request_ids,
     webext_action,
+    webext_events,
     webext_transaction,
     multi_client,
     presenter,

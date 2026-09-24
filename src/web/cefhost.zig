@@ -481,6 +481,12 @@ pub const View = struct {
     /// Added on top of the DPR zoom in `applyZoom`, and re-applied on
     /// every load start because Chromium resets zoom per navigation.
     user_zoom_x100: i32 = 0,
+    /// `tabs.executeScript({runAt:"document_start"})` commands aimed at
+    /// the document this view is navigating TO (a main-frame response
+    /// has started, the document has not committed): run at the next
+    /// main-frame load start. `exec_nav_pending` is that window.
+    exec_at_start: std.ArrayList([]u8) = .empty,
+    exec_nav_pending: bool = false,
     /// Identity context this view was created in (0 = shared default).
     /// Kept so a post-discard revival re-uses the same request context
     /// and its cookie jar / egress; resolved to a pointer per spawn.
@@ -1129,6 +1135,9 @@ pub const Host = struct {
         const Kind = enum {
             message,
             popup,
+            /// `tabs.executeScript` / `insertCSS` / `removeCSS`: the
+            /// target frame answers with `ext-exec-result`.
+            exec,
 
             /// What the waiting Promise is rejected with when its
             /// recipient goes away.
@@ -1136,6 +1145,7 @@ pub const Host = struct {
                 return switch (self) {
                     .message => "message recipient is gone",
                     .popup => "popup target is gone",
+                    .exec => "the tab's document went away before the script ran",
                 };
             }
 
@@ -1144,6 +1154,7 @@ pub const Host = struct {
                 return switch (self) {
                     .message => "message recipient did not reply",
                     .popup => "native popup was never acknowledged",
+                    .exec => "the script did not run (it may not have compiled)",
                 };
             }
         };
@@ -3473,6 +3484,8 @@ pub const Host = struct {
         if (v.title.len != 0) self.gpa.free(v.title);
         if (v.sel_text.len != 0) self.gpa.free(v.sel_text);
         v.pending.deinit(self.gpa);
+        for (v.exec_at_start.items) |js| self.gpa.free(js);
+        v.exec_at_start.deinit(self.gpa);
         v.forgetFrames(self.gpa);
         v.sem.deinit();
         self.gpa.destroy(v);
@@ -5832,6 +5845,8 @@ pub const Host = struct {
             self.wreqDecision(v, json);
         } else if (std.mem.eql(u8, op, "ext-reply")) {
             self.extRouteReply(v, json);
+        } else if (std.mem.eql(u8, op, "ext-exec-result")) {
+            self.extExecResult(v, json);
         } else if (std.mem.eql(u8, op, "ext-connect")) {
             self.extPortConnect(v, json);
         } else if (std.mem.eql(u8, op, "ext-port-msg")) {
@@ -5899,6 +5914,22 @@ pub const Host = struct {
             (std.mem.eql(u8, r.method, "update") or std.mem.eql(u8, r.method, "reload")))
         {
             self.extTabsNavigate(v, e, r.req, r.method, r.args);
+            return;
+        }
+        // Script and style injection reach a FRAME; zoom is the view's.
+        if (std.mem.eql(u8, r.ns, "tabs") and
+            (std.mem.eql(u8, r.method, "executeScript") or std.mem.eql(u8, r.method, "insertCSS") or
+                std.mem.eql(u8, r.method, "removeCSS")))
+        {
+            self.extTabsExec(v, e, r.req, r.method, r.args);
+            return;
+        }
+        if (std.mem.eql(u8, r.ns, "tabs") and std.mem.eql(u8, r.method, "getZoom")) {
+            self.extTabsGetZoom(v, e, r.req, r.args);
+            return;
+        }
+        if (std.mem.eql(u8, r.ns, "webNavigation")) {
+            self.extWebNavFrames(v, e, r.req, r.method, r.args);
             return;
         }
         if (std.mem.eql(u8, r.ns, "browserAction") and
@@ -6255,6 +6286,332 @@ pub const Host = struct {
         self.extReplyOk(v, e, req, "null");
     }
 
+    /// The tab a `tabs.*` call names (negative = the active one) and its
+    /// live view; the reply is sent from here when there is none.
+    fn extTabView(self: *Host, v: *View, e: *webexthost.Extension, req: u32, id_arg: ?std.json.Value) ?struct { tab: *const exttabs.Tab, view: *View } {
+        const raw_id: i64 = if (id_arg) |a| (if (a == .integer) a.integer else -1) else -1;
+        const tb = blk: {
+            if (raw_id >= 0) break :blk if (exttabs.u32Of(id_arg.?)) |id| self.webext.tabs.find(id) else null;
+            break :blk self.webext.tabs.active();
+        } orelse {
+            self.extReplyErr(v, req, e.id, &e.capability, "no such tab");
+            return null;
+        };
+        const target = (if (tb.view != 0) self.find(tb.view) else null) orelse {
+            self.extReplyErr(v, req, e.id, &e.capability, "tab has no live browser view");
+            return null;
+        };
+        return .{ .tab = tb, .view = target };
+    }
+
+    /// Whether the extension's host permissions cover `url` — what
+    /// `executeScript`/`insertCSS` require of the tab's document.
+    fn extHostAllowed(self: *Host, e: *const webexthost.Extension, url: []const u8) bool {
+        const man = if (e.man) |*m| m else return false;
+        var set: extmatch.PatternSet = .{};
+        defer set.deinit(self.gpa);
+        for (man.permissions) |p| set.addInclude(self.gpa, p) catch continue;
+        for (man.host_permissions) |p| set.addInclude(self.gpa, p) catch continue;
+        return set.matchesUrl(url);
+    }
+
+    /// `tabs.executeScript` / `insertCSS` / `removeCSS`, args
+    /// `[tabId, details]`. Runs in ONE frame — the main one, or
+    /// `details.frameId` — through the semantic slot, and answers with
+    /// that frame's `ext-exec-result`. `allFrames` is refused rather
+    /// than half-served. A `runAt:"document_start"` call against a view
+    /// that is mid-navigation waits for the new document's load start,
+    /// which is where uBlock Origin's scriptlets (sent from
+    /// `onResponseStarted`) have to land.
+    fn extTabsExec(self: *Host, v: *View, e: *webexthost.Extension, req: u32, method: []const u8, args: std.json.Value) void {
+        const items = if (args == .array) args.array.items else &[_]std.json.Value{};
+        const tv = self.extTabView(v, e, req, if (items.len > 0) items[0] else null) orelse return;
+        const details: ?std.json.ObjectMap = if (items.len > 1 and items[1] == .object) items[1].object else null;
+        const d = details orelse {
+            self.extReplyErr(v, req, e.id, &e.capability, "missing details");
+            return;
+        };
+        if (d.get("allFrames")) |af| if (af == .bool and af.bool) {
+            self.extReplyErr(v, req, e.id, &e.capability, "allFrames is not supported: target one frame (frameId)");
+            return;
+        };
+        const tab_url = if (tv.view.url.len != 0) tv.view.url else tv.tab.url;
+        if (!self.extHostAllowed(e, tab_url)) {
+            self.extReplyErr(v, req, e.id, &e.capability, "missing host permission for the tab");
+            return;
+        }
+        var owned_file: ?[]u8 = null;
+        defer if (owned_file) |f| self.gpa.free(f);
+        var code: []const u8 = "";
+        if (d.get("code")) |cv| {
+            if (cv == .string) code = cv.string;
+        } else if (d.get("file")) |fv| {
+            if (fv == .string) {
+                owned_file = self.webext.readAsset(e, fv.string);
+                code = owned_file orelse {
+                    self.extReplyErr(v, req, e.id, &e.capability, "file not found in the extension package");
+                    return;
+                };
+            }
+        }
+        if (code.len == 0) {
+            self.extReplyErr(v, req, e.id, &e.capability, "details need code or file");
+            return;
+        }
+        const frame_id: i64 = if (d.get("frameId")) |fv| (if (fv == .integer) fv.integer else 0) else 0;
+        const is_css = !std.mem.eql(u8, method, "executeScript");
+        const gid = self.webext_next_gid;
+        self.webext_next_gid +%= 1;
+        if (self.webext_next_gid == 0) self.webext_next_gid = 1;
+
+        var cmd: std.Io.Writer.Allocating = .init(self.gpa);
+        defer cmd.deinit();
+        const w = &cmd.writer;
+        const slot: []const u8 = &sem_secret.slot;
+        // An OBJECT command, so script code can travel as a function
+        // literal compiled with the command itself: a page whose CSP
+        // forbids eval() still runs it (the result is then undefined,
+        // because only eval yields a completion value).
+        w.print("window[\"{s}\"]&&window[\"{s}\"]({{\"op\":\"ext-exec\",\"ext\":", .{ slot, slot }) catch return;
+        jsonStr(w, e.id) catch return;
+        w.writeAll(",\"cap\":") catch return;
+        jsonStr(w, &e.capability) catch return;
+        w.print(",\"gid\":{d}", .{gid}) catch return;
+        if (is_css) {
+            w.writeAll(",\"css\":") catch return;
+            jsonStr(w, code) catch return;
+            if (std.mem.eql(u8, method, "removeCSS")) w.writeAll(",\"remove\":true") catch return;
+        } else {
+            w.writeAll(",\"code\":") catch return;
+            jsonStr(w, code) catch return;
+            w.writeAll(",\"fn\":function(){\n") catch return;
+            w.writeAll(code) catch return;
+            w.writeAll("\n}") catch return;
+        }
+        w.writeAll("},0)") catch return;
+
+        const ext_copy = self.gpa.dupe(u8, e.id) catch {
+            self.extReplyErr(v, req, e.id, &e.capability, "out of memory");
+            return;
+        };
+        if (!self.pushReply(.{
+            .kind = .exec,
+            .gid = gid,
+            .origin_view = v.id,
+            .origin_req = req,
+            .reply_view = tv.view.id,
+            .ext = ext_copy,
+            .deadline_ms = nowMs() + route_reply_timeout_ms,
+        })) {
+            self.gpa.free(ext_copy);
+            self.extReplyErr(v, req, e.id, &e.capability, "out of memory");
+            return;
+        }
+        const run_at: []const u8 = if (d.get("runAt")) |rv| (if (rv == .string) rv.string else "") else "";
+        if (frame_id == 0 and std.mem.eql(u8, run_at, "document_start") and tv.view.exec_nav_pending) {
+            // The document this is meant for has not committed yet.
+            const js = self.gpa.dupe(u8, cmd.written()) catch return;
+            tv.view.exec_at_start.append(self.gpa, js) catch self.gpa.free(js);
+            return;
+        }
+        const b = tv.view.browser orelse return;
+        const frame: *cef.cef_frame_t = blk: {
+            if (frame_id == 0) {
+                const gf = b.get_main_frame orelse return;
+                break :blk gf(b) orelse return;
+            }
+            break :blk self.frameById(tv.view, frame_id) orelse {
+                if (self.takeReply(.exec, gid, tv.view.id, e.id)) |rec| self.failReply(rec, "no frame with that frameId");
+                return;
+            };
+        };
+        defer release(&frame.base);
+        runJs(frame, cmd.written());
+    }
+
+    /// Run the `document_start` scripts queued for a view's next
+    /// document. Called from the main frame's load start.
+    fn flushExecAtStart(self: *Host, v: *View, frame: *cef.cef_frame_t) void {
+        if (v.exec_at_start.items.len == 0) return;
+        const list = v.exec_at_start.toOwnedSlice(self.gpa) catch return;
+        defer {
+            for (list) |js| self.gpa.free(js);
+            self.gpa.free(list);
+        }
+        for (list) |js| runJs(frame, js);
+    }
+
+    /// A frame answered `tabs.executeScript`/`insertCSS`/`removeCSS`.
+    fn extExecResult(self: *Host, v: *View, json: []const u8) void {
+        const R = struct { ext: []const u8 = "", cap: []const u8 = "", gid: u32 = 0, ok: bool = false, err: []const u8 = "", result: std.json.Value = .null };
+        const parsed = std.json.parseFromSlice(R, self.gpa, json, .{ .ignore_unknown_fields = true }) catch return;
+        defer parsed.deinit();
+        const e = self.webext.authorize(parsed.value.ext, parsed.value.cap) orelse return;
+        const route = self.takeReply(.exec, parsed.value.gid, v.id, e.id) orelse return;
+        defer self.gpa.free(route.ext);
+        const origin = self.find(route.origin_view) orelse return;
+        if (!parsed.value.ok) {
+            self.extReplyErr(origin, route.origin_req, e.id, &e.capability, if (parsed.value.err.len != 0) parsed.value.err else "script failed");
+            return;
+        }
+        // executeScript resolves with one result PER FRAME it ran in.
+        var out: std.Io.Writer.Allocating = .init(self.gpa);
+        defer out.deinit();
+        out.writer.writeByte('[') catch return;
+        std.json.Stringify.value(parsed.value.result, .{}, &out.writer) catch return;
+        out.writer.writeByte(']') catch return;
+        self.sendExtReply(origin, e.id, &e.capability, route.origin_req, true, out.written());
+    }
+
+    /// A frame of `v` by the `frameId` this helper reports for it
+    /// (`frameIdOf`); the caller releases it.
+    fn frameById(self: *Host, v: *View, want: i64) ?*cef.cef_frame_t {
+        _ = self;
+        const b = v.browser orelse return null;
+        const gfi = b.get_frame_identifiers orelse return null;
+        const byid = b.get_frame_by_identifier orelse return null;
+        const list = cef.cef_string_list_alloc() orelse return null;
+        defer cef.cef_string_list_free(list);
+        gfi(b, list);
+        const n = cef.cef_string_list_size(list);
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            var ident = std.mem.zeroes(cef.cef_string_t);
+            defer cef.cef_string_utf16_clear(&ident);
+            if (cef.cef_string_list_value(list, i, &ident) == 0) continue;
+            const frame: *cef.cef_frame_t = byid(b, &ident) orelse continue;
+            if (frameIdOf(frame) == want) return frame;
+            release(&frame.base);
+        }
+        return null;
+    }
+
+    /// `tabs.getZoom([tabId])`: the user zoom as a factor.
+    fn extTabsGetZoom(self: *Host, v: *View, e: *webexthost.Extension, req: u32, args: std.json.Value) void {
+        const items = if (args == .array) args.array.items else &[_]std.json.Value{};
+        const tv = self.extTabView(v, e, req, if (items.len > 0) items[0] else null) orelse return;
+        const factor = std.math.pow(f64, 1.2, @as(f64, @floatFromInt(tv.view.user_zoom_x100)) / 100.0);
+        var buf: [64]u8 = undefined;
+        const txt = std.fmt.bufPrint(&buf, "{d:.4}", .{factor}) catch "1";
+        self.extReplyOk(v, e, req, txt);
+    }
+
+    /// `webNavigation.getFrame({tabId, frameId})` /
+    /// `getAllFrames({tabId})`, from the engine's live frame tree.
+    fn extWebNavFrames(self: *Host, v: *View, e: *webexthost.Extension, req: u32, method: []const u8, args: std.json.Value) void {
+        const man = if (e.man) |*m| m else return;
+        if (!man.hasPermission("webNavigation")) {
+            self.extReplyErr(v, req, e.id, &e.capability, "webNavigation permission is required");
+            return;
+        }
+        const items = if (args == .array) args.array.items else &[_]std.json.Value{};
+        const d: ?std.json.ObjectMap = if (items.len > 0 and items[0] == .object) items[0].object else null;
+        const tab_arg: ?std.json.Value = if (d) |o| o.get("tabId") else null;
+        const tv = self.extTabView(v, e, req, tab_arg) orelse return;
+        const want_one = std.mem.eql(u8, method, "getFrame");
+        const want_id: i64 = if (d) |o| (if (o.get("frameId")) |f| (if (f == .integer) f.integer else 0) else 0) else 0;
+        const b = tv.view.browser orelse {
+            self.extReplyOk(v, e, req, if (want_one) "null" else "[]");
+            return;
+        };
+        var out: std.Io.Writer.Allocating = .init(self.gpa);
+        defer out.deinit();
+        const w = &out.writer;
+        if (!want_one) w.writeByte('[') catch return;
+        var wrote = false;
+        const gfi = b.get_frame_identifiers orelse return;
+        const byid = b.get_frame_by_identifier orelse return;
+        const list = cef.cef_string_list_alloc() orelse return;
+        defer cef.cef_string_list_free(list);
+        gfi(b, list);
+        const n = cef.cef_string_list_size(list);
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            var ident = std.mem.zeroes(cef.cef_string_t);
+            defer cef.cef_string_utf16_clear(&ident);
+            if (cef.cef_string_list_value(list, i, &ident) == 0) continue;
+            const frame: *cef.cef_frame_t = byid(b, &ident) orelse continue;
+            defer release(&frame.base);
+            const fid = frameIdOf(frame);
+            if (want_one and fid != want_id) continue;
+            if (wrote) w.writeByte(',') catch return;
+            wrote = true;
+            var url_buf: [2048]u8 = undefined;
+            const url = if (frame.get_url) |gu| userfreeInto(gu(frame), &url_buf) else "";
+            w.print("{{\"frameId\":{d},\"parentFrameId\":{d},\"errorOccurred\":false,\"url\":", .{ fid, parentFrameIdOf(frame) }) catch return;
+            jsonStr(w, url) catch return;
+            w.writeByte('}') catch return;
+            if (want_one) break;
+        }
+        if (want_one) {
+            if (!wrote) w.writeAll("null") catch return;
+        } else w.writeByte(']') catch return;
+        self.extReplyOk(v, e, req, out.written());
+    }
+
+    /// One `webNavigation.<ev>` event for a frame of a page view, to
+    /// every enabled extension holding the `webNavigation` permission.
+    fn webNavEvent(self: *Host, v: *View, frame: ?*cef.cef_frame_t, ev: []const u8, url_override: []const u8, extra: []const u8) void {
+        if (v.webext_bg or v.webext_popup or v.devtools_of != 0) return;
+        const f = frame orelse return;
+        var any = false;
+        for (self.webext.exts.items) |*e| {
+            if (!e.enabled or !e.ok or e.bg_view == 0) continue;
+            const man = if (e.man) |*m| m else continue;
+            if (man.hasPermission("webNavigation")) {
+                any = true;
+                break;
+            }
+        }
+        if (!any) return;
+        var url_buf: [2048]u8 = undefined;
+        const url = if (url_override.len != 0) url_override else if (f.get_url) |gu| userfreeInto(gu(f), &url_buf) else "";
+        // A page no extension could see (the helper's own internal
+        // documents) never produces an event.
+        if (std.mem.startsWith(u8, url, ext_scheme ++ "://")) return;
+        const tab_id: i64 = if (self.webext.tabs.findByView(v.id)) |tb| @intCast(tb.id) else -1;
+        var details: std.Io.Writer.Allocating = .init(self.gpa);
+        defer details.deinit();
+        const dw = &details.writer;
+        dw.print("{{\"tabId\":{d},\"frameId\":{d},\"parentFrameId\":{d},\"processId\":-1,\"timeStamp\":{d},\"url\":", .{
+            tab_id, frameIdOf(f), parentFrameIdOf(f), @import("../util/clock.zig").wallMs(),
+        }) catch return;
+        jsonStr(dw, url) catch return;
+        if (extra.len != 0) {
+            dw.writeByte(',') catch return;
+            dw.writeAll(extra) catch return;
+        }
+        dw.writeByte('}') catch return;
+        for (self.webext.exts.items) |*e| {
+            if (!e.enabled or !e.ok) continue;
+            const man = if (e.man) |*m| m else continue;
+            if (!man.hasPermission("webNavigation")) continue;
+            const bg = if (e.bg_view != 0) self.find(e.bg_view) else null;
+            if (bg == null) continue;
+            self.postNsEvent(bg.?, e, "webNavigation", ev, details.written());
+        }
+    }
+
+    /// `{op:"ext-ns-event"}`: fire `browser.<ns>.<ev>(args...)` in one
+    /// extension page. `args_json` is the single argument, already JSON.
+    fn postNsEvent(self: *Host, target: *View, e: *const webexthost.Extension, ns: []const u8, ev: []const u8, arg_json: []const u8) void {
+        var cmd: std.Io.Writer.Allocating = .init(self.gpa);
+        defer cmd.deinit();
+        const w = &cmd.writer;
+        w.writeAll("{\"op\":\"ext-ns-event\",\"ext\":") catch return;
+        jsonStr(w, e.id) catch return;
+        w.writeAll(",\"cap\":") catch return;
+        jsonStr(w, &e.capability) catch return;
+        w.writeAll(",\"ns\":") catch return;
+        jsonStr(w, ns) catch return;
+        w.writeAll(",\"ev\":") catch return;
+        jsonStr(w, ev) catch return;
+        w.writeAll(",\"args\":[") catch return;
+        w.writeAll(arg_json) catch return;
+        w.writeAll("]}") catch return;
+        self.sendScript(target, cmd.written());
+    }
+
     /// `browser.tabs.sendMessage(tabId, message)` — the direction that
     /// did not exist: background -> a CONTENT frame.
     ///
@@ -6558,32 +6915,56 @@ pub const Host = struct {
 
     // -- blocking webRequest, main-thread half ------------------------
 
-    /// Called once per poll iteration. Two jobs, both of which have to
-    /// happen on this thread because both touch a browser: dispatch the
-    /// holds the IO thread queued, and fail-open anything past its
-    /// deadline.
+    /// Called once per poll iteration. Three jobs, all of which have to
+    /// happen on this thread because they touch a browser or the
+    /// registry: move each held chain on to its next extension, dispatch
+    /// what is queued, and move past (never cancel on) an extension that
+    /// missed its deadline.
     ///
     /// Cheap when idle: one relaxed atomic load and a return.
     pub fn webrequestPump(self: *Host) void {
         if (!webrequestBusy()) return;
         webrequestDrainWake();
 
+        // Chains first: an advance either queues the next dispatch
+        // (picked up below, this same turn) or answers the request.
+        {
+            var adv: [MAX_HOLDS]u32 = undefined;
+            var nadv: usize = 0;
+            {
+                g_wreq.acquire();
+                defer g_wreq.release();
+                for (&g_wreq.holds) |*h| {
+                    if (h.used and h.advance) {
+                        adv[nadv] = h.hid;
+                        nadv += 1;
+                    }
+                }
+            }
+            for (adv[0..nadv]) |hid| self.wreqAdvance(hid);
+        }
+
         // One pass, copying what we need out under the lock — sending a
         // command re-enters CEF and must not run with the spinlock held.
         const Job = struct {
             hid: u32,
+            gen: u32,
             bg_view: u32,
             ext: usize,
             event: webrequest.Event,
             rtype: u8,
             view_id: u32,
             with_headers: bool,
+            observational: bool,
+            held: bool,
             url: [HOLD_URL_MAX]u8,
             url_len: u16,
             method: [8]u8,
             method_len: u8,
             hdr: [HOLD_HDR_MAX]u8,
             hdr_len: u16,
+            extra: [256]u8,
+            extra_len: u16,
             lids: [webrequest.MAX_MATCHED]u32,
             n_lids: u8,
         };
@@ -6596,7 +6977,7 @@ pub const Host = struct {
             g_wreq.acquire();
             defer g_wreq.release();
             for (&g_wreq.holds) |*h| {
-                if (!h.used) continue;
+                if (!h.used or h.advance) continue;
                 if (h.dispatched) {
                     if (now >= h.deadline_ms) {
                         expired[nexpired] = h.hid;
@@ -6609,20 +6990,25 @@ pub const Host = struct {
                 njobs += 1;
                 j.* = .{
                     .hid = h.hid,
+                    .gen = h.gen,
                     .bg_view = h.bg_view,
                     .ext = h.ext,
                     .event = h.event,
                     .rtype = h.rtype,
                     .view_id = h.view_id,
                     .with_headers = h.want_request_headers,
+                    .observational = !h.cur_blocking,
+                    .held = h.cb != null,
                     .url = h.url,
                     .url_len = h.url_len,
                     .method = h.method,
                     .method_len = h.method_len,
                     .hdr = h.hdr,
                     .hdr_len = h.hdr_len,
-                    .lids = h.lids[@intFromEnum(h.event)],
-                    .n_lids = h.n_lids[@intFromEnum(h.event)],
+                    .extra = h.extra,
+                    .extra_len = h.extra_len,
+                    .lids = h.lids,
+                    .n_lids = h.n_lids,
                 };
             }
         }
@@ -6630,7 +7016,6 @@ pub const Host = struct {
         for (jobs[0..njobs]) |*j| {
             var ext_buf: [webrequest.MAX_ID]u8 = undefined;
             var ext_len: usize = 0;
-            var observational = false;
             {
                 g_wreq.acquire();
                 defer g_wreq.release();
@@ -6638,106 +7023,35 @@ pub const Host = struct {
                     ext_len = s.id_len;
                     @memcpy(ext_buf[0..ext_len], s.idSlice());
                 }
-                if (wreqFind(j.hid)) |h| observational = h.cb == null;
             }
             const bg = self.find(j.bg_view);
-            if (ext_len == 0 or bg == null) {
+            const e_opt = if (ext_len == 0) null else self.webext.find(ext_buf[0..ext_len]);
+            if (ext_len == 0 or bg == null or e_opt == null) {
                 // The listener became unreachable between the hold and
-                // this dispatch. An enumerated exit: fail open.
-                self.wreqFailOpen(j.hid);
+                // this dispatch: skip this extension (a mailbox simply
+                // retires).
+                self.wreqStepDone(j.hid, j.gen, j.held);
                 continue;
             }
+            const e = e_opt.?;
             var cmd: std.Io.Writer.Allocating = .init(self.gpa);
             defer cmd.deinit();
-            const w = &cmd.writer;
-            w.writeAll("{\"op\":\"ext-wreq\",\"ext\":") catch continue;
-            jsonStr(w, ext_buf[0..ext_len]) catch continue;
-            const e = self.webext.find(ext_buf[0..ext_len]) orelse {
-                self.wreqFailOpen(j.hid);
+            self.writeWreqCommand(&cmd.writer, e, j, now) catch {
+                self.wreqStepDone(j.hid, j.gen, j.held);
                 continue;
             };
-            w.writeAll(",\"cap\":") catch continue;
-            jsonStr(w, &e.capability) catch continue;
-            w.print(",\"hid\":{d},\"event\":", .{j.hid}) catch continue;
-            jsonStr(w, j.event.toStr()) catch continue;
-            w.writeAll(",\"details\":{\"requestId\":") catch continue;
-            var rid_buf: [24]u8 = undefined;
-            const rid = std.fmt.bufPrint(&rid_buf, "{d}", .{j.hid}) catch "0";
-            jsonStr(w, rid) catch continue;
-            w.writeAll(",\"url\":") catch continue;
-            jsonStr(w, j.url[0..j.url_len]) catch continue;
-            w.writeAll(",\"method\":") catch continue;
-            jsonStr(w, j.method[0..j.method_len]) catch continue;
-            w.writeAll(",\"type\":") catch continue;
-            const rt: webrequest.RType = @enumFromInt(j.rtype);
-            jsonStr(w, rt.toStr()) catch continue;
-            // THE TAB ID IS LOAD-BEARING, not decoration. MV2 defines
-            // -1 as "not associated with a tab", and uBlock Origin's
-            // `onBeforeRequest` reads exactly that: `if (tabId < 0)` it
-            // takes its BEHIND-THE-SCENE path, where a page it has no
-            // store for is handled by different rules — measured here as
-            // uBO cancelling the top-level navigation of every page.
-            // So the real tab is looked up from the client's mirrored
-            // list, and -1 survives only for a view no tab claims (a
-            // background page's own fetch, which IS tabless).
-            const tab_id: i64 = if (self.webext.tabs.findByView(j.view_id)) |tb|
-                @intCast(tb.id)
-            else
-                -1;
-            w.print(",\"tabId\":{d},\"frameId\":0,\"parentFrameId\":-1,\"timeStamp\":{d}", .{ tab_id, now }) catch continue;
-            // `documentUrl`/`originUrl` describe the document that CAUSED
-            // the request, and MV2 OMITS them for a top-level navigation
-            // — the document is the request. Sending the view's previous
-            // url there (`about:blank` on a fresh view) makes a page
-            // third-party to ITSELF, and uBO then strict-blocks the
-            // navigation: measured as every page failing ERR_ABORTED.
-            if (rt != .main_frame) {
-                // OUR OWN view's url wins over the client's mirrored tab.
-                // `v.url` is set in-process by `on_address_change`; the
-                // tab table is at minimum a full round trip behind it
-                // (helper -> socket -> GUI -> a coalescing idle -> back),
-                // so right after a navigation the mirror still names the
-                // PREVIOUS page. That made a page's own subresources
-                // third-party to itself, which is exactly what uBO
-                // strict-blocks. The mirror supplies IDENTITY (tabId),
-                // never the url. Before the GUI posted a tab list at all
-                // this could not bite, because the lookup always missed.
-                const doc: []const u8 = if (self.find(j.view_id)) |pv| blk: {
-                    if (pv.url.len != 0) break :blk pv.url;
-                    break :blk if (self.webext.tabs.findByView(j.view_id)) |tb| tb.url else "";
-                } else if (self.webext.tabs.findByView(j.view_id)) |tb| tb.url else "";
-                if (doc.len != 0) {
-                    w.writeAll(",\"documentUrl\":") catch continue;
-                    jsonStr(w, doc) catch continue;
-                    w.writeAll(",\"originUrl\":") catch continue;
-                    jsonStr(w, doc) catch continue;
-                }
-            }
-            if (j.with_headers and j.hdr_len != 0) {
-                w.writeAll(",\"requestHeaders\":") catch continue;
-                w.writeAll(j.hdr[0..j.hdr_len]) catch continue;
-            }
-            if (observational) w.writeAll(",\"obs\":true") catch continue;
-            w.writeAll("}") catch continue;
-            // The listener ids whose own filter matched. The frame runs
-            // ONLY these.
-            w.writeAll(",\"lids\":[") catch continue;
-            for (j.lids[0..j.n_lids], 0..) |lid, li| {
-                if (li != 0) w.writeByte(',') catch continue;
-                w.print("{d}", .{lid}) catch continue;
-            }
-            w.writeByte(']') catch continue;
-            if (c.getenv("SKETERM_WEB_WREQ_DEBUG") != null) {
-                w.writeAll(",\"dbg\":true") catch continue;
-            }
-            w.writeByte('}') catch continue;
             self.sendScript(bg.?, cmd.written());
+            // A main-frame response started: until the new document
+            // commits, a `document_start` executeScript is for IT.
+            if (j.event == .response_started and @as(webrequest.RType, @enumFromInt(j.rtype)) == .main_frame) {
+                if (self.find(j.view_id)) |pv| pv.exec_nav_pending = true;
+            }
             // An OBSERVATIONAL notification is a mailbox drop, not a
-            // question: the request continued long ago and no decision
-            // is coming back. Retire the slot the moment the command is
-            // out, so a page full of non-blocking notifications never
-            // occupies the hold table or keeps the loop spinning.
-            if (observational) self.wreqRetire(j.hid);
+            // question: no decision is coming back. A mailbox slot is
+            // retired the moment the command is out, so a page full of
+            // non-blocking notifications never occupies the hold table;
+            // a held chain moves on to its next extension.
+            if (j.observational) self.wreqStepDone(j.hid, j.gen, j.held);
         }
 
         for (expired[0..nexpired]) |hid| {
@@ -6747,12 +7061,309 @@ pub const Host = struct {
                     s.timed_out +%= 1;
                     s.failed_open +%= 1;
                 }
+                // A timeout moves PAST the slow extension, it NEVER
+                // cancels: a wedged or slow extension must degrade the
+                // browser's filtering, not its ability to load pages.
+                if (h.cb != null) {
+                    h.advance = true;
+                    h.dispatched = false;
+                }
             }
             g_wreq.release();
-            // A timeout continues the request. NEVER cancels: a wedged
-            // or slow extension must degrade the browser's filtering,
-            // not its ability to load pages.
-            self.wreqFailOpen(hid);
+            // A mailbox with nobody listening any more just retires.
+            self.wreqRetire(hid);
+            wreqPoke();
+        }
+    }
+
+    /// The `ext-wreq` command for one dispatch.
+    fn writeWreqCommand(self: *Host, w: *std.Io.Writer, e: *const webexthost.Extension, j: anytype, now: i64) !void {
+        try w.writeAll("{\"op\":\"ext-wreq\",\"ext\":");
+        try jsonStr(w, e.id);
+        try w.writeAll(",\"cap\":");
+        try jsonStr(w, &e.capability);
+        try w.print(",\"hid\":{d},\"g\":{d},\"event\":", .{ j.hid, j.gen });
+        try jsonStr(w, j.event.toStr());
+        try w.writeAll(",\"details\":{\"requestId\":");
+        var rid_buf: [24]u8 = undefined;
+        const rid = std.fmt.bufPrint(&rid_buf, "{d}", .{j.hid}) catch "0";
+        try jsonStr(w, rid);
+        try w.writeAll(",\"url\":");
+        try jsonStr(w, j.url[0..j.url_len]);
+        try w.writeAll(",\"method\":");
+        try jsonStr(w, if (j.method_len == 0) "GET" else j.method[0..j.method_len]);
+        try w.writeAll(",\"type\":");
+        const rt: webrequest.RType = @enumFromInt(j.rtype);
+        try jsonStr(w, rt.toStr());
+        // THE TAB ID IS LOAD-BEARING, not decoration. MV2 defines
+        // -1 as "not associated with a tab", and uBlock Origin's
+        // `onBeforeRequest` reads exactly that: `if (tabId < 0)` it
+        // takes its BEHIND-THE-SCENE path, where a page it has no
+        // store for is handled by different rules — measured here as
+        // uBO cancelling the top-level navigation of every page.
+        // So the real tab is looked up from the client's mirrored
+        // list, and -1 survives only for a view no tab claims (a
+        // background page's own fetch, which IS tabless).
+        const tab_id: i64 = if (self.webext.tabs.findByView(j.view_id)) |tb|
+            @intCast(tb.id)
+        else
+            -1;
+        // Frame attribution is coarse: the main frame is 0 and a
+        // subresource is attributed to it (parent -1) too.
+        try w.print(",\"tabId\":{d},\"frameId\":0,\"parentFrameId\":-1,\"timeStamp\":{d}", .{ tab_id, now });
+        // `documentUrl`/`originUrl` describe the document that CAUSED
+        // the request, and MV2 OMITS them for a top-level navigation
+        // — the document is the request. Sending the view's previous
+        // url there (`about:blank` on a fresh view) makes a page
+        // third-party to ITSELF, and uBO then strict-blocks the
+        // navigation: measured as every page failing ERR_ABORTED.
+        if (rt != .main_frame) {
+            // OUR OWN view's url wins over the client's mirrored tab.
+            // `v.url` is set in-process by `on_address_change`; the
+            // tab table is at minimum a full round trip behind it
+            // (helper -> socket -> GUI -> a coalescing idle -> back),
+            // so right after a navigation the mirror still names the
+            // PREVIOUS page. That made a page's own subresources
+            // third-party to itself, which is exactly what uBO
+            // strict-blocks. The mirror supplies IDENTITY (tabId),
+            // never the url.
+            const doc: []const u8 = if (self.find(j.view_id)) |pv| blk: {
+                if (pv.url.len != 0) break :blk pv.url;
+                break :blk if (self.webext.tabs.findByView(j.view_id)) |tb| tb.url else "";
+            } else if (self.webext.tabs.findByView(j.view_id)) |tb| tb.url else "";
+            if (doc.len != 0) {
+                try w.writeAll(",\"documentUrl\":");
+                try jsonStr(w, doc);
+                try w.writeAll(",\"originUrl\":");
+                try jsonStr(w, doc);
+            }
+        }
+        if (j.with_headers and j.hdr_len != 0) {
+            const hdr_key: []const u8 = switch (j.event) {
+                .headers_received, .response_started, .completed => ",\"responseHeaders\":",
+                else => ",\"requestHeaders\":",
+            };
+            try w.writeAll(hdr_key);
+            try w.writeAll(j.hdr[0..j.hdr_len]);
+        }
+        if (j.extra_len != 0) {
+            try w.writeByte(',');
+            try w.writeAll(j.extra[0..j.extra_len]);
+        }
+        if (j.observational) try w.writeAll(",\"obs\":true");
+        try w.writeAll("}");
+        // The listener ids whose own filter matched. The frame runs
+        // ONLY these.
+        try w.writeAll(",\"lids\":[");
+        for (j.lids[0..j.n_lids], 0..) |lid, li| {
+            if (li != 0) try w.writeByte(',');
+            try w.print("{d}", .{lid});
+        }
+        try w.writeByte(']');
+        if (c.getenv("SKETERM_WEB_WREQ_DEBUG") != null) try w.writeAll(",\"dbg\":true");
+        try w.writeByte('}');
+    }
+
+    /// One step of a hold is finished without a decision to fold: a
+    /// mailbox retires, a held chain moves on. `gen` guards against a
+    /// step that was already superseded.
+    fn wreqStepDone(self: *Host, hid: u32, gen: u32, held: bool) void {
+        if (!held) {
+            self.wreqRetire(hid);
+            return;
+        }
+        g_wreq.acquire();
+        defer g_wreq.release();
+        const h = wreqFind(hid) orelse return;
+        if (h.gen != gen) return;
+        h.advance = true;
+        h.dispatched = false;
+        wreqPoke();
+    }
+
+    /// Move a held chain to the next extension whose filters match,
+    /// `onBeforeRequest` across every extension first, then
+    /// `onBeforeSendHeaders` (skipped once a redirect is decided: the
+    /// redirect restarts the request and its own headers phase runs on
+    /// the new load). With nobody left, the verdict is applied.
+    fn wreqAdvance(self: *Host, hid: u32) void {
+        var url_buf: [HOLD_URL_MAX]u8 = undefined;
+        var url_len: usize = 0;
+        var rtype: webrequest.RType = .other;
+        var ev: webrequest.Event = .before_request;
+        var cur: i32 = -1;
+        var held = false;
+        var redirected = false;
+        var cancelled = false;
+        {
+            g_wreq.acquire();
+            defer g_wreq.release();
+            const h = wreqFind(hid) orelse return;
+            url_len = h.url_len;
+            @memcpy(url_buf[0..url_len], h.url[0..url_len]);
+            rtype = @enumFromInt(h.rtype);
+            ev = h.event;
+            cur = h.cursor;
+            held = h.cb != null;
+            redirected = h.verdict.redirect_len != 0;
+            cancelled = h.verdict.cancel;
+        }
+        if (!held) {
+            self.wreqRetire(hid);
+            return;
+        }
+        const url = url_buf[0..url_len];
+        while (!cancelled) {
+            var found = false;
+            var idx: usize = 0;
+            var id_buf: [webrequest.MAX_ID]u8 = undefined;
+            var id_len: usize = 0;
+            var bg: u32 = 0;
+            var need = webrequest.Need.none();
+            {
+                webrequest.acquire();
+                defer webrequest.release();
+                var i: usize = @intCast(cur + 1);
+                while (i < webrequest.slots.len) : (i += 1) {
+                    const s = &webrequest.slots[i];
+                    if (!s.used) continue;
+                    const reg = s.reg orelse continue;
+                    const n = webrequest.needFor(reg, ev, url, rtype);
+                    if (n.isNone()) continue;
+                    found = true;
+                    idx = i;
+                    id_len = s.id_len;
+                    @memcpy(id_buf[0..id_len], s.idSlice());
+                    bg = s.bg_view;
+                    need = n;
+                    break;
+                }
+            }
+            if (found) {
+                cur = @intCast(idx);
+                if (bg == 0) {
+                    // Nobody to ask for this one; the chain goes on.
+                    g_wreq.acquire();
+                    if (wstatFor(id_buf[0..id_len])) |st| {
+                        st.matched +%= 1;
+                        if (need.blocking) st.failed_open +%= 1;
+                    }
+                    g_wreq.release();
+                    continue;
+                }
+                // The headers phase shows each extension the headers the
+                // previous one left: re-read them from the request.
+                var hdr_buf: [HOLD_HDR_MAX]u8 = undefined;
+                var hdr_len: u16 = 0;
+                if (ev == .before_send_headers) {
+                    var req: ?*cef.cef_request_t = null;
+                    {
+                        g_wreq.acquire();
+                        defer g_wreq.release();
+                        const h = wreqFind(hid) orelse return;
+                        req = h.req;
+                        if (req) |r| if (r.base.add_ref) |ar| ar(&r.base);
+                    }
+                    if (req) |r| {
+                        hdr_len = headerMapJson(r, &hdr_buf);
+                        release(&r.base);
+                    }
+                }
+                g_wreq.acquire();
+                defer g_wreq.release();
+                const h = wreqFind(hid) orelse return;
+                const st = wstatFor(id_buf[0..id_len]);
+                if (st) |s| {
+                    s.matched +%= 1;
+                    if (need.blocking) s.held +%= 1;
+                }
+                h.ext = if (st) |s| (@intFromPtr(s) - @intFromPtr(&g_wreq.stats[0])) / @sizeOf(WStat) else 0;
+                h.bg_view = bg;
+                h.cursor = @intCast(idx);
+                h.event = ev;
+                h.cur_blocking = need.blocking;
+                h.want_request_headers = need.want_request_headers or ev == .before_send_headers;
+                if (ev == .before_send_headers) {
+                    h.hdr_len = hdr_len;
+                    if (hdr_len != 0) @memcpy(h.hdr[0..hdr_len], hdr_buf[0..hdr_len]);
+                }
+                setHoldLids(h, &need);
+                h.advance = false;
+                h.dispatched = false;
+                h.gen +%= 1;
+                h.start_us = nowUs();
+                h.deadline_ms = nowMs() + g_wreq.timeout_ms;
+                return;
+            }
+            if (ev == .before_request and !redirected) {
+                ev = .before_send_headers;
+                cur = -1;
+                continue;
+            }
+            break;
+        }
+        self.wreqFinish(hid);
+    }
+
+    /// Answer a held request with its folded verdict and free the slot.
+    fn wreqFinish(self: *Host, hid: u32) void {
+        var cb: ?*cef.cef_callback_t = null;
+        var req: ?*cef.cef_request_t = null;
+        var verdict: webrequest.Verdict = .{};
+        var url_buf: [HOLD_URL_MAX]u8 = undefined;
+        var url_len: usize = 0;
+        var method_buf: [8]u8 = undefined;
+        var method_len: usize = 0;
+        var rtype: webrequest.RType = .other;
+        var view_id: u32 = 0;
+        {
+            g_wreq.acquire();
+            defer g_wreq.release();
+            const h = wreqFind(hid) orelse return;
+            cb = h.cb;
+            req = h.req;
+            verdict = h.verdict;
+            url_len = h.url_len;
+            @memcpy(url_buf[0..url_len], h.url[0..url_len]);
+            method_len = h.method_len;
+            @memcpy(method_buf[0..method_len], h.method[0..method_len]);
+            rtype = @enumFromInt(h.rtype);
+            view_id = h.view_id;
+            h.* = .{};
+            _ = g_wreq.outstanding.fetchSub(1, .release);
+        }
+        if (!verdict.cancel) {
+            if (verdict.redirectUrl()) |u| {
+                // Changing the url of a request held in
+                // on_before_resource_load IS the redirect: CEF re-issues
+                // the load at the new url when we continue.
+                if (req) |r| if (r.set_url) |f| {
+                    var s = std.mem.zeroes(cef.cef_string_t);
+                    setStr(u, &s);
+                    defer cef.cef_string_utf16_clear(&s);
+                    f(r, &s);
+                };
+            } else {
+                _ = wreqNotifyAll(.{
+                    .event = .send_headers,
+                    .url = url_buf[0..url_len],
+                    .method = method_buf[0..method_len],
+                    .rtype = rtype,
+                    .view_id = view_id,
+                });
+            }
+        }
+        _ = self;
+        // CEF is re-entered OUTSIDE the spinlock, always; the hold's own
+        // request reference can be the last one.
+        if (req) |r| release(&r.base);
+        if (cb) |x| {
+            if (verdict.cancel) {
+                if (x.cancel) |f| f(x);
+            } else {
+                if (x.cont) |f| f(x);
+            }
+            release(&x.base);
         }
     }
 
@@ -6769,75 +7380,46 @@ pub const Host = struct {
         _ = g_wreq.outstanding.fetchSub(1, .release);
     }
 
-    /// Let a held request through, unfiltered, and free its slot. THE
-    /// single "answer without a decision" exit, and it always continues
-    /// — never cancels. A broken, slow or vanished extension must cost
-    /// the user filtering, never the ability to load a page.
+    /// A background page answered. Folds the decision into the hold's
+    /// verdict; a cancel answers the request at once, anything else
+    /// moves the chain on to the next extension.
     ///
-    /// Every path that can end a hold reaches one of exactly four
-    /// places, and they are all of them:
-    ///   - a decision arrived            -> `wreqDecision`
-    ///   - the deadline passed           -> here, from `webrequestPump`
-    ///   - the listener became unreachable between hold and dispatch
-    ///                                   -> here, from `webrequestPump`
+    /// Every path that can end a hold reaches one of exactly these:
+    ///   - the chain ran out of extensions -> `wreqFinish`
+    ///   - a cancel arrived                -> `wreqFinish`, here
+    ///   - an extension missed its deadline or became unreachable
+    ///                                     -> the chain moves past it
     ///   - the extension was disabled, removed or reparsed
-    ///                                   -> `wreqAbandonExt`
+    ///                                     -> `wreqAbandonExt`
     ///   - its background page or the requesting view was destroyed
-    ///                                   -> `wreqAbandonView`
-    ///   - the helper is shutting down   -> `webrequestDeinit`
+    ///                                     -> `wreqAbandonView`
+    ///   - the helper is shutting down     -> `webrequestDeinit`
     /// Anything added later that can make a listener unreachable MUST
-    /// call one of these. A hold that is never answered is a page that
+    /// reach one of these. A hold that is never answered is a page that
     /// never finishes loading, with no error and no way out.
-    fn wreqFailOpen(self: *Host, hid: u32) void {
-        _ = self;
-        var cb: ?*cef.cef_callback_t = null;
-        var req: ?*cef.cef_request_t = null;
-        {
-            g_wreq.acquire();
-            defer g_wreq.release();
-            const h = wreqFind(hid) orelse return;
-            cb = h.cb;
-            req = h.req;
-            h.* = .{};
-            _ = g_wreq.outstanding.fetchSub(1, .release);
-        }
-        if (cb) |x| {
-            if (x.cont) |f| f(x);
-            release(&x.base);
-        }
-        if (req) |r| release(&r.base);
-    }
-
-    /// A background page answered. Applies the decision to the held
-    /// request and either continues it, cancels it, or moves it to the
-    /// second phase (`onBeforeSendHeaders`).
     fn wreqDecision(self: *Host, v: *View, json: []const u8) void {
-        const R = struct { ext: []const u8 = "", cap: []const u8 = "", hid: u32 = 0, d: std.json.Value = .null };
+        const R = struct { ext: []const u8 = "", cap: []const u8 = "", hid: u32 = 0, g: u32 = 0, d: std.json.Value = .null };
         const parsed = std.json.parseFromSlice(R, self.gpa, json, .{ .ignore_unknown_fields = true }) catch return;
         defer parsed.deinit();
         const e = self.webext.authorize(parsed.value.ext, parsed.value.cap) orelse return;
         const hid = parsed.value.hid;
+        const gen = parsed.value.g;
 
         // Take our OWN reference to the request before dropping the
         // lock: an abandon (extension removed, view destroyed) racing
         // us would otherwise release the last one while we are still
-        // calling set_url on it.
+        // calling set_header on it.
         var req: ?*cef.cef_request_t = null;
         var event: webrequest.Event = .before_request;
-        var want_sh = false;
-        var ext: usize = 0;
-        var start_us: i64 = 0;
         {
             g_wreq.acquire();
             defer g_wreq.release();
             const h = wreqFind(hid) orelse return;
             const st = wstatIdx(h.ext) orelse return;
             if (h.bg_view != v.id or !std.mem.eql(u8, st.idSlice(), e.id)) return;
+            if (!h.dispatched or !h.cur_blocking or h.gen != gen or h.cb == null) return;
             req = h.req;
             event = h.event;
-            want_sh = h.want_send_headers;
-            ext = h.ext;
-            start_us = h.start_us;
             if (req) |r| if (r.base.add_ref) |ar| ar(&r.base);
         }
         defer if (req) |r| release(&r.base);
@@ -6851,7 +7433,9 @@ pub const Host = struct {
         };
         var dp = webrequest.parseDecision(self.gpa, dec_buf.written(), hdr_key) catch return;
         defer dp.deinit(self.gpa);
-        const d = dp.decision;
+        var d = dp.decision;
+        // MV2: only onBeforeRequest may redirect.
+        if (event != .before_request) d.redirect = null;
         // `SKETERM_WEB_WREQ_DEBUG=1` prints every decision with the url
         // it applies to. Finding out WHY a real extension blocked
         // something is otherwise guesswork: the verdict is computed in
@@ -6862,107 +7446,52 @@ pub const Host = struct {
             if (req) |r| {
                 if (r.get_url) |gu| url = userfreeInto(gu(r), &url_buf);
             }
-            std.debug.print("wreq[{d}] {s} {s} -> {s}\n", .{
-                hid, event.toStr(), url, dec_buf.written(),
+            std.debug.print("wreq[{d}] {s} {s} {s} -> {s}\n", .{
+                hid, e.id, event.toStr(), url, dec_buf.written(),
             });
         }
 
-        const cancel = d.cancel;
-        var redirected = false;
-        var hdr_changed = false;
-        if (!cancel) {
-            if (req) |r| {
-                if (d.redirect) |u| {
-                    // Changing the url of a request held in
-                    // on_before_resource_load IS the redirect: CEF
-                    // re-issues the load at the new url when we
-                    // continue.
-                    var s = std.mem.zeroes(cef.cef_string_t);
-                    setStr(u, &s);
-                    defer cef.cef_string_utf16_clear(&s);
-                    if (r.set_url) |f| {
-                        f(r, &s);
-                        redirected = true;
-                    }
-                }
-                if (d.headers) |edits| {
-                    if (r.set_header_by_name) |seth| {
-                        for (edits) |ed| {
-                            var nk = std.mem.zeroes(cef.cef_string_t);
-                            var nv = std.mem.zeroes(cef.cef_string_t);
-                            setStr(ed.name, &nk);
-                            defer cef.cef_string_utf16_clear(&nk);
-                            if (ed.value.len != 0) setStr(ed.value, &nv);
-                            defer cef.cef_string_utf16_clear(&nv);
-                            // An empty value REMOVES the header: MV2
-                            // expresses a deletion by omitting it from
-                            // the returned array, and the JS side turns
-                            // that omission into an empty-valued entry.
-                            seth(r, &nk, if (ed.value.len != 0) &nv else null, 1);
-                            hdr_changed = true;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Second phase, only when the first neither cancelled nor
-        // redirected — a redirect restarts the request and its own
-        // onBeforeSendHeaders fires on the new load.
-        const go_second = !cancel and !redirected and event == .before_request and want_sh;
-
-        // The second phase's header snapshot is built HERE, against the
-        // reference we took above, and only COPIED under the lock:
-        // `get_header_map` re-enters Chromium and allocates, which no
-        // spinlock may be held across. Same stash-then-copy shape as
-        // the hold in `onBeforeResourceLoad`.
-        var hdr_buf: [HOLD_HDR_MAX]u8 = undefined;
-        var hdr_len: u16 = 0;
-        if (go_second) {
-            if (req) |r| hdr_len = headerMapJson(r, &hdr_buf);
-        }
-
-        var cb: ?*cef.cef_callback_t = null;
-        var hreq: ?*cef.cef_request_t = null;
+        var outcome = false;
+        var apply_headers = false;
         {
             g_wreq.acquire();
             defer g_wreq.release();
             const h = wreqFind(hid) orelse return; // abandoned meanwhile
-            if (wstatIdx(ext)) |s| {
-                if (cancel) s.cancelled +%= 1;
-                if (redirected) s.redirected +%= 1;
-                if (hdr_changed) s.headers_modified +%= 1;
-                const us = nowUs() - start_us;
+            if (h.gen != gen) return;
+            const res = h.verdict.fold(d);
+            if (wstatIdx(h.ext)) |s| {
+                if (d.cancel) s.cancelled +%= 1;
+                if (d.redirect != null and !h.verdict.cancel) s.redirected +%= 1;
+                const us = nowUs() - h.start_us;
                 s.note(@intCast(std.math.clamp(us, 0, std.math.maxInt(u32))));
+                if (res == .apply_headers and d.headers.?.len != 0) s.headers_modified +%= 1;
             }
-            if (go_second) {
-                h.event = .before_send_headers;
+            outcome = res == .done;
+            apply_headers = res == .apply_headers;
+            if (!outcome) {
+                h.advance = true;
                 h.dispatched = false;
-                h.want_request_headers = true;
-                if (h.hdr_len == 0 and hdr_len != 0) {
-                    @memcpy(h.hdr[0..hdr_len], hdr_buf[0..hdr_len]);
-                    h.hdr_len = hdr_len;
+            }
+        }
+        if (apply_headers) {
+            if (req) |r| if (r.set_header_by_name) |seth| {
+                for (d.headers.?) |ed| {
+                    var nk = std.mem.zeroes(cef.cef_string_t);
+                    var nv = std.mem.zeroes(cef.cef_string_t);
+                    setStr(ed.name, &nk);
+                    defer cef.cef_string_utf16_clear(&nk);
+                    if (ed.value.len != 0) setStr(ed.value, &nv);
+                    defer cef.cef_string_utf16_clear(&nv);
+                    // An empty value REMOVES the header: MV2 expresses
+                    // a deletion by omitting it from the returned array,
+                    // and the JS side turns that omission into an
+                    // empty-valued entry.
+                    seth(r, &nk, if (ed.value.len != 0) &nv else null, 1);
                 }
-                return;
-            }
-            cb = h.cb;
-            hreq = h.req;
-            h.* = .{};
-            _ = g_wreq.outstanding.fetchSub(1, .release);
+            };
         }
-        // The hold's own request reference is dropped OUTSIDE the lock:
-        // it can be the last one, and the destructor is CEF code.
-        if (hreq) |r| release(&r.base);
-        if (cb) |x| {
-            if (cancel) {
-                if (x.cancel) |f| f(x);
-            } else {
-                if (x.cont) |f| f(x);
-            }
-            release(&x.base);
-        }
+        if (outcome) self.wreqFinish(hid) else wreqPoke();
     }
-
     /// Report per-extension blocking-webRequest counters (0xB4 -> 0xB5).
     pub fn webrequestStats(self: *Host) void {
         var out: [webrequest.MAX_PUBLISHED]proto.EvWebextWreqStats = undefined;
@@ -11553,72 +12082,133 @@ fn onResourceResponse(
     var url_raw: [2048]u8 = undefined;
     const gu = req.get_url orelse return 0;
     const url = userfreeInto(gu(req), &url_raw);
+    if (std.mem.startsWith(u8, url, ext_scheme ++ "://")) return 0;
     const rtype = wreqTypeOf(if (req.get_resource_type) |grt| grt(req) else cef.RT_SUB_RESOURCE);
-
-    var ext_buf: [webrequest.MAX_ID]u8 = undefined;
-    var ext_len: usize = 0;
-    var bg_view: u32 = 0;
-    var need_hdr = webrequest.Need.none();
-    {
-        webrequest.acquire();
-        defer webrequest.release();
-        for (&webrequest.slots) |*s| {
-            if (!s.used) continue;
-            const reg = s.reg orelse continue;
-            const nh = webrequest.needFor(reg, .headers_received, url, rtype);
-            if (nh.isNone()) continue;
-            ext_len = s.id_len;
-            @memcpy(ext_buf[0..ext_len], s.idSlice());
-            bg_view = s.bg_view;
-            need_hdr = nh;
-            break;
-        }
-    }
-    if (ext_len == 0 or bg_view == 0) return 0;
+    const view_id = viewIdOfBrowser(browser);
 
     var hdr_buf: [HOLD_HDR_MAX]u8 = undefined;
     var hdr_len: u16 = 0;
     if (response) |resp| hdr_len = headerMapJson(resp, &hdr_buf);
+    var method_buf: [8]u8 = undefined;
+    var method: []const u8 = "";
+    if (req.get_method) |gm| method = userfreeInto(gm(req), &method_buf);
+    var extra_buf: [256]u8 = undefined;
+    const extra = responseExtra(&extra_buf, response);
 
-    g_wreq.acquire();
-    var slot: ?*Hold = null;
-    for (&g_wreq.holds) |*h| {
-        if (!h.used) {
-            slot = h;
-            break;
-        }
+    // Both events are notifications on this path: `onHeadersReceived`
+    // because the response cannot be paused (above), and
+    // `onResponseStarted` by definition. Every matching extension gets
+    // its own mailbox drop.
+    inline for (.{ webrequest.Event.headers_received, webrequest.Event.response_started }) |ev| {
+        _ = wreqNotifyAll(.{
+            .event = ev,
+            .url = url,
+            .method = method,
+            .rtype = rtype,
+            .view_id = view_id,
+            .hdr = hdr_buf[0..hdr_len],
+            .extra = extra,
+        });
     }
-    const st = wstatFor(ext_buf[0..ext_len]);
-    if (st) |s| {
-        s.matched +%= 1;
-        // Counted here, at the only moment we know a listener will be
-        // told about headers it cannot change.
-        s.headers_received_dropped +%= 1;
-    }
-    if (slot) |h| {
-        h.* = .{
-            .used = true,
-            .hid = g_wreq.next_hid,
-            .ext = if (st) |s| (@intFromPtr(s) - @intFromPtr(&g_wreq.stats[0])) / @sizeOf(WStat) else 0,
-            .bg_view = bg_view,
-            .event = .headers_received,
-            .start_us = nowUs(),
-            .deadline_ms = nowMs() + g_wreq.timeout_ms,
-            .hdr_len = hdr_len,
-            .want_request_headers = true,
-            .rtype = @intFromEnum(rtype),
-        };
-        setHoldLids(h, .headers_received, &need_hdr);
-        g_wreq.next_hid +%= 1;
-        if (g_wreq.next_hid == 0) g_wreq.next_hid = 1;
-        h.url_len = @intCast(@min(url.len, h.url.len));
-        @memcpy(h.url[0..h.url_len], url[0..h.url_len]);
-        if (hdr_len != 0) @memcpy(h.hdr[0..hdr_len], hdr_buf[0..hdr_len]);
-        _ = g_wreq.outstanding.fetchAdd(1, .release);
-    }
-    g_wreq.release();
-    wreqPoke();
     return 0;
+}
+
+/// `"statusCode":200,"statusLine":"HTTP/1.1 200 OK","fromCache":false`
+/// for a response, "" without one. IO THREAD: fixed buffer only.
+fn responseExtra(buf: []u8, response: ?*cef.cef_response_t) []const u8 {
+    const resp = response orelse return "";
+    var status: i32 = 0;
+    if (resp.get_status) |gs| status = gs(resp);
+    var text_buf: [128]u8 = undefined;
+    var text: []const u8 = "";
+    if (resp.get_status_text) |gt| text = userfreeInto(gt(resp), &text_buf);
+    var w = std.Io.Writer.fixed(buf);
+    w.print("\"statusCode\":{d},\"statusLine\":", .{status}) catch return "";
+    var line_buf: [160]u8 = undefined;
+    const line = std.fmt.bufPrint(&line_buf, "HTTP/1.1 {d} {s}", .{ status, text }) catch "";
+    jsonStr(&w, line) catch return "";
+    w.writeAll(",\"fromCache\":false") catch return "";
+    return buf[0..w.end];
+}
+
+/// The view a browser belongs to, 0 when none (a background page's own
+/// fetch, a urlrequest). IO THREAD safe: reads the intercept table.
+fn viewIdOfBrowser(browser: ?*cef.cef_browser_t) u32 {
+    const b = browser orelse return 0;
+    const gi = b.get_identifier orelse return 0;
+    const cef_id = gi(b);
+    g_int.acquire();
+    defer g_int.release();
+    return if (g_int.slotByCef(cef_id)) |s| s.view_id else 0;
+}
+
+/// IO THREAD. `webRequest.onCompleted` / `onErrorOccurred`, as
+/// notifications to every matching extension.
+fn notifyLoadComplete(
+    browser: ?*cef.cef_browser_t,
+    req: *cef.cef_request_t,
+    response: ?*cef.cef_response_t,
+    ur_status: cef.cef_urlrequest_status_t,
+) void {
+    if (!webrequest.any_listeners.load(.acquire)) return;
+    var url_raw: [2048]u8 = undefined;
+    const gu = req.get_url orelse return;
+    const url = userfreeInto(gu(req), &url_raw);
+    if (std.mem.startsWith(u8, url, ext_scheme ++ "://")) return;
+    const rtype = wreqTypeOf(if (req.get_resource_type) |grt| grt(req) else cef.RT_SUB_RESOURCE);
+    var method_buf: [8]u8 = undefined;
+    var method: []const u8 = "";
+    if (req.get_method) |gm| method = userfreeInto(gm(req), &method_buf);
+    const ok = ur_status == @as(cef.cef_urlrequest_status_t, @intCast(cef.UR_SUCCESS));
+    var extra_buf: [256]u8 = undefined;
+    var extra: []const u8 = "";
+    if (ok) {
+        extra = responseExtra(&extra_buf, response);
+    } else {
+        var code: i32 = if (ur_status == @as(cef.cef_urlrequest_status_t, @intCast(cef.UR_CANCELED))) -3 else -2;
+        if (response) |resp| {
+            if (resp.get_error) |ge| {
+                const e: i32 = @intCast(ge(resp));
+                if (e != 0) code = e;
+            }
+        }
+        var w = std.Io.Writer.fixed(&extra_buf);
+        w.writeAll("\"fromCache\":false,\"error\":") catch {};
+        var name_buf: [64]u8 = undefined;
+        jsonStr(&w, netErrorName(&name_buf, code)) catch {};
+        extra = extra_buf[0..w.end];
+    }
+    _ = wreqNotifyAll(.{
+        .event = if (ok) .completed else .error_occurred,
+        .url = url,
+        .method = method,
+        .rtype = rtype,
+        .view_id = viewIdOfBrowser(browser),
+        .extra = extra,
+    });
+}
+
+/// Chromium's `net::ERR_*` spelling for the codes a page actually
+/// meets; anything else keeps its number, never a made-up name.
+fn netErrorName(buf: []u8, code: i32) []const u8 {
+    const name: []const u8 = switch (code) {
+        -2 => "FAILED",
+        -3 => "ABORTED",
+        -7 => "TIMED_OUT",
+        -20 => "BLOCKED_BY_CLIENT",
+        -21 => "NETWORK_CHANGED",
+        -100 => "CONNECTION_CLOSED",
+        -101 => "CONNECTION_RESET",
+        -102 => "CONNECTION_REFUSED",
+        -105 => "NAME_NOT_RESOLVED",
+        -106 => "INTERNET_DISCONNECTED",
+        -118 => "CONNECTION_TIMED_OUT",
+        -200 => "CERT_COMMON_NAME_INVALID",
+        -201 => "CERT_DATE_INVALID",
+        -202 => "CERT_AUTHORITY_INVALID",
+        else => return std.fmt.bufPrint(buf, "net::ERROR_{d}", .{code}) catch "net::ERR_FAILED",
+    };
+    return std.fmt.bufPrint(buf, "net::ERR_{s}", .{name}) catch "net::ERR_FAILED";
 }
 
 /// IO THREAD. Completes a logged entry with status/size/timing.
@@ -11628,7 +12218,7 @@ fn onResourceLoadComplete(
     frame: [*c]cef.cef_frame_t,
     request: [*c]cef.cef_request_t,
     response: [*c]cef.cef_response_t,
-    _: cef.cef_urlrequest_status_t,
+    ur_status: cef.cef_urlrequest_status_t,
     received: i64,
 ) callconv(.c) void {
     defer releaseArg(browser);
@@ -11636,6 +12226,7 @@ fn onResourceLoadComplete(
     defer releaseArg(request);
     defer releaseArg(response);
     const req: *cef.cef_request_t = request orelse return;
+    notifyLoadComplete(browser, req, response, ur_status);
     const b: *cef.cef_browser_t = browser orelse return;
     const gi = b.get_identifier orelse return;
     const cef_id = gi(b);
@@ -11724,8 +12315,9 @@ fn fillEntry(out: *proto.NetEntry, url_buf: *[LOG_URL_MAX]u8, method_buf: *[8]u8
 //      trip on requests we already decided in nanoseconds.
 //   2. Extensions see everything the native engine let through, in
 //      registration order per extension and extension order after that.
-//   3. Among extensions, FIRST CANCEL WINS and a cancel beats a
-//      redirect, which is Firefox's own resolution.
+//   3. EVERY matching extension is asked (`Host.wreqAdvance`), and the
+//      answers fold with Chrome's precedence (`webrequest.Verdict`):
+//      a cancel wins, then a redirect (the later one), then headers.
 //   4. The per-view shield gate (`intercept_enable`) disables BOTH: a
 //      user who turned blocking off for a site gets no extension
 //      filtering there either, because "off" has to mean off.
@@ -11769,11 +12361,31 @@ const Hold = struct {
     event: webrequest.Event = .before_request,
     /// A slot with no `cb` is a MAILBOX, not a hold: the request has
     /// already continued and this exists only to deliver an
-    /// observational notification.
-    want_send_headers: bool = false,
+    /// observational notification to ONE extension.
     want_request_headers: bool = false,
     /// False until the main thread has actually sent the command.
     dispatched: bool = false,
+    /// A HELD request is a CHAIN over every extension whose filters
+    /// match: `webrequest.slots` index of the one asked now (-1 before
+    /// the first), and `advance` asks the main thread to move on to the
+    /// next one (`Host.wreqAdvance`). Every matching extension is
+    /// consulted, first phase then second, and the answers fold into
+    /// `verdict` with Chrome's precedence.
+    cursor: i8 = -1,
+    advance: bool = false,
+    /// The extension asked now registered a BLOCKING listener for this
+    /// event; false means its dispatch is a notification and the chain
+    /// moves on without waiting.
+    cur_blocking: bool = false,
+    /// Bumped per dispatch and echoed by the answer, so a late reply
+    /// for an earlier step (a timed-out extension, the first phase) is
+    /// never applied to a later one.
+    gen: u32 = 0,
+    verdict: webrequest.Verdict = .{},
+    /// Extra `details` members for a notification (statusCode, error,
+    /// …), already JSON, spliced verbatim.
+    extra_len: u16 = 0,
+    extra: [256]u8 = @splat(0),
     deadline_ms: i64 = 0,
     start_us: i64 = 0,
     rtype: u8 = 0,
@@ -11787,16 +12399,15 @@ const Hold = struct {
     /// on that thread, same rule the intercept log follows).
     hdr_len: u16 = 0,
     hdr: [HOLD_HDR_MAX]u8 = @splat(0),
-    /// The listener ids whose OWN `RequestFilter` matched, PER EVENT
-    /// (indexed by `@intFromEnum(Event)`) — one hold can be dispatched
-    /// for `onBeforeRequest` and then again for `onBeforeSendHeaders`,
-    /// and the two have different listeners.
+    /// The listener ids whose OWN `RequestFilter` matched, for the
+    /// extension and event being dispatched now (the chain rewrites
+    /// them per step).
     ///
     /// Only these ids may run; see `webrequest.Need.ids` for why running
     /// the others is not a small inaccuracy but a browser that loads no
     /// pages at all.
-    lids: [3][webrequest.MAX_MATCHED]u32 = @splat(@splat(0)),
-    n_lids: [3]u8 = @splat(0),
+    lids: [webrequest.MAX_MATCHED]u32 = @splat(0),
+    n_lids: u8 = 0,
 
     fn urlSlice(self: *const Hold) []const u8 {
         return self.url[0..self.url_len];
@@ -11836,6 +12447,8 @@ const WreqState = struct {
     /// blocking extension pays one relaxed load per request.
     outstanding: std.atomic.Value(u32) = .init(0),
     next_hid: u32 = 1,
+    /// Requests that found the table full and went through unasked.
+    overflow: u32 = 0,
     timeout_ms: i64 = wreq_timeout_ms_default,
     holds: [MAX_HOLDS]Hold = @splat(.{}),
     stats: [webrequest.MAX_PUBLISHED]WStat = @splat(.{}),
@@ -11991,6 +12604,17 @@ fn utf16Into(s: *const cef.cef_string_t, buf: []u8) []const u8 {
 /// Returns true when the caller must return `RV_CONTINUE_ASYNC` — the
 /// request is now this table's responsibility and WILL be answered.
 ///
+/// EVERY extension whose filters match is consulted. A request no
+/// extension blocks on is a set of per-extension MAILBOX drops and is
+/// never held. A request any extension blocks on becomes ONE hold whose
+/// chain the main thread walks (`Host.wreqAdvance`): each matching
+/// extension in `webrequest.slots` order, `onBeforeRequest` first, then
+/// `onBeforeSendHeaders`, the answers folded by `webrequest.Verdict`
+/// (cancel > redirect > header edits, Chrome's precedence). Sequential
+/// rather than parallel on purpose: an extension's `onBeforeSendHeaders`
+/// must see the headers the one before it wrote, and the cost is one
+/// round trip per extension that actually blocks on this url.
+///
 /// LOCK ORDER: `webrequest.lock` (the registry) is taken and RELEASED
 /// before `g_wreq.lock` (the hold table). They are never nested, in
 /// either direction, anywhere.
@@ -12007,13 +12631,9 @@ fn wreqConsider(
     // exactly this and nothing else.
     if (!webrequest.any_listeners.load(.acquire)) return false;
 
-    // Which extension cares, and how. Copied out under the registry
-    // lock so nothing is held while we touch CEF.
-    var ext_id_buf: [webrequest.MAX_ID]u8 = undefined;
-    var ext_id_len: usize = 0;
-    var bg_view: u32 = 0;
-    var need_before = webrequest.Need.none();
-    var need_send = webrequest.Need.none();
+    var any_blocking = false;
+    var any_match = false;
+    var want_hdr = false;
     {
         webrequest.acquire();
         defer webrequest.release();
@@ -12023,42 +12643,33 @@ fn wreqConsider(
             const nb = webrequest.needFor(reg, .before_request, url, rtype);
             const ns = webrequest.needFor(reg, .before_send_headers, url, rtype);
             if (nb.isNone() and ns.isNone()) continue;
-            // v1 asks ONE extension per request — the first that
-            // matches. Chaining several would multiply the round trip
-            // by the extension count on the critical path, and the
-            // measured cost of one round trip (src/web/CLAUDE.md) is
-            // already the dominant term. Documented, not hidden.
-            ext_id_len = s.id_len;
-            @memcpy(ext_id_buf[0..s.id_len], s.idSlice());
-            bg_view = s.bg_view;
-            need_before = nb;
-            need_send = ns;
-            break;
+            any_match = true;
+            // An extension with no background page cannot be asked: it
+            // does not make the request wait (an enumerated exit).
+            if (s.bg_view != 0 and (nb.blocking or ns.blocking)) any_blocking = true;
+            if (nb.want_request_headers or ns.want_request_headers) want_hdr = true;
         }
     }
-    if (ext_id_len == 0) return false;
-
-    const ext_id = ext_id_buf[0..ext_id_len];
-    const blocking = need_before.blocking or need_send.blocking;
-    // No background page yet (or torn down): there is nobody to ask.
-    // Fail open immediately rather than hold for a listener that cannot
-    // run — this is one of the enumerated exits.
-    if (bg_view == 0) {
-        g_wreq.acquire();
-        defer g_wreq.release();
-        if (wstatFor(ext_id)) |st| {
-            st.matched +%= 1;
-            if (blocking) st.failed_open +%= 1;
-        }
-        return false;
-    }
+    if (!any_match) return false;
 
     // Header collection costs a CEF multimap walk; only pay for it when
     // a matching listener asked for requestHeaders.
     var hdr_buf: [HOLD_HDR_MAX]u8 = undefined;
     var hdr_len: u16 = 0;
-    if (need_before.want_request_headers or need_send.want_request_headers) {
-        hdr_len = headerMapJson(req, &hdr_buf);
+    if (want_hdr) hdr_len = headerMapJson(req, &hdr_buf);
+
+    if (!any_blocking) {
+        inline for (.{ webrequest.Event.before_request, webrequest.Event.before_send_headers, webrequest.Event.send_headers }) |ev| {
+            _ = wreqNotifyAll(.{
+                .event = ev,
+                .url = url,
+                .method = method,
+                .rtype = rtype,
+                .view_id = view_id,
+                .hdr = hdr_buf[0..hdr_len],
+            });
+        }
+        return false;
     }
 
     g_wreq.acquire();
@@ -12069,30 +12680,31 @@ fn wreqConsider(
             break;
         }
     }
-    const st = wstatFor(ext_id);
-    if (st) |s| s.matched +%= 1;
     const h = slot orelse {
         // Table full. Fail OPEN: a burst of requests must not queue
         // behind a listener, and dropping the notification is strictly
         // better than stalling the page.
-        if (st) |s| if (blocking) {
-            s.failed_open +%= 1;
-        };
+        g_wreq.overflow +%= 1;
         g_wreq.release();
         return false;
     };
-
-    const ext_idx: usize = if (st) |s| (@intFromPtr(s) - @intFromPtr(&g_wreq.stats[0])) / @sizeOf(WStat) else 0;
     h.* = .{
         .used = true,
         .hid = g_wreq.next_hid,
-        .ext = ext_idx,
-        .bg_view = bg_view,
         .view_id = view_id,
         .rtype = @intFromEnum(rtype),
         .start_us = nowUs(),
         .deadline_ms = nowMs() + g_wreq.timeout_ms,
         .hdr_len = hdr_len,
+        .event = .before_request,
+        .cursor = -1,
+        // The main thread picks the first extension.
+        .advance = true,
+        // The hold KEEPS the references the callback received with
+        // `cb` and `req` (the caller releases them only when this
+        // returns false), so no add_ref: one would never be paid back.
+        .cb = cb,
+        .req = req,
     };
     g_wreq.next_hid +%= 1;
     if (g_wreq.next_hid == 0) g_wreq.next_hid = 1;
@@ -12101,44 +12713,112 @@ fn wreqConsider(
     h.method_len = @intCast(@min(method.len, h.method.len));
     @memcpy(h.method[0..h.method_len], method[0..h.method_len]);
     if (hdr_len != 0) @memcpy(h.hdr[0..hdr_len], hdr_buf[0..hdr_len]);
-
-    if (!blocking) {
-        // A NON-blocking listener must not hold the request at all —
-        // the slot is only a mailbox for the notification, and the
-        // caller has already been told to continue.
-        h.event = if (need_before.matched) .before_request else .before_send_headers;
-        h.want_request_headers = need_before.want_request_headers or need_send.want_request_headers;
-    } else if (need_before.blocking) {
-        h.event = .before_request;
-        h.want_send_headers = need_send.blocking;
-        h.want_request_headers = need_before.want_request_headers;
-    } else {
-        h.event = .before_send_headers;
-        h.want_request_headers = true;
-    }
-    setHoldLids(h, .before_request, &need_before);
-    setHoldLids(h, .before_send_headers, &need_send);
-
-    if (blocking) {
-        // The hold KEEPS the references the callback received with
-        // `cb` and `req` (the caller releases them only when this
-        // returns false), so no add_ref: one would never be paid back.
-        h.cb = cb;
-        h.req = req;
-        if (st) |s| s.held +%= 1;
-    }
     _ = g_wreq.outstanding.fetchAdd(1, .release);
     g_wreq.release();
     wreqPoke();
-    return blocking;
+    return true;
 }
 
-fn setHoldLids(h: *Hold, event: webrequest.Event, need: *const webrequest.Need) void {
-    const i: usize = @intFromEnum(event);
-    h.n_lids[i] = need.n_ids;
-    @memcpy(h.lids[i][0..need.n_ids], need.idSlice());
+/// One webRequest NOTIFICATION, as the request path saw it.
+const Notice = struct {
+    event: webrequest.Event,
+    url: []const u8,
+    method: []const u8 = "",
+    rtype: webrequest.RType,
+    view_id: u32,
+    /// Request headers, or RESPONSE headers for a response event.
+    hdr: []const u8 = "",
+    /// Extra `details` members, already JSON (`"statusCode":200`).
+    extra: []const u8 = "",
+};
+
+/// Queue one mailbox drop per extension whose filter matches `n`.
+/// Never holds anything: the request has continued (or cannot be
+/// paused at all, on the response path). Safe from the IO thread and
+/// the main thread alike. Returns how many were queued.
+fn wreqNotifyAll(n: Notice) usize {
+    if (!webrequest.any_listeners.load(.acquire)) return 0;
+    const Hit = struct {
+        id: [webrequest.MAX_ID]u8,
+        id_len: usize,
+        bg_view: u32,
+        need: webrequest.Need,
+    };
+    var hits: [webrequest.MAX_PUBLISHED]Hit = undefined;
+    var nhits: usize = 0;
+    {
+        webrequest.acquire();
+        defer webrequest.release();
+        for (&webrequest.slots) |*s| {
+            if (!s.used or s.bg_view == 0) continue;
+            const reg = s.reg orelse continue;
+            const need = webrequest.needFor(reg, n.event, n.url, n.rtype);
+            if (need.isNone()) continue;
+            hits[nhits] = .{ .id = undefined, .id_len = s.id_len, .bg_view = s.bg_view, .need = need };
+            @memcpy(hits[nhits].id[0..s.id_len], s.idSlice());
+            nhits += 1;
+        }
+    }
+    if (nhits == 0) return 0;
+    var queued: usize = 0;
+    g_wreq.acquire();
+    defer g_wreq.release();
+    for (hits[0..nhits]) |*hit| {
+        const st = wstatFor(hit.id[0..hit.id_len]);
+        if (st) |s| {
+            s.matched +%= 1;
+            // Counted at the only moment we know a listener will be told
+            // about headers it cannot change.
+            if (n.event == .headers_received) s.headers_received_dropped +%= 1;
+        }
+        var slot: ?*Hold = null;
+        for (&g_wreq.holds) |*h| {
+            if (!h.used) {
+                slot = h;
+                break;
+            }
+        }
+        const h = slot orelse {
+            g_wreq.overflow +%= 1;
+            break;
+        };
+        h.* = .{
+            .used = true,
+            .hid = g_wreq.next_hid,
+            .ext = if (st) |s| (@intFromPtr(s) - @intFromPtr(&g_wreq.stats[0])) / @sizeOf(WStat) else 0,
+            .bg_view = hit.bg_view,
+            .event = n.event,
+            .view_id = n.view_id,
+            .rtype = @intFromEnum(n.rtype),
+            .start_us = nowUs(),
+            .deadline_ms = nowMs() + g_wreq.timeout_ms,
+            .want_request_headers = n.hdr.len != 0 and
+                (hit.need.want_request_headers or hit.need.want_response_headers or n.event == .headers_received),
+        };
+        setHoldLids(h, &hit.need);
+        g_wreq.next_hid +%= 1;
+        if (g_wreq.next_hid == 0) g_wreq.next_hid = 1;
+        h.url_len = @intCast(@min(n.url.len, h.url.len));
+        @memcpy(h.url[0..h.url_len], n.url[0..h.url_len]);
+        h.method_len = @intCast(@min(n.method.len, h.method.len));
+        @memcpy(h.method[0..h.method_len], n.method[0..h.method_len]);
+        if (h.want_request_headers) {
+            h.hdr_len = @intCast(@min(n.hdr.len, h.hdr.len));
+            @memcpy(h.hdr[0..h.hdr_len], n.hdr[0..h.hdr_len]);
+        }
+        h.extra_len = @intCast(@min(n.extra.len, h.extra.len));
+        @memcpy(h.extra[0..h.extra_len], n.extra[0..h.extra_len]);
+        _ = g_wreq.outstanding.fetchAdd(1, .release);
+        queued += 1;
+    }
+    if (queued != 0) wreqPoke();
+    return queued;
 }
 
+fn setHoldLids(h: *Hold, need: *const webrequest.Need) void {
+    h.n_lids = need.n_ids;
+    @memcpy(h.lids[0..need.n_ids], need.idSlice());
+}
 /// Answer every hold belonging to one extension. Main thread.
 fn wreqAbandonExt(ext_id: []const u8) void {
     var cbs: [MAX_HOLDS]?*cef.cef_callback_t = @splat(null);
@@ -15097,7 +15777,16 @@ fn onLoadStart(
     // A SUBFRAME reaches this hook too, and only for the extension
     // injection: `all_frames` content scripts belong in it. Everything
     // else below is per-DOCUMENT and stays main-frame-only.
+    if (main) {
+        v.exec_nav_pending = false;
+        host.flushExecAtStart(v, f);
+    }
     host.injectMatchingExtensions(v, f, .document_start);
+    // CEF reports a document only once it COMMITS, so the two events
+    // arrive together here (onBeforeNavigate cannot fire earlier: the
+    // request path runs on the IO thread with no script to run).
+    host.webNavEvent(v, f, "onBeforeNavigate", "", "");
+    host.webNavEvent(v, f, "onCommitted", "", "\"transitionType\":\"link\",\"transitionQualifiers\":[]");
     if (!main) return;
     v.load_retry.loadStarted();
     if (!v.sem_nav.takeExpectedLoadStart()) {
@@ -15142,6 +15831,12 @@ fn onLoadEnd(
     // Subframes get this too, gated on `all_frames`.
     host.injectMatchingExtensions(v, f, .document_end);
     host.injectMatchingExtensions(v, f, .document_idle);
+    if (!v.webext_popup) {
+        // Load end is the one moment the engine names; DOMContentLoaded
+        // has already happened by then, so both are reported, in order.
+        host.webNavEvent(v, f, "onDOMContentLoaded", "", "");
+        host.webNavEvent(v, f, "onCompleted", "", "");
+    }
     if (!main) return;
     if (v.webext_popup) return;
     host.post(proto.EvLoad{
@@ -15193,6 +15888,21 @@ fn onLoadError(
         }) catch return;
         host.post(proto.EvConsole{ .view = v.id, .level = 3, .msg = line });
         return;
+    }
+    {
+        var ebuf: [96]u8 = undefined;
+        var name_buf: [64]u8 = undefined;
+        var ew = std.Io.Writer.fixed(&ebuf);
+        ew.writeAll("\"error\":") catch {};
+        jsonStr(&ew, netErrorName(&name_buf, @intCast(code))) catch {};
+        host.webNavEvent(v, frame, "onErrorOccurred", url.slice(), ebuf[0..ew.end]);
+    }
+    if (code != cef.ERR_ABORTED) {
+        // The document the queued document_start scripts were for is
+        // not coming; their Promises expire through the reply deadline.
+        v.exec_nav_pending = false;
+        for (v.exec_at_start.items) |js| host.gpa.free(js);
+        v.exec_at_start.clearRetainingCapacity();
     }
     // Chromium reports the document displaced by a redirect or a
     // second navigation as ERR_ABORTED. A newer load is still active;
@@ -15749,6 +16459,27 @@ fn isMainFrame(frame: [*c]cef.cef_frame_t) bool {
     if (frame == null) return false;
     const f = frame.*.is_main orelse return false;
     return f(frame) != 0;
+}
+
+/// The WebExtension `frameId` of a frame: 0 for the main frame (the
+/// spec's fixed value), otherwise a stable positive number derived from
+/// the engine's opaque frame identifier string.
+fn frameIdOf(frame: *cef.cef_frame_t) i64 {
+    if (isMainFrame(frame)) return 0;
+    const gi = frame.get_identifier orelse return 1;
+    var buf: [128]u8 = undefined;
+    const ident = userfreeInto(gi(frame), &buf);
+    const h: u32 = std.hash.Fnv1a_32.hash(ident) & 0x7fff_ffff;
+    return if (h == 0) 1 else h;
+}
+
+/// -1 for the main frame, else the parent's `frameIdOf`.
+fn parentFrameIdOf(frame: *cef.cef_frame_t) i64 {
+    if (isMainFrame(frame)) return -1;
+    const gp = frame.get_parent orelse return 0;
+    const parent: *cef.cef_frame_t = gp(frame) orelse return 0;
+    defer release(&parent.base);
+    return frameIdOf(parent);
 }
 
 // ---------------------------------------------------------------------

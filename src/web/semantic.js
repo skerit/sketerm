@@ -1789,25 +1789,26 @@
     OTHER: "other"
   };
 
-  // The NOTIFICATION-ONLY webRequest events. They accept listeners and
-  // never fire: nothing in the helper delivers them yet.
-  //
-  // They exist because their ABSENCE was fatal, not because they work.
-  // uBlock Origin's `webRequest.start()` calls
-  // `browser.webRequest.onResponseStarted.addListener(...)` — an
-  // unconditional property access — and a TypeError there aborts the
-  // REST of uBO's boot sequence from inside its own startup, leaving a
-  // half-initialised filtering engine that then cancelled every
-  // top-level navigation. An inert event object is a limitation; an
-  // undefined one is a broken extension.
-  //
-  // The cost is named: `onResponseStarted` is where uBO injects its
-  // scriptlets, so scriptlet injection does not happen.
-  function inertEvent() {
+  // The two webRequest events the engine has NO hook for:
+  // `onBeforeRedirect` (CEF reports a redirect only by re-entering the
+  // request path) and `onAuthRequired` (credentials are the client's
+  // prompt, not an extension's). Registering on either is REPORTED on
+  // the page console (an `ext-error`, which reaches the client log)
+  // rather than thrown: the object must exist because extensions reach
+  // for these unconditionally at boot and a TypeError there aborts the
+  // rest of it, but a silently inert event was a lie nobody could see.
+  // `onSendHeaders`, `onResponseStarted`, `onCompleted` and
+  // `onErrorOccurred` are real notifications (the helper delivers them
+  // to every extension whose filter matches).
+  function unsupportedEvent(extId, ctx, name) {
     var ev = extEvent();
     var add = ev.addListener;
     ev.addListener = function (fn) {
       add(fn);
+      try {
+        send({ op: "ext-error", ext: extId, cap: ctx.cap,
+          msg: "webRequest." + name + " is not supported: this listener will never be called" });
+      } catch (e) {}
     };
     return ev;
   }
@@ -1819,12 +1820,12 @@
       onBeforeRequest: extWebRequestEvent(extId, ctx, "onBeforeRequest"),
       onBeforeSendHeaders: extWebRequestEvent(extId, ctx, "onBeforeSendHeaders"),
       onHeadersReceived: extWebRequestEvent(extId, ctx, "onHeadersReceived"),
-      onSendHeaders: inertEvent(),
-      onResponseStarted: inertEvent(),
-      onBeforeRedirect: inertEvent(),
-      onCompleted: inertEvent(),
-      onErrorOccurred: inertEvent(),
-      onAuthRequired: inertEvent(),
+      onSendHeaders: extWebRequestEvent(extId, ctx, "onSendHeaders"),
+      onResponseStarted: extWebRequestEvent(extId, ctx, "onResponseStarted"),
+      onBeforeRedirect: unsupportedEvent(extId, ctx, "onBeforeRedirect"),
+      onCompleted: extWebRequestEvent(extId, ctx, "onCompleted"),
+      onErrorOccurred: extWebRequestEvent(extId, ctx, "onErrorOccurred"),
+      onAuthRequired: unsupportedEvent(extId, ctx, "onAuthRequired"),
       handlerBehaviorChanged: function () {
         return extApiCall(extId, ctx.cap, "webRequest", "handlerBehaviorChanged", []);
       }
@@ -1849,7 +1850,7 @@
       if (!wantAnswer) return;
       try {
         if (!ctx || ctx.cap !== m.cap) return;
-        send({ op: "ext-wreq-decision", ext: m.ext, cap: ctx.cap, hid: m.hid, d: d || {} });
+        send({ op: "ext-wreq-decision", ext: m.ext, cap: ctx.cap, hid: m.hid, g: m.g || 0, d: d || {} });
       } catch (e) {}
     }
     if (!ctx || ctx.cap !== m.cap || !ctx.wreq) {
@@ -2010,11 +2011,25 @@
         reload: function (id) {
           return extApiCall(extId, ctx.cap, "tabs", "reload", [typeof id === "number" ? id : -1]);
         },
+        // Closing a tab is the browser UI's decision, and no wire frame
+        // hands it to the client: rejected, naming the API.
         remove: unsupportedAsync("tabs.remove"),
-        insertCSS: unsupportedAsync("tabs.insertCSS"),
-        removeCSS: unsupportedAsync("tabs.removeCSS"),
-        executeScript: unsupportedAsync("tabs.executeScript"),
-        getZoom: unsupportedAsync("tabs.getZoom"),
+        // (tabId?, details): executed in the tab's frame by the browser
+        // process, answered with the frame's result.
+        insertCSS: function (a, b) {
+          return extApiCall(extId, ctx.cap, "tabs", "insertCSS", extTabArgs(a, b));
+        },
+        removeCSS: function (a, b) {
+          return extApiCall(extId, ctx.cap, "tabs", "removeCSS", extTabArgs(a, b));
+        },
+        executeScript: function (a, b) {
+          return extApiCall(extId, ctx.cap, "tabs", "executeScript", extTabArgs(a, b));
+        },
+        getZoom: function (id) {
+          return extApiCall(extId, ctx.cap, "tabs", "getZoom", [typeof id === "number" ? id : -1]);
+        },
+        // Zoom belongs to the browser UI (it is persisted per site by
+        // the client, which no frame tells): rejected, naming the API.
         setZoom: unsupportedAsync("tabs.setZoom"),
         onUpdated: extEvent(),
         onRemoved: extEvent(),
@@ -2080,6 +2095,112 @@
     };
   }
 
+  // `tabs.executeScript(tabId?, details)` and friends: normalised to
+  // `[tabId, details]`, -1 meaning the active tab.
+  function extTabArgs(a, b) {
+    var id = typeof a === "number" ? a : -1;
+    var details = (typeof a === "object" && a !== null ? a : b) || {};
+    return [id, details];
+  }
+
+  // The permission model is the MANIFEST: sketerm grants what the
+  // manifest declares at install and nothing at runtime, so these are
+  // answered from it rather than asked of anyone.
+  function extPermissionSets(manifestObj) {
+    var perms = [];
+    var origins = [];
+    var all = (manifestObj.permissions || []).concat(manifestObj.host_permissions || []);
+    for (var i = 0; i < all.length; i++) {
+      var p = String(all[i]);
+      if (p === "<all_urls>" || p.indexOf("://") >= 0) {
+        if (origins.indexOf(p) < 0) origins.push(p);
+      } else if (perms.indexOf(p) < 0) {
+        perms.push(p);
+      }
+    }
+    return { permissions: perms, origins: origins };
+  }
+
+  function extPermissionsContain(held, want) {
+    var wp = (want && want.permissions) || [];
+    var wo = (want && want.origins) || [];
+    for (var i = 0; i < wp.length; i++) {
+      if (held.permissions.indexOf(wp[i]) < 0) return false;
+    }
+    for (var j = 0; j < wo.length; j++) {
+      if (held.origins.indexOf(wo[j]) >= 0) continue;
+      if (held.origins.indexOf("<all_urls>") >= 0) continue;
+      if (held.origins.indexOf("*://*/*") >= 0 && /^(https?|\*):\/\//.test(wo[j])) continue;
+      return false;
+    }
+    return true;
+  }
+
+  // `tabs.executeScript` / `insertCSS` / `removeCSS`, run in THIS frame
+  // on the browser process's behalf. The script runs in the page's main
+  // world, like a content script here (no isolated world exists on this
+  // path) and without the extension's `browser` object. `code` is tried
+  // through indirect eval first because only eval yields the completion
+  // value executeScript resolves with; a CSP that forbids eval falls back
+  // to `fn`, the same code compiled as part of the command itself.
+  function extExec(m) {
+    var ok = true;
+    var err = "";
+    var result = null;
+    try {
+      if (typeof m.css === "string") {
+        var attr = "data-sketerm-ext-css";
+        if (m.remove) {
+          var els = document.querySelectorAll("style[" + attr + "]");
+          for (var i = 0; i < els.length; i++) {
+            if (els[i].getAttribute(attr) === m.ext && els[i].textContent === m.css) {
+              els[i].parentNode.removeChild(els[i]);
+              break;
+            }
+          }
+        } else {
+          var s = document.createElement("style");
+          s.setAttribute(attr, m.ext);
+          s.textContent = m.css;
+          (document.head || document.documentElement).appendChild(s);
+        }
+      } else {
+        try {
+          result = (0, eval)(String(m.code || ""));
+        } catch (e) {
+          var cspish = false;
+          try {
+            cspish = e instanceof EvalError || /Content Security Policy/i.test(String((e && e.message) || e));
+          } catch (e2) {}
+          if (!cspish || typeof m.fn !== "function") throw e;
+          result = m.fn();
+        }
+      }
+    } catch (e3) {
+      ok = false;
+      err = String((e3 && e3.message) || e3);
+    }
+    var out = null;
+    try {
+      out = result === undefined ? null : JSON.parse(JSON.stringify(result));
+    } catch (e4) {
+      out = null;
+    }
+    send({ op: "ext-exec-result", ext: m.ext, cap: m.cap, gid: m.gid, ok: ok, err: err, result: out });
+  }
+
+  // A namespace event pushed from the browser process
+  // (`webNavigation.on*`, ...).
+  function extNsEvent(m) {
+    var ctx = extCtx[m.ext];
+    if (!ctx || ctx.cap !== m.cap) return;
+    var api = extApiOf[m.ext];
+    if (!api || !api[m.ns]) return;
+    var ev = api[m.ns][m.ev];
+    if (!ev || !ev._fns) return;
+    fireAll(ev, m.args || []);
+  }
+
   function addExtStubs(api, extId, ctx, manifestObj) {
     var actionNs = manifestObj.page_action ? "pageAction" : "browserAction";
     var action = {
@@ -2106,9 +2227,30 @@
       api.pageAction = action;
     }
 
+    // There is no extension context-menu surface in the client, so
+    // `create` FAILS the way the spec reports a failed create: through
+    // `runtime.lastError` inside its callback (and on the page console
+    // via `ext-error`). It still returns the item id the spec promises,
+    // so an extension that ignores the callback keeps running; it used
+    // to return 0 and report success, which no caller could detect.
+    var menuSeq = 1;
     var menus = {
-      create: function () {
-        return 0;
+      create: function (props, cb) {
+        var id = props && props.id !== undefined ? props.id : menuSeq++;
+        var msg = "menus.create is not supported: this browser has no extension context-menu surface";
+        try {
+          send({ op: "ext-error", ext: extId, cap: ctx.cap, msg: msg });
+        } catch (e0) {}
+        if (typeof cb === "function") {
+          setTimeout(function () {
+            api.runtime.lastError = { message: msg };
+            try {
+              cb();
+            } catch (e1) {}
+            api.runtime.lastError = null;
+          }, 0);
+        }
+        return id;
       },
       update: unsupportedAsync("menus.update"),
       remove: unsupportedAsync("menus.remove"),
@@ -2161,10 +2303,21 @@
     api.windows = {
       WINDOW_ID_NONE: -1,
       WINDOW_ID_CURRENT: -2,
-      get: unsupportedAsync("windows.get"),
-      getCurrent: unsupportedAsync("windows.getCurrent"),
-      getLastFocused: unsupportedAsync("windows.getLastFocused"),
-      getAll: unsupportedAsync("windows.getAll"),
+      // Read from the client's mirrored tab table (`webext_tabs`).
+      get: function (id, info) {
+        return extApiCall(extId, ctx.cap, "windows", "get", [id, info || {}]);
+      },
+      getCurrent: function (info) {
+        return extApiCall(extId, ctx.cap, "windows", "getLastFocused", [info || {}]);
+      },
+      getLastFocused: function (info) {
+        return extApiCall(extId, ctx.cap, "windows", "getLastFocused", [info || {}]);
+      },
+      getAll: function (info) {
+        return extApiCall(extId, ctx.cap, "windows", "getAll", [info || {}]);
+      },
+      // Creating, moving and closing windows is the client's; no frame
+      // hands it over, so these reject naming the API.
       create: unsupportedAsync("windows.create"),
       update: unsupportedAsync("windows.update"),
       remove: unsupportedAsync("windows.remove"),
@@ -2173,41 +2326,88 @@
       onFocusChanged: extEvent()
     };
 
-    // webNavigation: the EVENTS exist so a listener can be registered
-    // without throwing; nothing fires them yet, which is why an
-    // extension relying on them for per-frame bookkeeping stays empty.
+    // webNavigation: real, pushed by the browser process from the
+    // engine's load handler (`ext-ns-event`) to extensions holding the
+    // `webNavigation` permission. The three events the engine gives no
+    // hook for report themselves on registration instead of lying.
+    function navUnsupported(name) {
+      var ev = extEvent();
+      var add = ev.addListener;
+      ev.addListener = function (fn) {
+        add(fn);
+        try {
+          send({ op: "ext-error", ext: extId, cap: ctx.cap,
+            msg: "webNavigation." + name + " is not supported: this listener will never be called" });
+        } catch (e) {}
+      };
+      return ev;
+    }
     api.webNavigation = {
-      getFrame: unsupportedAsync("webNavigation.getFrame"),
-      getAllFrames: unsupportedAsync("webNavigation.getAllFrames"),
+      getFrame: function (d) {
+        return extApiCall(extId, ctx.cap, "webNavigation", "getFrame", [d || {}]);
+      },
+      getAllFrames: function (d) {
+        return extApiCall(extId, ctx.cap, "webNavigation", "getAllFrames", [d || {}]);
+      },
       onBeforeNavigate: extEvent(),
       onCommitted: extEvent(),
       onDOMContentLoaded: extEvent(),
       onCompleted: extEvent(),
       onErrorOccurred: extEvent(),
-      onCreatedNavigationTarget: extEvent(),
-      onHistoryStateUpdated: extEvent(),
-      onReferenceFragmentUpdated: extEvent()
+      onCreatedNavigationTarget: navUnsupported("onCreatedNavigationTarget"),
+      onHistoryStateUpdated: navUnsupported("onHistoryStateUpdated"),
+      onReferenceFragmentUpdated: navUnsupported("onReferenceFragmentUpdated")
     };
 
+    // No notification surface reaches the client: create/clear reject
+    // naming the API; `getAll` truthfully has nothing to list.
     api.notifications = {
       create: unsupportedAsync("notifications.create"),
       clear: unsupportedAsync("notifications.clear"),
-      getAll: unsupportedAsync("notifications.getAll"),
+      getAll: function () {
+        return Promise.resolve({});
+      },
       onClicked: extEvent(),
       onClosed: extEvent(),
       onButtonClicked: extEvent()
     };
 
+    // The manifest's commands, each with the shortcut the spec uses
+    // for "not assigned": the empty string. Nothing binds them to a
+    // key, so `onCommand` never fires — which `shortcut: ""` states.
     api.commands = {
-      getAll: unsupportedAsync("commands.getAll"),
+      getAll: function () {
+        var out = [];
+        var cmds = manifestObj.commands || {};
+        for (var name in cmds) {
+          var c = cmds[name] || {};
+          out.push({ name: name, description: c.description || "", shortcut: "" });
+        }
+        return Promise.resolve(out);
+      },
       onCommand: extEvent()
     };
 
+    var held = extPermissionSets(manifestObj);
     api.permissions = {
-      contains: unsupportedAsync("permissions.contains"),
-      getAll: unsupportedAsync("permissions.getAll"),
-      request: unsupportedAsync("permissions.request"),
-      remove: unsupportedAsync("permissions.remove"),
+      contains: function (want) {
+        return Promise.resolve(extPermissionsContain(held, want));
+      },
+      getAll: function () {
+        return Promise.resolve({ permissions: held.permissions.slice(), origins: held.origins.slice() });
+      },
+      // Granting at runtime needs a prompt this browser does not have:
+      // already-held permissions resolve true, anything else REJECTS.
+      request: function (want) {
+        if (extPermissionsContain(held, want)) return Promise.resolve(true);
+        return Promise.reject(new Error("permissions.request: this browser cannot grant optional permissions at runtime"));
+      },
+      remove: function (want) {
+        var wp = (want && want.permissions) || [];
+        var wo = (want && want.origins) || [];
+        if (wp.length === 0 && wo.length === 0) return Promise.resolve(false);
+        return Promise.reject(new Error("permissions.remove: required permissions cannot be removed"));
+      },
       onAdded: extEvent(),
       onRemoved: extEvent()
     };
@@ -2713,6 +2913,12 @@
         break;
       case "ext-tab-event":
         extTabEvent(m);
+        break;
+      case "ext-ns-event":
+        extNsEvent(m);
+        break;
+      case "ext-exec":
+        extExec(m);
         break;
       case "ext-action-clicked":
         extActionClicked(m);

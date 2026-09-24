@@ -138,6 +138,7 @@ const unconditional_caps = [_]proto.Cap{
     .webext,
     .webext_tabs,
     .webext_action,
+    .webext_events,
     .webext_transaction,
     .filter_subscribe,
     .reader_ids,

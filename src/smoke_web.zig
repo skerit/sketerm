@@ -3700,6 +3700,298 @@ fn runWebrequestStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u
     _ = c.unsetenv("SKETERM_WEB_WREQ_TIMEOUT_MS");
 }
 
+// ---------------------------------------------------------------------
+// Stage 43: every extension is consulted, and the API gaps are real
+// ---------------------------------------------------------------------
+
+/// Stage 43's router: which endpoints the browser actually reached is
+/// half of what the stage asserts.
+const XaServer = struct {
+    lis: tcpserver.Listener = .{ .backlog = 64, .poll_ms = 100 },
+    r1_hits: std.atomic.Value(u32) = .init(0),
+    rdst_hits: std.atomic.Value(u32) = .init(0),
+
+    fn start(self: *XaServer) bool {
+        return self.lis.start(self, &onConn);
+    }
+
+    fn onConn(ctx: ?*anyopaque, afd: c_int) bool {
+        const self: *XaServer = @ptrCast(@alignCast(ctx.?));
+        self.handle(afd);
+        return false;
+    }
+
+    fn handle(self: *XaServer, afd: c_int) void {
+        var req: [8192]u8 = undefined;
+        var pfd = c.struct_pollfd{ .fd = afd, .events = c.POLLIN, .revents = 0 };
+        if (c.poll(@ptrCast(&pfd), 1, 3000) <= 0) return;
+        const n = c.read(afd, &req, req.len);
+        if (n <= 0) return;
+        const raw = req[0..@intCast(n)];
+        var body_buf: [8192]u8 = undefined;
+        var body: []const u8 = "ok";
+        var ctype: []const u8 = "text/plain";
+        if (std.mem.indexOf(u8, raw, "GET /x/page") != null) {
+            body = xa_page;
+            ctype = "text/html";
+        } else if (std.mem.indexOf(u8, raw, "GET /x/r1") != null) {
+            _ = self.r1_hits.fetchAdd(1, .release);
+            body = "R1-REACHED";
+        } else if (std.mem.indexOf(u8, raw, "GET /x/rdst2") != null) {
+            body = "RDST2";
+        } else if (std.mem.indexOf(u8, raw, "GET /x/rdst") != null) {
+            _ = self.rdst_hits.fetchAdd(1, .release);
+            body = "RDST";
+        } else if (std.mem.indexOf(u8, raw, "GET /x/r2") != null) {
+            body = "R2-ORIGINAL";
+        } else if (std.mem.indexOf(u8, raw, "GET /x/h") != null) {
+            var w = std.Io.Writer.fixed(&body_buf);
+            for (raw) |ch| w.writeByte(std.ascii.toLower(ch)) catch break;
+            body = body_buf[0..w.end];
+        }
+        tcpserver.respondOk(afd, ctype, body, tcpserver.CORS);
+    }
+
+    fn deinit(self: *XaServer) void {
+        self.lis.deinit();
+    }
+};
+
+/// Three same-origin fetches whose fate is decided by TWO extensions:
+/// /x/r1 is redirected by A and cancelled by B (the cancel must win and
+/// neither url may reach the network), /x/r2 is redirected by A alone
+/// (it must land), /x/h gets a header from each (both must arrive).
+const xa_page =
+    \\<!doctype html><html><head><title>xa-start</title></head><body style="margin:0"><p>xa</p><script>
+    \\(async function () {
+    \\  var r = [];
+    \\  try { await fetch("/x/r1"); r.push("r1:loaded"); } catch (e) { r.push("r1:blocked"); }
+    \\  try { r.push("r2:" + (await (await fetch("/x/r2")).text())); } catch (e) { r.push("r2:err"); }
+    \\  try {
+    \\    var h = await (await fetch("/x/h")).text();
+    \\    r.push("h:" + (h.indexOf("x-a: a") >= 0 ? "A" : "") + (h.indexOf("x-b: b") >= 0 ? "B" : ""));
+    \\  } catch (e) { r.push("h:err"); }
+    \\  window.__xaNet = r.join(",");
+    \\  document.title = "xa-net:" + window.__xaNet;
+    \\})();
+    \\</script></body></html>
+;
+
+const xa_manifest_a =
+    \\{"manifest_version":2,"name":"sketerm xa A","version":"1",
+    \\ "permissions":["webRequest","webRequestBlocking","webNavigation","tabs","<all_urls>"],
+    \\ "commands":{"do-thing":{"description":"Do the thing"}},
+    \\ "background":{"scripts":["bg.js"],"persistent":true},
+    \\ "content_scripts":[{"matches":["<all_urls>"],"js":["content.js"],"run_at":"document_idle"}]}
+;
+
+const xa_manifest_b =
+    \\{"manifest_version":2,"name":"sketerm xa B","version":"1",
+    \\ "permissions":["webRequest","webRequestBlocking","<all_urls>"],
+    \\ "background":{"scripts":["bg.js"],"persistent":true}}
+;
+
+/// Extension A: redirects r1 and r2, adds X-A, and records every
+/// notification the helper delivers, then answers the content script's
+/// "report" with what it saw and with the answers of the APIs that used
+/// to be stubs.
+const xa_bg_a =
+    \\var seen = { rs: 0, done: 0, nav: "", sent: 0 };
+    \\var U = { urls: ["<all_urls>"] };
+    \\browser.webRequest.onBeforeRequest.addListener(function (d) {
+    \\  if (d.url.indexOf("/x/r1") >= 0) return { redirectUrl: d.url.replace("/x/r1", "/x/rdst") };
+    \\  if (d.url.indexOf("/x/r2") >= 0) return { redirectUrl: d.url.replace("/x/r2", "/x/rdst2") };
+    \\  return {};
+    \\}, U, ["blocking"]);
+    \\browser.webRequest.onBeforeSendHeaders.addListener(function (d) {
+    \\  if (d.url.indexOf("/x/h") < 0) return {};
+    \\  var h = (d.requestHeaders || []).slice();
+    \\  h.push({ name: "X-A", value: "a" });
+    \\  return { requestHeaders: h };
+    \\}, U, ["blocking", "requestHeaders"]);
+    \\browser.webRequest.onSendHeaders.addListener(function (d) {
+    \\  if (d.url.indexOf("/x/page") >= 0) seen.sent++;
+    \\}, U);
+    \\browser.webRequest.onResponseStarted.addListener(function (d) {
+    \\  if (d.url.indexOf("/x/page") >= 0 && d.statusCode === 200 && d.type === "main_frame") seen.rs++;
+    \\}, U);
+    \\browser.webRequest.onCompleted.addListener(function (d) {
+    \\  if (d.url.indexOf("/x/page") >= 0) seen.done++;
+    \\}, U);
+    \\browser.webNavigation.onCommitted.addListener(function (d) {
+    \\  if (d.frameId === 0 && d.url.indexOf("/x/page") >= 0) { seen.nav += "c"; seen.navTab = d.tabId; }
+    \\});
+    \\browser.webNavigation.onCompleted.addListener(function (d) {
+    \\  if (d.frameId === 0 && d.url.indexOf("/x/page") >= 0) seen.nav += "d";
+    \\});
+    \\function settle(p) {
+    \\  return p.then(function (v) { return { ok: true, v: v }; }, function (e) { return { ok: false, e: String(e && e.message || e) }; });
+    \\}
+    \\browser.runtime.onMessage.addListener(function (m, sender) {
+    \\  if (m !== "report") return;
+    \\  var tab = sender.tab ? sender.tab.id : -1;
+    \\  var menuErr = new Promise(function (res) {
+    \\    browser.menus.create({ id: "x", title: "x", contexts: ["page"] }, function () {
+    \\      res(browser.runtime.lastError ? "err" : "ok");
+    \\    });
+    \\  });
+    \\  return Promise.all([
+    \\    settle(browser.permissions.getAll()),
+    \\    settle(browser.permissions.contains({ permissions: ["cookies"] })),
+    \\    settle(browser.permissions.request({ permissions: ["cookies"] })),
+    \\    settle(browser.commands.getAll()),
+    \\    settle(browser.windows.getAll({ populate: true })),
+    \\    settle(browser.tabs.executeScript(tab, { code: "document.title.indexOf('xa-net:') === 0" })),
+    \\    settle(browser.tabs.insertCSS(tab, { code: "body{outline:3px solid rgb(1, 2, 3)}" })),
+    \\    settle(browser.tabs.getZoom(tab)),
+    \\    menuErr,
+    \\    settle(browser.webNavigation.getAllFrames({ tabId: tab })),
+    \\    settle(browser.tabs.setZoom(tab, 2))
+    \\  ]).then(function (a) {
+    \\    return settle(browser.tabs.executeScript(tab, { code: "getComputedStyle(document.body).outlineColor" })).then(function (css) {
+    \\      var out = [];
+    \\      out.push("rs" + seen.rs, "done" + (seen.done > 0 ? 1 : 0), "sent" + (seen.sent > 0 ? 1 : 0), "nav:" + seen.nav, "navtab:" + (seen.navTab === tab ? "ok" : seen.navTab));
+    \\      out.push("perm:" + (a[0].ok && a[0].v.permissions.indexOf("webNavigation") >= 0 ? 1 : 0));
+    \\      out.push("has-cookies:" + (a[1].ok ? a[1].v : "x"));
+    \\      out.push("request:" + (a[2].ok ? "resolved" : "rejected"));
+    \\      out.push("cmd:" + (a[3].ok && a[3].v[0] ? a[3].v[0].name + "/" + JSON.stringify(a[3].v[0].shortcut) : "x"));
+    \\      out.push("win:" + (a[4].ok ? a[4].v.length + "/" + a[4].v[0].tabs.length : "x"));
+    \\      out.push("exec:" + (a[5].ok ? JSON.stringify(a[5].v) : a[5].e));
+    \\      out.push("css:" + (css.ok ? css.v[0] : css.e));
+    \\      out.push("zoom:" + (a[7].ok ? a[7].v : "x"));
+    \\      out.push("menu:" + a[8]);
+    \\      out.push("frames:" + (a[9].ok ? a[9].v.length + "/" + a[9].v[0].frameId : a[9].e));
+    \\      out.push("setzoom:" + (a[10].ok ? "resolved" : "rejected"));
+    \\      return out.join(",");
+    \\    });
+    \\  });
+    \\});
+;
+
+const xa_content_a =
+    \\(function tick() {
+    \\  if (document.title.indexOf("xa-net:") !== 0) { setTimeout(tick, 100); return; }
+    \\  var net = document.title.slice(7);
+    \\  // Let the load's completion notifications land first.
+    \\  setTimeout(function ask() {
+    \\    browser.runtime.sendMessage("report").then(function (rep) {
+    \\      if (!rep) { setTimeout(ask, 200); return; }
+    \\      document.title = "xa:" + net + "|" + rep;
+    \\    }, function () { setTimeout(ask, 200); });
+    \\  }, 500);
+    \\})();
+;
+
+/// Extension B: cancels r1 (which A redirects) and adds X-B.
+const xa_bg_b =
+    \\var U = { urls: ["<all_urls>"] };
+    \\browser.webRequest.onBeforeRequest.addListener(function (d) {
+    \\  if (d.url.indexOf("/x/r1") >= 0) return { cancel: true };
+    \\  return {};
+    \\}, U, ["blocking"]);
+    \\browser.webRequest.onBeforeSendHeaders.addListener(function (d) {
+    \\  if (d.url.indexOf("/x/h") < 0) return {};
+    \\  var h = (d.requestHeaders || []).slice();
+    \\  h.push({ name: "X-B", value: "b" });
+    \\  return { requestHeaders: h };
+    \\}, U, ["blocking", "requestHeaders"]);
+;
+
+fn runExtApiStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) void {
+    var data_buf: [4096]u8 = undefined;
+    const data_dir = std.fmt.bufPrintZ(&data_buf, "{s}/xadata", .{dir}) catch fail("stage 43 data path");
+    mkdirZ(data_dir);
+    _ = c.setenv("XDG_DATA_HOME", data_dir.ptr, 1);
+    var cache_buf: [4096]u8 = undefined;
+    const cache_dir = std.fmt.bufPrintZ(&cache_buf, "{s}/xacache", .{dir}) catch fail("stage 43 cache path");
+    mkdirZ(cache_dir);
+    var a_buf: [4096]u8 = undefined;
+    const a_dir = std.fmt.bufPrint(&a_buf, "{s}/xafixa", .{dir}) catch fail("stage 43 ext path");
+    mkdirZ(a_dir);
+    if (!writeFile(a_dir, "manifest.json", xa_manifest_a) or !writeFile(a_dir, "bg.js", xa_bg_a) or
+        !writeFile(a_dir, "content.js", xa_content_a)) fail("stage 43: could not write extension A");
+    var b_buf: [4096]u8 = undefined;
+    const b_dir = std.fmt.bufPrint(&b_buf, "{s}/xafixb", .{dir}) catch fail("stage 43 ext path");
+    mkdirZ(b_dir);
+    if (!writeFile(b_dir, "manifest.json", xa_manifest_b) or !writeFile(b_dir, "bg.js", xa_bg_b))
+        fail("stage 43: could not write extension B");
+
+    var srv = XaServer{};
+    if (!srv.start()) fail("stage 43: loopback HTTP server would not start");
+    defer srv.deinit();
+    var url_buf: [96]u8 = undefined;
+    const page = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/x/page", .{srv.lis.port}) catch fail("url");
+
+    var sock_buf: [96]u8 = undefined;
+    const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/xa.sock", .{dir}) catch fail("stage 43 sock");
+    const pid = spawnHelper(exe, sock.ptr, cache_dir.ptr, "--ozone-platform=headless", null, false);
+    var cl = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
+    cl.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web" });
+    {
+        const d = nowMs() + 15_000;
+        while (cl.ack_proto == 0 and nowMs() < d) cl.pump(100);
+    }
+    if (!cl.acks(.webext)) fail("stage 43: hello_ack lacks the webext capability");
+    if (!cl.acks(.webext_events)) fail("stage 43: hello_ack lacks the webext-events capability");
+    inline for (.{ .{ "xafixturea", "a" }, .{ "xafixtureb", "b" } }) |ext| {
+        cl.we_ok = 0xff;
+        cl.send(proto.WebextSet{ .id = ext[0], .dir = if (std.mem.eql(u8, ext[1], "a")) a_dir else b_dir, .enabled = 1 });
+        const d = nowMs() + 5_000;
+        while (cl.we_ok == 0xff and nowMs() < d) cl.pump(100);
+        if (cl.we_ok != 1) {
+            std.debug.print("stage 43: extension {s} load error \"{s}\"\n", .{ ext[0], cl.we_err[0..cl.we_err_len] });
+            fail("stage 43: a fixture extension failed to load");
+        }
+    }
+    // Both background pages register their listeners before the page.
+    {
+        const d = nowMs() + 2500;
+        while (nowMs() < d) cl.pump(50);
+    }
+    cl.send(proto.ViewCreate{ .view = view_id, .w = 640, .h = 480, .scale_x1000 = 1000, .context = 0 });
+    if (!cl.waitBufferAfter(0, 20_000)) fail("stage 43: no frame_buffer for the page view");
+    cl.sendTabs(&.{.{ .id = 1, .view = view_id, .active = true, .url = page, .title = "xa" }});
+    cl.resetTitle();
+    cl.send(proto.Navigate{ .view = view_id, .url = page });
+    if (!cl.waitTitle("xa:", 30_000)) {
+        std.debug.print("stage 43: title was \"{s}\"\n", .{cl.titleSlice()});
+        fail("stage 43: the page never reported its results");
+    }
+    const res = cl.titleSlice();
+    std.debug.print("stage 43: {s}\n", .{res});
+    const want = [_][]const u8{
+        // The cancel (B) beat the redirect (A); the lone redirect landed;
+        // both extensions' headers arrived.
+        "r1:blocked", "r2:RDST2", "h:AB",
+        // Notifications and webNavigation fired.
+        "rs1", "done1", "sent1", "nav:cd", "navtab:ok",
+        // The former stubs answer for real, or reject by name.
+        "perm:1", "has-cookies:false", "request:rejected", "cmd:do-thing/\"\"",
+        "win:1/1", "exec:[true]", "css:rgb(1, 2, 3)", "zoom:1", "menu:err",
+        "frames:1/0", "setzoom:rejected",
+    };
+    for (want) |w| {
+        if (std.mem.indexOf(u8, res, w) == null) {
+            std.debug.print("stage 43: missing \"{s}\" in \"{s}\"\n", .{ w, res });
+            fail("stage 43: an extension API answer was wrong");
+        }
+    }
+    if (srv.r1_hits.load(.acquire) != 0 or srv.rdst_hits.load(.acquire) != 0)
+        fail("stage 43: the cancelled request (or its redirect target) reached the network");
+    pass("stage 43a every extension is consulted: cancel beats redirect, a lone redirect lands, both extensions' headers arrive");
+    pass("stage 43b onSendHeaders/onResponseStarted/onCompleted and webNavigation fire; permissions, commands, windows, executeScript, insertCSS, getZoom, getAllFrames answer; menus.create and setZoom fail loudly");
+
+    cl.send(proto.WebextRemove{ .id = "xafixturea" });
+    cl.send(proto.WebextRemove{ .id = "xafixtureb" });
+    cl.send(proto.ViewDestroy{ .view = view_id });
+    {
+        const d = nowMs() + 2500;
+        while (nowMs() < d) cl.pump(50);
+    }
+    cl.deinit();
+    reapHelperTimeout(pid, "stage 43 helper", 30_000);
+}
+
 /// Stage 28: the WebExtensions foundation, end to end against real CEF.
 /// Run 1 proves content-script injection at document_end (a DOM mutation
 /// and a title change) and runtime.sendMessage to the background with a
@@ -3877,7 +4169,7 @@ const action_bg =
     \\async function securityChecks() {
     \\  var helperRejected = false, unsupportedRejected = false, impersonationRejected = false;
     \\  try { await browser.tabs.get(4294967295); } catch (e) { helperRejected = String(e).includes("no such tab"); }
-    \\  try { await browser.windows.getCurrent(); } catch (e) { unsupportedRejected = String(e).includes("windows.getCurrent is not supported"); }
+    \\  try { await browser.windows.create({}); } catch (e) { unsupportedRejected = String(e).includes("windows.create is not supported"); }
     \\  try {
     \\    var source = await (await fetch(browser.runtime.getURL("__sketerm-extapi.js"))).text();
     \\    var tok = source.match(/tok:"([0-9a-f]{32})"/);
@@ -6663,6 +6955,23 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             return 1;
         }
         say("smoke-web: PASS (cookie sync only)");
+        return 0;
+    }
+    // Focused run for the WebExtension + userscript family (stages 28,
+    // 33-35, 40, 43-44) without the ~35 stages before them.
+    if (c.getenv("SKETERM_SMOKE_WEB_WEBEXT_ONLY") != null) {
+        runWebextStage(gpa, exe, dir);
+        runActionStage(gpa, exe, dir);
+        runWebrequestStage(gpa, exe, dir);
+        runExtApiStage(gpa, exe, dir);
+        runShapeStage(gpa, exe, dir);
+        runUboStage(gpa, exe, dir, ubo_xpi);
+        cleanup();
+        if (gpa_state.deinit() == .leak) {
+            say("smoke-web: FAIL leaked memory (see GPA report above)");
+            return 1;
+        }
+        say("smoke-web: PASS (webext only)");
         return 0;
     }
     if (c.getenv("SKETERM_SMOKE_WEB_OBSERVE_ONLY") != null) {

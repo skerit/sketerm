@@ -1521,7 +1521,7 @@ pub const Client = struct {
                 if (self.isRemote()) {
                     // Extension package paths belong to THIS host; a
                     // remote helper is told about none of them.
-                    for ([_]proto.Cap{ .webext, .webext_tabs, .webext_action, .webext_transaction }) |cap|
+                    for ([_]proto.Cap{ .webext, .webext_tabs, .webext_action, .webext_transaction, .webext_events }) |cap|
                         self.caps.remove(cap);
                 } else if (self.has(.webext)) {
                     webext.publish(self);

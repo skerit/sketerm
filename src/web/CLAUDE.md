@@ -496,17 +496,52 @@ dispatch, and the blocking half is documented in its own section below).
   protocol, so remote clients suppress `webext`, `webext-tabs` and
   `webext-action` and receive no extension state. `setIcon` accepts package
   paths, not `ImageData`; popup size remains a fixed 420x520 logical pixels.
-- Other namespaces an extension calls UNCONDITIONALLY are present as
-  explicit rejecting stubs (`menus`, `windows`, `webNavigation`, `notifications`,
-  `commands`, `permissions`, `extension`, and the notification-only
-  `webRequest` events). They exist because their ABSENCE is fatal.
-  `alarms` and `storage.session` are REAL (a timer and an in-memory map
-  cost nothing). Anything an
+- **The former stubs (capability `webext-events`).** REAL now:
+  `webRequest.onSendHeaders/onResponseStarted/onCompleted/onErrorOccurred`
+  (mailbox notifications to every matching extension, response events
+  carrying `statusCode`/`statusLine`/`error`); `webNavigation` events
+  (from the load handler; the engine names a document only once it
+  commits, so `onBeforeNavigate`+`onCommitted` arrive together at load
+  start and `onDOMContentLoaded`+`onCompleted` at load end) and
+  `getFrame`/`getAllFrames` (frameId 0 = main, others a hash of CEF's
+  frame identifier), gated on the `webNavigation` permission;
+  `tabs.executeScript`/`insertCSS`/`removeCSS` (one frame, host
+  permission required, run through the semantic slot as an OBJECT
+  command whose `fn` is the code compiled into the command, so a CSP
+  forbidding eval still runs it with an undefined result;
+  `runAt:"document_start"` after a main-frame `onResponseStarted` waits
+  for the new document's load start — where uBO's scriptlets land);
+  `tabs.getZoom`; `windows.get/getCurrent/getLastFocused/getAll` from the
+  mirrored tab table; `permissions.getAll/contains` and
+  `commands.getAll` from the manifest (shortcut `""` = unassigned).
+  LOUD failures, per spec: `menus.create` returns its id but reports the
+  failure through `runtime.lastError` in its callback and on the
+  console; `permissions.request` of anything not held, `tabs.remove`,
+  `tabs.setZoom`, `windows.create/update/remove`,
+  `notifications.create/clear` reject naming the API;
+  `webRequest.onBeforeRedirect/onAuthRequired` and three
+  `webNavigation` events the engine has no hook for report
+  "never called" on the console at `addListener`. `alarms` and
+  `storage.session` are REAL (a timer and an in-memory map cost
+  nothing). Anything an
   extension feature-detects — `privacy`, `dns`, `contentScripts`,
   `storage.sync`/`managed`, `filterResponseData` — is deliberately LEFT
   ABSENT, because degrading gracefully is what that detection is for.
-  The cost is named: `webRequest.onResponseStarted` never fires, and
-  that is where uBO injects its scriptlets.
+- **`storage.local` is merged BY KEY across helper instances.** Every
+  browser route is its own helper sharing one `storage.json`; a flush
+  used to write the whole in-memory object (last writer wins, the other
+  route's keys lost). `storage.Store` keeps a journal of the keys this
+  process touched; a flush takes `.storage.lock` (flock), re-reads the
+  file, `rebase`s the journal onto it and writes that, and a storage
+  call first notices another instance's write (inode/mtime/size) and
+  merges it in.
+- **Private tabs are visible to extensions** (open product question,
+  today's behaviour kept: uBO cancels loads it cannot see). The seam for
+  a future per-extension "allow in private" toggle is the tab record:
+  `webext_tabs` would carry a `private` flag, `exttabs.Tab` keep it,
+  and the three delivery points — `wreqNotifyAll`/`wreqAdvance` (by
+  `view_id`), `webNavEvent` and `postTabEvent` — skip extensions not
+  allowed in it; `incognito` in `writeTab` becomes that flag.
 - Smoke-web stage 33 is the content/background end-to-end proof (a committed fixture under
   `webext/testdata/fixture`): content script injected at document_end
   mutates the DOM + messages the background + `getMessage`; storage.local
@@ -571,11 +606,20 @@ hold->answer p50/p95/max in microseconds).
    "uncancel", and asking would put a JS round trip on requests decided in
    nanoseconds.
 2. Extensions see everything the native engine let through.
-3. Among extensions, first cancel wins and a cancel beats a redirect
-   (Firefox's own resolution). v1 asks ONE extension per request, the
-   first whose filters match: chaining several would multiply the round
-   trip by the extension count, and the measured round trip is already the
-   dominant term. Documented, not hidden.
+3. EVERY extension whose filters match is consulted (capability
+   `webext-events`). A held request is one CHAIN (`Host.wreqAdvance`):
+   each matching extension in `webrequest.slots` order for
+   `onBeforeRequest`, then again for `onBeforeSendHeaders`, each seeing
+   the headers the previous one left. Answers fold through
+   `webrequest.Verdict` with Chrome's precedence: any cancel wins and
+   ends the chain; otherwise a redirect wins over header edits and a
+   later extension's redirect replaces an earlier one; header edits from
+   every extension apply in order. Sequential by design: the cost is one
+   round trip per extension that BLOCKS on this url, and a request no
+   extension blocks on is only per-extension mailbox drops. A late
+   answer for a superseded step is dropped by the per-dispatch `gen`.
+   An extension that misses the deadline is moved PAST (counted
+   `timed_out`/`failed_open`), never waited on and never a cancel.
 4. The per-view shield (`intercept_enable`) gates BOTH. "Blocking off for
    this site" has to mean off.
 
@@ -744,8 +788,9 @@ while doing nothing:
 
 What still does NOT work for uBO, and why:
 
-- **Scriptlets do not inject.** `webRequest.onResponseStarted` is a
-  notification-only event here and that is where uBO injects them.
+- **Scriptlets are unverified.** `onResponseStarted` +
+  `tabs.executeScript({runAt:"document_start"})` now exist (stage 43),
+  but stage 35b does not yet assert a uBO scriptlet ran.
 - **Cosmetic filtering is limited** by the shared-world ceiling
   (below): uBO's content scripts run in the page's main world, so its
   scriptlets and page scripts share intrinsics.

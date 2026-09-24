@@ -72,6 +72,11 @@ pub const Extension = struct {
     store_dirty: bool = false,
     /// Monotonic ms after which a dirty store is written.
     store_due_ms: i64 = 0,
+    /// storage.json's mtime/size when `store` last matched it. Another
+    /// helper instance (a second browser route) writing the file moves
+    /// it, and the next storage call then merges instead of serving (or
+    /// later overwriting) a stale copy.
+    store_stamp: FileStamp = .{},
     /// The hidden background-page view id, 0 when the extension has no
     /// background or is disabled. Owned by cefhost; recorded here so a
     /// routing lookup finds it.
@@ -131,6 +136,30 @@ fn freeCandidate(gpa: std.mem.Allocator, e: *Extension) void {
 /// stores on every keystroke otherwise pays a full serialize plus two
 /// fsyncs per call, synchronously inside its own promise.
 const store_coalesce_ms: i64 = 400;
+
+/// What `stat` says about a file, enough to notice another process
+/// rewrote it (atomicwrite renames a new inode into place, so the inode
+/// alone already moves; mtime and size are belt and braces).
+const FileStamp = struct {
+    ino: u64 = 0,
+    size: i64 = 0,
+    mtime_ns: i128 = 0,
+
+    fn of(path: [:0]const u8) FileStamp {
+        var st: c.struct_stat = undefined;
+        if (c.stat(path.ptr, &st) != 0) return .{};
+        const ts = if (@hasField(c.struct_stat, "st_mtim")) st.st_mtim else st.st_mtimespec;
+        return .{
+            .ino = @intCast(st.st_ino),
+            .size = @intCast(st.st_size),
+            .mtime_ns = @as(i128, ts.tv_sec) * std.time.ns_per_s + ts.tv_nsec,
+        };
+    }
+
+    fn eql(a: FileStamp, b: FileStamp) bool {
+        return a.ino == b.ino and a.size == b.size and a.mtime_ns == b.mtime_ns;
+    }
+};
 
 pub const Host = struct {
     gpa: std.mem.Allocator,
@@ -394,12 +423,38 @@ pub const Host = struct {
     // -- storage.local ------------------------------------------------
 
     fn storeFor(self: *Host, e: *Extension) *storage.Store {
+        const stamp = self.storageStamp(e);
         if (e.store == null) {
             const bytes = self.readStorageBytes(e);
             defer if (bytes) |b| self.gpa.free(b);
             e.store = storage.Store.load(self.gpa, bytes orelse "");
+            e.store_stamp = stamp;
+        } else if (!stamp.eql(e.store_stamp)) {
+            // Another instance wrote the file. Adopt its state, keeping
+            // any local writes it has not seen on top.
+            const bytes = self.readStorageBytes(e);
+            defer if (bytes) |b| self.gpa.free(b);
+            const s = &e.store.?;
+            if (s.hasJournal()) {
+                s.rebase(self.gpa, bytes orelse "", true) catch {};
+            } else {
+                s.deinit();
+                e.store = storage.Store.load(self.gpa, bytes orelse "");
+            }
+            e.store_stamp = stamp;
         }
         return &e.store.?;
+    }
+
+    fn storagePath(self: *Host, e: *const Extension, name: []const u8, buf: []u8) ?[:0]const u8 {
+        if (self.data_dir.len == 0) return null;
+        return std.fmt.bufPrintZ(buf, "{s}/{s}/{s}", .{ self.data_dir, e.id, name }) catch null;
+    }
+
+    fn storageStamp(self: *Host, e: *const Extension) FileStamp {
+        var buf: [4200]u8 = undefined;
+        const path = self.storagePath(e, "storage.json", &buf) orelse return .{};
+        return FileStamp.of(path);
     }
 
     fn readStorageBytes(self: *Host, e: *Extension) ?[]u8 {
@@ -409,18 +464,37 @@ pub const Host = struct {
         return readFileZ(self.gpa, path, 16 * 1024 * 1024);
     }
 
+    /// Write the store as a MERGE: under a per-extension `flock`, re-read
+    /// what is on disk (another route's helper may have written it) and
+    /// replay only this process's journal onto it. Writing the in-memory
+    /// object whole was last-writer-wins across instances.
     fn persistStore(self: *Host, e: *Extension, s: *storage.Store) !void {
         if (self.data_dir.len == 0) return error.StorageUnavailable;
-        const bytes = try s.serialize(self.gpa);
-        defer self.gpa.free(bytes);
         var dir_buf: [4096]u8 = undefined;
         const dir = std.fmt.bufPrint(&dir_buf, "{s}/{s}", .{ self.data_dir, e.id }) catch
             return error.PathTooLong;
         try pathz.makeDirs(dir, 0o700);
+        var lock_buf: [4200]u8 = undefined;
+        const lock_path = self.storagePath(e, ".storage.lock", &lock_buf) orelse return error.PathTooLong;
+        const lock_fd = c.open(lock_path.ptr, c.O_RDWR | c.O_CREAT | c.O_CLOEXEC | c.O_NOFOLLOW, @as(c_uint, 0o600));
+        if (lock_fd < 0) return error.LockFailed;
+        defer _ = c.close(lock_fd);
+        if (c.flock(lock_fd, c.LOCK_EX) != 0) return error.LockFailed;
+        defer _ = c.flock(lock_fd, c.LOCK_UN);
+
+        const disk = self.readStorageBytes(e);
+        defer if (disk) |b| self.gpa.free(b);
+        // The journal is KEPT through the rebase and settled only once
+        // the write landed: a failed write must retry the same keys.
+        try s.rebase(self.gpa, disk orelse "", true);
+        const bytes = try s.serialize(self.gpa);
+        defer self.gpa.free(bytes);
         var path_buf: [4200]u8 = undefined;
         const path = std.fmt.bufPrint(&path_buf, "{s}/storage.json", .{dir}) catch
             return error.PathTooLong;
         try atomicwrite.writeFileExact(path, bytes, 0o600);
+        s.settle();
+        e.store_stamp = self.storageStamp(e);
     }
 
     // -- browser.* dispatch (THE SEAM) --------------------------------
@@ -448,6 +522,7 @@ pub const Host = struct {
         if (std.mem.eql(u8, ns, "runtime")) return self.dispatchRuntime(e, method, args_json);
         if (std.mem.eql(u8, ns, "i18n")) return self.dispatchI18n(e, method, args_json);
         if (std.mem.eql(u8, ns, "tabs")) return self.dispatchTabs(e, method, args_json);
+        if (std.mem.eql(u8, ns, "windows")) return self.dispatchWindows(method, args_json);
         if (std.mem.eql(u8, ns, "webRequest")) return self.dispatchWebRequest(e, method, args_json);
         if (std.mem.eql(u8, ns, "browserAction")) {
             if (e.action.kind != .browser) return self.errResult("extension has no browserAction");
@@ -739,6 +814,43 @@ pub const Host = struct {
             return aw.toOwnedSlice() catch self.errResult("oom");
         }
         return self.errResult("unknown tabs method");
+    }
+
+    /// `browser.windows.get/getLastFocused/getAll`, read from the same
+    /// mirrored tab table as `tabs` (a window is a window id some tab
+    /// reports). Creating or closing windows is the client's and is
+    /// rejected on the JS side.
+    fn dispatchWindows(self: *Host, method: []const u8, args_json: []const u8) []u8 {
+        var parsed = std.json.parseFromSlice(std.json.Value, self.gpa, args_json, .{}) catch
+            return self.errResult("bad args");
+        defer parsed.deinit();
+        const args = if (parsed.value == .array) parsed.value.array.items else &[_]std.json.Value{};
+        var pick: tabs.Table.WindowPick = .all;
+        var info_at: usize = 0;
+        if (std.mem.eql(u8, method, "get")) {
+            if (args.len == 0 or args[0] != .integer) return self.errResult("bad window id");
+            if (args[0].integer == -2) {
+                pick = .last_focused; // WINDOW_ID_CURRENT
+            } else {
+                pick = .{ .id = tabs.u32Of(args[0]) orelse return self.errResult("no such window") };
+            }
+            info_at = 1;
+        } else if (std.mem.eql(u8, method, "getLastFocused")) {
+            pick = .last_focused;
+        } else if (!std.mem.eql(u8, method, "getAll")) {
+            return self.errResult("unknown windows method");
+        }
+        var populate = false;
+        if (args.len > info_at and args[info_at] == .object) {
+            if (args[info_at].object.get("populate")) |p| populate = p == .bool and p.bool;
+        }
+        var aw: std.Io.Writer.Allocating = .init(self.gpa);
+        defer aw.deinit();
+        aw.writer.writeAll("{\"result\":") catch return self.errResult("oom");
+        const found = self.tabs.writeWindows(&aw.writer, pick, populate) catch return self.errResult("oom");
+        if (!found) return self.errResult("no such window");
+        aw.writer.writeByte('}') catch return self.errResult("oom");
+        return aw.toOwnedSlice() catch self.errResult("oom");
     }
 
     // -- helpers ------------------------------------------------------
