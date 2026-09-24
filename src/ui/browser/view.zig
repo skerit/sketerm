@@ -488,7 +488,6 @@ pub const BrowserView = struct {
     pub const newTabSpec = @import("nav.zig").newTabSpec;
     pub const newTab = @import("nav.zig").newTab;
     pub const currentTab = @import("nav.zig").currentTab;
-    pub const onTabCloseClicked = @import("nav.zig").onTabCloseClicked;
     pub const closeTab = @import("nav.zig").closeTab;
     pub const navigate = @import("nav.zig").navigate;
     pub const navigateMode = @import("nav.zig").navigateMode;
@@ -575,7 +574,6 @@ pub const BrowserView = struct {
     pub const reopenTabListing = @import("render.zig").reopenTabListing;
     pub const onHeaderClicked = @import("render.zig").onHeaderClicked;
     pub const updateSortHeader = @import("render.zig").updateSortHeader;
-    pub const onColumnPicker = @import("render.zig").onColumnPicker;
     pub const onColumnToggled = @import("render.zig").onColumnToggled;
     pub const renderList = @import("render.zig").renderList;
     pub const ensureFlowbox = @import("render.zig").ensureFlowbox;
@@ -601,7 +599,6 @@ pub const BrowserView = struct {
     pub const activateEntry = @import("render.zig").activateEntry;
     pub const loadFileColors = @import("render.zig").loadFileColors;
     pub const fileColorFor = @import("render.zig").fileColorFor;
-    pub const sortClicked = @import("render.zig").sortClicked;
 
     // mediacols.zig -- media-metadata columns (batched, bounded fetch)
     pub const mediaApplyValues = @import("mediacols.zig").applyValues;
@@ -736,7 +733,6 @@ pub const BrowserView = struct {
     pub const onArchiveMember = @import("ops.zig").onArchiveMember;
     pub const extractAndOpenMember = @import("ops.zig").extractAndOpenMember;
     pub const onListDrop = @import("ops.zig").onListDrop;
-    pub const dropSpecInto = @import("ops.zig").dropSpecInto;
     pub const peerView = @import("ops.zig").peerView;
     pub const sendToPeer = @import("ops.zig").sendToPeer;
 

@@ -224,12 +224,6 @@ pub fn dupeRef(a: std.mem.Allocator, ref: FileRef) !FileRef {
     return .{ .host = try a.dupe(u8, ref.host), .path = try a.dupe(u8, ref.path) };
 }
 
-pub fn dupeRefs(a: std.mem.Allocator, refs: []const FileRef) ![]const FileRef {
-    const out = try a.alloc(FileRef, refs.len);
-    for (refs, 0..) |ref, i| out[i] = try dupeRef(a, ref);
-    return out;
-}
-
 test "FileRef parses, formats, and keeps host identity explicit" {
     const local = parseSpec("local:/tmp", "remote").ref;
     try std.testing.expectEqualStrings("", local.host);

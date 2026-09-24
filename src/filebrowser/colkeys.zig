@@ -234,12 +234,6 @@ pub fn order(kind: ValueKind, a: []const u8, b: []const u8, desc: bool) std.math
     };
 }
 
-/// Order by key rather than a pre-resolved kind. The sort path
-/// resolves the kind once per sort instead (kindOf scans a table).
-pub fn orderKey(key: []const u8, a: []const u8, b: []const u8, desc: bool) std.math.Order {
-    return order(kindOf(key), a, b, desc);
-}
-
 // --- column bookkeeping ----------------------------------------
 
 /// Position of column `i` inside the dense value array its own

@@ -26,6 +26,7 @@ const c = @import("../c.zig").c;
 const pathz = @import("../util/pathz.zig");
 const platform = @import("../util/platform.zig");
 const profile = @import("../util/profile.zig");
+const xdg = @import("../util/xdg.zig");
 
 pub const VERSION: u32 = 6;
 pub const MIN_READ_VERSION: u32 = 2;
@@ -161,20 +162,12 @@ pub const Record = struct {
 
 /// `$XDG_STATE_HOME/sketerm/file-transfers.d`.
 pub fn dirPath(allocator: std.mem.Allocator) ![]u8 {
-    if (profile.getenv("XDG_STATE_HOME")) |xs|
-        return std.fmt.allocPrint(allocator, "{s}/sketerm/file-transfers.d", .{xs});
-    if (profile.getenv("HOME")) |home|
-        return std.fmt.allocPrint(allocator, "{s}/.local/state/sketerm/file-transfers.d", .{home});
-    return allocator.dupe(u8, "/tmp/sketerm-file-transfers.d");
+    return xdg.statePath(allocator, "file-transfers.d");
 }
 
 /// The single-document ledger this store replaced.
 pub fn legacyPath(allocator: std.mem.Allocator) ![]u8 {
-    if (profile.getenv("XDG_STATE_HOME")) |xs|
-        return std.fmt.allocPrint(allocator, "{s}/sketerm/file-transfers.json", .{xs});
-    if (profile.getenv("HOME")) |home|
-        return std.fmt.allocPrint(allocator, "{s}/.local/state/sketerm/file-transfers.json", .{home});
-    return allocator.dupe(u8, "/tmp/sketerm-file-transfers.json");
+    return xdg.statePath(allocator, "file-transfers.json");
 }
 
 fn prefixOf(rtype: RType) []const u8 {

@@ -19,7 +19,7 @@ const c = @import("../c.zig").c;
 const atomicwrite = @import("../util/atomicwrite.zig");
 const model = @import("model.zig");
 const pathz = @import("../util/pathz.zig");
-const profile = @import("../util/profile.zig");
+const xdg = @import("../util/xdg.zig");
 
 /// Named registers kept at once. A new register past this is REFUSED
 /// (never silently evicted): a curated mark set is user work, so
@@ -358,13 +358,7 @@ pub const Store = struct {
 };
 
 pub fn filePath(allocator: std.mem.Allocator) ![]u8 {
-    if (profile.getenv("XDG_STATE_HOME")) |xs| {
-        return std.fmt.allocPrint(allocator, "{s}/sketerm/registers.json", .{xs});
-    }
-    if (profile.getenv("HOME")) |home| {
-        return std.fmt.allocPrint(allocator, "{s}/.local/state/sketerm/registers.json", .{home});
-    }
-    return std.fmt.allocPrint(allocator, "/tmp/sketerm-registers.json", .{});
+    return xdg.statePath(allocator, "registers.json");
 }
 
 test "a register keeps operation-root form in either marking order" {

@@ -1524,17 +1524,10 @@ pub const Service = struct {
         self.appendIntent(.download, host, remote_path, "", cache_path, app_id orelse "", watch_token, 0, origin);
     }
 
-    /// Submit a one-way upload of a LOCAL file to `host:remote_path`
-    /// as a durable daemon transfer with no edit watch attached — the
-    /// web download manager's redirect-to-server handoff. Returns the
-    /// ledger token (allocated from `allocator`, caller owns) so the
-    /// submitter can poll `intentProgress`, or null when the record
-    /// could not be created.
-    pub fn submitUpload(self: *Service, allocator: std.mem.Allocator, local_path: []const u8, host: []const u8, remote_path: []const u8, origin: ?*anyopaque) ?[]u8 {
-        return self.submitDelivery(allocator, "", local_path, host, remote_path, false, origin);
-    }
-
-    /// One-way delivery without an editor watch, from either host.
+    /// One-way delivery without an editor watch, from either host (the
+    /// web download manager's redirect-to-server handoff).
+    /// @return the ledger token (caller owns) for `intentProgress`, or
+    /// null when the record could not be created.
     pub fn submitDelivery(self: *Service, allocator: std.mem.Allocator, src_host: []const u8, src_path: []const u8, dst_host: []const u8, dst_path: []const u8, consume_source: bool, origin: ?*anyopaque) ?[]u8 {
         if (self.durability_error) {
             self.notify("transfer not started because recovery state is unavailable", .{});

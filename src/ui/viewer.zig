@@ -13,6 +13,7 @@ const fsdrive = @import("../ipc/fsdrive.zig");
 const muxclient = @import("../mux/client.zig");
 const Config = @import("../config.zig").Config;
 const platform = @import("../util/platform.zig");
+const dirsweep = @import("../util/dirsweep.zig");
 const castbox = @import("castbox.zig");
 const Terminal = @import("../terminal.zig").Terminal;
 const Playbar = @import("playbar.zig").Playbar;
@@ -558,7 +559,7 @@ fn materializeOpenCopy(work: *LoadWork, bytes: []const u8, result: *LoadResult) 
     sweepOpenCopies(dir);
     const name = resource.name();
     const safe_name = if (name.len > 0 and name.len < 512) name else "remote-image";
-    const path = std.fmt.bufPrintZ(&result.materialized, "{s}/open-{d}-{d}-{s}", .{
+    const path = std.fmt.bufPrintZ(&result.materialized, "{s}/" ++ OPEN_COPY_PREFIX ++ "{d}-{d}-{s}", .{
         dir,
         c.getpid(),
         c.g_get_monotonic_time(),
@@ -583,20 +584,13 @@ fn materializeOpenCopy(work: *LoadWork, bytes: []const u8, result: *LoadResult) 
     result.materialized_len = path.len;
 }
 
+/// Open-copies are handed to an external app and unlinked when the
+/// viewer moves on; one older than this belongs to a viewer that died.
+const OPEN_COPY_MAX_AGE_SECS = 3600;
+const OPEN_COPY_PREFIX = "open-";
+
 fn sweepOpenCopies(directory: [:0]const u8) void {
-    const dir = c.opendir(directory.ptr) orelse return;
-    defer _ = c.closedir(dir);
-    const now = c.time(null);
-    while (c.readdir(dir)) |entry| {
-        const name = std.mem.span(@as([*:0]const u8, @ptrCast(&entry.*.d_name)));
-        if (!std.mem.startsWith(u8, name, "open-")) continue;
-        var path_buf: [4096:0]u8 = undefined;
-        const path = std.fmt.bufPrintZ(&path_buf, "{s}/{s}", .{ directory, name }) catch continue;
-        var st: c.struct_stat = undefined;
-        if (c.lstat(path.ptr, &st) != 0 or st.st_uid != c.geteuid() or (st.st_mode & c.S_IFMT) != c.S_IFREG) continue;
-        const modified = if (@hasField(c.struct_stat, "st_mtim")) st.st_mtim.tv_sec else st.st_mtimespec.tv_sec;
-        if (modified + 3600 < now) _ = c.unlink(path.ptr);
-    }
+    dirsweep.sweep(directory.ptr, .{ .prefix = OPEN_COPY_PREFIX, .max_age_secs = OPEN_COPY_MAX_AGE_SECS });
 }
 
 fn decodeStillCurrent(user: ?*anyopaque) bool {
@@ -617,19 +611,6 @@ fn loadIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
     std.heap.c_allocator.destroy(work);
     target.unref();
     return 0;
-}
-
-pub fn textureFromDecoded(image: *const decoder.Decoded) ?*c.GdkTexture {
-    const frame = image.first();
-    const bytes = c.g_bytes_new(frame.rgba.ptr, frame.rgba.len) orelse return null;
-    defer c.g_bytes_unref(bytes);
-    return @ptrCast(@alignCast(c.gdk_memory_texture_new(
-        @intCast(frame.width),
-        @intCast(frame.height),
-        c.GDK_MEMORY_R8G8B8A8,
-        bytes,
-        @intCast(frame.width * 4),
-    )));
 }
 
 const VIEWER_QDATA = "sketerm-viewer-window";

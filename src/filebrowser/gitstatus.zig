@@ -276,20 +276,6 @@ pub fn isUnmergedPair(x: u8, y: u8) bool {
     return false;
 }
 
-/// Index-side and worktree-side states of one record.
-///
-/// An unmerged record's columns are a CONFLICT PAIR (`AA`, `DU`, `UU`,
-/// …), not two independent statuses, so both sides read as conflicted
-/// rather than as "added twice".
-pub fn sidesFor(r: Record) struct { index: State, work: State } {
-    return switch (r.kind) {
-        .unmerged => .{ .index = .conflicted, .work = .conflicted },
-        .untracked => .{ .index = .none, .work = .untracked },
-        .ignored => .{ .index = .none, .work = .ignored },
-        .ordinary, .rename => .{ .index = sideState(r.x), .work = sideState(r.y) },
-    };
-}
-
 /// What a child state contributes to its ANCESTOR directories.
 ///
 /// Ignored content never propagates: a directory full of build output

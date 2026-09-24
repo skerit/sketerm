@@ -283,6 +283,8 @@ comptime {
     _ = @import("util/markdown.zig");
     _ = @import("util/marks.zig");
     _ = @import("util/mounts.zig");
+    _ = @import("util/xdg.zig");
+    _ = @import("util/dirsweep.zig");
     _ = @import("util/ocr.zig");
     _ = @import("util/pathz.zig");
     _ = @import("util/readfile.zig");

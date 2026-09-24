@@ -55,6 +55,7 @@ const fmtTimeZ = @import("../../filebrowser/format.zig").fmtTimeZ;
 const guessMime = @import("open.zig").guessMime;
 const open_mod = @import("open.zig");
 const viewer_model = @import("../../viewer.zig");
+const dirsweep = @import("../../util/dirsweep.zig");
 const render_mod = @import("render.zig");
 const fileicon = @import("../../filebrowser/fileicon.zig");
 const isImageName = @import("../../filebrowser/paths.zig").isImageName;
@@ -828,19 +829,23 @@ pub fn remoteThumbHeaderMtime(bytes: []const u8) ?i64 {
     return std.mem.readInt(i64, bytes[4..12], .little);
 }
 
+/// The extension every file in the remote thumbnail cache carries;
+/// the sweep selects candidates by it.
+const REMOTE_THUMB_EXT = ".thumb";
+
 /// Cache basename for one host-qualified identity: 32 hex chars of
-/// md5 plus ".thumb". Pure (unit-tested); md5 is key derivation
-/// here, not integrity.
-pub fn remoteThumbCacheName(identity: []const u8) [38]u8 {
+/// md5 plus REMOTE_THUMB_EXT. Pure (unit-tested); md5 is key
+/// derivation here, not integrity.
+pub fn remoteThumbCacheName(identity: []const u8) [32 + REMOTE_THUMB_EXT.len]u8 {
     var digest: [16]u8 = undefined;
     std.crypto.hash.Md5.hash(identity, &digest, .{});
-    var out: [38]u8 = undefined;
+    var out: [32 + REMOTE_THUMB_EXT.len]u8 = undefined;
     const hexd = "0123456789abcdef";
     for (digest, 0..) |b, i| {
         out[i * 2] = hexd[b >> 4];
         out[i * 2 + 1] = hexd[b & 15];
     }
-    out[32..38].* = ".thumb".*;
+    out[32..].* = REMOTE_THUMB_EXT.*;
     return out;
 }
 
@@ -951,42 +956,13 @@ fn writeRemoteThumbCache(host: []const u8, path: []const u8, mtime_ms: i64, byte
 }
 
 /// Oldest-first prune, run at most once per process and only when
-/// the cache exceeds its file cap. Bounded collection: entries past
-/// twice the cap are ignored this round; the next process sweeps
-/// again.
+/// the cache exceeds its file cap.
 fn sweepRemoteThumbCache(dirz: [*:0]const u8) void {
-    const Item = struct { mtime: i64, name: [38]u8 };
-    const a = std.heap.c_allocator;
-    var items: std.ArrayList(Item) = .empty;
-    defer items.deinit(a);
-    const d = c.opendir(dirz) orelse return;
-    defer _ = c.closedir(d);
-    while (true) {
-        const ent = c.readdir(d) orelse break;
-        const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
-        if (name.len != 38 or !std.mem.endsWith(u8, name, ".thumb")) continue;
-        var pz: [4200:0]u8 = undefined;
-        const p = std.fmt.bufPrintZ(&pz, "{s}/{s}", .{ std.mem.span(dirz), name }) catch continue;
-        var st: c.struct_stat = undefined;
-        if (c.stat(p.ptr, &st) != 0) continue;
-        const mts = if (@hasField(c.struct_stat, "st_mtim")) st.st_mtim else st.st_mtimespec;
-        var it = Item{ .mtime = @intCast(mts.tv_sec), .name = undefined };
-        @memcpy(&it.name, name);
-        items.append(a, it) catch break;
-        if (items.items.len >= REMOTE_THUMB_CACHE_MAX_FILES * 2) break;
-    }
-    if (items.items.len <= REMOTE_THUMB_CACHE_MAX_FILES) return;
-    std.mem.sort(Item, items.items, {}, struct {
-        fn lt(_: void, x: Item, y: Item) bool {
-            return x.mtime < y.mtime;
-        }
-    }.lt);
-    const doomed = @min(items.items.len - REMOTE_THUMB_CACHE_MAX_FILES + REMOTE_THUMB_CACHE_SWEEP, items.items.len);
-    for (items.items[0..doomed]) |it| {
-        var pz: [4200:0]u8 = undefined;
-        const p = std.fmt.bufPrintZ(&pz, "{s}/{s}", .{ std.mem.span(dirz), it.name }) catch continue;
-        _ = c.unlink(p.ptr);
-    }
+    dirsweep.sweep(dirz, .{
+        .suffix = REMOTE_THUMB_EXT,
+        .max_files = REMOTE_THUMB_CACHE_MAX_FILES,
+        .trim_extra = REMOTE_THUMB_CACHE_SWEEP,
+    });
 }
 
 pub fn enqueueRemoteThumb(self: *BrowserView, hc: *HostConn, path: []const u8, mtime_ms: i64) void {

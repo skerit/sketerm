@@ -227,11 +227,6 @@ pub fn currentTab(self: *BrowserView) ?*BTab {
     return null;
 }
 
-pub fn onTabCloseClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const tab = cast.userData(BTab, user);
-    tab.view.closeTab(tab);
-}
-
 pub fn closeTab(self: *BrowserView, tab: *BTab) void {
     self.verifyInlineRenameTeardown(tab, "tab");
     self.cancelInlineRename(tab);

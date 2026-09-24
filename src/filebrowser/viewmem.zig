@@ -13,7 +13,7 @@ const c = @import("../c.zig").c;
 const atomicwrite = @import("../util/atomicwrite.zig");
 const model = @import("model.zig");
 const pathz = @import("../util/pathz.zig");
-const profile = @import("../util/profile.zig");
+const xdg = @import("../util/xdg.zig");
 
 /// Remembered folders kept; the lowest `seq` is evicted first.
 pub const MAX_FOLDERS = 256;
@@ -274,13 +274,7 @@ pub const Store = struct {
 };
 
 pub fn filePath(allocator: std.mem.Allocator) ![]u8 {
-    if (profile.getenv("XDG_STATE_HOME")) |xs| {
-        return std.fmt.allocPrint(allocator, "{s}/sketerm/viewmem.json", .{xs});
-    }
-    if (profile.getenv("HOME")) |home| {
-        return std.fmt.allocPrint(allocator, "{s}/.local/state/sketerm/viewmem.json", .{home});
-    }
-    return std.fmt.allocPrint(allocator, "/tmp/sketerm-viewmem.json", .{});
+    return xdg.statePath(allocator, "viewmem.json");
 }
 
 test "a folder's settings survive an encode/decode round trip" {

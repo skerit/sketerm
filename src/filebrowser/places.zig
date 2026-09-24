@@ -8,7 +8,7 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const atomicwrite = @import("../util/atomicwrite.zig");
 const readfile = @import("../util/readfile.zig");
-const profile = @import("../util/profile.zig");
+const xdg = @import("../util/xdg.zig");
 
 /// Cap on this state file. Past it there is no usable record to read,
 /// and the cap is what stops a doctored one exhausting memory.
@@ -185,13 +185,7 @@ pub fn splitRecentLabel(spec: []const u8) RecentLabel {
 }
 
 pub fn filePath(allocator: std.mem.Allocator) ![]u8 {
-    if (profile.getenv("XDG_STATE_HOME")) |xs| {
-        return std.fmt.allocPrint(allocator, "{s}/sketerm/places.json", .{xs});
-    }
-    if (profile.getenv("HOME")) |home| {
-        return std.fmt.allocPrint(allocator, "{s}/.local/state/sketerm/places.json", .{home});
-    }
-    return std.fmt.allocPrint(allocator, "/tmp/sketerm-places.json", .{});
+    return xdg.statePath(allocator, "places.json");
 }
 
 pub fn load(allocator: std.mem.Allocator) ?std.json.Parsed(Places) {

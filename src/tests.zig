@@ -254,6 +254,8 @@ comptime {
     _ = @import("util/titlefmt.zig");
     _ = @import("util/ocr.zig");
     _ = @import("util/mounts.zig");
+    _ = @import("util/xdg.zig");
+    _ = @import("util/dirsweep.zig");
     _ = @import("util/markdown.zig");
     _ = @import("render/bg_pass.zig");
     _ = @import("render/shader_pass.zig");

@@ -18,6 +18,7 @@ const hostmount = @import("../hostmount.zig");
 const mimeListContains = @import("../../filebrowser/desktop.zig").mimeListContains;
 const paths = @import("../../filebrowser/paths.zig");
 const platform = @import("../../util/platform.zig");
+const dirsweep = @import("../../util/dirsweep.zig");
 const viewer_model = @import("../../viewer.zig");
 const views = @import("views.zig");
 const cast = @import("../../util/cast.zig");
@@ -170,28 +171,14 @@ pub fn openPathOnHost(self: *BrowserView, hc: *HostConn, path: []const u8) void 
 
 var viewer_manifest_serial: u64 = 0;
 
-fn sweepViewerManifests(directory: [:0]const u8) void {
-    const dir = c.opendir(directory.ptr) orelse return;
-    defer _ = c.closedir(dir);
-    const now = c.time(null);
-    while (c.readdir(dir)) |entry| {
-        const name = std.mem.span(@as([*:0]const u8, @ptrCast(&entry.*.d_name)));
-        if (!std.mem.startsWith(u8, name, viewer_model.MANIFEST_PREFIX)) continue;
-        var path_buf: [4096:0]u8 = undefined;
-        const path = std.fmt.bufPrintZ(&path_buf, "{s}/{s}", .{ directory, name }) catch continue;
-        var st: c.struct_stat = undefined;
-        if (c.lstat(path.ptr, &st) != 0 or
-            st.st_uid != c.geteuid() or
-            (st.st_mode & c.S_IFMT) != c.S_IFREG) continue;
-        const modified = if (@hasField(c.struct_stat, "st_mtim")) st.st_mtim.tv_sec else st.st_mtimespec.tv_sec;
-        if (modified + 300 < now) _ = c.unlink(path.ptr);
-    }
-}
+/// A manifest is read by the viewer it was written for within seconds;
+/// one older than this outlived a viewer that never started.
+const MANIFEST_MAX_AGE_SECS = 300;
 
 fn writeViewerManifest(bytes: []const u8, out: *[4096:0]u8) ?[:0]const u8 {
     var dir_buf: [4096:0]u8 = undefined;
     const dir = viewer_model.ensureManifestDirectory(&dir_buf) orelse return null;
-    sweepViewerManifests(dir);
+    dirsweep.sweep(dir.ptr, .{ .prefix = viewer_model.MANIFEST_PREFIX, .max_age_secs = MANIFEST_MAX_AGE_SECS });
     var fd: c_int = -1;
     var path: [:0]u8 = undefined;
     var attempts: u8 = 0;

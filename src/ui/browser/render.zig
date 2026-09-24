@@ -541,7 +541,6 @@ fn onWaitTick(user: ?*anyopaque) callconv(.c) c.gboolean {
     return 1;
 }
 
-
 /// Show/hide the chrome that belongs to the tab's view mode.
 pub fn applyViewChrome(self: *BrowserView, tab: *BTab) void {
     _ = self;
@@ -829,11 +828,6 @@ pub fn reopenTabListing(self: *BrowserView, tab: *BTab) void {
 /// callers that predate the migration).
 pub fn updateSortHeader(self: *BrowserView, tab: *BTab) void {
     @import("colview.zig").syncColumns(self, tab);
-}
-
-pub fn onColumnPicker(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx = cast.userData(HeaderCtx, user);
-    showColumnPicker(ctx.tab, @ptrCast(@alignCast(btn)), null);
 }
 
 pub const PickerPoint = struct { x: f64, y: f64 };
@@ -1839,19 +1833,4 @@ pub fn fileColorFor(self: *BrowserView, name: []const u8) ?*const [7]u8 {
         if (fsjob.nameMatches(fc.glob, name)) return &fc.color;
     }
     return null;
-}
-
-pub fn sortClicked(tab: *BTab, key: browser_model.SortKey) void {
-    // Only one key orders the view; picking a fixed column drops
-    // any attribute ordering.
-    tab.attr_sort = null;
-    if (tab.sort_key == key) {
-        tab.descending = !tab.descending;
-    } else {
-        tab.sort_key = key;
-        tab.descending = false;
-    }
-    tab.view.updateSortHeader(tab);
-    views.rememberFolder(tab.view, tab);
-    tab.view.renderTab(tab);
 }

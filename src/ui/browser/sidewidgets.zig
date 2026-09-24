@@ -99,26 +99,6 @@ pub const Store = struct {
         }
     }
 
-    /// Wire form for places.save; slices borrow from the store, the
-    /// nested arrays live in `arena`.
-    pub fn toPlaces(self: *const Store, arena: std.mem.Allocator) []const places_mod.WidgetSection {
-        const out = arena.alloc(places_mod.WidgetSection, self.sections.items.len) catch return &.{};
-        for (self.sections.items, 0..) |sec, i| {
-            const ws = arena.alloc(places_mod.Widget, sec.widgets.items.len) catch return &.{};
-            for (sec.widgets.items, 0..) |w, j| {
-                ws[j] = .{
-                    .kind = w.kind.name(),
-                    .text = w.text,
-                    .command = w.command,
-                    .path = w.path,
-                    .interval_secs = w.interval_secs,
-                };
-            }
-            out[i] = .{ .name = sec.name, .widgets = ws };
-        }
-        return out;
-    }
-
     pub fn sectionByName(self: *Store, name: []const u8) ?*Section {
         for (self.sections.items) |*s| {
             if (std.mem.eql(u8, s.name, name)) return s;
@@ -162,10 +142,6 @@ pub const Run = struct {
         self.allocator.destroy(self);
     }
 };
-
-pub fn runKey(a: std.mem.Allocator, section: []const u8, index: usize) ?[]u8 {
-    return std.fmt.allocPrint(a, "{s}\x00{d}", .{ section, index }) catch null;
-}
 
 /// The Run for a widget, created (and its first fetch kicked) on
 /// first sight. Returns null for kinds with no runtime.
