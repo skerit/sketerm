@@ -1,5 +1,36 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-09-25: response-body capture for headless web views
+
+`web_open capture:{...}` records the response BODIES a headless view's page
+receives, installed before its first request (frame order, like a policy) and
+kept for the view's lifetime across SPA route changes and full loads. The
+filter (hosts, url_contains, a pattern.zig url_regex, resource types, methods,
+mime prefixes) and the bounded store live in `src/web/capture.zig`; the CEF
+half is `cefhost/capture.zig`, a pass-through `cef_response_filter_t` handed
+out only for matching exchanges. `web_capture` pages metadata and reads one
+body (inline, `out_file`, or every listed body into `out_dir`),
+`web_capture_set` only narrows (clear, disable), `web_wait for:"response"`
+waits from a cursor, and `capabilities.web_capture` is the preflight. A helper
+without the `capture` capability refuses the open with nothing opened.
+
+Measured on CEF 151: the filter sees the body DECODED (a gzip response is kept
+as the page saw it), the POST body is still readable at response time, and the
+stream ends before `on_resource_load_complete`. A body the page never reads
+keeps its load open until the page reads it or leaves, so such an exchange
+is listed only on request (`include_in_flight`), with its bytes readable. The
+list cursor follows FINISH order and each exchange carries its request's
+`web_network` seq, because paging by seq would skip a slow response. Caps
+never cut silently: bodies are flagged with the delivered size, whole
+exchanges the total cap could not hold are counted as dropped.
+
+Proof: `web/capture.zig` and protocol unit tests (both roots), webdrive and
+mcp_web tests, smoke-web stage cap against real CEF
+(`SKETERM_SMOKE_WEB_CAPTURE_ONLY=1`) and smoke-mcp stage wc through the
+MCP tools (`SKETERM_SMOKE_MCP_WEBCAPTURE_ONLY=1`). sketerm-java mirrors it
+(`OpenOptions.withCapture`, `page.captured`/`responseBody`/`waitForResponse`)
+with a fake-server test and a real-browser `PageApiIT` journey.
+
 ## 2026-09-22: Files clipboard interoperability and live selection fixes
 
 Files now reads external GNOME copied-files and URI-list/KDE cut offers
