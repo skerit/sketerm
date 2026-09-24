@@ -153,6 +153,7 @@ fn capturePlaces(self: *BrowserView, allocator: std.mem.Allocator) !places_mod.P
         .hidden_sections = hidden,
         .section_order = order,
         .widget_sections = widget_sections,
+        .mount_aliases = try cloneAliases(allocator, self, &.{}),
         .sidebar_px = self.sidebar_px,
         .sidebar_open = self.sidebar_open,
         .zebra = self.zebra,
@@ -222,6 +223,31 @@ fn widgetsMatch(self: *BrowserView, saved: places_mod.Places) bool {
     return widgetStoreMatches(&self.widgets, saved.widget_sections);
 }
 
+fn aliasesMatch(self: *BrowserView, saved: places_mod.Places) bool {
+    if (self.mount_aliases.items.len != saved.mount_aliases.len) return false;
+    for (self.mount_aliases.items, saved.mount_aliases) |view_alias, saved_alias| {
+        if (!std.mem.eql(u8, view_alias.source, saved_alias.source) or
+            !std.mem.eql(u8, view_alias.host, saved_alias.host)) return false;
+    }
+    return true;
+}
+
+/// Arena-owned wire copies of a view's or a base's mount aliases.
+fn cloneAliases(allocator: std.mem.Allocator, view: ?*BrowserView, base: []const places_mod.MountAlias) ![]const places_mod.MountAlias {
+    const len = if (view) |v| v.mount_aliases.items.len else base.len;
+    const out = try allocator.alloc(places_mod.MountAlias, len);
+    if (view) |v| {
+        for (v.mount_aliases.items, 0..) |alias, i| {
+            out[i] = .{ .source = try allocator.dupe(u8, alias.source), .host = try allocator.dupe(u8, alias.host) };
+        }
+    } else {
+        for (base, 0..) |alias, i| {
+            out[i] = .{ .source = try allocator.dupe(u8, alias.source), .host = try allocator.dupe(u8, alias.host) };
+        }
+    }
+    return out;
+}
+
 /// Per-field providers whose local state differs from the previous
 /// authoritative snapshot. Unrelated unsaved changes in another view
 /// therefore join this save instead of being overwritten by it.
@@ -234,6 +260,7 @@ const MergeSources = struct {
     hidden_sections: ?*BrowserView = null,
     section_order: ?*BrowserView = null,
     widgets: ?*BrowserView = null,
+    mount_aliases: ?*BrowserView = null,
     sidebar_px: ?*BrowserView = null,
     sidebar_open: ?*BrowserView = null,
     zebra: ?*BrowserView = null,
@@ -241,6 +268,7 @@ const MergeSources = struct {
     side_info: ?*BrowserView = null,
 
     fn consider(self: *MergeSources, view: *BrowserView, base: places_mod.Places) void {
+        if (!aliasesMatch(view, base)) self.mount_aliases = view;
         if (!bookmarksMatch(view, base)) self.bookmarks = view;
         if (!stringsMatch(view.recent.items, base.recent)) self.recent = view;
         if (!frecencyMatches(view, base)) self.frecency = view;
@@ -367,6 +395,7 @@ fn captureMergedPlaces(base: places_mod.Places, sources: MergeSources, allocator
         .hidden_sections = hidden_sections,
         .section_order = section_order,
         .widget_sections = widget_sections,
+        .mount_aliases = try cloneAliases(allocator, sources.mount_aliases, base.mount_aliases),
         .sidebar_px = if (sources.sidebar_px) |view| view.sidebar_px else base.sidebar_px,
         .sidebar_open = if (sources.sidebar_open) |view| view.sidebar_open else base.sidebar_open,
         .zebra = if (sources.zebra) |view| view.zebra else base.zebra,
@@ -388,6 +417,7 @@ const PersistedState = struct {
     section_order: std.ArrayList([]u8) = .empty,
     widgets: sidewidgets.Store = .{},
     searches: std.ArrayList(@import("types.zig").OwnedSearch) = .empty,
+    mount_aliases: std.ArrayList(@import("types.zig").OwnedAlias) = .empty,
     sidebar_px: i32 = places_mod.DEFAULT_SIDEBAR_PX,
     sidebar_open: ?bool = null,
     zebra: bool = false,
@@ -449,6 +479,23 @@ const PersistedState = struct {
                 return null;
             };
         }
+        for (places.mount_aliases) |alias| {
+            const source = allocator.dupe(u8, alias.source) catch {
+                out.deinit(allocator);
+                return null;
+            };
+            const host = allocator.dupe(u8, alias.host) catch {
+                allocator.free(source);
+                out.deinit(allocator);
+                return null;
+            };
+            out.mount_aliases.append(allocator, .{ .source = source, .host = host }) catch {
+                allocator.free(source);
+                allocator.free(host);
+                out.deinit(allocator);
+                return null;
+            };
+        }
         out.widgets.loadFrom(allocator, places.widget_sections);
         if (!widgetStoreMatches(&out.widgets, places.widget_sections)) {
             out.deinit(allocator);
@@ -478,6 +525,9 @@ const PersistedState = struct {
         for (self.searches.items) |search| search.deinitOwned(allocator);
         self.searches.deinit(allocator);
         self.searches = .empty;
+        for (self.mount_aliases.items) |alias| alias.deinitOwned(allocator);
+        self.mount_aliases.deinit(allocator);
+        self.mount_aliases = .empty;
     }
 
     fn install(self: *PersistedState, view: *BrowserView, places: places_mod.Places) void {
@@ -530,6 +580,12 @@ const PersistedState = struct {
             view.saved_searches.deinit(allocator);
             view.saved_searches = self.searches;
             self.searches = .empty;
+        }
+        if (!aliasesMatch(view, places)) {
+            for (view.mount_aliases.items) |alias| alias.deinitOwned(allocator);
+            view.mount_aliases.deinit(allocator);
+            view.mount_aliases = self.mount_aliases;
+            self.mount_aliases = .empty;
         }
         view.sidebar_px = self.sidebar_px;
         view.sidebar_open = self.sidebar_open;

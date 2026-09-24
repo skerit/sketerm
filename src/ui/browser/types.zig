@@ -664,6 +664,8 @@ pub const BTab = struct {
     back: std.ArrayList([]u8) = .empty,
     fwd: std.ArrayList([]u8) = .empty,
     navigation_generation: u64 = 0,
+    /// Set while this tab browses a mount through its source host.
+    bypass: ?BypassLink = null,
     selected: std.ArrayList([]u8) = .empty,
     /// Full path selected once it appears in a streamed listing.
     pending_reveal: ?[]u8 = null,
@@ -1006,6 +1008,7 @@ pub const BTab = struct {
         self.pending_select.deinit(a);
         for (self.drag_selected.items) |p| a.free(p);
         self.drag_selected.deinit(a);
+        if (self.bypass) |*link| link.destroy(a);
         @import("dnd.zig").clearHover(self);
         for (self.attr_columns.items) |name| a.free(name);
         self.attr_columns.deinit(a);
@@ -1032,6 +1035,36 @@ pub const NavigationIntent = union(enum) {
     push,
     back: usize,
     forward: usize,
+    /// Replace the location without touching history: the mount
+    /// bypass swapping a mount path for the host's own, and back.
+    reroute,
+};
+
+/// A tab browsing a mount THROUGH the mount's source host (see
+/// filebrowser/bypass.zig): where the mount is, what it exports, and
+/// which host string the tab was rerouted to. Kept while the tab stays
+/// inside the export, so a lost host can fall back to the mount path.
+pub const BypassLink = struct {
+    mountpoint: []u8,
+    root: []u8,
+    host: []u8,
+
+    pub fn destroy(self: *BypassLink, allocator: std.mem.Allocator) void {
+        allocator.free(self.mountpoint);
+        allocator.free(self.root);
+        allocator.free(self.host);
+    }
+};
+
+/// An owned `places.MountAlias`.
+pub const OwnedAlias = struct {
+    source: []u8,
+    host: []u8,
+
+    pub fn deinitOwned(self: OwnedAlias, allocator: std.mem.Allocator) void {
+        allocator.free(self.source);
+        allocator.free(self.host);
+    }
 };
 
 /// In-flight listing request (open_view or refresh `list`). `sent`

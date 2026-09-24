@@ -650,6 +650,7 @@ pub fn main() u8 {
         const body = std.fmt.bufPrint(&script_buf,
             \\#!/bin/sh
             \\if [ "$1" = "-G" ]; then printf 'hostname 127.0.0.1\n'; exit 0; fi
+            \\case "$*" in *unreachable-host*) exit 255;; esac
             \\printf 'dial\n' >> '{s}/ssh-dials'
             \\if [ -e '{s}/ssh-delay' ]; then sleep 2; fi
             \\export XDG_RUNTIME_DIR='{s}'
@@ -976,6 +977,14 @@ pub fn main() u8 {
         if (!have_wl) return fail("focused files-bugs smoke is GTK/Wayland-only");
         if (filesBrowserBugsStage(allocator, app, rt, &wl_z)) |why| return failMsg(why);
         say("files bugs: hidden count, trash strip, Keep Both naming, location-entry focus, panel after Up and row drag all held");
+        teardown();
+        return 0;
+    }
+    if (c.getenv("SKETERM_SMOKE_E2E_FILES_BYPASS_ONLY") != null) {
+        const app = drive orelse return fail("focused files-bypass smoke has no display driver");
+        if (!have_wl) return fail("focused files-bypass smoke is GTK/Wayland-only");
+        if (filesMountBypassStage(allocator, app, rt, &wl_z)) |why| return failMsg(why);
+        say("files bypass: a proven mount was browsed via its host, a mismatched one and an unreachable one stayed on the mount");
         teardown();
         return 0;
     }
@@ -7861,6 +7870,104 @@ fn respawnRemoteMux(rt: []const u8) bool {
     }
     return true;
 }
+
+/// Mount bypass (ui/browser/mountbypass.zig) through the real entry
+/// point: `sketerm files <local path under a mount>`. The mount table
+/// is a file handed over SKETERM_MOUNT_TABLE (util/mounts.zig), and the
+/// "remote" host is the fake-SSH daemon on this machine, so an export
+/// whose mountpoint IS the exported directory shows identical files
+/// through both daemons. Three mounts: one proven the same (the tab is
+/// rerouted and the location bar says "via sketerm"), one whose
+/// mountpoint shows different files (stays on the mount), and one
+/// whose host cannot be reached (stays on the mount).
+fn filesMountBypassStage(
+    allocator: std.mem.Allocator,
+    app: *appdrive.App,
+    rt: []const u8,
+    wl: [*:0]const u8,
+) ?[]const u8 {
+    const ocr = @import("util/ocr.zig");
+    if (!ocr.available()) {
+        say("files bypass: tesseract unavailable; skipping");
+        return null;
+    }
+    if (remote_mux_pid <= 0) return "files bypass: the fake-SSH daemon is not running";
+
+    var dirs: [3][512:0]u8 = undefined;
+    const names = [_][]const u8{ "byexport", "bymis", "byunr" };
+    for (names, 0..) |name, i| {
+        const d = std.fmt.bufPrintZ(&dirs[i], "{s}/{s}", .{ rt, name }) catch return "files bypass: dir path";
+        _ = c.mkdir(d.ptr, 0o700);
+        var p: [560:0]u8 = undefined;
+        const z = std.fmt.bufPrintZ(&p, "{s}/BYPASSROW", .{d}) catch return "files bypass: seed path";
+        const fd = c.open(z.ptr, c.O_WRONLY | c.O_CREAT | c.O_TRUNC, @as(c_uint, 0o600));
+        if (fd < 0) return "files bypass: seed create";
+        _ = c.close(fd);
+    }
+    const export_dir = std.mem.sliceTo(&dirs[0], 0);
+    // The mismatched mountpoint is a different directory with an older
+    // mtime: the identity check compares kind and mtime to the second.
+    {
+        var times = [2]c.struct_timeval{ .{ .tv_sec = 1_000_000_000, .tv_usec = 0 }, .{ .tv_sec = 1_000_000_000, .tv_usec = 0 } };
+        if (c.utimes(&dirs[1], &times) != 0) return "files bypass: utimes";
+    }
+    var table_buf: [512:0]u8 = undefined;
+    const table = std.fmt.bufPrintZ(&table_buf, "{s}/mounts.tbl", .{rt}) catch return "files bypass: table path";
+    {
+        var body_buf: [2048]u8 = undefined;
+        const body = std.fmt.bufPrint(&body_buf,
+            \\localhost:{s} {s} fuse.sshfs rw,nosuid,nodev 0 0
+            \\localhost:{s} {s} fuse.sshfs rw,nosuid,nodev 0 0
+            \\unreachable-host:{s} {s} fuse.sshfs rw,nosuid,nodev 0 0
+            \\
+        , .{ export_dir, export_dir, export_dir, std.mem.sliceTo(&dirs[1], 0), export_dir, std.mem.sliceTo(&dirs[2], 0) }) catch return "files bypass: table body";
+        const fp = c.fopen(table.ptr, "wb") orelse return "files bypass: table open";
+        const wrote = c.fwrite(body.ptr, 1, body.len, fp) == body.len;
+        _ = c.fclose(fp);
+        if (!wrote) return "files bypass: table write";
+    }
+    _ = c.setenv("SKETERM_MOUNT_TABLE", table.ptr, 1);
+    defer _ = c.unsetenv("SKETERM_MOUNT_TABLE");
+
+    const Case = struct { dir: usize, tag: []const u8, rerouted: bool };
+    const cases = [_]Case{
+        .{ .dir = 0, .tag = "bypassok", .rerouted = true },
+        .{ .dir = 1, .tag = "bypassmis", .rerouted = false },
+        .{ .dir = 2, .tag = "bypassunr", .rerouted = false },
+    };
+    for (cases) |case| {
+        const dir = std.mem.sliceTo(&dirs[case.dir], 0);
+        const child = launchRenameFiles(app, dir, case.tag, "", wl) orelse
+            return "files bypass: the Files window never appeared";
+        defer if (renamefiles_pid > 0) reap(renamefiles_pid, c.SIGTERM, 3000);
+        if (!viewerWaitOcr(allocator, app, child.win, "BYPASSROW", 40_000)) {
+            viewerShot(allocator, app, child.win, "files-bypass-listing");
+            return "files bypass: the mount's listing never rendered";
+        }
+        if (case.rerouted) {
+            if (!viewerWaitOcr(allocator, app, child.win, "via", 40_000)) {
+                viewerShot(allocator, app, child.win, "files-bypass-verdict");
+                return "files bypass: a mount proven to show the host's files was not browsed via sketerm";
+            }
+        } else {
+            // The verdict is only a transient status line, so the check
+            // is the outcome: long after both daemons could have
+            // answered (the proven case above rerouted within seconds),
+            // the tab is still on the mount and still lists it.
+            pumpFor(app, 8_000);
+            if ((ocrCount(allocator, app, child.win, "via") orelse 0) > 0) {
+                viewerShot(allocator, app, child.win, "files-bypass-wrong-reroute");
+                _ = c.fprintf(platform.stderr(), "smoke-e2e: files bypass: case %.*s was rerouted\n", @as(c_int, @intCast(case.tag.len)), case.tag.ptr);
+                return "files bypass: a mismatched or unreachable mount was rerouted anyway";
+            }
+            if (!viewerWaitOcr(allocator, app, child.win, "BYPASSROW", 10_000))
+                return "files bypass: the mount's listing went away";
+        }
+        if (!closeRenameFiles(app, child)) return "files bypass: the Files window did not close cleanly";
+    }
+    return null;
+}
+
 
 /// A Files window on a fake-SSH directory survives its daemon dying:
 /// after the reconnect every row is listed ONCE (the re-open used to

@@ -77,6 +77,7 @@ comptime {
     _ = @import("filebrowser/model.zig");
     _ = @import("filebrowser/paths.zig");
     _ = @import("filebrowser/jobop.zig");
+    _ = @import("filebrowser/bypass.zig");
     _ = @import("filebrowser/places.zig");
     _ = @import("filebrowser/previewers.zig");
     _ = @import("filebrowser/progress.zig");

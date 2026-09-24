@@ -49,6 +49,14 @@ pub const WidgetSection = struct {
     widgets: []const Widget = &.{},
 };
 
+/// A remembered mount-bypass answer: which host string reaches the
+/// machine an sshfs/NFS mount's source names, chosen once when more
+/// than one known host named it (filebrowser/bypass.zig).
+pub const MountAlias = struct {
+    source: []const u8 = "",
+    host: []const u8 = "",
+};
+
 pub const Places = struct {
     bookmarks: []const []const u8 = &.{},
     /// Display labels parallel to `bookmarks`; "" (or a missing tail,
@@ -78,6 +86,8 @@ pub const Places = struct {
     /// User widget sections (rendered between the built-in sections
     /// per `section_order`).
     widget_sections: []const WidgetSection = &.{},
+    /// Remembered mount-bypass host choices, by mount source.
+    mount_aliases: []const MountAlias = &.{},
     /// Width of the places sidebar, in pixels (the GtkPaned position).
     sidebar_px: i32 = DEFAULT_SIDEBAR_PX,
     /// Whether the sidebar is shown. `null` = never toggled, so the

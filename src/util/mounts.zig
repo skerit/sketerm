@@ -19,11 +19,29 @@ pub const Hit = struct {
     path_len: usize = 0,
     mount_buf: [1024]u8 = undefined,
     mount_len: usize = 0,
+    root_buf: [1024]u8 = undefined,
+    root_len: usize = 0,
 
-    pub fn host(self: *const Hit) []const u8 { return self.host_buf[0..self.host_len]; }
-    pub fn path(self: *const Hit) []const u8 { return self.path_buf[0..self.path_len]; }
-    pub fn mountpoint(self: *const Hit) []const u8 { return self.mount_buf[0..self.mount_len]; }
+    pub fn host(self: *const Hit) []const u8 {
+        return self.host_buf[0..self.host_len];
+    }
+    pub fn path(self: *const Hit) []const u8 {
+        return self.path_buf[0..self.path_len];
+    }
+    pub fn mountpoint(self: *const Hit) []const u8 {
+        return self.mount_buf[0..self.mount_len];
+    }
+    /// The exported directory on the host the mount was made from
+    /// ("/" when the source named none): what maps host paths back
+    /// to mount paths.
+    pub fn root(self: *const Hit) []const u8 {
+        return self.root_buf[0..self.root_len];
+    }
 };
+
+/// Test hook: a file in /proc/mounts format read INSTEAD of the real
+/// table, so a rig can present an sshfs mount without mounting one.
+pub const TABLE_OVERRIDE_ENV = "SKETERM_MOUNT_TABLE";
 
 /// One mount, as the platform reports it. The slices point into the
 /// walker's own scratch and are valid ONLY for the duration of the
@@ -62,7 +80,14 @@ pub fn forEach(ctx: anytype) void {
         }
         return;
     }
-    const f = c.fopen("/proc/self/mounts", "r") orelse c.fopen("/proc/mounts", "r") orelse return;
+    const f = blk: {
+        if (@import("env.zig").nonEmpty(TABLE_OVERRIDE_ENV)) |table| {
+            var z: [4096:0]u8 = undefined;
+            const tz = std.fmt.bufPrintZ(&z, "{s}", .{table}) catch return;
+            break :blk c.fopen(tz.ptr, "r") orelse return;
+        }
+        break :blk c.fopen("/proc/self/mounts", "r") orelse c.fopen("/proc/mounts", "r") orelse return;
+    };
     defer _ = c.fclose(f);
     var line: [4096]u8 = undefined;
     while (c.fgets(&line, line.len, f) != null) {
@@ -90,11 +115,18 @@ fn unescape(buf: []u8, src: []const u8) []const u8 {
     while (r < src.len and w < buf.len) {
         if (src[r] == '\\' and r + 3 < src.len) {
             const v = std.fmt.parseInt(u8, src[r + 1 .. r + 4], 8) catch {
-                buf[w] = src[r]; w += 1; r += 1; continue;
+                buf[w] = src[r];
+                w += 1;
+                r += 1;
+                continue;
             };
-            buf[w] = v; w += 1; r += 4;
+            buf[w] = v;
+            w += 1;
+            r += 4;
         } else {
-            buf[w] = src[r]; w += 1; r += 1;
+            buf[w] = src[r];
+            w += 1;
+            r += 1;
         }
     }
     return buf[0..w];
@@ -140,6 +172,9 @@ fn consider(path: []const u8, source: []const u8, mountpoint: []const u8, out: *
     const mn = @min(mountpoint.len, out.mount_buf.len);
     @memcpy(out.mount_buf[0..mn], mountpoint[0..mn]);
     out.mount_len = mn;
+    const rn = @min(root.len, out.root_buf.len);
+    @memcpy(out.root_buf[0..rn], root[0..rn]);
+    out.root_len = rn;
     best.* = mountpoint.len;
 }
 
@@ -180,4 +215,11 @@ test "mount source parsing handles ssh, bracketed IPv6, and root mapping" {
     var best: usize = 0;
     consider("/home/me", "box:/", "/", &hit, &best);
     try std.testing.expectEqualStrings("/home/me", hit.path());
+    try std.testing.expectEqualStrings("/", hit.root());
+    var deep: Hit = .{};
+    best = 0;
+    consider("/mnt/box/x/y", "me@box:/srv/data", "/mnt/box", &deep, &best);
+    try std.testing.expectEqualStrings("/srv/data/x/y", deep.path());
+    try std.testing.expectEqualStrings("/srv/data", deep.root());
+    try std.testing.expectEqualStrings("/mnt/box", deep.mountpoint());
 }

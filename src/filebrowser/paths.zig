@@ -69,25 +69,9 @@ pub fn completionMatches(name: []const u8, prefix: []const u8) bool {
 }
 
 /// A network-mount bypass hit: (mountpoint under `path`) rewritten
-/// to direct mux access on the mount's source host.
-pub const BypassHit = struct {
-    host_buf: [256]u8 = undefined,
-    host_len: usize = 0,
-    path_buf: [4096]u8 = undefined,
-    path_len: usize = 0,
-    mp_buf: [1024]u8 = undefined,
-    mp_len: usize = 0,
-
-    pub fn host(self: *const BypassHit) []const u8 {
-        return self.host_buf[0..self.host_len];
-    }
-    pub fn path(self: *const BypassHit) []const u8 {
-        return self.path_buf[0..self.path_len];
-    }
-    pub fn mountpoint(self: *const BypassHit) []const u8 {
-        return self.mp_buf[0..self.mp_len];
-    }
-};
+/// to direct mux access on the mount's source host. Detection only;
+/// whether the reroute happens is `filebrowser/bypass.zig`'s call.
+pub const BypassHit = mounts.Hit;
 
 /// Decode /proc/mounts octal escapes (\040 = space, …) in place.
 pub fn unescapeMnt(buf: []u8, src: []const u8) []const u8 {
@@ -115,18 +99,9 @@ pub fn unescapeMnt(buf: []u8, src: []const u8) []const u8 {
 
 /// Detect an sshfs/NFS mount covering `p` and rewrite to direct mux
 /// access: the mount source ("user@host:/remote") names both the ssh
-/// host and the remote prefix. Longest mountpoint wins. Linux-only
-/// (/proc/mounts); false elsewhere.
+/// host and the remote prefix. Longest mountpoint wins.
 pub fn mountBypass(p: []const u8, out: *BypassHit) bool {
-    var hit: mounts.Hit = .{};
-    if (!mounts.detect(p, &hit)) return false;
-    @memcpy(out.host_buf[0..hit.host_len], hit.host());
-    out.host_len = hit.host_len;
-    @memcpy(out.path_buf[0..hit.path_len], hit.path());
-    out.path_len = hit.path_len;
-    @memcpy(out.mp_buf[0..hit.mount_len], hit.mountpoint());
-    out.mp_len = hit.mount_len;
-    return true;
+    return mounts.detect(p, out);
 }
 
 /// Host identity comparison: an unset host is "local", and equal to
@@ -289,28 +264,25 @@ pub fn isSketermMount(path: []const u8) bool {
     // failed read misreported as one. Said here so the next reader
     // does not have to re-derive it from two other files.
     if (comptime builtin.os.tag != .linux) return false;
-    const f = c.fopen("/proc/self/mounts", "r") orelse c.fopen("/proc/mounts", "r") orelse return false;
-    defer _ = c.fclose(f);
-    var line_ptr: [*c]u8 = null;
-    var line_cap: usize = 0;
-    defer if (line_ptr != null) c.free(line_ptr);
-    while (true) {
-        const line_len = c.getline(&line_ptr, &line_cap, f);
-        if (line_len < 0) break;
-        const raw_line = line_ptr[0..@intCast(line_len)];
-        const line = std.mem.trimEnd(u8, raw_line, "\r\n");
-        var fields = std.mem.tokenizeScalar(u8, line, ' ');
-        _ = fields.next() orelse continue;
-        const raw_mountpoint = fields.next() orelse continue;
-        const fstype = fields.next() orelse continue;
-        if (!std.mem.eql(u8, fstype, "fuse.sketerm")) continue;
-        var mountpoint_buf: [4096]u8 = undefined;
-        const mp = unescapeMnt(&mountpoint_buf, raw_mountpoint);
-        if (mp.len == 0) continue;
-        if (mountCovers(path, mp)) return true;
-    }
-    return false;
+    var walk: SketermMountWalk = .{ .path = path };
+    mounts.forEach(&walk);
+    return walk.found;
 }
+
+/// The one mount-table reader (util/mounts.zig) serves this consumer
+/// too, so the test hook that presents a fake table covers it.
+const SketermMountWalk = struct {
+    path: []const u8,
+    found: bool = false,
+
+    pub fn visit(self: *SketermMountWalk, e: mounts.Entry) bool {
+        if (std.mem.eql(u8, e.fstype, "fuse.sketerm") and e.mountpoint.len > 0 and mountCovers(self.path, e.mountpoint)) {
+            self.found = true;
+            return false;
+        }
+        return true;
+    }
+};
 
 /// The local freedesktop trash "files" directory.
 pub fn trashFilesDir(buf: []u8) ?[]const u8 {

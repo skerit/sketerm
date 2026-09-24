@@ -21,6 +21,7 @@ const Pending = @import("types.zig").Pending;
 const colview = @import("colview.zig");
 const render_mod = @import("render.zig");
 const selection = @import("selection.zig");
+const mountbypass = @import("mountbypass.zig");
 const completionMatches = @import("../../filebrowser/paths.zig").completionMatches;
 const hostEq = @import("../../filebrowser/paths.zig").hostEq;
 const mountBypass = @import("../../filebrowser/paths.zig").mountBypass;
@@ -214,6 +215,9 @@ pub fn newTab(self: *BrowserView, host: ?[]const u8, path: []const u8) ?*BTab {
     self.syncPathEntry(tab);
     self.refreshGitOverlay(tab);
     if (hc.state == .connecting) self.setStatusFmt("connecting to {s}…", .{hc.label()});
+    // A tab opened straight onto a mount path (`sketerm files /mnt/box`,
+    // a restored tab) gets the same bypass check a navigation does.
+    if (host == null) mountbypass.onTabOpened(self, tab);
     return tab;
 }
 
@@ -273,16 +277,26 @@ pub fn navigate(self: *BrowserView, tab: *BTab, host_in: ?[]const u8, path_in: [
 }
 
 pub fn navigateMode(self: *BrowserView, tab: *BTab, host_in: ?[]const u8, path_in: []const u8, intent: NavigationIntent) void {
-    // Mount bypass: a local path under an sshfs/NFS mount is
-    // silently rerouted to direct mux access on the source host
-    // (fast listings, push deltas, host-side jobs).
+    // Mount bypass: a local path under an sshfs/NFS mount is browsed
+    // through the source host's own daemon (fast listings, push
+    // deltas, host-side jobs) -- once that mount has been proven to
+    // show the host's files. The first visit lands on the mount and
+    // starts the proof (mountbypass.zig); a proven mount reroutes here.
     var host = host_in;
     var path = path_in;
     var bp: BypassHit = .{};
-    if (host == null and mountBypass(path, &bp)) {
-        host = bp.host();
-        path = bp.path();
-        self.setStatusFmt("via sketerm: {s} (bypassed mount {s})", .{ bp.host(), bp.mountpoint() });
+    var probe_mount = false;
+    if (host == null and intent != .reroute and mountBypass(path, &bp)) {
+        if (mountbypass.verifiedFor(self, bp.mountpoint())) |v| {
+            host = v.host;
+            path = bp.path();
+            mountbypass.linkTab(self, tab, v.mountpoint, v.root, v.host);
+            self.setStatusFmt("via sketerm: {s} (bypassed mount {s})", .{ v.host, bp.mountpoint() });
+        } else {
+            // Probed once this navigation is committed, so the answer
+            // is matched against THIS navigation's generation.
+            probe_mount = true;
+        }
     }
     const same_host = hostEq(tab.hc.host, host);
     if (same_host and tab.hc.state != .dead and !tab.root.isFlat() and
@@ -335,6 +349,7 @@ pub fn navigateMode(self: *BrowserView, tab: *BTab, host_in: ?[]const u8, path_i
     p.navigation = null;
     self.commitNavigation(tab, new_hc, new_dir, intent, "");
     if (new_hc.state == .ready) self.sendListingOp(p);
+    if (probe_mount) mountbypass.begin(self, tab, &bp, tab.root.path);
 }
 
 pub fn navigateSpec(self: *BrowserView, tab: *BTab, spec: []const u8) void {
@@ -408,6 +423,9 @@ pub fn applyHistoryIntent(self: *BrowserView, tab: *BTab, intent: NavigationInte
             }
             if (tab.fwd.pop()) |value| self.allocator.free(value);
         },
+        // The same place seen through another daemon: history keeps
+        // the entry it already has.
+        .reroute => if (current) |value| self.allocator.free(value),
     }
     while (tab.back.items.len > 100) self.allocator.free(tab.back.orderedRemove(0));
     while (tab.fwd.items.len > 100) self.allocator.free(tab.fwd.orderedRemove(0));
@@ -443,6 +461,7 @@ pub fn commitNavigation(self: *BrowserView, tab: *BTab, hc: *HostConn, candidate
     // A landed navigation settles the previous refusal.
     tab.clearNavError();
     self.applyHistoryIntent(tab, intent);
+    mountbypass.onNavigated(self, tab, hc.host, candidate.path);
     for (tab.selected.items) |value| self.allocator.free(value);
     tab.selected.clearRetainingCapacity();
     // The rows the visual range was anchored in are about to go.

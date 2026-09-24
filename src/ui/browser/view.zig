@@ -55,6 +55,7 @@ const MAX_ATTR_COLUMNS = @import("render.zig").MAX_ATTR_COLUMNS;
 const OpenWithCtx = @import("open.zig").OpenWithCtx;
 const PendingOpen = @import("open.zig").PendingOpen;
 const OwnedSearch = @import("types.zig").OwnedSearch;
+const OwnedAlias = @import("types.zig").OwnedAlias;
 const PathCompletion = @import("nav.zig").PathCompletion;
 const Pending = @import("types.zig").Pending;
 const PendingHistory = @import("types.zig").PendingHistory;
@@ -78,6 +79,7 @@ const tabsmod = @import("tabs.zig");
 const tabhost_mod = @import("../tabhost.zig");
 const facehost = @import("../facehost.zig");
 const templates_mod = @import("templates.zig");
+const mountbypass = @import("mountbypass.zig");
 const viewsmod = @import("views.zig");
 const cast = @import("../../util/cast.zig");
 
@@ -351,6 +353,12 @@ pub const BrowserView = struct {
     /// are ONE concept here -- what a query text means is decided by
     /// filebrowser/query.zig when it runs, not by a stored mode.
     saved_searches: std.ArrayList(OwnedSearch) = .empty,
+    /// Remembered mount-bypass host choices (places.json).
+    mount_aliases: std.ArrayList(OwnedAlias) = .empty,
+    /// Mount-bypass identity probes in flight, and the mounts already
+    /// proven to be the host's own files (mountbypass.zig).
+    bypass_probes: std.ArrayList(*mountbypass.Probe) = .empty,
+    bypass_verified: std.ArrayList(mountbypass.Verified) = .empty,
     /// The most recent query run (owned), for the save button.
     last_search: ?OwnedSearch = null,
     /// Relative-time filter for the NEXT find job ("@7d pattern").
@@ -1569,6 +1577,9 @@ pub const BrowserView = struct {
         self.widgets.deinit(self.allocator);
         for (self.saved_searches.items) |sq| sq.deinitOwned(self.allocator);
         self.saved_searches.deinit(self.allocator);
+        for (self.mount_aliases.items) |alias| alias.deinitOwned(self.allocator);
+        self.mount_aliases.deinit(self.allocator);
+        mountbypass.deinit(self);
         if (self.last_search) |ls| ls.deinitOwned(self.allocator);
         for (self.file_colors.items) |fc| self.allocator.free(fc.glob);
         self.file_colors.deinit(self.allocator);

@@ -248,9 +248,18 @@ pub fn rebuildCrumbs(self: *BrowserView, tab: *BTab) void {
     const box = self.locbar.box orelse return;
     if (self.locbar.host_label) |label| {
         var host_z: [512:0]u8 = undefined;
-        const host = std.fmt.bufPrintZ(&host_z, "{s}", .{tab.hc.host orelse "This computer"}) catch "Remote host";
+        // A rerouted mount says so: the files are the host's own, the
+        // path is no longer the mount's.
+        const host = if (tab.bypass) |link|
+            std.fmt.bufPrintZ(&host_z, "{s} via sketerm", .{link.host}) catch "via sketerm"
+        else
+            std.fmt.bufPrintZ(&host_z, "{s}", .{tab.hc.host orelse "This computer"}) catch "Remote host";
         c.gtk_label_set_text(@ptrCast(label), host.ptr);
-        c.gtk_widget_set_tooltip_text(label, host.ptr);
+        if (tab.bypass) |link| {
+            var tip: [1200:0]u8 = undefined;
+            const text = std.fmt.bufPrintZ(&tip, "{s}, browsed through its own daemon instead of the mount at {s}", .{ link.host, link.mountpoint }) catch host;
+            c.gtk_widget_set_tooltip_text(label, text.ptr);
+        } else c.gtk_widget_set_tooltip_text(label, host.ptr);
     }
     // The pending dropdown belongs to buttons that are about to be
     // destroyed.

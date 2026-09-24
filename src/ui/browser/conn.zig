@@ -425,6 +425,7 @@ pub fn wireReady(self: *BrowserView, hc: *HostConn) void {
         if (tab.hc == hc) self.refreshGitForced(tab);
     }
     self.requestHostDirs(hc);
+    @import("mountbypass.zig").hostReady(self, hc);
     self.pumpTransferQueue();
     self.pumpCopyQueue();
     self.pumpDeferredTransfers();
@@ -789,6 +790,9 @@ pub fn hostDied(self: *BrowserView, hc: *HostConn) void {
     // A lent connection belongs to its Terminal: end the lease, never close it.
     if (hc.lease) |*l| l.release() else hc.conn.deinit();
     hc.state = .dead;
+    // Tabs browsing a mount through this host go back to the mount
+    // path before the stranded-tab reconnect logic can see them.
+    @import("mountbypass.zig").hostDied(self, hc);
     self.pumpCopyQueue();
     if (self.transfer_service) |service| {
         for (retry_after_loss.items) |transfer_loss| {
@@ -1421,6 +1425,8 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
     if (@import("ops.zig").feedDropProbe(self, hc, rep)) return false;
     // A "New from Template" listing?
     if (self.feedTemplates(hc, rep)) return false;
+    // A mount-bypass identity stat?
+    if (@import("mountbypass.zig").feed(self, hc, rep)) return false;
     // A background-click folder Properties stat?
     if (@import("props.zig").feedFolderProps(self, hc, rep)) return false;
 
