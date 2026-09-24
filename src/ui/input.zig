@@ -522,6 +522,7 @@ pub fn actionLabel(a: Action) []const u8 {
         .toggle_web_face => "Show the web browser / show the shell (this pane)",
         .toggle_panel_face => "Show the panel / show the shell (this pane)",
         .panel_open => "Open a saved panel (this session's stored documents)…",
+        .panel_open_window => "Open a saved panel in a window of its own…",
         .panel_close => "Close the panel on this pane, its tab, or the window's only one",
         .mux_detach => "Detach mux session (pane drops to a local shell)",
         .paste_clipboard => "Paste clipboard",

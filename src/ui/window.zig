@@ -4541,6 +4541,7 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         // Only reached when the focused pane has NO web face.
         .toggle_web_face => showToast(self, "This pane has no web page. Use New Web Tab."),
         .panel_open => @import("panelpicker.zig").open(self),
+        .panel_open_window => @import("panelpicker.zig").openIn(self, .window),
         .panel_close => if (!@import("panelhost.zig").closeNearest(self, self.focusedPane()))
             showToast(self, "No panel to close here. Use Open Saved Panel… to show one."),
         // Only reached when the focused pane has NO panel face.

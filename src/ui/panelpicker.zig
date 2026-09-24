@@ -36,9 +36,10 @@ const window_mod = @import("window.zig");
 const cast = @import("../util/cast.zig");
 const Window = window_mod.Window;
 
-/// Where an activated row lands. A saved panel gets a TAB of its own:
-/// the user opened this from some pane, and taking that pane's shell
-/// away (target `.pane`) is not what "open" means to him.
+/// Where an activated row lands by default. A saved panel gets a TAB of
+/// its own: the user opened this from some pane, and taking that pane's
+/// shell away (target `.pane`) is not what "open" means to him. The
+/// `panel_open_window` action asks for a standalone window instead.
 const OPEN_TARGET: panelhost.Target = .tab;
 
 const RowCtx = struct {
@@ -90,6 +91,8 @@ const Ctx = struct {
     /// the window's live panes before use — a remote shell can exit
     /// while the dialog is up.
     pane: ?*Pane,
+    /// Where an activated row opens: a tab, or a panel window.
+    target: panelhost.Target = OPEN_TARGET,
 };
 
 /// Widget-owned context for one confirmation. The retained picker handle is
@@ -214,10 +217,16 @@ var store_jobs: std.ArrayListUnmanaged(*StoreJob) = .empty;
 var active_store_workers: usize = 0;
 
 pub fn open(window: *Window) void {
-    openFor(window, window.focusedPane());
+    openIn(window, OPEN_TARGET);
 }
 
-fn openFor(window: *Window, pane: ?*Pane) void {
+/// The picker, opening its chosen panel as `target` (never `.pane`: that
+/// would take away the shell of the pane the user opened it from).
+pub fn openIn(window: *Window, target: panelhost.Target) void {
+    openFor(window, window.focusedPane(), if (target == .pane) OPEN_TARGET else target);
+}
+
+fn openFor(window: *Window, pane: ?*Pane, target: panelhost.Target) void {
     const allocator = window.allocator;
     const session = panelhost.sessionForPane(pane);
     var store = StoreKey.init(allocator, pane) catch |err| {
@@ -251,6 +260,7 @@ fn openFor(window: *Window, pane: ?*Pane) void {
         .store = store,
         .handle = handle,
         .pane = pane,
+        .target = target,
     };
     handle.* = .{ .allocator = allocator, .ctx = ctx };
 
@@ -261,7 +271,7 @@ fn openFor(window: *Window, pane: ?*Pane) void {
         "Panels saved in this session";
 
     const ld = listdialog.build(.{
-        .title = "Open Saved Panel",
+        .title = if (target == .window) "Open Saved Panel in Window" else "Open Saved Panel",
         .width = 560,
         .height = 420,
         .header = head.ptr,
@@ -596,7 +606,7 @@ fn finishLoad(ctx: *Ctx, job: *StoreJob) void {
     const name = job.name orelse return;
     const document = job.document orelse return;
     var diag = Doc.Diag{};
-    _ = panelhost.openSavedDocument(ctx.window, pane, name, document, OPEN_TARGET, &diag) catch |err| {
+    _ = panelhost.openSavedDocument(ctx.window, pane, name, document, ctx.target, &diag) catch |err| {
         var buf: [512]u8 = undefined;
         const why = if (diag.len > 0) diag.msg() else @errorName(err);
         const message = std.fmt.bufPrint(&buf, "Could not open panel \"{s}\": {s}", .{ name, why }) catch

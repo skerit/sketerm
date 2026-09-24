@@ -27,6 +27,17 @@ pub const MAX_SHORT_TEXT: usize = 128;
 /// exactly as `@tagName` renders them.
 pub const Kind = enum { click, change, submit };
 
+/// The component types a panel document may name, in wire spelling.
+/// APPEND-ONLY: a document written for an older GUI must keep meaning
+/// the same thing, and `panelvocab_drift_test.zig` pins the GUI's
+/// `doc.Kind` to this exact order.
+pub const COMPONENT_KINDS = [_][]const u8{
+    "column",   "row",        "heading",  "text",   "image",
+    "image_compare", "button", "slider",  "select", "progress",
+    "separator", "spacer",    "scene",    "text_input",
+    "checkbox", "table",
+};
+
 /// Decode a wire kind token, or null when it names none of them.
 pub fn kindFromName(name: []const u8) ?Kind {
     return std.meta.stringToEnum(Kind, name);

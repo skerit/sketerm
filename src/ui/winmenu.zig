@@ -85,6 +85,11 @@ pub fn show(win: *Window, anchor: *c.GtkWidget) void {
     row(panes, win, .apply_profile, has_pane);
     row(panes, win, .close_pane, has_pane);
 
+    // Saved panels: the user's own way back to what an assistant stored.
+    const panels = m.section();
+    row(panels, win, .panel_open, has_pane);
+    row(panels, win, .panel_open_window, has_pane);
+
     const session = m.section().submenu("Session");
     row(session, win, .mux_detach, durable);
     row(session, win, .mux_rename, durable);

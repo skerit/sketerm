@@ -668,6 +668,18 @@ pub const PanelView = struct {
                 self.connectComp(entry, "activate", @ptrCast(&onTextInputActivate), id);
                 break :blk entry;
             },
+            .checkbox => |box| blk: {
+                const check = c.gtk_check_button_new().?;
+                setCheckbox(check, box);
+                c.gtk_widget_set_halign(check, c.GTK_ALIGN_START);
+                self.connectComp(check, "toggled", @ptrCast(&onCheckboxToggled), id);
+                break :blk check;
+            },
+            .table => |table| blk: {
+                const list = buildTable(table);
+                self.connectComp(list, "row-activated", @ptrCast(&onTableRowActivated), id);
+                break :blk list;
+            },
         };
 
         built.widget = widget;
@@ -814,6 +826,9 @@ pub const PanelView = struct {
             .spacer => return self.swapOne(id, entry.*),
             .scene => unreachable,
             .text_input => |input| setTextInput(entry.widget, input),
+            .checkbox => |box| setCheckbox(entry.widget, box),
+            // Rows and columns may change shape: rebuild the leaf.
+            .table => return self.swapOne(id, entry.*),
         }
         return true;
     }
@@ -978,6 +993,32 @@ pub const PanelView = struct {
         c.gtk_editable_set_position(editable, -1);
     }
 
+    fn onCheckboxToggled(button: *c.GtkCheckButton, user: ?*anyopaque) callconv(.c) void {
+        const ctx = canary.live(CompCtx, user) orelse return;
+        const view = ctx.view orelse return;
+        if (view.widgets_dead or view.applying) return;
+        const on = c.gtk_check_button_get_active(button) != 0;
+        view.queue.push(events.Event.init(ctx.id, .change, .{ .boolean = on }));
+    }
+
+    /// A data row was activated (click, or Enter on a focused row): its
+    /// 0-based index among the data rows, never counting the header.
+    fn onTableRowActivated(_: *c.GtkListBox, row: *c.GtkListBoxRow, user: ?*anyopaque) callconv(.c) void {
+        const ctx = canary.live(CompCtx, user) orelse return;
+        const view = ctx.view orelse return;
+        if (view.widgets_dead or view.applying) return;
+        const d = &(view.doc orelse return);
+        const comp = d.get(ctx.id) orelse return;
+        if (comp.kind() != .table) return;
+        const table = comp.props.table;
+        const raw = c.gtk_list_box_row_get_index(row);
+        const header: c_int = if (table.columns.len > 0) 1 else 0;
+        if (raw < header) return;
+        const index: usize = @intCast(raw - header);
+        if (index >= table.rows.len) return;
+        view.queue.push(events.Event.init(ctx.id, .click, .{ .number = @floatFromInt(index) }));
+    }
+
     fn onTextInputActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
         const ctx = canary.live(CompCtx, user) orelse return;
         const view = ctx.view orelse return;
@@ -996,6 +1037,57 @@ pub const PanelView = struct {
         }
     }
 };
+
+fn setCheckbox(check: *c.GtkWidget, box: Doc.Props.Checkbox) void {
+    var zbuf: [Doc.MAX_TEXT + 1]u8 = undefined;
+    c.gtk_check_button_set_label(@ptrCast(check), if (box.label.len > 0) zOf(&zbuf, box.label) else null);
+    c.gtk_check_button_set_active(@ptrCast(check), @intFromBool(box.value));
+}
+
+/// A table as a GtkListBox: an optional header row, then one
+/// activatable row per data row. Cells of one column share a
+/// horizontal GtkSizeGroup so the columns line up across rows (each
+/// member widget holds a reference to its group).
+fn buildTable(table: Doc.Props.Table) *c.GtkWidget {
+    const list = c.gtk_list_box_new().?;
+    c.gtk_list_box_set_selection_mode(@ptrCast(list), c.GTK_SELECTION_NONE);
+    c.gtk_widget_add_css_class(list, "boxed-list");
+    c.gtk_widget_set_hexpand(list, 1);
+    const width = if (table.columns.len > 0) table.columns.len else table.rows[0].len;
+    var groups: [Doc.MAX_TABLE_COLUMNS]*c.GtkSizeGroup = undefined;
+    for (groups[0..width]) |*g| g.* = c.gtk_size_group_new(c.GTK_SIZE_GROUP_HORIZONTAL).?;
+    defer for (groups[0..width]) |g| c.g_object_unref(g);
+    if (table.columns.len > 0) {
+        const row = tableRow(table.columns, groups[0..width], true);
+        c.gtk_list_box_append(@ptrCast(list), row);
+        const lbr = c.gtk_widget_get_parent(row).?;
+        c.gtk_list_box_row_set_activatable(@ptrCast(lbr), 0);
+    }
+    for (table.rows) |cells| {
+        const row = tableRow(cells, groups[0..width], false);
+        c.gtk_list_box_append(@ptrCast(list), row);
+    }
+    return list;
+}
+
+fn tableRow(cells: []const []u8, groups: []*c.GtkSizeGroup, header: bool) *c.GtkWidget {
+    const box = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 12).?;
+    c.gtk_widget_set_margin_start(box, 8);
+    c.gtk_widget_set_margin_end(box, 8);
+    c.gtk_widget_set_margin_top(box, 4);
+    c.gtk_widget_set_margin_bottom(box, 4);
+    for (cells, 0..) |cell, i| {
+        const label = c.gtk_label_new(null).?;
+        setLabelText(label, cell);
+        c.gtk_label_set_xalign(@ptrCast(label), 0);
+        c.gtk_label_set_ellipsize(@ptrCast(label), c.PANGO_ELLIPSIZE_END);
+        if (header) c.gtk_widget_add_css_class(label, "heading");
+        if (i + 1 == cells.len) c.gtk_widget_set_hexpand(label, 1);
+        c.gtk_size_group_add_widget(groups[i], label);
+        c.gtk_box_append(@ptrCast(box), label);
+    }
+    return box;
+}
 
 /// Pair GtkPicture's internal pixbuf ref with the same residency lease.
 fn setPicturePrepared(pic: *c.GtkWidget, lease: ?*assets.PreparedLease) void {

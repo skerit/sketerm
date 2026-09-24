@@ -234,6 +234,8 @@ pub const curated = [_]Row{
        .desc = "Swap this pane between its web browser and its shell. Both stay alive; neither is closed.", .action = .toggle_web_face },
     .{ .icon = "view-paged-symbolic", .title = "Open Saved Panel…",
        .desc = "Reopen a declarative UI panel saved for this pane's session. Broken documents are listed with the reason; each row can be deleted.", .action = .panel_open },
+    .{ .icon = "window-new-symbolic", .title = "Open Saved Panel in Window…",
+       .desc = "Reopen a saved panel in a standalone window instead of a tab, beside the terminal rather than in it.", .action = .panel_open_window },
     .{ .icon = "window-close-symbolic", .title = "Close Panel",
        .desc = "Take the panel off this pane, or off this tab. A panel that replaced a shell gives the shell back.", .action = .panel_close },
     .{ .icon = "view-paged-symbolic", .title = "Show Panel / Show Shell",
@@ -470,16 +472,19 @@ pub const Feed = struct {
 const t = std.testing;
 
 test "the curated set carries the panel actions" {
-    // The saved-panel picker is reachable ONLY from the palette (no
-    // default chord, no menu item), so a missing row is the whole
-    // feature missing.
+    // The palette is one of the saved-panel picker's two entry points
+    // (the menus are the other; no default chord), so a missing row is
+    // half the feature missing.
     var open_row = false;
+    var window_row = false;
     var close_row = false;
     for (curated) |e| {
         if (e.action == .panel_open) open_row = true;
+        if (e.action == .panel_open_window) window_row = true;
         if (e.action == .panel_close) close_row = true;
     }
     try t.expect(open_row);
+    try t.expect(window_row);
     try t.expect(close_row);
 }
 

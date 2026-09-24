@@ -37,6 +37,10 @@ pub const MAX_TEXT: usize = vocab.MAX_TEXT;
 pub const MAX_PATH: usize = 1024;
 pub const MAX_ID: usize = vocab.MAX_ID;
 pub const MAX_OPTIONS: usize = 64;
+/// Table bounds: columns per row, rows per table, bytes per cell.
+pub const MAX_TABLE_COLUMNS: usize = 16;
+pub const MAX_TABLE_ROWS: usize = 256;
+pub const MAX_CELL: usize = 256;
 /// Select options and button actions ride in fixed-size event
 /// payloads and retain their original compact bound.
 pub const MAX_OPTION: usize = vocab.MAX_SHORT_TEXT;
@@ -105,8 +109,12 @@ fn diagSet(diag: ?*Diag, comptime fmt: []const u8, args: anytype) void {
 // - button/slider/select/text_input: compact interaction primitives.
 // - progress/separator/spacer: cheap, high-value layout polish for
 //   live dashboards.
-// Dropped for now: checkbox (a two-option select covers it), table/list
-// (a column of rows covers small sets; a virtualized table is later).
+// - checkbox: a yes/no answer as one control (`change` with a boolean).
+// - table: rows of text under optional column headers; a one-column
+//   table without headers is a list. Activating a row queues `click`
+//   with the row's 0-based index. Bounded, not virtualized.
+// The kind set is part of the panel vocabulary (`panelvocab.zig`
+// COMPONENT_KINDS): append-only, drift-tested against this enum.
 
 pub const Kind = enum {
     column,
@@ -123,6 +131,8 @@ pub const Kind = enum {
     spacer,
     scene,
     text_input,
+    checkbox,
+    table,
 
     pub fn isContainer(self: Kind) bool {
         return self == .column or self == .row or self == .scene;
@@ -149,6 +159,8 @@ pub const Props = union(Kind) {
     spacer: Spacer,
     scene: Scene,
     text_input: TextInput,
+    checkbox: Checkbox,
+    table: Table,
 
     pub const Container = struct { children: [][]u8 };
     pub const Placement = struct {
@@ -169,6 +181,10 @@ pub const Props = union(Kind) {
     pub const Progress = struct { value: f64, label: []u8, indeterminate: bool };
     pub const Spacer = struct { size: u16 }; // 0 = expand
     pub const TextInput = struct { value: []u8, placeholder: []u8, clear_on_submit: bool };
+    pub const Checkbox = struct { label: []u8, value: bool };
+    /// `columns` may be empty (no header row); every row then has the
+    /// width of the first. Rows are arrays of cell texts.
+    pub const Table = struct { columns: [][]u8, rows: [][][]u8 };
 };
 
 pub const Component = struct {
@@ -1094,6 +1110,19 @@ fn parseComponent(
                 .clear_on_submit = clear_on_submit,
             } };
         },
+        .checkbox => blk: {
+            const label = try ownedOptText(a, obj, "label", id, diag);
+            errdefer a.free(label);
+            const checked = if (obj.get("value")) |v| switch (v) {
+                .bool => |b| b,
+                else => {
+                    diagSet(diag, "\"{s}\": checkbox \"value\" must be a boolean", .{id});
+                    return Error.BadValue;
+                },
+            } else false;
+            break :blk .{ .checkbox = .{ .label = label, .value = checked } };
+        },
+        .table => .{ .table = try parseTable(a, obj, id, diag) },
     };
     errdefer freeProps(a, props);
 
@@ -1101,6 +1130,94 @@ fn parseComponent(
         .props = props,
         .classes = classes.toOwnedSlice(a) catch return Error.OutOfMemory,
     };
+}
+
+/// One array of cell texts, each 0..MAX_CELL bytes.
+fn parseCells(a: std.mem.Allocator, v: std.json.Value, what: []const u8, id: []const u8, diag: ?*Diag) Error![][]u8 {
+    const arr = switch (v) {
+        .array => |x| x.items,
+        else => {
+            diagSet(diag, "\"{s}\": each table {s} must be an array of strings", .{ id, what });
+            return Error.BadValue;
+        },
+    };
+    if (arr.len > MAX_TABLE_COLUMNS) {
+        diagSet(diag, "\"{s}\": more than {d} table columns", .{ id, MAX_TABLE_COLUMNS });
+        return Error.TooBig;
+    }
+    var cells: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (cells.items) |cell| a.free(cell);
+        cells.deinit(a);
+    }
+    for (arr) |cell_v| {
+        const cell = switch (cell_v) {
+            .string => |x| x,
+            else => {
+                diagSet(diag, "\"{s}\": table {s} cells must be strings", .{ id, what });
+                return Error.BadValue;
+            },
+        };
+        if (cell.len > MAX_CELL) {
+            diagSet(diag, "\"{s}\": a table cell is longer than {d} bytes", .{ id, MAX_CELL });
+            return Error.TooBig;
+        }
+        try appendId(a, &cells, cell);
+    }
+    return cells.toOwnedSlice(a) catch return Error.OutOfMemory;
+}
+
+fn freeCells(a: std.mem.Allocator, cells: [][]u8) void {
+    for (cells) |cell| a.free(cell);
+    if (cells.len > 0) a.free(cells);
+}
+
+fn freeTable(a: std.mem.Allocator, table: Props.Table) void {
+    freeCells(a, table.columns);
+    for (table.rows) |row| freeCells(a, row);
+    if (table.rows.len > 0) a.free(table.rows);
+}
+
+fn parseTable(a: std.mem.Allocator, obj: std.json.ObjectMap, id: []const u8, diag: ?*Diag) Error!Props.Table {
+    const columns: [][]u8 = if (obj.get("columns")) |v| try parseCells(a, v, "columns", id, diag) else &.{};
+    errdefer freeCells(a, columns);
+    const rows_v = obj.get("rows") orelse {
+        diagSet(diag, "\"{s}\": table needs \"rows\"", .{id});
+        return Error.Malformed;
+    };
+    const rows_a = switch (rows_v) {
+        .array => |x| x.items,
+        else => {
+            diagSet(diag, "\"{s}\": table \"rows\" must be an array of rows", .{id});
+            return Error.BadValue;
+        },
+    };
+    if (rows_a.len > MAX_TABLE_ROWS) {
+        diagSet(diag, "\"{s}\": more than {d} table rows", .{ id, MAX_TABLE_ROWS });
+        return Error.TooBig;
+    }
+    var rows: std.ArrayList([][]u8) = .empty;
+    errdefer {
+        for (rows.items) |row| freeCells(a, row);
+        rows.deinit(a);
+    }
+    var width: ?usize = if (columns.len > 0) columns.len else null;
+    for (rows_a) |row_v| {
+        const row = try parseCells(a, row_v, "row", id, diag);
+        errdefer freeCells(a, row);
+        const want = width orelse row.len;
+        if (row.len != want or want == 0) {
+            diagSet(diag, "\"{s}\": every table row needs {d} cells", .{ id, @max(want, 1) });
+            return Error.BadValue;
+        }
+        width = want;
+        rows.append(a, row) catch return Error.OutOfMemory;
+    }
+    if (columns.len == 0 and rows.items.len == 0) {
+        diagSet(diag, "\"{s}\": a table needs columns or rows", .{id});
+        return Error.BadValue;
+    }
+    return .{ .columns = columns, .rows = rows.toOwnedSlice(a) catch return Error.OutOfMemory };
 }
 
 fn parseSide(
@@ -1275,6 +1392,8 @@ fn freeProps(a: std.mem.Allocator, props: Props) void {
             a.free(input.value);
             a.free(input.placeholder);
         },
+        .checkbox => |box| a.free(box.label),
+        .table => |table| freeTable(a, table),
     }
 }
 
@@ -1289,6 +1408,15 @@ pub fn freeComponent(a: std.mem.Allocator, comp: Component) void {
     freeProps(a, comp.props);
     for (comp.classes) |cl| a.free(cl);
     if (comp.classes.len > 0) a.free(comp.classes);
+}
+
+fn writeCells(w: *std.Io.Writer, cells: []const []u8) !void {
+    try w.writeByte('[');
+    for (cells, 0..) |cell, i| {
+        if (i > 0) try w.writeByte(',');
+        try jsonStr(w, cell);
+    }
+    try w.writeByte(']');
 }
 
 fn writeComponent(w: *std.Io.Writer, comp: *const Component) !void {
@@ -1386,6 +1514,22 @@ fn writeComponent(w: *std.Io.Writer, comp: *const Component) !void {
             try jsonStr(w, input.placeholder);
             try w.writeAll(",\"clear_on_submit\":");
             try w.writeAll(if (input.clear_on_submit) "true" else "false");
+        },
+        .checkbox => |box| {
+            try w.writeAll(",\"label\":");
+            try jsonStr(w, box.label);
+            try w.writeAll(",\"value\":");
+            try w.writeAll(if (box.value) "true" else "false");
+        },
+        .table => |table| {
+            try w.writeAll(",\"columns\":");
+            try writeCells(w, table.columns);
+            try w.writeAll(",\"rows\":[");
+            for (table.rows, 0..) |row, i| {
+                if (i > 0) try w.writeByte(',');
+                try writeCells(w, row);
+            }
+            try w.writeByte(']');
         },
     }
     if (comp.classes.len > 0) {
@@ -1552,6 +1696,56 @@ test "JSON round-trip is canonical and lossless" {
     try t.expectEqual(@as(usize, 11), doc2.components.count());
     try t.expectEqualStrings("/tmp/e41.png", doc2.get("cmp").?.props.image_compare.right.src);
     try t.expectEqual(@as(f64, 1.5), doc2.data.get("zoom").?.number);
+}
+
+test "checkbox and table parse, default, and round-trip losslessly" {
+    var doc = try Document.parse(t.allocator,
+        \\{"root":"r","components":{
+        \\ "r":{"type":"column","children":["agree","plain","grid","list"]},
+        \\ "agree":{"type":"checkbox","label":"Ship it","value":true},
+        \\ "plain":{"type":"checkbox"},
+        \\ "grid":{"type":"table","columns":["run","loss"],"rows":[["a","0.41"],["b","0.39"]]},
+        \\ "list":{"type":"table","rows":[["one"],["two"],["three"]]}}}
+    , null);
+    defer doc.deinit();
+    try t.expect(doc.get("agree").?.props.checkbox.value);
+    try t.expectEqualStrings("Ship it", doc.get("agree").?.props.checkbox.label);
+    try t.expect(!doc.get("plain").?.props.checkbox.value);
+    const grid = doc.get("grid").?.props.table;
+    try t.expectEqual(@as(usize, 2), grid.columns.len);
+    try t.expectEqualStrings("0.39", grid.rows[1][1]);
+    try t.expectEqual(@as(usize, 0), doc.get("list").?.props.table.columns.len);
+    try t.expectEqual(@as(usize, 3), doc.get("list").?.props.table.rows.len);
+
+    const json = try doc.toJson(t.allocator);
+    defer t.allocator.free(json);
+    var copy = try Document.parse(t.allocator, json, null);
+    defer copy.deinit();
+    const again = try copy.toJson(t.allocator);
+    defer t.allocator.free(again);
+    try t.expectEqualStrings(json, again);
+}
+
+test "table shape errors name the component" {
+    const cases = [_]struct { json: []const u8, want: []const u8 }{
+        .{ .json = "{\"root\":\"x\",\"components\":{\"x\":{\"type\":\"table\",\"columns\":[\"a\",\"b\"],\"rows\":[[\"1\"]]}}}", .want = "every table row needs 2 cells" },
+        .{ .json = "{\"root\":\"x\",\"components\":{\"x\":{\"type\":\"table\",\"columns\":[\"a\"]}}}", .want = "table needs \"rows\"" },
+        .{ .json = "{\"root\":\"x\",\"components\":{\"x\":{\"type\":\"table\",\"rows\":[[1]]}}}", .want = "cells must be strings" },
+        .{ .json = "{\"root\":\"x\",\"components\":{\"x\":{\"type\":\"table\",\"rows\":[]}}}", .want = "needs columns or rows" },
+        .{ .json = "{\"root\":\"x\",\"components\":{\"x\":{\"type\":\"checkbox\",\"value\":\"yes\"}}}", .want = "must be a boolean" },
+    };
+    for (cases) |case| {
+        var diag: Diag = .{};
+        if (Document.parse(t.allocator, case.json, &diag)) |parsed| {
+            var doc = parsed;
+            doc.deinit();
+            return error.TestUnexpectedResult;
+        } else |_| {}
+        if (std.mem.indexOf(u8, diag.msg(), case.want) == null or std.mem.indexOf(u8, diag.msg(), "\"x\"") == null) {
+            std.debug.print("diag \"{s}\" lacks \"{s}\"\n", .{ diag.msg(), case.want });
+            return error.TestUnexpectedResult;
+        }
+    }
 }
 
 test "scene and text_input parse, default, and round-trip losslessly" {

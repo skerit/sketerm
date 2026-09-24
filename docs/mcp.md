@@ -155,7 +155,7 @@ is kept by a `:ro` policy term. The full descriptions and schemas are in
 - `ui_show`: Show the user a real native UI PANEL in their sketerm window: a declarative document rendered as GTK widgets, not text or a screenshot.
 - `ui_show_files`: FAST PATH for "show me these images": hand it a list of image files on the session's host and it builds the panel document for you and shows it — ONE call instead of hand-authoring a ui_show document.
 - `ui_patch`: Update a live panel with a JSON array of ops applied as one transaction.
-- `ui_wait_event` (read-only): Block until the user interacts with a panel, then return queued interactions with component id and monotonic timestamp: button click values are actions, slider/select changes carry their new value, and text_input submit carries up to 4096 UTF-8 bytes.
+- `ui_wait_event` (read-only): Block until the user interacts with a panel, then return queued interactions with component id and monotonic timestamp: button click values are actions, slider/select changes carry their new value, a checkbox change carries true/false, a table click carries the activated row index, and text_input submit carries up to 4096 UTF-8 bytes.
 - `ui_panels` (read-only): Inventory of panels in a session, in two clearly separate lists: LIVE panels (on screen right now — panel_id, name, title, target) and SAVED documents (stored on disk by ui_save — name, title, size, mtime, and whether the stored file still parses).
 - `ui_save`: Persist a panel document to disk under the session's daemon origin and lifetime id so a later ui_show can bring it back with load=<name>.
 - `ui_close`: Close a LIVE panel: it disappears from the user's screen.
@@ -611,6 +611,23 @@ vocabulary is:
 - `button`: `{text,action}`; `slider`: `{min,max,step,value}`; `select`:
   `{options,value}`.
 - `progress`: `{value,label,indeterminate}`; `separator`; `spacer`: `{size}`.
+- `checkbox`: `{label,value}` with a boolean value (default false). Toggling it
+  emits `change` carrying the new boolean.
+- `table`: `{columns,rows}`. `columns` is an optional header row of strings;
+  `rows` is an array of rows, each an array of cell strings of the same width
+  (the header's, when there is one). Without a header, a one-column table is a
+  list. Bounds: 16 columns, 256 rows, 256 bytes per cell. Activating a row
+  (click, or Enter on a focused row) emits `click` with the row's 0-based index
+  among the data rows. It is not virtualized.
+
+The type set is part of the panel wire vocabulary (`src/panelvocab.zig`
+`COMPONENT_KINDS`) and only ever grows at its end, so a document written for an
+older GUI keeps its meaning.
+
+The user reaches saved panels without an assistant through the palette, the
+pane menu's Panels submenu and the window menu: Open Saved Panel… (in a tab of
+its own, `panel_open`) and Open Saved Panel in Window… (`panel_open_window`),
+both bindable in config.conf.
 
 Any component may use named classes from `dim`, `accent`, `success`, `warning`,
 `error`, `card`, `monospace`, `center`, `end`, and `expand`. There is no raw

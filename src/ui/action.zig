@@ -244,6 +244,9 @@ pub const Action = enum {
     /// own (src/ui/panelpicker.zig). The user's own way back to a
     /// panel an assistant saved for him.
     panel_open,
+    /// The same picker, but the chosen panel opens in a standalone
+    /// panel window of its own (src/ui/panelwin.zig) instead of a tab.
+    panel_open_window,
     /// Close the panel the focused pane is hosting. A panel put ON a
     /// pane hides that pane's shell, and this is how the shell comes
     /// back without an assistant.

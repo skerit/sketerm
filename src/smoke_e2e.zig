@@ -849,6 +849,8 @@ pub fn main() u8 {
         say("panel relay: focused transport, session-open, replacement, and lifecycle stage passed");
         if (panelStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
         say("panel: focused real-GTK scene, text input, events, patch, compare, and lifecycle stage passed");
+        if (panelPickerStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
+        say("panel picker: palette/keybind open in a tab and in a window, close, teardown");
         teardown();
         return 0;
     }
@@ -10262,6 +10264,38 @@ fn waitPanelTextEvent(
     return false;
 }
 
+/// Poll panel-events until an event of `component`/`kind` arrives whose
+/// `"value":` is followed by `value_prefix` (`true`, ...; `#` = a digit).
+fn waitPanelEventValue(
+    allocator: std.mem.Allocator,
+    app: *appdrive.App,
+    sock_path: [:0]const u8,
+    panel_id: u32,
+    component: []const u8,
+    kind: []const u8,
+    value_prefix: []const u8,
+) bool {
+    const head = std.fmt.allocPrint(allocator, "\"component\":\"{s}\",\"kind\":\"{s}\",\"value\":", .{ component, kind }) catch return false;
+    defer allocator.free(head);
+    var tries: u32 = 0;
+    while (tries < 40) : (tries += 1) {
+        pumpFor(app, 150);
+        var req_buf: [128]u8 = undefined;
+        const req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"panel-events\",\"panel_id\":{d},\"session\":\"e2e-scope\"}}\n", .{panel_id}) catch return false;
+        const reply = roundtrip(allocator, sock_path, req) orelse return false;
+        defer allocator.free(reply);
+        var from: usize = 0;
+        while (std.mem.indexOfPos(u8, reply, from, head)) |at| {
+            const rest = reply[at + head.len ..];
+            const digit = std.mem.eql(u8, value_prefix, "#");
+            if (digit and rest.len > 0 and std.ascii.isDigit(rest[0])) return true;
+            if (!digit and std.mem.startsWith(u8, rest, value_prefix)) return true;
+            from = at + head.len;
+        }
+    }
+    return false;
+}
+
 /// Declarative UI panels, end to end. What only a live run can prove:
 /// the renderer builds real widgets from a document, GTK gestures
 /// reach the event queue (the button click and the slider drag are
@@ -10547,6 +10581,101 @@ fn panelStage(
     if (std.mem.indexOf(u8, structural, "\"ok\":true") == null)
         return "scene structural regression patch was refused";
     _ = app.waitVisualSettle(win_id, 400, 10_000, 0.002, null);
+
+    // 6b. A checkbox as the whole client area: a real click toggles it
+    // and queues `change` with the boolean.
+    const check_req =
+        "{\"cmd\":\"panel-show\",\"name\":\"e2e\",\"session\":\"e2e-scope\",\"target\":\"window\"," ++
+        "\"document\":\"{\\\"version\\\":1,\\\"title\\\":\\\"Checkbox\\\",\\\"root\\\":\\\"agree\\\"," ++
+        "\\\"components\\\":{\\\"agree\\\":{\\\"type\\\":\\\"checkbox\\\",\\\"label\\\":\\\"Ship it\\\"," ++
+        "\\\"class\\\":[\\\"expand\\\",\\\"center\\\"]}}}\"}\n";
+    const check_shown = roundtrip(allocator, sock_path, check_req) orelse return "panel-show(checkbox) roundtrip";
+    defer allocator.free(check_shown);
+    if (!mcpHas(check_shown, "\"ok\":true")) return "panel-show(checkbox) not ok";
+    _ = app.waitVisualSettle(win_id, 400, 10_000, 0.002, null);
+    app.clickEx(win_id, cx, cy, 1, 100, 1) catch return "clicking the panel checkbox failed";
+    if (!waitPanelEventValue(allocator, app, sock_path, panel_id, "agree", "change", "true"))
+        return "a real click on the panel checkbox produced no change:true event";
+
+    // 6c. A table tall enough to fill the window: a click on a data row
+    // queues `click` with that row's 0-based index.
+    {
+        var table_doc: std.ArrayList(u8) = .empty;
+        defer table_doc.deinit(allocator);
+        table_doc.appendSlice(allocator, "{\"cmd\":\"panel-show\",\"name\":\"e2e\",\"session\":\"e2e-scope\",\"target\":\"window\"," ++
+            "\"document\":\"{\\\"version\\\":1,\\\"title\\\":\\\"Table\\\",\\\"root\\\":\\\"grid\\\"," ++
+            "\\\"components\\\":{\\\"grid\\\":{\\\"type\\\":\\\"table\\\",\\\"class\\\":[\\\"expand\\\"],\\\"rows\\\":[") catch return "table doc alloc";
+        var row_i: usize = 0;
+        while (row_i < 60) : (row_i += 1) {
+            if (row_i > 0) table_doc.append(allocator, ',') catch return "table doc alloc";
+            table_doc.print(allocator, "[\\\"row {d}\\\",\\\"{d}\\\"]", .{ row_i, row_i * 7 }) catch return "table doc alloc";
+        }
+        table_doc.appendSlice(allocator, "]}}}\"}\n") catch return "table doc alloc";
+        const table_shown = roundtrip(allocator, sock_path, table_doc.items) orelse return "panel-show(table) roundtrip";
+        defer allocator.free(table_shown);
+        if (!mcpHas(table_shown, "\"ok\":true")) return "panel-show(table) not ok";
+    }
+    _ = app.waitVisualSettle(win_id, 400, 10_000, 0.002, null);
+    app.clickEx(win_id, cx, cy, 1, 100, 1) catch return "clicking a panel table row failed";
+    if (!waitPanelEventValue(allocator, app, sock_path, panel_id, "grid", "click", "#"))
+        return "a real click on a panel table row produced no click event carrying a row index";
+
+    // 6d. Every component kind in one document: the renderer builds all
+    // of them, and the live document reads back with each one.
+    const all_png = std.fmt.allocPrintSentinel(allocator, "{s}/panel-all.png", .{rt}, 0) catch return "alloc";
+    defer allocator.free(all_png);
+    if (!writeSolidPng(allocator, all_png, 0x40, 0xa0, 0x60)) return "could not write the all-kinds image";
+    {
+        const all_req = std.fmt.allocPrint(allocator,
+            "{{\"cmd\":\"panel-show\",\"name\":\"e2e\",\"session\":\"e2e-scope\",\"target\":\"window\",\"document\":\"" ++
+            "{{\\\"version\\\":1,\\\"title\\\":\\\"All kinds\\\",\\\"root\\\":\\\"col\\\",\\\"components\\\":{{" ++
+            "\\\"col\\\":{{\\\"type\\\":\\\"column\\\",\\\"children\\\":[\\\"h\\\",\\\"t\\\",\\\"r\\\",\\\"img\\\",\\\"cmp\\\",\\\"p\\\",\\\"sep\\\",\\\"sp\\\",\\\"sc\\\",\\\"tbl\\\"]}}," ++
+            "\\\"h\\\":{{\\\"type\\\":\\\"heading\\\",\\\"text\\\":\\\"Kinds\\\"}}," ++
+            "\\\"t\\\":{{\\\"type\\\":\\\"text\\\",\\\"text\\\":\\\"every one\\\"}}," ++
+            "\\\"r\\\":{{\\\"type\\\":\\\"row\\\",\\\"children\\\":[\\\"b\\\",\\\"sl\\\",\\\"se\\\",\\\"in\\\",\\\"cb\\\"]}}," ++
+            "\\\"b\\\":{{\\\"type\\\":\\\"button\\\",\\\"text\\\":\\\"Go\\\"}}," ++
+            "\\\"sl\\\":{{\\\"type\\\":\\\"slider\\\"}}," ++
+            "\\\"se\\\":{{\\\"type\\\":\\\"select\\\",\\\"options\\\":[\\\"a\\\",\\\"b\\\"]}}," ++
+            "\\\"in\\\":{{\\\"type\\\":\\\"text_input\\\"}}," ++
+            "\\\"cb\\\":{{\\\"type\\\":\\\"checkbox\\\",\\\"label\\\":\\\"on\\\",\\\"value\\\":true}}," ++
+            "\\\"img\\\":{{\\\"type\\\":\\\"image\\\",\\\"src\\\":\\\"{s}\\\"}}," ++
+            "\\\"cmp\\\":{{\\\"type\\\":\\\"image_compare\\\",\\\"left\\\":{{\\\"src\\\":\\\"{s}\\\"}},\\\"right\\\":{{\\\"src\\\":\\\"{s}\\\"}}}}," ++
+            "\\\"p\\\":{{\\\"type\\\":\\\"progress\\\",\\\"value\\\":0.5}}," ++
+            "\\\"sep\\\":{{\\\"type\\\":\\\"separator\\\"}}," ++
+            "\\\"sp\\\":{{\\\"type\\\":\\\"spacer\\\",\\\"size\\\":8}}," ++
+            "\\\"sc\\\":{{\\\"type\\\":\\\"scene\\\",\\\"width\\\":200,\\\"height\\\":40,\\\"children\\\":[{{\\\"id\\\":\\\"st\\\",\\\"x\\\":0,\\\"y\\\":0,\\\"width\\\":200,\\\"height\\\":40}}]}}," ++
+            "\\\"st\\\":{{\\\"type\\\":\\\"text\\\",\\\"text\\\":\\\"placed\\\"}}," ++
+            "\\\"tbl\\\":{{\\\"type\\\":\\\"table\\\",\\\"columns\\\":[\\\"k\\\",\\\"v\\\"],\\\"rows\\\":[[\\\"a\\\",\\\"1\\\"]]}}" ++
+            "}}}}\"}}\n", .{ all_png, all_png, all_png }) catch return "all-kinds doc alloc";
+        defer allocator.free(all_req);
+        const all_shown = roundtrip(allocator, sock_path, all_req) orelse return "panel-show(all kinds) roundtrip";
+        defer allocator.free(all_shown);
+        if (!mcpHas(all_shown, "\"ok\":true")) {
+            std.debug.print("smoke-e2e: all-kinds reply: {s}\n", .{all_shown});
+            return "panel-show(all kinds) not ok";
+        }
+    }
+    _ = app.waitVisualSettle(win_id, 400, 10_000, 0.002, null);
+    {
+        var get_buf: [128]u8 = undefined;
+        const get_req = std.fmt.bufPrint(&get_buf, "{{\"cmd\":\"panel-get\",\"panel_id\":{d},\"session\":\"e2e-scope\"}}\n", .{panel_id}) catch
+            return "panel-get(all kinds) fmt";
+        const got = roundtrip(allocator, sock_path, get_req) orelse return "panel-get(all kinds) roundtrip";
+        defer allocator.free(got);
+        const doc_kinds = @import("panelvocab.zig").COMPONENT_KINDS;
+        for (doc_kinds) |kind| {
+            var needle_buf: [64]u8 = undefined;
+            const needle = std.fmt.bufPrint(&needle_buf, "\\\"type\\\":\\\"{s}\\\"", .{kind}) catch return "kind needle fmt";
+            if (std.mem.indexOf(u8, got, needle) == null) {
+                std.debug.print("smoke-e2e: live panel lacks kind {s}\n", .{kind});
+                return "the all-kinds panel did not carry every component kind";
+            }
+        }
+    }
+    if (hasToplevelOtherThan(app, known[0..n_known])) |id| {
+        if (id != win_id) return "the all-kinds document opened a second window";
+    }
+    _ = app.winById(win_id) orelse return "the panel window died rendering every component kind";
 
     // 7. The image_compare, on a PANE face this time: two generated
     // images, then a drag that must move the split (i.e. repaint).
@@ -12529,6 +12658,7 @@ fn panelPickerStage(
         \\font_size = 13
         \\confirm_close = always
         \\keybind.panel_open = <Control><Shift>F9
+        \\keybind.panel_open_window = <Control><Shift>F8
         \\keybind.panel_close = <Control><Shift>F10
         \\
     )) return "could not write the keybind config";
@@ -12746,11 +12876,54 @@ fn panelPickerStage(
         \\font_size = 13
         \\confirm_close = multiple
         \\keybind.panel_open = <Control><Shift>F9
+        \\keybind.panel_open_window = <Control><Shift>F8
         \\keybind.panel_close = <Control><Shift>F10
         \\
     )) return "could not restore confirm_close after the picker cancellation";
     var restore_waited: u32 = 0;
     while (restore_waited < 1_500) : (restore_waited += 100) pumpFor(app, 100);
+
+    // panel_open_window: the same picker, but the chosen panel opens in a
+    // standalone panel window rather than a tab.
+    {
+        const refocus = roundtrip(allocator, sock_path, custom_focus_req) orelse
+            return "focusing the custom pane before panel_open_window failed";
+        defer allocator.free(refocus);
+        _ = app.waitVisualSettle(term_win, 500, 8_000, 0.002, null);
+        var ref = app.frameRef(term_win, true) orelse return "no baseline frame for the window picker";
+        defer ref.deinit(allocator);
+        app.pressKey(term_win, "ctrl+shift+F8") catch return "injecting the panel_open_window chord failed";
+        if (!app.waitChangeSince(term_win, &ref, 10_000, 0.02, null))
+            return "the panel_open_window action never opened the picker";
+        _ = app.waitVisualSettle(term_win, 600, 8_000, 0.002, null);
+        app.pressKey(term_win, "Down") catch return "moving to the saved row (window) failed";
+        app.pressKey(term_win, "Down") catch return "moving to the final saved row (window) failed";
+        pumpFor(app, 400);
+        app.pressKey(term_win, "Return") catch return "opening the saved panel in a window failed";
+        var window_panel: u32 = 0;
+        const deadline = clock.nowMs() + 10_000;
+        while (clock.nowMs() < deadline) {
+            pumpFor(app, 100);
+            const live = roundtrip(allocator, sock_path, list_req) orelse continue;
+            defer allocator.free(live);
+            if (std.mem.indexOf(u8, live, "\"name\":\"e2e-saved\"") == null) continue;
+            if (std.mem.indexOf(u8, live, "\"target\":\"window\"") == null)
+                return "panel_open_window opened the panel somewhere other than a window";
+            window_panel = parseNumAfter(live, "\"panel_id\":") orelse
+                return "the window-opened saved panel has no id";
+            break;
+        } else return "panel_open_window never opened the saved panel";
+        var win_close_buf: [128]u8 = undefined;
+        const close_req = std.fmt.bufPrint(&win_close_buf, "{{\"cmd\":\"panel-close\",\"panel_id\":{d},\"session\":\"{s}\"}}\n", .{ window_panel, picker_session }) catch
+            return "formatting the window panel close failed";
+        const closed_window = roundtrip(allocator, sock_path, close_req) orelse
+            return "closing the window-opened panel roundtrip";
+        defer allocator.free(closed_window);
+        if (std.mem.indexOf(u8, closed_window, "\"ok\":true") == null)
+            return "closing the window-opened panel failed";
+        var settle: u32 = 0;
+        while (settle < 1_000) : (settle += 100) pumpFor(app, 100);
+    }
 
     // The pane the picker was driven from is still a working terminal.
     const alive = roundtrip(allocator, sock_path, "{\"cmd\":\"screen-info\",\"pane\":1}\n") orelse

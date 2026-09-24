@@ -130,6 +130,12 @@ const MENU = [_]Item{
         .{ .label = "Previous Tab (Tree Order)", .icon = "go-up-symbolic", .action = .tab_tree_prev },
         .{ .label = "Close Tab", .icon = "window-close-symbolic", .action = .close_tab },
     } } },
+    .{ .submenu = .{ .label = "Panels", .icon = "view-paged-symbolic", .items = &.{
+        .{ .label = "Open Saved Panel…", .icon = "view-paged-symbolic", .action = .panel_open },
+        .{ .label = "Open Saved Panel in Window…", .icon = "window-new-symbolic", .action = .panel_open_window },
+        .{ .label = "Show Panel / Show Shell", .icon = "view-paged-symbolic", .action = .toggle_panel_face },
+        .{ .label = "Close Panel", .icon = "window-close-symbolic", .action = .panel_close },
+    } } },
     .separator,
     .{ .bind = .{ .label = "Launch App…", .icon = "application-x-executable-symbolic", .action = .launch_app } },
     .{ .submenu = .{ .label = "Session", .icon = "network-server-symbolic", .remote_only = true, .items = &.{

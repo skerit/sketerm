@@ -682,6 +682,8 @@ fn hamburgerStage(allocator: std.mem.Allocator) ?[]const u8 {
         "New Tab",
         "Split Left / Right",
         "Split Top / Bottom",
+        "Open Saved Panel\u{2026}",
+        "Open Saved Panel in Window\u{2026}",
         "Preferences\u{2026}",
         "Keyboard Shortcuts",
         "About Sketerm",

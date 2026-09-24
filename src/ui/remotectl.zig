@@ -1201,6 +1201,7 @@ fn paneRoute(action: input.Action) PaneRoute {
         .web_history,
         .web_bookmarks,
         .panel_open,
+        .panel_open_window,
         .panel_close,
         .rename_tab,
         .color_tab,
