@@ -1087,6 +1087,9 @@ pub const Window = struct {
         self.detachGlobalSignals();
         // Teardown order matters. Steps:
         //
+        // 0. Pane.severFaces on every pane while its Terminal is alive:
+        //    face teardown calls back through the pane (titles, focus)
+        //    and those callbacks read pane.terminal.
         // 1. Null every Terminal sink + user_ctx so any idle/deferred
         //    callback already queued on the main loop can't reach into
         //    a Pane via stale callback pointers — it sees the cleared
@@ -1135,12 +1138,17 @@ pub const Window = struct {
             terminal.closePanelOrigin();
         }
         for (self.panes.items) |p| {
-            p.detachAppHost();
             // Pane.deinit stops frame-clock callbacks. Suppress their
             // window-wide offload notification before freeing any pane,
             // because the remaining array entries otherwise include
             // panes already destroyed earlier in the loop below.
             p.win_on_continuous_frames = null;
+            // Sever every face NOW, while each pane's Terminal is still
+            // alive — the same order the tab-close sweep uses. Leaving it
+            // to Pane.deinit's last-resort call ran face teardown (e.g.
+            // clearFaceTitle -> tab-title refresh -> paneFacts reading
+            // pane.terminal) after the terminals below were freed.
+            p.severFaces();
         }
         for (self.terminals.items) |t| t.clearSinks();
         for (self.terminals.items) |t| t.deinit();

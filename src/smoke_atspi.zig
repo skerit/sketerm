@@ -1814,11 +1814,13 @@ fn editorChromeStage(allocator: std.mem.Allocator, rt: []const u8, sock_path: [:
 
 /// Leave one editor pane open, with its GL atlas accounting armed, so
 /// the graceful shutdown below runs the real teardown order:
-/// window.deinit -> pane.deinit -> severFaces -> detachEditor, with the
-/// GtkGLArea still alive. A face that does not sever there leaves GTK
-/// calling unrealize/destroy into freed storage, and its texture
-/// counted-but-never-deleted; both abort the GUI, which the exit-status
-/// check reports. Every other editor stage closes its panes first,
+/// window.deinit -> severFaces -> detachEditor, with the GtkGLArea and
+/// the pane's Terminal still alive. A face that does not sever there
+/// leaves GTK calling unrealize/destroy into freed storage, and its
+/// texture counted-but-never-deleted; both abort the GUI, which the
+/// exit-status check reports. The editor's face title also makes that
+/// sever re-render the tab title from pane.terminal — a SIGSEGV when
+/// window.deinit freed the terminals before severing. Every other editor stage closes its panes first,
 /// which is exactly what hid this.
 fn editorTeardownStage(allocator: std.mem.Allocator, rt: []const u8, sock_path: [:0]const u8) ?[]const u8 {
     var efile_buf: [512]u8 = undefined;
