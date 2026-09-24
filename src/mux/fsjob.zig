@@ -1,8 +1,7 @@
 //! Subprocess file-job runner (`sketerm-mux --job`).
 //!
 //! Heavy fs verbs (copy, delete_tree, hash) run here — one process
-//! per OPERATION, spawned by the daemon (docs/filebrowser-roadmap.md
-//! phase 2): kill = cancel, SIGSTOP/SIGCONT = pause/resume, a crash
+//! per OPERATION, spawned by the daemon: kill = cancel, SIGSTOP/SIGCONT = pause/resume, a crash
 //! costs one job and never a session. Spec arrives as one JSON line
 //! on stdin; progress leaves as JSON lines on stdout; the exit code
 //! is redundant with the final done/error line (the daemon trusts

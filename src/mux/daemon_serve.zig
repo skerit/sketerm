@@ -1913,7 +1913,7 @@ pub fn handleFileList(self: *Daemon, cl: *Client, payload: []const u8) void {
 }
 
 // === File service (fs_op / fs_write / fs_delta) ================
-// The phase-1 file-browser surface (docs/filebrowser-roadmap.md):
+// The file-browser surface (src/ui/browser/CLAUDE.md):
 // rich one-round-trip listings, live directory views over inotify,
 // and the small mutation verbs. Everything here is an INLINE job in
 // the roadmap's terms — bounded work in the poll loop; recursive /

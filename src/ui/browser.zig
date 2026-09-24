@@ -1,4 +1,4 @@
-//! File-browser pane face (phases 3+4 of docs/filebrowser-roadmap.md).
+//! File-browser pane face (contract: src/ui/browser/CLAUDE.md).
 //!
 //! This file is the package facade. The implementation lives in
 //! src/ui/browser/, one module per responsibility; `view.zig` carries

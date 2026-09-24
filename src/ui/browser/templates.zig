@@ -330,3 +330,37 @@ pub fn instantiate(self: *BrowserView, tab: *BTab, source: []const u8) void {
     _ = self.startDaemonJobUndo(tab.hc, "copy", source, dst, label, self.makeUndo(tab.hc.host, .delete_created, dst, source, ""), .{ .no_replace = true });
     self.setStatusFmt("creating {s} from template on {s}", .{ name, tab.hc.label() });
 }
+
+test "the templates cache swaps in a whole chunked listing, sorted, and a refusal means none" {
+    const t = std.testing;
+    const a = t.allocator;
+    var view = BrowserView{ .allocator = a, .pane = undefined };
+    var hc = HostConn{ .view = &view, .host = null };
+    defer hc.templates_cache.deinit(a);
+    const Entry = @import("../../ipc/fsdrive.zig").Entry;
+
+    hc.templates_cache.req = 7;
+    var first = [_]Entry{ .{ .name = "report.odt", .kind = "file" }, .{ .name = ".hidden", .kind = "file" }, .{ .name = "Notes.txt", .kind = "file" } };
+    try t.expect(feedCache(&view, &hc, .{ .req = 7, .ok = true, .entries = &first, .more = true }));
+    // Mid-listing, a menu still renders the previous (cold) list.
+    try t.expect(!hc.templates_cache.warm);
+    try t.expectEqual(@as(usize, 0), hc.templates_cache.names.items.len);
+    var last = [_]Entry{.{ .name = "a.sh", .kind = "file" }};
+    try t.expect(feedCache(&view, &hc, .{ .req = 7, .ok = true, .entries = &last }));
+    try t.expect(hc.templates_cache.warm);
+    try t.expectEqual(@as(u32, 0), hc.templates_cache.req);
+    const names = hc.templates_cache.names.items;
+    try t.expectEqual(@as(usize, 3), names.len);
+    try t.expectEqualStrings("a.sh", names[0]);
+    try t.expectEqualStrings("Notes.txt", names[1]);
+    try t.expectEqualStrings("report.odt", names[2]);
+
+    // Another request's reply is not the cache's.
+    try t.expect(!feedCache(&view, &hc, .{ .req = 8, .ok = true }));
+    // A host whose Templates dir is missing answers with a refusal:
+    // that is "no templates", and the menu stops waiting.
+    hc.templates_cache.req = 9;
+    try t.expect(feedCache(&view, &hc, .{ .req = 9, .ok = false, .@"error" = "NOENT" }));
+    try t.expect(hc.templates_cache.warm);
+    try t.expectEqual(@as(usize, 0), hc.templates_cache.names.items.len);
+}

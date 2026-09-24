@@ -142,8 +142,8 @@ pub const FrameType = enum(u8) {
     /// run, `more:true` until the last), reads additionally stream
     /// `fs_data`. A directory VIEW (open_view) stays subscribed:
     /// daemon-side inotify pushes `fs_delta` until close_view / the
-    /// client disconnects. This is the phase-1 surface of the file
-    /// browser (docs/filebrowser-roadmap.md).
+    /// client disconnects. This is the file browser's daemon surface
+    /// (src/ui/browser/CLAUDE.md).
     fs_op = 23,
     /// File write (fsserve), binary — the one fs verb whose payload
     /// is bulk bytes: [u32 req][u64 off][u8 flags][u16 path_len]

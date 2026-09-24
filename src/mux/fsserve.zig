@@ -2,7 +2,7 @@
 //!
 //! Rich directory listings, entry stat, and the inotify watcher that
 //! backs live directory VIEWS — a listing is a subscription, not a
-//! one-shot reply (docs/filebrowser-roadmap.md, decision 1). View
+//! one-shot reply (src/ui/browser/CLAUDE.md, "Design locks"). View
 //! bookkeeping itself lives in daemon.zig (it owns *Client); this
 //! module is libc-only, GTK-free, musl-clean, and watches on both
 //! Linux (inotify) and macOS (kqueue) behind one event vocabulary —

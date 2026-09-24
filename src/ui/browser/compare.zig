@@ -709,3 +709,40 @@ pub fn startCompare(self: *BrowserView, tab: *BTab, right_path: []const u8) void
     self.search_max_matches = 100_000;
     self.startDaemonJobKind(right_hc, "find", cmp.right.root, "", "*", "scan target tree", .{ .kind = .compare_right });
 }
+
+test "Sync lists every mirror deletion host-qualified, and only one-sided rows delete" {
+    const t = std.testing;
+    const a = t.allocator;
+    const types = @import("types.zig");
+    var view = BrowserView{ .allocator = a, .pane = undefined };
+    var left_hc = types.HostConn{ .view = &view, .host = null };
+    var right_hc = types.HostConn{ .view = &view, .host = @constCast("box") };
+    var ctx = CompareCtx{
+        .allocator = a,
+        .view = &view,
+        .left = .{ .hc = &left_hc, .root = @constCast("/l") },
+        .right = .{ .hc = &right_hc, .root = @constCast("/r") },
+    };
+    const info: CompareCtx.CmpInfo = .{ .dir = false, .size = 1, .mtime_ms = 0 };
+    var only_left = CompareCtx.DiffRow{ .rel = @constCast("x"), .dir = false, .status = .left_only, .l = info, .r = null, .dd = undefined, .lab = undefined };
+    var both = CompareCtx.DiffRow{ .rel = @constCast("y"), .dir = false, .status = .differs, .l = info, .r = info, .dd = undefined, .lab = undefined };
+    var only_right = CompareCtx.DiffRow{ .rel = @constCast("z"), .dir = false, .status = .right_only, .l = null, .r = info, .dd = undefined, .lab = undefined };
+    try t.expect(ctx.deleteSide(&only_left) == &ctx.left);
+    try t.expect(ctx.deleteSide(&only_right) == &ctx.right);
+    // A file on both sides is never a deletion, whatever the row says.
+    try t.expect(ctx.deleteSide(&both) == null);
+
+    var paths: [CONFIRM_LIST_MAX + 2][16]u8 = undefined;
+    var deletes: [CONFIRM_LIST_MAX + 2]MirrorDelete = undefined;
+    for (&deletes, 0..) |*d, i| {
+        const p = try std.fmt.bufPrint(&paths[i], "/r/f{d}", .{i});
+        d.* = .{ .left = i == 0, .path = p };
+    }
+    const body = ctx.confirmBody(&deletes) orelse return error.NoBody;
+    defer a.free(body);
+    try t.expect(std.mem.indexOf(u8, body, "\nlocal:/r/f0") != null);
+    try t.expect(std.mem.indexOf(u8, body, "\nbox:/r/f1") != null);
+    try t.expect(std.mem.indexOf(u8, body, "\nbox:/r/f11") != null);
+    try t.expect(std.mem.indexOf(u8, body, "/r/f12") == null);
+    try t.expect(std.mem.endsWith(u8, body, "... and 2 more"));
+}

@@ -1672,3 +1672,18 @@ test "upsert defers the sort for a media column and performs it otherwise" {
     try t.expectEqualStrings("a.txt", dir.entries.items[0].name);
     try t.expectEqualStrings("aa.txt", dir.entries.items[1].name);
 }
+
+test "each host's Trash is its own: reported, derived from its home, never the local one" {
+    const t = std.testing;
+    var view = BrowserView{ .allocator = t.allocator, .pane = undefined };
+    var buf: [4200]u8 = undefined;
+    // A daemon that names its trash is taken at its word.
+    var named = HostConn{ .view = &view, .host = @constCast("box"), .trash_dir = @constCast("/srv/u/.local/share/Trash/files") };
+    try t.expectEqualStrings("box:/srv/u/.local/share/Trash/files", named.trashSpec(&buf).?);
+    // An older daemon reports only its home: the same rule applies there.
+    var old = HostConn{ .view = &view, .host = @constCast("box"), .home_dir = @constCast("/home/remote") };
+    try t.expectEqualStrings("box:/home/remote/.local/share/Trash/files", old.trashSpec(&buf).?);
+    // A remote host that told us nothing has no Trash place at all.
+    var unknown = HostConn{ .view = &view, .host = @constCast("box") };
+    try t.expect(unknown.trashSpec(&buf) == null);
+}

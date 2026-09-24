@@ -1,8 +1,8 @@
 //! fsdrive: mux file-service client (fs_op / fs_write frames).
 //!
-//! The client half of the phase-1 file browser (docs/
-//! filebrowser-roadmap.md): rich listings, live directory views with
-//! pushed deltas, ranged read/write, and the small mutation verbs —
+//! The client half of the file service (src/ui/browser/CLAUDE.md):
+//! rich listings, live directory views with pushed deltas, ranged
+//! read/write, and the small mutation verbs —
 //! all over one mux connection (local socket, SSH, or UDP; the
 //! transport is Conn's business). GTK-free and libc-only so it serves
 //! the GUI browser pane, MCP tools, and headless smokes alike.

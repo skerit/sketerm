@@ -1,5 +1,5 @@
 //! `sketerm mount <host>[:/path] <mountpoint>` — pure-Zig FUSE
-//! client (phase 6 of docs/filebrowser-roadmap.md): local apps open
+//! client: local apps open
 //! remote files through the kernel, backed by the mux file service.
 //! No libfuse: the /dev/fuse fd comes from the fusermount3 setuid
 //! helper (SCM_RIGHTS over a socketpair — the unprivileged path),

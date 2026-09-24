@@ -5,10 +5,12 @@
 //! wire.
 //!
 //! Host-side thumbnail caching is the DAEMON's job, not this module's:
-//! the `thumbnail` op installs the spec 128px PNG into its own host's
-//! freedesktop cache and serves that path, so the entry is shared with
-//! that machine's own file managers and survives our restarts. This
-//! side never writes a second copy of a LOCAL entry — but thumbnails
+//! the LOCAL daemon's `thumbnail` op installs the spec 128px PNG into
+//! the freedesktop cache and serves that path, so the entry is shared
+//! with the desktop's other file managers and survives our restarts; a
+//! REMOTE daemon (asked with `wire_cache`) keeps the codec bytes it
+//! sends under its own ~/.cache/sketerm/thumbs instead. This side
+//! never writes a second copy of a LOCAL entry — but thumbnails
 //! fetched from a REMOTE host persist their transport sidecar bytes in
 //! a private local cache (see "local persistent cache" below), because
 //! the daemon's cache lives on the wrong machine to save a revisit the

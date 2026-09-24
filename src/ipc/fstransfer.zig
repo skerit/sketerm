@@ -1,5 +1,4 @@
-//! Client-mediated cross-host file transfer (phase 4 of docs/
-//! filebrowser-roadmap.md): the client reads from the SOURCE host's
+//! Client-mediated cross-host file transfer: the client reads from the SOURCE host's
 //! daemon (fs_op read → fs_data) and writes to the DESTINATION host's
 //! daemon (fs_write), so two hosts that cannot see each other still
 //! transfer through the client. Single files and whole trees.
