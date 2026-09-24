@@ -44,6 +44,7 @@ const webstore = @import("webstore.zig");
 const webprofiles = @import("../ipc/webprofiles.zig");
 const webfindbin = @import("../web/findbin.zig");
 const capabilities = @import("capabilities.zig");
+const daemon_adopt = @import("daemon_adopt.zig");
 const wlvcodec = @import("../wlhost/vcodec.zig");
 
 const daemon_apps = @import("daemon_apps.zig");
@@ -369,7 +370,7 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
             retire(self, cl);
             cl.queueJson(.ok, .{ .ok = true });
         },
-        .quit_idle => handleQuitIdle(self, cl),
+        .quit_idle => handleQuitIdle(self, cl, frame.payload),
         .udp_ticket_req => handleUdpTicketReq(self, cl, frame.payload),
         .fs_op => handleFsOp(self, cl, frame.payload),
         // NOT attach-scoped (like fs_op): the web store belongs to the
@@ -472,8 +473,12 @@ fn retire(self: *Daemon, cl: *Client) void {
     for (self.clients.items) |other| {
         if (other != cl and !other.dead) other.queueFrame(.gone, "");
     }
-    for (self.workers.items) |w| {
-        if (!w.dead) _ = controlSend(w.control_fd, "K", -1);
+    // A handover leaves the workers running for the next broker to
+    // adopt: no 'K', and the control-fd close at exit orphans them.
+    if (!self.handing_over) {
+        for (self.workers.items) |w| {
+            if (!w.dead and !w.adopting) _ = controlSend(w.control_fd, "K", -1);
+        }
     }
     self.running = false;
 }
@@ -503,12 +508,37 @@ fn busyReason(self: *Daemon, buf: []u8) ?[]const u8 {
 /// check and the exit happen in one frame dispatch, so a session
 /// spawned between a client's probe and its request is refused rather
 /// than killed (the `.shutdown` path old daemons need is unconditional).
-pub fn handleQuitIdle(self: *Daemon, cl: *Client) void {
+/// `{"handover":true}` (welcome flag `worker_handover`) retires a broker
+/// that holds SESSIONS too: its workers are left running and the next
+/// broker adopts them (daemon_adopt.zig). Old daemons ignore the field
+/// and keep refusing a busy retire, which is the safe answer.
+pub fn handleQuitIdle(self: *Daemon, cl: *Client, payload: []const u8) void {
     if (self.isWorker()) {
         cl.queueJson(.ok, .{ .ok = false, .@"error" = "a session worker never retires on request; ask the broker" });
         return;
     }
     var buf: [192]u8 = undefined;
+    const Req = struct { handover: bool = false };
+    const handover = if (payload.len == 0) false else blk: {
+        const parsed = std.json.parseFromSlice(Req, self.allocator, payload, .{ .ignore_unknown_fields = true }) catch break :blk false;
+        defer parsed.deinit();
+        break :blk parsed.value.handover;
+    };
+    if (handover) {
+        if (daemon_adopt.handoverBlocker(self, &buf)) |reason| {
+            cl.queueJson(.ok, .{ .ok = false, .@"error" = reason });
+            return;
+        }
+        var kept: usize = 0;
+        for (self.workers.items) |w| {
+            if (!w.dead) kept += 1;
+        }
+        self.handing_over = true;
+        log.info("handing over {d} session worker(s) to the next broker", .{kept});
+        retire(self, cl);
+        cl.queueJson(.ok, .{ .ok = true, .handover = true, .sessions = kept });
+        return;
+    }
     if (busyReason(self, &buf)) |reason| {
         cl.queueJson(.ok, .{ .ok = false, .@"error" = reason });
         return;
@@ -546,7 +576,7 @@ test "quit_idle retires an idle daemon in one step and refuses a busy one" {
         .control_fd = -1,
     };
     try d.workers.append(a, &worker);
-    handleQuitIdle(&d, &requester);
+    handleQuitIdle(&d, &requester, "");
     try t.expect(d.running);
     var reply = (try wire.peelFrame(requester.wbuf.items)) orelse return error.TestUnexpectedResult;
     try t.expectEqual(wire.FrameType.ok, reply.frame.ftype);
@@ -557,7 +587,7 @@ test "quit_idle retires an idle daemon in one step and refuses a busy one" {
     // A dead worker is on its way out and holds nothing.
     worker.dead = true;
     requester.wbuf.clearRetainingCapacity();
-    handleQuitIdle(&d, &requester);
+    handleQuitIdle(&d, &requester, "");
     try t.expect(!d.running);
     reply = (try wire.peelFrame(requester.wbuf.items)) orelse return error.TestUnexpectedResult;
     try t.expectEqual(wire.FrameType.ok, reply.frame.ftype);
@@ -570,7 +600,7 @@ test "quit_idle retires an idle daemon in one step and refuses a busy one" {
     d.running = true;
     d.role = .worker;
     requester.wbuf.clearRetainingCapacity();
-    handleQuitIdle(&d, &requester);
+    handleQuitIdle(&d, &requester, "");
     try t.expect(d.running);
     reply = (try wire.peelFrame(requester.wbuf.items)) orelse return error.TestUnexpectedResult;
     try t.expect(std.mem.indexOf(u8, reply.frame.payload, "\"ok\":false") != null);

@@ -45,6 +45,80 @@ from `list`); a worker that crashes takes only its own session with it.
 that long. There is no single-process mode any more; `--broker` is
 accepted for older clients that still pass it and changes nothing.
 
+## Broker restarts: workers are adopted, not killed
+
+A worker does NOT die with its broker. Replacing the broker binary (an
+upgrade) or losing the broker to a crash keeps every session, and the
+next broker on the same socket adopts the running workers
+(`src/mux/daemon_adopt.zig`; the module header is the reference).
+
+- **Rendezvous.** After its session is up, each worker listens on a
+  stream socket `<broker socket>.w/<origin_id>` (directory mode 0700)
+  and reports `adopt:true` in its `'Y'` ready datagram. On control EOF
+  an adoptable worker becomes an ORPHAN instead of exiting: its session,
+  its PTY and every client it already serves keep running; only
+  broker-routed operations (a rename from an attached client) fail
+  until a broker adopts it. A worker whose listener could not be
+  created (a socket path over the `sockaddr_un` limit) keeps the old
+  behaviour and exits with its broker.
+- **Adoption.** A broker scans that directory at startup, and waits up
+  to 1.5 s for the answers before serving anyone, so the first `list`
+  after a restart shows every session. It rescans every 2 s after that.
+  For each listener it does not hold it creates a fresh
+  `platform.controlSocketpair` and passes one end over the stream in a
+  `'B' <version>` message. The stream is only a doorbell: the control
+  channel is the same datagram pair a fork creates. The worker drains
+  any pending control EOF first (the old broker's exit races the new
+  scan), accepts only while it has no live broker, and answers with one
+  `'D'` JSON record (`WorkerAdopt`: name, origin identity, worker and
+  child pids, hub paths). The broker lists it from then on; `'M'`
+  pushes, attach handoffs, kill and rename work as for a forked worker.
+  A name taken in the meantime is suffixed with the origin id and sent
+  to the worker as an `'R'` rename. An adopted worker is not the
+  broker's child: it is never `waitpid`ed (init reaps it) and control
+  EOF alone retires its record. A refused connect removes a listener
+  file older than 10 s (its worker is gone).
+- **Graceful upgrade.** `quit_idle` with `{"handover":true}` (welcome
+  flag `worker_handover`) retires a broker that holds sessions: it
+  refuses only while something the BROKER itself holds would be lost
+  (running jobs, transfers, debugger jobs, open channels) or while a
+  worker is still starting or cannot be adopted. It then exits without
+  the `'K'` stop byte, so its workers see control EOF and wait for the
+  replacement. `Conn.upgradeStaleIdle` sends it whenever the daemon
+  advertises the flag, so the GUI's startup upgrade and the browser's
+  remote connect now replace a stale daemon that is busy with
+  sessions instead of leaving it serving old code.
+- **Stopping is still stopping.** A `.shutdown` frame, SIGTERM/SIGINT
+  and a tripped lifetime fence send every worker the `'K'` stop byte:
+  those end the sessions, as they always did. Only a handover and an
+  uncontrolled broker death (SIGKILL, crash) leave orphans.
+- **Version skew.** Control opcodes and the `'A'` handoff encoding are
+  append-only, the offer's version byte is informational, and `'D'` is
+  parsed with unknown fields ignored, so a new broker adopts workers
+  forked by an older binary and vice versa. A record a broker cannot use
+  leaves that worker running and serving its clients, never killed.
+  Welcome capabilities are the BROKER's: a feature a newer broker
+  advertises but an older adopted worker does not serve fails on that
+  session with the worker's `.err`. Workers forked before adoption
+  existed have no listener and still exit with their broker; that is
+  why a handover refuses while such a worker is held, and why an
+  upgrade from such a daemon falls back to the old idle-only rule.
+- **Backstops.** Nothing PDEATHSIG-kills a worker (workers are
+  fork-without-exec children and never armed it), so a broker's death
+  cannot take them down. What bounds an orphan under a test harness is
+  the lifetime fence: workers keep the inherited `SKETERM_MUX_LIFETIME_FD`
+  and exit when it trips. The per-user daemon is never fenced; there an
+  orphan lives exactly as long as its session, which is the point.
+  `sketerm doctor` shows an adopted worker as such instead of as an
+  unreachable daemon.
+
+`zig build smoke-broker` runs the stage (`src/smoke_handover.zig`): a
+shell with state in a variable and a `cat`, one client attached
+throughout, a graceful handover and then a broker SIGKILL, each followed
+by a fresh broker, a reattach and the shell expanding the variable; then
+kill and shutdown on adopted workers, and an orphan reaped by its
+harness's fence with no broker ever adopting it.
+
 ## PTY spawn (worker side)
 
 `Pty.spawn` in `src/pty.zig` is called only from
@@ -413,7 +487,9 @@ the broker) are reaped from the poll loop. A broker asked to shut down
 sends each worker a graceful control byte first, so the workers flush
 `.gone` to their own clients before exiting; a `quit_idle` frame is the
 same exit, granted only when the broker holds no worker, job, transfer
-or channel at that instant.
+or channel at that instant, and `quit_idle` with `handover` is the one
+exit that leaves the workers running for the next broker (see "Broker
+restarts" above).
 
 ## Browser helper (optional)
 
@@ -529,8 +605,9 @@ auto-loaded when no flag is given. `--no-save` suppresses the exit save;
   sent kill or detach. Reattach restores screen and scrollback exactly.
 - The last clean layout save is on disk; `--restore` brings the tabs
   back.
-- Daemon death is the other boundary: sessions are gone, orphaned PTYs
-  SIGHUP their children. Same boundary tmux has.
+- A BROKER death is not a session boundary: workers outlive it and the
+  next broker adopts them. A WORKER death (or an explicit daemon stop)
+  is: its PTY is gone and the children get SIGHUP.
 - Daemon lifecycle events and warnings go to
   `$XDG_STATE_HOME/sketerm/mux.log` (all instances share it, `[pid]`
   attributes lines, rotated at 2 MB).
@@ -552,4 +629,6 @@ auto-loaded when no flag is given. `--no-save` suppresses the exit save;
 | GL resources are created and destroyed on the main thread | `realize` / `unrealize` on the `GtkGLArea` |
 | `TIOCSWINSZ` follows every grid geometry change | daemon `.resize` handler calls `pty.setSize` unconditionally |
 | A session never shares a process with another session | `Daemon.role`: the listening broker forks a worker per `.spawn`; a worker refuses `.spawn` |
+| A broker restart loses no session | adoptable workers orphan on control EOF (`daemon_adopt.workerOrphaned`); brokers scan `<socket>.w/` at startup; smoke-broker's handover stage |
+| A daemon stop still ends sessions | `'K'` to every worker on `.shutdown`, SIGTERM and a tripped fence, unless `handing_over` |
 | A rig never forks a daemon from a threaded process | `src/smoke/muxrig.zig` forks the broker before any thread exists |

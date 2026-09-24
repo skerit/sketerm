@@ -442,7 +442,10 @@ fn checkGui(allocator: std.mem.Allocator, palette: Palette) u32 {
     return 0;
 }
 
-const SocketState = enum { serving, gone, taken, refused, unknown };
+/// `adopted`: a session worker whose broker restarted. It is a fork of
+/// the old broker, so it looks like a daemon for that socket, but the
+/// broker now answering the socket lists its session (daemon_adopt.zig).
+const SocketState = enum { serving, gone, taken, refused, unknown, adopted };
 
 const DaemonProbe = struct {
     path: []const u8 = "",
@@ -497,7 +500,7 @@ fn probeWarns(p: *const procinv.Proc, probe: DaemonProbe) u32 {
     if (!p.isDaemon()) return 0;
     return switch (probe.state) {
         .gone, .taken, .refused => 1,
-        .serving, .unknown => 0,
+        .serving, .unknown, .adopted => 0,
     };
 }
 
@@ -541,6 +544,7 @@ fn writeProcRow(writer: *std.Io.Writer, palette: Palette, p: *const procinv.Proc
         .taken => try writer.print(" {s}{s} is answered by pid {d}{s}", .{ zspan(palette.warn), probe.path, probe.peer, zspan(palette.reset) }),
         .refused => try writer.print(" {s}{s} refuses connections{s}", .{ zspan(palette.warn), probe.path, zspan(palette.reset) }),
         .unknown => try writer.print(" {s}socket unknown{s}", .{ zspan(palette.dim), zspan(palette.reset) }),
+        .adopted => try writer.print(" adopted worker of pid {d} ({s})", .{ probe.peer, probe.path }),
     };
     for (sessions[0..@min(sessions.len, max_row_sessions)], 0..) |name, i| {
         try writer.print("{s}'{s}'", .{ if (i == 0) " " else ", ", name });
@@ -588,6 +592,11 @@ fn checkProcesses(allocator: std.mem.Allocator, palette: Palette) u32 {
     for (inv.procs, probes) |*p, *probe| {
         probe.* = if (p.isDaemon()) probeDaemon(a, &inv, p, &names) else .{};
         folded += p.folded;
+    }
+    // A "daemon" whose socket another daemon answers, holding a session
+    // that daemon lists, is a worker the restarted broker adopted.
+    for (inv.procs, probes) |*p, *probe| {
+        if (probe.state == .taken and names.contains(p.pid)) probe.state = .adopted;
     }
 
     printLabel(palette, "processes");

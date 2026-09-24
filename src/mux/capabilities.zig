@@ -83,6 +83,12 @@ pub const Flag = enum {
     /// unconditional `.shutdown` (racy: a session started in between
     /// dies).
     quit_idle,
+    /// `quit_idle` honors `{"handover":true}`: a broker whose session
+    /// workers can all be adopted retires WITH its sessions, leaving the
+    /// workers running for the next broker (daemon_adopt.zig). Absent =
+    /// a busy daemon is never replaced (the field would be ignored and
+    /// the request refused, so sending it is harmless but pointless).
+    worker_handover,
 };
 
 /// One bool per flag, keyed by wire name; the parsed form on the

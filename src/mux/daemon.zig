@@ -497,6 +497,18 @@ pub const Worker = struct {
     /// The worker's reported spawn-failure reason ('E' control datagram,
     /// sent just before it dies), surfaced in the deferred `.err` reply.
     spawn_err: ?[]u8 = null,
+    /// Not this broker's child: the worker was ADOPTED after a broker
+    /// restart (`daemon_adopt.zig`), so it is never waitpid'd (init
+    /// reaps it) and control EOF alone retires the record.
+    adopted: bool = false,
+    /// Adoption in flight: the 'B' offer went out, the worker's 'D'
+    /// record has not come back. Name and pid are unknown, so the
+    /// record is invisible to list/attach/name checks until then.
+    adopting: bool = false,
+    /// The worker listens for adoption (its 'Y'/'D' said `adopt`), so a
+    /// handover may leave it running. A worker that cannot be adopted
+    /// makes a handover refuse instead of orphaning it unreachable.
+    adoptable: bool = false,
 
     pub fn deinit(self: *Worker) void {
         if (self.control_fd >= 0) _ = c.close(self.control_fd);
@@ -600,9 +612,42 @@ pub const WorkerReady = struct {
     gpu: bool = false,
     output_width: u32 = wlcomp.DEFAULT_OUTPUT_WIDTH,
     output_height: u32 = wlcomp.DEFAULT_OUTPUT_HEIGHT,
+    /// The worker listens for adoption by a later broker.
+    adopt: bool = false,
     /// Repeated from the worker so a broker never acknowledges a mismatched
     /// fork-time identity.
     origin_id: []const u8 = "",
+};
+
+/// Worker->broker 'D' adoption record (JSON), the answer to a new
+/// broker's 'B' offer (`daemon_adopt.zig`). Everything a broker learns
+/// from the fork (name, identity, pid) plus the 'Y' paths, because the
+/// adopting broker saw neither. Append-only and parsed with unknown
+/// fields ignored: a broker adopts workers of OLDER and newer builds.
+pub const WorkerAdopt = struct {
+    /// Adoption record version (1 = this layout).
+    v: u32 = 1,
+    /// The worker process's own pid (Worker.pid).
+    wpid: i32 = 0,
+    name: []const u8 = "",
+    origin_name: []const u8 = "",
+    origin_id: []const u8 = "",
+    /// The worker binary's build id, for logs.
+    build: []const u8 = "",
+    /// The session child's pid (Worker.child_pid).
+    pid: i32 = 0,
+    app: bool = false,
+    display: bool = false,
+    ttl_secs: u32 = 0,
+    wl: []const u8 = "",
+    pa: []const u8 = "",
+    rt: []const u8 = "",
+    x: []const u8 = "",
+    xa: []const u8 = "",
+    xwayland: bool = false,
+    gpu: bool = false,
+    output_width: u32 = wlcomp.DEFAULT_OUTPUT_WIDTH,
+    output_height: u32 = wlcomp.DEFAULT_OUTPUT_HEIGHT,
 };
 
 /// Worker→broker metadata push payload (JSON over the 'M' control datagram).
@@ -2787,8 +2832,27 @@ pub const Daemon = struct {
     /// runs in workers only.
     role: Role = .broker,
     /// Worker only: the socketpair to the broker (passed client fds,
-    /// kill/rename control bytes, metadata pushes). -1 in the broker.
+    /// kill/rename control bytes, metadata pushes). -1 in the broker,
+    /// and -1 in an ORPHANED worker whose broker is gone and which is
+    /// waiting on `adopt_fd` for the next one.
     control_fd: c_int = -1,
+    /// Worker only: the adoption listener (`daemon_adopt.zig`), a stream
+    /// socket under `<broker socket>.w/` named by the session origin id.
+    /// A restarted broker connects and hands over a fresh control
+    /// channel. -1 = not adoptable (the old exit-with-broker behavior).
+    adopt_fd: c_int = -1,
+    /// Owned path + identity of the adoption socket, unlinked at exit
+    /// only while it is still the inode we bound.
+    adopt_path: ?[]u8 = null,
+    adopt_dev: u128 = 0,
+    adopt_ino: u128 = 0,
+    /// Broker only: when the adoption directory was last scanned for
+    /// orphaned workers (0 = never; the first tick scans).
+    adopt_scan_ms: i64 = 0,
+    /// Broker only: this exit is a HANDOVER (`quit_idle` with
+    /// `handover`): workers are left running for the next broker to
+    /// adopt instead of being told 'K'.
+    handing_over: bool = false,
     /// What the forked worker child runs; the default serves the session
     /// on the broker's allocator. A rig substitutes an entry that runs the
     /// same worker on a leak-checked allocator of its own.
@@ -3117,6 +3181,7 @@ pub const Daemon = struct {
         }
         if (self.listen_fd >= 0) _ = c.close(self.listen_fd);
         if (self.control_fd >= 0) _ = c.close(self.control_fd);
+        daemon_adopt.closeListener(self);
         if (self.base_dir) |d| self.allocator.free(d);
         if (self.broker_sock) |s| self.allocator.free(s);
         // Only unlink the exact inode this daemon bound. A replaced pathname
@@ -3143,6 +3208,9 @@ pub const Daemon = struct {
     pub fn run(self: *Daemon) !void {
         log.init();
         self.restoreFsJobs();
+        // A broker replacing one that handed over (or crashed) adopts the
+        // session workers it left running before serving anyone.
+        if (!self.isWorker() and self.listen_fd >= 0) daemon_adopt.brokerAdoptAtStartup(self);
         log.info("daemon up v{s} mode={s} socket={s}", .{
             version.string,
             @tagName(self.role),
@@ -3150,6 +3218,15 @@ pub const Daemon = struct {
         });
         while (self.running) try self.tick(500);
         log.info("daemon shutting down", .{});
+        // A broker that is NOT handing over ends its sessions: every
+        // worker gets the graceful 'K' (idempotent after `retire`). A
+        // bare control-fd close would now orphan them for adoption,
+        // which is the handover's and a crash's path, not a stop's.
+        if (!self.isWorker() and !self.handing_over) {
+            for (self.workers.items) |w| {
+                if (!w.dead and !w.adopting) _ = daemon_control.controlSend(w.control_fd, "K", -1);
+            }
+        }
         // The run loop exits the same tick `running` is cleared, so any frame
         // queued by the shutdown path (`.gone` on `.shutdown`, or a worker's
         // `.gone` on a broker `'K'`) is still sitting in each client's wbuf —
@@ -3236,6 +3313,10 @@ pub const Daemon = struct {
         // unfenced → ignored by poll.
         const lifetime_idx = fds.items.len;
         try fds.append(self.allocator, .{ .fd = self.lifetime_fd, .events = c.POLLIN, .revents = 0 });
+        // Worker: the adoption listener a restarted broker connects to
+        // (-1 when not adoptable → ignored by poll).
+        const adopt_idx = fds.items.len;
+        try fds.append(self.allocator, .{ .fd = self.adopt_fd, .events = c.POLLIN, .revents = 0 });
         // Shared inotify fd for fs directory views (-1 until the first
         // open_view → ignored by poll).
         const fs_idx = fds.items.len;
@@ -3394,6 +3475,8 @@ pub const Daemon = struct {
         if (self.listen_fd >= 0 and fds.items[0].revents & c.POLLIN != 0) self.acceptClient();
         if (self.control_fd >= 0 and fds.items[control_idx].revents & (c.POLLIN | c.POLLHUP | c.POLLERR) != 0)
             self.workerOnControl();
+        if (self.adopt_fd >= 0 and fds.items[adopt_idx].revents & c.POLLIN != 0)
+            daemon_adopt.workerOnAdopt(self);
         if (self.lifetime_fd >= 0 and lifetime.tripped(self.lifetime_fd, fds.items[lifetime_idx].revents)) {
             log.info("lifetime fence closed: the owning process is gone; shutting down", .{});
             self.running = false;
@@ -3501,6 +3584,9 @@ pub const Daemon = struct {
             }
         }
 
+        // Broker: offer a control channel to every orphaned worker a
+        // previous broker left behind (upgrade handover or a crash).
+        if (!self.isWorker()) daemon_adopt.brokerMaybeScan(self, nowMs());
         // Broker: drain worker control channels (metadata pushes + exit).
         i = 0;
         while (i < n_workers_built) : (i += 1) {
@@ -3581,6 +3667,7 @@ pub const Daemon = struct {
     const daemon_apps = @import("daemon_apps.zig");
     const daemon_browse = @import("daemon_browse.zig");
     const daemon_control = @import("daemon_control.zig");
+    const daemon_adopt = @import("daemon_adopt.zig");
     const daemon_fsops = @import("daemon_fsops.zig");
     const daemon_serve = @import("daemon_serve.zig");
     const daemon_transfer = @import("daemon_transfer.zig");
@@ -6960,6 +7047,13 @@ pub const Daemon = struct {
         i = 0;
         while (i < self.workers.items.len) {
             const w = self.workers.items[i];
+            if (w.dead and w.adopted) {
+                // Not our child: init reaps it; control EOF is all we get.
+                if (!w.adopting) log.info("adopted worker pid={d} session='{s}' gone", .{ w.pid, w.name });
+                _ = self.workers.swapRemove(i);
+                w.deinit();
+                continue;
+            }
             if (w.dead) {
                 var status: c_int = 0;
                 const r = c.waitpid(w.pid, &status, c.WNOHANG);

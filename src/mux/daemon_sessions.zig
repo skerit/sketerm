@@ -221,14 +221,14 @@ pub fn defaultWorkerEntry(
 
 pub fn brokerFindWorker(self: *Daemon, name: []const u8) ?*Worker {
     for (self.workers.items) |w| {
-        if (!w.dead and w.matchesName(name)) return w;
+        if (!w.dead and !w.adopting and w.matchesName(name)) return w;
     }
     return null;
 }
 
 fn brokerNameInUse(self: *Daemon, name: []const u8, except: ?*Worker) bool {
     for (self.workers.items) |w| {
-        if (w.dead or w == except) continue;
+        if (w.dead or w.adopting or w == except) continue;
         if (w.matchesName(name)) return true;
     }
     return false;
@@ -263,7 +263,10 @@ pub fn applyWorkerLimits() void {
 }
 
 fn workerKeepsFd(fd: c_int, control_fd: c_int, scan_fd: c_int) bool {
-    return fd <= 2 or fd == control_fd or fd == log.inheritedFd() or fd == scan_fd;
+    // The lifetime fence survives too: an orphaned worker (its broker
+    // gone, awaiting adoption) exits on it, see daemon_adopt.zig.
+    const fence = @import("../util/lifetime.zig").inherited() catch -1;
+    return fd <= 2 or fd == control_fd or fd == log.inheritedFd() or fd == scan_fd or (fence >= 0 and fd == fence);
 }
 
 /// Close every descriptor except the worker control channel, stdio, and log.
@@ -934,7 +937,7 @@ pub fn brokerList(self: *Daemon, cl: *Client) void {
     defer infos.deinit(self.allocator);
     const now = nowMs();
     for (self.workers.items) |w| {
-        if (w.dead) continue;
+        if (w.dead or w.adopting) continue;
         infos.append(self.allocator, .{
             .name = w.name,
             .origin_name = w.origin_name,

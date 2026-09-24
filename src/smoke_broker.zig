@@ -153,6 +153,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     }
     std.debug.print("smoke-broker: daemon PID metadata ok\n", .{});
 
+    // ── broker restart: workers survive a handover and a SIGKILL and are
+    // adopted by the next broker. Forks brokers of its own, so it runs
+    // before any stage below can have started a thread. ──
+    @import("smoke_handover.zig").run(allocator);
+
     @import("smoke_spawn_limits.zig").runRejected(allocator, sock_path);
     if (firstChildOf(bpid) > 0) fail("spawn limits: rejected request forked a worker");
     @import("smoke_spawn_limits.zig").runAcceptedMaximum(allocator, sock_path);

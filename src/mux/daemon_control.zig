@@ -44,6 +44,8 @@ const webstore = @import("webstore.zig");
 const webprofiles = @import("../ipc/webprofiles.zig");
 const webfindbin = @import("../web/findbin.zig");
 const capabilities = @import("capabilities.zig");
+const daemon_adopt = @import("daemon_adopt.zig");
+const lifetime = @import("../util/lifetime.zig");
 
 // ── broker ↔ worker control channel (process isolation) ─────────
 //
@@ -74,8 +76,14 @@ pub fn workerOnControl(self: *Daemon) void {
     var passed: c_int = -1;
     const n = controlRecv(self.control_fd, &buf, &passed);
     if (n <= 0) {
-        // Broker closed the control channel — no supervisor left; exit.
+        // Broker closed the control channel. An adoptable worker keeps
+        // its session for the next broker (daemon_adopt.zig); one that
+        // cannot be found again has no supervisor left and exits.
         if (passed >= 0) _ = c.close(passed);
+        if (self.adopt_fd >= 0) {
+            daemon_adopt.workerOrphaned(self);
+            return;
+        }
         workerShutdown(self);
         return;
     }
@@ -413,6 +421,7 @@ pub fn brokerOnWorkerControl(self: *Daemon, w: *Worker) void {
             w.setOwned(&w.xauthority, m.xa);
         },
         'N' => self.brokerWorkerRename(w, buf[0..@intCast(n)]),
+        'D' => daemon_adopt.brokerOnAdoptRecord(self, w, buf[1..@intCast(n)]),
         else => {},
     }
 }
@@ -445,6 +454,7 @@ pub fn applyWorkerReady(self: *Daemon, w: *Worker, payload: []const u8) bool {
         w.gpu = parsed.value.gpu;
         w.output_width = parsed.value.output_width;
         w.output_height = parsed.value.output_height;
+        w.adoptable = parsed.value.adopt;
         return true;
     }
     w.child_pid = std.fmt.parseInt(i32, payload, 10) catch 0;
@@ -706,6 +716,11 @@ fn runWorkerInner(
         return err;
     };
     try self.sessions.append(allocator, s);
+    // Outlive the broker: listen for the next one (daemon_adopt.zig),
+    // and keep the inherited lifetime fence, which is what bounds an
+    // orphan under a test harness.
+    self.lifetime_fd = lifetime.inherited() catch -1;
+    daemon_adopt.workerListen(self, &s.origin_id);
     // 'Y' carries the session's child pid (a debugger-attachable
     // handle) AND the hub paths it just created — the broker owns
     // neither, and the spawn `.ok` must return them so an external
@@ -724,6 +739,7 @@ fn runWorkerInner(
             .gpu = s.gpu,
             .output_width = s.output_width,
             .output_height = s.output_height,
+            .adopt = self.adopt_fd >= 0,
             .origin_id = &s.origin_id,
         }, .{}, &yaw.writer)) |_| {
             _ = controlSend(control_fd, yaw.written(), -1);

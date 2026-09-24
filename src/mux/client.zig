@@ -565,10 +565,16 @@ pub const Conn = struct {
     /// (a session it holds at that instant refuses the request); one
     /// that predates the flag gets the old probe-then-`.shutdown`
     /// sequence, which is racy by construction and kept only for it.
+    /// A daemon advertising `worker_handover` is asked to HAND OVER
+    /// instead: it retires even while holding sessions, whose workers
+    /// keep running and are adopted by the replacement broker.
     pub fn upgradeStaleIdle(self: *Conn, allocator: std.mem.Allocator) bool {
         if (!self.buildStale()) return false;
         if (self.caps.quit_idle) {
-            self.sendJson(.quit_idle, .{}) catch return false;
+            if (self.caps.worker_handover)
+                self.sendJson(.quit_idle, .{ .handover = true }) catch return false
+            else
+                self.sendJson(.quit_idle, .{}) catch return false;
             const f = self.recvExpectFor(&.{.ok}, 5_000) catch return false;
             defer f.deinit(allocator);
             const Reply = struct { ok: bool = false };
@@ -2744,7 +2750,16 @@ test "stale-idle upgrade asks quit_idle when advertised and probes old daemons o
     try peer.sendJson(.ok, .{ .ok = true });
     try t.expect(conn.upgradeStaleIdle(a));
     req = try peer.recvExpectFor(&.{.quit_idle}, 1_000);
+    try t.expect(std.mem.indexOf(u8, req.payload, "handover") == null);
     req.deinit(a);
+    // A daemon that can hand its workers over is asked to.
+    conn.caps.worker_handover = true;
+    try peer.sendJson(.ok, .{ .ok = true, .handover = true });
+    try t.expect(conn.upgradeStaleIdle(a));
+    req = try peer.recvExpectFor(&.{.quit_idle}, 1_000);
+    try t.expect(std.mem.indexOf(u8, req.payload, "\"handover\":true") != null);
+    req.deinit(a);
+    conn.caps.worker_handover = false;
 
     // Not advertised (an older daemon): the probe sequence, and a
     // listed session stops it before any shutdown is sent.
