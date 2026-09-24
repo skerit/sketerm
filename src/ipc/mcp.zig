@@ -2429,3 +2429,75 @@ test "the server entry point is analyzed by the unit build" {
     // the first full build instead of here.
     _ = &run;
 }
+
+/// The per-group tool reference in docs/mcp.md, rendered from the tool
+/// table: every tool under its group, marked read-only where it does not
+/// mutate, with its description's first sentence (timing tokens at their
+/// built-in defaults). The doc carries this text verbatim between two
+/// markers and a test keeps the two identical.
+pub fn toolReference(arena: std.mem.Allocator) ![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    for (std.enums.values(mcpfilter.Group)) |g| {
+        try w.print("### `{s}`\n\n", .{g.name()});
+        for (mcp_tools.TOOLS) |def| {
+            if (def.group != g) continue;
+            var sentence = firstSentence(def.description);
+            for (Tuning.all()) |item| {
+                var tok_buf: [32]u8 = undefined;
+                const tok = try std.fmt.bufPrint(&tok_buf, "%{s}_DEF%", .{tokenName(item.name)});
+                var def_buf: [32]u8 = undefined;
+                sentence = try replaceAll(arena, sentence, tok, try std.fmt.bufPrint(&def_buf, "default {d}", .{item.built_in}));
+            }
+            try w.print("- `{s}`{s}: {s}\n", .{ def.name, if (def.mutates) "" else " (read-only)", sentence });
+        }
+        try w.writeAll("\n");
+    }
+    return aw.written();
+}
+
+/// `hold_ms` -> `HOLD`: the description token a tuning item fills.
+fn tokenName(item: []const u8) []const u8 {
+    if (std.mem.eql(u8, item, "hold_ms")) return "HOLD";
+    if (std.mem.eql(u8, item, "settle_ms")) return "SETTLE";
+    if (std.mem.eql(u8, item, "timeout_ms")) return "TIMEOUT";
+    return "RETRY";
+}
+
+/// A description up to its first full stop (abbreviations excepted).
+fn firstSentence(desc: []const u8) []const u8 {
+    const d = std.mem.trim(u8, desc, " \n");
+    var i: usize = 0;
+    while (i < d.len) : (i += 1) {
+        if (d[i] != '.') continue;
+        if (i + 1 < d.len and d[i + 1] != ' ' and d[i + 1] != '\n') continue;
+        if (i >= 3 and (std.mem.eql(u8, d[i - 3 .. i], "e.g") or std.mem.eql(u8, d[i - 3 .. i], "i.e"))) continue;
+        return d[0 .. i + 1];
+    }
+    return d;
+}
+
+test "docs/mcp.md carries the tool reference the table renders" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const doc = @embedFile("docs_mcp_md");
+    const begin = "<!-- tool-reference:begin (generated: do not edit by hand) -->\n";
+    const end = "<!-- tool-reference:end -->";
+    const b = std.mem.indexOf(u8, doc, begin) orelse return error.MissingReferenceMarkers;
+    const e = std.mem.indexOfPos(u8, doc, b, end) orelse return error.MissingReferenceMarkers;
+    const have = std.mem.trim(u8, doc[b + begin.len .. e], "\n");
+    const want = std.mem.trim(u8, try toolReference(arena), "\n");
+    if (!std.mem.eql(u8, have, want)) {
+        // The block is long enough for a runner to clip it on stderr, so
+        // it also lands in a file to paste from.
+        const out = "/tmp/sketerm-mcp-tool-reference.md";
+        if (c.fopen(out, "w")) |f| {
+            _ = c.fwrite(want.ptr, 1, want.len, f);
+            _ = c.fclose(f);
+        }
+        std.debug.print("docs/mcp.md tool reference is stale; replace the block between the markers with the contents of {s}\n", .{out});
+        return error.StaleToolReference;
+    }
+}

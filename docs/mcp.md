@@ -1,7 +1,170 @@
 # MCP Tools
 
-`sketerm mcp` exposes GUI-backed terminal tools in shared mode and
-headless `term_*` and `app_*` tools against its isolated mux daemon.
+`sketerm mcp` is a Model Context Protocol server on stdio. Its tools come
+from one table (`src/ipc/mcp_tools.zig`) in eight groups; the reference
+below lists every one. The pane tools drive the running GUI's panes when
+a GUI socket is attached (`--shared`, or an explicit `--socket`) and the
+headless terminals of the server's own daemon otherwise; the `term_*`,
+`app_*`, `file_*` and forwarding tools always run against that daemon
+(private per server by default, see `--name`/`--durable`). `capabilities`
+is the one preflight: it reports what this server can reach right now.
+
+## Tool reference
+
+Generated from the tool table; a unit test fails when this block and the
+table disagree and prints the block to paste. A tool marked read-only
+is kept by a `:ro` policy term. The full descriptions and schemas are in
+`tools/list`.
+
+<!-- tool-reference:begin (generated: do not edit by hand) -->
+### `panes`
+
+- `list_terminals` (read-only): List the terminals the pane tools address: every GUI tab and pane (ids, titles, sizes, cwd, focus), or, with no GUI socket attached, the headless terminals this server opened (headless:true; each id is the `pane` every pane tool takes and the `term` every term_* tool takes).
+- `read_screen` (read-only): Read a pane's rendered screen: text plus cursor position, size and flags.
+- `screenshot_pane` (read-only): Screenshot a terminal pane as a lossless PNG (inline image) exactly as rendered, including colours, cursor and any shader.
+- `record_pane_start`: Start recording a terminal pane's session as an asciicast v2 (.cast) file: raw output with timestamps, playable with asciinema.
+- `record_pane_stop`: Stop the asciicast recording of a terminal pane's session.
+- `send_text`: Type literal text into a pane's terminal.
+- `send_keys`: Press named keys in a pane: space-separated chords like 'ctrl+c', 'enter', 'up', 'escape', 'f5', 'alt+x', 'shift+tab', 'pagedown'.
+- `run_command`: Type a shell command, press Enter, wait until OUTPUT settles (quiet_ms of no output), and return the resulting screen.
+- `wait_idle` (read-only): Wait until a pane produced no output for quiet_ms (or timeout_ms elapsed).
+- `new_tab`: Open a new shell tab in the GUI.
+- `split_pane`: Split a pane.
+- `focus_pane`: Focus a pane (selects its tab and grabs keyboard focus).
+- `close_pane`: Close a pane.
+
+### `app`
+
+- `list_installed_apps` (read-only): List installed GUI apps on the host (name + launch command), from its .desktop entries.
+- `launch_app`: Launch a GUI (Wayland) application HEADLESSLY: it renders into sketerm's mux daemon, never appears on any screen, and survives disconnects.
+- `list_apps` (read-only): List launched headless apps and their windows.
+- `app_windows` (read-only): List one app's rendered windows (ids, sizes, titles).
+- `screenshot_app` (read-only): Screenshot a headless app window as a lossless PNG (inline image).
+- `get_app_state` (read-only): One-call app observation: window list + screenshot of one window (inline PNG) with coordinate mapping.
+- `app_output` (read-only): Read a headless app's stdout/stderr (its PTY output as RENDERED BY A TERMINAL — a fixed-width grid, so long lines wrap and scrolled-off content needs scrollback=true; right for TUI-style redraws).
+- `app_log` (read-only): A headless app's stdout/stderr as an INDEXED LOG: each complete line gets a stable numeric id and a timestamp; the tail view shortens long lines (marked [+]) and any line can be re-read in full by id.
+- `app_wait_log` (read-only): BLOCK until one of the app's log lines matches a pattern, then return that line immediately.
+- `app_click`: Click inside an app window at surface-local pixel coordinates (from screenshot_app; apply the caption's multiplier if the image was downscaled).
+- `app_actions`: Execute an ORDERED batch of interaction steps against one app in a single call — collapses click/wait/screenshot round-trips (driving menus, games, wizards).
+- `app_mouse_move`: Move the pointer in an app window WITHOUT clicking.
+- `app_perform_action`: Invoke a widget's default AT-SPI action (press/activate/toggle) directly by element id — the reliable coordinate-free way to 'click' a button, menu item or checkbox.
+- `app_set_value`: Write a value straight into a widget via AT-SPI: 'text' replaces a text field's content (EditableText), 'value' sets a slider/spinner (Value).
+- `app_wait_for_element` (read-only): Wait until a widget appears in the app's accessibility tree (dialog opened, page loaded, ...).
+- `app_drag`: Press-move-release drag inside an app window (sliders, drag-and-drop, text selection).
+- `app_type`: Type literal text into an app window.
+- `app_clipboard_get` (read-only): Read what the app last copied to the clipboard (requires the app to have copied something).
+- `app_clipboard_set`: Offer text to the app as the host clipboard.
+- `app_key`: Press key chords in an app window: space-separated, e.g. 'ctrl+s', 'enter', 'alt+F4', 'down down enter'.
+- `app_scroll`: Scroll inside an app window.
+- `app_resize`: Ask an app window to redraw at a new size (deterministic screenshots).
+- `app_wait` (read-only): Wait until an app stopped producing new frames for quiet_ms (render quiescence), or — pass change_pct — until each new frame changes less than that percentage of pixels for quiet_ms (VISUAL quiescence: use this for games and other continuously-animating apps, which never stop committing frames but do reach a visually stable screen).
+- `app_watch` (read-only): Watch a window for a while and report WHEN it changed, as a timeline.
+- `app_hover_map`: Sweep the pointer over a grid and report which cells made the window repaint — empirical discovery of interactive regions for an app with no accessibility tree (games, raw framebuffer UIs), where the only alternative is guessing coordinates.
+- `app_backtrace`: Attach a debugger to the app on the daemon host and return every thread's backtrace.
+- `app_a11y_tree` (read-only): Read the app's accessibility (AT-SPI) tree as JSON: every widget's role, name, AT-SPI accessible identifier when exposed, description, states and screen rectangle.
+- `app_record_start`: Start recording a window's frames (a visual log of what you do).
+- `app_record_stop`: Stop the recording and save it (WebM or GIF per app_record_start).
+- `app_read_text` (read-only): OCR: read the TEXT rendered in an app window (or a region of it) — for custom-drawn UIs and games with no accessibility tree, this turns pixels into assertable strings.
+- `app_wait_text` (read-only): Wait until a text string becomes visible in an app window (OCR-polled, case-insensitive substring) — assert 'the dialog opened' / 'the menu lists Repairs' without eyeballing screenshots.
+- `app_template_save`: Save a named image template for visual matching: crop a distinctive UI element (a button, sprite, dialog frame) out of an app window via region, or pass image_b64 (PNG).
+- `app_templates` (read-only): List saved image templates (name + dimensions), or delete one.
+- `app_find_image` (read-only): Find a saved template (or inline PNG) in an app window RIGHT NOW by pixel matching — 'is the conversation frame on screen, and where?'.
+- `app_wait_image` (read-only): Wait until a template appears in an app window (pixel matching, polled), then optionally click its center (click=true) — the coordinate-free 'wait for this sprite, then click it' primitive for apps without an accessibility tree.
+- `app_macro_save`: Save a named, replayable input macro.
+- `app_macro_run`: Replay a saved macro against an app: runs its steps through the app_actions engine (deterministic order, per-step report, stops on failure/exit; wait_image/wait_text steps make the replay state-driven rather than timing-driven).
+- `app_macros` (read-only): List saved macros; show one's steps (show); delete one (delete); or view an app's recorded input journal (journal:true + app) to pick last_steps for app_macro_save.
+- `close_app_window`: Ask the app to close one window (like the titlebar button; the app decides).
+- `close_app`: Kill a headless app session outright.
+
+### `term`
+
+- `term_open`: Open a HEADLESS shell terminal on the private mux daemon (isolated mode) — a real PTY with no GUI, nothing of the user's reachable.
+- `term_list` (read-only): List open headless terminals: shell name + whether shell integration is active, exit state + real exit_status, pending command/exec trackers, the last rendered screen line (drained first, so a finished process never shows a stale progress frame), and each terminal's asciicast recording path.
+- `term_run`: Type a command line INTO the terminal's live session shell, exactly like a human: the SESSION SHELL parses it (its own dialect — bash/zsh/fish/whatever is running there) and state changes PERSIST across calls (cd, export, aliases, venv activation).
+- `term_send_text`: Write text to a headless terminal's PTY.
+- `term_send_keys`: Press named key chords in a headless terminal: 'ctrl+c', 'enter', 'up', 'tab', space-separated.
+- `term_read` (read-only): Read a headless terminal's rendered screen with its cursor/size facts.
+- `term_wait_idle` (read-only): Wait until a headless terminal's output stops changing (or timeout).
+- `term_wait_command` (read-only): Continue waiting for a term_run wait_for=command request that timed out.
+- `term_resize`: Resize a headless terminal's grid.
+- `term_close`: Close a headless terminal (kills its shell).
+- `term_exec`: Run one command inside a LIVE interactive shell (including a persistent SSH session from term_open host) and get STRUCTURED results: exact exit_status and the exact output between sentinel markers, independent of shell integration.
+- `term_exec_wait`: Continue waiting for a pending term_exec without resending — always attachable, including after a client-side tool timeout or abort.
+- `term_wait_exit` (read-only): Wait until a headless terminal's child PROCESS exits (distinct from output idleness — a silent scp can be running while output is idle, and an exited one can leave a stale progress frame).
+
+### `files`
+
+- `scp_put`: Copy a LOCAL file to an SSH host (scp), with integrity + atomicity built in: scp to a staged temp file, remote SHA-256 verify against the local hash, then an atomic mv into place (a corrupt transfer is discarded, never half-written).
+- `scp_get`: Copy a file from an SSH host to this machine (scp), with integrity + atomicity: scp to <local>.sketerm-part, SHA-256 compare against the remote hash, atomic rename into place.
+- `file_list` (read-only): Rich directory listing on the daemon's host in ONE round trip: kind, size, mtime, permissions and symlink target for every entry, dirs first.
+- `file_stat` (read-only): Stat one path: kind (file/dir/link/other), size, mtime, mode, owner, symlink target.
+- `file_read` (read-only): Read a file (ranged).
+- `file_write`: Write content to a file (created if missing; replaced unless append=true).
+- `file_mkdir`: Create a directory (single level, parent must exist).
+- `file_rename`: Rename/move a file or directory on the same filesystem.
+- `file_delete`: Delete ONE entry: a file, symlink, or EMPTY directory.
+- `file_copy`: Copy a file or a whole directory tree as a daemon-side JOB: runs in its own process, survives this MCP server, and is RESUMABLE — resume=true continues a previous interrupted copy from its hash-verified partial (a corrupted partial honestly restarts from zero; the reply's resumed_from says which happened).
+- `file_delete_tree`: Recursively delete a directory tree as a daemon-side job (same wait/job semantics as file_copy).
+- `file_hash` (read-only): SHA-256 of a file, computed daemon-side as a job (only the digest crosses the wire — use for verifying copies).
+- `file_extract`: Extract an archive ON THE HOST THAT OWNS IT.
+- `file_archive_create`: Create an archive ON THE SOURCE HOST.
+- `file_trash`: Move a file or directory to the owning host's freedesktop Trash as a daemon job, preserving restore metadata.
+- `file_chmod`: Change permissions on the owning host.
+- `file_truncate`: Set a file's exact byte length on the owning host.
+- `file_media_info` (read-only): Media metadata for MANY files in ONE daemon-side batch: image/video dimensions, JPEG EXIF (camera, lens, orientation, DateTimeOriginal, exposure, GPS), audio tags (ID3v1/v2, Vorbis, MP4 ilst), duration and bitrate.
+- `file_jobs` (read-only): List file jobs (running + recently finished): id, op, state, progress.
+- `file_job` (read-only): Control a file job: cancel (SIGKILL — works even on jobs stuck in unkillable IO), pause (SIGSTOP), resume (SIGCONT).
+
+### `net`
+
+- `port_forward_open`: Open a STRUCTURED SSH port forward (ssh -N -L with keepalives + ExitOnForwardFailure): picks a free local port when none is given, verifies the listener actually accepts before replying, and returns a forward id.
+- `port_forward_list` (read-only): List open port forwards with liveness and reconnect counts.
+- `port_forward_check` (read-only): Health-check one forward: verifies the ssh process AND that the local port accepts connections; if the ssh died (network blip, sshd restart) it RECONNECTS by respawning the same spec on the same local port.
+- `port_forward_close`: Close a port forward (kills its ssh).
+
+### `browser`
+
+- `web_tabs` (read-only): List the open browser views — SEVERAL can be open at once.
+- `web_open`: Open a NEW web view and return its handle plus a FIRST SNAPSHOT of the requested page, once THAT navigation has settled.
+- `web_close`: Close a web view.
+- `web_profiles` (read-only): HEADLESS ONLY (with a GUI attached the browser's identity containers belong to the user).
+- `web_profile_reset`: HEADLESS ONLY.
+- `web_policy` (read-only): HEADLESS ONLY (with a GUI attached this refuses: the user's own tabs are not policed by an assistant).
+- `web_policy_set`: HEADLESS ONLY (with a GUI attached this refuses).
+- `web_navigate`: Navigate a web view: a 'url', or an 'action' (back|forward|reload|stop).
+- `web_snapshot` (read-only): The page's ACCESSIBILITY-style tree as compact text: one line per node with a stable [id], role, name, states (focused/checked/disabled/required/invalid/expanded/current) and value.
+- `web_act`: Act on an element: by semantic ID from web_snapshot/web_read, or by accessible 'name' (with optional 'role' and 'nth') to fold the find-then-act two-step into one call.
+- `web_expand` (read-only): Full text of a node the snapshot truncated (the "(+N chars, expand [id])" marker), paged with offset/len.
+- `web_query` (read-only): Cheap spot-check against the tree AS LAST SENT to you (no fresh DOM walk): find_text (nodes whose name contains 'arg'), subtree (children of the node id in 'arg'), focused, form (every form control with its value and checked/disabled states and the row or group it sits in - what Apply would submit; 'arg' = a node id to scope it, or omit for the page), or within_text ('arg' = JSON {"text","name","role"}: the controls named name under the smallest container that also holds text, the same resolution web_act within_text uses).
+- `web_read` (read-only): READ THE PAGE: reader-mode markdown of the main content (headings, paragraphs, lists, code, links), with navigation and boilerplate dropped, plus stable semantic IDs for useful sections/headings/links/items.
+- `web_wait` (read-only): Wait until the view reaches a state: "load" (no load in flight), "title" (its title contains 'arg', or any title when arg is omitted), "text" ('arg' appears in the page's semantic tree) or "idle" (the DOM stopped changing for 600ms).
+- `web_scroll`: Scroll a web view and report the SETTLED position (before/after scrollX/scrollY plus the maximum), so "nothing moved" and "moved to the end" are different answers.
+- `web_key`: Send named key chords to a web view as TRUSTED key events (the same input path a real keystroke rides), so Tab order, Escape-to-dismiss and Enter-to-submit are testable.
+- `web_resize`: Resize a web view's viewport IN PLACE (width x height, logical px).
+- `web_inspect`: Compact UI review: focused control, landmarks, accessible-name approximations, disclosure wrapper/control mismatches, horizontal overflow and new page/console errors.
+- `web_checkpoint`: Without id, create a soft-navigation checkpoint.
+- `web_diagnostic` (read-only): Retrieve bounded, redacted helper failure evidence by the id returned in an error.
+- `web_console` (read-only): The page's console output (console.log/warn/error, uncaught exceptions as the engine reports them), mirrored per view since it opened - the blind spot behind "no console error column".
+- `web_eval`: Evaluate JavaScript in the page — the escape hatch for everything the structured tools do not cover.
+- `web_screenshot` (read-only): PNG of a web view.
+- `web_download`: Download a url to a FILE, fetched by the web view's own browser — so it carries that browser's cookies, session and route, and a file behind a login needs no token, no signed url and no cookie copying.
+- `web_network`: Content blocking + a network request log for a web view.
+
+### `ui`
+
+- `ui_show`: Show the user a real native UI PANEL in their sketerm window: a declarative document rendered as GTK widgets, not text or a screenshot.
+- `ui_show_files`: FAST PATH for "show me these images": hand it a list of image files on the session's host and it builds the panel document for you and shows it — ONE call instead of hand-authoring a ui_show document.
+- `ui_patch`: Update a live panel with a JSON array of ops applied as one transaction.
+- `ui_wait_event` (read-only): Block until the user interacts with a panel, then return queued interactions with component id and monotonic timestamp: button click values are actions, slider/select changes carry their new value, and text_input submit carries up to 4096 UTF-8 bytes.
+- `ui_panels` (read-only): Inventory of panels in a session, in two clearly separate lists: LIVE panels (on screen right now — panel_id, name, title, target) and SAVED documents (stored on disk by ui_save — name, title, size, mtime, and whether the stored file still parses).
+- `ui_save`: Persist a panel document to disk under the session's daemon origin and lifetime id so a later ui_show can bring it back with load=<name>.
+- `ui_close`: Close a LIVE panel: it disappears from the user's screen.
+- `ui_delete`: DESTRUCTIVE: permanently delete a SAVED panel document from disk.
+
+### `core`
+
+- `capabilities` (read-only): Preflight report of what THIS MCP server can do right now: isolation mode, headless GUI-app support (headless_gui — launch_app renders apps into the mux daemon and NEVER needs a display, an X server or a sketerm window), whether a direct sketerm GUI control socket is attached (gui_socket; independent of the session panel relay and of headless GUI apps), the live panel transport (panels + panel_transport) and the saved-panel store (panels_store + panel_store), OCR (tesseract) availability, whether the web_* tools can run and against what (web + web_backend "gui"/"session"/"headless"/"none" — "session" adds web_session, the watchable Wayland app session the helper renders into — plus the sketerm-webengine path in web_helper; web_gui says whether the user granted the web_* tools their OWN browser and logins, web_gui_source where that came from and web_gui_transport which GUI socket they hold now; web_profiles says whether named cookie jars work, web_routes which per-tab network routes web_open can honour, web_engine_broker whether the mux daemon owns the engine's lifetime and web_engine_owner who started the one in use; web_downloads whether web_download can pull a url through a view; web_engine_started whether an engine exists YET, since web_backend/web_watch/web_session are undetermined until it does), ssh/scp presence, the directory terminal asciicast recordings land in, the EFFECTIVE input-timing defaults (hold_ms/settle_ms/timeout_ms/click_retry, each marked when a SKETERM_MCP_* env override changed it from the built-in), and open session counts.
+<!-- tool-reference:end -->
 
 ## Tool exposure policy
 
@@ -303,6 +466,93 @@ What it does, and the three rules a consumer can rely on:
 apply: `profile:`/`ephemeral`, `policy`, `accept_cert`, `web_key`,
 `web_resize` are refused as headless-only features, and the refusal
 names the grant.
+
+### Headless web profiles
+
+`web_open profile:"work"` opens a view in a named, persistent browsing
+identity (its own cookie jar and cache); `ephemeral:true` opens a
+throwaway one; `web_profiles` lists them and `web_profile_reset` erases
+one. Headless only: with a GUI attached, `profile` is refused
+(`invalid_args`), because the GUI's containers are identities the user
+owns and names.
+
+- **Storage.** The helper's `--cache-dir` is the durable store root
+  `$XDG_STATE_HOME/sketerm/web-profiles/<instance-key>/` (`--name`, else
+  `anon`), because CEF requires every context's jar to be a child of the
+  root cache. Each jar is `profile-<name>-<id>`; `profiles.json` persists
+  the name-to-id table, since re-minting an id would hand a profile an
+  empty jar. The root is never the GUI's own web cache: two CEF
+  processes must not share one.
+- **One owner.** The store root is flock'd for the engine's lifetime. A
+  second process on the same instance key gets every profile request
+  refused, naming the owning pid and suggesting `--name`; its engine
+  keeps a volatile cache.
+- **Fail closed.** A profile view needs both the `contexts` and
+  `contexts-fail-closed` helper capabilities, an open store, and no
+  `ev_view_create_failed` for the new view. There is no shared-jar
+  fallback, ever; a refusal opens nothing.
+- **Reset retires the id.** The entry is dropped and the jar removed, so
+  the next use mints a fresh id and a fresh directory; a half-failed
+  removal can never come back as that profile's cookies. Orphan jars
+  are swept at open; a corrupt `profiles.json` is rebuilt from the jar
+  directories rather than restarting at id 1. Resetting a profile with
+  open views is a `conflict` naming them.
+- **Persistence.** Only the directory is durable, and the engine flushes
+  it only on a graceful helper exit. Chromium never persists session
+  cookies. `profile` with `ephemeral`, and the reserved names `default`
+  and `none`, are `invalid_args`.
+- **Privacy.** Store directories are 0700, but a profile store is not a
+  secret store: Chromium's Linux cookie encryption falls back to a fixed
+  key when no keyring is available, which is the headless case.
+
+`web_close` closes a view. With a GUI attached it closes one page of the
+pane (the `web-close` control verb; an older GUI without it gets the
+whole-pane `close-pane`), and the pane only with its last page.
+
+### Enforced network policy
+
+`web_open`'s `policy` object installs a per-view network policy that the
+browser engine enforces before a request leaves the process
+(`src/web/netpolicy.zig`, wire block 0x86 behind the `net-policy`
+capability). Headless only; with a GUI it is `unavailable`, and
+`web_network` is the GUI's equivalent.
+
+- **Fields.** `allow_hosts` (top-level document hosts and their
+  subdomains; empty = the url's host), `allow_subresource_hosts`,
+  `block_types` (the filter engine's resource types), `block_ads` (the
+  built-in filter list, the same switch as `web_network`),
+  `allow_schemes` (default http+https; `file` must be explicit),
+  `allow_private_addresses` (default false), and the budgets
+  `max_requests`, `max_bytes`, `max_navigations`, `deadline_ms`. A host
+  list holds at most 64 entries and a `*` entry is refused. `about:` is always allowed: it is a view's own blank
+  document.
+- **Fail closed.** A helper without the capability, or a full policy
+  table, refuses the open and the view never loads a page; there is no
+  unpoliced fallback. The policy frame travels before the `view_create` naming
+  the view, so it governs the very first request.
+- **Budgets latch.** Once one trips, `web_navigate`, `web_act`,
+  `web_eval` and `web_wait for:"load"` answer `refused` with the
+  numbers in the sentence; read tools keep answering and carry
+  `policy_exhausted` and `policy_exhausted_reason` as facts. `web_policy`
+  is the machine-readable accounting (requests, bytes, navigations,
+  time left, refusals by reason). `max_bytes` stops the NEXT request
+  after the crossing response completes.
+- **Only tighter.** `web_policy_set pane:` patches a live view: host
+  lists shrink, budgets lower, blocked types grow, private addresses
+  only turn off. A field the call omits stays as it was. A pure
+  loosening is `refused` naming every ignored field.
+  `web_policy_set profile:` registers a session default that a later
+  `web_open profile:` applies; it is in memory by design
+  (`durable:false`).
+- **Redirects.** Each redirect hop passes the same host gate (measured
+  on the pinned CEF: a 302 target is its own gate entry, and the request
+  id survives the chain, which is how a denial is named
+  `redirect_host`); main-frame hops count toward `max_navigations`.
+- **Limits.** Traffic with no browser behind it (service workers, the
+  favicon fetcher's browserless probe) is not policed; a per-context
+  resource handler would close that lane. Private-address refusal is
+  literal-only: a hostname that resolves to a private address is not
+  caught.
 
 ## Panels (`ui_*`)
 

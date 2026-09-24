@@ -98,8 +98,8 @@ keeps its own cookie jar there. Every one of these also works
 as a *face* on a pane inside a terminal window (`--here`/`--tab`).
 
 **MCP server.** `sketerm mcp` is a Model Context Protocol server on stdio
-with 120 tools in eight groups (`panes app term files net browser ui
-core`): read and type into terminals, run commands and wait for them,
+with tools in eight groups (`panes app term files net browser ui
+core`; [docs/mcp.md](docs/mcp.md) lists every one): read and type into terminals, run commands and wait for them,
 launch and drive GUI apps headlessly with screenshots, pixel diffs,
 hover maps and backtraces, transfer files and forward ports over SSH,
 browse the web headlessly in named cookie-jar profiles under an

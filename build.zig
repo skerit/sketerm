@@ -966,6 +966,7 @@ pub fn build(b: *std.Build) void {
     // docs/ is outside the source module root; drift tests that check a
     // doc against its code vocabulary embed it this way.
     tests_mod.addAnonymousImport("docs_config_md", .{ .root_source_file = b.path("docs/config.md") });
+    tests_mod.addAnonymousImport("docs_mcp_md", .{ .root_source_file = b.path("docs/mcp.md") });
     const tests = b.addTest(.{
         .root_module = tests_mod,
         .use_llvm = test_llvm,

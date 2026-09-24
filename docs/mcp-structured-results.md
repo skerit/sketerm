@@ -5,6 +5,13 @@ SHIPPED (2026-08-21): every tool speaks both lanes and declares an
 `output_schema`. Read fully before touching `src/ipc/mcp*.zig` — this
 is the contract a NEW tool has to meet, not a plan.
 
+Since written, `mcp.zig` was split: it keeps the loop, dispatch, `Res`,
+`ErrCode` and the test helpers, while each tool group lives in its own
+module (`mcp_panes`, `mcp_app`, `mcp_term`, `mcp_files`, `mcp_web`,
+`mcp_ui`, `mcp_caps`). Line anchors below name the code as it was then;
+find it by content. The tool count grew past the 112 quoted below;
+`docs/mcp.md` carries the current list, drift-tested against the table.
+
 ## Goal
 
 Every tool result carries BOTH lanes, each doing the one job it is good at:
@@ -118,7 +125,7 @@ fallthroughs use `.unknown_tool`.
 
 ## Tool declarations: one table (Phase 2)
 
-`TOOLS_JSON_RAW` (mcp.zig:1275-1390) + `mcpfilter.TOOL_META` are the same
+`TOOLS_JSON_RAW` (then in mcp.zig) + `mcpfilter.TOOL_META` are the same
 vocabulary declared twice. Replace with ONE comptime table in a new
 GTK-free module `src/ipc/mcp_tools.zig` (importable from both test
 roots):
@@ -142,7 +149,7 @@ pub const TOOLS = [_]ToolDef{ ... 112 entries ... };
   brace-depth `ObjectIter` filter may be kept or replaced by generating
   the filtered list straight from the table — prefer the table route and
   delete `ObjectIter` if nothing else needs it.
-- The drift test mcp.zig:5821 becomes structurally impossible to fail;
+- The old advertised-vs-classified drift test becomes structurally impossible to fail;
   replace it with: every tool has a non-empty description, unique name,
   inputSchema with `properties`, and (once Phase 3 completes) an
   `output_schema`.
@@ -167,7 +174,7 @@ literal, no escaping). It is no longer optional — three tests
 entry without one, so a new tool cannot ship JSON-in-text by omission.
 Property sets several tools share are spliced comptime instead of
 restated: `APP_STATE_PROPS` (appFacts), `SHOT_PROPS` (addShotFacts),
-`INPUT_PROPS` (inputResult), `SCREEN_PROPS` (addScreenFacts).
+`INPUT_PROPS` (inputResult), `SCREEN_PROPS` (`mcp_panes.addGrid`, for read_screen and term_read alike).
 
 ## Text-lane style rules
 
