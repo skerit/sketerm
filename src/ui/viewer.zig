@@ -85,6 +85,17 @@ pub const LoadResult = struct {
 
 pub const LoadCallback = *const fn (?*anyopaque, *LoadResult) void;
 
+/// A daemon connection kept between loads (see LoadTarget.takeConn).
+const CachedConn = struct {
+    host: ?[]u8,
+    fs: fsdrive.Fs,
+
+    fn destroy(self: *CachedConn) void {
+        self.fs.deinit();
+        if (self.host) |h| std.heap.c_allocator.free(h);
+    }
+};
+
 /// Refcounted liveness fence shared by detached loader workers and a UI owner.
 pub const LoadTarget = struct {
     mutex: c.pthread_mutex_t = undefined,
@@ -96,6 +107,16 @@ pub const LoadTarget = struct {
     pending: ?*LoadWork = null,
     callback: LoadCallback,
     context: ?*anyopaque,
+    /// The connection the last load used, kept for the next load on
+    /// the same host: Quick Look steps through a remote folder with
+    /// arrow keys, and a fresh ssh dial per keystroke WAS the latency.
+    /// Under the mutex; the worker takes it out for one load and puts
+    /// it back afterwards (`takeConn`/`giveConn`).
+    cached: ?CachedConn = null,
+    /// A cancel shut the active fd down while the worker held the
+    /// connection out, so the put-back must drop it rather than cache
+    /// a dead socket.
+    conn_poisoned: bool = false,
 
     pub fn create(callback: LoadCallback, context: ?*anyopaque) ?*LoadTarget {
         const allocator = std.heap.c_allocator;
@@ -127,15 +148,27 @@ pub const LoadTarget = struct {
         }
     }
 
+    /// Abort the in-flight load's socket. Under the lock; the worker
+    /// learns of it when it puts the connection back.
+    fn shutdownActive(self: *LoadTarget) void {
+        if (self.active_fd >= 0) {
+            _ = c.shutdown(self.active_fd, c.SHUT_RDWR);
+            self.conn_poisoned = true;
+        }
+        self.active_fd = -1;
+    }
+
     pub fn close(self: *LoadTarget) void {
         self.lock();
         self.alive = false;
         self.generation +%= 1;
-        if (self.active_fd >= 0) _ = c.shutdown(self.active_fd, c.SHUT_RDWR);
-        self.active_fd = -1;
+        self.shutdownActive();
         const pending = self.pending;
         self.pending = null;
+        var cached = self.cached;
+        self.cached = null;
         self.unlock();
+        if (cached) |*conn| conn.destroy();
         if (pending) |work| discardWork(work);
         self.unref();
     }
@@ -144,12 +177,54 @@ pub const LoadTarget = struct {
         self.lock();
         self.generation +%= 1;
         if (self.generation == 0) self.generation = 1;
-        if (self.active_fd >= 0) _ = c.shutdown(self.active_fd, c.SHUT_RDWR);
-        self.active_fd = -1;
+        self.shutdownActive();
         const pending = self.pending;
         self.pending = null;
         self.unlock();
         if (pending) |work| discardWork(work);
+    }
+
+    /// The kept connection for `host`, if any. Worker thread only; a
+    /// kept connection for another host is dropped, since a viewer
+    /// batch lives on one host.
+    fn takeConn(self: *LoadTarget, host: ?[]const u8) ?fsdrive.Fs {
+        self.lock();
+        var cached = self.cached orelse {
+            self.unlock();
+            return null;
+        };
+        self.cached = null;
+        self.conn_poisoned = false;
+        self.unlock();
+        if (!paths.hostEq(cached.host, host)) {
+            cached.destroy();
+            return null;
+        }
+        if (cached.host) |h| std.heap.c_allocator.free(h);
+        return cached.fs;
+    }
+
+    /// Put a load's connection back for the next load, or close it:
+    /// `reusable` is false after a transport failure, and a cancel that
+    /// shut the socket down meanwhile poisons it.
+    fn giveConn(self: *LoadTarget, host: ?[]const u8, fs: *fsdrive.Fs, reusable: bool) void {
+        self.lock();
+        const keep = reusable and self.alive and !self.conn_poisoned;
+        self.conn_poisoned = false;
+        var stale = self.cached;
+        self.cached = null;
+        if (keep) {
+            const owned: ?[]u8 = if (host) |h| (std.heap.c_allocator.dupe(u8, h) catch null) else null;
+            if (host == null or owned != null) {
+                self.cached = .{ .host = owned, .fs = fs.* };
+                self.unlock();
+                if (stale) |*old| old.destroy();
+                return;
+            }
+        }
+        self.unlock();
+        if (stale) |*old| old.destroy();
+        fs.deinit();
     }
 
     fn registerFd(self: *LoadTarget, generation: u64, fd: c_int) bool {
@@ -193,8 +268,7 @@ pub const LoadTarget = struct {
         }
         self.generation +%= 1;
         if (self.generation == 0) self.generation = 1;
-        if (self.active_fd >= 0) _ = c.shutdown(self.active_fd, c.SHUT_RDWR);
-        self.active_fd = -1;
+        self.shutdownActive();
         work.generation = self.generation;
         const superseded = self.pending;
         self.pending = null;
@@ -383,7 +457,6 @@ fn fetchMetadata(fs: *fsdrive.Fs, resource: model.Resource, payload: *FetchPaylo
 
 fn fetch(work: *LoadWork) !FetchPayload {
     const spec = work.spec;
-    const variant = work.variant;
     const resource = model.Resource.parse(spec);
     if (resource.host == null) {
         if (paths.isSketermMount(resource.path)) return error.SketermFusePathNotSupported;
@@ -394,8 +467,29 @@ fn fetch(work: *LoadWork) !FetchPayload {
             if (paths.isSketermMount(std.mem.span(resolved))) return error.SketermFusePathNotSupported;
         }
     }
-    var fs = try connectFs(resource.host);
-    defer fs.deinit();
+    const host = resource.host;
+    if (work.target.takeConn(host)) |kept| {
+        var fs = kept;
+        const kept_result = fetchOn(work, &fs, resource);
+        const transport_loss = if (kept_result) |_| false else |err| isTransportError(err);
+        work.target.giveConn(host, &fs, !transport_loss);
+        // A kept connection that died between loads (daemon restart,
+        // idle exit) costs one fresh dial, not a failed load.
+        if (!transport_loss or !work.target.current(work.generation)) return kept_result;
+    }
+    var fs = try connectFs(host);
+    const result = fetchOn(work, &fs, resource);
+    work.target.giveConn(host, &fs, if (result) |_| true else |err| !isTransportError(err));
+    return result;
+}
+
+fn isTransportError(err: anyerror) bool {
+    return err == fsdrive.Error.NotConnected or err == fsdrive.Error.Timeout;
+}
+
+/// One load over an open connection.
+fn fetchOn(work: *LoadWork, fs: *fsdrive.Fs, resource: model.Resource) !FetchPayload {
+    const variant = work.variant;
     if (!work.target.registerFd(work.generation, fs.conn.fd)) return error.Canceled;
     defer work.target.clearFd(work.generation, fs.conn.fd);
     if (variant == .head) {
@@ -404,17 +498,17 @@ fn fetch(work: *LoadWork) !FetchPayload {
         // of a tarball is a hex dump nobody learns anything from.
         var stat_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
         defer stat_arena.deinit();
-        const st = fs.statFollow(stat_arena.allocator(), resource.path) catch |err| return fsError(work, &fs, err);
+        const st = fs.statFollow(stat_arena.allocator(), resource.path) catch |err| return fsError(work, fs, err);
         if (std.mem.eql(u8, st.kind, "dir"))
-            return fetchDirectory(&fs, resource.path, st.size) catch |err| return fsError(work, &fs, err);
+            return fetchDirectory(fs, resource.path, st.size) catch |err| return fsError(work, fs, err);
         if (paths.isArchivePath(resource.path)) {
-            const listed = fetchArchive(&fs, resource.path, st.size) catch |err| return fsError(work, &fs, err);
+            const listed = fetchArchive(fs, resource.path, st.size) catch |err| return fsError(work, fs, err);
             if (listed) |payload| return payload;
         }
     }
     var probe_bytes: std.ArrayList(u8) = .empty;
     defer probe_bytes.deinit(std.heap.c_allocator);
-    const source = fs.read(resource.path, 0, 0, &probe_bytes) catch |err| return fsError(work, &fs, err);
+    const source = fs.read(resource.path, 0, 0, &probe_bytes) catch |err| return fsError(work, fs, err);
     if (variant == .head) {
         // No size ceiling: a huge binary still gets its bounded head.
         const allocator = std.heap.c_allocator;
@@ -441,9 +535,9 @@ fn fetch(work: *LoadWork) !FetchPayload {
         // The ceiling belongs to whole-file reads only: a preview of a
         // multi-GB video is a small daemon-rendered poster.
         if (source.size > ORIGINAL_BYTES_MAX) return error.SourceTooLarge;
-        const bytes = try readAll(&fs, resource.path, ORIGINAL_BYTES_MAX);
+        const bytes = try readAll(fs, resource.path, ORIGINAL_BYTES_MAX);
         var payload = FetchPayload{ .source_size = bytes.len, .bytes = bytes };
-        fetchMetadata(&fs, resource, &payload);
+        fetchMetadata(fs, resource, &payload);
         return payload;
     }
 
@@ -451,13 +545,13 @@ fn fetch(work: *LoadWork) !FetchPayload {
     var event = try fs.waitJobTerminal(job, LOAD_TIMEOUT_MS);
     defer event.deinit();
     if (!std.mem.eql(u8, event.ev, "done") or event.path.len == 0) return error.PreviewFailed;
-    const bytes = readAll(&fs, event.path, PREVIEW_BYTES_MAX) catch |err| {
+    const bytes = readAll(fs, event.path, PREVIEW_BYTES_MAX) catch |err| {
         if (!event.keep) fs.unlink(event.path) catch {};
         return err;
     };
     if (!event.keep) fs.unlink(event.path) catch {};
     var payload = FetchPayload{ .source_size = @intCast(source.size), .bytes = bytes };
-    fetchMetadata(&fs, resource, &payload);
+    fetchMetadata(fs, resource, &payload);
     return payload;
 }
 
@@ -2099,8 +2193,10 @@ fn onCastState(user: ?*anyopaque, st: Terminal.PlayState) void {
     const text = if (st.duration_ms) |d|
         std.fmt.bufPrintZ(&buf, "{s}  {d}:{d:0>2} / {d}:{d:0>2}{s}", .{
             title,
-            st.position_ms / 60_000, (st.position_ms / 1000) % 60,
-            d / 60_000,              (d / 1000) % 60,
+            st.position_ms / 60_000,
+            (st.position_ms / 1000) % 60,
+            d / 60_000,
+            (d / 1000) % 60,
             suffix,
         }) catch return
     else
@@ -2233,9 +2329,9 @@ fn onOpenClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
             .title = "Open File",
             .filters = &.{
                 .{ .label = "Images", .patterns = &.{
-                    "*.png",   "*.jpg",  "*.jpeg", "*.gif",  "*.webp",
-                    "*.jxl",   "*.bmp",  "*.svg",  "*.ico",  "*.tif",
-                    "*.tiff",  "*.avif", "*.heic", "*.heif",
+                    "*.png",  "*.jpg",  "*.jpeg", "*.gif",  "*.webp",
+                    "*.jxl",  "*.bmp",  "*.svg",  "*.ico",  "*.tif",
+                    "*.tiff", "*.avif", "*.heic", "*.heif",
                 } },
                 .{ .label = "Recordings", .patterns = &.{"*.cast"} },
             },

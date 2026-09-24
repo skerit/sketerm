@@ -864,6 +864,14 @@ pub fn main() u8 {
         teardown();
         return 0;
     }
+    if (c.getenv("SKETERM_SMOKE_E2E_VIEWER_REUSE_ONLY") != null) {
+        const app = drive orelse return fail("focused viewer-reuse smoke has no display driver");
+        if (!have_wl) return fail("focused viewer-reuse smoke is GTK/Wayland-only");
+        if (viewerReuseStage(allocator, app, rt, &wl_z)) |why| return failMsg(why);
+        say("viewer reuse: stepping through a remote batch rode the connection the first load dialed");
+        teardown();
+        return 0;
+    }
     if (c.getenv("SKETERM_SMOKE_E2E_VIEWER_ONLY") != null) {
         const app = drive orelse return fail("focused viewer smoke has no display driver");
         if (!have_wl) return fail("focused viewer smoke is GTK/Wayland-only");
@@ -7110,6 +7118,84 @@ fn viewerShot(allocator: std.mem.Allocator, app: *appdrive.App, win_id: u32, tag
     writePng(path, shot.png);
     _ = c.fprintf(platform.stderr(), "smoke-e2e: viewer failure screenshot: %s\n", path.ptr);
 }
+
+/// Quick Look / `sketerm view` over a REMOTE batch keeps the daemon
+/// connection between loads (ui/viewer.zig LoadTarget.takeConn): the
+/// first file dials the fake-SSH host once, and stepping to the next
+/// files must not dial again per keystroke (it did, before).
+fn viewerReuseStage(allocator: std.mem.Allocator, app: *appdrive.App, rt: [:0]const u8, wl: [*:0]const u8) ?[]const u8 {
+    const ocr = @import("util/ocr.zig");
+    if (!ocr.available()) {
+        say("viewer reuse: tesseract unavailable; skipping");
+        return null;
+    }
+    if (remote_mux_pid <= 0) return "viewer reuse: the fake-SSH daemon is not running";
+    var dir_buf: [512:0]u8 = undefined;
+    const dir = std.fmt.bufPrintZ(&dir_buf, "{s}/vreuse", .{rt}) catch return "viewer reuse: dir path";
+    _ = c.mkdir(dir.ptr, 0o700);
+    const words = [_][]const u8{ "ALPHAWORD", "BRAVOWORD", "CHARLIEWORD" };
+    var specs: [3][600:0]u8 = undefined;
+    for (words, 0..) |word, i| {
+        var p: [600:0]u8 = undefined;
+        const path = std.fmt.bufPrintZ(&p, "{s}/{d}.txt", .{ dir, i }) catch return "viewer reuse: path";
+        var body: [64]u8 = undefined;
+        if (!writeFile(path, std.fmt.bufPrint(&body, "{s}\n", .{word}) catch unreachable)) return "viewer reuse: seed";
+        _ = std.fmt.bufPrintZ(&specs[i], "localhost:{s}", .{path}) catch return "viewer reuse: spec";
+    }
+
+    _ = app.drainLive(2_000);
+    var known: [32]u32 = undefined;
+    var n_known: usize = 0;
+    for (app.windows.items) |w| {
+        if (w.popup or n_known >= known.len) continue;
+        known[n_known] = w.id;
+        n_known += 1;
+    }
+    const pid = c.fork();
+    if (pid < 0) return "viewer reuse: fork";
+    if (pid == 0) {
+        platform.dieWithParent();
+        _ = c.setenv("SKETERM_APP_ID", "dev.sker.sketerm.e2evreuse", 1);
+        _ = c.setenv("WAYLAND_DISPLAY", wl, 1);
+        _ = c.setenv("GDK_BACKEND", "wayland", 1);
+        _ = c.unsetenv("DISPLAY");
+        _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
+        _ = c.setenv("GTK_A11Y", "none", 1);
+        const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "view", &specs[0], &specs[1], &specs[2], null };
+        _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
+        c._exit(127);
+    }
+    vcast_pid = pid;
+    defer if (vcast_pid > 0) {
+        reap(vcast_pid, c.SIGTERM, 3000);
+        vcast_pid = -1;
+    };
+    var waited: u32 = 0;
+    const vwin = while (waited < 25_000) : (waited += 200) {
+        if (hasToplevelOtherThan(app, known[0..n_known])) |id| break id;
+        pumpFor(app, 200);
+    } else return "viewer reuse: sketerm view never mapped a window";
+
+    if (!viewerWaitOcr(allocator, app, vwin, words[0], 40_000)) {
+        viewerShot(allocator, app, vwin, "viewer-reuse-first");
+        return "viewer reuse: the first remote file never rendered";
+    }
+    const dials_before = sshDials(allocator, rt);
+    for (words[1..]) |word| {
+        app.pressKey(vwin, "Right") catch return "viewer reuse: injecting Right failed";
+        if (!viewerWaitOcr(allocator, app, vwin, word, 30_000)) {
+            viewerShot(allocator, app, vwin, "viewer-reuse-step");
+            return "viewer reuse: stepping to the next remote file never rendered it";
+        }
+    }
+    const dials = sshDials(allocator, rt) - dials_before;
+    if (dials >= words.len - 1) {
+        _ = c.fprintf(platform.stderr(), "smoke-e2e: viewer reuse: %zu ssh dials for %zu steps\n", dials, words.len - 1);
+        return "viewer reuse: every step dialed the host again instead of reusing the connection";
+    }
+    return null;
+}
+
 
 /// Cast playback INSIDE the Sketerm Viewer: `sketerm view` on a mixed
 /// batch (image + cast + text + binary), navigated both directions on
