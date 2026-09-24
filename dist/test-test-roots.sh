@@ -71,7 +71,7 @@ cef_count=0
 while IFS= read -r module; do
     case "$module" in
         # CEF types are legal only in the opt-in browser-helper test root.
-        web/cefhost.zig)
+        web/cefhost.zig|web/cefhost/*)
             class=cef
             ;;
         # Deliberate GTK-free model/data exceptions under ui/.
@@ -110,8 +110,8 @@ while IFS= read -r module; do
     esac
 done < "$work/modules"
 
-if [[ $cef_count -ne 1 ]]; then
-    fail "expected exactly one explicitly classified CEF test module, found $cef_count"
+if [[ $cef_count -lt 1 ]]; then
+    fail "expected at least one explicitly classified CEF test module, found $cef_count"
 fi
 
 total=$((core_count + gui_count + cef_count))
