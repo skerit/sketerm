@@ -16,6 +16,7 @@ const fsjob = @import("fsjob.zig");
 const daemon_fsjobs = @import("daemon_fsjobs.zig");
 const pulse = @import("pulse.zig");
 const snapshot = @import("snapshot.zig");
+const wlvcodec = @import("../wlhost/vcodec.zig");
 const dmod = @import("daemon.zig");
 const Daemon = dmod.Daemon;
 const Client = dmod.Client;
@@ -162,7 +163,10 @@ fn workerRenameResult(self: *Daemon, payload: []const u8) void {
 /// smoke-broker drives the real handoff.
 pub const PassedClient = struct {
     proto: u32,
-    video: bool,
+    /// The client's decodable video codecs (hello `video_codecs`). Byte 1
+    /// keeps the historical `video` bool (= decodes H.264) for a worker
+    /// that predates the list; the list itself rides the tail (12..).
+    video_codecs: wlvcodec.CodecList = .{},
     kind: Client.Kind,
     native_state_max: u8,
     snapshot_version: u8,
@@ -174,13 +178,13 @@ pub const PassedClient = struct {
     panel_rpc: u8 = 0,
     identity_first: bool = false,
 
-    pub const WIRE_SIZE: usize = 12;
+    pub const WIRE_SIZE: usize = 12 + wlvcodec.CodecList.wire_size;
 
     /// Append-only broker handoff encoding; old workers ignore tail bytes.
     pub fn encode(self: PassedClient) [WIRE_SIZE]u8 {
         var out: [WIRE_SIZE]u8 = @splat(0);
         out[0] = @truncate(self.proto);
-        out[1] = @intFromBool(self.video);
+        out[1] = @intFromBool(self.video_codecs.contains(.h264));
         out[2] = @intFromEnum(self.kind);
         out[3] = self.native_state_max;
         out[4] = self.snapshot_version;
@@ -191,6 +195,7 @@ pub const PassedClient = struct {
         out[9] = @intFromBool(self.panel_only);
         out[10] = self.panel_rpc;
         out[11] = @intFromBool(self.identity_first);
+        out[12..].* = self.video_codecs.encode();
         return out;
     }
 
@@ -199,7 +204,11 @@ pub const PassedClient = struct {
         const proto: u32 = if (bytes.len >= 1) bytes[0] else 1;
         return .{
             .proto = proto,
-            .video = bytes.len >= 2 and bytes[1] != 0,
+            // A pre-list broker sent only the bool: {h264} or nothing.
+            .video_codecs = if (bytes.len > 12)
+                wlvcodec.CodecList.decode(bytes[12..])
+            else
+                wlvcodec.CodecList.fromLegacy(bytes.len >= 2 and bytes[1] != 0),
             .kind = if (bytes.len >= 3) std.enums.fromInt(Client.Kind, bytes[2]) orelse .unknown else .unknown,
             .native_state_max = if (bytes.len >= 4)
                 bytes[3]
@@ -228,7 +237,7 @@ test "broker attach handoff preserves panel-only capability fields" {
     const t = std.testing;
     const original = PassedClient{
         .proto = wire.PROTO_VERSION,
-        .video = true,
+        .video_codecs = wlvcodec.CodecList.fromNames(&.{ "av1", "h264" }),
         .kind = .gui,
         .native_state_max = wire.NATIVE_STATE_VERSION,
         .snapshot_version = snapshot.SNAPSHOT_VERSION,
@@ -243,7 +252,7 @@ test "broker attach handoff preserves panel-only capability fields" {
     const encoded = original.encode();
     const decoded = PassedClient.decode(&encoded);
     try t.expectEqual(original.proto, decoded.proto);
-    try t.expectEqual(original.video, decoded.video);
+    try t.expectEqualSlices(wlvcodec.Codec, original.video_codecs.items(), decoded.video_codecs.items());
     try t.expectEqual(original.kind, decoded.kind);
     try t.expectEqual(original.native_state_max, decoded.native_state_max);
     try t.expectEqual(original.snapshot_version, decoded.snapshot_version);
@@ -261,6 +270,20 @@ test "broker attach handoff preserves panel-only capability fields" {
     try t.expect(!historical.identity_first);
     const pre_negotiation = PassedClient.decode(&.{6});
     try t.expectEqual(@as(u8, 10), pre_negotiation.snapshot_version);
+
+    // An OLD broker's 12-byte handoff carries only the video bool: the
+    // worker must hear {h264} (x264), never AV1 or nothing.
+    const old_bytes = encoded[0..12];
+    try t.expectEqual(@as(u8, 1), old_bytes[1]);
+    try t.expectEqualSlices(wlvcodec.Codec, &.{.h264}, PassedClient.decode(old_bytes).video_codecs.items());
+    var no_video = encoded;
+    no_video[1] = 0;
+    try t.expectEqual(@as(u8, 0), PassedClient.decode(no_video[0..12]).video_codecs.len);
+    // And an OLD worker reading a new handoff still finds byte 1 set for
+    // an H.264-capable client, cleared for an AV1-only one.
+    var av1_only = original;
+    av1_only.video_codecs = wlvcodec.CodecList.fromNames(&.{"av1"});
+    try t.expectEqual(@as(u8, 0), av1_only.encode()[1]);
 }
 
 /// Worker side: adopt a broker-passed client fd as a client of this
@@ -283,7 +306,7 @@ pub fn addPassedClient(self: *Daemon, fd: c_int, req: PassedClient) void {
         .native_state_max = req.native_state_max,
         .audio_channels = req.audio_channels,
         .winstream_channels = req.winstream_channels,
-        .video = req.video,
+        .video_codecs = req.video_codecs,
         .panel_rpc_support = req.panel_rpc,
     };
     self.next_client_id += 1;

@@ -388,10 +388,7 @@ pub fn nativeAction(self: *Daemon, nv: *Native, units: *std.ArrayList(u8), msgb:
             try wlpipe.appendUnit(units, a, .wl_msg, msgb);
         },
         .surface_destroy => |sd| {
-            if (nv.vstate.fetchRemove(sd.id)) |kv| {
-                var vs = kv.value;
-                vs.deinit();
-            }
+            nv.dropVideo(.surface, sd.id);
             try wlpipe.appendUnit(units, a, .wl_msg, msgb);
         },
         .dmabuf_add => |da| {
@@ -799,6 +796,9 @@ pub fn nativeAction(self: *Daemon, nv: *Native, units: *std.ArrayList(u8), msgb:
                 // remember the missed rows so the next SHIPPED
                 // commit re-covers them (regions the app never
                 // re-damages would otherwise stay stale forever).
+                // A video stream skipping a frame breaks the viewers'
+                // reference chain: restart it with a keyframe.
+                nv.forceSurfaceKeyframe(cm.surface);
                 const gop = nv.skipped.getOrPut(a, cm.surface) catch null;
                 if (gop) |g| {
                     g.value_ptr.* = if (g.found_existing)

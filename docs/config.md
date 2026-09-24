@@ -775,6 +775,7 @@ editor_keybind.sort_lines =
 
 | Key | Type | Default | Notes |
 | --- | --- | --- | --- |
+| `app_video_codec` | enum | `auto` | `auto`, `h264`, `av1`, `lossless`. Lossy video streaming for busy, photographic forwarded-app windows (a video player, a game). `auto` offers the daemon every codec this GUI can decode (H.264 first); `h264`/`av1` offer that codec first with the other as fallback; `lossless` never streams video. The daemon picks the first offered codec it can encode; with no common codec the window stays lossless. Applies to connections made after the change. See [app-video.md](app-video.md). |
 | `app_view` | enum | `window` | `window` (free-floating; the tab keeps the app log and a raise banner) or `tab` (embedded interactively). Pop-out is available either way. |
 | `app_keyboard_layout` | string | unset | xkb layout for forwarded-app session keyboards: `us`, `gb`, `fr`, `be`, `de`. Set it to YOUR physical layout -- keystrokes pass through as raw keycodes and the app decodes them with this keymap. Empty = `us`. |
 | `gpu_apps` | string | unset | Comma-separated app names always launched with GPU rendering (linux-dmabuf instead of software GL), matched case-insensitively against the .desktop `Name` or the `Exec` binary's basename: `Blender, mpv`. |

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-`sketerm` — native GTK4 terminal emulator written from scratch in Zig. No vendored terminal cores, no wrapper crates: parser/screen/atlas/render are all in-tree. Dependencies are system C libraries (`gtk4`, `libadwaita-1`, `freetype2`, `harfbuzz`, `epoxy`, `fribidi`, `fontconfig`, `libvpx` — VP9/WebM app-window recording, GUI-only) plus vendored `stb_image.h`/`stb_image_write.h`/`msf_gif.h` for image + GIF encode and a vendored Tree-sitter runtime (`vendor/tree-sitter/`) plus upstream grammars the build downloads at the commits and checksums pinned in `src/editor/grammars.zig` (editor syntax highlighting — fetched and compiled for the GUI/test targets ONLY, never for `sketerm-mux`; grammar sources are never committed). The browser adds `cef` as an OPTIONAL dependency of `sketerm-webengine` alone: nothing else links it, and the GUI degrades to "no browser" when it is absent.
+`sketerm` — native GTK4 terminal emulator written from scratch in Zig. No vendored terminal cores, no wrapper crates: parser/screen/atlas/render are all in-tree. Dependencies are system C libraries (`gtk4`, `libadwaita-1`, `freetype2`, `harfbuzz`, `epoxy`, `fribidi`, `fontconfig`, `libvpx` — VP9/WebM app-window recording, GUI-only) plus vendored `stb_image.h`/`stb_image_write.h`/`msf_gif.h` for image + GIF encode and a vendored Tree-sitter runtime (`vendor/tree-sitter/`) plus upstream grammars the build downloads at the commits and checksums pinned in `src/editor/grammars.zig` (editor syntax highlighting — fetched and compiled for the GUI/test targets ONLY, never for `sketerm-mux`; grammar sources are never committed). Forwarded-app video codecs (x264, SVT-AV1, libavcodec) are never linked: `-Dvideo` compiles header-only shims that `dlopen` them at runtime (`docs/app-video.md`). The browser adds `cef` as an OPTIONAL dependency of `sketerm-webengine` alone: nothing else links it, and the GUI degrades to "no browser" when it is absent.
 
 Three binaries ship: `sketerm` (the GUI, plus the `cli`/`ssh`/`mux` subcommands), `sketerm-mux` (the session daemon — **links libc only**, no GTK/GLib/freetype; check with `ldd` after touching its dep graph), and `sketerm-webengine` (the optional CEF browser helper — the ONLY binary that links CEF, kept in its own process for crash isolation; see `src/web/CLAUDE.md`). `sketerm-web` is not a binary of its own but an argv0 identity hardlink to the GUI, like `sketerm-files`.
 
@@ -51,7 +51,7 @@ Tests are discovered via `src/tests.zig`, which `_ = @import(...)`s every module
 
 **`zig build lint-errdefer` is the other build-time gate** (`src/lint_errdefer.zig`, likewise a dependency of all three test steps). Zig 0.16 accepts `errdefer` in a function that cannot return an error, compiles it clean, and then never runs it — every `catch return` inside such a function skips the rollback while reading as correct cleanup. The 2026-08 sweep that motivated it found 22, several in the daemon. It is an AST walk over `std.zig.Ast`, so comments, strings and disabled branches are classified rather than guessed; when it flags you, give the function an error return instead of deleting the `errdefer`.
 
-GUI system-package resolution is attached to reachable compile/TranslateC steps, never performed eagerly while constructing the graph (the two configure-time fribidi probes are the deliberate exception -- fribidi is in every target's dep set). `dist/test-mux-build.sh` injects a pkg-config that rejects every GUI package and runs real `mux`/`mux-portable` builds; keep it passing when changing build dependencies.
+GUI system-package resolution is attached to reachable compile/TranslateC steps, never performed eagerly while constructing the graph (the two configure-time fribidi probes and the `-Dvideo` header auto-detection, which build_options needs before the graph exists, are the deliberate exceptions). `dist/test-mux-build.sh` injects a pkg-config that rejects every GUI package and runs real `mux`/`mux-portable` builds; keep it passing when changing build dependencies.
 
 There's no `--test-filter` wired through `build.zig`; to run a single test, either invoke `zig test src/path/to/file.zig` directly with the same `linkSystemLibrary` flags, or add a temporary `b.option(...)` filter to the `tests` step.
 
@@ -114,7 +114,8 @@ it is loaded, because breaking one is how each was learned:
   - The wire protocol carries **parsed events, never re-encoded escape
     sequences**; FrameType/EventTag bytes are append-only.
   - `sketerm-mux` links **libc only** — never hard-link GTK/GLib/freetype,
-    EGL/GLES/libdrm, gdk-pixbuf or libopus into it. `ldd` after touching its
+    EGL/GLES/libdrm, gdk-pixbuf, libopus or a video codec (x264, SVT-AV1,
+    libavcodec: all dlopen'd) into it. `ldd` after touching its
     dep graph; `zig build mux-portable` is the musl check.
   - The GUI holds no `Pty` at all (a `Terminal` is only a daemon client).
     The `child_pid <= 0` guard in `Pty.reap`/`Pty.closeAndReap` must stay:

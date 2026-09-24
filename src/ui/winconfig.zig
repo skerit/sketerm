@@ -846,6 +846,8 @@ pub fn applyConfigChangeOpts(self: *Window, new_cfg: *const Config, opts: ApplyO
     var old_cfg = self.config;
     defer old_cfg.deinit();
     self.config = cloned;
+    // Applies to the next hello (new or reconnecting connections).
+    @import("../mux/client.zig").video_preference = self.config.app_video_codec;
     rebuildSymbolSpecs(self);
     @import("webface.zig").setMaxFps(self.config.browser_max_fps);
     @import("webface.zig").setRouteDefaults(self.config.web_route, self.config.mux_tor_socks_endpoint);

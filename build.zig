@@ -422,6 +422,31 @@ pub fn build(b: *std.Build) void {
     const smoke_foreign_step = b.step("smoke-foreign", "xdg-foreign cross-connection parenting smoke (headless)");
     smoke_foreign_step.dependOn(&smoke_foreign_run.step);
 
+    // Forwarded-app video smoke — `zig build smoke-video` (headless).
+    // A real mpv on a session display, a replica-compositor viewer per
+    // negotiated codec (lossless reference, legacy bool -> H.264, H.264,
+    // AV1): tiles arrive in exactly that codec and decode to the
+    // reference colours. Skips cleanly without -Dvideo or mpv.
+    const smoke_video_mod = b.createModule(.{
+        .root_source_file = b.path("src/smoke_video.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    configureCoreDeps(b, smoke_video_mod, core_cbindings_mod);
+    smoke_video_mod.addImport("build_options", noglib_opts_mod);
+    addVideo(b, smoke_video_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
+    if (native_sck) addSckBackend(b, smoke_video_mod);
+    if (have_vtenc) addVtEnc(b, smoke_video_mod);
+    const smoke_video = b.addExecutable(.{
+        .name = "sketerm-smoke-video",
+        .root_module = smoke_video_mod,
+        .use_lld = use_lld,
+    });
+    const smoke_video_run = b.addRunArtifact(smoke_video);
+    const smoke_video_step = b.step("smoke-video", "Forwarded-app video streaming smoke: each codec end to end (headless, needs mpv)");
+    smoke_video_step.dependOn(&smoke_video_run.step);
+
     // File-service smoke — `zig build smoke-fs` (headless). Daemon
     // thread + fsdrive client: listings, live view deltas, verbs,
     // ranged read/write, monolith AND broker mode.

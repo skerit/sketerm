@@ -308,16 +308,21 @@ pub const WsHost = struct {
                 if (tile.w <= 0 or tile.h <= 0) return error.Protocol;
                 const win = self.windows.get(wv.win) orelse return;
                 if (win.backing.items.len == 0) return; // need a base frame first
+                // Undecodable tiles are dropped (the backing keeps the
+                // previous frame; the next keyframe recovers), never a
+                // protocol fault — same rule as compositor.zig pool_vtile.
                 if (win.vdec == null or win.vdec_w != tile.w or win.vdec_h != tile.h or win.vdec_codec != tile.codec) {
                     if (win.vdec) |*d| d.deinit();
-                    win.vdec = vcodec.Decoder.initAvcodec(self.allocator, tile.w, tile.h, tile.codec) catch return error.Protocol;
+                    win.vdec = null;
+                    if (!tile.keyframe) return;
+                    win.vdec = vcodec.Decoder.initAvcodec(self.allocator, tile.w, tile.h, tile.codec) catch return;
                     win.vdec_w = tile.w;
                     win.vdec_h = tile.h;
                     win.vdec_codec = tile.codec;
                 }
                 const need: usize = @as(usize, @intCast(tile.w)) * @as(usize, @intCast(tile.h)) * 4;
                 try self.vscratch.resize(self.allocator, need);
-                win.vdec.?.decodeTile(tile, self.vscratch.items) catch return error.Protocol;
+                win.vdec.?.decodeTile(tile, self.vscratch.items) catch return;
                 rw.blitRect(win.backing.items, win.w, win.h, self.vscratch.items, tile.x, tile.y, tile.w, tile.h);
                 win.present();
             },

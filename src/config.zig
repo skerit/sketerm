@@ -68,6 +68,9 @@ pub const ExitAction = enum { close, restart, hold };
 /// interactively inside the tab (pop-out available either way).
 pub const AppView = enum { window, tab };
 
+/// `app_video_codec`: the viewer's forwarded-app video preference.
+pub const AppVideoCodec = @import("wlhost/vcodec.zig").Preference;
+
 /// Which GtkIMContext implementation the keyboard faces use.
 ///
 /// There is no value that gives both compose/dead keys and real input
@@ -855,6 +858,12 @@ pub const Config = struct {
     app_keyboard_layout: []const u8 = "",
     /// Default view for forwarded-app sessions (see AppView).
     app_view: AppView = .window,
+    /// Lossy video for busy, photographic forwarded-app windows (a video
+    /// player, a game): which codec this GUI offers the daemon. `auto`
+    /// offers every codec it can decode (H.264 first), `h264`/`av1` put
+    /// that one first, `lossless` never streams video. The daemon picks;
+    /// no common codec = lossless. docs/app-video.md.
+    app_video_codec: AppVideoCodec = .auto,
     /// GtkIMContext strategy for every keyboard face (see InputMethod).
     /// Applies to faces created after the change.
     input_method: InputMethod = .auto,
@@ -2578,6 +2587,7 @@ pub const keys = [_]Key{
     .{ .name = "gtk_theme", .codec = .string },
     .{ .name = "app_keyboard_layout", .codec = .string },
     .{ .name = "app_view", .codec = .{ .enum_ = .{} } },
+    .{ .name = "app_video_codec", .codec = .{ .enum_ = .{} } },
     .{ .name = "input_method", .codec = .{ .enum_ = .{} } },
     .{ .name = "gpu_apps", .codec = .string },
     .{ .name = "mux_udp_port_range", .codec = .{ .validated = .{ .check = checkUdpPortRange, .sample = "60000:61000" } } },

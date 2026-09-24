@@ -39,6 +39,7 @@ const version = @import("../version.zig");
 const a11yhub = @import("a11yhub.zig");
 const fillSockaddrUn = dmod.fillSockaddrUn;
 const opuscodec = @import("opuscodec.zig");
+const wlvcodec = @import("../wlhost/vcodec.zig");
 const Pty = @import("../pty.zig").Pty;
 const Pool = @import("../grid/style_pool.zig").Pool;
 const Screen = @import("../grid/screen.zig").Screen;
@@ -891,7 +892,7 @@ pub fn brokerAttach(self: *Daemon, cl: *Client, payload: []const u8) void {
     const kind = clientKindNamed(parsed.value.kind);
     const encoded = (PassedClient{
         .proto = cl.proto,
-        .video = cl.video,
+        .video_codecs = cl.video_codecs,
         .kind = kind,
         .native_state_max = cl.native_state_max,
         .snapshot_version = cl.snapshot_version,
@@ -971,7 +972,8 @@ pub fn brokerList(self: *Daemon, cl: *Client) void {
             return;
         };
     }
-    cl.queueJson(.welcome, .{ .proto = cl.proto, .daemon_pid = c.getpid(), .server_proto = wire.PROTO_VERSION, .min_proto = wire.MIN_SERVER_PROTO, .negotiation = @as(u8, 1), .version = version.string, .audio_opus = opuscodec.available(), .video = build_options.video, .sessions = infos.items });
+    var vnames: [wlvcodec.CodecList.cap][]const u8 = undefined;
+    cl.queueJson(.welcome, .{ .proto = cl.proto, .daemon_pid = c.getpid(), .server_proto = wire.PROTO_VERSION, .min_proto = wire.MIN_SERVER_PROTO, .negotiation = @as(u8, 1), .version = version.string, .audio_opus = opuscodec.available(), .video = wlvcodec.canEncode(.h264), .video_codecs = wlvcodec.encodableHere().names(&vnames), .sessions = infos.items });
 }
 
 test "broker list answers an allocation failure instead of dropping the reply" {
@@ -1763,8 +1765,8 @@ pub fn attachClientToSession(self: *Daemon, cl: *Client, s: *Session, spec: Atta
     cl.panel_rpc = spec.panel_rpc;
     cl.read_only = spec.read_only or spec.panel_only;
     cl.kind = spec.kind;
-    log.info("client attached session='{s}' kind={s} proto={d} video={} panel_only={} panel_rpc={d} ({s})", .{
-        s.name, @tagName(spec.kind), cl.proto, cl.video, cl.panel_only, cl.panel_rpc, how,
+    log.info("client attached session='{s}' kind={s} proto={d} video_codecs={d} panel_only={} panel_rpc={d} ({s})", .{
+        s.name, @tagName(spec.kind), cl.proto, cl.video_codecs.len, cl.panel_only, cl.panel_rpc, how,
     });
     if (cl.panel_only) {
         cl.queueJson(.ok, .{

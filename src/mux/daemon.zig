@@ -719,10 +719,12 @@ pub const Client = struct {
     audio_ok: bool = false,
     /// Subscribe flags bit0: the client decodes Opus (pcm_opus).
     audio_opus: bool = false,
-    /// The client advertised it can decode the video codec (hello
-    /// `video`). Gates whether forwarded surfaces route through the lossy
-    /// video path — never send a tile a client can't decode.
-    video: bool = false,
+    /// Video codecs the client can decode, in ITS preference order: the
+    /// hello's `video_codecs` names, or for a pre-negotiation client its
+    /// `video` bool mapped to {h264} (the only codec such a daemon ever
+    /// encoded). Gates whether and how forwarded surfaces route through
+    /// the lossy video path — never send a tile a client can't decode.
+    video_codecs: wlvcodec.CodecList = .{},
     /// Self-declared attach kind.
     kind: Kind = .unknown,
     /// The client asked to view only: it never takes the controller
@@ -1761,9 +1763,15 @@ pub const Native = struct {
     dmabuf_scratch: std.ArrayList(u8) = .empty,
     /// Per-surface lossy-video state (only populated under
     /// build_options.video): a churn tracker + a fixed-resolution
-    /// encoder, keyed by surface id. Hot, photographic surfaces route
-    /// through here to pool_vtile instead of the lossless pool_update_c.
-    vstate: std.AutoHashMapUnmanaged(u32, VideoSurface) = .empty,
+    /// encoder, keyed by (surface id, POOL id) — `videoKey`. Hot,
+    /// photographic surfaces route through here to pool_vtile instead of
+    /// the lossless pool_update_c. The pool is part of the key because
+    /// every receiver (old GUIs included) keeps ONE decoder per pool: a
+    /// surface whose buffers live in different pools (mpv's wlshm output
+    /// uses one pool per buffer) must feed each pool a self-consistent
+    /// stream, or every other frame references a picture that decoder
+    /// never saw.
+    vstate: std.AutoHashMapUnmanaged(u64, VideoSurface) = .empty,
     /// Scratch reused across commits: tight full-surface BGRA, and the
     /// encoded vcodec tile blob.
     vscratch: std.ArrayList(u8) = .empty,
@@ -1775,12 +1783,12 @@ pub const Native = struct {
     /// frame) and an allocation-churn win (buffers stay at high
     /// water instead of realloc-per-frame).
     pixscratch: wlpixcodec.Scratch = .{},
-    /// Video consensus for this channel: set by `videoOk` when at least
-    /// one native viewer of the session is attached and EVERY one of them
-    /// advertised video decoding. Recomputed on client churn
-    /// (`refreshVideoGates`). While false videoCommit stays dormant:
+    /// Negotiated video codec for this channel (`videoCodecFor`): set when
+    /// at least one native viewer of the session is attached and EVERY one
+    /// of them decodes a codec this daemon can encode. Recomputed on client
+    /// churn (`refreshVideoGates`). While null videoCommit stays dormant:
     /// never emit a tile some attached client cannot decode.
-    wants_video: bool = false,
+    video_codec: ?wlvcodec.Codec = null,
     /// Icon injection back-pointers (set after the Channel exists) so
     /// the brain's toplevel_app_id callback can resolve the app's icon
     /// on THIS host and queue it toward clients.
@@ -1807,7 +1815,14 @@ pub const Native = struct {
 
     const VideoSurface = struct {
         churn: churnmod.Tracker,
-        enc: wlvcodec.Encoder,
+        /// Opened lazily, the first time the surface is hot AND
+        /// photographic, for the channel's negotiated codec; reopened
+        /// when that codec changes (a viewer joins or leaves).
+        enc: ?wlvcodec.Encoder = null,
+        /// The codec an open FAILED for at this size (e.g. below an
+        /// encoder's minimum): the surface stays lossless instead of
+        /// retrying an expensive open on every commit.
+        failed: ?wlvcodec.Codec = null,
         w: i32,
         h: i32,
         seq: u32 = 0,
@@ -1815,7 +1830,7 @@ pub const Native = struct {
 
         pub fn deinit(self: *VideoSurface) void {
             self.churn.deinit();
-            self.enc.deinit();
+            if (self.enc) |*e| e.deinit();
         }
     };
 
@@ -1972,6 +1987,7 @@ pub const Native = struct {
         const kv = nv.pools.fetchRemove(id) orelse return;
         _ = c.munmap(kv.value.ptr, kv.value.size);
         _ = c.close(kv.value.fd);
+        nv.dropVideo(.pool, id);
         try wlpipe.appendPoolMeta(units, a, .pool_destroy, id, 0);
     }
 
@@ -2024,13 +2040,46 @@ pub const Native = struct {
         self.allocator.destroy(self);
     }
 
-    /// Lossy-video routing for a commit (build_options.video only). Feeds
-    /// per-surface churn; when the surface is HOT and looks photographic,
-    /// encodes the WHOLE surface as one H.264 tile and emits a pool_vtile,
+    /// Lossy-video routing for a commit (build_options.video / vtenc only).
+    /// Feeds per-surface churn; when the surface is HOT and looks
+    /// photographic, encodes the WHOLE surface as one tile in the
+    /// channel's NEGOTIATED codec (`video_codec`) and emits a pool_vtile,
     /// returning true so the caller skips the lossless path. Any failure
     /// (odd dims, encoder open, mirror too small) returns false → lossless.
+    pub fn videoKey(surface: u32, pool: u32) u64 {
+        return (@as(u64, surface) << 32) | pool;
+    }
+
+    /// Drop every video stream of a destroyed surface or reclaimed pool
+    /// (a reused pool id then starts a fresh stream with a keyframe).
+    pub fn dropVideo(nv: *Native, comptime by: enum { surface, pool }, id: u32) void {
+        var again = true;
+        while (again) {
+            again = false;
+            var it = nv.vstate.iterator();
+            while (it.next()) |e| {
+                const part: u32 = if (by == .surface) @intCast(e.key_ptr.* >> 32) else @truncate(e.key_ptr.*);
+                if (part != id) continue;
+                var vs = e.value_ptr.*;
+                _ = nv.vstate.remove(e.key_ptr.*);
+                vs.deinit();
+                again = true; // iterator invalidated by the removal
+                break;
+            }
+        }
+    }
+
+    /// The next tile of `surface`'s streams must be a keyframe (its
+    /// previous tile never reached the viewers).
+    pub fn forceSurfaceKeyframe(nv: *Native, surface: u32) void {
+        var it = nv.vstate.iterator();
+        while (it.next()) |e| {
+            if (e.key_ptr.* >> 32 == surface) e.value_ptr.needs_kf = true;
+        }
+    }
+
     pub fn videoCommit(nv: *Native, units: *std.ArrayList(u8), a: std.mem.Allocator, cm: anytype, mirror: PoolMirror, y0: i64, y1: i64) !bool {
-        if (!nv.wants_video) return false; // no client can decode video yet
+        const codec = nv.video_codec orelse return false; // no common codec with the viewers
         const w = cm.info.width;
         const h = cm.info.height;
         if (w <= 0 or h <= 0 or @rem(w, 2) != 0 or @rem(h, 2) != 0) return false; // codec needs even dims
@@ -2041,19 +2090,15 @@ pub const Native = struct {
         const tight = uw * 4;
         if (base + (uh - 1) * stride + tight > mirror.size) return false; // whole surface must fit
 
-        const gop = try nv.vstate.getOrPut(nv.allocator, cm.surface);
+        const key = videoKey(cm.surface, cm.info.pool);
+        const gop = try nv.vstate.getOrPut(nv.allocator, key);
         if (!gop.found_existing or gop.value_ptr.w != w or gop.value_ptr.h != h) {
             if (gop.found_existing) gop.value_ptr.deinit();
-            var enc = wlvcodec.Encoder.initX264(nv.allocator, w, h, 30) catch {
-                _ = nv.vstate.remove(cm.surface);
-                return false;
-            };
             const tracker = churnmod.Tracker.init(nv.allocator, @intCast(w), @intCast(h), .{}) catch {
-                enc.deinit();
-                _ = nv.vstate.remove(cm.surface);
+                _ = nv.vstate.remove(key);
                 return false;
             };
-            gop.value_ptr.* = .{ .churn = tracker, .enc = enc, .w = w, .h = h };
+            gop.value_ptr.* = .{ .churn = tracker, .w = w, .h = h };
         }
         const vs = gop.value_ptr;
 
@@ -2069,12 +2114,32 @@ pub const Native = struct {
         }
         if (!contentmod.looksPhotographic(nv.vscratch.items, .{})) return false;
 
-        const res = vs.enc.encodeTile(w, h, nv.vscratch.items, vs.needs_kf) catch return false;
+        // The negotiated codec moved (a viewer joined/left): reopen, and
+        // the new stream starts with a keyframe.
+        if (vs.enc) |*e| {
+            if (e.codec() != codec) {
+                e.deinit();
+                vs.enc = null;
+            }
+        }
+        if (vs.enc == null) {
+            if (vs.failed == codec) return false;
+            vs.enc = wlvcodec.Encoder.init(nv.allocator, codec, w, h, 30) catch |err| {
+                log.warn("video: {s} encoder for a {d}x{d} surface failed ({s}); it stays lossless", .{ wlvcodec.codecName(codec), w, h, @errorName(err) });
+                vs.failed = codec;
+                return false;
+            };
+            vs.needs_kf = true;
+            log.info("video: streaming a {d}x{d} surface as {s}", .{ w, h, wlvcodec.codecName(codec) });
+        }
+        const enc = &vs.enc.?;
+
+        const res = enc.encodeTile(w, h, nv.vscratch.items, vs.needs_kf) catch return false;
         vs.needs_kf = false;
 
         nv.vblob.clearRetainingCapacity();
         wlvcodec.appendTile(&nv.vblob, nv.allocator, .{
-            .codec = vs.enc.codec(),
+            .codec = enc.codec(),
             .keyframe = res.keyframe,
             .x = 0,
             .y = 0,
@@ -4162,20 +4227,26 @@ pub const Daemon = struct {
     pub fn refreshVideoGates(self: *Daemon) void {
         for (self.channels.items) |ch| {
             if (ch.dead) continue;
-            if (ch.native) |nv| nv.wants_video = self.videoOk(ch.session.?);
+            if (ch.native) |nv| nv.video_codec = self.videoCodecFor(ch.session.?);
         }
     }
 
-    /// Video tiles may only flow when every viewer can decode them
-    /// (a tile one client can't decode is a black window there).
-    fn videoOk(self: *Daemon, s: *Session) bool {
-        var any = false;
+    /// The codec session `s`'s video tiles use right now, or null for
+    /// lossless: negotiated across EVERY native viewer (a tile one client
+    /// can't decode is a black window there) against what this daemon can
+    /// encode (runtime-probed libraries). The first viewer's order wins.
+    fn videoCodecFor(self: *Daemon, s: *Session) ?wlvcodec.Codec {
+        var lists: [16]wlvcodec.CodecList = undefined;
+        var n: usize = 0;
         for (self.clients.items) |cl| {
             if (!nativeViewer(cl, s)) continue;
-            if (!cl.video) return false;
-            any = true;
+            if (cl.video_codecs.len == 0) return null;
+            if (n == lists.len) return null; // absurd viewer count: stay lossless
+            lists[n] = cl.video_codecs;
+            n += 1;
         }
-        return any;
+        if (n == 0) return null;
+        return wlvcodec.negotiate(lists[0..n], wlvcodec.encodableHere());
     }
 
     /// Initializes the process-wide importer once and always preserves the
@@ -4314,7 +4385,7 @@ pub const Daemon = struct {
             .auxiliary = auxiliary,
             .native = native,
         };
-        native.wants_video = self.videoOk(s);
+        native.video_codec = self.videoCodecFor(s);
         // Wire the brain to resolve + inject the app's icon when it
         // announces its app_id. Stable pointers (native/ch are heap).
         native.daemon = self;
@@ -5209,9 +5280,9 @@ pub const Daemon = struct {
         // Windows opened while nobody was attached (or for a prior
         // client) must be replayed for this one. Route windows through the
         // lossy video coder only if THIS client can decode it (mirrors the
-        // Wayland `native.wants_video = cl.video`).
+        // Wayland negotiation). The macOS encoder emits H.264 only.
         if (s.winstream) |ws| {
-            ws.setWantsVideo(cl.video);
+            ws.setWantsVideo(cl.video_codecs.contains(.h264));
             ws.reannounce();
         }
     }
@@ -5593,7 +5664,8 @@ pub const Daemon = struct {
                 return;
             };
         }
-        cl.queueJson(.welcome, .{ .proto = cl.proto, .daemon_pid = c.getpid(), .server_proto = wire.PROTO_VERSION, .min_proto = wire.MIN_SERVER_PROTO, .negotiation = @as(u8, 1), .version = version.string, .audio_opus = opuscodec.available(), .video = build_options.video, .sessions = infos.items });
+        var vnames: [wlvcodec.CodecList.cap][]const u8 = undefined;
+        cl.queueJson(.welcome, .{ .proto = cl.proto, .daemon_pid = c.getpid(), .server_proto = wire.PROTO_VERSION, .min_proto = wire.MIN_SERVER_PROTO, .negotiation = @as(u8, 1), .version = version.string, .audio_opus = opuscodec.available(), .video = wlvcodec.canEncode(.h264), .video_codecs = wlvcodec.encodableHere().names(&vnames), .sessions = infos.items });
     }
 
     const ForwardReq = struct { port: u16 };

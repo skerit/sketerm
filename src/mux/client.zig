@@ -11,6 +11,48 @@ const rudp = @import("rudp.zig");
 const sshroute = @import("sshroute.zig");
 const selfexec = @import("selfexec.zig");
 const capabilities = @import("capabilities.zig");
+const vcodec = @import("../wlhost/vcodec.zig");
+
+/// Which video codecs every hello offers (config `app_video_codec`, set
+/// by the GUI at startup and on reload): the process's runtime-decodable
+/// set, filtered and ordered by this. Takes effect on the next hello, so
+/// a live connection keeps what it negotiated until it reconnects.
+pub var video_preference: vcodec.Preference = .auto;
+
+/// The hello's two video fields. `video_codecs` is what a negotiating
+/// daemon reads; `video` is all an OLDER daemon reads, and it encodes
+/// x264 when that is set, so it must mean exactly "I decode H.264".
+pub fn helloVideo(pref: vcodec.Preference, decodable: vcodec.CodecList, names: *[vcodec.CodecList.cap][]const u8) struct { video: bool, video_codecs: []const []const u8 } {
+    const offered = vcodec.offer(pref, decodable);
+    return .{ .video = offered.contains(.h264), .video_codecs = offered.names(names) };
+}
+
+test "a new GUI's hello keeps an old daemon on x264 (or lossless)" {
+    const t = std.testing;
+    // The hello struct of a daemon that predates codec negotiation.
+    const OldDaemonHello = struct { proto: u32 = 1, video: bool = false };
+    var list: vcodec.CodecList = .{};
+    list.add(.h264);
+    list.add(.av1);
+    const cases = [_]struct { pref: vcodec.Preference, decodable: vcodec.CodecList, old_video: bool }{
+        .{ .pref = .auto, .decodable = list, .old_video = true },
+        // Preferring AV1 still lets an old daemon stream H.264.
+        .{ .pref = .av1, .decodable = list, .old_video = true },
+        // No H.264 decoder here: an old daemon must stay lossless.
+        .{ .pref = .auto, .decodable = vcodec.CodecList.fromNames(&.{"av1"}), .old_video = false },
+        .{ .pref = .lossless, .decodable = list, .old_video = false },
+    };
+    for (cases) |cs| {
+        var names: [vcodec.CodecList.cap][]const u8 = undefined;
+        const vf = helloVideo(cs.pref, cs.decodable, &names);
+        var out: std.Io.Writer.Allocating = .init(t.allocator);
+        defer out.deinit();
+        try std.json.Stringify.value(.{ .proto = wire.PROTO_VERSION, .video = vf.video, .video_codecs = vf.video_codecs }, .{}, &out.writer);
+        const parsed = try std.json.parseFromSlice(OldDaemonHello, t.allocator, out.written(), .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        try t.expectEqual(cs.old_video, parsed.value.video);
+    }
+}
 /// The one publish/stop/release mechanism for interrupting a blocking
 /// socket from another thread; re-exported so SDK consumers can declare
 /// the slot these connect helpers take.
@@ -433,6 +475,8 @@ pub const Conn = struct {
     }
 
     fn hello(self: *Conn, comptime queue_only: bool, deadline_ms: ?i64) !void {
+        var names: [vcodec.CodecList.cap][]const u8 = undefined;
+        const vf = helloVideo(video_preference, vcodec.decodableHere(), &names);
         const value = .{
             .proto = wire.PROTO_VERSION,
             .min_proto = @as(u32, 1),
@@ -441,7 +485,8 @@ pub const Conn = struct {
             .native_state_max = wire.NATIVE_STATE_VERSION,
             .audio = true,
             .winstream = true,
-            .video = @import("build_options").video,
+            .video = vf.video,
+            .video_codecs = vf.video_codecs,
             .panel_rpc = wire.PANEL_RPC_VERSION,
         };
         if (queue_only)

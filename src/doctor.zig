@@ -13,8 +13,8 @@ const mux_daemon = @import("mux/daemon.zig");
 const ipc_client = @import("ipc/client.zig");
 const mcp_registry = @import("ipc/mcp_registry.zig");
 const version = @import("version.zig");
-const build_options = @import("build_options");
 const opuscodec = @import("mux/opuscodec.zig");
+const vcodec = @import("wlhost/vcodec.zig");
 const procinv = @import("procinv.zig");
 
 /// Daemon `list` reply; pre-doctor daemons omit version/caps fields
@@ -26,6 +26,8 @@ const Welcome = struct {
     version: []const u8 = "",
     audio_opus: bool = false,
     video: bool = false,
+    /// Runtime-probed encode set (newer daemons); absent = only `video`.
+    video_codecs: ?[]const []const u8 = null,
     sessions: []const Sess = &.{},
 
     const Sess = struct {
@@ -94,6 +96,30 @@ fn onOff(b: bool) [*:0]const u8 {
     return if (b) "on" else "off";
 }
 
+/// "h264,av1" / "off" for a codec list, NUL-terminated in `buf`.
+fn codecText(list: vcodec.CodecList, buf: *[32]u8) [*:0]const u8 {
+    var names: [vcodec.CodecList.cap][]const u8 = undefined;
+    return joinCodecs(list.names(&names), buf);
+}
+
+fn joinCodecs(names: []const []const u8, buf: *[32]u8) [*:0]const u8 {
+    if (names.len == 0) return "off";
+    var w: std.Io.Writer = .fixed(buf[0 .. buf.len - 1]);
+    for (names, 0..) |n, i| {
+        if (i > 0) w.writeByte(',') catch break;
+        w.writeAll(n) catch break;
+    }
+    buf[w.end] = 0;
+    return @ptrCast(buf);
+}
+
+/// A daemon's encode set: its list when it reports one, else the
+/// pre-negotiation bool (which meant H.264).
+fn daemonVideoText(w: Welcome, buf: *[32]u8) [*:0]const u8 {
+    if (w.video_codecs) |names| return joinCodecs(names, buf);
+    return if (w.video) "h264" else "off";
+}
+
 pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     const palette = outputPalette();
     var host: ?[]const u8 = null;
@@ -117,12 +143,15 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     var warns: u32 = 0;
 
     printLabel(palette, "binary");
+    var dec_buf: [32]u8 = undefined;
+    var enc_buf: [32]u8 = undefined;
     _ = c.printf(
-        "%s  proto %u  opus:%s video:%s\n",
+        "%s  proto %u  opus:%s video decode:%s encode:%s\n",
         @as([*:0]const u8, version.string),
         @as(c_uint, wire.PROTO_VERSION),
         onOff(opuscodec.available()),
-        onOff(build_options.video),
+        codecText(vcodec.decodableHere(), &dec_buf),
+        codecText(vcodec.encodableHere(), &enc_buf),
     );
 
     warns += checkDaemon(allocator, null, palette);
@@ -224,12 +253,13 @@ fn checkDaemon(allocator: std.mem.Allocator, host: ?[]const u8, palette: Palette
     } else {
         _ = c.printf("%spid ?%s  ", palette.dim, palette.reset);
     }
+    var dv_buf: [32]u8 = undefined;
     _ = c.printf(
         "proto %u (selected %u)  opus:%s video:%s  %u session(s), %u app\n",
         @as(c_uint, server_proto),
         @as(c_uint, w.proto),
         onOff(w.audio_opus),
-        onOff(w.video),
+        daemonVideoText(w, &dv_buf),
         @as(c_uint, live),
         @as(c_uint, apps),
     );

@@ -44,6 +44,7 @@ const webstore = @import("webstore.zig");
 const webprofiles = @import("../ipc/webprofiles.zig");
 const webfindbin = @import("../web/findbin.zig");
 const capabilities = @import("capabilities.zig");
+const wlvcodec = @import("../wlhost/vcodec.zig");
 
 const daemon_apps = @import("daemon_apps.zig");
 const daemon_browse = @import("daemon_browse.zig");
@@ -187,8 +188,63 @@ const WelcomeBase = struct {
     build: []const u8,
     audio_opus: bool,
     video: bool,
+    video_codecs: []const []const u8,
     panel_rpc: u8,
 };
+
+/// The client's hello. Every field defaults to what a client predating
+/// it meant, and unknown fields are ignored (a newer client's extras).
+pub const HelloReq = struct {
+    proto: u32 = 1,
+    min_proto: u32 = 1,
+    negotiation: u8 = 0,
+    snapshot_max: u8 = 0,
+    native_state_max: u8 = 0,
+    audio: bool = false,
+    winstream: bool = false,
+    /// Pre-negotiation video capability: "I decode H.264".
+    video: bool = false,
+    /// Codecs the client decodes, in its preference order (vcodec
+    /// names). Present = authoritative, even when empty (a user who
+    /// chose lossless); absent = an older client, fall back to `video`.
+    video_codecs: ?[]const []const u8 = null,
+    panel_rpc: u8 = 0,
+
+    pub fn videoCodecs(self: HelloReq) wlvcodec.CodecList {
+        if (self.video_codecs) |names| return wlvcodec.CodecList.fromNames(names);
+        return wlvcodec.CodecList.fromLegacy(self.video);
+    }
+};
+
+test "an old GUI's hello (video bool only) negotiates x264, never AV1" {
+    const t = std.testing;
+    const old = try std.json.parseFromSlice(HelloReq, t.allocator,
+        \\{"proto":6,"min_proto":1,"negotiation":1,"audio":true,"winstream":true,"video":true}
+    , .{ .ignore_unknown_fields = true });
+    defer old.deinit();
+    const list = old.value.videoCodecs();
+    try t.expectEqualSlices(wlvcodec.Codec, &.{.h264}, list.items());
+    // Even against a daemon that could encode AV1 too.
+    const both = wlvcodec.CodecList.fromNames(&.{ "av1", "h264" });
+    try t.expectEqual(@as(?wlvcodec.Codec, .h264), wlvcodec.negotiate(&.{list}, both));
+
+    const none = try std.json.parseFromSlice(HelloReq, t.allocator, "{\"proto\":6}", .{ .ignore_unknown_fields = true });
+    defer none.deinit();
+    try t.expectEqual(@as(u8, 0), none.value.videoCodecs().len);
+
+    // A new GUI's explicit list wins over its compatibility bool, and an
+    // explicit EMPTY list (lossless by choice) stays empty.
+    const new = try std.json.parseFromSlice(HelloReq, t.allocator,
+        \\{"proto":6,"video":true,"video_codecs":["av1","h264","vp9"]}
+    , .{ .ignore_unknown_fields = true });
+    defer new.deinit();
+    try t.expectEqualSlices(wlvcodec.Codec, &.{ .av1, .h264 }, new.value.videoCodecs().items());
+    const off = try std.json.parseFromSlice(HelloReq, t.allocator,
+        \\{"proto":6,"video":false,"video_codecs":[]}
+    , .{ .ignore_unknown_fields = true });
+    defer off.deinit();
+    try t.expectEqual(@as(u8, 0), off.value.videoCodecs().len);
+}
 
 pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
     if (cl.proto == 0 and frame.ftype != .hello and frame.ftype != .list and
@@ -206,17 +262,6 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
     }
     switch (frame.ftype) {
         .hello => {
-            const HelloReq = struct {
-                proto: u32 = 1,
-                min_proto: u32 = 1,
-                negotiation: u8 = 0,
-                snapshot_max: u8 = 0,
-                native_state_max: u8 = 0,
-                audio: bool = false,
-                winstream: bool = false,
-                video: bool = false,
-                panel_rpc: u8 = 0,
-            };
             if (std.json.parseFromSlice(HelloReq, self.allocator, frame.payload, .{
                 .ignore_unknown_fields = true,
             })) |p| {
@@ -240,7 +285,7 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
                     0;
                 cl.audio_channels = cl.proto != 0 and if (negotiated) p.value.audio else cl.proto >= 5;
                 cl.winstream_channels = cl.proto != 0 and if (negotiated) p.value.winstream else cl.proto >= wire.WINSTREAM_PROTO_VERSION;
-                cl.video = p.value.video;
+                cl.video_codecs = p.value.videoCodecs();
                 cl.panel_rpc_support = @min(p.value.panel_rpc, wire.PANEL_RPC_VERSION);
                 p.deinit();
             } else |_| {}
@@ -248,6 +293,7 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
             // table advertises, parses and resets them, and a frame an
             // old daemon would `.err` on is gated client-side by its flag
             // (misattributable on a multiplexed connection otherwise).
+            var codec_names: [wlvcodec.CodecList.cap][]const u8 = undefined;
             cl.queueJson(.welcome, capabilities.withFlags(WelcomeBase{
                 .proto = cl.proto,
                 .daemon_pid = c.getpid(),
@@ -264,7 +310,12 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
                 // it is provably idle (Conn.upgradeStaleIdle).
                 .build = build_options.commit,
                 .audio_opus = opuscodec.available(),
-                .video = build_options.video,
+                // Pre-negotiation meaning ("this daemon encodes H.264"),
+                // kept for old clients; `video_codecs` is the full
+                // runtime-probed encode set, informational (the daemon
+                // picks from the client's hello list, see HelloReq).
+                .video = wlvcodec.canEncode(.h264),
+                .video_codecs = wlvcodec.encodableHere().names(&codec_names),
                 // Correlated native-panel relay, a version rather than
                 // a flag: independent of the terminal profile, so
                 // future clients may share it with no snapshot/event

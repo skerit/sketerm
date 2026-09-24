@@ -705,6 +705,10 @@ pub const Window = struct {
         };
         next_window_id += 1;
 
+        // Forwarded-app video codecs every mux hello offers (app-level,
+        // module-level in mux/client.zig; set before any pane connects).
+        @import("../mux/client.zig").video_preference = self.config.app_video_codec;
+
         // Browser frame cap: app-level like the IM strategy below, and
         // module-level in webface, which owns the one helper client.
         @import("webface.zig").setMaxFps(self.config.browser_max_fps);

@@ -54,7 +54,8 @@ Remaining gaps are listed at the bottom.
   `vendor/vtenc_shim.c` plus the VideoToolbox/CoreMedia/CoreVideo
   frameworks into the daemon and the GUI (`have_vtenc = native_macos`
   in build.zig, no option to pass), so a Mac daemon can produce video
-  tiles for a `-Dvideo` client without libx264. It only activates when
+  tiles for a client that negotiates `h264` (docs/app-video.md) without
+  libx264. It only activates when
   such a client attaches; `mux-portable` never carries it.
 - **Daemon process model** is the same as on Linux: the listening
   daemon is a broker that forks one worker per session over a
