@@ -66,7 +66,11 @@ depends=(
     'cef'
 )
 optdepends=(
-    'ffmpeg: video posters, media metadata, and cheap remote video previews (on the host serving the files)'
+    'ffmpeg: video posters, media metadata, cheap remote video previews (on the host serving the files), and decoding forwarded-app video streams (GUI)'
+    # Forwarded-app video streaming. All three are dlopen'd at runtime, so
+    # sketerm-mux keeps its libc-only ELF graph; absent = lossless frames.
+    'x264: H.264 encode of forwarded-app video streams (daemon)'
+    'svt-av1: AV1 encode of forwarded-app video streams (daemon)'
     'xorg-xwayland: X11 application support in external displays'
     'xwayland-satellite>=0.8.1: rootless X window management in external displays'
 )
@@ -74,6 +78,11 @@ makedepends=(
     'zig>=0.16.0'
     'zig<0.17.0'
     'ncurses'  # provides tic, the terminfo compiler
+    # Headers for the runtime-loaded video codec shims (-Dvideo is
+    # auto-detected from these; nothing links them).
+    'x264'
+    'svt-av1'
+    'ffmpeg'
 )
 provides=("$_pkgname")
 conflicts=("$_pkgname")

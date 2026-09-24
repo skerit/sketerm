@@ -1,37 +1,293 @@
 //! Video-tile codec layer — the LOSSY / temporal path for HOT regions
-//! (src/util/churn.zig decides which). Sibling of pixcodec (lossless):
-//! where pixcodec encodes a self-contained region, vcodec encodes a tile
-//! as an opaque, possibly inter-frame-predicted bitstream plus the
-//! framing a receiver needs to decode it and place it in the window
-//! backing buffer.
+//! of forwarded app windows (src/util/churn.zig + util/content.zig decide
+//! which). Sibling of pixcodec (lossless): where pixcodec encodes a
+//! self-contained region, vcodec encodes a surface as an opaque, possibly
+//! inter-frame-predicted bitstream plus the framing a receiver needs to
+//! decode it and place it in the window backing buffer.
 //!
-//! Step 1 (this file) ships ONLY a `stub` backend — raw BGRA passthrough,
-//! every tile a keyframe — so the entire transport → decode → composite
-//! path is testable with no real codec linked. x264 / AV1 / hardware
-//! backends slot behind the same `Encoder`/`Decoder` interface (the way
-//! winstream/source.zig swaps Stub for the SCK backend). Pure std,
-//! daemon-safe; the future C backends link via extern fn like zstd.
+//! Who runs what: the session daemon ENCODES (daemon.zig `videoCommit`,
+//! winstream/sck.zig on macOS) and the viewer DECODES (wlhost/compositor.zig
+//! `pool_vtile`, winapp.zig `win_vtile`). Backends:
+//!   - `.h264` encode: libx264 (vendor/x264_shim.c); VideoToolbox on a
+//!     native macOS toolchain (vendor/vtenc_shim.c), same wire codec.
+//!   - `.av1` encode: SVT-AV1 (vendor/svtav1_shim.c), low-delay.
+//!   - decode, both codecs: libavcodec (vendor/avdec_shim.c; AV1 through
+//!     libdav1d wherever ffmpeg has it).
+//!   - `.stub`: raw BGRA passthrough, always available, for tests.
+//!
+//! Every third-party codec library is RUNTIME-LOADED (`dlopen`, the
+//! opuscodec.zig pattern): `-Dvideo` compiles the shims against the
+//! headers only, so sketerm-mux keeps its libc-only ELF graph, and what a
+//! process can actually encode/decode is a runtime fact (`canEncode`,
+//! `canDecode`) that the mux handshake negotiates: the viewer lists the
+//! codecs it can decode (hello `video_codecs`, in its preference order),
+//! the daemon picks the first one it can encode that every viewer of the
+//! session shares (`negotiate`), and without a common codec the surface
+//! simply stays lossless. See docs/app-video.md.
 
 const std = @import("std");
 const build_options = @import("build_options");
 const yuv = @import("../util/yuv.zig");
+const platform = @import("../util/platform.zig");
 
-/// libx264 is linked (build_options.video). When false the x264 backend
-/// collapses to `void`, mirroring winstream/source.zig's SckImpl.
+/// The x264 + libavcodec shims are compiled in (build_options.video: the
+/// headers were found at build time). Says nothing about the RUNTIME:
+/// the libraries are dlopen'd on first use, see `canEncode`/`canDecode`.
 const have_video = build_options.video;
+/// The SVT-AV1 shim is compiled in (its headers were found too).
+const have_svt = build_options.video_av1enc;
 const X264Impl = if (have_video) X264 else void;
-const AvEncImpl = if (have_video) AvEnc else void;
+const SvtImpl = if (have_svt) Svt else void;
 const AvDecImpl = if (have_video) AvDec else void;
 
 /// VideoToolbox H.264 encoder (build_options.vtenc — native macOS only).
 /// The Mac-native encode path: hardware H.264 with NO libx264/libavcodec
-/// dependency, so the daemon can produce video tiles a `-Dvideo` client
-/// decodes (avdec) without the daemon itself linking the codec libs.
-/// Independent of `have_video`: a Mac daemon can have vtenc without video.
+/// dependency, a system framework. Independent of `have_video`: a Mac
+/// daemon can have vtenc without video.
 const have_vtenc = build_options.vtenc;
 const VtImpl = if (have_vtenc) Vt else void;
 
-/// Codec → the int the C shims use (avdec/avenc): 0 = H.264, 1 = AV1.
+// ─── runtime library loading ────────────────────────────────────
+
+extern fn sk_x264_build() c_int;
+extern fn sk_x264_bind(h: ?*anyopaque) c_int;
+extern fn sk_av_codec_major() c_int;
+extern fn sk_av_util_major() c_int;
+extern fn sk_av_bind(hcodec: ?*anyopaque, hutil: ?*anyopaque) c_int;
+extern fn sk_avdec_has(which: c_int) c_int;
+extern fn sk_svt_major() c_int;
+extern fn sk_svt_bind(h: ?*anyopaque) c_int;
+
+const Probe = enum { unknown, ok, missing };
+var x264_probe: Probe = .unknown;
+var av_probe: Probe = .unknown;
+var svt_probe: Probe = .unknown;
+
+/// dlopen the Linux soname or Darwin dylib spelling of a versioned
+/// library through platform.dlopenAny (which also knows the
+/// Homebrew/MacPorts prefixes). The major comes from the header the shim
+/// was compiled against, so a runtime of another ABI fails the open
+/// instead of being called with mismatched struct layouts.
+fn openVersioned(comptime linux_fmt: []const u8, comptime mac_fmt: []const u8, major: c_int) ?*anyopaque {
+    var a: [64]u8 = undefined;
+    var b: [64]u8 = undefined;
+    const n1 = std.fmt.bufPrintZ(&a, linux_fmt, .{major}) catch return null;
+    const n2 = std.fmt.bufPrintZ(&b, mac_fmt, .{major}) catch return null;
+    return platform.dlopenAny(&.{ n1.ptr, n2.ptr });
+}
+
+/// Test/diagnostic override: `SKETERM_VIDEO_DISABLE=h264,av1` (or `all`)
+/// makes this process behave as if those codecs were absent, so the
+/// negotiation and degrade-to-lossless paths are reachable on a host
+/// that has every library.
+fn disabledByEnv(codec: Codec) bool {
+    const raw = std.c.getenv("SKETERM_VIDEO_DISABLE") orelse return false;
+    var it = std.mem.tokenizeAny(u8, std.mem.span(raw), ", ");
+    while (it.next()) |tok| {
+        if (std.mem.eql(u8, tok, "all")) return true;
+        if (codecFromName(tok)) |named| {
+            if (named == codec) return true;
+        }
+    }
+    return false;
+}
+
+fn x264Loaded() bool {
+    if (comptime !have_video) return false;
+    if (x264_probe == .unknown) {
+        const h = openVersioned("libx264.so.{d}", "libx264.{d}.dylib", sk_x264_build());
+        x264_probe = if (h != null and sk_x264_bind(h) == 1) .ok else .missing;
+    }
+    return x264_probe == .ok;
+}
+
+fn avLoaded() bool {
+    if (comptime !have_video) return false;
+    if (av_probe == .unknown) {
+        const util = openVersioned("libavutil.so.{d}", "libavutil.{d}.dylib", sk_av_util_major());
+        const codec = openVersioned("libavcodec.so.{d}", "libavcodec.{d}.dylib", sk_av_codec_major());
+        av_probe = if (util != null and codec != null and sk_av_bind(codec, util) == 1) .ok else .missing;
+    }
+    return av_probe == .ok;
+}
+
+fn svtLoaded() bool {
+    if (comptime !have_svt) return false;
+    if (svt_probe == .unknown) {
+        const h = openVersioned("libSvtAv1Enc.so.{d}", "libSvtAv1Enc.{d}.dylib", sk_svt_major());
+        svt_probe = if (h != null and sk_svt_bind(h) == 1) .ok else .missing;
+    }
+    return svt_probe == .ok;
+}
+
+/// This process can ENCODE `codec` right now (library present + bound).
+/// The stub is deliberately not negotiable: it is a test backend.
+pub fn canEncode(codec: Codec) bool {
+    if (disabledByEnv(codec)) return false;
+    return switch (codec) {
+        .h264 => have_vtenc or x264Loaded(),
+        .av1 => svtLoaded(),
+        else => false,
+    };
+}
+
+/// This process can DECODE `codec` right now.
+pub fn canDecode(codec: Codec) bool {
+    if (comptime !have_video) return false;
+    if (disabledByEnv(codec)) return false;
+    return switch (codec) {
+        .h264, .av1 => avLoaded() and sk_avdec_has(shimCodec(codec)) == 1,
+        else => false,
+    };
+}
+
+// ─── negotiation ────────────────────────────────────────────────
+
+/// Every codec a peer may negotiate, in the DAEMON's default preference
+/// order: H.264 first (x264 ultrafast/zerolatency is the cheapest
+/// real-time encoder by far), AV1 second (royalty-free, smaller on the
+/// wire, several times the CPU). A viewer reorders it with its own list.
+pub const negotiable = [_]Codec{ .h264, .av1 };
+
+pub fn codecName(codec: Codec) []const u8 {
+    return switch (codec) {
+        .stub => "stub",
+        .h264 => "h264",
+        .av1 => "av1",
+        _ => "unknown",
+    };
+}
+
+pub fn codecFromName(name: []const u8) ?Codec {
+    inline for (negotiable) |cd| {
+        if (std.mem.eql(u8, name, codecName(cd))) return cd;
+    }
+    return null;
+}
+
+/// A small ordered set of codecs (preference order, no duplicates, no
+/// stub). What a hello carries, what a Client keeps, what the broker's
+/// handoff datagram ships.
+pub const CodecList = struct {
+    pub const cap = negotiable.len;
+    buf: [cap]Codec = undefined,
+    len: u8 = 0,
+
+    pub fn items(self: *const CodecList) []const Codec {
+        return self.buf[0..self.len];
+    }
+
+    pub fn contains(self: *const CodecList, codec: Codec) bool {
+        return std.mem.indexOfScalar(Codec, self.items(), codec) != null;
+    }
+
+    /// Append unless already present, not negotiable, or full.
+    pub fn add(self: *CodecList, codec: Codec) void {
+        if (self.contains(codec) or self.len >= cap) return;
+        if (std.mem.indexOfScalar(Codec, &negotiable, codec) == null) return;
+        self.buf[self.len] = codec;
+        self.len += 1;
+    }
+
+    /// A pre-negotiation peer's `video: bool`: every client that ever
+    /// sent `true` decoded H.264 (the only codec such a daemon encoded),
+    /// so the bool maps to exactly {h264} and never to AV1.
+    pub fn fromLegacy(video: bool) CodecList {
+        var l: CodecList = .{};
+        if (video) l.add(.h264);
+        return l;
+    }
+
+    /// Parse a hello's `video_codecs` names; unknown names (codecs a
+    /// newer peer knows) are skipped, never an error.
+    pub fn fromNames(names_in: []const []const u8) CodecList {
+        var l: CodecList = .{};
+        for (names_in) |n| {
+            if (codecFromName(n)) |cd| l.add(cd);
+        }
+        return l;
+    }
+
+    /// Names for a JSON array; `out` must hold `cap` entries.
+    pub fn names(self: *const CodecList, out: *[cap][]const u8) []const []const u8 {
+        for (self.items(), 0..) |cd, i| out[i] = codecName(cd);
+        return out[0..self.len];
+    }
+
+    /// Byte form for the broker->worker handoff: count, then codec ids.
+    pub const wire_size = 1 + cap;
+    pub fn encode(self: *const CodecList) [wire_size]u8 {
+        var out: [wire_size]u8 = @splat(0);
+        out[0] = self.len;
+        for (self.items(), 0..) |cd, i| out[1 + i] = @intFromEnum(cd);
+        return out;
+    }
+    pub fn decode(bytes: []const u8) CodecList {
+        var l: CodecList = .{};
+        if (bytes.len == 0) return l;
+        const n = @min(bytes[0], bytes.len - 1);
+        for (bytes[1 .. 1 + n]) |b| l.add(@enumFromInt(b));
+        return l;
+    }
+};
+
+/// What a user may ask for (config `app_video_codec`). `auto` offers
+/// every decodable codec in the daemon's default order; a named codec
+/// is offered FIRST with the others as fallbacks, so a daemon lacking
+/// it still streams video; `lossless` offers nothing.
+pub const Preference = enum { auto, h264, av1, lossless };
+
+/// The list a viewer puts in its hello: `decodable` filtered and
+/// ordered by the user's preference.
+pub fn offer(pref: Preference, decodable: CodecList) CodecList {
+    var l: CodecList = .{};
+    switch (pref) {
+        .lossless => return l,
+        .h264 => if (decodable.contains(.h264)) l.add(.h264),
+        .av1 => if (decodable.contains(.av1)) l.add(.av1),
+        .auto => {},
+    }
+    for (negotiable) |cd| {
+        if (decodable.contains(cd)) l.add(cd);
+    }
+    return l;
+}
+
+/// What this process can decode, in the default order.
+pub fn decodableHere() CodecList {
+    var l: CodecList = .{};
+    for (negotiable) |cd| {
+        if (canDecode(cd)) l.add(cd);
+    }
+    return l;
+}
+
+/// What this process can encode, in the default order.
+pub fn encodableHere() CodecList {
+    var l: CodecList = .{};
+    for (negotiable) |cd| {
+        if (canEncode(cd)) l.add(cd);
+    }
+    return l;
+}
+
+/// Daemon-side pick for one session: the first codec of the FIRST
+/// viewer's list that every viewer can decode and this daemon can
+/// encode. Null = stay lossless (no viewer, or no common codec): a
+/// tile one viewer cannot decode is a black window there.
+pub fn negotiate(viewers: []const CodecList, encodable: CodecList) ?Codec {
+    if (viewers.len == 0) return null;
+    outer: for (viewers[0].items()) |cd| {
+        if (!encodable.contains(cd)) continue;
+        for (viewers[1..]) |v| {
+            if (!v.contains(cd)) continue :outer;
+        }
+        return cd;
+    }
+    return null;
+}
+
+/// Codec → the int the avdec shim uses: 0 = H.264, 1 = AV1.
 fn shimCodec(codec: Codec) c_int {
     return switch (codec) {
         .av1 => 1,
@@ -128,23 +384,40 @@ pub const EncodeResult = struct { keyframe: bool, bytes: []const u8 };
 pub const Encoder = union(enum) {
     stub: Stub,
     x264: X264Impl,
-    av1: AvEncImpl,
+    av1: SvtImpl,
     vtoolbox: VtImpl,
 
     pub fn initStub(allocator: std.mem.Allocator) Encoder {
         return .{ .stub = .{ .allocator = allocator } };
     }
 
+    /// Open a fixed-size encoder for the NEGOTIATED `codec` — the one
+    /// entry point the daemon uses, so the codec is a runtime choice.
+    /// H.264 prefers libx264 and falls back to VideoToolbox (macOS).
+    /// Unsupported when no backend for `codec` is loadable here.
+    pub fn init(allocator: std.mem.Allocator, codec_: Codec, w: i32, h: i32, fps: i32) !Encoder {
+        if (!canEncode(codec_)) return Error.Unsupported;
+        return switch (codec_) {
+            .h264 => if (x264Loaded()) initX264(allocator, w, h, fps) else initVtoolbox(allocator, w, h, fps),
+            .av1 => initAv1(allocator, w, h, fps),
+            else => Error.Unsupported,
+        };
+    }
+
     /// Open a fixed-size H.264 encoder for `w`×`h` tiles. Errors with
-    /// Unsupported when libx264 isn't linked (build_options.video off).
+    /// Unsupported when libx264 is not compiled in or not loadable.
     pub fn initX264(allocator: std.mem.Allocator, w: i32, h: i32, fps: i32) !Encoder {
-        if (comptime have_video) return .{ .x264 = try X264.init(allocator, w, h, fps) };
+        if (comptime have_video) {
+            if (x264Loaded()) return .{ .x264 = try X264.init(allocator, w, h, fps) };
+        }
         return Error.Unsupported;
     }
 
-    /// Open a fixed-size AV1 encoder (libsvtav1 via libavcodec).
+    /// Open a fixed-size AV1 encoder (SVT-AV1, low delay).
     pub fn initAv1(allocator: std.mem.Allocator, w: i32, h: i32, fps: i32) !Encoder {
-        if (comptime have_video) return .{ .av1 = try AvEnc.init(allocator, w, h, fps, "libsvtav1") };
+        if (comptime have_svt) {
+            if (svtLoaded()) return .{ .av1 = try Svt.init(allocator, w, h, fps) };
+        }
         return Error.Unsupported;
     }
 
@@ -160,7 +433,7 @@ pub const Encoder = union(enum) {
         switch (self.*) {
             .stub => |*s| s.deinit(),
             .x264 => |*s| if (comptime have_video) s.deinit(),
-            .av1 => |*s| if (comptime have_video) s.deinit(),
+            .av1 => |*s| if (comptime have_svt) s.deinit(),
             .vtoolbox => |*s| if (comptime have_vtenc) s.deinit(),
         }
     }
@@ -182,7 +455,7 @@ pub const Encoder = union(enum) {
         return switch (self.*) {
             .stub => |*s| s.encodeTile(w, h, pixels, force_keyframe),
             .x264 => |*s| if (comptime have_video) s.encodeTile(w, h, pixels, force_keyframe) else Error.Unsupported,
-            .av1 => |*s| if (comptime have_video) s.encodeTile(w, h, pixels, force_keyframe) else Error.Unsupported,
+            .av1 => |*s| if (comptime have_svt) s.encodeTile(w, h, pixels, force_keyframe) else Error.Unsupported,
             .vtoolbox => |*s| if (comptime have_vtenc) s.encodeTile(w, h, pixels, force_keyframe) else Error.Unsupported,
         };
     }
@@ -302,9 +575,10 @@ const Vt = struct {
     }
 };
 
-/// libavcodec encoder backend (vendor/avenc_shim.c) — used for AV1
-/// (libsvtav1, low-delay). Same shape as X264; BGRA→I420 then encode.
-const AvEnc = struct {
+/// SVT-AV1 encoder backend (vendor/svtav1_shim.c), low-delay so a frame
+/// in is a packet out. Same shape as X264; BGRA→I420 then encode.
+/// Compiled only when build_options.video_av1enc is set.
+const Svt = struct {
     allocator: std.mem.Allocator,
     handle: ?*anyopaque,
     w: i32,
@@ -314,16 +588,16 @@ const AvEnc = struct {
     vp: []u8,
     out: std.ArrayList(u8) = .empty,
 
-    extern fn sk_avenc_open(codec_name: [*:0]const u8, width: c_int, height: c_int, fps: c_int) ?*anyopaque;
-    extern fn sk_avenc_encode(enc: ?*anyopaque, y: [*]const u8, u: [*]const u8, v: [*]const u8, force_kf: c_int, out: *[*]const u8, is_kf: *c_int) c_int;
-    extern fn sk_avenc_close(enc: ?*anyopaque) void;
+    extern fn sk_svt_open(width: c_int, height: c_int, fps: c_int) ?*anyopaque;
+    extern fn sk_svt_encode(enc: ?*anyopaque, y: [*]const u8, u: [*]const u8, v: [*]const u8, force_kf: c_int, out: *[*]const u8, is_kf: *c_int) c_int;
+    extern fn sk_svt_close(enc: ?*anyopaque) void;
 
-    fn init(allocator: std.mem.Allocator, w: i32, h: i32, fps: i32, codec_name: [*:0]const u8) !AvEnc {
+    fn init(allocator: std.mem.Allocator, w: i32, h: i32, fps: i32) !Svt {
         if (w <= 0 or h <= 0 or @rem(w, 2) != 0 or @rem(h, 2) != 0) return Error.SizeMismatch;
         const uw: u32 = @intCast(w);
         const uh: u32 = @intCast(h);
-        const handle = sk_avenc_open(codec_name, w, h, fps) orelse return Error.X264;
-        errdefer sk_avenc_close(handle);
+        const handle = sk_svt_open(w, h, fps) orelse return Error.X264;
+        errdefer sk_svt_close(handle);
         const yp = try allocator.alloc(u8, yuv.ySize(uw, uh));
         errdefer allocator.free(yp);
         const up = try allocator.alloc(u8, yuv.chromaSize(uw, uh));
@@ -332,15 +606,15 @@ const AvEnc = struct {
         return .{ .allocator = allocator, .handle = handle, .w = w, .h = h, .yp = yp, .up = up, .vp = vp };
     }
 
-    fn deinit(self: *AvEnc) void {
-        sk_avenc_close(self.handle);
+    fn deinit(self: *Svt) void {
+        sk_svt_close(self.handle);
         self.allocator.free(self.yp);
         self.allocator.free(self.up);
         self.allocator.free(self.vp);
         self.out.deinit(self.allocator);
     }
 
-    fn encodeTile(self: *AvEnc, w: i32, h: i32, pixels: []const u8, force_keyframe: bool) !EncodeResult {
+    fn encodeTile(self: *Svt, w: i32, h: i32, pixels: []const u8, force_keyframe: bool) !EncodeResult {
         if (w != self.w or h != self.h) return Error.SizeMismatch;
         const uw: u32 = @intCast(w);
         const uh: u32 = @intCast(h);
@@ -349,8 +623,8 @@ const AvEnc = struct {
 
         var out_ptr: [*]const u8 = undefined;
         var is_kf: c_int = 0;
-        const n = sk_avenc_encode(self.handle, self.yp.ptr, self.up.ptr, self.vp.ptr, if (force_keyframe) 1 else 0, &out_ptr, &is_kf);
-        if (n <= 0) return Error.X264; // 0 = encoder buffered (shouldn't with low-delay)
+        const n = sk_svt_encode(self.handle, self.yp.ptr, self.up.ptr, self.vp.ptr, if (force_keyframe) 1 else 0, &out_ptr, &is_kf);
+        if (n <= 0) return Error.X264; // 0 = no packet (low-delay get_packet blocks, so shouldn't happen)
         self.out.clearRetainingCapacity();
         try self.out.appendSlice(self.allocator, out_ptr[0..@intCast(n)]);
         return .{ .keyframe = is_kf != 0, .bytes = self.out.items };
@@ -388,9 +662,12 @@ pub const Decoder = union(enum) {
     }
 
     /// Open a fixed-size software decoder (libavcodec) for `w`×`h` tiles
-    /// of `codec` (.h264 or .av1). Errors Unsupported without -Dvideo.
+    /// of `codec` (.h264 or .av1). Errors Unsupported without -Dvideo or
+    /// when libavcodec (or its decoder for `codec`) is not loadable here.
     pub fn initAvcodec(allocator: std.mem.Allocator, w: i32, h: i32, codec: Codec) !Decoder {
-        if (comptime have_video) return .{ .avcodec = try AvDec.init(allocator, w, h, codec) };
+        if (comptime have_video) {
+            if (canDecode(codec)) return .{ .avcodec = try AvDec.init(allocator, w, h, codec) };
+        }
         return Error.Unsupported;
     }
 
@@ -429,8 +706,8 @@ pub const Decoder = union(enum) {
     };
 };
 
-/// libavcodec H.264 software decoder via vendor/avdec_shim.c. Fixed tile
-/// geometry; decodes an Annex-B tile to I420 then yuv.zig → BGRA. The
+/// libavcodec software decoder (H.264 or AV1) via vendor/avdec_shim.c.
+/// Fixed tile geometry; decodes a tile to I420 then yuv.zig → BGRA. The
 /// daemon never instantiates this (it encodes); it's the GUI/compositor
 /// receive path. Compiled only when build_options.video is set.
 const AvDec = struct {
@@ -623,8 +900,8 @@ test "stub encoder rejects a pixel buffer that isn't w*h*4" {
     try t.expectError(Error.SizeMismatch, enc.encodeTile(2, 2, &px, true)); // needs 16
 }
 
-test "x264 backend encodes a keyframe Annex-B stream (when libx264 linked)" {
-    if (!have_video) return error.SkipZigTest;
+test "x264 backend encodes a keyframe Annex-B stream (when libx264 loads)" {
+    if (!x264Loaded()) return error.SkipZigTest;
     var enc = try Encoder.initX264(t.allocator, TILE, TILE, 30);
     defer enc.deinit();
     try t.expectEqual(Codec.h264, enc.codec());
@@ -645,8 +922,8 @@ test "x264 backend encodes a keyframe Annex-B stream (when libx264 linked)" {
     try t.expectError(Error.SizeMismatch, enc.encodeTile(32, 32, &px, false));
 }
 
-test "x264 encode → avcodec decode round-trips a frame (-Dvideo)" {
-    if (!have_video) return error.SkipZigTest;
+test "x264 encode → avcodec decode round-trips a frame (when both load)" {
+    if (!x264Loaded() or !canDecode(.h264)) return error.SkipZigTest;
     var enc = try Encoder.initX264(t.allocator, TILE, TILE, 30);
     defer enc.deinit();
     var dec = try Decoder.initAvcodec(t.allocator, TILE, TILE, .h264);
@@ -706,8 +983,8 @@ test "VideoToolbox encode → avcodec decode round-trips a frame (vtenc + -Dvide
     try t.expect(try rgbMae(&px, &dst, true) < 15.0);
 }
 
-test "AV1 (libsvtav1) encode → avcodec decode round-trips a frame (-Dvideo)" {
-    if (!have_video) return error.SkipZigTest;
+test "AV1 (SVT-AV1) encode → avcodec decode round-trips frames (when both load)" {
+    if (!canEncode(.av1) or !canDecode(.av1)) return error.SkipZigTest;
     var enc = try Encoder.initAv1(t.allocator, TILE, TILE, 30);
     defer enc.deinit();
     var dec = try Decoder.initAvcodec(t.allocator, TILE, TILE, .av1);
@@ -723,4 +1000,82 @@ test "AV1 (libsvtav1) encode → avcodec decode round-trips a frame (-Dvideo)" {
     try dec.decodeTile(wholeTile(enc.codec(), r), &dst);
     // AV1 4:2:0 lossy; grayscale stays close.
     try t.expect(try rgbMae(&px, &dst, false) < 20.0);
+
+    // Inter frames: low delay means every frame in is a packet out, and
+    // each decodes immediately (the tile stream has no reorder buffer).
+    for (0..4) |i| {
+        for (&px) |*b| b.* +%= @intCast(i + 1);
+        const ri = try enc.encodeTile(TILE, TILE, &px, false);
+        try t.expect(ri.bytes.len > 0);
+        try dec.decodeTile(wholeTile(enc.codec(), ri), &dst);
+    }
+}
+
+test "Encoder.init picks the backend of the negotiated codec" {
+    try t.expectError(Error.Unsupported, Encoder.init(t.allocator, .stub, TILE, TILE, 30));
+    inline for (negotiable) |cd| {
+        if (canEncode(cd)) {
+            var enc = try Encoder.init(t.allocator, cd, TILE, TILE, 30);
+            defer enc.deinit();
+            try t.expectEqual(cd, enc.codec());
+        } else {
+            try t.expectError(Error.Unsupported, Encoder.init(t.allocator, cd, TILE, TILE, 30));
+        }
+    }
+}
+
+fn listOf(codecs: []const Codec) CodecList {
+    var l: CodecList = .{};
+    for (codecs) |cd| l.add(cd);
+    return l;
+}
+
+test "an old viewer's video bool negotiates H.264 and never AV1" {
+    const both = listOf(&.{ .av1, .h264 });
+    // A pre-negotiation GUI that sent `video: true` gets x264 even from
+    // a daemon that could (and a new viewer would) prefer AV1.
+    try t.expectEqual(@as(?Codec, .h264), negotiate(&.{CodecList.fromLegacy(true)}, both));
+    try t.expectEqual(@as(?Codec, null), negotiate(&.{CodecList.fromLegacy(false)}, both));
+    // A daemon without x264 has nothing an old viewer can decode.
+    try t.expectEqual(@as(?Codec, null), negotiate(&.{CodecList.fromLegacy(true)}, listOf(&.{.av1})));
+}
+
+test "negotiate honours the first viewer's order within the common set" {
+    const enc = listOf(&.{ .h264, .av1 });
+    try t.expectEqual(@as(?Codec, .av1), negotiate(&.{listOf(&.{ .av1, .h264 })}, enc));
+    try t.expectEqual(@as(?Codec, .h264), negotiate(&.{listOf(&.{ .h264, .av1 })}, enc));
+    // Every viewer must decode the pick: an old (h264-only) viewer
+    // joining an AV1-preferring one moves the session to H.264.
+    try t.expectEqual(@as(?Codec, .h264), negotiate(&.{ listOf(&.{ .av1, .h264 }), CodecList.fromLegacy(true) }, enc));
+    // No common codec → lossless.
+    try t.expectEqual(@as(?Codec, null), negotiate(&.{ listOf(&.{.av1}), listOf(&.{.h264}) }, enc));
+    // Daemon cannot encode the viewer's only codec → lossless.
+    try t.expectEqual(@as(?Codec, null), negotiate(&.{listOf(&.{.av1})}, listOf(&.{.h264})));
+    try t.expectEqual(@as(?Codec, null), negotiate(&.{}, enc));
+}
+
+test "codec lists parse names, skip unknowns and round-trip the handoff bytes" {
+    const names_in = [_][]const u8{ "vp9", "av1", "stub", "h264", "av1" };
+    const l = CodecList.fromNames(&names_in);
+    try t.expectEqualSlices(Codec, &.{ .av1, .h264 }, l.items());
+    var nb: [CodecList.cap][]const u8 = undefined;
+    const out = l.names(&nb);
+    try t.expectEqual(@as(usize, 2), out.len);
+    try t.expectEqualStrings("av1", out[0]);
+    const bytes = l.encode();
+    try t.expectEqualSlices(Codec, l.items(), CodecList.decode(&bytes).items());
+    // Truncated / garbage-tolerant.
+    try t.expectEqual(@as(u8, 0), CodecList.decode(&.{}).len);
+    try t.expectEqual(@as(u8, 1), CodecList.decode(&.{ 5, 2 }).len);
+    try t.expectEqual(@as(u8, 0), CodecList.decode(&.{ 1, 0 }).len); // stub is never negotiable
+}
+
+test "offer applies the user's preference to what this viewer decodes" {
+    const both = listOf(&.{ .h264, .av1 });
+    try t.expectEqualSlices(Codec, &.{ .h264, .av1 }, offer(.auto, both).items());
+    try t.expectEqualSlices(Codec, &.{ .av1, .h264 }, offer(.av1, both).items());
+    try t.expectEqualSlices(Codec, &.{ .h264, .av1 }, offer(.h264, both).items());
+    try t.expectEqual(@as(u8, 0), offer(.lossless, both).len);
+    // Preferring a codec this viewer cannot decode never offers it.
+    try t.expectEqualSlices(Codec, &.{.h264}, offer(.av1, listOf(&.{.h264})).items());
 }

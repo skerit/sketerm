@@ -216,6 +216,12 @@ DEB_BUILD_DEPS_MUX=(build-essential pkg-config ncurses-bin libfribidi-dev)
 # fail the whole install there. probe_layer_shell decides what the build
 # then gets.
 DEB_BUILD_DEPS_OPTIONAL=(libgtk4-layer-shell-dev)
+# Headers for forwarded-app video streaming (x264/SVT-AV1 encode in the
+# daemon, libavcodec decode in the GUI). The libraries are dlopen'd at
+# runtime, never linked; without the headers `zig build` auto-detects
+# -Dvideo off and says so, and apps forward losslessly. Optional for both
+# the GUI and the mux-only package, since the daemon is the encoder.
+DEB_BUILD_DEPS_VIDEO=(libx264-dev libavcodec-dev libavutil-dev libsvtav1enc-dev)
 
 install_deb_deps_optional() {
     local -n list=$1
@@ -354,7 +360,7 @@ do_debian() {
         if [ "$kind" = gui ]; then
             echo "Recommends: libopus0, libglycin-2-0, glycin-loaders, gstreamer1.0-plugins-good, gstreamer1.0-libav, gstreamer1.0-pipewire, ffmpeg"
         else
-            echo "Recommends: libopus0"
+            echo "Recommends: libopus0, ffmpeg"
         fi
         echo "Suggests: libtesseract-dev"
         echo "Homepage: https://github.com/skerit/sketerm"
@@ -560,6 +566,7 @@ if command -v dpkg-deb >/dev/null 2>&1; then
             install_deb_deps DEB_BUILD_DEPS
             install_deb_deps_optional DEB_BUILD_DEPS_OPTIONAL
         fi
+        install_deb_deps_optional DEB_BUILD_DEPS_VIDEO
     fi
     select_kind
     build_all "$kind" "$package_arch"

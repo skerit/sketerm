@@ -33,7 +33,6 @@ package="$work/package"
 vendor_entries=(
     aro_shims
     avdec_shim.c
-    avenc_shim.c
     cef_root.h
     cimport_core.h
     cimport_root.h
@@ -42,6 +41,7 @@ vendor_entries=(
     stb_image_impl.c
     stb_image_write.h
     stb_image.h
+    svtav1_shim.c
     tree-sitter
     vpxenc_shim.c
     vtenc_shim.c

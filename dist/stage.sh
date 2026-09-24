@@ -145,7 +145,9 @@ sketerm_build() {
             gui_flags+=(-Dlayer-shell=false)
             sketerm_warn "gtk4-layer-shell development files missing; quake_edge and quake_monitor fall back to xdg-toplevel placement (install libgtk4-layer-shell-dev for wlr-layer-shell placement)"
         fi
-        # Normal builds runtime-load Opus automatically.
+        # Normal builds runtime-load Opus automatically, and the forwarded-app
+        # video codecs when their headers are present (-Dvideo auto-detects
+        # and prints a note when it turns itself off).
         sketerm_say "building GUI + daemon"
         zig build -Doptimize=ReleaseFast ${gui_flags[@]+"${gui_flags[@]}"}
         if [ "$web_ok" -eq 1 ]; then
@@ -167,7 +169,7 @@ sketerm_build() {
         zig build mux -Doptimize=ReleaseFast
     fi
 
-    # The portable daemon compiles the Opus probe out and stays
+    # The portable daemon compiles the Opus and video probes out and stays
     # static/codec-free by design; it is what gets scp'd to servers.
     if [ -n "$portable_target" ]; then
         zig build mux-portable -Doptimize=ReleaseFast \

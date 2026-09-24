@@ -86,12 +86,20 @@ pub fn build(b: *std.Build) void {
     // Same condition, named for the NSAccessibility bridge (a11y/nsax*):
     // its ObjC shim only builds on a native macOS toolchain.
     const native_macos = native_sck;
-    // Software H.264 (libx264) for the lossy video-tile path. Dynamically
-    // linked on native builds when present (declared a package dep, like
-    // gtk4); the musl-portable daemon never gets it and falls back to
-    // lossless. Auto-detected so the default `zig build`/`test` exercises
-    // it wherever x264 is installed; `-Dvideo=false` forces it off.
-    const have_x264 = b.option(bool, "video", "H.264 video-tile codec via libx264 — requires libx264 (default off)") orelse false;
+    // Lossy video streaming for forwarded app windows (wlhost/vcodec.zig):
+    // x264 + SVT-AV1 encode in the daemon, libavcodec decode in the GUI.
+    // The codec libraries are RUNTIME-LOADED (dlopen), never linked, so
+    // this only needs their HEADERS at build time; sketerm-mux keeps its
+    // libc-only ELF graph and a host without the libraries negotiates
+    // lossless. The default is AUTO-DETECTED here, at configure time
+    // (build_options must be known before the graph exists; the third
+    // deliberate eager probe after the two fribidi ones): on when
+    // pkg-config finds x264 + libavcodec + libavutil, with AV1 encode
+    // additionally needing SvtAv1Enc. `-Dvideo=false` forces it off;
+    // `-Dvideo=true` fails the build when the headers are missing. The
+    // musl-portable daemon never has it (lossless only).
+    const video = configureVideo(b, target, optimize);
+    video_cfg = video;
     // VideoToolbox H.264 encoder — the Mac-native video-tile encode path
     // (no libx264/libavcodec needed; a system framework). Auto-on for a
     // native macOS toolchain so the daemon can produce tiles a -Dvideo
@@ -118,7 +126,8 @@ pub fn build(b: *std.Build) void {
     glib_opts.addOption([]const u8, "commit", git_commit);
     glib_opts.addOption([]const u8, "commit_date", git_date);
     glib_opts.addOption(bool, "winstream_sck", native_sck);
-    glib_opts.addOption(bool, "video", have_x264);
+    glib_opts.addOption(bool, "video", video.enabled);
+    glib_opts.addOption(bool, "video_av1enc", video.av1enc);
     glib_opts.addOption(bool, "vtenc", have_vtenc);
     glib_opts.addOption(bool, "audio_opus", have_opus);
     glib_opts.addOption(bool, "dmabuf_import", have_dmabuf_import);
@@ -129,7 +138,8 @@ pub fn build(b: *std.Build) void {
     noglib_opts.addOption([]const u8, "commit", git_commit);
     noglib_opts.addOption([]const u8, "commit_date", git_date);
     noglib_opts.addOption(bool, "winstream_sck", native_sck);
-    noglib_opts.addOption(bool, "video", have_x264);
+    noglib_opts.addOption(bool, "video", video.enabled);
+    noglib_opts.addOption(bool, "video_av1enc", video.av1enc);
     noglib_opts.addOption(bool, "vtenc", have_vtenc);
     noglib_opts.addOption(bool, "audio_opus", have_opus);
     noglib_opts.addOption(bool, "dmabuf_import", have_dmabuf_import);
@@ -149,12 +159,12 @@ pub fn build(b: *std.Build) void {
     });
     configureSysDeps(b, exe_mod, cbindings_mod);
     exe_mod.addImport("build_options", glib_opts_mod);
+    addVideo(b, exe_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
     // NSAccessibility bridge (live on macOS: GTK4 has no NSAccessibility
     // backend, so every pane hangs an element on the window's content
     // view through a11y/nsax.zig). main.zig force-includes nsax.zig on
     // macOS so its export callbacks are present for the shim to resolve.
     if (native_macos) addNsaxBridge(b, exe_mod);
-    if (have_x264) addVideo(b, exe_mod); // GUI-side H.264 decode (-Dvideo)
     if (have_vtenc) addVtEnc(b, exe_mod); // VideoToolbox H.264 encode (macOS)
     addTreeSitter(b, exe_mod, tree_sitter); // editor syntax highlighting (GUI only)
 
@@ -205,8 +215,8 @@ pub fn build(b: *std.Build) void {
     });
     configureCoreDeps(b, mux_mod, core_cbindings_mod);
     mux_mod.addImport("build_options", noglib_opts_mod);
+    addVideo(b, mux_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
     if (native_sck) addSckBackend(b, mux_mod);
-    if (have_x264) addVideo(b, mux_mod); // daemon-side x264 encode (-Dvideo)
     if (have_vtenc) addVtEnc(b, mux_mod); // daemon-side VideoToolbox encode (macOS)
     const mux_exe = b.addExecutable(.{
         .name = "sketerm-mux",
@@ -234,6 +244,7 @@ pub fn build(b: *std.Build) void {
     });
     configureCoreDeps(b, mux_client_mod, core_cbindings_mod);
     mux_client_mod.addImport("build_options", noglib_opts_mod);
+    addVideo(b, mux_client_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
 
     const mux_client_check_mod = b.createModule(.{
         .root_source_file = b.path("src/mux_client_check.zig"),
@@ -318,6 +329,7 @@ pub fn build(b: *std.Build) void {
     portable_opts.addOption([]const u8, "commit_date", git_date);
     portable_opts.addOption(bool, "winstream_sck", false);
     portable_opts.addOption(bool, "video", false);
+    portable_opts.addOption(bool, "video_av1enc", false);
     portable_opts.addOption(bool, "vtenc", false);
     portable_opts.addOption(bool, "audio_opus", false);
     portable_opts.addOption(bool, "dmabuf_import", false);
@@ -346,8 +358,8 @@ pub fn build(b: *std.Build) void {
     });
     configureCoreDeps(b, smoke_mux_mod, core_cbindings_mod);
     smoke_mux_mod.addImport("build_options", noglib_opts_mod);
+    addVideo(b, smoke_mux_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
     if (native_sck) addSckBackend(b, smoke_mux_mod);
-    if (have_x264) addVideo(b, smoke_mux_mod);
     if (have_vtenc) addVtEnc(b, smoke_mux_mod);
     const smoke_mux = b.addExecutable(.{
         .name = "sketerm-smoke-mux",
@@ -372,8 +384,8 @@ pub fn build(b: *std.Build) void {
     });
     configureCoreDeps(b, smoke_udp_mod, core_cbindings_mod);
     smoke_udp_mod.addImport("build_options", noglib_opts_mod);
+    addVideo(b, smoke_udp_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
     if (native_sck) addSckBackend(b, smoke_udp_mod);
-    if (have_x264) addVideo(b, smoke_udp_mod);
     if (have_vtenc) addVtEnc(b, smoke_udp_mod);
     const smoke_udp = b.addExecutable(.{
         .name = "sketerm-smoke-udp",
@@ -398,8 +410,8 @@ pub fn build(b: *std.Build) void {
     });
     configureCoreDeps(b, smoke_foreign_mod, core_cbindings_mod);
     smoke_foreign_mod.addImport("build_options", noglib_opts_mod);
+    addVideo(b, smoke_foreign_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
     if (native_sck) addSckBackend(b, smoke_foreign_mod);
-    if (have_x264) addVideo(b, smoke_foreign_mod);
     if (have_vtenc) addVtEnc(b, smoke_foreign_mod);
     const smoke_foreign = b.addExecutable(.{
         .name = "sketerm-smoke-foreign",
@@ -421,8 +433,8 @@ pub fn build(b: *std.Build) void {
     });
     configureCoreDeps(b, smoke_fs_mod, core_cbindings_mod);
     smoke_fs_mod.addImport("build_options", noglib_opts_mod);
+    addVideo(b, smoke_fs_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
     if (native_sck) addSckBackend(b, smoke_fs_mod);
-    if (have_x264) addVideo(b, smoke_fs_mod);
     if (have_vtenc) addVtEnc(b, smoke_fs_mod);
     const smoke_fs = b.addExecutable(.{
         .name = "sketerm-smoke-fs",
@@ -444,8 +456,8 @@ pub fn build(b: *std.Build) void {
     });
     configureCoreDeps(b, smoke_fuse_mod, core_cbindings_mod);
     smoke_fuse_mod.addImport("build_options", noglib_opts_mod);
+    addVideo(b, smoke_fuse_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
     if (native_sck) addSckBackend(b, smoke_fuse_mod);
-    if (have_x264) addVideo(b, smoke_fuse_mod);
     if (have_vtenc) addVtEnc(b, smoke_fuse_mod);
     const smoke_fuse = b.addExecutable(.{
         .name = "sketerm-smoke-fuse",
@@ -467,8 +479,8 @@ pub fn build(b: *std.Build) void {
     });
     configureCoreDeps(b, smoke_mcp_mod, core_cbindings_mod);
     smoke_mcp_mod.addImport("build_options", noglib_opts_mod);
+    addVideo(b, smoke_mcp_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
     if (native_sck) addSckBackend(b, smoke_mcp_mod);
-    if (have_x264) addVideo(b, smoke_mcp_mod);
     if (have_vtenc) addVtEnc(b, smoke_mcp_mod);
     const smoke_mcp = b.addExecutable(.{
         .name = "sketerm-smoke-mcp",
@@ -491,8 +503,8 @@ pub fn build(b: *std.Build) void {
     });
     configureCoreDeps(b, smoke_broker_mod, core_cbindings_mod);
     smoke_broker_mod.addImport("build_options", noglib_opts_mod);
+    addVideo(b, smoke_broker_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
     if (native_sck) addSckBackend(b, smoke_broker_mod);
-    if (have_x264) addVideo(b, smoke_broker_mod);
     if (have_vtenc) addVtEnc(b, smoke_broker_mod);
     const smoke_broker = b.addExecutable(.{
         .name = "sketerm-smoke-broker",
@@ -514,6 +526,7 @@ pub fn build(b: *std.Build) void {
     });
     configureSysDeps(b, replay_mod, cbindings_mod);
     replay_mod.addImport("build_options", glib_opts_mod);
+    addVideo(b, replay_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
     const replay = b.addExecutable(.{
         .name = "sketerm-replay",
         .root_module = replay_mod,
@@ -533,6 +546,7 @@ pub fn build(b: *std.Build) void {
     });
     configureSysDeps(b, bench_mod, cbindings_mod);
     bench_mod.addImport("build_options", glib_opts_mod);
+    addVideo(b, bench_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
     const bench = b.addExecutable(.{
         .name = "sketerm-bench-parser",
         .root_module = bench_mod,
@@ -553,6 +567,7 @@ pub fn build(b: *std.Build) void {
     });
     configureCoreDeps(b, bench_ed_mod, core_cbindings_mod);
     bench_ed_mod.addImport("build_options", noglib_opts_mod);
+    addVideo(b, bench_ed_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
     const bench_ed = b.addExecutable(.{
         .name = "sketerm-bench-editor",
         .root_module = bench_ed_mod,
@@ -583,6 +598,7 @@ pub fn build(b: *std.Build) void {
     // exe.
     configureSysDeps(b, smoke_mod, cbindings_mod);
     smoke_mod.addImport("build_options", glib_opts_mod);
+    addVideo(b, smoke_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
     smoke_mod.linkSystemLibrary("EGL", .{});
     const smoke = b.addExecutable(.{
         .name = "sketerm-smoke-image",
@@ -608,6 +624,7 @@ pub fn build(b: *std.Build) void {
     });
     configureSysDeps(b, smoke_e2e_mod, cbindings_mod);
     smoke_e2e_mod.addImport("build_options", glib_opts_mod);
+    addVideo(b, smoke_e2e_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
     const smoke_e2e = b.addExecutable(.{
         .name = "sketerm-smoke-e2e",
         .root_module = smoke_e2e_mod,
@@ -632,6 +649,7 @@ pub fn build(b: *std.Build) void {
     });
     configureSysDeps(b, smoke_stream_mod, cbindings_mod);
     smoke_stream_mod.addImport("build_options", glib_opts_mod);
+    addVideo(b, smoke_stream_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
     const smoke_stream = b.addExecutable(.{
         .name = "sketerm-smoke-stream",
         .root_module = smoke_stream_mod,
@@ -653,6 +671,7 @@ pub fn build(b: *std.Build) void {
         });
         configureSysDeps(b, wm_mod, cbindings_mod);
         wm_mod.addImport("build_options", glib_opts_mod);
+        addVideo(b, wm_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
         const wm = b.addExecutable(.{
             .name = "sketerm-web-measure",
             .root_module = wm_mod,
@@ -681,6 +700,7 @@ pub fn build(b: *std.Build) void {
     });
     configureSysDeps(b, smoke_lsp_mod, cbindings_mod);
     smoke_lsp_mod.addImport("build_options", glib_opts_mod);
+    addVideo(b, smoke_lsp_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
     const smoke_lsp = b.addExecutable(.{
         .name = "sketerm-smoke-lsp-gui",
         .root_module = smoke_lsp_mod,
@@ -710,6 +730,7 @@ pub fn build(b: *std.Build) void {
         });
         configureSysDeps(b, smoke_atspi_mod, cbindings_mod);
         smoke_atspi_mod.addImport("build_options", glib_opts_mod);
+        addVideo(b, smoke_atspi_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
         const smoke_atspi = b.addExecutable(.{
             .name = "sketerm-smoke-atspi",
             .root_module = smoke_atspi_mod,
@@ -738,6 +759,7 @@ pub fn build(b: *std.Build) void {
         });
         configureSysDeps(b, smoke_webax_mod, cbindings_mod);
         smoke_webax_mod.addImport("build_options", glib_opts_mod);
+        addVideo(b, smoke_webax_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
         const smoke_webax = b.addExecutable(.{
             .name = "sketerm-smoke-webax",
             .root_module = smoke_webax_mod,
@@ -763,6 +785,7 @@ pub fn build(b: *std.Build) void {
         });
         configureSysDeps(b, smoke_a11y_mod, cbindings_mod);
         smoke_a11y_mod.addImport("build_options", glib_opts_mod);
+        addVideo(b, smoke_a11y_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
         addNsaxBridge(b, smoke_a11y_mod);
         smoke_a11y_mod.addCSourceFile(.{
             .file = b.path("src/a11y/nsax_probe.m"),
@@ -792,6 +815,7 @@ pub fn build(b: *std.Build) void {
     });
     configureSysDeps(b, smoke_cell_mod, cbindings_mod);
     smoke_cell_mod.addImport("build_options", glib_opts_mod);
+    addVideo(b, smoke_cell_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
     smoke_cell_mod.linkSystemLibrary("EGL", .{});
     // The shipped CRT shader, embedded so the smoke test compiles
     // and runs the REAL file (data/ is outside the module root).
@@ -833,6 +857,7 @@ pub fn build(b: *std.Build) void {
     });
     configureSysDeps(b, bench_cell_mod, cbindings_mod);
     bench_cell_mod.addImport("build_options", glib_opts_mod);
+    addVideo(b, bench_cell_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
     bench_cell_mod.linkSystemLibrary("EGL", .{});
     const bench_cell = b.addExecutable(.{
         .name = "sketerm-bench-cell-upload",
@@ -857,6 +882,7 @@ pub fn build(b: *std.Build) void {
     });
     configureSysDeps(b, smoke_trans_mod, cbindings_mod);
     smoke_trans_mod.addImport("build_options", glib_opts_mod);
+    addVideo(b, smoke_trans_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
     smoke_trans_mod.linkSystemLibrary("EGL", .{});
     const smoke_trans = b.addExecutable(.{
         .name = "sketerm-smoke-transparency",
@@ -881,6 +907,7 @@ pub fn build(b: *std.Build) void {
     });
     configureCoreDeps(b, lsp_stub_mod, core_cbindings_mod);
     lsp_stub_mod.addImport("build_options", noglib_opts_mod);
+    addVideo(b, lsp_stub_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
     const lsp_stub = b.addExecutable(.{
         .name = "sketerm-lsp-stub",
         .root_module = lsp_stub_mod,
@@ -905,6 +932,7 @@ pub fn build(b: *std.Build) void {
     });
     configureSysDeps(b, smoke_editor_mod, cbindings_mod);
     smoke_editor_mod.addImport("build_options", glib_opts_mod);
+    addVideo(b, smoke_editor_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
     smoke_editor_mod.linkSystemLibrary("EGL", .{});
     addTreeSitter(b, smoke_editor_mod, tree_sitter);
     const smoke_editor = b.addExecutable(.{
@@ -932,6 +960,7 @@ pub fn build(b: *std.Build) void {
     });
     configureSysDeps(b, smoke_core_mod, cbindings_mod);
     smoke_core_mod.addImport("build_options", glib_opts_mod);
+    addVideo(b, smoke_core_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
     smoke_core_mod.linkSystemLibrary("EGL", .{});
     smoke_core_mod.addAnonymousImport("crt_glsl", .{
         .root_source_file = b.path("data/shaders/crt.glsl"),
@@ -954,13 +983,13 @@ pub fn build(b: *std.Build) void {
     });
     configureSysDeps(b, tests_mod, cbindings_mod);
     tests_mod.addImport("build_options", glib_opts_mod);
+    addVideo(b, tests_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
     if (native_sck) addSckBackend(b, tests_mod);
     // Link the NSAccessibility shim so `zig build test` compiles AND
     // links the macOS a11y bridge end-to-end (tests.zig imports nsax.zig).
     if (native_macos) addNsaxBridge(b, tests_mod);
     // libx264 + shim so `zig build test` compiles AND exercises the
     // vcodec x264 backend wherever x264 is installed.
-    if (have_x264) addVideo(b, tests_mod);
     if (have_vtenc) addVtEnc(b, tests_mod);
     addTreeSitter(b, tests_mod, tree_sitter);
     // docs/ is outside the source module root; drift tests that check a
@@ -1042,8 +1071,8 @@ pub fn build(b: *std.Build) void {
     });
     configureCoreDeps(b, coretests_mod, core_cbindings_mod);
     coretests_mod.addImport("build_options", noglib_opts_mod);
+    addVideo(b, coretests_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
     if (native_sck) addSckBackend(b, coretests_mod);
-    if (have_x264) addVideo(b, coretests_mod);
     if (have_vtenc) addVtEnc(b, coretests_mod);
     // test-core covers src/editor/syntax.zig, which is GTK-free but
     // tree-sitter-backed. This is the ONLY non-GUI module that gets the
@@ -1940,24 +1969,66 @@ fn addTreeSitter(b: *std.Build, mod: *std.Build.Module, ts: TreeSitter) void {
     }
 }
 
-/// libx264 + the C shim (vendor/x264_shim.c) for the lossy video path.
-/// Dynamically links the SYSTEM x264 (declared a package dep) rather
-/// than vendoring it — x264's speed lives in per-arch asm, so a vendored
-/// C-only build would be too slow, and the optional video path can be
-/// absent on the portable binary (→ lossless). Gated on build_options.video.
-fn addVideo(b: *std.Build, mod: *std.Build.Module) void {
-    // Encode: libx264 + shim. Decode: libavcodec/avutil + shim. Both
-    // link into any artifact under -Dvideo; the encoder is referenced
-    // only daemon-side and the decoder only GUI-side, so the "other"
-    // library is dead weight there — fine on native builds (it's the
-    // portable musl daemon that stays codec-free).
-    addPkgConfig(b, mod, "x264");
-    addPkgConfig(b, mod, "libavcodec");
-    addPkgConfig(b, mod, "libavutil");
+/// The video-tile codec configuration `configureVideo` resolved.
+const VideoCfg = struct {
+    /// x264 + libavcodec shims compiled (build_options.video).
+    enabled: bool = false,
+    /// SVT-AV1 shim compiled too (build_options.video_av1enc).
+    av1enc: bool = false,
+    /// The shims as one static library, linked into every module that
+    /// sees build_options (unreferenced archive members cost nothing).
+    lib: ?*std.Build.Step.Compile = null,
+};
+var video_cfg: VideoCfg = .{};
+
+fn pkgConfigExists(b: *std.Build, pkgs: []const []const u8) bool {
+    var argv: std.ArrayList([]const u8) = .empty;
+    argv.appendSlice(b.allocator, &.{ "pkg-config", "--exists" }) catch return false;
+    argv.appendSlice(b.allocator, pkgs) catch return false;
+    var code: u8 = undefined; // written only on a nonzero exit
+    _ = b.runAllowFail(argv.items, &code, .ignore) catch return false;
+    return true;
+}
+
+/// Resolve `-Dvideo` (auto-detected by default, see the call site) and
+/// build the shim library. The shims are compiled against the codec
+/// HEADERS only: every library call goes through dlsym'd pointers
+/// (vendor/*_shim.c), so no artifact gains an ELF dependency on x264,
+/// SVT-AV1 or ffmpeg; wlhost/vcodec.zig dlopens them at runtime.
+fn configureVideo(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) VideoCfg {
+    const requested = b.option(bool, "video", "Lossy video streaming for forwarded apps: x264/SVT-AV1 encode + libavcodec decode, runtime-loaded (default: auto-detected from pkg-config headers)");
+    const host = b.graph.host.result;
+    // Host headers describe host libraries: only probe for native builds.
+    const native = target.result.os.tag == host.os.tag and target.result.cpu.arch == host.cpu.arch;
+    const base_pkgs = [_][]const u8{ "x264", "libavcodec", "libavutil" };
+    if (requested == false) return .{};
+    const found = native and pkgConfigExists(b, &base_pkgs);
+    if (!found) {
+        if (requested == true) {
+            std.debug.print("error: -Dvideo=true, but pkg-config cannot find x264, libavcodec and libavutil development headers (install x264 + ffmpeg headers, or drop -Dvideo)\n", .{});
+            std.process.exit(1);
+        }
+        if (native) std.debug.print("note: video streaming for forwarded apps DISABLED: x264/libavcodec/libavutil headers not found by pkg-config (install x264 + ffmpeg development files to enable; -Dvideo=false silences this). Apps still forward, lossless.\n", .{});
+        return .{};
+    }
+    const av1enc = pkgConfigExists(b, &.{"SvtAv1Enc"});
+    if (!av1enc) std.debug.print("note: AV1 video ENCODE disabled: SvtAv1Enc headers not found by pkg-config (H.264 streaming and AV1 decode unaffected; install svt-av1 development files to enable).\n", .{});
+
+    const mod = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true });
+    const pkgs = [_][]const u8{ "x264", "libavcodec", "libavutil", "SvtAv1Enc" };
+    for (pkgs[0 .. if (av1enc) pkgs.len else base_pkgs.len]) |pkg| addPkgConfigIncludes(b, mod, pkg);
     mod.addCSourceFile(.{ .file = b.path("vendor/x264_shim.c"), .flags = &.{"-O2"} });
     mod.addCSourceFile(.{ .file = b.path("vendor/avdec_shim.c"), .flags = &.{"-O2"} });
-    mod.addCSourceFile(.{ .file = b.path("vendor/avenc_shim.c"), .flags = &.{"-O2"} });
-    mod.addIncludePath(b.path("vendor"));
+    if (av1enc) mod.addCSourceFile(.{ .file = b.path("vendor/svtav1_shim.c"), .flags = &.{"-O2"} });
+    const lib = b.addLibrary(.{ .name = "sketerm-vcodec-shims", .linkage = .static, .root_module = mod });
+    return .{ .enabled = true, .av1enc = av1enc, .lib = lib };
+}
+
+/// Link the runtime-loading codec shims (see configureVideo) into a
+/// module compiled with glib/noglib build_options. No-op without video.
+fn addVideo(b: *std.Build, mod: *std.Build.Module) void {
+    _ = b;
+    if (video_cfg.lib) |lib| mod.linkLibrary(lib);
 }
 
 /// VideoToolbox H.264 encoder shim (vendor/vtenc_shim.c) + the system
