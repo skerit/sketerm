@@ -23,6 +23,7 @@ const c = @import("../c.zig").c;
 const muxclient = @import("../mux/client.zig");
 const wire = @import("../mux/wire.zig");
 const store = @import("../filebrowser/transfers.zig");
+const transfer = @import("../filebrowser/transfer.zig");
 const xferqueue = @import("../filebrowser/xferqueue.zig");
 const pathz = @import("../util/pathz.zig");
 const cast = @import("../util/cast.zig");
@@ -107,6 +108,11 @@ const Intent = struct {
     submission_uncertain: bool = false,
     ack_host: []u8,
     claimed: bool = false,
+    /// The driver (browser view ctx) holding the claim, when known.
+    /// Volatile: set wherever a claim is handed to a specific driver,
+    /// cleared with `claimed`. Process-wide admission reads it to tell
+    /// this view's transfers from every other view's.
+    claimant: ?*anyopaque = null,
     open_when_done: bool = false,
     delete_src_after: bool = false,
     no_replace: bool = false,
@@ -411,6 +417,10 @@ pub const Service = struct {
     disconnect_after_drain: bool = false,
     in_fd_callback: bool = false,
     legacy_lock: ?store.LegacyLock = null,
+    /// Phase changes `transfer.legal` refused (logged, then applied:
+    /// the first pass must not strand a transfer on a table gap).
+    /// Tests assert it stays zero across the real flows.
+    illegal_transitions: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator, notify_ctx: ?*anyopaque, notify_fn: ?NotifyFn) !*Service {
         const self = try allocator.create(Service);
@@ -560,7 +570,7 @@ pub const Service = struct {
                         it.record_version = rec.value.version;
                         if (it.record_version < store.VERSION and it.mediated and it.job != 0) {
                             it.state = .failed;
-                            it.claimed = false;
+                            unclaimIntent(it);
                             self.replaceMessage(it, "legacy transfer held because its running job identity is not durable");
                         }
                         self.intents.append(self.allocator, it) catch {
@@ -1014,7 +1024,7 @@ pub const Service = struct {
                 continue;
             }
             it.retry_due_ms = 0;
-            it.state = .queued;
+            self.setState(it, .queued);
             if (it.mediated) {
                 if (!it.claimed) {
                     // Live views retain their claim and run their own
@@ -1049,7 +1059,7 @@ pub const Service = struct {
         // Reclaiming a possibly-live idempotent attempt is not permission
         // to create new work and cannot be bounded by the work retry budget.
         const retry = it.cancel_requested or unresolved or automaticRetryAllowed(it.attempts, true);
-        it.state = if (retry) .waiting_retry else .failed;
+        self.setState(it, if (retry) .waiting_retry else .failed);
         it.retry_due_ms = if (retry) nowMs() + RETRY_DELAY_MS else 0;
         self.replaceMessage(it, "daemon connection lost during transfer");
         if (!retry)
@@ -1139,16 +1149,16 @@ pub const Service = struct {
             p.intent.submission_uncertain = false;
             if (!rep.ok or rep.job == 0) {
                 if (p.intent.cancel_requested) {
-                    p.intent.state = .canceled;
+                    self.setState(p.intent, .canceled);
                     self.removeIntent(p.intent);
                     self.pump();
                     return;
                 }
-                p.intent.state = .failed;
+                self.setState(p.intent, .failed);
                 self.replaceMessage(p.intent, rep.@"error");
             } else {
                 p.intent.job = rep.job;
-                p.intent.state = parseState(rep.state) orelse .running;
+                self.setState(p.intent, parseState(rep.state) orelse .running);
                 p.intent.done = rep.done;
                 p.intent.total = rep.total;
                 if (p.intent.cancel_requested and p.intent.state == .running and !self.sendJobControl(p.intent.job, "job_cancel"))
@@ -1237,10 +1247,10 @@ pub const Service = struct {
         it.message = replacement_message;
         it.ack_job = 0;
         it.ack_durable = false;
-        it.state = .waiting_retry;
+        self.setState(it, .waiting_retry);
         it.retry_due_ms = nowMs() + RETRY_DELAY_MS;
         it.submission_uncertain = false;
-        it.claimed = false;
+        unclaimIntent(it);
         it.cancel_requested = true;
         if (!txn.commit()) {
             self.allocator.free(fresh);
@@ -1260,7 +1270,7 @@ pub const Service = struct {
             if (canceled) {
                 it.ack_job = terminal_job;
                 it.ack_durable = false;
-                it.state = .canceled;
+                self.setState(it, .canceled);
                 if (!self.retire(it)) return;
                 self.notify("transfer canceled: {s}", .{std.fs.path.basename(it.dst_path)});
                 self.pump();
@@ -1281,7 +1291,7 @@ pub const Service = struct {
             if (!retryable) {
                 it.ack_job = terminal_job;
                 it.ack_durable = false;
-                it.state = .failed;
+                self.setState(it, .failed);
                 self.replaceMessage(it, message);
                 self.notify("transfer failed: {s}", .{std.fs.path.basename(it.dst_path)});
                 if (!self.writeIntentOk(it)) return;
@@ -1293,7 +1303,7 @@ pub const Service = struct {
             if (!automaticRetryAllowed(it.attempts, true)) {
                 it.ack_job = terminal_job;
                 it.ack_durable = false;
-                it.state = .failed;
+                self.setState(it, .failed);
                 self.replaceMessage(it, message);
                 self.notify("transfer failed: {s}", .{std.fs.path.basename(it.dst_path)});
                 if (!self.writeIntentOk(it)) return;
@@ -1314,7 +1324,7 @@ pub const Service = struct {
             const fresh = self.newToken() catch {
                 it.ack_job = terminal_job;
                 it.ack_durable = false;
-                it.state = .failed;
+                self.setState(it, .failed);
                 it.retry_due_ms = 0;
                 self.replaceMessage(it, "could not allocate a durable retry identity");
                 if (self.writeIntentOk(it)) self.pumpAcksNow();
@@ -1325,7 +1335,7 @@ pub const Service = struct {
             const previous_job = it.job;
             it.client_token = fresh;
             it.job = 0;
-            it.state = .waiting_retry;
+            self.setState(it, .waiting_retry);
             it.ack_job = terminal_job;
             it.ack_durable = false;
             it.retry_due_ms = nowMs() + RETRY_DELAY_MS;
@@ -1337,7 +1347,7 @@ pub const Service = struct {
                 // silent no-op after a restart.
                 it.client_token = previous_token;
                 it.job = previous_job;
-                it.state = .failed;
+                self.setState(it, .failed);
                 it.retry_due_ms = 0;
                 self.allocator.free(fresh);
                 return;
@@ -1348,13 +1358,13 @@ pub const Service = struct {
             self.pump();
             return;
         }
-        it.state = .done;
+        self.setState(it, .done);
         it.ack_job = terminal_job;
         it.ack_durable = false;
         if (it.kind == .download) {
             const w = self.ensureWatch(it.watch_token, it.src_host, it.src_path, it.dst_path);
             const watch = w orelse {
-                it.state = .failed;
+                self.setState(it, .failed);
                 it.ack_job = terminal_job;
                 it.ack_durable = false;
                 self.replaceMessage(it, "cannot create durable edit watch");
@@ -1638,7 +1648,7 @@ pub const Service = struct {
                 if (it.job != 0) continue;
                 it.record_version = store.VERSION;
                 it.mediated = true;
-                it.claimed = false;
+                unclaimIntent(it);
                 self.writeIntent(it);
                 self.handToDriver(it);
                 changed = true;
@@ -1663,6 +1673,16 @@ pub const Service = struct {
         defer self.allocator.free(map);
         var n: usize = 0;
         for (self.intents.items, 0..) |it, i| {
+            // A view's copy to the same disk holds a slot too: the
+            // service's downloads queue behind it rather than beside it.
+            if (it.mediated and it.claimed and !it.retired and !it.paused and it.dest_key != 0 and
+                (it.state == .running or it.state == .submitting))
+            {
+                slots[n] = .{ .dest = it.dest_key, .state = .running };
+                map[n] = i;
+                n += 1;
+                continue;
+            }
             if (it.retired or it.mediated or it.paused or it.ack_job != 0) continue;
             if (!current_durable_copy and it.record_version >= store.VERSION) continue;
             const state: ?xferqueue.State = switch (it.state) {
@@ -1695,7 +1715,7 @@ pub const Service = struct {
         if (self.next_req == 0) self.next_req = 1;
         if (conn.durable_copy_v2) it.record_version = store.VERSION;
         self.pending.append(self.allocator, .{ .req = req, .intent = it }) catch {
-            it.state = .failed;
+            self.setState(it, .failed);
             it.submission_uncertain = false;
             it.retry_due_ms = 0;
             self.replaceMessage(it, "could not queue transfer request");
@@ -1703,11 +1723,11 @@ pub const Service = struct {
             self.refreshViews();
             return true;
         };
-        it.state = .submitting;
+        self.setState(it, .submitting);
         it.submission_uncertain = true;
         if (!self.writeIntentOk(it)) {
             _ = self.pending.pop();
-            it.state = .failed;
+            self.setState(it, .failed);
             it.submission_uncertain = false;
             return true;
         }
@@ -1731,7 +1751,7 @@ pub const Service = struct {
                 self.requestDisconnect();
                 return false;
             }
-            it.state = .failed;
+            self.setState(it, .failed);
             it.submission_uncertain = false;
             it.retry_due_ms = 0;
             self.replaceMessage(it, "could not serialize transfer request");
@@ -1828,9 +1848,9 @@ pub const Service = struct {
     fn cancelUnresolvedSubmission(self: *Service, it: *Intent) bool {
         const txn = IntentTxn.begin(self, it);
         it.cancel_requested = true;
-        it.state = .waiting_retry;
+        self.setState(it, .waiting_retry);
         it.retry_due_ms = nowMs();
-        it.claimed = false;
+        unclaimIntent(it);
         if (!txn.commit()) return false;
         self.armTransferRetry();
         self.refreshViews();
@@ -1842,7 +1862,7 @@ pub const Service = struct {
         const txn = IntentTxn.begin(self, it);
         it.cancel_requested = true;
         it.retry_due_ms = 0;
-        it.state = .canceled;
+        self.setState(it, .canceled);
         it.retired = true;
         if (!txn.commit()) return false;
         if (it.ack_job == 0 and !self.childManifestExists(it.token, it.batch_token)) self.removeIntent(it);
@@ -1853,7 +1873,7 @@ pub const Service = struct {
     /// Never handed to a daemon job: cancel and retire it directly.
     fn cancelUnsubmitted(self: *Service, it: *Intent) bool {
         const txn = IntentTxn.begin(self, it);
-        it.state = .canceled;
+        self.setState(it, .canceled);
         it.retired = true;
         if (!txn.commit()) return false;
         _ = self.retire(it);
@@ -1961,6 +1981,62 @@ pub const Service = struct {
 
     // ── client-mediated records ─────────────────────────────────
 
+    /// THE way a record changes phase: every transition is checked
+    /// against the one table in filebrowser/transfer.zig.
+    fn setState(self: *Service, it: *Intent, to: store.State) void {
+        if (!transfer.legal(it.state, to)) {
+            self.illegal_transitions +|= 1;
+            std.debug.print("sketerm: transfer {s}: illegal phase change {s} -> {s}\n", .{ it.token, @tagName(it.state), @tagName(to) });
+        }
+        it.state = to;
+    }
+
+    /// Record a claim by `driver` (null when the holder is not a
+    /// specific view).
+    fn claimIntent(it: *Intent, driver: ?*anyopaque) void {
+        it.claimed = true;
+        it.claimant = driver;
+    }
+
+    fn unclaimIntent(it: *Intent) void {
+        it.claimed = false;
+        it.claimant = null;
+    }
+
+    /// What the ledger says about one transfer, independent of any
+    /// view's working lists.
+    pub fn liveness(self: *Service, token: []const u8) ?transfer.Liveness {
+        const it = self.intentByToken(token) orelse return null;
+        return livenessOf(it);
+    }
+
+    fn livenessOf(it: *const Intent) transfer.Liveness {
+        return .{ .state = it.state, .claimed = it.claimed, .retired = it.retired };
+    }
+
+    /// Destinations other drivers are writing to right now: running
+    /// or submitting records with a destination key that are claimed
+    /// by a view other than `me`, plus the service's own daemon
+    /// transfers. A view's copy queue admits against these, so two
+    /// windows pasting onto one disk share its slots.
+    /// @return the filled prefix of `out`.
+    pub fn foreignRunningDests(self: *Service, me: ?*anyopaque, out: []u64) []u64 {
+        var n: usize = 0;
+        for (self.intents.items) |it| {
+            if (n == out.len) break;
+            if (it.retired or it.dest_key == 0 or it.paused) continue;
+            if (it.state != .running and it.state != .submitting) continue;
+            if (it.mediated) {
+                if (!it.claimed) continue;
+                const holder = it.claimant orelse continue;
+                if (me != null and holder == me.?) continue;
+            }
+            out[n] = it.dest_key;
+            n += 1;
+        }
+        return out[0..n];
+    }
+
     fn intentByToken(self: *Service, token: []const u8) ?*Intent {
         for (self.intents.items) |it| if (std.mem.eql(u8, it.token, token)) return it;
         return null;
@@ -2033,7 +2109,7 @@ pub const Service = struct {
         }
         if (it.ack_job == 0 and (it.retired or it.state == .done or it.state == .canceled)) return;
         if (it.state == .failed and it.ack_job == 0) return;
-        it.claimed = true;
+        claimIntent(it, driver.ctx);
         driver.callback(driver.ctx, mediatedRec(it));
     }
 
@@ -2141,7 +2217,7 @@ pub const Service = struct {
     /// the record stays: another driver or process resumes it.
     pub fn unclaimMediated(self: *Service, token: []const u8) void {
         const it = self.intentByToken(token) orelse return;
-        it.claimed = false;
+        unclaimIntent(it);
     }
 
     /// Hand a record whose view-side setup failed back through normal
@@ -2149,7 +2225,7 @@ pub const Service = struct {
     /// dying queue object.
     pub fn redispatchMediated(self: *Service, token: []const u8) void {
         const it = self.intentByToken(token) orelse return;
-        it.claimed = false;
+        unclaimIntent(it);
         self.handToDriver(it);
     }
 
@@ -2360,9 +2436,9 @@ pub const Service = struct {
             if (!std.mem.eql(u8, it.src_host, src_host) or !std.mem.eql(u8, it.src_path, src_path)) continue;
             if (!std.mem.eql(u8, it.dst_host, dst_host) or !std.mem.eql(u8, it.dst_path, dst_path)) continue;
             it.cancel_requested = true;
-            it.state = .canceled;
+            self.setState(it, .canceled);
             it.retired = true;
-            it.claimed = false;
+            unclaimIntent(it);
             self.replaceMessage(it, "superseded by a newer copy of the same files");
             self.writeIntent(it);
         }
@@ -2385,12 +2461,12 @@ pub const Service = struct {
         if (self.intentByToken(item.token)) |existing| {
             if (skipped and !existing.retired) {
                 existing.cancel_requested = true;
-                existing.state = .canceled;
+                self.setState(existing, .canceled);
                 existing.retired = true;
-                existing.claimed = false;
+                unclaimIntent(existing);
                 if (!self.writeIntentOk(existing)) return null;
             } else if (!skipped) {
-                existing.claimed = true;
+                claimIntent(existing, owner);
             }
             return existing.token;
         }
@@ -2412,10 +2488,10 @@ pub const Service = struct {
             existing.record_version = rec.value.version;
             if (skipped and !existing.retired) {
                 existing.cancel_requested = true;
-                existing.state = .canceled;
+                self.setState(existing, .canceled);
                 existing.retired = true;
             }
-            existing.claimed = !skipped;
+            if (skipped) unclaimIntent(existing) else claimIntent(existing, owner);
             self.intents.append(self.allocator, existing) catch {
                 existing.handle.release();
                 existing.destroy(self.allocator);
@@ -2451,12 +2527,12 @@ pub const Service = struct {
                 existing.batch_id = batch.batch_id;
                 existing.batch_total = batch.batch_total;
                 existing.order = self.nextOrder();
-                existing.state = .queued;
+                self.setState(existing, .queued);
                 existing.attempts = 0;
                 existing.job = 0;
                 existing.mediated = true;
                 existing.user_copy = true;
-                existing.claimed = true;
+                claimIntent(existing, owner);
                 existing.paused = false;
                 existing.delete_src_after = batch.move;
                 existing.no_replace = no_replace orelse batch.no_replace;
@@ -2493,7 +2569,7 @@ pub const Service = struct {
             handle.release();
             return null;
         };
-        it.claimed = !skipped;
+        if (skipped) unclaimIntent(it) else claimIntent(it, owner);
         self.intents.append(self.allocator, it) catch {
             _ = it.handle.destroyRecord();
             it.destroy(self.allocator);
@@ -2577,6 +2653,8 @@ pub const Service = struct {
             delete_src_after: bool = false,
             no_replace: bool = false,
             watch_after: bool = false,
+            /// The view that drives it (see Intent.claimant).
+            owner: ?*anyopaque = null,
         },
     ) ?[]const u8 {
         const token = self.newToken() catch return null;
@@ -2599,7 +2677,7 @@ pub const Service = struct {
             handle.release();
             return null;
         };
-        it.claimed = true;
+        claimIntent(it, opts.owner);
         self.intents.append(self.allocator, it) catch {
             _ = it.handle.destroyRecord();
             it.destroy(self.allocator);
@@ -2626,6 +2704,7 @@ pub const Service = struct {
         batch_id: u64,
         batch_total: usize,
         coordinator_host: ?[]const u8,
+        owner: ?*anyopaque,
     ) ?[]const u8 {
         const token = self.newToken() catch return null;
         defer self.allocator.free(token);
@@ -2649,7 +2728,7 @@ pub const Service = struct {
             handle.release();
             return null;
         };
-        it.claimed = true;
+        claimIntent(it, owner);
         self.intents.append(self.allocator, it) catch {
             _ = it.handle.destroyRecord();
             it.destroy(self.allocator);
@@ -2692,7 +2771,7 @@ pub const Service = struct {
         const txn = IntentTxn.begin(self, it);
         it.cancel_requested = true;
         it.submission_uncertain = false;
-        it.state = .canceled;
+        self.setState(it, .canceled);
         it.retired = true;
         if (!txn.commit()) return false;
         if (!self.childManifestExists(it.token, it.batch_token)) self.removeIntent(it);
@@ -2706,7 +2785,7 @@ pub const Service = struct {
         if (!it.cancel_requested) return false;
         const txn = IntentTxn.begin(self, it);
         it.submission_uncertain = false;
-        it.state = .canceled;
+        self.setState(it, .canceled);
         it.retired = true;
         if (!txn.commit()) return false;
         if (!self.childManifestExists(it.token, it.batch_token)) self.removeIntent(it);
@@ -2733,8 +2812,7 @@ pub const Service = struct {
 
     pub fn mediatedRunnable(self: *Service, token: []const u8) bool {
         const it = self.intentByToken(token) orelse return false;
-        return !it.retired and it.state != .failed and it.state != .canceled and it.state != .done and
-            (it.state != .waiting_retry or it.retry_due_ms <= nowMs());
+        return livenessOf(it).live() and (it.state != .waiting_retry or it.retry_due_ms <= nowMs());
     }
 
     pub fn mediatedAckPending(self: *Service, token: []const u8) bool {
@@ -2766,7 +2844,7 @@ pub const Service = struct {
         const it = self.intentByToken(token) orelse return false;
         it.job = job;
         it.submission_uncertain = false;
-        it.state = .running;
+        self.setState(it, .running);
         it.retry_due_ms = 0;
         self.writeIntent(it);
         return !self.durability_error;
@@ -2778,7 +2856,7 @@ pub const Service = struct {
         const it = self.intentByToken(token) orelse return false;
         if (it.retired or it.state == .canceled or it.state == .done) return false;
         it.record_version = store.VERSION;
-        it.state = .submitting;
+        self.setState(it, .submitting);
         it.submission_uncertain = true;
         return self.writeIntentOk(it);
     }
@@ -2792,11 +2870,11 @@ pub const Service = struct {
         it.submission_uncertain = false;
         const terminal = finish;
         it.retired = terminal;
-        it.state = if (terminal and it.cancel_requested) .canceled else if (terminal) .done else .waiting_retry;
+        self.setState(it, if (terminal and it.cancel_requested) .canceled else if (terminal) .done else .waiting_retry);
         if (!self.writeIntentOk(it)) {
             // A later sweep retries the write and hands the durable ACK
             // back to a driver once it succeeds.
-            it.claimed = false;
+            unclaimIntent(it);
             return false;
         }
         // This exact copy just succeeded: siblings still claiming these
@@ -2834,9 +2912,9 @@ pub const Service = struct {
         if (!retryable) {
             self.replaceMessage(it, message);
             it.retry_due_ms = 0;
-            it.state = .failed;
+            self.setState(it, .failed);
             it.submission_uncertain = false;
-            it.claimed = false;
+            unclaimIntent(it);
             if (!self.writeIntentOk(it)) return false;
             self.refreshViews();
             return false;
@@ -2847,11 +2925,11 @@ pub const Service = struct {
         // same possible daemon job; it is cancellation/source-safety
         // resolution, not permission to create another work attempt.
         const retry = it.submission_uncertain or automaticRetryAllowed(it.attempts, true);
-        it.state = if (retry) .waiting_retry else .failed;
+        self.setState(it, if (retry) .waiting_retry else .failed);
         it.retry_due_ms = if (retry) nowMs() + RETRY_DELAY_MS else 0;
-        if (!retry) it.claimed = false;
+        if (!retry) unclaimIntent(it);
         if (!self.writeIntentOk(it)) {
-            if (retry) it.claimed = false;
+            if (retry) unclaimIntent(it);
             return false;
         }
         if (retry) self.armTransferRetry();
@@ -2862,9 +2940,9 @@ pub const Service = struct {
     pub fn setMediatedFailed(self: *Service, token: []const u8, message: []const u8, unclaim: bool) void {
         const it = self.intentByToken(token) orelse return;
         self.replaceMessage(it, message);
-        it.state = .failed;
+        self.setState(it, .failed);
         it.retry_due_ms = 0;
-        if (unclaim) it.claimed = false;
+        if (unclaim) unclaimIntent(it);
         self.writeIntent(it);
     }
 
@@ -2876,10 +2954,10 @@ pub const Service = struct {
         it.client_token = fresh;
         it.attempts = 0;
         it.retry_due_ms = 0;
-        it.state = .queued;
+        self.setState(it, .queued);
         it.submission_uncertain = false;
         it.retired = false;
-        it.claimed = false;
+        unclaimIntent(it);
         it.job = 0;
         it.cancel_requested = false;
         if (!self.writeIntentOk(it)) return;
@@ -2898,11 +2976,11 @@ pub const Service = struct {
         it.attempts = 0;
         it.retry_due_ms = 0;
         it.job = 0;
-        it.state = .queued;
+        self.setState(it, .queued);
         it.submission_uncertain = false;
         it.retired = false;
         if (!self.writeIntentOk(it)) {
-            it.claimed = false;
+            unclaimIntent(it);
             return false;
         }
         return true;
@@ -2915,13 +2993,13 @@ pub const Service = struct {
         if (it.cancel_requested and it.state != .canceled and it.state != .done) return false;
         if (it.ack_job == 0) {
             it.retired = true;
-            it.state = .canceled;
+            self.setState(it, .canceled);
             if (!self.writeIntentOk(it)) return false;
             if (!self.childManifestExists(it.token, it.batch_token)) self.removeIntent(it);
             return true;
         }
         it.retired = true;
-        it.state = .canceled;
+        self.setState(it, .canceled);
         return self.writeIntentOk(it);
     }
 
@@ -2951,10 +3029,10 @@ pub const Service = struct {
         it.job = 0;
         it.submission_uncertain = false;
         if (count_attempt) it.attempts +|= 1;
-        it.state = .waiting_retry;
+        self.setState(it, .waiting_retry);
         it.retry_due_ms = nowMs() + RETRY_DELAY_MS;
         if (!self.writeIntentOk(it)) {
-            it.claimed = false;
+            unclaimIntent(it);
             return false;
         }
         self.armTransferRetry();
@@ -2972,7 +3050,7 @@ pub const Service = struct {
             // The view-side retry object died with its HostConn. Drop
             // that volatile claim so this or another driver can rebuild
             // it from the durable record when the deadline expires.
-            it.claimed = false;
+            unclaimIntent(it);
             if (attempt_started or it.job != 0) {
                 it.record_version = store.VERSION;
                 it.submission_uncertain = true;
@@ -2986,12 +3064,12 @@ pub const Service = struct {
         const unresolved = it.submission_uncertain or attempt_started or it.job != 0;
         if (unresolved) it.record_version = store.VERSION;
         const retry = it.cancel_requested or unresolved or automaticRetryAllowed(it.attempts, true);
-        it.state = if (retry) .waiting_retry else .failed;
+        self.setState(it, if (retry) .waiting_retry else .failed);
         it.retry_due_ms = if (retry) nowMs() + RETRY_DELAY_MS else 0;
         it.submission_uncertain = unresolved;
         // Connection teardown destroys every live view-side attempt,
         // including one that is waiting only to re-assert cancellation.
-        it.claimed = false;
+        unclaimIntent(it);
         if (!self.writeIntentOk(it)) {
             return false;
         }
@@ -3025,7 +3103,7 @@ pub const Service = struct {
     pub fn finishMediated(self: *Service, token: []const u8) bool {
         const it = self.intentByToken(token) orelse return true;
         it.retired = true;
-        it.state = if (it.cancel_requested) .canceled else .done;
+        self.setState(it, if (it.cancel_requested) .canceled else .done);
         it.submission_uncertain = false;
         if (!self.writeIntentOk(it)) return false;
         // This exact copy just succeeded: siblings still claiming these
@@ -3824,4 +3902,80 @@ fn filenameUri(path: []const u8) ?[*c]c.gchar {
     const path_z = std.fmt.bufPrintZ(&path_buf, "{s}", .{path}) catch return null;
     const uri = c.g_filename_to_uri(path_z.ptr, null, null);
     return if (uri == null) null else uri;
+}
+
+test "a browser copy's record moves through legal phases and is admitted process-wide" {
+    const t = std.testing;
+    const old_state = if (c.getenv("XDG_STATE_HOME")) |value|
+        try t.allocator.dupe(u8, std.mem.span(@as([*:0]const u8, @ptrCast(value))))
+    else
+        null;
+    defer {
+        if (old_state) |value| {
+            var z: [4096:0]u8 = undefined;
+            const restored = std.fmt.bufPrintZ(&z, "{s}", .{value}) catch unreachable;
+            _ = c.setenv("XDG_STATE_HOME", restored.ptr, 1);
+            t.allocator.free(value);
+        } else {
+            _ = c.unsetenv("XDG_STATE_HOME");
+        }
+    }
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var state_buf: [4096:0]u8 = undefined;
+    const state = try std.fmt.bufPrintZ(&state_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    _ = c.setenv("XDG_STATE_HOME", state.ptr, 1);
+
+    var service = Service{ .allocator = t.allocator, .shutting_down = true };
+    defer {
+        for (service.intents.items) |it| {
+            _ = it.handle.destroyRecord();
+            it.destroy(t.allocator);
+        }
+        service.intents.deinit(t.allocator);
+    }
+    var window_a: u8 = 0;
+    var window_b: u8 = 0;
+    // The destination is a real directory, so it has a device key.
+    const token = service.newUserCopy("", "/src/file", "", state, false, true, 0, 1, null, @ptrCast(&window_a)) orelse
+        return error.CopyRecordFailed;
+    const it = service.intentByToken(token).?;
+    try t.expect(it.dest_key != 0);
+    try t.expectEqual(@as(?*anyopaque, @ptrCast(&window_a)), it.claimant);
+
+    // One record answers "is it in flight, and is someone driving it".
+    try t.expect(service.liveness(token).?.driven());
+    try t.expect(service.liveness("no-such-token") == null);
+
+    // A copy still waiting in A's queue holds no slot anywhere.
+    var out: [4]u64 = undefined;
+    try t.expectEqual(store.State.queued, it.state);
+    try t.expectEqual(@as(usize, 0), service.foreignRunningDests(@ptrCast(&window_b), &out).len);
+
+    // The real submission path: every phase change is a legal one.
+    try t.expect(service.mediatedSubmissionStarted(token));
+    try t.expectEqual(store.State.submitting, it.state);
+    try t.expect(service.mediatedJobStarted(token, 7));
+    try t.expectEqual(store.State.running, it.state);
+
+    // Now window B's queue sees A's copy to that disk; A does not see
+    // itself...
+    try t.expectEqualSlices(u64, &.{it.dest_key}, service.foreignRunningDests(@ptrCast(&window_b), &out));
+    try t.expectEqual(@as(usize, 0), service.foreignRunningDests(@ptrCast(&window_a), &out).len);
+    // ...so B's copy onto the same disk waits while one elsewhere starts.
+    var scratch: [8]xferqueue.Slot = undefined;
+    var admitted: [8]usize = undefined;
+    const own = [_]xferqueue.Slot{ .{ .dest = it.dest_key, .state = .queued }, .{ .dest = it.dest_key +% 1, .state = .queued } };
+    try t.expectEqualSlices(usize, &.{1}, transfer.admissible(&own, service.foreignRunningDests(@ptrCast(&window_b), &out), &scratch, &admitted));
+
+    try t.expect(service.noteMediatedTerminal(token, "", 7, true));
+    try t.expectEqual(store.State.done, it.state);
+    try t.expect(!service.liveness(token).?.live());
+    try t.expectEqual(@as(usize, 0), service.foreignRunningDests(@ptrCast(&window_b), &out).len);
+    try t.expectEqual(@as(u32, 0), service.illegal_transitions);
+
+    // A finished record never runs again: the table refuses it, counts
+    // it, and still applies it (first pass: never strand a transfer).
+    service.setState(it, .running);
+    try t.expectEqual(@as(u32, 1), service.illegal_transitions);
 }

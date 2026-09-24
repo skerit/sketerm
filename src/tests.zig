@@ -278,6 +278,7 @@ comptime {
     _ = @import("filebrowser/places.zig");
     _ = @import("filebrowser/thumbs.zig");
     _ = @import("filebrowser/transfers.zig");
+    _ = @import("filebrowser/transfer.zig");
     _ = @import("filebrowser/selection_set.zig");
     _ = @import("filebrowser/paths.zig");
     _ = @import("filebrowser/jobop.zig");

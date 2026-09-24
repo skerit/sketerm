@@ -14,6 +14,7 @@ const file_transfers = @import("../file_transfers.zig");
 const fstransfer = @import("../../ipc/fstransfer.zig");
 const incomplete = @import("../../filebrowser/incomplete.zig");
 const xferqueue = @import("../../filebrowser/xferqueue.zig");
+const transfer = @import("../../filebrowser/transfer.zig");
 
 const ActiveTransfer = @import("types.zig").ActiveTransfer;
 const BTab = @import("types.zig").BTab;
@@ -295,6 +296,7 @@ fn enqueueCrossCopy(
         batch_id,
         batch_total,
         coordinator.host,
+        @ptrCast(self),
     ) orelse {
         self.allocator.free(src);
         self.allocator.free(dst);
@@ -376,8 +378,15 @@ pub fn pumpCopyQueue(self: *BrowserView) void {
         slots[n] = .{ .dest = item.dest_key, .state = .queued };
         n += 1;
     }
+    // Admission is process-wide: another window's copy (or the
+    // service's own download) onto the same disk holds its slot here
+    // too, so two windows pasting onto one disk take turns.
+    var foreign_buf: [64]u64 = undefined;
+    const foreign = if (self.transfer_service) |service| service.foreignRunningDests(@ptrCast(self), &foreign_buf) else foreign_buf[0..0];
+    const scratch = self.allocator.alloc(xferqueue.Slot, n + foreign.len) catch return;
+    defer self.allocator.free(scratch);
     var admitted: [xferqueue.MAX_ACTIVE]usize = undefined;
-    const start = xferqueue.admissible(slots[0..n], &admitted);
+    const start = transfer.admissible(slots[0..n], foreign, scratch, &admitted);
     // Submitting removes items, so collect the targets first.
     var targets: [xferqueue.MAX_ACTIVE]*CopyItem = undefined;
     var count: usize = 0;
@@ -1343,6 +1352,7 @@ fn startTransferImpl(
             opts.batch_id,
             opts.batch_total,
             if (initial_coordinator) |coordinator| coordinator.host else null,
+            @ptrCast(self),
         ) orelse {
             self.setStatus("transfer not started because its recovery record could not be saved");
             return;
@@ -1480,6 +1490,7 @@ fn startTransferImpl(
                     .delete_src_after = opts.delete_src_after,
                     .no_replace = opts.no_replace,
                     .watch_after = opts.watch_host != null,
+                    .owner = @ptrCast(self),
                 },
             );
             if (token) |tok| {

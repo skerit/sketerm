@@ -80,7 +80,7 @@ while IFS= read -r module; do
             ;;
         # Toolkit/render modules and the few GUI-dependency outliers outside
         # those trees belong only to the full root.
-        ui/*|render/*|a11y/nsax.zig|a11y/view.zig|audio_sink.zig|doctor.zig|filebrowser/transfers.zig|ipc/appdrive.zig|ipc/client.zig|ipc/mcp.zig|ipc/mcp_app.zig|ipc/mcp_caps.zig|ipc/mcp_files.zig|ipc/mcp_panes.zig|ipc/mcp_term.zig|ipc/mcp_ui.zig|ipc/mcp_web.zig|ipc/mcp_webgui.zig|remote_menu.zig|remote_window.zig|terminal.zig|util/gifrec.zig|wlapp.zig)
+        ui/*|render/*|a11y/nsax.zig|a11y/view.zig|audio_sink.zig|doctor.zig|filebrowser/transfer.zig|filebrowser/transfers.zig|ipc/appdrive.zig|ipc/client.zig|ipc/mcp.zig|ipc/mcp_app.zig|ipc/mcp_caps.zig|ipc/mcp_files.zig|ipc/mcp_panes.zig|ipc/mcp_term.zig|ipc/mcp_ui.zig|ipc/mcp_web.zig|ipc/mcp_webgui.zig|remote_menu.zig|remote_window.zig|terminal.zig|util/gifrec.zig|wlapp.zig)
             class=gui
             ;;
         *)
