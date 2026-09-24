@@ -360,11 +360,14 @@ comptime {
     _ = @import("wlhost/track.zig");
     _ = @import("wlhost/pipe.zig");
     _ = @import("wlhost/compositor.zig");
+    _ = @import("wlhost/requests.zig");
+    _ = @import("winapp.zig");
     _ = @import("wlhost/zpool.zig");
     _ = @import("wlhost/pixcodec.zig");
     _ = @import("wlhost/vcodec.zig");
     _ = @import("winstream/proto.zig");
     _ = @import("winstream/source.zig");
+    _ = @import("winstream/sck.zig");
     _ = @import("winstream/keymap.zig");
     _ = @import("remote_window.zig");
     _ = @import("remote_menu.zig");

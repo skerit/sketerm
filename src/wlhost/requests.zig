@@ -17,6 +17,95 @@ const Surface = cmod.Surface;
 const Buffer = cmod.Buffer;
 const removeId = cmod.removeId;
 
+const t = std.testing;
+
+/// Feed one client request as a wl_msg unit into a compositor whose
+/// view has no callbacks: the dispatch under test, nothing rendered.
+fn feedRequest(comp: *Compositor, msg: []const u8) !void {
+    var unit: std.ArrayList(u8) = .empty;
+    defer unit.deinit(t.allocator);
+    try pipe.appendUnit(&unit, t.allocator, .wl_msg, msg);
+    try comp.feed(unit.items);
+}
+
+/// One registry bind against a fresh compositor that already asked for
+/// the registry as object 2; the bound object is 3.
+fn bindOutcome(lenient: bool, name: u32, iname: []const u8, ver: u32) Error!void {
+    var comp = try Compositor.init(t.allocator, .{});
+    defer comp.deinit();
+    comp.lenient = lenient;
+    var buf: [64]u8 = undefined;
+    var reg = wire.Builder.init(&buf, 1, 1); // wl_display.get_registry(2)
+    reg.putNewId(2);
+    try feedRequest(&comp, try reg.finish());
+    comp.clearOut();
+    var b = wire.Builder.init(&buf, 2, 0); // wl_registry.bind
+    b.putUint(name);
+    b.putString(iname);
+    b.putUint(ver);
+    b.putNewId(3);
+    try feedRequest(&comp, try b.finish());
+    if (comp.objects.get(3) == null) return Error.Protocol;
+    if ((comp.obj_versions.get(3) orelse 0) != ver) return Error.Protocol;
+}
+
+test "registry bind validates the global name, interface and version against the table" {
+    const g = globals[0];
+    try bindOutcome(false, g.name, g.iface.name, g.version);
+    try bindOutcome(false, g.name, g.iface.name, 1);
+    try t.expectError(Error.Protocol, bindOutcome(false, g.name, "wl_nope", 1));
+    try t.expectError(Error.Protocol, bindOutcome(false, g.name, g.iface.name, 0));
+    try t.expectError(Error.Protocol, bindOutcome(false, g.name, g.iface.name, g.version + 1));
+    try t.expectError(Error.Protocol, bindOutcome(false, 0xdead_beef, g.iface.name, 1));
+    // The opt-in dmabuf global is refused while unannounced, except to
+    // a replica re-parsing an authoritative stream.
+    const dmabuf_global = for (globals) |cand| {
+        if (cand.iface == &protocol.zwp_linux_dmabuf_v1) break cand;
+    } else return error.TestUnexpectedResult;
+    try t.expectError(Error.Protocol, bindOutcome(false, dmabuf_global.name, dmabuf_global.iface.name, 3));
+    try bindOutcome(true, dmabuf_global.name, dmabuf_global.iface.name, 3);
+}
+
+test "a request on an unknown object is fatal to the brain and skipped by a replica" {
+    var buf: [16]u8 = undefined;
+    var b = wire.Builder.init(&buf, 77, 0);
+    const msg = try b.finish();
+    // The brain answers with wl_display.error and is dead from then on.
+    var strict = try Compositor.init(t.allocator, .{});
+    defer strict.deinit();
+    try feedRequest(&strict, msg);
+    try t.expect(strict.dead);
+    var replica = try Compositor.init(t.allocator, .{});
+    defer replica.deinit();
+    replica.lenient = true;
+    try feedRequest(&replica, msg);
+    try t.expect(!replica.dead);
+}
+
+test "wl_display.sync answers with done on the callback and retires its id" {
+    var comp = try Compositor.init(t.allocator, .{});
+    defer comp.deinit();
+    var buf: [16]u8 = undefined;
+    var b = wire.Builder.init(&buf, 1, 0); // sync(5)
+    b.putNewId(5);
+    try feedRequest(&comp, try b.finish());
+    var saw_done = false;
+    var saw_delete = false;
+    var pos: usize = 0;
+    const bytes = comp.takeOut();
+    while (try pipe.peelUnit(bytes[pos..])) |p| {
+        if (p.unit.tag == .wl_msg) {
+            const hdr = (try wire.parseHeader(p.unit.payload)).?;
+            if (hdr.object == 5 and hdr.opcode == 0) saw_done = true;
+            if (hdr.object == 1 and hdr.opcode == 1) saw_delete = true;
+        }
+        pos += p.consumed;
+    }
+    try t.expect(saw_done);
+    try t.expect(saw_delete);
+    try t.expect(comp.objects.get(5) == null);
+}
+
 // ── request dispatch ────────────────────────────────────────
 
 pub fn request(self: *Compositor, hdr: wire.Header, body: []const u8) Error!void {

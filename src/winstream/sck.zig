@@ -489,3 +489,68 @@ pub const Source = struct {
         }
     }
 };
+
+// The lifecycle arms of `emitOne` never touch the shim, so they are
+// testable on any host: a Source with a dangling ctx is enough, and the
+// extern shim symbols are never referenced by these tests.
+test "shim lifecycle events become winstream units without touching the shim" {
+    const t = std.testing;
+    var src = Source{ .allocator = t.allocator, .ctx = @ptrFromInt(@alignOf(usize)) };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(t.allocator);
+    const title = "Calculator";
+    try src.emitOne(.{ .kind = 0, .win = 7, .w = 320, .h = 200, .x = 0, .y = 0, .data = title.ptr, .len = title.len }, &out, t.allocator);
+    // Drag blob: i16 ref_w, ref_h, then ev.w rects of i16{x,y,w,h}.
+    const words = [_]i16{ 320, 200, 0, 0, 320, 28, 10, 40, 50, 20 };
+    try src.emitOne(.{ .kind = 4, .win = 7, .w = 2, .h = 0, .x = 0, .y = 0, .data = @ptrCast(&words), .len = words.len * 2 }, &out, t.allocator);
+    try src.emitOne(.{ .kind = 2, .win = 7, .w = 0, .h = 0, .x = 0, .y = 0, .data = title.ptr, .len = title.len }, &out, t.allocator);
+    try src.emitOne(.{ .kind = 3, .win = 7, .w = 0, .h = 0, .x = 0, .y = 0, .data = null, .len = 0 }, &out, t.allocator);
+    // An unknown kind emits nothing.
+    const before = out.items.len;
+    try src.emitOne(.{ .kind = 9, .win = 7, .w = 0, .h = 0, .x = 0, .y = 0, .data = null, .len = 0 }, &out, t.allocator);
+    try t.expectEqual(before, out.items.len);
+
+    var pos: usize = 0;
+    const open = (try proto.peelUnit(out.items[pos..])) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(proto.Tag.win_open, open.unit.tag);
+    const wo = proto.decodeWinOpen(open.unit.payload) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(@as(u32, 7), wo.win);
+    try t.expectEqual(@as(i32, 320), wo.w);
+    try t.expectEqual(@as(i32, 200), wo.h);
+    try t.expectEqualStrings(title, wo.title);
+    pos += open.consumed;
+
+    const drag = (try proto.peelUnit(out.items[pos..])) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(proto.Tag.win_drag, drag.unit.tag);
+    const wd = proto.decodeWinDrag(drag.unit.payload) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(@as(i16, 320), wd.ref_w);
+    try t.expectEqual(@as(i16, 200), wd.ref_h);
+    try t.expectEqual(@as(u16, 2), wd.n);
+    try t.expectEqual(proto.DragRect{ .x = 0, .y = 0, .w = 320, .h = 28 }, proto.dragRectAt(wd.body, 0));
+    try t.expectEqual(proto.DragRect{ .x = 10, .y = 40, .w = 50, .h = 20 }, proto.dragRectAt(wd.body, 1));
+    pos += drag.consumed;
+
+    const ttl = (try proto.peelUnit(out.items[pos..])) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(proto.Tag.win_title, ttl.unit.tag);
+    try t.expectEqual(@as(u32, 7), std.mem.readInt(u32, ttl.unit.payload[0..4], .little));
+    try t.expectEqualStrings(title, ttl.unit.payload[4..]);
+    pos += ttl.consumed;
+
+    const close = (try proto.peelUnit(out.items[pos..])) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(proto.Tag.win_close, close.unit.tag);
+    try t.expectEqual(@as(u32, 7), std.mem.readInt(u32, close.unit.payload[0..4], .little));
+    pos += close.consumed;
+    try t.expectEqual(out.items.len, pos);
+}
+
+test "the video route refuses odd dimensions before touching an encoder" {
+    const t = std.testing;
+    var src = Source{ .allocator = t.allocator, .ctx = @ptrFromInt(@alignOf(usize)) };
+    defer src.vstate.deinit(t.allocator);
+    // Odd sizes (and empty ones) never get a video state; on a host
+    // without VideoToolbox nothing does.
+    try t.expect(src.videoState(1, 641, 480) == null);
+    try t.expect(src.videoState(1, 640, 481) == null);
+    try t.expect(src.videoState(1, 0, 480) == null);
+    try t.expectEqual(@as(usize, 0), src.vstate.count());
+}

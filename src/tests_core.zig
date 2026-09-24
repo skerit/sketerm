@@ -312,7 +312,9 @@ comptime {
     _ = @import("winstream/keymap.zig");
     _ = @import("winstream/proto.zig");
     _ = @import("winstream/source.zig");
+    _ = @import("winstream/sck.zig");
     _ = @import("wlhost/compositor.zig");
+    _ = @import("wlhost/requests.zig");
     _ = @import("wlhost/dmabuf.zig");
     _ = @import("wlhost/keymaps.zig");
     _ = @import("wlhost/pipe.zig");

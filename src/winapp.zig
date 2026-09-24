@@ -546,3 +546,38 @@ pub const WsHost = struct {
         if (rw.evdevCode(keycode)) |key| cast.userData(Win, user).sendKey(key, false, state);
     }
 };
+
+test "drag regions are hit-tested in the window's current scale" {
+    const t = std.testing;
+    var rects = [_]proto.DragRect{
+        .{ .x = 0, .y = 0, .w = 100, .h = 10 },
+        .{ .x = 60, .y = 40, .w = 20, .h = 10 },
+    };
+    // Measured against a 100x50 reference, shown at 200x100: every
+    // rect doubles. No GTK object is touched by the hit test.
+    var win = WsHost.Win{
+        .host = undefined,
+        .id = 1,
+        .window = undefined,
+        .picture = undefined,
+        .w = 200,
+        .h = 100,
+        .drag_rects = &rects,
+        .drag_ref_w = 100,
+        .drag_ref_h = 50,
+    };
+    try t.expect(win.inDragRegion(0, 0));
+    try t.expect(win.inDragRegion(199, 19));
+    try t.expect(!win.inDragRegion(199, 20));
+    try t.expect(!win.inDragRegion(200, 0));
+    try t.expect(win.inDragRegion(120, 80));
+    try t.expect(win.inDragRegion(159, 99));
+    try t.expect(!win.inDragRegion(119, 80));
+    try t.expect(!win.inDragRegion(120, 79));
+    // No rects, or no reference size to scale by: never draggable.
+    win.drag_rects = &.{};
+    try t.expect(!win.inDragRegion(0, 0));
+    win.drag_rects = &rects;
+    win.drag_ref_w = 0;
+    try t.expect(!win.inDragRegion(0, 0));
+}

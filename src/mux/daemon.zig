@@ -2186,6 +2186,18 @@ pub fn canonicalSocketPath(allocator: std.mem.Allocator, path: []const u8) ![]u8
 
 test "daemon listener paths are canonicalized before bind and export" {
     const t = std.testing;
+    // A relative spelling resolves against the CURRENT directory, so the
+    // test moves into a short /tmp root first: canonicalization ends in a
+    // sockaddr_un length check, and a checkout under a long path (a git
+    // worktree, a CI workspace) would fail it for the wrong reason.
+    var orig_cwd_buf: [4096]u8 = undefined;
+    try t.expect(c.getcwd(&orig_cwd_buf, orig_cwd_buf.len) != null);
+    var root_buf: [64:0]u8 = undefined;
+    const root = try std.fmt.bufPrintZ(&root_buf, "/tmp/sk-canon-{d}", .{c.getpid()});
+    _ = c.mkdir(root.ptr, 0o700);
+    defer _ = c.rmdir(root.ptr);
+    try t.expectEqual(@as(c_int, 0), c.chdir(root.ptr));
+    defer _ = c.chdir(@as([*:0]const u8, @ptrCast(&orig_cwd_buf)));
     var cwd_buf: [4096]u8 = undefined;
     try t.expect(c.getcwd(&cwd_buf, cwd_buf.len) != null);
     const cwd = std.mem.sliceTo(&cwd_buf, 0);
