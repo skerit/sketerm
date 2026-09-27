@@ -1013,6 +1013,7 @@ pub const ViewerWindow = struct {
         // Cast content's surface timers and terminal sinks reach into
         // widgets; fence them the moment the window starts dying, not
         // at finalize (same contract as castview.zig).
+        _ = c.g_signal_connect_data(window, "close-request", @ptrCast(&onWindowCloseRequest), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         _ = c.g_signal_connect_data(window, "destroy", @ptrCast(&onWindowDestroy), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         _ = c.g_signal_connect_data(open_button, "clicked", @ptrCast(&onOpenClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         _ = c.g_signal_connect_data(prev_button, "clicked", @ptrCast(&onPrevious), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
@@ -1091,9 +1092,9 @@ pub const ViewerWindow = struct {
 
     fn destroyViewer(user: ?*anyopaque) callconv(.c) void {
         const self = cast.userData(ViewerWindow, user);
-        // Finalize path: the widget tree is already gone, so free the
-        // controller without touching the cast_slot (onWindowDestroy
-        // severed the timers/sinks when the window started dying).
+        // The widget tree is already gone. The close request normally
+        // retired video; direct destruction still has its stream to clear
+        // here without touching the picture.
         switch (self.content) {
             .cast => |box| box.destroy(),
             .video => |stream| self.retireStream(stream),
@@ -1127,15 +1128,25 @@ pub const ViewerWindow = struct {
         return model.Resource.parse(self.batch.specs[self.index]);
     }
 
+    fn onWindowCloseRequest(_: *c.GtkWindow, user: ?*anyopaque) callconv(.c) c.gboolean {
+        const self = cast.userData(ViewerWindow, user);
+        // The picture is still alive here; detach it before GTK begins
+        // disposing the window and its children.
+        if (self.content == .video) self.releaseVideoStream();
+        return 0;
+    }
+
     fn onWindowDestroy(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
         const self = cast.userData(ViewerWindow, user);
         self.anim_bar.sever();
+        self.video_bar.sever();
         switch (self.content) {
             .cast => |box| box.severLive(),
+            // A direct gtk_window_destroy bypasses close-request. Its
+            // picture is already gone; the finalizer clears our stream.
             .video => |stream| c.gtk_media_stream_pause(stream),
             else => {},
         }
-        self.video_bar.sever();
         if (self.video_tick != 0) _ = c.g_source_remove(self.video_tick);
         self.video_tick = 0;
     }
@@ -1200,8 +1211,8 @@ pub const ViewerWindow = struct {
     }
 
     /// Disconnect, stop and finalize one media stream and its input.
-    /// Separate from `releaseVideoStream` because window finalize must
-    /// do the same WITHOUT touching the already-dead picture widget.
+    /// Called after the picture has released its paintable reference,
+    /// while our own stream reference is still held.
     /// `gtk_media_file_clear` retires the backend's pipeline through the
     /// documented API while the object is still fully referenced; without
     /// it the last unref finalizes a live GStreamer pipeline (GTK 4.22

@@ -2887,7 +2887,9 @@ pub fn quickLookOpen(self: *BrowserView, path: []const u8) bool {
 /// tracking pointer (Space/Enter/WM closes land there too).
 pub fn quickLookClose(self: *BrowserView) void {
     const viewer = self.preview_state.quick_look orelse return;
-    c.gtk_window_destroy(@ptrCast(@alignCast(viewer.window)));
+    // Go through close-request so the viewer stops video before GTK
+    // disposes the picture (destroy fires too late for that).
+    c.gtk_window_close(@ptrCast(@alignCast(viewer.window)));
 }
 
 fn onQuickLookDestroyed(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {

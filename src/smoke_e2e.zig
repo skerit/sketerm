@@ -7754,7 +7754,14 @@ fn viewerCastStage(
     if (!castWaitRgb(allocator, app, vwin, .{ 255, 0, 0 }, 40, true, 20_000))
         return viewerWhy("navigating text -> cast never rendered the recording");
 
-    // WM close -> clean exit, and the second session dies too.
+    // Close with the video pipeline active: navigation above exercises
+    // item-change teardown, while this exercises window destruction.
+    // Quick Look hosts this same ViewerWindow inside Sketerm Files.
+    if (have_video) {
+        for (0..3) |_| app.pressKey(vwin, "Right") catch return "navigating to the closing video failed";
+        if (!castWaitRgb(allocator, app, vwin, .{ 0xFF, 0x80, 0x00 }, 400, true, 30_000))
+            return viewerWhy("the closing video never painted");
+    }
     app.closeWindow(vwin) catch return "closing the viewer window failed";
     {
         // `viewerDied` reaps and clears the pid, so a cleared one here
