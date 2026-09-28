@@ -55,6 +55,11 @@ const MUX_HELP =
     \\      --control    take the app's controller lease by force
     \\  attach-all            attach EVERY session not already shown
     \\                        (bulk handoff after a move/crash; GUI only)
+    \\  watch-web <instance>  open the browser of the named MCP instance
+    \\                        (`sketerm mcp --name <instance>`) in the GUI,
+    \\                        on <host> through its daemon over SSH
+    \\      --read-only  watch without driving (the default)
+    \\      --control    take control: your input drives its pages
     \\  new                   spawn a durable session and attach it
     \\  kill <name>           kill a session
     \\  rename <old> <new>    rename a session
@@ -157,7 +162,7 @@ pub const Welcome = struct {
 };
 
 fn isSubcommand(s2: []const u8) bool {
-    const known = [_][]const u8{ "list", "attach", "attach-all", "new", "kill", "rename", "spawn", "send", "get-text", "search", "forward" };
+    const known = [_][]const u8{ "list", "attach", "attach-all", "watch-web", "new", "kill", "rename", "spawn", "send", "get-text", "search", "forward" };
     for (known) |k| {
         if (std.mem.eql(u8, s2, k)) return true;
     }
@@ -313,6 +318,16 @@ pub fn run(allocator: std.mem.Allocator, args_in: []const []const u8) u8 {
     }
     if (std.mem.eql(u8, cmd, "attach-all")) {
         return if (guiCommand(allocator, "attach-all", null, host, false)) 0 else 1;
+    }
+    if (std.mem.eql(u8, cmd, "watch-web")) {
+        const opts = AttachArgs.parse(args[1..]);
+        const instance = opts.target orelse {
+            _ = c.fprintf(platform.stderr(), "sketerm mux: watch-web needs an MCP instance name\n");
+            return 1;
+        };
+        // Watching is read-only unless control is asked for explicitly.
+        const lease: Lease = if (opts.lease == .control) .control else .read_only;
+        return if (guiCommandLease(allocator, "web-watch", instance, host, false, lease)) 0 else 1;
     }
     if (std.mem.eql(u8, cmd, "new")) {
         if (placement.inTerminalHere(false)) {

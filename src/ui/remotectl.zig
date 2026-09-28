@@ -14,6 +14,8 @@ const Screen = @import("../grid/screen.zig").Screen;
 const Pane = @import("pane.zig").Pane;
 const winmod = @import("window.zig");
 const muxtabs = @import("muxtabs.zig");
+const webwatch = @import("webwatch.zig");
+const webpresence = @import("../web/webpresence.zig");
 const cast = @import("../util/cast.zig");
 const Window = winmod.Window;
 
@@ -947,6 +949,16 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
             const msg = std.fmt.bufPrint(&msg_buf, "attach failed: {s}", .{detail}) catch "attach failed";
             return ipc_protocol.writeErr(out, allocator, .failed, msg);
         };
+        try ipc_protocol.writeOk(out, allocator, null, {});
+    } else if (eql(u8, req.cmd, "web-watch")) {
+        // Watch (or take control of) a NAMED MCP instance's browser --
+        // an unattended service driving websites -- locally or on
+        // `host` through that host's per-user daemon (webwatch.zig).
+        const instance = req.data orelse return ipc_protocol.writeErr(out, allocator, .invalid_request, "web-watch requires data (MCP instance name)");
+        if (!webpresence.validInstance(instance)) return ipc_protocol.writeErr(out, allocator, .invalid_request, "web-watch: not an MCP instance name");
+        const lease: Window.Lease = if (req.control) .control else .read_only;
+        if (!webwatch.openInstance(activeOrSelf(self), req.host, instance, req.session orelse "", lease))
+            return ipc_protocol.writeErr(out, allocator, .failed, "the instance's browser could not be watched");
         try ipc_protocol.writeOk(out, allocator, null, {});
     } else if (eql(u8, req.cmd, "attach-all")) {
         // Bulk handoff: attach every session on the daemon that

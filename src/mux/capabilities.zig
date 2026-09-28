@@ -96,6 +96,12 @@ pub const Flag = enum {
     /// daemon never asks; the viewer keeps answering what its replica
     /// resolves itself.
     app_paste_request,
+    /// `web_helper_connect` honors `instance`: the per-user daemon an SSH
+    /// `--proxy` reaches bridges the helper of the NAMED MCP instance
+    /// (`sketerm mcp --name <instance>`) living in `mcp-<instance>/`
+    /// beside it. Absent = the daemon ignores the field and would look
+    /// beside its OWN socket, so a client refuses instead of sending it.
+    web_helper_instance,
 };
 
 /// One bool per flag, keyed by wire name; the parsed form on the

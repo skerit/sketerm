@@ -773,6 +773,10 @@ pub const Engine = struct {
     /// The LOCAL fallback: `remote` (the broker-owned store) is tried
     /// first for named instances and wins when the daemon serves it.
     store: ?webprofiles.Store = null,
+    /// `flush_req` bookkeeping (`saveProfiles`): the next token to send
+    /// and the last one the engine answered with `ev_flushed`.
+    flush_token_next: u32 = 1,
+    flushed_token: u32 = 0,
     /// Broker-owned profile store, the normal path for a NAMED
     /// instance: the daemon holds the flock and allocates ids, so N
     /// concurrent clients of one instance all get working profiles.
@@ -2053,6 +2057,38 @@ pub const Engine = struct {
     /// failed removal can then never resurface as this profile's
     /// cookies.
     /// @return the context id that was retired.
+    pub const SaveError = error{ Unsupported, Unavailable, Timeout };
+    pub const Saved = enum { flushed, nothing_live };
+
+    /// Commit every persistent jar of the running engine to disk NOW
+    /// (every named profile's cookies, and the instance's own durable
+    /// jar), without closing a view or stopping the engine: the
+    /// "keep this login" save after a sign-in or a human hand-back.
+    /// Rides the helper's `flush_req`, answered by `ev_flushed` once
+    /// every jar's flush callback completed. Chromium commits a jar as
+    /// one SQLite transaction, so a crash leaves the previous jar or
+    /// the new one, never a half-written file. Site storage
+    /// (localStorage/IndexedDB) keeps Chromium's own ~15s cadence; the
+    /// engine's periodic flush (20s) and a clean exit still apply.
+    /// With no engine running there is nothing live to lose: the store
+    /// on disk is already the whole truth, and no engine is spawned
+    /// just to answer.
+    pub fn saveProfiles(self: *Engine, budget_ms: i64) SaveError!Saved {
+        if (self.state != .ready) return .nothing_live;
+        if (!self.has(.flush)) return error.Unsupported;
+        const token = self.flush_token_next;
+        self.flush_token_next +%= 1;
+        if (self.flush_token_next == 0) self.flush_token_next = 1;
+        self.send(proto.FlushReq{ .token = token }) catch return error.Unavailable;
+        const deadline = clock.nowMs() + @max(budget_ms, 100);
+        while (self.flushed_token != token) {
+            if (self.state != .ready) return error.Unavailable;
+            if (clock.nowMs() >= deadline) return error.Timeout;
+            self.pumpOnce(40);
+        }
+        return .flushed;
+    }
+
     pub fn resetProfile(self: *Engine, name: []const u8) ProfileError!u32 {
         if (!webprofiles.validName(name)) return error.InvalidName;
         self.openStore();
@@ -3187,6 +3223,10 @@ pub const Engine = struct {
             .ev_title => {
                 const ev = proto.decode(proto.EvTitle, frame.payload) catch return;
                 if (self.findView(ev.view)) |v| self.setOwned(&v.title, ev.title);
+            },
+            .ev_flushed => {
+                const ev = proto.decode(proto.EvFlushed, frame.payload) catch return;
+                self.flushed_token = ev.token;
             },
             .ev_page_popup => {
                 const ev = proto.decode(proto.EvPagePopup, frame.payload) catch return;

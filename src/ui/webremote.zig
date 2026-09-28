@@ -52,6 +52,11 @@ pub const Bridge = struct {
     /// Set with `connect_session`: the connect form was asked for, so
     /// an empty session means the direct route's helper.
     connect_mode: bool = false,
+    /// Non-empty with `connect_mode`: the helper belongs to the NAMED
+    /// MCP instance beside the host's per-user daemon (the daemon's
+    /// `web_helper_instance` flag), not to that daemon itself.
+    connect_instance: [48]u8 = undefined,
+    connect_instance_len: usize = 0,
     /// How the worker reaches the host's daemon. A field so a test can
     /// hold the connect open and prove `stop` does not wait for it.
     connectFn: *const fn (allocator: std.mem.Allocator, host: ?[]const u8) ?mux_client.Conn = mux_cli.muxConnect,
@@ -108,6 +113,14 @@ pub const Bridge = struct {
         @memcpy(self.connect_session[0..n], session[0..n]);
         self.connect_session_len = n;
         self.connect_mode = true;
+    }
+
+    /// Name the MCP instance whose helper the connect form reaches (see
+    /// `connect_instance`). Call after `setConnectSession`, before `spawn`.
+    pub fn setConnectInstance(self: *Bridge, instance: []const u8) void {
+        const n = @min(instance.len, self.connect_instance.len);
+        @memcpy(self.connect_instance[0..n], instance[0..n]);
+        self.connect_instance_len = n;
     }
 
     /// The GUI end, exactly once (the Client owns and closes it).
@@ -209,6 +222,12 @@ pub const Bridge = struct {
                 self.failWith("The daemon on that host is too old to watch an assistant's browser (no web_helper_connect capability).");
                 return;
             }
+            // An old daemon would ignore `instance` and look beside its
+            // own socket: refuse rather than watch the wrong browser.
+            if (self.connect_instance_len > 0 and !self.conn.caps.web_helper_instance) {
+                self.failWith("The daemon on that host is too old to watch a named assistant instance's browser (no web_helper_instance capability).");
+                return;
+            }
         } else if (!self.conn.caps.web_helper) {
             self.failWith("The daemon on that host is too old for remote browsing (no web_helper capability).");
             return;
@@ -224,7 +243,11 @@ pub const Bridge = struct {
 
     fn openHelper(self: *Bridge) ?u32 {
         const queued = if (self.connect_mode)
-            self.conn.queueJson(.web_helper_connect, .{ .req = @as(u32, 1), .session = self.connect_session[0..self.connect_session_len] })
+            self.conn.queueJson(.web_helper_connect, .{
+                .req = @as(u32, 1),
+                .session = self.connect_session[0..self.connect_session_len],
+                .instance = self.connect_instance[0..self.connect_instance_len],
+            })
         else
             self.conn.queueJson(.web_helper_open, .{ .req = @as(u32, 1) });
         queued catch {

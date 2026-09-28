@@ -3050,6 +3050,7 @@ pub fn webTool(
     if (eql(u8, name, "web_close")) return closeTool(drv, arena, views, handle_u);
     if (eql(u8, name, "web_profiles")) return profilesTool(drv, arena);
     if (eql(u8, name, "web_profile_reset")) return profileResetTool(drv, arena, args);
+    if (eql(u8, name, "web_profile_save")) return profileSaveTool(drv, arena, args);
     if (eql(u8, name, "web_policy")) return policyTool(drv, arena, args, views, handle_u);
     if (eql(u8, name, "web_policy_set")) return policySetTool(drv, arena, args, views, handle_u);
 
@@ -3626,6 +3627,48 @@ fn profileResetTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value)
     return profileResetResult(arena, name, retired);
 }
 
+/// `web_profile_save`: commit the live jars to disk without closing
+/// anything (`webdrive.Engine.saveProfiles`). A named profile is only
+/// CHECKED -- the engine's flush covers every persistent jar at once,
+/// which is what "save this login now" must mean anyway.
+fn profileSaveTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
+    const e = switch (drv) {
+        .gui => return mcp.errRes(arena, .unavailable, GUI_PROFILE_REFUSAL),
+        .headless => |eng| eng,
+    };
+    const named = mcp.argStr(args, "profile");
+    const listed = try e.profileList(arena);
+    if (named) |want| {
+        var found = false;
+        for (listed) |p| {
+            if (std.mem.eql(u8, p.name, want)) found = true;
+        }
+        if (!found) return failRes(arena, try profileFail(arena, e, want, error.NoProfile));
+    }
+    const budget: i64 = mcp.argInt(args, "timeout_ms") orelse 10_000;
+    const saved = e.saveProfiles(budget) catch |err| return switch (err) {
+        error.Unsupported => mcp.errRes(arena, .unavailable, "this browser helper cannot flush its jars on request (no 'flush-store' capability); its own periodic flush and a clean exit still persist them"),
+        error.Timeout => mcp.errRes(arena, .timeout, "the browser engine did not confirm the flush in time; nothing is known to be lost, but the save is unconfirmed"),
+        error.Unavailable => failRes(arena, try headlessFail(arena, e, err)),
+    };
+    return profileSaveResult(arena, named, listed, saved);
+}
+
+fn profileSaveResult(arena: std.mem.Allocator, named: ?[]const u8, listed: []const webdrive.Engine.ProfileInfo, saved: webdrive.Engine.Saved) ![]const u8 {
+    var res = mcp.Res.init(arena);
+    const names = try arena.alloc([]const u8, listed.len);
+    for (listed, 0..) |p, i| names[i] = p.name;
+    try res.fact("saved", true);
+    try res.fact("engine_running", saved == .flushed);
+    try res.fact("profiles", names);
+    if (named) |n| try res.fact("profile", n);
+    switch (saved) {
+        .flushed => try res.text("every persistent jar (cookies and logins of each named profile and of this instance) is committed to disk; a crash from here on keeps them"),
+        .nothing_live => try res.text("no browser engine is running, so nothing is held in memory: the profile store on disk is already complete"),
+    }
+    return res.finish();
+}
+
 // ---------------------------------------------------------------------
 // Enforced network policy (headless only)
 // ---------------------------------------------------------------------
@@ -3949,6 +3992,17 @@ const NO_CAPTURE =
 
 /// What `capabilities` reports about capture. Never spawns the helper:
 /// before one exists this is what the code supports.
+/// Whether `web_profile_save` can commit the live jars on request:
+/// headless only, and the running helper must speak `flush_req`
+/// (capability 'flush-store'). Before the engine starts it is
+/// intention: there is nothing in memory yet, and the call says so.
+pub fn profileSaveCapability() bool {
+    if (guiDrivesWeb()) return false;
+    const e = headlessEngine() orelse return false;
+    if (e.state != .ready) return true;
+    return e.has(.flush);
+}
+
 pub fn captureCapability() struct { supported: bool, started: bool } {
     if (guiDrivesWeb()) return .{ .supported = false, .started = true };
     const e = headlessEngine() orelse return .{ .supported = false, .started = false };
@@ -7061,6 +7115,33 @@ test "web_close with a GUI closes one PAGE of the pane, and falls back to the pa
     try t.expect(oparsed.object.get("structuredContent").?.object.get("pane_closed").?.bool);
 }
 
+test "web_profile_save result shapes: a live flush and a no-engine answer" {
+    var arena_state = testArena();
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const t = std.testing;
+    const rows = [_]webdrive.Engine.ProfileInfo{
+        .{ .name = "liantis-main", .id = 3, .views = 1, .created_ms = 1, .last_used_ms = 2, .live = true },
+        .{ .name = "reddit-scout-1", .id = 4, .views = 0, .created_ms = 1, .last_used_ms = 2, .live = false },
+    };
+    // 1. A running engine flushed every jar; the named profile is echoed.
+    const live = try profileSaveResult(arena, "liantis-main", &rows, .flushed);
+    const lp = try mcp.expectToolResultShape(arena, "web_profile_save", live);
+    const lsc = lp.object.get("structuredContent").?.object;
+    try t.expect(lsc.get("saved").?.bool);
+    try t.expect(lsc.get("engine_running").?.bool);
+    try t.expectEqualStrings("liantis-main", lsc.get("profile").?.string);
+    try t.expectEqual(@as(usize, 2), lsc.get("profiles").?.array.items.len);
+    try t.expect(std.mem.indexOf(u8, lp.object.get("content").?.array.items[0].object.get("text").?.string, "committed to disk") != null);
+    // 2. No engine: nothing was in memory, and the reply says the disk
+    // store is already complete instead of pretending a flush ran.
+    const idle = try profileSaveResult(arena, null, &.{}, .nothing_live);
+    const ip = try mcp.expectToolResultShape(arena, "web_profile_save", idle);
+    const isc = ip.object.get("structuredContent").?.object;
+    try t.expect(!isc.get("engine_running").?.bool);
+    try t.expect(isc.get("profile") == null);
+}
+
 test "web_close / web_profiles / web_profile_reset result shapes" {
     var arena_state = testArena();
     defer arena_state.deinit();
@@ -7192,7 +7273,7 @@ test "every tool this module serves declares an output schema" {
             return error.MissingOutputSchema;
         }
     }
-    try std.testing.expectEqual(@as(usize, 27), seen);
+    try std.testing.expectEqual(@as(usize, 28), seen);
 }
 
 test "parsePolicy fails closed on every unknown name, wildcard and port" {

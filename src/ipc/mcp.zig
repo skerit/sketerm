@@ -264,13 +264,8 @@ pub const Opts = struct {
 pub const DURABLE_DEFAULT_NAME = "default";
 
 fn validInstanceName(n: []const u8) bool {
-    if (n.len == 0 or n.len > 48) return false;
-    for (n) |ch| {
-        const ok = (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or
-            (ch >= '0' and ch <= '9') or ch == '-' or ch == '_';
-        if (!ok) return false;
-    }
-    return true;
+    // One rule with the daemon's `web_helper_connect{instance}` resolver.
+    return @import("../web/webpresence.zig").validInstance(n);
 }
 
 /// `--log DIR` trace: one JSONL entry per MCP message plus every

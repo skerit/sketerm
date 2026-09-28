@@ -129,6 +129,7 @@ is kept by a `:ro` policy term. The full descriptions and schemas are in
 - `web_close`: Close a web view.
 - `web_profiles` (read-only): HEADLESS ONLY (with a GUI attached the browser's identity containers belong to the user).
 - `web_profile_reset`: HEADLESS ONLY.
+- `web_profile_save`: HEADLESS ONLY.
 - `web_policy` (read-only): HEADLESS ONLY (with a GUI attached this refuses: the user's own tabs are not policed by an assistant).
 - `web_policy_set`: HEADLESS ONLY (with a GUI attached this refuses).
 - `web_navigate`: Navigate a web view: a 'url', or an 'action' (back|forward|reload|stop).

@@ -129,6 +129,11 @@ pub const Client = struct {
     /// what `web_helper_connect` names to the remote daemon.
     obs_session: [64]u8 = undefined,
     obs_session_len: usize = 0,
+    /// Remote observer only: the named MCP instance whose helper the
+    /// host's per-user daemon bridges (`web_helper_connect{instance}`);
+    /// empty = the helper beside that daemon itself.
+    obs_instance: [48]u8 = undefined,
+    obs_instance_len: usize = 0,
     /// Identity an observer client was minted for; an idle one with the
     /// same key is reused by the next watch on that assistant.
     obs_key: [384]u8 = undefined,
@@ -281,7 +286,10 @@ pub const Client = struct {
         };
         // An observer joins the helper serving the assistant's session
         // on that host instead of having one spawned.
-        if (self.observer) br.setConnectSession(self.obs_session[0..self.obs_session_len]);
+        if (self.observer) {
+            br.setConnectSession(self.obs_session[0..self.obs_session_len]);
+            if (self.obs_instance_len > 0) br.setConnectInstance(self.obs_instance[0..self.obs_instance_len]);
+        }
         const fd = br.guiFd();
         if (fd < 0) {
             br.stop();

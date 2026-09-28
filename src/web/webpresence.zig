@@ -15,6 +15,46 @@ const c = @import("../c.zig").c;
 /// shorter, so a longer instance directory could never bind anyway.
 pub const MAX_PATH = 512;
 
+/// Whether `name` is an MCP instance name (`sketerm mcp --name`). The
+/// ONE rule: `mcp.zig` validates `--name` with it, and a remote
+/// `web_helper_connect{instance}` is refused by it, so a peer can never
+/// climb out of the runtime directory with `..` or a slash.
+pub fn validInstance(name: []const u8) bool {
+    if (name.len == 0 or name.len > 48) return false;
+    for (name) |ch| {
+        const ok = (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or
+            (ch >= '0' and ch <= '9') or ch == '-' or ch == '_';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+/// The private daemon socket of the MCP instance `instance` whose
+/// directory sits beside the per-user daemon socket `mux_socket`
+/// (`<runtime>/sketerm/mux.sock` -> `<runtime>/sketerm/mcp-<instance>/mux.sock`,
+/// the layout `mcp.zig` creates). This is what lets the per-user daemon
+/// an SSH `--proxy` reaches bridge a NAMED instance's browser helper,
+/// which lives beside that instance's own daemon, not beside it.
+/// Null for an invalid name or an over-long path.
+pub fn instanceMuxSocket(buf: []u8, mux_socket: []const u8, instance: []const u8) ?[]const u8 {
+    if (!validInstance(instance)) return null;
+    const dir = std.fs.path.dirname(mux_socket) orelse return null;
+    return std.fmt.bufPrint(buf, "{s}/mcp-{s}/mux.sock", .{ dir, instance }) catch null;
+}
+
+test "instanceMuxSocket resolves a named instance beside the per-user socket and refuses escapes" {
+    var buf: [MAX_PATH]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "/run/user/1/sketerm/mcp-switchboard/mux.sock",
+        instanceMuxSocket(&buf, "/run/user/1/sketerm/mux.sock", "switchboard").?,
+    );
+    try std.testing.expect(instanceMuxSocket(&buf, "/run/user/1/sketerm/mux.sock", "../etc") == null);
+    try std.testing.expect(instanceMuxSocket(&buf, "/run/user/1/sketerm/mux.sock", "a/b") == null);
+    try std.testing.expect(instanceMuxSocket(&buf, "/run/user/1/sketerm/mux.sock", "") == null);
+    try std.testing.expect(!validInstance("x" ** 49));
+    try std.testing.expect(validInstance("hub_1-A"));
+}
+
 /// The helper socket serving `session` of the instance whose daemon
 /// listens on `mux_socket`: the sibling `web*.json` presence file
 /// naming that session, with `.sock` for `.json`. When no presence

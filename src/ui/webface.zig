@@ -780,8 +780,10 @@ var g_observer_clients: std.ArrayList(*Client) = .empty;
 pub const ObserverSpec = union(enum) {
     /// Helper socket path of a local assistant.
     local: []const u8,
-    /// A remote assistant: mux host spec + its web session name.
-    remote: struct { host: []const u8, session: []const u8 },
+    /// A remote assistant: mux host spec + its web session name, and
+    /// the MCP instance name when the assistant is a named instance
+    /// beside the host's per-user daemon (empty otherwise).
+    remote: struct { host: []const u8, session: []const u8, instance: []const u8 = "" },
 };
 
 /// An idle or fresh observer client for `spec`. Null when the spec
@@ -790,7 +792,7 @@ pub fn observerClient(gpa: std.mem.Allocator, spec: ObserverSpec) ?*Client {
     var key_buf: [384]u8 = undefined;
     const key = switch (spec) {
         .local => |path| std.fmt.bufPrint(&key_buf, "sock:{s}", .{path}) catch return null,
-        .remote => |r| std.fmt.bufPrint(&key_buf, "host:{s}|{s}", .{ r.host, r.session }) catch return null,
+        .remote => |r| std.fmt.bufPrint(&key_buf, "host:{s}|{s}|{s}", .{ r.host, r.instance, r.session }) catch return null,
     };
     for (g_observer_clients.items) |cl| {
         if (cl.watch == null and cl.state == .idle and std.mem.eql(u8, cl.obs_key[0..cl.obs_key_len], key)) return cl;
@@ -809,10 +811,12 @@ pub fn observerClient(gpa: std.mem.Allocator, spec: ObserverSpec) ?*Client {
             cl.obs_local_len = path.len;
         },
         .remote => |r| {
-            if (r.host.len > cl.host.len or r.session.len > cl.obs_session.len) {
+            if (r.host.len > cl.host.len or r.session.len > cl.obs_session.len or r.instance.len > cl.obs_instance.len) {
                 gpa.destroy(cl);
                 return null;
             }
+            @memcpy(cl.obs_instance[0..r.instance.len], r.instance);
+            cl.obs_instance_len = r.instance.len;
             @memcpy(cl.host[0..r.host.len], r.host);
             cl.host_len = r.host.len;
             cl.route_kind = .remote_browser;

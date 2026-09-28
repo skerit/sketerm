@@ -310,6 +310,7 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
         else
             "certificate errors fail closed in headless views and are reported as cert facts; web_open accept_cert trusts one fingerprint for one view");
         if (profiles.store.len > 0) try res.fact("web_profile_store", profiles.store);
+        try res.fact("web_profile_save", @import("mcp_web.zig").profileSaveCapability());
         if (profiles.available)
             try res.text("named browsing profiles are available (web_open profile:\"name\"); each keeps its own cookie jar across MCP restarts")
         else if (profiles.reason.len > 0)

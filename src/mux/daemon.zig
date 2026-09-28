@@ -1812,6 +1812,89 @@ test "web_helper_connect: bridges a helper serving beside the daemon socket, des
     }
 }
 
+test "web_helper_connect: an instance name re-anchors the lookup in that MCP instance's directory" {
+    const t = std.testing;
+    const muxclient = @import("client.zig");
+    var dir_buf: [128:0]u8 = undefined;
+    const dir = try std.fmt.bufPrintZ(&dir_buf, "/tmp/sk-webi-{d}", .{c.getpid()});
+    _ = c.mkdir(dir.ptr, 0o700);
+    var inst_buf: [160:0]u8 = undefined;
+    const inst_dir = try std.fmt.bufPrintZ(&inst_buf, "{s}/mcp-hub", .{dir});
+    _ = c.mkdir(inst_dir.ptr, 0o700);
+    var path_buf: [160:0]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "{s}/mux.sock", .{dir});
+    var lock_buf: [180:0]u8 = undefined;
+    const lock_path = try std.fmt.bufPrintZ(&lock_buf, "{s}.lock", .{path});
+    var helper_buf: [180:0]u8 = undefined;
+    const helper_path = try std.fmt.bufPrintZ(&helper_buf, "{s}/web.sock", .{inst_dir});
+    _ = c.unlink(path.ptr);
+    _ = c.unlink(lock_path.ptr);
+    _ = c.unlink(helper_path.ptr);
+    defer {
+        _ = c.unlink(path.ptr);
+        _ = c.unlink(lock_path.ptr);
+        _ = c.unlink(helper_path.ptr);
+        _ = c.rmdir(inst_dir.ptr);
+        _ = c.rmdir(dir.ptr);
+    }
+    // The stand-in helper serves beside the INSTANCE's socket, not this
+    // daemon's: exactly the layout of `sketerm mcp --name hub`.
+    const lfd = platform.socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
+    try t.expect(lfd >= 0);
+    defer _ = c.close(lfd);
+    {
+        var addr = std.mem.zeroes(c.struct_sockaddr_un);
+        addr.sun_family = c.AF_UNIX;
+        @memcpy(addr.sun_path[0..helper_path.len], helper_path);
+        try t.expect(c.bind(lfd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un)) == 0);
+        try t.expect(c.listen(lfd, 4) == 0);
+        _ = c.fcntl(lfd, c.F_SETFL, c.O_NONBLOCK);
+    }
+    var d = try Daemon.init(t.allocator, path);
+    defer d.deinit();
+    var conn = try muxclient.Conn.connect(t.allocator, path);
+    defer conn.deinit();
+    const Reply = struct { req: u32 = 0, ok: bool = false, chan: u32 = 0, @"error": []const u8 = "" };
+    const Pump = struct {
+        fn reply(dm: *Daemon, cn: *muxclient.Conn, want: u32) !Reply {
+            var spins: usize = 0;
+            while (spins < 4000) : (spins += 1) {
+                try dm.tick(0);
+                if (!cn.fillAvailable()) return error.Disconnected;
+                if (try cn.takeFrame()) |f| {
+                    defer f.deinit(t.allocator);
+                    if (f.ftype != .web_helper_reply) continue;
+                    var parsed = try std.json.parseFromSlice(Reply, t.allocator, f.payload, .{ .ignore_unknown_fields = true });
+                    defer parsed.deinit();
+                    if (parsed.value.req != want) continue;
+                    var out = parsed.value;
+                    out.@"error" = "";
+                    if (!parsed.value.ok and std.mem.indexOf(u8, parsed.value.@"error", "instance name") != null) out.chan = 0xFFFF;
+                    return out;
+                }
+                _ = c.usleep(1000);
+            }
+            return error.Timeout;
+        }
+    };
+
+    // 1. Without the instance the per-user directory has no helper.
+    try conn.sendJson(.web_helper_connect, .{ .req = @as(u32, 1), .session = "" });
+    try t.expect(!(try Pump.reply(d, &conn, 1)).ok);
+    // 2. Naming the instance reaches its helper, and it sees the connect.
+    try conn.sendJson(.web_helper_connect, .{ .req = @as(u32, 2), .session = "", .instance = "hub" });
+    try t.expect((try Pump.reply(d, &conn, 2)).ok);
+    const afd = c.accept(lfd, null, null);
+    try t.expect(afd >= 0);
+    _ = c.close(afd);
+    // 3. A name that would leave the runtime directory is refused as a
+    // name, before any path is built.
+    try conn.sendJson(.web_helper_connect, .{ .req = @as(u32, 3), .session = "", .instance = "../mcp-hub" });
+    const bad = try Pump.reply(d, &conn, 3);
+    try t.expect(!bad.ok);
+    try t.expectEqual(@as(u32, 0xFFFF), bad.chan);
+}
+
 /// Per-channel state of the sketerm-native app pipe: the session's
 /// app connects straight to the daemon. Owns the protocol tracker
 /// and the daemon-owned shm pool mirrors.
@@ -6336,7 +6419,7 @@ pub const Daemon = struct {
         cl.queueJson(.web_helper_reply, .{ .req = req.req, .ok = true, .chan = ch.id });
     }
 
-    const WebHelperConnectReq = struct { req: u32 = 0, session: []const u8 = "" };
+    const WebHelperConnectReq = struct { req: u32 = 0, session: []const u8 = "", instance: []const u8 = "" };
 
     /// Bridge a browser helper ALREADY serving beside this daemon's
     /// socket (`web_helper_connect`): the assistant's helper of the MCP
@@ -6354,8 +6437,20 @@ pub const Daemon = struct {
         };
         defer parsed.deinit();
         const req = parsed.value;
+        // `instance` names a durable MCP instance (`sketerm mcp --name`)
+        // whose private daemon lives in `mcp-<instance>/` beside THIS
+        // socket: an SSH `--proxy` always reaches the per-user daemon,
+        // and the named instance's helper sits beside its own daemon,
+        // so the lookup is re-anchored there (capability
+        // `web_helper_instance`; an old daemon ignores the field, which
+        // is why clients must gate on the flag).
+        var inst_buf: [webpresence.MAX_PATH]u8 = undefined;
+        const anchor = if (req.instance.len == 0) self.sock_path else webpresence.instanceMuxSocket(&inst_buf, self.sock_path, req.instance) orelse {
+            cl.queueJson(.web_helper_reply, .{ .req = req.req, .ok = false, .@"error" = "not an MCP instance name" });
+            return;
+        };
         var sock_buf: [webpresence.MAX_PATH]u8 = undefined;
-        const sock = webpresence.helperSocketFor(&sock_buf, self.sock_path, req.session) orelse {
+        const sock = webpresence.helperSocketFor(&sock_buf, anchor, req.session) orelse {
             cl.queueJson(.web_helper_reply, .{ .req = req.req, .ok = false, .@"error" = "no browser helper socket beside this daemon" });
             return;
         };
