@@ -1,5 +1,30 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-09-28: saving live browser profiles, watching a named instance remotely
+
+For an unattended service driving websites (Arcana's integration hub runs its
+browser as `sketerm mcp --name <instance>`), two gaps closed.
+
+`web_profile_save` commits every persistent cookie jar NOW, views open and the
+engine running, after a sign-in, a 2FA approval or a human hand-back. It rides
+the helper's existing `flush_req`/`ev_flushed` (`webdrive.Engine.saveProfiles`
+waits for the token); each jar is one SQLite transaction, so a crash keeps the
+old or the new jar, never half. localStorage keeps Chromium's ~15s cadence and
+the engine's own 20s flush still runs. No engine = nothing live, said so.
+`capabilities.web_profile_save` is the preflight.
+
+A remote Watch/Take control reached only the helper beside the host's
+PER-USER daemon (what `--proxy` dials), never a named instance's, which lives
+in `mcp-<instance>/`. `web_helper_connect` now takes `instance` and re-anchors
+the lookup there (`webpresence.instanceMuxSocket`; the name rule is the one
+`--name` uses, so `..` is refused), gated by the welcome flag
+`web_helper_instance`. `sketerm mux [host] watch-web <instance> [--control]`
+opens it in the GUI (`webwatch.openInstance`), read-only by default.
+
+Proof: webpresence and daemon unit tests (the instance lookup, the refused
+escape), the web_profile_save result-shape test. Not yet proven end to end:
+a real SSH watch of a remote instance, and the GUI path beyond compiling.
+
 ## 2026-09-25: response-body capture for headless web views
 
 `web_open capture:{...}` records the response BODIES a headless view's page
