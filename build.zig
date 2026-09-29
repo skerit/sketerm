@@ -131,6 +131,9 @@ pub fn build(b: *std.Build) void {
     glib_opts.addOption(bool, "vtenc", have_vtenc);
     glib_opts.addOption(bool, "audio_opus", have_opus);
     glib_opts.addOption(bool, "dmabuf_import", have_dmabuf_import);
+    // WebM app recording (util/videorec.zig) links libvpx: GUI targets
+    // only. Every noglib artifact records GIF and says so in capabilities.
+    glib_opts.addOption(bool, "webm_rec", true);
     const glib_opts_mod = glib_opts.createModule();
     const noglib_opts = b.addOptions();
     noglib_opts.addOption(bool, "glib", false);
@@ -143,6 +146,7 @@ pub fn build(b: *std.Build) void {
     noglib_opts.addOption(bool, "vtenc", have_vtenc);
     noglib_opts.addOption(bool, "audio_opus", have_opus);
     noglib_opts.addOption(bool, "dmabuf_import", have_dmabuf_import);
+    noglib_opts.addOption(bool, "webm_rec", false);
     const noglib_opts_mod = noglib_opts.createModule();
 
     // Vendored Tree-sitter runtime + pinned upstream grammars for the
@@ -228,6 +232,35 @@ pub fn build(b: *std.Build) void {
     const mux_step = b.step("mux", "Build the sketerm-mux session daemon");
     mux_step.dependOn(&install_mux.step);
 
+    // GTK-free MCP server (`sketerm-mcp`) for hosts whose GTK is too old
+    // or absent for the GUI: the portable daemon's dependency set, so
+    // `sketerm mcp`'s headless terminal/app/web tools run anywhere
+    // sketerm-mux does. Not part of the default install; `zig build
+    // mcp-standalone`. Ship it beside sketerm-mux and sketerm-webengine,
+    // which it finds as siblings.
+    const mcp_mod = b.createModule(.{
+        .root_source_file = b.path("src/mcp_main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .strip = strip,
+    });
+    configureShippableCoreDeps(b, mcp_mod, core_cbindings_mod);
+    mcp_mod.addImport("build_options", noglib_opts_mod);
+    addVideo(b, mcp_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
+    const mcp_exe = b.addExecutable(.{
+        .name = "sketerm-mcp",
+        .root_module = mcp_mod,
+        .use_lld = use_lld,
+    });
+    const mcp_standalone_step = b.step("mcp-standalone", "Build sketerm-mcp, the GTK-free MCP server (no GUI toolchain needed)");
+    mcp_standalone_step.dependOn(&b.addInstallArtifact(mcp_exe, .{}).step);
+    mcp_standalone_step.dependOn(&b.addInstallDirectory(.{
+        .source_dir = b.path("data/shell-integration"),
+        .install_dir = .prefix,
+        .install_subdir = "share/sketerm/shell-integration",
+    }).step);
+
     // Public mux-client SDK — the supported module for OUT-OF-REPO
     // daemon clients (agent harnesses, automation). Consumers add
     // sketerm as a build.zig.zon dependency and import
@@ -309,14 +342,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
         .strip = strip,
     });
-    mux_portable_mod.addImport("cbindings", portable_cbindings);
-    addPkgConfigIncludes(b, mux_portable_mod, "fribidi");
-    mux_portable_mod.addCSourceFile(.{
-        .file = b.path("vendor/stb_image_impl.c"),
-        .flags = &.{ "-O2", "-Wno-unused-function", "-Wno-unused-but-set-variable" },
-    });
-    addZstd(b, mux_portable_mod);
-    mux_portable_mod.addIncludePath(b.path("vendor"));
+    configureShippableCoreDeps(b, mux_portable_mod, portable_cbindings);
     // mux-portable NEVER carries the ScreenCaptureKit backend:
     // explicit -Dportable-target triples count as cross builds, so
     // zig adds no macOS SDK framework search paths — even on a Mac
@@ -333,6 +359,7 @@ pub fn build(b: *std.Build) void {
     portable_opts.addOption(bool, "vtenc", false);
     portable_opts.addOption(bool, "audio_opus", false);
     portable_opts.addOption(bool, "dmabuf_import", false);
+    portable_opts.addOption(bool, "webm_rec", false);
     mux_portable_mod.addImport("build_options", portable_opts.createModule());
     const mux_portable_exe = b.addExecutable(.{
         .name = "sketerm-mux-portable",
@@ -1821,6 +1848,24 @@ fn configureCoreDeps(
     mod.addImport("cbindings", cbindings_mod);
     mod.addIncludePath(b.path("vendor/aro_shims"));
     addPkgConfig(b, mod, "fribidi");
+    mod.addCSourceFile(.{
+        .file = b.path("vendor/stb_image_impl.c"),
+        .flags = &.{ "-O2", "-Wno-unused-function", "-Wno-unused-but-set-variable" },
+    });
+    addZstd(b, mod);
+    mod.addIncludePath(b.path("vendor"));
+}
+
+/// `configureCoreDeps` minus the fribidi LINK, for binaries copied to other
+/// hosts (`mux-portable`, `sketerm-mcp`): nothing they reach calls fribidi,
+/// so libc stays the only runtime dependency.
+fn configureShippableCoreDeps(
+    b: *std.Build,
+    mod: *std.Build.Module,
+    cbindings_mod: *std.Build.Module,
+) void {
+    mod.addImport("cbindings", cbindings_mod);
+    addPkgConfigIncludes(b, mod, "fribidi");
     mod.addCSourceFile(.{
         .file = b.path("vendor/stb_image_impl.c"),
         .flags = &.{ "-O2", "-Wno-unused-function", "-Wno-unused-but-set-variable" },

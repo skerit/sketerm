@@ -9,6 +9,44 @@ headless terminals of the server's own daemon otherwise; the `term_*`,
 (private per server by default, see `--name`/`--durable`). `capabilities`
 is the one preflight: it reports what this server can reach right now.
 
+## Headless hosts: `sketerm-mcp`
+
+`sketerm mcp` lives in the GUI binary, which links GTK 4.14+ and libadwaita.
+For a server without them, `zig build mcp-standalone` builds `sketerm-mcp`,
+the same server with the portable daemon's dependency set: libc (plus libm)
+is its only runtime dependency. Its arguments are what `sketerm mcp` takes
+after `mcp`. It finds `sketerm-mux` and `sketerm-webengine` as siblings of
+its own executable, so ship the three side by side:
+
+```
+zig build mcp-standalone -Dvideo=false -Dtarget=x86_64-linux-gnu.2.36 -Dcpu=baseline
+zig build mux-portable                       # install as bin/sketerm-mux
+zig build web -Dtarget=x86_64-linux-gnu.2.36 -Dcpu=baseline -Dcef-runtime-dir=/opt/sketerm/cef
+```
+
+Deploy `zig-out/share/sketerm/shell-integration/` alongside the `bin/`
+directory as `share/sketerm/shell-integration/` too. The standalone build
+installs these scripts; local shell command-completion tracking and SSH
+shell bootstrapping need them. The browser helper and CEF are optional
+when no browser tools are needed. `--web-gui` still requires a running
+GUI, a sibling `sketerm` executable, or an explicit `SKETERM_GUI_BIN`.
+
+Pick the `-Dtarget` glibc to match the server's (`ldd --version`) and use
+`-Dcpu=baseline` because the default build is tuned to the build host's
+CPU. `-Dvideo=false` is needed for any explicit `-Dtarget` because the
+optional codec shims compile against the host's headers. The helper
+loads `libcef.so` from `-Dcef-runtime-dir`, so copy the matching CEF
+`Release/` directory there (the pinned CDN build needs glibc 2.25+;
+`ldd libcef.so` on the server lists any system library to install).
+A distro CEF of a different version will not do: the helper is bound to
+the pinned CEF API. The one difference from the GUI's server:
+`app_record_start` records GIF only (no libvpx), reported as
+`capabilities.app_record_webm: false`.
+
+After building `mcp-standalone` and `mux`, run
+`python3 dist/test-mcp-standalone.py` to check a relocated installation
+with no GUI sibling, including shell integration and WebM refusal.
+
 ## Tool reference
 
 Generated from the tool table; a unit test fails when this block and the

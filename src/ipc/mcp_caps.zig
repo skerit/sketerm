@@ -172,6 +172,10 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
     const pathz = @import("../util/pathz.zig");
     const xwl_ok = pathz.executableOnPath("Xwayland") and pathz.executableOnPath("xwayland-satellite");
     try res.fact("app_xwayland", xwl_ok);
+    const webm_ok = @import("../util/videorec.zig").available;
+    try res.fact("app_record_webm", webm_ok);
+    if (!webm_ok)
+        try res.text("app_record_start records GIF only: this binary links no libvpx, so format:\"webm\" is refused and the default format is gif");
     if (!xwl_ok)
         try res.text("launch_app xwayland:true (X11-only apps) needs Xwayland AND xwayland-satellite on THIS machine's PATH; a launch asking for it fails until they are installed");
 

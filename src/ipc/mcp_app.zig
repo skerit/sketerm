@@ -6,6 +6,7 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const atomicwrite = @import("../util/atomicwrite.zig");
 const appdrive = @import("appdrive.zig");
+const videorec = @import("../util/videorec.zig");
 const ocr = @import("../util/ocr.zig");
 const mcp = @import("mcp.zig");
 const eql = std.mem.eql;
@@ -1761,8 +1762,12 @@ fn appRecordStart(arena: std.mem.Allocator, _: Tool, args: std.json.Value, app: 
     }
     if (win_id == 0) return errRes(arena, .not_found, "no rendered window yet (try app_wait first)");
     // WebM/VP9 is the default (smaller, higher quality); format:"gif"
-    // for the animated GIF.
-    const want_gif = if (argStr(args, "format")) |fmt| std.mem.eql(u8, fmt, "gif") else false;
+    // for the animated GIF. A build without libvpx defaults to GIF and
+    // refuses an explicit webm rather than failing at the first frame.
+    const fmt_arg = argStr(args, "format");
+    if (!videorec.available and fmt_arg != null and std.mem.eql(u8, fmt_arg.?, "webm"))
+        return errRes(arena, .unavailable, "webm recording is not built into this binary (no libvpx); use format:\"gif\"");
+    const want_gif = if (fmt_arg) |fmt| std.mem.eql(u8, fmt, "gif") else !videorec.available;
     const max_px: u32 = @intCast(std.math.clamp(argInt(args, "max_px") orelse (if (want_gif) @as(i64, 800) else 1280), 0, 4096));
     const fps: u32 = @intCast(std.math.clamp(argInt(args, "fps") orelse 0, 0, 60));
     app.recordStart(win_id, max_px, !want_gif, fps) catch return errRes(arena, .not_found, "no such window");

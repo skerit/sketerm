@@ -1,17 +1,38 @@
 //! WebM/VP9 video recorder for app windows — the higher-quality
 //! sibling of gifrec.zig. Feeds committed wl_shm frames through a
 //! BGRA→I420 conversion, the libvpx VP9 encoder (vendor/vpxenc_shim.c)
-//! and a live WebM muxer (webm.zig). GUI-side only: the daemon links
-//! no libvpx, so nothing here may be imported by the mux graph.
+//! and a live WebM muxer (webm.zig). Builds without libvpx expose an
+//! unavailable encoder so GTK-free clients can still import this module.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const png = @import("png.zig");
 const webm = @import("webm.zig");
 
-extern fn sk_vpxenc_open(w: c_int, h: c_int, fps: c_int, bitrate_kbps: c_int) ?*anyopaque;
-extern fn sk_vpxenc_encode(enc: ?*anyopaque, i420: [*]const u8, force_kf: c_int, out: *[*]const u8, out_size: *usize, is_kf: *c_int) c_int;
-extern fn sk_vpxenc_flush(enc: ?*anyopaque, out: *[*]const u8, out_size: *usize, is_kf: *c_int) c_int;
-extern fn sk_vpxenc_close(enc: ?*anyopaque) void;
+/// False in artifacts that link no libvpx (`sketerm-mcp`); callers must refuse WebM up front, since the stub encoder only fails at the first frame.
+pub const available = build_options.webm_rec;
+
+const vpx = if (available) struct {
+    extern fn sk_vpxenc_open(w: c_int, h: c_int, fps: c_int, bitrate_kbps: c_int) ?*anyopaque;
+    extern fn sk_vpxenc_encode(enc: ?*anyopaque, i420: [*]const u8, force_kf: c_int, out: *[*]const u8, out_size: *usize, is_kf: *c_int) c_int;
+    extern fn sk_vpxenc_flush(enc: ?*anyopaque, out: *[*]const u8, out_size: *usize, is_kf: *c_int) c_int;
+    extern fn sk_vpxenc_close(enc: ?*anyopaque) void;
+} else struct {
+    fn sk_vpxenc_open(_: c_int, _: c_int, _: c_int, _: c_int) ?*anyopaque {
+        return null;
+    }
+    fn sk_vpxenc_encode(_: ?*anyopaque, _: [*]const u8, _: c_int, _: *[*]const u8, _: *usize, _: *c_int) c_int {
+        return -1;
+    }
+    fn sk_vpxenc_flush(_: ?*anyopaque, _: *[*]const u8, _: *usize, _: *c_int) c_int {
+        return -1;
+    }
+    fn sk_vpxenc_close(_: ?*anyopaque) void {}
+};
+const sk_vpxenc_open = vpx.sk_vpxenc_open;
+const sk_vpxenc_encode = vpx.sk_vpxenc_encode;
+const sk_vpxenc_flush = vpx.sk_vpxenc_flush;
+const sk_vpxenc_close = vpx.sk_vpxenc_close;
 
 pub const Error = error{ EncodeFailed, OutOfMemory };
 
@@ -181,6 +202,22 @@ fn rgbaToI420(rgba: []const u8, w: u32, h: u32, out: []u8) void {
             u_plane[cy * cw + cx] = @intCast(std.math.clamp(u, 0, 255));
             v_plane[cy * cw + cx] = @intCast(std.math.clamp(v, 0, 255));
         }
+    }
+}
+
+test "recorder availability matches encoding support" {
+    var rec = Rec.init(std.testing.allocator, 0);
+    defer rec.abort();
+    const pixels = [_]u8{128} ** (4 * 4 * 4);
+    if (available) {
+        try rec.addShmFrame(&pixels, 4, 4, 0, 0);
+        const data = try rec.finish(100);
+        defer std.testing.allocator.free(data);
+        try std.testing.expect(data.len > 0);
+        try std.testing.expectEqual(@as(usize, 1), rec.frames);
+    } else {
+        try std.testing.expectError(Error.EncodeFailed, rec.addShmFrame(&pixels, 4, 4, 0, 0));
+        try std.testing.expectEqual(@as(usize, 0), rec.frames);
     }
 }
 

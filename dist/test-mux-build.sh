@@ -36,6 +36,7 @@ run_mux_build() {
 cd "$root"
 run_mux_build mux
 run_mux_build mux-portable
+run_mux_build mcp-standalone
 
 if grep -Eq 'sketerm-gui|gtk4|libadwaita|glib-2.0|gio|freetype|harfbuzz|epoxy|fontconfig|vpx|libpulse' \
         "$work/pkg-config.log"; then

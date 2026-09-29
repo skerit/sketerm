@@ -53,6 +53,11 @@ Three binaries:
   own process for crash isolation. Without it the browser face says so
   and everything else keeps working.
 
+For hosts without GTK, `zig build mcp-standalone` additionally builds
+**`sketerm-mcp`**, the same MCP server without the GUI dependencies, and
+installs its shell-integration scripts. App recording is GIF-only in this
+binary. See [standalone deployment](docs/mcp.md#headless-hosts-sketerm-mcp).
+
 ## Features
 
 **Terminal.** Truecolor SGR with all line decorations, Sixel + Kitty +

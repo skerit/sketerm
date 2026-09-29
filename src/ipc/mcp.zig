@@ -15,6 +15,7 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const clock = @import("../util/clock.zig");
 const platform = @import("../util/platform.zig");
+const SpinLock = @import("../util/spinlock.zig").SpinLock;
 const protocol = @import("protocol.zig");
 const ctlclient = @import("ctlclient.zig");
 const muxclient = @import("../mux/client.zig");
@@ -498,13 +499,10 @@ pub const Watchdog = struct {
     /// Guards started_ms/fds/fd_count against the check-then-shutdown in
     /// loop(): without it, a call ending right at the cap can race begin()
     /// resetting the state, aborting the NEXT call's connections at t=0.
-    /// Uncontended in practice (the thread wakes once per second).
-    /// pthread via libc: Zig 0.16 std.Thread has no Mutex.
-    pub var mu: c.pthread_mutex_t = undefined;
-
-    pub fn initLock() void {
-        _ = c.pthread_mutex_init(&mu, null);
-    }
+    /// Uncontended in practice (the thread wakes once per second), and
+    /// every section is bounded fd bookkeeping plus non-sleeping
+    /// shutdown() calls, so the repo spinlock is the right primitive.
+    pub var mu: SpinLock = .init;
     /// Monotonic ms when the in-flight call started; 0 = idle.
     pub var started_ms: i64 = 0;
     /// Conn fds snapshotted at call start. An fd closed AND reused
@@ -520,8 +518,8 @@ pub const Watchdog = struct {
     pub var hard_ms: i64 = 150_000;
 
     pub fn begin() void {
-        _ = c.pthread_mutex_lock(&mu);
-        defer _ = c.pthread_mutex_unlock(&mu);
+        mu.lock();
+        defer mu.unlock();
         fd_count = 0;
         // A previous call's panel connection is gone; the persistent fs
         // one is deliberately kept, but both stop latches must clear or
@@ -559,8 +557,8 @@ pub const Watchdog = struct {
     }
 
     pub fn end() void {
-        _ = c.pthread_mutex_lock(&mu);
-        defer _ = c.pthread_mutex_unlock(&mu);
+        mu.lock();
+        defer mu.unlock();
         started_ms = 0;
     }
 
@@ -573,7 +571,7 @@ pub const Watchdog = struct {
         while (true) {
             var ts = c.struct_timespec{ .tv_sec = 1, .tv_nsec = 0 };
             _ = c.nanosleep(&ts, null);
-            _ = c.pthread_mutex_lock(&mu);
+            mu.lock();
             const overdue = started_ms != 0 and !fired.load(.acquire) and clock.nowMs() - started_ms > hard_ms;
             if (overdue) {
                 fired.store(true, .release);
@@ -583,7 +581,7 @@ pub const Watchdog = struct {
                 // fd atomically so the watchdog covers establishment too.
                 cancelDynamicFds();
             }
-            _ = c.pthread_mutex_unlock(&mu);
+            mu.unlock();
             if (overdue) {
                 // stderr only: mcp_log is main-thread-owned (its
                 // close at exit would race a note from this thread).
@@ -903,7 +901,6 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
             Watchdog.hard_ms = @max(ms, 30_000);
         } else |_| {}
     }
-    Watchdog.initLock();
     if (std.Thread.spawn(.{}, Watchdog.loop, .{})) |t| t.detach() else |_| {}
 
     // Project-level input-timing overrides (see Tuning). Logged so

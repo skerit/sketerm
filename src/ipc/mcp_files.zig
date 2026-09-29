@@ -68,7 +68,6 @@ test "watchdog fs cancellation follows a replacement connection during one call"
     const t = std.testing;
     Watchdog.fs_fd.release();
     Watchdog.fs_fd.arm();
-    Watchdog.initLock();
     Watchdog.begin();
     defer Watchdog.end();
 

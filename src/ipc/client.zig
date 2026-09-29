@@ -520,11 +520,12 @@ pub fn discoverGuiSocket(allocator: std.mem.Allocator, how: Discover) ?[:0]u8 {
     const rt = @import("../util/platform.zig").runtimeDir();
     const dir_z = std.fmt.allocPrintSentinel(allocator, "{s}/sketerm", .{rt}, 0) catch return null;
     defer allocator.free(dir_z);
-    const dir = c.g_dir_open(dir_z.ptr, 0, null) orelse return null;
-    defer c.g_dir_close(dir);
+    const dir = c.opendir(dir_z.ptr) orelse return null;
+    defer _ = c.closedir(dir);
     var found: ?[:0]u8 = null;
-    while (c.g_dir_read_name(dir)) |name_c| {
-        const name = std.mem.span(@as([*:0]const u8, @ptrCast(name_c)));
+    while (c.readdir(dir)) |ent| {
+        const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
+        if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
         if (!std.mem.endsWith(u8, name, ".sock")) continue;
         // The mux daemon's socket lives in the same dir; it speaks a
         // different protocol and must never match GUI discovery.

@@ -124,3 +124,4 @@ int kevent(int kq, const struct kevent *changelist, int nchanges,
 
 #include <stb_image.h>
 #include <stb_image_write.h>
+#include <msf_gif.h> /* sketerm-mcp: GIF app recording (impl in stb_image_impl.c) */

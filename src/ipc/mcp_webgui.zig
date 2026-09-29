@@ -67,9 +67,7 @@ pub const Grant = struct {
 /// the config key (`web_gui` in `[mcp]` / `[mcp.<name>]`) share one name.
 pub const ENV = "SKETERM_MCP_WEB_GUI";
 pub const FLAG = "--web-gui";
-/// Executable spawned as `<exe> web` when no GUI is running; defaults
-/// to this process's own image. An explicit, documented override so a
-/// test can stand in a fake GUI -- never a hidden hook.
+/// Overrides the GUI executable, which otherwise defaults to this GUI image or the standalone server's sibling `sketerm`.
 pub const EXE_ENV = "SKETERM_GUI_BIN";
 
 /// Bounded wait for a spawned GUI's control socket.
@@ -205,18 +203,21 @@ fn realDiscover(_: *anyopaque, allocator: std.mem.Allocator) ?[:0]u8 {
     return @import("client.zig").discoverGuiSocket(allocator, .any);
 }
 
-/// Start `<exe> web` DETACHED: double-forked so init reaps it and it
-/// outlives this server, in its own session, with stdio on /dev/null
-/// -- this process's stdin/stdout ARE the JSON-RPC stream, and a GUI
-/// writing a warning there would corrupt it. The daemon idle-exit hint
-/// this server set for its private instances must not reach the GUI's
-/// real per-user daemon.
+fn guiExecutable(own: [:0]const u8, gui_build: bool, buf: []u8) ?[:0]const u8 {
+    if (gui_build) return own;
+    const dir = std.fs.path.dirname(own) orelse return null;
+    return std.fmt.bufPrintZ(buf, "{s}/sketerm", .{dir}) catch null;
+}
+
+/// Spawn a detached GUI with stdio redirected away from JSON-RPC and without the private daemon's idle-exit hint.
 fn realSpawn(_: *anyopaque) bool {
     var exe_buf: [4096:0]u8 = undefined;
+    var sibling_buf: [4096]u8 = undefined;
     const exe: [*:0]const u8 = if (c.getenv(EXE_ENV)) |v|
         @ptrCast(v)
     else
-        (platform.exePathZ(&exe_buf) orelse return false).ptr;
+        (guiExecutable(platform.exePathZ(&exe_buf) orelse return false, @import("build_options").glib, &sibling_buf) orelse return false).ptr;
+    if (c.access(exe, c.X_OK) != 0) return false;
     const pid = c.fork();
     if (pid < 0) return false;
     if (pid == 0) {
@@ -310,6 +311,13 @@ pub fn ensureBackend() error{Unavailable}!mcp.Backend {
 // ---------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------
+
+test "standalone web_gui resolves the GUI sibling, never its own MCP image" {
+    var buf: [4096]u8 = undefined;
+    try std.testing.expectEqualStrings("/opt/bin/sketerm", guiExecutable("/opt/bin/sketerm-mcp", false, &buf).?);
+    try std.testing.expectEqualStrings("/opt/bin/renamed-gui", guiExecutable("/opt/bin/renamed-gui", true, &buf).?);
+    try std.testing.expect(guiExecutable("/opt/bin/sketerm-mcp", false, buf[0..1]) == null);
+}
 
 test "web_gui grant precedence: config [mcp] < [mcp.<name>] < env < flag" {
     const t = std.testing;
