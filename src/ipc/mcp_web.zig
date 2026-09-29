@@ -2802,6 +2802,27 @@ fn webGuiUnavailable(arena: std.mem.Allocator) ![]const u8 {
     return mcp.errRes(arena, .unavailable, if (why.len > 0) why else "the web_gui grant is active but no sketerm GUI could be reached; nothing was opened headlessly");
 }
 
+fn validBrowserName(value: std.json.Value) bool {
+    if (value != .string) return false;
+    const label = value.string;
+    if (label.len == 0 or label.len > 160) return false;
+    const utf8 = std.unicode.Utf8View.init(label) catch return false;
+    var it = utf8.iterator();
+    while (it.nextCodepoint()) |cp| {
+        if (cp < 0x20 or (cp >= 0x7f and cp <= 0x9f) or cp == 0x2028 or cp == 0x2029) return false;
+    }
+    return true;
+}
+
+test "browser names reject nonstrings and Unicode line breaks without splitting UTF-8" {
+    try std.testing.expect(!validBrowserName(.null));
+    try std.testing.expect(!validBrowserName(.{ .integer = 42 }));
+    for ([_][]const u8{ "", "x" ** 161, "bad\xff", "a\nb", "a\r", "a\x00", "a\tb", "a\u{85}b", "a\u{2028}b", "a\u{2029}b" }) |s|
+        try std.testing.expect(!validBrowserName(.{ .string = s }));
+    try std.testing.expect(validBrowserName(.{ .string = "Login \"café\"" }));
+    try std.testing.expect(validBrowserName(.{ .string = "é" ** 80 }));
+}
+
 pub fn webTool(
     arena: std.mem.Allocator,
     backend: mcp.Backend,
@@ -2809,6 +2830,14 @@ pub fn webTool(
     args: std.json.Value,
 ) ![]const u8 {
     const eql = std.mem.eql;
+    // Validate before selecting a backend: invalid names must not start a
+    // browser, and a present non-string is not the same as an omitted name.
+    if (eql(u8, name, "web_open") and args == .object) {
+        if (args.object.get("name")) |value| {
+            if (!validBrowserName(value))
+                return mcp.errRes(arena, .invalid_args, "name must be a non-empty, single-line UTF-8 browser session name without control characters (at most 160 bytes)");
+        }
+    }
     // Diagnostics must remain readable after helper death, without spawning a
     // replacement (which would overwrite precisely the evidence requested).
     if (eql(u8, name, "web_diagnostic")) return diagnosticTool(arena, args);
@@ -2832,10 +2861,6 @@ pub fn webTool(
     if (eql(u8, name, "web_open")) {
         const url = mcp.argStr(args, "url");
         const browser_name = mcp.argStr(args, "name");
-        if (browser_name) |label| {
-            if (label.len == 0 or label.len > 160 or !std.unicode.utf8ValidateSlice(label) or std.mem.indexOfAny(u8, label, "\r\n\x00") != null)
-                return mcp.errRes(arena, .invalid_args, "name must be a non-empty, single-line UTF-8 browser session name (at most 160 bytes)");
-        }
         const where = mcp.argStr(args, "where") orelse "tab";
         const vw: u16 = @intCast(std.math.clamp(mcp.argInt(args, "width") orelse webdrive.DEFAULT_W, 320, 3840));
         const vh: u16 = @intCast(std.math.clamp(mcp.argInt(args, "height") orelse webdrive.DEFAULT_H, 240, 2160));

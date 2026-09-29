@@ -3874,7 +3874,9 @@ fn assistantWebWatchStage(allocator: std.mem.Allocator, app: *appdrive.App, sock
     defer if (m_open) m.close();
     if (!m.initialize()) return "the web watch MCP server never answered initialize";
     var args: [1024]u8 = undefined;
-    const open_args = std.fmt.bufPrint(&args, "{{\"name\":\"Login review\",\"url\":\"file://{s}\",\"timeout_ms\":45000,\"snapshot\":\"none\"}}", .{page}) catch
+    // A realistic long name exercises ellipsis in both the popover and
+    // narrow split-pane chip, without losing the control button.
+    const open_args = std.fmt.bufPrint(&args, "{{\"name\":\"Login review for the customer portal — password and two-factor sign-in with the assistant\",\"url\":\"file://{s}\",\"timeout_ms\":45000,\"snapshot\":\"none\"}}", .{page}) catch
         return "web_open arguments did not fit";
     const opened = m.call("web_open", open_args, 90_000) orelse return "web_open on the isolated MCP timed out";
     if (mcpHas(opened, "isError"))
@@ -3895,6 +3897,10 @@ fn assistantWebWatchStage(allocator: std.mem.Allocator, app: *appdrive.App, sock
         return "the AI badge did not show the assistant's browser name";
     if (waitOcrWordCenter(allocator, app, pop_id, "Local", 10_000) == null)
         return "the AI badge did not show the page subtitle";
+    if (app.screenshotPng(pop_id, 0, null, 0)) |shot| {
+        defer allocator.free(shot.png);
+        writePng("zig-out/smoke-e2e-webwatch-menu.png", shot.png);
+    } else |_| {}
     const watch = waitOcrWordCenter(allocator, app, pop_id, "Watch", 10_000) orelse {
         if (app.screenshotPng(pop_id, 0, null, 0)) |shot| {
             defer allocator.free(shot.png);
@@ -3995,6 +4001,22 @@ fn assistantWebWatchStage(allocator: std.mem.Allocator, app: *appdrive.App, sock
         return whyf("clicking Take control at {d},{d} (chip {d},{d} {d}x{d}) did not flip the pane's lease chip (see zig-out/smoke-e2e-webwatch-notaken.png)", .{ take.x + take.w - 12, take.y + take.h / 2, take.x, take.y, take.w, take.h });
     }
     _ = app.waitIdle(300, 5_000);
+    // Watch on an existing controlled viewer must actually give up control.
+    if (!wsFocus(allocator, sock_path, keep_ids[0])) return "could not focus the assistant pane for Watch";
+    pumpFor(app, 300);
+    _ = app.waitVisualSettle(win_id, 400, 5_000, 0.1, null);
+    const readonly_chip = waitAssistantChip(app, win_id, true, 10_000) orelse return "no badge for returning to Watch";
+    app.click(win_id, readonly_chip.x + readonly_chip.w / 2, readonly_chip.y + readonly_chip.h / 2, 1) catch return "opening Watch menu failed";
+    const readonly_pop = waitPopup(app, true, 10_000) orelse return "no Watch menu";
+    const readonly_button = waitOcrWordCenter(allocator, app, readonly_pop, "Watch", 10_000) orelse return "no Watch action";
+    app.click(readonly_pop, readonly_button.x, readonly_button.y, 1) catch return "selecting Watch failed";
+    _ = waitPopup(app, false, 5_000);
+    pumpFor(app, 500);
+    app.click(win_id, red.x + red.w / 2, red.y + red.h / 2, 1) catch return "clicking after Watch failed";
+    if (waitColorBox(app, win_id, isLime, 2_500) != null) return "Watch retained the previous control lease";
+    const retake = waitPaneChip(app, win_id, 5_000) orelse return "Watch did not restore the Take control chip";
+    app.clickEx(win_id, retake.x + retake.w - 12, retake.y + retake.h / 2, 1, 100, 1) catch return "retaking control failed";
+    pumpFor(app, 500);
     // OFF-CENTRE on purpose: the frame is letterboxed at the assistant's
     // size, and a mapping that is merely centred right (the bug: the
     // picture allocated larger than the fit and CONTAIN re-centring the
@@ -4054,16 +4076,24 @@ fn assistantWebWatchStage(allocator: std.mem.Allocator, app: *appdrive.App, sock
 
     // Closing the owner's LAST page retains this exact viewer, and its
     // control preference applies to the replacement without another click.
-    const closed = m.call("web_close", "{}", 30_000) orelse return "closing the last owner tab timed out";
-    if (mcpHas(closed, "isError")) return "closing the last owner tab failed";
-    if (waitOcrWordCenter(allocator, app, win_id, "Following", 10_000) == null)
-        return "the last owner close did not leave a following placeholder";
-    const reopened = m.call("web_open", open_args, 90_000) orelse return "reopening the owner tab timed out";
-    if (mcpHas(reopened, "isError")) return "reopening the owner tab failed";
-    const replacement = waitColorBox(app, win_id, isRed, 15_000) orelse return "the viewer did not follow the next owner tab";
-    if (!waitWebPaneTitled(allocator, sock_path, app, web_pane, "watch:red", 5_000)) return "following the next tab replaced the viewer pane";
-    app.click(win_id, replacement.x + replacement.w / 3, replacement.y + replacement.h / 3, 1) catch return "clicking the replacement failed";
-    if (waitColorBox(app, win_id, isLime, 10_000) == null) return "the replacement did not retain Take control";
+    // Repeat: one cycle misses a stale placeholder that failed to retire,
+    // since the next owner close is then mistaken for a non-last page.
+    for (0..2) |_| {
+        const closed = m.call("web_close", "{}", 30_000) orelse return "closing the last owner tab timed out";
+        if (mcpHas(closed, "isError")) return "closing the last owner tab failed";
+        if (waitOcrWordCenter(allocator, app, win_id, "Following", 10_000) == null)
+            return "the last owner close did not leave a following placeholder";
+        if (app.screenshotPng(win_id, 0, null, 0)) |shot| {
+            defer allocator.free(shot.png);
+            writePng("zig-out/smoke-e2e-webwatch-waiting.png", shot.png);
+        } else |_| {}
+        const reopened = m.call("web_open", open_args, 90_000) orelse return "reopening the owner tab timed out";
+        if (mcpHas(reopened, "isError")) return "reopening the owner tab failed";
+        const replacement = waitColorBox(app, win_id, isRed, 15_000) orelse return "the viewer did not follow the next owner tab";
+        if (!waitWebPaneTitled(allocator, sock_path, app, web_pane, "watch:red", 5_000)) return "following the next tab replaced the viewer pane";
+        app.click(win_id, replacement.x + replacement.w / 3, replacement.y + replacement.h / 3, 1) catch return "clicking the replacement failed";
+        if (waitColorBox(app, win_id, isLime, 10_000) == null) return "the replacement did not retain Take control";
+    }
 
     // Move the existing watch beside the original assistant pane via the
     // visible badge, without navigating or destroying the owner's page.
@@ -4094,6 +4124,10 @@ fn assistantWebWatchStage(allocator: std.mem.Allocator, app: *appdrive.App, sock
     }
     if (tabCount(allocator, sock_path) != tabs_before) return "Beside opened a new tab instead of a split";
     if (!waitPaneGone(allocator, sock_path, web_pane, 5_000)) return "Beside left the old viewer behind";
+    if (app.screenshotPng(win_id, 0, null, 0)) |shot| {
+        defer allocator.free(shot.png);
+        writePng("zig-out/smoke-e2e-webwatch-side-by-side.png", shot.png);
+    } else |_| {}
 
     // Close the tab: the assistant's page lives on, changed by our click.
     closeAddedPanes(allocator, sock_path, app, keep_ids[0..keep_n]);

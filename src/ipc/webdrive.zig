@@ -1222,13 +1222,16 @@ pub const Engine = struct {
     /// Write `web.json` next to the socket (see the header). Best
     /// effort: enumeration metadata, never load-bearing.
     pub fn writePresence(self: *Engine) void {
-        if (self.state != .ready) return;
+        // This file also locates the owner's watchable session. An adopted
+        // connection has neither its pid nor its session; publishing our
+        // local view state would erase the real owner's discovery record.
+        if (self.state != .ready or self.owner != .self_spawned) return;
         if (self.presence_started_ms == 0) self.presence_started_ms = clock.nowMs();
         var path_z: [4096:0]u8 = undefined;
         const p = self.routePathZ(&path_z, ".json") orelse return;
         const url = if (self.findView(self.current)) |v| v.url orelse "" else "";
         const host = @import("../web/urlhost.zig").hostOf(url, .{ .require_scheme = true });
-        const domain = if (host.len != 0) host else if (url.len != 0) "Local page" else "";
+        const domain = if (host.len != 0) host else if (url.len != 0) "Local page" else if (self.views.items.len == 0) "Waiting for a page" else "Opening page";
         const body = std.json.Stringify.valueAlloc(self.gpa, .{
             .mcp_pid = c.getpid(),
             .helper_pid = self.pid,
@@ -1249,6 +1252,8 @@ pub const Engine = struct {
     }
 
     fn removePresence(self: *Engine) void {
+        if (self.owner != .self_spawned) return;
+        self.presence_started_ms = 0;
         var path_z: [4096:0]u8 = undefined;
         const p = self.routePathZ(&path_z, ".json") orelse return;
         _ = c.unlink(p.ptr);
@@ -3499,6 +3504,41 @@ pub const Engine = struct {
 // ---------------------------------------------------------------------
 // Tests (pure bookkeeping; no helper is spawned)
 // ---------------------------------------------------------------------
+
+test "presence updates and teardown leave broker and adopted owner records intact" {
+    const gpa = std.testing.allocator;
+    var template = "/tmp/sk-presence-owner-XXXXXX".* ++ [_]u8{0};
+    const dir = std.mem.span(c.mkdtemp(&template) orelse return error.SkipZigTest);
+    defer _ = c.rmdir(dir.ptr);
+    var path_buf: [512:0]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "{s}/web.json", .{dir});
+    defer _ = c.unlink(path.ptr);
+    const original = "{\"broker_pid\":42,\"helper_pid\":43,\"session\":\"web-owner\",\"label\":\"Owner login\"}";
+    try @import("../util/atomicwrite.zig").writeCacheFile(path, original, 0o600);
+    for ([_]Owner{ .broker, .adopted }) |owner| {
+        var eng = try Engine.init(gpa, dir, null, null, .{});
+        eng.state = .ready;
+        eng.owner = owner;
+        eng.setBrowserLabel("Sibling login");
+        eng.writePresence();
+        eng.lost();
+        eng.deinit();
+        const f = c.fopen(path.ptr, "r") orelse return error.TestUnexpectedResult;
+        defer _ = c.fclose(f);
+        var bytes: [512]u8 = undefined;
+        const n = c.fread(&bytes, 1, bytes.len, f);
+        try std.testing.expectEqualStrings(original, bytes[0..n]);
+    }
+    // The spawning client still publishes and refreshes its own label.
+    var eng = try Engine.init(gpa, dir, null, null, .{});
+    defer eng.deinit();
+    eng.state = .ready;
+    eng.owner = .self_spawned;
+    eng.setBrowserLabel("Login \"café\"");
+    var mux_buf: [512]u8 = undefined;
+    const metadata = @import("../web/webpresence.zig").readMetadata(gpa, try std.fmt.bufPrint(&mux_buf, "{s}/mux.sock", .{dir}), "");
+    try std.testing.expectEqualStrings("Login \"café\"", metadata.title());
+}
 
 test "an offer for an asked-for download is DECIDED into the caller's path" {
     const gpa = std.testing.allocator;

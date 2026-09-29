@@ -203,12 +203,12 @@ pub fn attachVerb(lease: muxtabs.Lease) AttachVerb {
     return switch (lease) {
         .read_only => .{
             .icon = "view-reveal-symbolic",
-            .tip = "Watch read-only - view the session without taking control of it",
+            .tip = "View without sending keyboard or mouse input; also gives up control if you were controlling this session",
             .text = "Watch",
         },
         .control, .default => .{
             .icon = "input-keyboard-symbolic",
-            .tip = "Take control - attach and take the controller lease so your input reaches it",
+            .tip = "Use your keyboard and mouse in this session, for example to sign in",
             .text = "Take control",
         },
     };
@@ -473,6 +473,15 @@ pub const Watcher = struct {
             c.gtk_widget_add_css_class(none, "dim-label");
             c.gtk_box_append(@ptrCast(root), none);
         }
+        if (summarize(self.roster.items).web != 0) {
+            const help = c.gtk_label_new("Watch is read-only. Take control to type or sign in.\nFor side by side, select a destination pane first.").?;
+            c.gtk_label_set_xalign(@ptrCast(help), 0);
+            c.gtk_label_set_wrap(@ptrCast(help), 1);
+            c.gtk_label_set_max_width_chars(@ptrCast(help), 44);
+            c.gtk_widget_add_css_class(help, "dim-label");
+            c.gtk_widget_add_css_class(help, "caption");
+            c.gtk_box_append(@ptrCast(root), help);
+        }
         c.gtk_popover_set_child(pop, root);
     }
 
@@ -517,8 +526,12 @@ pub const Watcher = struct {
         c.gtk_label_set_ellipsize(@ptrCast(label), c.PANGO_ELLIPSIZE_END);
         c.gtk_label_set_max_width_chars(@ptrCast(label), 36);
         c.gtk_widget_set_hexpand(label, 1);
+        if (s.kind == .web) c.gtk_widget_add_css_class(label, "heading");
         var tip_buf: [400:0]u8 = undefined;
-        const tip = std.fmt.bufPrintZ(&tip_buf, "{s} ({s}), {d} viewer(s)", .{ s.name, @tagName(s.kind), s.viewers }) catch null;
+        const tip = if (s.kind == .web)
+            std.fmt.bufPrintZ(&tip_buf, "{s}", .{s.browser.title()}) catch null
+        else
+            std.fmt.bufPrintZ(&tip_buf, "{s} ({s}), {d} viewer(s)", .{ s.name, @tagName(s.kind), s.viewers }) catch null;
         if (tip) |tz| c.gtk_widget_set_tooltip_text(label, tz.ptr);
         const identity = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 2).?;
         c.gtk_widget_set_hexpand(identity, 1);
@@ -532,9 +545,20 @@ pub const Watcher = struct {
             c.gtk_label_set_max_width_chars(@ptrCast(sub), 36);
             c.gtk_widget_add_css_class(sub, "dim-label");
             c.gtk_widget_add_css_class(sub, "caption");
+            c.gtk_widget_set_tooltip_text(sub, domain.ptr);
             c.gtk_box_append(@ptrCast(identity), sub);
         }
         c.gtk_box_append(@ptrCast(row), identity);
+        // Identity above actions: long names no longer compete for width
+        // with the buttons, and each browser reads as one compact group.
+        const card = if (s.kind == .web) c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 6).? else row;
+        const controls = if (s.kind == .web) c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 6).? else row;
+        if (s.kind == .web) {
+            c.gtk_widget_set_margin_top(card, 8);
+            c.gtk_widget_set_margin_bottom(card, 8);
+            c.gtk_box_append(@ptrCast(card), row);
+            c.gtk_box_append(@ptrCast(card), controls);
+        }
         const placement = self.win.sessionPlacement(s.name, a.host);
         const actions = [_]struct { lease: muxtabs.Lease, beside: bool = false }{
             .{ .lease = .read_only }, .{ .lease = .control }, .{ .lease = .read_only, .beside = true },
@@ -544,8 +568,8 @@ pub const Watcher = struct {
             const lease = action.lease;
             const verb: AttachVerb = if (action.beside) .{
                 .icon = "view-dual-symbolic",
-                .text = "Beside",
-                .tip = "Open or move this browser beside the active pane. Select the assistant pane first to follow side by side.",
+                .text = "Show beside pane",
+                .tip = "Open or move this browser next to the selected pane. Starts read-only for a new viewer; keeps your current mode when moving.",
             } else attachVerb(lease);
             // Labelled, not icon-only: the popover is the one place a
             // person reads these verbs cold, and a rig drives them by text.
@@ -573,9 +597,9 @@ pub const Watcher = struct {
                 .beside = action.beside,
             };
             _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onRowClicked), @ptrCast(ctx), @ptrCast(&freeRowCtx), c.G_CONNECT_DEFAULT);
-            c.gtk_box_append(@ptrCast(row), btn);
+            c.gtk_box_append(@ptrCast(controls), btn);
         }
-        c.gtk_box_append(@ptrCast(section), row);
+        c.gtk_box_append(@ptrCast(section), card);
     }
 
     /// Attach `session` of the assistant `pid` into this window with

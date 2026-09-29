@@ -1518,12 +1518,11 @@ pub const WebFace = struct {
     /// window. Never the hidden shell the tab was built on: a popup
     /// closing itself must not leave a terminal behind.
     ///
-    /// Only an engine-opened face (`popup_owned`) is closed; the
-    /// helper emits the event only for its own popups and this is the
-    /// belt, so a script can never close a tab the user opened. The
-    /// helper already freed the view, so nothing is posted back to it.
+    /// Engine-owned popups and observed faces can retire this way. An
+    /// observed face also uses it when its waiting placeholder is replaced;
+    /// neither case destroys an owner-side browser view.
     pub fn closeSelf(self: *WebFace) void {
-        if (!self.popup_owned) return;
+        if (!self.popup_owned and !self.observed) return;
         self.view_live = false;
         if (self.group()) |g| {
             if (g.pages.items.len > 1) {
@@ -1573,7 +1572,7 @@ pub const WebFace = struct {
             _ = c.g_object_ref_sink(@ptrCast(self.root_box));
             c.g_object_unref(@ptrCast(self.root_box));
             if (self.pending_url) |u| allocator.free(u);
-            allocator.destroy(self);
+            // The errdefer above owns the face allocation.
             return error.PaneHasNoWrapper;
         };
         pane.setWebVisible(true);

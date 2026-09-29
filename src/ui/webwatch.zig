@@ -44,7 +44,7 @@ const Pane = @import("pane.zig").Pane;
 
 /// Longest assistant label and key the watch keeps; anything longer
 /// is truncated for display and refused as a key.
-const MAX_LABEL = 128;
+const MAX_LABEL = 160;
 const MAX_KEY = 384;
 
 pub const Watch = struct {
@@ -165,9 +165,14 @@ pub const Watch = struct {
             c.gtk_picture_set_paintable(@ptrCast(face.picture), null);
             face.setUrl("");
             c.gtk_editable_set_text(@ptrCast(face.entry), "");
+            // There is no page to navigate or search while we wait.
+            c.gtk_widget_set_visible(face.bar, 0);
+            c.gtk_widget_set_visible(face.find_bar, 0);
+            face.cancelHints();
             face.onTitle("Waiting for the next page");
             face.setStatus("Following the assistant's browser.\nThe next tab will appear here automatically.\nClose this viewer to stop following.", false);
         }
+        if (self.pane) |pane| pane.refreshLeaseChip();
     }
 
     /// A face of this watch is being freed (the page ended, or the
@@ -363,7 +368,7 @@ pub fn openLocalBeside(win: *Window, label: []const u8, mux_socket: []const u8, 
     var lease: muxtabs.Lease = .read_only;
     if (find(win, key)) |w| {
         if (w.pane == source) {
-            winmod.showToast(win, "Select the pane you want the browser beside, then choose Beside again.");
+            winmod.showToast(win, "Select a destination pane, then choose Show beside pane from the AI badge.");
             return false;
         }
         lease = w.lease;
@@ -409,15 +414,39 @@ pub fn openInstance(win: *Window, host: ?[]const u8, instance: []const u8, sessi
 }
 
 fn reuse(w: *Watch, lease: muxtabs.Lease) bool {
-    if (lease == .control and w.lease != .control) w.setLease(.control);
+    // Watch is an explicit read-only request, including on a viewer that
+    // previously held control. Beside preserves its lease separately.
+    const requested: muxtabs.Lease = if (lease == .default) .read_only else lease;
+    // Reassert even an unchanged preference: another viewer may have
+    // taken the actual control since the previous request.
+    w.setLease(requested);
     w.focus();
     return true;
+}
+
+test "reusing a waiting watch honours both control and read-only requests" {
+    var w: Watch = .{
+        .allocator = std.testing.allocator,
+        .win = undefined,
+        .cl = undefined,
+        .label = &.{},
+        .key = &.{},
+        .lease = .control,
+    };
+    try std.testing.expect(reuse(&w, .read_only));
+    try std.testing.expectEqual(muxtabs.Lease.read_only, w.lease);
+    try std.testing.expect(reuse(&w, .control));
+    try std.testing.expectEqual(muxtabs.Lease.control, w.lease);
+    try std.testing.expect(reuse(&w, .default));
+    try std.testing.expectEqual(muxtabs.Lease.read_only, w.lease);
 }
 
 fn start(win: *Window, cl: *webface.Client, label: []const u8, key: []const u8, lease: muxtabs.Lease) bool {
     const allocator = win.allocator;
     const w = allocator.create(Watch) catch return false;
-    const label_owned = allocator.dupe(u8, label[0..@min(label.len, MAX_LABEL)]) catch {
+    var label_buf: [MAX_LABEL + 1]u8 = undefined;
+    webpresence.copyText(&label_buf, label);
+    const label_owned = allocator.dupe(u8, std.mem.sliceTo(&label_buf, 0)) catch {
         allocator.destroy(w);
         return false;
     };
@@ -486,15 +515,19 @@ pub fn onClientLost(cl: *webface.Client) void {
 /// watch. `buf` receives the text.
 pub fn chipText(g: *webgroup.Group, buf: []u8) ?struct { text: []const u8, view_only: bool } {
     const w: *Watch = @ptrCast(@alignCast(g.watch orelse return null));
-    return switch (w.lease) {
-        .control => .{
-            .text = std.fmt.bufPrint(buf, "Controlling {s}", .{w.label}) catch "Controlling the assistant's browser",
-            .view_only = false,
-        },
-        else => .{
-            .text = std.fmt.bufPrint(buf, "View only - {s}", .{w.label}) catch "View only",
-            .view_only = true,
-        },
+    if (w.pages.items.len == 1 and w.pages.items[0].target == 0) return .{
+        .text = "Following - waiting for the next page",
+        .view_only = false,
+    };
+    // Show the helper-confirmed state of the visible page. The requested
+    // lease is only a preference for future pages, not a granted control.
+    const controlled = if (g.active()) |face| face.view_live and face.obs_control else false;
+    return if (controlled) .{
+        .text = std.fmt.bufPrint(buf, "Controlling {s}", .{w.label}) catch "Controlling the assistant's browser",
+        .view_only = false,
+    } else .{
+        .text = std.fmt.bufPrint(buf, "View only - {s}", .{w.label}) catch "View only",
+        .view_only = true,
     };
 }
 

@@ -362,6 +362,10 @@ pub const Pane = struct {
         c.gtk_widget_add_css_class(tb_chip, "sketerm-titlebar-chip");
         c.gtk_widget_set_visible(tb_chip, 0);
         const tb_chip_label = c.gtk_label_new("");
+        // Assistant-supplied names must not widen a split pane or push
+        // its Take control button out of reach.
+        c.gtk_label_set_ellipsize(@ptrCast(tb_chip_label), c.PANGO_ELLIPSIZE_END);
+        c.gtk_label_set_max_width_chars(@ptrCast(tb_chip_label), 32);
         c.gtk_box_append(@ptrCast(tb_chip), tb_chip_label);
         const tb_take = c.gtk_button_new_with_label("Take control");
         c.gtk_widget_add_css_class(tb_take, "flat");

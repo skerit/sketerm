@@ -92,7 +92,7 @@ pub const Metadata = struct {
 
     pub fn subtitle(self: *const Metadata) []const u8 {
         const text = std.mem.sliceTo(&self.domain, 0);
-        return if (text.len != 0) text else "Waiting for a page";
+        return if (text.len != 0) text else "Page details unavailable";
     }
 };
 

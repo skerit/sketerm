@@ -67,8 +67,8 @@ route add browser tabs; omit `name` to keep the session name. Prefer
 waiting for manual login. Profiles describe cookie storage, independently of
 the human-facing name.
 
-To follow beside the assistant, select its pane and choose **Beside** in the
-AI badge. The same action relocates an existing viewer. The viewer retains its
+To follow beside the assistant, select its pane and choose **Show beside pane**
+in the AI badge. The same action relocates an existing viewer. The viewer retains its
 place when the assistant closes its last tab: it waits for the next tab in
 that browser and displays it automatically. Closing the viewer yourself stops
 following and leaves the assistant's pages running.

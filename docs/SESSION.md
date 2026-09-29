@@ -1,5 +1,32 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-09-30: browser handoff correctness and usability reviews
+
+A fresh correctness review of `31573454` fixed read-only requests retaining
+an earlier control lease, observed faces refusing to retire (leaving stale
+waiting placeholders after tab replacement), and adopted/broker connections
+overwriting or removing another owner's browser discovery record. It also
+removed a double-free in failed face attachment and tightened name validation
+and UTF-8-safe label copying. Watch and Take control reassert the requested
+mode; the pane chip reflects the visible page's confirmed control state.
+
+The separate UI review moved browser identity above its actions, emphasized
+the descriptive title, retained full-name/domain tooltips, and replaced the
+ambiguous Beside label with Show beside pane. Brief inline help explains
+read-only viewing, manual login, and selecting a destination pane. Waiting
+viewers hide obsolete navigation/search controls and say they are following,
+not controlling an absent page. Missing page metadata is described as
+unavailable rather than falsely claiming no page exists. Long names are
+ellipsized in pane chips so Take control stays reachable in a split.
+
+Validation: `zig build test --summary all` passed 3713 tests with 19 skips.
+The focused watch smoke passed with both short and long descriptive names,
+including control-to-read-only transitions, two consecutive last-tab
+replacements, placement and viewer-close opt-out. The rendered popover,
+waiting state, and split viewer were inspected from the saved screenshots.
+Formatting and diff checks passed. Native maximize verification and the
+one-pixel split measurement warning remain as recorded below.
+
 ## 2026-09-30: named browser handoff and a persistent viewer
 
 `web_open name` labels the assistant-owned browser on its route. The AI
