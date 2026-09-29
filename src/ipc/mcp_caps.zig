@@ -251,9 +251,11 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
     // capability "observe"). `web_socket` is the socket it joins.
     const web_observe = @import("mcp_web.zig").observeActive();
     try res.fact("web_observe", web_observe);
+    const handoff_available: ?bool = if (!gui_web and !engine_started) null else web_observe and @import("mcp_web.zig").sessionInfo() != null;
+    try res.fact("web_handoff", .{ .session_naming = !gui_web, .available = handoff_available, .entry_point = "AI badge: Watch / Take control", .backend_is_visibility = false });
     var web_sock_buf: [4096]u8 = undefined;
     if (@import("mcp_web.zig").helperSocket(&web_sock_buf)) |ws| try res.fact("web_socket", ws) else try res.raw("web_socket", "null");
-    if (web_observe) try res.text("the user can watch this browser's pages as browser pages from their sketerm GUI (assistant chip / Session Overview: Watch or Take control)");
+    if (web_observe) try res.text("Assistant-owned browser tabs can be shown and driven by the user: orange AI badge / Session Overview -> Watch or Take control. backend:headless does not mean invisible. Give web_open a descriptive name; keep its tab open for manual login and reuse it with web_navigate.");
     if (mcp_app.app_state.mux_sock) |ms| try res.fact("mux_socket", ms) else try res.raw("mux_socket", "null");
     if (@import("mcp_web.zig").sessionInfo()) |ws| {
         if (mcp_app.app_state.mux_sock) |ms| {

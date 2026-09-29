@@ -47,6 +47,32 @@ After building `mcp-standalone` and `mux`, run
 `python3 dist/test-mcp-standalone.py` to check a relocated installation
 with no GUI sibling, including shell integration and WebM refusal.
 
+## Browser handoff and following
+
+An assistant-owned browser does not open a visible viewer automatically.
+`backend: "headless"` describes the automation connection; it does **not** mean
+that the user cannot see or drive it. When `web_open` reports
+`handoff.available: true`, click Sketerm's orange **AI** badge, then **Watch**
+(read-only) or **Take control** (for example, to log in manually).
+
+Give the browser a descriptive name on its first open:
+
+```json
+{"name":"Account login","url":"https://example.com","profile":"work"}
+```
+
+The badge shows that name above a shortened domain. Later opens on the same
+route add browser tabs; omit `name` to keep the session name. Prefer
+`web_navigate` to continue in an existing tab, and leave that tab open while
+waiting for manual login. Profiles describe cookie storage, independently of
+the human-facing name.
+
+To follow beside the assistant, select its pane and choose **Beside** in the
+AI badge. The same action relocates an existing viewer. The viewer retains its
+place when the assistant closes its last tab: it waits for the next tab in
+that browser and displays it automatically. Closing the viewer yourself stops
+following and leaves the assistant's pages running.
+
 ## Tool reference
 
 Generated from the tool table; a unit test fails when this block and the
@@ -163,8 +189,8 @@ is kept by a `:ro` policy term. The full descriptions and schemas are in
 ### `browser`
 
 - `web_tabs` (read-only): List the open browser views — SEVERAL can be open at once.
-- `web_open`: Open a NEW web view and return its handle plus a FIRST SNAPSHOT of the requested page, once THAT navigation has settled.
-- `web_close`: Close a web view.
+- `web_open`: Open a NEW browser TAB and return its handle and the first snapshot after navigation settles.
+- `web_close`: Close one browser TAB.
 - `web_profiles` (read-only): HEADLESS ONLY (with a GUI attached the browser's identity containers belong to the user).
 - `web_profile_reset`: HEADLESS ONLY.
 - `web_profile_save`: HEADLESS ONLY.

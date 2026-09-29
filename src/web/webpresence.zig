@@ -80,6 +80,55 @@ pub fn helperSocketFor(buf: []u8, mux_socket: []const u8, session: []const u8) ?
     return std.fmt.bufPrint(buf, "{s}/web.sock", .{dir}) catch null;
 }
 
+/// Human-facing identity, copied by value across the roster worker handback.
+pub const Metadata = struct {
+    label: [161]u8 = @splat(0),
+    domain: [257]u8 = @splat(0),
+
+    pub fn title(self: *const Metadata) []const u8 {
+        const text = std.mem.sliceTo(&self.label, 0);
+        return if (text.len != 0) text else "Assistant browser";
+    }
+
+    pub fn subtitle(self: *const Metadata) []const u8 {
+        const text = std.mem.sliceTo(&self.domain, 0);
+        return if (text.len != 0) text else "Waiting for a page";
+    }
+};
+
+/// Called on the roster's IO worker, never the GTK thread. Old presence files
+/// remain valid and get a readable fallback instead of the transport id.
+pub fn readMetadata(allocator: std.mem.Allocator, mux_socket: []const u8, session: []const u8) Metadata {
+    var socket_buf: [MAX_PATH]u8 = undefined;
+    const socket = helperSocketFor(&socket_buf, mux_socket, session) orelse return .{};
+    var path_buf: [MAX_PATH:0]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buf, "{s}.json", .{socket[0 .. socket.len - ".sock".len]}) catch return .{};
+    const f = c.fopen(path.ptr, "r") orelse return .{};
+    defer _ = c.fclose(f);
+    var bytes: [16384]u8 = undefined;
+    const n = c.fread(&bytes, 1, bytes.len, f);
+    const parsed = std.json.parseFromSlice(struct {
+        session: []const u8 = "",
+        label: []const u8 = "",
+        domain: []const u8 = "",
+    }, allocator, bytes[0..n], .{ .ignore_unknown_fields = true }) catch return .{};
+    defer parsed.deinit();
+    if (!std.mem.eql(u8, parsed.value.session, session)) return .{};
+    var out: Metadata = .{};
+    copyText(&out.label, parsed.value.label);
+    copyText(&out.domain, parsed.value.domain);
+    return out;
+}
+
+/// Bounded, single-line UTF-8 for labels; always NUL-terminated.
+pub fn copyText(out: []u8, text: []const u8) void {
+    @memset(out, 0);
+    if (!std.unicode.utf8ValidateSlice(text)) return;
+    var n = @min(out.len - 1, text.len);
+    while (n < text.len and n > 0 and (text[n] & 0xc0) == 0x80) n -= 1;
+    for (text[0..n], 0..) |ch, i| out[i] = if (ch < 0x20 or ch == 0x7f) ' ' else ch;
+}
+
 /// Whether the presence file at `path` carries `"session":"<session>"`.
 fn presenceNamesSession(path: [:0]const u8, session: []const u8) bool {
     const f = c.fopen(path.ptr, "r") orelse return false;
@@ -111,7 +160,7 @@ test "helperSocketFor picks the routed helper whose presence file names the sess
     {
         const f = c.fopen(json.ptr, "w") orelse return error.TestUnexpectedResult;
         defer _ = c.fclose(f);
-        const body = "{\"mcp_pid\":1,\"helper_pid\":2,\"client\":\"x\",\"started_at_ms\":3,\"session\":\"web-9-cafe\",\"mux_socket\":\"/x/mux.sock\"}\n";
+        const body = "{\"mcp_pid\":1,\"helper_pid\":2,\"client\":\"x\",\"started_at_ms\":3,\"session\":\"web-9-cafe\",\"mux_socket\":\"/x/mux.sock\",\"label\":\"Login \\\"café\\\"\",\"domain\":\"accounts.example.com\"}\n";
         _ = c.fwrite(body.ptr, 1, body.len, f);
     }
     var mux_buf: [MAX_PATH]u8 = undefined;
@@ -121,6 +170,11 @@ test "helperSocketFor picks the routed helper whose presence file names the sess
     var buf: [MAX_PATH]u8 = undefined;
     const got = helperSocketFor(&buf, mux, "web-9-cafe") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings(want, got);
+    const metadata = readMetadata(std.testing.allocator, mux, "web-9-cafe");
+    try std.testing.expectEqualStrings("Login \"café\"", metadata.title());
+    try std.testing.expectEqualStrings("accounts.example.com", metadata.subtitle());
+    const missing = readMetadata(std.testing.allocator, mux, "web-9-dead");
+    try std.testing.expectEqualStrings("Assistant browser", missing.title());
     // Another session is not that helper's.
     var other_buf: [MAX_PATH]u8 = undefined;
     const other = try std.fmt.bufPrint(&other_buf, "{s}/web.sock", .{dir});

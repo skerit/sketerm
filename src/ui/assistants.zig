@@ -29,6 +29,7 @@ const mux_client = @import("../mux/client.zig");
 const mux_cli = @import("../ipc/mux_cli.zig");
 const muxtabs = @import("muxtabs.zig");
 const webwatch = @import("webwatch.zig");
+const webpresence = @import("../web/webpresence.zig");
 const Window = @import("window.zig").Window;
 const Pane = @import("pane.zig").Pane;
 
@@ -80,6 +81,7 @@ pub const Session = struct {
     origin_id: []u8,
     kind: Kind,
     viewers: u32,
+    browser: webpresence.Metadata = .{},
 
     fn deinit(self: *Session, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
@@ -509,7 +511,7 @@ pub const Watcher = struct {
         const icon = c.gtk_image_new_from_icon_name(s.kind.icon()).?;
         c.gtk_box_append(@ptrCast(row), icon);
         var text_buf: [320:0]u8 = undefined;
-        const text = std.fmt.bufPrintZ(&text_buf, "{s}", .{if (s.title.len > 0) s.title else s.name}) catch "session";
+        const text = std.fmt.bufPrintZ(&text_buf, "{s}", .{if (s.kind == .web) s.browser.title() else if (s.title.len > 0) s.title else s.name}) catch "session";
         const label = c.gtk_label_new(text.ptr).?;
         c.gtk_label_set_xalign(@ptrCast(label), 0);
         c.gtk_label_set_ellipsize(@ptrCast(label), c.PANGO_ELLIPSIZE_END);
@@ -518,29 +520,41 @@ pub const Watcher = struct {
         var tip_buf: [400:0]u8 = undefined;
         const tip = std.fmt.bufPrintZ(&tip_buf, "{s} ({s}), {d} viewer(s)", .{ s.name, @tagName(s.kind), s.viewers }) catch null;
         if (tip) |tz| c.gtk_widget_set_tooltip_text(label, tz.ptr);
-        c.gtk_box_append(@ptrCast(row), label);
-        // A web session is shown as a BROWSER (webwatch), never as a
-        // forwarded app: its placement is the watch's lease.
-        const web_placement: ?webwatch.Placement = if (s.kind == .web)
-            webwatch.placementLocal(self.win, a.host["sock:".len..], s.name)
-        else
-            null;
+        const identity = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 2).?;
+        c.gtk_widget_set_hexpand(identity, 1);
+        c.gtk_box_append(@ptrCast(identity), label);
+        if (s.kind == .web) {
+            var domain_buf: [320:0]u8 = undefined;
+            const domain = std.fmt.bufPrintZ(&domain_buf, "{s}", .{s.browser.subtitle()}) catch "Browser";
+            const sub = c.gtk_label_new(domain.ptr).?;
+            c.gtk_label_set_xalign(@ptrCast(sub), 0);
+            c.gtk_label_set_ellipsize(@ptrCast(sub), c.PANGO_ELLIPSIZE_END);
+            c.gtk_label_set_max_width_chars(@ptrCast(sub), 36);
+            c.gtk_widget_add_css_class(sub, "dim-label");
+            c.gtk_widget_add_css_class(sub, "caption");
+            c.gtk_box_append(@ptrCast(identity), sub);
+        }
+        c.gtk_box_append(@ptrCast(row), identity);
         const placement = self.win.sessionPlacement(s.name, a.host);
-        for ([_]muxtabs.Lease{ .read_only, .control }) |lease| {
-            const verb = attachVerb(lease);
+        const actions = [_]struct { lease: muxtabs.Lease, beside: bool = false }{
+            .{ .lease = .read_only }, .{ .lease = .control }, .{ .lease = .read_only, .beside = true },
+        };
+        for (actions) |action| {
+            if (action.beside and s.kind != .web) continue;
+            const lease = action.lease;
+            const verb: AttachVerb = if (action.beside) .{
+                .icon = "view-dual-symbolic",
+                .text = "Beside",
+                .tip = "Open or move this browser beside the active pane. Select the assistant pane first to follow side by side.",
+            } else attachVerb(lease);
             // Labelled, not icon-only: the popover is the one place a
             // person reads these verbs cold, and a rig drives them by text.
             const btn = c.gtk_button_new_with_label(verb.text).?;
             c.gtk_widget_add_css_class(btn, "flat");
             c.gtk_widget_set_tooltip_text(btn, verb.tip);
-            // A session already in this window is not attached twice
-            // from here. With a pane, its own chip escalates the lease;
-            // a TABLESS app session has no chip, so Take control stays
-            // live and materializes it as a tab instead of dead-ending.
-            const sensitive = if (web_placement) |wp| switch (wp) {
-                .none => true,
-                .watching => |held| lease == .control and held != .control,
-            } else switch (placement) {
+            // Browser actions focus, escalate, or relocate the existing
+            // watch. Other session kinds retain their attachment policy.
+            const sensitive = if (s.kind == .web) true else switch (placement) {
                 .none => true,
                 .tabless => lease == .control,
                 .pane => false,
@@ -556,6 +570,7 @@ pub const Watcher = struct {
                     continue;
                 },
                 .lease = lease,
+                .beside = action.beside,
             };
             _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onRowClicked), @ptrCast(ctx), @ptrCast(&freeRowCtx), c.G_CONNECT_DEFAULT);
             c.gtk_box_append(@ptrCast(row), btn);
@@ -565,14 +580,19 @@ pub const Watcher = struct {
 
     /// Attach `session` of the assistant `pid` into this window with
     /// `lease`, off-thread; the popover closes when the attach lands.
-    fn startAttach(self: *Watcher, pid: c.pid_t, session: []const u8, lease: muxtabs.Lease) void {
+    fn startAttach(self: *Watcher, pid: c.pid_t, session: []const u8, lease: muxtabs.Lease, beside: bool) void {
         if (self.dead) return;
         const a = self.findByPid(pid) orelse return;
         // The assistant's browser opens as a browser: a second client
         // of its own helper, its pages as web pages (webwatch.zig).
         // The mux app session behind it is never attached from here.
         if (kindOf(session, true) == .web) {
-            if (webwatch.openLocal(self.win, a.label(), a.host["sock:".len..], session, lease))
+            const target = a.findSession(session) orelse return;
+            const opened = if (beside)
+                webwatch.openLocalBeside(self.win, target.browser.title(), a.host["sock:".len..], session)
+            else
+                webwatch.openLocal(self.win, target.browser.title(), a.host["sock:".len..], session, lease);
+            if (opened)
                 c.gtk_popover_popdown(@ptrCast(self.popover));
             return;
         }
@@ -639,11 +659,11 @@ pub const Watcher = struct {
         var changed = a.failed != failed;
         a.failed = failed;
         if (op.parsed) |parsed| {
-            const fp = rosterFingerprint(parsed.value.sessions);
+            const fp = std.hash.Wyhash.hash(rosterFingerprint(parsed.value.sessions), std.mem.sliceAsBytes(op.browsers));
             if (fp != a.fingerprint or a.sessions.items.len == 0) {
                 a.fingerprint = fp;
                 a.clearSessions(self.allocator);
-                for (parsed.value.sessions) |info| {
+                for (parsed.value.sessions, 0..) |info, index| {
                     if (info.exited) continue;
                     // Out of memory mid-roster: show what fit; the next
                     // poll's fingerprint differs from nothing and retries.
@@ -651,6 +671,7 @@ pub const Watcher = struct {
                         a.fingerprint = 0;
                         break;
                     };
+                    if (index < op.browsers.len) a.sessions.items[a.sessions.items.len - 1].browser = op.browsers[index];
                 }
                 changed = true;
             }
@@ -703,6 +724,7 @@ const RowCtx = struct {
     pid: c.pid_t,
     session: []u8,
     lease: muxtabs.Lease,
+    beside: bool = false,
 };
 
 fn freeRowCtx(user: ?*anyopaque, _: ?*c.GClosure) callconv(.c) void {
@@ -719,10 +741,11 @@ fn onRowClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const watcher = ctx.watcher;
     const pid = ctx.pid;
     const lease = ctx.lease;
+    const beside = ctx.beside;
     var name_buf: [256]u8 = undefined;
     const n = @min(ctx.session.len, name_buf.len);
     @memcpy(name_buf[0..n], ctx.session[0..n]);
-    watcher.startAttach(pid, name_buf[0..n], lease);
+    watcher.startAttach(pid, name_buf[0..n], lease, beside);
 }
 
 fn onAttachReady(user: ?*anyopaque, job: *muxtabs.AttachJob) void {
@@ -768,12 +791,14 @@ const FetchOp = struct {
     conn: ?mux_client.Conn = null,
     parsed: ?std.json.Parsed(mux_cli.Welcome) = null,
     ok: bool = false,
+    browsers: []webpresence.Metadata = &.{},
 
     fn destroy(self: *FetchOp) void {
         const allocator = std.heap.c_allocator;
         if (self.conn) |*conn| conn.deinit();
         if (self.parsed) |*parsed| parsed.deinit();
         if (self.path) |path| allocator.free(path);
+        allocator.free(self.browsers);
         allocator.destroy(self);
     }
 };
@@ -787,6 +812,16 @@ fn fetchThreadMain(op: *FetchOp) void {
         op.conn.?.deinit();
         op.conn = dialSocket(op.path.?);
         if (op.conn != null) _ = runList(op);
+    }
+    if (op.parsed) |parsed| {
+        op.browsers = std.heap.c_allocator.alloc(webpresence.Metadata, parsed.value.sessions.len) catch &.{};
+        for (op.browsers, 0..) |*metadata, i| {
+            const info = parsed.value.sessions[i];
+            metadata.* = if (kindOf(info.name, info.app) == .web)
+                webpresence.readMetadata(std.heap.c_allocator, op.path.?, info.name)
+            else
+                .{};
+        }
     }
     _ = c.g_idle_add(@ptrCast(&onFetchIdle), @ptrCast(op));
 }

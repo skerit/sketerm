@@ -58,30 +58,27 @@ pub fn postObserveControl(self: *WebFace, control: bool) void {
     self.cl.post(proto.ObserveControl{ .view = self.view, .control = if (control) 1 else 0 });
 }
 
-/// Place the fitted frame: the picture is sized to the fit and
-/// offset by its margins, and input subtracts the same offsets
-/// (`snap_dx/dy`) before dividing by the fit's scale.
+/// Frame geometry changed. Placement happens INSIDE the overlay's allocation,
+/// not by feeding yesterday's allocation back into margins/minimum sizes.
 pub fn layoutObserved(self: *WebFace) void {
     if (!self.observed or self.widgets_dead) return;
-    const alloc = self.allocationSize();
+    c.gtk_widget_queue_allocate(self.overlay);
+}
+
+/// GtkOverlay asks for the picture's exact rectangle on EVERY allocation,
+/// including the first map and maximization. Input uses this same rectangle.
+pub fn picturePosition(overlay: *c.GtkOverlay, child: *c.GtkWidget, rect: *c.GdkRectangle, user: ?*anyopaque) callconv(.c) c.gboolean {
+    const self = @import("../../util/cast.zig").userData(WebFace, user);
+    if (!self.observed or self.widgets_dead or child != self.picture) return 0;
+    const widget: *c.GtkWidget = @ptrCast(@alignCast(overlay));
+    const w: u16 = @intCast(std.math.clamp(c.gtk_widget_get_width(widget), 0, std.math.maxInt(u16)));
+    const h: u16 = @intCast(std.math.clamp(c.gtk_widget_get_height(widget), 0, std.math.maxInt(u16)));
     const lw = if (self.frame_lw != 0) self.frame_lw else self.obs_w;
     const lh = if (self.frame_lh != 0) self.frame_lh else self.obs_h;
-    const f = watchgeom.fit(alloc.w, alloc.h, lw, lh);
+    const f = watchgeom.fit(w, h, lw, lh);
     self.obs_fit = f;
     self.snap_dx = f.x;
     self.snap_dy = f.y;
-    // All FOUR margins: a size request is only a minimum, and a
-    // GtkPicture's natural size is its paintable's, so with just
-    // start/top margins the picture was allocated wider or taller
-    // than the fit and CONTAIN re-centred the frame inside that,
-    // moving the drawn pixels away from where `obs_fit` (and so the
-    // pointer mapping) says they are. Pinning every side makes the
-    // allocation exactly the fit.
-    const end_x: c_int = @max(0, @as(c_int, alloc.w) - @as(c_int, f.x) - @as(c_int, f.w));
-    const end_y: c_int = @max(0, @as(c_int, alloc.h) - @as(c_int, f.y) - @as(c_int, f.h));
-    c.gtk_widget_set_margin_start(self.picture, f.x);
-    c.gtk_widget_set_margin_top(self.picture, f.y);
-    c.gtk_widget_set_margin_end(self.picture, end_x);
-    c.gtk_widget_set_margin_bottom(self.picture, end_y);
-    c.gtk_widget_set_size_request(self.picture, f.w, f.h);
+    rect.* = .{ .x = f.x, .y = f.y, .width = f.w, .height = f.h };
+    return 1;
 }

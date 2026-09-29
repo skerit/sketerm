@@ -2494,6 +2494,8 @@ pub const WebFace = struct {
         self.track(self.picture);
         c.gtk_overlay_add_overlay(@ptrCast(self.overlay), self.picture);
         c.gtk_overlay_set_clip_overlay(@ptrCast(self.overlay), self.picture, 1);
+        _ = c.g_signal_connect_data(@ptrCast(self.overlay), "get-child-position", @ptrCast(&@import("webface/observed.zig").picturePosition), self, null, 0);
+        self.track(self.overlay);
 
         self.sensor = c.gtk_drawing_area_new();
         c.gtk_widget_set_can_target(self.sensor, 0);

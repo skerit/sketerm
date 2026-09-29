@@ -1,5 +1,34 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-09-30: named browser handoff and a persistent viewer
+
+`web_open name` labels the assistant-owned browser on its route. The AI
+badge shows that name above a smaller, ellipsized domain; metadata is
+published atomically and read by the roster's IO worker. Open results expose
+`handoff.available` and the name, and capabilities exposes `web_handoff`.
+Tool wording distinguishes backend ownership from visibility, explains
+Watch / Take control for manual login, and steers assistants toward keeping
+and navigating existing tabs.
+
+The watched frame is placed by GtkOverlay's allocation callback, using one
+rectangle for pixels and pointer mapping rather than old margins and minimum
+sizes. Closing the owner's last tab leaves a waiting placeholder, preserving
+the viewer's place and control preference for the next tab. Closing the
+viewer itself stops following. The badge's Beside action opens or relocates
+the observation next to the selected pane without navigating the owner's
+pages; detachment is synchronous before reopening, since tab closure itself
+is asynchronous.
+
+Validation: `zig build test --summary all` passed 3710 tests with 19 skips.
+`SKETERM_SMOKE_E2E_WATCH_ONLY=1 zig build smoke-e2e` passed the real GUI checks
+for naming/subtitle, initial paint, read-only/control input, off-centre
+pointer mapping, smaller/larger allocations, last-tab replacement, Beside
+relocation, and explicit viewer-close opt-out. Native maximization remains
+unverified: the external-display rig receives GTK's `set_maximized` but does
+not return a configure; the regression therefore tests allocation growth
+with an explicit resize instead. GTK also reports a one-pixel minimum-width
+warning while forming the split; the split and browser remain functional.
+
 ## 2026-09-29: standalone GTK-free MCP server
 
 `zig build mcp-standalone` installs `sketerm-mcp` and the shell-integration

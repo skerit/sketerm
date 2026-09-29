@@ -696,6 +696,8 @@ pub const Engine = struct {
     /// helper logs and a future viewer can attribute the session to an
     /// assistant rather than an anonymous client. Owned.
     client_name: []u8,
+    browser_label: [161]u8 = @splat(0),
+    presence_started_ms: i64 = 0,
     /// Mux daemon socket for the watchable web session; null disables
     /// session hosting outright. Owned.
     mux_sock: ?[]u8 = null,
@@ -1219,25 +1221,31 @@ pub const Engine = struct {
 
     /// Write `web.json` next to the socket (see the header). Best
     /// effort: enumeration metadata, never load-bearing.
-    fn writePresence(self: *Engine) void {
+    pub fn writePresence(self: *Engine) void {
+        if (self.state != .ready) return;
+        if (self.presence_started_ms == 0) self.presence_started_ms = clock.nowMs();
         var path_z: [4096:0]u8 = undefined;
         const p = self.routePathZ(&path_z, ".json") orelse return;
-        const f = c.fopen(p.ptr, "w") orelse return;
-        defer _ = c.fclose(f);
-        var line: [8704]u8 = undefined;
-        var len: usize = 0;
-        len += (std.fmt.bufPrint(line[len..], "{{\"mcp_pid\":{d},\"helper_pid\":{d},\"client\":\"{s}\",\"started_at_ms\":{d}", .{
-            c.getpid(), self.pid, self.client_name, clock.nowMs(),
-        }) catch return).len;
-        if (self.session) |*ws| {
-            // Session name + daemon socket contain no JSON specials
-            // (daemon-validated name, filesystem path we minted).
-            len += (std.fmt.bufPrint(line[len..], ",\"session\":\"{s}\",\"mux_socket\":\"{s}\"", .{
-                ws.created.name, self.mux_sock.?,
-            }) catch return).len;
-        }
-        len += (std.fmt.bufPrint(line[len..], "}}\n", .{}) catch return).len;
-        _ = c.fwrite(&line, 1, len, f);
+        const url = if (self.findView(self.current)) |v| v.url orelse "" else "";
+        const host = @import("../web/urlhost.zig").hostOf(url, .{ .require_scheme = true });
+        const domain = if (host.len != 0) host else if (url.len != 0) "Local page" else "";
+        const body = std.json.Stringify.valueAlloc(self.gpa, .{
+            .mcp_pid = c.getpid(),
+            .helper_pid = self.pid,
+            .client = self.client_name,
+            .started_at_ms = self.presence_started_ms,
+            .session = if (self.session) |ws| ws.created.name else "",
+            .mux_socket = self.mux_sock orelse "",
+            .label = std.mem.sliceTo(&self.browser_label, 0),
+            .domain = domain,
+        }, .{}) catch return;
+        defer self.gpa.free(body);
+        @import("../util/atomicwrite.zig").writeCacheFile(p, body, 0o600) catch {};
+    }
+
+    pub fn setBrowserLabel(self: *Engine, label: []const u8) void {
+        @import("../web/webpresence.zig").copyText(&self.browser_label, label);
+        self.writePresence();
     }
 
     fn removePresence(self: *Engine) void {
@@ -1634,7 +1642,10 @@ pub const Engine = struct {
     /// tool addresses a view, so "current" tracks what the caller is
     /// actually working on rather than what it opened first.
     pub fn setCurrent(self: *Engine, id: u32) void {
-        if (self.findView(id) != null) self.current = id;
+        if (self.current != id and self.findView(id) != null) {
+            self.current = id;
+            self.writePresence();
+        }
     }
 
     /// Create a headless view; `url` may be empty for a blank page.
@@ -1946,6 +1957,7 @@ pub const Engine = struct {
             self.releaseContext(context);
             if (self.current == id)
                 self.current = if (self.views.items.len > 0) self.views.items[self.views.items.len - 1].id else 0;
+            self.writePresence();
             return;
         }
     }
@@ -3248,7 +3260,10 @@ pub const Engine = struct {
                     v.can_back = ev.can_back != 0;
                     v.can_fwd = ev.can_fwd != 0;
                     v.loading = ev.loading != 0;
-                    if (ev.url.len > 0) self.setOwned(&v.url, ev.url);
+                    if (ev.url.len > 0 and !std.mem.eql(u8, v.url orelse "", ev.url)) {
+                        self.setOwned(&v.url, ev.url);
+                        if (self.current == ev.view) self.writePresence();
+                    }
                 }
             },
             .ev_load => {

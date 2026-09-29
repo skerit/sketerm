@@ -492,6 +492,9 @@ pub const View = struct {
     /// in `web-list`; headless it is the route of the ENGINE the view
     /// lives in, since a route there is a whole helper instance.
     route: []const u8 = "direct",
+    /// Manual handoff is independent of the automation backend's ownership.
+    handoff_available: bool = false,
+    browser_name: []const u8 = "",
     /// Named persistent profile the view lives in; empty otherwise.
     /// Headless only — the GUI's identity containers are the user's own
     /// and are not reported through these tools yet.
@@ -844,6 +847,8 @@ fn appendEngineViews(
             // One helper INSTANCE per route, so the engine's route is
             // every one of its views' route.
             .route = route,
+            .handoff_available = e.session != null and e.observeActive(),
+            .browser_name = try arena.dupe(u8, std.mem.sliceTo(&e.browser_label, 0)),
             .profile = if (v.profile) |p| try arena.dupe(u8, p) else "",
             .profile_kind = if (v.ephemeral_ctx)
                 "ephemeral"
@@ -1540,6 +1545,13 @@ fn tabsResult(arena: std.mem.Allocator, mode: Mode, vs: Views) ![]const u8 {
             if (v.profile.len > 0) "]" else "",
         });
     }
+    if (mode == .headless) {
+        for (vs.views) |v| {
+            if (!v.handoff_available) continue;
+            try res.text("These assistant-owned tabs can be shown through Sketerm's orange AI badge: Watch or Take control. 'headless' is the automation backend, not a visibility verdict. Reuse a tab with web_navigate and leave it open during manual login.");
+            break;
+        }
+    }
     if (vs.views.len > 0) try res.text("* = the view a web_* call with no 'pane' addresses");
     return res.finish();
 }
@@ -1600,6 +1612,8 @@ fn openResult(
     if (open_views > 1)
         try res.textf("{d} web views are now open, this one included (web_tabs lists them; web_close drops the ones you are done with)", .{open_views});
     if (mode == .headless) {
+        try res.fact("handoff", .{ .available = v.handoff_available, .name = v.browser_name });
+        if (v.handoff_available) try res.text("This is an assistant-owned browser tab. 'headless' describes ownership, not whether you can see it: the user can open Sketerm's orange AI badge and choose Watch or Take control to log in manually. Keep this tab open during handoff; use web_navigate to continue in it. The viewer follows new tabs in the same browser, including after the last tab closes.");
         try res.fact("profile", v.profile);
         try res.fact("profile_kind", v.profile_kind);
         try res.fact("context", v.context);
@@ -1627,7 +1641,7 @@ fn openResult(
         try res.text("the page had not finished loading inside the timeout; this describes the view at that moment - call web_snapshot for the settled page");
     if (where_ignored) {
         try res.fact("where_ignored", true);
-        try res.text("no GUI is attached: 'where' was ignored (a headless view has no tab/split/window placement)");
+        try res.text("'where' does not open a viewer for an assistant-owned tab; handoff.available reports whether the user can open one from the AI badge");
     }
     if (snap_err) |e| {
         try res.fact("snapshot_error", e);
@@ -2817,6 +2831,11 @@ pub fn webTool(
 
     if (eql(u8, name, "web_open")) {
         const url = mcp.argStr(args, "url");
+        const browser_name = mcp.argStr(args, "name");
+        if (browser_name) |label| {
+            if (label.len == 0 or label.len > 160 or !std.unicode.utf8ValidateSlice(label) or std.mem.indexOfAny(u8, label, "\r\n\x00") != null)
+                return mcp.errRes(arena, .invalid_args, "name must be a non-empty, single-line UTF-8 browser session name (at most 160 bytes)");
+        }
         const where = mcp.argStr(args, "where") orelse "tab";
         const vw: u16 = @intCast(std.math.clamp(mcp.argInt(args, "width") orelse webdrive.DEFAULT_W, 320, 3840));
         const vh: u16 = @intCast(std.math.clamp(mcp.argInt(args, "height") orelse webdrive.DEFAULT_H, 240, 2160));
@@ -2895,6 +2914,9 @@ pub fn webTool(
         // the rest of this call must address that engine, not the one
         // the call was picked with.
         drv = pick(backend, new_handle) catch return webGuiUnavailable(arena);
+        if (drv == .headless) {
+            if (browser_name) |label| drv.headless.setBrowserLabel(label) else drv.headless.writePresence();
+        }
         // Before the first pump: the hold this navigation raises must
         // be answered against it.
         if (accept_cert) |fp| drv.headless.setAcceptCert(new_handle, fp) catch |e| switch (e) {
@@ -4323,7 +4345,7 @@ fn present(arena: std.mem.Allocator, mime: []const u8, charset: []const u8, raw:
 fn extensionFor(mime: []const u8, kind: []const u8) []const u8 {
     if (std.mem.eql(u8, kind, "binary")) return ".bin";
     const pairs = [_][2][]const u8{
-        .{ "json", ".json" }, .{ "html", ".html" }, .{ "xml", ".xml" },
+        .{ "json", ".json" },     .{ "html", ".html" }, .{ "xml", ".xml" },
         .{ "javascript", ".js" }, .{ "css", ".css" },
     };
     for (pairs) |p| {
@@ -5837,13 +5859,32 @@ test "web_open: the snapshot rides both lanes, situational notes only in text" {
     try t.expect(rsc.get("snapshot") == null);
     const rtext = rp.object.get("content").?.array.items[0].object.get("text").?.string;
     try t.expect(std.mem.indexOf(u8, rtext, "had not finished loading inside the timeout") != null);
-    try t.expect(std.mem.indexOf(u8, rtext, "'where' was ignored") != null);
+    try t.expect(std.mem.indexOf(u8, rtext, "does not open a viewer") != null);
+    try t.expect(!rsc.get("handoff").?.object.get("available").?.bool);
     // No page content arrived, so no trust line is spent on it.
     try t.expect(std.mem.indexOf(u8, rtext, TRUST_LINE) == null);
     // The count nudges only once there is something to clean up: a
     // single view says nothing, three say so in the text lane too.
     try t.expect(std.mem.indexOf(u8, text, "web views are now open") == null);
     try t.expect(std.mem.indexOf(u8, rtext, "3 web views are now open") != null);
+}
+
+test "assistant-owned browser handoff is independent of headless backend" {
+    var arena_state = testArena();
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var view = EXAMPLE;
+    view.handoff_available = true;
+    view.browser_name = "Account login";
+    const result = try openResult(arena, .headless, view, true, false, null, null, null, "none", null, 1);
+    const parsed = try mcp.expectToolResultShape(arena, "web_open", result);
+    const sc = parsed.object.get("structuredContent").?.object;
+    try std.testing.expectEqualStrings("headless", sc.get("backend").?.string);
+    const handoff = sc.get("handoff").?.object;
+    try std.testing.expect(handoff.get("available").?.bool);
+    try std.testing.expectEqualStrings("Account login", handoff.get("name").?.string);
+    const text = parsed.object.get("content").?.array.items[0].object.get("text").?.string;
+    try std.testing.expect(std.mem.indexOf(u8, text, "Take control to log in manually") != null);
 }
 
 test "web_snapshot: kind/document/revision structured, unchanged said once" {

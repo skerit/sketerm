@@ -324,11 +324,23 @@ pub fn newWebTabFrom(self: *Window, url: ?[]const u8, opener: ?*c.AdwTabPage) !v
 /// watch's client. Returns the pane the tab was built around.
 pub fn newWebTabObserving(self: *Window, watch: *@import("webwatch.zig").Watch, view: u32) !*Pane {
     const before = self.panes.items.len;
-    try self.newShellTab("Web");
+    var source: ?*Pane = null;
+    for (self.panes.items) |p| {
+        if (p.id == watch.split_source_id) {
+            source = p;
+            break;
+        }
+    }
+    if (source) |p| {
+        try self.splitPane(p, c.GTK_ORIENTATION_HORIZONTAL);
+    } else {
+        try self.newShellTab("Assistant browser");
+    }
     if (self.panes.items.len <= before) return error.TabSpawnFailed;
     const pane = self.panes.items[self.panes.items.len - 1];
     _ = @import("webface.zig").WebFace.attachObserved(self.allocator, pane, view, watch.cl, @ptrCast(watch)) catch |err| {
         logActionError("watch attach", err);
+        self.closePane(pane);
         return err;
     };
     if (@import("webgroup.zig").Group.fromPane(pane)) |g| g.watch = @ptrCast(watch);

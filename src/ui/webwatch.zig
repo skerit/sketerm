@@ -18,7 +18,8 @@
 //! assistant's own trusted input does. Neither ever RESIZES,
 //! discards or destroys the assistant's view: closing the tab drops
 //! the subscription and nothing else, and a page the assistant closes
-//! ends here too.
+//! ends here too. Its last page becomes a waiting placeholder, keeping
+//! this viewer's placement and control preference for the next page.
 //!
 //! Lifetimes: pages are faces of the pane's `webgroup.Group`, which
 //! frees them with the pane; each face tells its watch on deinit
@@ -59,6 +60,8 @@ pub const Watch = struct {
     lease: muxtabs.Lease,
     pane: ?*Pane = null,
     pane_id: u32 = 0,
+    /// Resolve by id when the first asynchronous page arrives.
+    split_source_id: u32 = 0,
     pages: std.ArrayList(Page) = .empty,
     /// Set once teardown started, so a page closing during it does not
     /// re-enter.
@@ -100,6 +103,7 @@ pub const Watch = struct {
     fn addPage(self: *Watch, ev: proto.EvObserveView) void {
         if (self.closing) return;
         if (self.pageByTarget(ev.target) != null) return;
+        const waiting = if (self.pages.items.len == 1 and self.pages.items[0].target == 0) self.pages.items[0].face else null;
         const view = webface.mintViewId();
         self.cl.post(proto.ObserveSubscribe{
             .view = view,
@@ -126,18 +130,44 @@ pub const Watch = struct {
             face.closeSelf();
             return;
         };
+        // Attach the replacement first, so dropping the placeholder cannot
+        // tear down the group, its placement, or the follow subscription.
+        if (waiting) |old| old.closeSelf();
         if (self.pane) |pane| pane.refreshLeaseChip();
     }
 
     fn onState(self: *Watch, ev: proto.EvObserveState) void {
         const page = self.pageByView(ev.view) orelse return;
+        if (page.target == 0) return;
         switch (ev.state) {
             proto.observe_subscribed => page.face.onObserved(ev.w, ev.h, ev.scale_x1000, ev.control != 0),
             proto.observe_refused => page.face.observeRefused(ev.reason),
-            proto.observe_ended => page.face.closeSelf(),
+            proto.observe_ended => self.endPage(page),
             else => {},
         }
         if (self.pane) |pane| pane.refreshLeaseChip();
+    }
+
+    /// Only an OWNER close follows automatically. A user closing the viewer
+    /// still goes through onFaceGone and ends the subscription deliberately.
+    fn endPage(self: *Watch, page: *Page) void {
+        if (page.target == 0) return;
+        if (self.pages.items.len > 1) {
+            page.face.closeSelf();
+            return;
+        }
+        page.target = 0;
+        const face = page.face;
+        face.view_live = false;
+        face.obs_control = false;
+        face.dropMap();
+        if (!face.widgets_dead) {
+            c.gtk_picture_set_paintable(@ptrCast(face.picture), null);
+            face.setUrl("");
+            c.gtk_editable_set_text(@ptrCast(face.entry), "");
+            face.onTitle("Waiting for the next page");
+            face.setStatus("Following the assistant's browser.\nThe next tab will appear here automatically.\nClose this viewer to stop following.", false);
+        }
     }
 
     /// A face of this watch is being freed (the page ended, or the
@@ -323,6 +353,33 @@ pub fn openLocal(win: *Window, label: []const u8, mux_socket: []const u8, sessio
     return start(win, cl, label, key, lease);
 }
 
+/// Open or relocate the viewer beside the active pane. Only the observation
+/// is replaced: the assistant's pages and login state stay in its helper.
+pub fn openLocalBeside(win: *Window, label: []const u8, mux_socket: []const u8, session: []const u8) bool {
+    const source = win.focusedPane() orelse win.selectedTabPane() orelse return false;
+    const source_id = source.id;
+    var key_buf: [MAX_KEY]u8 = undefined;
+    const key = localKey(&key_buf, mux_socket, session) orelse return false;
+    var lease: muxtabs.Lease = .read_only;
+    if (find(win, key)) |w| {
+        if (w.pane == source) {
+            winmod.showToast(win, "Select the pane you want the browser beside, then choose Beside again.");
+            return false;
+        }
+        lease = w.lease;
+        // Tab closing is asynchronous. Detach the observation now so the
+        // fresh open cannot accidentally find/reuse the retiring watch.
+        // onFaceGone schedules removal of its now-empty pane.
+        if (w.pane) |pane| pane.detachWeb() else {
+            w.closing = true;
+            w.teardown();
+        }
+    }
+    if (!openLocal(win, label, mux_socket, session, lease)) return false;
+    if (find(win, key)) |w| w.split_source_id = source_id;
+    return true;
+}
+
 /// Same for an assistant on a REMOTE mux host (`host` in the mux host
 /// vocabulary): the remote daemon connects to the helper serving
 /// `session` beside its own socket, or beside the private daemon of
@@ -409,7 +466,7 @@ pub fn onObserveView(cl: *webface.Client, ev: proto.EvObserveView) void {
     const w = watchOf(cl) orelse return;
     switch (ev.state) {
         proto.observe_view_present => w.addPage(ev),
-        proto.observe_view_gone => if (w.pageByTarget(ev.target)) |p| p.face.closeSelf(),
+        proto.observe_view_gone => if (w.pageByTarget(ev.target)) |p| w.endPage(p),
         else => {},
     }
 }
@@ -431,11 +488,11 @@ pub fn chipText(g: *webgroup.Group, buf: []u8) ?struct { text: []const u8, view_
     const w: *Watch = @ptrCast(@alignCast(g.watch orelse return null));
     return switch (w.lease) {
         .control => .{
-            .text = std.fmt.bufPrint(buf, "Controlling {s}'s browser", .{w.label}) catch "Controlling the assistant's browser",
+            .text = std.fmt.bufPrint(buf, "Controlling {s}", .{w.label}) catch "Controlling the assistant's browser",
             .view_only = false,
         },
         else => .{
-            .text = std.fmt.bufPrint(buf, "View only - {s} controls", .{w.label}) catch "View only",
+            .text = std.fmt.bufPrint(buf, "View only - {s}", .{w.label}) catch "View only",
             .view_only = true,
         },
     };

@@ -3874,11 +3874,13 @@ fn assistantWebWatchStage(allocator: std.mem.Allocator, app: *appdrive.App, sock
     defer if (m_open) m.close();
     if (!m.initialize()) return "the web watch MCP server never answered initialize";
     var args: [1024]u8 = undefined;
-    const open_args = std.fmt.bufPrint(&args, "{{\"url\":\"file://{s}\",\"timeout_ms\":45000,\"snapshot\":\"none\"}}", .{page}) catch
+    const open_args = std.fmt.bufPrint(&args, "{{\"name\":\"Login review\",\"url\":\"file://{s}\",\"timeout_ms\":45000,\"snapshot\":\"none\"}}", .{page}) catch
         return "web_open arguments did not fit";
     const opened = m.call("web_open", open_args, 90_000) orelse return "web_open on the isolated MCP timed out";
     if (mcpHas(opened, "isError"))
         return whyf("web_open failed: {s}", .{opened[0..@min(opened.len, 400)]});
+    if (!mcpHas(opened, "\"available\":true") or !mcpHas(opened, "Login review") or !mcpHas(opened, "Take control"))
+        return "web_open did not explain the named manual handoff";
     const caps = m.call("capabilities", "{}", 30_000) orelse return "capabilities timed out";
     if (!mcpHas(caps, "\"web_observe\":true"))
         return whyf("capabilities does not report web_observe:true: {s}", .{capsExcerpt(caps, "web_observe")});
@@ -3889,6 +3891,10 @@ fn assistantWebWatchStage(allocator: std.mem.Allocator, app: *appdrive.App, sock
     if (openPopup(app) != null) return "a popup surface was already open before the chip was clicked";
     app.click(win_id, chip.x + chip.w / 2, chip.y + chip.h / 2, 1) catch return "clicking the assistant chip failed";
     const pop_id = waitPopup(app, true, 10_000) orelse return "the assistant chip opened no popover surface";
+    if (waitOcrWordCenter(allocator, app, pop_id, "Login", 10_000) == null)
+        return "the AI badge did not show the assistant's browser name";
+    if (waitOcrWordCenter(allocator, app, pop_id, "Local", 10_000) == null)
+        return "the AI badge did not show the page subtitle";
     const watch = waitOcrWordCenter(allocator, app, pop_id, "Watch", 10_000) orelse {
         if (app.screenshotPng(pop_id, 0, null, 0)) |shot| {
             defer allocator.free(shot.png);
@@ -4024,6 +4030,71 @@ fn assistantWebWatchStage(allocator: std.mem.Allocator, app: *appdrive.App, sock
             return whyf("the watched page's pointer mapping is off: clicked {d:.0},{d:.0} in a {d:.0}x{d:.0} box, page saw {d},{d} of {d}x{d}, expected {d:.0},{d:.0}", .{ cx - red.x, cy - red.y, red.w, red.h, got.x, got.y, got.vw, got.vh, ex, ey });
     }
 
+    // Reallocation alone must fit the existing frame: the page is static,
+    // so a new browser paint cannot accidentally repair stale geometry.
+    const original_size = app.windowSize(win_id) orelse return "watch window has no size";
+    app.resizeWindow(win_id, 800, 600) catch return "shrinking the watch failed";
+    _ = app.waitVisualSettle(win_id, 400, 5_000, 0.1, null);
+    const small = waitColorBox(app, win_id, isLime, 5_000) orelse return "watch vanished after shrinking";
+    // The external-display rig currently does not grant GTK's maximize
+    // request (set_maximized is sent, no configure comes back). Exercise
+    // the larger allocation explicitly rather than calling that a pass.
+    app.resizeWindow(win_id, 1500, 1000) catch return "enlarging the watch failed";
+    _ = app.waitVisualSettle(win_id, 400, 5_000, 0.1, null);
+    const large = waitColorBox(app, win_id, isLime, 5_000) orelse return "watch vanished after enlarging";
+    if (large.w <= small.w or large.h <= small.h) {
+        if (app.screenshotPng(win_id, 0, null, 0)) |shot| {
+            defer allocator.free(shot.png);
+            writePng("zig-out/smoke-e2e-webwatch-resize.png", shot.png);
+        } else |_| {}
+        return whyf("enlarged watch did not grow: {d:.0}x{d:.0} -> {d:.0}x{d:.0}", .{ small.w, small.h, large.w, large.h });
+    }
+    app.resizeWindow(win_id, @intCast(original_size.w), @intCast(original_size.h)) catch return "restoring the watch size failed";
+    _ = app.waitVisualSettle(win_id, 400, 5_000, 0.1, null);
+
+    // Closing the owner's LAST page retains this exact viewer, and its
+    // control preference applies to the replacement without another click.
+    const closed = m.call("web_close", "{}", 30_000) orelse return "closing the last owner tab timed out";
+    if (mcpHas(closed, "isError")) return "closing the last owner tab failed";
+    if (waitOcrWordCenter(allocator, app, win_id, "Following", 10_000) == null)
+        return "the last owner close did not leave a following placeholder";
+    const reopened = m.call("web_open", open_args, 90_000) orelse return "reopening the owner tab timed out";
+    if (mcpHas(reopened, "isError")) return "reopening the owner tab failed";
+    const replacement = waitColorBox(app, win_id, isRed, 15_000) orelse return "the viewer did not follow the next owner tab";
+    if (!waitWebPaneTitled(allocator, sock_path, app, web_pane, "watch:red", 5_000)) return "following the next tab replaced the viewer pane";
+    app.click(win_id, replacement.x + replacement.w / 3, replacement.y + replacement.h / 3, 1) catch return "clicking the replacement failed";
+    if (waitColorBox(app, win_id, isLime, 10_000) == null) return "the replacement did not retain Take control";
+
+    // Move the existing watch beside the original assistant pane via the
+    // visible badge, without navigating or destroying the owner's page.
+    if (!wsFocus(allocator, sock_path, keep_ids[0])) return "could not focus the assistant pane for Beside";
+    pumpFor(app, 300);
+    _ = app.waitVisualSettle(win_id, 400, 5_000, 0.1, null);
+    const move_chip = waitAssistantChip(app, win_id, true, 10_000) orelse return "no chip for moving the watch";
+    app.click(win_id, move_chip.x + move_chip.w / 2, move_chip.y + move_chip.h / 2, 1) catch return "opening the move menu failed";
+    const move_pop = waitPopup(app, true, 10_000) orelse {
+        if (app.screenshotPng(win_id, 0, null, 0)) |shot| {
+            defer allocator.free(shot.png);
+            writePng("zig-out/smoke-e2e-webwatch-nomove.png", shot.png);
+        } else |_| {}
+        return whyf("no move popover after clicking {d:.0},{d:.0}", .{ move_chip.x + move_chip.w / 2, move_chip.y + move_chip.h / 2 });
+    };
+    const beside = waitOcrWordCenter(allocator, app, move_pop, "Beside", 10_000) orelse return "the badge offered no Beside placement";
+    app.click(move_pop, beside.x, beside.y, 1) catch return "clicking Beside failed";
+    if (waitColorBox(app, win_id, isLime, 15_000) == null) {
+        if (app.screenshotPng(win_id, 0, null, 0)) |shot| {
+            defer allocator.free(shot.png);
+            writePng("zig-out/smoke-e2e-webwatch-beside.png", shot.png);
+        } else |_| {}
+        if (roundtrip(allocator, sock_path, "{\"cmd\":\"web-list\"}\n")) |r| {
+            defer allocator.free(r);
+            return whyf("Beside did not show the existing page: {s}", .{r});
+        }
+        return "Beside did not show the existing page";
+    }
+    if (tabCount(allocator, sock_path) != tabs_before) return "Beside opened a new tab instead of a split";
+    if (!waitPaneGone(allocator, sock_path, web_pane, 5_000)) return "Beside left the old viewer behind";
+
     // Close the tab: the assistant's page lives on, changed by our click.
     closeAddedPanes(allocator, sock_path, app, keep_ids[0..keep_n]);
     _ = app.waitIdle(300, 5_000);
@@ -4032,6 +4103,11 @@ fn assistantWebWatchStage(allocator: std.mem.Allocator, app: *appdrive.App, sock
         if (mcpHas(title, "isError") or !mcpHas(title, "watch:clicked"))
             return whyf("closing the watch tab did not leave the assistant's clicked page alive: {s}", .{title[0..@min(title.len, 300)]});
     }
+    const after_viewer_close = m.call("web_open", open_args, 90_000) orelse return "opening after viewer close timed out";
+    if (mcpHas(after_viewer_close, "isError")) return "opening after viewer close failed";
+    pumpFor(app, 1000);
+    if (tabCount(allocator, sock_path) != tabs_before or waitColorBox(app, win_id, isRed, 1000) != null)
+        return "closing the viewer failed to stop following";
     m.close();
     m_open = false;
     const retired = waitAssistantChip(app, win_id, false, 30_000) != null;
@@ -7454,7 +7530,6 @@ fn viewerReuseStage(allocator: std.mem.Allocator, app: *appdrive.App, rt: [:0]co
     return null;
 }
 
-
 /// Cast playback INSIDE the Sketerm Viewer: `sketerm view` on a mixed
 /// batch (image + cast + text + binary), navigated both directions on
 /// a real seat. What only a live run can prove: the shared
@@ -8239,7 +8314,6 @@ fn filesMountBypassStage(
     }
     return null;
 }
-
 
 /// A Files window on a fake-SSH directory survives its daemon dying:
 /// after the reconnect every row is listed ONCE (the re-open used to
@@ -11751,8 +11825,7 @@ fn panelStage(
     defer allocator.free(all_png);
     if (!writeSolidPng(allocator, all_png, 0x40, 0xa0, 0x60)) return "could not write the all-kinds image";
     {
-        const all_req = std.fmt.allocPrint(allocator,
-            "{{\"cmd\":\"panel-show\",\"name\":\"e2e\",\"session\":\"e2e-scope\",\"target\":\"window\",\"document\":\"" ++
+        const all_req = std.fmt.allocPrint(allocator, "{{\"cmd\":\"panel-show\",\"name\":\"e2e\",\"session\":\"e2e-scope\",\"target\":\"window\",\"document\":\"" ++
             "{{\\\"version\\\":1,\\\"title\\\":\\\"All kinds\\\",\\\"root\\\":\\\"col\\\",\\\"components\\\":{{" ++
             "\\\"col\\\":{{\\\"type\\\":\\\"column\\\",\\\"children\\\":[\\\"h\\\",\\\"t\\\",\\\"r\\\",\\\"img\\\",\\\"cmp\\\",\\\"p\\\",\\\"sep\\\",\\\"sp\\\",\\\"sc\\\",\\\"tbl\\\"]}}," ++
             "\\\"h\\\":{{\\\"type\\\":\\\"heading\\\",\\\"text\\\":\\\"Kinds\\\"}}," ++
