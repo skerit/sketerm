@@ -1,5 +1,32 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-09-29: standalone GTK-free MCP server
+
+`zig build mcp-standalone` installs `sketerm-mcp` and the shell-integration
+scripts needed by its terminal tools. It reuses the existing server and
+portable daemon dependency setup; the Linux binary links only libc and
+libm. GUI socket discovery now uses libc, and the watchdog uses the shared
+spinlock. The standalone entry point also handles the SOCKS5 self-exec mode.
+WebM remains available in the GUI server; standalone recording defaults to
+GIF and refuses explicit WebM, exposed as `capabilities.app_record_webm`.
+GUI browser grants resolve a sibling `sketerm` or `SKETERM_GUI_BIN`, never
+try to execute the standalone server as a GUI, and refuse missing binaries.
+
+Validation: `test` and `test-core` passed 6605 tests with 21 skips; the
+recorder availability and GUI-executable resolution have unit coverage.
+`dist/test-mux-build.sh` includes the standalone target and passed with GUI
+package probes forbidden. `dist/test-mcp-standalone.py` passed against a
+relocated installation, exercising JSON-RPC, shell command completion,
+missing-GUI refusal, app launch/close, and explicit WebM refusal. The
+glibc 2.36 baseline-CPU standalone build and aarch64-macos portable daemon
+cross-build passed too.
+
+The broader `smoke-mcp` passed its terminal, file, panel, GUI grant, app,
+and initial real-browser stages but failed the certificate assertion
+"the refusal's load failure is not reported". An unchanged worktree at
+97b58485 reproduced the identical failure; this pre-existing browser issue
+is not changed by the standalone feature.
+
 ## 2026-09-28: saving live browser profiles, watching a named instance remotely
 
 For an unattended service driving websites (Arcana's integration hub runs its
