@@ -10,6 +10,7 @@
 //! musl-clean for the portable daemon.
 
 const std = @import("std");
+const TokenBucket = @import("../util/tokenbucket.zig").TokenBucket;
 
 pub const LogRing = struct {
     pub const Line = struct {
@@ -28,7 +29,7 @@ pub const LogRing = struct {
     pub const MAX_LINES: usize = 1000;
     pub const MAX_TOTAL_BYTES: usize = 2 << 20;
 
-    /// Marker admission (token bucket): an accidentally `cat`ed log
+    /// Marker admission (`TokenBucket`): an accidentally `cat`ed log
     /// full of OSC 5522 escapes must not evict real lines from the
     /// ring or flood viewers with pushes (each push costs the client
     /// a PNG encode).
@@ -49,9 +50,7 @@ pub const LogRing = struct {
     /// keep the new segment). Resolving eagerly on CR would wipe
     /// every CRLF-terminated line — which is ALL PTY output.
     cur_cr: bool = false,
-    /// Marker token bucket state.
-    marker_tokens: f64 = MARKER_BURST,
-    marker_refill_ms: i64 = 0,
+    marker_bucket: TokenBucket = .init(MARKER_BURST, MARKER_PER_SEC),
     /// Markers rejected by the bucket, ever (surfaced in log_get).
     markers_dropped: u64 = 0,
     /// A drop-run is in progress (one note line per run, not per drop).
@@ -111,17 +110,7 @@ pub const LogRing = struct {
     /// real output) and no viewer push (each costs a PNG encode) —
     /// except ONE note line at the start of each drop-run.
     pub fn admitMarker(self: *LogRing, t_ms: i64) bool {
-        if (self.marker_refill_ms == 0) self.marker_refill_ms = t_ms;
-        const elapsed = t_ms - self.marker_refill_ms;
-        if (elapsed > 0) {
-            self.marker_tokens = @min(
-                MARKER_BURST,
-                self.marker_tokens + @as(f64, @floatFromInt(elapsed)) * MARKER_PER_SEC / 1000.0,
-            );
-            self.marker_refill_ms = t_ms;
-        }
-        if (self.marker_tokens >= 1.0) {
-            self.marker_tokens -= 1.0;
+        if (self.marker_bucket.take(t_ms)) {
             self.marker_limiting = false;
             return true;
         }

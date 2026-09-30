@@ -24,6 +24,17 @@ pub fn stateDir(buf: []u8) ?[]const u8 {
     return null;
 }
 
+/// The user's sketerm config directory (`$XDG_CONFIG_HOME/sketerm`, else
+/// `$HOME/.config/sketerm`), without a trailing slash.
+/// @return null when neither variable names a directory.
+pub fn configDir(buf: []u8) ?[]const u8 {
+    if (env.nonEmpty("XDG_CONFIG_HOME")) |xc|
+        return std.fmt.bufPrint(buf, "{s}/sketerm", .{xc}) catch null;
+    if (env.nonEmpty("HOME")) |home|
+        return std.fmt.bufPrint(buf, "{s}/.config/sketerm", .{home}) catch null;
+    return null;
+}
+
 /// `<state dir>/<rel>`, allocated. `rel` is a relative path such as
 /// `places.json` or `file-transfers.d`.
 pub fn statePath(allocator: std.mem.Allocator, rel: []const u8) Error![]u8 {
@@ -55,6 +66,26 @@ test "statePath prefers XDG_STATE_HOME, falls back to HOME, and never to /tmp" {
     _ = c.unsetenv("XDG_STATE_HOME");
     _ = c.unsetenv("HOME");
     try t.expectError(Error.NoStateDir, statePath(t.allocator, "x"));
+}
+
+test "configDir prefers XDG_CONFIG_HOME, falls back to HOME" {
+    const c = @import("../c.zig").c;
+    const t = std.testing;
+    const old_cfg = env.get("XDG_CONFIG_HOME");
+    const old_home = env.get("HOME");
+    defer {
+        restore("XDG_CONFIG_HOME", old_cfg);
+        restore("HOME", old_home);
+    }
+    var buf: [256]u8 = undefined;
+    _ = c.setenv("XDG_CONFIG_HOME", "/xc", 1);
+    _ = c.setenv("HOME", "/home/u", 1);
+    try t.expectEqualStrings("/xc/sketerm", configDir(&buf).?);
+    _ = c.setenv("XDG_CONFIG_HOME", "", 1);
+    try t.expectEqualStrings("/home/u/.config/sketerm", configDir(&buf).?);
+    _ = c.unsetenv("XDG_CONFIG_HOME");
+    _ = c.unsetenv("HOME");
+    try t.expect(configDir(&buf) == null);
 }
 
 fn restore(name: [*:0]const u8, value: ?[]const u8) void {

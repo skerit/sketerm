@@ -314,6 +314,12 @@ comptime {
     _ = @import("util/invocation.zig");
     _ = @import("util/atomicwrite.zig");
     _ = @import("util/pattern.zig");
+    _ = @import("util/tokenbucket.zig");
+    _ = @import("agent/vocab.zig");
+    _ = @import("agent/events.zig");
+    _ = @import("agent/adapter.zig");
+    _ = @import("agent/grammar.zig");
+    _ = @import("agent/screen_source.zig");
     _ = @import("util/percent.zig");
     _ = @import("util/suggest.zig");
     _ = @import("util/platform.zig");

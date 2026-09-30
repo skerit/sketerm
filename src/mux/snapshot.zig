@@ -174,6 +174,9 @@ const field_policy = [_]struct { name: []const u8, class: FieldClass }{
     // IME preedit and the bell timestamp belong to the local frame.
     .{ .name = "preedit_text", .class = .transient },
     .{ .name = "bell_at_us", .class = .transient },
+    // A per-Screen-object counter for batch readers; they treat a restart
+    // (a new Screen after resync) as a resync.
+    .{ .name = "bell_seq", .class = .transient },
 
     .{ .name = "last_print_cp", .class = .carried },
     .{ .name = "last_print_key", .class = .carried },

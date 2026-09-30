@@ -314,6 +314,10 @@ pub const Screen = struct {
     /// Microsecond timestamp when BEL was last received. Renderer
     /// flashes a translucent white overlay for ~200ms after.
     bell_at_us: i64 = 0,
+    /// BELs received by this Screen object, ever: lets a reader driven after
+    /// a whole batch count bells the timestamp would merge. Restarts at 0
+    /// with a new Screen (a snapshot resync).
+    bell_seq: u64 = 0,
 
     /// Last printed codepoint (for REP, CSI Pn b). 0 = none.
     last_print_cp: u32 = 0,
@@ -2145,7 +2149,7 @@ pub const Screen = struct {
 
     /// True when the row after `row` is a soft-wrap continuation, i.e.
     /// the two rows are one logical line and no newline separates them.
-    fn nextRowContinues(self: *const Screen, row: i32) bool {
+    pub fn nextRowContinues(self: *const Screen, row: i32) bool {
         return if (self.lineAt(row + 1)) |l| l.continues_above else false;
     }
 
@@ -4489,6 +4493,7 @@ pub const Screen = struct {
             0x07 => {
                 // BEL: visual flash + optional sink notification.
                 self.bell_at_us = @import("../util/profile.zig").microTimestamp();
+                self.bell_seq +%= 1;
                 if (self.sink.on_bell) |f| f(self.sink.ctx);
             },
             0x08 => self.backspace(),

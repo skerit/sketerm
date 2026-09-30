@@ -1,0 +1,101 @@
+{
+  "id": "claude",
+  "name": "Claude Code",
+  "source": "screen",
+  "launch": {
+    "binary": "claude",
+    "candidates": ["$PATH", "~/.local/bin/claude", "~/.claude/local/claude"],
+    "args": ["--ax-screen-reader"],
+    "model_args": ["--model", "{model}"],
+    "effort_args": ["--effort", "{effort}"],
+    "unset_env": ["CLAUDE*"]
+  },
+  "screen": {
+    "input_prefix": "$",
+    "ready_settle_ms": 800,
+    "busy_title": ["◐", "◑", "◒", "◓"],
+    "turn_end": "osc133",
+    "footer": { "pattern": "^\\S+ for [0-9][0-9hms ]* · done|^\\S+ for [0-9][0-9hms ]*$" },
+    "settle_ms": 1500,
+    "records": [
+      { "kind": "user", "prefix": "you: ", "then": "notice", "then_when": "/" },
+      { "kind": "assistant", "prefix": "claude: " },
+      { "kind": "tool", "prefix": "tool: " },
+      { "kind": "tool", "pattern": "^tool error: " },
+      { "kind": "tool", "pattern": "^Read [0-9]+ .*ctrl\\+o to expand|^Listed [0-9]+ .*ctrl\\+o to expand|^Searched for [0-9]+ .*ctrl\\+o to expand|^Ran [0-9]+ .*ctrl\\+o to expand|^Found [0-9]+ .*ctrl\\+o to expand|^Fetched [0-9]+ .*ctrl\\+o to expand" },
+      { "kind": "notice", "pattern": "^Interrupted .*What should Claude do instead" },
+      { "kind": "notice", "pattern": "^ *Agent \".*\" finished" },
+      { "kind": "notice", "pattern": "^Compacted (" },
+      { "kind": "notice", "pattern": "^Conversation compacted" }
+    ],
+    "chrome": [
+      { "pattern": "^[A-Z]\\S*…$" },
+      { "pattern": "^[A-Z]\\S* \\S+…$" },
+      { "prefix": "Tip: " },
+      { "pattern": "^[0-9]+ tasks? (" },
+      { "prefix": "✔ " },
+      { "prefix": "◻ " },
+      { "prefix": "◼ " },
+      { "prefix": "☒ " },
+      { "prefix": "☐ " },
+      { "prefix": "Backgrounded agent (" },
+      { "pattern": "^ *● " },
+      { "pattern": "^ *◯ " },
+      { "prefix": "manual mode on" },
+      { "prefix": "auto mode on" },
+      { "prefix": "accept edits on" },
+      { "prefix": "plan mode on" },
+      { "prefix": "bypass permissions on" },
+      { "prefix": "⏵" },
+      { "prefix": "⏸" },
+      { "pattern": "^\\$$" },
+      { "prefix": "$ " },
+      { "prefix": "ctrl+g to edit" },
+      { "pattern": "^/[a-z][-a-z0-9:_]*  +\\S" },
+      { "pattern": "^                                        +\\S" },
+      { "prefix": "[Screen Reader Mode: " },
+      { "pattern": "^Claude Code v[0-9]" }
+    ],
+    "subagent": { "pattern": "^Waiting for [0-9]+ background agents? to finish" },
+    "choice_prompt": { "prefix": "Select with numbers [" },
+    "selected_marker": "(selected)",
+    "permission": { "prefix": "Permission Required:" },
+    "bell_needs_input": true
+  },
+  "actions": {
+    "submit": [
+      { "clear_input": ["escape", "escape"] },
+      { "text": "{text}" },
+      { "sleep_ms": 800 },
+      { "key": "enter" }
+    ],
+    "answer": [
+      { "pick": "{choice}" },
+      { "sleep_ms": 300 },
+      { "key": "enter" }
+    ],
+    "interrupt": [
+      { "key": "escape" }
+    ],
+    "set_model": [
+      { "text": "/model" },
+      { "sleep_ms": 800 },
+      { "key": "enter" },
+      { "wait": "choice" },
+      { "pick": "{model}" },
+      { "sleep_ms": 300 },
+      { "key": "s" }
+    ],
+    "set_effort": [
+      { "text": "/effort {effort}" },
+      { "sleep_ms": 800 },
+      { "key": "enter" }
+    ]
+  },
+  "errors": [
+    { "class": "limit", "pattern": "You've hit your |Usage limit reached|usage limit reached|You're out of usage credits|Credit balance is too low|spend limit reached", "reset_marker": "resets " },
+    { "class": "auth", "pattern": "Please run /login|Not logged in|Invalid API key|Invalid auth token|Authentication required|Failed to authenticate|OAuth token has expired" },
+    { "class": "retrying", "pattern": "Retrying in [0-9]" },
+    { "class": "api", "pattern": "^API Error|Repeated 529 Overloaded errors|is experiencing high load|^Prompt is too long" }
+  ]
+}
