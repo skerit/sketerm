@@ -18,6 +18,11 @@
 //! it, plus the lines that scrolled into history since the previous frame.
 //! A frame is every run of events sharing one timestamp, skipped while the
 //! app holds a synchronized-output (DEC 2026) update open.
+//!
+//! `replay --agent <adapter> rec.cast` runs the same frames through the
+//! agent screen engine (`src/agent/screen_source.zig`) and prints its
+//! records, events, state and interaction changes as JSON lines, then the
+//! final transcript: the debugging entry point for an adapter file.
 
 const std = @import("std");
 const cell_mod = @import("grid/cell.zig");
@@ -79,8 +84,20 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
 
     const argv = init.args.vector;
     if (argv.len < 2) {
-        std.debug.print("usage: replay <capture.bin> [cols rows]\n       replay --cast <rec.cast> [cols rows]\n", .{});
+        std.debug.print("usage: replay <capture.bin> [cols rows]\n       replay --cast <rec.cast> [cols rows]\n" ++
+            "       replay --agent <adapter-id|adapter.json> <rec.cast> [cols rows]\n", .{});
         return 1;
+    }
+    if (std.mem.eql(u8, std.mem.span(argv[1]), "--agent")) {
+        if (argv.len < 4) {
+            std.debug.print("usage: replay --agent <adapter-id|adapter.json> <rec.cast> [cols rows]\n", .{});
+            return 1;
+        }
+        const size: ?[2]u16 = if (argv.len > 5) .{
+            try std.fmt.parseInt(u16, std.mem.span(argv[4]), 10),
+            try std.fmt.parseInt(u16, std.mem.span(argv[5]), 10),
+        } else null;
+        return replayAgent(allocator, std.mem.span(argv[2]), std.mem.span(argv[3]), size);
     }
     if (std.mem.eql(u8, std.mem.span(argv[1]), "--cast")) {
         if (argv.len < 3) {
@@ -181,8 +198,19 @@ fn replayCast(allocator: std.mem.Allocator, path: [:0]const u8, size: ?[2]u16) !
     return 0;
 }
 
-/// Replay a whole cast, writing one `Frame` JSON line per distinct event time.
-fn castFrames(allocator: std.mem.Allocator, bytes: []const u8, size: ?[2]u16, out: *std.Io.Writer) !void {
+/// What a cast replay does with the Screen it drives.
+const FrameSink = struct {
+    ctx: *anyopaque,
+    /// Every distinct event time, after its events are applied.
+    frame: *const fn (ctx: *anyopaque, screen: *Screen, ms: u64) anyerror!void,
+    /// Time moved on to `ms` with no output in between (before that time's
+    /// events are applied).
+    idle: ?*const fn (ctx: *anyopaque, ms: u64) anyerror!void = null,
+};
+
+/// Replay a whole cast through a parser + Screen, one `sink.frame` per
+/// distinct event time.
+fn playCast(allocator: std.mem.Allocator, bytes: []const u8, size: ?[2]u16, sink: FrameSink) !void {
     var player = cast_play.Player.init(allocator);
     defer player.deinit();
     try player.feed(bytes);
@@ -199,11 +227,13 @@ fn castFrames(allocator: std.mem.Allocator, bytes: []const u8, size: ?[2]u16, ou
     defer parser.deinit();
     var ctx = Ctx{ .screen = screen, .allocator = allocator };
 
-    var prev_newest: u64 = 0;
     var pending_ms: ?u64 = null;
     while (next_ev) |te| : (next_ev = try player.next()) {
         if (pending_ms) |ms| {
-            if (te.time_ms != ms) try writeFrame(allocator, screen, ms, &prev_newest, out);
+            if (te.time_ms != ms) {
+                try sink.frame(sink.ctx, screen, ms);
+                if (sink.idle) |f| try f(sink.ctx, te.time_ms);
+            }
         }
         switch (te.event) {
             .output => |data| parser.advance(data, emit, @ptrCast(&ctx)),
@@ -212,7 +242,24 @@ fn castFrames(allocator: std.mem.Allocator, bytes: []const u8, size: ?[2]u16, ou
         }
         pending_ms = te.time_ms;
     }
-    if (pending_ms) |ms| try writeFrame(allocator, screen, ms, &prev_newest, out);
+    if (pending_ms) |ms| try sink.frame(sink.ctx, screen, ms);
+}
+
+const FrameWriter = struct {
+    allocator: std.mem.Allocator,
+    out: *std.Io.Writer,
+    prev_newest: u64 = 0,
+
+    fn frame(ctx: *anyopaque, screen: *Screen, ms: u64) anyerror!void {
+        const self: *FrameWriter = @ptrCast(@alignCast(ctx));
+        try writeFrame(self.allocator, screen, ms, &self.prev_newest, self.out);
+    }
+};
+
+/// Replay a whole cast, writing one `Frame` JSON line per distinct event time.
+fn castFrames(allocator: std.mem.Allocator, bytes: []const u8, size: ?[2]u16, out: *std.Io.Writer) !void {
+    var fw: FrameWriter = .{ .allocator = allocator, .out = out };
+    try playCast(allocator, bytes, size, .{ .ctx = &fw, .frame = FrameWriter.frame });
 }
 
 /// A frame inside an open synchronized-output update is skipped: no reader
@@ -283,6 +330,192 @@ fn writeColor(w: *std.Io.Writer, color: @import("grid/style_pool.zig").Color) !v
         .palette => |p| try w.print("p{d}", .{p}),
         .rgb => |c| try w.print("#{x:0>2}{x:0>2}{x:0>2}", .{ c.r, c.g, c.b }),
     }
+}
+
+// ── --agent: a recording through the agent screen engine ─────────
+
+const agent_adapter = @import("agent/adapter.zig");
+const agent_engine = @import("agent/screen_source.zig");
+const agent_vocab = @import("agent/vocab.zig");
+
+/// How long the replay keeps the clock running after the last event, so the
+/// engine's settle guards fire as they would live.
+const AGENT_TAIL_MS: u64 = 10_000;
+
+fn replayAgent(allocator: std.mem.Allocator, adapter_arg: []const u8, path: [:0]const u8, size: ?[2]u16) !u8 {
+    var set = try agent_adapter.Set.loadDefault(allocator);
+    defer set.deinit();
+    for (set.problems.items) |p| std.debug.print("replay: adapter problem: {s}\n", .{p});
+    const loaded = set.get(adapter_arg) orelse blk: {
+        // An adapter file under development: `replay --agent ./mine.json rec.cast`.
+        if (!std.mem.endsWith(u8, adapter_arg, ".json")) break :blk null;
+        const z = try allocator.dupeZ(u8, adapter_arg);
+        defer allocator.free(z);
+        const json = (try readFile(allocator, z)) orelse return 1;
+        defer allocator.free(json);
+        const before = set.problems.items.len;
+        try set.addSource(adapter_arg, json, .user);
+        if (set.problems.items.len > before) {
+            std.debug.print("replay: {s}\n", .{set.problems.items[before]});
+            return 1;
+        }
+        for (set.items.items) |l| {
+            if (std.mem.eql(u8, l.source, adapter_arg)) break :blk l;
+        }
+        break :blk null;
+    } orelse {
+        std.debug.print("replay: no adapter \"{s}\"\n", .{adapter_arg});
+        return 1;
+    };
+    const bytes = (try readFile(allocator, path)) orelse return 1;
+    defer allocator.free(bytes);
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    agentLines(allocator, loaded, bytes, size, &aw.writer) catch |err| {
+        std.debug.print("replay: {s}: {s}\n", .{ path, @errorName(err) });
+        return 1;
+    };
+    const out = aw.written();
+    _ = cstd.fwrite(out.ptr, 1, out.len, cstd.stdout);
+    return 0;
+}
+
+/// Replay a cast through the engine, printing records, events, state and
+/// interaction changes as they happen, then every final record.
+fn agentLines(allocator: std.mem.Allocator, loaded: *const agent_adapter.Loaded, bytes: []const u8, size: ?[2]u16, out: *std.Io.Writer) !void {
+    var engine = try agent_engine.Engine.init(allocator, loaded, .{});
+    defer engine.deinit();
+    var sink: AgentSink = .{ .allocator = allocator, .engine = &engine, .out = out };
+    try playCast(allocator, bytes, size, .{ .ctx = &sink, .frame = AgentSink.frame, .idle = AgentSink.idle });
+    try AgentSink.idle(&sink, sink.last_ms + AGENT_TAIL_MS);
+    for (engine.records.items) |r| {
+        try std.json.Stringify.value(.{ .type = "final", .id = r.id, .turn = r.turn, .kind = r.kind, .text = r.text, .synthetic = r.synthetic }, .{}, out);
+        try out.writeByte('\n');
+    }
+}
+
+const AgentSink = struct {
+    allocator: std.mem.Allocator,
+    engine: *agent_engine.Engine,
+    out: *std.Io.Writer,
+    last_ms: u64 = 0,
+    printed_record: u64 = 0,
+    printed_seq: u64 = 0,
+    state: ?agent_vocab.State = null,
+    interaction: ?u64 = null,
+
+    fn frame(ctx: *anyopaque, screen: *Screen, ms: u64) anyerror!void {
+        const self: *AgentSink = @ptrCast(@alignCast(ctx));
+        try self.engine.feed(screen, @intCast(ms));
+        try self.flush(ms);
+    }
+
+    fn idle(ctx: *anyopaque, ms: u64) anyerror!void {
+        const self: *AgentSink = @ptrCast(@alignCast(ctx));
+        try self.engine.tick(@intCast(ms));
+        try self.flush(ms);
+    }
+
+    fn flush(self: *AgentSink, ms: u64) !void {
+        self.last_ms = ms;
+        const t: f64 = @as(f64, @floatFromInt(ms)) / 1000.0;
+        var fresh: std.ArrayList(agent_engine.Record) = .empty;
+        defer fresh.deinit(self.allocator);
+        try self.engine.recordsSince(self.printed_record, &fresh, self.allocator);
+        for (fresh.items) |r| {
+            try std.json.Stringify.value(.{ .t = t, .type = "record", .id = r.id, .turn = r.turn, .kind = r.kind, .text = r.text }, .{}, self.out);
+            try self.out.writeByte('\n');
+            self.printed_record = @max(self.printed_record, r.id);
+        }
+        for (self.engine.queue.events.items) |ev| {
+            if (ev.seq <= self.printed_seq) continue;
+            try std.json.Stringify.value(.{
+                .t = t,
+                .type = "event",
+                .seq = ev.seq,
+                .kind = ev.kind,
+                .class = ev.class,
+                .text = ev.text,
+                .detail = ev.detail,
+            }, .{}, self.out);
+            try self.out.writeByte('\n');
+            self.printed_seq = ev.seq;
+        }
+        if (self.state != self.engine.state) {
+            self.state = self.engine.state;
+            try std.json.Stringify.value(.{ .t = t, .type = "state", .state = self.engine.state }, .{}, self.out);
+            try self.out.writeByte('\n');
+        }
+        const ih: ?u64 = if (self.engine.interaction) |it| it.hash() else null;
+        if (ih != self.interaction) {
+            self.interaction = ih;
+            if (self.engine.interaction) |it| {
+                try std.json.Stringify.value(.{
+                    .t = t,
+                    .type = "interaction",
+                    .kind = it.kind,
+                    .title = it.title,
+                    .detail = it.detail,
+                    .hint = it.hint,
+                    .options = it.options,
+                }, .{}, self.out);
+            } else {
+                try std.json.Stringify.value(.{ .t = t, .type = "interaction", .cleared = true }, .{}, self.out);
+            }
+            try self.out.writeByte('\n');
+        }
+    }
+};
+
+test "agent replay: records, events and the final transcript as JSON lines" {
+    const cast =
+        \\{"version": 2, "width": 80, "height": 12}
+        \\[0.1, "o", "\u001b]0;✳ Claude Code\u0007banner\r\n[status]\r\nmanual mode on\r\n$"]
+        \\[1.5, "o", "\u001b]133;A\u0007\u001b]0;◐ Task\u0007\u001b[2K\u001b[1A\u001b[2K\u001b[1A\u001b[2K\u001b[Gyou: say hi\r\nPuttering…\r\n[status]\r\nmanual mode on\r\n$"]
+        \\[2.0, "o", "\u001b[2K\u001b[1A\u001b[2K\u001b[1A\u001b[2K\u001b[1A\u001b[2K\u001b[Gclaude: Hello there\r\n[status]\r\nmanual mode on\r\n$"]
+        \\[2.1, "o", "\u001b]133;C\u0007\u001b]133;D\u0007\u0007\u001b]0;✳ Task\u0007"]
+        \\[2.1, "o", "\u001b[2K\u001b[1A\u001b[2K\u001b[1A\u001b[2K\u001b[GBrewed for 1s · done\r\n[status]\r\nmanual mode on\r\n$"]
+        \\
+    ;
+    const gpa = std.testing.allocator;
+    const grammar = @import("agent/grammar.zig");
+    const loaded = try grammar.testAdapter();
+    defer loaded.destroy(gpa);
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try agentLines(gpa, loaded, cast, null, &aw.writer);
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const Seen = struct {
+        type: []const u8,
+        kind: ?[]const u8 = null,
+        text: ?[]const u8 = null,
+        state: ?[]const u8 = null,
+    };
+    var records: usize = 0;
+    var done: usize = 0;
+    var finals: std.ArrayList(Seen) = .empty;
+    var states: std.ArrayList([]const u8) = .empty;
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, aw.written(), "\n"), '\n');
+    while (lines.next()) |line| {
+        const s = try std.json.parseFromSliceLeaky(Seen, arena.allocator(), line, .{ .ignore_unknown_fields = true });
+        if (std.mem.eql(u8, s.type, "record")) records += 1;
+        if (std.mem.eql(u8, s.type, "event") and std.mem.eql(u8, s.kind.?, "done")) {
+            done += 1;
+            try std.testing.expectEqualStrings("Hello there", s.text.?);
+        }
+        if (std.mem.eql(u8, s.type, "final")) try finals.append(arena.allocator(), s);
+        if (std.mem.eql(u8, s.type, "state")) try states.append(arena.allocator(), s.state.?);
+    }
+    try std.testing.expectEqual(@as(usize, 2), records);
+    try std.testing.expectEqual(@as(usize, 1), done);
+    try std.testing.expectEqual(@as(usize, 2), finals.items.len);
+    try std.testing.expectEqualStrings("user", finals.items[0].kind.?);
+    try std.testing.expectEqualStrings("say hi", finals.items[0].text.?);
+    try std.testing.expectEqualStrings("Hello there", finals.items[1].text.?);
+    try std.testing.expectEqualStrings("starting", states.items[0]);
+    try std.testing.expectEqualStrings("idle", states.items[states.items.len - 1]);
 }
 
 test "cast replay: a frame per event time, open sync updates skipped, scrolled lines reported" {
