@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const headers = @import("../util/headers.zig");
 
 pub const Error = error{
     /// A header block with no parsable Content-Length.
@@ -78,15 +79,8 @@ pub const Reader = struct {
 };
 
 fn parseContentLength(header: []const u8) ?usize {
-    var lines = std.mem.splitSequence(u8, header, "\r\n");
-    while (lines.next()) |line| {
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
-        const name = std.mem.trim(u8, line[0..colon], " \t");
-        if (!std.ascii.eqlIgnoreCase(name, "content-length")) continue;
-        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
-        return std.fmt.parseInt(usize, value, 10) catch null;
-    }
-    return null;
+    const value = headers.value(header, "content-length") orelse return null;
+    return std.fmt.parseInt(usize, value, 10) catch null;
 }
 
 /// Prepend the base-protocol header to `body` (caller owns the result).

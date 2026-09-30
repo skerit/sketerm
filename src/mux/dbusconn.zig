@@ -63,11 +63,15 @@ pub fn waitFd(fd: c_int, events: c_short, deadline: i64) !void {
     }
 }
 
-/// Write every byte, waiting on POLLOUT whenever the socket is full.
+/// Write every byte to a socket, waiting on POLLOUT whenever it is full.
+/// A peer that went away is `error.Write`, never a SIGPIPE.
 pub fn writeAll(fd: c_int, bytes: []const u8, deadline: i64) !void {
     var off: usize = 0;
     while (off < bytes.len) {
-        const n = c.write(fd, bytes[off..].ptr, bytes.len - off);
+        const n = if (comptime @hasDecl(c, "MSG_NOSIGNAL"))
+            c.send(fd, bytes[off..].ptr, bytes.len - off, c.MSG_NOSIGNAL)
+        else
+            c.write(fd, bytes[off..].ptr, bytes.len - off);
         if (n > 0) {
             off += @intCast(n);
             continue;

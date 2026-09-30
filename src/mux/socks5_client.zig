@@ -44,7 +44,9 @@ pub const Endpoint = union(enum) {
         return .{ .ipv4 = .{ .addr = addr, .port = port } };
     }
 
-    fn connect(self: Endpoint, deadline: i64) !c_int {
+    /// A non-blocking cloexec TCP stream connected to the endpoint (also the
+    /// agent HTTP client's loopback dial).
+    pub fn connect(self: Endpoint, deadline: i64) !c_int {
         const family: c_int = switch (self) {
             .ipv4 => c.AF_INET,
             .ipv6 => c.AF_INET6,

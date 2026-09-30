@@ -21,6 +21,8 @@ comptime {
     _ = @import("agent/adapter.zig");
     _ = @import("agent/grammar.zig");
     _ = @import("agent/screen_source.zig");
+    _ = @import("agent/http.zig");
+    _ = @import("util/headers.zig");
     _ = @import("util/glob.zig");
     _ = @import("util/pathz.zig");
     _ = @import("util/readfile.zig");
