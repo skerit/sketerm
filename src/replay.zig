@@ -23,6 +23,11 @@
 //! agent screen engine (`src/agent/screen_source.zig`) and prints its
 //! records, events, state and interaction changes as JSON lines, then the
 //! final transcript: the debugging entry point for an adapter file.
+//!
+//! `replay --opencode events.jsonl [session]` does the same for the opencode
+//! API source (`src/agent/opencode.zig`), fed a recorded event log: one
+//! `{"t": <epoch seconds>, "event": <SSE data object>}` per line. Final
+//! records carry their opencode part id (`ref`) and tool call.
 
 const std = @import("std");
 const cell_mod = @import("grid/cell.zig");
@@ -85,8 +90,16 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     const argv = init.args.vector;
     if (argv.len < 2) {
         std.debug.print("usage: replay <capture.bin> [cols rows]\n       replay --cast <rec.cast> [cols rows]\n" ++
-            "       replay --agent <adapter-id|adapter.json> <rec.cast> [cols rows]\n", .{});
+            "       replay --agent <adapter-id|adapter.json> <rec.cast> [cols rows]\n" ++
+            "       replay --opencode <events.jsonl> [session-id]\n", .{});
         return 1;
+    }
+    if (std.mem.eql(u8, std.mem.span(argv[1]), "--opencode")) {
+        if (argv.len < 3) {
+            std.debug.print("usage: replay --opencode <events.jsonl> [session-id]\n", .{});
+            return 1;
+        }
+        return replayOpencode(allocator, std.mem.span(argv[2]), if (argv.len > 3) std.mem.span(argv[3]) else null);
     }
     if (std.mem.eql(u8, std.mem.span(argv[1]), "--agent")) {
         if (argv.len < 4) {
@@ -336,6 +349,8 @@ fn writeColor(w: *std.Io.Writer, color: @import("grid/style_pool.zig").Color) !v
 
 const agent_adapter = @import("agent/adapter.zig");
 const agent_engine = @import("agent/screen_source.zig");
+const agent_opencode = @import("agent/opencode.zig");
+const agent_output = @import("agent/output.zig");
 const agent_vocab = @import("agent/vocab.zig");
 
 /// How long the replay keeps the clock running after the last event, so the
@@ -385,18 +400,47 @@ fn replayAgent(allocator: std.mem.Allocator, adapter_arg: []const u8, path: [:0]
 fn agentLines(allocator: std.mem.Allocator, loaded: *const agent_adapter.Loaded, bytes: []const u8, size: ?[2]u16, out: *std.Io.Writer) !void {
     var engine = try agent_engine.Engine.init(allocator, loaded, .{});
     defer engine.deinit();
-    var sink: AgentSink = .{ .allocator = allocator, .engine = &engine, .out = out };
+    var sink: AgentSink = .{ .engine = &engine, .printer = .{ .allocator = allocator, .out = out } };
     try playCast(allocator, bytes, size, .{ .ctx = &sink, .frame = AgentSink.frame, .idle = AgentSink.idle });
-    try AgentSink.idle(&sink, sink.last_ms + AGENT_TAIL_MS);
-    for (engine.records.items) |r| {
-        try std.json.Stringify.value(.{ .type = "final", .id = r.id, .turn = r.turn, .kind = r.kind, .text = r.text, .synthetic = r.synthetic }, .{}, out);
-        try out.writeByte('\n');
-    }
+    try AgentSink.idle(&sink, sink.printer.last_ms + AGENT_TAIL_MS);
+    try sink.printer.finals(engine.records.items, null);
 }
 
 const AgentSink = struct {
-    allocator: std.mem.Allocator,
     engine: *agent_engine.Engine,
+    printer: AgentPrinter,
+
+    fn frame(ctx: *anyopaque, screen: *Screen, ms: u64) anyerror!void {
+        const self: *AgentSink = @ptrCast(@alignCast(ctx));
+        try self.engine.feed(screen, @intCast(ms));
+        try self.printer.flush(self.engine, self.engine.interaction, ms);
+    }
+
+    fn idle(ctx: *anyopaque, ms: u64) anyerror!void {
+        const self: *AgentSink = @ptrCast(@alignCast(ctx));
+        try self.engine.tick(@intCast(ms));
+        try self.printer.flush(self.engine, self.engine.interaction, ms);
+    }
+};
+
+/// A record's structured tool call as the replay prints it (`input` is the
+/// call's JSON, as text).
+const ToolOut = struct {
+    name: []const u8,
+    input: []const u8,
+    status: agent_vocab.ToolStatus,
+    output: []const u8,
+
+    fn of(r: agent_output.Record) ?ToolOut {
+        const tc = r.tool orelse return null;
+        return .{ .name = tc.name, .input = tc.input, .status = tc.status, .output = tc.output };
+    }
+};
+
+/// Prints what an agent source changed since the last flush: new records,
+/// new events, state and interaction changes. Shared by every source.
+const AgentPrinter = struct {
+    allocator: std.mem.Allocator,
     out: *std.Io.Writer,
     last_ms: u64 = 0,
     printed_record: u64 = 0,
@@ -404,30 +448,19 @@ const AgentSink = struct {
     state: ?agent_vocab.State = null,
     interaction: ?u64 = null,
 
-    fn frame(ctx: *anyopaque, screen: *Screen, ms: u64) anyerror!void {
-        const self: *AgentSink = @ptrCast(@alignCast(ctx));
-        try self.engine.feed(screen, @intCast(ms));
-        try self.flush(ms);
-    }
-
-    fn idle(ctx: *anyopaque, ms: u64) anyerror!void {
-        const self: *AgentSink = @ptrCast(@alignCast(ctx));
-        try self.engine.tick(@intCast(ms));
-        try self.flush(ms);
-    }
-
-    fn flush(self: *AgentSink, ms: u64) !void {
+    /// @param src a source with `recordsSince`, `queue` and `state`.
+    fn flush(self: *AgentPrinter, src: anytype, interaction: ?agent_output.Interaction, ms: u64) !void {
         self.last_ms = ms;
         const t: f64 = @as(f64, @floatFromInt(ms)) / 1000.0;
-        var fresh: std.ArrayList(agent_engine.Record) = .empty;
+        var fresh: std.ArrayList(agent_output.Record) = .empty;
         defer fresh.deinit(self.allocator);
-        try self.engine.recordsSince(self.printed_record, &fresh, self.allocator);
+        try src.recordsSince(self.printed_record, &fresh, self.allocator);
         for (fresh.items) |r| {
-            try std.json.Stringify.value(.{ .t = t, .type = "record", .id = r.id, .turn = r.turn, .kind = r.kind, .text = r.text }, .{}, self.out);
+            try std.json.Stringify.value(.{ .t = t, .type = "record", .id = r.id, .turn = r.turn, .kind = r.kind, .text = r.text, .tool = ToolOut.of(r) }, .{ .emit_null_optional_fields = false }, self.out);
             try self.out.writeByte('\n');
             self.printed_record = @max(self.printed_record, r.id);
         }
-        for (self.engine.queue.events.items) |ev| {
+        for (src.queue.events.items) |ev| {
             if (ev.seq <= self.printed_seq) continue;
             try std.json.Stringify.value(.{
                 .t = t,
@@ -441,15 +474,15 @@ const AgentSink = struct {
             try self.out.writeByte('\n');
             self.printed_seq = ev.seq;
         }
-        if (self.state != self.engine.state) {
-            self.state = self.engine.state;
-            try std.json.Stringify.value(.{ .t = t, .type = "state", .state = self.engine.state }, .{}, self.out);
+        if (self.state != src.state) {
+            self.state = src.state;
+            try std.json.Stringify.value(.{ .t = t, .type = "state", .state = src.state }, .{}, self.out);
             try self.out.writeByte('\n');
         }
-        const ih: ?u64 = if (self.engine.interaction) |it| it.hash() else null;
+        const ih: ?u64 = if (interaction) |it| it.hash() else null;
         if (ih != self.interaction) {
             self.interaction = ih;
-            if (self.engine.interaction) |it| {
+            if (interaction) |it| {
                 try std.json.Stringify.value(.{
                     .t = t,
                     .type = "interaction",
@@ -465,7 +498,147 @@ const AgentSink = struct {
             try self.out.writeByte('\n');
         }
     }
+
+    /// Every record as the source ends with it.
+    /// @param refs the app-side id of each record (API sources), or null.
+    fn finals(self: *AgentPrinter, records: []const agent_output.Record, refs: ?[]const []const u8) !void {
+        for (records, 0..) |r, i| {
+            try std.json.Stringify.value(.{
+                .type = "final",
+                .id = r.id,
+                .turn = r.turn,
+                .kind = r.kind,
+                .text = r.text,
+                .synthetic = r.synthetic,
+                .ref = if (refs) |rs| rs[i] else null,
+                .tool = ToolOut.of(r),
+            }, .{ .emit_null_optional_fields = false }, self.out);
+            try self.out.writeByte('\n');
+        }
+    }
 };
+
+// ── --opencode: a recorded event log through the API source ──────
+
+/// Replay a recorded opencode event log (one `{"t": <epoch s>, "event":
+/// <SSE data object>}` per line) through the API source.
+fn replayOpencode(allocator: std.mem.Allocator, path: [:0]const u8, session: ?[]const u8) !u8 {
+    var set = try agent_adapter.Set.loadDefault(allocator);
+    defer set.deinit();
+    for (set.problems.items) |p| std.debug.print("replay: adapter problem: {s}\n", .{p});
+    const loaded = set.get("opencode") orelse {
+        std.debug.print("replay: no \"opencode\" adapter\n", .{});
+        return 1;
+    };
+    const bytes = (try readFile(allocator, path)) orelse return 1;
+    defer allocator.free(bytes);
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    opencodeLines(allocator, loaded, bytes, session, &aw.writer) catch |err| {
+        std.debug.print("replay: {s}: {s}\n", .{ path, @errorName(err) });
+        return 1;
+    };
+    const out = aw.written();
+    _ = cstd.fwrite(out.ptr, 1, out.len, cstd.stdout);
+    return 0;
+}
+
+/// Feed every logged event at its time (relative to the first), printing
+/// what changed after each, then every final record with its part id.
+/// @param session the root session; null adopts the first parentless one.
+fn opencodeLines(allocator: std.mem.Allocator, loaded: *const agent_adapter.Loaded, bytes: []const u8, session: ?[]const u8, out: *std.Io.Writer) !void {
+    var src = try agent_opencode.Source.init(allocator, loaded, .{}, session);
+    defer src.deinit();
+    var printer: AgentPrinter = .{ .allocator = allocator, .out = out };
+    var t0: ?f64 = null;
+    var last_ms: u64 = 0;
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \r\t");
+        if (line.len == 0) continue;
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch return error.BadLogLine;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.BadLogLine;
+        const secs: f64 = switch (parsed.value.object.get("t") orelse return error.BadLogLine) {
+            .float => |f| f,
+            .integer => |i| @floatFromInt(i),
+            else => return error.BadLogLine,
+        };
+        const ev = parsed.value.object.get("event") orelse return error.BadLogLine;
+        const base = t0 orelse secs;
+        t0 = base;
+        const ms: u64 = @intFromFloat(@max(0, (secs - base) * 1000.0));
+        if (ms > last_ms) {
+            // Time passed before this event (settle and retry rules).
+            try src.tick(@intCast(ms));
+            try printer.flush(&src, src.interaction(), ms);
+        }
+        try src.apply(ev, @intCast(ms));
+        try printer.flush(&src, src.interaction(), ms);
+        last_ms = @max(last_ms, ms);
+    }
+    try src.tick(@intCast(last_ms + AGENT_TAIL_MS));
+    try printer.flush(&src, src.interaction(), last_ms + AGENT_TAIL_MS);
+    try printer.finals(src.records.items, src.refs.items);
+}
+
+test "opencode replay: a logged turn with a permission as JSON lines" {
+    const log =
+        \\{"t": 100.0, "event": {"type": "server.connected", "properties": {}}}
+        \\{"t": 100.1, "event": {"type": "session.created", "properties": {"sessionID": "ses_r", "info": {"id": "ses_r"}}}}
+        \\{"t": 101.0, "event": {"type": "message.updated", "properties": {"sessionID": "ses_r", "info": {"id": "msg_u", "role": "user", "sessionID": "ses_r"}}}}
+        \\{"t": 101.0, "event": {"type": "message.part.updated", "properties": {"sessionID": "ses_r", "part": {"type": "text", "text": "rm it", "id": "prt_u", "messageID": "msg_u", "sessionID": "ses_r"}}}}
+        \\{"t": 101.1, "event": {"type": "session.status", "properties": {"sessionID": "ses_r", "status": {"type": "busy"}}}}
+        \\{"t": 101.2, "event": {"type": "message.updated", "properties": {"sessionID": "ses_r", "info": {"id": "msg_a", "role": "assistant", "sessionID": "ses_r", "time": {"created": 1}}}}}
+        \\{"t": 101.3, "event": {"type": "message.part.updated", "properties": {"sessionID": "ses_r", "part": {"type": "tool", "tool": "bash", "state": {"status": "running", "input": {"command": "rm x"}}, "id": "prt_t", "messageID": "msg_a", "sessionID": "ses_r"}}}}
+        \\{"t": 101.4, "event": {"type": "permission.asked", "properties": {"id": "per_1", "sessionID": "ses_r", "permission": "bash", "patterns": ["rm x"], "metadata": {}, "always": []}}}
+        \\{"t": 103.0, "event": {"type": "permission.replied", "properties": {"sessionID": "ses_r", "requestID": "per_1", "reply": "reject"}}}
+        \\{"t": 103.1, "event": {"type": "message.part.updated", "properties": {"sessionID": "ses_r", "part": {"type": "tool", "tool": "bash", "state": {"status": "error", "input": {"command": "rm x"}, "error": "rejected"}, "id": "prt_t", "messageID": "msg_a", "sessionID": "ses_r"}}}}
+        \\{"t": 103.2, "event": {"type": "message.updated", "properties": {"sessionID": "ses_r", "info": {"id": "msg_a", "role": "assistant", "sessionID": "ses_r", "time": {"created": 1, "completed": 2}}}}}
+        \\{"t": 103.3, "event": {"type": "session.status", "properties": {"sessionID": "ses_r", "status": {"type": "idle"}}}}
+        \\
+    ;
+    const gpa = std.testing.allocator;
+    var set = agent_adapter.Set.init(gpa);
+    defer set.deinit();
+    try set.loadShipped();
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try opencodeLines(gpa, set.get("opencode").?, log, null, &aw.writer);
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const Seen = struct {
+        type: []const u8,
+        t: f64 = 0,
+        kind: ?[]const u8 = null,
+        state: ?[]const u8 = null,
+        ref: ?[]const u8 = null,
+        tool: ?struct { name: []const u8, input: []const u8, status: []const u8, output: []const u8 } = null,
+    };
+    var states: std.ArrayList([]const u8) = .empty;
+    var finals: std.ArrayList(Seen) = .empty;
+    var needs_input_t: f64 = 0;
+    var done: usize = 0;
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, aw.written(), "\n"), '\n');
+    while (lines.next()) |line| {
+        const s = try std.json.parseFromSliceLeaky(Seen, arena.allocator(), line, .{ .ignore_unknown_fields = true });
+        if (std.mem.eql(u8, s.type, "state")) try states.append(arena.allocator(), s.state.?);
+        if (std.mem.eql(u8, s.type, "final")) try finals.append(arena.allocator(), s);
+        if (std.mem.eql(u8, s.type, "event") and std.mem.eql(u8, s.kind.?, "needs_input")) needs_input_t = s.t;
+        if (std.mem.eql(u8, s.type, "event") and std.mem.eql(u8, s.kind.?, "done")) done += 1;
+    }
+    const want = [_][]const u8{ "starting", "idle", "working", "waiting_user", "working", "idle" };
+    try std.testing.expectEqual(want.len, states.items.len);
+    for (want, states.items) |w, got| try std.testing.expectEqualStrings(w, got);
+    try std.testing.expectApproxEqAbs(1.4, needs_input_t, 1e-6);
+    try std.testing.expectEqual(@as(usize, 1), done);
+    try std.testing.expectEqual(@as(usize, 2), finals.items.len);
+    try std.testing.expectEqualStrings("prt_t", finals.items[1].ref.?);
+    try std.testing.expectEqualStrings("error", finals.items[1].tool.?.status);
+    try std.testing.expectEqualStrings("{\"command\":\"rm x\"}", finals.items[1].tool.?.input);
+    try std.testing.expectEqualStrings("rejected", finals.items[1].tool.?.output);
+}
 
 test "agent replay: records, events and the final transcript as JSON lines" {
     const cast =
