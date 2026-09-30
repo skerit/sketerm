@@ -60,6 +60,13 @@ pub const Launch = struct {
     /// Removed from the app's environment; a trailing `*` removes every
     /// variable with that prefix.
     unset_env: []const []const u8 = &.{},
+    /// API sources: the environment variable that hands the server its
+    /// password (required for them; a password never goes on argv). The
+    /// attached client reads the same variable.
+    password_env: ?[]const u8 = null,
+    /// API sources: arguments of a second, visible process the human
+    /// watches (opencode's TUI attached to the server); empty for none.
+    attach_args: []const []const u8 = &.{},
 };
 
 pub const TurnEnd = enum {
@@ -134,8 +141,10 @@ pub const Spec = struct {
     errors: []const ErrorRule = &.{},
 };
 
-/// The `{name}`s a recipe or launch argument may use.
-pub const Placeholder = enum { text, choice, model, effort };
+/// The `{name}`s a recipe or launch argument may use. `port`, `cwd` and
+/// `session` are an API source's server port, working directory and
+/// session id.
+pub const Placeholder = enum { text, choice, model, effort, port, cwd, session };
 
 // ── compiled form ────────────────────────────────────────────────
 
@@ -253,6 +262,10 @@ const Validator = struct {
         for (s.launch.args) |x| try self.placeholders(x, "launch.args");
         for (s.launch.model_args) |x| try self.placeholders(x, "launch.model_args");
         for (s.launch.effort_args) |x| try self.placeholders(x, "launch.effort_args");
+        for (s.launch.attach_args) |x| try self.placeholders(x, "launch.attach_args");
+        if (s.launch.password_env) |name| {
+            if (!validEnvName(name)) return self.fail("launch.password_env \"{s}\" is not an environment variable name", .{name});
+        }
         inline for (@typeInfo(Actions).@"struct".fields) |f| {
             for (@field(s.actions, f.name)) |step| switch (step) {
                 .text, .pick => |x| try self.placeholders(x, "actions." ++ f.name),
@@ -279,7 +292,10 @@ const Validator = struct {
                 const sc = if (s.screen) |*x| x else return self.fail("source \"screen\" needs a \"screen\" section", .{});
                 l.screen = try self.screen(sc);
             },
-            .opencode_api => if (s.screen != null) return self.fail("source \"opencode_api\" takes no \"screen\" section", .{}),
+            .opencode_api => {
+                if (s.screen != null) return self.fail("source \"opencode_api\" takes no \"screen\" section", .{});
+                if (s.launch.password_env == null) return self.fail("source \"opencode_api\" needs launch.password_env", .{});
+            },
         }
     }
 
@@ -335,6 +351,14 @@ const Validator = struct {
         }
     }
 };
+
+fn validEnvName(name: []const u8) bool {
+    if (name.len == 0 or std.ascii.isDigit(name[0])) return false;
+    for (name) |ch| {
+        if (!(std.ascii.isAlphanumeric(ch) or ch == '_')) return false;
+    }
+    return true;
+}
 
 fn validId(id: []const u8) bool {
     if (id.len == 0 or id.len > 32) return false;
@@ -551,6 +575,27 @@ test "semantic errors name the rule" {
     try expectProblem(noscreen, "unknown key \"screenx\"");
 }
 
+test "an API source needs a password variable and checks its attach arguments" {
+    const api =
+        \\{ "id": "api", "name": "API", "source": "opencode_api",
+        \\  "launch": { "binary": "x", "candidates": ["$PATH"], "args": ["serve", "--port", "{port}"],
+        \\              "password_env": "X_PASSWORD", "attach_args": ["attach", "{session}"] } }
+    ;
+    var problem: ?[]u8 = null;
+    const l = try load(t.allocator, "api.json", api, .user, &problem);
+    l.destroy(t.allocator);
+
+    const no_pw = std.mem.replaceOwned(u8, t.allocator, api, "\"password_env\": \"X_PASSWORD\", ", "") catch unreachable;
+    defer t.allocator.free(no_pw);
+    try expectProblem(no_pw, "needs launch.password_env");
+    const bad_env = std.mem.replaceOwned(u8, t.allocator, api, "X_PASSWORD", "X-PASSWORD") catch unreachable;
+    defer t.allocator.free(bad_env);
+    try expectProblem(bad_env, "is not an environment variable name");
+    const bad_ph = std.mem.replaceOwned(u8, t.allocator, api, "{session}", "{sesion}") catch unreachable;
+    defer t.allocator.free(bad_ph);
+    try expectProblem(bad_ph, "launch.attach_args: unknown placeholder {sesion}");
+}
+
 test "expand fills known placeholders and leaves other braces alone" {
     const s = try expand(t.allocator, "/model {model} {x}", .{ .model = "opus" });
     defer t.allocator.free(s);
@@ -565,8 +610,11 @@ test "every shipped adapter loads, and a user file overrides by id" {
         for (set.problems.items) |p| std.debug.print("shipped adapter problem: {s}\n", .{p});
         return error.ShippedAdapterInvalid;
     }
-    try t.expect(set.items.items.len >= 1);
+    try t.expect(set.items.items.len >= 2);
     try t.expect(set.get("claude") != null);
+    const oc = set.get("opencode").?;
+    try t.expectEqual(vocab.SourceKind.opencode_api, oc.spec.source);
+    try t.expectEqualStrings("OPENCODE_SERVER_PASSWORD", oc.spec.launch.password_env.?);
 
     const user = std.mem.replaceOwned(u8, t.allocator, minimal, "\"demo\"", "\"claude\"") catch unreachable;
     defer t.allocator.free(user);

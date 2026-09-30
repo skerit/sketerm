@@ -74,9 +74,21 @@ pub const ErrorClass = enum {
     api,
     crashed,
     unknown,
+
+    /// How long a condition of this class must persist before a source
+    /// surfaces it (as an event and, for `retrying`, as the state).
+    pub fn surfaceAfterMs(self: ErrorClass) i64 {
+        return switch (self) {
+            .retrying => 10_000,
+            .limit, .auth, .api, .crashed, .unknown => 0,
+        };
+    }
 };
 
 pub const InteractionKind = enum { permission, question, choice };
+
+/// A tool call's progress, as a record reports it.
+pub const ToolStatus = enum { pending, running, completed, @"error" };
 
 /// The member names of `E`, in declaration order (for schemas and help text).
 pub fn names(comptime E: type) []const []const u8 {
@@ -109,4 +121,11 @@ test "names follow declaration order" {
     try t.expectEqualStrings("starting", n[0]);
     try t.expectEqualStrings("disconnected", n[7]);
     try t.expectEqualStrings("error", names(EventKind)[2]);
+}
+
+test "only retrying waits before it is surfaced" {
+    const t = std.testing;
+    for (std.enums.values(ErrorClass)) |cls| {
+        try t.expectEqual(cls == .retrying, cls.surfaceAfterMs() > 0);
+    }
 }

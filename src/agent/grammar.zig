@@ -6,6 +6,7 @@
 const std = @import("std");
 const vocab = @import("vocab.zig");
 const adapter = @import("adapter.zig");
+const output = @import("output.zig");
 
 pub const Line = struct {
     text: []const u8,
@@ -227,38 +228,10 @@ pub fn markLive(sc: *const adapter.Screen, lines: []Line, input: usize, status_r
 
 // ── interactions ─────────────────────────────────────────────────
 
-pub const Option = struct {
-    label: []const u8,
-    selected: bool,
-};
-
-pub const Interaction = struct {
-    kind: vocab.InteractionKind,
-    title: []const u8,
-    detail: []const u8,
-    /// The prompt line and what follows it ("Enter to set as default · s
-    /// to use this session only").
-    hint: []const u8,
-    options: []const Option,
-    /// The lines it occupies, header to hint: [rows_start, rows_end).
-    rows_start: usize,
-    rows_end: usize,
-
-    /// Identity for "is this the prompt already announced": kind, title,
-    /// detail and options (the hint, which echoes typed digits, is not part).
-    pub fn hash(self: Interaction) u64 {
-        var h = std.hash.Wyhash.init(@intFromEnum(self.kind));
-        h.update(self.title);
-        h.update("\x00");
-        h.update(self.detail);
-        for (self.options) |o| {
-            h.update("\x00");
-            h.update(o.label);
-            h.update(if (o.selected) "+" else "-");
-        }
-        return h.final();
-    }
-};
+pub const Option = output.Option;
+/// A parsed interaction's `hint` is the prompt line and what follows it;
+/// `rows_start`/`rows_end` are always set.
+pub const Interaction = output.Interaction;
 
 /// `N. label` (leading spaces allowed): the number and the label.
 pub fn numbered(text: []const u8) ?struct { n: u32, label: []const u8 } {

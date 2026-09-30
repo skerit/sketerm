@@ -1,0 +1,17 @@
+{
+  "id": "opencode",
+  "name": "opencode",
+  "source": "opencode_api",
+  "launch": {
+    "binary": "opencode",
+    "candidates": ["$PATH", "~/.opencode/bin/opencode", "~/.local/bin/opencode"],
+    "args": ["serve", "--port", "{port}"],
+    "password_env": "OPENCODE_SERVER_PASSWORD",
+    "attach_args": ["attach", "http://127.0.0.1:{port}", "--dir", "{cwd}", "-s", "{session}"]
+  },
+  "errors": [
+    { "class": "auth", "pattern": "^ProviderAuthError|^APIError 401|^APIError 403" },
+    { "class": "limit", "pattern": "^APIError 429|[Rr]ate limit|[Uu]sage limit|[Qq]uota|Too Many Requests", "reset_marker": "resets " },
+    { "class": "api", "pattern": "^APIError|^ContextOverflowError|^MessageOutputLengthError|^ContentFilterError|^StructuredOutputError" }
+  ]
+}

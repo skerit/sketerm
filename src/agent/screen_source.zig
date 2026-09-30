@@ -19,27 +19,17 @@ const vocab = @import("vocab.zig");
 const adapter = @import("adapter.zig");
 const events = @import("events.zig");
 const grammar = @import("grammar.zig");
+const output = @import("output.zig");
 const Screen = @import("../grid/screen.zig").Screen;
 const cell_mod = @import("../grid/cell.zig");
 
 pub const Line = grammar.Line;
 pub const Interaction = grammar.Interaction;
 
-pub const Record = struct {
-    /// Stable while the record's text is unchanged; a changed record gets
-    /// a new id (an `agent_read` cursor then returns it again).
-    id: u64,
-    kind: vocab.RecordKind,
-    /// Owned by the engine.
-    text: []u8,
-    /// Index into `Engine.turns`.
-    turn: u32,
-    /// Added through `Engine.addNotice`, not read off the screen; kept
-    /// when the turn is re-captured.
-    synthetic: bool = false,
-    /// A `message` event was pushed for it.
-    announced: bool = false,
-};
+/// `turn` indexes `Engine.turns`; a `synthetic` record came through
+/// `Engine.addNotice` and is kept when its turn is re-captured. Screen
+/// records never carry a `tool` call.
+pub const Record = output.Record;
 
 pub const Turn = struct {
     user_line_id: u64,
@@ -53,7 +43,7 @@ pub const Turn = struct {
 };
 
 /// Wait this long after a retrying error first shows before surfacing it.
-pub const RETRY_SURFACE_MS: i64 = 10_000;
+pub const RETRY_SURFACE_MS: i64 = vocab.ErrorClass.retrying.surfaceAfterMs();
 /// Bottom rows searched for the input box.
 const INPUT_SEARCH_ROWS = 8;
 const MAX_STATUS_ROWS = 10;
@@ -387,15 +377,7 @@ pub const Engine = struct {
             if (self.announced_interaction != id) {
                 // What led to the prompt belongs to the transcript now.
                 try self.capture(false);
-                var buf: std.ArrayList(u8) = .empty;
-                defer buf.deinit(self.allocator);
-                for (it.options, 0..) |o, i| {
-                    if (i > 0) try buf.append(self.allocator, '\n');
-                    try buf.print(self.allocator, "{d}. {s}{s}", .{ i + 1, o.label, if (o.selected) " (selected)" else "" });
-                }
-                const text = try std.fmt.allocPrint(self.allocator, "{s}: {s}", .{ @tagName(it.kind), it.title });
-                defer self.allocator.free(text);
-                _ = try self.queue.push(now_ms, .needs_input, null, text, buf.items);
+                _ = try it.announce(&self.queue, now_ms);
                 self.announced_interaction = id;
                 self.ackBells();
             }
