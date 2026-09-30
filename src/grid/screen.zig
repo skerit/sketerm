@@ -2301,6 +2301,12 @@ pub const Screen = struct {
         return self.lineCellsAt(row);
     }
 
+    /// The monotonic id of the line at a display row (negative rows index
+    /// scrollback), or null when out of range.
+    pub fn lineIdAt(self: *const Screen, row: i32) ?u64 {
+        return if (self.lineAt(row)) |l| l.id else null;
+    }
+
     /// True iff the row contains a codepoint that needs fribidi
     /// reorder (RTL scripts) or HarfBuzz complex-script shaping
     /// (Indic, Thai, Khmer, Tibetan, Myanmar). Pure ASCII / Latin

@@ -169,6 +169,7 @@ comptime {
     _ = @import("mux/a11yhub.zig");
     _ = @import("mux/cast.zig");
     _ = @import("mux/cast_play.zig");
+    _ = @import("replay.zig");
     _ = @import("mux/dbus.zig");
     _ = @import("mux/dbusconn.zig");
     _ = @import("mux/desktop.zig");
