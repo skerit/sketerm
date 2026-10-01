@@ -1546,7 +1546,12 @@ fn openTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
     const ready = waitReady(e, deadline);
     // An adopted conversation's past was the caller's before: it is
     // history, never a first delivery (`since`/`detail:"all"` re-read it).
-    if (o.resume_id != null) for (e.agent.records()) |r| try e.handed.markRecord(e.allocator, r);
+    if (o.resume_id != null and ready) {
+        // A screen source only folds turns at a turn end; fold the
+        // reprinted history now, or the first new turn delivers it.
+        try e.agent.syncHistory();
+        for (e.agent.records()) |r| try e.handed.markRecord(e.allocator, r);
+    }
     var notes: std.ArrayList([]const u8) = .empty;
     // A model or effort the launch cannot take goes through the app.
     if (ready) {

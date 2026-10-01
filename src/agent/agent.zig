@@ -120,6 +120,16 @@ pub const Agent = struct {
 
     /// Every record in the source's (chronological) order. Borrowed: valid
     /// until the source next changes.
+    /// Fold what the app shows now into records, without announcing them
+    /// (an adopted conversation's history, printed before the input box).
+    pub fn syncHistory(self: *Agent) !void {
+        switch (self.source) {
+            .screen => |*e| try e.syncHistory(),
+            // The API source loads the history when it adopts the session.
+            .opencode_api => {},
+        }
+    }
+
     pub fn records(self: *const Agent) []const output.Record {
         return switch (self.source) {
             .screen => |*e| e.records.items,

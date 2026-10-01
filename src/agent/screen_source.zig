@@ -626,6 +626,11 @@ pub const Engine = struct {
 
     // ── capture ──────────────────────────────────────────────────
 
+    /// Fold the screen's turns into records now, announcing nothing.
+    pub fn syncHistory(self: *Engine) !void {
+        try self.capture(false);
+    }
+
     /// Parse history + screen and fold the turns into `records`.
     /// @param complete the latest turn has ended (announce its messages).
     fn capture(self: *Engine, complete: bool) !void {
