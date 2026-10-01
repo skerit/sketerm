@@ -145,6 +145,12 @@ const Message = struct {
     error_seen: bool = false,
     /// The turn (index of the root user message) it belongs to.
     turn: u32,
+    /// A root user message that started a turn, and whether `done` was
+    /// armed before it (a compaction request is undone back to that).
+    opened_turn: bool = false,
+    armed_before: bool = false,
+    /// A compaction summary (`summary: true`): never a record or an event.
+    summary: bool = false,
 };
 
 /// A streamed text part not finalized yet.
@@ -567,13 +573,16 @@ pub const Source = struct {
                 self.messages.removeByPtr(gop.key_ptr);
                 return err;
             };
-            if (role == .user and self.isRoot(sid)) {
+            const opens = role == .user and self.isRoot(sid);
+            const armed = self.done_armed;
+            if (opens) {
                 self.turns += 1;
                 if (!self.quiet) self.startTurn();
             }
-            gop.value_ptr.* = .{ .role = role, .session = session_copy, .turn = self.turns -| 1 };
+            gop.value_ptr.* = .{ .role = role, .session = session_copy, .turn = self.turns -| 1, .opened_turn = opens, .armed_before = armed };
         }
         const m = gop.value_ptr;
+        if (boolean(info, "summary") orelse false) m.summary = true;
         if (!self.isRoot(sid)) return;
         if (role == .user) {
             if (get(info, "model")) |model| try self.noteModel(str(model, "providerID"), str(model, "modelID"), str(info, "variant"));
@@ -629,6 +638,8 @@ pub const Source = struct {
         if (!self.isRoot(sid)) return;
         const mid = str(part, "messageID") orelse "";
         const ptype = std.meta.stringToEnum(PartType, str(part, "type") orelse return) orelse return;
+        // A compaction summary is never returned, not even as detail all.
+        if (self.messages.get(mid)) |m| if (m.summary) return;
         switch (ptype) {
             .text => {
                 if (boolean(part, "synthetic") orelse false) return;
@@ -669,8 +680,23 @@ pub const Source = struct {
                 defer self.allocator.free(text);
                 _ = try self.upsert(pid, .notice, text, null, false);
             },
-            .compaction => _ = try self.upsert(pid, .notice, "compaction", null, false),
+            .compaction => {
+                self.undoCompactionTurn(mid);
+                _ = try self.upsert(pid, .notice, "compaction requested", null, false);
+            },
         }
+    }
+
+    /// A compaction request arrives as a root user message: it is not a
+    /// prompt, so it starts no job and arms no `done` of its own (the
+    /// summary that follows belongs to the job it compacts).
+    fn undoCompactionTurn(self: *Source, message_id: []const u8) void {
+        const m = self.messages.getPtr(message_id) orelse return;
+        if (!m.opened_turn or m.turn + 1 != self.turns) return;
+        m.opened_turn = false;
+        self.turns -= 1;
+        m.turn = self.turns -| 1;
+        if (!self.quiet) self.done_armed = m.armed_before;
     }
 
     fn applyDelta(self: *Source, props: Value) !void {
@@ -680,7 +706,7 @@ pub const Source = struct {
         const pid = str(props, "partID") orelse return;
         const mid = str(props, "messageID") orelse "";
         if (self.messages.get(mid)) |m| {
-            if (m.role == .user) return;
+            if (m.role == .user or m.summary) return;
         }
         if (self.by_ref.contains(pid)) return; // already final
         const lt = try self.liveEntry(pid, mid);
@@ -746,7 +772,7 @@ pub const Source = struct {
         if (rec.announced) return;
         rec.announced = true;
         if (self.quiet) return;
-        _ = try self.queue.push(self.clockNow(), .message, null, rec.text, "");
+        _ = try self.queue.pushMessage(self.clockNow(), rec.text, rec.id);
     }
 
     const ToolFields = struct {
@@ -994,7 +1020,7 @@ pub const Source = struct {
             self.done_armed = false;
             const job = self.turns -| 1;
             const end = self.waker.segmentEnd(self.records.items, job);
-            if (end.wake) _ = try self.queue.pushDone(now_ms, job, end.answer);
+            if (end.wake) _ = try self.queue.pushDone(now_ms, job, end.answer, end.answer_id, null);
         }
     }
 
@@ -1920,6 +1946,61 @@ test "a job's later segment: its final is flagged, only a substantive one wakes 
     try feedStatus(&rig, 24, "ses_root", "idle");
     try t.expectEqual(@as(usize, 2), rig.count(.done));
     try t.expectEqualStrings(more, rig.last(.done).?.text);
+}
+
+test "compaction: only a notice, the summary is never a record or an event, and nothing wakes" {
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    try connectRoot(&rig);
+    try feedPrompt(&rig, 1, 1, "say hi");
+    try feedStatus(&rig, 2, "ses_root", "busy");
+    try feedAssistant(&rig, 3, "msg_a1", false);
+    try feedText(&rig, 4, "msg_a1", "prt_a1", "hi there");
+    try feedAssistant(&rig, 5, "msg_a1", true);
+    try feedStatus(&rig, 6, "ses_root", "idle");
+    try t.expectEqual(@as(usize, 1), rig.count(.done));
+    const messages_before = rig.count(.message);
+
+    // What opencode sends for a compaction (session/compaction.ts): a root
+    // user message whose only part is `compaction`, then an assistant
+    // message with `summary: true` streaming the summary, then
+    // session.compacted.
+    try rig.feed(10, "{\"type\":\"message.updated\",\"properties\":{\"sessionID\":\"ses_root\",\"info\":{\"id\":\"msg_c\",\"role\":\"user\",\"sessionID\":\"ses_root\",\"time\":{\"created\":10},\"model\":{\"providerID\":\"openai\",\"modelID\":\"gpt-x\"}}}}");
+    try rig.feed(10, "{\"type\":\"message.part.updated\",\"properties\":{\"sessionID\":\"ses_root\",\"part\":{\"type\":\"compaction\",\"auto\":false,\"messageID\":\"msg_c\",\"sessionID\":\"ses_root\",\"id\":\"prt_c\"}}}");
+    try feedStatus(&rig, 11, "ses_root", "busy");
+    try rig.feed(12, "{\"type\":\"message.updated\",\"properties\":{\"sessionID\":\"ses_root\",\"info\":{\"id\":\"msg_s\",\"role\":\"assistant\",\"summary\":true,\"mode\":\"compaction\",\"agent\":\"compaction\",\"parentID\":\"msg_c\",\"sessionID\":\"ses_root\",\"time\":{\"created\":12}}}}");
+    try rig.feed(13, "{\"type\":\"message.part.delta\",\"properties\":{\"sessionID\":\"ses_root\",\"messageID\":\"msg_s\",\"partID\":\"prt_s\",\"field\":\"text\",\"delta\":\"SUMMARY-TEXT goal: say hi\"}}");
+    try feedText(&rig, 14, "msg_s", "prt_s", "SUMMARY-TEXT goal: say hi. Progress: said hi.");
+    try rig.feed(15, "{\"type\":\"message.updated\",\"properties\":{\"sessionID\":\"ses_root\",\"info\":{\"id\":\"msg_s\",\"role\":\"assistant\",\"summary\":true,\"mode\":\"compaction\",\"sessionID\":\"ses_root\",\"time\":{\"created\":12,\"completed\":15}}}}");
+    try rig.feed(16, "{\"type\":\"session.compacted\",\"properties\":{\"sessionID\":\"ses_root\"}}");
+    try feedStatus(&rig, 17, "ses_root", "idle");
+    try rig.src.tick(9000);
+
+    try t.expectEqual(vocab.State.idle, rig.src.state);
+    // No job of its own, no done, no message event.
+    try t.expectEqual(@as(u32, 1), rig.src.turns);
+    try t.expectEqual(@as(usize, 1), rig.count(.done));
+    try t.expectEqual(messages_before, rig.count(.message));
+    for (rig.src.queue.events.items) |ev| try t.expect(std.mem.indexOf(u8, ev.text, "SUMMARY-TEXT") == null);
+    var notices: usize = 0;
+    for (rig.src.records.items) |r| {
+        try t.expect(std.mem.indexOf(u8, r.text, "SUMMARY-TEXT") == null);
+        try t.expectEqual(@as(u32, 0), r.job);
+        if (r.kind == .notice) notices += 1;
+    }
+    try t.expectEqual(@as(usize, 2), notices);
+    try t.expectEqualStrings("conversation compacted", rig.src.records.items[rig.src.records.items.len - 1].text);
+
+    // The next real prompt is job 1 and wakes as always.
+    try feedPrompt(&rig, 20, 2, "again");
+    try feedStatus(&rig, 21, "ses_root", "busy");
+    try feedAssistant(&rig, 22, "msg_a2", false);
+    try feedText(&rig, 23, "msg_a2", "prt_a2", "hi again");
+    try feedAssistant(&rig, 24, "msg_a2", true);
+    try feedStatus(&rig, 25, "ses_root", "idle");
+    try t.expectEqual(@as(usize, 2), rig.count(.done));
+    try t.expectEqual(@as(?u32, 1), rig.last(.done).?.job);
 }
 
 test "a text part cut off by its message completing keeps what the deltas built" {

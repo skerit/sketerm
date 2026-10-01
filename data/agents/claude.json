@@ -67,6 +67,7 @@
       { "pattern": "^Claude Code v[0-9]" }
     ],
     "subagent": { "pattern": "^Waiting for [0-9]+ background agents? to finish" },
+    "background": { "pattern": "· +[0-9]+ shells?$" },
     "choice_prompt": { "prefix": "Select with numbers [" },
     "selected_marker": "(selected)",
     "permission": { "prefix": "Permission Required:" },

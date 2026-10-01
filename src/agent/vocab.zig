@@ -19,11 +19,22 @@ pub const State = enum {
     starting,
     working,
     waiting_subagent,
+    /// Idle at its prompt while background tasks it started (a shell run
+    /// in the background) still run: its turn is not settled, so no `done`.
+    waiting_background,
     waiting_user,
     retrying,
     idle,
     exited,
     disconnected,
+
+    /// A prompt typed now is taken as the next one (not refused as busy).
+    pub fn takesPrompt(self: State) bool {
+        return switch (self) {
+            .idle, .waiting_background => true,
+            .starting, .working, .waiting_subagent, .waiting_user, .retrying, .exited, .disconnected => false,
+        };
+    }
 };
 
 pub const RecordKind = enum {
@@ -64,6 +75,15 @@ pub const EventKind = enum {
         };
     }
 
+    /// Its text is a record's (a completed message, a job's answer): a
+    /// result that carries records refers to it rather than repeat it.
+    pub fn announcesRecord(self: EventKind) bool {
+        return switch (self) {
+            .done, .message, .match => true,
+            .needs_input, .@"error", .exited, .connection_lost => false,
+        };
+    }
+
     /// Which kind a wake-up reports as its outcome when several arrive
     /// together: the highest rank wins (an agent that is gone outranks a
     /// prompt waiting for an answer, which outranks a finished turn).
@@ -78,6 +98,15 @@ pub const EventKind = enum {
             .message => 0,
         };
     }
+};
+
+/// The outcome of a wait that no event decided (every other outcome is
+/// the `EventKind` delivered).
+pub const WaitOutcome = enum {
+    /// The agent is working and the wait ran out.
+    still_working,
+    /// A prompt went in, and the call returned before the agent started on it.
+    sent,
 };
 
 pub const ErrorClass = enum {
@@ -96,6 +125,16 @@ pub const ErrorClass = enum {
         return switch (self) {
             .retrying => 10_000,
             .limit, .auth, .api, .crashed, .unknown => 0,
+        };
+    }
+
+    /// An `error` of this class wakes every wait like the other always-on
+    /// events; one that does not is delivered only to a consumer that
+    /// opted in (`events.Filter.retrying`): the app recovers by itself.
+    pub fn wakesByDefault(self: ErrorClass) bool {
+        return switch (self) {
+            .retrying => false,
+            .limit, .auth, .api, .crashed, .unknown => true,
         };
     }
 };
@@ -143,15 +182,31 @@ test "outcome ranks are distinct and put an ended agent first" {
 test "names follow declaration order" {
     const t = std.testing;
     const n = names(State);
-    try t.expectEqual(@as(usize, 8), n.len);
+    try t.expectEqual(@as(usize, 9), n.len);
     try t.expectEqualStrings("starting", n[0]);
-    try t.expectEqualStrings("disconnected", n[7]);
+    try t.expectEqualStrings("disconnected", n[8]);
     try t.expectEqualStrings("error", names(EventKind)[2]);
 }
 
-test "only retrying waits before it is surfaced" {
+test "only retrying waits before it is surfaced, and only it does not wake by default" {
     const t = std.testing;
     for (std.enums.values(ErrorClass)) |cls| {
         try t.expectEqual(cls == .retrying, cls.surfaceAfterMs() > 0);
+        try t.expectEqual(cls != .retrying, cls.wakesByDefault());
     }
+}
+
+test "a wait outcome never shares a name with an event kind" {
+    const t = std.testing;
+    for (names(WaitOutcome)) |w| {
+        try t.expect(std.meta.stringToEnum(EventKind, w) == null);
+    }
+}
+
+test "an idle agent and one with background tasks take prompts; a busy one does not" {
+    const t = std.testing;
+    try t.expect(State.idle.takesPrompt());
+    try t.expect(State.waiting_background.takesPrompt());
+    try t.expect(!State.working.takesPrompt());
+    try t.expect(!State.waiting_user.takesPrompt());
 }

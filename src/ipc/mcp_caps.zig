@@ -447,9 +447,21 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
             .long_min_chars = select.LONG_MIN_CHARS,
             .cap_chars = select.READ_CAP_CHARS,
         });
+        try res.fact("agent_records_once", agents_ok);
+        try res.fact("agent_events_shared", agents_ok);
+        try res.fact("agent_wait_any", agents_ok);
+        const vocab = @import("../agent/vocab.zig");
+        var quiet: std.ArrayList([]const u8) = .empty;
+        for (std.enums.values(vocab.ErrorClass)) |cls| if (!cls.wakesByDefault()) try quiet.append(arena, @tagName(cls));
+        try res.fact("agent_done", .{
+            .settled = true,
+            .background_cap_ms = select.BACKGROUND_DONE_CAP_MS,
+            .quiet_errors = quiet.items,
+        });
         if (agents_ok) {
             try res.textf("sub-agents: agent_open runs one of {d} adapter(s) on this machine{s}, directly or through a wrapper (binary + args + env); results carry a watch_command that wakes you when it needs attention", .{ ids.len, if (agent_ssh) " or on an SSH host (host)" else " (no ssh client here, so not on SSH hosts)" });
-            try res.textf("agent_read and done results return per job its last message, earlier segment finals of {d}+ chars, messages of {d}+ chars and notices, about {d} chars per read (detail all for every message)", .{ select.FINAL_MIN_CHARS, select.LONG_MIN_CHARS, select.READ_CAP_CHARS });
+            try res.textf("agent_read and done results return per job its last message, earlier segment finals of {d}+ chars, messages of {d}+ chars and notices, about {d} chars per read (detail all for every message); each record reaches you once", .{ select.FINAL_MIN_CHARS, select.LONG_MIN_CHARS, select.READ_CAP_CHARS });
+            try res.text("done means settled (no subagents or background tasks left running); results and waiters share one event delivery, and agent_wait agents / agent-wait --any watch several agents");
         } else
             try res.text("sub-agents (agent_*) are unavailable in --shared mode: they run on an isolated or durable instance's private daemon");
     }

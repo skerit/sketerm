@@ -107,6 +107,10 @@ pub const ScreenSpec = struct {
     chrome: []const LineRule = &.{},
     /// "Waiting for N background agents" style line: busy is a subagent wait.
     subagent: ?LineRule = null,
+    /// A line saying background tasks the app started still run (its first
+    /// number is their count, 1 when it has none): an idle app showing it
+    /// is `waiting_background`, and its `done` waits for them.
+    background: ?LineRule = null,
     /// The line under a numbered option list (`N. label` rows) that makes
     /// it a pending interaction.
     choice_prompt: LineRule,
@@ -223,6 +227,7 @@ pub const Screen = struct {
     records: []const RecordMatcher,
     chrome: []const Matcher,
     subagent: ?Matcher,
+    background: ?Matcher,
     choice_prompt: Matcher,
     permission: ?Matcher,
 };
@@ -390,6 +395,7 @@ const Validator = struct {
             .records = recs,
             .chrome = chrome,
             .subagent = if (sc.subagent) |r| try self.rule(r, "screen.subagent", null) else null,
+            .background = if (sc.background) |r| try self.rule(r, "screen.background", null) else null,
             .choice_prompt = try self.rule(sc.choice_prompt, "screen.choice_prompt", null),
             .permission = if (sc.permission) |r| try self.rule(r, "screen.permission", null) else null,
         };

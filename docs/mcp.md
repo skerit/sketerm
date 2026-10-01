@@ -233,8 +233,8 @@ is kept by a `:ro` policy term. The full descriptions and schemas are in
 - `agent_adapters` (read-only): List the agent adapters this server can run (shipped ones plus user files in $XDG_CONFIG_HOME/sketerm/agents/*.json), whether each app's binary is installed on this machine (and where), and which actions each supports.
 - `agent_open`: Run another coding agent as a SUB-AGENT and talk to it in clean records, never raw screens: app "claude" (Claude Code) or "opencode" (see agent_adapters).
 - `agent_send`: Send a prompt to an idle agent and wait (bounded, timeout_ms default 60000, max 120000) for the turn.
-- `agent_wait` (read-only): Wait (bounded, timeout_ms default 60000, max 120000) for an agent's next wake-up, with agent_send's filter rules, and return the events you were not handed before (a turn that finished meanwhile answers at once, with its job's answer and key messages, as agent_send).
-- `agent_read` (read-only): Read what an agent did, per JOB (one user prompt and everything until the next, turns the agent started on its own included), for the jobs with records you have not read yet (a server-side cursor every agent_read advances; nothing new = the latest job again).
+- `agent_wait` (read-only): Wait (bounded, timeout_ms default 60000, max 120000) for an agent's next wake-up, with agent_send's filter rules, and return the events no result or waiter delivered before (a turn that finished meanwhile answers at once, with its job's answer and key messages, as agent_send).
+- `agent_read` (read-only): Read what an agent did, per JOB (one user prompt and everything until the next, turns the agent started on its own included), returning only what no result has handed you before: delivery is per record, so every selected message reaches you once, whether a read or a done result (agent_send/agent_wait/agent_answer/agent_open) carried it; a job's earlier ones are not repeated, jobs[].earlier points at one, and with nothing new the read says so and returns no records.
 - `agent_answer`: Answer the agent's pending prompt (permission, question or choice; see interaction) by option label, its 1-based number or a unique part of a label, then wait for the turn like agent_send.
 - `agent_set`: Change an agent's model and/or effort level for THIS session only, never the user's defaults (Claude Code: /model with its session-only choice, confirmed by the app before this returns; effort by restarting Claude Code in the same terminal with --effort and resuming the conversation, since its /effort saves the user's default; opencode: the model and variant of the prompts this agent sends).
 - `agent_interrupt`: Interrupt an agent's running turn (Claude Code: Escape; opencode: abort, subagents included).
@@ -244,7 +244,7 @@ is kept by a `:ro` policy term. The full descriptions and schemas are in
 
 ### `core`
 
-- `capabilities` (read-only): Preflight report of what THIS MCP server can do right now: isolation mode, headless GUI-app support (headless_gui — launch_app renders apps into the mux daemon and NEVER needs a display, an X server or a sketerm window), whether a direct sketerm GUI control socket is attached (gui_socket; independent of the session panel relay and of headless GUI apps), the live panel transport (panels + panel_transport) and the saved-panel store (panels_store + panel_store), OCR (tesseract) availability, whether the web_* tools can run and against what (web + web_backend "gui"/"session"/"headless"/"none" — "session" adds web_session, the watchable Wayland app session the helper renders into — plus the sketerm-webengine path in web_helper; web_gui says whether the user granted the web_* tools their OWN browser and logins, web_gui_source where that came from and web_gui_transport which GUI socket they hold now; web_profiles says whether named cookie jars work, web_routes which per-tab network routes web_open can honour, web_engine_broker whether the mux daemon owns the engine's lifetime and web_engine_owner who started the one in use; web_downloads whether web_download can pull a url through a view; web_capture whether web_open can record the response bodies a headless view's page receives; web_engine_started whether an engine exists YET, since web_backend/web_watch/web_session are undetermined until it does), ssh/scp presence, the directory terminal asciicast recordings land in, the EFFECTIVE input-timing defaults (hold_ms/settle_ms/timeout_ms/click_retry, each marked when a SKETERM_MCP_* env override changed it from the built-in), whether sub-agents run here (agents, agent_adapters, agent_waiter, agent_ssh, agent_open_args_env for a wrapper's args and env) and how agent_read selects what it returns (agent_read_select), and open session counts.
+- `capabilities` (read-only): Preflight report of what THIS MCP server can do right now: isolation mode, headless GUI-app support (headless_gui — launch_app renders apps into the mux daemon and NEVER needs a display, an X server or a sketerm window), whether a direct sketerm GUI control socket is attached (gui_socket; independent of the session panel relay and of headless GUI apps), the live panel transport (panels + panel_transport) and the saved-panel store (panels_store + panel_store), OCR (tesseract) availability, whether the web_* tools can run and against what (web + web_backend "gui"/"session"/"headless"/"none" — "session" adds web_session, the watchable Wayland app session the helper renders into — plus the sketerm-webengine path in web_helper; web_gui says whether the user granted the web_* tools their OWN browser and logins, web_gui_source where that came from and web_gui_transport which GUI socket they hold now; web_profiles says whether named cookie jars work, web_routes which per-tab network routes web_open can honour, web_engine_broker whether the mux daemon owns the engine's lifetime and web_engine_owner who started the one in use; web_downloads whether web_download can pull a url through a view; web_capture whether web_open can record the response bodies a headless view's page receives; web_engine_started whether an engine exists YET, since web_backend/web_watch/web_session are undetermined until it does), ssh/scp presence, the directory terminal asciicast recordings land in, the EFFECTIVE input-timing defaults (hold_ms/settle_ms/timeout_ms/click_retry, each marked when a SKETERM_MCP_* env override changed it from the built-in), whether sub-agents run here (agents, agent_adapters, agent_waiter, agent_ssh, agent_open_args_env for a wrapper's args and env) and how agent_read selects what it returns (agent_read_select), how sub-agent output is delivered (agent_records_once, agent_events_shared), whether agent_wait can watch several agents (agent_wait_any) and when done fires (agent_done), and open session counts.
 <!-- tool-reference:end -->
 
 ## Tool exposure policy
@@ -717,15 +717,56 @@ on a free loopback port, read over its HTTP API and SSE stream, with
 - **Waiting.** `agent_send`, `agent_answer`, `agent_open prompt` and
   `agent_wait` wait (bounded, default 60 s, at most 120 s) on the agent's
   event queue. Always-on wake-ups (`done`, `needs_input`, `error`,
-  `exited`, `connection_lost`) end every wait; `messages:true` and
-  `match:"text"` add opt-in ones, rate limited per agent (burst 3, then
-  one per 30 s; the rest ride the next wake-up as a `digest`). `outcome`
-  is the highest-ranked kind delivered (`vocab.EventKind.outcomeRank`),
-  or `still_working`; on `done`, `message` is the job's answer and
-  `records`/`jobs`/`cut_ids` are the job exactly as `agent_read` selects
-  it (below), so no extra read is needed. Events no result handed out yet
-  ride the next `agent_*` result, so nothing is lost when no wait was
-  armed.
+  `exited`, `connection_lost`) end every wait, except an `error` whose
+  class the agent recovers from by itself (`retrying`: "servers
+  overloaded", a provider retry; `vocab.ErrorClass.wakesByDefault`),
+  which wakes only a caller that passes `retrying:true` (waiter
+  `--retrying`); the `retrying` STATE still shows in every result and
+  `agent_list`, and a retry that turns into a real error or a limit wakes
+  through that class. `messages:true` and `match:"text"` add opt-in
+  wake-ups, rate limited per agent (burst 3, then one per 30 s; the rest
+  ride the next wake-up as a `digest`). `outcome` is the highest-ranked
+  kind delivered (`vocab.EventKind.outcomeRank`), else `still_working`,
+  or `sent` when the prompt went in and the call returned before the
+  agent started on it (`agent_send timeout_ms:0`; `vocab.WaitOutcome`).
+  An event that announces a message (`done`, `message`, `match`:
+  `EventKind.announcesRecord`) carries its `record` id and a one-line
+  preview (`events.PREVIEW_MAX`, 120 bytes) in results, never the text
+  again (the waiter's line is unchanged). On
+  `done`, `message` is the job's answer and `records`/`jobs`/`cut_ids`
+  are the job exactly as `agent_read` selects it (below), minus what was
+  handed out before, so no extra read is needed. `agent_wait agents:[...]`
+  waits on several agents: the first wake-up of any wins, the result is
+  that agent's (`agents` lists the ones waited on) and its
+  `watch_command` waits on all of them with `--any`.
+- **`done` means settled.** An agent is done when it is idle with no
+  subagents and no background tasks running. Claude Code shows a shell it
+  started in the background on its mode line (`manual mode on  ·  1
+  shell`, measured 2.1.286; the turn's footer also says `· 1 shell still
+  running`), and drops it in the same frame in which it starts the turn
+  that reports the task's end; the adapter's `screen.background` rule
+  reads that line, the state is `waiting_background` (the agent still
+  takes prompts) and the `done` waits for the wake turn. The segment's
+  final is flagged when the agent goes idle, so the job's summary is
+  still selected. An agent idle with background tasks for 30 minutes
+  (`select.BACKGROUND_DONE_CAP_MS`) fires its `done` anyway, with
+  `background_tasks` (their count) on the event, so a server left running
+  on purpose never means silence. opencode has no background shells; its
+  background subagents are child sessions, whose busy status already
+  holds the root as `waiting_subagent`.
+- **Compaction is a notice, never a message.** A compaction summary is
+  never part of any result, `detail:"all"` and event text included, and
+  compaction never counts as a new answer for the re-wake rule. opencode
+  marks it in its API: the request is a root user message whose only
+  part is `compaction` (it opens no job and arms no `done` of its own),
+  the summary is an assistant message with `summary: true` (its parts are
+  dropped), and `session.compacted` adds the notice `conversation
+  compacted`. Claude Code never draws the summary (measured, 2.1.286:
+  `/compact` erases the turn below the first prompt, reprints it shorter
+  with `Conversation compacted (ctrl+o for history)`, and the command's
+  own turn shows `Compacted (ctrl+o to see full summary)`, a notice); a
+  `/compact` sent with `agent_send` is a job of its own whose one `done`
+  carries an empty answer.
 - **Jobs, and what is read back (`src/agent/select.zig`).** The unit is
   the JOB: one user prompt (whoever typed it: `agent_send`, `agent_open`'s
   prompt, a human in the GUI) and everything until the next one,
@@ -745,34 +786,57 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   thresholds come from 489 real Claude Code sessions (intermediates:
   median 137 chars; prompt-answer finals: median 2016; wake-segment
   finals: median 351; in 162 of 860 multi-segment jobs the last final was
-  under 300 after an earlier final of 300+). `agent_read` covers the jobs
-  with records newer than a per-agent read cursor that every read
-  advances (nothing new: the latest job again; an explicit `since`
-  replaces the cursor), at most ~12000 characters: the newest job's last
-  message whole, then the longest that fit, the rest listed in `cut_ids`.
-  `detail: "all"` returns every assistant message and notice above
-  `since` (or the cursor) by id, paged by `limit` with
-  `next_since`/`more`. The answer a `done` carries is the job's latest
+  under 300 after an earlier final of 300+). **Delivery is per record**
+  (`select.Handed`, one per agent): the default `agent_read` applies the
+  selection to every job and returns only records no result handed out
+  before, whichever result that was (a read, or a `done` result of
+  `agent_open`/`agent_send`/`agent_wait`/`agent_answer`, which mark what
+  they return). A selected record handed out earlier is never repeated;
+  its job carries one pointer instead (`jobs[].returned_before`,
+  `jobs[].earlier` and a line like `earlier in job 3: [12] assistant,
+  3.1k chars, returned before`), and a read with nothing new says so in
+  one line and returns no records. At most ~12000 characters per read:
+  the newest job's last message whole, then the longest that fit; what
+  the cap leaves out is listed in `cut_ids` and comes with the next read.
+  `jobs` and `cut_ids` only cover jobs this read returns a record of (old
+  history contributes at most its one pointer line); a job whose new
+  records the cap kept out entirely is only counted, in `jobs_pending`.
+  An explicit `since` re-reads the jobs with records above it, handed out
+  or not; `detail: "all"` returns every assistant message and notice
+  above `since` (or above what the previous detail-all read covered) by
+  id, paged by `limit` with `next_since`/`more`. Record ids restart when
+  a durable instance reattaches (the app's transcript is read again), so
+  the handed-out state is not persisted: the first read after a reattach
+  returns the selection again. The answer a `done` carries is the job's latest
   selected message of 300+ characters, else its last message. A job's
   FIRST `done` always wakes; a later one (a wake segment) wakes only when
   the job gained a message the rules select besides its last one, so a
   trivial "that was another wakeup, ignoring" goes idle without waking
   anyone (`agent_read` still shows it). `capabilities.agent_read_select`
-  reports the unit and the thresholds.
+  reports the unit and the thresholds; `agent_records_once`,
+  `agent_events_shared`, `agent_wait_any` and `agent_done` (settled,
+  `background_cap_ms`, `quiet_errors`) report the rest of this.
 - **Being woken.** Every per-agent result carries `watch_command`, the
   exact command (this executable, absolute) that blocks until the agent
   next needs attention: `sketerm mcp agent-wait --socket <instance>/agents.sock
-  [--match X] [--messages] <agent>`. It wakes for events no result had
-  handed the assistant when it subscribes, so the same command can be run
-  again any number of calls later and never re-wakes on an event the
-  assistant already has (`--since SEQ` is the explicit alternative). It
-  prints one line per wake-up (`claude-1 done: <first line> [state
-  idle]`), exits after the first unless `--follow`, and always prints
-  `watch ended: <reason>` when the agent closes or the server goes away.
-  `sketerm-mcp agent-wait` and `sketerm-mcp mcp agent-wait` are the same
-  command. The waiter and `agent_wait` share one filter and limiter
-  (`events.Cursor.take`); a waiter never advances what the assistant has
-  been handed.
+  [--match X] [--messages] [--retrying] <agent>`, or `--any <agent>
+  <agent>...` for several (the first wake-up of any; with `--follow`, all
+  of them). Events have ONE delivery state per agent (`Event.delivered`),
+  shared by every `agent_*` result, `agent_wait` and every waiter: an
+  event any of them delivered is delivered for all, because a waiter's
+  line lands in the same assistant's context. So the same command can be
+  run again any number of calls later and never re-wakes on an event
+  already delivered; two waiters on one agent wake once between them;
+  and a tool call on an agent holds that agent's waiters while it runs,
+  so its own result gets what happens meanwhile. `--since SEQ` re-reads
+  every event after SEQ, delivered or not. A waiter prints one line per
+  wake-up (`claude-1 done: <first line> [state idle]`) and marks no
+  RECORD as handed out: `agent_read` afterwards returns the messages in
+  full. It exits after the first wake-up unless `--follow`, and always
+  prints `watch ended: <reason>` when its agents close or the server goes
+  away. `sketerm-mcp agent-wait` and `sketerm-mcp mcp agent-wait` are the
+  same command; the subscribe line keeps `agent` (the first) beside
+  `agents`, so an older server watches the first one.
 - **Observation.** The server loop polls stdin together with every agent
   terminal, API stream and waiter connection, and wakes for the sources'
   timers, so agents are observed between requests. Turn detection is

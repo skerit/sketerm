@@ -105,9 +105,11 @@ pub const INSTRUCTIONS =
     "sketerm can run other coding agents for you as sub-agents. To delegate work to Claude Code or opencode, call agent_open " ++
     "(app \"claude\" or \"opencode\", optionally with a prompt) and agent_send; results carry the finished job's answer and its " ++
     "other key messages, pending prompts (answer with agent_answer) and events, never raw screens, and agent_read returns the same " ++
-    "per job for what you have not read yet (detail \"all\" for every message, include_tools for tool calls). " ++
-    "When a result says still_working, run its watch_command in the background (or as a Monitor with --follow) " ++
-    "to be woken when the agent finishes or needs input, instead of polling with agent_wait.";
+    "per job for what no result has handed you yet: every message comes to you once (detail \"all\" or a since re-reads, include_tools adds tool calls). " ++
+    "When a result says still_working (or sent: the agent had not started yet), run its watch_command in the background (or as a Monitor with --follow) " ++
+    "to be woken when the agent finishes (done means settled: idle with no subagents or background tasks) or needs input, " ++
+    "instead of polling with agent_wait; to watch several agents at once use agent-wait --any with their ids. " ++
+    "A wake-up the waiter printed is not repeated by agent_* results, so read the agent afterwards.";
 
 // ── state ────────────────────────────────────────────────────────
 
@@ -140,10 +142,14 @@ pub const Entry = struct {
     cwd: []u8,
     recordings: std.ArrayList([]u8) = .empty,
     seen_snapshots: u32 = 0,
-    /// What the ASSISTANT has been handed (every agent_* result).
+    /// The agent_* results' examined mark; what is DELIVERED is one state
+    /// on the agent's queue, shared with every waiter.
     cursor: events.Cursor = .{},
-    /// The highest record id an agent_read covered: the next read without
-    /// `since` returns the jobs holding newer records.
+    /// The records handed to the assistant (every result that carries a
+    /// selection marks what it returned).
+    handed: select.Handed = .{},
+    /// The highest record id a `detail: all` read covered: the next one
+    /// without `since` pages on from it.
     read_cursor: u64 = 0,
     /// The SSH host the agent runs on; null = this machine.
     host: ?[]u8 = null,
@@ -213,6 +219,7 @@ pub const Entry = struct {
             if (o) |s| a.free(s);
         }
         self.extra.free(a);
+        self.handed.deinit(a);
         for (self.recordings.items) |r| a.free(r);
         self.recordings.deinit(a);
         a.free(self.id);
@@ -246,7 +253,25 @@ const State = struct {
     waiter: Waiter = .{},
     /// The server's registry record, which publishes `entries`.
     registry: ?*mcp_registry.Lease = null,
+    /// The agents the running tool call acts on: their waiters deliver
+    /// nothing until it returns, so its own result gets what happens.
+    held: [MAX_ANY]*const Entry = undefined,
+    held_len: usize = 0,
 };
+
+/// Agents one agent_wait or waiter watches at most.
+pub const MAX_ANY = agentwait.MAX_ANY;
+
+fn hold(e: *const Entry) void {
+    if (isHeld(e) or state.held_len == state.held.len) return;
+    state.held[state.held_len] = e;
+    state.held_len += 1;
+}
+
+fn isHeld(e: *const Entry) bool {
+    for (state.held[0..state.held_len]) |h| if (h == e) return true;
+    return false;
+}
 
 pub var state: State = .{};
 
@@ -301,7 +326,7 @@ pub fn adapterIds(arena: std.mem.Allocator) ![]const []const u8 {
 pub fn waiterTemplate(arena: std.mem.Allocator) !?[]const u8 {
     const exe = state.exe orelse return null;
     const sock = state.waiter.path orelse return null;
-    return try agentwait.watchCommand(arena, exe, sock, "AGENT", .{});
+    return try agentwait.watchCommand(arena, exe, sock, &.{"AGENT"}, .{});
 }
 
 /// The conn fds the watchdog may shut down.
@@ -400,7 +425,7 @@ pub fn dueInMs(now_ms: i64) ?i64 {
     var due: ?i64 = null;
     for (state.entries.items) |e| {
         const d: ?i64 = switch (e.agent.source) {
-            .screen => |*eng| if (screenNeedsTick(eng)) TICK_MS else null,
+            .screen => |*eng| if (screenNeedsTick(eng)) TICK_MS else eng.backgroundDueIn(now_ms),
             .opencode_api => |*api| api.serviceDueIn(now_ms),
         };
         if (d) |x| due = if (due) |y| @min(x, y) else x;
@@ -415,7 +440,9 @@ pub fn dueInMs(now_ms: i64) ?i64 {
 
 fn screenNeedsTick(e: *const screen_source.Engine) bool {
     if (e.exited or e.disconnected) return false;
-    return !e.ready or e.end_pending or e.lone_bell or e.retry_since_ms != null or e.state != .idle;
+    // Idle with background tasks needs no ticks: their line changing is
+    // output, and the cap is a deadline (`backgroundDueIn`).
+    return !e.ready or e.end_pending or e.lone_bell or e.retry_since_ms != null or (e.state != .idle and e.state != .waiting_background);
 }
 
 /// Read every agent's sources and deliver waiter wake-ups. Never blocks.
@@ -562,10 +589,26 @@ fn waitReady(e: *Entry, deadline: i64) bool {
 /// The assistant's next delivery with `filter`, waiting until `deadline`;
 /// null on timeout or when the agent is gone with nothing left to hand.
 fn waitDelivery(e: *Entry, filter: events.Filter, deadline: i64, arena: std.mem.Allocator) !?events.Delivery {
+    const one = [1]*Entry{e};
+    const got = (try waitAny(&one, filter, deadline, arena)) orelse return null;
+    return got.delivery;
+}
+
+const Woken = struct { entry: *Entry, delivery: events.Delivery };
+
+/// The first delivery from any of `entries` (in their order when several
+/// have one), waiting until `deadline`; null on timeout or when every one
+/// is gone with nothing left to hand.
+fn waitAny(entries: []const *Entry, filter: events.Filter, deadline: i64, arena: std.mem.Allocator) !?Woken {
+    for (entries) |e| hold(e);
     service(clock.nowMs());
     while (true) {
-        if (try e.cursor.take(e.agent.queue(), filter, clock.nowMs(), arena)) |d| return d;
-        if (gone(e) or clock.nowMs() >= deadline) return null;
+        var all_gone = true;
+        for (entries) |e| {
+            if (try e.cursor.take(e.agent.queue(), filter, clock.nowMs(), arena)) |d| return .{ .entry = e, .delivery = d };
+            if (!gone(e)) all_gone = false;
+        }
+        if (all_gone or clock.nowMs() >= deadline) return null;
         pump(deadline - clock.nowMs());
     }
 }
@@ -589,19 +632,36 @@ fn waitStep(e: *Entry, what: adapter.WaitFor, asked: ?u64, deadline: i64) bool {
 
 // ── the waiter socket ────────────────────────────────────────────
 
+/// One agent a waiter watches, with its own examined mark.
+const Target = struct {
+    id: []u8,
+    cursor: events.Cursor,
+};
+
 const Sub = struct {
     fd: c_int,
     inbuf: std.ArrayList(u8) = .empty,
     subscribed: bool = false,
-    agent: []u8 = &.{},
+    targets: std.ArrayList(Target) = .empty,
     match: ?[]u8 = null,
     messages: bool = false,
+    retrying: bool = false,
     follow: bool = false,
-    cursor: events.Cursor = .{},
     done: bool = false,
 
     fn filter(self: *const Sub) events.Filter {
-        return .{ .messages = self.messages, .match = self.match };
+        return .{ .messages = self.messages, .match = self.match, .retrying = self.retrying };
+    }
+
+    fn watches(self: *const Sub, id: []const u8) ?usize {
+        for (self.targets.items, 0..) |tg, i| if (std.mem.eql(u8, tg.id, id)) return i;
+        return null;
+    }
+
+    /// Stop watching target `i`.
+    fn drop(self: *Sub, a: std.mem.Allocator, i: usize) void {
+        a.free(self.targets.items[i].id);
+        _ = self.targets.orderedRemove(i);
     }
 };
 
@@ -663,8 +723,10 @@ const Waiter = struct {
         var due: ?i64 = null;
         for (self.subs.items) |s| {
             if (!s.subscribed) continue;
-            const e = findById(s.agent) orelse continue;
-            if (s.cursor.digestDueIn(e.agent.queue(), now_ms)) |d| due = if (due) |x| @min(x, d) else d;
+            for (s.targets.items) |*tg| {
+                const e = findById(tg.id) orelse continue;
+                if (tg.cursor.digestDueIn(e.agent.queue(), now_ms)) |d| due = if (due) |x| @min(x, d) else d;
+            }
         }
         return due;
     }
@@ -733,18 +795,45 @@ fn serviceSub(a: std.mem.Allocator, s: *Sub, now_ms: i64) void {
         s.subscribed = true;
         const sub = std.json.parseFromSliceLeaky(agentwait.Subscribe, arena, s.inbuf.items[0..nl], .{ .ignore_unknown_fields = true }) catch
             return endSub(s, "bad subscribe line");
-        const e = findByName(sub.agent) orelse
-            return endSub(s, std.fmt.allocPrint(arena, "no agent {s} on this server", .{sub.agent}) catch "no such agent");
-        s.agent = a.dupe(u8, e.id) catch return endSub(s, "out of memory");
+        const names = sub.names();
+        if (names.len == 0) return endSub(s, "no agent named");
+        if (names.len > MAX_ANY) return endSub(s, "too many agents");
+        for (names) |name| {
+            const e = findByName(name) orelse
+                return endSub(s, std.fmt.allocPrint(arena, "no agent {s} on this server", .{name}) catch "no such agent");
+            if (s.watches(e.id) != null) continue;
+            const id = a.dupe(u8, e.id) catch return endSub(s, "out of memory");
+            // Without `since`: whatever nobody delivered yet, and opt-in
+            // events the assistant's calls have not examined.
+            const cursor = if (sub.since) |n| events.Cursor.replayFrom(n) else events.Cursor.after(e.cursor.seen);
+            s.targets.append(a, .{ .id = id, .cursor = cursor }) catch {
+                a.free(id);
+                return endSub(s, "out of memory");
+            };
+        }
         if (sub.match) |m| s.match = a.dupe(u8, m) catch return endSub(s, "out of memory");
         s.messages = sub.messages;
+        s.retrying = sub.retrying;
         s.follow = sub.follow;
-        s.cursor = .{ .seen = sub.since orelse e.cursor.seen };
     }
-    const e = findById(s.agent) orelse return endSub(s, "agent closed");
-    const d = (s.cursor.take(e.agent.queue(), s.filter(), now_ms, arena) catch return) orelse return;
-    sendLine(s, agentwait.encodeWake(arena, e.id, e.agent.state(), d, e.agent.queue()) catch return);
-    if (!s.follow) s.done = true;
+    var i: usize = 0;
+    while (i < s.targets.items.len) {
+        const tg = &s.targets.items[i];
+        const e = findById(tg.id) orelse {
+            s.drop(a, i);
+            continue;
+        };
+        i += 1;
+        // A tool call on this agent is under way: its result gets this.
+        if (isHeld(e)) continue;
+        const d = (tg.cursor.take(e.agent.queue(), s.filter(), now_ms, arena) catch continue) orelse continue;
+        sendLine(s, agentwait.encodeWake(arena, e.id, e.agent.state(), d, e.agent.queue()) catch continue);
+        if (!s.follow) {
+            s.done = true;
+            return;
+        }
+    }
+    if (s.targets.items.len == 0) endSub(s, "agent closed");
 }
 
 /// Send the end line and let the client go.
@@ -773,19 +862,22 @@ fn sendLine(s: *Sub, line: []const u8) void {
 fn freeSub(a: std.mem.Allocator, s: *Sub) void {
     _ = c.close(s.fd);
     s.inbuf.deinit(a);
-    if (s.agent.len > 0) a.free(s.agent);
+    for (s.targets.items) |tg| a.free(tg.id);
+    s.targets.deinit(a);
     if (s.match) |m| a.free(m);
     a.destroy(s);
 }
 
-/// End the waiters of an agent that is going away.
+/// Drop an agent that is going away from every waiter, and end the
+/// waiters left watching nothing.
 fn endWaitersOf(id: []const u8, reason: []const u8) void {
     const a = state.allocator;
     var i: usize = 0;
     while (i < state.waiter.subs.items.len) {
         const s = state.waiter.subs.items[i];
-        if (s.subscribed and std.mem.eql(u8, s.agent, id)) {
-            endSub(s, reason);
+        if (s.subscribed) if (s.watches(id)) |ti| s.drop(a, ti);
+        if (s.subscribed and s.targets.items.len == 0) {
+            if (!s.done) endSub(s, reason);
             freeSub(a, s);
             _ = state.waiter.subs.swapRemove(i);
             continue;
@@ -802,13 +894,18 @@ const Fail = struct { code: mcp.ErrCode, msg: []const u8 };
 pub fn agentTool(arena: std.mem.Allocator, tool: Tool, args: std.json.Value) ![]const u8 {
     if (!available())
         return errRes(arena, .unavailable, "the agent tools need an isolated or durable instance (the default, or --durable/--name); this server runs --shared, where agents are not available");
+    state.held_len = 0;
+    defer state.held_len = 0;
     return switch (tool) {
         .agent_adapters => adaptersTool(arena, args),
         .agent_open => openTool(arena, args),
         .agent_attach => attachTool(arena, args),
         .agent_list => listTool(arena),
         .agent_send => withEntry(arena, args, sendTool),
-        .agent_wait => withEntry(arena, args, waitTool),
+        .agent_wait => if (mcp.argValue(args, "agents")) |v| switch (v) {
+            .array => |list| waitAnyTool(arena, args, list.items),
+            else => errRes(arena, .invalid_args, "agents must be an array of agent ids"),
+        } else withEntry(arena, args, waitTool),
         .agent_read => withEntry(arena, args, readTool),
         .agent_answer => withEntry(arena, args, answerTool),
         .agent_set => withEntry(arena, args, setTool),
@@ -822,8 +919,10 @@ fn withEntry(
     args: std.json.Value,
     comptime body: fn (std.mem.Allocator, std.json.Value, *Entry) anyerror![]const u8,
 ) ![]const u8 {
+    if (entryFromArgs(args)) |e| hold(e);
     service(clock.nowMs());
     const e = entryFromArgs(args) orelse return notFound(arena, args);
+    hold(e);
     reconnectIfLost(e);
     return body(arena, args, e);
 }
@@ -856,7 +955,7 @@ fn notFound(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
 
 fn filterFrom(args: std.json.Value) events.Filter {
     const m = argStr(args, "match");
-    return .{ .messages = argBool(args, "messages"), .match = if (m != null and m.?.len > 0) m else null };
+    return .{ .messages = argBool(args, "messages"), .match = if (m != null and m.?.len > 0) m else null, .retrying = argBool(args, "retrying") };
 }
 
 fn deadlineFrom(args: std.json.Value, default_ms: i64) i64 {
@@ -878,6 +977,8 @@ const WaitPart = struct {
     /// pending before the call acted.
     post_from: usize,
     timed_out: bool,
+    /// The call submitted a prompt (an outcome may be `sent`).
+    sent: bool = false,
 };
 
 /// A payload block of the text lane (after the prose).
@@ -909,16 +1010,18 @@ fn pending(arena: std.mem.Allocator, e: *Entry) !Delivered {
 }
 
 /// The kind a wake-up reports: the delivered kind of the highest
-/// `outcomeRank`, else `exited` for an agent that is gone, else still
-/// working.
-pub fn outcomeOf(items: []const events.Item, st: vocab.State) []const u8 {
+/// `outcomeRank`, else `exited` for an agent that is gone, else `sent`
+/// for a prompt the agent has not started on, else still working.
+/// @param sent the call submitted a prompt.
+pub fn outcomeOf(items: []const events.Item, st: vocab.State, sent: bool) []const u8 {
     var best: ?vocab.EventKind = null;
     for (items) |it| {
         if (best == null or it.kind.outcomeRank() > best.?.outcomeRank()) best = it.kind;
     }
     if (best) |b| return @tagName(b);
     if (st == .exited) return @tagName(vocab.EventKind.exited);
-    return mcp_tools.OUTCOME_STILL_WORKING;
+    if (sent and st.takesPrompt()) return @tagName(vocab.WaitOutcome.sent);
+    return @tagName(vocab.WaitOutcome.still_working);
 }
 
 const EventJson = struct {
@@ -929,7 +1032,15 @@ const EventJson = struct {
     count: u32,
     class: ?[]const u8 = null,
     job: ?u32 = null,
+    record: ?u64 = null,
+    background_tasks: ?u32 = null,
 };
+
+/// An event's text as a result shows it: a record it announces is
+/// referenced by id with a one-line preview, never repeated whole.
+fn eventText(it: events.Item) []const u8 {
+    return if (it.kind.announcesRecord()) events.preview(it.event.text) else it.event.text;
+}
 
 const InteractionJson = struct {
     kind: []const u8,
@@ -943,9 +1054,16 @@ fn toJson(arena: std.mem.Allocator, value: anytype) ![]const u8 {
     return std.json.Stringify.valueAlloc(arena, value, .{ .emit_null_optional_fields = false });
 }
 
+/// What a result's watch_command waits for.
+const Watch = struct {
+    filter: events.Filter = .{},
+    /// Several agents (agent_wait `agents`): the first wake-up of any.
+    any: []const []const u8 = &.{},
+};
+
 /// The facts and prose every per-agent result shares, then the payload
 /// blocks (`extra` first) and the finished result.
-fn finish(arena: std.mem.Allocator, res: *Res, e: *Entry, dv: Delivered, filter: events.Filter, extra: []const Block) ![]const u8 {
+fn finish(arena: std.mem.Allocator, res: *Res, e: *Entry, dv: Delivered, watch: Watch, extra: []const Block) ![]const u8 {
     const st = e.agent.state();
     const q = e.agent.queue();
     try res.fact("agent", e.id);
@@ -962,40 +1080,54 @@ fn finish(arena: std.mem.Allocator, res: *Res, e: *Entry, dv: Delivered, filter:
     var job_block: ?Block = null;
     if (dv.wait) |w| {
         const post = dv.items[w.post_from..];
-        const outcome = outcomeOf(post, st);
+        const outcome = outcomeOf(post, st, w.sent);
         try res.fact("outcome", outcome);
         var job: ?u32 = null;
+        var background: ?u32 = null;
         for (post) |it| if (it.kind == .done) {
             message = it.event.text;
             job = it.event.job;
+            background = it.event.background_tasks;
         };
-        if (message) |m| try res.fact("message", m);
-        // The finished job as agent_read would return it: no extra read.
+        // The finished job as agent_read would return it, without what the
+        // assistant was handed before: no extra read, no repeat.
         if (job) |j| {
-            var one = [1]u32{j};
+            const one = [1]u32{j};
             const recs = e.agent.records();
-            const sel = try select.select(arena, recs, .{ .list = &one, .fallback = false }, .{});
+            const fresh = if (select.answerIndex(recs, j)) |i| !e.handed.has(recs[i].id) else false;
+            if (!fresh) message = null;
+            const sel = try select.select(arena, recs, &one, .{ .handed = &e.handed, .keep_empty = true });
             job_block = .{ .name = try std.fmt.allocPrint(arena, "job {d}", .{j}), .body = try writeSelection(arena, res, recs, sel) };
+            try e.handed.markSelection(e.allocator, recs, sel);
         }
+        if (message) |m| try res.fact("message", m);
         try res.fact("timed_out", w.timed_out);
         try res.textf("{s}: {s} (state {s})", .{ e.id, outcome, @tagName(st) });
-        if (w.timed_out)
-            try res.text("still working when the wait ran out: run watch_command in the background (or as a Monitor with --follow) to be woken instead of polling");
+        if (background) |n|
+            try res.textf("done after {d} minutes idle with {d} background task(s) still running", .{ @divTrunc(select.BACKGROUND_DONE_CAP_MS, 60_000), n });
+        if (w.timed_out) {
+            if (std.mem.eql(u8, outcome, @tagName(vocab.WaitOutcome.sent)))
+                try res.text("sent; the agent had not started on it when the call returned: run watch_command in the background (or as a Monitor with --follow) to be woken instead of polling")
+            else
+                try res.text("still working when the wait ran out: run watch_command in the background (or as a Monitor with --follow) to be woken instead of polling");
+        }
     } else try res.textf("{s}: state {s}", .{ e.id, @tagName(st) });
 
     const evs = try arena.alloc(EventJson, dv.items.len);
     for (dv.items, evs) |it, *out| out.* = .{
         .seq = it.event.seq,
         .kind = @tagName(it.kind),
-        .text = it.event.text,
+        .text = eventText(it),
+        .record = it.event.record,
         .detail = it.event.detail,
         .count = it.event.count,
         .class = if (it.event.class) |cls| @tagName(cls) else null,
         .job = it.event.job,
+        .background_tasks = it.event.background_tasks,
     };
     try res.raw("events", try toJson(arena, evs));
     if (dv.digest) |g| {
-        const latest = if (q.bySeq(g.latest_seq)) |ev| ev.text else "";
+        const latest = if (q.bySeq(g.latest_seq)) |ev| events.preview(ev.text) else "";
         try res.raw("digest", try toJson(arena, .{ .count = g.count, .latest = latest }));
         try res.textf("{d} more opt-in event(s) held back by the rate limit", .{g.count});
     }
@@ -1010,7 +1142,8 @@ fn finish(arena: std.mem.Allocator, res: *Res, e: *Entry, dv: Delivered, filter:
     var cmd: ?[]const u8 = null;
     if (state.exe) |exe| {
         if (state.waiter.path) |sock| {
-            cmd = try agentwait.watchCommand(arena, exe, sock, e.id, filter);
+            const one = [1][]const u8{e.id};
+            cmd = try agentwait.watchCommand(arena, exe, sock, if (watch.any.len > 0) watch.any else &one, watch.filter);
             try res.fact("watch_command", cmd.?);
         }
     }
@@ -1024,7 +1157,8 @@ fn finish(arena: std.mem.Allocator, res: *Res, e: *Entry, dv: Delivered, filter:
             if (i > 0) try aw.writer.writeAll("\n");
             try aw.writer.print("{d} {s}", .{ ev.event.seq, @tagName(ev.kind) });
             if (ev.event.count > 1) try aw.writer.print(" (x{d})", .{ev.event.count});
-            if (ev.event.text.len > 0) try aw.writer.print(": {s}", .{agentwait.clip(ev.event.text, 300)});
+            if (ev.event.record) |id| try aw.writer.print(" [{d}]", .{id});
+            if (ev.event.text.len > 0) try aw.writer.print(": {s}", .{agentwait.clip(eventText(ev), 300)});
         }
         try block(res, .{ .name = "events", .body = aw.written() });
     }
@@ -1324,6 +1458,7 @@ fn openTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
     };
     writeDescriptor(e);
     publishAgents();
+    hold(e);
 
     const filter = filterFrom(args);
     const ready = waitReady(e, deadline);
@@ -1382,7 +1517,7 @@ fn openResult(arena: std.mem.Allocator, e: *Entry, ready: bool, sent: bool, note
     var extra: std.ArrayList(Block) = .empty;
     try extra.append(arena, .{ .name = "binary", .body = e.binary });
     if (notes.len > 0) try extra.append(arena, .{ .name = "notes", .body = try std.mem.join(arena, "\n", notes) });
-    return finish(arena, &res, e, dv, filter, extra.items);
+    return finish(arena, &res, e, dv, .{ .filter = filter }, extra.items);
 }
 
 fn randomHex(a: std.mem.Allocator, comptime nbytes: usize) ![]u8 {
@@ -1788,8 +1923,9 @@ fn attachTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
 /// is idle.
 fn busy(arena: std.mem.Allocator, e: *Entry) !?Fail {
     const st = e.agent.state();
+    if (st.takesPrompt()) return null;
     return switch (st) {
-        .idle => null,
+        .idle, .waiting_background => null,
         .starting => Fail{ .code = .timeout, .msg = try std.fmt.allocPrint(arena, "agent {s} is not ready yet (state starting); nothing was sent", .{e.id}) },
         .working, .waiting_subagent, .retrying => Fail{ .code = .conflict, .msg = try std.fmt.allocPrint(arena, "agent {s} is busy (state {s}): agent_wait for its turn to finish, or agent_interrupt it", .{ e.id, @tagName(st) }) },
         .waiting_user => Fail{ .code = .conflict, .msg = try std.fmt.allocPrint(arena, "agent {s} is waiting for an answer: agent_answer its prompt first", .{e.id}) },
@@ -1813,7 +1949,9 @@ fn submitAndWait(arena: std.mem.Allocator, e: *Entry, text: []const u8, filter: 
         e.conversed = true;
         writeDescriptor(e);
     }
-    return .{ .ok = try waitAfter(arena, e, pre, filter, deadline) };
+    var dv = try waitAfter(arena, e, pre, filter, deadline);
+    if (dv.wait) |*w| w.sent = true;
+    return .{ .ok = dv };
 }
 
 /// The wait that follows an action, combined with what was pending
@@ -2138,7 +2276,7 @@ fn sendTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]const 
         .fail => |f| return errRes(arena, f.code, f.msg),
         .ok => |dv| {
             var res = Res.init(arena);
-            return finish(arena, &res, e, dv, filter, &.{});
+            return finish(arena, &res, e, dv, .{ .filter = filter }, &.{});
         },
     }
 }
@@ -2147,7 +2285,34 @@ fn waitTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]const 
     const filter = filterFrom(args);
     const dv = try waitAfter(arena, e, null, filter, deadlineFrom(args, DEFAULT_WAIT_MS));
     var res = Res.init(arena);
-    return finish(arena, &res, e, dv, filter, &.{});
+    return finish(arena, &res, e, dv, .{ .filter = filter }, &.{});
+}
+
+/// agent_wait with `agents`: the first wake-up of any of them; the result
+/// is that agent's (the first listed one's when none woke).
+fn waitAnyTool(arena: std.mem.Allocator, args: std.json.Value, list: []const std.json.Value) ![]const u8 {
+    if (list.len == 0) return errRes(arena, .invalid_args, "agents is empty: name at least one agent id");
+    if (list.len > MAX_ANY) return errRes(arena, .invalid_args, try std.fmt.allocPrint(arena, "agents names at most {d} agents", .{MAX_ANY}));
+    var entries: std.ArrayList(*Entry) = .empty;
+    var ids: std.ArrayList([]const u8) = .empty;
+    for (list) |v| {
+        if (v != .string) return errRes(arena, .invalid_args, "agents must be an array of agent ids");
+        const e = findByName(v.string) orelse
+            return errRes(arena, .not_found, try std.fmt.allocPrint(arena, "no agent '{s}' (open: {s})", .{ v.string, try idList(arena) }));
+        if (std.mem.indexOfScalar(*Entry, entries.items, e) != null) continue;
+        try entries.append(arena, e);
+        try ids.append(arena, e.id);
+        hold(e);
+    }
+    for (entries.items) |e| reconnectIfLost(e);
+    const filter = filterFrom(args);
+    const got = try waitAny(entries.items, filter, deadlineFrom(args, DEFAULT_WAIT_MS), arena);
+    const e = if (got) |g| g.entry else entries.items[0];
+    const dv = try combine(arena, null, if (got) |g| g.delivery else null, true, got == null and !gone(e));
+    var res = Res.init(arena);
+    try res.fact("agents", ids.items);
+    if (got != null) try res.textf("{s} woke first of {d} agent(s)", .{ e.id, ids.items.len });
+    return finish(arena, &res, e, dv, .{ .filter = filter, .any = ids.items }, &.{});
 }
 
 fn answerTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]const u8 {
@@ -2185,7 +2350,7 @@ fn answerTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]cons
     try res.textf("answered the {s} prompt", .{@tagName(kind)});
     try res.fact("answered", label);
     const answer = try std.fmt.allocPrint(arena, "{s}\n-> {s}", .{ title, label });
-    return finish(arena, &res, e, dv, filter, &.{.{ .name = "answer", .body = answer }});
+    return finish(arena, &res, e, dv, .{ .filter = filter }, &.{.{ .name = "answer", .body = answer }});
 }
 
 fn setTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]const u8 {
@@ -2280,6 +2445,7 @@ fn writeSelection(arena: std.mem.Allocator, res: *Res, recs: []const output.Reco
     try res.raw("records", try toJson(arena, out));
     try res.raw("jobs", try toJson(arena, sel.jobs));
     try res.fact("cut_ids", sel.cut);
+    if (sel.jobs_pending > 0) try res.fact("jobs_pending", sel.jobs_pending);
 
     var aw: std.Io.Writer.Allocating = .init(arena);
     const w = &aw.writer;
@@ -2298,12 +2464,21 @@ fn writeSelection(arena: std.mem.Allocator, res: *Res, recs: []const output.Reco
             const r = recs[i];
             if (r.job == s.job) try w.print("\n[{d}] {s}: {s}", .{ r.id, @tagName(r.kind), r.text });
         }
+        // What was handed out before is never repeated: one pointer.
+        if (s.earlier) |x| {
+            try w.print("\nearlier in job {d}: [{d}] {s}, ", .{ s.job, x.id, @tagName(x.kind) });
+            if (x.chars >= 1000) try w.print("{d}.{d}k chars", .{ x.chars / 1000, x.chars % 1000 / 100 }) else try w.print("{d} chars", .{x.chars});
+            try w.writeAll(", returned before");
+            if (s.returned_before > 1) try w.print(" (with {d} more)", .{s.returned_before - 1});
+        }
     }
     if (sel.cut.len > 0) {
         try w.print("\n{d} selected record(s) left out by the {d}-character cap, ids", .{ sel.cut.len, select.READ_CAP_CHARS });
         for (sel.cut) |id| try w.print(" {d}", .{id});
-        try w.writeAll(": agent_read with detail all and a since below an id returns it");
+        try w.writeAll(": the next agent_read returns them");
     }
+    if (sel.jobs_pending > 0)
+        try w.print("\n{d} more job(s) with new records the cap kept out entirely: the next agent_read returns them", .{sel.jobs_pending});
     return aw.written();
 }
 
@@ -2313,27 +2488,39 @@ fn readTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]const 
     else
         select.Detail.selected;
     const explicit = argInt(args, "since");
-    const base: u64 = if (explicit) |s| @intCast(@max(s, 0)) else e.read_cursor;
     const limit: usize = @intCast(std.math.clamp(argInt(args, "limit") orelse READ_DEFAULT, 1, READ_MAX));
     const recs = e.agent.records();
+    // The default read: every job, minus what was handed out before. An
+    // explicit `since` or `all` is a deliberate re-read of what it names.
+    const delivery = detail == .selected and explicit == null;
+    const base: u64 = if (explicit) |s| @intCast(@max(s, 0)) else if (delivery) 0 else e.read_cursor;
     const jobs = try select.jobsAfter(arena, recs, base);
-    const sel = try select.select(arena, recs, jobs, .{ .detail = detail, .include_tools = argBool(args, "include_tools"), .limit = limit, .since = base });
+    const sel = try select.select(arena, recs, jobs, .{
+        .detail = detail,
+        .include_tools = argBool(args, "include_tools"),
+        .limit = limit,
+        .since = base,
+        .handed = if (delivery) &e.handed else null,
+    });
+    try e.handed.markSelection(e.allocator, recs, sel);
     var high = base;
     for (recs) |r| high = @max(high, r.id);
     // A paged `all` read goes on after its last record; any other covers everything.
     const next: u64 = if (sel.more) recs[sel.picked[sel.picked.len - 1]].id else high;
-    e.read_cursor = @max(e.read_cursor, next);
+    // Only `all` pages; the default read's delivery is per record.
+    if (detail == .all) e.read_cursor = @max(e.read_cursor, next);
 
     var res = Res.init(arena);
     const body = try writeSelection(arena, &res, recs, sel);
-    if (jobs.list.len == 0)
+    if (recs.len == 0)
         try res.text("no records yet")
+    else if (sel.jobs.len == 0)
+        try res.textf("nothing new since the last read; next_since {d}", .{next})
     else
-        try res.textf("{d} record(s) of job(s) {d}-{d}{s}; next_since {d}{s}", .{
+        try res.textf("{d} record(s) of job(s) {d}-{d}; next_since {d}{s}", .{
             sel.picked.len,
-            jobs.list[0],
-            jobs.list[jobs.list.len - 1],
-            if (jobs.fallback) " (nothing new: the latest job again)" else "",
+            sel.jobs[0].job,
+            sel.jobs[sel.jobs.len - 1].job,
             next,
             if (sel.more) " (more follow)" else "",
         });
@@ -2341,7 +2528,7 @@ fn readTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]const 
     try res.fact("next_since", next);
     try res.fact("more", sel.more);
     const blocks = [1]Block{.{ .name = "records", .body = body }};
-    return finish(arena, &res, e, try pending(arena, e), .{}, blocks[0..@intFromBool(jobs.list.len > 0)]);
+    return finish(arena, &res, e, try pending(arena, e), .{}, blocks[0..@intFromBool(sel.jobs.len > 0)]);
 }
 
 fn listTool(arena: std.mem.Allocator) ![]const u8 {
@@ -2372,7 +2559,7 @@ fn listTool(arena: std.mem.Allocator) ![]const u8 {
             .ready = e.agent.ready(),
             .session = e.session,
             .server_session = e.server_session,
-            .pending_events = e.cursor.pendingAlwaysOn(e.agent.queue()),
+            .pending_events = e.agent.queue().undelivered(),
             .waiting_on_user = e.agent.interaction() != null,
             .host = e.host,
             .transport = @tagName(e.transport),
@@ -2854,11 +3041,15 @@ test "the outcome of a wake-up is its highest-ranked kind" {
     var cur: events.Cursor = .{};
     const d = (try cur.take(&q, .{ .messages = true }, 0, testing.allocator)).?;
     defer testing.allocator.free(d.items);
-    try testing.expectEqualStrings("needs_input", outcomeOf(d.items, .waiting_user));
-    try testing.expectEqualStrings("done", outcomeOf(d.items[0..2], .idle));
-    try testing.expectEqualStrings("message", outcomeOf(d.items[0..1], .working));
-    try testing.expectEqualStrings(mcp_tools.OUTCOME_STILL_WORKING, outcomeOf(&.{}, .working));
-    try testing.expectEqualStrings("exited", outcomeOf(&.{}, .exited));
+    try testing.expectEqualStrings("needs_input", outcomeOf(d.items, .waiting_user, false));
+    try testing.expectEqualStrings("done", outcomeOf(d.items[0..2], .idle, false));
+    try testing.expectEqualStrings("message", outcomeOf(d.items[0..1], .working, false));
+    try testing.expectEqualStrings("still_working", outcomeOf(&.{}, .working, false));
+    try testing.expectEqualStrings("exited", outcomeOf(&.{}, .exited, true));
+    // A prompt the agent has not started on yet is sent, not working.
+    try testing.expectEqualStrings("sent", outcomeOf(&.{}, .idle, true));
+    try testing.expectEqualStrings("still_working", outcomeOf(&.{}, .working, true));
+    try testing.expectEqualStrings("still_working", outcomeOf(&.{}, .idle, false));
 }
 
 /// A configured instance in a temp dir, torn down by `deinit`.
@@ -3113,31 +3304,141 @@ test "the waiter socket: subscribe, wake once, and end when the agent closes" {
     try testing.expect(std.mem.indexOf(u8, woke, "connection_lost") == null);
     try testing.expect(std.mem.indexOf(u8, woke, "all done") != null);
 
-    // A follower from seq 0 sees everything, then the end on close.
+    // ONE delivery state: the done the waiter printed went into the same
+    // assistant's context, so no agent_* result hands it out again.
+    try testing.expectEqual(@as(usize, 0), e.agent.queue().undelivered());
+    try testing.expect((try e.cursor.take(e.agent.queue(), .{}, clock.nowMs(), arena_state.allocator())) == null);
+
+    // The same watch command, run again later, waits for what is new: it
+    // never re-wakes on an event already delivered (a baked-in cursor went
+    // stale). Two waiters armed on one agent: the first delivers, the
+    // other keeps waiting.
+    const tmpl = (try waiterTemplate(arena_state.allocator())).?;
+    try testing.expect(std.mem.indexOf(u8, tmpl, "--since") == null);
+    const again = try connectSub("{\"agent\":\"claude-1\"}\n");
+    defer _ = c.close(again);
+    const twin = try connectSub("{\"agent\":\"claude-1\"}\n");
+    defer _ = c.close(twin);
+    try testing.expectError(error.Timeout, readLineFor(again, &buf, 400));
+    _ = try ag.source.screen.queue.push(clock.nowMs(), .done, null, "second turn", "");
+    service(clock.nowMs());
+    var woken: usize = 0;
+    for ([_]c_int{ again, twin }) |fd| {
+        if (readLineFor(fd, &buf, 300)) |line| {
+            woken += 1;
+            try testing.expect(std.mem.indexOf(u8, line, "second turn") != null);
+            try testing.expect(std.mem.indexOf(u8, line, "all done") == null);
+        } else |_| {}
+    }
+    try testing.expectEqual(@as(usize, 1), woken);
+
+    // A tool call on the agent holds its waiters: the call's own result
+    // gets what happens meanwhile, never both.
+    hold(e);
+    _ = try ag.source.screen.queue.push(clock.nowMs(), .needs_input, null, "permission: rm", "");
+    service(clock.nowMs());
+    try testing.expect((try e.cursor.take(e.agent.queue(), .{}, clock.nowMs(), arena_state.allocator())) != null);
+    state.held_len = 0;
+
+    // A follower from seq 0 re-reads everything, delivered or not, then
+    // gets the end on close.
     const follow = try connectSub("{\"agent\":\"agent-claude-1\",\"follow\":true,\"since\":0}\n");
     defer _ = c.close(follow);
     const all = try readLine(follow, &buf);
     try testing.expect(std.mem.indexOf(u8, all, "connection_lost") != null);
     try testing.expect(std.mem.indexOf(u8, all, "all done") != null);
-    // The assistant's own cursor is untouched by the waiters.
-    try testing.expectEqual(@as(usize, 1), e.cursor.pendingAlwaysOn(e.agent.queue()));
-
-    // The same watch command, run again after a later call handed the
-    // assistant that done, waits for what is new: it never re-wakes on an
-    // event the assistant already has (a baked-in cursor went stale).
-    try testing.expect((try e.cursor.take(e.agent.queue(), .{}, clock.nowMs(), arena_state.allocator())) != null);
-    const tmpl = (try waiterTemplate(arena_state.allocator())).?;
-    try testing.expect(std.mem.indexOf(u8, tmpl, "--since") == null);
-    const again = try connectSub("{\"agent\":\"claude-1\"}\n");
-    defer _ = c.close(again);
-    try testing.expectError(error.Timeout, readLineFor(again, &buf, 400));
-    _ = try ag.source.screen.queue.push(clock.nowMs(), .done, null, "second turn", "");
-    const fresh = try readLine(again, &buf);
-    try testing.expect(std.mem.indexOf(u8, fresh, "second turn") != null);
-    try testing.expect(std.mem.indexOf(u8, fresh, "all done") == null);
+    try testing.expect(std.mem.indexOf(u8, all, "second turn") != null);
 
     _ = try closeTool(arena_state.allocator(), .null, e);
-    try testing.expect(std.mem.indexOf(u8, try readLine(follow, &buf), "agent closed") != null);
+    // The follower re-reads (since 0), so its later wake lines come first.
+    var used: usize = 0;
+    const deadline = clock.nowMs() + 3000;
+    while (std.mem.indexOf(u8, buf[0..used], "agent closed") == null) {
+        if (clock.nowMs() > deadline) return error.Timeout;
+        var pfd = c.struct_pollfd{ .fd = follow, .events = c.POLLIN, .revents = 0 };
+        if (c.poll(&pfd, 1, 50) <= 0) continue;
+        const n = c.read(follow, buf[used..].ptr, buf.len - used);
+        if (n <= 0) break;
+        used += @intCast(n);
+    }
+    try testing.expect(std.mem.indexOf(u8, buf[0..used], "agent closed") != null);
+}
+
+test "an event announcing a record carries its id and a one-line preview, never the text again" {
+    var rig: ToolRig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    const a = rig.arena.allocator();
+    const set = try adapters();
+    const e = try newEntry(set.get("claude").?, "claude-1", "agent-claude-1", "/bin/claude", "/");
+    const ag = try state.allocator.create(agent_mod.Agent);
+    ag.* = try agent_mod.Agent.initScreen(state.allocator, set.get("claude").?, .{});
+    e.agent = ag;
+    e.visible = .{ .borrowed = 4242 };
+    try state.entries.append(state.allocator, e);
+    const long = "first line of a long report\n" ++ "x" ** 3000;
+    _ = try ag.source.screen.queue.pushDone(clock.nowMs(), 0, long, 42, null);
+    _ = try ag.source.screen.queue.push(clock.nowMs(), .needs_input, null, "permission: rm", "1. Yes");
+    const read = try mcp.expectToolResultShape(a, "agent_read", try rig.call(.agent_read, "{}"));
+    const sc = read.object.get("structuredContent").?.object;
+    var saw_done = false;
+    for (sc.get("events").?.array.items) |ev| {
+        const kind = ev.object.get("kind").?.string;
+        if (!std.mem.eql(u8, kind, "done")) continue;
+        saw_done = true;
+        try testing.expectEqualStrings("first line of a long report", ev.object.get("text").?.string);
+        try testing.expectEqual(@as(i64, 42), ev.object.get("record").?.integer);
+    }
+    try testing.expect(saw_done);
+    // Nothing of the long text anywhere in the result.
+    const raw = try std.json.Stringify.valueAlloc(a, read, .{});
+    try testing.expect(std.mem.indexOf(u8, raw, "xxxxxxxxxx") == null);
+}
+
+test "the waiter --any: the first wake-up of several agents names its agent; a closed one is dropped" {
+    var rig: ToolRig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    const set = try adapters();
+    var ags: [2]*agent_mod.Agent = undefined;
+    for ([_][]const u8{ "claude-1", "claude-2" }, 0..) |id, i| {
+        const e = try newEntry(set.get("claude").?, id, id, "/bin/claude", "/");
+        const ag = try state.allocator.create(agent_mod.Agent);
+        ag.* = try agent_mod.Agent.initScreen(state.allocator, set.get("claude").?, .{});
+        e.agent = ag;
+        e.visible = .{ .borrowed = 4242 };
+        try state.entries.append(state.allocator, e);
+        ags[i] = ag;
+    }
+    // The terminals name nothing: take the connection_lost both report.
+    service(clock.nowMs());
+    for (state.entries.items) |e| _ = try e.cursor.take(e.agent.queue(), .{}, clock.nowMs(), rig.arena.allocator());
+
+    const fd = c.socket(c.AF_UNIX, c.SOCK_STREAM, 0);
+    defer _ = c.close(fd);
+    var addr: c.struct_sockaddr_un = undefined;
+    try @import("../mux/sockpath.zig").fillSockaddrUn(&addr, state.waiter.path.?);
+    try testing.expect(c.connect(fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un)) == 0);
+    const line = "{\"agent\":\"claude-1\",\"agents\":[\"claude-1\",\"claude-2\"],\"follow\":true}\n";
+    _ = c.write(fd, line, line.len);
+    var buf: [4096]u8 = undefined;
+    try testing.expectError(error.Timeout, readLineFor(fd, &buf, 300));
+    _ = try ags[1].source.screen.queue.push(clock.nowMs(), .done, null, "two finished", "");
+    const woke = try readLineFor(fd, &buf, 3000);
+    try testing.expect(std.mem.indexOf(u8, woke, "\"agent\":\"claude-2\"") != null);
+    try testing.expect(std.mem.indexOf(u8, woke, "two finished") != null);
+    // Closing one leaves the waiter on the other.
+    _ = try closeTool(rig.arena.allocator(), .null, state.entries.items[1]);
+    _ = try ags[0].source.screen.queue.push(clock.nowMs(), .done, null, "one finished", "");
+    const next = try readLineFor(fd, &buf, 3000);
+    try testing.expect(std.mem.indexOf(u8, next, "\"agent\":\"claude-1\"") != null);
+    // agent_wait agents: the same first-wins rule, through the tool.
+    _ = try ags[0].source.screen.queue.push(clock.nowMs(), .needs_input, null, "permission: x", "");
+    const waited = try shaped(rig.arena.allocator(), "agent_wait", try rig.call(.agent_wait, "{\"agents\":[\"claude-1\"],\"timeout_ms\":0}"));
+    try testing.expectEqualStrings("claude-1", waited.get("agent").?.string);
+    try testing.expectEqual(@as(usize, 1), waited.get("agents").?.array.items.len);
+    try expectError(rig.arena.allocator(), "agent_wait", try rig.call(.agent_wait, "{\"agents\":[\"nope-9\"]}"), "not_found");
+    try expectError(rig.arena.allocator(), "agent_wait", try rig.call(.agent_wait, "{\"agents\":\"claude-1\"}"), "invalid_args");
 }
 
 /// Read one waiter line within `ms`, servicing the server meanwhile.
@@ -3329,15 +3630,17 @@ test "every agent tool answers in its declared shape: a scripted Claude Code on 
     try testing.expectEqualStrings("echo: hello", sent_recs[0].object.get("text").?.string);
     try testing.expectEqual(@as(i64, 0), sent.get("jobs").?.array.items[0].object.get("job").?.integer);
 
+    // The done result handed the answer out: a read right after has
+    // nothing new (it used to repeat the job), and says so.
     const read = try shaped(a, "agent_read", try rig.call(.agent_read, "{}"));
-    const read_recs = read.get("records").?.array.items;
-    try testing.expectEqual(@as(usize, 1), read_recs.len);
-    try testing.expectEqualStrings("assistant", read_recs[0].object.get("kind").?.string);
+    try testing.expectEqual(@as(usize, 0), read.get("records").?.array.items.len);
+    try testing.expectEqual(@as(usize, 0), read.get("jobs").?.array.items.len);
     try testing.expectEqualStrings("selected", read.get("detail").?.string);
-    // Nothing unread: the latest job again; detail all with tools has the
-    // same (the fake app draws no tool call).
-    const again = try shaped(a, "agent_read", try rig.call(.agent_read, "{}"));
-    try testing.expectEqual(@as(usize, 1), again.get("records").?.array.items.len);
+    // A deliberate re-read returns it: an explicit since, or detail all.
+    const again = try shaped(a, "agent_read", try rig.call(.agent_read, "{\"since\":0}"));
+    const again_recs = again.get("records").?.array.items;
+    try testing.expectEqual(@as(usize, 1), again_recs.len);
+    try testing.expectEqualStrings("assistant", again_recs[0].object.get("kind").?.string);
     try testing.expectEqual(read.get("next_since").?.integer, again.get("next_since").?.integer);
     const all = try shaped(a, "agent_read", try rig.call(.agent_read, "{\"detail\":\"all\",\"include_tools\":true,\"since\":0}"));
     try testing.expectEqual(@as(usize, 1), all.get("records").?.array.items.len);

@@ -79,6 +79,10 @@ pub const Engine = struct {
     input_text: []u8 = &.{},
     status_rows: usize = 0,
     subagent_visible: bool = false,
+    /// Background tasks the screen says still run (0: none shown).
+    background_tasks: u32 = 0,
+    /// When the agent went idle with its turn unsettled by them.
+    background_since_ms: ?i64 = null,
 
     // Counters from the Screen, relative to the first feed.
     primed: bool = false,
@@ -409,6 +413,7 @@ pub const Engine = struct {
             self.input_text = try grammar.inputText(self.allocator, sc, self.rows.items, in);
         }
         self.subagent_visible = self.subagentInTail();
+        self.background_tasks = self.backgroundInTail();
 
         _ = self.interaction_arena.reset(.retain_capacity);
         self.interaction = try grammar.parseInteraction(self.interaction_arena.allocator(), sc, self.rows.items);
@@ -430,6 +435,26 @@ pub const Engine = struct {
             if (grammar.classify(self.sc, l) == .record) return false;
         }
         return false;
+    }
+
+    /// The count on a background line after the last record start (its
+    /// first number, 1 without one), 0 when none shows.
+    fn backgroundInTail(self: *const Engine) u32 {
+        const m = self.sc.background orelse return 0;
+        var i = self.rows.items.len;
+        while (i > 0) {
+            i -= 1;
+            const l = self.rows.items[i];
+            if (m.matches(l.text)) return firstNumber(l.text) orelse 1;
+            if (grammar.classify(self.sc, l) == .record) return 0;
+        }
+        return 0;
+    }
+
+    /// Milliseconds until the background cap fires a `done`, or null.
+    pub fn backgroundDueIn(self: *const Engine, now_ms: i64) ?i64 {
+        const since = self.background_since_ms orelse return null;
+        return @max(0, since + select.BACKGROUND_DONE_CAP_MS - now_ms);
     }
 
     // ── evaluation ───────────────────────────────────────────────
@@ -483,19 +508,39 @@ pub const Engine = struct {
             (if (self.subagent_visible) .waiting_subagent else .working)
         else if (self.subagent_visible)
             .waiting_subagent
+        else if (self.background_tasks > 0)
+            .waiting_background
         else
             .idle;
 
-        if (self.state == .idle and self.done_armed and self.captured_since_end) {
-            self.done_armed = false;
-            // An adapter command's turn is not a turn the assistant asked for.
-            const n = self.turns.items.len;
-            if (n > 0 and !self.turns.items[n - 1].hidden) {
-                const job: u32 = @intCast(n - 1);
-                const end = self.waker.segmentEnd(self.records.items, job);
-                if (end.wake) _ = try self.queue.pushDone(now_ms, job, end.answer);
-            }
-        }
+        const ended = self.done_armed and self.captured_since_end;
+        if (self.state == .waiting_background and ended) {
+            // Idle but unsettled: the segment's final is known now, the
+            // done waits for the background tasks (or the cap).
+            if (self.visibleJob()) |job| select.markFinal(self.records.items, job);
+            const since = self.background_since_ms orelse now_ms;
+            self.background_since_ms = since;
+            if (now_ms - since >= select.BACKGROUND_DONE_CAP_MS) try self.segmentDone(now_ms, self.background_tasks);
+        } else self.background_since_ms = null;
+        if (self.state == .idle and ended) try self.segmentDone(now_ms, null);
+    }
+
+    /// The latest job, unless it is an adapter command's hidden turn.
+    fn visibleJob(self: *const Engine) ?u32 {
+        const n = self.turns.items.len;
+        if (n == 0 or self.turns.items[n - 1].hidden) return null;
+        return @intCast(n - 1);
+    }
+
+    /// The turn settled (or the background cap ran out): push its done
+    /// when the re-wake rule says so.
+    fn segmentDone(self: *Engine, now_ms: i64, background: ?u32) !void {
+        self.done_armed = false;
+        self.background_since_ms = null;
+        // An adapter command's turn is not a turn the assistant asked for.
+        const job = self.visibleJob() orelse return;
+        const end = self.waker.segmentEnd(self.records.items, job);
+        if (end.wake) _ = try self.queue.pushDone(now_ms, job, end.answer, end.answer_id, background);
     }
 
     fn ackBells(self: *Engine) void {
@@ -786,7 +831,7 @@ pub const Engine = struct {
         for (self.records.items[turn.first..]) |*r| {
             if (r.kind != .assistant or r.announced) continue;
             r.announced = true;
-            _ = try self.queue.push(self.clock_ms, .message, null, r.text, "");
+            _ = try self.queue.pushMessage(self.clock_ms, r.text, r.id);
         }
     }
 
@@ -814,6 +859,13 @@ pub const Engine = struct {
 fn freeLines(allocator: std.mem.Allocator, list: *std.ArrayList(Line)) void {
     for (list.items) |l| allocator.free(l.text);
     if (list.capacity > 4096) list.clearAndFree(allocator) else list.clearRetainingCapacity();
+}
+
+fn firstNumber(text: []const u8) ?u32 {
+    const start = std.mem.indexOfAny(u8, text, "0123456789") orelse return null;
+    var end = start;
+    while (end < text.len and std.ascii.isDigit(text[end])) end += 1;
+    return std.fmt.parseInt(u32, text[start..end], 10) catch null;
 }
 
 fn titleBusy(sc: *const adapter.Screen, title: ?[]const u8) bool {
@@ -1098,6 +1150,117 @@ test "a turn the app starts on its own extends the job; only a substantive reply
     try t.expectEqual(vocab.EventKind.done, done.kind);
     try t.expectEqual(@as(?u32, 0), done.job);
     try t.expectEqual(@as(usize, 323), done.text.len);
+}
+
+/// The live block while a background shell runs (observed, 2.1.286: the
+/// mode line gains `·  N shell`, and loses it when the task ends).
+const live_bg = "[Haiku 4.5] repo:master\r\n[\xe2\x96\xa0\xe2\x96\xa1] 21%\r\nmanual mode on  \xc2\xb7  1 shell\r\n$";
+const summary_lines = ("s" ** 90 ++ "\r\n") ** 3 ++ "s" ** 90;
+
+/// A turn that started a background shell and answered with a summary,
+/// as claude draws it: idle again while the shell still runs.
+fn backgroundTurn(rig: *Rig) !void {
+    rig.write("\x1b]0;\xe2\x9c\xb3 C\x07" ++ live);
+    try rig.feed(0);
+    try rig.engine.tick(1000);
+    rig.write("\x1b]133;A\x07\x1b]0;\xe2\x97\x90 C\x07" ++ erase ++ "you: run it in the background, summarize\r\n" ++ live);
+    try rig.feed(1100);
+    rig.write(erase ++ "tool: Bash (sleep 40; echo BG-DONE)\r\nRunning in the background (\xe2\x86\x93 to manage)\r\nclaude: " ++ summary_lines ++ "\r\n" ++ live_bg);
+    try rig.feed(1200);
+    rig.write("\x1b]133;C\x07\x1b]133;D\x07\x07\x1b]0;\xe2\x9c\xb3 C\x07" ++ erase ++ "Cogitated for 10s \xc2\xb7 done\r\n" ++ live_bg);
+    try rig.feed(1300);
+    try rig.engine.tick(5000);
+}
+
+test "done means settled: idle with a background shell is waiting_background, the done comes after it" {
+    var rig: Rig = undefined;
+    try rig.init(100, 30);
+    defer rig.deinit();
+    try backgroundTurn(&rig);
+    try t.expectEqual(vocab.State.waiting_background, rig.engine.state);
+    try t.expectEqual(@as(u32, 1), rig.engine.background_tasks);
+    try t.expectEqual(@as(usize, 0), countKind(&rig.engine, .done));
+    // The segment's final is known already (it is selected by length).
+    try t.expect(rig.engine.records.items[2].segment_final);
+    try rig.engine.tick(40_000);
+    try t.expectEqual(@as(usize, 0), countKind(&rig.engine, .done));
+
+    // The shell ends: claude starts the wake turn in the same frame that
+    // drops the count, then answers below the previous footer.
+    rig.write("\x1b]0;\xe2\x97\x90 C\x07\x1b]133;A\x07" ++ erase ++ " Background command \"sleep\" completed (exit code 0)\r\nCreating\xe2\x80\xa6\r\n" ++ live);
+    try rig.feed(54_400);
+    try t.expectEqual(vocab.State.working, rig.engine.state);
+    rig.write("\x1b]133;C\x07\x1b]133;D\x07\x07\x1b]0;\xe2\x9c\xb3 C\x07" ++ erase ++ "claude: It printed BG-DONE.\r\nCrunched for 3s \xc2\xb7 done\r\n" ++ live);
+    try rig.feed(57_700);
+    try rig.engine.tick(60_000);
+    try t.expectEqual(vocab.State.idle, rig.engine.state);
+    try t.expectEqual(@as(usize, 1), countKind(&rig.engine, .done));
+    const done = rig.engine.queue.events.items[rig.engine.queue.events.items.len - 1];
+    try t.expectEqual(vocab.EventKind.done, done.kind);
+    try t.expect(done.background_tasks == null);
+    // The answer is the summary; the closing sentence is the job's last.
+    try t.expectEqual(@as(usize, 363), done.text.len);
+    const recs = rig.engine.records.items;
+    try t.expectEqualStrings("It printed BG-DONE.", recs[recs.len - 1].text);
+    try t.expectEqual(@as(usize, 1), rig.engine.turns.items.len);
+}
+
+test "a background task that never ends: done fires at the cap with the count" {
+    var rig: Rig = undefined;
+    try rig.init(100, 30);
+    defer rig.deinit();
+    try backgroundTurn(&rig);
+    const since = rig.engine.background_since_ms.?;
+    try t.expectEqual(select.BACKGROUND_DONE_CAP_MS, rig.engine.backgroundDueIn(since).?);
+    try rig.engine.tick(since + select.BACKGROUND_DONE_CAP_MS - 1);
+    try t.expectEqual(@as(usize, 0), countKind(&rig.engine, .done));
+    try rig.engine.tick(since + select.BACKGROUND_DONE_CAP_MS);
+    try t.expectEqual(@as(usize, 1), countKind(&rig.engine, .done));
+    const done = rig.engine.queue.events.items[rig.engine.queue.events.items.len - 1];
+    try t.expectEqual(@as(?u32, 1), done.background_tasks);
+    try t.expect(rig.engine.backgroundDueIn(since) == null);
+    // Once: still waiting_background, no second done.
+    try rig.engine.tick(since + 2 * select.BACKGROUND_DONE_CAP_MS);
+    try t.expectEqual(@as(usize, 1), countKind(&rig.engine, .done));
+    try t.expectEqual(vocab.State.waiting_background, rig.engine.state);
+}
+
+test "claude /compact: a notice, never the summary, and only the command's own done" {
+    var rig: Rig = undefined;
+    try rig.init(100, 30);
+    defer rig.deinit();
+    rig.write("\x1b]0;\xe2\x9c\xb3 C\x07" ++ live);
+    try rig.feed(0);
+    try rig.engine.tick(1000);
+    rig.write("\x1b]133;A\x07\x1b]0;\xe2\x97\x90 C\x07" ++ erase ++ "you: summarize it\r\nclaude: " ++ summary_lines ++ "\r\nclaude: and that is all.\r\n" ++ live ++
+        "\x1b]133;C\x07\x1b]133;D\x07\x07\x1b]0;\xe2\x9c\xb3 C\x07" ++ erase ++ "Cogitated for 10s \xc2\xb7 done\r\n" ++ live);
+    try rig.feed(1100);
+    try rig.engine.tick(5000);
+    try t.expectEqual(@as(usize, 1), countKind(&rig.engine, .done));
+    const before = rig.engine.records.items.len;
+
+    // Observed (2.1.286): the turn below the first prompt is erased and
+    // reprinted shorter with a compaction line; the summary is never drawn.
+    rig.write("\x1b]133;A\x07\x1b]0;\xe2\x97\x91 C\x07" ++ erase ++ "you: /compact\r\n" ++ live);
+    try rig.feed(6000);
+    rig.write("\x1b]133;C\x07\x1b]133;D\x07\x07\x1b]0;\xe2\x9c\xb3 C\x07\x1b[10A\x1b[J" ++
+        "Conversation compacted (ctrl+o for history)\r\nclaude: and that is all.\r\nCogitated for 10s \xc2\xb7 done\r\n" ++
+        "you: /compact\r\nCompacted (ctrl+o to see full summary)\r\nRead vocab.zig (158 lines)\r\n" ++ live);
+    try rig.feed(30_000);
+    try rig.engine.tick(40_000);
+    try t.expectEqual(vocab.State.idle, rig.engine.state);
+    const recs = rig.engine.records.items;
+    // The first job is kept as captured; the command's job has its prompt
+    // and the compaction notice, and no assistant message.
+    try t.expectEqual(before + 2, recs.len);
+    try t.expectEqual(vocab.RecordKind.notice, recs[recs.len - 1].kind);
+    try t.expect(std.mem.startsWith(u8, recs[recs.len - 1].text, "Compacted ("));
+    for (recs[before..]) |r| try t.expect(r.kind != .assistant);
+    // Its own done (a new job), and no other.
+    try t.expectEqual(@as(usize, 2), countKind(&rig.engine, .done));
+    const done = rig.engine.queue.events.items[rig.engine.queue.events.items.len - 1];
+    try t.expectEqual(@as(?u32, 1), done.job);
+    try t.expectEqualStrings("", done.text);
 }
 
 test "a clear-and-reprint never duplicates, shrinks or re-adds a turn" {

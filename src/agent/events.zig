@@ -5,13 +5,24 @@
 //! call returning "events since last time") owns a `Cursor` and calls
 //! `Cursor.take`, which never blocks: blocking waits are the caller's loop.
 //!
-//! Always-on kinds (`vocab.EventKind.alwaysOn`) are delivered to every
+//! Delivery is ONE state per agent, on the events themselves
+//! (`Event.delivered`): every consumer hands its output to the same
+//! assistant, so an event any of them delivered is delivered for all and
+//! no other consumer wakes for it again. A cursor only remembers which
+//! opt-in events it examined, so a consumer that did not want a message
+//! leaves it for one that does. A cursor built `replay` (an explicit
+//! `since`) re-reads everything after it, delivered or not.
+//!
+//! Default-wake events (`wakesByDefault`: an always-on kind, and for an
+//! `error` a class that `vocab.ErrorClass.wakesByDefault`) wake every
 //! consumer, never rate limited; repeats of a coalescing kind within
 //! `dedupe_window_ms` fold into the earlier event's `count` at push time.
-//! Opt-in kinds go through the agent's ONE `TokenBucket` (shared by all its
-//! consumers); a blocked one is not dropped but counted into the cursor's
-//! digest, which rides the next delivery that has items (the current one
-//! included) or is delivered alone once the bucket has a token again.
+//! Opt-in messages go through the agent's ONE `TokenBucket` (shared by all
+//! its consumers); a blocked one is not dropped but counted into the
+//! cursor's digest, which rides the next delivery that has items (the
+//! current one included) or is delivered alone once the bucket has a token
+//! again. An opted-in `retrying` error bypasses the bucket (it is surfaced
+//! once per episode and coalesces).
 //!
 //! Only `message` occurrences are stored for the opt-in side: `match` is
 //! derived at delivery from the consumer's filter, so one stored message
@@ -20,6 +31,30 @@
 const std = @import("std");
 const vocab = @import("vocab.zig");
 const TokenBucket = @import("../util/tokenbucket.zig").TokenBucket;
+
+/// Bytes of an event's text a result shows when the record it announces
+/// rides the same result (the text is that record's, never repeated).
+pub const PREVIEW_MAX = 120;
+
+/// `s` cut to at most `max` bytes on a UTF-8 boundary.
+pub fn clip(s: []const u8, max: usize) []const u8 {
+    if (s.len <= max) return s;
+    var end = max;
+    while (end > 0 and (s[end] & 0xC0) == 0x80) end -= 1;
+    return s[0..end];
+}
+
+/// The first line of `s`, trimmed.
+pub fn firstLine(s: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, s, " \t\r\n");
+    const nl = std.mem.indexOfScalar(u8, trimmed, '\n') orelse trimmed.len;
+    return std.mem.trimEnd(u8, trimmed[0..nl], " \t\r");
+}
+
+/// A one-line preview of a record's text.
+pub fn preview(s: []const u8) []const u8 {
+    return clip(firstLine(s), PREVIEW_MAX);
+}
 
 pub const Event = struct {
     seq: u64,
@@ -36,6 +71,20 @@ pub const Event = struct {
     detail: []u8,
     /// `done`: the job whose segment ended (`select.zig`).
     job: ?u32 = null,
+    /// `done` and `message`: the record whose text `text` is (the job's
+    /// answer, the completed message); null for a done without one.
+    record: ?u64 = null,
+    /// `done` fired at the background cap: background tasks still running.
+    background_tasks: ?u32 = null,
+    /// Handed to the assistant by some consumer.
+    delivered: bool = false,
+
+    /// Wakes every consumer without being asked for.
+    pub fn wakesByDefault(self: *const Event) bool {
+        if (!self.kind.alwaysOn()) return false;
+        const cls = self.class orelse return true;
+        return cls.wakesByDefault();
+    }
 };
 
 pub const Limits = struct {
@@ -110,10 +159,31 @@ pub const Queue = struct {
 
     /// Record that `job`'s segment ended with `text` as its answer.
     /// @return the seq.
-    pub fn pushDone(self: *Queue, now_ms: i64, job: u32, text: []const u8) !u64 {
+    /// @param record the answer's record, null when the job has none.
+    /// @param background_tasks set when it fired with background tasks still running.
+    pub fn pushDone(self: *Queue, now_ms: i64, job: u32, text: []const u8, record: ?u64, background_tasks: ?u32) !u64 {
         const seq = try self.push(now_ms, .done, null, text, "");
-        self.events.items[self.events.items.len - 1].job = job;
+        const ev = &self.events.items[self.events.items.len - 1];
+        ev.job = job;
+        ev.record = record;
+        ev.background_tasks = background_tasks;
         return seq;
+    }
+
+    /// Record that assistant message `record` completed with `text`.
+    pub fn pushMessage(self: *Queue, now_ms: i64, text: []const u8, record: u64) !u64 {
+        const seq = try self.push(now_ms, .message, null, text, "");
+        self.events.items[self.events.items.len - 1].record = record;
+        return seq;
+    }
+
+    /// Default-wake events no consumer has delivered yet.
+    pub fn undelivered(self: *const Queue) usize {
+        var n: usize = 0;
+        for (self.events.items) |*ev| {
+            if (!ev.delivered and ev.wakesByDefault()) n += 1;
+        }
+        return n;
     }
 
     /// The stored event with `seq`, or null when evicted or never pushed.
@@ -125,11 +195,13 @@ pub const Queue = struct {
     }
 };
 
-/// What a consumer asked to be woken for besides the always-on kinds.
+/// What a consumer asked to be woken for besides the default-wake events.
 pub const Filter = struct {
     messages: bool = false,
     /// Case-insensitive substring of a completed assistant message.
     match: ?[]const u8 = null,
+    /// Also `error` events whose class does not wake by default.
+    retrying: bool = false,
 
     /// The kind a stored message is delivered as, or null when not wanted.
     fn classify(self: Filter, text: []const u8) ?vocab.EventKind {
@@ -137,6 +209,11 @@ pub const Filter = struct {
             if (m.len > 0 and std.ascii.indexOfIgnoreCase(text, m) != null) return .match;
         }
         return if (self.messages) .message else null;
+    }
+
+    /// An always-on kind held back by its class, which this filter opts into.
+    fn wantsQuiet(self: Filter, ev: *const Event) bool {
+        return self.retrying and ev.kind.alwaysOn() and !ev.wakesByDefault();
     }
 };
 
@@ -161,21 +238,42 @@ pub const Delivery = struct {
 };
 
 pub const Cursor = struct {
-    /// Highest seq examined.
+    /// Highest seq this consumer examined: opt-in events at or below it
+    /// are not examined again (a default-wake one is, until delivered).
     seen: u64 = 0,
+    /// Re-read everything after `seen` once, delivered or not (an
+    /// explicit `since`).
+    replay: bool = false,
     digest: ?Digest = null,
 
-    /// Everything undelivered that wakes this consumer, or null.
+    /// A consumer that wakes for undelivered events, and for opt-in ones
+    /// after `seen`.
+    pub fn after(seen: u64) Cursor {
+        return .{ .seen = seen };
+    }
+
+    /// A consumer that wants every event after `since`, delivered or not.
+    pub fn replayFrom(since: u64) Cursor {
+        return .{ .seen = since, .replay = true };
+    }
+
+    /// Everything that wakes this consumer and nobody delivered yet (a
+    /// replaying one: everything after its mark), or null. What it returns
+    /// is marked delivered for every consumer of the queue.
     /// @param alloc owns the returned `items` slice.
     pub fn take(self: *Cursor, q: *Queue, filter: Filter, now_ms: i64, alloc: std.mem.Allocator) !?Delivery {
         var items: std.ArrayList(Item) = .empty;
         errdefer items.deinit(alloc);
         for (q.events.items) |*ev| {
-            if (ev.seq <= self.seen) continue;
-            if (ev.kind.alwaysOn()) {
+            const fresh = ev.seq > self.seen;
+            if (self.replay) {
+                if (!fresh) continue;
+            } else if (ev.delivered) continue;
+            if (ev.wakesByDefault() or (fresh and filter.wantsQuiet(ev))) {
                 try items.append(alloc, .{ .kind = ev.kind, .event = ev });
                 continue;
             }
+            if (!fresh or ev.kind.alwaysOn()) continue;
             const as = filter.classify(ev.text) orelse continue;
             if (q.bucket.take(now_ms)) {
                 try items.append(alloc, .{ .kind = as, .event = ev });
@@ -185,6 +283,7 @@ pub const Cursor = struct {
             }
         }
         self.seen = q.next_seq - 1;
+        for (items.items) |it| @constCast(it.event).delivered = true;
         if (items.items.len == 0) {
             items.deinit(alloc);
             // A held-back digest is delivered alone once a token is back.
@@ -204,16 +303,6 @@ pub const Cursor = struct {
         if (self.digest == null) return null;
         return q.bucket.msUntilToken(now_ms);
     }
-
-    /// Always-on events this consumer has not been handed yet, without
-    /// taking them (a listing reports the count and leaves the delivery).
-    pub fn pendingAlwaysOn(self: *const Cursor, q: *const Queue) usize {
-        var n: usize = 0;
-        for (q.events.items) |ev| {
-            if (ev.seq > self.seen and ev.kind.alwaysOn()) n += 1;
-        }
-        return n;
-    }
 };
 
 // ── tests ────────────────────────────────────────────────────────
@@ -230,10 +319,10 @@ test "always-on events are delivered in order and advance the cursor" {
     var c: Cursor = .{};
     _ = try q.push(0, .needs_input, null, "Do you want to proceed?", "");
     _ = try q.push(5, .done, null, "final answer", "");
-    try t.expectEqual(@as(usize, 2), c.pendingAlwaysOn(&q));
+    try t.expectEqual(@as(usize, 2), q.undelivered());
     const d = (try c.take(&q, .{}, 10, t.allocator)).?;
     defer t.allocator.free(d.items);
-    try t.expectEqual(@as(usize, 0), c.pendingAlwaysOn(&q));
+    try t.expectEqual(@as(usize, 0), q.undelivered());
     try t.expectEqual(@as(usize, 2), d.items.len);
     try t.expectEqual(vocab.EventKind.needs_input, d.items[0].kind);
     try t.expectEqual(@as(u64, 2), d.items[1].event.seq);
@@ -319,6 +408,76 @@ test "an always-on event bypasses the empty bucket and carries the pending diges
     try t.expectEqualStrings("resets 5pm", b.items[0].event.detail);
     try t.expect(b.digest != null);
     try t.expectEqual(@as(u32, 1), b.digest.?.count);
+}
+
+test "one delivery state: what one consumer delivered never wakes another" {
+    var q = Queue.init(t.allocator, .{});
+    defer q.deinit();
+    // The assistant's tool calls and two waiters on the same agent.
+    var tool: Cursor = .{};
+    var w1: Cursor = .{};
+    var w2: Cursor = .{};
+    _ = try q.push(0, .done, null, "first", "");
+    const a = (try w1.take(&q, .{}, 0, t.allocator)).?;
+    defer t.allocator.free(a.items);
+    try t.expectEqual(@as(usize, 1), a.items.len);
+    // Delivered by the first waiter: the other waiter and the tool keep waiting.
+    try t.expect((try w2.take(&q, .{}, 0, t.allocator)) == null);
+    try t.expect((try tool.take(&q, .{}, 0, t.allocator)) == null);
+    // The next one goes to whoever takes first, once.
+    _ = try q.push(1, .needs_input, null, "permission: rm", "");
+    const b = (try tool.take(&q, .{}, 1, t.allocator)).?;
+    defer t.allocator.free(b.items);
+    try t.expectEqual(@as(usize, 1), b.items.len);
+    try t.expect((try w1.take(&q, .{}, 1, t.allocator)) == null);
+    try t.expect((try w2.take(&q, .{}, 1, t.allocator)) == null);
+    // A message the tool did not ask for is left for a waiter that did.
+    _ = try q.push(2, .message, null, "progress", "");
+    try t.expect((try tool.take(&q, .{}, 2, t.allocator)) == null);
+    const m = (try w2.take(&q, .{ .messages = true }, 2, t.allocator)).?;
+    defer t.allocator.free(m.items);
+    try t.expectEqual(vocab.EventKind.message, m.items[0].kind);
+    try t.expect((try w1.take(&q, .{ .messages = true }, 2, t.allocator)) == null);
+    // An explicit since re-reads everything after it, delivered or not.
+    var again = Cursor.replayFrom(0);
+    const r = (try again.take(&q, .{}, 3, t.allocator)).?;
+    defer t.allocator.free(r.items);
+    try t.expectEqual(@as(usize, 2), r.items.len);
+    try t.expect((try again.take(&q, .{}, 3, t.allocator)) == null);
+}
+
+test "a retrying error wakes only a consumer that opted in; other errors always" {
+    var q = Queue.init(t.allocator, .{});
+    defer q.deinit();
+    _ = try q.push(0, .@"error", .retrying, "servers overloaded", "");
+    try t.expectEqual(@as(usize, 0), q.undelivered());
+    var plain: Cursor = .{};
+    try t.expect((try plain.take(&q, .{}, 0, t.allocator)) == null);
+    var opted: Cursor = .{};
+    const d = (try opted.take(&q, .{ .retrying = true }, 0, t.allocator)).?;
+    defer t.allocator.free(d.items);
+    try t.expectEqual(vocab.ErrorClass.retrying, d.items[0].event.class.?);
+    try t.expect((try opted.take(&q, .{ .retrying = true }, 0, t.allocator)) == null);
+    // The retry turned into a real error: that wakes everyone.
+    _ = try q.push(1, .@"error", .api, "Repeated 529 Overloaded errors", "");
+    const e = (try plain.take(&q, .{}, 1, t.allocator)).?;
+    defer t.allocator.free(e.items);
+    try t.expectEqual(vocab.ErrorClass.api, e.items[0].event.class.?);
+}
+
+test "a preview is the first line, cut on a UTF-8 boundary at PREVIEW_MAX bytes" {
+    try t.expectEqualStrings("first line", preview("  first line \nsecond"));
+    const long = "\xc3\xa9" ** 100;
+    const p = preview(long);
+    try t.expect(p.len <= PREVIEW_MAX);
+    try t.expect(std.unicode.utf8ValidateSlice(p));
+    var q = Queue.init(t.allocator, .{});
+    defer q.deinit();
+    _ = try q.pushMessage(0, "msg", 7);
+    _ = try q.pushDone(0, 2, "msg", 7, null);
+    try t.expectEqual(@as(?u64, 7), q.events.items[0].record);
+    try t.expectEqual(@as(?u64, 7), q.events.items[1].record);
+    try t.expectEqual(@as(?u32, 2), q.events.items[1].job);
 }
 
 test "coalescing kinds fold repeats within the window, done never does" {

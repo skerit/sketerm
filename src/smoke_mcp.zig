@@ -6411,6 +6411,31 @@ const Waiter = struct {
         return .{ .pid = pid, .fd = pipe[0] };
     }
 
+    /// Whether it printed `needle` at least `count` times within `timeout_ms`.
+    fn waitFor(self: *Waiter, allocator: std.mem.Allocator, needle: []const u8, count: usize, timeout_ms: i64) bool {
+        const deadline = nowMs() + timeout_ms;
+        while (std.mem.count(u8, self.out.items, needle) < count) {
+            if (nowMs() > deadline) return false;
+            var pfd = c.struct_pollfd{ .fd = self.fd, .events = c.POLLIN, .revents = 0 };
+            if (c.poll(&pfd, 1, 100) <= 0) continue;
+            var buf: [4096]u8 = undefined;
+            const n = c.read(self.fd, &buf, buf.len);
+            if (n <= 0) {
+                _ = c.usleep(50_000);
+                continue;
+            }
+            self.out.appendSlice(allocator, buf[0..@intCast(n)]) catch fail("oom");
+        }
+        return true;
+    }
+
+    /// End it (this pid only) whether or not it exited by itself.
+    fn stop(self: *Waiter) void {
+        _ = c.kill(self.pid, c.SIGKILL);
+        _ = c.waitpid(self.pid, &self.status, 0);
+        _ = c.close(self.fd);
+    }
+
     /// Everything it printed until it exited, or fail at the deadline.
     fn finish(self: *Waiter, allocator: std.mem.Allocator, timeout_ms: i64, comptime what: []const u8) []const u8 {
         const deadline = nowMs() + timeout_ms;
@@ -6448,6 +6473,16 @@ fn waitUnlisted(allocator: std.mem.Allocator, sock: []const u8, name: []const u8
     while (sessionListed(allocator, sock, name)) {
         if (nowMs() > deadline) fail(what ++ ": the session is still on the daemon");
         _ = c.usleep(100_000);
+    }
+}
+
+/// A send that returned at once: `sent` while the agent had not started
+/// on the prompt yet, `still_working` once it had.
+fn expectSentOrWorking(o: std.json.ObjectMap, comptime what: []const u8) void {
+    const got = scStr(o, "outcome", what);
+    if (!std.mem.eql(u8, got, "sent") and !std.mem.eql(u8, got, "still_working")) {
+        say(got);
+        fail(what);
     }
 }
 
@@ -6607,14 +6642,19 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
         // The done carried its job's selection: the answer, not the prompt.
         const sent_recs = (sent.get("records") orelse fail("agent_send: no records with the done")).array.items;
         if (sent_recs.len != 1 or !std.mem.eql(u8, sent_recs[0].object.get("text").?.string, "echo: hello there")) fail("agent_send: the done's records are not its job's answer");
-        // Unread, the job reads the same: its answer, never the prompt.
+        // Delivery is per record: the done handed the answer out, so a read
+        // right after has nothing new (it used to repeat the whole job).
         const read = agentCall(&m, arena, "agent_read", "{\"agent\":\"claude-1\"}", "agent_read", false, 15_000);
-        const recs = read.get("records").?.array.items;
-        if (recs.len != 1) fail("agent_read: expected the one assistant record of one job");
+        if (read.get("records").?.array.items.len != 0 or read.get("jobs").?.array.items.len != 0)
+            fail("agent_read: repeated what the done result already handed out");
+        // A deliberate re-read returns it: the answer, never the prompt.
+        const reread = agentCall(&m, arena, "agent_read", "{\"agent\":\"claude-1\",\"since\":0}", "agent_read since 0", false, 15_000);
+        const recs = reread.get("records").?.array.items;
+        if (recs.len != 1) fail("agent_read since 0: expected the one assistant record of one job");
         if (!std.mem.eql(u8, recs[0].object.get("kind").?.string, "assistant") or !std.mem.eql(u8, recs[0].object.get("text").?.string, "echo: hello there"))
-            fail("agent_read: wrong records");
-        if (read.get("jobs").?.array.items.len != 1) fail("agent_read: expected one job");
-        var since = read.get("next_since").?.integer;
+            fail("agent_read since 0: wrong records");
+        if (reread.get("jobs").?.array.items.len != 1) fail("agent_read since 0: expected one job");
+        const since = read.get("next_since").?.integer;
 
         // A permission prompt waits for its answer.
         const asked = agentCall(&m, arena, "agent_send", "{\"agent\":\"claude-1\",\"text\":\"please ask permission\",\"timeout_ms\":20000}", "agent_send permission", false, 45_000);
@@ -6650,9 +6690,9 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
         // The loop observes agents between calls, and a turn that ended
         // while an unrelated call blocked the loop reads correctly after.
         const slow = agentCall(&m, arena, "agent_send", "{\"agent\":\"claude-1\",\"text\":\"slow reply\",\"timeout_ms\":0}", "agent_send slow", false, 15_000);
-        expectFact(slow, "outcome", "still_working", "agent_send slow: outcome");
-        const before_slow = agentCall(&m, arena, "agent_read", "{\"agent\":\"claude-1\"}", "agent_read before slow", false, 15_000);
-        since = before_slow.get("next_since").?.integer;
+        expectSentOrWorking(slow, "agent_send slow: outcome");
+        // Everything before the slow turn, handed out now.
+        _ = agentCall(&m, arena, "agent_read", "{\"agent\":\"claude-1\"}", "agent_read before slow", false, 15_000);
         var one_shot = Waiter.start(scStr(slow, "watch_command", "agent_send slow"));
         const term = agentCall(&m, arena, "term_open", "{}", "term_open", false, 30_000);
         const term_id = term.get("term").?.integer;
@@ -6663,22 +6703,56 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
             fail("the one-shot waiter did not print the done wake-up");
         }
         if (one_shot.status != 0) fail("the one-shot waiter did not exit 0");
-        const slow_done = agentCall(&m, arena, "agent_wait", "{\"agent\":\"claude-1\",\"timeout_ms\":5000}", "agent_wait slow", false, 15_000);
-        expectFact(slow_done, "outcome", "done", "agent_wait slow: outcome");
-        expectFact(slow_done, "message", "echo: slow reply", "agent_wait slow: message");
-        const slow_read = agentCall(&m, arena, "agent_read", std.fmt.allocPrint(arena, "{{\"agent\":\"claude-1\",\"since\":{d}}}", .{since}) catch fail("oom"), "agent_read slow", false, 15_000);
-        // The turn was captured once, late: its answer, once.
+        // ONE delivery state: the waiter's line went into the assistant's
+        // context, so agent_wait does not wake for that done again...
+        const slow_done = agentCall(&m, arena, "agent_wait", "{\"agent\":\"claude-1\",\"timeout_ms\":1500}", "agent_wait slow", false, 15_000);
+        expectFact(slow_done, "outcome", "still_working", "agent_wait slow: the waiter's done woke the tool again");
+        if (eventKinds(slow_done, "done") != 0) fail("agent_wait slow: repeated the done the waiter delivered");
+        // ...but the waiter marks no record: the read returns the answer,
+        // captured once though observed late, and a second read nothing.
+        const slow_read = agentCall(&m, arena, "agent_read", "{\"agent\":\"claude-1\"}", "agent_read slow", false, 15_000);
         const slow_recs = slow_read.get("records").?.array.items;
         if (slow_recs.len != 1 or !std.mem.eql(u8, slow_recs[0].object.get("text").?.string, "echo: slow reply")) {
             say(std.json.Stringify.valueAlloc(arena, slow_read.get("records").?, .{}) catch "?");
             fail("agent_read: the late-observed turn is not exactly its answer");
         }
+        const slow_again = agentCall(&m, arena, "agent_read", "{\"agent\":\"claude-1\"}", "agent_read slow again", false, 15_000);
+        if (slow_again.get("records").?.array.items.len != 0) fail("agent_read: a second read repeated a record");
         _ = agentCall(&m, arena, "term_close", std.fmt.allocPrint(arena, "{{\"term\":{d}}}", .{term_id}) catch fail("oom"), "term_close", false, 15_000);
 
-        // --follow: one line per wake-up, then `watch ended` on close.
+        // Two waiters armed on one agent: the first delivers, the other
+        // keeps waiting.
+        const lone_cmd = scStr(slow_done, "watch_command", "agent_wait slow");
+        var twin_a = Waiter.start(lone_cmd);
+        var twin_b = Waiter.start(lone_cmd);
+        _ = c.usleep(300_000);
+        _ = agentCall(&m, arena, "agent_send", "{\"agent\":\"claude-1\",\"text\":\"slow twins\",\"timeout_ms\":0}", "agent_send twins", false, 15_000);
+        const a_woke = twin_a.waitFor(arena, "claude-1 done", 1, 8_000);
+        const b_woke = twin_b.waitFor(arena, "claude-1 done", 1, if (a_woke) 2_000 else 8_000);
+        if (a_woke == b_woke) {
+            say(twin_a.out.items);
+            say(twin_b.out.items);
+            fail("two waiters on one agent: expected exactly one to wake");
+        }
+        twin_a.stop();
+        twin_b.stop();
+
+        // --follow: one line per wake-up (turns that end between calls; a
+        // call on the agent gets its own), then `watch ended` on close.
         const follow_cmd = std.fmt.allocPrint(arena, "{s} --follow", .{scStr(slow_done, "watch_command", "agent_wait slow")}) catch fail("oom");
         var follower = Waiter.start(follow_cmd);
         _ = c.usleep(300_000);
+        for (1..3) |n| {
+            // Distinct prompts: the same prompt and answer again would read
+            // as the app reprinting its last turn.
+            const bg = agentCall(&m, arena, "agent_send", std.fmt.allocPrint(arena, "{{\"agent\":\"claude-1\",\"text\":\"slow again {d}\",\"timeout_ms\":0}}", .{n}) catch fail("oom"), "agent_send slow again", false, 15_000);
+            expectSentOrWorking(bg, "agent_send slow again: outcome");
+            if (!follower.waitFor(arena, "claude-1 done", n, 15_000)) {
+                say(follower.out.items);
+                fail("the --follow waiter missed a turn that ended between calls");
+            }
+        }
+        _ = agentCall(&m, arena, "agent_read", "{\"agent\":\"claude-1\"}", "agent_read after follow", false, 15_000);
         const again = agentCall(&m, arena, "agent_send", "{\"agent\":\"claude-1\",\"text\":\"hello again\",\"timeout_ms\":20000}", "agent_send again", false, 45_000);
         expectFact(again, "outcome", "done", "agent_send again: outcome");
         const more = agentCall(&m, arena, "agent_send", "{\"agent\":\"claude-1\",\"text\":\"and once more\",\"timeout_ms\":20000}", "agent_send more", false, 45_000);
@@ -6731,6 +6805,28 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
             if (fileExists(fcPath(&sb, FC_SETTINGS_WRITTEN))) fail("something wrote the user's default settings (/effort or a picker's Enter)");
         }
 
+        // Several agents: agent_wait `agents` hands out one --any command,
+        // which wakes on the first of them and names it.
+        const second = agentCall(&m, arena, "agent_open", std.fmt.allocPrint(arena, "{{\"app\":\"claude\",\"binary\":{s},\"timeout_ms\":30000{s}}}", .{ bin_json, extraJson(arena) }) catch fail("oom"), "agent_open claude-2", false, 45_000);
+        expectFact(second, "agent", "claude-2", "agent_open: second agent id");
+        const both = agentCall(&m, arena, "agent_wait", "{\"agents\":[\"claude-1\",\"claude-2\"],\"timeout_ms\":0}", "agent_wait agents", false, 15_000);
+        expectFact(both, "outcome", "still_working", "agent_wait agents: outcome");
+        if (both.get("agents").?.array.items.len != 2) fail("agent_wait agents: the agents fact");
+        const any_cmd = scStr(both, "watch_command", "agent_wait agents");
+        if (std.mem.indexOf(u8, any_cmd, " --any ") == null or !std.mem.endsWith(u8, any_cmd, " claude-1 claude-2")) {
+            say(any_cmd);
+            fail("agent_wait agents: watch_command is not an --any waiter on both");
+        }
+        var any_waiter = Waiter.start(any_cmd);
+        _ = c.usleep(300_000);
+        _ = agentCall(&m, arena, "agent_send", "{\"agent\":\"claude-2\",\"text\":\"slow from two\",\"timeout_ms\":0}", "agent_send claude-2", false, 15_000);
+        const any_out = any_waiter.finish(arena, 15_000, "--any waiter");
+        if (std.mem.indexOf(u8, any_out, "claude-2 done: echo: slow from two") == null) {
+            say(any_out);
+            fail("the --any waiter did not wake on the second agent, by name");
+        }
+        _ = agentCall(&m, arena, "agent_close", "{\"agent\":\"claude-2\"}", "agent_close claude-2", false, 15_000);
+
         const closed = agentCall(&m, arena, "agent_close", "{\"agent\":\"claude-1\"}", "agent_close claude", false, 15_000);
         if (!closed.get("closed").?.bool or closed.get("sessions").?.array.items.len != 1) fail("agent_close: did not close the one session");
         const followed = follower.finish(arena, 15_000, "follow waiter");
@@ -6747,7 +6843,7 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
         }
         waitUnlisted(allocator, mux_sock, "agent-claude-1", "agent_close claude");
         if (!fileExists(claude_cast)) fail("the agent's recording does not exist");
-        say("smoke-mcp: agents: fake Claude Code (open, send, read, permission, match, flood, waiters, late backlog, model, effort relaunch, recording, close) ok");
+        say("smoke-mcp: agents: fake Claude Code (open, send, read once per record, permission, match, flood, shared waiter delivery, two waiters, --any, late backlog, model, effort relaunch, recording, close) ok");
 
         // ── opencode (API source) ───────────────────────────────────
         resetStarts();

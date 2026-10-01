@@ -12,6 +12,15 @@
 //! segment final of at least `FINAL_MIN_CHARS`, any message of at least
 //! `LONG_MIN_CHARS`, every notice, tool records only on request, never a
 //! user prompt (the caller sent it). The rest is counted, never listed.
+//!
+//! Delivery is per RECORD (`Handed`): a default read and every `done`
+//! result return only selected records the assistant was not handed
+//! before; a selected one it was handed is never repeated, a job says so
+//! in one pointer (`JobSummary.earlier`). An explicit `since` or `all`
+//! re-reads regardless. Record ids restart when a durable instance
+//! reattaches (the app's transcript is read again), so the handed-out
+//! state is not persisted: the first read after a reattach returns the
+//! selection again.
 
 const std = @import("std");
 const vocab = @import("vocab.zig");
@@ -31,6 +40,10 @@ pub const LONG_MIN_CHARS: usize = 1500;
 /// Characters of record text one selected read returns at most; the
 /// newest job's last message is returned whole even beyond it.
 pub const READ_CAP_CHARS: usize = 12_000;
+/// A `done` waits while the agent sits idle with background tasks still
+/// running, at most this long; then it fires with their count, so a
+/// server left running on purpose never means silence forever.
+pub const BACKGROUND_DONE_CAP_MS: i64 = 30 * 60_000;
 
 pub const Detail = enum {
     /// Per job: the selection, the rest counted.
@@ -73,16 +86,45 @@ fn lastMessage(records: []const Record, job: u32) ?usize {
 /// The job's answer: its most recent selected message of at least
 /// `FINAL_MIN_CHARS`, else its last message ("" when it has none).
 pub fn answer(records: []const Record, job: u32) []const u8 {
-    const last = lastMessage(records, job) orelse return "";
+    const i = answerIndex(records, job) orelse return "";
+    return records[i].text;
+}
+
+/// The index of `answer`'s record, or null when the job has no message.
+pub fn answerIndex(records: []const Record, job: u32) ?usize {
+    const last = lastMessage(records, job) orelse return null;
     var i = last + 1;
     while (i > 0) {
         i -= 1;
         const r = records[i];
         if (r.job != job or r.kind != .assistant) continue;
-        if ((i == last or substantive(r)) and chars(r.text) >= FINAL_MIN_CHARS) return r.text;
+        if ((i == last or substantive(r)) and chars(r.text) >= FINAL_MIN_CHARS) return i;
     }
-    return records[last].text;
+    return last;
 }
+
+/// The record ids handed to the assistant, per agent.
+pub const Handed = struct {
+    ids: std.DynamicBitSetUnmanaged = .{},
+
+    pub fn deinit(self: *Handed, alloc: std.mem.Allocator) void {
+        self.ids.deinit(alloc);
+    }
+
+    pub fn has(self: *const Handed, id: u64) bool {
+        return id < self.ids.bit_length and self.ids.isSet(@intCast(id));
+    }
+
+    pub fn mark(self: *Handed, alloc: std.mem.Allocator, id: u64) !void {
+        if (id >= self.ids.bit_length) try self.ids.resize(alloc, @max(@as(usize, @intCast(id)) + 1, self.ids.bit_length * 2), false);
+        self.ids.set(@intCast(id));
+    }
+
+    /// Mark every record `sel` returns.
+    pub fn markSelection(self: *Handed, alloc: std.mem.Allocator, records: []const Record, sel: Selection) !void {
+        for (sel.picked) |i| try self.mark(alloc, records[i].id);
+    }
+};
 
 pub const SegmentEnd = struct {
     /// Push the `done` (the first of a job, or one that brought a new
@@ -90,7 +132,15 @@ pub const SegmentEnd = struct {
     wake: bool,
     /// The done's text: `answer` of the job. Borrowed from the records.
     answer: []const u8,
+    /// The answer's record id, null when the job has no message.
+    answer_id: ?u64,
 };
+
+/// The agent went idle but its turn is not settled (background tasks
+/// still run): flag the segment final without deciding a wake.
+pub fn markFinal(records: []Record, job: u32) void {
+    if (lastMessage(records, job)) |i| records[i].segment_final = true;
+}
 
 /// A source's memory of its latest segment end, for the re-wake rule.
 pub const Waker = struct {
@@ -102,7 +152,7 @@ pub const Waker = struct {
     /// and decide whether the done wakes the caller.
     /// @param records the source's records, chronological.
     pub fn segmentEnd(self: *Waker, records: []Record, job: u32) SegmentEnd {
-        if (lastMessage(records, job)) |i| records[i].segment_final = true;
+        markFinal(records, job);
         var wake = self.job == null or self.job.? != job;
         var high = self.mark;
         for (records) |r| {
@@ -111,33 +161,21 @@ pub const Waker = struct {
         }
         self.job = job;
         self.mark = high;
-        return .{ .wake = wake, .answer = answer(records, job) };
+        const i = answerIndex(records, job);
+        return .{ .wake = wake, .answer = if (i) |x| records[x].text else "", .answer_id = if (i) |x| records[x].id else null };
     }
 };
 
-/// Which jobs one read covers.
-pub const Jobs = struct {
-    /// Ascending.
-    list: []u32,
-    /// Nothing was newer than the cursor: `list` is the latest job alone.
-    fallback: bool,
-};
-
-/// The jobs holding a record above `since`, or the latest job when none
-/// does (no jobs without records).
-pub fn jobsAfter(alloc: std.mem.Allocator, records: []const Record, since: u64) !Jobs {
+/// The jobs holding a record above `since` (0: every job), ascending.
+pub fn jobsAfter(alloc: std.mem.Allocator, records: []const Record, since: u64) ![]u32 {
     var list: std.ArrayList(u32) = .empty;
     errdefer list.deinit(alloc);
-    var latest: ?u32 = null;
     for (records) |r| {
-        latest = if (latest) |l| @max(l, r.job) else r.job;
         if (r.id <= since) continue;
         if (std.mem.indexOfScalar(u32, list.items, r.job) == null) try list.append(alloc, r.job);
     }
-    const fallback = list.items.len == 0;
-    if (fallback) if (latest) |l| try list.append(alloc, l);
     std.mem.sort(u32, list.items, {}, std.sort.asc(u32));
-    return .{ .list = try list.toOwnedSlice(alloc), .fallback = fallback };
+    return list.toOwnedSlice(alloc);
 }
 
 pub const Options = struct {
@@ -147,9 +185,19 @@ pub const Options = struct {
     cap: usize = READ_CAP_CHARS,
     /// `all` only: records returned at most.
     limit: usize = std.math.maxInt(usize),
-    /// `all` only: records at or below it are not returned (unless the
-    /// jobs are a fallback).
+    /// `all` only: records at or below it are not returned.
     since: u64 = 0,
+    /// `selected` only: records handed out before are not returned again,
+    /// and a job left with nothing new is dropped unless `keep_empty`.
+    handed: ?*const Handed = null,
+    keep_empty: bool = false,
+};
+
+/// A selected record not returned because it was handed out before.
+pub const Earlier = struct {
+    id: u64,
+    kind: vocab.RecordKind,
+    chars: usize,
 };
 
 /// What a job had that the selection does not list.
@@ -157,6 +205,10 @@ pub const JobSummary = struct {
     job: u32,
     omitted_messages: u32 = 0,
     omitted_tools: u32 = 0,
+    /// Selected records left out because they were handed out before.
+    returned_before: u32 = 0,
+    /// The one of them to point at: the job's answer, else the latest.
+    earlier: ?Earlier = null,
 };
 
 pub const Selection = struct {
@@ -169,6 +221,9 @@ pub const Selection = struct {
     cut: []u64,
     /// `all`: records beyond `limit` remain.
     more: bool = false,
+    /// `selected`: jobs left out whole because the cap kept every record
+    /// of theirs out (not listed in `jobs` or `cut`).
+    jobs_pending: u32 = 0,
 
     pub fn deinit(self: Selection, alloc: std.mem.Allocator) void {
         alloc.free(self.picked);
@@ -177,29 +232,37 @@ pub const Selection = struct {
     }
 };
 
-/// What one read returns of `jobs` (from `jobsAfter`).
+/// What one read returns of `jobs` (ascending, from `jobsAfter`).
 /// @param records the source's records, chronological.
-pub fn select(alloc: std.mem.Allocator, records: []const Record, jobs: Jobs, opts: Options) !Selection {
-    const summaries = try alloc.alloc(JobSummary, jobs.list.len);
-    errdefer alloc.free(summaries);
-    for (jobs.list, summaries) |j, *s| s.* = .{ .job = j };
+pub fn select(alloc: std.mem.Allocator, records: []const Record, jobs: []const u32, opts: Options) !Selection {
+    var summaries: std.ArrayList(JobSummary) = .empty;
+    errdefer summaries.deinit(alloc);
     var picked: std.ArrayList(usize) = .empty;
     errdefer picked.deinit(alloc);
     var cut: std.ArrayList(u64) = .empty;
     errdefer cut.deinit(alloc);
     var more = false;
+    var jobs_pending: u32 = 0;
+    const handed = if (opts.detail == .selected) opts.handed else null;
 
-    for (summaries) |*s| {
-        const last = lastMessage(records, s.job);
+    for (jobs) |job| {
+        var s: JobSummary = .{ .job = job };
+        const last = lastMessage(records, job);
+        const ans = answerIndex(records, job);
+        const before = picked.items.len;
+        var earlier: ?usize = null;
         for (records, 0..) |r, i| {
-            if (r.job != s.job) continue;
+            if (r.job != job) continue;
             // `all` pages by id: what is at or below `since` was read.
-            if (opts.detail == .all and !jobs.fallback and r.id <= opts.since) continue;
+            if (opts.detail == .all and r.id <= opts.since) continue;
             const take = visible(r.kind, opts.include_tools) and switch (opts.detail) {
                 .selected => r.kind != .assistant or i == last or substantive(r),
                 .all => true,
             };
-            if (take) {
+            if (take and handed != null and handed.?.has(r.id)) {
+                s.returned_before += 1;
+                if (earlier == null or earlier.? != ans) earlier = i;
+            } else if (take) {
                 try picked.append(alloc, i);
             } else if (r.kind == .assistant) {
                 s.omitted_messages += 1;
@@ -207,10 +270,23 @@ pub fn select(alloc: std.mem.Allocator, records: []const Record, jobs: Jobs, opt
                 s.omitted_tools += 1;
             }
         }
+        if (earlier) |i| s.earlier = .{ .id = records[i].id, .kind = records[i].kind, .chars = chars(records[i].text) };
+        if (picked.items.len == before and handed != null and !opts.keep_empty) continue;
+        try summaries.append(alloc, s);
     }
 
     switch (opts.detail) {
-        .selected => try applyCap(alloc, records, &picked, &cut, if (summaries.len > 0) lastMessage(records, summaries[summaries.len - 1].job) else null, opts.cap),
+        .selected => {
+            // The newest job's last message stays whole, when it is returned.
+            var keep: ?usize = null;
+            if (summaries.items.len > 0) {
+                if (lastMessage(records, summaries.items[summaries.items.len - 1].job)) |k| {
+                    if (std.mem.indexOfScalar(usize, picked.items, k) != null) keep = k;
+                }
+            }
+            try applyCap(alloc, records, &picked, &cut, keep, opts.cap);
+            if (!opts.keep_empty) jobs_pending = narrowToReturned(records, picked.items, &summaries, &cut);
+        },
         .all => {
             std.mem.sort(usize, picked.items, records, struct {
                 fn lt(rs: []const Record, a: usize, b: usize) bool {
@@ -225,10 +301,52 @@ pub fn select(alloc: std.mem.Allocator, records: []const Record, jobs: Jobs, opt
     }
     return .{
         .picked = try picked.toOwnedSlice(alloc),
-        .jobs = summaries,
+        .jobs = try summaries.toOwnedSlice(alloc),
         .cut = try cut.toOwnedSlice(alloc),
         .more = more,
+        .jobs_pending = jobs_pending,
     };
+}
+
+fn jobOf(records: []const Record, id: u64) ?u32 {
+    for (records) |r| if (r.id == id) return r.job;
+    return null;
+}
+
+/// Keep only the jobs this read returns a record of, and the cut ids of
+/// those: the metadata never lists old history.
+/// @return the jobs dropped with records the cap kept out (the next read returns them).
+fn narrowToReturned(records: []const Record, picked: []const usize, summaries: *std.ArrayList(JobSummary), cut: *std.ArrayList(u64)) u32 {
+    var pending: u32 = 0;
+    var w: usize = 0;
+    for (summaries.items) |s| {
+        var returned = false;
+        for (picked) |i| if (records[i].job == s.job) {
+            returned = true;
+            break;
+        };
+        if (returned) {
+            summaries.items[w] = s;
+            w += 1;
+            continue;
+        }
+        for (cut.items) |id| if (jobOf(records, id) == s.job) {
+            pending += 1;
+            break;
+        };
+    }
+    summaries.shrinkRetainingCapacity(w);
+    var cw: usize = 0;
+    for (cut.items) |id| {
+        const job = jobOf(records, id) orelse continue;
+        for (summaries.items) |s| if (s.job == job) {
+            cut.items[cw] = id;
+            cw += 1;
+            break;
+        };
+    }
+    cut.shrinkRetainingCapacity(cw);
+    return pending;
 }
 
 /// Keep `keep` whole, then the longest other picks that still fit `cap`;
@@ -311,7 +429,7 @@ test "the motivating job: a long summary, then a trivial wake reply; both kept, 
     try t.expect(records[6].segment_final);
 
     const jobs = try jobsAfter(t.allocator, &records, 0);
-    defer t.allocator.free(jobs.list);
+    defer t.allocator.free(jobs);
     const sel = try select(t.allocator, &records, jobs, .{});
     defer sel.deinit(t.allocator);
     const ids = try pickedIds(&records, sel);
@@ -332,7 +450,7 @@ test "rule 3: a long intermediate is kept, a short one is not, a short earlier f
     };
     records[2].segment_final = true;
     const jobs = try jobsAfter(t.allocator, &records, 0);
-    defer t.allocator.free(jobs.list);
+    defer t.allocator.free(jobs);
     const sel = try select(t.allocator, &records, jobs, .{});
     defer sel.deinit(t.allocator);
     const ids = try pickedIds(&records, sel);
@@ -376,15 +494,20 @@ test "the cap keeps the newest job's last message whole, then the longest that f
     records[0].segment_final = true;
     records[1].segment_final = true;
     const jobs = try jobsAfter(t.allocator, &records, 0);
-    defer t.allocator.free(jobs.list);
-    try t.expectEqualSlices(u32, &.{ 0, 1 }, jobs.list);
+    defer t.allocator.free(jobs);
+    try t.expectEqualSlices(u32, &.{ 0, 1 }, jobs);
     const sel = try select(t.allocator, &records, jobs, .{});
     defer sel.deinit(t.allocator);
     const ids = try pickedIds(&records, sel);
     defer t.allocator.free(ids);
-    // 13000 alone exceeds the cap: kept whole, nothing else fits.
+    // 13000 alone exceeds the cap: kept whole, nothing else fits. Job 0
+    // returns nothing this read, so it is neither listed nor in cut: one
+    // count says it waits for the next read.
     try t.expectEqualSlices(u64, &.{5}, ids);
-    try t.expectEqualSlices(u64, &.{ 1, 2, 3, 4 }, sel.cut);
+    try t.expectEqualSlices(u64, &.{4}, sel.cut);
+    try t.expectEqual(@as(usize, 1), sel.jobs.len);
+    try t.expectEqual(@as(u32, 1), sel.jobs[0].job);
+    try t.expectEqual(@as(u32, 1), sel.jobs_pending);
 
     const roomy = try select(t.allocator, &records, jobs, .{ .cap = 13000 + 5000 + 2000 + 9 });
     defer roomy.deinit(t.allocator);
@@ -393,6 +516,7 @@ test "the cap keeps the newest job's last message whole, then the longest that f
     // Longest first: 5000 fits, 4000 does not, 2000 and the notice do.
     try t.expectEqualSlices(u64, &.{ 1, 3, 4, 5 }, ids2);
     try t.expectEqualSlices(u64, &.{2}, roomy.cut);
+    try t.expectEqual(@as(u32, 0), roomy.jobs_pending);
 }
 
 test "tools only on request, notices always, user prompts never" {
@@ -403,7 +527,7 @@ test "tools only on request, notices always, user prompts never" {
         rec(4, 0, .assistant, "done"),
     };
     const jobs = try jobsAfter(t.allocator, &records, 0);
-    defer t.allocator.free(jobs.list);
+    defer t.allocator.free(jobs);
     for ([_]Detail{ .selected, .all }) |d| {
         const plain = try select(t.allocator, &records, jobs, .{ .detail = d });
         defer plain.deinit(t.allocator);
@@ -420,7 +544,7 @@ test "tools only on request, notices always, user prompts never" {
     }
 }
 
-test "the read cursor: unread jobs, else the latest job; all honours since and limit" {
+test "jobs after a since; all honours since and limit" {
     var records = [_]Record{
         rec(1, 0, .user, "one"),
         rec(2, 0, .assistant, "first"),
@@ -431,16 +555,14 @@ test "the read cursor: unread jobs, else the latest job; all honours since and l
         rec(7, 2, .assistant, "fourth"),
     };
     const unread = try jobsAfter(t.allocator, &records, 4);
-    defer t.allocator.free(unread.list);
-    try t.expectEqualSlices(u32, &.{ 1, 2 }, unread.list);
-    try t.expect(!unread.fallback);
+    defer t.allocator.free(unread);
+    try t.expectEqualSlices(u32, &.{ 1, 2 }, unread);
     const none = try jobsAfter(t.allocator, &records, 7);
-    defer t.allocator.free(none.list);
-    try t.expectEqualSlices(u32, &.{2}, none.list);
-    try t.expect(none.fallback);
+    defer t.allocator.free(none);
+    try t.expectEqual(@as(usize, 0), none.len);
     const empty = try jobsAfter(t.allocator, records[0..0], 0);
-    defer t.allocator.free(empty.list);
-    try t.expectEqual(@as(usize, 0), empty.list.len);
+    defer t.allocator.free(empty);
+    try t.expectEqual(@as(usize, 0), empty.len);
 
     // `all` returns only what is above `since`, by id, paged by `limit`.
     const all = try select(t.allocator, &records, unread, .{ .detail = .all, .since = 4, .limit = 1 });
@@ -449,12 +571,141 @@ test "the read cursor: unread jobs, else the latest job; all honours since and l
     defer t.allocator.free(a);
     try t.expectEqualSlices(u64, &.{5}, a);
     try t.expect(all.more);
-    // The fallback job is returned whole.
-    const again = try select(t.allocator, &records, none, .{ .detail = .all, .since = 7 });
-    defer again.deinit(t.allocator);
-    const b = try pickedIds(&records, again);
+}
+
+/// One default read as agent_read makes it: every job, nothing handed out
+/// before, then what it returned marked handed.
+fn readNew(records: []const Record, handed: *Handed) !Selection {
+    const jobs = try jobsAfter(t.allocator, records, 0);
+    defer t.allocator.free(jobs);
+    const sel = try select(t.allocator, records, jobs, .{ .handed = handed });
+    try handed.markSelection(t.allocator, records, sel);
+    return sel;
+}
+
+test "per-record delivery: one long job's final is returned exactly once, later reads only what is new plus a pointer" {
+    // The motivating shape: one job, a long report, then wake segments
+    // (background builds) each ending with a short message.
+    const report = filled(3100, 'r');
+    var records = [_]Record{
+        rec(1, 0, .user, "build it, report"),
+        rec(2, 0, .assistant, "starting the build"),
+        rec(3, 0, .tool, "Bash (make)"),
+        rec(4, 0, .assistant, report),
+        rec(5, 0, .notice, "Background command \"make\" completed"),
+        rec(6, 0, .assistant, "build 1 green"),
+        rec(7, 0, .notice, "Background command \"test\" completed"),
+        rec(8, 0, .assistant, "tests green"),
+    };
+    var handed: Handed = .{};
+    defer handed.deinit(t.allocator);
+    var w: Waker = .{};
+
+    // First segment ends: the done result carries the report.
+    _ = w.segmentEnd(records[0..4], 0);
+    const first = try readNew(records[0..4], &handed);
+    defer first.deinit(t.allocator);
+    const a = try pickedIds(&records, first);
+    defer t.allocator.free(a);
+    try t.expectEqualSlices(u64, &.{4}, a);
+    try t.expectEqual(@as(u32, 0), first.jobs[0].returned_before);
+
+    // A wake segment: only the notice and the new last message, and one
+    // pointer at the report.
+    _ = w.segmentEnd(records[0..6], 0);
+    const second = try readNew(records[0..6], &handed);
+    defer second.deinit(t.allocator);
+    const b = try pickedIds(&records, second);
     defer t.allocator.free(b);
-    try t.expectEqualSlices(u64, &.{7}, b);
+    try t.expectEqualSlices(u64, &.{ 5, 6 }, b);
+    try t.expectEqual(@as(u32, 1), second.jobs[0].returned_before);
+    try t.expectEqual(@as(u64, 4), second.jobs[0].earlier.?.id);
+    try t.expectEqual(@as(usize, 3100), second.jobs[0].earlier.?.chars);
+
+    // Nothing new: nothing at all, not the latest job again.
+    const idle = try readNew(records[0..6], &handed);
+    defer idle.deinit(t.allocator);
+    try t.expectEqual(@as(usize, 0), idle.picked.len);
+    try t.expectEqual(@as(usize, 0), idle.jobs.len);
+
+    // The next segment: the earlier short final is no longer the last
+    // message, so it is not selected; the report is still never repeated.
+    _ = w.segmentEnd(&records, 0);
+    const third = try readNew(&records, &handed);
+    defer third.deinit(t.allocator);
+    const c = try pickedIds(&records, third);
+    defer t.allocator.free(c);
+    try t.expectEqualSlices(u64, &.{ 7, 8 }, c);
+    try t.expectEqual(@as(u64, 4), third.jobs[0].earlier.?.id);
+
+    // Across all reads the report went out exactly once.
+    var times: usize = 0;
+    for ([_][]const u64{ a, b, c }) |ids| {
+        for (ids) |id| if (id == 4) {
+            times += 1;
+        };
+    }
+    try t.expectEqual(@as(usize, 1), times);
+
+    // A done result keeps its job even with nothing new, to point at it.
+    const one = [1]u32{0};
+    const done = try select(t.allocator, &records, &one, .{ .handed = &handed, .keep_empty = true });
+    defer done.deinit(t.allocator);
+    try t.expectEqual(@as(usize, 0), done.picked.len);
+    try t.expectEqual(@as(usize, 1), done.jobs.len);
+
+    // A deliberate re-read (no handed state: an explicit since, or all)
+    // returns what it asks for.
+    const again = try select(t.allocator, &records, &one, .{});
+    defer again.deinit(t.allocator);
+    const d = try pickedIds(&records, again);
+    defer t.allocator.free(d);
+    try t.expectEqualSlices(u64, &.{ 4, 5, 7, 8 }, d);
+    const all = try select(t.allocator, &records, &one, .{ .detail = .all, .handed = &handed });
+    defer all.deinit(t.allocator);
+    try t.expectEqual(@as(usize, 6), all.picked.len);
+}
+
+test "a read's metadata covers only the jobs it returns something of" {
+    var records = [_]Record{
+        rec(1, 0, .assistant, filled(400, 'a')),
+        rec(2, 1, .assistant, filled(400, 'b')),
+        rec(3, 2, .assistant, "c"),
+        rec(4, 2, .notice, "Background command completed"),
+    };
+    var handed: Handed = .{};
+    defer handed.deinit(t.allocator);
+    // Old history, handed out by earlier results.
+    for (records[0..3]) |r| try handed.mark(t.allocator, r.id);
+    const sel = try readNew(&records, &handed);
+    defer sel.deinit(t.allocator);
+    const ids = try pickedIds(&records, sel);
+    defer t.allocator.free(ids);
+    try t.expectEqualSlices(u64, &.{4}, ids);
+    // Jobs 0 and 1 had nothing new: no entry, no cut ids, no pointer line.
+    try t.expectEqual(@as(usize, 1), sel.jobs.len);
+    try t.expectEqual(@as(u32, 2), sel.jobs[0].job);
+    try t.expectEqual(@as(usize, 0), sel.cut.len);
+    try t.expectEqual(@as(u32, 0), sel.jobs_pending);
+}
+
+test "the cap's cut records are not handed out: the next read returns them" {
+    var records = [_]Record{
+        rec(1, 0, .assistant, filled(9000, 'a')),
+        rec(2, 0, .assistant, filled(5000, 'b')),
+    };
+    records[0].segment_final = true;
+    var handed: Handed = .{};
+    defer handed.deinit(t.allocator);
+    const first = try readNew(&records, &handed);
+    defer first.deinit(t.allocator);
+    try t.expectEqual(@as(usize, 1), first.picked.len);
+    try t.expectEqualSlices(u64, &.{1}, first.cut);
+    const second = try readNew(&records, &handed);
+    defer second.deinit(t.allocator);
+    const ids = try pickedIds(&records, second);
+    defer t.allocator.free(ids);
+    try t.expectEqualSlices(u64, &.{1}, ids);
 }
 
 test "chars counts code points" {

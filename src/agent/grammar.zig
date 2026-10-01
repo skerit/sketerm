@@ -28,8 +28,8 @@ pub const Class = union(enum) {
     text,
 };
 
-/// Record rules win over chrome; footer, subagent, choice-prompt and
-/// permission lines are chrome without being listed as such.
+/// Record rules win over chrome; footer, subagent, background,
+/// choice-prompt and permission lines are chrome without being listed as such.
 pub fn classify(sc: *const adapter.Screen, line: Line) Class {
     if (line.live) return .chrome;
     for (sc.records, 0..) |r, i| {
@@ -43,7 +43,7 @@ pub fn isChrome(sc: *const adapter.Screen, text: []const u8) bool {
     for (sc.chrome) |m| {
         if (m.matches(text)) return true;
     }
-    inline for (.{ "footer", "subagent", "permission" }) |f| {
+    inline for (.{ "footer", "subagent", "background", "permission" }) |f| {
         if (@field(sc, f)) |m| {
             if (m.matches(text)) return true;
         }
@@ -415,6 +415,7 @@ pub const test_adapter_json =
     \\    ],
     \\    "chrome": [ { "pattern": "^[A-Z]\\S*…$" }, { "prefix": "manual mode on" }, { "pattern": "^\\$$" }, { "prefix": "$ " }, { "prefix": "✔ " } ],
     \\    "subagent": { "pattern": "^Waiting for [0-9]+ background agents? to finish" },
+    \\    "background": { "pattern": "· +[0-9]+ shells?$" },
     \\    "choice_prompt": { "prefix": "Select with numbers [" },
     \\    "permission": { "prefix": "Permission Required:" },
     \\    "bell_needs_input": true
