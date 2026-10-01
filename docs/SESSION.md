@@ -1,5 +1,41 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-01: sub-agents over MCP (`agent_*`)
+
+The `agent` tool group runs Claude Code (screen source, ax mode) and opencode
+(API source: `opencode serve` plus an attached TUI) as sub-agents on the
+instance's private daemon, as sessions named `agent-<app>-<n>` the GUI lists
+for watch-along. agent_open / send / wait / read / answer / set / interrupt /
+list / close / attach / adapters return records, state, the pending prompt and
+events (schemas derived from `src/agent/vocab.zig`), never screens. A `binary`
+override runs a custom build; `unset_env` is applied in the child by a POSIX
+sh wrapper; opencode's per-agent password rides the spawn environment.
+
+`sketerm mcp`'s loop now polls stdin together with every agent source and the
+waiter socket, so agents are observed between requests; detection stays
+content-based, and a turn that ended while another call blocked the loop reads
+the same afterwards (unit test with a late observation, smoke stage with a
+blocking term_exec). Results carry `watch_command`: `sketerm mcp agent-wait
+... --since N AGENT` (also `sketerm-mcp agent-wait`) wakes the assistant on
+done / needs_input / error / exit, or with `--follow` streams one line per
+wake-up and ends with `watch ended: <reason>`. It shares
+`events.Cursor.take` and the per-agent limiter with agent_wait. The
+initialize result carries `instructions` pointing assistants at agent_open and
+the watcher; capabilities reports `agents`, `agent_ssh`, `agent_adapters`,
+`agent_waiter`, `open_agents`. Durable instances keep a 0600 descriptor per
+agent and re-attach after a restart. SSH (`host`) answers `unavailable`.
+
+Validation: `zig build test` 3793 passed / 19 skipped; `zig build test-core`
+2972 passed / 3 skipped; `zig build mux-portable` and `mcp-standalone` build.
+The focused smoke (`SKETERM_SMOKE_MCP_AGENT_ONLY=1 zig build smoke-mcp`)
+drives the real server against the smoke binary as a fake Claude Code and a
+fake opencode server/TUI, three runs green; the focused web profile, policy
+and real-CEF web stages pass on the new loop too. The full smoke-mcp is red on this
+host for two reasons outside this change: `sketerm doctor` exits 1 on a stale
+15-day-old daemon of the user's (stage 1), and, run in a private PID
+namespace, stage 1-9 pass and the web-session stage fails because `31573454`
+writes `"session":""` into web.json while the stage asserts the key is absent.
+
 ## 2026-09-30: browser handoff correctness and usability reviews
 
 A fresh correctness review of `31573454` fixed read-only requests retaining
