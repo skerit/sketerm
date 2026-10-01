@@ -1,5 +1,33 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-01: sub-agents: queued prompts, free-text answers, agent_list facts
+
+An orchestrator could not tell a busy worker "Docker is fixed" without
+interrupting its turn, could only answer a prompt with one of its options,
+and could not see which clone a worker ran in. `agent_send` to a busy
+agent (`State.queuesPrompt`) now uses the app's OWN queue and reports
+`queued` (fact, and `outcome: "queued"` when the call returned first).
+Probed: Claude Code 2.1.287 takes typed input while it works, draws it as
+a `you:` preview with `ctrl+enter to send now` above the status block, and
+at the turn's end prints it as a normal prompt and runs it; the adapter's
+`actions.queue` recipe types it without the interrupting Escapes (refused
+when a human's text sits in the input box) and `screen.queued` keeps the
+preview out of the transcript and the agent out of `idle`. opencode
+answers `prompt_async` on a busy session with 204 and creates the user
+message at once; answers now keep the job of the prompt they answer
+(`parentID`). The superseded turn raises no done; the queued job's done
+covers it (`first_job`), so its final message rides along. `agent_answer
+text` answers in words: Claude Code's permission `No` (its ax dialog has
+no "tell Claude" option; No ends the turn with "What should Claude do
+instead?") then the text as the next prompt, declared in the adapter as
+`screen.text_options` + `actions.answer_text`; opencode rejects with a
+`message` or gives a question a custom answer; anything else is refused
+naming the options. `agent_list` adds host/transport/cwd/binary/model/
+effort/sessions/started_ms/last_activity_ms/queued_prompts. Confirmed on
+real Claude Code (Haiku) and opencode-oc11: a queued prompt during an
+essay came back as one done with both jobs' finals, and a text answer to
+a bash permission produced BANANA without the file being created.
+
 ## 2026-10-01: sub-agent delivery: each record once, one event state, settled done
 
 From a session that ran 5-8 sub-agents for a day: a ~3k-char report came
