@@ -1,5 +1,23 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-01: sub-agent results are selected per job
+
+agent_read and every `done` result now return a JOB (one user prompt and
+everything until the next, turns the agent starts on its own included)
+as its last message, earlier segment finals of 300+ characters, any
+message of 1500+ characters and its notices; the rest is a count per job,
+user prompts are never echoed and tool records need `include_tools`. A
+per-agent read cursor picks the unread jobs, ~12000 characters per read
+with the newest answer always whole and cut ids listed; `detail:"all"`
+pages everything by id. A job's first `done` always wakes; a later one
+only with a new substantive message, so a background task waking Claude
+Code into "ignoring wakeup" no longer wakes the caller. The probe showed
+Claude Code's wake turn has no `you:` line and prints below the previous
+footer before answering, which made the engine capture it early and push
+an empty done; the footer check now wants only chrome below it, and the
+`Background command "..." completed` line is a notice. One home:
+`src/agent/select.zig`; `capabilities.agent_read_select` reports it.
+
 ## 2026-10-01: sub-agents fixed against the real apps, and over SSH
 
 Real-app runs of the `agent_*` tools found six faults, each now covered.
