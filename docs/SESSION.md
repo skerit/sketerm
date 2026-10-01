@@ -1,5 +1,33 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-01: remote assistants in the GUI (watch-along across hosts, part 2)
+
+A GUI muxed into host A now sees the `sketerm mcp` servers on A and their
+sub-agents, including one placed on B. `src/ui/assistants.zig` stays the
+one discovery home: beside the local registry it reads the `assistants`
+report of every remote per-user daemon a pane or app session talks to,
+every 6 s over that host's pooled idle connection (`editorio.pool`, shared
+with the Session Overview, which also hands in its own list replies), with
+backoff on failure and a slow re-check for daemons without the capability.
+A remote server is keyed by its derived instance route (`route:A#key`), so
+two specs for one machine list it once, and the local daemon's report is
+never read. Its own daemon is listed through the route only while the
+popover is open; otherwise its rows are the agents its report publishes.
+The popover shows `mcp <pid> on A` (or its name) with `claude-1 (claude)`
+and `claude-2 (claude) on B via A`; the Overview lists the same rows (an
+agent elsewhere gets a row of its own, without a stop button). Watch and
+Take control run the existing `AttachJob` along `route:A#key` or
+`route:A/B`; a refused route is a toast naming the hop (`AttachJob` now
+keeps `client.routeFailure()`). The per-pane AI chip resolves a pane on
+either route to its server. Verified by the focused
+`SKETERM_SMOKE_E2E_WATCH_ONLY` smoke-e2e run: fake hosta/hostb behind the
+fake ssh, a real `sketerm mcp` on hosta with a fake Claude Code there and
+on hostb; chip up 1.6 s after the hosta pane, both agents in the Overview
+and popover by OCR, Watch shows claude-1's screen, Take control typed into
+claude-2 on hostb, and the chip retired 0.8 s after the server exited.
+Found on the way: a read-only Watch of a TERMINAL session does not stop
+typed input (neither the GUI nor the daemon gates `.input` on the lease).
+
 ## 2026-10-01: sub-agents: queued prompts, free-text answers, agent_list facts
 
 An orchestrator could not tell a busy worker "Docker is fixed" without
