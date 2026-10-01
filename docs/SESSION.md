@@ -1,5 +1,42 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-01: sub-agents fixed against the real apps, and over SSH
+
+Real-app runs of the `agent_*` tools found six faults, each now covered.
+opencode listens ~2 s before it answers and never answers a request sent
+in between, so agent_open polls `GET /global/health` (short probes, fresh
+connections) before the event stream and reports a server that never
+answers as not ready. Recipe actions verify their effect: a `command`
+step (`/model`) is a hidden turn whose picker the recipe adopts, and a
+`confirm` step waits for the app's own confirmation below it, so
+agent_set no longer returns while the picker is still open, and the
+transcript gets a notice instead of `user: /model`. Claude Code's
+`/effort` saves the user's default even when launched with `--effort` or
+`CLAUDE_CODE_EFFORT_LEVEL` (measured; settings.json restored byte-exact),
+so effort is a relaunch: `/exit`, then the same session with `--resume`
+of the agent's own `--session-id` and every launch value. watch_command
+carries no cursor any more (a reused one woke on old events), and a
+relative `--log` dir no longer records nothing (casts are absolute paths,
+reported by agent_open and agent_list).
+
+`host` works: one ssh probe resolves the binary on the host from the
+candidates, sessions use term_open's transports (the host's own daemon,
+else plain `ssh -tt`), a remote opencode server is reached through a
+per-agent `ssh -L` forward that is respawned when it dies, and its
+password is typed on the remote terminal with echo off, never on an argv.
+A lost remote link is `connection_lost` and recovers on the next call
+with a wipe-style resync; durable instances re-attach remote agents over
+ssh. `capabilities.agent_ssh` is true wherever ssh is installed.
+
+Validation: `zig build test` 3800 passed / 19 skipped; `zig build test-core`
+2978 passed / 3 skipped; `mux-portable` and `mcp-standalone` build. The
+focused agent smoke and the new `SKETERM_SMOKE_MCP_AGENTSSH_ONLY=1` stage
+(a second private daemon behind a fake `$SKETERM_SSH`, this binary as `ssh`)
+are green. Against the real apps: Claude Code 2.1.286 on Haiku confirmed the
+model in 1.3 s, relaunched for effort in 7.4 s and still knew the earlier
+answer; the fake agents ran over a real `ssh localhost` (plain ssh) with the
+opencode password on no argv.
+
 ## 2026-10-01: sub-agents over MCP (`agent_*`)
 
 The `agent` tool group runs Claude Code (screen source, ax mode) and opencode
