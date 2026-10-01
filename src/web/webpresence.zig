@@ -42,6 +42,33 @@ pub fn instanceMuxSocket(buf: []u8, mux_socket: []const u8, instance: []const u8
     return std.fmt.bufPrint(buf, "{s}/mcp-{s}/mux.sock", .{ dir, instance }) catch null;
 }
 
+/// The inverse of `instanceMuxSocket`: the instance key whose daemon socket
+/// is `instance_socket`, or null when that socket is not an instance laid
+/// out beside `mux_socket` (a `--shared` server's per-user socket, say).
+/// Ephemeral instances answer as `tmp-<pid>`, their directory's suffix.
+pub fn instanceKeyOf(mux_socket: []const u8, instance_socket: []const u8) ?[]const u8 {
+    const dir = std.fs.path.dirname(mux_socket) orelse return null;
+    if (!std.mem.startsWith(u8, instance_socket, dir)) return null;
+    const rest = instance_socket[dir.len..];
+    if (!std.mem.startsWith(u8, rest, "/mcp-") or !std.mem.endsWith(u8, rest, "/mux.sock")) return null;
+    const key = rest["/mcp-".len .. rest.len - "/mux.sock".len];
+    if (!validInstance(key)) return null;
+    return key;
+}
+
+test "instanceKeyOf inverts instanceMuxSocket" {
+    const t = std.testing;
+    const anchor = "/run/user/1/sketerm/mux.sock";
+    var buf: [MAX_PATH]u8 = undefined;
+    for ([_][]const u8{ "switchboard", "tmp-4242", "default" }) |key| {
+        try t.expectEqualStrings(key, instanceKeyOf(anchor, instanceMuxSocket(&buf, anchor, key).?).?);
+    }
+    try t.expect(instanceKeyOf(anchor, anchor) == null);
+    try t.expect(instanceKeyOf(anchor, "/elsewhere/mcp-x/mux.sock") == null);
+    try t.expect(instanceKeyOf(anchor, "/run/user/1/sketerm/mcp-a/b/mux.sock") == null);
+    try t.expect(instanceKeyOf(anchor, "/run/user/1/sketerm/mcp-/mux.sock") == null);
+}
+
 test "instanceMuxSocket resolves a named instance beside the per-user socket and refuses escapes" {
     var buf: [MAX_PATH]u8 = undefined;
     try std.testing.expectEqualStrings(

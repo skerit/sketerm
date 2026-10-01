@@ -119,6 +119,23 @@ pub fn parseUdpTicketReply(allocator: std.mem.Allocator, payload: []const u8) ?U
 pub const Transport = enum { local, ssh, udp, tor };
 pub const RemoteMode = sshroute.Mode;
 pub const RemoteSpec = sshroute.RemoteSpec;
+pub const RouteSpec = sshroute.RouteSpec;
+const proxyroute = @import("proxyroute.zig");
+
+/// Why the last route connect on this thread failed (`Conn.connectRoute`).
+threadlocal var route_failure_buf: [384]u8 = undefined;
+threadlocal var route_failure_len: usize = 0;
+
+/// The sentence naming the failing hop and the reason, after a route connect
+/// on this thread failed; empty after a success or a non-route connect.
+pub fn routeFailure() []const u8 {
+    return route_failure_buf[0..route_failure_len];
+}
+
+fn noteRouteFailure(comptime fmt: []const u8, args: anytype) void {
+    const text = std.fmt.bufPrint(&route_failure_buf, fmt, args) catch route_failure_buf[0..];
+    route_failure_len = text.len;
+}
 
 pub const ConnectOptions = struct {
     udp_port_range: ?[]const u8 = null,
@@ -181,6 +198,8 @@ pub fn findMuxBinary(buf: *[4096:0]u8) [*:0]const u8 {
 /// on the two functions that mint and consume, so a new call site cannot
 /// forget it.
 pub fn udpTicketEligible(spec: []const u8) bool {
+    // A route is ssh end to end; a ticket would dial its last daemon directly.
+    if (RouteSpec.isRoute(spec)) return false;
     return switch (RemoteSpec.parse(spec).mode) {
         .auto, .udp => true,
         .ssh, .tor => false,
@@ -673,6 +692,7 @@ pub const Conn = struct {
     /// retried once the network may have changed.
     pub fn connectRemote(allocator: std.mem.Allocator, spec: []const u8, options: ConnectOptions) !Conn {
         if (std.mem.startsWith(u8, spec, "sock:")) return connectProbed(allocator, spec[5..]);
+        if (RouteSpec.isRoute(spec)) return connectRoute(allocator, spec, options.tor_socks_endpoint);
         const remote = RemoteSpec.parse(spec);
         if (remote.mode == .auto and udpMemoDown(remote.host)) {
             var conn = try connectSshRoute(allocator, remote.host, .direct, options.tor_socks_endpoint);
@@ -853,6 +873,8 @@ pub const Conn = struct {
     }
 
     fn connectUdpFor(allocator: std.mem.Allocator, host: []const u8, port_range: ?[]const u8, timeout_ms: i64) !Conn {
+        // A live route's background UDP upgrade lands here: refuse at once.
+        if (RouteSpec.isRoute(host)) return error.RouteIsSshOnly;
         if (!validSshHost(host)) return error.BadPath;
         if (port_range) |r| if (!validPortRange(r)) return error.BadPath;
 
@@ -1166,6 +1188,7 @@ pub const Conn = struct {
 
     /// Route-aware SSH connect; `tor:` is forced and never downgrades.
     pub fn connectSshWithEndpoint(allocator: std.mem.Allocator, spec: []const u8, tor_endpoint: []const u8) !Conn {
+        if (RouteSpec.isRoute(spec)) return connectRoute(allocator, spec, tor_endpoint);
         const remote = RemoteSpec.parse(spec);
         const route: sshroute.Route = switch (remote.mode) {
             .auto, .ssh => .direct,
@@ -1216,6 +1239,7 @@ pub const Conn = struct {
     }
 
     pub fn connectSshOnceWithEndpoint(allocator: std.mem.Allocator, spec: []const u8, tor_endpoint: []const u8) !Conn {
+        if (RouteSpec.isRoute(spec)) return connectRoute(allocator, spec, tor_endpoint);
         const remote = RemoteSpec.parse(spec);
         const route: sshroute.Route = switch (remote.mode) {
             .auto, .ssh => .direct,
@@ -1288,6 +1312,177 @@ pub const Conn = struct {
 
     fn validSshHost(host: []const u8) bool {
         return host.len > 0 and host[0] != '-';
+    }
+
+    /// Connect along a `route:` host spec (`sshroute.RouteSpec`): ssh to
+    /// the first hop, whose `sketerm-mux --proxy` dials the rest. Always
+    /// ssh, whatever transport the first hop would get on its own.
+    /// `routeFailure()` names the failing hop and why after an error.
+    pub fn connectRoute(allocator: std.mem.Allocator, spec: []const u8, tor_endpoint: []const u8) !Conn {
+        route_failure_len = 0;
+        const route = RouteSpec.parse(spec) catch |err| {
+            noteRouteFailure("invalid route '{s}': {s}", .{ spec, @errorName(err) });
+            return error.BadRoute;
+        };
+        const plan = sshroute.Plan.init(route.hops()[0], if (route.tor) .tor else .direct, tor_endpoint) catch {
+            noteRouteFailure("invalid route '{s}': bad first hop", .{spec});
+            return error.BadRoute;
+        };
+        // Every further hop is one more ssh handshake inside the budget.
+        const budget: i64 = 20_000 + 10_000 * @as(i64, @intCast(route.hops().len - 1));
+        var prepared = deploy.prepare(allocator, &plan);
+        defer if (prepared) |*p| p.deinit();
+        if (prepared) |p| {
+            if (connectRouteOnce(allocator, &route, &plan, p.path, budget)) |conn| return conn else |err| switch (err) {
+                // Definitive answers from beyond the first hop; the PATH
+                // spelling of the first hop cannot change them.
+                error.RouteRefused, error.RouteHopTooOld => return err,
+                else => {},
+            }
+        }
+        return connectRouteOnce(allocator, &route, &plan, null, budget);
+    }
+
+    fn connectRouteOnce(allocator: std.mem.Allocator, route: *const RouteSpec, plan: *const sshroute.Plan, remote_mux: ?[]const u8, timeout_ms: i64) !Conn {
+        const hops = route.hops();
+        const command = proxyroute.remoteCommand(allocator, remote_mux orelse selfexec.BINARY, hops[1..], route.instance) catch return error.BadRoute;
+        defer allocator.free(command);
+        var host_z_buf: [256:0]u8 = undefined;
+        const host_z = std.fmt.bufPrintZ(&host_z_buf, "{s}", .{plan.destination}) catch return error.BadRoute;
+        const ssh_env = c.getenv("SKETERM_SSH");
+        const ssh_bin: [*:0]const u8 = if (ssh_env != null) ssh_env else "ssh";
+        var route_args = plan.args(ssh_env == null and deploy.canMultiplex()) catch return error.BadRoute;
+        var argv_buf: [32:null]?[*:0]const u8 = .{null} ** 32;
+        var n: usize = 0;
+        argv_buf[n] = ssh_bin;
+        n += 1;
+        route_args.append(&argv_buf, &n) catch return error.BadRoute;
+        if (n + 3 > argv_buf.len) return error.BadRoute;
+        argv_buf[n] = host_z.ptr;
+        argv_buf[n + 1] = command.ptr;
+        argv_buf[n + 2] = null;
+
+        // ssh's stderr (and every hop's, relayed) lands in an unlinked
+        // file: readable after a failure, never a pipe that could fill
+        // and stall ssh for the life of the connection.
+        const err_fd = scratchFile();
+        defer if (err_fd >= 0) {
+            _ = c.close(err_fd);
+        };
+        var conn = try spawnOverSocketpairErr(allocator, ssh_bin, @ptrCast(&argv_buf), err_fd);
+        errdefer conn.deinit();
+        const deadline = nowMs() + timeout_ms;
+
+        // One status line per routed hop until `ok` (proxyroute.zig).
+        var seen: usize = 0;
+        while (true) {
+            var line_buf: [proxyroute.MAX_LINE]u8 = undefined;
+            const line = readStatusLine(conn.fd, &line_buf, deadline) catch |err| return routeBroke(hops[@min(seen, hops.len - 1)], err, err_fd, timeout_ms);
+            const status = proxyroute.parseStatus(line) orelse {
+                noteRouteFailure("route hop {s} answered something other than a route status", .{hops[@min(seen, hops.len - 1)]});
+                return error.RouteProtocol;
+            };
+            switch (status) {
+                .hop => {
+                    seen += 1;
+                    if (seen >= hops.len) {
+                        noteRouteFailure("route hop {s} announced a hop past the end of the route", .{hops[hops.len - 1]});
+                        return error.RouteProtocol;
+                    }
+                },
+                .ok => break,
+                .err => |e| {
+                    noteRouteFailure("{s} refused the route ({s}): {s}", .{ hops[@min(seen, hops.len - 1)], @tagName(e.code), e.msg });
+                    return error.RouteRefused;
+                },
+            }
+        }
+        // The last hop's daemon speaks the ordinary protocol from here.
+        const last = hops[hops.len - 1];
+        conn.sendHello() catch return routeBroke(last, error.EndOfStream, err_fd, timeout_ms);
+        const remain = deadline - nowMs();
+        if (remain <= 0) return routeBroke(last, error.Timeout, err_fd, timeout_ms);
+        const w = conn.recvExpectFor(&.{.welcome}, remain) catch |err|
+            return routeBroke(last, if (err == error.Timeout) error.Timeout else error.EndOfStream, err_fd, timeout_ms);
+        defer w.deinit(allocator);
+        conn.applyWelcome(allocator, w.payload);
+        conn.transport = if (plan.route == .tor) .tor else .ssh;
+        return conn;
+    }
+
+    /// Name why the route stopped at `host`: an older binary's refusal of
+    /// the route flags, a timeout, or whatever ssh said.
+    fn routeBroke(host: []const u8, err: anyerror, err_fd: c_int, timeout_ms: i64) anyerror {
+        var buf: [1024]u8 = undefined;
+        const said = scratchRead(err_fd, &buf);
+        if (proxyroute.refusedByOldBinary(said)) {
+            noteRouteFailure("the sketerm-mux on {s} is too old for routes (it refused the route flags); update sketerm-mux there", .{host});
+            return error.RouteHopTooOld;
+        }
+        if (err == error.Timeout) {
+            noteRouteFailure("no answer from route hop {s} within {d}s", .{ host, @divTrunc(timeout_ms, 1000) });
+            return error.RouteTimeout;
+        }
+        noteRouteFailure("route hop {s} did not answer: {s}", .{ host, lastLine(said) });
+        return error.RouteHopUnreachable;
+    }
+
+    fn lastLine(text: []const u8) []const u8 {
+        const trimmed = std.mem.trim(u8, text, " \t\r\n");
+        if (trimmed.len == 0) return "no ssh output (host down, auth refused, or no sketerm-mux there)";
+        const nl = std.mem.lastIndexOfScalar(u8, trimmed, '\n') orelse return trimmed;
+        return trimmed[nl + 1 ..];
+    }
+
+    /// One `\n`-terminated line, read a byte at a time so nothing past it
+    /// (the mux stream) is consumed. error.EndOfStream / error.Timeout.
+    fn readStatusLine(fd: c_int, buf: *[proxyroute.MAX_LINE]u8, deadline: i64) ![]const u8 {
+        var len: usize = 0;
+        while (true) {
+            const remain = deadline - nowMs();
+            if (remain <= 0) return error.Timeout;
+            var pfd = c.struct_pollfd{ .fd = fd, .events = c.POLLIN, .revents = 0 };
+            const pr = c.poll(&pfd, 1, @intCast(@min(remain, 250)));
+            if (pr < 0) {
+                if (std.posix.errno(pr) == .INTR) continue;
+                return error.EndOfStream;
+            }
+            if (pr == 0) continue;
+            var byte: [1]u8 = undefined;
+            const n = c.read(fd, &byte, 1);
+            if (n < 0 and std.posix.errno(n) == .INTR) continue;
+            if (n < 0 and std.posix.errno(n) == .AGAIN) continue;
+            if (n <= 0) return error.EndOfStream;
+            if (byte[0] == '\n') return buf[0..len];
+            if (len >= buf.len) return error.RouteProtocol;
+            buf[len] = byte[0];
+            len += 1;
+        }
+    }
+
+    /// An unlinked, close-on-exec scratch file; -1 when none can be made.
+    fn scratchFile() c_int {
+        var tmpl: [4096:0]u8 = undefined;
+        const path = std.fmt.bufPrintZ(&tmpl, "{s}/sketerm-route-XXXXXX", .{@import("../util/platform.zig").runtimeDir()}) catch return -1;
+        const fd = c.mkstemp(path.ptr);
+        if (fd < 0) return -1;
+        _ = c.unlink(path.ptr);
+        _ = c.fcntl(fd, c.F_SETFD, c.FD_CLOEXEC);
+        return fd;
+    }
+
+    /// What the scratch file holds, once ssh stopped writing to it (bounded).
+    fn scratchRead(fd: c_int, buf: []u8) []const u8 {
+        if (fd < 0) return "";
+        var last: isize = -1;
+        const until = nowMs() + 400;
+        while (true) {
+            const n = c.pread(fd, buf.ptr, buf.len, 0);
+            if (n < 0) return "";
+            if (n == last or nowMs() >= until) return buf[0..@intCast(n)];
+            last = n;
+            _ = c.usleep(100_000);
+        }
     }
 
     /// Switch the fd to non-blocking so NO call on this connection can
@@ -1593,6 +1788,11 @@ pub const Conn = struct {
     /// (a Ctrl+C or SIGHUP in the shell that launched the GUI) from taking
     /// every session transport down with it.
     fn spawnOverSocketpair(allocator: std.mem.Allocator, bin: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) !Conn {
+        return spawnOverSocketpairErr(allocator, bin, argv, -1);
+    }
+
+    /// `spawnOverSocketpair` with the child's stderr on `err_fd` (-1 = inherited).
+    fn spawnOverSocketpairErr(allocator: std.mem.Allocator, bin: [*:0]const u8, argv: [*:null]const ?[*:0]const u8, err_fd: c_int) !Conn {
         var pair: [2]c_int = undefined;
         if (@import("../util/platform.zig").socketpairCloexec(&pair) != 0) return error.SocketFailed;
         errdefer {
@@ -1606,6 +1806,7 @@ pub const Conn = struct {
                 _ = c.setsid();
                 _ = c.dup2(pair[1], 0);
                 _ = c.dup2(pair[1], 1);
+                if (err_fd >= 0) _ = c.dup2(err_fd, 2);
                 _ = c.close(pair[0]);
                 _ = c.close(pair[1]);
                 _ = c.execvp(bin, @ptrCast(@constCast(argv)));

@@ -102,6 +102,12 @@ pub const Flag = enum {
     /// beside it. Absent = the daemon ignores the field and would look
     /// beside its OWN socket, so a client refuses instead of sending it.
     web_helper_instance,
+    /// The `.list` reply carries `assistants`: THIS host's live MCP
+    /// servers from its registry (`mcp_registry.Report`), each with its
+    /// instance key and published agents, so a viewer can derive routes
+    /// to watch them (`sshroute.watchSpec`). Absent = an older daemon,
+    /// whose list says nothing about assistants: none are known there.
+    assistants,
 };
 
 /// One bool per flag, keyed by wire name; the parsed form on the

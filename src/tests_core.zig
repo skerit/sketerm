@@ -176,6 +176,7 @@ comptime {
     _ = @import("mux/deploy.zig");
     _ = @import("mux/socks5_client.zig");
     _ = @import("mux/sshroute.zig");
+    _ = @import("mux/proxyroute.zig");
     _ = @import("mux/display.zig");
     _ = @import("mux/dmabuf_egl.zig");
     _ = @import("mux/drmdev.zig");

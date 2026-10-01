@@ -903,6 +903,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     // the agents a previous run left running.
     if (iso) |i| {
         mcp_agent.configure(allocator, i.dir, i.sock, i.durable);
+        mcp_agent.publishTo(if (registry_lease) |*lease| lease else null);
         mcp_agent.reattach();
     }
     defer mcp_agent.shutdown();

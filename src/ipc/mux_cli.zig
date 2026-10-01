@@ -32,6 +32,9 @@ const MUX_HELP =
     \\
     \\No command: interactive session picker (TUI) — local daemon,
     \\or <host>'s daemon (UDP when reachable, SSH fallback).
+    \\<host> may be a route, `route:A/B#KEY`: ssh to A, which dials B
+    \\with its own ssh, ending at B's daemon or, with #KEY, at the
+    \\private daemon of the live `sketerm mcp` instance KEY on B.
     \\  Up/Down or j/k  select        Enter  attach
     \\  n  new durable session        x      kill selected session
     \\  r  rename selected session    q / Esc  quit
@@ -1073,6 +1076,21 @@ pub fn muxConnect(allocator: std.mem.Allocator, host: ?[]const u8) ?mux_client.C
         defer cfg.deinit();
         const remote = mux_client.RemoteSpec.parse(h);
         const conn = mux_client.Conn.connectRemote(allocator, h, cfg.muxConnectOptions()) catch |err| {
+            if (mux_client.RouteSpec.isRoute(h)) {
+                // The route names its failing hop; ssh advice for the
+                // whole spec would point at a host that does not exist.
+                const why = mux_client.routeFailure();
+                const err_name = @errorName(err);
+                _ = c.fprintf(
+                    platform.stderr(),
+                    "sketerm mux: cannot reach %.*s: %.*s\n",
+                    @as(c_int, @intCast(h.len)),
+                    h.ptr,
+                    @as(c_int, @intCast(if (why.len > 0) why.len else err_name.len)),
+                    (if (why.len > 0) why else err_name).ptr,
+                );
+                return null;
+            }
             const mode_name = @tagName(remote.mode);
             const err_name = @errorName(err);
             // No portable artifact = this install cannot deploy the daemon

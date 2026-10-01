@@ -10,6 +10,9 @@ const selfexec = @import("selfexec.zig");
 pub const Mode = enum { auto, ssh, udp, tor };
 pub const Route = enum { direct, tor };
 
+/// A route spec reads as `.auto` with the whole text as `host`; callers that
+/// dial check `RouteSpec.isRoute` first (`Conn.connectRemote` and the
+/// `connectSsh*` family do), so a route can never reach a bare ssh argv.
 pub const RemoteSpec = struct {
     host: []const u8,
     mode: Mode,
@@ -22,6 +25,179 @@ pub const RemoteSpec = struct {
     }
 };
 
+/// Whether `destination` is an SSH destination that is safe on a command
+/// line: an alias, a host or `user@host`, no option and no shell
+/// metacharacter. The ONE rule for every destination this module puts on
+/// an argv or into a remote command (ProxyCommand `%h`, route hops).
+pub fn validDestination(destination: []const u8) bool {
+    if (destination.len == 0 or destination.len > 255 or destination[0] == '-') return false;
+    for (destination) |byte| switch (byte) {
+        'a'...'z', 'A'...'Z', '0'...'9', '.', '-', '_', '@', ':', '[', ']' => {},
+        else => return false,
+    };
+    return true;
+}
+
+/// One hop of a route: a valid destination that is not itself a
+/// transport-prefixed or routed spec (`udp:b`, `tor:b`, `route:b`).
+pub fn validHop(hop: []const u8) bool {
+    if (!validDestination(hop)) return false;
+    if (RemoteSpec.parse(hop).mode != .auto) return false;
+    return !std.mem.startsWith(u8, hop, RouteSpec.PREFIX) and !std.mem.startsWith(u8, hop, "sock:");
+}
+
+const webpresence = @import("../web/webpresence.zig");
+
+/// A host spec that reaches a daemon THROUGH other hosts:
+/// `route:[tor:]<hop>[/<hop>...][#<instance>]`. The first hop is dialed
+/// over ssh from here (through Tor with `tor:`); every further hop is
+/// dialed by the `sketerm-mux --proxy --via` on the hop before it; the
+/// optional instance is a live MCP server's private daemon on the LAST
+/// hop, else that host's per-user daemon. `/` and `#` cannot occur in a
+/// destination (`validDestination`), and `route:` is no transport
+/// prefix, so no existing spec (bare host, user@host, udp:/ssh:/tor:,
+/// sock:) parses as a route.
+pub const RouteSpec = struct {
+    pub const PREFIX = "route:";
+    pub const MAX_HOPS = 8;
+
+    tor: bool = false,
+    hop_buf: [MAX_HOPS][]const u8 = undefined,
+    n_hops: u8 = 0,
+    instance: ?[]const u8 = null,
+
+    pub const Error = error{ NotARoute, BadHop, TooManyHops, BadInstance, NotRouted };
+
+    pub fn isRoute(spec: []const u8) bool {
+        return std.mem.startsWith(u8, spec, PREFIX);
+    }
+
+    pub fn hops(self: *const RouteSpec) []const []const u8 {
+        return self.hop_buf[0..self.n_hops];
+    }
+
+    /// Append one hop; refused unless `validHop`.
+    pub fn addHop(self: *RouteSpec, hop: []const u8) Error!void {
+        if (!validHop(hop)) return error.BadHop;
+        if (self.n_hops >= MAX_HOPS) return error.TooManyHops;
+        self.hop_buf[self.n_hops] = hop;
+        self.n_hops += 1;
+    }
+
+    /// The slices point into `spec`.
+    /// @throws NotRouted for a single hop without an instance: that is the plain host spec.
+    pub fn parse(spec: []const u8) Error!RouteSpec {
+        if (!isRoute(spec)) return error.NotARoute;
+        var rest = spec[PREFIX.len..];
+        var out: RouteSpec = .{};
+        if (std.mem.startsWith(u8, rest, "tor:")) {
+            out.tor = true;
+            rest = rest["tor:".len..];
+        }
+        if (std.mem.indexOfScalar(u8, rest, '#')) |hash| {
+            const inst = rest[hash + 1 ..];
+            if (!webpresence.validInstance(inst)) return error.BadInstance;
+            out.instance = inst;
+            rest = rest[0..hash];
+        }
+        var it = std.mem.splitScalar(u8, rest, '/');
+        while (it.next()) |hop| try out.addHop(hop);
+        try out.check();
+        return out;
+    }
+
+    /// Refuse what `parse` would refuse; builders call it before `format`.
+    pub fn check(self: *const RouteSpec) Error!void {
+        if (self.n_hops == 0) return error.BadHop;
+        if (self.n_hops == 1 and self.instance == null) return error.NotRouted;
+        for (self.hops()) |hop| if (!validHop(hop)) return error.BadHop;
+        if (self.instance) |inst| if (!webpresence.validInstance(inst)) return error.BadInstance;
+    }
+
+    /// The canonical text `parse` reads back.
+    pub fn format(self: *const RouteSpec, buf: []u8) (Error || error{NoSpaceLeft})![]const u8 {
+        try self.check();
+        var w: std.Io.Writer = .fixed(buf);
+        w.writeAll(PREFIX) catch return error.NoSpaceLeft;
+        if (self.tor) w.writeAll("tor:") catch return error.NoSpaceLeft;
+        for (self.hops(), 0..) |hop, i| {
+            if (i > 0) w.writeByte('/') catch return error.NoSpaceLeft;
+            w.writeAll(hop) catch return error.NoSpaceLeft;
+        }
+        if (self.instance) |inst| w.print("#{s}", .{inst}) catch return error.NoSpaceLeft;
+        return w.buffered();
+    }
+};
+
+/// Where an MCP sub-agent's sessions live, as the MCP registry records it:
+/// `instance` (the MCP server's private daemon: local and `ssh -tt`
+/// agents) or `host:<destination>` (that host's per-user daemon: the
+/// remote sketerm-mux transport).
+pub const Location = union(enum) {
+    instance,
+    host: []const u8,
+
+    pub fn parse(text: []const u8) ?Location {
+        if (std.mem.eql(u8, text, "instance")) return .instance;
+        if (std.mem.startsWith(u8, text, "host:") and text.len > "host:".len) return .{ .host = text["host:".len..] };
+        return null;
+    }
+
+    pub fn format(self: Location, buf: []u8) error{NoSpaceLeft}![]const u8 {
+        return switch (self) {
+            .instance => std.fmt.bufPrint(buf, "instance", .{}),
+            .host => |h| std.fmt.bufPrint(buf, "host:{s}", .{h}),
+        };
+    }
+};
+
+/// The host spec a viewer dials to watch an agent at `location` of the MCP
+/// instance `instance` whose registry a daemon reported. `reached` is the
+/// spec that daemon was reached at (null or `sock:...` = this machine,
+/// i.e. the local registry); `local_socket` is the instance's daemon
+/// socket from the local registry and is only read for local `instance`
+/// agents. Remote: `instance` -> the reached hops plus `#instance`;
+/// `host:B` -> the reached hops plus `/B` (B's per-user daemon). Local:
+/// `instance` -> `sock:<local_socket>`; `host:B` -> plain `B`. A UDP or
+/// automatic first hop becomes plain ssh: routes always dial ssh.
+pub fn watchSpec(
+    buf: []u8,
+    reached: ?[]const u8,
+    instance: []const u8,
+    local_socket: []const u8,
+    location: Location,
+) (RouteSpec.Error || error{NoSpaceLeft})![]const u8 {
+    const local = if (reached) |r| std.mem.startsWith(u8, r, "sock:") else true;
+    if (local) return switch (location) {
+        .instance => blk: {
+            if (local_socket.len == 0) return error.BadInstance;
+            break :blk std.fmt.bufPrint(buf, "sock:{s}", .{local_socket});
+        },
+        .host => |h| blk: {
+            if (!validHop(h)) return error.BadHop;
+            break :blk std.fmt.bufPrint(buf, "{s}", .{h});
+        },
+    };
+    var route: RouteSpec = .{};
+    if (RouteSpec.isRoute(reached.?)) {
+        const base = try RouteSpec.parse(reached.?);
+        route.tor = base.tor;
+        for (base.hops()) |hop| try route.addHop(hop);
+    } else {
+        const remote = RemoteSpec.parse(reached.?);
+        route.tor = remote.mode == .tor;
+        try route.addHop(remote.host);
+    }
+    switch (location) {
+        .instance => {
+            if (!webpresence.validInstance(instance)) return error.BadInstance;
+            route.instance = instance;
+        },
+        .host => |h| try route.addHop(h),
+    }
+    return route.format(buf);
+}
+
 pub const Plan = struct {
     destination: []const u8,
     route: Route = .direct,
@@ -31,17 +207,8 @@ pub const Plan = struct {
     /// runs the result through `/bin/sh -c`. Our command starts with `exec`,
     /// which makes an injected `';cmd;'` unreachable today, but that is a
     /// subtle property to depend on: one edit to the command prefix would
-    /// turn a destination into arbitrary local execution. Constrain the
-    /// destination to what an SSH alias or user@host can legitimately hold.
-    fn validDestination(destination: []const u8) bool {
-        if (destination.len == 0 or destination[0] == '-') return false;
-        for (destination) |byte| switch (byte) {
-            'a'...'z', 'A'...'Z', '0'...'9', '.', '-', '_', '@', ':', '[', ']' => {},
-            else => return false,
-        };
-        return true;
-    }
-
+    /// turn a destination into arbitrary local execution, hence the
+    /// module-level `validDestination`.
     pub fn init(destination: []const u8, route: Route, tor_endpoint: []const u8) !Plan {
         if (!validDestination(destination)) return error.BadDestination;
         if (route == .tor) _ = try socks5_client.Endpoint.parse(tor_endpoint);
@@ -268,6 +435,90 @@ test "the slice form carries the same route options minus the ssh-only flags" {
         proxies += 1;
     };
     try t.expectEqual(@as(usize, 1), proxies);
+}
+
+test "route specs round-trip through their one canonical text" {
+    const t = std.testing;
+    const cases = [_][]const u8{
+        "route:hosta#tmp-4242",
+        "route:me@hosta/hostb",
+        "route:a/b/c#work_1",
+        "route:tor:abcdefghij234567.onion/inner#default",
+        "route:[::1]/b",
+    };
+    for (cases) |text| {
+        const r = try RouteSpec.parse(text);
+        var buf: [256]u8 = undefined;
+        try t.expectEqualStrings(text, try r.format(&buf));
+    }
+    const r = try RouteSpec.parse("route:tor:a/b#x");
+    try t.expect(r.tor);
+    try t.expectEqual(@as(usize, 2), r.hops().len);
+    try t.expectEqualStrings("b", r.hops()[1]);
+    try t.expectEqualStrings("x", r.instance.?);
+}
+
+test "route specs refuse what could not be dialed safely" {
+    const t = std.testing;
+    try t.expectError(error.NotARoute, RouteSpec.parse("hosta"));
+    try t.expectError(error.NotRouted, RouteSpec.parse("route:hosta"));
+    try t.expectError(error.BadHop, RouteSpec.parse("route:"));
+    try t.expectError(error.BadHop, RouteSpec.parse("route:a//b"));
+    try t.expectError(error.BadHop, RouteSpec.parse("route:a/b;rm -rf ~"));
+    try t.expectError(error.BadHop, RouteSpec.parse("route:a/$(id)"));
+    try t.expectError(error.BadHop, RouteSpec.parse("route:a/-oProxyCommand=x"));
+    try t.expectError(error.BadHop, RouteSpec.parse("route:a/udp:b"));
+    try t.expectError(error.BadHop, RouteSpec.parse("route:udp:a/b"));
+    try t.expectError(error.BadHop, RouteSpec.parse("route:a/route:b"));
+    try t.expectError(error.BadHop, RouteSpec.parse("route:a/sock:b"));
+    try t.expectError(error.BadInstance, RouteSpec.parse("route:a#"));
+    try t.expectError(error.BadInstance, RouteSpec.parse("route:a#../x"));
+    try t.expectError(error.BadInstance, RouteSpec.parse("route:a#x/y"));
+    try t.expectError(error.TooManyHops, RouteSpec.parse("route:a/b/c/d/e/f/g/h/i"));
+}
+
+test "route specs never collide with the existing host specs" {
+    const t = std.testing;
+    for ([_][]const u8{ "box", "user@box", "udp:box", "ssh:box", "tor:box", "sock:/run/x/mux.sock", "[::1]" }) |spec| {
+        try t.expect(!RouteSpec.isRoute(spec));
+        try t.expectError(error.NotARoute, RouteSpec.parse(spec));
+    }
+    // ...and a route is never mistaken for a transport prefix or a destination.
+    try t.expectEqual(Mode.auto, RemoteSpec.parse("route:a#x").mode);
+    try t.expect(!validDestination("route:a#x"));
+    try t.expect(!validDestination("route:a/b"));
+}
+
+test "agent locations round-trip" {
+    const t = std.testing;
+    var buf: [64]u8 = undefined;
+    try t.expectEqualStrings("instance", try (Location{ .instance = {} }).format(&buf));
+    try t.expectEqualStrings("host:me@b", try (Location{ .host = "me@b" }).format(&buf));
+    try t.expectEqual(Location.instance, Location.parse("instance").?);
+    try t.expectEqualStrings("b", Location.parse("host:b").?.host);
+    try t.expect(Location.parse("host:") == null);
+    try t.expect(Location.parse("elsewhere") == null);
+}
+
+test "watchSpec derives the route an agent is watched at" {
+    const t = std.testing;
+    var buf: [256]u8 = undefined;
+    // Reached at host A (any transport): instance -> A#I, host:B -> A/B.
+    try t.expectEqualStrings("route:a#tmp-9", try watchSpec(&buf, "a", "tmp-9", "", .instance));
+    try t.expectEqualStrings("route:a/b", try watchSpec(&buf, "udp:a", "tmp-9", "", .{ .host = "b" }));
+    try t.expectEqualStrings("route:a#tmp-9", try watchSpec(&buf, "ssh:a", "tmp-9", "", .instance));
+    try t.expectEqualStrings("route:tor:a/b", try watchSpec(&buf, "tor:a", "x", "", .{ .host = "b" }));
+    // Reached through a route: its hops are kept, its own instance is not.
+    try t.expectEqualStrings("route:a/b#w", try watchSpec(&buf, "route:a/b", "w", "", .instance));
+    try t.expectEqualStrings("route:a/c", try watchSpec(&buf, "route:a#x", "w", "", .{ .host = "c" }));
+    // The local registry: the private socket, or the host's own daemon.
+    try t.expectEqualStrings("sock:/run/u/sketerm/mcp-w/mux.sock", try watchSpec(&buf, null, "w", "/run/u/sketerm/mcp-w/mux.sock", .instance));
+    try t.expectEqualStrings("b", try watchSpec(&buf, null, "w", "", .{ .host = "b" }));
+    try t.expectEqualStrings("b", try watchSpec(&buf, "sock:/x/mux.sock", "w", "", .{ .host = "b" }));
+    // A host an MCP accepted but a route cannot carry is refused.
+    try t.expectError(error.BadHop, watchSpec(&buf, "a", "w", "", .{ .host = "b;x" }));
+    try t.expectError(error.BadHop, watchSpec(&buf, null, "w", "", .{ .host = "b c" }));
+    try t.expectError(error.BadInstance, watchSpec(&buf, "a", "../w", "", .instance));
 }
 
 test "route memo identity separates direct and Tor verification" {

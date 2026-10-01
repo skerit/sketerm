@@ -27,6 +27,8 @@ const platform = @import("util/platform.zig");
 const testserver = @import("agent/testserver.zig");
 const readfile = @import("util/readfile.zig");
 const SpinLock = @import("util/spinlock.zig").SpinLock;
+const termdrive = @import("ipc/termdrive.zig");
+const sshroute = @import("mux/sshroute.zig");
 
 fn say(msg: []const u8) void {
     _ = c.write(2, msg.ptr, msg.len);
@@ -728,6 +730,16 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     if (c.getenv("SKETERM_SMOKE_MCP_AGENTSSH_ONLY") != null) {
         agentSshStage(allocator, exe, rt);
         say("smoke-mcp: focused sub-agents over ssh stage ok");
+        killDaemonsUnderRt(rt, allocator);
+        _ = c.usleep(500_000);
+        g_rt = null;
+        pathz.removeTree(rt);
+        return 0;
+    }
+    // Focused only, by design: routes + the daemon's assistants report.
+    if (c.getenv("SKETERM_SMOKE_MCP_ROUTE_ONLY") != null) {
+        routeStage(allocator, exe, rt);
+        say("smoke-mcp: focused routes and assistants report stage ok");
         killDaemonsUnderRt(rt, allocator);
         _ = c.usleep(500_000);
         g_rt = null;
@@ -6890,6 +6902,345 @@ fn expectPasswordsHidden(arena: std.mem.Allocator, casts: []const std.json.Value
             if (std.mem.indexOf(u8, bytes, pw) != null) fail(what ++ ": a recording carries the password");
         }
     }
+}
+
+/// Run `argv` with stdout+stderr captured, bounded; the exit status in `status`.
+fn runCapture(argv: []const ?[*:0]const u8, buf: []u8, status: *c_int, timeout_ms: i64) []const u8 {
+    var pipe: [2]c_int = undefined;
+    if (c.pipe(&pipe) != 0) fail("capture pipe");
+    const pid = c.fork();
+    if (pid < 0) fail("capture fork");
+    if (pid == 0) {
+        _ = c.dup2(pipe[1], 1);
+        _ = c.dup2(pipe[1], 2);
+        _ = c.close(pipe[0]);
+        _ = c.close(pipe[1]);
+        _ = c.execv(argv[0].?, @ptrCast(argv.ptr));
+        c._exit(127);
+    }
+    _ = c.close(pipe[1]);
+    defer _ = c.close(pipe[0]);
+    var used: usize = 0;
+    const deadline = nowMs() + timeout_ms;
+    while (used < buf.len) {
+        var pfd = c.struct_pollfd{ .fd = pipe[0], .events = c.POLLIN, .revents = 0 };
+        if (c.poll(&pfd, 1, 200) > 0) {
+            const n = c.read(pipe[0], buf[used..].ptr, buf.len - used);
+            if (n <= 0) break;
+            used += @intCast(n);
+        }
+        if (nowMs() >= deadline) {
+            _ = c.kill(pid, c.SIGKILL);
+            _ = c.waitpid(pid, null, 0);
+            fail("a captured command timed out");
+        }
+    }
+    _ = c.waitpid(pid, status, 0);
+    return buf[0..used];
+}
+
+/// Start a per-user daemon for one fake host (its own runtime dir).
+fn startHostDaemon(rt_host: [:0]const u8) c.pid_t {
+    const pid = c.fork();
+    if (pid < 0) fail("fork host daemon");
+    if (pid == 0) {
+        _ = c.setenv("XDG_RUNTIME_DIR", rt_host.ptr, 1);
+        _ = c.setenv("XDG_STATE_HOME", rt_host.ptr, 1);
+        _ = c.setenv("XDG_CONFIG_HOME", rt_host.ptr, 1);
+        const argv = [_:null]?[*:0]const u8{ "sketerm-mux", "--broker", null };
+        _ = c.execv("zig-out/bin/sketerm-mux", @ptrCast(@constCast(&argv)));
+        c._exit(127);
+    }
+    var sock_buf: [512]u8 = undefined;
+    const sock = std.fmt.bufPrint(&sock_buf, "{s}/sketerm/mux.sock", .{rt_host}) catch fail("oom");
+    const deadline = nowMs() + 10_000;
+    while (!fileExists(sock)) {
+        if (nowMs() > deadline) fail("a fake host's daemon socket never appeared");
+        _ = c.usleep(50_000);
+    }
+    return pid;
+}
+
+/// A session of `conn`'s daemon: present, with its lifetime id.
+fn listedOrigin(allocator: std.mem.Allocator, conn: *muxclient.Conn, name: []const u8) ?wire.SessionOriginId {
+    conn.sendFrame(.list, "") catch fail("route list send");
+    const frame = conn.recvExpectFor(&.{.welcome}, 10_000) catch fail("route list reply");
+    defer frame.deinit(allocator);
+    const Listing = struct { sessions: []const struct { name: []const u8 = "", origin_id: []const u8 = "" } = &.{} };
+    const parsed = std.json.parseFromSlice(Listing, allocator, frame.payload, .{ .ignore_unknown_fields = true }) catch fail("route list parse");
+    defer parsed.deinit();
+    for (parsed.value.sessions) |s| {
+        if (!std.mem.eql(u8, s.name, name)) continue;
+        if (!wire.validSessionOriginId(s.origin_id)) return null;
+        var id: wire.SessionOriginId = undefined;
+        @memcpy(&id, s.origin_id);
+        return id;
+    }
+    return null;
+}
+
+/// Watch an agent along `route` the way a viewer does: list it there,
+/// attach, read the fake Claude Code's screen, type a prompt and see its
+/// answer, detach (never kill: the agent belongs to its MCP server).
+fn watchAlong(allocator: std.mem.Allocator, route: []const u8, session: []const u8, prompt: []const u8, comptime what: []const u8) void {
+    var conn = muxclient.Conn.connectRemote(allocator, route, .{}) catch {
+        say(muxclient.routeFailure());
+        fail(what ++ ": the route did not connect");
+    };
+    const origin = listedOrigin(allocator, &conn, session) orelse {
+        conn.deinit();
+        fail(what ++ ": the agent's session is not listed along the route");
+    };
+    conn.setNonBlocking();
+    const term = termdrive.Term.attachConn(allocator, &conn, session, origin) catch fail(what ++ ": attach along the route failed");
+    defer term.detach();
+    const deadline = nowMs() + 15_000;
+    var typed = false;
+    var answer_buf: [128]u8 = undefined;
+    const answer = std.fmt.bufPrint(&answer_buf, "echo: {s}", .{prompt}) catch fail("oom");
+    while (true) {
+        const text = term.readScreen(false) catch fail(what ++ ": the attached screen is unreadable");
+        defer allocator.free(text);
+        if (!typed and std.mem.indexOf(u8, text, "Claude Code v0.0.0") != null) {
+            var line_buf: [128]u8 = undefined;
+            term.sendText(std.fmt.bufPrint(&line_buf, "{s}\r", .{prompt}) catch fail("oom")) catch fail(what ++ ": input along the route failed");
+            typed = true;
+        }
+        if (typed and std.mem.indexOf(u8, text, answer) != null) return;
+        if (nowMs() > deadline) {
+            say(text);
+            if (typed) fail(what ++ ": the typed prompt never reached the agent");
+            fail(what ++ ": the agent's screen never showed");
+        }
+        _ = c.usleep(100_000);
+    }
+}
+
+/// Expect `route` to fail fast with `want` in the client's sentence.
+fn expectRouteRefused(allocator: std.mem.Allocator, route: []const u8, want_err: anyerror, want: []const u8, comptime what: []const u8) void {
+    const started = nowMs();
+    if (muxclient.Conn.connectRemote(allocator, route, .{})) |conn| {
+        var cc = conn;
+        cc.deinit();
+        fail(what ++ ": the route connected");
+    } else |err| {
+        const took = nowMs() - started;
+        const why = muxclient.routeFailure();
+        if (err != want_err or std.mem.indexOf(u8, why, want) == null) {
+            say(@errorName(err));
+            say(why);
+            fail(what ++ ": the wrong failure");
+        }
+        if (took > 10_000) fail(what ++ ": the failure was not prompt");
+        var line_buf: [512]u8 = undefined;
+        say(std.fmt.bufPrint(&line_buf, "smoke-mcp: route {s} refused in {d}ms: {s}", .{ route, took, why }) catch "smoke-mcp: route refused");
+    }
+}
+
+/// Routes and the assistants report, across fake hosts: `$SKETERM_SSH` is
+/// a script that runs each "host" here under its OWN runtime dir (hosta,
+/// hostb, oldhost whose sketerm-mux predates routes). A real `sketerm mcp`
+/// runs on hosta with one sub-agent there and one on hostb's daemon; from
+/// this side hosta's daemon reports both, and routes derived by
+/// `sshroute.watchSpec` list, attach and type into each.
+fn routeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) void {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var self_buf: [4096]u8 = undefined;
+    const self_exe = platform.exePath(&self_buf) orelse fail("route stage: own executable path");
+    var mux_abs_buf: [4096]u8 = undefined;
+    const mux_abs = std.mem.span(@as([*:0]const u8, @ptrCast(c.realpath("zig-out/bin/sketerm-mux", &mux_abs_buf) orelse fail("zig-out/bin/sketerm-mux missing"))));
+
+    // The sub-agent binaries live where an ssh login's PATH does not look.
+    const home = std.mem.span(@as([*:0]const u8, @ptrCast(c.getenv("HOME") orelse fail("no HOME"))));
+    const local_bin = std.fmt.allocPrintSentinel(arena, "{s}/.local/bin", .{home}, 0) catch fail("oom");
+    _ = c.system((std.fmt.allocPrintSentinel(arena, "mkdir -p '{s}'", .{local_bin}, 0) catch fail("oom")).ptr);
+    {
+        const link = std.fmt.allocPrintSentinel(arena, "{s}/claude", .{local_bin}, 0) catch fail("oom");
+        _ = c.unlink(link.ptr);
+        if (c.symlink((arena.dupeZ(u8, self_exe) catch fail("oom")).ptr, link.ptr) != 0) fail("route stage: fake claude link");
+    }
+    const fakebin = std.fmt.allocPrintSentinel(arena, "{s}/fakebin", .{rt}, 0) catch fail("oom");
+    _ = c.mkdir(fakebin.ptr, 0o700);
+    {
+        const link = std.fmt.allocPrintSentinel(arena, "{s}/ssh", .{fakebin}, 0) catch fail("oom");
+        _ = c.unlink(link.ptr);
+        if (c.symlink((arena.dupeZ(u8, self_exe) catch fail("oom")).ptr, link.ptr) != 0) fail("route stage: fake ssh link");
+    }
+
+    // Three hosts, each its own runtime dir; `sketerm-mux` on each one's
+    // PATH is this build, except on oldhost, where it predates routes.
+    const hosts = [_][]const u8{ "a", "b", "o" };
+    var host_rt: [3][:0]const u8 = undefined;
+    for (hosts, 0..) |h, i| {
+        host_rt[i] = std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ rt, h }, 0) catch fail("oom");
+        _ = c.mkdir(host_rt[i].ptr, 0o700);
+        const bin = std.fmt.allocPrintSentinel(arena, "{s}/bin", .{host_rt[i]}, 0) catch fail("oom");
+        _ = c.mkdir(bin.ptr, 0o700);
+        const mux = std.fmt.allocPrintSentinel(arena, "{s}/sketerm-mux", .{bin}, 0) catch fail("oom");
+        _ = c.unlink(mux.ptr);
+        if (i < 2) {
+            if (c.symlink((arena.dupeZ(u8, mux_abs) catch fail("oom")).ptr, mux.ptr) != 0) fail("route stage: mux link");
+        } else {
+            // What every sketerm-mux before routes does with a flag it
+            // does not know: name it on stderr and exit 2.
+            const body = std.fmt.allocPrint(arena,
+                \\#!/bin/sh
+                \\[ "$1" = "--proxy" ] && exec '{s}' --proxy
+                \\echo "sketerm-mux: unknown argument: $1" >&2
+                \\exit 2
+                \\
+            , .{mux_abs}) catch fail("oom");
+            writeExecutable(mux, body);
+        }
+    }
+    const ssh_script = std.fmt.allocPrintSentinel(arena, "{s}/route-ssh", .{rt}, 0) catch fail("oom");
+    {
+        const body = std.fmt.allocPrint(arena,
+            \\#!/bin/sh
+            \\if [ "$1" = "-G" ]; then printf 'hostname 127.0.0.1\n'; exit 0; fi
+            \\while [ $# -gt 0 ]; do
+            \\  case "$1" in
+            \\    -o|-L|-R|-D|-i|-p|-F|-J|-l) shift 2 ;;
+            \\    -*) shift ;;
+            \\    *) break ;;
+            \\  esac
+            \\done
+            \\host="$1"; shift
+            \\case "$host" in
+            \\  hosta) h='{s}' ;;
+            \\  hostb) h='{s}' ;;
+            \\  oldhost) h='{s}' ;;
+            \\  *) echo "ssh: Could not resolve hostname $host: Name or service not known" >&2; exit 255 ;;
+            \\esac
+            \\export XDG_RUNTIME_DIR="$h" XDG_STATE_HOME="$h" XDG_CONFIG_HOME="$h" PATH="$h/bin:$PATH"
+            \\exec /bin/sh -c "$*"
+            \\
+        , .{ host_rt[0], host_rt[1], host_rt[2] }) catch fail("oom");
+        writeExecutable(ssh_script, body);
+    }
+
+    const old_path: []const u8 = if (c.getenv("PATH")) |p| std.mem.span(@as([*:0]const u8, @ptrCast(p))) else "/usr/bin:/bin";
+    const saved_path = arena.dupeZ(u8, old_path) catch fail("oom");
+    const saved_rt = arena.dupeZ(u8, std.mem.span(@as([*:0]const u8, @ptrCast(c.getenv("XDG_RUNTIME_DIR").?)))) catch fail("oom");
+    _ = c.setenv("PATH", (std.fmt.allocPrintSentinel(arena, "{s}:/usr/bin:/bin", .{fakebin}, 0) catch fail("oom")).ptr, 1);
+    _ = c.setenv(FAKE_SSH_ENV, "1", 1);
+    _ = c.setenv(FAKE_AGENT_ENV, "1", 1);
+    _ = c.setenv("SKETERM_SSH", ssh_script.ptr, 1);
+    defer {
+        _ = c.setenv("PATH", saved_path.ptr, 1);
+        _ = c.setenv("XDG_RUNTIME_DIR", saved_rt.ptr, 1);
+        _ = c.unsetenv(FAKE_SSH_ENV);
+        _ = c.unsetenv(FAKE_AGENT_ENV);
+        _ = c.unsetenv("SKETERM_SSH");
+    }
+    // The per-user daemons of hosta and hostb, started here so their pids are ours.
+    const pid_a = startHostDaemon(host_rt[0]);
+    const pid_b = startHostDaemon(host_rt[1]);
+    defer for ([_]c.pid_t{ pid_a, pid_b }) |p| {
+        _ = c.kill(p, c.SIGTERM);
+        _ = c.waitpid(p, null, 0);
+    };
+
+    // ── hosta runs `sketerm mcp` with an agent there and one on hostb ──
+    _ = c.setenv("XDG_RUNTIME_DIR", host_rt[0].ptr, 1);
+    var m = Mcp.spawn(allocator, exe, &.{});
+    // A durable instance that has exited: its directory stays, no live server.
+    var dead = Mcp.spawn(allocator, exe, &.{ "--name", "deadone" });
+    _ = c.setenv("XDG_RUNTIME_DIR", saved_rt.ptr, 1);
+    dead.initialize();
+    dead.closeStdinWait();
+    m.initialize();
+    const bin_json = std.fmt.allocPrint(arena, "{f}", .{std.json.fmt(self_exe, .{})}) catch fail("oom");
+    const local = agentCall(&m, arena, "agent_open", std.fmt.allocPrint(arena, "{{\"app\":\"claude\",\"binary\":{s},\"timeout_ms\":30000}}", .{bin_json}) catch fail("oom"), "route stage: agent_open on hosta", false, 45_000);
+    expectFact(local, "transport", "local", "route stage: the hosta agent is local");
+    const remote = agentCall(&m, arena, "agent_open", "{\"app\":\"claude\",\"host\":\"hostb\",\"timeout_ms\":45000}", "route stage: agent_open host hostb", false, 60_000);
+    expectFact(remote, "transport", "sketerm-mux", "route stage: the hostb agent is on hostb's daemon");
+    const local_session = scStr(local, "session", "route stage: local session");
+    const remote_session = scStr(remote, "session", "route stage: remote session");
+
+    // ── from here: hosta's daemon reports the assistant and both agents ──
+    const Report = @import("ipc/mcp_registry.zig").Report;
+    var instance_key: []const u8 = "";
+    {
+        var conn = muxclient.Conn.connectRemote(allocator, "ssh:hosta", .{}) catch fail("route stage: ssh to hosta");
+        defer conn.deinit();
+        if (!conn.caps.assistants) fail("route stage: hosta's daemon does not advertise assistants");
+        conn.sendFrame(.list, "") catch fail("route stage: list send");
+        const frame = conn.recvExpectFor(&.{.welcome}, 10_000) catch fail("route stage: list reply");
+        defer frame.deinit(allocator);
+        const Listing = struct { assistants: []const Report = &.{} };
+        const parsed = std.json.parseFromSlice(Listing, arena, frame.payload, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch fail("route stage: list parse");
+        if (parsed.value.assistants.len != 1) {
+            say(frame.payload);
+            fail("route stage: hosta's daemon must report exactly its one live MCP server");
+        }
+        const rep = parsed.value.assistants[0];
+        var want_buf: [32]u8 = undefined;
+        if (!std.mem.eql(u8, rep.instance, std.fmt.bufPrint(&want_buf, "tmp-{d}", .{m.pid}) catch fail("oom"))) fail("route stage: the reported instance key is not the server's");
+        instance_key = rep.instance;
+        const agents = rep.agents orelse fail("route stage: the report carries no agents");
+        if (agents.len != 2) fail("route stage: the report must carry both agents");
+        var buf: [256]u8 = undefined;
+        for (agents) |ag| {
+            const where = sshroute.Location.parse(ag.location) orelse fail("route stage: unparseable agent location");
+            const route = sshroute.watchSpec(&buf, "ssh:hosta", rep.instance, "", where) catch fail("route stage: no watch route derived");
+            const want_route = if (std.mem.eql(u8, ag.sessions[0], local_session))
+                std.fmt.bufPrint(&want_buf, "route:hosta#{s}", .{rep.instance}) catch fail("oom")
+            else if (std.mem.eql(u8, ag.sessions[0], remote_session))
+                "route:hosta/hostb"
+            else
+                fail("route stage: a reported agent's session is unknown");
+            if (!std.mem.eql(u8, route, want_route)) {
+                say(route);
+                fail("route stage: the derived watch route is wrong");
+            }
+        }
+        say("smoke-mcp: route stage: hosta's daemon reports the assistant, both agents and their locations");
+    }
+
+    // ── the CLI takes a route as its host ──
+    const inst_route = std.fmt.allocPrintSentinel(arena, "route:hosta#{s}", .{instance_key}, 0) catch fail("oom");
+    {
+        var out_buf: [16 * 1024]u8 = undefined;
+        var status: c_int = 0;
+        const argv = [_]?[*:0]const u8{ exe, "mux", inst_route.ptr, "list", null };
+        const out = runCapture(&argv, &out_buf, &status, 60_000);
+        if (status != 0 or std.mem.indexOf(u8, out, local_session) == null) {
+            say(out);
+            fail("route stage: `sketerm mux <route> list` did not list the instance's agent");
+        }
+        const argv2 = [_]?[*:0]const u8{ exe, "mux", "route:hosta#nosuch", "list", null };
+        const out2 = runCapture(&argv2, &out_buf, &status, 60_000);
+        if (status == 0 or std.mem.indexOf(u8, out2, "no MCP instance 'nosuch'") == null) {
+            say(out2);
+            fail("route stage: the CLI did not name the unknown instance");
+        }
+    }
+
+    // ── watch along both routes ──
+    watchAlong(allocator, inst_route, local_session, "via hosta", "route stage: hosta instance");
+    watchAlong(allocator, "route:hosta/hostb", remote_session, "via hostb", "route stage: hosta -> hostb");
+    say("smoke-mcp: route stage: both agents listed, attached, read and typed into along their routes");
+
+    // ── refusals: named, prompt, never a hang ──
+    expectRouteRefused(allocator, "route:hosta#deadone", error.RouteRefused, "is not running", "route stage: dead instance");
+    expectRouteRefused(allocator, "route:hosta#nosuch", error.RouteRefused, "no MCP instance 'nosuch'", "route stage: unknown instance");
+    expectRouteRefused(allocator, "route:oldhost/hostb", error.RouteHopTooOld, "sketerm-mux on oldhost is too old for routes", "route stage: an old first hop");
+    expectRouteRefused(allocator, "route:hosta/oldhost#x", error.RouteHopTooOld, "sketerm-mux on oldhost is too old for routes", "route stage: an old later hop");
+    expectRouteRefused(allocator, "route:hosta/nohost", error.RouteHopUnreachable, "Could not resolve hostname nohost", "route stage: an unreachable hop");
+
+    _ = agentCall(&m, arena, "agent_close", "{\"agent\":\"claude-2\"}", "route stage: close hostb agent", false, 15_000);
+    _ = agentCall(&m, arena, "agent_close", "{\"agent\":\"claude-1\"}", "route stage: close hosta agent", false, 15_000);
+    m.closeStdinWait();
+}
+
+fn writeExecutable(path: [:0]const u8, body: []const u8) void {
+    const f = c.fopen(path.ptr, "w") orelse fail("cannot write a fake executable");
+    _ = c.fwrite(body.ptr, 1, body.len, f);
+    _ = c.fclose(f);
+    if (c.chmod(path.ptr, 0o755) != 0) fail("chmod a fake executable");
 }
 
 /// The agent_* tools with `host`, against this machine standing in for

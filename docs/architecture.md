@@ -359,6 +359,12 @@ path every session uses — there is no separate "local" path left.
   go-back-N stream with piggybacked acks runs on top so the framed
   protocol is unchanged. `rudp.zig` is a pure state machine with
   injectable clock/emit — loss, replay, and tamper are unit-tested.
+- *Routes*: a `route:hostA/hostB#instance` host spec (grammar in
+  `src/mux/sshroute.zig`) reaches a daemon THROUGH other hosts: ssh to
+  the first hop runs `sketerm-mux --via hostB --instance K --proxy`,
+  and each hop's proxy dials the next with its own ssh, ending at a
+  host's per-user daemon or (with `#K`) a live MCP server's private
+  daemon there. Always ssh, never UDP. See `src/mux/CLAUDE.md`.
 
 **File transfer (proto v3).** Because the daemon *is* the session,
 moving a file is just streaming bytes over the mux connection.

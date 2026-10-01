@@ -4845,6 +4845,7 @@ pub const Daemon = struct {
     pub const spawnCastSessionWithOrigin = daemon_cast.spawnCastSessionWithOrigin;
 
     pub const isWorker = daemon_sessions.isWorker;
+    pub const queueListReply = daemon_sessions.queueListReply;
     pub const handleSpawn = daemon_sessions.handleSpawn;
     pub const spawnSession = daemon_sessions.spawnSession;
     pub const spawnSessionWithOrigin = daemon_sessions.spawnSessionWithOrigin;
@@ -5977,8 +5978,7 @@ pub const Daemon = struct {
                 return;
             };
         }
-        var vnames: [wlvcodec.CodecList.cap][]const u8 = undefined;
-        cl.queueJson(.welcome, .{ .proto = cl.proto, .daemon_pid = c.getpid(), .server_proto = wire.PROTO_VERSION, .min_proto = wire.MIN_SERVER_PROTO, .negotiation = @as(u8, 1), .version = version.string, .audio_opus = opuscodec.available(), .video = wlvcodec.canEncode(.h264), .video_codecs = wlvcodec.encodableHere().names(&vnames), .sessions = infos.items });
+        self.queueListReply(cl, infos.items);
     }
 
     const ForwardReq = struct { port: u16 };

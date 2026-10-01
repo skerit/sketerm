@@ -8,13 +8,14 @@ const c = @import("c.zig").c;
 const daemon = @import("mux/daemon.zig");
 const platform = @import("util/platform.zig");
 const selfexec = @import("mux/selfexec.zig");
+const proxyroute = @import("mux/proxyroute.zig");
 const VERSION = @import("version.zig").string;
 
 const HELP =
     \\sketerm-mux — sketerm session daemon (durable panes)
     \\
     \\Usage: sketerm-mux [--socket PATH] [--idle-exit SECS]
-    \\       sketerm-mux --proxy
+    \\       sketerm-mux [--via HOST]... [--instance KEY] --proxy
     \\       sketerm-mux --udp-listen [--udp-port LO:HI]
     \\       sketerm-mux display <create|run|inspect|list|destroy> ...
     \\       sketerm-mux --version
@@ -40,6 +41,17 @@ const HELP =
     \\runs `ssh <host> sketerm-mux --proxy` and speaks the mux
     \\protocol over the SSH pipe — sessions live in the REMOTE
     \\daemon and survive the connection.
+    \\--instance KEY bridges instead to the private daemon of a live MCP
+    \\server on this host (`sketerm mcp`; KEY is its --name, or tmp-PID
+    \\for an unnamed one), resolved from this host's MCP registry. It
+    \\connects only: a dead instance is refused, never restarted.
+    \\--via HOST (repeatable, in order) runs the next hop instead:
+    \\`ssh HOST sketerm-mux [the remaining --via/--instance] --proxy`
+    \\with THIS host's ssh, keys and config ($SKETERM_SSH overrides the
+    \\ssh binary). These are the hops of a `route:` host spec; give
+    \\them BEFORE --proxy so an older sketerm-mux refuses them instead
+    \\of bridging its default daemon. A routed proxy prints one
+    \\`SKETERM-ROUTE hop|ok|err <code> <why>` line before the stream.
     \\
     \\`display` manages EXTERNAL display sessions: a named session whose
     \\child is a keeper process, existing only to own a Wayland display
@@ -64,6 +76,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
     var sock_path: ?[]const u8 = null;
     var idle_exit_ms: i64 = 0;
+    var route: proxyroute.Args = .{};
     const argv = init.args.vector;
     // Self-spawns exec /proc/self/exe, which the kernel would name "exe".
     platform.setProcessName(selfexec.BINARY);
@@ -122,8 +135,37 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             var j: usize = i + 1;
             while (j < argv.len) : (j += 1) rest.append(allocator, std.mem.span(argv[j])) catch return 1;
             return @import("mux/display.zig").run(allocator, rest.items);
+        } else if (proxyroute.Args.isFlag(a)) {
+            // Route flags arrive BEFORE `--proxy` (see proxyroute.zig);
+            // values are validated where a refusal can be reported.
+            if (i + 1 >= argv.len) {
+                std.debug.print("sketerm-mux: {s} needs a value\n", .{a});
+                return 2;
+            }
+            i += 1;
+            route.take(a, std.mem.span(argv[i])) catch |err| {
+                std.debug.print("sketerm-mux: {s}: {s}\n", .{ a, @errorName(err) });
+                return 2;
+            };
         } else if (selfexec.Mode.proxy.is(a)) {
-            return runProxy(allocator);
+            // The documented `--proxy --via ...` order works too; any
+            // other trailing word is ignored, as it always was.
+            var j = i + 1;
+            while (j + 1 < argv.len) : (j += 1) {
+                const word = std.mem.span(argv[j]);
+                if (!proxyroute.Args.isFlag(word)) continue;
+                route.take(word, std.mem.span(argv[j + 1])) catch |err| {
+                    std.debug.print("sketerm-mux: {s}: {s}\n", .{ word, @errorName(err) });
+                    return 2;
+                };
+                j += 1;
+            }
+            if (!route.routed()) return runProxy(allocator);
+            platform.ignoreSigpipe();
+            return switch (proxyroute.run(allocator, route)) {
+                .exit => |code| code,
+                .bridge => |fd| pumpStdio(fd),
+            };
         } else if (selfexec.Mode.udp_listen.is(a)) {
             // Optional: --udp-port 60000:61000 (firewalls usually need a
             // pinned range, like mosh's 60000-61000) and --socket PATH
@@ -173,6 +215,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             std.debug.print("sketerm-mux: unknown argument: {s}\n", .{a});
             return 2;
         }
+    }
+    if (route.routed()) {
+        std.debug.print("sketerm-mux: {s}/{s} only go with --proxy\n", .{ proxyroute.VIA_FLAG, proxyroute.INSTANCE_FLAG });
+        return 2;
     }
 
     const path = if (sock_path) |p|
@@ -232,14 +278,19 @@ fn runProxy(allocator: std.mem.Allocator) u8 {
         std.debug.print("sketerm-mux --proxy: daemon unreachable\n", .{});
         return 1;
     };
-    defer conn.deinit();
+    const fd = conn.fd;
+    conn.rbuf.deinit(conn.allocator); // keep the fd, drop the wrapper
+    return pumpStdio(fd);
+}
 
-    // Byte pump: stdin → socket, socket → stdout. Either side's EOF
-    // ends the bridge (the daemon treats it as client disconnect,
-    // i.e. detach — sessions keep running).
+/// Byte pump: stdin -> `fd`, `fd` -> stdout, until either side's EOF (the
+/// daemon treats it as a client disconnect, i.e. detach). Closes `fd`.
+fn pumpStdio(fd: c_int) u8 {
+    const cc = @import("c.zig").c;
+    defer _ = cc.close(fd);
     var fds = [_]cc.struct_pollfd{
         .{ .fd = 0, .events = cc.POLLIN, .revents = 0 },
-        .{ .fd = conn.fd, .events = cc.POLLIN, .revents = 0 },
+        .{ .fd = fd, .events = cc.POLLIN, .revents = 0 },
     };
     // Test hook: SKETERM_MUX_DELAY_MS sleeps before forwarding each
     // chunk in both directions, simulating a high-latency link
@@ -257,10 +308,10 @@ fn runProxy(allocator: std.mem.Allocator) u8 {
             const n = cc.read(0, &buf, buf.len);
             if (n <= 0) return 0;
             if (delay_us != 0) _ = cc.usleep(delay_us);
-            if (!writeFull(conn.fd, buf[0..@intCast(n)])) return 0;
+            if (!writeFull(fd, buf[0..@intCast(n)])) return 0;
         }
         if (fds[1].revents & (cc.POLLIN | cc.POLLHUP) != 0) {
-            const n = cc.read(conn.fd, &buf, buf.len);
+            const n = cc.read(fd, &buf, buf.len);
             if (n <= 0) return 0;
             if (delay_us != 0) _ = cc.usleep(delay_us);
             if (!writeFull(1, buf[0..@intCast(n)])) return 0;

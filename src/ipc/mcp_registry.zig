@@ -9,6 +9,9 @@ const c = @import("../c.zig").c;
 const platform = @import("../util/platform.zig");
 const atomicwrite = @import("../util/atomicwrite.zig");
 const pathz = @import("../util/pathz.zig");
+const readfile = @import("../util/readfile.zig");
+const sockpath = @import("../mux/sockpath.zig");
+const webpresence = @import("../web/webpresence.zig");
 const pathZ = pathz.pathZ;
 const unlinkPath = pathz.unlinkPath;
 
@@ -30,6 +33,26 @@ pub const Registration = struct {
     mux_socket: []const u8,
 };
 
+/// One sub-agent as the record publishes it, so a viewer on any host can
+/// derive where to watch it (`sshroute.watchSpec`).
+pub const Agent = struct {
+    id: []const u8,
+    app: []const u8,
+    /// Every session the agent runs (opencode's `-server` included).
+    sessions: []const []const u8 = &.{},
+    /// `sshroute.Location` text: `instance` or `host:<destination>`.
+    location: []const u8,
+};
+
+/// More agents than this are not published: an oversized record would
+/// read as no server at all (`MAX_RECORD_BYTES`), which is worse.
+pub const MAX_PUBLISHED_AGENTS = 64;
+const MAX_RECORD_BYTES = 64 * 1024;
+
+/// Still version 1: `agents` is additive, and a reader predating it
+/// refuses any other version, so a bump would hide every new server from
+/// an older GUI or doctor on the same host. Absent `agents` = a server
+/// that predates publishing them (unknown), never "none".
 const Record = struct {
     version: u8 = 1,
     pid: c.pid_t,
@@ -38,6 +61,7 @@ const Record = struct {
     profile: []const u8 = "",
     log_dir: []const u8 = "",
     mux_socket: []const u8,
+    agents: ?[]const Agent = null,
 };
 
 pub const Entry = struct {
@@ -48,12 +72,15 @@ pub const Entry = struct {
     log_dir: []u8,
     mux_socket: []u8,
     legacy: bool = false,
+    /// Null = the server does not publish its agents (older build).
+    agents: ?[]Agent = null,
 
     pub fn deinit(self: *Entry, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
         allocator.free(self.profile);
         allocator.free(self.log_dir);
         allocator.free(self.mux_socket);
+        if (self.agents) |owned| freeAgents(allocator, owned);
     }
 
     /// Short operator-facing identity, preferring explicit configuration.
@@ -72,11 +99,53 @@ pub fn freeEntries(allocator: std.mem.Allocator, entries: []Entry) void {
     allocator.free(entries);
 }
 
+fn freeAgents(allocator: std.mem.Allocator, agents: []Agent) void {
+    for (agents) |agent| {
+        allocator.free(agent.id);
+        allocator.free(agent.app);
+        for (agent.sessions) |s| allocator.free(s);
+        allocator.free(agent.sessions);
+        allocator.free(agent.location);
+    }
+    allocator.free(agents);
+}
+
+fn dupeAgents(allocator: std.mem.Allocator, src: []const Agent) ![]Agent {
+    const out = try allocator.alloc(Agent, src.len);
+    var done: usize = 0;
+    errdefer freeAgents(allocator, out[0..done]);
+    for (src, out) |agent, *slot| {
+        const id = try allocator.dupe(u8, agent.id);
+        errdefer allocator.free(id);
+        const app = try allocator.dupe(u8, agent.app);
+        errdefer allocator.free(app);
+        const location = try allocator.dupe(u8, agent.location);
+        errdefer allocator.free(location);
+        const sessions = try allocator.alloc([]const u8, agent.sessions.len);
+        var n: usize = 0;
+        errdefer {
+            for (sessions[0..n]) |s| allocator.free(s);
+            allocator.free(sessions);
+        }
+        for (agent.sessions) |s| {
+            sessions[n] = try allocator.dupe(u8, s);
+            n += 1;
+        }
+        slot.* = .{ .id = id, .app = app, .sessions = sessions, .location = location };
+        done += 1;
+    }
+    return out;
+}
+
 pub const Lease = struct {
     allocator: std.mem.Allocator,
     fd: c_int,
     record_path: []u8,
     lock_path: []u8,
+    pid: c.pid_t = 0,
+    /// Owned copy of what was registered: `publishAgents` rewrites the
+    /// whole record from it.
+    registration: Registration = .{ .mode = .isolated, .mux_socket = "" },
 
     /// Publish this MCP server and hold its ownership lock until deinit/process exit.
     pub fn acquire(allocator: std.mem.Allocator, registration: Registration) !Lease {
@@ -94,29 +163,60 @@ pub const Lease = struct {
         errdefer _ = c.close(fd);
         if (c.flock(fd, c.LOCK_EX | c.LOCK_NB) != 0) return error.LockHeld;
 
-        var aw: std.Io.Writer.Allocating = .init(allocator);
-        defer aw.deinit();
-        try std.json.Stringify.value(Record{
-            .pid = pid,
-            .mode = registration.mode,
-            .name = registration.name,
-            .profile = registration.profile,
-            .log_dir = registration.log_dir,
-            .mux_socket = registration.mux_socket,
-        }, .{}, &aw.writer);
-
-        // Runtime-only publication: the held flock is authoritative and the
-        // record is deleted at process exit, so `writeCacheFile` — the shared
-        // writer's no-fsync policy, which exists for exactly this case.
-        atomicwrite.writeCacheFile(record_path, aw.written(), 0o600) catch
-            return error.RecordWriteFailed;
-
-        return .{
+        var lease: Lease = .{
             .allocator = allocator,
             .fd = fd,
             .record_path = record_path,
             .lock_path = lock_path,
+            .pid = pid,
         };
+        lease.registration = .{
+            .mode = registration.mode,
+            .name = try allocator.dupe(u8, registration.name),
+            .profile = &.{},
+            .log_dir = &.{},
+            .mux_socket = &.{},
+        };
+        errdefer lease.freeRegistration();
+        lease.registration.profile = try allocator.dupe(u8, registration.profile);
+        lease.registration.log_dir = try allocator.dupe(u8, registration.log_dir);
+        lease.registration.mux_socket = try allocator.dupe(u8, registration.mux_socket);
+        try lease.write(null);
+        return lease;
+    }
+
+    /// Rewrite the record (atomically, like the first publication) with
+    /// the current agents; past `MAX_PUBLISHED_AGENTS` the tail is dropped.
+    pub fn publishAgents(self: *Lease, agents: []const Agent) !void {
+        try self.write(agents[0..@min(agents.len, MAX_PUBLISHED_AGENTS)]);
+    }
+
+    fn write(self: *Lease, agents: ?[]const Agent) !void {
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
+        defer aw.deinit();
+        try std.json.Stringify.value(Record{
+            .pid = self.pid,
+            .mode = self.registration.mode,
+            .name = self.registration.name,
+            .profile = self.registration.profile,
+            .log_dir = self.registration.log_dir,
+            .mux_socket = self.registration.mux_socket,
+            .agents = agents,
+        }, .{ .emit_null_optional_fields = false }, &aw.writer);
+        // Runtime-only publication: the held flock is authoritative and the
+        // record is deleted at process exit, so `writeCacheFile` — the shared
+        // writer's no-fsync policy, which exists for exactly this case.
+        atomicwrite.writeCacheFile(self.record_path, aw.written(), 0o600) catch
+            return error.RecordWriteFailed;
+    }
+
+    fn freeRegistration(self: *Lease) void {
+        const a = self.allocator;
+        a.free(self.registration.name);
+        a.free(self.registration.profile);
+        a.free(self.registration.log_dir);
+        a.free(self.registration.mux_socket);
+        self.registration = .{ .mode = .isolated, .mux_socket = "" };
     }
 
     pub fn deinit(self: *Lease) void {
@@ -128,6 +228,7 @@ pub const Lease = struct {
         unlinkPath(self.lock_path);
         self.allocator.free(self.record_path);
         self.allocator.free(self.lock_path);
+        self.freeRegistration();
     }
 
     /// Simulate process death in a unit test: release the flock, leave debris.
@@ -136,6 +237,7 @@ pub const Lease = struct {
         self.fd = -1;
         self.allocator.free(self.record_path);
         self.allocator.free(self.lock_path);
+        self.freeRegistration();
     }
 };
 
@@ -265,15 +367,7 @@ fn lockState(lock_path: []const u8) LockState {
 }
 
 fn readEntry(allocator: std.mem.Allocator, record_path: []const u8) ?Entry {
-    var z: [4096]u8 = undefined;
-    const fp = c.fopen(pathZ(&z, record_path) catch return null, "rb") orelse return null;
-    defer _ = c.fclose(fp);
-    var buf: [16 * 1024]u8 = undefined;
-    const n = c.fread(&buf, 1, buf.len, fp);
-    if (n == 0 or n == buf.len) return null;
-    const parsed = std.json.parseFromSlice(Record, allocator, buf[0..n], .{
-        .ignore_unknown_fields = true,
-    }) catch return null;
+    const parsed = readfile.json(Record, allocator, record_path, MAX_RECORD_BYTES) orelse return null;
     defer parsed.deinit();
     if (parsed.value.version != 1 or parsed.value.pid <= 0) return null;
     return ownedEntry(allocator, parsed.value, false) catch null;
@@ -287,6 +381,8 @@ fn ownedEntry(allocator: std.mem.Allocator, record: Record, legacy: bool) !Entry
     const log_dir = try allocator.dupe(u8, record.log_dir);
     errdefer allocator.free(log_dir);
     const mux_socket = try allocator.dupe(u8, record.mux_socket);
+    errdefer allocator.free(mux_socket);
+    const agents = if (record.agents) |src| try dupeAgents(allocator, src) else null;
     return .{
         .pid = record.pid,
         .mode = record.mode,
@@ -295,7 +391,71 @@ fn ownedEntry(allocator: std.mem.Allocator, record: Record, legacy: bool) !Entry
         .log_dir = log_dir,
         .mux_socket = mux_socket,
         .legacy = legacy,
+        .agents = agents,
     };
+}
+
+/// What `sketerm-mux --proxy --instance <key>` may bridge to.
+pub const Lookup = union(enum) {
+    /// A live server's private daemon socket (owned).
+    live: []u8,
+    /// The instance directory exists but no live server holds it.
+    dead,
+    unknown,
+    invalid,
+};
+
+/// Resolve an instance key against THIS host's live registry only: a
+/// caller names a key, never a path, and a key no live server holds is
+/// never mapped to a socket (its daemon must not be reached, let alone
+/// autostarted). The key-to-path mapping is `webpresence.instanceMuxSocket`.
+pub fn lookupInstance(allocator: std.mem.Allocator, key: []const u8) !Lookup {
+    if (!webpresence.validInstance(key)) return .invalid;
+    const anchor = try sockpath.defaultSocketPath(allocator);
+    defer allocator.free(anchor);
+    var buf: [webpresence.MAX_PATH]u8 = undefined;
+    const want = webpresence.instanceMuxSocket(&buf, anchor, key) orelse return .invalid;
+    const entries = try list(allocator, false);
+    defer freeEntries(allocator, entries);
+    for (entries) |entry| {
+        if (std.mem.eql(u8, entry.mux_socket, want)) return .{ .live = try allocator.dupe(u8, want) };
+    }
+    const dir = std.fs.path.dirname(want) orelse return .unknown;
+    var z: [4096]u8 = undefined;
+    var st: c.struct_stat = undefined;
+    if (c.stat(try pathZ(&z, dir), &st) == 0) return .dead;
+    return .unknown;
+}
+
+/// One live MCP server as a daemon's session list reports it (`assistants`).
+pub const Report = struct {
+    /// The key `--proxy --instance` and `route:...#<key>` take.
+    instance: []const u8,
+    /// The server's name, else its other configured identity, else its pid.
+    label: []const u8,
+    mode: []const u8,
+    pid: c.pid_t,
+    /// Null = the server predates publishing agents: list its daemon.
+    agents: ?[]const Agent = null,
+};
+
+/// Reports for `entries`, which must outlive them. A server without a
+/// private instance beside `anchor` (`--shared`) is skipped: it has no
+/// sessions of its own to watch.
+pub fn reports(arena: std.mem.Allocator, entries: []const Entry, anchor: []const u8) ![]Report {
+    var out: std.ArrayList(Report) = .empty;
+    for (entries) |entry| {
+        const key = webpresence.instanceKeyOf(anchor, entry.mux_socket) orelse continue;
+        const shown = entry.displayName();
+        try out.append(arena, .{
+            .instance = key,
+            .label = if (shown.len > 0) shown else try std.fmt.allocPrint(arena, "{d}", .{entry.pid}),
+            .mode = entry.mode.text(),
+            .pid = entry.pid,
+            .agents = entry.agents,
+        });
+    }
+    return out.toOwnedSlice(arena);
 }
 
 fn containsPid(entries: []const Entry, pid: c.pid_t) bool {
@@ -359,6 +519,87 @@ test "mcp registry lists a live lease and cleans an abandoned record" {
     const after = try list(allocator, false);
     defer freeEntries(allocator, after);
     try std.testing.expectEqual(@as(usize, 0), after.len);
+}
+
+test "mcp registry publishes agents and still reads a record that predates them" {
+    const allocator = std.testing.allocator;
+    var scope = try ScopedRuntime.init(allocator, "agents");
+    defer scope.deinit();
+    var sock_buf: [256]u8 = undefined;
+    const sock = try std.fmt.bufPrint(&sock_buf, "{s}/sketerm/mcp-tmp-{d}/mux.sock", .{ scope.path, c.getpid() });
+    var lease = try Lease.acquire(allocator, .{ .mode = .isolated, .mux_socket = sock });
+    defer lease.deinit();
+
+    // Freshly acquired: no agents field at all, i.e. exactly a v1 record.
+    {
+        const bytes = try readfile.cappedAlloc(allocator, lease.record_path, MAX_RECORD_BYTES);
+        defer allocator.free(bytes);
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "\"version\":1") != null);
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "\"agents\"") == null);
+        const entries = try list(allocator, false);
+        defer freeEntries(allocator, entries);
+        try std.testing.expect(entries[0].agents == null);
+    }
+
+    try lease.publishAgents(&.{
+        .{ .id = "claude-1", .app = "claude", .sessions = &.{"agent-claude-1"}, .location = "instance" },
+        .{ .id = "opencode-1", .app = "opencode", .sessions = &.{ "agent-opencode-1", "agent-opencode-1-server" }, .location = "host:me@b" },
+    });
+    const entries = try list(allocator, false);
+    defer freeEntries(allocator, entries);
+    const agents = entries[0].agents.?;
+    try std.testing.expectEqual(@as(usize, 2), agents.len);
+    try std.testing.expectEqualStrings("agent-opencode-1-server", agents[1].sessions[1]);
+    try std.testing.expectEqualStrings("host:me@b", agents[1].location);
+
+    // What a daemon reports for it.
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    var anchor_buf: [256]u8 = undefined;
+    const anchor = try std.fmt.bufPrint(&anchor_buf, "{s}/sketerm/mux.sock", .{scope.path});
+    const got = try reports(arena_state.allocator(), entries, anchor);
+    try std.testing.expectEqual(@as(usize, 1), got.len);
+    var key_buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&key_buf, "tmp-{d}", .{c.getpid()}), got[0].instance);
+    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&key_buf, "{d}", .{c.getpid()}), got[0].label);
+    try std.testing.expectEqualStrings("isolated", got[0].mode);
+    try std.testing.expectEqual(@as(usize, 2), got[0].agents.?.len);
+
+    // A record an older server wrote (no agents) reads as unknown agents.
+    var old_buf: [512]u8 = undefined;
+    const old_path = try std.fmt.bufPrint(&old_buf, "{s}/sketerm/mcp-servers/1.json", .{scope.path});
+    const old_record = "{\"version\":1,\"pid\":1,\"mode\":\"durable\",\"name\":\"old\",\"mux_socket\":\"/x/mcp-old/mux.sock\"}";
+    try atomicwrite.writeCacheFile(old_path, old_record, 0o600);
+    const old = readEntry(allocator, old_path).?;
+    var old_mut = old;
+    defer old_mut.deinit(allocator);
+    try std.testing.expect(old.agents == null);
+    try std.testing.expectEqualStrings("old", old.name);
+}
+
+test "an instance key resolves only to a live server's daemon" {
+    const allocator = std.testing.allocator;
+    var scope = try ScopedRuntime.init(allocator, "lookup");
+    defer scope.deinit();
+    var z: [512]u8 = undefined;
+    const sock = try std.fmt.bufPrint(&z, "{s}/sketerm/mcp-live/mux.sock", .{scope.path});
+    var lease = try Lease.acquire(allocator, .{ .mode = .durable, .name = "live", .mux_socket = sock });
+    defer lease.deinit();
+
+    switch (try lookupInstance(allocator, "live")) {
+        .live => |path| {
+            defer allocator.free(path);
+            try std.testing.expectEqualStrings(sock, path);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    // A durable instance whose server exited leaves its directory behind.
+    var dir_buf: [512]u8 = undefined;
+    _ = c.mkdir(try std.fmt.bufPrintZ(&dir_buf, "{s}/sketerm/mcp-gone", .{scope.path}), 0o700);
+    try std.testing.expectEqual(Lookup.dead, try lookupInstance(allocator, "gone"));
+    try std.testing.expectEqual(Lookup.unknown, try lookupInstance(allocator, "never"));
+    try std.testing.expectEqual(Lookup.invalid, try lookupInstance(allocator, "../live"));
+    try std.testing.expectEqual(Lookup.invalid, try lookupInstance(allocator, ""));
 }
 
 test "mcp registry includes a live pre-registry ephemeral instance" {

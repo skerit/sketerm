@@ -39,6 +39,8 @@ const version = @import("../version.zig");
 const a11yhub = @import("a11yhub.zig");
 const fillSockaddrUn = dmod.fillSockaddrUn;
 const opuscodec = @import("opuscodec.zig");
+const sockpath = @import("sockpath.zig");
+const mcp_registry = @import("../ipc/mcp_registry.zig");
 const wlvcodec = @import("../wlhost/vcodec.zig");
 const Pty = @import("../pty.zig").Pty;
 const Pool = @import("../grid/style_pool.zig").Pool;
@@ -976,8 +978,25 @@ pub fn brokerList(self: *Daemon, cl: *Client) void {
             return;
         };
     }
+    queueListReply(self, cl, infos.items);
+}
+
+/// The `.list` answer (a welcome-shaped frame) for both roles: the
+/// sessions plus `assistants`, this host's live MCP servers as its registry
+/// publishes them (capability `assistants`). The registry is best effort:
+/// an unreadable one costs the assistants, never the reply the client is
+/// blocked on.
+pub fn queueListReply(self: *Daemon, cl: *Client, infos: []const SessionInfo) void {
+    var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const assistants: []const mcp_registry.Report = blk: {
+        const entries = mcp_registry.list(arena, false) catch break :blk &.{};
+        const anchor = sockpath.defaultSocketPath(arena) catch break :blk &.{};
+        break :blk mcp_registry.reports(arena, entries, anchor) catch &.{};
+    };
     var vnames: [wlvcodec.CodecList.cap][]const u8 = undefined;
-    cl.queueJson(.welcome, .{ .proto = cl.proto, .daemon_pid = c.getpid(), .server_proto = wire.PROTO_VERSION, .min_proto = wire.MIN_SERVER_PROTO, .negotiation = @as(u8, 1), .version = version.string, .audio_opus = opuscodec.available(), .video = wlvcodec.canEncode(.h264), .video_codecs = wlvcodec.encodableHere().names(&vnames), .sessions = infos.items });
+    cl.queueJson(.welcome, .{ .proto = cl.proto, .daemon_pid = c.getpid(), .server_proto = wire.PROTO_VERSION, .min_proto = wire.MIN_SERVER_PROTO, .negotiation = @as(u8, 1), .version = version.string, .audio_opus = opuscodec.available(), .video = wlvcodec.canEncode(.h264), .video_codecs = wlvcodec.encodableHere().names(&vnames), .sessions = infos, .assistants = assistants });
 }
 
 test "broker list answers an allocation failure instead of dropping the reply" {
@@ -1020,6 +1039,52 @@ test "broker list answers an allocation failure instead of dropping the reply" {
     const ok = (try wire.peelFrame(requester.wbuf.items)) orelse return error.TestUnexpectedResult;
     try t.expectEqual(wire.FrameType.welcome, ok.frame.ftype);
     try t.expect(std.mem.indexOf(u8, ok.frame.payload, "listed") != null);
+}
+
+test "the list reply reports this host's live MCP servers and their agents" {
+    const t = std.testing;
+    const a = t.allocator;
+    const saved = c.getenv("XDG_RUNTIME_DIR");
+    var saved_buf: [4096]u8 = undefined;
+    const saved_copy: ?[:0]const u8 = if (saved) |s| try std.fmt.bufPrintZ(&saved_buf, "{s}", .{std.mem.span(@as([*:0]const u8, @ptrCast(s)))}) else null;
+    var rt_buf: [128]u8 = undefined;
+    const rt = try std.fmt.bufPrintZ(&rt_buf, "/tmp/sketerm-list-assistants-{d}", .{c.getpid()});
+    _ = c.mkdir(rt.ptr, 0o700);
+    _ = c.setenv("XDG_RUNTIME_DIR", rt.ptr, 1);
+    defer {
+        if (saved_copy) |s| _ = c.setenv("XDG_RUNTIME_DIR", s.ptr, 1) else _ = c.unsetenv("XDG_RUNTIME_DIR");
+        pathz.removeTree(rt);
+    }
+    var sock_buf: [256]u8 = undefined;
+    const sock = try std.fmt.bufPrint(&sock_buf, "{s}/sketerm/mcp-hub/mux.sock", .{rt});
+    var lease = try mcp_registry.Lease.acquire(a, .{ .mode = .durable, .name = "hub", .mux_socket = sock });
+    defer lease.deinit();
+    try lease.publishAgents(&.{
+        .{ .id = "claude-1", .app = "claude", .sessions = &.{"agent-claude-1"}, .location = "instance" },
+        .{ .id = "claude-2", .app = "claude", .sessions = &.{"agent-claude-2"}, .location = "host:hostb" },
+    });
+
+    var empty: [0]u8 = .{};
+    var broker = Daemon{ .allocator = a, .listen_fd = -1, .sock_path = empty[0..] };
+    defer broker.workers.deinit(a);
+    var requester = Client{ .allocator = a, .fd = -1 };
+    defer requester.rbuf.deinit(a);
+    defer requester.wbuf.deinit(a);
+    defer requester.audio_wbuf.deinit(a);
+    brokerList(&broker, &requester);
+    const reply = (try wire.peelFrame(requester.wbuf.items)) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(wire.FrameType.welcome, reply.frame.ftype);
+    const Listing = struct { assistants: []const mcp_registry.Report = &.{} };
+    const parsed = try std.json.parseFromSlice(Listing, a, reply.frame.payload, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try t.expectEqual(@as(usize, 1), parsed.value.assistants.len);
+    const hub = parsed.value.assistants[0];
+    try t.expectEqualStrings("hub", hub.instance);
+    try t.expectEqualStrings("hub", hub.label);
+    try t.expectEqualStrings("durable", hub.mode);
+    try t.expectEqual(c.getpid(), hub.pid);
+    try t.expectEqualStrings("host:hostb", hub.agents.?[1].location);
+    try t.expectEqualStrings("agent-claude-1", hub.agents.?[0].sessions[0]);
 }
 
 /// Broker side of kill: send the worker a graceful 'K', stop routing its name,

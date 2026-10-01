@@ -814,6 +814,26 @@ on a free loopback port, read over its HTTP API and SSE stream, with
 - **`agent_attach`** puts a screen adapter on a terminal `term_open`
   created (you started the app yourself); `agent_close` then drops only
   the adapter.
+- **Watch-along from any host.** The server's registry record
+  (`$XDG_RUNTIME_DIR/sketerm/mcp-servers/<pid>.json`,
+  `src/ipc/mcp_registry.zig`) lists its agents and is rewritten
+  atomically whenever one opens, is attached, closes, relaunches or is
+  reattached: per agent its `id`, `app`, `sessions` (opencode's
+  `-server` included) and `location`, `instance` (this server's private
+  daemon: local and plain-ssh agents) or `host:<B>` (B's per-user
+  daemon: the remote sketerm-mux transport). The record stays version 1
+  (an older reader refuses any other version); a record without
+  `agents` comes from a server that predates them. Every sketerm-mux
+  reports its host's live servers in its session list (`assistants`,
+  capability `assistants`), so a GUI that reaches host A, directly or
+  through a route, learns A's assistants and their agents and derives
+  where to watch each one (`sshroute.watchSpec`):
+  `route:A#<instance>` for an `instance` agent, `route:A/B` for a
+  `host:B` one. Such a route ends in `sketerm-mux --proxy --instance
+  <key>` on A, which bridges only a LIVE server's daemon (the
+  registry's flock decides) and never starts one: a server that exited
+  is refused as not running, an unknown key as unknown. The instance
+  key is the server's `--name`, or `tmp-<pid>` for an unnamed one.
 
 The server's `instructions` (initialize result) tell the assistant to use
 `agent_open` for Claude Code and opencode and to run `watch_command` in the

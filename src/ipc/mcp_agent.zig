@@ -42,6 +42,8 @@ const atomicwrite = @import("../util/atomicwrite.zig");
 const pathz = @import("../util/pathz.zig");
 const readfile = @import("../util/readfile.zig");
 const transport_mod = @import("transport.zig");
+const mcp_registry = @import("mcp_registry.zig");
+const sshroute = @import("../mux/sshroute.zig");
 const Transport = transport_mod.Transport;
 
 const Res = mcp.Res;
@@ -242,6 +244,8 @@ const State = struct {
     /// Last number used per adapter id (keys borrow the loaded spec's id).
     counters: std.StringHashMapUnmanaged(u32) = .empty,
     waiter: Waiter = .{},
+    /// The server's registry record, which publishes `entries`.
+    registry: ?*mcp_registry.Lease = null,
 };
 
 pub var state: State = .{};
@@ -272,6 +276,7 @@ pub fn shutdown() void {
     if (state.exe) |e| a.free(e);
     state.exe = null;
     state.dir = null;
+    state.registry = null;
 }
 
 pub fn available() bool {
@@ -1318,6 +1323,7 @@ fn openTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
         return err;
     };
     writeDescriptor(e);
+    publishAgents();
 
     const filter = filterFrom(args);
     const ready = waitReady(e, deadline);
@@ -1768,6 +1774,7 @@ fn attachTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
         e.destroy(false);
         return err;
     };
+    publishAgents();
     const ready = waitReady(e, deadlineFrom(args, ATTACH_WAIT_MS));
     var res = Res.init(arena);
     try res.textf("{s} adapter attached to terminal {d} as {s}{s}", .{ loaded.spec.name, tid, e.id, if (ready) "" else " (not ready yet)" });
@@ -2027,6 +2034,7 @@ fn relaunch(arena: std.mem.Allocator, e: *Entry, action: agent_mod.Action, deadl
     try replaceOwned(e, &e.launch_effort, effort);
     e.relaunching = false;
     writeDescriptor(e);
+    publishAgents();
 
     // 3. It is back once its input box shows again.
     if (!waitReady(e, deadline))
@@ -2389,6 +2397,7 @@ fn closeTool(arena: std.mem.Allocator, _: std.json.Value, e: *Entry) ![]const u8
         _ = state.entries.orderedRemove(i);
         break;
     };
+    publishAgents();
     e.destroy(true);
     var res = Res.init(arena);
     try res.textf("closed {s}{s}", .{ id, if (sessions.items.len == 0) " (its terminal belongs to term_open and stays)" else "" });
@@ -2526,6 +2535,38 @@ pub fn reattach() void {
             }
         };
     }
+    publishAgents();
+}
+
+/// Publish into the MCP registry record (`mcp_registry.Lease`) so a viewer
+/// on any host can find the agents: set by `mcp.zig` before `reattach`.
+pub fn publishTo(lease: ?*mcp_registry.Lease) void {
+    state.registry = lease;
+}
+
+/// Rewrite the registry record's agent list from `state.entries`: called
+/// after every open, attach, close, relaunch and the startup reattach.
+/// Best effort: a failed rewrite leaves the previous list, never the server.
+fn publishAgents() void {
+    const lease = state.registry orelse return;
+    var arena_state = std.heap.ArenaAllocator.init(state.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var out: std.ArrayList(mcp_registry.Agent) = .empty;
+    for (state.entries.items) |e| {
+        var sessions: std.ArrayList([]const u8) = .empty;
+        sessions.append(arena, e.session) catch return;
+        if (e.server_session) |s| sessions.append(arena, s) catch return;
+        // The term's own fact: it runs on a host's daemon or on ours.
+        const where: sshroute.Location = if (e.visibleTerm() orelse e.server) |t|
+            (if (t.remote_host) |h| .{ .host = h } else .instance)
+        else
+            .instance;
+        var buf: [300]u8 = undefined;
+        const location = arena.dupe(u8, where.format(&buf) catch continue) catch return;
+        out.append(arena, .{ .id = e.id, .app = e.loaded.spec.id, .sessions = sessions.items, .location = location }) catch return;
+    }
+    lease.publishAgents(out.items) catch {};
 }
 
 fn originOf(s: ?[]const u8) !wire.SessionOriginId {
