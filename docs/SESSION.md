@@ -1,5 +1,32 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-01: routes and the assistants report (watch-along across hosts, part 1)
+
+A host spec can now name a route, `route:[tor:]A[/B...][#KEY]`
+(`sshroute.RouteSpec`, round-trip tested, refusing anything that is not a
+plain ssh destination): ssh to A runs `sketerm-mux --via B --instance KEY
+--proxy`, each hop's proxy dials the next with that host's own ssh
+(`src/mux/proxyroute.zig`), and the last bridges the host's per-user daemon
+or, with `#KEY`, a live MCP server's private daemon resolved from that
+host's registry (connect only; dead, unknown and down instances are named
+refusals). Each routed hop prints one `SKETERM-ROUTE hop|ok|err` line
+before the stream; the route flags go before `--proxy`, so an older
+sketerm-mux refuses them and the client says "too old for routes" naming
+the host, instead of bridging the wrong daemon. Every client entry point
+(`Conn.connectRemote`, the `connectSsh*` family, hence the GUI, the CLI
+and the attach jobs) dials routes through `Conn.connectRoute`. The MCP
+registry record now lists the server's agents and where each runs
+(`instance` or `host:B`), rewritten on every agent change and still
+version 1 so older readers keep seeing the server; every daemon reports
+its host's live servers in the session list (`assistants`, capability
+`assistants`), and `sshroute.watchSpec` derives the route a viewer dials.
+smoke-mcp's focused `SKETERM_SMOKE_MCP_ROUTE_ONLY` stage runs three fake
+hosts with separate runtime dirs behind one `$SKETERM_SSH` script, a real
+`sketerm mcp` on hosta with an agent there and one on hostb's daemon, and
+proves the report, the derived routes (list, attach, screen, typed input),
+the CLI, and the dead/unknown/old-hop/unreachable refusals. The GUI side
+is the next package.
+
 ## 2026-10-01: agent_open runs a wrapper (args and env)
 
 `agent_open` takes `args` and `env` beside `binary`, so a wrapper script
