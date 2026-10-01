@@ -433,6 +433,7 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
         try res.fact("agents", agents_ok);
         try res.fact("agent_ssh", agent_ssh);
         try res.fact("agent_open_args_env", agents_ok);
+        try res.fact("agent_open_resume", agents_ok);
         const ids: []const []const u8 = if (agents_ok) mcp_agent.adapterIds(arena) catch &.{} else &.{};
         try res.fact("agent_adapters", ids);
         if (agents_ok) {

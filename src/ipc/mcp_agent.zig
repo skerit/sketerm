@@ -1316,12 +1316,22 @@ const OpenOpts = struct {
     /// Absolute; null with a host until the probe names the remote home.
     cwd: ?[]const u8,
     prompt: ?[]const u8,
+    /// An existing conversation of the app to continue (`agent_open resume`).
+    resume_id: ?[]const u8 = null,
     cols: u16,
     rows: u16,
     host: ?[]const u8,
     choice: transport_mod.Choice,
     extra: launch.Extra,
 };
+
+/// A conversation id travels on the app's argv and in an API path, so only
+/// plain id characters are accepted.
+fn validConversationId(id: []const u8) bool {
+    if (id.len == 0 or id.len > 128) return false;
+    for (id) |ch| if (!std.ascii.isAlphanumeric(ch) and ch != '-' and ch != '_') return false;
+    return true;
+}
 
 /// agent_open's `args` (strings) and `env` (string values), checked by
 /// `launch.checkExtra`.
@@ -1409,7 +1419,23 @@ fn openOpts(arena: std.mem.Allocator, args: std.json.Value, loaded: *const adapt
         why.* = .{ .code = .invalid_args, .msg = "prompt is empty" };
         return error.Refused;
     };
+    const resume_id = argStr(args, "resume");
+    if (resume_id) |r| {
+        if (!validConversationId(r)) {
+            why.* = .{ .code = .invalid_args, .msg = "resume must be a conversation id: 1-128 letters, digits, '-' or '_'" };
+            return error.Refused;
+        }
+        const resumable = switch (loaded.spec.source) {
+            .screen => loaded.spec.launch.resume_args.len > 0,
+            .opencode_api => true,
+        };
+        if (!resumable) {
+            why.* = .{ .code = .invalid_args, .msg = try std.fmt.allocPrint(arena, "{s} cannot resume a conversation (its adapter declares no resume_args)", .{loaded.spec.id}) };
+            return error.Refused;
+        }
+    }
     return .{
+        .resume_id = resume_id,
         .override = override,
         .model = argStr(args, "model"),
         .effort = argStr(args, "effort"),
@@ -1744,20 +1770,23 @@ fn spawnScreen(arena: std.mem.Allocator, loaded: *const adapter.Loaded, binary: 
     const n = try nextNumber(spec.id);
     const id = try std.fmt.allocPrint(arena, "{s}-{d}", .{ spec.id, n });
     const session = try std.fmt.allocPrint(arena, "agent-{s}", .{id});
-    // A conversation id the agent owns, so a relaunch resumes exactly it.
-    const conversation: ?[]const u8 = if (spec.launch.session_args.len > 0) try newUuid(arena) else null;
+    // A conversation id the agent owns, so a relaunch resumes exactly it;
+    // `resume` continues the caller's existing one instead.
+    const conversation: ?[]const u8 = if (o.resume_id) |r| r else if (spec.launch.session_args.len > 0) try newUuid(arena) else null;
     const argv = try launch.startArgv(arena, spec.launch, binary, o.extra, .{
         .model = o.model,
         .effort = o.effort,
         .cwd = o.cwd,
         .session = conversation,
-    }, .{ .main = .fresh });
+    }, .{ .main = if (o.resume_id != null) .resumed else .fresh });
     const t = try spawnOn(arena, where, o.choice, argv, .{ .name = session, .cwd = o.cwd.?, .extra_env = o.extra.env }, why);
     errdefer t.deinit();
     const e = try newEntry(loaded, id, session, binary, o.cwd.?);
     errdefer dropBare(e);
     try setPlace(e, where.*, o);
     if (conversation) |cv| e.conversation = try a.dupe(u8, cv);
+    // A resumed conversation has turns: a relaunch must resume it too.
+    if (o.resume_id != null) e.conversed = true;
     const ag = try a.create(agent_mod.Agent);
     errdefer a.destroy(ag);
     ag.* = try agent_mod.Agent.initScreen(a, loaded, .{});
@@ -1863,7 +1892,7 @@ fn spawnApi(arena: std.mem.Allocator, loaded: *const adapter.Loaded, binary: []c
     // The server listens a while before it answers, and swallows what it
     // gets in between: wait for its health route before the event stream.
     try waitServerReady(arena, api, server, what, @min(deadline, clock.nowMs() + PORT_WAIT_MS), why);
-    api.connect(null, clock.nowMs()) catch |err| {
+    api.connect(o.resume_id, clock.nowMs()) catch |err| {
         why.* = .{ .code = .failed, .msg = try std.fmt.allocPrint(arena, "the {s} API refused the connection: {s}", .{ spec.name, if (api.problem().len > 0) api.problem() else @errorName(err) }) };
         return error.Refused;
     };
