@@ -1,5 +1,25 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-01: agent_open runs a wrapper (args and env)
+
+`agent_open` takes `args` and `env` beside `binary`, so a wrapper script
+(a container or profile launcher such as `claude-capture`) runs the agent.
+`args` go right after the binary on every start of it (Claude Code and its
+effort relaunches, opencode's `serve` and attached TUI); `env` is set on
+those processes and spared by `unset_env`, so a `CLAUDE_*` name survives
+while every other `CLAUDE*` variable is still removed. One rule
+(`launch.checkExtra`: 64 entries, 4096 bytes, UTF-8, no control
+characters, refused never cleaned) and one argv (`launch.startArgv`).
+Locally and on a remote daemon the values ride the spawn request; over
+plain ssh the start script exports them, which is why `env` is documented
+as no place for secrets. Both persist in the durable descriptor (older
+descriptors read as none). Results report `args` and `env_names`;
+`capabilities.agent_open_args_env`. smoke-mcp's agent stages pass shell
+metacharacters through a fake claude and opencode locally, on a faked
+host daemon and over faked plain ssh, and assert them byte-exact across
+relaunches and a durable reattach; a real run through a recording wrapper
+and through `claude-capture` both answered PONG.
+
 ## 2026-10-01: sub-agent results are selected per job
 
 agent_read and every `done` result now return a JOB (one user prompt and
