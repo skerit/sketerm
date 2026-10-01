@@ -255,6 +255,9 @@ pub const Pane = struct {
     app: AppView = .{},
     /// The per-pane title bar (src/ui/panetitlebar.zig).
     titlebar: panetitlebar.Titlebar = .{},
+    /// The terminal was a watcher at the last roster update; its end is
+    /// when the grid starts following the allocation again.
+    was_watching: bool = false,
     /// User-locked title — when true, on_title sink drops incoming
     /// OSC 0/1/2 updates so the manual string sticks. Cleared via
     /// the menu's "Set Pane Title…" → empty input.
@@ -1977,7 +1980,8 @@ fn updateControlChip(self: *Pane) bool {
         }
     }
     const term = self.terminal;
-    const view_only = if (term.remote) |r| r.control_known and !term.has_control else false;
+    const watching = term.isViewOnly();
+    const view_only = watching or if (term.remote) |r| r.control_known and !term.has_control else false;
     const driven = term.peer_drivers > 0;
     if (!view_only and !driven) {
         c.gtk_widget_set_visible(chip, 0);
@@ -1985,7 +1989,12 @@ fn updateControlChip(self: *Pane) bool {
     }
     var buf: [128:0]u8 = undefined;
     const holder = term.control_holder[0..term.control_holder_len];
-    const text = if (view_only)
+    // A watcher on a daemon that would accept its input says so: only
+    // this GUI is holding the keys back.
+    const unenforced = watching and !term.viewOnlyEnforced();
+    const text = if (unenforced)
+        std.fmt.bufPrintZ(&buf, "View only - not enforced by this daemon", .{}) catch "View only"
+    else if (view_only)
         (if (holder.len > 0)
             std.fmt.bufPrintZ(&buf, "View only - {s} controls", .{holder}) catch "View only"
         else
@@ -1993,8 +2002,13 @@ fn updateControlChip(self: *Pane) bool {
     else
         std.fmt.bufPrintZ(&buf, "AI attached", .{}) catch "AI attached";
     if (self.titlebar.chip_label) |lbl| c.gtk_label_set_text(lbl, text.ptr);
-    var tip: [160:0]u8 = undefined;
-    const tip_z = std.fmt.bufPrintZ(&tip, "{d} viewer(s) attached to this session", .{term.peer_viewers}) catch null;
+    var tip: [256:0]u8 = undefined;
+    const tip_z = if (unenforced)
+        std.fmt.bufPrintZ(&tip, "Watching: this window sends no input, but the daemon serving this session is too old to refuse it. {d} viewer(s) attached. Take control to type.", .{term.peer_viewers}) catch null
+    else if (watching)
+        std.fmt.bufPrintZ(&tip, "Watching: the daemon drops this window's input and resize. {d} viewer(s) attached. Take control to type.", .{term.peer_viewers}) catch null
+    else
+        std.fmt.bufPrintZ(&tip, "{d} viewer(s) attached to this session", .{term.peer_viewers}) catch null;
     c.gtk_widget_set_tooltip_text(chip, if (tip_z) |t| t.ptr else null);
     if (self.titlebar.take_btn) |btn| c.gtk_widget_set_visible(btn, @intFromBool(view_only));
     c.gtk_widget_set_visible(chip, 1);
@@ -2050,6 +2064,10 @@ fn onPeersChanged(ctx: ?*anyopaque) void {
     if (self.terminal.remote) |remote| {
         for (remote.napps.items) |na| na.host.setDriven(driven);
     }
+    // A watcher that took control sizes the session like any pane again.
+    const watching = self.terminal.isViewOnly();
+    if (self.was_watching and !watching) self.surface.refit();
+    self.was_watching = watching;
     // Lease chip + auto-shown titlebar track the same roster.
     updateTitlebarActivity(self);
 }

@@ -46,8 +46,7 @@ pub const Outcome = enum {
 pub const Options = struct {
     in_fd: c_int = 0,
     out_fd: c_int = 1,
-    read_only: bool = false,
-    control: bool = false,
+    lease: mux_client.Lease = .default,
     /// Grid when `out_fd` is not a terminal (tests); a tty's own size wins.
     fixed_size: ?Size = null,
     /// Skip the hint line and the outcome line on stderr.
@@ -349,7 +348,7 @@ const Viewer = struct {
     last_err_len: usize = 0,
 
     fn attachOpts(self: *const Viewer) mux_client.AttachOptions {
-        return .{ .kind = "cli", .read_only = self.opts.read_only, .control = self.opts.control };
+        return (mux_client.AttachOptions{ .kind = "cli" }).withLease(self.opts.lease);
     }
 
     fn replaceMirror(self: *Viewer, payload: []const u8) bool {
@@ -446,7 +445,7 @@ const Viewer = struct {
         var pass: std.ArrayList(u8) = .empty;
         defer pass.deinit(self.allocator);
         const cmds = self.filter.feed(self.allocator, bytes, &pass) catch return;
-        if (pass.items.len > 0 and !self.opts.read_only) {
+        if (pass.items.len > 0 and self.opts.lease != .read_only) {
             self.conn.queueFrame(.input, pass.items) catch return self.lost();
         }
         for (cmds) |cmd| self.runCommand(cmd);
@@ -530,7 +529,7 @@ const Viewer = struct {
 /// `in_fd`/`out_fd` until detached, exited or lost. `conn` is left
 /// connected (the caller closes it).
 pub fn attach(allocator: std.mem.Allocator, conn: *mux_client.Conn, name: []const u8, opts: Options) Outcome {
-    conn.sendAttach(name, .{ .kind = "cli", .read_only = opts.read_only, .control = opts.control }) catch return .failed;
+    conn.sendAttach(name, (mux_client.AttachOptions{ .kind = "cli" }).withLease(opts.lease)) catch return .failed;
     const snap = conn.recvExpectFor(&.{.snapshot}, 15_000) catch |err| {
         msg("sketerm mux: cannot attach '{s}': {s}\n", .{ name, conn.attachFailure(err) });
         return .failed;

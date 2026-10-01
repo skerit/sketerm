@@ -55,7 +55,7 @@ const MUX_HELP =
     \\  attach <name>         attach a session (here, or as a GUI tab)
     \\      --new-tab    always a NEW GUI tab; without it, running this
     \\                   INSIDE a pane takes over that pane (tmux-style)
-    \\      --read-only  view a forwarded app without driving it
+    \\      --read-only  watch: no keys, paste, mouse or resize reach it
     \\      --control    take the app's controller lease by force
     \\  attach-all            attach EVERY session not already shown
     \\                        (bulk handoff after a move/crash; GUI only)
@@ -506,7 +506,7 @@ const SpawnResult = enum { ok, name_taken, failed };
 // ── in-terminal viewing ─────────────────────────────────────────
 
 fn ttyOptions(lease: Lease) mux_tty.Options {
-    return .{ .read_only = lease == .read_only, .control = lease == .control };
+    return .{ .lease = lease };
 }
 
 /// Show `name` in this terminal until detached or ended.
@@ -1137,7 +1137,7 @@ pub fn muxConnect(allocator: std.mem.Allocator, host: ?[]const u8) ?mux_client.C
             _ = c.fputs(deploy_note, platform.stderr());
             return null;
         };
-        if (remote.mode == .auto and conn.transport == .ssh) {
+        if (mux_client.udpUpgradeEligible(h) and conn.transport == .ssh) {
             const why = if (conn.udp_error) |e| mux_client.Conn.udpErrorText(e) else "reason unrecorded";
             _ = c.fprintf(
                 platform.stderr(),
@@ -1188,7 +1188,7 @@ pub fn fetchSessions(allocator: std.mem.Allocator, host: ?[]const u8) ?std.json.
 /// Send one command to the running GUI over its IPC socket
 /// ($SKETERM_SOCKET inside a pane, auto-discovery otherwise).
 /// Controller-lease intent for an attach that goes through the GUI.
-pub const Lease = enum { default, read_only, control };
+pub const Lease = mux_client.Lease;
 
 /// `sketerm mux attach` arguments. The session name is the first
 /// NON-flag argument, so `attach --read-only foo` and `attach foo

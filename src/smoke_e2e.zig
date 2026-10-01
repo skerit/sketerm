@@ -805,6 +805,13 @@ pub fn main() u8 {
             if (trace < 0 or c.dup2(trace, 2) < 0) c._exit(126);
             if (trace != 2) _ = c.close(trace);
         }
+        // The watch stages read the GUI's own messages (a route must never
+        // report UDP as unavailable), so they keep its stderr.
+        if (c.getenv("SKETERM_SMOKE_E2E_WATCH_ONLY") != null) {
+            const trace = c.open(WATCH_GUI_LOG.ptr, c.O_WRONLY | c.O_CREAT | c.O_TRUNC, @as(c_uint, 0o600));
+            if (trace < 0 or c.dup2(trace, 2) < 0) c._exit(126);
+            if (trace != 2) _ = c.close(trace);
+        }
         const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "--no-save", if (debug_events) "--debug-events" else null, null };
         _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
         c._exit(127);
@@ -841,6 +848,8 @@ pub fn main() u8 {
         const app = drive orelse return fail("focused assistant-watch smoke has no display driver");
         if (assistantChipStage(allocator, app, sock_path)) |why| return failMsg(why);
         say("assistant chip: focused embedded-app watch stage passed");
+        if (assistantLocalTermStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
+        say("assistant local terminal watch: Watch is read-only, Take control types");
         if (have_web_action) {
             if (assistantWebWatchStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
             say("assistant web watch: focused browser watch stage passed");
@@ -1277,6 +1286,8 @@ pub fn main() u8 {
 
         if (assistantChipStage(allocator, app, sock_path)) |why| return failMsg(why);
         say("assistant chip: an isolated MCP app raised the tab-bar chip, Watch forced a closable view-only tab under app_view=window with the app EMBEDDED, and closing it left the app alive");
+        if (assistantLocalTermStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
+        say("assistant local terminal watch: Watch is read-only, Take control types");
 
         if (have_web_action) {
             if (assistantWebWatchStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
@@ -3433,7 +3444,8 @@ fn watchAlongStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: 
 /// Spawn a plain isolated `sketerm mcp` (no --shared, no --socket): its
 /// registry record lands in this run's runtime dir, the one the GUI
 /// under test watches, exactly as a user's assistant would.
-fn spawnIsolatedMcp(allocator: std.mem.Allocator) ?McpChild {
+/// `fake_log` makes the server's Claude Code agents the rig's fake, logging there.
+fn spawnIsolatedMcp(allocator: std.mem.Allocator, fake_log: ?[*:0]const u8) ?McpChild {
     var in_pipe: [2]c_int = undefined;
     var out_pipe: [2]c_int = undefined;
     if (c.pipe(&in_pipe) != 0) return null;
@@ -3457,6 +3469,10 @@ fn spawnIsolatedMcp(allocator: std.mem.Allocator) ?McpChild {
         _ = c.unsetenv("SKETERM_SESSION");
         _ = c.unsetenv("SKETERM_MUX_SOCKET");
         _ = c.unsetenv("SKETERM_SESSION_ORIGIN_ID");
+        if (fake_log) |path| {
+            _ = c.setenv(FAKE_AGENT_ENV, "1", 1);
+            _ = c.setenv(FAKE_AGENT_LOG_ENV, path, 1);
+        }
         const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "mcp", "--no-record", null };
         _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
         c._exit(127);
@@ -3588,7 +3604,7 @@ fn assistantChipStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_pat
 
     if (assistantChipBox(app, win_id) != null)
         return "an assistant chip was already showing before the isolated MCP registered";
-    var m = spawnIsolatedMcp(allocator) orelse return "could not spawn an isolated `sketerm mcp`";
+    var m = spawnIsolatedMcp(allocator, null) orelse return "could not spawn an isolated `sketerm mcp`";
     var m_open = true;
     defer if (m_open) m.close();
     if (!m.initialize()) return "the isolated MCP server never answered initialize";
@@ -3821,6 +3837,145 @@ fn waitColorBox(app: *appdrive.App, win_id: u32, comptime pred: fn (r: i32, g: i
     return null;
 }
 
+fn fileLen(path: [:0]const u8) usize {
+    var st: c.struct_stat = undefined;
+    if (c.stat(path.ptr, &st) != 0) return 0;
+    return @intCast(st.st_size);
+}
+
+/// The first line in `path` past byte `from` that contains `needle`, or null.
+fn logLineSince(allocator: std.mem.Allocator, path: [:0]const u8, from: usize, needle: []const u8, out: []u8) ?[]const u8 {
+    const body = @import("util/readfile.zig").cappedAlloc(allocator, path, 64 << 20) catch return null;
+    defer allocator.free(body);
+    if (from >= body.len) return null;
+    var it = std.mem.splitScalar(u8, body[from..], '\n');
+    while (it.next()) |line| if (std.mem.indexOf(u8, line, needle) != null) {
+        const n = @min(line.len, out.len);
+        @memcpy(out[0..n], line[0..n]);
+        return out[0..n];
+    };
+    return null;
+}
+
+/// A Watch pane of an agent terminal is read-only end to end: typed keys
+/// and a paste reach nothing and the agent's terminal is never resized
+/// (the fake logs every prompt and every SIGWINCH as `<who> ...`), its
+/// lease chip offers Take control, and after it typed text does arrive.
+fn watchedTerminalIsReadOnly(
+    allocator: std.mem.Allocator,
+    app: *appdrive.App,
+    sock_path: [:0]const u8,
+    win_id: u32,
+    pane: u32,
+    log_path: [:0]const u8,
+    who: []const u8,
+    tag: []const u8,
+    shot: [*:0]const u8,
+) ?[]const u8 {
+    focusPane(allocator, sock_path, pane);
+    pumpFor(app, 800);
+    const from = fileLen(log_path);
+    var typed_buf: [64]u8 = undefined;
+    const typed = std.fmt.bufPrint(&typed_buf, "{s}typed\n", .{tag}) catch return "fmt";
+    app.typeText(null, typed) catch return "typing into the Watch pane failed";
+    var req_buf: [160]u8 = undefined;
+    const paste = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"send-text\",\"pane\":{d},\"data\":\"{s}pasted\\n\",\"paste\":true}}\n", .{ pane, tag }) catch return "fmt";
+    if (roundtrip(allocator, sock_path, paste)) |r| allocator.free(r) else return "pasting into the Watch pane failed";
+    pumpFor(app, 3_000);
+    var line_buf: [256]u8 = undefined;
+    if (logLineSince(allocator, log_path, from, who, &line_buf)) |line|
+        return whyf("a Watch pane drove the agent: its log got `{s}`", .{line});
+    shotTo(allocator, app, win_id, shot);
+    {
+        var get_buf: [96]u8 = undefined;
+        const get = std.fmt.bufPrint(&get_buf, "{{\"cmd\":\"get-text\",\"pane\":{d}}}\n", .{pane}) catch return "fmt";
+        const text = roundtrip(allocator, sock_path, get) orelse return "get-text of the Watch pane failed";
+        defer allocator.free(text);
+        if (std.mem.indexOf(u8, text, "UDP unavailable") != null) return "the Watch pane shows a UDP-unavailable notice";
+        if (std.mem.indexOf(u8, text, tag) != null) return "the Watch pane echoed text that must never have been sent";
+    }
+
+    // Take control from the pane's lease chip (its right end is the button).
+    const take = waitPaneChip(app, win_id, 10_000) orelse
+        return whyf("the Watch pane showed no lease chip with Take control (see {s})", .{std.mem.span(shot)});
+    app.clickEx(win_id, take.x + take.w - 12, take.y + take.h / 2, 1, 100, 1) catch return "clicking Take control failed";
+    var waited: u32 = 0;
+    var narrowed = false;
+    while (waited < 8_000 and !narrowed) : (waited += 200) {
+        pumpFor(app, 200);
+        if (paneChipBox(app, win_id)) |now| narrowed = now.w + 20 < take.w else narrowed = true;
+    }
+    if (!narrowed) return "Take control did not end the Watch pane's view-only state (the chip kept its button)";
+    focusPane(allocator, sock_path, pane);
+    pumpFor(app, 500);
+    const ctl = std.fmt.bufPrint(&typed_buf, "{s}ctl\n", .{tag}) catch return "fmt";
+    app.typeText(null, ctl) catch return "typing after Take control failed";
+    var want_buf: [96]u8 = undefined;
+    const want = std.fmt.bufPrint(&want_buf, "{s}{s}ctl", .{ who, tag }) catch return "fmt";
+    waited = 0;
+    while (waited < 15_000 and logLineSince(allocator, log_path, from, want, &line_buf) == null) : (waited += 250) pumpFor(app, 250);
+    const got = logLineSince(allocator, log_path, from, want, &line_buf) orelse
+        return whyf("text typed after Take control never reached {s}", .{who});
+    var say_buf: [256]u8 = undefined;
+    say(std.fmt.bufPrint(&say_buf, "watch read-only ({s}): typed+pasted text and resizes never reached the agent; after Take control it logged `{s}`", .{ tag, got }) catch "watch read-only");
+    return null;
+}
+
+/// A LOCAL assistant's agent terminal (a `sketerm mcp` on this machine,
+/// its Claude Code the rig's fake): Watch is read-only, Take control types.
+fn assistantLocalTermStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]const u8, rt: []const u8) ?[]const u8 {
+    if (!@import("util/ocr.zig").available()) {
+        say("SKIP assistant local terminal watch: tesseract unavailable; the popover is driven by OCR");
+        return null;
+    }
+    if (app.windows.items.len == 0) return "the display session lost its window";
+    const win_id = mainWin(app).id;
+    if (assistantChipBox(app, win_id) != null) return "an assistant chip was already showing before the local terminal stage";
+    var keep_ids: [64]u32 = undefined;
+    var keep_n: usize = 0;
+    {
+        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse return "list before the local terminal stage failed";
+        defer allocator.free(r);
+        keep_n = listPaneIds(r, &keep_ids);
+    }
+    var log_buf: [512:0]u8 = undefined;
+    const log_path = std.fmt.bufPrintZ(&log_buf, "{s}/agent-local.log", .{rt}) catch return "log path";
+    var self_buf: [4096]u8 = undefined;
+    const self_exe = std.mem.span(@as([*:0]const u8, @ptrCast(c.realpath("/proc/self/exe", &self_buf) orelse return "realpath of the rig binary")));
+    var m = spawnIsolatedMcp(allocator, log_path.ptr) orelse return "could not spawn an isolated `sketerm mcp`";
+    var m_open = true;
+    defer if (m_open) m.close();
+    if (!m.initialize()) return "the isolated MCP server never answered initialize";
+    var args_buf: [4400]u8 = undefined;
+    const args = std.fmt.bufPrint(&args_buf, "{{\"app\":\"claude\",\"binary\":{f},\"timeout_ms\":30000}}", .{std.json.fmt(self_exe, .{})}) catch return "agent_open args";
+    const opened = mcpCallReply(&m, "agent_open", args, 60_000) orelse return "agent_open on the local MCP timed out";
+    if (mcpHas(opened, "\"isError\":true")) return whyf("agent_open failed: {s}", .{opened[0..@min(opened.len, 300)]});
+
+    const chip = waitAssistantChip(app, win_id, true, 30_000) orelse {
+        shotTo(allocator, app, win_id, "zig-out/smoke-e2e-localterm-nochip.png");
+        return "the local assistant raised no chip (see zig-out/smoke-e2e-localterm-nochip.png)";
+    };
+    if (openPopup(app) != null) return "a popup was already open before the chip click";
+    app.click(win_id, chip.x + chip.w / 2, chip.y + chip.h / 2, 1) catch return "clicking the assistant chip failed";
+    const pop_id = waitPopup(app, true, 10_000) orelse return "the assistant chip opened no popover";
+    const watch = waitOcrRowAction(allocator, app, pop_id, "claude-1", "Watch", 15_000) orelse {
+        shotTo(allocator, app, pop_id, "zig-out/smoke-e2e-localterm-popover.png");
+        return "no Watch button on the local claude-1 row (see zig-out/smoke-e2e-localterm-popover.png)";
+    };
+    app.click(pop_id, watch.x, watch.y, 1) catch return "clicking Watch failed";
+    const pane = waitNewPaneText(allocator, sock_path, keep_ids[0..keep_n], &.{}, "manual mode on", 30_000) orelse {
+        shotTo(allocator, app, win_id, "zig-out/smoke-e2e-localterm-watch.png");
+        return "Watch opened no pane showing the local claude-1 (see zig-out/smoke-e2e-localterm-watch.png)";
+    };
+    if (watchedTerminalIsReadOnly(allocator, app, sock_path, win_id, pane, log_path, "agent-claude-1 ", "lw", "zig-out/smoke-e2e-watch-readonly-local.png")) |why| return why;
+
+    closeAddedPanes(allocator, sock_path, app, keep_ids[0..keep_n]);
+    m.close();
+    m_open = false;
+    if (waitAssistantChip(app, win_id, false, 30_000) == null) return "the chip survived the local assistant exiting";
+    return null;
+}
+
 /// An assistant's BROWSER, watched as a browser: an isolated `sketerm
 /// mcp` opens a page, the chip's Watch opens that page as an ordinary
 /// web tab (a WebFace with the page's url in its address bar), never a
@@ -3876,7 +4031,7 @@ fn assistantWebWatchStage(allocator: std.mem.Allocator, app: *appdrive.App, sock
     defer _ = c.unsetenv("SKETERM_WEB_BIN");
     if (assistantChipBox(app, win_id) != null)
         return "an assistant chip was already showing before the web watch MCP registered";
-    var m = spawnIsolatedMcp(allocator) orelse return "could not spawn an isolated `sketerm mcp`";
+    var m = spawnIsolatedMcp(allocator, null) orelse return "could not spawn an isolated `sketerm mcp`";
     var m_open = true;
     defer if (m_open) m.close();
     if (!m.initialize()) return "the web watch MCP server never answered initialize";
@@ -16027,6 +16182,8 @@ fn configReloadStage(allocator: std.mem.Allocator, sock_path: [:0]const u8, rt: 
 /// The GUI's stderr in the focused workspace run, which passes
 /// `--debug-events`.
 const debug_events_log: [*:0]const u8 = "zig-out/smoke-e2e-debug-events.log";
+/// The GUI's stderr in the focused watch run.
+const WATCH_GUI_LOG: [:0]const u8 = "zig-out/smoke-e2e-watch-gui.log";
 
 /// `--debug-events` printed the events the workspace stage caused and
 /// the snapshot swaps its font resizes forced (a resize answers with a
@@ -17396,19 +17553,43 @@ const FA_BUSY = "\x1b]0;\xe2\x97\x90 Working\x07";
 const FA_IDLE = "\x1b]0;\xe2\x9c\xb3 Claude Code\x07";
 const FA_END = "\x1b]133;C\x07\x1b]133;D\x07\x07" ++ FA_IDLE ++ FA_ERASE ++ "Brewed for 1s \xc2\xb7 done\r\n" ++ FA_LIVE;
 
+var fa_winch: bool = false;
+
+fn faOnWinch(_: @TypeOf(std.posix.SIG.WINCH)) callconv(.c) void {
+    @atomicStore(bool, &fa_winch, true, .seq_cst);
+}
+
+/// Append `<session> <what> @<cols>x<rows>` to `$FAKE_AGENT_LOG_ENV`.
+fn faLog(what: []const u8) void {
+    const log_path = c.getenv(FAKE_AGENT_LOG_ENV) orelse return;
+    const f = c.fopen(log_path, "a") orelse return;
+    defer _ = c.fclose(f);
+    var ws: c.struct_winsize = std.mem.zeroes(c.struct_winsize);
+    _ = c.ioctl(0, c.TIOCGWINSZ, &ws);
+    const who: [*:0]const u8 = c.getenv("SKETERM_SESSION") orelse "?";
+    _ = c.fprintf(f, "%s %.*s @%ux%u\n", who, @as(c_int, @intCast(what.len)), what.ptr, @as(c_uint, ws.ws_col), @as(c_uint, ws.ws_row));
+}
+
 /// The fake: draws the banner, echoes typed input, answers every prompt
-/// with `claude: echo: <prompt>` and logs it to `$FAKE_AGENT_LOG_ENV`.
+/// with `claude: echo: <prompt>` and logs it, and every resize as
+/// `winch`, to `$FAKE_AGENT_LOG_ENV`.
 fn fakeAgent(allocator: std.mem.Allocator) u8 {
     var tio: c.struct_termios = undefined;
     if (c.tcgetattr(0, &tio) == 0) {
         c.cfmakeraw(&tio);
         _ = c.tcsetattr(0, c.TCSANOW, &tio);
     }
+    const winch = std.posix.Sigaction{ .handler = .{ .handler = &faOnWinch }, .mask = std.posix.sigemptyset(), .flags = 0 };
+    std.posix.sigaction(std.posix.SIG.WINCH, &winch, null);
     _ = c.usleep(300_000);
     fakeOut(FA_IDLE ++ "Claude Code v0.0.0 (smoke fake)\r\n" ++ FA_LIVE);
     var input: std.ArrayList(u8) = .empty;
     defer input.deinit(allocator);
     while (true) {
+        if (@atomicRmw(bool, &fa_winch, .Xchg, false, .seq_cst)) faLog("winch");
+        // Polled, so a resize is logged when it lands, not at the next key.
+        var pfd = c.struct_pollfd{ .fd = 0, .events = c.POLLIN, .revents = 0 };
+        if (c.poll(&pfd, 1, 250) <= 0) continue;
         var buf: [512]u8 = undefined;
         const n = c.read(0, &buf, buf.len);
         if (n == 0) return 0;
@@ -17419,13 +17600,7 @@ fn fakeAgent(allocator: std.mem.Allocator) u8 {
         for (buf[0..@intCast(n)]) |b| switch (b) {
             '\r', '\n' => {
                 if (input.items.len == 0) continue;
-                if (c.getenv(FAKE_AGENT_LOG_ENV)) |log_path| {
-                    if (c.fopen(log_path, "a")) |f| {
-                        const who: [*:0]const u8 = c.getenv("SKETERM_SESSION") orelse "?";
-                        _ = c.fprintf(f, "%s %.*s\n", who, @as(c_int, @intCast(input.items.len)), input.items.ptr);
-                        _ = c.fclose(f);
-                    }
-                }
+                faLog(input.items);
                 const turn = std.fmt.allocPrint(allocator, "\x1b]133;A\x07" ++ FA_BUSY ++ FA_ERASE ++ "you: {s}\r\n" ++ FA_LIVE, .{input.items}) catch return 1;
                 fakeOut(turn);
                 allocator.free(turn);
@@ -17787,6 +17962,7 @@ fn assistantRemoteStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_p
     skip_ids[skip_n] = watch_pane;
     skip_n += 1;
     say("assistant remote watch: Watch shows claude-1's screen through route:hosta#<instance>");
+    if (watchedTerminalIsReadOnly(allocator, app, sock_path, win_id, watch_pane, log_path, "agent-claude-1 ", "rw", "zig-out/smoke-e2e-watch-readonly-remote.png")) |why| return why;
 
     // ── Take control of claude-2, placed on hostb, through hosta ──
     app.click(win_id, chip.x + chip.w / 2, chip.y + chip.h / 2, 1) catch return "clicking the assistant chip again failed";
@@ -17811,6 +17987,17 @@ fn assistantRemoteStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_p
     if (!logHas(allocator, log_path, "agent-claude-2 viagui"))
         return "text typed after Take control never reached claude-2 on hostb (see zig-out/smoke-e2e-remote-control.png)";
     say("assistant remote watch: Take control typed into claude-2 on hostb through route:hosta/hostb");
+    // Routes are ssh end to end: no UDP upgrade, so no UDP notice anywhere.
+    {
+        var get_buf: [96]u8 = undefined;
+        const get = std.fmt.bufPrint(&get_buf, "{{\"cmd\":\"get-text\",\"pane\":{d}}}\n", .{ctl_pane}) catch return "fmt";
+        const text = roundtrip(allocator, sock_path, get) orelse return "get-text of the route-attached pane failed";
+        defer allocator.free(text);
+        if (std.mem.indexOf(u8, text, "UDP unavailable") != null) return "the route-attached pane shows a UDP-unavailable notice";
+    }
+    var gui_line: [256]u8 = undefined;
+    if (logLineSince(allocator, WATCH_GUI_LOG, 0, "UDP unavailable", &gui_line)) |line|
+        return whyf("the GUI reported UDP as unavailable for a route: `{s}` ({s})", .{ line, WATCH_GUI_LOG });
 
     // ── the server exits: its agents leave with hosta's next report ──
     for ([_]u32{ ctl_pane, watch_pane }) |id| {

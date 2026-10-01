@@ -187,9 +187,13 @@ pub const PassedClient = struct {
     identity_first: bool = false,
     /// Hello `paste_request`: the client answers paste_request units.
     answers_paste: bool = false,
+    /// `AttachReq.view_only`. An older worker ignores the byte, which is
+    /// why the GUI trusts only the worker's `control_state` echo.
+    view_only: bool = false,
 
     const CODECS_END: usize = 12 + wlvcodec.CodecList.wire_size;
-    pub const WIRE_SIZE: usize = CODECS_END + 1;
+    const VIEW_ONLY_AT: usize = CODECS_END + 1;
+    pub const WIRE_SIZE: usize = VIEW_ONLY_AT + 1;
 
     /// Append-only broker handoff encoding; old workers ignore tail bytes.
     pub fn encode(self: PassedClient) [WIRE_SIZE]u8 {
@@ -208,6 +212,7 @@ pub const PassedClient = struct {
         out[11] = @intFromBool(self.identity_first);
         out[12..CODECS_END].* = self.video_codecs.encode();
         out[CODECS_END] = @intFromBool(self.answers_paste);
+        out[VIEW_ONLY_AT] = @intFromBool(self.view_only);
         return out;
     }
 
@@ -242,6 +247,7 @@ pub const PassedClient = struct {
             .panel_rpc = if (bytes.len >= 11) @min(bytes[10], wire.PANEL_RPC_VERSION) else 0,
             .identity_first = bytes.len >= 12 and bytes[11] != 0,
             .answers_paste = bytes.len > CODECS_END and bytes[CODECS_END] != 0,
+            .view_only = bytes.len > VIEW_ONLY_AT and bytes[VIEW_ONLY_AT] != 0,
         };
     }
 };
@@ -262,6 +268,7 @@ test "broker attach handoff preserves panel-only capability fields" {
         .panel_rpc = wire.PANEL_RPC_VERSION,
         .identity_first = true,
         .answers_paste = true,
+        .view_only = true,
     };
     const encoded = original.encode();
     const decoded = PassedClient.decode(&encoded);
@@ -278,8 +285,13 @@ test "broker attach handoff preserves panel-only capability fields" {
     try t.expectEqual(original.panel_rpc, decoded.panel_rpc);
     try t.expectEqual(original.identity_first, decoded.identity_first);
     try t.expectEqual(original.answers_paste, decoded.answers_paste);
+    try t.expectEqual(original.view_only, decoded.view_only);
     // A handoff from before the paste byte never claims it.
-    try t.expect(!PassedClient.decode(encoded[0 .. PassedClient.WIRE_SIZE - 1]).answers_paste);
+    try t.expect(!PassedClient.decode(encoded[0..PassedClient.VIEW_ONLY_AT - 1]).answers_paste);
+    // One from before the view-only byte keeps paste and is no watcher.
+    const pre_view = PassedClient.decode(encoded[0..PassedClient.VIEW_ONLY_AT]);
+    try t.expect(pre_view.answers_paste);
+    try t.expect(!pre_view.view_only);
 
     const historical = PassedClient.decode(encoded[0..9]);
     try t.expect(!historical.panel_only);
@@ -339,6 +351,7 @@ pub fn addPassedClient(self: *Daemon, fd: c_int, req: PassedClient) void {
         .kind = req.kind,
         .read_only = req.read_only,
         .want_control = req.want_control,
+        .view_only = req.view_only,
         .panel_only = req.panel_only,
         .panel_rpc = req.panel_rpc,
         .identity_first = req.identity_first,

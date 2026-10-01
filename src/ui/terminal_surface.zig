@@ -1113,7 +1113,7 @@ pub const TerminalSurface = struct {
         // are framebuffer pixels — multiply by scale_factor to
         // compare in the same space. A fixed_grid surface never
         // follows the allocation, so its grid keeps its dimensions.
-        if (self.geometry == .live_terminal) {
+        if (self.followsAllocation()) {
             const w = c.gtk_widget_get_width(@ptrCast(self.area));
             const h = c.gtk_widget_get_height(@ptrCast(self.area));
             const scale = c.gtk_widget_get_scale_factor(@ptrCast(self.area));
@@ -1140,6 +1140,23 @@ pub const TerminalSurface = struct {
 
         self.terminal.screen.dirty = true;
         c.gtk_gl_area_queue_render(@ptrCast(self.area));
+    }
+
+    /// Whether the allocation drives the cell grid. A watcher's never does:
+    /// its local grid must stay the session's, or events land on a grid
+    /// the daemon never resized.
+    fn followsAllocation(self: *const TerminalSurface) bool {
+        return self.geometry == .live_terminal and !self.terminal.isViewOnly();
+    }
+
+    /// Fit the grid to the current allocation again, e.g. once a watcher
+    /// takes control; a no-op while the grid does not follow it.
+    pub fn refit(self: *TerminalSurface) void {
+        const scale = c.gtk_widget_get_scale_factor(@ptrCast(self.area));
+        const w = c.gtk_widget_get_width(@ptrCast(self.area)) * scale;
+        const h = c.gtk_widget_get_height(@ptrCast(self.area)) * scale;
+        if (w <= 0 or h <= 0) return;
+        onResize(self.area, w, h, @ptrCast(self));
     }
 
     /// Terminal image sink landed (kitty/iTerm2 image arrived): store
@@ -1734,15 +1751,12 @@ fn onAreaUnmap(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
 
 fn onResize(_: *c.GtkGLArea, width: c_int, height: c_int, user: ?*anyopaque) callconv(.c) void {
     const self = cast.userData(TerminalSurface, user);
-    switch (self.geometry) {
-        // A fixed grid never follows the allocation and never
-        // reports geometry; the framebuffer was reallocated though,
-        // so repaint the letterbox.
-        .fixed_grid => {
-            c.gtk_gl_area_queue_render(@ptrCast(self.area));
-            return;
-        },
-        .live_terminal => {},
+    // A fixed grid, or a watcher's grid (the session's size, rendered
+    // 1:1), never follows the allocation and never reports geometry;
+    // the framebuffer was reallocated though, so repaint.
+    if (!self.followsAllocation()) {
+        c.gtk_gl_area_queue_render(@ptrCast(self.area));
+        return;
     }
     const atlas = self.atlas orelse return;
     if (atlas.cell_w == 0 or atlas.cell_h == 0) return;

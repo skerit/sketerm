@@ -123,7 +123,7 @@ fn onSharedReady(ctx: *anyopaque) void {
             "{s}: daemon runs an older sketerm build (busy; upgrades when its sessions end)",
             .{remote.host},
         );
-    } else if (remote.mode == .auto and conn.transport == .ssh) {
+    } else if (muxclient.udpUpgradeEligible(hc.host.?) and conn.transport == .ssh) {
         view.setStatusFmt("UDP unavailable; connected to {s} over SSH", .{remote.host});
     } else {
         view.setStatusFmt("connected to {s} over {s}", .{ remote.host, @tagName(conn.transport) });

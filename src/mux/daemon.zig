@@ -780,6 +780,9 @@ pub const Client = struct {
     /// The client asked to view only: it never takes the controller
     /// lease, not even when the session has none.
     read_only: bool = false,
+    /// A watcher (`AttachReq.view_only`): its input and resize are
+    /// dropped until it acquires control. See `drivesTerminal`.
+    view_only: bool = false,
     /// Terminal `.events` were withheld because this client's wbuf
     /// exceeded EVENTS_BACKLOG (a flooding session vs a slow/idle
     /// consumer — e.g. an MCP client between tool calls). Once the
@@ -842,6 +845,11 @@ pub const Client = struct {
     fn resyncBackoffMs(attempt: u8) i64 {
         const shift: u6 = @intCast(@min(attempt -| 1, 5));
         return @min(RESYNC_RETRY_BASE_MS << shift, RESYNC_RETRY_MAX_MS);
+    }
+
+    /// Whether this client's `.input` and `.resize` may reach its session.
+    pub fn drivesTerminal(self: *const Client) bool {
+        return !self.panel_only and !self.view_only;
     }
 
     pub fn deinit(self: *Client) void {
@@ -4909,6 +4917,7 @@ pub const Daemon = struct {
                 .read_only = cl.read_only,
                 .controller_label = label,
                 .viewers = viewers,
+                .view_only = cl.view_only,
             });
         }
     }
@@ -4978,8 +4987,10 @@ pub const Daemon = struct {
         defer parsed.deinit();
         const op = parsed.value.op;
         if (std.mem.eql(u8, op, "acquire") or std.mem.eql(u8, op, "takeover")) {
-            // A read-only viewer asking for control is opting back in.
+            // A read-only viewer asking for control is opting back in;
+            // a watcher taking control may type from now on.
             cl.read_only = false;
+            cl.view_only = false;
             _ = self.acquireControl(s, cl, std.mem.eql(u8, op, "takeover"));
         } else if (std.mem.eql(u8, op, "release")) {
             _ = self.releaseControl(s, cl);

@@ -108,6 +108,12 @@ pub const Flag = enum {
     /// to watch them (`sshroute.watchSpec`). Absent = an older daemon,
     /// whose list says nothing about assistants: none are known there.
     assistants,
+    /// Attach honors `view_only`: the session's process drops that
+    /// client's input and resize and echoes `view_only` in
+    /// `control_state`. The ECHO is the proof (an adopted older worker
+    /// behind a new broker lacks it). Absent = the client withholds
+    /// input itself and tells its user the daemon does not enforce it.
+    view_only,
 };
 
 /// One bool per flag, keyed by wire name; the parsed form on the

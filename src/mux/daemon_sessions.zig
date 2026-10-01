@@ -910,6 +910,7 @@ pub fn brokerAttach(self: *Daemon, cl: *Client, payload: []const u8) void {
         .identity_first = parsed.value.identity_first and panel_rpc > 0 and kind == .gui and
             !parsed.value.panel_only,
         .answers_paste = cl.answers_paste,
+        .view_only = parsed.value.view_only,
     }).encode();
     var msg: [1 + PassedClient.WIRE_SIZE]u8 = undefined;
     msg[0] = 'A';
@@ -1820,6 +1821,7 @@ pub const AttachSpec = struct {
     kind: Client.Kind,
     read_only: bool,
     want_control: bool,
+    view_only: bool = false,
     panel_only: bool,
     panel_rpc: u8,
     identity_first: bool,
@@ -1832,10 +1834,12 @@ pub fn attachClientToSession(self: *Daemon, cl: *Client, s: *Session, spec: Atta
     cl.attached = s;
     cl.panel_only = spec.panel_only;
     cl.panel_rpc = spec.panel_rpc;
-    cl.read_only = spec.read_only or spec.panel_only;
+    // A watcher never drives the seat either, whatever else it asked.
+    cl.view_only = spec.view_only and !spec.panel_only;
+    cl.read_only = spec.read_only or spec.panel_only or cl.view_only;
     cl.kind = spec.kind;
-    log.info("client attached session='{s}' kind={s} proto={d} video_codecs={d} panel_only={} panel_rpc={d} ({s})", .{
-        s.name, @tagName(spec.kind), cl.proto, cl.video_codecs.len, cl.panel_only, cl.panel_rpc, how,
+    log.info("client attached session='{s}' kind={s} proto={d} video_codecs={d} panel_only={} panel_rpc={d} view_only={} ({s})", .{
+        s.name, @tagName(spec.kind), cl.proto, cl.video_codecs.len, cl.panel_only, cl.panel_rpc, cl.view_only, how,
     });
     if (cl.panel_only) {
         cl.queueJson(.ok, .{
@@ -1924,6 +1928,7 @@ pub fn handleAttach(self: *Daemon, cl: *Client, payload: []const u8) void {
         .kind = clientKindNamed(parsed.value.kind),
         .read_only = parsed.value.read_only,
         .want_control = parsed.value.control,
+        .view_only = parsed.value.view_only,
         .panel_only = parsed.value.panel_only,
         .panel_rpc = panel_rpc,
         .identity_first = parsed.value.identity_first,

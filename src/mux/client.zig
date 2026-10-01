@@ -189,6 +189,15 @@ pub fn findMuxBinary(buf: *[4096:0]u8) [*:0]const u8 {
     return selfexec.BINARY;
 }
 
+/// Whether a live connection to `spec` should try a background upgrade to
+/// UDP (and so may report UDP as unavailable): bare auto hosts only, never
+/// a route, which is ssh end to end.
+pub fn udpUpgradeEligible(spec: []const u8) bool {
+    if (RouteSpec.isRoute(spec)) return false;
+    if (std.mem.startsWith(u8, spec, "sock:")) return false;
+    return RemoteSpec.parse(spec).mode == .auto;
+}
+
 /// Whether a remote spec may mint or consume a UDP ticket.
 ///
 /// A ticket IS a transport choice: riding one dials the daemon over UDP
@@ -285,6 +294,10 @@ fn udpMemoClear(host: []const u8) void {
     _ = c.unlink(path.ptr);
 }
 
+/// What a viewer asks of a session's input: the default (type, and take a
+/// free seat lease), watch only, or take control from whoever holds it.
+pub const Lease = enum { default, read_only, control };
+
 /// Additive attach properties shared by terminal viewers, future GUI panel
 /// presenters, and panel-only requesters.
 pub const AttachOptions = struct {
@@ -292,8 +305,20 @@ pub const AttachOptions = struct {
     origin_id: []const u8 = "",
     read_only: bool = false,
     control: bool = false,
+    /// Sent only to a daemon advertising `view_only`.
+    view_only: bool = false,
     panel_only: bool = false,
     panel_rpc: u8 = 0,
+
+    /// These options with `lease`'s attach flags; the one place a lease
+    /// becomes wire fields.
+    pub fn withLease(self: AttachOptions, lease: Lease) AttachOptions {
+        var out = self;
+        out.read_only = lease == .read_only;
+        out.view_only = lease == .read_only;
+        out.control = lease == .control;
+        return out;
+    }
 };
 
 pub const AttachIdentity = struct {
@@ -1669,6 +1694,7 @@ pub const Conn = struct {
             .kind = opts.kind,
             .read_only = opts.read_only,
             .control = opts.control,
+            .view_only = opts.view_only and self.caps.view_only,
             .panel_only = opts.panel_only,
             .panel_rpc = opts.panel_rpc,
             .identity_first = identity_first,
@@ -2852,6 +2878,33 @@ test "UDP tickets are refused for every forced non-UDP transport" {
     try t.expect(takeTicketFromEnv("tor:box") == null);
     // Still present for an eligible spec: the refusals above consumed nothing.
     try t.expect(takeTicketFromEnv("box") != null);
+}
+
+test "only a bare auto host is upgraded to UDP in the background; never a route" {
+    const t = std.testing;
+    try t.expect(udpUpgradeEligible("box"));
+    try t.expect(udpUpgradeEligible("user@box"));
+    // A route parses as an "auto" RemoteSpec; it must still never upgrade.
+    try t.expect(!udpUpgradeEligible("route:hosta#k3y"));
+    try t.expect(!udpUpgradeEligible("route:hosta/hostb"));
+    try t.expect(!udpUpgradeEligible("route:tor:hosta/hostb#k3y"));
+    try t.expect(!udpUpgradeEligible("udp:box"));
+    try t.expect(!udpUpgradeEligible("ssh:box"));
+    try t.expect(!udpUpgradeEligible("tor:box"));
+    try t.expect(!udpUpgradeEligible("sock:/tmp/x/mux.sock"));
+}
+
+test "a lease becomes exactly one set of attach flags" {
+    const t = std.testing;
+    const base = AttachOptions{ .kind = "gui", .panel_rpc = 2 };
+    const watch = base.withLease(.read_only);
+    try t.expect(watch.read_only and watch.view_only and !watch.control);
+    try t.expectEqualStrings("gui", watch.kind);
+    try t.expectEqual(@as(u8, 2), watch.panel_rpc);
+    const take = base.withLease(.control);
+    try t.expect(!take.read_only and !take.view_only and take.control);
+    const plain = watch.withLease(.default);
+    try t.expect(!plain.read_only and !plain.view_only and !plain.control);
 }
 
 test "a ticket connection refuses a forced non-UDP spec" {

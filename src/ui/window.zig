@@ -1807,7 +1807,7 @@ pub const Window = struct {
         defer attached.snapshot.deinit(self.allocator);
         // Pass the pre-allocated id so it isn't double-allocated (keeps pane
         // ids contiguous + matches the env-exported SKETERM_PANE_ID).
-        const pane = try self.makeRemotePaneFromSnap(conn, name, null, attached.snapshot.payload, attached.identity, pane_id, false, false, true);
+        const pane = try self.makeRemotePaneFromSnap(conn, name, null, attached.snapshot.payload, attached.identity, pane_id, .default, true);
         if (pane.terminal.remote) |r| {
             r.ephemeral = true; // GUI-owned → close kills the session (no leak)
             pane.terminal.markLocalEcho();

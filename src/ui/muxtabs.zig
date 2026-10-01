@@ -262,8 +262,7 @@ pub fn attachMuxApp(
     host: ?[]const u8,
     snap_payload: []const u8,
     identity: @import("../mux/client.zig").AttachIdentity,
-    read_only: bool,
-    want_control: bool,
+    lease: Lease,
 ) !void {
     var conn = conn_in;
     const term = blk: {
@@ -277,8 +276,7 @@ pub fn attachMuxApp(
             host,
             self.config.mux_udp_port_range,
             self.config.mux_tor_socks_endpoint,
-            read_only,
-            want_control,
+            lease,
         );
     };
     errdefer term.deinit();
@@ -453,8 +451,7 @@ pub fn makeRemotePaneFromSnap(
     // env at spawn time; passing it here keeps that id (no double-alloc,
     // so pane ids stay contiguous — `split --pane 2` must find pane 2).
     pane_id: ?u32,
-    read_only: bool,
-    want_control: bool,
+    lease: Lease,
     ephemeral: bool,
 ) !*Pane {
     var conn = conn_in;
@@ -478,8 +475,7 @@ pub fn makeRemotePaneFromSnap(
             host,
             self.config.mux_udp_port_range,
             self.config.mux_tor_socks_endpoint,
-            read_only,
-            want_control,
+            lease,
         );
     };
     errdefer term.deinit();
@@ -573,7 +569,7 @@ pub fn restoreMuxPane(self: *Window, spec: layout_mod.PaneSpec) !*Pane {
         }
     }
     defer snap.deinit(self.allocator);
-    const pane = try makeRemotePaneFromSnap(self, conn, spec.mux_session, host, snap.payload, identity, null, false, false, false);
+    const pane = try makeRemotePaneFromSnap(self, conn, spec.mux_session, host, snap.payload, identity, null, .default, false);
     const profile = self.findProfile(spec.profile);
     pane.active_profile = if (profile) |p| p.name else null;
     self.applyPaneConfig(pane, .{ .profile = profile, .font_size_override = spec.font_size });
@@ -843,9 +839,9 @@ pub fn onMuxRestoreDone(user: ?*anyopaque) callconv(.c) c_int {
 
     const conn = job.conn.?;
     const remote = @import("../mux/client.zig").RemoteSpec.parse(job.host);
-    const used_ssh_fallback = remote.mode == .auto and conn.transport == .ssh;
+    const used_ssh_fallback = @import("../mux/client.zig").udpUpgradeEligible(job.host) and conn.transport == .ssh;
     job.conn = null; // ownership moves to makeRemotePaneFromSnap
-    const pane = makeRemotePaneFromSnap(win, conn, job.session, job.host, job.snap.?, job.identity, null, false, false, false) catch |err| {
+    const pane = makeRemotePaneFromSnap(win, conn, job.session, job.host, job.snap.?, job.identity, null, .default, false) catch |err| {
         std.debug.print(
             "sketerm: mux restore '{s}' @ {s}: pane build failed ({s})\n",
             .{ job.session, job.host, @errorName(err) },
@@ -867,8 +863,8 @@ pub fn onMuxRestoreDone(user: ?*anyopaque) callconv(.c) c_int {
     return 0;
 }
 
-/// Controller-lease intent for one attach (see mux_cli.Lease).
-pub const Lease = enum { default, read_only, control };
+/// Controller-lease intent for one attach.
+pub const Lease = @import("../mux/client.zig").Lease;
 
 pub fn attachMux(self: *Window, conn_in: @import("../mux/client.zig").Conn, name: []const u8, host: ?[]const u8, takeover: ?*Pane) !void {
     return attachMuxProfile(self, conn_in, name, host, takeover, null);
@@ -889,12 +885,10 @@ pub fn attachMuxLease(self: *Window, conn_in: @import("../mux/client.zig").Conn,
         // default (it only lands if free); the daemon answers with
         // a control_state frame either way, so a viewer that did
         // not get it finds out.
-        try conn.sendAttach(name, .{
+        try conn.sendAttach(name, (@import("../mux/client.zig").AttachOptions{
             .kind = "gui",
-            .read_only = lease == .read_only,
-            .control = lease == .control,
             .panel_rpc = conn.panel_rpc,
-        });
+        }).withLease(lease));
         break :blk conn.recvGuiAttach() catch |err| {
             // Stash the daemon's reason while `conn` is still alive
             // (the errdefer below frees it) so the caller surfaces it.
@@ -940,12 +934,12 @@ fn attachMuxPreparedMode(self: *Window, conn_in: @import("../mux/client.zig").Co
         return error.BadSnapshot;
     };
     if (!force_tab and takeover == null and self.config.app_view == .window and envelope.app) {
-        try attachMuxApp(self, conn, name, host, snapshot_payload, identity, lease == .read_only, lease == .control);
+        try attachMuxApp(self, conn, name, host, snapshot_payload, identity, lease);
         return null;
     }
 
     crashlog.set("mux attach '{s}' @ {s} takeover={} - building pane", .{ name, host orelse "local", takeover != null });
-    const pane = try makeRemotePaneFromSnap(self, conn, name, host, snapshot_payload, identity, null, lease == .read_only, lease == .control, false);
+    const pane = try makeRemotePaneFromSnap(self, conn, name, host, snapshot_payload, identity, null, lease, false);
     pane.active_profile = if (profile) |p| p.name else null;
     // BEFORE the config push and before any app channel can open:
     // `onAppViewEvent` installs the embed box only when the flag is
@@ -1201,13 +1195,11 @@ pub const AttachJob = struct {
     }
 
     fn attachOn(self: *AttachJob, conn: *mux_client.Conn) bool {
-        conn.sendAttach(self.session, .{
+        conn.sendAttach(self.session, (mux_client.AttachOptions{
             .kind = "gui",
             .origin_id = self.origin_id,
-            .read_only = self.lease == .read_only,
-            .control = self.lease == .control,
             .panel_rpc = conn.panel_rpc,
-        }) catch |err| return self.noteFailure(conn, err);
+        }).withLease(self.lease)) catch |err| return self.noteFailure(conn, err);
         const attached = conn.recvGuiAttachFor(20_000) catch |err| return self.noteFailure(conn, err);
         self.snapshot = attached.snapshot;
         self.identity = attached.identity;

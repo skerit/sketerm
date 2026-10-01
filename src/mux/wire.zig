@@ -155,7 +155,8 @@ pub const FrameType = enum(u8) {
     /// `acquire` only succeeds while nobody holds the lease;
     /// `takeover` evicts the current controller. Answered by a
     /// `control_state` broadcast (never an ok/err — the state IS the
-    /// answer, and every viewer needs it anyway).
+    /// answer, and every viewer needs it anyway). `acquire`/`takeover`
+    /// also end a `view_only` attach: that is how a watcher takes control.
     control_req = 25,
     /// Mint a sibling UDP listener on the daemon's host, so a NEW
     /// client can reach this daemon over UDP without its own ssh
@@ -349,9 +350,11 @@ pub const FrameType = enum(u8) {
     /// Controller lease state for the client's session, pushed to
     /// EVERY attached client on every change (attach, release,
     /// takeover, controller death): JSON { controller, read_only,
-    /// controller_label, viewers }. `controller` is "do I hold it" —
-    /// each recipient gets its own view, so a viewer that asked for
-    /// control and did not get it learns so without polling.
+    /// controller_label, viewers, view_only }. `controller` is "do I hold
+    /// it" — each recipient gets its own view, so a viewer that asked for
+    /// control and did not get it learns so without polling. `view_only`
+    /// is present only from a daemon that ENFORCES it (capability
+    /// `view_only`); its absence means an old process holds the session.
     control_state = 89,
     /// Daemon-authoritative metadata for the attached session. JSON
     /// `{cwd}` follows every snapshot so a newly attached GUI does not
@@ -1354,6 +1357,11 @@ pub const AttachReq = struct {
     /// Force the controller lease on attach, evicting whoever holds it.
     /// Without this an attach only acquires a FREE lease.
     control: bool = false,
+    /// A watcher: the daemon drops this client's `.input` and `.resize`
+    /// for the session (terminal AND app sessions) and never lets it take
+    /// the seat lease, until a `control_req` acquire/takeover. Distinct
+    /// from `read_only`, which one-shot `mux send` attaches set while typing.
+    view_only: bool = false,
     /// Attach for correlated panel RPC only: no snapshot, terminal events,
     /// native channels, audio, controller lease, or viewer occupancy.
     panel_only: bool = false,

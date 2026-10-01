@@ -295,6 +295,13 @@ pub const Terminal = struct {
         tor_socks_endpoint: []u8 = &.{},
         /// Preserve a read-only attach across reconnects.
         read_only: bool = false,
+        /// A watcher (Watch lease): input and resize are withheld here
+        /// whatever the daemon does, until a control_state ends it.
+        view_only: bool = false,
+        /// `view_only` as the session's daemon process last echoed it in
+        /// control_state; null = never echoed (an old daemon or worker
+        /// that does not enforce it).
+        view_only_echo: ?bool = null,
         /// Preserve an acquired/requested controller lease across transport
         /// replacement; a replacement attach may need to evict the stale fd.
         force_control: bool = false,
@@ -504,6 +511,7 @@ pub const Terminal = struct {
         origin_id: []u8,
         pending_rename: ?[]u8,
         read_only: bool,
+        view_only: bool,
         control: bool,
         upgrade: bool = false,
         conn: ?mux_client.Conn = null,
@@ -651,8 +659,7 @@ pub const Terminal = struct {
         host: ?[]const u8,
         port_range: []const u8,
         tor_socks_endpoint: []const u8,
-        read_only: bool,
-        want_control: bool,
+        lease: mux_client.Lease,
     ) !*Terminal {
         const envelope = mux_snapshot.peelEnvelope(snap_payload) catch return error.BadSnapshot;
         const self = try allocator.create(Terminal);
@@ -695,8 +702,9 @@ pub const Terminal = struct {
             .host = host_owned,
             .port_range = port_range_owned,
             .tor_socks_endpoint = tor_socks_endpoint_owned,
-            .read_only = read_only,
-            .force_control = want_control,
+            .read_only = lease == .read_only,
+            .view_only = lease == .read_only,
+            .force_control = lease == .control,
             .event_seq = envelope.seq,
             .predictor = predict_mod.Predictor.init(allocator),
             .is_app = envelope.app,
@@ -1006,7 +1014,7 @@ pub const Terminal = struct {
         if (remote.conn.transport != .ssh) return;
         if (!remote.control_known) return;
         const host = remote.host orelse return;
-        if (mux_client.RemoteSpec.parse(host).mode != .auto) return;
+        if (!mux_client.udpUpgradeEligible(host)) return;
         remote.bumpGeneration();
         const job = self.makeReconnectJob(true) orelse return;
         remote.upgrade_job_active = true;
@@ -1072,6 +1080,7 @@ pub const Terminal = struct {
             .origin_id = origin_id,
             .pending_rename = pending_rename,
             .read_only = remote.read_only,
+            .view_only = remote.view_only,
             .control = self.has_control or remote.force_control,
             .upgrade = upgrade,
         };
@@ -1088,10 +1097,10 @@ pub const Terminal = struct {
         var conn_owned = true;
         defer if (conn_owned) conn.deinit();
         const attach_control = job.control and !job.upgrade;
-        const snapshot = reconnectAttach(&conn, job.session, job.origin_id, job.read_only, attach_control) catch |err| blk: {
+        const snapshot = reconnectAttach(&conn, job, job.session, attach_control) catch |err| blk: {
             if (err == error.DaemonError and std.mem.eql(u8, conn.lastErr(), "no such session")) {
                 if (job.pending_rename) |name| {
-                    const renamed = reconnectAttach(&conn, name, job.origin_id, job.read_only, attach_control) catch |rename_err| {
+                    const renamed = reconnectAttach(&conn, job, name, attach_control) catch |rename_err| {
                         if (rename_err == error.DaemonError and std.mem.eql(u8, conn.lastErr(), "no such session"))
                             job.session_missing = true;
                         if (rename_err == error.DaemonError and std.mem.eql(u8, conn.lastErr(), "session origin identity changed"))
@@ -1122,12 +1131,13 @@ pub const Terminal = struct {
         });
     }
 
-    fn reconnectAttach(conn: *mux_client.Conn, session: []const u8, origin_id: []const u8, read_only: bool, control: bool) !mux_client.Conn.OwnedFrame {
-        if (!@import("mux/daemon.zig").validSessionOriginId(origin_id)) return error.MissingOriginId;
+    fn reconnectAttach(conn: *mux_client.Conn, job: *const ReconnectJob, session: []const u8, control: bool) !mux_client.Conn.OwnedFrame {
+        if (!@import("mux/daemon.zig").validSessionOriginId(job.origin_id)) return error.MissingOriginId;
         try conn.sendAttach(session, .{
-            .origin_id = origin_id,
+            .origin_id = job.origin_id,
             .kind = "gui",
-            .read_only = read_only,
+            .read_only = job.read_only,
+            .view_only = job.view_only,
             .control = control,
             .panel_rpc = conn.panel_rpc,
         });
@@ -2497,6 +2507,7 @@ pub const Terminal = struct {
             read_only: bool = false,
             controller_label: []const u8 = "",
             viewers: u32 = 0,
+            view_only: ?bool = null,
         };
         const parsed = std.json.parseFromSlice(Msg, self.allocator, payload, .{
             .ignore_unknown_fields = true,
@@ -2504,7 +2515,12 @@ pub const Terminal = struct {
         }) catch return;
         defer parsed.deinit();
         const was = self.has_control;
+        var watch_changed = false;
         if (self.remote) |remote| {
+            const was_watching = remote.view_only;
+            remote.view_only = nextViewOnly(remote.view_only, parsed.value.read_only, parsed.value.view_only);
+            remote.view_only_echo = parsed.value.view_only;
+            watch_changed = was_watching != remote.view_only;
             remote.read_only = parsed.value.read_only;
             remote.force_control = parsed.value.controller;
             remote.control_known = true;
@@ -2524,7 +2540,7 @@ pub const Terminal = struct {
         // The titlebar lease chip reads has_control/holder/viewers, so
         // any roster movement must reach the on_peers sink, not just
         // lease flips.
-        if (was != self.has_control or holder_changed or viewers_changed) {
+        if (was != self.has_control or holder_changed or viewers_changed or watch_changed) {
             if (self.on_peers) |f| f(self.user_ctx);
         }
         if (was == self.has_control) return;
@@ -2568,6 +2584,31 @@ pub const Terminal = struct {
         remote.conn.sendFrame(.play_control, payload) catch {
             self.transportLost("play control write failed");
         };
+    }
+
+    /// Whether this pane is a watcher: it sends no input and no resize.
+    pub fn isViewOnly(self: *const Terminal) bool {
+        const r = self.remote orelse return false;
+        return r.view_only;
+    }
+
+    /// Whether the session's daemon process itself drops this watcher's
+    /// input and resize, as opposed to only this GUI withholding them.
+    pub fn viewOnlyEnforced(self: *const Terminal) bool {
+        const r = self.remote orelse return false;
+        if (r.view_only_echo) |echo| return echo;
+        // Before the first control_state the welcome is all we know; after
+        // it, a missing echo is an old daemon or adopted worker.
+        return !r.control_known and r.conn.caps.view_only;
+    }
+
+    /// Watch state after a control_state frame. `echo` is the daemon's own
+    /// `view_only` (authoritative); without it (an old daemon) a watcher
+    /// stays one until the daemon reports it no longer read-only, which
+    /// only an acquire/takeover does.
+    fn nextViewOnly(current: bool, read_only: bool, echo: ?bool) bool {
+        if (echo) |e| return e;
+        return current and read_only;
     }
 
     /// Ask the daemon for the session's controller lease. `force` evicts
@@ -2910,6 +2951,9 @@ pub const Terminal = struct {
     /// Route parser replies, input and focus reports to the mux daemon.
     pub fn writeRaw(self: *Terminal, bytes: []const u8) void {
         const r = self.remote orelse return;
+        // Keys, pastes, mouse reports and replies alike: a watcher sends
+        // nothing, so an old daemon that would accept it never sees it.
+        if (r.view_only) return;
         if (!r.sendInput(bytes) and r.canSend())
             self.transportLost("input write failed");
     }
@@ -2927,6 +2971,7 @@ pub const Terminal = struct {
 
     fn sendPendingResize(self: *Terminal) void {
         const r = self.remote orelse return;
+        if (r.view_only) return;
         if (!r.canSend() or r.pending_rows == 0 or r.pending_cols == 0) return;
         var payload: [4]u8 = undefined;
         std.mem.writeInt(u16, payload[0..2], r.pending_rows, .little);
@@ -3208,6 +3253,8 @@ pub const Terminal = struct {
     /// this — those bytes are responses TO this PTY (DA, DSR, OSC 52,
     /// kitty kbd reports) and must not be broadcast.
     pub fn writeUserInput(self: *Terminal, bytes: []const u8) void {
+        // A watcher's keystrokes must not even show as predicted echo.
+        if (self.isViewOnly()) return;
         // Predictive echo speculates on keystrokes only — parser
         // replies and mouse reports go through writeRaw directly and
         // must not disturb the prediction state.
@@ -3745,6 +3792,64 @@ test "panel request dispatch returns a correlated reply on the same connection" 
     const envelope = try mux_wire.decodePanelEnvelope(frame.payload);
     try std.testing.expectEqual(@as(u64, 0x1234), envelope.id);
     try std.testing.expectEqualStrings("{\"ok\":true,\"panels\":[]}", envelope.json);
+}
+
+test "a watcher withholds input and resize itself when the daemon does not enforce it" {
+    const a = std.testing.allocator;
+    var pair: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), platform.socketpairCloexec(&pair));
+    var session = [_]u8{ 'a', 'g', 'e', 'n', 't' };
+    // An old daemon: its welcome had no `view_only`, nor will its echoes.
+    var remote = Terminal.Remote{
+        .conn = .{ .allocator = a, .fd = pair[0], .proto = mux_wire.PROTO_VERSION },
+        .session = &session,
+        .origin_name = &session,
+        .predictor = undefined,
+        .read_only = true,
+        .view_only = true,
+    };
+    defer remote.conn.deinit();
+    remote.conn.setNonBlocking();
+    var peer = mux_client.Conn{ .allocator = a, .fd = pair[1], .proto = mux_wire.PROTO_VERSION };
+    defer peer.deinit();
+
+    var term: Terminal = undefined;
+    term.allocator = a;
+    term.remote = &remote;
+    term.has_control = false;
+    term.control_holder_len = 0;
+    term.peer_viewers = 0;
+    term.on_peers = null;
+    term.user_ctx = null;
+    try std.testing.expect(term.isViewOnly());
+    try std.testing.expect(!term.viewOnlyEnforced());
+
+    // The old daemon's lease frame for a read-only viewer: still a watcher.
+    term.handleRemoteFrame(.{ .ftype = .control_state, .payload = "{\"controller\":false,\"read_only\":true,\"viewers\":2}" });
+    try std.testing.expect(term.isViewOnly());
+    try std.testing.expect(!term.viewOnlyEnforced());
+    term.writeUserInput("typed\n");
+    term.writeRaw("\x1b[<0;5;5M");
+    term.requestResize(40, 120);
+    try std.testing.expectError(error.Timeout, peer.recvExpectFor(&.{ .input, .resize }, 200));
+
+    // Take control on an old daemon: read_only clears, input flows again.
+    term.handleRemoteFrame(.{ .ftype = .control_state, .payload = "{\"controller\":true,\"read_only\":false,\"viewers\":2}" });
+    try std.testing.expect(!term.isViewOnly());
+    term.writeRaw("controlled");
+    const frame = try peer.recvExpectFor(&.{.input}, 1_000);
+    defer frame.deinit(a);
+    try std.testing.expectEqualStrings("controlled", frame.payload);
+}
+
+test "the daemon's view_only echo is authoritative over the read_only fallback" {
+    try std.testing.expect(Terminal.nextViewOnly(false, true, true));
+    try std.testing.expect(!Terminal.nextViewOnly(true, true, false));
+    // No echo (old daemon): only a watcher that is still read-only stays one.
+    try std.testing.expect(Terminal.nextViewOnly(true, true, null));
+    try std.testing.expect(!Terminal.nextViewOnly(true, false, null));
+    // A `mux send`-style read_only viewer is never turned into a watcher.
+    try std.testing.expect(!Terminal.nextViewOnly(false, true, null));
 }
 
 test "session metadata separates immutable origin from mutable display rename" {

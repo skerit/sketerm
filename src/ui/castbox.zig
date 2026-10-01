@@ -132,8 +132,7 @@ pub const CastPlayerBox = struct {
             loc.host,
             "",
             route_cfg.mux_tor_socks_endpoint,
-            false,
-            false,
+            .default,
         );
         conn_owned = false; // moved into the Terminal
         errdefer terminal.deinit();

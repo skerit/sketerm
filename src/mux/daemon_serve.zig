@@ -336,7 +336,8 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
         },
         .control_req => self.handleControlReq(cl, frame.payload),
         .input => {
-            if (cl.panel_only) return;
+            // A watcher's keys, pastes and mouse reports all arrive here.
+            if (!cl.drivesTerminal()) return;
             const s = cl.attached orelse {
                 cl.queueErr("not attached");
                 return;
@@ -345,7 +346,9 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
             s.writeToChild(frame.payload);
         },
         .resize => {
-            if (cl.panel_only) return;
+            // Last resize wins among the clients that drive the session;
+            // a watcher's window never decides the agent's terminal size.
+            if (!cl.drivesTerminal()) return;
             const s = cl.attached orelse return;
             // Client geometry must never overwrite a cast's recorded
             // dimensions — only cast resize events change the grid.
@@ -608,6 +611,88 @@ test "quit_idle retires an idle daemon in one step and refuses a busy one" {
     try t.expect(d.running);
     reply = (try wire.peelFrame(requester.wbuf.items)) orelse return error.TestUnexpectedResult;
     try t.expect(std.mem.indexOf(u8, reply.frame.payload, "\"ok\":false") != null);
+}
+
+/// Bytes the session's child echoed within `ms` (empty = it got nothing).
+fn testDrainChild(s: *Session, buf: []u8, ms: c_int) []const u8 {
+    const fd = s.ptyPtr().?.master_fd;
+    var got: usize = 0;
+    var pfd = c.struct_pollfd{ .fd = fd, .events = c.POLLIN, .revents = 0 };
+    while (got < buf.len and c.poll(&pfd, 1, if (got == 0) ms else 100) > 0) {
+        const n = c.read(fd, buf[got..].ptr, buf.len - got);
+        if (n <= 0) break;
+        got += @intCast(n);
+    }
+    return buf[0..got];
+}
+
+/// The `view_only` field of the newest `control_state` queued for `cl`.
+fn testViewOnlyEcho(cl: *Client) !?bool {
+    var pos: usize = 0;
+    var echo: ?bool = null;
+    while (try wire.peelFrame(cl.wbuf.items[pos..])) |p| {
+        pos += p.consumed;
+        if (p.frame.ftype != .control_state) continue;
+        const parsed = try std.json.parseFromSlice(struct { view_only: ?bool = null }, std.testing.allocator, p.frame.payload, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        echo = parsed.value.view_only;
+    }
+    cl.wbuf.clearRetainingCapacity();
+    return echo;
+}
+
+fn testClient(d: *Daemon, id: u32) !*Client {
+    const cl = try d.allocator.create(Client);
+    cl.* = .{ .allocator = d.allocator, .fd = -1, .id = id, .proto = wire.PROTO_VERSION, .snapshot_version = snapshot.SNAPSHOT_VERSION };
+    try d.clients.append(d.allocator, cl);
+    return cl;
+}
+
+test "a view-only client cannot type into, paste into or resize a terminal session" {
+    const t = std.testing;
+    const a = t.allocator;
+    const d = try a.create(Daemon);
+    d.* = .{ .allocator = a, .listen_fd = -1, .sock_path = try a.dupe(u8, ""), .role = .worker };
+    defer d.deinit();
+    // `cat` with echo on: anything that reaches the child comes back.
+    const s = try d.spawnSession(.{ .name = "agent", .argv = &.{"/bin/cat"}, .local = true, .rows = 24, .cols = 80 });
+    try d.sessions.append(a, s);
+    var buf: [256]u8 = undefined;
+
+    const watcher = try testClient(d, 1);
+    d.attachClientToSession(watcher, s, .{ .kind = .gui, .read_only = true, .want_control = false, .view_only = true, .panel_only = false, .panel_rpc = 0, .identity_first = false }, "test");
+    try t.expect(watcher.view_only and watcher.read_only);
+    try t.expectEqual(@as(?bool, true), try testViewOnlyEcho(watcher));
+
+    // Keys, a bracketed paste and an SGR mouse report: all `.input`.
+    handleFrame(d, watcher, .{ .ftype = .input, .payload = "typed\n" });
+    handleFrame(d, watcher, .{ .ftype = .input, .payload = "\x1b[200~pasted\x1b[201~" });
+    handleFrame(d, watcher, .{ .ftype = .input, .payload = "\x1b[<0;5;5M" });
+    try t.expectEqual(@as(usize, 0), testDrainChild(s, &buf, 300).len);
+    var rz: [4]u8 = undefined;
+    std.mem.writeInt(u16, rz[0..2], 40, .little);
+    std.mem.writeInt(u16, rz[2..4], 120, .little);
+    handleFrame(d, watcher, .{ .ftype = .resize, .payload = &rz });
+    try t.expectEqual(@as(u16, 80), s.screen.cols);
+    try t.expectEqual(@as(u16, 24), s.screen.rows);
+
+    // A one-shot `mux send` attach is read_only but NOT a watcher: it types.
+    const sender = try testClient(d, 2);
+    d.attachClientToSession(sender, s, .{ .kind = .cli, .read_only = true, .want_control = false, .panel_only = false, .panel_rpc = 0, .identity_first = false }, "test");
+    try t.expectEqual(@as(?bool, false), try testViewOnlyEcho(sender));
+    handleFrame(d, sender, .{ .ftype = .input, .payload = "sent\n" });
+    try t.expect(std.mem.indexOf(u8, testDrainChild(s, &buf, 2000), "sent") != null);
+
+    // Take control ends the watch: input and resize reach the session.
+    watcher.wbuf.clearRetainingCapacity();
+    handleFrame(d, watcher, .{ .ftype = .control_req, .payload = "{\"op\":\"takeover\"}" });
+    try t.expect(!watcher.view_only);
+    try t.expectEqual(@as(?bool, false), try testViewOnlyEcho(watcher));
+    handleFrame(d, watcher, .{ .ftype = .input, .payload = "controlled\n" });
+    try t.expect(std.mem.indexOf(u8, testDrainChild(s, &buf, 2000), "controlled") != null);
+    handleFrame(d, watcher, .{ .ftype = .resize, .payload = &rz });
+    try t.expectEqual(@as(u16, 120), s.screen.cols);
+    try t.expectEqual(@as(u16, 40), s.screen.rows);
 }
 
 pub fn findChannel(self: *Daemon, id: u32) ?*Channel {

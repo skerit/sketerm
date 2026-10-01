@@ -2542,8 +2542,7 @@ fn panelTabDone(user: ?*anyopaque) callconv(.c) c.gboolean {
         job.snapshot.?,
         job.identity,
         job.pane_id,
-        false,
-        false,
+        .default,
         true,
     ) catch |err| {
         var msg_buf: [160]u8 = undefined;
