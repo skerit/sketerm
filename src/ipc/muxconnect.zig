@@ -7,11 +7,11 @@ const muxclient = @import("../mux/client.zig");
 pub fn connectSsh(allocator: std.mem.Allocator, host: []const u8) !muxclient.Conn {
     var cfg = Config.load(allocator);
     defer cfg.deinit();
-    return muxclient.Conn.connectSshWithEndpoint(allocator, host, cfg.mux_tor_socks_endpoint);
+    return muxclient.Conn.connectSshWith(allocator, host, cfg.muxConnectOptions());
 }
 
 pub fn connectSshOnce(allocator: std.mem.Allocator, host: []const u8) !muxclient.Conn {
     var cfg = Config.load(allocator);
     defer cfg.deinit();
-    return muxclient.Conn.connectSshOnceWithEndpoint(allocator, host, cfg.mux_tor_socks_endpoint);
+    return muxclient.Conn.connectSshOnceWith(allocator, host, cfg.muxConnectOptions());
 }

@@ -48,18 +48,26 @@ pub const MAX_EXEC_STRING = 128 * 1024;
 pub const EnvVar = struct { name: []const u8, value: []const u8 };
 
 /// A caller's additions to every launch of the agent's binary: `args`
-/// right after the binary, `env` exempt from `unset_env`.
+/// right after the binary, `env` exempt from `unset_env`, `path_prepend`
+/// in front of the PATH the binary is looked up in and runs with.
 pub const Extra = struct {
     args: []const []const u8 = &.{},
     env: []const EnvVar = &.{},
+    path_prepend: []const []const u8 = &.{},
+    /// Remote probes and starts run in the user's login shell environment.
+    login_shell: bool = true,
 
     pub fn clone(self: Extra, a: std.mem.Allocator) !Extra {
-        var out: Extra = .{};
+        var out: Extra = .{ .login_shell = self.login_shell };
         errdefer out.free(a);
         const args = try a.alloc([]const u8, self.args.len);
         @memset(args, "");
         out.args = args;
         for (self.args, args) |s, *d| d.* = try a.dupe(u8, s);
+        const dirs = try a.alloc([]const u8, self.path_prepend.len);
+        @memset(dirs, "");
+        out.path_prepend = dirs;
+        for (self.path_prepend, dirs) |s, *d| d.* = try a.dupe(u8, s);
         const env = try a.alloc(EnvVar, self.env.len);
         @memset(env, .{ .name = "", .value = "" });
         out.env = env;
@@ -74,6 +82,8 @@ pub const Extra = struct {
     pub fn free(self: Extra, a: std.mem.Allocator) void {
         for (self.args) |s| a.free(s);
         a.free(self.args);
+        for (self.path_prepend) |s| a.free(s);
+        a.free(self.path_prepend);
         for (self.env) |v| {
             a.free(v.name);
             a.free(v.value);
@@ -112,7 +122,72 @@ pub fn checkExtra(arena: std.mem.Allocator, launch: adapter.Launch, x: Extra) !?
         if (v.value.len > MAX_EXTRA_BYTES) return try std.fmt.allocPrint(arena, "env {s}: the value must be at most {d} bytes (got {d})", .{ v.name, MAX_EXTRA_BYTES, v.value.len });
         if (try textProblem(arena, v.value)) |p| return try std.fmt.allocPrint(arena, "env {s}: the value {s}", .{ v.name, p });
     }
+    if (x.path_prepend.len > MAX_EXTRA) return try std.fmt.allocPrint(arena, "path_prepend: at most {d} entries (got {d})", .{ MAX_EXTRA, x.path_prepend.len });
+    for (x.path_prepend, 0..) |d, i| {
+        if (d.len == 0 or d.len > MAX_EXTRA_BYTES) return try std.fmt.allocPrint(arena, "path_prepend[{d}] must be 1-{d} bytes (got {d})", .{ i, MAX_EXTRA_BYTES, d.len });
+        if (try textProblem(arena, d)) |p| return try std.fmt.allocPrint(arena, "path_prepend[{d}] {s}", .{ i, p });
+        if (d[0] != '/') return try std.fmt.allocPrint(arena, "path_prepend[{d}] must be an absolute directory", .{i});
+        if (std.mem.indexOfScalar(u8, d, ':') != null) return try std.fmt.allocPrint(arena, "path_prepend[{d}] contains ':', the PATH separator", .{i});
+    }
     return null;
+}
+
+/// Carries a script past the login shell's profile; the script unsets it.
+const LOGIN_SCRIPT_ENV = "SKETERM_LOGIN_SCRIPT";
+/// A remote daemon start carries the caller's `env` values under this
+/// prefix past the login shell, which could otherwise override them.
+pub const ENV_RELAY_PREFIX = "SKETERM_AGENT_ENV_";
+/// How long a probe waits for the login shell before it falls back to the
+/// plain environment (a profile that execs another shell never returns).
+pub const LOGIN_PROBE_SECS = 10;
+
+/// POSIX sh that picks the user's login shell: `$SHELL` (sshd sets it from
+/// the passwd entry), except csh/tcsh, which refuse `-l` beside `-c` and
+/// get `/bin/sh -l` (its `~/.profile`) instead.
+const PICK_LOGIN_SHELL =
+    "sk_ls=${SHELL:-/bin/sh}\n" ++
+    "case \"${sk_ls##*/}\" in csh|tcsh) sk_ls=/bin/sh;; esac\n" ++
+    "[ -x \"$sk_ls\" ] || sk_ls=/bin/sh\n";
+
+/// The `-c` command handed to the login shell: the same text in sh, dash,
+/// bash, zsh, ksh and fish, and it only re-enters POSIX sh.
+const LOGIN_REENTRY = "'exec /bin/sh -c \"$" ++ LOGIN_SCRIPT_ENV ++ "\"'";
+
+/// Export `inner` for the login shell to run (the inner script starts by
+/// unsetting it, see `innerPrelude`).
+fn exportLoginScript(arena: std.mem.Allocator, s: *std.ArrayList(u8), inner: []const u8) !void {
+    try s.appendSlice(arena, LOGIN_SCRIPT_ENV ++ "=");
+    try shellquote.appendQuoted(s, arena, inner);
+    try s.appendSlice(arena, "; export " ++ LOGIN_SCRIPT_ENV ++ "\n");
+}
+
+/// POSIX sh that runs the POSIX sh `inner` in the environment of the
+/// user's login shell (whatever it is), replacing this shell.
+pub fn loginExec(arena: std.mem.Allocator, inner: []const u8) ![]const u8 {
+    var s: std.ArrayList(u8) = .empty;
+    try s.appendSlice(arena, PICK_LOGIN_SHELL);
+    try exportLoginScript(arena, &s, inner);
+    try s.appendSlice(arena, "exec \"$sk_ls\" -l -c " ++ LOGIN_REENTRY ++ "\n");
+    return s.items;
+}
+
+/// `dirs` in front of `path`, the local twin of the scripts' PATH prepend.
+pub fn prependPath(arena: std.mem.Allocator, dirs: []const []const u8, path: []const u8) ![]const u8 {
+    if (dirs.len == 0) return path;
+    const head = try std.mem.join(arena, ":", dirs);
+    return if (path.len == 0) head else std.fmt.allocPrint(arena, "{s}:{s}", .{ head, path });
+}
+
+/// What an inner script does first: drop the login carrier, prepend PATH.
+fn innerPrelude(arena: std.mem.Allocator, s: *std.ArrayList(u8), login: bool, path_prepend: []const []const u8) !void {
+    if (login) try s.appendSlice(arena, "unset " ++ LOGIN_SCRIPT_ENV ++ "\n");
+    if (path_prepend.len == 0) return;
+    try s.appendSlice(arena, "PATH=");
+    for (path_prepend) |d| {
+        try shellquote.appendQuoted(s, arena, d);
+        try s.append(arena, ':');
+    }
+    try s.appendSlice(arena, "\"$PATH\"; export PATH\n");
 }
 
 fn validEnvName(s: []const u8) bool {
@@ -216,20 +291,62 @@ pub fn resolve(arena: std.mem.Allocator, launch: adapter.Launch, override: ?[]co
     return null;
 }
 
-/// One lookup of a remote probe: an adapter's launch and its override.
-pub const Lookup = struct { launch: adapter.Launch, override: ?[]const u8 = null };
+/// One lookup of a remote probe: an adapter's launch and its override;
+/// `version` also asks the found binary for its `version_args` line.
+pub const Lookup = struct { launch: adapter.Launch, override: ?[]const u8 = null, version: bool = false };
 
 /// Marker lines of a probe's output.
 const PROBE_BIN = "SK_BIN ";
 const PROBE_NONE = "SK_NONE ";
 const PROBE_DIR = "SK_DIR ";
+const PROBE_VER = "SK_VER ";
+const PROBE_ENV = "SK_ENV ";
+const PROBE_SHELL = "SK_SHELL ";
+const PROBE_END = "SK_END";
+
+pub const ProbeOpts = struct {
+    /// A remote working dir to check.
+    dir: ?[]const u8 = null,
+    /// Resolve in the login shell's environment (falls back to the plain one).
+    login: bool = true,
+    path_prepend: []const []const u8 = &.{},
+    login_secs: u32 = LOGIN_PROBE_SECS,
+};
 
 /// A POSIX sh script that does `resolve` ON THE HOST IT RUNS ON, for every
 /// lookup at once (one ssh round trip): `command -v` for `$PATH`, `$HOME`
-/// for `~/`. It prints `SK_BIN <i> <path>` or `SK_NONE <i>` per lookup,
-/// and `SK_DIR ok|missing` when `dir` is given (a remote working dir).
-pub fn probeScript(arena: std.mem.Allocator, lookups: []const Lookup, dir: ?[]const u8) ![]const u8 {
+/// for `~/`. It prints `SK_BIN <i> <path>` (plus `SK_VER <i> <line>` for a
+/// `version` lookup) or `SK_NONE <i>` per lookup, `SK_DIR ok|missing` when
+/// `dir` is given, and `SK_ENV login|plain` for the environment it used.
+/// With `login`, the lookups run under the login shell, bounded by
+/// `LOGIN_PROBE_SECS`; output a profile prints around them is ignored
+/// (markers only), and a login run that never reaches `SK_END` is replaced
+/// by a plain one.
+pub fn probeScript(arena: std.mem.Allocator, lookups: []const Lookup, opts: ProbeOpts) ![]const u8 {
+    const inner = try innerProbe(arena, lookups, opts);
     var s: std.ArrayList(u8) = .empty;
+    if (!opts.login) {
+        try s.appendSlice(arena, "echo '" ++ PROBE_ENV ++ "plain'\n");
+        try s.appendSlice(arena, inner);
+        return s.items;
+    }
+    try s.appendSlice(arena, PICK_LOGIN_SHELL);
+    try s.appendSlice(arena, "printf '" ++ PROBE_SHELL ++ "%s\\n' \"$sk_ls\"\n");
+    try exportLoginScript(arena, &s, inner);
+    try s.appendSlice(arena, "umask 077; sk_t=/tmp/.sk_probe_$$\n");
+    try s.appendSlice(arena, "\"$sk_ls\" -l -c " ++ LOGIN_REENTRY ++ " </dev/null >\"$sk_t\" 2>&1 &\nsk_p=$!\n");
+    try s.print(arena, "( sleep {d}; kill \"$sk_p\" ) </dev/null >/dev/null 2>&1 &\nsk_w=$!\n", .{opts.login_secs});
+    try s.appendSlice(arena, "wait \"$sk_p\" 2>/dev/null; kill \"$sk_w\" 2>/dev/null\n");
+    // The end marker must be a whole line: a profile's noise may contain it.
+    try s.appendSlice(arena, "if grep -qx '" ++ PROBE_END ++ "' \"$sk_t\" 2>/dev/null; then echo '" ++ PROBE_ENV ++ "login'; cat \"$sk_t\";\n" ++
+        "else echo '" ++ PROBE_ENV ++ "plain'; /bin/sh -c \"$" ++ LOGIN_SCRIPT_ENV ++ "\" </dev/null; fi\n");
+    try s.appendSlice(arena, "rm -f \"$sk_t\"\n");
+    return s.items;
+}
+
+fn innerProbe(arena: std.mem.Allocator, lookups: []const Lookup, opts: ProbeOpts) ![]const u8 {
+    var s: std.ArrayList(u8) = .empty;
+    try innerPrelude(arena, &s, opts.login, opts.path_prepend);
     try s.appendSlice(arena, "sk_x() { case \"$1\" in /*) [ -f \"$1\" ] && [ -x \"$1\" ];; *) false;; esac; }\n");
     for (lookups, 0..) |l, i| {
         try s.appendSlice(arena, "p=''\n");
@@ -258,14 +375,24 @@ pub fn probeScript(arena: std.mem.Allocator, lookups: []const Lookup, dir: ?[]co
             }
             try s.appendSlice(arena, "; sk_x \"$c\" && p=\"$c\"; }\n");
         };
-        try s.print(arena, "if [ -n \"$p\" ]; then printf '" ++ PROBE_BIN ++ "{d} %s\\n' \"$p\"; else echo '" ++ PROBE_NONE ++ "{d}'; fi\n", .{ i, i });
+        try s.print(arena, "if [ -n \"$p\" ]; then printf '" ++ PROBE_BIN ++ "{d} %s\\n' \"$p\"", .{i});
+        if (l.version and l.launch.version_args.len > 0) {
+            try s.appendSlice(arena, "; v=$(\"$p\"");
+            for (l.launch.version_args) |a| {
+                try s.append(arena, ' ');
+                try shellquote.appendQuoted(&s, arena, a);
+            }
+            try s.print(arena, " </dev/null 2>&1 | sed -n '/[^[:space:]]/{{p;q;}}'); printf '" ++ PROBE_VER ++ "{d} %s\\n' \"$v\"", .{i});
+        }
+        try s.print(arena, "; else echo '" ++ PROBE_NONE ++ "{d}'; fi\n", .{i});
     }
-    if (dir) |d| {
+    if (opts.dir) |d| {
         try s.appendSlice(arena, "if [ -d ");
         try shellquote.appendQuoted(&s, arena, d);
         try s.appendSlice(arena, " ]; then echo '" ++ PROBE_DIR ++ "ok'; else echo '" ++ PROBE_DIR ++ "missing'; fi\n");
     }
     try s.appendSlice(arena, "printf '" ++ PROBE_HOME ++ "%s\\n' \"$HOME\"\n");
+    try s.appendSlice(arena, "echo '" ++ PROBE_END ++ "'\n");
     return s.items;
 }
 
@@ -274,6 +401,12 @@ const PROBE_HOME = "SK_HOME ";
 pub const ProbeResult = struct {
     /// Per lookup: the executable found, or null.
     binaries: []?[]const u8,
+    /// Per lookup: the first line its `version_args` printed, or null.
+    versions: []?[]const u8,
+    /// Whether the lookups ran in the login shell's environment (null: not said).
+    login: ?bool = null,
+    /// The login shell the probe picked.
+    shell: ?[]const u8 = null,
     /// Null when no dir was probed.
     dir_ok: ?bool = null,
     /// The host's `$HOME` (the default working directory there).
@@ -286,13 +419,33 @@ pub const ProbeResult = struct {
 pub fn parseProbe(arena: std.mem.Allocator, output: []const u8, n: usize) !ProbeResult {
     const bins = try arena.alloc(?[]const u8, n);
     @memset(bins, null);
+    const vers = try arena.alloc(?[]const u8, n);
+    @memset(vers, null);
     const seen = try arena.alloc(bool, n);
     @memset(seen, false);
-    var r = ProbeResult{ .binaries = bins, .complete = false };
+    var r = ProbeResult{ .binaries = bins, .versions = vers, .complete = false };
     var lines = std.mem.splitScalar(u8, output, '\n');
     while (lines.next()) |raw| {
         // A terminal transcript: CR line ends, and the marker may follow noise.
         const line = std.mem.trim(u8, raw, " \r\t");
+        if (std.mem.indexOf(u8, line, PROBE_ENV)) |at| {
+            const v = line[at + PROBE_ENV.len ..];
+            if (std.mem.eql(u8, v, "login")) r.login = true else if (std.mem.eql(u8, v, "plain")) r.login = false;
+            continue;
+        }
+        if (std.mem.indexOf(u8, line, PROBE_SHELL)) |at| {
+            const v = line[at + PROBE_SHELL.len ..];
+            if (v.len > 0 and v[0] == '/') r.shell = v;
+            continue;
+        }
+        if (std.mem.indexOf(u8, line, PROBE_VER)) |at| {
+            const rest = line[at + PROBE_VER.len ..];
+            const sp = std.mem.indexOfScalar(u8, rest, ' ') orelse continue;
+            const i = std.fmt.parseInt(usize, rest[0..sp], 10) catch continue;
+            const v = std.mem.trim(u8, rest[sp + 1 ..], " \t");
+            if (i < n and v.len > 0) vers[i] = v;
+            continue;
+        }
         if (std.mem.indexOf(u8, line, PROBE_HOME)) |at| {
             const v = line[at + PROBE_HOME.len ..];
             if (v.len > 0 and v[0] == '/') r.home = v;
@@ -357,17 +510,23 @@ pub fn validEffort(launch: adapter.Launch, level: []const u8) bool {
 pub const SECRET_PROMPT = "[sketerm] agent secret: ";
 
 /// A POSIX sh script that starts `argv` on a remote host: it removes
-/// `cleanup` (the ssh transport's script file), changes to `cwd`, and with
-/// `secret_env` reads that variable's value from the terminal with echo
-/// off (after printing `SECRET_PROMPT`) and exports it, so the secret
-/// rides neither an argv nor the spawn request. It exports `env` (values
-/// in the script, so never a secret), then execs `argv`.
+/// `cleanup` (the ssh transport's script file); with `login` it goes on in
+/// the user's login shell environment (`loginExec`); then it prepends
+/// `path_prepend` to PATH, changes to `cwd`, and with `secret_env` reads
+/// that variable's value from the terminal with echo off (after printing
+/// `SECRET_PROMPT`) and exports it, so the secret rides neither an argv nor
+/// the spawn request. It exports `env` (values in the script, so never a
+/// secret) and the `env_relay` names from their `ENV_RELAY_PREFIX` copies
+/// (values in the spawn environment), then execs `argv`.
 pub fn remoteScript(arena: std.mem.Allocator, argv: []const []const u8, opts: struct {
     cleanup: ?[]const u8 = null,
     cwd: ?[]const u8 = null,
     secret_env: ?[]const u8 = null,
     /// Names `checkExtra` validated.
     env: []const EnvVar = &.{},
+    env_relay: []const []const u8 = &.{},
+    login: bool = false,
+    path_prepend: []const []const u8 = &.{},
 }) ![]const u8 {
     var s: std.ArrayList(u8) = .empty;
     if (opts.cleanup) |f| {
@@ -375,6 +534,17 @@ pub fn remoteScript(arena: std.mem.Allocator, argv: []const []const u8, opts: st
         try shellquote.appendQuoted(&s, arena, f);
         try s.append(arena, '\n');
     }
+    if (opts.login) {
+        var inner_opts = opts;
+        inner_opts.cleanup = null;
+        inner_opts.login = false;
+        var inner: std.ArrayList(u8) = .empty;
+        try innerPrelude(arena, &inner, true, &.{});
+        try inner.appendSlice(arena, try remoteScript(arena, argv, inner_opts));
+        try s.appendSlice(arena, try loginExec(arena, inner.items));
+        return s.items;
+    }
+    try innerPrelude(arena, &s, false, opts.path_prepend);
     if (opts.cwd) |d| {
         try s.appendSlice(arena, "cd ");
         try shellquote.appendQuoted(&s, arena, d);
@@ -389,6 +559,7 @@ pub fn remoteScript(arena: std.mem.Allocator, argv: []const []const u8, opts: st
         try shellquote.appendQuoted(&s, arena, v.value);
         try s.append(arena, '\n');
     }
+    for (opts.env_relay) |name| try s.print(arena, "{s}=${s}{s}; export {s}; unset {s}{s}\n", .{ name, ENV_RELAY_PREFIX, name, name, ENV_RELAY_PREFIX, name });
     try s.appendSlice(arena, "exec");
     for (argv) |a| {
         try s.append(arena, ' ');
@@ -602,7 +773,7 @@ test "the remote probe resolves candidates on the host it runs on, in one script
         .{ .launch = tool },
         .{ .launch = claude, .override = try std.fmt.allocPrint(a, "{s}/skprobe-a", .{bin}) },
         .{ .launch = claude, .override = "skprobe-missing" },
-    }, "/nonexistent-dir");
+    }, .{ .dir = "/nonexistent-dir", .login = false });
     // The script uses shell builtins only: PATH is just the "remote" one.
     const env = try std.fmt.allocPrint(a, "HOME='{s}/home' PATH='{s}'", .{ root, usr });
     const out = try runSh(a, env, script);
@@ -620,6 +791,159 @@ test "the remote probe resolves candidates on the host it runs on, in one script
     const cut = try parseProbe(a, "noise SK_BIN 0 /x/claude\r\nSK_NONE 1\r\n", 3);
     try t.expect(!cut.complete);
     try t.expectEqualStrings("/x/claude", cut.binaries[0].?);
+}
+
+/// Write `body` to `path` with mode 0755.
+fn writeExec(a: std.mem.Allocator, path: []const u8, body: []const u8) !void {
+    const z = try a.dupeZ(u8, path);
+    const f = c.fopen(z.ptr, "w") orelse return error.SkipZigTest;
+    _ = c.fwrite(body.ptr, 1, body.len, f);
+    _ = c.fclose(f);
+    if (c.chmod(z.ptr, 0o755) != 0) return error.SkipZigTest;
+}
+
+/// A login shell whose profile prepends `dir` to PATH and prints noise
+/// that looks almost like a marker.
+fn fakeLoginShell(a: std.mem.Allocator, root: []const u8, dir: []const u8, hang: bool) ![]const u8 {
+    const path = try std.fmt.allocPrint(a, "{s}/fakeshell{s}", .{ root, if (hang) "-hang" else "" });
+    try writeExec(a, path, try std.fmt.allocPrint(a,
+        \\#!/bin/sh
+        \\[ "$1" = -l ] || exit 99
+        \\echo 'Welcome! SK_BIN is not a marker, SK_ENDING neither'
+        \\{s}
+        \\PATH='{s}':"$PATH"; export PATH; FROM_PROFILE=yes; export FROM_PROFILE
+        \\CLAUDE_KEEP=profile-clobbered; export CLAUDE_KEEP
+        \\exec /bin/sh -c "$3"
+        \\
+    , .{ if (hang) "exec sleep 30" else "", dir }));
+    return path;
+}
+
+test "the probe resolves in the login shell's environment, profile noise and all" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var tmpl = "/tmp/sketerm-login-XXXXXX".*;
+    const root_ptr = c.mkdtemp(&tmpl) orelse return error.SkipZigTest;
+    const root = std.mem.span(@as([*:0]u8, @ptrCast(root_ptr)));
+    defer @import("../util/pathz.zig").removeTree(root);
+    const login_dir = try std.fmt.allocPrint(a, "{s}/login-bin", .{root});
+    const pre_dir = try std.fmt.allocPrint(a, "{s}/pre-bin", .{root});
+    _ = try runSh(a, "", try std.fmt.allocPrint(a, "mkdir -p '{s}' '{s}'", .{ login_dir, pre_dir }));
+    // Only the login PATH has the app; it prints a version after a blank line.
+    try writeExec(a, try std.fmt.allocPrint(a, "{s}/skapp", .{login_dir}), "#!/bin/sh\n[ \"$1\" = --version ] && { echo; echo 'skapp 9.9.9 (login)'; echo second; }\n");
+    const app = adapter.Launch{ .binary = "skapp", .candidates = &.{"$PATH"}, .version_args = &.{"--version"} };
+    const lookups = [_]Lookup{.{ .launch = app, .version = true }};
+
+    const shell = try fakeLoginShell(a, root, login_dir, false);
+    const env = try std.fmt.allocPrint(a, "SHELL='{s}' PATH=/usr/bin:/bin", .{shell});
+    const r = try parseProbe(a, try runSh(a, env, try probeScript(a, &lookups, .{})), 1);
+    try t.expect(r.complete);
+    try t.expectEqual(@as(?bool, true), r.login);
+    try t.expectEqualStrings(shell, r.shell.?);
+    try t.expectEqualStrings(try std.fmt.allocPrint(a, "{s}/skapp", .{login_dir}), r.binaries[0].?);
+    try t.expectEqualStrings("skapp 9.9.9 (login)", r.versions[0].?);
+
+    // path_prepend wins over the login PATH (applied after it).
+    try writeExec(a, try std.fmt.allocPrint(a, "{s}/skapp", .{pre_dir}), "#!/bin/sh\necho 'skapp 1.0 (pre)'\n");
+    const pre = try parseProbe(a, try runSh(a, env, try probeScript(a, &lookups, .{ .path_prepend = &.{pre_dir} })), 1);
+    try t.expectEqualStrings(try std.fmt.allocPrint(a, "{s}/skapp", .{pre_dir}), pre.binaries[0].?);
+    try t.expectEqualStrings("skapp 1.0 (pre)", pre.versions[0].?);
+
+    // Without the login shell the plain PATH has no app: reported as such.
+    const plain = try parseProbe(a, try runSh(a, env, try probeScript(a, &lookups, .{ .login = false })), 1);
+    try t.expect(plain.complete);
+    try t.expectEqual(@as(?bool, false), plain.login);
+    try t.expect(plain.binaries[0] == null);
+
+    // A profile that never returns costs the bound, then the plain run answers.
+    const hang = try fakeLoginShell(a, root, login_dir, true);
+    const started = @import("../util/clock.zig").nowMs();
+    const hung = try parseProbe(a, try runSh(a, try std.fmt.allocPrint(a, "SHELL='{s}' PATH=/usr/bin:/bin", .{hang}), try probeScript(a, &lookups, .{ .login_secs = 1 })), 1);
+    try t.expect(hung.complete);
+    try t.expectEqual(@as(?bool, false), hung.login);
+    try t.expect(@import("../util/clock.zig").nowMs() - started < 8_000);
+}
+
+test "a remote start runs in the login environment, then path_prepend, env and relayed env" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var tmpl = "/tmp/sketerm-login-XXXXXX".*;
+    const root_ptr = c.mkdtemp(&tmpl) orelse return error.SkipZigTest;
+    const root = std.mem.span(@as([*:0]u8, @ptrCast(root_ptr)));
+    defer @import("../util/pathz.zig").removeTree(root);
+    const shell = try fakeLoginShell(a, root, "/login/dir", false);
+    const argv = try weirdArgv(a, root);
+    const probe = [_][]const u8{ "/bin/sh", "-c", "printf 'P=%s F=%s L=%s\\n' \"$PATH\" \"$FROM_PROFILE\" \"${SKETERM_LOGIN_SCRIPT-unset}\"" };
+    const env = try std.fmt.allocPrint(a, "SHELL='{s}' PATH=/usr/bin:/bin", .{shell});
+    // Plain ssh: values in the script.
+    const out = try runSh(a, env, try remoteScript(a, &probe, .{ .login = true, .path_prepend = &.{"/pre dir"} }));
+    try t.expect(std.mem.indexOf(u8, out, "P=/pre dir:/login/dir:/usr/bin:/bin F=yes L=unset") != null);
+    // The caller's env beats the profile's, byte-exact, args too.
+    const run = try remoteScript(a, argv, .{ .cwd = root, .env = &WEIRD_ENV, .login = true });
+    const got = try runSh(a, try std.fmt.allocPrint(a, "{s} CLAUDE_DROP=1 CLAUDE_KEEP=old", .{env}), run);
+    try t.expect(std.mem.endsWith(u8, got, try expectedEcho(a)));
+    // A remote daemon start: values ride the spawn env under the relay prefix.
+    var relay_env: std.ArrayList(u8) = .empty;
+    try relay_env.appendSlice(a, env);
+    try relay_env.appendSlice(a, " CLAUDE_DROP=1");
+    for (WEIRD_ENV) |v| {
+        try relay_env.print(a, " " ++ ENV_RELAY_PREFIX ++ "{s}=", .{v.name});
+        try shellquote.appendQuoted(&relay_env, a, v.value);
+    }
+    const relayed = try runSh(a, relay_env.items, try remoteScript(a, argv, .{ .cwd = root, .env_relay = &.{ "CLAUDE_KEEP", "PLAIN_SET" }, .login = true }));
+    try t.expect(std.mem.endsWith(u8, relayed, try expectedEcho(a)));
+}
+
+test "real login shells on this machine: bash, zsh, dash and fish profiles reach the probe" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var tmpl = "/tmp/sketerm-login-XXXXXX".*;
+    const root_ptr = c.mkdtemp(&tmpl) orelse return error.SkipZigTest;
+    const root = std.mem.span(@as([*:0]u8, @ptrCast(root_ptr)));
+    defer @import("../util/pathz.zig").removeTree(root);
+    const dir = try std.fmt.allocPrint(a, "{s}/profile-bin", .{root});
+    _ = try runSh(a, "", try std.fmt.allocPrint(a, "mkdir -p '{s}' '{s}/.config/fish'", .{ dir, root }));
+    try writeExec(a, try std.fmt.allocPrint(a, "{s}/skreal", .{dir}), "#!/bin/sh\necho skreal 2.0\n");
+    const app = adapter.Launch{ .binary = "skreal", .candidates = &.{"$PATH"}, .version_args = &.{"--version"} };
+    const Case = struct { shell: []const u8, profile: []const u8, line: []const u8 };
+    const cases = [_]Case{
+        .{ .shell = "/usr/bin/bash", .profile = ".bash_profile", .line = "PATH=\"{s}:$PATH\"; export PATH; echo bash-profile-noise\n" },
+        .{ .shell = "/usr/bin/zsh", .profile = ".zprofile", .line = "path=({s} $path); echo zsh-noise\n" },
+        .{ .shell = "/usr/bin/dash", .profile = ".profile", .line = "PATH=\"{s}:$PATH\"; export PATH\n" },
+        .{ .shell = "/usr/bin/fish", .profile = ".config/fish/config.fish", .line = "set -gx PATH {s} $PATH; echo fish-noise\n" },
+    };
+    var ran: usize = 0;
+    inline for (cases) |cs| if (isExecutable(cs.shell)) {
+        try writeExec(a, try std.fmt.allocPrint(a, "{s}/{s}", .{ root, cs.profile }), try std.fmt.allocPrint(a, cs.line, .{dir}));
+        const env = try std.fmt.allocPrint(a, "env -i HOME='{s}' SHELL='{s}' PATH=/usr/bin:/bin", .{ root, cs.shell });
+        const out = try runSh(a, env, try probeScript(a, &.{.{ .launch = app, .version = true }}, .{}));
+        const r = try parseProbe(a, out, 1);
+        if (r.binaries[0] == null or r.login != true) std.debug.print("{s} probe output:\n{s}\n", .{ cs.shell, out });
+        try t.expectEqual(@as(?bool, true), r.login);
+        try t.expectEqualStrings(try std.fmt.allocPrint(a, "{s}/skreal", .{dir}), r.binaries[0].?);
+        try t.expectEqualStrings("skreal 2.0", r.versions[0].?);
+        ran += 1;
+    };
+    if (ran == 0) return error.SkipZigTest;
+}
+
+test "path_prepend is refused, never cleaned: relative, PATH separator, control bytes" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const l = adapter.Launch{ .binary = "x", .candidates = &.{} };
+    try t.expect((try checkExtra(a, l, .{ .path_prepend = &.{ "/opt/my tools/bin", "/a" } })) == null);
+    try t.expect(std.mem.indexOf(u8, (try checkExtra(a, l, .{ .path_prepend = &.{"rel/bin"} })).?, "absolute") != null);
+    try t.expect(std.mem.indexOf(u8, (try checkExtra(a, l, .{ .path_prepend = &.{"/a:/b"} })).?, "PATH separator") != null);
+    try t.expect(std.mem.indexOf(u8, (try checkExtra(a, l, .{ .path_prepend = &.{"/a\nb"} })).?, "control character") != null);
+    try t.expect(std.mem.indexOf(u8, (try checkExtra(a, l, .{ .path_prepend = &.{""} })).?, "1-4096 bytes") != null);
+    const copy = try (Extra{ .path_prepend = &.{"/a"}, .login_shell = false }).clone(t.allocator);
+    defer copy.free(t.allocator);
+    try t.expectEqualStrings("/a", copy.path_prepend[0]);
+    try t.expect(!copy.login_shell);
 }
 
 test "the remote start script reads its secret off the terminal, never from argv" {

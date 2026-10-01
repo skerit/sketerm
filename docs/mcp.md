@@ -913,6 +913,57 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   terminal with echo off after printing `[sketerm] agent secret:` and
   exports it, so it rides neither an argv (local or remote) nor the
   spawn request, and nothing records it.
+- **The login environment (`login_shell`, `path_prepend`,
+  `capabilities.agent_login_shell`).** A non-login ssh command gets
+  sshd's bare PATH (measured: `/usr/local/sbin:/usr/local/bin:/usr/bin`,
+  no `~/.local/bin`, nothing `/etc/profile.d` adds), which once picked an
+  ancient `/usr/bin/claude` and hid the user's own tools. By default the
+  probe AND the start run under the remote user's login shell: `$SHELL -l
+  -c 'exec /bin/sh -c "$SKETERM_LOGIN_SCRIPT"'`, a command bash, zsh,
+  fish, sh/dash and ksh parse alike, which re-enters POSIX sh with the
+  profiles applied (csh/tcsh refuse `-l -c` and get `/bin/sh -l`). The
+  probe runs it bounded (`launch.LOGIN_PROBE_SECS`, 10 s; a profile that
+  execs another shell or waits forever costs that much), reads markers
+  only (a profile's noise is ignored; the end marker must be a whole
+  line), and falls back to the plain environment when the login run did
+  not finish (`login_shell: false` in the result). `path_prepend`
+  (absolute directories, refused like `env` values plus no `:`) goes in
+  front of PATH after the login environment and before the lookup.
+  A plain-ssh start exports `env` after the login shell; a start on the
+  host's daemon (whose child would otherwise inherit the DAEMON's
+  environment) carries `env` values under `SKETERM_AGENT_ENV_<name>` in
+  the spawn request and restores them after the login shell, so no
+  profile overrides them and no value goes on an argv. `login_shell:
+  false` keeps the plain environment; locally both are ignored and
+  `path_prepend` still applies to the lookup. The result reports
+  `binary`, `binary_version` (the first line of the adapter's
+  `version_args`, `--version` for both shipped adapters, so a stale
+  binary is visible), `login_shell` and `login_shell_path`. Both are
+  kept for relaunches and durable reattaches.
+- **SSH logins and sketerm's ControlMaster (`fresh_login`).** Every
+  ssh/scp leg sketerm runs takes its options from ONE home,
+  `sshroute.Args.options` (ForwardX11=no everywhere, BatchMode,
+  keepalives, forwardings, multiplexing, the Tor block), with each
+  caller's differences named as a `sshroute.Leg`. The legs that
+  multiplex share sketerm's own ControlMaster
+  (`~/.ssh/sketerm-%C`, `ControlPersist=120`), and a master keeps the
+  credentials of the login that made it, its group list included, for
+  as long as any session uses it. So before a NEW connection rides it,
+  sketerm stops a master older than `mux_ssh_master_max_age_secs`
+  (default 3600; `ssh -O stop`: the sessions it carries keep running,
+  the new connection logs in afresh), and `fresh_login: true` on
+  `agent_open`/`term_open` does so whatever its age. The age is the
+  control socket's mtime (`/proc` start times lie inside LXC containers,
+  where lxcfs virtualizes uptime). `agent_open`, `term_open` and
+  `port_forward_open` report `ssh_master` (`sketerm`, `user_config`,
+  `none`, `unknown`), `ssh_master_reused`, `ssh_master_age_s`,
+  `ssh_master_stopped` and `ssh_control_path`. A ControlPath your
+  `ssh_config` sets (seen with `ssh -G`) is reported as `user_config`
+  and never stopped; port forwards never multiplex (a forward in a
+  master would outlive its ssh and keep the port bound). The remote
+  sketerm-mux daemon is a separate long-lived process: an agent it
+  spawns inherits the DAEMON's groups, which a fresh ssh login does not
+  change.
 - **Connection loss.** A remote-mux session whose link drops is
   reattached once at once; when that fails the agent reports
   `connection_lost` (state `disconnected`) and the next `agent_*` call on

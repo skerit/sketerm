@@ -583,6 +583,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         const v = init.args.vector;
         const self_name = std.fs.path.basename(std.mem.span(v[0]));
         if (std.mem.eql(u8, self_name, "ssh") or std.mem.eql(u8, self_name, "scp")) break :fake;
+        // The adapters' `version_args`: agent_open reports this line.
+        if (v.len == 2 and std.mem.eql(u8, std.mem.span(v[1]), "--version")) {
+            say(FAKE_AGENT_VERSION);
+            return 0;
+        }
         for (v[1..], 1..) |arg, k| {
             const mode = std.mem.span(arg);
             if (std.mem.eql(u8, mode, "--ax-screen-reader")) {
@@ -5844,6 +5849,8 @@ fn writeSolidPngFile(path: [:0]const u8, r: u8, g: u8, b: u8) bool {
 
 /// Env under which THIS binary, run with an agent app's argv, is that app.
 const FAKE_AGENT_ENV = "SKETERM_SMOKE_FAKE_AGENT";
+/// What the fake agents print for `--version`.
+const FAKE_AGENT_VERSION = "sk-fake-agent 0.0.0 (smoke)";
 
 fn writeOut(bytes: []const u8) void {
     var off: usize = 0;
@@ -7441,6 +7448,34 @@ fn agentSshStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u
         m.initialize();
         const caps = agentCall(&m, arena, "capabilities", "{}", "capabilities", false, 15_000);
         if (!caps.get("agent_ssh").?.bool) fail("capabilities: agent_ssh is false with an ssh client on PATH");
+        if (!caps.get("agent_login_shell").?.bool) fail("capabilities: agent_login_shell is false with an ssh client on PATH");
+        if (capInt(caps, "scp_put_targets") != 32) fail("capabilities: scp_put_targets is not 32");
+
+        // scp_put to several targets: each verified and moved on its own,
+        // a failing one (its directory does not exist) stops none of the others.
+        {
+            const src = std.fmt.allocPrintSentinel(arena, "{s}/multi-src.txt", .{rt}, 0) catch fail("oom");
+            const f = c.fopen(src.ptr, "w") orelse fail("could not write the upload source");
+            _ = c.fputs("MULTI-TARGET-PAYLOAD\n", f);
+            _ = c.fclose(f);
+            const put = agentCall(&m, arena, "scp_put", std.fmt.allocPrint(arena, "{{\"local_path\":\"{s}\",\"targets\":[{{\"host\":\"fakehost\",\"path\":\"{s}/multi-1.txt\"}},{{\"host\":\"fakehost\",\"path\":\"{s}/no-such-dir/multi-2.txt\"}},{{\"host\":\"fakehost\",\"path\":\"{s}/multi-3.txt\"}}]}}", .{ src, rt, rt, rt }) catch fail("oom"), "scp_put targets", false, 90_000);
+            if (capInt(put, "total") != 3 or capInt(put, "succeeded") != 2 or capInt(put, "failed") != 1) {
+                say(std.json.Stringify.valueAlloc(arena, put.get("targets").?, .{}) catch "?");
+                fail("scp_put targets: expected 2 ok and 1 failed");
+            }
+            const items = put.get("targets").?.array.items;
+            const sha = scStr(put, "sha256", "scp_put targets: the local sha256");
+            for (items, [_][]const u8{ "ok", "failed", "ok" }) |item, want| {
+                if (!std.mem.eql(u8, item.object.get("status").?.string, want)) fail("scp_put targets: a target has the wrong status");
+                if (std.mem.eql(u8, want, "ok") and !std.mem.eql(u8, item.object.get("sha256").?.string, sha))
+                    fail("scp_put targets: an ok target's sha256 is not the local one");
+            }
+            for ([_][]const u8{ "multi-1.txt", "multi-3.txt" }) |name| {
+                const p = std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ rt, name }, 0) catch fail("oom");
+                if (c.access(p.ptr, c.F_OK) != 0) fail("scp_put targets: an ok target's file is missing");
+            }
+            say("smoke-mcp: scp_put targets: 2 verified and moved, the broken one failed alone");
+        }
         // One probe on the host: claude is found through ~/.local/bin.
         const ad = agentCall(&m, arena, "agent_adapters", "{\"host\":\"fakehost\"}", "agent_adapters host", false, 45_000);
         expectFact(ad, "host", "fakehost", "agent_adapters host: host fact");
@@ -7462,6 +7497,7 @@ fn agentSshStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u
         expectFact(opened, "transport", "sketerm-mux", "agent_open host: the host's own daemon");
         expectFact(opened, "host", "fakehost", "agent_open host: host fact");
         expectFact(opened, "binary", want_bin, "agent_open host: the remote binary from the candidates");
+        expectFact(opened, "binary_version", FAKE_AGENT_VERSION, "agent_open host: the binary's version line");
         if (!opened.get("ready").?.bool) fail("agent_open host: the remote fake Claude Code never became ready");
         if (!sessionListed(allocator, rsock, "agent-claude-1")) fail("agent-claude-1 is not a session on the remote daemon");
         const hello = agentCall(&m, arena, "agent_send", "{\"agent\":\"claude-1\",\"text\":\"hello from afar\",\"timeout_ms\":20000}", "agent_send remote", false, 45_000);

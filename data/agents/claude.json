@@ -12,6 +12,7 @@
     "effort_args": ["--effort", "{effort}"],
     "effort_values": ["low", "medium", "high", "xhigh", "max"],
     "unset_env": ["CLAUDE*"],
+    "version_args": ["--version"],
     "exit": [
       { "clear_input": ["escape", "escape"] },
       { "command": "/exit" },

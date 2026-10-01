@@ -36,9 +36,7 @@ const Candidate = struct {
     }
 };
 
-fn mtimeSec(st: *const c.struct_stat) i64 {
-    return if (@hasField(c.struct_stat, "st_mtim")) st.st_mtim.tv_sec else st.st_mtimespec.tv_sec;
-}
+const mtimeSec = @import("platform.zig").mtimeSecs;
 
 /// Sweep `dir` under `policy`. Best effort: an unreadable directory
 /// removes nothing, and the count trim bounds its own collection at

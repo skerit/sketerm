@@ -17,7 +17,7 @@ const c = @import("../c.zig").c;
 const sshroute = @import("sshroute.zig");
 const sockpath = @import("sockpath.zig");
 const selfexec = @import("selfexec.zig");
-const deploy = @import("deploy.zig");
+const sshmaster = @import("sshmaster.zig");
 const socks5_client = @import("socks5_client.zig");
 const shellquote = @import("../util/shellquote.zig");
 const fdio = @import("../util/fdio.zig");
@@ -206,10 +206,11 @@ fn execNext(allocator: std.mem.Allocator, args: Args) Outcome {
     const command = remoteCommand(allocator, selfexec.BINARY, rest, args.instance) catch return refuse(.exec_failed, "out of memory");
     defer allocator.free(command);
     const plan = sshroute.Plan.init(next, .direct, socks5_client.DEFAULT_ENDPOINT) catch return refuse(.bad_route, "a --via hop is not a plain ssh destination");
-    const ssh_env = c.getenv("SKETERM_SSH");
-    const ssh_bin: [*:0]const u8 = if (ssh_env != null) ssh_env else "ssh";
-    var route_args = plan.args(ssh_env == null and deploy.canMultiplex()) catch return refuse(.exec_failed, "cannot build the ssh options");
-    var argv: [40:null]?[*:0]const u8 = .{null} ** 40;
+    const ssh_bin = sshroute.sshBinary();
+    var route_args = plan.args(.{ .multiplex = true }) catch return refuse(.exec_failed, "cannot build the ssh options");
+    // This hop's own ssh: its ControlMaster ages under this host's default policy.
+    if (route_args.multiplexes()) _ = sshmaster.prepare(ssh_bin, &route_args, next, .{});
+    var argv: [sshroute.Args.MAX_OPTIONS + 8:null]?[*:0]const u8 = .{null} ** (sshroute.Args.MAX_OPTIONS + 8);
     var n: usize = 0;
     argv[n] = ssh_bin;
     n += 1;

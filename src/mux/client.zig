@@ -9,6 +9,7 @@ const sockpath = @import("sockpath.zig");
 const deploy = @import("deploy.zig");
 const rudp = @import("rudp.zig");
 const sshroute = @import("sshroute.zig");
+const sshmaster = @import("sshmaster.zig");
 const selfexec = @import("selfexec.zig");
 const capabilities = @import("capabilities.zig");
 const vcodec = @import("../wlhost/vcodec.zig");
@@ -140,6 +141,8 @@ fn noteRouteFailure(comptime fmt: []const u8, args: anytype) void {
 pub const ConnectOptions = struct {
     udp_port_range: ?[]const u8 = null,
     tor_socks_endpoint: []const u8 = @import("socks5_client.zig").DEFAULT_ENDPOINT,
+    /// How old a login sketerm's own ControlMaster may carry into a new connection.
+    ssh_master: sshmaster.Policy = .{},
 };
 
 const nowMs = @import("../util/clock.zig").nowMs;
@@ -717,10 +720,10 @@ pub const Conn = struct {
     /// retried once the network may have changed.
     pub fn connectRemote(allocator: std.mem.Allocator, spec: []const u8, options: ConnectOptions) !Conn {
         if (std.mem.startsWith(u8, spec, "sock:")) return connectProbed(allocator, spec[5..]);
-        if (RouteSpec.isRoute(spec)) return connectRoute(allocator, spec, options.tor_socks_endpoint);
+        if (RouteSpec.isRoute(spec)) return connectRoute(allocator, spec, options);
         const remote = RemoteSpec.parse(spec);
         if (remote.mode == .auto and udpMemoDown(remote.host)) {
-            var conn = try connectSshRoute(allocator, remote.host, .direct, options.tor_socks_endpoint);
+            var conn = try connectSshRoute(allocator, remote.host, .direct, options);
             conn.udp_error = error.UdpRecentlyUnavailable;
             return conn;
         }
@@ -736,19 +739,19 @@ pub const Conn = struct {
     const RemoteConnector = *const fn (std.mem.Allocator, []const u8, ConnectOptions) anyerror!Conn;
 
     fn connectSshDirect(allocator: std.mem.Allocator, host: []const u8, options: ConnectOptions) !Conn {
-        return connectSshRoute(allocator, host, .direct, options.tor_socks_endpoint);
+        return connectSshRoute(allocator, host, .direct, options);
     }
 
     fn connectSshTor(allocator: std.mem.Allocator, host: []const u8, options: ConnectOptions) !Conn {
-        return connectSshRoute(allocator, host, .tor, options.tor_socks_endpoint);
+        return connectSshRoute(allocator, host, .tor, options);
     }
 
     fn connectUdpAuto(allocator: std.mem.Allocator, host: []const u8, options: ConnectOptions) !Conn {
-        return connectUdpFor(allocator, host, options.udp_port_range, 6_000);
+        return connectUdpFor(allocator, host, options.udp_port_range, 6_000, options.ssh_master);
     }
 
     fn connectUdpForced(allocator: std.mem.Allocator, host: []const u8, options: ConnectOptions) !Conn {
-        return connectUdp(allocator, host, options.udp_port_range);
+        return connectUdpFor(allocator, host, options.udp_port_range, 20_000, options.ssh_master);
     }
 
     fn connectRemoteUsing(
@@ -840,8 +843,7 @@ pub const Conn = struct {
         if (c.pipe(&pipe_fds) != 0) return null;
         for (pipe_fds) |fd| _ = c.fcntl(fd, c.F_SETFD, c.FD_CLOEXEC);
 
-        const ssh_env = c.getenv("SKETERM_SSH");
-        const ssh_bin: [*:0]const u8 = if (ssh_env != null) ssh_env else "ssh";
+        const ssh_bin = sshroute.sshBinary();
 
         const pid = c.fork();
         if (pid < 0) {
@@ -894,10 +896,10 @@ pub const Conn = struct {
     /// (punch.zig): we announce our pre-bound UDP port over ssh
     /// stdin so a NATed remote can probe back at us.
     pub fn connectUdp(allocator: std.mem.Allocator, host: []const u8, port_range: ?[]const u8) !Conn {
-        return connectUdpFor(allocator, host, port_range, 20_000);
+        return connectUdpFor(allocator, host, port_range, 20_000, .{});
     }
 
-    fn connectUdpFor(allocator: std.mem.Allocator, host: []const u8, port_range: ?[]const u8, timeout_ms: i64) !Conn {
+    fn connectUdpFor(allocator: std.mem.Allocator, host: []const u8, port_range: ?[]const u8, timeout_ms: i64, master: sshmaster.Policy) !Conn {
         // A live route's background UDP upgrade lands here: refuse at once.
         if (RouteSpec.isRoute(host)) return error.RouteIsSshOnly;
         if (!validSshHost(host)) return error.BadPath;
@@ -978,34 +980,25 @@ pub const Conn = struct {
         for (in_fds) |fd| {
             if (fd >= 0) _ = c.fcntl(fd, c.F_SETFD, c.FD_CLOEXEC);
         }
-        const ssh_env = c.getenv("SKETERM_SSH");
-        const ssh_bin: [*:0]const u8 = if (ssh_env != null) ssh_env else "ssh";
+        const ssh_bin = sshroute.sshBinary();
         var range_z_buf: [32:0]u8 = undefined;
         const range_z: ?[:0]const u8 = if (port_range) |r|
             std.fmt.bufPrintZ(&range_z_buf, "{s}", .{r}) catch return error.BadPath
         else
             null;
-        var argv: [20:null]?[*:0]const u8 = .{null} ** 20;
+        const ArgvBuf = [sshroute.Args.MAX_OPTIONS + 8:null]?[*:0]const u8;
+        var argv: ArgvBuf = .{null} ** (sshroute.Args.MAX_OPTIONS + 8);
         var argc: usize = 0;
         const push = struct {
-            fn f(buf: *[20:null]?[*:0]const u8, i: *usize, value: ?[*:0]const u8) void {
+            fn f(buf: *ArgvBuf, i: *usize, value: ?[*:0]const u8) void {
                 buf[i.*] = value;
                 i.* += 1;
             }
         }.f;
         push(&argv, &argc, ssh_bin);
-        push(&argv, &argc, "-T");
-        push(&argv, &argc, "-x");
-        push(&argv, &argc, "-o");
-        push(&argv, &argc, "BatchMode=yes");
-        if (ssh_env == null and deploy.canMultiplex()) {
-            push(&argv, &argc, "-o");
-            push(&argv, &argc, "ControlMaster=auto");
-            push(&argv, &argc, "-o");
-            push(&argv, &argc, "ControlPath=~/.ssh/sketerm-%C");
-            push(&argv, &argc, "-o");
-            push(&argv, &argc, "ControlPersist=120");
-        }
+        var route_args = deploy_plan.args(.{ .multiplex = true }) catch return error.BadPath;
+        route_args.append(&argv, &argc) catch return error.BadPath;
+        if (route_args.multiplexes()) _ = sshmaster.prepare(ssh_bin, &route_args, host, master);
         push(&argv, &argc, host_z.ptr);
         if (prepared_command) |command| {
             push(&argv, &argc, command.ptr);
@@ -1213,19 +1206,24 @@ pub const Conn = struct {
 
     /// Route-aware SSH connect; `tor:` is forced and never downgrades.
     pub fn connectSshWithEndpoint(allocator: std.mem.Allocator, spec: []const u8, tor_endpoint: []const u8) !Conn {
-        if (RouteSpec.isRoute(spec)) return connectRoute(allocator, spec, tor_endpoint);
+        return connectSshWith(allocator, spec, .{ .tor_socks_endpoint = tor_endpoint });
+    }
+
+    /// Route-aware SSH connect with every connect option (`udp_port_range` unused).
+    pub fn connectSshWith(allocator: std.mem.Allocator, spec: []const u8, options: ConnectOptions) !Conn {
+        if (RouteSpec.isRoute(spec)) return connectRoute(allocator, spec, options);
         const remote = RemoteSpec.parse(spec);
         const route: sshroute.Route = switch (remote.mode) {
             .auto, .ssh => .direct,
             .tor => .tor,
             .udp => return error.BadPath,
         };
-        return connectSshRoute(allocator, remote.host, route, tor_endpoint);
+        return connectSshRoute(allocator, remote.host, route, options);
     }
 
-    fn connectSshRoute(allocator: std.mem.Allocator, host: []const u8, route: sshroute.Route, tor_endpoint: []const u8) !Conn {
+    fn connectSshRoute(allocator: std.mem.Allocator, host: []const u8, route: sshroute.Route, options: ConnectOptions) !Conn {
         if (!validSshHost(host)) return error.BadPath;
-        const plan = sshroute.Plan.init(host, route, tor_endpoint) catch return error.BadPath;
+        const plan = sshroute.Plan.init(host, route, options.tor_socks_endpoint) catch return error.BadPath;
         var prepared = deploy.prepare(allocator, &plan);
         defer if (prepared) |*p| p.deinit();
         // `sketerm app` opens TWO connections moments apart (the CLI to
@@ -1245,9 +1243,9 @@ pub const Conn = struct {
             // demote every remaining attempt to fast "command not
             // found" failures.
             if (prepared) |p| {
-                if (connectSshOnceUsing(allocator, &plan, p.path, 20_000)) |conn| return conn else |_| {}
+                if (connectSshOnceUsing(allocator, &plan, p.path, 20_000, options.ssh_master)) |conn| return conn else |_| {}
             }
-            if (connectSshOnceUsing(allocator, &plan, null, 20_000)) |conn| {
+            if (connectSshOnceUsing(allocator, &plan, null, 20_000, options.ssh_master)) |conn| {
                 return conn;
             } else |err| {
                 if (attempt + 1 >= 3) return err;
@@ -1264,7 +1262,12 @@ pub const Conn = struct {
     }
 
     pub fn connectSshOnceWithEndpoint(allocator: std.mem.Allocator, spec: []const u8, tor_endpoint: []const u8) !Conn {
-        if (RouteSpec.isRoute(spec)) return connectRoute(allocator, spec, tor_endpoint);
+        return connectSshOnceWith(allocator, spec, .{ .tor_socks_endpoint = tor_endpoint });
+    }
+
+    /// `connectSshOnceWithEndpoint` with every connect option.
+    pub fn connectSshOnceWith(allocator: std.mem.Allocator, spec: []const u8, options: ConnectOptions) !Conn {
+        if (RouteSpec.isRoute(spec)) return connectRoute(allocator, spec, options);
         const remote = RemoteSpec.parse(spec);
         const route: sshroute.Route = switch (remote.mode) {
             .auto, .ssh => .direct,
@@ -1272,20 +1275,19 @@ pub const Conn = struct {
             .udp => return error.BadPath,
         };
         if (!validSshHost(remote.host)) return error.BadPath;
-        const plan = sshroute.Plan.init(remote.host, route, tor_endpoint) catch return error.BadPath;
+        const plan = sshroute.Plan.init(remote.host, route, options.tor_socks_endpoint) catch return error.BadPath;
         var prepared = deploy.localPath(allocator);
         defer if (prepared) |*p| p.deinit();
         if (prepared) |p| {
-            if (connectSshOnceUsing(allocator, &plan, p.path, 5_000)) |conn| return conn else |_| {}
+            if (connectSshOnceUsing(allocator, &plan, p.path, 5_000, options.ssh_master)) |conn| return conn else |_| {}
         }
-        return connectSshOnceUsing(allocator, &plan, null, 15_000);
+        return connectSshOnceUsing(allocator, &plan, null, 15_000, options.ssh_master);
     }
 
-    fn connectSshOnceUsing(allocator: std.mem.Allocator, plan: *const sshroute.Plan, remote_mux: ?[]const u8, timeout_ms: c_int) !Conn {
+    fn connectSshOnceUsing(allocator: std.mem.Allocator, plan: *const sshroute.Plan, remote_mux: ?[]const u8, timeout_ms: c_int, master: sshmaster.Policy) !Conn {
         var host_z_buf: [256:0]u8 = undefined;
         const host_z = std.fmt.bufPrintZ(&host_z_buf, "{s}", .{plan.destination}) catch return error.BadPath;
-        const ssh_env = c.getenv("SKETERM_SSH");
-        const ssh_bin: [*:0]const u8 = if (ssh_env != null) ssh_env else "ssh";
+        const ssh_bin = sshroute.sshBinary();
 
         // Connection multiplexing — only with the real ssh (a test rig
         // pointed at by $SKETERM_SSH keeps the plain positional argv).
@@ -1294,8 +1296,9 @@ pub const Conn = struct {
         // exits so the GUI's attach a beat later rides the same master
         // (instant — no second banner exchange). %C is a fixed-length
         // hash, so the socket path stays well under the sun_path limit.
-        var route_args = plan.args(ssh_env == null and deploy.canMultiplex()) catch return error.BadPath;
-        var argv_buf: [32:null]?[*:0]const u8 = .{null} ** 32;
+        var route_args = plan.args(.{ .multiplex = true }) catch return error.BadPath;
+        if (route_args.multiplexes()) _ = sshmaster.prepare(ssh_bin, &route_args, plan.destination, master);
+        var argv_buf: [sshroute.Args.MAX_OPTIONS + 8:null]?[*:0]const u8 = .{null} ** (sshroute.Args.MAX_OPTIONS + 8);
         var n: usize = 0;
         argv_buf[n] = ssh_bin;
         n += 1;
@@ -1343,13 +1346,13 @@ pub const Conn = struct {
     /// the first hop, whose `sketerm-mux --proxy` dials the rest. Always
     /// ssh, whatever transport the first hop would get on its own.
     /// `routeFailure()` names the failing hop and why after an error.
-    pub fn connectRoute(allocator: std.mem.Allocator, spec: []const u8, tor_endpoint: []const u8) !Conn {
+    pub fn connectRoute(allocator: std.mem.Allocator, spec: []const u8, options: ConnectOptions) !Conn {
         route_failure_len = 0;
         const route = RouteSpec.parse(spec) catch |err| {
             noteRouteFailure("invalid route '{s}': {s}", .{ spec, @errorName(err) });
             return error.BadRoute;
         };
-        const plan = sshroute.Plan.init(route.hops()[0], if (route.tor) .tor else .direct, tor_endpoint) catch {
+        const plan = sshroute.Plan.init(route.hops()[0], if (route.tor) .tor else .direct, options.tor_socks_endpoint) catch {
             noteRouteFailure("invalid route '{s}': bad first hop", .{spec});
             return error.BadRoute;
         };
@@ -1358,26 +1361,26 @@ pub const Conn = struct {
         var prepared = deploy.prepare(allocator, &plan);
         defer if (prepared) |*p| p.deinit();
         if (prepared) |p| {
-            if (connectRouteOnce(allocator, &route, &plan, p.path, budget)) |conn| return conn else |err| switch (err) {
+            if (connectRouteOnce(allocator, &route, &plan, p.path, budget, options.ssh_master)) |conn| return conn else |err| switch (err) {
                 // Definitive answers from beyond the first hop; the PATH
                 // spelling of the first hop cannot change them.
                 error.RouteRefused, error.RouteHopTooOld => return err,
                 else => {},
             }
         }
-        return connectRouteOnce(allocator, &route, &plan, null, budget);
+        return connectRouteOnce(allocator, &route, &plan, null, budget, options.ssh_master);
     }
 
-    fn connectRouteOnce(allocator: std.mem.Allocator, route: *const RouteSpec, plan: *const sshroute.Plan, remote_mux: ?[]const u8, timeout_ms: i64) !Conn {
+    fn connectRouteOnce(allocator: std.mem.Allocator, route: *const RouteSpec, plan: *const sshroute.Plan, remote_mux: ?[]const u8, timeout_ms: i64, master: sshmaster.Policy) !Conn {
         const hops = route.hops();
         const command = proxyroute.remoteCommand(allocator, remote_mux orelse selfexec.BINARY, hops[1..], route.instance) catch return error.BadRoute;
         defer allocator.free(command);
         var host_z_buf: [256:0]u8 = undefined;
         const host_z = std.fmt.bufPrintZ(&host_z_buf, "{s}", .{plan.destination}) catch return error.BadRoute;
-        const ssh_env = c.getenv("SKETERM_SSH");
-        const ssh_bin: [*:0]const u8 = if (ssh_env != null) ssh_env else "ssh";
-        var route_args = plan.args(ssh_env == null and deploy.canMultiplex()) catch return error.BadRoute;
-        var argv_buf: [32:null]?[*:0]const u8 = .{null} ** 32;
+        const ssh_bin = sshroute.sshBinary();
+        var route_args = plan.args(.{ .multiplex = true }) catch return error.BadRoute;
+        if (route_args.multiplexes()) _ = sshmaster.prepare(ssh_bin, &route_args, plan.destination, master);
+        var argv_buf: [sshroute.Args.MAX_OPTIONS + 8:null]?[*:0]const u8 = .{null} ** (sshroute.Args.MAX_OPTIONS + 8);
         var n: usize = 0;
         argv_buf[n] = ssh_bin;
         n += 1;
@@ -2846,7 +2849,7 @@ test "UDP bootstrap sends the punch line with the pre-bound port on ssh stdin" {
 
     try std.testing.expectError(
         error.SshTransportFailed,
-        Conn.connectUdpFor(std.testing.allocator, "punch-test-host", null, 1_000),
+        Conn.connectUdpFor(std.testing.allocator, "punch-test-host", null, 1_000, .{}),
     );
 
     const cf = c.fopen(cap.ptr, "r") orelse return error.TestUnexpectedResult;

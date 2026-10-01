@@ -22,6 +22,7 @@ const tailLines = mcp.tailLines;
 const nowMs = @import("../util/clock.zig").nowMs;
 const shellquote = mcp.shellquote;
 const sshroute = @import("../mux/sshroute.zig");
+const sshmaster = @import("../mux/sshmaster.zig");
 const Config = @import("../config.zig").Config;
 const transport_mod = @import("transport.zig");
 
@@ -298,6 +299,10 @@ fn termOpen(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
     } else true;
     const choice = transportChoice(args) orelse
         return mcp.errRes(arena, .invalid_args, "transport must be 'auto', 'mux' or 'ssh'");
+    if (host) |h| if (!validHostSpec(h)) return mcp.errRes(arena, .invalid_args, BAD_HOST);
+    // Before the first connection: which login it rides, and a fresh one
+    // when sketerm's master is too old or the caller asks for it.
+    const master: ?sshmaster.Report = if (host) |h| try sshMasterCheck(arena, h, legs.script, argBool(args, "fresh_login")) else null;
 
     var remote_integration = false;
     var via_mux = false;
@@ -425,6 +430,7 @@ fn termOpen(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
     try res.fact("integration", t.integration);
     if (rec_state.casts.get(id)) |p| try res.fact("recording", p);
     try res.textf("opened headless terminal {d} ({d}x{d}{s}){s}{s}", .{ id, cols, rows, shell_note, where, rec_note });
+    if (master) |*m| try masterFacts(&res, m);
     return res.finish();
 }
 
@@ -712,27 +718,72 @@ pub fn tcpListening(port: u16, timeout_ms: i64) bool {
 /// headless terminal, wait for its exit, and hand back status + the
 /// rendered output. `.output` is arena-owned.
 pub const ArgvRun = struct { exited: bool, status: i32, status_known: bool, output: []const u8 };
-/// Append the route options for `host` and return its bare SSH destination.
-///
-/// `term_open`'s plain-ssh fallback, both transfer directions and the port
-/// forwarder each build their own ssh/scp argv, so a `tor:` host reached any
-/// of those ways would otherwise hand the literal prefixed alias to the
-/// resolver instead of staying on the forced route. Options are duped into
-/// `arena`: the Tor ProxyCommand lives inside the stack-local `Args`.
-fn appendRoute(
-    arena: std.mem.Allocator,
-    out: *std.ArrayList([]const u8),
-    host: []const u8,
-    ssh_flags: bool,
-) ![]const u8 {
-    const remote = sshroute.RemoteSpec.parse(host);
-    if (remote.mode != .tor) return host;
+/// The legs the MCP tools run, each with its legitimate differences named
+/// here and every shared option from `sshroute.Args.options`.
+pub const legs = struct {
+    /// `term_open`/agents over plain ssh: a pty, prompts on the screen,
+    /// keepalives, the user's configured forwardings kept.
+    pub const interactive: sshroute.Leg = .{ .tty = .force, .batch = false, .keepalive = true, .clear_forwardings = false, .multiplex = true };
+    /// One-shot remote scripts (transfer checksums, the agent probe).
+    pub const script: sshroute.Leg = .{ .multiplex = true };
+    pub const scp: sshroute.Leg = .{ .tool = .scp, .multiplex = true };
+    /// `ssh -N -L`: never through a master, whose forwards would outlive
+    /// this process and keep the local port bound after a respawn.
+    pub const forward: sshroute.Leg = .{ .forward = true, .keepalive = true, .clear_forwardings = false };
+};
+
+pub const BAD_HOST = "host must be an SSH destination (user@box or an ssh config alias, optionally tor: or ssh:)";
+
+/// Whether an MCP `host` argument is a destination the ssh legs accept
+/// (`sshroute.validDestination` after an optional `tor:`/`ssh:`).
+pub fn validHostSpec(host: []const u8) bool {
+    _ = sshroute.Plan.fromSpec(host, @import("../mux/socks5_client.zig").DEFAULT_ENDPOINT) catch return false;
+    return true;
+}
+
+/// Append `ssh`/`scp` and the leg's options for `host` (its forced route
+/// included) and return the bare destination, arena-owned.
+pub fn appendSshLeg(arena: std.mem.Allocator, out: *std.ArrayList([]const u8), host: []const u8, leg: sshroute.Leg) ![]const u8 {
     var cfg = Config.load(arena);
     defer cfg.deinit();
-    const plan = try sshroute.Plan.init(remote.host, .tor, cfg.mux_tor_socks_endpoint);
-    var args = try plan.args(false);
-    try args.appendSlices(arena, out, ssh_flags);
-    return try arena.dupe(u8, remote.host);
+    const plan = try sshroute.Plan.fromSpec(host, cfg.mux_tor_socks_endpoint);
+    const args = try plan.args(leg);
+    try out.append(arena, if (leg.tool == .scp) "scp" else "ssh");
+    try args.appendSlices(arena, out);
+    return try arena.dupe(u8, plan.destination);
+}
+
+/// Inspect the ControlMaster the next connection to `host` rides, stopping
+/// sketerm's own one first when it is older than the configured maximum
+/// or `fresh` asks for a new login.
+pub fn sshMasterCheck(arena: std.mem.Allocator, host: []const u8, leg: sshroute.Leg, fresh: bool) !sshmaster.Report {
+    var cfg = Config.load(arena);
+    defer cfg.deinit();
+    const plan = sshroute.Plan.fromSpec(host, cfg.mux_tor_socks_endpoint) catch return .{};
+    const args = plan.args(leg) catch return .{};
+    return sshmaster.prepare("ssh", &args, plan.destination, .{ .max_age_s = cfg.mux_ssh_master_max_age_secs, .fresh = fresh });
+}
+
+/// The `ssh_master*` facts and one line saying which login a connection rides.
+pub fn masterFacts(res: *mcp.Res, m: *const sshmaster.Report) !void {
+    try res.fact("ssh_master", @tagName(m.kind));
+    try res.fact("ssh_master_reused", m.reused);
+    try res.fact("ssh_master_age_s", m.age_s);
+    try res.fact("ssh_master_stopped", m.stopped);
+    try res.fact("ssh_control_path", m.controlPath());
+    switch (m.kind) {
+        .sketerm => if (m.reused)
+            try res.textf("ssh: reuses sketerm's login from {d}s ago (fresh_login:true starts a new one)", .{m.age_s orelse 0})
+        else if (m.stopped)
+            try res.text("ssh: sketerm's older login was stopped; this connection logged in afresh")
+        else
+            try res.text("ssh: a fresh login (no sketerm master was running)"),
+        .user_config => if (m.reused)
+            try res.textf("ssh: rides a ControlMaster your ssh_config sets ({s}), {s}; sketerm does not manage it", .{ m.controlPath() orelse "?", if (m.age_s) |a| try std.fmt.allocPrint(res.arena, "logged in {d}s ago", .{a}) else "age unknown" })
+        else
+            try res.textf("ssh: your ssh_config sets a ControlPath ({s}); no master was running", .{m.controlPath() orelse "?"}),
+        .none, .unknown => {},
+    }
 }
 
 /// The refusal of a remote open that required the host's own daemon.
@@ -748,32 +799,64 @@ pub fn transportChoice(args: std.json.Value) ?transport_mod.Choice {
 /// host's forced route) up to and including its destination; the remote
 /// command, if any, goes after it. Auth prompts land on the screen.
 pub fn appendSshTt(arena: std.mem.Allocator, out: *std.ArrayList([]const u8), host: []const u8) !void {
-    try out.appendSlice(arena, &.{
-        "ssh", "-tt",
-        "-o",  "ServerAliveInterval=15",
-        "-o",  "ServerAliveCountMax=4",
-    });
     // A forced route must survive the fall out of the mux path.
-    try out.append(arena, try appendRoute(arena, out, host, false));
+    try out.append(arena, try appendSshLeg(arena, out, host, legs.interactive));
 }
 
-pub fn runArgvTerm(arena: std.mem.Allocator, argv: []const []const u8, timeout_ms: i64) !union(enum) { run: ArgvRun, err: []const u8 } {
-    const t = termdrive.Term.spawn(term_state.allocator, argv, 120, 30, term_state.mux_sock) catch
-        return .{ .err = "spawn failed (mux daemon unreachable?)" };
-    defer t.deinit();
-    recordAuxTerm(t, std.fs.path.basename(argv[0]));
-    const exited = t.waitExit(timeout_ms);
-    const output = blk: {
-        const text = t.readScreen(true) catch break :blk "";
-        defer term_state.allocator.free(text);
-        break :blk try arena.dupe(u8, std.mem.trim(u8, text, "\n "));
-    };
-    return .{ .run = .{
-        .exited = exited,
-        .status = t.exit_status,
-        .status_known = t.exit_status_known,
-        .output = output,
-    } };
+pub const ArgvOutcome = union(enum) { run: ArgvRun, err: []const u8 };
+
+pub fn runArgvTerm(arena: std.mem.Allocator, argv: []const []const u8, timeout_ms: i64) !ArgvOutcome {
+    return (try runArgvTerms(arena, &.{argv}, nowMs() + timeout_ms, 1))[0];
+}
+
+/// `runArgvTerm` for several argvs, at most `max_par` running at once, all
+/// bounded by one absolute deadline; one outcome per argv, in order.
+pub fn runArgvTerms(arena: std.mem.Allocator, argvs: []const []const []const u8, deadline_ms: i64, max_par: usize) ![]ArgvOutcome {
+    const out = try arena.alloc(ArgvOutcome, argvs.len);
+    const live = try arena.alloc(?*termdrive.Term, argvs.len);
+    @memset(live, null);
+    defer for (live) |slot| if (slot) |t| t.deinit();
+    var next: usize = 0;
+    var running: usize = 0;
+    var done: usize = 0;
+    while (done < argvs.len) {
+        while (running < @max(max_par, 1) and next < argvs.len) : (next += 1) {
+            const t = termdrive.Term.spawn(term_state.allocator, argvs[next], 120, 30, term_state.mux_sock) catch {
+                out[next] = .{ .err = "spawn failed (mux daemon unreachable?)" };
+                done += 1;
+                continue;
+            };
+            recordAuxTerm(t, std.fs.path.basename(argvs[next][0]));
+            live[next] = t;
+            running += 1;
+        }
+        var finished = false;
+        const late = nowMs() >= deadline_ms;
+        for (live, 0..) |*slot, i| {
+            const t = slot.* orelse continue;
+            t.drain();
+            if (!t.exited and !late) continue;
+            const output = blk: {
+                const text = t.readScreen(true) catch break :blk "";
+                defer term_state.allocator.free(text);
+                break :blk try arena.dupe(u8, std.mem.trim(u8, text, "\n "));
+            };
+            out[i] = .{ .run = .{ .exited = t.exited, .status = t.exit_status, .status_known = t.exit_status_known, .output = output } };
+            t.deinit();
+            slot.* = null;
+            running -= 1;
+            done += 1;
+            finished = true;
+        }
+        if (!finished and running > 0) {
+            // Wake on the first live terminal's traffic, or after a short tick.
+            for (live) |slot| if (slot) |t| {
+                _ = t.pumpOnce(20);
+                break;
+            };
+        }
+    }
+    return out;
 }
 
 /// Shell-quote into an arena string.
@@ -849,8 +932,7 @@ fn forwardElemJson(
 pub fn remoteShArgv(arena: std.mem.Allocator, host: []const u8, script: []const u8) ![]const []const u8 {
     var argv: std.ArrayList([]const u8) = .empty;
     errdefer argv.deinit(arena);
-    try argv.appendSlice(arena, &.{ "ssh", "-o", "BatchMode=yes" });
-    const dest = try appendRoute(arena, &argv, host, false);
+    const dest = try appendSshLeg(arena, &argv, host, legs.script);
     try argv.appendSlice(arena, &.{ dest, try remoteShLine(arena, script) });
     return argv.toOwnedSlice(arena);
 }
@@ -913,7 +995,8 @@ pub fn scpTool(arena: std.mem.Allocator, upload: bool, args: std.json.Value) ![]
     if (term_state.mux_sock == null)
         return mcp.errRes(arena, .unavailable, "file transfer / port forward tools need isolated mode (they run over private headless terminals)");
     const local = argStr(args, "local_path") orelse return mcp.errRes(arena, .invalid_args, "requires 'local_path'");
-    const remote = argStr(args, "remote_path") orelse return mcp.errRes(arena, .invalid_args, "requires 'remote_path'");
+    if (upload) if (mcp.argValue(args, "targets")) |v| if (v != .null) return scpPutTargets(arena, local, v, args);
+    const remote = argStr(args, "remote_path") orelse return mcp.errRes(arena, .invalid_args, "requires 'remote_path' (or 'targets')");
     const timeout_ms: i64 = mcp.waitCap(argInt(args, "timeout_ms"), 120_000);
     // A transfer is TWO ssh legs, and their budgets used to add up
     // (120s + 60s) past the 150s watchdog, which aborts the call and
@@ -934,71 +1017,21 @@ pub fn scpTool(arena: std.mem.Allocator, upload: bool, args: std.json.Value) ![]
     const h = host.?;
 
     if (upload) {
-        const local_sha = sha256File(local) orelse return mcp.errRes(arena, .io_failed, "cannot read/hash the local file");
-        const bytes = fileSize(local);
-        const tmp = try stagedPartPath(arena, remote);
-        var scp_argv: std.ArrayList([]const u8) = .empty;
-        defer scp_argv.deinit(arena);
-        try scp_argv.appendSlice(arena, &.{ "scp", "-q", "-o", "BatchMode=yes" });
-        const dest = appendRoute(arena, &scp_argv, h, false) catch
-            return mcp.errRes(arena, .refused, "cannot build the forced route for this host");
-        const spec = try std.fmt.allocPrint(arena, "{s}:{s}", .{ dest, tmp });
-        try scp_argv.appendSlice(arena, &.{ local, spec });
-        switch (try runArgvTerm(arena, scp_argv.items, timeout_ms)) {
-            .err => |e| return mcp.errRes(arena, .unavailable, e),
-            .run => |r| {
-                if (!r.exited) return mcp.errRes(arena, .timeout, "scp still running at timeout; the transfer terminal was killed — retry with a larger timeout_ms");
-                if (!r.status_known or r.status != 0)
-                    return mcp.errRes(arena, .io_failed, try std.fmt.allocPrint(arena, "scp failed (status {d}):\n{s}", .{ r.status, r.output }));
-            },
-        }
-        // Checksum + optional caller validation + atomic move in
-        // ONE remote script (b64→sh so the remote login shell's
-        // dialect is irrelevant); echo tokens report the branch.
-        var verify_layer: []const u8 = "mv -f \"$SK_TMP\" \"$SK_DST\" && echo SK_MOVED || echo SK_MVFAIL";
-        if (argStr(args, "verify_command")) |vc| {
-            // "{}" marks where the staged path goes; without it
-            // the path is appended as the final argument.
-            const resolved = if (std.mem.indexOf(u8, vc, "{}")) |at|
-                try std.fmt.allocPrint(arena, "{s}\"$SK_TMP\"{s}", .{ vc[0..at], vc[at + 2 ..] })
-            else
-                try std.fmt.allocPrint(arena, "{s} \"$SK_TMP\"", .{vc});
-            verify_layer = try std.fmt.allocPrint(
-                arena,
-                "if ( {s} ); then mv -f \"$SK_TMP\" \"$SK_DST\" && echo SK_MOVED || echo SK_MVFAIL; else echo \"SK_VERIFYFAIL:$?\"; rm -f \"$SK_TMP\"; fi",
-                .{resolved},
-            );
-        }
-        const script = try std.fmt.allocPrint(
-            arena,
-            "SK_TMP={s}\nSK_DST={s}\nsha=$(sha256sum \"$SK_TMP\" 2>/dev/null | cut -c1-64) || sha=fail\nif [ \"$sha\" = \"{s}\" ]; then {s}; else echo \"SK_SHA:$sha\"; rm -f \"$SK_TMP\"; fi\n",
-            .{ try quoted(arena, tmp), try quoted(arena, remote), local_sha, verify_layer },
-        );
-        const move_argv = remoteShArgv(arena, h, script) catch
-            return mcp.errRes(arena, .refused, "cannot build the forced route for this host");
-        switch (try runArgvTerm(arena, move_argv, legBudget(xfer_deadline, 60_000))) {
-            .err => |e| return mcp.errRes(arena, .unavailable, e),
-            .run => |r| {
-                if (std.mem.indexOf(u8, r.output, "SK_MOVED") != null)
-                    return xferOk(arena, "upload", remote, bytes, &local_sha);
-                if (std.mem.indexOf(u8, r.output, "SK_VERIFYFAIL") != null)
-                    return mcp.errRes(arena, .refused, try std.fmt.allocPrint(arena, "verify_command rejected the staged file — upload discarded, destination untouched:\n{s}", .{r.output}));
-                if (std.mem.indexOf(u8, r.output, "SK_MVFAIL") != null)
-                    return mcp.errRes(arena, .io_failed, "checksum verified but the atomic move failed on the remote (target dir not writable?)");
-                if (std.mem.indexOf(u8, r.output, "SK_SHA:fail") != null)
-                    return mcp.errRes(arena, .unavailable, "remote has no usable sha256sum — cannot verify; file left absent (partial removed)");
-                return mcp.errRes(arena, .io_failed, try std.fmt.allocPrint(arena, "remote checksum mismatch — corrupt transfer discarded:\n{s}", .{r.output}));
-            },
-        }
+        const one = [_]UpTarget{.{ .host = h, .path = remote }};
+        const r = (try uploadTargets(arena, local, &one, argStr(args, "verify_command"), xfer_deadline))[0];
+        return switch (r) {
+            .ok => |o| xferOk(arena, "upload", remote, o.bytes, &o.sha),
+            .fail => |f| mcp.errRes(arena, f.code, f.msg),
+        };
     }
 
     // download
     const part = try stagedPartPath(arena, local);
     var dl_argv: std.ArrayList([]const u8) = .empty;
     defer dl_argv.deinit(arena);
-    try dl_argv.appendSlice(arena, &.{ "scp", "-q", "-o", "BatchMode=yes" });
-    const dl_dest = appendRoute(arena, &dl_argv, h, false) catch
-        return mcp.errRes(arena, .refused, "cannot build the forced route for this host");
+    const dl_dest = appendSshLeg(arena, &dl_argv, h, legs.scp) catch
+        return mcp.errRes(arena, .invalid_args, BAD_HOST);
+    try dl_argv.append(arena, "-q");
     const spec = try std.fmt.allocPrint(arena, "{s}:{s}", .{ dl_dest, remote });
     try dl_argv.appendSlice(arena, &.{ spec, part });
     switch (try runArgvTerm(arena, dl_argv.items, timeout_ms)) {
@@ -1035,6 +1068,175 @@ pub fn scpTool(arena: std.mem.Allocator, upload: bool, args: std.json.Value) ![]
     return xferOk(arena, "download", local, bytes, &part_sha);
 }
 
+/// One destination of an upload; no host = a local atomic copy.
+pub const UpTarget = struct { host: ?[]const u8 = null, path: []const u8 };
+
+pub const UpOutcome = union(enum) {
+    ok: struct { bytes: ?u64, sha: [64]u8 },
+    fail: struct { code: mcp.ErrCode, msg: []const u8 },
+};
+
+/// Most `scp_put` targets in one call.
+pub const MAX_TARGETS = 32;
+/// Transfers in flight at once: targets are independent hosts and paths,
+/// and four keep the call well inside the watchdog for 32 slow targets
+/// without opening dozens of ssh sessions (and PTYs) at once.
+const UPLOAD_PARALLEL = 4;
+
+/// Upload `local` to every target with the one-target guarantees (scp to a
+/// staged name, remote SHA-256 against the local hash, optional
+/// `verify_command`, atomic `mv`); a failed target never stops the others.
+fn uploadTargets(arena: std.mem.Allocator, local: []const u8, targets: []const UpTarget, verify_command: ?[]const u8, deadline_ms: i64) ![]UpOutcome {
+    const out = try arena.alloc(UpOutcome, targets.len);
+    const local_sha = sha256File(local) orelse {
+        for (out) |*o| o.* = .{ .fail = .{ .code = .io_failed, .msg = "cannot read/hash the local file" } };
+        return out;
+    };
+    const bytes = fileSize(local);
+    var pending: std.ArrayList(usize) = .empty;
+    var scp_argvs: std.ArrayList([]const []const u8) = .empty;
+    for (targets, out, 0..) |tg, *o, i| {
+        const h = tg.host orelse {
+            o.* = switch (try localCopyAtomic(arena, local, tg.path)) {
+                .ok => |r| .{ .ok = .{ .bytes = r.bytes, .sha = r.sha } },
+                .err => |e| .{ .fail = .{ .code = .io_failed, .msg = e } },
+            };
+            continue;
+        };
+        var argv: std.ArrayList([]const u8) = .empty;
+        const dest = appendSshLeg(arena, &argv, h, legs.scp) catch {
+            o.* = .{ .fail = .{ .code = .invalid_args, .msg = BAD_HOST } };
+            continue;
+        };
+        try argv.append(arena, "-q");
+        try argv.appendSlice(arena, &.{ local, try std.fmt.allocPrint(arena, "{s}:{s}", .{ dest, try stagedPartPath(arena, tg.path) }) });
+        try pending.append(arena, i);
+        try scp_argvs.append(arena, argv.items);
+    }
+    var moving: std.ArrayList(usize) = .empty;
+    var move_argvs: std.ArrayList([]const []const u8) = .empty;
+    for (try runArgvTerms(arena, scp_argvs.items, deadline_ms, UPLOAD_PARALLEL), pending.items) |ran, i| {
+        switch (ran) {
+            .err => |e| out[i] = .{ .fail = .{ .code = .unavailable, .msg = e } },
+            .run => |r| {
+                if (!r.exited) {
+                    out[i] = .{ .fail = .{ .code = .timeout, .msg = "scp still running at timeout; the transfer terminal was killed — retry with a larger timeout_ms" } };
+                } else if (!r.status_known or r.status != 0) {
+                    out[i] = .{ .fail = .{ .code = .io_failed, .msg = try std.fmt.allocPrint(arena, "scp failed (status {d}):\n{s}", .{ r.status, r.output }) } };
+                } else {
+                    const script = try moveScript(arena, try stagedPartPath(arena, targets[i].path), targets[i].path, &local_sha, verify_command);
+                    const argv = remoteShArgv(arena, targets[i].host.?, script) catch {
+                        out[i] = .{ .fail = .{ .code = .invalid_args, .msg = BAD_HOST } };
+                        continue;
+                    };
+                    try moving.append(arena, i);
+                    try move_argvs.append(arena, argv);
+                }
+            },
+        }
+    }
+    for (try runArgvTerms(arena, move_argvs.items, nowMs() + legBudget(deadline_ms, 60_000), UPLOAD_PARALLEL), moving.items) |ran, i| {
+        out[i] = switch (ran) {
+            .err => |e| .{ .fail = .{ .code = .unavailable, .msg = e } },
+            .run => |r| try classifyMove(arena, r.output, bytes, &local_sha),
+        };
+    }
+    return out;
+}
+
+/// Checksum + optional caller validation + atomic move in ONE remote script
+/// (b64→sh so the remote login shell's dialect is irrelevant); echo tokens
+/// report the branch.
+fn moveScript(arena: std.mem.Allocator, tmp: []const u8, remote: []const u8, local_sha: *const [64]u8, verify_command: ?[]const u8) ![]const u8 {
+    var verify_layer: []const u8 = "mv -f \"$SK_TMP\" \"$SK_DST\" && echo SK_MOVED || echo SK_MVFAIL";
+    if (verify_command) |vc| {
+        // "{}" marks where the staged path goes; without it the path is
+        // appended as the final argument.
+        const resolved = if (std.mem.indexOf(u8, vc, "{}")) |at|
+            try std.fmt.allocPrint(arena, "{s}\"$SK_TMP\"{s}", .{ vc[0..at], vc[at + 2 ..] })
+        else
+            try std.fmt.allocPrint(arena, "{s} \"$SK_TMP\"", .{vc});
+        verify_layer = try std.fmt.allocPrint(
+            arena,
+            "if ( {s} ); then mv -f \"$SK_TMP\" \"$SK_DST\" && echo SK_MOVED || echo SK_MVFAIL; else echo \"SK_VERIFYFAIL:$?\"; rm -f \"$SK_TMP\"; fi",
+            .{resolved},
+        );
+    }
+    return std.fmt.allocPrint(
+        arena,
+        "SK_TMP={s}\nSK_DST={s}\nsha=$(sha256sum \"$SK_TMP\" 2>/dev/null | cut -c1-64) || sha=fail\nif [ \"$sha\" = \"{s}\" ]; then {s}; else echo \"SK_SHA:$sha\"; rm -f \"$SK_TMP\"; fi\n",
+        .{ try quoted(arena, tmp), try quoted(arena, remote), local_sha, verify_layer },
+    );
+}
+
+fn classifyMove(arena: std.mem.Allocator, output: []const u8, bytes: ?u64, local_sha: *const [64]u8) !UpOutcome {
+    if (std.mem.indexOf(u8, output, "SK_MOVED") != null) return .{ .ok = .{ .bytes = bytes, .sha = local_sha.* } };
+    if (std.mem.indexOf(u8, output, "SK_VERIFYFAIL") != null)
+        return .{ .fail = .{ .code = .refused, .msg = try std.fmt.allocPrint(arena, "verify_command rejected the staged file — upload discarded, destination untouched:\n{s}", .{output}) } };
+    if (std.mem.indexOf(u8, output, "SK_MVFAIL") != null)
+        return .{ .fail = .{ .code = .io_failed, .msg = "checksum verified but the atomic move failed on the remote (target dir not writable?)" } };
+    if (std.mem.indexOf(u8, output, "SK_SHA:fail") != null)
+        return .{ .fail = .{ .code = .unavailable, .msg = "remote has no usable sha256sum — cannot verify; file left absent (partial removed)" } };
+    return .{ .fail = .{ .code = .io_failed, .msg = try std.fmt.allocPrint(arena, "remote checksum mismatch — corrupt transfer discarded:\n{s}", .{output}) } };
+}
+
+/// `scp_put targets`: one upload to every target, one result per target.
+fn scpPutTargets(arena: std.mem.Allocator, local: []const u8, v: std.json.Value, args: std.json.Value) ![]const u8 {
+    if (argStr(args, "host") != null or argStr(args, "remote_path") != null)
+        return mcp.errRes(arena, .invalid_args, "targets replaces host and remote_path: pass one or the other");
+    if (v != .array or v.array.items.len == 0 or v.array.items.len > MAX_TARGETS)
+        return mcp.errRes(arena, .invalid_args, try std.fmt.allocPrint(arena, "targets must be an array of 1-{d} {{host?, path}} objects", .{MAX_TARGETS}));
+    const targets = try arena.alloc(UpTarget, v.array.items.len);
+    for (v.array.items, targets, 0..) |item, *tg, i| {
+        const path = if (item == .object) item.object.get("path") else null;
+        const host = if (item == .object) item.object.get("host") else null;
+        if (path == null or path.? != .string or path.?.string.len == 0 or (host != null and host.? != .string and host.? != .null))
+            return mcp.errRes(arena, .invalid_args, try std.fmt.allocPrint(arena, "targets[{d}] must be {{\"path\": string, \"host\"?: string}}", .{i}));
+        tg.* = .{ .path = path.?.string, .host = if (host) |h| (if (h == .string) h.string else null) else null };
+    }
+    const timeout_ms: i64 = mcp.waitCap(argInt(args, "timeout_ms"), 120_000);
+    const outcomes = try uploadTargets(arena, local, targets, argStr(args, "verify_command"), nowMs() + timeout_ms);
+
+    const Item = struct {
+        host: ?[]const u8,
+        path: []const u8,
+        status: []const u8,
+        bytes: ?u64 = null,
+        sha256: ?[]const u8 = null,
+        @"error": ?struct { code: []const u8, message: []const u8 } = null,
+    };
+    const items = try arena.alloc(Item, targets.len);
+    var ok: usize = 0;
+    var lines: std.Io.Writer.Allocating = .init(arena);
+    for (targets, outcomes, items, 0..) |tg, o, *it, i| {
+        if (i > 0) try lines.writer.writeAll("\n");
+        const where = if (tg.host) |h| try std.fmt.allocPrint(arena, "{s}:{s}", .{ h, tg.path }) else tg.path;
+        switch (o) {
+            .ok => |r| {
+                ok += 1;
+                it.* = .{ .host = tg.host, .path = tg.path, .status = "ok", .bytes = r.bytes, .sha256 = try arena.dupe(u8, &r.sha) };
+                try lines.writer.print("ok {s}: sha256 verified, moved atomically", .{where});
+            },
+            .fail => |f| {
+                it.* = .{ .host = tg.host, .path = tg.path, .status = "failed", .@"error" = .{ .code = @tagName(f.code), .message = f.msg } };
+                try lines.writer.print("FAILED {s} ({s}): {s}", .{ where, @tagName(f.code), tailLines(f.msg, 3) });
+            },
+        }
+    }
+    var res = mcp.Res.init(arena);
+    try res.fact("direction", "upload");
+    try res.fact("targets", items);
+    try res.fact("total", targets.len);
+    try res.fact("succeeded", ok);
+    try res.fact("failed", targets.len - ok);
+    try res.fact("all_ok", ok == targets.len);
+    if (sha256File(local)) |sha| try res.fact("sha256", @as([]const u8, &sha));
+    try res.textf("upload of {s} to {d} target(s): {d} ok, {d} failed", .{ local, targets.len, ok, targets.len - ok });
+    try res.textf("--- targets ---", .{});
+    try res.text(lines.written());
+    return res.finish();
+}
+
 /// Resolve the addressed port forward, then run one forward-scoped tool on it.
 fn withForward(
     arena: std.mem.Allocator,
@@ -1057,6 +1259,10 @@ fn portForwardOpen(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
         break :blk @intCast(v);
     } else pickFreePort() orelse return mcp.errRes(arena, .unavailable, "could not pick a free local port");
     const timeout_ms: i64 = mcp.waitCap(argInt(args, "timeout_ms"), 20_000);
+    if (!validHostSpec(h)) return mcp.errRes(arena, .invalid_args, BAD_HOST);
+    // A forward never rides sketerm's master; this reports whether the
+    // user's ssh_config puts it on one of theirs, and how old that login is.
+    const master = try sshMasterCheck(arena, h, legs.forward, false);
 
     const t = spawnForwardTerm(arena, h, lp, rh, rp) catch
         return mcp.errRes(arena, .unavailable, "spawn failed (mux daemon unreachable?)");
@@ -1093,6 +1299,7 @@ fn portForwardOpen(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
     try res.fact("remote_port", rp);
     try res.fact("listening", true);
     try res.textf("forward {d}: 127.0.0.1:{d} -> {s} ({s}:{d}), listening", .{ f.id, lp, h, rh, rp });
+    try masterFacts(&res, &master);
     return res.finish();
 }
 
@@ -1166,16 +1373,8 @@ pub fn spawnForwardTermNamed(arena: std.mem.Allocator, host: []const u8, lp: u16
     const bindspec = try std.fmt.allocPrint(arena, "127.0.0.1:{d}:{s}:{d}", .{ lp, rh, rp });
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(arena);
-    try argv.appendSlice(arena, &.{
-        "ssh",                      "-N",
-        "-T",                       "-o",
-        "BatchMode=yes",            "-o",
-        "ExitOnForwardFailure=yes", "-o",
-        "ServerAliveInterval=15",   "-o",
-        "ServerAliveCountMax=4",
-    });
     // A forward reconnect must stay on the route its host asked for.
-    const dest = appendRoute(arena, &argv, host, false) catch return error.SpawnFailed;
+    const dest = appendSshLeg(arena, &argv, host, legs.forward) catch return error.SpawnFailed;
     try argv.appendSlice(arena, &.{ "-L", bindspec, dest });
     const t = termdrive.Term.spawnWith(term_state.allocator, argv.items, 120, 30, term_state.mux_sock, .{ .name = name }) catch return error.SpawnFailed;
     recordAuxTerm(t, "forward");
@@ -1364,6 +1563,44 @@ test "remoteShArgv keeps a forced route off the ssh destination" {
         if (std.mem.indexOf(u8, a, "ProxyCommand") != null) proxied = true;
     }
     try t.expect(proxied);
+}
+
+test "every MCP ssh/scp argv goes through the one options home: no X11, its own leg's differences" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const has = struct {
+        fn f(argv: []const []const u8, want: []const u8) bool {
+            for (argv) |a| if (std.mem.eql(u8, a, want)) return true;
+            return false;
+        }
+    }.f;
+    for ([_][]const u8{ "box", "tor:box" }) |host| {
+        const script = try remoteShArgv(arena, host, "true\n");
+        var tt: std.ArrayList([]const u8) = .empty;
+        try appendSshTt(arena, &tt, host);
+        var scp: std.ArrayList([]const u8) = .empty;
+        _ = try appendSshLeg(arena, &scp, host, legs.scp);
+        var fwd: std.ArrayList([]const u8) = .empty;
+        _ = try appendSshLeg(arena, &fwd, host, legs.forward);
+        for ([_][]const []const u8{ script, tt.items, scp.items, fwd.items }) |argv| {
+            try t.expect(has(argv, "ForwardX11=no"));
+        }
+        try t.expect(has(script, "BatchMode=yes") and has(script, "-T"));
+        // Interactive: prompts land on the screen, keepalives, a pty.
+        try t.expect(!has(tt.items, "BatchMode=yes") and has(tt.items, "-tt") and has(tt.items, "ServerAliveInterval=15"));
+        try t.expectEqualStrings("scp", scp.items[0]);
+        try t.expect(!has(scp.items, "-T"));
+        // A forward keeps its -L (ClearAllForwardings would clear it).
+        try t.expect(has(fwd.items, "-N") and has(fwd.items, "ExitOnForwardFailure=yes") and !has(fwd.items, "ClearAllForwardings=yes"));
+        for (fwd.items) |a| try t.expect(!std.mem.eql(u8, a, "ControlMaster=auto"));
+    }
+    try t.expect(!validHostSpec("box name"));
+    try t.expect(!validHostSpec("-oProxyCommand=x"));
+    try t.expect(!validHostSpec("udp:box"));
+    try t.expect(validHostSpec("me@box"));
+    try t.expect(validHostSpec("tor:box"));
 }
 
 // ── session state: terminals, recordings, forwards ──────────────

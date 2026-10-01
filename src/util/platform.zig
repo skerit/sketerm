@@ -1211,3 +1211,8 @@ test "foregroundProgram returns null for a non-tty fd" {
     }
     try std.testing.expect(foregroundProgram(fds[0], &buf) == null);
 }
+
+/// A stat result's modification time in seconds since the epoch.
+pub fn mtimeSecs(st: *const c.struct_stat) i64 {
+    return if (@hasField(c.struct_stat, "st_mtim")) st.st_mtim.tv_sec else st.st_mtimespec.tv_sec;
+}

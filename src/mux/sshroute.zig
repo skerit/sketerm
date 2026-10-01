@@ -198,6 +198,67 @@ pub fn watchSpec(
     return route.format(buf);
 }
 
+/// What one ssh/scp invocation differs in; everything else every sketerm
+/// ssh leg shares comes from `Args.options`.
+pub const Leg = struct {
+    pub const Tool = enum { ssh, scp };
+    pub const Tty = enum {
+        /// `-T`: a protocol pipe or a script, never a pty.
+        none,
+        /// `-tt`: an interactive session on a pty it always gets.
+        force,
+    };
+
+    tool: Tool = .ssh,
+    /// Ignored for scp, whose `-T` means "no strict filename checking".
+    tty: Tty = .none,
+    /// `BatchMode=yes`: fail instead of prompting. Off only where a prompt
+    /// lands on a screen a human or the caller reads (interactive sessions).
+    batch: bool = true,
+    /// ServerAlive keepalives, for legs that live as long as a session.
+    keepalive: bool = false,
+    /// `-N` + `ExitOnForwardFailure=yes`: a port-forward-only connection.
+    forward: bool = false,
+    /// `ClearAllForwardings=yes`; it clears command-line `-L` too, so a
+    /// forward leg must keep it off.
+    clear_forwardings: bool = true,
+    /// Ride sketerm's own ControlMaster (`sshmaster.zig` governs its age).
+    /// Direct routes only, and only where `multiplexAvailable()`.
+    multiplex: bool = false,
+};
+
+/// Moves sketerm's ControlPath directory (default `~/.ssh`), so a test can
+/// run masters the user's own sessions never see.
+pub const CONTROL_DIR_ENV = "SKETERM_SSH_CONTROL_DIR";
+/// The basename prefix of every control socket sketerm creates.
+pub const CONTROL_PREFIX = "sketerm-";
+
+/// The ssh binary of every mux-side leg: `$SKETERM_SSH` (tests fake a remote host) or `ssh`.
+pub fn sshBinary() [*:0]const u8 {
+    return if (c.getenv("SKETERM_SSH")) |p| p else "ssh";
+}
+
+/// Whether sketerm may multiplex at all: the real ssh (a `$SKETERM_SSH`
+/// test wrapper keeps the historical plain argv) and an existing control dir.
+pub fn multiplexAvailable() bool {
+    if (c.getenv("SKETERM_SSH") != null) return false;
+    var buf: [512:0]u8 = undefined;
+    const dir = controlDir(&buf) orelse return false;
+    var st: c.struct_stat = undefined;
+    return c.stat(dir.ptr, &st) == 0 and (st.st_mode & c.S_IFMT) == c.S_IFDIR;
+}
+
+/// The directory sketerm's control sockets live in.
+pub fn controlDir(buf: *[512:0]u8) ?[:0]const u8 {
+    if (c.getenv(CONTROL_DIR_ENV)) |raw| {
+        const v = std.mem.span(@as([*:0]const u8, @ptrCast(raw)));
+        if (v.len > 1 and v[0] == '/') return std.fmt.bufPrintZ(buf, "{s}", .{std.mem.trimEnd(u8, v, "/")}) catch null;
+    }
+    const home_raw = c.getenv("HOME") orelse return null;
+    const home = std.mem.span(@as([*:0]const u8, @ptrCast(home_raw)));
+    return std.fmt.bufPrintZ(buf, "{s}/.ssh", .{home}) catch null;
+}
+
 pub const Plan = struct {
     destination: []const u8,
     route: Route = .direct,
@@ -215,6 +276,17 @@ pub const Plan = struct {
         return .{ .destination = destination, .route = route, .tor_endpoint = tor_endpoint };
     }
 
+    /// A host spec as the MCP tools take it: `tor:` forces Tor, `ssh:` and a
+    /// bare destination are direct, anything else is refused.
+    pub fn fromSpec(spec: []const u8, tor_endpoint: []const u8) !Plan {
+        const remote = RemoteSpec.parse(spec);
+        return switch (remote.mode) {
+            .auto, .ssh => init(remote.host, .direct, tor_endpoint),
+            .tor => init(remote.host, .tor, tor_endpoint),
+            .udp => error.BadDestination,
+        };
+    }
+
     /// Stable memo identity: a direct verification never suppresses a Tor-routed check.
     pub fn memoKey(self: Plan, buf: []u8) ?[]const u8 {
         return switch (self.route) {
@@ -223,9 +295,16 @@ pub const Plan = struct {
         };
     }
 
-    /// Build route options once, then append them to every SSH leg.
-    pub fn args(self: Plan, allow_multiplex: bool) !Args {
-        var out = Args{ .route = self.route, .multiplex = allow_multiplex and self.route == .direct };
+    /// Build one leg's options once, then append them to its argv.
+    pub fn args(self: Plan, leg: Leg) !Args {
+        var out = Args{ .route = self.route, .leg = leg };
+        out.leg.multiplex = leg.multiplex and self.route == .direct and multiplexAvailable();
+        if (out.leg.multiplex) {
+            var dir_buf: [512:0]u8 = undefined;
+            const dir = controlDir(&dir_buf) orelse return error.NoControlDir;
+            const cp = std.fmt.bufPrintZ(&out.control, "ControlPath={s}/" ++ CONTROL_PREFIX ++ "%C", .{dir}) catch return error.ControlPathTooLong;
+            out.control_len = cp.len;
+        }
         if (self.route == .tor) try out.buildProxy(self.tor_endpoint);
         return out;
     }
@@ -233,9 +312,11 @@ pub const Plan = struct {
 
 pub const Args = struct {
     route: Route,
-    multiplex: bool,
+    leg: Leg,
     proxy: [12 * 1024:0]u8 = undefined,
     proxy_len: usize = 0,
+    control: [600:0]u8 = undefined,
+    control_len: usize = 0,
 
     fn buildProxy(self: *Args, endpoint: []const u8) !void {
         var exe_buf: [4096]u8 = undefined;
@@ -257,20 +338,22 @@ pub const Args = struct {
         self.proxy_len = command.items.len;
     }
 
-    /// Most route options any route emits, plus room to grow.
-    pub const MAX_OPTIONS = 26;
+    /// Whether this leg rides sketerm's own ControlMaster.
+    pub fn multiplexes(self: *const Args) bool {
+        return self.leg.multiplex;
+    }
 
-    /// The ONE definition of a route's SSH options.
+    /// Most options any leg emits, plus room to grow.
+    pub const MAX_OPTIONS = 44;
+
+    /// The ONE definition of the options every sketerm ssh/scp leg carries.
     ///
     /// Two consumers need different string shapes — `execvp` argv wants
     /// `[*:0]`, the MCP tools build `[]const u8` lists for termdrive — and
-    /// a hand-copied second list is exactly how a route option goes missing
-    /// from one of them. Everything here is either a literal or `self.proxy`,
-    /// both null-terminated, so one sentinel-slice list serves both.
-    /// `ssh_flags` adds `-T`/`-x`, which are ssh-only: `scp -T` means
-    /// "disable strict filename checking" and would be a real behaviour
-    /// change, so transfer callers ask for the `-o` options alone.
-    pub fn options(self: *const Args, out: *[MAX_OPTIONS][:0]const u8, ssh_flags: bool) usize {
+    /// a hand-copied second list is exactly how an option goes missing from
+    /// one of them. Everything here is a literal or a buffer of `self`, all
+    /// null-terminated, so one sentinel-slice list serves both.
+    pub fn options(self: *const Args, out: *[MAX_OPTIONS][:0]const u8) usize {
         var n: usize = 0;
         const put = struct {
             fn f(buf: *[MAX_OPTIONS][:0]const u8, i: *usize, v: [:0]const u8) void {
@@ -278,28 +361,47 @@ pub const Args = struct {
                 i.* += 1;
             }
         }.f;
-        if (ssh_flags) {
-            put(out, &n, "-T");
-            // The proxy channel carries the mux binary protocol — never X11.
-            // `-x` disables X11 forwarding so a user's `ForwardX11 yes` config
-            // can't print "X11 forwarding request failed" onto the terminal
-            // (and can't perturb the protocol pipe).
-            put(out, &n, "-x");
+        const leg = self.leg;
+        if (leg.tool == .ssh) {
+            if (leg.forward) put(out, &n, "-N");
+            put(out, &n, switch (leg.tty) {
+                .none => "-T",
+                .force => "-tt",
+            });
         }
+        // No sketerm leg ever wants X11: a user's `ForwardX11 yes` prints
+        // "X11 forwarding request failed" onto a terminal, a protocol pipe
+        // or a script's output. `-o` works for scp too, unlike `-x`.
         put(out, &n, "-o");
-        put(out, &n, "BatchMode=yes");
+        put(out, &n, "ForwardX11=no");
+        if (leg.batch) {
+            put(out, &n, "-o");
+            put(out, &n, "BatchMode=yes");
+        }
+        if (leg.keepalive) {
+            put(out, &n, "-o");
+            put(out, &n, "ServerAliveInterval=15");
+            put(out, &n, "-o");
+            put(out, &n, "ServerAliveCountMax=4");
+        }
+        if (leg.forward) {
+            put(out, &n, "-o");
+            put(out, &n, "ExitOnForwardFailure=yes");
+        }
         // A dedicated mux/deployment connection must not recreate unrelated
         // LocalForward/RemoteForward/DynamicForward entries from ssh_config.
-        put(out, &n, "-o");
-        put(out, &n, "ClearAllForwardings=yes");
+        if (leg.clear_forwardings) {
+            put(out, &n, "-o");
+            put(out, &n, "ClearAllForwardings=yes");
+        }
         switch (self.route) {
-            .direct => if (self.multiplex) {
+            .direct => if (leg.multiplex) {
                 // `%C` is a fixed-length hash, so the socket path stays
                 // well under the sun_path limit.
                 put(out, &n, "-o");
                 put(out, &n, "ControlMaster=auto");
                 put(out, &n, "-o");
-                put(out, &n, "ControlPath=~/.ssh/sketerm-%C");
+                put(out, &n, self.control[0..self.control_len :0]);
                 put(out, &n, "-o");
                 put(out, &n, "ControlPersist=120");
             },
@@ -335,10 +437,10 @@ pub const Args = struct {
         return n;
     }
 
-    /// Append options common to deployment and the final mux proxy SSH.
-    pub fn append(self: *Args, argv: []?[*:0]const u8, count: *usize) !void {
+    /// Append the options to an `execvp` argv.
+    pub fn append(self: *const Args, argv: []?[*:0]const u8, count: *usize) !void {
         var buf: [MAX_OPTIONS][:0]const u8 = undefined;
-        const n = self.options(&buf, true);
+        const n = self.options(&buf);
         if (count.* + n > argv.len) return error.ArgumentOverflow;
         for (buf[0..n]) |opt| {
             argv[count.*] = opt.ptr;
@@ -347,12 +449,12 @@ pub const Args = struct {
     }
 
     /// Same options for callers that spawn ssh/scp through a `[]const u8`
-    /// argv list (the MCP transfer and port-forward tools).
-    pub fn appendSlices(self: *Args, allocator: std.mem.Allocator, out: *std.ArrayList([]const u8), ssh_flags: bool) !void {
+    /// argv list (the MCP terminal, transfer and port-forward tools).
+    pub fn appendSlices(self: *const Args, allocator: std.mem.Allocator, out: *std.ArrayList([]const u8)) !void {
         var buf: [MAX_OPTIONS][:0]const u8 = undefined;
-        const n = self.options(&buf, ssh_flags);
-        // Duped: the Tor ProxyCommand lives inside `self`, which is a stack
-        // temporary at every caller here.
+        const n = self.options(&buf);
+        // Duped: the Tor ProxyCommand and the ControlPath live inside
+        // `self`, which is a stack temporary at every caller here.
         for (buf[0..n]) |opt| try out.append(allocator, try allocator.dupe(u8, opt));
     }
 };
@@ -367,8 +469,8 @@ test "remote specs recognize forced Tor without changing the SSH destination" {
 test "Tor route forces the internal proxy and disables direct multiplexing" {
     const t = std.testing;
     const plan = try Plan.init("work-alias", .tor, socks5_client.DEFAULT_ENDPOINT);
-    var args = try plan.args(true);
-    var argv: [32:null]?[*:0]const u8 = .{null} ** 32;
+    var args = try plan.args(.{ .multiplex = true });
+    var argv: [48:null]?[*:0]const u8 = .{null} ** 48;
     var count: usize = 0;
     try args.append(&argv, &count);
     var joined: std.ArrayList(u8) = .empty;
@@ -404,18 +506,18 @@ test "a destination that could break out of the ProxyCommand is refused" {
 
 const DEFAULT_ENDPOINT_FOR_TEST = socks5_client.DEFAULT_ENDPOINT;
 
-test "the slice form carries the same route options minus the ssh-only flags" {
+test "the slice form carries the same options as the argv form; scp drops the ssh-only flags" {
     const t = std.testing;
     const plan = try Plan.init("work-alias", .tor, socks5_client.DEFAULT_ENDPOINT);
-    var args = try plan.args(false);
+    var args = try plan.args(.{});
 
-    var argv: [40:null]?[*:0]const u8 = .{null} ** 40;
+    var argv: [48:null]?[*:0]const u8 = .{null} ** 48;
     var count: usize = 0;
     try args.append(&argv, &count);
 
     var slices: std.ArrayList([]const u8) = .empty;
     defer slices.deinit(t.allocator);
-    try args.appendSlices(t.allocator, &slices, true);
+    try args.appendSlices(t.allocator, &slices);
     defer for (slices.items) |item| t.allocator.free(item);
 
     // One definition, two shapes: they must not drift.
@@ -423,18 +525,95 @@ test "the slice form carries the same route options minus the ssh-only flags" {
     for (argv[0..count], slices.items) |a, b| try t.expectEqualStrings(std.mem.span(a.?), b);
 
     // scp form: `-T` there means "no strict filename checking", so the
-    // ssh-only flags are dropped and every `-o` option is kept.
+    // ssh-only flag is dropped and every `-o` option is kept.
+    var scp_args = try plan.args(.{ .tool = .scp });
     var scp: std.ArrayList([]const u8) = .empty;
     defer scp.deinit(t.allocator);
-    try args.appendSlices(t.allocator, &scp, false);
+    try scp_args.appendSlices(t.allocator, &scp);
     defer for (scp.items) |item| t.allocator.free(item);
-    try t.expectEqual(slices.items.len - 2, scp.items.len);
+    try t.expectEqual(slices.items.len - 1, scp.items.len);
     for (scp.items) |item| try t.expect(!std.mem.eql(u8, item, "-T") and !std.mem.eql(u8, item, "-x"));
     var proxies: usize = 0;
     for (scp.items) |item| if (std.mem.startsWith(u8, item, "ProxyCommand=")) {
         proxies += 1;
     };
     try t.expectEqual(@as(usize, 1), proxies);
+}
+
+fn joinedOptions(a: std.mem.Allocator, args: *const Args) ![]const u8 {
+    var buf: [Args.MAX_OPTIONS][:0]const u8 = undefined;
+    const n = args.options(&buf);
+    var out: std.ArrayList(u8) = .empty;
+    for (buf[0..n]) |o| {
+        try out.appendSlice(a, o);
+        try out.append(a, ' ');
+    }
+    return out.items;
+}
+
+test "every leg disables X11 and keeps its own differences explicit" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const legs = [_]Leg{
+        .{},
+        .{ .tool = .scp },
+        .{ .tty = .force, .batch = false, .keepalive = true, .clear_forwardings = false, .multiplex = true },
+        .{ .forward = true, .keepalive = true, .clear_forwardings = false },
+        .{ .multiplex = true },
+    };
+    for ([_]Route{ .direct, .tor }) |route| for (legs) |leg| {
+        const plan = try Plan.init("box", route, socks5_client.DEFAULT_ENDPOINT);
+        var args = try plan.args(leg);
+        const text = try joinedOptions(a, &args);
+        try t.expect(std.mem.indexOf(u8, text, "-o ForwardX11=no ") != null);
+        try t.expectEqual(leg.batch, std.mem.indexOf(u8, text, "BatchMode=yes") != null);
+        try t.expectEqual(leg.keepalive, std.mem.indexOf(u8, text, "ServerAliveInterval=15") != null);
+        try t.expectEqual(leg.clear_forwardings, std.mem.indexOf(u8, text, "ClearAllForwardings=yes") != null);
+        try t.expectEqual(leg.forward, std.mem.startsWith(u8, text, "-N "));
+        if (leg.tool == .ssh) try t.expect(std.mem.indexOf(u8, text, if (leg.tty == .force) "-tt " else "-T ") != null);
+        // Tor never rides a direct master, whatever the leg asks.
+        if (route == .tor) try t.expect(std.mem.indexOf(u8, text, "ControlMaster=auto") == null);
+    };
+}
+
+test "multiplexing uses sketerm's own ControlPath under the control dir" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    if (c.getenv("SKETERM_SSH") != null) return error.SkipZigTest;
+    var tmpl = "/tmp/skcd-XXXXXX".*;
+    const dir_ptr = c.mkdtemp(&tmpl) orelse return error.SkipZigTest;
+    const dir = std.mem.span(@as([*:0]u8, @ptrCast(dir_ptr)));
+    defer _ = c.rmdir(dir_ptr);
+    const old = c.getenv(CONTROL_DIR_ENV);
+    _ = c.setenv(CONTROL_DIR_ENV, dir_ptr, 1);
+    defer if (old) |o| {
+        _ = c.setenv(CONTROL_DIR_ENV, o, 1);
+    } else {
+        _ = c.unsetenv(CONTROL_DIR_ENV);
+    };
+    const plan = try Plan.init("box", .direct, socks5_client.DEFAULT_ENDPOINT);
+    var args = try plan.args(.{ .multiplex = true });
+    try t.expect(args.multiplexes());
+    const text = try joinedOptions(a, &args);
+    try t.expect(std.mem.indexOf(u8, text, try std.fmt.allocPrint(a, "ControlPath={s}/sketerm-%C ", .{dir})) != null);
+    try t.expect(std.mem.indexOf(u8, text, "ControlMaster=auto") != null);
+    // A leg that does not ask stays off sketerm's master.
+    var plain = try plan.args(.{});
+    try t.expect(!plain.multiplexes());
+    try t.expect(std.mem.indexOf(u8, try joinedOptions(a, &plain), "ControlPath") == null);
+}
+
+test "MCP host specs map onto one plan: tor: forced, ssh: and bare direct, udp: refused" {
+    const t = std.testing;
+    try t.expectEqual(Route.tor, (try Plan.fromSpec("tor:box", DEFAULT_ENDPOINT_FOR_TEST)).route);
+    try t.expectEqualStrings("box", (try Plan.fromSpec("ssh:box", DEFAULT_ENDPOINT_FOR_TEST)).destination);
+    try t.expectEqual(Route.direct, (try Plan.fromSpec("me@box", DEFAULT_ENDPOINT_FOR_TEST)).route);
+    try t.expectError(error.BadDestination, Plan.fromSpec("udp:box", DEFAULT_ENDPOINT_FOR_TEST));
+    try t.expectError(error.BadDestination, Plan.fromSpec("box name", DEFAULT_ENDPOINT_FOR_TEST));
 }
 
 test "route specs round-trip through their one canonical text" {

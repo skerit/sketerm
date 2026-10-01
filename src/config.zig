@@ -899,6 +899,11 @@ pub const Config = struct {
     /// Numeric SOCKS5 endpoint used by forced `tor:` mux routes. Numeric-only
     /// ensures resolving the proxy itself can never leak through local DNS.
     mux_tor_socks_endpoint: []const u8 = socks5_client.DEFAULT_ENDPOINT,
+    /// The oldest login (seconds) sketerm's own SSH ControlMaster may carry
+    /// into a NEW connection; an older master is stopped first so the new
+    /// connection logs in afresh (new group list, new environment). Its open
+    /// sessions keep running. 0 = never stop one.
+    mux_ssh_master_max_age_secs: u32 = 3600,
     /// Smart copy: when no selection is active, Ctrl+Shift+C
     /// forwards as Ctrl+C (interrupt) instead of being a no-op.
     smart_copy: bool = true,
@@ -1428,6 +1433,7 @@ pub const Config = struct {
         return .{
             .udp_port_range = self.udpRange(),
             .tor_socks_endpoint = self.mux_tor_socks_endpoint,
+            .ssh_master = .{ .max_age_s = self.mux_ssh_master_max_age_secs },
         };
     }
 
@@ -2612,6 +2618,7 @@ pub const keys = [_]Key{
     .{ .name = "gpu_apps", .codec = .string },
     .{ .name = "mux_udp_port_range", .codec = .{ .validated = .{ .check = checkUdpPortRange, .sample = "60000:61000" } } },
     .{ .name = "mux_tor_socks_endpoint", .codec = .{ .validated = .{ .check = checkTorSocksEndpoint, .sample = "127.0.0.1:9150" } } },
+    .{ .name = "mux_ssh_master_max_age_secs", .codec = .{ .int = .{ .min = 0, .max = 30 * 24 * 3600 } } },
     // File browser.
     .{ .name = "files_default_view", .codec = .{ .enum_ = .{} } },
     .{ .name = "files_show_hidden", .codec = .bool },

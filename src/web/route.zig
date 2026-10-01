@@ -326,14 +326,10 @@ pub const Choice = enum(u8) {
 /// shape where no real endpoint applies (`validText`).
 const SHAPE_CHECK_ENDPOINT = "127.0.0.1:9050";
 
-/// A mux host spec (`user@box`, `ssh:box`, ...): non-empty, bounded,
-/// and never containing whitespace, a slash or a control byte.
+/// A mux host spec (`user@box`, `ssh:box`, ...): `sshroute.validDestination`,
+/// the one destination rule, so a route this accepts is one ssh can dial.
 fn validHost(host: []const u8) bool {
-    if (host.len == 0 or host.len > MAX_HOST) return false;
-    for (host) |ch| {
-        if (ch <= ' ' or ch == '/' or ch == 0x7f) return false;
-    }
-    return true;
+    return host.len <= MAX_HOST and @import("../mux/sshroute.zig").validDestination(host);
 }
 
 /// `host:port` with a numeric-or-name host and a nonzero port. Bracketed

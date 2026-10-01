@@ -1207,19 +1207,15 @@ fn block(res: *Res, b: Block) !void {
 
 // ── agent_adapters ───────────────────────────────────────────────
 
-/// An SSH destination as a caller may name it: no option-looking or
-/// blank-carrying string ever reaches an ssh argv.
-fn validHost(h: []const u8) bool {
-    if (h.len == 0 or h.len > 255 or h[0] == '-') return false;
-    for (h) |b| if (b <= 0x20 or b == 0x7f) return false;
-    return true;
-}
+/// The one host rule of every ssh leg (`sshroute.validDestination`), so an
+/// agent's host is also one its watch route can carry.
+const validHost = mcp_term.validHostSpec;
 
-const BAD_HOST = "host must be an SSH destination (user@box or an ssh config alias)";
+const BAD_HOST = mcp_term.BAD_HOST;
 
 /// Resolve executables on `host` in one ssh round trip (`launch.probeScript`).
-fn probeRemote(arena: std.mem.Allocator, host: []const u8, lookups: []const launch.Lookup, dir: ?[]const u8) !union(enum) { ok: launch.ProbeResult, fail: Fail } {
-    const script = try launch.probeScript(arena, lookups, dir);
+fn probeRemote(arena: std.mem.Allocator, host: []const u8, lookups: []const launch.Lookup, opts: launch.ProbeOpts) !union(enum) { ok: launch.ProbeResult, fail: Fail } {
+    const script = try launch.probeScript(arena, lookups, opts);
     const argv = mcp_term.remoteShArgv(arena, host, script) catch
         return .{ .fail = .{ .code = .refused, .msg = "cannot build the forced route for this host" } };
     switch (try mcp_term.runArgvTerm(arena, argv, PROBE_WAIT_MS)) {
@@ -1244,7 +1240,7 @@ fn adaptersTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
         if (!validHost(h)) return errRes(arena, .invalid_args, BAD_HOST);
         const lookups = try arena.alloc(launch.Lookup, set.items.items.len);
         for (set.items.items, lookups) |l, *out| out.* = .{ .launch = l.spec.launch };
-        switch (try probeRemote(arena, h, lookups, null)) {
+        switch (try probeRemote(arena, h, lookups, .{})) {
             .fail => |f| return errRes(arena, f.code, f.msg),
             .ok => |r| remote = r,
         }
@@ -1369,6 +1365,23 @@ fn extraOpts(arena: std.mem.Allocator, args: std.json.Value, loaded: *const adap
         }
         x.env = out;
     };
+    if (mcp.argValue(args, "path_prepend")) |v| if (v != .null) {
+        if (v != .array) {
+            why.* = .{ .code = .invalid_args, .msg = "path_prepend must be an array of absolute directories" };
+            return error.Refused;
+        }
+        const out = try arena.alloc([]const u8, v.array.items.len);
+        for (v.array.items, out) |item, *o| {
+            if (item != .string) {
+                why.* = .{ .code = .invalid_args, .msg = "path_prepend must be an array of absolute directories" };
+                return error.Refused;
+            }
+            o.* = item.string;
+        }
+        x.path_prepend = out;
+    };
+    // Default true: only an explicit false opts out.
+    x.login_shell = if (mcp.argValue(args, "login_shell")) |v| !(v == .bool and !v.bool) else true;
     if (try launch.checkExtra(arena, loaded.spec.launch, x)) |msg| {
         why.* = .{ .code = .invalid_args, .msg = msg };
         return error.Refused;
@@ -1483,18 +1496,35 @@ fn openTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
         else => return err,
     };
     const name = o.override orelse loaded.spec.launch.binary;
+    var facts: LaunchFacts = .{};
+    // Before the first connection: which login the agent's legs ride, and a
+    // fresh one when sketerm's master is too old or the caller asks.
+    if (o.host) |h| facts.master = try mcp_term.sshMasterCheck(arena, h, mcp_term.legs.script, argBool(args, "fresh_login"));
     const binary = if (o.host) |h| blk: {
-        // One probe on the host: the binary from the adapter's candidates
-        // (an ssh login's PATH lacks ~/.local/bin), the dir, the home.
-        const r = switch (try probeRemote(arena, h, &.{.{ .launch = loaded.spec.launch, .override = o.override }}, o.cwd)) {
+        // One probe on the host, in its login environment: the binary from
+        // the adapter's candidates, its version, the dir, the home.
+        const r = switch (try probeRemote(arena, h, &.{.{ .launch = loaded.spec.launch, .override = o.override, .version = true }}, .{
+            .dir = o.cwd,
+            .login = o.extra.login_shell,
+            .path_prepend = o.extra.path_prepend,
+        })) {
             .fail => |f| return errRes(arena, f.code, f.msg),
             .ok => |r| r,
         };
         if (r.dir_ok) |ok| if (!ok) return errRes(arena, .invalid_args, try std.fmt.allocPrint(arena, "cwd {s} is not a directory on {s}", .{ o.cwd.?, h }));
         if (o.cwd == null) o.cwd = r.home orelse "/";
-        break :blk r.binaries[0] orelse return errRes(arena, .unavailable, try std.fmt.allocPrint(arena, "cannot find {s} on {s} (looked in: {s}); pass 'binary' with its name or absolute path there", .{ name, h, try candidateList(arena, loaded) }));
-    } else (try launch.resolve(arena, loaded.spec.launch, o.override, localHost())) orelse
-        return errRes(arena, .unavailable, try std.fmt.allocPrint(arena, "cannot find {s} on this machine (looked in: {s}); pass 'binary' with its name or absolute path", .{ name, try candidateList(arena, loaded) }));
+        facts.version = r.versions[0];
+        facts.login = r.login;
+        facts.shell = r.shell;
+        break :blk r.binaries[0] orelse return errRes(arena, .unavailable, try std.fmt.allocPrint(arena, "cannot find {s} on {s} (looked in: {s}{s}); pass 'binary' with its name or absolute path there", .{ name, h, try candidateList(arena, loaded), if (r.login == false and o.extra.login_shell) ", the login shell did not answer in time" else "" }));
+    } else blk: {
+        var here = localHost();
+        here.path = try launch.prependPath(arena, o.extra.path_prepend, here.path);
+        const found = (try launch.resolve(arena, loaded.spec.launch, o.override, here)) orelse
+            return errRes(arena, .unavailable, try std.fmt.allocPrint(arena, "cannot find {s} on this machine (looked in: {s}); pass 'binary' with its name or absolute path", .{ name, try candidateList(arena, loaded) }));
+        facts.version = try localVersion(arena, loaded.spec.launch, found);
+        break :blk found;
+    };
 
     var where = Where{ .host = o.host, .cols = o.cols, .rows = o.rows };
     const e = (switch (loaded.spec.source) {
@@ -1544,11 +1574,44 @@ fn openTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
             dv = try pending(arena, e);
         }
     } else dv = try pending(arena, e);
-    return openResult(arena, e, ready, sent, notes.items, dv, filter);
+    return openResult(arena, e, ready, sent, notes.items, dv, filter, &facts);
+}
+
+/// What agent_open learned about the launch besides the entry itself.
+const LaunchFacts = struct {
+    /// The first line the binary's `version_args` printed.
+    version: ?[]const u8 = null,
+    /// Remote: whether the probe ran in the login environment.
+    login: ?bool = null,
+    shell: ?[]const u8 = null,
+    master: ?@import("../mux/sshmaster.zig").Report = null,
+};
+
+/// How long a local `version_args` run may take.
+const VERSION_WAIT_MS: i64 = 10_000;
+
+/// The first non-empty line `binary` prints for the adapter's
+/// `version_args`, run like the app (the `unset_env` wrapper applied).
+fn localVersion(arena: std.mem.Allocator, l: adapter.Launch, binary: []const u8) !?[]const u8 {
+    if (l.version_args.len == 0 or state.mux_sock == null) return null;
+    const head = [_][]const u8{binary};
+    const argv = try launch.withUnsetEnv(arena, l.unset_env, &.{}, try std.mem.concat(arena, []const u8, &.{ &head, l.version_args }));
+    switch (try mcp_term.runArgvTerm(arena, argv, VERSION_WAIT_MS)) {
+        .err => return null,
+        .run => |r| {
+            if (!r.exited) return null;
+            var lines = std.mem.splitScalar(u8, r.output, '\n');
+            while (lines.next()) |line| {
+                const v = std.mem.trim(u8, line, " \r\t");
+                if (v.len > 0) return v;
+            }
+            return null;
+        },
+    }
 }
 
 /// agent_open's result: the launch facts, then every per-agent fact.
-fn openResult(arena: std.mem.Allocator, e: *Entry, ready: bool, sent: bool, notes: []const []const u8, dv: Delivered, filter: events.Filter) ![]const u8 {
+fn openResult(arena: std.mem.Allocator, e: *Entry, ready: bool, sent: bool, notes: []const []const u8, dv: Delivered, filter: events.Filter, lf: *const LaunchFacts) ![]const u8 {
     var res = Res.init(arena);
     if (e.host) |h|
         try res.textf("opened {s} ({s}) on {s} over {s} in session {s}", .{ e.id, e.loaded.spec.name, h, @tagName(e.transport), e.session })
@@ -1557,6 +1620,16 @@ fn openResult(arena: std.mem.Allocator, e: *Entry, ready: bool, sent: bool, note
     if (!ready) try res.textf("not ready yet (state {s}); agent_send waits for it", .{@tagName(e.agent.state())});
     if (notes.len > 0) try res.textf("{d} note(s) below", .{notes.len});
     try res.fact("binary", e.binary);
+    try res.fact("binary_version", lf.version);
+    try res.textf("binary: {s}{s}{s}", .{ e.binary, if (lf.version != null) ", " else "", lf.version orelse "" });
+    try res.fact("path_prepend", e.extra.path_prepend);
+    if (e.host != null) {
+        try res.fact("login_shell", lf.login orelse false);
+        try res.fact("login_shell_path", lf.shell);
+        if (e.extra.login_shell and lf.login == false)
+            try res.textf("the login shell ({s}) did not answer in time: the binary was looked up in the plain ssh environment", .{lf.shell orelse "?"});
+    }
+    if (lf.master) |*m| try mcp_term.masterFacts(&res, m);
     try res.fact("cwd", e.cwd);
     // The values of `env` are never echoed: only what was set.
     const env_names = try e.extra.names(arena);
@@ -1656,9 +1729,9 @@ const SpawnSpec = struct {
     /// Remote starts: the variable to read off the terminal (then the
     /// caller types its value at `launch.SECRET_PROMPT`).
     secret_env: ?[]const u8 = null,
-    /// The caller's `env`, on every transport: the spawn request's
-    /// environment, or exported by a plain-ssh start's script.
-    extra_env: []const launch.EnvVar = &.{},
+    /// The caller's `env` (the spawn request's environment, or exported by
+    /// a plain-ssh start's script), `path_prepend` and `login_shell`.
+    extra: launch.Extra = .{},
 };
 
 /// Start `argv` on the agent's host as session `spec.name`. A remote
@@ -1668,12 +1741,19 @@ const SpawnSpec = struct {
 /// the outcome in `where`.
 fn spawnOn(arena: std.mem.Allocator, where: *Where, choice: transport_mod.Choice, argv: []const []const u8, spec: SpawnSpec, why: *Fail) !*termdrive.Term {
     const a = state.allocator;
-    const extra_kv = try (launch.Extra{ .env = spec.extra_env }).assignments(arena);
+    const extra_kv = try (launch.Extra{ .env = spec.extra.env }).assignments(arena);
+    const login = spec.extra.login_shell;
     const host = where.host orelse {
         if (!try fitsExec(arena, argv, why)) return error.Refused;
+        // The private daemon inherited this server's PATH.
+        const path_kv: []const []const u8 = if (spec.extra.path_prepend.len == 0) &.{} else blk: {
+            const one = try arena.alloc([]const u8, 1);
+            one[0] = try std.fmt.allocPrint(arena, "PATH={s}", .{try launch.prependPath(arena, spec.extra.path_prepend, localHost().path)});
+            break :blk one;
+        };
         return termdrive.Term.spawnWith(a, argv, where.cols, where.rows, state.mux_sock, .{
             .name = spec.name,
-            .env = try std.mem.concat(arena, []const u8, &.{ spec.env, extra_kv }),
+            .env = try std.mem.concat(arena, []const u8, &.{ spec.env, extra_kv, path_kv }),
             .cwd = spec.cwd,
             .shell_integration = false,
         }) catch {
@@ -1683,12 +1763,29 @@ fn spawnOn(arena: std.mem.Allocator, where: *Where, choice: transport_mod.Choice
     };
     const undecided = where.transport == .local;
     if ((undecided and choice != .ssh) or where.transport == .@"sketerm-mux") mux: {
-        const margv: []const []const u8 = if (spec.secret_env) |v|
-            try arena.dupe([]const u8, &.{ "/bin/sh", "-c", try launch.remoteScript(arena, argv, .{ .secret_env = v }) })
+        // The child inherits the remote DAEMON's environment: the login
+        // shell's is put back in, and the caller's env values ride the
+        // spawn under the relay prefix so no profile overrides them.
+        const relay = login and spec.extra.env.len > 0;
+        const needs_script = spec.secret_env != null or login or spec.extra.path_prepend.len > 0;
+        const margv: []const []const u8 = if (needs_script)
+            try arena.dupe([]const u8, &.{ "/bin/sh", "-c", try launch.remoteScript(arena, argv, .{
+                .secret_env = spec.secret_env,
+                // A profile may change directory; the spawn's cwd comes first.
+                .cwd = if (login) spec.cwd else null,
+                .login = login,
+                .path_prepend = spec.extra.path_prepend,
+                .env_relay = if (relay) try spec.extra.names(arena) else &.{},
+            }) })
         else
             argv;
         if (!try fitsExec(arena, margv, why)) return error.Refused;
-        const t = termdrive.Term.spawnRemoteMux(a, host, margv, where.cols, where.rows, .{ .name = spec.name, .cwd = spec.cwd, .env = extra_kv }) catch {
+        const spawn_env = if (relay) blk: {
+            const out = try arena.alloc([]const u8, spec.extra.env.len);
+            for (spec.extra.env, out) |v, *o| o.* = try std.fmt.allocPrint(arena, launch.ENV_RELAY_PREFIX ++ "{s}={s}", .{ v.name, v.value });
+            break :blk out;
+        } else extra_kv;
+        const t = termdrive.Term.spawnRemoteMux(a, host, margv, where.cols, where.rows, .{ .name = spec.name, .cwd = spec.cwd, .env = spawn_env }) catch {
             if (!undecided or choice == .mux) {
                 why.* = .{ .code = .unavailable, .msg = mcp_term.NO_REMOTE_MUX };
                 return error.Refused;
@@ -1703,7 +1800,14 @@ fn spawnOn(arena: std.mem.Allocator, where: *Where, choice: transport_mod.Choice
     // caller's env does: it is documented as no place for secrets).
     const nonce = try randomHex(arena, 6);
     const file = try std.fmt.allocPrint(arena, "/tmp/.sk_ssh_{s}", .{nonce});
-    const script = try launch.remoteScript(arena, argv, .{ .cleanup = file, .cwd = spec.cwd, .secret_env = spec.secret_env, .env = spec.extra_env });
+    const script = try launch.remoteScript(arena, argv, .{
+        .cleanup = file,
+        .cwd = spec.cwd,
+        .secret_env = spec.secret_env,
+        .env = spec.extra.env,
+        .login = login,
+        .path_prepend = spec.extra.path_prepend,
+    });
     var sargv: std.ArrayList([]const u8) = .empty;
     mcp_term.appendSshTt(arena, &sargv, host) catch {
         why.* = .{ .code = .refused, .msg = "cannot build the forced route for this host" };
@@ -1779,7 +1883,7 @@ fn spawnScreen(arena: std.mem.Allocator, loaded: *const adapter.Loaded, binary: 
         .cwd = o.cwd,
         .session = conversation,
     }, .{ .main = if (o.resume_id != null) .resumed else .fresh });
-    const t = try spawnOn(arena, where, o.choice, argv, .{ .name = session, .cwd = o.cwd.?, .extra_env = o.extra.env }, why);
+    const t = try spawnOn(arena, where, o.choice, argv, .{ .name = session, .cwd = o.cwd.?, .extra = o.extra }, why);
     errdefer t.deinit();
     const e = try newEntry(loaded, id, session, binary, o.cwd.?);
     errdefer dropBare(e);
@@ -1863,7 +1967,7 @@ fn spawnApi(arena: std.mem.Allocator, loaded: *const adapter.Loaded, binary: []c
         .model = o.model,
         .effort = o.effort,
     }, .{ .main = .fresh });
-    const server = try spawnOn(arena, where, o.choice, server_argv, .{ .name = server_session, .cwd = cwd, .env = env, .secret_env = secret_env, .extra_env = o.extra.env }, why);
+    const server = try spawnOn(arena, where, o.choice, server_argv, .{ .name = server_session, .cwd = cwd, .env = env, .secret_env = secret_env, .extra = o.extra }, why);
     errdefer server.deinit();
     if (secret_env != null) try typeSecret(arena, server, password, deadline, what, why);
 
@@ -1905,7 +2009,7 @@ fn spawnApi(arena: std.mem.Allocator, loaded: *const adapter.Loaded, binary: []c
         .cwd = cwd,
         .session = sid,
     }, .attach);
-    const tui: ?*termdrive.Term = if (spec.launch.attach_args.len == 0) null else try spawnOn(arena, where, o.choice, tui_argv, .{ .name = session, .cwd = cwd, .env = env, .secret_env = secret_env, .extra_env = o.extra.env }, why);
+    const tui: ?*termdrive.Term = if (spec.launch.attach_args.len == 0) null else try spawnOn(arena, where, o.choice, tui_argv, .{ .name = session, .cwd = cwd, .env = env, .secret_env = secret_env, .extra = o.extra }, why);
     errdefer if (tui) |t| t.deinit();
     if (tui) |t| if (secret_env != null) try typeSecret(arena, t, password, deadline, "the attached client", why);
 
@@ -2296,7 +2400,7 @@ fn restartOf(arena: std.mem.Allocator, e: *const Entry, model: ?[]const u8, effo
             .cwd = e.cwd,
             .session = conversation,
         }, .{ .main = start }),
-        .spec = .{ .name = e.session, .cwd = e.cwd, .extra_env = e.extra.env },
+        .spec = .{ .name = e.session, .cwd = e.cwd, .extra = e.extra },
     };
 }
 
@@ -2821,6 +2925,9 @@ const Descriptor = struct {
     /// agent_open's `args`/`env` (absent in older descriptors: none).
     args: []const []const u8 = &.{},
     env: []const launch.EnvVar = &.{},
+    /// agent_open's `path_prepend`/`login_shell` (absent: none / login).
+    path_prepend: []const []const u8 = &.{},
+    login_shell: bool = true,
     /// `Entry.started_ms` (absent in older descriptors: the reattach's).
     started_ms: i64 = 0,
 };
@@ -2874,6 +2981,8 @@ fn writeDescriptor(e: *Entry) void {
         .rows = e.rows,
         .args = e.extra.args,
         .env = e.extra.env,
+        .path_prepend = e.extra.path_prepend,
+        .login_shell = e.extra.login_shell,
         .started_ms = e.started_ms,
     };
     const path = descriptorPath(arena, e.id, "json") catch return;
@@ -2942,8 +3051,9 @@ fn publishAgents() void {
         sessions.append(arena, e.session) catch return;
         if (e.server_session) |s| sessions.append(arena, s) catch return;
         // The term's own fact: it runs on a host's daemon or on ours.
+        // `ssh:box` is reached at `box`; a route hop takes the bare destination.
         const where: sshroute.Location = if (e.visibleTerm() orelse e.server) |t|
-            (if (t.remote_host) |h| .{ .host = h } else .instance)
+            (if (t.remote_host) |h| .{ .host = if (sshroute.RemoteSpec.parse(h).mode == .ssh) sshroute.RemoteSpec.parse(h).host else h } else .instance)
         else
             .instance;
         var buf: [300]u8 = undefined;
@@ -3004,7 +3114,7 @@ fn reattachOne(d: Descriptor) !void {
     const loaded = (try adapters()).get(d.app) orelse return error.UnknownAdapter;
     const transport: Transport = if (d.transport) |s| std.meta.stringToEnum(Transport, s) orelse return error.BadDescriptor else .local;
     if (transport != .local and d.host == null) return error.BadDescriptor;
-    const extra = launch.Extra{ .args = d.args, .env = d.env };
+    const extra = launch.Extra{ .args = d.args, .env = d.env, .path_prepend = d.path_prepend, .login_shell = d.login_shell };
     {
         var arena_state = std.heap.ArenaAllocator.init(a);
         defer arena_state.deinit();
@@ -3353,8 +3463,8 @@ test "a relaunch and a durable descriptor keep the caller's args and env" {
     try testing.expectEqual(want.len, r.argv.len - 4);
     for (want, r.argv[4..]) |w, g| try testing.expectEqualStrings(w, g);
     try testing.expect(std.mem.indexOf(u8, r.argv[2], "case \"$n\" in CLAUDE_CAPTURE_PROFILE|") != null);
-    try testing.expectEqual(@as(usize, 1), r.spec.extra_env.len);
-    try testing.expectEqualStrings("w o'rk $x", r.spec.extra_env[0].value);
+    try testing.expectEqual(@as(usize, 1), r.spec.extra.env.len);
+    try testing.expectEqualStrings("w o'rk $x", r.spec.extra.env[0].value);
     try testing.expectEqualStrings("agent-claude-1", r.spec.name);
 
     // The descriptor carries them through a restart of this server, byte
@@ -3952,8 +4062,23 @@ test "every agent tool answers in its declared shape: a scripted Claude Code on 
     // agent_open's own facts around the same per-agent ones.
     const e = state.entries.items[0];
     const dv = try combine(a, null, null, true, true);
-    const opened = try shaped(a, "agent_open", try openResult(a, e, true, false, &.{"a note"}, dv, .{ .match = "x" }));
+    const opened = try shaped(a, "agent_open", try openResult(a, e, true, false, &.{"a note"}, dv, .{ .match = "x" }, &.{ .version = "9.9 (x)" }));
     try testing.expect(!opened.get("prompt_sent").?.bool);
+    try testing.expectEqualStrings("9.9 (x)", opened.get("binary_version").?.string);
+    try testing.expectEqual(@as(usize, 0), opened.get("path_prepend").?.array.items.len);
+    // A remote launch's login and ControlMaster facts match the schema too.
+    var m: @import("../mux/sshmaster.zig").Report = .{ .kind = .sketerm, .reused = true, .age_s = 42 };
+    @memcpy(m.path_buf[0..9], "/x/sk-abc");
+    m.path_len = 9;
+    // Borrowed for this one result; agent_close below frees the entry.
+    const was_host = e.host;
+    e.host = @constCast("box");
+    const remote_out = openResult(a, e, true, false, &.{}, dv, .{}, &.{ .login = true, .shell = "/bin/bash", .master = m });
+    e.host = was_host;
+    const remote = try shaped(a, "agent_open", try remote_out);
+    try testing.expect(remote.get("login_shell").?.bool);
+    try testing.expectEqual(@as(i64, 42), remote.get("ssh_master_age_s").?.integer);
+    try testing.expectEqualStrings("sketerm", remote.get("ssh_master").?.string);
     try testing.expect(std.mem.indexOf(u8, opened.get("watch_command").?.string, "--match x") != null);
 
     const closed = try shaped(a, "agent_close", try rig.call(.agent_close, "{}"));

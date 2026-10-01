@@ -118,9 +118,7 @@ pub fn prepare(allocator: std.mem.Allocator, plan: *const sshroute.Plan) ?Prepar
         ) catch return null;
         return .{ .allocator = allocator, .path = remote_path };
     }
-    const ssh_env = c.getenv("SKETERM_SSH");
-    const ssh_bin: [*:0]const u8 = if (ssh_env) |p| p else "ssh";
-    const prepared = ensureUsing(allocator, plan, ssh_bin, artifact, .{ .run = runSshCommand });
+    const prepared = ensureUsing(allocator, plan, sshroute.sshBinary(), artifact, .{ .run = runSshCommand });
     if (prepared != null) deployMemoStamp(plan, &artifact.hash.hex);
     return prepared;
 }
@@ -149,16 +147,6 @@ pub fn localPath(allocator: std.mem.Allocator) ?Prepared {
         0,
     ) catch return null;
     return .{ .allocator = allocator, .path = remote_path };
-}
-
-/// ControlPath uses ~/.ssh, so only request multiplexing when it exists.
-pub fn canMultiplex() bool {
-    const home_raw = c.getenv("HOME") orelse return false;
-    const home = std.mem.span(@as([*:0]const u8, @ptrCast(home_raw)));
-    var path_buf: [4096:0]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "{s}/.ssh", .{home}) catch return false;
-    var st: c.struct_stat = undefined;
-    return c.stat(path.ptr, &st) == 0 and (st.st_mode & c.S_IFMT) == c.S_IFDIR;
 }
 
 fn findPortable(buf: *[4096:0]u8) ?[:0]const u8 {
@@ -345,7 +333,7 @@ fn runSshCommand(_: ?*anyopaque, plan: *const sshroute.Plan, ssh_bin: [*:0]const
     // process is still feeding the upload on stdin. The mux channel then
     // stops draining after its window fills, poisoning later proxy dials.
     // Deployment is infrequent and correctness matters more than reuse.
-    var route_args = plan.args(false) catch return 255;
+    var route_args = plan.args(.{ .multiplex = false }) catch return 255;
     var pair: [2]c_int = undefined;
     if (platform.socketpairCloexec(&pair) != 0) return 255;
     const devnull = c.open("/dev/null", c.O_WRONLY | c.O_CLOEXEC);
@@ -354,7 +342,7 @@ fn runSshCommand(_: ?*anyopaque, plan: *const sshroute.Plan, ssh_bin: [*:0]const
         _ = c.close(pair[1]);
         return 255;
     }
-    var argv: [32:null]?[*:0]const u8 = .{null} ** 32;
+    var argv: [sshroute.Args.MAX_OPTIONS + 8:null]?[*:0]const u8 = .{null} ** (sshroute.Args.MAX_OPTIONS + 8);
     var n: usize = 0;
     argv[n] = ssh_bin;
     n += 1;

@@ -343,6 +343,13 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
 
     try res.fact("ssh", findExecutable(arena, "ssh") != null);
     try res.fact("scp", findExecutable(arena, "scp") != null);
+    {
+        var cfg = @import("../config.zig").Config.load(arena);
+        defer cfg.deinit();
+        try res.fact("ssh_master_max_age_s", cfg.mux_ssh_master_max_age_secs);
+    }
+    try res.fact("ssh_no_x11", true);
+    try res.fact("scp_put_targets", @as(u32, mcp_term.MAX_TARGETS));
     try res.fact("mux_tor", true);
     try res.text("mux Tor transport: supported via tor:<ssh-alias>; forced SOCKS5 remote DNS, with no UDP or direct fallback");
     if (mcp_term.rec_state.enabled) {
@@ -434,6 +441,7 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
         try res.fact("agent_ssh", agent_ssh);
         try res.fact("agent_open_args_env", agents_ok);
         try res.fact("agent_open_resume", agents_ok);
+        try res.fact("agent_login_shell", agent_ssh);
         const ids: []const []const u8 = if (agents_ok) mcp_agent.adapterIds(arena) catch &.{} else &.{};
         try res.fact("agent_adapters", ids);
         if (agents_ok) {

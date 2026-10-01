@@ -79,6 +79,9 @@ pub const Launch = struct {
     /// API sources: arguments of a second, visible process the human
     /// watches (opencode's TUI attached to the server); empty for none.
     attach_args: []const []const u8 = &.{},
+    /// Arguments that make the binary print its version, whose first line
+    /// is reported with the resolved path; empty = not asked.
+    version_args: []const []const u8 = &.{},
 };
 
 pub const TurnEnd = enum {
