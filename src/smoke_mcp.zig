@@ -25,6 +25,7 @@ const wlcomp = @import("wlhost/compositor.zig");
 const wlpipe = @import("wlhost/pipe.zig");
 const platform = @import("util/platform.zig");
 const testserver = @import("agent/testserver.zig");
+const readfile = @import("util/readfile.zig");
 const SpinLock = @import("util/spinlock.zig").SpinLock;
 
 fn say(msg: []const u8) void {
@@ -576,7 +577,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // a fake `opencode serve`, as `<bin> attach` opencode's attached TUI.
     if (c.getenv(FAKE_AGENT_ENV) != null and init.args.vector.len >= 2) {
         const mode = std.mem.span(init.args.vector[1]);
-        if (std.mem.eql(u8, mode, "--ax-screen-reader")) return fakeClaude(allocator);
+        if (std.mem.eql(u8, mode, "--ax-screen-reader")) return fakeClaude(allocator, init.args.vector[1..]);
         if (std.mem.eql(u8, mode, "serve")) return fakeOpencodeServe(allocator, init.args.vector[1..]);
         if (std.mem.eql(u8, mode, "attach")) return fakeOpencodeAttach(init.args.vector[1..]);
     }
@@ -706,6 +707,15 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         defer _ = c.unsetenv("SKETERM_WEB_BIN");
         webPresenterStage(allocator, exe, rt);
         say("smoke-mcp: focused watch-along presenter stage ok");
+        return 0;
+    }
+    if (c.getenv("SKETERM_SMOKE_MCP_AGENTSSH_ONLY") != null) {
+        agentSshStage(allocator, exe, rt);
+        say("smoke-mcp: focused sub-agents over ssh stage ok");
+        killDaemonsUnderRt(rt, allocator);
+        _ = c.usleep(500_000);
+        g_rt = null;
+        pathz.removeTree(rt);
         return 0;
     }
     if (c.getenv("SKETERM_SMOKE_MCP_AGENT_ONLY") != null) {
@@ -2211,6 +2221,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // -- sub-agents: agent_* against a fake Claude Code and opencode ----
     agentStage(allocator, exe, rt);
     say("smoke-mcp: agent_* tools against fake Claude Code and opencode ok");
+    agentSshStage(allocator, exe, rt);
+    say("smoke-mcp: agent_* tools on an SSH host (both transports) ok");
 
     // -- app_* against a real GTK app on the private headless display --
     appToolsStage(allocator, exe, rt);
@@ -5445,8 +5457,39 @@ fn fakeSsh(args: []const [*:0]const u8) u8 {
     }
     line.append(std.heap.c_allocator, 0) catch return 255;
     const argv = [_:null]?[*:0]const u8{ "sh", "-c", @ptrCast(line.items.ptr) };
-    _ = c.execv("/bin/sh", @ptrCast(&argv));
-    return 127;
+    // The remote command runs in a child, so a dropped "connection"
+    // (SIGTERM to this ssh) ends it the way a real one does: the remote
+    // side goes, and ssh exits 255.
+    const child = c.fork();
+    if (child < 0) return 255;
+    if (child == 0) {
+        _ = c.execv("/bin/sh", @ptrCast(&argv));
+        c._exit(127);
+    }
+    // No SA_RESTART: waitpid must return EINTR when the drop arrives.
+    const act = std.posix.Sigaction{
+        .handler = .{ .handler = &fakeSshDropped },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.TERM, &act, null);
+    var status: c_int = 0;
+    while (c.waitpid(child, &status, 0) < 0) {
+        if (fake_ssh_dropped) {
+            _ = c.kill(child, c.SIGKILL);
+            _ = c.waitpid(child, null, 0);
+            return 255;
+        }
+    }
+    if (fake_ssh_dropped) return 255;
+    if ((status & 0x7f) == 0) return @intCast((status >> 8) & 0xff);
+    return 255;
+}
+
+var fake_ssh_dropped: bool = false;
+
+fn fakeSshDropped(_: @TypeOf(std.posix.SIG.TERM)) callconv(.c) void {
+    fake_ssh_dropped = true;
 }
 
 /// `[bind:]lport:host:rport`: listen on 127.0.0.1:lport and relay each
@@ -5799,12 +5842,48 @@ const FC_PERMISSION = FC_ERASE ++ "tool: Bash (rm notes.md)\r\nPermission Requir
 
 const FcStep = struct { at_ms: i64, bytes: []u8, picker: bool = false };
 
+/// Where the fake Claude Code keeps what a real one keeps in ~/.claude:
+/// one transcript per conversation id, every launch's argv, and a marker
+/// for anything that would have saved the user's defaults.
+const FC_DIR = ".fake-claude";
+const FC_LAUNCHES = "launches";
+const FC_SETTINGS_WRITTEN = "settings-written";
+
+/// `$HOME/.fake-claude/<name>`.
+fn fcPath(buf: []u8, name: []const u8) [:0]const u8 {
+    const home = if (c.getenv("HOME")) |h| std.mem.span(@as([*:0]const u8, @ptrCast(h))) else "/tmp";
+    return std.fmt.bufPrintZ(buf, "{s}/" ++ FC_DIR ++ "/{s}", .{ home, name }) catch "/tmp/.fake-claude-overflow";
+}
+
+fn fcAppend(name: []const u8, line: []const u8) void {
+    var buf: [1024]u8 = undefined;
+    const path = fcPath(&buf, name);
+    var dir_buf: [1024]u8 = undefined;
+    const dir = fcPath(&dir_buf, "");
+    _ = c.mkdir(dir.ptr, 0o700);
+    const f = c.fopen(path.ptr, "a") orelse return;
+    defer _ = c.fclose(f);
+    _ = c.fwrite(line.ptr, 1, line.len, f);
+    _ = c.fputc('\n', f);
+}
+
+/// The conversation file of the session id this launch names.
+fn fcConversation(buf: []u8, id: []const u8) [:0]const u8 {
+    var nbuf: [200]u8 = undefined;
+    const name = std.fmt.bufPrint(&nbuf, "conv-{s}", .{id}) catch "conv-x";
+    return fcPath(buf, name);
+}
+
 /// A fake Claude Code in ax mode, enough for the adapter: typed input in
 /// a `$` box, `you:`/`claude:`/`tool:` lines, busy/idle title glyphs,
 /// OSC 133 turn marks with BEL, a numbered permission prompt that waits
-/// for its answer, a subagent wait, and a message flood. It refuses to
-/// start with a CLAUDE* variable a nested Claude Code must not inherit.
-fn fakeClaude(allocator: std.mem.Allocator) u8 {
+/// for its answer, a subagent wait, a message flood, the `/model` picker
+/// (applied a moment after `s`, as the real one does), `/exit`, and
+/// conversations kept per `--session-id` that `--resume` reprints. It
+/// refuses to start with a CLAUDE* variable a nested Claude Code must not
+/// inherit, and marks anything that would save the user's defaults
+/// (`/effort`, a picker's Enter).
+fn fakeClaude(allocator: std.mem.Allocator, args: []const [*:0]const u8) u8 {
     for ([_][*:0]const u8{ "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CONFIG_DIR" }) |k| {
         if (c.getenv(k) != null) {
             writeOut("fake claude: ENV LEAK ");
@@ -5814,18 +5893,49 @@ fn fakeClaude(allocator: std.mem.Allocator) u8 {
             return 3;
         }
     }
+    {
+        var line: std.ArrayList(u8) = .empty;
+        defer line.deinit(allocator);
+        for (args, 0..) |a, i| {
+            if (i > 0) line.append(allocator, ' ') catch {};
+            line.appendSlice(allocator, std.mem.span(a)) catch {};
+        }
+        fcAppend(FC_LAUNCHES, line.items);
+    }
+    const resumed = argAfter(args, "--resume");
+    const conv_id = resumed orelse argAfter(args, "--session-id") orelse "none";
+    var conv_buf: [1024]u8 = undefined;
+    const conv_path = fcConversation(&conv_buf, conv_id);
     var tio: c.struct_termios = undefined;
     if (c.tcgetattr(0, &tio) == 0) {
         c.cfmakeraw(&tio);
         _ = c.tcsetattr(0, c.TCSANOW, &tio);
     }
     _ = c.usleep(300_000);
-    writeOut(FC_IDLE ++ "Claude Code v0.0.0 (smoke fake)\r\n" ++ FC_LIVE);
+    if (resumed) |id| {
+        const past = readfile.cappedAlloc(allocator, conv_path, 1 << 20) catch {
+            writeOut("No conversation found with session ID: ");
+            writeOut(id);
+            writeOut("\r\n");
+            _ = c.usleep(500_000);
+            return 1;
+        };
+        defer allocator.free(past);
+        writeOut(FC_IDLE ++ "Claude Code v0.0.0 (smoke fake, resumed)\r\n");
+        var it = std.mem.splitScalar(u8, std.mem.trimEnd(u8, past, "\n"), '\n');
+        while (it.next()) |l| {
+            writeOut(l);
+            writeOut("\r\n");
+        }
+        writeOut(FC_LIVE);
+    } else writeOut(FC_IDLE ++ "Claude Code v0.0.0 (smoke fake)\r\n" ++ FC_LIVE);
 
     var input: std.ArrayList(u8) = .empty;
     var steps: std.ArrayList(FcStep) = .empty;
     var picker = false;
     var choice: u8 = 0;
+    var model_picker = false;
+    var model_choice: u8 = 0;
     while (true) {
         const now = nowMs();
         var i: usize = 0;
@@ -5846,6 +5956,30 @@ fn fakeClaude(allocator: std.mem.Allocator) u8 {
         if (n == 0) return 0;
         if (n < 0) continue;
         for (buf[0..@intCast(n)]) |b| {
+            if (model_picker) {
+                const label = if (model_choice == 1) "Sonnet 4.5" else "Haiku 4.5";
+                switch (b) {
+                    '1'...'9' => model_choice = b - '0',
+                    's' => {
+                        model_picker = false;
+                        const done = std.fmt.allocPrint(allocator, "\r\x1b[4A\x1b[JSet model to {s} for this session only\r\n" ++ FC_LIVE ++ "\x1b]133;C\x07\x1b]133;D\x07\x07", .{label}) catch return 1;
+                        defer allocator.free(done);
+                        // Applied a moment later, like the real one.
+                        fcSchedule(allocator, &steps, 600, done, false);
+                    },
+                    '\r' => {
+                        model_picker = false;
+                        fcAppend(FC_SETTINGS_WRITTEN, "model picker Enter");
+                        writeOut("\r\x1b[4A\x1b[JSet model to default (saved as your default for new sessions)\r\n" ++ FC_LIVE);
+                    },
+                    0x1b => {
+                        model_picker = false;
+                        writeOut("\r\x1b[4A\x1b[J" ++ FC_LIVE);
+                    },
+                    else => {},
+                }
+                continue;
+            }
             if (picker) {
                 if (b >= '1' and b <= '9') choice = b - '0';
                 if (b != '\r') continue;
@@ -5864,7 +5998,20 @@ fn fakeClaude(allocator: std.mem.Allocator) u8 {
             switch (b) {
                 '\r' => {
                     if (input.items.len == 0) continue;
-                    fcTurn(allocator, &steps, input.items);
+                    const text = input.items;
+                    if (std.mem.eql(u8, text, "/model")) {
+                        model_picker = true;
+                        writeOut("\x1b]133;A\x07" ++ FC_ERASE ++ "you: /model\r\nSelect model\r\n1. Sonnet 4.5\r\n2. Haiku 4.5 (selected)\r\n" ++
+                            "Select with numbers [1-2]. Then Enter to submit or Escape to cancel:\r\nEnter to set as default \xc2\xb7 s to use this session only \xc2\xb7 Esc to cancel");
+                    } else if (std.mem.eql(u8, text, "/exit")) {
+                        writeOut(FC_ERASE ++ "you: /exit\r\nGoodbye!\r\n");
+                        return 0;
+                    } else if (std.mem.startsWith(u8, text, "/effort")) {
+                        fcAppend(FC_SETTINGS_WRITTEN, text);
+                        const saved = std.fmt.allocPrint(allocator, FC_ERASE ++ "you: {s}\r\nSet effort level to {s} (saved as your default for new sessions)\r\n" ++ FC_LIVE, .{ text, std.mem.trim(u8, text["/effort".len..], " ") }) catch return 1;
+                        writeOut(saved);
+                        allocator.free(saved);
+                    } else fcTurn(allocator, &steps, text, conv_path);
                     input.clearRetainingCapacity();
                 },
                 0x1b => {
@@ -5894,8 +6041,10 @@ fn fcSchedule(allocator: std.mem.Allocator, steps: *std.ArrayList(FcStep), delay
     steps.append(allocator, .{ .at_ms = nowMs() + delay_ms, .bytes = owned, .picker = picker }) catch allocator.free(owned);
 }
 
-/// One turn of the fake: the prompt's words pick the script.
-fn fcTurn(allocator: std.mem.Allocator, steps: *std.ArrayList(FcStep), text: []const u8) void {
+/// One turn of the fake: the prompt's words pick the script. Plain turns
+/// are kept in the conversation file (`recall` answers with its first
+/// prompt, which is how a resumed conversation proves it is the same one).
+fn fcTurn(allocator: std.mem.Allocator, steps: *std.ArrayList(FcStep), text: []const u8, conv_path: [:0]const u8) void {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -5924,8 +6073,24 @@ fn fcTurn(allocator: std.mem.Allocator, steps: *std.ArrayList(FcStep), text: []c
         fcSchedule(allocator, steps, 300, body.items, false);
         fcSchedule(allocator, steps, 400, FC_END, false);
     } else {
+        const reply: []const u8 = if (std.mem.eql(u8, text, "recall")) blk: {
+            const past = readfile.cappedAlloc(a, conv_path, 1 << 20) catch break :blk "first prompt was: (none)";
+            var lines = std.mem.splitScalar(u8, past, '\n');
+            while (lines.next()) |l| {
+                if (std.mem.startsWith(u8, l, "you: ")) break :blk std.fmt.allocPrint(a, "first prompt was: {s}", .{l["you: ".len..]}) catch return;
+            }
+            break :blk "first prompt was: (none)";
+        } else std.fmt.allocPrint(a, "echo: {s}", .{text}) catch return;
+        {
+            const f = c.fopen(conv_path.ptr, "a");
+            if (f) |file| {
+                defer _ = c.fclose(file);
+                const rec = std.fmt.allocPrint(a, "you: {s}\nclaude: {s}\n", .{ text, reply }) catch return;
+                _ = c.fwrite(rec.ptr, 1, rec.len, file);
+            }
+        }
         const delay: i64 = if (has(text, "slow")) 1500 else 300;
-        const answer = std.fmt.allocPrint(a, FC_ERASE ++ "claude: echo: {s}\r\n" ++ FC_LIVE, .{text}) catch return;
+        const answer = std.fmt.allocPrint(a, FC_ERASE ++ "claude: {s}\r\n" ++ FC_LIVE, .{reply}) catch return;
         fcSchedule(allocator, steps, delay, answer, false);
         fcSchedule(allocator, steps, delay + 100, FC_END, false);
     }
@@ -6045,6 +6210,11 @@ const FakeOc = struct {
     }
 };
 
+/// Milliseconds a fake `opencode serve` stays deaf after it listens.
+const FAKE_OC_DEAF_ENV = "SKETERM_SMOKE_OC_DEAF_MS";
+/// Every password a fake server was started with, one per line.
+const FAKE_OC_PASSWORDS = "oc-passwords";
+
 const FAKE_OC_PROVIDERS =
     \\{"all":[{"id":"fakeprov","models":{"m1":{"name":"Fake One","variants":{"low":{},"high":{}}}}}],"connected":["fakeprov"]}
 ;
@@ -6086,9 +6256,25 @@ fn fakeOpencodeServe(allocator: std.mem.Allocator, args: []const [*:0]const u8) 
     const b64 = allocator.alloc(u8, enc.calcSize(pair.len)) catch return 1;
     _ = enc.encode(b64, pair);
     const auth = std.fmt.allocPrint(allocator, "Basic {s}", .{b64}) catch return 1;
+    // Where the stage reads the password back, to prove no process of the
+    // run ever carried it on its argv (a test fake writes it; opencode
+    // never would).
+    {
+        var dir_buf: [1024]u8 = undefined;
+        const dir = fcPath(&dir_buf, "");
+        _ = c.mkdir(dir.ptr, 0o700);
+        fcAppend(FAKE_OC_PASSWORDS, pw);
+    }
     var oc = FakeOc{ .allocator = allocator };
     var srv: testserver.Server = .{};
     srv.auth = auth;
+    // A starting opencode accepts connections seconds before it answers,
+    // and never answers what it got in between.
+    if (c.getenv(FAKE_OC_DEAF_ENV)) |ms| {
+        const deaf = std.fmt.parseInt(i64, std.mem.span(@as([*:0]const u8, @ptrCast(ms))), 10) catch 0;
+        srv.deaf_until_ms = nowMs() + deaf;
+    }
+    srv.route("GET " ++ @import("agent/opencode.zig").HEALTH_PATH, .{ .body = "{\"healthy\":true,\"version\":\"smoke\"}" });
     srv.hook = FakeOc.hook;
     srv.hook_ctx = &oc;
     srv.route("POST /session", .{ .body = "{\"id\":\"" ++ FakeOc.SES ++ "\"}" });
@@ -6235,10 +6421,15 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
     // start with either (the adapter's unset_env removes CLAUDE*).
     _ = c.setenv("CLAUDE_CODE_CHILD_SESSION", "1", 1);
     _ = c.setenv("CLAUDE_CONFIG_DIR", "/nonexistent-smoke-claude", 1);
+    // Like the real one: listening long before it answers, and a request
+    // in between is never answered (agent_open's event stream used to be
+    // exactly that request, and timed out).
+    _ = c.setenv(FAKE_OC_DEAF_ENV, "4500", 1);
     defer {
         _ = c.unsetenv(FAKE_AGENT_ENV);
         _ = c.unsetenv("CLAUDE_CODE_CHILD_SESSION");
         _ = c.unsetenv("CLAUDE_CONFIG_DIR");
+        _ = c.unsetenv(FAKE_OC_DEAF_ENV);
     }
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -6257,7 +6448,8 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
 
         const caps = agentCall(&m, arena, "capabilities", "{}", "capabilities", false, 15_000);
         if (!caps.get("agents").?.bool) fail("capabilities: agents is false in isolated mode");
-        if (caps.get("agent_ssh").?.bool) fail("capabilities: agent_ssh claims SSH agents");
+        // Agents run on SSH hosts wherever an ssh client is installed.
+        if (caps.get("agent_ssh").?.bool != caps.get("ssh").?.bool) fail("capabilities: agent_ssh disagrees with the ssh client's presence");
         var ids = std.ArrayList(u8).empty;
         for (caps.get("agent_adapters").?.array.items) |v| ids.appendSlice(arena, v.string) catch {};
         if (std.mem.indexOf(u8, ids.items, "claude") == null or std.mem.indexOf(u8, ids.items, "opencode") == null)
@@ -6275,7 +6467,14 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
         expectFact(opened, "session", "agent-claude-1", "agent_open: session name");
         if (!opened.get("ready").?.bool) fail("agent_open: the fake Claude Code never became ready (an unset_env leak makes it refuse to start)");
         if (std.mem.indexOf(u8, scStr(opened, "watch_command", "agent_open"), " agent-wait ") == null) fail("agent_open: no watch_command");
+        // A cursor baked into the command went stale with the next call.
+        if (std.mem.indexOf(u8, scStr(opened, "watch_command", "agent_open"), "--since") != null) fail("agent_open: watch_command carries a cursor");
         if (!sessionListed(allocator, mux_sock, "agent-claude-1")) fail("agent-claude-1 is not a session on the private daemon");
+        // Recorded like every other headless terminal, at an absolute path.
+        const recs_opened = (opened.get("recordings") orelse fail("agent_open: no recordings fact")).array.items;
+        if (recs_opened.len != 1 or recs_opened[0].string[0] != '/' or !std.mem.endsWith(u8, recs_opened[0].string, "/agent-claude-1.cast"))
+            fail("agent_open: the agent's terminal is not recorded at an absolute path");
+        const claude_cast = arena.dupe(u8, recs_opened[0].string) catch fail("oom");
 
         const sent = agentCall(&m, arena, "agent_send", "{\"agent\":\"claude-1\",\"text\":\"hello there\",\"timeout_ms\":20000}", "agent_send", false, 45_000);
         expectFact(sent, "outcome", "done", "agent_send: outcome");
@@ -6358,6 +6557,52 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
         expectFact(again, "outcome", "done", "agent_send again: outcome");
         const more = agentCall(&m, arena, "agent_send", "{\"agent\":\"claude-1\",\"text\":\"and once more\",\"timeout_ms\":20000}", "agent_send more", false, 45_000);
         expectFact(more, "outcome", "done", "agent_send more: outcome");
+
+        // The model picker: agent_set returns once the app CONFIRMED the
+        // change (the fake applies it 600 ms after `s`), so the very next
+        // call finds the agent idle instead of `waiting for an answer`.
+        const before_set = agentCall(&m, arena, "agent_read", "{\"agent\":\"claude-1\"}", "agent_read before set", false, 15_000).get("next_since").?.integer;
+        const set_model = agentCall(&m, arena, "agent_set", "{\"agent\":\"claude-1\",\"model\":\"Haiku\",\"timeout_ms\":20000}", "agent_set model", false, 45_000);
+        expectFact(set_model, "confirmation", "Set model to Haiku 4.5 for this session only", "agent_set model: the app's confirmation");
+        expectFact(set_model, "state", "idle", "agent_set model: idle once confirmed");
+        const right_after = agentCall(&m, arena, "agent_send", "{\"agent\":\"claude-1\",\"text\":\"right after the model\",\"timeout_ms\":20000}", "agent_send after set", false, 45_000);
+        expectFact(right_after, "outcome", "done", "agent_send after agent_set: outcome");
+        // The adapter's command is a notice, not `user: /model`.
+        const set_read = agentCall(&m, arena, "agent_read", std.fmt.allocPrint(arena, "{{\"agent\":\"claude-1\",\"since\":{d}}}", .{before_set}) catch fail("oom"), "agent_read after set", false, 15_000);
+        const set_recs = set_read.get("records").?.array.items;
+        if (set_recs.len != 3 or !std.mem.eql(u8, set_recs[0].object.get("kind").?.string, "notice") or
+            std.mem.indexOf(u8, set_recs[0].object.get("text").?.string, "model set to Haiku") == null)
+        {
+            say(std.json.Stringify.valueAlloc(arena, set_read.get("records").?, .{}) catch "?");
+            fail("agent_read: the model change is not one notice record before the next turn");
+        }
+        for (set_recs) |r| if (std.mem.indexOf(u8, r.object.get("text").?.string, "/model") != null) fail("agent_read: the adapter's /model reached the transcript");
+
+        // Effort is a launch value (Claude Code's /effort saves the user's
+        // default): the app is restarted with --effort and resumes ITS
+        // conversation, which `recall` proves.
+        const set_effort = agentCall(&m, arena, "agent_set", "{\"agent\":\"claude-1\",\"effort\":\"high\",\"timeout_ms\":30000}", "agent_set effort", false, 60_000);
+        if (!set_effort.get("relaunched").?.bool) fail("agent_set effort: not a relaunch");
+        expectFact(set_effort, "state", "idle", "agent_set effort: idle after the relaunch");
+        const recalled = agentCall(&m, arena, "agent_send", "{\"agent\":\"claude-1\",\"text\":\"recall\",\"timeout_ms\":20000}", "agent_send recall", false, 45_000);
+        expectFact(recalled, "message", "first prompt was: hello there", "agent_send recall: the relaunch resumed the same conversation");
+        {
+            var lb: [1024]u8 = undefined;
+            const launches = readfile.cappedAlloc(arena, fcPath(&lb, FC_LAUNCHES), 1 << 20) catch fail("the fake Claude Code logged no launch");
+            var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, launches, "\n"), '\n');
+            const first = lines.next() orelse fail("no first launch");
+            const second = lines.next() orelse fail("agent_set effort: no second launch");
+            const sid_at = std.mem.indexOf(u8, first, "--session-id ") orelse fail("the first launch named no conversation id");
+            const sid = first[sid_at + "--session-id ".len ..][0..36];
+            const want = std.fmt.allocPrint(arena, "--resume {s}", .{sid}) catch fail("oom");
+            if (std.mem.indexOf(u8, second, want) == null or std.mem.indexOf(u8, second, "--effort high") == null) {
+                say(launches);
+                fail("the relaunch did not resume the conversation with --effort high");
+            }
+            var sb: [1024]u8 = undefined;
+            if (fileExists(fcPath(&sb, FC_SETTINGS_WRITTEN))) fail("something wrote the user's default settings (/effort or a picker's Enter)");
+        }
+
         const closed = agentCall(&m, arena, "agent_close", "{\"agent\":\"claude-1\"}", "agent_close claude", false, 15_000);
         if (!closed.get("closed").?.bool or closed.get("sessions").?.array.items.len != 1) fail("agent_close: did not close the one session");
         const followed = follower.finish(arena, 15_000, "follow waiter");
@@ -6365,17 +6610,28 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
             say(followed);
             fail("the --follow waiter did not print each turn and then watch ended");
         }
+        // The adapter's own picker and the restart woke nobody.
+        if (std.mem.indexOf(u8, followed, "needs_input") != null or std.mem.indexOf(u8, followed, "exited") != null or
+            std.mem.indexOf(u8, followed, "connection_lost") != null)
+        {
+            say(followed);
+            fail("the --follow waiter was woken by the adapter's own picker or restart");
+        }
         waitUnlisted(allocator, mux_sock, "agent-claude-1", "agent_close claude");
-        say("smoke-mcp: agents: fake Claude Code (open, send, read, permission, match, flood, waiters, late backlog, close) ok");
+        if (!fileExists(claude_cast)) fail("the agent's recording does not exist");
+        say("smoke-mcp: agents: fake Claude Code (open, send, read, permission, match, flood, waiters, late backlog, model, effort relaunch, recording, close) ok");
 
         // ── opencode (API source) ───────────────────────────────────
         const oc = agentCall(&m, arena, "agent_open", std.fmt.allocPrint(arena, "{{\"app\":\"opencode\",\"binary\":{s},\"timeout_ms\":30000}}", .{bin_json}) catch fail("oom"), "agent_open opencode", false, 45_000);
         expectFact(oc, "agent", "opencode-1", "agent_open opencode: agent id");
         expectFact(oc, "session", "agent-opencode-1", "agent_open opencode: session");
         expectFact(oc, "server_session", "agent-opencode-1-server", "agent_open opencode: server session");
+        // The fake server swallowed every request of its first 4.5 s: the
+        // open waited it out on health probes instead of failing.
         if (!oc.get("ready").?.bool) fail("agent_open opencode: not ready");
         if (!sessionListed(allocator, mux_sock, "agent-opencode-1") or !sessionListed(allocator, mux_sock, "agent-opencode-1-server"))
             fail("the opencode sessions are not on the private daemon");
+        expectPasswordsHidden(arena, (oc.get("recordings") orelse fail("agent_open opencode: no recordings")).array.items, "local opencode");
         const set = agentCall(&m, arena, "agent_set", "{\"agent\":\"opencode-1\",\"model\":\"fakeprov/m1\",\"effort\":\"high\"}", "agent_set opencode", false, 30_000);
         expectFact(set, "current_model", "fakeprov/m1", "agent_set: current model");
         expectFact(set, "current_effort", "high", "agent_set: current effort");
@@ -6427,4 +6683,330 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
         d2.closeStdinWait();
         say("smoke-mcp: agents: a durable instance re-attaches its running agent ok");
     }
+}
+
+// ── sub-agents on an SSH host: both transports, a faked remote ──────
+
+/// Read `/proc/<pid>/<file>` into `out` (bounded); "" when unreadable.
+fn procRead(pid: []const u8, file: []const u8, out: []u8) []const u8 {
+    var path_buf: [128]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buf, "/proc/{s}/{s}", .{ pid, file }) catch return "";
+    const f = c.fopen(path.ptr, "rb") orelse return "";
+    defer _ = c.fclose(f);
+    return out[0..c.fread(out.ptr, 1, out.len, f)];
+}
+
+/// The pids whose argv contains every one of `needles` and whose
+/// environment carries `env_needle` (this run's isolated dirs).
+fn findProcs(needles: []const []const u8, env_needle: []const u8, out: []c.pid_t) []c.pid_t {
+    var n: usize = 0;
+    const d = c.opendir("/proc") orelse return out[0..0];
+    defer _ = c.closedir(d);
+    while (c.readdir(d)) |ent| {
+        const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
+        if (name.len == 0 or name[0] < '0' or name[0] > '9') continue;
+        var cbuf: [16384]u8 = undefined;
+        const cmd = procRead(name, "cmdline", &cbuf);
+        var ok = cmd.len > 0;
+        for (needles) |x| {
+            if (std.mem.indexOf(u8, cmd, x) == null) ok = false;
+        }
+        if (!ok) continue;
+        var ebuf: [65536]u8 = undefined;
+        if (std.mem.indexOf(u8, procRead(name, "environ", &ebuf), env_needle) == null) continue;
+        if (n == out.len) break;
+        out[n] = std.fmt.parseInt(c.pid_t, name, 10) catch continue;
+        n += 1;
+    }
+    return out[0..n];
+}
+
+/// Fail when any process this user can see carries `secret` on its argv.
+fn expectNoArgvCarries(secret: []const u8, comptime what: []const u8) void {
+    const d = c.opendir("/proc") orelse fail("cannot list /proc");
+    defer _ = c.closedir(d);
+    var seen: usize = 0;
+    while (c.readdir(d)) |ent| {
+        const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
+        if (name.len == 0 or name[0] < '0' or name[0] > '9') continue;
+        var cbuf: [65536]u8 = undefined;
+        const cmd = procRead(name, "cmdline", &cbuf);
+        if (cmd.len == 0) continue;
+        seen += 1;
+        if (std.mem.indexOf(u8, cmd, secret) != null) {
+            say(name);
+            fail(what ++ ": a password is on a process argv");
+        }
+    }
+    if (seen < 5) fail(what ++ ": too few readable argvs to conclude anything");
+}
+
+/// The passwords the fake opencode servers of this run were started with.
+fn fakeOcPasswords(arena: std.mem.Allocator) []const []const u8 {
+    var pb: [1024]u8 = undefined;
+    const all = readfile.cappedAlloc(arena, fcPath(&pb, FAKE_OC_PASSWORDS), 1 << 16) catch return &.{};
+    var list: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.splitScalar(u8, std.mem.trimEnd(u8, all, "\n"), '\n');
+    while (it.next()) |l| if (l.len > 0) list.append(arena, l) catch {};
+    return list.items;
+}
+
+/// No argv and no recording of the run carries a fake server's password.
+fn expectPasswordsHidden(arena: std.mem.Allocator, casts: []const std.json.Value, comptime what: []const u8) void {
+    const pws = fakeOcPasswords(arena);
+    if (pws.len == 0) fail(what ++ ": no fake opencode server recorded its password");
+    for (pws) |pw| {
+        if (pw.len < 16) fail(what ++ ": an implausible password");
+        expectNoArgvCarries(pw, what);
+        for (casts) |p| {
+            const bytes = readfile.cappedAlloc(arena, p.string, 16 << 20) catch continue;
+            if (std.mem.indexOf(u8, bytes, pw) != null) fail(what ++ ": a recording carries the password");
+        }
+    }
+}
+
+/// The agent_* tools with `host`, against this machine standing in for
+/// the remote: `ssh` on PATH is this binary (remote commands run here,
+/// `-N -L` forwards locally) and `$SKETERM_SSH` bridges to a second
+/// private daemon, the "remote" one. Proves both transports, remote
+/// binary resolution through the candidates, the typed (never argv)
+/// opencode password, the port forward and its revival, connection loss
+/// and recovery, and a durable re-attach over SSH.
+fn agentSshStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) void {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var self_buf: [4096]u8 = undefined;
+    const self_exe = platform.exePath(&self_buf) orelse fail("agent ssh stage: own executable path");
+
+    // The "remote" home: the app binaries live where an ssh login's PATH
+    // does not look (~/.local/bin), so only the candidates find them.
+    const home = std.mem.span(@as([*:0]const u8, @ptrCast(c.getenv("HOME") orelse fail("no HOME"))));
+    const local_bin = std.fmt.allocPrintSentinel(arena, "{s}/.local/bin", .{home}, 0) catch fail("oom");
+    _ = c.system((std.fmt.allocPrintSentinel(arena, "mkdir -p '{s}'", .{local_bin}, 0) catch fail("oom")).ptr);
+    for ([_][]const u8{ "claude", "sk-fake-opencode" }) |name| {
+        const link = std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ local_bin, name }, 0) catch fail("oom");
+        _ = c.unlink(link.ptr);
+        const target = std.fmt.allocPrintSentinel(arena, "{s}", .{self_exe}, 0) catch fail("oom");
+        if (c.symlink(target.ptr, link.ptr) != 0) fail("could not place the fake agent binaries");
+    }
+
+    // `ssh`/`scp` on PATH: plain transport, the binary probe, forwards.
+    const bin = std.fmt.allocPrintSentinel(arena, "{s}/fakebin", .{rt}, 0) catch fail("oom");
+    _ = c.mkdir(bin.ptr, 0o700);
+    for ([_][]const u8{ "ssh", "scp" }) |name| {
+        const link = std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ bin, name }, 0) catch fail("oom");
+        _ = c.unlink(link.ptr);
+        if (c.symlink((std.fmt.allocPrintSentinel(arena, "{s}", .{self_exe}, 0) catch fail("oom")).ptr, link.ptr) != 0) fail("could not link the fake ssh");
+    }
+    const old_path: []const u8 = if (c.getenv("PATH")) |p| std.mem.span(@as([*:0]const u8, @ptrCast(p))) else "/usr/bin:/bin";
+    const saved_path = arena.dupeZ(u8, old_path) catch fail("oom");
+    // A system PATH only: the developer's own ~/.local/bin holds a REAL
+    // claude the candidates must never find in this stage.
+    _ = c.setenv("PATH", (std.fmt.allocPrintSentinel(arena, "{s}:/usr/bin:/bin", .{bin}, 0) catch fail("oom")).ptr, 1);
+    _ = c.setenv(FAKE_SSH_ENV, "1", 1);
+    _ = c.setenv(FAKE_AGENT_ENV, "1", 1);
+    _ = c.setenv(FAKE_OC_DEAF_ENV, "3000", 1);
+    defer {
+        _ = c.setenv("PATH", saved_path.ptr, 1);
+        _ = c.unsetenv(FAKE_SSH_ENV);
+        _ = c.unsetenv(FAKE_AGENT_ENV);
+        _ = c.unsetenv(FAKE_OC_DEAF_ENV);
+        _ = c.unsetenv("SKETERM_SSH");
+    }
+
+    // The "remote" daemon, and the `$SKETERM_SSH` bridge to it. A flag
+    // file makes the bridge refuse, like a host that went away.
+    const rrt = std.fmt.allocPrintSentinel(arena, "{s}/r", .{rt}, 0) catch fail("oom");
+    _ = c.mkdir(rrt.ptr, 0o700);
+    var mux_abs_buf: [4096]u8 = undefined;
+    const mux_abs = std.mem.span(@as([*:0]const u8, @ptrCast(c.realpath("zig-out/bin/sketerm-mux", &mux_abs_buf) orelse fail("zig-out/bin/sketerm-mux missing"))));
+    const rpid = c.fork();
+    if (rpid < 0) fail("fork remote daemon");
+    if (rpid == 0) {
+        _ = c.setenv("XDG_RUNTIME_DIR", rrt.ptr, 1);
+        _ = c.setenv("XDG_STATE_HOME", rrt.ptr, 1);
+        _ = c.setenv("XDG_CONFIG_HOME", rrt.ptr, 1);
+        const argv = [_:null]?[*:0]const u8{ "sketerm-mux", "--broker", null };
+        _ = c.execv("zig-out/bin/sketerm-mux", @ptrCast(@constCast(&argv)));
+        c._exit(127);
+    }
+    const rsock = std.fmt.allocPrint(arena, "{s}/sketerm/mux.sock", .{rrt}) catch fail("oom");
+    {
+        const deadline = nowMs() + 10_000;
+        while (!fileExists(rsock)) {
+            if (nowMs() > deadline) fail("the remote daemon's socket never appeared");
+            _ = c.usleep(50_000);
+        }
+    }
+    const down = std.fmt.allocPrintSentinel(arena, "{s}/ssh-down", .{rt}, 0) catch fail("oom");
+    const bridge = std.fmt.allocPrintSentinel(arena, "{s}/fake-mux-ssh", .{rt}, 0) catch fail("oom");
+    {
+        const body = std.fmt.allocPrint(arena,
+            \\#!/bin/sh
+            \\if [ "$1" = "-G" ]; then printf 'hostname 127.0.0.1\n'; exit 0; fi
+            \\[ -e '{s}' ] && exit 255
+            \\export XDG_RUNTIME_DIR='{s}' XDG_STATE_HOME='{s}' XDG_CONFIG_HOME='{s}' SKETERM_MUX_BIN='{s}'
+            \\exec '{s}' --proxy
+            \\
+        , .{ down, rrt, rrt, rrt, mux_abs, mux_abs }) catch fail("oom");
+        const f = c.fopen(bridge.ptr, "w") orelse fail("cannot write the fake mux ssh");
+        _ = c.fwrite(body.ptr, 1, body.len, f);
+        _ = c.fclose(f);
+        if (c.chmod(bridge.ptr, 0o755) != 0) fail("chmod fake mux ssh");
+    }
+    _ = c.setenv("SKETERM_SSH", bridge.ptr, 1);
+    const rt_env = std.fmt.allocPrint(arena, "XDG_RUNTIME_DIR={s}", .{rrt}) catch fail("oom");
+
+    // ── the host's own daemon (transport sketerm-mux) ───────────────
+    {
+        var m = Mcp.spawn(allocator, exe, &.{});
+        m.initialize();
+        const caps = agentCall(&m, arena, "capabilities", "{}", "capabilities", false, 15_000);
+        if (!caps.get("agent_ssh").?.bool) fail("capabilities: agent_ssh is false with an ssh client on PATH");
+        // One probe on the host: claude is found through ~/.local/bin.
+        const ad = agentCall(&m, arena, "agent_adapters", "{\"host\":\"fakehost\"}", "agent_adapters host", false, 45_000);
+        expectFact(ad, "host", "fakehost", "agent_adapters host: host fact");
+        var claude_bin: ?[]const u8 = null;
+        for (ad.get("adapters").?.array.items) |item| {
+            if (!std.mem.eql(u8, item.object.get("id").?.string, "claude")) continue;
+            if (item.object.get("binary").? == .string) claude_bin = item.object.get("binary").?.string;
+        }
+        const want_bin = std.fmt.allocPrint(arena, "{s}/claude", .{local_bin}) catch fail("oom");
+        if (claude_bin == null or !std.mem.eql(u8, claude_bin.?, want_bin)) {
+            say(std.json.Stringify.valueAlloc(arena, ad.get("adapters").?, .{}) catch "?");
+            fail("agent_adapters host: claude not resolved through the ~/.local/bin candidate");
+        }
+
+        const opened = agentCall(&m, arena, "agent_open", "{\"app\":\"claude\",\"host\":\"fakehost\",\"timeout_ms\":45000}", "agent_open claude on host", false, 60_000);
+        expectFact(opened, "transport", "sketerm-mux", "agent_open host: the host's own daemon");
+        expectFact(opened, "host", "fakehost", "agent_open host: host fact");
+        expectFact(opened, "binary", want_bin, "agent_open host: the remote binary from the candidates");
+        if (!opened.get("ready").?.bool) fail("agent_open host: the remote fake Claude Code never became ready");
+        if (!sessionListed(allocator, rsock, "agent-claude-1")) fail("agent-claude-1 is not a session on the remote daemon");
+        const hello = agentCall(&m, arena, "agent_send", "{\"agent\":\"claude-1\",\"text\":\"hello from afar\",\"timeout_ms\":20000}", "agent_send remote", false, 45_000);
+        expectFact(hello, "message", "echo: hello from afar", "agent_send remote: message");
+
+        // The link drops and the host refuses for a while: connection_lost.
+        {
+            const f = c.fopen(down.ptr, "w") orelse fail("flag");
+            _ = c.fclose(f);
+        }
+        var pids_buf: [32]c.pid_t = undefined;
+        const proxies = findProcs(&.{"--proxy"}, rt_env, &pids_buf);
+        if (proxies.len == 0) fail("no ssh bridge to the remote daemon to cut");
+        for (proxies) |p| _ = c.kill(p, c.SIGKILL);
+        const lost = agentCall(&m, arena, "agent_wait", "{\"agent\":\"claude-1\",\"timeout_ms\":20000}", "agent_wait lost", false, 45_000);
+        expectFact(lost, "outcome", "connection_lost", "agent_wait: the lost link is connection_lost");
+        expectFact(lost, "state", "disconnected", "agent_wait: state after the drop");
+        // The host answers again: the next call reconnects and resyncs.
+        _ = c.unlink(down.ptr);
+        _ = c.usleep(5_500_000);
+        const back = agentCall(&m, arena, "agent_wait", "{\"agent\":\"claude-1\",\"timeout_ms\":3000}", "agent_wait recovered", false, 30_000);
+        expectFact(back, "state", "idle", "agent_wait: idle again after the reconnect");
+        const after = agentCall(&m, arena, "agent_send", "{\"agent\":\"claude-1\",\"text\":\"after the drop\",\"timeout_ms\":20000}", "agent_send after drop", false, 45_000);
+        expectFact(after, "message", "echo: after the drop", "agent_send after the reconnect");
+        // The resync is a wipe: nothing captured twice.
+        const all = agentCall(&m, arena, "agent_read", "{\"agent\":\"claude-1\"}", "agent_read remote", false, 15_000);
+        var hellos: usize = 0;
+        for (all.get("records").?.array.items) |r| {
+            if (std.mem.eql(u8, r.object.get("text").?.string, "hello from afar")) hellos += 1;
+        }
+        if (hellos != 1) fail("agent_read: the resync captured a turn twice");
+
+        // Effort on the host: restarted there, the conversation resumed.
+        const eff = agentCall(&m, arena, "agent_set", "{\"agent\":\"claude-1\",\"effort\":\"low\",\"timeout_ms\":30000}", "agent_set effort remote", false, 60_000);
+        if (!eff.get("relaunched").?.bool) fail("agent_set effort on the host: not a relaunch");
+        const recall = agentCall(&m, arena, "agent_send", "{\"agent\":\"claude-1\",\"text\":\"recall\",\"timeout_ms\":20000}", "agent_send recall remote", false, 45_000);
+        expectFact(recall, "message", "first prompt was: hello from afar", "agent_send recall on the host");
+
+        // opencode on the host: password typed, server behind a forward.
+        const oc = agentCall(&m, arena, "agent_open", "{\"app\":\"opencode\",\"host\":\"fakehost\",\"binary\":\"sk-fake-opencode\",\"timeout_ms\":45000}", "agent_open opencode on host", false, 60_000);
+        expectFact(oc, "transport", "sketerm-mux", "agent_open opencode host: transport");
+        if (!oc.get("ready").?.bool) fail("agent_open opencode host: not ready");
+        if (!sessionListed(allocator, rsock, "agent-opencode-1-server")) fail("the opencode server is not a session on the remote daemon");
+        const oc_sent = agentCall(&m, arena, "agent_send", "{\"agent\":\"opencode-1\",\"text\":\"over the forward\",\"timeout_ms\":20000}", "agent_send opencode remote", false, 45_000);
+        expectFact(oc_sent, "outcome", "done", "agent_send opencode on the host: outcome");
+        expectPasswordsHidden(arena, &.{}, "opencode on the host's daemon");
+        // The forward dies: it is re-established and the API comes back.
+        const fwd = findProcs(&.{ "-N", "-L" }, std.fmt.allocPrint(arena, "XDG_RUNTIME_DIR={s}\x00", .{rt}) catch fail("oom"), &pids_buf);
+        if (fwd.len == 0) fail("no port forward process to kill");
+        for (fwd) |p| _ = c.kill(-p, c.SIGKILL);
+        _ = c.usleep(5_000_000);
+        const oc_again = agentCall(&m, arena, "agent_send", "{\"agent\":\"opencode-1\",\"text\":\"after the forward died\",\"timeout_ms\":30000}", "agent_send after forward", false, 45_000);
+        expectFact(oc_again, "outcome", "done", "agent_send after the forward was re-established");
+
+        _ = agentCall(&m, arena, "agent_close", "{\"agent\":\"opencode-1\"}", "agent_close opencode remote", false, 15_000);
+        _ = agentCall(&m, arena, "agent_close", "{\"agent\":\"claude-1\"}", "agent_close claude remote", false, 15_000);
+        waitUnlisted(allocator, rsock, "agent-claude-1", "agent_close remote claude");
+        waitUnlisted(allocator, rsock, "agent-opencode-1-server", "agent_close remote opencode");
+        m.closeStdinWait();
+        say("smoke-mcp: agents over ssh: host daemon (probe, open, send, drop + recovery, effort relaunch, opencode forward + revival, password hidden, close) ok");
+    }
+
+    // ── plain ssh (transport ssh) ───────────────────────────────────
+    {
+        var m = Mcp.spawn(allocator, exe, &.{});
+        m.initialize();
+        const oc = agentCall(&m, arena, "agent_open", "{\"app\":\"opencode\",\"host\":\"fakehost\",\"transport\":\"ssh\",\"binary\":\"sk-fake-opencode\",\"timeout_ms\":45000}", "agent_open opencode over ssh", false, 60_000);
+        expectFact(oc, "transport", "ssh", "agent_open opencode over plain ssh: transport");
+        const oc_sent = agentCall(&m, arena, "agent_send", "{\"agent\":\"opencode-1\",\"text\":\"plain ssh\",\"timeout_ms\":20000}", "agent_send opencode over ssh", false, 45_000);
+        expectFact(oc_sent, "outcome", "done", "agent_send opencode over plain ssh");
+        // Its server terminal is recorded here, and was typed the password.
+        const recs = (oc.get("recordings") orelse fail("no recordings")).array.items;
+        if (recs.len == 0) fail("agent_open over plain ssh: not recorded");
+        expectPasswordsHidden(arena, recs, "opencode over plain ssh");
+        _ = agentCall(&m, arena, "agent_close", "{\"agent\":\"opencode-1\"}", "agent_close opencode ssh", false, 15_000);
+
+        const cl = agentCall(&m, arena, "agent_open", "{\"app\":\"claude\",\"host\":\"fakehost\",\"transport\":\"ssh\",\"timeout_ms\":45000}", "agent_open claude over ssh", false, 60_000);
+        expectFact(cl, "transport", "ssh", "agent_open claude over plain ssh: transport");
+        const sent = agentCall(&m, arena, "agent_send", "{\"agent\":\"claude-1\",\"text\":\"plain hello\",\"timeout_ms\":20000}", "agent_send claude over ssh", false, 45_000);
+        expectFact(sent, "message", "echo: plain hello", "agent_send claude over plain ssh");
+        // ssh loses the connection: the remote process is gone with it.
+        var pids_buf: [32]c.pid_t = undefined;
+        const env_rt = std.fmt.allocPrint(arena, "XDG_RUNTIME_DIR={s}\x00", .{rt}) catch fail("oom");
+        // The closed opencode agent's ssh sessions may take a moment to go.
+        var sshs = findProcs(&.{"-tt"}, env_rt, &pids_buf);
+        const until = nowMs() + 5_000;
+        while (sshs.len != 1 and nowMs() < until) {
+            _ = c.usleep(100_000);
+            sshs = findProcs(&.{"-tt"}, env_rt, &pids_buf);
+        }
+        if (sshs.len != 1) fail("expected exactly the claude agent's ssh -tt");
+        _ = c.kill(sshs[0], c.SIGTERM);
+        const lost = agentCall(&m, arena, "agent_wait", "{\"agent\":\"claude-1\",\"timeout_ms\":20000}", "agent_wait ssh lost", false, 45_000);
+        var kinds: [2]bool = .{ false, false };
+        for (lost.get("events").?.array.items) |ev| {
+            const k = ev.object.get("kind").?.string;
+            if (std.mem.eql(u8, k, "connection_lost")) kinds[0] = true;
+            if (std.mem.eql(u8, k, "exited")) kinds[1] = true;
+        }
+        if (!kinds[0] or !kinds[1]) fail("a dropped plain ssh is not connection_lost + exited");
+        _ = agentCall(&m, arena, "agent_close", "{\"agent\":\"claude-1\"}", "agent_close claude ssh", false, 15_000);
+        m.closeStdinWait();
+        say("smoke-mcp: agents over ssh: plain ssh (opencode with a typed password, claude, drop) ok");
+    }
+
+    // ── a durable instance re-attaches a remote agent over ssh ───────
+    {
+        var d1 = Mcp.spawn(allocator, exe, &.{ "--name", "agentssh" });
+        d1.initialize();
+        const opened = agentCall(&d1, arena, "agent_open", "{\"app\":\"claude\",\"host\":\"fakehost\",\"prompt\":\"before restart\",\"timeout_ms\":45000}", "durable remote agent_open", false, 60_000);
+        expectFact(opened, "transport", "sketerm-mux", "durable remote: transport");
+        expectFact(opened, "message", "echo: before restart", "durable remote: prompt answer");
+        d1.closeStdinWait();
+        var d2 = Mcp.spawn(allocator, exe, &.{ "--name", "agentssh" });
+        d2.initialize();
+        const listed = agentCall(&d2, arena, "agent_list", "{}", "durable remote agent_list", false, 30_000);
+        if (listed.get("count").?.integer != 1) fail("durable remote: the restarted server did not pick its remote agent up");
+        const item = listed.get("agents").?.array.items[0].object;
+        if (!std.mem.eql(u8, item.get("transport").?.string, "sketerm-mux")) fail("durable remote: re-attached over another transport");
+        const back = agentCall(&d2, arena, "agent_send", "{\"agent\":\"claude-1\",\"text\":\"after restart\",\"timeout_ms\":20000}", "durable remote agent_send", false, 45_000);
+        expectFact(back, "message", "echo: after restart", "durable remote: the re-attached agent answers");
+        _ = agentCall(&d2, arena, "agent_close", "{\"agent\":\"claude-1\"}", "durable remote agent_close", false, 15_000);
+        d2.closeStdinWait();
+        say("smoke-mcp: agents over ssh: a durable instance re-attaches its remote agent ok");
+    }
+    _ = c.kill(rpid, c.SIGTERM);
+    _ = c.waitpid(rpid, null, 0);
 }
