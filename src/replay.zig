@@ -456,7 +456,7 @@ const AgentPrinter = struct {
         defer fresh.deinit(self.allocator);
         try src.recordsSince(self.printed_record, &fresh, self.allocator);
         for (fresh.items) |r| {
-            try std.json.Stringify.value(.{ .t = t, .type = "record", .id = r.id, .turn = r.turn, .kind = r.kind, .text = r.text, .tool = ToolOut.of(r) }, .{ .emit_null_optional_fields = false }, self.out);
+            try std.json.Stringify.value(.{ .t = t, .type = "record", .id = r.id, .job = r.job, .kind = r.kind, .text = r.text, .tool = ToolOut.of(r) }, .{ .emit_null_optional_fields = false }, self.out);
             try self.out.writeByte('\n');
             self.printed_record = @max(self.printed_record, r.id);
         }
@@ -506,7 +506,7 @@ const AgentPrinter = struct {
             try std.json.Stringify.value(.{
                 .type = "final",
                 .id = r.id,
-                .turn = r.turn,
+                .job = r.job,
                 .kind = r.kind,
                 .text = r.text,
                 .synthetic = r.synthetic,

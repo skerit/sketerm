@@ -108,6 +108,15 @@ pub const Agent = struct {
         };
     }
 
+    /// Every record in the source's (chronological) order. Borrowed: valid
+    /// until the source next changes.
+    pub fn records(self: *const Agent) []const output.Record {
+        return switch (self.source) {
+            .screen => |*e| e.records.items,
+            .opencode_api => |*a| a.source.records.items,
+        };
+    }
+
     /// What the app is waiting on the user for, or null. Borrowed: valid
     /// until the source next changes.
     pub fn interaction(self: *const Agent) ?output.Interaction {

@@ -34,6 +34,7 @@
       { "kind": "tool", "pattern": "^Read [0-9]+ .*ctrl\\+o to expand|^Listed [0-9]+ .*ctrl\\+o to expand|^Searched for [0-9]+ .*ctrl\\+o to expand|^Ran [0-9]+ .*ctrl\\+o to expand|^Found [0-9]+ .*ctrl\\+o to expand|^Fetched [0-9]+ .*ctrl\\+o to expand" },
       { "kind": "notice", "pattern": "^Interrupted .*What should Claude do instead" },
       { "kind": "notice", "pattern": "^ *Agent \".*\" finished" },
+      { "kind": "notice", "pattern": "^ *Background command \".*\" " },
       { "kind": "notice", "pattern": "^Compacted (" },
       { "kind": "notice", "pattern": "^Conversation compacted" }
     ],

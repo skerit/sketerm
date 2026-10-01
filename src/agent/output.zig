@@ -31,12 +31,15 @@ pub const Record = struct {
     kind: vocab.RecordKind,
     /// Owned by the source. A tool record's text is a one-line summary.
     text: []u8,
-    /// The turn it belongs to (0-based, in prompt order).
-    turn: u32,
+    /// The job it belongs to (0-based, in prompt order; see `select.zig`).
+    job: u32,
     /// Added by the adapter, not read from the app (a denial it answered).
     synthetic: bool = false,
     /// A `message` event was pushed for it.
     announced: bool = false,
+    /// It was the job's last assistant message when the agent went idle
+    /// (`select.Waker.segmentEnd`); kept across re-captures like `announced`.
+    segment_final: bool = false,
     /// Owned by the source; null for records without a structured call.
     tool: ?ToolCall = null,
 

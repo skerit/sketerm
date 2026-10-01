@@ -322,6 +322,7 @@ comptime {
     _ = @import("agent/screen_source.zig");
     _ = @import("agent/http.zig");
     _ = @import("agent/output.zig");
+    _ = @import("agent/select.zig");
     _ = @import("agent/opencode.zig");
     _ = @import("agent/agent.zig");
     _ = @import("agent/launch.zig");

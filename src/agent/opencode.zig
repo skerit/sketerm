@@ -19,6 +19,7 @@ const vocab = @import("vocab.zig");
 const adapter = @import("adapter.zig");
 const events = @import("events.zig");
 const output = @import("output.zig");
+const select = @import("select.zig");
 const grammar = @import("grammar.zig");
 const http = @import("http.zig");
 const c = @import("../c.zig").c;
@@ -183,6 +184,8 @@ pub const Source = struct {
     ready: bool = false,
     state: vocab.State = .starting,
     done_armed: bool = false,
+    /// Segment ends so far, for the re-wake rule.
+    waker: select.Waker = .{},
     idle_since_ms: ?i64 = null,
     retry_reported: bool = false,
     exited: bool = false,
@@ -513,7 +516,11 @@ pub const Source = struct {
         if (st != .retry) self.retry_reported = false;
         if (st == .idle) {
             if (self.idle_since_ms == null) self.idle_since_ms = now_ms;
-        } else self.idle_since_ms = null;
+        } else {
+            self.idle_since_ms = null;
+            // Busy again without a new prompt: a new segment of the same job.
+            if (self.turns > 0 and !self.quiet) self.done_armed = true;
+        }
     }
 
     fn isRoot(self: *const Source, id: []const u8) bool {
@@ -780,7 +787,7 @@ pub const Source = struct {
             .id = self.nextId(),
             .kind = kind,
             .text = owned_text,
-            .turn = self.turns -| 1,
+            .job = self.turns -| 1,
             .synthetic = synthetic,
             .tool = owned_tool,
         });
@@ -985,7 +992,9 @@ pub const Source = struct {
 
         if (self.state == .idle and self.done_armed and self.settled(now_ms)) {
             self.done_armed = false;
-            _ = try self.queue.push(now_ms, .done, null, self.finalMessage(), "");
+            const job = self.turns -| 1;
+            const end = self.waker.segmentEnd(self.records.items, job);
+            if (end.wake) _ = try self.queue.pushDone(now_ms, job, end.answer);
         }
     }
 
@@ -1014,17 +1023,6 @@ pub const Source = struct {
             answered = true;
         }
         return answered;
-    }
-
-    /// The latest assistant record of the current turn ("" when none).
-    fn finalMessage(self: *const Source) []const u8 {
-        const turn = self.turns -| 1;
-        var best: ?Record = null;
-        for (self.records.items) |r| {
-            if (r.kind != .assistant or r.turn != turn) continue;
-            best = r;
-        }
-        return if (best) |b| b.text else "";
     }
 };
 
@@ -1877,6 +1875,51 @@ test "a normal turn: no early done, streamed text, a tool record updated in plac
     const kinds = [_]vocab.RecordKind{ .user, .tool, .assistant };
     for (rig.src.records.items, kinds) |r, k| try t.expectEqual(k, r.kind);
     try t.expectEqualStrings("openai", rig.src.seenModel().?.provider);
+}
+
+test "a job's later segment: its final is flagged, only a substantive one wakes again" {
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    try connectRoot(&rig);
+    const long = "s" ** 400;
+    try feedPrompt(&rig, 1, 1, "summarize, ignore wakeups");
+    try feedStatus(&rig, 2, "ses_root", "busy");
+    try feedAssistant(&rig, 3, "msg_a1", false);
+    try feedText(&rig, 4, "msg_a1", "prt_a1", long);
+    try feedAssistant(&rig, 5, "msg_a1", true);
+    try feedStatus(&rig, 6, "ses_root", "idle");
+    try t.expectEqual(@as(usize, 1), rig.count(.done));
+    try t.expectEqualStrings(long, rig.last(.done).?.text);
+    try t.expectEqual(@as(?u32, 0), rig.last(.done).?.job);
+    try t.expect(rig.src.records.items[1].segment_final);
+
+    // Busy again without a prompt: the same job. A trivial reply is
+    // recorded and flagged, but raises no second done.
+    try feedStatus(&rig, 10, "ses_root", "busy");
+    try t.expectEqual(vocab.State.working, rig.src.state);
+    try feedAssistant(&rig, 11, "msg_a2", false);
+    try feedText(&rig, 12, "msg_a2", "prt_a2", "ignoring wakeup.");
+    try feedAssistant(&rig, 13, "msg_a2", true);
+    try feedStatus(&rig, 14, "ses_root", "idle");
+    try rig.src.tick(9000);
+    try t.expectEqual(vocab.State.idle, rig.src.state);
+    try t.expectEqual(@as(usize, 1), rig.count(.done));
+    const recs = rig.src.records.items;
+    try t.expectEqual(@as(usize, 3), recs.len);
+    try t.expectEqual(@as(u32, 0), recs[2].job);
+    try t.expect(recs[2].segment_final);
+    try t.expect(recs[1].segment_final);
+
+    // A substantive later segment wakes, with itself as the answer.
+    const more = "m" ** 350;
+    try feedStatus(&rig, 20, "ses_root", "busy");
+    try feedAssistant(&rig, 21, "msg_a3", false);
+    try feedText(&rig, 22, "msg_a3", "prt_a3", more);
+    try feedAssistant(&rig, 23, "msg_a3", true);
+    try feedStatus(&rig, 24, "ses_root", "idle");
+    try t.expectEqual(@as(usize, 2), rig.count(.done));
+    try t.expectEqualStrings(more, rig.last(.done).?.text);
 }
 
 test "a text part cut off by its message completing keeps what the deltas built" {

@@ -30,6 +30,7 @@ const agent_mod = @import("../agent/agent.zig");
 const events = @import("../agent/events.zig");
 const vocab = @import("../agent/vocab.zig");
 const output = @import("../agent/output.zig");
+const select = @import("../agent/select.zig");
 const launch = @import("../agent/launch.zig");
 const screen_source = @import("../agent/screen_source.zig");
 const opencode = @import("../agent/opencode.zig");
@@ -98,8 +99,9 @@ const SSH_LOST_STATUS: i32 = 255;
 /// are offered: MCP clients put them in the assistant's system prompt.
 pub const INSTRUCTIONS =
     "sketerm can run other coding agents for you as sub-agents. To delegate work to Claude Code or opencode, call agent_open " ++
-    "(app \"claude\" or \"opencode\", optionally with a prompt) and agent_send; results carry the agent's final message, " ++
-    "pending prompts (answer with agent_answer) and events, never raw screens, and agent_read returns the transcript. " ++
+    "(app \"claude\" or \"opencode\", optionally with a prompt) and agent_send; results carry the finished job's answer and its " ++
+    "other key messages, pending prompts (answer with agent_answer) and events, never raw screens, and agent_read returns the same " ++
+    "per job for what you have not read yet (detail \"all\" for every message, include_tools for tool calls). " ++
     "When a result says still_working, run its watch_command in the background (or as a Monitor with --follow) " ++
     "to be woken when the agent finishes or needs input, instead of polling with agent_wait.";
 
@@ -136,6 +138,9 @@ pub const Entry = struct {
     seen_snapshots: u32 = 0,
     /// What the ASSISTANT has been handed (every agent_* result).
     cursor: events.Cursor = .{},
+    /// The highest record id an agent_read covered: the next read without
+    /// `since` returns the jobs holding newer records.
+    read_cursor: u64 = 0,
     /// The SSH host the agent runs on; null = this machine.
     host: ?[]u8 = null,
     transport: Transport = .local,
@@ -913,6 +918,7 @@ const EventJson = struct {
     detail: []const u8,
     count: u32,
     class: ?[]const u8 = null,
+    job: ?u32 = null,
 };
 
 const InteractionJson = struct {
@@ -943,14 +949,24 @@ fn finish(arena: std.mem.Allocator, res: *Res, e: *Entry, dv: Delivered, filter:
     try res.fact("transport", @tagName(e.transport));
 
     var message: ?[]const u8 = null;
+    var job_block: ?Block = null;
     if (dv.wait) |w| {
         const post = dv.items[w.post_from..];
         const outcome = outcomeOf(post, st);
         try res.fact("outcome", outcome);
+        var job: ?u32 = null;
         for (post) |it| if (it.kind == .done) {
             message = it.event.text;
+            job = it.event.job;
         };
         if (message) |m| try res.fact("message", m);
+        // The finished job as agent_read would return it: no extra read.
+        if (job) |j| {
+            var one = [1]u32{j};
+            const recs = e.agent.records();
+            const sel = try select.select(arena, recs, .{ .list = &one, .fallback = false }, .{});
+            job_block = .{ .name = try std.fmt.allocPrint(arena, "job {d}", .{j}), .body = try writeSelection(arena, res, recs, sel) };
+        }
         try res.fact("timed_out", w.timed_out);
         try res.textf("{s}: {s} (state {s})", .{ e.id, outcome, @tagName(st) });
         if (w.timed_out)
@@ -965,6 +981,7 @@ fn finish(arena: std.mem.Allocator, res: *Res, e: *Entry, dv: Delivered, filter:
         .detail = it.event.detail,
         .count = it.event.count,
         .class = if (it.event.class) |cls| @tagName(cls) else null,
+        .job = it.event.job,
     };
     try res.raw("events", try toJson(arena, evs));
     if (dv.digest) |g| {
@@ -989,7 +1006,8 @@ fn finish(arena: std.mem.Allocator, res: *Res, e: *Entry, dv: Delivered, filter:
     }
 
     for (extra) |b| try block(res, b);
-    if (message) |m| try block(res, .{ .name = "message", .body = m });
+    // The job block holds the message among its selected ones.
+    if (job_block) |b| try block(res, b) else if (message) |m| try block(res, .{ .name = "message", .body = m });
     if (dv.items.len > 0) {
         var aw: std.Io.Writer.Allocating = .init(arena);
         for (dv.items, 0..) |ev, i| {
@@ -2145,39 +2163,91 @@ const RecordJson = struct {
     id: u64,
     kind: []const u8,
     text: []const u8,
-    turn: u32,
+    job: u32,
     synthetic: bool,
     tool: ?struct { name: []const u8, input: []const u8, status: []const u8, output: []const u8 } = null,
 };
 
-fn readTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]const u8 {
-    const since: u64 = @intCast(@max(argInt(args, "since") orelse 0, 0));
-    const limit: usize = @intCast(std.math.clamp(argInt(args, "limit") orelse READ_DEFAULT, 1, READ_MAX));
-    var recs: std.ArrayList(output.Record) = .empty;
-    try e.agent.recordsSince(since, &recs, arena);
-    const shown = recs.items[0..@min(limit, recs.items.len)];
-    const out = try arena.alloc(RecordJson, shown.len);
-    var transcript: std.Io.Writer.Allocating = .init(arena);
-    for (shown, out, 0..) |r, *j, i| {
+/// Write a selection's facts (`records`, `jobs`, `cut_ids`).
+/// @return its text block: per job a marker line, then its records.
+fn writeSelection(arena: std.mem.Allocator, res: *Res, recs: []const output.Record, sel: select.Selection) ![]const u8 {
+    const out = try arena.alloc(RecordJson, sel.picked.len);
+    for (sel.picked, out) |i, *j| {
+        const r = recs[i];
         j.* = .{
             .id = r.id,
             .kind = @tagName(r.kind),
             .text = r.text,
-            .turn = r.turn,
+            .job = r.job,
             .synthetic = r.synthetic,
             .tool = if (r.tool) |tc| .{ .name = tc.name, .input = tc.input, .status = @tagName(tc.status), .output = tc.output } else null,
         };
-        if (i > 0) try transcript.writer.writeAll("\n");
-        try transcript.writer.print("[{d}] {s}: {s}", .{ r.id, @tagName(r.kind), r.text });
     }
-    const next: u64 = if (shown.len > 0) shown[shown.len - 1].id else since;
-    var res = Res.init(arena);
-    try res.textf("{d} record(s) after {d}{s}; next_since {d}", .{ shown.len, since, if (recs.items.len > shown.len) " (more follow)" else "", next });
     try res.raw("records", try toJson(arena, out));
+    try res.raw("jobs", try toJson(arena, sel.jobs));
+    try res.fact("cut_ids", sel.cut);
+
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    for (sel.jobs, 0..) |s, n| {
+        if (n > 0) try w.writeAll("\n");
+        try w.print("== job {d}", .{s.job});
+        if (s.omitted_messages > 0 or s.omitted_tools > 0) {
+            try w.writeAll(" (");
+            if (s.omitted_messages > 0) try w.print("{d} more message{s}", .{ s.omitted_messages, if (s.omitted_messages == 1) "" else "s" });
+            if (s.omitted_messages > 0 and s.omitted_tools > 0) try w.writeAll(", ");
+            if (s.omitted_tools > 0) try w.print("{d} tool call{s}", .{ s.omitted_tools, if (s.omitted_tools == 1) "" else "s" });
+            try w.writeAll(")");
+        }
+        try w.writeAll(" ==");
+        for (sel.picked) |i| {
+            const r = recs[i];
+            if (r.job == s.job) try w.print("\n[{d}] {s}: {s}", .{ r.id, @tagName(r.kind), r.text });
+        }
+    }
+    if (sel.cut.len > 0) {
+        try w.print("\n{d} selected record(s) left out by the {d}-character cap, ids", .{ sel.cut.len, select.READ_CAP_CHARS });
+        for (sel.cut) |id| try w.print(" {d}", .{id});
+        try w.writeAll(": agent_read with detail all and a since below an id returns it");
+    }
+    return aw.written();
+}
+
+fn readTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]const u8 {
+    const detail = if (argStr(args, "detail")) |d|
+        std.meta.stringToEnum(select.Detail, d) orelse return errRes(arena, .invalid_args, "detail must be selected or all")
+    else
+        select.Detail.selected;
+    const explicit = argInt(args, "since");
+    const base: u64 = if (explicit) |s| @intCast(@max(s, 0)) else e.read_cursor;
+    const limit: usize = @intCast(std.math.clamp(argInt(args, "limit") orelse READ_DEFAULT, 1, READ_MAX));
+    const recs = e.agent.records();
+    const jobs = try select.jobsAfter(arena, recs, base);
+    const sel = try select.select(arena, recs, jobs, .{ .detail = detail, .include_tools = argBool(args, "include_tools"), .limit = limit, .since = base });
+    var high = base;
+    for (recs) |r| high = @max(high, r.id);
+    // A paged `all` read goes on after its last record; any other covers everything.
+    const next: u64 = if (sel.more) recs[sel.picked[sel.picked.len - 1]].id else high;
+    e.read_cursor = @max(e.read_cursor, next);
+
+    var res = Res.init(arena);
+    const body = try writeSelection(arena, &res, recs, sel);
+    if (jobs.list.len == 0)
+        try res.text("no records yet")
+    else
+        try res.textf("{d} record(s) of job(s) {d}-{d}{s}; next_since {d}{s}", .{
+            sel.picked.len,
+            jobs.list[0],
+            jobs.list[jobs.list.len - 1],
+            if (jobs.fallback) " (nothing new: the latest job again)" else "",
+            next,
+            if (sel.more) " (more follow)" else "",
+        });
+    try res.fact("detail", @tagName(detail));
     try res.fact("next_since", next);
-    try res.fact("more", recs.items.len > shown.len);
-    const blocks = [1]Block{.{ .name = "records", .body = transcript.written() }};
-    return finish(arena, &res, e, try pending(arena, e), .{}, blocks[0..@intFromBool(shown.len > 0)]);
+    try res.fact("more", sel.more);
+    const blocks = [1]Block{.{ .name = "records", .body = body }};
+    return finish(arena, &res, e, try pending(arena, e), .{}, blocks[0..@intFromBool(jobs.list.len > 0)]);
 }
 
 fn listTool(arena: std.mem.Allocator) ![]const u8 {
@@ -3049,9 +3119,25 @@ test "every agent tool answers in its declared shape: a scripted Claude Code on 
     const sent = try shaped(a, "agent_send", try rig.call(.agent_send, "{\"text\":\"hello\",\"timeout_ms\":10000}"));
     try testing.expectEqualStrings("done", sent.get("outcome").?.string);
     try testing.expectEqualStrings("echo: hello", sent.get("message").?.string);
+    // The done carries its job's selection: the answer, never the prompt.
+    const sent_recs = sent.get("records").?.array.items;
+    try testing.expectEqual(@as(usize, 1), sent_recs.len);
+    try testing.expectEqualStrings("echo: hello", sent_recs[0].object.get("text").?.string);
+    try testing.expectEqual(@as(i64, 0), sent.get("jobs").?.array.items[0].object.get("job").?.integer);
 
     const read = try shaped(a, "agent_read", try rig.call(.agent_read, "{}"));
-    try testing.expectEqual(@as(usize, 2), read.get("records").?.array.items.len);
+    const read_recs = read.get("records").?.array.items;
+    try testing.expectEqual(@as(usize, 1), read_recs.len);
+    try testing.expectEqualStrings("assistant", read_recs[0].object.get("kind").?.string);
+    try testing.expectEqualStrings("selected", read.get("detail").?.string);
+    // Nothing unread: the latest job again; detail all with tools has the
+    // same (the fake app draws no tool call).
+    const again = try shaped(a, "agent_read", try rig.call(.agent_read, "{}"));
+    try testing.expectEqual(@as(usize, 1), again.get("records").?.array.items.len);
+    try testing.expectEqual(read.get("next_since").?.integer, again.get("next_since").?.integer);
+    const all = try shaped(a, "agent_read", try rig.call(.agent_read, "{\"detail\":\"all\",\"include_tools\":true,\"since\":0}"));
+    try testing.expectEqual(@as(usize, 1), all.get("records").?.array.items.len);
+    try expectError(a, "agent_read", try rig.call(.agent_read, "{\"detail\":\"everything\"}"), "invalid_args");
 
     const asked = try shaped(a, "agent_send", try rig.call(.agent_send, "{\"text\":\"please ask permission\",\"timeout_ms\":10000}"));
     try testing.expectEqualStrings("needs_input", asked.get("outcome").?.string);
@@ -3081,10 +3167,10 @@ test "every agent tool answers in its declared shape: a scripted Claude Code on 
     var arg_buf: [64]u8 = undefined;
     const set_read = try shaped(a, "agent_read", try rig.call(.agent_read, try std.fmt.bufPrint(&arg_buf, "{{\"since\":{d}}}", .{before_set})));
     const set_recs = set_read.get("records").?.array.items;
-    try testing.expectEqual(@as(usize, 3), set_recs.len);
+    try testing.expectEqual(@as(usize, 2), set_recs.len);
     try testing.expectEqualStrings("notice", set_recs[0].object.get("kind").?.string);
     try testing.expect(std.mem.indexOf(u8, set_recs[0].object.get("text").?.string, "model set to haiku for this session: Set model to Haiku 4.5") != null);
-    try testing.expectEqualStrings("right after", set_recs[1].object.get("text").?.string);
+    try testing.expectEqualStrings("echo: right after", set_recs[1].object.get("text").?.string);
     // Effort only takes at launch; a term_open terminal cannot be relaunched.
     try expectError(a, "agent_set", try rig.call(.agent_set, "{\"effort\":\"high\"}"), "refused");
     try expectError(a, "agent_set", try rig.call(.agent_set, "{\"effort\":\"turbo\"}"), "invalid_args");

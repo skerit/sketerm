@@ -34,6 +34,8 @@ pub const Event = struct {
     text: []u8,
     /// Owned by the queue; e.g. the reset time of a `limit` error.
     detail: []u8,
+    /// `done`: the job whose segment ended (`select.zig`).
+    job: ?u32 = null,
 };
 
 pub const Limits = struct {
@@ -103,6 +105,14 @@ pub const Queue = struct {
             self.freeEvent(self.events.orderedRemove(0));
             self.evicted += 1;
         }
+        return seq;
+    }
+
+    /// Record that `job`'s segment ended with `text` as its answer.
+    /// @return the seq.
+    pub fn pushDone(self: *Queue, now_ms: i64, job: u32, text: []const u8) !u64 {
+        const seq = try self.push(now_ms, .done, null, text, "");
+        self.events.items[self.events.items.len - 1].job = job;
         return seq;
     }
 

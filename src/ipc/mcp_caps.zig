@@ -438,9 +438,18 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
             if (try mcp_agent.waiterTemplate(arena)) |w| try res.fact("agent_waiter", w) else try res.raw("agent_waiter", "null");
         } else try res.raw("agent_waiter", "null");
         try res.fact("open_agents", mcp_agent.state.entries.items.len);
-        if (agents_ok)
-            try res.textf("sub-agents: agent_open runs one of {d} adapter(s) on this machine{s}; results carry a watch_command that wakes you when it needs attention", .{ ids.len, if (agent_ssh) " or on an SSH host (host)" else " (no ssh client here, so not on SSH hosts)" })
-        else
+        const select = @import("../agent/select.zig");
+        try res.fact("agent_read_select", .{
+            .unit = "job",
+            .default_detail = @tagName(select.Detail.selected),
+            .final_min_chars = select.FINAL_MIN_CHARS,
+            .long_min_chars = select.LONG_MIN_CHARS,
+            .cap_chars = select.READ_CAP_CHARS,
+        });
+        if (agents_ok) {
+            try res.textf("sub-agents: agent_open runs one of {d} adapter(s) on this machine{s}; results carry a watch_command that wakes you when it needs attention", .{ ids.len, if (agent_ssh) " or on an SSH host (host)" else " (no ssh client here, so not on SSH hosts)" });
+            try res.textf("agent_read and done results return per job its last message, earlier segment finals of {d}+ chars, messages of {d}+ chars and notices, about {d} chars per read (detail all for every message)", .{ select.FINAL_MIN_CHARS, select.LONG_MIN_CHARS, select.READ_CAP_CHARS });
+        } else
             try res.text("sub-agents (agent_*) are unavailable in --shared mode: they run on an isolated or durable instance's private daemon");
     }
 

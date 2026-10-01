@@ -6480,12 +6480,16 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
         expectFact(sent, "outcome", "done", "agent_send: outcome");
         expectFact(sent, "message", "echo: hello there", "agent_send: final message");
 
+        // The done carried its job's selection: the answer, not the prompt.
+        const sent_recs = (sent.get("records") orelse fail("agent_send: no records with the done")).array.items;
+        if (sent_recs.len != 1 or !std.mem.eql(u8, sent_recs[0].object.get("text").?.string, "echo: hello there")) fail("agent_send: the done's records are not its job's answer");
+        // Unread, the job reads the same: its answer, never the prompt.
         const read = agentCall(&m, arena, "agent_read", "{\"agent\":\"claude-1\"}", "agent_read", false, 15_000);
         const recs = read.get("records").?.array.items;
-        if (recs.len != 2) fail("agent_read: expected the user and assistant records of one turn");
-        if (!std.mem.eql(u8, recs[0].object.get("kind").?.string, "user") or !std.mem.eql(u8, recs[0].object.get("text").?.string, "hello there") or
-            !std.mem.eql(u8, recs[1].object.get("kind").?.string, "assistant"))
+        if (recs.len != 1) fail("agent_read: expected the one assistant record of one job");
+        if (!std.mem.eql(u8, recs[0].object.get("kind").?.string, "assistant") or !std.mem.eql(u8, recs[0].object.get("text").?.string, "echo: hello there"))
             fail("agent_read: wrong records");
+        if (read.get("jobs").?.array.items.len != 1) fail("agent_read: expected one job");
         var since = read.get("next_since").?.integer;
 
         // A permission prompt waits for its answer.
@@ -6539,11 +6543,9 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
         expectFact(slow_done, "outcome", "done", "agent_wait slow: outcome");
         expectFact(slow_done, "message", "echo: slow reply", "agent_wait slow: message");
         const slow_read = agentCall(&m, arena, "agent_read", std.fmt.allocPrint(arena, "{{\"agent\":\"claude-1\",\"since\":{d}}}", .{since}) catch fail("oom"), "agent_read slow", false, 15_000);
-        // The turn was captured once, late: its prompt and its answer, each once.
+        // The turn was captured once, late: its answer, once.
         const slow_recs = slow_read.get("records").?.array.items;
-        if (slow_recs.len != 2 or !std.mem.eql(u8, slow_recs[0].object.get("text").?.string, "slow reply") or
-            !std.mem.eql(u8, slow_recs[1].object.get("text").?.string, "echo: slow reply"))
-        {
+        if (slow_recs.len != 1 or !std.mem.eql(u8, slow_recs[0].object.get("text").?.string, "echo: slow reply")) {
             say(std.json.Stringify.valueAlloc(arena, slow_read.get("records").?, .{}) catch "?");
             fail("agent_read: the late-observed turn is not exactly its answer");
         }
@@ -6570,7 +6572,7 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
         // The adapter's command is a notice, not `user: /model`.
         const set_read = agentCall(&m, arena, "agent_read", std.fmt.allocPrint(arena, "{{\"agent\":\"claude-1\",\"since\":{d}}}", .{before_set}) catch fail("oom"), "agent_read after set", false, 15_000);
         const set_recs = set_read.get("records").?.array.items;
-        if (set_recs.len != 3 or !std.mem.eql(u8, set_recs[0].object.get("kind").?.string, "notice") or
+        if (set_recs.len != 2 or !std.mem.eql(u8, set_recs[0].object.get("kind").?.string, "notice") or
             std.mem.indexOf(u8, set_recs[0].object.get("text").?.string, "model set to Haiku") == null)
         {
             say(std.json.Stringify.valueAlloc(arena, set_read.get("records").?, .{}) catch "?");
@@ -6907,10 +6909,10 @@ fn agentSshStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u
         const after = agentCall(&m, arena, "agent_send", "{\"agent\":\"claude-1\",\"text\":\"after the drop\",\"timeout_ms\":20000}", "agent_send after drop", false, 45_000);
         expectFact(after, "message", "echo: after the drop", "agent_send after the reconnect");
         // The resync is a wipe: nothing captured twice.
-        const all = agentCall(&m, arena, "agent_read", "{\"agent\":\"claude-1\"}", "agent_read remote", false, 15_000);
+        const all = agentCall(&m, arena, "agent_read", "{\"agent\":\"claude-1\",\"detail\":\"all\",\"since\":0}", "agent_read remote", false, 15_000);
         var hellos: usize = 0;
         for (all.get("records").?.array.items) |r| {
-            if (std.mem.eql(u8, r.object.get("text").?.string, "hello from afar")) hellos += 1;
+            if (std.mem.eql(u8, r.object.get("text").?.string, "echo: hello from afar")) hellos += 1;
         }
         if (hellos != 1) fail("agent_read: the resync captured a turn twice");
 

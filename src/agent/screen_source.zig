@@ -20,13 +20,15 @@ const adapter = @import("adapter.zig");
 const events = @import("events.zig");
 const grammar = @import("grammar.zig");
 const output = @import("output.zig");
+const select = @import("select.zig");
 const Screen = @import("../grid/screen.zig").Screen;
 const cell_mod = @import("../grid/cell.zig");
 
 pub const Line = grammar.Line;
 pub const Interaction = grammar.Interaction;
 
-/// `turn` indexes `Engine.turns`; a `synthetic` record came through
+/// `job` indexes `Engine.turns` (a turn the app starts on its own prints
+/// no user record, so it extends the job); a `synthetic` record came through
 /// `Engine.addNotice` and is kept when its turn is re-captured. Screen
 /// records never carry a `tool` call.
 pub const Record = output.Record;
@@ -94,9 +96,8 @@ pub const Engine = struct {
     bells_acked: u64 = 0,
     lone_bell: bool = false,
     lone_bell_at_ms: i64 = 0,
-    /// `next_record_id` when the latest turn started: its final message is
-    /// an assistant record created since.
-    turn_first_record: u64 = 1,
+    /// Segment ends so far, for the re-wake rule.
+    waker: select.Waker = .{},
 
     // Derived state.
     ready: bool = false,
@@ -210,7 +211,7 @@ pub const Engine = struct {
         const owned = try self.allocator.dupe(u8, text);
         errdefer self.allocator.free(owned);
         const turn: u32 = if (self.turns.items.len > 0) @intCast(self.turns.items.len - 1) else 0;
-        try self.records.append(self.allocator, .{ .id = self.nextId(), .kind = .notice, .text = owned, .turn = turn, .synthetic = true });
+        try self.records.append(self.allocator, .{ .id = self.nextId(), .kind = .notice, .text = owned, .job = turn, .synthetic = true });
     }
 
     /// The adapter is about to type `text` as its own command: the turn it
@@ -333,7 +334,6 @@ pub const Engine = struct {
             self.turn_open = self.starts > self.ends;
             if (a_delta > 0) {
                 self.done_armed = true;
-                self.turn_first_record = self.next_record_id;
                 self.clearTurnErrors();
             }
             if (self.turn_open) {
@@ -489,8 +489,12 @@ pub const Engine = struct {
         if (self.state == .idle and self.done_armed and self.captured_since_end) {
             self.done_armed = false;
             // An adapter command's turn is not a turn the assistant asked for.
-            const hidden = self.turns.items.len > 0 and self.turns.items[self.turns.items.len - 1].hidden;
-            if (!hidden) _ = try self.queue.push(now_ms, .done, null, self.finalMessage(), "");
+            const n = self.turns.items.len;
+            if (n > 0 and !self.turns.items[n - 1].hidden) {
+                const job: u32 = @intCast(n - 1);
+                const end = self.waker.segmentEnd(self.records.items, job);
+                if (end.wake) _ = try self.queue.pushDone(now_ms, job, end.answer);
+            }
         }
     }
 
@@ -499,15 +503,18 @@ pub const Engine = struct {
         self.lone_bell = false;
     }
 
+    /// The footer is the newest content: a record or text line below it
+    /// means it is an earlier turn's (a turn the app starts on its own
+    /// prints below the previous footer before it answers).
     fn footerBelowRecords(self: *const Engine) bool {
         const m = self.sc.footer orelse return false;
         var i = self.rows.items.len;
         while (i > 0) {
             i -= 1;
             const l = self.rows.items[i];
-            if (l.live) continue;
+            if (l.live or l.text.len == 0) continue;
             if (m.matches(l.text)) return true;
-            if (grammar.classify(self.sc, l) == .record) return false;
+            if (grammar.classify(self.sc, l) != .chrome) return false;
         }
         return false;
     }
@@ -520,17 +527,6 @@ pub const Engine = struct {
             if (!l.live and l.text.len > 0) return l.text;
         }
         return "";
-    }
-
-    /// The latest assistant record created since the turn started ("" when
-    /// the turn left none, e.g. it was interrupted before answering).
-    fn finalMessage(self: *const Engine) []const u8 {
-        var best: ?Record = null;
-        for (self.records.items) |r| {
-            if (r.kind != .assistant or r.id < self.turn_first_record) continue;
-            if (best == null or r.id > best.?.id) best = r;
-        }
-        return if (best) |b| b.text else "";
     }
 
     /// Error lines of the current turn (everything after the last user
@@ -763,8 +759,9 @@ pub const Engine = struct {
                 .id = if (kept) |k| k.id else self.nextId(),
                 .kind = r.kind,
                 .text = text,
-                .turn = @intCast(ti),
+                .job = @intCast(ti),
                 .announced = if (kept) |k| k.announced else false,
+                .segment_final = if (kept) |k| k.segment_final else false,
             }) catch |err| {
                 self.allocator.free(text);
                 return err;
@@ -1042,10 +1039,65 @@ test "a subagent wait is not done; the continuation turn extends the same turn" 
     try t.expectEqual(@as(usize, 1), countKind(&rig.engine, .done));
     const recs = rig.engine.records.items;
     try t.expectEqual(@as(usize, 5), recs.len);
-    try t.expectEqual(@as(u32, 0), recs[4].turn);
+    try t.expectEqual(@as(u32, 0), recs[4].job);
     try t.expectEqual(vocab.RecordKind.notice, recs[3].kind);
     try t.expectEqualStrings("found it in screen.zig", recs[4].text);
     try t.expectEqual(@as(usize, 1), rig.engine.turns.items.len);
+}
+
+test "a turn the app starts on its own extends the job; only a substantive reply wakes again" {
+    var rig: Rig = undefined;
+    try rig.init(100, 30);
+    defer rig.deinit();
+    rig.write("\x1b]0;\xe2\x9c\xb3 C\x07" ++ live);
+    try rig.feed(0);
+    try rig.engine.tick(1000);
+    const line = "s" ** 90;
+    const summary = line ++ "\n" ++ line ++ "\n" ++ line ++ "\n" ++ line;
+    rig.write("\x1b]133;A\x07\x1b]0;\xe2\x97\x90 C\x07" ++ erase ++ "you: summarize, ignore wakeups\r\ntool: Bash (sleep 20)\r\nclaude: " ++
+        line ++ "\r\n" ++ line ++ "\r\n" ++ line ++ "\r\n" ++ line ++ "\r\n" ++ live ++
+        "\x1b]133;C\x07\x1b]133;D\x07\x07\x1b]0;\xe2\x9c\xb3 C\x07" ++ erase ++ "Crunched for 10s \xc2\xb7 done\r\n" ++ live);
+    try rig.feed(1100);
+    try rig.engine.tick(3000);
+    try t.expectEqual(@as(usize, 1), countKind(&rig.engine, .done));
+    try t.expectEqualStrings(summary, rig.engine.queue.events.items[rig.engine.queue.events.items.len - 1].text);
+    try t.expect(rig.engine.records.items[2].segment_final);
+
+    // The wake, as claude draws it (observed, 2.1.286): no user line, a
+    // notification below the previous footer, the end mark before the
+    // answer. The old footer must not pass for this turn's.
+    rig.write("\x1b]0;\xe2\x97\x90 C\x07\x1b]133;A\x07" ++ erase ++ " Background command \"Sleep\" completed (exit code 0)\r\nIonizing\xe2\x80\xa6\r\n" ++ live);
+    try rig.feed(28_000);
+    rig.write("\x1b]133;C\x07\x1b]133;D\x07\x07\x1b]0;\xe2\x9c\xb3 C\x07");
+    try rig.feed(29_000);
+    try t.expectEqual(vocab.State.working, rig.engine.state);
+    rig.write("\x1b[2K\x1b[1A" ++ erase ++ "claude: ignoring wakeup.\r\nCogitated for 1s \xc2\xb7 done\r\n" ++ live);
+    try rig.feed(29_100);
+    try rig.engine.tick(40_000);
+    try t.expectEqual(vocab.State.idle, rig.engine.state);
+    try t.expectEqual(@as(usize, 1), countKind(&rig.engine, .done));
+    try t.expectEqual(@as(usize, 1), rig.engine.turns.items.len);
+    const recs = rig.engine.records.items;
+    try t.expectEqual(@as(usize, 4), recs.len);
+    try t.expectEqualStrings("ignoring wakeup.", recs[3].text);
+    try t.expectEqual(@as(u32, 0), recs[3].job);
+    try t.expect(recs[3].segment_final);
+    // The summary kept its id and flag through the re-capture.
+    try t.expect(recs[2].segment_final);
+    try t.expectEqual(@as(usize, 2), countKind(&rig.engine, .message));
+
+    // A later wake with something to say wakes the caller again.
+    const more = "m" ** 80 ++ "\r\n" ++ "m" ** 80 ++ "\r\n" ++ "m" ** 80 ++ "\r\n" ++ "m" ** 80;
+    rig.write("\x1b]0;\xe2\x97\x90 C\x07\x1b]133;A\x07" ++ erase ++ " Background command \"Build\" completed (exit code 0)\r\nIonizing\xe2\x80\xa6\r\n" ++ live ++
+        "\x1b]133;C\x07\x1b]133;D\x07\x07\x1b]0;\xe2\x9c\xb3 C\x07" ++
+        "\x1b[2K\x1b[1A" ++ erase ++ "claude: " ++ more ++ "\r\nBaked for 1s \xc2\xb7 done\r\n" ++ live);
+    try rig.feed(50_000);
+    try rig.engine.tick(60_000);
+    try t.expectEqual(@as(usize, 2), countKind(&rig.engine, .done));
+    const done = rig.engine.queue.events.items[rig.engine.queue.events.items.len - 1];
+    try t.expectEqual(vocab.EventKind.done, done.kind);
+    try t.expectEqual(@as(?u32, 0), done.job);
+    try t.expectEqual(@as(usize, 323), done.text.len);
 }
 
 test "a clear-and-reprint never duplicates, shrinks or re-adds a turn" {
