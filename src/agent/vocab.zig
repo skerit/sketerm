@@ -63,6 +63,21 @@ pub const EventKind = enum {
             .done, .needs_input, .exited, .message, .match => false,
         };
     }
+
+    /// Which kind a wake-up reports as its outcome when several arrive
+    /// together: the highest rank wins (an agent that is gone outranks a
+    /// prompt waiting for an answer, which outranks a finished turn).
+    pub fn outcomeRank(self: EventKind) u8 {
+        return switch (self) {
+            .exited => 6,
+            .connection_lost => 5,
+            .needs_input => 4,
+            .@"error" => 3,
+            .done => 2,
+            .match => 1,
+            .message => 0,
+        };
+    }
 };
 
 pub const ErrorClass = enum {
@@ -112,6 +127,17 @@ test "event kinds: always-on and coalescing facts" {
     try t.expectEqual(@as(usize, 5), always);
     try t.expect(!EventKind.message.alwaysOn());
     try t.expect(!EventKind.done.coalesces());
+}
+
+test "outcome ranks are distinct and put an ended agent first" {
+    const t = std.testing;
+    var seen = std.StaticBitSet(8).initEmpty();
+    for (std.enums.values(EventKind)) |k| {
+        try t.expect(!seen.isSet(k.outcomeRank()));
+        seen.set(k.outcomeRank());
+        if (k != .exited) try t.expect(k.outcomeRank() < EventKind.exited.outcomeRank());
+    }
+    try t.expect(EventKind.needs_input.outcomeRank() > EventKind.done.outcomeRank());
 }
 
 test "names follow declaration order" {

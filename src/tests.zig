@@ -25,6 +25,8 @@ comptime {
     _ = @import("agent/output.zig");
     _ = @import("agent/opencode.zig");
     _ = @import("agent/agent.zig");
+    _ = @import("agent/launch.zig");
+    _ = @import("ipc/agentwait.zig");
     _ = @import("util/headers.zig");
     _ = @import("util/glob.zig");
     _ = @import("util/pathz.zig");
@@ -257,6 +259,7 @@ comptime {
     _ = @import("ipc/mcp_ui.zig");
     _ = @import("ipc/mcp_web.zig");
     _ = @import("ipc/mcp_webgui.zig");
+    _ = @import("ipc/mcp_agent.zig");
     _ = @import("ipc/paneldrive.zig");
     _ = @import("ipc/evkeys.zig");
     _ = @import("ipc/xkblayout.zig");

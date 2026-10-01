@@ -194,6 +194,16 @@ pub const Cursor = struct {
         if (self.digest == null) return null;
         return q.bucket.msUntilToken(now_ms);
     }
+
+    /// Always-on events this consumer has not been handed yet, without
+    /// taking them (a listing reports the count and leaves the delivery).
+    pub fn pendingAlwaysOn(self: *const Cursor, q: *const Queue) usize {
+        var n: usize = 0;
+        for (q.events.items) |ev| {
+            if (ev.seq > self.seen and ev.kind.alwaysOn()) n += 1;
+        }
+        return n;
+    }
 };
 
 // ── tests ────────────────────────────────────────────────────────
@@ -210,8 +220,10 @@ test "always-on events are delivered in order and advance the cursor" {
     var c: Cursor = .{};
     _ = try q.push(0, .needs_input, null, "Do you want to proceed?", "");
     _ = try q.push(5, .done, null, "final answer", "");
+    try t.expectEqual(@as(usize, 2), c.pendingAlwaysOn(&q));
     const d = (try c.take(&q, .{}, 10, t.allocator)).?;
     defer t.allocator.free(d.items);
+    try t.expectEqual(@as(usize, 0), c.pendingAlwaysOn(&q));
     try t.expectEqual(@as(usize, 2), d.items.len);
     try t.expectEqual(vocab.EventKind.needs_input, d.items[0].kind);
     try t.expectEqual(@as(u64, 2), d.items[1].event.seq);

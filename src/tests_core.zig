@@ -324,6 +324,8 @@ comptime {
     _ = @import("agent/output.zig");
     _ = @import("agent/opencode.zig");
     _ = @import("agent/agent.zig");
+    _ = @import("agent/launch.zig");
+    _ = @import("ipc/agentwait.zig");
     _ = @import("util/headers.zig");
     _ = @import("util/percent.zig");
     _ = @import("util/suggest.zig");

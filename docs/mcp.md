@@ -1,7 +1,7 @@
 # MCP Tools
 
 `sketerm mcp` is a Model Context Protocol server on stdio. Its tools come
-from one table (`src/ipc/mcp_tools.zig`) in eight groups; the reference
+from one table (`src/ipc/mcp_tools.zig`) in nine groups; the reference
 below lists every one. The pane tools drive the running GUI's panes when
 a GUI socket is attached (`--shared`, or an explicit `--socket`) and the
 headless terminals of the server's own daemon otherwise; the `term_*`,
@@ -228,9 +228,23 @@ is kept by a `:ro` policy term. The full descriptions and schemas are in
 - `ui_close`: Close a LIVE panel: it disappears from the user's screen.
 - `ui_delete`: DESTRUCTIVE: permanently delete a SAVED panel document from disk.
 
+### `agent`
+
+- `agent_adapters` (read-only): List the agent adapters this server can run (shipped ones plus user files in $XDG_CONFIG_HOME/sketerm/agents/*.json), whether each app's binary is installed on this machine (and where), and which actions each supports.
+- `agent_open`: Run another coding agent as a SUB-AGENT and talk to it in clean records, never raw screens: app "claude" (Claude Code) or "opencode" (see agent_adapters).
+- `agent_send`: Send a prompt to an idle agent and wait (bounded, timeout_ms default 60000, max 120000) for the turn.
+- `agent_wait` (read-only): Wait (bounded, timeout_ms default 60000, max 120000) for an agent's next wake-up, with agent_send's filter rules, and return the events you were not handed before (a turn that finished meanwhile answers at once, with its final message).
+- `agent_read` (read-only): Read an agent's transcript as records (user, assistant, tool, notice) with stable ids, oldest first.
+- `agent_answer`: Answer the agent's pending prompt (permission, question or choice; see interaction) by option label, its 1-based number or a unique part of a label, then wait for the turn like agent_send.
+- `agent_set`: Change an agent's model and/or effort level for THIS session only, never the user's defaults (Claude Code: /model with its session-only choice, /effort; opencode: the model and variant of the prompts this agent sends).
+- `agent_interrupt`: Interrupt an agent's running turn (Claude Code: Escape; opencode: abort, subagents included).
+- `agent_list` (read-only): List this server's agents: app, state, the session the user can watch, and how many wake-ups each holds that no agent_* result has handed out yet.
+- `agent_close`: Stop an agent: kills its session(s) and ends its waiters.
+- `agent_attach`: Put an adapter on a terminal term_open already created, when you started the app yourself (screen adapters only, e.g. claude --ax-screen-reader).
+
 ### `core`
 
-- `capabilities` (read-only): Preflight report of what THIS MCP server can do right now: isolation mode, headless GUI-app support (headless_gui — launch_app renders apps into the mux daemon and NEVER needs a display, an X server or a sketerm window), whether a direct sketerm GUI control socket is attached (gui_socket; independent of the session panel relay and of headless GUI apps), the live panel transport (panels + panel_transport) and the saved-panel store (panels_store + panel_store), OCR (tesseract) availability, whether the web_* tools can run and against what (web + web_backend "gui"/"session"/"headless"/"none" — "session" adds web_session, the watchable Wayland app session the helper renders into — plus the sketerm-webengine path in web_helper; web_gui says whether the user granted the web_* tools their OWN browser and logins, web_gui_source where that came from and web_gui_transport which GUI socket they hold now; web_profiles says whether named cookie jars work, web_routes which per-tab network routes web_open can honour, web_engine_broker whether the mux daemon owns the engine's lifetime and web_engine_owner who started the one in use; web_downloads whether web_download can pull a url through a view; web_capture whether web_open can record the response bodies a headless view's page receives; web_engine_started whether an engine exists YET, since web_backend/web_watch/web_session are undetermined until it does), ssh/scp presence, the directory terminal asciicast recordings land in, the EFFECTIVE input-timing defaults (hold_ms/settle_ms/timeout_ms/click_retry, each marked when a SKETERM_MCP_* env override changed it from the built-in), and open session counts.
+- `capabilities` (read-only): Preflight report of what THIS MCP server can do right now: isolation mode, headless GUI-app support (headless_gui — launch_app renders apps into the mux daemon and NEVER needs a display, an X server or a sketerm window), whether a direct sketerm GUI control socket is attached (gui_socket; independent of the session panel relay and of headless GUI apps), the live panel transport (panels + panel_transport) and the saved-panel store (panels_store + panel_store), OCR (tesseract) availability, whether the web_* tools can run and against what (web + web_backend "gui"/"session"/"headless"/"none" — "session" adds web_session, the watchable Wayland app session the helper renders into — plus the sketerm-webengine path in web_helper; web_gui says whether the user granted the web_* tools their OWN browser and logins, web_gui_source where that came from and web_gui_transport which GUI socket they hold now; web_profiles says whether named cookie jars work, web_routes which per-tab network routes web_open can honour, web_engine_broker whether the mux daemon owns the engine's lifetime and web_engine_owner who started the one in use; web_downloads whether web_download can pull a url through a view; web_capture whether web_open can record the response bodies a headless view's page receives; web_engine_started whether an engine exists YET, since web_backend/web_watch/web_session are undetermined until it does), ssh/scp presence, the directory terminal asciicast recordings land in, the EFFECTIVE input-timing defaults (hold_ms/settle_ms/timeout_ms/click_retry, each marked when a SKETERM_MCP_* env override changed it from the built-in), whether sub-agents run here (agents, agent_adapters, agent_waiter, agent_ssh), and open session counts.
 <!-- tool-reference:end -->
 
 ## Tool exposure policy
@@ -620,6 +634,70 @@ capability). Headless only; with a GUI it is `unavailable`, and
   resource handler would close that lane. Private-address refusal is
   literal-only: a hostname that resolves to a private address is not
   caught.
+
+## Sub-agents (`agent_*`)
+
+The `agent` group runs another coding agent as a sub-agent and reads it
+through an adapter (`data/agents/*.json`, user overrides in
+`$XDG_CONFIG_HOME/sketerm/agents/`): records (user, assistant, tool,
+notice), a state, the pending prompt and events, never raw screens.
+Claude Code is a `screen` source (launched with `--ax-screen-reader`, read
+off its terminal); opencode is an `opencode_api` source (`opencode serve`
+on a free loopback port, read over its HTTP API and SSE stream, with
+`opencode attach` in a second session for the human).
+
+- **Sessions.** An agent is `agent-<app>-<n>` on the instance's private
+  daemon (opencode adds `agent-<app>-<n>-server`), so the GUI's AI badge
+  and Session Overview list it for watch-along. Both are recorded as
+  asciicasts like every headless terminal. Isolated and durable modes
+  only; `--shared` answers `unavailable` (`capabilities.agents`).
+- **Launch.** The binary is resolved from the adapter's ordered
+  `candidates` (`binary` overrides it: a name looked up the same way, or
+  an absolute path). `unset_env` is applied in the child by a POSIX `sh`
+  wrapper, because the child inherits the daemon's environment, not this
+  server's. opencode's password is random per agent and reaches the
+  server and the TUI through the spawn request's environment, never an
+  argv; a durable instance keeps it in a 0600 file beside the agent's
+  descriptor. A model or effort the launch cannot take is applied through
+  the app once it is ready, session-scoped.
+- **Waiting.** `agent_send`, `agent_answer`, `agent_open prompt` and
+  `agent_wait` wait (bounded, default 60 s, at most 120 s) on the agent's
+  event queue. Always-on wake-ups (`done`, `needs_input`, `error`,
+  `exited`, `connection_lost`) end every wait; `messages:true` and
+  `match:"text"` add opt-in ones, rate limited per agent (burst 3, then
+  one per 30 s; the rest ride the next wake-up as a `digest`). `outcome`
+  is the highest-ranked kind delivered (`vocab.EventKind.outcomeRank`),
+  or `still_working`; `message` is the finished turn's final message.
+  Events no result handed out yet ride the next `agent_*` result, so
+  nothing is lost when no wait was armed.
+- **Being woken.** Every per-agent result carries `watch_command`, the
+  exact command (this executable, absolute) that blocks until the agent
+  next needs attention: `sketerm mcp agent-wait --socket <instance>/agents.sock
+  --since <seq> [--match X] [--messages] <agent>`. It prints one line per
+  wake-up (`claude-1 done: <first line> [state idle]`), exits after the
+  first unless `--follow`, and always prints `watch ended: <reason>` when
+  the agent closes or the server goes away. `sketerm-mcp agent-wait` and
+  `sketerm-mcp mcp agent-wait` are the same command. The waiter and
+  `agent_wait` share one filter and limiter (`events.Cursor.take`); a
+  waiter never advances what the assistant has been handed.
+- **Observation.** The server loop polls stdin together with every agent
+  terminal, API stream and waiter connection, and wakes for the sources'
+  timers, so agents are observed between requests. Turn detection is
+  content-based (OSC 133 marks, the footer line, API events): a turn that
+  ended while another tool call blocked the loop reads the same when it is
+  observed afterwards.
+- **Durable instances.** `--name`/`--durable` keep agents running across
+  restarts: each has a 0600 descriptor in `<instance>/agents/` (adapter,
+  session names and lifetime ids, opencode port, password file, API
+  session), and the next server re-attaches them. A descriptor whose
+  session is gone is removed.
+- **`agent_attach`** puts a screen adapter on a terminal `term_open`
+  created (you started the app yourself); `agent_close` then drops only
+  the adapter.
+
+The server's `instructions` (initialize result) tell the assistant to use
+`agent_open` for Claude Code and opencode and to run `watch_command` in the
+background instead of polling, whenever the agent tools are offered.
 
 ## Panels (`ui_*`)
 

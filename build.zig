@@ -164,6 +164,7 @@ pub fn build(b: *std.Build) void {
     configureSysDeps(b, exe_mod, cbindings_mod);
     exe_mod.addImport("build_options", glib_opts_mod);
     addVideo(b, exe_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
+    addAgentAdapters(b, exe_mod); // `sketerm mcp`'s agent_* tools
     // NSAccessibility bridge (live on macOS: GTK4 has no NSAccessibility
     // backend, so every pane hangs an element on the window's content
     // view through a11y/nsax.zig). main.zig force-includes nsax.zig on
@@ -248,6 +249,7 @@ pub fn build(b: *std.Build) void {
     configureShippableCoreDeps(b, mcp_mod, core_cbindings_mod);
     mcp_mod.addImport("build_options", noglib_opts_mod);
     addVideo(b, mcp_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
+    addAgentAdapters(b, mcp_mod); // the agent_* tools load the shipped adapters
     const mcp_exe = b.addExecutable(.{
         .name = "sketerm-mcp",
         .root_module = mcp_mod,

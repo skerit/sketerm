@@ -266,6 +266,10 @@ const Validator = struct {
         if (s.launch.password_env) |name| {
             if (!validEnvName(name)) return self.fail("launch.password_env \"{s}\" is not an environment variable name", .{name});
         }
+        for (s.launch.unset_env) |name| {
+            const base = if (std.mem.endsWith(u8, name, "*")) name[0 .. name.len - 1] else name;
+            if (!validEnvName(base)) return self.fail("launch.unset_env \"{s}\" is not a variable name (a trailing * matches a prefix)", .{name});
+        }
         inline for (@typeInfo(Actions).@"struct".fields) |f| {
             for (@field(s.actions, f.name)) |step| switch (step) {
                 .text, .pick => |x| try self.placeholders(x, "actions." ++ f.name),
@@ -594,6 +598,15 @@ test "an API source needs a password variable and checks its attach arguments" {
     const bad_ph = std.mem.replaceOwned(u8, t.allocator, api, "{session}", "{sesion}") catch unreachable;
     defer t.allocator.free(bad_ph);
     try expectProblem(bad_ph, "launch.attach_args: unknown placeholder {sesion}");
+    // unset_env entries are names with an optional trailing * (they end up
+    // in a shell case pattern), never anything else.
+    const unset_ok = std.mem.replaceOwned(u8, t.allocator, api, "\"password_env\"", "\"unset_env\": [\"CLAUDE*\", \"X_TOKEN\"], \"password_env\"") catch unreachable;
+    defer t.allocator.free(unset_ok);
+    const l2 = try load(t.allocator, "api.json", unset_ok, .user, &problem);
+    l2.destroy(t.allocator);
+    const unset_bad = std.mem.replaceOwned(u8, t.allocator, api, "\"password_env\"", "\"unset_env\": [\"A;B*\"], \"password_env\"") catch unreachable;
+    defer t.allocator.free(unset_bad);
+    try expectProblem(unset_bad, "launch.unset_env \"A;B*\" is not a variable name");
 }
 
 test "expand fills known placeholders and leaves other braces alone" {

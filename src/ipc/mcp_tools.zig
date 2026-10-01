@@ -12,6 +12,8 @@
 //! defaults into them when it renders tools/list.
 
 const std = @import("std");
+const vocab = @import("../agent/vocab.zig");
+const adapter = @import("../agent/adapter.zig");
 
 const REVIEW_INPUT =
     \\{"type":"object","properties":{"pane":{"type":"integer"},"view":{"type":"integer"},"id":{"type":"string"},"selector":{"type":"string"},"ready_selector":{"type":"string"},"url_contains":{"type":"string"},"expect_preserved":{"type":"boolean"},"timeout_ms":{"type":"integer"},"screenshot":{"type":"boolean"},"out_dir":{"type":"string"}}}
@@ -39,6 +41,9 @@ pub const Group = enum {
     browser,
     /// Agent-authored UI panels.
     ui,
+    /// Sub-agents: other coding agents (Claude Code, opencode) run
+    /// through adapters.
+    agent,
     /// Always exposed regardless of policy.
     core,
 
@@ -153,6 +158,49 @@ const WEB_RESULT_HEAD =
 /// report it (`mcp_web.exchangeJson` writes exactly these keys).
 const EXCHANGE_ITEM_Z =
     \\{"type":"object","properties":{"seq":{"type":"integer","description":"The request's web_network seq (the join key)"},"cursor":{"type":"integer","description":"List position, in the order exchanges FINISHED; 0 = still in flight"},"url":{"type":"string"},"method":{"type":"string"},"status":{"type":"integer"},"type":{"type":"string"},"mime":{"type":"string"},"charset":{"type":"string"},"started_ms":{"type":"integer","description":"Wall clock, ms since the epoch"},"duration_ms":{"type":"integer"},"complete":{"type":"boolean"},"failed":{"type":"boolean","description":"The load failed or was aborted; error is the engine's net error"},"error":{"type":"integer"},"body_bytes":{"type":"integer","description":"Bytes held"},"body_delivered_bytes":{"type":"integer","description":"Bytes the page received, held or not"},"body_truncated":{"type":"boolean"},"body_truncated_reason":{"type":"string","enum":["none","body_cap","total_cap","no_memory","unknown"]},"request_body_bytes":{"type":"integer"},"request_body_total_bytes":{"type":"integer"},"request_body_truncated":{"type":"boolean"},"request_body_truncated_reason":{"type":"string","enum":["none","body_cap","total_cap","no_memory","unknown"]},"request_body_nonbytes":{"type":"boolean","description":"The request had parts that are not bytes (a file upload); only its byte parts are held"},"headers_truncated":{"type":"boolean"},"path":{"type":"string","description":"out_dir only: where the body was written"},"file_bytes":{"type":"integer"},"sha256":{"type":"string"},"encoding":{"type":"string","enum":["utf8","binary"],"description":"out_dir only: text is written as UTF-8 (transcoded from a declared single-byte charset), anything else as its raw bytes"}},"required":["seq","cursor","url","method","status","complete","body_bytes","body_truncated"]}
+;
+
+/// `"a","b"` for a vocabulary enum: every agent schema enum is DERIVED
+/// from its one home (`src/agent/vocab.zig`), so it cannot drift.
+fn enumItems(comptime E: type) []const u8 {
+    comptime {
+        var out: []const u8 = "";
+        for (@typeInfo(E).@"enum".fields, 0..) |f, i| out = out ++ (if (i > 0) "," else "") ++ "\"" ++ f.name ++ "\"";
+        return out;
+    }
+}
+
+/// The outcome of a wait that nothing woke: the one outcome that is not
+/// an event kind.
+pub const OUTCOME_STILL_WORKING = "still_working";
+
+const AGENT_EVENT_ITEM = "{\"type\":\"object\",\"properties\":{\"seq\":{\"type\":\"integer\"},\"kind\":{\"type\":\"string\",\"enum\":[" ++ enumItems(vocab.EventKind) ++
+    "]},\"text\":{\"type\":\"string\"},\"detail\":{\"type\":\"string\",\"description\":\"needs_input: the numbered options; a limit error: its reset time\"},\"count\":{\"type\":\"integer\",\"description\":\"Repeats folded into this event\"},\"class\":{\"type\":\"string\",\"enum\":[" ++
+    enumItems(vocab.ErrorClass) ++ "]}},\"required\":[\"seq\",\"kind\",\"text\"]}";
+
+const AGENT_INTERACTION = "{\"type\":\"object\",\"description\":\"What the agent waits on the user for; answer with agent_answer\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[" ++ enumItems(vocab.InteractionKind) ++
+    "]},\"title\":{\"type\":\"string\"},\"detail\":{\"type\":\"string\"},\"hint\":{\"type\":\"string\"},\"options\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"label\":{\"type\":\"string\"},\"selected\":{\"type\":\"boolean\"}}}}}}";
+
+/// The facts `mcp_agent.finish` writes on every per-agent result.
+const AGENT_PROPS = "\"agent\":{\"type\":\"string\",\"description\":\"The agent id every agent_* tool takes\"},\"app\":{\"type\":\"string\"},\"source\":{\"type\":\"string\",\"enum\":[" ++ enumItems(vocab.SourceKind) ++
+    "]},\"state\":{\"type\":\"string\",\"enum\":[" ++ enumItems(vocab.State) ++
+    "]},\"ready\":{\"type\":\"boolean\",\"description\":\"Input sent now is not lost\"},\"session\":{\"type\":\"string\",\"description\":\"The terminal session the user can watch in the sketerm GUI\"},\"server_session\":{\"type\":\"string\",\"description\":\"API sources: the session running the app's server\"},\"interaction\":" ++ AGENT_INTERACTION ++
+    ",\"events\":{\"type\":\"array\",\"items\":" ++ AGENT_EVENT_ITEM ++ ",\"description\":\"Events not handed out before, oldest first\"},\"digest\":{\"type\":\"object\",\"description\":\"Rate-limited message events held back since the last wake-up\",\"properties\":{\"count\":{\"type\":\"integer\"},\"latest\":{\"type\":\"string\"}}},\"watch_command\":{\"type\":\"string\",\"description\":\"The exact shell command that blocks until this agent next needs attention (with this call's filter); run it in the background, or with --follow as a monitor\"}";
+
+/// The facts of a result that waited.
+const AGENT_WAIT_PROPS = "\"outcome\":{\"type\":\"string\",\"enum\":[" ++ enumItems(vocab.EventKind) ++ ",\"" ++ OUTCOME_STILL_WORKING ++
+    "\"],\"description\":\"The wake-up that ended the wait (the highest-ranked event kind), or still_working\"},\"message\":{\"type\":\"string\",\"description\":\"The final message of the finished turn\"},\"timed_out\":{\"type\":\"boolean\"}";
+
+const AGENT_RECORD_ITEM = "{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"},\"kind\":{\"type\":\"string\",\"enum\":[" ++ enumItems(vocab.RecordKind) ++
+    "]},\"text\":{\"type\":\"string\"},\"turn\":{\"type\":\"integer\"},\"synthetic\":{\"type\":\"boolean\",\"description\":\"Recorded by the adapter, not read from the app (an answered permission)\"},\"tool\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"input\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[" ++
+    enumItems(vocab.ToolStatus) ++ "]},\"output\":{\"type\":\"string\"}}}},\"required\":[\"id\",\"kind\",\"text\",\"turn\"]}";
+
+fn agentSchema(comptime extra: []const u8, comptime required: []const u8) []const u8 {
+    return "{\"type\":\"object\",\"properties\":{" ++ AGENT_PROPS ++ extra ++ "},\"required\":[\"agent\",\"app\",\"source\",\"state\",\"ready\",\"session\",\"events\"" ++ required ++ "]}";
+}
+
+const AGENT_FILTER_INPUT =
+    \\"match":{"type":"string","description":"Also wake on a completed message containing this text (case-insensitive)"},"messages":{"type":"boolean","description":"Also wake on every completed message (rate limited: burst 3, then 1 per 30 s; the rest arrive as a digest)"}
 ;
 
 pub const TOOLS = [_]ToolDef{
@@ -1379,19 +1427,152 @@ pub const TOOLS = [_]ToolDef{
         .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"deleted\":{\"type\":\"string\"},\"session\":{\"type\":[\"string\",\"null\"]}" ++ "},\"required\":[\"deleted\"]}",
     },
 
+    // ── agent: sub-agents through adapters ─────────────────────────
+    .{
+        .name = "agent_adapters",
+        .group = .agent,
+        .mutates = false,
+        .description =
+        \\List the agent adapters this server can run (shipped ones plus user files in $XDG_CONFIG_HOME/sketerm/agents/*.json), whether each app's binary is installed on this machine (and where), and which actions each supports. Adapter files that fail to load are listed as problems, never ignored silently.
+        ,
+        .input_schema =
+        \\{"type":"object","properties":{"host":{"type":"string","description":"SSH host to check instead of this machine (not available yet: answers unavailable)"}}}
+        ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{\"adapters\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"},\"source\":{\"type\":\"string\",\"enum\":[" ++ enumItems(vocab.SourceKind) ++
+            "]},\"origin\":{\"type\":\"string\",\"enum\":[" ++ enumItems(adapter.Origin) ++ "]},\"file\":{\"type\":\"string\"},\"installed\":{\"type\":\"boolean\"},\"binary\":{\"type\":[\"string\",\"null\"]},\"actions\":{\"type\":\"array\",\"items\":{\"type\":\"string\",\"enum\":[" ++
+            enumItems(std.meta.FieldEnum(adapter.Actions)) ++ "]}}}}},\"count\":{\"type\":\"integer\"},\"problems\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"required\":[\"adapters\",\"count\",\"problems\"]}",
+    },
+    .{
+        .name = "agent_open",
+        .group = .agent,
+        .mutates = true,
+        .description =
+        \\Run another coding agent as a SUB-AGENT and talk to it in clean records, never raw screens: app "claude" (Claude Code) or "opencode" (see agent_adapters). It runs on this server's private daemon in a terminal session the user can watch in the sketerm GUI (AI badge / Session Overview). Returns the agent id, its state and a watch_command; with `prompt` it also submits that prompt and waits (bounded) for the turn like agent_send, returning the final message. model/effort apply to this session only. `binary` runs a custom build: an executable name looked up like the adapter's own, or an absolute path. timeout_ms (default 60000, max 120000) bounds the start and the wait. Isolated/durable mode only; `host` (SSH) is not available yet.
+        ,
+        .input_schema = "{\"type\":\"object\",\"properties\":{\"app\":{\"type\":\"string\",\"description\":\"Adapter id: claude, opencode, or a user adapter\"},\"prompt\":{\"type\":\"string\",\"description\":\"Submit this once the agent is ready, and wait for the turn\"},\"cwd\":{\"type\":\"string\",\"description\":\"Absolute working directory (default: this server's)\"},\"model\":{\"type\":\"string\"},\"effort\":{\"type\":\"string\"},\"binary\":{\"type\":\"string\",\"description\":\"Executable name or absolute path overriding the adapter's (e.g. a custom build)\"}," ++ AGENT_FILTER_INPUT ++
+            ",\"timeout_ms\":{\"type\":\"integer\",\"description\":\"Default 60000, max 120000\"},\"cols\":{\"type\":\"integer\"},\"rows\":{\"type\":\"integer\"},\"host\":{\"type\":\"string\",\"description\":\"SSH host (not available yet)\"}},\"required\":[\"app\"]}",
+        .output_schema = agentSchema("," ++ AGENT_WAIT_PROPS ++ ",\"binary\":{\"type\":\"string\"},\"cwd\":{\"type\":\"string\"},\"prompt_sent\":{\"type\":\"boolean\"},\"recordings\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"asciicast recordings of the agent's sessions\"}", ",\"binary\",\"cwd\",\"prompt_sent\""),
+    },
+    .{
+        .name = "agent_send",
+        .group = .agent,
+        .mutates = true,
+        .description =
+        \\Send a prompt to an idle agent and wait (bounded, timeout_ms default 60000, max 120000) for the turn. outcome done + message = the turn's final answer; needs_input = it asks something (interaction; answer with agent_answer); still_working = the turn goes on: run watch_command in the background to be woken instead of polling. Always-on wake-ups (done, needs_input, error, exited, connection_lost) are never suppressed; `messages` also wakes on every completed message and `match` on a message containing a text (rate limited; the rest arrive as a digest). Events you were not handed before ride along in `events`. Refused while the agent is busy or waiting for an answer.
+        ,
+        .input_schema = "{\"type\":\"object\",\"properties\":{\"agent\":{\"type\":\"string\",\"description\":\"Agent id (optional while only one is open)\"},\"text\":{\"type\":\"string\"}," ++ AGENT_FILTER_INPUT ++ ",\"timeout_ms\":{\"type\":\"integer\",\"description\":\"Default 60000, max 120000; 0 returns at once\"}},\"required\":[\"text\"]}",
+        .output_schema = agentSchema("," ++ AGENT_WAIT_PROPS, ",\"outcome\",\"timed_out\""),
+    },
+    .{
+        .name = "agent_wait",
+        .group = .agent,
+        .mutates = false,
+        .description =
+        \\Wait (bounded, timeout_ms default 60000, max 120000) for an agent's next wake-up, with agent_send's filter rules, and return the events you were not handed before (a turn that finished meanwhile answers at once, with its final message). Prefer running watch_command in the background over calling this in a loop.
+        ,
+        .input_schema = "{\"type\":\"object\",\"properties\":{\"agent\":{\"type\":\"string\"}," ++ AGENT_FILTER_INPUT ++ ",\"timeout_ms\":{\"type\":\"integer\",\"description\":\"Default 60000, max 120000\"}}}",
+        .output_schema = agentSchema("," ++ AGENT_WAIT_PROPS, ",\"outcome\",\"timed_out\""),
+    },
+    .{
+        .name = "agent_read",
+        .group = .agent,
+        .mutates = false,
+        .description =
+        \\Read an agent's transcript as records (user, assistant, tool, notice) with stable ids, oldest first. Pass `since` = a previous next_since to get only newer or changed records (a record whose text changed gets a new id). limit defaults to 100 (max 500).
+        ,
+        .input_schema =
+        \\{"type":"object","properties":{"agent":{"type":"string"},"since":{"type":"integer"},"limit":{"type":"integer"}}}
+        ,
+        .output_schema = agentSchema(",\"records\":{\"type\":\"array\",\"items\":" ++ AGENT_RECORD_ITEM ++ "},\"next_since\":{\"type\":\"integer\"},\"more\":{\"type\":\"boolean\"}", ",\"records\",\"next_since\",\"more\""),
+    },
+    .{
+        .name = "agent_answer",
+        .group = .agent,
+        .mutates = true,
+        .description =
+        \\Answer the agent's pending prompt (permission, question or choice; see interaction) by option label, its 1-based number or a unique part of a label, then wait for the turn like agent_send. A permission answer is recorded as a notice record, since a denied call leaves no trace in the app's own output.
+        ,
+        .input_schema = "{\"type\":\"object\",\"properties\":{\"agent\":{\"type\":\"string\"},\"choice\":{\"type\":\"string\"}," ++ AGENT_FILTER_INPUT ++ ",\"timeout_ms\":{\"type\":\"integer\",\"description\":\"Default 60000, max 120000\"}},\"required\":[\"choice\"]}",
+        .output_schema = agentSchema("," ++ AGENT_WAIT_PROPS ++ ",\"answered\":{\"type\":\"string\",\"description\":\"The option chosen\"}", ",\"answered\",\"outcome\",\"timed_out\""),
+    },
+    .{
+        .name = "agent_set",
+        .group = .agent,
+        .mutates = true,
+        .description =
+        \\Change an agent's model and/or effort level for THIS session only, never the user's defaults (Claude Code: /model with its session-only choice, /effort; opencode: the model and variant of the prompts this agent sends). Only while the agent is idle.
+        ,
+        .input_schema =
+        \\{"type":"object","properties":{"agent":{"type":"string"},"model":{"type":"string","description":"As the app names it (opencode: provider/model)"},"effort":{"type":"string"}}}
+        ,
+        .output_schema = agentSchema(",\"model\":{\"type\":\"string\"},\"effort\":{\"type\":\"string\"},\"current_model\":{\"type\":\"string\",\"description\":\"API sources: the model the next prompt runs with\"},\"current_effort\":{\"type\":\"string\"}", ""),
+    },
+    .{
+        .name = "agent_interrupt",
+        .group = .agent,
+        .mutates = true,
+        .description =
+        \\Interrupt an agent's running turn (Claude Code: Escape; opencode: abort, subagents included).
+        ,
+        .input_schema =
+        \\{"type":"object","properties":{"agent":{"type":"string"}}}
+        ,
+        .output_schema = agentSchema(",\"interrupted\":{\"type\":\"boolean\"}", ",\"interrupted\""),
+    },
+    .{
+        .name = "agent_list",
+        .group = .agent,
+        .mutates = false,
+        .description =
+        \\List this server's agents: app, state, the session the user can watch, and how many wake-ups each holds that no agent_* result has handed out yet.
+        ,
+        .input_schema =
+        \\{"type":"object","properties":{}}
+        ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{\"agents\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"agent\":{\"type\":\"string\"},\"app\":{\"type\":\"string\"},\"source\":{\"type\":\"string\",\"enum\":[" ++ enumItems(vocab.SourceKind) ++
+            "]},\"state\":{\"type\":\"string\",\"enum\":[" ++ enumItems(vocab.State) ++ "]},\"ready\":{\"type\":\"boolean\"},\"session\":{\"type\":\"string\"},\"server_session\":{\"type\":\"string\"},\"pending_events\":{\"type\":\"integer\"},\"waiting_on_user\":{\"type\":\"boolean\"}}}},\"count\":{\"type\":\"integer\"}},\"required\":[\"agents\",\"count\"]}",
+    },
+    .{
+        .name = "agent_close",
+        .group = .agent,
+        .mutates = true,
+        .description =
+        \\Stop an agent: kills its session(s) and ends its waiters. For an agent put on a term_open terminal with agent_attach, only the adapter is dropped; the terminal stays.
+        ,
+        .input_schema =
+        \\{"type":"object","properties":{"agent":{"type":"string"}}}
+        ,
+        .output_schema =
+        \\{"type":"object","properties":{"agent":{"type":"string"},"closed":{"type":"boolean"},"sessions":{"type":"array","items":{"type":"string"},"description":"Sessions killed"}},"required":["agent","closed","sessions"]}
+        ,
+    },
+    .{
+        .name = "agent_attach",
+        .group = .agent,
+        .mutates = true,
+        .description =
+        \\Put an adapter on a terminal term_open already created, when you started the app yourself (screen adapters only, e.g. claude --ax-screen-reader). The agent then answers every agent_* tool; agent_close drops the adapter and leaves the terminal.
+        ,
+        .input_schema =
+        \\{"type":"object","properties":{"term":{"type":"integer"},"app":{"type":"string"},"timeout_ms":{"type":"integer","description":"Wait this long for the app to be ready (default 10000)"}},"required":["term","app"]}
+        ,
+        .output_schema = agentSchema(",\"term\":{\"type\":\"integer\"}", ",\"term\""),
+    },
+
     // ── core: never filtered ───────────────────────────────────────
     .{
         .name = "capabilities",
         .group = .core,
         .mutates = false,
         .description =
-        \\Preflight report of what THIS MCP server can do right now: isolation mode, headless GUI-app support (headless_gui — launch_app renders apps into the mux daemon and NEVER needs a display, an X server or a sketerm window), whether a direct sketerm GUI control socket is attached (gui_socket; independent of the session panel relay and of headless GUI apps), the live panel transport (panels + panel_transport) and the saved-panel store (panels_store + panel_store), OCR (tesseract) availability, whether the web_* tools can run and against what (web + web_backend "gui"/"session"/"headless"/"none" — "session" adds web_session, the watchable Wayland app session the helper renders into — plus the sketerm-webengine path in web_helper; web_gui says whether the user granted the web_* tools their OWN browser and logins, web_gui_source where that came from and web_gui_transport which GUI socket they hold now; web_profiles says whether named cookie jars work, web_routes which per-tab network routes web_open can honour, web_engine_broker whether the mux daemon owns the engine's lifetime and web_engine_owner who started the one in use; web_downloads whether web_download can pull a url through a view; web_capture whether web_open can record the response bodies a headless view's page receives; web_engine_started whether an engine exists YET, since web_backend/web_watch/web_session are undetermined until it does), ssh/scp presence, the directory terminal asciicast recordings land in, the EFFECTIVE input-timing defaults (hold_ms/settle_ms/timeout_ms/click_retry, each marked when a SKETERM_MCP_* env override changed it from the built-in), and open session counts. Call it before starting GUI/OCR/browser work to avoid discovering a missing dependency mid-flow.
+        \\Preflight report of what THIS MCP server can do right now: isolation mode, headless GUI-app support (headless_gui — launch_app renders apps into the mux daemon and NEVER needs a display, an X server or a sketerm window), whether a direct sketerm GUI control socket is attached (gui_socket; independent of the session panel relay and of headless GUI apps), the live panel transport (panels + panel_transport) and the saved-panel store (panels_store + panel_store), OCR (tesseract) availability, whether the web_* tools can run and against what (web + web_backend "gui"/"session"/"headless"/"none" — "session" adds web_session, the watchable Wayland app session the helper renders into — plus the sketerm-webengine path in web_helper; web_gui says whether the user granted the web_* tools their OWN browser and logins, web_gui_source where that came from and web_gui_transport which GUI socket they hold now; web_profiles says whether named cookie jars work, web_routes which per-tab network routes web_open can honour, web_engine_broker whether the mux daemon owns the engine's lifetime and web_engine_owner who started the one in use; web_downloads whether web_download can pull a url through a view; web_capture whether web_open can record the response bodies a headless view's page receives; web_engine_started whether an engine exists YET, since web_backend/web_watch/web_session are undetermined until it does), ssh/scp presence, the directory terminal asciicast recordings land in, the EFFECTIVE input-timing defaults (hold_ms/settle_ms/timeout_ms/click_retry, each marked when a SKETERM_MCP_* env override changed it from the built-in), whether sub-agents run here (agents, agent_adapters, agent_waiter, agent_ssh), and open session counts. Call it before starting GUI/OCR/browser work to avoid discovering a missing dependency mid-flow.
         ,
         .input_schema =
         \\{"type":"object","properties":{}}
         ,
         // Browser handoff naming is independent of the optional helper.
-        .output_schema = "{\"type\":\"object\",\"properties\":{\"web_handoff\":{\"type\":\"object\",\"description\":\"Assistant-owned browser naming and manual handoff; backend is ownership, not visibility\"},\"web_review\":{\"type\":\"object\"},\"web_diagnostics\":{\"type\":\"object\"}," ++ "\"mode\":{\"type\":\"string\"},\"headless_gui\":{\"type\":\"boolean\"},\"gui_socket\":{\"type\":\"boolean\"},\"gui_socket_source\":{\"type\":\"string\"},\"headless_terminals\":{\"type\":\"boolean\"},\"transfers_and_forwards\":{\"type\":\"boolean\"},\"panels\":{\"type\":\"boolean\"},\"panels_store\":{\"type\":\"boolean\"},\"panel_store\":{\"type\":\"object\"},\"panel_transport\":{\"type\":\"object\"},\"ocr\":{\"type\":\"boolean\"},\"app_xwayland\":{\"type\":\"boolean\",\"description\":\"launch_app xwayland:true can attach a rootless X11 display on THIS host (Xwayland + xwayland-satellite found on PATH); a remote host is probed at launch\"},\"app_record_webm\":{\"type\":\"boolean\",\"description\":\"app_record_start can encode WebM/VP9 (the default format); false = GIF only, the default becomes gif and format:webm is refused\"},\"web_helper\":{\"type\":[\"string\",\"null\"]},\"web\":{\"type\":\"boolean\"},\"web_backend\":{\"type\":\"string\",\"enum\":[\"none\",\"gui\",\"session\",\"headless\",\"not_yet_determined\"],\"description\":\"not_yet_determined = the headless engine has not started (it spawns at the first web_* call), so session-vs-headless is not decided yet; open a view and read this again\"},\"web_gui\":{\"type\":\"boolean\",\"description\":\"The user granted the web_* tools (and ONLY those) their own browser and logins; false = private headless browser with its own empty cookie jar\"},\"web_gui_source\":{\"type\":\"string\",\"enum\":[\"none\",\"config\",\"env\",\"flag\"],\"description\":\"Where the web_gui verdict came from: config (web_gui in [mcp] / [mcp.<name>]), env (SKETERM_MCP_WEB_GUI), flag (--web-gui)\"},\"web_gui_transport\":{\"type\":\"string\",\"enum\":[\"none\",\"discovered\",\"spawned\",\"explicit\"],\"description\":\"The GUI socket the web tools hold now: none (nothing browsed yet, or unreachable), discovered (a running GUI), spawned (sketerm web was started for this server), explicit (the server-wide --socket or shared-mode socket)\"},\"web_session\":{\"type\":\"string\"},\"web_watch\":{\"type\":[\"boolean\",\"null\"],\"description\":\"The web session presents the assistant's pages as windows a viewer can watch and drive; null while the browser engine has not started, because the answer is not known yet\"},\"web_engine_started\":{\"type\":\"boolean\",\"description\":\"A browser engine exists, so the web_* facts here are measurements rather than intentions\"},\"web_downloads\":{\"type\":\"boolean\",\"description\":\"web_download can fetch a url through a view (the page's own cookies and session) straight to a file\"},\"web_capture\":{\"type\":\"boolean\",\"description\":\"Headless: web_open capture:{...} records the response bodies a view's page receives (web_capture, web_capture_set, web_wait for:\\\"response\\\"); false with a GUI attached or on a helper without the capture capability, where a captured open is refused\"},\"web_observe\":{\"type\":\"boolean\",\"description\":\"The browser helper lets the user's GUI join it as a second client and show these pages as ordinary browser pages (Watch / Take control)\"},\"web_socket\":{\"type\":[\"string\",\"null\"],\"description\":\"The helper socket a GUI joins to watch; null until the helper is serving\"},\"mux_socket\":{\"type\":[\"string\",\"null\"],\"description\":\"This server's private mux daemon socket; attach a viewer there to watch its sessions\"},\"web_routes\":{\"type\":\"string\",\"enum\":[\"none\",\"gui\",\"headless\"],\"description\":\"Which per-tab browser routes web_open can honour: none = no browser backend; gui = direct, tor, via:<host> and on:<host>; headless = direct and tor only (via:/on: are refused, never downgraded to direct)\"},\"web_profiles\":{\"type\":\"boolean\"},\"web_cert_facts\":{\"type\":\"boolean\",\"description\":\"Every web result carries cert/load_error facts when a load is held or failed\"},\"web_accept_cert\":{\"type\":\"boolean\",\"description\":\"web_open accept_cert is honoured (headless); with a GUI the user answers the interstitial\"},\"web_profile_store\":{\"type\":\"string\"},\"web_profile_save\":{\"type\":\"boolean\",\"description\":\"web_profile_save can commit the live browser jars to disk on request (headless, helper capability flush-store)\"},\"web_engine_broker\":{\"type\":\"boolean\",\"description\":\"Headless only: the mux daemon spawns and keeps the browser engine (it survives this server's restart) rather than this server forking one that exits with its last client\"},\"web_engine_owner\":{\"type\":\"string\",\"enum\":[\"none\",\"broker\",\"self\",\"adopted\"],\"description\":\"Who started the engine this server is connected to now; none = not started yet, adopted = a live engine another client of this instance started\"},\"ssh\":{\"type\":\"boolean\"},\"scp\":{\"type\":\"boolean\"},\"mux_tor\":{\"type\":\"boolean\",\"description\":\"Forced tor: mux-over-SSH routes through SOCKS5 with proxy-side DNS and no direct fallback\"},\"terminal_recordings\":{\"type\":[\"string\",\"null\"]},\"input_tuning\":{\"type\":\"object\"},\"tool_policy\":{\"type\":\"object\"},\"session_lifetime\":{\"type\":\"string\"},\"open_terms\":{\"type\":\"integer\"},\"open_apps\":{\"type\":\"integer\"},\"open_forwards\":{\"type\":\"integer\"}" ++ "},\"required\":[\"mode\",\"headless_gui\",\"gui_socket\",\"panels\",\"panels_store\",\"web\",\"web_backend\",\"tool_policy\",\"session_lifetime\"]}",
+        .output_schema = "{\"type\":\"object\",\"properties\":{\"web_handoff\":{\"type\":\"object\",\"description\":\"Assistant-owned browser naming and manual handoff; backend is ownership, not visibility\"},\"web_review\":{\"type\":\"object\"},\"web_diagnostics\":{\"type\":\"object\"}," ++ "\"mode\":{\"type\":\"string\"},\"headless_gui\":{\"type\":\"boolean\"},\"gui_socket\":{\"type\":\"boolean\"},\"gui_socket_source\":{\"type\":\"string\"},\"headless_terminals\":{\"type\":\"boolean\"},\"transfers_and_forwards\":{\"type\":\"boolean\"},\"panels\":{\"type\":\"boolean\"},\"panels_store\":{\"type\":\"boolean\"},\"panel_store\":{\"type\":\"object\"},\"panel_transport\":{\"type\":\"object\"},\"ocr\":{\"type\":\"boolean\"},\"app_xwayland\":{\"type\":\"boolean\",\"description\":\"launch_app xwayland:true can attach a rootless X11 display on THIS host (Xwayland + xwayland-satellite found on PATH); a remote host is probed at launch\"},\"app_record_webm\":{\"type\":\"boolean\",\"description\":\"app_record_start can encode WebM/VP9 (the default format); false = GIF only, the default becomes gif and format:webm is refused\"},\"web_helper\":{\"type\":[\"string\",\"null\"]},\"web\":{\"type\":\"boolean\"},\"web_backend\":{\"type\":\"string\",\"enum\":[\"none\",\"gui\",\"session\",\"headless\",\"not_yet_determined\"],\"description\":\"not_yet_determined = the headless engine has not started (it spawns at the first web_* call), so session-vs-headless is not decided yet; open a view and read this again\"},\"web_gui\":{\"type\":\"boolean\",\"description\":\"The user granted the web_* tools (and ONLY those) their own browser and logins; false = private headless browser with its own empty cookie jar\"},\"web_gui_source\":{\"type\":\"string\",\"enum\":[\"none\",\"config\",\"env\",\"flag\"],\"description\":\"Where the web_gui verdict came from: config (web_gui in [mcp] / [mcp.<name>]), env (SKETERM_MCP_WEB_GUI), flag (--web-gui)\"},\"web_gui_transport\":{\"type\":\"string\",\"enum\":[\"none\",\"discovered\",\"spawned\",\"explicit\"],\"description\":\"The GUI socket the web tools hold now: none (nothing browsed yet, or unreachable), discovered (a running GUI), spawned (sketerm web was started for this server), explicit (the server-wide --socket or shared-mode socket)\"},\"web_session\":{\"type\":\"string\"},\"web_watch\":{\"type\":[\"boolean\",\"null\"],\"description\":\"The web session presents the assistant's pages as windows a viewer can watch and drive; null while the browser engine has not started, because the answer is not known yet\"},\"web_engine_started\":{\"type\":\"boolean\",\"description\":\"A browser engine exists, so the web_* facts here are measurements rather than intentions\"},\"web_downloads\":{\"type\":\"boolean\",\"description\":\"web_download can fetch a url through a view (the page's own cookies and session) straight to a file\"},\"web_capture\":{\"type\":\"boolean\",\"description\":\"Headless: web_open capture:{...} records the response bodies a view's page receives (web_capture, web_capture_set, web_wait for:\\\"response\\\"); false with a GUI attached or on a helper without the capture capability, where a captured open is refused\"},\"web_observe\":{\"type\":\"boolean\",\"description\":\"The browser helper lets the user's GUI join it as a second client and show these pages as ordinary browser pages (Watch / Take control)\"},\"web_socket\":{\"type\":[\"string\",\"null\"],\"description\":\"The helper socket a GUI joins to watch; null until the helper is serving\"},\"mux_socket\":{\"type\":[\"string\",\"null\"],\"description\":\"This server's private mux daemon socket; attach a viewer there to watch its sessions\"},\"web_routes\":{\"type\":\"string\",\"enum\":[\"none\",\"gui\",\"headless\"],\"description\":\"Which per-tab browser routes web_open can honour: none = no browser backend; gui = direct, tor, via:<host> and on:<host>; headless = direct and tor only (via:/on: are refused, never downgraded to direct)\"},\"web_profiles\":{\"type\":\"boolean\"},\"web_cert_facts\":{\"type\":\"boolean\",\"description\":\"Every web result carries cert/load_error facts when a load is held or failed\"},\"web_accept_cert\":{\"type\":\"boolean\",\"description\":\"web_open accept_cert is honoured (headless); with a GUI the user answers the interstitial\"},\"web_profile_store\":{\"type\":\"string\"},\"web_profile_save\":{\"type\":\"boolean\",\"description\":\"web_profile_save can commit the live browser jars to disk on request (headless, helper capability flush-store)\"},\"web_engine_broker\":{\"type\":\"boolean\",\"description\":\"Headless only: the mux daemon spawns and keeps the browser engine (it survives this server's restart) rather than this server forking one that exits with its last client\"},\"web_engine_owner\":{\"type\":\"string\",\"enum\":[\"none\",\"broker\",\"self\",\"adopted\"],\"description\":\"Who started the engine this server is connected to now; none = not started yet, adopted = a live engine another client of this instance started\"},\"ssh\":{\"type\":\"boolean\"},\"scp\":{\"type\":\"boolean\"},\"mux_tor\":{\"type\":\"boolean\",\"description\":\"Forced tor: mux-over-SSH routes through SOCKS5 with proxy-side DNS and no direct fallback\"},\"terminal_recordings\":{\"type\":[\"string\",\"null\"]},\"input_tuning\":{\"type\":\"object\"},\"tool_policy\":{\"type\":\"object\"},\"session_lifetime\":{\"type\":\"string\"},\"open_terms\":{\"type\":\"integer\"},\"open_apps\":{\"type\":\"integer\"},\"open_forwards\":{\"type\":\"integer\"}," ++
+            "\"agents\":{\"type\":\"boolean\",\"description\":\"The agent_* tools work here (isolated or durable mode; false in shared mode)\"},\"agent_ssh\":{\"type\":\"boolean\",\"description\":\"agent_open host: runs agents over SSH\"},\"agent_adapters\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"Adapter ids agent_open accepts\"},\"agent_waiter\":{\"type\":[\"string\",\"null\"],\"description\":\"The waiter command, AGENT standing for the agent id; results hand out the exact one as watch_command\"},\"open_agents\":{\"type\":\"integer\"}" ++ "},\"required\":[\"mode\",\"headless_gui\",\"gui_socket\",\"panels\",\"panels_store\",\"web\",\"web_backend\",\"tool_policy\",\"session_lifetime\"]}",
     },
 
     // ── browser: CDP automation ────────────────────────────────────

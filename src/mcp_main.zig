@@ -23,8 +23,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
     @import("util/crashlog.zig").install();
 
-    const mcp_args = allocator.alloc([]const u8, argv.len - 1) catch return 1;
+    // `sketerm-mcp mcp ...` is `sketerm mcp ...` spelled with this binary:
+    // a watch_command names the running executable followed by `mcp`.
+    const skip: usize = if (argv.len >= 2 and std.mem.eql(u8, std.mem.span(argv[1]), "mcp")) 2 else 1;
+    const mcp_args = allocator.alloc([]const u8, argv.len - skip) catch return 1;
     defer allocator.free(mcp_args);
-    for (argv[1..], 0..) |a, n| mcp_args[n] = std.mem.span(a);
+    for (argv[skip..], 0..) |a, n| mcp_args[n] = std.mem.span(a);
     return @import("ipc/mcp.zig").run(allocator, mcp_args);
 }

@@ -424,6 +424,25 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
     else
         try res.text("session lifetime: the daemon and its sessions survive this server's restarts and are reattached on reconnect; there is no idle timeout");
 
+    // Sub-agents (the agent_* tools): available in isolated/durable mode,
+    // local only in this build, woken through the waiter command.
+    {
+        const mcp_agent = @import("mcp_agent.zig");
+        const agents_ok = mcp_agent.available();
+        try res.fact("agents", agents_ok);
+        try res.fact("agent_ssh", false);
+        const ids: []const []const u8 = if (agents_ok) mcp_agent.adapterIds(arena) catch &.{} else &.{};
+        try res.fact("agent_adapters", ids);
+        if (agents_ok) {
+            if (try mcp_agent.waiterTemplate(arena)) |w| try res.fact("agent_waiter", w) else try res.raw("agent_waiter", "null");
+        } else try res.raw("agent_waiter", "null");
+        try res.fact("open_agents", mcp_agent.state.entries.items.len);
+        if (agents_ok)
+            try res.textf("sub-agents: agent_open runs one of {d} adapter(s) on this machine (not over SSH yet); results carry a watch_command that wakes you when it needs attention", .{ids.len})
+        else
+            try res.text("sub-agents (agent_*) are unavailable in --shared mode: they run on an isolated or durable instance's private daemon");
+    }
+
     try res.fact("open_terms", mcp_term.term_state.terms.count());
     try res.fact("open_apps", mcp_app.app_state.apps.count());
     try res.fact("open_forwards", mcp_term.forward_state.forwards.count());

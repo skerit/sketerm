@@ -291,7 +291,7 @@ test "all:ro grants every non-mutating tool and nothing else" {
     try testing.expect(p.allows("capabilities"));
 
     // Every group keeps a read-only half, so none is suppressed.
-    var buf: [8]Group = undefined;
+    var buf: [std.enums.values(Group).len]Group = undefined;
     try testing.expectEqual(@as(usize, 0), suppressedGroups(p, &buf).len);
 
     // The spec is valid, and tools/list agrees with tools/call.
@@ -423,16 +423,16 @@ test "TOOL_META mirrors the table exactly" {
 }
 
 test "suppressedGroups names the groups an assistant cannot reach" {
-    var buf: [8]Group = undefined;
+    var buf: [std.enums.values(Group).len]Group = undefined;
     const out = suppressedGroups(.{ .spec = "app:ro" }, &buf);
     // app keeps its read-only half, so every other populated group is
     // withheld. core is always on.
-    try testing.expectEqualSlices(Group, &.{ .panes, .term, .files, .net, .browser, .ui }, out);
+    try testing.expectEqualSlices(Group, &.{ .panes, .term, .files, .net, .browser, .ui, .agent }, out);
 
     // ui is populated now, so it can be asked for on its own — and is
     // then the ONLY group that survives.
     const only_ui = suppressedGroups(.{ .spec = "ui" }, &buf);
-    try testing.expectEqualSlices(Group, &.{ .panes, .app, .term, .files, .net, .browser }, only_ui);
+    try testing.expectEqualSlices(Group, &.{ .panes, .app, .term, .files, .net, .browser, .agent }, only_ui);
     try testing.expect((Policy{ .spec = "ui" }).allows("ui_show"));
     try testing.expect(!(Policy{ .spec = "ui" }).allows("run_command"));
     // ui:ro keeps the two reads and drops the writes, including the

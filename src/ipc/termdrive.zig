@@ -502,6 +502,22 @@ pub const TokenResult = union(enum) {
 
 var name_counter: u32 = 0;
 
+/// What `Term.spawnWith` sets beyond argv and size; the defaults are
+/// what `Term.spawn` has always done.
+pub const SpawnOpts = struct {
+    /// Session name; null mints `mcpterm-<pid>-<n>`. A name the daemon
+    /// already holds fails the spawn.
+    name: ?[]const u8 = null,
+    /// Extra child environment, "KEY=VALUE". This is how a secret reaches
+    /// a child: it rides the spawn request, never the argv.
+    env: []const []const u8 = &.{},
+    /// Working directory on the daemon's host; null = the daemon's own.
+    cwd: ?[]const u8 = null,
+    /// Inject OSC 133 shell integration for a recognised shell. An app
+    /// that emits its own marks (Claude Code in ax mode) must not get it.
+    shell_integration: bool = true,
+};
+
 pub const Term = struct {
     allocator: std.mem.Allocator,
     conn: muxclient.Conn,
@@ -541,6 +557,10 @@ pub const Term = struct {
     prompt_wait_exhausted: bool = false,
     pending_command: ?CommandToken = null,
     pending_exec: ?ExecPending = null,
+    /// Bumped by every snapshot that replaced the mirror (attach, resync,
+    /// reattach): an observer of `screen` compares it to learn that the
+    /// Screen it last read was swapped wholesale.
+    snapshots: u32 = 0,
 
     /// Spawn a shell session on the daemon at `local_sock` (null = the
     /// shared per-user daemon) and attach. `argv` null = the login
@@ -552,6 +572,19 @@ pub const Term = struct {
         rows: u16,
         local_sock: ?[]const u8,
     ) Error!*Term {
+        return spawnWith(allocator, argv, cols, rows, local_sock, .{});
+    }
+
+    /// `spawn` with a chosen session name, child environment, working
+    /// directory and shell-integration policy.
+    pub fn spawnWith(
+        allocator: std.mem.Allocator,
+        argv: ?[]const []const u8,
+        cols: u16,
+        rows: u16,
+        local_sock: ?[]const u8,
+        opts: SpawnOpts,
+    ) Error!*Term {
         var conn = muxclient.Conn.connectLocalAutostartAt(allocator, local_sock) catch return Error.SpawnFailed;
         errdefer conn.deinit();
         // Non-blocking + deadline recv everywhere: a wedged daemon
@@ -561,9 +594,13 @@ pub const Term = struct {
         (conn.recvExpectFor(&.{.welcome}, 15_000) catch return Error.SpawnFailed).deinit(allocator);
         if (!conn.caps.kill_origin_fence) return Error.SpawnFailed;
 
-        name_counter += 1;
-        const name = std.fmt.allocPrint(allocator, "mcpterm-{d}-{d}", .{ c.getpid(), name_counter }) catch
-            return Error.OutOfMemory;
+        const name = if (opts.name) |n|
+            allocator.dupe(u8, n) catch return Error.OutOfMemory
+        else blk: {
+            name_counter += 1;
+            break :blk std.fmt.allocPrint(allocator, "mcpterm-{d}-{d}", .{ c.getpid(), name_counter }) catch
+                return Error.OutOfMemory;
+        };
         errdefer allocator.free(name);
 
         // Auto shell-integration, like a GUI pane would get: the OSC
@@ -573,15 +610,15 @@ pub const Term = struct {
         // explicit argv, resolve the same account shell as the local daemon.
         const shellintegration = @import("../util/shellintegration.zig");
         const shell: []const u8 = if (argv) |av| av[0] else @import("../mux/shell.zig").accountLoginShell();
-        const si = shellintegration.resolve(allocator, shell);
+        const si = if (opts.shell_integration) shellintegration.resolve(allocator, shell) else null;
         defer if (si) |r| r.deinit(allocator);
         const SiWire = struct { kind: []const u8, script: []const u8, shim_dir: []const u8 };
         const si_wire: ?SiWire = if (si) |r| .{ .kind = r.kind, .script = r.script, .shim_dir = r.shim } else null;
 
         if (argv) |av| {
-            conn.sendJson(.spawn, .{ .name = name, .argv = av, .rows = rows, .cols = cols, .shell_integration = si_wire }) catch return Error.SpawnFailed;
+            conn.sendJson(.spawn, .{ .name = name, .argv = av, .rows = rows, .cols = cols, .shell_integration = si_wire, .env = opts.env, .cwd = opts.cwd }) catch return Error.SpawnFailed;
         } else {
-            conn.sendJson(.spawn, .{ .name = name, .argv = &.{shell}, .rows = rows, .cols = cols, .login_shell = true, .shell_integration = si_wire }) catch return Error.SpawnFailed;
+            conn.sendJson(.spawn, .{ .name = name, .argv = &.{shell}, .rows = rows, .cols = cols, .login_shell = true, .shell_integration = si_wire, .env = opts.env, .cwd = opts.cwd }) catch return Error.SpawnFailed;
         }
         const ok = conn.recvExpectFor(&.{.ok}, 15_000) catch return Error.SpawnFailed;
         defer ok.deinit(allocator);
@@ -652,9 +689,55 @@ pub const Term = struct {
         const meta = launch_cleanup.parseSpawnMeta(spawn_payload) catch return Error.SpawnFailed;
         var cleanup = launch_cleanup.Guard.init(conn, name, meta.origin_id, endpoint, timeout_ms);
         errdefer cleanup.rollback();
+        const self = try attachBuild(allocator, conn, name, meta.origin_id, shell, integration, remote_host, timeout_ms);
+        cleanup.disarm();
+        return self;
+    }
 
+    /// Attach to a session that is already running on the daemon at
+    /// `local_sock` (a durable instance picking its sessions up again).
+    /// Nothing is spawned and nothing is killed on failure.
+    /// @param origin_id the session's lifetime fence; a reused name with
+    /// another lifetime is refused.
+    pub fn attachExisting(
+        allocator: std.mem.Allocator,
+        name: []const u8,
+        origin_id: wire.SessionOriginId,
+        local_sock: []const u8,
+    ) Error!*Term {
+        var conn = muxclient.Conn.connectProbed(allocator, local_sock) catch return Error.SpawnFailed;
+        errdefer conn.deinit();
+        conn.setNonBlocking();
+        return attachConn(allocator, &conn, name, origin_id);
+    }
+
+    /// Attach session `name` over a connection that already spoke hello;
+    /// the Term owns `conn` on success.
+    pub fn attachConn(
+        allocator: std.mem.Allocator,
+        conn: *muxclient.Conn,
+        name: []const u8,
+        origin_id: wire.SessionOriginId,
+    ) Error!*Term {
+        const owned = allocator.dupe(u8, name) catch return Error.OutOfMemory;
+        errdefer allocator.free(owned);
+        return attachBuild(allocator, conn, owned, origin_id, "", false, null, 15_000);
+    }
+
+    /// Attach `name`, restore the snapshot into a mirror and build the
+    /// Term that owns `conn` and `name` from here on.
+    fn attachBuild(
+        allocator: std.mem.Allocator,
+        conn: *muxclient.Conn,
+        name: []u8,
+        origin_id: wire.SessionOriginId,
+        shell: []const u8,
+        integration: bool,
+        remote_host: ?[]const u8,
+        timeout_ms: i64,
+    ) Error!*Term {
         conn.sendAttach(name, .{
-            .origin_id = &meta.origin_id,
+            .origin_id = &origin_id,
             .kind = "mcp",
         }) catch return Error.SpawnFailed;
         const snap = conn.recvExpectFor(&.{.snapshot}, timeout_ms) catch |err|
@@ -690,7 +773,7 @@ pub const Term = struct {
             .allocator = allocator,
             .conn = conn.*,
             .name = name,
-            .origin_id = meta.origin_id,
+            .origin_id = origin_id,
             .origin_id_valid = true,
             .pool = pool,
             .screen = if (restored) |r| r.screen else null,
@@ -698,18 +781,24 @@ pub const Term = struct {
             .integration = integration,
             .shell_name = shell_name,
             .remote_host = host_owned,
+            .snapshots = if (restored != null) 1 else 0,
         };
         if (self.screen) |mirror| self.app_cursor = mirror.app_cursor_keys;
-        cleanup.disarm();
         return self;
     }
 
+    /// Kill the session (unless it already exited) and free the client.
     pub fn deinit(self: *Term) void {
-        const a = self.allocator;
         if (!self.exited) self.conn.sendKill(.{
             .name = self.name,
             .origin_id = if (self.origin_id_valid) &self.origin_id else "",
         }) catch {};
+        self.detach();
+    }
+
+    /// Free the client and leave the session running on its daemon.
+    pub fn detach(self: *Term) void {
+        const a = self.allocator;
         if (self.shell_name) |s| a.free(s);
         if (self.remote_host) |h| a.free(h);
         self.conn.deinit();
@@ -733,6 +822,7 @@ pub const Term = struct {
         self.screen = restored.screen;
         self.app_cursor = restored.screen.app_cursor_keys;
         self.events_desynced = false;
+        self.snapshots +%= 1;
     }
 
     fn applyScreenEvent(screen: *Screen, ev: Event) void {

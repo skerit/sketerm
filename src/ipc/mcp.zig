@@ -38,6 +38,8 @@ const mcp_panes = @import("mcp_panes.zig");
 const mcp_term = @import("mcp_term.zig");
 const mcp_caps = @import("mcp_caps.zig");
 const mcp_ui = @import("mcp_ui.zig");
+const mcp_agent = @import("mcp_agent.zig");
+const agentwait = @import("agentwait.zig");
 const mcp_testkit = @import("mcp_testkit.zig");
 const FakeBackend = mcp_testkit.FakeBackend;
 const Journal = mcp_app.Journal;
@@ -48,6 +50,8 @@ const reattachApps = mcp_app.reattachApps;
 const MCP_HELP =
     \\Usage: sketerm mcp [--shared | --durable | --name NAME] [--socket PATH]
     \\                   [--log DIR] [--tools SPEC | --profile NAME] [--web-gui]
+    \\       sketerm mcp agent-wait --socket PATH [--match TEXT] [--messages]
+    \\                   [--follow] [--timeout SECONDS] [--since SEQ] AGENT
     \\
     \\Runs a Model Context Protocol server on stdio. Register it in an
     \\MCP client (Claude Code, etc.) as command "sketerm" with args
@@ -112,6 +116,15 @@ const MCP_HELP =
     \\term_send_keys, term_read, term_wait_idle, term_resize,
     \\term_list, term_close.
     \\
+    \\Sub-agent tools (isolated/durable mode): agent_open runs Claude Code
+    \\or opencode as a sub-agent on the private daemon (watchable from the
+    \\GUI); agent_send / agent_wait / agent_read / agent_answer / agent_set /
+    \\agent_interrupt / agent_close drive it in clean records and events;
+    \\agent_attach puts an adapter on a term_open terminal; agent_list and
+    \\agent_adapters report. `sketerm mcp agent-wait ... AGENT` blocks until
+    \\the agent next needs attention (the tools return the exact command as
+    \\watch_command); see `sketerm mcp agent-wait --help`.
+    \\
     \\Every headless terminal (term_open, transfer/forward helpers) is
     \\automatically recorded as an asciicast v2 (.cast) file, replayable
     \\with asciinema: into the --log session folder when logging is on,
@@ -129,7 +142,7 @@ const MCP_HELP =
     \\                   TOOL           one tool by name
     \\                   -GROUP, -TOOL  deny (always wins)
     \\                 Groups: panes, app, term, files, net, browser,
-    \\                 ui, core. `core` (capabilities) is always on.
+    \\                 ui, agent, core. `core` (capabilities) is always on.
     \\                 A spec with any allow term starts from nothing;
     \\                 a spec of only deny terms keeps everything else.
     \\                 Example: --tools "app, files:ro"
@@ -536,6 +549,10 @@ pub const Watchdog = struct {
         }
         for (mcp_term.forward_state.forwards.values()) |f| addFd(f.term.conn.fd);
         {
+            var agent_fds: [32]c_int = undefined;
+            for (mcp_agent.watchdogFds(&agent_fds)) |fd| addFd(fd);
+        }
+        {
             // EVERY headless web helper's socket (one helper instance
             // per browser route), and the broker-profile connection
             // beside each. A wedged helper on any route must be
@@ -713,6 +730,10 @@ fn resolveWebGuiGrant(opts: Opts, cfg: *const Config) error{BadPolicy}!mcp_webgu
 }
 
 pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
+    // The waiter is a client of a running server, not a server: it shares
+    // the entry point so both binaries (`sketerm mcp`, `sketerm-mcp`)
+    // answer the exact watch_command the agent tools hand out.
+    if (args.len > 0 and std.mem.eql(u8, args[0], agentwait.SUBCOMMAND)) return agentwait.cli(allocator, args[1..]);
     const opts = Opts.parse(args) catch |err| {
         const msg = switch (err) {
             error.UnknownFlag => "sketerm mcp: unknown flag (see --help)\n",
@@ -873,6 +894,13 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     if (iso) |i| {
         if (i.durable) reattachApps(i.sock);
     }
+    // Sub-agents: the waiter socket in the instance dir, and (durable)
+    // the agents a previous run left running.
+    if (iso) |i| {
+        mcp_agent.configure(allocator, i.dir, i.sock, i.durable);
+        mcp_agent.reattach();
+    }
+    defer mcp_agent.shutdown();
 
     // Headless web fallback: with no GUI socket the web_* tools run
     // their own sketerm-webengine inside the instance dir (spawned
@@ -935,32 +963,26 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
         l.logNote(note);
     }
 
-    // stdin loop: one JSON-RPC message per line.
-    var lineptr: [*c]u8 = null;
-    var linecap: usize = 0;
-    defer if (lineptr != null) c.free(lineptr);
-    while (!quit_flag) {
-        const n = c.getline(&lineptr, &linecap, platform.stdin());
-        if (n < 0) break; // EOF or EINTR — client closed us down.
-        var line: []const u8 = lineptr[0..@intCast(n)];
-        line = std.mem.trim(u8, line, " \t\r\n");
-        if (line.len == 0) continue;
-        if (mcp_log) |*l| l.logMessage("in", line);
-
-        var arena_state = std.heap.ArenaAllocator.init(allocator);
-        defer arena_state.deinit();
-        Watchdog.begin();
-        const reply = handleMessage(arena_state.allocator(), backend, line);
-        Watchdog.end();
-        if (Watchdog.fired.load(.acquire)) {
-            // Main-thread, post-call: safe to touch the trace log.
-            if (mcp_log) |*l| l.logNote("watchdog fired during the previous call: hard timeout exceeded, mux connections were aborted");
+    // The loop: one JSON-RPC message per stdin line, and between them the
+    // agents (and their waiters) keep being observed.
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(allocator);
+    serve: while (!quit_flag) {
+        while (std.mem.indexOfScalar(u8, input.items, '\n')) |nl| {
+            handleLine(allocator, backend, input.items[0..nl]);
+            std.mem.copyForwards(u8, input.items[0 .. input.items.len - nl - 1], input.items[nl + 1 ..]);
+            input.shrinkRetainingCapacity(input.items.len - nl - 1);
+            if (quit_flag) break :serve;
         }
-        if (reply) |r| {
-            if (mcp_log) |*l| l.logMessage("out", r);
-            _ = c.fwrite(r.ptr, 1, r.len, platform.stdout());
-            _ = c.fputc('\n', platform.stdout());
-            _ = c.fflush(platform.stdout());
+        switch (waitInput(&input, allocator)) {
+            .more => {},
+            .eof => {
+                // A last line without a newline still counts, as it did
+                // with getline.
+                if (input.items.len > 0) handleLine(allocator, backend, input.items);
+                break;
+            },
+            .failed => break,
         }
     }
 
@@ -969,6 +991,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     // private daemon and remove its dir. Durable/named instances stay.
     // The web helper must die BEFORE the tree removal — a live CEF
     // keeps writing into its cache dir, leaving the dir un-removable.
+    // Agents first: an agent may borrow a term_* terminal.
+    mcp_agent.shutdown();
     @import("mcp_web.zig").shutdownHeadless();
     mcp_term.forward_state.deinit();
     mcp_term.term_state.deinit();
@@ -980,6 +1004,56 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
         }
     }
     return 0;
+}
+
+/// Handle one stdin line: log it, dispatch it under the watchdog, write
+/// the reply.
+fn handleLine(allocator: std.mem.Allocator, backend: Backend, raw: []const u8) void {
+    const line = std.mem.trim(u8, raw, " \t\r\n");
+    if (line.len == 0) return;
+    if (mcp_log) |*l| l.logMessage("in", line);
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    Watchdog.begin();
+    const reply = handleMessage(arena_state.allocator(), backend, line);
+    Watchdog.end();
+    if (Watchdog.fired.load(.acquire)) {
+        // Main-thread, post-call: safe to touch the trace log.
+        if (mcp_log) |*l| l.logNote("watchdog fired during the previous call: hard timeout exceeded, mux connections were aborted");
+    }
+    if (reply) |r| {
+        if (mcp_log) |*l| l.logMessage("out", r);
+        _ = c.fwrite(r.ptr, 1, r.len, platform.stdout());
+        _ = c.fputc('\n', platform.stdout());
+        _ = c.fflush(platform.stdout());
+    }
+}
+
+const InputWait = enum { more, eof, failed };
+
+/// Wait for stdin while the agents are served: poll stdin together with
+/// every agent and waiter fd, wake for the agents' timers, then read what
+/// stdin has. EINTR (a quit signal) is `.more`, so the caller re-checks
+/// quit_flag.
+fn waitInput(input: *std.ArrayList(u8), allocator: std.mem.Allocator) InputWait {
+    var pfds: [129]c.struct_pollfd = undefined;
+    pfds[0] = .{ .fd = 0, .events = c.POLLIN, .revents = 0 };
+    const n = 1 + mcp_agent.pollFds(pfds[1..]);
+    const timeout: c_int = if (mcp_agent.dueInMs(clock.nowMs())) |d| @intCast(std.math.clamp(d, 0, 1000)) else -1;
+    const rc = c.poll(&pfds, @intCast(n), timeout);
+    if (rc < 0) return if (std.posix.errno(rc) == .INTR) .more else .failed;
+    mcp_agent.service(clock.nowMs());
+    if (pfds[0].revents == 0) return .more;
+    var buf: [65536]u8 = undefined;
+    const got = c.read(0, &buf, buf.len);
+    if (got < 0) return switch (std.posix.errno(got)) {
+        .INTR, .AGAIN => .more,
+        else => .failed,
+    };
+    if (got == 0) return .eof;
+    input.appendSlice(allocator, buf[0..@intCast(got)]) catch return .failed;
+    return .more;
 }
 
 /// Backend when no GUI is running: terminal tools fail with a clear
@@ -1074,7 +1148,14 @@ pub fn handleMessage(arena: std.mem.Allocator, backend: Backend, line: []const u
         const w = &aw.writer;
         w.writeAll("{\"protocolVersion\":") catch return null;
         std.json.Stringify.value(ver, .{}, w) catch return null;
-        w.print(",\"capabilities\":{{\"tools\":{{}}}},\"serverInfo\":{{\"name\":\"sketerm\",\"version\":\"{s}\"}}}}", .{SERVER_VERSION}) catch return null;
+        w.print(",\"capabilities\":{{\"tools\":{{}}}},\"serverInfo\":{{\"name\":\"sketerm\",\"version\":\"{s}\"}}", .{SERVER_VERSION}) catch return null;
+        // Server instructions: MCP clients put them in the assistant's
+        // system prompt, so they only name tools this connection can use.
+        if (mcp_agent.available() and policy.allows("agent_open")) {
+            w.writeAll(",\"instructions\":") catch return null;
+            std.json.Stringify.value(mcp_agent.INSTRUCTIONS, .{}, w) catch return null;
+        }
+        w.writeAll("}") catch return null;
         return rpcResult(arena, id, aw.written());
     }
     if (std.mem.startsWith(u8, method, "notifications/")) return null;
@@ -1123,6 +1204,7 @@ fn callTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: 
         // mcp_web.zig resolves its own tool names.
         .browser => |tool| @import("mcp_web.zig").webTool(arena, backend, @tagName(tool), args),
         .ui => |tool| mcp_ui.uiTool(arena, backend, tool, args),
+        .agent => |tool| mcp_agent.agentTool(arena, tool, args),
         .core => |tool| switch (tool) {
             .capabilities => mcp_caps.capabilitiesTool(arena, backend),
         },

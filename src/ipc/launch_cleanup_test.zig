@@ -155,9 +155,14 @@ fn expectKill(peer: *muxclient.Conn, allocator: std.mem.Allocator, name: []const
 }
 
 pub fn snapshotPayload(allocator: std.mem.Allocator, app: bool) ![]u8 {
+    return snapshotPayloadSized(allocator, app, 2, 2);
+}
+
+/// The attach snapshot of a blank `cols` x `rows` screen at seq 7.
+pub fn snapshotPayloadSized(allocator: std.mem.Allocator, app: bool, cols: u16, rows: u16) ![]u8 {
     var pool = try Pool.init(allocator);
     defer pool.deinit();
-    const screen = try Screen.init(allocator, &pool, 2, 2);
+    const screen = try Screen.init(allocator, &pool, cols, rows);
     defer screen.deinit();
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);

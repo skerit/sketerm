@@ -1472,6 +1472,15 @@ pub fn stopTermRecording(t: *termdrive.Term, term_id: u32) void {
     if (rec_state.casts.fetchSwapRemove(term_id)) |kv| rec_state.allocator.free(kv.value);
 }
 
+/// Record an agent's terminal as `<name>.cast` in the recordings dir.
+/// @return the path, allocated from `allocator`, or null when recording is off.
+pub fn recordNamedTerm(allocator: std.mem.Allocator, t: *termdrive.Term, name: []const u8) ?[]u8 {
+    const dir = recDir() orelse return null;
+    const path = std.fmt.allocPrint(allocator, "{s}/{s}.cast", .{ dir, name }) catch return null;
+    t.startRecording(path);
+    return path;
+}
+
 /// Record an UNREGISTERED helper terminal (scp/ssh/forward).
 pub fn recordAuxTerm(t: *termdrive.Term, label: []const u8) void {
     const dir = recDir() orelse return;
