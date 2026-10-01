@@ -14,6 +14,7 @@
 const std = @import("std");
 const vocab = @import("../agent/vocab.zig");
 const adapter = @import("../agent/adapter.zig");
+const transport = @import("transport.zig");
 
 const REVIEW_INPUT =
     \\{"type":"object","properties":{"pane":{"type":"integer"},"view":{"type":"integer"},"id":{"type":"string"},"selector":{"type":"string"},"ready_selector":{"type":"string"},"url_contains":{"type":"string"},"expect_preserved":{"type":"boolean"},"timeout_ms":{"type":"integer"},"screenshot":{"type":"boolean"},"out_dir":{"type":"string"}}}
@@ -184,7 +185,7 @@ const AGENT_INTERACTION = "{\"type\":\"object\",\"description\":\"What the agent
 /// The facts `mcp_agent.finish` writes on every per-agent result.
 const AGENT_PROPS = "\"agent\":{\"type\":\"string\",\"description\":\"The agent id every agent_* tool takes\"},\"app\":{\"type\":\"string\"},\"source\":{\"type\":\"string\",\"enum\":[" ++ enumItems(vocab.SourceKind) ++
     "]},\"state\":{\"type\":\"string\",\"enum\":[" ++ enumItems(vocab.State) ++
-    "]},\"ready\":{\"type\":\"boolean\",\"description\":\"Input sent now is not lost\"},\"session\":{\"type\":\"string\",\"description\":\"The terminal session the user can watch in the sketerm GUI\"},\"server_session\":{\"type\":\"string\",\"description\":\"API sources: the session running the app's server\"},\"interaction\":" ++ AGENT_INTERACTION ++
+    "]},\"ready\":{\"type\":\"boolean\",\"description\":\"Input sent now is not lost\"},\"session\":{\"type\":\"string\",\"description\":\"The terminal session the user can watch in the sketerm GUI\"},\"server_session\":{\"type\":\"string\",\"description\":\"API sources: the session running the app's server\"},\"host\":{\"type\":\"string\",\"description\":\"The SSH host the agent runs on (absent: this machine)\"}," ++ TRANSPORT_FACT ++ ",\"interaction\":" ++ AGENT_INTERACTION ++
     ",\"events\":{\"type\":\"array\",\"items\":" ++ AGENT_EVENT_ITEM ++ ",\"description\":\"Events not handed out before, oldest first\"},\"digest\":{\"type\":\"object\",\"description\":\"Rate-limited message events held back since the last wake-up\",\"properties\":{\"count\":{\"type\":\"integer\"},\"latest\":{\"type\":\"string\"}}},\"watch_command\":{\"type\":\"string\",\"description\":\"The exact shell command that blocks until this agent next needs attention (with this call's filter); run it in the background, or with --follow as a monitor\"}";
 
 /// The facts of a result that waited.
@@ -196,8 +197,15 @@ const AGENT_RECORD_ITEM = "{\"type\":\"object\",\"properties\":{\"id\":{\"type\"
     enumItems(vocab.ToolStatus) ++ "]},\"output\":{\"type\":\"string\"}}}},\"required\":[\"id\",\"kind\",\"text\",\"turn\"]}";
 
 fn agentSchema(comptime extra: []const u8, comptime required: []const u8) []const u8 {
-    return "{\"type\":\"object\",\"properties\":{" ++ AGENT_PROPS ++ extra ++ "},\"required\":[\"agent\",\"app\",\"source\",\"state\",\"ready\",\"session\",\"events\"" ++ required ++ "]}";
+    return "{\"type\":\"object\",\"properties\":{" ++ AGENT_PROPS ++ extra ++ "},\"required\":[\"agent\",\"app\",\"source\",\"state\",\"ready\",\"session\",\"transport\",\"events\"" ++ required ++ "]}";
 }
+
+/// term_open's and agent_open's `transport` argument.
+const TRANSPORT_INPUT = "\"transport\":{\"type\":\"string\",\"enum\":[" ++ enumItems(transport.Choice) ++
+    "],\"description\":\"Default auto (use the remote sketerm-mux daemon when reachable, else plain ssh). mux = require the daemon (error instead of falling back); ssh = never probe for it. Normally leave unset.\"}";
+
+/// The `transport` fact of a terminal or an agent.
+const TRANSPORT_FACT = "\"transport\":{\"type\":\"string\",\"enum\":[" ++ enumItems(transport.Transport) ++ "]}";
 
 const AGENT_FILTER_INPUT =
     \\"match":{"type":"string","description":"Also wake on a completed message containing this text (case-insensitive)"},"messages":{"type":"boolean","description":"Also wake on every completed message (rate limited: burst 3, then 1 per 30 s; the rest arrive as a digest)"}
@@ -855,11 +863,12 @@ pub const TOOLS = [_]ToolDef{
         \\Open a HEADLESS shell terminal on the private mux daemon (isolated mode) — a real PTY with no GUI, nothing of the user's reachable. Returns a term id. Drive with term_run/term_send_text/term_read. The reply names the SESSION'S SHELL and whether shell integration is active (for ssh, detected on the remote side and announced by a visible '[sketerm] remote shell: ...' line; if auth is still pending the reply says so and term_list carries the fields once connected). Pass 'host' for a PERSISTENT SSH session (keepalives preconfigured, survives long provisioning waits). The transport is picked automatically: when the remote host has sketerm-mux in PATH (key auth), the session lives on ITS daemon — it survives connection drops and is reattached transparently; otherwise plain interactive ssh is used. Either way, remote shell sessions get OSC 133 shell integration auto-bootstrapped into a remote bash/zsh, so term_run wait_for=command works on stock hosts too; other remote shells fall back to a plain login shell with term_exec as the structured path. Every headless terminal is AUTO-RECORDED as an asciicast v2 .cast file (the reply names the path; replay later with asciinema play).
         ,
         .input_schema =
-        \\{"type":"object","properties":{"command":{"description":"argv array or shell string to run instead of the login shell (optional; with 'host' a string is the remote command)","anyOf":[{"type":"array","items":{"type":"string"}},{"type":"string"}]},"host":{"type":"string","description":"SSH destination (user@box): opens ssh -tt with ServerAlive keepalives. Auth prompts appear on the screen — answer with term_send_text."},"integration":{"type":"boolean","description":"Default true: with 'host', bootstrap OSC 133 shell integration into the remote bash/zsh. false = plain remote login shell, nothing injected."},"transport":{"type":"string","enum":["auto","mux","ssh"],"description":"Default auto (use the remote sketerm-mux daemon when reachable, else plain ssh). mux = require the daemon (error instead of falling back); ssh = never probe for it. Normally leave unset."},"cols":{"type":"integer"},"rows":{"type":"integer"}}}
+        \\{"type":"object","properties":{"command":{"description":"argv array or shell string to run instead of the login shell (optional; with 'host' a string is the remote command)","anyOf":[{"type":"array","items":{"type":"string"}},{"type":"string"}]},"host":{"type":"string","description":"SSH destination (user@box): opens ssh -tt with ServerAlive keepalives. Auth prompts appear on the screen — answer with term_send_text."},"integration":{"type":"boolean","description":"Default true: with 'host', bootstrap OSC 133 shell integration into the remote bash/zsh. false = plain remote login shell, nothing injected."},
+        ++ TRANSPORT_INPUT ++
+        \\,"cols":{"type":"integer"},"rows":{"type":"integer"}}}
         ,
-        .output_schema =
-        \\{"type":"object","properties":{"term":{"type":"integer"},"cols":{"type":"integer"},"rows":{"type":"integer"},"transport":{"type":"string","enum":["local","ssh","sketerm-mux"]},"host":{"type":"string"},"shell":{"type":"string","description":"Detected session shell; absent until the session announces it"},"integration":{"type":"boolean","description":"OSC 133 shell integration is active"},"recording":{"type":"string","description":"Path of the automatic asciicast"}},"required":["term","cols","rows","transport","integration"]}
-        ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{\"term\":{\"type\":\"integer\"},\"cols\":{\"type\":\"integer\"},\"rows\":{\"type\":\"integer\"}," ++ TRANSPORT_FACT ++
+            ",\"host\":{\"type\":\"string\"},\"shell\":{\"type\":\"string\",\"description\":\"Detected session shell; absent until the session announces it\"},\"integration\":{\"type\":\"boolean\",\"description\":\"OSC 133 shell integration is active\"},\"recording\":{\"type\":\"string\",\"description\":\"Path of the automatic asciicast\"}},\"required\":[\"term\",\"cols\",\"rows\",\"transport\",\"integration\"]}",
     },
     .{
         .name = "term_list",
@@ -1433,24 +1442,24 @@ pub const TOOLS = [_]ToolDef{
         .group = .agent,
         .mutates = false,
         .description =
-        \\List the agent adapters this server can run (shipped ones plus user files in $XDG_CONFIG_HOME/sketerm/agents/*.json), whether each app's binary is installed on this machine (and where), and which actions each supports. Adapter files that fail to load are listed as problems, never ignored silently.
+        \\List the agent adapters this server can run (shipped ones plus user files in $XDG_CONFIG_HOME/sketerm/agents/*.json), whether each app's binary is installed on this machine (and where), and which actions each supports. With `host`, the binaries are looked up ON THAT SSH HOST instead (one probe over ssh, key auth; each adapter's candidates: the remote PATH, then paths like ~/.local/bin that an ssh login does not put on PATH). Adapter files that fail to load are listed as problems, never ignored silently.
         ,
         .input_schema =
-        \\{"type":"object","properties":{"host":{"type":"string","description":"SSH host to check instead of this machine (not available yet: answers unavailable)"}}}
+        \\{"type":"object","properties":{"host":{"type":"string","description":"SSH host (user@box) to look the binaries up on instead of this machine"}}}
         ,
         .output_schema = "{\"type\":\"object\",\"properties\":{\"adapters\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"},\"source\":{\"type\":\"string\",\"enum\":[" ++ enumItems(vocab.SourceKind) ++
             "]},\"origin\":{\"type\":\"string\",\"enum\":[" ++ enumItems(adapter.Origin) ++ "]},\"file\":{\"type\":\"string\"},\"installed\":{\"type\":\"boolean\"},\"binary\":{\"type\":[\"string\",\"null\"]},\"actions\":{\"type\":\"array\",\"items\":{\"type\":\"string\",\"enum\":[" ++
-            enumItems(std.meta.FieldEnum(adapter.Actions)) ++ "]}}}}},\"count\":{\"type\":\"integer\"},\"problems\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"required\":[\"adapters\",\"count\",\"problems\"]}",
+            enumItems(std.meta.FieldEnum(adapter.Actions)) ++ "]}}}}},\"count\":{\"type\":\"integer\"},\"problems\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"host\":{\"type\":\"string\",\"description\":\"The SSH host the binaries were looked up on\"}},\"required\":[\"adapters\",\"count\",\"problems\"]}",
     },
     .{
         .name = "agent_open",
         .group = .agent,
         .mutates = true,
         .description =
-        \\Run another coding agent as a SUB-AGENT and talk to it in clean records, never raw screens: app "claude" (Claude Code) or "opencode" (see agent_adapters). It runs on this server's private daemon in a terminal session the user can watch in the sketerm GUI (AI badge / Session Overview). Returns the agent id, its state and a watch_command; with `prompt` it also submits that prompt and waits (bounded) for the turn like agent_send, returning the final message. model/effort apply to this session only. `binary` runs a custom build: an executable name looked up like the adapter's own, or an absolute path. timeout_ms (default 60000, max 120000) bounds the start and the wait. Isolated/durable mode only; `host` (SSH) is not available yet.
+        \\Run another coding agent as a SUB-AGENT and talk to it in clean records, never raw screens: app "claude" (Claude Code) or "opencode" (see agent_adapters). It runs on this server's private daemon in a terminal session the user can watch in the sketerm GUI (AI badge / Session Overview). Returns the agent id, its state and a watch_command; with `prompt` it also submits that prompt and waits (bounded) for the turn like agent_send, returning the final message. model/effort apply to this session only (passed at launch; never saved as the user's defaults). `binary` runs a custom build: an executable name looked up like the adapter's own, or an absolute path. `host` runs the agent ON THAT SSH HOST (key auth): the binary is looked up there, the session lives on the host's own sketerm-mux daemon when it has one (it survives connection drops) or else in a plain ssh session, and opencode's server is reached through an ssh port forward. timeout_ms (default 60000, max 120000) bounds the start and the wait. Isolated/durable mode only.
         ,
-        .input_schema = "{\"type\":\"object\",\"properties\":{\"app\":{\"type\":\"string\",\"description\":\"Adapter id: claude, opencode, or a user adapter\"},\"prompt\":{\"type\":\"string\",\"description\":\"Submit this once the agent is ready, and wait for the turn\"},\"cwd\":{\"type\":\"string\",\"description\":\"Absolute working directory (default: this server's)\"},\"model\":{\"type\":\"string\"},\"effort\":{\"type\":\"string\"},\"binary\":{\"type\":\"string\",\"description\":\"Executable name or absolute path overriding the adapter's (e.g. a custom build)\"}," ++ AGENT_FILTER_INPUT ++
-            ",\"timeout_ms\":{\"type\":\"integer\",\"description\":\"Default 60000, max 120000\"},\"cols\":{\"type\":\"integer\"},\"rows\":{\"type\":\"integer\"},\"host\":{\"type\":\"string\",\"description\":\"SSH host (not available yet)\"}},\"required\":[\"app\"]}",
+        .input_schema = "{\"type\":\"object\",\"properties\":{\"app\":{\"type\":\"string\",\"description\":\"Adapter id: claude, opencode, or a user adapter\"},\"prompt\":{\"type\":\"string\",\"description\":\"Submit this once the agent is ready, and wait for the turn\"},\"cwd\":{\"type\":\"string\",\"description\":\"Absolute working directory (default: this server's; with host: the remote home)\"},\"model\":{\"type\":\"string\"},\"effort\":{\"type\":\"string\"},\"binary\":{\"type\":\"string\",\"description\":\"Executable name or absolute path overriding the adapter's (e.g. a custom build)\"}," ++ AGENT_FILTER_INPUT ++
+            ",\"timeout_ms\":{\"type\":\"integer\",\"description\":\"Default 60000, max 120000\"},\"cols\":{\"type\":\"integer\"},\"rows\":{\"type\":\"integer\"},\"host\":{\"type\":\"string\",\"description\":\"SSH host (user@box) to run the agent on\"}," ++ TRANSPORT_INPUT ++ "},\"required\":[\"app\"]}",
         .output_schema = agentSchema("," ++ AGENT_WAIT_PROPS ++ ",\"binary\":{\"type\":\"string\"},\"cwd\":{\"type\":\"string\"},\"prompt_sent\":{\"type\":\"boolean\"},\"recordings\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"asciicast recordings of the agent's sessions\"}", ",\"binary\",\"cwd\",\"prompt_sent\""),
     },
     .{
@@ -1500,12 +1509,12 @@ pub const TOOLS = [_]ToolDef{
         .group = .agent,
         .mutates = true,
         .description =
-        \\Change an agent's model and/or effort level for THIS session only, never the user's defaults (Claude Code: /model with its session-only choice, /effort; opencode: the model and variant of the prompts this agent sends). Only while the agent is idle.
+        \\Change an agent's model and/or effort level for THIS session only, never the user's defaults (Claude Code: /model with its session-only choice, confirmed by the app before this returns; effort by restarting Claude Code in the same terminal with --effort and resuming the conversation, since its /effort saves the user's default; opencode: the model and variant of the prompts this agent sends). Only while the agent is idle. A change the app did not confirm is a failure that says what the screen shows.
         ,
         .input_schema =
-        \\{"type":"object","properties":{"agent":{"type":"string"},"model":{"type":"string","description":"As the app names it (opencode: provider/model)"},"effort":{"type":"string"}}}
+        \\{"type":"object","properties":{"agent":{"type":"string"},"model":{"type":"string","description":"As the app names it (opencode: provider/model)"},"effort":{"type":"string"},"timeout_ms":{"type":"integer","description":"Default 60000, max 120000"}}}
         ,
-        .output_schema = agentSchema(",\"model\":{\"type\":\"string\"},\"effort\":{\"type\":\"string\"},\"current_model\":{\"type\":\"string\",\"description\":\"API sources: the model the next prompt runs with\"},\"current_effort\":{\"type\":\"string\"}", ""),
+        .output_schema = agentSchema(",\"model\":{\"type\":\"string\"},\"effort\":{\"type\":\"string\"},\"current_model\":{\"type\":\"string\",\"description\":\"API sources: the model the next prompt runs with\"},\"current_effort\":{\"type\":\"string\"},\"confirmation\":{\"type\":\"string\",\"description\":\"Screen apps: the line the app printed confirming the change\"},\"relaunched\":{\"type\":\"boolean\",\"description\":\"The app was restarted with the new setting and its conversation resumed\"}", ""),
     },
     .{
         .name = "agent_interrupt",
@@ -1530,7 +1539,8 @@ pub const TOOLS = [_]ToolDef{
         \\{"type":"object","properties":{}}
         ,
         .output_schema = "{\"type\":\"object\",\"properties\":{\"agents\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"agent\":{\"type\":\"string\"},\"app\":{\"type\":\"string\"},\"source\":{\"type\":\"string\",\"enum\":[" ++ enumItems(vocab.SourceKind) ++
-            "]},\"state\":{\"type\":\"string\",\"enum\":[" ++ enumItems(vocab.State) ++ "]},\"ready\":{\"type\":\"boolean\"},\"session\":{\"type\":\"string\"},\"server_session\":{\"type\":\"string\"},\"pending_events\":{\"type\":\"integer\"},\"waiting_on_user\":{\"type\":\"boolean\"}}}},\"count\":{\"type\":\"integer\"}},\"required\":[\"agents\",\"count\"]}",
+            "]},\"state\":{\"type\":\"string\",\"enum\":[" ++ enumItems(vocab.State) ++ "]},\"ready\":{\"type\":\"boolean\"},\"session\":{\"type\":\"string\"},\"server_session\":{\"type\":\"string\"},\"pending_events\":{\"type\":\"integer\"},\"waiting_on_user\":{\"type\":\"boolean\"},\"host\":{\"type\":\"string\"}," ++ TRANSPORT_FACT ++
+            ",\"recordings\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"asciicast recordings of the agent's sessions\"}}}},\"count\":{\"type\":\"integer\"}},\"required\":[\"agents\",\"count\"]}",
     },
     .{
         .name = "agent_close",

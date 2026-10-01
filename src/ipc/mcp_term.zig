@@ -23,6 +23,7 @@ const nowMs = @import("../util/clock.zig").nowMs;
 const shellquote = mcp.shellquote;
 const sshroute = @import("../mux/sshroute.zig");
 const Config = @import("../config.zig").Config;
+const transport_mod = @import("transport.zig");
 
 // ── headless terminal tools (shell sessions on the private daemon) ─
 
@@ -30,7 +31,7 @@ const Config = @import("../config.zig").Config;
 /// daemon. No local asciicast: rec_start writes on the daemon's host,
 /// which would litter the remote box.
 pub fn spawnRegisteredRemoteTerm(host: []const u8, argv: []const []const u8, cols: u16, rows: u16) !u32 {
-    const t = termdrive.Term.spawnRemoteMux(term_state.allocator, host, argv, cols, rows) catch
+    const t = termdrive.Term.spawnRemoteMux(term_state.allocator, host, argv, cols, rows, .{}) catch
         return error.SpawnFailed;
     const id = term_state.next_id;
     term_state.next_id += 1;
@@ -295,8 +296,7 @@ fn termOpen(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
         const v = args.object.get("integration") orelse break :blk true;
         break :blk !(v == .bool and !v.bool);
     } else true;
-    const transport = argStr(args, "transport") orelse "auto";
-    if (!eql(u8, transport, "auto") and !eql(u8, transport, "mux") and !eql(u8, transport, "ssh"))
+    const choice = transportChoice(args) orelse
         return mcp.errRes(arena, .invalid_args, "transport must be 'auto', 'mux' or 'ssh'");
 
     var remote_integration = false;
@@ -309,7 +309,7 @@ fn termOpen(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
     // ssh forced command. Absent binary / password auth / any
     // failure falls back to plain interactive ssh below; the
     // assistant never chooses.
-    if (host != null and !eql(u8, transport, "ssh")) mux: {
+    if (host != null and choice != .ssh) mux: {
         var margv: []const []const u8 = undefined;
         if (cmd_array) |a| {
             margv = a;
@@ -335,8 +335,8 @@ fn termOpen(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
         }
         id = spawnRegisteredRemoteTerm(host.?, margv, cols, rows) catch {
             remote_integration = false;
-            if (eql(u8, transport, "mux"))
-                return mcp.errRes(arena, .unavailable, "no reachable sketerm-mux daemon on the remote host (needs key/agent auth and sketerm-mux in the remote PATH; transport 'auto' would fall back to plain ssh)");
+            if (choice == .mux)
+                return mcp.errRes(arena, .unavailable, NO_REMOTE_MUX);
             break :mux;
         };
         via_mux = true;
@@ -345,18 +345,8 @@ fn termOpen(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
         var argv_store: std.ArrayList([]const u8) = .empty;
         defer argv_store.deinit(arena);
         if (host) |h| {
-            // Persistent SSH session with keepalives: survives long
-            // provisioning waits; interactive (auth prompts reach
-            // the screen — drive them with term_send_text).
-            try argv_store.appendSlice(arena, &.{
-                "ssh", "-tt",
-                "-o",  "ServerAliveInterval=15",
-                "-o",  "ServerAliveCountMax=4",
-            });
-            // A forced route must survive the fall out of the mux path.
-            const dest = appendRoute(arena, &argv_store, h, false) catch
+            appendSshTt(arena, &argv_store, h) catch
                 return mcp.errRes(arena, .refused, "cannot build the forced route for this host");
-            try argv_store.append(arena, dest);
         }
         if (cmd_string) |s| {
             if (host != null) {
@@ -428,7 +418,8 @@ fn termOpen(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
     try res.fact("term", id);
     try res.fact("cols", cols);
     try res.fact("rows", rows);
-    try res.fact("transport", if (via_mux) "sketerm-mux" else if (host != null) "ssh" else "local");
+    const used: transport_mod.Transport = if (via_mux) .@"sketerm-mux" else if (host != null) .ssh else .local;
+    try res.fact("transport", @tagName(used));
     if (host) |h| try res.fact("host", h);
     if (t.shell_name) |sn| try res.fact("shell", sn);
     try res.fact("integration", t.integration);
@@ -742,6 +733,28 @@ fn appendRoute(
     var args = try plan.args(false);
     try args.appendSlices(arena, out, ssh_flags);
     return try arena.dupe(u8, remote.host);
+}
+
+/// The refusal of a remote open that required the host's own daemon.
+pub const NO_REMOTE_MUX = "no reachable sketerm-mux daemon on the remote host (needs key/agent auth and sketerm-mux in the remote PATH; transport 'auto' would fall back to plain ssh)";
+
+/// The `transport` argument, default auto; null when it names no choice.
+pub fn transportChoice(args: std.json.Value) ?transport_mod.Choice {
+    const s = argStr(args, "transport") orelse return .auto;
+    return std.meta.stringToEnum(transport_mod.Choice, s);
+}
+
+/// Append a persistent interactive `ssh -tt` to `host` (keepalives, the
+/// host's forced route) up to and including its destination; the remote
+/// command, if any, goes after it. Auth prompts land on the screen.
+pub fn appendSshTt(arena: std.mem.Allocator, out: *std.ArrayList([]const u8), host: []const u8) !void {
+    try out.appendSlice(arena, &.{
+        "ssh", "-tt",
+        "-o",  "ServerAliveInterval=15",
+        "-o",  "ServerAliveCountMax=4",
+    });
+    // A forced route must survive the fall out of the mux path.
+    try out.append(arena, try appendRoute(arena, out, host, false));
 }
 
 pub fn runArgvTerm(arena: std.mem.Allocator, argv: []const []const u8, timeout_ms: i64) !union(enum) { run: ArgvRun, err: []const u8 } {
@@ -1144,6 +1157,12 @@ fn portForwardClose(arena: std.mem.Allocator, _: std.json.Value, f: *Forward) ![
 }
 
 pub fn spawnForwardTerm(arena: std.mem.Allocator, host: []const u8, lp: u16, rh: []const u8, rp: u16) !*termdrive.Term {
+    return spawnForwardTermNamed(arena, host, lp, rh, rp, null);
+}
+
+/// `spawnForwardTerm` as session `name` (null mints one), so a durable
+/// owner can find the forward again by name.
+pub fn spawnForwardTermNamed(arena: std.mem.Allocator, host: []const u8, lp: u16, rh: []const u8, rp: u16, name: ?[]const u8) !*termdrive.Term {
     const bindspec = try std.fmt.allocPrint(arena, "127.0.0.1:{d}:{s}:{d}", .{ lp, rh, rp });
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(arena);
@@ -1158,7 +1177,7 @@ pub fn spawnForwardTerm(arena: std.mem.Allocator, host: []const u8, lp: u16, rh:
     // A forward reconnect must stay on the route its host asked for.
     const dest = appendRoute(arena, &argv, host, false) catch return error.SpawnFailed;
     try argv.appendSlice(arena, &.{ "-L", bindspec, dest });
-    const t = termdrive.Term.spawn(term_state.allocator, argv.items, 120, 30, term_state.mux_sock) catch return error.SpawnFailed;
+    const t = termdrive.Term.spawnWith(term_state.allocator, argv.items, 120, 30, term_state.mux_sock, .{ .name = name }) catch return error.SpawnFailed;
     recordAuxTerm(t, "forward");
     return t;
 }

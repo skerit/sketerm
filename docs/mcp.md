@@ -236,7 +236,7 @@ is kept by a `:ro` policy term. The full descriptions and schemas are in
 - `agent_wait` (read-only): Wait (bounded, timeout_ms default 60000, max 120000) for an agent's next wake-up, with agent_send's filter rules, and return the events you were not handed before (a turn that finished meanwhile answers at once, with its final message).
 - `agent_read` (read-only): Read an agent's transcript as records (user, assistant, tool, notice) with stable ids, oldest first.
 - `agent_answer`: Answer the agent's pending prompt (permission, question or choice; see interaction) by option label, its 1-based number or a unique part of a label, then wait for the turn like agent_send.
-- `agent_set`: Change an agent's model and/or effort level for THIS session only, never the user's defaults (Claude Code: /model with its session-only choice, /effort; opencode: the model and variant of the prompts this agent sends).
+- `agent_set`: Change an agent's model and/or effort level for THIS session only, never the user's defaults (Claude Code: /model with its session-only choice, confirmed by the app before this returns; effort by restarting Claude Code in the same terminal with --effort and resuming the conversation, since its /effort saves the user's default; opencode: the model and variant of the prompts this agent sends).
 - `agent_interrupt`: Interrupt an agent's running turn (Claude Code: Escape; opencode: abort, subagents included).
 - `agent_list` (read-only): List this server's agents: app, state, the session the user can watch, and how many wake-ups each holds that no agent_* result has handed out yet.
 - `agent_close`: Stop an agent: kills its session(s) and ends its waiters.
@@ -648,9 +648,12 @@ on a free loopback port, read over its HTTP API and SSE stream, with
 
 - **Sessions.** An agent is `agent-<app>-<n>` on the instance's private
   daemon (opencode adds `agent-<app>-<n>-server`), so the GUI's AI badge
-  and Session Overview list it for watch-along. Both are recorded as
-  asciicasts like every headless terminal. Isolated and durable modes
-  only; `--shared` answers `unavailable` (`capabilities.agents`).
+  and Session Overview list it for watch-along. Its terminals are
+  recorded as asciicasts like every headless terminal (`--no-record` opts
+  out); `agent_open` and `agent_list` report the absolute paths as
+  `recordings` (a relaunch adds `<session>-r<N>.cast`). Isolated and
+  durable modes only; `--shared` answers `unavailable`
+  (`capabilities.agents`).
 - **Launch.** The binary is resolved from the adapter's ordered
   `candidates` (`binary` overrides it: a name looked up the same way, or
   an absolute path). `unset_env` is applied in the child by a POSIX `sh`
@@ -658,8 +661,37 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   server's. opencode's password is random per agent and reaches the
   server and the TUI through the spawn request's environment, never an
   argv; a durable instance keeps it in a 0600 file beside the agent's
-  descriptor. A model or effort the launch cannot take is applied through
-  the app once it is ready, session-scoped.
+  descriptor. `model` and `effort` are launch arguments where the adapter
+  has `model_args`/`effort_args` (Claude Code: `--model`, `--effort`,
+  session-scoped; an effort outside `effort_values` is refused up front);
+  otherwise they are applied through the app once it is ready.
+  opencode's server is only waited for once it answers `GET
+  /global/health` (short probes, each on a fresh connection: a starting
+  opencode listens seconds before it answers and never answers what it
+  received in between); a server that never does is a `timeout` saying it
+  did not become ready.
+- **Settings are confirmed, never assumed.** A recipe step `command` is
+  the adapter's own command (`/model`): its turn is hidden from the
+  transcript and the events, and the picker it opens is the recipe's to
+  answer (no `needs_input`). A `confirm` step waits until no prompt shows
+  and the app printed its confirmation below that command (Claude Code:
+  `Set model to … this session only`); without it `agent_set` fails and
+  says what the screen shows (a picker left open is cancelled). The
+  transcript gets one adapter `notice` instead of `user: /model`.
+  `agent_answer` likewise waits for the prompt it answered to go
+  (`wait: answered`).
+- **Effort is a relaunch for Claude Code.** Its `/effort` writes the
+  user's `~/.claude/settings.json` even when it was launched with
+  `--effort` or `CLAUDE_CODE_EFFORT_LEVEL` (measured, 2.1.286), so the
+  `set_effort` recipe is `relaunch`: the app is ended (`launch.exit`,
+  `/exit`), started again in the SAME session name with `resume_args`
+  (`--resume <id>`: every agent is started with its own `--session-id`,
+  so it never resumes another conversation in the same directory, the
+  calling assistant's included) and every launch value as set now, and a
+  model chosen in the app since is chosen again. The restart raises no
+  event; the screen engine re-syncs as after a wipe and the transcript
+  gets a notice. An agent put on a `term_open` terminal cannot be
+  relaunched.
 - **Waiting.** `agent_send`, `agent_answer`, `agent_open prompt` and
   `agent_wait` wait (bounded, default 60 s, at most 120 s) on the agent's
   event queue. Always-on wake-ups (`done`, `needs_input`, `error`,
@@ -673,24 +705,54 @@ on a free loopback port, read over its HTTP API and SSE stream, with
 - **Being woken.** Every per-agent result carries `watch_command`, the
   exact command (this executable, absolute) that blocks until the agent
   next needs attention: `sketerm mcp agent-wait --socket <instance>/agents.sock
-  --since <seq> [--match X] [--messages] <agent>`. It prints one line per
-  wake-up (`claude-1 done: <first line> [state idle]`), exits after the
-  first unless `--follow`, and always prints `watch ended: <reason>` when
-  the agent closes or the server goes away. `sketerm-mcp agent-wait` and
-  `sketerm-mcp mcp agent-wait` are the same command. The waiter and
-  `agent_wait` share one filter and limiter (`events.Cursor.take`); a
-  waiter never advances what the assistant has been handed.
+  [--match X] [--messages] <agent>`. It wakes for events no result had
+  handed the assistant when it subscribes, so the same command can be run
+  again any number of calls later and never re-wakes on an event the
+  assistant already has (`--since SEQ` is the explicit alternative). It
+  prints one line per wake-up (`claude-1 done: <first line> [state
+  idle]`), exits after the first unless `--follow`, and always prints
+  `watch ended: <reason>` when the agent closes or the server goes away.
+  `sketerm-mcp agent-wait` and `sketerm-mcp mcp agent-wait` are the same
+  command. The waiter and `agent_wait` share one filter and limiter
+  (`events.Cursor.take`); a waiter never advances what the assistant has
+  been handed.
 - **Observation.** The server loop polls stdin together with every agent
   terminal, API stream and waiter connection, and wakes for the sources'
   timers, so agents are observed between requests. Turn detection is
   content-based (OSC 133 marks, the footer line, API events): a turn that
   ended while another tool call blocked the loop reads the same when it is
   observed afterwards.
+- **On an SSH host (`host`, `capabilities.agent_ssh`).** One probe over
+  ssh (key or agent auth) resolves the binary ON THE HOST from the
+  adapter's candidates (`command -v` for `$PATH`, `$HOME` for `~/`; an
+  ssh login's PATH lacks `~/.local/bin`, which is why the candidates
+  exist), checks `cwd` there (default: the remote home) and is how
+  `agent_adapters host` reports what is installed. The sessions use
+  `term_open`'s transports (`transport` auto|mux|ssh): the host's own
+  sketerm-mux daemon when it answers (sessions survive drops; not
+  recorded, the cast would land on the host), else plain `ssh -tt` in a
+  local session (dialect-proof base64 script, terminal on stdin; the
+  remote process ends with the connection). Results report `host` and
+  `transport`. opencode's server listens on the HOST's loopback (a random
+  remote port, `{port}` in `attach_args`) and the API client reaches it
+  through an ssh `-L` forward from a local port, one per agent, respawned
+  whenever it dies. A remote start reads opencode's password off its own
+  terminal with echo off after printing `[sketerm] agent secret:` and
+  exports it, so it rides neither an argv (local or remote) nor the
+  spawn request, and nothing records it.
+- **Connection loss.** A remote-mux session whose link drops is
+  reattached once at once; when that fails the agent reports
+  `connection_lost` (state `disconnected`) and the next `agent_*` call on
+  it tries again (at most every 5 s); a recovered link re-syncs like a
+  wipe (nothing is captured twice). A plain-ssh agent whose ssh lost the
+  connection (status 255) reports `connection_lost` and `exited`.
 - **Durable instances.** `--name`/`--durable` keep agents running across
   restarts: each has a 0600 descriptor in `<instance>/agents/` (adapter,
-  session names and lifetime ids, opencode port, password file, API
-  session), and the next server re-attaches them. A descriptor whose
-  session is gone is removed.
+  session names and lifetime ids, opencode ports, password file, API
+  session, host and transport, the forward, the conversation id and
+  launch values), and the next server re-attaches them, over ssh for a
+  remote daemon's sessions. A descriptor whose session is gone is
+  removed.
 - **`agent_attach`** puts a screen adapter on a terminal `term_open`
   created (you started the app yourself); `agent_close` then drops only
   the adapter.

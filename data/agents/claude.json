@@ -6,9 +6,18 @@
     "binary": "claude",
     "candidates": ["$PATH", "~/.local/bin/claude", "~/.claude/local/claude"],
     "args": ["--ax-screen-reader"],
+    "session_args": ["--session-id", "{session}"],
+    "resume_args": ["--resume", "{session}"],
     "model_args": ["--model", "{model}"],
     "effort_args": ["--effort", "{effort}"],
-    "unset_env": ["CLAUDE*"]
+    "effort_values": ["low", "medium", "high", "xhigh", "max"],
+    "unset_env": ["CLAUDE*"],
+    "exit": [
+      { "clear_input": ["escape", "escape"] },
+      { "command": "/exit" },
+      { "sleep_ms": 800 },
+      { "key": "enter" }
+    ]
   },
   "screen": {
     "input_prefix": "$",
@@ -72,24 +81,24 @@
     "answer": [
       { "pick": "{choice}" },
       { "sleep_ms": 300 },
-      { "key": "enter" }
+      { "key": "enter" },
+      { "wait": "answered" }
     ],
     "interrupt": [
       { "key": "escape" }
     ],
     "set_model": [
-      { "text": "/model" },
+      { "command": "/model" },
       { "sleep_ms": 800 },
       { "key": "enter" },
       { "wait": "choice" },
       { "pick": "{model}" },
       { "sleep_ms": 300 },
-      { "key": "s" }
+      { "key": "s" },
+      { "confirm": { "pattern": "^Set model to .* this session only" } }
     ],
     "set_effort": [
-      { "text": "/effort {effort}" },
-      { "sleep_ms": 800 },
-      { "key": "enter" }
+      { "relaunch": {} }
     ]
   },
   "errors": [

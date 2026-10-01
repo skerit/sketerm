@@ -40,6 +40,9 @@ pub const Turn = struct {
     /// First index into `Engine.records`.
     first: usize,
     alnum: usize,
+    /// The prompt is an adapter command (`Engine.beginCommand`): the turn
+    /// keeps only synthetic records and raises no events.
+    hidden: bool = false,
 };
 
 /// Wait this long after a retrying error first shows before surfacing it.
@@ -112,6 +115,11 @@ pub const Engine = struct {
     retrying_visible: bool = false,
     exited: bool = false,
     disconnected: bool = false,
+    /// Prompts the adapter typed as its own commands; owned.
+    commands: std.ArrayList([]u8) = .empty,
+    /// A command recipe is running: a new interaction is the recipe's to
+    /// answer and raises no needs_input.
+    adopting: bool = false,
 
     /// @param loaded must be a screen-source adapter and outlive the engine.
     pub fn init(allocator: std.mem.Allocator, loaded: *const adapter.Loaded, limits: events.Limits) !Engine {
@@ -137,6 +145,8 @@ pub const Engine = struct {
         self.allocator.free(self.input_text);
         for (self.turn_errors.items) |e| self.allocator.free(e);
         self.turn_errors.deinit(self.allocator);
+        for (self.commands.items) |x| self.allocator.free(x);
+        self.commands.deinit(self.allocator);
         self.interaction_arena.deinit();
         self.queue.deinit();
     }
@@ -201,6 +211,74 @@ pub const Engine = struct {
         errdefer self.allocator.free(owned);
         const turn: u32 = if (self.turns.items.len > 0) @intCast(self.turns.items.len - 1) else 0;
         try self.records.append(self.allocator, .{ .id = self.nextId(), .kind = .notice, .text = owned, .turn = turn, .synthetic = true });
+    }
+
+    /// The adapter is about to type `text` as its own command: the turn it
+    /// starts is hidden from the transcript and the events, and an
+    /// interaction it opens is adopted (no needs_input) until `endCommand`.
+    pub fn beginCommand(self: *Engine, text: []const u8) !void {
+        self.adopting = true;
+        for (self.commands.items) |x| if (std.mem.eql(u8, x, text)) return;
+        try self.commands.append(self.allocator, try self.allocator.dupe(u8, text));
+    }
+
+    /// The command recipe is over. An interaction it adopted that is still
+    /// showing is announced now: nobody else would ever answer it.
+    pub fn endCommand(self: *Engine, now_ms: i64) !void {
+        self.adopting = false;
+        if (self.interaction) |it| {
+            if (self.announced_interaction == it.hash()) {
+                self.announced_interaction = null;
+                try self.evaluate(now_ms);
+            }
+        }
+    }
+
+    /// The text of the first line below the latest `command` prompt that
+    /// matches `rule` (borrowed until the next feed), or null.
+    pub fn confirmLine(self: *const Engine, rule: adapter.Matcher, command: []const u8) ?[]const u8 {
+        const lists = [2][]const Line{ self.hist.items, self.rows.items };
+        var anchor: ?[2]usize = null;
+        for (lists, 0..) |list, li| {
+            for (list, 0..) |l, i| {
+                const ri = recordRule(self.sc, l.text) orelse continue;
+                if (self.sc.records[ri].kind != .user) continue;
+                if (std.mem.eql(u8, std.mem.trim(u8, stripRecordPrefix(self.sc, l.text), " "), command)) anchor = .{ li, i };
+            }
+        }
+        const at = anchor orelse return null;
+        var li = at[0];
+        var start = at[1] + 1;
+        while (li < lists.len) : (li += 1) {
+            for (lists[li][start..]) |l| {
+                if (l.live) continue;
+                if (rule.matches(l.text)) return l.text;
+            }
+            start = 0;
+        }
+        return null;
+    }
+
+    /// The app was restarted in place (a relaunch): a new screen that must
+    /// show its input box again before anything is typed. No event: the
+    /// adapter did it, and the conversation goes on.
+    pub fn noteRestart(self: *Engine) void {
+        self.noteResync();
+        self.ready = false;
+        self.state = .starting;
+        self.turn_open = false;
+        self.end_pending = false;
+        self.done_armed = false;
+        self.lone_bell = false;
+        self.interaction = null;
+        self.announced_interaction = null;
+        self.disconnected = false;
+    }
+
+    fn isCommand(self: *const Engine, prompt: []const u8) bool {
+        const p = std.mem.trim(u8, prompt, " ");
+        for (self.commands.items) |x| if (std.mem.eql(u8, x, p)) return true;
+        return false;
     }
 
     /// Records with an id above `since`, oldest first.
@@ -365,8 +443,9 @@ pub const Engine = struct {
         try self.scanErrors(now_ms);
 
         // A turn end is captured once the footer shows below its last record
-        // (all text drawn), or after the settle guard.
-        if (self.end_pending and (self.footerBelowRecords() or now_ms - self.end_at_ms >= settle)) {
+        // (all text drawn), or after the settle guard. An adapter command's
+        // turn has no answer still to draw: it is captured at once.
+        if (self.end_pending and (self.adopting or self.footerBelowRecords() or now_ms - self.end_at_ms >= settle)) {
             try self.capture(true);
             self.end_pending = false;
             self.captured_since_end = true;
@@ -377,7 +456,8 @@ pub const Engine = struct {
             if (self.announced_interaction != id) {
                 // What led to the prompt belongs to the transcript now.
                 try self.capture(false);
-                _ = try it.announce(&self.queue, now_ms);
+                // A command recipe's own picker is the recipe's to answer.
+                if (!self.adopting) _ = try it.announce(&self.queue, now_ms);
                 self.announced_interaction = id;
                 self.ackBells();
             }
@@ -408,7 +488,9 @@ pub const Engine = struct {
 
         if (self.state == .idle and self.done_armed and self.captured_since_end) {
             self.done_armed = false;
-            _ = try self.queue.push(now_ms, .done, null, self.finalMessage(), "");
+            // An adapter command's turn is not a turn the assistant asked for.
+            const hidden = self.turns.items.len > 0 and self.turns.items[self.turns.items.len - 1].hidden;
+            if (!hidden) _ = try self.queue.push(now_ms, .done, null, self.finalMessage(), "");
         }
     }
 
@@ -625,6 +707,7 @@ pub const Engine = struct {
             .key = owned_key,
             .first = self.records.items.len,
             .alnum = 0,
+            .hidden = self.isCommand(recs[0].text),
         });
         try self.replaceLast(recs, alnum, complete);
     }
@@ -652,10 +735,12 @@ pub const Engine = struct {
 
     /// Replace the latest turn's screen records with `recs`, keeping the id
     /// of every record whose text did not change and its synthetic notices.
-    fn replaceLast(self: *Engine, recs: []const grammar.Rec, alnum: usize, complete: bool) !void {
+    fn replaceLast(self: *Engine, all_recs: []const grammar.Rec, alnum: usize, complete: bool) !void {
         const ti = self.turns.items.len - 1;
         const turn = &self.turns.items[ti];
         turn.alnum = alnum;
+        // An adapter command leaves only what the adapter recorded of it.
+        const recs = if (turn.hidden) all_recs[0..0] else all_recs;
         const old = self.records.items[turn.first..];
 
         var fresh: std.ArrayList(Record) = .empty;
@@ -1092,4 +1177,92 @@ test "errors, exit and synthetic notices" {
     try t.expectEqual(vocab.State.exited, rig.engine.state);
     try t.expectEqual(@as(usize, 1), countKind(&rig.engine, .exited));
     try t.expectEqual(@as(usize, 2), countKind(&rig.engine, .@"error"));
+}
+
+test "an adapter command: hidden turn, adopted picker, confirmation below it, no events" {
+    var rig: Rig = undefined;
+    try rig.init(80, 24);
+    defer rig.deinit();
+    rig.write("\x1b]0;\xe2\x9c\xb3 C\x07" ++ live);
+    try rig.feed(0);
+    try rig.engine.tick(1000);
+    // An earlier confirmation must not count for this command.
+    rig.write(erase ++ "Set model to Sonnet for this session only\r\n" ++ live);
+    try rig.feed(1050);
+    try rig.engine.beginCommand("/model");
+    rig.write("\x1b]133;A\x07" ++ erase ++ "you: /model\r\nSelect model\r\n1. Sonnet\r\n2. Haiku (selected)\r\n" ++
+        "Select with numbers [1-2]. Then Enter to submit or Escape to cancel:");
+    try rig.feed(1100);
+    try t.expectEqual(vocab.State.waiting_user, rig.engine.state);
+    try t.expect(rig.engine.interaction != null);
+    // The recipe's own picker raises nothing.
+    try t.expectEqual(@as(usize, 0), countKind(&rig.engine, .needs_input));
+    const rule = adapter.Matcher{ .prefix = "Set model to " };
+    try t.expect(rig.engine.confirmLine(rule, "/model") == null);
+    // Picked: the picker goes, the app confirms below the command.
+    rig.write("\r\x1b[3A\x1b[JSet model to Haiku for this session only\r\n" ++ live ++
+        "\x1b]133;C\x07\x1b]133;D\x07\x07");
+    try rig.feed(1200);
+    try t.expect(rig.engine.interaction == null);
+    try t.expectEqualStrings("Set model to Haiku for this session only", rig.engine.confirmLine(rule, "/model").?);
+    try rig.engine.addNotice("model set: Set model to Haiku for this session only");
+    try rig.engine.endCommand(1250);
+    try rig.engine.tick(9000);
+    // Neither the command nor the app's echo of it is transcript; no turn
+    // the assistant asked for ended, so no done and no message.
+    var recs: std.ArrayList(Record) = .empty;
+    defer recs.deinit(t.allocator);
+    try rig.engine.recordsSince(0, &recs, t.allocator);
+    try t.expectEqual(@as(usize, 1), recs.items.len);
+    try t.expect(recs.items[0].synthetic);
+    try t.expectEqual(@as(usize, 0), countKind(&rig.engine, .done));
+    try t.expectEqual(@as(usize, 0), countKind(&rig.engine, .needs_input));
+    try t.expectEqual(vocab.State.idle, rig.engine.state);
+
+    // The next real turn is transcript and ends with a done as always.
+    rig.write("\x1b]133;A\x07" ++ erase ++ "you: hi\r\nclaude: hello\r\n" ++ live ++
+        "\x1b]133;C\x07\x1b]133;D\x07\x07" ++ erase ++ "Brewed for 1s \xc2\xb7 done\r\n" ++ live);
+    try rig.feed(10_000);
+    try rig.engine.tick(20_000);
+    recs.clearRetainingCapacity();
+    try rig.engine.recordsSince(0, &recs, t.allocator);
+    try t.expectEqual(@as(usize, 3), recs.items.len);
+    try t.expectEqualStrings("hi", recs.items[1].text);
+    try t.expectEqual(@as(usize, 1), countKind(&rig.engine, .done));
+}
+
+test "a command picker still showing when the recipe ends is announced then" {
+    var rig: Rig = undefined;
+    try rig.init(80, 24);
+    defer rig.deinit();
+    rig.write("\x1b]0;\xe2\x9c\xb3 C\x07" ++ live);
+    try rig.feed(0);
+    try rig.engine.tick(1000);
+    try rig.engine.beginCommand("/model");
+    rig.write(erase ++ "you: /model\r\nSelect model\r\n1. Sonnet\r\n2. Haiku (selected)\r\n" ++
+        "Select with numbers [1-2]. Then Enter to submit or Escape to cancel:");
+    try rig.feed(1100);
+    try t.expectEqual(@as(usize, 0), countKind(&rig.engine, .needs_input));
+    // The recipe failed and left it open: nobody else would answer it.
+    try rig.engine.endCommand(1200);
+    try t.expectEqual(@as(usize, 1), countKind(&rig.engine, .needs_input));
+    try rig.feed(1300);
+    try t.expectEqual(@as(usize, 1), countKind(&rig.engine, .needs_input));
+}
+
+test "a restart in place re-arms readiness without an event" {
+    var rig: Rig = undefined;
+    try rig.init(80, 24);
+    defer rig.deinit();
+    rig.write("\x1b]0;\xe2\x9c\xb3 C\x07" ++ live);
+    try rig.feed(0);
+    try rig.engine.tick(1000);
+    try t.expect(rig.engine.ready);
+    rig.engine.noteRestart();
+    try t.expect(!rig.engine.ready);
+    try t.expectEqual(vocab.State.starting, rig.engine.state);
+    try rig.feed(1100);
+    try rig.engine.tick(3000);
+    try t.expect(rig.engine.ready);
+    try t.expectEqual(@as(usize, 0), rig.engine.queue.events.items.len);
 }

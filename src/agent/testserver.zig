@@ -63,6 +63,10 @@ pub const Server = struct {
     /// `Basic <base64(user:password)>` every request must carry ("" = no
     /// check); a request without it is answered 401, like opencode.
     auth: []const u8 = "",
+    /// Until this `clock.nowMs()` the server accepts connections but never
+    /// answers a request that arrives (it holds the connection open): a
+    /// starting opencode does exactly that for a few seconds.
+    deaf_until_ms: i64 = 0,
 
     pub fn start(self: *Server, allocator: std.mem.Allocator) !void {
         self.allocator = allocator;
@@ -205,6 +209,7 @@ pub const Server = struct {
             } else self.allocator.free(owned);
             self.lock.unlock();
 
+            if (clock.nowMs() < self.deaf_until_ms) return self.holdUnanswered(fd);
             const head_end = std.mem.indexOf(u8, req, "\r\n\r\n").?;
             if (self.auth.len > 0 and !authorized(req[0..head_end], self.auth)) {
                 writeResponse(fd, .{ .status = 401, .close_after = true }, "{\"name\":\"Unauthorized\"}");
@@ -228,6 +233,17 @@ pub const Server = struct {
             std.mem.copyForwards(u8, buf.items[0 .. buf.items.len - used], buf.items[used..]);
             buf.shrinkRetainingCapacity(buf.items.len - used);
             if (reply.close_after) return;
+        }
+    }
+
+    /// Never answer: keep the connection until the client drops it or the
+    /// server stops (a request sent while the server is deaf is lost).
+    fn holdUnanswered(self: *Server, fd: c_int) void {
+        var tmp: [1024]u8 = undefined;
+        while (!self.stopping.load(.acquire)) {
+            var pfd = c.struct_pollfd{ .fd = fd, .events = c.POLLIN, .revents = 0 };
+            if (c.poll(&pfd, 1, 20) <= 0) continue;
+            if (c.read(fd, &tmp, tmp.len) <= 0) return;
         }
     }
 

@@ -165,9 +165,6 @@ pub const ScreenDriver = struct {
     pub fn plan(self: ScreenDriver, allocator: std.mem.Allocator, action: Action) !Plan {
         const steps = recipe(self.loaded, action);
         if (steps.len == 0) return error.Unsupported;
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        errdefer arena.deinit();
-        const a = arena.allocator();
         var values: std.enums.EnumFieldStruct(adapter.Placeholder, ?[]const u8, @as(?[]const u8, null)) = .{};
         switch (action) {
             .submit => |x| values.text = x,
@@ -176,13 +173,16 @@ pub const ScreenDriver = struct {
             .set_model => |x| values.model = x,
             .set_effort => |x| values.effort = x,
         }
-        const out = try a.alloc(adapter.Step, steps.len);
-        for (steps, out) |s, *o| o.* = switch (s) {
-            .text => |x| .{ .text = try adapter.expand(a, x, values) },
-            .pick => |x| .{ .pick = try adapter.expand(a, x, values) },
-            .key, .sleep_ms, .clear_input, .wait => s,
-        };
-        return .{ .arena = arena, .steps = out };
+        return planSteps(allocator, steps, values);
+    }
+
+    /// The adapter's `launch.exit` recipe (empty when it has none).
+    pub fn exitPlan(self: ScreenDriver, allocator: std.mem.Allocator) !Plan {
+        return planSteps(allocator, self.loaded.spec.launch.exit, .{});
+    }
+
+    pub fn inputEmpty(self: ScreenDriver) bool {
+        return self.engine.input_text.len == 0;
     }
 
     /// The number to type for `choice` (label, 1-based index or a unique
@@ -192,11 +192,21 @@ pub const ScreenDriver = struct {
         const i = it.pick(choice) orelse return error.NoSuchOption;
         return @intCast(i + 1);
     }
-
-    pub fn inputEmpty(self: ScreenDriver) bool {
-        return self.engine.input_text.len == 0;
-    }
 };
+
+fn planSteps(allocator: std.mem.Allocator, steps: []const adapter.Step, values: std.enums.EnumFieldStruct(adapter.Placeholder, ?[]const u8, @as(?[]const u8, null))) !Plan {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+    const out = try a.alloc(adapter.Step, steps.len);
+    for (steps, out) |s, *o| o.* = switch (s) {
+        .text => |x| .{ .text = try adapter.expand(a, x, values) },
+        .command => |x| .{ .command = try adapter.expand(a, x, values) },
+        .pick => |x| .{ .pick = try adapter.expand(a, x, values) },
+        .key, .sleep_ms, .clear_input, .wait, .confirm, .relaunch => s,
+    };
+    return .{ .arena = arena, .steps = out };
+}
 
 pub const Plan = struct {
     arena: std.heap.ArenaAllocator,

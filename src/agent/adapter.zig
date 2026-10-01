@@ -57,6 +57,18 @@ pub const Launch = struct {
     /// Appended when the caller names a model / an effort level.
     model_args: []const []const u8 = &.{},
     effort_args: []const []const u8 = &.{},
+    /// The effort levels `effort_args` accepts; empty = any. A level
+    /// outside it is refused before anything is started or stopped.
+    effort_values: []const []const u8 = &.{},
+    /// Appended on a fresh start: `{session}` is a conversation id (a UUID)
+    /// the MCP layer mints, so a `relaunch` can resume exactly that one.
+    session_args: []const []const u8 = &.{},
+    /// Appended instead of `session_args` when a `relaunch` restarts an
+    /// app whose conversation already has a turn.
+    resume_args: []const []const u8 = &.{},
+    /// How to end the app gracefully before a `relaunch` (a recipe; the
+    /// app is killed when it has not exited shortly after).
+    exit: []const Step = &.{},
     /// Removed from the app's environment; a trailing `*` removes every
     /// variable with that prefix.
     unset_env: []const []const u8 = &.{},
@@ -105,13 +117,23 @@ pub const ScreenSpec = struct {
     bell_needs_input: bool = false,
 };
 
-pub const WaitFor = enum { ready, choice, idle };
+pub const WaitFor = enum {
+    ready,
+    choice,
+    idle,
+    /// The interaction showing when the recipe started is gone.
+    answered,
+};
 
-/// One step of an action recipe, run by the MCP layer. `text` and `pick`
-/// expand `{placeholders}`.
+/// One step of an action recipe, run by the MCP layer. `text`, `command`
+/// and `pick` expand `{placeholders}`.
 pub const Step = union(enum) {
     /// Typed as one write.
     text: []const u8,
+    /// Typed like `text`, but it is the adapter's own command (`/model`):
+    /// its turn never reaches the transcript or the events, and the
+    /// interaction it opens is the recipe's to answer, not the assistant's.
+    command: []const u8,
     /// A key name as the MCP `send_keys` tools spell it (`enter`, `escape`, `s`).
     key: []const u8,
     sleep_ms: u32,
@@ -121,6 +143,14 @@ pub const Step = union(enum) {
     /// Choose an option of the pending interaction by label or 1-based
     /// index (types its number).
     pick: []const u8,
+    /// The action took effect: no interaction shows and a line matching
+    /// this rule appeared below the recipe's `command`. A recipe never
+    /// reports success before it.
+    confirm: LineRule,
+    /// End the app (`launch.exit`) and start it again in the same session
+    /// with `launch.resume_args` and every launch value as set now (the
+    /// effort an app only takes at launch). Last step of its recipe.
+    relaunch: struct {},
 };
 
 pub const Actions = struct {
@@ -141,9 +171,10 @@ pub const Spec = struct {
     errors: []const ErrorRule = &.{},
 };
 
-/// The `{name}`s a recipe or launch argument may use. `port`, `cwd` and
-/// `session` are an API source's server port, working directory and
-/// session id.
+/// The `{name}`s a recipe or launch argument may use. `port` and `cwd` are
+/// an API source's server port and working directory; `session` is the
+/// app's conversation: an API source's session id, or the id minted for
+/// `session_args` / `resume_args`.
 pub const Placeholder = enum { text, choice, model, effort, port, cwd, session };
 
 // ── compiled form ────────────────────────────────────────────────
@@ -159,6 +190,17 @@ pub const Matcher = union(enum) {
         };
     }
 };
+
+/// Compile one line rule (the validator has checked every rule a loaded
+/// adapter holds, so on those only OutOfMemory can happen).
+pub fn compileLine(arena: std.mem.Allocator, r: LineRule) error{ NotOneRule, EmptyPrefix, BadPattern, OutOfMemory }!Matcher {
+    if ((r.prefix == null) == (r.pattern == null)) return error.NotOneRule;
+    if (r.prefix) |p| {
+        if (p.len == 0) return error.EmptyPrefix;
+        return .{ .prefix = p };
+    }
+    return .{ .pattern = try pattern.compile(arena, r.pattern.?, false) };
+}
 
 pub const RecordMatcher = struct {
     kind: vocab.RecordKind,
@@ -263,6 +305,12 @@ const Validator = struct {
         for (s.launch.model_args) |x| try self.placeholders(x, "launch.model_args");
         for (s.launch.effort_args) |x| try self.placeholders(x, "launch.effort_args");
         for (s.launch.attach_args) |x| try self.placeholders(x, "launch.attach_args");
+        for (s.launch.session_args) |x| try self.placeholders(x, "launch.session_args");
+        for (s.launch.resume_args) |x| try self.placeholders(x, "launch.resume_args");
+        if ((s.launch.session_args.len == 0) != (s.launch.resume_args.len == 0))
+            return self.fail("launch.session_args and launch.resume_args go together (a relaunch resumes the conversation the start named)", .{});
+        if (s.launch.effort_values.len > 0 and s.launch.effort_args.len == 0)
+            return self.fail("launch.effort_values without launch.effort_args", .{});
         if (s.launch.password_env) |name| {
             if (!validEnvName(name)) return self.fail("launch.password_env \"{s}\" is not an environment variable name", .{name});
         }
@@ -270,17 +318,8 @@ const Validator = struct {
             const base = if (std.mem.endsWith(u8, name, "*")) name[0 .. name.len - 1] else name;
             if (!validEnvName(base)) return self.fail("launch.unset_env \"{s}\" is not a variable name (a trailing * matches a prefix)", .{name});
         }
-        inline for (@typeInfo(Actions).@"struct".fields) |f| {
-            for (@field(s.actions, f.name)) |step| switch (step) {
-                .text, .pick => |x| try self.placeholders(x, "actions." ++ f.name),
-                .key => |x| if (x.len == 0) return self.fail("actions.{s}: empty key", .{f.name}),
-                .clear_input => |keys| {
-                    if (keys.len == 0) return self.fail("actions.{s}: clear_input names no key", .{f.name});
-                    for (keys) |k| if (k.len == 0) return self.fail("actions.{s}: empty key", .{f.name});
-                },
-                .sleep_ms, .wait => {},
-            };
-        }
+        try self.recipe(s, s.launch.exit, "launch.exit");
+        inline for (@typeInfo(Actions).@"struct".fields) |f| try self.recipe(s, @field(s.actions, f.name), "actions." ++ f.name);
         const errs = try self.arena.alloc(ErrorMatcher, s.errors.len);
         for (s.errors, errs, 0..) |r, *out, i| {
             out.* = .{
@@ -301,6 +340,35 @@ const Validator = struct {
                 if (s.launch.password_env == null) return self.fail("source \"opencode_api\" needs launch.password_env", .{});
             },
         }
+    }
+
+    fn recipe(self: *Validator, s: *const Spec, steps: []const Step, where: []const u8) !void {
+        var commanded = false;
+        for (steps, 0..) |step, i| switch (step) {
+            .text, .pick => |x| try self.placeholders(x, where),
+            .command => |x| {
+                if (x.len == 0) return self.fail("{s}: empty command", .{where});
+                try self.placeholders(x, where);
+                commanded = true;
+            },
+            .key => |x| if (x.len == 0) return self.fail("{s}: empty key", .{where}),
+            .clear_input => |keys| {
+                if (keys.len == 0) return self.fail("{s}: clear_input names no key", .{where});
+                for (keys) |k| if (k.len == 0) return self.fail("{s}: empty key", .{where});
+            },
+            .sleep_ms, .wait => {},
+            .confirm => |r| {
+                if (!commanded) return self.fail("{s}: confirm needs a command step before it (it looks below that command)", .{where});
+                _ = try self.rule(r, where, i);
+            },
+            .relaunch => {
+                if (s.source != .screen) return self.fail("{s}: relaunch is for screen sources (an API source takes settings per request)", .{where});
+                if (s.launch.resume_args.len == 0) return self.fail("{s}: relaunch needs launch.session_args and launch.resume_args", .{where});
+                if (s.launch.exit.len == 0) return self.fail("{s}: relaunch needs launch.exit", .{where});
+                if (steps.ptr == s.launch.exit.ptr) return self.fail("{s}: an exit recipe cannot relaunch", .{where});
+                if (i + 1 != steps.len) return self.fail("{s}: relaunch must be the last step", .{where});
+            },
+        };
     }
 
     fn screen(self: *Validator, sc: *const ScreenSpec) !Screen {
@@ -330,17 +398,12 @@ const Validator = struct {
     fn rule(self: *Validator, r: LineRule, where: []const u8, index: ?usize) !Matcher {
         var ibuf: [24]u8 = undefined;
         const idx: []const u8 = if (index) |i| std.fmt.bufPrint(&ibuf, "[{d}]", .{i}) catch "" else "";
-        if ((r.prefix == null) == (r.pattern == null))
-            return self.fail("{s}{s}: needs exactly one of \"prefix\" or \"pattern\"", .{ where, idx });
-        if (r.prefix) |p| {
-            if (p.len == 0) return self.fail("{s}{s}: empty prefix", .{ where, idx });
-            return .{ .prefix = p };
-        }
-        const m = pattern.compile(self.arena, r.pattern.?, false) catch |err| switch (err) {
+        return compileLine(self.arena, r) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.NotOneRule => return self.fail("{s}{s}: needs exactly one of \"prefix\" or \"pattern\"", .{ where, idx }),
+            error.EmptyPrefix => return self.fail("{s}{s}: empty prefix", .{ where, idx }),
             error.BadPattern => return self.fail("{s}{s}: bad pattern \"{s}\"", .{ where, idx, r.pattern.? }),
         };
-        return .{ .pattern = m };
     }
 
     fn placeholders(self: *Validator, s: []const u8, where: []const u8) !void {

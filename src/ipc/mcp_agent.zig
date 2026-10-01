@@ -40,6 +40,8 @@ const platform = @import("../util/platform.zig");
 const atomicwrite = @import("../util/atomicwrite.zig");
 const pathz = @import("../util/pathz.zig");
 const readfile = @import("../util/readfile.zig");
+const transport_mod = @import("transport.zig");
+const Transport = transport_mod.Transport;
 
 const Res = mcp.Res;
 const errRes = mcp.errRes;
@@ -75,8 +77,22 @@ const DESCRIPTOR_DIR = "agents";
 pub const WAITER_SOCKET = "agents.sock";
 const MAX_SUBS = 32;
 const DESCRIPTOR_MAX_BYTES = 64 * 1024;
-
-const NO_SSH = "agents on an SSH host ('host') are not available in this build yet; omit host to run the agent on this machine";
+/// Bound on the remote binary probe (one ssh round trip).
+const PROBE_WAIT_MS: i64 = 30_000;
+/// Bound on a remote start asking for its secret.
+const SECRET_WAIT_MS: i64 = 30_000;
+/// Bound on the app ending after its exit recipe, before it is killed.
+const EXIT_WAIT_MS: i64 = 10_000;
+/// How often a dead forward is respawned / a lost link retried.
+const FORWARD_RETRY_MS: i64 = 3_000;
+const RECONNECT_RETRY_MS: i64 = 5_000;
+/// Remote ports an API server is started on (the remote host's free ports
+/// are not knowable from here; a taken one fails the open with the
+/// server's own message).
+const REMOTE_PORT_MIN: u16 = 20_000;
+const REMOTE_PORT_SPAN: u16 = 40_000;
+/// The exit status ssh reports for a lost connection.
+const SSH_LOST_STATUS: i32 = 255;
 
 /// Server `instructions` (the MCP initialize result) while the agent tools
 /// are offered: MCP clients put them in the assistant's system prompt.
@@ -120,6 +136,32 @@ pub const Entry = struct {
     seen_snapshots: u32 = 0,
     /// What the ASSISTANT has been handed (every agent_* result).
     cursor: events.Cursor = .{},
+    /// The SSH host the agent runs on; null = this machine.
+    host: ?[]u8 = null,
+    transport: Transport = .local,
+    cols: u16 = DEFAULT_COLS,
+    rows: u16 = DEFAULT_ROWS,
+    /// The conversation id `launch.session_args` named (owned).
+    conversation: ?[]u8 = null,
+    /// A prompt went in: a relaunch resumes the conversation.
+    conversed: bool = false,
+    /// What the launch passed and a relaunch repeats (owned).
+    launch_model: ?[]u8 = null,
+    launch_effort: ?[]u8 = null,
+    /// A model chosen in the app since the launch, re-applied after a
+    /// relaunch (owned).
+    picked_model: ?[]u8 = null,
+    relaunches: u32 = 0,
+    /// A relaunch is swapping the terminal: the old one's exit is not
+    /// the agent's.
+    relaunching: bool = false,
+    /// API sources over SSH: the server's port on the remote host (`port`
+    /// is the local end of the forward that reaches it).
+    remote_port: u16 = 0,
+    forward: ?*termdrive.Term = null,
+    /// The next respawn of a dead forward / reconnect of a lost link.
+    forward_retry_ms: i64 = 0,
+    reconnect_ms: i64 = 0,
 
     fn visibleTerm(self: *const Entry) ?*termdrive.Term {
         const l = self.visible orelse return null;
@@ -127,6 +169,10 @@ pub const Entry = struct {
             .owned => |t| t,
             .borrowed => |id| mcp_term.term_state.terms.get(id),
         };
+    }
+
+    fn where(self: *const Entry) Where {
+        return .{ .host = self.host, .transport = self.transport, .cols = self.cols, .rows = self.rows };
     }
 
     /// Free the entry. `kill` ends the sessions it owns; otherwise they
@@ -140,19 +186,36 @@ pub const Entry = struct {
             .borrowed => {},
         };
         if (self.server) |t| if (kill) t.deinit() else t.detach();
+        if (self.forward) |t| if (kill) t.deinit() else t.detach();
+        self.freeFields();
+        a.destroy(self);
+    }
+
+    /// Free what the entry owns besides its agent and terminals.
+    fn freeFields(self: *Entry) void {
+        const a = self.allocator;
         if (self.password) |p| {
             std.crypto.secureZero(u8, p);
             a.free(p);
         }
-        if (self.server_session) |s| a.free(s);
+        for ([_]?[]u8{ self.server_session, self.host, self.conversation, self.launch_model, self.launch_effort, self.picked_model }) |o| {
+            if (o) |s| a.free(s);
+        }
         for (self.recordings.items) |r| a.free(r);
         self.recordings.deinit(a);
         a.free(self.id);
         a.free(self.session);
         a.free(self.binary);
         a.free(self.cwd);
-        a.destroy(self);
     }
+};
+
+/// Where an agent's sessions run.
+const Where = struct {
+    host: ?[]const u8 = null,
+    transport: Transport = .local,
+    cols: u16 = DEFAULT_COLS,
+    rows: u16 = DEFAULT_ROWS,
 };
 
 const State = struct {
@@ -223,7 +286,7 @@ pub fn adapterIds(arena: std.mem.Allocator) ![]const []const u8 {
 pub fn waiterTemplate(arena: std.mem.Allocator) !?[]const u8 {
     const exe = state.exe orelse return null;
     const sock = state.waiter.path orelse return null;
-    return try agentwait.watchCommand(arena, exe, sock, "AGENT", .{}, 0);
+    return try agentwait.watchCommand(arena, exe, sock, "AGENT", .{});
 }
 
 /// The conn fds the watchdog may shut down.
@@ -237,7 +300,7 @@ pub fn watchdogFds(out: []c_int) []c_int {
             },
             .borrowed => {},
         };
-        if (e.server) |t| if (n < out.len) {
+        for ([_]?*termdrive.Term{ e.server, e.forward }) |o| if (o) |t| if (n < out.len) {
             out[n] = t.conn.fd;
             n += 1;
         };
@@ -301,6 +364,7 @@ pub fn pollFds(out: []c.struct_pollfd) usize {
     for (state.entries.items) |e| {
         if (e.visibleTerm()) |t| n = addFd(out, n, t);
         if (e.server) |t| n = addFd(out, n, t);
+        if (e.forward) |t| n = addFd(out, n, t);
         switch (e.agent.source) {
             .opencode_api => |*api| n += api.pollFds(out[n..]),
             .screen => {},
@@ -325,6 +389,10 @@ pub fn dueInMs(now_ms: i64) ?i64 {
             .opencode_api => |*api| api.serviceDueIn(now_ms),
         };
         if (d) |x| due = if (due) |y| @min(x, y) else x;
+        if (e.forward) |f| if (f.exited) {
+            const x = @max(0, e.forward_retry_ms - now_ms);
+            due = if (due) |y| @min(x, y) else x;
+        };
     }
     if (state.waiter.dueIn(now_ms)) |x| due = if (due) |y| @min(x, y) else x;
     return due;
@@ -342,28 +410,102 @@ pub fn service(now_ms: i64) void {
 }
 
 fn serviceEntry(e: *Entry, now_ms: i64) !void {
+    // A relaunch is replacing the terminal; it observes the new one itself.
+    if (e.relaunching) return;
     switch (e.agent.source) {
         .screen => |*eng| {
             const t = e.visibleTerm() orelse return eng.noteDisconnected(now_ms, "the agent's terminal was closed");
             t.drain();
-            try observeScreen(eng, .{
-                .screen = t.screen,
-                .resynced = t.snapshots != e.seen_snapshots,
-                .exited = t.exited,
-                .exit_status = if (t.exit_status_known) t.exit_status else null,
-            }, now_ms);
+            var why_buf: [512]u8 = undefined;
+            switch (linkEnd(e, t)) {
+                .live => try observeScreen(eng, .{
+                    .screen = t.screen,
+                    .resynced = t.snapshots != e.seen_snapshots,
+                    .exited = t.exited,
+                    .exit_status = if (t.exit_status_known) t.exit_status else null,
+                }, now_ms),
+                // The remote session may run on: the link is what is gone.
+                .lost => try eng.noteDisconnected(now_ms, lostReason(e, &why_buf)),
+                .ssh_gone => {
+                    try eng.noteDisconnected(now_ms, lostReason(e, &why_buf));
+                    try eng.noteExited(now_ms, null);
+                },
+            }
             e.seen_snapshots = t.snapshots;
         },
         .opencode_api => |*api| {
             if (e.visibleTerm()) |t| t.drain();
             if (e.server) |srv| {
                 srv.drain();
-                if (srv.exited and !api.source.exited)
+                // A lost link to a remote server's session is not its end:
+                // the API (through the forward) says whether it runs.
+                if (srv.exited and !srv.lost and !api.source.exited)
                     try api.noteExited(now_ms, if (srv.exit_status_known) srv.exit_status else null);
             }
+            reviveForward(e, now_ms);
             try api.service(now_ms);
         },
     }
+}
+
+/// How a terminal's session ended for the agent, if it did.
+const LinkEnd = enum {
+    /// Running, or ended for real (`observeScreen` reports the exit).
+    live,
+    /// The link to a remote-mux session is lost; it may come back.
+    lost,
+    /// A plain-ssh session whose ssh lost the connection: the remote
+    /// process went with it.
+    ssh_gone,
+};
+
+fn linkEnd(e: *const Entry, t: *const termdrive.Term) LinkEnd {
+    if (!t.exited) return .live;
+    if (t.lost) return .lost;
+    if (e.transport == .ssh and t.exit_status_known and t.exit_status == SSH_LOST_STATUS) return .ssh_gone;
+    return .live;
+}
+
+fn lostReason(e: *const Entry, buf: []u8) []const u8 {
+    return std.fmt.bufPrint(buf, "the connection to {s} was lost", .{e.host orelse "the agent's host"}) catch "the connection was lost";
+}
+
+/// Respawn a remote API agent's dead port forward (rate limited, never
+/// waits for it: the API's own reconnect picks it up once it listens).
+fn reviveForward(e: *Entry, now_ms: i64) void {
+    const f = e.forward orelse return;
+    f.drain();
+    if (!f.exited or now_ms < e.forward_retry_ms) return;
+    e.forward_retry_ms = now_ms + FORWARD_RETRY_MS;
+    var arena_state = std.heap.ArenaAllocator.init(state.allocator);
+    defer arena_state.deinit();
+    const host = e.host orelse return;
+    const name = forwardName(arena_state.allocator(), e.id) catch return;
+    // The dead one's session is gone: its name is free again.
+    const nt = mcp_term.spawnForwardTermNamed(arena_state.allocator(), host, e.port, "127.0.0.1", e.remote_port, name) catch return;
+    f.deinit();
+    e.forward = nt;
+    writeDescriptor(e);
+}
+
+fn forwardName(arena: std.mem.Allocator, id: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(arena, "agent-{s}-forward", .{id});
+}
+
+/// Bring a lost remote link back, at most every RECONNECT_RETRY_MS (one
+/// bounded ssh connect each). Runs on the agent's own calls, so a dead
+/// host never stalls the loop for agents nobody asks about.
+fn reconnectIfLost(e: *Entry) void {
+    const now = clock.nowMs();
+    if (now < e.reconnect_ms) return;
+    var tried = false;
+    for ([_]?*termdrive.Term{ e.visibleTerm(), e.server }) |o| {
+        const t = o orelse continue;
+        if (!t.lost) continue;
+        tried = true;
+        _ = t.reconnect();
+    }
+    if (tried) e.reconnect_ms = clock.nowMs() + RECONNECT_RETRY_MS;
 }
 
 /// Wait up to `max_ms` for any agent or waiter fd, then service.
@@ -413,13 +555,16 @@ fn waitDelivery(e: *Entry, filter: events.Filter, deadline: i64, arena: std.mem.
     }
 }
 
-fn waitStep(e: *Entry, what: adapter.WaitFor, deadline: i64) bool {
+/// @param asked identity of the interaction showing when the recipe
+/// started (`answered` waits for it to go).
+fn waitStep(e: *Entry, what: adapter.WaitFor, asked: ?u64, deadline: i64) bool {
     service(clock.nowMs());
     while (true) {
         const met = switch (what) {
             .ready => e.agent.ready(),
             .choice => e.agent.interaction() != null,
             .idle => e.agent.state() == .idle,
+            .answered => if (e.agent.interaction()) |it| asked == null or it.hash() != asked.? else true,
         };
         if (met) return true;
         if (gone(e) or clock.nowMs() >= deadline) return false;
@@ -664,6 +809,7 @@ fn withEntry(
 ) ![]const u8 {
     service(clock.nowMs());
     const e = entryFromArgs(args) orelse return notFound(arena, args);
+    reconnectIfLost(e);
     return body(arena, args, e);
 }
 
@@ -793,6 +939,8 @@ fn finish(arena: std.mem.Allocator, res: *Res, e: *Entry, dv: Delivered, filter:
     try res.fact("ready", e.agent.ready());
     try res.fact("session", e.session);
     if (e.server_session) |s| try res.fact("server_session", s);
+    if (e.host) |h| try res.fact("host", h);
+    try res.fact("transport", @tagName(e.transport));
 
     var message: ?[]const u8 = null;
     if (dv.wait) |w| {
@@ -835,7 +983,7 @@ fn finish(arena: std.mem.Allocator, res: *Res, e: *Entry, dv: Delivered, filter:
     var cmd: ?[]const u8 = null;
     if (state.exe) |exe| {
         if (state.waiter.path) |sock| {
-            cmd = try agentwait.watchCommand(arena, exe, sock, e.id, filter, e.cursor.seen);
+            cmd = try agentwait.watchCommand(arena, exe, sock, e.id, filter);
             try res.fact("watch_command", cmd.?);
         }
     }
@@ -871,9 +1019,48 @@ fn block(res: *Res, b: Block) !void {
 
 // ── agent_adapters ───────────────────────────────────────────────
 
+/// An SSH destination as a caller may name it: no option-looking or
+/// blank-carrying string ever reaches an ssh argv.
+fn validHost(h: []const u8) bool {
+    if (h.len == 0 or h.len > 255 or h[0] == '-') return false;
+    for (h) |b| if (b <= 0x20 or b == 0x7f) return false;
+    return true;
+}
+
+const BAD_HOST = "host must be an SSH destination (user@box or an ssh config alias)";
+
+/// Resolve executables on `host` in one ssh round trip (`launch.probeScript`).
+fn probeRemote(arena: std.mem.Allocator, host: []const u8, lookups: []const launch.Lookup, dir: ?[]const u8) !union(enum) { ok: launch.ProbeResult, fail: Fail } {
+    const script = try launch.probeScript(arena, lookups, dir);
+    const argv = mcp_term.remoteShArgv(arena, host, script) catch
+        return .{ .fail = .{ .code = .refused, .msg = "cannot build the forced route for this host" } };
+    switch (try mcp_term.runArgvTerm(arena, argv, PROBE_WAIT_MS)) {
+        .err => |m| return .{ .fail = .{ .code = .unavailable, .msg = m } },
+        .run => |r| {
+            const res = try launch.parseProbe(arena, r.output, lookups.len);
+            if (r.exited and r.status_known and r.status == 0 and res.complete) return .{ .ok = res };
+            return .{ .fail = .{ .code = .unavailable, .msg = try std.fmt.allocPrint(arena, "could not look the agent up on {s} over ssh (key or agent auth is required; {s}):\n{s}", .{
+                host,
+                if (!r.exited) "the probe did not finish in time" else "the probe failed",
+                mcp.tailLines(r.output, 8),
+            }) } };
+        },
+    }
+}
+
 fn adaptersTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
-    if (argStr(args, "host") != null) return errRes(arena, .unavailable, NO_SSH);
     const set = try adapters();
+    const host = argStr(args, "host");
+    var remote: ?launch.ProbeResult = null;
+    if (host) |h| {
+        if (!validHost(h)) return errRes(arena, .invalid_args, BAD_HOST);
+        const lookups = try arena.alloc(launch.Lookup, set.items.items.len);
+        for (set.items.items, lookups) |l, *out| out.* = .{ .launch = l.spec.launch };
+        switch (try probeRemote(arena, h, lookups, null)) {
+            .fail => |f| return errRes(arena, f.code, f.msg),
+            .ok => |r| remote = r,
+        }
+    }
     const Item = struct {
         id: []const u8,
         name: []const u8,
@@ -886,10 +1073,13 @@ fn adaptersTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
     };
     const items = try arena.alloc(Item, set.items.items.len);
     var res = Res.init(arena);
-    try res.textf("{d} agent adapter(s) on this machine", .{items.len});
+    if (host) |h| {
+        try res.textf("{d} agent adapter(s), binaries looked up on {s}", .{ items.len, h });
+        try res.fact("host", h);
+    } else try res.textf("{d} agent adapter(s) on this machine", .{items.len});
     var listing: std.Io.Writer.Allocating = .init(arena);
     for (set.items.items, items, 0..) |l, *out, i| {
-        const bin = try launch.resolve(arena, l.spec.launch, null, localHost());
+        const bin = if (remote) |r| r.binaries[i] else try launch.resolve(arena, l.spec.launch, null, localHost());
         var acts: std.ArrayList([]const u8) = .empty;
         for (std.enums.values(agent_mod.ActionKind)) |k| {
             if (agent_mod.supportsAction(l, k)) try acts.append(arena, @tagName(k));
@@ -935,13 +1125,16 @@ const OpenOpts = struct {
     override: ?[]const u8,
     model: ?[]const u8,
     effort: ?[]const u8,
-    cwd: []const u8,
+    /// Absolute; null with a host until the probe names the remote home.
+    cwd: ?[]const u8,
     prompt: ?[]const u8,
     cols: u16,
     rows: u16,
+    host: ?[]const u8,
+    choice: transport_mod.Choice,
 };
 
-fn openOpts(arena: std.mem.Allocator, args: std.json.Value, why: *Fail) !OpenOpts {
+fn openOpts(arena: std.mem.Allocator, args: std.json.Value, loaded: *const adapter.Loaded, why: *Fail) !OpenOpts {
     const override = argStr(args, "binary");
     if (override) |b| if (!launch.validBinary(b)) {
         why.* = .{ .code = .invalid_args, .msg = "binary must be a bare executable name or an absolute path of plain characters (no shell metacharacters, no ..)" };
@@ -953,13 +1146,27 @@ fn openOpts(arena: std.mem.Allocator, args: std.json.Value, why: *Fail) !OpenOpt
             return error.Refused;
         };
     }
-    const cwd = if (argStr(args, "cwd")) |d| blk: {
-        if (d.len == 0 or d[0] != '/' or !isDir(d)) {
+    if (argStr(args, "effort")) |x| if (!launch.validEffort(loaded.spec.launch, x)) {
+        why.* = .{ .code = .invalid_args, .msg = try effortRefusal(arena, loaded) };
+        return error.Refused;
+    };
+    const host = argStr(args, "host");
+    if (host) |h| if (!validHost(h)) {
+        why.* = .{ .code = .invalid_args, .msg = BAD_HOST };
+        return error.Refused;
+    };
+    const choice = mcp_term.transportChoice(args) orelse {
+        why.* = .{ .code = .invalid_args, .msg = "transport must be 'auto', 'mux' or 'ssh'" };
+        return error.Refused;
+    };
+    const cwd: ?[]const u8 = if (argStr(args, "cwd")) |d| blk: {
+        // A remote dir is checked by the host's probe.
+        if (d.len == 0 or d[0] != '/' or (host == null and !isDir(d))) {
             why.* = .{ .code = .invalid_args, .msg = "cwd must be an absolute path to an existing directory" };
             return error.Refused;
         }
         break :blk d;
-    } else blk: {
+    } else if (host != null) null else blk: {
         var buf: [4096]u8 = undefined;
         const p = c.getcwd(&buf, buf.len) orelse break :blk "/";
         break :blk try arena.dupe(u8, std.mem.span(@as([*:0]const u8, @ptrCast(p))));
@@ -977,7 +1184,13 @@ fn openOpts(arena: std.mem.Allocator, args: std.json.Value, why: *Fail) !OpenOpt
         .prompt = prompt,
         .cols = @intCast(std.math.clamp(argInt(args, "cols") orelse DEFAULT_COLS, 40, 500)),
         .rows = @intCast(std.math.clamp(argInt(args, "rows") orelse DEFAULT_ROWS, 10, 300)),
+        .host = host,
+        .choice = choice,
     };
+}
+
+fn effortRefusal(arena: std.mem.Allocator, loaded: *const adapter.Loaded) ![]const u8 {
+    return std.fmt.allocPrint(arena, "effort must be one of: {s}", .{try std.mem.join(arena, ", ", loaded.spec.launch.effort_values)});
 }
 
 fn isDir(path: []const u8) bool {
@@ -987,10 +1200,13 @@ fn isDir(path: []const u8) bool {
     return c.stat(z.ptr, &st) == 0 and (st.st_mode & c.S_IFMT) == c.S_IFDIR;
 }
 
+fn candidateList(arena: std.mem.Allocator, loaded: *const adapter.Loaded) ![]const u8 {
+    return std.mem.join(arena, ", ", loaded.spec.launch.candidates);
+}
+
 fn openTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
     const app = argStr(args, "app") orelse
         return errRes(arena, .invalid_args, "agent_open needs 'app': an adapter id from agent_adapters (claude, opencode, ...)");
-    if (argStr(args, "host") != null) return errRes(arena, .unavailable, NO_SSH);
     const deadline = deadlineFrom(args, DEFAULT_WAIT_MS);
     const set = try adapters();
     const loaded = set.get(app) orelse {
@@ -1002,21 +1218,28 @@ fn openTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
         return errRes(arena, .not_found, try std.fmt.allocPrint(arena, "no adapter '{s}' (available: {s})", .{ app, ids.items }));
     };
     var why: Fail = undefined;
-    const o = openOpts(arena, args, &why) catch |err| switch (err) {
+    var o = openOpts(arena, args, loaded, &why) catch |err| switch (err) {
         error.Refused => return errRes(arena, why.code, why.msg),
         else => return err,
     };
-    const binary = (try launch.resolve(arena, loaded.spec.launch, o.override, localHost())) orelse {
-        var looked: std.ArrayList(u8) = .empty;
-        for (loaded.spec.launch.candidates, 0..) |cand, i| {
-            if (i > 0) try looked.appendSlice(arena, ", ");
-            try looked.appendSlice(arena, cand);
-        }
-        return errRes(arena, .unavailable, try std.fmt.allocPrint(arena, "cannot find {s} on this machine (looked in: {s}); pass 'binary' with its name or absolute path", .{ o.override orelse loaded.spec.launch.binary, looked.items }));
-    };
+    const name = o.override orelse loaded.spec.launch.binary;
+    const binary = if (o.host) |h| blk: {
+        // One probe on the host: the binary from the adapter's candidates
+        // (an ssh login's PATH lacks ~/.local/bin), the dir, the home.
+        const r = switch (try probeRemote(arena, h, &.{.{ .launch = loaded.spec.launch, .override = o.override }}, o.cwd)) {
+            .fail => |f| return errRes(arena, f.code, f.msg),
+            .ok => |r| r,
+        };
+        if (r.dir_ok) |ok| if (!ok) return errRes(arena, .invalid_args, try std.fmt.allocPrint(arena, "cwd {s} is not a directory on {s}", .{ o.cwd.?, h }));
+        if (o.cwd == null) o.cwd = r.home orelse "/";
+        break :blk r.binaries[0] orelse return errRes(arena, .unavailable, try std.fmt.allocPrint(arena, "cannot find {s} on {s} (looked in: {s}); pass 'binary' with its name or absolute path there", .{ name, h, try candidateList(arena, loaded) }));
+    } else (try launch.resolve(arena, loaded.spec.launch, o.override, localHost())) orelse
+        return errRes(arena, .unavailable, try std.fmt.allocPrint(arena, "cannot find {s} on this machine (looked in: {s}); pass 'binary' with its name or absolute path", .{ name, try candidateList(arena, loaded) }));
+
+    var where = Where{ .host = o.host, .cols = o.cols, .rows = o.rows };
     const e = (switch (loaded.spec.source) {
-        .screen => spawnScreen(arena, loaded, binary, o, &why),
-        .opencode_api => spawnApi(arena, loaded, binary, o, deadline, &why),
+        .screen => spawnScreen(arena, loaded, binary, o, &where, deadline, &why),
+        .opencode_api => spawnApi(arena, loaded, binary, o, &where, deadline, &why),
     }) catch |err| switch (err) {
         error.Refused => return errRes(arena, why.code, why.msg),
         else => return err,
@@ -1065,7 +1288,10 @@ fn openTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
 /// agent_open's result: the launch facts, then every per-agent fact.
 fn openResult(arena: std.mem.Allocator, e: *Entry, ready: bool, sent: bool, notes: []const []const u8, dv: Delivered, filter: events.Filter) ![]const u8 {
     var res = Res.init(arena);
-    try res.textf("opened {s} ({s}) in session {s}", .{ e.id, e.loaded.spec.name, e.session });
+    if (e.host) |h|
+        try res.textf("opened {s} ({s}) on {s} over {s} in session {s}", .{ e.id, e.loaded.spec.name, h, @tagName(e.transport), e.session })
+    else
+        try res.textf("opened {s} ({s}) in session {s}", .{ e.id, e.loaded.spec.name, e.session });
     if (!ready) try res.textf("not ready yet (state {s}); agent_send waits for it", .{@tagName(e.agent.state())});
     if (notes.len > 0) try res.textf("{d} note(s) below", .{notes.len});
     try res.fact("binary", e.binary);
@@ -1089,6 +1315,16 @@ fn randomHex(a: std.mem.Allocator, comptime nbytes: usize) ![]u8 {
         out[i * 2 + 1] = hex[b & 0xf];
     }
     return out;
+}
+
+/// A random (version 4) UUID, the form `--session-id` takes.
+fn newUuid(a: std.mem.Allocator) ![]u8 {
+    var raw: [16]u8 = undefined;
+    if (c.getentropy(&raw, raw.len) != 0) return error.NoEntropy;
+    raw[6] = (raw[6] & 0x0f) | 0x40;
+    raw[8] = (raw[8] & 0x3f) | 0x80;
+    const hex = std.fmt.bytesToHex(raw, .lower);
+    return std.fmt.allocPrint(a, "{s}-{s}-{s}-{s}-{s}", .{ hex[0..8], hex[8..12], hex[12..16], hex[16..20], hex[20..32] });
 }
 
 fn newEntry(loaded: *const adapter.Loaded, id: []const u8, session: []const u8, binary: []const u8, cwd: []const u8) !*Entry {
@@ -1115,51 +1351,151 @@ fn newEntry(loaded: *const adapter.Loaded, id: []const u8, session: []const u8, 
     return e;
 }
 
+/// Copy where the agent runs and what its launch passed into `e`.
+fn setPlace(e: *Entry, where: Where, o: OpenOpts) !void {
+    const a = e.allocator;
+    e.transport = where.transport;
+    e.cols = where.cols;
+    e.rows = where.rows;
+    if (where.host) |h| e.host = try a.dupe(u8, h);
+    if (o.model) |m| e.launch_model = try a.dupe(u8, m);
+    if (o.effort) |x| e.launch_effort = try a.dupe(u8, x);
+}
+
 /// Free a half-built entry whose agent is not set yet (the terms it
 /// points at are the caller's to release).
 fn dropBare(e: *Entry) void {
-    const a = state.allocator;
-    for (e.recordings.items) |r| a.free(r);
-    e.recordings.deinit(a);
-    if (e.password) |p| {
-        std.crypto.secureZero(u8, p);
-        a.free(p);
-    }
-    if (e.server_session) |s| a.free(s);
-    a.free(e.id);
-    a.free(e.session);
-    a.free(e.binary);
-    a.free(e.cwd);
-    a.destroy(e);
+    e.freeFields();
+    state.allocator.destroy(e);
 }
 
+/// Record a terminal of `e` as `<name>.cast`. A session on a remote
+/// daemon is not recorded: the daemon writes the file, on ITS host.
 fn record(e: *Entry, t: *termdrive.Term, name: []const u8) void {
+    if (t.remote_host != null) return;
     const path = mcp_term.recordNamedTerm(state.allocator, t, name) orelse return;
     e.recordings.append(state.allocator, path) catch state.allocator.free(path);
 }
 
-fn spawnScreen(arena: std.mem.Allocator, loaded: *const adapter.Loaded, binary: []const u8, o: OpenOpts, why: *Fail) !*Entry {
+/// What a spawn on the agent's host needs besides the argv.
+const SpawnSpec = struct {
+    name: []const u8,
+    cwd: []const u8,
+    /// Local sessions only: the child environment ("KEY=VALUE").
+    env: []const []const u8 = &.{},
+    /// Remote starts: the variable to read off the terminal (then the
+    /// caller types its value at `launch.SECRET_PROMPT`).
+    secret_env: ?[]const u8 = null,
+};
+
+/// Start `argv` on the agent's host as session `spec.name`. A remote
+/// start whose transport is not decided yet (`where.transport == .local`
+/// with a host) tries the host's own daemon first unless `choice` says
+/// ssh, falls back to plain `ssh -tt` unless it says mux, and records
+/// the outcome in `where`.
+fn spawnOn(arena: std.mem.Allocator, where: *Where, choice: transport_mod.Choice, argv: []const []const u8, spec: SpawnSpec, why: *Fail) !*termdrive.Term {
+    const a = state.allocator;
+    const host = where.host orelse {
+        return termdrive.Term.spawnWith(a, argv, where.cols, where.rows, state.mux_sock, .{
+            .name = spec.name,
+            .env = spec.env,
+            .cwd = spec.cwd,
+            .shell_integration = false,
+        }) catch {
+            why.* = .{ .code = .unavailable, .msg = "could not start the agent's session on the private daemon" };
+            return error.Refused;
+        };
+    };
+    const undecided = where.transport == .local;
+    if ((undecided and choice != .ssh) or where.transport == .@"sketerm-mux") mux: {
+        const margv: []const []const u8 = if (spec.secret_env) |v|
+            try arena.dupe([]const u8, &.{ "/bin/sh", "-c", try launch.remoteScript(arena, argv, .{ .secret_env = v }) })
+        else
+            argv;
+        const t = termdrive.Term.spawnRemoteMux(a, host, margv, where.cols, where.rows, .{ .name = spec.name, .cwd = spec.cwd }) catch {
+            if (!undecided or choice == .mux) {
+                why.* = .{ .code = .unavailable, .msg = mcp_term.NO_REMOTE_MUX };
+                return error.Refused;
+            }
+            break :mux;
+        };
+        where.transport = .@"sketerm-mux";
+        return t;
+    }
+    // Plain ssh: the script rides the ssh command (base64, dialect-proof)
+    // and runs with the terminal on stdin; no secret ever goes in it.
+    const nonce = try randomHex(arena, 6);
+    const file = try std.fmt.allocPrint(arena, "/tmp/.sk_ssh_{s}", .{nonce});
+    const script = try launch.remoteScript(arena, argv, .{ .cleanup = file, .cwd = spec.cwd, .secret_env = spec.secret_env });
+    var sargv: std.ArrayList([]const u8) = .empty;
+    mcp_term.appendSshTt(arena, &sargv, host) catch {
+        why.* = .{ .code = .refused, .msg = "cannot build the forced route for this host" };
+        return error.Refused;
+    };
+    try sargv.append(arena, try termdrive.sshScriptCommand(arena, nonce, script));
+    const t = termdrive.Term.spawnWith(a, sargv.items, where.cols, where.rows, state.mux_sock, .{
+        .name = spec.name,
+        .shell_integration = false,
+    }) catch {
+        why.* = .{ .code = .unavailable, .msg = "could not start the agent's ssh session on the private daemon" };
+        return error.Refused;
+    };
+    where.transport = .ssh;
+    return t;
+}
+
+/// Type `secret` into a remote start once it asks for it (echo is off
+/// there by then, so nothing shows, and nothing is recorded).
+fn typeSecret(arena: std.mem.Allocator, t: *termdrive.Term, secret: []const u8, deadline: i64, what: []const u8, why: *Fail) !void {
+    const until = @min(deadline, clock.nowMs() + SECRET_WAIT_MS);
+    while (true) {
+        t.drain();
+        if (t.readScreen(false)) |text| {
+            defer t.allocator.free(text);
+            if (std.mem.indexOf(u8, text, launch.SECRET_PROMPT) != null) break;
+        } else |_| {}
+        if (t.exited) {
+            why.* = .{ .code = .failed, .msg = try std.fmt.allocPrint(arena, "{s} ended before it started (last line: {s})", .{ what, mcp_term.termLastLine(arena, t) }) };
+            return error.Refused;
+        }
+        if (clock.nowMs() >= until) {
+            why.* = .{ .code = .timeout, .msg = try std.fmt.allocPrint(arena, "{s} did not start in time (ssh still connecting or asking for a password? last line: {s})", .{ what, mcp_term.termLastLine(arena, t) }) };
+            return error.Refused;
+        }
+        pumpFor(100);
+    }
+    const line = try std.fmt.allocPrint(state.allocator, "{s}\r", .{secret});
+    defer {
+        std.crypto.secureZero(u8, line);
+        state.allocator.free(line);
+    }
+    t.sendText(line) catch {
+        why.* = .{ .code = .unavailable, .msg = try std.fmt.allocPrint(arena, "{s}: the session is gone", .{what}) };
+        return error.Refused;
+    };
+}
+
+fn spawnScreen(arena: std.mem.Allocator, loaded: *const adapter.Loaded, binary: []const u8, o: OpenOpts, where: *Where, deadline: i64, why: *Fail) !*Entry {
+    _ = deadline;
     const a = state.allocator;
     const spec = &loaded.spec;
     const n = try nextNumber(spec.id);
     const id = try std.fmt.allocPrint(arena, "{s}-{d}", .{ spec.id, n });
     const session = try std.fmt.allocPrint(arena, "agent-{s}", .{id});
+    // A conversation id the agent owns, so a relaunch resumes exactly it.
+    const conversation: ?[]const u8 = if (spec.launch.session_args.len > 0) try newUuid(arena) else null;
     const argv = try launch.withUnsetEnv(arena, spec.launch.unset_env, try launch.mainArgv(arena, spec.launch, binary, .{
         .model = o.model,
         .effort = o.effort,
         .cwd = o.cwd,
-    }));
-    const t = termdrive.Term.spawnWith(a, argv, o.cols, o.rows, state.mux_sock, .{
-        .name = session,
-        .cwd = o.cwd,
-        .shell_integration = false,
-    }) catch {
-        why.* = .{ .code = .unavailable, .msg = "could not start the agent's session on the private daemon" };
-        return error.Refused;
-    };
+        .session = conversation,
+    }, .fresh));
+    const t = try spawnOn(arena, where, o.choice, argv, .{ .name = session, .cwd = o.cwd.? }, why);
     errdefer t.deinit();
-    const e = try newEntry(loaded, id, session, binary, o.cwd);
+    const e = try newEntry(loaded, id, session, binary, o.cwd.?);
     errdefer dropBare(e);
+    try setPlace(e, where.*, o);
+    if (conversation) |cv| e.conversation = try a.dupe(u8, cv);
     const ag = try a.create(agent_mod.Agent);
     errdefer a.destroy(ag);
     ag.* = try agent_mod.Agent.initScreen(a, loaded, .{});
@@ -1170,16 +1506,50 @@ fn spawnScreen(arena: std.mem.Allocator, loaded: *const adapter.Loaded, binary: 
     return e;
 }
 
-fn spawnApi(arena: std.mem.Allocator, loaded: *const adapter.Loaded, binary: []const u8, o: OpenOpts, deadline: i64, why: *Fail) !*Entry {
+/// Wait until an API server answers its health route (`probeHealth`),
+/// watching its session: a server that swallows the requests of its
+/// first seconds is waited out, one that exits is reported as such.
+fn waitServerReady(arena: std.mem.Allocator, api: *opencode.Api, server: *termdrive.Term, what: []const u8, deadline: i64, why: *Fail) !void {
+    const started = clock.nowMs();
+    while (true) {
+        server.drain();
+        if (server.exited and !server.lost) {
+            why.* = .{ .code = .failed, .msg = try std.fmt.allocPrint(arena, "{s} exited before it was ready (last line: {s})", .{ what, mcp_term.termLastLine(arena, server) }) };
+            return error.Refused;
+        }
+        const now = clock.nowMs();
+        if (now >= deadline) {
+            why.* = .{ .code = .timeout, .msg = try std.fmt.allocPrint(arena, "{s} did not become ready within {d} ms (no answer to GET {s}: {s}; its last line: {s})", .{
+                what, now - started, opencode.HEALTH_PATH, api.problem(), mcp_term.termLastLine(arena, server),
+            }) };
+            return error.Refused;
+        }
+        const ok = api.probeHealth(@min(deadline, now + opencode.HEALTH_PROBE_MS)) catch |err| switch (err) {
+            error.Unauthorized => {
+                why.* = .{ .code = .failed, .msg = try std.fmt.allocPrint(arena, "{s} refused the password it was started with: {s}", .{ what, api.problem() }) };
+                return error.Refused;
+            },
+            else => return err,
+        };
+        if (ok) return;
+        pumpFor(100);
+    }
+}
+
+fn spawnApi(arena: std.mem.Allocator, loaded: *const adapter.Loaded, binary: []const u8, o: OpenOpts, where: *Where, deadline: i64, why: *Fail) !*Entry {
     const a = state.allocator;
     const spec = &loaded.spec;
     const pw_env = spec.launch.password_env orelse unreachable; // adapter.zig requires it for API sources
+    const cwd = o.cwd.?;
+    // The API client's port, here. A remote server listens on its own
+    // host's loopback; the client reaches it through a forward from `port`.
     const port = mcp_term.pickFreePort() orelse {
         why.* = .{ .code = .unavailable, .msg = "no free local port for the app's server" };
         return error.Refused;
     };
+    const server_port: u16 = if (where.host == null) port else try remotePort(port);
     var port_buf: [8]u8 = undefined;
-    const port_str = std.fmt.bufPrint(&port_buf, "{d}", .{port}) catch unreachable;
+    const port_str = std.fmt.bufPrint(&port_buf, "{d}", .{server_port}) catch unreachable;
     const password = try randomHex(a, 24);
     errdefer {
         std.crypto.secureZero(u8, password);
@@ -1187,41 +1557,40 @@ fn spawnApi(arena: std.mem.Allocator, loaded: *const adapter.Loaded, binary: []c
     }
     const env_kv = try std.fmt.allocPrint(arena, "{s}={s}", .{ pw_env, password });
     defer std.crypto.secureZero(u8, env_kv);
+    // Local: the spawn request's environment. Remote: typed at the prompt.
+    const env: []const []const u8 = if (where.host == null) try arena.dupe([]const u8, &.{env_kv}) else &.{};
+    const secret_env: ?[]const u8 = if (where.host == null) null else pw_env;
 
     const n = try nextNumber(spec.id);
     const id = try std.fmt.allocPrint(arena, "{s}-{d}", .{ spec.id, n });
     const session = try std.fmt.allocPrint(arena, "agent-{s}", .{id});
     const server_session = try std.fmt.allocPrint(arena, "agent-{s}-server", .{id});
+    const what = try std.fmt.allocPrint(arena, "the {s} server", .{spec.name});
     const server_argv = try launch.withUnsetEnv(arena, spec.launch.unset_env, try launch.mainArgv(arena, spec.launch, binary, .{
         .port = port_str,
-        .cwd = o.cwd,
+        .cwd = cwd,
         .model = o.model,
         .effort = o.effort,
-    }));
-    const server = termdrive.Term.spawnWith(a, server_argv, 100, 30, state.mux_sock, .{
-        .name = server_session,
-        .env = &.{env_kv},
-        .cwd = o.cwd,
-        .shell_integration = false,
-    }) catch {
-        why.* = .{ .code = .unavailable, .msg = "could not start the app's server session on the private daemon" };
-        return error.Refused;
-    };
+    }, .fresh));
+    const server = try spawnOn(arena, where, o.choice, server_argv, .{ .name = server_session, .cwd = cwd, .env = env, .secret_env = secret_env }, why);
     errdefer server.deinit();
+    if (secret_env != null) try typeSecret(arena, server, password, deadline, what, why);
 
-    // The server listens before anything talks to it.
-    const port_deadline = @min(deadline, clock.nowMs() + PORT_WAIT_MS);
-    while (!mcp_term.tcpListening(port, 200)) {
-        server.drain();
-        if (server.exited) {
-            why.* = .{ .code = .failed, .msg = try std.fmt.allocPrint(arena, "the {s} server exited before it listened (last line: {s})", .{ spec.name, mcp_term.termLastLine(arena, server) }) };
+    var forward: ?*termdrive.Term = null;
+    errdefer if (forward) |f| f.deinit();
+    if (where.host) |h| {
+        const f = mcp_term.spawnForwardTermNamed(arena, h, port, "127.0.0.1", server_port, try forwardName(arena, id)) catch {
+            why.* = .{ .code = .unavailable, .msg = "could not start the port forward to the app's server" };
             return error.Refused;
+        };
+        forward = f;
+        switch (try mcp_term.waitForwardReady(arena, f, port, @max(1000, @min(deadline, clock.nowMs() + PORT_WAIT_MS) - clock.nowMs()))) {
+            .ready => {},
+            .err => |m| {
+                why.* = .{ .code = .unavailable, .msg = try std.fmt.allocPrint(arena, "the port forward to {s} did not come up: {s}", .{ h, m }) };
+                return error.Refused;
+            },
         }
-        if (clock.nowMs() >= port_deadline) {
-            why.* = .{ .code = .timeout, .msg = try std.fmt.allocPrint(arena, "the {s} server did not listen on port {d} in time (last line: {s})", .{ spec.name, port, mcp_term.termLastLine(arena, server) }) };
-            return error.Refused;
-        }
-        pumpFor(100);
     }
 
     const ag = try a.create(agent_mod.Agent);
@@ -1229,6 +1598,9 @@ fn spawnApi(arena: std.mem.Allocator, loaded: *const adapter.Loaded, binary: []c
     ag.* = try agent_mod.Agent.initOpencode(a, loaded, .{}, .{ .port = port, .password = password });
     errdefer ag.deinit();
     const api = &ag.source.opencode_api;
+    // The server listens a while before it answers, and swallows what it
+    // gets in between: wait for its health route before the event stream.
+    try waitServerReady(arena, api, server, what, @min(deadline, clock.nowMs() + PORT_WAIT_MS), why);
     api.connect(null, clock.nowMs()) catch |err| {
         why.* = .{ .code = .failed, .msg = try std.fmt.allocPrint(arena, "the {s} API refused the connection: {s}", .{ spec.name, if (api.problem().len > 0) api.problem() else @errorName(err) }) };
         return error.Refused;
@@ -1239,31 +1611,38 @@ fn spawnApi(arena: std.mem.Allocator, loaded: *const adapter.Loaded, binary: []c
     };
     const tui_argv = try launch.withUnsetEnv(arena, spec.launch.unset_env, try launch.attachArgv(arena, spec.launch, binary, .{
         .port = port_str,
-        .cwd = o.cwd,
+        .cwd = cwd,
         .session = sid,
     }));
-    const tui: ?*termdrive.Term = if (spec.launch.attach_args.len == 0) null else termdrive.Term.spawnWith(a, tui_argv, o.cols, o.rows, state.mux_sock, .{
-        .name = session,
-        .env = &.{env_kv},
-        .cwd = o.cwd,
-        .shell_integration = false,
-    }) catch {
-        why.* = .{ .code = .unavailable, .msg = "could not start the app's visible session on the private daemon" };
-        return error.Refused;
-    };
+    const tui: ?*termdrive.Term = if (spec.launch.attach_args.len == 0) null else try spawnOn(arena, where, o.choice, tui_argv, .{ .name = session, .cwd = cwd, .env = env, .secret_env = secret_env }, why);
     errdefer if (tui) |t| t.deinit();
+    if (tui) |t| if (secret_env != null) try typeSecret(arena, t, password, deadline, "the attached client", why);
 
-    const e = try newEntry(loaded, id, if (tui != null) session else server_session, binary, o.cwd);
+    const e = try newEntry(loaded, id, if (tui != null) session else server_session, binary, cwd);
     errdefer dropBare(e);
+    try setPlace(e, where.*, o);
     e.server_session = try a.dupe(u8, server_session);
     e.agent = ag;
     e.visible = if (tui) |t| .{ .owned = t } else null;
     e.server = server;
     e.port = port;
+    e.remote_port = if (where.host != null) server_port else 0;
+    e.forward = forward;
     e.password = password;
     if (tui) |t| record(e, t, session);
     record(e, server, server_session);
     return e;
+}
+
+/// A port for an API server on a remote host, other than `local` (on a
+/// loopback ssh both ends share one port space).
+fn remotePort(local: u16) !u16 {
+    var raw: [2]u8 = undefined;
+    while (true) {
+        if (c.getentropy(&raw, raw.len) != 0) return error.NoEntropy;
+        const p: u16 = REMOTE_PORT_MIN + std.mem.readInt(u16, &raw, .little) % REMOTE_PORT_SPAN;
+        if (p != local) return p;
+    }
 }
 
 fn attachTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
@@ -1324,7 +1703,15 @@ fn submitAndWait(arena: std.mem.Allocator, e: *Entry, text: []const u8, filter: 
     const pre = try e.cursor.take(e.agent.queue(), .{}, clock.nowMs(), arena);
     _ = waitReady(e, deadline);
     if (try busy(arena, e)) |f| return .{ .fail = f };
-    if (try act(arena, e, .{ .submit = text }, deadline)) |f| return .{ .fail = f };
+    switch (try act(arena, e, .{ .submit = text }, deadline)) {
+        .fail => |f| return .{ .fail = f },
+        .ok => {},
+    }
+    // The conversation has a turn now: a relaunch resumes it.
+    if (!e.conversed) {
+        e.conversed = true;
+        writeDescriptor(e);
+    }
     return .{ .ok = try waitAfter(arena, e, pre, filter, deadline) };
 }
 
@@ -1335,20 +1722,47 @@ fn waitAfter(arena: std.mem.Allocator, e: *Entry, pre: ?events.Delivery, filter:
     return combine(arena, pre, post, true, post == null and !gone(e));
 }
 
+/// What an action came to.
+const Acted = union(enum) {
+    ok: Outcome,
+    fail: Fail,
+};
+
+const Outcome = struct {
+    /// The app's line confirming the action (a recipe's `confirm`).
+    confirmation: ?[]const u8 = null,
+    /// The app was restarted with the change (a recipe's `relaunch`).
+    relaunched: bool = false,
+};
+
 /// Take `action` through the agent's source: an API call, or the
 /// adapter's recipe run against the terminal.
-fn act(arena: std.mem.Allocator, e: *Entry, action: agent_mod.Action, deadline: i64) !?Fail {
+fn act(arena: std.mem.Allocator, e: *Entry, action: agent_mod.Action, deadline: i64) anyerror!Acted {
     switch (e.agent.driver()) {
         .opencode_api => |d| {
-            d.perform(action) catch |err| return try apiFail(arena, d.api, err);
-            return null;
+            d.perform(action) catch |err| return .{ .fail = try apiFail(arena, d.api, err) };
+            return .{ .ok = .{} };
         },
-        .screen => return runPlan(arena, e, action, deadline),
+        .screen => |d| {
+            var plan = d.plan(state.allocator, action) catch |err| switch (err) {
+                error.Unsupported => return .{ .fail = .{ .code = .refused, .msg = try std.fmt.allocPrint(arena, "the {s} adapter has no recipe for {s}", .{ e.loaded.spec.id, @tagName(std.meta.activeTag(action)) }) } },
+                else => return err,
+            };
+            defer plan.deinit();
+            return runSteps(arena, e, action, plan.steps, deadline);
+        },
     }
 }
 
+/// A setting through `act`; the failure, if any (agent_open's notes).
 fn applySet(arena: std.mem.Allocator, e: *Entry, action: agent_mod.Action, deadline: i64) !?Fail {
-    return act(arena, e, action, deadline);
+    return switch (try act(arena, e, action, deadline)) {
+        .ok => |o| blk: {
+            try noteSetting(arena, e, action, o);
+            break :blk null;
+        },
+        .fail => |f| f,
+    };
 }
 
 fn apiFail(arena: std.mem.Allocator, api: *opencode.Api, err: anyerror) !Fail {
@@ -1363,42 +1777,223 @@ fn apiFail(arena: std.mem.Allocator, api: *opencode.Api, err: anyerror) !Fail {
     return .{ .code = code, .msg = try arena.dupe(u8, why) };
 }
 
-/// Run a screen adapter's recipe for `action` against the terminal.
-fn runPlan(arena: std.mem.Allocator, e: *Entry, action: agent_mod.Action, deadline: i64) !?Fail {
+/// One recipe run's state the failure path needs.
+const Run = struct {
+    /// The adapter command typed last (`confirm` looks below it).
+    command: ?[]const u8 = null,
+};
+
+/// Run recipe `steps` (of `action`, or the exit recipe for null) against
+/// the agent's terminal. A command recipe that fails is cleaned up: the
+/// picker it opened is cancelled, and announced if it will not go.
+fn runSteps(arena: std.mem.Allocator, e: *Entry, action: ?agent_mod.Action, steps: []const adapter.Step, deadline: i64) anyerror!Acted {
+    var run: Run = .{};
+    const result = try runStepsIn(arena, e, action, steps, deadline, &run);
+    const eng = &e.agent.source.screen;
+    if (run.command != null) {
+        if (result == .fail and e.agent.interaction() != null and e.visibleTerm() != null) {
+            if (e.loaded.spec.actions.interrupt.len > 0) {
+                var cancel = try e.agent.driver().screen.plan(state.allocator, .interrupt);
+                defer cancel.deinit();
+                _ = try runStepsIn(arena, e, agent_mod.Action.interrupt, cancel.steps, clock.nowMs() + STEP_WAIT_MS, &run);
+                pumpFor(INTERRUPT_SETTLE_MS);
+            }
+        }
+        try eng.endCommand(clock.nowMs());
+    }
+    return result;
+}
+
+fn runStepsIn(arena: std.mem.Allocator, e: *Entry, action: ?agent_mod.Action, steps: []const adapter.Step, deadline: i64, run: *Run) anyerror!Acted {
     const d = e.agent.driver().screen;
-    var plan = d.plan(state.allocator, action) catch |err| switch (err) {
-        error.Unsupported => return Fail{ .code = .refused, .msg = try std.fmt.allocPrint(arena, "the {s} adapter has no recipe for {s}", .{ e.loaded.spec.id, @tagName(std.meta.activeTag(action)) }) },
-        else => return err,
-    };
-    defer plan.deinit();
-    const gone_fail = Fail{ .code = .unavailable, .msg = "the agent's terminal is gone" };
-    for (plan.steps) |step| {
+    const what: []const u8 = if (action) |x| @tagName(std.meta.activeTag(x)) else "exit";
+    const gone_fail = Acted{ .fail = .{ .code = .unavailable, .msg = "the agent's terminal is gone" } };
+    // The prompt showing now: `wait answered` waits for it to go.
+    const asked: ?u64 = if (e.agent.interaction()) |it| it.hash() else null;
+    var out: Outcome = .{};
+    for (steps) |step| {
         const t = e.visibleTerm() orelse return gone_fail;
+        const step_deadline = @min(deadline, clock.nowMs() + STEP_WAIT_MS);
         switch (step) {
             .text => |s| t.sendText(s) catch return gone_fail,
-            .key => |k| t.sendKeys(k) catch |err| return try keyFail(arena, err, k),
+            .command => |s| {
+                try d.engine.beginCommand(s);
+                run.command = s;
+                t.sendText(s) catch return gone_fail;
+            },
+            .key => |k| t.sendKeys(k) catch |err| return .{ .fail = try keyFail(arena, err, k) },
             .sleep_ms => |ms| pumpFor(ms),
             .clear_input => |ks| {
                 service(clock.nowMs());
                 if (!d.inputEmpty()) {
                     for (ks) |k| {
-                        t.sendKeys(k) catch |err| return try keyFail(arena, err, k);
+                        t.sendKeys(k) catch |err| return .{ .fail = try keyFail(arena, err, k) };
                         pumpFor(50);
                     }
                     pumpFor(CLEAR_SETTLE_MS);
                 }
             },
-            .wait => |w| if (!waitStep(e, w, @min(deadline, clock.nowMs() + STEP_WAIT_MS)))
-                return Fail{ .code = .timeout, .msg = try std.fmt.allocPrint(arena, "the agent did not become {s} while running its {s} recipe", .{ @tagName(w), @tagName(std.meta.activeTag(action)) }) },
+            .wait => |w| if (!waitStep(e, w, asked, step_deadline))
+                return .{ .fail = .{ .code = .timeout, .msg = try std.fmt.allocPrint(arena, "the agent did not become {s} while running its {s} recipe; the screen shows:\n{s}", .{ @tagName(w), what, try screenTail(arena, e) }) } },
             .pick => |choice| {
                 service(clock.nowMs());
-                const num = d.pickNumber(choice) catch |err| return try pickFail(arena, e, choice, err);
+                const num = d.pickNumber(choice) catch |err| return .{ .fail = try pickFail(arena, e, choice, err) };
                 var nb: [16]u8 = undefined;
                 t.sendText(std.fmt.bufPrint(&nb, "{d}", .{num}) catch unreachable) catch return gone_fail;
             },
+            .confirm => |r| {
+                const m = try adapter.compileLine(arena, r);
+                out.confirmation = (try waitConfirm(arena, e, m, run.command.?, step_deadline)) orelse
+                    return .{ .fail = .{ .code = .timeout, .msg = try std.fmt.allocPrint(arena, "the app did not confirm {s}: no confirmation below `{s}` within {d} ms, so the change may not have taken effect; the screen shows:\n{s}", .{ what, run.command.?, STEP_WAIT_MS, try screenTail(arena, e) }) } };
+            },
+            .relaunch => return relaunch(arena, e, action orelse return gone_fail, deadline),
         }
     }
-    return null;
+    return .{ .ok = out };
+}
+
+/// Wait until no interaction shows and the app printed a line matching
+/// `rule` below `command`, then (still bounded) until the agent is idle
+/// again, so the next call is not refused as busy; the line (owned by
+/// `arena`), or null when it never showed.
+fn waitConfirm(arena: std.mem.Allocator, e: *Entry, rule: adapter.Matcher, command: []const u8, deadline: i64) !?[]const u8 {
+    const eng = &e.agent.source.screen;
+    service(clock.nowMs());
+    var seen: ?[]const u8 = null;
+    while (true) {
+        if (seen == null and e.agent.interaction() == null) {
+            if (eng.confirmLine(rule, command)) |line| seen = try arena.dupe(u8, line);
+        }
+        if (seen != null and e.agent.state() == .idle) return seen;
+        if (gone(e) or clock.nowMs() >= deadline) return seen;
+        pump(deadline - clock.nowMs());
+    }
+}
+
+/// The last lines of the agent's terminal, for a failure that must say
+/// what the app shows.
+fn screenTail(arena: std.mem.Allocator, e: *Entry) ![]const u8 {
+    const t = e.visibleTerm() orelse return "(no terminal)";
+    const text = t.readScreen(false) catch return "(the screen could not be read)";
+    defer t.allocator.free(text);
+    return arena.dupe(u8, mcp.tailLines(std.mem.trimEnd(u8, text, "\n "), 12));
+}
+
+/// Restart a screen app with `action`'s value as a launch value (the
+/// effort Claude Code only takes at launch: its /effort saves the user's
+/// default), in the same session, resuming its conversation.
+fn relaunch(arena: std.mem.Allocator, e: *Entry, action: agent_mod.Action, deadline: i64) anyerror!Acted {
+    const old = switch (e.visible orelse return .{ .fail = .{ .code = .unavailable, .msg = "the agent's terminal is gone" } }) {
+        .owned => |t| t,
+        .borrowed => return .{ .fail = .{ .code = .refused, .msg = "this agent runs on a term_open terminal (agent_attach): it cannot be restarted with new launch settings; agent_open it instead" } },
+    };
+    var model: ?[]const u8 = e.launch_model;
+    var effort: ?[]const u8 = e.launch_effort;
+    switch (action) {
+        .set_effort => |x| effort = x,
+        .set_model => |x| model = x,
+        .submit, .answer, .interrupt => return .{ .fail = .{ .code = .refused, .msg = "the adapter relaunches for an action that is no launch value" } },
+    }
+    // A conversation with a turn is resumed; an empty one starts afresh
+    // under a new id (the old id may already be taken by the app).
+    const resumed = e.conversed and e.conversation != null;
+    const conversation: ?[]const u8 = if (resumed) e.conversation else if (e.conversation != null) try newUuid(arena) else null;
+
+    // 1. End the app the way a user would, then make sure it is gone.
+    e.relaunching = true;
+    defer e.relaunching = false;
+    var exit_plan = try e.agent.driver().screen.exitPlan(state.allocator);
+    defer exit_plan.deinit();
+    _ = try runSteps(arena, e, null, exit_plan.steps, clock.nowMs() + STEP_WAIT_MS);
+    const exit_until = clock.nowMs() + EXIT_WAIT_MS;
+    while (!old.exited and clock.nowMs() < exit_until) {
+        old.drain();
+        if (!old.exited) _ = old.pumpOnce(100);
+    }
+    const ended = old.exited;
+    e.visible = null;
+    if (ended) old.detach() else old.deinit();
+
+    // 2. Start it again in the same session name, with every launch value.
+    const new_t = startAgain(arena, e, model, effort, conversation, if (resumed) .resumed else .fresh, deadline) catch |err| switch (err) {
+        error.Refused => return .{ .fail = .{ .code = .failed, .msg = try std.fmt.allocPrint(arena, "the app was ended to apply the change and could not be started again; agent_close it and agent_open a new one", .{}) } },
+        else => return err,
+    };
+    e.visible = .{ .owned = new_t };
+    e.seen_snapshots = new_t.snapshots;
+    e.agent.source.screen.noteRestart();
+    e.relaunches += 1;
+    const cast_name = try std.fmt.allocPrint(arena, "{s}-r{d}", .{ e.session, e.relaunches });
+    record(e, new_t, cast_name);
+    if (conversation) |cv| if (!resumed) {
+        if (e.conversation) |prev| e.allocator.free(prev);
+        e.conversation = try e.allocator.dupe(u8, cv);
+    };
+    try replaceOwned(e, &e.launch_model, model);
+    try replaceOwned(e, &e.launch_effort, effort);
+    e.relaunching = false;
+    writeDescriptor(e);
+
+    // 3. It is back once its input box shows again.
+    if (!waitReady(e, deadline))
+        return .{ .fail = .{ .code = .timeout, .msg = try std.fmt.allocPrint(arena, "the app was restarted with the new setting but did not become ready in time; the screen shows:\n{s}", .{try screenTail(arena, e)}) } };
+    // A model chosen in the app since the launch is not a launch value.
+    if (e.picked_model) |m| if (action != .set_model) {
+        const again = try arena.dupe(u8, m);
+        switch (try act(arena, e, .{ .set_model = again }, deadline)) {
+            .ok => {},
+            .fail => |f| return .{ .fail = .{ .code = f.code, .msg = try std.fmt.allocPrint(arena, "restarted with the new setting, but the model chosen before ({s}) could not be chosen again: {s}", .{ again, f.msg }) } },
+        }
+    };
+    return .{ .ok = .{ .relaunched = true } };
+}
+
+/// Spawn the agent's app again on its host as its session, for a relaunch.
+fn startAgain(arena: std.mem.Allocator, e: *Entry, model: ?[]const u8, effort: ?[]const u8, conversation: ?[]const u8, start: launch.Start, deadline: i64) !*termdrive.Term {
+    const spec = &e.loaded.spec;
+    const argv = try launch.withUnsetEnv(arena, spec.launch.unset_env, try launch.mainArgv(arena, spec.launch, e.binary, .{
+        .model = model,
+        .effort = effort,
+        .cwd = e.cwd,
+        .session = conversation,
+    }, start));
+    var where = e.where();
+    var why: Fail = undefined;
+    // The ended session may hold its name a moment longer.
+    const until = @min(deadline, clock.nowMs() + EXIT_WAIT_MS);
+    while (true) {
+        if (spawnOn(arena, &where, .auto, argv, .{ .name = e.session, .cwd = e.cwd }, &why)) |t| return t else |err| {
+            if (err != error.Refused or clock.nowMs() >= until) return err;
+        }
+        pumpFor(200);
+    }
+}
+
+fn replaceOwned(e: *Entry, slot: *?[]u8, value: ?[]const u8) !void {
+    const fresh: ?[]u8 = if (value) |v| try e.allocator.dupe(u8, v) else null;
+    if (slot.*) |old| e.allocator.free(old);
+    slot.* = fresh;
+}
+
+/// A setting the app took: what the adapter did goes into the transcript
+/// as a notice (the app's own echo of an adapter command is hidden), and
+/// a model chosen in the app is kept for a later relaunch.
+fn noteSetting(arena: std.mem.Allocator, e: *Entry, action: agent_mod.Action, o: Outcome) !void {
+    switch (e.agent.source) {
+        .screen => |*eng| {
+            const text = switch (action) {
+                .set_model => |m| blk: {
+                    if (!o.relaunched) try replaceOwned(e, &e.picked_model, m);
+                    break :blk try std.fmt.allocPrint(arena, "model set to {s} for this session{s}{s}", .{ m, if (o.confirmation != null) ": " else "", o.confirmation orelse "" });
+                },
+                .set_effort => |x| try std.fmt.allocPrint(arena, "effort set to {s} for this session{s}", .{ x, if (o.relaunched) " (the app was restarted with it and the conversation resumed)" else "" }),
+                .submit, .answer, .interrupt => return,
+            };
+            try eng.addNotice(text);
+            writeDescriptor(e);
+        },
+        .opencode_api => {},
+    }
 }
 
 fn keyFail(arena: std.mem.Allocator, err: anyerror, key: []const u8) !Fail {
@@ -1464,7 +2059,10 @@ fn answerTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]cons
         else
             try arena.dupe(u8, choice),
     };
-    if (try act(arena, e, .{ .answer = choice }, deadline)) |f| return errRes(arena, f.code, f.msg);
+    switch (try act(arena, e, .{ .answer = choice }, deadline)) {
+        .fail => |f| return errRes(arena, f.code, f.msg),
+        .ok => {},
+    }
     // A denied call leaves no trace on a screen app: the adapter keeps one.
     if (kind == .permission) switch (e.agent.source) {
         .screen => |*eng| try eng.addNotice(try std.fmt.allocPrint(arena, "permission \"{s}\" answered: {s}", .{ title, label })),
@@ -1485,22 +2083,41 @@ fn setTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]const u
     inline for (.{ "model", "effort" }) |key| {
         if (argStr(args, key)) |v| if (!launch.validValue(v)) return errRes(arena, .invalid_args, key ++ " must be 1-256 printable characters");
     }
+    // Refused before anything is typed, stopped or restarted.
+    if (effort) |x| if (!launch.validEffort(e.loaded.spec.launch, x)) return errRes(arena, .invalid_args, try effortRefusal(arena, e.loaded));
     const deadline = deadlineFrom(args, DEFAULT_WAIT_MS);
     // A screen app is typed at: only while it is idle.
     if (e.agent.kind() == .screen) {
         _ = waitReady(e, deadline);
         if (try busy(arena, e)) |f| return errRes(arena, f.code, f.msg);
     }
-    if (model) |m| if (try applySet(arena, e, .{ .set_model = m }, deadline)) |f| return errRes(arena, f.code, f.msg);
-    if (effort) |x| if (try applySet(arena, e, .{ .set_effort = x }, deadline)) |f| return errRes(arena, f.code, f.msg);
+    var confirmations: std.ArrayList([]const u8) = .empty;
+    var relaunched = false;
+    for ([_]?agent_mod.Action{
+        if (model) |m| agent_mod.Action{ .set_model = m } else null,
+        if (effort) |x| agent_mod.Action{ .set_effort = x } else null,
+    }) |maybe| {
+        const action = maybe orelse continue;
+        switch (try act(arena, e, action, deadline)) {
+            .fail => |f| return errRes(arena, f.code, f.msg),
+            .ok => |o| {
+                if (o.confirmation) |line| try confirmations.append(arena, line);
+                relaunched = relaunched or o.relaunched;
+                try noteSetting(arena, e, action, o);
+            },
+        }
+    }
     service(clock.nowMs());
     var res = Res.init(arena);
-    try res.textf("{s}: {s} set for this session only", .{
+    try res.textf("{s}: {s} set for this session only{s}", .{
         e.id,
         if (model != null and effort != null) "model and effort" else if (model != null) "model" else "effort",
+        if (relaunched) " (restarted with it; the conversation was resumed)" else "",
     });
     if (model) |m| try res.fact("model", m);
     if (effort) |x| try res.fact("effort", x);
+    if (confirmations.items.len > 0) try res.fact("confirmation", try std.mem.join(arena, "\n", confirmations.items));
+    try res.fact("relaunched", relaunched);
     switch (e.agent.source) {
         .opencode_api => |*api| {
             if (api.currentModel()) |m| try res.fact("current_model", try std.fmt.allocPrint(arena, "{s}/{s}", .{ m.provider, m.model }));
@@ -1508,11 +2125,15 @@ fn setTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]const u
         },
         .screen => {},
     }
-    return finish(arena, &res, e, try pending(arena, e), .{}, &.{});
+    const blocks = [1]Block{.{ .name = "confirmation", .body = try std.mem.join(arena, "\n", confirmations.items) }};
+    return finish(arena, &res, e, try pending(arena, e), .{}, blocks[0..@intFromBool(confirmations.items.len > 0)]);
 }
 
 fn interruptTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]const u8 {
-    if (try act(arena, e, .interrupt, deadlineFrom(args, DEFAULT_WAIT_MS))) |f| return errRes(arena, f.code, f.msg);
+    switch (try act(arena, e, .interrupt, deadlineFrom(args, DEFAULT_WAIT_MS))) {
+        .fail => |f| return errRes(arena, f.code, f.msg),
+        .ok => {},
+    }
     pumpFor(INTERRUPT_SETTLE_MS);
     var res = Res.init(arena);
     try res.textf("{s}: interrupted", .{e.id});
@@ -1571,6 +2192,9 @@ fn listTool(arena: std.mem.Allocator) ![]const u8 {
         server_session: ?[]const u8,
         pending_events: usize,
         waiting_on_user: bool,
+        host: ?[]const u8,
+        transport: []const u8,
+        recordings: []const []const u8,
     };
     const items = try arena.alloc(Item, state.entries.items.len);
     var res = Res.init(arena);
@@ -1586,8 +2210,12 @@ fn listTool(arena: std.mem.Allocator) ![]const u8 {
             .server_session = e.server_session,
             .pending_events = e.cursor.pendingAlwaysOn(e.agent.queue()),
             .waiting_on_user = e.agent.interaction() != null,
+            .host = e.host,
+            .transport = @tagName(e.transport),
+            .recordings = e.recordings.items,
         };
-        try res.textf("{s} ({s}): {s}, session {s}, {d} undelivered event(s)", .{ out.agent, out.app, out.state, out.session, out.pending_events });
+        try res.textf("{s} ({s}): {s}, session {s}{s}{s}, {d} undelivered event(s)", .{ out.agent, out.app, out.state, out.session, if (e.host != null) " on " else "", e.host orelse "", out.pending_events });
+        for (e.recordings.items) |r| try res.textf("  recording: {s}", .{r});
     }
     try res.raw("agents", try toJson(arena, items));
     try res.fact("count", items.len);
@@ -1629,6 +2257,21 @@ const Descriptor = struct {
     api_session: ?[]const u8 = null,
     binary: []const u8 = "",
     cwd: []const u8 = "",
+    /// Remote agents: the host, and how the sessions reach it (a
+    /// `Transport` name; absent = local, as P3 descriptors were written).
+    host: ?[]const u8 = null,
+    transport: ?[]const u8 = null,
+    remote_port: u16 = 0,
+    forward_session: ?[]const u8 = null,
+    forward_origin: ?[]const u8 = null,
+    conversation: ?[]const u8 = null,
+    conversed: bool = false,
+    launch_model: ?[]const u8 = null,
+    launch_effort: ?[]const u8 = null,
+    picked_model: ?[]const u8 = null,
+    relaunches: u32 = 0,
+    cols: u16 = DEFAULT_COLS,
+    rows: u16 = DEFAULT_ROWS,
 };
 
 fn descriptorPath(arena: std.mem.Allocator, id: []const u8, ext: []const u8) ![]const u8 {
@@ -1665,8 +2308,22 @@ fn writeDescriptor(e: *Entry) void {
         },
         .binary = e.binary,
         .cwd = e.cwd,
+        .host = e.host,
+        .transport = @tagName(e.transport),
+        .remote_port = e.remote_port,
+        .forward_session = if (e.forward) |f| f.name else null,
+        .forward_origin = if (e.forward) |f| @as([]const u8, &f.origin_id) else null,
+        .conversation = e.conversation,
+        .conversed = e.conversed,
+        .launch_model = e.launch_model,
+        .launch_effort = e.launch_effort,
+        .picked_model = e.picked_model,
+        .relaunches = e.relaunches,
+        .cols = e.cols,
+        .rows = e.rows,
     };
     const path = descriptorPath(arena, e.id, "json") catch return;
+    pathz.makeParentDirs(path) catch return;
     atomicwrite.writeJsonExact(arena, path, d, 0o600) catch {};
 }
 
@@ -1722,6 +2379,7 @@ fn originOf(s: ?[]const u8) !wire.SessionOriginId {
 const Parts = struct {
     vis: ?*termdrive.Term = null,
     server: ?*termdrive.Term = null,
+    forward: ?*termdrive.Term = null,
     pw: ?[]u8 = null,
     ag: ?*agent_mod.Agent = null,
     ag_live: bool = false,
@@ -1735,23 +2393,40 @@ const Parts = struct {
             std.crypto.secureZero(u8, p);
             a.free(p);
         }
+        if (self.forward) |x| x.detach();
         if (self.server) |x| x.detach();
         if (self.vis) |x| x.detach();
         self.* = .{};
     }
 };
 
+/// Attach session `name` where a descriptor says it runs: the remote
+/// host's own daemon (reconnected over ssh), else this server's daemon
+/// (local agents, and the local ssh sessions of plain-ssh ones).
+fn attachWhere(transport: Transport, host: ?[]const u8, name: []const u8, origin: ?[]const u8) !*termdrive.Term {
+    const a = state.allocator;
+    const id = try originOf(origin);
+    if (transport == .@"sketerm-mux") {
+        return termdrive.Term.attachRemote(a, host orelse return error.BadDescriptor, name, id) catch error.SessionGone;
+    }
+    const sock = state.mux_sock orelse return error.NoDaemon;
+    return termdrive.Term.attachExisting(a, name, id, sock) catch error.SessionGone;
+}
+
 fn reattachOne(d: Descriptor) !void {
     const a = state.allocator;
-    const sock = state.mux_sock orelse return error.NoDaemon;
     const loaded = (try adapters()).get(d.app) orelse return error.UnknownAdapter;
+    const transport: Transport = if (d.transport) |s| std.meta.stringToEnum(Transport, s) orelse return error.BadDescriptor else .local;
+    if (transport != .local and d.host == null) return error.BadDescriptor;
     var parts: Parts = .{};
     errdefer parts.release(a);
-    parts.vis = termdrive.Term.attachExisting(a, d.session, try originOf(d.origin), sock) catch return error.SessionGone;
+    parts.vis = try attachWhere(transport, d.host, d.session, d.origin);
     if (loaded.spec.source == .opencode_api) {
-        const server_name = d.server_session orelse return error.BadDescriptor;
-        parts.server = termdrive.Term.attachExisting(a, server_name, try originOf(d.server_origin), sock) catch return error.SessionGone;
+        parts.server = try attachWhere(transport, d.host, d.server_session orelse return error.BadDescriptor, d.server_origin);
         parts.pw = readfile.cappedAlloc(a, d.password_file orelse return error.BadDescriptor, 4096) catch return error.BadDescriptor;
+        // The forward is this server's own ssh; a dead one is respawned
+        // by `service` on the same local port.
+        if (d.forward_session) |fs| parts.forward = attachWhere(.local, null, fs, d.forward_origin) catch null;
     }
     parts.ag = try a.create(agent_mod.Agent);
     parts.ag.?.* = switch (loaded.spec.source) {
@@ -1759,22 +2434,49 @@ fn reattachOne(d: Descriptor) !void {
         .opencode_api => try agent_mod.Agent.initOpencode(a, loaded, .{}, .{ .port = d.port, .password = parts.pw.? }),
     };
     parts.ag_live = true;
-    // An adopted session's past is history: it arms no turn.
-    if (loaded.spec.source == .opencode_api) try parts.ag.?.source.opencode_api.connect(d.api_session, clock.nowMs());
 
     try state.entries.ensureUnusedCapacity(a, 1);
     const e = try newEntry(loaded, d.id, d.session, d.binary, d.cwd);
     errdefer dropBare(e);
     if (d.server_session) |s| e.server_session = try a.dupe(u8, s);
+    if (d.host) |h| e.host = try a.dupe(u8, h);
+    if (d.conversation) |s| e.conversation = try a.dupe(u8, s);
+    if (d.launch_model) |s| e.launch_model = try a.dupe(u8, s);
+    if (d.launch_effort) |s| e.launch_effort = try a.dupe(u8, s);
+    if (d.picked_model) |s| e.picked_model = try a.dupe(u8, s);
+    e.transport = transport;
+    e.conversed = d.conversed;
+    e.relaunches = d.relaunches;
+    e.cols = d.cols;
+    e.rows = d.rows;
+    e.remote_port = d.remote_port;
     // Nothing below fails: the parts move into the entry.
     e.agent = parts.ag.?;
     e.visible = .{ .owned = parts.vis.? };
     e.seen_snapshots = parts.vis.?.snapshots;
     e.server = parts.server;
+    e.forward = parts.forward;
     e.port = d.port;
     e.password = parts.pw;
     parts = .{};
     state.entries.appendAssumeCapacity(e);
+    // An adopted session's past is history: it arms no turn. A server
+    // whose forward is down answers once `service` brings it back.
+    if (loaded.spec.source == .opencode_api) {
+        const api = &e.agent.source.opencode_api;
+        if (e.forward == null and e.host != null) {
+            e.forward_retry_ms = 0;
+            e.forward = null;
+            reviveForwardNow(e);
+        }
+        api.connect(d.api_session, clock.nowMs()) catch {
+            // Reconnects with backoff from `service`, then resyncs the
+            // session it drives.
+            if (d.api_session) |sid| api.source.setRoot(sid) catch {};
+            api.source.noteDisconnected(clock.nowMs(), "the app's server is not reachable yet") catch {};
+            api.reconnect_at_ms = clock.nowMs() + 500;
+        };
+    }
     // New agents must not reuse this one's number.
     if (std.mem.lastIndexOfScalar(u8, d.id, '-')) |dash| {
         if (std.fmt.parseInt(u32, d.id[dash + 1 ..], 10)) |n| {
@@ -1782,6 +2484,17 @@ fn reattachOne(d: Descriptor) !void {
             if (!gop.found_existing or gop.value_ptr.* < n) gop.value_ptr.* = n;
         } else |_| {}
     }
+}
+
+/// Start a remote API agent's forward when it has none (a durable
+/// instance whose forward session is gone).
+fn reviveForwardNow(e: *Entry) void {
+    var arena_state = std.heap.ArenaAllocator.init(state.allocator);
+    defer arena_state.deinit();
+    const host = e.host orelse return;
+    const name = forwardName(arena_state.allocator(), e.id) catch return;
+    e.forward = mcp_term.spawnForwardTermNamed(arena_state.allocator(), host, e.port, "127.0.0.1", e.remote_port, name) catch null;
+    if (e.forward) |f| _ = mcp_term.waitForwardReady(arena_state.allocator(), f, e.port, 10_000) catch {};
 }
 
 // ── tests ────────────────────────────────────────────────────────
@@ -1978,14 +2691,18 @@ test "argument validation refuses before anything is spawned" {
     const a = rig.arena.allocator();
     try expectError(a, "agent_open", try rig.call(.agent_open, "{}"), "invalid_args");
     try expectError(a, "agent_open", try rig.call(.agent_open, "{\"app\":\"nope\"}"), "not_found");
-    try expectError(a, "agent_open", try rig.call(.agent_open, "{\"app\":\"claude\",\"host\":\"box\"}"), "unavailable");
+    // An option-looking host never reaches an ssh argv; a transport is one
+    // of the three; an effort the app does not take is refused up front.
+    try expectError(a, "agent_open", try rig.call(.agent_open, "{\"app\":\"claude\",\"host\":\"-oProxyCommand=sh\"}"), "invalid_args");
+    try expectError(a, "agent_open", try rig.call(.agent_open, "{\"app\":\"claude\",\"host\":\"box\",\"transport\":\"pigeon\"}"), "invalid_args");
+    try expectError(a, "agent_open", try rig.call(.agent_open, "{\"app\":\"claude\",\"effort\":\"extreme\"}"), "invalid_args");
     try expectError(a, "agent_open", try rig.call(.agent_open, "{\"app\":\"claude\",\"binary\":\"claude; rm -rf /\"}"), "invalid_args");
     try expectError(a, "agent_open", try rig.call(.agent_open, "{\"app\":\"claude\",\"binary\":\"/nonexistent/claude\"}"), "unavailable");
     try expectError(a, "agent_open", try rig.call(.agent_open, "{\"app\":\"claude\",\"cwd\":\"relative\"}"), "invalid_args");
     try expectError(a, "agent_open", try rig.call(.agent_open, "{\"app\":\"claude\",\"model\":\"a\\nb\"}"), "invalid_args");
     try expectError(a, "agent_attach", try rig.call(.agent_attach, "{\"term\":99,\"app\":\"claude\"}"), "not_found");
     try expectError(a, "agent_attach", try rig.call(.agent_attach, "{\"term\":1,\"app\":\"opencode\"}"), "invalid_args");
-    try expectError(a, "agent_adapters", try rig.call(.agent_adapters, "{\"host\":\"box\"}"), "unavailable");
+    try expectError(a, "agent_adapters", try rig.call(.agent_adapters, "{\"host\":\"a host\"}"), "invalid_args");
     inline for (.{ Tool.agent_send, Tool.agent_wait, Tool.agent_read, Tool.agent_answer, Tool.agent_set, Tool.agent_interrupt, Tool.agent_close }) |tool| {
         try expectError(a, @tagName(tool), try rig.call(tool, "{\"agent\":\"claude-9\"}"), "not_found");
     }
@@ -2094,18 +2811,7 @@ test "the waiter socket: subscribe, wake once, and end when the agent closes" {
     }.f;
     const readLine = struct {
         fn f(fd: c_int, buf: []u8) ![]const u8 {
-            var used: usize = 0;
-            const deadline = clock.nowMs() + 3000;
-            while (clock.nowMs() < deadline) {
-                service(clock.nowMs());
-                var pfd = c.struct_pollfd{ .fd = fd, .events = c.POLLIN, .revents = 0 };
-                if (c.poll(&pfd, 1, 20) <= 0) continue;
-                const n = c.read(fd, buf[used..].ptr, buf.len - used);
-                if (n <= 0) return buf[0..used];
-                used += @intCast(n);
-                if (std.mem.indexOfScalar(u8, buf[0..used], '\n') != null) return buf[0..used];
-            }
-            return error.Timeout;
+            return readLineFor(fd, buf, 3000);
         }
     }.f;
 
@@ -2141,8 +2847,39 @@ test "the waiter socket: subscribe, wake once, and end when the agent closes" {
     try testing.expect(std.mem.indexOf(u8, all, "all done") != null);
     // The assistant's own cursor is untouched by the waiters.
     try testing.expectEqual(@as(usize, 1), e.cursor.pendingAlwaysOn(e.agent.queue()));
+
+    // The same watch command, run again after a later call handed the
+    // assistant that done, waits for what is new: it never re-wakes on an
+    // event the assistant already has (a baked-in cursor went stale).
+    try testing.expect((try e.cursor.take(e.agent.queue(), .{}, clock.nowMs(), arena_state.allocator())) != null);
+    const tmpl = (try waiterTemplate(arena_state.allocator())).?;
+    try testing.expect(std.mem.indexOf(u8, tmpl, "--since") == null);
+    const again = try connectSub("{\"agent\":\"claude-1\"}\n");
+    defer _ = c.close(again);
+    try testing.expectError(error.Timeout, readLineFor(again, &buf, 400));
+    _ = try ag.source.screen.queue.push(clock.nowMs(), .done, null, "second turn", "");
+    const fresh = try readLine(again, &buf);
+    try testing.expect(std.mem.indexOf(u8, fresh, "second turn") != null);
+    try testing.expect(std.mem.indexOf(u8, fresh, "all done") == null);
+
     _ = try closeTool(arena_state.allocator(), .null, e);
     try testing.expect(std.mem.indexOf(u8, try readLine(follow, &buf), "agent closed") != null);
+}
+
+/// Read one waiter line within `ms`, servicing the server meanwhile.
+fn readLineFor(fd: c_int, buf: []u8, ms: i64) ![]const u8 {
+    var used: usize = 0;
+    const deadline = clock.nowMs() + ms;
+    while (clock.nowMs() < deadline) {
+        service(clock.nowMs());
+        var pfd = c.struct_pollfd{ .fd = fd, .events = c.POLLIN, .revents = 0 };
+        if (c.poll(&pfd, 1, 20) <= 0) continue;
+        const n = c.read(fd, buf[used..].ptr, buf.len - used);
+        if (n <= 0) return buf[0..used];
+        used += @intCast(n);
+        if (std.mem.indexOfScalar(u8, buf[0..used], '\n') != null) return buf[0..used];
+    }
+    return error.Timeout;
 }
 
 const fake_daemon = @import("launch_cleanup_test.zig");
@@ -2222,17 +2959,35 @@ const FakeApp = struct {
     }
 
     fn run(self: *FakeApp) void {
+        var picker = false;
+        var choice: u8 = 0;
         while (!self.stop.load(.acquire)) {
             const f = self.daemon.primary_peer.recvExpectFor(&.{.input}, 50) catch continue;
             defer f.deinit(testing.allocator);
-            for (f.payload) |b| switch (b) {
-                '\r' => {
-                    self.respond(self.typed.items) catch self.failed.store(true, .release);
-                    self.typed.clearRetainingCapacity();
-                },
-                0x1b => self.typed.clearRetainingCapacity(),
-                else => self.typed.append(testing.allocator, b) catch self.failed.store(true, .release),
-            };
+            for (f.payload) |b| {
+                if (picker) {
+                    switch (b) {
+                        '1'...'9' => choice = b - '0',
+                        // Session only: applied a moment later, as Claude Code does.
+                        's' => {
+                            picker = false;
+                            _ = c.usleep(400_000);
+                            self.draw(if (choice == 1) MODEL_SET_SONNET else MODEL_SET_HAIKU) catch self.failed.store(true, .release);
+                        },
+                        else => {},
+                    }
+                    continue;
+                }
+                switch (b) {
+                    '\r' => {
+                        picker = std.mem.eql(u8, self.typed.items, "/model");
+                        self.respond(self.typed.items) catch self.failed.store(true, .release);
+                        self.typed.clearRetainingCapacity();
+                    },
+                    0x1b => self.typed.clearRetainingCapacity(),
+                    else => self.typed.append(testing.allocator, b) catch self.failed.store(true, .release),
+                }
+            }
         }
     }
 
@@ -2243,13 +2998,18 @@ const FakeApp = struct {
             try self.draw("\r\x1b[5A\x1b[Jclaude: permission answered No\r\n" ++ live);
             return self.draw(APP_END);
         }
+        if (std.mem.eql(u8, line, "/model")) return self.draw("\x1b]133;A\x07" ++ erase ++ "you: /model\r\n" ++ MODEL_PICKER);
         try self.draw(try std.fmt.bufPrint(&buf, "\x1b]133;A\x07" ++ APP_BUSY ++ erase ++ "you: {s}\r\n" ++ live, .{line}));
         if (std.mem.indexOf(u8, line, "permission") != null) return self.draw(APP_PERMISSION);
-        if (std.mem.startsWith(u8, line, "/effort")) return self.draw(erase ++ "Set effort level to high\r\n" ++ live ++ APP_END);
         try self.draw(try std.fmt.bufPrint(&buf, erase ++ "claude: echo: {s}\r\n" ++ live, .{line}));
         return self.draw(APP_END);
     }
 };
+
+const MODEL_PICKER = "Select model\r\n1. Sonnet 4.5\r\n2. Haiku 4.5 (selected)\r\nSelect with numbers [1-2]. Then Enter to submit or Escape to cancel:";
+const MODEL_SET = "\r\x1b[3A\x1b[JSet model to {s} for this session only\r\n" ++ live ++ "\x1b]133;C\x07\x1b]133;D\x07\x07";
+const MODEL_SET_HAIKU = std.fmt.comptimePrint(MODEL_SET, .{"Haiku 4.5"});
+const MODEL_SET_SONNET = std.fmt.comptimePrint(MODEL_SET, .{"Sonnet 4.5"});
 
 fn shaped(arena: std.mem.Allocator, tool: []const u8, result: []const u8) !std.json.ObjectMap {
     const parsed = try mcp.expectToolResultShape(arena, tool, result);
@@ -2305,8 +3065,29 @@ test "every agent tool answers in its declared shape: a scripted Claude Code on 
     try testing.expectEqualStrings("done", answered.get("outcome").?.string);
     try testing.expectEqualStrings("permission answered No", answered.get("message").?.string);
 
-    const set = try shaped(a, "agent_set", try rig.call(.agent_set, "{\"effort\":\"high\"}"));
-    try testing.expectEqualStrings("high", set.get("effort").?.string);
+    // The model picker: agent_set returns only once the app confirmed the
+    // change (it does so 400 ms after `s`), so the next call finds it idle.
+    const before_set = (try shaped(a, "agent_read", try rig.call(.agent_read, "{}"))).get("next_since").?.integer;
+    const set = try shaped(a, "agent_set", try rig.call(.agent_set, "{\"model\":\"haiku\",\"timeout_ms\":10000}"));
+    try testing.expectEqualStrings("haiku", set.get("model").?.string);
+    try testing.expectEqualStrings("Set model to Haiku 4.5 for this session only", set.get("confirmation").?.string);
+    try testing.expect(!set.get("relaunched").?.bool);
+    try testing.expectEqualStrings("idle", set.get("state").?.string);
+    // The adapter's own picker raised nothing for the assistant.
+    for (set.get("events").?.array.items) |ev| try testing.expect(!std.mem.eql(u8, ev.object.get("kind").?.string, "needs_input"));
+    const after_set = try shaped(a, "agent_send", try rig.call(.agent_send, "{\"text\":\"right after\",\"timeout_ms\":10000}"));
+    try testing.expectEqualStrings("echo: right after", after_set.get("message").?.string);
+    // The transcript says what the adapter did, not `user: /model`.
+    var arg_buf: [64]u8 = undefined;
+    const set_read = try shaped(a, "agent_read", try rig.call(.agent_read, try std.fmt.bufPrint(&arg_buf, "{{\"since\":{d}}}", .{before_set})));
+    const set_recs = set_read.get("records").?.array.items;
+    try testing.expectEqual(@as(usize, 3), set_recs.len);
+    try testing.expectEqualStrings("notice", set_recs[0].object.get("kind").?.string);
+    try testing.expect(std.mem.indexOf(u8, set_recs[0].object.get("text").?.string, "model set to haiku for this session: Set model to Haiku 4.5") != null);
+    try testing.expectEqualStrings("right after", set_recs[1].object.get("text").?.string);
+    // Effort only takes at launch; a term_open terminal cannot be relaunched.
+    try expectError(a, "agent_set", try rig.call(.agent_set, "{\"effort\":\"high\"}"), "refused");
+    try expectError(a, "agent_set", try rig.call(.agent_set, "{\"effort\":\"turbo\"}"), "invalid_args");
     const stopped = try shaped(a, "agent_interrupt", try rig.call(.agent_interrupt, "{}"));
     try testing.expect(stopped.get("interrupted").?.bool);
     _ = try shaped(a, "agent_wait", try rig.call(.agent_wait, "{\"timeout_ms\":300}"));

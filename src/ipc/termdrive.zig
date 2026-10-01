@@ -236,6 +236,16 @@ pub fn buildSshBootstrap(
 ) ![]u8 {
     const script = try buildBootstrapScript(allocator, nonce, bash_script, zsh_env, zsh_script);
     defer allocator.free(script);
+    return sshScriptCommand(allocator, nonce, script);
+}
+
+/// The ssh remote command that runs `script` under `sh` on the remote
+/// host whatever its login shell (fish, csh: the command is quote-free),
+/// with the terminal still on stdin: base64 into `/tmp/.sk_ssh_<nonce>`,
+/// then `sh` that file. The script's first line must remove the file
+/// (`rm -f /tmp/.sk_ssh_<nonce>`). Needs `base64` on the remote. Never
+/// put a secret in `script`: it rides the ssh argv.
+pub fn sshScriptCommand(allocator: std.mem.Allocator, nonce: []const u8, script: []const u8) ![]u8 {
     const enc = std.base64.standard.Encoder;
     const b64 = try allocator.alloc(u8, enc.calcSize(script.len));
     defer allocator.free(b64);
@@ -551,6 +561,9 @@ pub const Term = struct {
     /// retried, so a dead host costs ONE bounded connect attempt, not
     /// one per drain.
     reattach_spent: bool = false,
+    /// `exited` because the link to a remote-mux session was lost, not
+    /// because the session ended: it may still run (`reconnect`).
+    lost: bool = false,
     /// One full-length first-prompt wait already expired with no mark:
     /// later commandToken calls fail fast instead of re-burning it.
     /// Never blocks success — a mark that shows up later still wins.
@@ -647,6 +660,7 @@ pub const Term = struct {
         argv: []const []const u8,
         cols: u16,
         rows: u16,
+        opts: SpawnOpts,
     ) Error!*Term {
         var conn = muxconnect.connectSsh(allocator, host) catch return Error.SpawnFailed;
         errdefer conn.deinit();
@@ -654,12 +668,18 @@ pub const Term = struct {
         conn.setNonBlocking();
         if (!conn.caps.kill_origin_fence) return Error.SpawnFailed;
 
-        name_counter += 1;
-        const name = std.fmt.allocPrint(allocator, "mcpterm-{d}-{d}", .{ c.getpid(), name_counter }) catch
-            return Error.OutOfMemory;
+        const name = if (opts.name) |n|
+            allocator.dupe(u8, n) catch return Error.OutOfMemory
+        else blk: {
+            name_counter += 1;
+            break :blk std.fmt.allocPrint(allocator, "mcpterm-{d}-{d}", .{ c.getpid(), name_counter }) catch
+                return Error.OutOfMemory;
+        };
         errdefer allocator.free(name);
 
-        conn.sendJson(.spawn, .{ .name = name, .argv = argv, .rows = rows, .cols = cols, .ttl_secs = 3600 }) catch return Error.SpawnFailed;
+        // `env`/`cwd` are long-standing spawn fields; shell integration is
+        // never injected remotely (the scripts live on THIS host).
+        conn.sendJson(.spawn, .{ .name = name, .argv = argv, .rows = rows, .cols = cols, .ttl_secs = 3600, .env = opts.env, .cwd = opts.cwd }) catch return Error.SpawnFailed;
         const ok = conn.recvExpectFor(&.{.ok}, 15_000) catch return Error.SpawnFailed;
         defer ok.deinit(allocator);
         return finishSpawn(
@@ -709,6 +729,23 @@ pub const Term = struct {
         errdefer conn.deinit();
         conn.setNonBlocking();
         return attachConn(allocator, &conn, name, origin_id);
+    }
+
+    /// Attach a session already running on `host`'s own daemon (a durable
+    /// instance picking a remote agent up again); it is reattached on
+    /// transport loss like a `spawnRemoteMux` one.
+    pub fn attachRemote(
+        allocator: std.mem.Allocator,
+        host: []const u8,
+        name: []const u8,
+        origin_id: wire.SessionOriginId,
+    ) Error!*Term {
+        var conn = muxconnect.connectSsh(allocator, host) catch return Error.SpawnFailed;
+        errdefer conn.deinit();
+        conn.setNonBlocking();
+        const owned = allocator.dupe(u8, name) catch return Error.OutOfMemory;
+        errdefer allocator.free(owned);
+        return attachBuild(allocator, &conn, owned, origin_id, "", false, host, 15_000);
     }
 
     /// Attach session `name` over a connection that already spoke hello;
@@ -921,38 +958,56 @@ pub const Term = struct {
     /// is final for THIS drop (exited); success re-arms the shot for
     /// the next drop. Local terms share their daemon's fate: exited.
     fn transportLost(self: *Term) void {
-        const host = self.remote_host orelse {
-            self.exited = true;
-            return;
-        };
-        if (self.reattach_spent) {
+        if (self.remote_host == null) {
             self.exited = true;
             return;
         }
-        self.reattach_spent = true;
-        var conn = muxconnect.connectSshOnce(self.allocator, host) catch {
+        if (self.reattach_spent or !self.reattachOnce()) {
+            // The session may well live on: `lost` says it is the link
+            // that is gone, and `reconnect` may bring it back later.
             self.exited = true;
+            self.lost = true;
             return;
-        };
+        }
+        self.reattach_spent = false;
+    }
+
+    /// One bounded reattach of a remote-mux session over a fresh ssh
+    /// connection, resyncing the mirror from its snapshot.
+    fn reattachOnce(self: *Term) bool {
+        const host = self.remote_host orelse return false;
+        self.reattach_spent = true;
+        var conn = muxconnect.connectSshOnce(self.allocator, host) catch return false;
         conn.setNonBlocking();
         conn.sendAttach(self.name, .{
             .origin_id = if (self.origin_id_valid) &self.origin_id else "",
             .kind = "mcp",
         }) catch {
             conn.deinit();
-            self.exited = true;
-            return;
+            return false;
         };
         const snap = conn.recvExpectFor(&.{.snapshot}, 15_000) catch {
             conn.deinit();
-            self.exited = true;
-            return;
+            return false;
         };
         defer snap.deinit(self.allocator);
         self.conn.deinit();
         self.conn = conn;
         self.applySnapshot(snap.payload) catch {};
+        return true;
+    }
+
+    /// Try once more to reach a remote-mux session whose link was lost
+    /// (`lost`). Blocks for one bounded ssh connect (~15 s worst case), so
+    /// callers rate-limit it. The mirror is resynced (`snapshots` moves).
+    /// @return whether the session is reachable again.
+    pub fn reconnect(self: *Term) bool {
+        if (!self.lost) return !self.exited;
+        if (!self.reattachOnce()) return false;
+        self.lost = false;
+        self.exited = false;
         self.reattach_spent = false;
+        return true;
     }
 
     /// Time-boxed like appdrive.drain: a flooding shell (`cat` of a

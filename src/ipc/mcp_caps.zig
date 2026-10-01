@@ -425,12 +425,13 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
         try res.text("session lifetime: the daemon and its sessions survive this server's restarts and are reattached on reconnect; there is no idle timeout");
 
     // Sub-agents (the agent_* tools): available in isolated/durable mode,
-    // local only in this build, woken through the waiter command.
+    // here or on an SSH host, woken through the waiter command.
     {
         const mcp_agent = @import("mcp_agent.zig");
         const agents_ok = mcp_agent.available();
+        const agent_ssh = agents_ok and findExecutable(arena, "ssh") != null;
         try res.fact("agents", agents_ok);
-        try res.fact("agent_ssh", false);
+        try res.fact("agent_ssh", agent_ssh);
         const ids: []const []const u8 = if (agents_ok) mcp_agent.adapterIds(arena) catch &.{} else &.{};
         try res.fact("agent_adapters", ids);
         if (agents_ok) {
@@ -438,7 +439,7 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
         } else try res.raw("agent_waiter", "null");
         try res.fact("open_agents", mcp_agent.state.entries.items.len);
         if (agents_ok)
-            try res.textf("sub-agents: agent_open runs one of {d} adapter(s) on this machine (not over SSH yet); results carry a watch_command that wakes you when it needs attention", .{ids.len})
+            try res.textf("sub-agents: agent_open runs one of {d} adapter(s) on this machine{s}; results carry a watch_command that wakes you when it needs attention", .{ ids.len, if (agent_ssh) " or on an SSH host (host)" else " (no ssh client here, so not on SSH hosts)" })
         else
             try res.text("sub-agents (agent_*) are unavailable in --shared mode: they run on an isolated or durable instance's private daemon");
     }

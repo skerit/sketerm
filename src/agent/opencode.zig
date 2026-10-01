@@ -1122,6 +1122,11 @@ pub const Endpoint = struct {
 /// Every synchronous request's deadline (loopback; `/provider` is the
 /// slowest at a few MiB).
 pub const REQUEST_TIMEOUT_MS: i64 = 10_000;
+/// The readiness route (`probeHealth`).
+pub const HEALTH_PATH = "/global/health";
+/// One readiness probe's deadline: short, because a request the starting
+/// server swallowed is never answered.
+pub const HEALTH_PROBE_MS: i64 = 1000;
 const RECONNECT_MIN_MS: i64 = 500;
 const RECONNECT_MAX_MS: i64 = 10_000;
 
@@ -1212,6 +1217,26 @@ pub const Api = struct {
     fn fail(self: *Api, comptime fmt: []const u8, args: anytype) void {
         const s = std.fmt.bufPrint(&self.problem_buf, fmt, args) catch self.problem_buf[0..];
         self.problem_len = s.len;
+    }
+
+    /// One readiness probe: `GET /global/health` with its own deadline.
+    /// A starting opencode accepts connections seconds before it answers,
+    /// and a request sent in that window is never answered at all; a
+    /// probe that times out drops its connection, so the next one dials
+    /// fresh. Call it until true before `connect`.
+    /// @return true once the server answered 200; error.Unauthorized when
+    /// it refuses the password (no point waiting).
+    pub fn probeHealth(self: *Api, deadline_ms: i64) !bool {
+        const r = self.client.call(.{ .method = .GET, .path = HEALTH_PATH }, deadline_ms) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            self.fail("GET " ++ HEALTH_PATH ++ ": {s}", .{@errorName(err)});
+            return false;
+        };
+        defer r.deinit(self.allocator);
+        if (r.status == 200) return true;
+        self.fail("GET " ++ HEALTH_PATH ++ ": {d} {s}", .{ r.status, r.body[0..@min(r.body.len, 200)] });
+        if (r.status == 401) return error.Unauthorized;
+        return false;
     }
 
     /// Open the event stream first (nothing is missed), then drive
@@ -2194,4 +2219,45 @@ test "api: a refused session create is Rejected with the status in problem()" {
     defer api.deinit();
     try t.expectError(error.Rejected, api.connect(null, clock.nowMs()));
     try t.expect(std.mem.indexOf(u8, api.problem(), "POST /session: 401") != null);
+}
+
+test "api: a starting server that swallows requests is waited out by short fresh health probes" {
+    // opencode listens ~2 s after launch but answers only ~4.5 s in, and a
+    // request sent in between is never answered: one long request (the
+    // event stream's 10 s) hangs and fails; short probes get through.
+    var srv: testserver.Server = .{};
+    srv.deaf_until_ms = clock.nowMs() + 1200;
+    try srv.start(t.allocator);
+    defer srv.deinit();
+    srv.route("GET " ++ HEALTH_PATH, .{ .body = "{\"healthy\":true}" });
+    var set = adapter.Set.init(t.allocator);
+    defer set.deinit();
+    try set.loadShipped();
+    var api = try Api.init(t.allocator, set.get("opencode").?, .{}, .{ .port = srv.port(), .password = "pw" });
+    defer api.deinit();
+
+    // The first probe lands in the deaf window: it times out, not hangs.
+    const t0 = clock.nowMs();
+    try t.expect(!try api.probeHealth(t0 + 300));
+    try t.expect(clock.nowMs() - t0 < 1000);
+    try t.expect(std.mem.indexOf(u8, api.problem(), "Timeout") != null);
+    var probes: u32 = 1;
+    while (!try api.probeHealth(clock.nowMs() + 300)) {
+        probes += 1;
+        if (clock.nowMs() - t0 > 5000) return error.TestServerNeverAnswered;
+    }
+    try t.expect(probes >= 2);
+    try t.expect(clock.nowMs() - t0 >= 1100);
+    // Every probe after a swallowed one dialed fresh: the server saw as
+    // many connections as probes (the answered one keeps its keep-alive).
+    try t.expect(srv.connections() >= probes);
+
+    // A wrong password is final, not something to wait out.
+    var bad: testserver.Server = .{};
+    bad.auth = "Basic b3BlbmNvZGU6cmlnaHQ=";
+    try bad.start(t.allocator);
+    defer bad.deinit();
+    var api2 = try Api.init(t.allocator, set.get("opencode").?, .{}, .{ .port = bad.port(), .password = "wrong" });
+    defer api2.deinit();
+    try t.expectError(error.Unauthorized, api2.probeHealth(clock.nowMs() + 1000));
 }

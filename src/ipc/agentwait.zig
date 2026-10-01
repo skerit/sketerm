@@ -138,15 +138,15 @@ fn firstLine(s: []const u8) []const u8 {
     return std.mem.trimEnd(u8, trimmed[0..nl], " \t\r");
 }
 
-/// The exact command that waits on `agent` with `filter`, woken by events
-/// after `since`: the running executable, absolute, with every argument
-/// shell-quoted.
-pub fn watchCommand(arena: std.mem.Allocator, exe: []const u8, socket: []const u8, agent: []const u8, filter: events.Filter, since: u64) ![]const u8 {
+/// The exact command that waits on `agent` with `filter`: the running
+/// executable, absolute, with every argument shell-quoted. It carries no
+/// cursor, so it never goes stale: it wakes for events not yet handed to
+/// the assistant when it subscribes, however many calls later it runs.
+pub fn watchCommand(arena: std.mem.Allocator, exe: []const u8, socket: []const u8, agent: []const u8, filter: events.Filter) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     try shellquote.appendQuoted(&out, arena, exe);
     try out.appendSlice(arena, " mcp " ++ SUBCOMMAND ++ " --socket ");
     try shellquote.appendQuoted(&out, arena, socket);
-    try out.print(arena, " --since {d}", .{since});
     if (filter.match) |m| {
         try out.appendSlice(arena, " --match ");
         try shellquote.appendQuoted(&out, arena, m);
@@ -170,6 +170,9 @@ pub const HELP =
     \\TEXT with --match (rate limited: the rest are summarised). Exits after
     \\the first wake-up unless --follow; always prints `watch ended: REASON`
     \\when the server goes away, the agent closes or --timeout runs out.
+    \\It wakes for events the agent_* tools have not handed out yet when it
+    \\connects (so the same command can be run again later); --since SEQ
+    \\wakes for every event after SEQ instead.
     \\The agent_* tools hand out the exact command as `watch_command`.
     \\
     \\Exit status: 0 woken or ended normally, 1 the server went away,
@@ -346,16 +349,21 @@ test "cli arguments: flags anywhere, one agent, numbers checked" {
     try t.expectError(error.UnknownFlag, Cli.parse(&.{"--bogus"}));
 }
 
-test "the watch command round-trips through the cli grammar" {
+test "the watch command round-trips through the cli grammar and bakes in no cursor" {
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    const cmd = try watchCommand(a, "/usr/bin/sketerm", "/run/user/1/sketerm/mcp-tmp-9/agents.sock", "claude-1", .{ .match = "it's done", .messages = true }, 12);
-    try t.expectEqualStrings("/usr/bin/sketerm mcp agent-wait --socket /run/user/1/sketerm/mcp-tmp-9/agents.sock --since 12 --match 'it'\\''s done' --messages claude-1", cmd);
+    const cmd = try watchCommand(a, "/usr/bin/sketerm", "/run/user/1/sketerm/mcp-tmp-9/agents.sock", "claude-1", .{ .match = "it's done", .messages = true });
+    try t.expectEqualStrings("/usr/bin/sketerm mcp agent-wait --socket /run/user/1/sketerm/mcp-tmp-9/agents.sock --match 'it'\\''s done' --messages claude-1", cmd);
+    // A cursor baked in went stale with the next tool call: a reused
+    // command woke on an event the assistant already had.
+    try t.expect(std.mem.indexOf(u8, cmd, "--since") == null);
     // What sh would hand the cli after `mcp agent-wait`.
-    const o = try Cli.parse(&.{ "--socket", "/run/user/1/sketerm/mcp-tmp-9/agents.sock", "--since", "12", "--match", "it's done", "--messages", "claude-1" });
+    const o = try Cli.parse(&.{ "--socket", "/run/user/1/sketerm/mcp-tmp-9/agents.sock", "--match", "it's done", "--messages", "claude-1" });
     try t.expectEqualStrings("it's done", o.match.?);
-    try t.expectEqual(@as(u64, 12), o.since.?);
+    try t.expect(o.since == null);
+    // --since stays an explicit option.
+    try t.expectEqual(@as(u64, 12), (try Cli.parse(&.{ "--since", "12", "claude-1" })).since.?);
 }
 
 test "wake lines: encode, parse, and one compact printed line" {
