@@ -106,13 +106,38 @@ pub fn answerIndex(records: []const Record, job: u32) ?usize {
 /// The record ids handed to the assistant, per agent.
 pub const Handed = struct {
     ids: std.DynamicBitSetUnmanaged = .{},
+    /// Content keys of handed-out records: a screen source can re-capture
+    /// an unchanged record under a NEW id (Claude Code reprints its
+    /// transcript below the old copy), and that must not be a new delivery.
+    texts: std.AutoHashMapUnmanaged(u64, void) = .empty,
+
+    /// Shorter texts are not deduplicated by content: two jobs may well
+    /// both answer "Done.".
+    pub const CONTENT_MIN_CHARS: usize = 80;
 
     pub fn deinit(self: *Handed, alloc: std.mem.Allocator) void {
         self.ids.deinit(alloc);
+        self.texts.deinit(alloc);
     }
 
-    pub fn has(self: *const Handed, id: u64) bool {
-        return id < self.ids.bit_length and self.ids.isSet(@intCast(id));
+    fn contentKey(r: Record) ?u64 {
+        if (r.kind == .user or r.text.len < CONTENT_MIN_CHARS) return null;
+        var h = std.hash.Wyhash.init(@intFromEnum(r.kind));
+        h.update(r.text);
+        return h.final();
+    }
+
+    /// Whether `r` was handed out, by id or by identical content.
+    pub fn has(self: *const Handed, r: Record) bool {
+        if (r.id < self.ids.bit_length and self.ids.isSet(@intCast(r.id))) return true;
+        const k = contentKey(r) orelse return false;
+        return self.texts.contains(k);
+    }
+
+    /// Mark `r` handed out, by id and by content.
+    pub fn markRecord(self: *Handed, alloc: std.mem.Allocator, r: Record) !void {
+        try self.mark(alloc, r.id);
+        if (contentKey(r)) |k| try self.texts.put(alloc, k, {});
     }
 
     pub fn mark(self: *Handed, alloc: std.mem.Allocator, id: u64) !void {
@@ -122,7 +147,7 @@ pub const Handed = struct {
 
     /// Mark every record `sel` returns.
     pub fn markSelection(self: *Handed, alloc: std.mem.Allocator, records: []const Record, sel: Selection) !void {
-        for (sel.picked) |i| try self.mark(alloc, records[i].id);
+        for (sel.picked) |i| try self.markRecord(alloc, records[i]);
     }
 };
 
@@ -268,7 +293,7 @@ pub fn select(alloc: std.mem.Allocator, records: []const Record, jobs: []const u
                 .selected => r.kind != .assistant or i == last or substantive(r),
                 .all => true,
             };
-            if (take and handed != null and handed.?.has(r.id)) {
+            if (take and handed != null and handed.?.has(r)) {
                 s.returned_before += 1;
                 if (earlier == null or earlier.? != ans) earlier = i;
             } else if (take) {
@@ -614,6 +639,26 @@ test "jobs after a since; all honours since and limit" {
     defer t.allocator.free(a);
     try t.expectEqualSlices(u64, &.{5}, a);
     try t.expect(all.more);
+}
+
+
+test "a record re-captured under a new id with unchanged text is not delivered again" {
+    const long = "Both review defects are fixed and pushed: the address-class fact moved into AddressScope and the tests cover both databases.";
+    const recs = [_]Record{
+        .{ .id = 5, .kind = .assistant, .text = @constCast(long), .job = 0, .segment_final = true },
+        .{ .id = 9, .kind = .assistant, .text = @constCast(long), .job = 2, .segment_final = true },
+        .{ .id = 10, .kind = .assistant, .text = @constCast("Done."), .job = 2 },
+    };
+    var handed: Handed = .{};
+    defer handed.deinit(t.allocator);
+    try handed.markRecord(t.allocator, recs[0]);
+    try t.expect(handed.has(recs[1]));
+    try t.expect(!handed.has(recs[2]));
+    // A short text is never matched by content.
+    var short = recs[2];
+    short.id = 11;
+    try handed.markRecord(t.allocator, recs[2]);
+    try t.expect(!handed.has(short));
 }
 
 /// One default read as agent_read makes it: every job, nothing handed out

@@ -1115,7 +1115,7 @@ fn finish(arena: std.mem.Allocator, res: *Res, e: *Entry, dv: Delivered, watch: 
             var jobs: std.ArrayList(u32) = .empty;
             for (try select.jobsAfter(arena, recs, 0)) |x| if (x >= lo and x < j) try jobs.append(arena, x);
             try jobs.append(arena, j);
-            const fresh = if (select.answerIndex(recs, j)) |i| !e.handed.has(recs[i].id) else false;
+            const fresh = if (select.answerIndex(recs, j)) |i| !e.handed.has(recs[i]) else false;
             if (!fresh) message = null;
             const sel = try select.select(arena, recs, jobs.items, .{ .handed = &e.handed, .keep_empty = true });
             const name = if (lo < j) try std.fmt.allocPrint(arena, "jobs {d}-{d}", .{ lo, j }) else try std.fmt.allocPrint(arena, "job {d}", .{j});
@@ -1544,6 +1544,9 @@ fn openTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
 
     const filter = filterFrom(args);
     const ready = waitReady(e, deadline);
+    // An adopted conversation's past was the caller's before: it is
+    // history, never a first delivery (`since`/`detail:"all"` re-read it).
+    if (o.resume_id != null) for (e.agent.records()) |r| try e.handed.markRecord(e.allocator, r);
     var notes: std.ArrayList([]const u8) = .empty;
     // A model or effort the launch cannot take goes through the app.
     if (ready) {
