@@ -316,7 +316,12 @@ pub const McpLog = struct {
             @as(u32, @intCast(tm.tm_sec)),
         }) catch return null;
         _ = c.mkdir(sub.ptr, 0o700);
-        const dir = allocator.dupe(u8, sub) catch return null;
+        // Absolute, always: the session casts land in this dir, and the
+        // daemon that writes them resolves a relative path against ITS
+        // own cwd, so a relative `--log` silently recorded nothing.
+        var abs_buf: [c.PATH_MAX + 1]u8 = undefined;
+        const abs = c.realpath(sub.ptr, &abs_buf) orelse return null;
+        const dir = allocator.dupe(u8, std.mem.span(@as([*:0]const u8, @ptrCast(abs)))) catch return null;
         var pz: [4096]u8 = undefined;
         const path = std.fmt.bufPrintZ(&pz, "{s}/mcp-{d}.jsonl", .{ dir, c.getpid() }) catch {
             allocator.free(dir);
@@ -2119,6 +2124,30 @@ test "mcp log: entries and screenshot files land in the dir" {
     _ = c.rmdir(sub_z.ptr);
     const dir_z = try std.fmt.bufPrintZ(&pbuf, "{s}", .{dir});
     _ = c.rmdir(dir_z.ptr);
+}
+
+test "mcp log: a relative --log dir becomes an absolute session dir" {
+    // The daemon writes the session casts into this dir and resolves a
+    // relative path against its own cwd: a relative dir recorded nothing.
+    const t = std.testing;
+    var tmpl = "/tmp/sketerm-mcplog-rel-XXXXXX".*;
+    const base_ptr = c.mkdtemp(&tmpl) orelse return error.SkipZigTest;
+    const base = std.mem.span(@as([*:0]u8, @ptrCast(base_ptr)));
+    defer @import("../util/pathz.zig").removeTree(base);
+    const here = c.open(".", c.O_RDONLY | c.O_DIRECTORY);
+    if (here < 0) return error.SkipZigTest;
+    defer _ = c.close(here);
+    if (c.chdir(base_ptr) != 0) return error.SkipZigTest;
+    var log_opt = McpLog.open(t.allocator, "rel-logs");
+    _ = c.fchdir(here);
+    var log = log_opt orelse return error.OpenFailed;
+    defer log.close();
+    log_opt = null;
+    var real_buf: [c.PATH_MAX + 1]u8 = undefined;
+    const real_base = std.mem.span(@as([*:0]const u8, @ptrCast(c.realpath(base_ptr, &real_buf) orelse return error.SkipZigTest)));
+    try t.expect(log.dir[0] == '/');
+    try t.expect(std.mem.startsWith(u8, log.dir, real_base));
+    try t.expect(std.mem.indexOf(u8, log.dir, "/rel-logs/") != null);
 }
 
 test "instance name validation" {
