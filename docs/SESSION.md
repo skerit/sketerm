@@ -1,5 +1,33 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-01: sub-agent delivery: each record once, one event state, settled done
+
+From a session that ran 5-8 sub-agents for a day: a ~3k-char report came
+back 5-6 times, waiters woke for events the tools had already returned,
+idle-with-a-background-build and "servers overloaded" retries woke the
+caller, and an opencode compaction summary came back as a message.
+Delivery is now per RECORD (`select.Handed`): the default `agent_read` and
+every done result return only selected records not handed out before (a
+`jobs[].earlier` pointer instead of a repeat, "nothing new" in one line,
+metadata only for jobs this read returns something of, `jobs_pending` for
+jobs the cap kept out); `since` and `detail:"all"` re-read. Events have
+ONE delivery state per agent (`Event.delivered`) shared by results,
+`agent_wait` and every waiter, and a tool call holds its agent's waiters
+so its own result gets what happens meanwhile; events announcing a
+message carry its `record` id and a one-line preview, never the text.
+`done` means settled: Claude Code's `·  N shell` mode line (probed,
+2.1.286) is the `screen.background` rule and the `waiting_background`
+state; the done waits for the wake turn, or fires after 30 minutes with
+`background_tasks`. A `retrying` error wakes only with `retrying:true` /
+`--retrying` (`ErrorClass.wakesByDefault`). `agent_wait agents` and
+`agent-wait --any` watch several agents. opencode's compaction request
+(a `compaction` part) opens no job and its `summary: true` message is
+dropped; Claude Code never draws the summary. `agent_send timeout_ms:0`
+reports `sent` (`vocab.WaitOutcome`). Verified against real Claude Code
+(Haiku: waiting_background 18 s, one done after the wake turn, each
+record once, /compact a notice) and opencode-oc11 (summarize endpoint:
+two notices, no summary text, no wake).
+
 ## 2026-10-01: routes and the assistants report (watch-along across hosts, part 1)
 
 A host spec can now name a route, `route:[tor:]A[/B...][#KEY]`
