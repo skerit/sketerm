@@ -1,5 +1,39 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-01: Watch is view-only for terminals; no UDP notice on routes
+
+Watch on an assistant's agent terminal let typed text reach the agent:
+the seat lease never gated terminal input, and `read_only` cannot,
+because one-shot `mux send` attaches set it while typing. A watcher is
+now its own attach flag, `view_only` (capability `view_only`): the
+daemon drops that client's `.input` (keys, pastes, mouse reports,
+replies) and `.resize` (`Client.drivesTerminal`), forces it read-only
+so it never holds the seat, and echoes `view_only` in `control_state`;
+acquire/takeover ends it, which is what Take control sends. Terminal
+size stays last-resize-wins among clients that drive the session, so a
+watcher's window never resizes the agent. The flag rides the broker's
+`'A'` handoff as an appended byte; the echo, not the welcome flag, is
+the proof, since a new broker can front an adopted older worker.
+`client.Lease` is now the one lease vocabulary (`mux_cli.Lease` and
+`muxtabs.Lease` alias it; `AttachOptions.withLease` is the one mapping,
+so `mux attach --read-only` is view-only too). The GUI withholds input
+and resize itself whatever the daemon does, keeps the session's grid
+(the surface stops following its allocation, `refit` when control is
+taken), and its lease chip reads "View only" with Take control, or
+"View only - not enforced by this daemon" when no echo came. Routes are
+ssh end to end: `client.udpUpgradeEligible` keeps the Terminal's
+background UDP upgrade, `mux_cli.muxConnect`'s notice, the restore
+toast and the file browser status off them. Unit tests: a real `cat`
+session behind `daemon_serve` (watcher input/paste/mouse/resize dropped,
+a `mux send` read-only client still types, takeover restores both), the
+handoff byte, the GUI's old-daemon fallback over a socketpair, the
+lease mapping and the upgrade predicate. The focused
+`SKETERM_SMOKE_E2E_WATCH_ONLY` smoke-e2e gained a local agent-terminal
+stage and the same check on the remote route watch: typed and pasted
+text and SIGWINCH never reached the fake agent (it now logs both, with
+its size), Take control typed through, and neither the route pane nor
+the GUI's stderr mentions UDP.
+
 ## 2026-10-01: remote assistants in the GUI (watch-along across hosts, part 2)
 
 A GUI muxed into host A now sees the `sketerm mcp` servers on A and their
