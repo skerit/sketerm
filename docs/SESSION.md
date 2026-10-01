@@ -1,5 +1,31 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-02: SSH fixes: one options home, login-shell agents, aged masters, scp targets
+
+Every ssh/scp argv sketerm builds now takes its options from
+`sshroute.Plan.args(Leg)` -> `Args.options`: the mux client, the UDP
+bootstrap, route hops, deploy, and every MCP leg (`mcp_term.appendSshLeg`
+with `legs.interactive/script/scp/forward`). Each passes
+`ForwardX11=no` (a user's `ForwardX11 yes` printed X11 noise into
+`term_exec` output), and BatchMode, keepalives, forwardings and
+multiplexing are `Leg` fields instead of hand-written lists. The host
+rule of term_open, transfers, forwards, agents and web routes is
+`sshroute.validDestination`. Remote agents are probed and started in
+the user's LOGIN shell (`$SHELL -l -c` re-entering sh; bounded, marker
+based, plain fallback reported), with `path_prepend`, `login_shell` and
+a `binary_version` fact from the adapters' new `version_args`; on a
+remote daemon `env` rides the spawn under `SKETERM_AGENT_ENV_` and is
+restored after the profiles. `src/mux/sshmaster.zig` stops sketerm's
+own ControlMaster before a new connection rides a login older than
+`mux_ssh_master_max_age_secs` (default 3600) or on `fresh_login`; the
+age is the control socket's mtime, since `/proc` start times read 0
+under lxcfs. `term_open`/`agent_open`/`port_forward_open` report
+`ssh_master*` facts; a user_config ControlPath is reported, never
+stopped. `scp_put targets` uploads one file to up to 32 destinations,
+4 at a time, one result entry each. Verified against `ssh localhost`:
+claude found at `~/.local/bin/claude` 2.1.287 through the login shell
+(plain ssh has none on PATH), PONG; `-O stop` keeps open sessions alive.
+
 ## 2026-10-01: Watch is view-only for terminals; no UDP notice on routes
 
 Watch on an assistant's agent terminal let typed text reach the agent:
