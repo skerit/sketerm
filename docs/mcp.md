@@ -244,7 +244,7 @@ is kept by a `:ro` policy term. The full descriptions and schemas are in
 
 ### `core`
 
-- `capabilities` (read-only): Preflight report of what THIS MCP server can do right now: isolation mode, headless GUI-app support (headless_gui — launch_app renders apps into the mux daemon and NEVER needs a display, an X server or a sketerm window), whether a direct sketerm GUI control socket is attached (gui_socket; independent of the session panel relay and of headless GUI apps), the live panel transport (panels + panel_transport) and the saved-panel store (panels_store + panel_store), OCR (tesseract) availability, whether the web_* tools can run and against what (web + web_backend "gui"/"session"/"headless"/"none" — "session" adds web_session, the watchable Wayland app session the helper renders into — plus the sketerm-webengine path in web_helper; web_gui says whether the user granted the web_* tools their OWN browser and logins, web_gui_source where that came from and web_gui_transport which GUI socket they hold now; web_profiles says whether named cookie jars work, web_routes which per-tab network routes web_open can honour, web_engine_broker whether the mux daemon owns the engine's lifetime and web_engine_owner who started the one in use; web_downloads whether web_download can pull a url through a view; web_capture whether web_open can record the response bodies a headless view's page receives; web_engine_started whether an engine exists YET, since web_backend/web_watch/web_session are undetermined until it does), ssh/scp presence, the directory terminal asciicast recordings land in, the EFFECTIVE input-timing defaults (hold_ms/settle_ms/timeout_ms/click_retry, each marked when a SKETERM_MCP_* env override changed it from the built-in), whether sub-agents run here (agents, agent_adapters, agent_waiter, agent_ssh) and how agent_read selects what it returns (agent_read_select), and open session counts.
+- `capabilities` (read-only): Preflight report of what THIS MCP server can do right now: isolation mode, headless GUI-app support (headless_gui — launch_app renders apps into the mux daemon and NEVER needs a display, an X server or a sketerm window), whether a direct sketerm GUI control socket is attached (gui_socket; independent of the session panel relay and of headless GUI apps), the live panel transport (panels + panel_transport) and the saved-panel store (panels_store + panel_store), OCR (tesseract) availability, whether the web_* tools can run and against what (web + web_backend "gui"/"session"/"headless"/"none" — "session" adds web_session, the watchable Wayland app session the helper renders into — plus the sketerm-webengine path in web_helper; web_gui says whether the user granted the web_* tools their OWN browser and logins, web_gui_source where that came from and web_gui_transport which GUI socket they hold now; web_profiles says whether named cookie jars work, web_routes which per-tab network routes web_open can honour, web_engine_broker whether the mux daemon owns the engine's lifetime and web_engine_owner who started the one in use; web_downloads whether web_download can pull a url through a view; web_capture whether web_open can record the response bodies a headless view's page receives; web_engine_started whether an engine exists YET, since web_backend/web_watch/web_session are undetermined until it does), ssh/scp presence, the directory terminal asciicast recordings land in, the EFFECTIVE input-timing defaults (hold_ms/settle_ms/timeout_ms/click_retry, each marked when a SKETERM_MCP_* env override changed it from the built-in), whether sub-agents run here (agents, agent_adapters, agent_waiter, agent_ssh, agent_open_args_env for a wrapper's args and env) and how agent_read selects what it returns (agent_read_select), and open session counts.
 <!-- tool-reference:end -->
 
 ## Tool exposure policy
@@ -671,6 +671,27 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   opencode listens seconds before it answers and never answers what it
   received in between); a server that never does is a `timeout` saying it
   did not become ready.
+- **Wrappers: `binary` + `args` + `env`.** A wrapper script (a container
+  or profile launcher that passes unknown arguments on to the app) is run
+  by naming it as `binary` and giving its own options as `args` and the
+  variables it reads as `env`. `args` (at most 64, each 1-4096 bytes of
+  UTF-8 without control characters) go right after the binary and before
+  the adapter's arguments, on every process started with the binary:
+  Claude Code's one process (relaunches included), opencode's `serve` and
+  its attached TUI. `env` (at most 64; names `[A-Za-z_][A-Za-z0-9_]*`,
+  values 0-4096 bytes, same rules) is set on those processes and spared
+  by `unset_env`, so it reads as applied after it: `env:
+  {"CLAUDE_CAPTURE_PROFILE":"work"}` survives Claude Code's `CLAUDE*`
+  removal while every variable not named is still removed. Anything
+  else is refused as `invalid_args`, never cleaned up; spaces, quotes,
+  `$`, `;`, backticks and `*` arrive byte-exact (`launch.checkExtra` is
+  the one rule, `launch.startArgv` the one argv). Locally and on a remote
+  daemon the values ride the spawn request's environment; over plain
+  `ssh -tt` the start script exports them, and that script's base64 is on
+  the ssh command line, so `env` is NOT for secrets. Both are kept for an
+  effort relaunch and in a durable instance's descriptor; `agent_open`
+  reports `args` and `env_names` (never the values), and
+  `capabilities.agent_open_args_env` says the server takes them.
 - **Settings are confirmed, never assumed.** A recipe step `command` is
   the adapter's own command (`/model`): its turn is hidden from the
   transcript and the events, and the picker it opens is the recipe's to
@@ -786,7 +807,8 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   restarts: each has a 0600 descriptor in `<instance>/agents/` (adapter,
   session names and lifetime ids, opencode ports, password file, API
   session, host and transport, the forward, the conversation id and
-  launch values), and the next server re-attaches them, over ssh for a
+  launch values, `args` and `env` included; one written before those
+  existed reads as none), and the next server re-attaches them, over ssh for a
   remote daemon's sessions. A descriptor whose session is gone is
   removed.
 - **`agent_attach`** puts a screen adapter on a terminal `term_open`

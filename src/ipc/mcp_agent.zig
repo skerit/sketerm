@@ -77,7 +77,9 @@ const DESCRIPTOR_DIR = "agents";
 /// The waiter socket's name in the instance dir.
 pub const WAITER_SOCKET = "agents.sock";
 const MAX_SUBS = 32;
-const DESCRIPTOR_MAX_BYTES = 64 * 1024;
+/// Room for `launch.MAX_EXTRA` args and env values of the longest kind,
+/// JSON-escaped.
+const DESCRIPTOR_MAX_BYTES = 4 * 1024 * 1024;
 /// Bound on the remote binary probe (one ssh round trip).
 const PROBE_WAIT_MS: i64 = 30_000;
 /// Bound on a remote start asking for its secret.
@@ -153,6 +155,8 @@ pub const Entry = struct {
     /// What the launch passed and a relaunch repeats (owned).
     launch_model: ?[]u8 = null,
     launch_effort: ?[]u8 = null,
+    /// The caller's `args`/`env`, on every start of the binary (owned).
+    extra: launch.Extra = .{},
     /// A model chosen in the app since the launch, re-applied after a
     /// relaunch (owned).
     picked_model: ?[]u8 = null,
@@ -206,6 +210,7 @@ pub const Entry = struct {
         for ([_]?[]u8{ self.server_session, self.host, self.conversation, self.launch_model, self.launch_effort, self.picked_model }) |o| {
             if (o) |s| a.free(s);
         }
+        self.extra.free(a);
         for (self.recordings.items) |r| a.free(r);
         self.recordings.deinit(a);
         a.free(self.id);
@@ -1150,7 +1155,51 @@ const OpenOpts = struct {
     rows: u16,
     host: ?[]const u8,
     choice: transport_mod.Choice,
+    extra: launch.Extra,
 };
+
+/// agent_open's `args` (strings) and `env` (string values), checked by
+/// `launch.checkExtra`.
+fn extraOpts(arena: std.mem.Allocator, args: std.json.Value, loaded: *const adapter.Loaded, why: *Fail) !launch.Extra {
+    var x: launch.Extra = .{};
+    if (mcp.argValue(args, "args")) |v| if (v != .null) {
+        if (v != .array) {
+            why.* = .{ .code = .invalid_args, .msg = "args must be an array of strings" };
+            return error.Refused;
+        }
+        const out = try arena.alloc([]const u8, v.array.items.len);
+        for (v.array.items, out) |item, *o| {
+            if (item != .string) {
+                why.* = .{ .code = .invalid_args, .msg = "args must be an array of strings" };
+                return error.Refused;
+            }
+            o.* = item.string;
+        }
+        x.args = out;
+    };
+    if (mcp.argValue(args, "env")) |v| if (v != .null) {
+        if (v != .object) {
+            why.* = .{ .code = .invalid_args, .msg = "env must be an object of variable names to string values" };
+            return error.Refused;
+        }
+        const out = try arena.alloc(launch.EnvVar, v.object.count());
+        var it = v.object.iterator();
+        var i: usize = 0;
+        while (it.next()) |kv| : (i += 1) {
+            if (kv.value_ptr.* != .string) {
+                why.* = .{ .code = .invalid_args, .msg = try std.fmt.allocPrint(arena, "env {f} must be a string", .{std.json.fmt(kv.key_ptr.*, .{})}) };
+                return error.Refused;
+            }
+            out[i] = .{ .name = kv.key_ptr.*, .value = kv.value_ptr.string };
+        }
+        x.env = out;
+    };
+    if (try launch.checkExtra(arena, loaded.spec.launch, x)) |msg| {
+        why.* = .{ .code = .invalid_args, .msg = msg };
+        return error.Refused;
+    }
+    return x;
+}
 
 fn openOpts(arena: std.mem.Allocator, args: std.json.Value, loaded: *const adapter.Loaded, why: *Fail) !OpenOpts {
     const override = argStr(args, "binary");
@@ -1158,6 +1207,7 @@ fn openOpts(arena: std.mem.Allocator, args: std.json.Value, loaded: *const adapt
         why.* = .{ .code = .invalid_args, .msg = "binary must be a bare executable name or an absolute path of plain characters (no shell metacharacters, no ..)" };
         return error.Refused;
     };
+    const extra = try extraOpts(arena, args, loaded, why);
     inline for (.{ "model", "effort" }) |key| {
         if (argStr(args, key)) |v| if (!launch.validValue(v)) {
             why.* = .{ .code = .invalid_args, .msg = key ++ " must be 1-256 printable characters" };
@@ -1204,6 +1254,7 @@ fn openOpts(arena: std.mem.Allocator, args: std.json.Value, loaded: *const adapt
         .rows = @intCast(std.math.clamp(argInt(args, "rows") orelse DEFAULT_ROWS, 10, 300)),
         .host = host,
         .choice = choice,
+        .extra = extra,
     };
 }
 
@@ -1314,6 +1365,12 @@ fn openResult(arena: std.mem.Allocator, e: *Entry, ready: bool, sent: bool, note
     if (notes.len > 0) try res.textf("{d} note(s) below", .{notes.len});
     try res.fact("binary", e.binary);
     try res.fact("cwd", e.cwd);
+    // The values of `env` are never echoed: only what was set.
+    const env_names = try e.extra.names(arena);
+    try res.fact("args", e.extra.args);
+    try res.fact("env_names", env_names);
+    if (e.extra.args.len > 0 or env_names.len > 0)
+        try res.textf("launched with {d} extra arg(s) and env {s}", .{ e.extra.args.len, if (env_names.len == 0) "(none)" else try std.mem.join(arena, ", ", env_names) });
     if (e.recordings.items.len > 0) try res.fact("recordings", e.recordings.items);
     try res.fact("prompt_sent", sent);
     var extra: std.ArrayList(Block) = .empty;
@@ -1378,6 +1435,7 @@ fn setPlace(e: *Entry, where: Where, o: OpenOpts) !void {
     if (where.host) |h| e.host = try a.dupe(u8, h);
     if (o.model) |m| e.launch_model = try a.dupe(u8, m);
     if (o.effort) |x| e.launch_effort = try a.dupe(u8, x);
+    e.extra = try o.extra.clone(a);
 }
 
 /// Free a half-built entry whose agent is not set yet (the terms it
@@ -1399,11 +1457,14 @@ fn record(e: *Entry, t: *termdrive.Term, name: []const u8) void {
 const SpawnSpec = struct {
     name: []const u8,
     cwd: []const u8,
-    /// Local sessions only: the child environment ("KEY=VALUE").
+    /// Local sessions only: the secret's environment ("KEY=VALUE").
     env: []const []const u8 = &.{},
     /// Remote starts: the variable to read off the terminal (then the
     /// caller types its value at `launch.SECRET_PROMPT`).
     secret_env: ?[]const u8 = null,
+    /// The caller's `env`, on every transport: the spawn request's
+    /// environment, or exported by a plain-ssh start's script.
+    extra_env: []const launch.EnvVar = &.{},
 };
 
 /// Start `argv` on the agent's host as session `spec.name`. A remote
@@ -1413,10 +1474,12 @@ const SpawnSpec = struct {
 /// the outcome in `where`.
 fn spawnOn(arena: std.mem.Allocator, where: *Where, choice: transport_mod.Choice, argv: []const []const u8, spec: SpawnSpec, why: *Fail) !*termdrive.Term {
     const a = state.allocator;
+    const extra_kv = try (launch.Extra{ .env = spec.extra_env }).assignments(arena);
     const host = where.host orelse {
+        if (!try fitsExec(arena, argv, why)) return error.Refused;
         return termdrive.Term.spawnWith(a, argv, where.cols, where.rows, state.mux_sock, .{
             .name = spec.name,
-            .env = spec.env,
+            .env = try std.mem.concat(arena, []const u8, &.{ spec.env, extra_kv }),
             .cwd = spec.cwd,
             .shell_integration = false,
         }) catch {
@@ -1430,7 +1493,8 @@ fn spawnOn(arena: std.mem.Allocator, where: *Where, choice: transport_mod.Choice
             try arena.dupe([]const u8, &.{ "/bin/sh", "-c", try launch.remoteScript(arena, argv, .{ .secret_env = v }) })
         else
             argv;
-        const t = termdrive.Term.spawnRemoteMux(a, host, margv, where.cols, where.rows, .{ .name = spec.name, .cwd = spec.cwd }) catch {
+        if (!try fitsExec(arena, margv, why)) return error.Refused;
+        const t = termdrive.Term.spawnRemoteMux(a, host, margv, where.cols, where.rows, .{ .name = spec.name, .cwd = spec.cwd, .env = extra_kv }) catch {
             if (!undecided or choice == .mux) {
                 why.* = .{ .code = .unavailable, .msg = mcp_term.NO_REMOTE_MUX };
                 return error.Refused;
@@ -1441,16 +1505,18 @@ fn spawnOn(arena: std.mem.Allocator, where: *Where, choice: transport_mod.Choice
         return t;
     }
     // Plain ssh: the script rides the ssh command (base64, dialect-proof)
-    // and runs with the terminal on stdin; no secret ever goes in it.
+    // and runs with the terminal on stdin; no secret ever goes in it (the
+    // caller's env does: it is documented as no place for secrets).
     const nonce = try randomHex(arena, 6);
     const file = try std.fmt.allocPrint(arena, "/tmp/.sk_ssh_{s}", .{nonce});
-    const script = try launch.remoteScript(arena, argv, .{ .cleanup = file, .cwd = spec.cwd, .secret_env = spec.secret_env });
+    const script = try launch.remoteScript(arena, argv, .{ .cleanup = file, .cwd = spec.cwd, .secret_env = spec.secret_env, .env = spec.extra_env });
     var sargv: std.ArrayList([]const u8) = .empty;
     mcp_term.appendSshTt(arena, &sargv, host) catch {
         why.* = .{ .code = .refused, .msg = "cannot build the forced route for this host" };
         return error.Refused;
     };
     try sargv.append(arena, try termdrive.sshScriptCommand(arena, nonce, script));
+    if (!try fitsExec(arena, sargv.items, why)) return error.Refused;
     const t = termdrive.Term.spawnWith(a, sargv.items, where.cols, where.rows, state.mux_sock, .{
         .name = spec.name,
         .shell_integration = false,
@@ -1460,6 +1526,16 @@ fn spawnOn(arena: std.mem.Allocator, where: *Where, choice: transport_mod.Choice
     };
     where.transport = .ssh;
     return t;
+}
+
+/// Whether every string of a start's argv can be exec'd (a plain-ssh
+/// start carries `args` and `env` inside one quoted, base64'd string).
+fn fitsExec(arena: std.mem.Allocator, argv: []const []const u8, why: *Fail) !bool {
+    if (launch.argvFits(argv)) return true;
+    var longest: usize = 0;
+    for (argv) |s| longest = @max(longest, s.len);
+    why.* = .{ .code = .invalid_args, .msg = try std.fmt.allocPrint(arena, "the start command is too long once args and env are quoted for the shell ({d} bytes in one argument; at most {d}): pass fewer or shorter args/env", .{ longest, launch.MAX_EXEC_STRING - 1 }) };
+    return false;
 }
 
 /// Type `secret` into a remote start once it asks for it (echo is off
@@ -1502,13 +1578,13 @@ fn spawnScreen(arena: std.mem.Allocator, loaded: *const adapter.Loaded, binary: 
     const session = try std.fmt.allocPrint(arena, "agent-{s}", .{id});
     // A conversation id the agent owns, so a relaunch resumes exactly it.
     const conversation: ?[]const u8 = if (spec.launch.session_args.len > 0) try newUuid(arena) else null;
-    const argv = try launch.withUnsetEnv(arena, spec.launch.unset_env, try launch.mainArgv(arena, spec.launch, binary, .{
+    const argv = try launch.startArgv(arena, spec.launch, binary, o.extra, .{
         .model = o.model,
         .effort = o.effort,
         .cwd = o.cwd,
         .session = conversation,
-    }, .fresh));
-    const t = try spawnOn(arena, where, o.choice, argv, .{ .name = session, .cwd = o.cwd.? }, why);
+    }, .{ .main = .fresh });
+    const t = try spawnOn(arena, where, o.choice, argv, .{ .name = session, .cwd = o.cwd.?, .extra_env = o.extra.env }, why);
     errdefer t.deinit();
     const e = try newEntry(loaded, id, session, binary, o.cwd.?);
     errdefer dropBare(e);
@@ -1584,13 +1660,13 @@ fn spawnApi(arena: std.mem.Allocator, loaded: *const adapter.Loaded, binary: []c
     const session = try std.fmt.allocPrint(arena, "agent-{s}", .{id});
     const server_session = try std.fmt.allocPrint(arena, "agent-{s}-server", .{id});
     const what = try std.fmt.allocPrint(arena, "the {s} server", .{spec.name});
-    const server_argv = try launch.withUnsetEnv(arena, spec.launch.unset_env, try launch.mainArgv(arena, spec.launch, binary, .{
+    const server_argv = try launch.startArgv(arena, spec.launch, binary, o.extra, .{
         .port = port_str,
         .cwd = cwd,
         .model = o.model,
         .effort = o.effort,
-    }, .fresh));
-    const server = try spawnOn(arena, where, o.choice, server_argv, .{ .name = server_session, .cwd = cwd, .env = env, .secret_env = secret_env }, why);
+    }, .{ .main = .fresh });
+    const server = try spawnOn(arena, where, o.choice, server_argv, .{ .name = server_session, .cwd = cwd, .env = env, .secret_env = secret_env, .extra_env = o.extra.env }, why);
     errdefer server.deinit();
     if (secret_env != null) try typeSecret(arena, server, password, deadline, what, why);
 
@@ -1627,12 +1703,12 @@ fn spawnApi(arena: std.mem.Allocator, loaded: *const adapter.Loaded, binary: []c
         why.* = .{ .code = .failed, .msg = "the app's API created no session" };
         return error.Refused;
     };
-    const tui_argv = try launch.withUnsetEnv(arena, spec.launch.unset_env, try launch.attachArgv(arena, spec.launch, binary, .{
+    const tui_argv = try launch.startArgv(arena, spec.launch, binary, o.extra, .{
         .port = port_str,
         .cwd = cwd,
         .session = sid,
-    }));
-    const tui: ?*termdrive.Term = if (spec.launch.attach_args.len == 0) null else try spawnOn(arena, where, o.choice, tui_argv, .{ .name = session, .cwd = cwd, .env = env, .secret_env = secret_env }, why);
+    }, .attach);
+    const tui: ?*termdrive.Term = if (spec.launch.attach_args.len == 0) null else try spawnOn(arena, where, o.choice, tui_argv, .{ .name = session, .cwd = cwd, .env = env, .secret_env = secret_env, .extra_env = o.extra.env }, why);
     errdefer if (tui) |t| t.deinit();
     if (tui) |t| if (secret_env != null) try typeSecret(arena, t, password, deadline, "the attached client", why);
 
@@ -1966,21 +2042,31 @@ fn relaunch(arena: std.mem.Allocator, e: *Entry, action: agent_mod.Action, deadl
     return .{ .ok = .{ .relaunched = true } };
 }
 
+/// What a relaunch of `e` spawns: its binary with every launch value,
+/// the caller's `args`/`env` included.
+const Restart = struct { argv: []const []const u8, spec: SpawnSpec };
+
+fn restartOf(arena: std.mem.Allocator, e: *const Entry, model: ?[]const u8, effort: ?[]const u8, conversation: ?[]const u8, start: launch.Start) !Restart {
+    return .{
+        .argv = try launch.startArgv(arena, e.loaded.spec.launch, e.binary, e.extra, .{
+            .model = model,
+            .effort = effort,
+            .cwd = e.cwd,
+            .session = conversation,
+        }, .{ .main = start }),
+        .spec = .{ .name = e.session, .cwd = e.cwd, .extra_env = e.extra.env },
+    };
+}
+
 /// Spawn the agent's app again on its host as its session, for a relaunch.
 fn startAgain(arena: std.mem.Allocator, e: *Entry, model: ?[]const u8, effort: ?[]const u8, conversation: ?[]const u8, start: launch.Start, deadline: i64) !*termdrive.Term {
-    const spec = &e.loaded.spec;
-    const argv = try launch.withUnsetEnv(arena, spec.launch.unset_env, try launch.mainArgv(arena, spec.launch, e.binary, .{
-        .model = model,
-        .effort = effort,
-        .cwd = e.cwd,
-        .session = conversation,
-    }, start));
+    const r = try restartOf(arena, e, model, effort, conversation, start);
     var where = e.where();
     var why: Fail = undefined;
     // The ended session may hold its name a moment longer.
     const until = @min(deadline, clock.nowMs() + EXIT_WAIT_MS);
     while (true) {
-        if (spawnOn(arena, &where, .auto, argv, .{ .name = e.session, .cwd = e.cwd }, &why)) |t| return t else |err| {
+        if (spawnOn(arena, &where, .auto, r.argv, r.spec, &why)) |t| return t else |err| {
             if (err != error.Refused or clock.nowMs() >= until) return err;
         }
         pumpFor(200);
@@ -2342,6 +2428,9 @@ const Descriptor = struct {
     relaunches: u32 = 0,
     cols: u16 = DEFAULT_COLS,
     rows: u16 = DEFAULT_ROWS,
+    /// agent_open's `args`/`env` (absent in older descriptors: none).
+    args: []const []const u8 = &.{},
+    env: []const launch.EnvVar = &.{},
 };
 
 fn descriptorPath(arena: std.mem.Allocator, id: []const u8, ext: []const u8) ![]const u8 {
@@ -2391,6 +2480,8 @@ fn writeDescriptor(e: *Entry) void {
         .relaunches = e.relaunches,
         .cols = e.cols,
         .rows = e.rows,
+        .args = e.extra.args,
+        .env = e.extra.env,
     };
     const path = descriptorPath(arena, e.id, "json") catch return;
     pathz.makeParentDirs(path) catch return;
@@ -2488,6 +2579,12 @@ fn reattachOne(d: Descriptor) !void {
     const loaded = (try adapters()).get(d.app) orelse return error.UnknownAdapter;
     const transport: Transport = if (d.transport) |s| std.meta.stringToEnum(Transport, s) orelse return error.BadDescriptor else .local;
     if (transport != .local and d.host == null) return error.BadDescriptor;
+    const extra = launch.Extra{ .args = d.args, .env = d.env };
+    {
+        var arena_state = std.heap.ArenaAllocator.init(a);
+        defer arena_state.deinit();
+        if ((try launch.checkExtra(arena_state.allocator(), loaded.spec.launch, extra)) != null) return error.BadDescriptor;
+    }
     var parts: Parts = .{};
     errdefer parts.release(a);
     parts.vis = try attachWhere(transport, d.host, d.session, d.origin);
@@ -2514,6 +2611,7 @@ fn reattachOne(d: Descriptor) !void {
     if (d.launch_model) |s| e.launch_model = try a.dupe(u8, s);
     if (d.launch_effort) |s| e.launch_effort = try a.dupe(u8, s);
     if (d.picked_model) |s| e.picked_model = try a.dupe(u8, s);
+    e.extra = try extra.clone(a);
     e.transport = transport;
     e.conversed = d.conversed;
     e.relaunches = d.relaunches;
@@ -2770,12 +2868,77 @@ test "argument validation refuses before anything is spawned" {
     try expectError(a, "agent_open", try rig.call(.agent_open, "{\"app\":\"claude\",\"binary\":\"/nonexistent/claude\"}"), "unavailable");
     try expectError(a, "agent_open", try rig.call(.agent_open, "{\"app\":\"claude\",\"cwd\":\"relative\"}"), "invalid_args");
     try expectError(a, "agent_open", try rig.call(.agent_open, "{\"app\":\"claude\",\"model\":\"a\\nb\"}"), "invalid_args");
+    // A wrapper's args and env: refused whole, never cleaned up (the rules
+    // themselves are launch.checkExtra's, tested there).
+    for ([_][]const u8{
+        "{\"app\":\"claude\",\"args\":\"--profile work\"}",
+        "{\"app\":\"claude\",\"args\":[\"ok\",3]}",
+        "{\"app\":\"claude\",\"args\":[\"line\\nbreak\"]}",
+        "{\"app\":\"claude\",\"args\":[\"\"]}",
+        "{\"app\":\"claude\",\"env\":[\"A=1\"]}",
+        "{\"app\":\"claude\",\"env\":{\"A\":1}}",
+        "{\"app\":\"claude\",\"env\":{\"1A\":\"x\"}}",
+        "{\"app\":\"claude\",\"env\":{\"A\":\"x\\u0000y\"}}",
+        "{\"app\":\"opencode\",\"env\":{\"OPENCODE_SERVER_PASSWORD\":\"mine\"}}",
+    }) |json| {
+        const r = try rig.call(.agent_open, json);
+        expectError(a, "agent_open", r, "invalid_args") catch |err| {
+            std.debug.print("not refused as invalid_args: {s}\n", .{json});
+            return err;
+        };
+    }
     try expectError(a, "agent_attach", try rig.call(.agent_attach, "{\"term\":99,\"app\":\"claude\"}"), "not_found");
     try expectError(a, "agent_attach", try rig.call(.agent_attach, "{\"term\":1,\"app\":\"opencode\"}"), "invalid_args");
     try expectError(a, "agent_adapters", try rig.call(.agent_adapters, "{\"host\":\"a host\"}"), "invalid_args");
     inline for (.{ Tool.agent_send, Tool.agent_wait, Tool.agent_read, Tool.agent_answer, Tool.agent_set, Tool.agent_interrupt, Tool.agent_close }) |tool| {
         try expectError(a, @tagName(tool), try rig.call(tool, "{\"agent\":\"claude-9\"}"), "not_found");
     }
+}
+
+test "a relaunch and a durable descriptor keep the caller's args and env" {
+    var rig: ToolRig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    const a = rig.arena.allocator();
+    const set = try adapters();
+    const e = try newEntry(set.get("claude").?, "claude-1", "agent-claude-1", "/opt/wrap", "/srv");
+    defer dropBare(e);
+    const x = launch.Extra{
+        .args = &.{ "--profile", "a b 'c' \"d\" $e ;f `g` *h" },
+        .env = &.{.{ .name = "CLAUDE_CAPTURE_PROFILE", .value = "w o'rk $x" }},
+    };
+    e.extra = try x.clone(state.allocator);
+
+    // The relaunch: the same args right after the binary, before the
+    // adapter's own and the resumed conversation; the env still spared
+    // from CLAUDE* and still set by the spawn.
+    const r = try restartOf(a, e, null, "low", "u-1", .resumed);
+    const want = [_][]const u8{ "/opt/wrap", x.args[0], x.args[1], "--ax-screen-reader", "--resume", "u-1", "--effort", "low" };
+    try testing.expectEqualStrings("/bin/sh", r.argv[0]);
+    try testing.expectEqual(want.len, r.argv.len - 4);
+    for (want, r.argv[4..]) |w, g| try testing.expectEqualStrings(w, g);
+    try testing.expect(std.mem.indexOf(u8, r.argv[2], "case \"$n\" in CLAUDE_CAPTURE_PROFILE|") != null);
+    try testing.expectEqual(@as(usize, 1), r.spec.extra_env.len);
+    try testing.expectEqualStrings("w o'rk $x", r.spec.extra_env[0].value);
+    try testing.expectEqualStrings("agent-claude-1", r.spec.name);
+
+    // The descriptor carries them through a restart of this server, byte
+    // for byte, and the reattached entry validates them again.
+    const path = try std.fmt.allocPrint(a, "{s}/agents/claude-1.json", .{rig.dir.path()});
+    const d = Descriptor{ .id = e.id, .app = "claude", .session = e.session, .origin = "o", .binary = e.binary, .args = e.extra.args, .env = e.extra.env };
+    try atomicwrite.writeJsonExact(a, path, d, 0o600);
+    const parsed = readfile.json(Descriptor, testing.allocator, path, DESCRIPTOR_MAX_BYTES) orelse return error.TestUnexpectedResult;
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 2), parsed.value.args.len);
+    for (x.args, parsed.value.args) |w, g| try testing.expectEqualStrings(w, g);
+    try testing.expectEqualStrings("CLAUDE_CAPTURE_PROFILE", parsed.value.env[0].name);
+    try testing.expectEqualStrings(x.env[0].value, parsed.value.env[0].value);
+    try testing.expect((try launch.checkExtra(a, set.get("claude").?.spec.launch, .{ .args = parsed.value.args, .env = parsed.value.env })) == null);
+    // One written before args/env existed reads as none.
+    const old = try std.json.parseFromSlice(Descriptor, testing.allocator, "{\"id\":\"claude-1\",\"app\":\"claude\",\"session\":\"s\",\"origin\":\"o\",\"binary\":\"/x\"}", .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+    defer old.deinit();
+    try testing.expectEqual(@as(usize, 0), old.value.args.len);
+    try testing.expectEqual(@as(usize, 0), old.value.env.len);
 }
 
 test "agent_adapters and agent_list speak both lanes" {

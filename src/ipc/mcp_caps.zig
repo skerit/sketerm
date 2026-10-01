@@ -432,6 +432,7 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
         const agent_ssh = agents_ok and findExecutable(arena, "ssh") != null;
         try res.fact("agents", agents_ok);
         try res.fact("agent_ssh", agent_ssh);
+        try res.fact("agent_open_args_env", agents_ok);
         const ids: []const []const u8 = if (agents_ok) mcp_agent.adapterIds(arena) catch &.{} else &.{};
         try res.fact("agent_adapters", ids);
         if (agents_ok) {
@@ -447,7 +448,7 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
             .cap_chars = select.READ_CAP_CHARS,
         });
         if (agents_ok) {
-            try res.textf("sub-agents: agent_open runs one of {d} adapter(s) on this machine{s}; results carry a watch_command that wakes you when it needs attention", .{ ids.len, if (agent_ssh) " or on an SSH host (host)" else " (no ssh client here, so not on SSH hosts)" });
+            try res.textf("sub-agents: agent_open runs one of {d} adapter(s) on this machine{s}, directly or through a wrapper (binary + args + env); results carry a watch_command that wakes you when it needs attention", .{ ids.len, if (agent_ssh) " or on an SSH host (host)" else " (no ssh client here, so not on SSH hosts)" });
             try res.textf("agent_read and done results return per job its last message, earlier segment finals of {d}+ chars, messages of {d}+ chars and notices, about {d} chars per read (detail all for every message)", .{ select.FINAL_MIN_CHARS, select.LONG_MIN_CHARS, select.READ_CAP_CHARS });
         } else
             try res.text("sub-agents (agent_*) are unavailable in --shared mode: they run on an isolated or durable instance's private daemon");

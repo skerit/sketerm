@@ -575,11 +575,27 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // The agent stage points agent_open's `binary` at THIS binary: run as
     // `<bin> --ax-screen-reader` it is a fake Claude Code, as `<bin> serve`
     // a fake `opencode serve`, as `<bin> attach` opencode's attached TUI.
-    if (c.getenv(FAKE_AGENT_ENV) != null and init.args.vector.len >= 2) {
-        const mode = std.mem.span(init.args.vector[1]);
-        if (std.mem.eql(u8, mode, "--ax-screen-reader")) return fakeClaude(allocator, init.args.vector[1..]);
-        if (std.mem.eql(u8, mode, "serve")) return fakeOpencodeServe(allocator, init.args.vector[1..]);
-        if (std.mem.eql(u8, mode, "attach")) return fakeOpencodeAttach(init.args.vector[1..]);
+    // agent_open's `args` come first (a wrapper's own options), so the
+    // mode is the first argument naming one; every start is recorded.
+    if (c.getenv(FAKE_AGENT_ENV) != null and init.args.vector.len >= 2) fake: {
+        const v = init.args.vector;
+        const self_name = std.fs.path.basename(std.mem.span(v[0]));
+        if (std.mem.eql(u8, self_name, "ssh") or std.mem.eql(u8, self_name, "scp")) break :fake;
+        for (v[1..], 1..) |arg, k| {
+            const mode = std.mem.span(arg);
+            if (std.mem.eql(u8, mode, "--ax-screen-reader")) {
+                fcRecordStart("claude", v[1..]);
+                return fakeClaude(allocator, v[1..]);
+            }
+            if (std.mem.eql(u8, mode, "serve")) {
+                fcRecordStart("serve", v[1..]);
+                return fakeOpencodeServe(allocator, v[k..]);
+            }
+            if (std.mem.eql(u8, mode, "attach")) {
+                fcRecordStart("attach", v[1..]);
+                return fakeOpencodeAttach(v[k..]);
+            }
+        }
     }
 
     // The ssh-tools stage puts THIS binary on PATH as `ssh` and `scp`:
@@ -5867,6 +5883,27 @@ fn fcAppend(name: []const u8, line: []const u8) void {
     _ = c.fputc('\n', f);
 }
 
+/// Every start of a fake app, one line each: the app's tag, its argv
+/// after argv[0] and `env=` with SMOKE_EXTRA_ENV's value, NUL-separated
+/// (agent_open refuses control characters, so none occurs inside).
+const FC_STARTS = "starts";
+/// A CLAUDE* name: agent_open's `env` must survive Claude Code's unset_env.
+const SMOKE_EXTRA_ENV = "CLAUDE_SMOKE_EXTRA";
+
+fn fcRecordStart(tag: []const u8, args: []const [*:0]const u8) void {
+    const a = std.heap.c_allocator;
+    var line: std.ArrayList(u8) = .empty;
+    defer line.deinit(a);
+    line.appendSlice(a, tag) catch return;
+    for (args) |x| {
+        line.append(a, 0) catch return;
+        line.appendSlice(a, std.mem.span(x)) catch return;
+    }
+    line.appendSlice(a, "\x00env=") catch return;
+    line.appendSlice(a, if (c.getenv(SMOKE_EXTRA_ENV)) |v| std.mem.span(@as([*:0]const u8, @ptrCast(v))) else "<unset>") catch return;
+    fcAppend(FC_STARTS, line.items);
+}
+
 /// The conversation file of the session id this launch names.
 fn fcConversation(buf: []u8, id: []const u8) [:0]const u8 {
     var nbuf: [200]u8 = undefined;
@@ -6413,6 +6450,76 @@ fn eventKinds(o: std.json.ObjectMap, kind: []const u8) usize {
 /// The agent_* tools end to end against the REAL server, with this binary
 /// as the agent apps: a fake Claude Code (screen source) and a fake
 /// opencode server plus its attached TUI (API source).
+/// agent_open `args`/`env` the stages pass: every byte a shell treats
+/// specially must reach the fake app exactly.
+const EXTRA_ARGS = [_][]const u8{ "--wrap-opt", "a b 'c' \"d\" $HOME ;e `f` *g \\h caf\xc3\xa9 & | <i> #j $(id)" };
+const EXTRA_ENV_VALUE = "x y 'z' \"q\" $HOME;`id` *w \\v $(id)";
+
+/// `,"args":[...],"env":{...}` for an agent_open request.
+fn extraJson(arena: std.mem.Allocator) []const u8 {
+    return std.fmt.allocPrint(arena, ",\"args\":{f},\"env\":{{\"" ++ SMOKE_EXTRA_ENV ++ "\":{f}}}", .{
+        std.json.fmt(EXTRA_ARGS, .{}), std.json.fmt(EXTRA_ENV_VALUE, .{}),
+    }) catch fail("oom");
+}
+
+fn resetStarts() void {
+    var buf: [1024]u8 = undefined;
+    _ = c.unlink(fcPath(&buf, FC_STARTS).ptr);
+}
+
+/// agent_open reports the args and the env NAMES, never a value.
+fn expectExtraFacts(arena: std.mem.Allocator, opened: std.json.ObjectMap, comptime what: []const u8) void {
+    const args = (opened.get("args") orelse fail(what ++ ": no args fact")).array.items;
+    if (args.len != EXTRA_ARGS.len) fail(what ++ ": args fact has the wrong length");
+    for (EXTRA_ARGS, args) |w, g| if (!std.mem.eql(u8, w, g.string)) fail(what ++ ": args fact differs");
+    const names = (opened.get("env_names") orelse fail(what ++ ": no env_names fact")).array.items;
+    if (names.len != 1 or !std.mem.eql(u8, names[0].string, SMOKE_EXTRA_ENV)) fail(what ++ ": env_names fact differs");
+    const all = std.json.Stringify.valueAlloc(arena, std.json.Value{ .object = opened }, .{}) catch fail("oom");
+    if (std.mem.indexOf(u8, all, "x y 'z'") != null) fail(what ++ ": an env value was echoed");
+}
+
+/// Exactly `n` recorded starts of `tag` (a process started a moment ago
+/// is waited for), each with the extra args first (byte-exact) and the
+/// extra env value.
+fn expectStarts(arena: std.mem.Allocator, tag: []const u8, n: usize, comptime what: []const u8) void {
+    const until = nowMs() + 5_000;
+    while (true) {
+        const seen = countStarts(arena, tag, what);
+        if (seen == n) return;
+        if (seen > n or nowMs() > until) {
+            say(std.fmt.allocPrint(arena, "{s}: {d} start(s), expected {d}", .{ tag, seen, n }) catch "?");
+            fail(what ++ ": wrong number of starts");
+        }
+        _ = c.usleep(100_000);
+    }
+}
+
+fn countStarts(arena: std.mem.Allocator, tag: []const u8, comptime what: []const u8) usize {
+    var buf: [1024]u8 = undefined;
+    const log = readfile.cappedAlloc(arena, fcPath(&buf, FC_STARTS), 1 << 20) catch return 0;
+    var seen: usize = 0;
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, log, "\n"), '\n');
+    while (lines.next()) |line| {
+        var fields = std.mem.splitScalar(u8, line, 0);
+        if (!std.mem.eql(u8, fields.next() orelse continue, tag)) continue;
+        seen += 1;
+        for (EXTRA_ARGS) |want| {
+            const got = fields.next() orelse "";
+            if (!std.mem.eql(u8, got, want)) {
+                say(std.fmt.allocPrint(arena, "{s}: start argument {f}, expected {f}", .{ tag, std.json.fmt(got, .{}), std.json.fmt(want, .{}) }) catch "?");
+                fail(what ++ ": the args did not arrive byte-exact right after the binary");
+            }
+        }
+        var last: []const u8 = "";
+        while (fields.next()) |f| last = f;
+        if (!std.mem.startsWith(u8, last, "env=") or !std.mem.eql(u8, last["env=".len..], EXTRA_ENV_VALUE)) {
+            say(std.fmt.allocPrint(arena, "{s}: {f}", .{ tag, std.json.fmt(last, .{}) }) catch "?");
+            fail(what ++ ": the env value did not arrive byte-exact (or unset_env removed it)");
+        }
+    }
+    return seen;
+}
+
 fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) void {
     var self_buf: [4096]u8 = undefined;
     const self_exe = platform.exePath(&self_buf) orelse fail("agent stage: own executable path");
@@ -6462,7 +6569,12 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
         if (ad.get("count").?.integer < 2) fail("agent_adapters lists fewer than two adapters");
 
         // ── Claude Code (screen source) ─────────────────────────────
-        const opened = agentCall(&m, arena, "agent_open", std.fmt.allocPrint(arena, "{{\"app\":\"claude\",\"binary\":{s},\"timeout_ms\":30000}}", .{bin_json}) catch fail("oom"), "agent_open claude", false, 45_000);
+        // A wrapper's args and env: byte-exact, the CLAUDE* one kept while
+        // the others are removed (the fake refuses to start with those).
+        resetStarts();
+        const opened = agentCall(&m, arena, "agent_open", std.fmt.allocPrint(arena, "{{\"app\":\"claude\",\"binary\":{s},\"timeout_ms\":30000{s}}}", .{ bin_json, extraJson(arena) }) catch fail("oom"), "agent_open claude", false, 45_000);
+        expectExtraFacts(arena, opened, "agent_open claude");
+        expectStarts(arena, "claude", 1, "agent_open claude");
         expectFact(opened, "agent", "claude-1", "agent_open: agent id");
         expectFact(opened, "session", "agent-claude-1", "agent_open: session name");
         if (!opened.get("ready").?.bool) fail("agent_open: the fake Claude Code never became ready (an unset_env leak makes it refuse to start)");
@@ -6601,6 +6713,8 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
                 say(launches);
                 fail("the relaunch did not resume the conversation with --effort high");
             }
+            // The relaunch started the wrapper with the same args and env.
+            expectStarts(arena, "claude", 2, "agent_set effort relaunch");
             var sb: [1024]u8 = undefined;
             if (fileExists(fcPath(&sb, FC_SETTINGS_WRITTEN))) fail("something wrote the user's default settings (/effort or a picker's Enter)");
         }
@@ -6624,13 +6738,18 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
         say("smoke-mcp: agents: fake Claude Code (open, send, read, permission, match, flood, waiters, late backlog, model, effort relaunch, recording, close) ok");
 
         // ── opencode (API source) ───────────────────────────────────
-        const oc = agentCall(&m, arena, "agent_open", std.fmt.allocPrint(arena, "{{\"app\":\"opencode\",\"binary\":{s},\"timeout_ms\":30000}}", .{bin_json}) catch fail("oom"), "agent_open opencode", false, 45_000);
+        resetStarts();
+        const oc = agentCall(&m, arena, "agent_open", std.fmt.allocPrint(arena, "{{\"app\":\"opencode\",\"binary\":{s},\"timeout_ms\":30000{s}}}", .{ bin_json, extraJson(arena) }) catch fail("oom"), "agent_open opencode", false, 45_000);
         expectFact(oc, "agent", "opencode-1", "agent_open opencode: agent id");
         expectFact(oc, "session", "agent-opencode-1", "agent_open opencode: session");
         expectFact(oc, "server_session", "agent-opencode-1-server", "agent_open opencode: server session");
         // The fake server swallowed every request of its first 4.5 s: the
         // open waited it out on health probes instead of failing.
         if (!oc.get("ready").?.bool) fail("agent_open opencode: not ready");
+        // Both processes started with the binary got the args and env.
+        expectExtraFacts(arena, oc, "agent_open opencode");
+        expectStarts(arena, "serve", 1, "agent_open opencode server");
+        expectStarts(arena, "attach", 1, "agent_open opencode TUI");
         if (!sessionListed(allocator, mux_sock, "agent-opencode-1") or !sessionListed(allocator, mux_sock, "agent-opencode-1-server"))
             fail("the opencode sessions are not on the private daemon");
         expectPasswordsHidden(arena, (oc.get("recordings") orelse fail("agent_open opencode: no recordings")).array.items, "local opencode");
@@ -6663,7 +6782,7 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
     {
         var d1 = Mcp.spawn(allocator, exe, &.{ "--name", "agentdur" });
         d1.initialize();
-        const opened = agentCall(&d1, arena, "agent_open", std.fmt.allocPrint(arena, "{{\"app\":\"claude\",\"binary\":{s},\"prompt\":\"before restart\",\"timeout_ms\":30000}}", .{bin_json}) catch fail("oom"), "durable agent_open", false, 45_000);
+        const opened = agentCall(&d1, arena, "agent_open", std.fmt.allocPrint(arena, "{{\"app\":\"claude\",\"binary\":{s},\"prompt\":\"before restart\",\"timeout_ms\":30000{s}}}", .{ bin_json, extraJson(arena) }) catch fail("oom"), "durable agent_open", false, 45_000);
         expectFact(opened, "outcome", "done", "durable agent_open: prompt outcome");
         expectFact(opened, "message", "echo: before restart", "durable agent_open: prompt answer");
         d1.closeStdinWait();
@@ -6680,6 +6799,12 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
         const back = agentCall(&d2, arena, "agent_send", "{\"agent\":\"claude-1\",\"text\":\"after restart\",\"timeout_ms\":20000}", "durable agent_send", false, 45_000);
         expectFact(back, "outcome", "done", "durable agent_send: outcome");
         expectFact(back, "message", "echo: after restart", "durable agent_send: message");
+        // The descriptor kept the wrapper's args and env: a relaunch after
+        // the reattach still uses them.
+        resetStarts();
+        const relaunched = agentCall(&d2, arena, "agent_set", "{\"agent\":\"claude-1\",\"effort\":\"low\",\"timeout_ms\":30000}", "durable agent_set effort", false, 60_000);
+        if (!relaunched.get("relaunched").?.bool) fail("durable agent_set effort: not a relaunch");
+        expectStarts(arena, "claude", 1, "durable relaunch after reattach");
         _ = agentCall(&d2, arena, "agent_close", "{\"agent\":\"claude-1\"}", "durable agent_close", false, 15_000);
         if (c.stat(desc.ptr, &st) == 0) fail("durable: agent_close left the descriptor behind");
         d2.closeStdinWait();
@@ -6809,11 +6934,14 @@ fn agentSshStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u
     _ = c.setenv(FAKE_SSH_ENV, "1", 1);
     _ = c.setenv(FAKE_AGENT_ENV, "1", 1);
     _ = c.setenv(FAKE_OC_DEAF_ENV, "3000", 1);
+    // What a nested Claude Code must never inherit, on the "remote" host too.
+    _ = c.setenv("CLAUDE_CODE_CHILD_SESSION", "1", 1);
     defer {
         _ = c.setenv("PATH", saved_path.ptr, 1);
         _ = c.unsetenv(FAKE_SSH_ENV);
         _ = c.unsetenv(FAKE_AGENT_ENV);
         _ = c.unsetenv(FAKE_OC_DEAF_ENV);
+        _ = c.unsetenv("CLAUDE_CODE_CHILD_SESSION");
         _ = c.unsetenv("SKETERM_SSH");
     }
 
@@ -6880,7 +7008,10 @@ fn agentSshStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u
             fail("agent_adapters host: claude not resolved through the ~/.local/bin candidate");
         }
 
-        const opened = agentCall(&m, arena, "agent_open", "{\"app\":\"claude\",\"host\":\"fakehost\",\"timeout_ms\":45000}", "agent_open claude on host", false, 60_000);
+        resetStarts();
+        const opened = agentCall(&m, arena, "agent_open", std.fmt.allocPrint(arena, "{{\"app\":\"claude\",\"host\":\"fakehost\",\"timeout_ms\":45000{s}}}", .{extraJson(arena)}) catch fail("oom"), "agent_open claude on host", false, 60_000);
+        expectExtraFacts(arena, opened, "agent_open claude on host");
+        expectStarts(arena, "claude", 1, "agent_open claude on the host daemon");
         expectFact(opened, "transport", "sketerm-mux", "agent_open host: the host's own daemon");
         expectFact(opened, "host", "fakehost", "agent_open host: host fact");
         expectFact(opened, "binary", want_bin, "agent_open host: the remote binary from the candidates");
@@ -6921,6 +7052,7 @@ fn agentSshStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u
         if (!eff.get("relaunched").?.bool) fail("agent_set effort on the host: not a relaunch");
         const recall = agentCall(&m, arena, "agent_send", "{\"agent\":\"claude-1\",\"text\":\"recall\",\"timeout_ms\":20000}", "agent_send recall remote", false, 45_000);
         expectFact(recall, "message", "first prompt was: hello from afar", "agent_send recall on the host");
+        expectStarts(arena, "claude", 2, "agent_set effort relaunch on the host");
 
         // opencode on the host: password typed, server behind a forward.
         const oc = agentCall(&m, arena, "agent_open", "{\"app\":\"opencode\",\"host\":\"fakehost\",\"binary\":\"sk-fake-opencode\",\"timeout_ms\":45000}", "agent_open opencode on host", false, 60_000);
@@ -6960,7 +7092,10 @@ fn agentSshStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u
         expectPasswordsHidden(arena, recs, "opencode over plain ssh");
         _ = agentCall(&m, arena, "agent_close", "{\"agent\":\"opencode-1\"}", "agent_close opencode ssh", false, 15_000);
 
-        const cl = agentCall(&m, arena, "agent_open", "{\"app\":\"claude\",\"host\":\"fakehost\",\"transport\":\"ssh\",\"timeout_ms\":45000}", "agent_open claude over ssh", false, 60_000);
+        resetStarts();
+        const cl = agentCall(&m, arena, "agent_open", std.fmt.allocPrint(arena, "{{\"app\":\"claude\",\"host\":\"fakehost\",\"transport\":\"ssh\",\"timeout_ms\":45000{s}}}", .{extraJson(arena)}) catch fail("oom"), "agent_open claude over ssh", false, 60_000);
+        expectExtraFacts(arena, cl, "agent_open claude over plain ssh");
+        expectStarts(arena, "claude", 1, "agent_open claude over plain ssh");
         expectFact(cl, "transport", "ssh", "agent_open claude over plain ssh: transport");
         const sent = agentCall(&m, arena, "agent_send", "{\"agent\":\"claude-1\",\"text\":\"plain hello\",\"timeout_ms\":20000}", "agent_send claude over ssh", false, 45_000);
         expectFact(sent, "message", "echo: plain hello", "agent_send claude over plain ssh");
