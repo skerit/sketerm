@@ -952,6 +952,18 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   registry's flock decides) and never starts one: a server that exited
   is refused as not running, an unknown key as unknown. The instance
   key is the server's `--name`, or `tmp-<pid>` for an unnamed one.
+- **Watching them from the GUI.** A sketerm window that has a pane (or
+  app session) on host A reads A's report on its own: the tab-bar AI
+  chip counts A's agents, its popover lists each server as `<name> on
+  A` with one row per agent (`claude-1 (claude)`, and `claude-2 (claude)
+  on B via A` for one placed on B), and the Session Overview lists the
+  same rows. Watch and Take control attach along the derived route,
+  read-only or with the controller lease, exactly as for an assistant on
+  this machine; a refusal (the server exited, a too-old sketerm-mux on a
+  hop, an unreachable hop) is shown as a message naming the hop. A host
+  whose sketerm-mux predates the report contributes nothing. When the
+  server exits, its agents leave the chip with A's next report (a few
+  seconds).
 
 The server's `instructions` (initialize result) tell the assistant to use
 `agent_open` for Claude Code and opencode and to run `watch_command` in the

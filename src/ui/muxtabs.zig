@@ -1217,10 +1217,7 @@ pub const AttachJob = struct {
     /// Record why this attempt failed and report it as one. Always false,
     /// so a caller reads `return self.noteFailure(...)`.
     fn noteFailure(self: *AttachJob, conn: *const mux_client.Conn, err: anyerror) bool {
-        const why = conn.attachFailure(err);
-        const n = @min(why.len, self.fail_reason.len);
-        @memcpy(self.fail_reason[0..n], why[0..n]);
-        self.fail_reason_len = n;
+        self.noteText(conn.attachFailure(err));
         return false;
     }
 
@@ -1264,8 +1261,18 @@ pub const AttachJob = struct {
             } else {
                 conn.deinit();
             }
+        } else if (host) |h| {
+            // A route names the hop that refused (dead instance, too-old
+            // sketerm-mux, unreachable host); it is per-thread, so read here.
+            if (mux_client.RouteSpec.isRoute(h)) self.noteText(mux_client.routeFailure());
         }
         _ = c.g_idle_add(@ptrCast(&onIdle), @ptrCast(self));
+    }
+
+    fn noteText(self: *AttachJob, why: []const u8) void {
+        const n = @min(why.len, self.fail_reason.len);
+        @memcpy(self.fail_reason[0..n], why[0..n]);
+        self.fail_reason_len = n;
     }
 
     /// Whether the handshake produced something to attach; false is

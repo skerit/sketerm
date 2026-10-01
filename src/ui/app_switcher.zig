@@ -396,6 +396,7 @@ fn render(self: *Switcher) void {
     createGroups(self);
     populateAttached(self);
     populateFetched(self);
+    populateAgentsElsewhere(self);
     self.attached_hash = attachedFingerprint(self);
     applySearch(self, selected);
     self.updateStatus();
@@ -614,6 +615,50 @@ fn populateFetched(self: *Switcher) void {
     }
 }
 
+/// A sub-agent's title for `session` on `host` (`claude-1 (claude)`),
+/// from the window's assistant roster; null when it is no agent's.
+fn agentTitle(self: *Switcher, buf: []u8, host: ?[]const u8, session: []const u8) ?[]const u8 {
+    const watcher = self.win.assistants orelse return null;
+    const row = watcher.findRow(host orelse return null, session) orelse return null;
+    if (row.s.agent == null) return null;
+    return assistants.rowTitle(buf, row.a, row.s);
+}
+
+/// Sub-agent sessions on a daemon this overview does not list (an
+/// agent placed on another host, reached through its server's host):
+/// one row each, from the roster's report, with Watch and Take control.
+/// Stopping is the agent's server's business, so no stop button.
+fn populateAgentsElsewhere(self: *Switcher) void {
+    const watcher = self.win.assistants orelse return;
+    for (watcher.roster.items) |*a| {
+        for (a.sessions.items) |*s| {
+            const host = s.host orelse continue;
+            if (listedHere(self, host, s.name)) continue;
+            if (self.win.sessionPlacement(s.name, host) == .pane) continue;
+            var title_buf: [320]u8 = undefined;
+            const title = assistants.rowTitle(&title_buf, a, s);
+            var subtitle_buf: [768:0]u8 = undefined;
+            const subtitle = std.fmt.bufPrintZ(&subtitle_buf, "Sub-agent - assistant {s} - session {s} at {s}", .{ a.label(), s.name, host }) catch "Sub-agent session";
+            const entry = appendRow(self, .available, title, subtitle, null, std.mem.span(s.kind.icon()), false) orelse continue;
+            entry.kind = .attach;
+            setSessionTarget(self, entry, s.name, host, s.origin_id, false);
+            addWatchButton(self, entry);
+            setIdentity(self, entry, "agent:{s}\x00{s}", .{ host, s.name });
+            self.available_sessions += 1;
+        }
+    }
+}
+
+/// Whether a polled daemon at `host` already lists `session`.
+fn listedHere(self: *Switcher, host: []const u8, session: []const u8) bool {
+    const daemon = findDaemon(self, host) orelse return false;
+    const listing = daemon.listing orelse return false;
+    for (listing.value.sessions) |info| {
+        if (!info.exited and std.mem.eql(u8, info.name, session)) return true;
+    }
+    return false;
+}
+
 fn addFetchedAudioRow(self: *Switcher, daemon: *DaemonState, session: *const mux_cli.SessionInfo, info: pulse.AudioInfo, streams: usize) void {
     var pid_buf: [48]u8 = undefined;
     const pid = if (info.pid != 0) std.fmt.bufPrint(&pid_buf, " - PID {d}", .{info.pid}) catch "" else "";
@@ -634,7 +679,9 @@ fn addFetchedAudioRow(self: *Switcher, daemon: *DaemonState, session: *const mux
 }
 
 fn addAvailableRow(self: *Switcher, daemon: *DaemonState, session: *const mux_cli.SessionInfo) void {
-    const title = if (session.title.len > 0) session.title else session.name;
+    var agent_buf: [320]u8 = undefined;
+    const title = agentTitle(self, &agent_buf, daemon.host, session.name) orelse
+        if (session.title.len > 0) session.title else session.name;
     var subtitle_buf: [896:0]u8 = undefined;
     const kind = if (session.app) "Application" else "Shell";
     const cwd = if (session.cwd.len > 0) session.cwd else "working directory unavailable";
@@ -1063,8 +1110,9 @@ fn onRefreshClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     startAllFetches(self);
 }
 
-/// Drop assistant (`sock:`) daemons whose socket vanished — their MCP
-/// instance is gone and re-discovery will never re-add them. Host
+/// Drop assistant daemons that are gone: a `sock:` one whose socket
+/// vanished (its MCP instance exited), a remote instance route the
+/// roster no longer has. Re-discovery would never re-add either. Host
 /// daemons stay: their reachability is what `failed` reports.
 fn pruneDaemons(self: *Switcher) void {
     var index: usize = 0;
@@ -1075,7 +1123,25 @@ fn pruneDaemons(self: *Switcher) void {
             index += 1;
             continue;
         };
-        if (!std.mem.startsWith(u8, host, "sock:") or daemon.busy) {
+        if (daemon.busy) {
+            index += 1;
+            continue;
+        }
+        if (mux_client.RouteSpec.isRoute(host)) {
+            // A remote assistant's instance route: kept exactly while the
+            // roster has it (its server left = its host's report dropped it).
+            const route = mux_client.RouteSpec.parse(host) catch null;
+            const known = if (self.win.assistants) |w| w.findByHost(host) != null else false;
+            if (route == null or route.?.instance == null or known) {
+                index += 1;
+                continue;
+            }
+            var gone = self.daemons.swapRemove(index);
+            gone.deinit(self.allocator);
+            changed = true;
+            continue;
+        }
+        if (!std.mem.startsWith(u8, host, "sock:")) {
             index += 1;
             continue;
         }
@@ -1152,6 +1218,8 @@ const Op = struct {
     parsed: ?std.json.Parsed(mux_cli.Welcome) = null,
     fingerprint: u64 = 0,
     ok: bool = false,
+    /// The daemon advertises `assistants`, so its reply's report counts.
+    assistants_cap: bool = false,
 
     fn destroy(self: *Op) void {
         const allocator = std.heap.c_allocator;
@@ -1327,6 +1395,7 @@ fn runOp(ctx: *Op) bool {
         ctx.ok = true;
         return true;
     }
+    ctx.assistants_cap = conn.caps.assistants;
     conn.sendFrame(.list, "") catch return false;
     const f = conn.recvExpectFor(&.{.welcome}, 10_000) catch return false;
     defer f.deinit(allocator);
@@ -1407,6 +1476,11 @@ fn onOpIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
                 const failed = !ctx.ok;
                 changed = daemon.failed != failed;
                 daemon.failed = failed;
+                // The same reply carries the host's assistants: hand them
+                // to the roster instead of it polling this host again.
+                if (ctx.parsed) |parsed| if (ctx.assistants_cap) {
+                    if (self.win.assistants) |w| w.applyHostReport(host, parsed.value.assistants);
+                };
                 if (ctx.parsed != null and (daemon.listing == null or daemon.fingerprint != ctx.fingerprint)) {
                     if (daemon.listing) |*old| old.deinit();
                     daemon.listing = ctx.parsed;

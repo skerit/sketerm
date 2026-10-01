@@ -460,6 +460,10 @@ pub fn main() u8 {
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
 
+    // The remote-watch stage hands THIS binary to agent_open as Claude
+    // Code; started as one, it is a fake of it and nothing else.
+    if (c.getenv(FAKE_AGENT_ENV) != null and cmdlineHas("--ax-screen-reader")) return fakeAgent(allocator);
+
     g_alloc = allocator;
 
     // On Linux the harness makes its own display below. macOS always
@@ -649,10 +653,11 @@ pub fn main() u8 {
 
         var ssh_path_buf: [300:0]u8 = undefined;
         const ssh_path = std.fmt.bufPrintZ(&ssh_path_buf, "{s}/fake-ssh", .{rt}) catch return fail("fake ssh path");
-        var script_buf: [2048]u8 = undefined;
+        var script_buf: [4096]u8 = undefined;
         const body = std.fmt.bufPrint(&script_buf,
             \\#!/bin/sh
             \\if [ "$1" = "-G" ]; then printf 'hostname 127.0.0.1\n'; exit 0; fi
+            \\for a in "$@"; do case "$a" in hosta|hostb) exec '{s}/route-ssh' "$@";; esac; done
             \\case "$*" in *unreachable-host*) exit 255;; esac
             \\printf 'dial\n' >> '{s}/ssh-dials'
             \\if [ -e '{s}/ssh-delay' ]; then sleep 2; fi
@@ -667,7 +672,7 @@ pub fn main() u8 {
             \\printf '%s\n' "$$" > '{s}/ssh-child-'"$SKETERM_APP_ID"
             \\exec '{s}' --proxy --socket '{s}'
             \\
-        , .{ rt, rt, rrt, rrt, rrt, mux_abs, rsock, rt, mux_abs, rsock }) catch return fail("fake ssh body");
+        , .{ rt, rt, rt, rrt, rrt, rrt, mux_abs, rsock, rt, mux_abs, rsock }) catch return fail("fake ssh body");
         const fp = c.fopen(ssh_path.ptr, "wb") orelse return fail("fake ssh open");
         const wrote = c.fwrite(body.ptr, 1, body.len, fp) == body.len;
         _ = c.fclose(fp);
@@ -842,6 +847,8 @@ pub fn main() u8 {
         } else {
             say("SKIP assistant web watch stage (sketerm-webengine is not built)");
         }
+        if (assistantRemoteStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
+        say("assistant remote watch: agents on hosta and hostb (via hosta) listed, watched and controlled");
         teardown();
         return 0;
     }
@@ -17351,4 +17358,482 @@ fn parseNumAfter(text: []const u8, key: []const u8) ?u32 {
 /// and the display-session viewer is pumped first.
 fn roundtrip(allocator: std.mem.Allocator, sock_path: [:0]const u8, line: []const u8) ?[]u8 {
     return ctlsock.roundtrip(allocator, drive, sock_path, line);
+}
+
+// ── remote assistants: watch-along across hosts ─────────────────────
+
+/// Env under which THIS binary, started as Claude Code (`--ax-screen-reader`
+/// on its command line), is a minimal fake of it.
+const FAKE_AGENT_ENV = "SKETERM_SMOKE_E2E_FAKE_AGENT";
+/// Where the fake appends every prompt it receives, prefixed with its session.
+const FAKE_AGENT_LOG_ENV = "SKETERM_SMOKE_E2E_AGENT_LOG";
+
+fn cmdlineHas(arg: []const u8) bool {
+    var buf: [4096]u8 = undefined;
+    const f = c.fopen("/proc/self/cmdline", "rb") orelse return false;
+    defer _ = c.fclose(f);
+    const n = c.fread(&buf, 1, buf.len, f);
+    var it = std.mem.splitScalar(u8, buf[0..n], 0);
+    while (it.next()) |a| if (std.mem.eql(u8, a, arg)) return true;
+    return false;
+}
+
+fn fakeOut(bytes: []const u8) void {
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const n = c.write(1, bytes[off..].ptr, bytes.len - off);
+        if (n <= 0) return;
+        off += @intCast(n);
+    }
+}
+
+/// Claude Code's ax-mode live region and turn markers, as smoke-mcp's
+/// fuller fake draws them: enough for the adapter to read it as idle
+/// and to see a turn start and end.
+const FA_LIVE = "[Haiku 4.5] repo:smoke\r\n[\xe2\x96\xa0\xe2\x96\xa1] 21%\r\nmanual mode on\r\n$";
+const FA_ERASE = "\x1b[2K\x1b[1A\x1b[2K\x1b[1A\x1b[2K\x1b[1A\x1b[2K\x1b[G";
+const FA_BUSY = "\x1b]0;\xe2\x97\x90 Working\x07";
+const FA_IDLE = "\x1b]0;\xe2\x9c\xb3 Claude Code\x07";
+const FA_END = "\x1b]133;C\x07\x1b]133;D\x07\x07" ++ FA_IDLE ++ FA_ERASE ++ "Brewed for 1s \xc2\xb7 done\r\n" ++ FA_LIVE;
+
+/// The fake: draws the banner, echoes typed input, answers every prompt
+/// with `claude: echo: <prompt>` and logs it to `$FAKE_AGENT_LOG_ENV`.
+fn fakeAgent(allocator: std.mem.Allocator) u8 {
+    var tio: c.struct_termios = undefined;
+    if (c.tcgetattr(0, &tio) == 0) {
+        c.cfmakeraw(&tio);
+        _ = c.tcsetattr(0, c.TCSANOW, &tio);
+    }
+    _ = c.usleep(300_000);
+    fakeOut(FA_IDLE ++ "Claude Code v0.0.0 (smoke fake)\r\n" ++ FA_LIVE);
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(allocator);
+    while (true) {
+        var buf: [512]u8 = undefined;
+        const n = c.read(0, &buf, buf.len);
+        if (n == 0) return 0;
+        if (n < 0) {
+            if (std.posix.errno(n) == .INTR) continue;
+            return 0;
+        }
+        for (buf[0..@intCast(n)]) |b| switch (b) {
+            '\r', '\n' => {
+                if (input.items.len == 0) continue;
+                if (c.getenv(FAKE_AGENT_LOG_ENV)) |log_path| {
+                    if (c.fopen(log_path, "a")) |f| {
+                        const who: [*:0]const u8 = c.getenv("SKETERM_SESSION") orelse "?";
+                        _ = c.fprintf(f, "%s %.*s\n", who, @as(c_int, @intCast(input.items.len)), input.items.ptr);
+                        _ = c.fclose(f);
+                    }
+                }
+                const turn = std.fmt.allocPrint(allocator, "\x1b]133;A\x07" ++ FA_BUSY ++ FA_ERASE ++ "you: {s}\r\n" ++ FA_LIVE, .{input.items}) catch return 1;
+                fakeOut(turn);
+                allocator.free(turn);
+                _ = c.usleep(200_000);
+                const answer = std.fmt.allocPrint(allocator, FA_ERASE ++ "claude: echo: {s}\r\n" ++ FA_LIVE ++ FA_END, .{input.items}) catch return 1;
+                fakeOut(answer);
+                allocator.free(answer);
+                input.clearRetainingCapacity();
+            },
+            0x1b => {
+                input.clearRetainingCapacity();
+                fakeOut("\r\x1b[2K$");
+            },
+            0x7f => {
+                _ = input.pop();
+                fakeOut("\r\x1b[2K$ ");
+                fakeOut(input.items);
+            },
+            else => if (b >= 0x20) {
+                input.append(allocator, b) catch return 1;
+                fakeOut("\r\x1b[2K$ ");
+                fakeOut(input.items);
+            },
+        };
+    }
+}
+
+/// One tools/call answered: skips notifications until the reply line.
+fn mcpCallReply(m: *McpChild, name: []const u8, args: []const u8, timeout_ms: i64) ?[]const u8 {
+    if (!m.startCall(name, args)) return null;
+    const deadline = clock.nowMs() + timeout_ms;
+    while (clock.nowMs() < deadline) {
+        const line = m.recv(deadline - clock.nowMs()) orelse return null;
+        if (std.mem.indexOf(u8, line, "\"result\"") != null or std.mem.indexOf(u8, line, "\"error\"") != null) return line;
+    }
+    return null;
+}
+
+/// Start one fake host's per-user daemon under its own runtime dir.
+fn startFakeHostDaemon(host_rt: [:0]const u8, log_path: [:0]const u8) ?c.pid_t {
+    const pid = c.fork();
+    if (pid < 0) return null;
+    if (pid == 0) {
+        platform.dieWithParent();
+        _ = c.setenv("XDG_RUNTIME_DIR", host_rt.ptr, 1);
+        _ = c.setenv("XDG_STATE_HOME", host_rt.ptr, 1);
+        _ = c.setenv("XDG_CONFIG_HOME", host_rt.ptr, 1);
+        // Agent sessions this daemon spawns run the fake.
+        _ = c.setenv(FAKE_AGENT_ENV, "1", 1);
+        _ = c.setenv(FAKE_AGENT_LOG_ENV, log_path.ptr, 1);
+        const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm-mux", "--broker", null };
+        _ = c.execv("zig-out/bin/sketerm-mux", @ptrCast(@constCast(&argv)));
+        c._exit(127);
+    }
+    var sock_buf: [512:0]u8 = undefined;
+    const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/sketerm/mux.sock", .{host_rt}) catch return pid;
+    var waited: u32 = 0;
+    while (c.access(sock.ptr, c.F_OK) != 0 and waited < 200) : (waited += 1) _ = c.usleep(50_000);
+    return pid;
+}
+
+/// `sketerm mcp` "on hosta": hosta's runtime dir, its PATH, the fake agent env.
+fn spawnHostMcp(allocator: std.mem.Allocator, host_rt: [:0]const u8, path_env: [:0]const u8, log_path: [:0]const u8) ?McpChild {
+    var in_pipe: [2]c_int = undefined;
+    var out_pipe: [2]c_int = undefined;
+    if (c.pipe(&in_pipe) != 0) return null;
+    if (c.pipe(&out_pipe) != 0) return null;
+    const pid = c.fork();
+    if (pid < 0) return null;
+    if (pid == 0) {
+        platform.dieWithParent();
+        _ = c.dup2(in_pipe[0], 0);
+        _ = c.dup2(out_pipe[1], 1);
+        for ([_]c_int{ in_pipe[0], in_pipe[1], out_pipe[0], out_pipe[1] }) |fd| _ = c.close(fd);
+        for ([_][*:0]const u8{ "SKETERM_SESSION", "SKETERM_MUX_SOCKET", "SKETERM_SESSION_ORIGIN_ID" }) |name| _ = c.unsetenv(name);
+        _ = c.setenv("XDG_RUNTIME_DIR", host_rt.ptr, 1);
+        _ = c.setenv("XDG_STATE_HOME", host_rt.ptr, 1);
+        _ = c.setenv("XDG_CONFIG_HOME", host_rt.ptr, 1);
+        _ = c.setenv("PATH", path_env.ptr, 1);
+        _ = c.setenv(FAKE_AGENT_ENV, "1", 1);
+        _ = c.setenv(FAKE_AGENT_LOG_ENV, log_path.ptr, 1);
+        const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "mcp", "--no-record", null };
+        _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
+        c._exit(127);
+    }
+    _ = c.close(in_pipe[0]);
+    _ = c.close(out_pipe[1]);
+    return .{ .pid = pid, .to_child = in_pipe[1], .from_child = out_pipe[0], .allocator = allocator };
+}
+
+/// The OCR word `action` on the same row as the first word containing
+/// `row` (nearest vertically), from one recognition pass.
+fn waitOcrRowAction(allocator: std.mem.Allocator, app: *appdrive.App, win_id: u32, row: []const u8, action: []const u8, timeout_ms: i64) ?OcrPoint {
+    const ocr = @import("util/ocr.zig");
+    const png_util = @import("util/png.zig");
+    if (!ocr.available()) return null;
+    const deadline = clock.nowMs() + timeout_ms;
+    while (clock.nowMs() < deadline) {
+        _ = app.drainLive(2_000);
+        pumpFor(app, 200);
+        const shot = app.snapshotRgba(win_id, null) catch continue;
+        defer allocator.free(shot.px);
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const scale: u32 = 2;
+        const px = png_util.upscaleRgba(arena.allocator(), shot.px, shot.w, shot.h, scale) catch continue;
+        const result = ocr.recognize(arena.allocator(), px, shot.w * scale, shot.h * scale, .{ .psm = 11 }) catch continue;
+        var row_y: ?f64 = null;
+        for (result.words) |w| {
+            if (std.ascii.indexOfIgnoreCase(w.text, row) == null) continue;
+            row_y = @as(f64, @floatFromInt(w.y * 2 + w.h)) / (2 * scale);
+            break;
+        }
+        const ry = row_y orelse continue;
+        var best: ?OcrPoint = null;
+        var best_d: f64 = 1e9;
+        for (result.words) |w| {
+            if (std.ascii.indexOfIgnoreCase(w.text, action) == null) continue;
+            const p: OcrPoint = .{
+                .x = @as(f64, @floatFromInt(w.x * 2 + w.w)) / (2 * scale),
+                .y = @as(f64, @floatFromInt(w.y * 2 + w.h)) / (2 * scale),
+            };
+            const d = @abs(p.y - ry);
+            if (d < best_d) {
+                best_d = d;
+                best = p;
+            }
+        }
+        if (best) |p| if (best_d < 20) return p;
+    }
+    return null;
+}
+
+/// Save a window's screenshot as evidence.
+fn shotTo(allocator: std.mem.Allocator, app: *appdrive.App, win_id: u32, path: [*:0]const u8) void {
+    if (app.screenshotPng(win_id, 0, null, 0)) |shot| {
+        defer allocator.free(shot.png);
+        writePng(path, shot.png);
+    } else |_| {}
+}
+
+/// A pane outside `keep` and `skip` whose `get-text` shows `needle`.
+fn waitNewPaneText(allocator: std.mem.Allocator, sock_path: [:0]const u8, keep: []const u32, skip: []const u32, needle: []const u8, timeout_ms: u32) ?u32 {
+    var waited: u32 = 0;
+    while (waited < timeout_ms) : (waited += 250) {
+        if (drive) |app| pumpFor(app, 250) else _ = c.usleep(250_000);
+        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse continue;
+        defer allocator.free(r);
+        var now: [64]u32 = undefined;
+        const n = listPaneIds(r, &now);
+        for (now[0..n]) |id| {
+            if (contains(keep, id) or contains(skip, id)) continue;
+            var req_buf: [96]u8 = undefined;
+            const req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"get-text\",\"pane\":{d}}}\n", .{id}) catch continue;
+            const text = roundtrip(allocator, sock_path, req) orelse continue;
+            defer allocator.free(text);
+            if (std.mem.indexOf(u8, text, needle) != null) return id;
+        }
+    }
+    return null;
+}
+
+fn logHas(allocator: std.mem.Allocator, path: [:0]const u8, needle: []const u8) bool {
+    const body = @import("util/readfile.zig").cappedAlloc(allocator, path, 1 << 20) catch return false;
+    defer allocator.free(body);
+    return std.mem.indexOf(u8, body, needle) != null;
+}
+
+fn focusPane(allocator: std.mem.Allocator, sock_path: [:0]const u8, id: u32) void {
+    var req_buf: [64]u8 = undefined;
+    const req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"focus\",\"pane\":{d}}}\n", .{id}) catch return;
+    if (roundtrip(allocator, sock_path, req)) |r| allocator.free(r);
+}
+
+/// Watch-along across hosts, through the real GUI: a pane muxed into
+/// fake host `hosta` (the fake ssh runs each host under its own runtime
+/// dir), on which a real `sketerm mcp` runs one sub-agent locally and
+/// one on `hostb`'s daemon. hosta's `assistants` report must put both
+/// in the Session Overview and the tab-bar popover with their hosts;
+/// Watch shows the hosta agent's screen without the lease; Take control on the hostb agent (through `route:hosta/hostb`)
+/// carries typed text to the fake; the server exiting retires the chip.
+fn assistantRemoteStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]const u8, rt: []const u8) ?[]const u8 {
+    if (!@import("util/ocr.zig").available()) {
+        say("SKIP assistant remote watch: tesseract unavailable; the popover is driven by OCR");
+        return null;
+    }
+    if (app.windows.items.len == 0) return "the display session lost its window";
+    const win_id = mainWin(app).id;
+    if (assistantChipBox(app, win_id) != null) return "an assistant chip was already showing before the remote stage";
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // ── two fake hosts, each its own runtime dir and sketerm-mux ──
+    var mux_abs_buf: [4096]u8 = undefined;
+    const mux_abs = std.mem.span(@as([*:0]const u8, @ptrCast(c.realpath("zig-out/bin/sketerm-mux", &mux_abs_buf) orelse return "realpath sketerm-mux")));
+    var self_buf: [4096]u8 = undefined;
+    const self_exe = std.mem.span(@as([*:0]const u8, @ptrCast(c.realpath("/proc/self/exe", &self_buf) orelse return "realpath of the rig binary")));
+    const host_rt = [_][:0]const u8{
+        std.fmt.allocPrintSentinel(arena, "{s}/ha", .{rt}, 0) catch return "oom",
+        std.fmt.allocPrintSentinel(arena, "{s}/hb", .{rt}, 0) catch return "oom",
+    };
+    for (host_rt) |h| {
+        _ = c.mkdir(h.ptr, 0o700);
+        const bin = std.fmt.allocPrintSentinel(arena, "{s}/bin", .{h}, 0) catch return "oom";
+        _ = c.mkdir(bin.ptr, 0o700);
+        const mux = std.fmt.allocPrintSentinel(arena, "{s}/sketerm-mux", .{bin}, 0) catch return "oom";
+        _ = c.unlink(mux.ptr);
+        if (c.symlink((arena.dupeZ(u8, mux_abs) catch return "oom").ptr, mux.ptr) != 0) return "linking a fake host's sketerm-mux";
+    }
+    const route_ssh = std.fmt.allocPrintSentinel(arena, "{s}/route-ssh", .{rt}, 0) catch return "oom";
+    {
+        const body = std.fmt.allocPrint(arena,
+            \\#!/bin/sh
+            \\if [ "$1" = "-G" ]; then printf 'hostname 127.0.0.1\n'; exit 0; fi
+            \\while [ $# -gt 0 ]; do
+            \\  case "$1" in
+            \\    -o|-L|-R|-D|-i|-p|-F|-J|-l|-S|-W|-b|-c|-e|-E|-m|-O|-Q|-w) shift 2 ;;
+            \\    -*) shift ;;
+            \\    *) break ;;
+            \\  esac
+            \\done
+            \\host="$1"; shift
+            \\case "$host" in
+            \\  hosta) h='{s}' ;;
+            \\  hostb) h='{s}' ;;
+            \\  *) echo "ssh: Could not resolve hostname $host: Name or service not known" >&2; exit 255 ;;
+            \\esac
+            \\export XDG_RUNTIME_DIR="$h" XDG_STATE_HOME="$h" XDG_CONFIG_HOME="$h" PATH="$h/bin:$PATH"
+            \\exec /bin/sh -c "$*"
+            \\
+        , .{ host_rt[0], host_rt[1] }) catch return "oom";
+        if (!writeFile(route_ssh, body)) return "writing the route ssh script";
+        if (c.chmod(route_ssh.ptr, 0o755) != 0) return "chmod the route ssh script";
+    }
+    // Plain `ssh` (the agent tools' probe) is the same dispatcher.
+    const fakebin = std.fmt.allocPrintSentinel(arena, "{s}/fb", .{rt}, 0) catch return "oom";
+    _ = c.mkdir(fakebin.ptr, 0o700);
+    {
+        const link = std.fmt.allocPrintSentinel(arena, "{s}/ssh", .{fakebin}, 0) catch return "oom";
+        _ = c.unlink(link.ptr);
+        if (c.symlink(route_ssh.ptr, link.ptr) != 0) return "linking the fake plain ssh";
+    }
+    const log_path = std.fmt.allocPrintSentinel(arena, "{s}/agent-prompts.log", .{rt}, 0) catch return "oom";
+    const pid_a = startFakeHostDaemon(host_rt[0], log_path) orelse return "could not start hosta's daemon";
+    const pid_b = startFakeHostDaemon(host_rt[1], log_path) orelse return "could not start hostb's daemon";
+    defer for ([_]c.pid_t{ pid_a, pid_b }) |p| {
+        _ = c.kill(p, c.SIGTERM);
+        _ = c.waitpid(p, null, 0);
+    };
+
+    // ── hosta runs `sketerm mcp`: one agent there, one on hostb ──
+    const path_env = std.fmt.allocPrintSentinel(arena, "{s}:{s}/bin:/usr/bin:/bin", .{ fakebin, host_rt[0] }, 0) catch return "oom";
+    var m = spawnHostMcp(allocator, host_rt[0], path_env, log_path) orelse return "could not spawn `sketerm mcp` on hosta";
+    var m_open = true;
+    defer if (m_open) m.close();
+    if (!m.initialize()) return "hosta's MCP server never answered initialize";
+    const bin_json = std.fmt.allocPrint(arena, "{f}", .{std.json.fmt(self_exe, .{})}) catch return "oom";
+    const args_a = std.fmt.allocPrint(arena, "{{\"app\":\"claude\",\"binary\":{s},\"timeout_ms\":30000}}", .{bin_json}) catch return "oom";
+    const open_a = arena.dupe(u8, mcpCallReply(&m, "agent_open", args_a, 60_000) orelse return "agent_open on hosta timed out") catch return "oom";
+    if (mcpHas(open_a, "\"isError\":true")) return whyf("agent_open on hosta failed: {s}", .{open_a[0..@min(open_a.len, 400)]});
+    const args_b = std.fmt.allocPrint(arena, "{{\"app\":\"claude\",\"host\":\"hostb\",\"binary\":{s},\"timeout_ms\":45000}}", .{bin_json}) catch return "oom";
+    const open_b = arena.dupe(u8, mcpCallReply(&m, "agent_open", args_b, 90_000) orelse return "agent_open with host hostb timed out") catch return "oom";
+    if (mcpHas(open_b, "\"isError\":true")) return whyf("agent_open on hostb failed: {s}", .{open_b[0..@min(open_b.len, 400)]});
+    say("assistant remote watch: hosta's MCP server runs claude-1 there and claude-2 on hostb");
+
+    // ── the GUI talks to hosta: a durable pane there ──
+    var keep_ids: [64]u32 = undefined;
+    var keep_n: usize = 0;
+    {
+        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse return "list before the hosta pane failed";
+        defer allocator.free(r);
+        keep_n = listPaneIds(r, &keep_ids);
+    }
+    {
+        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"new-durable-tab\",\"host\":\"ssh:hosta\"}\n") orelse return "opening a pane on hosta failed";
+        defer allocator.free(r);
+        if (std.mem.indexOf(u8, r, "\"ok\":true") == null) return whyf("opening a pane on hosta was refused: {s}", .{r[0..@min(r.len, 200)]});
+    }
+    var skip_ids: [66]u32 = undefined;
+    var skip_n: usize = 0;
+    {
+        var waited: u32 = 0;
+        while (waited < 20_000 and skip_n == 0) : (waited += 250) {
+            pumpFor(app, 250);
+            const r = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse continue;
+            defer allocator.free(r);
+            var now: [64]u32 = undefined;
+            const n = listPaneIds(r, &now);
+            for (now[0..n]) |id| if (!contains(keep_ids[0..keep_n], id)) {
+                skip_ids[skip_n] = id;
+                skip_n += 1;
+            };
+        }
+        if (skip_n == 0) return "the hosta pane never appeared";
+    }
+
+    // ── discovery: hosta's report raises the chip ──
+    const started = clock.nowMs();
+    const chip = waitAssistantChip(app, win_id, true, 40_000) orelse {
+        shotTo(allocator, app, win_id, "zig-out/smoke-e2e-remote-nochip.png");
+        return "hosta's assistants raised no chip (see zig-out/smoke-e2e-remote-nochip.png)";
+    };
+    {
+        var line: [128]u8 = undefined;
+        say(std.fmt.bufPrint(&line, "assistant remote watch: chip up {d}ms after the hosta pane", .{clock.nowMs() - started}) catch "chip up");
+    }
+
+    // ── the Session Overview lists both, labelled by host ──
+    {
+        var before: [32]u32 = undefined;
+        var before_n: usize = 0;
+        for (app.windows.items) |w| if (before_n < before.len) {
+            before[before_n] = w.id;
+            before_n += 1;
+        };
+        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"action\",\"data\":\"app_windows\"}\n") orelse return "opening the Session Overview failed";
+        allocator.free(r);
+        var ov_id: ?u32 = null;
+        var waited: u32 = 0;
+        while (waited < 10_000 and ov_id == null) : (waited += 200) {
+            pumpFor(app, 200);
+            for (app.windows.items) |w| {
+                if (w.popup or w.frames == 0 or contains(before[0..before_n], w.id)) continue;
+                ov_id = w.id;
+            }
+        }
+        const ov = ov_id orelse return "the Session Overview opened no window";
+        for ([_][]const u8{ "claude-1", "claude-2", "hostb" }) |word| {
+            if (waitOcrRowAction(allocator, app, ov, word, word, 20_000) == null) {
+                shotTo(allocator, app, ov, "zig-out/smoke-e2e-remote-overview.png");
+                return whyf("the Session Overview does not show {s} (see zig-out/smoke-e2e-remote-overview.png)", .{word});
+            }
+        }
+        shotTo(allocator, app, ov, "zig-out/smoke-e2e-remote-overview.png");
+        app.closeWindow(ov) catch return "closing the Session Overview failed";
+        pumpFor(app, 500);
+        say("assistant remote watch: the Session Overview lists claude-1 and claude-2 on hostb via hosta");
+    }
+
+    // ── the popover: both agents by host, then Watch claude-1 ──
+    if (openPopup(app) != null) return "a popup was already open before the remote chip click";
+    app.click(win_id, chip.x + chip.w / 2, chip.y + chip.h / 2, 1) catch return "clicking the assistant chip failed";
+    var pop_id = waitPopup(app, true, 10_000) orelse return "the assistant chip opened no popover";
+    for ([_][]const u8{ "hosta", "hostb" }) |word| {
+        if (waitOcrWordCenter(allocator, app, pop_id, word, 15_000) == null) {
+            shotTo(allocator, app, pop_id, "zig-out/smoke-e2e-remote-popover.png");
+            return whyf("the popover does not name {s} (see zig-out/smoke-e2e-remote-popover.png)", .{word});
+        }
+    }
+    shotTo(allocator, app, pop_id, "zig-out/smoke-e2e-remote-popover.png");
+    const watch = waitOcrRowAction(allocator, app, pop_id, "claude-1", "Watch", 15_000) orelse
+        return "no Watch button on claude-1's row (see zig-out/smoke-e2e-remote-popover.png)";
+    app.click(pop_id, watch.x, watch.y, 1) catch return "clicking Watch failed";
+    const watch_pane = waitNewPaneText(allocator, sock_path, keep_ids[0..keep_n], skip_ids[0..skip_n], "manual mode on", 30_000) orelse {
+        shotTo(allocator, app, win_id, "zig-out/smoke-e2e-remote-watch.png");
+        return "Watch opened no pane showing claude-1's screen (see zig-out/smoke-e2e-remote-watch.png)";
+    };
+    skip_ids[skip_n] = watch_pane;
+    skip_n += 1;
+    say("assistant remote watch: Watch shows claude-1's screen through route:hosta#<instance>");
+
+    // ── Take control of claude-2, placed on hostb, through hosta ──
+    app.click(win_id, chip.x + chip.w / 2, chip.y + chip.h / 2, 1) catch return "clicking the assistant chip again failed";
+    pop_id = waitPopup(app, true, 10_000) orelse return "the assistant chip opened no popover the second time";
+    const take = waitOcrRowAction(allocator, app, pop_id, "claude-2", "control", 15_000) orelse {
+        shotTo(allocator, app, pop_id, "zig-out/smoke-e2e-remote-popover2.png");
+        return "no Take control button on claude-2's row (see zig-out/smoke-e2e-remote-popover2.png)";
+    };
+    app.click(pop_id, take.x, take.y, 1) catch return "clicking Take control failed";
+    const ctl_pane = waitNewPaneText(allocator, sock_path, keep_ids[0..keep_n], skip_ids[0..skip_n], "manual mode on", 40_000) orelse {
+        shotTo(allocator, app, win_id, "zig-out/smoke-e2e-remote-control.png");
+        return "Take control opened no pane showing claude-2's screen (see zig-out/smoke-e2e-remote-control.png)";
+    };
+    focusPane(allocator, sock_path, ctl_pane);
+    pumpFor(app, 500);
+    app.typeText(null, "viagui\n") catch return "typing into the controlled pane failed";
+    {
+        var waited: u32 = 0;
+        while (waited < 15_000 and !logHas(allocator, log_path, "agent-claude-2 viagui")) : (waited += 250) pumpFor(app, 250);
+    }
+    shotTo(allocator, app, win_id, "zig-out/smoke-e2e-remote-control.png");
+    if (!logHas(allocator, log_path, "agent-claude-2 viagui"))
+        return "text typed after Take control never reached claude-2 on hostb (see zig-out/smoke-e2e-remote-control.png)";
+    say("assistant remote watch: Take control typed into claude-2 on hostb through route:hosta/hostb");
+
+    // ── the server exits: its agents leave with hosta's next report ──
+    for ([_]u32{ ctl_pane, watch_pane }) |id| {
+        var buf: [64]u8 = undefined;
+        const req = std.fmt.bufPrint(&buf, "{{\"cmd\":\"close-pane\",\"pane\":{d}}}\n", .{id}) catch return "fmt";
+        if (roundtrip(allocator, sock_path, req)) |r| allocator.free(r);
+        _ = app.waitIdle(200, 4_000);
+    }
+    m.close();
+    m_open = false;
+    const gone_at = clock.nowMs();
+    if (waitAssistantChip(app, win_id, false, 40_000) == null) {
+        shotTo(allocator, app, win_id, "zig-out/smoke-e2e-remote-stale.png");
+        return "the chip survived hosta's MCP server exiting (see zig-out/smoke-e2e-remote-stale.png)";
+    }
+    const retired_ms = clock.nowMs() - gone_at;
+    const t0 = clock.nowMs();
+    const answered = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse return "the GUI stopped answering after the server exited";
+    allocator.free(answered);
+    {
+        var line: [160]u8 = undefined;
+        say(std.fmt.bufPrint(&line, "assistant remote watch: chip retired {d}ms after the server exited; GUI answered in {d}ms", .{ retired_ms, clock.nowMs() - t0 }) catch "retired");
+    }
+    closeAddedPanes(allocator, sock_path, app, keep_ids[0..keep_n]);
+    return null;
 }

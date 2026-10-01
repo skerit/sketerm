@@ -26,6 +26,7 @@ const mux_wire = @import("../mux/wire.zig");
 const pulse = @import("../mux/pulse.zig");
 const ipc_client = @import("client.zig");
 const mux_tty = @import("mux_tty.zig");
+const mcp_registry = @import("mcp_registry.zig");
 
 const MUX_HELP =
     \\Usage: sketerm mux [host] [--alternate] [command]
@@ -162,6 +163,9 @@ test "fmtIdle: thresholds and coarse buckets" {
 pub const Welcome = struct {
     proto: u32 = 0,
     sessions: []SessionInfo = &.{},
+    /// This host's live MCP servers (capability `assistants`); absent from
+    /// an older daemon, which reads as none.
+    assistants: []const mcp_registry.Report = &.{},
 };
 
 fn isSubcommand(s2: []const u8) bool {
