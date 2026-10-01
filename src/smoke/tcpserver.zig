@@ -23,6 +23,8 @@ pub const Listener = struct {
     backlog: c_int = 16,
     /// Accept-poll timeout in ms; also the worst-case `deinit` latency.
     poll_ms: c_int = 200,
+    /// The loopback port to bind; 0 = an ephemeral one (`port` says which).
+    bind_port: u16 = 0,
 
     ctx: ?*anyopaque = null,
     /// Called with each accepted fd. `Listener` closes the fd after it
@@ -30,7 +32,7 @@ pub const Listener = struct {
     /// return true to keep it open.
     handler: ?*const fn (?*anyopaque, c_int) bool = null,
 
-    /// Bind an ephemeral loopback port and start serving. False when any
+    /// Bind a loopback port (`bind_port`, else an ephemeral one) and start serving. False when any
     /// step failed, with nothing left open.
     pub fn start(
         self: *Listener,
@@ -43,7 +45,7 @@ pub const Listener = struct {
         _ = c.setsockopt(lfd, c.SOL_SOCKET, c.SO_REUSEADDR, &one, @sizeOf(c_int));
         var sa = std.mem.zeroes(c.struct_sockaddr_in);
         sa.sin_family = c.AF_INET;
-        sa.sin_port = std.mem.nativeToBig(u16, 0);
+        sa.sin_port = std.mem.nativeToBig(u16, self.bind_port);
         sa.sin_addr.s_addr = std.mem.nativeToBig(u32, c.INADDR_LOOPBACK);
         if (c.bind(lfd, @ptrCast(&sa), @sizeOf(c.struct_sockaddr_in)) != 0 or
             c.listen(lfd, self.backlog) != 0)

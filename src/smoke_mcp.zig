@@ -23,6 +23,9 @@ const version = @import("version.zig");
 const smoke_tls = @import("smoke_tls.zig");
 const wlcomp = @import("wlhost/compositor.zig");
 const wlpipe = @import("wlhost/pipe.zig");
+const platform = @import("util/platform.zig");
+const testserver = @import("agent/testserver.zig");
+const SpinLock = @import("util/spinlock.zig").SpinLock;
 
 fn say(msg: []const u8) void {
     _ = c.write(2, msg.ptr, msg.len);
@@ -568,6 +571,16 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             return fakeGui(std.mem.span(rt_dir));
     }
 
+    // The agent stage points agent_open's `binary` at THIS binary: run as
+    // `<bin> --ax-screen-reader` it is a fake Claude Code, as `<bin> serve`
+    // a fake `opencode serve`, as `<bin> attach` opencode's attached TUI.
+    if (c.getenv(FAKE_AGENT_ENV) != null and init.args.vector.len >= 2) {
+        const mode = std.mem.span(init.args.vector[1]);
+        if (std.mem.eql(u8, mode, "--ax-screen-reader")) return fakeClaude(allocator);
+        if (std.mem.eql(u8, mode, "serve")) return fakeOpencodeServe(allocator, init.args.vector[1..]);
+        if (std.mem.eql(u8, mode, "attach")) return fakeOpencodeAttach(init.args.vector[1..]);
+    }
+
     // The ssh-tools stage puts THIS binary on PATH as `ssh` and `scp`:
     // a local stand-in for a remote host, so scp_get/scp_put and the
     // port forwards are provable with no sshd.
@@ -693,6 +706,15 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         defer _ = c.unsetenv("SKETERM_WEB_BIN");
         webPresenterStage(allocator, exe, rt);
         say("smoke-mcp: focused watch-along presenter stage ok");
+        return 0;
+    }
+    if (c.getenv("SKETERM_SMOKE_MCP_AGENT_ONLY") != null) {
+        agentStage(allocator, exe, rt);
+        say("smoke-mcp: focused sub-agent stage ok");
+        killDaemonsUnderRt(rt, allocator);
+        _ = c.usleep(500_000);
+        g_rt = null;
+        pathz.removeTree(rt);
         return 0;
     }
     if (c.getenv("SKETERM_SMOKE_MCP_WEBENGINE_ONLY") != null) {
@@ -2185,6 +2207,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // -- scp/port forwards through the real ssh tool paths ------------
     sshToolsStage(allocator, exe, rt);
     say("smoke-mcp: scp_get/scp_put and port_forward_* over a fake ssh ok");
+
+    // -- sub-agents: agent_* against a fake Claude Code and opencode ----
+    agentStage(allocator, exe, rt);
+    say("smoke-mcp: agent_* tools against fake Claude Code and opencode ok");
 
     // -- app_* against a real GTK app on the private headless display --
     appToolsStage(allocator, exe, rt);
@@ -5741,4 +5767,664 @@ fn writeSolidPngFile(path: [:0]const u8, r: u8, g: u8, b: u8) bool {
     const f = c.fopen(path.ptr, "wb") orelse return false;
     defer _ = c.fclose(f);
     return c.fwrite(png.ptr, 1, png.len, f) == png.len;
+}
+
+// ── sub-agents: fake Claude Code and opencode, and the agent_* tools ──
+
+/// Env under which THIS binary, run with an agent app's argv, is that app.
+const FAKE_AGENT_ENV = "SKETERM_SMOKE_FAKE_AGENT";
+
+fn writeOut(bytes: []const u8) void {
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const n = c.write(1, bytes[off..].ptr, bytes.len - off);
+        if (n <= 0) {
+            if (n < 0 and std.posix.errno(n) == .INTR) continue;
+            return;
+        }
+        off += @intCast(n);
+    }
+}
+
+/// Claude Code's ax-mode live region (status block, mode line, input).
+const FC_LIVE = "[Haiku 4.5] repo:smoke\r\n[\xe2\x96\xa0\xe2\x96\xa1] 21%\r\nmanual mode on\r\n$";
+/// Erase the live region (4 rows) before drawing above it.
+const FC_ERASE = "\x1b[2K\x1b[1A\x1b[2K\x1b[1A\x1b[2K\x1b[1A\x1b[2K\x1b[G";
+const FC_BUSY = "\x1b]0;\xe2\x97\x90 Working\x07";
+const FC_IDLE = "\x1b]0;\xe2\x9c\xb3 Claude Code\x07";
+/// A turn end: OSC 133 C + D + BEL together, the idle glyph, the footer.
+const FC_END = "\x1b]133;C\x07\x1b]133;D\x07\x07" ++ FC_IDLE ++ FC_ERASE ++ "Brewed for 1s \xc2\xb7 done\r\n" ++ FC_LIVE;
+const FC_PERMISSION = FC_ERASE ++ "tool: Bash (rm notes.md)\r\nPermission Required: Bash command\r\n> rm notes.md\r\n" ++
+    "Do you want to proceed?\r\n1. Yes\r\n2. No\r\nSelect with numbers [1-2]. Then Enter to submit or Escape to cancel:\x07";
+
+const FcStep = struct { at_ms: i64, bytes: []u8, picker: bool = false };
+
+/// A fake Claude Code in ax mode, enough for the adapter: typed input in
+/// a `$` box, `you:`/`claude:`/`tool:` lines, busy/idle title glyphs,
+/// OSC 133 turn marks with BEL, a numbered permission prompt that waits
+/// for its answer, a subagent wait, and a message flood. It refuses to
+/// start with a CLAUDE* variable a nested Claude Code must not inherit.
+fn fakeClaude(allocator: std.mem.Allocator) u8 {
+    for ([_][*:0]const u8{ "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CONFIG_DIR" }) |k| {
+        if (c.getenv(k) != null) {
+            writeOut("fake claude: ENV LEAK ");
+            writeOut(std.mem.span(k));
+            writeOut("\r\n");
+            _ = c.usleep(2_000_000);
+            return 3;
+        }
+    }
+    var tio: c.struct_termios = undefined;
+    if (c.tcgetattr(0, &tio) == 0) {
+        c.cfmakeraw(&tio);
+        _ = c.tcsetattr(0, c.TCSANOW, &tio);
+    }
+    _ = c.usleep(300_000);
+    writeOut(FC_IDLE ++ "Claude Code v0.0.0 (smoke fake)\r\n" ++ FC_LIVE);
+
+    var input: std.ArrayList(u8) = .empty;
+    var steps: std.ArrayList(FcStep) = .empty;
+    var picker = false;
+    var choice: u8 = 0;
+    while (true) {
+        const now = nowMs();
+        var i: usize = 0;
+        while (i < steps.items.len) {
+            if (steps.items[i].at_ms > now) {
+                i += 1;
+                continue;
+            }
+            const s = steps.orderedRemove(i);
+            writeOut(s.bytes);
+            if (s.picker) picker = true;
+            allocator.free(s.bytes);
+        }
+        var pfd = c.struct_pollfd{ .fd = 0, .events = c.POLLIN, .revents = 0 };
+        if (c.poll(&pfd, 1, 20) <= 0) continue;
+        var buf: [1024]u8 = undefined;
+        const n = c.read(0, &buf, buf.len);
+        if (n == 0) return 0;
+        if (n < 0) continue;
+        for (buf[0..@intCast(n)]) |b| {
+            if (picker) {
+                if (b >= '1' and b <= '9') choice = b - '0';
+                if (b != '\r') continue;
+                picker = false;
+                const label = switch (choice) {
+                    1 => "Yes",
+                    2 => "No",
+                    else => "nothing",
+                };
+                const answer = std.fmt.allocPrint(allocator, "\r\x1b[5A\x1b[Jclaude: permission answered {s}\r\n" ++ FC_LIVE, .{label}) catch return 1;
+                writeOut(answer);
+                allocator.free(answer);
+                fcSchedule(allocator, &steps, 200, FC_END, false);
+                continue;
+            }
+            switch (b) {
+                '\r' => {
+                    if (input.items.len == 0) continue;
+                    fcTurn(allocator, &steps, input.items);
+                    input.clearRetainingCapacity();
+                },
+                0x1b => {
+                    input.clearRetainingCapacity();
+                    writeOut("\r\x1b[2K$");
+                },
+                0x7f => {
+                    _ = input.pop();
+                    fcInput(input.items);
+                },
+                else => if (b >= 0x20) {
+                    input.append(allocator, b) catch return 1;
+                    fcInput(input.items);
+                },
+            }
+        }
+    }
+}
+
+fn fcInput(text: []const u8) void {
+    writeOut("\r\x1b[2K$ ");
+    writeOut(text);
+}
+
+fn fcSchedule(allocator: std.mem.Allocator, steps: *std.ArrayList(FcStep), delay_ms: i64, bytes: []const u8, picker: bool) void {
+    const owned = allocator.dupe(u8, bytes) catch return;
+    steps.append(allocator, .{ .at_ms = nowMs() + delay_ms, .bytes = owned, .picker = picker }) catch allocator.free(owned);
+}
+
+/// One turn of the fake: the prompt's words pick the script.
+fn fcTurn(allocator: std.mem.Allocator, steps: *std.ArrayList(FcStep), text: []const u8) void {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const start = std.fmt.allocPrint(a, "\x1b]133;A\x07" ++ FC_BUSY ++ FC_ERASE ++ "you: {s}\r\n" ++ FC_LIVE, .{text}) catch return;
+    writeOut(start);
+    const has = struct {
+        fn f(hay: []const u8, needle: []const u8) bool {
+            return std.mem.indexOf(u8, hay, needle) != null;
+        }
+    }.f;
+    if (has(text, "permission")) {
+        fcSchedule(allocator, steps, 300, FC_PERMISSION, true);
+    } else if (has(text, "two parts")) {
+        // A turn end while a background agent still runs, then the
+        // continuation turn once it finished.
+        fcSchedule(allocator, steps, 300, FC_ERASE ++ "claude: part one\r\n" ++ FC_LIVE ++ "\x1b]133;C\x07\x1b]133;D\x07\x07" ++
+            FC_ERASE ++ "Waiting for 1 background agent to finish\r\n" ++ FC_LIVE, false);
+        fcSchedule(allocator, steps, 3500, FC_BUSY ++ "\x1b]133;A\x07" ++ FC_ERASE ++ " Agent \"helper\" finished \xc2\xb7 3s\r\nclaude: part two\r\n" ++ FC_LIVE ++ FC_END, false);
+    } else if (std.mem.startsWith(u8, text, "flood ")) {
+        const count = std.fmt.parseInt(u32, text["flood ".len..], 10) catch 3;
+        var body: std.ArrayList(u8) = .empty;
+        body.appendSlice(a, FC_ERASE) catch return;
+        var k: u32 = 1;
+        while (k <= count) : (k += 1) body.print(a, "claude: flood message {d}\r\ntool: Step {d}\r\n", .{ k, k }) catch return;
+        body.appendSlice(a, FC_LIVE) catch return;
+        fcSchedule(allocator, steps, 300, body.items, false);
+        fcSchedule(allocator, steps, 400, FC_END, false);
+    } else {
+        const delay: i64 = if (has(text, "slow")) 1500 else 300;
+        const answer = std.fmt.allocPrint(a, FC_ERASE ++ "claude: echo: {s}\r\n" ++ FC_LIVE, .{text}) catch return;
+        fcSchedule(allocator, steps, delay, answer, false);
+        fcSchedule(allocator, steps, delay + 100, FC_END, false);
+    }
+}
+
+/// opencode's API for one session, served by the agent tests' scripted
+/// server with a hook for what fixed routes cannot answer: a prompt's
+/// turn (echoing the model and variant it was sent with), a permission
+/// and its reply, and a turn with two messages.
+const FakeOc = struct {
+    allocator: std.mem.Allocator,
+    lock: SpinLock = .init,
+    turn: u32 = 0,
+    due: [256]Due = undefined,
+    n_due: usize = 0,
+
+    const SES = "ses_fake1";
+    const Due = struct { at_ms: i64, json: []u8 };
+
+    /// Queue `json` (owned) for the event stream in `delay_ms`.
+    fn later(self: *FakeOc, delay_ms: i64, json: []u8) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        if (self.n_due == self.due.len) return;
+        self.due[self.n_due] = .{ .at_ms = nowMs() + delay_ms, .json = json };
+        self.n_due += 1;
+    }
+
+    fn flush(self: *FakeOc, srv: *testserver.Server) void {
+        var ready: [256][]u8 = undefined;
+        var n: usize = 0;
+        self.lock.lock();
+        const now = nowMs();
+        var i: usize = 0;
+        while (i < self.n_due) {
+            if (self.due[i].at_ms > now) {
+                i += 1;
+                continue;
+            }
+            ready[n] = self.due[i].json;
+            n += 1;
+            std.mem.copyForwards(Due, self.due[i .. self.n_due - 1], self.due[i + 1 .. self.n_due]);
+            self.n_due -= 1;
+        }
+        self.lock.unlock();
+        for (ready[0..n]) |json| {
+            srv.pushEvent(json);
+            self.allocator.free(json);
+        }
+    }
+
+    fn ev(self: *FakeOc, delay_ms: i64, comptime fmt: []const u8, args: anytype) void {
+        const json = std.fmt.allocPrint(self.allocator, fmt, args) catch return;
+        self.later(delay_ms, json);
+    }
+
+    fn status(self: *FakeOc, delay_ms: i64, kind: []const u8) void {
+        self.ev(delay_ms, "{{\"type\":\"session.status\",\"properties\":{{\"sessionID\":\"" ++ SES ++ "\",\"status\":{{\"type\":\"{s}\"}}}}}}", .{kind});
+    }
+
+    /// A completed assistant message `id` with one text part.
+    fn answer(self: *FakeOc, delay_ms: i64, id: []const u8, text: []const u8) void {
+        self.ev(delay_ms, "{{\"type\":\"message.updated\",\"properties\":{{\"sessionID\":\"" ++ SES ++ "\",\"info\":{{\"id\":\"{s}\",\"role\":\"assistant\",\"sessionID\":\"" ++ SES ++ "\"}}}}}}", .{id});
+        self.ev(delay_ms, "{{\"type\":\"message.part.updated\",\"properties\":{{\"sessionID\":\"" ++ SES ++ "\",\"part\":{{\"type\":\"text\",\"text\":{f},\"messageID\":\"{s}\",\"sessionID\":\"" ++ SES ++ "\",\"id\":\"prt_{s}\",\"time\":{{\"start\":1,\"end\":2}}}}}}}}", .{ std.json.fmt(text, .{}), id, id });
+        self.ev(delay_ms, "{{\"type\":\"message.updated\",\"properties\":{{\"sessionID\":\"" ++ SES ++ "\",\"info\":{{\"id\":\"{s}\",\"role\":\"assistant\",\"sessionID\":\"" ++ SES ++ "\",\"time\":{{\"created\":1,\"completed\":2}}}}}}}}", .{id});
+    }
+
+    fn hook(ctx: ?*anyopaque, _: *testserver.Server, method: []const u8, path: []const u8, body: []const u8) ?testserver.Reply {
+        const self: *FakeOc = @ptrCast(@alignCast(ctx.?));
+        if (!std.mem.eql(u8, method, "POST")) return null;
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        if (std.mem.eql(u8, path, "/session/" ++ SES ++ "/prompt_async")) {
+            const Prompt = struct {
+                parts: []const struct { text: []const u8 = "" } = &.{},
+                model: ?struct { providerID: []const u8, modelID: []const u8 } = null,
+                variant: ?[]const u8 = null,
+            };
+            const p = std.json.parseFromSliceLeaky(Prompt, a, body, .{ .ignore_unknown_fields = true }) catch return .{ .status = 400 };
+            const text = if (p.parts.len > 0) p.parts[0].text else "";
+            self.lock.lock();
+            self.turn += 1;
+            const n = self.turn;
+            self.lock.unlock();
+            const model = if (p.model) |m| std.fmt.allocPrint(a, "{s}/{s}", .{ m.providerID, m.modelID }) catch "?" else "default";
+            self.ev(0, "{{\"type\":\"message.updated\",\"properties\":{{\"sessionID\":\"" ++ SES ++ "\",\"info\":{{\"id\":\"msg_u{d}\",\"role\":\"user\",\"sessionID\":\"" ++ SES ++ "\"}}}}}}", .{n});
+            self.ev(0, "{{\"type\":\"message.part.updated\",\"properties\":{{\"sessionID\":\"" ++ SES ++ "\",\"part\":{{\"type\":\"text\",\"text\":{f},\"messageID\":\"msg_u{d}\",\"sessionID\":\"" ++ SES ++ "\",\"id\":\"prt_u{d}\"}}}}}}", .{ std.json.fmt(text, .{}), n, n });
+            self.status(0, "busy");
+            const id1 = std.fmt.allocPrint(a, "msg_a{d}_1", .{n}) catch return .{ .status = 500 };
+            if (std.mem.indexOf(u8, text, "permission") != null) {
+                self.ev(200, "{{\"type\":\"permission.asked\",\"properties\":{{\"id\":\"per_{d}\",\"sessionID\":\"" ++ SES ++ "\",\"permission\":\"bash\",\"patterns\":[\"rm notes.md\"]}}}}", .{n});
+            } else if (std.mem.indexOf(u8, text, "two messages") != null) {
+                self.answer(200, id1, "alpha one");
+                const id2 = std.fmt.allocPrint(a, "msg_a{d}_2", .{n}) catch return .{ .status = 500 };
+                self.answer(1500, id2, "beta two");
+                self.status(1600, "idle");
+            } else {
+                const reply = std.fmt.allocPrint(a, "echo: {s} model={s} variant={s}", .{ text, model, p.variant orelse "default" }) catch return .{ .status = 500 };
+                self.answer(200, id1, reply);
+                self.status(300, "idle");
+            }
+            return .{ .status = 204 };
+        }
+        if (std.mem.startsWith(u8, path, "/permission/") and std.mem.endsWith(u8, path, "/reply")) {
+            const id = path["/permission/".len .. path.len - "/reply".len];
+            const Reply = struct { reply: []const u8 = "" };
+            const r = std.json.parseFromSliceLeaky(Reply, a, body, .{ .ignore_unknown_fields = true }) catch return .{ .status = 400 };
+            self.ev(0, "{{\"type\":\"permission.replied\",\"properties\":{{\"sessionID\":\"" ++ SES ++ "\",\"requestID\":{f},\"reply\":{f}}}}}", .{ std.json.fmt(id, .{}), std.json.fmt(r.reply, .{}) });
+            const msg_id = std.fmt.allocPrint(a, "msg_{s}", .{id}) catch return .{ .status = 500 };
+            const text = std.fmt.allocPrint(a, "permission {s}", .{r.reply}) catch return .{ .status = 500 };
+            self.answer(100, msg_id, text);
+            self.status(200, "idle");
+            return .{ .body = "true" };
+        }
+        return null;
+    }
+};
+
+const FAKE_OC_PROVIDERS =
+    \\{"all":[{"id":"fakeprov","models":{"m1":{"name":"Fake One","variants":{"low":{},"high":{}}}}}],"connected":["fakeprov"]}
+;
+
+fn argAfter(args: []const [*:0]const u8, flag: []const u8) ?[]const u8 {
+    for (args, 0..) |a, i| {
+        if (std.mem.eql(u8, std.mem.span(a), flag) and i + 1 < args.len) return std.mem.span(args[i + 1]);
+    }
+    return null;
+}
+
+/// The password reaches the app through its environment and nowhere
+/// else: no argv element may carry it.
+fn fakeAgentPassword(args: []const [*:0]const u8) ?[]const u8 {
+    const raw = c.getenv("OPENCODE_SERVER_PASSWORD") orelse {
+        writeOut("fake opencode: no OPENCODE_SERVER_PASSWORD in the environment\r\n");
+        return null;
+    };
+    const pw = std.mem.span(@as([*:0]const u8, @ptrCast(raw)));
+    for (args) |a| {
+        if (std.mem.indexOf(u8, std.mem.span(a), pw) != null) {
+            writeOut("fake opencode: the password is on the argv\r\n");
+            return null;
+        }
+    }
+    return pw;
+}
+
+/// `opencode serve --port P`: basic auth with the environment's password,
+/// SSE events, and the routes the API source uses.
+fn fakeOpencodeServe(allocator: std.mem.Allocator, args: []const [*:0]const u8) u8 {
+    const pw = fakeAgentPassword(args) orelse {
+        _ = c.usleep(2_000_000);
+        return 3;
+    };
+    const port = std.fmt.parseInt(u16, argAfter(args, "--port") orelse "0", 10) catch 0;
+    const pair = std.fmt.allocPrint(allocator, "opencode:{s}", .{pw}) catch return 1;
+    const enc = std.base64.standard.Encoder;
+    const b64 = allocator.alloc(u8, enc.calcSize(pair.len)) catch return 1;
+    _ = enc.encode(b64, pair);
+    const auth = std.fmt.allocPrint(allocator, "Basic {s}", .{b64}) catch return 1;
+    var oc = FakeOc{ .allocator = allocator };
+    var srv: testserver.Server = .{};
+    srv.auth = auth;
+    srv.hook = FakeOc.hook;
+    srv.hook_ctx = &oc;
+    srv.route("POST /session", .{ .body = "{\"id\":\"" ++ FakeOc.SES ++ "\"}" });
+    srv.route("GET /session/" ++ FakeOc.SES, .{ .body = "{\"id\":\"" ++ FakeOc.SES ++ "\"}" });
+    srv.route("GET /session/" ++ FakeOc.SES ++ "/message", .{ .body = "[]" });
+    srv.route("GET /session/status", .{ .body = "{}" });
+    srv.route("GET /permission", .{ .body = "[]" });
+    srv.route("GET /question", .{ .body = "[]" });
+    srv.route("GET /provider", .{ .body = FAKE_OC_PROVIDERS });
+    srv.route("POST /session/" ++ FakeOc.SES ++ "/abort", .{ .body = "true" });
+    srv.startOn(allocator, port) catch {
+        writeOut("fake opencode: cannot listen\r\n");
+        _ = c.usleep(2_000_000);
+        return 5;
+    };
+    var line_buf: [96]u8 = undefined;
+    writeOut(std.fmt.bufPrint(&line_buf, "fake opencode server listening on 127.0.0.1:{d}\r\n", .{port}) catch "listening\r\n");
+    // Until the session is killed.
+    while (true) {
+        oc.flush(&srv);
+        _ = c.usleep(10_000);
+    }
+}
+
+/// `opencode attach URL --dir D -s SESSION`: the visible TUI a human
+/// watches; the fake just names its session and waits.
+fn fakeOpencodeAttach(args: []const [*:0]const u8) u8 {
+    _ = fakeAgentPassword(args) orelse {
+        _ = c.usleep(2_000_000);
+        return 3;
+    };
+    writeOut("fake opencode attach: session ");
+    writeOut(argAfter(args, "-s") orelse "?");
+    writeOut("\r\n");
+    var buf: [256]u8 = undefined;
+    while (c.read(0, &buf, buf.len) > 0) {}
+    return 0;
+}
+
+/// One agent_* call: its structuredContent, the reply line kept in `arena`.
+fn agentCall(m: *Mcp, arena: std.mem.Allocator, name: []const u8, args_json: []const u8, comptime what: []const u8, comptime want_error: bool, timeout_ms: i64) std.json.ObjectMap {
+    m.sendToolAllocated(name, args_json);
+    const line = arena.dupe(u8, m.recvLine(timeout_ms)) catch fail(what ++ ": oom");
+    return capSc(arena, line, what, want_error);
+}
+
+fn scStr(o: std.json.ObjectMap, key: []const u8, comptime what: []const u8) []const u8 {
+    const v = o.get(key) orelse fail(what ++ ": a fact is missing");
+    if (v != .string) fail(what ++ ": a fact is not a string");
+    return v.string;
+}
+
+fn expectFact(o: std.json.ObjectMap, key: []const u8, want: []const u8, comptime what: []const u8) void {
+    const got = scStr(o, key, what);
+    if (!std.mem.eql(u8, got, want)) {
+        say(key);
+        say(got);
+        fail(what);
+    }
+}
+
+/// A waiter started from a watch_command, its stdout on a pipe.
+const Waiter = struct {
+    pid: c.pid_t,
+    fd: c_int,
+    out: std.ArrayList(u8) = .empty,
+    status: c_int = -1,
+
+    fn start(cmd: []const u8) Waiter {
+        var pipe: [2]c_int = undefined;
+        if (c.pipe(&pipe) != 0) fail("waiter pipe");
+        var cmd_buf: [8192]u8 = undefined;
+        const cmd_z = std.fmt.bufPrintZ(&cmd_buf, "{s}", .{cmd}) catch fail("waiter command too long");
+        const pid = c.fork();
+        if (pid < 0) fail("waiter fork");
+        if (pid == 0) {
+            _ = c.dup2(pipe[1], 1);
+            _ = c.close(pipe[0]);
+            _ = c.close(pipe[1]);
+            var argv: [4:null]?[*:0]const u8 = .{ "/bin/sh", "-c", cmd_z.ptr, null };
+            _ = c.execv("/bin/sh", @ptrCast(&argv));
+            c._exit(127);
+        }
+        _ = c.close(pipe[1]);
+        return .{ .pid = pid, .fd = pipe[0] };
+    }
+
+    /// Everything it printed until it exited, or fail at the deadline.
+    fn finish(self: *Waiter, allocator: std.mem.Allocator, timeout_ms: i64, comptime what: []const u8) []const u8 {
+        const deadline = nowMs() + timeout_ms;
+        while (true) {
+            var pfd = c.struct_pollfd{ .fd = self.fd, .events = c.POLLIN, .revents = 0 };
+            if (c.poll(&pfd, 1, 100) > 0) {
+                var buf: [4096]u8 = undefined;
+                const n = c.read(self.fd, &buf, buf.len);
+                if (n == 0) break;
+                if (n > 0) self.out.appendSlice(allocator, buf[0..@intCast(n)]) catch fail("oom");
+            }
+            if (nowMs() > deadline) {
+                _ = c.kill(self.pid, c.SIGKILL);
+                _ = c.waitpid(self.pid, null, 0);
+                say(self.out.items);
+                fail(what ++ ": the waiter did not exit");
+            }
+        }
+        _ = c.close(self.fd);
+        _ = c.waitpid(self.pid, &self.status, 0);
+        return self.out.items;
+    }
+};
+
+fn sessionListed(allocator: std.mem.Allocator, sock: []const u8, name: []const u8) bool {
+    var buf: [64 * 1024]u8 = undefined;
+    const listing = listSessionsChecked(allocator, sock, &buf, "agent sessions");
+    var needle_buf: [128]u8 = undefined;
+    const needle = std.fmt.bufPrint(&needle_buf, "\"{s}\"", .{name}) catch return false;
+    return std.mem.indexOf(u8, listing, needle) != null;
+}
+
+fn waitUnlisted(allocator: std.mem.Allocator, sock: []const u8, name: []const u8, comptime what: []const u8) void {
+    const deadline = nowMs() + 8_000;
+    while (sessionListed(allocator, sock, name)) {
+        if (nowMs() > deadline) fail(what ++ ": the session is still on the daemon");
+        _ = c.usleep(100_000);
+    }
+}
+
+fn eventKinds(o: std.json.ObjectMap, kind: []const u8) usize {
+    var n: usize = 0;
+    for (o.get("events").?.array.items) |ev| {
+        if (std.mem.eql(u8, ev.object.get("kind").?.string, kind)) n += 1;
+    }
+    return n;
+}
+
+/// The agent_* tools end to end against the REAL server, with this binary
+/// as the agent apps: a fake Claude Code (screen source) and a fake
+/// opencode server plus its attached TUI (API source).
+fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) void {
+    var self_buf: [4096]u8 = undefined;
+    const self_exe = platform.exePath(&self_buf) orelse fail("agent stage: own executable path");
+    _ = c.setenv(FAKE_AGENT_ENV, "1", 1);
+    // What a nested Claude Code must never inherit; the fake refuses to
+    // start with either (the adapter's unset_env removes CLAUDE*).
+    _ = c.setenv("CLAUDE_CODE_CHILD_SESSION", "1", 1);
+    _ = c.setenv("CLAUDE_CONFIG_DIR", "/nonexistent-smoke-claude", 1);
+    defer {
+        _ = c.unsetenv(FAKE_AGENT_ENV);
+        _ = c.unsetenv("CLAUDE_CODE_CHILD_SESSION");
+        _ = c.unsetenv("CLAUDE_CONFIG_DIR");
+    }
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const bin_json = std.fmt.allocPrint(arena, "{f}", .{std.json.fmt(self_exe, .{})}) catch fail("oom");
+
+    {
+        var m = Mcp.spawn(allocator, exe, &.{});
+        m.id += 1;
+        const init_req = std.fmt.allocPrint(arena, "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"{s}\",\"capabilities\":{{}}}}}}", .{ m.id, version.mcp_protocol }) catch fail("oom");
+        m.send(init_req);
+        const init_reply = m.recvLine(10_000);
+        if (std.mem.indexOf(u8, init_reply, "\"instructions\"") == null or std.mem.indexOf(u8, init_reply, "agent_open") == null or
+            std.mem.indexOf(u8, init_reply, "watch_command") == null)
+            fail("initialize carries no instructions about agent_open and watch_command");
+
+        const caps = agentCall(&m, arena, "capabilities", "{}", "capabilities", false, 15_000);
+        if (!caps.get("agents").?.bool) fail("capabilities: agents is false in isolated mode");
+        if (caps.get("agent_ssh").?.bool) fail("capabilities: agent_ssh claims SSH agents");
+        var ids = std.ArrayList(u8).empty;
+        for (caps.get("agent_adapters").?.array.items) |v| ids.appendSlice(arena, v.string) catch {};
+        if (std.mem.indexOf(u8, ids.items, "claude") == null or std.mem.indexOf(u8, ids.items, "opencode") == null)
+            fail("capabilities: agent_adapters lacks claude or opencode");
+        if (std.mem.indexOf(u8, scStr(caps, "agent_waiter", "capabilities"), " mcp agent-wait --socket ") == null)
+            fail("capabilities: agent_waiter is not the waiter command");
+        const mux_sock = arena.dupe(u8, scStr(caps, "mux_socket", "capabilities")) catch fail("oom");
+
+        const ad = agentCall(&m, arena, "agent_adapters", "{}", "agent_adapters", false, 15_000);
+        if (ad.get("count").?.integer < 2) fail("agent_adapters lists fewer than two adapters");
+
+        // ── Claude Code (screen source) ─────────────────────────────
+        const opened = agentCall(&m, arena, "agent_open", std.fmt.allocPrint(arena, "{{\"app\":\"claude\",\"binary\":{s},\"timeout_ms\":30000}}", .{bin_json}) catch fail("oom"), "agent_open claude", false, 45_000);
+        expectFact(opened, "agent", "claude-1", "agent_open: agent id");
+        expectFact(opened, "session", "agent-claude-1", "agent_open: session name");
+        if (!opened.get("ready").?.bool) fail("agent_open: the fake Claude Code never became ready (an unset_env leak makes it refuse to start)");
+        if (std.mem.indexOf(u8, scStr(opened, "watch_command", "agent_open"), " agent-wait ") == null) fail("agent_open: no watch_command");
+        if (!sessionListed(allocator, mux_sock, "agent-claude-1")) fail("agent-claude-1 is not a session on the private daemon");
+
+        const sent = agentCall(&m, arena, "agent_send", "{\"agent\":\"claude-1\",\"text\":\"hello there\",\"timeout_ms\":20000}", "agent_send", false, 45_000);
+        expectFact(sent, "outcome", "done", "agent_send: outcome");
+        expectFact(sent, "message", "echo: hello there", "agent_send: final message");
+
+        const read = agentCall(&m, arena, "agent_read", "{\"agent\":\"claude-1\"}", "agent_read", false, 15_000);
+        const recs = read.get("records").?.array.items;
+        if (recs.len != 2) fail("agent_read: expected the user and assistant records of one turn");
+        if (!std.mem.eql(u8, recs[0].object.get("kind").?.string, "user") or !std.mem.eql(u8, recs[0].object.get("text").?.string, "hello there") or
+            !std.mem.eql(u8, recs[1].object.get("kind").?.string, "assistant"))
+            fail("agent_read: wrong records");
+        var since = read.get("next_since").?.integer;
+
+        // A permission prompt waits for its answer.
+        const asked = agentCall(&m, arena, "agent_send", "{\"agent\":\"claude-1\",\"text\":\"please ask permission\",\"timeout_ms\":20000}", "agent_send permission", false, 45_000);
+        expectFact(asked, "outcome", "needs_input", "agent_send: permission outcome");
+        const it = asked.get("interaction") orelse fail("agent_send: no interaction with needs_input");
+        if (!std.mem.eql(u8, it.object.get("kind").?.string, "permission")) fail("agent_send: the interaction is not a permission");
+        if (it.object.get("options").?.array.items.len != 2) fail("agent_send: the permission has not two options");
+        const answered = agentCall(&m, arena, "agent_answer", "{\"agent\":\"claude-1\",\"choice\":\"No\",\"timeout_ms\":20000}", "agent_answer", false, 45_000);
+        expectFact(answered, "answered", "No", "agent_answer: answered");
+        expectFact(answered, "outcome", "done", "agent_answer: outcome");
+        expectFact(answered, "message", "permission answered No", "agent_answer: final message");
+        const after = agentCall(&m, arena, "agent_read", std.fmt.allocPrint(arena, "{{\"agent\":\"claude-1\",\"since\":{d}}}", .{since}) catch fail("oom"), "agent_read after the permission", false, 15_000);
+        var saw_notice = false;
+        for (after.get("records").?.array.items) |r| {
+            if (std.mem.eql(u8, r.object.get("kind").?.string, "notice") and std.mem.indexOf(u8, r.object.get("text").?.string, "answered: No") != null) saw_notice = true;
+        }
+        if (!saw_notice) fail("agent_read: the answered permission left no notice record");
+
+        // match: a message of an unfinished turn (a background agent runs).
+        const matched = agentCall(&m, arena, "agent_send", "{\"agent\":\"claude-1\",\"text\":\"two parts\",\"match\":\"PART ONE\",\"timeout_ms\":20000}", "agent_send match", false, 45_000);
+        expectFact(matched, "outcome", "match", "agent_send: match outcome");
+        const rest = agentCall(&m, arena, "agent_wait", "{\"agent\":\"claude-1\",\"timeout_ms\":20000}", "agent_wait", false, 45_000);
+        expectFact(rest, "outcome", "done", "agent_wait: outcome");
+        expectFact(rest, "message", "part two", "agent_wait: final message");
+
+        // An opt-in flood: a few messages, the rest as a digest.
+        const flood = agentCall(&m, arena, "agent_send", "{\"agent\":\"claude-1\",\"text\":\"flood 7\",\"messages\":true,\"timeout_ms\":20000}", "agent_send flood", false, 45_000);
+        expectFact(flood, "outcome", "done", "agent_send flood: outcome");
+        const msgs = eventKinds(flood, "message");
+        const digest = flood.get("digest") orelse fail("agent_send flood: no digest");
+        if (msgs > 3 or msgs + @as(usize, @intCast(digest.object.get("count").?.integer)) != 7) fail("agent_send flood: messages + digest do not add up to the 7 messages");
+
+        // The loop observes agents between calls, and a turn that ended
+        // while an unrelated call blocked the loop reads correctly after.
+        const slow = agentCall(&m, arena, "agent_send", "{\"agent\":\"claude-1\",\"text\":\"slow reply\",\"timeout_ms\":0}", "agent_send slow", false, 15_000);
+        expectFact(slow, "outcome", "still_working", "agent_send slow: outcome");
+        const before_slow = agentCall(&m, arena, "agent_read", "{\"agent\":\"claude-1\"}", "agent_read before slow", false, 15_000);
+        since = before_slow.get("next_since").?.integer;
+        var one_shot = Waiter.start(scStr(slow, "watch_command", "agent_send slow"));
+        const term = agentCall(&m, arena, "term_open", "{}", "term_open", false, 30_000);
+        const term_id = term.get("term").?.integer;
+        _ = agentCall(&m, arena, "term_exec", std.fmt.allocPrint(arena, "{{\"term\":{d},\"command\":\"sleep 3\",\"timeout_ms\":20000}}", .{term_id}) catch fail("oom"), "term_exec sleep", false, 45_000);
+        const woke = one_shot.finish(arena, 15_000, "one-shot waiter");
+        if (std.mem.indexOf(u8, woke, "claude-1 done: echo: slow reply") == null) {
+            say(woke);
+            fail("the one-shot waiter did not print the done wake-up");
+        }
+        if (one_shot.status != 0) fail("the one-shot waiter did not exit 0");
+        const slow_done = agentCall(&m, arena, "agent_wait", "{\"agent\":\"claude-1\",\"timeout_ms\":5000}", "agent_wait slow", false, 15_000);
+        expectFact(slow_done, "outcome", "done", "agent_wait slow: outcome");
+        expectFact(slow_done, "message", "echo: slow reply", "agent_wait slow: message");
+        const slow_read = agentCall(&m, arena, "agent_read", std.fmt.allocPrint(arena, "{{\"agent\":\"claude-1\",\"since\":{d}}}", .{since}) catch fail("oom"), "agent_read slow", false, 15_000);
+        // The turn was captured once, late: its prompt and its answer, each once.
+        const slow_recs = slow_read.get("records").?.array.items;
+        if (slow_recs.len != 2 or !std.mem.eql(u8, slow_recs[0].object.get("text").?.string, "slow reply") or
+            !std.mem.eql(u8, slow_recs[1].object.get("text").?.string, "echo: slow reply"))
+        {
+            say(std.json.Stringify.valueAlloc(arena, slow_read.get("records").?, .{}) catch "?");
+            fail("agent_read: the late-observed turn is not exactly its answer");
+        }
+        _ = agentCall(&m, arena, "term_close", std.fmt.allocPrint(arena, "{{\"term\":{d}}}", .{term_id}) catch fail("oom"), "term_close", false, 15_000);
+
+        // --follow: one line per wake-up, then `watch ended` on close.
+        const follow_cmd = std.fmt.allocPrint(arena, "{s} --follow", .{scStr(slow_done, "watch_command", "agent_wait slow")}) catch fail("oom");
+        var follower = Waiter.start(follow_cmd);
+        _ = c.usleep(300_000);
+        const again = agentCall(&m, arena, "agent_send", "{\"agent\":\"claude-1\",\"text\":\"hello again\",\"timeout_ms\":20000}", "agent_send again", false, 45_000);
+        expectFact(again, "outcome", "done", "agent_send again: outcome");
+        const more = agentCall(&m, arena, "agent_send", "{\"agent\":\"claude-1\",\"text\":\"and once more\",\"timeout_ms\":20000}", "agent_send more", false, 45_000);
+        expectFact(more, "outcome", "done", "agent_send more: outcome");
+        const closed = agentCall(&m, arena, "agent_close", "{\"agent\":\"claude-1\"}", "agent_close claude", false, 15_000);
+        if (!closed.get("closed").?.bool or closed.get("sessions").?.array.items.len != 1) fail("agent_close: did not close the one session");
+        const followed = follower.finish(arena, 15_000, "follow waiter");
+        if (std.mem.count(u8, followed, "claude-1 done") < 2 or std.mem.indexOf(u8, followed, "watch ended: agent closed") == null) {
+            say(followed);
+            fail("the --follow waiter did not print each turn and then watch ended");
+        }
+        waitUnlisted(allocator, mux_sock, "agent-claude-1", "agent_close claude");
+        say("smoke-mcp: agents: fake Claude Code (open, send, read, permission, match, flood, waiters, late backlog, close) ok");
+
+        // ── opencode (API source) ───────────────────────────────────
+        const oc = agentCall(&m, arena, "agent_open", std.fmt.allocPrint(arena, "{{\"app\":\"opencode\",\"binary\":{s},\"timeout_ms\":30000}}", .{bin_json}) catch fail("oom"), "agent_open opencode", false, 45_000);
+        expectFact(oc, "agent", "opencode-1", "agent_open opencode: agent id");
+        expectFact(oc, "session", "agent-opencode-1", "agent_open opencode: session");
+        expectFact(oc, "server_session", "agent-opencode-1-server", "agent_open opencode: server session");
+        if (!oc.get("ready").?.bool) fail("agent_open opencode: not ready");
+        if (!sessionListed(allocator, mux_sock, "agent-opencode-1") or !sessionListed(allocator, mux_sock, "agent-opencode-1-server"))
+            fail("the opencode sessions are not on the private daemon");
+        const set = agentCall(&m, arena, "agent_set", "{\"agent\":\"opencode-1\",\"model\":\"fakeprov/m1\",\"effort\":\"high\"}", "agent_set opencode", false, 30_000);
+        expectFact(set, "current_model", "fakeprov/m1", "agent_set: current model");
+        expectFact(set, "current_effort", "high", "agent_set: current effort");
+        const oc_sent = agentCall(&m, arena, "agent_send", "{\"agent\":\"opencode-1\",\"text\":\"what model\",\"timeout_ms\":20000}", "agent_send opencode", false, 45_000);
+        expectFact(oc_sent, "outcome", "done", "agent_send opencode: outcome");
+        expectFact(oc_sent, "message", "echo: what model model=fakeprov/m1 variant=high", "agent_send opencode: the model and variant reached the server");
+        const oc_match = agentCall(&m, arena, "agent_send", "{\"agent\":\"opencode-1\",\"text\":\"two messages\",\"match\":\"alpha\",\"timeout_ms\":20000}", "agent_send opencode match", false, 45_000);
+        expectFact(oc_match, "outcome", "match", "agent_send opencode: match outcome");
+        const oc_rest = agentCall(&m, arena, "agent_wait", "{\"agent\":\"opencode-1\",\"timeout_ms\":20000}", "agent_wait opencode", false, 45_000);
+        expectFact(oc_rest, "outcome", "done", "agent_wait opencode: outcome");
+        expectFact(oc_rest, "message", "beta two", "agent_wait opencode: message");
+        const oc_perm = agentCall(&m, arena, "agent_send", "{\"agent\":\"opencode-1\",\"text\":\"needs permission\",\"timeout_ms\":20000}", "agent_send opencode permission", false, 45_000);
+        expectFact(oc_perm, "outcome", "needs_input", "agent_send opencode permission: outcome");
+        const oc_ans = agentCall(&m, arena, "agent_answer", "{\"agent\":\"opencode-1\",\"choice\":\"Reject\",\"timeout_ms\":20000}", "agent_answer opencode", false, 45_000);
+        expectFact(oc_ans, "answered", "Reject", "agent_answer opencode: answered");
+        expectFact(oc_ans, "outcome", "done", "agent_answer opencode: outcome");
+        expectFact(oc_ans, "message", "permission reject", "agent_answer opencode: message");
+        const oc_closed = agentCall(&m, arena, "agent_close", "{\"agent\":\"opencode-1\"}", "agent_close opencode", false, 15_000);
+        if (oc_closed.get("sessions").?.array.items.len != 2) fail("agent_close opencode: not both sessions");
+        waitUnlisted(allocator, mux_sock, "agent-opencode-1", "agent_close opencode");
+        waitUnlisted(allocator, mux_sock, "agent-opencode-1-server", "agent_close opencode server");
+        say("smoke-mcp: agents: fake opencode (open, set, send, match, permission, close) ok");
+        m.closeStdinWait();
+    }
+
+    // ── a durable instance picks its agents up again ─────────────────
+    {
+        var d1 = Mcp.spawn(allocator, exe, &.{ "--name", "agentdur" });
+        d1.initialize();
+        const opened = agentCall(&d1, arena, "agent_open", std.fmt.allocPrint(arena, "{{\"app\":\"claude\",\"binary\":{s},\"prompt\":\"before restart\",\"timeout_ms\":30000}}", .{bin_json}) catch fail("oom"), "durable agent_open", false, 45_000);
+        expectFact(opened, "outcome", "done", "durable agent_open: prompt outcome");
+        expectFact(opened, "message", "echo: before restart", "durable agent_open: prompt answer");
+        d1.closeStdinWait();
+        var desc_buf: [512]u8 = undefined;
+        const desc = std.fmt.bufPrintZ(&desc_buf, "{s}/sketerm/mcp-agentdur/agents/claude-1.json", .{rt}) catch fail("path");
+        var st: c.struct_stat = undefined;
+        if (c.stat(desc.ptr, &st) != 0) fail("durable: no agent descriptor in the instance dir");
+        if ((st.st_mode & 0o777) != 0o600) fail("durable: the agent descriptor is not 0600");
+
+        var d2 = Mcp.spawn(allocator, exe, &.{ "--name", "agentdur" });
+        d2.initialize();
+        const listed = agentCall(&d2, arena, "agent_list", "{}", "durable agent_list", false, 15_000);
+        if (listed.get("count").?.integer != 1) fail("durable: the restarted server did not pick its agent up");
+        const back = agentCall(&d2, arena, "agent_send", "{\"agent\":\"claude-1\",\"text\":\"after restart\",\"timeout_ms\":20000}", "durable agent_send", false, 45_000);
+        expectFact(back, "outcome", "done", "durable agent_send: outcome");
+        expectFact(back, "message", "echo: after restart", "durable agent_send: message");
+        _ = agentCall(&d2, arena, "agent_close", "{\"agent\":\"claude-1\"}", "durable agent_close", false, 15_000);
+        if (c.stat(desc.ptr, &st) == 0) fail("durable: agent_close left the descriptor behind");
+        d2.closeStdinWait();
+        say("smoke-mcp: agents: a durable instance re-attaches its running agent ok");
+    }
 }

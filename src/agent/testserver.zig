@@ -2,9 +2,11 @@
 //! fixed responses, and every `GET /event` connection streams the pushed
 //! SSE events as chunked `data:` lines, like opencode's server. A route can
 //! push events when it is hit, so a reply the client sends is answered on
-//! the stream the way the real server answers it.
+//! the stream the way the real server answers it; a `hook` answers what a
+//! fixed route cannot (it sees the request body).
 //!
-//! Test support only (imported from test blocks). Each accepted connection
+//! Test support only: the agent tests import it, and smoke-mcp serves it
+//! on a chosen port as a fake `opencode serve`. Each accepted connection
 //! runs on its own thread; shared state lives in fixed arrays behind the
 //! repo's spinlock, which is never held across an allocation or IO.
 
@@ -31,6 +33,10 @@ pub const Reply = struct {
 
 const Route = struct { key: []const u8, reply: Reply };
 
+/// Answers a request before the routes do, or null to leave it to them.
+/// Runs on the connection's thread; it may `pushEvent`.
+pub const Hook = *const fn (ctx: ?*anyopaque, srv: *Server, method: []const u8, path: []const u8, body: []const u8) ?Reply;
+
 const MAX_ROUTES = 64;
 const MAX_REQUESTS = 256;
 const MAX_EVENTS = 1024;
@@ -52,10 +58,21 @@ pub const Server = struct {
     closed_count: std.atomic.Value(u32) = .init(0),
     end: std.atomic.Value(bool) = .init(false),
     stopping: std.atomic.Value(bool) = .init(false),
+    hook: ?Hook = null,
+    hook_ctx: ?*anyopaque = null,
+    /// `Basic <base64(user:password)>` every request must carry ("" = no
+    /// check); a request without it is answered 401, like opencode.
+    auth: []const u8 = "",
 
     pub fn start(self: *Server, allocator: std.mem.Allocator) !void {
         self.allocator = allocator;
         if (!self.lis.start(self, onAccept)) return error.ListenFailed;
+    }
+
+    /// `start` on loopback `port` (0 = an ephemeral one).
+    pub fn startOn(self: *Server, allocator: std.mem.Allocator, port_: u16) !void {
+        self.lis.bind_port = port_;
+        return self.start(allocator);
     }
 
     pub fn deinit(self: *Server) void {
@@ -188,16 +205,21 @@ pub const Server = struct {
             } else self.allocator.free(owned);
             self.lock.unlock();
 
+            const head_end = std.mem.indexOf(u8, req, "\r\n\r\n").?;
+            if (self.auth.len > 0 and !authorized(req[0..head_end], self.auth)) {
+                writeResponse(fd, .{ .status = 401, .close_after = true }, "{\"name\":\"Unauthorized\"}");
+                return;
+            }
             if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/event")) {
                 self.stream(fd);
                 return;
             }
             var key_buf: [512]u8 = undefined;
             const key = std.fmt.bufPrint(&key_buf, "{s} {s}", .{ method, path }) catch return;
-            const reply = self.lookup(key) orelse Reply{ .status = 404, .body = "{\"name\":\"NotFoundError\",\"data\":{\"message\":\"no route\"}}" };
+            const hooked = if (self.hook) |h| h(self.hook_ctx, self, method, path, req[head_end + 4 ..]) else null;
+            const reply = hooked orelse self.lookup(key) orelse Reply{ .status = 404, .body = "{\"name\":\"NotFoundError\",\"data\":{\"message\":\"no route\"}}" };
             var waited: u32 = 0;
             while (waited < reply.delay_ms and !self.stopping.load(.acquire)) : (waited += 5) _ = c.usleep(5000);
-            const head_end = std.mem.indexOf(u8, req, "\r\n\r\n").?;
             const body = if (reply.echo) req[head_end + 4 ..] else reply.body;
             writeResponse(fd, reply, body);
             for (reply.events) |e| self.pushEvent(e);
@@ -270,6 +292,16 @@ pub const Server = struct {
         }
     }
 };
+
+/// The request head carries `Authorization: <want>`.
+fn authorized(head: []const u8, want: []const u8) bool {
+    var lines = std.mem.splitSequence(u8, head, "\r\n");
+    while (lines.next()) |l| {
+        if (!std.ascii.startsWithIgnoreCase(l, "authorization:")) continue;
+        return std.mem.eql(u8, std.mem.trim(u8, l["authorization:".len..], " "), want);
+    }
+    return false;
+}
 
 fn writeResponse(fd: c_int, reply: Reply, body: []const u8) void {
     var head: [512]u8 = undefined;
