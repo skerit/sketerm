@@ -63,6 +63,9 @@ pub const Interaction = struct {
     /// use this session only"); "" when the app gives none.
     hint: []const u8,
     options: []const Option,
+    /// A free-text answer is accepted (agent_answer `text`); derived, so
+    /// not part of `hash`.
+    free_text: bool = false,
     /// The screen lines it occupies, header to hint: [rows_start, rows_end)
     /// (screen sources only).
     rows_start: usize = 0,

@@ -232,19 +232,19 @@ is kept by a `:ro` policy term. The full descriptions and schemas are in
 
 - `agent_adapters` (read-only): List the agent adapters this server can run (shipped ones plus user files in $XDG_CONFIG_HOME/sketerm/agents/*.json), whether each app's binary is installed on this machine (and where), and which actions each supports.
 - `agent_open`: Run another coding agent as a SUB-AGENT and talk to it in clean records, never raw screens: app "claude" (Claude Code) or "opencode" (see agent_adapters).
-- `agent_send`: Send a prompt to an idle agent and wait (bounded, timeout_ms default 60000, max 120000) for the turn.
+- `agent_send`: Send a prompt to an agent and wait (bounded, timeout_ms default 60000, max 120000) for the turn.
 - `agent_wait` (read-only): Wait (bounded, timeout_ms default 60000, max 120000) for an agent's next wake-up, with agent_send's filter rules, and return the events no result or waiter delivered before (a turn that finished meanwhile answers at once, with its job's answer and key messages, as agent_send).
 - `agent_read` (read-only): Read what an agent did, per JOB (one user prompt and everything until the next, turns the agent started on its own included), returning only what no result has handed you before: delivery is per record, so every selected message reaches you once, whether a read or a done result (agent_send/agent_wait/agent_answer/agent_open) carried it; a job's earlier ones are not repeated, jobs[].earlier points at one, and with nothing new the read says so and returns no records.
-- `agent_answer`: Answer the agent's pending prompt (permission, question or choice; see interaction) by option label, its 1-based number or a unique part of a label, then wait for the turn like agent_send.
+- `agent_answer`: Answer the agent's pending prompt (permission, question or choice; see interaction) with `choice` (an option label, its 1-based number or a unique part of a label) OR `text` (a free-text answer, when interaction.free_text says the prompt takes one), then wait for the turn like agent_send.
 - `agent_set`: Change an agent's model and/or effort level for THIS session only, never the user's defaults (Claude Code: /model with its session-only choice, confirmed by the app before this returns; effort by restarting Claude Code in the same terminal with --effort and resuming the conversation, since its /effort saves the user's default; opencode: the model and variant of the prompts this agent sends).
 - `agent_interrupt`: Interrupt an agent's running turn (Claude Code: Escape; opencode: abort, subagents included).
-- `agent_list` (read-only): List this server's agents: app, state, the session the user can watch, and how many wake-ups each holds that no agent_* result has handed out yet.
+- `agent_list` (read-only): List this server's agents, one line each: app, model and effort when known, state, where it runs (host or this machine, transport) and in which directory (cwd: which clone a worker is in), the binary, the session(s) the user can watch, when it was started and last showed activity (wall-clock ms), how many prompts its app holds queued, and how many wake-ups each holds that no agent_* result has handed out yet.
 - `agent_close`: Stop an agent: kills its session(s) and ends its waiters.
 - `agent_attach`: Put an adapter on a terminal term_open already created, when you started the app yourself (screen adapters only, e.g. claude --ax-screen-reader).
 
 ### `core`
 
-- `capabilities` (read-only): Preflight report of what THIS MCP server can do right now: isolation mode, headless GUI-app support (headless_gui — launch_app renders apps into the mux daemon and NEVER needs a display, an X server or a sketerm window), whether a direct sketerm GUI control socket is attached (gui_socket; independent of the session panel relay and of headless GUI apps), the live panel transport (panels + panel_transport) and the saved-panel store (panels_store + panel_store), OCR (tesseract) availability, whether the web_* tools can run and against what (web + web_backend "gui"/"session"/"headless"/"none" — "session" adds web_session, the watchable Wayland app session the helper renders into — plus the sketerm-webengine path in web_helper; web_gui says whether the user granted the web_* tools their OWN browser and logins, web_gui_source where that came from and web_gui_transport which GUI socket they hold now; web_profiles says whether named cookie jars work, web_routes which per-tab network routes web_open can honour, web_engine_broker whether the mux daemon owns the engine's lifetime and web_engine_owner who started the one in use; web_downloads whether web_download can pull a url through a view; web_capture whether web_open can record the response bodies a headless view's page receives; web_engine_started whether an engine exists YET, since web_backend/web_watch/web_session are undetermined until it does), ssh/scp presence, the directory terminal asciicast recordings land in, the EFFECTIVE input-timing defaults (hold_ms/settle_ms/timeout_ms/click_retry, each marked when a SKETERM_MCP_* env override changed it from the built-in), whether sub-agents run here (agents, agent_adapters, agent_waiter, agent_ssh, agent_open_args_env for a wrapper's args and env) and how agent_read selects what it returns (agent_read_select), how sub-agent output is delivered (agent_records_once, agent_events_shared), whether agent_wait can watch several agents (agent_wait_any) and when done fires (agent_done), and open session counts.
+- `capabilities` (read-only): Preflight report of what THIS MCP server can do right now: isolation mode, headless GUI-app support (headless_gui — launch_app renders apps into the mux daemon and NEVER needs a display, an X server or a sketerm window), whether a direct sketerm GUI control socket is attached (gui_socket; independent of the session panel relay and of headless GUI apps), the live panel transport (panels + panel_transport) and the saved-panel store (panels_store + panel_store), OCR (tesseract) availability, whether the web_* tools can run and against what (web + web_backend "gui"/"session"/"headless"/"none" — "session" adds web_session, the watchable Wayland app session the helper renders into — plus the sketerm-webengine path in web_helper; web_gui says whether the user granted the web_* tools their OWN browser and logins, web_gui_source where that came from and web_gui_transport which GUI socket they hold now; web_profiles says whether named cookie jars work, web_routes which per-tab network routes web_open can honour, web_engine_broker whether the mux daemon owns the engine's lifetime and web_engine_owner who started the one in use; web_downloads whether web_download can pull a url through a view; web_capture whether web_open can record the response bodies a headless view's page receives; web_engine_started whether an engine exists YET, since web_backend/web_watch/web_session are undetermined until it does), ssh/scp presence, the directory terminal asciicast recordings land in, the EFFECTIVE input-timing defaults (hold_ms/settle_ms/timeout_ms/click_retry, each marked when a SKETERM_MCP_* env override changed it from the built-in), whether sub-agents run here (agents, agent_adapters, agent_waiter, agent_ssh, agent_open_args_env for a wrapper's args and env) and how agent_read selects what it returns (agent_read_select), how sub-agent output is delivered (agent_records_once, agent_events_shared), whether agent_wait can watch several agents (agent_wait_any), whether agent_send queues a prompt for a busy agent (agent_send_queue) and agent_answer takes free text (agent_answer_text), and when done fires (agent_done), and open session counts.
 <!-- tool-reference:end -->
 
 ## Tool exposure policy
@@ -739,6 +739,52 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   waits on several agents: the first wake-up of any wins, the result is
   that agent's (`agents` lists the ones waited on) and its
   `watch_command` waits on all of them with `--any`.
+- **Messaging a busy agent (`capabilities.agent_send_queue`).**
+  `agent_send` to an agent that works (`working`, `waiting_subagent`,
+  `retrying`: `vocab.State.queuesPrompt`) puts the prompt in the app's
+  OWN queue for its next turn instead of refusing it, so "Docker is
+  fixed" reaches a worker without interrupting its turn; the result
+  carries `queued: true`, and `outcome: "queued"` when the call returned
+  before the app took it. Both apps queue natively (measured): Claude Code
+  2.1.287 takes typed input while it works, draws it as a `you:` preview
+  with `ctrl+enter to send now` under it above the status block, and at the
+  turn's end prints it as an ordinary prompt below the footer and starts a
+  turn for it (the adapter's `actions.queue` recipe types it without the
+  Escapes that would interrupt, and `screen.queued` marks the preview
+  live, never a record; an idle app still showing one is not done);
+  opencode (oc11) answers `prompt_async` on a busy session with 204,
+  creates the user message at once and runs it after the current answer
+  (its records keep the job of the prompt they answer, by `parentID`). A
+  queued prompt is a user prompt like any other: it starts a new job when
+  the app takes it. The turn it waited behind never settles on its own,
+  so it raises no `done`; the queued job's `done` covers every job since
+  the previous waking done (`Event.first_job`, `select.Waker`), and its
+  result's `records`/`jobs` include the earlier job's final message, so
+  nothing is lost and the caller is woken once. The wait is for the queued
+  job (same `timeout_ms` and wake rules; a `needs_input` meanwhile still
+  wakes). Refused: an agent waiting for an answer (`conflict`: typed keys
+  would answer its prompt), a Claude Code whose input box holds text a
+  human is typing (`conflict`: it would merge), an adapter without a
+  `queue` recipe (`conflict`, as before), and a typed prompt the app did
+  not take out of its input box within 10 s (`timeout`, with the screen).
+- **Free-text answers (`capabilities.agent_answer_text`).** `agent_answer
+  text:"..."` (instead of `choice`) answers a prompt in words when
+  `interaction.free_text` says it takes them; otherwise it is refused as
+  `invalid_args` naming the options, never answered with a guessed one.
+  Claude Code: the adapter's `screen.text_options` rules name the option a
+  text goes through (its permission's `No`, measured 2.1.287: in ax mode
+  the dialog offers `1. Yes / 2. Yes, and always… / 3. No`, and `No` ends
+  the turn with `Interrupted · What should Claude do instead?`), and the
+  `answer_text` recipe picks it, waits for the app to be idle and types the
+  text as the next prompt, which is a new job; the refused job's `done`
+  rides along in the result, the wait is for the text's turn. opencode:
+  a permission is rejected with the text as `message` (the model gets "The
+  user rejected permission ... with the following feedback: <text>" in
+  the same turn), a question takes it as a custom answer (one line per
+  question when it asks several; a question with `custom: false` has no
+  free-text route). Claude Code's AskUserQuestion dialog was not available
+  to measure (the tool is not offered in this setup), so no text rule
+  exists for its questions yet.
 - **`done` means settled.** An agent is done when it is idle with no
   subagents and no background tasks running. Claude Code shows a shell it
   started in the background on its mode line (`manual mode on  ·  1
@@ -875,6 +921,14 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   existed reads as none), and the next server re-attaches them, over ssh for a
   remote daemon's sessions. A descriptor whose session is gone is
   removed.
+- **`agent_list`** gives one short text line per agent and, per agent in
+  `agents`, where and how it runs: `host` (absent: this machine),
+  `transport`, `cwd` (which clone a worker is in), `binary`, `model` and
+  `effort` when known (Claude Code: the launch value or the model chosen
+  since; opencode: the next prompt's), `state`, `session`/`sessions`
+  (opencode adds its server's), `started_ms` (kept across a durable
+  reattach), `last_activity_ms` (the app last drew or sent anything; both
+  Unix ms), `queued_prompts`, `pending_events` and `recordings`.
 - **`agent_attach`** puts a screen adapter on a terminal `term_open`
   created (you started the app yourself); `agent_close` then drops only
   the adapter.

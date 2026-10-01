@@ -71,6 +71,8 @@ pub const Event = struct {
     detail: []u8,
     /// `done`: the job whose segment ended (`select.zig`).
     job: ?u32 = null,
+    /// `done`: the oldest job it covers (`select.SegmentEnd.first_job`).
+    first_job: ?u32 = null,
     /// `done` and `message`: the record whose text `text` is (the job's
     /// answer, the completed message); null for a done without one.
     record: ?u64 = null,
@@ -159,12 +161,14 @@ pub const Queue = struct {
 
     /// Record that `job`'s segment ended with `text` as its answer.
     /// @return the seq.
+    /// @param first_job the oldest job the done covers.
     /// @param record the answer's record, null when the job has none.
     /// @param background_tasks set when it fired with background tasks still running.
-    pub fn pushDone(self: *Queue, now_ms: i64, job: u32, text: []const u8, record: ?u64, background_tasks: ?u32) !u64 {
+    pub fn pushDone(self: *Queue, now_ms: i64, job: u32, first_job: u32, text: []const u8, record: ?u64, background_tasks: ?u32) !u64 {
         const seq = try self.push(now_ms, .done, null, text, "");
         const ev = &self.events.items[self.events.items.len - 1];
         ev.job = job;
+        ev.first_job = first_job;
         ev.record = record;
         ev.background_tasks = background_tasks;
         return seq;
@@ -474,7 +478,7 @@ test "a preview is the first line, cut on a UTF-8 boundary at PREVIEW_MAX bytes"
     var q = Queue.init(t.allocator, .{});
     defer q.deinit();
     _ = try q.pushMessage(0, "msg", 7);
-    _ = try q.pushDone(0, 2, "msg", 7, null);
+    _ = try q.pushDone(0, 2, 1, "msg", 7, null);
     try t.expectEqual(@as(?u64, 7), q.events.items[0].record);
     try t.expectEqual(@as(?u64, 7), q.events.items[1].record);
     try t.expectEqual(@as(?u32, 2), q.events.items[1].job);

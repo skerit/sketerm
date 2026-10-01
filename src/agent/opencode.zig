@@ -183,6 +183,11 @@ pub const Source = struct {
     next_record_id: u64 = 1,
     /// Root user messages seen; the current turn is `turns - 1`.
     turns: u32 = 0,
+    /// The turn of the latest root assistant message: the prompt being
+    /// answered (later root prompts wait in the server's queue).
+    answering: ?u32 = null,
+    /// The `now_ms` of the latest event read from the app.
+    activity_ms: i64 = 0,
 
     pending: std.ArrayList(*Pending) = .empty,
 
@@ -261,6 +266,7 @@ pub const Source = struct {
         const type_name = str(ev, "type") orelse return;
         const props = get(ev, "properties") orelse Value{ .null = {} };
         const kind = std.meta.stringToEnum(EventType, type_name) orelse return;
+        self.activity_ms = now_ms;
         switch (kind) {
             .@"server.connected" => self.connected = true,
             .@"session.created", .@"session.updated" => try self.applySessionInfo(get(props, "info") orelse return),
@@ -332,7 +338,7 @@ pub const Source = struct {
     pub fn addNotice(self: *Source, text: []const u8) !void {
         var buf: [32]u8 = undefined;
         const key = std.fmt.bufPrint(&buf, "notice:{d}", .{self.next_record_id}) catch unreachable;
-        _ = try self.upsert(key, .notice, text, null, true);
+        _ = try self.upsert(key, .notice, text, null, true, self.turns -| 1);
     }
 
     /// Replace the pending requests with the server's lists (a resync).
@@ -434,6 +440,15 @@ pub const Source = struct {
     pub fn interaction(self: *const Source) ?Interaction {
         const p = self.pendingRequest() orelse return null;
         return p.interaction;
+    }
+
+    /// Root prompts the server holds for a later turn (sent while busy).
+    pub fn queuedPrompts(self: *const Source) u32 {
+        const r = self.root orelse return 0;
+        const s = self.sessions.get(r) orelse return 0;
+        if (s.status == .idle) return 0;
+        const answering = self.answering orelse return 0;
+        return (self.turns -| 1) -| answering;
     }
 
     /// Sessions whose parent is unknown (the IO half looks them up once).
@@ -562,6 +577,12 @@ pub const Source = struct {
         const id = str(info, "id") orelse return;
         const sid = str(info, "sessionID") orelse return;
         const role = std.meta.stringToEnum(Role, str(info, "role") orelse return) orelse return;
+        // An answer belongs to the prompt it answers (a prompt queued while
+        // the server works is created before the earlier answer ends).
+        const parent_turn: ?u32 = if (role == .assistant) blk: {
+            const pid = str(info, "parentID") orelse break :blk null;
+            break :blk if (self.messages.get(pid)) |pm| pm.turn else null;
+        } else null;
         const gop = try self.messages.getOrPut(self.allocator, id);
         if (!gop.found_existing) {
             gop.key_ptr.* = self.allocator.dupe(u8, id) catch |err| {
@@ -579,7 +600,8 @@ pub const Source = struct {
                 self.turns += 1;
                 if (!self.quiet) self.startTurn();
             }
-            gop.value_ptr.* = .{ .role = role, .session = session_copy, .turn = self.turns -| 1, .opened_turn = opens, .armed_before = armed };
+            gop.value_ptr.* = .{ .role = role, .session = session_copy, .turn = parent_turn orelse self.turns -| 1, .opened_turn = opens, .armed_before = armed };
+            if (role == .assistant and self.isRoot(sid)) self.answering = gop.value_ptr.turn;
         }
         const m = gop.value_ptr;
         if (boolean(info, "summary") orelse false) m.summary = true;
@@ -607,6 +629,12 @@ pub const Source = struct {
         self.idle_since_ms = null;
     }
 
+    /// The job a message's records belong to.
+    fn jobOf(self: *const Source, message_id: []const u8) u32 {
+        if (self.messages.get(message_id)) |m| return m.turn;
+        return self.turns -| 1;
+    }
+
     fn messageError(self: *Source, message_id: []const u8, err: Value) !void {
         const name = str(err, "name") orelse "UnknownError";
         const data = get(err, "data") orelse Value{ .null = {} };
@@ -614,7 +642,7 @@ pub const Source = struct {
         var key_buf: [160]u8 = undefined;
         const key = std.fmt.bufPrint(&key_buf, "error:{s}", .{message_id}) catch "error:";
         if (std.mem.eql(u8, name, "MessageAbortedError")) {
-            _ = try self.upsert(key, .notice, "interrupted", null, false);
+            _ = try self.upsert(key, .notice, "interrupted", null, false, self.jobOf(message_id));
             return;
         }
         var line: std.ArrayList(u8) = .empty;
@@ -628,7 +656,7 @@ pub const Source = struct {
         _ = try self.queue.push(self.clockNow(), .@"error", class, line.items, detail);
         const note = try std.fmt.allocPrint(self.allocator, "error: {s}", .{line.items});
         defer self.allocator.free(note);
-        _ = try self.upsert(key, .notice, note, null, false);
+        _ = try self.upsert(key, .notice, note, null, false, self.jobOf(message_id));
     }
 
     fn applyPart(self: *Source, part: Value, now_ms: i64) !void {
@@ -649,13 +677,13 @@ pub const Source = struct {
                 const role: Role = if (self.messages.get(mid)) |m| m.role else if (get(part, "time") == null) .user else .assistant;
                 if (role == .user) {
                     if (std.mem.trim(u8, text, " \n").len == 0) return;
-                    _ = try self.upsert(pid, .user, text, null, false);
+                    _ = try self.upsert(pid, .user, text, null, false, self.jobOf(mid));
                     return;
                 }
                 const ended = if (get(part, "time")) |tm| get(tm, "end") != null else false;
                 if (!ended) return self.liveSnapshot(pid, mid, text);
                 self.dropLive(pid);
-                try self.finalizeText(pid, text);
+                try self.finalizeText(pid, mid, text);
             },
             .tool => {
                 const state = get(part, "state") orelse return;
@@ -671,18 +699,18 @@ pub const Source = struct {
                 };
                 const summary = try toolSummary(self.allocator, name, get(state, "input"));
                 defer self.allocator.free(summary);
-                _ = try self.upsert(pid, .tool, summary, .{ .name = name, .input = input, .status = status, .output = out }, false);
+                _ = try self.upsert(pid, .tool, summary, .{ .name = name, .input = input, .status = status, .output = out }, false, self.jobOf(mid));
             },
             .subtask => {
                 const cmd = str(part, "command") orelse str(part, "agent") orelse "subtask";
                 const desc = str(part, "description") orelse "";
                 const text = try std.fmt.allocPrint(self.allocator, "/{s} (subtask): {s}", .{ cmd, desc });
                 defer self.allocator.free(text);
-                _ = try self.upsert(pid, .notice, text, null, false);
+                _ = try self.upsert(pid, .notice, text, null, false, self.jobOf(mid));
             },
             .compaction => {
                 self.undoCompactionTurn(mid);
-                _ = try self.upsert(pid, .notice, "compaction requested", null, false);
+                _ = try self.upsert(pid, .notice, "compaction requested", null, false, self.jobOf(mid));
             },
         }
     }
@@ -762,13 +790,13 @@ pub const Source = struct {
             const key = try self.allocator.dupe(u8, pid);
             defer self.allocator.free(key);
             self.dropLive(pid);
-            try self.finalizeText(key, text);
+            try self.finalizeText(key, message_id, text);
         }
     }
 
-    fn finalizeText(self: *Source, pid: []const u8, text: []const u8) !void {
+    fn finalizeText(self: *Source, pid: []const u8, mid: []const u8, text: []const u8) !void {
         if (std.mem.trim(u8, text, " \n").len == 0) return;
-        const rec = (try self.upsert(pid, .assistant, text, null, false)) orelse return;
+        const rec = (try self.upsert(pid, .assistant, text, null, false, self.jobOf(mid))) orelse return;
         if (rec.announced) return;
         rec.announced = true;
         if (self.quiet) return;
@@ -784,7 +812,7 @@ pub const Source = struct {
 
     /// Create or update the record for `ref`.
     /// @return the record when it was created or changed, null when unchanged.
-    fn upsert(self: *Source, ref: []const u8, kind: vocab.RecordKind, text: []const u8, tool: ?ToolFields, synthetic: bool) !?*Record {
+    fn upsert(self: *Source, ref: []const u8, kind: vocab.RecordKind, text: []const u8, tool: ?ToolFields, synthetic: bool, job: u32) !?*Record {
         const a = self.allocator;
         if (self.by_ref.get(ref)) |i| {
             const r = &self.records.items[i];
@@ -813,7 +841,7 @@ pub const Source = struct {
             .id = self.nextId(),
             .kind = kind,
             .text = owned_text,
-            .job = self.turns -| 1,
+            .job = job,
             .synthetic = synthetic,
             .tool = owned_tool,
         });
@@ -829,7 +857,7 @@ pub const Source = struct {
     fn notice(self: *Source, key_prefix: []const u8, text: []const u8) !void {
         var buf: [48]u8 = undefined;
         const key = std.fmt.bufPrint(&buf, "{s}{d}", .{ key_prefix, self.next_record_id }) catch unreachable;
-        _ = try self.upsert(key, .notice, text, null, false);
+        _ = try self.upsert(key, .notice, text, null, false, self.turns -| 1);
     }
 
     fn noteModel(self: *Source, provider: ?[]const u8, model: ?[]const u8, variant: ?[]const u8) !void {
@@ -917,6 +945,8 @@ pub const Source = struct {
             .detail = detail.items,
             .hint = "",
             .options = &permission_options,
+            // A reject carries the user's message to the model.
+            .free_text = true,
         };
         try self.pending.append(self.allocator, p);
     }
@@ -961,12 +991,15 @@ pub const Source = struct {
         if (qs.items.len > 1) {
             hint = try std.fmt.allocPrint(a, "{d} questions: answer each on its own line", .{qs.items.len});
         } else if (first.multiple) hint = "several options may be chosen, separated by commas";
+        var custom = true;
+        for (qs.items) |q| custom = custom and q.custom;
         p.interaction = .{
             .kind = .question,
             .title = first.text,
             .detail = first.header,
             .hint = hint,
             .options = opts,
+            .free_text = custom,
         };
         try self.pending.append(self.allocator, p);
     }
@@ -1020,7 +1053,7 @@ pub const Source = struct {
             self.done_armed = false;
             const job = self.turns -| 1;
             const end = self.waker.segmentEnd(self.records.items, job);
-            if (end.wake) _ = try self.queue.pushDone(now_ms, job, end.answer, end.answer_id, null);
+            if (end.wake) _ = try self.queue.pushDone(now_ms, job, end.first_job, end.answer, end.answer_id, null);
         }
     }
 
@@ -1175,6 +1208,8 @@ pub const ActionError = error{
     NoSession,
     NoPendingInteraction,
     NoSuchOption,
+    /// The pending interaction takes no free-text answer.
+    NoFreeText,
     UnknownModel,
     AmbiguousModel,
     UnknownEffort,
@@ -1469,6 +1504,34 @@ pub const Api = struct {
         self.source.removePending(id);
     }
 
+    /// Answer the pending interaction in free text: a permission is rejected
+    /// with `text` as the user's message to the model, a question gets it as
+    /// a custom answer (one line per question when it asks several).
+    pub fn answerText(self: *Api, text: []const u8) !void {
+        const p = self.source.pendingRequest() orelse return error.NoPendingInteraction;
+        if (!p.interaction.free_text) return error.NoFreeText;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var path_buf: [256]u8 = undefined;
+        const path: []const u8, const body: []const u8 = switch (p.interaction.kind) {
+            .permission => .{
+                std.fmt.bufPrint(&path_buf, "/permission/{s}/reply", .{p.id}) catch return error.NoSuchOption,
+                try std.json.Stringify.valueAlloc(a, .{ .reply = @tagName(PermissionReply.reject), .message = text }, .{}),
+            },
+            .question => .{
+                std.fmt.bufPrint(&path_buf, "/question/{s}/reply", .{p.id}) catch return error.NoSuchOption,
+                try std.json.Stringify.valueAlloc(a, .{ .answers = try customAnswers(a, p.questions, text) }, .{}),
+            },
+            .choice => return error.NoFreeText,
+        };
+        const r = try self.request(.{ .method = .POST, .path = path, .body = body });
+        r.deinit(self.allocator);
+        const id = try self.allocator.dupe(u8, p.id);
+        defer self.allocator.free(id);
+        self.source.removePending(id);
+    }
+
     /// Abort the running turn (subagents included).
     pub fn interrupt(self: *Api) !void {
         const root = self.source.root orelse return error.NoSession;
@@ -1716,6 +1779,27 @@ fn containsString(list: Value, s: []const u8) bool {
         if (x == .string and std.mem.eql(u8, x.string, s)) return true;
     }
     return false;
+}
+
+/// The `answers` of a free-text reply: the whole text for one question,
+/// one line each for several.
+fn customAnswers(arena: std.mem.Allocator, questions: []const Question, text: []const u8) ![]const []const []const u8 {
+    const out = try arena.alloc([]const []const u8, questions.len);
+    if (questions.len == 1) {
+        const one = try arena.alloc([]const u8, 1);
+        one[0] = std.mem.trim(u8, text, " \t\r\n");
+        out[0] = one;
+        return out;
+    }
+    var lines = std.mem.splitScalar(u8, std.mem.trim(u8, text, "\n"), '\n');
+    for (out) |*slot| {
+        const line = std.mem.trim(u8, lines.next() orelse return error.NoSuchOption, " \t\r");
+        if (line.len == 0) return error.NoSuchOption;
+        const one = try arena.alloc([]const u8, 1);
+        one[0] = line;
+        slot.* = one;
+    }
+    return out;
 }
 
 /// The reply body's `answers` for a question request: one line of `choice`
@@ -2152,6 +2236,8 @@ test "a question request: options, custom answers and several questions" {
     try t.expectEqual(vocab.InteractionKind.question, p.interaction.kind);
     try t.expectEqualStrings("Which file?", p.interaction.title);
     try t.expectEqualStrings("b.zig", p.interaction.options[1].label);
+    // One of its questions takes no custom answer: no free-text route.
+    try t.expect(!p.interaction.free_text);
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
     const ans = try questionAnswers(arena.allocator(), p.questions, "2\nlint, test");
@@ -2384,4 +2470,82 @@ test "api: a starting server that swallows requests is waited out by short fresh
     var api2 = try Api.init(t.allocator, set.get("opencode").?, .{}, .{ .port = bad.port(), .password = "wrong" });
     defer api2.deinit();
     try t.expectError(error.Unauthorized, api2.probeHealth(clock.nowMs() + 1000));
+}
+
+/// A root assistant message answering prompt `parent` (`msg_u<n>`).
+fn feedAnswer(rig: *Rig, now: i64, id: []const u8, parent: u32, completed: bool) !void {
+    var buf: [512]u8 = undefined;
+    try rig.feed(now, try std.fmt.bufPrint(&buf,
+        \\{{"type":"message.updated","properties":{{"sessionID":"ses_root","info":{{"id":"{s}","role":"assistant","parentID":"msg_u{d}","sessionID":"ses_root","time":{{"created":2{s}}}}}}}}}
+    , .{ id, parent, if (completed) ",\"completed\":3" else "" }));
+}
+
+test "a prompt queued while the server works: the earlier answer keeps its job, one done covers both" {
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    try connectRoot(&rig);
+    try feedPrompt(&rig, 1, 1, "write an essay");
+    try feedStatus(&rig, 2, "ses_root", "busy");
+    try feedAnswer(&rig, 3, "msg_a1", 1, false);
+    // Measured (oc11): the server creates the queued prompt's message at
+    // once, before the earlier answer ends.
+    try feedPrompt(&rig, 4, 2, "then say PINEAPPLE");
+    try t.expectEqual(@as(u32, 1), rig.src.queuedPrompts());
+    try feedText(&rig, 5, "msg_a1", "prt_a1", "The essay.");
+    try feedAnswer(&rig, 6, "msg_a1", 1, true);
+    try feedAnswer(&rig, 7, "msg_a2", 2, false);
+    try t.expectEqual(@as(u32, 0), rig.src.queuedPrompts());
+    try feedText(&rig, 8, "msg_a2", "prt_a2", "PINEAPPLE");
+    try feedAnswer(&rig, 9, "msg_a2", 2, true);
+    try t.expectEqual(@as(usize, 0), rig.count(.done));
+    try feedStatus(&rig, 10, "ses_root", "idle");
+    try rig.src.tick(5000);
+    try t.expectEqual(@as(usize, 1), rig.count(.done));
+    const done = rig.last(.done).?;
+    try t.expectEqual(@as(?u32, 1), done.job);
+    try t.expectEqual(@as(?u32, 0), done.first_job);
+    try t.expectEqualStrings("PINEAPPLE", done.text);
+    const Want = struct { kind: vocab.RecordKind, job: u32, text: []const u8 };
+    const want = [_]Want{
+        .{ .kind = .user, .job = 0, .text = "write an essay" },
+        .{ .kind = .user, .job = 1, .text = "then say PINEAPPLE" },
+        .{ .kind = .assistant, .job = 0, .text = "The essay." },
+        .{ .kind = .assistant, .job = 1, .text = "PINEAPPLE" },
+    };
+    try t.expectEqual(want.len, rig.src.records.items.len);
+    for (rig.src.records.items, want) |r, w| {
+        try t.expectEqual(w.kind, r.kind);
+        try t.expectEqual(w.job, r.job);
+        try t.expectEqualStrings(w.text, r.text);
+    }
+}
+
+test "api: free-text answers reject a permission with a message and give a question a custom answer" {
+    var srv: testserver.Server = .{};
+    try srv.start(t.allocator);
+    defer srv.deinit();
+    srv.route("POST /session", .{ .body = "{\"id\":\"ses_root\"}" });
+    srv.route("GET /session/status", .{ .body = "{}" });
+    srv.route("GET /permission", .{ .body = "[{\"id\":\"per_1\",\"sessionID\":\"ses_root\",\"permission\":\"bash\",\"patterns\":[\"touch x\"],\"always\":[]}]" });
+    srv.route("GET /question", .{ .body = "[{\"id\":\"que_1\",\"sessionID\":\"ses_root\",\"questions\":[{\"question\":\"Which color?\",\"header\":\"Color\",\"options\":[{\"label\":\"red\"},{\"label\":\"blue\"}]}]}]" });
+    srv.route("POST /permission/per_1/reply", .{ .body = "true" });
+    srv.route("POST /question/que_1/reply", .{ .body = "true" });
+    var set = adapter.Set.init(t.allocator);
+    defer set.deinit();
+    try set.loadShipped();
+    var api = try Api.init(t.allocator, set.get("opencode").?, .{}, .{ .port = srv.port(), .password = "pw" });
+    defer api.deinit();
+    try api.connect(null, clock.nowMs());
+    // The permission is the oldest request: it shows first, and takes text.
+    try t.expect(api.source.interaction().?.free_text);
+    try t.expectEqual(vocab.InteractionKind.permission, api.source.interaction().?.kind);
+    try api.answerText("Do not create files; say BANANA.");
+    const perm = srv.lastRequest("POST /permission/per_1/reply").?;
+    try t.expect(std.mem.indexOf(u8, perm, "{\"reply\":\"reject\",\"message\":\"Do not create files; say BANANA.\"}") != null);
+    try t.expect(api.source.interaction().?.free_text);
+    try api.answerText("green, actually");
+    const q = srv.lastRequest("POST /question/que_1/reply").?;
+    try t.expect(std.mem.indexOf(u8, q, "{\"answers\":[[\"green, actually\"]]}") != null);
+    try t.expectError(error.NoPendingInteraction, api.answerText("x"));
 }

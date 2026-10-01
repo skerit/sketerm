@@ -18,6 +18,7 @@ const adapter = @import("adapter.zig");
 const events = @import("events.zig");
 const output = @import("output.zig");
 const screen_source = @import("screen_source.zig");
+const grammar = @import("grammar.zig");
 const opencode = @import("opencode.zig");
 
 /// The actions an agent takes: the fields of `adapter.Actions`, so a new
@@ -27,13 +28,22 @@ pub const ActionKind = std.meta.FieldEnum(adapter.Actions);
 pub const Action = union(ActionKind) {
     /// The prompt text.
     submit: []const u8,
+    /// A prompt typed while the app works, for its next turn.
+    queue: []const u8,
     /// An option label, a 1-based index, or (API permissions) yes/no/always.
     answer: []const u8,
+    answer_text: AnswerText,
     interrupt,
     /// A model name as the app takes it (`provider/model` for opencode).
     set_model: []const u8,
     /// An effort level.
     set_effort: []const u8,
+};
+
+pub const AnswerText = struct {
+    /// Screen sources: the label of the option `screen.text_options` matched.
+    option: []const u8,
+    text: []const u8,
 };
 
 pub const Error = error{
@@ -117,6 +127,22 @@ pub const Agent = struct {
         };
     }
 
+    /// Prompts the app holds queued for a later turn.
+    pub fn queuedPrompts(self: *const Agent) u32 {
+        return switch (self.source) {
+            .screen => |*e| e.queued_visible,
+            .opencode_api => |*a| a.source.queuedPrompts(),
+        };
+    }
+
+    /// When the app last showed or sent anything (monotonic `clock.nowMs`).
+    pub fn lastActivityMs(self: *const Agent) i64 {
+        return switch (self.source) {
+            .screen => |*e| e.last_change_ms,
+            .opencode_api => |*a| a.source.activity_ms,
+        };
+    }
+
     /// What the app is waiting on the user for, or null. Borrowed: valid
     /// until the source next changes.
     pub fn interaction(self: *const Agent) ?output.Interaction {
@@ -176,8 +202,12 @@ pub const ScreenDriver = struct {
         if (steps.len == 0) return error.Unsupported;
         var values: std.enums.EnumFieldStruct(adapter.Placeholder, ?[]const u8, @as(?[]const u8, null)) = .{};
         switch (action) {
-            .submit => |x| values.text = x,
+            .submit, .queue => |x| values.text = x,
             .answer => |x| values.choice = x,
+            .answer_text => |x| {
+                values.choice = x.option;
+                values.text = x.text;
+            },
             .interrupt => {},
             .set_model => |x| values.model = x,
             .set_effort => |x| values.effort = x,
@@ -192,6 +222,19 @@ pub const ScreenDriver = struct {
 
     pub fn inputEmpty(self: ScreenDriver) bool {
         return self.engine.input_text.len == 0;
+    }
+
+    /// The label of the option a free-text answer goes through in the
+    /// interaction showing now (`screen.text_options`), or null.
+    pub fn textOption(self: ScreenDriver) ?[]const u8 {
+        const it = self.engine.interaction orelse return null;
+        const i = grammar.textOption(self.engine.sc, it.kind, it.options) orelse return null;
+        return it.options[i].label;
+    }
+
+    /// The app's input box is on screen (typing now reaches it).
+    pub fn inputShowing(self: ScreenDriver) bool {
+        return self.engine.input_row != null;
     }
 
     /// The number to type for `choice` (label, 1-based index or a unique
@@ -236,8 +279,10 @@ pub const ApiDriver = struct {
     /// `api.problem()` says why.
     pub fn perform(self: ApiDriver, action: Action) !void {
         switch (action) {
-            .submit => |x| try self.api.submit(x, null),
+            // The server queues a prompt sent while it works.
+            .submit, .queue => |x| try self.api.submit(x, null),
             .answer => |x| try self.api.answer(x),
+            .answer_text => |x| try self.api.answerText(x.text),
             .interrupt => try self.api.interrupt(),
             .set_model => |x| try self.api.setModel(x),
             .set_effort => |x| try self.api.setEffort(x),

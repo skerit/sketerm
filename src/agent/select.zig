@@ -134,6 +134,10 @@ pub const SegmentEnd = struct {
     answer: []const u8,
     /// The answer's record id, null when the job has no message.
     answer_id: ?u64,
+    /// The oldest job the done covers: every job since the previous done
+    /// that woke, so a job a queued prompt superseded before it settled
+    /// (it never had a done of its own) is not lost.
+    first_job: u32,
 };
 
 /// The agent went idle but its turn is not settled (background tasks
@@ -147,6 +151,8 @@ pub const Waker = struct {
     job: ?u32 = null,
     /// The highest record id at that segment end.
     mark: u64 = 0,
+    /// The job of the latest done that woke the caller.
+    woke: ?u32 = null,
 
     /// `job`'s segment ended: flag its last message as the segment final
     /// and decide whether the done wakes the caller.
@@ -161,8 +167,10 @@ pub const Waker = struct {
         }
         self.job = job;
         self.mark = high;
+        const first: u32 = if (self.woke) |w| @min(w + 1, job) else 0;
+        if (wake) self.woke = job;
         const i = answerIndex(records, job);
-        return .{ .wake = wake, .answer = if (i) |x| records[x].text else "", .answer_id = if (i) |x| records[x].id else null };
+        return .{ .wake = wake, .answer = if (i) |x| records[x].text else "", .answer_id = if (i) |x| records[x].id else null, .first_job = first };
     }
 };
 
@@ -188,7 +196,8 @@ pub const Options = struct {
     /// `all` only: records at or below it are not returned.
     since: u64 = 0,
     /// `selected` only: records handed out before are not returned again,
-    /// and a job left with nothing new is dropped unless `keep_empty`.
+    /// and a job left with nothing new is dropped, except the last of
+    /// `jobs` with `keep_empty` (a done's own job, to point at it).
     handed: ?*const Handed = null,
     keep_empty: bool = false,
 };
@@ -271,7 +280,8 @@ pub fn select(alloc: std.mem.Allocator, records: []const Record, jobs: []const u
             }
         }
         if (earlier) |i| s.earlier = .{ .id = records[i].id, .kind = records[i].kind, .chars = chars(records[i].text) };
-        if (picked.items.len == before and handed != null and !opts.keep_empty) continue;
+        const kept = opts.keep_empty and job == jobs[jobs.len - 1];
+        if (picked.items.len == before and handed != null and !kept) continue;
         try summaries.append(alloc, s);
     }
 
@@ -481,6 +491,39 @@ test "re-wake: the first done always wakes, a substantive later one does, a triv
     var more = [_]Record{ rec(1, 0, .assistant, "a"), rec(2, 0, .assistant, filled(1500, 'c')), rec(3, 0, .assistant, "b") };
     _ = w2.segmentEnd(more[0..1], 0);
     try t.expect(w2.segmentEnd(&more, 0).wake);
+}
+
+test "a done covers every job since the previous one that woke: a superseded job is not lost" {
+    var records = [_]Record{
+        rec(1, 0, .assistant, "a"),
+        rec(2, 1, .assistant, filled(500, 'e')),
+        rec(3, 2, .assistant, "PINEAPPLE"),
+    };
+    var w: Waker = .{};
+    try t.expectEqual(@as(u32, 0), w.segmentEnd(records[0..1], 0).first_job);
+    // Job 1 never settled: a prompt queued behind it took over. Job 2's
+    // done covers it.
+    const s = w.segmentEnd(&records, 2);
+    try t.expect(s.wake);
+    try t.expectEqual(@as(u32, 1), s.first_job);
+    // A later segment of the same job covers only that job.
+    try t.expectEqual(@as(u32, 2), w.segmentEnd(&records, 2).first_job);
+    // A done result selects the covered jobs; the done's own job is kept
+    // even with nothing new, an earlier one only with something new.
+    var handed: Handed = .{};
+    defer handed.deinit(t.allocator);
+    try handed.mark(t.allocator, 3);
+    const sel = try select(t.allocator, &records, &.{ 1, 2 }, .{ .handed = &handed, .keep_empty = true });
+    defer sel.deinit(t.allocator);
+    const ids = try pickedIds(&records, sel);
+    defer t.allocator.free(ids);
+    try t.expectEqualSlices(u64, &.{2}, ids);
+    try t.expectEqual(@as(usize, 2), sel.jobs.len);
+    try handed.mark(t.allocator, 2);
+    const again = try select(t.allocator, &records, &.{ 1, 2 }, .{ .handed = &handed, .keep_empty = true });
+    defer again.deinit(t.allocator);
+    try t.expectEqual(@as(usize, 1), again.jobs.len);
+    try t.expectEqual(@as(u32, 2), again.jobs[0].job);
 }
 
 test "the cap keeps the newest job's last message whole, then the longest that fit, and reports the cut" {

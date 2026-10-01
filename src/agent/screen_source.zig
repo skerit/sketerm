@@ -83,6 +83,8 @@ pub const Engine = struct {
     background_tasks: u32 = 0,
     /// When the agent went idle with its turn unsettled by them.
     background_since_ms: ?i64 = null,
+    /// Prompts the app shows queued for its next turn (`screen.queued`).
+    queued_visible: u32 = 0,
 
     // Counters from the Screen, relative to the first feed.
     primed: bool = false,
@@ -407,9 +409,11 @@ pub const Engine = struct {
         self.input_row = grammar.findInput(sc, self.rows.items, INPUT_SEARCH_ROWS);
         self.allocator.free(self.input_text);
         self.input_text = &.{};
+        self.queued_visible = 0;
         if (self.input_row) |in| {
             if (grammar.measureStatusRows(sc, self.rows.items, in, MAX_STATUS_ROWS)) |n| self.status_rows = n;
             grammar.markLive(sc, self.rows.items, in, self.status_rows);
+            self.queued_visible = grammar.markQueued(sc, self.rows.items, in);
             self.input_text = try grammar.inputText(self.allocator, sc, self.rows.items, in);
         }
         self.subagent_visible = self.subagentInTail();
@@ -508,6 +512,9 @@ pub const Engine = struct {
             (if (self.subagent_visible) .waiting_subagent else .working)
         else if (self.subagent_visible)
             .waiting_subagent
+        else if (self.queued_visible > 0)
+            // The app takes its queued prompt next: not settled, no done.
+            .working
         else if (self.background_tasks > 0)
             .waiting_background
         else
@@ -540,7 +547,7 @@ pub const Engine = struct {
         // An adapter command's turn is not a turn the assistant asked for.
         const job = self.visibleJob() orelse return;
         const end = self.waker.segmentEnd(self.records.items, job);
-        if (end.wake) _ = try self.queue.pushDone(now_ms, job, end.answer, end.answer_id, background);
+        if (end.wake) _ = try self.queue.pushDone(now_ms, job, end.first_job, end.answer, end.answer_id, background);
     }
 
     fn ackBells(self: *Engine) void {
@@ -1150,6 +1157,53 @@ test "a turn the app starts on its own extends the job; only a substantive reply
     try t.expectEqual(vocab.EventKind.done, done.kind);
     try t.expectEqual(@as(?u32, 0), done.job);
     try t.expectEqual(@as(usize, 323), done.text.len);
+}
+
+test "a prompt queued while the app works: a preview until taken, then its own job; one done covers both" {
+    var rig: Rig = undefined;
+    try rig.init(100, 30);
+    defer rig.deinit();
+    rig.write("\x1b]0;\xe2\x9c\xb3 C\x07" ++ live);
+    try rig.feed(0);
+    try rig.engine.tick(1000);
+    rig.write("\x1b]133;A\x07\x1b]0;\xe2\x97\x90 C\x07" ++ erase ++ "you: write an essay\r\nclaude: The essay begins\r\n" ++ live);
+    try rig.feed(1100);
+    // As Claude Code 2.1.287 draws a prompt queued while it works: the
+    // preview and its hint between the streaming answer and the status block.
+    rig.write(erase ++ "and goes on.\r\nyou: then say PINEAPPLE\r\nctrl+enter to send now\r\n" ++ live);
+    try rig.feed(1200);
+    try t.expectEqual(@as(u32, 1), rig.engine.queued_visible);
+    // The turn ends with the preview still showing; the app has not taken
+    // it yet when the settle guard runs out: not idle, no done.
+    rig.write("\x1b]133;C\x07\x1b]133;D\x07\x07\x1b]0;\xe2\x9c\xb3 C\x07");
+    try rig.feed(1300);
+    try rig.engine.tick(5000);
+    try t.expectEqual(vocab.State.working, rig.engine.state);
+    try t.expectEqual(@as(usize, 0), countKind(&rig.engine, .done));
+    try t.expectEqual(@as(usize, 2), rig.engine.records.items.len);
+    // Taken: the prompt is printed below the footer as transcript, then
+    // the turn mark (observed order), then the answer.
+    const erase6 = "\x1b[2K\x1b[1A" ** 5 ++ "\x1b[2K\x1b[G";
+    rig.write(erase6 ++ "Churned for 2s \xc2\xb7 done\r\nyou: then say PINEAPPLE\r\n" ++ live ++ "\x1b]133;A\x07\x1b]0;\xe2\x97\x90 C\x07");
+    try rig.feed(5100);
+    try t.expectEqual(@as(u32, 0), rig.engine.queued_visible);
+    try t.expectEqual(vocab.State.working, rig.engine.state);
+    rig.write(erase ++ "claude: PINEAPPLE\r\n" ++ live ++ "\x1b]133;C\x07\x1b]133;D\x07\x07\x1b]0;\xe2\x9c\xb3 C\x07" ++ erase ++ "Crunched for 1s \xc2\xb7 done\r\n" ++ live);
+    try rig.feed(5200);
+    try rig.engine.tick(9000);
+    try t.expectEqual(vocab.State.idle, rig.engine.state);
+    try t.expectEqual(@as(usize, 1), countKind(&rig.engine, .done));
+    const done = rig.engine.queue.events.items[rig.engine.queue.events.items.len - 1];
+    try t.expectEqual(@as(?u32, 1), done.job);
+    try t.expectEqual(@as(?u32, 0), done.first_job);
+    try t.expectEqualStrings("PINEAPPLE", done.text);
+    const recs = rig.engine.records.items;
+    try t.expectEqual(@as(usize, 4), recs.len);
+    try t.expectEqualStrings("The essay begins\nand goes on.", recs[1].text);
+    try t.expectEqual(@as(u32, 0), recs[1].job);
+    try t.expectEqualStrings("then say PINEAPPLE", recs[2].text);
+    try t.expectEqual(@as(u32, 1), recs[2].job);
+    try t.expectEqual(@as(usize, 2), rig.engine.turns.items.len);
 }
 
 /// The live block while a background shell runs (observed, 2.1.286: the

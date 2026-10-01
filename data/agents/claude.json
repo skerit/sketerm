@@ -71,11 +71,20 @@
     "choice_prompt": { "prefix": "Select with numbers [" },
     "selected_marker": "(selected)",
     "permission": { "prefix": "Permission Required:" },
-    "bell_needs_input": true
+    "bell_needs_input": true,
+    "queued": { "prefix": "ctrl+enter to send now" },
+    "text_options": [
+      { "kind": "permission", "pattern": "^No$" }
+    ]
   },
   "actions": {
     "submit": [
       { "clear_input": ["escape", "escape"] },
+      { "text": "{text}" },
+      { "sleep_ms": 800 },
+      { "key": "enter" }
+    ],
+    "queue": [
       { "text": "{text}" },
       { "sleep_ms": 800 },
       { "key": "enter" }
@@ -85,6 +94,17 @@
       { "sleep_ms": 300 },
       { "key": "enter" },
       { "wait": "answered" }
+    ],
+    "answer_text": [
+      { "pick": "{choice}" },
+      { "sleep_ms": 300 },
+      { "key": "enter" },
+      { "wait": "answered" },
+      { "wait": "idle" },
+      { "clear_input": ["escape", "escape"] },
+      { "text": "{text}" },
+      { "sleep_ms": 800 },
+      { "key": "enter" }
     ],
     "interrupt": [
       { "key": "escape" }

@@ -35,6 +35,15 @@ pub const State = enum {
             .starting, .working, .waiting_subagent, .waiting_user, .retrying, .exited, .disconnected => false,
         };
     }
+
+    /// Busy, but a prompt sent now goes into the app's queue for its next
+    /// turn. A prompt waiting on the user is not: its keys would answer it.
+    pub fn queuesPrompt(self: State) bool {
+        return switch (self) {
+            .working, .waiting_subagent, .retrying => true,
+            .starting, .waiting_background, .waiting_user, .idle, .exited, .disconnected => false,
+        };
+    }
 };
 
 pub const RecordKind = enum {
@@ -107,6 +116,9 @@ pub const WaitOutcome = enum {
     still_working,
     /// A prompt went in, and the call returned before the agent started on it.
     sent,
+    /// The agent was busy: the app queued the prompt for its next turn, and
+    /// the call returned before the app took it.
+    queued,
 };
 
 pub const ErrorClass = enum {
@@ -209,4 +221,8 @@ test "an idle agent and one with background tasks take prompts; a busy one does 
     try t.expect(State.waiting_background.takesPrompt());
     try t.expect(!State.working.takesPrompt());
     try t.expect(!State.waiting_user.takesPrompt());
+    // A state never both takes a prompt and queues one.
+    for (std.enums.values(State)) |s| try t.expect(!(s.takesPrompt() and s.queuesPrompt()));
+    try t.expect(State.working.queuesPrompt());
+    try t.expect(!State.waiting_user.queuesPrompt());
 }

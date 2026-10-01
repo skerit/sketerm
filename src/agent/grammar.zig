@@ -43,7 +43,7 @@ pub fn isChrome(sc: *const adapter.Screen, text: []const u8) bool {
     for (sc.chrome) |m| {
         if (m.matches(text)) return true;
     }
-    inline for (.{ "footer", "subagent", "background", "permission" }) |f| {
+    inline for (.{ "footer", "subagent", "background", "permission", "queued" }) |f| {
         if (@field(sc, f)) |m| {
             if (m.matches(text)) return true;
         }
@@ -226,6 +226,35 @@ pub fn markLive(sc: *const adapter.Screen, lines: []Line, input: usize, status_r
     for (lines[i..]) |*l| l.live = true;
 }
 
+/// Mark the app's queued-prompt previews live: the `queued` line right
+/// above the live region and the user records directly above it.
+/// @return the previews showing (0 when none).
+pub fn markQueued(sc: *const adapter.Screen, lines: []Line, input: usize) u32 {
+    const m = sc.queued orelse return 0;
+    var i = input;
+    while (i > 0 and lines[i - 1].live) i -= 1;
+    if (i == 0 or !m.matches(lines[i - 1].text)) return 0;
+    var top = i - 1;
+    var n: u32 = 0;
+    var k = top;
+    // A preview is a user record and its continuation lines; whatever is
+    // above the topmost one (an answer still streaming) is transcript.
+    while (k > 0) {
+        k -= 1;
+        switch (classify(sc, lines[k])) {
+            .record => |ri| {
+                if (sc.records[ri].kind != .user) break;
+                n += 1;
+                top = k;
+            },
+            .text => {},
+            .chrome => break,
+        }
+    }
+    for (lines[top..i]) |*l| l.live = true;
+    return n;
+}
+
 // ── interactions ─────────────────────────────────────────────────
 
 pub const Option = output.Option;
@@ -334,15 +363,27 @@ pub fn parseInteraction(alloc: std.mem.Allocator, sc: *const adapter.Screen, lin
         try hint.append(alloc, l.text);
         end = row + 1;
     }
+    const opts = try options.toOwnedSlice(alloc);
     return .{
         .kind = kind,
         .title = title,
         .detail = detail,
         .hint = try std.mem.join(alloc, "\n", hint.items),
-        .options = try options.toOwnedSlice(alloc),
+        .options = opts,
+        .free_text = textOption(sc, kind, opts) != null,
         .rows_start = h,
         .rows_end = end,
     };
+}
+
+/// The option a free-text answer goes through: the first one a
+/// `text_options` rule for `kind` matches, or null.
+pub fn textOption(sc: *const adapter.Screen, kind: vocab.InteractionKind, options: []const Option) ?usize {
+    for (sc.text_options) |r| {
+        if (r.kind) |k| if (k != kind) continue;
+        for (options, 0..) |o, i| if (r.matcher.matches(o.label)) return i;
+    }
+    return null;
 }
 
 fn makeOption(alloc: std.mem.Allocator, sc: *const adapter.Screen, raw: []const u8) !Option {
@@ -418,8 +459,11 @@ pub const test_adapter_json =
     \\    "background": { "pattern": "· +[0-9]+ shells?$" },
     \\    "choice_prompt": { "prefix": "Select with numbers [" },
     \\    "permission": { "prefix": "Permission Required:" },
-    \\    "bell_needs_input": true
+    \\    "bell_needs_input": true,
+    \\    "queued": { "prefix": "ctrl+enter to send now" },
+    \\    "text_options": [ { "kind": "permission", "pattern": "^No$" } ]
     \\  },
+    \\  "actions": { "answer_text": [ { "pick": "{choice}" }, { "key": "enter" }, { "wait": "idle" }, { "text": "{text}" }, { "key": "enter" } ] },
     \\  "errors": [ { "class": "limit", "pattern": "Usage limit reached", "reset_marker": "resets " } ]
     \\}
 ;
@@ -578,6 +622,65 @@ test "interactions: a picker with the selected option, and a stale one" {
     const stale = try mk(&.{ "1. a", "2. b", "Select with numbers [1-2].", "manual mode on", "$" });
     defer t.allocator.free(stale);
     try t.expect((try parseInteraction(arena.allocator(), sc, stale)) == null);
+}
+
+test "queued previews are live, never records; the streaming answer above them is not" {
+    const l = try testAdapter();
+    defer l.destroy(t.allocator);
+    const sc = &l.screen.?;
+    // As Claude Code 2.1.287 draws a prompt typed while it works.
+    const lines = try mk(&.{
+        "you: write an essay",
+        "claude: The essay begins",
+        "and goes on",
+        "you: after the essay, say",
+        "PINEAPPLE",
+        "ctrl+enter to send now",
+        "[Haiku 4.5]",
+        "[■■□□] 21%",
+        "manual mode on",
+        "$",
+    });
+    defer t.allocator.free(lines);
+    const input = findInput(sc, lines, 8).?;
+    markLive(sc, lines, input, 2);
+    try t.expectEqual(@as(u32, 1), markQueued(sc, lines, input));
+    try t.expect(lines[3].live and lines[4].live and lines[5].live);
+    try t.expect(!lines[2].live);
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const recs = try parseRecords(arena.allocator(), sc, lines);
+    try t.expectEqual(@as(usize, 2), recs.len);
+    try t.expectEqualStrings("The essay begins\nand goes on", recs[1].text);
+    // Without the line, nothing is a preview.
+    const plain = try mk(&.{ "you: a", "claude: b", "[Haiku 4.5]", "[■■□□] 21%", "manual mode on", "$" });
+    defer t.allocator.free(plain);
+    markLive(sc, plain, 5, 2);
+    try t.expectEqual(@as(u32, 0), markQueued(sc, plain, 5));
+    try t.expect(!plain[1].live);
+}
+
+test "a text option is matched per interaction kind" {
+    const l = try testAdapter();
+    defer l.destroy(t.allocator);
+    const sc = &l.screen.?;
+    const opts = [_]Option{ .{ .label = "Yes", .selected = false }, .{ .label = "No", .selected = false } };
+    try t.expectEqual(@as(?usize, 1), textOption(sc, .permission, &opts));
+    try t.expectEqual(@as(?usize, null), textOption(sc, .choice, &opts));
+    const lines = try mk(&.{
+        "tool: Bash (touch x)",
+        "Permission Required: Bash command",
+        "Do you want to proceed?",
+        "1. Yes",
+        "2. No",
+        "Select with numbers [1-2]. Then Enter to submit or Escape to cancel:",
+    });
+    defer t.allocator.free(lines);
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    try t.expect((try parseInteraction(arena.allocator(), sc, lines)).?.free_text);
+    lines[4].text = "2. Not now";
+    try t.expect(!(try parseInteraction(arena.allocator(), sc, lines)).?.free_text);
 }
 
 test "errors carry the reset text" {

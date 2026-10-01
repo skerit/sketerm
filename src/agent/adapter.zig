@@ -119,6 +119,21 @@ pub const ScreenSpec = struct {
     permission: ?LineRule = null,
     /// A lone BEL (one not part of a turn end) means the app wants input.
     bell_needs_input: bool = false,
+    /// The line the app draws under prompts it queued (typed while it
+    /// works) until it takes them: the user records directly above it are
+    /// previews, never transcript, and an idle app showing it is not done.
+    queued: ?LineRule = null,
+    /// Options a free-text answer goes through (`actions.answer_text`
+    /// picks the first that matches, then types the text).
+    text_options: []const TextOption = &.{},
+};
+
+/// An interaction option that takes free text: its label matches exactly
+/// one of `prefix`/`pattern`, in an interaction of `kind` (any when null).
+pub const TextOption = struct {
+    kind: ?vocab.InteractionKind = null,
+    prefix: ?[]const u8 = null,
+    pattern: ?[]const u8 = null,
 };
 
 pub const WaitFor = enum {
@@ -159,7 +174,13 @@ pub const Step = union(enum) {
 
 pub const Actions = struct {
     submit: []const Step = &.{},
+    /// Typing a prompt while the app works, for its native queue; empty when
+    /// it has none (a busy agent then refuses prompts).
+    queue: []const Step = &.{},
     answer: []const Step = &.{},
+    /// A free-text answer: `{choice}` is the option `screen.text_options`
+    /// matched, `{text}` the caller's text.
+    answer_text: []const Step = &.{},
     interrupt: []const Step = &.{},
     set_model: []const Step = &.{},
     set_effort: []const Step = &.{},
@@ -230,6 +251,13 @@ pub const Screen = struct {
     background: ?Matcher,
     choice_prompt: Matcher,
     permission: ?Matcher,
+    queued: ?Matcher,
+    text_options: []const TextOptionMatcher,
+};
+
+pub const TextOptionMatcher = struct {
+    kind: ?vocab.InteractionKind,
+    matcher: Matcher,
 };
 
 pub const Origin = enum { shipped, user };
@@ -339,6 +367,8 @@ const Validator = struct {
             .screen => {
                 const sc = if (s.screen) |*x| x else return self.fail("source \"screen\" needs a \"screen\" section", .{});
                 l.screen = try self.screen(sc);
+                if ((sc.text_options.len == 0) != (s.actions.answer_text.len == 0))
+                    return self.fail("screen.text_options and actions.answer_text go together (the recipe answers through the option the rules match)", .{});
             },
             .opencode_api => {
                 if (s.screen != null) return self.fail("source \"opencode_api\" takes no \"screen\" section", .{});
@@ -389,6 +419,8 @@ const Validator = struct {
         }
         const chrome = try self.arena.alloc(Matcher, sc.chrome.len);
         for (sc.chrome, chrome, 0..) |r, *out, i| out.* = try self.rule(r, "screen.chrome", i);
+        const texts = try self.arena.alloc(TextOptionMatcher, sc.text_options.len);
+        for (sc.text_options, texts, 0..) |r, *out, i| out.* = .{ .kind = r.kind, .matcher = try self.rule(.{ .prefix = r.prefix, .pattern = r.pattern }, "screen.text_options", i) };
         return .{
             .spec = sc,
             .footer = if (sc.footer) |r| try self.rule(r, "screen.footer", null) else null,
@@ -398,6 +430,8 @@ const Validator = struct {
             .background = if (sc.background) |r| try self.rule(r, "screen.background", null) else null,
             .choice_prompt = try self.rule(sc.choice_prompt, "screen.choice_prompt", null),
             .permission = if (sc.permission) |r| try self.rule(r, "screen.permission", null) else null,
+            .queued = if (sc.queued) |r| try self.rule(r, "screen.queued", null) else null,
+            .text_options = texts,
         };
     }
 

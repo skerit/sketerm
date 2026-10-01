@@ -109,7 +109,8 @@ pub const INSTRUCTIONS =
     "When a result says still_working (or sent: the agent had not started yet), run its watch_command in the background (or as a Monitor with --follow) " ++
     "to be woken when the agent finishes (done means settled: idle with no subagents or background tasks) or needs input, " ++
     "instead of polling with agent_wait; to watch several agents at once use agent-wait --any with their ids. " ++
-    "A wake-up the waiter printed is not repeated by agent_* results, so read the agent afterwards.";
+    "A wake-up the waiter printed is not repeated by agent_* results, so read the agent afterwards. " ++
+    "agent_send to a busy agent queues the prompt for its next turn without interrupting it, and agent_answer takes text when a prompt's right answer is none of its options.";
 
 // ── state ────────────────────────────────────────────────────────
 
@@ -175,6 +176,9 @@ pub const Entry = struct {
     /// API sources over SSH: the server's port on the remote host (`port`
     /// is the local end of the forward that reaches it).
     remote_port: u16 = 0,
+    /// When the agent was opened or attached (`clock.wallMs`; a durable
+    /// reattach keeps the first open's).
+    started_ms: i64 = 0,
     forward: ?*termdrive.Term = null,
     /// The next respawn of a dead forward / reconnect of a lost link.
     forward_retry_ms: i64 = 0,
@@ -979,6 +983,8 @@ const WaitPart = struct {
     timed_out: bool,
     /// The call submitted a prompt (an outcome may be `sent`).
     sent: bool = false,
+    /// The prompt went into the app's queue (an outcome may be `queued`).
+    queued: bool = false,
 };
 
 /// A payload block of the text lane (after the prose).
@@ -1010,16 +1016,19 @@ fn pending(arena: std.mem.Allocator, e: *Entry) !Delivered {
 }
 
 /// The kind a wake-up reports: the delivered kind of the highest
-/// `outcomeRank`, else `exited` for an agent that is gone, else `sent`
-/// for a prompt the agent has not started on, else still working.
+/// `outcomeRank`, else `exited` for an agent that is gone, else `queued`
+/// for a prompt the app still holds for a later turn, else `sent` for a
+/// prompt the agent has not started on, else still working.
 /// @param sent the call submitted a prompt.
-pub fn outcomeOf(items: []const events.Item, st: vocab.State, sent: bool) []const u8 {
+/// @param queued the call queued it and the app has not taken it yet.
+pub fn outcomeOf(items: []const events.Item, st: vocab.State, sent: bool, queued: bool) []const u8 {
     var best: ?vocab.EventKind = null;
     for (items) |it| {
         if (best == null or it.kind.outcomeRank() > best.?.outcomeRank()) best = it.kind;
     }
     if (best) |b| return @tagName(b);
     if (st == .exited) return @tagName(vocab.EventKind.exited);
+    if (sent and queued) return @tagName(vocab.WaitOutcome.queued);
     if (sent and st.takesPrompt()) return @tagName(vocab.WaitOutcome.sent);
     return @tagName(vocab.WaitOutcome.still_working);
 }
@@ -1048,6 +1057,7 @@ const InteractionJson = struct {
     detail: []const u8,
     hint: []const u8,
     options: []const output.Option,
+    free_text: bool,
 };
 
 fn toJson(arena: std.mem.Allocator, value: anytype) ![]const u8 {
@@ -1080,24 +1090,36 @@ fn finish(arena: std.mem.Allocator, res: *Res, e: *Entry, dv: Delivered, watch: 
     var job_block: ?Block = null;
     if (dv.wait) |w| {
         const post = dv.items[w.post_from..];
-        const outcome = outcomeOf(post, st, w.sent);
+        const outcome = outcomeOf(post, st, w.sent, w.queued and e.agent.queuedPrompts() > 0);
         try res.fact("outcome", outcome);
         var job: ?u32 = null;
+        var first: ?u32 = null;
         var background: ?u32 = null;
         for (post) |it| if (it.kind == .done) {
             message = it.event.text;
             job = it.event.job;
             background = it.event.background_tasks;
         };
-        // The finished job as agent_read would return it, without what the
-        // assistant was handed before: no extra read, no repeat.
+        // A done covers every job since the previous one that woke (one a
+        // queued prompt superseded has none of its own), a done that rode
+        // along before the wait included.
+        for (dv.items) |it| if (it.kind == .done) {
+            const f = it.event.first_job orelse it.event.job orelse continue;
+            first = if (first) |x| @min(x, f) else f;
+        };
+        // The finished job(s) as agent_read would return them, without
+        // what the assistant was handed before: no extra read, no repeat.
         if (job) |j| {
-            const one = [1]u32{j};
+            const lo = @min(first orelse j, j);
             const recs = e.agent.records();
+            var jobs: std.ArrayList(u32) = .empty;
+            for (try select.jobsAfter(arena, recs, 0)) |x| if (x >= lo and x < j) try jobs.append(arena, x);
+            try jobs.append(arena, j);
             const fresh = if (select.answerIndex(recs, j)) |i| !e.handed.has(recs[i].id) else false;
             if (!fresh) message = null;
-            const sel = try select.select(arena, recs, &one, .{ .handed = &e.handed, .keep_empty = true });
-            job_block = .{ .name = try std.fmt.allocPrint(arena, "job {d}", .{j}), .body = try writeSelection(arena, res, recs, sel) };
+            const sel = try select.select(arena, recs, jobs.items, .{ .handed = &e.handed, .keep_empty = true });
+            const name = if (lo < j) try std.fmt.allocPrint(arena, "jobs {d}-{d}", .{ lo, j }) else try std.fmt.allocPrint(arena, "job {d}", .{j});
+            job_block = .{ .name = name, .body = try writeSelection(arena, res, recs, sel) };
             try e.handed.markSelection(e.allocator, recs, sel);
         }
         if (message) |m| try res.fact("message", m);
@@ -1106,7 +1128,9 @@ fn finish(arena: std.mem.Allocator, res: *Res, e: *Entry, dv: Delivered, watch: 
         if (background) |n|
             try res.textf("done after {d} minutes idle with {d} background task(s) still running", .{ @divTrunc(select.BACKGROUND_DONE_CAP_MS, 60_000), n });
         if (w.timed_out) {
-            if (std.mem.eql(u8, outcome, @tagName(vocab.WaitOutcome.sent)))
+            if (std.mem.eql(u8, outcome, @tagName(vocab.WaitOutcome.queued)))
+                try res.text("queued; the agent was busy and takes the prompt when its current turn ends: run watch_command in the background (or as a Monitor with --follow) to be woken once it has answered it")
+            else if (std.mem.eql(u8, outcome, @tagName(vocab.WaitOutcome.sent)))
                 try res.text("sent; the agent had not started on it when the call returned: run watch_command in the background (or as a Monitor with --follow) to be woken instead of polling")
             else
                 try res.text("still working when the wait ran out: run watch_command in the background (or as a Monitor with --follow) to be woken instead of polling");
@@ -1138,6 +1162,7 @@ fn finish(arena: std.mem.Allocator, res: *Res, e: *Entry, dv: Delivered, watch: 
         .detail = x.detail,
         .hint = x.hint,
         .options = x.options,
+        .free_text = x.free_text,
     }));
     var cmd: ?[]const u8 = null;
     if (state.exe) |exe| {
@@ -1168,6 +1193,7 @@ fn finish(arena: std.mem.Allocator, res: *Res, e: *Entry, dv: Delivered, watch: 
         if (x.detail.len > 0) try aw.writer.print("\n{s}", .{x.detail});
         for (x.options, 1..) |o, n| try aw.writer.print("\n{d}. {s}{s}", .{ n, o.label, if (o.selected) " (selected)" else "" });
         if (x.hint.len > 0) try aw.writer.print("\n{s}", .{x.hint});
+        if (x.free_text) try aw.writer.writeAll("\n(a free-text answer is accepted: agent_answer text)");
         try block(res, .{ .name = "prompt", .body = aw.written() });
     }
     if (cmd) |x| try block(res, .{ .name = "watch_command", .body = x });
@@ -1563,6 +1589,7 @@ fn newEntry(loaded: *const adapter.Loaded, id: []const u8, session: []const u8, 
         .visible = null,
         .binary = binary_owned,
         .cwd = cwd_owned,
+        .started_ms = clock.wallMs(),
     };
     return e;
 }
@@ -1927,7 +1954,7 @@ fn busy(arena: std.mem.Allocator, e: *Entry) !?Fail {
     return switch (st) {
         .idle, .waiting_background => null,
         .starting => Fail{ .code = .timeout, .msg = try std.fmt.allocPrint(arena, "agent {s} is not ready yet (state starting); nothing was sent", .{e.id}) },
-        .working, .waiting_subagent, .retrying => Fail{ .code = .conflict, .msg = try std.fmt.allocPrint(arena, "agent {s} is busy (state {s}): agent_wait for its turn to finish, or agent_interrupt it", .{ e.id, @tagName(st) }) },
+        .working, .waiting_subagent, .retrying => Fail{ .code = .conflict, .msg = try std.fmt.allocPrint(arena, "agent {s} is busy (state {s}){s}: agent_wait for its turn to finish, or agent_interrupt it", .{ e.id, @tagName(st), if (e.agent.supports(.queue)) "" else try std.fmt.allocPrint(arena, " and the {s} adapter cannot queue a prompt", .{e.loaded.spec.id}) }) },
         .waiting_user => Fail{ .code = .conflict, .msg = try std.fmt.allocPrint(arena, "agent {s} is waiting for an answer: agent_answer its prompt first", .{e.id}) },
         .exited, .disconnected => Fail{ .code = .unavailable, .msg = try std.fmt.allocPrint(arena, "agent {s} is {s}; agent_close it", .{ e.id, @tagName(st) }) },
     };
@@ -1939,19 +1966,59 @@ fn submitAndWait(arena: std.mem.Allocator, e: *Entry, text: []const u8, filter: 
     service(clock.nowMs());
     const pre = try e.cursor.take(e.agent.queue(), .{}, clock.nowMs(), arena);
     _ = waitReady(e, deadline);
-    if (try busy(arena, e)) |f| return .{ .fail = f };
-    switch (try act(arena, e, .{ .submit = text }, deadline)) {
+    // A busy agent's app queues the prompt for its next turn, when it can.
+    const queued = e.agent.state().queuesPrompt() and e.agent.supports(.queue);
+    if (queued) {
+        if (try queueRefusal(arena, e)) |f| return .{ .fail = f };
+    } else if (try busy(arena, e)) |f| return .{ .fail = f };
+    switch (try act(arena, e, if (queued) .{ .queue = text } else .{ .submit = text }, deadline)) {
         .fail => |f| return .{ .fail = f },
         .ok => {},
     }
+    if (queued) if (try confirmQueued(arena, e, deadline)) |f| return .{ .fail = f };
     // The conversation has a turn now: a relaunch resumes it.
     if (!e.conversed) {
         e.conversed = true;
         writeDescriptor(e);
     }
     var dv = try waitAfter(arena, e, pre, filter, deadline);
-    if (dv.wait) |*w| w.sent = true;
+    if (dv.wait) |*w| {
+        w.sent = true;
+        w.queued = queued;
+    }
     return .{ .ok = dv };
+}
+
+/// Why a prompt cannot be typed into a busy screen app's queue now, or
+/// null: the input box must show and be empty (a human may be typing).
+fn queueRefusal(arena: std.mem.Allocator, e: *Entry) !?Fail {
+    const d = switch (e.agent.driver()) {
+        .screen => |d| d,
+        .opencode_api => return null,
+    };
+    service(clock.nowMs());
+    if (!d.inputShowing())
+        return Fail{ .code = .timeout, .msg = try std.fmt.allocPrint(arena, "agent {s} is busy and its input box is not showing; nothing was sent", .{e.id}) };
+    if (!d.inputEmpty())
+        return Fail{ .code = .conflict, .msg = try std.fmt.allocPrint(arena, "agent {s} is busy and its input box holds text someone is typing; nothing was sent (it would merge with theirs)", .{e.id}) };
+    return null;
+}
+
+/// A screen app took the queued prompt out of its input box; the failure
+/// when it is still there (bounded), saying what the screen shows.
+fn confirmQueued(arena: std.mem.Allocator, e: *Entry, deadline: i64) !?Fail {
+    const d = switch (e.agent.driver()) {
+        .screen => |d| d,
+        .opencode_api => return null,
+    };
+    const until = @min(deadline, clock.nowMs() + STEP_WAIT_MS);
+    service(clock.nowMs());
+    while (!d.inputEmpty()) {
+        if (gone(e) or clock.nowMs() >= until)
+            return Fail{ .code = .timeout, .msg = try std.fmt.allocPrint(arena, "the app did not take the queued prompt: it is still in the input box; the screen shows:\n{s}", .{try screenTail(arena, e)}) };
+        pump(until - clock.nowMs());
+    }
+    return null;
 }
 
 /// The wait that follows an action, combined with what was pending
@@ -2006,7 +2073,7 @@ fn applySet(arena: std.mem.Allocator, e: *Entry, action: agent_mod.Action, deadl
 
 fn apiFail(arena: std.mem.Allocator, api: *opencode.Api, err: anyerror) !Fail {
     const code: mcp.ErrCode = switch (err) {
-        error.UnknownModel, error.AmbiguousModel, error.UnknownEffort, error.NoCurrentModel, error.NoSuchOption => .invalid_args,
+        error.UnknownModel, error.AmbiguousModel, error.UnknownEffort, error.NoCurrentModel, error.NoSuchOption, error.NoFreeText => .invalid_args,
         error.NoPendingInteraction => .conflict,
         error.NoSession => .unavailable,
         error.OutOfMemory => return err,
@@ -2131,7 +2198,7 @@ fn relaunch(arena: std.mem.Allocator, e: *Entry, action: agent_mod.Action, deadl
     switch (action) {
         .set_effort => |x| effort = x,
         .set_model => |x| model = x,
-        .submit, .answer, .interrupt => return .{ .fail = .{ .code = .refused, .msg = "the adapter relaunches for an action that is no launch value" } },
+        .submit, .queue, .answer, .answer_text, .interrupt => return .{ .fail = .{ .code = .refused, .msg = "the adapter relaunches for an action that is no launch value" } },
     }
     // A conversation with a turn is resumed; an empty one starts afresh
     // under a new id (the old id may already be taken by the app).
@@ -2237,7 +2304,7 @@ fn noteSetting(arena: std.mem.Allocator, e: *Entry, action: agent_mod.Action, o:
                     break :blk try std.fmt.allocPrint(arena, "model set to {s} for this session{s}{s}", .{ m, if (o.confirmation != null) ": " else "", o.confirmation orelse "" });
                 },
                 .set_effort => |x| try std.fmt.allocPrint(arena, "effort set to {s} for this session{s}", .{ x, if (o.relaunched) " (the app was restarted with it and the conversation resumed)" else "" }),
-                .submit, .answer, .interrupt => return,
+                .submit, .queue, .answer, .answer_text, .interrupt => return,
             };
             try eng.addNotice(text);
             writeDescriptor(e);
@@ -2276,6 +2343,9 @@ fn sendTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]const 
         .fail => |f| return errRes(arena, f.code, f.msg),
         .ok => |dv| {
             var res = Res.init(arena);
+            const queued = if (dv.wait) |w| w.queued else false;
+            try res.fact("queued", queued);
+            if (queued) try res.textf("{s} was busy: the prompt went into its queue for its next turn", .{e.id});
             return finish(arena, &res, e, dv, .{ .filter = filter }, &.{});
         },
     }
@@ -2316,7 +2386,11 @@ fn waitAnyTool(arena: std.mem.Allocator, args: std.json.Value, list: []const std
 }
 
 fn answerTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]const u8 {
-    const choice = argStr(args, "choice") orelse return errRes(arena, .invalid_args, "agent_answer needs 'choice': an option label, its 1-based number or a unique part of a label");
+    if (argStr(args, "text")) |text| {
+        if (argStr(args, "choice") != null) return errRes(arena, .invalid_args, "pass either 'choice' or 'text', not both");
+        return answerTextTool(arena, args, e, text);
+    }
+    const choice = argStr(args, "choice") orelse return errRes(arena, .invalid_args, "agent_answer needs 'choice' (an option label, its 1-based number or a unique part of a label) or 'text' (a free-text answer)");
     const filter = filterFrom(args);
     const deadline = deadlineFrom(args, DEFAULT_WAIT_MS);
     const pre = try e.cursor.take(e.agent.queue(), .{}, clock.nowMs(), arena);
@@ -2351,6 +2425,62 @@ fn answerTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]cons
     try res.fact("answered", label);
     const answer = try std.fmt.allocPrint(arena, "{s}\n-> {s}", .{ title, label });
     return finish(arena, &res, e, dv, .{ .filter = filter }, &.{.{ .name = "answer", .body = answer }});
+}
+
+/// agent_answer `text`: a free-text answer through the route the app
+/// offers (Claude Code: the option `screen.text_options` names, then the
+/// text as its next prompt; opencode: a reject's message, a custom answer).
+fn answerTextTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry, text: []const u8) ![]const u8 {
+    if (std.mem.trim(u8, text, " \t\r\n").len == 0) return errRes(arena, .invalid_args, "text is empty");
+    const filter = filterFrom(args);
+    const deadline = deadlineFrom(args, DEFAULT_WAIT_MS);
+    const pre = try e.cursor.take(e.agent.queue(), .{}, clock.nowMs(), arena);
+    const it = e.agent.interaction() orelse
+        return errRes(arena, .conflict, try std.fmt.allocPrint(arena, "agent {s} has no pending prompt (state {s})", .{ e.id, @tagName(e.agent.state()) }));
+    // Never a silent pick: no route for text means the caller chooses.
+    if (!it.free_text or !e.agent.supports(.answer_text))
+        return errRes(arena, .invalid_args, try std.fmt.allocPrint(arena, "this {s} prompt takes no free-text answer; answer with choice, one of: {s}", .{ @tagName(it.kind), try optionList(arena, it) }));
+    const kind = it.kind;
+    const title = try arena.dupe(u8, it.title);
+    const label: []const u8 = switch (e.agent.driver()) {
+        .screen => |d| try arena.dupe(u8, d.textOption() orelse
+            return errRes(arena, .invalid_args, try std.fmt.allocPrint(arena, "this {s} prompt takes no free-text answer; answer with choice, one of: {s}", .{ @tagName(kind), try optionList(arena, it) }))),
+        .opencode_api => if (kind == .permission) opencode.PermissionReply.reject.label() else "free text",
+    };
+    switch (try act(arena, e, .{ .answer_text = .{ .option = label, .text = text } }, deadline)) {
+        .fail => |f| return errRes(arena, f.code, f.msg),
+        .ok => {},
+    }
+    // What the recipe's own steps caused (the turn the option ended going
+    // idle) rides along; the wait is for what the text brings.
+    const mid = try e.cursor.take(e.agent.queue(), .{}, clock.nowMs(), arena);
+    switch (e.agent.source) {
+        .screen => |*eng| {
+            if (kind == .permission) try eng.addNotice(try std.fmt.allocPrint(arena, "permission \"{s}\" answered: {s}, with a message", .{ title, label }));
+            if (!e.conversed) {
+                e.conversed = true;
+                writeDescriptor(e);
+            }
+        },
+        .opencode_api => {},
+    }
+    const dv = try waitAfter(arena, e, try joinDeliveries(arena, pre, mid), filter, deadline);
+    var res = Res.init(arena);
+    try res.textf("answered the {s} prompt with text", .{@tagName(kind)});
+    try res.fact("answered", label);
+    try res.fact("free_text", true);
+    const answer = try std.fmt.allocPrint(arena, "{s}\n-> {s}: {s}", .{ title, label, text });
+    return finish(arena, &res, e, dv, .{ .filter = filter }, &.{.{ .name = "answer", .body = answer }});
+}
+
+/// Two deliveries as one (oldest first), digests added.
+fn joinDeliveries(arena: std.mem.Allocator, a: ?events.Delivery, b: ?events.Delivery) !?events.Delivery {
+    const x = a orelse return b;
+    const y = b orelse return a;
+    const items = try std.mem.concat(arena, events.Item, &.{ x.items, y.items });
+    var digest = x.digest;
+    if (y.digest) |d| digest = if (digest) |old| .{ .count = old.count + d.count, .latest_seq = d.latest_seq } else d;
+    return .{ .items = items, .digest = digest };
 }
 
 fn setTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]const u8 {
@@ -2539,34 +2669,69 @@ fn listTool(arena: std.mem.Allocator) ![]const u8 {
         source: []const u8,
         state: []const u8,
         ready: bool,
-        session: []const u8,
-        server_session: ?[]const u8,
-        pending_events: usize,
-        waiting_on_user: bool,
+        /// The SSH host; null = this machine.
         host: ?[]const u8,
         transport: []const u8,
+        cwd: []const u8,
+        binary: []const u8,
+        model: ?[]const u8,
+        effort: ?[]const u8,
+        session: []const u8,
+        server_session: ?[]const u8,
+        sessions: []const []const u8,
+        started_ms: i64,
+        last_activity_ms: ?i64,
+        pending_events: usize,
+        waiting_on_user: bool,
+        queued_prompts: u32,
         recordings: []const []const u8,
     };
     const items = try arena.alloc(Item, state.entries.items.len);
     var res = Res.init(arena);
     try res.textf("{d} agent(s)", .{items.len});
+    const wall = clock.wallMs();
+    const mono = clock.nowMs();
     for (state.entries.items, items) |e, *out| {
+        var model: ?[]const u8 = e.picked_model orelse e.launch_model;
+        var effort: ?[]const u8 = e.launch_effort;
+        switch (e.agent.source) {
+            .opencode_api => |*api| {
+                if (api.currentModel()) |m| model = try std.fmt.allocPrint(arena, "{s}/{s}", .{ m.provider, m.model });
+                effort = api.currentEffort();
+            },
+            .screen => {},
+        }
+        var sessions: std.ArrayList([]const u8) = .empty;
+        try sessions.append(arena, e.session);
+        if (e.server_session) |s| try sessions.append(arena, s);
+        const act_ms = e.agent.lastActivityMs();
         out.* = .{
             .agent = e.id,
             .app = e.loaded.spec.id,
             .source = @tagName(e.agent.kind()),
             .state = @tagName(e.agent.state()),
             .ready = e.agent.ready(),
-            .session = e.session,
-            .server_session = e.server_session,
-            .pending_events = e.agent.queue().undelivered(),
-            .waiting_on_user = e.agent.interaction() != null,
             .host = e.host,
             .transport = @tagName(e.transport),
+            .cwd = e.cwd,
+            .binary = e.binary,
+            .model = model,
+            .effort = effort,
+            .session = e.session,
+            .server_session = e.server_session,
+            .sessions = sessions.items,
+            .started_ms = e.started_ms,
+            .last_activity_ms = if (act_ms > 0) wall - @max(0, mono - act_ms) else null,
+            .pending_events = e.agent.queue().undelivered(),
+            .waiting_on_user = e.agent.interaction() != null,
+            .queued_prompts = e.agent.queuedPrompts(),
             .recordings = e.recordings.items,
         };
-        try res.textf("{s} ({s}): {s}, session {s}{s}{s}, {d} undelivered event(s)", .{ out.agent, out.app, out.state, out.session, if (e.host != null) " on " else "", e.host orelse "", out.pending_events });
-        for (e.recordings.items) |r| try res.textf("  recording: {s}", .{r});
+        try res.textf("{s} ({s}{s}{s}): {s} on {s} in {s}, up {d}s, active {s} ago, {d} undelivered event(s)", .{
+            out.agent,                         out.app,                    if (model != null) ", " else "",                          model orelse "",
+            out.state,                         e.host orelse "this machine", out.cwd,                                                   @divTrunc(@max(0, wall - e.started_ms), 1000),
+            if (out.last_activity_ms) |x| try std.fmt.allocPrint(arena, "{d}s", .{@divTrunc(@max(0, wall - x), 1000)}) else "never", out.pending_events,
+        });
     }
     try res.raw("agents", try toJson(arena, items));
     try res.fact("count", items.len);
@@ -2627,6 +2792,8 @@ const Descriptor = struct {
     /// agent_open's `args`/`env` (absent in older descriptors: none).
     args: []const []const u8 = &.{},
     env: []const launch.EnvVar = &.{},
+    /// `Entry.started_ms` (absent in older descriptors: the reattach's).
+    started_ms: i64 = 0,
 };
 
 fn descriptorPath(arena: std.mem.Allocator, id: []const u8, ext: []const u8) ![]const u8 {
@@ -2678,6 +2845,7 @@ fn writeDescriptor(e: *Entry) void {
         .rows = e.rows,
         .args = e.extra.args,
         .env = e.extra.env,
+        .started_ms = e.started_ms,
     };
     const path = descriptorPath(arena, e.id, "json") catch return;
     pathz.makeParentDirs(path) catch return;
@@ -2846,6 +3014,7 @@ fn reattachOne(d: Descriptor) !void {
     e.cols = d.cols;
     e.rows = d.rows;
     e.remote_port = d.remote_port;
+    if (d.started_ms > 0) e.started_ms = d.started_ms;
     // Nothing below fails: the parts move into the entry.
     e.agent = parts.ag.?;
     e.visible = .{ .owned = parts.vis.? };
@@ -3041,15 +3210,20 @@ test "the outcome of a wake-up is its highest-ranked kind" {
     var cur: events.Cursor = .{};
     const d = (try cur.take(&q, .{ .messages = true }, 0, testing.allocator)).?;
     defer testing.allocator.free(d.items);
-    try testing.expectEqualStrings("needs_input", outcomeOf(d.items, .waiting_user, false));
-    try testing.expectEqualStrings("done", outcomeOf(d.items[0..2], .idle, false));
-    try testing.expectEqualStrings("message", outcomeOf(d.items[0..1], .working, false));
-    try testing.expectEqualStrings("still_working", outcomeOf(&.{}, .working, false));
-    try testing.expectEqualStrings("exited", outcomeOf(&.{}, .exited, true));
+    try testing.expectEqualStrings("needs_input", outcomeOf(d.items, .waiting_user, false, false));
+    try testing.expectEqualStrings("done", outcomeOf(d.items[0..2], .idle, false, false));
+    try testing.expectEqualStrings("message", outcomeOf(d.items[0..1], .working, false, false));
+    try testing.expectEqualStrings("still_working", outcomeOf(&.{}, .working, false, false));
+    try testing.expectEqualStrings("exited", outcomeOf(&.{}, .exited, true, false));
     // A prompt the agent has not started on yet is sent, not working.
-    try testing.expectEqualStrings("sent", outcomeOf(&.{}, .idle, true));
-    try testing.expectEqualStrings("still_working", outcomeOf(&.{}, .working, true));
-    try testing.expectEqualStrings("still_working", outcomeOf(&.{}, .idle, false));
+    try testing.expectEqualStrings("sent", outcomeOf(&.{}, .idle, true, false));
+    try testing.expectEqualStrings("still_working", outcomeOf(&.{}, .working, true, false));
+    try testing.expectEqualStrings("still_working", outcomeOf(&.{}, .idle, false, false));
+    // A prompt queued behind a busy agent's turn and not taken yet.
+    try testing.expectEqualStrings("queued", outcomeOf(&.{}, .working, true, true));
+    // Taken: it is the turn now, and a wake-up still outranks it.
+    try testing.expectEqualStrings("still_working", outcomeOf(&.{}, .working, true, false));
+    try testing.expectEqualStrings("needs_input", outcomeOf(d.items, .waiting_user, true, true));
 }
 
 /// A configured instance in a temp dir, torn down by `deinit`.
@@ -3377,7 +3551,7 @@ test "an event announcing a record carries its id and a one-line preview, never 
     e.visible = .{ .borrowed = 4242 };
     try state.entries.append(state.allocator, e);
     const long = "first line of a long report\n" ++ "x" ** 3000;
-    _ = try ag.source.screen.queue.pushDone(clock.nowMs(), 0, long, 42, null);
+    _ = try ag.source.screen.queue.pushDone(clock.nowMs(), 0, 0, long, 42, null);
     _ = try ag.source.screen.queue.push(clock.nowMs(), .needs_input, null, "permission: rm", "1. Yes");
     const read = try mcp.expectToolResultShape(a, "agent_read", try rig.call(.agent_read, "{}"));
     const sc = read.object.get("structuredContent").?.object;
@@ -3477,6 +3651,8 @@ const FakeApp = struct {
     /// The mirror's seq after the attach snapshot.
     seq: u64 = 7,
     typed: std.ArrayList(u8) = .empty,
+    /// A slow turn is under way: the next line is queued behind it.
+    slow: bool = false,
     stop: std.atomic.Value(bool) = .init(false),
     failed: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
@@ -3569,6 +3745,18 @@ const FakeApp = struct {
     /// What the app draws for a submitted line.
     fn respond(self: *FakeApp, line: []const u8) !void {
         var buf: [512]u8 = undefined;
+        if (self.slow) {
+            // Typed while working: queued (a preview above the status
+            // block), then taken at the turn's end as Claude Code 2.1.287
+            // draws it.
+            self.slow = false;
+            try self.draw(try std.fmt.bufPrint(&buf, erase ++ "you: {s}\r\nctrl+enter to send now\r\n" ++ live, .{line}));
+            _ = c.usleep(300_000);
+            try self.draw("\x1b]133;C\x07\x1b]133;D\x07\x07" ++ APP_IDLE);
+            try self.draw(try std.fmt.bufPrint(&buf, "\x1b[2K\x1b[1A" ** 5 ++ "\x1b[2K\x1b[G" ++ "Churned for 2s \xc2\xb7 done\r\nyou: {s}\r\n" ++ live ++ "\x1b]133;A\x07" ++ APP_BUSY, .{line}));
+            try self.draw(try std.fmt.bufPrint(&buf, erase ++ "claude: echo: {s}\r\n" ++ live, .{line}));
+            return self.draw(APP_END);
+        }
         if (std.mem.eql(u8, line, "2")) {
             try self.draw("\r\x1b[5A\x1b[Jclaude: permission answered No\r\n" ++ live);
             return self.draw(APP_END);
@@ -3576,6 +3764,10 @@ const FakeApp = struct {
         if (std.mem.eql(u8, line, "/model")) return self.draw("\x1b]133;A\x07" ++ erase ++ "you: /model\r\n" ++ MODEL_PICKER);
         try self.draw(try std.fmt.bufPrint(&buf, "\x1b]133;A\x07" ++ APP_BUSY ++ erase ++ "you: {s}\r\n" ++ live, .{line}));
         if (std.mem.indexOf(u8, line, "permission") != null) return self.draw(APP_PERMISSION);
+        if (std.mem.indexOf(u8, line, "slow") != null) {
+            self.slow = true;
+            return self.draw(erase ++ "claude: started the slow one\r\n" ++ live);
+        }
         try self.draw(try std.fmt.bufPrint(&buf, erase ++ "claude: echo: {s}\r\n" ++ live, .{line}));
         return self.draw(APP_END);
     }
@@ -3649,9 +3841,22 @@ test "every agent tool answers in its declared shape: a scripted Claude Code on 
     const asked = try shaped(a, "agent_send", try rig.call(.agent_send, "{\"text\":\"please ask permission\",\"timeout_ms\":10000}"));
     try testing.expectEqualStrings("needs_input", asked.get("outcome").?.string);
     try testing.expectEqualStrings("permission", asked.get("interaction").?.object.get("kind").?.string);
-    // Busy agents refuse a prompt rather than queue it.
+    // An agent waiting for an answer refuses a prompt: its keys would answer it.
     try expectError(a, "agent_send", try rig.call(.agent_send, "{\"text\":\"again\"}"), "conflict");
     try expectError(a, "agent_answer", try rig.call(.agent_answer, "{\"choice\":\"Maybe\"}"), "invalid_args");
+    try testing.expect(asked.get("interaction").?.object.get("free_text").?.bool);
+    try expectError(a, "agent_answer", try rig.call(.agent_answer, "{\"choice\":\"no\",\"text\":\"x\"}"), "invalid_args");
+    // A free-text answer: No, then the text as the next prompt. The wait is
+    // for the text's turn; the refused job's done rides along.
+    const texted = try shaped(a, "agent_answer", try rig.call(.agent_answer, "{\"text\":\"do it differently\",\"timeout_ms\":10000}"));
+    try testing.expectEqualStrings("No", texted.get("answered").?.string);
+    try testing.expect(texted.get("free_text").?.bool);
+    try testing.expectEqualStrings("done", texted.get("outcome").?.string);
+    try testing.expectEqualStrings("echo: do it differently", texted.get("message").?.string);
+    try expectError(a, "agent_answer", try rig.call(.agent_answer, "{\"text\":\"nothing asked\"}"), "conflict");
+
+    const asked2 = try shaped(a, "agent_send", try rig.call(.agent_send, "{\"text\":\"please ask permission again\",\"timeout_ms\":10000}"));
+    try testing.expectEqualStrings("needs_input", asked2.get("outcome").?.string);
 
     const answered = try shaped(a, "agent_answer", try rig.call(.agent_answer, "{\"choice\":\"no\",\"timeout_ms\":10000}"));
     try testing.expectEqualStrings("No", answered.get("answered").?.string);
@@ -3678,6 +3883,29 @@ test "every agent tool answers in its declared shape: a scripted Claude Code on 
     try testing.expectEqualStrings("notice", set_recs[0].object.get("kind").?.string);
     try testing.expect(std.mem.indexOf(u8, set_recs[0].object.get("text").?.string, "model set to haiku for this session: Set model to Haiku 4.5") != null);
     try testing.expectEqualStrings("echo: right after", set_recs[1].object.get("text").?.string);
+
+    // A prompt sent while the agent works goes into the app's queue; the
+    // wait is for its turn, and the turn it waited behind is not lost.
+    const slow = try shaped(a, "agent_send", try rig.call(.agent_send, "{\"text\":\"a slow one\",\"timeout_ms\":300}"));
+    // The recipe outlasts the 300 ms: the call may return before it saw the turn start.
+    const slow_outcome = slow.get("outcome").?.string;
+    try testing.expect(std.mem.eql(u8, slow_outcome, "still_working") or std.mem.eql(u8, slow_outcome, "sent"));
+    try testing.expect(!slow.get("queued").?.bool);
+    var polls: usize = 0;
+    while (polls < 50) : (polls += 1) {
+        const l = try shaped(a, "agent_list", try rig.call(.agent_list, "{}"));
+        if (std.mem.eql(u8, l.get("agents").?.array.items[0].object.get("state").?.string, "working")) break;
+        _ = c.usleep(50_000);
+    }
+    const queued = try shaped(a, "agent_send", try rig.call(.agent_send, "{\"text\":\"queued one\",\"timeout_ms\":10000}"));
+    try testing.expect(queued.get("queued").?.bool);
+    try testing.expectEqualStrings("done", queued.get("outcome").?.string);
+    try testing.expectEqualStrings("echo: queued one", queued.get("message").?.string);
+    const q_recs = queued.get("records").?.array.items;
+    try testing.expectEqual(@as(usize, 2), q_recs.len);
+    try testing.expectEqualStrings("started the slow one", q_recs[0].object.get("text").?.string);
+    try testing.expectEqualStrings("echo: queued one", q_recs[1].object.get("text").?.string);
+    try testing.expectEqual(@as(usize, 2), queued.get("jobs").?.array.items.len);
     // Effort only takes at launch; a term_open terminal cannot be relaunched.
     try expectError(a, "agent_set", try rig.call(.agent_set, "{\"effort\":\"high\"}"), "refused");
     try expectError(a, "agent_set", try rig.call(.agent_set, "{\"effort\":\"turbo\"}"), "invalid_args");
@@ -3686,6 +3914,11 @@ test "every agent tool answers in its declared shape: a scripted Claude Code on 
     _ = try shaped(a, "agent_wait", try rig.call(.agent_wait, "{\"timeout_ms\":300}"));
     const listed = try shaped(a, "agent_list", try rig.call(.agent_list, "{}"));
     try testing.expectEqual(@as(i64, 1), listed.get("count").?.integer);
+    const item = listed.get("agents").?.array.items[0].object;
+    try testing.expectEqualStrings("fake-claude", item.get("sessions").?.array.items[0].string);
+    try testing.expect(item.get("started_ms").?.integer > 0);
+    try testing.expect(item.get("last_activity_ms").?.integer >= item.get("started_ms").?.integer - 1000);
+    try testing.expectEqual(@as(i64, 0), item.get("queued_prompts").?.integer);
 
     // agent_open's own facts around the same per-agent ones.
     const e = state.entries.items[0];
