@@ -441,6 +441,10 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
         try res.fact("agent_ssh", agent_ssh);
         try res.fact("agent_open_args_env", agents_ok);
         try res.fact("agent_open_resume", agents_ok);
+        try res.fact("agent_resume_checked", agents_ok);
+        try res.fact("agent_open_process_args", agents_ok);
+        try res.fact("agent_conversation", agents_ok);
+        try res.fact("user_daemon_env_scrubbed", @import("../mux/client.zig").Conn.scrub_user_daemon_env);
         try res.fact("agent_resume_by_id", agents_ok);
         try res.fact("agent_idle_ttl_hours", if (agents_ok) mcp_agent.state.ttl_secs / 3600 else 0);
         try res.fact("tombstones", agents_ok);

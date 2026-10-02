@@ -43,7 +43,7 @@ pub fn isChrome(sc: *const adapter.Screen, text: []const u8) bool {
     for (sc.chrome) |m| {
         if (m.matches(text)) return true;
     }
-    inline for (.{ "footer", "subagent", "background", "permission", "queued" }) |f| {
+    inline for (.{ "footer", "subagent", "background", "background_agent", "permission", "queued" }) |f| {
         if (@field(sc, f)) |m| {
             if (m.matches(text)) return true;
         }
@@ -554,7 +554,8 @@ pub const test_adapter_json =
     \\    ],
     \\    "chrome": [ { "pattern": "^[A-Z]\\S*…$" }, { "prefix": "manual mode on" }, { "pattern": "^\\$$" }, { "prefix": "$ " }, { "prefix": "✔ " } ],
     \\    "subagent": { "pattern": "^Waiting for [0-9]+ background agents? to finish" },
-    \\    "background": { "pattern": "· +[0-9]+ shells?$" },
+    \\    "background": { "pattern": "· +[0-9]+ shells?$|· +[0-9]+ shells?, |· +[0-9]+ monitors?$|· +[0-9]+ monitors?, " },
+    \\    "background_agent": { "pattern": "^ +◯ " },
     \\    "choice_prompt": { "prefix": "Select with numbers [" },
     \\    "permission": { "prefix": "Permission Required:" },
     \\    "bell_needs_input": true,

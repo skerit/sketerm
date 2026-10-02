@@ -460,6 +460,34 @@ pub const Conn = struct {
     /// it; the per-user daemon (default socket) never takes it.
     pub const IDLE_EXIT_ENV = "SKETERM_MUX_IDLE_EXIT";
 
+    /// Set once by `sketerm mcp` at startup: a PER-USER daemon this process
+    /// autostarts gets an environment without `USER_DAEMON_SCRUB`, because
+    /// every shell the user opens there later inherits it. Private instance
+    /// daemons keep the environment as it is.
+    pub var scrub_user_daemon_env: bool = false;
+
+    /// What an MCP server's environment carries that the per-user daemon it
+    /// autostarts must not pass on: the assistant's own variables (a
+    /// trailing `*` is a prefix) and this server's.
+    pub const USER_DAEMON_SCRUB = [_][]const u8{
+        "CLAUDE*",
+        "AI_AGENT",
+        "SKETERM_MCP_*",
+        IDLE_EXIT_ENV,
+        @import("../util/lifetime.zig").ENV,
+    };
+
+    /// Whether the `NAME=VALUE` environment entry `entry` is one
+    /// `USER_DAEMON_SCRUB` names.
+    pub fn userDaemonScrubs(entry: []const u8) bool {
+        const name = entry[0 .. std.mem.indexOfScalar(u8, entry, '=') orelse entry.len];
+        for (USER_DAEMON_SCRUB) |s| {
+            const hit = if (std.mem.endsWith(u8, s, "*")) std.mem.startsWith(u8, name, s[0 .. s.len - 1]) else std.mem.eql(u8, name, s);
+            if (hit) return true;
+        }
+        return false;
+    }
+
     /// Like `connectLocalAutostart`, but against `sock_path` when given —
     /// a PRIVATE daemon instance (its aux sockets live next to the socket),
     /// used by `sketerm mcp` isolation. null = the shared per-user daemon.
@@ -493,9 +521,11 @@ pub const Conn = struct {
             _ = std.fmt.parseInt(u32, s, 10) catch break :blk null;
             break :blk @ptrCast(v);
         };
+        const scrub = sock_path == null and scrub_user_daemon_env;
         const pid = c.fork();
         if (pid == 0) {
             _ = c.setsid();
+            if (scrub) @import("../util/platform.zig").dropEnvironment(&userDaemonScrubs);
             // Detach stdio before exec. The daemon outlives the client
             // that autostarted it, so inheriting its stdout/stderr wedges
             // any pipeline or $(...) that client sits in: the shell waits
@@ -3207,4 +3237,26 @@ test "env ticket is host-matched and single-use" {
     try std.testing.expect(c.getenv("SKETERM_UDP_TICKET") == null);
     try std.testing.expect(takeTicketFromEnv("boxy") == null);
     key[0] = 0;
+}
+
+test "a per-user daemon an MCP server autostarts inherits neither the assistant's nor the server's variables" {
+    const t = std.testing;
+    for ([_][]const u8{
+        "CLAUDECODE=1",
+        "CLAUDE_CODE_SESSION_ID=0b5d",
+        "CLAUDE_CONFIG_DIR=/x",
+        "AI_AGENT=claude-code",
+        "SKETERM_MCP_TOOLS=all",
+        "SKETERM_MCP_HARD_TIMEOUT_MS=1",
+        "SKETERM_MUX_IDLE_EXIT=120",
+        "SKETERM_MUX_LIFETIME_FD=7",
+    }) |e| try t.expect(Conn.userDaemonScrubs(e));
+    for ([_][]const u8{
+        "PATH=/usr/bin",
+        "HOME=/home/u",
+        "AI_AGENTS=1",
+        "SKETERM_MUX_SOCKET=/run/x",
+        "XDG_RUNTIME_DIR=/run/user/1000",
+        "CLAUD=1",
+    }) |e| try t.expect(!Conn.userDaemonScrubs(e));
 }

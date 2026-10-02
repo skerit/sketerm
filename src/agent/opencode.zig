@@ -1299,6 +1299,23 @@ pub const Api = struct {
         return false;
     }
 
+    /// Whether the server knows session `id` (`GET /session/<id>`): false on
+    /// a 404, an error (`problem` says which) on any other failure.
+    pub fn sessionExists(self: *Api, id: []const u8) !bool {
+        var path_buf: [256]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "/session/{s}", .{id}) catch return error.NoSession;
+        const r = self.client.call(.{ .method = .GET, .path = path }, clock.nowMs() + REQUEST_TIMEOUT_MS) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            self.fail("GET {s}: {s}", .{ path, @errorName(err) });
+            return error.Rejected;
+        };
+        defer r.deinit(self.allocator);
+        if (r.ok()) return true;
+        if (r.status == 404) return false;
+        self.fail("GET {s}: {d} {s}", .{ path, r.status, r.body[0..@min(r.body.len, 300)] });
+        return error.Rejected;
+    }
+
     /// Open the event stream first (nothing is missed), then drive
     /// `session` or a new one, then read the server's current state.
     /// @param session an existing session to adopt; its past is history.
@@ -2418,6 +2435,24 @@ test "api: connect, submit with a chosen model and effort, answer, interrupt, co
     try t.expectEqual(@as(usize, 1), countKind(&api.source.queue, .connection_restored));
     try t.expect(srv.lastRequest("GET /session/ses_root/message") != null);
     try t.expectEqual(@as(usize, 3), api.source.records.items.len);
+}
+
+test "api: a session to resume is checked first; an unknown one is false, never adopted" {
+    var srv: testserver.Server = .{};
+    try srv.start(t.allocator);
+    defer srv.deinit();
+    srv.route("GET /session/ses_known", .{ .body = "{\"id\":\"ses_known\",\"title\":\"t\"}" });
+    srv.route("GET /session/ses_nope", .{ .status = 404, .body = "{\"name\":\"NotFoundError\"}" });
+    srv.route("GET /session/ses_err", .{ .status = 500, .body = "boom" });
+    var set = adapter.Set.init(t.allocator);
+    defer set.deinit();
+    try set.loadShipped();
+    var api = try Api.init(t.allocator, set.get("opencode").?, .{}, .{ .port = srv.port(), .password = "pw" });
+    defer api.deinit();
+    try t.expect(try api.sessionExists("ses_known"));
+    try t.expect(!try api.sessionExists("ses_nope"));
+    try t.expectError(error.Rejected, api.sessionExists("ses_err"));
+    try t.expect(std.mem.indexOf(u8, api.problem(), "500") != null);
 }
 
 test "api: a refused session create is Rejected with the status in problem()" {

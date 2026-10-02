@@ -787,6 +787,10 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     // per-user daemon and GUI stay out of reach. --shared opts into
     // the real daemon + running GUI.
     var iso: ?Isolation = null;
+    // A per-user daemon this server autostarts (agents live there) must
+    // not hand the assistant's environment, or this server's, to every
+    // shell the user opens there later.
+    muxclient.Conn.scrub_user_daemon_env = true;
     if (!opts.shared) {
         sweepStaleEphemeral(allocator);
         iso = setupIsolation(allocator, opts.name, opts.durable) orelse {

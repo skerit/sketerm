@@ -449,18 +449,31 @@ pub const Engine = struct {
         return false;
     }
 
-    /// The count on a background line after the last record start (its
-    /// first number, 1 without one), 0 when none shows.
+    /// The background tasks shown after the last record start: the numbers
+    /// on the background line summed (1 without one), plus one per
+    /// background agent row; 0 when none shows.
     fn backgroundInTail(self: *const Engine) u32 {
-        const m = self.sc.background orelse return 0;
+        var n: u32 = 0;
+        var seen_line = false;
         var i = self.rows.items.len;
         while (i > 0) {
             i -= 1;
             const l = self.rows.items[i];
-            if (m.matches(l.text)) return firstNumber(l.text) orelse 1;
-            if (grammar.classify(self.sc, l) == .record) return 0;
+            if (self.sc.background_agent) |m| if (m.matches(l.text)) {
+                n += 1;
+                continue;
+            };
+            // A turn's footer says what still ran when it ended, and keeps
+            // saying it after they ended: never the live count.
+            if (self.sc.footer) |m| if (m.matches(l.text)) continue;
+            if (self.sc.background) |m| if (!seen_line and m.matches(l.text)) {
+                seen_line = true;
+                n += @max(1, sumNumbers(l.text));
+                continue;
+            };
+            if (grammar.classify(self.sc, l) == .record) break;
         }
-        return 0;
+        return n;
     }
 
     /// Milliseconds until the background cap fires a `done`, or null.
@@ -1007,11 +1020,21 @@ fn freeLines(allocator: std.mem.Allocator, list: *std.ArrayList(Line)) void {
     if (list.capacity > 4096) list.clearAndFree(allocator) else list.clearRetainingCapacity();
 }
 
-fn firstNumber(text: []const u8) ?u32 {
-    const start = std.mem.indexOfAny(u8, text, "0123456789") orelse return null;
-    var end = start;
-    while (end < text.len and std.ascii.isDigit(text[end])) end += 1;
-    return std.fmt.parseInt(u32, text[start..end], 10) catch null;
+/// Every decimal number in `text`, summed (0 without one).
+fn sumNumbers(text: []const u8) u32 {
+    var sum: u32 = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        if (!std.ascii.isDigit(text[i])) {
+            i += 1;
+            continue;
+        }
+        var end = i;
+        while (end < text.len and std.ascii.isDigit(text[end])) end += 1;
+        sum +|= std.fmt.parseInt(u32, text[i..end], 10) catch 0;
+        i = end;
+    }
+    return sum;
 }
 
 fn titleBusy(sc: *const adapter.Screen, title: ?[]const u8) bool {
@@ -1416,6 +1439,91 @@ test "a background task that never ends: done fires at the cap with the count" {
     try rig.engine.tick(since + 2 * select.BACKGROUND_DONE_CAP_MS);
     try t.expectEqual(@as(usize, 1), countKind(&rig.engine, .done));
     try t.expectEqual(vocab.State.waiting_background, rig.engine.state);
+}
+
+/// Erase `n` live rows before a redraw, as claude does.
+fn eraseRows(comptime n: usize) []const u8 {
+    return "\x1b[2K\x1b[1A" ** (n - 1) ++ "\x1b[2K\x1b[G";
+}
+const erase_6 = eraseRows(6);
+const erase_7 = eraseRows(7);
+const status_rows = "[Haiku 4.5] repo:master\r\n[\xe2\x96\xa0\xe2\x96\xa1] 21%\r\n";
+/// The live blocks claude 2.1.287 draws while background work runs
+/// (measured with Haiku at 120 and 48 columns): shells and monitors on the
+/// mode line, one `◯` row per background subagent under `● main`.
+const live_all = status_rows ++ "manual mode on  \xc2\xb7  2 shells, 1 monitor\r\n  \xe2\x97\x8f main\r\n   \xe2\x97\xaf  general-purpose Subagent sleep 60 then answer 6s \xc2\xb7 \xe2\x86\x93 32.7k tokens\r\n$";
+const live_shell_monitor = status_rows ++ "manual mode on  \xc2\xb7  1 shell, 1 monitor\r\n$";
+const live_monitor = status_rows ++ "manual mode on  \xc2\xb7  1 monitor\r\n$";
+const live_agent_only = status_rows ++ "manual mode on\r\n  \xe2\x97\x8f main\r\n   \xe2\x97\xaf  claude Run sleep 60 then report\r\nSUB-DONE 7s \xc2\xb7 \xe2\x86\x93 32.9k tokens\r\n$";
+
+test "every kind of background work holds the done: shells, a monitor, a background subagent" {
+    var rig: Rig = undefined;
+    try rig.init(120, 40);
+    defer rig.deinit();
+    rig.write("\x1b]0;\xe2\x9c\xb3 C\x07" ++ live);
+    try rig.feed(0);
+    try rig.engine.tick(1000);
+    rig.write("\x1b]133;A\x07\x1b]0;\xe2\x97\x90 C\x07" ++ erase ++ "you: start them, do not wait\r\n" ++ live);
+    try rig.feed(1100);
+    rig.write(erase ++ "tool: Bash (sleep 75; echo BG-SHELL-DONE)\r\nclaude: Started a shell, a monitor and a subagent.\r\n" ++ live_all);
+    try rig.feed(1200);
+    rig.write("\x1b]133;C\x07\x1b]133;D\x07\x07\x1b]0;\xe2\x9c\xb3 C\x07" ++ erase_6 ++
+        "Brewed for 44s \xc2\xb7 done 10:29 AM \xc2\xb7 2 shells still running\r\n" ++ live_all);
+    try rig.feed(1300);
+    try rig.engine.tick(5000);
+    try t.expectEqual(vocab.State.waiting_background, rig.engine.state);
+    try t.expectEqual(@as(u32, 4), rig.engine.background_tasks);
+    try t.expectEqual(@as(usize, 0), countKind(&rig.engine, .done));
+
+    // The subagent finishes first and wakes the agent; the shell and the
+    // monitor still run, so its wake turn is not settled either (this is
+    // the done that fired early in the field, on a 48-column terminal).
+    rig.write("\x1b]0;\xe2\x97\x90 C\x07\x1b]133;A\x07" ++ erase_6 ++ " Agent \"sleep 60\" finished \xc2\xb7 60s\r\nclaude: Subagent task complete; the shell and the monitor still run.\r\n" ++ live_shell_monitor ++
+        "\x1b]133;C\x07\x1b]133;D\x07\x07\x1b]0;\xe2\x9c\xb3 C\x07" ++ erase ++ "Baked for 2s \xc2\xb7 done 10:30 AM \xc2\xb7 1 shell, 1 monitor still running\r\n" ++ live_shell_monitor);
+    try rig.feed(61_000);
+    try rig.engine.tick(65_000);
+    try t.expectEqual(vocab.State.waiting_background, rig.engine.state);
+    try t.expectEqual(@as(u32, 2), rig.engine.background_tasks);
+    try t.expectEqual(@as(usize, 0), countKind(&rig.engine, .done));
+    // Only the monitor left.
+    rig.write(erase ++ live_monitor);
+    try rig.feed(76_000);
+    try rig.engine.tick(80_000);
+    try t.expectEqual(vocab.State.waiting_background, rig.engine.state);
+    try t.expectEqual(@as(u32, 1), rig.engine.background_tasks);
+    try t.expectEqual(@as(usize, 0), countKind(&rig.engine, .done));
+
+    // All done: the wake turn settles, and the footer that still says
+    // what ran when the earlier turn ended is no live count.
+    rig.write("\x1b]0;\xe2\x97\x90 C\x07\x1b]133;A\x07" ++ erase ++ " Background command \"sleep 75\" completed (exit code 0)\r\nclaude: All three finished.\r\n" ++ live ++
+        "\x1b]133;C\x07\x1b]133;D\x07\x07\x1b]0;\xe2\x9c\xb3 C\x07" ++ erase ++ "Crunched for 1s \xc2\xb7 done 10:31 AM\r\n" ++ live);
+    try rig.feed(90_000);
+    try rig.engine.tick(95_000);
+    try t.expectEqual(vocab.State.idle, rig.engine.state);
+    try t.expectEqual(@as(usize, 1), countKind(&rig.engine, .done));
+}
+
+test "a background subagent alone holds the done, its row wrapped on a narrow terminal" {
+    var rig: Rig = undefined;
+    try rig.init(48, 30);
+    defer rig.deinit();
+    rig.write("\x1b]0;\xe2\x9c\xb3 C\x07" ++ live);
+    try rig.feed(0);
+    try rig.engine.tick(1000);
+    rig.write("\x1b]133;A\x07\x1b]0;\xe2\x97\x90 C\x07" ++ erase ++ "you: start a subagent\r\nclaude: Started.\r\n" ++ live_agent_only ++
+        "\x1b]133;C\x07\x1b]133;D\x07\x07\x1b]0;\xe2\x9c\xb3 C\x07" ++ erase_7 ++ "Brewed for 3s \xc2\xb7 done\r\n" ++ live_agent_only);
+    try rig.feed(1100);
+    try rig.engine.tick(5000);
+    try t.expectEqual(vocab.State.waiting_background, rig.engine.state);
+    try t.expectEqual(@as(u32, 1), rig.engine.background_tasks);
+    try t.expectEqual(@as(usize, 0), countKind(&rig.engine, .done));
+    // Its row goes with the wake turn that reports it.
+    rig.write("\x1b]0;\xe2\x97\x90 C\x07\x1b]133;A\x07" ++ erase_7 ++ " Agent \"sleep 60\" finished \xc2\xb7 60s\r\nclaude: SUB-DONE arrived.\r\n" ++ live ++
+        "\x1b]133;C\x07\x1b]133;D\x07\x07\x1b]0;\xe2\x9c\xb3 C\x07" ++ erase ++ "Baked for 1s \xc2\xb7 done\r\n" ++ live);
+    try rig.feed(61_000);
+    try rig.engine.tick(65_000);
+    try t.expectEqual(vocab.State.idle, rig.engine.state);
+    try t.expectEqual(@as(usize, 1), countKind(&rig.engine, .done));
 }
 
 test "claude /compact: a notice, never the summary, and only the command's own done" {

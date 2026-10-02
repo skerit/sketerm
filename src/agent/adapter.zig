@@ -110,10 +110,13 @@ pub const ScreenSpec = struct {
     chrome: []const LineRule = &.{},
     /// "Waiting for N background agents" style line: busy is a subagent wait.
     subagent: ?LineRule = null,
-    /// A line saying background tasks the app started still run (its first
-    /// number is their count, 1 when it has none): an idle app showing it
-    /// is `waiting_background`, and its `done` waits for them.
+    /// A line saying background tasks the app started still run (its
+    /// numbers summed are their count, 1 when it has none): an idle app
+    /// showing it is `waiting_background`, and its `done` waits for them.
     background: ?LineRule = null,
+    /// A row the app draws for each background subagent still running:
+    /// counted with `background`'s tasks.
+    background_agent: ?LineRule = null,
     /// The line under a numbered option list (`N. label` rows) that makes
     /// it a pending interaction.
     choice_prompt: LineRule,
@@ -129,6 +132,10 @@ pub const ScreenSpec = struct {
     /// Options a free-text answer goes through (`actions.answer_text`
     /// picks the first that matches, then types the text).
     text_options: []const TextOption = &.{},
+    /// A line the app prints when `launch.resume_args` named a conversation
+    /// it does not have: `agent_open resume` then fails naming the id, and
+    /// no new conversation is left running in its name.
+    resume_refused: ?LineRule = null,
 };
 
 /// An interaction option that takes free text: its label matches exactly
@@ -252,10 +259,12 @@ pub const Screen = struct {
     chrome: []const Matcher,
     subagent: ?Matcher,
     background: ?Matcher,
+    background_agent: ?Matcher,
     choice_prompt: Matcher,
     permission: ?Matcher,
     queued: ?Matcher,
     text_options: []const TextOptionMatcher,
+    resume_refused: ?Matcher,
 };
 
 pub const TextOptionMatcher = struct {
@@ -431,10 +440,12 @@ const Validator = struct {
             .chrome = chrome,
             .subagent = if (sc.subagent) |r| try self.rule(r, "screen.subagent", null) else null,
             .background = if (sc.background) |r| try self.rule(r, "screen.background", null) else null,
+            .background_agent = if (sc.background_agent) |r| try self.rule(r, "screen.background_agent", null) else null,
             .choice_prompt = try self.rule(sc.choice_prompt, "screen.choice_prompt", null),
             .permission = if (sc.permission) |r| try self.rule(r, "screen.permission", null) else null,
             .queued = if (sc.queued) |r| try self.rule(r, "screen.queued", null) else null,
             .text_options = texts,
+            .resume_refused = if (sc.resume_refused) |r| try self.rule(r, "screen.resume_refused", null) else null,
         };
     }
 
@@ -731,6 +742,8 @@ test "every shipped adapter loads, and a user file overrides by id" {
     }
     try t.expect(set.items.items.len >= 2);
     try t.expect(set.get("claude") != null);
+    // What `claude --resume <unknown id>` prints before it exits 1 (measured, 2.1.287).
+    try t.expect(set.get("claude").?.screen.?.resume_refused.?.matches("No conversation found with session ID: 00000000-0000-4000-8000-00000000beef"));
     const oc = set.get("opencode").?;
     try t.expectEqual(vocab.SourceKind.opencode_api, oc.spec.source);
     try t.expectEqualStrings("OPENCODE_SERVER_PASSWORD", oc.spec.launch.password_env.?);

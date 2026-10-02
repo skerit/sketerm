@@ -6640,6 +6640,18 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
         expectFact(opened, "session", c1_session, "agent_open: session name");
         // A name is unique among this machine's live agents.
         _ = agentCall(&m, arena, "agent_open", std.fmt.allocPrint(arena, "{{\"app\":\"claude\",\"name\":\"claude-1\",\"binary\":{s}}}", .{bin_json}) catch fail("oom"), "agent_open taken name", true, 15_000);
+        // The conversation it runs is a fact, for a resume after a restart.
+        if (scStr(opened, "conversation", "agent_open: conversation").len != 36) fail("agent_open: the conversation fact is not the --session-id it was started with");
+        // A conversation the app does not have fails the open, naming it,
+        // and leaves no agent behind (the fake prints what claude prints).
+        {
+            const refused = agentCall(&m, arena, "agent_open", std.fmt.allocPrint(arena, "{{\"app\":\"claude\",\"resume\":\"nope-1234\",\"binary\":{s},\"timeout_ms\":15000}}", .{bin_json}) catch fail("oom"), "agent_open unknown resume", true, 30_000);
+            const err = (refused.get("error") orelse fail("agent_open unknown resume: no error object")).object;
+            expectFact(err, "code", "not_found", "agent_open unknown resume: code");
+            if (std.mem.indexOf(u8, scStr(err, "message", "agent_open unknown resume"), "nope-1234") == null) fail("agent_open unknown resume: the error does not name the id");
+            if (agentCall(&m, arena, "agent_list", "{}", "agent_list after a refused resume", false, 15_000).get("count").?.integer != 1)
+                fail("agent_open unknown resume: an agent was left behind");
+        }
         if (!opened.get("ready").?.bool) fail("agent_open: the fake Claude Code never became ready (an unset_env leak makes it refuse to start)");
         if (std.mem.indexOf(u8, scStr(opened, "watch_command", "agent_open"), " agent-wait ") == null) fail("agent_open: no watch_command");
         // A cursor baked into the command went stale with the next call.

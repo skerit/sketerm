@@ -52,6 +52,10 @@ pub const EnvVar = struct { name: []const u8, value: []const u8 };
 /// in front of the PATH the binary is looked up in and runs with.
 pub const Extra = struct {
     args: []const []const u8 = &.{},
+    /// After `args`, on the main process only (opencode's `serve`).
+    server_args: []const []const u8 = &.{},
+    /// After `args`, on the attached process only (opencode's TUI).
+    tui_args: []const []const u8 = &.{},
     env: []const EnvVar = &.{},
     path_prepend: []const []const u8 = &.{},
     /// Remote probes and starts run in the user's login shell environment.
@@ -60,10 +64,12 @@ pub const Extra = struct {
     pub fn clone(self: Extra, a: std.mem.Allocator) !Extra {
         var out: Extra = .{ .login_shell = self.login_shell };
         errdefer out.free(a);
-        const args = try a.alloc([]const u8, self.args.len);
-        @memset(args, "");
-        out.args = args;
-        for (self.args, args) |s, *d| d.* = try a.dupe(u8, s);
+        inline for (.{ "args", "server_args", "tui_args" }) |f| {
+            const list = try a.alloc([]const u8, @field(self, f).len);
+            @memset(list, "");
+            @field(out, f) = list;
+            for (@field(self, f), list) |s, *d| d.* = try a.dupe(u8, s);
+        }
         const dirs = try a.alloc([]const u8, self.path_prepend.len);
         @memset(dirs, "");
         out.path_prepend = dirs;
@@ -80,8 +86,10 @@ pub const Extra = struct {
 
     /// Free what `clone` allocated.
     pub fn free(self: Extra, a: std.mem.Allocator) void {
-        for (self.args) |s| a.free(s);
-        a.free(self.args);
+        inline for (.{ "args", "server_args", "tui_args" }) |f| {
+            for (@field(self, f)) |s| a.free(s);
+            a.free(@field(self, f));
+        }
         for (self.path_prepend) |s| a.free(s);
         a.free(self.path_prepend);
         for (self.env) |v| {
@@ -108,11 +116,17 @@ pub const Extra = struct {
 /// Why `x` cannot be passed to a launch of `launch`'s binary, or null when
 /// it can: the one rule for caller `args`/`env`, refused, never sanitized.
 pub fn checkExtra(arena: std.mem.Allocator, launch: adapter.Launch, x: Extra) !?[]const u8 {
-    if (x.args.len > MAX_EXTRA) return try std.fmt.allocPrint(arena, "args: at most {d} entries (got {d})", .{ MAX_EXTRA, x.args.len });
-    for (x.args, 0..) |s, i| {
-        if (s.len == 0 or s.len > MAX_EXTRA_BYTES) return try std.fmt.allocPrint(arena, "args[{d}] must be 1-{d} bytes (got {d})", .{ i, MAX_EXTRA_BYTES, s.len });
-        if (try textProblem(arena, s)) |p| return try std.fmt.allocPrint(arena, "args[{d}] {s}", .{ i, p });
+    inline for (.{ "args", "server_args", "tui_args" }) |f| {
+        const list = @field(x, f);
+        if (list.len > MAX_EXTRA) return try std.fmt.allocPrint(arena, f ++ ": at most {d} entries (got {d})", .{ MAX_EXTRA, list.len });
+        for (list, 0..) |s, i| {
+            if (s.len == 0 or s.len > MAX_EXTRA_BYTES) return try std.fmt.allocPrint(arena, f ++ "[{d}] must be 1-{d} bytes (got {d})", .{ i, MAX_EXTRA_BYTES, s.len });
+            if (try textProblem(arena, s)) |p| return try std.fmt.allocPrint(arena, f ++ "[{d}] {s}", .{ i, p });
+        }
     }
+    // Only an app started as two processes has a second one to target.
+    if (launch.attach_args.len == 0 and (x.server_args.len > 0 or x.tui_args.len > 0))
+        return try std.fmt.allocPrint(arena, "{s} runs as one process: server_args and tui_args are for an app with an attached client (opencode); pass args", .{launch.binary});
     if (x.env.len > MAX_EXTRA) return try std.fmt.allocPrint(arena, "env: at most {d} entries (got {d})", .{ MAX_EXTRA, x.env.len });
     for (x.env, 0..) |v, i| {
         if (!validEnvName(v.name)) return try std.fmt.allocPrint(arena, "env name {f} must match [A-Za-z_][A-Za-z0-9_]* (at most {d} bytes)", .{ std.json.fmt(v.name, .{}), MAX_EXTRA_BYTES });
@@ -587,8 +601,8 @@ pub const Run = union(enum) { main: Start, attach };
 /// names `x.env` sets (the spawn or the remote script sets their values).
 pub fn startArgv(arena: std.mem.Allocator, launch: adapter.Launch, binary: []const u8, x: Extra, values: Values, run: Run) ![]const []const u8 {
     const argv = switch (run) {
-        .main => |start| try mainArgv(arena, launch, binary, x.args, values, start),
-        .attach => try attachArgv(arena, launch, binary, x.args, values),
+        .main => |start| try mainArgv(arena, launch, binary, try std.mem.concat(arena, []const u8, &.{ x.args, x.server_args }), values, start),
+        .attach => try attachArgv(arena, launch, binary, try std.mem.concat(arena, []const u8, &.{ x.args, x.tui_args }), values),
     };
     return withUnsetEnv(arena, launch.unset_env, try x.names(arena), argv);
 }
@@ -604,6 +618,73 @@ pub fn launchTakes(launch: adapter.Launch, comptime which: enum { model, effort 
         .model => launch.model_args.len > 0,
         .effort => launch.effort_args.len > 0,
     };
+}
+
+/// The `$0` of the `withUnsetEnv` wrapper: what `appArgv` strips.
+const WRAPPER_NAME = "sketerm-agent";
+
+/// The app's own argv inside a start argv (`withUnsetEnv` wrapper dropped).
+pub fn appArgv(argv: []const []const u8) []const []const u8 {
+    if (argv.len > 4 and std.mem.eql(u8, argv[3], WRAPPER_NAME)) return argv[4..];
+    return argv;
+}
+
+/// What a process that exited before it was ready printed, split into
+/// its error lines and whether it printed its usage text.
+pub const StartFailure = struct {
+    errors: []const []const u8,
+    usage: bool,
+};
+
+/// Separate a short start output's error lines from the usage text a CLI
+/// argument parser prints (yargs, as opencode uses it: a `<binary> <command>`
+/// line, its description, then `Options:` rows), which buries the real
+/// error, or replaces it: opencode 0.0.0-oc11 prints nothing else for an
+/// unknown option.
+/// @param binary the started executable; its basename starts the usage header.
+pub fn startFailure(arena: std.mem.Allocator, output: []const u8, binary: []const u8) !StartFailure {
+    var lines: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.splitScalar(u8, output, '\n');
+    while (it.next()) |l| try lines.append(arena, std.mem.trimEnd(u8, l, " \r\t"));
+    const ls = lines.items;
+    var opt: ?usize = null;
+    for (ls, 0..) |l, i| {
+        if (usageHeader(l)) {
+            opt = i;
+            break;
+        }
+    }
+    var start = ls.len;
+    var end = ls.len;
+    if (opt) |o| {
+        start = o;
+        const base = std.fs.path.basename(binary);
+        var k = o;
+        while (k > 0) {
+            k -= 1;
+            const first = std.mem.sliceTo(std.mem.trimStart(u8, ls[k], " "), ' ');
+            if (std.mem.eql(u8, first, base)) {
+                start = k;
+                break;
+            }
+        }
+        end = o + 1;
+        while (end < ls.len and (ls[end].len == 0 or ls[end][0] == ' ' or usageHeader(ls[end]))) end += 1;
+    }
+    var errors: std.ArrayList([]const u8) = .empty;
+    for (ls, 0..) |l, i| {
+        if (i >= start and i < end) continue;
+        const v = std.mem.trim(u8, l, " ");
+        if (v.len > 0) try errors.append(arena, v);
+    }
+    return .{ .errors = errors.items, .usage = opt != null };
+}
+
+fn usageHeader(line: []const u8) bool {
+    for ([_][]const u8{ "Options:", "Commands:", "Positionals:", "Usage:", "Examples:" }) |h| {
+        if (std.mem.eql(u8, line, h)) return true;
+    }
+    return false;
 }
 
 /// `argv` wrapped so the child starts with every variable `unset` names
@@ -630,7 +711,7 @@ pub fn withUnsetEnv(arena: std.mem.Allocator, unset: []const []const u8, keep: [
     }
     try script.appendSlice(arena, "*[!A-Za-z0-9_]*) ;; *) unset \"$n\";; esac; done; exec \"$@\"");
     var out: std.ArrayList([]const u8) = .empty;
-    try out.appendSlice(arena, &.{ "/bin/sh", "-c", script.items, "sketerm-agent" });
+    try out.appendSlice(arena, &.{ "/bin/sh", "-c", script.items, WRAPPER_NAME });
     try out.appendSlice(arena, argv);
     return out.items;
 }
@@ -1075,6 +1156,58 @@ test "caller args come right after the binary, before the adapter's own" {
     // Placeholders are the adapter's: a caller's `{port}` stays literal.
     const lit = try mainArgv(a, test_launch, "/w", &.{"{port}"}, .{ .port = "4100" }, .fresh);
     try t.expectEqualStrings("{port}", lit[1]);
+}
+
+test "server_args and tui_args reach one process each; args reach both; a one-process app refuses them" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const x = Extra{ .args = &.{"--wrap"}, .server_args = &.{ "--cors", "x" }, .tui_args = &.{"--tui-only"} };
+    try t.expect((try checkExtra(a, test_launch, x)) == null);
+    const server = try startArgv(a, test_launch, "/w", x, .{ .port = "4100" }, .{ .main = .fresh });
+    const want_server = [_][]const u8{ "/w", "--wrap", "--cors", "x", "serve", "--port", "4100" };
+    try t.expectEqual(want_server.len, server.len);
+    for (want_server, server) |w, g| try t.expectEqualStrings(w, g);
+    const tui = try startArgv(a, test_launch, "/w", x, .{ .port = "4100", .session = "s" }, .attach);
+    try t.expectEqualStrings("--wrap", tui[1]);
+    try t.expectEqualStrings("--tui-only", tui[2]);
+    try t.expectEqualStrings("attach", tui[3]);
+    // The same validation as args, and a clone carries them.
+    try t.expect((try checkExtra(a, test_launch, .{ .tui_args = &.{"a\nb"} })) != null);
+    const copy = try x.clone(t.allocator);
+    defer copy.free(t.allocator);
+    try t.expectEqualStrings("--tui-only", copy.tui_args[0]);
+    const claude = adapter.Launch{ .binary = "claude", .candidates = &.{"$PATH"} };
+    const refused = (try checkExtra(a, claude, .{ .server_args = &.{"--x"} })).?;
+    try t.expect(std.mem.indexOf(u8, refused, "one process") != null);
+}
+
+test "a start failure: the error lines, not the usage text the parser printed around them" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // As opencode 0.0.0-oc11 prints an unknown option to `serve` (measured):
+    // the usage text and nothing else.
+    const usage =
+        "opencode serve\n\nstarts a headless opencode server\n\nOptions:\n" ++
+        "  -h, --help         show help                    [boolean]\n" ++
+        "      --mdns         enable mDNS service discovery (defaults hostname to 0.0.0.0)\n" ++
+        "                                                  [boolean] [default: false]\n" ++
+        "      --cors         additional domains to allow for CORS   [array] [default: []]\n";
+    const only = try startFailure(a, usage, "/home/u/.opencode/bin/opencode");
+    try t.expect(only.usage);
+    try t.expectEqual(@as(usize, 0), only.errors.len);
+    // An error line above it, and one below it, are what is reported.
+    const both = try startFailure(a, "Error: Unknown argument: bogus\n" ++ usage ++ "\nport 4100 is taken\n", "opencode");
+    try t.expectEqual(@as(usize, 2), both.errors.len);
+    try t.expectEqualStrings("Error: Unknown argument: bogus", both.errors[0]);
+    try t.expectEqualStrings("port 4100 is taken", both.errors[1]);
+    // No usage text: every line is the error.
+    const plain = try startFailure(a, "EADDRINUSE: 127.0.0.1:4100\n", "opencode");
+    try t.expect(!plain.usage);
+    try t.expectEqualStrings("EADDRINUSE: 127.0.0.1:4100", plain.errors[0]);
+    const wrapped = [_][]const u8{ "/bin/sh", "-c", "script", "sketerm-agent", "/oc", "serve" };
+    try t.expectEqualStrings("/oc", appArgv(&wrapped)[0]);
 }
 
 /// Every byte a shell treats specially, in args and env values.

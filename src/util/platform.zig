@@ -25,6 +25,26 @@ pub fn clearEnvironment() void {
     }
 }
 
+/// Drop every `NAME=VALUE` entry of the process environment that `drop`
+/// names, in place: no allocation and no libc lock, so a forked child of a
+/// threaded parent may call it before exec.
+pub fn dropEnvironment(drop: *const fn ([]const u8) bool) void {
+    const env: [*c][*c]u8 = if (is_linux) @ptrCast(std.c.environ) else blk: {
+        const slot = _NSGetEnviron();
+        if (slot == null) return;
+        break :blk slot[0];
+    };
+    if (env == null) return;
+    var r: usize = 0;
+    var w: usize = 0;
+    while (env[r] != null) : (r += 1) {
+        if (drop(std.mem.span(@as([*:0]const u8, @ptrCast(env[r]))))) continue;
+        env[w] = env[r];
+        w += 1;
+    }
+    env[w] = null;
+}
+
 /// Clears libc's thread-local errno before an API whose sentinel is ambiguous.
 pub fn clearErrno() void {
     if (is_linux)
@@ -1215,4 +1235,19 @@ test "foregroundProgram returns null for a non-tty fd" {
 /// A stat result's modification time in seconds since the epoch.
 pub fn mtimeSecs(st: *const c.struct_stat) i64 {
     return if (@hasField(c.struct_stat, "st_mtim")) st.st_mtim.tv_sec else st.st_mtimespec.tv_sec;
+}
+
+test "dropEnvironment removes exactly the entries it is told to" {
+    const t = std.testing;
+    _ = c.setenv("SKETERM_DROPTEST_GONE", "1", 1);
+    _ = c.setenv("SKETERM_DROPTEST_KEPT", "2", 1);
+    defer _ = c.unsetenv("SKETERM_DROPTEST_KEPT");
+    dropEnvironment(&struct {
+        fn drop(entry: []const u8) bool {
+            return std.mem.startsWith(u8, entry, "SKETERM_DROPTEST_GONE=");
+        }
+    }.drop);
+    try t.expect(c.getenv("SKETERM_DROPTEST_GONE") == null);
+    try t.expectEqualStrings("2", std.mem.span(@as([*:0]const u8, @ptrCast(c.getenv("SKETERM_DROPTEST_KEPT").?))));
+    try t.expect(c.getenv("PATH") != null);
 }

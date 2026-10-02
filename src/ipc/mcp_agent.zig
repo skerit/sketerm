@@ -310,6 +310,9 @@ const State = struct {
     /// nothing until it returns, so its own result gets what happens.
     held: [MAX_ANY]*const Entry = undefined,
     held_len: usize = 0,
+    /// The running tool call was asked not to wait (`timeout_ms: 0`): its
+    /// wait running out is what it asked for, never `timed_out`.
+    no_wait: bool = false,
 };
 
 /// Agents one agent_wait or waiter watches at most.
@@ -1116,6 +1119,8 @@ pub fn agentTool(arena: std.mem.Allocator, tool: Tool, args: std.json.Value) ![]
         return errRes(arena, .unavailable, "the agent tools need an isolated or durable instance (the default, or --durable/--name); this server runs --shared, where agents are not available");
     state.held_len = 0;
     defer state.held_len = 0;
+    state.no_wait = if (argInt(args, "timeout_ms")) |ms| ms == 0 else false;
+    defer state.no_wait = false;
     sweep(clock.nowMs());
     return switch (tool) {
         .agent_adapters => adaptersTool(arena, args),
@@ -1304,6 +1309,7 @@ fn finish(arena: std.mem.Allocator, res: *Res, e: *Entry, dv: Delivered, watch: 
     try res.fact("session", e.session);
     if (e.server_session) |s| try res.fact("server_session", s);
     if (e.host) |h| try res.fact("host", h);
+    if (conversationOf(e)) |cv| try res.fact("conversation", cv);
     try res.fact("transport", @tagName(e.transport));
 
     var message: ?[]const u8 = null;
@@ -1338,12 +1344,11 @@ fn finish(arena: std.mem.Allocator, res: *Res, e: *Entry, dv: Delivered, watch: 
             const fresh = if (select.answerIndex(recs, j)) |i| !e.handed.has(recs[i]) else false;
             if (!fresh) message = null;
             const sel = try select.select(arena, recs, jobs.items, .{ .handed = &e.handed, .keep_empty = true });
-            const name = if (lo < j) try std.fmt.allocPrint(arena, "jobs {d}-{d}", .{ lo, j }) else try std.fmt.allocPrint(arena, "job {d}", .{j});
-            job_block = .{ .name = name, .body = try writeSelection(arena, res, recs, sel) };
+            job_block = .{ .name = try jobsName(arena, sel.jobs), .body = try writeSelection(arena, res, recs, sel) };
             try e.handed.markSelection(e.allocator, recs, sel);
         }
         if (message) |m| try res.fact("message", m);
-        try res.fact("timed_out", w.timed_out);
+        try res.fact("timed_out", w.timed_out and !state.no_wait);
         try res.textf("{s}: {s} (state {s})", .{ e.id, outcome, @tagName(st) });
         if (background) |n|
             try res.textf("done after {d} minutes idle with {d} background task(s) still running", .{ @divTrunc(select.BACKGROUND_DONE_CAP_MS, 60_000), n });
@@ -1418,6 +1423,30 @@ fn finish(arena: std.mem.Allocator, res: *Res, e: *Entry, dv: Delivered, watch: 
     }
     if (cmd) |x| try block(res, .{ .name = "watch_command", .body = x });
     return res.finish();
+}
+
+/// The app conversation `e` runs (what `agent_open resume` takes), or null
+/// while unknown: a screen app's session id, an API source's session.
+fn conversationOf(e: *Entry) ?[]const u8 {
+    return switch (e.agent.source) {
+        .opencode_api => |*api| api.sessionId(),
+        .screen => e.conversation,
+    };
+}
+
+/// A job block's header: the jobs it holds (`job 3`, `jobs 2, 4`, `jobs 2-4`).
+fn jobsName(arena: std.mem.Allocator, jobs: []const select.JobSummary) ![]const u8 {
+    if (jobs.len == 0) return "jobs";
+    if (jobs.len == 1) return std.fmt.allocPrint(arena, "job {d}", .{jobs[0].job});
+    var contiguous = true;
+    for (jobs[1..], 0..) |s, i| {
+        if (s.job != jobs[i].job + 1) contiguous = false;
+    }
+    if (contiguous) return std.fmt.allocPrint(arena, "jobs {d}-{d}", .{ jobs[0].job, jobs[jobs.len - 1].job });
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(arena, "jobs ");
+    for (jobs, 0..) |s, i| try out.print(arena, "{s}{d}", .{ if (i > 0) ", " else "", s.job });
+    return out.items;
 }
 
 fn block(res: *Res, b: Block) !void {
@@ -1555,21 +1584,23 @@ fn validConversationId(id: []const u8) bool {
 /// `launch.checkExtra`.
 fn extraOpts(arena: std.mem.Allocator, args: std.json.Value, loaded: *const adapter.Loaded, why: *Fail) !launch.Extra {
     var x: launch.Extra = .{};
-    if (mcp.argValue(args, "args")) |v| if (v != .null) {
-        if (v != .array) {
-            why.* = .{ .code = .invalid_args, .msg = "args must be an array of strings" };
-            return error.Refused;
-        }
-        const out = try arena.alloc([]const u8, v.array.items.len);
-        for (v.array.items, out) |item, *o| {
-            if (item != .string) {
-                why.* = .{ .code = .invalid_args, .msg = "args must be an array of strings" };
+    inline for (.{ "args", "server_args", "tui_args" }) |key| {
+        if (mcp.argValue(args, key)) |v| if (v != .null) {
+            if (v != .array) {
+                why.* = .{ .code = .invalid_args, .msg = key ++ " must be an array of strings" };
                 return error.Refused;
             }
-            o.* = item.string;
-        }
-        x.args = out;
-    };
+            const out = try arena.alloc([]const u8, v.array.items.len);
+            for (v.array.items, out) |item, *o| {
+                if (item != .string) {
+                    why.* = .{ .code = .invalid_args, .msg = key ++ " must be an array of strings" };
+                    return error.Refused;
+                }
+                o.* = item.string;
+            }
+            @field(x, key) = out;
+        };
+    }
     if (mcp.argValue(args, "env")) |v| if (v != .null) {
         if (v != .object) {
             why.* = .{ .code = .invalid_args, .msg = "env must be an object of variable names to string values" };
@@ -1781,6 +1812,12 @@ fn openTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
 
     const filter = filterFrom(args);
     const ready = waitReady(e, deadline);
+    // A conversation the app does not have is an error, never a new one
+    // left running in its name.
+    if (o.resume_id) |rid| if (try resumeRefused(arena, e, rid)) |msg| {
+        discard(e);
+        return errRes(arena, .not_found, msg);
+    };
     // An adopted conversation's past was the caller's before: it is
     // history, never a first delivery (`since`/`detail:"all"` re-read it).
     if (o.resume_id != null and ready) {
@@ -1867,6 +1904,7 @@ fn openResult(arena: std.mem.Allocator, e: *Entry, ready: bool, sent: bool, note
     try res.fact("binary", e.binary);
     try res.fact("binary_version", lf.version);
     try res.textf("binary: {s}{s}{s}", .{ e.binary, if (lf.version != null) ", " else "", lf.version orelse "" });
+    if (conversationOf(e)) |cv| try res.textf("conversation {s} (agent_open resume takes it after a restart)", .{cv});
     try res.fact("path_prepend", e.extra.path_prepend);
     if (e.host != null) {
         try res.fact("login_shell", lf.login orelse false);
@@ -1879,6 +1917,8 @@ fn openResult(arena: std.mem.Allocator, e: *Entry, ready: bool, sent: bool, note
     // The values of `env` are never echoed: only what was set.
     const env_names = try e.extra.names(arena);
     try res.fact("args", e.extra.args);
+    if (e.extra.server_args.len > 0) try res.fact("server_args", e.extra.server_args);
+    if (e.extra.tui_args.len > 0) try res.fact("tui_args", e.extra.tui_args);
     try res.fact("env_names", env_names);
     if (e.extra.args.len > 0 or env_names.len > 0)
         try res.textf("launched with {d} extra arg(s) and env {s}", .{ e.extra.args.len, if (env_names.len == 0) "(none)" else try std.mem.join(arena, ", ", env_names) });
@@ -2187,12 +2227,12 @@ fn spawnScreen(arena: std.mem.Allocator, loaded: *const adapter.Loaded, binary: 
 /// Wait until an API server answers its health route (`probeHealth`),
 /// watching its session: a server that swallows the requests of its
 /// first seconds is waited out, one that exits is reported as such.
-fn waitServerReady(arena: std.mem.Allocator, api: *opencode.Api, server: *termdrive.Term, what: []const u8, deadline: i64, why: *Fail) !void {
+fn waitServerReady(arena: std.mem.Allocator, api: *opencode.Api, server: *termdrive.Term, what: []const u8, argv: []const []const u8, deadline: i64, why: *Fail) !void {
     const started = clock.nowMs();
     while (true) {
         server.drain();
         if (server.exited and !server.lost) {
-            why.* = .{ .code = .failed, .msg = try std.fmt.allocPrint(arena, "{s} exited before it was ready (last line: {s})", .{ what, mcp_term.termLastLine(arena, server) }) };
+            why.* = .{ .code = .failed, .msg = try exitedEarly(arena, server, what, launch.appArgv(argv)) };
             return error.Refused;
         }
         const now = clock.nowMs();
@@ -2212,6 +2252,27 @@ fn waitServerReady(arena: std.mem.Allocator, api: *opencode.Api, server: *termdr
         if (ok) return;
         pumpFor(100);
     }
+}
+
+/// Why a process exited before it was ready: its status, the argv that
+/// ran and the error lines it printed, never the usage text around them.
+fn exitedEarly(arena: std.mem.Allocator, t: *termdrive.Term, what: []const u8, argv: []const []const u8) ![]const u8 {
+    const text = t.readScreen(true) catch try t.allocator.dupe(u8, "");
+    defer t.allocator.free(text);
+    const f = try launch.startFailure(arena, text, if (argv.len > 0) argv[0] else "");
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    try w.print("{s} exited", .{what});
+    if (t.exit_status_known) try w.print(" with status {d}", .{t.exit_status});
+    try w.writeAll(" before it was ready; it ran:");
+    for (argv) |a| try w.print(" {s}", .{a});
+    if (f.errors.len > 0) {
+        try w.writeAll("\nit said:");
+        for (f.errors[0..@min(f.errors.len, 12)]) |l| try w.print("\n{s}", .{l});
+    } else if (f.usage) {
+        try w.writeAll("\nit printed only its usage text, naming no error: it rejected its command line (an argument it does not take; server_args and tui_args target one of its processes)");
+    } else try w.writeAll("\nit printed nothing");
+    return aw.written();
 }
 
 fn spawnApi(arena: std.mem.Allocator, loaded: *const adapter.Loaded, binary: []const u8, o: OpenOpts, where: *Where, deadline: i64, why: *Fail) !*Entry {
@@ -2277,7 +2338,19 @@ fn spawnApi(arena: std.mem.Allocator, loaded: *const adapter.Loaded, binary: []c
     const api = &ag.source.opencode_api;
     // The server listens a while before it answers, and swallows what it
     // gets in between: wait for its health route before the event stream.
-    try waitServerReady(arena, api, server, what, @min(deadline, clock.nowMs() + PORT_WAIT_MS), why);
+    try waitServerReady(arena, api, server, what, server_argv, @min(deadline, clock.nowMs() + PORT_WAIT_MS), why);
+    // A conversation to resume must exist, or the caller would be handed
+    // a new one under the old id's name.
+    if (o.resume_id) |rid| {
+        const known = api.sessionExists(rid) catch |err| {
+            why.* = .{ .code = .failed, .msg = try std.fmt.allocPrint(arena, "could not check that {s} has conversation {s}: {s}", .{ what, rid, if (api.problem().len > 0) api.problem() else @errorName(err) }) };
+            return error.Refused;
+        };
+        if (!known) {
+            why.* = .{ .code = .not_found, .msg = try std.fmt.allocPrint(arena, "{s} has no conversation {s}: {s} serve, started in {s} on {s}, answered 404 for GET /session/{s} (it looks in its own storage of that user on that host); nothing was resumed and the server was stopped", .{ what, rid, binary, cwd, where.host orelse "this machine", rid }) };
+            return error.Refused;
+        }
+    }
     api.connect(o.resume_id, clock.nowMs()) catch |err| {
         why.* = .{ .code = .failed, .msg = try std.fmt.allocPrint(arena, "the {s} API refused the connection: {s}", .{ spec.name, if (api.problem().len > 0) api.problem() else @errorName(err) }) };
         return error.Refused;
@@ -3110,6 +3183,7 @@ fn listTool(arena: std.mem.Allocator) ![]const u8 {
         pending_events: usize,
         waiting_on_user: bool,
         queued_prompts: u32,
+        conversation: ?[]const u8,
         recordings: []const []const u8,
     };
     const items = try arena.alloc(Item, state.entries.items.len);
@@ -3152,6 +3226,7 @@ fn listTool(arena: std.mem.Allocator) ![]const u8 {
             .pending_events = e.agent.queue().undelivered(),
             .waiting_on_user = e.agent.interaction() != null,
             .queued_prompts = e.agent.queuedPrompts(),
+            .conversation = conversationOf(e),
             .recordings = e.recordings.items,
         };
         try res.textf("{s} ({s}{s}{s}): {s} on {s} in {s}, up {d}s, active {s} ago, {d} undelivered event(s)", .{
@@ -3165,11 +3240,9 @@ fn listTool(arena: std.mem.Allocator) ![]const u8 {
     return res.finish();
 }
 
-fn closeTool(arena: std.mem.Allocator, _: std.json.Value, e: *Entry) ![]const u8 {
-    const id = try arena.dupe(u8, e.id);
-    var sessions: std.ArrayList([]const u8) = .empty;
-    if (e.visible) |l| if (l == .owned) try sessions.append(arena, try arena.dupe(u8, e.session));
-    if (e.server_session) |s| try sessions.append(arena, try arena.dupe(u8, s));
+/// End agent `e` and everything it owns: its sessions, waiters and index
+/// entry. `e` is freed.
+fn discard(e: *Entry) void {
     endWaitersOf(e.id, "agent closed");
     removeDescriptor(e);
     for (state.entries.items, 0..) |x, i| if (x == e) {
@@ -3178,6 +3251,33 @@ fn closeTool(arena: std.mem.Allocator, _: std.json.Value, e: *Entry) ![]const u8
     };
     publishAgents();
     e.destroy(true);
+}
+
+/// Why `e`, started to resume conversation `id`, has not got it: the
+/// adapter's `screen.resume_refused` line on its terminal, or null.
+fn resumeRefused(arena: std.mem.Allocator, e: *Entry, id: []const u8) !?[]const u8 {
+    const sc = e.loaded.screen orelse return null;
+    const m = sc.resume_refused orelse return null;
+    const t = e.visibleTerm() orelse return null;
+    const text = t.readScreen(true) catch return null;
+    defer t.allocator.free(text);
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \r\t");
+        if (!m.matches(line)) continue;
+        return try std.fmt.allocPrint(arena, "{s} has no conversation {s}: {s} {s} {s} said \"{s}\" (it looks among the conversations of its working directory {s}{s}{s}); nothing was resumed and the agent was closed", .{
+            e.loaded.spec.name, id, e.binary, e.loaded.spec.launch.resume_args[0], id, line, e.cwd, if (e.host != null) " on " else "", e.host orelse "",
+        });
+    }
+    return null;
+}
+
+fn closeTool(arena: std.mem.Allocator, _: std.json.Value, e: *Entry) ![]const u8 {
+    const id = try arena.dupe(u8, e.id);
+    var sessions: std.ArrayList([]const u8) = .empty;
+    if (e.visible) |l| if (l == .owned) try sessions.append(arena, try arena.dupe(u8, e.session));
+    if (e.server_session) |s| try sessions.append(arena, try arena.dupe(u8, s));
+    discard(e);
     var res = Res.init(arena);
     try res.textf("closed {s}{s}", .{ id, if (sessions.items.len == 0) " (its terminal belongs to term_open and stays)" else "" });
     try res.fact("agent", id);
@@ -3250,6 +3350,8 @@ fn writeDescriptor(e: *Entry) void {
         .cols = e.cols,
         .rows = e.rows,
         .args = e.extra.args,
+        .server_args = e.extra.server_args,
+        .tui_args = e.extra.tui_args,
         .env = e.extra.env,
         .path_prepend = e.extra.path_prepend,
         .login_shell = e.extra.login_shell,
@@ -3514,7 +3616,7 @@ fn reattachOne(arena: std.mem.Allocator, d: Descriptor, claim: ?agentindex.Claim
     const loaded = (try adapters()).get(d.app) orelse return error.UnknownAdapter;
     const transport: Transport = if (d.transport) |s| std.meta.stringToEnum(Transport, s) orelse return error.BadDescriptor else .local;
     if (transport != .local and d.host == null) return error.BadDescriptor;
-    const extra = launch.Extra{ .args = d.args, .env = d.env, .path_prepend = d.path_prepend, .login_shell = d.login_shell };
+    const extra = launch.Extra{ .args = d.args, .server_args = d.server_args, .tui_args = d.tui_args, .env = d.env, .path_prepend = d.path_prepend, .login_shell = d.login_shell };
     if ((try launch.checkExtra(arena, loaded.spec.launch, extra)) != null) return error.BadDescriptor;
     const socket = d.socket orelse state.mux_sock;
     var parts: Parts = .{};
@@ -4056,6 +4158,7 @@ test "every per-agent result shape is declared: a live agent on a scripted scree
     ag.* = try agent_mod.Agent.initScreen(state.allocator, set.get("claude").?, .{});
     e.agent = ag;
     e.visible = .{ .borrowed = 4242 };
+    e.conversation = try state.allocator.dupe(u8, "0b5d4c1e-8f7a-4d2b-9c3e-1a2b3c4d5e6f");
     try state.entries.append(state.allocator, e);
     const eng = &ag.source.screen;
     _ = try eng.queue.push(clock.nowMs(), .needs_input, null, "permission: Bash", "1. Yes\n2. No");
@@ -4063,17 +4166,24 @@ test "every per-agent result shape is declared: a live agent on a scripted scree
     // Listing services the agent first: its terminal id names nothing, so
     // the connection is reported lost; neither event is taken by the list.
     const listed = try mcp.expectToolResultShape(a, "agent_list", try rig.call(.agent_list, "{}"));
-    try testing.expectEqual(@as(i64, 2), listed.object.get("structuredContent").?.object.get("agents").?.array.items[0].object.get("pending_events").?.integer);
+    const item = listed.object.get("structuredContent").?.object.get("agents").?.array.items[0].object;
+    try testing.expectEqual(@as(i64, 2), item.get("pending_events").?.integer);
+    // The conversation a restarted orchestrator resumes it by.
+    try testing.expectEqualStrings(e.conversation.?, item.get("conversation").?.string);
 
     const read = try mcp.expectToolResultShape(a, "agent_read", try rig.call(.agent_read, "{\"agent\":\"claude-1\"}"));
     const rsc = read.object.get("structuredContent").?.object;
+    try testing.expectEqualStrings(e.conversation.?, rsc.get("conversation").?.string);
     // The pending event rode along; the terminal is gone, so the state says so.
     try testing.expectEqual(@as(usize, 2), rsc.get("events").?.array.items.len);
     try testing.expectEqualStrings("disconnected", rsc.get("state").?.string);
     try testing.expect(std.mem.indexOf(u8, rsc.get("watch_command").?.string, "agent-wait") != null);
 
+    // Asked not to wait: running out is no timeout, the outcome says it all.
     const waited = try mcp.expectToolResultShape(a, "agent_wait", try rig.call(.agent_wait, "{\"timeout_ms\":0}"));
-    try testing.expect(waited.object.get("structuredContent").?.object.get("timed_out").?.bool);
+    try testing.expect(!waited.object.get("structuredContent").?.object.get("timed_out").?.bool);
+    const waited_some = try mcp.expectToolResultShape(a, "agent_wait", try rig.call(.agent_wait, "{\"timeout_ms\":1}"));
+    try testing.expect(waited_some.object.get("structuredContent").?.object.get("timed_out").?.bool);
     try testing.expectEqualStrings("still_working", waited.object.get("structuredContent").?.object.get("outcome").?.string);
 
     try expectError(a, "agent_send", try rig.call(.agent_send, "{\"text\":\"hi\"}"), "unavailable");
@@ -4272,6 +4382,15 @@ test "the waiter --any: the first wake-up of several agents names its agent; a c
     try testing.expectEqual(@as(usize, 1), waited.get("agents").?.array.items.len);
     try expectError(rig.arena.allocator(), "agent_wait", try rig.call(.agent_wait, "{\"agents\":[\"nope-9\"]}"), "not_found");
     try expectError(rig.arena.allocator(), "agent_wait", try rig.call(.agent_wait, "{\"agents\":\"claude-1\"}"), "invalid_args");
+}
+
+test "a job block names exactly the jobs it holds" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try testing.expectEqualStrings("job 2", try jobsName(a, &.{.{ .job = 2 }}));
+    try testing.expectEqualStrings("jobs 1-3", try jobsName(a, &.{ .{ .job = 1 }, .{ .job = 2 }, .{ .job = 3 } }));
+    try testing.expectEqualStrings("jobs 0, 2", try jobsName(a, &.{ .{ .job = 0 }, .{ .job = 2 } }));
 }
 
 /// Read one waiter line within `ms`, servicing the server meanwhile.
