@@ -26,6 +26,12 @@ MCP server autostarts no longer inherits `CLAUDE*`, `AI_AGENT`,
 `/proc/<pid>/environ`). `timed_out` is false for `timeout_ms: 0`, a done's
 block header names only the jobs it holds, and a view-only watcher can no
 longer kill, rename, drive playback, query `app_a11y` or answer a paste.
+A report Claude re-wraps at another width is no longer handed out twice
+(the content key collapses whitespace), the mode-line count is read
+wherever on the line it sits (a resized session wraps or extends it),
+`agent_interrupt` reports the queued prompts Claude's Escape threw away
+(`queued_dropped`), and a waiter line cuts a long text between words with
+an explicit ` ...`.
 
 ## 2026-10-02: agents outlive their MCP server, resumable by id
 
