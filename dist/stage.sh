@@ -241,6 +241,10 @@ sketerm_stage() {
             "$dest/usr/share/dbus-1/services/org.freedesktop.impl.portal.desktop.sketerm.service" \
             "$service_prefix"
         install -Dm644 data/sample.layout "$dest/usr/share/sketerm/sample.layout"
+        # opencode plugin that pushes `sketerm mcp` sub-agent events into
+        # the orchestrating session (docs/mcp.md, Sub-agents).
+        install -Dm644 data/opencode/sketerm-agents.js \
+            "$dest/usr/share/sketerm/opencode/sketerm-agents.js"
 
         for i in crt crt-lottes crt-easymode zfast-crt; do
             install -Dm644 "data/shaders/$i.glsl" \

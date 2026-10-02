@@ -12,9 +12,11 @@
 //! Wire, newline-delimited JSON. Client -> server, once:
 //! `{"agent":"claude-1","match":"x","messages":true,"retrying":false,"follow":false,"since":7}`,
 //! with `"agents":[...]` added for `--any` (`agent` stays the first, so a
-//! server that predates `agents` watches that one). Server -> client:
-//! `{"type":"wake","agent":...}` per wake-up and a final
-//! `{"type":"end","reason":"..."}` before it closes.
+//! server that predates `agents` watches that one) and `"server":true`
+//! for every agent of the server, later ones included (`--server`, the
+//! follower push route: its wakes carry `content` and `meta`, composed by
+//! `agentpush.zig`). Server -> client: `{"type":"wake","agent":...}` per
+//! wake-up and a final `{"type":"end","reason":"..."}` before it closes.
 //!
 //! A waiter shares the agent's ONE delivery state with the agent_* tools
 //! (`events.Cursor`): what it prints is delivered, so no result repeats
@@ -27,6 +29,7 @@ const events = @import("../agent/events.zig");
 const shellquote = @import("../util/shellquote.zig");
 const platform = @import("../util/platform.zig");
 const clock = @import("../util/clock.zig");
+const registry = @import("mcp_registry.zig");
 
 /// The argv word after `mcp` that selects the waiter.
 pub const SUBCOMMAND = "agent-wait";
@@ -52,6 +55,10 @@ pub const Subscribe = struct {
     /// Wake for events after this seq, delivered or not; null = for what
     /// nobody has delivered yet.
     since: ?u64 = null,
+    /// Every agent of the server, those opened later included; each wake
+    /// carries the pushed text, and a done's answer it carries is handed
+    /// out (agent_read does not repeat it).
+    server: bool = false,
 
     /// The agents it names.
     pub fn names(self: *const Subscribe) []const []const u8 {
@@ -70,6 +77,23 @@ pub const WireEvent = struct {
 
 pub const WireDigest = struct { count: u32, latest: []const u8 };
 
+/// A pushed wake-up's facts. Every value is a string: Claude Code's
+/// channel `meta` takes nothing else, and its keys must be identifiers.
+pub const Meta = struct {
+    agent: []const u8,
+    name: ?[]const u8 = null,
+    /// The kind that decides the wake-up, or `digest`.
+    kind: []const u8,
+    state: []const u8,
+    seq: []const u8,
+    record: ?[]const u8 = null,
+    job: ?[]const u8 = null,
+    conversation: ?[]const u8 = null,
+};
+
+/// What a `server` subscription's wake carries besides the events.
+pub const Pushed = struct { content: []const u8, meta: Meta };
+
 /// Every server line; `type` is "wake" or "end".
 pub const Message = struct {
     type: []const u8,
@@ -78,13 +102,27 @@ pub const Message = struct {
     events: []const WireEvent = &.{},
     digest: ?WireDigest = null,
     reason: []const u8 = "",
+    /// `server` subscriptions: the pushed text and its facts.
+    content: ?[]const u8 = null,
+    meta: ?Meta = null,
 };
 
 pub const clip = events.clip;
 const firstLine = events.firstLine;
 
 /// The wake line for `d`, newline-terminated.
-pub fn encodeWake(arena: std.mem.Allocator, agent: []const u8, state: vocab.State, d: events.Delivery, q: *const events.Queue) ![]const u8 {
+/// @param push the pushed text and facts (`server` subscriptions), or null.
+pub fn encodeWake(arena: std.mem.Allocator, agent: []const u8, state: vocab.State, d: events.Delivery, q: *const events.Queue, push: ?Pushed) ![]const u8 {
+    var msg = try wakeMessage(arena, agent, state, d, q);
+    if (push) |p| {
+        msg.content = p.content;
+        msg.meta = p.meta;
+    }
+    return std.fmt.allocPrint(arena, "{f}\n", .{std.json.fmt(msg, .{ .emit_null_optional_fields = false })});
+}
+
+/// The wake message for `d` (what `formatWake` prints).
+pub fn wakeMessage(arena: std.mem.Allocator, agent: []const u8, state: vocab.State, d: events.Delivery, q: *const events.Queue) !Message {
     const evs = try arena.alloc(WireEvent, d.items.len);
     for (d.items, evs) |it, *w| w.* = .{
         .seq = it.event.seq,
@@ -96,8 +134,7 @@ pub fn encodeWake(arena: std.mem.Allocator, agent: []const u8, state: vocab.Stat
         .count = g.count,
         .latest = if (q.bySeq(g.latest_seq)) |ev| clip(ev.text, WIRE_TEXT_MAX) else "",
     } else null;
-    const msg = Message{ .type = "wake", .agent = agent, .state = @tagName(state), .events = evs, .digest = digest };
-    return std.fmt.allocPrint(arena, "{f}\n", .{std.json.fmt(msg, .{ .emit_null_optional_fields = false })});
+    return .{ .type = "wake", .agent = agent, .state = @tagName(state), .events = evs, .digest = digest };
 }
 
 pub fn encodeEnd(arena: std.mem.Allocator, reason: []const u8) ![]const u8 {
@@ -195,6 +232,8 @@ pub const HELP =
     \\                              [--retrying] [--follow] [--timeout SECONDS]
     \\                              [--since SEQ] AGENT
     \\       sketerm mcp agent-wait --socket PATH [...] --any AGENT AGENT...
+    \\       sketerm mcp agent-wait (--socket PATH | --parent PID) --server
+    \\                              [--follow] [--json] [...]
     \\
     \\Waits for an agent that an MCP server (`sketerm mcp`) runs, and prints
     \\one line per wake-up: the agent, the event that woke it and a short
@@ -213,8 +252,15 @@ pub const HELP =
     \\wakes for every event after SEQ instead, delivered or not.
     \\The agent_* tools hand out the exact command as `watch_command`.
     \\
-    \\Exit status: 0 woken or ended normally, 1 the server went away,
-    \\2 bad usage, 3 timed out.
+    \\--server follows every agent of the server, those opened later too,
+    \\and prints each wake-up as the text a push delivers: the line, and for
+    \\a done the job's answer when it is short (agent_read then does not
+    \\repeat it). --parent PID finds the server that process started (how
+    \\an MCP client's plugin finds its own server) instead of --socket.
+    \\--json prints every server line as it arrives, one JSON object each.
+    \\
+    \\Exit status: 0 woken or ended normally, 1 the server went away (or
+    \\--parent found none, or several), 2 bad usage, 3 timed out.
     \\
 ;
 
@@ -229,6 +275,10 @@ pub const Cli = struct {
     follow: bool = false,
     timeout_s: ?u32 = null,
     since: ?u64 = null,
+    server: bool = false,
+    /// `--parent`: find the server this process started.
+    parent: ?i32 = null,
+    json: bool = false,
     help: bool = false,
 
     pub const ParseError = error{ UnknownFlag, MissingValue, BadNumber, ExtraArgument };
@@ -253,7 +303,11 @@ pub const Cli = struct {
                 o.any = true;
             } else if (eql(u8, a, "--follow")) {
                 o.follow = true;
-            } else if (eql(u8, a, "--socket") or eql(u8, a, "--match") or eql(u8, a, "--timeout") or eql(u8, a, "--since")) {
+            } else if (eql(u8, a, "--server")) {
+                o.server = true;
+            } else if (eql(u8, a, "--json")) {
+                o.json = true;
+            } else if (eql(u8, a, "--socket") or eql(u8, a, "--match") or eql(u8, a, "--timeout") or eql(u8, a, "--since") or eql(u8, a, "--parent")) {
                 if (i + 1 >= args.len) return error.MissingValue;
                 i += 1;
                 const v = args[i];
@@ -261,6 +315,7 @@ pub const Cli = struct {
                 if (eql(u8, a, "--match")) o.match = v;
                 if (eql(u8, a, "--timeout")) o.timeout_s = std.fmt.parseInt(u32, v, 10) catch return error.BadNumber;
                 if (eql(u8, a, "--since")) o.since = std.fmt.parseInt(u64, v, 10) catch return error.BadNumber;
+                if (eql(u8, a, "--parent")) o.parent = std.fmt.parseInt(i32, v, 10) catch return error.BadNumber;
             } else if (a.len > 0 and a[0] == '-') {
                 return error.UnknownFlag;
             } else {
@@ -269,8 +324,10 @@ pub const Cli = struct {
                 o.agent_count += 1;
             }
         }
-        // Several agents only with --any (a typo is not a second agent).
+        // Several agents only with --any (a typo is not a second agent);
+        // --server names none, it watches them all.
         if (o.agent_count > 1 and !o.any) return error.ExtraArgument;
+        if (o.server and o.agent_count > 0) return error.ExtraArgument;
         return o;
     }
 };
@@ -301,8 +358,8 @@ pub fn cli(allocator: std.mem.Allocator, args: []const []const u8) u8 {
         const msg = switch (err) {
             error.UnknownFlag => "agent-wait: unknown flag (see --help)\n",
             error.MissingValue => "agent-wait: flag needs a value\n",
-            error.BadNumber => "agent-wait: --timeout and --since take a whole number\n",
-            error.ExtraArgument => std.fmt.comptimePrint("agent-wait: exactly one AGENT, or --any with up to {d}\n", .{MAX_ANY}),
+            error.BadNumber => "agent-wait: --timeout, --since and --parent take a whole number\n",
+            error.ExtraArgument => std.fmt.comptimePrint("agent-wait: exactly one AGENT, or --any with up to {d}, or none with --server\n", .{MAX_ANY}),
         };
         say(2, msg);
         return 2;
@@ -311,16 +368,25 @@ pub fn cli(allocator: std.mem.Allocator, args: []const []const u8) u8 {
         say(1, HELP);
         return 0;
     }
-    const sock = o.socket orelse {
-        say(2, "agent-wait: --socket is required (the agent_* tools return the exact command as watch_command)\n");
+    if (o.socket == null and (o.parent == null or !o.server)) {
+        say(2, "agent-wait: --socket is required (the agent_* tools return the exact command as watch_command), or --parent with --server\n");
         return 2;
-    };
+    }
     const names = o.agents();
-    if (names.len == 0) {
+    if (names.len == 0 and !o.server) {
         say(2, "agent-wait: name the AGENT to wait for\n");
         return 2;
     }
     platform.ignoreSigpipe();
+    var found: ?[]u8 = null;
+    defer if (found) |f| allocator.free(f);
+    const sock = o.socket orelse sock: {
+        found = registry.agentSocketOf(allocator, o.parent.?) catch |err| return ended(switch (err) {
+            error.Ambiguous => "several sketerm MCP servers were started by that process",
+            else => "no sketerm MCP server with an agent socket was started by that process",
+        }, 1);
+        break :sock found.?;
+    };
 
     const fd = platform.socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
     if (fd < 0) return ended("cannot create a socket", 1);
@@ -334,13 +400,14 @@ pub fn cli(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const sub = Subscribe{
-        .agent = names[0],
+        .agent = if (names.len > 0) names[0] else "",
         .agents = if (names.len > 1) names else &.{},
         .match = o.match,
         .messages = o.messages,
         .retrying = o.retrying,
         .follow = o.follow,
         .since = o.since,
+        .server = o.server,
     };
     const line = std.fmt.allocPrint(arena, "{f}\n", .{std.json.fmt(sub, .{ .emit_null_optional_fields = false })}) catch return ended("out of memory", 1);
     say(fd, line);
@@ -353,14 +420,21 @@ pub fn cli(allocator: std.mem.Allocator, args: []const []const u8) u8 {
             var line_arena = std.heap.ArenaAllocator.init(allocator);
             defer line_arena.deinit();
             const la = line_arena.allocator();
-            const parsed = std.json.parseFromSliceLeaky(Message, la, buf.items[0..nl], .{ .ignore_unknown_fields = true }) catch null;
+            const raw_line = la.dupe(u8, buf.items[0..nl]) catch return ended("out of memory", 1);
             std.mem.copyForwards(u8, buf.items[0 .. buf.items.len - nl - 1], buf.items[nl + 1 ..]);
             buf.shrinkRetainingCapacity(buf.items.len - nl - 1);
-            const m = parsed orelse continue;
-            if (std.mem.eql(u8, m.type, "end")) return ended(m.reason, 0);
+            const m = std.json.parseFromSliceLeaky(Message, la, raw_line, .{ .ignore_unknown_fields = true }) catch continue;
+            const is_end = std.mem.eql(u8, m.type, "end");
+            if (o.json) {
+                say(1, raw_line);
+                say(1, "\n");
+                if (is_end or !o.follow) return 0;
+                continue;
+            }
+            if (is_end) return ended(m.reason, 0);
             if (!std.mem.eql(u8, m.type, "wake")) continue;
             var aw: std.Io.Writer.Allocating = .init(la);
-            formatWake(&aw.writer, m) catch continue;
+            if (m.content) |text| aw.writer.writeAll(text) catch continue else formatWake(&aw.writer, m) catch continue;
             aw.writer.writeAll("\n") catch continue;
             say(1, aw.written());
             if (!o.follow) return 0;
@@ -414,6 +488,30 @@ test "cli arguments: flags anywhere, one agent, numbers checked" {
     try t.expectError(error.BadNumber, Cli.parse(&.{ "--timeout", "soon" }));
     try t.expectError(error.MissingValue, Cli.parse(&.{"--match"}));
     try t.expectError(error.UnknownFlag, Cli.parse(&.{"--bogus"}));
+    // --server follows them all: it names none, and --parent may replace --socket.
+    const srv = try Cli.parse(&.{ "--server", "--follow", "--json", "--parent", "4242" });
+    try t.expect(srv.server and srv.follow and srv.json and srv.socket == null);
+    try t.expectEqual(@as(?i32, 4242), srv.parent);
+    try t.expectError(error.ExtraArgument, Cli.parse(&.{ "--server", "claude-1" }));
+    try t.expectError(error.BadNumber, Cli.parse(&.{ "--parent", "me" }));
+}
+
+test "a server subscription and its pushed wake round-trip" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const line = try std.fmt.allocPrint(a, "{f}", .{std.json.fmt(Subscribe{ .server = true, .follow = true }, .{ .emit_null_optional_fields = false })});
+    const back = try std.json.parseFromSliceLeaky(Subscribe, a, line, .{ .ignore_unknown_fields = true });
+    try t.expect(back.server and back.follow and back.names().len == 0);
+    var q = events.Queue.init(t.allocator, .{});
+    defer q.deinit();
+    _ = try q.push(0, .done, null, "ok", "");
+    var cur: events.Cursor = .{};
+    const d = (try cur.take(&q, .{}, 0, a)).?;
+    const wake = try encodeWake(a, "claude-1", .idle, d, &q, .{ .content = "claude-1 done: ok [state idle]\n\nok", .meta = .{ .agent = "claude-1", .kind = "done", .state = "idle", .seq = "1" } });
+    const m = try std.json.parseFromSliceLeaky(Message, a, wake[0 .. wake.len - 1], .{ .ignore_unknown_fields = true });
+    try t.expectEqualStrings("claude-1 done: ok [state idle]\n\nok", m.content.?);
+    try t.expectEqualStrings("done", m.meta.?.kind);
 }
 
 test "the watch command round-trips through the cli grammar and bakes in no cursor" {
@@ -459,7 +557,7 @@ test "wake lines: encode, parse, and one compact printed line" {
     _ = try q.push(0, .done, null, "All done.\nDetails follow.", "");
     var cur: events.Cursor = .{};
     const d = (try cur.take(&q, .{ .messages = true }, 0, a)).?;
-    const line = try encodeWake(a, "claude-1", .idle, d, &q);
+    const line = try encodeWake(a, "claude-1", .idle, d, &q, null);
     try t.expect(std.mem.endsWith(u8, line, "}\n"));
     try t.expectEqual(@as(usize, 1), std.mem.count(u8, line, "\n"));
     const m = try std.json.parseFromSliceLeaky(Message, a, line[0 .. line.len - 1], .{ .ignore_unknown_fields = true });

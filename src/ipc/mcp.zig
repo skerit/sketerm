@@ -40,6 +40,7 @@ const mcp_caps = @import("mcp_caps.zig");
 const mcp_ui = @import("mcp_ui.zig");
 const mcp_agent = @import("mcp_agent.zig");
 const agentwait = @import("agentwait.zig");
+const agentpush = @import("agentpush.zig");
 const mcp_testkit = @import("mcp_testkit.zig");
 const FakeBackend = mcp_testkit.FakeBackend;
 const Journal = mcp_app.Journal;
@@ -50,6 +51,7 @@ const reattachApps = mcp_app.reattachApps;
 const MCP_HELP =
     \\Usage: sketerm mcp [--shared | --durable | --name NAME] [--socket PATH]
     \\                   [--log DIR] [--tools SPEC | --profile NAME] [--web-gui]
+    \\                   [--channel-name NAME]
     \\       sketerm mcp agent-wait --socket PATH [--match TEXT] [--messages]
     \\                   [--follow] [--timeout SECONDS] [--since SEQ] AGENT
     \\
@@ -126,6 +128,13 @@ const MCP_HELP =
     \\agent_adapters report. `sketerm mcp agent-wait ... AGENT` blocks until
     \\the agent next needs attention (the tools return the exact command as
     \\watch_command); see `sketerm mcp agent-wait --help`.
+    \\
+    \\Pushed agent events: in a Claude Code session started with
+    \\`--dangerously-load-development-channels server:sketerm` (or
+    \\`--channels`), every sub-agent wake-up arrives as a channel message
+    \\that starts a new turn, instead of through a waiter.
+    \\  --channel-name NAME  the name this server has in that session's
+    \\                 MCP config, when it is not "sketerm"
     \\
     \\Every headless terminal (term_open, transfer/forward helpers) is
     \\automatically recorded as an asciicast v2 (.cast) file, replayable
@@ -220,6 +229,9 @@ pub const Opts = struct {
     /// `--web-gui`: the web_* tools may use the user's own browser
     /// (see mcp_webgui.zig); highest-precedence source of that grant.
     web_gui: bool = false,
+    /// `--channel-name`: the `server:<name>` a Claude Code channel entry
+    /// must name for this server to push (`agentpush.zig`).
+    channel_name: ?[]const u8 = null,
 
     pub const ParseError = error{ UnknownFlag, MissingValue, BadName, SharedConflict };
 
@@ -255,6 +267,11 @@ pub const Opts = struct {
                 i += 1;
                 if (!validInstanceName(args[i])) return error.BadName;
                 o.profile = args[i];
+            } else if (std.mem.eql(u8, a, "--channel-name")) {
+                if (i + 1 >= args.len) return error.MissingValue;
+                i += 1;
+                if (!validInstanceName(args[i])) return error.BadName;
+                o.channel_name = args[i];
             } else if (std.mem.eql(u8, a, "--no-record")) {
                 o.no_record = true;
             } else if (std.mem.eql(u8, a, mcp_webgui.FLAG)) {
@@ -745,7 +762,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
         const msg = switch (err) {
             error.UnknownFlag => "sketerm mcp: unknown flag (see --help)\n",
             error.MissingValue => "sketerm mcp: flag needs a value\n",
-            error.BadName => "sketerm mcp: --name/--profile must be 1-48 chars of [A-Za-z0-9_-]\n",
+            error.BadName => "sketerm mcp: --name/--profile/--channel-name must be 1-48 chars of [A-Za-z0-9_-]\n",
             error.SharedConflict => "sketerm mcp: --shared conflicts with --durable/--name\n",
         };
         _ = c.fputs(msg, platform.stderr());
@@ -892,6 +909,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     mcp_term.rec_state = .{ .allocator = allocator, .enabled = !opts.no_record };
     defer mcp_term.rec_state.deinit();
     srv_mode = if (opts.shared) "shared" else if (iso != null and iso.?.durable) "durable" else "isolated";
+    channel_name = opts.channel_name orelse agentpush.DEFAULT_CHANNEL_NAME;
     srv_gui_socket = sock_path != null;
     srv_gui_socket_source = if (sock_path == null)
         .none
@@ -1034,12 +1052,28 @@ fn handleLine(allocator: std.mem.Allocator, backend: Backend, raw: []const u8) v
         // Main-thread, post-call: safe to touch the trace log.
         if (mcp_log) |*l| l.logNote("watchdog fired during the previous call: hard timeout exceeded, mux connections were aborted");
     }
-    if (reply) |r| {
-        if (mcp_log) |*l| l.logMessage("out", r);
-        _ = c.fwrite(r.ptr, 1, r.len, platform.stdout());
-        _ = c.fputc('\n', platform.stdout());
-        _ = c.fflush(platform.stdout());
-    }
+    if (reply) |r| writeOut(r);
+}
+
+/// Write one message line to the client (a reply or a notification).
+fn writeOut(line: []const u8) void {
+    if (mcp_log) |*l| l.logMessage("out", line);
+    _ = c.fwrite(line.ptr, 1, line.len, platform.stdout());
+    _ = c.fputc('\n', platform.stdout());
+    _ = c.fflush(platform.stdout());
+}
+
+/// The name a Claude Code channel entry must give this server.
+var channel_name: []const u8 = agentpush.DEFAULT_CHANNEL_NAME;
+
+/// The push route for a session whose `initialize` came from
+/// `client_name`: a channel only when the agent tools are offered, the
+/// client is Claude Code and an ancestor's argv names our channel.
+fn pushRouteFor(client_name: ?[]const u8) agentpush.Route {
+    if (!mcp_agent.available() or !policy.allows("agent_open")) return .none;
+    const name = client_name orelse return .none;
+    if (!std.mem.eql(u8, name, agentpush.CLAUDE_CODE_CLIENT)) return .none;
+    return if (agentpush.ancestorNamesChannel(channel_name)) .channel else .none;
 }
 
 const InputWait = enum { more, eof, failed };
@@ -1152,21 +1186,34 @@ pub fn handleMessage(arena: std.mem.Allocator, backend: Backend, line: []const u
         // Echo the client's protocol version when it sent one — we
         // speak plain tools-only MCP, compatible across revisions.
         var ver: []const u8 = PROTOCOL_VERSION;
+        var client_name: ?[]const u8 = null;
         if (params == .object) {
             if (params.object.get("protocolVersion")) |v| {
                 if (v == .string) ver = v.string;
             }
+            if (params.object.get("clientInfo")) |ci| if (ci == .object) if (ci.object.get("name")) |n| if (n == .string) {
+                client_name = n.string;
+            };
         }
+        const agents_offered = mcp_agent.available() and policy.allows("agent_open");
+        const route = pushRouteFor(client_name);
+        mcp_agent.armPush(route, &writeOut);
         var aw: std.Io.Writer.Allocating = .init(arena);
         const w = &aw.writer;
         w.writeAll("{\"protocolVersion\":") catch return null;
         std.json.Stringify.value(ver, .{}, w) catch return null;
-        w.print(",\"capabilities\":{{\"tools\":{{}}}},\"serverInfo\":{{\"name\":\"sketerm\",\"version\":\"{s}\"}}", .{SERVER_VERSION}) catch return null;
+        // A channel server declares `claude/channel`; Claude Code delivers
+        // its notifications only in a session that lists the channel.
+        if (agents_offered)
+            w.writeAll(",\"capabilities\":{\"tools\":{},\"experimental\":{\"" ++ agentpush.CHANNEL_CAPABILITY ++ "\":{}}}") catch return null
+        else
+            w.writeAll(",\"capabilities\":{\"tools\":{}}") catch return null;
+        w.print(",\"serverInfo\":{{\"name\":\"sketerm\",\"version\":\"{s}\"}}", .{SERVER_VERSION}) catch return null;
         // Server instructions: MCP clients put them in the assistant's
         // system prompt, so they only name tools this connection can use.
-        if (mcp_agent.available() and policy.allows("agent_open")) {
+        if (agents_offered) {
             w.writeAll(",\"instructions\":") catch return null;
-            std.json.Stringify.value(mcp_agent.INSTRUCTIONS, .{}, w) catch return null;
+            std.json.Stringify.value(mcp_agent.instructions(route), .{}, w) catch return null;
         }
         w.writeAll("}") catch return null;
         return rpcResult(arena, id, aw.written());
@@ -1181,6 +1228,7 @@ pub fn handleMessage(arena: std.mem.Allocator, backend: Backend, line: []const u
         return rpcResult(arena, id, result);
     }
     if (std.mem.eql(u8, method, "tools/call")) {
+        mcp_agent.startPush();
         if (params != .object) return rpcError(arena, id, -32602, "tools/call needs params");
         const name_v = params.object.get("name") orelse return rpcError(arena, id, -32602, "missing tool name");
         if (name_v != .string) return rpcError(arena, id, -32602, "bad tool name");

@@ -244,7 +244,7 @@ is kept by a `:ro` policy term. The full descriptions and schemas are in
 
 ### `core`
 
-- `capabilities` (read-only): Preflight report of what THIS MCP server can do right now: isolation mode, headless GUI-app support (headless_gui — launch_app renders apps into the mux daemon and NEVER needs a display, an X server or a sketerm window), whether a direct sketerm GUI control socket is attached (gui_socket; independent of the session panel relay and of headless GUI apps), the live panel transport (panels + panel_transport) and the saved-panel store (panels_store + panel_store), OCR (tesseract) availability, whether the web_* tools can run and against what (web + web_backend "gui"/"session"/"headless"/"none" — "session" adds web_session, the watchable Wayland app session the helper renders into — plus the sketerm-webengine path in web_helper; web_gui says whether the user granted the web_* tools their OWN browser and logins, web_gui_source where that came from and web_gui_transport which GUI socket they hold now; web_profiles says whether named cookie jars work, web_routes which per-tab network routes web_open can honour, web_engine_broker whether the mux daemon owns the engine's lifetime and web_engine_owner who started the one in use; web_downloads whether web_download can pull a url through a view; web_capture whether web_open can record the response bodies a headless view's page receives; web_engine_started whether an engine exists YET, since web_backend/web_watch/web_session are undetermined until it does), ssh/scp presence, the directory terminal asciicast recordings land in, the EFFECTIVE input-timing defaults (hold_ms/settle_ms/timeout_ms/click_retry, each marked when a SKETERM_MCP_* env override changed it from the built-in), whether sub-agents run here (agents, agent_adapters, agent_waiter, agent_ssh, agent_open_args_env for a wrapper's args and env, agent_open_resume for continuing an existing conversation (agent_resume_checked: an unknown id fails instead of starting afresh), agent_open_process_args for server_args/tui_args, agent_conversation for the conversation id results report, user_daemon_env_scrubbed for a per-user daemon started without the assistant's environment, agent_resume_by_id for agent_attach {agent} from any server, agent_idle_ttl_hours for how long an unattached agent lives, tombstones for agent_attach saying why a gone agent ended) and how agent_read selects what it returns (agent_read_select), how sub-agent output is delivered (agent_records_once, agent_events_shared), whether agent_wait can watch several agents (agent_wait_any), whether agent_send queues a prompt for a busy agent (agent_send_queue) and agent_answer takes free text (agent_answer_text), and when done fires (agent_done), and open session counts.
+- `capabilities` (read-only): Preflight report of what THIS MCP server can do right now: isolation mode, headless GUI-app support (headless_gui — launch_app renders apps into the mux daemon and NEVER needs a display, an X server or a sketerm window), whether a direct sketerm GUI control socket is attached (gui_socket; independent of the session panel relay and of headless GUI apps), the live panel transport (panels + panel_transport) and the saved-panel store (panels_store + panel_store), OCR (tesseract) availability, whether the web_* tools can run and against what (web + web_backend "gui"/"session"/"headless"/"none" — "session" adds web_session, the watchable Wayland app session the helper renders into — plus the sketerm-webengine path in web_helper; web_gui says whether the user granted the web_* tools their OWN browser and logins, web_gui_source where that came from and web_gui_transport which GUI socket they hold now; web_profiles says whether named cookie jars work, web_routes which per-tab network routes web_open can honour, web_engine_broker whether the mux daemon owns the engine's lifetime and web_engine_owner who started the one in use; web_downloads whether web_download can pull a url through a view; web_capture whether web_open can record the response bodies a headless view's page receives; web_engine_started whether an engine exists YET, since web_backend/web_watch/web_session are undetermined until it does), ssh/scp presence, the directory terminal asciicast recordings land in, the EFFECTIVE input-timing defaults (hold_ms/settle_ms/timeout_ms/click_retry, each marked when a SKETERM_MCP_* env override changed it from the built-in), whether sub-agents run here (agents, agent_adapters, agent_waiter, agent_ssh, agent_open_args_env for a wrapper's args and env, agent_open_resume for continuing an existing conversation (agent_resume_checked: an unknown id fails instead of starting afresh), agent_open_process_args for server_args/tui_args, agent_conversation for the conversation id results report, user_daemon_env_scrubbed for a per-user daemon started without the assistant's environment, agent_resume_by_id for agent_attach {agent} from any server, agent_idle_ttl_hours for how long an unattached agent lives, tombstones for agent_attach saying why a gone agent ended) and how agent_read selects what it returns (agent_read_select), how sub-agent output is delivered (agent_records_once, agent_events_shared), whether agent_wait can watch several agents (agent_wait_any), whether agent_send queues a prompt for a busy agent (agent_send_queue) and agent_answer takes free text (agent_answer_text), when done fires (agent_done), and whether agent events are pushed into this session (agent_push: channel = Claude Code channel messages; agent_push_follow / agent_push_followers for the agent-wait --server follower the opencode plugin runs), and open session counts.
 <!-- tool-reference:end -->
 
 ## Tool exposure policy
@@ -982,7 +982,10 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   next needs attention: `sketerm mcp agent-wait --socket <instance>/agents.sock
   [--match X] [--messages] [--retrying] <agent>`, or `--any <agent>
   <agent>...` for several (the first wake-up of any; with `--follow`, all
-  of them). Events have ONE delivery state per agent (`Event.delivered`),
+  of them), or `--server` for every agent of the server, later ones
+  included, printed as the pushed text below (`--parent PID` finds the
+  server PID started instead of `--socket`; `--json` prints the server's
+  lines verbatim). Events have ONE delivery state per agent (`Event.delivered`),
   shared by every `agent_*` result, `agent_wait` and every waiter: an
   event any of them delivered is delivered for all, because a waiter's
   line lands in the same assistant's context. So the same command can be
@@ -999,6 +1002,66 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   away. `sketerm-mcp agent-wait` and `sketerm-mcp mcp agent-wait` are the
   same command; the subscribe line keeps `agent` (the first) beside
   `agents`, so an older server watches the first one.
+- **Pushed events (`capabilities.agent_push`, `agent_push_follow`,
+  `agent_push_followers`).** Instead of a waiter the orchestrator
+  re-arms (a Monitor stops after 30 minutes, a background command after
+  one wake-up), the wake-ups can be pushed INTO its session, where each
+  starts a new turn. The event rules are unchanged (always-on kinds,
+  the opt-in kinds of the last result's `watch_command`, the flood
+  limiter, the hold during a call on the agent), and a push goes through
+  the agent's ONE delivery state like a waiter: what it delivered no
+  result, `agent_wait` or waiter hands out again, and the first of them
+  to take an event delivers it. A pushed wake-up is the waiter's line,
+  and for a `done` the job's answer in full when it is under 2000
+  characters (that record is then handed out: `agent_read` points at it
+  instead of repeating it; a longer answer gets a pointer to
+  `agent_read`) (`src/ipc/agentpush.zig`). Results of a call that
+  returned before its agent finished say the events are pushed instead
+  of asking for a waiter, and the server instructions tell the
+  orchestrator to end its turn and rely on them.
+  - **Claude Code (channels, research preview).** The server declares
+    the experimental capability `claude/channel` and sends
+    `notifications/claude/channel` with `{content, meta}`; Claude Code
+    wraps the content as `<channel source="sketerm" agent=... kind=...
+    state=... seq=... record=... job=... conversation=...>` (every meta
+    value a string) and queues it as the session's next prompt. It
+    delivers them only in a session started with the channel, which for
+    a server outside the approved plugin allowlist is
+    `claude --dangerously-load-development-channels server:sketerm`
+    (a confirmation dialog at startup; `--channels server:sketerm` only
+    for allowlisted ones), where `sketerm` is the server's name in the
+    session's MCP config (`sketerm mcp --channel-name NAME` when it is
+    another), on a first-party login (not Bedrock, Vertex or Foundry),
+    with channels enabled for the org (Team/Enterprise: managed setting
+    `channelsEnabled: true`). Claude Code tells a server nothing about
+    any of this (read from 2.1.287's bundled client: its client
+    capabilities are empty and an unregistered notification is dropped), and a push marks its
+    events delivered, so the server pushes only when the client is
+    Claude Code (`clientInfo.name` `claude-code`) and its parent, or an
+    ancestor up to 8 levels, has that option naming this server's
+    channel on its argv (Linux; elsewhere `agent_push` stays `none`),
+    and only from the session's first tool call on (Claude Code
+    registers its listener after the handshake). A session whose channel
+    Claude Code nevertheless refused (feature gate, org policy, a declined
+    dialog) loses the pushed events: `agent_read` still returns the
+    records.
+  - **opencode (a plugin).** `data/opencode/sketerm-agents.js`, installed
+    as `/usr/share/sketerm/opencode/sketerm-agents.js`; enable it with
+    `mkdir -p ~/.config/opencode/plugin && ln -s /usr/share/sketerm/opencode/sketerm-agents.js ~/.config/opencode/plugin/`
+    (or a project's `.opencode/plugin/`).
+    On the first `agent_*` tool call of a session (its
+    `tool.execute.before` hook) it starts `<sketerm> mcp agent-wait
+    --server --follow --json --parent <its pid>`, which finds the server
+    that opencode process started through the MCP registry (each record
+    publishes `ppid` and `agent_socket`) and follows every agent of it,
+    those opened later included; each wake-up is injected with
+    `session.promptAsync` into the session that last called an `agent_*`
+    tool, as `<sketerm-agent-event agent=... kind=...>` around the same
+    content, which starts a turn there (or queues behind the running
+    one). The sketerm binary is the `command` of the opencode MCP entry
+    whose executable is `sketerm` or `sketerm-mcp` (plugin option
+    `binary` overrides it). Without such an entry or server it does
+    nothing; a follower that ended is started again by the next call.
 - **Observation.** The server loop polls stdin together with every agent
   terminal, API stream and waiter connection, and wakes for the sources'
   timers, so agents are observed between requests. Turn detection is

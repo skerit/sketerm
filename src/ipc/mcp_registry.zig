@@ -62,6 +62,11 @@ const Record = struct {
     log_dir: []const u8 = "",
     mux_socket: []const u8,
     agents: ?[]const Agent = null,
+    /// The process that started the server (an MCP client): how a client's
+    /// in-process plugin finds the server it runs (`agent-wait --parent`).
+    ppid: ?c.pid_t = null,
+    /// The agent waiter socket (`agentwait.zig`); absent without one.
+    agent_socket: ?[]const u8 = null,
 };
 
 pub const Entry = struct {
@@ -74,12 +79,17 @@ pub const Entry = struct {
     legacy: bool = false,
     /// Null = the server does not publish its agents (older build).
     agents: ?[]Agent = null,
+    /// 0 = not recorded (older build).
+    ppid: c.pid_t = 0,
+    /// Empty = no waiter socket, or an older build.
+    agent_socket: []u8 = &.{},
 
     pub fn deinit(self: *Entry, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
         allocator.free(self.profile);
         allocator.free(self.log_dir);
         allocator.free(self.mux_socket);
+        allocator.free(self.agent_socket);
         if (self.agents) |owned| freeAgents(allocator, owned);
     }
 
@@ -143,9 +153,12 @@ pub const Lease = struct {
     record_path: []u8,
     lock_path: []u8,
     pid: c.pid_t = 0,
+    ppid: c.pid_t = 0,
     /// Owned copy of what was registered: `publishAgents` rewrites the
     /// whole record from it.
     registration: Registration = .{ .mode = .isolated, .mux_socket = "" },
+    /// Owned; empty until `setAgentSocket`.
+    agent_socket: []u8 = &.{},
 
     /// Publish this MCP server and hold its ownership lock until deinit/process exit.
     pub fn acquire(allocator: std.mem.Allocator, registration: Registration) !Lease {
@@ -169,6 +182,7 @@ pub const Lease = struct {
             .record_path = record_path,
             .lock_path = lock_path,
             .pid = pid,
+            .ppid = c.getppid(),
         };
         lease.registration = .{
             .mode = registration.mode,
@@ -191,6 +205,13 @@ pub const Lease = struct {
         try self.write(agents[0..@min(agents.len, MAX_PUBLISHED_AGENTS)]);
     }
 
+    /// Record the agent waiter socket; the next write publishes it.
+    pub fn setAgentSocket(self: *Lease, path: []const u8) !void {
+        const owned = try self.allocator.dupe(u8, path);
+        self.allocator.free(self.agent_socket);
+        self.agent_socket = owned;
+    }
+
     fn write(self: *Lease, agents: ?[]const Agent) !void {
         var aw: std.Io.Writer.Allocating = .init(self.allocator);
         defer aw.deinit();
@@ -202,6 +223,8 @@ pub const Lease = struct {
             .log_dir = self.registration.log_dir,
             .mux_socket = self.registration.mux_socket,
             .agents = agents,
+            .ppid = self.ppid,
+            .agent_socket = if (self.agent_socket.len > 0) self.agent_socket else null,
         }, .{ .emit_null_optional_fields = false }, &aw.writer);
         // Runtime-only publication: the held flock is authoritative and the
         // record is deleted at process exit, so `writeCacheFile` — the shared
@@ -217,6 +240,8 @@ pub const Lease = struct {
         a.free(self.registration.log_dir);
         a.free(self.registration.mux_socket);
         self.registration = .{ .mode = .isolated, .mux_socket = "" };
+        a.free(self.agent_socket);
+        self.agent_socket = &.{};
     }
 
     pub fn deinit(self: *Lease) void {
@@ -257,6 +282,20 @@ pub fn list(allocator: std.mem.Allocator, include_legacy: bool) ![]Entry {
         }
     }.less);
     return out.toOwnedSlice(allocator);
+}
+
+/// The agent waiter socket of the one live server `parent` started (owned).
+/// @throws error.NotFound when none has one, error.Ambiguous when several do.
+pub fn agentSocketOf(allocator: std.mem.Allocator, parent: c.pid_t) ![]u8 {
+    const entries = try list(allocator, false);
+    defer freeEntries(allocator, entries);
+    var hit: ?[]const u8 = null;
+    for (entries) |e| {
+        if (e.ppid != parent or e.agent_socket.len == 0) continue;
+        if (hit != null) return error.Ambiguous;
+        hit = e.agent_socket;
+    }
+    return allocator.dupe(u8, hit orelse return error.NotFound);
 }
 
 /// The registry directory, created on first use so a GUI can watch it
@@ -383,6 +422,8 @@ fn ownedEntry(allocator: std.mem.Allocator, record: Record, legacy: bool) !Entry
     const mux_socket = try allocator.dupe(u8, record.mux_socket);
     errdefer allocator.free(mux_socket);
     const agents = if (record.agents) |src| try dupeAgents(allocator, src) else null;
+    errdefer if (agents) |owned| freeAgents(allocator, owned);
+    const agent_socket = try allocator.dupe(u8, record.agent_socket orelse "");
     return .{
         .pid = record.pid,
         .mode = record.mode,
@@ -392,6 +433,8 @@ fn ownedEntry(allocator: std.mem.Allocator, record: Record, legacy: bool) !Entry
         .mux_socket = mux_socket,
         .legacy = legacy,
         .agents = agents,
+        .ppid = record.ppid orelse 0,
+        .agent_socket = agent_socket,
     };
 }
 
@@ -541,6 +584,7 @@ test "mcp registry publishes agents and still reads a record that predates them"
         try std.testing.expect(entries[0].agents == null);
     }
 
+    try lease.setAgentSocket("/x/mcp-tmp-1/agents.sock");
     try lease.publishAgents(&.{
         .{ .id = "claude-1", .app = "claude", .sessions = &.{"agent-claude-1"}, .location = "instance" },
         .{ .id = "opencode-1", .app = "opencode", .sessions = &.{ "agent-opencode-1", "agent-opencode-1-server" }, .location = "host:me@b" },
@@ -551,6 +595,13 @@ test "mcp registry publishes agents and still reads a record that predates them"
     try std.testing.expectEqual(@as(usize, 2), agents.len);
     try std.testing.expectEqualStrings("agent-opencode-1-server", agents[1].sessions[1]);
     try std.testing.expectEqualStrings("host:me@b", agents[1].location);
+    // Who started it and where its waiter listens: a client plugin's link.
+    try std.testing.expectEqual(c.getppid(), entries[0].ppid);
+    try std.testing.expectEqualStrings("/x/mcp-tmp-1/agents.sock", entries[0].agent_socket);
+    const by_parent = try agentSocketOf(allocator, c.getppid());
+    defer allocator.free(by_parent);
+    try std.testing.expectEqualStrings("/x/mcp-tmp-1/agents.sock", by_parent);
+    try std.testing.expectError(error.NotFound, agentSocketOf(allocator, 1));
 
     // What a daemon reports for it.
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -575,6 +626,8 @@ test "mcp registry publishes agents and still reads a record that predates them"
     defer old_mut.deinit(allocator);
     try std.testing.expect(old.agents == null);
     try std.testing.expectEqualStrings("old", old.name);
+    try std.testing.expectEqual(@as(c.pid_t, 0), old.ppid);
+    try std.testing.expectEqual(@as(usize, 0), old.agent_socket.len);
 }
 
 test "an instance key resolves only to a live server's daemon" {

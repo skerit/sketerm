@@ -15,8 +15,10 @@
 //! sources decide everything from content, never from gaps between feeds.
 //!
 //! Waking the assistant is the waiter socket (`agentwait.zig` is its
-//! protocol and CLI); it and `agent_wait` both go through
-//! `events.Cursor.take` on the agent's one queue and limiter.
+//! protocol and CLI) or a push into its session (`agentpush.zig`: a
+//! Claude Code channel, an `agent-wait --server` follower); all of them
+//! and `agent_wait` go through `events.Cursor.take` on the agent's one
+//! queue and limiter.
 //!
 //! Gotcha: an `Entry` is heap-allocated and stays put, because the
 //! agent's driver points into it; entries are removed only by a tool
@@ -30,6 +32,7 @@ const mcp_tools = @import("mcp_tools.zig");
 const mcp_term = @import("mcp_term.zig");
 const termdrive = @import("termdrive.zig");
 const agentwait = @import("agentwait.zig");
+const agentpush = @import("agentpush.zig");
 const adapter = @import("../agent/adapter.zig");
 const agent_mod = @import("../agent/agent.zig");
 const events = @import("../agent/events.zig");
@@ -179,6 +182,12 @@ pub const Entry = struct {
     /// The records handed to the assistant (every result that carries a
     /// selection marks what it returned).
     handed: select.Handed = .{},
+    /// The channel push's examined mark (delivery stays the queue's).
+    push_cursor: events.Cursor = .{},
+    /// What the last agent_* result's watch_command waits for: a push
+    /// wakes for the same (its `match` is `push_match`, owned).
+    push_filter: events.Filter = .{},
+    push_match: ?[]u8 = null,
     /// The highest record id a `detail: all` read covered: the next one
     /// without `since` pages on from it.
     read_cursor: u64 = 0,
@@ -257,7 +266,7 @@ pub const Entry = struct {
             std.crypto.secureZero(u8, p);
             a.free(p);
         }
-        for ([_]?[]u8{ self.server_session, self.host, self.conversation, self.launch_model, self.launch_effort, self.picked_model, self.name, self.socket }) |o| {
+        for ([_]?[]u8{ self.server_session, self.host, self.conversation, self.launch_model, self.launch_effort, self.picked_model, self.name, self.socket, self.push_match }) |o| {
             if (o) |s| a.free(s);
         }
         self.extra.free(a);
@@ -313,6 +322,12 @@ const State = struct {
     /// The running tool call was asked not to wait (`timeout_ms: 0`): its
     /// wait running out is what it asked for, never `timed_out`.
     no_wait: bool = false,
+    /// This MCP session's push route (`armPush`) and whether it pushes yet
+    /// (`startPush`: the session made its first tool call).
+    push: agentpush.Route = .none,
+    push_live: bool = false,
+    /// Where a channel notification line goes (the MCP server's stdout).
+    push_sink: ?*const fn ([]const u8) void = null,
 };
 
 /// Agents one agent_wait or waiter watches at most.
@@ -538,7 +553,84 @@ pub fn service(now_ms: i64) void {
         // An agent that ended is no longer one to resume.
         if (e.indexed and !e.relaunching and gone(e)) removeDescriptor(e);
     }
+    servicePush(now_ms);
     state.waiter.service(now_ms);
+}
+
+// ── push delivery ────────────────────────────────────────────────
+
+/// Set this MCP session's push route (at `initialize`): `sink` gets each
+/// channel notification line once `startPush` ran.
+pub fn armPush(route: agentpush.Route, sink: ?*const fn ([]const u8) void) void {
+    state.push = route;
+    state.push_sink = sink;
+    state.push_live = false;
+}
+
+/// The session is up (its first tool call): Claude Code registers its
+/// channel listener after the handshake, and a push before that is lost.
+pub fn startPush() void {
+    if (state.push != .none) state.push_live = true;
+}
+
+/// Server instructions for an MCP session on push `route`.
+pub fn instructions(route: agentpush.Route) []const u8 {
+    return switch (route) {
+        .channel => INSTRUCTIONS ++ " " ++ PUSH_CHANNEL_NOTE,
+        .none => INSTRUCTIONS ++ " " ++ PUSH_NOTE,
+    };
+}
+
+const PUSH_NOTE = "If agent events are pushed into this session (Claude Code: a <channel source=\"sketerm\"> message; opencode: a <sketerm-agent-event> message from the sketerm agents plugin), rely on them and end your turn instead of running watch_command; otherwise use the waiter.";
+const PUSH_CHANNEL_NOTE = "This session receives every agent's events as <channel source=\"sketerm\"> messages that start a new turn (a done carries the job's answer when it is short), so after delegating END YOUR TURN: do not run watch_command, a Monitor or agent_wait to wait for them.";
+
+/// `agent-wait --server` followers connected now (the opencode plugin
+/// runs one).
+pub fn followers() usize {
+    var n: usize = 0;
+    for (state.waiter.subs.items) |s| {
+        if (s.server and s.subscribed and !s.done) n += 1;
+    }
+    return n;
+}
+
+/// Events reach the session without a waiter: a live channel, or a
+/// follower watching every agent.
+fn pushing() bool {
+    return (state.push == .channel and state.push_live) or followers() > 0;
+}
+
+/// Keep the filter of the result's watch_command for the pushes.
+fn rememberFilter(e: *Entry, f: events.Filter) void {
+    const owned: ?[]u8 = if (f.match) |m| (e.allocator.dupe(u8, m) catch return) else null;
+    if (e.push_match) |old| e.allocator.free(old);
+    e.push_match = owned;
+    e.push_filter = .{ .messages = f.messages, .retrying = f.retrying, .match = owned };
+}
+
+/// The push for `d`, its answer marked handed out (agent_read and done
+/// results do not repeat what the push carried in full).
+fn pushOf(arena: std.mem.Allocator, e: *Entry, d: events.Delivery) !agentpush.Push {
+    const recs = e.agent.records();
+    const p = try agentpush.compose(arena, .{ .agent = e.id, .name = e.name, .conversation = conversationOf(e), .state = e.agent.state() }, d, e.agent.queue(), recs, &e.handed);
+    if (p.answer) |i| try e.handed.markRecord(e.allocator, recs[i]);
+    return p;
+}
+
+/// Send every agent's pending wake-up as one channel notification each.
+fn servicePush(now_ms: i64) void {
+    if (state.push != .channel or !state.push_live) return;
+    const sink = state.push_sink orelse return;
+    var arena_state = std.heap.ArenaAllocator.init(state.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    for (state.entries.items) |e| {
+        // A tool call on this agent is under way: its result gets this.
+        if (isHeld(e)) continue;
+        const d = (e.push_cursor.take(e.agent.queue(), e.push_filter, now_ms, arena) catch continue) orelse continue;
+        const p = pushOf(arena, e, d) catch continue;
+        sink(agentpush.encodeChannel(arena, p) catch continue);
+    }
 }
 
 /// Between requests: drop the agents another server took over (`agent_attach
@@ -870,10 +962,29 @@ const Sub = struct {
     messages: bool = false,
     retrying: bool = false,
     follow: bool = false,
+    /// Every agent of the server, later ones included, with pushed text.
+    server: bool = false,
     done: bool = false,
 
-    fn filter(self: *const Sub) events.Filter {
-        return .{ .messages = self.messages, .match = self.match, .retrying = self.retrying };
+    /// What wakes it for `e`: its own filter, and for a server follower
+    /// also what the assistant's last call on `e` asked for.
+    fn filterFor(self: *const Sub, e: *const Entry) events.Filter {
+        const own: events.Filter = .{ .messages = self.messages, .match = self.match, .retrying = self.retrying };
+        if (!self.server) return own;
+        return .{
+            .messages = own.messages or e.push_filter.messages,
+            .retrying = own.retrying or e.push_filter.retrying,
+            .match = own.match orelse e.push_filter.match,
+        };
+    }
+
+    /// Add every agent it does not watch yet (a server follower).
+    fn adoptAll(self: *Sub, a: std.mem.Allocator) void {
+        for (state.entries.items) |e| {
+            if (self.watches(e.id) != null) continue;
+            const id = a.dupe(u8, e.id) catch return;
+            self.targets.append(a, .{ .id = id, .cursor = .after(e.cursor.seen) }) catch return a.free(id);
+        }
     }
 
     fn watches(self: *const Sub, id: []const u8) ?usize {
@@ -1019,7 +1130,7 @@ fn serviceSub(a: std.mem.Allocator, s: *Sub, now_ms: i64) void {
         const sub = std.json.parseFromSliceLeaky(agentwait.Subscribe, arena, s.inbuf.items[0..nl], .{ .ignore_unknown_fields = true }) catch
             return endSub(s, "bad subscribe line");
         const names = sub.names();
-        if (names.len == 0) return endSub(s, "no agent named");
+        if (names.len == 0 and !sub.server) return endSub(s, "no agent named");
         if (names.len > MAX_ANY) return endSub(s, "too many agents");
         for (names) |name| {
             const e = findByName(name) orelse
@@ -1038,7 +1149,9 @@ fn serviceSub(a: std.mem.Allocator, s: *Sub, now_ms: i64) void {
         s.messages = sub.messages;
         s.retrying = sub.retrying;
         s.follow = sub.follow;
+        s.server = sub.server;
     }
+    if (s.server) s.adoptAll(a);
     var i: usize = 0;
     while (i < s.targets.items.len) {
         const tg = &s.targets.items[i];
@@ -1049,14 +1162,19 @@ fn serviceSub(a: std.mem.Allocator, s: *Sub, now_ms: i64) void {
         i += 1;
         // A tool call on this agent is under way: its result gets this.
         if (isHeld(e)) continue;
-        const d = (tg.cursor.take(e.agent.queue(), s.filter(), now_ms, arena) catch continue) orelse continue;
-        sendLine(s, agentwait.encodeWake(arena, e.id, e.agent.state(), d, e.agent.queue()) catch continue);
+        const d = (tg.cursor.take(e.agent.queue(), s.filterFor(e), now_ms, arena) catch continue) orelse continue;
+        const pushed: ?agentwait.Pushed = if (s.server) blk: {
+            const p = pushOf(arena, e, d) catch continue;
+            break :blk .{ .content = p.content, .meta = p.meta };
+        } else null;
+        sendLine(s, agentwait.encodeWake(arena, e.id, e.agent.state(), d, e.agent.queue(), pushed) catch continue);
         if (!s.follow) {
             s.done = true;
             return;
         }
     }
-    if (s.targets.items.len == 0) endSub(s, "agent closed");
+    // A server follower watches agents not opened yet.
+    if (s.targets.items.len == 0 and !s.server) endSub(s, "agent closed");
 }
 
 /// Send the end line and let the client go.
@@ -1099,7 +1217,7 @@ fn endWaitersOf(id: []const u8, reason: []const u8) void {
     while (i < state.waiter.subs.items.len) {
         const s = state.waiter.subs.items[i];
         if (s.subscribed) if (s.watches(id)) |ti| s.drop(a, ti);
-        if (s.subscribed and s.targets.items.len == 0) {
+        if (s.subscribed and s.targets.items.len == 0 and !s.server) {
             if (!s.done) endSub(s, reason);
             freeSub(a, s);
             _ = state.waiter.subs.swapRemove(i);
@@ -1300,6 +1418,7 @@ const Watch = struct {
 fn finish(arena: std.mem.Allocator, res: *Res, e: *Entry, dv: Delivered, watch: Watch, extra: []const Block) ![]const u8 {
     const st = e.agent.state();
     const q = e.agent.queue();
+    rememberFilter(e, watch.filter);
     try res.fact("agent", e.id);
     if (e.name) |n| try res.fact("name", n);
     try res.fact("app", e.loaded.spec.id);
@@ -1352,7 +1471,9 @@ fn finish(arena: std.mem.Allocator, res: *Res, e: *Entry, dv: Delivered, watch: 
         try res.textf("{s}: {s} (state {s})", .{ e.id, outcome, @tagName(st) });
         if (background) |n|
             try res.textf("done after {d} minutes idle with {d} background task(s) still running", .{ @divTrunc(select.BACKGROUND_DONE_CAP_MS, 60_000), n });
-        if (w.timed_out) {
+        if (w.timed_out and pushing()) {
+            try res.textf("{s}: its events are pushed into this session as they happen, so end your turn here; no watch_command, Monitor or agent_wait is needed", .{outcome});
+        } else if (w.timed_out) {
             if (std.mem.eql(u8, outcome, @tagName(vocab.WaitOutcome.queued)))
                 try res.text("queued; the agent was busy and takes the prompt when its current turn ends: run watch_command in the background (or as a Monitor with --follow) to be woken once it has answered it")
             else if (std.mem.eql(u8, outcome, @tagName(vocab.WaitOutcome.sent)))
@@ -3500,6 +3621,11 @@ fn sweepIndex() void {
 /// on any host can find the agents: set by `mcp.zig` before `reattach`.
 pub fn publishTo(lease: ?*mcp_registry.Lease) void {
     state.registry = lease;
+    const l = lease orelse return;
+    // Where a client's plugin follows this server's agents (`agent-wait
+    // --parent`); published with the (still empty) agent list.
+    if (state.waiter.path) |p| l.setAgentSocket(p) catch {};
+    publishAgents();
 }
 
 /// Rewrite the registry record's agent list from `state.entries`: called

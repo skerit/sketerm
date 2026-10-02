@@ -468,6 +468,9 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
         try res.fact("agent_wait_any", agents_ok);
         try res.fact("agent_send_queue", agents_ok);
         try res.fact("agent_answer_text", agents_ok);
+        try res.fact("agent_push", @tagName(if (agents_ok) mcp_agent.state.push else .none));
+        try res.fact("agent_push_follow", agents_ok and mcp_agent.state.waiter.path != null);
+        try res.fact("agent_push_followers", if (agents_ok) mcp_agent.followers() else 0);
         const vocab = @import("../agent/vocab.zig");
         var quiet: std.ArrayList([]const u8) = .empty;
         for (std.enums.values(vocab.ErrorClass)) |cls| if (!cls.wakesByDefault()) try quiet.append(arena, @tagName(cls));
@@ -481,6 +484,12 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
             try res.textf("agent_read and done results return per job its last message, earlier segment finals of {d}+ chars, messages of {d}+ chars and notices, about {d} chars per read (detail all for every message); each record reaches you once", .{ select.FINAL_MIN_CHARS, select.LONG_MIN_CHARS, select.READ_CAP_CHARS });
             try res.text("done means settled (no subagents or background tasks left running); results and waiters share one event delivery, and agent_wait agents / agent-wait --any watch several agents");
             try res.text("agent_send to a busy agent queues the prompt in its app for the next turn (outcome queued), and agent_answer takes free text where the prompt allows it");
+            if (mcp_agent.state.push == .channel)
+                try res.text("agent events are pushed into this session as Claude Code channel messages: end your turn after delegating instead of running watch_command")
+            else if (mcp_agent.followers() > 0)
+                try res.text("agent events are pushed into this session by an agent-wait --server follower (the opencode plugin): end your turn after delegating instead of running watch_command")
+            else
+                try res.text("agent events are not pushed into this session: Claude Code needs --dangerously-load-development-channels server:sketerm (or --channels), opencode the sketerm agents plugin; until then use watch_command");
             try res.textf("agents outlive this server on their host's per-user daemon for {d} h unattached (mcp_agent_idle_ttl_hours): agent_open returns an id, and agent_attach {{agent: id}} resumes it after a restart", .{mcp_agent.state.ttl_secs / 3600});
         } else
             try res.text("sub-agents (agent_*) are unavailable in --shared mode: they run on an isolated or durable instance's private daemon");

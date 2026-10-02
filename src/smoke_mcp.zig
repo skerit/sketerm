@@ -83,14 +83,33 @@ const Mcp = struct {
     /// Spawn `sketerm mcp <extra...>`. `extra` is a null-terminated
     /// list of extra argv entries (e.g. {"--name", "smoke1"}).
     fn spawn(allocator: std.mem.Allocator, exe: [*:0]const u8, extra: []const [*:0]const u8) Mcp {
-        var in_pipe: [2]c_int = undefined; // parent→child stdin
-        var out_pipe: [2]c_int = undefined; // child→parent stdout
-        if (c.pipe(&in_pipe) != 0 or c.pipe(&out_pipe) != 0) fail("pipe");
         // Build argv before fork (no allocation between fork and exec).
         var argv_buf: [8:null]?[*:0]const u8 = @splat(null);
         argv_buf[0] = exe;
         argv_buf[1] = "mcp";
         for (extra, 0..) |e, i| argv_buf[2 + i] = e;
+        return spawnArgv(allocator, exe, &argv_buf);
+    }
+
+    /// Spawn `sketerm mcp` under a `/bin/sh` that stays its parent and
+    /// carries `parent_args` on its own argv (a Claude Code started with
+    /// a channel option, as `agentpush.ancestorNamesChannel` reads it).
+    fn spawnUnder(allocator: std.mem.Allocator, exe: [*:0]const u8, parent_args: []const [*:0]const u8) Mcp {
+        var argv_buf: [8:null]?[*:0]const u8 = @splat(null);
+        argv_buf[0] = "/bin/sh";
+        argv_buf[1] = "-c";
+        // Not the last command, so sh does not exec it away.
+        argv_buf[2] = "\"$0\" mcp; :";
+        argv_buf[3] = exe;
+        for (parent_args, 0..) |e, i| argv_buf[4 + i] = e;
+        return spawnArgv(allocator, "/bin/sh", &argv_buf);
+    }
+
+    fn spawnArgv(allocator: std.mem.Allocator, path: [*:0]const u8, argv_buf: *const [8:null]?[*:0]const u8) Mcp {
+        var in_pipe: [2]c_int = undefined; // parent→child stdin
+        var out_pipe: [2]c_int = undefined; // child→parent stdout
+        if (c.pipe(&in_pipe) != 0 or c.pipe(&out_pipe) != 0) fail("pipe");
+        const exe = path;
         const pid = c.fork();
         if (pid < 0) fail("fork");
         if (pid == 0) {
@@ -100,7 +119,7 @@ const Mcp = struct {
             _ = c.close(in_pipe[1]);
             _ = c.close(out_pipe[0]);
             _ = c.close(out_pipe[1]);
-            _ = c.execv(exe, @ptrCast(@constCast(&argv_buf)));
+            _ = c.execv(exe, @ptrCast(@constCast(argv_buf)));
             c._exit(127);
         }
         _ = c.close(in_pipe[0]);
@@ -6861,6 +6880,43 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
         }
         _ = agentCall(&m, arena, "agent_close", "{\"agent\":\"claude-2\"}", "agent_close claude-2", false, 15_000);
 
+        // The follower push route (the opencode plugin's): found by the
+        // pid that started the server, it follows agents opened after it,
+        // and a done carries its short answer, which agent_read then does
+        // not repeat.
+        {
+            const follow_server = std.fmt.allocPrint(arena, "'{s}' mcp agent-wait --server --follow --json --parent {d}", .{ std.mem.span(exe), c.getpid() }) catch fail("oom");
+            var pushed = Waiter.start(follow_server);
+            const push_deadline = nowMs() + 8_000;
+            while (agentCall(&m, arena, "capabilities", "{}", "capabilities followers", false, 15_000).get("agent_push_followers").?.integer != 1) {
+                if (nowMs() > push_deadline) fail("capabilities: the --server follower is not counted");
+                _ = c.usleep(100_000);
+            }
+            const third = agentCall(&m, arena, "agent_open", std.fmt.allocPrint(arena, "{{\"app\":\"claude\",\"name\":\"claude-3\",\"binary\":{s},\"timeout_ms\":30000{s}}}", .{ bin_json, extraJson(arena) }) catch fail("oom"), "agent_open claude-3", false, 45_000);
+            const c3 = arena.dupe(u8, scStr(third, "agent", "agent_open claude-3")) catch fail("oom");
+            m.sendToolAllocated("agent_send", "{\"agent\":\"claude-3\",\"text\":\"push to three\",\"timeout_ms\":0}");
+            const bg3 = arena.dupe(u8, m.recvLine(15_000)) catch fail("oom");
+            _ = capSc(arena, bg3, "agent_send claude-3", false);
+            // Pushed: the prose says to end the turn, not to arm a waiter.
+            if (std.mem.indexOf(u8, bg3, "pushed into this session") == null) {
+                say(bg3);
+                fail("agent_send with a follower: the prose still asks for a waiter");
+            }
+            const want = std.fmt.allocPrint(arena, "\"content\":\"{s} done: echo: push to three [state idle]\\n\\necho: push to three\"", .{c3}) catch fail("oom");
+            if (!pushed.waitFor(arena, want, 1, 15_000)) {
+                say(pushed.out.items);
+                fail("the --server follower did not push the later agent's done with its answer");
+            }
+            if (std.mem.indexOf(u8, pushed.out.items, "\"meta\":{\"agent\":") == null) fail("the --server follower's wake carries no meta");
+            const after_push = agentCall(&m, arena, "agent_read", "{\"agent\":\"claude-3\"}", "agent_read after push", false, 15_000);
+            if (after_push.get("records").?.array.items.len != 0) fail("agent_read: repeated the answer the push carried");
+            _ = agentCall(&m, arena, "agent_close", "{\"agent\":\"claude-3\"}", "agent_close claude-3", false, 15_000);
+            // A server follower outlives the agents it watched.
+            _ = c.usleep(300_000);
+            if (std.mem.indexOf(u8, pushed.out.items, "\"type\":\"end\"") != null) fail("the --server follower ended when its agent closed");
+            pushed.stop();
+        }
+
         const closed = agentCall(&m, arena, "agent_close", "{\"agent\":\"claude-1\"}", "agent_close claude", false, 15_000);
         if (!closed.get("closed").?.bool or closed.get("sessions").?.array.items.len != 1) fail("agent_close: did not close the one session");
         const followed = follower.finish(arena, 15_000, "follow waiter");
@@ -6878,6 +6934,44 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
         waitUnlisted(allocator, mux_sock, c1_session, "agent_close claude");
         if (!fileExists(claude_cast)) fail("the agent's recording does not exist");
         say("smoke-mcp: agents: fake Claude Code (open, send, read once per record, permission, match, flood, shared waiter delivery, two waiters, --any, late backlog, model, effort relaunch, recording, close) ok");
+
+        // The channel push route: a Claude Code session started with this
+        // server's channel gets every wake-up as a notification line, a
+        // done with its answer, once; without the option nothing is pushed.
+        {
+            var ch = Mcp.spawnUnder(allocator, exe, &.{ "--dangerously-load-development-channels", "server:sketerm" });
+            ch.id += 1;
+            ch.send(std.fmt.allocPrint(arena, "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"{s}\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"claude-code\",\"version\":\"2\"}}}}}}", .{ ch.id, version.mcp_protocol }) catch fail("oom"));
+            const ch_init = arena.dupe(u8, ch.recvLine(10_000)) catch fail("oom");
+            if (std.mem.indexOf(u8, ch_init, "\"experimental\":{\"claude/channel\":{}}") == null) fail("initialize: no claude/channel capability");
+            if (std.mem.indexOf(u8, ch_init, "END YOUR TURN") == null) fail("initialize: the instructions do not say the channel delivers events");
+            ch.send("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}");
+            expectFact(agentCall(&ch, arena, "capabilities", "{}", "capabilities channel", false, 15_000), "agent_push", "channel", "capabilities: agent_push under a channel session");
+            const pc = agentCall(&ch, arena, "agent_open", std.fmt.allocPrint(arena, "{{\"app\":\"claude\",\"name\":\"claude-ch\",\"binary\":{s},\"timeout_ms\":30000{s}}}", .{ bin_json, extraJson(arena) }) catch fail("oom"), "agent_open channel", false, 45_000);
+            const pid_ch = arena.dupe(u8, scStr(pc, "agent", "agent_open channel")) catch fail("oom");
+            _ = agentCall(&ch, arena, "agent_send", "{\"agent\":\"claude-ch\",\"text\":\"channel ping\",\"timeout_ms\":0}", "agent_send channel", false, 15_000);
+            const note = arena.dupe(u8, ch.recvLine(15_000)) catch fail("oom");
+            const want_note = std.fmt.allocPrint(arena, "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/claude/channel\",\"params\":{{\"content\":\"{s} done: echo: channel ping [state idle]\\n\\necho: channel ping\",\"meta\":{{\"agent\":\"{s}\",\"name\":\"claude-ch\",\"kind\":\"done\"", .{ pid_ch, pid_ch }) catch fail("oom");
+            if (!std.mem.startsWith(u8, note, want_note)) {
+                say(note);
+                fail("the channel notification is not the done with its answer");
+            }
+            // Delivered once: neither a wait nor a read repeats it.
+            const ch_after = agentCall(&ch, arena, "agent_wait", "{\"agent\":\"claude-ch\",\"timeout_ms\":1500}", "agent_wait after channel", false, 15_000);
+            if (eventKinds(ch_after, "done") != 0) fail("agent_wait: repeated the done the channel delivered");
+            if (agentCall(&ch, arena, "agent_read", "{\"agent\":\"claude-ch\"}", "agent_read after channel", false, 15_000).get("records").?.array.items.len != 0)
+                fail("agent_read: repeated the answer the channel carried");
+            _ = agentCall(&ch, arena, "agent_close", "{\"agent\":\"claude-ch\"}", "agent_close channel", false, 15_000);
+            ch.closeStdinWait();
+            // Another server's channel is not ours: no capability is withheld, but nothing is pushed.
+            var other = Mcp.spawnUnder(allocator, exe, &.{ "--channels", "server:telegram" });
+            other.id += 1;
+            other.send(std.fmt.allocPrint(arena, "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"{s}\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"claude-code\",\"version\":\"2\"}}}}}}", .{ other.id, version.mcp_protocol }) catch fail("oom"));
+            _ = other.recvLine(10_000);
+            expectFact(agentCall(&other, arena, "capabilities", "{}", "capabilities other channel", false, 15_000), "agent_push", "none", "capabilities: agent_push for another server's channel");
+            other.closeStdinWait();
+            say("smoke-mcp: agents: push routes (channel notification with the answer once, --server follower with later agents) ok");
+        }
 
         // ── opencode (API source) ───────────────────────────────────
         resetStarts();
