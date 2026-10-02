@@ -240,11 +240,11 @@ is kept by a `:ro` policy term. The full descriptions and schemas are in
 - `agent_interrupt`: Interrupt an agent's running turn (Claude Code: Escape; opencode: abort, subagents included).
 - `agent_list` (read-only): List this server's agents, one line each: app, model and effort when known, state, where it runs (host or this machine, transport) and in which directory (cwd: which clone a worker is in), the binary, the session(s) the user can watch, when it was started and last showed activity (wall-clock ms), how many prompts its app holds queued, and how many wake-ups each holds that no agent_* result has handed out yet.
 - `agent_close`: Stop an agent: kills its session(s) and ends its waiters.
-- `agent_attach`: Put an adapter on a terminal term_open already created, when you started the app yourself (screen adapters only, e.g. claude --ax-screen-reader).
+- `agent_attach`: Resume an agent: `agent` (an id agent_open returned, or its name) picks up a live agent of THIS MACHINE from any MCP server, e.g. after a restart, and returns exactly one outcome in `attach`: reattached (it is yours again, with its latest job's selected records, as a first agent_read returns them), gone (its daemon answered that its session no longer exists, with `reason`: expired = no client for mcp_agent_idle_ttl_hours, exited with exit_status or signal, closed, or unknown when the daemon keeps no record), or unreachable (its host or daemon did not answer: `host` and `ssh_error`; its entry stays, so try again later).
 
 ### `core`
 
-- `capabilities` (read-only): Preflight report of what THIS MCP server can do right now: isolation mode, headless GUI-app support (headless_gui — launch_app renders apps into the mux daemon and NEVER needs a display, an X server or a sketerm window), whether a direct sketerm GUI control socket is attached (gui_socket; independent of the session panel relay and of headless GUI apps), the live panel transport (panels + panel_transport) and the saved-panel store (panels_store + panel_store), OCR (tesseract) availability, whether the web_* tools can run and against what (web + web_backend "gui"/"session"/"headless"/"none" — "session" adds web_session, the watchable Wayland app session the helper renders into — plus the sketerm-webengine path in web_helper; web_gui says whether the user granted the web_* tools their OWN browser and logins, web_gui_source where that came from and web_gui_transport which GUI socket they hold now; web_profiles says whether named cookie jars work, web_routes which per-tab network routes web_open can honour, web_engine_broker whether the mux daemon owns the engine's lifetime and web_engine_owner who started the one in use; web_downloads whether web_download can pull a url through a view; web_capture whether web_open can record the response bodies a headless view's page receives; web_engine_started whether an engine exists YET, since web_backend/web_watch/web_session are undetermined until it does), ssh/scp presence, the directory terminal asciicast recordings land in, the EFFECTIVE input-timing defaults (hold_ms/settle_ms/timeout_ms/click_retry, each marked when a SKETERM_MCP_* env override changed it from the built-in), whether sub-agents run here (agents, agent_adapters, agent_waiter, agent_ssh, agent_open_args_env for a wrapper's args and env, agent_open_resume for continuing an existing conversation) and how agent_read selects what it returns (agent_read_select), how sub-agent output is delivered (agent_records_once, agent_events_shared), whether agent_wait can watch several agents (agent_wait_any), whether agent_send queues a prompt for a busy agent (agent_send_queue) and agent_answer takes free text (agent_answer_text), and when done fires (agent_done), and open session counts.
+- `capabilities` (read-only): Preflight report of what THIS MCP server can do right now: isolation mode, headless GUI-app support (headless_gui — launch_app renders apps into the mux daemon and NEVER needs a display, an X server or a sketerm window), whether a direct sketerm GUI control socket is attached (gui_socket; independent of the session panel relay and of headless GUI apps), the live panel transport (panels + panel_transport) and the saved-panel store (panels_store + panel_store), OCR (tesseract) availability, whether the web_* tools can run and against what (web + web_backend "gui"/"session"/"headless"/"none" — "session" adds web_session, the watchable Wayland app session the helper renders into — plus the sketerm-webengine path in web_helper; web_gui says whether the user granted the web_* tools their OWN browser and logins, web_gui_source where that came from and web_gui_transport which GUI socket they hold now; web_profiles says whether named cookie jars work, web_routes which per-tab network routes web_open can honour, web_engine_broker whether the mux daemon owns the engine's lifetime and web_engine_owner who started the one in use; web_downloads whether web_download can pull a url through a view; web_capture whether web_open can record the response bodies a headless view's page receives; web_engine_started whether an engine exists YET, since web_backend/web_watch/web_session are undetermined until it does), ssh/scp presence, the directory terminal asciicast recordings land in, the EFFECTIVE input-timing defaults (hold_ms/settle_ms/timeout_ms/click_retry, each marked when a SKETERM_MCP_* env override changed it from the built-in), whether sub-agents run here (agents, agent_adapters, agent_waiter, agent_ssh, agent_open_args_env for a wrapper's args and env, agent_open_resume for continuing an existing conversation, agent_resume_by_id for agent_attach {agent} from any server, agent_idle_ttl_hours for how long an unattached agent lives, tombstones for agent_attach saying why a gone agent ended) and how agent_read selects what it returns (agent_read_select), how sub-agent output is delivered (agent_records_once, agent_events_shared), whether agent_wait can watch several agents (agent_wait_any), whether agent_send queues a prompt for a busy agent (agent_send_queue) and agent_answer takes free text (agent_answer_text), and when done fires (agent_done), and open session counts.
 <!-- tool-reference:end -->
 
 ## Tool exposure policy
@@ -647,9 +647,50 @@ off its terminal); opencode is an `opencode_api` source (`opencode serve`
 on a free loopback port, read over its HTTP API and SSE stream, with
 `opencode attach` in a second session for the human).
 
-- **Sessions.** An agent is `agent-<app>-<n>` on the instance's private
-  daemon (opencode adds `agent-<app>-<n>-server`), so the GUI's AI badge
-  and Session Overview list it for watch-along. Its terminals are
+- **Sessions and ids.** An agent's id is machine-unique and short:
+  `<app>-xxxx` (four lowercase base32 characters, `claude-k3f9`), checked
+  against the per-user index below. Its session is `agent-<id>` (opencode
+  adds `agent-<id>-server`) on the PER-USER daemon of the host it runs on
+  (this machine's, the one the GUI uses, or the remote host's), so the GUI's
+  AI badge and Session Overview list it for watch-along. `agent_open name:`
+  gives it an alias usable wherever the id is (every `agent_*` call,
+  `agent_attach`), unique among this machine's live agents (a taken name
+  is `conflict`, never reused), listed by `agent_list` and used as the
+  session's title (`SpawnReq.title`; an older daemon ignores it).
+  `term_open name:` does the same for a terminal (unique among this
+  server's terminals; `term` takes it, `term_list` shows it).
+- **Agents outlive their MCP server.** A server that exits only detaches:
+  every agent session (Claude Code, opencode's server and TUI, the local
+  end of a plain-ssh agent) is spawned with the daemon-enforced
+  `ttl_secs` of `mcp_agent_idle_ttl_hours` (config, default 24), so it
+  ends after that long with no client attached. `agent_close` ends one at
+  once. Every agent has a 0600 descriptor in the per-user index
+  `$XDG_STATE_HOME/sketerm/agents/<id>.json` (adapter, host, transport,
+  session names and lifetime ids, daemon socket, opencode port, password
+  file and API session, conversation id, launch values, args/env, name),
+  removed when the agent is closed, ends, or is found gone; the index
+  holds live agents only. `agent_attach {agent: <id or name>}` resumes one
+  from ANY server on this machine and answers exactly one of `reattached`
+  (with its latest job's selected records), `gone` (its daemon answered
+  that the session no longer exists: `reason` expired, exited with
+  `exit_status`/`signal`, closed, or unknown when the daemon keeps no
+  record) or `unreachable` (`host` and `ssh_error`; the entry stays).
+  Ownership is a held flock on `<id>.lock`, never a pid: an agent another
+  LIVE server drives is refused as `conflict` unless `takeover: true`,
+  which replaces the lock file; the displaced server notices between
+  requests and lets the agent go. There is no auto-reattach for an
+  isolated server; a durable instance (`--name`) still picks up at startup
+  the agents it opened (and its pre-index descriptors in
+  `<instance>/agents/`, migrated into the index). At startup every server
+  drops index entries whose local session its daemon says ended.
+- **Why a session ended (tombstones).** The daemon (broker) keeps a short
+  record of ended sessions: name, lifetime id, end time and reason
+  (`expired`, `exited` with status or signal, `closed`, `unknown`), at
+  most 256 entries and 48 h (`src/mux/tombstones.zig`), answered by
+  `tombstone_get`/`tombstone_reply` behind the `tombstones` welcome
+  capability. A worker reports its session's end in a `'T'` control
+  datagram before it goes. An older daemon has none: `gone` then says the
+  reason is unknown. Its terminals are
   recorded as asciicasts like every headless terminal (`--no-record` opts
   out); `agent_open` and `agent_list` report the absolute paths as
   `recordings` (a relaunch adds `<session>-r<N>.cast`). Isolated and
@@ -723,7 +764,7 @@ on a free loopback port, read over its HTTP API and SSE stream, with
 - **Waiting.** `agent_send`, `agent_answer`, `agent_open prompt` and
   `agent_wait` wait (bounded, default 60 s, at most 120 s) on the agent's
   event queue. Always-on wake-ups (`done`, `needs_input`, `error`,
-  `exited`, `connection_lost`) end every wait, except an `error` whose
+  `exited`, `connection_lost`, `connection_restored`) end every wait, except an `error` whose
   class the agent recovers from by itself (`retrying`: "servers
   overloaded", a provider retry; `vocab.ErrorClass.wakesByDefault`),
   which wakes only a caller that passes `retrying:true` (waiter
@@ -966,18 +1007,28 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   change.
 - **Connection loss.** A remote-mux session whose link drops is
   reattached once at once; when that fails the agent reports
-  `connection_lost` (state `disconnected`) and the next `agent_*` call on
-  it tries again (at most every 5 s); a recovered link re-syncs like a
-  wipe (nothing is captured twice). A plain-ssh agent whose ssh lost the
-  connection (status 255) reports `connection_lost` and `exited`.
-- **Durable instances.** `--name`/`--durable` keep agents running across
-  restarts: each has a 0600 descriptor in `<instance>/agents/` (adapter,
-  session names and lifetime ids, opencode ports, password file, API
-  session, host and transport, the forward, the conversation id and
-  launch values, `args` and `env` included; one written before those
-  existed reads as none), and the next server re-attaches them, over ssh for a
-  remote daemon's sessions. A descriptor whose session is gone is
-  removed.
+  `connection_lost` (state `disconnected`) and a background thread retries
+  (2 s, doubling to 60 s, forever while the agent is in this server; an
+  `agent_*` call on it retries at once without waiting); a recovered link
+  re-syncs like a wipe (nothing is captured twice) and raises the always-on
+  `connection_restored`, so a waiter learns it is back. A plain-ssh agent
+  whose ssh lost the connection (status 255) reports `connection_lost` and
+  `exited`.
+- **Remote agents never die with the link.** With `host`, `auto` runs the
+  agent on the host's own sketerm-mux, deploying the portable one there
+  when the host has none (`src/mux/deploy.zig`, the deployer every first
+  hop uses); a failed deploy or start is an error naming why (with what
+  ssh said), never a silent plain-ssh agent. `transport: "ssh"` asks for
+  the plain ssh session explicitly. A remote opencode's port forward is
+  this server's own ssh, re-created on a free local port on attach.
+- **Startup prompts.** A prompt the app shows before it is ready is still
+  an interaction (state `waiting_user`, `needs_input`), so `agent_open`
+  returns instead of sitting in `starting`: Claude Code's "trust this
+  folder" dialog (measured, 2.1.287: `Permission Required: Accessing
+  workspace:` with lettered options `y. Yes, I trust this folder` / `n.
+  No, exit` and `Enter y/n:`) is declared in `data/agents/claude.json`
+  (the `choice_prompt` rule), and lettered options carry their `key`, the
+  letter `agent_answer` types. Answering it waits for the app to be ready.
 - **`agent_list`** gives one short text line per agent and, per agent in
   `agents`, where and how it runs: `host` (absent: this machine),
   `transport`, `cwd` (which clone a worker is in), `binary`, `model` and
@@ -986,17 +1037,20 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   (opencode adds its server's), `started_ms` (kept across a durable
   reattach), `last_activity_ms` (the app last drew or sent anything; both
   Unix ms), `queued_prompts`, `pending_events` and `recordings`.
-- **`agent_attach`** puts a screen adapter on a terminal `term_open`
-  created (you started the app yourself); `agent_close` then drops only
-  the adapter.
+- **`agent_attach`** with `agent` resumes an agent (above); with `term`
+  and `app` it puts a screen adapter on a terminal `term_open` created
+  (you started the app yourself), `attach: "adapter"`, and `agent_close`
+  then drops only the adapter.
 - **Watch-along from any host.** The server's registry record
   (`$XDG_RUNTIME_DIR/sketerm/mcp-servers/<pid>.json`,
   `src/ipc/mcp_registry.zig`) lists its agents and is rewritten
   atomically whenever one opens, is attached, closes, relaunches or is
   reattached: per agent its `id`, `app`, `sessions` (opencode's
-  `-server` included) and `location`, `instance` (this server's private
-  daemon: local and plain-ssh agents) or `host:<B>` (B's per-user
-  daemon: the remote sketerm-mux transport). The record stays version 1
+  `-server` included) and `location`: `user` (this host's per-user
+  daemon: local and plain-ssh agents), `host:<B>` (B's per-user daemon:
+  the remote sketerm-mux transport) or `instance` (this server's private
+  daemon: an adapter on a `term_open` terminal, or an agent of an older
+  server). The record stays version 1
   (an older reader refuses any other version); a record without
   `agents` comes from a server that predates them. Every sketerm-mux
   reports its host's live servers in its session list (`assistants`,
@@ -1004,7 +1058,9 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   through a route, learns A's assistants and their agents and derives
   where to watch each one (`sshroute.watchSpec`):
   `route:A#<instance>` for an `instance` agent, `route:A/B` for a
-  `host:B` one. Such a route ends in `sketerm-mux --proxy --instance
+  `host:B` one, `A` itself for a `user` one (a GUI that predates `user`
+  skips such an agent; its session still shows in the Session
+  Overview). Such a route ends in `sketerm-mux --proxy --instance
   <key>` on A, which bridges only a LIVE server's daemon (the
   registry's flock decides) and never starts one: a server that exited
   is refused as not running, an unknown key as unknown. The instance
@@ -1023,8 +1079,10 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   seconds).
 
 The server's `instructions` (initialize result) tell the assistant to use
-`agent_open` for Claude Code and opencode and to run `watch_command` in the
-background instead of polling, whenever the agent tools are offered.
+`agent_open` for Claude Code and opencode, to run `watch_command` in the
+background instead of polling, and that `agent_open` returns an id that
+`agent_attach {agent: id}` resumes after a restart, whenever the agent
+tools are offered.
 
 ## Panels (`ui_*`)
 

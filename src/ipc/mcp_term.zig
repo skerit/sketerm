@@ -31,8 +31,8 @@ const transport_mod = @import("transport.zig");
 /// Spawn + register a terminal on a REMOTE host's own sketerm-mux
 /// daemon. No local asciicast: rec_start writes on the daemon's host,
 /// which would litter the remote box.
-pub fn spawnRegisteredRemoteTerm(host: []const u8, argv: []const []const u8, cols: u16, rows: u16) !u32 {
-    const t = termdrive.Term.spawnRemoteMux(term_state.allocator, host, argv, cols, rows, .{}) catch
+pub fn spawnRegisteredRemoteTerm(host: []const u8, argv: []const []const u8, cols: u16, rows: u16, opts: termdrive.SpawnOpts) !u32 {
+    const t = termdrive.Term.spawnRemoteMux(term_state.allocator, host, argv, cols, rows, opts) catch
         return error.SpawnFailed;
     const id = term_state.next_id;
     term_state.next_id += 1;
@@ -44,8 +44,8 @@ pub fn spawnRegisteredRemoteTerm(host: []const u8, argv: []const []const u8, col
 }
 
 /// Spawn + register a headless terminal; returns its id.
-pub fn spawnRegisteredTerm(argv: ?[]const []const u8, cols: u16, rows: u16) !u32 {
-    const t = termdrive.Term.spawn(term_state.allocator, argv, cols, rows, term_state.mux_sock) catch
+pub fn spawnRegisteredTerm(argv: ?[]const []const u8, cols: u16, rows: u16, opts: termdrive.SpawnOpts) !u32 {
+    const t = termdrive.Term.spawnWith(term_state.allocator, argv, cols, rows, term_state.mux_sock, opts) catch
         return error.SpawnFailed;
     const id = term_state.next_id;
     term_state.next_id += 1;
@@ -300,6 +300,13 @@ fn termOpen(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
     const choice = transportChoice(args) orelse
         return mcp.errRes(arena, .invalid_args, "transport must be 'auto', 'mux' or 'ssh'");
     if (host) |h| if (!validHostSpec(h)) return mcp.errRes(arena, .invalid_args, BAD_HOST);
+    const name = argStr(args, "name");
+    if (name) |n| {
+        if (!validTermName(n))
+            return mcp.errRes(arena, .invalid_args, "name must be 1-64 letters, digits, '.', '-' or '_', start with a letter or digit, and not be a number");
+        if (termByName(n) != null)
+            return mcp.errRes(arena, .conflict, try std.fmt.allocPrint(arena, "a terminal named '{s}' is already open on this server", .{n}));
+    }
     // Before the first connection: which login it rides, and a fresh one
     // when sketerm's master is too old or the caller asks for it.
     const master: ?sshmaster.Report = if (host) |h| try sshMasterCheck(arena, h, legs.script, argBool(args, "fresh_login")) else null;
@@ -338,7 +345,7 @@ fn termOpen(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
         } else {
             margv = &@import("../mux/shell.zig").remote_login_argv;
         }
-        id = spawnRegisteredRemoteTerm(host.?, margv, cols, rows) catch {
+        id = spawnRegisteredRemoteTerm(host.?, margv, cols, rows, .{ .title = name orelse "" }) catch {
             remote_integration = false;
             if (choice == .mux)
                 return mcp.errRes(arena, .unavailable, NO_REMOTE_MUX);
@@ -369,12 +376,15 @@ fn termOpen(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
             }
         }
         const argv: ?[]const []const u8 = if (argv_store.items.len > 0) argv_store.items else null;
-        id = spawnRegisteredTerm(argv, cols, rows) catch |err| switch (err) {
+        id = spawnRegisteredTerm(argv, cols, rows, .{ .title = name orelse "" }) catch |err| switch (err) {
             error.SpawnFailed => return mcp.errRes(arena, .unavailable, "spawn failed (mux daemon unreachable?)"),
             else => return err,
         };
     }
     const t = term_state.terms.get(id).?;
+    if (name) |n| if (term_state.allocator.dupe(u8, n)) |owned| {
+        term_state.names.put(term_state.allocator, id, owned) catch term_state.allocator.free(owned);
+    } else |_| {};
     // The injection claim: command-mode still waits for the first
     // real prompt mark before trusting it, so an unsupported
     // remote shell degrades to an honest not-ready refusal.
@@ -421,6 +431,7 @@ fn termOpen(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
         "";
     var res = mcp.Res.init(arena);
     try res.fact("term", id);
+    if (name) |n| try res.fact("name", n);
     try res.fact("cols", cols);
     try res.fact("rows", rows);
     const used: transport_mod.Transport = if (via_mux) .@"sketerm-mux" else if (host != null) .ssh else .local;
@@ -587,6 +598,7 @@ fn termResize(arena: std.mem.Allocator, args: std.json.Value, t: *termdrive.Term
 fn termClose(arena: std.mem.Allocator, _: std.json.Value, t: *termdrive.Term, _: u32) ![]const u8 {
     const id = termIdOf(t);
     _ = term_state.terms.swapRemove(id);
+    if (term_state.names.fetchSwapRemove(id)) |kv| term_state.allocator.free(kv.value);
     t.deinit();
     // The daemon finalizes the cast with the session; keep the
     // path out of future term_list output.
@@ -1616,10 +1628,16 @@ const TermState = struct {
     /// error, directing the user to the GUI-backed terminal tools).
     mux_sock: ?[]const u8 = null,
 
+    /// term_open's `name` per terminal id (owned).
+    names: std.AutoArrayHashMapUnmanaged(u32, []u8) = .empty,
+
     pub fn deinit(self: *TermState) void {
         for (self.terms.values()) |t| t.deinit();
         self.terms.deinit(self.allocator);
         self.terms = .empty;
+        for (self.names.values()) |n| self.allocator.free(n);
+        self.names.deinit(self.allocator);
+        self.names = .empty;
     }
 };
 
@@ -1802,8 +1820,28 @@ pub fn termFromArgs(args: std.json.Value, key: []const u8) ?*termdrive.Term {
         if (id < 0) return null;
         return term_state.terms.get(@intCast(id));
     }
+    // A name term_open gave it is as good as its id.
+    if (argStr(args, key)) |s| {
+        if (termByName(s)) |id| return term_state.terms.get(id);
+        const id = std.fmt.parseInt(u32, s, 10) catch return null;
+        return term_state.terms.get(id);
+    }
     if (term_state.terms.count() == 1) return term_state.terms.values()[0];
     return null;
+}
+
+/// The terminal term_open named `name`.
+pub fn termByName(name: []const u8) ?u32 {
+    var it = term_state.names.iterator();
+    while (it.next()) |e| if (std.mem.eql(u8, e.value_ptr.*, name)) return e.key_ptr.*;
+    return null;
+}
+
+/// A term_open name: plain characters, and never a number (that is an id).
+pub fn validTermName(name: []const u8) bool {
+    if (!@import("agentindex.zig").validName(name)) return false;
+    for (name) |ch| if (!std.ascii.isDigit(ch)) return true;
+    return false;
 }
 
 pub fn termIdOf(t: *termdrive.Term) u32 {

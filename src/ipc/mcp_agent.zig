@@ -2,8 +2,12 @@
 //! Code, opencode) as a sub-agent and talk to it through its adapter, in
 //! records, state, the pending prompt and events, never raw screens.
 //!
-//! An agent is a session (two for an API source) on this server's private
-//! daemon, named `agent-<id>` so the user's GUI lists it for watch-along.
+//! An agent is a session (two for an API source) on the per-user daemon of
+//! the host it runs on, named `agent-<id>` so the user's GUI lists it for
+//! watch-along. It outlives this server: a server that exits only detaches,
+//! the daemon ends the sessions after `mcp_agent_idle_ttl_hours` unattached,
+//! and any later server resumes it from the per-user index
+//! (`agentindex.zig`) with `agent_attach {agent}`.
 //! The server loop observes every agent between requests (`pollFds`,
 //! `dueInMs`, `service`), and so does every wait here, so a turn that ends
 //! while the assistant is idle is noticed, and one that ended while an
@@ -16,7 +20,8 @@
 //!
 //! Gotcha: an `Entry` is heap-allocated and stays put, because the
 //! agent's driver points into it; entries are removed only by a tool
-//! handler (agent_close) or `shutdown`, never by `service`.
+//! handler (agent_close), `sweep` (between requests) or `shutdown`, never
+//! by `service`, which runs inside tool calls that hold entry pointers.
 
 const std = @import("std");
 const c = @import("../c.zig").c;
@@ -43,6 +48,13 @@ const pathz = @import("../util/pathz.zig");
 const readfile = @import("../util/readfile.zig");
 const transport_mod = @import("transport.zig");
 const mcp_registry = @import("mcp_registry.zig");
+const agentindex = @import("agentindex.zig");
+const muxconnect = @import("muxconnect.zig");
+const muxclient = @import("../mux/client.zig");
+const tombstones = @import("../mux/tombstones.zig");
+const sockpath = @import("../mux/sockpath.zig");
+const deploy = @import("../mux/deploy.zig");
+const Config = @import("../config.zig").Config;
 const sshroute = @import("../mux/sshroute.zig");
 const Transport = transport_mod.Transport;
 
@@ -74,14 +86,13 @@ const DEFAULT_ROWS: u16 = 40;
 /// Records one agent_read returns by default, and at most.
 const READ_DEFAULT: usize = 100;
 const READ_MAX: usize = 500;
-/// Descriptor files and passwords live here, in the instance dir.
+/// Legacy descriptors (durable instances before the per-user index) live
+/// here, in the instance dir.
 const DESCRIPTOR_DIR = "agents";
 /// The waiter socket's name in the instance dir.
 pub const WAITER_SOCKET = "agents.sock";
 const MAX_SUBS = 32;
-/// Room for `launch.MAX_EXTRA` args and env values of the longest kind,
-/// JSON-escaped.
-const DESCRIPTOR_MAX_BYTES = 4 * 1024 * 1024;
+const DESCRIPTOR_MAX_BYTES = agentindex.DESCRIPTOR_MAX_BYTES;
 /// Bound on the remote binary probe (one ssh round trip).
 const PROBE_WAIT_MS: i64 = 30_000;
 /// Bound on a remote start asking for its secret.
@@ -90,7 +101,14 @@ const SECRET_WAIT_MS: i64 = 30_000;
 const EXIT_WAIT_MS: i64 = 10_000;
 /// How often a dead forward is respawned / a lost link retried.
 const FORWARD_RETRY_MS: i64 = 3_000;
-const RECONNECT_RETRY_MS: i64 = 5_000;
+/// Background reconnection of a lost remote link: the first retry, doubled
+/// after each failure up to the cap, forever while the agent is here.
+const RECONNECT_MIN_MS: i64 = 2_000;
+const RECONNECT_MAX_MS: i64 = 60_000;
+/// How often `sweep` checks that this server still owns its agents.
+const SWEEP_EVERY_MS: i64 = 1_000;
+/// Bound on asking a daemon why a session ended.
+const TOMBSTONE_WAIT_MS: i64 = 5_000;
 /// Remote ports an API server is started on (the remote host's free ports
 /// are not knowable from here; a taken one fails the open with the
 /// server's own message).
@@ -110,7 +128,8 @@ pub const INSTRUCTIONS =
     "to be woken when the agent finishes (done means settled: idle with no subagents or background tasks) or needs input, " ++
     "instead of polling with agent_wait; to watch several agents at once use agent-wait --any with their ids. " ++
     "A wake-up the waiter printed is not repeated by agent_* results, so read the agent afterwards. " ++
-    "agent_send to a busy agent queues the prompt for its next turn without interrupting it, and agent_answer takes text when a prompt's right answer is none of its options.";
+    "agent_send to a busy agent queues the prompt for its next turn without interrupting it, and agent_answer takes text when a prompt's right answer is none of its options. " ++
+    "agent_open returns an id; after a restart, agent_attach {agent: id} resumes it.";
 
 // ── state ────────────────────────────────────────────────────────
 
@@ -124,8 +143,19 @@ const Link = union(enum) {
 
 pub const Entry = struct {
     allocator: std.mem.Allocator,
-    /// `<app>-<n>`.
+    /// `<app>-xxxx`, unique on this machine (`agentindex.mint`).
     id: []u8,
+    /// agent_open's alias, usable wherever the id is (owned).
+    name: ?[]u8 = null,
+    /// The local daemon its sessions run on (local and plain-ssh agents;
+    /// owned): the per-user daemon, or a legacy durable instance's.
+    socket: ?[]u8 = null,
+    /// This server's hold on the agent in the per-user index.
+    claim: ?agentindex.Claim = null,
+    /// Its descriptor is in the index (a borrowed terminal's never is).
+    indexed: bool = false,
+    /// Wait before the next background reconnect of a lost link.
+    reconnect_delay_ms: i64 = RECONNECT_MIN_MS,
     loaded: *const adapter.Loaded,
     agent: *agent_mod.Agent,
     /// The terminal the user watches: the app itself (screen sources) or
@@ -197,11 +227,19 @@ pub const Entry = struct {
     }
 
     /// Free the entry. `kill` ends the sessions it owns; otherwise they
-    /// keep running on the daemon (a durable instance exiting).
+    /// keep running on the daemon (this server exiting, or another one
+    /// taking the agent over). Its index claim is let go either way.
     fn destroy(self: *Entry, kill: bool) void {
         const a = self.allocator;
         self.agent.deinit();
         a.destroy(self.agent);
+        for ([_]?*termdrive.Term{ self.visibleTerm(), self.server }) |o| if (o) |t| abandonReconnect(t);
+        if (self.claim) |*cl| {
+            var buf: [4096]u8 = undefined;
+            var fba = std.heap.FixedBufferAllocator.init(&buf);
+            if (lockPath(fba.allocator(), self.id)) |lp| cl.release(lp, false) else |_| {}
+            self.claim = null;
+        }
         if (self.visible) |l| switch (l) {
             .owned => |t| if (kill) t.deinit() else t.detach(),
             .borrowed => {},
@@ -219,7 +257,7 @@ pub const Entry = struct {
             std.crypto.secureZero(u8, p);
             a.free(p);
         }
-        for ([_]?[]u8{ self.server_session, self.host, self.conversation, self.launch_model, self.launch_effort, self.picked_model }) |o| {
+        for ([_]?[]u8{ self.server_session, self.host, self.conversation, self.launch_model, self.launch_effort, self.picked_model, self.name, self.socket }) |o| {
             if (o) |s| a.free(s);
         }
         self.extra.free(a);
@@ -248,12 +286,23 @@ const State = struct {
     dir: ?[]const u8 = null,
     mux_sock: ?[]const u8 = null,
     durable: bool = false,
+    /// The durable instance's name (its startup reattaches what it opened).
+    instance: ?[]const u8 = null,
+    /// The per-user index (`agentindex`) and the per-user daemon's socket
+    /// on this host (owned; null without a state dir / runtime dir).
+    index_dir: ?[]u8 = null,
+    user_sock: ?[]u8 = null,
+    /// `mcp_agent_idle_ttl_hours`, in seconds: every agent session's
+    /// daemon-enforced lifetime with no client attached.
+    ttl_secs: u32 = 24 * 3600,
     /// The running executable, absolute (watch_command).
     exe: ?[]u8 = null,
     set: ?adapter.Set = null,
     entries: std.ArrayList(*Entry) = .empty,
-    /// Last number used per adapter id (keys borrow the loaded spec's id).
-    counters: std.StringHashMapUnmanaged(u32) = .empty,
+    /// Background reconnects in flight (each owned here, freed only once
+    /// its thread is done).
+    reconnects: std.ArrayList(*ReconnectJob) = .empty,
+    last_sweep_ms: i64 = 0,
     waiter: Waiter = .{},
     /// The server's registry record, which publishes `entries`.
     registry: ?*mcp_registry.Lease = null,
@@ -280,30 +329,43 @@ fn isHeld(e: *const Entry) bool {
 pub var state: State = .{};
 
 /// Arm the agent tools for an isolated or durable instance: `dir` holds
-/// the waiter socket and (durable) the agent descriptors. Both slices
-/// must outlive `shutdown`.
-pub fn configure(allocator: std.mem.Allocator, dir: []const u8, mux_sock: []const u8, durable: bool) void {
-    state = .{ .allocator = allocator, .dir = dir, .mux_sock = mux_sock, .durable = durable };
+/// the waiter socket (and a durable instance's legacy descriptors).
+/// `dir`, `mux_sock` and `instance` must outlive `shutdown`.
+pub fn configure(allocator: std.mem.Allocator, dir: []const u8, mux_sock: []const u8, durable: bool, instance: ?[]const u8) void {
+    state = .{ .allocator = allocator, .dir = dir, .mux_sock = mux_sock, .durable = durable, .instance = if (durable) instance else null };
     var buf: [4096]u8 = undefined;
     if (platform.exePath(&buf)) |p| state.exe = allocator.dupe(u8, p) catch null;
+    state.index_dir = agentindex.dir(allocator);
+    state.user_sock = sockpath.defaultSocketPath(allocator) catch null;
+    var cfg = Config.load(allocator);
+    defer cfg.deinit();
+    state.ttl_secs = cfg.mcp_agent_idle_ttl_hours * 3600;
     state.waiter.listen(allocator, dir);
 }
 
-/// End every waiter, then close (ephemeral) or detach (durable) every
-/// agent. Idempotent.
+/// End every waiter and detach every agent: its sessions run on (their
+/// daemon ends them after `ttl_secs` unattached) and any server can
+/// `agent_attach` it. Idempotent.
 pub fn shutdown() void {
     if (state.dir == null) return;
     const a = state.allocator;
     state.waiter.close(a, "the MCP server is exiting");
-    for (state.entries.items) |e| e.destroy(!state.durable);
+    for (state.entries.items) |e| e.destroy(false);
     state.entries.deinit(a);
     state.entries = .empty;
-    state.counters.deinit(a);
-    state.counters = .empty;
+    // A job whose thread still runs cannot be freed: it is abandoned
+    // (the process is exiting), a finished one is.
+    serviceReconnects(clock.nowMs());
+    state.reconnects.deinit(a);
+    state.reconnects = .empty;
     if (state.set) |*s| s.deinit();
     state.set = null;
     if (state.exe) |e| a.free(e);
     state.exe = null;
+    if (state.index_dir) |d| a.free(d);
+    state.index_dir = null;
+    if (state.user_sock) |s| a.free(s);
+    state.user_sock = null;
     state.dir = null;
     state.registry = null;
 }
@@ -355,8 +417,23 @@ pub fn watchdogFds(out: []c_int) []c_int {
 fn findByName(name: []const u8) ?*Entry {
     for (state.entries.items) |e| {
         if (std.mem.eql(u8, e.id, name) or std.mem.eql(u8, e.session, name)) return e;
+        if (e.name) |n| if (std.mem.eql(u8, n, name)) return e;
     }
     return null;
+}
+
+/// Whether `key` names one of this server's agents (id, session or name).
+fn knownHere(key: []const u8) bool {
+    return findByName(key) != null;
+}
+
+/// A machine-unique id for a new agent of `app`.
+fn mintId(arena: std.mem.Allocator, app: []const u8) ![]const u8 {
+    return agentindex.mint(arena, state.index_dir, app, &knownHere);
+}
+
+fn lockPath(a: std.mem.Allocator, id: []const u8) ![]u8 {
+    return agentindex.path(a, state.index_dir orelse return error.NoIndex, id, "lock");
 }
 
 fn findById(id: []const u8) ?*Entry {
@@ -364,13 +441,6 @@ fn findById(id: []const u8) ?*Entry {
         if (std.mem.eql(u8, e.id, id)) return e;
     }
     return null;
-}
-
-fn nextNumber(app: []const u8) !u32 {
-    const gop = try state.counters.getOrPut(state.allocator, app);
-    if (!gop.found_existing) gop.value_ptr.* = 0;
-    gop.value_ptr.* += 1;
-    return gop.value_ptr.*;
 }
 
 fn localHost() launch.Host {
@@ -437,7 +507,13 @@ pub fn dueInMs(now_ms: i64) ?i64 {
             const x = @max(0, e.forward_retry_ms - now_ms);
             due = if (due) |y| @min(x, y) else x;
         };
+        for ([_]?*termdrive.Term{ e.visibleTerm(), e.server }) |o| if (o) |t| if (t.lost and !inFlight(t)) {
+            const x = @max(0, e.reconnect_ms - now_ms);
+            due = if (due) |y| @min(x, y) else x;
+        };
     }
+    // A reconnect thread cannot wake the loop: look at it often.
+    if (state.reconnects.items.len > 0) due = if (due) |y| @min(TICK_MS, y) else TICK_MS;
     if (state.waiter.dueIn(now_ms)) |x| due = if (due) |y| @min(x, y) else x;
     return due;
 }
@@ -449,10 +525,156 @@ fn screenNeedsTick(e: *const screen_source.Engine) bool {
     return !e.ready or e.end_pending or e.lone_bell or e.retry_since_ms != null or (e.state != .idle and e.state != .waiting_background);
 }
 
-/// Read every agent's sources and deliver waiter wake-ups. Never blocks.
+/// Read every agent's sources and deliver waiter wake-ups. Never blocks:
+/// a lost remote link is retried by a background thread.
 pub fn service(now_ms: i64) void {
-    for (state.entries.items) |e| serviceEntry(e, now_ms) catch {};
+    serviceReconnects(now_ms);
+    for (state.entries.items) |e| {
+        serviceEntry(e, now_ms) catch {};
+        kickReconnects(e, now_ms);
+        // An agent that ended is no longer one to resume.
+        if (e.indexed and !e.relaunching and gone(e)) removeDescriptor(e);
+    }
     state.waiter.service(now_ms);
+}
+
+/// Between requests: drop the agents another server took over (`agent_attach
+/// takeover`), detaching them. Never inside a tool call: it frees entries.
+pub fn sweep(now_ms: i64) void {
+    if (now_ms - state.last_sweep_ms < SWEEP_EVERY_MS) return;
+    state.last_sweep_ms = now_ms;
+    var i: usize = 0;
+    while (i < state.entries.items.len) {
+        const e = state.entries.items[i];
+        if (e.claim) |*cl| {
+            var buf: [4096]u8 = undefined;
+            var fba = std.heap.FixedBufferAllocator.init(&buf);
+            const lp = lockPath(fba.allocator(), e.id) catch {
+                i += 1;
+                continue;
+            };
+            if (!cl.stillOwned(lp)) {
+                endWaitersOf(e.id, "the agent was taken over by another MCP server");
+                _ = state.entries.orderedRemove(i);
+                e.destroy(false);
+                publishAgents();
+                continue;
+            }
+        }
+        i += 1;
+    }
+}
+
+// ── background reconnection ──────────────────────────────────────
+
+/// One background reattach of a lost remote-mux session: the thread
+/// connects and attaches, `serviceReconnects` hands the result to the Term
+/// on the server loop. Only the loop frees a job, and only once its thread
+/// is done, so an abandoned job never races its own teardown.
+const ReconnectJob = struct {
+    allocator: std.mem.Allocator,
+    host: []u8,
+    name: []u8,
+    origin: wire.SessionOriginId,
+    /// Null once the Term went away: the result is dropped.
+    term: ?*termdrive.Term,
+    done: std.atomic.Value(bool) = .init(false),
+    conn: ?muxclient.Conn = null,
+    snapshot: ?[]u8 = null,
+
+    fn run(self: *ReconnectJob) void {
+        defer self.done.store(true, .release);
+        const a = self.allocator;
+        var conn = muxconnect.connectSshOnce(a, self.host) catch return;
+        conn.setNonBlocking();
+        conn.sendAttach(self.name, .{ .origin_id = &self.origin, .kind = "mcp" }) catch return conn.deinit();
+        const snap = conn.recvExpectFor(&.{.snapshot}, 15_000) catch return conn.deinit();
+        defer snap.deinit(a);
+        self.snapshot = a.dupe(u8, snap.payload) catch return conn.deinit();
+        self.conn = conn;
+    }
+
+    fn free(self: *ReconnectJob) void {
+        const a = self.allocator;
+        if (self.conn) |*conn| conn.deinit();
+        if (self.snapshot) |s| a.free(s);
+        a.free(self.host);
+        a.free(self.name);
+        a.destroy(self);
+    }
+};
+
+fn inFlight(t: *const termdrive.Term) bool {
+    for (state.reconnects.items) |j| if (j.term == t) return true;
+    return false;
+}
+
+/// `t` is going away: a reconnect still running for it is dropped.
+fn abandonReconnect(t: *const termdrive.Term) void {
+    for (state.reconnects.items) |j| if (j.term == t) {
+        j.term = null;
+    };
+}
+
+fn entryOfTerm(t: *const termdrive.Term) ?*Entry {
+    for (state.entries.items) |e| {
+        if (e.visibleTerm() == t or e.server == t) return e;
+    }
+    return null;
+}
+
+/// Hand finished reconnects to their terminals (the link is back: the
+/// screen engine sees a resync and reports `connection_restored`).
+fn serviceReconnects(now_ms: i64) void {
+    _ = now_ms;
+    var i: usize = 0;
+    while (i < state.reconnects.items.len) {
+        const j = state.reconnects.items[i];
+        if (!j.done.load(.acquire)) {
+            i += 1;
+            continue;
+        }
+        _ = state.reconnects.swapRemove(i);
+        if (j.term) |t| if (j.conn) |conn| {
+            t.adoptReattached(conn, j.snapshot.?);
+            j.conn = null;
+            if (entryOfTerm(t)) |e| e.reconnect_delay_ms = RECONNECT_MIN_MS;
+        };
+        j.free();
+    }
+}
+
+/// Start a background reconnect for each of `e`'s lost links that is due,
+/// backing off 2 s doubling to 60 s.
+fn kickReconnects(e: *Entry, now_ms: i64) void {
+    if (now_ms < e.reconnect_ms) return;
+    var started = false;
+    for ([_]?*termdrive.Term{ e.visibleTerm(), e.server }) |o| {
+        const t = o orelse continue;
+        if (!t.lost or inFlight(t)) continue;
+        startReconnect(t);
+        started = true;
+    }
+    if (!started) return;
+    e.reconnect_ms = now_ms + e.reconnect_delay_ms;
+    e.reconnect_delay_ms = @min(e.reconnect_delay_ms * 2, RECONNECT_MAX_MS);
+}
+
+fn startReconnect(t: *termdrive.Term) void {
+    const a = state.allocator;
+    const host = t.remote_host orelse return;
+    if (!t.origin_id_valid) return;
+    state.reconnects.ensureUnusedCapacity(a, 1) catch return;
+    const j = a.create(ReconnectJob) catch return;
+    const h = a.dupe(u8, host) catch return a.destroy(j);
+    const n = a.dupe(u8, t.name) catch {
+        a.free(h);
+        return a.destroy(j);
+    };
+    j.* = .{ .allocator = a, .host = h, .name = n, .origin = t.origin_id, .term = t };
+    const th = std.Thread.spawn(.{}, ReconnectJob.run, .{j}) catch return j.free();
+    th.detach();
+    state.reconnects.appendAssumeCapacity(j);
 }
 
 fn serviceEntry(e: *Entry, now_ms: i64) !void {
@@ -538,20 +760,12 @@ fn forwardName(arena: std.mem.Allocator, id: []const u8) ![]const u8 {
     return std.fmt.allocPrint(arena, "agent-{s}-forward", .{id});
 }
 
-/// Bring a lost remote link back, at most every RECONNECT_RETRY_MS (one
-/// bounded ssh connect each). Runs on the agent's own calls, so a dead
-/// host never stalls the loop for agents nobody asks about.
+/// A call on an agent whose link is lost retries it at once (in the
+/// background; the call does not wait for it) and restarts the backoff.
 fn reconnectIfLost(e: *Entry) void {
-    const now = clock.nowMs();
-    if (now < e.reconnect_ms) return;
-    var tried = false;
-    for ([_]?*termdrive.Term{ e.visibleTerm(), e.server }) |o| {
-        const t = o orelse continue;
-        if (!t.lost) continue;
-        tried = true;
-        _ = t.reconnect();
-    }
-    if (tried) e.reconnect_ms = clock.nowMs() + RECONNECT_RETRY_MS;
+    e.reconnect_ms = 0;
+    e.reconnect_delay_ms = RECONNECT_MIN_MS;
+    kickReconnects(e, clock.nowMs());
 }
 
 /// Wait up to `max_ms` for any agent or waiter fd, then service.
@@ -584,6 +798,8 @@ fn gone(e: *const Entry) bool {
 fn waitReady(e: *Entry, deadline: i64) bool {
     service(clock.nowMs());
     while (!e.agent.ready()) {
+        // A prompt before the app is ready (a trust dialog) is the caller's.
+        if (e.agent.interaction() != null) return false;
         if (gone(e) or e.agent.state() == .disconnected or clock.nowMs() >= deadline) return false;
         pump(deadline - clock.nowMs());
     }
@@ -900,10 +1116,11 @@ pub fn agentTool(arena: std.mem.Allocator, tool: Tool, args: std.json.Value) ![]
         return errRes(arena, .unavailable, "the agent tools need an isolated or durable instance (the default, or --durable/--name); this server runs --shared, where agents are not available");
     state.held_len = 0;
     defer state.held_len = 0;
+    sweep(clock.nowMs());
     return switch (tool) {
         .agent_adapters => adaptersTool(arena, args),
         .agent_open => openTool(arena, args),
-        .agent_attach => attachTool(arena, args),
+        .agent_attach => if (argStr(args, "agent") != null) attachIdTool(arena, args) else attachTool(arena, args),
         .agent_list => listTool(arena),
         .agent_send => withEntry(arena, args, sendTool),
         .agent_wait => if (mcp.argValue(args, "agents")) |v| switch (v) {
@@ -948,6 +1165,8 @@ fn idList(arena: std.mem.Allocator) ![]const u8 {
 
 fn notFound(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
     const open = try idList(arena);
+    if (argStr(args, "agent")) |name| if (state.index_dir) |d| if (try agentindex.resolve(arena, d, name)) |desc|
+        return errRes(arena, .not_found, try std.fmt.allocPrint(arena, "agent '{s}' ({s}) is not attached to this server: agent_attach {{agent: \"{s}\"}} resumes it", .{ name, desc.id, name }));
     const msg = if (argStr(args, "agent")) |name|
         try std.fmt.allocPrint(arena, "no agent '{s}' (open: {s})", .{ name, if (open.len > 0) open else "none" })
     else if (state.entries.items.len == 0)
@@ -1077,6 +1296,7 @@ fn finish(arena: std.mem.Allocator, res: *Res, e: *Entry, dv: Delivered, watch: 
     const st = e.agent.state();
     const q = e.agent.queue();
     try res.fact("agent", e.id);
+    if (e.name) |n| try res.fact("name", n);
     try res.fact("app", e.loaded.spec.id);
     try res.fact("source", @tagName(e.agent.kind()));
     try res.fact("state", @tagName(st));
@@ -1319,6 +1539,8 @@ const OpenOpts = struct {
     host: ?[]const u8,
     choice: transport_mod.Choice,
     extra: launch.Extra,
+    /// The alias (`name`), also the sessions' title.
+    name: ?[]const u8 = null,
 };
 
 /// A conversation id travels on the app's argv and in an API path, so only
@@ -1432,6 +1654,19 @@ fn openOpts(arena: std.mem.Allocator, args: std.json.Value, loaded: *const adapt
         why.* = .{ .code = .invalid_args, .msg = "prompt is empty" };
         return error.Refused;
     };
+    const name = argStr(args, "name");
+    if (name) |n| {
+        if (!agentindex.validName(n)) {
+            why.* = .{ .code = .invalid_args, .msg = "name must be 1-64 letters, digits, '.', '-' or '_', starting with a letter or digit" };
+            return error.Refused;
+        }
+        // Unique among this machine's live agents, ids included.
+        const in_index = if (state.index_dir) |d| try agentindex.taken(arena, d, n) else false;
+        if (knownHere(n) or in_index) {
+            why.* = .{ .code = .conflict, .msg = try std.fmt.allocPrint(arena, "the name '{s}' is taken by a live agent on this machine (agent_attach {{agent: \"{s}\"}} resumes it); pick another", .{ n, n }) };
+            return error.Refused;
+        }
+    }
     const resume_id = argStr(args, "resume");
     if (resume_id) |r| {
         if (!validConversationId(r)) {
@@ -1448,6 +1683,7 @@ fn openOpts(arena: std.mem.Allocator, args: std.json.Value, loaded: *const adapt
         }
     }
     return .{
+        .name = name,
         .resume_id = resume_id,
         .override = override,
         .model = argStr(args, "model"),
@@ -1538,6 +1774,7 @@ fn openTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
         e.destroy(true);
         return err;
     };
+    claimNew(e);
     writeDescriptor(e);
     publishAgents();
     hold(e);
@@ -1708,6 +1945,11 @@ fn setPlace(e: *Entry, where: Where, o: OpenOpts) !void {
     e.cols = where.cols;
     e.rows = where.rows;
     if (where.host) |h| e.host = try a.dupe(u8, h);
+    // Local and plain-ssh sessions live on this host's per-user daemon.
+    if (where.transport != .@"sketerm-mux") if (state.user_sock) |s| {
+        e.socket = try a.dupe(u8, s);
+    };
+    if (o.name) |n| e.name = try a.dupe(u8, n);
     if (o.model) |m| e.launch_model = try a.dupe(u8, m);
     if (o.effort) |x| e.launch_effort = try a.dupe(u8, x);
     e.extra = try o.extra.clone(a);
@@ -1740,37 +1982,43 @@ const SpawnSpec = struct {
     /// The caller's `env` (the spawn request's environment, or exported by
     /// a plain-ssh start's script), `path_prepend` and `login_shell`.
     extra: launch.Extra = .{},
+    /// The session's listed title (the agent's name).
+    title: []const u8 = "",
 };
 
-/// Start `argv` on the agent's host as session `spec.name`. A remote
-/// start whose transport is not decided yet (`where.transport == .local`
-/// with a host) tries the host's own daemon first unless `choice` says
-/// ssh, falls back to plain `ssh -tt` unless it says mux, and records
-/// the outcome in `where`.
+/// Start `argv` on the agent's host as session `spec.name`, with the
+/// agents' unattached lifetime. Locally (and the local end of a plain-ssh
+/// agent) that is this host's per-user daemon; remotely the host's own
+/// daemon, the portable one deployed when it has none. A remote start
+/// whose transport is not decided yet (`where.transport == .local` with a
+/// host) never falls back to plain `ssh -tt`: only `choice` ssh runs it
+/// there. The outcome is recorded in `where`.
 fn spawnOn(arena: std.mem.Allocator, where: *Where, choice: transport_mod.Choice, argv: []const []const u8, spec: SpawnSpec, why: *Fail) !*termdrive.Term {
     const a = state.allocator;
     const extra_kv = try (launch.Extra{ .env = spec.extra.env }).assignments(arena);
     const login = spec.extra.login_shell;
     const host = where.host orelse {
         if (!try fitsExec(arena, argv, why)) return error.Refused;
-        // The private daemon inherited this server's PATH.
-        const path_kv: []const []const u8 = if (spec.extra.path_prepend.len == 0) &.{} else blk: {
-            const one = try arena.alloc([]const u8, 1);
-            one[0] = try std.fmt.allocPrint(arena, "PATH={s}", .{try launch.prependPath(arena, spec.extra.path_prepend, localHost().path)});
-            break :blk one;
-        };
-        return termdrive.Term.spawnWith(a, argv, where.cols, where.rows, state.mux_sock, .{
+        // The per-user daemon may have been started with another
+        // environment: the agent gets this server's PATH, as it would here.
+        const path_kv = try arena.alloc([]const u8, 1);
+        path_kv[0] = try std.fmt.allocPrint(arena, "PATH={s}", .{try launch.prependPath(arena, spec.extra.path_prepend, localHost().path)});
+        // null: the per-user daemon, autostarted as itself (an explicit
+        // socket would start it as a private instance that retires idle).
+        return termdrive.Term.spawnWith(a, argv, where.cols, where.rows, null, .{
             .name = spec.name,
             .env = try std.mem.concat(arena, []const u8, &.{ spec.env, extra_kv, path_kv }),
             .cwd = spec.cwd,
             .shell_integration = false,
+            .ttl_secs = state.ttl_secs,
+            .title = spec.title,
         }) catch {
-            why.* = .{ .code = .unavailable, .msg = "could not start the agent's session on the private daemon" };
+            why.* = .{ .code = .unavailable, .msg = "could not start the agent's session on this host's per-user sketerm-mux daemon" };
             return error.Refused;
         };
     };
     const undecided = where.transport == .local;
-    if ((undecided and choice != .ssh) or where.transport == .@"sketerm-mux") mux: {
+    if ((undecided and choice != .ssh) or where.transport == .@"sketerm-mux") {
         // The child inherits the remote DAEMON's environment: the login
         // shell's is put back in, and the caller's env values ride the
         // spawn under the relay prefix so no profile overrides them.
@@ -1793,12 +2041,16 @@ fn spawnOn(arena: std.mem.Allocator, where: *Where, choice: transport_mod.Choice
             for (spec.extra.env, out) |v, *o| o.* = try std.fmt.allocPrint(arena, launch.ENV_RELAY_PREFIX ++ "{s}={s}", .{ v.name, v.value });
             break :blk out;
         } else extra_kv;
-        const t = termdrive.Term.spawnRemoteMux(a, host, margv, where.cols, where.rows, .{ .name = spec.name, .cwd = spec.cwd, .env = spawn_env }) catch {
-            if (!undecided or choice == .mux) {
-                why.* = .{ .code = .unavailable, .msg = mcp_term.NO_REMOTE_MUX };
-                return error.Refused;
-            }
-            break :mux;
+        const t = termdrive.Term.spawnRemoteMux(a, host, margv, where.cols, where.rows, .{
+            .name = spec.name,
+            .cwd = spec.cwd,
+            .env = spawn_env,
+            .ttl_secs = state.ttl_secs,
+            .title = spec.title,
+        }) catch {
+            // Never a silent plain-ssh agent: it would die with the link.
+            why.* = .{ .code = .unavailable, .msg = try noRemoteMux(arena, host) };
+            return error.Refused;
         };
         where.transport = .@"sketerm-mux";
         return t;
@@ -1823,15 +2075,39 @@ fn spawnOn(arena: std.mem.Allocator, where: *Where, choice: transport_mod.Choice
     };
     try sargv.append(arena, try termdrive.sshScriptCommand(arena, nonce, script));
     if (!try fitsExec(arena, sargv.items, why)) return error.Refused;
-    const t = termdrive.Term.spawnWith(a, sargv.items, where.cols, where.rows, state.mux_sock, .{
+    const t = termdrive.Term.spawnWith(a, sargv.items, where.cols, where.rows, null, .{
         .name = spec.name,
         .shell_integration = false,
+        .ttl_secs = state.ttl_secs,
+        .title = spec.title,
     }) catch {
-        why.* = .{ .code = .unavailable, .msg = "could not start the agent's ssh session on the private daemon" };
+        why.* = .{ .code = .unavailable, .msg = "could not start the agent's ssh session on this host's per-user sketerm-mux daemon" };
         return error.Refused;
     };
     where.transport = .ssh;
     return t;
+}
+
+/// Why no agent could start on `host`'s own daemon, naming what ssh said.
+fn noRemoteMux(arena: std.mem.Allocator, host: []const u8) ![]const u8 {
+    const said = try sshDiagnose(arena, host);
+    if (!deploy.portableAvailable())
+        return std.fmt.allocPrint(arena, "no sketerm-mux daemon answered on {s}, and this install has no portable sketerm-mux to deploy there (put sketerm-mux on the remote PATH); transport \"ssh\" runs the agent in a plain ssh session instead, which ends with the connection. ssh: {s}", .{ host, said });
+    return std.fmt.allocPrint(arena, "could not start the agent on {s}'s sketerm-mux (the portable daemon is deployed there automatically, and that failed); transport \"ssh\" runs it in a plain ssh session instead, which ends with the connection. ssh: {s}", .{ host, said });
+}
+
+/// What a plain `ssh host true` says: its error, or that it connected.
+fn sshDiagnose(arena: std.mem.Allocator, host: []const u8) ![]const u8 {
+    const argv = mcp_term.remoteShArgv(arena, host, "true") catch return "cannot build the ssh route for this host";
+    return switch (try mcp_term.runArgvTerm(arena, argv, PROBE_WAIT_MS)) {
+        .err => |m| m,
+        .run => |r| if (r.exited and r.status_known and r.status == 0)
+            "ssh connected, but no sketerm-mux answered there"
+        else if (!r.exited)
+            "ssh did not finish connecting in time"
+        else
+            try std.fmt.allocPrint(arena, "{s}", .{if (r.output.len > 0) mcp.tailLines(r.output, 4) else "ssh failed with no message"}),
+    };
 }
 
 /// Whether every string of a start's argv can be exec'd (a plain-ssh
@@ -1879,8 +2155,7 @@ fn spawnScreen(arena: std.mem.Allocator, loaded: *const adapter.Loaded, binary: 
     _ = deadline;
     const a = state.allocator;
     const spec = &loaded.spec;
-    const n = try nextNumber(spec.id);
-    const id = try std.fmt.allocPrint(arena, "{s}-{d}", .{ spec.id, n });
+    const id = try mintId(arena, spec.id);
     const session = try std.fmt.allocPrint(arena, "agent-{s}", .{id});
     // A conversation id the agent owns, so a relaunch resumes exactly it;
     // `resume` continues the caller's existing one instead.
@@ -1891,7 +2166,7 @@ fn spawnScreen(arena: std.mem.Allocator, loaded: *const adapter.Loaded, binary: 
         .cwd = o.cwd,
         .session = conversation,
     }, .{ .main = if (o.resume_id != null) .resumed else .fresh });
-    const t = try spawnOn(arena, where, o.choice, argv, .{ .name = session, .cwd = o.cwd.?, .extra = o.extra }, why);
+    const t = try spawnOn(arena, where, o.choice, argv, .{ .name = session, .cwd = o.cwd.?, .extra = o.extra, .title = o.name orelse "" }, why);
     errdefer t.deinit();
     const e = try newEntry(loaded, id, session, binary, o.cwd.?);
     errdefer dropBare(e);
@@ -1964,8 +2239,7 @@ fn spawnApi(arena: std.mem.Allocator, loaded: *const adapter.Loaded, binary: []c
     const env: []const []const u8 = if (where.host == null) try arena.dupe([]const u8, &.{env_kv}) else &.{};
     const secret_env: ?[]const u8 = if (where.host == null) null else pw_env;
 
-    const n = try nextNumber(spec.id);
-    const id = try std.fmt.allocPrint(arena, "{s}-{d}", .{ spec.id, n });
+    const id = try mintId(arena, spec.id);
     const session = try std.fmt.allocPrint(arena, "agent-{s}", .{id});
     const server_session = try std.fmt.allocPrint(arena, "agent-{s}-server", .{id});
     const what = try std.fmt.allocPrint(arena, "the {s} server", .{spec.name});
@@ -1975,7 +2249,7 @@ fn spawnApi(arena: std.mem.Allocator, loaded: *const adapter.Loaded, binary: []c
         .model = o.model,
         .effort = o.effort,
     }, .{ .main = .fresh });
-    const server = try spawnOn(arena, where, o.choice, server_argv, .{ .name = server_session, .cwd = cwd, .env = env, .secret_env = secret_env, .extra = o.extra }, why);
+    const server = try spawnOn(arena, where, o.choice, server_argv, .{ .name = server_session, .cwd = cwd, .env = env, .secret_env = secret_env, .extra = o.extra, .title = o.name orelse "" }, why);
     errdefer server.deinit();
     if (secret_env != null) try typeSecret(arena, server, password, deadline, what, why);
 
@@ -2017,7 +2291,7 @@ fn spawnApi(arena: std.mem.Allocator, loaded: *const adapter.Loaded, binary: []c
         .cwd = cwd,
         .session = sid,
     }, .attach);
-    const tui: ?*termdrive.Term = if (spec.launch.attach_args.len == 0) null else try spawnOn(arena, where, o.choice, tui_argv, .{ .name = session, .cwd = cwd, .env = env, .secret_env = secret_env, .extra = o.extra }, why);
+    const tui: ?*termdrive.Term = if (spec.launch.attach_args.len == 0) null else try spawnOn(arena, where, o.choice, tui_argv, .{ .name = session, .cwd = cwd, .env = env, .secret_env = secret_env, .extra = o.extra, .title = o.name orelse "" }, why);
     errdefer if (tui) |t| t.deinit();
     if (tui) |t| if (secret_env != null) try typeSecret(arena, t, password, deadline, "the attached client", why);
 
@@ -2049,7 +2323,7 @@ fn remotePort(local: u16) !u16 {
 }
 
 fn attachTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
-    const term_id = argInt(args, "term") orelse return errRes(arena, .invalid_args, "agent_attach needs 'term': the id term_open returned");
+    const term_id = argInt(args, "term") orelse return errRes(arena, .invalid_args, "agent_attach needs 'agent' (an agent id or name to resume) or 'term' (a term_open terminal to put an adapter on)");
     const app = argStr(args, "app") orelse return errRes(arena, .invalid_args, "agent_attach needs 'app': a screen adapter id from agent_adapters");
     const set = try adapters();
     const loaded = set.get(app) orelse return errRes(arena, .not_found, try std.fmt.allocPrint(arena, "no adapter '{s}'", .{app}));
@@ -2063,8 +2337,7 @@ fn attachTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
         .owned => {},
     };
     const a = state.allocator;
-    const n = try nextNumber(loaded.spec.id);
-    const id = try std.fmt.allocPrint(arena, "{s}-{d}", .{ loaded.spec.id, n });
+    const id = try mintId(arena, loaded.spec.id);
     const e = try newEntry(loaded, id, t.name, "", "");
     errdefer dropBare(e);
     const ag = try a.create(agent_mod.Agent);
@@ -2081,6 +2354,7 @@ fn attachTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
     const ready = waitReady(e, deadlineFrom(args, ATTACH_WAIT_MS));
     var res = Res.init(arena);
     try res.textf("{s} adapter attached to terminal {d} as {s}{s}", .{ loaded.spec.name, tid, e.id, if (ready) "" else " (not ready yet)" });
+    try res.fact("attach", "adapter");
     try res.fact("term", tid);
     return finish(arena, &res, e, try pending(arena, e), .{}, &.{});
 }
@@ -2284,9 +2558,9 @@ fn runStepsIn(arena: std.mem.Allocator, e: *Entry, action: ?agent_mod.Action, st
                 return .{ .fail = .{ .code = .timeout, .msg = try std.fmt.allocPrint(arena, "the agent did not become {s} while running its {s} recipe; the screen shows:\n{s}", .{ @tagName(w), what, try screenTail(arena, e) }) } },
             .pick => |choice| {
                 service(clock.nowMs());
-                const num = d.pickNumber(choice) catch |err| return .{ .fail = try pickFail(arena, e, choice, err) };
                 var nb: [16]u8 = undefined;
-                t.sendText(std.fmt.bufPrint(&nb, "{d}", .{num}) catch unreachable) catch return gone_fail;
+                const keys = d.pickKeys(choice, &nb) catch |err| return .{ .fail = try pickFail(arena, e, choice, err) };
+                t.sendText(keys) catch return gone_fail;
             },
             .confirm => |r| {
                 const m = try adapter.compileLine(arena, r);
@@ -2408,7 +2682,7 @@ fn restartOf(arena: std.mem.Allocator, e: *const Entry, model: ?[]const u8, effo
             .cwd = e.cwd,
             .session = conversation,
         }, .{ .main = start }),
-        .spec = .{ .name = e.session, .cwd = e.cwd, .extra = e.extra },
+        .spec = .{ .name = e.session, .cwd = e.cwd, .extra = e.extra, .title = e.name orelse "" },
     };
 }
 
@@ -2551,9 +2825,19 @@ fn answerTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]cons
         else
             try arena.dupe(u8, choice),
     };
+    // A prompt before the app is ready (Claude Code's trust dialog): the
+    // answer leads to the app getting ready, not to a turn.
+    const startup = !e.agent.ready();
     switch (try act(arena, e, .{ .answer = choice }, deadline)) {
         .fail => |f| return errRes(arena, f.code, f.msg),
         .ok => {},
+    }
+    if (startup) {
+        const ready = waitReady(e, deadline);
+        var res = Res.init(arena);
+        try res.textf("answered the {s} prompt{s}", .{ @tagName(kind), if (ready) "; the agent is ready" else "" });
+        try res.fact("answered", label);
+        return finish(arena, &res, e, try combine(arena, pre, try e.cursor.take(e.agent.queue(), .{}, clock.nowMs(), arena), false, false), .{ .filter = filter }, &.{.{ .name = "answer", .body = try std.fmt.allocPrint(arena, "{s}\n-> {s}", .{ title, label }) }});
     }
     // A denied call leaves no trace on a screen app: the adapter keeps one.
     if (kind == .permission) switch (e.agent.source) {
@@ -2806,6 +3090,7 @@ fn listTool(arena: std.mem.Allocator) ![]const u8 {
     service(clock.nowMs());
     const Item = struct {
         agent: []const u8,
+        name: ?[]const u8,
         app: []const u8,
         source: []const u8,
         state: []const u8,
@@ -2848,6 +3133,7 @@ fn listTool(arena: std.mem.Allocator) ![]const u8 {
         const act_ms = e.agent.lastActivityMs();
         out.* = .{
             .agent = e.id,
+            .name = e.name,
             .app = e.loaded.spec.id,
             .source = @tagName(e.agent.kind()),
             .state = @tagName(e.agent.state()),
@@ -2900,52 +3186,29 @@ fn closeTool(arena: std.mem.Allocator, _: std.json.Value, e: *Entry) ![]const u8
     return res.finish();
 }
 
-// ── durable instances: descriptors and reattach ──────────────────
+// ── the per-user index: descriptors, ownership and reattach ──────
 
-/// What a durable instance needs to pick a running agent up again.
-const Descriptor = struct {
-    id: []const u8,
-    app: []const u8,
-    session: []const u8,
-    origin: []const u8,
-    server_session: ?[]const u8 = null,
-    server_origin: ?[]const u8 = null,
-    port: u16 = 0,
-    password_file: ?[]const u8 = null,
-    api_session: ?[]const u8 = null,
-    binary: []const u8 = "",
-    cwd: []const u8 = "",
-    /// Remote agents: the host, and how the sessions reach it (a
-    /// `Transport` name; absent = local, as P3 descriptors were written).
-    host: ?[]const u8 = null,
-    transport: ?[]const u8 = null,
-    remote_port: u16 = 0,
-    forward_session: ?[]const u8 = null,
-    forward_origin: ?[]const u8 = null,
-    conversation: ?[]const u8 = null,
-    conversed: bool = false,
-    launch_model: ?[]const u8 = null,
-    launch_effort: ?[]const u8 = null,
-    picked_model: ?[]const u8 = null,
-    relaunches: u32 = 0,
-    cols: u16 = DEFAULT_COLS,
-    rows: u16 = DEFAULT_ROWS,
-    /// agent_open's `args`/`env` (absent in older descriptors: none).
-    args: []const []const u8 = &.{},
-    env: []const launch.EnvVar = &.{},
-    /// agent_open's `path_prepend`/`login_shell` (absent: none / login).
-    path_prepend: []const []const u8 = &.{},
-    login_shell: bool = true,
-    /// `Entry.started_ms` (absent in older descriptors: the reattach's).
-    started_ms: i64 = 0,
-};
+const Descriptor = agentindex.Descriptor;
 
-fn descriptorPath(arena: std.mem.Allocator, id: []const u8, ext: []const u8) ![]const u8 {
+/// Legacy durable-instance descriptor path (`<instance>/agents/<id>.<ext>`).
+fn legacyPath(arena: std.mem.Allocator, id: []const u8, ext: []const u8) ![]const u8 {
     return std.fmt.allocPrint(arena, "{s}/" ++ DESCRIPTOR_DIR ++ "/{s}.{s}", .{ state.dir.?, id, ext });
 }
 
+/// Hold a freshly opened agent in the index (its id is new: nobody else
+/// can hold it).
+fn claimNew(e: *Entry) void {
+    var buf: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const lp = lockPath(fba.allocator(), e.id) catch return;
+    pathz.makeDirs(state.index_dir.?, 0o700) catch return;
+    e.claim = agentindex.claim(lp, false) catch null;
+}
+
+/// Write `e`'s descriptor (and opencode's password beside it) into the
+/// per-user index, where any server can resume it.
 fn writeDescriptor(e: *Entry) void {
-    if (!state.durable or state.dir == null) return;
+    const index_dir = state.index_dir orelse return;
     const vis = if (e.visible) |l| switch (l) {
         .owned => |t| t,
         .borrowed => return,
@@ -2953,17 +3216,18 @@ fn writeDescriptor(e: *Entry) void {
     var arena_state = std.heap.ArenaAllocator.init(state.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const pw_path: ?[]const u8 = if (e.password) |p| blk: {
-        const path = descriptorPath(arena, e.id, "pw") catch return;
-        pathz.makeParentDirs(path) catch return;
-        atomicwrite.writeFileExact(path, p, 0o600) catch return;
-        break :blk path;
-    } else null;
+    const pw_path: ?[]const u8 = if (e.password) |p|
+        (agentindex.writePassword(arena, index_dir, e.id, p) catch return)
+    else
+        null;
     const d = Descriptor{
         .id = e.id,
         .app = e.loaded.spec.id,
+        .name = e.name,
         .session = vis.name,
         .origin = &vis.origin_id,
+        .socket = e.socket,
+        .instance = state.instance,
         .server_session = if (e.server) |s| s.name else null,
         .server_origin = if (e.server) |s| @as([]const u8, &s.origin_id) else null,
         .port = e.port,
@@ -2977,8 +3241,6 @@ fn writeDescriptor(e: *Entry) void {
         .host = e.host,
         .transport = @tagName(e.transport),
         .remote_port = e.remote_port,
-        .forward_session = if (e.forward) |f| f.name else null,
-        .forward_origin = if (e.forward) |f| @as([]const u8, &f.origin_id) else null,
         .conversation = e.conversation,
         .conversed = e.conversed,
         .launch_model = e.launch_model,
@@ -2993,26 +3255,47 @@ fn writeDescriptor(e: *Entry) void {
         .login_shell = e.extra.login_shell,
         .started_ms = e.started_ms,
     };
-    const path = descriptorPath(arena, e.id, "json") catch return;
-    pathz.makeParentDirs(path) catch return;
-    atomicwrite.writeJsonExact(arena, path, d, 0o600) catch {};
+    agentindex.write(arena, index_dir, d) catch return;
+    e.indexed = true;
 }
 
+/// The agent is over: out of the index (descriptor, password, lock) and,
+/// for a legacy durable descriptor, out of the instance dir too.
 fn removeDescriptor(e: *Entry) void {
-    if (state.dir == null) return;
-    var buf: [4096]u8 = undefined;
+    var buf: [8192]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&buf);
     const a = fba.allocator();
-    if (descriptorPath(a, e.id, "json")) |p| pathz.unlinkPath(p) else |_| {}
+    if (state.index_dir) |d| agentindex.remove(a, d, e.id);
     fba.reset();
-    if (descriptorPath(a, e.id, "pw")) |p| pathz.unlinkPath(p) else |_| {}
+    if (e.claim) |*cl| {
+        if (lockPath(a, e.id)) |lp| cl.release(lp, true) else |_| {}
+        e.claim = null;
+    }
+    e.indexed = false;
+    if (state.dir == null) return;
+    fba.reset();
+    if (legacyPath(a, e.id, "json")) |p| pathz.unlinkPath(p) else |_| {}
+    fba.reset();
+    if (legacyPath(a, e.id, "pw")) |p| pathz.unlinkPath(p) else |_| {}
 }
 
-/// A durable instance's startup: pick up every agent whose descriptor is
-/// in the instance dir and whose session still runs. A descriptor whose
-/// session is gone is removed.
+/// Startup: a durable instance picks up its legacy descriptors
+/// (`<instance>/agents/`, sessions on its own daemon) and the index entries
+/// it opened, unless another live server holds them; a descriptor whose
+/// session is gone is removed. Every server also drops index entries whose
+/// local sessions are known to have ended. Never auto-reattaches anything
+/// for an isolated server: that is `agent_attach`.
 pub fn reattach() void {
-    if (!state.durable) return;
+    if (state.dir == null) return;
+    if (state.durable) {
+        reattachLegacy();
+        reattachInstance();
+    }
+    sweepIndex();
+    publishAgents();
+}
+
+fn reattachLegacy() void {
     const dir = state.dir orelse return;
     var arena_state = std.heap.ArenaAllocator.init(state.allocator);
     defer arena_state.deinit();
@@ -3029,14 +3312,79 @@ pub fn reattach() void {
             continue;
         };
         defer parsed.deinit();
-        reattachOne(parsed.value) catch |err| {
+        var why: AttachWhy = .{};
+        var desc = parsed.value;
+        // Its sessions are on this instance's own daemon.
+        if (desc.socket == null) desc.socket = state.mux_sock;
+        const e = reattachOne(arena, desc, null, &why) catch |err| {
             if (err == error.SessionGone) {
                 pathz.unlinkPath(path);
                 if (parsed.value.password_file) |p| pathz.unlinkPath(p);
             }
+            continue;
+        };
+        // Migrated: the index holds it from now on.
+        claimNew(e);
+        writeDescriptor(e);
+        if (e.indexed) {
+            pathz.unlinkPath(path);
+            if (parsed.value.password_file) |p| pathz.unlinkPath(p);
+        }
+    }
+}
+
+fn reattachInstance() void {
+    const index_dir = state.index_dir orelse return;
+    const inst = state.instance orelse return;
+    var arena_state = std.heap.ArenaAllocator.init(state.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    for (agentindex.ids(arena, index_dir) catch return) |id| {
+        if (findById(id) != null) continue;
+        const parsed = agentindex.read(arena, index_dir, id) orelse continue;
+        const d = parsed.value;
+        const mine = if (d.instance) |x| std.mem.eql(u8, x, inst) else false;
+        if (!mine) continue;
+        const lp = lockPath(arena, id) catch continue;
+        var claimed = agentindex.claim(lp, false) catch continue;
+        var why: AttachWhy = .{};
+        _ = reattachOne(arena, d, claimed, &why) catch |err| {
+            if (err == error.SessionGone) {
+                agentindex.remove(arena, index_dir, id);
+                claimed.release(lp, true);
+            } else claimed.release(lp, false);
         };
     }
-    publishAgents();
+}
+
+/// Drop index entries no live server holds whose LOCAL sessions their
+/// daemon says ended. A daemon that does not answer proves nothing: its
+/// session workers outlive it until the next one adopts them. Remote
+/// entries are checked when someone attaches them.
+fn sweepIndex() void {
+    const index_dir = state.index_dir orelse return;
+    var arena_state = std.heap.ArenaAllocator.init(state.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    for (agentindex.ids(arena, index_dir) catch return) |id| {
+        const parsed = agentindex.read(arena, index_dir, id) orelse continue;
+        const d = parsed.value;
+        const sock = d.socket orelse continue;
+        if (d.host != null and !std.mem.eql(u8, d.transport orelse "", @tagName(Transport.ssh))) continue;
+        const lp = lockPath(arena, id) catch continue;
+        var claimed = agentindex.claim(lp, false) catch continue;
+        var ended = false;
+        if (muxclient.Conn.connectProbed(arena, sock)) |conn_val| {
+            var conn = conn_val;
+            defer conn.deinit();
+            conn.setNonBlocking();
+            if (conn.tombstone(arena, d.session, d.origin, TOMBSTONE_WAIT_MS) catch null) |r| ended = r.value.found;
+        } else |_| {}
+        if (ended) {
+            agentindex.remove(arena, index_dir, id);
+            claimed.release(lp, true);
+        } else claimed.release(lp, false);
+    }
 }
 
 /// Publish into the MCP registry record (`mcp_registry.Lease`) so a viewer
@@ -3058,10 +3406,14 @@ fn publishAgents() void {
         var sessions: std.ArrayList([]const u8) = .empty;
         sessions.append(arena, e.session) catch return;
         if (e.server_session) |s| sessions.append(arena, s) catch return;
-        // The term's own fact: it runs on a host's daemon or on ours.
-        // `ssh:box` is reached at `box`; a route hop takes the bare destination.
-        const where: sshroute.Location = if (e.visibleTerm() orelse e.server) |t|
-            (if (t.remote_host) |h| .{ .host = if (sshroute.RemoteSpec.parse(h).mode == .ssh) sshroute.RemoteSpec.parse(h).host else h } else .instance)
+        // The term's own fact: it runs on a host's daemon, on this host's
+        // per-user daemon, or on our private one (a term_open terminal, a
+        // legacy durable agent). `ssh:box` is reached at `box`.
+        const remote: ?[]const u8 = if (e.visibleTerm() orelse e.server) |t| t.remote_host else null;
+        const where: sshroute.Location = if (remote) |h|
+            .{ .host = if (sshroute.RemoteSpec.parse(h).mode == .ssh) sshroute.RemoteSpec.parse(h).host else h }
+        else if (e.socket) |s|
+            (if (state.mux_sock != null and std.mem.eql(u8, s, state.mux_sock.?)) .instance else .user)
         else
             .instance;
         var buf: [300]u8 = undefined;
@@ -3097,57 +3449,104 @@ const Parts = struct {
             std.crypto.secureZero(u8, p);
             a.free(p);
         }
-        if (self.forward) |x| x.detach();
+        if (self.forward) |x| x.deinit();
         if (self.server) |x| x.detach();
         if (self.vis) |x| x.detach();
         self.* = .{};
     }
 };
 
+/// Why a session could not be attached: `gone` when its daemon answered
+/// that it does not exist (with the daemon's record of its end, when it
+/// keeps one), `unreachable` when the host or its daemon did not answer.
+const AttachWhy = struct {
+    kind: enum { gone, unreachable_host } = .gone,
+    msg: []const u8 = "",
+    session: []const u8 = "",
+    tomb: ?tombstones.Reply = null,
+};
+
 /// Attach session `name` where a descriptor says it runs: the remote
-/// host's own daemon (reconnected over ssh), else this server's daemon
-/// (local agents, and the local ssh sessions of plain-ssh ones).
-fn attachWhere(transport: Transport, host: ?[]const u8, name: []const u8, origin: ?[]const u8) !*termdrive.Term {
+/// host's own daemon (over ssh, reattached on loss), else the local daemon
+/// at `socket`.
+fn attachSession(arena: std.mem.Allocator, transport: Transport, host: ?[]const u8, socket: ?[]const u8, name: []const u8, origin: ?[]const u8, why: *AttachWhy) !*termdrive.Term {
     const a = state.allocator;
     const id = try originOf(origin);
-    if (transport == .@"sketerm-mux") {
-        return termdrive.Term.attachRemote(a, host orelse return error.BadDescriptor, name, id) catch error.SessionGone;
+    const remote = transport == .@"sketerm-mux";
+    why.session = name;
+    var conn = if (remote)
+        muxconnect.connectSsh(a, host orelse return error.BadDescriptor) catch {
+            why.* = .{ .kind = .unreachable_host, .session = name, .msg = try sshDiagnose(arena, host.?) };
+            return error.Unreachable;
+        }
+    else blk: {
+        const sock = socket orelse return error.NoDaemon;
+        // The per-user daemon is started when it is down: the new one
+        // adopts the session workers the old one left running.
+        const default_sock = sockpath.defaultSocketPath(arena) catch "";
+        const per_user = std.mem.eql(u8, default_sock, sock);
+        break :blk (if (per_user) muxclient.Conn.connectLocalAutostartAt(a, null) else muxclient.Conn.connectProbed(a, sock)) catch {
+            why.* = .{ .kind = .gone, .session = name, .msg = "the daemon that held it is not running, and none could be started" };
+            return error.SessionGone;
+        };
+    };
+    conn.setNonBlocking();
+    conn.last_err_len = 0;
+    if (termdrive.Term.attachVia(a, &conn, name, id, if (remote) host else null)) |t| return t else |_| {}
+    defer conn.deinit();
+    if (conn.last_err_len == 0) {
+        why.* = .{ .kind = .unreachable_host, .session = name, .msg = "its daemon did not answer the attach in time" };
+        return error.Unreachable;
     }
-    const sock = state.mux_sock orelse return error.NoDaemon;
-    return termdrive.Term.attachExisting(a, name, id, sock) catch error.SessionGone;
+    // The daemon answered: no such session (lifetime). Ask it why.
+    why.* = .{ .kind = .gone, .session = name, .msg = try arena.dupe(u8, conn.last_err[0..conn.last_err_len]) };
+    if (conn.tombstone(arena, name, origin.?, TOMBSTONE_WAIT_MS) catch null) |r| {
+        if (r.value.found) why.tomb = r.value;
+    }
+    return error.SessionGone;
 }
 
-fn reattachOne(d: Descriptor) !void {
+/// Pick a running agent up from descriptor `d`, holding `claim` (moved into
+/// the entry on success): every session attached, the API reconnected, a
+/// remote API agent's forward re-created on a free local port.
+fn reattachOne(arena: std.mem.Allocator, d: Descriptor, claim: ?agentindex.Claim, why: *AttachWhy) !*Entry {
     const a = state.allocator;
     const loaded = (try adapters()).get(d.app) orelse return error.UnknownAdapter;
     const transport: Transport = if (d.transport) |s| std.meta.stringToEnum(Transport, s) orelse return error.BadDescriptor else .local;
     if (transport != .local and d.host == null) return error.BadDescriptor;
     const extra = launch.Extra{ .args = d.args, .env = d.env, .path_prepend = d.path_prepend, .login_shell = d.login_shell };
-    {
-        var arena_state = std.heap.ArenaAllocator.init(a);
-        defer arena_state.deinit();
-        if ((try launch.checkExtra(arena_state.allocator(), loaded.spec.launch, extra)) != null) return error.BadDescriptor;
-    }
+    if ((try launch.checkExtra(arena, loaded.spec.launch, extra)) != null) return error.BadDescriptor;
+    const socket = d.socket orelse state.mux_sock;
     var parts: Parts = .{};
     errdefer parts.release(a);
-    parts.vis = try attachWhere(transport, d.host, d.session, d.origin);
+    parts.vis = try attachSession(arena, transport, d.host, socket, d.session, d.origin, why);
+    var port = d.port;
     if (loaded.spec.source == .opencode_api) {
-        parts.server = try attachWhere(transport, d.host, d.server_session orelse return error.BadDescriptor, d.server_origin);
+        parts.server = try attachSession(arena, transport, d.host, socket, d.server_session orelse return error.BadDescriptor, d.server_origin, why);
         parts.pw = readfile.cappedAlloc(a, d.password_file orelse return error.BadDescriptor, 4096) catch return error.BadDescriptor;
-        // The forward is this server's own ssh; a dead one is respawned
-        // by `service` on the same local port.
-        if (d.forward_session) |fs| parts.forward = attachWhere(.local, null, fs, d.forward_origin) catch null;
+        // The forward is the attaching server's own ssh: a fresh one on a
+        // free local port (the previous server's may still hold its port).
+        if (d.host != null) {
+            port = mcp_term.pickFreePort() orelse return error.NoFreePort;
+            const fname = try forwardName(arena, d.id);
+            parts.forward = mcp_term.spawnForwardTermNamed(arena, d.host.?, port, "127.0.0.1", d.remote_port, fname) catch null;
+            if (parts.forward) |f| _ = mcp_term.waitForwardReady(arena, f, port, 10_000) catch {};
+        }
     }
     parts.ag = try a.create(agent_mod.Agent);
     parts.ag.?.* = switch (loaded.spec.source) {
         .screen => try agent_mod.Agent.initScreen(a, loaded, .{}),
-        .opencode_api => try agent_mod.Agent.initOpencode(a, loaded, .{}, .{ .port = d.port, .password = parts.pw.? }),
+        .opencode_api => try agent_mod.Agent.initOpencode(a, loaded, .{}, .{ .port = port, .password = parts.pw.? }),
     };
     parts.ag_live = true;
 
     try state.entries.ensureUnusedCapacity(a, 1);
     const e = try newEntry(loaded, d.id, d.session, d.binary, d.cwd);
     errdefer dropBare(e);
+    if (d.name) |s| e.name = try a.dupe(u8, s);
+    if (socket) |s| if (transport != .@"sketerm-mux") {
+        e.socket = try a.dupe(u8, s);
+    };
     if (d.server_session) |s| e.server_session = try a.dupe(u8, s);
     if (d.host) |h| e.host = try a.dupe(u8, h);
     if (d.conversation) |s| e.conversation = try a.dupe(u8, s);
@@ -3168,19 +3567,15 @@ fn reattachOne(d: Descriptor) !void {
     e.seen_snapshots = parts.vis.?.snapshots;
     e.server = parts.server;
     e.forward = parts.forward;
-    e.port = d.port;
+    e.port = port;
     e.password = parts.pw;
+    e.claim = claim;
     parts = .{};
     state.entries.appendAssumeCapacity(e);
     // An adopted session's past is history: it arms no turn. A server
     // whose forward is down answers once `service` brings it back.
     if (loaded.spec.source == .opencode_api) {
         const api = &e.agent.source.opencode_api;
-        if (e.forward == null and e.host != null) {
-            e.forward_retry_ms = 0;
-            e.forward = null;
-            reviveForwardNow(e);
-        }
         api.connect(d.api_session, clock.nowMs()) catch {
             // Reconnects with backoff from `service`, then resyncs the
             // session it drives.
@@ -3189,24 +3584,136 @@ fn reattachOne(d: Descriptor) !void {
             api.reconnect_at_ms = clock.nowMs() + 500;
         };
     }
-    // New agents must not reuse this one's number.
-    if (std.mem.lastIndexOfScalar(u8, d.id, '-')) |dash| {
-        if (std.fmt.parseInt(u32, d.id[dash + 1 ..], 10)) |n| {
-            const gop = state.counters.getOrPut(a, loaded.spec.id) catch return;
-            if (!gop.found_existing or gop.value_ptr.* < n) gop.value_ptr.* = n;
-        } else |_| {}
-    }
+    return e;
 }
 
-/// Start a remote API agent's forward when it has none (a durable
-/// instance whose forward session is gone).
-fn reviveForwardNow(e: *Entry) void {
-    var arena_state = std.heap.ArenaAllocator.init(state.allocator);
-    defer arena_state.deinit();
-    const host = e.host orelse return;
-    const name = forwardName(arena_state.allocator(), e.id) catch return;
-    e.forward = mcp_term.spawnForwardTermNamed(arena_state.allocator(), host, e.port, "127.0.0.1", e.remote_port, name) catch null;
-    if (e.forward) |f| _ = mcp_term.waitForwardReady(arena_state.allocator(), f, e.port, 10_000) catch {};
+/// agent_attach {agent}: resume an agent of this machine's index, from any
+/// server. Exactly one outcome: `reattached`, `gone` or `unreachable`.
+fn attachIdTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
+    const key = argStr(args, "agent").?;
+    const deadline = deadlineFrom(args, ATTACH_WAIT_MS);
+    // Already ours: nothing to resume.
+    if (findByName(key)) |e| {
+        hold(e);
+        return reattachedResult(arena, e, "already attached to this server");
+    }
+    const index_dir = state.index_dir orelse
+        return errRes(arena, .unavailable, "no state directory ($XDG_STATE_HOME or $HOME) to keep the agent index in");
+    const d = (try agentindex.resolve(arena, index_dir, key)) orelse {
+        // No longer in the index: this host's daemon may still say why it
+        // ended (its tombstone knows the session name and the agent's name).
+        if (try localTombstone(arena, key)) |why| return goneResult(arena, .{ .id = key, .app = "", .session = why.session, .origin = "" }, &why);
+        var known: std.ArrayList(u8) = .empty;
+        for (try agentindex.ids(arena, index_dir), 0..) |id, i| {
+            if (i > 0) try known.appendSlice(arena, ", ");
+            try known.appendSlice(arena, id);
+            if (agentindex.read(arena, index_dir, id)) |p| if (p.value.name) |n| try known.print(arena, " ({s})", .{n});
+        }
+        return errRes(arena, .not_found, try std.fmt.allocPrint(arena, "no live agent '{s}' on this machine (known: {s})", .{ key, if (known.items.len > 0) known.items else "none" }));
+    };
+    const lp = try lockPath(arena, d.id);
+    var claimed = agentindex.claim(lp, argBool(args, "takeover")) catch |err| switch (err) {
+        error.Held => return errRes(arena, .conflict, try std.fmt.allocPrint(arena, "agent {s} is in use by another live MCP server; agent_attach with takeover:true takes it over (that server then lets it go)", .{d.id})),
+        error.LockFailed => return errRes(arena, .io_failed, "could not lock the agent in the index"),
+    };
+    var why: AttachWhy = .{};
+    const e = reattachOne(arena, d, claimed, &why) catch |err| switch (err) {
+        error.SessionGone => {
+            agentindex.remove(arena, index_dir, d.id);
+            claimed.release(lp, true);
+            return goneResult(arena, d, &why);
+        },
+        error.Unreachable => {
+            claimed.release(lp, false);
+            return unreachableResult(arena, d, &why);
+        },
+        error.OutOfMemory => {
+            claimed.release(lp, false);
+            return err;
+        },
+        else => {
+            claimed.release(lp, false);
+            return errRes(arena, .failed, try std.fmt.allocPrint(arena, "agent {s} could not be resumed: {s}", .{ d.id, @errorName(err) }));
+        },
+    };
+    hold(e);
+    writeDescriptor(e);
+    publishAgents();
+    // A screen source folds turns only at a turn end: fold the transcript
+    // the attach snapshot shows now, so its latest job can be returned.
+    if (waitReady(e, deadline)) try e.agent.syncHistory();
+    return reattachedResult(arena, e, null);
+}
+
+/// A resumed agent with its latest job selection, as a first read returns
+/// it (nothing was handed to this server yet).
+fn reattachedResult(arena: std.mem.Allocator, e: *Entry, note: ?[]const u8) ![]const u8 {
+    var res = Res.init(arena);
+    try res.fact("attach", "reattached");
+    try res.textf("reattached {s}{s}{s}{s}", .{ e.id, if (e.name != null) " (" else "", e.name orelse "", if (e.name != null) ")" else "" });
+    if (note) |n| try res.text(n);
+    const recs = e.agent.records();
+    const jobs = try select.jobsAfter(arena, recs, 0);
+    const latest: []const u32 = if (jobs.len > 0) jobs[jobs.len - 1 ..] else &.{};
+    const sel = try select.select(arena, recs, latest, .{ .handed = &e.handed });
+    try e.handed.markSelection(e.allocator, recs, sel);
+    const body = try writeSelection(arena, &res, recs, sel);
+    const blocks = [1]Block{.{ .name = "records", .body = body }};
+    return finish(arena, &res, e, try pending(arena, e), .{}, blocks[0..@intFromBool(sel.jobs.len > 0)]);
+}
+
+/// What this host's per-user daemon remembers about the end of agent `key`
+/// (its name, or the id of its session `agent-<key>`); null when nothing.
+fn localTombstone(arena: std.mem.Allocator, key: []const u8) !?AttachWhy {
+    const sock = state.user_sock orelse return null;
+    var conn = muxclient.Conn.connectProbed(arena, sock) catch return null;
+    defer conn.deinit();
+    conn.setNonBlocking();
+    const session = try std.fmt.allocPrint(arena, "agent-{s}", .{key});
+    for ([_][]const u8{ session, key }) |name| {
+        const r = (conn.tombstone(arena, name, "", TOMBSTONE_WAIT_MS) catch return null) orelse return null;
+        if (r.value.found) return .{ .kind = .gone, .session = r.value.name, .tomb = r.value };
+    }
+    return null;
+}
+
+fn goneResult(arena: std.mem.Allocator, d: Descriptor, why: *const AttachWhy) ![]const u8 {
+    var res = Res.init(arena);
+    try res.fact("attach", "gone");
+    try res.fact("agent", d.id);
+    if (d.name) |n| try res.fact("name", n);
+    try res.fact("session", why.session);
+    if (d.host) |h| try res.fact("host", h);
+    const reason: []const u8 = if (why.tomb) |tb| (if (tb.reason) |r| @tagName(r) else "unknown") else "unknown";
+    try res.fact("reason", reason);
+    if (why.tomb) |tb| {
+        try res.fact("ended_ms", tb.ended_ms);
+        if (tb.exit_status) |s| try res.fact("exit_status", s);
+        if (tb.signal) |s| try res.fact("signal", s);
+    }
+    const detail: []const u8 = if (why.tomb) |tb| switch (tb.reason orelse .unknown) {
+        .expired => "it had no client attached for its idle lifetime (mcp_agent_idle_ttl_hours) and its daemon ended it",
+        .closed => "it was closed (agent_close, or a kill)",
+        .exited => if (tb.signal) |s| try std.fmt.allocPrint(arena, "its app was killed by signal {d}", .{s}) else try std.fmt.allocPrint(arena, "its app exited with status {d}", .{tb.exit_status orelse 0}),
+        .unknown => "its daemon does not know why it ended",
+    } else "reason unknown: the daemon keeps no record of it (an older daemon, or it ended long ago)";
+    try res.textf("agent {s} is gone: {s}", .{ d.id, detail });
+    if (why.msg.len > 0) try res.textf("the daemon said: {s}", .{why.msg});
+    try res.text("it is not in the agent index (any more); agent_open starts a new one");
+    return res.finish();
+}
+
+fn unreachableResult(arena: std.mem.Allocator, d: Descriptor, why: *const AttachWhy) ![]const u8 {
+    var res = Res.init(arena);
+    try res.fact("attach", "unreachable");
+    try res.fact("agent", d.id);
+    if (d.name) |n| try res.fact("name", n);
+    try res.fact("session", why.session);
+    try res.fact("host", d.host orelse "this machine");
+    try res.fact("ssh_error", why.msg);
+    try res.textf("agent {s} could not be reached on {s}: {s}", .{ d.id, d.host orelse "this machine", why.msg });
+    try res.text("it may still run there: agent_attach again once the host answers (its entry stays in the index)");
+    return res.finish();
 }
 
 // ── tests ────────────────────────────────────────────────────────
@@ -3382,7 +3889,12 @@ const ToolRig = struct {
     fn init(self: *ToolRig) !void {
         self.dir = pathz.TempDir.make("mcp-agent") orelse return error.SkipZigTest;
         const sock = try std.fmt.bufPrint(&self.sock_buf, "{s}/mux.sock", .{self.dir.path()});
-        configure(testing.allocator, self.dir.path(), sock, false);
+        configure(testing.allocator, self.dir.path(), sock, false, null);
+        // Never the user's real index or daemon.
+        if (state.index_dir) |d| testing.allocator.free(d);
+        state.index_dir = try std.fmt.allocPrint(testing.allocator, "{s}/index", .{self.dir.path()});
+        if (state.user_sock) |u| testing.allocator.free(u);
+        state.user_sock = try std.fmt.allocPrint(testing.allocator, "{s}/user.sock", .{self.dir.path()});
         self.arena = std.heap.ArenaAllocator.init(testing.allocator);
     }
 
@@ -3958,7 +4470,10 @@ test "every agent tool answers in its declared shape: a scripted Claude Code on 
 
     const attached = try shaped(a, "agent_attach", try rig.call(.agent_attach, "{\"term\":1,\"app\":\"claude\",\"timeout_ms\":5000}"));
     try testing.expect(attached.get("ready").?.bool);
-    try testing.expectEqualStrings("claude-1", attached.get("agent").?.string);
+    // A machine-unique id: the app, then four random characters.
+    try testing.expect(std.mem.startsWith(u8, attached.get("agent").?.string, "claude-"));
+    try testing.expectEqual(@as(usize, "claude-".len + agentindex.ID_CHARS), attached.get("agent").?.string.len);
+    try testing.expectEqualStrings("adapter", attached.get("attach").?.string);
 
     const sent = try shaped(a, "agent_send", try rig.call(.agent_send, "{\"text\":\"hello\",\"timeout_ms\":10000}"));
     try testing.expectEqualStrings("done", sent.get("outcome").?.string);

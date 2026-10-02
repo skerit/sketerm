@@ -443,6 +443,11 @@ fn listHeadless(arena: std.mem.Allocator, family: Family) ![]const u8 {
         t.drain();
         _ = t.scanShellAnnounce();
         try w.print("{{\"{s}\":{d},\"exited\":{}", .{ family.addr(), id, t.exited });
+        const term_name = mcp_term.term_state.names.get(id);
+        if (term_name) |n| {
+            try w.writeAll(",\"name\":");
+            try std.json.Stringify.value(n, .{}, w);
+        }
         if (family == .pane) try w.writeAll(",\"headless\":true");
         if (t.screen) |s| try w.print(",\"rows\":{d},\"cols\":{d}", .{ s.rows, s.cols });
         if (t.shell_name) |sn| {
@@ -470,7 +475,7 @@ fn listHeadless(arena: std.mem.Allocator, family: Family) ![]const u8 {
         try w.writeAll("}");
 
         // One compact human line per terminal, same facts, no JSON.
-        try res.textf("{s} {d}: {s}", .{ family.addr(), id, if (t.exited) "exited" else "running" });
+        try res.textf("{s} {d}{s}{s}: {s}", .{ family.addr(), id, if (term_name != null) " " else "", term_name orelse "", if (t.exited) "exited" else "running" });
         if (t.exited and t.exit_status_known) try res.textf("  exit_status: {d}", .{t.exit_status});
         if (t.shell_name) |sn| try res.textf("  shell: {s}, integration: {}", .{ sn, t.integration });
         if (t.remote_host) |rh| try res.textf("  host: {s} (sketerm-mux)", .{rh});
@@ -782,7 +787,7 @@ fn newTab(arena: std.mem.Allocator, backend: Backend, args: std.json.Value) ![]c
     // No GUI: a headless terminal is the pane, addressed by the same id
     // through every pane tool and every term_* tool.
     if (mcp_term.term_state.mux_sock == null) return failRes(arena, noHeadlessFail(.pane));
-    const id = mcp_term.spawnRegisteredTerm(null, 120, 40) catch
+    const id = mcp_term.spawnRegisteredTerm(null, 120, 40, .{}) catch
         return errRes(arena, .unavailable, "no GUI socket, and opening a headless terminal failed too (mux daemon unreachable?)");
     const t = mcp_term.term_state.terms.get(id).?;
     _ = t.waitIdle(250, 3_000);

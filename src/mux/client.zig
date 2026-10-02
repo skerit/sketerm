@@ -12,6 +12,7 @@ const sshroute = @import("sshroute.zig");
 const sshmaster = @import("sshmaster.zig");
 const selfexec = @import("selfexec.zig");
 const capabilities = @import("capabilities.zig");
+pub const tombstones = @import("tombstones.zig");
 const vcodec = @import("../wlhost/vcodec.zig");
 
 /// Which video codecs every hello offers (config `app_video_codec`, set
@@ -422,6 +423,8 @@ pub const Conn = struct {
     /// Lifetime-unique immutable session incarnation returned by attach.
     panel_origin_id: wire.SessionOriginId = undefined,
     panel_origin_id_valid: bool = false,
+    /// Last `tombstone_get` request id (replies echo it).
+    tombstone_req: u32 = 0,
 
     pub fn connect(allocator: std.mem.Allocator, sock_path: []const u8) !Conn {
         const fd = @import("../util/platform.zig").socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
@@ -1969,6 +1972,24 @@ pub const Conn = struct {
 
     /// Deadline-aware `recvExpect`; error.Timeout applies to the WHOLE
     /// wait, however many unrelated frames arrive meanwhile.
+    /// Why session `name` (exactly lifetime `origin_id` when non-empty)
+    /// ended, as the daemon remembers it; null from a daemon without the
+    /// `tombstones` capability, which cannot say.
+    pub fn tombstone(self: *Conn, allocator: std.mem.Allocator, name: []const u8, origin_id: []const u8, timeout_ms: i64) !?std.json.Parsed(tombstones.Reply) {
+        if (!self.caps.tombstones) return null;
+        self.tombstone_req +%= 1;
+        const req = self.tombstone_req;
+        try self.sendJson(.tombstone_get, tombstones.Query{ .req = req, .name = name, .origin_id = origin_id });
+        const deadline = nowMs() + timeout_ms;
+        while (true) {
+            const f = try self.recvExpectFor(&.{.tombstone_reply}, @max(1, deadline - nowMs()));
+            defer f.deinit(self.allocator);
+            const parsed = try std.json.parseFromSlice(tombstones.Reply, allocator, f.payload, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+            if (parsed.value.req == req) return parsed;
+            parsed.deinit();
+        }
+    }
+
     pub fn recvExpectFor(self: *Conn, want: []const wire.FrameType, timeout_ms: i64) !OwnedFrame {
         const deadline = nowMs() + timeout_ms;
         while (true) {

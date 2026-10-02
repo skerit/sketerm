@@ -114,6 +114,10 @@ pub const Flag = enum {
     /// behind a new broker lacks it). Absent = the client withholds
     /// input itself and tells its user the daemon does not enforce it.
     view_only,
+    /// The broker remembers why sessions ended (`tombstone_get`, answered
+    /// by `tombstone_reply`: expired, exited with status or signal,
+    /// closed). Absent = never ask; a gone session's reason is unknown.
+    tombstones,
 };
 
 /// One bool per flag, keyed by wire name; the parsed form on the

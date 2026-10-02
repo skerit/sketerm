@@ -166,7 +166,10 @@ pub const Engine = struct {
         // Inside a synchronized-output update the app has not finished
         // drawing; the batch that closes it feeds again.
         if (screen.sync_output) return;
-        self.disconnected = false;
+        if (self.disconnected) {
+            self.disconnected = false;
+            _ = try self.queue.push(now_ms, .connection_restored, null, "the connection to the agent's session is back", "");
+        }
         try self.readCounters(screen, now_ms);
         try self.readHistory(screen);
         try self.readRows(screen, now_ms);
@@ -502,10 +505,12 @@ pub const Engine = struct {
             }
         }
 
-        self.state = if (!self.ready)
-            .starting
-        else if (self.interaction != null)
+        // A prompt shown before the app is ready (a trust dialog) is still
+        // the user's to answer.
+        self.state = if (self.interaction != null)
             .waiting_user
+        else if (!self.ready)
+            .starting
         else if (self.retrying_visible)
             .retrying
         else if (self.title_busy or self.turn_open or self.end_pending)

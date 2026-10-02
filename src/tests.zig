@@ -28,6 +28,7 @@ comptime {
     _ = @import("agent/agent.zig");
     _ = @import("agent/launch.zig");
     _ = @import("ipc/agentwait.zig");
+    _ = @import("ipc/agentindex.zig");
     _ = @import("util/headers.zig");
     _ = @import("util/glob.zig");
     _ = @import("util/pathz.zig");
@@ -282,6 +283,7 @@ comptime {
     _ = @import("render/shader_pass.zig");
     _ = @import("mux/wire.zig");
     _ = @import("mux/capabilities.zig");
+    _ = @import("mux/tombstones.zig");
     _ = @import("mux/webstore.zig");
     _ = @import("mux/fsserve.zig");
     _ = @import("mux/disk_usage.zig");

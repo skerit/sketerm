@@ -217,6 +217,7 @@ comptime {
     _ = @import("mux/pulse.zig");
     _ = @import("mux/client.zig");
     _ = @import("mux/capabilities.zig");
+    _ = @import("mux/tombstones.zig");
     _ = @import("mux/punch.zig");
     _ = @import("mux/rudp.zig");
     _ = @import("mux/selfexec.zig");
@@ -329,6 +330,7 @@ comptime {
     _ = @import("agent/agent.zig");
     _ = @import("agent/launch.zig");
     _ = @import("ipc/agentwait.zig");
+    _ = @import("ipc/agentindex.zig");
     _ = @import("util/headers.zig");
     _ = @import("util/percent.zig");
     _ = @import("util/suggest.zig");

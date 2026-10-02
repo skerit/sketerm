@@ -117,10 +117,12 @@ const MCP_HELP =
     \\term_list, term_close.
     \\
     \\Sub-agent tools (isolated/durable mode): agent_open runs Claude Code
-    \\or opencode as a sub-agent on the private daemon (watchable from the
-    \\GUI); agent_send / agent_wait / agent_read / agent_answer / agent_set /
+    \\or opencode as a sub-agent on the per-user daemon of its host (watchable
+    \\from the GUI; it outlives this server for mcp_agent_idle_ttl_hours);
+    \\agent_send / agent_wait / agent_read / agent_answer / agent_set /
     \\agent_interrupt / agent_close drive it in clean records and events;
-    \\agent_attach puts an adapter on a term_open terminal; agent_list and
+    \\agent_attach resumes an agent by id or name from any server (or puts an
+    \\adapter on a term_open terminal); agent_list and
     \\agent_adapters report. `sketerm mcp agent-wait ... AGENT` blocks until
     \\the agent next needs attention (the tools return the exact command as
     \\watch_command); see `sketerm mcp agent-wait --help`.
@@ -902,7 +904,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     // Sub-agents: the waiter socket in the instance dir, and (durable)
     // the agents a previous run left running.
     if (iso) |i| {
-        mcp_agent.configure(allocator, i.dir, i.sock, i.durable);
+        mcp_agent.configure(allocator, i.dir, i.sock, i.durable, opts.name);
         mcp_agent.publishTo(if (registry_lease) |*lease| lease else null);
         mcp_agent.reattach();
     }
@@ -1050,6 +1052,7 @@ fn waitInput(input: *std.ArrayList(u8), allocator: std.mem.Allocator) InputWait 
     const rc = c.poll(&pfds, @intCast(n), timeout);
     if (rc < 0) return if (std.posix.errno(rc) == .INTR) .more else .failed;
     mcp_agent.service(clock.nowMs());
+    mcp_agent.sweep(clock.nowMs());
     if (pfds[0].revents == 0) return .more;
     var buf: [65536]u8 = undefined;
     const got = c.read(0, &buf, buf.len);

@@ -130,15 +130,19 @@ pub const RouteSpec = struct {
 };
 
 /// Where an MCP sub-agent's sessions live, as the MCP registry records it:
-/// `instance` (the MCP server's private daemon: local and `ssh -tt`
-/// agents) or `host:<destination>` (that host's per-user daemon: the
-/// remote sketerm-mux transport).
+/// `user` (this host's per-user daemon: local and `ssh -tt` agents),
+/// `host:<destination>` (that host's per-user daemon: the remote
+/// sketerm-mux transport) or `instance` (an MCP server's private daemon,
+/// as servers before `user` published local agents).
 pub const Location = union(enum) {
     instance,
     host: []const u8,
+    /// The per-user daemon of the host whose registry names the agent.
+    user,
 
     pub fn parse(text: []const u8) ?Location {
         if (std.mem.eql(u8, text, "instance")) return .instance;
+        if (std.mem.eql(u8, text, "user")) return .user;
         if (std.mem.startsWith(u8, text, "host:") and text.len > "host:".len) return .{ .host = text["host:".len..] };
         return null;
     }
@@ -147,6 +151,7 @@ pub const Location = union(enum) {
         return switch (self) {
             .instance => std.fmt.bufPrint(buf, "instance", .{}),
             .host => |h| std.fmt.bufPrint(buf, "host:{s}", .{h}),
+            .user => std.fmt.bufPrint(buf, "user", .{}),
         };
     }
 };
@@ -177,6 +182,12 @@ pub fn watchSpec(
             if (!validHop(h)) return error.BadHop;
             break :blk std.fmt.bufPrint(buf, "{s}", .{h});
         },
+        .user => blk: {
+            var path_buf: [600]u8 = undefined;
+            var fba = std.heap.FixedBufferAllocator.init(&path_buf);
+            const path = @import("sockpath.zig").defaultSocketPath(fba.allocator()) catch return error.NoSpaceLeft;
+            break :blk std.fmt.bufPrint(buf, "sock:{s}", .{path});
+        },
     };
     var route: RouteSpec = .{};
     if (RouteSpec.isRoute(reached.?)) {
@@ -194,6 +205,9 @@ pub fn watchSpec(
             route.instance = instance;
         },
         .host => |h| try route.addHop(h),
+        // The reached host's own daemon: a lone hop is the plain host spec.
+        .user => if (route.n_hops == 1)
+            return std.fmt.bufPrint(buf, "{s}{s}", .{ if (route.tor) "tor:" else "", route.hops()[0] }),
     }
     return route.format(buf);
 }
@@ -698,6 +712,14 @@ test "watchSpec derives the route an agent is watched at" {
     try t.expectError(error.BadHop, watchSpec(&buf, "a", "w", "", .{ .host = "b;x" }));
     try t.expectError(error.BadHop, watchSpec(&buf, null, "w", "", .{ .host = "b c" }));
     try t.expectError(error.BadInstance, watchSpec(&buf, "a", "../w", "", .instance));
+    // The reached host's per-user daemon: that host itself, or the route to it.
+    try t.expectEqualStrings("a", try watchSpec(&buf, "udp:a", "w", "", .user));
+    try t.expectEqualStrings("tor:a", try watchSpec(&buf, "tor:a", "w", "", .user));
+    try t.expectEqualStrings("route:a/b", try watchSpec(&buf, "route:a/b#w", "w", "", .user));
+    try t.expect(std.mem.endsWith(u8, try watchSpec(&buf, null, "w", "", .user), "/sketerm/mux.sock"));
+    try t.expect(std.mem.startsWith(u8, try watchSpec(&buf, null, "w", "", .user), "sock:"));
+    var lb: [16]u8 = undefined;
+    try t.expectEqualStrings("user", try (Location.parse("user").?).format(&lb));
 }
 
 test "route memo identity separates direct and Tor verification" {

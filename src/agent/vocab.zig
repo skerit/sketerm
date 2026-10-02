@@ -60,6 +60,9 @@ pub const EventKind = enum {
     @"error",
     exited,
     connection_lost,
+    /// A lost link to the agent's session is back (always on, so a waiter
+    /// learns it without polling).
+    connection_restored,
     /// Every completed assistant message (opt-in).
     message,
     /// A completed assistant message containing the caller's text (opt-in).
@@ -69,7 +72,7 @@ pub const EventKind = enum {
     /// never be suppressed; the rest are opt-in and rate limited.
     pub fn alwaysOn(self: EventKind) bool {
         return switch (self) {
-            .done, .needs_input, .@"error", .exited, .connection_lost => true,
+            .done, .needs_input, .@"error", .exited, .connection_lost, .connection_restored => true,
             .message, .match => false,
         };
     }
@@ -79,7 +82,7 @@ pub const EventKind = enum {
     /// turns with the same answer are two turns.
     pub fn coalesces(self: EventKind) bool {
         return switch (self) {
-            .@"error", .connection_lost => true,
+            .@"error", .connection_lost, .connection_restored => true,
             .done, .needs_input, .exited, .message, .match => false,
         };
     }
@@ -89,7 +92,7 @@ pub const EventKind = enum {
     pub fn announcesRecord(self: EventKind) bool {
         return switch (self) {
             .done, .message, .match => true,
-            .needs_input, .@"error", .exited, .connection_lost => false,
+            .needs_input, .@"error", .exited, .connection_lost, .connection_restored => false,
         };
     }
 
@@ -98,11 +101,12 @@ pub const EventKind = enum {
     /// prompt waiting for an answer, which outranks a finished turn).
     pub fn outcomeRank(self: EventKind) u8 {
         return switch (self) {
-            .exited => 6,
-            .connection_lost => 5,
-            .needs_input => 4,
-            .@"error" => 3,
-            .done => 2,
+            .exited => 7,
+            .connection_lost => 6,
+            .needs_input => 5,
+            .@"error" => 4,
+            .done => 3,
+            .connection_restored => 2,
             .match => 1,
             .message => 0,
         };
@@ -175,7 +179,8 @@ test "event kinds: always-on and coalescing facts" {
         // Only always-on kinds bypass the limiter, so only they may coalesce.
         if (k.coalesces()) try t.expect(k.alwaysOn());
     }
-    try t.expectEqual(@as(usize, 5), always);
+    try t.expectEqual(@as(usize, 6), always);
+    try t.expect(EventKind.connection_restored.alwaysOn());
     try t.expect(!EventKind.message.alwaysOn());
     try t.expect(!EventKind.done.coalesces());
 }
@@ -189,6 +194,8 @@ test "outcome ranks are distinct and put an ended agent first" {
         if (k != .exited) try t.expect(k.outcomeRank() < EventKind.exited.outcomeRank());
     }
     try t.expect(EventKind.needs_input.outcomeRank() > EventKind.done.outcomeRank());
+    // A link that is back says less than a finished turn arriving with it.
+    try t.expect(EventKind.connection_restored.outcomeRank() < EventKind.done.outcomeRank());
 }
 
 test "names follow declaration order" {

@@ -526,7 +526,15 @@ pub const SpawnOpts = struct {
     /// Inject OSC 133 shell integration for a recognised shell. An app
     /// that emits its own marks (Claude Code in ax mode) must not get it.
     shell_integration: bool = true,
+    /// Seconds the daemon keeps the session with no client attached;
+    /// null = forever locally, an hour on a remote host's daemon.
+    ttl_secs: ?u32 = null,
+    /// A fixed title the daemon lists instead of the app's own.
+    title: []const u8 = "",
 };
+
+/// The orphan bound of a remote session spawned without an explicit one.
+pub const REMOTE_TTL_SECS: u32 = 3600;
 
 pub const Term = struct {
     allocator: std.mem.Allocator,
@@ -628,10 +636,11 @@ pub const Term = struct {
         const SiWire = struct { kind: []const u8, script: []const u8, shim_dir: []const u8 };
         const si_wire: ?SiWire = if (si) |r| .{ .kind = r.kind, .script = r.script, .shim_dir = r.shim } else null;
 
+        const ttl = opts.ttl_secs orelse 0;
         if (argv) |av| {
-            conn.sendJson(.spawn, .{ .name = name, .argv = av, .rows = rows, .cols = cols, .shell_integration = si_wire, .env = opts.env, .cwd = opts.cwd }) catch return Error.SpawnFailed;
+            conn.sendJson(.spawn, .{ .name = name, .argv = av, .rows = rows, .cols = cols, .shell_integration = si_wire, .env = opts.env, .cwd = opts.cwd, .ttl_secs = ttl, .title = opts.title }) catch return Error.SpawnFailed;
         } else {
-            conn.sendJson(.spawn, .{ .name = name, .argv = &.{shell}, .rows = rows, .cols = cols, .login_shell = true, .shell_integration = si_wire, .env = opts.env, .cwd = opts.cwd }) catch return Error.SpawnFailed;
+            conn.sendJson(.spawn, .{ .name = name, .argv = &.{shell}, .rows = rows, .cols = cols, .login_shell = true, .shell_integration = si_wire, .env = opts.env, .cwd = opts.cwd, .ttl_secs = ttl, .title = opts.title }) catch return Error.SpawnFailed;
         }
         const ok = conn.recvExpectFor(&.{.ok}, 15_000) catch return Error.SpawnFailed;
         defer ok.deinit(allocator);
@@ -679,7 +688,7 @@ pub const Term = struct {
 
         // `env`/`cwd` are long-standing spawn fields; shell integration is
         // never injected remotely (the scripts live on THIS host).
-        conn.sendJson(.spawn, .{ .name = name, .argv = argv, .rows = rows, .cols = cols, .ttl_secs = 3600, .env = opts.env, .cwd = opts.cwd }) catch return Error.SpawnFailed;
+        conn.sendJson(.spawn, .{ .name = name, .argv = argv, .rows = rows, .cols = cols, .ttl_secs = opts.ttl_secs orelse REMOTE_TTL_SECS, .env = opts.env, .cwd = opts.cwd, .title = opts.title }) catch return Error.SpawnFailed;
         const ok = conn.recvExpectFor(&.{.ok}, 15_000) catch return Error.SpawnFailed;
         defer ok.deinit(allocator);
         return finishSpawn(
@@ -746,6 +755,22 @@ pub const Term = struct {
         const owned = allocator.dupe(u8, name) catch return Error.OutOfMemory;
         errdefer allocator.free(owned);
         return attachBuild(allocator, &conn, owned, origin_id, "", false, host, 15_000);
+    }
+
+    /// Attach session `name` over a connection that already spoke hello,
+    /// reattached over ssh on loss when `remote_host` is set. The Term owns
+    /// `conn` on success; on failure it is still the caller's (a daemon's
+    /// refusal is in `conn.last_err`).
+    pub fn attachVia(
+        allocator: std.mem.Allocator,
+        conn: *muxclient.Conn,
+        name: []const u8,
+        origin_id: wire.SessionOriginId,
+        remote_host: ?[]const u8,
+    ) Error!*Term {
+        const owned = allocator.dupe(u8, name) catch return Error.OutOfMemory;
+        errdefer allocator.free(owned);
+        return attachBuild(allocator, conn, owned, origin_id, "", false, remote_host, 15_000);
     }
 
     /// Attach session `name` over a connection that already spoke hello;
@@ -1008,6 +1033,17 @@ pub const Term = struct {
         self.exited = false;
         self.reattach_spent = false;
         return true;
+    }
+
+    /// Take over a connection a background reconnect already attached to
+    /// this session, and the snapshot it answered with: the link is back.
+    pub fn adoptReattached(self: *Term, conn: muxclient.Conn, snapshot_payload: []const u8) void {
+        self.conn.deinit();
+        self.conn = conn;
+        self.applySnapshot(snapshot_payload) catch {};
+        self.lost = false;
+        self.exited = false;
+        self.reattach_spent = false;
     }
 
     /// Time-boxed like appdrive.drain: a flooding shell (`cat` of a

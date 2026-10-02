@@ -266,6 +266,11 @@ pub const FrameType = enum(u8) {
     /// Only sent to daemons whose welcome advertises
     /// `web_helper_connect:true`.
     web_helper_connect = 35,
+    /// Ask the daemon why a session ended (`tombstones.Query`: name and an
+    /// optional lifetime id). NOT attach-scoped: the broker keeps the
+    /// record. Answered by `tombstone_reply`. Only sent to daemons whose
+    /// welcome advertises `tombstones:true`.
+    tombstone_get = 36,
     // daemon → client
     welcome = 64,
     snapshot = 65,
@@ -405,6 +410,10 @@ pub const FrameType = enum(u8) {
     /// installed on this host", spawn failure) so the GUI can show a
     /// described error instead of a hang.
     web_helper_reply = 98,
+    /// Answer to `tombstone_get`, ALWAYS echoing `req` (`tombstones.Reply`):
+    /// `found` false = no ended session of that name or lifetime is
+    /// remembered here (never ended, or longer ago than the daemon keeps).
+    tombstone_reply = 99,
     _,
 };
 
@@ -1116,6 +1125,8 @@ test "wire: append-only frame and event values include panel RPC" {
     try std.testing.expectEqual(@as(u8, 34), @intFromEnum(FrameType.web_helper_open));
     try std.testing.expectEqual(@as(u8, 35), @intFromEnum(FrameType.web_helper_connect));
     try std.testing.expectEqual(@as(u8, 98), @intFromEnum(FrameType.web_helper_reply));
+    try std.testing.expectEqual(@as(u8, 36), @intFromEnum(FrameType.tombstone_get));
+    try std.testing.expectEqual(@as(u8, 99), @intFromEnum(FrameType.tombstone_reply));
     try std.testing.expectEqual(@as(u8, 7), @intFromEnum(ChannelKind.web_helper));
     try std.testing.expectEqual(@as(u8, 64), @intFromEnum(FrameType.welcome));
     try std.testing.expectEqual(@as(u8, 94), @intFromEnum(FrameType.play_state));
@@ -1321,6 +1332,9 @@ pub const SpawnReq = struct {
     /// which the daemon kills this session. Counted from creation when it
     /// has never been occupied. 0 = live forever.
     ttl_secs: u32 = 0,
+    /// A fixed title `list` reports instead of the one the app sets (an
+    /// MCP agent's name). Older daemons ignore it.
+    title: []const u8 = "",
     /// Allow `app_debug` to take a backtrace of this session's child:
     /// the child relaxes Yama's ptrace restriction before exec, because
     /// the gdb the daemon spawns is the app's SIBLING and Yama's default

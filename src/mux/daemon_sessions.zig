@@ -1125,6 +1125,7 @@ pub fn brokerKill(self: *Daemon, cl: *Client, payload: []const u8) void {
     }
     _ = controlSend(w.control_fd, "K", -1);
     w.dead = true;
+    if (w.end == null) w.end = .{ .reason = .closed };
     cl.queueJson(.ok, .{ .ok = true });
 }
 
@@ -1770,6 +1771,7 @@ pub fn spawnSessionWithOrigin(self: *Daemon, req_in: SpawnReq, origin_id: Sessio
     // the daemon, so silently dropping the request would lie.
     if (req.audio_capture.len > 0 and s.pa_hub_fd >= 0)
         s.audio_capture_base = allocator.dupe(u8, req.audio_capture) catch null;
+    if (req.title.len > 0) s.fixed_title = allocator.dupe(u8, req.title[0..@min(req.title.len, 256)]) catch null;
     if (rt_dir_owned) |p| {
         s.runtime_dir_path = p;
         rt_dir_owned = null; // ownership moved to the session

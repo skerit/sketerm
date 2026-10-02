@@ -34,6 +34,7 @@ const cast_rec = @import("cast.zig");
 const daemon_cast = @import("daemon_cast.zig");
 const kitty_image = @import("../parser/kitty_image.zig");
 const logring = @import("logring.zig");
+pub const tombstones = @import("tombstones.zig");
 const fsserve = @import("fsserve.zig");
 const fsjournal = @import("fsjournal.zig");
 const fs_boundary = @import("fs_boundary.zig");
@@ -257,6 +258,8 @@ pub const Session = struct {
     /// Zero means occupied. Seeded at spawn so an abandoned session expires.
     ttl_ms: i64 = 0,
     no_viewer_since_ms: i64 = 0,
+    /// Owned `SpawnReq.title`: listed instead of the app's own title.
+    fixed_title: ?[]u8 = null,
     /// The attached client currently allowed to drive this session's
     /// Wayland seat (null = nobody). Every other viewer is read-only:
     /// its input-shaped pipe units are dropped daemon-side. Cleared
@@ -315,7 +318,14 @@ pub const Session = struct {
     /// Indexed escape-free log of the child's output (log_get / MCP
     /// app_log): one monotonically-increasing id per line, bounded.
     log: logring.LogRing,
+    /// The title `list` reports: the fixed one, else the app's.
+    pub fn listTitle(self: *const Session) []const u8 {
+        if (self.fixed_title) |t| return t;
+        return if (self.screen.last_title) |t| t else "";
+    }
+
     pub fn deinit(self: *Session) void {
+        if (self.fixed_title) |t| self.allocator.free(t);
         if (self.xwayland) |*xwl| xwl.deinit();
         self.log.deinit();
         if (self.cast_recorder) |*rec| rec.finish();
@@ -510,6 +520,10 @@ pub const Worker = struct {
     /// handover may leave it running. A worker that cannot be adopted
     /// makes a handover refuse instead of orphaning it unreachable.
     adoptable: bool = false,
+    /// Why the session ended, once known: the worker's 'T' report, or a
+    /// kill this broker forwarded. Recorded as a tombstone when the
+    /// record is retired.
+    end: ?tombstones.End = null,
 
     pub fn deinit(self: *Worker) void {
         if (self.control_fd >= 0) _ = c.close(self.control_fd);
@@ -3026,6 +3040,8 @@ pub const Daemon = struct {
     /// death is logged but not counted, since rigs SIGKILL workers on
     /// purpose and the OOM killer is not the worker's fault.
     worker_failures: u32 = 0,
+    /// Broker: why recently ended sessions ended (`tombstone_get`).
+    tombstones: tombstones.Ring = .{},
     /// Broker only: forked session workers, by session name.
     workers: std.ArrayList(*Worker) = .empty,
     /// Worker only: an attached client's rename forwarded to the broker (the
@@ -5964,7 +5980,7 @@ pub const Daemon = struct {
                 .cols = s.screen.cols,
                 .clients = n_clients,
                 .exited = s.exited,
-                .title = if (s.screen.last_title) |t| t else "",
+                .title = s.listTitle(),
                 .app = s.app,
                 .idle_ms = now - s.last_activity_ms,
                 .cwd = cwd,
@@ -6604,8 +6620,51 @@ pub const Daemon = struct {
             cl.queueErr("display session identity changed");
             return;
         }
+        self.reportEnd(.{ .reason = .closed });
         self.removeSession(s);
         cl.queueJson(.ok, .{ .ok = true });
+    }
+
+    /// Worker: tell the broker why our session ends, for its tombstone.
+    /// Sent before the session goes, so it precedes the control EOF.
+    fn reportEnd(self: *Daemon, end: tombstones.End) void {
+        if (!self.isWorker() or self.control_fd < 0) return;
+        var buf: [160]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        w.writeByte('T') catch return;
+        std.json.Stringify.value(end, .{ .emit_null_optional_fields = false }, &w) catch return;
+        _ = daemon_control.controlSend(self.control_fd, w.buffered(), -1);
+    }
+
+    /// Broker: why session `name` (or exactly lifetime `origin_id`) ended,
+    /// if it is remembered. A worker remembers nothing and says so.
+    pub fn handleTombstoneGet(self: *Daemon, cl: *Client, payload: []const u8) void {
+        var parsed = std.json.parseFromSlice(tombstones.Query, self.allocator, payload, .{ .ignore_unknown_fields = true }) catch {
+            cl.queueErr("bad tombstone_get request");
+            return;
+        };
+        defer parsed.deinit();
+        const q = parsed.value;
+        const found = if (self.isWorker()) null else self.tombstones.find(q.name, if (q.origin_id.len > 0) q.origin_id else null, wallMs());
+        const e = found orelse return cl.queueJson(.tombstone_reply, tombstones.Reply{ .req = q.req, .name = q.name, .origin_id = q.origin_id });
+        cl.queueJson(.tombstone_reply, tombstones.Reply{
+            .req = q.req,
+            .found = true,
+            .name = e.name(),
+            .origin_id = &e.origin_id,
+            .ended_ms = e.ended_ms,
+            .reason = e.reason,
+            .exit_status = e.exit_status,
+            .signal = e.signal,
+        });
+    }
+
+    /// Broker: a retired worker record leaves a tombstone when it ever
+    /// held a session (an adoption that never completed or a spawn that
+    /// failed did not).
+    fn noteWorkerEnded(self: *Daemon, w: *const Worker) void {
+        if (!w.ready or w.adopting) return;
+        self.tombstones.add(w.name, w.title orelse "", w.origin_id, w.end orelse .{ .reason = .unknown }, wallMs());
     }
 
     test "direct kill origin fence preserves replacements and accepts exact or absent identity" {
@@ -6932,6 +6991,7 @@ pub const Daemon = struct {
                 _ = c.usleep(1000);
             }
         }
+        self.reportEnd(tombstones.End.exited(s.exit_status));
         var st: [4]u8 = undefined;
         std.mem.writeInt(i32, &st, s.exit_status, .little);
         // A crash mid-line must keep the tail in the log ring.
@@ -6999,6 +7059,7 @@ pub const Daemon = struct {
             }
             if (now - s.no_viewer_since_ms < s.ttl_ms) continue;
             log.info("session '{s}': ttl expired ({d}s unoccupied)", .{ s.name, @divTrunc(s.ttl_ms, 1000) });
+            self.reportEnd(.{ .reason = .expired });
             self.removeSession(s);
         }
     }
@@ -7310,6 +7371,7 @@ pub const Daemon = struct {
             if (w.dead and w.adopted) {
                 // Not our child: init reaps it; control EOF is all we get.
                 if (!w.adopting) log.info("adopted worker pid={d} session='{s}' gone", .{ w.pid, w.name });
+                self.noteWorkerEnded(w);
                 _ = self.workers.swapRemove(i);
                 w.deinit();
                 continue;
@@ -7322,6 +7384,7 @@ pub const Daemon = struct {
                     continue;
                 }
                 if (r == w.pid) self.noteWorkerExit(w, status);
+                self.noteWorkerEnded(w);
                 _ = self.workers.swapRemove(i);
                 w.deinit();
                 continue;

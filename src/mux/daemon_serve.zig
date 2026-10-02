@@ -407,6 +407,8 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
         // host and belongs to the client connection, not to a session.
         .web_helper_open => self.handleWebHelperOpen(cl, frame.payload),
         .web_helper_connect => self.handleWebHelperConnect(cl, frame.payload),
+        // NOT attach-scoped: the broker keeps the tombstones.
+        .tombstone_get => self.handleTombstoneGet(cl, frame.payload),
         .rec_stop => {
             const s = cl.attached orelse {
                 cl.queueErr("not attached");

@@ -274,8 +274,26 @@ pub fn numbered(text: []const u8) ?struct { n: u32, label: []const u8 } {
     return .{ .n = n, .label = text[i + 2 ..] };
 }
 
-/// The numbered option list above the last choice-prompt line, or null
-/// when none is showing (or an input box below it says it is stale).
+/// `k. label` with a single lowercase letter key (leading spaces allowed).
+pub fn lettered(text: []const u8) ?struct { key: []const u8, label: []const u8 } {
+    var i: usize = 0;
+    while (i < text.len and text[i] == ' ') i += 1;
+    if (i + 2 >= text.len or !std.ascii.isLower(text[i]) or text[i + 1] != '.' or text[i + 2] != ' ') return null;
+    return .{ .key = text[i .. i + 1], .label = text[i + 3 ..] };
+}
+
+/// The first row of the run of lettered option lines right above `p`, when
+/// there are at least two.
+fn letteredRun(lines: []const Line, p: usize) ?usize {
+    var k = p;
+    while (k > 0 and lettered(lines[k - 1].text) != null) k -= 1;
+    return if (p - k >= 2) k else null;
+}
+
+/// The option list above the last choice-prompt line, or null when none is
+/// showing (or an input box below it says it is stale): numbered options
+/// (`1. Yes`), or a run of lettered ones right above the prompt (`y. Yes`,
+/// chosen by typing their letter), whose prompt leads with its question.
 /// Everything returned is allocated from `alloc` (an arena).
 pub fn parseInteraction(alloc: std.mem.Allocator, sc: *const adapter.Screen, lines: []const Line) !?Interaction {
     var prompt: ?usize = null;
@@ -290,38 +308,49 @@ pub fn parseInteraction(alloc: std.mem.Allocator, sc: *const adapter.Screen, lin
     const p = prompt orelse return null;
     if (findInput(sc, lines[p..], 8)) |_| return null;
 
-    // Option 1 is the nearest "1. " above the prompt.
-    var first: ?usize = null;
-    var k = p;
-    while (k > 0 and p - k < 80) {
-        k -= 1;
-        if (numbered(lines[k].text)) |nb| {
-            if (nb.n == 1) {
-                first = k;
-                break;
-            }
-        }
-    }
-    const f = first orelse return null;
-
     var options: std.ArrayList(Option) = .empty;
-    var label: std.ArrayList(u8) = .empty;
-    var expected: u32 = 1;
-    for (lines[f..p], f..) |l, row| {
-        if (numbered(l.text)) |nb| {
-            if (nb.n == expected) {
-                if (expected > 1) try options.append(alloc, try makeOption(alloc, sc, label.items));
-                label.clearRetainingCapacity();
-                try label.appendSlice(alloc, nb.label);
-                expected += 1;
-                continue;
+    const letter_run = letteredRun(lines, p);
+    const f = if (letter_run) |run| blk: {
+        for (lines[run..p]) |l| {
+            const lt = lettered(l.text).?;
+            var o = try makeOption(alloc, sc, lt.label);
+            o.key = try alloc.dupe(u8, lt.key);
+            try options.append(alloc, o);
+        }
+        break :blk run;
+    } else blk: {
+        // Option 1 is the nearest "1. " above the prompt.
+        var first: ?usize = null;
+        var k = p;
+        while (k > 0 and p - k < 80) {
+            k -= 1;
+            if (numbered(lines[k].text)) |nb| {
+                if (nb.n == 1) {
+                    first = k;
+                    break;
+                }
             }
         }
-        if (l.text.len == 0) continue;
-        if (!lines[row - 1].joins_next) try label.append(alloc, ' ');
-        try label.appendSlice(alloc, l.text);
-    }
-    try options.append(alloc, try makeOption(alloc, sc, label.items));
+        const one = first orelse return null;
+        var label: std.ArrayList(u8) = .empty;
+        var expected: u32 = 1;
+        for (lines[one..p], one..) |l, row| {
+            if (numbered(l.text)) |nb| {
+                if (nb.n == expected) {
+                    if (expected > 1) try options.append(alloc, try makeOption(alloc, sc, label.items));
+                    label.clearRetainingCapacity();
+                    try label.appendSlice(alloc, nb.label);
+                    expected += 1;
+                    continue;
+                }
+            }
+            if (l.text.len == 0) continue;
+            if (!lines[row - 1].joins_next) try label.append(alloc, ' ');
+            try label.appendSlice(alloc, l.text);
+        }
+        try options.append(alloc, try makeOption(alloc, sc, label.items));
+        break :blk one;
+    };
 
     // Header: up from option 1 to a record start or chrome line.
     var h = f;
@@ -346,7 +375,7 @@ pub fn parseInteraction(alloc: std.mem.Allocator, sc: *const adapter.Screen, lin
     var detail: []const u8 = "";
     const kind: vocab.InteractionKind = if (permission_row != null) .permission else .choice;
     if (header.items.len > 0) {
-        if (kind == .permission) {
+        if (kind == .permission and letter_run == null) {
             title = header.items[header.items.len - 1];
             detail = try std.mem.join(alloc, "\n", header.items[0 .. header.items.len - 1]);
         } else {
@@ -592,6 +621,43 @@ test "interactions: a permission prompt with wrapped options" {
     try t.expectEqualStrings("Yes, and always allow access to /tmp/scratch from this project", it.options[1].label);
     try t.expect(!it.options[0].selected);
     try t.expectEqualStrings("Select with numbers [1-3]. Then Enter to submit or Escape to cancel:\nEsc to cancel · Tab to amend", it.hint);
+}
+
+test "interactions: Claude Code's trust dialog is a lettered permission prompt" {
+    var set = adapter.Set.init(t.allocator);
+    defer set.deinit();
+    try set.loadShipped();
+    const sc = &set.get("claude").?.screen.?;
+    // Measured, Claude Code 2.1.287 --ax-screen-reader in a new directory.
+    const lines = try mk(&.{
+        "[Screen Reader Mode: on via flag]",
+        "Permission Required: Accessing workspace:",
+        "/tmp/scratch/untrusted-probe",
+        "Quick safety check: Is this a project you created or one you trust? (Like your",
+        "own code, a well-known open source project, or work from your team). If not,",
+        "take a moment to review what's in this folder first.",
+        "Claude Code'll be able to read, edit, and execute files here.",
+        "Security guide",
+        "y. Yes, I trust this folder",
+        "n. No, exit",
+        "Enter y/n:",
+        "Enter to confirm · Esc to cancel",
+    });
+    defer t.allocator.free(lines);
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const it = (try parseInteraction(arena.allocator(), sc, lines)).?;
+    try t.expectEqual(vocab.InteractionKind.permission, it.kind);
+    try t.expectEqualStrings("Permission Required: Accessing workspace:", it.title);
+    try t.expectEqual(@as(usize, 2), it.options.len);
+    try t.expectEqualStrings("Yes, I trust this folder", it.options[0].label);
+    try t.expectEqualStrings("y", it.options[0].key);
+    try t.expectEqualStrings("n", it.options[1].key);
+    // Chosen by label, part of one, number or the letter itself.
+    try t.expectEqual(@as(?usize, 0), it.pick("yes"));
+    try t.expectEqual(@as(?usize, 1), it.pick("2"));
+    try t.expectEqual(@as(?usize, 1), it.pick("n"));
+    try t.expectEqual(@as(?usize, 0), it.pick("trust"));
 }
 
 test "interactions: a picker with the selected option, and a stale one" {

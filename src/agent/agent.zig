@@ -254,6 +254,15 @@ pub const ScreenDriver = struct {
         const i = it.pick(choice) orelse return error.NoSuchOption;
         return @intCast(i + 1);
     }
+
+    /// What to type to choose the option `choice` names: its key, else its
+    /// 1-based number (written into `buf`).
+    pub fn pickKeys(self: ScreenDriver, choice: []const u8, buf: []u8) Error![]const u8 {
+        const it = self.engine.interaction orelse return error.NoPendingInteraction;
+        const i = it.pick(choice) orelse return error.NoSuchOption;
+        if (it.options[i].key.len > 0) return it.options[i].key;
+        return std.fmt.bufPrint(buf, "{d}", .{i + 1}) catch error.NoSuchOption;
+    }
 };
 
 fn planSteps(allocator: std.mem.Allocator, steps: []const adapter.Step, values: std.enums.EnumFieldStruct(adapter.Placeholder, ?[]const u8, @as(?[]const u8, null))) !Plan {

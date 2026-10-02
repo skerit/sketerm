@@ -320,6 +320,7 @@ pub const Source = struct {
 
     /// The event stream is back.
     pub fn noteReconnected(self: *Source, now_ms: i64) !void {
+        if (self.disconnected) _ = try self.queue.push(now_ms, .connection_restored, null, "the connection to the agent's server is back", "");
         self.disconnected = false;
         self.connected = true;
         try self.evaluate(now_ms);
@@ -2413,6 +2414,8 @@ test "api: connect, submit with a chosen model and effort, answer, interrupt, co
         }
     }.f);
     try t.expect(countRequests(&srv, "GET /session/status") > status_gets);
+    // A waiter learns the link is back without polling.
+    try t.expectEqual(@as(usize, 1), countKind(&api.source.queue, .connection_restored));
     try t.expect(srv.lastRequest("GET /session/ses_root/message") != null);
     try t.expectEqual(@as(usize, 3), api.source.records.items.len);
 }

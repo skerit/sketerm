@@ -53,6 +53,8 @@ pub const Record = struct {
 pub const Option = struct {
     label: []const u8,
     selected: bool,
+    /// What is typed to choose it; empty = its 1-based number.
+    key: []const u8 = "",
 };
 
 pub const Interaction = struct {
@@ -86,14 +88,18 @@ pub const Interaction = struct {
         return h.final();
     }
 
-    /// The option `choice` names: an exact label (case-insensitive), a
-    /// 1-based index, or a case-insensitive substring of exactly one label.
+    /// The option `choice` names: an exact label (case-insensitive), its
+    /// key, a 1-based index, or a case-insensitive substring of exactly one
+    /// label.
     /// @return its 0-based index, or null.
     pub fn pick(self: Interaction, choice: []const u8) ?usize {
         const want = std.mem.trim(u8, choice, " \t\r\n");
         if (want.len == 0) return null;
         for (self.options, 0..) |o, i| {
             if (std.ascii.eqlIgnoreCase(o.label, want)) return i;
+        }
+        for (self.options, 0..) |o, i| {
+            if (o.key.len > 0 and std.ascii.eqlIgnoreCase(o.key, want)) return i;
         }
         if (std.fmt.parseInt(usize, want, 10)) |n| {
             return if (n >= 1 and n <= self.options.len) n - 1 else null;

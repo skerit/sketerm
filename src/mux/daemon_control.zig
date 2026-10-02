@@ -60,7 +60,8 @@ const lifetime = @import("../util/lifetime.zig");
 // 'K' kill, 'R' broker-authoritative rename, 'n' result of a rename this
 // worker forwarded. Broker-handled opcodes (brokerOnWorkerControl):
 // 'Y' ready, 'E' spawn-failure reason, 'M' metadata push, 'N' an attached
-// client's rename forwarded by the worker.
+// client's rename forwarded by the worker, 'T' why the session ends
+// (`tombstones.End`, sent before the session goes).
 
 /// Graceful worker stop, shared by the broker's 'K' and control EOF: close
 /// panel scopes, tell live clients it is intentional, and leave the loop.
@@ -443,6 +444,13 @@ pub fn brokerOnWorkerControl(self: *Daemon, w: *Worker) void {
             w.setOwned(&w.x_display, m.x);
             w.setOwned(&w.xauthority, m.xa);
         },
+        'T' => {
+            const parsed = std.json.parseFromSlice(dmod.tombstones.End, self.allocator, buf[1..@intCast(n)], .{
+                .ignore_unknown_fields = true,
+            }) catch return;
+            defer parsed.deinit();
+            w.end = parsed.value;
+        },
         'N' => self.brokerWorkerRename(w, buf[0..@intCast(n)]),
         'D' => daemon_adopt.brokerOnAdoptRecord(self, w, buf[1..@intCast(n)]),
         else => {},
@@ -531,7 +539,7 @@ pub fn maybePushMeta(self: *Daemon) void {
     for (self.clients.items) |cl| {
         if (!cl.dead) n_clients += 1;
     }
-    const title: []const u8 = if (s.screen.last_title) |t| t else "";
+    const title = s.listTitle();
     const viewers = self.viewerCount(s);
     const th = std.hash.Wyhash.hash(0, title);
     var ctrl_buf: [32]u8 = undefined;

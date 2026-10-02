@@ -441,6 +441,9 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
         try res.fact("agent_ssh", agent_ssh);
         try res.fact("agent_open_args_env", agents_ok);
         try res.fact("agent_open_resume", agents_ok);
+        try res.fact("agent_resume_by_id", agents_ok);
+        try res.fact("agent_idle_ttl_hours", if (agents_ok) mcp_agent.state.ttl_secs / 3600 else 0);
+        try res.fact("tombstones", agents_ok);
         try res.fact("agent_login_shell", agent_ssh);
         const ids: []const []const u8 = if (agents_ok) mcp_agent.adapterIds(arena) catch &.{} else &.{};
         try res.fact("agent_adapters", ids);
@@ -474,6 +477,7 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
             try res.textf("agent_read and done results return per job its last message, earlier segment finals of {d}+ chars, messages of {d}+ chars and notices, about {d} chars per read (detail all for every message); each record reaches you once", .{ select.FINAL_MIN_CHARS, select.LONG_MIN_CHARS, select.READ_CAP_CHARS });
             try res.text("done means settled (no subagents or background tasks left running); results and waiters share one event delivery, and agent_wait agents / agent-wait --any watch several agents");
             try res.text("agent_send to a busy agent queues the prompt in its app for the next turn (outcome queued), and agent_answer takes free text where the prompt allows it");
+            try res.textf("agents outlive this server on their host's per-user daemon for {d} h unattached (mcp_agent_idle_ttl_hours): agent_open returns an id, and agent_attach {{agent: id}} resumes it after a restart", .{mcp_agent.state.ttl_secs / 3600});
         } else
             try res.text("sub-agents (agent_*) are unavailable in --shared mode: they run on an isolated or durable instance's private daemon");
     }

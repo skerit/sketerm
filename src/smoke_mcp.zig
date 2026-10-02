@@ -6617,7 +6617,10 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
             fail("capabilities: agent_adapters lacks claude or opencode");
         if (std.mem.indexOf(u8, scStr(caps, "agent_waiter", "capabilities"), " mcp agent-wait --socket ") == null)
             fail("capabilities: agent_waiter is not the waiter command");
-        const mux_sock = arena.dupe(u8, scStr(caps, "mux_socket", "capabilities")) catch fail("oom");
+        // Agents run on the PER-USER daemon of this (isolated) runtime dir.
+        const mux_sock = std.fmt.allocPrint(arena, "{s}/sketerm/mux.sock", .{rt}) catch fail("oom");
+        if (!caps.get("agent_resume_by_id").?.bool) fail("capabilities: agent_resume_by_id is false");
+        if (caps.get("agent_idle_ttl_hours").?.integer != 24) fail("capabilities: agent_idle_ttl_hours is not the default 24");
 
         const ad = agentCall(&m, arena, "agent_adapters", "{}", "agent_adapters", false, 15_000);
         if (ad.get("count").?.integer < 2) fail("agent_adapters lists fewer than two adapters");
@@ -6626,19 +6629,25 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
         // A wrapper's args and env: byte-exact, the CLAUDE* one kept while
         // the others are removed (the fake refuses to start with those).
         resetStarts();
-        const opened = agentCall(&m, arena, "agent_open", std.fmt.allocPrint(arena, "{{\"app\":\"claude\",\"binary\":{s},\"timeout_ms\":30000{s}}}", .{ bin_json, extraJson(arena) }) catch fail("oom"), "agent_open claude", false, 45_000);
+        // Named after the ids older builds minted: every call below uses it.
+        const opened = agentCall(&m, arena, "agent_open", std.fmt.allocPrint(arena, "{{\"app\":\"claude\",\"name\":\"claude-1\",\"binary\":{s},\"timeout_ms\":30000{s}}}", .{ bin_json, extraJson(arena) }) catch fail("oom"), "agent_open claude", false, 45_000);
         expectExtraFacts(arena, opened, "agent_open claude");
         expectStarts(arena, "claude", 1, "agent_open claude");
-        expectFact(opened, "agent", "claude-1", "agent_open: agent id");
-        expectFact(opened, "session", "agent-claude-1", "agent_open: session name");
+        expectFact(opened, "name", "claude-1", "agent_open: agent name");
+        const c1 = arena.dupe(u8, scStr(opened, "agent", "agent_open")) catch fail("oom");
+        if (!std.mem.startsWith(u8, c1, "claude-") or c1.len != "claude-".len + 4) fail("agent_open: the id is not <app>-xxxx");
+        const c1_session = std.fmt.allocPrint(arena, "agent-{s}", .{c1}) catch fail("oom");
+        expectFact(opened, "session", c1_session, "agent_open: session name");
+        // A name is unique among this machine's live agents.
+        _ = agentCall(&m, arena, "agent_open", std.fmt.allocPrint(arena, "{{\"app\":\"claude\",\"name\":\"claude-1\",\"binary\":{s}}}", .{bin_json}) catch fail("oom"), "agent_open taken name", true, 15_000);
         if (!opened.get("ready").?.bool) fail("agent_open: the fake Claude Code never became ready (an unset_env leak makes it refuse to start)");
         if (std.mem.indexOf(u8, scStr(opened, "watch_command", "agent_open"), " agent-wait ") == null) fail("agent_open: no watch_command");
         // A cursor baked into the command went stale with the next call.
         if (std.mem.indexOf(u8, scStr(opened, "watch_command", "agent_open"), "--since") != null) fail("agent_open: watch_command carries a cursor");
-        if (!sessionListed(allocator, mux_sock, "agent-claude-1")) fail("agent-claude-1 is not a session on the private daemon");
+        if (!sessionListed(allocator, mux_sock, c1_session)) fail("the agent is not a session on the per-user daemon");
         // Recorded like every other headless terminal, at an absolute path.
         const recs_opened = (opened.get("recordings") orelse fail("agent_open: no recordings fact")).array.items;
-        if (recs_opened.len != 1 or recs_opened[0].string[0] != '/' or !std.mem.endsWith(u8, recs_opened[0].string, "/agent-claude-1.cast"))
+        if (recs_opened.len != 1 or recs_opened[0].string[0] != '/' or !std.mem.endsWith(u8, recs_opened[0].string, std.fmt.allocPrint(arena, "/{s}.cast", .{c1_session}) catch fail("oom")))
             fail("agent_open: the agent's terminal is not recorded at an absolute path");
         const claude_cast = arena.dupe(u8, recs_opened[0].string) catch fail("oom");
 
@@ -6705,7 +6714,7 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
         const term_id = term.get("term").?.integer;
         _ = agentCall(&m, arena, "term_exec", std.fmt.allocPrint(arena, "{{\"term\":{d},\"command\":\"sleep 3\",\"timeout_ms\":20000}}", .{term_id}) catch fail("oom"), "term_exec sleep", false, 45_000);
         const woke = one_shot.finish(arena, 15_000, "one-shot waiter");
-        if (std.mem.indexOf(u8, woke, "claude-1 done: echo: slow reply") == null) {
+        if (std.mem.indexOf(u8, woke, std.fmt.allocPrint(arena, "{s} done: echo: slow reply", .{c1}) catch fail("oom")) == null) {
             say(woke);
             fail("the one-shot waiter did not print the done wake-up");
         }
@@ -6734,8 +6743,9 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
         var twin_b = Waiter.start(lone_cmd);
         _ = c.usleep(300_000);
         _ = agentCall(&m, arena, "agent_send", "{\"agent\":\"claude-1\",\"text\":\"slow twins\",\"timeout_ms\":0}", "agent_send twins", false, 15_000);
-        const a_woke = twin_a.waitFor(arena, "claude-1 done", 1, 8_000);
-        const b_woke = twin_b.waitFor(arena, "claude-1 done", 1, if (a_woke) 2_000 else 8_000);
+        const c1_done = std.fmt.allocPrint(arena, "{s} done", .{c1}) catch fail("oom");
+        const a_woke = twin_a.waitFor(arena, c1_done, 1, 8_000);
+        const b_woke = twin_b.waitFor(arena, c1_done, 1, if (a_woke) 2_000 else 8_000);
         if (a_woke == b_woke) {
             say(twin_a.out.items);
             say(twin_b.out.items);
@@ -6754,7 +6764,7 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
             // as the app reprinting its last turn.
             const bg = agentCall(&m, arena, "agent_send", std.fmt.allocPrint(arena, "{{\"agent\":\"claude-1\",\"text\":\"slow again {d}\",\"timeout_ms\":0}}", .{n}) catch fail("oom"), "agent_send slow again", false, 15_000);
             expectSentOrWorking(bg, "agent_send slow again: outcome");
-            if (!follower.waitFor(arena, "claude-1 done", n, 15_000)) {
+            if (!follower.waitFor(arena, c1_done, n, 15_000)) {
                 say(follower.out.items);
                 fail("the --follow waiter missed a turn that ended between calls");
             }
@@ -6814,13 +6824,14 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
 
         // Several agents: agent_wait `agents` hands out one --any command,
         // which wakes on the first of them and names it.
-        const second = agentCall(&m, arena, "agent_open", std.fmt.allocPrint(arena, "{{\"app\":\"claude\",\"binary\":{s},\"timeout_ms\":30000{s}}}", .{ bin_json, extraJson(arena) }) catch fail("oom"), "agent_open claude-2", false, 45_000);
-        expectFact(second, "agent", "claude-2", "agent_open: second agent id");
+        const second = agentCall(&m, arena, "agent_open", std.fmt.allocPrint(arena, "{{\"app\":\"claude\",\"name\":\"claude-2\",\"binary\":{s},\"timeout_ms\":30000{s}}}", .{ bin_json, extraJson(arena) }) catch fail("oom"), "agent_open claude-2", false, 45_000);
+        expectFact(second, "name", "claude-2", "agent_open: second agent name");
+        const c2 = arena.dupe(u8, scStr(second, "agent", "agent_open claude-2")) catch fail("oom");
         const both = agentCall(&m, arena, "agent_wait", "{\"agents\":[\"claude-1\",\"claude-2\"],\"timeout_ms\":0}", "agent_wait agents", false, 15_000);
         expectFact(both, "outcome", "still_working", "agent_wait agents: outcome");
         if (both.get("agents").?.array.items.len != 2) fail("agent_wait agents: the agents fact");
         const any_cmd = scStr(both, "watch_command", "agent_wait agents");
-        if (std.mem.indexOf(u8, any_cmd, " --any ") == null or !std.mem.endsWith(u8, any_cmd, " claude-1 claude-2")) {
+        if (std.mem.indexOf(u8, any_cmd, " --any ") == null or !std.mem.endsWith(u8, any_cmd, std.fmt.allocPrint(arena, " {s} {s}", .{ c1, c2 }) catch fail("oom"))) {
             say(any_cmd);
             fail("agent_wait agents: watch_command is not an --any waiter on both");
         }
@@ -6828,7 +6839,7 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
         _ = c.usleep(300_000);
         _ = agentCall(&m, arena, "agent_send", "{\"agent\":\"claude-2\",\"text\":\"slow from two\",\"timeout_ms\":0}", "agent_send claude-2", false, 15_000);
         const any_out = any_waiter.finish(arena, 15_000, "--any waiter");
-        if (std.mem.indexOf(u8, any_out, "claude-2 done: echo: slow from two") == null) {
+        if (std.mem.indexOf(u8, any_out, std.fmt.allocPrint(arena, "{s} done: echo: slow from two", .{c2}) catch fail("oom")) == null) {
             say(any_out);
             fail("the --any waiter did not wake on the second agent, by name");
         }
@@ -6837,7 +6848,7 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
         const closed = agentCall(&m, arena, "agent_close", "{\"agent\":\"claude-1\"}", "agent_close claude", false, 15_000);
         if (!closed.get("closed").?.bool or closed.get("sessions").?.array.items.len != 1) fail("agent_close: did not close the one session");
         const followed = follower.finish(arena, 15_000, "follow waiter");
-        if (std.mem.count(u8, followed, "claude-1 done") < 2 or std.mem.indexOf(u8, followed, "watch ended: agent closed") == null) {
+        if (std.mem.count(u8, followed, c1_done) < 2 or std.mem.indexOf(u8, followed, "watch ended: agent closed") == null) {
             say(followed);
             fail("the --follow waiter did not print each turn and then watch ended");
         }
@@ -6848,16 +6859,18 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
             say(followed);
             fail("the --follow waiter was woken by the adapter's own picker or restart");
         }
-        waitUnlisted(allocator, mux_sock, "agent-claude-1", "agent_close claude");
+        waitUnlisted(allocator, mux_sock, c1_session, "agent_close claude");
         if (!fileExists(claude_cast)) fail("the agent's recording does not exist");
         say("smoke-mcp: agents: fake Claude Code (open, send, read once per record, permission, match, flood, shared waiter delivery, two waiters, --any, late backlog, model, effort relaunch, recording, close) ok");
 
         // ── opencode (API source) ───────────────────────────────────
         resetStarts();
-        const oc = agentCall(&m, arena, "agent_open", std.fmt.allocPrint(arena, "{{\"app\":\"opencode\",\"binary\":{s},\"timeout_ms\":30000{s}}}", .{ bin_json, extraJson(arena) }) catch fail("oom"), "agent_open opencode", false, 45_000);
-        expectFact(oc, "agent", "opencode-1", "agent_open opencode: agent id");
-        expectFact(oc, "session", "agent-opencode-1", "agent_open opencode: session");
-        expectFact(oc, "server_session", "agent-opencode-1-server", "agent_open opencode: server session");
+        const oc = agentCall(&m, arena, "agent_open", std.fmt.allocPrint(arena, "{{\"app\":\"opencode\",\"name\":\"opencode-1\",\"binary\":{s},\"timeout_ms\":30000{s}}}", .{ bin_json, extraJson(arena) }) catch fail("oom"), "agent_open opencode", false, 45_000);
+        const o1 = arena.dupe(u8, scStr(oc, "agent", "agent_open opencode")) catch fail("oom");
+        const o1_session = std.fmt.allocPrint(arena, "agent-{s}", .{o1}) catch fail("oom");
+        const o1_server = std.fmt.allocPrint(arena, "agent-{s}-server", .{o1}) catch fail("oom");
+        expectFact(oc, "session", o1_session, "agent_open opencode: session");
+        expectFact(oc, "server_session", o1_server, "agent_open opencode: server session");
         // The fake server swallowed every request of its first 4.5 s: the
         // open waited it out on health probes instead of failing.
         if (!oc.get("ready").?.bool) fail("agent_open opencode: not ready");
@@ -6865,8 +6878,8 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
         expectExtraFacts(arena, oc, "agent_open opencode");
         expectStarts(arena, "serve", 1, "agent_open opencode server");
         expectStarts(arena, "attach", 1, "agent_open opencode TUI");
-        if (!sessionListed(allocator, mux_sock, "agent-opencode-1") or !sessionListed(allocator, mux_sock, "agent-opencode-1-server"))
-            fail("the opencode sessions are not on the private daemon");
+        if (!sessionListed(allocator, mux_sock, o1_session) or !sessionListed(allocator, mux_sock, o1_server))
+            fail("the opencode sessions are not on the per-user daemon");
         expectPasswordsHidden(arena, (oc.get("recordings") orelse fail("agent_open opencode: no recordings")).array.items, "local opencode");
         const set = agentCall(&m, arena, "agent_set", "{\"agent\":\"opencode-1\",\"model\":\"fakeprov/m1\",\"effort\":\"high\"}", "agent_set opencode", false, 30_000);
         expectFact(set, "current_model", "fakeprov/m1", "agent_set: current model");
@@ -6887,24 +6900,79 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
         expectFact(oc_ans, "message", "permission reject", "agent_answer opencode: message");
         const oc_closed = agentCall(&m, arena, "agent_close", "{\"agent\":\"opencode-1\"}", "agent_close opencode", false, 15_000);
         if (oc_closed.get("sessions").?.array.items.len != 2) fail("agent_close opencode: not both sessions");
-        waitUnlisted(allocator, mux_sock, "agent-opencode-1", "agent_close opencode");
-        waitUnlisted(allocator, mux_sock, "agent-opencode-1-server", "agent_close opencode server");
+        waitUnlisted(allocator, mux_sock, o1_session, "agent_close opencode");
+        waitUnlisted(allocator, mux_sock, o1_server, "agent_close opencode server");
         say("smoke-mcp: agents: fake opencode (open, set, send, match, permission, close) ok");
         m.closeStdinWait();
+    }
+
+    // ── an agent outlives its server: another one resumes it by name ──
+    {
+        const user_sock = std.fmt.allocPrint(arena, "{s}/sketerm/mux.sock", .{rt}) catch fail("oom");
+        var s1 = Mcp.spawn(allocator, exe, &.{});
+        s1.initialize();
+        const opened = agentCall(&s1, arena, "agent_open", std.fmt.allocPrint(arena, "{{\"app\":\"claude\",\"name\":\"probe\",\"binary\":{s},\"prompt\":\"before the restart\",\"timeout_ms\":30000}}", .{bin_json}) catch fail("oom"), "resume: agent_open", false, 45_000);
+        expectFact(opened, "message", "echo: before the restart", "resume: agent_open prompt answer");
+        const id = arena.dupe(u8, scStr(opened, "agent", "resume: agent_open")) catch fail("oom");
+        const session = std.fmt.allocPrint(arena, "agent-{s}", .{id}) catch fail("oom");
+        var desc_buf: [512]u8 = undefined;
+        const desc = std.fmt.bufPrintZ(&desc_buf, "{s}/sketerm/agents/{s}.json", .{ rt, id }) catch fail("path");
+        var st: c.struct_stat = undefined;
+        if (c.stat(desc.ptr, &st) != 0 or (st.st_mode & 0o777) != 0o600) fail("resume: no 0600 descriptor in the per-user index");
+        // The server goes away for good (not a clean exit): the agent runs on.
+        _ = c.kill(s1.pid, c.SIGKILL);
+        _ = c.waitpid(s1.pid, null, 0);
+        if (!sessionListed(allocator, user_sock, session)) fail("resume: the agent did not outlive its server");
+
+        var s2 = Mcp.spawn(allocator, exe, &.{});
+        s2.initialize();
+        if (agentCall(&s2, arena, "agent_list", "{}", "resume: agent_list", false, 15_000).get("count").?.integer != 0)
+            fail("resume: an isolated server re-attached an agent on its own");
+        const back = agentCall(&s2, arena, "agent_attach", "{\"agent\":\"probe\"}", "resume: agent_attach", false, 30_000);
+        expectFact(back, "attach", "reattached", "resume: agent_attach outcome");
+        expectFact(back, "agent", id, "resume: agent_attach id");
+        const after = agentCall(&s2, arena, "agent_send", "{\"agent\":\"probe\",\"text\":\"after the restart\",\"timeout_ms\":20000}", "resume: agent_send", false, 45_000);
+        expectFact(after, "message", "echo: after the restart", "resume: the resumed agent answers");
+
+        // A third server: refused while s2 holds it, then takeover moves it.
+        var s3 = Mcp.spawn(allocator, exe, &.{});
+        s3.initialize();
+        const held = agentCall(&s3, arena, "agent_attach", std.fmt.allocPrint(arena, "{{\"agent\":\"{s}\"}}", .{id}) catch fail("oom"), "resume: attach while held", true, 30_000);
+        if (!std.mem.eql(u8, held.get("error").?.object.get("code").?.string, "conflict")) fail("resume: attach of an agent another live server holds is not conflict");
+        const took = agentCall(&s3, arena, "agent_attach", "{\"agent\":\"probe\",\"takeover\":true}", "resume: takeover", false, 30_000);
+        expectFact(took, "attach", "reattached", "resume: takeover outcome");
+        _ = c.usleep(1_500_000);
+        if (agentCall(&s2, arena, "agent_list", "{}", "resume: loser agent_list", false, 15_000).get("count").?.integer != 0)
+            fail("resume: the server that was taken over still lists the agent");
+        s2.closeStdinWait();
+
+        // Closed: gone, with the daemon's reason.
+        _ = agentCall(&s3, arena, "agent_close", "{\"agent\":\"probe\"}", "resume: agent_close", false, 15_000);
+        if (c.stat(desc.ptr, &st) == 0) fail("resume: agent_close left the descriptor in the index");
+        waitUnlisted(allocator, user_sock, session, "resume: agent_close");
+        // Any server asking for it now: gone, with the daemon's reason.
+        var s4 = Mcp.spawn(allocator, exe, &.{});
+        s4.initialize();
+        const gone = agentCall(&s4, arena, "agent_attach", "{\"agent\":\"probe\"}", "resume: attach a closed agent", false, 15_000);
+        expectFact(gone, "attach", "gone", "resume: a closed agent is gone");
+        expectFact(gone, "reason", "closed", "resume: the daemon remembers it was closed");
+        s4.closeStdinWait();
+        s3.closeStdinWait();
+        say("smoke-mcp: agents: an agent outlives its server, agent_attach resumes it by name, refuses a held one, takeover moves it ok");
     }
 
     // ── a durable instance picks its agents up again ─────────────────
     {
         var d1 = Mcp.spawn(allocator, exe, &.{ "--name", "agentdur" });
         d1.initialize();
-        const opened = agentCall(&d1, arena, "agent_open", std.fmt.allocPrint(arena, "{{\"app\":\"claude\",\"binary\":{s},\"prompt\":\"before restart\",\"timeout_ms\":30000{s}}}", .{ bin_json, extraJson(arena) }) catch fail("oom"), "durable agent_open", false, 45_000);
+        const opened = agentCall(&d1, arena, "agent_open", std.fmt.allocPrint(arena, "{{\"app\":\"claude\",\"name\":\"claude-1\",\"binary\":{s},\"prompt\":\"before restart\",\"timeout_ms\":30000{s}}}", .{ bin_json, extraJson(arena) }) catch fail("oom"), "durable agent_open", false, 45_000);
         expectFact(opened, "outcome", "done", "durable agent_open: prompt outcome");
         expectFact(opened, "message", "echo: before restart", "durable agent_open: prompt answer");
         d1.closeStdinWait();
         var desc_buf: [512]u8 = undefined;
-        const desc = std.fmt.bufPrintZ(&desc_buf, "{s}/sketerm/mcp-agentdur/agents/claude-1.json", .{rt}) catch fail("path");
+        const desc = std.fmt.bufPrintZ(&desc_buf, "{s}/sketerm/agents/{s}.json", .{ rt, scStr(opened, "agent", "durable agent_open") }) catch fail("path");
         var st: c.struct_stat = undefined;
-        if (c.stat(desc.ptr, &st) != 0) fail("durable: no agent descriptor in the instance dir");
+        if (c.stat(desc.ptr, &st) != 0) fail("durable: no agent descriptor in the per-user index");
         if ((st.st_mode & 0o777) != 0o600) fail("durable: the agent descriptor is not 0600");
 
         var d2 = Mcp.spawn(allocator, exe, &.{ "--name", "agentdur" });
@@ -7290,7 +7358,7 @@ fn routeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
             const where = sshroute.Location.parse(ag.location) orelse fail("route stage: unparseable agent location");
             const route = sshroute.watchSpec(&buf, "ssh:hosta", rep.instance, "", where) catch fail("route stage: no watch route derived");
             const want_route = if (std.mem.eql(u8, ag.sessions[0], local_session))
-                std.fmt.bufPrint(&want_buf, "route:hosta#{s}", .{rep.instance}) catch fail("oom")
+                "hosta"
             else if (std.mem.eql(u8, ag.sessions[0], remote_session))
                 "route:hosta/hostb"
             else
@@ -7491,7 +7559,7 @@ fn agentSshStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u
         }
 
         resetStarts();
-        const opened = agentCall(&m, arena, "agent_open", std.fmt.allocPrint(arena, "{{\"app\":\"claude\",\"host\":\"fakehost\",\"timeout_ms\":45000{s}}}", .{extraJson(arena)}) catch fail("oom"), "agent_open claude on host", false, 60_000);
+        const opened = agentCall(&m, arena, "agent_open", std.fmt.allocPrint(arena, "{{\"app\":\"claude\",\"name\":\"claude-1\",\"host\":\"fakehost\",\"timeout_ms\":45000{s}}}", .{extraJson(arena)}) catch fail("oom"), "agent_open claude on host", false, 60_000);
         expectExtraFacts(arena, opened, "agent_open claude on host");
         expectStarts(arena, "claude", 1, "agent_open claude on the host daemon");
         expectFact(opened, "transport", "sketerm-mux", "agent_open host: the host's own daemon");
@@ -7499,7 +7567,8 @@ fn agentSshStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u
         expectFact(opened, "binary", want_bin, "agent_open host: the remote binary from the candidates");
         expectFact(opened, "binary_version", FAKE_AGENT_VERSION, "agent_open host: the binary's version line");
         if (!opened.get("ready").?.bool) fail("agent_open host: the remote fake Claude Code never became ready");
-        if (!sessionListed(allocator, rsock, "agent-claude-1")) fail("agent-claude-1 is not a session on the remote daemon");
+        const r_session = arena.dupe(u8, scStr(opened, "session", "agent_open claude on host")) catch fail("oom");
+        if (!sessionListed(allocator, rsock, r_session)) fail("the agent is not a session on the remote daemon");
         const hello = agentCall(&m, arena, "agent_send", "{\"agent\":\"claude-1\",\"text\":\"hello from afar\",\"timeout_ms\":20000}", "agent_send remote", false, 45_000);
         expectFact(hello, "message", "echo: hello from afar", "agent_send remote: message");
 
@@ -7515,11 +7584,13 @@ fn agentSshStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u
         const lost = agentCall(&m, arena, "agent_wait", "{\"agent\":\"claude-1\",\"timeout_ms\":20000}", "agent_wait lost", false, 45_000);
         expectFact(lost, "outcome", "connection_lost", "agent_wait: the lost link is connection_lost");
         expectFact(lost, "state", "disconnected", "agent_wait: state after the drop");
-        // The host answers again: the next call reconnects and resyncs.
+        // The host answers again: the background retry reconnects and
+        // resyncs, and says so (connection_restored wakes a waiter).
         _ = c.unlink(down.ptr);
         _ = c.usleep(5_500_000);
         const back = agentCall(&m, arena, "agent_wait", "{\"agent\":\"claude-1\",\"timeout_ms\":3000}", "agent_wait recovered", false, 30_000);
         expectFact(back, "state", "idle", "agent_wait: idle again after the reconnect");
+        if (eventKinds(back, "connection_restored") != 1) fail("agent_wait: the reconnect raised no connection_restored");
         const after = agentCall(&m, arena, "agent_send", "{\"agent\":\"claude-1\",\"text\":\"after the drop\",\"timeout_ms\":20000}", "agent_send after drop", false, 45_000);
         expectFact(after, "message", "echo: after the drop", "agent_send after the reconnect");
         // The resync is a wipe: nothing captured twice.
@@ -7538,10 +7609,11 @@ fn agentSshStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u
         expectStarts(arena, "claude", 2, "agent_set effort relaunch on the host");
 
         // opencode on the host: password typed, server behind a forward.
-        const oc = agentCall(&m, arena, "agent_open", "{\"app\":\"opencode\",\"host\":\"fakehost\",\"binary\":\"sk-fake-opencode\",\"timeout_ms\":45000}", "agent_open opencode on host", false, 60_000);
+        const oc = agentCall(&m, arena, "agent_open", "{\"app\":\"opencode\",\"name\":\"opencode-1\",\"host\":\"fakehost\",\"binary\":\"sk-fake-opencode\",\"timeout_ms\":45000}", "agent_open opencode on host", false, 60_000);
         expectFact(oc, "transport", "sketerm-mux", "agent_open opencode host: transport");
         if (!oc.get("ready").?.bool) fail("agent_open opencode host: not ready");
-        if (!sessionListed(allocator, rsock, "agent-opencode-1-server")) fail("the opencode server is not a session on the remote daemon");
+        const r_server = arena.dupe(u8, scStr(oc, "server_session", "agent_open opencode on host")) catch fail("oom");
+        if (!sessionListed(allocator, rsock, r_server)) fail("the opencode server is not a session on the remote daemon");
         const oc_sent = agentCall(&m, arena, "agent_send", "{\"agent\":\"opencode-1\",\"text\":\"over the forward\",\"timeout_ms\":20000}", "agent_send opencode remote", false, 45_000);
         expectFact(oc_sent, "outcome", "done", "agent_send opencode on the host: outcome");
         expectPasswordsHidden(arena, &.{}, "opencode on the host's daemon");
@@ -7555,8 +7627,8 @@ fn agentSshStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u
 
         _ = agentCall(&m, arena, "agent_close", "{\"agent\":\"opencode-1\"}", "agent_close opencode remote", false, 15_000);
         _ = agentCall(&m, arena, "agent_close", "{\"agent\":\"claude-1\"}", "agent_close claude remote", false, 15_000);
-        waitUnlisted(allocator, rsock, "agent-claude-1", "agent_close remote claude");
-        waitUnlisted(allocator, rsock, "agent-opencode-1-server", "agent_close remote opencode");
+        waitUnlisted(allocator, rsock, r_session, "agent_close remote claude");
+        waitUnlisted(allocator, rsock, r_server, "agent_close remote opencode");
         m.closeStdinWait();
         say("smoke-mcp: agents over ssh: host daemon (probe, open, send, drop + recovery, effort relaunch, opencode forward + revival, password hidden, close) ok");
     }
@@ -7565,7 +7637,7 @@ fn agentSshStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u
     {
         var m = Mcp.spawn(allocator, exe, &.{});
         m.initialize();
-        const oc = agentCall(&m, arena, "agent_open", "{\"app\":\"opencode\",\"host\":\"fakehost\",\"transport\":\"ssh\",\"binary\":\"sk-fake-opencode\",\"timeout_ms\":45000}", "agent_open opencode over ssh", false, 60_000);
+        const oc = agentCall(&m, arena, "agent_open", "{\"app\":\"opencode\",\"name\":\"opencode-1\",\"host\":\"fakehost\",\"transport\":\"ssh\",\"binary\":\"sk-fake-opencode\",\"timeout_ms\":45000}", "agent_open opencode over ssh", false, 60_000);
         expectFact(oc, "transport", "ssh", "agent_open opencode over plain ssh: transport");
         const oc_sent = agentCall(&m, arena, "agent_send", "{\"agent\":\"opencode-1\",\"text\":\"plain ssh\",\"timeout_ms\":20000}", "agent_send opencode over ssh", false, 45_000);
         expectFact(oc_sent, "outcome", "done", "agent_send opencode over plain ssh");
@@ -7576,7 +7648,7 @@ fn agentSshStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u
         _ = agentCall(&m, arena, "agent_close", "{\"agent\":\"opencode-1\"}", "agent_close opencode ssh", false, 15_000);
 
         resetStarts();
-        const cl = agentCall(&m, arena, "agent_open", std.fmt.allocPrint(arena, "{{\"app\":\"claude\",\"host\":\"fakehost\",\"transport\":\"ssh\",\"timeout_ms\":45000{s}}}", .{extraJson(arena)}) catch fail("oom"), "agent_open claude over ssh", false, 60_000);
+        const cl = agentCall(&m, arena, "agent_open", std.fmt.allocPrint(arena, "{{\"app\":\"claude\",\"name\":\"claude-1\",\"host\":\"fakehost\",\"transport\":\"ssh\",\"timeout_ms\":45000{s}}}", .{extraJson(arena)}) catch fail("oom"), "agent_open claude over ssh", false, 60_000);
         expectExtraFacts(arena, cl, "agent_open claude over plain ssh");
         expectStarts(arena, "claude", 1, "agent_open claude over plain ssh");
         expectFact(cl, "transport", "ssh", "agent_open claude over plain ssh: transport");
@@ -7611,7 +7683,7 @@ fn agentSshStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u
     {
         var d1 = Mcp.spawn(allocator, exe, &.{ "--name", "agentssh" });
         d1.initialize();
-        const opened = agentCall(&d1, arena, "agent_open", "{\"app\":\"claude\",\"host\":\"fakehost\",\"prompt\":\"before restart\",\"timeout_ms\":45000}", "durable remote agent_open", false, 60_000);
+        const opened = agentCall(&d1, arena, "agent_open", "{\"app\":\"claude\",\"name\":\"claude-1\",\"host\":\"fakehost\",\"prompt\":\"before restart\",\"timeout_ms\":45000}", "durable remote agent_open", false, 60_000);
         expectFact(opened, "transport", "sketerm-mux", "durable remote: transport");
         expectFact(opened, "message", "echo: before restart", "durable remote: prompt answer");
         d1.closeStdinWait();
