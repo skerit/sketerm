@@ -1535,12 +1535,12 @@ pub const TOOLS = [_]ToolDef{
         .group = .agent,
         .mutates = true,
         .description =
-        \\Interrupt an agent's running turn (Claude Code: Escape; opencode: abort, subagents included).
+        \\Interrupt an agent's running turn (Claude Code: Escape; opencode: abort, subagents included). Prompts the app held queued for its next turn go with it (Claude Code discards its queue on Escape): queued_dropped says how many, so they can be sent again.
         ,
         .input_schema =
         \\{"type":"object","properties":{"agent":{"type":"string"}}}
         ,
-        .output_schema = agentSchema(",\"interrupted\":{\"type\":\"boolean\"}", ",\"interrupted\""),
+        .output_schema = agentSchema(",\"interrupted\":{\"type\":\"boolean\"},\"queued_dropped\":{\"type\":\"integer\",\"description\":\"Prompts the app held queued that the interrupt discarded (Claude Code drops its queue with the turn); send them again\"}", ",\"interrupted\",\"queued_dropped\""),
     },
     .{
         .name = "agent_list",

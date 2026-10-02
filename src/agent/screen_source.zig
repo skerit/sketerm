@@ -1520,6 +1520,31 @@ test "every kind of background work holds the done: shells, a monitor, a backgro
     try t.expectEqual(@as(usize, 1), countKind(&rig.engine, .done));
 }
 
+test "the background count does not depend on the terminal's width" {
+    // A session another client resized: the mode line wraps on a narrow
+    // terminal, or carries more after the count on a wide one.
+    for ([_]struct { cols: u16, line: []const u8, n: u32 }{
+        .{ .cols = 30, .line = "manual mode on  \xc2\xb7  1 shell, 1 monitor", .n = 2 },
+        .{ .cols = 200, .line = "manual mode on  \xc2\xb7  2 shells  \xc2\xb7  \xe2\x86\x93 to manage", .n = 2 },
+    }) |c| {
+        var rig: Rig = undefined;
+        try rig.init(c.cols, 30);
+        defer rig.deinit();
+        rig.write("\x1b]0;\xe2\x9c\xb3 C\x07" ++ live);
+        try rig.feed(0);
+        try rig.engine.tick(1000);
+        rig.write("\x1b]133;A\x07\x1b]0;\xe2\x97\x90 C\x07" ++ erase ++ "you: run them in the background\r\nclaude: Both started.\r\n" ++ live ++
+            "\x1b]133;C\x07\x1b]133;D\x07\x07\x1b]0;\xe2\x9c\xb3 C\x07" ++ erase ++ "Brewed for 3s \xc2\xb7 done\r\n" ++ status_rows);
+        rig.write(c.line);
+        rig.write("\r\n$");
+        try rig.feed(1100);
+        try rig.engine.tick(5000);
+        try t.expectEqual(vocab.State.waiting_background, rig.engine.state);
+        try t.expectEqual(c.n, rig.engine.background_tasks);
+        try t.expectEqual(@as(usize, 0), countKind(&rig.engine, .done));
+    }
+}
+
 test "a background subagent alone holds the done, its row wrapped on a narrow terminal" {
     var rig: Rig = undefined;
     try rig.init(48, 30);

@@ -122,7 +122,10 @@ pub fn formatWake(w: *std.Io.Writer, m: Message) !void {
     if (best) |b| {
         try w.print(" {s}", .{b.kind});
         const first = firstLine(b.text);
-        if (first.len > 0) try w.print(": {s}", .{clip(first, LINE_TEXT_MAX)});
+        if (first.len > 0) {
+            try w.writeAll(": ");
+            try writeClipped(w, first, LINE_TEXT_MAX);
+        }
         if (b.count > 1) try w.print(" (x{d})", .{b.count});
         if (m.events.len > 1) {
             try w.print(" (+{d} more:", .{m.events.len - 1});
@@ -140,10 +143,25 @@ pub fn formatWake(w: *std.Io.Writer, m: Message) !void {
     if (m.digest) |g| {
         try w.print(" [{d} more held back", .{g.count});
         const latest = firstLine(g.latest);
-        if (latest.len > 0) try w.print("; latest: {s}", .{clip(latest, LINE_TEXT_MAX)});
+        if (latest.len > 0) {
+            try w.writeAll("; latest: ");
+            try writeClipped(w, latest, LINE_TEXT_MAX);
+        }
         try w.writeAll("]");
     }
     if (m.state.len > 0) try w.print(" [state {s}]", .{m.state});
+}
+
+/// `s`, or when longer than `max` its head cut at the last space (a
+/// character boundary when it has none nearby) and an explicit `...`: a
+/// cut inside a word reads as a value of the line's own fields.
+fn writeClipped(w: *std.Io.Writer, s: []const u8, max: usize) !void {
+    if (s.len <= max) return w.writeAll(s);
+    const head = clip(s, max);
+    const space = std.mem.lastIndexOfScalar(u8, head, ' ');
+    const cut = if (space) |sp| (if (sp >= max / 2) sp else head.len) else head.len;
+    try w.writeAll(std.mem.trimEnd(u8, head[0..cut], " "));
+    try w.writeAll(" ...");
 }
 
 /// The exact command that waits on `agents` (several: `--any`, the first
@@ -450,6 +468,15 @@ test "wake lines: encode, parse, and one compact printed line" {
     var aw: std.Io.Writer.Allocating = .init(a);
     try formatWake(&aw.writer, m);
     try t.expectEqualStrings("claude-1 done: All done. (+1 more: message) [1 more held back; latest: second] [state idle]", aw.written());
+    // A long digest text is cut between words with an explicit ellipsis,
+    // never inside a value its own brackets would make look like a field.
+    const long = "Waiting for the zenit red run; it reports " ++ "[state \"idle\"] " ** 12;
+    var aw2: std.Io.Writer.Allocating = .init(a);
+    try formatWake(&aw2.writer, .{ .type = "wake", .agent = "claude-1", .state = "idle", .digest = .{ .count = 2, .latest = long } });
+    const out = aw2.written();
+    try t.expect(std.mem.indexOf(u8, out, " ...] [state idle]") != null);
+    try t.expect(std.mem.indexOf(u8, out, "\"idl]") == null);
+    try t.expect(std.mem.indexOf(u8, out, "\"idl ...") == null);
 
     const end = try encodeEnd(a, "agent closed");
     const e = try std.json.parseFromSliceLeaky(Message, a, end[0 .. end.len - 1], .{ .ignore_unknown_fields = true });

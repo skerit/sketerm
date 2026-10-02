@@ -120,10 +120,34 @@ pub const Handed = struct {
         self.texts.deinit(alloc);
     }
 
+    /// A hash of the kind and the text with every whitespace run (spaces,
+    /// tabs, newlines, NBSP) one space and both ends trimmed: Claude Code
+    /// re-wraps a message when it reprints it at another width.
     fn contentKey(r: Record) ?u64 {
         if (r.kind == .user or r.text.len < CONTENT_MIN_CHARS) return null;
         var h = std.hash.Wyhash.init(@intFromEnum(r.kind));
-        h.update(r.text);
+        var gap = false;
+        var started = false;
+        var i: usize = 0;
+        while (i < r.text.len) {
+            const ch = r.text[i];
+            const ws: usize = if (ch == ' ' or ch == '\t' or ch == '\n' or ch == '\r')
+                1
+            else if (ch == 0xC2 and i + 1 < r.text.len and r.text[i + 1] == 0xA0)
+                2
+            else
+                0;
+            if (ws > 0) {
+                gap = started;
+                i += ws;
+                continue;
+            }
+            if (gap) h.update(" ");
+            gap = false;
+            started = true;
+            h.update(r.text[i .. i + 1]);
+            i += 1;
+        }
         return h.final();
     }
 
@@ -654,6 +678,18 @@ test "a record re-captured under a new id with unchanged text is not delivered a
     try handed.markRecord(t.allocator, recs[0]);
     try t.expect(handed.has(recs[1]));
     try t.expect(!handed.has(recs[2]));
+    // The same report re-wrapped at another width (seen over mux: ids 1611
+    // and 1722) is the same record; different words are not.
+    const wrapped = [_]Record{
+        .{ .id = 20, .kind = .assistant, .text = @constCast("Both review defects are fixed and pushed:\nthe address-class fact moved into AddressScope and\nthe tests cover both databases."), .job = 3 },
+        .{ .id = 21, .kind = .assistant, .text = @constCast("  Both review defects are fixed and pushed: the address-class fact moved into AddressScope and the tests cover both databases.\n"), .job = 3 },
+        .{ .id = 22, .kind = .assistant, .text = @constCast("Both review defects are fixed and pushed: the address-class fact moved into\xc2\xa0AddressScope and the tests cover both\tdatabases."), .job = 3 },
+        .{ .id = 23, .kind = .assistant, .text = @constCast("Both review defects are fixed and pushed: the address-class fact moved into AddressScope and the tests cover one database."), .job = 3 },
+    };
+    try t.expect(handed.has(wrapped[0]));
+    try t.expect(handed.has(wrapped[1]));
+    try t.expect(handed.has(wrapped[2]));
+    try t.expect(!handed.has(wrapped[3]));
     // A short text is never matched by content.
     var short = recs[2];
     short.id = 11;

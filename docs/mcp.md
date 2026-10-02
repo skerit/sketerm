@@ -832,7 +832,9 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   turn's end prints it as an ordinary prompt below the footer and starts a
   turn for it (the adapter's `actions.queue` recipe types it without the
   Escapes that would interrupt, and `screen.queued` marks the preview
-  live, never a record; an idle app still showing one is not done);
+  live, never a record; an idle app still showing one is not done; an
+  `agent_interrupt` throws Claude Code's queue away with the turn, and its
+  result says how many prompts went as `queued_dropped`);
   opencode (oc11) answers `prompt_async` on a busy session with 204,
   creates the user message at once and runs it after the current answer
   (its records keep the job of the prompt they answer, by `parentID`). A
@@ -874,8 +876,11 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   each background subagent as a `◯` row under `● main` below it (wrapped
   onto a second row on a narrow terminal), and drops them in the same
   frame in which it starts the turn that reports their end. The adapter's
-  `screen.background` rule reads the mode line (its numbers summed are
-  the count) and `screen.background_agent` counts the rows; the turn's
+  `screen.background` rule reads the mode line wherever on it the count
+  sits (`· N shell`, `· N monitor`: a session another client resized
+  wraps it on a narrow terminal or carries more after it on a wide one;
+  every transport spawns at the `cols` asked for, 120 by default; its
+  numbers summed are the count) and `screen.background_agent` counts the rows; the turn's
   footer (`· 2 shells still running`) is never read as the live count,
   since it keeps saying so after they ended. The state is
   `waiting_background` (the agent still takes prompts) and the `done`
@@ -935,6 +940,9 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   one line and returns no records. At most ~12000 characters per read:
   the newest job's last message whole, then the longest that fit; what
   the cap leaves out is listed in `cut_ids` and comes with the next read.
+  A record handed out is never handed out again under another id with
+  the same text, whitespace runs counting as one space (Claude Code
+  re-wraps a message it reprints at another width).
   A record keeps its id and its job however often the app draws it again:
   Claude Code reprints older turns below the transcript without erasing
   (their old copies may be trimmed from the parse by then), places a
@@ -985,7 +993,8 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   every event after SEQ, delivered or not. A waiter prints one line per
   wake-up (`claude-1 done: <first line> [state idle]`) and marks no
   RECORD as handed out: `agent_read` afterwards returns the messages in
-  full. It exits after the first wake-up unless `--follow`, and always
+  full. A text the line shortens is cut between words and marked ` ...`,
+  never inside a value its own brackets would make read as a field. It exits after the first wake-up unless `--follow`, and always
   prints `watch ended: <reason>` when its agents close or the server goes
   away. `sketerm-mcp agent-wait` and `sketerm-mcp mcp agent-wait` are the
   same command; the subscribe line keeps `agent` (the first) beside

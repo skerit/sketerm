@@ -3035,14 +3035,21 @@ fn setTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]const u
 }
 
 fn interruptTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]const u8 {
+    service(clock.nowMs());
+    const queued_before = e.agent.queuedPrompts();
     switch (try act(arena, e, .interrupt, deadlineFrom(args, DEFAULT_WAIT_MS))) {
         .fail => |f| return errRes(arena, f.code, f.msg),
         .ok => {},
     }
     pumpFor(INTERRUPT_SETTLE_MS);
+    // Claude Code's Escape throws its queue away with the turn: say so,
+    // never leave the caller believing those prompts still wait.
+    const dropped = queued_before -| e.agent.queuedPrompts();
     var res = Res.init(arena);
     try res.textf("{s}: interrupted", .{e.id});
+    if (dropped > 0) try res.textf("{d} queued prompt(s) were dropped by the interrupt (the app discards its queue with the turn): agent_send them again", .{dropped});
     try res.fact("interrupted", true);
+    try res.fact("queued_dropped", dropped);
     return finish(arena, &res, e, try pending(arena, e), .{}, &.{});
 }
 

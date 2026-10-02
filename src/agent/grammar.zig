@@ -554,7 +554,7 @@ pub const test_adapter_json =
     \\    ],
     \\    "chrome": [ { "pattern": "^[A-Z]\\S*…$" }, { "prefix": "manual mode on" }, { "pattern": "^\\$$" }, { "prefix": "$ " }, { "prefix": "✔ " } ],
     \\    "subagent": { "pattern": "^Waiting for [0-9]+ background agents? to finish" },
-    \\    "background": { "pattern": "· +[0-9]+ shells?$|· +[0-9]+ shells?, |· +[0-9]+ monitors?$|· +[0-9]+ monitors?, " },
+    \\    "background": { "pattern": "· +[0-9]+ shell|· +[0-9]+ monitor" },
     \\    "background_agent": { "pattern": "^ +◯ " },
     \\    "choice_prompt": { "prefix": "Select with numbers [" },
     \\    "permission": { "prefix": "Permission Required:" },
