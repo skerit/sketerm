@@ -1,5 +1,26 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-02: sub-agent events pushed into the orchestrator
+
+An orchestrator learned that its sub-agent finished only through a waiter
+it had to re-arm (a Monitor stops after 30 minutes, a background command
+after one wake-up). Now the wake-ups can be pushed into its session, with
+the same rules and the same one delivery state (`src/ipc/agentpush.zig`):
+a pushed `done` carries the job's answer under 2000 characters, which
+`agent_read` then does not repeat. Claude Code: the server declares
+`claude/channel` and sends `notifications/claude/channel` when the
+session was started with `--dangerously-load-development-channels
+server:sketerm` (found on an ancestor's argv, because Claude Code tells a
+server nothing about channels). opencode: the shipped plugin
+`data/opencode/sketerm-agents.js` runs the new `agent-wait --server
+--follow --json --parent <pid>` follower (the registry now records each
+server's `ppid` and `agent_socket`) and prompts the session that last
+called an `agent_*` tool. Both measured end to end with a Haiku sub-agent
+that answered after a background `sleep 20`: the done arrived once, as a
+new turn of an idle orchestrator, with no waiter involved.
+`capabilities` reports `agent_push`, `agent_push_follow` and
+`agent_push_followers`.
+
 ## 2026-10-02: a command that exits at once still reports its exit
 
 Spawn and attach are two round trips, and a child that exited before its
