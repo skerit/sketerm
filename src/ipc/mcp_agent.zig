@@ -43,6 +43,8 @@ const launch = @import("../agent/launch.zig");
 const screen_source = @import("../agent/screen_source.zig");
 const opencode = @import("../agent/opencode.zig");
 const retry_mod = @import("../agent/retry.zig");
+const brief = @import("../agent/brief.zig");
+const mcpassets = @import("mcpassets.zig");
 const wire = @import("../mux/wire.zig");
 const Screen = @import("../grid/screen.zig").Screen;
 const clock = @import("../util/clock.zig");
@@ -134,6 +136,7 @@ pub const INSTRUCTIONS =
     "A wake-up the waiter printed is not repeated by agent_* results, so read the agent afterwards. " ++
     "agent_send to a busy agent queues the prompt for its next turn without interrupting it (interrupt:true stops it first; agents:[...] sends to several at once), and agent_answer takes text when a prompt's right answer is none of its options. " ++
     "agent_read final:true returns just the newest job's last message, and agent_list is compact unless detail:true. " ++
+    "Rules every brief repeats belong in a template (agent_template_save, then template + vars on agent_send/agent_open). " ++
     "agent_open returns an id; after a restart, agent_attach {agent: id} resumes it, and relaunch:true starts a gone one again under the same id.";
 
 // ── state ────────────────────────────────────────────────────────
@@ -644,7 +647,7 @@ fn serviceRetry(e: *Entry, now_ms: i64) !void {
     state.retry_busy = true;
     defer state.retry_busy = false;
     const from = q.next_seq;
-    switch (try submitPrompt(arena, e, prompt, clock.nowMs() + STEP_WAIT_MS, true)) {
+    switch (try submitPrompt(arena, e, .{ .text = prompt }, clock.nowMs() + STEP_WAIT_MS, true)) {
         .ok => e.retry.sent(from),
         .fail => |f| {
             e.retry.abandon(q);
@@ -1511,6 +1514,9 @@ pub fn agentTool(arena: std.mem.Allocator, tool: Tool, args: std.json.Value) ![]
         .agent_set => withEntry(arena, args, setTool),
         .agent_interrupt => withEntry(arena, args, interruptTool),
         .agent_close => withEntry(arena, args, closeTool),
+        .agent_template_save => templateSaveTool(arena, args),
+        .agent_templates => templatesTool(arena, args),
+        .agent_template_delete => templateDeleteTool(arena, args),
     };
 }
 
@@ -1669,6 +1675,8 @@ const Watch = struct {
     any: []const []const u8 = &.{},
     /// How the command wakes on several: the first of any, or once all settled.
     several: agentwait.Several = .any,
+    /// The template the call's prompt was rendered from (the `template` fact).
+    template: ?[]const u8 = null,
 };
 
 /// The facts and prose every per-agent result shares, then the payload
@@ -1742,6 +1750,7 @@ fn finish(arena: std.mem.Allocator, res: *Res, e: *Entry, dv: Delivered, watch: 
                 try res.text("still working when the wait ran out: run watch_command in the background (or as a Monitor with --follow) to be woken instead of polling");
         }
     } else try res.textf("{s}: state {s}", .{ e.id, @tagName(st) });
+    if (watch.template) |x| try res.fact("template", x);
 
     try res.raw("events", try toJson(arena, try eventsJson(arena, dv.items)));
     if (dv.digest) |g| {
@@ -1972,7 +1981,7 @@ const OpenOpts = struct {
     effort: ?[]const u8,
     /// Absolute; null with a host until the probe names the remote home.
     cwd: ?[]const u8,
-    prompt: ?[]const u8,
+    prompt: ?Prompt,
     /// An existing conversation of the app to continue (`agent_open resume`).
     resume_id: ?[]const u8 = null,
     cols: u16,
@@ -2114,11 +2123,7 @@ fn openOpts(arena: std.mem.Allocator, args: std.json.Value, loaded: *const adapt
         const p = c.getcwd(&buf, buf.len) orelse break :blk "/";
         break :blk try arena.dupe(u8, std.mem.span(@as([*:0]const u8, @ptrCast(p))));
     };
-    const prompt = argStr(args, "prompt");
-    if (prompt) |p| if (std.mem.trim(u8, p, " \t\r\n").len == 0) {
-        why.* = .{ .code = .invalid_args, .msg = "prompt is empty" };
-        return error.Refused;
-    };
+    const prompt = try promptFrom(arena, args, "prompt", why);
     const name = argStr(args, "name");
     if (name) |n| {
         if (!agentindex.validName(n)) {
@@ -2236,7 +2241,7 @@ fn openTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
             dv = try pending(arena, e);
         }
     } else dv = try pending(arena, e);
-    return openResult(arena, e, ready, sent, notes.items, dv, filter, &facts);
+    return openResult(arena, e, ready, sent, notes.items, dv, .{ .filter = filter, .template = if (o.prompt) |p| p.template else null }, &facts);
 }
 
 /// The bounds of a start (`startAgent`).
@@ -2386,7 +2391,7 @@ fn localVersion(arena: std.mem.Allocator, l: adapter.Launch, binary: []const u8)
 }
 
 /// agent_open's result: the launch facts, then every per-agent fact.
-fn openResult(arena: std.mem.Allocator, e: *Entry, ready: bool, sent: bool, notes: []const []const u8, dv: Delivered, filter: events.Filter, lf: *const LaunchFacts) ![]const u8 {
+fn openResult(arena: std.mem.Allocator, e: *Entry, ready: bool, sent: bool, notes: []const []const u8, dv: Delivered, watch: Watch, lf: *const LaunchFacts) ![]const u8 {
     var res = Res.init(arena);
     if (e.host) |h|
         try res.textf("opened {s} ({s}) on {s} over {s} in session {s}", .{ e.id, e.loaded.spec.name, h, @tagName(e.transport), e.session })
@@ -2426,7 +2431,7 @@ fn openResult(arena: std.mem.Allocator, e: *Entry, ready: bool, sent: bool, note
     var extra: std.ArrayList(Block) = .empty;
     try extra.append(arena, .{ .name = "binary", .body = e.binary });
     if (notes.len > 0) try extra.append(arena, .{ .name = "notes", .body = try std.mem.join(arena, "\n", notes) });
-    return finish(arena, &res, e, dv, .{ .filter = filter }, extra.items);
+    return finish(arena, &res, e, dv, watch, extra.items);
 }
 
 fn randomHex(a: std.mem.Allocator, comptime nbytes: usize) ![]u8 {
@@ -2949,14 +2954,148 @@ fn busy(arena: std.mem.Allocator, e: *Entry) !?Fail {
     };
 }
 
+// ── prompts from templates ───────────────────────────────────────
+
+/// A prompt as typed: the caller's text and/or a rendered template.
+const Prompt = struct {
+    text: []const u8,
+    /// The template it was rendered from (results name it, never echo it).
+    template: ?[]const u8 = null,
+};
+
+fn refuse(why: *Fail, code: mcp.ErrCode, msg: []const u8) error{Refused} {
+    why.* = .{ .code = code, .msg = msg };
+    return error.Refused;
+}
+
+/// A stored template, checked as at save.
+/// @throws Refused with `why` set.
+fn loadTemplate(arena: std.mem.Allocator, name: []const u8, why: *Fail) !brief.Template {
+    if (!mcpassets.validName(name)) return refuse(why, .invalid_args, TEMPLATE_NAME_RULE);
+    const bytes = mcpassets.load(arena, .agent_template, name) catch |err| return switch (err) {
+        error.NotFound => refuse(why, .not_found, try std.fmt.allocPrint(arena, "no template '{s}' (agent_templates lists them)", .{name})),
+        error.OutOfMemory => error.OutOfMemory,
+        else => refuse(why, .io_failed, try std.fmt.allocPrint(arena, "cannot read template '{s}': {s}", .{ name, @errorName(err) })),
+    };
+    var r: brief.Refusal = undefined;
+    return (try brief.parseStored(arena, name, bytes, &r)) orelse refuse(why, .failed, r.msg);
+}
+
+const TEMPLATE_NAME_RULE = "template names are 1-64 letters, digits, '.', '_' or '-', not starting with '.'";
+
+/// The prompt `args` carry: `key` and/or `template` + `vars` (the caller's
+/// text after the rendered template); null when neither is given.
+/// @throws Refused with `why` set.
+fn promptFrom(arena: std.mem.Allocator, args: std.json.Value, key: []const u8, why: *Fail) !?Prompt {
+    const text = argStr(args, key);
+    if (text) |x| if (std.mem.trim(u8, x, " \t\r\n").len == 0)
+        return refuse(why, .invalid_args, try std.fmt.allocPrint(arena, "{s} is empty", .{key}));
+    const name = argStr(args, "template");
+    const vars = mcp.argValue(args, "vars");
+    if (name == null and vars != null) return refuse(why, .invalid_args, "vars fills a template: pass 'template' with it");
+    const tpl: ?brief.Template = if (name) |n| try loadTemplate(arena, n, why) else null;
+    if (text == null and tpl == null) return null;
+    var body: []const u8 = text orelse "";
+    if (tpl) |t| {
+        var r: brief.Refusal = undefined;
+        const rendered = (try brief.render(arena, t, vars, &r)) orelse return refuse(why, .invalid_args, r.msg);
+        body = if (text) |x| try std.mem.concat(arena, u8, &.{ rendered, "\n\n", x }) else rendered;
+    }
+    return .{ .text = body, .template = name };
+}
+
+fn templateSaveTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
+    const name = argStr(args, "name") orelse return errRes(arena, .invalid_args, "agent_template_save needs 'name'");
+    if (!mcpassets.validName(name)) return errRes(arena, .invalid_args, TEMPLATE_NAME_RULE);
+    const text = argStr(args, "text") orelse return errRes(arena, .invalid_args, "agent_template_save needs 'text'");
+    var r: brief.Refusal = undefined;
+    const tpl = (try brief.build(arena, name, text, mcp.argValue(args, "vars"), argStr(args, "description"), &r)) orelse
+        return errRes(arena, .invalid_args, r.msg);
+    const replaced = if (mcpassets.load(arena, .agent_template, name)) |_| true else |_| false;
+    mcpassets.save(arena, .agent_template, name, try brief.serialize(arena, tpl)) catch |err|
+        return errRes(arena, .io_failed, try std.fmt.allocPrint(arena, "cannot save template '{s}': {s}", .{ name, @errorName(err) }));
+    var names: std.ArrayList([]const u8) = .empty;
+    for (tpl.vars) |v| try names.append(arena, v.name);
+    var res = Res.init(arena);
+    try res.textf("{s} template '{s}' (variables: {s}); agent_send or agent_open take it as template", .{ if (replaced) "replaced" else "saved", name, try brief.varNames(arena, tpl.vars) });
+    try res.fact("template", name);
+    try res.fact("vars", names.items);
+    try res.fact("replaced", replaced);
+    return res.finish();
+}
+
+const TemplateItem = struct {
+    name: []const u8,
+    description: ?[]const u8 = null,
+    vars: []const []const u8,
+};
+
+fn templatesTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
+    var why: Fail = undefined;
+    if (argStr(args, "name")) |name| {
+        const tpl = loadTemplate(arena, name, &why) catch |err| switch (err) {
+            error.Refused => return errRes(arena, why.code, why.msg),
+            else => return err,
+        };
+        var vars: std.json.ObjectMap = .empty;
+        for (tpl.vars) |v| try vars.put(arena, v.name, if (v.default) |d| .{ .string = d } else .null);
+        var res = Res.init(arena);
+        try res.textf("template '{s}': variables {s}", .{ name, try brief.varNames(arena, tpl.vars) });
+        try res.fact("name", name);
+        if (tpl.description) |d| try res.fact("description", d);
+        try res.fact("text", tpl.text);
+        try res.raw("vars", try toJson(arena, std.json.Value{ .object = vars }));
+        if (tpl.description) |d| try block(&res, .{ .name = "description", .body = d });
+        try block(&res, .{ .name = "text", .body = tpl.text });
+        return res.finish();
+    }
+    const names = mcpassets.list(arena, .agent_template) catch |err|
+        return errRes(arena, .io_failed, try std.fmt.allocPrint(arena, "cannot list templates: {s}", .{@errorName(err)}));
+    var items: std.ArrayList(TemplateItem) = .empty;
+    var problems: std.ArrayList([]const u8) = .empty;
+    var res = Res.init(arena);
+    for (names) |n| {
+        const tpl = loadTemplate(arena, n, &why) catch |err| switch (err) {
+            error.Refused => {
+                try problems.append(arena, why.msg);
+                continue;
+            },
+            else => return err,
+        };
+        var vn: std.ArrayList([]const u8) = .empty;
+        for (tpl.vars) |v| try vn.append(arena, v.name);
+        try items.append(arena, .{ .name = n, .description = tpl.description, .vars = vn.items });
+    }
+    try res.textf("{d} template(s){s}", .{ items.items.len, if (problems.items.len > 0) " and stored files that do not load (problems)" else "" });
+    for (items.items) |it| try res.textf("{s}: variables {s}", .{ it.name, if (it.vars.len == 0) "none" else try std.mem.join(arena, ", ", it.vars) });
+    try res.raw("templates", try toJson(arena, items.items));
+    try res.fact("count", items.items.len);
+    try res.fact("problems", problems.items);
+    return res.finish();
+}
+
+fn templateDeleteTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
+    const name = argStr(args, "name") orelse return errRes(arena, .invalid_args, "agent_template_delete needs 'name'");
+    if (!mcpassets.validName(name)) return errRes(arena, .invalid_args, TEMPLATE_NAME_RULE);
+    mcpassets.delete(arena, .agent_template, name) catch |err| return switch (err) {
+        error.NotFound => errRes(arena, .not_found, try std.fmt.allocPrint(arena, "no template '{s}' (agent_templates lists them)", .{name})),
+        else => errRes(arena, .io_failed, try std.fmt.allocPrint(arena, "cannot delete template '{s}': {s}", .{ name, @errorName(err) })),
+    };
+    var res = Res.init(arena);
+    try res.textf("deleted template '{s}'", .{name});
+    try res.fact("template", name);
+    try res.fact("deleted", true);
+    return res.finish();
+}
+
 const Sent = union(enum) { ok: Delivered, fail: Fail };
 
 /// @param no_queue a busy agent is refused instead of queued (agent_send
 /// interrupt: it was stopped for this prompt).
-fn submitAndWait(arena: std.mem.Allocator, e: *Entry, text: []const u8, filter: events.Filter, deadline: i64, no_queue: bool) !Sent {
+fn submitAndWait(arena: std.mem.Allocator, e: *Entry, p: Prompt, filter: events.Filter, deadline: i64, no_queue: bool) !Sent {
     service(clock.nowMs());
     const pre = try e.cursor.take(e.agent.queue(), .{}, clock.nowMs(), arena);
-    const queued = switch (try submitPrompt(arena, e, text, deadline, no_queue)) {
+    const queued = switch (try submitPrompt(arena, e, p, deadline, no_queue)) {
         .fail => |f| return .{ .fail = f },
         .ok => |q| q,
     };
@@ -2972,7 +3111,8 @@ fn submitAndWait(arena: std.mem.Allocator, e: *Entry, text: []const u8, filter: 
 /// while it works (unless `no_queue`); `ok` says whether it was queued.
 /// The recipe's keys get at least `STEP_WAIT_MS` to land even when the
 /// caller does not wait for the turn.
-fn submitPrompt(arena: std.mem.Allocator, e: *Entry, text: []const u8, deadline: i64, no_queue: bool) !Submitted {
+fn submitPrompt(arena: std.mem.Allocator, e: *Entry, p: Prompt, deadline: i64, no_queue: bool) !Submitted {
+    const text = p.text;
     // The caller's own prompt starts a new job: a new retry budget.
     if (!state.retry_busy) e.retry.newPrompt();
     _ = waitReady(e, deadline);
@@ -3393,16 +3533,16 @@ fn optionList(arena: std.mem.Allocator, it: ?output.Interaction) ![]const u8 {
 // ── agent_send / agent_wait / agent_answer / agent_set / ... ─────
 
 /// agent_send's `text`, or why it is refused.
-fn sendText(args: std.json.Value) union(enum) { ok: []const u8, fail: []const u8 } {
-    const text = argStr(args, "text") orelse return .{ .fail = "agent_send needs 'text'" };
-    if (std.mem.trim(u8, text, " \t\r\n").len == 0) return .{ .fail = "text is empty" };
-    return .{ .ok = text };
+/// agent_send's prompt: `text` and/or `template`.
+fn sendPrompt(arena: std.mem.Allocator, args: std.json.Value, why: *Fail) !Prompt {
+    return (try promptFrom(arena, args, "text", why)) orelse refuse(why, .invalid_args, "agent_send needs 'text' or 'template'");
 }
 
 fn sendTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]const u8 {
-    const text = switch (sendText(args)) {
-        .fail => |m| return errRes(arena, .invalid_args, m),
-        .ok => |t| t,
+    var why: Fail = undefined;
+    const text = sendPrompt(arena, args, &why) catch |err| switch (err) {
+        error.Refused => return errRes(arena, why.code, why.msg),
+        else => return err,
     };
     const filter = filterFrom(args);
     const interrupt = argBool(args, "interrupt");
@@ -3422,7 +3562,7 @@ fn sendTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]const 
             if (stop[0].queued_dropped > 0) try res.fact("queued_dropped", stop[0].queued_dropped);
             if (stop[0].interrupted) try res.textf("{s} was busy: interrupted it first, then sent the prompt as a new one{s}", .{ e.id, if (stop[0].queued_dropped > 0) " (its app dropped the prompts it held queued)" else "" });
             if (queued) try res.textf("{s} was busy: the prompt went into its queue for its next turn", .{e.id});
-            return finish(arena, &res, e, dv, .{ .filter = filter }, &.{});
+            return finish(arena, &res, e, dv, .{ .filter = filter, .template = text.template }, &.{});
         },
     }
 }
@@ -3446,9 +3586,10 @@ const SendResult = struct {
 /// ones first with `interrupt`), one result per agent; a failure is that
 /// agent's, never the call's. It does not wait for the turns.
 fn sendManyTool(arena: std.mem.Allocator, args: std.json.Value, list: []const std.json.Value) ![]const u8 {
-    const text = switch (sendText(args)) {
-        .fail => |m| return errRes(arena, .invalid_args, m),
-        .ok => |t| t,
+    var why: Fail = undefined;
+    const text = sendPrompt(arena, args, &why) catch |err| switch (err) {
+        error.Refused => return errRes(arena, why.code, why.msg),
+        else => return err,
     };
     if (list.len == 0) return errRes(arena, .invalid_args, "agents is empty: name at least one agent");
     if (list.len > MAX_ANY) return errRes(arena, .invalid_args, try std.fmt.allocPrint(arena, "agents names at most {d} agents", .{MAX_ANY}));
@@ -3506,6 +3647,7 @@ fn sendManyTool(arena: std.mem.Allocator, args: std.json.Value, list: []const st
     try res.raw("results", try toJson(arena, results.items));
     try res.fact("count", results.items.len);
     try res.fact("failed", failed);
+    if (text.template) |x| try res.fact("template", x);
     for (results.items) |r| {
         if (r.@"error") |er|
             try res.textf("{s}: failed ({s}): {s}", .{ if (r.agent.len > 0) r.agent else "?", er.code, er.message })
@@ -5827,7 +5969,7 @@ test "every agent tool answers in its declared shape: a scripted Claude Code on 
     // agent_open's own facts around the same per-agent ones.
     const e = state.entries.items[0];
     const dv = try combine(a, null, null, true, true);
-    const opened = try shaped(a, "agent_open", try openResult(a, e, true, false, &.{"a note"}, dv, .{ .match = "x" }, &.{ .version = "9.9 (x)" }));
+    const opened = try shaped(a, "agent_open", try openResult(a, e, true, false, &.{"a note"}, dv, .{ .filter = .{ .match = "x" } }, &.{ .version = "9.9 (x)" }));
     try testing.expect(!opened.get("prompt_sent").?.bool);
     try testing.expectEqualStrings("9.9 (x)", opened.get("binary_version").?.string);
     try testing.expectEqual(@as(usize, 0), opened.get("path_prepend").?.array.items.len);

@@ -6131,9 +6131,22 @@ fn fakeClaude(allocator: std.mem.Allocator, args: []const [*:0]const u8) u8 {
     }
 }
 
+/// The smoke brief template's marker, which no result may echo.
+const BRIEF_MARK = "RULES-BLOCK-7 ";
+
+/// A rendered smoke brief without its marker, so a fake agent's answer
+/// proves the substitution without echoing the prompt.
+fn briefTail(text: []const u8) ?[]const u8 {
+    const at = std.mem.indexOf(u8, text, BRIEF_MARK) orelse return null;
+    return text[at + BRIEF_MARK.len ..];
+}
+
+/// Redraw the input box on its one row: a long prompt (a rendered template)
+/// shows its tail, as a real one-row box scrolls, instead of wrapping rows
+/// of stale copies onto the screen.
 fn fcInput(text: []const u8) void {
     writeOut("\r\x1b[2K$ ");
-    writeOut(text);
+    writeOut(text[text.len -| 100..]);
 }
 
 fn fcSchedule(allocator: std.mem.Allocator, steps: *std.ArrayList(FcStep), delay_ms: i64, bytes: []const u8, picker: bool) void {
@@ -6180,7 +6193,10 @@ fn fcTurn(allocator: std.mem.Allocator, steps: *std.ArrayList(FcStep), text: []c
                 if (std.mem.startsWith(u8, l, "you: ")) break :blk std.fmt.allocPrint(a, "first prompt was: {s}", .{l["you: ".len..]}) catch return;
             }
             break :blk "first prompt was: (none)";
-        } else std.fmt.allocPrint(a, "echo: {s}", .{text}) catch return;
+        } else if (briefTail(text)) |tail|
+            std.fmt.allocPrint(a, "brief: {s}", .{tail}) catch return
+        else
+            std.fmt.allocPrint(a, "echo: {s}", .{text}) catch return;
         {
             const f = c.fopen(conv_path.ptr, "a");
             if (f) |file| {
@@ -6292,6 +6308,10 @@ const FakeOc = struct {
                 self.status(300, "idle");
             } else if (std.mem.indexOf(u8, text, "permission") != null) {
                 self.ev(200, "{{\"type\":\"permission.asked\",\"properties\":{{\"id\":\"per_{d}\",\"sessionID\":\"" ++ SES ++ "\",\"permission\":\"bash\",\"patterns\":[\"rm notes.md\"]}}}}", .{n});
+            } else if (briefTail(text)) |tail| {
+                const reply = std.fmt.allocPrint(a, "brief: {s}", .{tail}) catch return .{ .status = 500 };
+                self.answer(200, id1, reply);
+                self.status(300, "idle");
             } else if (std.mem.indexOf(u8, text, "two messages") != null) {
                 self.answer(200, id1, "alpha one");
                 const id2 = std.fmt.allocPrint(a, "msg_a{d}_2", .{n}) catch return .{ .status = 500 };
@@ -7372,6 +7392,71 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
         m.closeStdinWait();
         say("smoke-mcp: agents: permissions (claude --settings, opencode config merged, refusals) and retry on overload (recovered, gave up, off) ok");
     }
+
+    // ── brief templates ───────────────────────────────────────────────
+    {
+        var m = Mcp.spawn(allocator, exe, &.{});
+        m.initialize();
+        const caps = agentCall(&m, arena, "capabilities", "{}", "capabilities templates", false, 15_000);
+        if (!caps.get("agent_templates").?.bool) fail("capabilities: agent_templates is false");
+
+        // Refusals: a name is refused, never cleaned up; a lone brace is
+        // refused with what is wrong.
+        _ = agentCall(&m, arena, "agent_template_save", "{\"name\":\"a b\",\"text\":\"x\"}", "template bad name", true, 15_000);
+        _ = agentCall(&m, arena, "agent_template_save", "{\"name\":\"t\",\"text\":\"json {\\\"a\\\":1}\"}", "template lone brace", true, 15_000);
+
+        const saved = agentCall(&m, arena, "agent_template_save", "{\"name\":\"smoke-brief\",\"description\":\"smoke brief\",\"text\":\"" ++ BRIEF_MARK ++ "for {target}: {task} {{literal}}\",\"vars\":{\"target\":\"the repo\"}}", "template save", false, 15_000);
+        if (saved.get("vars").?.array.items.len != 2 or saved.get("replaced").?.bool) fail("template save: wrong facts");
+        const listed = agentCall(&m, arena, "agent_templates", "{}", "templates list", false, 15_000);
+        if (listed.get("count").?.integer != 1) fail("agent_templates: not one template");
+        const item = listed.get("templates").?.array.items[0].object;
+        if (!std.mem.eql(u8, item.get("name").?.string, "smoke-brief") or item.get("vars").?.array.items.len != 2) fail("agent_templates: wrong item");
+        const shown = agentCall(&m, arena, "agent_templates", "{\"name\":\"smoke-brief\"}", "templates show", false, 15_000);
+        expectFact(shown, "text", BRIEF_MARK ++ "for {target}: {task} {{literal}}", "agent_templates name: text");
+        const sv = shown.get("vars").?.object;
+        if (!std.mem.eql(u8, sv.get("target").?.string, "the repo") or sv.get("task").? != .null) fail("agent_templates name: vars and defaults differ");
+
+        // Claude Code: refusals by name, then a rendered brief.
+        _ = agentCall(&m, arena, "agent_open", std.fmt.allocPrint(arena, "{{\"app\":\"claude\",\"name\":\"brief-claude\",\"binary\":{s},\"timeout_ms\":30000}}", .{bin_json}) catch fail("oom"), "agent_open brief-claude", false, 45_000);
+        const missing = agentCall(&m, arena, "agent_send", "{\"agent\":\"brief-claude\",\"template\":\"smoke-brief\"}", "template missing var", true, 15_000);
+        if (std.mem.indexOf(u8, missing.get("error").?.object.get("message").?.string, "'task'") == null) fail("template send: the refusal does not name the missing variable");
+        const unknown = agentCall(&m, arena, "agent_send", "{\"agent\":\"brief-claude\",\"template\":\"smoke-brief\",\"vars\":{\"task\":\"x\",\"bogus\":\"y\"}}", "template unknown var", true, 15_000);
+        if (std.mem.indexOf(u8, unknown.get("error").?.object.get("message").?.string, "'bogus'") == null) fail("template send: the refusal does not name the unknown variable");
+        _ = agentCall(&m, arena, "agent_send", "{\"agent\":\"brief-claude\",\"template\":\"no-such\",\"vars\":{\"task\":\"x\"}}", "template not found", true, 15_000);
+        _ = agentCall(&m, arena, "agent_send", "{\"agent\":\"brief-claude\",\"vars\":{\"task\":\"x\"}}", "vars without template", true, 15_000);
+
+        const good = agentCall(&m, arena, "agent_send", "{\"agent\":\"brief-claude\",\"template\":\"smoke-brief\",\"vars\":{\"task\":\"fix-it\"},\"timeout_ms\":20000}", "claude brief", false, 45_000);
+        expectBrief(arena, good, "brief: for the repo: fix-it {literal}", "claude brief");
+        const plain = agentCall(&m, arena, "agent_send", "{\"agent\":\"brief-claude\",\"text\":\"hello again\",\"timeout_ms\":20000}", "claude plain after brief", false, 45_000);
+        expectFact(plain, "outcome", "done", "claude plain after brief: outcome");
+        if (plain.get("template") != null) fail("a plain prompt after a templated one names a template");
+        _ = agentCall(&m, arena, "agent_close", "{\"agent\":\"brief-claude\"}", "agent_close brief-claude", false, 15_000);
+
+        // opencode: the template on agent_open's prompt, a default overridden.
+        const oc = agentCall(&m, arena, "agent_open", std.fmt.allocPrint(arena, "{{\"app\":\"opencode\",\"name\":\"brief-oc\",\"binary\":{s},\"template\":\"smoke-brief\",\"vars\":{{\"task\":\"ship-it\",\"target\":\"the docs\"}},\"timeout_ms\":30000}}", .{bin_json}) catch fail("oom"), "opencode brief", false, 45_000);
+        expectBrief(arena, oc, "brief: for the docs: ship-it {literal}", "opencode brief");
+        _ = agentCall(&m, arena, "agent_close", "{\"agent\":\"brief-oc\"}", "agent_close brief-oc", false, 15_000);
+
+        const del = agentCall(&m, arena, "agent_template_delete", "{\"name\":\"smoke-brief\"}", "template delete", false, 15_000);
+        if (!del.get("deleted").?.bool) fail("agent_template_delete: not deleted");
+        _ = agentCall(&m, arena, "agent_template_delete", "{\"name\":\"smoke-brief\"}", "template delete again", true, 15_000);
+        if (agentCall(&m, arena, "agent_templates", "{}", "templates after delete", false, 15_000).get("count").?.integer != 0) fail("agent_templates: the deleted template is still listed");
+        m.closeStdinWait();
+        say("smoke-mcp: agents: brief templates (save, list, show, delete, refusals; claude and opencode) ok");
+    }
+}
+
+/// A done result of a templated prompt: the agent's answer to the rendered
+/// brief, the template fact, and never the rendered prompt itself.
+fn expectBrief(arena: std.mem.Allocator, o: std.json.ObjectMap, answer: []const u8, comptime what: []const u8) void {
+    expectFact(o, "outcome", "done", what ++ ": outcome");
+    const all = std.json.Stringify.valueAlloc(arena, std.json.Value{ .object = o }, .{}) catch fail("oom");
+    if (std.mem.indexOf(u8, all, BRIEF_MARK) != null) {
+        say(all);
+        fail(what ++ ": the rendered prompt was echoed");
+    }
+    expectFact(o, "message", answer, what ++ ": message");
+    expectFact(o, "template", "smoke-brief", what ++ ": template");
 }
 
 // ── sub-agents on an SSH host: both transports, a faked remote ──────

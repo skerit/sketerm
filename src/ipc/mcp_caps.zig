@@ -478,6 +478,7 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
         try res.fact("agent_send_queue", agents_ok);
         try res.fact("agent_answer_text", agents_ok);
         try res.fact("agent_permissions", agents_ok);
+        try res.fact("agent_templates", agents_ok);
         {
             const retry = @import("../agent/retry.zig");
             const vocab_r = @import("../agent/vocab.zig");
@@ -511,6 +512,7 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
             try res.text("agent_send to a busy agent queues the prompt in its app for the next turn (outcome queued) unless interrupt, agents sends to several in one call, and agent_answer takes free text where the prompt allows it");
             try res.text("agent_read final returns just the newest job's last message, agent_list is compact unless detail, and agent_attach relaunch starts a gone agent again under its id");
             try res.text("agent_open takes permissions (name to allow/ask/deny, mapped to each app's own mechanism) and retry_on_overload (continue a turn a provider overload ended, off by default); a lost remote link that comes back to find the session gone ends the agent as exited, relaunchable");
+            try res.text("agent_template_save keeps named briefs (placeholders in braces) that agent_send and agent_open take as template + vars");
             if (mcp_agent.state.push == .channel)
                 try res.text("agent events are pushed into this session as Claude Code channel messages: end your turn after delegating instead of running watch_command")
             else if (mcp_agent.followers() > 0)

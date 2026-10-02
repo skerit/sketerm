@@ -1,5 +1,6 @@
-//! Persistent MCP assets: named screenshot templates (PNG) and named
-//! input macros (JSON step lists) under $XDG_STATE_HOME/sketerm.
+//! Persistent MCP assets: named screenshot templates (PNG), named input
+//! macros (JSON step lists) and sub-agent brief templates (JSON,
+//! `agent/brief.zig`) under $XDG_STATE_HOME/sketerm.
 //! Shared across MCP instances deliberately — a macro recorded in one
 //! session must replay in the next (that is the whole point).
 //!
@@ -16,18 +17,21 @@ pub const Error = error{ BadName, NotFound, TooBig, IoFailed, OutOfMemory };
 pub const Kind = enum {
     template,
     macro,
+    /// Sub-agent brief templates (`agent/brief.zig`).
+    agent_template,
 
     fn dir(self: Kind) []const u8 {
         return switch (self) {
             .template => "templates",
             .macro => "macros",
+            .agent_template => "agent-templates",
         };
     }
 
     fn ext(self: Kind) []const u8 {
         return switch (self) {
             .template => ".png",
-            .macro => ".json",
+            .macro, .agent_template => ".json",
         };
     }
 };
@@ -171,6 +175,9 @@ test "save/load/list/delete round-trip in an isolated state dir" {
         if (std.fmt.bufPrintZ(&zbuf, "{s}/sketerm/macros", .{dir})) |macros| {
             _ = c.rmdir(macros.ptr);
         } else |_| {}
+        if (std.fmt.bufPrintZ(&zbuf, "{s}/sketerm/agent-templates", .{dir})) |tpls| {
+            _ = c.rmdir(tpls.ptr);
+        } else |_| {}
         if (std.fmt.bufPrintZ(&zbuf, "{s}/sketerm", .{dir})) |root| {
             _ = c.rmdir(root.ptr);
         } else |_| {}
@@ -205,6 +212,23 @@ test "save/load/list/delete round-trip in an isolated state dir" {
 
     try delete(a, .macro, "walk-to-riker");
     try std.testing.expectError(Error.NotFound, load(a, .macro, "walk-to-riker"));
+
+    // Brief templates live in their own directory, by the same rules.
+    try save(a, .agent_template, "review", "{\"text\":\"r\"}");
+    const tpl_path = try assetPath(a, .agent_template, "review");
+    defer a.free(tpl_path);
+    try std.testing.expect(std.mem.endsWith(u8, tpl_path, "/sketerm/agent-templates/review.json"));
+    try std.testing.expect(c.stat(try pathz.pathZ(&zbuf, tpl_path), &st) == 0);
+    try std.testing.expectEqual(@as(c_uint, 0o600), @as(c_uint, @intCast(st.st_mode & 0o777)));
+    const tnames = try list(a, .agent_template);
+    defer {
+        for (tnames) |n| a.free(n);
+        a.free(tnames);
+    }
+    try std.testing.expectEqual(@as(usize, 1), tnames.len);
+    try delete(a, .agent_template, "review");
+    try std.testing.expectError(Error.NotFound, delete(a, .agent_template, "review"));
+    try std.testing.expectError(Error.BadName, save(a, .agent_template, "a b", "{}"));
     try std.testing.expectError(Error.BadName, save(a, .macro, "../evil", "x"));
 }
 
