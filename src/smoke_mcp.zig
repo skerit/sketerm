@@ -7346,10 +7346,14 @@ fn routeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
     expectFact(remote, "transport", "sketerm-mux", "route stage: the hostb agent is on hostb's daemon");
     const local_session = scStr(local, "session", "route stage: local session");
     const remote_session = scStr(remote, "session", "route stage: remote session");
+    // What still lives on the server's private instance daemon: its terminals.
+    _ = agentCall(&m, arena, "term_open", "{\"command\":[\"/bin/sh\"]}", "route stage: term_open on hosta", false, 30_000);
+    const term_prefix = std.fmt.allocPrint(arena, "mcpterm-{d}-", .{m.pid}) catch fail("oom");
 
     // ── from here: hosta's daemon reports the assistant and both agents ──
     const Report = @import("ipc/mcp_registry.zig").Report;
     var instance_key: []const u8 = "";
+    var local_route: [:0]const u8 = "";
     {
         var conn = muxclient.Conn.connectRemote(allocator, "ssh:hosta", .{}) catch fail("route stage: ssh to hosta");
         defer conn.deinit();
@@ -7383,20 +7387,33 @@ fn routeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
                 say(route);
                 fail("route stage: the derived watch route is wrong");
             }
+            if (std.mem.eql(u8, ag.sessions[0], local_session)) {
+                // A local agent lives on hosta's per-user daemon.
+                if (!std.mem.eql(u8, ag.location, "user")) fail("route stage: the report does not place the hosta agent on the per-user daemon");
+                local_route = arena.dupeZ(u8, route) catch fail("oom");
+            }
         }
         say("smoke-mcp: route stage: hosta's daemon reports the assistant, both agents and their locations");
     }
 
-    // ── the CLI takes a route as its host ──
+    // ── the CLI takes a route as its host: the agent's derived one, and
+    // the instance route to the server's own daemon, which holds its
+    // terminals and no longer its agents ──
     const inst_route = std.fmt.allocPrintSentinel(arena, "route:hosta#{s}", .{instance_key}, 0) catch fail("oom");
     {
         var out_buf: [16 * 1024]u8 = undefined;
         var status: c_int = 0;
+        const argv_user = [_]?[*:0]const u8{ exe, "mux", local_route.ptr, "list", null };
+        const out_user = runCapture(&argv_user, &out_buf, &status, 60_000);
+        if (status != 0 or std.mem.indexOf(u8, out_user, local_session) == null) {
+            say(out_user);
+            fail("route stage: `sketerm mux <agent route> list` did not list the hosta agent");
+        }
         const argv = [_]?[*:0]const u8{ exe, "mux", inst_route.ptr, "list", null };
         const out = runCapture(&argv, &out_buf, &status, 60_000);
-        if (status != 0 or std.mem.indexOf(u8, out, local_session) == null) {
+        if (status != 0 or std.mem.indexOf(u8, out, term_prefix) == null or std.mem.indexOf(u8, out, local_session) != null) {
             say(out);
-            fail("route stage: `sketerm mux <route> list` did not list the instance's agent");
+            fail("route stage: `sketerm mux <instance route> list` did not list exactly the instance's terminal");
         }
         const argv2 = [_]?[*:0]const u8{ exe, "mux", "route:hosta#nosuch", "list", null };
         const out2 = runCapture(&argv2, &out_buf, &status, 60_000);
@@ -7407,7 +7424,7 @@ fn routeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
     }
 
     // ── watch along both routes ──
-    watchAlong(allocator, inst_route, local_session, "via hosta", "route stage: hosta instance");
+    watchAlong(allocator, local_route, local_session, "via hosta", "route stage: hosta per-user daemon");
     watchAlong(allocator, "route:hosta/hostb", remote_session, "via hostb", "route stage: hosta -> hostb");
     say("smoke-mcp: route stage: both agents listed, attached, read and typed into along their routes");
 
@@ -7418,8 +7435,10 @@ fn routeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
     expectRouteRefused(allocator, "route:hosta/oldhost#x", error.RouteHopTooOld, "sketerm-mux on oldhost is too old for routes", "route stage: an old later hop");
     expectRouteRefused(allocator, "route:hosta/nohost", error.RouteHopUnreachable, "Could not resolve hostname nohost", "route stage: an unreachable hop");
 
-    _ = agentCall(&m, arena, "agent_close", "{\"agent\":\"claude-2\"}", "route stage: close hostb agent", false, 15_000);
-    _ = agentCall(&m, arena, "agent_close", "{\"agent\":\"claude-1\"}", "route stage: close hosta agent", false, 15_000);
+    const close_remote = std.fmt.allocPrint(arena, "{{\"agent\":\"{s}\"}}", .{scStr(remote, "agent", "route stage: hostb agent id")}) catch fail("oom");
+    _ = agentCall(&m, arena, "agent_close", close_remote, "route stage: close hostb agent", false, 15_000);
+    const close_local = std.fmt.allocPrint(arena, "{{\"agent\":\"{s}\"}}", .{scStr(local, "agent", "route stage: hosta agent id")}) catch fail("oom");
+    _ = agentCall(&m, arena, "agent_close", close_local, "route stage: close hosta agent", false, 15_000);
     m.closeStdinWait();
 }
 
