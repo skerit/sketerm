@@ -1,5 +1,51 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-02: restricted headless rendering and native media emulation
+
+`policy.untrusted:true` selects a Linux-only, direct-route, ephemeral helper.
+Browser processes cannot create Internet sockets; a separate HTTP broker
+validates each actual resolved address and port. Native CEF initiator metadata
+governs request authority. Unsupported cross-origin fetch/image/media/worker
+lanes and non-navigation redirects fail closed; public CDN scripts, styles and
+fonts require wildcard CORS authorization and matching MIME, without cookies.
+Worker CSP, context permissions, background-load denial and native feature
+restrictions replace page-world guards. The private-address opt-in remains
+explicit; native loader and protocol limits are reported by `web_policy`.
+
+An independent subreaper owns the private root
+(`$XDG_RUNTIME_DIR/sketerm/u/<16 hex>`, which also holds the browser's HOME,
+TMPDIR and XDG dirs), retires every descendant before deletion, and survives
+browser crashes and MCP-parent death; deletion is bounded and a later
+supervisor sweeps what a failed one left. Untrusted renderers run Chromium's
+own namespace + seccomp-bpf sandbox (ordinary helpers still do not). That
+forced one design change: a non-dumpable process cannot map the sandbox's
+user namespace, so cores are stopped by the inherited `RLIMIT_CORE=0` and
+the browser/renderers turn nondumpable only after their sandbox exists.
+The broker queues loads past 16 (up to 256) instead of failing them, counts
+its 15s deadline from open, refuses this host's own interface addresses,
+and Landlock-confines each job. Policy installs and updates use correlated
+acknowledgements; a `web_policy` status read never closes a view; a full
+policy table refuses only the view that did not fit. Host/port narrowing
+preserves scheme scope and budget accounting; IP-literal entries match
+exactly. Budget-refused navigation preserves the readable document. Media
+overrides await native DevTools execution before the first requested
+document; DPR uses native geometry from 0.5 through 4.
+`capabilities.web_untrusted` is a build fact, not a property of whichever
+engine is current.
+
+Validation (2026-10-02): the full browser matrix (24 browser tests,
+including a renderer-sandbox test with an unsandboxed ordinary control, plus
+8 rig tests) and the 6 native ACK-failure tests passed on CEF 152 and the
+pinned 151. The namespace wrapper now runs the rig as the real user in a
+nested user namespace, because Chromium will not sandbox as root. Native
+loader and supervisor suites passed. Unit suites: 3,750 GUI/core tests
+(18 skips), 2,933 lean core tests (3 skips), 386 CEF tests. The mux links
+libc/libm only; musl and macOS cross-builds pass. Hardware access, GPU
+rendering, system core collectors and a sandbox escape are not claimed as
+covered; CEF sanitized clipboard writes remain permitted. The ordinary
+`smoke-web` stage-36 caret-churn failure predates this work and was not
+re-run.
+
 ## 2026-10-02: agent brief templates
 
 From the orchestrator running 8+ sub-agents: every brief repeated the same
