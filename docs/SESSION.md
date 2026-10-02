@@ -1,5 +1,21 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-02: agent brief templates
+
+From the orchestrator running 8+ sub-agents: every brief repeated the same
+~500-token rules block. `agent_template_save {name, text, vars,
+description}` stores a brief per user
+(`$XDG_STATE_HOME/sketerm/agent-templates/`, 0600, the third `mcpassets`
+kind), `agent_templates` lists or shows them, `agent_template_delete`
+removes one; `agent_send`/`agent_open` take `template` + `vars` (the
+caller's text appended after). `{var}` placeholders, `{{`/`}}` literal,
+any other brace refused at save, a missing or unknown variable
+`invalid_args` by name (`src/agent/brief.zig`). Results name the template
+and never echo the rendered prompt. Capability `agent_templates`.
+smoke-mcp's agent stage saves a template, sends it to a fake Claude Code
+and a fake opencode whose answers prove the substitution, and lists,
+shows and deletes it.
+
 ## 2026-10-02: file_sync, one directory to many hosts and clones
 
 From the same orchestrator: copying a docs directory to four hosts and
