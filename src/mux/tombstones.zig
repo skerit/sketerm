@@ -70,13 +70,7 @@ pub const Ring = struct {
     /// Remember that session `name` (lifetime `origin_id`, fixed title
     /// `title`) ended at `now_wall_ms`.
     pub fn add(self: *Ring, name: []const u8, title: []const u8, origin_id: wire.SessionOriginId, end: End, now_wall_ms: i64) void {
-        var e = Entry{ .ended_ms = now_wall_ms, .reason = end.reason, .exit_status = end.exit_status, .signal = end.signal, .origin_id = origin_id };
-        const n = @min(name.len, e.name_buf.len);
-        @memcpy(e.name_buf[0..n], name[0..n]);
-        e.name_len = @intCast(n);
-        const tn = @min(title.len, e.title_buf.len);
-        @memcpy(e.title_buf[0..tn], title[0..tn]);
-        e.title_len = @intCast(tn);
+        const e = entryOf(name, title, origin_id, end, now_wall_ms);
         if (self.len < MAX_ENTRIES) {
             self.entries[self.len] = e;
             self.len += 1;
@@ -100,6 +94,18 @@ pub const Ring = struct {
         return best;
     }
 };
+
+/// The record of a session that ended at `now_wall_ms`.
+pub fn entryOf(name: []const u8, title: []const u8, origin_id: wire.SessionOriginId, end: End, now_wall_ms: i64) Entry {
+    var e = Entry{ .ended_ms = now_wall_ms, .reason = end.reason, .exit_status = end.exit_status, .signal = end.signal, .origin_id = origin_id };
+    const n = @min(name.len, e.name_buf.len);
+    @memcpy(e.name_buf[0..n], name[0..n]);
+    e.name_len = @intCast(n);
+    const tn = @min(title.len, e.title_buf.len);
+    @memcpy(e.title_buf[0..tn], title[0..tn]);
+    e.title_len = @intCast(tn);
+    return e;
+}
 
 /// `tombstone_get` request body.
 pub const Query = struct {

@@ -6667,7 +6667,8 @@ pub const Daemon = struct {
         };
         defer parsed.deinit();
         const q = parsed.value;
-        const found = if (self.isWorker()) null else self.tombstones.find(q.name, if (q.origin_id.len > 0) q.origin_id else null, wallMs());
+        const origin: ?[]const u8 = if (q.origin_id.len > 0) q.origin_id else null;
+        const found = if (self.isWorker()) null else self.tombstones.find(q.name, origin, wallMs()) orelse self.endingWorker(q.name, origin);
         const e = found orelse return cl.queueJson(.tombstone_reply, tombstones.Reply{ .req = q.req, .name = q.name, .origin_id = q.origin_id });
         cl.queueJson(.tombstone_reply, tombstones.Reply{
             .req = q.req,
@@ -6679,6 +6680,20 @@ pub const Daemon = struct {
             .exit_status = e.exit_status,
             .signal = e.signal,
         });
+    }
+
+    /// Broker: the end of a session that attach and list no longer see
+    /// (killed, `dead`) but whose worker record is not retired yet, so its
+    /// tombstone is not written: a client reconnecting in that window must
+    /// not be told the daemon keeps no record.
+    fn endingWorker(self: *Daemon, name: []const u8, origin_id: ?[]const u8) ?tombstones.Entry {
+        for (self.workers.items) |w| {
+            if (!w.dead or !w.ready or w.adopting) continue;
+            const end = w.end orelse continue;
+            const hit = if (origin_id) |o| std.mem.eql(u8, &w.origin_id, o) else w.matchesName(name);
+            if (hit) return tombstones.entryOf(w.name, w.title orelse "", w.origin_id, end, wallMs());
+        }
+        return null;
     }
 
     /// Broker: a retired worker record leaves a tombstone when it ever
