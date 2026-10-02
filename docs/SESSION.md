@@ -1,5 +1,34 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-02: agent permissions, retry on overload, gone after a reboot
+
+`agent_open permissions` takes an app-neutral policy (tool or permission
+name to allow, ask or deny) that each adapter maps declaratively
+(`launch.permissions` in its JSON, applied by `launch.applyPermissions` at
+every start): opencode gets its config `permission` block in
+`OPENCODE_CONFIG_CONTENT`, merged into a value the caller passes, so
+`external_directory: allow` ends the `/tmp/*` prompts; Claude Code gets
+`--settings` with `permissions.allow/ask/deny` (read from 2.1.287's help
+and bundled settings schema), so `Bash(git *)` rules work. A name the app
+does not take is `invalid_args` naming the ones it does. `retry_on_overload
+{max, backoff_s}` (off by default, also on `agent_set`) continues a turn a
+provider overload ended (new error class `overloaded`, declared in each
+adapter's error rules) with the adapter's `retry.prompt` after a doubling
+backoff; the overload error is held and wakes nobody unless the retries
+give up, each retry is a notice record, and limits or auth failures are
+never retried (`src/agent/retry.zig`, unit-tested on fake error
+sequences). A lost remote link whose reconnect reaches the host's daemon
+and finds no session (closed, expired, or a fresh daemon after a reboot)
+now ends the agent with one `exited` naming the reason, plus
+`gone_reason` and `relaunchable` in results and `agent_list`, instead of
+staying `disconnected` forever; an unreachable host still retries. The
+broker now answers `tombstone_get` from a killed worker it has not retired
+yet, which a reconnect within a fraction of a second of the kill hit.
+Capabilities `agent_permissions`, `agent_retry_on_overload` and
+`agent_gone_on_reconnect`; smoke-mcp's agent stage proves the first two
+with the fake apps, the agent-ssh stage the third by closing the fake
+host's session and by "rebooting" the fake host while the link is down.
+
 ## 2026-10-02: an orchestrator of many agents: one call for several, wait all, relaunch
 
 From an orchestrator that ran 17 agents across four hosts. `agent_send
