@@ -5479,6 +5479,11 @@ fn webOnly(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: [:0]const u8) u
 /// stand-in for a remote host.
 const FAKE_SSH_ENV = "SKETERM_SMOKE_FAKE_SSH";
 
+/// The fake host whose remote commands see `$SKETERM_SMOKE_NORSYNC_BIN`
+/// (a failing `rsync`) first on PATH.
+const NORSYNC_HOST = "fakehost-norsync";
+const NORSYNC_BIN_ENV = "SKETERM_SMOKE_NORSYNC_BIN";
+
 /// Options of ssh/scp that take a value (the rest are flags).
 fn sshOptTakesValue(opt: []const u8) bool {
     if (opt.len != 2) return false;
@@ -5502,6 +5507,7 @@ fn fakeSsh(args: []const [*:0]const u8) u8 {
         }
     }
     if (i >= args.len) return 255; // no host
+    const host_name = std.mem.span(args[i]);
     i += 1; // the host: this machine stands in for it
     if (no_cmd) {
         const spec = forward orelse return 255;
@@ -5520,6 +5526,14 @@ fn fakeSsh(args: []const [*:0]const u8) u8 {
     const child = c.fork();
     if (child < 0) return 255;
     if (child == 0) {
+        // `fakehost-norsync` is a host whose rsync does not work, which is
+        // how file_sync's tar mode is reached through the real probe.
+        if (std.mem.eql(u8, host_name, NORSYNC_HOST)) if (c.getenv(NORSYNC_BIN_ENV)) |nb| {
+            var pbuf: [8192]u8 = undefined;
+            const old_path: [*:0]const u8 = if (c.getenv("PATH")) |p| p else "/usr/bin:/bin";
+            const np = std.fmt.bufPrintZ(&pbuf, "{s}:{s}", .{ std.mem.span(@as([*:0]const u8, @ptrCast(nb))), std.mem.span(old_path) }) catch c._exit(127);
+            _ = c.setenv("PATH", np.ptr, 1);
+        };
         _ = c.execv("/bin/sh", @ptrCast(&argv));
         c._exit(127);
     }
@@ -7837,6 +7851,157 @@ fn cutRemoteLink(down: [:0]const u8, rt_env: []const u8) void {
     for (proxies) |p| _ = c.kill(p, c.SIGKILL);
 }
 
+fn syncWrite(arena: std.mem.Allocator, path: []const u8, body: []const u8, mtime: ?i64) void {
+    const z = arena.dupeZ(u8, path) catch fail("oom");
+    const f = c.fopen(z.ptr, "wb") orelse fail("file_sync: cannot write a fixture file");
+    _ = c.fwrite(body.ptr, 1, body.len, f);
+    _ = c.fclose(f);
+    if (mtime) |t| {
+        const cmd = std.fmt.allocPrintSentinel(arena, "touch -m -d @{d} '{s}'", .{ t, path }, 0) catch fail("oom");
+        if (c.system(cmd.ptr) != 0) fail("file_sync: touch failed");
+    }
+}
+
+fn syncExpect(arena: std.mem.Allocator, path: []const u8, want: ?[]const u8, comptime what: []const u8) void {
+    const got = readFileAlloc(arena, path);
+    if (want) |w| {
+        if (got == null or !std.mem.eql(u8, got.?, w)) {
+            say(path);
+            say(got orelse "(missing)");
+            fail("file_sync: " ++ what);
+        }
+    } else if (got != null) {
+        say(path);
+        fail("file_sync: " ++ what);
+    }
+}
+
+fn syncTargets(r: std.json.ObjectMap) []std.json.Value {
+    return (r.get("targets") orelse fail("file_sync: no targets fact")).array.items;
+}
+
+fn syncField(item: std.json.Value, key: []const u8) std.json.Value {
+    return item.object.get(key) orelse fail("file_sync: a target fact is missing");
+}
+
+fn syncPath(a: std.mem.Allocator, dir: []const u8, rel: []const u8) []const u8 {
+    return std.fmt.allocPrint(a, "{s}/{s}", .{ dir, rel }) catch fail("oom");
+}
+
+fn syncCall(m: *Mcp, a: std.mem.Allocator, json: []const u8, comptime what: []const u8) std.json.ObjectMap {
+    const r = agentCall(m, a, "file_sync", json, "file_sync " ++ what, false, 110_000);
+    for (syncTargets(r)) |item| {
+        const st = syncField(item, "status");
+        if (st == .string and std.mem.eql(u8, st.string, "failed"))
+            say(std.json.Stringify.valueAlloc(a, item, .{}) catch "?");
+    }
+    return r;
+}
+
+/// file_sync over two fake hosts (`fakehost` syncs by rsync,
+/// `fakehost-norsync` by the verified tar stream) and one local directory:
+/// the first sync, keep_newer against a newer remote copy, a failing
+/// target alone, dry_run changing nothing, and delete scoped to the target.
+fn fileSyncStage(m: *Mcp, arena: std.mem.Allocator, rt: []const u8) void {
+    if (c.getenv(NORSYNC_BIN_ENV) == null) fail("file_sync: the no-rsync fake host was not set up before the server started");
+    const src = std.fmt.allocPrint(arena, "{s}/sync-src", .{rt}) catch fail("oom");
+    for ([_][]const u8{ "", "/sub", "/sub/deep" }) |d| {
+        const z = std.fmt.allocPrintSentinel(arena, "{s}{s}", .{ src, d }, 0) catch fail("oom");
+        _ = c.mkdir(z.ptr, 0o755);
+    }
+    const now: i64 = @intCast(c.time(null));
+    syncWrite(arena, syncPath(arena, src, "a.txt"), "A1\n", now - 600);
+    syncWrite(arena, syncPath(arena, src, "keep.txt"), "K1\n", now - 600);
+    syncWrite(arena, syncPath(arena, src, "sub/b.txt"), "B1\n", null);
+    syncWrite(arena, syncPath(arena, src, "sub/deep/c.txt"), "C1\n", null);
+    syncWrite(arena, syncPath(arena, src, "skip.tmp"), "TMP\n", null);
+    // The tar-mode target is two levels below an existing directory.
+    const dests = [_][]const u8{ syncPath(arena, rt, "sync-r1"), syncPath(arena, rt, "sync-r2/nested"), syncPath(arena, rt, "sync-l") };
+    const bad = syncPath(arena, rt, "sync-notdir");
+    syncWrite(arena, bad, "a file, not a directory\n", null);
+    const outside = syncPath(arena, rt, "sync-outside.txt");
+    syncWrite(arena, outside, "OUTSIDE\n", null);
+    const targets_json = std.fmt.allocPrint(arena, "[{{\"host\":\"fakehost\",\"path\":\"{s}\"}},{{\"host\":\"" ++ NORSYNC_HOST ++ "\",\"path\":\"{s}\"}},{{\"path\":\"{s}\"}}", .{ dests[0], dests[1], dests[2] }) catch fail("oom");
+
+    // 1. First sync, plus one target that is a file: it fails alone.
+    {
+        const r = syncCall(m, arena, std.fmt.allocPrint(arena, "{{\"local_dir\":\"{s}\",\"exclude\":[\"*.tmp\"],\"targets\":{s},{{\"host\":\"fakehost\",\"path\":\"{s}\"}}]}}", .{ src, targets_json, bad }) catch fail("oom"), "first sync");
+        if (capInt(r, "total") != 4 or capInt(r, "succeeded") != 3 or capInt(r, "failed") != 1) fail("file_sync: expected 3 ok and the not-a-directory target failed");
+        const items = syncTargets(r);
+        for (items[0..3], [_][]const u8{ "rsync", "tar", "rsync" }) |item, want| {
+            if (!std.mem.eql(u8, syncField(item, "method").string, want)) {
+                say(want);
+                fail("file_sync: a target used the wrong method");
+            }
+            if (syncField(item, "sent").integer != 4) fail("file_sync: the first sync did not send the 4 files");
+        }
+        if (!std.mem.eql(u8, syncField(items[1], "verification").string, "sha256_manifest")) fail("file_sync: tar mode did not report its sha256 verification");
+        if (!std.mem.eql(u8, syncField(items[3], "status").string, "failed")) fail("file_sync: the not-a-directory target did not fail");
+        for (dests) |d| {
+            syncExpect(arena, syncPath(arena, d, "a.txt"), "A1\n", "a.txt did not arrive");
+            syncExpect(arena, syncPath(arena, d, "sub/deep/c.txt"), "C1\n", "the nested file did not arrive");
+            syncExpect(arena, syncPath(arena, d, "skip.tmp"), null, "an excluded file was synced");
+        }
+        say("smoke-mcp: file_sync: rsync, tar and local targets synced; the broken one failed alone");
+    }
+
+    // 2. keep_newer: a.txt changed here, keep.txt changed LATER on every target.
+    syncWrite(arena, syncPath(arena, src, "a.txt"), "A2\n", now - 60);
+    for (dests) |d| syncWrite(arena, syncPath(arena, d, "keep.txt"), "K-REMOTE\n", now + 600);
+    {
+        const r = syncCall(m, arena, std.fmt.allocPrint(arena, "{{\"local_dir\":\"{s}\",\"exclude\":[\"*.tmp\"],\"targets\":{s}]}}", .{ src, targets_json }) catch fail("oom"), "keep_newer");
+        if (capInt(r, "succeeded") != 3) fail("file_sync: the keep_newer sync did not succeed everywhere");
+        for (syncTargets(r)) |item| {
+            if (syncField(item, "sent").integer != 1) fail("file_sync: keep_newer should send exactly the changed file");
+            const sk = syncField(item, "skipped");
+            if (sk != .integer or sk.integer < 1) fail("file_sync: keep_newer reported no skipped file");
+        }
+        for (dests) |d| {
+            syncExpect(arena, syncPath(arena, d, "a.txt"), "A2\n", "the changed file did not arrive");
+            syncExpect(arena, syncPath(arena, d, "keep.txt"), "K-REMOTE\n", "keep_newer overwrote a newer remote file");
+        }
+        say("smoke-mcp: file_sync: keep_newer kept the newer remote file and sent the changed one");
+    }
+
+    // 3. dry_run with delete: reports, changes nothing.
+    syncWrite(arena, syncPath(arena, src, "a.txt"), "A3\n", now - 30);
+    for (dests) |d| {
+        syncWrite(arena, syncPath(arena, d, "extra.txt"), "EXTRA\n", null);
+        syncWrite(arena, syncPath(arena, d, "local.tmp"), "EXCLUDED\n", null);
+    }
+    {
+        const r = syncCall(m, arena, std.fmt.allocPrint(arena, "{{\"local_dir\":\"{s}\",\"exclude\":[\"*.tmp\"],\"delete\":true,\"dry_run\":true,\"targets\":{s}]}}", .{ src, targets_json }) catch fail("oom"), "dry_run");
+        if (capInt(r, "succeeded") != 3) fail("file_sync: the dry run did not succeed everywhere");
+        for (syncTargets(r)) |item| {
+            if (syncField(item, "sent").integer != 1 or syncField(item, "deleted").integer != 1) fail("file_sync: the dry run should report 1 to send and 1 to delete");
+        }
+        for (dests) |d| {
+            syncExpect(arena, syncPath(arena, d, "a.txt"), "A2\n", "dry_run changed a file");
+            syncExpect(arena, syncPath(arena, d, "extra.txt"), "EXTRA\n", "dry_run deleted a file");
+        }
+        say("smoke-mcp: file_sync: dry_run reported the changes and made none");
+    }
+
+    // 4. delete: only inside the target, never an excluded file; a missing
+    //    target directory refuses delete alone.
+    {
+        const absent = syncPath(arena, rt, "sync-absent");
+        const r = syncCall(m, arena, std.fmt.allocPrint(arena, "{{\"local_dir\":\"{s}\",\"exclude\":[\"*.tmp\"],\"delete\":true,\"targets\":{s},{{\"host\":\"fakehost\",\"path\":\"{s}\"}}]}}", .{ src, targets_json, absent }) catch fail("oom"), "delete");
+        if (capInt(r, "succeeded") != 3 or capInt(r, "failed") != 1) fail("file_sync: delete: expected 3 ok and the absent target refused");
+        const items = syncTargets(r);
+        for (items[0..3]) |item| if (syncField(item, "deleted").integer != 1) fail("file_sync: delete did not remove exactly the one extra file");
+        if (!std.mem.eql(u8, syncField(syncField(items[3], "error"), "code").string, "refused")) fail("file_sync: delete into a missing directory was not refused");
+        if (fileExists(absent)) fail("file_sync: a refused delete target was created");
+        for (dests) |d| {
+            syncExpect(arena, syncPath(arena, d, "extra.txt"), null, "delete left the extra file");
+            syncExpect(arena, syncPath(arena, d, "local.tmp"), "EXCLUDED\n", "delete removed an excluded file");
+            syncExpect(arena, syncPath(arena, d, "a.txt"), "A3\n", "the delete run did not send the change");
+        }
+        syncExpect(arena, outside, "OUTSIDE\n", "delete reached outside the target");
+        say("smoke-mcp: file_sync: delete stayed inside the target and spared excluded files");
+    }
+}
+
 fn agentSshStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) void {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -7874,7 +8039,15 @@ fn agentSshStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u
     _ = c.setenv(FAKE_OC_DEAF_ENV, "3000", 1);
     // What a nested Claude Code must never inherit, on the "remote" host too.
     _ = c.setenv("CLAUDE_CODE_CHILD_SESSION", "1", 1);
+    // file_sync's tar mode: `fakehost-norsync` sees a failing rsync first
+    // on PATH. Set before any server starts, since the daemon that runs
+    // the fake ssh inherits its environment then.
+    const norsync_bin = std.fmt.allocPrintSentinel(arena, "{s}/norsync-bin", .{rt}, 0) catch fail("oom");
+    _ = c.mkdir(norsync_bin.ptr, 0o700);
+    writeExecutable(std.fmt.allocPrintSentinel(arena, "{s}/rsync", .{norsync_bin}, 0) catch fail("oom"), "#!/bin/sh\nexit 127\n");
+    _ = c.setenv(NORSYNC_BIN_ENV, norsync_bin.ptr, 1);
     defer {
+        _ = c.unsetenv(NORSYNC_BIN_ENV);
         _ = c.setenv("PATH", saved_path.ptr, 1);
         _ = c.unsetenv(FAKE_SSH_ENV);
         _ = c.unsetenv(FAKE_AGENT_ENV);
@@ -7944,6 +8117,7 @@ fn agentSshStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u
             }
             say("smoke-mcp: scp_put targets: 2 verified and moved, the broken one failed alone");
         }
+        fileSyncStage(&m, arena, rt);
         // One probe on the host: claude is found through ~/.local/bin.
         const ad = agentCall(&m, arena, "agent_adapters", "{\"host\":\"fakehost\"}", "agent_adapters host", false, 45_000);
         expectFact(ad, "host", "fakehost", "agent_adapters host: host fact");

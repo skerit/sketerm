@@ -116,6 +116,7 @@ comptime {
     _ = @import("ipc/evkeys.zig");
     _ = @import("ipc/fsdrive.zig");
     _ = @import("ipc/fstransfer.zig");
+    _ = @import("ipc/filesync.zig");
     _ = @import("ipc/keys.zig");
     _ = @import("mux/channel_pump.zig");
     _ = @import("ipc/socks5.zig");

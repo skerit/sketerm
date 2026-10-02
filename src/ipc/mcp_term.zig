@@ -25,6 +25,10 @@ const sshroute = @import("../mux/sshroute.zig");
 const sshmaster = @import("../mux/sshmaster.zig");
 const Config = @import("../config.zig").Config;
 const transport_mod = @import("transport.zig");
+const filesync = @import("filesync.zig");
+const filehash = @import("../util/filehash.zig");
+const pathz = @import("../util/pathz.zig");
+const readfile = @import("../util/readfile.zig");
 
 // ── headless terminal tools (shell sessions on the private daemon) ─
 
@@ -1293,6 +1297,402 @@ fn scpPutTargets(arena: std.mem.Allocator, local: []const u8, v: std.json.Value,
     return res.finish();
 }
 
+// ── file_sync ─────────────────────────────────────────────────────
+
+const SyncFail = struct { code: mcp.ErrCode, msg: []const u8 };
+
+/// One `file_sync` destination as it moves through probe, inspect and transfer.
+const SyncTarget = struct {
+    host: ?[]const u8,
+    raw_path: []const u8,
+    path: []const u8 = "",
+    /// `ssh` + the options home's words, and the bare destination.
+    ssh: []const []const u8 = &.{},
+    dest: []const u8 = "",
+    method: ?filesync.Method = null,
+    fail: ?SyncFail = null,
+    existed: bool = false,
+    created: bool = false,
+    sent: usize = 0,
+    skipped: ?usize = 0,
+    deleted: usize = 0,
+    bytes: ?u64 = 0,
+    verification: filesync.Verification = .none,
+    changes: []const []const u8 = &.{},
+    insp: filesync.Inspect = .{},
+    plan: filesync.Plan = .{},
+    out: []const u8 = "",
+    leg: ?usize = null,
+
+    fn failed(self: *SyncTarget, code: mcp.ErrCode, msg: []const u8) void {
+        if (self.fail == null) self.fail = .{ .code = code, .msg = msg };
+    }
+
+    /// Words that run `script` where this target lives (`sh -c` locally).
+    fn scriptWords(self: *const SyncTarget, arena: std.mem.Allocator, script: []const u8) ![]const []const u8 {
+        if (self.host == null) return arena.dupe([]const u8, &.{ "sh", "-c", script });
+        return std.mem.concat(arena, []const u8, &.{ self.ssh, &.{ self.dest, try remoteShLine(arena, script) } });
+    }
+};
+
+const SYNC_OUT_CAP = 64 * 1024 * 1024;
+
+/// The terminal's tail as a failure message for a leg that did not finish.
+fn legFailure(arena: std.mem.Allocator, what: []const u8, ran: ArgvOutcome) !?SyncFail {
+    switch (ran) {
+        .err => |e| return .{ .code = .unavailable, .msg = e },
+        .run => |r| {
+            if (!r.exited) return .{ .code = .timeout, .msg = try std.fmt.allocPrint(arena, "{s} still running at timeout; its terminal was killed (raise timeout_ms, max 120000)", .{what}) };
+            if (!r.status_known or r.status != 0)
+                return .{ .code = .io_failed, .msg = try std.fmt.allocPrint(arena, "{s} failed (status {d}): {s}", .{ what, r.status, tailLines(r.output, 4) }) };
+            return null;
+        },
+    }
+}
+
+/// `file_sync`: make `local_dir`'s contents present in every target.
+pub fn fileSyncTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
+    if (term_state.mux_sock == null)
+        return mcp.errRes(arena, .unavailable, "file transfer / port forward tools need isolated mode (they run over private headless terminals)");
+    const local_raw = argStr(args, "local_dir") orelse return mcp.errRes(arena, .invalid_args, "requires 'local_dir'");
+    var rp_buf: [4096]u8 = undefined;
+    var rz: [4096]u8 = undefined;
+    const real = c.realpath(pathz.pathZ(&rz, local_raw) catch return mcp.errRes(arena, .invalid_args, "local_dir is too long"), &rp_buf) orelse
+        return mcp.errRes(arena, .invalid_args, "local_dir does not exist");
+    const local_dir = try arena.dupe(u8, std.mem.span(@as([*:0]const u8, @ptrCast(real))));
+    {
+        var st: c.struct_stat = undefined;
+        if (c.stat(pathz.pathZ(&rz, local_dir) catch unreachable, &st) != 0 or (st.st_mode & c.S_IFMT) != c.S_IFDIR)
+            return mcp.errRes(arena, .invalid_args, "local_dir is not a directory");
+    }
+    const tv = mcp.argValue(args, "targets") orelse return mcp.errRes(arena, .invalid_args, "requires 'targets'");
+    if (tv != .array or tv.array.items.len == 0 or tv.array.items.len > MAX_TARGETS)
+        return mcp.errRes(arena, .invalid_args, try std.fmt.allocPrint(arena, "targets must be an array of 1-{d} {{host?, path}} objects", .{MAX_TARGETS}));
+    const keep_newer = if (mcp.argValue(args, "keep_newer")) |v| (if (v == .bool) v.bool else true) else true;
+    const delete = argBool(args, "delete");
+    const dry_run = argBool(args, "dry_run");
+    var excludes: std.ArrayList([]const u8) = .empty;
+    const ex_arg: std.json.Value = mcp.argValue(args, "exclude") orelse .null;
+    if (ex_arg != .null) {
+        const ev = ex_arg;
+        if (ev != .array or ev.array.items.len > filesync.MAX_EXCLUDES)
+            return mcp.errRes(arena, .invalid_args, "exclude must be an array of at most 64 pattern strings");
+        for (ev.array.items) |p| {
+            if (p != .string) return mcp.errRes(arena, .invalid_args, "exclude must be an array of pattern strings");
+            if (filesync.Exclude.check(p.string)) |why| return mcp.errRes(arena, .invalid_args, why);
+            try excludes.append(arena, p.string);
+        }
+    }
+    const ex: filesync.Exclude = .{ .pats = excludes.items };
+    const deadline = nowMs() + mcp.waitCap(argInt(args, "timeout_ms"), 120_000);
+
+    const walk = filesync.walkLocal(arena, local_dir, ex, false) catch |err| return mcp.errRes(arena, .io_failed, switch (err) {
+        error.TooManyEntries => "local_dir holds more than 100000 entries",
+        else => "local_dir could not be read completely (an unreadable entry?)",
+    });
+    if (delete and walk.entries.len == 0)
+        return mcp.errRes(arena, .refused, "delete:true with an empty local_dir (after excludes) would empty every target; refused");
+
+    const home: ?[]const u8 = if (c.getenv("HOME")) |h| std.mem.span(@as([*:0]const u8, @ptrCast(h))) else null;
+    const targets = try arena.alloc(SyncTarget, tv.array.items.len);
+    for (tv.array.items, targets, 0..) |item, *tg, i| {
+        const pv = if (item == .object) item.object.get("path") else null;
+        const hv = if (item == .object) item.object.get("host") else null;
+        if (pv == null or pv.? != .string or (hv != null and hv.? != .string and hv.? != .null))
+            return mcp.errRes(arena, .invalid_args, try std.fmt.allocPrint(arena, "targets[{d}] must be {{\"path\": string, \"host\"?: string}}", .{i}));
+        tg.* = .{ .host = if (hv) |h| (if (h == .string) h.string else null) else null, .raw_path = pv.?.string };
+        switch (try filesync.normalizeTarget(arena, tg.raw_path, tg.host == null, home)) {
+            .refused => |why| {
+                tg.failed(.refused, why);
+                continue;
+            },
+            .ok => |p| tg.path = p,
+        }
+        if (tg.host) |h| {
+            var words: std.ArrayList([]const u8) = .empty;
+            tg.dest = appendSshLeg(arena, &words, h, legs.script) catch {
+                tg.failed(.invalid_args, BAD_HOST);
+                continue;
+            };
+            tg.ssh = words.items;
+        } else if (filesync.pathsNest(tg.path, local_dir)) {
+            tg.failed(.refused, "a local target must not be local_dir itself, inside it, or above it");
+            continue;
+        }
+        for (targets[0..i]) |prev| {
+            if (prev.fail == null and std.mem.eql(u8, prev.path, tg.path) and std.mem.eql(u8, prev.host orelse "", tg.host orelse ""))
+                tg.failed(.invalid_args, "the same destination is listed twice");
+        }
+    }
+
+    const scratch = pathz.TempDir.make("sync") orelse return mcp.errRes(arena, .io_failed, "cannot create a scratch directory");
+    defer scratch.remove();
+    const outPath = struct {
+        fn f(a: std.mem.Allocator, dir: []const u8, comptime tag: []const u8, i: usize) ![]const u8 {
+            return std.fmt.allocPrint(a, "{s}/" ++ tag ++ "{d}", .{ dir, i });
+        }
+    }.f;
+
+    // Probe once per host: rsync on both ends picks rsync, else tar.
+    const local_rsync = pathz.executableOnPath("rsync");
+    const local_tar = pathz.executableOnPath("tar");
+    var probe_hosts: std.ArrayList(usize) = .empty;
+    var probe_argvs: std.ArrayList([]const []const u8) = .empty;
+    for (targets, 0..) |*tg, i| {
+        if (tg.fail != null or tg.host == null) continue;
+        const seen = for (probe_hosts.items) |j| {
+            if (std.mem.eql(u8, targets[j].host.?, tg.host.?)) break true;
+        } else false;
+        if (seen) continue;
+        try probe_hosts.append(arena, i);
+        try probe_argvs.append(arena, try filesync.redirectArgv(arena, try tg.scriptWords(arena, filesync.PROBE_SCRIPT), null, try outPath(arena, scratch.path(), "p", i)));
+    }
+    const probes = try arena.alloc(?filesync.Probe, targets.len);
+    @memset(probes, null);
+    const probe_fail = try arena.alloc(?SyncFail, targets.len);
+    @memset(probe_fail, null);
+    for (try runArgvTerms(arena, probe_argvs.items, deadline, UPLOAD_PARALLEL), probe_hosts.items) |ran, i| {
+        const out = readfile.capped(arena, try outPath(arena, scratch.path(), "p", i), SYNC_OUT_CAP) orelse "";
+        const p = filesync.parseProbe(out);
+        if (p.ok) probes[i] = p else probe_fail[i] = (try legFailure(arena, "the host probe", ran)) orelse .{ .code = .unavailable, .msg = "the host probe gave no answer" };
+    }
+    var any_tar = false;
+    for (targets) |*tg| {
+        if (tg.fail != null) continue;
+        if (tg.host == null) {
+            tg.method = if (local_rsync) .rsync else if (local_tar) .tar else null;
+            if (tg.method == null) tg.failed(.unavailable, "neither rsync nor tar is installed here");
+        } else {
+            const j = for (probe_hosts.items) |j| {
+                if (std.mem.eql(u8, targets[j].host.?, tg.host.?)) break j;
+            } else unreachable;
+            if (probe_fail[j]) |f| {
+                tg.failed(f.code, f.msg);
+                continue;
+            }
+            const p = probes[j].?;
+            tg.method = if (local_rsync and p.rsync) .rsync else if (p.tar) .tar else null;
+            if (tg.method == null) tg.failed(.unavailable, "the host has neither rsync nor tar");
+        }
+        if (tg.method == .tar) {
+            if (walk.newline_names > 0) tg.failed(.refused, "local_dir has a name containing a newline, which tar mode cannot manifest (install rsync on both ends)");
+            any_tar = true;
+        }
+    }
+    if (any_tar) for (walk.entries) |*e| {
+        if (e.kind != .file) continue;
+        const p = try std.fmt.allocPrint(arena, "{s}/{s}", .{ local_dir, e.rel });
+        e.sha = (filehash.sha256File(p) orelse return mcp.errRes(arena, .io_failed, try std.fmt.allocPrint(arena, "cannot hash {s}", .{e.rel}))).hex;
+    };
+
+    // Inspect every target: refuse / and the home as the HOST resolves
+    // them, learn whether it existed, create it unless deleting or a dry
+    // run, and (tar mode) read its manifest.
+    var insp_idx: std.ArrayList(usize) = .empty;
+    var insp_argvs: std.ArrayList([]const []const u8) = .empty;
+    for (targets, 0..) |*tg, i| {
+        if (tg.fail != null) continue;
+        const script = try filesync.inspectScript(arena, tg.path, tg.method == .tar, !dry_run and !delete);
+        try insp_idx.append(arena, i);
+        try insp_argvs.append(arena, try filesync.redirectArgv(arena, try tg.scriptWords(arena, script), null, try outPath(arena, scratch.path(), "i", i)));
+    }
+    for (try runArgvTerms(arena, insp_argvs.items, deadline, UPLOAD_PARALLEL), insp_idx.items) |ran, i| {
+        const tg = &targets[i];
+        const out = readfile.capped(arena, try outPath(arena, scratch.path(), "i", i), SYNC_OUT_CAP) orelse "";
+        tg.insp = try filesync.parseInspect(arena, out, tg.method == .tar);
+        if (tg.insp.refused) |why| {
+            tg.failed(.refused, why);
+            continue;
+        }
+        if (tg.insp.err) |why| {
+            tg.failed(.io_failed, if (try legFailure(arena, "inspecting the target", ran)) |f| f.msg else why);
+            continue;
+        }
+        tg.existed = tg.insp.existed;
+        tg.created = !tg.existed and !dry_run;
+        if (delete and !tg.existed) tg.failed(.refused, "delete:true needs a target directory that already exists; this one does not, so nothing was done");
+    }
+
+    // Transfer: one leg per target that still has work.
+    var xfer_idx: std.ArrayList(usize) = .empty;
+    var xfer_argvs: std.ArrayList([]const []const u8) = .empty;
+    for (targets, 0..) |*tg, i| {
+        if (tg.fail != null) continue;
+        const out = try outPath(arena, scratch.path(), "x", i);
+        switch (tg.method.?) {
+            .rsync => {
+                if (dry_run and !tg.existed) {
+                    // Nothing there: everything would be sent.
+                    tg.sent = walk.count(.file);
+                    var total: u64 = 0;
+                    for (walk.entries) |e| total += e.size;
+                    tg.bytes = total;
+                    continue;
+                }
+                const dest = if (tg.host == null) tg.path else try std.fmt.allocPrint(arena, "{s}:{s}", .{ tg.dest, tg.path });
+                const argv = try filesync.rsyncArgv(arena, local_dir, if (tg.host == null) null else tg.ssh, dest, .{ .keep_newer = keep_newer, .delete = delete, .dry_run = dry_run, .excludes = excludes.items });
+                try xfer_idx.append(arena, i);
+                try xfer_argvs.append(arena, try filesync.redirectArgv(arena, argv, null, out));
+            },
+            .tar => {
+                tg.plan = try filesync.diff(arena, walk, &tg.insp.manifest, ex, keep_newer, delete);
+                if (tg.plan.conflicts.len > 0) {
+                    tg.failed(.conflict, try std.fmt.allocPrint(arena, "{d} path(s) are a file on one side and a directory on the other, nothing was changed: {s}", .{ tg.plan.conflicts.len, tg.plan.conflicts[0] }));
+                    continue;
+                }
+                tg.skipped = tg.plan.skipped();
+                if (dry_run or tg.plan.empty()) {
+                    tg.sent = tg.plan.send.len;
+                    tg.deleted = tg.plan.deletes.len;
+                    tg.bytes = tg.plan.bytes;
+                    var ch: std.ArrayList([]const u8) = .empty;
+                    for (tg.plan.send) |e| try ch.append(arena, e.rel);
+                    for (tg.plan.deletes) |d| try ch.append(arena, try std.fmt.allocPrint(arena, "-{s}", .{d}));
+                    tg.changes = ch.items;
+                    if (!dry_run) tg.verification = .sha256_manifest;
+                    continue;
+                }
+                const tar_path = try outPath(arena, scratch.path(), "t", i);
+                filesync.writeTar(arena, tar_path, local_dir, tg.plan) catch |err| {
+                    tg.failed(.io_failed, if (err == error.Changed) "a local file changed while the archive was written; retry" else "cannot write the local archive");
+                    continue;
+                };
+                var raw: [8]u8 = undefined;
+                if (c.getentropy(&raw, raw.len) != 0) return mcp.errRes(arena, .io_failed, "getentropy failed");
+                const nonce = std.fmt.bytesToHex(raw, .lower);
+                const self_file = try filesync.selfName(arena, &nonce);
+                const script = try filesync.applyScript(arena, tg.path, &nonce, keep_newer, if (tg.host == null) null else self_file);
+                const words = if (tg.host == null)
+                    try arena.dupe([]const u8, &.{ "sh", "-c", script })
+                else
+                    try std.mem.concat(arena, []const u8, &.{ tg.ssh, &.{ tg.dest, try filesync.remoteFileLine(arena, script, self_file) } });
+                try xfer_idx.append(arena, i);
+                try xfer_argvs.append(arena, try filesync.redirectArgv(arena, words, tar_path, out));
+            },
+        }
+    }
+    for (try runArgvTerms(arena, xfer_argvs.items, deadline, UPLOAD_PARALLEL), xfer_idx.items) |ran, i| {
+        const tg = &targets[i];
+        const out = readfile.capped(arena, try outPath(arena, scratch.path(), "x", i), SYNC_OUT_CAP) orelse "";
+        switch (tg.method.?) {
+            .rsync => {
+                if (try legFailure(arena, "rsync", ran)) |f| {
+                    tg.failed(f.code, f.msg);
+                    continue;
+                }
+                const r = try filesync.parseRsync(arena, out);
+                tg.sent = r.sent;
+                tg.deleted = r.deleted;
+                tg.skipped = r.skipped();
+                tg.bytes = r.bytes;
+                tg.changes = r.changed.items;
+                if (!dry_run) tg.verification = .rsync_checksum;
+            },
+            .tar => {
+                const a = try filesync.parseApply(arena, out);
+                tg.sent = a.sent.items.len;
+                tg.deleted = a.deleted;
+                tg.skipped = tg.plan.skipped() + a.kept;
+                var bytes: u64 = 0;
+                for (a.sent.items) |rel| if (walk.find(rel)) |e| {
+                    bytes += e.size;
+                };
+                tg.bytes = bytes;
+                tg.changes = a.sent.items;
+                if (a.err) |why| {
+                    tg.failed(.io_failed, why);
+                } else if (!a.done) {
+                    tg.failed(.io_failed, if (try legFailure(arena, "the tar apply", ran)) |f| f.msg else "the tar apply ended before it finished");
+                } else if (a.failed.items.len > 0) {
+                    tg.failed(.io_failed, try std.fmt.allocPrint(arena, "{d} path(s) did not land (a directory in the way, or a failed move): {s}", .{ a.failed.items.len, a.failed.items[0] }));
+                } else tg.verification = .sha256_manifest;
+            },
+        }
+    }
+    return syncResult(arena, local_dir, targets, local_rsync, keep_newer, delete, dry_run);
+}
+
+fn syncResult(arena: std.mem.Allocator, local_dir: []const u8, targets: []SyncTarget, local_rsync: bool, keep_newer: bool, delete: bool, dry_run: bool) ![]const u8 {
+    const Item = struct {
+        host: ?[]const u8,
+        path: []const u8,
+        method: ?[]const u8,
+        status: []const u8,
+        sent: usize,
+        skipped: ?usize,
+        deleted: usize,
+        bytes: ?u64,
+        created: bool,
+        verification: []const u8,
+        @"error": ?struct { code: []const u8, message: []const u8 } = null,
+    };
+    const items = try arena.alloc(Item, targets.len);
+    var ok: usize = 0;
+    var sent: usize = 0;
+    var deleted: usize = 0;
+    var bytes: u64 = 0;
+    var lines: std.Io.Writer.Allocating = .init(arena);
+    for (targets, items, 0..) |tg, *it, i| {
+        if (i > 0) try lines.writer.writeAll("\n");
+        const where = if (tg.host) |h| try std.fmt.allocPrint(arena, "{s}:{s}", .{ h, tg.raw_path }) else tg.raw_path;
+        const method = if (tg.method) |m| @tagName(m) else null;
+        it.* = .{ .host = tg.host, .path = tg.raw_path, .method = method, .status = if (tg.fail == null) "ok" else "failed", .sent = tg.sent, .skipped = tg.skipped, .deleted = tg.deleted, .bytes = tg.bytes, .created = tg.created and tg.fail == null, .verification = @tagName(tg.verification) };
+        if (tg.fail) |f| {
+            it.@"error" = .{ .code = @tagName(f.code), .message = f.msg };
+            try lines.writer.print("FAILED {s} [{s}] ({s}): {s}", .{ where, method orelse "-", @tagName(f.code), tailLines(f.msg, 3) });
+            continue;
+        }
+        ok += 1;
+        sent += tg.sent;
+        deleted += tg.deleted;
+        bytes += tg.bytes orelse 0;
+        try lines.writer.print("ok {s} [{s}] {s} {d}, skipped {s}, {s} {d}, {d} bytes{s}", .{
+            where,
+            method.?,
+            if (dry_run) "would send" else "sent",
+            tg.sent,
+            if (tg.skipped) |s| try std.fmt.allocPrint(arena, "{d}", .{s}) else "?",
+            if (dry_run) "would delete" else "deleted",
+            tg.deleted,
+            tg.bytes orelse 0,
+            if (tg.created) " (directory created)" else "",
+        });
+        if (dry_run and tg.changes.len > 0) {
+            const shown = @min(tg.changes.len, 20);
+            try lines.writer.print("\n  {s}", .{try std.mem.join(arena, ", ", tg.changes[0..shown])});
+            if (tg.changes.len > shown) try lines.writer.print(" (+{d} more)", .{tg.changes.len - shown});
+        }
+    }
+    var res = mcp.Res.init(arena);
+    try res.fact("local_dir", local_dir);
+    try res.fact("targets", items);
+    try res.fact("total", targets.len);
+    try res.fact("succeeded", ok);
+    try res.fact("failed", targets.len - ok);
+    try res.fact("all_ok", ok == targets.len);
+    try res.fact("dry_run", dry_run);
+    try res.fact("keep_newer", keep_newer);
+    try res.fact("delete", delete);
+    try res.fact("files_sent", sent);
+    try res.fact("files_deleted", deleted);
+    try res.fact("bytes_sent", bytes);
+    try res.fact("local_rsync", local_rsync);
+    try res.textf("{s}sync of {s} to {d} target(s): {d} ok, {d} failed; {d} file(s) {s}, {d} {s}", .{
+        if (dry_run) "DRY RUN (nothing changed): " else "",
+        local_dir,
+        targets.len,
+        ok,
+        targets.len - ok,
+        sent,
+        if (dry_run) "would be sent" else "sent",
+        deleted,
+        if (dry_run) "would be deleted" else "deleted",
+    });
+    try res.text("--- targets ---");
+    try res.text(lines.written());
+    return res.finish();
+}
+
 /// Resolve the addressed port forward, then run one forward-scoped tool on it.
 fn withForward(
     arena: std.mem.Allocator,
@@ -1657,6 +2057,48 @@ test "every MCP ssh/scp argv goes through the one options home: no X11, its own 
     try t.expect(!validHostSpec("udp:box"));
     try t.expect(validHostSpec("me@box"));
     try t.expect(validHostSpec("tor:box"));
+}
+
+test "file_sync's rsync -e is the options home's ssh leg, Tor route included" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    for ([_][]const u8{ "box", "tor:box" }) |host| {
+        var words: std.ArrayList([]const u8) = .empty;
+        const dest = try appendSshLeg(arena, &words, host, legs.script);
+        try t.expectEqualStrings("box", dest);
+        const argv = try filesync.rsyncArgv(arena, "/src", words.items, "box:./docs", .{ .keep_newer = true, .delete = false, .dry_run = false, .excludes = &.{} });
+        const rsh = argv[argv.len - 3];
+        try t.expect(std.mem.startsWith(u8, rsh, "'ssh' '-T' "));
+        try t.expect(std.mem.indexOf(u8, rsh, "'ForwardX11=no'") != null);
+        try t.expect(std.mem.indexOf(u8, rsh, "'BatchMode=yes'") != null);
+        if (std.mem.startsWith(u8, host, "tor:")) try t.expect(std.mem.indexOf(u8, rsh, "'ProxyCommand=exec ") != null);
+    }
+}
+
+test "file_sync result: per-target facts, a failed target beside an ok one, prose with a targets block" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var targets = [_]SyncTarget{
+        .{ .host = "box", .raw_path = "docs", .method = .tar, .sent = 2, .skipped = 1, .bytes = 10, .created = true, .verification = .sha256_manifest },
+        .{ .host = null, .raw_path = "/", .fail = .{ .code = .refused, .msg = "refusing to sync into / itself" } },
+    };
+    const out = try syncResult(arena, "/src", &targets, true, true, false, false);
+    const parsed = try mcp.expectToolResultShape(arena, "file_sync", out);
+    const sc = parsed.object.get("structuredContent").?.object;
+    try t.expectEqual(@as(i64, 1), sc.get("succeeded").?.integer);
+    try t.expectEqual(@as(i64, 1), sc.get("failed").?.integer);
+    try t.expectEqual(@as(i64, 2), sc.get("files_sent").?.integer);
+    const items = sc.get("targets").?.array.items;
+    try t.expectEqualStrings("tar", items[0].object.get("method").?.string);
+    try t.expectEqualStrings("refused", items[1].object.get("error").?.object.get("code").?.string);
+    try t.expect(parsed.object.get("isError") == null or !parsed.object.get("isError").?.bool);
+    const text = parsed.object.get("content").?.array.items[0].object.get("text").?.string;
+    try t.expect(std.mem.indexOf(u8, text, "--- targets ---") != null);
+    try t.expect(std.mem.indexOf(u8, text, "ok box:docs [tar] sent 2, skipped 1") != null);
 }
 
 // ── session state: terminals, recordings, forwards ──────────────

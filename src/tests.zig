@@ -296,6 +296,7 @@ comptime {
     _ = @import("mux/fsjournal.zig");
     _ = @import("ipc/fsdrive.zig");
     _ = @import("ipc/fstransfer.zig");
+    _ = @import("ipc/filesync.zig");
     _ = @import("filebrowser/model.zig");
     _ = @import("filebrowser/colkeys.zig");
     _ = @import("filebrowser/cache.zig");

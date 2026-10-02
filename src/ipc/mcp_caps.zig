@@ -350,6 +350,8 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
     }
     try res.fact("ssh_no_x11", true);
     try res.fact("scp_put_targets", @as(u32, mcp_term.MAX_TARGETS));
+    try res.fact("file_sync", headless_terms);
+    try res.fact("file_sync_local_rsync", @import("../util/pathz.zig").executableOnPath("rsync"));
     try res.fact("mux_tor", true);
     try res.text("mux Tor transport: supported via tor:<ssh-alias>; forced SOCKS5 remote DNS, with no UDP or direct fallback");
     if (mcp_term.rec_state.enabled) {
@@ -538,7 +540,7 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
             "move bytes OUT of a page -> web_download (url -> file, with the page's own session) or web_eval out_file: (a computed result -> file); " ++
             "read a page -> web_read (article text) or web_snapshot (things to act on); act on it -> web_act; " ++
             "run something -> term_run in a live shell, term_exec for an isolated one-shot; " ++
-            "files on THIS machine -> file_read / file_write / file_list; files over SSH -> scp_get / scp_put; " ++
+            "files on THIS machine -> file_read / file_write / file_list; files over SSH -> scp_get / scp_put; a directory to many hosts or clones -> file_sync; " ++
             "drive a GUI app -> launch_app then app_click / app_type / screenshot_app; " ++
             "show the user something -> ui_show. Nothing here streams data through the conversation that a file could carry.",
     );

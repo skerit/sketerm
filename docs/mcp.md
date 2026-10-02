@@ -160,6 +160,7 @@ is kept by a `:ro` policy term. The full descriptions and schemas are in
 
 - `scp_put`: Copy a LOCAL file to an SSH host (scp), with integrity + atomicity built in: scp to a staged temp file, remote SHA-256 verify against the local hash, then an atomic mv into place (a corrupt transfer is discarded, never half-written).
 - `scp_get`: Copy a file from an SSH host to this machine (scp), with integrity + atomicity: scp to <local>.sketerm-part, SHA-256 compare against the remote hash, atomic rename into place.
+- `file_sync`: Make a LOCAL directory's contents present in up to 32 destinations (SSH hosts and/or local paths) in one call: the docs-to-every-clone job that otherwise takes a tar, an scp_put per host and an unpack per host.
 - `file_list` (read-only): Rich directory listing on the daemon's host in ONE round trip: kind, size, mtime, permissions and symlink target for every entry, dirs first.
 - `file_stat` (read-only): Stat one path: kind (file/dir/link/other), size, mtime, mode, owner, symlink target.
 - `file_read` (read-only): Read a file (ranged).
@@ -317,6 +318,48 @@ Group and read-only classification are fields of the one tool table,
 (the extra fields never reach the wire). A tool is therefore one entry:
 it cannot be advertised without a group or grouped without being
 advertised.
+
+## Syncing a directory (`file_sync`)
+
+`file_sync {local_dir, targets: [{host?, path}], keep_newer, delete,
+exclude, dry_run}` makes the CONTENTS of `local_dir` present in up to 32
+destinations: SSH hosts, and local directories when `host` is omitted.
+It replaces the tar + `scp_put` per host + unpack per host loop.
+
+- **Method per target.** Each distinct host is probed once per call
+  (`rsync --version` and `tar`). When rsync works on BOTH ends the
+  target syncs with `rsync -rlpt`, its `-e` built from the same ssh
+  options every sketerm leg uses (ForwardX11=no, BatchMode, sketerm's
+  ControlMaster, a forced Tor route). Otherwise a tar stream goes over
+  ssh: it is extracted into `.sketerm-sync-<nonce>/` INSIDE the target,
+  every staged file's SHA-256 is checked against the local hash before
+  anything lands (one mismatch applies nothing), then each entry is moved
+  into place. The method is a per-target fact (`method`), and so is how
+  the landed files were verified (`verification`).
+- **keep_newer** (default true) never overwrites a destination file
+  modified after the local copy: rsync `--update`; in tar mode the
+  manifest diff skips it and the apply re-checks with `find -newer`, so a
+  file changed on the host between the two is still kept. With
+  `keep_newer:false`, content decides (`--checksum`, or the sha256
+  manifest).
+- **delete** removes destination files `local_dir` lacks, strictly
+  inside the target, and never what an `exclude` pattern covers. It only
+  runs on an explicit `delete:true`, is refused for a target directory
+  that does not already exist, and is refused outright for an empty
+  `local_dir`.
+- **Refusals.** A target that is `/` or the home directory (also as the
+  HOST resolves it, so a symlink to either is caught), a path with `..`,
+  an empty path, a target that exists as a file, a local target nested
+  with `local_dir`, the same destination twice, and (tar mode) a path
+  that is a file on one side and a directory on the other. Symlinks in
+  `local_dir` are copied as links and never followed.
+- **dry_run** changes and creates nothing; each target reports what it
+  would send and delete (`sent`/`deleted`) and the text lane lists the
+  first paths.
+- At most 4 targets run at once, one deadline (`timeout_ms`, max 120 s)
+  covers every leg, and a failed target is a `targets[]` entry with
+  `status:"failed"` and an `error`, never an aborted call.
+  `capabilities` reports `file_sync` and `file_sync_local_rsync`.
 
 ## Terminal waits
 

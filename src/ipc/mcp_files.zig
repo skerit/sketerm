@@ -281,6 +281,7 @@ pub fn filesTool(arena: std.mem.Allocator, tool: Tool, args: std.json.Value) ![]
     return switch (tool) {
         .scp_put => mcp_term.scpTool(arena, true, args),
         .scp_get => mcp_term.scpTool(arena, false, args),
+        .file_sync => mcp_term.fileSyncTool(arena, args),
 
         .file_list => withFs(arena, args, fileList),
         .file_stat => withFs(arena, args, fileStat),
