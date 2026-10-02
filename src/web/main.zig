@@ -30,6 +30,9 @@ const cefhost = @import("cefhost.zig");
 const ozone = @import("ozone.zig");
 const server = @import("server.zig");
 const pathz = @import("../util/pathz.zig");
+const untrusted = @import("cefhost/untrusted.zig");
+const cef = @import("cef");
+const untrusted_env = @import("untrusted_env.zig");
 
 const USAGE =
     \\sketerm-web --socket PATH [--cache-dir PATH] [--proxy URL] [--linger-ms N]
@@ -49,6 +52,33 @@ const PRELOAD_GUARD = "SKETERM_WEB_PRELOADED";
 
 pub fn main(init: std.process.Init.Minimal) u8 {
     const argv = init.args.vector;
+    var restricted = c.getenv("SKETERM_WEB_UNTRUSTED") != null;
+    var subprocess = false;
+    var private_root: ?[*:0]const u8 = null;
+    var lifetime_fd: c_int = -1;
+    for (argv, 0..) |arg, index| {
+        const text = std.mem.span(arg);
+        if (std.mem.eql(u8, text, "--untrusted")) restricted = true;
+        if (std.mem.startsWith(u8, text, "--type=")) subprocess = true;
+        if (std.mem.eql(u8, text, "--untrusted-root") and index + 1 < argv.len) private_root = argv[index + 1];
+        if (std.mem.eql(u8, text, "--untrusted-lifetime-fd") and index + 1 < argv.len)
+            lifetime_fd = std.fmt.parseInt(c_int, std.mem.span(argv[index + 1]), 10) catch return 2;
+    }
+    untrusted.enabled = restricted;
+    if (restricted) {
+        if (cef.sk_web_untrusted_core_limit() == 0 or c.setenv("SKETERM_WEB_UNTRUSTED", "1", 1) != 0) return 1;
+        // The launcher already filtered envp; a direct launch gets the same list.
+        if (!scrubUntrustedEnv()) return 1;
+        // Only the original, pre-CEF process owns cleanup; the browser's
+        // preload re-exec and CEF subprocesses must never fork another owner.
+        if (!subprocess and c.getenv("SKETERM_WEB_SUPERVISED") == null) {
+            const root = private_root orelse return 2;
+            if (cef.sk_web_supervise(root, lifetime_fd) == 0) {
+                std.debug.print("sketerm-web: untrusted lifecycle supervisor refused\n", .{});
+                return 1;
+            }
+        }
+    }
 
     // (1) DT_NEEDED order workaround, LINUX ONLY. Zig always emits libc
     // BEFORE libcef, and libcef's zygote resolves dlsym(RTLD_NEXT,
@@ -65,12 +95,6 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         reexecPreloaded(argv);
         // Only reachable if the re-exec failed; carry on and hope the
         // zygote never needs the symbol.
-    }
-
-    // (2) Configures the API version for every later libcef call.
-    if (!cefhost.apiHash()) {
-        std.debug.print("sketerm-web: cef_api_hash failed\n", .{});
-        return 1;
     }
 
     // (3) OUR OWN ARGUMENTS, COPIED, BEFORE CEF EVER SEES ARGV.
@@ -144,12 +168,38 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         }
     }
 
+    // The broker is created before CEF can spawn a thread or subprocess.
+    // Every browser descendant inherits the irreversible socket restriction.
+    if (restricted) {
+        if (instance_proxy.len != 0) return 2;
+        if (!subprocess) {
+            const dir = cache_dir orelse return 2;
+            pathz.makeDirs(dir, 0o700) catch return 1;
+            var dir_buf: [4096]u8 = undefined;
+            const dir_z = std.fmt.bufPrintZ(&dir_buf, "{s}", .{dir}) catch return 1;
+            if (cef.sk_web_untrusted_start(dir_z) == 0) {
+                std.debug.print("sketerm-web: untrusted broker unavailable\n", .{});
+                return 1;
+            }
+        }
+        if (cef.sk_web_untrusted_confine() == 0) {
+            if (!subprocess) cef.sk_web_untrusted_stop();
+            std.debug.print("sketerm-web: untrusted confinement refused\n", .{});
+            return 1;
+        }
+    }
+    defer if (restricted and !subprocess) cef.sk_web_untrusted_stop();
+
+    // The hash remains the first libcef call, including in subprocesses.
+    if (!cefhost.apiHash()) return 1;
+
     // (4) The argv handed to CEF must go to cef_execute_process TOO,
     // not just cef_initialize: Chromium's global command line is
     // initialized by whichever runs first, and switches missing there
     // are silently ignored (a browser process that keeps its GPU
     // process paints EMPTY frames in windowless mode).
-    var disable_cap = cefargs.disable_features_prefix.len + cefargs.read_anything_feature.len + 2;
+    var disable_cap = cefargs.disable_features_prefix.len + cefargs.read_anything_feature.len + 2 +
+        (if (restricted) untrusted.chromium_features.len + 1 else @as(usize, 0));
     for (argv) |a| {
         const value = cefargs.disableFeaturesValue(std.mem.span(a)) orelse continue;
         const extra = std.math.add(usize, value.len, 1) catch {
@@ -171,6 +221,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         const value = cefargs.disableFeaturesValue(std.mem.span(a)) orelse continue;
         disable_builder.add(value) catch return 1;
     }
+    if (restricted) disable_builder.add(untrusted.chromium_features) catch return 1;
     const disable_features = disable_builder.finish() catch return 1;
 
     var argv_buf: [64][*c]u8 = undefined;
@@ -211,7 +262,13 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             std.debug.print("sketerm-web: cef_initialize failed\n", .{});
             return 1;
         }
-        defer cefhost.shutdown();
+        defer {
+            if (restricted) cef.sk_web_untrusted_stop();
+            cefhost.shutdown();
+        }
+        // Dumpability waits until the zygotes exist: a non-dumpable parent
+        // cannot write the uid_map of the namespace sandbox's child.
+        if (restricted and cef.sk_web_untrusted_nondumpable() == 0) return 1;
 
         var srv = server.Server.init(gpa, sock);
         srv.profile_dir = cache;
@@ -235,6 +292,33 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
 /// Re-exec this binary with LD_PRELOAD pointing at the CEF library the
 /// build linked against. Returns only on failure.
+/// Applies `untrusted_env` to this process; SKETERM_WEB_SUPERVISED is kept
+/// because it marks a process the supervisor already forked.
+fn scrubUntrustedEnv() bool {
+    var names: [64][256:0]u8 = undefined;
+    var count: usize = 0;
+    var i: usize = 0;
+    while (std.c.environ[i]) |entry| : (i += 1) {
+        const text = std.mem.span(entry);
+        const name = text[0 .. std.mem.indexOfScalar(u8, text, '=') orelse text.len];
+        if (std.mem.eql(u8, name, "SKETERM_WEB_SUPERVISED") or !untrusted_env.dropped(name)) continue;
+        // unsetenv rewrites environ, so names are copied out first.
+        if (count == names.len or name.len >= names[0].len) return false;
+        @memcpy(names[count][0..name.len], name);
+        names[count][name.len] = 0;
+        count += 1;
+    }
+    for (names[0..count]) |*name| if (c.unsetenv(name) != 0) return false;
+    for (untrusted_env.sets) |kv| {
+        var key: [64:0]u8 = undefined;
+        var value: [64:0]u8 = undefined;
+        const k = std.fmt.bufPrintZ(&key, "{s}", .{kv[0]}) catch return false;
+        const v = std.fmt.bufPrintZ(&value, "{s}", .{kv[1]}) catch return false;
+        if (c.setenv(k.ptr, v.ptr, 1) != 0) return false;
+    }
+    return true;
+}
+
 fn reexecPreloaded(argv: []const [*:0]const u8) void {
     var preload: [4096]u8 = undefined;
     const lib = std.fmt.bufPrintZ(&preload, "{s}/libcef.so", .{build_options.cef_release_dir}) catch return;
@@ -287,6 +371,27 @@ fn reexecPreloaded(argv: []const [*:0]const u8) void {
 /// through untouched: that is how the smoke rig pins a mode.
 fn buildCefArgv(argv: []const [*:0]const u8, disable_features: [:0]u8, buf: *[64][*c]u8) [][*c]u8 {
     var n = cefargs.withDefaults(argv, disable_features, buf).len;
+    if (untrusted.enabled) {
+        const switches = [_][*:0]const u8{
+            "--disable-blink-features=" ++ untrusted.blink_features,
+            "--host-resolver-rules=MAP * ~NOTFOUND",
+            // NO_NEW_PRIVS forbids the setuid helper; naming it off makes the
+            // namespace sandbox the only candidate instead of a fallback.
+            "--disable-setuid-sandbox",
+            "--disable-background-networking",
+            "--disable-component-update",
+            "--disable-extensions",
+            "--disable-component-extensions-with-background-pages",
+            "--disable-quic",
+            "--disable-breakpad",
+            "--no-proxy-server",
+        };
+        if (n + switches.len > buf.len) c._exit(2);
+        for (switches) |value| {
+            buf[n] = @ptrCast(@constCast(value));
+            n += 1;
+        }
+    }
     // macOS has no ozone at all — Chromium uses its own windowing
     // layer, and `--ozone-platform=` is simply not a switch there. The
     // GPU decision the rest of this function makes is likewise moot:

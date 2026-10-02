@@ -115,6 +115,7 @@ const unconditional_caps = [_]proto.Cap{
     .context_menu,
     .intercept,
     .net_policy,
+    .net_policy_ack,
     .capture,
     .tls,
     .permissions,
@@ -150,6 +151,7 @@ const unconditional_caps = [_]proto.Cap{
     .cookie_sync,
     .observe,
     .load_retry,
+    .web_emulation,
 };
 
 /// Test-only negotiation seam: an environment switch that withholds one
@@ -160,7 +162,10 @@ fn withheld(cap: proto.Cap) bool {
         .reader_ids => "SKETERM_WEB_DISABLE_READER_IDS",
         .semantic_request_ids => "SKETERM_WEB_DISABLE_SEMANTIC_REQUEST_IDS",
         .net_policy => "SKETERM_WEB_DISABLE_NET_POLICY",
+        .net_policy_ack => "SKETERM_WEB_DISABLE_NET_POLICY_ACK",
         .capture => "SKETERM_WEB_DISABLE_CAPTURE",
+        .untrusted_web => "SKETERM_WEB_DISABLE_UNTRUSTED",
+        .web_emulation => "SKETERM_WEB_DISABLE_EMULATION",
         else => return false,
     };
     return c.getenv(env) != null;
@@ -823,14 +828,17 @@ pub const Server = struct {
             self.host.dispatch_inline = false;
             self.host.dispatch_alias = 0;
         }
+        if (cefhost.untrusted.enabled and proto.untrustedWithheld(frame.tag)) return refuseWithheld(cn, frame);
         switch (frame.tag) {
             .hello => {
                 const req = try proto.decode(proto.Hello, frame.payload);
                 if (req.proto != proto.PROTO_VERSION) return error.ProtocolMismatch;
                 var caps: CapList = .{};
                 for (unconditional_caps) |cap| {
+                    if (cefhost.untrusted.enabled and proto.untrustedWithholdsCap(cap)) continue;
                     if (!withheld(cap)) caps.add(cap);
                 }
+                if (cefhost.untrusted.enabled and !withheld(.untrusted_web)) caps.add(.untrusted_web);
                 if (cefhost.isAccelerated()) caps.add(.frames_dmabuf);
                 if (self.host.presenterActive()) caps.add(.presenter);
                 try cn.out.post(proto.HelloAck{
@@ -853,6 +861,7 @@ pub const Server = struct {
             .view_show => self.host.showView((try self.dec(cn, proto.ViewShow, frame.payload)).view, true),
             .view_hide => self.host.showView((try self.dec(cn, proto.ViewHide, frame.payload)).view, false),
             .view_max_fps => self.host.setMaxFps(try self.dec(cn, proto.ViewMaxFps, frame.payload)),
+            .view_emulation => try self.host.setEmulation(try self.dec(cn, proto.ViewEmulation, frame.payload)),
             .cert_decision => self.host.certDecision(try self.dec(cn, proto.CertDecision, frame.payload)),
             .permission_decision => self.host.permissionDecision(try self.dec(cn, proto.PermissionDecision, frame.payload)),
             .navigate => self.host.navigate(try self.dec(cn, proto.Navigate, frame.payload)),
@@ -1003,6 +1012,30 @@ pub const Server = struct {
             .webext_open_popup_result => self.host.webextOpenPopupResult(try self.dec(cn, proto.WebextOpenPopupResult, frame.payload)),
             // Helper-to-client frames arriving from the client, and any
             // tag this build does not act on, are ignored by design.
+            else => {},
+        }
+    }
+
+    const withheld_msg = "refused: this untrusted helper does not serve this request";
+
+    /// Answer a withheld request: the generic refusal, plus the family's own
+    /// failure reply where a client blocks on one. Ids are echoed in the
+    /// client's own namespace, so nothing is translated.
+    fn refuseWithheld(cn: *Conn, frame: proto.Frame) !void {
+        try cn.out.post(proto.EvRequestRefused{ .request = @intFromEnum(frame.tag), .reason = withheld_msg }, null);
+        switch (frame.tag) {
+            .devtools_show => {
+                const req = try proto.decode(proto.DevToolsShow, frame.payload);
+                try cn.out.post(proto.EvDevToolsView{ .view = req.view, .devtools = 0, .reason = "untrusted" }, null);
+            },
+            .print_pdf => {
+                const req = try proto.decode(proto.PrintPdf, frame.payload);
+                try cn.out.post(proto.EvPrintPdfDone{ .view = req.view, .ok = 0, .path = req.path }, null);
+            },
+            .download_start => {
+                const req = try proto.decode(proto.DownloadStart, frame.payload);
+                try cn.out.post(proto.EvDownloadProgress{ .view = req.view, .id = 0, .received = 0, .total = 0, .done = 0, .failed = 1, .req = req.req }, null);
+            },
             else => {},
         }
     }

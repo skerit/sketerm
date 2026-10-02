@@ -87,6 +87,7 @@
 #include <sys/types.h>
 #include <sys/ioctl.h>
 #include <sys/wait.h>
+#include <sys/resource.h>
 #ifdef __linux__
 #include <malloc.h>      /* mallinfo2: C-heap leak assertions in tests
                           * (cairo/freetype allocate via malloc, which

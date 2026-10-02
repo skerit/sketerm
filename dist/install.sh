@@ -180,6 +180,12 @@ probe_web() {
     web_why="CEF headers or runtime not found (set CEF_INCLUDE and CEF_LIB for a system CEF install)"
     [ -f "$CEF_INCLUDE/include/capi/cef_app_capi.h" ] || return 0
     [ -f "$CEF_LIB/libcef.so" ] || return 0
+    # The untrusted-mode HTTP broker compiles against curl/curl.h and
+    # dlopens libcurl at runtime; nothing links it.
+    if ! pkg-config --modversion libcurl >/dev/null 2>&1; then
+        web_why="libcurl development files missing (install libcurl4-openssl-dev)"
+        return 0
+    fi
     web_ok=1
     web_why=""
 }
@@ -222,6 +228,9 @@ DEB_BUILD_DEPS_OPTIONAL=(libgtk4-layer-shell-dev)
 # -Dvideo off and says so, and apps forward losslessly. Optional for both
 # the GUI and the mux-only package, since the daemon is the encoder.
 DEB_BUILD_DEPS_VIDEO=(libx264-dev libavcodec-dev libavutil-dev libsvtav1enc-dev)
+# Header for the browser helper's untrusted-mode broker (libcurl is
+# dlopen'd, never linked). Optional: without it probe_web omits the helper.
+DEB_BUILD_DEPS_WEB=(libcurl4-openssl-dev)
 
 install_deb_deps_optional() {
     local -n list=$1
@@ -358,7 +367,10 @@ do_debian() {
         # Runtime-dlopen'd, all optional by design: absent means the
         # feature degrades, never that the binary fails to start.
         if [ "$kind" = gui ]; then
-            echo "Recommends: libopus0, libglycin-2-0, glycin-loaders, gstreamer1.0-plugins-good, gstreamer1.0-libav, gstreamer1.0-pipewire, ffmpeg"
+            web_recommends=""
+            # The helper's untrusted mode dlopens libcurl, so ldd cannot see it.
+            [ "$web_ok" -eq 1 ] && web_recommends=", libcurl4t64 | libcurl4"
+            echo "Recommends: libopus0, libglycin-2-0, glycin-loaders, gstreamer1.0-plugins-good, gstreamer1.0-libav, gstreamer1.0-pipewire, ffmpeg$web_recommends"
         else
             echo "Recommends: libopus0, ffmpeg"
         fi
@@ -565,6 +577,7 @@ if command -v dpkg-deb >/dev/null 2>&1; then
         else
             install_deb_deps DEB_BUILD_DEPS
             install_deb_deps_optional DEB_BUILD_DEPS_OPTIONAL
+            install_deb_deps_optional DEB_BUILD_DEPS_WEB
         fi
         install_deb_deps_optional DEB_BUILD_DEPS_VIDEO
     fi

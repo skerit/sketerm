@@ -46,3 +46,8 @@
 // downloaded.
 #include "include/capi/cef_urlrequest_capi.h"
 #include "include/cef_version.h"
+// Untrusted-mode HTTP broker (vendor/web_untrusted.c): its reason enum,
+// limits and entry points, so the helper never hand-copies them.
+#include "web_untrusted.h"
+// Untrusted-mode cleanup supervisor (vendor/web_supervisor.c).
+#include "web_supervisor.h"

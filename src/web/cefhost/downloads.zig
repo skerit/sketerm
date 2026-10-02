@@ -315,7 +315,7 @@ pub fn onCanDownload(
     _: [*c]const cef.cef_string_t,
 ) callconv(.c) c_int {
     releaseArg(browser);
-    return 1;
+    return @intFromBool(!host_mod.untrusted.enabled);
 }
 
 /// The engine's download entry for `id`, minted on first sight — the
@@ -338,6 +338,7 @@ pub fn onBeforeDownload(
     defer releaseArg(download_item);
     var kept = false;
     defer if (!kept) releaseArg(callback);
+    if (host_mod.untrusted.enabled) return 0;
     const host = host_mod.g_host orelse return 0;
     const v = viewOf(browser) orelse return 0;
     const item: *cef.cef_download_item_t = download_item orelse return 0;
@@ -390,6 +391,10 @@ pub fn onDownloadUpdated(
     // every other exit returns it.
     var kept = false;
     defer if (!kept) releaseArg(callback);
+    if (host_mod.untrusted.enabled) {
+        if (callback) |cb| if (cb.*.cancel) |cancel| cancel(cb);
+        return;
+    }
     const host = host_mod.g_host orelse return;
     const item: *cef.cef_download_item_t = download_item orelse return;
     const id: u32 = if (item.get_id) |gid| gid(item) else return;
@@ -438,4 +443,31 @@ pub fn onDownloadUpdated(
             kept = true;
         }
     }
+}
+
+test "untrusted download callbacks cancel without creating offers or target files" {
+    const saved = host_mod.untrusted.enabled;
+    defer host_mod.untrusted.enabled = saved;
+    host_mod.untrusted.enabled = true;
+    const Fake = struct {
+        var releases: usize = 0;
+        var cancels: usize = 0;
+        fn release(_: [*c]cef.cef_base_ref_counted_t) callconv(.c) c_int {
+            releases += 1;
+            return 0;
+        }
+        fn cancel(_: [*c]cef.cef_download_item_callback_t) callconv(.c) void {
+            cancels += 1;
+        }
+    };
+    var before = std.mem.zeroes(cef.cef_before_download_callback_t);
+    before.base.release = Fake.release;
+    var updated = std.mem.zeroes(cef.cef_download_item_callback_t);
+    updated.base.release = Fake.release;
+    updated.cancel = Fake.cancel;
+    try std.testing.expectEqual(@as(c_int, 0), onCanDownload(null, null, null, null));
+    try std.testing.expectEqual(@as(c_int, 0), onBeforeDownload(null, null, null, null, &before));
+    onDownloadUpdated(null, null, null, &updated);
+    try std.testing.expectEqual(@as(usize, 2), Fake.releases);
+    try std.testing.expectEqual(@as(usize, 1), Fake.cancels);
 }

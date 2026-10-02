@@ -11,6 +11,7 @@
 const std = @import("std");
 const filter = @import("filter.zig");
 const proto = @import("protocol.zig");
+const urlhost = @import("urlhost.zig");
 
 /// Hosts an allow-list can carry. The MCP layer refuses more, loudly;
 /// the wire clamps at u16 as a last resort.
@@ -41,9 +42,7 @@ pub const default_schemes: u16 = Scheme.http.bit() | Scheme.https.bit();
 pub const Policy = struct {
     arena_state: std.heap.ArenaAllocator,
     serial: u32,
-    /// Hosts (and, `hostWithin`-style, their subdomains) the TOP-LEVEL
-    /// document may load from. Never empty: an empty allow-list is
-    /// refused at parse time, not silently allow-all.
+    /// Empty means no hosted top-level requests, never allow-all.
     allow_top: []const []const u8 = &.{},
     /// EXTRA hosts subresources may use; the effective subresource list
     /// is always the union with `allow_top`.
@@ -52,6 +51,7 @@ pub const Policy = struct {
     block_types: u16 = 0,
     allow_schemes: u16 = default_schemes,
     allow_private: bool = false,
+    untrusted: bool = false,
     max_requests: u32 = 0,
     max_bytes: u64 = 0,
     max_navigations: u32 = 0,
@@ -68,6 +68,7 @@ pub const Policy = struct {
             .block_types = req.block_types,
             .allow_schemes = req.allow_schemes,
             .allow_private = req.flags & proto.NetPolicySet.flag_allow_private != 0,
+            .untrusted = req.flags & proto.NetPolicySet.flag_untrusted != 0,
             .max_requests = req.max_requests,
             .max_bytes = req.max_bytes,
             .max_navigations = req.max_navigations,
@@ -93,8 +94,7 @@ fn dupeHosts(arena: std.mem.Allocator, hosts: []const []const u8) ![]const []con
     return out;
 }
 
-/// Live accounting for one view. Mutated ONLY on the IO thread under
-/// the intercept lock (cefhost owns the locking).
+/// Live accounting for one view, mutated under the helper's intercept lock.
 pub const Counters = struct {
     /// Policy install time; the deadline anchors here.
     started_ms: i64 = 0,
@@ -111,6 +111,7 @@ pub const Counters = struct {
 pub const Req = struct {
     host: []const u8,
     scheme: []const u8,
+    port: u16 = 0,
     rtype: filter.RType,
     is_top: bool,
     /// The ring already holds a live entry with this request id: CEF
@@ -119,44 +120,117 @@ pub const Req = struct {
     is_redirect_hop: bool = false,
 };
 
-/// The verdict, first refusal wins, cheapest checks first. Pure: no
-/// allocation, no clock. Budget hits LATCH `c.exhausted`; the caller
-/// commits counter updates for allowed requests via `commit`.
-pub fn decide(p: *const Policy, c: *const Counters, r: Req, now_ms: i64) proto.NetReason {
+/// Check budgets without counting or latching; navigation preflight and the resource gate share this rule.
+pub fn budgetReason(p: *const Policy, c: *const Counters, is_top: bool, scheme: []const u8, now_ms: i64) proto.NetReason {
     if (c.exhausted != .none) return c.exhausted;
     if (p.deadline_ms != 0 and now_ms - c.started_ms >= p.deadline_ms) return .deadline;
+    if (std.mem.eql(u8, scheme, "about")) return .none;
+    if (is_top and p.max_navigations != 0 and c.navigations >= p.max_navigations) return .nav_cap;
+    if (p.max_requests != 0 and c.requests >= p.max_requests) return .request_cap;
+    if (p.max_bytes != 0 and c.bytes >= p.max_bytes) return .byte_cap;
+    return .none;
+}
+
+/// First refusal wins; callers count allowed requests with `commit` and latch refusals with `deny`.
+pub fn decide(p: *const Policy, c: *const Counters, r: Req, now_ms: i64) proto.NetReason {
+    const budget = budgetReason(p, c, r.is_top, r.scheme, now_ms);
+    if (c.exhausted != .none or budget == .deadline) return budget;
 
     // The view's own blank document; refusing it breaks view creation.
     if (std.mem.eql(u8, r.scheme, "about")) return .none;
     const scheme = std.meta.stringToEnum(Scheme, r.scheme) orelse return .scheme;
+    if (p.untrusted and scheme != .http and scheme != .https) return .untrusted_transport;
     if (p.allow_schemes & scheme.bit() == 0) return .scheme;
 
     // Hostless schemes (data:, about:, blob:) are judged by scheme
     // alone: there is no authority to test.
     if (r.host.len > 0) {
         if (!p.allow_private and isPrivateHostLiteral(r.host)) return .private_address;
-        const listed = hostAllowed(p, r.host, r.is_top);
+        const listed = hostAllowed(p, r);
         if (!listed) return if (r.is_redirect_hop) .redirect_host else if (r.is_top) .top_host else .sub_host;
     }
 
     if (p.block_types & r.rtype.bit() != 0) return .resource_type;
 
-    if (r.is_top and p.max_navigations != 0 and c.navigations >= p.max_navigations) return .nav_cap;
-    if (p.max_requests != 0 and c.requests >= p.max_requests) return .request_cap;
-    if (p.max_bytes != 0 and c.bytes >= p.max_bytes) return .byte_cap;
-    return .none;
+    return budget;
 }
 
-fn hostAllowed(p: *const Policy, host: []const u8, is_top: bool) bool {
+fn hostAllowed(p: *const Policy, r: Req) bool {
     for (p.allow_top) |base| {
-        if (filter.hostWithin(host, base)) return true;
+        if (entryAllows(base, r.host, r.port, r.scheme, p.untrusted)) return true;
     }
-    if (!is_top) {
+    if (!r.is_top) {
         for (p.allow_sub) |base| {
-            if (filter.hostWithin(host, base)) return true;
+            if (entryAllows(base, r.host, r.port, r.scheme, p.untrusted)) return true;
         }
     }
     return false;
+}
+
+/// An IP-literal entry names exactly that address (compared as bytes, so
+/// spelling and case do not matter); a hostname entry also covers its
+/// subdomains and never an address.
+fn hostMatches(host: []const u8, base: []const u8) bool {
+    if (ipLiteral(base)) |want| {
+        const got = ipLiteral(host) orelse return false;
+        return got.eql(want);
+    }
+    if (ipLiteral(host) != null) return false;
+    return filter.hostWithin(host, base);
+}
+
+pub fn entryAllows(entry: []const u8, host: []const u8, port: u16, scheme: []const u8, untrusted: bool) bool {
+    const base = urlhost.authorityOf(entry) orelse return false;
+    const target = urlhost.authorityOf(host) orelse return false;
+    if (!hostMatches(target.host, base.host)) return false;
+    const effective = if (port != 0) port else urlhost.defaultPort(scheme);
+    if (base.port != 0) return effective == base.port;
+    return !untrusted or (effective != 0 and effective == urlhost.defaultPort(scheme));
+}
+
+pub fn entrySubset(narrow: []const u8, wide: []const u8, untrusted: bool, schemes: u16) bool {
+    const n = urlhost.authorityOf(narrow) orelse return false;
+    const w = urlhost.authorityOf(wide) orelse return false;
+    if (!hostMatches(n.host, w.host)) return false;
+    if (w.port != 0) return n.port == w.port;
+    if (!untrusted or n.port == 0) return true;
+    // An explicit port spans schemes; a bare untrusted entry does not.
+    for ([_]Scheme{ .http, .https }) |scheme| {
+        if (schemes & scheme.bit() != 0 and n.port != urlhost.defaultPort(@tagName(scheme))) return false;
+    }
+    return true;
+}
+
+/// Compare complete policies without allowing a replacement to expand any request scope.
+pub fn subsetOf(next: *const Policy, old: *const Policy) bool {
+    if (next.untrusted != old.untrusted or
+        (next.allow_private and !old.allow_private) or
+        next.allow_schemes & ~old.allow_schemes != 0 or
+        old.block_types & ~next.block_types != 0) return false;
+    inline for (.{ "max_requests", "max_bytes", "max_navigations", "deadline_ms" }) |field| {
+        const before = @field(old, field);
+        const after = @field(next, field);
+        if (before != 0 and (after == 0 or after > before)) return false;
+    }
+    for (next.allow_top) |entry| {
+        var covered = false;
+        for (old.allow_top) |base| if (entrySubset(entry, base, old.untrusted, next.allow_schemes)) {
+            covered = true;
+            break;
+        };
+        if (!covered) return false;
+    }
+    for (next.allow_sub) |entry| {
+        var covered = false;
+        for ([_][]const []const u8{ old.allow_top, old.allow_sub }) |list| {
+            for (list) |base| if (entrySubset(entry, base, old.untrusted, next.allow_schemes)) {
+                covered = true;
+                break;
+            };
+        }
+        if (!covered) return false;
+    }
+    return true;
 }
 
 /// Record one ALLOWED request. Kept beside `decide` so the counting
@@ -185,10 +259,90 @@ pub fn schemeOf(url: []const u8) []const u8 {
     return url[0..colon];
 }
 
-/// A host that IS a literal loopback/private/link-local address, or a
-/// name reserved for one. A hostname that merely RESOLVES to a private
-/// address is invisible here (no resolver on this path) — the positive
-/// host allow-list is the real defence, and the docs say so.
+/// An address literal, family-tagged. IPv4 must be canonical dotted quad
+/// (a leading zero is octal to a URL parser, so it is refused, not read
+/// as decimal); IPv6 may be bracketed, in any case or compression.
+pub const Ip = union(enum) {
+    v4: [4]u8,
+    v6: [16]u8,
+
+    pub fn eql(a: Ip, b: Ip) bool {
+        return switch (a) {
+            .v4 => |x| b == .v4 and std.mem.eql(u8, &x, &b.v4),
+            .v6 => |x| b == .v6 and std.mem.eql(u8, &x, &b.v6),
+        };
+    }
+};
+
+pub fn ipLiteral(host: []const u8) ?Ip {
+    var h = host;
+    if (h.len >= 2 and h[0] == '[' and h[h.len - 1] == ']') h = h[1 .. h.len - 1];
+    if (std.mem.indexOfScalar(u8, h, ':') != null) return .{ .v6 = parseV6(h) orelse return null };
+    const a = std.Io.net.Ip4Address.parse(h, 0) catch return null;
+    return .{ .v4 = a.bytes };
+}
+
+/// RFC 4291 text (one `::`, an optional dotted IPv4 tail, no zone). Not
+/// `std.Io.net.Ip6Address.parse`: it refuses `::ffff:7f00:1`, the very
+/// form Chromium canonicalizes IPv4-mapped hosts to.
+fn parseV6(text: []const u8) ?[16]u8 {
+    var groups: [8]u16 = @splat(0);
+    var n: usize = 0;
+    var gap: ?usize = null;
+    var rest = text;
+    if (std.mem.startsWith(u8, rest, "::")) {
+        gap = 0;
+        rest = rest[2..];
+    } else if (rest.len != 0 and rest[0] == ':') return null;
+    while (rest.len != 0) {
+        const end = std.mem.indexOfScalar(u8, rest, ':') orelse rest.len;
+        const part = rest[0..end];
+        if (std.mem.indexOfScalar(u8, part, '.') != null) {
+            // A dotted IPv4 tail fills the last two groups and ends the text.
+            if (end != rest.len or n > 6) return null;
+            const v4 = std.Io.net.Ip4Address.parse(part, 0) catch return null;
+            groups[n] = @as(u16, v4.bytes[0]) << 8 | v4.bytes[1];
+            groups[n + 1] = @as(u16, v4.bytes[2]) << 8 | v4.bytes[3];
+            n += 2;
+            rest = "";
+            break;
+        }
+        if (part.len == 0 or part.len > 4 or n == 8) return null;
+        groups[n] = std.fmt.parseInt(u16, part, 16) catch return null;
+        n += 1;
+        rest = rest[end..];
+        if (rest.len == 0) break;
+        if (std.mem.startsWith(u8, rest, "::")) {
+            if (gap != null) return null;
+            gap = n;
+            rest = rest[2..];
+        } else {
+            rest = rest[1..];
+            if (rest.len == 0) return null;
+        }
+    }
+    if (gap) |at| {
+        if (n == 8) return null;
+        const tail = n - at;
+        var i: usize = 0;
+        while (i < tail) : (i += 1) {
+            groups[7 - i] = groups[n - 1 - i];
+            groups[n - 1 - i] = 0;
+        }
+    } else if (n != 8) return null;
+    var out: [16]u8 = undefined;
+    for (groups, 0..) |g, i| std.mem.writeInt(u16, out[i * 2 ..][0..2], g, .big);
+    return out;
+}
+
+/// A host the gate must treat as non-public WITHOUT resolving it: a
+/// reserved name, or an address literal outside ordinary public unicast.
+/// The address rule mirrors the untrusted broker's connect-time check
+/// (`sk_public_address` in `vendor/web_untrusted.c`) range for range, so a
+/// literal is refused here exactly when the broker would refuse its
+/// socket. A hostname that merely RESOLVES to a private address is
+/// invisible here (no resolver on this path); the positive host
+/// allow-list and, untrusted, the broker are the defence there.
 pub fn isPrivateHostLiteral(host: []const u8) bool {
     if (host.len == 0) return false;
     // Reserved names.
@@ -196,49 +350,55 @@ pub fn isPrivateHostLiteral(host: []const u8) bool {
     if (std.mem.endsWith(u8, host, ".localhost")) return true;
     if (std.mem.endsWith(u8, host, ".local")) return true;
     if (std.mem.endsWith(u8, host, ".internal")) return true;
-    // IPv6 literal (urlhost keeps the brackets off or on; accept both).
+    if (ipLiteral(host)) |ip| return switch (ip) {
+        .v4 => |b| !publicV4(b),
+        .v6 => |b| !publicV6(b),
+    };
+    // Address-shaped but not a canonical literal (an unparseable IPv6, a
+    // numeric last label a URL parser reads as IPv4): refuse, never guess.
     var h = host;
-    if (h[0] == '[' and h[h.len - 1] == ']') h = h[1 .. h.len - 1];
-    if (std.mem.indexOfScalar(u8, h, ':') != null) return isPrivateV6(h);
-    return isPrivateV4(h);
+    if (h[0] == '[') return true;
+    if (std.mem.indexOfScalar(u8, h, ':') != null) return true;
+    if (std.mem.lastIndexOfScalar(u8, h, '.')) |dot| h = h[dot + 1 ..];
+    return numericLabel(h);
 }
 
-fn isPrivateV6(h: []const u8) bool {
-    if (std.mem.eql(u8, h, "::1") or std.mem.eql(u8, h, "::")) return true;
-    // fc00::/7 (fc, fd) and fe80::/10 (fe80-febf).
-    if (h.len >= 2) {
-        const a = std.ascii.toLower(h[0]);
-        const b = std.ascii.toLower(h[1]);
-        if (a == 'f' and (b == 'c' or b == 'd')) return true;
-        if (h.len >= 4 and a == 'f' and b == 'e') {
-            const c3 = std.ascii.toLower(h[2]);
-            if (c3 == '8' or c3 == '9' or c3 == 'a' or c3 == 'b') return true;
-        }
-    }
-    return false;
+/// The broker's `sk_public_v4`: everything IANA reserves as special-purpose,
+/// multicast or reserved is not public.
+pub fn publicV4(b: [4]u8) bool {
+    if (b[0] == 0 or b[0] == 10 or b[0] == 127 or b[0] >= 224) return false;
+    if (b[0] == 100 and (b[1] & 0xc0) == 64) return false;
+    if (b[0] == 169 and b[1] == 254) return false;
+    if (b[0] == 172 and (b[1] & 0xf0) == 16) return false;
+    if (b[0] == 192 and (b[1] == 168 or (b[1] == 0 and (b[2] == 0 or b[2] == 2)) or (b[1] == 88 and b[2] == 99))) return false;
+    if (b[0] == 198 and (b[1] == 18 or b[1] == 19 or (b[1] == 51 and b[2] == 100))) return false;
+    if (b[0] == 203 and b[1] == 0 and b[2] == 113) return false;
+    return true;
 }
 
-fn isPrivateV4(h: []const u8) bool {
-    var parts: [4]u32 = undefined;
-    var n: usize = 0;
-    var it = std.mem.splitScalar(u8, h, '.');
-    while (it.next()) |part| {
-        if (n >= 4 or part.len == 0 or part.len > 3) return false;
-        for (part) |ch| {
-            if (ch < '0' or ch > '9') return false;
-        }
-        parts[n] = std.fmt.parseInt(u32, part, 10) catch return false;
-        if (parts[n] > 255) return false;
-        n += 1;
+/// The broker's IPv6 half: an IPv4-mapped address is judged as its IPv4;
+/// otherwise only 2000::/3 global unicast, minus 2001::/23 (Teredo and the
+/// other protocol assignments), 2001:db8::/32, 2002::/16 (6to4) and 3fff::/20.
+pub fn publicV6(b: [16]u8) bool {
+    const mapped = [12]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
+    if (std.mem.eql(u8, b[0..12], &mapped)) return publicV4(b[12..16].*);
+    if ((b[0] & 0xe0) != 0x20) return false;
+    if (b[0] == 0x20 and b[1] == 0x01 and b[2] < 2) return false;
+    if (b[0] == 0x20 and b[1] == 0x01 and b[2] == 0x0d and b[3] == 0xb8) return false;
+    if (b[0] == 0x20 and b[1] == 0x02) return false;
+    if (b[0] == 0x3f and b[1] == 0xff and (b[2] & 0xf0) == 0) return false;
+    return true;
+}
+
+/// A label a URL parser reads as a number (decimal, or 0x-prefixed hex).
+fn numericLabel(label: []const u8) bool {
+    if (label.len == 0) return false;
+    if (label.len >= 2 and label[0] == '0' and (label[1] == 'x' or label[1] == 'X')) {
+        for (label[2..]) |ch| if (!std.ascii.isHex(ch)) return false;
+        return true;
     }
-    if (n != 4) return false;
-    const a = parts[0];
-    const b = parts[1];
-    if (a == 127 or a == 10 or a == 0) return true;
-    if (a == 172 and b >= 16 and b <= 31) return true;
-    if (a == 192 and b == 168) return true;
-    if (a == 169 and b == 254) return true;
-    return false;
+    for (label) |ch| if (!std.ascii.isDigit(ch)) return false;
+    return true;
 }
 
 /// Resource-class names -> `filter.RType` mask. Derived from the enum
@@ -254,21 +414,90 @@ pub fn schemeBit(name: []const u8) ?u16 {
     return s.bit();
 }
 
-/// A host allow-list entry a caller may store: lower-case labels,
-/// digits, '-' and '.', no scheme, no port, no path, no wildcard. A
-/// bare IP literal is fine (it is a host).
+/// Host entries may include a nonzero port; IPv6 with a port must be bracketed.
+///
+/// An entry is EITHER a complete address literal (matched exactly) or a
+/// lower-case hostname whose last label is not numeric: "0.1" or "2.3.4"
+/// would otherwise act as a suffix of every address ending in it.
 pub fn validHostEntry(host: []const u8) bool {
     if (host.len == 0 or host.len > 253) return false;
-    if (std.mem.eql(u8, host, "*")) return false;
-    // IPv6 literals keep their colons (always at least two of them);
-    // ONE colon is a :port, which an entry must not carry.
-    const v6 = host[0] == '[' or std.mem.count(u8, host, ":") >= 2;
-    for (host) |ch| {
-        const ok = (ch >= 'a' and ch <= 'z') or (ch >= '0' and ch <= '9') or
-            ch == '-' or ch == '.' or (v6 and (ch == ':' or ch == '[' or ch == ']'));
-        if (!ok) return false;
+    const authority = urlhost.authorityOf(host) orelse return false;
+    if (ipLiteral(authority.host) != null) return true;
+    if (std.mem.indexOfScalar(u8, authority.host, ':') != null) return false;
+    var it = std.mem.splitScalar(u8, authority.host, '.');
+    var last: []const u8 = "";
+    while (it.next()) |label| {
+        if (label.len == 0 or label.len > 63 or label[0] == '-' or label[label.len - 1] == '-') return false;
+        for (label) |ch| {
+            const ok = (ch >= 'a' and ch <= 'z') or (ch >= '0' and ch <= '9') or ch == '-';
+            if (!ok) return false;
+        }
+        last = label;
     }
-    return true;
+    return !numericLabel(last);
+}
+
+/// Errors `canonicalEntry` names so a caller can say WHY a url host cannot be an entry.
+pub const EntryError = error{ NonAscii, InvalidHost, NoSpaceLeft };
+
+/// The policy entry for a url's host (and port, when nonzero): lower-cased
+/// hostname, or an address literal in the form Chromium canonicalizes
+/// request hosts to (RFC 5952 hex groups, IPv6 bracketed). A non-ASCII
+/// (IDN) host is refused: there is no punycode encoder here, and a
+/// lowercased Unicode name would never match the engine's xn-- host.
+pub fn canonicalEntry(buf: []u8, host: []const u8, port: u16) EntryError![]const u8 {
+    for (host) |ch| if (ch >= 0x80) return error.NonAscii;
+    var w = std.Io.Writer.fixed(buf);
+    if (ipLiteral(host)) |ip| switch (ip) {
+        .v4 => |b| w.print("{d}.{d}.{d}.{d}", .{ b[0], b[1], b[2], b[3] }) catch return error.NoSpaceLeft,
+        .v6 => |b| {
+            w.writeByte('[') catch return error.NoSpaceLeft;
+            writeV6(&w, b) catch return error.NoSpaceLeft;
+            w.writeByte(']') catch return error.NoSpaceLeft;
+        },
+    } else {
+        if (host.len > buf.len) return error.NoSpaceLeft;
+        for (host) |ch| w.writeByte(std.ascii.toLower(ch)) catch return error.NoSpaceLeft;
+    }
+    if (port != 0) w.print(":{d}", .{port}) catch return error.NoSpaceLeft;
+    const out = buf[0..w.end];
+    if (!validHostEntry(out)) return error.InvalidHost;
+    return out;
+}
+
+/// RFC 5952 text, hex groups throughout (Chromium writes a mapped address as `::ffff:7f00:1`).
+fn writeV6(w: *std.Io.Writer, b: [16]u8) !void {
+    var parts: [8]u16 = undefined;
+    for (&parts, 0..) |*p, i| p.* = std.mem.readInt(u16, b[i * 2 ..][0..2], .big);
+    var best: usize = 8;
+    var best_len: usize = 0;
+    var i: usize = 0;
+    while (i < 8) {
+        if (parts[i] != 0) {
+            i += 1;
+            continue;
+        }
+        var j = i;
+        while (j < 8 and parts[j] == 0) j += 1;
+        if (j - i > best_len) {
+            best = i;
+            best_len = j - i;
+        }
+        i = j;
+    }
+    if (best_len < 2) best = 8;
+    i = 0;
+    while (i < 8) {
+        if (i == best) {
+            // The group before already wrote its separator.
+            try w.writeAll(if (i == 0) "::" else ":");
+            i += best_len;
+            continue;
+        }
+        try w.print("{x}", .{parts[i]});
+        i += 1;
+        if (i < 8) try w.writeByte(':');
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -342,10 +571,75 @@ test "private-literal table" {
     };
     for (private) |h| try testing.expect(isPrivateHostLiteral(h));
     const public = [_][]const u8{
-        "172.15.0.1",   "172.32.0.1",            "11.0.0.1", "192.169.1.1",  "10.example.com",
-        "notlocalhost", "localhost.example.com", "fe00::1",  "site.example", "1.2.3.4",
+        "172.15.0.1",     "172.32.0.1",            "11.0.0.1",         "192.169.1.1",  "10.example.com",
+        "notlocalhost",   "localhost.example.com", "2606:4700::1111",  "site.example", "1.2.3.4",
+        "[2a00:1450::1]", "[::ffff:1.2.3.4]",      "[::ffff:102:304]",
     };
     for (public) |h| try testing.expect(!isPrivateHostLiteral(h));
+}
+
+test "literal classifier matches the broker's connect-time ranges" {
+    // Each row: a literal and whether `sk_public_address` would connect to it.
+    const rows = [_]struct { []const u8, bool }{
+        .{ "0.0.0.0", false },            .{ "0.255.1.1", false },             .{ "10.1.2.3", false },
+        .{ "100.63.255.255", true },      .{ "100.64.0.1", false },            .{ "100.127.255.255", false },
+        .{ "100.128.0.1", true },         .{ "127.0.0.1", false },             .{ "169.254.1.1", false },
+        .{ "172.16.0.1", false },         .{ "172.31.255.255", false },        .{ "192.0.0.8", false },
+        .{ "192.0.2.1", false },          .{ "192.88.99.1", false },           .{ "192.168.0.1", false },
+        .{ "198.18.0.1", false },         .{ "198.19.255.1", false },          .{ "198.51.100.1", false },
+        .{ "203.0.113.9", false },        .{ "224.0.0.1", false },             .{ "239.255.255.250", false },
+        .{ "240.0.0.1", false },          .{ "255.255.255.255", false },       .{ "8.8.8.8", true },
+        .{ "223.255.255.255", true },     .{ "198.20.0.1", true },             .{ "192.0.1.1", true },
+        .{ "[::]", false },               .{ "[::1]", false },                 .{ "[::ffff:127.0.0.1]", false },
+        .{ "[::ffff:7f00:1]", false },    .{ "[::ffff:a00:1]", false },        .{ "[::ffff:808:808]", true },
+        .{ "[fc00::1]", false },          .{ "[fe80::1]", false },             .{ "[fec0::1]", false },
+        .{ "[ff02::1]", false },          .{ "[ff0e::1]", false },             .{ "[64:ff9b::7f00:1]", false },
+        .{ "[64:ff9b::808:808]", false }, .{ "[2002:7f00:1::]", false },       .{ "[2002:808:808::1]", false },
+        .{ "[2001::1]", false },          .{ "[2001:0:4136:e378::1]", false }, .{ "[2001:1ff::1]", false },
+        .{ "[2001:200::1]", true },       .{ "[2001:db8::1]", false },         .{ "[2001:DB8::1]", false },
+        .{ "[3fff::1]", false },          .{ "[3fff:1000::1]", true },         .{ "[2606:4700::1]", true },
+        .{ "[4000::1]", false },          .{ "[1fff::1]", false },
+    };
+    for (rows) |row| {
+        if (isPrivateHostLiteral(row[0]) == row[1]) {
+            std.debug.print("misclassified {s}\n", .{row[0]});
+            return error.Misclassified;
+        }
+    }
+    // Address-shaped hosts that are not canonical literals are refused, not guessed.
+    for ([_][]const u8{ "2130706433", "0x7f000001", "127.1", "a.0x7f", "[bad::ipv6::]", "010.0.0.1" }) |h|
+        try testing.expect(isPrivateHostLiteral(h));
+}
+
+test "IP literal entries match exactly; hostname entries never match addresses" {
+    try testing.expect(entryAllows("1.2.3.4", "1.2.3.4", 0, "https", false));
+    try testing.expect(!entryAllows("1.2.3.4", "5.1.2.3.4", 0, "https", false));
+    try testing.expect(entryAllows("[2001:0DB8::1]", "2001:db8::1", 0, "https", false));
+    try testing.expect(entryAllows("[2001:db8:0:0::1]:8443", "[2001:db8::1]", 8443, "https", false));
+    try testing.expect(!entryAllows("[2001:db8::1]", "2001:db8::2", 0, "https", false));
+    try testing.expect(!entryAllows("1.2.3.4", "[::ffff:1.2.3.4]", 0, "https", false));
+    try testing.expect(!entryAllows("example", "1.2.3.4", 0, "https", false));
+    try testing.expect(entrySubset("[2001:db8::1]", "[2001:DB8:0::1]", false, default_schemes));
+    try testing.expect(!entrySubset("1.2.3.4", "2.3.4", false, default_schemes));
+    for ([_][]const u8{ "0.1", "2.3.4", "4", "1.2.3", "a.0x1f", "a..b", "-a.example", "a-.example", "example.", "1.2.3.04", "[::1", "::1:8080x" }) |entry|
+        try testing.expect(!validHostEntry(entry));
+    for ([_][]const u8{ "1.2.3.4", "1.2.3.4:80", "2001:db8::1", "[2001:DB8::1]:443", "a1.example", "x-y.example", "localhost" }) |entry|
+        try testing.expect(validHostEntry(entry));
+}
+
+test "canonical entries lower-case names, compress IPv6 and refuse IDN text" {
+    var buf: [300]u8 = undefined;
+    try testing.expectEqualStrings("site.example:8443", try canonicalEntry(&buf, "SiTe.Example", 8443));
+    try testing.expectEqualStrings("[2001:db8::1]", try canonicalEntry(&buf, "[2001:0DB8:0:0::1]", 0));
+    try testing.expectEqualStrings("[::ffff:7f00:1]:443", try canonicalEntry(&buf, "[::ffff:127.0.0.1]", 443));
+    try testing.expectEqualStrings("[::1]", try canonicalEntry(&buf, "[::1]", 0));
+    try testing.expectEqualStrings("[1::]", try canonicalEntry(&buf, "[1:0:0:0:0:0:0:0]", 0));
+    try testing.expectEqualStrings("[1:0:2::3]", try canonicalEntry(&buf, "[1:0:2:0:0:0:0:3]", 0));
+    try testing.expectEqualStrings("[1:2:3:4:5:6:7:8]", try canonicalEntry(&buf, "[1:2:3:4:5:6:7:8]", 0));
+    try testing.expectEqualStrings("10.0.0.1:80", try canonicalEntry(&buf, "10.0.0.1", 80));
+    try testing.expectError(error.NonAscii, canonicalEntry(&buf, "b\xc3\xbccher.example", 0));
+    try testing.expectError(error.InvalidHost, canonicalEntry(&buf, "1.2.3", 0));
+    try testing.expectError(error.InvalidHost, canonicalEntry(&buf, "under_score.example", 0));
 }
 
 test "scheme mask, hostless schemes, and the private toggle" {
@@ -411,6 +705,29 @@ test "navigation cap counts main-frame hops only; byte cap stops the next reques
     try testing.expectEqual(proto.NetReason.byte_cap, over);
 }
 
+test "budget preflight never counts or latches the last allowed navigation" {
+    var set = baseSet();
+    set.max_navigations = 1;
+    const p = try testPolicy(testing.allocator, set);
+    defer p.deinit(testing.allocator);
+    var c = Counters{};
+    try testing.expectEqual(proto.NetReason.none, budgetReason(p, &c, true, "https", 0));
+    try testing.expectEqual(@as(u32, 0), c.requests);
+    commit(&c, true);
+    for (0..3) |_| {
+        try testing.expectEqual(proto.NetReason.nav_cap, budgetReason(p, &c, true, "https", 0));
+        try testing.expectEqual(proto.NetReason.none, c.exhausted);
+        try testing.expectEqual(proto.NetReason.none, budgetReason(p, &c, false, "https", 0));
+    }
+    try testing.expectEqual(proto.NetReason.none, decide(p, &c, .{ .host = "site.example", .scheme = "https", .rtype = .script, .is_top = false }, 0));
+    commit(&c, false);
+    try testing.expectEqual(@as(u32, 2), c.requests);
+    try testing.expectEqual(@as(u32, 1), c.navigations);
+    deny(&c, budgetReason(p, &c, true, "https", 0));
+    try testing.expectEqual(proto.NetReason.nav_cap, c.exhausted);
+    try testing.expectEqual(@as(u32, 1), c.denied[@intFromEnum(proto.NetReason.nav_cap)]);
+}
+
 test "deadline is monotone against a clock that jumps backwards" {
     var set = baseSet();
     set.deadline_ms = 1000;
@@ -426,13 +743,17 @@ test "deadline is monotone against a clock that jumps backwards" {
     try testing.expectEqual(proto.NetReason.deadline, decide(p, &c, r, 9_000));
 }
 
-test "host entry validation refuses wildcards, ports, schemes and upper case" {
+test "host entry validation supports ports but refuses wildcards, schemes and upper case" {
     try testing.expect(validHostEntry("site.example"));
     try testing.expect(validHostEntry("127.0.0.1"));
     try testing.expect(validHostEntry("[::1]"));
     try testing.expect(!validHostEntry("*"));
     try testing.expect(!validHostEntry("Site.Example"));
-    try testing.expect(!validHostEntry("site.example:8080"));
+    try testing.expect(validHostEntry("[2001:DB8::1]"));
+    try testing.expect(validHostEntry("site.example:8080"));
+    try testing.expect(validHostEntry("[2001:db8::1]:8443"));
+    try testing.expect(!validHostEntry("[bad::ipv6]:8443"));
+    try testing.expect(!validHostEntry("site.example:0"));
     try testing.expect(!validHostEntry("https://site.example"));
     try testing.expect(!validHostEntry("site.example/path"));
     try testing.expect(!validHostEntry(""));
@@ -447,4 +768,76 @@ test "wire round trip: build copies and clamps" {
     defer p.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, MAX_HOSTS), p.allow_top.len);
     try testing.expectEqualStrings("h.example", p.allow_top[0]);
+}
+
+test "policy ports constrain ordinary and untrusted requests without widening defaults" {
+    var set = baseSet();
+    set.allow_top = &.{ "site.example:8443", "[2606:4700::1]:443" };
+    const p = try testPolicy(testing.allocator, set);
+    defer p.deinit(testing.allocator);
+    const counters = Counters{};
+    var r = Req{ .host = "site.example", .scheme = "https", .rtype = .document, .is_top = true };
+    try testing.expectEqual(proto.NetReason.top_host, decide(p, &counters, r, 0));
+    r.port = 8443;
+    try testing.expectEqual(proto.NetReason.none, decide(p, &counters, r, 0));
+    r.host = "2606:4700::1";
+    r.port = 443;
+    try testing.expectEqual(proto.NetReason.none, decide(p, &counters, r, 0));
+    try testing.expect(entryAllows("site.example", "site.example", 8443, "https", false));
+    try testing.expect(!entryAllows("site.example", "site.example", 8443, "https", true));
+    try testing.expect(entryAllows("site.example", "site.example", 0, "https", true));
+    try testing.expect(!entrySubset("sub.site.example:443", "site.example", true, default_schemes));
+    try testing.expect(entrySubset("sub.site.example:443", "site.example", true, Scheme.https.bit()));
+    try testing.expect(!entrySubset("site.example:8443", "site.example", true, default_schemes));
+    try testing.expect(!entrySubset("site.example", "site.example:443", false, default_schemes));
+    p.untrusted = true;
+    p.allow_private = true;
+    p.allow_top = &.{"127.0.0.1:443"};
+    r.host = "127.0.0.1";
+    try testing.expectEqual(proto.NetReason.none, decide(p, &counters, r, 0));
+    p.allow_private = false;
+    try testing.expectEqual(proto.NetReason.private_address, decide(p, &counters, r, 0));
+    r.scheme = "wss";
+    try testing.expectEqual(proto.NetReason.untrusted_transport, decide(p, &counters, r, 0));
+}
+
+test "host subset never admits a new scheme and port combination" {
+    const entries = [_][]const u8{ "site.example", "site.example:80", "site.example:443", "sub.site.example", "sub.site.example:443", "site.example:8443" };
+    for ([_]bool{ false, true }) |untrusted| {
+        for ([_]u16{ Scheme.http.bit(), Scheme.https.bit(), default_schemes }) |schemes| {
+            for (entries) |wide| for (entries) |narrow| {
+                if (!entrySubset(narrow, wide, untrusted, schemes)) continue;
+                for ([_][]const u8{ "site.example", "sub.site.example", "deep.sub.site.example" }) |host| {
+                    for ([_]Scheme{ .http, .https }) |scheme| {
+                        if (schemes & scheme.bit() == 0) continue;
+                        for ([_]u16{ 0, 80, 443, 8443 }) |port| {
+                            if (entryAllows(narrow, host, port, @tagName(scheme), untrusted))
+                                try testing.expect(entryAllows(wide, host, port, @tagName(scheme), untrusted));
+                        }
+                    }
+                }
+            };
+        }
+    }
+}
+
+test "whole policy replacement must preserve every restriction" {
+    var set = baseSet();
+    set.flags = proto.NetPolicySet.flag_untrusted | proto.NetPolicySet.flag_allow_private;
+    set.max_requests = 20;
+    const old = try testPolicy(testing.allocator, set);
+    defer old.deinit(testing.allocator);
+    set.allow_top = &.{"site.example:443"};
+    const next = try testPolicy(testing.allocator, set);
+    defer next.deinit(testing.allocator);
+    try testing.expect(!subsetOf(next, old));
+    next.allow_schemes = Scheme.https.bit();
+    try testing.expect(subsetOf(next, old));
+    next.max_requests = 0;
+    try testing.expect(!subsetOf(next, old));
+    next.max_requests = 10;
+    next.allow_private = false;
+    try testing.expect(subsetOf(next, old));
+    next.untrusted = false;
+    try testing.expect(!subsetOf(next, old));
 }

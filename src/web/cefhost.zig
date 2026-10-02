@@ -52,6 +52,8 @@ const host_sem = @import("cefhost/semlayer.zig");
 const host_wreq = @import("cefhost/webrequest.zig");
 const host_webext = @import("cefhost/webext.zig");
 const host_cookies = @import("cefhost/cookies.zig");
+pub const untrusted = @import("cefhost/untrusted.zig");
+const emulation = @import("cefhost/emulation.zig");
 const SpinLock = @import("../util/spinlock.zig").SpinLock;
 const builtin = @import("builtin");
 const cef = @import("cef");
@@ -447,6 +449,14 @@ pub const View = struct {
     /// Device scale factor x1000, reported to the engine through
     /// `get_screen_info` so the PAGE lays out at that DPR.
     scale_x1000: u16,
+    media: proto.ViewEmulation = .{ .view = 0 },
+    media_observer: ?*emulation.Observer = null,
+    media_generation: u64 = 0,
+    /// Bootstrap blank callbacks cannot settle the deferred requested document.
+    initial_url: ?[]u8 = null,
+    initial_submitted: bool = false,
+    /// `initial_url` is a navigation deferred behind a LIVE media change, not the view's first document.
+    initial_live: bool = false,
     /// PHYSICAL size: the frame buffer's real pixel dimensions, what
     /// `frame_buffer` announces, and the size CEF's OnPaint delivers.
     pw: u16,
@@ -1071,6 +1081,8 @@ pub const Host = struct {
     /// context at create, so a routed instance has no direct path at
     /// all — the route is the process, never a per-view setting.
     instance_proxy: []const u8 = "",
+    pending_media: [proto.MAX_POLICY_VIEWS]proto.ViewEmulation = @splat(.{ .view = 0 }),
+    next_media_generation: u64 = 0,
     /// Why this ROUTED instance serves nothing (empty while it serves):
     /// the engine refused the route's proxy, or the WebRTC policy that
     /// keeps UDP inside it, on some request context. From then on no
@@ -1297,6 +1309,8 @@ pub const Host = struct {
         ephemeral: bool,
         /// Creating connection (multi-client), 0 without a router.
         owner: u32 = 0,
+        /// Untrusted mode: the one view this context was dedicated to; never released, so a jar is never reused.
+        claimed_view: u32 = 0,
     };
 
     const PendingFlush = struct { token: u32, conn: u32, outstanding: u32 };
@@ -1396,8 +1410,24 @@ pub const Host = struct {
     /// `contextForSpawn`'s refusal without its reference: this instance
     /// still serves its route, and the container a view names still
     /// exists (or it never named one).
+    ///
+    /// Untrusted mode also CLAIMS the context for `v`: a fresh context is
+    /// ephemeral and dedicated to exactly one view for its whole life,
+    /// so a second view (or a destroyed view's successor) can never
+    /// inherit another hostile page's jar.
     pub fn requireContext(self: *Host, v: *const View) SpawnRefusal!void {
         if (self.route_refusal.len != 0) return error.RouteRefused;
+        if (untrusted.enabled) {
+            if (!host_icpt.untrustedPolicyPresent(v.id) or v.context == 0) return error.RouteRefused;
+            var fresh = false;
+            for (self.contexts.items) |*ctx| if (ctx.id == v.context) {
+                if (ctx.ephemeral and (ctx.claimed_view == 0 or ctx.claimed_view == v.id)) {
+                    ctx.claimed_view = v.id;
+                    fresh = true;
+                }
+            };
+            if (!fresh) return error.RouteRefused;
+        }
         if (v.context == 0) return;
         if (self.lookupContext(v.context) == null) return error.ContextGone;
     }
@@ -1414,6 +1444,7 @@ pub const Host = struct {
 
     fn contextCreateWith(self: *Host, req: proto.ContextCreate, ops: *const ContextCreateOps) void {
         if (req.id == 0 or self.lookupContext(req.id) != null) return;
+        if (untrusted.enabled and req.ephemeral == 0) return;
 
         var settings = std.mem.zeroes(cef.cef_request_context_settings_t);
         settings.size = @sizeOf(cef.cef_request_context_settings_t);
@@ -1438,6 +1469,11 @@ pub const Host = struct {
         defer cef.cef_string_utf16_clear(&settings.cache_path);
 
         const rc: *cef.cef_request_context_t = ops.create(ops.ctx, &settings) orelse return;
+        if (untrusted.enabled and !untrusted.configureContext(rc)) {
+            release(&rc.base.base);
+            self.refuseRoute("untrusted context restrictions were not effective");
+            return;
+        }
 
         // A proxied context is all-or-nothing. Registering an rc whose
         // preference was refused would make its views use direct traffic,
@@ -1482,7 +1518,7 @@ pub const Host = struct {
         _: ?*anyopaque,
         settings: *const cef.cef_request_context_settings_t,
     ) ?*cef.cef_request_context_t {
-        return cef.cef_request_context_create_context(settings, null);
+        return cef.cef_request_context_create_context(settings, untrusted.contextHandler());
     }
 
     /// The id the OWNING CLIENT minted for an engine-global context id.
@@ -1618,15 +1654,67 @@ pub const Host = struct {
         return self.views.items.len;
     }
 
+    pub fn setEmulation(self: *Host, req: proto.ViewEmulation) !void {
+        if (!req.valid()) return error.InvalidEmulation;
+        if (self.find(req.view)) |v| {
+            const merged = emulation.merge(v.media, req);
+            const media_changed = merged.color_scheme != v.media.color_scheme or merged.reduced_motion != v.media.reduced_motion;
+            v.media = merged;
+            if (req.scale_x1000 != 0) self.resizeView(.{
+                .view = v.id,
+                .w = v.w,
+                .h = v.h,
+                .scale_x1000 = merged.scale_x1000,
+            }) catch {
+                self.failView(v.id, "could not apply emulated device scale");
+                return;
+            };
+            if (media_changed and v.browser != null) self.submitEmulation(v) catch {
+                self.failView(v.id, "could not register or submit media emulation");
+            };
+            return;
+        }
+        for (&self.pending_media) |*slot| {
+            if (slot.view == req.view) {
+                slot.* = emulation.merge(slot.*, req);
+                return;
+            }
+        }
+        for (&self.pending_media) |*slot| {
+            if (slot.view == 0) {
+                slot.* = req;
+                return;
+            }
+        }
+        return error.TooManyEmulatedViews;
+    }
+
+    fn submitEmulation(self: *Host, v: *View) !void {
+        if (!emulation.hasMedia(v.media)) return;
+        const browser = v.browser orelse return error.EmulationRefused;
+        if (v.media_observer == null) {
+            v.media_observer = emulation.Observer.create(self.gpa, browser, v.id, v.media_generation) catch return error.EmulationRefused;
+        }
+        if (!v.media_observer.?.submit(browser, v.media, nowMs())) return error.EmulationRefused;
+    }
+
+    /// Post while ownership still exists, then retire only this view.
+    pub fn failView(self: *Host, id: u32, reason: []const u8) void {
+        const context = if (self.findAny(id)) |v| v.context else 0;
+        self.post(proto.EvViewCreateFailed{ .view = id, .context = context, .reason = reason });
+        if (self.findAny(id)) |v| {
+            self.clearInitialUrl(v);
+            if (v.media_observer) |observer| observer.active = false;
+        }
+        self.destroyView(id);
+    }
+
     /// Create a windowless browser showing a blank document.
     pub fn createView(self: *Host, req: proto.ViewCreate) !void {
         return self.createViewAt(req, "");
     }
 
-    /// Create a windowless browser AT `req.url` (capability
-    /// `view-create-url`): the browser's first and only document is the
-    /// requested page, where create-then-navigate would have loaded
-    /// about:blank first.
+    /// Requested media overrides are acknowledged before the initial URL is loaded.
     pub fn createViewUrl(self: *Host, req: proto.ViewCreateUrl) !void {
         return self.createViewAt(.{
             .view = req.view,
@@ -1658,6 +1746,14 @@ pub const Host = struct {
             });
             return;
         }
+        if (host_icpt.policyRefusedView(req.view)) {
+            self.post(proto.EvViewCreateFailed{ .view = req.view, .context = req.context, .reason = "network policy table is full; this view was refused its policy" });
+            return;
+        }
+        if (untrusted.enabled and (!host_icpt.untrustedPolicyPresent(req.view) or req.context == 0)) {
+            self.post(proto.EvViewCreateFailed{ .view = req.view, .context = req.context, .reason = "untrusted view requires an installed untrusted policy and fresh context" });
+            return;
+        }
         const v = try self.registerView(req);
         // registerView transferred ownership to Host.views. From here on
         // every failure leaves cleanup to that owner, never to spawnBrowser.
@@ -1673,6 +1769,10 @@ pub const Host = struct {
         while (true) : (attempt += 1) {
             const spawned: bool = if (self.spawnBrowserWith(v, initial_url, ops)) |_| true else |err| switch (err) {
                 error.BrowserCreateFailed => false,
+                error.EmulationRefused => {
+                    self.failView(v.id, "could not register or submit media emulation before initial navigation");
+                    return;
+                },
                 else => return err,
             };
             if (spawned) {
@@ -1716,6 +1816,18 @@ pub const Host = struct {
             .context = req.context,
             .sem = semantic.View.init(self.gpa),
         };
+        for (&self.pending_media) |*slot| {
+            if (slot.view == req.view) {
+                v.media = slot.*;
+                slot.* = .{ .view = 0 };
+                if (v.media.scale_x1000 != 0) {
+                    v.scale_x1000 = v.media.scale_x1000;
+                    v.pw = physicalOf(lw, v.scale_x1000);
+                    v.ph = physicalOf(lh, v.scale_x1000);
+                }
+                break;
+            }
+        }
         errdefer v.sem.deinit();
         try self.views.append(self.gpa, v);
         return v;
@@ -1871,10 +1983,21 @@ pub const Host = struct {
         // it per spawn, and an ephemeral context that never reaches zero
         // never wipes its in-memory jar.
         try self.requireContext(v);
-        const browser = ops.create_browser(ops.ctx, self, v, initial_url) orelse return error.BrowserCreateFailed;
+        const deferred = emulation.hasMedia(v.media);
+        if (deferred) {
+            v.initial_url = self.gpa.dupe(u8, if (initial_url.len != 0) initial_url else "about:blank") catch return error.EmulationRefused;
+            v.initial_submitted = false;
+            v.initial_live = false;
+            v.nav_loading = true;
+        }
+        errdefer self.clearInitialUrl(v);
+        const browser = ops.create_browser(ops.ctx, self, v, if (deferred) "" else initial_url) orelse return error.BrowserCreateFailed;
         v.browser = browser;
         v.cef_id = browserInt(browser, "get_identifier");
+        self.next_media_generation +%= 1;
+        v.media_generation = self.next_media_generation;
         interceptRegister(self.gpa, v.id, v.cef_id);
+        try self.submitEmulation(v);
         applyZoom(v);
         // A revived (or freshly created) browser knows nothing of the
         // client's earlier `a11y_enable`; re-apply it. ALWAYS, including
@@ -1886,6 +2009,7 @@ pub const Host = struct {
         // engine's AX machinery running behind the client's back.
         applyA11yState(v);
         try self.allocBufferWith(v, ops);
+        if (deferred) self.postNavState(v);
     }
 
     fn createBrowserSystem(_: ?*anyopaque, self: *Host, v: *View, initial_url: []const u8) ?*cef.cef_browser_t {
@@ -1963,6 +2087,9 @@ pub const Host = struct {
     }
 
     pub fn destroyView(self: *Host, id: u32) void {
+        for (&self.pending_media) |*slot| if (slot.view == id) {
+            slot.* = .{ .view = 0 };
+        };
         self.abandonViewWaiters(id);
         // A page owns every browser-action popup it opened. Close those
         // first so no floating extension page survives its toolbar.
@@ -2012,6 +2139,8 @@ pub const Host = struct {
             if (inspector != 0) self.destroyView(inspector);
             return;
         }
+        // Policy ACK failures can destroy a reserved id before any browser exists.
+        interceptUnregister(self.gpa, id);
     }
 
     /// A page popup of `owner` that no client frame has named yet.
@@ -2180,6 +2309,9 @@ pub const Host = struct {
         // opened would pin slots from the shared MAX_POLICY_VIEWS pool
         // until engine exit.
         const base = conn_id *| proto.CONN_ID_WINDOW;
+        for (&self.pending_media) |*slot| {
+            if (slot.view >= base and slot.view < base + proto.CONN_ID_WINDOW) slot.* = .{ .view = 0 };
+        }
         var slot_ids: [proto.MAX_POLICY_VIEWS]u32 = undefined;
         var n: usize = 0;
         {
@@ -2211,10 +2343,21 @@ pub const Host = struct {
     pub fn discardView(self: *Host, id: u32) void {
         const v = self.find(id) orelse return;
         if (v.discarded) return;
+        if (v.initial_url != null and !v.initial_live) {
+            self.failView(id, "view discarded before initial media emulation navigation completed");
+            return;
+        }
         // A revival goes through `create_browser_sync`, which makes a
         // fresh TOP-LEVEL browser — silently re-breaking the opener
         // relationship this popup exists for.
         if (v.page_popup) return;
+        // A live media change still awaiting its ACK is kept in `v.media`
+        // and resubmitted by the revival; a navigation deferred behind it
+        // becomes the address the view comes back at.
+        if (v.initial_url) |url| {
+            self.setUrl(v, url);
+            self.clearInitialUrl(v);
+        }
         self.dropBrowser(v, true);
         v.discarded = true;
         // The engine is gone, so nothing may be asked of it: hidden is
@@ -2262,7 +2405,9 @@ pub const Host = struct {
             // A vanished container joins the first group: the record is
             // worth keeping (the client still knows the id) and the page
             // must not come back on the global context.
-            if (err == error.BrowserCreateFailed or err == error.ContextGone or err == error.RouteRefused) {
+            if (err == error.EmulationRefused) {
+                self.failView(id, "could not restore media emulation before navigation");
+            } else if (err == error.BrowserCreateFailed or err == error.ContextGone or err == error.RouteRefused) {
                 v.discarded = true;
             } else {
                 self.destroyView(id);
@@ -2573,6 +2718,20 @@ pub const Host = struct {
     /// closed the browser itself (`popupClosedByEngine`), where asking
     /// it to close again would re-enter a teardown in progress.
     fn dropBrowser(self: *Host, v: *View, close: bool) void {
+        // Only a view still creating its first document failed to be
+        // created; a live media change awaiting its ACK is not a creation.
+        if (v.initial_url != null and !v.initial_live) self.post(proto.EvViewCreateFailed{
+            .view = v.id,
+            .context = v.context,
+            .reason = "view torn down before initial media emulation navigation completed",
+        });
+        self.clearInitialUrl(v);
+        var browser_closed = false;
+        if (v.media_observer) |observer| {
+            v.media_observer = null;
+            browser_closed = observer.browser_closed;
+            observer.stop();
+        }
         // The toplevel mirrors THIS browser's frame buffer, which goes
         // away below; a revived view paints again and gets a new one.
         if (self.presenter) |p| p.dropView(v.id);
@@ -2583,7 +2742,7 @@ pub const Host = struct {
         resolveCert(v, false);
         for (&v.perms) |*p| resolvePerm(p, false);
         self.dropDownloadsOf(v.id);
-        if (close) {
+        if (close and !browser_closed) {
             if (browserHost(v)) |host| {
                 // force_close: a windowless browser has no user to
                 // prompt and no unload dialog anybody could answer.
@@ -2784,6 +2943,36 @@ pub const Host = struct {
     /// deadlines of engine promises nobody else would ever answer.
     /// Called once per poll iteration.
     pub fn watchdog(self: *Host, now_ms: i64) void {
+        // Observer callbacks only record outcomes; navigation and retirement
+        // happen here, never by recursively pumping CEF from a callback.
+        var mi: usize = 0;
+        while (mi < self.views.items.len) {
+            const v = self.views.items[mi];
+            const observer = v.media_observer orelse {
+                mi += 1;
+                continue;
+            };
+            if (observer.view != v.id or observer.generation != v.media_generation or observer.browser_id != v.cef_id) {
+                self.failView(v.id, "media emulation browser generation changed");
+                continue;
+            }
+            if (observer.failure.len != 0 or observer.expired(now_ms)) {
+                self.failView(v.id, if (observer.failure.len != 0) observer.failure else "media emulation execution acknowledgment timed out");
+                continue;
+            }
+            if (observer.acknowledged and !v.initial_submitted) {
+                if (v.initial_url) |url| {
+                    v.initial_submitted = true;
+                    self.semanticNavigationStarted(v);
+                    v.sem_nav.waiting_load_start = true;
+                    if (!self.loadUrl(v, url)) {
+                        self.failView(v.id, "could not navigate after media emulation acknowledgment");
+                        continue;
+                    }
+                }
+            }
+            mi += 1;
+        }
         filterSubPump(self, now_ms);
         filterSubTick(self, now_ms);
         // A scroll that STOPPED left its resting position behind the
@@ -2975,8 +3164,55 @@ pub const Host = struct {
 
     pub const flushDownloadProgress = host_dl.flushDownloadProgress;
     pub const dropDownloadsOf = host_dl.dropDownloadsOf;
+
+    /// Record a refused attempt without changing the view's actual document or resource-gate counts.
+    fn refuseNavigation(self: *Host, v: *View, target: []const u8, main: bool) bool {
+        const reason = host_icpt.navigationBudget(v.id, main, netpolicy.schemeOf(target), nowMs());
+        if (reason == .none) return false;
+        self.post(host_icpt.netPolicyFrame(v.id));
+        // Only the engine path reaches here mid-deferral (client frames are
+        // queued behind it): the refused requested document is its terminal.
+        if (main and v.initial_url != null and !bootstrapLoad(v, target)) self.settleInitialNavigation(v, true);
+        if (main) {
+            var buf: [128]u8 = undefined;
+            self.post(proto.EvLoadError{
+                .view = v.id,
+                .code = cef.ERR_BLOCKED_BY_CLIENT,
+                .url = target,
+                .msg = std.fmt.bufPrint(&buf, "navigation refused by network policy: {s}", .{proto.reasonName(reason)}) catch "navigation refused by network policy",
+            });
+            self.post(proto.EvLoad{ .view = v.id, .state = @intFromEnum(proto.LoadState.failed), .url = target });
+            // No CEF call means no later loading-state callback to restore a
+            // client's optimistic requested URL. Publish the retained state.
+            self.post(proto.EvNavState{
+                .view = v.id,
+                .can_back = @intFromBool(v.nav_back),
+                .can_fwd = @intFromBool(v.nav_fwd),
+                .loading = @intFromBool(v.nav_loading),
+                .url = v.url,
+            });
+        }
+        return true;
+    }
+
     pub fn navigate(self: *Host, req: proto.Navigate) void {
         const v = self.find(req.view) orelse return;
+        const waiting_media = if (v.media_observer) |observer| !observer.acknowledged else false;
+        if (v.initial_url != null or waiting_media) {
+            const url = self.gpa.dupe(u8, req.url) catch {
+                self.failView(v.id, "could not retain initial media emulation navigation");
+                return;
+            };
+            // Replacing a deferred FIRST document keeps it the first one.
+            const live = if (v.initial_url != null) v.initial_live else true;
+            self.clearInitialUrl(v);
+            v.initial_url = url;
+            v.initial_submitted = false;
+            v.initial_live = live;
+            self.postNavState(v);
+            return;
+        }
+        if (self.refuseNavigation(v, req.url, true)) return;
         // A discarded view is revived straight AT the requested address
         // rather than at the one it was discarded holding: reviving
         // first and navigating after would mint a document nobody asked
@@ -2986,32 +3222,80 @@ pub const Host = struct {
         self.semanticNavigationStarted(v);
         v.sem_nav.waiting_load_start = true;
         if (v.discarded) return self.reviveAt(v, req.url);
-        self.loadUrl(v, req.url);
+        _ = self.loadUrl(v, req.url);
     }
 
     /// Load `url` in the view's main frame. The semantic side must
     /// already have been told a navigation started; the network-change
     /// retry and `navigate` share this and differ only in what they
     /// do to the retry budget.
-    fn loadUrl(self: *Host, v: *View, url_text: []const u8) void {
-        _ = self;
-        const b = v.browser orelse return;
-        const get_frame = b.get_main_frame orelse return;
-        const frame: *cef.cef_frame_t = get_frame(b) orelse return;
+    fn loadUrl(_: *Host, v: *View, url_text: []const u8) bool {
+        const b = v.browser orelse return false;
+        const get_frame = b.get_main_frame orelse return false;
+        const frame: *cef.cef_frame_t = get_frame(b) orelse return false;
         defer release(&frame.base);
+        const load = frame.load_url orelse return false;
         var url = std.mem.zeroes(cef.cef_string_t);
         setStr(url_text, &url);
         defer cef.cef_string_utf16_clear(&url);
-        if (frame.load_url) |lu| lu(frame, &url);
+        if (url.length == 0) return false;
+        load(frame, &url);
+        return true;
     }
 
-    /// Back/forward/reload/stop. A discarded view is revived first, so
-    /// a reload of one does exactly what the user expects; back and
-    /// forward then find an empty history (see `View.discarded`).
+    fn clearInitialUrl(self: *Host, v: *View) void {
+        if (v.initial_url) |url| self.gpa.free(url);
+        v.initial_url = null;
+        v.initial_submitted = false;
+        v.initial_live = false;
+    }
+
+    /// Leave deferred-navigation mode once the engine has the requested navigation; idempotent.
+    ///
+    /// From here CEF's own load and loading-state callbacks report it like
+    /// any navigation, so a 204/205, a download or an abort ends in the
+    /// engine's loading=0 instead of the deferral's synthetic loading=1.
+    /// `terminal` (refused before it started) also releases semantic reads
+    /// queued for a document that is never coming.
+    fn settleInitialNavigation(self: *Host, v: *View, terminal: bool) void {
+        if (v.initial_url == null) return;
+        self.clearInitialUrl(v);
+        if (!terminal) return;
+        v.nav_loading = false;
+        if (v.sem_nav.waiting_load_start) self.semRearm(v);
+    }
+
+    fn bootstrapLoad(v: *const View, url: []const u8) bool {
+        const initial = v.initial_url orelse return false;
+        return !v.initial_submitted or (std.mem.eql(u8, url, "about:blank") and !std.mem.eql(u8, initial, "about:blank"));
+    }
+
+    /// Back/forward/reload may revive a discarded view without its history; stop never revives.
     pub fn navAction(self: *Host, req: proto.NavAction) void {
-        const v = self.findWake(req.view) orelse return;
+        var v = self.find(req.view) orelse return;
+        if (v.initial_url != null) {
+            if (req.action != @intFromEnum(proto.NavAct.stop)) return;
+            if (!v.initial_live) return self.failView(v.id, "initial media emulation navigation canceled");
+            // Stopping a navigation deferred behind a live media change
+            // cancels that navigation, not the view.
+            self.clearInitialUrl(v);
+            self.postNavState(v);
+            return;
+        }
+        const action: proto.NavAct = @enumFromInt(req.action);
+        switch (action) {
+            .back, .forward, .reload, .reload_no_cache => {
+                // The wire names no back/forward target; don't invent one from
+                // the current URL. CEF supplies the actual URL if it proceeds.
+                const target = if (action == .back or action == .forward) "" else v.url;
+                if (self.refuseNavigation(v, target, true)) return;
+            },
+            .stop => if (v.discarded) return,
+            else => return,
+        }
+        v = self.findWake(req.view) orelse return;
         const b = v.browser orelse return;
-        switch (@as(proto.NavAct, @enumFromInt(req.action))) {
+        switch (action) {
             .back => if (browserInt(b, "can_go_back") != 0) {
                 v.load_retry.reset();
                 self.semanticNavigationStarted(v);
@@ -3633,7 +3917,7 @@ pub const Host = struct {
         const b = v.browser;
         const can_back: u8 = if (b != null and browserInt(b, "can_go_back") != 0) 1 else 0;
         const can_fwd: u8 = if (b != null and browserInt(b, "can_go_forward") != 0) 1 else 0;
-        const loading: u8 = if (b != null and browserInt(b, "is_loading") != 0) 1 else 0;
+        const loading: u8 = if (v.initial_url != null or (b != null and browserInt(b, "is_loading") != 0)) 1 else 0;
         v.nav_back = can_back != 0;
         v.nav_fwd = can_fwd != 0;
         v.nav_loading = loading != 0;
@@ -3642,12 +3926,21 @@ pub const Host = struct {
             .can_back = can_back,
             .can_fwd = can_fwd,
             .loading = loading,
-            .url = v.url,
+            .url = v.initial_url orelse v.url,
         });
     }
 };
 
 pub var g_host: ?*Host = null;
+
+/// One `sketerm-web: ` diagnostic line on stderr, where the rigs read the helper's log; an overlong line is cut, never dropped.
+pub fn logLine(comptime fmt: []const u8, args: anytype) void {
+    var buf: [512]u8 = undefined;
+    var w = std.Io.Writer.fixed(buf[0 .. buf.len - 1]);
+    w.print("sketerm-web: " ++ fmt, args) catch {};
+    buf[w.end] = '\n';
+    _ = c.write(2, &buf, w.end + 1);
+}
 
 const ViewConstructionTest = struct {
     const Failure = enum { none, browser, memfd, truncate, map, announce };
@@ -3797,6 +4090,461 @@ const ViewConstructionTest = struct {
         }
     }
 };
+
+const MediaTest = struct {
+    var browser: cef.cef_browser_t = undefined;
+    var browser_host: cef.cef_browser_host_t = undefined;
+    var frame: cef.cef_frame_t = undefined;
+    var registration: cef.cef_registration_t = undefined;
+    var observer: ?*cef.cef_dev_tools_message_observer_t = null;
+    var refused_registration = false;
+    var refused_submission = false;
+    var queued_id: c_int = 0;
+    var navigations: usize = 0;
+    var registration_releases: usize = 0;
+    var closes: usize = 0;
+    var create_url_empty = false;
+    var frame_url: []const u8 = "about:blank";
+    var loaded_url: [128]u8 = undefined;
+    var loaded_len: usize = 0;
+
+    fn reset() void {
+        browser = std.mem.zeroes(cef.cef_browser_t);
+        browser_host = std.mem.zeroes(cef.cef_browser_host_t);
+        frame = std.mem.zeroes(cef.cef_frame_t);
+        registration = std.mem.zeroes(cef.cef_registration_t);
+        browser.get_identifier = identifier;
+        browser.get_host = getHost;
+        browser.get_main_frame = getFrame;
+        browser_host.add_dev_tools_message_observer = addObserver;
+        browser_host.execute_dev_tools_method = execute;
+        browser_host.close_browser = closeBrowser;
+        frame.load_url = load;
+        frame.get_url = getUrl;
+        frame.is_main = isMain;
+        registration.base.release = releaseRegistration;
+        observer = null;
+        refused_registration = false;
+        refused_submission = false;
+        queued_id = 0;
+        navigations = 0;
+        registration_releases = 0;
+        closes = 0;
+        create_url_empty = false;
+        frame_url = "about:blank";
+        loaded_len = 0;
+    }
+
+    fn identifier(_: [*c]cef.cef_browser_t) callconv(.c) c_int {
+        return 71;
+    }
+    fn otherIdentifier(_: [*c]cef.cef_browser_t) callconv(.c) c_int {
+        return 72;
+    }
+    fn getHost(_: [*c]cef.cef_browser_t) callconv(.c) [*c]cef.cef_browser_host_t {
+        return &browser_host;
+    }
+    fn getFrame(_: [*c]cef.cef_browser_t) callconv(.c) [*c]cef.cef_frame_t {
+        return &frame;
+    }
+    fn isMain(_: [*c]cef.cef_frame_t) callconv(.c) c_int {
+        return 1;
+    }
+    fn getUrl(_: [*c]cef.cef_frame_t) callconv(.c) cef.cef_string_userfree_t {
+        const url = cef.cef_string_userfree_utf16_alloc();
+        if (url != null) setStr(frame_url, url);
+        return url;
+    }
+    fn addObserver(_: [*c]cef.cef_browser_host_t, arg: [*c]cef.cef_dev_tools_message_observer_t) callconv(.c) [*c]cef.cef_registration_t {
+        if (refused_registration) {
+            releaseArg(arg);
+            return null;
+        }
+        observer = arg;
+        return &registration;
+    }
+    fn releaseRegistration(_: [*c]cef.cef_base_ref_counted_t) callconv(.c) c_int {
+        registration_releases += 1;
+        const obs = observer.?;
+        observer = null;
+        release(&obs.base);
+        return 1;
+    }
+    fn execute(_: [*c]cef.cef_browser_host_t, _: c_int, _: [*c]const cef.cef_string_t, params: [*c]cef.cef_dictionary_value_t) callconv(.c) c_int {
+        defer releaseArg(params);
+        if (refused_submission) return 0;
+        queued_id += 1;
+        return queued_id;
+    }
+    fn closeBrowser(_: [*c]cef.cef_browser_host_t, _: c_int) callconv(.c) void {
+        closes += 1;
+    }
+    fn load(_: [*c]cef.cef_frame_t, url: [*c]const cef.cef_string_t) callconv(.c) void {
+        navigations += 1;
+        var text = Utf8.init(url);
+        defer text.free();
+        loaded_len = @min(loaded_url.len, text.slice().len);
+        @memcpy(loaded_url[0..loaded_len], text.slice()[0..loaded_len]);
+    }
+    fn create(_: ?*anyopaque, _: *Host, _: *View, url: []const u8) ?*cef.cef_browser_t {
+        create_url_empty = url.len == 0;
+        return &browser;
+    }
+    fn result(id: c_int, success: bool) void {
+        const obs = observer.?;
+        obs.on_dev_tools_method_result.?(obs, &browser, id, if (success) 1 else 0, null, 0);
+    }
+    fn expectFailure(out: *proto.Outbox, expected_id: u32) !void {
+        var count: usize = 0;
+        while (out.front()) |msg| {
+            var reader = proto.Reader.init(msg.bytes);
+            while (try reader.next()) |wire| {
+                if (wire.tag != .ev_view_create_failed) continue;
+                const failure = try proto.decode(proto.EvViewCreateFailed, wire.payload);
+                try std.testing.expectEqual(expected_id, failure.view);
+                try std.testing.expect(failure.reason.len != 0);
+                count += 1;
+            }
+            out.advance(msg.bytes.len);
+        }
+        try std.testing.expectEqual(@as(usize, 1), count);
+    }
+};
+
+test "media initial navigation waits for execution success and hides bootstrap blank completion" {
+    try std.testing.expect(apiHash());
+    MediaTest.reset();
+    var out = proto.Outbox.init(std.testing.allocator);
+    defer out.deinit();
+    var host = Host.init(std.testing.allocator, &out);
+    defer host.deinit();
+    host.inline_mode = true;
+    g_host = &host;
+    defer g_host = null;
+    var ops = system_browser_spawn_ops;
+    ops.create_browser = MediaTest.create;
+    try host.setEmulation(.{ .view = 52, .color_scheme = 1 });
+    try host.setEmulation(.{ .view = 51, .color_scheme = 2, .scale_x1000 = 1500 });
+    host.destroyView(52);
+    try host.setEmulation(.{ .view = 51, .reduced_motion = 1 });
+    try host.createViewAtWith(ViewConstructionTest.req(51, 0), "https://first.test/", &ops);
+    const v = host.find(51).?;
+    try std.testing.expect(MediaTest.create_url_empty);
+    try std.testing.expectEqual(@as(u16, 1500), v.scale_x1000);
+    try std.testing.expectEqual(@as(u8, 2), v.media.color_scheme);
+    try std.testing.expectEqual(@as(u8, 1), v.media.reduced_motion);
+    try std.testing.expectEqual(@as(usize, 0), MediaTest.navigations);
+    try std.testing.expect(!v.media_observer.?.acknowledged);
+    onLoadStart(null, &MediaTest.browser, &MediaTest.frame, 0);
+    onLoadEnd(null, &MediaTest.browser, &MediaTest.frame, 200);
+    onLoadingStateChange(null, &MediaTest.browser, 0, 0, 0);
+    host.watchdog(nowMs());
+    try std.testing.expect(v.nav_loading);
+    try std.testing.expectEqual(@as(usize, 0), MediaTest.navigations);
+    while (out.front()) |msg| {
+        var reader = proto.Reader.init(msg.bytes);
+        while (try reader.next()) |wire| {
+            try std.testing.expect(wire.tag != .ev_load);
+            if (wire.tag == .ev_nav_state) {
+                const nav = try proto.decode(proto.EvNavState, wire.payload);
+                try std.testing.expectEqual(@as(u8, 1), nav.loading);
+                try std.testing.expectEqualStrings("https://first.test/", nav.url);
+            }
+        }
+        out.advance(msg.bytes.len);
+    }
+    const first_id = v.media_observer.?.message_id;
+    try host.setEmulation(.{ .view = 51, .color_scheme = 1 });
+    try host.setEmulation(.{ .view = 51 });
+    try std.testing.expectEqual(@as(u16, 1500), v.media.scale_x1000);
+    try std.testing.expectEqual(@as(u8, 1), v.media.reduced_motion);
+    try std.testing.expect(v.media_observer.?.message_id != first_id);
+    MediaTest.result(first_id, true);
+    var other_browser = MediaTest.browser;
+    other_browser.get_identifier = MediaTest.otherIdentifier;
+    MediaTest.observer.?.on_dev_tools_method_result.?(MediaTest.observer.?, &other_browser, MediaTest.queued_id, 1, null, 0);
+    host.watchdog(nowMs());
+    try std.testing.expectEqual(@as(usize, 0), MediaTest.navigations);
+    MediaTest.result(MediaTest.queued_id, true);
+    try std.testing.expectEqual(@as(usize, 0), MediaTest.navigations);
+    host.watchdog(nowMs());
+    try std.testing.expectEqual(@as(usize, 1), MediaTest.navigations);
+    try std.testing.expectEqualStrings("https://first.test/", MediaTest.loaded_url[0..MediaTest.loaded_len]);
+    onLoadEnd(null, &MediaTest.browser, &MediaTest.frame, 200);
+    onLoadingStateChange(null, &MediaTest.browser, 0, 0, 0);
+    try std.testing.expect(v.nav_loading);
+    MediaTest.frame_url = "https://first.test/";
+    onLoadStart(null, &MediaTest.browser, &MediaTest.frame, 0);
+    try std.testing.expect(v.initial_url == null);
+    onLoadEnd(null, &MediaTest.browser, &MediaTest.frame, 200);
+    onLoadingStateChange(null, &MediaTest.browser, 0, 0, 0);
+    try std.testing.expect(!v.nav_loading);
+    const media_id = MediaTest.queued_id;
+    for ([_]u16{ 500, 4000 }) |scale| {
+        try host.setEmulation(.{ .view = 51, .scale_x1000 = scale });
+        try host.setEmulation(.{ .view = 51 });
+        try std.testing.expectEqual(scale, v.scale_x1000);
+        try std.testing.expectEqual(scale, v.media.scale_x1000);
+        try std.testing.expectEqual(physicalOf(v.w, scale), v.pw);
+        try std.testing.expectEqual(physicalOf(v.h, scale), v.ph);
+        try std.testing.expectEqual(media_id, MediaTest.queued_id);
+        try std.testing.expectEqual(@as(u8, 1), v.media.color_scheme);
+        try std.testing.expectEqual(@as(u8, 1), v.media.reduced_motion);
+    }
+    host.destroyView(51);
+    try std.testing.expectEqual(@as(usize, 1), MediaTest.registration_releases);
+}
+
+test "media rejection timeout detach browser destruction and submission refusal preserve unrelated views" {
+    try std.testing.expect(apiHash());
+    const Case = enum { rejection, timeout, late_result, generation, detach, browser_destroyed, submission, registration, teardown, stop };
+    for (std.enums.values(Case)) |case| {
+        MediaTest.reset();
+        var out = proto.Outbox.init(std.testing.allocator);
+        defer out.deinit();
+        var host = Host.init(std.testing.allocator, &out);
+        defer host.deinit();
+        host.inline_mode = true;
+        g_host = &host;
+        defer g_host = null;
+        const prior = try host.registerView(ViewConstructionTest.req(61, 0));
+        var survivor = MediaTest.browser;
+        survivor.get_identifier = MediaTest.otherIdentifier;
+        survivor.get_host = null;
+        prior.browser = &survivor;
+        prior.cef_id = 72;
+        var ops = system_browser_spawn_ops;
+        ops.create_browser = MediaTest.create;
+        MediaTest.refused_registration = case == .registration;
+        MediaTest.refused_submission = case == .submission;
+        try host.setEmulation(.{ .view = 62, .color_scheme = 2 });
+        try host.createViewAtWith(ViewConstructionTest.req(62, 0), "https://never.test/", &ops);
+        var held: ?*cef.cef_dev_tools_message_observer_t = null;
+        if (MediaTest.observer) |obs| {
+            obs.base.add_ref.?(&obs.base);
+            held = obs;
+        }
+        defer if (held) |obs| release(&obs.base);
+        switch (case) {
+            .rejection => MediaTest.result(MediaTest.queued_id, false),
+            .timeout => host.watchdog(host.find(62).?.media_observer.?.deadline_ms),
+            .late_result => {
+                host.find(62).?.media_observer.?.deadline_ms = nowMs() - 1;
+                MediaTest.result(MediaTest.queued_id, true);
+            },
+            .generation => host.find(62).?.media_generation += 1,
+            .detach => MediaTest.observer.?.on_dev_tools_agent_detached.?(MediaTest.observer.?, &MediaTest.browser),
+            .browser_destroyed => onBeforeClose(null, &MediaTest.browser),
+            .teardown => host.destroyView(62),
+            .stop => host.navAction(.{ .view = 62, .action = @intFromEnum(proto.NavAct.stop) }),
+            .submission, .registration => {},
+        }
+        host.watchdog(nowMs());
+        try std.testing.expect(host.find(62) == null);
+        try std.testing.expect(host.find(61) == prior);
+        try std.testing.expectEqual(@as(usize, 1), host.viewCount());
+        try std.testing.expectEqual(@as(usize, 0), MediaTest.navigations);
+        try MediaTest.expectFailure(&out, 62);
+        if (held) |obs| {
+            obs.on_dev_tools_method_result.?(obs, &MediaTest.browser, MediaTest.queued_id, 1, null, 0);
+            obs.on_dev_tools_agent_detached.?(obs, &MediaTest.browser);
+            host.watchdog(nowMs());
+            try std.testing.expectEqual(@as(usize, 0), MediaTest.navigations);
+            try std.testing.expect(out.empty());
+        }
+        try std.testing.expectEqual(@as(usize, if (case == .registration) 0 else 1), MediaTest.registration_releases);
+        try std.testing.expectEqual(@as(usize, if (case == .browser_destroyed) 0 else 1), MediaTest.closes);
+        try std.testing.expect(prior.browser == &survivor);
+        host.navigate(.{ .view = 61, .url = "https://survives.test/" });
+        try std.testing.expectEqual(@as(usize, 1), MediaTest.navigations);
+        try std.testing.expectEqualStrings("https://survives.test/", MediaTest.loaded_url[0..MediaTest.loaded_len]);
+    }
+}
+
+test "live media patches defer navigation and contain submission failures to their view" {
+    try std.testing.expect(apiHash());
+    MediaTest.reset();
+    var out = proto.Outbox.init(std.testing.allocator);
+    defer out.deinit();
+    var host = Host.init(std.testing.allocator, &out);
+    defer host.deinit();
+    host.inline_mode = true;
+    g_host = &host;
+    defer g_host = null;
+    var ops = system_browser_spawn_ops;
+    ops.create_browser = MediaTest.create;
+    try host.createViewAtWith(ViewConstructionTest.req(71, 0), "https://live.test/", &ops);
+    const v = host.find(71).?;
+    const other = try host.registerView(ViewConstructionTest.req(72, 0));
+    try host.setEmulation(.{ .view = 71, .color_scheme = 2, .reduced_motion = 1, .scale_x1000 = 500 });
+    host.navigate(.{ .view = 71, .url = "https://patched.test/" });
+    try host.setEmulation(.{ .view = 71 });
+    host.watchdog(nowMs());
+    try std.testing.expect(v.nav_loading);
+    try std.testing.expectEqual(@as(usize, 0), MediaTest.navigations);
+    try std.testing.expectEqual(@as(u16, 500), v.scale_x1000);
+    MediaTest.result(MediaTest.queued_id, true);
+    host.watchdog(nowMs());
+    try std.testing.expectEqual(@as(usize, 1), MediaTest.navigations);
+    try std.testing.expectEqualStrings("https://patched.test/", MediaTest.loaded_url[0..MediaTest.loaded_len]);
+    MediaTest.frame_url = "https://patched.test/";
+    onLoadStart(null, &MediaTest.browser, &MediaTest.frame, 0);
+    MediaTest.refused_submission = true;
+    try host.setEmulation(.{ .view = 71, .reduced_motion = 2 });
+    try std.testing.expect(host.find(71) == null);
+    try std.testing.expect(host.find(72) == other);
+    try MediaTest.expectFailure(&out, 71);
+    try std.testing.expectEqual(@as(usize, 1), MediaTest.registration_releases);
+}
+
+const DeferredSettleTest = struct {
+    var request_url: []const u8 = "";
+
+    fn getUrl(_: [*c]cef.cef_request_t) callconv(.c) cef.cef_string_userfree_t {
+        const url = cef.cef_string_userfree_utf16_alloc();
+        if (url != null) setStr(request_url, url);
+        return url;
+    }
+    fn rel(_: [*c]cef.cef_base_ref_counted_t) callconv(.c) c_int {
+        return 0;
+    }
+    fn browse(url: []const u8) c_int {
+        request_url = url;
+        var request = std.mem.zeroes(cef.cef_request_t);
+        request.base.release = rel;
+        request.get_url = getUrl;
+        return onBeforeBrowse(null, &MediaTest.browser, &MediaTest.frame, &request, 0, 0);
+    }
+    fn loadError(code: cef.cef_errorcode_t, url: []const u8) void {
+        var failed = std.mem.zeroes(cef.cef_string_t);
+        setStr(url, &failed);
+        defer cef.cef_string_utf16_clear(&failed);
+        onLoadError(null, &MediaTest.browser, &MediaTest.frame, code, null, &failed);
+    }
+    /// Drain the outbox; the loading byte of the last nav state, null without one. Fails on a create failure.
+    fn lastLoading(out: *proto.Outbox) !?u8 {
+        var last: ?u8 = null;
+        while (out.front()) |msg| {
+            var reader = proto.Reader.init(msg.bytes);
+            while (try reader.next()) |wire| {
+                if (wire.tag == .ev_view_create_failed) return error.UnexpectedCreateFailure;
+                if (wire.tag == .ev_nav_state) last = (try proto.decode(proto.EvNavState, wire.payload)).loading;
+            }
+            out.advance(msg.bytes.len);
+        }
+        return last;
+    }
+};
+
+test "every terminal outcome of the deferred first navigation settles loading once" {
+    try std.testing.expect(apiHash());
+    const Case = enum { started_then_aborted, aborted_unbrowsed, superseded_abort, budget_refusal };
+    for (std.enums.values(Case)) |case| {
+        MediaTest.reset();
+        var out = proto.Outbox.init(std.testing.allocator);
+        defer out.deinit();
+        var host = Host.init(std.testing.allocator, &out);
+        defer host.deinit();
+        host.inline_mode = true;
+        g_host = &host;
+        defer g_host = null;
+        if (case == .budget_refusal) host.netPolicySet(.{
+            .view = 81,
+            .serial = 1,
+            .flags = 0,
+            .block_types = 0,
+            .allow_schemes = netpolicy.default_schemes,
+            .max_requests = 0,
+            .max_bytes = 0,
+            .max_navigations = 0,
+            .deadline_ms = 100_000,
+            .allow_top = &.{"deferred.test"},
+            .allow_sub = &.{},
+        });
+        var ops = system_browser_spawn_ops;
+        ops.create_browser = MediaTest.create;
+        try host.setEmulation(.{ .view = 81, .color_scheme = 2 });
+        try host.createViewAtWith(ViewConstructionTest.req(81, 0), "https://deferred.test/", &ops);
+        const v = host.find(81).?;
+        MediaTest.result(MediaTest.queued_id, true);
+        host.watchdog(nowMs());
+        try std.testing.expectEqual(@as(usize, 1), MediaTest.navigations);
+        try std.testing.expectEqual(@as(?u8, 1), try DeferredSettleTest.lastLoading(&out));
+        switch (case) {
+            // A 204/205, a refused download or any abort after the engine took the navigation.
+            .started_then_aborted => {
+                try std.testing.expectEqual(@as(c_int, 0), DeferredSettleTest.browse("https://deferred.test/"));
+                try std.testing.expect(v.initial_url == null);
+                DeferredSettleTest.loadError(cef.ERR_ABORTED, "https://deferred.test/");
+            },
+            .aborted_unbrowsed => {
+                DeferredSettleTest.loadError(cef.ERR_ABORTED, "https://deferred.test/");
+                try std.testing.expect(v.initial_url == null);
+            },
+            .superseded_abort => {
+                DeferredSettleTest.loadError(cef.ERR_ABORTED, "https://older.test/");
+                try std.testing.expect(v.initial_url != null);
+                onLoadingStateChange(null, &MediaTest.browser, 1, 0, 0);
+                try std.testing.expectEqual(@as(?u8, 1), try DeferredSettleTest.lastLoading(&out));
+                DeferredSettleTest.loadError(cef.ERR_ABORTED, "https://deferred.test/");
+            },
+            .budget_refusal => {
+                const s = host_icpt.interceptSlotFor(host.gpa, v.id).?;
+                s.pc.started_ms -= 100_000;
+                try std.testing.expectEqual(@as(c_int, 1), DeferredSettleTest.browse("https://deferred.test/"));
+                try std.testing.expect(v.initial_url == null);
+                try std.testing.expectEqual(@as(?u8, 0), try DeferredSettleTest.lastLoading(&out));
+                DeferredSettleTest.loadError(cef.ERR_ABORTED, "https://deferred.test/");
+            },
+        }
+        onLoadingStateChange(null, &MediaTest.browser, 0, 0, 0);
+        try std.testing.expect(v.initial_url == null);
+        try std.testing.expect(!v.nav_loading);
+        try std.testing.expectEqual(@as(?u8, 0), try DeferredSettleTest.lastLoading(&out));
+        // Settled means settled: a late bootstrap or abort changes nothing.
+        DeferredSettleTest.loadError(cef.ERR_ABORTED, "https://deferred.test/");
+        try std.testing.expect(out.empty());
+    }
+}
+
+test "a discard during a live media acknowledgment keeps the view and reports no creation failure" {
+    try std.testing.expect(apiHash());
+    for ([_]bool{ false, true }) |deferred_nav| {
+        MediaTest.reset();
+        var out = proto.Outbox.init(std.testing.allocator);
+        defer out.deinit();
+        var host = Host.init(std.testing.allocator, &out);
+        defer host.deinit();
+        host.inline_mode = true;
+        g_host = &host;
+        defer g_host = null;
+        var ops = system_browser_spawn_ops;
+        ops.create_browser = MediaTest.create;
+        try host.createViewAtWith(ViewConstructionTest.req(91, 0), "https://live.test/", &ops);
+        const v = host.find(91).?;
+        host.setUrl(v, "https://live.test/");
+        try host.setEmulation(.{ .view = 91, .color_scheme = 2 });
+        try std.testing.expect(!v.media_observer.?.acknowledged);
+        if (deferred_nav) {
+            host.navigate(.{ .view = 91, .url = "https://patched.test/" });
+            try std.testing.expect(v.initial_live);
+        }
+        _ = try DeferredSettleTest.lastLoading(&out);
+        host.discardView(91);
+        try std.testing.expect(host.find(91) == v);
+        try std.testing.expect(v.discarded and v.browser == null);
+        try std.testing.expect(v.initial_url == null);
+        try std.testing.expectEqualStrings(if (deferred_nav) "https://patched.test/" else "https://live.test/", v.url);
+        _ = try DeferredSettleTest.lastLoading(&out);
+        // The kept media is resubmitted before the revived document loads.
+        host.reviveViewWith(v, &ops);
+        try std.testing.expect(!v.discarded);
+        try std.testing.expectEqualStrings(v.url, v.initial_url.?);
+        try std.testing.expect(!v.initial_live);
+        try std.testing.expectEqual(@as(u8, 2), v.media.color_scheme);
+        while (out.front()) |msg| out.advance(msg.bytes.len);
+    }
+}
 
 test "view construction allocation failures preserve prior views" {
     try std.testing.checkAllAllocationFailures(
@@ -4139,6 +4887,316 @@ test "releaseArg returns exactly one reference and tolerates null" {
     releaseArg(@as([*c]cef.cef_browser_t, &CallbackArgTest.browser));
     releaseArg(@as([*c]cef.cef_browser_t, null));
     try std.testing.expectEqual(@as(usize, 1), CallbackArgTest.released);
+}
+
+test "native navigation budget cancellation preserves the document and rearms explicit reads" {
+    try std.testing.expect(apiHash());
+    const Fake = struct {
+        fn getUrl(_: [*c]cef.cef_request_t) callconv(.c) cef.cef_string_userfree_t {
+            const url = cef.cef_string_userfree_utf16_alloc();
+            if (url != null) setStr("https://site.example/denied", url);
+            return url;
+        }
+    };
+    for ([_]bool{ false, true }) |untrusted_policy| {
+        for ([_]proto.NetReason{ .nav_cap, .request_cap, .byte_cap, .deadline }) |reason| {
+            for ([_]bool{ false, true }) |explicit| {
+                CallbackArgTest.reset();
+                var request = std.mem.zeroes(cef.cef_request_t);
+                request.base.release = CallbackArgTest.rel;
+                request.get_url = Fake.getUrl;
+                var out = proto.Outbox.init(std.testing.allocator);
+                defer out.deinit();
+                var host = Host.init(std.testing.allocator, &out);
+                defer host.deinit();
+                g_host = &host;
+                defer g_host = null;
+                const v = try host.registerView(ViewConstructionTest.req(95, 0));
+                v.cef_id = CallbackArgTest.cef_id;
+                host.setUrl(v, "https://site.example/healthy");
+                host.setTitle(v, "Healthy document");
+                v.sem.doc_gen = 9;
+                v.sem.doc_token = 123;
+                v.sem_context_doc = 123;
+                v.sem_want_observer = true;
+                const other = try host.registerView(ViewConstructionTest.req(96, 0));
+                host.setUrl(other, "https://other.example/healthy");
+                host.netPolicySet(.{
+                    .view = v.id,
+                    .serial = 1,
+                    .flags = if (untrusted_policy) proto.NetPolicySet.flag_untrusted else 0,
+                    .block_types = 0,
+                    .allow_schemes = netpolicy.default_schemes,
+                    .max_requests = if (reason == .request_cap) 2 else 0,
+                    .max_bytes = if (reason == .byte_cap) 2 else 0,
+                    .max_navigations = if (reason == .nav_cap) 2 else 0,
+                    .deadline_ms = if (reason == .deadline) 100_000 else 0,
+                    .allow_top = &.{"site.example"},
+                    .allow_sub = &.{},
+                });
+                const s = host_icpt.interceptSlotFor(host.gpa, v.id).?;
+                s.pc = .{ .started_ms = nowMs(), .requests = 1, .bytes = 1, .navigations = 1 };
+                const allowed = s.pc;
+                try std.testing.expectEqual(@as(c_int, 0), onBeforeBrowse(null, &CallbackArgTest.browser, &CallbackArgTest.frame, &request, 1, 0));
+                try std.testing.expectEqualDeep(allowed, s.pc);
+                try std.testing.expectEqual(@as(usize, 3), CallbackArgTest.released);
+                switch (reason) {
+                    .nav_cap => s.pc.navigations = 2,
+                    .request_cap => s.pc.requests = 2,
+                    .byte_cap => s.pc.bytes = 2,
+                    .deadline => s.pc.started_ms -= 100_000,
+                    else => unreachable,
+                }
+                // Status reads and the accounting flush must not exhaust a
+                // navigation budget before the next attempt actually arrives.
+                host.netPolicyStatus(.{ .view = v.id, .serial = 0 });
+                host.flushNetPolicy();
+                try std.testing.expectEqual(if (reason == .deadline) reason else proto.NetReason.none, s.pc.exhausted);
+                while (out.front()) |msg| out.advance(msg.bytes.len);
+                if (explicit) {
+                    _ = try host.pushPending(v, .{ .req = 1, .kind = .read });
+                    host.semanticNavigationStarted(v);
+                    v.sem_nav.waiting_load_start = true;
+                    try std.testing.expect(v.pending.items[0].rearm);
+                }
+                const before = s.pc;
+                const generation = v.sem_nav.generation;
+                CallbackArgTest.released = 0;
+                try std.testing.expectEqual(@as(c_int, 1), onBeforeBrowse(null, &CallbackArgTest.browser, &CallbackArgTest.frame, &request, 0, 1));
+                try std.testing.expectEqual(@as(usize, 3), CallbackArgTest.released);
+                try std.testing.expectEqual(before.requests, s.pc.requests);
+                try std.testing.expectEqual(before.bytes, s.pc.bytes);
+                try std.testing.expectEqual(before.navigations, s.pc.navigations);
+                try std.testing.expectEqual(reason, s.pc.exhausted);
+                try std.testing.expectEqual(@as(u32, 1), s.pc.denied[@intFromEnum(reason)]);
+                try std.testing.expectEqual(@as(u32, 9), v.sem.doc_gen);
+                try std.testing.expectEqual(@as(u32, 123), v.sem.doc_token);
+                try std.testing.expectEqual(generation, v.sem_nav.generation);
+                try std.testing.expect(!v.sem_nav.loading and !v.sem_nav.waiting_load_start);
+                if (explicit) try std.testing.expect(!v.pending.items[0].rearm) else try std.testing.expectEqual(@as(u32, 123), v.sem_context_doc);
+                try std.testing.expectEqualStrings("https://site.example/healthy", v.url);
+                try std.testing.expectEqualStrings("Healthy document", v.title);
+                try std.testing.expectEqualStrings("https://other.example/healthy", other.url);
+                try std.testing.expect(!other.sem_nav.loading);
+                var policy_events: usize = 0;
+                var errors: usize = 0;
+                while (out.front()) |msg| {
+                    var reader = proto.Reader.init(msg.bytes);
+                    const wire = (try reader.next()).?;
+                    switch (wire.tag) {
+                        .ev_net_policy => {
+                            const ev = try proto.decode(proto.EvNetPolicy, wire.payload);
+                            try std.testing.expectEqual(@intFromEnum(reason), ev.exhausted);
+                            try std.testing.expectEqual(before.navigations, ev.navigations);
+                            policy_events += 1;
+                        },
+                        .ev_load_error => {
+                            const ev = try proto.decode(proto.EvLoadError, wire.payload);
+                            try std.testing.expectEqual(@as(i32, cef.ERR_BLOCKED_BY_CLIENT), ev.code);
+                            try std.testing.expectEqualStrings("https://site.example/denied", ev.url);
+                            try std.testing.expect(std.mem.endsWith(u8, ev.msg, proto.reasonName(reason)));
+                            errors += 1;
+                        },
+                        .ev_load => try std.testing.expectEqual(@intFromEnum(proto.LoadState.failed), (try proto.decode(proto.EvLoad, wire.payload)).state),
+                        .ev_nav_state => {
+                            const ev = try proto.decode(proto.EvNavState, wire.payload);
+                            try std.testing.expectEqualStrings(v.url, ev.url);
+                            try std.testing.expectEqual(@as(u8, 0), ev.loading);
+                        },
+                        else => return error.UnexpectedEvent,
+                    }
+                    out.advance(msg.bytes.len);
+                }
+                try std.testing.expectEqual(@as(usize, 1), policy_events);
+                try std.testing.expectEqual(@as(usize, 1), errors);
+                var failed_url = std.mem.zeroes(cef.cef_string_t);
+                setStr("https://site.example/denied", &failed_url);
+                defer cef.cef_string_utf16_clear(&failed_url);
+                onLoadError(null, &CallbackArgTest.browser, &CallbackArgTest.frame, cef.ERR_ABORTED, null, &failed_url);
+                try std.testing.expect(out.empty());
+                onLoadingStateChange(null, &CallbackArgTest.browser, 0, 0, 0);
+                try std.testing.expect(!v.nav_loading and !v.sem_nav.loading);
+                try std.testing.expectEqualStrings("https://site.example/healthy", v.url);
+                var unrelated_browser = CallbackArgTest.browser;
+                unrelated_browser.get_identifier = MediaTest.otherIdentifier;
+                other.cef_id = 72;
+                try std.testing.expectEqual(@as(c_int, 0), onBeforeBrowse(null, &unrelated_browser, &CallbackArgTest.frame, &request, 0, 0));
+            }
+        }
+    }
+}
+
+test "controller budget preflight precedes semantic invalidation CEF history calls and revival" {
+    try std.testing.expect(apiHash());
+    const Fake = struct {
+        var calls: usize = 0;
+        fn action(_: [*c]cef.cef_browser_t) callconv(.c) void {
+            calls += 1;
+        }
+        fn canGo(_: [*c]cef.cef_browser_t) callconv(.c) c_int {
+            calls += 1;
+            return 1;
+        }
+    };
+    for ([_]proto.NetReason{ .nav_cap, .request_cap, .byte_cap, .deadline }) |reason| {
+        for (0..5) |operation| {
+            MediaTest.reset();
+            MediaTest.browser.can_go_back = Fake.canGo;
+            MediaTest.browser.can_go_forward = Fake.canGo;
+            MediaTest.browser.go_back = Fake.action;
+            MediaTest.browser.go_forward = Fake.action;
+            MediaTest.browser.reload = Fake.action;
+            MediaTest.browser.reload_ignore_cache = Fake.action;
+            MediaTest.browser.stop_load = Fake.action;
+            var out = proto.Outbox.init(std.testing.allocator);
+            defer out.deinit();
+            var host = Host.init(std.testing.allocator, &out);
+            defer host.deinit();
+            const v = try host.registerView(ViewConstructionTest.req(97, 0));
+            v.browser = &MediaTest.browser;
+            v.cef_id = 71;
+            host.setUrl(v, "https://site.example/healthy");
+            host.setTitle(v, "Healthy document");
+            const target = "https://site.example/next";
+            const action = ([_]proto.NavAct{ .back, .forward, .reload, .reload_no_cache })[@min(operation, 3)];
+            // The unpolicied control still reaches the same native entry point.
+            Fake.calls = 0;
+            if (operation == 4) host.navigate(.{ .view = v.id, .url = target }) else host.navAction(.{ .view = v.id, .action = @intFromEnum(action) });
+            try std.testing.expect(Fake.calls != 0 or MediaTest.navigations == 1);
+            host.netPolicySet(.{
+                .view = v.id,
+                .serial = 1,
+                .flags = 0,
+                .block_types = 0,
+                .allow_schemes = netpolicy.default_schemes,
+                .max_requests = if (reason == .request_cap) 2 else 0,
+                .max_bytes = if (reason == .byte_cap) 2 else 0,
+                .max_navigations = if (reason == .nav_cap) 2 else 0,
+                .deadline_ms = if (reason == .deadline) 100_000 else 0,
+                .allow_top = &.{"site.example"},
+                .allow_sub = &.{},
+            });
+            const s = host_icpt.interceptSlotFor(host.gpa, v.id).?;
+            s.pc = .{ .started_ms = nowMs(), .requests = 1, .bytes = 1, .navigations = 1 };
+            const allowed = s.pc;
+            Fake.calls = 0;
+            MediaTest.navigations = 0;
+            if (operation == 4) host.navigate(.{ .view = v.id, .url = target }) else host.navAction(.{ .view = v.id, .action = @intFromEnum(action) });
+            try std.testing.expect(Fake.calls != 0 or MediaTest.navigations == 1);
+            try std.testing.expectEqualDeep(allowed, s.pc);
+            switch (reason) {
+                .nav_cap => s.pc.navigations = 2,
+                .request_cap => s.pc.requests = 2,
+                .byte_cap => s.pc.bytes = 2,
+                .deadline => s.pc.started_ms -= 100_000,
+                else => unreachable,
+            }
+            while (out.front()) |msg| out.advance(msg.bytes.len);
+            v.sem_nav.rearmed();
+            v.sem_context_doc = 123;
+            v.load_retry = .settled;
+            _ = try host.pushPending(v, .{ .req = 1, .kind = .read });
+            const before = s.pc;
+            const generation = v.sem_nav.generation;
+            Fake.calls = 0;
+            MediaTest.navigations = 0;
+            if (operation == 4) host.navigate(.{ .view = v.id, .url = target }) else host.navAction(.{ .view = v.id, .action = @intFromEnum(action) });
+            try std.testing.expectEqual(@as(usize, 0), Fake.calls);
+            try std.testing.expectEqual(@as(usize, 0), MediaTest.navigations);
+            try std.testing.expectEqual(generation, v.sem_nav.generation);
+            try std.testing.expectEqual(@as(u32, 123), v.sem_context_doc);
+            try std.testing.expect(!v.sem_nav.loading and !v.pending.items[0].rearm);
+            try std.testing.expectEqual(loadretry.State.settled, v.load_retry);
+            try std.testing.expectEqualStrings("https://site.example/healthy", v.url);
+            try std.testing.expectEqualStrings("Healthy document", v.title);
+            try std.testing.expectEqual(reason, s.pc.exhausted);
+            try std.testing.expectEqual(before.requests, s.pc.requests);
+            try std.testing.expectEqual(before.navigations, s.pc.navigations);
+            try std.testing.expectEqual(before.bytes, s.pc.bytes);
+            try std.testing.expectEqual(@as(u32, 1), s.pc.denied[@intFromEnum(reason)]);
+            var errors: usize = 0;
+            while (out.front()) |msg| {
+                var reader = proto.Reader.init(msg.bytes);
+                const wire = (try reader.next()).?;
+                if (wire.tag == .ev_load_error) {
+                    const ev = try proto.decode(proto.EvLoadError, wire.payload);
+                    const expected = if (operation == 4) target else if (action == .back or action == .forward) "" else v.url;
+                    try std.testing.expectEqualStrings(expected, ev.url);
+                    try std.testing.expect(std.mem.endsWith(u8, ev.msg, proto.reasonName(reason)));
+                    errors += 1;
+                } else if (wire.tag == .ev_nav_state) {
+                    const ev = try proto.decode(proto.EvNavState, wire.payload);
+                    try std.testing.expectEqualStrings(v.url, ev.url);
+                    try std.testing.expectEqual(@as(u8, 0), ev.loading);
+                }
+                out.advance(msg.bytes.len);
+            }
+            try std.testing.expectEqual(@as(usize, 1), errors);
+            const denied = s.pc.denied;
+            host.navAction(.{ .view = v.id, .action = @intFromEnum(proto.NavAct.stop) });
+            try std.testing.expectEqual(@as(usize, 1), Fake.calls);
+            try std.testing.expectEqualDeep(denied, s.pc.denied);
+            v.discarded = true;
+            Fake.calls = 0;
+            host.navAction(.{ .view = v.id, .action = @intFromEnum(proto.NavAct.stop) });
+            try std.testing.expectEqual(@as(usize, 0), Fake.calls);
+            if (operation == 4) host.navigate(.{ .view = v.id, .url = target }) else host.navAction(.{ .view = v.id, .action = @intFromEnum(action) });
+            try std.testing.expect(v.discarded);
+            try std.testing.expectEqual(@as(usize, 0), Fake.calls);
+            try std.testing.expectEqual(@as(usize, 0), MediaTest.navigations);
+        }
+    }
+}
+
+test "renderer context guard turns renderers nondumpable, leaves the inherited core limit alone, and fails closed" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var parent_limit: c.struct_rlimit = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), c.getrlimit(c.RLIMIT_CORE, &parent_limit));
+    const parent_dumpable = c.prctl(c.PR_GET_DUMPABLE, @as(c_ulong, 0), @as(c_ulong, 0), @as(c_ulong, 0), @as(c_ulong, 0));
+    for ([_]bool{ false, true }) |deny_prctl| {
+        const pid = c.fork();
+        try std.testing.expect(pid >= 0);
+        if (pid == 0) {
+            if (c.prctl(c.PR_SET_DUMPABLE, @as(c_ulong, 1), @as(c_ulong, 0), @as(c_ulong, 0), @as(c_ulong, 0)) != 0) c._exit(20);
+            untrusted.enabled = false;
+            onContextCreated(null, null, null, null);
+            if (c.prctl(c.PR_GET_DUMPABLE, @as(c_ulong, 0), @as(c_ulong, 0), @as(c_ulong, 0), @as(c_ulong, 0)) != 1) c._exit(21);
+            if (deny_prctl) {
+                const Insn = extern struct { code: u16, jt: u8 = 0, jf: u8 = 0, k: u32 };
+                const Program = extern struct { len: u16, filter: [*]const Insn };
+                // Linux seccomp: deny prctl to exercise the real setter failure.
+                const filter_program = [_]Insn{
+                    .{ .code = 0x20, .k = 0 },
+                    .{ .code = 0x15, .jf = 1, .k = @intFromEnum(std.os.linux.SYS.prctl) },
+                    .{ .code = 0x06, .k = 0x00050000 | c.EPERM },
+                    .{ .code = 0x06, .k = 0x7fff0000 },
+                };
+                const program = Program{ .len = filter_program.len, .filter = &filter_program };
+                if (c.prctl(c.PR_SET_NO_NEW_PRIVS, @as(c_ulong, 1), @as(c_ulong, 0), @as(c_ulong, 0), @as(c_ulong, 0)) != 0 or
+                    c.prctl(c.PR_SET_SECCOMP, @as(c_ulong, 2), @as(c_ulong, @intFromPtr(&program)), @as(c_ulong, 0), @as(c_ulong, 0)) != 0) c._exit(22);
+            }
+            untrusted.enabled = true;
+            for (0..2) |_| {
+                onContextCreated(null, null, null, null);
+                if (deny_prctl) c._exit(23);
+                // A sandboxed renderer may not setrlimit, so the guard must not try.
+                var limit: c.struct_rlimit = undefined;
+                if (c.getrlimit(c.RLIMIT_CORE, &limit) != 0 or limit.rlim_cur != parent_limit.rlim_cur or
+                    limit.rlim_max != parent_limit.rlim_max or
+                    c.prctl(c.PR_GET_DUMPABLE, @as(c_ulong, 0), @as(c_ulong, 0), @as(c_ulong, 0), @as(c_ulong, 0)) != 0) c._exit(24);
+                if (c.prctl(c.PR_SET_DUMPABLE, @as(c_ulong, 1), @as(c_ulong, 0), @as(c_ulong, 0), @as(c_ulong, 0)) != 0) c._exit(25);
+            }
+            c._exit(0);
+        }
+        var status: c_int = 0;
+        try std.testing.expectEqual(pid, c.waitpid(pid, &status, 0));
+        try std.testing.expect(c.WIFEXITED(status));
+        try std.testing.expectEqual(@as(c_int, if (deny_prctl) 1 else 0), c.WEXITSTATUS(status));
+    }
+    var after: c.struct_rlimit = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), c.getrlimit(c.RLIMIT_CORE, &after));
+    try std.testing.expectEqualDeep(parent_limit, after);
+    try std.testing.expectEqual(parent_dumpable, c.prctl(c.PR_GET_DUMPABLE, @as(c_ulong, 0), @as(c_ulong, 0), @as(c_ulong, 0), @as(c_ulong, 0)));
 }
 
 test "a background page replacing its document drops its ports and returns every argument" {
@@ -4797,7 +5855,7 @@ fn readFaultEnv() void {
 /// IO THREAD. Hand the engine our own handler for a request only while
 /// a fault is armed; NULL is the default network loader.
 fn onGetResourceHandler(
-    _: [*c]cef.cef_resource_request_handler_t,
+    self: [*c]cef.cef_resource_request_handler_t,
     browser: [*c]cef.cef_browser_t,
     frame: [*c]cef.cef_frame_t,
     request: [*c]cef.cef_request_t,
@@ -4805,6 +5863,13 @@ fn onGetResourceHandler(
     defer releaseArg(browser);
     defer releaseArg(frame);
     defer releaseArg(request);
+    if (untrusted.enabled) {
+        const req: *cef.cef_request_t = request orelse return null;
+        const b: *cef.cef_browser_t = browser orelse return null;
+        const id = (b.get_identifier orelse return null)(b);
+        const allow_private = host_icpt.untrustedPrivateAllowed(id) orelse return null;
+        return cef.sk_web_untrusted_resource(req, self, @intFromBool(allow_private), host_icpt.untrustedDenied, id);
+    }
     if (g_fault_net_changed.load(.acquire) == 0) return null;
     const req: *cef.cef_request_t = request orelse return null;
     const grt = req.get_resource_type orelse return null;
@@ -5120,6 +6185,7 @@ fn installHandlers() void {
 
     request_handler = std.mem.zeroes(cef.cef_request_handler_t);
     request_handler.base = staticBase(cef.cef_request_handler_t);
+    request_handler.on_before_browse = onBeforeBrowse;
     request_handler.on_render_process_terminated = onRenderProcessTerminated;
     // Interception: the request handler hands out ONE shared resource
     // request handler, whose IO-thread callbacks run the filter engine
@@ -5749,6 +6815,7 @@ fn onAddressChange(
     var s = Utf8.init(url);
     defer s.free();
     if (v.webext_bg or v.webext_popup) return;
+    if (Host.bootstrapLoad(v, s.slice())) return;
     host.setUrl(v, s.slice());
     host.postNavState(v);
 }
@@ -5763,7 +6830,7 @@ fn onTitleChange(
     const v = viewOf(browser) orelse return;
     var s = Utf8.init(title);
     defer s.free();
-    if (v.webext_bg or v.webext_popup) return;
+    if (v.webext_bg or v.webext_popup or v.initial_url != null) return;
     host.setTitle(v, s.slice());
     host.presentTitle(v, s.slice());
     host.post(proto.EvTitle{ .view = v.id, .title = s.slice() });
@@ -5860,6 +6927,7 @@ fn onBeforePopup(
 ) callconv(.c) c_int {
     defer releaseArg(browser);
     defer releaseArg(frame);
+    if (untrusted.enabled) return 1;
     const host = g_host orelse return 1;
     const v = viewOf(browser) orelse return 1;
     var s = Utf8.init(target_url);
@@ -5935,6 +7003,7 @@ fn onBeforeClose(
     // `pending orelse adopting` fallback would hand back a LIVE
     // unrelated view and we would close the wrong tab.
     const v = host.findCef(browserInt(browser, "get_identifier")) orelse return;
+    if (v.media_observer) |observer| observer.closed();
     if (v.webext_popup and v.browser != null) host.popupClosedByEngine(v.id);
     if (v.page_popup and v.browser != null) host.pagePopupClosedByEngine(v);
 }
@@ -5994,6 +7063,46 @@ fn onPdfPrintFinished(
     host.onPrintDone(s.slice(), ok != 0);
 }
 
+/// Cancel budget-refused request navigations and settle a deferred first navigation the engine has taken over.
+///
+/// A back/forward-cache restore never reaches this throttle; only the untrusted helper disables that cache (`untrusted.chromium_features`).
+fn onBeforeBrowse(
+    _: [*c]cef.cef_request_handler_t,
+    browser: [*c]cef.cef_browser_t,
+    frame: [*c]cef.cef_frame_t,
+    request: [*c]cef.cef_request_t,
+    _: c_int,
+    _: c_int,
+) callconv(.c) c_int {
+    defer releaseArg(browser);
+    defer releaseArg(frame);
+    defer releaseArg(request);
+    const host = g_host orelse return 0;
+    const v = viewOf(browser) orelse return 0;
+    const req: *cef.cef_request_t = request orelse return 0;
+    const get_url = req.get_url orelse return 0;
+    const raw = get_url(req);
+    defer if (raw != null) cef.cef_string_userfree_utf16_free(raw);
+    var url = Utf8.init(raw);
+    defer url.free();
+    const main = isMainFrame(frame);
+    // The engine has the deferred first navigation (or its redirect hop)
+    // now; every outcome from here, including a refusal below, is CEF's.
+    // A refusal settles it terminally inside `refuseNavigation`.
+    const settles = main and v.initial_url != null and !Host.bootstrapLoad(v, url.slice());
+    if (!host.refuseNavigation(v, url.slice(), main)) {
+        if (settles) host.settleInitialNavigation(v, false);
+        return 0;
+    }
+    if (main) {
+        // Explicit navigation already queued reads for a new context, but
+        // cancellation keeps the old one. ERR_ABORTED itself must not rearm
+        // unrelated loads or overwrite the policy reason reported above.
+        if (v.sem_nav.waiting_load_start) host.semRearm(v);
+    }
+    return 1;
+}
+
 fn onLoadingStateChange(
     _: [*c]cef.cef_load_handler_t,
     browser: [*c]cef.cef_browser_t,
@@ -6007,6 +7116,10 @@ fn onLoadingStateChange(
     if (v.webext_bg) return;
     if (v.webext_popup) {
         applyZoom(v);
+        return;
+    }
+    if (v.initial_url != null) {
+        host.postNavState(v);
         return;
     }
     v.nav_back = can_back != 0;
@@ -6038,6 +7151,20 @@ fn onLoadStart(
     const host = g_host orelse return;
     const v = viewOf(browser) orelse return;
     const main = isMainFrame(frame);
+    if (v.initial_url != null) {
+        if (!main) return;
+        const f: *cef.cef_frame_t = frame orelse return;
+        const get_url = f.get_url orelse return;
+        const raw = get_url(f);
+        defer if (raw != null) cef.cef_string_userfree_utf16_free(raw);
+        if (raw == null) return;
+        var url = Utf8.init(raw);
+        defer url.free();
+        if (url.slice().len == 0) return;
+        if (Host.bootstrapLoad(v, url.slice())) return;
+        host.clearInitialUrl(v);
+        host.setUrl(v, url.slice());
+    }
     // A hidden background page never faces the client: no zoom, no load
     // events. Its scripts arrive at load end (or, on the origin path,
     // from the document itself). Its Ports still die with its document,
@@ -6089,6 +7216,7 @@ fn onLoadEnd(
     defer releaseArg(frame);
     const host = g_host orelse return;
     const v = viewOf(browser) orelse return;
+    if (v.initial_url != null) return;
     if (v.webext_bg) {
         if (!isMainFrame(frame)) return;
         // The background page's document is up. On the origin path the
@@ -6138,6 +7266,16 @@ fn onLoadError(
     const v = viewOf(browser) orelse return;
     var url = Utf8.init(failed_url);
     defer url.free();
+    if (Host.bootstrapLoad(v, url.slice())) return;
+    // `onBeforeBrowse` normally settled it already. An abort of a URL other
+    // than the requested one is a superseded load, not this one's end.
+    if (v.initial_url) |initial| {
+        if (code != cef.ERR_ABORTED) {
+            host.clearInitialUrl(v);
+        } else if (v.initial_submitted and std.mem.eql(u8, initial, url.slice())) {
+            host.settleInitialNavigation(v, true);
+        }
+    }
     var msg = Utf8.init(text);
     defer msg.free();
     if (v.webext_bg or v.webext_popup) {
@@ -6202,7 +7340,7 @@ fn onLoadError(
         });
         host.semanticNavigationStarted(v);
         v.sem_nav.waiting_load_start = true;
-        host.loadUrl(v, url.slice());
+        _ = host.loadUrl(v, url.slice());
         return;
     }
     host.post(proto.EvLoadError{
@@ -6362,6 +7500,10 @@ fn onContextCreated(
     defer releaseArg(browser);
     defer releaseArg(frame);
     defer releaseArg(context);
+    // Renderers stay dumpable until here: the namespace sandbox needs that to
+    // map its user namespace, and the core limit is already inherited (a
+    // sandboxed renderer may not call setrlimit at all).
+    if (untrusted.enabled and cef.sk_web_untrusted_nondumpable() == 0) c._exit(1);
     const ctx: *cef.cef_v8_context_t = context orelse return;
     if (!sem_secret.ok) {
         // Without the secrets there is no authenticated channel, so the
@@ -6564,7 +7706,11 @@ pub fn initialize(argc: c_int, argv: [*c][*c]u8, cache_dir: []const u8, log_file
     const args = cef.cef_main_args_t{ .argc = argc, .argv = argv };
     var settings = std.mem.zeroes(cef.cef_settings_t);
     settings.size = @sizeOf(cef.cef_settings_t);
-    settings.no_sandbox = 1;
+    // Untrusted mode runs hostile script, so its renderers get Chromium's
+    // namespace + seccomp-bpf sandbox. NO_NEW_PRIVS (set before CEF) rules
+    // out the setuid helper; without user namespaces Chromium aborts with
+    // "No usable sandbox" rather than running unconfined.
+    settings.no_sandbox = if (untrusted.enabled) 0 else 1;
     settings.windowless_rendering_enabled = 1;
     // Opaque background: a windowless browser defaults to transparent,
     // and Chromium disables LCD (subpixel) text AA on any surface that
@@ -6623,4 +7769,30 @@ pub fn engineName() []const u8 {
 
 pub fn engineVersion() []const u8 {
     return std.mem.span(@as([*:0]const u8, cef.CEF_VERSION));
+}
+
+test "untrusted permission prompts are denied even when no host or view resolves" {
+    const Fake = struct {
+        var result: ?cef.cef_permission_request_result_t = null;
+        var releases: usize = 0;
+        fn cont(_: [*c]cef.cef_permission_prompt_callback_t, r: cef.cef_permission_request_result_t) callconv(.c) void {
+            result = r;
+        }
+        fn rel(_: [*c]cef.cef_base_ref_counted_t) callconv(.c) c_int {
+            releases += 1;
+            return 0;
+        }
+    };
+    const previous_enabled = untrusted.enabled;
+    const previous_host = g_host;
+    defer untrusted.enabled = previous_enabled;
+    defer g_host = previous_host;
+    untrusted.enabled = true;
+    g_host = null;
+    var cb = std.mem.zeroes(cef.cef_permission_prompt_callback_t);
+    cb.cont = Fake.cont;
+    cb.base.release = Fake.rel;
+    try std.testing.expectEqual(@as(c_int, 1), host_sec.onShowPermissionPrompt(null, null, 7, null, cef.CEF_PERMISSION_TYPE_GEOLOCATION, &cb));
+    try std.testing.expectEqual(@as(?cef.cef_permission_request_result_t, cef.CEF_PERMISSION_RESULT_DENY), Fake.result);
+    try std.testing.expectEqual(@as(usize, 1), Fake.releases);
 }

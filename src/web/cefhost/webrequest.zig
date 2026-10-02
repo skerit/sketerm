@@ -1338,13 +1338,17 @@ pub fn onGetResourceRequestHandler(
     browser: [*c]cef.cef_browser_t,
     frame: [*c]cef.cef_frame_t,
     request: [*c]cef.cef_request_t,
-    _: c_int,
-    _: c_int,
-    _: [*c]const cef.cef_string_t,
-    _: [*c]c_int,
+    is_navigation: c_int,
+    is_download: c_int,
+    request_initiator: [*c]const cef.cef_string_t,
+    disable_default_handling: [*c]c_int,
 ) callconv(.c) [*c]cef.cef_resource_request_handler_t {
-    releaseArg(browser);
-    releaseArg(frame);
-    releaseArg(request);
+    defer releaseArg(browser);
+    defer releaseArg(frame);
+    defer releaseArg(request);
+    if (host_mod.untrusted.enabled) {
+        if (disable_default_handling != null) disable_default_handling.* = 1;
+        return cef.sk_web_untrusted_request_handler(&host_mod.resource_request_handler, request, is_navigation, is_download, request_initiator);
+    }
     return &host_mod.resource_request_handler;
 }

@@ -141,6 +141,7 @@ comptime {
     // Enforced network policy: std-only decision half of the web
     // helper's request gate, shared with the GUI-side client.
     _ = @import("web/netpolicy.zig");
+    _ = @import("web/untrusted_env.zig");
     // Response-body capture: the filter and the bounded store the
     // helper's IO thread records into.
     _ = @import("web/capture.zig");

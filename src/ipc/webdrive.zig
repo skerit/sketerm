@@ -79,6 +79,11 @@ const muxclient = @import("../mux/client.zig");
 const fsserve = @import("../mux/fsserve.zig");
 const display = @import("../mux/display.zig");
 const proto = @import("../web/protocol.zig");
+const untrusted_env = @import("../web/untrusted_env.zig");
+comptime {
+    // untrusted_env spells the presenter switch itself to stay import-free.
+    if (!untrusted_env.dropped(proto.PRESENTER_ENV)) @compileError("untrusted helpers must not inherit the presenter switch");
+}
 const navfault = @import("../web/navfault.zig");
 const reader_model = @import("../web/reader.zig");
 const reader_guards = @import("../web/reader_guards.zig");
@@ -115,6 +120,33 @@ const SPAWN_LOCK_WAIT_MS: i64 = 30_000;
 /// which is the only thing that flushes a persistent profile's cookies;
 /// CEF usually takes a few hundred ms.
 const GRACEFUL_EXIT_MS: u32 = 4_000;
+
+/// After the graceful window, how long an untrusted cleanup owner gets to
+/// SIGKILL its descendants and delete the private root once its lifetime
+/// fence closes and it is sent SIGTERM; past it the owner itself is
+/// SIGKILLed and the root is left for a later supervisor's sweep.
+const UNTRUSTED_RETIRE_MS: i64 = 2_000;
+
+/// Wait slice for a child when no pidfd is available (pre-5.3 kernels).
+const CHILD_POLL_FALLBACK_MS: i64 = 20;
+
+/// `SK_WEB_SUPERVISOR_CLEANUP_FAILED` in vendor/web_supervisor.h: the
+/// cleanup owner exhausted its bounded deletion attempts.
+const SUPERVISOR_CLEANUP_FAILED: u8 = 251;
+
+/// Directory under the per-user runtime dir that holds untrusted roots.
+/// Short on purpose: see `UNTRUSTED_TMPDIR_MAX`.
+const UNTRUSTED_PARENT = "sketerm/u";
+
+/// `SK_WEB_SUPERVISOR_TMPDIR_MAX` in vendor/web_supervisor.h: the longest
+/// `<root>/t` the browser may get as $TMPDIR, because Chromium binds
+/// $TMPDIR/org.chromium.Chromium.XXXXXX/SingletonSocket (about 46 more
+/// bytes) and a unix socket path caps at 108.
+const UNTRUSTED_TMPDIR_MAX = 60;
+
+/// Random bytes in a root's name (16 hex chars, the supervisor's sweep
+/// pattern). The 0700 parent provides privacy; the name only uniqueness.
+const UNTRUSTED_NAME_BYTES = 8;
 
 /// Deadline for one bounded send. The helper drains its socket in its
 /// poll loop; a peer that takes longer than this is wedged.
@@ -173,6 +205,7 @@ pub const View = struct {
     id: u32,
     w: u16,
     h: u16,
+    emulation: Emulation = .{},
     /// Identity context this view lives in; 0 = the shared default jar
     /// (in-memory, dies with the helper).
     context: u32 = 0,
@@ -250,9 +283,11 @@ pub const View = struct {
     // `ev_net_policy` keeps fresh.
     pol: ?NetPolicy = null,
     pol_serial: u32 = 0,
+    pol_wait_serial: u32 = 0,
+    pol_reply: ?proto.EvNetPolicy = null,
+    pol_seen: u32 = 0,
     pol_active: bool = false,
-    /// The helper answered `active=0` for our serial: the install was
-    /// refused (its slot table is full). The open must fail closed.
+    /// The helper refused our install/update serial; the affected view must close.
     pol_install_failed: bool = false,
     /// `proto.NetReason` byte; nonzero once a budget latched.
     pol_exhausted: u8 = 0,
@@ -461,6 +496,7 @@ pub const ProfileError = error{
 /// serializes. Field semantics live in `web/netpolicy.zig` (the
 /// decision home); this is the transportable value.
 pub const NetPolicy = struct {
+    untrusted: bool = false,
     allow_top: []const []const u8 = &.{},
     allow_sub: []const []const u8 = &.{},
     block_types: u16 = 0,
@@ -490,6 +526,7 @@ pub const NetPolicy = struct {
 /// defaults to the url's host as before; at tighten time it narrows the
 /// view to NO hosts, the one monotone reading there is.
 pub const NetPolicyPatch = struct {
+    untrusted: ?bool = null,
     allow_top: ?[]const []const u8 = null,
     allow_sub: ?[]const []const u8 = null,
     block_types: ?u16 = null,
@@ -548,8 +585,31 @@ pub const NetPolicyPatch = struct {
 /// Same fail-closed contract as `ProfileError`: no unpoliced fallback.
 pub const NetPolicyError = error{
     PolicyUnsupported,
+    PolicyAckUnsupported,
+    PolicyRefused,
+    PolicyAckTimeout,
     PolicyTooManyViews,
     NoPolicy,
+};
+
+pub const Emulation = struct {
+    color_scheme: ?proto.ColorScheme = null,
+    reduced_motion: ?proto.ReducedMotion = null,
+    device_scale_factor: ?f64 = null,
+
+    pub fn present(self: Emulation) bool {
+        return self.color_scheme != null or self.reduced_motion != null or self.device_scale_factor != null;
+    }
+
+    pub fn scale(self: Emulation) u16 {
+        return if (self.device_scale_factor) |s| @intFromFloat(@round(s * 1000)) else 1000;
+    }
+
+    pub fn valid(self: Emulation) bool {
+        if (self.color_scheme == .unchanged or self.reduced_motion == .unchanged) return false;
+        if (self.device_scale_factor) |s| return std.math.isFinite(s) and s >= 0.5 and s <= 4;
+        return true;
+    }
 };
 
 /// Deep-copy a policy so a stored one outlives its caller's arena.
@@ -678,6 +738,153 @@ const SpawnLock = struct {
 /// way, for the same reason.)
 var g_next_view: u32 = 1;
 
+/// Outcome of retiring an untrusted helper's cleanup owner.
+pub const UntrustedCleanup = enum {
+    none,
+    /// The owner exited after deleting the private root.
+    deleted,
+    /// The owner exhausted its bounded deletion attempts (`SUPERVISOR_CLEANUP_FAILED`).
+    gave_up,
+    /// The owner missed its retirement deadline and was SIGKILLed; the
+    /// root is left for a later supervisor's sweep.
+    owner_killed,
+    /// The owner died by a signal, or someone else reaped it.
+    unknown,
+};
+
+/// `CLOSE_RANGE_CLOEXEC` from linux/close_range.h. std's `CLOSE_RANGE`
+/// packed struct numbers its bits from 0 (UNSHARE=1, CLOEXEC=2), but the
+/// kernel's are 1<<1 and 1<<2, so it cannot be used here.
+const CLOSE_RANGE_CLOEXEC: u32 = 1 << 2;
+
+/// Mark every descriptor from `first` up close-on-exec. Fork-child safe:
+/// raw syscalls and stack memory only. `how` exists so tests can force
+/// the fallbacks a pre-5.11 kernel or a /proc-less system takes.
+fn markCloexecFrom(first: c_int, how: CloexecPath) bool {
+    const linux = std.os.linux;
+    if (how == .close_range) {
+        const rc = linux.syscall3(.close_range, @intCast(first), std.math.maxInt(u32), CLOSE_RANGE_CLOEXEC);
+        switch (linux.errno(rc)) {
+            .SUCCESS => return true,
+            .NOSYS, .INVAL => {},
+            else => return false,
+        }
+    }
+    if (how != .rlimit) proc: {
+        const dir = c.open("/proc/self/fd", c.O_RDONLY | c.O_DIRECTORY | c.O_CLOEXEC);
+        if (dir < 0) break :proc;
+        defer _ = c.close(dir);
+        var buf: [4096]u8 align(8) = undefined;
+        while (true) {
+            const n = linux.getdents64(dir, &buf, buf.len);
+            if (linux.errno(n) != .SUCCESS) break :proc;
+            if (n == 0) return true;
+            var off: usize = 0;
+            while (off < n) {
+                const ent: *align(1) const linux.dirent64 = @ptrCast(&buf[off]);
+                const name_ptr: [*:0]const u8 = @ptrCast(&buf[off + @offsetOf(linux.dirent64, "name")]);
+                off += ent.reclen;
+                const fd = std.fmt.parseInt(c_int, std.mem.span(name_ptr), 10) catch continue;
+                if (fd < first or fd == dir) continue;
+                if (c.fcntl(fd, c.F_SETFD, c.FD_CLOEXEC) < 0) return false;
+            }
+        }
+    }
+    // Neither: every descriptor the soft limit allows; EBADF is expected.
+    var lim: c.struct_rlimit = undefined;
+    if (c.getrlimit(c.RLIMIT_NOFILE, &lim) != 0) return false;
+    const top: c_int = @intCast(@min(lim.rlim_cur, @as(c.rlim_t, std.math.maxInt(c_int))));
+    var fd = first;
+    while (fd < top) : (fd += 1) _ = c.fcntl(fd, c.F_SETFD, c.FD_CLOEXEC);
+    return true;
+}
+
+const CloexecPath = enum { close_range, proc, rlimit };
+
+/// A close-on-exec pidfd for an unreaped child, or -1 where the kernel
+/// (pre-5.3) or platform has none and waits fall back to polling.
+fn pidfdOpen(pid: c.pid_t) c_int {
+    if (comptime @import("builtin").os.tag != .linux) return -1;
+    const linux = std.os.linux;
+    const rc = linux.pidfd_open(pid, 0);
+    if (linux.errno(rc) != .SUCCESS) return -1;
+    return @intCast(rc);
+}
+
+/// A child's environment, assembled before fork: nothing may allocate
+/// between fork and exec while the MCP watchdog thread runs.
+const ChildEnv = struct {
+    arena: std.heap.ArenaAllocator,
+    envp: [*:null]const ?[*:0]const u8,
+
+    fn deinit(self: *ChildEnv) void {
+        self.arena.deinit();
+    }
+
+    /// The inherited environment minus every `dropped` name, plus `sets`
+    /// (which replace any inherited value).
+    fn build(gpa: std.mem.Allocator, dropped: *const fn ([]const u8) bool, sets: []const [2][]const u8) !ChildEnv {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        var list: std.ArrayList(?[*:0]const u8) = .empty;
+        var i: usize = 0;
+        outer: while (std.c.environ[i]) |entry| : (i += 1) {
+            const text = std.mem.span(entry);
+            const eq = std.mem.indexOfScalar(u8, text, '=') orelse continue;
+            const name = text[0..eq];
+            if (dropped(name)) continue;
+            for (sets) |kv| if (std.mem.eql(u8, kv[0], name)) continue :outer;
+            try list.append(a, entry);
+        }
+        for (sets) |kv| {
+            const joined = try std.fmt.allocPrintSentinel(a, "{s}={s}", .{ kv[0], kv[1] }, 0);
+            try list.append(a, joined.ptr);
+        }
+        try list.append(a, null);
+        return .{ .arena = arena, .envp = @ptrCast(list.items.ptr) };
+    }
+};
+
+fn keepAll(_: []const u8) bool {
+    return false;
+}
+
+/// Display, audio and bus endpoints a session helper must not inherit.
+fn sessionDropped(name: []const u8) bool {
+    for ([_][]const u8{ "WAYLAND_SOCKET", "DISPLAY", "XAUTHORITY" }) |n| if (std.mem.eql(u8, n, name)) return true;
+    return false;
+}
+
+/// The per-user directory untrusted roots live in, created 0700. Refused
+/// unless the runtime dir is closed to other users (or sticky) and both
+/// sketerm levels are ours and closed to group/other writes.
+fn untrustedParent(runtime: []const u8, buf: []u8) ?[:0]const u8 {
+    const uid = c.getuid();
+    var st: c.struct_stat = undefined;
+    const rt = std.fmt.bufPrintZ(buf, "{s}", .{runtime}) catch return null;
+    if (c.lstat(rt.ptr, &st) != 0 or (st.st_mode & c.S_IFMT) != c.S_IFDIR) return null;
+    if (st.st_uid != uid and st.st_uid != 0) return null;
+    if (st.st_mode & 0o022 != 0 and st.st_mode & c.S_ISVTX == 0) return null;
+    const levels = [_]struct { suffix: []const u8, forbid: c_uint }{
+        .{ .suffix = "sketerm", .forbid = 0o022 },
+        .{ .suffix = UNTRUSTED_PARENT, .forbid = 0o077 },
+    };
+    var out: [:0]const u8 = rt;
+    for (levels, 0..) |level, i| {
+        out = std.fmt.bufPrintZ(buf, "{s}/{s}", .{ runtime, level.suffix }) catch return null;
+        _ = c.mkdir(out.ptr, 0o700);
+        if (c.lstat(out.ptr, &st) != 0 or (st.st_mode & c.S_IFMT) != c.S_IFDIR or st.st_uid != uid) return null;
+        // Our own untrusted dir is tightened in place; its parent is ours
+        // and closed to writes, so no one can swap it for a link meanwhile.
+        if (i == levels.len - 1 and st.st_mode & level.forbid != 0) {
+            if (c.chmod(out.ptr, 0o700) != 0 or c.lstat(out.ptr, &st) != 0) return null;
+        }
+        if (st.st_mode & level.forbid != 0) return null;
+    }
+    return out;
+}
+
 fn nextViewId() u32 {
     const id = g_next_view;
     g_next_view +%= 1;
@@ -689,6 +896,20 @@ pub const Engine = struct {
     gpa: std.mem.Allocator,
     /// Directory holding the helper socket and its cache; owned.
     dir: []u8,
+    /// Fixed when the engine is created: an engine never switches modes,
+    /// so an ordinary helper can never be reused for untrusted content.
+    untrusted: bool = false,
+    /// This launch's private root, `<runtime>/sketerm/untrusted/<random>`;
+    /// fresh per launch, so a leftover root never blocks the next one.
+    private_dir: ?[]u8 = null,
+    private_lifetime: c_int = -1,
+    /// How the last untrusted teardown ended.
+    untrusted_cleanup: UntrustedCleanup = .none,
+    /// Teardown phases (graceful self-exit, then owner retirement); fields so
+    /// tests can shorten them.
+    untrusted_grace_ms: i64 = GRACEFUL_EXIT_MS,
+    untrusted_retire_ms: i64 = UNTRUSTED_RETIRE_MS,
+    mode_selected: bool = false,
     /// MCP instance name (`--name work`), which keys the profile store
     /// root; owned, null for an anonymous instance.
     instance: ?[]u8 = null,
@@ -875,6 +1096,10 @@ pub const Engine = struct {
     /// byte: a changed socket or store path strands the profiles behind
     /// it (the rule `webface.clientForRoute` follows).
     fn routePathZ(self: *const Engine, buf: []u8, ext: []const u8) ?[:0]u8 {
+        if (self.untrusted) {
+            const dir = self.private_dir orelse return null;
+            return std.fmt.bufPrintZ(buf, "{s}/web{s}", .{ dir, ext }) catch null;
+        }
         if (self.route_kind == .direct)
             return std.fmt.bufPrintZ(buf, "{s}/web{s}", .{ self.dir, ext }) catch null;
         var slug_buf: [64]u8 = undefined;
@@ -887,6 +1112,7 @@ pub const Engine = struct {
     /// process's socket closes).
     pub fn deinit(self: *Engine) void {
         defer self.diagnostic.deinit();
+        if (self.untrusted) self.stopUntrusted();
         self.dropConnection();
         if (self.pid > 0 and self.has(.multi_client) and self.remote != null) {
             // Broker-owned store + multi-client helper: the helper
@@ -905,7 +1131,7 @@ pub const Engine = struct {
             }
             self.pid = -1;
         }
-        if (self.pid > 0) {
+        if (self.pid > 0 and !self.untrusted) {
             var status: c_int = 0;
             // Let the helper exit ON ITS OWN first. The closed socket is
             // its exit signal, and the clean path it then runs (close
@@ -987,6 +1213,10 @@ pub const Engine = struct {
             self.store = null;
         }
         self.clearStoreReason();
+        // `stopUntrusted` above already released it; a root its owner could
+        // not delete is swept by a later supervisor, never by this process.
+        if (self.private_dir) |dir| self.gpa.free(dir);
+        self.private_dir = null;
         if (self.instance) |n| self.gpa.free(n);
         self.instance = null;
         self.gpa.free(self.route_host);
@@ -1022,6 +1252,10 @@ pub const Engine = struct {
     /// engine keeps its volatile cache dir and every profile request is
     /// refused with `store_reason`.
     fn openStore(self: *Engine) void {
+        if (self.untrusted) {
+            self.setStoreReason("untrusted browsing permits only ephemeral identities and has no durable profile store", false);
+            return;
+        }
         if (self.store_tried) return;
         self.store_tried = true;
         // A ROUTED engine keeps a store of its own, keyed by the route's
@@ -1285,8 +1519,9 @@ pub const Engine = struct {
     /// The connection died (helper crash or protocol error): reap,
     /// drop views (a fresh helper knows no ids), stay retryable.
     fn lost(self: *Engine) void {
+        if (self.untrusted) self.stopUntrusted();
         self.dropConnection();
-        if (self.pid > 0) {
+        if (self.pid > 0 and !self.untrusted) {
             var status: c_int = 0;
             if (c.waitpid(self.pid, &status, c.WNOHANG) == self.pid) self.diagnostic.exited(status);
             self.pid = -1;
@@ -1312,6 +1547,8 @@ pub const Engine = struct {
     /// binary or a helper that never binds leaves `.unavailable` with
     /// `reason` set, and the caller reports that instead of hanging.
     pub fn ensure(self: *Engine) bool {
+        self.mode_selected = true;
+        if (self.untrusted) return self.ensureUntrusted();
         // Before anything else, and exactly once: the store root IS the
         // helper's --cache-dir, so the decision has to be made before a
         // helper exists and must never change under a running one.
@@ -1423,6 +1660,142 @@ pub const Engine = struct {
         return !(std.mem.eql(u8, s, "0") or std.mem.eql(u8, s, "off") or std.mem.eql(u8, s, "no"));
     }
 
+    fn ensureUntrusted(self: *Engine) bool {
+        if (@import("builtin").os.tag != .linux or self.route_kind != .direct)
+            return self.failStart("untrusted browsing requires Linux and route direct");
+        if (self.state == .ready) return self.readAvailable() and self.state == .ready;
+        // A connection that is not ready was already retired by `lost`;
+        // this only releases what a failed start left behind.
+        self.retireUntrusted(false);
+        var parent_buf: [4096]u8 = undefined;
+        const parent = untrustedParent(platform.runtimeDir(), &parent_buf) orelse
+            return self.failStart("the per-user untrusted root directory (<runtime dir>/sketerm/untrusted) could not be created or is not private to this user; nothing was opened");
+        // Reserve only a name: creation must happen in the cleanup owner,
+        // or MCP death between mkdir and exec leaves an unowned root.
+        var nonce: [UNTRUSTED_NAME_BYTES]u8 = undefined;
+        if (c.getentropy(&nonce, nonce.len) != 0)
+            return self.failStart("could not reserve the untrusted helper's private directory name");
+        const hex = std.fmt.bytesToHex(nonce, .lower);
+        if (parent.len + 1 + hex.len + "/t".len > UNTRUSTED_TMPDIR_MAX)
+            return self.failStart("the runtime directory path is too long for an untrusted helper: its private TMPDIR would not fit Chromium's unix socket path; use a shorter XDG_RUNTIME_DIR. Nothing was opened");
+        self.private_dir = std.fmt.allocPrint(self.gpa, "{s}/{s}", .{ parent, hex }) catch
+            return self.failStart("could not retain the untrusted helper's private directory name");
+        self.untrusted_cleanup = .none;
+        var ok = false;
+        defer if (!ok) self.retireUntrusted(false);
+        var bin_buf: [4096:0]u8 = undefined;
+        const bin = findbin.find(&bin_buf) orelse return self.failStart(MISSING_MSG);
+        var sock_z: [108:0]u8 = undefined;
+        const sock = self.routePathZ(&sock_z, ".sock") orelse return self.failStart("untrusted helper socket path too long");
+        var cache_z: [4096:0]u8 = undefined;
+        _ = self.routePathZ(&cache_z, "-cache") orelse return self.failStart("untrusted helper cache path too long");
+        if (!self.startHelper(bin, sock, &sock_z, &cache_z)) return false;
+        if (!self.has(.untrusted_web)) {
+            self.reason = "the dedicated helper did not verify capability untrusted-web; nothing was opened";
+            self.state = .unavailable;
+            return false;
+        }
+        ok = true;
+        return true;
+    }
+
+    /// Retire the untrusted helper, letting it exit on its own first.
+    fn stopUntrusted(self: *Engine) void {
+        self.retireUntrusted(true);
+    }
+
+    /// Idempotent teardown of an untrusted helper under ONE deadline:
+    /// self-exit (graceful only), then lifetime-fence close + SIGTERM so the
+    /// owner kills its tree and deletes the root, then SIGKILL of the owner.
+    /// This process never deletes the root itself; a root a killed owner
+    /// left behind is swept by the next launch's supervisor.
+    fn retireUntrusted(self: *Engine, graceful: bool) void {
+        self.dropConnection();
+        if (self.pid > 0) {
+            const pidfd = pidfdOpen(self.pid);
+            defer if (pidfd >= 0) {
+                _ = c.close(pidfd);
+            };
+            const start = clock.nowMs();
+            const graceful_end = start + (if (graceful) self.untrusted_grace_ms else 0);
+            const deadline = graceful_end + self.untrusted_retire_ms;
+            var status: c_int = 0;
+            var outcome = self.awaitChild(pidfd, graceful_end, &status);
+            if (outcome == .running) {
+                self.closeLifetime();
+                // Exact unreaped child only; wake a stopped cleanup owner.
+                _ = c.kill(self.pid, c.SIGTERM);
+                _ = c.kill(self.pid, c.SIGCONT);
+                outcome = self.awaitChild(pidfd, deadline, &status);
+            }
+            if (outcome == .running) {
+                std.debug.print("sketerm mcp: untrusted cleanup owner {d} missed its retirement deadline; killed it, its private root is left for the next launch's sweep\n", .{self.pid});
+                _ = c.kill(self.pid, c.SIGKILL);
+                outcome = while (true) {
+                    const r = c.waitpid(self.pid, &status, 0);
+                    if (r == self.pid) break .reaped;
+                    if (r < 0 and std.posix.errno(r) != .INTR) break .lost;
+                };
+                if (outcome == .reaped) self.diagnostic.exited(status);
+                self.untrusted_cleanup = .owner_killed;
+            } else if (outcome == .reaped) {
+                self.diagnostic.exited(status);
+                // The owner exits only after its deletion attempt; dying by a
+                // signal means it never reached it.
+                self.untrusted_cleanup = if (!c.WIFEXITED(status))
+                    .unknown
+                else if (c.WEXITSTATUS(status) == SUPERVISOR_CLEANUP_FAILED)
+                    .gave_up
+                else
+                    .deleted;
+                if (self.untrusted_cleanup != .deleted) std.debug.print("sketerm mcp: untrusted cleanup owner did not delete its private root ({s}); the next launch's supervisor sweeps it\n", .{@tagName(self.untrusted_cleanup)});
+            } else self.untrusted_cleanup = .unknown;
+            self.pid = -1;
+        }
+        self.closeLifetime();
+        if (self.private_dir) |dir| self.gpa.free(dir);
+        self.private_dir = null;
+        self.caps = .initEmpty();
+        self.owner = .none;
+        if (self.state == .ready) self.state = .idle;
+    }
+
+    fn closeLifetime(self: *Engine) void {
+        if (self.private_lifetime >= 0) _ = c.close(self.private_lifetime);
+        self.private_lifetime = -1;
+    }
+
+    const ChildWait = enum { reaped, running, lost };
+
+    /// Wait for the spawned helper until `deadline`, draining its
+    /// diagnostics; blocks on the pidfd when there is one.
+    fn awaitChild(self: *Engine, pidfd: c_int, deadline: i64, status: *c_int) ChildWait {
+        var diag_live = self.diagnostic.reader >= 0;
+        while (true) {
+            self.diagnostic.drain();
+            const r = c.waitpid(self.pid, status, c.WNOHANG);
+            if (r == self.pid) return .reaped;
+            // Another reaper or a broken ownership invariant: nothing to wait on.
+            if (r < 0 and std.posix.errno(r) != .INTR) return .lost;
+            const left = deadline - clock.nowMs();
+            if (left <= 0) return .running;
+            var fds: [2]c.struct_pollfd = undefined;
+            var n: usize = 0;
+            if (pidfd >= 0) {
+                fds[n] = .{ .fd = pidfd, .events = c.POLLIN, .revents = 0 };
+                n += 1;
+            }
+            const diag_at = n;
+            if (diag_live) {
+                fds[n] = .{ .fd = self.diagnostic.reader, .events = c.POLLIN, .revents = 0 };
+                n += 1;
+            }
+            const slice = if (pidfd >= 0) left else @min(left, CHILD_POLL_FALLBACK_MS);
+            if (c.poll(&fds, @intCast(n), @intCast(slice)) > 0 and diag_live and
+                fds[diag_at].revents & (c.POLLHUP | c.POLLERR | c.POLLNVAL) != 0) diag_live = false;
+        }
+    }
+
     /// Ask the broker for its engine (web_op engine_open) and adopt it.
     /// The broker replies before the engine binds — CEF startup is
     /// seconds and must not block the daemon's loop — so the connect
@@ -1459,6 +1832,7 @@ pub const Engine = struct {
     /// not set). Answers `capabilities` before any view exists; once an
     /// engine is up, `owner` is the fact.
     pub fn brokerLaneAvailable(self: *Engine) bool {
+        if (self.untrusted) return false;
         if (self.route_kind != .direct) return false;
         if (!brokerEngineWanted()) return false;
         self.openStore();
@@ -1491,8 +1865,78 @@ pub const Engine = struct {
         self.diagnostic.deinit();
         self.diagnostic = diagnostic.Capture.init() catch
             return self.failStart("could not create the browser helper's diagnostic capture");
+        var lifetime: [2]c_int = .{ -1, -1 };
+        var lifetime_z: [16:0]u8 = undefined;
+        var root_z: [4096:0]u8 = undefined;
+        if (self.untrusted) {
+            if (comptime @import("builtin").os.tag != .linux) return self.failStart("untrusted browsing requires Linux");
+            const linux = std.os.linux;
+            if (linux.errno(linux.pipe2(&lifetime, .{ .CLOEXEC = true })) != .SUCCESS)
+                return self.failStart("could not create the untrusted supervisor's lifetime fence");
+            _ = std.fmt.bufPrintZ(&lifetime_z, "{d}", .{lifetime[0]}) catch unreachable;
+            _ = std.fmt.bufPrintZ(&root_z, "{s}", .{self.private_dir.?}) catch unreachable;
+        }
+        // Environment and argv are complete before the fork: the child
+        // only rearranges descriptors and execs.
+        var child_env = (if (self.untrusted)
+            ChildEnv.build(self.gpa, &untrusted_env.dropped, &untrusted_env.sets)
+        else if (env.active) blk: {
+            // The session's display, software rendering. The exact env
+            // recipe is display.zig's `run` (never derive wl-* paths; the
+            // daemon returned these). The presenter flag arms THIS helper
+            // as a client of a hub nobody else renders into, so its
+            // toplevels are the watch-along surface and not a stray
+            // desktop window.
+            var sets: [8][2][]const u8 = undefined;
+            var n: usize = 0;
+            sets[n] = .{ "WAYLAND_DISPLAY", std.mem.sliceTo(&env.wl, 0) };
+            n += 1;
+            if (env.have_rt) {
+                sets[n] = .{ "XDG_RUNTIME_DIR", std.mem.sliceTo(&env.rt, 0) };
+                n += 1;
+            }
+            if (env.have_pulse) {
+                sets[n] = .{ "PULSE_SERVER", std.mem.sliceTo(&env.pulse, 0) };
+                n += 1;
+            }
+            for ([_][2][]const u8{
+                .{ "XDG_SESSION_TYPE", "wayland" },
+                .{ "LIBGL_ALWAYS_SOFTWARE", "1" },
+                .{ "SKETERM_WEB_OZONE", "wayland" },
+                .{ "SKETERM_WEB_GPU", "0" },
+                .{ proto.PRESENTER_ENV, "1" },
+            }) |kv| {
+                sets[n] = kv;
+                n += 1;
+            }
+            break :blk ChildEnv.build(self.gpa, &sessionDropped, sets[0..n]);
+        } else ChildEnv.build(self.gpa, &keepAll, &.{})) catch {
+            if (lifetime[0] >= 0) _ = c.close(lifetime[0]);
+            if (lifetime[1] >= 0) _ = c.close(lifetime[1]);
+            return self.failStart("could not prepare the browser helper's environment");
+        };
+        defer child_env.deinit();
+        var argv: [12:null]?[*:0]const u8 = .{ bin, "--socket", sock_z, "--cache-dir", cache_z, null, null, null, null, null, null, null };
+        if (self.untrusted) {
+            argv[5] = "--untrusted";
+            argv[6] = "--untrusted-root";
+            argv[7] = &root_z;
+            argv[8] = "--untrusted-lifetime-fd";
+            argv[9] = &lifetime_z;
+        }
+        if (proxy) |p| {
+            argv[5] = "--proxy";
+            argv[6] = p;
+        }
         const pid = c.fork();
         if (pid == 0) {
+            if (self.untrusted) {
+                // The supervisor must survive MCP death, not receive SIGKILL.
+                // Only its read fence crosses either helper/preload exec.
+                _ = c.close(lifetime[1]);
+                if (!markCloexecFrom(3, .close_range)) c._exit(127);
+                if (c.fcntl(lifetime[0], c.F_SETFD, @as(c_int, 0)) < 0) c._exit(127);
+            }
             self.diagnostic.child();
             // stdin/stdout must not corrupt the MCP stream.
             const devnull = c.open("/dev/null", c.O_RDWR);
@@ -1501,40 +1945,21 @@ pub const Engine = struct {
                 _ = c.dup2(devnull, 1);
                 if (devnull > 2) _ = c.close(devnull);
             }
-            if (env.active) {
-                // The session's display, software rendering. The exact
-                // env recipe is display.zig's `run` (never derive wl-*
-                // paths; the daemon returned these).
-                _ = c.setenv("WAYLAND_DISPLAY", &env.wl, 1);
-                if (env.have_rt) _ = c.setenv("XDG_RUNTIME_DIR", &env.rt, 1);
-                _ = c.setenv("XDG_SESSION_TYPE", "wayland", 1);
-                if (env.have_pulse) _ = c.setenv("PULSE_SERVER", &env.pulse, 1);
-                _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
-                _ = c.setenv("SKETERM_WEB_OZONE", "wayland", 1);
-                _ = c.setenv("SKETERM_WEB_GPU", "0", 1);
-                // Arm the presenter: THIS helper is a client of a hub
-                // nobody else renders into, so its toplevels are the
-                // watch-along surface and not a stray desktop window.
-                _ = c.setenv(proto.PRESENTER_ENV, "1", 1);
-                _ = c.unsetenv("WAYLAND_SOCKET");
-                _ = c.unsetenv("DISPLAY");
-                _ = c.unsetenv("XAUTHORITY");
-            }
-            var argv: [8:null]?[*:0]const u8 = .{ bin, "--socket", sock_z, "--cache-dir", cache_z, null, null, null };
-            if (proxy) |p| {
-                argv[5] = "--proxy";
-                argv[6] = p;
-            }
-            _ = c.execv(bin, @ptrCast(@constCast(&argv)));
+            _ = c.execve(bin, @ptrCast(@constCast(&argv)), @ptrCast(@constCast(child_env.envp)));
             diagnostic.Capture.execFailed();
             c._exit(127);
         }
+        if (lifetime[0] >= 0) _ = c.close(lifetime[0]);
         if (pid < 0) {
+            if (lifetime[1] >= 0) _ = c.close(lifetime[1]);
             self.diagnostic.deinit();
             return self.failStart("could not start the browser helper (fork failed)");
         }
         self.diagnostic.parent();
         self.pid = pid;
+        if (self.untrusted) {
+            self.private_lifetime = lifetime[1];
+        }
 
         // Connect loop, watching for a helper that dies on startup
         // (missing libcef, bad CEF deployment) — that never binds.
@@ -1611,11 +2036,17 @@ pub const Engine = struct {
         return false;
     }
 
+    /// Only failed starts kill: an untrusted helper there never served a
+    /// page, so its owner is retired without the graceful self-exit wait.
     fn killChild(self: *Engine) void {
+        if (self.untrusted) {
+            self.retireUntrusted(false);
+            return;
+        }
         if (self.pid <= 0) return;
         _ = c.kill(self.pid, c.SIGKILL);
         var status: c_int = 0;
-        _ = c.waitpid(self.pid, &status, 0);
+        if (c.waitpid(self.pid, &status, 0) == self.pid) self.diagnostic.exited(status);
         self.pid = -1;
     }
 
@@ -1678,21 +2109,35 @@ pub const Engine = struct {
     /// policy, and refused (nothing opened) on a helper that cannot
     /// honour it.
     pub fn openViewWith(self: *Engine, url: []const u8, w: u16, h: u16, spec: ProfileSpec, policy_arg: ?*const NetPolicy, capture_arg: ?*const CaptureFilter) !*View {
+        return self.openViewConfigured(url, w, h, spec, policy_arg, capture_arg, .{});
+    }
+
+    pub fn openViewConfigured(self: *Engine, url: []const u8, w: u16, h: u16, spec: ProfileSpec, policy_arg: ?*const NetPolicy, capture_arg: ?*const CaptureFilter, emulation: Emulation) !*View {
+        if (!emulation.valid()) return error.InvalidEmulation;
+        var policy: ?*const NetPolicy = policy_arg;
+        if (policy == null and spec == .named) policy = self.profile_policy.getPtr(spec.named);
+        const wants_untrusted = if (policy) |p| p.untrusted else false;
+        if (wants_untrusted) {
+            if (policy.?.allow_schemes & ~netpolicy.default_schemes != 0) return error.UntrustedRestrictions;
+            if (spec != .ephemeral or self.route_kind != .direct) return error.UntrustedRestrictions;
+            if (@import("builtin").os.tag != .linux) return error.UntrustedUnsupported;
+            // Mode is fixed at engine creation; an ordinary engine is never
+            // flipped, whatever state it is in.
+            if (!self.untrusted) return error.UntrustedModeConflict;
+        } else if (self.untrusted) return error.UntrustedRestrictions;
         if (!self.ensure()) return error.Unavailable;
+        errdefer if (self.untrusted and self.views.items.len == 0) self.stopUntrusted();
+        if (wants_untrusted and !self.has(.untrusted_web)) return error.UntrustedUnsupported;
+        if (emulation.present() and !self.has(.web_emulation)) return error.EmulationUnsupported;
         // A routed helper that refused its route says so right after
         // the handshake; read that before minting a view it would refuse.
         self.pumpOnce(0);
         if (self.state != .ready) return if (self.route_refused != null) error.RouteRefused else error.Unavailable;
         self.diagnostic.stage = .creating_browser;
 
-        // The effective policy: the explicit one, else the profile's
-        // session default when the open names a profile.
-        var policy: ?*const NetPolicy = policy_arg;
-        if (policy == null and spec == .named) {
-            if (self.profile_policy.getPtr(spec.named)) |p| policy = p;
-        }
         if (policy != null) {
             if (!self.has(.net_policy)) return error.PolicyUnsupported;
+            if (wants_untrusted and !self.has(.net_policy_ack)) return error.PolicyAckUnsupported;
             // The helper can hold this many policies; past it a policied
             // view would silently run unpoliced, so refuse instead.
             if (self.views.items.len >= proto.MAX_POLICY_VIEWS) return error.PolicyTooManyViews;
@@ -1728,52 +2173,59 @@ pub const Engine = struct {
         var owned_cap: ?CaptureFilter = if (capture_arg) |f| try dupeCapture(self.gpa, f.*) else null;
         errdefer if (owned_cap) |*f| freeCapture(self.gpa, f);
         const new_id = nextViewId();
-        var pol_serial: u32 = 0;
-        if (policy) |p| {
-            pol_serial = self.next_policy_serial;
-            self.next_policy_serial += 1;
-            self.send(policyFrame(new_id, pol_serial, p)) catch return error.Unavailable;
-            if (p.block_ads) |on| {
-                self.send(proto.InterceptSet{ .view = new_id, .enabled = if (on) 1 else 0 }) catch return error.Unavailable;
-            }
-        }
-        var cap_serial: u32 = 0;
-        if (capture_arg) |f| {
-            cap_serial = self.next_capture_serial;
-            self.next_capture_serial += 1;
-            self.send(captureInstallFrame(new_id, cap_serial, f)) catch return error.Unavailable;
-        }
-
         const v = try self.gpa.create(View);
-        // Covers both halves: before the append it just destroys the
-        // view, after it also unlinks it from `views` (a bare destroy
-        // there would leave a dangling pointer in the list).
-        errdefer self.abandonView(v);
-        const owned_profile: ?[]u8 = if (profile_name.len > 0) try self.gpa.dupe(u8, profile_name) else null;
+        var registered = false;
         v.* = .{
             .id = new_id,
             .w = w,
             .h = h,
+            .emulation = emulation,
             .context = ctx_id,
-            .profile = owned_profile,
             .ephemeral_ctx = ctx_ephemeral,
             .pol = owned_pol,
-            .pol_serial = pol_serial,
-            .pol_active = policy != null,
             .cap = owned_cap,
-            .cap_serial = cap_serial,
         };
-        // Ownership moved into the view; the errdefers above must not
-        // double-free through the locals.
         owned_pol = null;
         owned_cap = null;
+        // A policy ACK may arrive before any browser exists, so register first.
+        errdefer {
+            if (self.state == .ready) self.send(proto.ViewDestroy{ .view = new_id }) catch {};
+            if (!registered or self.findView(new_id) != null) self.abandonView(v);
+        }
+        if (profile_name.len > 0) v.profile = try self.gpa.dupe(u8, profile_name);
         try self.views.append(self.gpa, v);
+        registered = true;
+        if (emulation.present()) self.send(proto.ViewEmulation{
+            .view = new_id,
+            .color_scheme = if (emulation.color_scheme) |value| @intFromEnum(value) else 0,
+            .reduced_motion = if (emulation.reduced_motion) |value| @intFromEnum(value) else 0,
+            .scale_x1000 = if (emulation.device_scale_factor != null) emulation.scale() else 0,
+        }) catch return error.Unavailable;
+        if (policy) |p| {
+            const serial = self.mintPolicySerial();
+            v.pol_serial = serial;
+            v.pol_wait_serial = if (self.has(.net_policy_ack)) serial else 0;
+            self.send(policyFrame(new_id, serial, p)) catch return error.Unavailable;
+            if (self.has(.net_policy_ack)) {
+                const ev = try self.awaitPolicyReply(new_id, serial, SEND_TIMEOUT_MS);
+                if (ev.active != 1) return error.PolicyRefused;
+                applyPolicyAccounting(v, ev);
+            } else v.pol_active = true;
+            if (p.block_ads) |on| {
+                self.send(proto.InterceptSet{ .view = new_id, .enabled = if (on) 1 else 0 }) catch return error.Unavailable;
+            }
+        }
+        if (capture_arg) |f| {
+            v.cap_serial = self.next_capture_serial;
+            self.next_capture_serial += 1;
+            self.send(captureInstallFrame(new_id, v.cap_serial, f)) catch return error.Unavailable;
+        }
         if (url.len > 0 and self.has(.view_create_url)) {
             self.send(proto.ViewCreateUrl{
                 .view = v.id,
                 .w = w,
                 .h = h,
-                .scale_x1000 = 1000,
+                .scale_x1000 = emulation.scale(),
                 .context = ctx_id,
                 .url = url,
             }) catch return error.Unavailable;
@@ -1782,7 +2234,7 @@ pub const Engine = struct {
                 .view = v.id,
                 .w = w,
                 .h = h,
-                .scale_x1000 = 1000,
+                .scale_x1000 = emulation.scale(),
                 .context = ctx_id,
             }) catch return error.Unavailable;
         }
@@ -1915,7 +2367,8 @@ pub const Engine = struct {
         return .{
             .view = view_id,
             .serial = serial,
-            .flags = if (p.allow_private) proto.NetPolicySet.flag_allow_private else 0,
+            .flags = (if (p.allow_private) proto.NetPolicySet.flag_allow_private else @as(u32, 0)) |
+                (if (p.untrusted) proto.NetPolicySet.flag_untrusted else @as(u32, 0)),
             .block_types = p.block_types,
             .allow_schemes = p.allow_schemes,
             .max_requests = p.max_requests,
@@ -1943,8 +2396,8 @@ pub const Engine = struct {
             if (ctx.id != id) continue;
             if (ctx.views > 0) ctx.views -= 1;
             if (ctx.views == 0 and ctx.ephemeral) {
-                if (self.state == .ready) self.send(proto.ContextDestroy{ .id = id }) catch {};
                 const dead = self.live.orderedRemove(i);
+                if (self.state == .ready) self.send(proto.ContextDestroy{ .id = id }) catch {};
                 if (dead.name.len > 0) self.gpa.free(dead.name);
             }
             return;
@@ -1955,6 +2408,8 @@ pub const Engine = struct {
         for (self.views.items, 0..) |v, i| {
             if (v.id != id) continue;
             if (self.state == .ready) self.send(proto.ViewDestroy{ .view = id }) catch {};
+            // A failed send calls lost(), which already freed every view.
+            if (self.findView(id) == null) return;
             const context = v.context;
             v.deinit(self.gpa);
             self.gpa.destroy(v);
@@ -1963,6 +2418,10 @@ pub const Engine = struct {
             if (self.current == id)
                 self.current = if (self.views.items.len > 0) self.views.items[self.views.items.len - 1].id else 0;
             self.writePresence();
+            if (self.untrusted and self.views.items.len == 0) {
+                self.stopUntrusted();
+                self.state = .idle;
+            }
             return;
         }
     }
@@ -2152,6 +2611,7 @@ pub const Engine = struct {
     /// name. In-memory only, BY DESIGN: persisting it would let the
     /// store's corrupt-rebuild path silently loosen a profile.
     pub fn setProfilePolicy(self: *Engine, name: []const u8, p: *const NetPolicy) !void {
+        if (p.untrusted or self.untrusted) return error.UntrustedRestrictions;
         const owned = try dupePolicy(self.gpa, p.*);
         errdefer {
             var tmp = owned;
@@ -2175,9 +2635,9 @@ pub const Engine = struct {
     /// reports both; an SDK must never mistake "ignored" for
     /// "applied").
     pub const TightenReport = struct {
-        tightened: [10][]const u8 = undefined,
+        tightened: [11][]const u8 = undefined,
         n_tightened: usize = 0,
-        ignored: [10][]const u8 = undefined,
+        ignored: [11][]const u8 = undefined,
         n_ignored: usize = 0,
 
         fn tight(self: *TightenReport, name: []const u8) void {
@@ -2199,12 +2659,14 @@ pub const Engine = struct {
     pub fn tightenViewPolicy(self: *Engine, view_id: u32, incoming: *const NetPolicyPatch) !TightenReport {
         const v = self.findView(view_id) orelse return error.NoView;
         const old = if (v.pol) |*p| p else return error.NoPolicy;
+        if (!self.has(.net_policy_ack)) return error.PolicyAckUnsupported;
+        if (incoming.untrusted) |want| {
+            if (want != old.untrusted) return error.UntrustedModeConflict;
+        }
         var report = TightenReport{};
         var next = try dupePolicy(self.gpa, old.*);
         errdefer freePolicy(self.gpa, &next);
 
-        try self.tightenHosts(old.allow_top, incoming.allow_top, &next.allow_top, &report, "allow_hosts");
-        try self.tightenHosts(old.allow_sub, incoming.allow_sub, &next.allow_sub, &report, "allow_subresource_hosts");
         if (incoming.block_types) |want| {
             if (want & ~old.block_types != 0) {
                 next.block_types = old.block_types | want;
@@ -2219,6 +2681,8 @@ pub const Engine = struct {
             }
             if (want & ~old.allow_schemes != 0) report.ign("allow_schemes");
         }
+        try self.tightenHosts(old.allow_top, incoming.allow_top, &next.allow_top, &report, "allow_hosts", next.allow_schemes);
+        try self.tightenHosts(old.allow_sub, incoming.allow_sub, &next.allow_sub, &report, "allow_subresource_hosts", next.allow_schemes);
         if (incoming.allow_private) |want| {
             if (old.allow_private and !want) {
                 next.allow_private = false;
@@ -2235,7 +2699,6 @@ pub const Engine = struct {
             if (on) {
                 next.block_ads = true;
                 report.tight("block_ads");
-                if (self.state == .ready) self.send(proto.InterceptSet{ .view = view_id, .enabled = 1 }) catch {};
             } else {
                 report.ign("block_ads");
             }
@@ -2245,30 +2708,44 @@ pub const Engine = struct {
             freePolicy(self.gpa, &next);
             return report;
         }
-        const serial = self.next_policy_serial;
-        self.next_policy_serial += 1;
-        self.send(policyFrame(view_id, serial, &next)) catch {
-            freePolicy(self.gpa, &next);
-            return error.Unavailable;
-        };
-        freePolicy(self.gpa, &v.pol.?);
-        v.pol = next;
-        v.pol_serial = serial;
+        const serial = self.mintPolicySerial();
+        v.pol_reply = null;
+        v.pol_wait_serial = serial;
+        errdefer self.closeView(view_id);
+        self.send(policyFrame(view_id, serial, &next)) catch return error.Unavailable;
+        const ev = try self.awaitPolicyReply(view_id, serial, SEND_TIMEOUT_MS);
+        if (ev.active != 1) return error.PolicyRefused;
+        if (incoming.block_ads == true)
+            self.send(proto.InterceptSet{ .view = view_id, .enabled = 1 }) catch return error.Unavailable;
+        const live = self.findView(view_id) orelse return error.NoView;
+        freePolicy(self.gpa, &live.pol.?);
+        live.pol = next;
+        live.pol_serial = serial;
+        applyPolicyAccounting(live, ev);
         return report;
     }
 
     /// An omitted host list is untouched; a present one INTERSECTS (an
     /// explicit empty list narrows to no hosts), and any host it names
     /// beyond the old list is a loosening named under `name`.
-    fn tightenHosts(self: *Engine, old: []const []const u8, incoming: ?[]const []const u8, out: *[]const []const u8, report: *TightenReport, name: []const u8) !void {
+    fn tightenHosts(self: *Engine, old: []const []const u8, incoming: ?[]const []const u8, out: *[]const []const u8, report: *TightenReport, name: []const u8, schemes: u16) !void {
         const want = incoming orelse return;
         var extra = false;
         for (want) |h| {
-            if (!hostListed(old, h)) extra = true;
+            var covered = false;
+            for (old) |base| if (netpolicy.entrySubset(h, base, self.untrusted, schemes)) {
+                covered = true;
+                break;
+            };
+            if (!covered) extra = true;
         }
         if (extra) report.ign(name);
-        const kept = try intersectHosts(self.gpa, old, want);
-        if (kept.len < old.len) {
+        const kept = try intersectHosts(self.gpa, old, want, self.untrusted, schemes);
+        var changed = kept.len != old.len;
+        if (!changed) for (old, kept) |a, b| {
+            if (!std.mem.eql(u8, a, b)) changed = true;
+        };
+        if (changed) {
             freeHostList(self.gpa, out.*);
             out.* = kept;
             report.tight(name);
@@ -2291,30 +2768,94 @@ pub const Engine = struct {
 
     const hostListed = strz.contains;
 
-    /// Owned list of `old` entries that also appear in `incoming`.
-    fn intersectHosts(gpa: std.mem.Allocator, old: []const []const u8, incoming: []const []const u8) ![]const []const u8 {
+    /// Intersect host scopes and ports without widening either list.
+    fn intersectHosts(gpa: std.mem.Allocator, old: []const []const u8, incoming: []const []const u8, untrusted: bool, schemes: u16) ![]const []const u8 {
         var out: std.ArrayList([]const u8) = .empty;
         errdefer {
             for (out.items) |h| gpa.free(h);
             out.deinit(gpa);
         }
         for (old) |h| {
-            if (hostListed(incoming, h)) try out.append(gpa, try gpa.dupe(u8, h));
+            for (incoming) |want| {
+                const kept = if (netpolicy.entrySubset(h, want, untrusted, schemes)) h else if (netpolicy.entrySubset(want, h, untrusted, schemes)) want else continue;
+                if (hostListed(out.items, kept)) continue;
+                const owned = try gpa.dupe(u8, kept);
+                out.append(gpa, owned) catch |err| {
+                    gpa.free(owned);
+                    return err;
+                };
+            }
         }
         return try out.toOwnedSlice(gpa);
     }
 
-    /// Freshen a view's policy accounting (one req + bounded pump).
+    fn mintPolicySerial(self: *Engine) u32 {
+        const serial = self.next_policy_serial;
+        self.next_policy_serial +%= 1;
+        if (self.next_policy_serial == 0) self.next_policy_serial = 1;
+        return serial;
+    }
+
+    fn awaitPolicyReply(self: *Engine, id: u32, serial: u32, budget_ms: i64) !proto.EvNetPolicy {
+        defer if (self.findView(id)) |v| {
+            v.pol_wait_serial = 0;
+            v.pol_reply = null;
+        };
+        const deadline = clock.nowMs() + @max(budget_ms, 0);
+        while (true) {
+            if (self.state != .ready) return error.Unavailable;
+            const v = self.findView(id) orelse return error.NoView;
+            if (v.create_failed != null) return error.PolicyRefused;
+            if (v.pol_reply) |ev| if (ev.serial == serial) return ev;
+            const left = deadline - clock.nowMs();
+            if (left <= 0) return error.PolicyAckTimeout;
+            self.pumpOnce(@intCast(@min(left, 40)));
+        }
+    }
+
+    fn applyPolicyAccounting(v: *View, ev: proto.EvNetPolicy) void {
+        v.pol_active = ev.active == 1;
+        v.pol_install_failed = v.pol != null and ev.active != 1;
+        v.pol_exhausted = ev.exhausted;
+        v.pol_requests = ev.requests;
+        v.pol_bytes = ev.bytes;
+        v.pol_navigations = ev.navigations;
+        v.pol_ms_left = ev.ms_left;
+        v.pol_denied = ev.denied;
+    }
+
+    /// Wait for this query's correlated accounting rather than an arbitrary
+    /// pump turn. Read-only: a timeout or refusal is returned, the view is
+    /// never closed. An abandoned query's serial is never waited on again
+    /// and differs from the view's install serial, so its late reply is
+    /// dropped by `dispatch` instead of answering a later query.
     pub fn netPolicyStatus(self: *Engine, id: u32, budget_ms: i64) !*View {
         if (!self.ensure()) return error.Unavailable;
-        if (self.findView(id) == null) return error.NoView;
+        const v = self.findView(id) orelse return error.NoView;
         if (self.has(.net_policy)) {
+            if (self.has(.net_policy_ack)) {
+                const serial = self.mintPolicySerial();
+                v.pol_wait_serial = serial;
+                v.pol_reply = null;
+                self.send(proto.NetPolicyReq{ .view = id, .serial = serial }) catch return error.Unavailable;
+                const ev = try self.awaitPolicyReply(id, serial, budget_ms);
+                const live = self.findView(id) orelse return error.NoView;
+                applyPolicyAccounting(live, ev);
+                if (live.pol != null and ev.active != 1) return error.PolicyRefused;
+                return live;
+            }
+            // An older helper echoes no serial: any accounting frame for the
+            // live policy that lands after the request answers it.
+            const seen = v.pol_seen;
             self.send(proto.NetPolicyReq{ .view = id }) catch return error.Unavailable;
-            const deadline = clock.nowMs() + @max(budget_ms, 100);
-            while (clock.nowMs() < deadline) {
+            const deadline = clock.nowMs() + @max(budget_ms, 0);
+            while (true) {
                 if (self.state != .ready) return error.Unavailable;
-                self.pumpOnce(40);
-                break;
+                const live = self.findView(id) orelse return error.NoView;
+                if (live.pol_seen != seen) return live;
+                const left = deadline - clock.nowMs();
+                if (left <= 0) return error.PolicyAckTimeout;
+                self.pumpOnce(@intCast(@min(left, 40)));
             }
         }
         return self.findView(id) orelse error.NoView;
@@ -2434,7 +2975,7 @@ pub const Engine = struct {
     pub fn resize(self: *Engine, id: u32, w: u16, h: u16) !void {
         if (!self.ensure()) return error.Unavailable;
         const v = self.findView(id) orelse return error.NoView;
-        self.send(proto.ViewResize{ .view = id, .w = w, .h = h, .scale_x1000 = 1000 }) catch return error.Unavailable;
+        self.send(proto.ViewResize{ .view = id, .w = w, .h = h, .scale_x1000 = v.emulation.scale() }) catch return error.Unavailable;
         v.w = w;
         v.h = h;
     }
@@ -3103,7 +3644,7 @@ pub const Engine = struct {
             mh.msg_iovlen = 1;
             mh.msg_control = &cbuf;
             mh.msg_controllen = cbuf.len;
-            const n = c.recvmsg(self.fd, &mh, 0);
+            const n = c.recvmsg(self.fd, &mh, if (platform.is_linux) c.MSG_CMSG_CLOEXEC else 0);
             if (n == 0) {
                 self.lost();
                 return false;
@@ -3128,6 +3669,10 @@ pub const Engine = struct {
                     while (off + @sizeOf(c_int) <= bytes and hdr_size + off + @sizeOf(c_int) <= cbuf.len) : (off += @sizeOf(c_int)) {
                         var passed: c_int = undefined;
                         @memcpy(std.mem.asBytes(&passed), cbuf[hdr_size + off ..][0..@sizeOf(c_int)]);
+                        if (!platform.is_linux and c.fcntl(passed, c.F_SETFD, c.FD_CLOEXEC) < 0) {
+                            _ = c.close(passed);
+                            continue;
+                        }
                         self.rx_fds.append(self.gpa, passed) catch {
                             _ = c.close(passed);
                         };
@@ -3315,6 +3860,16 @@ pub const Engine = struct {
                         std.ascii.eqlIgnoreCase(v.accept_fingerprint.?, ev.fingerprint);
                     if (v.cert) |*old| old.free(self.gpa);
                     v.cert = navfault.CertRec.init(self.gpa, ev, if (accept) .accepted else .refused) catch null;
+                    if (!accept) {
+                        // Refusal fails this TLS load before the engine's later error arrives.
+                        if (v.load_error) |*old| old.free(self.gpa);
+                        v.load_error = navfault.LoadErrRec.init(self.gpa, .{
+                            .view = ev.view,
+                            .code = ev.code,
+                            .url = ev.url,
+                            .msg = ev.msg,
+                        }) catch null;
+                    }
                     self.send(proto.CertDecision{ .view = ev.view, .proceed = if (accept) 1 else 0 }) catch {};
                 }
             },
@@ -3424,20 +3979,15 @@ pub const Engine = struct {
             .ev_net_policy => {
                 const ev = proto.decode(proto.EvNetPolicy, frame.payload) catch return;
                 const v = self.findView(ev.view) orelse return;
-                // A stale serial answers for a policy this view no
-                // longer runs; ignore it.
-                if (v.pol_serial == 0 or ev.serial != v.pol_serial) return;
-                if (ev.active == 0) {
-                    v.pol_install_failed = true;
+                if (v.pol_wait_serial != 0 and ev.serial == v.pol_wait_serial) {
+                    v.pol_reply = ev;
                     return;
                 }
-                v.pol_active = true;
-                v.pol_exhausted = ev.exhausted;
-                v.pol_requests = ev.requests;
-                v.pol_bytes = ev.bytes;
-                v.pol_navigations = ev.navigations;
-                v.pol_ms_left = ev.ms_left;
-                v.pol_denied = ev.denied;
+                // A stale serial answers for a policy this view no
+                // longer runs; ignore it.
+                if (ev.serial != v.pol_serial) return;
+                v.pol_seen +%= 1;
+                applyPolicyAccounting(v, ev);
             },
             else => {},
         }
@@ -3861,7 +4411,134 @@ const Pair = struct {
         const n = c.recv(self.peer, buf.ptr, buf.len, c.MSG_DONTWAIT);
         return if (n <= 0) buf[0..0] else buf[0..@intCast(n)];
     }
+
+    fn policyAck(self: *Pair, v: *const View) !void {
+        self.eng.caps.insert(.net_policy_ack);
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(std.testing.allocator);
+        try proto.encode(std.testing.allocator, &buf, proto.EvNetPolicy{
+            .view = v.id,
+            .serial = self.eng.next_policy_serial,
+            .active = 1,
+            .exhausted = v.pol_exhausted,
+            .requests = v.pol_requests,
+            .bytes = v.pol_bytes,
+            .navigations = v.pol_navigations,
+            .ms_left = v.pol_ms_left,
+            .denied = v.pol_denied,
+        });
+        try std.testing.expectEqual(@as(isize, @intCast(buf.items.len)), c.write(self.peer, buf.items.ptr, buf.items.len));
+    }
+
+    fn openPolicyAck(self: *Pair, pol: *const NetPolicy) !*View {
+        self.eng.caps.insert(.net_policy_ack);
+        var helper = PolicyPeer{ .peer = self.peer, .serial = self.eng.next_policy_serial };
+        const thread = try std.Thread.spawn(.{}, PolicyPeer.run, .{&helper});
+        defer thread.join();
+        return self.eng.openViewIn("https://site.example/", 800, 600, if (pol.untrusted) .ephemeral else .default, pol);
+    }
 };
+
+const PolicyPeer = struct {
+    const Action = enum { success, reject, timeout, disappear, create_failed };
+    peer: c_int,
+    serial: u32,
+    tag: proto.Tag = .net_policy_set,
+    action: Action = .success,
+    reply: ?proto.EvNetPolicy = null,
+    before_ack_create: bool = false,
+    answered: bool = false,
+
+    fn run(self: *PolicyPeer) void {
+        var buf: [65536]u8 = undefined;
+        const deadline = clock.nowMs() + 2000;
+        while (clock.nowMs() < deadline) {
+            const n = c.recv(self.peer, &buf, buf.len, c.MSG_PEEK | c.MSG_DONTWAIT);
+            if (n <= 0) {
+                _ = c.usleep(1000);
+                continue;
+            }
+            var reader = proto.Reader.init(buf[0..@intCast(n)]);
+            while (reader.next() catch null) |frame| {
+                if (frame.tag != self.tag) continue;
+                var view: u32 = 0;
+                var serial: u32 = 0;
+                if (self.tag == .net_policy_set) {
+                    const set = proto.NetPolicySet.decodeAlloc(frame.payload, std.heap.page_allocator) catch return;
+                    defer std.heap.page_allocator.free(set.allow_top);
+                    defer std.heap.page_allocator.free(set.allow_sub);
+                    view = set.view;
+                    serial = set.serial;
+                } else {
+                    const req = proto.decode(proto.NetPolicyReq, frame.payload) catch return;
+                    view = req.view;
+                    serial = req.serial;
+                }
+                if (serial != self.serial) continue;
+                var ev = self.reply orelse proto.EvNetPolicy{
+                    .view = view,
+                    .serial = serial,
+                    .active = 1,
+                    .exhausted = 0,
+                    .requests = 0,
+                    .bytes = 0,
+                    .navigations = 0,
+                    .ms_left = 0,
+                    .denied = @splat(0),
+                };
+                ev.view = view;
+                ev.serial = serial + 1000;
+                self.post(ev);
+                _ = c.usleep(80_000);
+                const waiting = c.recv(self.peer, &buf, buf.len, c.MSG_PEEK | c.MSG_DONTWAIT);
+                if (waiting > 0) {
+                    var pending = proto.Reader.init(buf[0..@intCast(waiting)]);
+                    while (pending.next() catch null) |f| {
+                        if (f.tag == .view_create or f.tag == .view_create_url) self.before_ack_create = true;
+                    }
+                }
+                switch (self.action) {
+                    .timeout => return,
+                    .disappear => {
+                        _ = c.shutdown(self.peer, c.SHUT_RDWR);
+                        return;
+                    },
+                    .create_failed => self.post(proto.EvViewCreateFailed{ .view = view, .context = 0, .reason = "view disappeared" }),
+                    .success, .reject => {
+                        ev.serial = serial;
+                        ev.active = if (self.action == .success) 1 else 0;
+                        if (ev.active == 0) ev.exhausted = @intFromEnum(proto.NetReason.policy_refused);
+                        self.post(ev);
+                    },
+                }
+                self.answered = true;
+                return;
+            }
+            _ = c.usleep(1000);
+        }
+    }
+
+    fn post(self: *PolicyPeer, value: anytype) void {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(std.heap.page_allocator);
+        proto.encode(std.heap.page_allocator, &buf, value) catch return;
+        _ = c.write(self.peer, buf.items.ptr, buf.items.len);
+    }
+};
+
+test "received frame descriptors cannot cross a later helper exec" {
+    var pair = try Pair.init(std.testing.allocator);
+    defer pair.deinit();
+    const source = c.open("/dev/null", c.O_RDONLY | c.O_CLOEXEC);
+    try std.testing.expect(source >= 0);
+    defer _ = c.close(source);
+    // A partial frame holds the descriptor in the receive queue rather
+    // than dispatching it, covering the inheritance window before pairing.
+    try @import("../smoke/unixsock.zig").sendWithFd(pair.peer, &.{0}, source);
+    try std.testing.expect(pair.eng.readAvailable());
+    try std.testing.expectEqual(@as(usize, 1), pair.eng.rx_fds.items.len);
+    try std.testing.expect(c.fcntl(pair.eng.rx_fds.items[0], c.F_GETFD) & c.FD_CLOEXEC != 0);
+}
 
 /// The frame tags the engine emitted, in order.
 fn tagsOf(bytes: []const u8, out: []proto.Tag) []const proto.Tag {
@@ -4122,10 +4799,16 @@ test "ev_cert_error is answered: refused by default, accepted only for the named
     try std.testing.expect(v.cert.?.verdict == .refused);
     try std.testing.expectEqualStrings("CERT_AUTHORITY_INVALID", v.cert.?.msg);
     try std.testing.expectEqualStrings(fp, v.cert.?.fingerprint);
+    // No later load-error event or pump may be needed to report the refusal.
+    try std.testing.expect(v.load_error != null);
+    try std.testing.expectEqual(@as(i32, -202), v.load_error.?.code);
+    try std.testing.expectEqualStrings("https://10.0.0.1/", v.load_error.?.url);
+    try std.testing.expectEqualStrings("CERT_AUTHORITY_INVALID", v.load_error.?.msg);
     const refused = frameOf(proto.CertDecision, p.drain(&buf)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(v.id, refused.view);
     try std.testing.expectEqual(@as(u8, 0), refused.proceed);
 
-    // The engine then fails the load; both records explain it.
+    // A later engine-specific error replaces the immediate TLS failure.
     var err_payload: std.ArrayList(u8) = .empty;
     defer err_payload.deinit(gpa);
     try proto.encodePayload(gpa, &err_payload, proto.EvLoadError{
@@ -4136,14 +4819,19 @@ test "ev_cert_error is answered: refused by default, accepted only for the named
     });
     p.eng.dispatch(.{ .tag = .ev_load_error, .payload = err_payload.items });
     try std.testing.expectEqual(@as(i32, -202), v.load_error.?.code);
+    try std.testing.expectEqualStrings("ERR_CERT_AUTHORITY_INVALID", v.load_error.?.msg);
 
     // Opting in names ONE certificate, case-insensitively; a string
     // that cannot be a fingerprint is refused at the call.
     try std.testing.expectError(error.InvalidFingerprint, p.eng.setAcceptCert(v.id, "abc"));
     try p.eng.setAcceptCert(v.id, "AB" ** 32);
+    p.eng.loadStarted(v, "https://10.0.0.1/");
+    try std.testing.expect(v.cert == null and v.load_error == null);
     p.eng.dispatch(.{ .tag = .ev_cert_error, .payload = payload.items });
     try std.testing.expect(v.cert.?.verdict == .accepted);
+    try std.testing.expect(v.load_error == null);
     const accepted = frameOf(proto.CertDecision, p.drain(&buf)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(v.id, accepted.view);
     try std.testing.expectEqual(@as(u8, 1), accepted.proceed);
 
     // A started load on the same host keeps the accepted verdict (the
@@ -4183,6 +4871,9 @@ test "ev_cert_error is answered: refused by default, accepted only for the named
     });
     p.eng.dispatch(.{ .tag = .ev_cert_error, .payload = other.items });
     try std.testing.expect(v.cert.?.verdict == .refused);
+    try std.testing.expectEqual(@as(i32, -201), v.load_error.?.code);
+    try std.testing.expectEqualStrings("https://other.test/", v.load_error.?.url);
+    try std.testing.expectEqualStrings("CERT_DATE_INVALID", v.load_error.?.msg);
     const again = frameOf(proto.CertDecision, p.drain(&buf)) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(u8, 0), again.proceed);
 }
@@ -4296,6 +4987,222 @@ test "a policied open is refused, opening nothing, without the net-policy capabi
     // never loaded unpoliced.
     try std.testing.expectEqual(@as(usize, 0), p.eng.views.items.len);
     try std.testing.expectEqual(@as(usize, 0), p.drain(&buf).len);
+}
+
+test "initial policy ACK precedes browser creation and delayed stale replies cannot satisfy it" {
+    var pair = try Pair.init(std.testing.allocator);
+    defer pair.deinit();
+    pair.eng.caps.insert(.net_policy);
+    pair.eng.caps.insert(.net_policy_ack);
+    var helper = PolicyPeer{ .peer = pair.peer, .serial = pair.eng.next_policy_serial };
+    const thread = try std.Thread.spawn(.{}, PolicyPeer.run, .{&helper});
+    const started = clock.nowMs();
+    const view = pair.eng.openViewIn("https://site.example/", 800, 600, .default, &.{ .allow_top = &.{"site.example"} }) catch |err| {
+        thread.join();
+        return err;
+    };
+    thread.join();
+    try std.testing.expect(helper.answered);
+    try std.testing.expect(!helper.before_ack_create);
+    try std.testing.expect(clock.nowMs() - started >= 70);
+    try std.testing.expect(view.pol_active);
+    try std.testing.expectEqual(helper.serial, view.pol_serial);
+}
+
+test "rejected lost and missing initial policy ACKs never create an unpoliced browser" {
+    for ([_]PolicyPeer.Action{ .reject, .timeout, .disappear, .create_failed }) |action| {
+        var pair = try Pair.init(std.testing.allocator);
+        defer pair.deinit();
+        pair.eng.caps.insert(.net_policy);
+        pair.eng.caps.insert(.net_policy_ack);
+        var helper = PolicyPeer{ .peer = pair.peer, .serial = pair.eng.next_policy_serial, .action = action };
+        const thread = try std.Thread.spawn(.{}, PolicyPeer.run, .{&helper});
+        const opened = pair.eng.openViewIn("https://site.example/", 800, 600, .default, &.{ .allow_top = &.{"site.example"} });
+        thread.join();
+        try std.testing.expectError(switch (action) {
+            .reject, .create_failed => error.PolicyRefused,
+            .timeout => error.PolicyAckTimeout,
+            .disappear => error.Unavailable,
+            else => unreachable,
+        }, opened);
+        try std.testing.expectEqual(@as(usize, 0), pair.eng.views.items.len);
+        try std.testing.expect(!helper.before_ack_create);
+        var buf: [16384]u8 = undefined;
+        var reader = proto.Reader.init(pair.drain(&buf));
+        while (try reader.next()) |frame| {
+            try std.testing.expect(frame.tag != .view_create and frame.tag != .view_create_url and frame.tag != .navigate);
+        }
+    }
+}
+
+test "live policy updates require ACK support and preserve accounting after the matching ACK" {
+    var pair = try Pair.init(std.testing.allocator);
+    defer pair.deinit();
+    pair.eng.caps.insert(.net_policy);
+    const view = try pair.eng.openViewIn("https://site.example/", 800, 600, .default, &.{ .allow_top = &.{"site.example"}, .max_requests = 100 });
+    const id = view.id;
+    const old_serial = view.pol_serial;
+    var buf: [16384]u8 = undefined;
+    _ = pair.drain(&buf);
+    try std.testing.expectError(error.PolicyAckUnsupported, pair.eng.tightenViewPolicy(id, &.{ .max_requests = 10 }));
+    try std.testing.expectEqual(@as(usize, 0), pair.drain(&buf).len);
+    try std.testing.expectEqual(@as(u32, 100), view.pol.?.max_requests);
+    pair.eng.caps.insert(.net_policy_ack);
+    var helper = PolicyPeer{ .peer = pair.peer, .serial = pair.eng.next_policy_serial, .reply = .{
+        .view = id,
+        .serial = 0,
+        .active = 1,
+        .exhausted = @intFromEnum(proto.NetReason.byte_cap),
+        .requests = 7,
+        .bytes = 1234,
+        .navigations = 2,
+        .ms_left = 320,
+        .denied = @splat(0),
+    } };
+    const thread = try std.Thread.spawn(.{}, PolicyPeer.run, .{&helper});
+    const report = pair.eng.tightenViewPolicy(id, &.{ .max_requests = 10 });
+    thread.join();
+    try std.testing.expectEqual(@as(usize, 1), (try report).n_tightened);
+    try std.testing.expectEqual(@as(u32, 10), view.pol.?.max_requests);
+    try std.testing.expect(view.pol_serial != old_serial);
+    try std.testing.expectEqual(@as(u32, 7), view.pol_requests);
+    try std.testing.expectEqual(@as(u64, 1234), view.pol_bytes);
+    try std.testing.expectEqual(@as(u32, 320), view.pol_ms_left);
+    var stale = helper.reply.?;
+    stale.serial = old_serial;
+    stale.requests = 0;
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(std.testing.allocator);
+    try proto.encodePayload(std.testing.allocator, &payload, stale);
+    pair.eng.dispatch(.{ .tag = .ev_net_policy, .payload = payload.items });
+    try std.testing.expectEqual(@as(u32, 7), view.pol_requests);
+}
+
+test "rejected missing and disappearing update ACKs close only the affected view" {
+    for ([_]PolicyPeer.Action{ .reject, .timeout, .disappear, .create_failed }) |action| {
+        var pair = try Pair.init(std.testing.allocator);
+        defer pair.deinit();
+        pair.eng.caps.insert(.net_policy);
+        const view = try pair.eng.openViewIn("https://site.example/", 800, 600, .default, &.{ .allow_top = &.{"site.example"}, .max_requests = 100 });
+        const id = view.id;
+        const other = try pair.eng.openView("https://other.example/", 800, 600);
+        const other_id = other.id;
+        var buf: [16384]u8 = undefined;
+        _ = pair.drain(&buf);
+        pair.eng.caps.insert(.net_policy_ack);
+        var helper = PolicyPeer{ .peer = pair.peer, .serial = pair.eng.next_policy_serial, .action = action };
+        const thread = try std.Thread.spawn(.{}, PolicyPeer.run, .{&helper});
+        const updated = pair.eng.tightenViewPolicy(id, &.{ .max_requests = 10 });
+        thread.join();
+        try std.testing.expectError(switch (action) {
+            .reject, .create_failed => error.PolicyRefused,
+            .timeout => error.PolicyAckTimeout,
+            .disappear => error.Unavailable,
+            else => unreachable,
+        }, updated);
+        try std.testing.expect(pair.eng.findView(id) == null);
+        if (action != .disappear) try std.testing.expect(pair.eng.findView(other_id) != null);
+    }
+}
+
+test "policy status awaits a fresh query serial despite stale pushed accounting" {
+    var pair = try Pair.init(std.testing.allocator);
+    defer pair.deinit();
+    pair.eng.caps.insert(.net_policy);
+    const view = try pair.eng.openViewIn("https://site.example/", 800, 600, .default, &.{ .allow_top = &.{"site.example"} });
+    const serial = view.pol_serial;
+    var buf: [16384]u8 = undefined;
+    _ = pair.drain(&buf);
+    pair.eng.caps.insert(.net_policy_ack);
+    var helper = PolicyPeer{ .peer = pair.peer, .serial = pair.eng.next_policy_serial, .tag = .net_policy_req, .reply = .{
+        .view = view.id,
+        .serial = 0,
+        .active = 1,
+        .exhausted = 0,
+        .requests = 9,
+        .bytes = 81,
+        .navigations = 1,
+        .ms_left = 10,
+        .denied = @splat(0),
+    } };
+    const thread = try std.Thread.spawn(.{}, PolicyPeer.run, .{&helper});
+    const started = clock.nowMs();
+    const queried = pair.eng.netPolicyStatus(view.id, 500);
+    thread.join();
+    const fresh = try queried;
+    try std.testing.expect(clock.nowMs() - started >= 70);
+    try std.testing.expectEqual(@as(u32, 9), fresh.pol_requests);
+    try std.testing.expectEqual(serial, fresh.pol_serial);
+    _ = pair.drain(&buf);
+    // A status query that times out is read-only: the view stays.
+    const abandoned = pair.eng.next_policy_serial;
+    try std.testing.expectError(error.PolicyAckTimeout, pair.eng.netPolicyStatus(fresh.id, 5));
+    try std.testing.expectEqual(@as(usize, 1), pair.eng.views.items.len);
+    try std.testing.expect(pair.eng.findView(fresh.id) != null);
+    _ = pair.drain(&buf);
+    // Its late reply arrives while the NEXT query waits: it must neither
+    // answer that query nor be applied as accounting.
+    var late: std.ArrayList(u8) = .empty;
+    defer late.deinit(std.testing.allocator);
+    try proto.encode(std.testing.allocator, &late, proto.EvNetPolicy{
+        .view = fresh.id,
+        .serial = abandoned,
+        .active = 1,
+        .exhausted = 0,
+        .requests = 77,
+        .bytes = 0,
+        .navigations = 0,
+        .ms_left = 0,
+        .denied = @splat(0),
+    });
+    try std.testing.expectEqual(@as(isize, @intCast(late.items.len)), c.write(pair.peer, late.items.ptr, late.items.len));
+    var next = PolicyPeer{ .peer = pair.peer, .serial = pair.eng.next_policy_serial, .tag = .net_policy_req, .reply = .{
+        .view = fresh.id,
+        .serial = 0,
+        .active = 1,
+        .exhausted = 0,
+        .requests = 12,
+        .bytes = 0,
+        .navigations = 1,
+        .ms_left = 0,
+        .denied = @splat(0),
+    } };
+    const second = try std.Thread.spawn(.{}, PolicyPeer.run, .{&next});
+    const requeried = pair.eng.netPolicyStatus(fresh.id, 1000);
+    second.join();
+    try std.testing.expectEqual(@as(u32, 12), (try requeried).pol_requests);
+    try std.testing.expectEqual(serial, fresh.pol_serial);
+}
+
+test "an older helper's missing status reply leaves the view open" {
+    var pair = try Pair.init(std.testing.allocator);
+    defer pair.deinit();
+    pair.eng.caps.insert(.net_policy);
+    const view = try pair.eng.openViewIn("https://site.example/", 800, 600, .default, &.{ .allow_top = &.{"site.example"} });
+    try std.testing.expectError(error.PolicyAckTimeout, pair.eng.netPolicyStatus(view.id, 5));
+    try std.testing.expect(pair.eng.findView(view.id) != null);
+    try std.testing.expectEqual(State.ready, pair.eng.state);
+}
+
+test "untrusted host intersection uses the narrowed schemes before testing explicit ports" {
+    for ([_]netpolicy.Scheme{ .https, .http }) |scheme| {
+        var pair = try Pair.init(std.testing.allocator);
+        defer pair.deinit();
+        pair.eng.caps.insert(.net_policy);
+        const view = try pair.eng.openViewIn("https://site.example/", 800, 600, .default, &.{ .allow_top = &.{"site.example"} });
+        pair.eng.untrusted = true;
+        view.pol.?.untrusted = true;
+        try pair.policyAck(view);
+        const report = try pair.eng.tightenViewPolicy(view.id, &.{ .allow_schemes = scheme.bit(), .allow_top = &.{"site.example:443"} });
+        try std.testing.expectEqual(scheme.bit(), view.pol.?.allow_schemes);
+        if (scheme == .https) {
+            try std.testing.expectEqual(@as(usize, 0), report.n_ignored);
+            try std.testing.expectEqualStrings("site.example:443", view.pol.?.allow_top[0]);
+        } else {
+            try std.testing.expectEqual(@as(usize, 1), report.n_ignored);
+            try std.testing.expectEqual(@as(usize, 0), view.pol.?.allow_top.len);
+        }
+    }
 }
 
 test "net_policy_set travels strictly before view_create_url, naming the same view" {
@@ -4580,6 +5487,7 @@ test "a live policy only tightens: loosenings are named and never sent" {
     const v = try p.eng.openViewIn("https://site.example/", 800, 600, .default, &pol);
     _ = p.drain(&buf);
     const first_serial = v.pol_serial;
+    p.eng.caps.insert(.net_policy_ack);
 
     // Pure loosening: more hosts, higher budget. Nothing may move and
     // nothing may be sent.
@@ -4601,6 +5509,7 @@ test "a live policy only tightens: loosenings are named and never sent" {
         .max_requests = 10,
         .max_bytes = 5000, // looser: ignored
     };
+    try p.policyAck(v);
     const r2 = try p.eng.tightenViewPolicy(v.id, &tighter);
     try std.testing.expect(r2.n_tightened >= 2);
     try std.testing.expect(r2.n_ignored >= 1);
@@ -4638,6 +5547,7 @@ test "a partial tighten leaves every omitted field exactly as it was" {
     _ = p.drain(&buf);
 
     // Only max_requests is said: schemes and private access must survive.
+    try p.policyAck(v);
     const r = try p.eng.tightenViewPolicy(v.id, &.{ .max_requests = 10 });
     try std.testing.expectEqual(@as(usize, 1), r.n_tightened);
     try std.testing.expectEqualStrings("max_requests", r.tightened[0]);
@@ -4684,6 +5594,7 @@ test "explicit scheme and private-address fields still tighten, and widen attemp
     _ = p.drain(&buf);
 
     // Explicit shrink of schemes, explicit private off: both tighten.
+    try p.policyAck(v);
     const r1 = try p.eng.tightenViewPolicy(v.id, &.{
         .allow_schemes = netpolicy.default_schemes,
         .allow_private = false,
@@ -4743,6 +5654,7 @@ test "NetPolicyPatch.effective carries every said field, checked field by field"
     // Every value differs from NetPolicy's default, so a field that
     // effective() failed to copy would read back as the default.
     const full = NetPolicyPatch{
+        .untrusted = true,
         .allow_top = &.{"a.example"},
         .allow_sub = &.{"b.example"},
         .block_types = netpolicy.typeBit("image").?,
@@ -4796,6 +5708,7 @@ test "a present empty host list narrows a live view to no hosts; an absent one i
     _ = p.drain(&buf);
 
     // Absent lists and an explicit empty block_types move nothing.
+    p.eng.caps.insert(.net_policy_ack);
     const r0 = try p.eng.tightenViewPolicy(v.id, &.{ .block_types = 0 });
     try std.testing.expectEqual(@as(usize, 0), r0.n_tightened);
     try std.testing.expectEqual(@as(usize, 0), r0.n_ignored);
@@ -4805,6 +5718,7 @@ test "a present empty host list narrows a live view to no hosts; an absent one i
 
     // An explicit empty top-level list is the literal tighten: no hosts.
     // The subresource list was not said and survives.
+    try p.policyAck(v);
     const r1 = try p.eng.tightenViewPolicy(v.id, &.{ .allow_top = &.{} });
     try std.testing.expectEqual(@as(usize, 1), r1.n_tightened);
     try std.testing.expectEqualStrings("allow_hosts", r1.tightened[0]);
@@ -4857,4 +5771,305 @@ test "a profile's session-default policy rides its web_open, and only its own" {
     try std.testing.expect(other.pol == null);
     const plain = try p.eng.openViewIn("https://site.example/", 800, 600, .default, null);
     try std.testing.expect(plain.pol == null);
+}
+
+test "emulation capability refuses before publication and precedes the first document" {
+    var pair = try Pair.init(std.testing.allocator);
+    defer pair.deinit();
+    const emulation = Emulation{ .color_scheme = .dark, .reduced_motion = .reduce, .device_scale_factor = 1.5 };
+    var buf: [16384]u8 = undefined;
+    try std.testing.expectError(error.EmulationUnsupported, pair.eng.openViewConfigured("https://site.example/", 800, 600, .ephemeral, null, null, emulation));
+    try std.testing.expectEqual(@as(usize, 0), pair.drain(&buf).len);
+    pair.eng.caps.insert(.web_emulation);
+    pair.eng.caps.insert(.net_policy);
+    const policy = NetPolicy{ .allow_top = &.{"site.example"} };
+    const view = try pair.eng.openViewConfigured("https://site.example/", 800, 600, .ephemeral, &policy, null, emulation);
+    var tags: [8]proto.Tag = undefined;
+    try std.testing.expectEqualSlices(proto.Tag, &.{ .context_create, .view_emulation, .net_policy_set, .view_create_url, .view_show }, tagsOf(pair.drain(&buf), &tags));
+    try pair.eng.resize(view.id, 900, 700);
+    var reader = proto.Reader.init(pair.drain(&buf));
+    const resized = try proto.decode(proto.ViewResize, (try reader.next()).?.payload);
+    try std.testing.expectEqual(@as(u16, 1500), resized.scale_x1000);
+}
+
+test "untrusted opens never switch an ordinary helper or loosen a live policy" {
+    var pair = try Pair.init(std.testing.allocator);
+    defer pair.deinit();
+    const policy = NetPolicy{ .untrusted = true, .allow_top = &.{"site.example:443"} };
+    var buf: [16384]u8 = undefined;
+    try std.testing.expectError(error.UntrustedRestrictions, pair.eng.openViewIn("https://site.example/", 800, 600, .default, &policy));
+    try std.testing.expectError(error.UntrustedModeConflict, pair.eng.openViewIn("https://site.example/", 800, 600, .ephemeral, &policy));
+    try std.testing.expectEqual(@as(usize, 0), pair.drain(&buf).len);
+    pair.eng.untrusted = true;
+    try std.testing.expectError(error.UntrustedUnsupported, pair.eng.openViewIn("https://site.example/", 800, 600, .ephemeral, &policy));
+    try std.testing.expectEqual(State.idle, pair.eng.state);
+    // Reconnect the fake peer after the refused open's cleanup.
+    pair.reconnect();
+    pair.eng.caps.insert(.untrusted_web);
+    pair.eng.caps.insert(.net_policy);
+    try std.testing.expectError(error.PolicyAckUnsupported, pair.eng.openViewIn("https://site.example/", 800, 600, .ephemeral, &policy));
+    pair.reconnect();
+    pair.eng.caps.insert(.untrusted_web);
+    pair.eng.caps.insert(.net_policy);
+    const view = try pair.openPolicyAck(&policy);
+    try std.testing.expectError(error.UntrustedRestrictions, pair.eng.openView("https://site.example/", 800, 600));
+    try std.testing.expectError(error.UntrustedModeConflict, pair.eng.tightenViewPolicy(view.id, &.{ .untrusted = false }));
+    var reader = proto.Reader.init(pair.drain(&buf));
+    _ = try reader.next(); // context_create
+    const set = try proto.NetPolicySet.decodeAlloc((try reader.next()).?.payload, std.testing.allocator);
+    defer std.testing.allocator.free(set.allow_top);
+    defer std.testing.allocator.free(set.allow_sub);
+    try std.testing.expectEqual(proto.NetPolicySet.flag_untrusted, set.flags);
+    pair.eng.closeView(view.id);
+    try std.testing.expectEqual(@as(c_int, -1), pair.eng.fd);
+    try std.testing.expectEqual(State.idle, pair.eng.state);
+}
+
+/// Sets one environment variable for a test and restores it.
+const EnvPin = struct {
+    name: [*:0]const u8,
+    saved: ?[:0]u8 = null,
+
+    fn set(name: [*:0]const u8, value: ?[*:0]const u8) !EnvPin {
+        var pin = EnvPin{ .name = name };
+        if (c.getenv(name)) |old| pin.saved = try std.testing.allocator.dupeZ(u8, std.mem.span(@as([*:0]const u8, @ptrCast(old))));
+        if (value) |v| _ = c.setenv(name, v, 1) else _ = c.unsetenv(name);
+        return pin;
+    }
+
+    fn restore(self: *EnvPin) void {
+        if (self.saved) |old| {
+            _ = c.setenv(self.name, old.ptr, 1);
+            std.testing.allocator.free(old);
+        } else _ = c.unsetenv(self.name);
+    }
+};
+
+test "a leftover private root never blocks the next untrusted launch and is never deleted here" {
+    var pair = try Pair.init(std.testing.allocator);
+    defer pair.deinit();
+    var runtime = try EnvPin.set("XDG_RUNTIME_DIR", @ptrCast(&pair.tmpl));
+    defer runtime.restore();
+    var bin = try EnvPin.set("SKETERM_WEB_BIN", "/nonexistent/sketerm-webengine");
+    defer bin.restore();
+    pair.eng.untrusted = true;
+    var parent_buf: [4096]u8 = undefined;
+    const parent = untrustedParent(pair.stateDir(), &parent_buf) orelse return error.TestUnexpectedResult;
+    // A dead supervisor's root, still holding a profile.
+    var leftover: [512:0]u8 = undefined;
+    _ = try std.fmt.bufPrintZ(&leftover, "{s}/{s}", .{ parent, "0123456789abcdef" });
+    try std.testing.expectEqual(@as(c_int, 0), c.mkdir(&leftover, 0o700));
+    pair.eng.private_dir = try std.testing.allocator.dupe(u8, std.mem.span(@as([*:0]const u8, &leftover)));
+    pair.eng.stopUntrusted();
+    try std.testing.expect(pair.eng.private_dir == null);
+    try std.testing.expect(c.access(&leftover, c.F_OK) == 0);
+    // The next launch is refused only for the missing binary, not the leftover.
+    try std.testing.expect(!pair.eng.ensure());
+    try std.testing.expectEqualStrings(MISSING_MSG, pair.eng.reason);
+    try std.testing.expect(pair.eng.private_dir == null);
+    try std.testing.expectEqual(@as(c_int, 0), c.rmdir(&leftover));
+}
+
+test "a runtime dir too long for Chromium's singleton socket fails the launch closed" {
+    var pair = try Pair.init(std.testing.allocator);
+    defer pair.deinit();
+    var deep: [256:0]u8 = undefined;
+    const dir = try std.fmt.bufPrintZ(&deep, "{s}/{s}", .{ pair.stateDir(), "r" ** 40 });
+    try std.testing.expectEqual(@as(c_int, 0), c.mkdir(dir.ptr, 0o700));
+    var runtime = try EnvPin.set("XDG_RUNTIME_DIR", dir.ptr);
+    defer runtime.restore();
+    var bin = try EnvPin.set("SKETERM_WEB_BIN", "/bin/sh");
+    defer bin.restore();
+    pair.eng.untrusted = true;
+    pair.eng.stopUntrusted();
+    try std.testing.expect(!pair.eng.ensure());
+    try std.testing.expect(std.mem.indexOf(u8, pair.eng.reason, "too long") != null);
+    try std.testing.expect(pair.eng.private_dir == null);
+    try std.testing.expectEqual(@as(c.pid_t, -1), pair.eng.pid);
+}
+
+test "untrusted roots live in a private per-user parent" {
+    var pair = try Pair.init(std.testing.allocator);
+    defer pair.deinit();
+    const base = pair.stateDir();
+    var buf: [4096]u8 = undefined;
+    var path: [512:0]u8 = undefined;
+    const made = untrustedParent(base, &buf) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.endsWith(u8, made, "/" ++ UNTRUSTED_PARENT));
+    var st: c.struct_stat = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), c.lstat(made.ptr, &st));
+    try std.testing.expectEqual(@as(c_uint, 0o700), st.st_mode & 0o7777);
+    // A loosened untrusted dir of ours is tightened in place.
+    try std.testing.expectEqual(@as(c_int, 0), c.chmod(made.ptr, 0o755));
+    _ = untrustedParent(base, &buf) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(c_int, 0), c.lstat(made.ptr, &st));
+    try std.testing.expectEqual(@as(c_uint, 0o700), st.st_mode & 0o7777);
+    // A group-writable sketerm level is refused, never repaired.
+    _ = try std.fmt.bufPrintZ(&path, "{s}/sketerm", .{base});
+    try std.testing.expectEqual(@as(c_int, 0), c.chmod(&path, 0o775));
+    try std.testing.expect(untrustedParent(base, &buf) == null);
+    try std.testing.expectEqual(@as(c_int, 0), c.chmod(&path, 0o700));
+    // A symlink in place of the untrusted dir is refused.
+    _ = try std.fmt.bufPrintZ(&path, "{s}/" ++ UNTRUSTED_PARENT, .{base});
+    try std.testing.expectEqual(@as(c_int, 0), c.rmdir(&path));
+    try std.testing.expectEqual(@as(c_int, 0), c.symlink("/tmp", &path));
+    try std.testing.expect(untrustedParent(base, &buf) == null);
+    try std.testing.expectEqual(@as(c_int, 0), c.unlink(&path));
+    // A world-writable runtime dir without the sticky bit is refused.
+    try std.testing.expectEqual(@as(c_int, 0), c.chmod(@ptrCast(&pair.tmpl), 0o777));
+    try std.testing.expect(untrustedParent(base, &buf) == null);
+    try std.testing.expectEqual(@as(c_int, 0), c.chmod(@ptrCast(&pair.tmpl), 0o1777));
+    try std.testing.expect(untrustedParent(base, &buf) != null);
+    try std.testing.expectEqual(@as(c_int, 0), c.chmod(@ptrCast(&pair.tmpl), 0o700));
+}
+
+/// A stand-in cleanup owner: exits with `code` once its lifetime fence
+/// closes, or ignores SIGTERM and the fence entirely when `stubborn`.
+fn fakeOwner(code: u8, stubborn: bool) !struct { pid: c.pid_t, fence: c_int } {
+    var fds: [2]c_int = undefined;
+    if (c.pipe(&fds) != 0) return error.SkipZigTest;
+    var ready: [2]c_int = undefined;
+    if (c.pipe(&ready) != 0) return error.SkipZigTest;
+    defer _ = c.close(ready[0]);
+    const pid = c.fork();
+    if (pid < 0) return error.SkipZigTest;
+    if (pid == 0) {
+        _ = c.close(fds[1]);
+        _ = c.close(ready[0]);
+        // A real owner takes SIGTERM through its signalfd and keeps going.
+        const Ignore = struct {
+            fn signal(_: c_int) callconv(.c) void {}
+        };
+        _ = c.signal(c.SIGTERM, &Ignore.signal);
+        _ = c.close(ready[1]);
+        if (stubborn) while (true) {
+            _ = c.pause();
+        };
+        var byte: u8 = 0;
+        while (c.read(fds[0], &byte, 1) > 0) {}
+        c._exit(code);
+    }
+    _ = c.close(fds[0]);
+    _ = c.close(ready[1]);
+    // EOF once the child installed its handler.
+    var byte: u8 = 0;
+    _ = c.read(ready[0], &byte, 1);
+    return .{ .pid = pid, .fence = fds[1] };
+}
+
+test "untrusted teardown has one deadline, escalates to SIGKILL and is idempotent" {
+    var pair = try Pair.init(std.testing.allocator);
+    defer pair.deinit();
+    pair.eng.untrusted = true;
+    pair.eng.untrusted_grace_ms = 300;
+    pair.eng.untrusted_retire_ms = 200;
+
+    // A failed start skips the graceful wait: the fence closes at once.
+    const quick = try fakeOwner(0, false);
+    pair.eng.pid = quick.pid;
+    pair.eng.private_lifetime = quick.fence;
+    var started = clock.nowMs();
+    pair.eng.killChild();
+    try std.testing.expect(clock.nowMs() - started < 250);
+    try std.testing.expectEqual(UntrustedCleanup.deleted, pair.eng.untrusted_cleanup);
+    try std.testing.expectEqual(@as(c.pid_t, -1), pair.eng.pid);
+
+    // An owner that gave up deleting reports it.
+    const failed = try fakeOwner(SUPERVISOR_CLEANUP_FAILED, false);
+    pair.eng.pid = failed.pid;
+    pair.eng.private_lifetime = failed.fence;
+    pair.eng.stopUntrusted();
+    try std.testing.expectEqual(UntrustedCleanup.gave_up, pair.eng.untrusted_cleanup);
+
+    // A stuck owner costs exactly grace + retire, then SIGKILL.
+    const stuck = try fakeOwner(0, true);
+    pair.eng.pid = stuck.pid;
+    pair.eng.private_lifetime = stuck.fence;
+    started = clock.nowMs();
+    pair.eng.stopUntrusted();
+    const took = clock.nowMs() - started;
+    try std.testing.expect(took >= 500 and took < 1500);
+    try std.testing.expectEqual(UntrustedCleanup.owner_killed, pair.eng.untrusted_cleanup);
+    try std.testing.expectEqual(@as(c.pid_t, -1), pair.eng.pid);
+    try std.testing.expect(c.kill(stuck.pid, 0) != 0);
+    // Repeated stops (killChild, lost, the launch's defer) cost nothing more.
+    started = clock.nowMs();
+    pair.eng.killChild();
+    pair.eng.stopUntrusted();
+    try std.testing.expect(clock.nowMs() - started < 50);
+}
+
+test "inherited descriptors become close-on-exec on every fallback path" {
+    for ([_]CloexecPath{ .close_range, .proc, .rlimit }) |how| {
+        var fds: [2]c_int = undefined;
+        try std.testing.expectEqual(@as(c_int, 0), c.pipe(&fds));
+        defer _ = c.close(fds[0]);
+        defer _ = c.close(fds[1]);
+        try std.testing.expect(c.fcntl(fds[1], c.F_GETFD) & c.FD_CLOEXEC == 0);
+        try std.testing.expect(markCloexecFrom(@min(fds[0], fds[1]), how));
+        try std.testing.expect(c.fcntl(fds[0], c.F_GETFD) & c.FD_CLOEXEC != 0);
+        try std.testing.expect(c.fcntl(fds[1], c.F_GETFD) & c.FD_CLOEXEC != 0);
+    }
+}
+
+test "untrusted child environment drops desktop, bus, agent and sketerm endpoints" {
+    const names = [_][*:0]const u8{ "SKETERM_MUX_SOCKET", "SKETERM_WEB_WREQ_TIMEOUT_MS", "DBUS_SESSION_BUS_ADDRESS", "WAYLAND_DISPLAY", "SSH_AUTH_SOCK", "SKETERM_WEB_GPU", "SKETERM_UNIT_KEEP" };
+    var pins: [names.len]EnvPin = undefined;
+    for (names, 0..) |n, i| pins[i] = try EnvPin.set(n, "x");
+    defer for (&pins) |*p| p.restore();
+    var env = try ChildEnv.build(std.testing.allocator, &untrusted_env.dropped, &untrusted_env.sets);
+    defer env.deinit();
+    var seen = std.StringHashMap([]const u8).init(std.testing.allocator);
+    defer seen.deinit();
+    var i: usize = 0;
+    while (env.envp[i]) |entry| : (i += 1) {
+        const text = std.mem.span(entry);
+        const eq = std.mem.indexOfScalar(u8, text, '=').?;
+        try std.testing.expect(!seen.contains(text[0..eq]));
+        try seen.put(text[0..eq], text[eq + 1 ..]);
+    }
+    for ([_][]const u8{ "SKETERM_MUX_SOCKET", "SKETERM_UNIT_KEEP", "DBUS_SESSION_BUS_ADDRESS", "WAYLAND_DISPLAY", "SSH_AUTH_SOCK" }) |n|
+        try std.testing.expect(!seen.contains(n));
+    try std.testing.expectEqualStrings("x", seen.get("SKETERM_WEB_WREQ_TIMEOUT_MS").?);
+    try std.testing.expectEqualStrings("0", seen.get("SKETERM_WEB_GPU").?);
+    try std.testing.expectEqualStrings("headless", seen.get("SKETERM_WEB_OZONE").?);
+}
+
+test "port narrowing preserves accounting and rejects reopening all ports" {
+    var pair = try Pair.init(std.testing.allocator);
+    defer pair.deinit();
+    pair.eng.caps.insert(.net_policy);
+    const policy = NetPolicy{ .allow_top = &.{"site.example"} };
+    const view = try pair.eng.openViewIn("https://site.example/", 800, 600, .default, &policy);
+    view.pol_requests = 7;
+    try pair.policyAck(view);
+    const report = try pair.eng.tightenViewPolicy(view.id, &.{ .allow_top = &.{"site.example:443"} });
+    try std.testing.expectEqual(@as(usize, 1), report.n_tightened);
+    try std.testing.expectEqualStrings("site.example:443", view.pol.?.allow_top[0]);
+    try std.testing.expectEqual(@as(u32, 7), view.pol_requests);
+    const refused = try pair.eng.tightenViewPolicy(view.id, &.{ .allow_top = &.{"site.example"} });
+    try std.testing.expectEqual(@as(usize, 1), refused.n_ignored);
+    try std.testing.expectEqual(@as(usize, 0), refused.n_tightened);
+}
+
+test "untrusted teardown tolerates socket loss while destroying a view or context" {
+    const Ignore = struct {
+        fn signal(_: c_int) callconv(.c) void {}
+    };
+    const old_signal = c.signal(c.SIGPIPE, &Ignore.signal);
+    defer _ = c.signal(c.SIGPIPE, old_signal);
+    for ([_]bool{ false, true }) |context_only| {
+        var pair = try Pair.init(std.testing.allocator);
+        defer pair.deinit();
+        pair.eng.untrusted = true;
+        pair.eng.caps.insert(.untrusted_web);
+        pair.eng.caps.insert(.net_policy);
+        const policy = NetPolicy{ .untrusted = true, .allow_top = &.{"site.example:443"} };
+        const view = try pair.openPolicyAck(&policy);
+        try std.testing.expectEqual(@as(c_int, 0), c.shutdown(pair.eng.fd, c.SHUT_WR));
+        if (context_only) pair.eng.releaseContext(view.context) else pair.eng.closeView(view.id);
+        try std.testing.expectEqual(@as(usize, 0), pair.eng.views.items.len);
+        try std.testing.expectEqual(@as(usize, 0), pair.eng.live.items.len);
+        try std.testing.expectEqual(@as(c_int, -1), pair.eng.fd);
+    }
 }

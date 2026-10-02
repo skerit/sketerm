@@ -86,10 +86,12 @@ pub const CAP_INTERCEPT = "intercept";
 /// (requests/bytes/navigations/deadline), decided inline in
 /// `on_before_resource_load` before a request leaves the process. A
 /// `net_policy_set` must arrive BEFORE the `view_create*` naming the
-/// view (frame order is the guarantee; there is no ack) — a client on a
+/// view (ACK-capable clients also await installation) — a client on a
 /// helper without this capability REFUSES a policied open rather than
 /// opening an unpoliced view.
 pub const CAP_NET_POLICY = "net-policy";
+/// Policy installs/replacements acknowledge their serial with active=1 on success or active=0 on fail-closed refusal.
+pub const CAP_NET_POLICY_ACK = "net-policy-ack";
 /// The helper captures response BODIES per view (0x8B block): a
 /// `capture_set` installs a filter (hosts, url substring/regex,
 /// resource types, methods, mime prefixes) and byte caps, and matching
@@ -348,6 +350,8 @@ pub const CAP_OBSERVE = "observe";
 /// every such blink is an `ev_load_error` the client has to retry
 /// itself. `web/loadretry.zig` is the rule.
 pub const CAP_LOAD_RETRY = "load-retry";
+pub const CAP_UNTRUSTED_WEB = "untrusted-web";
+pub const CAP_WEB_EMULATION = "web-emulation";
 
 /// Every capability this protocol names, as one enum: the declaring home
 /// every client tracks a helper's `hello_ack` through (`Caps`,
@@ -404,6 +408,9 @@ pub const Cap = enum {
     cookie_sync,
     observe,
     load_retry,
+    untrusted_web,
+    web_emulation,
+    net_policy_ack,
 
     /// The wire name `hello_ack` carries.
     pub fn name(self: Cap) []const u8 {
@@ -559,6 +566,7 @@ pub const Tag = enum(u8) {
     view_discard = 0x17,
     navigate = 0x18,
     nav_action = 0x19,
+    view_emulation = 0x1A,
     input_pointer = 0x20,
     input_scroll = 0x21,
     input_key = 0x22,
@@ -642,6 +650,9 @@ pub const Tag = enum(u8) {
     context_destroy = 0x91,
     ev_view_create_failed = 0x92,
     ev_route_refused = 0x93,
+    /// A request this helper withholds (an untrusted helper's dropped
+    /// capabilities); always answered, never silently ignored.
+    ev_request_refused = 0x94,
     sem_eval = 0xA0,
     sem_eval_result = 0xA1,
     devtools_show = 0xA2,
@@ -989,6 +1000,23 @@ pub const ViewCreateUrl = struct {
 pub const ViewDestroy = struct {
     pub const tag: Tag = .view_destroy;
     view: u32,
+};
+
+pub const ColorScheme = enum(u8) { unchanged = 0, light = 1, dark = 2 };
+pub const ReducedMotion = enum(u8) { unchanged = 0, reduce = 1, no_preference = 2 };
+
+/// Sent before view creation; zero fields leave the engine's defaults unchanged.
+pub const ViewEmulation = struct {
+    pub const tag: Tag = .view_emulation;
+    view: u32,
+    color_scheme: u8 = 0,
+    reduced_motion: u8 = 0,
+    scale_x1000: u16 = 0,
+
+    pub fn valid(self: ViewEmulation) bool {
+        return self.color_scheme <= 2 and self.reduced_motion <= 2 and
+            (self.scale_x1000 == 0 or (self.scale_x1000 >= 500 and self.scale_x1000 <= 4000));
+    }
 };
 
 /// Destroy a view's BROWSER while keeping the view (capability
@@ -2698,18 +2726,42 @@ pub const NetReason = enum(u8) {
     byte_cap = 9,
     nav_cap = 10,
     deadline = 11,
+    resolved_private_address = 12,
+    untrusted_http = 13,
+    untrusted_transport = 14,
+    untrusted_broker = 15,
+    policy_refused = 16,
+    /// The url is longer than the untrusted broker can carry (`UNTRUSTED_URL_CAP`).
+    url_too_long = 17,
+    /// The url's authority could not be parsed (e.g. a malformed port).
+    malformed_url = 18,
+    /// The untrusted broker's per-request deadline passed, time queued included.
+    untrusted_timeout = 19,
+    /// Every untrusted broker job was busy and its wait queue was full.
+    untrusted_queue_full = 20,
     _,
 };
 
 /// Reasons a `denied` counter array carries, indexed by `NetReason`.
-pub const NREASONS = 12;
+pub const NREASONS = std.meta.fields(NetReason).len;
+
+/// The counters an `EvNetPolicy` carried before the untrusted reasons were appended.
+pub const NREASONS_LEGACY = 12;
 
 pub fn reasonName(r: NetReason) []const u8 {
-    return switch (r) {
-        .none, .filter_list, .top_host, .sub_host, .resource_type, .private_address, .scheme, .redirect_host, .request_cap, .byte_cap, .nav_cap, .deadline => @tagName(r),
-        _ => "unknown",
-    };
+    return std.enums.tagName(NetReason, r) orelse "unknown";
 }
+
+// Untrusted HTTP broker limits, mirrored from `vendor/web_untrusted.h`
+// (`SK_WEB_UNTRUSTED_*`) because the MCP server must report them and
+// cannot include a CEF header; the helper's test root drift-tests the
+// pair, so neither side can change alone.
+pub const UNTRUSTED_MAX_JOBS = 16;
+pub const UNTRUSTED_QUEUE_CAP = 256;
+pub const UNTRUSTED_TIMEOUT_MS = 15_000;
+pub const UNTRUSTED_URL_CAP = 8192;
+pub const UNTRUSTED_UPLOAD_CAP = 1024 * 1024;
+pub const UNTRUSTED_BODY_CAP = 16 * 1024 * 1024;
 
 /// Helper slots that can hold a policy (and a log ring). A client must
 /// refuse a POLICIED open past this many concurrent views rather than
@@ -2717,13 +2769,11 @@ pub fn reasonName(r: NetReason) []const u8 {
 /// log, as before.
 pub const MAX_POLICY_VIEWS = 32;
 
-/// Install (or replace) the enforced policy for a view. Sent BEFORE the
-/// `view_create*` naming the view — frame order on the one stream is
-/// the guarantee it applies from the view's very first request; there
-/// is no ack. `serial` stamps every `ev_net_policy` answering for it.
+/// ACK-capable clients await this serial before creating the view or committing a monotone replacement.
 pub const NetPolicySet = struct {
     pub const tag: Tag = .net_policy_set;
     pub const flag_allow_private: u32 = 1;
+    pub const flag_untrusted: u32 = 2;
 
     view: u32,
     serial: u32,
@@ -2788,10 +2838,21 @@ pub const NetPolicySet = struct {
     }
 };
 
-/// Ask for one `ev_net_policy` for `view`.
+/// ACK-capable helpers echo a nonzero query serial instead of the installed policy serial.
 pub const NetPolicyReq = struct {
     pub const tag: Tag = .net_policy_req;
     view: u32,
+    serial: u32 = 0,
+
+    pub fn encodeTo(self: NetPolicyReq, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        try putU32(gpa, out, self.view);
+        if (self.serial != 0) try putU32(gpa, out, self.serial);
+    }
+
+    pub fn decodeFrom(payload: []const u8) !NetPolicyReq {
+        var cur = Cur{ .buf = payload };
+        return .{ .view = try cur.readU32(), .serial = if (cur.pos < payload.len) try cur.readU32() else 0 };
+    }
 };
 
 /// Per-view policy accounting. Answered on `net_policy_req` AND pushed
@@ -2800,6 +2861,7 @@ pub const NetPolicyReq = struct {
 pub const EvNetPolicy = struct {
     pub const tag: Tag = .ev_net_policy;
     view: u32,
+    /// Installed/rejected policy serial, or the nonzero serial of the status query being answered.
     serial: u32,
     active: u8,
     /// `NetReason` byte; nonzero once a budget latched.
@@ -2835,7 +2897,12 @@ pub const EvNetPolicy = struct {
         out.bytes = try cur.readU64();
         out.navigations = try cur.readU32();
         out.ms_left = try cur.readU32();
-        for (&out.denied) |*d| d.* = try cur.readU32();
+        out.denied = @splat(0);
+        for (&out.denied, 0..) |*d, i| {
+            // A pre-untrusted helper sends exactly the legacy counters.
+            if (cur.buf.len == cur.pos and i == NREASONS_LEGACY) break;
+            d.* = try cur.readU32();
+        }
         return out;
     }
 };
@@ -3518,6 +3585,57 @@ pub const EvRouteRefused = struct {
     pub const tag: Tag = .ev_route_refused;
     reason: []const u8,
 };
+
+/// The answer to a request frame the helper refuses to serve at all.
+pub const EvRequestRefused = struct {
+    pub const tag: Tag = .ev_request_refused;
+    /// The refused frame's `Tag` byte.
+    request: u8,
+    reason: []const u8,
+};
+
+/// Capabilities an untrusted helper leaves out of `hello_ack`; `untrustedWithheld` refuses their frames.
+pub fn untrustedWithholdsCap(cap: Cap) bool {
+    return switch (cap) {
+        .devtools, .print_pdf, .print_pdf_staging, .clipboard, .popup_open, .downloads, .download_start, .download_staging, .download_errors, .userscripts, .userscripts_gm, .webext, .webext_tabs, .webext_action, .webext_events, .webext_transaction, .filter_subscribe, .cookie_sync, .observe => true,
+        else => false,
+    };
+}
+
+/// Request frames an untrusted helper refuses at dispatch: the families behind
+/// every capability it withholds from `hello_ack`, so hiding one is never the
+/// only barrier.
+pub fn untrustedWithheld(tag: Tag) bool {
+    return switch (tag) {
+        .devtools_show,
+        .print_pdf,
+        .clipboard_read,
+        .popup_policy_set,
+        .download_decide,
+        .download_cancel,
+        .download_start,
+        .us_script_set,
+        .us_style_set,
+        .webext_set,
+        .webext_remove,
+        .webext_list_req,
+        .webext_wreq_stats_req,
+        .webext_tabs,
+        .webext_install_prepare,
+        .webext_install_commit,
+        .webext_action_activate,
+        .webext_open_popup_result,
+        .intercept_subscribe,
+        .cookie_sync_enable,
+        .cookie_apply,
+        .cookie_dump_req,
+        .observe_enable,
+        .observe_subscribe,
+        .observe_control,
+        => true,
+        else => false,
+    };
+}
 
 // -- cookies + site data (0xC8 block, capability "sitedata") ----------
 
@@ -6043,4 +6161,72 @@ test "one message carries a descriptor per plane, and only on the first write" {
     ob.advance(m.bytes.len - 2);
     try std.testing.expect(ob.empty());
     try std.testing.expectError(error.TooManyFds, ob.postFds(EvCrashed{ .view = 1 }, &[_]i32{ 1, 2, 3, 4, 5 }));
+}
+
+test "emulation frame is append-only and validates wire values" {
+    try std.testing.expectEqual(@as(u8, 0x1A), @intFromEnum(Tag.view_emulation));
+    try roundTrip(ViewEmulation, .{ .view = 4, .color_scheme = 2, .reduced_motion = 1, .scale_x1000 = 1500 });
+    try std.testing.expect((ViewEmulation{ .view = 1 }).valid());
+    try std.testing.expect(!(ViewEmulation{ .view = 1, .color_scheme = 3 }).valid());
+    try std.testing.expect(!(ViewEmulation{ .view = 1, .scale_x1000 = 499 }).valid());
+    try std.testing.expectEqualStrings("untrusted-web", Cap.untrusted_web.name());
+    try std.testing.expectEqualStrings("web-emulation", Cap.web_emulation.name());
+    try std.testing.expectEqual(@as(u32, 2), NetPolicySet.flag_untrusted);
+    try std.testing.expect(!observerAllows(.view_emulation, true));
+}
+
+test "an untrusted helper refuses the request frames of every capability it withholds" {
+    const families = [_]struct { cap: Cap, tags: []const Tag }{
+        .{ .cap = .devtools, .tags = &.{.devtools_show} },
+        .{ .cap = .print_pdf, .tags = &.{.print_pdf} },
+        .{ .cap = .clipboard, .tags = &.{.clipboard_read} },
+        .{ .cap = .popup_open, .tags = &.{.popup_policy_set} },
+        .{ .cap = .downloads, .tags = &.{ .download_decide, .download_cancel } },
+        .{ .cap = .download_start, .tags = &.{.download_start} },
+        .{ .cap = .userscripts, .tags = &.{ .us_script_set, .us_style_set } },
+        .{ .cap = .webext, .tags = &.{ .webext_set, .webext_remove, .webext_list_req, .webext_wreq_stats_req, .webext_install_prepare, .webext_install_commit } },
+        .{ .cap = .webext_tabs, .tags = &.{.webext_tabs} },
+        .{ .cap = .webext_action, .tags = &.{ .webext_action_activate, .webext_open_popup_result } },
+        .{ .cap = .filter_subscribe, .tags = &.{.intercept_subscribe} },
+        .{ .cap = .cookie_sync, .tags = &.{ .cookie_sync_enable, .cookie_apply, .cookie_dump_req } },
+        .{ .cap = .observe, .tags = &.{ .observe_enable, .observe_subscribe, .observe_control } },
+    };
+    for (families) |f| {
+        try std.testing.expect(untrustedWithholdsCap(f.cap));
+        for (f.tags) |t| try std.testing.expect(untrustedWithheld(t));
+    }
+    for ([_]Tag{ .hello, .view_create_url, .navigate, .net_policy_set, .net_log_req, .view_emulation, .sem_snapshot_req, .input_pointer, .context_create }) |t|
+        try std.testing.expect(!untrustedWithheld(t));
+    try std.testing.expect(!untrustedWithholdsCap(.untrusted_web) and !untrustedWithholdsCap(.net_policy));
+    try roundTrip(EvRequestRefused, .{ .request = @intFromEnum(Tag.devtools_show), .reason = "refused" });
+    try std.testing.expectEqual(@as(u8, 0x94), @intFromEnum(Tag.ev_request_refused));
+}
+
+test "new refusal counters append to legacy policy accounting" {
+    const gpa = std.testing.allocator;
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(gpa);
+    var denied: [NREASONS]u32 = @splat(0);
+    denied[12] = 7;
+    try encodePayload(gpa, &payload, EvNetPolicy{ .view = 1, .serial = 3, .active = 1, .exhausted = 0, .requests = 5, .bytes = 6, .navigations = 1, .ms_left = 0, .denied = denied });
+    const fresh = try decode(EvNetPolicy, payload.items);
+    try std.testing.expectEqual(@as(u32, 7), fresh.denied[12]);
+    const appended = (NREASONS - NREASONS_LEGACY) * 4;
+    const legacy = try decode(EvNetPolicy, payload.items[0 .. payload.items.len - appended]);
+    try std.testing.expectEqual(@as(u32, 5), legacy.requests);
+    try std.testing.expectEqual(@as(u32, 0), legacy.denied[12]);
+    // Only the shipped legacy length and the full length decode; no intermediate count ever shipped.
+    var cut: usize = 4;
+    while (cut < appended) : (cut += 4)
+        try std.testing.expectError(error.Truncated, decode(EvNetPolicy, payload.items[0 .. payload.items.len - cut]));
+    try std.testing.expectError(error.Truncated, decode(EvNetPolicy, payload.items[0 .. payload.items.len - appended + 1]));
+    for (std.enums.values(NetReason)) |r| try std.testing.expect(!std.mem.eql(u8, reasonName(r), "unknown"));
+    try std.testing.expectEqualStrings("unknown", reasonName(@enumFromInt(NREASONS)));
+    try std.testing.expectEqualStrings("url_too_long", reasonName(.url_too_long));
+    try std.testing.expectEqualStrings("resolved_private_address", reasonName(.resolved_private_address));
+    try std.testing.expectEqualStrings("untrusted_broker", reasonName(.untrusted_broker));
+    try std.testing.expectEqualStrings("policy_refused", reasonName(.policy_refused));
+    try std.testing.expectEqualStrings("net-policy-ack", Cap.net_policy_ack.name());
+    try roundTrip(NetPolicyReq, .{ .view = 1 });
+    try roundTrip(NetPolicyReq, .{ .view = 1, .serial = 123 });
 }

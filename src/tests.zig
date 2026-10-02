@@ -68,6 +68,7 @@ comptime {
     _ = @import("web/filter.zig");
     _ = @import("web/filtersub.zig");
     _ = @import("web/netpolicy.zig");
+    _ = @import("web/untrusted_env.zig");
     _ = @import("web/capture.zig");
     _ = @import("web/userscript.zig");
     _ = @import("web/urlhost.zig");

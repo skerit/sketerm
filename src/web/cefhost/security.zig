@@ -301,6 +301,12 @@ pub fn onShowPermissionPrompt(
     defer releaseArg(browser);
     var kept = false;
     defer if (!kept) releaseArg(callback);
+    // Untrusted denies before any lookup: returning 0 for an unknown view
+    // would hand the prompt to CEF's default handling instead.
+    if (host_mod.untrusted.enabled) {
+        if (callback) |cb| if (cb.*.cont) |cont| cont(cb, cef.CEF_PERMISSION_RESULT_DENY);
+        return 1;
+    }
     const host = host_mod.g_host orelse return 0;
     const v = viewOf(browser) orelse return 0;
     const cb: *cef.cef_permission_prompt_callback_t = callback orelse return 0;
@@ -334,6 +340,11 @@ pub fn onRequestMediaAccess(
 ) callconv(.c) c_int {
     defer releaseArg(browser);
     defer releaseArg(frame);
+    if (host_mod.untrusted.enabled) {
+        defer releaseArg(callback);
+        if (callback) |cb| if (cb.*.cont) |cont| cont(cb, 0);
+        return 1;
+    }
     var kept = false;
     defer if (!kept) releaseArg(callback);
     const host = host_mod.g_host orelse return 0;

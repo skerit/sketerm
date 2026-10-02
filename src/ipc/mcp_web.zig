@@ -248,10 +248,12 @@ pub fn observeActive() bool {
     return false;
 }
 
-/// The direct route's helper socket, once its helper serves.
+/// The direct route's ORDINARY helper socket, once its helper serves. The
+/// untrusted engine is skipped: its socket lives in a private root that
+/// is deleted with it and it serves no observers.
 pub fn helperSocket(buf: []u8) ?[]const u8 {
     for (g_engines.items) |re| {
-        if (re.engine.routeSpec().isDirect()) return re.engine.helperSocketPath(buf);
+        if (!re.engine.untrusted and re.engine.routeSpec().isDirect()) return re.engine.helperSocketPath(buf);
     }
     return null;
 }
@@ -331,6 +333,33 @@ pub fn engineStarted() bool {
     return false;
 }
 
+/// A current-helper capability fact (null before a handshake), except
+/// `untrusted_web`, which is the build/platform fact `untrustedSupported`.
+pub fn restrictedCapability(cap: web_proto.Cap) ?bool {
+    if (guiDrivesWeb() or g_headless_alloc == null) return false;
+    if (cap == .untrusted_web) return untrustedSupported();
+    const e = currentEngine() orelse return null;
+    if (e.state != .ready) return null;
+    return e.has(cap);
+}
+
+/// Whether this server can launch a dedicated untrusted engine: the
+/// headless backend (GUI-driven web has no untrusted lane), Linux, and a
+/// resolvable helper binary. Never depends on which engine is current;
+/// each launch still requires the helper to advertise `untrusted-web`
+/// and fails the open closed otherwise.
+fn untrustedSupported() bool {
+    if (comptime @import("builtin").os.tag != .linux) return false;
+    if (guiDrivesWeb() or g_headless_alloc == null) return false;
+    var bin_buf: [4096:0]u8 = undefined;
+    return @import("../web/findbin.zig").find(&bin_buf) != null;
+}
+
+pub fn untrustedMode() bool {
+    const e = currentEngine() orelse return false;
+    return e.untrusted;
+}
+
 /// What `capabilities` reports about downloading through a view. Never
 /// spawns the helper: before one exists this is what the CODE supports,
 /// which is exactly what a preflight can honestly promise.
@@ -346,8 +375,21 @@ pub fn downloadCapability() struct { supported: bool, started: bool } {
 /// owns the engine this server is connected to right now.
 pub fn engineCapability() struct { broker_lane: bool, owner: webdrive.Owner } {
     if (guiDrivesWeb()) return .{ .broker_lane = false, .owner = .none };
-    const e = headlessEngine() orelse return .{ .broker_lane = false, .owner = .none };
+    const e = currentOrdinaryEngine() orelse headlessEngine() orelse return .{ .broker_lane = false, .owner = .none };
     return .{ .broker_lane = e.brokerLaneAvailable(), .owner = e.owner };
+}
+
+/// `currentEngine` restricted to ordinary engines: the dedicated untrusted
+/// engine never answers for the instance's engine lifecycle.
+fn currentOrdinaryEngine() ?*webdrive.Engine {
+    if (g_current_engine < g_engines.items.len) {
+        const e = &g_engines.items[g_current_engine].engine;
+        if (!e.untrusted and e.views.items.len > 0) return e;
+    }
+    for (g_engines.items) |re| {
+        if (!re.engine.untrusted and re.engine.views.items.len > 0) return &re.engine;
+    }
+    return null;
 }
 
 /// Kill and reap the owned helper; part of server teardown (stdin EOF
@@ -402,11 +444,16 @@ pub fn watchdogMuxFds(out: []c_int) []const c_int {
 /// route's slug, which is also what names the engine's socket and its
 /// store root, so "same route" means "same instance" everywhere.
 fn headlessEngineFor(spec: webroute.Spec) ?*webdrive.Engine {
+    return headlessEngineForMode(spec, false);
+}
+
+fn headlessEngineForMode(spec: webroute.Spec, untrusted: bool) ?*webdrive.Engine {
     if (!spec.valid()) return null;
+    if (untrusted and !spec.isDirect()) return null;
     var slug_buf: [64]u8 = undefined;
     const slug = spec.slug(&slug_buf) orelse return null;
     for (g_engines.items) |re| {
-        if (std.mem.eql(u8, re.key(), slug)) return &re.engine;
+        if (re.engine.untrusted == untrusted and std.mem.eql(u8, re.key(), slug)) return &re.engine;
     }
     const alloc = g_headless_alloc orelse return null;
     const dir = g_headless_dir orelse return null;
@@ -417,6 +464,7 @@ fn headlessEngineFor(spec: webroute.Spec) ?*webdrive.Engine {
             return null;
         },
     };
+    re.engine.untrusted = untrusted;
     @memcpy(re.slug[0..slug.len], slug);
     re.slug_len = slug.len;
     g_engines.append(alloc, re) catch {
@@ -509,6 +557,8 @@ pub const View = struct {
     /// Enforced network policy (headless only). `policy_exhausted` is
     /// the latched `NetReason` NAME, "" while budgets hold.
     policy_active: bool = false,
+    untrusted: bool = false,
+    emulation: webdrive.Emulation = .{},
     policy_serial: u32 = 0,
     policy_install_failed: bool = false,
     policy_exhausted: []const u8 = "",
@@ -859,6 +909,8 @@ fn appendEngineViews(
             .context = v.context,
             .create_failed = if (v.create_failed) |f| try arena.dupe(u8, f) else "",
             .policy_active = v.pol_active,
+            .untrusted = e.untrusted and e.has(.untrusted_web),
+            .emulation = v.emulation,
             .policy_serial = v.pol_serial,
             .policy_install_failed = v.pol_install_failed,
             .policy_exhausted = if (v.pol_exhausted != 0)
@@ -940,6 +992,9 @@ fn headlessFail(arena: std.mem.Allocator, e: *webdrive.Engine, err: anyerror) !F
         error.LegacySemanticReplyPending => fail(.conflict, "an older browser helper still owes the previous timed-out semantic reply; wait for it or restart the helper before retrying this operation kind"),
         error.NoFrame => fail(.unavailable, "the view has not painted a frame yet (a page must load first; try web_wait for:\"load\")"),
         error.Timeout => try diagnosticFail(arena, e, .timeout, "the browser helper did not answer in time"),
+        error.PolicyAckUnsupported => fail(.unavailable, "the helper does not advertise net-policy-ack; live policy updates and untrusted opens are refused without a correlated installation acknowledgement"),
+        error.PolicyRefused => fail(.refused, "the helper rejected the network policy; the affected view was closed fail-closed and no replacement was reported as applied"),
+        error.PolicyAckTimeout => fail(.timeout, "the helper did not acknowledge the network policy request in time; the affected view was closed fail-closed, not reported as applied"),
         else => try diagnosticFail(arena, e, .io_failed, try std.fmt.allocPrint(arena, "the browser helper failed ({s})", .{@errorName(err)})),
     };
 }
@@ -1179,6 +1234,11 @@ fn headlessRouteEngine(arena: std.mem.Allocator, text: []const u8) RouteEngineOu
 }
 
 fn openView(drv: Driver, arena: std.mem.Allocator, url: ?[]const u8, where: []const u8, w: u16, h: u16, spec: webdrive.ProfileSpec, policy: ?*const webdrive.NetPolicy, cap: ?*const webdrive.CaptureFilter, route: ?[]const u8) !OpenOutcome {
+    return openViewConfigured(drv, arena, url, where, w, h, spec, policy, cap, route, .{});
+}
+
+fn openViewConfigured(drv: Driver, arena: std.mem.Allocator, url: ?[]const u8, where: []const u8, w: u16, h: u16, spec: webdrive.ProfileSpec, policy: ?*const webdrive.NetPolicy, cap: ?*const webdrive.CaptureFilter, route: ?[]const u8, emulation: webdrive.Emulation) !OpenOutcome {
+    if (drv == .gui and emulation.present()) return .{ .err = fail(.unavailable, "web emulation is headless only; nothing was opened") };
     if (drv == .gui and spec != .default) return .{ .err = fail(.invalid_args, GUI_PROFILE_REFUSAL) };
     if (drv == .gui and policy != null) return .{ .err = fail(.unavailable, GUI_POLICY_REFUSAL) };
     if (drv == .gui and cap != null) return .{ .err = fail(.unavailable, GUI_CAPTURE_REFUSAL) };
@@ -1204,6 +1264,14 @@ fn openView(drv: Driver, arena: std.mem.Allocator, url: ?[]const u8, where: []co
             // A route selects the helper INSTANCE this view is opened
             // in; without one it is the engine the call already picked.
             var e = drv_engine;
+            const untrusted = if (policy) |p| p.untrusted else false;
+            if (untrusted) {
+                if (@import("builtin").os.tag != .linux or spec != .ephemeral or !isDirectRoute(route orelse "direct"))
+                    return .{ .err = fail(.refused, "untrusted browsing requires Linux, route direct, ephemeral:true and no profile; nothing was opened") };
+                e = headlessEngineForMode(.{}, true) orelse return .{ .err = fail(.unavailable, "could not allocate a dedicated untrusted browser engine") };
+            } else if (e.untrusted or (route != null and isDirectRoute(route.?))) {
+                e = headlessEngine() orelse return .{ .err = fail(.unavailable, "could not allocate an ordinary browser engine") };
+            }
             if (route) |r| {
                 if (!isDirectRoute(r)) {
                     switch (headlessRouteEngine(arena, r)) {
@@ -1212,15 +1280,21 @@ fn openView(drv: Driver, arena: std.mem.Allocator, url: ?[]const u8, where: []co
                     }
                 }
             }
-            const v = e.openViewWith(url orelse "", w, h, spec, policy, cap) catch |err| {
+            const v = e.openViewConfigured(url orelse "", w, h, spec, policy, cap, emulation) catch |err| {
                 const name: []const u8 = if (spec == .named) spec.named else "";
                 return .{ .err = switch (err) {
+                    error.UntrustedRestrictions => fail(.refused, "untrusted opens require policy.untrusted:true, ephemeral:true, route direct and HTTP/HTTPS only; nothing was opened"),
+                    error.UntrustedModeConflict => fail(.conflict, "a running ordinary helper cannot switch to untrusted mode; use a new dedicated engine"),
+                    error.UntrustedUnsupported => fail(.unavailable, "the helper did not advertise untrusted-web; nothing was opened"),
+                    error.EmulationUnsupported => fail(.unavailable, "the helper did not advertise web-emulation; nothing was opened"),
+                    error.InvalidEmulation => fail(.invalid_args, "invalid web emulation options; nothing was opened"),
                     error.RouteRefused => fail(.unavailable, try std.fmt.allocPrint(
                         arena,
                         "{s}. Nothing was opened; the next web_open on this route starts a fresh browser that tries the route again.",
                         .{e.reason},
                     )),
                     error.PolicyUnsupported => fail(.unavailable, "this browser helper does not advertise the net-policy capability, so the requested policy cannot be ENFORCED. Nothing was opened: there is deliberately no unpoliced fallback."),
+                    error.PolicyAckUnsupported, error.PolicyRefused, error.PolicyAckTimeout => try headlessFail(arena, e, err),
                     error.PolicyTooManyViews => fail(.conflict, try std.fmt.allocPrint(
                         arena,
                         "too many concurrent web views for another POLICIED one (the helper can enforce {d}); close one with web_close first — an unpoliced open past the cap is refused rather than silently unenforced",
@@ -1617,6 +1691,10 @@ fn openResult(
         try res.fact("profile", v.profile);
         try res.fact("profile_kind", v.profile_kind);
         try res.fact("context", v.context);
+        try res.fact("untrusted", v.untrusted);
+        if (v.emulation.color_scheme) |value| try res.fact("color_scheme", @tagName(value));
+        if (v.emulation.reduced_motion) |value| try res.fact("reduced_motion", if (value == .reduce) "reduce" else "no-preference");
+        if (v.emulation.device_scale_factor != null) try res.fact("device_scale_factor", @as(f64, @floatFromInt(v.emulation.scale())) / 1000);
         if (v.profile.len > 0)
             try res.textf("profile: {s} (its own cookie jar; logins here survive web_close and MCP restarts)", .{v.profile})
         else if (std.mem.eql(u8, v.profile_kind, "ephemeral"))
@@ -2833,6 +2911,12 @@ pub fn webTool(
     // Validate before selecting a backend: invalid names must not start a
     // browser, and a present non-string is not the same as an omitted name.
     if (eql(u8, name, "web_open") and args == .object) {
+        for ([_][]const u8{ "route", "profile" }) |key| {
+            if (args.object.get(key)) |value| if (value != .string)
+                return mcp.errRes(arena, .invalid_args, try std.fmt.allocPrint(arena, "{s} must be a string when present", .{key}));
+        }
+        if (args.object.get("ephemeral")) |value| if (value != .bool)
+            return mcp.errRes(arena, .invalid_args, "ephemeral must be a boolean when present");
         if (args.object.get("name")) |value| {
             if (!validBrowserName(value))
                 return mcp.errRes(arena, .invalid_args, "name must be a non-empty, single-line UTF-8 browser session name without control characters (at most 160 bytes)");
@@ -2859,6 +2943,10 @@ pub fn webTool(
     }
 
     if (eql(u8, name, "web_open")) {
+        const emulation = switch (try parseEmulation(arena, args)) {
+            .err => |f| return failRes(arena, f),
+            .value => |v| v,
+        };
         const url = mcp.argStr(args, "url");
         const browser_name = mcp.argStr(args, "name");
         const where = mcp.argStr(args, "where") orelse "tab";
@@ -2908,7 +2996,17 @@ pub fn webTool(
                 const host = urlhost.hostOf(u, urlhost.filtering);
                 if (host.len > 0) {
                     const hosts = try arena.alloc([]const u8, 1);
-                    hosts[0] = try std.ascii.allocLowerString(arena, host);
+                    // Untrusted keeps the url's effective port (bare entries
+                    // only allow default ports there).
+                    const port: u16 = if (policy.?.untrusted)
+                        urlhost.portOf(u) orelse return mcp.errRes(arena, .invalid_args, "untrusted policy URL has a malformed authority port")
+                    else
+                        0;
+                    const buf = try arena.alloc(u8, host.len + 16);
+                    hosts[0] = netpolicy.canonicalEntry(buf, host, port) catch |err| return mcp.errRes(arena, .invalid_args, switch (err) {
+                        error.NonAscii => "the url's host is not ASCII: give an internationalized host in its punycode (xn--) form, in the url or in policy.allow_hosts",
+                        error.InvalidHost, error.NoSpaceLeft => "the url's host cannot be a policy host entry (not a hostname or a complete IP address); name the allowed hosts in policy.allow_hosts",
+                    });
                     policy.?.allow_top = hosts;
                 }
                 // A hostless url (data:) keeps the empty list: every
@@ -2931,7 +3029,7 @@ pub fn webTool(
             if (drv == .gui) return mcp.errRes(arena, .invalid_args, "accept_cert is headless only: with a GUI attached the user answers certificate errors in the pane's interstitial");
             if (!navfault.validFingerprint(fp)) return mcp.errRes(arena, .invalid_args, "accept_cert must be the certificate's SHA-256 as 64 hex digits (the 'cert.fingerprint' a refused open reported)");
         }
-        const new_handle: u32 = switch (try openView(drv, arena, url, where, vw, vh, spec, if (policy) |*p| p else null, if (cap) |*f| f else null, route)) {
+        const new_handle: u32 = switch (try openViewConfigured(drv, arena, url, where, vw, vh, spec, if (policy) |*p| p else null, if (cap) |*f| f else null, route, emulation)) {
             .err => |e| return failRes(arena, e),
             .opened => |p| p,
         };
@@ -3728,6 +3826,30 @@ const GUI_POLICY_REFUSAL =
 
 const PolicyParse = union(enum) { none, policy: webdrive.NetPolicyPatch, err: Fail };
 
+const EmulationParse = union(enum) { value: webdrive.Emulation, err: Fail };
+
+fn parseEmulation(arena: std.mem.Allocator, args: std.json.Value) !EmulationParse {
+    var out = webdrive.Emulation{};
+    if (args != .object) return .{ .value = out };
+    if (args.object.get("color_scheme")) |v| {
+        if (v != .string) return .{ .err = fail(.invalid_args, "color_scheme must be light or dark") };
+        out.color_scheme = if (std.mem.eql(u8, v.string, "light")) .light else if (std.mem.eql(u8, v.string, "dark")) .dark else return .{ .err = fail(.invalid_args, "color_scheme must be light or dark") };
+    }
+    if (args.object.get("reduced_motion")) |v| {
+        if (v != .string) return .{ .err = fail(.invalid_args, "reduced_motion must be reduce or no-preference") };
+        out.reduced_motion = if (std.mem.eql(u8, v.string, "reduce")) .reduce else if (std.mem.eql(u8, v.string, "no-preference")) .no_preference else return .{ .err = fail(.invalid_args, "reduced_motion must be reduce or no-preference") };
+    }
+    if (args.object.get("device_scale_factor")) |v| {
+        out.device_scale_factor = switch (v) {
+            .integer => |n| @floatFromInt(n),
+            .float => |n| n,
+            else => return .{ .err = fail(.invalid_args, "device_scale_factor must be numeric, from 0.5 through 4") },
+        };
+    }
+    if (!out.valid()) return .{ .err = fail(.invalid_args, try std.fmt.allocPrint(arena, "device_scale_factor must be finite and from {d} through {d}", .{ @as(f64, 0.5), @as(f64, 4) })) };
+    return .{ .value = out };
+}
+
 /// Parse `web_open`'s / `web_policy_set`'s `policy` object into the
 /// client PATCH: presence survives, so a live-view tighten leaves
 /// omitted fields alone while `effective()` gives an open its defaults.
@@ -3739,8 +3861,22 @@ fn parsePolicy(arena: std.mem.Allocator, args: std.json.Value) !PolicyParse {
     if (pv == .null) return .none;
     if (pv != .object) return .{ .err = fail(.invalid_args, "'policy' must be an object") };
     const o = pv.object;
+    var keys = o.iterator();
+    while (keys.next()) |entry| {
+        const known = [_][]const u8{ "untrusted", "allow_hosts", "allow_subresource_hosts", "block_types", "allow_schemes", "allow_private_addresses", "block_ads", "max_requests", "max_bytes", "max_navigations", "deadline_ms" };
+        var found = false;
+        for (known) |key| if (std.mem.eql(u8, entry.key_ptr.*, key)) {
+            found = true;
+            break;
+        };
+        if (!found) return .{ .err = fail(.invalid_args, try std.fmt.allocPrint(arena, "unknown policy key '{s}'; nothing was applied", .{entry.key_ptr.*})) };
+    }
 
     var p = webdrive.NetPolicyPatch{};
+    if (o.get("untrusted")) |b| {
+        if (b != .bool) return .{ .err = fail(.invalid_args, "policy.untrusted must be a boolean") };
+        p.untrusted = b.bool;
+    }
     switch (try parseHostList(arena, o, "allow_hosts")) {
         .ok => |hosts| p.allow_top = hosts,
         .err => |e| return .{ .err = e },
@@ -3809,7 +3945,7 @@ fn parseHostList(arena: std.mem.Allocator, o: std.json.ObjectMap, key: []const u
             return .{ .err = fail(.invalid_args, try std.fmt.allocPrint(arena, "policy.{s} entries must be strings", .{key})) };
         const folded = try std.ascii.allocLowerString(arena, item.string);
         if (!netpolicy.validHostEntry(folded))
-            return .{ .err = fail(.invalid_args, try std.fmt.allocPrint(arena, "'{s}' is not a usable host entry: bare lower-case host names or IP literals only — no '*' (write no policy instead of an allow-all one), no scheme, no port, no path", .{item.string})) };
+            return .{ .err = fail(.invalid_args, try std.fmt.allocPrint(arena, "'{s}' is not a usable host entry: use a host or host:port (bracket IPv6 with a port), no wildcard, scheme or path", .{item.string})) };
         hosts[i] = folded;
     }
     return .{ .ok = hosts };
@@ -3841,7 +3977,7 @@ fn policyJson(arena: std.mem.Allocator, p: *const webdrive.NetPolicy) ![]const u
             first = false;
         }
     }
-    try w.print("],\"allow_private_addresses\":{}", .{p.allow_private});
+    try w.print("],\"allow_private_addresses\":{},\"untrusted\":{}", .{ p.allow_private, p.untrusted });
     if (p.block_ads) |on| try w.print(",\"block_ads\":{}", .{on});
     try w.print(",\"max_requests\":{d},\"max_bytes\":{d},\"max_navigations\":{d},\"deadline_ms\":{d}}}", .{
         p.max_requests, p.max_bytes, p.max_navigations, p.deadline_ms,
@@ -3891,8 +4027,12 @@ fn policyTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, views
     }
     const vs = views orelse return helperErr(drv, arena, views);
     const listed = viewFor(vs, handle) orelse return helperErr(drv, arena, views);
-    const fresh = e.netPolicyStatus(listed.pane, 500) catch |err|
-        return failRes(arena, try headlessFail(arena, e, err));
+    const fresh = e.netPolicyStatus(listed.pane, 500) catch |err| switch (err) {
+        // A status read never closes or changes the view, unlike an install.
+        error.PolicyAckTimeout => return failRes(arena, fail(.timeout, "the helper did not answer the policy status query in time; the view and its policy are unchanged")),
+        error.PolicyRefused => return failRes(arena, fail(.refused, "the helper reports this view's policy as refused or inactive; the view stays fail-closed and unchanged")),
+        else => return failRes(arena, try headlessFail(arena, e, err)),
+    };
     return policyViewResult(arena, listed, fresh);
 }
 
@@ -3909,6 +4049,67 @@ fn policyViewResult(arena: std.mem.Allocator, listed: View, fresh: *const webdri
     try res.fact("policy_source", if (fresh.pol != null) "call" else "none");
     try res.fact("policy_serial", fresh.pol_serial);
     if (fresh.pol) |*p| try res.raw("policy", try policyJson(arena, p));
+    if (listed.untrusted) try res.fact("enforced", .{
+        .internet_sockets = "denied",
+        .http_broker = "actual-address-validated",
+        .service_workers = false,
+        .websockets = false,
+        .webrtc = false,
+        .extensions = false,
+        .methods = "GET/HEAD and same-origin POST only",
+        .ranges = false,
+        .navigation_methods = "GET/HEAD and same-origin POST",
+        .same_origin_methods = "GET/HEAD/POST",
+        .cors = .{
+            .cross_origin_fetch_xhr = "denied",
+            .cross_origin_images_media_workers = "denied",
+            .worker_network = "denied; native worker-src CSP and request gates",
+            .opaque_initiator_subresources = "denied",
+            .cross_origin_scripts_styles_fonts = "GET only; 2xx; exactly one ACAO:*; matching MIME; CORP absent or cross-origin",
+            .response_tainting = "unsupported; unsafe cross-origin lanes denied",
+            .initiator = "native CEF metadata; Origin header consistency-checked",
+        },
+        .disabled_lanes = [_][]const u8{
+            "browserless", "service_worker", "worker",               "shared_worker", "navigation_preload", "prefetch",     "favicon",
+            "websocket",   "webrtc_network", "webtransport_network", "quic",          "preconnect",         "dns_prefetch", "extensions",
+        },
+        .credentials = .{
+            .same_origin = "ephemeral context cookies; no broker cookie jar",
+            .cross_origin_request = "Cookie and Referer stripped; native initiator supplies Origin",
+            .cross_origin_response = "Set-Cookie stripped",
+            .authentication = "denied",
+        },
+        .redirects = .{
+            .navigation = "CEF follows; every hop passes the policy and actual-address/port validation",
+            .non_navigation = "denied",
+        },
+        .permissions = "denied",
+        .clipboard_read = "denied",
+        .clipboard_sanitized_write = "may be granted by CEF; not covered by permission-prompt denial",
+        .downloads = "denied",
+        .popups = "denied",
+        .file_uploads = false,
+        .upgrades = false,
+        // The broker's own limits (`vendor/web_untrusted.h`), via the one
+        // Zig mirror the helper's test root drift-tests against the header.
+        .max_active_jobs = @as(u32, web_proto.UNTRUSTED_MAX_JOBS),
+        .max_queued_jobs = @as(u32, web_proto.UNTRUSTED_QUEUE_CAP),
+        .max_url_bytes = @as(u32, web_proto.UNTRUSTED_URL_CAP),
+        .max_upload_bytes = @as(u32, web_proto.UNTRUSTED_UPLOAD_CAP),
+        .max_response_bytes = @as(u32, web_proto.UNTRUSTED_BODY_CAP),
+        .response_bytes = "decoded",
+        .response_timeout_ms = @as(u32, web_proto.UNTRUSTED_TIMEOUT_MS),
+        .cleanup = .{
+            .owner = "independent subreaper supervisor",
+            .delete_after = "ECHILD; all browser/broker descendants reaped",
+            .events = [_][]const u8{ "last_view_close", "startup_failure", "helper_crash", "mcp_shutdown", "mcp_parent_sigkill" },
+            .filesystem_failure = "bounded retries, then the owner exits 251 and a later supervisor sweeps the stale root",
+        },
+        .kernel_core_limit_bytes = @as(u64, 0),
+        .nondumpable = "browser after initialize, renderers from their first script context; zygotes stay dumpable for the namespace sandbox",
+        .renderer_sandbox = "chromium namespace (user/pid/net) + seccomp-bpf",
+        .destinations = "connect-time refusal of special-purpose ranges and this host's own interface addresses unless allow_private_addresses",
+    });
     try res.fact("requests", fresh.pol_requests);
     try res.fact("bytes", fresh.pol_bytes);
     try res.fact("navigations", fresh.pol_navigations);
@@ -3960,6 +4161,7 @@ fn policySetTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, vi
         if (!webprofiles.validName(name))
             return mcp.errRes(arena, .invalid_args, "'profile' must be a usable profile name (1-64 of a-z, 0-9, '_', '-')");
         const full = parsed.effective();
+        if (full.untrusted or e.untrusted) return mcp.errRes(arena, .refused, "untrusted policies cannot be registered for named profiles; use a direct ephemeral web_open");
         try e.setProfilePolicy(name, &full);
         var res = mcp.Res.init(arena);
         try res.fact("profile", name);
@@ -3972,6 +4174,7 @@ fn policySetTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, vi
     const vs = views orelse return helperErr(drv, arena, views);
     const view = viewFor(vs, handle) orelse return helperErr(drv, arena, views);
     const report = e.tightenViewPolicy(view.pane, &parsed) catch |err| return switch (err) {
+        error.UntrustedModeConflict => mcp.errRes(arena, .refused, "untrusted cannot change on a live view, in either direction; open a new dedicated instance"),
         error.NoPolicy => mcp.errRes(arena, .conflict, "this view runs no policy; one can only be installed at web_open, never added to a live view (its earlier requests would predate it)"),
         else => failRes(arena, try headlessFail(arena, e, err)),
     };
@@ -7342,15 +7545,15 @@ test "every tool this module serves declares an output schema" {
     try std.testing.expectEqual(@as(usize, 28), seen);
 }
 
-test "parsePolicy fails closed on every unknown name, wildcard and port" {
+test "parsePolicy fails closed on unknown names and invalid host authorities" {
     var arena_state = testArena();
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const t = std.testing;
 
     const cases = [_]struct { json: []const u8, needle: []const u8 }{
-        .{ .json = "{\"policy\":{\"allow_hosts\":[\"*\"]}}", .needle = "allow-all" },
-        .{ .json = "{\"policy\":{\"allow_hosts\":[\"site.example:8080\"]}}", .needle = "no scheme, no port" },
+        .{ .json = "{\"policy\":{\"allow_hosts\":[\"*\"]}}", .needle = "wildcard" },
+        .{ .json = "{\"policy\":{\"allow_hosts\":[\"site.example:0\"]}}", .needle = "host entry" },
         .{ .json = "{\"policy\":{\"allow_hosts\":[\"https://site.example\"]}}", .needle = "host entry" },
         .{ .json = "{\"policy\":{\"block_types\":[\"imgae\"]}}", .needle = "not a resource class" },
         .{ .json = "{\"policy\":{\"allow_schemes\":[\"gopher\"]}}", .needle = "not an allowable scheme" },
@@ -7367,10 +7570,10 @@ test "parsePolicy fails closed on every unknown name, wildcard and port" {
     }
 
     // Upper case folds rather than refuses; names/masks land as sent.
-    const ok_args = try std.json.parseFromSliceLeaky(std.json.Value, arena, "{\"policy\":{\"allow_hosts\":[\"Site.Example\"],\"block_types\":[\"image\",\"media\"],\"allow_schemes\":[\"https\"],\"max_requests\":9,\"deadline_ms\":1500}}", .{});
+    const ok_args = try std.json.parseFromSliceLeaky(std.json.Value, arena, "{\"policy\":{\"allow_hosts\":[\"Site.Example:8080\"],\"block_types\":[\"image\",\"media\"],\"allow_schemes\":[\"https\"],\"max_requests\":9,\"deadline_ms\":1500}}", .{});
     const ok = try parsePolicy(arena, ok_args);
     try t.expect(ok == .policy);
-    try t.expectEqualStrings("site.example", ok.policy.allow_top.?[0]);
+    try t.expectEqualStrings("site.example:8080", ok.policy.allow_top.?[0]);
     try t.expect(ok.policy.allow_sub == null);
     try t.expectEqual(netpolicy.typeBit("image").? | netpolicy.typeBit("media").?, ok.policy.block_types.?);
     try t.expectEqual(netpolicy.schemeBit("https").?, ok.policy.allow_schemes.?);
@@ -7532,4 +7735,122 @@ test "capabilities schema: web_engine_owner enum is webdrive.Owner, drift-tested
         n += 1;
     }
     try t.expectEqual(n, std.mem.count(u8, listed, "\"") / 2);
+}
+
+test "policy parser rejects unknown keys and preserves untrusted patch presence" {
+    var arena_state = testArena();
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const parsed = try parsePolicy(arena, try jsonArgs(arena, "{\"policy\":{\"untrusted\":true,\"allow_hosts\":[\"site.example:8443\",\"[2001:db8::1]:443\"]}}"));
+    try std.testing.expect(parsed.policy.untrusted.?);
+    try std.testing.expectEqualStrings("site.example:8443", parsed.policy.allow_top.?[0]);
+    const absent = try parsePolicy(arena, try jsonArgs(arena, "{\"policy\":{}}"));
+    try std.testing.expect(absent.policy.untrusted == null);
+    try std.testing.expect(!absent.policy.effective().untrusted);
+    for ([_][]const u8{ "{\"policy\":{\"untrusted\":1}}", "{\"policy\":{\"untrused\":true}}", "{\"policy\":{\"allow_hosts\":[\"site.example:0\"]}}" }) |text|
+        try std.testing.expect((try parsePolicy(arena, try jsonArgs(arena, text))) == .err);
+}
+
+test "emulation parser accepts only specified media values and bounded numeric scale" {
+    var arena_state = testArena();
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const parsed = try parseEmulation(arena, try jsonArgs(arena, "{\"color_scheme\":\"dark\",\"reduced_motion\":\"no-preference\",\"device_scale_factor\":1.25}"));
+    try std.testing.expectEqual(web_proto.ColorScheme.dark, parsed.value.color_scheme.?);
+    try std.testing.expectEqual(web_proto.ReducedMotion.no_preference, parsed.value.reduced_motion.?);
+    try std.testing.expectEqual(@as(u16, 1250), parsed.value.scale());
+    for ([_][]const u8{ "{\"color_scheme\":\"auto\"}", "{\"reduced_motion\":null}", "{\"device_scale_factor\":0.49}", "{\"device_scale_factor\":4.01}", "{\"device_scale_factor\":\"2\"}" }) |text|
+        try std.testing.expect((try parseEmulation(arena, try jsonArgs(arena, text))) == .err);
+    const out = try openResult(arena, .headless, .{ .pane = 1, .untrusted = true, .emulation = parsed.value }, true, false, null, null, null, "none", null, 1);
+    const sc = (try mcp.expectToolResultShape(arena, "web_open", out)).object.get("structuredContent").?.object;
+    try std.testing.expect(sc.get("untrusted").?.bool);
+    try std.testing.expectEqualStrings("dark", sc.get("color_scheme").?.string);
+    try std.testing.expectEqual(@as(f64, 1.25), sc.get("device_scale_factor").?.float);
+}
+
+test "ordinary and untrusted engine addresses remain stable across route table growth" {
+    const saved_alloc = g_headless_alloc;
+    const saved_dir = g_headless_dir;
+    const saved_instance = g_headless_instance;
+    const saved_mux = g_headless_mux_sock;
+    if (g_engines.items.len != 0) return error.SkipZigTest;
+    configureHeadless(std.testing.allocator, "/tmp/webdrive-mode-test", null, null);
+    defer {
+        shutdownHeadless();
+        g_headless_alloc = saved_alloc;
+        g_headless_dir = saved_dir;
+        g_headless_instance = saved_instance;
+        g_headless_mux_sock = saved_mux;
+    }
+    const ordinary = headlessEngineForMode(.{}, false).?;
+    const untrusted = headlessEngineForMode(.{}, true).?;
+    try std.testing.expect(ordinary != untrusted);
+    _ = headlessEngineFor(.{ .kind = .tor, .endpoint = "127.0.0.1:9050" }).?;
+    try std.testing.expectEqual(ordinary, headlessEngineForMode(.{}, false).?);
+    try std.testing.expectEqual(untrusted, headlessEngineForMode(.{}, true).?);
+    try std.testing.expect(!untrusted.brokerLaneAvailable());
+    try std.testing.expect(untrusted.profileStorePath() == null);
+}
+
+/// Pins `SKETERM_WEB_BIN` for one test and restores the caller's value.
+const WebBinPin = struct {
+    const libc = @import("../c.zig").c;
+
+    saved: ?[:0]u8 = null,
+
+    fn set(gpa: std.mem.Allocator, value: [*:0]const u8) !WebBinPin {
+        var pin = WebBinPin{};
+        if (libc.getenv("SKETERM_WEB_BIN")) |old| pin.saved = try gpa.dupeZ(u8, std.mem.span(old));
+        if (libc.setenv("SKETERM_WEB_BIN", value, 1) != 0) return error.SkipZigTest;
+        return pin;
+    }
+
+    fn restore(self: *WebBinPin, gpa: std.mem.Allocator) void {
+        if (self.saved) |old| {
+            _ = libc.setenv("SKETERM_WEB_BIN", old.ptr, 1);
+            gpa.free(old);
+        } else _ = libc.unsetenv("SKETERM_WEB_BIN");
+    }
+};
+
+test "web_untrusted is a build fact, and lifecycle facts never come from the untrusted engine" {
+    const saved_alloc = g_headless_alloc;
+    const saved_dir = g_headless_dir;
+    const saved_instance = g_headless_instance;
+    const saved_mux = g_headless_mux_sock;
+    if (g_engines.items.len != 0 or guiDrivesWeb()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var pin = try WebBinPin.set(gpa, "/bin/sh");
+    defer pin.restore(gpa);
+    configureHeadless(gpa, "/tmp/webdrive-mode-test", null, null);
+    defer {
+        shutdownHeadless();
+        g_headless_alloc = saved_alloc;
+        g_headless_dir = saved_dir;
+        g_headless_instance = saved_instance;
+        g_headless_mux_sock = saved_mux;
+    }
+    const linux = @import("builtin").os.tag == .linux;
+    // No engine exists yet, and the answer is already known rather than null.
+    try std.testing.expectEqual(@as(usize, 0), g_engines.items.len);
+    try std.testing.expectEqual(@as(?bool, linux), restrictedCapability(.untrusted_web));
+    // The untrusted engine sits FIRST in the table, where a fallback to
+    // `g_engines[0]` would read it.
+    const untrusted = headlessEngineForMode(.{}, true).?;
+    untrusted.owner = .self_spawned;
+    untrusted.state = .ready;
+    untrusted.private_dir = try gpa.dupe(u8, "/run/user/0/sketerm/u/0000000000000000");
+    const ordinary = headlessEngineForMode(.{}, false).?;
+    ordinary.state = .ready;
+    try std.testing.expectEqual(@as(?bool, linux), restrictedCapability(.untrusted_web));
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("/tmp/webdrive-mode-test/web.sock", helperSocket(&buf).?);
+    const eng = engineCapability();
+    try std.testing.expectEqual(webdrive.Owner.none, eng.owner);
+    try std.testing.expectEqual(ordinary.brokerLaneAvailable(), eng.broker_lane);
+    // A capable build with no resolvable helper says so.
+    _ = WebBinPin.libc.setenv("SKETERM_WEB_BIN", "/nonexistent/sketerm-webengine", 1);
+    try std.testing.expectEqual(@as(?bool, false), restrictedCapability(.untrusted_web));
+    untrusted.state = .idle;
+    ordinary.state = .idle;
 }

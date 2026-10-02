@@ -64,6 +64,9 @@ depends=(
     # codecs, so H.264/AAC and Widevine work where the stock upstream
     # binaries have neither.
     'cef'
+    # Untrusted headless browsing: the helper's HTTP broker dlopens
+    # libcurl.so.4 at runtime and compiles against its header.
+    'curl'
 )
 optdepends=(
     'ffmpeg: video posters, media metadata, cheap remote video previews (on the host serving the files), and decoding forwarded-app video streams (GUI)'

@@ -13,6 +13,7 @@ const cef = @import("cef");
 const filter = @import("../filter.zig");
 const filtersub = @import("../filtersub.zig");
 const netpolicy = @import("../netpolicy.zig");
+const urlhost = @import("../urlhost.zig");
 const capture = @import("../capture.zig");
 const nowMs = @import("../../util/clock.zig").nowMs;
 const pathz = @import("../../util/pathz.zig");
@@ -185,43 +186,450 @@ pub fn interceptLog(self: *Host, req: proto.InterceptLogReq) void {
 
 // -- enforced network policy (0x86 block) --------------------------
 
-/// Install (or replace) a view's enforced policy. MAIN thread; the
-/// slot is found-or-created so the frame can precede the
-/// `view_create` naming the view. When no slot is free (the
-/// MAX_POLICY_VIEWS ceiling) an `active=0` event is posted — the
-/// client refuses the open on its own count, this is the belt.
+var fault_policy_installs: u32 = 0;
+
+/// Rig-only `SKETERM_WEB_FAULT_POLICY_INSTALL=<n>` + `SKETERM_WEB_FAULT_POLICY_ACK=oom|drop|stale` (default oom): fault the n-th install.
+const PolicyFault = enum { oom, drop, stale };
+
+fn policyFault() ?PolicyFault {
+    const ordinal = c.getenv("SKETERM_WEB_FAULT_POLICY_INSTALL") orelse return null;
+    fault_policy_installs +|= 1;
+    const wanted = std.fmt.parseInt(u32, std.mem.span(ordinal), 10) catch return null;
+    if (wanted != fault_policy_installs) return null;
+    const mode = c.getenv("SKETERM_WEB_FAULT_POLICY_ACK") orelse return .oom;
+    return std.meta.stringToEnum(PolicyFault, std.mem.span(mode));
+}
+
+/// Reserve a fail-closed slot before any allocation and acknowledge only installed monotone policies.
 pub fn netPolicySet(self: *Host, req: proto.NetPolicySet) void {
-    const pol = netpolicy.Policy.build(self.gpa, req) catch return;
-    const s = interceptSlotFor(self.gpa, req.view) orelse {
-        pol.deinit(self.gpa);
-        self.post(proto.EvNetPolicy{
-            .view = req.view,
-            .serial = req.serial,
-            .active = 0,
-            .exhausted = 0,
-            .requests = 0,
-            .bytes = 0,
-            .navigations = 0,
-            .ms_left = 0,
-            .denied = @splat(0),
-        });
+    const s = policySlotFor(req.view) orelse return refusePolicyView(self, req);
+    g_int.acquire();
+    const failed = s.pc.exhausted == .policy_refused;
+    g_int.release();
+    if (!validPolicySet(req) or failed) {
+        rejectPolicy(self, s, req.serial);
+        return;
+    }
+    const fault = policyFault();
+    // The injected OOM stands in for the real build allocation failing,
+    // never for an ACK of an already accepted policy.
+    const built = if (fault == .oom) error.OutOfMemory else netpolicy.Policy.build(self.gpa, req);
+    const pol = built catch {
+        if (fault == .oom) host_mod.logLine("fault policy oom view={d} serial={d} browser={any}", .{ req.view, req.serial, self.find(req.view) != null });
+        rejectPolicy(self, s, req.serial);
         return;
     };
+    if (s.pol) |old| {
+        if (!netpolicy.subsetOf(pol, old)) {
+            pol.deinit(self.gpa);
+            rejectPolicy(self, s, req.serial);
+            return;
+        }
+    }
     var old: ?*netpolicy.Policy = null;
     {
         g_int.acquire();
         defer g_int.release();
         old = s.pol;
         s.pol = pol;
-        s.pc = .{ .started_ms = nowMs() };
-        s.pol_dirty = true;
-        s.deadline_stopped = false;
+        if (old == null) s.pc = .{ .started_ms = nowMs() };
+        // An idle install must not emit a second, honest ACK behind the injected one.
+        s.pol_dirty = fault != .drop and fault != .stale;
+        if (old == null) s.deadline_stopped = false;
     }
     if (old) |o| o.deinit(self.gpa);
+    var ack = netPolicyFrame(req.view);
+    if (fault) |mode| {
+        host_mod.logLine("fault policy {s} view={d} serial={d} browser={any}", .{ @tagName(mode), req.view, req.serial, self.find(req.view) != null });
+        if (mode == .drop) return;
+        if (mode == .stale) ack.serial -%= 1;
+    }
+    self.post(ack);
+}
+
+const table_full_msg = "network policy table is full; this view is refused";
+
+/// No slot can hold the policy: fail THAT view closed (its create, or its
+/// unpoliced existing browser) and keep every other view serving. Only a
+/// refusal set that is itself full falls back to refusing the route.
+fn refusePolicyView(self: *Host, req: proto.NetPolicySet) void {
+    self.post(proto.EvNetPolicy{
+        .view = req.view,
+        .serial = req.serial,
+        .active = 0,
+        .exhausted = @intFromEnum(proto.NetReason.policy_refused),
+        .requests = 0,
+        .bytes = 0,
+        .navigations = 0,
+        .ms_left = 0,
+        .denied = @splat(0),
+    });
+    if (self.findAny(req.view) != null) {
+        // Created past the table without a slot: it can never be policied.
+        self.failView(req.view, table_full_msg);
+        return;
+    }
+    g_int.acquire();
+    const remembered = g_int.refuseView(req.view);
+    if (!remembered) g_int.policy_failed = true;
+    g_int.release();
+    if (remembered) return;
+    self.route_refusal = "network policy table and its refusal list are full; this helper route is fail-closed";
+    self.post(proto.EvRouteRefused{ .reason = self.route_refusal });
+}
+
+/// MAIN thread: the view was refused a policy, so its `view_create*` must fail.
+pub fn policyRefusedView(view: u32) bool {
+    g_int.acquire();
+    defer g_int.release();
+    for (g_int.refused_views) |id| if (id == view) return true;
+    return false;
+}
+
+fn policyTestSet(view: u32, serial: u32) proto.NetPolicySet {
+    return .{
+        .view = view,
+        .serial = serial,
+        .flags = 0,
+        .block_types = filter.RType.script.bit(),
+        .allow_schemes = netpolicy.default_schemes,
+        .max_requests = 100,
+        .max_bytes = 1000,
+        .max_navigations = 10,
+        .deadline_ms = 5000,
+        .allow_top = &.{"site.example"},
+        .allow_sub = &.{"cdn.example"},
+    };
+}
+
+fn policyTestAck(out: *proto.Outbox) !proto.EvNetPolicy {
+    const msg = out.front() orelse return error.MissingAck;
+    var reader = proto.Reader.init(msg.bytes);
+    const frame = (try reader.next()) orelse return error.MissingAck;
+    try std.testing.expectEqual(proto.Tag.ev_net_policy, frame.tag);
+    const ev = try proto.decode(proto.EvNetPolicy, frame.payload);
+    out.advance(msg.bytes.len);
+    return ev;
+}
+
+test "policy installation OOM reserves a rejection and ring OOM cannot detach enforcement" {
+    const gpa = std.testing.allocator;
+    var out = proto.Outbox.init(gpa);
+    defer out.deinit();
+    var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
+    var host = Host.init(failing.allocator(), &out);
+    defer host.deinit();
+    defer interceptUnregister(gpa, 91);
+    netPolicySet(&host, policyTestSet(91, 1));
+    const ev = try policyTestAck(&out);
+    try std.testing.expectEqual(@as(u32, 1), ev.serial);
+    try std.testing.expectEqual(@as(u8, 0), ev.active);
+    try std.testing.expectEqual(@intFromEnum(proto.NetReason.policy_refused), ev.exhausted);
+    interceptRegister(failing.allocator(), 91, 88);
+    try std.testing.expect(g_int.slotByCef(88) != null);
+    try std.testing.expect(g_int.slotByCef(88).?.ring == null);
+    const Fake = struct {
+        fn id(_: [*c]cef.cef_browser_t) callconv(.c) c_int {
+            return 88;
+        }
+    };
+    var browser = std.mem.zeroes(cef.cef_browser_t);
+    browser.get_identifier = Fake.id;
+    try std.testing.expectEqual(@as(cef.cef_return_value_t, cef.RV_CANCEL), onBeforeResourceLoad(null, &browser, null, null, null));
+    host.gpa = gpa;
+    netPolicySet(&host, policyTestSet(91, 2));
+    const retry = try policyTestAck(&out);
+    try std.testing.expectEqual(@as(u8, 0), retry.active);
+    try std.testing.expectEqual(@as(u32, 2), retry.serial);
+}
+
+test "replacement OOM latches refusal instead of retaining an usable broader grant" {
+    const gpa = std.testing.allocator;
+    var out = proto.Outbox.init(gpa);
+    defer out.deinit();
+    var host = Host.init(gpa, &out);
+    defer host.deinit();
+    defer interceptUnregister(gpa, 92);
+    netPolicySet(&host, policyTestSet(92, 1));
+    _ = try policyTestAck(&out);
+    var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
+    host.gpa = failing.allocator();
+    var next = policyTestSet(92, 2);
+    next.max_requests = 10;
+    netPolicySet(&host, next);
+    const ev = try policyTestAck(&out);
+    try std.testing.expectEqual(@as(u8, 0), ev.active);
+    try std.testing.expectEqual(@as(u32, 2), ev.serial);
+    const s = policySlotFor(92).?;
+    try std.testing.expectEqual(proto.NetReason.policy_refused, s.pc.exhausted);
+    try std.testing.expectEqual(proto.NetReason.policy_refused, netpolicy.decide(s.pol.?, &s.pc, .{
+        .host = "site.example",
+        .scheme = "https",
+        .rtype = .document,
+        .is_top = true,
+    }, nowMs()));
+    host.gpa = gpa;
+}
+
+test "helper validates all replacement scope and budget fields and preserves accounting" {
+    const gpa = std.testing.allocator;
+    for (0..11) |change| {
+        var out = proto.Outbox.init(gpa);
+        defer out.deinit();
+        var host = Host.init(gpa, &out);
+        defer host.deinit();
+        defer interceptUnregister(gpa, 93);
+        netPolicySet(&host, policyTestSet(93, 1));
+        _ = try policyTestAck(&out);
+        const s = policySlotFor(93).?;
+        s.pc = .{ .started_ms = nowMs() - 100, .requests = 7, .bytes = 50, .navigations = 2, .exhausted = .byte_cap };
+        const started = s.pc.started_ms;
+        var next = policyTestSet(93, 2);
+        switch (change) {
+            0 => {
+                next.max_requests = 10;
+                next.allow_sub = &.{"site.example"};
+            },
+            1 => next.allow_top = &.{"extra.example"},
+            2 => next.allow_sub = &.{"extra.example"},
+            3 => next.allow_schemes |= netpolicy.Scheme.ws.bit(),
+            4 => next.flags = proto.NetPolicySet.flag_allow_private,
+            5 => next.block_types = 0,
+            6 => next.max_requests = 101,
+            7 => next.max_bytes = 0,
+            8 => next.max_navigations = 11,
+            9 => next.deadline_ms = 5001,
+            10 => next.flags = proto.NetPolicySet.flag_untrusted,
+            else => unreachable,
+        }
+        netPolicySet(&host, next);
+        const ev = try policyTestAck(&out);
+        try std.testing.expectEqual(@as(u32, 2), ev.serial);
+        try std.testing.expectEqual(@as(u8, if (change == 0) 1 else 0), ev.active);
+        try std.testing.expectEqual(started, s.pc.started_ms);
+        try std.testing.expectEqual(@as(u32, 7), ev.requests);
+        try std.testing.expectEqual(@as(u64, 50), ev.bytes);
+        try std.testing.expectEqual(@as(u32, 2), ev.navigations);
+        try std.testing.expect(ev.ms_left <= 4900);
+        try std.testing.expectEqual(if (change == 0) proto.NetReason.byte_cap else .policy_refused, s.pc.exhausted);
+    }
+}
+
+test "a full policy table refuses only the view past it" {
+    const gpa = std.testing.allocator;
+    var out = proto.Outbox.init(gpa);
+    defer out.deinit();
+    var host = Host.init(gpa, &out);
+    defer host.deinit();
+    defer {
+        for (0..MAX_ISLOTS) |i| interceptUnregister(gpa, @intCast(100 + i));
+        interceptUnregister(gpa, 500);
+        g_int.policy_failed = false;
+    }
+    for (0..MAX_ISLOTS) |i| {
+        netPolicySet(&host, policyTestSet(@intCast(100 + i), 1));
+        try std.testing.expectEqual(@as(u8, 1), (try policyTestAck(&out)).active);
+    }
+    // The 33rd view: refused, and remembered so its create fails closed.
+    netPolicySet(&host, policyTestSet(500, 5));
+    const ev = try policyTestAck(&out);
+    try std.testing.expectEqual(@as(u8, 0), ev.active);
+    try std.testing.expectEqual(@as(u32, 5), ev.serial);
+    try std.testing.expectEqual(@intFromEnum(proto.NetReason.policy_refused), ev.exhausted);
+    try std.testing.expect(out.empty());
+    try std.testing.expectEqual(@as(usize, 0), host.route_refusal.len);
+    try std.testing.expect(!g_int.policy_failed);
+    try std.testing.expect(policyRefusedView(500));
+    try host.createView(.{ .view = 500, .w = 8, .h = 8, .scale_x1000 = 1000, .context = 0 });
+    try std.testing.expect(host.find(500) == null);
+    {
+        const msg = out.front().?;
+        var reader = proto.Reader.init(msg.bytes);
+        try std.testing.expectEqual(proto.Tag.ev_view_create_failed, (try reader.next()).?.tag);
+        out.advance(msg.bytes.len);
+    }
+    // Every other view keeps its policy, its replacements and its verdicts.
+    for (0..MAX_ISLOTS) |i| {
+        const view: u32 = @intCast(100 + i);
+        try std.testing.expect(!policyRefusedView(view));
+        const s = policySlotFor(view).?;
+        try std.testing.expectEqual(proto.NetReason.none, netpolicy.decide(s.pol.?, &s.pc, .{ .host = "site.example", .scheme = "https", .rtype = .document, .is_top = true }, nowMs()));
+    }
+    var narrower = policyTestSet(100, 2);
+    narrower.max_requests = 50;
+    netPolicySet(&host, narrower);
+    try std.testing.expectEqual(@as(u8, 1), (try policyTestAck(&out)).active);
+    try std.testing.expectEqual(@as(cef.cef_return_value_t, cef.RV_CONTINUE), onBeforeResourceLoad(null, null, null, null, null));
+    // Destroying the refused id forgets the refusal.
+    host.destroyView(500);
+    try std.testing.expect(!policyRefusedView(500));
+}
+
+test "destroy before browser creation releases installed and rejected policy slots" {
+    const gpa = std.testing.allocator;
+    var out = proto.Outbox.init(gpa);
+    defer out.deinit();
+    var host = Host.init(gpa, &out);
+    defer host.deinit();
+    for ([_]bool{ false, true }) |reject| {
+        var req = policyTestSet(94, 1);
+        if (reject) req.flags = 0x80000000;
+        netPolicySet(&host, req);
+        _ = try policyTestAck(&out);
+        host.destroyView(94);
+        for (&g_int.slots) |s| try std.testing.expect(!s.used or s.view_id != 94);
+        netPolicyStatus(&host, .{ .view = 94, .serial = 123 });
+        const ev = try policyTestAck(&out);
+        try std.testing.expectEqual(@as(u32, 123), ev.serial);
+        try std.testing.expectEqual(@as(u8, 0), ev.active);
+    }
+}
+
+fn validPolicySet(req: proto.NetPolicySet) bool {
+    const schemes: u16 = (1 << std.meta.fields(netpolicy.Scheme).len) - 1;
+    const types: u16 = (1 << std.meta.fields(filter.RType).len) - 1;
+    if (req.flags & ~(proto.NetPolicySet.flag_allow_private | proto.NetPolicySet.flag_untrusted) != 0 or
+        req.allow_schemes & ~schemes != 0 or req.block_types & ~types != 0 or
+        req.allow_top.len > netpolicy.MAX_HOSTS or req.allow_sub.len > netpolicy.MAX_HOSTS) return false;
+    if (req.flags & proto.NetPolicySet.flag_untrusted != 0 and req.allow_schemes & ~netpolicy.default_schemes != 0) return false;
+    for ([_][]const []const u8{ req.allow_top, req.allow_sub }) |hosts| {
+        for (hosts) |host| if (!netpolicy.validHostEntry(host)) return false;
+    }
+    return true;
+}
+
+fn policySlotFor(view: u32) ?*ISlot {
+    g_int.acquire();
+    defer g_int.release();
+    var free: ?*ISlot = null;
+    for (&g_int.slots) |*s| {
+        if (s.used and s.view_id == view) return s;
+        if (!s.used and free == null) free = s;
+    }
+    const s = free orelse return null;
+    s.* = .{ .used = true, .view_id = view };
+    return s;
+}
+
+fn rejectPolicy(self: *Host, s: *ISlot, serial: u32) void {
+    g_int.acquire();
+    s.pol_failed_serial = serial;
+    s.pc.exhausted = .policy_refused;
+    netpolicy.deny(&s.pc, .policy_refused);
+    s.pol_dirty = true;
+    g_int.release();
+    self.post(netPolicyFrame(s.view_id));
+    if (self.find(s.view_id)) |v| if (v.browser) |b| if (b.stop_load) |stop| stop(b);
+}
+
+pub fn untrustedPolicyPresent(view: u32) bool {
+    g_int.acquire();
+    defer g_int.release();
+    for (&g_int.slots) |*s| if (s.used and s.view_id == view) {
+        return if (s.pol) |p| p.untrusted and s.pc.exhausted != .policy_refused else false;
+    };
+    return false;
+}
+
+pub fn untrustedPrivateAllowed(cef_id: c_int) ?bool {
+    g_int.acquire();
+    defer g_int.release();
+    const s = g_int.slotByCef(cef_id) orelse return null;
+    if (g_int.policy_failed or s.pc.exhausted == .policy_refused) return null;
+    const pol = s.pol orelse return null;
+    return if (pol.untrusted) pol.allow_private else null;
+}
+
+/// The broker's `enum sk_web_untrusted_reason` as a wire reason; an unknown (newer) value is a broker failure, never an allowance.
+pub fn untrustedReason(reason: c_int) proto.NetReason {
+    return switch (reason) {
+        cef.SK_WEB_UNTRUSTED_PRIVATE => .resolved_private_address,
+        cef.SK_WEB_UNTRUSTED_UNSUPPORTED => .untrusted_http,
+        cef.SK_WEB_UNTRUSTED_BROKER_FAILURE => .untrusted_broker,
+        cef.SK_WEB_UNTRUSTED_TIMEOUT => .untrusted_timeout,
+        cef.SK_WEB_UNTRUSTED_QUEUE_FULL => .untrusted_queue_full,
+        else => .untrusted_broker,
+    };
+}
+
+pub fn untrustedDenied(cef_id: c_int, reason: c_int) callconv(.c) void {
+    g_int.acquire();
+    defer g_int.release();
+    const s = g_int.slotByCef(cef_id) orelse return;
+    netpolicy.deny(&s.pc, untrustedReason(reason));
+    s.pol_dirty = true;
+}
+
+test "broker reasons map by the header's enum and unknown values fail closed" {
+    try std.testing.expectEqual(proto.NetReason.resolved_private_address, untrustedReason(cef.SK_WEB_UNTRUSTED_PRIVATE));
+    try std.testing.expectEqual(proto.NetReason.untrusted_http, untrustedReason(cef.SK_WEB_UNTRUSTED_UNSUPPORTED));
+    try std.testing.expectEqual(proto.NetReason.untrusted_broker, untrustedReason(cef.SK_WEB_UNTRUSTED_BROKER_FAILURE));
+    try std.testing.expectEqual(proto.NetReason.untrusted_timeout, untrustedReason(cef.SK_WEB_UNTRUSTED_TIMEOUT));
+    try std.testing.expectEqual(proto.NetReason.untrusted_queue_full, untrustedReason(cef.SK_WEB_UNTRUSTED_QUEUE_FULL));
+    for ([_]c_int{ 0, -1, 99 }) |unknown| try std.testing.expectEqual(proto.NetReason.untrusted_broker, untrustedReason(unknown));
+}
+
+test "untrusted broker limits mirrored for the MCP server match the header" {
+    try std.testing.expectEqual(cef.SK_WEB_UNTRUSTED_MAX_JOBS, proto.UNTRUSTED_MAX_JOBS);
+    try std.testing.expectEqual(cef.SK_WEB_UNTRUSTED_QUEUE_CAP, proto.UNTRUSTED_QUEUE_CAP);
+    try std.testing.expectEqual(cef.SK_WEB_UNTRUSTED_TIMEOUT_MS, proto.UNTRUSTED_TIMEOUT_MS);
+    try std.testing.expectEqual(cef.SK_WEB_UNTRUSTED_URL_CAP, proto.UNTRUSTED_URL_CAP);
+    try std.testing.expectEqual(cef.SK_WEB_UNTRUSTED_UPLOAD_CAP, proto.UNTRUSTED_UPLOAD_CAP);
+    try std.testing.expectEqual(cef.SK_WEB_UNTRUSTED_BODY_CAP, proto.UNTRUSTED_BODY_CAP);
 }
 
 pub fn netPolicyStatus(self: *Host, req: proto.NetPolicyReq) void {
-    self.post(netPolicyFrame(req.view));
+    var ev = netPolicyFrame(req.view);
+    if (req.serial != 0) ev.serial = req.serial;
+    self.post(ev);
+}
+
+/// Latch only a refused navigation attempt; allowed preflight leaves resource-gate accounting untouched.
+pub fn navigationBudget(view: u32, is_main: bool, scheme: []const u8, now_ms: i64) proto.NetReason {
+    g_int.acquire();
+    defer g_int.release();
+    for (&g_int.slots) |*s| {
+        if (!s.used or s.view_id != view) continue;
+        const reason = if (s.pc.exhausted == .policy_refused)
+            proto.NetReason.policy_refused
+        else if (s.pol) |pol|
+            netpolicy.budgetReason(pol, &s.pc, is_main, scheme, now_ms)
+        else
+            return .none;
+        if (reason != .none) {
+            netpolicy.deny(&s.pc, reason);
+            s.pol_dirty = true;
+        }
+        return reason;
+    }
+    return .none;
+}
+
+test "navigation preflight leaves subframes and unrelated views outside the main-frame cap" {
+    const gpa = std.testing.allocator;
+    var out = proto.Outbox.init(gpa);
+    defer out.deinit();
+    var host = Host.init(gpa, &out);
+    defer host.deinit();
+    defer interceptUnregister(gpa, 95);
+    var req = policyTestSet(95, 1);
+    req.deadline_ms = 0;
+    req.max_navigations = 1;
+    netPolicySet(&host, req);
+    _ = try policyTestAck(&out);
+    const s = policySlotFor(95).?;
+    netpolicy.commit(&s.pc, true);
+    const before = s.pc;
+    try std.testing.expectEqual(proto.NetReason.none, navigationBudget(95, false, "https", nowMs()));
+    try std.testing.expectEqual(proto.NetReason.none, navigationBudget(95, true, "about", nowMs()));
+    try std.testing.expectEqual(proto.NetReason.none, navigationBudget(96, true, "https", nowMs()));
+    try std.testing.expectEqualDeep(before, s.pc);
+    try std.testing.expectEqual(proto.NetReason.nav_cap, navigationBudget(95, true, "https", nowMs()));
+    try std.testing.expectEqual(before.requests, s.pc.requests);
+    try std.testing.expectEqual(before.navigations, s.pc.navigations);
+    try std.testing.expectEqual(proto.NetReason.nav_cap, s.pc.exhausted);
+    try std.testing.expectEqual(proto.NetReason.nav_cap, navigationBudget(95, true, "about", nowMs()));
+    try std.testing.expectEqual(proto.NetReason.none, navigationBudget(96, true, "https", nowMs()));
 }
 
 /// Answer a reason-carrying log pull; the `intercept_log` shape
@@ -287,17 +695,18 @@ pub fn netPolicyFrame(view_id: u32) proto.EvNetPolicy {
     };
     for (&g_int.slots) |*s| {
         if (!s.used or s.view_id != view_id) continue;
-        const pol = s.pol orelse break;
-        out.serial = pol.serial;
-        out.active = 1;
+        out.serial = if (s.pc.exhausted == .policy_refused) s.pol_failed_serial else if (s.pol) |pol| pol.serial else 0;
+        out.active = if (s.pol != null and s.pc.exhausted != .policy_refused) 1 else 0;
         out.exhausted = @intFromEnum(s.pc.exhausted);
         out.requests = s.pc.requests;
         out.bytes = s.pc.bytes;
         out.navigations = s.pc.navigations;
-        out.ms_left = if (pol.deadline_ms == 0)
-            0
-        else
-            @intCast(std.math.clamp(@as(i64, pol.deadline_ms) - (nowMs() - s.pc.started_ms), 0, std.math.maxInt(u32)));
+        if (s.pol) |pol| {
+            out.ms_left = if (pol.deadline_ms == 0)
+                0
+            else
+                @intCast(std.math.clamp(@as(i64, pol.deadline_ms) - (nowMs() - s.pc.started_ms), 0, std.math.maxInt(u32)));
+        }
         out.denied = s.pc.denied;
         break;
     }
@@ -331,8 +740,8 @@ pub fn flushNetPolicy(self: *Host) void {
             s.pol_dirty = false;
             pending[n] = .{
                 .view = s.view_id,
-                .serial = pol.serial,
-                .active = 1,
+                .serial = if (s.pc.exhausted == .policy_refused) s.pol_failed_serial else pol.serial,
+                .active = if (s.pc.exhausted == .policy_refused) 0 else 1,
                 .exhausted = @intFromEnum(s.pc.exhausted),
                 .requests = s.pc.requests,
                 .bytes = s.pc.bytes,
@@ -1081,7 +1490,8 @@ pub const ISlot = struct {
     /// path and nothing else). Swapped whole by the MAIN thread under
     /// the lock, freed outside it, like the filter engine.
     pol: ?*netpolicy.Policy = null,
-    /// Live accounting for `pol`; IO-thread-mutated under the lock.
+    pol_failed_serial: u32 = 0,
+    /// Live accounting shared by UI-thread navigation preflight and the IO-thread resource gate.
     pc: netpolicy.Counters = .{},
     /// Accounting changed since the last pushed `ev_net_policy`.
     pol_dirty: bool = false,
@@ -1105,8 +1515,24 @@ pub const Intercept = struct {
     /// freeing a swapped-out engine.
     readers: u32 = 0,
     global_enabled: bool = true,
+    /// Last resort: a policy could be neither installed nor remembered as
+    /// refused, so no request of this helper may proceed.
+    policy_failed: bool = false,
     rules: u32 = 0,
     slots: [MAX_ISLOTS]ISlot = @splat(.{}),
+    /// Views refused a policy because `slots` was full (0 = free entry);
+    /// forgotten when the view id is destroyed.
+    refused_views: [MAX_ISLOTS]u32 = @splat(0),
+
+    /// Under the lock. False when the refusal list itself is full.
+    fn refuseView(self: *Intercept, view: u32) bool {
+        for (self.refused_views) |id| if (id == view) return true;
+        for (&self.refused_views) |*id| if (id.* == 0) {
+            id.* = view;
+            return true;
+        };
+        return false;
+    }
 
     pub fn acquire(self: *Intercept) void {
         self.lock.lock();
@@ -1163,10 +1589,10 @@ pub var g_int: Intercept = .{};
 /// a load racing `create_browser_sync`'s return is still attributed).
 pub fn interceptRegister(gpa: std.mem.Allocator, view_id: u32, cef_id: c_int) void {
     if (cef_id == 0) return;
-    const ring = gpa.create([NLOG]LogEntry) catch return;
-    ring.* = @splat(.{});
+    const ring = gpa.create([NLOG]LogEntry) catch null;
+    if (ring) |r| r.* = @splat(.{});
     var keep = false;
-    defer if (!keep) gpa.destroy(ring);
+    defer if (!keep) if (ring) |r| gpa.destroy(r);
     g_int.acquire();
     defer g_int.release();
     var free_slot: ?*ISlot = null;
@@ -1226,6 +1652,9 @@ pub fn interceptUnregister(gpa: std.mem.Allocator, view_id: u32) void {
     {
         g_int.acquire();
         defer g_int.release();
+        for (&g_int.refused_views) |*id| if (id.* == view_id) {
+            id.* = 0;
+        };
         for (&g_int.slots) |*s| {
             if (!s.used or s.view_id != view_id) continue;
             ring = s.ring;
@@ -1469,6 +1898,46 @@ pub fn userfreeInto(raw: cef.cef_string_userfree_t, buf: []u8) []const u8 {
     return buf[0..n];
 }
 
+/// Longest url the gate reads whole; the untrusted broker refuses anything longer.
+const URL_MAX = proto.UNTRUSTED_URL_CAP;
+
+/// Under the lock. Append one request to the view's ring; a `reason` other than `.none` marks it refused and final.
+fn logRequest(s: *ISlot, req_id: u64, now: i64, rtype: filter.RType, reason: proto.NetReason, method: []const u8, url: []const u8) void {
+    const ring = s.ring orelse return;
+    const blocked = reason != .none;
+    const e = &ring[s.widx];
+    s.widx = (s.widx + 1) % NLOG;
+    e.* = .{
+        .seq = s.next_seq,
+        .req_id = req_id,
+        .start_ms = now,
+        .rtype = @intFromEnum(rtype),
+        .blocked = blocked,
+        // A blocked entry never completes; it is final now.
+        .done = blocked,
+        .reason = @intFromEnum(reason),
+    };
+    s.next_seq +%= 1;
+    if (s.next_seq == 0) s.next_seq = 1;
+    e.method_len = @intCast(@min(method.len, e.method.len));
+    @memcpy(e.method[0..e.method_len], method[0..e.method_len]);
+    e.url_len = @intCast(@min(url.len, e.url.len));
+    @memcpy(e.url[0..e.url_len], url[0..e.url_len]);
+}
+
+/// IO THREAD. Refuse a request before the filter/policy step: counted, latched if a budget, and logged with its reason.
+fn denyRequest(cef_id: c_int, reason: proto.NetReason, req_id: u64, rtype: filter.RType, method: []const u8, url: []const u8, now: i64) void {
+    g_int.acquire();
+    defer g_int.release();
+    const s = g_int.slotByCef(cef_id) orelse return;
+    netpolicy.deny(&s.pc, reason);
+    s.pol_dirty = true;
+    s.total +%= 1;
+    s.blocked +%= 1;
+    s.dirty = true;
+    logRequest(s, req_id, now, rtype, reason, method, url);
+}
+
 /// IO THREAD. The verdict and the log append, inline with the request.
 pub fn onBeforeResourceLoad(
     _: [*c]cef.cef_resource_request_handler_t,
@@ -1486,18 +1955,54 @@ pub fn onBeforeResourceLoad(
         releaseArg(request);
         releaseArg(callback);
     };
-    const req: *cef.cef_request_t = request orelse return cef.RV_CONTINUE;
+    {
+        g_int.acquire();
+        defer g_int.release();
+        if (g_int.policy_failed) return cef.RV_CANCEL;
+        if (browser) |b| if (b[0].get_identifier) |gi| {
+            if (g_int.slotByCef(gi(b))) |s| if (s.pc.exhausted == .policy_refused) return cef.RV_CANCEL;
+        };
+    }
+    const untrusted = host_mod.untrusted.enabled;
+    // Untrusted: no request without a view to attribute it to. Such a
+    // request (browserless, or racing registration/teardown) has no slot
+    // and therefore no ring or counter to name its refusal in.
+    const req: *cef.cef_request_t = request orelse return if (untrusted) cef.RV_CANCEL else cef.RV_CONTINUE;
     // Service-worker / urlrequest traffic has no browser and thus no
     // view to attribute it to; it passes unfiltered (matching without
     // a first-party context would misapply domain=/third-party rules).
-    const b: *cef.cef_browser_t = browser orelse return cef.RV_CONTINUE;
-    const gi = b.get_identifier orelse return cef.RV_CONTINUE;
+    const b: *cef.cef_browser_t = browser orelse return if (untrusted) cef.RV_CANCEL else cef.RV_CONTINUE;
+    const gi = b.get_identifier orelse return if (untrusted) cef.RV_CANCEL else cef.RV_CONTINUE;
     const cef_id = gi(b);
 
-    var url_raw: [2048]u8 = undefined;
-    var url_buf: [2048]u8 = undefined;
-    const gu = req.get_url orelse return cef.RV_CONTINUE;
+    // One byte past the broker's cap is how an overlong url is detected
+    // (`userfreeInto` truncates to the buffer); trusted mode shares the
+    // size so the filter sees the same url the broker would.
+    var url_raw: [URL_MAX + 1]u8 = undefined;
+    var url_buf: [URL_MAX + 1]u8 = undefined;
+    const gu = req.get_url orelse return if (untrusted) cef.RV_CANCEL else cef.RV_CONTINUE;
     const url_unf = userfreeInto(gu(req), &url_raw);
+    const rtype = if (req.get_resource_type) |grt| rtypeOf(grt(req)) else filter.RType.other;
+    const req_id: u64 = if (req.get_identifier) |gid| gid(req) else 0;
+    var method_buf: [8]u8 = undefined;
+    var method: []const u8 = "";
+    if (req.get_method) |gm| method = userfreeInto(gm(req), &method_buf);
+    const now = nowMs();
+    if (untrusted) {
+        const raw_rt = if (req.get_resource_type) |rt| rt(req) else cef.RT_SUB_RESOURCE;
+        const refusal: proto.NetReason = if (url_unf.len > URL_MAX)
+            .url_too_long
+        else if (untrustedPrivateAllowed(cef_id) == null)
+            .policy_refused
+        else if (host_mod.untrusted.restrictedRequest(raw_rt, url_unf, true) != null)
+            .untrusted_transport
+        else
+            .none;
+        if (refusal != .none) {
+            denyRequest(cef_id, refusal, req_id, rtype, method, url_unf, now);
+            return cef.RV_CANCEL;
+        }
+    }
 
     // AN EXTENSION'S OWN ORIGIN IS NEVER FILTERED. `filter.hostOf` sees
     // a 16-hex-digit host it cannot know anything about, the seed engine
@@ -1519,14 +2024,6 @@ pub fn onBeforeResourceLoad(
         const fp = filter.foldUrl(&fp_buf, userfreeInto(gfp(req), &fp_raw));
         doc_host = filter.hostOf(fp);
     }
-
-    var method_buf: [8]u8 = undefined;
-    var method: []const u8 = "";
-    if (req.get_method) |gm| method = userfreeInto(gm(req), &method_buf);
-
-    const rtype = if (req.get_resource_type) |grt| rtypeOf(grt(req)) else filter.RType.other;
-    const req_id: u64 = if (req.get_identifier) |gid| gid(req) else 0;
-    const now = nowMs();
 
     var verdict = false;
     var shield_on = true;
@@ -1582,13 +2079,17 @@ pub fn onBeforeResourceLoad(
                             }
                         }
                     }
-                    pol_reason = netpolicy.decide(pol, &s.pc, .{
+                    // An authority whose port does not parse cannot be
+                    // matched against a port-carrying entry: refused, named.
+                    const port: ?u16 = if (host.len == 0) 0 else urlhost.portOf(url);
+                    pol_reason = if (port) |p| netpolicy.decide(pol, &s.pc, .{
                         .host = host,
                         .scheme = netpolicy.schemeOf(url),
+                        .port = p,
                         .rtype = rtype,
                         .is_top = is_top,
                         .is_redirect_hop = is_hop,
-                    }, now);
+                    }, now) else .malformed_url;
                     if (pol_reason == .none) {
                         netpolicy.commit(&s.pc, is_top);
                     } else {
@@ -1603,37 +2104,14 @@ pub fn onBeforeResourceLoad(
             s.total +%= 1;
             if (verdict) s.blocked +%= 1;
             s.dirty = true;
-            if (s.ring) |ring| {
-                if (!verdict) {
-                    if (s.cap) |cs| {
-                        cap_store = cs.retain();
-                        cap_seq = s.next_seq;
-                    }
+            if (s.ring != null and !verdict) {
+                if (s.cap) |cs| {
+                    cap_store = cs.retain();
+                    cap_seq = s.next_seq;
                 }
-                const e = &ring[s.widx];
-                s.widx = (s.widx + 1) % NLOG;
-                e.* = .{
-                    .seq = s.next_seq,
-                    .req_id = req_id,
-                    .start_ms = now,
-                    .rtype = @intFromEnum(rtype),
-                    .blocked = verdict,
-                    // A blocked entry never completes; it is final now.
-                    .done = verdict,
-                    .reason = if (pol_reason != .none)
-                        @intFromEnum(pol_reason)
-                    else if (verdict)
-                        @intFromEnum(proto.NetReason.filter_list)
-                    else
-                        0,
-                };
-                s.next_seq +%= 1;
-                if (s.next_seq == 0) s.next_seq = 1;
-                e.method_len = @intCast(@min(method.len, e.method.len));
-                @memcpy(e.method[0..e.method_len], method[0..e.method_len]);
-                e.url_len = @intCast(@min(url_unf.len, e.url.len));
-                @memcpy(e.url[0..e.url_len], url_unf[0..e.url_len]);
             }
+            const reason: proto.NetReason = if (pol_reason != .none) pol_reason else if (verdict) .filter_list else .none;
+            logRequest(s, req_id, now, rtype, reason, method, url_unf);
         }
     }
     // Only a request that will reach the network can have a response to

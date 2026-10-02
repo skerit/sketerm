@@ -661,13 +661,38 @@ capability). Headless only; with a GUI it is `unavailable`, and
   built-in filter list, the same switch as `web_network`),
   `allow_schemes` (default http+https; `file` must be explicit),
   `allow_private_addresses` (default false), and the budgets
-  `max_requests`, `max_bytes`, `max_navigations`, `deadline_ms`. A host
-  list holds at most 64 entries and a `*` entry is refused. `about:` is always allowed: it is a view's own blank
-  document.
-- **Fail closed.** A helper without the capability, or a full policy
-  table, refuses the open and the view never loads a page; there is no
-  unpoliced fallback. The policy frame travels before the `view_create` naming
+  `max_requests`, `max_bytes`, `max_navigations`, `deadline_ms`, plus
+  `untrusted` (default false; the restricted mode below). Unknown keys
+  are errors. A host list holds at most 64 entries and a `*` entry is refused. Entries can carry
+  a port (`example.com:8443`, `[2001:db8::1]:443`). Explicit ports are
+  enforced in every mode. Bare entries allow all ports ordinarily, but
+  only the scheme's default port in untrusted mode. An IP-literal entry
+  matches that exact address (any spelling of it), never as a domain
+  suffix; a hostname entry never matches an address, and fragments such as
+  `0.1` are refused. Internationalized hosts must be given in punycode
+  (`xn--`) form. `about:` is always
+  allowed for the view's own blank document; it does not enable arbitrary
+  external protocols.
+- **Fail closed.** A helper without the capability refuses the open and
+  the view never loads a page; there is no unpoliced fallback. A full
+  policy table (32 policied views per helper) refuses only the view that
+  did not fit; the helper's other views keep working. The policy frame travels before the `view_create` naming
   the view, so it governs the very first request.
+- **Installation acknowledgement.** `capabilities.web_policy_ack` is the
+  current helper's verified `net-policy-ack` capability: null before its
+  handshake, then boolean (false with a GUI backend). Untrusted opens and
+  every live update require it. An untrusted initial install must receive
+  its correlated successful acknowledgement before a browser is created.
+  The client commits a live replacement only after its matching helper
+  acknowledgement, not after sending it. Refusal, timeout or allocation
+  failure closes the affected view fail-closed; rejected replacement or
+  loosening latches `policy_refused` in the helper. A successful tightening
+  preserves counters, the original deadline and exhaustion latches.
+  Policy-status queries are also correlated, so a late status reply cannot
+  satisfy a newer query. A status query (`web_policy`) only reads: when it
+  times out or reports the policy refused, the view and its policy are left
+  exactly as they were. Ordinary initial opens retain the ordered-frame
+  contract with helpers lacking the acknowledgement capability.
 - **Budgets latch.** Once one trips, `web_navigate`, `web_act`,
   `web_eval` and `web_wait for:"load"` answer `refused` with the
   numbers in the sentence; read tools keep answering and carry
@@ -686,11 +711,158 @@ capability). Headless only; with a GUI it is `unavailable`, and
   on the pinned CEF: a 302 target is its own gate entry, and the request
   id survives the chain, which is how a denial is named
   `redirect_host`); main-frame hops count toward `max_navigations`.
-- **Limits.** Traffic with no browser behind it (service workers, the
+- **Ordinary-mode limits.** Traffic with no browser behind it (service workers, the
   favicon fetcher's browserless probe) is not policed; a per-context
   resource handler would close that lane. Private-address refusal is
   literal-only: a hostname that resolves to a private address is not
   caught.
+
+### Untrusted Loading
+
+`web_open policy:{"untrusted":true} ephemeral:true route:"direct"` selects
+a dedicated restricted helper automatically. This is Linux-only and
+headless-only. Named profiles and the default identity are refused. Every
+view in that helper must carry an untrusted policy and an ephemeral identity.
+Ordinary route helpers remain separate; their existing behavior is unchanged,
+and ordinary and untrusted views can coexist with stable handles.
+
+The helper runs with `--untrusted`, software rendering, and no presenter,
+helper adoption, durable store or broker-owned persistent engine. Its
+renderers run Chromium's own namespace sandbox (user, PID and network
+namespaces plus seccomp-bpf), which ordinary helpers do not use: a renderer
+compromised by page script has no filesystem, no sockets of its own and no
+route to the user's sessions. That requires unprivileged user namespaces;
+without them Chromium refuses to start ("No usable sandbox") and the open
+fails, never falling back to an unsandboxed renderer. It also requires
+libcurl headers and a runtime library at least 7.85 with HTTP/HTTPS and TLS
+support, plus Linux seccomp TSYNC; unavailable prerequisites refuse startup,
+never fall back to the ordinary loader. The HTTP broker loads libcurl
+dynamically; the mux daemon gains no CEF or curl dependency.
+
+An independent subreaper supervisor creates and owns a fresh 0700 root at
+`$XDG_RUNTIME_DIR/sketerm/u/<16 hex>` (the parents must be 0700 and owned by
+the user, or the open is refused; a root whose `t` subdirectory would exceed
+60 bytes is refused too, because Chromium places sockets under it). The
+browser's `HOME`, `TMPDIR` and `XDG_*` directories all point into that root,
+so nothing Chromium writes outlives it, and the session bus, display, audio
+and sketerm socket variables are removed from its environment. Closing the
+last untrusted view terminates the helper. Last-view close, startup failure,
+helper/browser crash, MCP shutdown and MCP-parent SIGKILL all retire the
+supervised browser, broker and their descendants. Only after `waitpid`
+reports `ECHILD` does the supervisor delete the root, without following
+symlinks or crossing filesystems. Descendants are found through
+`/proc/self/task/*/children`, or a `/proc/*/stat` scan on kernels without
+it. Deletion repairs owner permissions it finds stripped and gives up after
+30 attempts; the supervisor then exits with status 251, which MCP logs, and
+the next untrusted supervisor sweeps such stale roots once their owner is
+gone. The supervisor does not depend on MCP running a shutdown handler.
+Every process starts with both soft and hard `RLIMIT_CORE` at zero (for
+which systemd-coredump stores no core). The browser turns nondumpable after
+initialization and each renderer at its first script context; zygotes stay
+dumpable, because a nondumpable process cannot map the namespace sandbox's
+user namespace. These are kernel core-dump controls, not a claim that every
+application crash reporter or external privileged collector can never write
+a file.
+
+`capabilities.web_untrusted` is a build fact: true when this server is a
+Linux headless backend with a resolvable helper binary, false otherwise,
+whichever engine is current. It is absent from builds without untrusted
+mode, so a client that requires it must treat a missing key as "no". Each
+open still requires the launched helper to advertise `untrusted-web` and
+fails closed otherwise. `web_policy_ack` independently reports
+`net-policy-ack`.
+`web_untrusted_mode` names the current engine's selected mode;
+selection alone is not a claim of enforcement. No unsupported helper may open
+an untrusted view. Setting `untrusted` in either direction on a live view is
+refused and requires a new dedicated instance. Unknown policy keys are errors.
+An omitted/empty top-level host list defaults to the URL's effective port as
+well as its host in untrusted mode.
+
+For a verified untrusted view, `web_policy.enforced` reports this matrix.
+The existing `internet_sockets`, `http_broker`, `service_workers`,
+`websockets`, `webrtc`, `extensions`, `methods`, `ranges`,
+`max_response_bytes` and `response_timeout_ms` facts remain compatible.
+False feature flags mean the operation or traffic is denied, not that the
+JavaScript API is necessarily absent. The explicit `disabled_lanes`, `cors`,
+`credentials`, `redirects`, `permissions`, `downloads` and `cleanup` facts
+describe the actual enforcement responsibility.
+
+| Lane | Untrusted contract |
+| --- | --- |
+| Native network | Seccomp denies Internet socket/socketpair creation in the browser and its subprocesses, including UDP/QUIC; inherited Internet sockets are refused and io_uring is denied. AF_UNIX IPC and NETLINK_ROUTE remain available. Only the separate HTTP broker has Internet sockets. |
+| Broker destinations | The policy checks scheme, host and effective port; the broker checks each actual binary IPv4/IPv6 socket address and port before connection. Private, loopback, link-local, mapped and special-purpose ranges, and every address currently assigned to one of this host's interfaces (a public address included), are refused by default, including hostname resolution and DNS rebinding. `allow_private_addresses:true` explicitly permits those addresses while retaining scheme, host, port and all other restrictions. |
+| Renderer sandbox | Renderers run Chromium's namespace sandbox (user/PID/network namespaces + seccomp-bpf) on top of the helper's socket filter. Reported as `renderer_sandbox`. |
+| Navigation | GET/HEAD and same-origin POST for top-level and subframe documents; CEF follows navigation redirects and every hop repeats policy and actual-address/port checks. |
+| Same-origin resources | GET/HEAD/POST using the native CEF initiator's exact scheme/host/port, with ephemeral context cookies. Author headers are validated; an `Origin` header is consistency-checked and never supplies authority. |
+| Cross-origin fetch/XHR | Denied before network, even with valid CORS headers, because CEF custom responses cannot faithfully preserve Fetch response tainting, opaque bodies or exposed-header semantics. |
+| Cross-origin images/media | Denied before network to avoid exposing unsafe canvas/media/body lanes. Same-origin images/media remain subject to attribution and policy. |
+| Workers/opaque documents | All worker HTTP(S) loads are denied. Navigation responses add a separate browser-enforced `Content-Security-Policy: worker-src 'none'`, preserving existing policies and blocking HTTP/blob worker bootstraps and inherited document cases. HTTP subresources with empty/null initiators are refused, including libraries requested directly from opaque documents. |
+| Cross-origin scripts/styles/fonts | GET only from HTTP(S) documents, with safelisted author headers, no HTTPS-to-HTTP downgrade, 2xx, exactly one `Access-Control-Allow-Origin: *` and matching MIME. Scripts require `text/javascript` or `application/javascript`; styles require `text/css`; fonts require `font/woff`, `font/woff2`, `font/ttf`, `font/otf` or `application/font-woff`. `Cross-Origin-Resource-Policy`, if present, must be `cross-origin`. Cookie/Referer request headers and Set-Cookie response headers are stripped; the broker supplies Origin from native initiator metadata. |
+| Non-navigation redirects | Denied, even same-origin; the broker never follows redirects itself. |
+| Unsupported HTTP | Ranges/partial responses, file uploads, URL userinfo, HTTP/proxy authentication and protocol upgrades are denied. The broker has no cookie jar, ignores ambient proxies and netrc, uses HTTP/1.1, and verifies TLS peer and hostname. `accept_cert` cannot loosen broker TLS verification. |
+| Unattributed/background traffic | Browserless loads, service-worker scripts/navigation preload, prefetch, favicon probes, and extension traffic are denied; context-level interception has no ordinary-network fallback. |
+| Alternate network lanes | WebSocket, WebRTC and WebTransport network traffic is denied by native socket confinement, not JavaScript constructor replacement. Preconnect/DNS-prefetch prediction is disabled; Chromium's network path cannot bypass the broker. Broker DNS resolution remains necessary for allowed HTTP requests. |
+| Permissions | All native permission/media-access prompts are denied. Fresh-context settings block USB, Bluetooth/scanning, HID, serial, NFC, notifications, geolocation, clipboard read, microphone/camera, MIDI sysex, sensors, filesystem access, background sync and direct sockets. Startup verifies effective settings; selected Blink APIs are disabled natively, not by injected JavaScript guards. Chromium may still grant sanitized clipboard writes without a prompt; `clipboard_sanitized_write` reports this limitation rather than claiming those writes are denied. |
+| Popups/downloads | Page popups and both page-initiated and client-requested downloads are denied, including blob downloads. No target file is authorized. |
+| Hard loader limits | At most 16 active broker jobs; further loads wait first-in first-out, up to 256, and past that are refused `untrusted_queue_full`. 8 KiB URLs (longer: `url_too_long`), 1 MiB byte-only upload, 64 KiB headers, 16 MiB decoded response and a 15-second deadline counted from when the load was opened, queueing and blocking resolver work included (`untrusted_timeout`). These are independent of policy budgets; oversize/unsupported responses fail rather than silently returning a prefix. Each broker job confines itself with Landlock where the kernel has it (no file writes, TCP only to the target port and DNS); a kernel without Landlock still loads, a failed Landlock setup refuses the load. |
+| Cleanup/core controls | Independent supervisor owns retirement and root deletion after all descendants are reaped, including MCP-parent SIGKILL. Deletion is bounded (exit 251, swept by the next supervisor). Kernel core limits are zero; browser and renderers are nondumpable as described above. |
+| Withheld helper requests | DevTools, PDF printing, WebExtensions, userscripts, observers and cookie sync are not advertised, and a request for one is refused at dispatch (`ev_request_refused`), never served. |
+
+Policy budgets and tighter-only patches still apply; no policy field can
+loosen these loader restrictions except the explicit private-address opt-in.
+Budget-refused navigation is canceled before replacing the readable document;
+native controller history operations use the same gate. Untrusted helpers
+disable back/forward caching so page-driven history restoration cannot skip
+the navigation hook. Native Chromium extensions and default background
+components are disabled in addition to withholding Sketerm extension APIs;
+this does not claim that Chromium contains no internal component-extension code.
+
+Untrusted refusals are counted in `web_policy` and `web_network` under these
+reasons, beside the ordinary ones: `resolved_private_address`,
+`untrusted_http` (an unsupported HTTP shape), `untrusted_transport` (a lane
+that is disabled outright), `untrusted_broker`, `untrusted_timeout`,
+`untrusted_queue_full`, `url_too_long`, `malformed_url` and `policy_refused`.
+
+The threat model is hostile web content under the native request/permission
+boundaries. A renderer exploit is contained by Chromium's sandbox; a chain
+that also escapes it (a browser-process or kernel exploit), a privileged or
+same-user native attacker passing descriptors over AF_UNIX, killing the cleanup supervisor itself, machine failure and an
+external privileged crash collector are outside that guarantee. Page-authored
+DOM, text and evaluated results remain untrusted data, not instructions.
+
+The tests do not download dependencies or fixtures:
+
+- `zig build test-web-untrusted-native` compiles and runs the native loader
+  and independent-supervisor C suites against the selected CEF headers and
+  runtime, without starting a browser.
+- `zig build test-web-untrusted-rig` runs
+  `dist/test-web-untrusted.py --rig-only`; it validates the test machinery,
+  not browser enforcement.
+- `zig build smoke-web-untrusted` builds fresh helper and GTK-free MCP
+  artifacts and runs the full browser matrix in rootless user/mount/network/PID
+  namespaces, with a private DNS resolver and real QUIC/WebTransport responder,
+  followed by native policy/media acknowledgement-failure tests. It requires
+  util-linux, iproute2, and Python `aioquic`/`cryptography`; dependencies are not
+  downloaded automatically. Host resolver files and interfaces are untouched.
+
+### View Emulation
+
+Headless `web_open` accepts `color_scheme:"light"|"dark"`,
+`reduced_motion:"reduce"|"no-preference"`, and numeric
+`device_scale_factor` from 0.5 through 4. Omitted settings keep engine defaults.
+These options require the verified `web-emulation` capability; an unsupported
+helper or GUI backend refuses the open, without loading a page. The settings
+are sent before view creation. A native DevTools MediaObserver must receive
+the matching successful execution acknowledgement within 5 seconds before
+the initial URL loads; submission alone is not success. Asynchronous refusal,
+timeout or agent detachment fails the affected view rather than exposing an
+unemulated initial document. `web_open` echoes the selected settings.
+Device scale uses native view geometry, not a JavaScript `devicePixelRatio`
+override; scale is rounded to thousandths and survives `web_resize`, with
+input and screenshot dimensions using the same geometry.
+`capabilities.web_emulation` is null until the helper handshake, then boolean.
+CEF applies media emulation internally through DevTools commands without
+opening a remote debugging port or installing page-side JavaScript guards.
 
 ## Sub-agents (`agent_*`)
 

@@ -70,6 +70,29 @@ skipping it produced a silent hang or an abort:
    process that keeps its GPU process paints EMPTY frames in windowless
    mode.
 
+`--untrusted` (the restricted helper, `cefhost/untrusted.zig` +
+`vendor/web_untrusted.c`) inserts three steps without moving
+`cef_api_hash` from being the first libcef call: the core-dump limit and
+the cleanup supervisor fork come BEFORE step 1 (only the original process
+owns cleanup; the re-exec and CEF subprocesses must never fork another),
+and the HTTP broker fork plus the seccomp socket confinement come after
+step 3 and before step 2, so no CEF thread or subprocess ever exists
+unconfined. Two constraints that come with it, both measured:
+
+- **Untrusted renderers run Chromium's namespace sandbox** (`no_sandbox`
+  is 0 only in that mode). NO_NEW_PRIVS rules out the setuid helper, and
+  a process with `PR_SET_DUMPABLE=0` cannot write the `uid_map` of a
+  child it puts in a new user namespace, so Chromium then aborts with
+  "No usable sandbox". The browser therefore turns non-dumpable only
+  after `cef_initialize` (its zygotes exist by then) and each renderer
+  only in `onContextCreated`; the inherited `RLIMIT_CORE=0` is what keeps
+  cores away before that (systemd-coredump stores none for it). A
+  sandboxed renderer may not call `setrlimit` at all.
+- Chromium ignores unknown switches silently. Check a new one with
+  `strings libcef.so | grep -x <name>` before relying on it;
+  `--disable-dns-prefetch` and `--disable-crash-reporter` both looked
+  plausible and do not exist.
+
 `cefargs.withDefaults` includes `--no-first-run` before either call. On a
 fresh cache, Chromium's first-run path can hold `cef_initialize` in a
 nested message loop forever, so the helper never binds its control socket.
@@ -1002,21 +1025,26 @@ Facts that bound the design, each measured:
   cap completes; the NEXT request is refused". The `deadline_ms` sweep
   (`flushNetPolicy`, once per poll) issues one `stop_load` for a load
   already streaming past its deadline.
-- **Slot-less traffic is unpoliced** (service workers, `cef_urlrequest`
-  — and, measured live: CEF's favicon fetcher probes through a
-  browserless URLRequest BESIDE the browser-path favicon request the
-  gate correctly denies). The per-context
-  `cef_request_context_handler_t::get_resource_request_handler` is the
-  follow-up that would close this lane.
-- **Private-address refusal is LITERAL only** (loopback/RFC1918/
-  link-local/ULA text, `localhost`/`*.local`/`*.internal`): no
+- **In ORDINARY mode slot-less traffic is unpoliced** (service workers,
+  `cef_urlrequest` — and, measured live: CEF's favicon fetcher probes
+  through a browserless URLRequest BESIDE the browser-path favicon
+  request the gate correctly denies). Untrusted mode closes that lane
+  with the per-context
+  `cef_request_context_handler_t::get_resource_request_handler` and
+  `disable_default_handling`, so browserless loads have no fallback.
+- **In ORDINARY mode private-address refusal is LITERAL only**: no
   resolver runs on this path, so a hostname that merely RESOLVES to a
-  private address passes the address check — the positive host
-  allow-list is the real defence, and the tool description says so.
+  private address passes — the positive host allow-list is the real
+  defence. The literal classifier in `netpolicy.zig` mirrors the C
+  connect-time one in `vendor/web_untrusted.c` range for range (a table
+  test pins it); the C one is what untrusted mode enforces, on the actual
+  socket address, plus this host's own interface addresses.
 - The policy install is `net_policy_set` BEFORE the `view_create*`
-  naming the view (frame order is the guarantee; there is no ack); the
-  slot is found-or-created so the pre-create frame sticks — the same
-  fix `intercept_set` needed for a pre-create shield toggle.
+  naming the view; the slot is found-or-created so the pre-create frame
+  sticks — the same fix `intercept_set` needed for a pre-create shield
+  toggle. With `net-policy-ack` the install and every replacement are
+  answered by a serial-correlated ack, and an untrusted view is created
+  only after its install was acknowledged.
 
 - **There is no per-origin cache clear.** `cef_request_context_t` has
   exactly one cache verb, `clear_http_cache`, and it drops the WHOLE
@@ -1532,10 +1560,10 @@ costs the caller its entire 120s deadline and explains nothing.
   the next visit — except on a PRIVATE page (`WebFace.isPrivate`: an
   incognito container or an observed assistant page), whose answers
   apply to that page alone.
-- **`ev_popup_request` carries an OPTIONAL TRAILING `user_gesture`
-  byte**, and its decoder treats a short payload as "field absent,
-  assume a gesture". That is the only frame on this wire allowed to
-  grow, and only because the reader tolerates the old length: an
+- **A frame may grow only by OPTIONAL TRAILING fields whose decoder
+  treats a short payload as "field absent".** `ev_popup_request`'s
+  `user_gesture` byte, `NetPolicyReq.serial` and `EvNetPolicy`'s counter
+  array (12 legacy counters, or the full set) are the instances. An
   existing field may still never be widened, reordered or removed.
 - CEF types stay inside this directory — that seam is what keeps a
   future engine swap to a new helper binary rather than a rewrite.

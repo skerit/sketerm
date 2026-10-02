@@ -242,6 +242,10 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
     else
         try res.fact("web_watch", web_watch);
     try res.fact("web_engine_started", engine_started);
+    try res.fact("web_untrusted", @import("mcp_web.zig").restrictedCapability(.untrusted_web));
+    try res.fact("web_policy_ack", @import("mcp_web.zig").restrictedCapability(.net_policy_ack));
+    try res.fact("web_emulation", @import("mcp_web.zig").restrictedCapability(.web_emulation));
+    try res.fact("web_untrusted_mode", @import("mcp_web.zig").untrustedMode());
     try res.fact("web_review", .{ .inspection = true, .checkpoints = true, .evidence_export = true, .requires_helper_capability = "review", .gui_console = false });
     try res.fact("web_diagnostics", .{ .direct_capture = true, .broker_capture = "requires engine_open diagnostics capability", .gui_capture = false, .retention = "last attempt per route until next attempt or MCP shutdown" });
     if (web_ok and !gui_web and !engine_started)

@@ -16,4 +16,8 @@ pub const main = @import("web/main.zig").main;
 test {
     _ = @import("web/cefhost.zig");
     _ = @import("web/cefhost/semlayer.zig");
+    _ = @import("web/cefhost/intercept.zig");
+    _ = @import("web/cefhost/downloads.zig");
+    _ = @import("web/cefhost/untrusted.zig");
+    _ = @import("web/cefhost/emulation.zig");
 }

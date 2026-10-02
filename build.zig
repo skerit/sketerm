@@ -1153,7 +1153,7 @@ pub fn build(b: *std.Build) void {
     // step, the binary distribution is never downloaded unless the fetch
     // step is asked for by name, and the CEF headers are only translated
     // when that distribution is already on disk.
-    addCef(b, target, optimize, strip, use_lld, core_cbindings_mod, mux_exe, smoke_mcp_run, &test_roots.step, &lint_errdefer.step);
+    addCef(b, target, optimize, strip, use_lld, core_cbindings_mod, mux_exe, mcp_exe, smoke_mcp_run, &test_roots.step, &lint_errdefer.step);
 }
 
 /// Pinned CEF binary distribution ("minimal" distro). SINGLE source of
@@ -1227,6 +1227,7 @@ fn addCef(
     use_lld: bool,
     core_cbindings_mod: *std.Build.Module,
     mux_exe: *std.Build.Step.Compile,
+    mcp_exe: *std.Build.Step.Compile,
     smoke_mcp_run: *std.Build.Step.Run,
     test_roots: *std.Build.Step,
     lint_errdefer: *std.Build.Step,
@@ -1404,6 +1405,23 @@ fn addCef(
     test_web_step.dependOn(lint_errdefer);
     const smoke_web_step = b.step("smoke-web", "browser-helper end-to-end smoke (headless)");
     const bench_wreq_step = b.step("bench-webreq", "Blocking-webRequest added-latency benchmark (real helper, real page)");
+    const native_untrusted_step = if (target.result.os.tag == .linux)
+        b.step("test-web-untrusted-native", "Run restricted-loader and cleanup-supervisor native C tests (Linux, needs CEF)")
+    else
+        null;
+    const smoke_untrusted_step = if (target.result.os.tag == .linux)
+        b.step("smoke-web-untrusted", "Run the full restricted-browser Python suite against fresh helper/MCP artifacts (Linux)")
+    else
+        null;
+    if (target.result.os.tag == .linux) {
+        const rig = b.addSystemCommand(&.{"python3"});
+        rig.addFileArg(b.path("dist/test-web-untrusted.py"));
+        rig.addArg("--rig-only");
+        rig.setEnvironmentVariable("PYTHONDONTWRITEBYTECODE", "1");
+        rig.has_side_effects = true;
+        const rig_step = b.step("test-web-untrusted-rig", "Run restricted-browser fixture/RPC/PID rig tests only (Linux, no browser)");
+        rig_step.dependOn(&rig.step);
+    }
 
     // The engine binary this platform actually ships: an ELF shared
     // object on Linux, an unversioned framework bundle on macOS.
@@ -1481,6 +1499,8 @@ fn addCef(
         test_web_step.dependOn(&missing.step);
         smoke_web_step.dependOn(&missing.step);
         bench_wreq_step.dependOn(&missing.step);
+        if (native_untrusted_step) |step| step.dependOn(&missing.step);
+        if (smoke_untrusted_step) |step| step.dependOn(&missing.step);
         return;
     }
 
@@ -1520,6 +1540,15 @@ fn addCef(
     // this module also carries are never referenced, so nothing extra
     // links.
     web_mod.addImport("cbindings", core_cbindings_mod);
+    web_mod.addIncludePath(.{ .cwd_relative = include_root });
+    web_mod.addCSourceFile(.{
+        .file = b.path("vendor/web_untrusted.c"),
+        .flags = &.{ "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror" },
+    });
+    web_mod.addCSourceFile(.{
+        .file = b.path("vendor/web_supervisor.c"),
+        .flags = &.{ "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror" },
+    });
     // Raw-deflate codec for inline frames (frames-inline): the same
     // pure-std module pool updates on the native app pipe use. A named
     // module because src/wlhost/ sits outside the helper's module root.
@@ -1615,6 +1644,50 @@ fn addCef(
     // Installed by the `web` step only — never by `b.installArtifact`,
     // which would drag CEF into the default build.
     web_step.dependOn(&b.addInstallArtifact(web_exe, .{}).step);
+
+    if (native_untrusted_step) |step| {
+        // Keep C assertions active even when the surrounding build is ReleaseFast.
+        const flags = &.{ "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-UNDEBUG" };
+        const loader_mod = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true });
+        loader_mod.addIncludePath(.{ .cwd_relative = include_root });
+        loader_mod.addCSourceFile(.{ .file = b.path("dist/test-web-untrusted.c"), .flags = flags });
+        loader_mod.addLibraryPath(.{ .cwd_relative = release_dir });
+        loader_mod.addRPath(.{ .cwd_relative = runtime_dir });
+        for ([_][]const u8{ "cef", "dl", "pthread", "z", "ssl", "crypto" }) |lib| loader_mod.linkSystemLibrary(lib, .{});
+        const loader = b.addExecutable(.{ .name = "test-web-untrusted-native", .root_module = loader_mod, .use_lld = use_lld });
+        loader.rdynamic = true; // The DNS cancellation fixture interposes getaddrinfo.
+        const loader_run = b.addRunArtifact(loader);
+        loader_run.has_side_effects = true;
+        step.dependOn(&loader_run.step);
+
+        const supervisor_mod = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true });
+        supervisor_mod.addCSourceFile(.{ .file = b.path("dist/test-web-supervisor.c"), .flags = flags });
+        supervisor_mod.addCSourceFile(.{ .file = b.path("vendor/web_supervisor.c"), .flags = flags });
+        const supervisor = b.addExecutable(.{ .name = "test-web-supervisor", .root_module = supervisor_mod, .use_lld = use_lld });
+        const supervisor_run = b.addRunArtifact(supervisor);
+        supervisor_run.has_side_effects = true;
+        step.dependOn(&supervisor_run.step);
+        test_web_step.dependOn(step);
+    }
+    if (smoke_untrusted_step) |step| {
+        const smoke = b.addSystemCommand(&.{"bash"});
+        smoke.addFileArg(b.path("dist/test-web-untrusted-netns.sh"));
+        smoke.addArg("--bin-dir");
+        smoke.addDirectoryArg(mcp_exe.getEmittedBin().dirname());
+        smoke.addArg("--helper");
+        smoke.addArtifactArg(web_exe);
+        smoke.setEnvironmentVariable("PYTHONDONTWRITEBYTECODE", "1");
+        smoke.has_side_effects = true;
+        const acks = b.addSystemCommand(&.{ "python3", "-B" });
+        acks.addFileArg(b.path("dist/test-web-untrusted-acks.py"));
+        acks.addArg("--bin-dir");
+        acks.addDirectoryArg(mcp_exe.getEmittedBin().dirname());
+        acks.addArg("--helper");
+        acks.addArtifactArg(web_exe);
+        acks.has_side_effects = true;
+        acks.step.dependOn(&smoke.step);
+        step.dependOn(&acks.step);
+    }
 
     // macOS: the bare executable in `zig-out/bin/` CANNOT RUN. Chromium
     // resolves icudtl.dat and its .pak files through the framework

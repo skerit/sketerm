@@ -71,6 +71,62 @@ pub fn hostOf(url: []const u8, opts: Options) []const u8 {
     return s;
 }
 
+pub const Authority = struct { host: []const u8, port: u16 = 0 };
+
+/// Parse a host entry without mistaking an unbracketed IPv6 literal for a port.
+pub fn authorityOf(entry: []const u8) ?Authority {
+    if (entry.len == 0) return null;
+    var host = entry;
+    var port_text: ?[]const u8 = null;
+    if (entry[0] == '[') {
+        const end = std.mem.indexOfScalar(u8, entry, ']') orelse return null;
+        host = entry[1..end];
+        if (host.len == 0 or std.mem.indexOfScalar(u8, host, ':') == null) return null;
+        if (end + 1 < entry.len) {
+            if (entry[end + 1] != ':') return null;
+            port_text = entry[end + 2 ..];
+        }
+    } else if (std.mem.count(u8, entry, ":") == 1) {
+        const colon = std.mem.indexOfScalar(u8, entry, ':').?;
+        host = entry[0..colon];
+        port_text = entry[colon + 1 ..];
+    }
+    if (host.len == 0) return null;
+    var port: u16 = 0;
+    if (port_text) |s| {
+        if (s.len == 0) return null;
+        for (s) |ch| if (!std.ascii.isDigit(ch)) return null;
+        port = std.fmt.parseInt(u16, s, 10) catch return null;
+        if (port == 0) return null;
+    }
+    return .{ .host = host, .port = port };
+}
+
+pub fn defaultPort(scheme: []const u8) u16 {
+    if (std.ascii.eqlIgnoreCase(scheme, "http") or std.ascii.eqlIgnoreCase(scheme, "ws")) return 80;
+    if (std.ascii.eqlIgnoreCase(scheme, "https") or std.ascii.eqlIgnoreCase(scheme, "wss")) return 443;
+    return 0;
+}
+
+/// Return the effective authority port, with null distinguishing malformed authorities.
+pub fn portOf(url: []const u8) ?u16 {
+    const raw = hostOf(url, .{ .require_scheme = true, .keep_port = true });
+    const authority = authorityOf(raw) orelse return null;
+    if (authority.port != 0) return authority.port;
+    const colon = std.mem.indexOfScalar(u8, url, ':') orelse return 0;
+    return defaultPort(url[0..colon]);
+}
+
+test "authority ports distinguish IPv6 literals, defaults and malformed ports" {
+    const t = std.testing;
+    try t.expectEqual(@as(?u16, 443), portOf("https://u:p@example.com/path"));
+    try t.expectEqual(@as(?u16, 8443), portOf("https://[2001:db8::1]:8443/"));
+    try t.expectEqual(@as(u16, 0), authorityOf("2001:db8::1").?.port);
+    try t.expectEqualStrings("2001:db8::1", authorityOf("[2001:db8::1]:443").?.host);
+    for ([_][]const u8{ "host:", "host:0", "host:65536", "host:+80", "[::1]x", "[::1" }) |s|
+        try t.expect(authorityOf(s) == null);
+}
+
 // ---------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------

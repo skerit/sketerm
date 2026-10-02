@@ -20,6 +20,16 @@ const adapter = @import("../agent/adapter.zig");
 const retry = @import("../agent/retry.zig");
 const transport = @import("transport.zig");
 const sshmaster = @import("../mux/sshmaster.zig");
+const web_proto = @import("../web/protocol.zig");
+
+/// Every name `web_proto.reasonName` can render (each `NetReason`, plus
+/// "unknown" for a newer helper's byte), as a JSON enum body: generated, so
+/// `web_policy`/`web_network` cannot drift from the wire vocabulary.
+const NET_REASON_ENUM = blk: {
+    var out: []const u8 = "";
+    for (std.meta.fields(web_proto.NetReason)) |f| out = out ++ "\"" ++ f.name ++ "\",";
+    break :blk out ++ "\"unknown\"";
+};
 
 const REVIEW_INPUT =
     \\{"type":"object","properties":{"pane":{"type":"integer"},"view":{"type":"integer"},"id":{"type":"string"},"selector":{"type":"string"},"ready_selector":{"type":"string"},"url_contains":{"type":"string"},"expect_preserved":{"type":"boolean"},"timeout_ms":{"type":"integer"},"screenshot":{"type":"boolean"},"out_dir":{"type":"string"}}}
@@ -265,7 +275,7 @@ const AGENT_FILTER_INPUT =
     \\"match":{"type":"string","description":"Also wake on a completed message containing this text (case-insensitive)"},"messages":{"type":"boolean","description":"Also wake on every completed message (rate limited: burst 3, then 1 per 30 s; the rest arrive as a digest)"},"retrying":{"type":"boolean","description":"Also wake on an error the agent recovers from by itself (class retrying: a provider overloaded, retrying); without it only the retrying STATE shows, and a retry that turns into a real error or limit still wakes"}
 ;
 
-pub const TOOLS = [_]ToolDef{
+const TOOL_DECLS = [_]ToolDef{
     // ── panes: the running GUI's tabs and panes ────────────────────
     .{
         .name = "list_terminals",
@@ -1788,7 +1798,9 @@ pub const TOOLS = [_]ToolDef{
         \\{"type":"object","properties":{"pane":{"type":"integer","description":"View handle; omit for the current view"},"view":{"type":"integer","description":"Synonym for 'pane'"},"profile":{"type":"string","description":"Report this profile's session-default policy instead of a view"}}}
         ,
         .output_schema =
-        \\{"type":"object","properties":{"backend":{"type":"string","enum":["gui","headless"]},"pane":{"type":"integer"},"view":{"type":"integer"},"origin":{"type":"string"},"url":{"type":"string"},"title":{"type":"string"},"loading":{"type":"boolean"},"route":{"type":"string","description":"This tab's network route: direct | tor | via:<host> | on:<host>"},"policy_exhausted":{"type":"boolean"},"policy_exhausted_reason":{"type":"string"},"cert":{"type":"object","description":"Certificate verdict on the current navigation (absent when none was raised). state: pending = the helper HOLDS the load until the user answers the GUI interstitial; refused = headless default, the load failed closed; accepted = accept_cert matched","properties":{"state":{"type":"string","enum":["pending","refused","accepted"]},"code":{"type":"integer"},"url":{"type":"string"},"host":{"type":"string"},"msg":{"type":"string","description":"Symbolic engine error, e.g. CERT_AUTHORITY_INVALID"},"subject":{"type":"string"},"issuer":{"type":"string"},"fingerprint":{"type":"string","description":"SHA-256, 64 hex digits: what web_open accept_cert takes"}}},"load_error":{"type":"object","description":"The last main-frame load failure on this view, cleared by the next started load","properties":{"code":{"type":"integer"},"url":{"type":"string"},"msg":{"type":"string"}}},"load_retry":{"type":"object","description":"Headless only: the browser reloaded the main frame ONCE after ERR_NETWORK_CHANGED (a local network interface came or went, e.g. a container starting) during the navigation this client last asked for; in-page fetches at that moment failed too. Absent when no retry happened; cleared by the next navigation request","properties":{"code":{"type":"integer"},"url":{"type":"string"},"msg":{"type":"string"}}},"policy_active":{"type":"boolean"},"policy_source":{"type":"string","enum":["call","profile_default","none"]},"policy_serial":{"type":"integer"},"policy":{"type":"object"},"profile":{"type":"string"},"requests":{"type":"integer"},"bytes":{"type":"integer"},"navigations":{"type":"integer"},"ms_left":{"type":"integer","description":"Of deadline_ms; 0 when none is set or when it ran out (exhausted disambiguates)"},"exhausted":{"type":"boolean"},"exhausted_reason":{"type":"string","enum":["none","request_cap","byte_cap","nav_cap","deadline"]},"denied":{"type":"object","description":"Refusals by reason since the policy was installed"},"durable":{"type":"boolean","description":"Always false: policies and profile defaults live for this MCP server's lifetime only, by design"}},"required":["backend","policy_active"]}
+        \\{"type":"object","properties":{"backend":{"type":"string","enum":["gui","headless"]},"pane":{"type":"integer"},"view":{"type":"integer"},"origin":{"type":"string"},"url":{"type":"string"},"title":{"type":"string"},"loading":{"type":"boolean"},"route":{"type":"string","description":"This tab's network route: direct | tor | via:<host> | on:<host>"},"policy_exhausted":{"type":"boolean"},"policy_exhausted_reason":{"type":"string"},"cert":{"type":"object","description":"Certificate verdict on the current navigation (absent when none was raised). state: pending = the helper HOLDS the load until the user answers the GUI interstitial; refused = headless default, the load failed closed; accepted = accept_cert matched","properties":{"state":{"type":"string","enum":["pending","refused","accepted"]},"code":{"type":"integer"},"url":{"type":"string"},"host":{"type":"string"},"msg":{"type":"string","description":"Symbolic engine error, e.g. CERT_AUTHORITY_INVALID"},"subject":{"type":"string"},"issuer":{"type":"string"},"fingerprint":{"type":"string","description":"SHA-256, 64 hex digits: what web_open accept_cert takes"}}},"load_error":{"type":"object","description":"The last main-frame load failure on this view, cleared by the next started load","properties":{"code":{"type":"integer"},"url":{"type":"string"},"msg":{"type":"string"}}},"load_retry":{"type":"object","description":"Headless only: the browser reloaded the main frame ONCE after ERR_NETWORK_CHANGED (a local network interface came or went, e.g. a container starting) during the navigation this client last asked for; in-page fetches at that moment failed too. Absent when no retry happened; cleared by the next navigation request","properties":{"code":{"type":"integer"},"url":{"type":"string"},"msg":{"type":"string"}}},"policy_active":{"type":"boolean"},"policy_source":{"type":"string","enum":["call","profile_default","none"]},"policy_serial":{"type":"integer"},"policy":{"type":"object"},"profile":{"type":"string"},"requests":{"type":"integer"},"bytes":{"type":"integer"},"navigations":{"type":"integer"},"ms_left":{"type":"integer","description":"Of deadline_ms; 0 when none is set or when it ran out (exhausted disambiguates)"},"exhausted":{"type":"boolean"},"exhausted_reason":{"type":"string","enum":[
+        ++ NET_REASON_ENUM ++
+            \\]},"denied":{"type":"object","description":"Refusals by reason since the policy was installed"},"durable":{"type":"boolean","description":"Always false: policies and profile defaults live for this MCP server's lifetime only, by design"}},"required":["backend","policy_active"]}
         ,
     },
     .{
@@ -2044,7 +2056,9 @@ pub const TOOLS = [_]ToolDef{
         \\{"type":"object","properties":{"pane":{"type":"integer"},"action":{"type":"string","enum":["enable","disable","toggle","status"]},"since":{"type":"integer","description":"Only entries with seq greater than this (from a previous next_seq)"},"max":{"type":"integer","description":"Max entries, default 50, cap 128"},"timeout_ms":{"type":"integer"}}}
         ,
         .output_schema = WEB_RESULT_HEAD ++
-            \\"blocking_enabled":{"type":"boolean"},"blocked":{"type":"integer"},"total_requests":{"type":"integer"},"rules_loaded":{"type":"integer"},"next_seq":{"type":"integer","description":"Pass as 'since' next time for only newer entries"},"requests":{"type":"array","items":{"type":"object","properties":{"seq":{"type":"integer"},"blocked":{"type":"boolean"},"type":{"type":"string"},"method":{"type":"string"},"url":{"type":"string"},"status":{"type":"integer"},"duration_ms":{"type":"integer"},"size":{"type":"integer"},"pending":{"type":"boolean"},"reason":{"type":"string","enum":["none","filter_list","top_host","sub_host","resource_type","private_address","scheme","redirect_host","request_cap","byte_cap","nav_cap","deadline"],"description":"Why a blocked entry was refused (filter_list = the adblock engine; everything else = the enforced policy)"}},"required":["seq","blocked","type","method","url"]}}},"required":["backend","origin","url","title","loading","blocking_enabled","blocked","total_requests","rules_loaded"]}
+            \\"blocking_enabled":{"type":"boolean"},"blocked":{"type":"integer"},"total_requests":{"type":"integer"},"rules_loaded":{"type":"integer"},"next_seq":{"type":"integer","description":"Pass as 'since' next time for only newer entries"},"requests":{"type":"array","items":{"type":"object","properties":{"seq":{"type":"integer"},"blocked":{"type":"boolean"},"type":{"type":"string"},"method":{"type":"string"},"url":{"type":"string"},"status":{"type":"integer"},"duration_ms":{"type":"integer"},"size":{"type":"integer"},"pending":{"type":"boolean"},"reason":{"type":"string","enum":[
+        ++ NET_REASON_ENUM ++
+            \\],"description":"Why a blocked entry was refused (filter_list = the adblock engine; everything else = the enforced policy)"}},"required":["seq","blocked","type","method","url"]}}},"required":["backend","origin","url","title","loading","blocking_enabled","blocked","total_requests","rules_loaded"]}
         ,
     },
     .{
@@ -2078,6 +2092,59 @@ pub const TOOLS = [_]ToolDef{
         ,
     },
 };
+
+pub const TOOLS = blk: {
+    @setEvalBranchQuota(4_000_000);
+    var tools = TOOL_DECLS;
+    for (&tools) |*tool| {
+        if (std.mem.eql(u8, tool.name, "web_open")) {
+            tool.input_schema = schemaProperties(tool.input_schema,
+                \\"color_scheme":{"type":"string","enum":["light","dark"],"description":"Headless only; applied before the first document, requires web-emulation"},"reduced_motion":{"type":"string","enum":["reduce","no-preference"]},"device_scale_factor":{"type":"number","minimum":0.5,"maximum":4},
+            );
+            tool.input_schema = schemaInsert(tool.input_schema, "\"policy\":{", "\"additionalProperties\":false,");
+            tool.input_schema = schemaReplace(tool.input_schema, "\"properties\":{\"allow_hosts\":", "\"properties\":{\"untrusted\":{\"type\":\"boolean\",\"description\":\"Linux-only restricted loader; requires ephemeral:true and route direct\"},\"allow_hosts\":");
+            tool.input_schema = schemaReplace(tool.input_schema, "Bare lower-case host names or IP literals; no '*', scheme, port or path", "Host or host:port entries; bracket IPv6 with a port. No wildcard, scheme or path. Explicit ports apply in all modes; bare entries allow all ports ordinarily, default ports only when untrusted. The URL default retains its effective port when untrusted");
+            tool.output_schema = schemaProperties(tool.output_schema.?,
+                \\"untrusted":{"type":"boolean"},"color_scheme":{"type":"string","enum":["light","dark"]},"reduced_motion":{"type":"string","enum":["reduce","no-preference"]},"device_scale_factor":{"type":"number","minimum":0.5,"maximum":4},
+            );
+            tool.description = tool.description ++ " Untrusted loading: policy.untrusted:true requires Linux, ephemeral:true, route direct and verified untrusted-web + net-policy-ack capabilities. It uses a dedicated restricted helper, native socket confinement and a separate address-validating HTTP broker. Cross-origin fetch/XHR/images/media and all worker networking are denied; cross-origin GET scripts/styles/fonts from HTTP(S) documents require exactly one ACAO:*, matching MIME and 2xx. Downloads, popups, native permission prompts and clipboard reads are denied; CEF may allow sanitized clipboard writes. web_policy.enforced names the full contract and limits. Native-code exploits are outside this protection. Emulation options are headless-only and require web-emulation; media execution is acknowledged before the initial URL loads, with a 5s deadline. Scale 0.5..4 uses native view geometry and survives resize.";
+        }
+        if (std.mem.eql(u8, tool.name, "capabilities")) tool.output_schema = schemaProperties(tool.output_schema.?,
+            \\"web_untrusted":{"type":"boolean","description":"This build can open untrusted views here: Linux headless backend with a resolvable helper. Each open still requires the launched helper to advertise untrusted-web and fails closed otherwise. Absent in sketerm builds without untrusted mode"},"web_policy_ack":{"type":["boolean","null"],"description":"Verified net-policy-ack capability of the current helper; null before handshake. Required for untrusted opens and all live policy updates"},"web_untrusted_mode":{"type":"boolean","description":"The current engine was launched in untrusted mode; selection is not verification"},"web_emulation":{"type":["boolean","null"]},
+        );
+        if (std.mem.eql(u8, tool.name, "web_policy")) {
+            tool.output_schema = schemaProperties(tool.output_schema.?,
+                \\"enforced":{"type":"object","description":"Verified untrusted-view contract; legacy false feature flags describe denied operation/traffic, not absence of JavaScript APIs","properties":{
+            ++
+                \\"internet_sockets":{"type":"string"},"http_broker":{"type":"string"},"service_workers":{"type":"boolean"},"websockets":{"type":"boolean"},"webrtc":{"type":"boolean"},"extensions":{"type":"boolean"},"methods":{"type":"string"},"ranges":{"type":"boolean"},"navigation_methods":{"type":"string"},"same_origin_methods":{"type":"string"},
+            ++
+                \\"cors":{"type":"object","properties":{"cross_origin_fetch_xhr":{"type":"string"},"cross_origin_images_media_workers":{"type":"string"},"worker_network":{"type":"string"},"opaque_initiator_subresources":{"type":"string"},"cross_origin_scripts_styles_fonts":{"type":"string"},"response_tainting":{"type":"string"},"initiator":{"type":"string"}}},"disabled_lanes":{"type":"array","items":{"type":"string"}},"credentials":{"type":"object","properties":{"same_origin":{"type":"string"},"cross_origin_request":{"type":"string"},"cross_origin_response":{"type":"string"},"authentication":{"type":"string"}}},"redirects":{"type":"object","properties":{"navigation":{"type":"string"},"non_navigation":{"type":"string"}}},
+            ++
+                \\"permissions":{"type":"string"},"clipboard_read":{"type":"string"},"clipboard_sanitized_write":{"type":"string"},"downloads":{"type":"string"},"popups":{"type":"string"},"file_uploads":{"type":"boolean"},"upgrades":{"type":"boolean"},"max_active_jobs":{"type":"integer"},"max_queued_jobs":{"type":"integer","description":"Loads that wait FIFO behind the active ones; past it a load is refused untrusted_queue_full"},"max_url_bytes":{"type":"integer","description":"Longer urls are refused url_too_long"},"max_upload_bytes":{"type":"integer"},"max_response_bytes":{"type":"integer"},"response_bytes":{"type":"string"},"response_timeout_ms":{"type":"integer"},"cleanup":{"type":"object","properties":{"owner":{"type":"string"},"delete_after":{"type":"string"},"events":{"type":"array","items":{"type":"string"}},"filesystem_failure":{"type":"string"}}},"kernel_core_limit_bytes":{"type":"integer"},"nondumpable":{"type":"string"},"renderer_sandbox":{"type":"string","description":"Untrusted renderers run Chromium's own sandbox"},"destinations":{"type":"string"}}},
+            );
+            tool.description = tool.description ++ " For a verified untrusted view, enforced reports native socket/broker restrictions, allowed request lanes, CORS limitations, stripped credentials, redirects, denied permissions/downloads, response limits and independent supervisor cleanup. Legacy false flags mean unusable operations/traffic, not removed JavaScript APIs. Status queries are correlated to the current request.";
+        }
+        if (std.mem.eql(u8, tool.name, "web_policy_set")) {
+            tool.input_schema = schemaInsert(tool.input_schema, "\"policy\":{", "\"properties\":{\"untrusted\":{\"type\":\"boolean\",\"description\":\"Immutable on live views; requires a new dedicated instance\"}},");
+            tool.description = tool.description ++ " Live updates require verified net-policy-ack (capabilities.web_policy_ack). The client commits only after the matching helper acknowledgement; refusal, allocation failure or timeout fails closed rather than reporting applied. Successful tightening preserves counters, deadline and exhaustion latches. Untrusted policies cannot be profile defaults.";
+        }
+    }
+    break :blk tools;
+};
+
+fn schemaProperties(comptime schema: []const u8, comptime fields: []const u8) []const u8 {
+    return schemaInsert(schema, "\"properties\":{", fields);
+}
+
+fn schemaInsert(comptime schema: []const u8, comptime needle: []const u8, comptime fields: []const u8) []const u8 {
+    const at = (std.mem.indexOf(u8, schema, needle) orelse @compileError("missing schema insertion point: " ++ needle)) + needle.len;
+    return schema[0..at] ++ fields ++ schema[at..];
+}
+
+fn schemaReplace(comptime schema: []const u8, comptime needle: []const u8, comptime replacement: []const u8) []const u8 {
+    const at = std.mem.indexOf(u8, schema, needle) orelse @compileError("missing schema replacement point: " ++ needle);
+    return schema[0..at] ++ replacement ++ schema[at + needle.len ..];
+}
 
 // ── generated tools/list JSON ─────────────────────────────────────
 
@@ -2301,6 +2368,69 @@ test "every tool is uniquely named, described and grouped" {
     }
     try testing.expect(find("capabilities") != null);
     try testing.expect(find("no_such_tool") == null);
+}
+
+test "restricted web schemas expose nullable policy acknowledgements and explicit enforcement lanes" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const caps = try std.json.parseFromSliceLeaky(std.json.Value, arena, find("capabilities").?.output_schema.?, .{});
+    try testing.expectEqualStrings("boolean", caps.object.get("properties").?.object.get("web_untrusted").?.object.get("type").?.string);
+    for ([_][]const u8{ "web_policy_ack", "web_emulation" }) |name| {
+        const types = caps.object.get("properties").?.object.get(name).?.object.get("type").?.array.items;
+        try testing.expectEqual(@as(usize, 2), types.len);
+        try testing.expectEqualStrings("boolean", types[0].string);
+        try testing.expectEqualStrings("null", types[1].string);
+    }
+    const policy = try std.json.parseFromSliceLeaky(std.json.Value, arena, find("web_policy").?.output_schema.?, .{});
+    const enforced = policy.object.get("properties").?.object.get("enforced").?.object;
+    const props = enforced.get("properties").?.object;
+    for ([_][]const u8{ "internet_sockets", "http_broker", "methods", "navigation_methods", "same_origin_methods", "permissions", "downloads", "popups", "response_bytes", "nondumpable", "renderer_sandbox", "destinations" }) |name|
+        try testing.expectEqualStrings("string", props.get(name).?.object.get("type").?.string);
+    for ([_][]const u8{ "service_workers", "websockets", "webrtc", "extensions", "ranges", "file_uploads", "upgrades" }) |name|
+        try testing.expectEqualStrings("boolean", props.get(name).?.object.get("type").?.string);
+    for ([_][]const u8{ "max_active_jobs", "max_queued_jobs", "max_url_bytes", "max_upload_bytes", "max_response_bytes", "response_timeout_ms", "kernel_core_limit_bytes" }) |name|
+        try testing.expectEqualStrings("integer", props.get(name).?.object.get("type").?.string);
+    for ([_][]const u8{ "cors", "credentials", "redirects", "cleanup" }) |name| {
+        const field = props.get(name).?.object;
+        try testing.expectEqualStrings("object", field.get("type").?.string);
+        try testing.expect(field.get("properties").?.object.count() > 0);
+    }
+    const lanes = props.get("disabled_lanes").?.object;
+    try testing.expectEqualStrings("array", lanes.get("type").?.string);
+    try testing.expectEqualStrings("string", lanes.get("items").?.object.get("type").?.string);
+}
+
+test "web_policy and web_network reason enums name every reason the wire can render" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const policy = try std.json.parseFromSliceLeaky(std.json.Value, arena, find("web_policy").?.output_schema.?, .{});
+    const network = try std.json.parseFromSliceLeaky(std.json.Value, arena, find("web_network").?.output_schema.?, .{});
+    const enums = [_][]const std.json.Value{
+        policy.object.get("properties").?.object.get("exhausted_reason").?.object.get("enum").?.array.items,
+        network.object.get("properties").?.object.get("requests").?.object.get("items").?.object.get("properties").?.object.get("reason").?.object.get("enum").?.array.items,
+    };
+    for (enums) |values| {
+        var names: [256][]const u8 = undefined;
+        var count: usize = 0;
+        for (std.enums.values(web_proto.NetReason)) |r| {
+            names[count] = web_proto.reasonName(r);
+            count += 1;
+        }
+        // A byte from a newer helper renders as this.
+        names[count] = web_proto.reasonName(@enumFromInt(web_proto.NREASONS));
+        count += 1;
+        for (names[0..count]) |name| {
+            var found = false;
+            for (values) |v| found = found or std.mem.eql(u8, v.string, name);
+            if (!found) {
+                std.debug.print("reason '{s}' missing from a schema enum\n", .{name});
+                return error.ReasonMissingFromSchema;
+            }
+        }
+        try testing.expectEqual(count, values.len);
+    }
 }
 
 test "every table entry routes to exactly its own group's handler enum" {
