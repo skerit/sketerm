@@ -1,5 +1,33 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-02: agents outlive their MCP server, resumable by id
+
+An MCP sub-agent now runs on the per-user daemon of its host (this
+machine's, the one the GUI uses, or the remote host's) instead of the
+server's private instance, so restarting the orchestrator no longer kills
+it. Ids are machine-unique and short (`claude-k3f9`: app plus four base32
+characters), `agent_open name:` adds an alias usable everywhere the id is
+(unique among this machine's live agents, `conflict` when taken, and the
+session's listed title through the new `SpawnReq.title`), and `term_open
+name:` does the same for terminals. Every agent has a 0600 descriptor in
+the per-user index `$XDG_STATE_HOME/sketerm/agents/` (`agentindex.zig`),
+which holds live agents only. `agent_attach {agent}` resumes one from any
+server and answers `reattached` (with its latest job's records), `gone`
+(with the reason the daemon remembers) or `unreachable` (host and ssh's
+words). Ownership is a held flock, never a pid; `takeover` replaces the
+lock file and the displaced server lets the agent go between requests.
+Daemons keep tombstones (`tombstone_get`/`tombstone_reply`, capability
+`tombstones`, 256 entries / 48 h): `expired`, `exited` with status or
+signal, `closed`, or `unknown`, reported by the worker in a `'T'` control
+datagram. Every agent session carries `ttl_secs` from the new
+`mcp_agent_idle_ttl_hours` (default 24); a server that exits only
+detaches. Remote agents never fall back to plain `ssh -tt` on `auto` (the
+portable daemon is deployed instead; a failure names why), a lost link is
+retried by a background thread (2 s doubling to 60 s) and announced with
+the new always-on `connection_restored`, and Claude Code's "trust this
+folder" dialog (lettered `y.`/`n.` options, measured on 2.1.287) is an
+interaction `agent_answer` accepts.
+
 ## 2026-10-02: SSH fixes: one options home, login-shell agents, aged masters, scp targets
 
 Every ssh/scp argv sketerm builds now takes its options from
