@@ -1,5 +1,32 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-02: sub-agent fixes: reprints, background kinds, resumes, watchers
+
+A resumed Claude Code agent's 3-hour cast turned 12 prompts into 36 jobs
+with 860 texts under two or more record ids: Claude reprints older turns
+below the transcript, places a prompt it took mid-turn at different points
+of different renderings, and leaves a stale copy in history when it
+redraws a live region taller than the screen. `foldTurn` now folds a
+reprinted turn into the captured one it matches (a copy, most of the same
+records, or the same three opening records), a run of records an earlier
+job holds stays in that job, and a redraw's stale copy inside a turn is
+dropped: the same cast now gives 12 jobs and no text under two ids.
+`done` no longer fires while Claude waits on a monitor or a background
+subagent (measured with Haiku at 120 and 48 columns: `· 1 shell, 1
+monitor` on the mode line, a `◯` row per background subagent), and a
+turn's footer is never read as the live count. Results and `agent_list`
+report `conversation`; `agent_open resume` with an id the app does not
+have fails as `not_found` (Claude prints `No conversation found with
+session ID:` and exits 1; opencode is asked `GET /session/<id>`), leaving
+nothing running. `server_args`/`tui_args` target one of opencode's two
+processes, and a server that exits early is reported with its status, the
+argv and its error lines rather than its usage text. A per-user daemon an
+MCP server autostarts no longer inherits `CLAUDE*`, `AI_AGENT`,
+`SKETERM_MCP_*`, the idle-exit knob or the lifetime fence (proved on
+`/proc/<pid>/environ`). `timed_out` is false for `timeout_ms: 0`, a done's
+block header names only the jobs it holds, and a view-only watcher can no
+longer kill, rename, drive playback, query `app_a11y` or answer a paste.
+
 ## 2026-10-02: agents outlive their MCP server, resumable by id
 
 An MCP sub-agent now runs on the per-user daemon of its host (this
