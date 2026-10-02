@@ -1,5 +1,30 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-02: file_sync, one directory to many hosts and clones
+
+From the same orchestrator: copying a docs directory to four hosts and
+about ten clones took a tar, an `scp_put` per host and a `term_exec` per
+host to unpack with keep-newer, after every change. `file_sync {local_dir,
+targets: [{host?, path}], keep_newer = true, delete = false, exclude,
+dry_run}` does it in one call. Each distinct host is probed once (rsync,
+tar); a target whose two ends both have rsync syncs with `rsync -rlpt`
+over the same ssh options every sketerm leg uses (`--update` for
+keep_newer, `--checksum` otherwise, `--delete` only when asked), any other
+target gets a tar stream written in Zig, piped over ssh, extracted into a
+staging directory inside the target, sha256-verified file by file against
+the local hash before anything lands, then moved into place with a
+`find -newer` keep-newer re-check. Refusals: `/` and the home (also as the
+host resolves them), `..`, a file where the directory should be, a local
+target nested with the source, delete into a missing directory or from an
+empty source, and a file/directory clash. At most 4 targets run at once,
+one deadline covers every leg, and a failed target is a `targets[]` entry,
+never an aborted call. `dry_run` reports and touches nothing. Capabilities
+`file_sync` and `file_sync_local_rsync`. The engine is
+`src/ipc/filesync.zig` (GTK-free, both test roots); smoke-mcp's agent-ssh
+stage syncs to a fake host with rsync, a fake host whose rsync is broken
+(tar mode) and a local directory, and proves keep_newer, a lone failing
+target, dry_run and delete scoping.
+
 ## 2026-10-02: agent permissions, retry on overload, gone after a reboot
 
 `agent_open permissions` takes an app-neutral policy (tool or permission
