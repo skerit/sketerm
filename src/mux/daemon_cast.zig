@@ -741,6 +741,7 @@ pub fn playControl(self: *Daemon, cl: *Client, payload: []const u8, now: i64) vo
         return;
     };
     const cp = s.castPtr() orelse return;
+    if (!cl.actsOnSession()) return cl.queueErr(dmod.VIEW_ONLY_REFUSAL);
     // An op this build does not know is ignored: ops are append-only.
     const cmd = (wire.PlayCommand.decode(self.allocator, payload) catch {
         cl.queueErr("bad play_control request");

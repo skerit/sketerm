@@ -965,7 +965,8 @@ pub fn requestHostPaste(self: *Daemon, ch: *Channel, kind: u8, mime: []const u8)
     var legacy = false;
     if (ch.session) |s| {
         for (self.clients.items) |cl| {
-            if (cl.dead or !Daemon.nativeViewer(cl, s)) continue;
+            // A watcher's clipboard is not the app's to read.
+            if (cl.dead or !Daemon.nativeViewer(cl, s) or !cl.actsOnSession()) continue;
             if (!cl.answers_paste) {
                 legacy = true;
                 continue;
@@ -1179,7 +1180,8 @@ pub fn nativeClientData(self: *Daemon, cl: *Client, ch: *Channel, bytes: []const
             // worse than never having been sent.
             .intent => if (drives) nv.brain.applyIntent(peeled.unit.tag, peeled.unit.payload),
             .describe => nv.brain.applyIntent(peeled.unit.tag, peeled.unit.payload),
-            .transfer => {
+            // A watcher may fetch the app's selection, never paste into it.
+            .transfer => if (cl.actsOnSession() or peeled.unit.tag == .clip_send) {
                 settlePasteWait(ch.native.?, cl.id, peeled.unit.tag);
                 applyAppUnit(self, ch, peeled.unit.tag, peeled.unit.payload);
             },

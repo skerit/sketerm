@@ -69,6 +69,10 @@ pub fn handleAppA11y(self: *Daemon, cl: *Client, payload: []const u8) void {
         cl.queueJson(.app_a11y_tree, .{ .@"error" = "not attached" });
         return;
     };
+    if (!cl.actsOnSession()) {
+        cl.queueJson(.app_a11y_tree, .{ .@"error" = dmod.VIEW_ONLY_REFUSAL });
+        return;
+    }
     var hub = &(s.a11y orelse {
         cl.queueJson(.app_a11y_tree, .{ .@"error" = "no accessibility bus for this session (not an app session, or dbus-daemon unavailable)" });
         return;

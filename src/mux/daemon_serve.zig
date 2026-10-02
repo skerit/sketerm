@@ -685,6 +685,26 @@ test "a view-only client cannot type into, paste into or resize a terminal sessi
     handleFrame(d, sender, .{ .ftype = .input, .payload = "sent\n" });
     try t.expect(std.mem.indexOf(u8, testDrainChild(s, &buf, 2000), "sent") != null);
 
+    // Nor kill or rename it, or query its app's accessibility bus; each
+    // refusal says why.
+    watcher.wbuf.clearRetainingCapacity();
+    handleFrame(d, watcher, .{ .ftype = .kill, .payload = "{\"name\":\"agent\"}" });
+    handleFrame(d, watcher, .{ .ftype = .rename, .payload = "{\"name\":\"agent\",\"new_name\":\"renamed\"}" });
+    handleFrame(d, watcher, .{ .ftype = .app_a11y, .payload = "" });
+    try t.expectEqual(@as(usize, 1), d.sessions.items.len);
+    try t.expectEqualStrings("agent", s.name);
+    var refusals: usize = 0;
+    var pos: usize = 0;
+    while (try wire.peelFrame(watcher.wbuf.items[pos..])) |p| {
+        pos += p.consumed;
+        if (std.mem.indexOf(u8, p.frame.payload, "view-only") != null) refusals += 1;
+    }
+    try t.expectEqual(@as(usize, 3), refusals);
+    // A one-shot client that is not a watcher still renames.
+    sender.wbuf.clearRetainingCapacity();
+    handleFrame(d, sender, .{ .ftype = .rename, .payload = "{\"name\":\"agent\",\"new_name\":\"renamed\"}" });
+    try t.expect(std.mem.indexOf(u8, sender.wbuf.items, "view-only") == null);
+
     // Take control ends the watch: input and resize reach the session.
     watcher.wbuf.clearRetainingCapacity();
     handleFrame(d, watcher, .{ .ftype = .control_req, .payload = "{\"op\":\"takeover\"}" });

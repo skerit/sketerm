@@ -719,6 +719,9 @@ pub const WorkerPush = struct {
     last_push_ms: i64 = 0,
 };
 
+/// The refusal a watcher (`Client.actsOnSession` false) gets.
+pub const VIEW_ONLY_REFUSAL = "view-only: this client watches the session; take control to act on it";
+
 pub const Client = struct {
     const WriteLane = enum { none, normal, audio };
 
@@ -861,9 +864,17 @@ pub const Client = struct {
         return @min(RESYNC_RETRY_BASE_MS << shift, RESYNC_RETRY_MAX_MS);
     }
 
+    /// Whether this client may do more to its session than watch it: kill
+    /// or rename it, drive cast playback, query the app's accessibility
+    /// bus, answer the app's paste requests with its own clipboard. A
+    /// watcher may not, until it takes control.
+    pub fn actsOnSession(self: *const Client) bool {
+        return !self.view_only;
+    }
+
     /// Whether this client's `.input` and `.resize` may reach its session.
     pub fn drivesTerminal(self: *const Client) bool {
-        return !self.panel_only and !self.view_only;
+        return !self.panel_only and self.actsOnSession();
     }
 
     pub fn deinit(self: *Client) void {
@@ -6587,6 +6598,7 @@ pub const Daemon = struct {
     }
 
     pub fn handleKill(self: *Daemon, cl: *Client, payload: []const u8) void {
+        if (!cl.actsOnSession()) return cl.queueErr(VIEW_ONLY_REFUSAL);
         if (!self.isWorker()) return self.brokerKill(cl, payload);
         var parsed = std.json.parseFromSlice(KillReq, self.allocator, payload, .{
             .ignore_unknown_fields = true,
@@ -6717,6 +6729,7 @@ pub const Daemon = struct {
     /// A worker owns one session, so `name` can only be that one; the
     /// broker is the rename authority and answers through the worker.
     pub fn handleRename(self: *Daemon, cl: *Client, payload: []const u8) void {
+        if (!cl.actsOnSession()) return cl.queueErr(VIEW_ONLY_REFUSAL);
         if (!self.isWorker()) return self.brokerRename(cl, payload);
         var parsed = std.json.parseFromSlice(RenameReq, self.allocator, payload, .{
             .ignore_unknown_fields = true,
