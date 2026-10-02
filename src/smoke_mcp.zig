@@ -6820,7 +6820,9 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
             const launches = readfile.cappedAlloc(arena, fcPath(&lb, FC_LAUNCHES), 1 << 20) catch fail("the fake Claude Code logged no launch");
             var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, launches, "\n"), '\n');
             const first = lines.next() orelse fail("no first launch");
-            const second = lines.next() orelse fail("agent_set effort: no second launch");
+            // The refused resume (`nope-1234`) launched the fake in between.
+            var second = lines.next() orelse fail("agent_set effort: no second launch");
+            if (std.mem.indexOf(u8, second, "--resume nope-1234") != null) second = lines.next() orelse fail("agent_set effort: no relaunch after the refused resume");
             const sid_at = std.mem.indexOf(u8, first, "--session-id ") orelse fail("the first launch named no conversation id");
             const sid = first[sid_at + "--session-id ".len ..][0..36];
             const want = std.fmt.allocPrint(arena, "--resume {s}", .{sid}) catch fail("oom");
