@@ -1,5 +1,27 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-02: an orchestrator of many agents: one call for several, wait all, relaunch
+
+From an orchestrator that ran 17 agents across four hosts. `agent_send
+agents:[...]` sends one text to several agents (one result each, a failed
+one never stops the others) and `interrupt:true` stops a busy agent first,
+then sends the text as a new prompt, never queued behind the turn.
+`agent_wait agents all:true` and `agent-wait --all` wake once every agent
+settled, with each one's outcome; "settled" is one rule (`settleOf`: the
+state, and the prompt last sent must have been followed by a settling
+event), so an agent that has not started on its prompt does not count.
+`agent_read final:true` returns just the newest job's last message (it
+replaces reading opencode's database or Claude's jsonl). `agent_list` is
+compact by default (~5k tokens for 17 agents before), `detail:true` gives
+every fact. A gone agent whose launch settings and conversation are known
+stays in the index (`gone_ms`, swept after the idle TTL) and
+`agent_attach relaunch:true` starts it again under the same id and name,
+through the same start as `agent_open`. `agent_open` with a prompt and
+`timeout_ms:0` now waits for readiness and hands the prompt off (`sent`)
+instead of never sending it. `term_open exec_shell:"bash"` sets
+`term_exec`'s default shell for a terminal. Each is a `capabilities` fact;
+smoke-mcp's agent stage proves them with the fake Claude Code.
+
 ## 2026-10-02: sub-agent events pushed into the orchestrator
 
 An orchestrator learned that its sub-agent finished only through a waiter
