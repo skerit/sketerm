@@ -109,6 +109,60 @@ fn finish(alloc: std.mem.Allocator, kind: vocab.RecordKind, first: usize, line_i
     return .{ .kind = kind, .first = first, .line_id = line_id, .text = text };
 }
 
+/// A record's alphanumerics that make it worth comparing by content (a few
+/// words two different records may well share are compared exactly).
+pub const CONTENT_ALNUM = 20;
+
+/// What `alnumRelated` texts of one kind share when both are long enough to
+/// compare by content: a hash of the kind and the first `CONTENT_ALNUM`
+/// lowercase alphanumerics. Null for a user prompt or a shorter text.
+pub fn contentKey(kind: vocab.RecordKind, text: []const u8) ?u64 {
+    if (kind == .user) return null;
+    var h = std.hash.Wyhash.init(@intFromEnum(kind));
+    var n: usize = 0;
+    for (text) |ch| {
+        if (!std.ascii.isAlphanumeric(ch)) continue;
+        h.update(&.{std.ascii.toLower(ch)});
+        n += 1;
+        if (n == CONTENT_ALNUM) return h.final();
+    }
+    return null;
+}
+
+/// The same record drawn twice: one copy cut short or extended, or, when
+/// short, the very same text.
+pub fn sameRecord(a: Rec, b: Rec) bool {
+    if (a.kind != b.kind) return false;
+    if (alnumLen(a.text) < CONTENT_ALNUM and alnumLen(b.text) < CONTENT_ALNUM) return std.mem.eql(u8, a.text, b.text);
+    return alnumRelated(a.text, b.text);
+}
+
+/// One turn's records without the stale copies a redraw leaves behind: an
+/// app that redraws a live region taller than the screen erases only the
+/// rows still on screen, so the part that scrolled into history stays and
+/// the redraw prints it again below (its last line cut where the screen
+/// began). A run whose next two records repeat an earlier run's is that
+/// redraw; the earlier copy goes, the later one stays.
+/// @param recs one turn's records, its user record first.
+pub fn dropStaleCopies(alloc: std.mem.Allocator, recs: []const Rec) ![]const Rec {
+    var out: std.ArrayList(Rec) = .empty;
+    try out.appendSlice(alloc, recs);
+    var j: usize = 2;
+    while (j + 1 < out.items.len) : (j += 1) {
+        const items = out.items;
+        var i = j - 1;
+        while (i > 0) : (i -= 1) {
+            if (i + 1 >= j or items[i].kind == .user) continue;
+            if (!sameRecord(items[i], items[j]) or !sameRecord(items[i + 1], items[j + 1])) continue;
+            if (alnumLen(items[j].text) < CONTENT_ALNUM and alnumLen(items[j + 1].text) < CONTENT_ALNUM) continue;
+            out.replaceRangeAssumeCapacity(i, j - i, &.{});
+            j = i;
+            break;
+        }
+    }
+    return out.toOwnedSlice(alloc);
+}
+
 /// Wrap- and truncation-insensitive identity of a prompt: lowercase
 /// alphanumerics up to the first ellipsis.
 pub fn promptKey(alloc: std.mem.Allocator, text: []const u8) ![]u8 {
@@ -125,6 +179,21 @@ pub fn promptKey(alloc: std.mem.Allocator, text: []const u8) ![]u8 {
 pub fn samePrompt(a: []const u8, b: []const u8) bool {
     if (a.len == 0 or b.len == 0) return false;
     return std.mem.startsWith(u8, a, b) or std.mem.startsWith(u8, b, a);
+}
+
+/// Whether one text's lowercase alphanumerics are a prefix of the other's
+/// (the same record drawn twice, one copy cut short or extended).
+pub fn alnumRelated(a: []const u8, b: []const u8) bool {
+    var i: usize = 0;
+    var j: usize = 0;
+    while (true) {
+        while (i < a.len and !std.ascii.isAlphanumeric(a[i])) i += 1;
+        while (j < b.len and !std.ascii.isAlphanumeric(b[j])) j += 1;
+        if (i == a.len or j == b.len) return true;
+        if (std.ascii.toLower(a[i]) != std.ascii.toLower(b[j])) return false;
+        i += 1;
+        j += 1;
+    }
 }
 
 pub fn alnumLen(text: []const u8) usize {
@@ -512,6 +581,39 @@ fn mk(texts: []const []const u8) ![]Line {
     const out = try t.allocator.alloc(Line, texts.len);
     for (texts, out, 0..) |s, *l, i| l.* = .{ .text = s, .id = i + 1 };
     return out;
+}
+
+test "a redraw's stale copy is dropped, the redraw kept; a repeated single record is not a redraw" {
+    const R = struct {
+        fn r(kind: vocab.RecordKind, text: []const u8) Rec {
+            return .{ .kind = kind, .first = 0, .line_id = 0, .text = @constCast(text) };
+        }
+    };
+    const a = R.r(.assistant, "Reading the screen engine to find where turns are folded.");
+    const b = R.r(.tool, "Bash (zig test src/agent/screen_source.zig)\n12 passed");
+    const c = R.r(.assistant, "The fold rule misses reprinted older turns; fixing it.");
+    const recs = [_]Rec{
+        R.r(.user, "fix it"),
+        a,
+        b,
+        // The stale copy's last line, cut where the screen began.
+        R.r(.assistant, "The fold rule misses"),
+        a,
+        b,
+        c,
+    };
+    const out = try dropStaleCopies(t.allocator, &recs);
+    defer t.allocator.free(out);
+    try t.expectEqual(@as(usize, 4), out.len);
+    try t.expectEqualStrings("fix it", out[0].text);
+    try t.expectEqualStrings(c.text, out[3].text);
+    // A job that runs one command twice keeps both runs.
+    const twice = [_]Rec{ R.r(.user, "again"), b, a, b, c };
+    const kept = try dropStaleCopies(t.allocator, &twice);
+    defer t.allocator.free(kept);
+    try t.expectEqual(@as(usize, 5), kept.len);
+    try t.expect(alnumRelated("Hello, wor", "hello world!"));
+    try t.expect(!alnumRelated("hello there", "hello world"));
 }
 
 test "records: prefixes start records, chrome ends them, text continues" {

@@ -41,6 +41,8 @@ pub const Turn = struct {
     key: []u8,
     /// First index into `Engine.records`.
     first: usize,
+    /// Alphanumerics of its screen records (`Engine.keptAlnum`): a copy
+    /// showing more replaces them.
     alnum: usize,
     /// The prompt is an adapter command (`Engine.beginCommand`): the turn
     /// keeps only synthetic records and raises no events.
@@ -49,6 +51,9 @@ pub const Turn = struct {
 
 /// Wait this long after a retrying error first shows before surfacing it.
 pub const RETRY_SURFACE_MS: i64 = vocab.ErrorClass.retrying.surfaceAfterMs();
+/// Consecutive records an earlier job holds that make a stretch of a turn
+/// a redraw of that job rather than a repeat (`Engine.knownRuns`).
+const KNOWN_RUN = 3;
 /// Bottom rows searched for the input box.
 const INPUT_SEARCH_ROWS = 8;
 const MAX_STATUS_ROWS = 10;
@@ -693,7 +698,8 @@ pub const Engine = struct {
         alnum: usize,
         skip: bool = false,
 
-        fn init(arena: std.mem.Allocator, recs: []const grammar.Rec) !Parsed {
+        fn init(arena: std.mem.Allocator, all: []const grammar.Rec) !Parsed {
+            const recs = try grammar.dropStaleCopies(arena, all);
             var sig: std.ArrayList(u8) = .empty;
             for (recs) |r| {
                 for (r.text) |ch| {
@@ -719,7 +725,6 @@ pub const Engine = struct {
     fn foldTurn(self: *Engine, p: Parsed, complete: bool) !void {
         const recs = p.recs;
         const key = p.key;
-        const alnum = p.alnum;
 
         const cur = self.wipe_seq;
         const n_turns = self.turns.items.len;
@@ -730,15 +735,29 @@ pub const Engine = struct {
             // the latest turn can still grow.
             for (self.turns.items, 0..) |tn, ti| {
                 if (tn.wipe_seq != cur or tn.user_line_id != p.line_id or !grammar.samePrompt(tn.key, key)) continue;
-                if (ti == n_turns - 1 and alnum >= last.alnum) try self.replaceLast(recs, alnum, complete);
+                if (ti == n_turns - 1 and try self.keptAlnum(recs, last.first) >= last.alnum) try self.replaceLast(recs, complete);
                 return;
             }
             // The latest turn printed again without an erase (claude does
             // that too): same prompt and one's content a prefix of the
             // other's. It keeps its identity, so a same-prompt turn whose
             // answer then diverges is still a new turn.
-            if (last.wipe_seq == cur and grammar.samePrompt(last.key, key) and self.lastTurnCopiedBy(p)) {
-                if (alnum > last.alnum) try self.replaceLast(recs, alnum, complete);
+            if (last.wipe_seq == cur and grammar.samePrompt(last.key, key) and self.turnCopiedBy(n_turns - 1, p)) {
+                if (try self.keptAlnum(recs, last.first) > last.alnum) try self.replaceLast(recs, complete);
+                return;
+            }
+            // An EARLIER turn printed again below the transcript without an
+            // erase (claude reprints its whole transcript, e.g. after a
+            // resume): its old copy may be trimmed from the parse already,
+            // and its new copy has higher line ids, so it is recognised by
+            // content against what was captured of every earlier turn with
+            // the same prompt, and folded into that turn, never appended.
+            var ri = n_turns;
+            while (ri > 0) {
+                ri -= 1;
+                const tn = self.turns.items[ri];
+                if (tn.hidden or tn.wipe_seq != cur or !grammar.samePrompt(tn.key, key) or !self.turnReprintedBy(ri, p)) continue;
+                if (ri == n_turns - 1 and try self.keptAlnum(recs, last.first) > last.alnum) try self.replaceLast(recs, complete);
                 return;
             }
             // A reprint of a turn captured before a wipe, by prompt.
@@ -750,7 +769,7 @@ pub const Engine = struct {
                 if (ti == n_turns - 1) {
                     last.user_line_id = p.line_id;
                     last.wipe_seq = cur;
-                    if (alnum >= last.alnum) try self.replaceLast(recs, alnum, complete);
+                    if (try self.keptAlnum(recs, last.first) >= last.alnum) try self.replaceLast(recs, complete);
                 }
                 return;
             }
@@ -767,16 +786,66 @@ pub const Engine = struct {
             .alnum = 0,
             .hidden = self.isCommand(recs[0].text),
         });
-        try self.replaceLast(recs, alnum, complete);
+        try self.replaceLast(recs, complete);
     }
 
-    /// Whether the latest turn's screen records and `p` are copies (one's
+    /// The captured records of turn `ti`.
+    fn turnRecords(self: *const Engine, ti: usize) []const Record {
+        const end = if (ti + 1 < self.turns.items.len) self.turns.items[ti + 1].first else self.records.items.len;
+        return self.records.items[self.turns.items[ti].first..end];
+    }
+
+    /// Whether `p` is a reprint of captured turn `ti`: a copy of it
+    /// (`turnCopiedBy`), or one whose content differs only in how the app
+    /// drew it this time (a tool's output collapsed or expanded, a queued
+    /// prompt placed elsewhere): most substantial records of the smaller
+    /// side are found, by kind and alphanumerics, on the other side.
+    fn turnReprintedBy(self: *const Engine, ti: usize, p: Parsed) bool {
+        if (self.turnCopiedBy(ti, p)) return true;
+        const captured = self.turnRecords(ti);
+        var mine: usize = 0;
+        for (captured) |r| {
+            if (evidence(r.kind, r.text) and !r.synthetic) mine += 1;
+        }
+        var theirs: usize = 0;
+        for (p.recs) |r| {
+            if (evidence(r.kind, r.text)) theirs += 1;
+        }
+        if (mine == 0 or theirs == 0) return false;
+        var found: usize = 0;
+        if (theirs <= mine) {
+            for (p.recs) |r| {
+                if (!evidence(r.kind, r.text)) continue;
+                for (captured) |o| if (!o.synthetic and o.kind == r.kind and grammar.alnumRelated(o.text, r.text)) {
+                    found += 1;
+                    break;
+                };
+            }
+            return found * 2 > theirs;
+        }
+        for (captured) |o| {
+            if (o.synthetic or !evidence(o.kind, o.text)) continue;
+            for (p.recs) |r| if (r.kind == o.kind and grammar.alnumRelated(o.text, r.text)) {
+                found += 1;
+                break;
+            };
+        }
+        return found * 2 > mine;
+    }
+
+    /// Whether a record says enough to identify its turn: not the prompt
+    /// (`samePrompt` compares that), and not a few words two different
+    /// turns may well share.
+    fn evidence(kind: vocab.RecordKind, text: []const u8) bool {
+        return kind != .user and grammar.alnumLen(text) >= grammar.CONTENT_ALNUM;
+    }
+
+    /// Whether turn `ti`'s screen records and `p` are copies (one's
     /// alphanumerics a prefix of the other's).
-    fn lastTurnCopiedBy(self: *const Engine, p: Parsed) bool {
-        const turn = self.turns.items[self.turns.items.len - 1];
+    fn turnCopiedBy(self: *const Engine, ti: usize, p: Parsed) bool {
         var pos: usize = 0;
         var diverged = false;
-        outer: for (self.records.items[turn.first..]) |r| {
+        outer: for (self.turnRecords(ti)) |r| {
             if (r.synthetic) continue;
             for (r.text) |ch| {
                 if (!std.ascii.isAlphanumeric(ch)) continue;
@@ -791,15 +860,30 @@ pub const Engine = struct {
         return !diverged;
     }
 
+    /// Alphanumerics of the records of `recs` that `knownRuns` keeps: how
+    /// much of a turn a copy shows, compared with `Turn.alnum`.
+    fn keptAlnum(self: *const Engine, recs: []const grammar.Rec, limit: usize) !usize {
+        const known = try self.knownRuns(recs, limit);
+        defer self.allocator.free(known);
+        var n: usize = 0;
+        for (recs, known) |r, skip| {
+            if (!skip) n += grammar.alnumLen(r.text);
+        }
+        return n;
+    }
+
     /// Replace the latest turn's screen records with `recs`, keeping the id
     /// of every record whose text did not change and its synthetic notices.
-    fn replaceLast(self: *Engine, all_recs: []const grammar.Rec, alnum: usize, complete: bool) !void {
+    fn replaceLast(self: *Engine, all_recs: []const grammar.Rec, complete: bool) !void {
         const ti = self.turns.items.len - 1;
         const turn = &self.turns.items[ti];
-        turn.alnum = alnum;
         // An adapter command leaves only what the adapter recorded of it.
         const recs = if (turn.hidden) all_recs[0..0] else all_recs;
         const old = self.records.items[turn.first..];
+
+        // Records an earlier job already holds keep their id there.
+        const known = try self.knownRuns(recs, turn.first);
+        defer self.allocator.free(known);
 
         var fresh: std.ArrayList(Record) = .empty;
         errdefer {
@@ -807,7 +891,10 @@ pub const Engine = struct {
             fresh.deinit(self.allocator);
         }
         var old_screen: usize = 0;
-        for (recs) |r| {
+        turn.alnum = 0;
+        for (recs, known) |r, skip| {
+            if (skip) continue;
+            turn.alnum += grammar.alnumLen(r.text);
             // Match against the old screen records in order.
             while (old_screen < old.len and old[old_screen].synthetic) old_screen += 1;
             var kept: ?Record = null;
@@ -850,6 +937,48 @@ pub const Engine = struct {
             r.announced = true;
             _ = try self.queue.pushMessage(self.clock_ms, r.text, r.id);
         }
+    }
+
+    /// Which of `recs` are records an earlier job captured already
+    /// (`self.records[0..limit]`), drawn again in this turn: claude places a
+    /// prompt it took mid-turn at different points of different renderings,
+    /// so one rendering's earlier job ends with what another's next job
+    /// starts with. Only runs of `KNOWN_RUN` or more such records count, so
+    /// a job that repeats a message or a tool call of an earlier one keeps
+    /// it. The caller frees the result.
+    fn knownRuns(self: *const Engine, recs: []const grammar.Rec, limit: usize) ![]bool {
+        const a = self.allocator;
+        const drop = try a.alloc(bool, recs.len);
+        @memset(drop, false);
+        if (limit == 0) return drop;
+        const earlier = self.records.items[0..limit];
+        const keys = try a.alloc(?u64, earlier.len);
+        defer a.free(keys);
+        for (earlier, keys) |r, *k| k.* = if (r.synthetic) null else grammar.contentKey(r.kind, r.text);
+        var run_start: ?usize = null;
+        var run_end: usize = 0;
+        var run_len: usize = 0;
+        for (recs, 0..) |r, i| {
+            const key = grammar.contentKey(r.kind, r.text);
+            var known = false;
+            if (key) |k| for (earlier, keys) |o, ok| if (ok == k and grammar.alnumRelated(o.text, r.text)) {
+                known = true;
+                break;
+            };
+            if (known) {
+                if (run_start == null) run_start = i;
+                run_end = i;
+                run_len += 1;
+                continue;
+            }
+            // A short record neither ends nor counts toward a run.
+            if (key == null and r.kind != .user) continue;
+            if (run_start) |s| if (run_len >= KNOWN_RUN) @memset(drop[s .. run_end + 1], true);
+            run_start = null;
+            run_len = 0;
+        }
+        if (run_start) |s| if (run_len >= KNOWN_RUN) @memset(drop[s .. run_end + 1], true);
+        return drop;
     }
 
     fn nextId(self: *Engine) u64 {
@@ -1386,6 +1515,81 @@ test "same prompt: a new answer is a new turn, a reprint without an erase is not
     try t.expectEqualStrings("step two", rig.engine.records.items[3].text);
     try t.expectEqual(@as(usize, 2), countKind(&rig.engine, .done));
     try t.expectEqual(@as(usize, 2), countKind(&rig.engine, .message));
+}
+
+test "a reprint of older turns below the transcript folds into them: no new job, no record under a second id" {
+    // Modelled on a resumed claude agent that reprints its whole transcript
+    // (no erase) whenever it redraws: the reprinted older turns have new,
+    // higher line ids, and the first one's old copy is trimmed from history.
+    var rig: Rig = undefined;
+    try rig.init(80, 12);
+    defer rig.deinit();
+    rig.write("\x1b]0;\xe2\x9c\xb3 C\x07" ++ live);
+    try rig.feed(0);
+    try rig.engine.tick(1000);
+    const a1 = "claude: The parser module splits records at every user prompt line.";
+    const a2 = "claude: The screen engine folds each parsed turn into the captured jobs.";
+    const t1 = "you: explain the parser\r\n" ++ a1 ++ "\r\nBrewed for 1s \xc2\xb7 done\r\n";
+    const t2 = "you: explain the engine\r\n" ++ a2 ++ "\r\nBrewed for 1s \xc2\xb7 done\r\n";
+    rig.write("\x1b]133;A\x07" ++ erase ++ t1 ++ live ++ "\x1b]133;C\x07\x1b]133;D\x07\x07");
+    try rig.feed(1100);
+    rig.write("\x1b]133;A\x07" ++ erase ++ t2 ++ live ++ "\x1b]133;C\x07\x1b]133;D\x07\x07");
+    try rig.feed(1200);
+    try rig.engine.tick(5000);
+    try t.expectEqual(@as(usize, 2), rig.engine.turns.items.len);
+    const ids = [_]u64{ rig.engine.records.items[1].id, rig.engine.records.items[3].id };
+    // The whole transcript again, below the old copy, then a new turn.
+    rig.write(erase ++ t1 ++ t2 ++ live);
+    try rig.feed(6000);
+    rig.write("\x1b]133;A\x07" ++ erase ++ "you: now the selection\r\nclaude: Selection picks the records a read returns per job.\r\nBrewed for 1s \xc2\xb7 done\r\n" ++ live ++ "\x1b]133;C\x07\x1b]133;D\x07\x07");
+    try rig.feed(7000);
+    // Once more, with the new turn in it.
+    rig.write(erase ++ t1 ++ t2 ++ "you: now the selection\r\nclaude: Selection picks the records a read returns per job.\r\nBrewed for 1s \xc2\xb7 done\r\n" ++ live ++ "\x1b]133;A\x07\x1b]133;C\x07\x1b]133;D\x07\x07");
+    try rig.feed(8000);
+    try rig.engine.tick(12_000);
+    const recs = rig.engine.records.items;
+    try t.expectEqual(@as(usize, 3), rig.engine.turns.items.len);
+    try t.expectEqual(@as(usize, 6), recs.len);
+    // A record already captured keeps its id.
+    try t.expectEqual(ids[0], recs[1].id);
+    try t.expectEqual(ids[1], recs[3].id);
+    try t.expectEqualStrings("now the selection", recs[4].text);
+    try t.expectEqual(@as(u32, 2), recs[5].job);
+    // A same-prompt turn whose answer differs is still a new one.
+    rig.write("\x1b]133;A\x07" ++ erase ++ "you: explain the engine\r\nclaude: The engine now also drops what a redraw left in the scrollback.\r\nBrewed for 1s \xc2\xb7 done\r\n" ++ live ++ "\x1b]133;C\x07\x1b]133;D\x07\x07");
+    try rig.feed(13_000);
+    try rig.engine.tick(20_000);
+    try t.expectEqual(@as(usize, 4), rig.engine.turns.items.len);
+}
+
+test "a job's rendering that repeats the previous job's records leaves them there" {
+    var rig: Rig = undefined;
+    try rig.init(100, 40);
+    defer rig.deinit();
+    rig.write("\x1b]0;\xe2\x9c\xb3 C\x07" ++ live);
+    try rig.feed(0);
+    try rig.engine.tick(1000);
+    const work = "tool: Bash (zig build test --summary all in the worktree)\r\n" ++
+        "claude: The first test run shows two failures in the screen engine.\r\n" ++
+        "tool: Bash (zig test src/agent/screen_source.zig with the filter)\r\n" ++
+        "claude: Both failures come from the reprint rule; fixing it now.\r\n";
+    rig.write("\x1b]133;A\x07" ++ erase ++ "you: fix the tests\r\n" ++ work ++ live);
+    try rig.feed(1100);
+    // A prompt taken mid-turn, drawn ABOVE the turn's last records in this
+    // rendering (claude places it differently in different renderings).
+    rig.write(erase ++ "you: also report the timings\r\n" ++ work ++ "claude: Timings: the suite takes four seconds on this machine.\r\nBrewed for 1s \xc2\xb7 done\r\n" ++ live ++
+        "\x1b]133;C\x07\x1b]133;D\x07\x07");
+    try rig.feed(2000);
+    try rig.engine.tick(9000);
+    const recs = rig.engine.records.items;
+    try t.expectEqual(@as(usize, 2), rig.engine.turns.items.len);
+    // Job 1 holds its prompt and its own answer; job 0's records stay job 0's.
+    var job1: usize = 0;
+    for (recs) |r| {
+        if (r.job == 1) job1 += 1;
+    }
+    try t.expectEqual(@as(usize, 2), job1);
+    try t.expectEqualStrings("Timings: the suite takes four seconds on this machine.", recs[recs.len - 1].text);
 }
 
 test "a picker is live state: it never lands in the transcript" {
