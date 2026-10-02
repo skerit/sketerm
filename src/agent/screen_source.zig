@@ -54,6 +54,9 @@ pub const RETRY_SURFACE_MS: i64 = vocab.ErrorClass.retrying.surfaceAfterMs();
 /// Consecutive records an earlier job holds that make a stretch of a turn
 /// a redraw of that job rather than a repeat (`Engine.knownRuns`).
 const KNOWN_RUN = 3;
+/// Substantial records a parsed turn must open with, as a captured turn
+/// with its prompt did, to be that turn drawn again (`turnReprintedBy`).
+const REPRINT_OPENING = 3;
 /// Bottom rows searched for the input box.
 const INPUT_SEARCH_ROWS = 8;
 const MAX_STATUS_ROWS = 10;
@@ -816,6 +819,20 @@ pub const Engine = struct {
     fn turnReprintedBy(self: *const Engine, ti: usize, p: Parsed) bool {
         if (self.turnCopiedBy(ti, p)) return true;
         const captured = self.turnRecords(ti);
+        // The same opening: a turn typed again with the same prompt does not
+        // start with the same `REPRINT_OPENING` substantial records.
+        var a: usize = 0;
+        var b: usize = 0;
+        var same: usize = 0;
+        while (same < REPRINT_OPENING) : (same += 1) {
+            while (a < captured.len and (captured[a].synthetic or !evidence(captured[a].kind, captured[a].text))) a += 1;
+            while (b < p.recs.len and !evidence(p.recs[b].kind, p.recs[b].text)) b += 1;
+            if (a == captured.len or b == p.recs.len) break;
+            if (captured[a].kind != p.recs[b].kind or !grammar.alnumRelated(captured[a].text, p.recs[b].text)) break;
+            a += 1;
+            b += 1;
+        }
+        if (same == REPRINT_OPENING) return true;
         var mine: usize = 0;
         for (captured) |r| {
             if (evidence(r.kind, r.text) and !r.synthetic) mine += 1;
@@ -1668,6 +1685,43 @@ test "a reprint of older turns below the transcript folds into them: no new job,
     try rig.feed(13_000);
     try rig.engine.tick(20_000);
     try t.expectEqual(@as(usize, 4), rig.engine.turns.items.len);
+}
+
+test "a rendering that opens like a captured turn is that turn, whatever it draws after" {
+    var rig: Rig = undefined;
+    try rig.init(100, 40);
+    defer rig.deinit();
+    rig.write("\x1b]0;\xe2\x9c\xb3 C\x07" ++ live);
+    try rig.feed(0);
+    try rig.engine.tick(1000);
+    const opening = "claude: Reading the screen engine to see where turns fold.\r\n" ++
+        "tool: Bash (zig build test-core --summary all, filtered to the agent)\r\n" ++
+        "claude: The fold misses reprints of older turns; writing a test first.\r\n";
+    // Most of what follows differs between the two renderings (outputs
+    // collapsed or expanded, notes placed elsewhere): only the opening holds.
+    const captured_tail = "tool: Bash (zig test src/agent/screen_source.zig, first run)\r\n" ++
+        "tool: Bash (zig test src/agent/grammar.zig, first run)\r\n" ++
+        "tool: Bash (zig test src/agent/select.zig, first run)\r\n" ++
+        "tool: Bash (zig test src/agent/launch.zig, first run)\r\n";
+    const redrawn_tail = "tool: Edit (src/agent/screen_source.zig, the fold rule)\r\n" ++
+        "tool: Edit (src/agent/grammar.zig, the stale copy rule)\r\n" ++
+        "tool: Edit (docs/mcp.md, the sub-agent reference)\r\n" ++
+        "tool: Edit (src/ipc/CLAUDE.md, the invariants)\r\n" ++
+        "tool: Edit (docs/SESSION.md, the session log)\r\n";
+    rig.write("\x1b]133;A\x07" ++ erase ++ "you: fix the fold\r\n" ++ opening ++ captured_tail ++ live ++
+        "\x1b]133;C\x07\x1b]133;D\x07\x07" ++ erase ++ "Brewed for 9s \xc2\xb7 done\r\n" ++ live);
+    try rig.feed(1100);
+    rig.write("\x1b]133;A\x07" ++ erase ++ "you: and the docs\r\nclaude: The docs now describe how a reprinted turn is folded.\r\n" ++ live ++
+        "\x1b]133;C\x07\x1b]133;D\x07\x07" ++ erase ++ "Brewed for 2s \xc2\xb7 done\r\n" ++ live);
+    try rig.feed(1200);
+    // The first turn drawn again below, its tool output collapsed this time.
+    rig.write(erase ++ "you: fix the fold\r\n" ++ opening ++ redrawn_tail ++
+        "you: and the docs\r\nclaude: The docs now describe how a reprinted turn is folded.\r\nBrewed for 2s \xc2\xb7 done\r\n" ++ live ++
+        "\x1b]133;A\x07\x1b]133;C\x07\x1b]133;D\x07\x07");
+    try rig.feed(2000);
+    try rig.engine.tick(9000);
+    try t.expectEqual(@as(usize, 2), rig.engine.turns.items.len);
+    try t.expectEqual(@as(usize, 10), rig.engine.records.items.len);
 }
 
 test "a job's rendering that repeats the previous job's records leaves them there" {

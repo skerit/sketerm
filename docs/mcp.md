@@ -942,13 +942,15 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   and a redraw of a live region taller than the screen leaves the part
   that scrolled into history behind and prints it again below. A reprinted
   turn is matched by prompt and content against what was captured of
-  every earlier turn and folded into it (`Engine.turnReprintedBy`), a run
+  every earlier turn (a copy, most of the same records, or the same
+  three substantial records first) and folded into it
+  (`Engine.turnReprintedBy`), a run
   of three or more records an earlier job holds is left in that job
   (`Engine.knownRuns`), and a redraw's stale copy inside a turn is dropped
   (`grammar.dropStaleCopies`); a same-prompt turn whose answer differs is
   still a new job. Measured on a resumed agent's 3-hour cast: 36 jobs and
-  860 texts under two or more ids before, 13 jobs for 12 prompts and none
-  after.
+  860 texts under two or more ids before, 12 jobs for its 12 prompts and
+  none after.
   `jobs` and `cut_ids` only cover jobs this read returns a record of (old
   history contributes at most its one pointer line); a job whose new
   records the cap kept out entirely is only counted, in `jobs_pending`.
