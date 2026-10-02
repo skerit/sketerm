@@ -1,5 +1,16 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-02: a command that exits at once still reports its exit
+
+Spawn and attach are two round trips, and a child that exited before its
+spawner's attach reached the worker was reaped with nobody told: an
+`scp_put` target (or a `launch_app` that crashes at once) reported "spawn
+failed". A session that exits before any terminal viewer ever attached is
+now held for 10s (`Daemon.exit_hold_ms`), and the attach gets its final
+screen, log and exit. Against an older daemon the MCP transfer and script
+helpers (`runArgvTerms`) read the exit from its tombstone and say the output
+was lost, instead of "spawn failed".
+
 ## 2026-10-02: sub-agent fixes: reprints, background kinds, resumes, watchers
 
 A resumed Claude Code agent's 3-hour cast turned 12 prompts into 36 jobs
