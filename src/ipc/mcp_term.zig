@@ -300,6 +300,11 @@ fn termOpen(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
     const choice = transportChoice(args) orelse
         return mcp.errRes(arena, .invalid_args, "transport must be 'auto', 'mux' or 'ssh'");
     if (host) |h| if (!validHostSpec(h)) return mcp.errRes(arena, .invalid_args, BAD_HOST);
+    // term_exec's `shell` when a call names none (a fish login shell made
+    // every term_exec need shell:"bash").
+    const exec_shell = argStr(args, "exec_shell");
+    if (exec_shell) |sh| if (!validShellName(sh))
+        return mcp.errRes(arena, .invalid_args, "invalid 'exec_shell' (a command name or absolute path: letters, digits, . _ - / only)");
     const name = argStr(args, "name");
     if (name) |n| {
         if (!validTermName(n))
@@ -385,6 +390,9 @@ fn termOpen(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
     if (name) |n| if (term_state.allocator.dupe(u8, n)) |owned| {
         term_state.names.put(term_state.allocator, id, owned) catch term_state.allocator.free(owned);
     } else |_| {};
+    if (exec_shell) |sh| if (term_state.allocator.dupe(u8, sh)) |owned| {
+        term_state.exec_shells.put(term_state.allocator, id, owned) catch term_state.allocator.free(owned);
+    } else |_| {};
     // The injection claim: command-mode still waits for the first
     // real prompt mark before trusting it, so an unsupported
     // remote shell degrades to an honest not-ready refusal.
@@ -439,8 +447,10 @@ fn termOpen(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
     if (host) |h| try res.fact("host", h);
     if (t.shell_name) |sn| try res.fact("shell", sn);
     try res.fact("integration", t.integration);
+    if (exec_shell) |sh| try res.fact("exec_shell", sh);
     if (rec_state.casts.get(id)) |p| try res.fact("recording", p);
     try res.textf("opened headless terminal {d} ({d}x{d}{s}){s}{s}", .{ id, cols, rows, shell_note, where, rec_note });
+    if (exec_shell) |sh| try res.textf("term_exec runs its commands with {s} here unless a call names another shell", .{sh});
     if (master) |*m| try masterFacts(&res, m);
     return res.finish();
 }
@@ -466,7 +476,9 @@ fn termExec(arena: std.mem.Allocator, args: std.json.Value, t: *termdrive.Term, 
     const noninteractive = argBool(args, "noninteractive");
     if (noninteractive and !subshell)
         return mcp.errRes(arena, .invalid_args, "'noninteractive' needs the default isolated transport (drop subshell:false)");
-    const shell = argStr(args, "shell");
+    // An explicit shell, else the terminal's exec_shell (only where the
+    // isolated transport uses one: subshell:false types into the session).
+    const shell = argStr(args, "shell") orelse if (subshell) term_state.exec_shells.get(termIdOf(t)) else null;
     if (shell) |sh| {
         if (!subshell)
             return mcp.errRes(arena, .invalid_args, "'shell' needs the default isolated transport (drop subshell:false)");
@@ -599,6 +611,7 @@ fn termClose(arena: std.mem.Allocator, _: std.json.Value, t: *termdrive.Term, _:
     const id = termIdOf(t);
     _ = term_state.terms.swapRemove(id);
     if (term_state.names.fetchSwapRemove(id)) |kv| term_state.allocator.free(kv.value);
+    if (term_state.exec_shells.fetchSwapRemove(id)) |kv| term_state.allocator.free(kv.value);
     t.deinit();
     // The daemon finalizes the cast with the session; keep the
     // path out of future term_list output.
@@ -1661,14 +1674,18 @@ const TermState = struct {
 
     /// term_open's `name` per terminal id (owned).
     names: std.AutoArrayHashMapUnmanaged(u32, []u8) = .empty,
+    /// term_open's `exec_shell` per terminal id (owned): term_exec's default `shell`.
+    exec_shells: std.AutoArrayHashMapUnmanaged(u32, []u8) = .empty,
 
     pub fn deinit(self: *TermState) void {
         for (self.terms.values()) |t| t.deinit();
         self.terms.deinit(self.allocator);
         self.terms = .empty;
-        for (self.names.values()) |n| self.allocator.free(n);
-        self.names.deinit(self.allocator);
-        self.names = .empty;
+        for ([_]*std.AutoArrayHashMapUnmanaged(u32, []u8){ &self.names, &self.exec_shells }) |m| {
+            for (m.values()) |n| self.allocator.free(n);
+            m.deinit(self.allocator);
+            m.* = .empty;
+        }
     }
 };
 

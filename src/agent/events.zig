@@ -87,6 +87,12 @@ pub const Event = struct {
         const cls = self.class orelse return true;
         return cls.wakesByDefault();
     }
+
+    /// It ends what a prompt started (`vocab.EventKind.settlesTurn`); an
+    /// error the agent recovers from by itself does not.
+    pub fn settlesTurn(self: *const Event) bool {
+        return self.kind.settlesTurn() and self.wakesByDefault();
+    }
 };
 
 pub const Limits = struct {
@@ -188,6 +194,19 @@ pub const Queue = struct {
             if (!ev.delivered and ev.wakesByDefault()) n += 1;
         }
         return n;
+    }
+
+    /// The newest event at or after `from_seq` that settles a turn
+    /// (`Event.settlesTurn`), delivered or not; null when none.
+    pub fn lastSettle(self: *const Queue, from_seq: u64) ?*const Event {
+        var i = self.events.items.len;
+        while (i > 0) {
+            i -= 1;
+            const ev = &self.events.items[i];
+            if (ev.seq < from_seq) break;
+            if (ev.settlesTurn()) return ev;
+        }
+        return null;
     }
 
     /// The stored event with `seq`, or null when evicted or never pushed.
@@ -498,6 +517,25 @@ test "coalescing kinds fold repeats within the window, done never does" {
     const d1 = try q.push(3000, .done, null, "same", "");
     const d2 = try q.push(3001, .done, null, "same", "");
     try t.expect(d1 != d2);
+}
+
+test "the last settling event from a seq: delivered or not, never a quiet error or a message" {
+    var q = Queue.init(t.allocator, .{});
+    defer q.deinit();
+    _ = try q.push(0, .done, null, "old", "");
+    const from = q.next_seq;
+    try t.expect(q.lastSettle(from) == null);
+    _ = try q.push(1, .message, null, "progress", "");
+    _ = try q.push(2, .@"error", .retrying, "overloaded", "");
+    _ = try q.push(3, .connection_lost, null, "lost", "");
+    try t.expect(q.lastSettle(from) == null);
+    _ = try q.push(4, .needs_input, null, "permission", "");
+    var c: Cursor = .{};
+    const d = (try c.take(&q, .{}, 5, t.allocator)).?;
+    defer t.allocator.free(d.items);
+    try t.expectEqual(vocab.EventKind.needs_input, q.lastSettle(from).?.kind);
+    // The newest one wins; an older range still sees it.
+    try t.expectEqual(vocab.EventKind.needs_input, q.lastSettle(0).?.kind);
 }
 
 test "the cap evicts the oldest events and counts them" {

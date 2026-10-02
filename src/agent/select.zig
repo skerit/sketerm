@@ -249,6 +249,9 @@ pub const Options = struct {
     /// `jobs` with `keep_empty` (a done's own job, to point at it).
     handed: ?*const Handed = null,
     keep_empty: bool = false,
+    /// `selected` only: each job's last assistant message and nothing else
+    /// (`agent_read final`).
+    final_only: bool = false,
 };
 
 /// A selected record not returned because it was handed out before.
@@ -314,7 +317,7 @@ pub fn select(alloc: std.mem.Allocator, records: []const Record, jobs: []const u
             // `all` pages by id: what is at or below `since` was read.
             if (opts.detail == .all and r.id <= opts.since) continue;
             const take = visible(r.kind, opts.include_tools) and switch (opts.detail) {
-                .selected => r.kind != .assistant or i == last or substantive(r),
+                .selected => if (opts.final_only) i == last else r.kind != .assistant or i == last or substantive(r),
                 .all => true,
             };
             if (take and handed != null and handed.?.has(r)) {
@@ -830,6 +833,34 @@ test "the cap's cut records are not handed out: the next read returns them" {
     const ids = try pickedIds(&records, second);
     defer t.allocator.free(ids);
     try t.expectEqualSlices(u64, &.{1}, ids);
+}
+
+test "final only: the job's last assistant message, once, then a pointer at it" {
+    var records = [_]Record{
+        rec(1, 0, .user, "do it"),
+        rec(2, 0, .assistant, filled(1600, 'l')),
+        rec(3, 0, .notice, "Background command completed"),
+        rec(4, 0, .tool, "Bash (make)"),
+        rec(5, 0, .assistant, "all green"),
+    };
+    var handed: Handed = .{};
+    defer handed.deinit(t.allocator);
+    const one = [1]u32{0};
+    const first = try select(t.allocator, &records, &one, .{ .handed = &handed, .keep_empty = true, .final_only = true });
+    defer first.deinit(t.allocator);
+    const ids = try pickedIds(&records, first);
+    defer t.allocator.free(ids);
+    try t.expectEqualSlices(u64, &.{5}, ids);
+    try t.expectEqual(@as(u32, 1), first.jobs[0].omitted_messages);
+    try handed.markSelection(t.allocator, &records, first);
+    // Handed out: nothing new, one pointer; a re-read (no handed state) returns it.
+    const again = try select(t.allocator, &records, &one, .{ .handed = &handed, .keep_empty = true, .final_only = true });
+    defer again.deinit(t.allocator);
+    try t.expectEqual(@as(usize, 0), again.picked.len);
+    try t.expectEqual(@as(u64, 5), again.jobs[0].earlier.?.id);
+    const reread = try select(t.allocator, &records, &one, .{ .final_only = true });
+    defer reread.deinit(t.allocator);
+    try t.expectEqual(@as(usize, 1), reread.picked.len);
 }
 
 test "chars counts code points" {

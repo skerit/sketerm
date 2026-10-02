@@ -129,10 +129,11 @@ pub const INSTRUCTIONS =
     "per job for what no result has handed you yet: every message comes to you once (detail \"all\" or a since re-reads, include_tools adds tool calls). " ++
     "When a result says still_working (or sent: the agent had not started yet), run its watch_command in the background (or as a Monitor with --follow) " ++
     "to be woken when the agent finishes (done means settled: idle with no subagents or background tasks) or needs input, " ++
-    "instead of polling with agent_wait; to watch several agents at once use agent-wait --any with their ids. " ++
+    "instead of polling with agent_wait; to watch several agents at once use agent-wait --any with their ids (--all: one wake-up once every one settled). " ++
     "A wake-up the waiter printed is not repeated by agent_* results, so read the agent afterwards. " ++
-    "agent_send to a busy agent queues the prompt for its next turn without interrupting it, and agent_answer takes text when a prompt's right answer is none of its options. " ++
-    "agent_open returns an id; after a restart, agent_attach {agent: id} resumes it.";
+    "agent_send to a busy agent queues the prompt for its next turn without interrupting it (interrupt:true stops it first; agents:[...] sends to several at once), and agent_answer takes text when a prompt's right answer is none of its options. " ++
+    "agent_read final:true returns just the newest job's last message, and agent_list is compact unless detail:true. " ++
+    "agent_open returns an id; after a restart, agent_attach {agent: id} resumes it, and relaunch:true starts a gone one again under the same id.";
 
 // ── state ────────────────────────────────────────────────────────
 
@@ -222,6 +223,13 @@ pub const Entry = struct {
     /// The next respawn of a dead forward / reconnect of a lost link.
     forward_retry_ms: i64 = 0,
     reconnect_ms: i64 = 0,
+    /// The queue's next seq when a prompt last went in: the agent has not
+    /// settled since until an event from there settles the turn
+    /// (`settleOf`); null before any prompt.
+    sent_seq: ?u64 = null,
+    /// When the agent was found ended (`clock.wallMs`), its descriptor kept
+    /// for `agent_attach relaunch`; 0 while it runs.
+    ended_ms: i64 = 0,
 
     fn visibleTerm(self: *const Entry) ?*termdrive.Term {
         const l = self.visible orelse return null;
@@ -410,7 +418,7 @@ pub fn adapterIds(arena: std.mem.Allocator) ![]const []const u8 {
 pub fn waiterTemplate(arena: std.mem.Allocator) !?[]const u8 {
     const exe = state.exe orelse return null;
     const sock = state.waiter.path orelse return null;
-    return try agentwait.watchCommand(arena, exe, sock, &.{"AGENT"}, .{});
+    return try agentwait.watchCommand(arena, exe, sock, &.{"AGENT"}, .{}, .any);
 }
 
 /// The conn fds the watchdog may shut down.
@@ -550,8 +558,14 @@ pub fn service(now_ms: i64) void {
     for (state.entries.items) |e| {
         serviceEntry(e, now_ms) catch {};
         kickReconnects(e, now_ms);
-        // An agent that ended is no longer one to resume.
-        if (e.indexed and !e.relaunching and gone(e)) removeDescriptor(e);
+        // An agent that ended is no longer one to resume; one that can be
+        // started again keeps its descriptor for `agent_attach relaunch`.
+        if (e.indexed and !e.relaunching and e.ended_ms == 0 and gone(e)) {
+            if (canRelaunch(e.loaded, e.binary, e.cwd, e.conversed, e.conversation)) {
+                e.ended_ms = clock.wallMs();
+                writeDescriptor(e);
+            } else removeDescriptor(e);
+        }
     }
     servicePush(now_ms);
     state.waiter.service(now_ms);
@@ -928,6 +942,36 @@ fn waitAny(entries: []const *Entry, filter: events.Filter, deadline: i64, arena:
     }
 }
 
+/// How an agent settled: the event that settled its last prompt's turn
+/// (null: it was never sent one and none ever settled), and its state.
+const Settle = struct { event: ?*const events.Event, state: vocab.State };
+
+/// Whether `e` settled (`vocab.State.settled`, and the turn of the prompt
+/// it was last sent ended: an idle agent that has not started on it yet is
+/// not settled), and how; null while it has not.
+fn settleOf(e: *Entry) ?Settle {
+    const st = e.agent.state();
+    if (!st.settled()) return null;
+    const q = e.agent.queue();
+    if (e.sent_seq) |from| {
+        const ev = q.lastSettle(from) orelse return null;
+        return .{ .event = ev, .state = st };
+    }
+    return .{ .event = q.lastSettle(0), .state = st };
+}
+
+/// One agent's line of an `all` wake: the settling kind (else the state).
+fn settledOf(e: *const Entry, s: Settle) agentwait.Settled {
+    const ev = s.event orelse return .{ .agent = e.id, .outcome = @tagName(s.state), .state = @tagName(s.state) };
+    return .{
+        .agent = e.id,
+        .outcome = @tagName(ev.kind),
+        .state = @tagName(s.state),
+        .text = if (ev.kind.announcesRecord()) events.preview(ev.text) else ev.text,
+        .record = ev.record,
+    };
+}
+
 /// @param asked identity of the interaction showing when the recipe
 /// started (`answered` waits for it to go).
 fn waitStep(e: *Entry, what: adapter.WaitFor, asked: ?u64, deadline: i64) bool {
@@ -951,6 +995,8 @@ fn waitStep(e: *Entry, what: adapter.WaitFor, asked: ?u64, deadline: i64) bool {
 const Target = struct {
     id: []u8,
     cursor: events.Cursor,
+    /// An `all` waiter's agent that closed: settled, as `closed`.
+    closed: bool = false,
 };
 
 const Sub = struct {
@@ -964,6 +1010,8 @@ const Sub = struct {
     follow: bool = false,
     /// Every agent of the server, later ones included, with pushed text.
     server: bool = false,
+    /// One wake once every target settled (`--all`).
+    all: bool = false,
     done: bool = false,
 
     /// What wakes it for `e`: its own filter, and for a server follower
@@ -1150,7 +1198,9 @@ fn serviceSub(a: std.mem.Allocator, s: *Sub, now_ms: i64) void {
         s.retrying = sub.retrying;
         s.follow = sub.follow;
         s.server = sub.server;
+        s.all = sub.all and !sub.server;
     }
+    if (s.all) return serviceAll(arena, s);
     if (s.server) s.adoptAll(a);
     var i: usize = 0;
     while (i < s.targets.items.len) {
@@ -1175,6 +1225,32 @@ fn serviceSub(a: std.mem.Allocator, s: *Sub, now_ms: i64) void {
     }
     // A server follower watches agents not opened yet.
     if (s.targets.items.len == 0 and !s.server) endSub(s, "agent closed");
+}
+
+/// An `all` waiter: once every target settled (a closed one included),
+/// one line with each one's outcome, what it delivers marked delivered.
+fn serviceAll(arena: std.mem.Allocator, s: *Sub) void {
+    for (s.targets.items) |*tg| {
+        if (tg.closed) continue;
+        const e = findById(tg.id) orelse {
+            tg.closed = true;
+            continue;
+        };
+        // A tool call on it is under way: its result gets what happens.
+        if (isHeld(e) or settleOf(e) == null) return;
+    }
+    const out = arena.alloc(agentwait.Settled, s.targets.items.len) catch return endSub(s, "out of memory");
+    for (s.targets.items, out) |*tg, *o| {
+        const e = (if (tg.closed) null else findById(tg.id)) orelse {
+            o.* = .{ .agent = tg.id, .outcome = "closed", .state = "" };
+            continue;
+        };
+        o.* = settledOf(e, settleOf(e).?);
+        // Delivered like any wake-up: no result repeats it.
+        if (tg.cursor.take(e.agent.queue(), .{}, clock.nowMs(), arena)) |_| {} else |_| {}
+    }
+    sendLine(s, agentwait.encodeAll(arena, out) catch return endSub(s, "out of memory"));
+    s.done = true;
 }
 
 /// Send the end line and let the client go.
@@ -1216,7 +1292,10 @@ fn endWaitersOf(id: []const u8, reason: []const u8) void {
     var i: usize = 0;
     while (i < state.waiter.subs.items.len) {
         const s = state.waiter.subs.items[i];
-        if (s.subscribed) if (s.watches(id)) |ti| s.drop(a, ti);
+        // An `all` waiter counts a closed agent as settled.
+        if (s.subscribed) if (s.watches(id)) |ti| {
+            if (s.all) s.targets.items[ti].closed = true else s.drop(a, ti);
+        };
         if (s.subscribed and s.targets.items.len == 0 and !s.server) {
             if (!s.done) endSub(s, reason);
             freeSub(a, s);
@@ -1244,12 +1323,21 @@ pub fn agentTool(arena: std.mem.Allocator, tool: Tool, args: std.json.Value) ![]
         .agent_adapters => adaptersTool(arena, args),
         .agent_open => openTool(arena, args),
         .agent_attach => if (argStr(args, "agent") != null) attachIdTool(arena, args) else attachTool(arena, args),
-        .agent_list => listTool(arena),
-        .agent_send => withEntry(arena, args, sendTool),
+        .agent_list => listTool(arena, args),
+        .agent_send => if (mcp.argValue(args, "agents")) |v| switch (v) {
+            .array => |list| if (argStr(args, "agent") != null)
+                errRes(arena, .invalid_args, "pass either 'agent' or 'agents', not both")
+            else
+                sendManyTool(arena, args, list.items),
+            else => errRes(arena, .invalid_args, "agents must be an array of agent ids or names"),
+        } else withEntry(arena, args, sendTool),
         .agent_wait => if (mcp.argValue(args, "agents")) |v| switch (v) {
-            .array => |list| waitAnyTool(arena, args, list.items),
+            .array => |list| if (argBool(args, "all")) waitAllTool(arena, args, list.items) else waitAnyTool(arena, args, list.items),
             else => errRes(arena, .invalid_args, "agents must be an array of agent ids"),
-        } else withEntry(arena, args, waitTool),
+        } else if (argBool(args, "all"))
+            errRes(arena, .invalid_args, "all waits on several agents: pass them as 'agents'")
+        else
+            withEntry(arena, args, waitTool),
         .agent_read => withEntry(arena, args, readTool),
         .agent_answer => withEntry(arena, args, answerTool),
         .agent_set => withEntry(arena, args, setTool),
@@ -1409,8 +1497,10 @@ fn toJson(arena: std.mem.Allocator, value: anytype) ![]const u8 {
 /// What a result's watch_command waits for.
 const Watch = struct {
     filter: events.Filter = .{},
-    /// Several agents (agent_wait `agents`): the first wake-up of any.
+    /// Several agents (agent_wait `agents`, agent_send `agents`).
     any: []const []const u8 = &.{},
+    /// How the command wakes on several: the first of any, or once all settled.
+    several: agentwait.Several = .any,
 };
 
 /// The facts and prose every per-agent result shares, then the payload
@@ -1483,19 +1573,7 @@ fn finish(arena: std.mem.Allocator, res: *Res, e: *Entry, dv: Delivered, watch: 
         }
     } else try res.textf("{s}: state {s}", .{ e.id, @tagName(st) });
 
-    const evs = try arena.alloc(EventJson, dv.items.len);
-    for (dv.items, evs) |it, *out| out.* = .{
-        .seq = it.event.seq,
-        .kind = @tagName(it.kind),
-        .text = eventText(it),
-        .record = it.event.record,
-        .detail = it.event.detail,
-        .count = it.event.count,
-        .class = if (it.event.class) |cls| @tagName(cls) else null,
-        .job = it.event.job,
-        .background_tasks = it.event.background_tasks,
-    };
-    try res.raw("events", try toJson(arena, evs));
+    try res.raw("events", try toJson(arena, try eventsJson(arena, dv.items)));
     if (dv.digest) |g| {
         const latest = if (q.bySeq(g.latest_seq)) |ev| events.preview(ev.text) else "";
         try res.raw("digest", try toJson(arena, .{ .count = g.count, .latest = latest }));
@@ -1514,7 +1592,7 @@ fn finish(arena: std.mem.Allocator, res: *Res, e: *Entry, dv: Delivered, watch: 
     if (state.exe) |exe| {
         if (state.waiter.path) |sock| {
             const one = [1][]const u8{e.id};
-            cmd = try agentwait.watchCommand(arena, exe, sock, if (watch.any.len > 0) watch.any else &one, watch.filter);
+            cmd = try agentwait.watchCommand(arena, exe, sock, if (watch.any.len > 0) watch.any else &one, watch.filter, watch.several);
             try res.fact("watch_command", cmd.?);
         }
     }
@@ -1691,6 +1769,8 @@ const OpenOpts = struct {
     extra: launch.Extra,
     /// The alias (`name`), also the sessions' title.
     name: ?[]const u8 = null,
+    /// A relaunch keeps the agent's id instead of minting one.
+    keep_id: ?[]const u8 = null,
 };
 
 /// A conversation id travels on the app's argv and in an API path, so only
@@ -1883,11 +1963,76 @@ fn openTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
         error.Refused => return errRes(arena, why.code, why.msg),
         else => return err,
     };
-    const name = o.override orelse loaded.spec.launch.binary;
+    // timeout_ms 0 is about the turn: the start and, with a prompt, the
+    // wait for the app to take it stay bounded by the default, so a prompt
+    // is handed off in one call (`sent`) instead of never being sent.
+    const start_deadline = if (state.no_wait) clock.nowMs() + DEFAULT_WAIT_MS else deadline;
     var facts: LaunchFacts = .{};
+    var claim: ?agentindex.Claim = null;
+    const st = startAgent(arena, loaded, &o, &claim, .{
+        .fresh_login = argBool(args, "fresh_login"),
+        .spawn = start_deadline,
+        .ready = if (o.prompt != null) start_deadline else deadline,
+    }, &facts, &why) catch |err| switch (err) {
+        error.Refused => return errRes(arena, why.code, why.msg),
+        else => return err,
+    };
+    const e = st.entry;
+    const ready = st.ready;
+    var notes = st.notes;
+    const filter = filterFrom(args);
+
+    var dv: Delivered = undefined;
+    var sent = false;
+    if (o.prompt) |p| {
+        if (ready) {
+            switch (try submitAndWait(arena, e, p, filter, deadline, false)) {
+                .fail => |f| {
+                    try notes.append(arena, try std.fmt.allocPrint(arena, "prompt not sent: {s}", .{f.msg}));
+                    dv = try pending(arena, e);
+                },
+                .ok => |d| {
+                    sent = true;
+                    dv = d;
+                },
+            }
+        } else {
+            try notes.append(arena, try std.fmt.allocPrint(arena, "prompt not sent: the agent was not ready within {d} ms", .{@max(0, start_deadline - st.started_ms)}));
+            dv = try pending(arena, e);
+        }
+    } else dv = try pending(arena, e);
+    return openResult(arena, e, ready, sent, notes.items, dv, filter, &facts);
+}
+
+/// The bounds of a start (`startAgent`).
+const StartBounds = struct {
+    fresh_login: bool = false,
+    /// The spawn, an API server's health included.
+    spawn: i64,
+    /// The app becoming ready to take input.
+    ready: i64,
+};
+
+/// A started agent: listed, indexed and held.
+const Started = struct {
+    entry: *Entry,
+    ready: bool,
+    /// What the start could not apply (a model or effort set in the app).
+    notes: std.ArrayList([]const u8),
+    started_ms: i64,
+};
+
+/// Resolve the binary where the agent runs, start it with `o`, list it,
+/// index it (holding `claim`, which is moved into the entry and nulled, or
+/// a fresh one) and wait for it to be ready. agent_open and agent_attach
+/// relaunch share it.
+/// @throws Refused with `why` set; `claim` is still the caller's unless nulled.
+fn startAgent(arena: std.mem.Allocator, loaded: *const adapter.Loaded, o: *OpenOpts, claim: *?agentindex.Claim, bounds: StartBounds, facts: *LaunchFacts, why: *Fail) !Started {
+    const started_ms = clock.nowMs();
+    const name = o.override orelse loaded.spec.launch.binary;
     // Before the first connection: which login the agent's legs ride, and a
     // fresh one when sketerm's master is too old or the caller asks.
-    if (o.host) |h| facts.master = try mcp_term.sshMasterCheck(arena, h, mcp_term.legs.script, argBool(args, "fresh_login"));
+    if (o.host) |h| facts.master = try mcp_term.sshMasterCheck(arena, h, mcp_term.legs.script, bounds.fresh_login);
     const binary = if (o.host) |h| blk: {
         // One probe on the host, in its login environment: the binary from
         // the adapter's candidates, its version, the dir, the home.
@@ -1896,48 +2041,59 @@ fn openTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
             .login = o.extra.login_shell,
             .path_prepend = o.extra.path_prepend,
         })) {
-            .fail => |f| return errRes(arena, f.code, f.msg),
+            .fail => |f| {
+                why.* = f;
+                return error.Refused;
+            },
             .ok => |r| r,
         };
-        if (r.dir_ok) |ok| if (!ok) return errRes(arena, .invalid_args, try std.fmt.allocPrint(arena, "cwd {s} is not a directory on {s}", .{ o.cwd.?, h }));
+        if (r.dir_ok) |ok| if (!ok) {
+            why.* = .{ .code = .invalid_args, .msg = try std.fmt.allocPrint(arena, "cwd {s} is not a directory on {s}", .{ o.cwd.?, h }) };
+            return error.Refused;
+        };
         if (o.cwd == null) o.cwd = r.home orelse "/";
         facts.version = r.versions[0];
         facts.login = r.login;
         facts.shell = r.shell;
-        break :blk r.binaries[0] orelse return errRes(arena, .unavailable, try std.fmt.allocPrint(arena, "cannot find {s} on {s} (looked in: {s}{s}); pass 'binary' with its name or absolute path there", .{ name, h, try candidateList(arena, loaded), if (r.login == false and o.extra.login_shell) ", the login shell did not answer in time" else "" }));
+        break :blk r.binaries[0] orelse {
+            why.* = .{ .code = .unavailable, .msg = try std.fmt.allocPrint(arena, "cannot find {s} on {s} (looked in: {s}{s}); pass 'binary' with its name or absolute path there", .{ name, h, try candidateList(arena, loaded), if (r.login == false and o.extra.login_shell) ", the login shell did not answer in time" else "" }) };
+            return error.Refused;
+        };
     } else blk: {
         var here = localHost();
         here.path = try launch.prependPath(arena, o.extra.path_prepend, here.path);
-        const found = (try launch.resolve(arena, loaded.spec.launch, o.override, here)) orelse
-            return errRes(arena, .unavailable, try std.fmt.allocPrint(arena, "cannot find {s} on this machine (looked in: {s}); pass 'binary' with its name or absolute path", .{ name, try candidateList(arena, loaded) }));
+        const found = (try launch.resolve(arena, loaded.spec.launch, o.override, here)) orelse {
+            why.* = .{ .code = .unavailable, .msg = try std.fmt.allocPrint(arena, "cannot find {s} on this machine (looked in: {s}); pass 'binary' with its name or absolute path", .{ name, try candidateList(arena, loaded) }) };
+            return error.Refused;
+        };
         facts.version = try localVersion(arena, loaded.spec.launch, found);
         break :blk found;
     };
 
     var where = Where{ .host = o.host, .cols = o.cols, .rows = o.rows };
-    const e = (switch (loaded.spec.source) {
-        .screen => spawnScreen(arena, loaded, binary, o, &where, deadline, &why),
-        .opencode_api => spawnApi(arena, loaded, binary, o, &where, deadline, &why),
-    }) catch |err| switch (err) {
-        error.Refused => return errRes(arena, why.code, why.msg),
-        else => return err,
+    const e = try switch (loaded.spec.source) {
+        .screen => spawnScreen(arena, loaded, binary, o.*, &where, bounds.spawn, why),
+        .opencode_api => spawnApi(arena, loaded, binary, o.*, &where, bounds.spawn, why),
     };
     state.entries.append(state.allocator, e) catch |err| {
         e.destroy(true);
         return err;
     };
-    claimNew(e);
+    if (claim.*) |cl| {
+        e.claim = cl;
+        claim.* = null;
+    } else claimNew(e);
     writeDescriptor(e);
     publishAgents();
     hold(e);
 
-    const filter = filterFrom(args);
-    const ready = waitReady(e, deadline);
+    const ready = waitReady(e, bounds.ready);
     // A conversation the app does not have is an error, never a new one
     // left running in its name.
     if (o.resume_id) |rid| if (try resumeRefused(arena, e, rid)) |msg| {
         discard(e);
-        return errRes(arena, .not_found, msg);
+        why.* = .{ .code = .not_found, .msg = msg };
+        return error.Refused;
     };
     // An adopted conversation's past was the caller's before: it is
     // history, never a first delivery (`since`/`detail:"all"` re-read it).
@@ -1951,33 +2107,13 @@ fn openTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
     // A model or effort the launch cannot take goes through the app.
     if (ready) {
         if (o.model) |m| if (!launch.launchTakes(loaded.spec.launch, .model)) {
-            if (try applySet(arena, e, .{ .set_model = m }, deadline)) |f| try notes.append(arena, try std.fmt.allocPrint(arena, "model not set: {s}", .{f.msg}));
+            if (try applySet(arena, e, .{ .set_model = m }, bounds.ready)) |f| try notes.append(arena, try std.fmt.allocPrint(arena, "model not set: {s}", .{f.msg}));
         };
         if (o.effort) |x| if (!launch.launchTakes(loaded.spec.launch, .effort)) {
-            if (try applySet(arena, e, .{ .set_effort = x }, deadline)) |f| try notes.append(arena, try std.fmt.allocPrint(arena, "effort not set: {s}", .{f.msg}));
+            if (try applySet(arena, e, .{ .set_effort = x }, bounds.ready)) |f| try notes.append(arena, try std.fmt.allocPrint(arena, "effort not set: {s}", .{f.msg}));
         };
     }
-
-    var dv: Delivered = undefined;
-    var sent = false;
-    if (o.prompt) |p| {
-        if (ready) {
-            switch (try submitAndWait(arena, e, p, filter, deadline)) {
-                .fail => |f| {
-                    try notes.append(arena, try std.fmt.allocPrint(arena, "prompt not sent: {s}", .{f.msg}));
-                    dv = try pending(arena, e);
-                },
-                .ok => |d| {
-                    sent = true;
-                    dv = d;
-                },
-            }
-        } else {
-            try notes.append(arena, "prompt not sent: the agent was not ready within timeout_ms");
-            dv = try pending(arena, e);
-        }
-    } else dv = try pending(arena, e);
-    return openResult(arena, e, ready, sent, notes.items, dv, filter, &facts);
+    return .{ .entry = e, .ready = ready, .notes = notes, .started_ms = started_ms };
 }
 
 /// What agent_open learned about the launch besides the entry itself.
@@ -2316,7 +2452,7 @@ fn spawnScreen(arena: std.mem.Allocator, loaded: *const adapter.Loaded, binary: 
     _ = deadline;
     const a = state.allocator;
     const spec = &loaded.spec;
-    const id = try mintId(arena, spec.id);
+    const id = o.keep_id orelse try mintId(arena, spec.id);
     const session = try std.fmt.allocPrint(arena, "agent-{s}", .{id});
     // A conversation id the agent owns, so a relaunch resumes exactly it;
     // `resume` continues the caller's existing one instead.
@@ -2421,7 +2557,7 @@ fn spawnApi(arena: std.mem.Allocator, loaded: *const adapter.Loaded, binary: []c
     const env: []const []const u8 = if (where.host == null) try arena.dupe([]const u8, &.{env_kv}) else &.{};
     const secret_env: ?[]const u8 = if (where.host == null) null else pw_env;
 
-    const id = try mintId(arena, spec.id);
+    const id = o.keep_id orelse try mintId(arena, spec.id);
     const session = try std.fmt.allocPrint(arena, "agent-{s}", .{id});
     const server_session = try std.fmt.allocPrint(arena, "agent-{s}-server", .{id});
     const what = try std.fmt.allocPrint(arena, "the {s} server", .{spec.name});
@@ -2571,31 +2707,94 @@ fn busy(arena: std.mem.Allocator, e: *Entry) !?Fail {
 
 const Sent = union(enum) { ok: Delivered, fail: Fail };
 
-fn submitAndWait(arena: std.mem.Allocator, e: *Entry, text: []const u8, filter: events.Filter, deadline: i64) !Sent {
+/// @param no_queue a busy agent is refused instead of queued (agent_send
+/// interrupt: it was stopped for this prompt).
+fn submitAndWait(arena: std.mem.Allocator, e: *Entry, text: []const u8, filter: events.Filter, deadline: i64, no_queue: bool) !Sent {
     service(clock.nowMs());
     const pre = try e.cursor.take(e.agent.queue(), .{}, clock.nowMs(), arena);
-    _ = waitReady(e, deadline);
-    // A busy agent's app queues the prompt for its next turn, when it can.
-    const queued = e.agent.state().queuesPrompt() and e.agent.supports(.queue);
-    if (queued) {
-        if (try queueRefusal(arena, e)) |f| return .{ .fail = f };
-    } else if (try busy(arena, e)) |f| return .{ .fail = f };
-    switch (try act(arena, e, if (queued) .{ .queue = text } else .{ .submit = text }, deadline)) {
+    const queued = switch (try submitPrompt(arena, e, text, deadline, no_queue)) {
         .fail => |f| return .{ .fail = f },
-        .ok => {},
-    }
-    if (queued) if (try confirmQueued(arena, e, deadline)) |f| return .{ .fail = f };
-    // The conversation has a turn now: a relaunch resumes it.
-    if (!e.conversed) {
-        e.conversed = true;
-        writeDescriptor(e);
-    }
+        .ok => |q| q,
+    };
     var dv = try waitAfter(arena, e, pre, filter, deadline);
     if (dv.wait) |*w| {
         w.sent = true;
         w.queued = queued;
     }
     return .{ .ok = dv };
+}
+
+/// Put `text` in as the agent's next prompt, or into its app's queue
+/// while it works (unless `no_queue`); `ok` says whether it was queued.
+/// The recipe's keys get at least `STEP_WAIT_MS` to land even when the
+/// caller does not wait for the turn.
+fn submitPrompt(arena: std.mem.Allocator, e: *Entry, text: []const u8, deadline: i64, no_queue: bool) !Submitted {
+    _ = waitReady(e, deadline);
+    // A busy agent's app queues the prompt for its next turn, when it can.
+    const queued = !no_queue and e.agent.state().queuesPrompt() and e.agent.supports(.queue);
+    if (queued) {
+        if (try queueRefusal(arena, e)) |f| return .{ .fail = f };
+    } else if (try busy(arena, e)) |f| return .{ .fail = f };
+    const act_deadline = @max(deadline, clock.nowMs() + STEP_WAIT_MS);
+    const from = e.agent.queue().next_seq;
+    switch (try act(arena, e, if (queued) .{ .queue = text } else .{ .submit = text }, act_deadline)) {
+        .fail => |f| return .{ .fail = f },
+        .ok => {},
+    }
+    if (queued) if (try confirmQueued(arena, e, act_deadline)) |f| return .{ .fail = f };
+    e.sent_seq = from;
+    // The conversation has a turn now: a relaunch resumes it.
+    if (!e.conversed) {
+        e.conversed = true;
+        writeDescriptor(e);
+    }
+    return .{ .ok = queued };
+}
+
+/// What agent_send `interrupt` did to one agent before its prompt.
+const Stopped = struct {
+    interrupted: bool = false,
+    /// Prompts the app held queued that the interrupt discarded.
+    queued_dropped: u32 = 0,
+    fail: ?Fail = null,
+};
+
+/// Whether `interrupt` must stop `e` before a prompt can go in as a new
+/// one: it works, or a prompt waits on the user.
+fn needsInterrupt(e: *Entry) bool {
+    const st = e.agent.state();
+    return st.queuesPrompt() or st == .waiting_user;
+}
+
+/// agent_send `interrupt`: interrupt every busy one of `list` at once, then
+/// wait (bounded, `STEP_WAIT_MS`) until each takes a prompt; one that does
+/// not gets a failure, never a prompt queued behind its turn.
+fn stopForSend(arena: std.mem.Allocator, list: []const *Entry, out: []Stopped) !void {
+    for (list, out) |e, *o| {
+        o.* = .{};
+        if (!needsInterrupt(e)) continue;
+        o.queued_dropped = e.agent.queuedPrompts();
+        switch (try act(arena, e, .interrupt, clock.nowMs() + STEP_WAIT_MS)) {
+            .fail => |f| o.fail = f,
+            .ok => o.interrupted = true,
+        }
+    }
+    const until = clock.nowMs() + STEP_WAIT_MS;
+    while (true) {
+        service(clock.nowMs());
+        var waiting = false;
+        for (list, out) |e, o| {
+            if (o.interrupted and !e.agent.state().takesPrompt() and !gone(e)) waiting = true;
+        }
+        if (!waiting or clock.nowMs() >= until) break;
+        pump(until - clock.nowMs());
+    }
+    for (list, out) |e, *o| {
+        if (!o.interrupted) continue;
+        o.queued_dropped -|= e.agent.queuedPrompts();
+        const st = e.agent.state();
+        if (!st.takesPrompt()) o.fail = .{ .code = .timeout, .msg = try std.fmt.allocPrint(arena, "agent {s} was interrupted but did not become idle within {d} ms (state {s}); nothing was sent", .{ e.id, STEP_WAIT_MS, @tagName(st) }) };
+    }
 }
 
 /// Why a prompt cannot be typed into a busy screen app's queue now, or
@@ -2944,20 +3143,161 @@ fn optionList(arena: std.mem.Allocator, it: ?output.Interaction) ![]const u8 {
 
 // ── agent_send / agent_wait / agent_answer / agent_set / ... ─────
 
+/// agent_send's `text`, or why it is refused.
+fn sendText(args: std.json.Value) union(enum) { ok: []const u8, fail: []const u8 } {
+    const text = argStr(args, "text") orelse return .{ .fail = "agent_send needs 'text'" };
+    if (std.mem.trim(u8, text, " \t\r\n").len == 0) return .{ .fail = "text is empty" };
+    return .{ .ok = text };
+}
+
 fn sendTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]const u8 {
-    const text = argStr(args, "text") orelse return errRes(arena, .invalid_args, "agent_send needs 'text'");
-    if (std.mem.trim(u8, text, " \t\r\n").len == 0) return errRes(arena, .invalid_args, "text is empty");
+    const text = switch (sendText(args)) {
+        .fail => |m| return errRes(arena, .invalid_args, m),
+        .ok => |t| t,
+    };
     const filter = filterFrom(args);
-    switch (try submitAndWait(arena, e, text, filter, deadlineFrom(args, DEFAULT_WAIT_MS))) {
+    const interrupt = argBool(args, "interrupt");
+    var stop = [1]Stopped{.{}};
+    if (interrupt) {
+        const one = [1]*Entry{e};
+        try stopForSend(arena, &one, &stop);
+        if (stop[0].fail) |f| return errRes(arena, f.code, f.msg);
+    }
+    switch (try submitAndWait(arena, e, text, filter, deadlineFrom(args, DEFAULT_WAIT_MS), interrupt)) {
         .fail => |f| return errRes(arena, f.code, f.msg),
         .ok => |dv| {
             var res = Res.init(arena);
             const queued = if (dv.wait) |w| w.queued else false;
             try res.fact("queued", queued);
+            if (interrupt) try res.fact("interrupted", stop[0].interrupted);
+            if (stop[0].queued_dropped > 0) try res.fact("queued_dropped", stop[0].queued_dropped);
+            if (stop[0].interrupted) try res.textf("{s} was busy: interrupted it first, then sent the prompt as a new one{s}", .{ e.id, if (stop[0].queued_dropped > 0) " (its app dropped the prompts it held queued)" else "" });
             if (queued) try res.textf("{s} was busy: the prompt went into its queue for its next turn", .{e.id});
             return finish(arena, &res, e, dv, .{ .filter = filter }, &.{});
         },
     }
+}
+
+/// One agent's line of a multi-agent agent_send.
+const SendResult = struct {
+    agent: []const u8,
+    name: ?[]const u8 = null,
+    /// sent, queued, still_working (`outcomeOf`), or failed.
+    outcome: []const u8 = "failed",
+    state: ?[]const u8 = null,
+    queued: bool = false,
+    interrupted: bool = false,
+    queued_dropped: ?u32 = null,
+    /// Events no result had handed out, taken with the send.
+    events: ?[]const EventJson = null,
+    @"error": ?struct { code: []const u8, message: []const u8 } = null,
+};
+
+/// agent_send with `agents`: the same prompt to each (interrupting the busy
+/// ones first with `interrupt`), one result per agent; a failure is that
+/// agent's, never the call's. It does not wait for the turns.
+fn sendManyTool(arena: std.mem.Allocator, args: std.json.Value, list: []const std.json.Value) ![]const u8 {
+    const text = switch (sendText(args)) {
+        .fail => |m| return errRes(arena, .invalid_args, m),
+        .ok => |t| t,
+    };
+    if (list.len == 0) return errRes(arena, .invalid_args, "agents is empty: name at least one agent");
+    if (list.len > MAX_ANY) return errRes(arena, .invalid_args, try std.fmt.allocPrint(arena, "agents names at most {d} agents", .{MAX_ANY}));
+    const interrupt = argBool(args, "interrupt");
+    const deadline = deadlineFrom(args, DEFAULT_WAIT_MS);
+    var results: std.ArrayList(SendResult) = .empty;
+    var entries: std.ArrayList(*Entry) = .empty;
+    var slots: std.ArrayList(usize) = .empty;
+    for (list) |v| {
+        if (v != .string) {
+            try results.append(arena, .{ .agent = "", .@"error" = .{ .code = @tagName(mcp.ErrCode.invalid_args), .message = "not an agent id or name (a string)" } });
+            continue;
+        }
+        const e = findByName(v.string) orelse {
+            try results.append(arena, .{ .agent = v.string, .@"error" = .{ .code = @tagName(mcp.ErrCode.not_found), .message = try std.fmt.allocPrint(arena, "no agent '{s}' on this server (open: {s})", .{ v.string, try idList(arena) }) } });
+            continue;
+        };
+        if (std.mem.indexOfScalar(*Entry, entries.items, e) != null) continue;
+        hold(e);
+        try entries.append(arena, e);
+        try slots.append(arena, results.items.len);
+        try results.append(arena, .{ .agent = e.id, .name = e.name });
+    }
+    for (entries.items) |e| reconnectIfLost(e);
+    service(clock.nowMs());
+    const stops = try arena.alloc(Stopped, entries.items.len);
+    @memset(stops, .{});
+    if (interrupt) try stopForSend(arena, entries.items, stops);
+    var sent: std.ArrayList([]const u8) = .empty;
+    for (entries.items, slots.items, stops) |e, slot, stop| {
+        const r = &results.items[slot];
+        r.interrupted = stop.interrupted;
+        if (stop.queued_dropped > 0) r.queued_dropped = stop.queued_dropped;
+        // What no result handed out yet rides with this agent's line.
+        if (try e.cursor.take(e.agent.queue(), .{}, clock.nowMs(), arena)) |d| r.events = try eventsJson(arena, d.items);
+        const outcome = if (stop.fail) |f| Submitted{ .fail = f } else try submitPrompt(arena, e, text, deadline, interrupt);
+        r.state = @tagName(e.agent.state());
+        switch (outcome) {
+            .fail => |f| r.@"error" = .{ .code = @tagName(f.code), .message = f.msg },
+            .ok => |queued| {
+                r.queued = queued;
+                r.outcome = outcomeOf(&.{}, e.agent.state(), true, queued and e.agent.queuedPrompts() > 0);
+                rememberFilter(e, .{});
+                try sent.append(arena, e.id);
+            },
+        }
+    }
+
+    var res = Res.init(arena);
+    const failed = results.items.len - sent.items.len;
+    try res.textf("sent to {d} of {d} agent(s){s}", .{ sent.items.len, results.items.len, if (interrupt) ", the busy ones interrupted first" else "" });
+    var ids: std.ArrayList([]const u8) = .empty;
+    for (entries.items) |e| try ids.append(arena, e.id);
+    try res.fact("agents", ids.items);
+    try res.raw("results", try toJson(arena, results.items));
+    try res.fact("count", results.items.len);
+    try res.fact("failed", failed);
+    for (results.items) |r| {
+        if (r.@"error") |er|
+            try res.textf("{s}: failed ({s}): {s}", .{ if (r.agent.len > 0) r.agent else "?", er.code, er.message })
+        else
+            try res.textf("{s}: {s}{s}{s}", .{ r.agent, r.outcome, if (r.interrupted) " (interrupted first)" else "", if (r.queued_dropped != null) "; its app dropped the prompts it held queued" else "" });
+    }
+    var cmd: ?[]const u8 = null;
+    if (sent.items.len > 0) if (state.exe) |exe| if (state.waiter.path) |sock| {
+        cmd = try agentwait.watchCommand(arena, exe, sock, sent.items, .{}, if (sent.items.len > 1) .all else .any);
+        try res.fact("watch_command", cmd.?);
+    };
+    if (sent.items.len > 0) {
+        if (pushing())
+            try res.text("their events are pushed into this session as they happen, so end your turn here; no watch_command, Monitor or agent_wait is needed")
+        else if (sent.items.len > 1)
+            try res.text("run watch_command in the background to be woken ONCE when every one of them has settled (agent-wait --all; --any wakes on the first), then agent_read final per agent")
+        else
+            try res.text("run watch_command in the background to be woken when it has answered");
+    }
+    if (cmd) |x| try block(&res, .{ .name = "watch_command", .body = x });
+    return res.finish();
+}
+
+/// A prompt that went in (queued or not), or why not.
+const Submitted = union(enum) { ok: bool, fail: Fail };
+
+/// Delivered events as results list them (`finish`'s `events`).
+fn eventsJson(arena: std.mem.Allocator, items: []const events.Item) ![]const EventJson {
+    const evs = try arena.alloc(EventJson, items.len);
+    for (items, evs) |it, *out| out.* = .{
+        .seq = it.event.seq,
+        .kind = @tagName(it.kind),
+        .text = eventText(it),
+        .record = it.event.record,
+        .detail = it.event.detail,
+        .count = it.event.count,
+        .class = if (it.event.class) |cls| @tagName(cls) else null,
+        .job = it.event.job,
+        .background_tasks = it.event.background_tasks,
+    };
+    return evs;
 }
 
 fn waitTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]const u8 {
@@ -2969,29 +3309,109 @@ fn waitTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]const 
 
 /// agent_wait with `agents`: the first wake-up of any of them; the result
 /// is that agent's (the first listed one's when none woke).
-fn waitAnyTool(arena: std.mem.Allocator, args: std.json.Value, list: []const std.json.Value) ![]const u8 {
-    if (list.len == 0) return errRes(arena, .invalid_args, "agents is empty: name at least one agent id");
-    if (list.len > MAX_ANY) return errRes(arena, .invalid_args, try std.fmt.allocPrint(arena, "agents names at most {d} agents", .{MAX_ANY}));
+/// agent_wait's `agents`, each once, held; or the refusal.
+const Waited = struct { entries: []*Entry, ids: []const []const u8 };
+
+fn waitedOf(arena: std.mem.Allocator, list: []const std.json.Value) !union(enum) { ok: Waited, fail: Fail } {
+    if (list.len == 0) return .{ .fail = .{ .code = .invalid_args, .msg = "agents is empty: name at least one agent id" } };
+    if (list.len > MAX_ANY) return .{ .fail = .{ .code = .invalid_args, .msg = try std.fmt.allocPrint(arena, "agents names at most {d} agents", .{MAX_ANY}) } };
     var entries: std.ArrayList(*Entry) = .empty;
     var ids: std.ArrayList([]const u8) = .empty;
     for (list) |v| {
-        if (v != .string) return errRes(arena, .invalid_args, "agents must be an array of agent ids");
+        if (v != .string) return .{ .fail = .{ .code = .invalid_args, .msg = "agents must be an array of agent ids" } };
         const e = findByName(v.string) orelse
-            return errRes(arena, .not_found, try std.fmt.allocPrint(arena, "no agent '{s}' (open: {s})", .{ v.string, try idList(arena) }));
+            return .{ .fail = .{ .code = .not_found, .msg = try std.fmt.allocPrint(arena, "no agent '{s}' (open: {s})", .{ v.string, try idList(arena) }) } };
         if (std.mem.indexOfScalar(*Entry, entries.items, e) != null) continue;
         try entries.append(arena, e);
         try ids.append(arena, e.id);
         hold(e);
     }
     for (entries.items) |e| reconnectIfLost(e);
+    return .{ .ok = .{ .entries = entries.items, .ids = ids.items } };
+}
+
+/// agent_wait `agents` + `all`: wait until every one settled (`settleOf`),
+/// then one line each with how it settled, what it delivers marked
+/// delivered like a waiter's.
+fn waitAllTool(arena: std.mem.Allocator, args: std.json.Value, list: []const std.json.Value) ![]const u8 {
+    const w = switch (try waitedOf(arena, list)) {
+        .fail => |f| return errRes(arena, f.code, f.msg),
+        .ok => |x| x,
+    };
+    const deadline = deadlineFrom(args, DEFAULT_WAIT_MS);
+    service(clock.nowMs());
+    var settled: usize = 0;
+    while (true) {
+        settled = 0;
+        for (w.entries) |e| {
+            if (settleOf(e) != null) settled += 1;
+        }
+        if (settled == w.entries.len or clock.nowMs() >= deadline) break;
+        pump(deadline - clock.nowMs());
+    }
+    const Item = struct {
+        agent: []const u8,
+        name: ?[]const u8,
+        outcome: []const u8,
+        state: []const u8,
+        settled: bool,
+        text: []const u8,
+        record: ?u64,
+        conversation: ?[]const u8,
+        events: []const EventJson,
+    };
+    const items = try arena.alloc(Item, w.entries.len);
+    const all = settled == w.entries.len;
+    var res = Res.init(arena);
+    if (all)
+        try res.textf("all {d} agent(s) settled", .{w.entries.len})
+    else
+        try res.textf("{d} of {d} agent(s) settled when the wait ran out", .{ settled, w.entries.len });
+    for (w.entries, items) |e, *o| {
+        const st = e.agent.state();
+        o.* = .{ .agent = e.id, .name = e.name, .outcome = outcomeOf(&.{}, st, e.sent_seq != null, false), .state = @tagName(st), .settled = false, .text = "", .record = null, .conversation = conversationOf(e), .events = &.{} };
+        if (settleOf(e)) |s| {
+            const line = settledOf(e, s);
+            o.outcome = line.outcome;
+            o.text = line.text;
+            o.record = line.record;
+            o.settled = true;
+            if (try e.cursor.take(e.agent.queue(), .{}, clock.nowMs(), arena)) |d| o.events = try eventsJson(arena, d.items);
+        }
+        try res.textf("{s}: {s}{s}{s}", .{ e.id, o.outcome, if (o.text.len > 0) ": " else "", agentwait.clip(events.firstLine(o.text), 160) });
+    }
+    try res.fact("agents", w.ids);
+    try res.fact("outcome", if (all) @tagName(vocab.WaitOutcome.all_settled) else @tagName(vocab.WaitOutcome.still_working));
+    try res.fact("timed_out", !all and !state.no_wait);
+    try res.raw("results", try toJson(arena, items));
+    if (all) try res.text("agent_read with final: true returns each one's final message whole");
+    if (!all and pushing())
+        try res.text("their events are pushed into this session as they happen, so end your turn here")
+    else if (!all)
+        try res.text("run watch_command in the background to be woken once every one of them has settled");
+    if (state.exe) |exe| if (state.waiter.path) |sock| {
+        const cmd = try agentwait.watchCommand(arena, exe, sock, w.ids, .{}, .all);
+        try res.fact("watch_command", cmd);
+        try block(&res, .{ .name = "watch_command", .body = cmd });
+    };
+    return res.finish();
+}
+
+fn waitAnyTool(arena: std.mem.Allocator, args: std.json.Value, list: []const std.json.Value) ![]const u8 {
+    const w = switch (try waitedOf(arena, list)) {
+        .fail => |f| return errRes(arena, f.code, f.msg),
+        .ok => |x| x,
+    };
+    const entries = w.entries;
+    const ids = w.ids;
     const filter = filterFrom(args);
-    const got = try waitAny(entries.items, filter, deadlineFrom(args, DEFAULT_WAIT_MS), arena);
-    const e = if (got) |g| g.entry else entries.items[0];
+    const got = try waitAny(entries, filter, deadlineFrom(args, DEFAULT_WAIT_MS), arena);
+    const e = if (got) |g| g.entry else entries[0];
     const dv = try combine(arena, null, if (got) |g| g.delivery else null, true, got == null and !gone(e));
     var res = Res.init(arena);
-    try res.fact("agents", ids.items);
-    if (got != null) try res.textf("{s} woke first of {d} agent(s)", .{ e.id, ids.items.len });
-    return finish(arena, &res, e, dv, .{ .filter = filter, .any = ids.items }, &.{});
+    try res.fact("agents", ids);
+    if (got != null) try res.textf("{s} woke first of {d} agent(s)", .{ e.id, ids.len });
+    return finish(arena, &res, e, dv, .{ .filter = filter, .any = ids }, &.{});
 }
 
 fn answerTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]const u8 {
@@ -3022,10 +3442,13 @@ fn answerTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]cons
     // A prompt before the app is ready (Claude Code's trust dialog): the
     // answer leads to the app getting ready, not to a turn.
     const startup = !e.agent.ready();
+    const from = e.agent.queue().next_seq;
     switch (try act(arena, e, .{ .answer = choice }, deadline)) {
         .fail => |f| return errRes(arena, f.code, f.msg),
         .ok => {},
     }
+    // The turn goes on: it has not settled until something after this does.
+    if (!startup) e.sent_seq = from;
     if (startup) {
         const ready = waitReady(e, deadline);
         var res = Res.init(arena);
@@ -3070,6 +3493,8 @@ fn answerTextTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry, tex
         .fail => |f| return errRes(arena, f.code, f.msg),
         .ok => {},
     }
+    // After the recipe: the turn the option ended settled inside it.
+    e.sent_seq = e.agent.queue().next_seq;
     // What the recipe's own steps caused (the turn the option ended going
     // idle) rides along; the wait is for what the text brings.
     const mid = try e.cursor.take(e.agent.queue(), .{}, clock.nowMs(), arena);
@@ -3244,19 +3669,26 @@ fn readTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]const 
     else
         select.Detail.selected;
     const explicit = argInt(args, "since");
+    // Only the newest job's last assistant message.
+    const final = argBool(args, "final");
+    if (final and detail == .all) return errRes(arena, .invalid_args, "final returns one message: it does not combine with detail \"all\"");
     const limit: usize = @intCast(std.math.clamp(argInt(args, "limit") orelse READ_DEFAULT, 1, READ_MAX));
     const recs = e.agent.records();
     // The default read: every job, minus what was handed out before. An
     // explicit `since` or `all` is a deliberate re-read of what it names.
     const delivery = detail == .selected and explicit == null;
     const base: u64 = if (explicit) |s| @intCast(@max(s, 0)) else if (delivery) 0 else e.read_cursor;
-    const jobs = try select.jobsAfter(arena, recs, base);
+    const after = try select.jobsAfter(arena, recs, base);
+    const jobs = if (final and after.len > 0) after[after.len - 1 ..] else after;
     const sel = try select.select(arena, recs, jobs, .{
         .detail = detail,
         .include_tools = argBool(args, "include_tools"),
         .limit = limit,
         .since = base,
         .handed = if (delivery) &e.handed else null,
+        // A final read names its job even with nothing new, to point at it.
+        .keep_empty = final,
+        .final_only = final,
     });
     try e.handed.markSelection(e.allocator, recs, sel);
     var high = base;
@@ -3268,9 +3700,18 @@ fn readTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]const 
 
     var res = Res.init(arena);
     const body = try writeSelection(arena, &res, recs, sel);
+    if (final) try res.fact("final", true);
     if (recs.len == 0)
         try res.text("no records yet")
-    else if (sel.jobs.len == 0)
+    else if (final and sel.jobs.len > 0) {
+        const j = sel.jobs[0];
+        if (sel.picked.len > 0)
+            try res.textf("job {d}'s final message [{d}]; next_since {d}", .{ j.job, recs[sel.picked[0]].id, next })
+        else if (j.earlier) |x|
+            try res.textf("job {d}'s final message [{d}] was returned before (final with since 0 re-reads it)", .{ j.job, x.id })
+        else
+            try res.textf("job {d} has no assistant message yet (state {s})", .{ j.job, @tagName(e.agent.state()) });
+    } else if (sel.jobs.len == 0)
         try res.textf("nothing new since the last read; next_since {d}", .{next})
     else
         try res.textf("{d} record(s) of job(s) {d}-{d}; next_since {d}{s}", .{
@@ -3287,8 +3728,9 @@ fn readTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]const 
     return finish(arena, &res, e, try pending(arena, e), .{}, blocks[0..@intFromBool(sel.jobs.len > 0)]);
 }
 
-fn listTool(arena: std.mem.Allocator) ![]const u8 {
+fn listTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
     service(clock.nowMs());
+    if (!argBool(args, "detail")) return listCompact(arena);
     const Item = struct {
         agent: []const u8,
         name: ?[]const u8,
@@ -3365,6 +3807,60 @@ fn listTool(arena: std.mem.Allocator) ![]const u8 {
     }
     try res.raw("agents", try toJson(arena, items));
     try res.fact("count", items.len);
+    try res.fact("detail", true);
+    return res.finish();
+}
+
+/// agent_list's default: what an orchestrator of many agents scans each
+/// turn (with 17 agents the full facts cost ~5k tokens), one line each.
+fn listCompact(arena: std.mem.Allocator) ![]const u8 {
+    const Pending = struct { kind: []const u8, title: []const u8 };
+    const Item = struct {
+        agent: []const u8,
+        name: ?[]const u8,
+        app: []const u8,
+        state: []const u8,
+        /// The SSH host, or "local".
+        host: []const u8,
+        cwd: []const u8,
+        /// Seconds since the app last drew or sent anything.
+        idle_s: ?i64,
+        queued: u32,
+        pending: ?Pending,
+        conversation: ?[]const u8,
+    };
+    const items = try arena.alloc(Item, state.entries.items.len);
+    var res = Res.init(arena);
+    try res.textf("{d} agent(s)", .{items.len});
+    const mono = clock.nowMs();
+    for (state.entries.items, items) |e, *out| {
+        const act_ms = e.agent.lastActivityMs();
+        const it = e.agent.interaction();
+        out.* = .{
+            .agent = e.id,
+            .name = e.name,
+            .app = e.loaded.spec.id,
+            .state = @tagName(e.agent.state()),
+            .host = e.host orelse "local",
+            .cwd = e.cwd,
+            .idle_s = if (act_ms > 0) @divTrunc(@max(0, mono - act_ms), 1000) else null,
+            .queued = e.agent.queuedPrompts(),
+            .pending = if (it) |x| .{ .kind = @tagName(x.kind), .title = x.title } else null,
+            .conversation = conversationOf(e),
+        };
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        const w = &aw.writer;
+        try w.print("{s}", .{e.id});
+        if (e.name) |n| try w.print(" ({s})", .{n});
+        try w.print(" {s} {s} on {s} in {s}", .{ out.app, out.state, out.host, out.cwd });
+        if (out.idle_s) |x| try w.print(", idle {d}s", .{x});
+        if (out.queued > 0) try w.print(", {d} queued", .{out.queued});
+        if (out.pending) |p| try w.print(", pending {s}: {s}", .{ p.kind, agentwait.clip(events.firstLine(p.title), 80) });
+        try res.text(aw.written());
+    }
+    try res.raw("agents", try toJson(arena, items));
+    try res.fact("count", items.len);
+    try res.fact("detail", false);
     return res.finish();
 }
 
@@ -3484,6 +3980,7 @@ fn writeDescriptor(e: *Entry) void {
         .path_prepend = e.extra.path_prepend,
         .login_shell = e.extra.login_shell,
         .started_ms = e.started_ms,
+        .gone_ms = e.ended_ms,
     };
     agentindex.write(arena, index_dir, d) catch return;
     e.indexed = true;
@@ -3574,14 +4071,14 @@ fn reattachInstance() void {
         const parsed = agentindex.read(arena, index_dir, id) orelse continue;
         const d = parsed.value;
         const mine = if (d.instance) |x| std.mem.eql(u8, x, inst) else false;
-        if (!mine) continue;
+        // Known gone: only agent_attach relaunch starts it again.
+        if (!mine or d.gone_ms > 0) continue;
         const lp = lockPath(arena, id) catch continue;
         var claimed = agentindex.claim(lp, false) catch continue;
         var why: AttachWhy = .{};
         _ = reattachOne(arena, d, claimed, &why) catch |err| {
             if (err == error.SessionGone) {
-                agentindex.remove(arena, index_dir, id);
-                claimed.release(lp, true);
+                _ = retireDescriptor(arena, index_dir, d, &claimed, lp);
             } else claimed.release(lp, false);
         };
     }
@@ -3599,6 +4096,15 @@ fn sweepIndex() void {
     for (agentindex.ids(arena, index_dir) catch return) |id| {
         const parsed = agentindex.read(arena, index_dir, id) orelse continue;
         const d = parsed.value;
+        // Kept for a relaunch: for the idle lifetime its sessions would have had.
+        if (d.gone_ms > 0) {
+            if (clock.wallMs() - d.gone_ms < @as(i64, state.ttl_secs) * 1000) continue;
+            const lp = lockPath(arena, id) catch continue;
+            var claimed = agentindex.claim(lp, false) catch continue;
+            agentindex.remove(arena, index_dir, id);
+            claimed.release(lp, true);
+            continue;
+        }
         const sock = d.socket orelse continue;
         if (d.host != null and !std.mem.eql(u8, d.transport orelse "", @tagName(Transport.ssh))) continue;
         const lp = lockPath(arena, id) catch continue;
@@ -3611,10 +4117,44 @@ fn sweepIndex() void {
             if (conn.tombstone(arena, d.session, d.origin, TOMBSTONE_WAIT_MS) catch null) |r| ended = r.value.found;
         } else |_| {}
         if (ended) {
-            agentindex.remove(arena, index_dir, id);
-            claimed.release(lp, true);
+            _ = retireDescriptor(arena, index_dir, d, &claimed, lp);
         } else claimed.release(lp, false);
     }
+}
+
+/// Whether an agent that ended can be started again with its launch
+/// settings, resuming its conversation (`agent_attach relaunch`).
+fn canRelaunch(loaded: *const adapter.Loaded, binary: []const u8, cwd: []const u8, conversed: bool, conversation: ?[]const u8) bool {
+    if (binary.len == 0 or cwd.len == 0) return false;
+    return switch (loaded.spec.source) {
+        .screen => !conversed or (conversation != null and loaded.spec.launch.resume_args.len > 0),
+        .opencode_api => true,
+    };
+}
+
+fn descRelaunchable(d: Descriptor) bool {
+    const loaded = (adapters() catch return false).get(d.app) orelse return false;
+    if (d.transport) |t| if (std.meta.stringToEnum(Transport, t) == null) return false;
+    return canRelaunch(loaded, d.binary, d.cwd, d.conversed, d.conversation);
+}
+
+/// Descriptor `d`'s sessions are gone: it stays, stamped `gone_ms`, while it
+/// can be relaunched, else it leaves the index with its lock. `claimed` is
+/// released either way.
+/// @return whether it was kept.
+fn retireDescriptor(arena: std.mem.Allocator, index_dir: []const u8, d: Descriptor, claimed: *agentindex.Claim, lp: []const u8) bool {
+    if (descRelaunchable(d)) {
+        if (d.gone_ms == 0) {
+            var kept = d;
+            kept.gone_ms = clock.wallMs();
+            agentindex.write(arena, index_dir, kept) catch {};
+        }
+        claimed.release(lp, false);
+        return true;
+    }
+    agentindex.remove(arena, index_dir, d.id);
+    claimed.release(lp, true);
+    return false;
 }
 
 /// Publish into the MCP registry record (`mcp_registry.Lease`) so a viewer
@@ -3827,17 +4367,30 @@ fn reattachOne(arena: std.mem.Allocator, d: Descriptor, claim: ?agentindex.Claim
 fn attachIdTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
     const key = argStr(args, "agent").?;
     const deadline = deadlineFrom(args, ATTACH_WAIT_MS);
-    // Already ours: nothing to resume.
+    const relaunch_asked = argBool(args, "relaunch");
+    // Already ours: nothing to resume, unless its app ended here and the
+    // caller asks to start it again.
     if (findByName(key)) |e| {
         hold(e);
-        return reattachedResult(arena, e, "already attached to this server");
+        if (!relaunch_asked or !gone(e))
+            return reattachedResult(arena, e, if (relaunch_asked) "already attached and not gone: relaunch only starts an agent whose session ended" else "already attached to this server");
+        if (e.ended_ms == 0)
+            return errRes(arena, .refused, try std.fmt.allocPrint(arena, "agent {s} ended and cannot be relaunched (no conversation to resume, or it runs on a term_open terminal); agent_open a new one", .{e.id}));
+        // Let it go (its descriptor stays) and start it again below.
+        endWaitersOf(e.id, "the agent is being relaunched");
+        for (state.entries.items, 0..) |x, i| if (x == e) {
+            _ = state.entries.orderedRemove(i);
+            break;
+        };
+        e.destroy(false);
+        publishAgents();
     }
     const index_dir = state.index_dir orelse
         return errRes(arena, .unavailable, "no state directory ($XDG_STATE_HOME or $HOME) to keep the agent index in");
     const d = (try agentindex.resolve(arena, index_dir, key)) orelse {
         // No longer in the index: this host's daemon may still say why it
         // ended (its tombstone knows the session name and the agent's name).
-        if (try localTombstone(arena, key)) |why| return goneResult(arena, .{ .id = key, .app = "", .session = why.session, .origin = "" }, &why);
+        if (try localTombstone(arena, key)) |why| return goneResult(arena, .{ .id = key, .app = "", .session = why.session, .origin = "" }, &why, false);
         var known: std.ArrayList(u8) = .empty;
         for (try agentindex.ids(arena, index_dir), 0..) |id, i| {
             if (i > 0) try known.appendSlice(arena, ", ");
@@ -3854,9 +4407,9 @@ fn attachIdTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
     var why: AttachWhy = .{};
     const e = reattachOne(arena, d, claimed, &why) catch |err| switch (err) {
         error.SessionGone => {
-            agentindex.remove(arena, index_dir, d.id);
-            claimed.release(lp, true);
-            return goneResult(arena, d, &why);
+            if (relaunch_asked and descRelaunchable(d)) return relaunchFrom(arena, args, d, &claimed, lp, &why);
+            const kept = retireDescriptor(arena, index_dir, d, &claimed, lp);
+            return goneResult(arena, d, &why, kept);
         },
         error.Unreachable => {
             claimed.release(lp, false);
@@ -3877,7 +4430,72 @@ fn attachIdTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
     // A screen source folds turns only at a turn end: fold the transcript
     // the attach snapshot shows now, so its latest job can be returned.
     if (waitReady(e, deadline)) try e.agent.syncHistory();
-    return reattachedResult(arena, e, null);
+    return reattachedResult(arena, e, if (relaunch_asked) "its session was still running: reattached, not relaunched" else null);
+}
+
+/// agent_attach relaunch: start a gone agent again from descriptor `d`
+/// with its launch settings, resuming its conversation, under the same id
+/// and name. `claimed` moves into the agent; on a failure it is released
+/// and the descriptor stays, so the relaunch can be tried again.
+fn relaunchFrom(arena: std.mem.Allocator, args: std.json.Value, d: Descriptor, claimed: *agentindex.Claim, lp: []const u8, gone_why: *const AttachWhy) ![]const u8 {
+    const loaded = (try adapters()).get(d.app).?;
+    const transport: Transport = if (d.transport) |s| std.meta.stringToEnum(Transport, s).? else .local;
+    var o = OpenOpts{
+        .override = d.binary,
+        .model = d.launch_model,
+        .effort = d.launch_effort,
+        .cwd = d.cwd,
+        .prompt = null,
+        // The conversation it had: a screen app's only once it had a turn
+        // (a fresh one starts afresh), an API source's session always.
+        .resume_id = switch (loaded.spec.source) {
+            .screen => if (d.conversed) d.conversation else null,
+            .opencode_api => d.api_session,
+        },
+        .cols = d.cols,
+        .rows = d.rows,
+        .host = d.host,
+        .choice = switch (transport) {
+            .local => .auto,
+            .ssh => .ssh,
+            .@"sketerm-mux" => .mux,
+        },
+        .extra = .{ .args = d.args, .server_args = d.server_args, .tui_args = d.tui_args, .env = d.env, .path_prepend = d.path_prepend, .login_shell = d.login_shell },
+        .name = d.name,
+        .keep_id = d.id,
+    };
+    const deadline = deadlineFrom(args, DEFAULT_WAIT_MS);
+    var claim: ?agentindex.Claim = claimed.*;
+    var facts: LaunchFacts = .{};
+    var why: Fail = undefined;
+    const st = startAgent(arena, loaded, &o, &claim, .{ .fresh_login = argBool(args, "fresh_login"), .spawn = deadline, .ready = deadline }, &facts, &why) catch |err| {
+        if (claim) |*cl| cl.release(lp, false);
+        return switch (err) {
+            error.Refused => errRes(arena, why.code, try std.fmt.allocPrint(arena, "agent {s} is gone and could not be relaunched: {s}", .{ d.id, why.msg })),
+            else => err,
+        };
+    };
+    const e = st.entry;
+    var notes = st.notes;
+    // A model chosen in the app since the launch is not a launch value.
+    if (st.ready) if (d.picked_model) |m| {
+        if (try applySet(arena, e, .{ .set_model = m }, deadline)) |f| try notes.append(arena, try std.fmt.allocPrint(arena, "the model chosen before ({s}) was not chosen again: {s}", .{ m, f.msg }));
+    };
+    var res = Res.init(arena);
+    try res.fact("attach", "relaunched");
+    try res.textf("relaunched {s}{s}{s}{s}: its session had ended ({s}), so it was started again with its launch settings{s}", .{
+        e.id,
+        if (e.name != null) " (" else "",
+        e.name orelse "",
+        if (e.name != null) ")" else "",
+        if (gone_why.tomb) |tb| (if (tb.reason) |r| @tagName(r) else "reason unknown") else "reason unknown",
+        if (o.resume_id != null) ", resuming its conversation" else "",
+    });
+    if (!st.ready) try res.textf("not ready yet (state {s}); agent_send waits for it", .{@tagName(e.agent.state())});
+    for (notes.items) |n| try res.text(n);
+    try res.fact("binary", e.binary);
+    try res.fact("cwd", e.cwd);
+    return finish(arena, &res, e, try pending(arena, e), .{}, &.{});
 }
 
 /// A resumed agent with its latest job selection, as a first read returns
@@ -3912,10 +4530,12 @@ fn localTombstone(arena: std.mem.Allocator, key: []const u8) !?AttachWhy {
     return null;
 }
 
-fn goneResult(arena: std.mem.Allocator, d: Descriptor, why: *const AttachWhy) ![]const u8 {
+/// @param relaunchable its descriptor stays: `relaunch: true` starts it again.
+fn goneResult(arena: std.mem.Allocator, d: Descriptor, why: *const AttachWhy, relaunchable: bool) ![]const u8 {
     var res = Res.init(arena);
     try res.fact("attach", "gone");
     try res.fact("agent", d.id);
+    try res.fact("relaunchable", relaunchable);
     if (d.name) |n| try res.fact("name", n);
     try res.fact("session", why.session);
     if (d.host) |h| try res.fact("host", h);
@@ -3934,7 +4554,10 @@ fn goneResult(arena: std.mem.Allocator, d: Descriptor, why: *const AttachWhy) ![
     } else "reason unknown: the daemon keeps no record of it (an older daemon, or it ended long ago)";
     try res.textf("agent {s} is gone: {s}", .{ d.id, detail });
     if (why.msg.len > 0) try res.textf("the daemon said: {s}", .{why.msg});
-    try res.text("it is not in the agent index (any more); agent_open starts a new one");
+    if (relaunchable)
+        try res.textf("agent_attach with agent \"{s}\" and relaunch: true starts it again with its launch settings, resuming its conversation, under the same id and name", .{d.name orelse d.id})
+    else
+        try res.text("it is not in the agent index (any more); agent_open starts a new one");
     return res.finish();
 }
 
@@ -4241,6 +4864,36 @@ test "a relaunch and a durable descriptor keep the caller's args and env" {
     try testing.expectEqual(@as(usize, 0), old.value.env.len);
 }
 
+test "a gone descriptor stays for a relaunch only when it can be started again" {
+    var rig: ToolRig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    const a = rig.arena.allocator();
+    const dir = state.index_dir.?;
+    const cases = [_]struct { d: Descriptor, keep: bool }{
+        // A conversation to resume: kept.
+        .{ .d = .{ .id = "claude-k3f9", .app = "claude", .session = "agent-claude-k3f9", .origin = "o", .binary = "/bin/claude", .cwd = "/", .conversed = true, .conversation = "c-1" }, .keep = true },
+        // Never prompted: kept, it starts afresh.
+        .{ .d = .{ .id = "claude-k3fa", .app = "claude", .session = "agent-claude-k3fa", .origin = "o", .binary = "/bin/claude", .cwd = "/" }, .keep = true },
+        // A turn but no conversation id, an unknown adapter, no binary: gone for good.
+        .{ .d = .{ .id = "claude-k3fb", .app = "claude", .session = "s", .origin = "o", .binary = "/bin/claude", .cwd = "/", .conversed = true }, .keep = false },
+        .{ .d = .{ .id = "nope-k3fc", .app = "nope", .session = "s", .origin = "o", .binary = "/bin/x", .cwd = "/" }, .keep = false },
+        .{ .d = .{ .id = "opencode-k3fd", .app = "opencode", .session = "s", .origin = "o", .cwd = "/" }, .keep = false },
+    };
+    for (cases) |cs| {
+        try agentindex.write(a, dir, cs.d);
+        const lp = try lockPath(a, cs.d.id);
+        var cl = try agentindex.claim(lp, false);
+        try testing.expectEqual(cs.keep, retireDescriptor(a, dir, cs.d, &cl, lp));
+        const back = agentindex.read(a, dir, cs.d.id);
+        try testing.expectEqual(cs.keep, back != null);
+        if (back) |p| try testing.expect(p.value.gone_ms > 0);
+        // The claim is released either way.
+        var again = try agentindex.claim(lp, false);
+        again.release(lp, true);
+    }
+}
+
 test "agent_adapters and agent_list speak both lanes" {
     var rig: ToolRig = undefined;
     try rig.init();
@@ -4298,7 +4951,7 @@ test "every per-agent result shape is declared: a live agent on a scripted scree
 
     // Listing services the agent first: its terminal id names nothing, so
     // the connection is reported lost; neither event is taken by the list.
-    const listed = try mcp.expectToolResultShape(a, "agent_list", try rig.call(.agent_list, "{}"));
+    const listed = try mcp.expectToolResultShape(a, "agent_list", try rig.call(.agent_list, "{\"detail\":true}"));
     const item = listed.object.get("structuredContent").?.object.get("agents").?.array.items[0].object;
     try testing.expectEqual(@as(i64, 2), item.get("pending_events").?.integer);
     // The conversation a restarted orchestrator resumes it by.
@@ -4826,13 +5479,55 @@ test "every agent tool answers in its declared shape: a scripted Claude Code on 
     const stopped = try shaped(a, "agent_interrupt", try rig.call(.agent_interrupt, "{}"));
     try testing.expect(stopped.get("interrupted").?.bool);
     _ = try shaped(a, "agent_wait", try rig.call(.agent_wait, "{\"timeout_ms\":300}"));
-    const listed = try shaped(a, "agent_list", try rig.call(.agent_list, "{}"));
+    const listed = try shaped(a, "agent_list", try rig.call(.agent_list, "{\"detail\":true}"));
     try testing.expectEqual(@as(i64, 1), listed.get("count").?.integer);
+    try testing.expect(listed.get("detail").?.bool);
     const item = listed.get("agents").?.array.items[0].object;
     try testing.expectEqualStrings("fake-claude", item.get("sessions").?.array.items[0].string);
     try testing.expect(item.get("started_ms").?.integer > 0);
     try testing.expect(item.get("last_activity_ms").?.integer >= item.get("started_ms").?.integer - 1000);
     try testing.expectEqual(@as(i64, 0), item.get("queued_prompts").?.integer);
+    // The default list: the compact facts only.
+    const compact = try shaped(a, "agent_list", try rig.call(.agent_list, "{}"));
+    try testing.expect(!compact.get("detail").?.bool);
+    const citem = compact.get("agents").?.array.items[0].object;
+    try testing.expectEqualStrings("local", citem.get("host").?.string);
+    try testing.expectEqual(@as(i64, 0), citem.get("queued").?.integer);
+    try testing.expect(citem.get("idle_s").?.integer >= 0);
+    try testing.expect(citem.get("sessions") == null and citem.get("recordings") == null and citem.get("pending") == null);
+
+    // final: the newest job's last message, under the handed-out state.
+    const fin = try shaped(a, "agent_read", try rig.call(.agent_read, "{\"final\":true}"));
+    try testing.expect(fin.get("final").?.bool);
+    try testing.expectEqual(@as(usize, 0), fin.get("records").?.array.items.len);
+    try testing.expect(fin.get("jobs").?.array.items[0].object.get("earlier") != null);
+    const fin_since = try shaped(a, "agent_read", try rig.call(.agent_read, "{\"final\":true,\"since\":0}"));
+    try testing.expectEqual(@as(usize, 1), fin_since.get("records").?.array.items.len);
+    try testing.expectEqualStrings("echo: queued one", fin_since.get("records").?.array.items[0].object.get("text").?.string);
+    try expectError(a, "agent_read", try rig.call(.agent_read, "{\"final\":true,\"detail\":\"all\"}"), "invalid_args");
+
+    // One text to several (an unknown one fails alone), then a wait for all.
+    const id = try a.dupe(u8, attached.get("agent").?.string);
+    const many = try shaped(a, "agent_send", try rig.call(.agent_send, try std.fmt.allocPrint(a, "{{\"agents\":[\"{s}\",\"nope-zz\"],\"text\":\"fanned\",\"interrupt\":true,\"timeout_ms\":10000}}", .{id})));
+    const mr = many.get("results").?.array.items;
+    try testing.expectEqual(@as(usize, 2), mr.len);
+    try testing.expectEqual(@as(i64, 1), many.get("failed").?.integer);
+    try testing.expect(!mr[0].object.get("interrupted").?.bool);
+    try testing.expect(mr[0].object.get("error") == null);
+    try testing.expectEqualStrings("not_found", mr[1].object.get("error").?.object.get("code").?.string);
+    try expectError(a, "agent_send", try rig.call(.agent_send, try std.fmt.allocPrint(a, "{{\"agent\":\"{s}\",\"agents\":[\"{s}\"],\"text\":\"x\"}}", .{ id, id })), "invalid_args");
+    const all_done = try shaped(a, "agent_wait", try rig.call(.agent_wait, try std.fmt.allocPrint(a, "{{\"agents\":[\"{s}\"],\"all\":true,\"timeout_ms\":10000}}", .{id})));
+    try testing.expectEqualStrings("all_settled", all_done.get("outcome").?.string);
+    try testing.expect(!all_done.get("timed_out").?.bool);
+    const ar = all_done.get("results").?.array.items[0].object;
+    try testing.expectEqualStrings("done", ar.get("outcome").?.string);
+    try testing.expectEqualStrings("echo: fanned", ar.get("text").?.string);
+    try testing.expect(std.mem.indexOf(u8, all_done.get("watch_command").?.string, " --all ") != null);
+    // It marked no record: final returns the answer.
+    const fin2 = try shaped(a, "agent_read", try rig.call(.agent_read, "{\"final\":true}"));
+    try testing.expectEqualStrings("echo: fanned", fin2.get("records").?.array.items[0].object.get("text").?.string);
+    try expectError(a, "agent_wait", try rig.call(.agent_wait, "{\"agents\":[\"nope-zz\"],\"all\":true}"), "not_found");
+    try expectError(a, "agent_wait", try rig.call(.agent_wait, "{\"all\":true}"), "invalid_args");
 
     // agent_open's own facts around the same per-agent ones.
     const e = state.entries.items[0];

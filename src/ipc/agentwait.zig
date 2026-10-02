@@ -15,8 +15,11 @@
 //! server that predates `agents` watches that one) and `"server":true`
 //! for every agent of the server, later ones included (`--server`, the
 //! follower push route: its wakes carry `content` and `meta`, composed by
-//! `agentpush.zig`). Server -> client: `{"type":"wake","agent":...}` per
-//! wake-up and a final `{"type":"end","reason":"..."}` before it closes.
+//! `agentpush.zig`), and `"all":true` beside `agents` for `--all` (one
+//! wake once EVERY agent settled). Server -> client:
+//! `{"type":"wake","agent":...}` per wake-up, `{"type":"all","results":[...]}`
+//! for `--all`, and a final `{"type":"end","reason":"..."}` before it
+//! closes. A server that predates `all` reads the line as `--any`.
 //!
 //! A waiter shares the agent's ONE delivery state with the agent_* tools
 //! (`events.Cursor`): what it prints is delivered, so no result repeats
@@ -59,6 +62,9 @@ pub const Subscribe = struct {
     /// carries the pushed text, and a done's answer it carries is handed
     /// out (agent_read does not repeat it).
     server: bool = false,
+    /// `--all`: one wake once every agent named settled
+    /// (`vocab.State.settled`), with each one's outcome.
+    all: bool = false,
 
     /// The agents it names.
     pub fn names(self: *const Subscribe) []const []const u8 {
@@ -94,7 +100,19 @@ pub const Meta = struct {
 /// What a `server` subscription's wake carries besides the events.
 pub const Pushed = struct { content: []const u8, meta: Meta };
 
-/// Every server line; `type` is "wake" or "end".
+/// One agent of an `all` wake: how it settled.
+pub const Settled = struct {
+    agent: []const u8,
+    /// The event kind that settled it, else its state, or `closed`.
+    outcome: []const u8,
+    state: []const u8,
+    /// The settling event's text (a done: a preview of its answer).
+    text: []const u8 = "",
+    /// A done's answer record (agent_read final returns it whole).
+    record: ?u64 = null,
+};
+
+/// Every server line; `type` is "wake", "all" or "end".
 pub const Message = struct {
     type: []const u8,
     agent: []const u8 = "",
@@ -105,7 +123,34 @@ pub const Message = struct {
     /// `server` subscriptions: the pushed text and its facts.
     content: ?[]const u8 = null,
     meta: ?Meta = null,
+    /// `all`: every agent waited on.
+    results: []const Settled = &.{},
 };
+
+/// The `all` line: every agent settled, `results` in the order named.
+pub fn encodeAll(arena: std.mem.Allocator, results: []const Settled) ![]const u8 {
+    const clipped = try arena.alloc(Settled, results.len);
+    for (results, clipped) |r, *o| {
+        o.* = r;
+        o.text = clip(r.text, WIRE_TEXT_MAX);
+    }
+    return std.fmt.allocPrint(arena, "{f}\n", .{std.json.fmt(Message{ .type = "all", .results = clipped }, .{ .emit_null_optional_fields = false })});
+}
+
+/// The printed `all` wake-up: a header line, then one line per agent.
+pub fn formatAll(w: *std.Io.Writer, m: Message) !void {
+    try w.print("all {d} agent(s) settled", .{m.results.len});
+    for (m.results) |r| {
+        try w.print("\n{s} {s}", .{ r.agent, r.outcome });
+        const first = firstLine(r.text);
+        if (first.len > 0) {
+            try w.writeAll(": ");
+            try writeClipped(w, first, LINE_TEXT_MAX);
+        }
+        if (r.record) |id| try w.print(" [record {d}]", .{id});
+        if (r.state.len > 0) try w.print(" [state {s}]", .{r.state});
+    }
+}
 
 pub const clip = events.clip;
 const firstLine = events.firstLine;
@@ -201,23 +246,35 @@ fn writeClipped(w: *std.Io.Writer, s: []const u8, max: usize) !void {
     try w.writeAll(" ...");
 }
 
-/// The exact command that waits on `agents` (several: `--any`, the first
-/// wake-up of any) with `filter`: the running executable, absolute, with
-/// every argument shell-quoted. It carries no cursor, so it never goes
-/// stale: it wakes for events nobody delivered when it subscribes,
-/// however many calls later it runs.
-pub fn watchCommand(arena: std.mem.Allocator, exe: []const u8, socket: []const u8, agents: []const []const u8, filter: events.Filter) ![]const u8 {
+/// How a waiter on several agents wakes.
+pub const Several = enum {
+    /// `--any`: the first wake-up of any of them.
+    any,
+    /// `--all`: once, when every one of them settled.
+    all,
+};
+
+/// The exact command that waits on `agents` (several: `--any` or `--all`)
+/// with `filter`: the running executable, absolute, with every argument
+/// shell-quoted. It carries no cursor, so it never goes stale: it wakes
+/// for events nobody delivered when it subscribes, however many calls
+/// later it runs. `--all` takes no filter (it waits for settling only).
+pub fn watchCommand(arena: std.mem.Allocator, exe: []const u8, socket: []const u8, agents: []const []const u8, filter: events.Filter, several: Several) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     try shellquote.appendQuoted(&out, arena, exe);
     try out.appendSlice(arena, " mcp " ++ SUBCOMMAND ++ " --socket ");
     try shellquote.appendQuoted(&out, arena, socket);
-    if (filter.match) |m| {
-        try out.appendSlice(arena, " --match ");
-        try shellquote.appendQuoted(&out, arena, m);
+    if (several == .all) {
+        try out.appendSlice(arena, " --all");
+    } else {
+        if (filter.match) |m| {
+            try out.appendSlice(arena, " --match ");
+            try shellquote.appendQuoted(&out, arena, m);
+        }
+        if (filter.messages) try out.appendSlice(arena, " --messages");
+        if (filter.retrying) try out.appendSlice(arena, " --retrying");
+        if (agents.len > 1) try out.appendSlice(arena, " --any");
     }
-    if (filter.messages) try out.appendSlice(arena, " --messages");
-    if (filter.retrying) try out.appendSlice(arena, " --retrying");
-    if (agents.len > 1) try out.appendSlice(arena, " --any");
     for (agents) |agent| {
         try out.append(arena, ' ');
         try shellquote.appendQuoted(&out, arena, agent);
@@ -232,6 +289,8 @@ pub const HELP =
     \\                              [--retrying] [--follow] [--timeout SECONDS]
     \\                              [--since SEQ] AGENT
     \\       sketerm mcp agent-wait --socket PATH [...] --any AGENT AGENT...
+    \\       sketerm mcp agent-wait --socket PATH [--timeout SECONDS] [--json]
+    \\                              --all AGENT AGENT...
     \\       sketerm mcp agent-wait (--socket PATH | --parent PID) --server
     \\                              [--follow] [--json] [...]
     \\
@@ -242,7 +301,11 @@ pub const HELP =
     \\plus every completed message with --messages or a message containing
     \\TEXT with --match (rate limited: the rest are summarised), and on the
     \\errors an agent recovers from by itself (retrying) with --retrying.
-    \\--any watches several agents and wakes on the first of them. Exits
+    \\--any watches several agents and wakes on the first of them. --all
+    \\wakes ONCE, when every agent named has settled (done, needs_input, an
+    \\error, exited or closed), and prints a line per agent with how it
+    \\settled; an agent already settled counts, unless a prompt it was sent
+    \\has not settled yet. Exits
     \\after the first wake-up unless --follow; always prints `watch ended:
     \\REASON` when the server goes away, the agents close or --timeout runs
     \\out.
@@ -269,6 +332,7 @@ pub const Cli = struct {
     agent_buf: [MAX_ANY][]const u8 = undefined,
     agent_count: usize = 0,
     any: bool = false,
+    all: bool = false,
     match: ?[]const u8 = null,
     messages: bool = false,
     retrying: bool = false,
@@ -281,7 +345,7 @@ pub const Cli = struct {
     json: bool = false,
     help: bool = false,
 
-    pub const ParseError = error{ UnknownFlag, MissingValue, BadNumber, ExtraArgument };
+    pub const ParseError = error{ UnknownFlag, MissingValue, BadNumber, ExtraArgument, Conflicting };
 
     pub fn agents(self: *const Cli) []const []const u8 {
         return self.agent_buf[0..self.agent_count];
@@ -301,6 +365,8 @@ pub const Cli = struct {
                 o.retrying = true;
             } else if (eql(u8, a, "--any")) {
                 o.any = true;
+            } else if (eql(u8, a, "--all")) {
+                o.all = true;
             } else if (eql(u8, a, "--follow")) {
                 o.follow = true;
             } else if (eql(u8, a, "--server")) {
@@ -324,9 +390,11 @@ pub const Cli = struct {
                 o.agent_count += 1;
             }
         }
-        // Several agents only with --any (a typo is not a second agent);
-        // --server names none, it watches them all.
-        if (o.agent_count > 1 and !o.any) return error.ExtraArgument;
+        // Several agents only with --any or --all (a typo is not a second
+        // agent); --server names none, it watches them all. --all wakes
+        // once and waits for settling only: no filter, no --follow.
+        if (o.all and (o.any or o.server or o.follow or o.messages or o.retrying or o.match != null or o.since != null)) return error.Conflicting;
+        if (o.agent_count > 1 and !o.any and !o.all) return error.ExtraArgument;
         if (o.server and o.agent_count > 0) return error.ExtraArgument;
         return o;
     }
@@ -359,7 +427,8 @@ pub fn cli(allocator: std.mem.Allocator, args: []const []const u8) u8 {
             error.UnknownFlag => "agent-wait: unknown flag (see --help)\n",
             error.MissingValue => "agent-wait: flag needs a value\n",
             error.BadNumber => "agent-wait: --timeout, --since and --parent take a whole number\n",
-            error.ExtraArgument => std.fmt.comptimePrint("agent-wait: exactly one AGENT, or --any with up to {d}, or none with --server\n", .{MAX_ANY}),
+            error.ExtraArgument => std.fmt.comptimePrint("agent-wait: exactly one AGENT, or --any/--all with up to {d}, or none with --server\n", .{MAX_ANY}),
+            error.Conflicting => "agent-wait: --all wakes once on settling: it takes no --any, --server, --follow, --since or filter\n",
         };
         say(2, msg);
         return 2;
@@ -408,6 +477,7 @@ pub fn cli(allocator: std.mem.Allocator, args: []const []const u8) u8 {
         .follow = o.follow,
         .since = o.since,
         .server = o.server,
+        .all = o.all,
     };
     const line = std.fmt.allocPrint(arena, "{f}\n", .{std.json.fmt(sub, .{ .emit_null_optional_fields = false })}) catch return ended("out of memory", 1);
     say(fd, line);
@@ -432,9 +502,14 @@ pub fn cli(allocator: std.mem.Allocator, args: []const []const u8) u8 {
                 continue;
             }
             if (is_end) return ended(m.reason, 0);
-            if (!std.mem.eql(u8, m.type, "wake")) continue;
             var aw: std.Io.Writer.Allocating = .init(la);
-            if (m.content) |text| aw.writer.writeAll(text) catch continue else formatWake(&aw.writer, m) catch continue;
+            if (std.mem.eql(u8, m.type, "all")) {
+                formatAll(&aw.writer, m) catch continue;
+            } else if (std.mem.eql(u8, m.type, "wake")) {
+                if (m.content) |text| aw.writer.writeAll(text) catch continue else formatWake(&aw.writer, m) catch continue;
+                // A server that predates --all read the line as --any.
+                if (o.all) aw.writer.writeAll("\n(this MCP server predates --all: it woke on the first agent only)") catch continue;
+            } else continue;
             aw.writer.writeAll("\n") catch continue;
             say(1, aw.written());
             if (!o.follow) return 0;
@@ -518,7 +593,7 @@ test "the watch command round-trips through the cli grammar and bakes in no curs
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    const cmd = try watchCommand(a, "/usr/bin/sketerm", "/run/user/1/sketerm/mcp-tmp-9/agents.sock", &.{"claude-1"}, .{ .match = "it's done", .messages = true });
+    const cmd = try watchCommand(a, "/usr/bin/sketerm", "/run/user/1/sketerm/mcp-tmp-9/agents.sock", &.{"claude-1"}, .{ .match = "it's done", .messages = true }, .any);
     try t.expectEqualStrings("/usr/bin/sketerm mcp agent-wait --socket /run/user/1/sketerm/mcp-tmp-9/agents.sock --match 'it'\\''s done' --messages claude-1", cmd);
     // A cursor baked in went stale with the next tool call: a reused
     // command woke on an event the assistant already had.
@@ -532,7 +607,7 @@ test "the watch command round-trips through the cli grammar and bakes in no curs
 
     // Several agents: --any, and the subscribe line names them all while
     // `agent` keeps the first for a server that predates `agents`.
-    const many = try watchCommand(a, "/x/sketerm-mcp", "/s.sock", &.{ "claude-1", "opencode-1" }, .{ .retrying = true });
+    const many = try watchCommand(a, "/x/sketerm-mcp", "/s.sock", &.{ "claude-1", "opencode-1" }, .{ .retrying = true }, .any);
     try t.expectEqualStrings("/x/sketerm-mcp mcp agent-wait --socket /s.sock --retrying --any claude-1 opencode-1", many);
     const p = try Cli.parse(&.{ "--socket", "/s.sock", "--retrying", "--any", "claude-1", "opencode-1" });
     const sub = Subscribe{ .agent = p.agents()[0], .agents = p.agents(), .retrying = p.retrying };
@@ -544,6 +619,36 @@ test "the watch command round-trips through the cli grammar and bakes in no curs
     // An old CLI's line: one agent.
     const old = try std.json.parseFromSliceLeaky(Subscribe, a, "{\"agent\":\"claude-1\"}", .{ .ignore_unknown_fields = true });
     try t.expectEqual(@as(usize, 1), old.names().len);
+
+    // --all: no filter rides along, and the grammar takes it back.
+    const all = try watchCommand(a, "/x/sketerm", "/s.sock", &.{ "claude-1", "opencode-1" }, .{ .messages = true }, .all);
+    try t.expectEqualStrings("/x/sketerm mcp agent-wait --socket /s.sock --all claude-1 opencode-1", all);
+    const pa = try Cli.parse(&.{ "--socket", "/s.sock", "--all", "claude-1", "opencode-1" });
+    try t.expect(pa.all and !pa.any);
+    try t.expectEqual(@as(usize, 2), pa.agents().len);
+    try t.expectError(error.Conflicting, Cli.parse(&.{ "--all", "--follow", "a", "b" }));
+    try t.expectError(error.Conflicting, Cli.parse(&.{ "--all", "--any", "a", "b" }));
+    try t.expectError(error.Conflicting, Cli.parse(&.{ "--all", "--messages", "a" }));
+}
+
+test "an all wake: one line, then one line per agent with how it settled" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const line = try encodeAll(a, &.{
+        .{ .agent = "claude-1", .outcome = "done", .state = "idle", .text = "All green.\nDetails.", .record = 12 },
+        .{ .agent = "opencode-2", .outcome = "needs_input", .state = "waiting_user", .text = "permission: bash" },
+        .{ .agent = "claude-3", .outcome = "closed", .state = "" },
+    });
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, line, "\n"));
+    const m = try std.json.parseFromSliceLeaky(Message, a, line[0 .. line.len - 1], .{ .ignore_unknown_fields = true });
+    try t.expectEqualStrings("all", m.type);
+    var aw: std.Io.Writer.Allocating = .init(a);
+    try formatAll(&aw.writer, m);
+    try t.expectEqualStrings("all 3 agent(s) settled\nclaude-1 done: All green. [record 12] [state idle]\nopencode-2 needs_input: permission: bash [state waiting_user]\nclaude-3 closed", aw.written());
+    // The subscribe line carries all beside agents; an old line has none.
+    const sub = try std.json.parseFromSliceLeaky(Subscribe, a, "{\"agent\":\"a\",\"agents\":[\"a\",\"b\"],\"all\":true}", .{ .ignore_unknown_fields = true });
+    try t.expect(sub.all and sub.names().len == 2);
 }
 
 test "wake lines: encode, parse, and one compact printed line" {

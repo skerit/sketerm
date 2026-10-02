@@ -9,8 +9,10 @@
 //! the displaced server still holds a lock, on an unlinked inode, and
 //! learns it lost the agent from `Claim.stillOwned`.
 //!
-//! The index holds live agents only: a descriptor is removed when its
-//! agent is closed, ends, or is found gone; there is no history.
+//! The index holds live agents, and ended ones that can be started again
+//! (`agent_attach relaunch`): a descriptor is removed when its agent is
+//! closed, or ends or is found gone without a way to relaunch it; a
+//! relaunchable one is stamped `gone_ms` and swept after the idle TTL.
 
 const std = @import("std");
 const c = @import("../c.zig").c;
@@ -75,6 +77,9 @@ pub const Descriptor = struct {
     path_prepend: []const []const u8 = &.{},
     login_shell: bool = true,
     started_ms: i64 = 0,
+    /// When its sessions were found gone (Unix ms); 0 while it runs. Such a
+    /// descriptor stays for `agent_attach relaunch` until the idle TTL.
+    gone_ms: i64 = 0,
 };
 
 /// `<state dir>/agents`, allocated; null without a state dir.

@@ -44,6 +44,16 @@ pub const State = enum {
             .starting, .waiting_background, .waiting_user, .idle, .exited, .disconnected => false,
         };
     }
+
+    /// Nothing more happens without the caller (`agent_wait all`, `agent-wait
+    /// --all`): its turn is over, it asks something, or it is gone. A
+    /// lost link may come back, and background tasks still end the turn.
+    pub fn settled(self: State) bool {
+        return switch (self) {
+            .idle, .waiting_user, .exited => true,
+            .starting, .working, .waiting_subagent, .waiting_background, .retrying, .disconnected => false,
+        };
+    }
 };
 
 pub const RecordKind = enum {
@@ -111,6 +121,16 @@ pub const EventKind = enum {
             .message => 0,
         };
     }
+
+    /// It ends what a prompt started (`agent_wait all`): the turn settled,
+    /// asks the user, failed or the app is gone. An `error` counts only
+    /// when its class wakes by default (`events.Event.settlesTurn`).
+    pub fn settlesTurn(self: EventKind) bool {
+        return switch (self) {
+            .done, .needs_input, .@"error", .exited => true,
+            .connection_lost, .connection_restored, .message, .match => false,
+        };
+    }
 };
 
 /// The outcome of a wait that no event decided (every other outcome is
@@ -123,6 +143,8 @@ pub const WaitOutcome = enum {
     /// The agent was busy: the app queued the prompt for its next turn, and
     /// the call returned before the app took it.
     queued,
+    /// `agent_wait all`: every agent waited on settled.
+    all_settled,
 };
 
 pub const ErrorClass = enum {
@@ -230,6 +252,12 @@ test "an idle agent and one with background tasks take prompts; a busy one does 
     try t.expect(!State.waiting_user.takesPrompt());
     // A state never both takes a prompt and queues one.
     for (std.enums.values(State)) |s| try t.expect(!(s.takesPrompt() and s.queuesPrompt()));
+    // A settled agent is never busy; one with background tasks is not settled.
+    for (std.enums.values(State)) |s| if (s.settled()) try t.expect(!s.queuesPrompt());
+    try t.expect(!State.waiting_background.settled());
+    try t.expect(State.waiting_user.settled());
+    // Only always-on kinds settle a turn.
+    for (std.enums.values(EventKind)) |k| if (k.settlesTurn()) try t.expect(k.alwaysOn());
     try t.expect(State.working.queuesPrompt());
     try t.expect(!State.waiting_user.queuesPrompt());
 }

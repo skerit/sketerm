@@ -238,13 +238,13 @@ is kept by a `:ro` policy term. The full descriptions and schemas are in
 - `agent_answer`: Answer the agent's pending prompt (permission, question or choice; see interaction) with `choice` (an option label, its 1-based number or a unique part of a label) OR `text` (a free-text answer, when interaction.free_text says the prompt takes one), then wait for the turn like agent_send.
 - `agent_set`: Change an agent's model and/or effort level for THIS session only, never the user's defaults (Claude Code: /model with its session-only choice, confirmed by the app before this returns; effort by restarting Claude Code in the same terminal with --effort and resuming the conversation, since its /effort saves the user's default; opencode: the model and variant of the prompts this agent sends).
 - `agent_interrupt`: Interrupt an agent's running turn (Claude Code: Escape; opencode: abort, subagents included).
-- `agent_list` (read-only): List this server's agents, one line each: app, model and effort when known, state, where it runs (host or this machine, transport) and in which directory (cwd: which clone a worker is in), the binary, the session(s) the user can watch, when it was started and last showed activity (wall-clock ms), how many prompts its app holds queued, the conversation it runs (what agent_open resume takes after a restart), and how many wake-ups each holds that no agent_* result has handed out yet.
+- `agent_list` (read-only): List this server's agents, one line each.
 - `agent_close`: Stop an agent: kills its session(s) and ends its waiters.
 - `agent_attach`: Resume an agent: `agent` (an id agent_open returned, or its name) picks up a live agent of THIS MACHINE from any MCP server, e.g. after a restart, and returns exactly one outcome in `attach`: reattached (it is yours again, with its latest job's selected records, as a first agent_read returns them), gone (its daemon answered that its session no longer exists, with `reason`: expired = no client for mcp_agent_idle_ttl_hours, exited with exit_status or signal, closed, or unknown when the daemon keeps no record), or unreachable (its host or daemon did not answer: `host` and `ssh_error`; its entry stays, so try again later).
 
 ### `core`
 
-- `capabilities` (read-only): Preflight report of what THIS MCP server can do right now: isolation mode, headless GUI-app support (headless_gui — launch_app renders apps into the mux daemon and NEVER needs a display, an X server or a sketerm window), whether a direct sketerm GUI control socket is attached (gui_socket; independent of the session panel relay and of headless GUI apps), the live panel transport (panels + panel_transport) and the saved-panel store (panels_store + panel_store), OCR (tesseract) availability, whether the web_* tools can run and against what (web + web_backend "gui"/"session"/"headless"/"none" — "session" adds web_session, the watchable Wayland app session the helper renders into — plus the sketerm-webengine path in web_helper; web_gui says whether the user granted the web_* tools their OWN browser and logins, web_gui_source where that came from and web_gui_transport which GUI socket they hold now; web_profiles says whether named cookie jars work, web_routes which per-tab network routes web_open can honour, web_engine_broker whether the mux daemon owns the engine's lifetime and web_engine_owner who started the one in use; web_downloads whether web_download can pull a url through a view; web_capture whether web_open can record the response bodies a headless view's page receives; web_engine_started whether an engine exists YET, since web_backend/web_watch/web_session are undetermined until it does), ssh/scp presence, the directory terminal asciicast recordings land in, the EFFECTIVE input-timing defaults (hold_ms/settle_ms/timeout_ms/click_retry, each marked when a SKETERM_MCP_* env override changed it from the built-in), whether sub-agents run here (agents, agent_adapters, agent_waiter, agent_ssh, agent_open_args_env for a wrapper's args and env, agent_open_resume for continuing an existing conversation (agent_resume_checked: an unknown id fails instead of starting afresh), agent_open_process_args for server_args/tui_args, agent_conversation for the conversation id results report, user_daemon_env_scrubbed for a per-user daemon started without the assistant's environment, agent_resume_by_id for agent_attach {agent} from any server, agent_idle_ttl_hours for how long an unattached agent lives, tombstones for agent_attach saying why a gone agent ended) and how agent_read selects what it returns (agent_read_select), how sub-agent output is delivered (agent_records_once, agent_events_shared), whether agent_wait can watch several agents (agent_wait_any), whether agent_send queues a prompt for a busy agent (agent_send_queue) and agent_answer takes free text (agent_answer_text), when done fires (agent_done), and whether agent events are pushed into this session (agent_push: channel = Claude Code channel messages; agent_push_follow / agent_push_followers for the agent-wait --server follower the opencode plugin runs), and open session counts.
+- `capabilities` (read-only): Preflight report of what THIS MCP server can do right now: isolation mode, headless GUI-app support (headless_gui — launch_app renders apps into the mux daemon and NEVER needs a display, an X server or a sketerm window), whether a direct sketerm GUI control socket is attached (gui_socket; independent of the session panel relay and of headless GUI apps), the live panel transport (panels + panel_transport) and the saved-panel store (panels_store + panel_store), OCR (tesseract) availability, whether the web_* tools can run and against what (web + web_backend "gui"/"session"/"headless"/"none" — "session" adds web_session, the watchable Wayland app session the helper renders into — plus the sketerm-webengine path in web_helper; web_gui says whether the user granted the web_* tools their OWN browser and logins, web_gui_source where that came from and web_gui_transport which GUI socket they hold now; web_profiles says whether named cookie jars work, web_routes which per-tab network routes web_open can honour, web_engine_broker whether the mux daemon owns the engine's lifetime and web_engine_owner who started the one in use; web_downloads whether web_download can pull a url through a view; web_capture whether web_open can record the response bodies a headless view's page receives; web_engine_started whether an engine exists YET, since web_backend/web_watch/web_session are undetermined until it does), ssh/scp presence, the directory terminal asciicast recordings land in, the EFFECTIVE input-timing defaults (hold_ms/settle_ms/timeout_ms/click_retry, each marked when a SKETERM_MCP_* env override changed it from the built-in), whether sub-agents run here (agents, agent_adapters, agent_waiter, agent_ssh, agent_open_args_env for a wrapper's args and env, agent_open_resume for continuing an existing conversation (agent_resume_checked: an unknown id fails instead of starting afresh), agent_open_process_args for server_args/tui_args, agent_conversation for the conversation id results report, user_daemon_env_scrubbed for a per-user daemon started without the assistant's environment, agent_resume_by_id for agent_attach {agent} from any server, agent_idle_ttl_hours for how long an unattached agent lives, tombstones for agent_attach saying why a gone agent ended) and how agent_read selects what it returns (agent_read_select), how sub-agent output is delivered (agent_records_once, agent_events_shared), whether agent_wait can watch several agents (agent_wait_any; agent_wait_all: once every one settled), whether agent_send queues a prompt for a busy agent (agent_send_queue), reaches several agents in one call (agent_send_many) and interrupts a busy one first (agent_send_interrupt), whether agent_read returns just the final message (agent_read_final), agent_list is compact by default (agent_list_compact), agent_attach relaunches a gone agent (agent_relaunch) and agent_open hands a prompt off with timeout_ms 0 (agent_open_handoff), whether agent_answer takes free text (agent_answer_text), when done fires (agent_done), and whether agent events are pushed into this session (agent_push: channel = Claude Code channel messages; agent_push_follow / agent_push_followers for the agent-wait --server follower the opencode plugin runs), whether term_open takes exec_shell (term_exec_shell_default), and open session counts.
 <!-- tool-reference:end -->
 
 ## Tool exposure policy
@@ -369,6 +369,17 @@ new commands while a tracked command is pending.
 
 The default `wait_for: "idle"` remains appropriate for interactive
 programs that do not return to a shell prompt.
+
+`term_exec` runs its command in a fresh `sh` by default, or in the
+interpreter its `shell` names (bash for pipefail). `term_open
+exec_shell: "bash"` makes that the terminal's default
+(`capabilities.term_exec_shell_default`): every `term_exec` there runs
+its command file with it unless the call names another `shell`, which
+is what a fish login shell needs on every call otherwise. It is checked
+like `shell` (a command name or absolute path of letters, digits, `.`,
+`_`, `-`, `/`; anything else is `invalid_args`), applies only to the
+isolated transport (`subshell: false` types into the session's own
+shell), and `term_open` and `term_list` report it as `exec_shell`.
 
 ## Browser (`web_*`)
 
@@ -668,13 +679,32 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   `$XDG_STATE_HOME/sketerm/agents/<id>.json` (adapter, host, transport,
   session names and lifetime ids, daemon socket, opencode port, password
   file and API session, conversation id, launch values, args/env, name),
-  removed when the agent is closed, ends, or is found gone; the index
-  holds live agents only. `agent_attach {agent: <id or name>}` resumes one
+  removed when the agent is closed, or ends or is found gone with no way
+  to start it again; an agent that ended and can be relaunched keeps its
+  descriptor, stamped `gone_ms`, for `mcp_agent_idle_ttl_hours` (the
+  next server start sweeps it after that). `agent_attach {agent: <id or name>}` resumes one
   from ANY server on this machine and answers exactly one of `reattached`
   (with its latest job's selected records), `gone` (its daemon answered
   that the session no longer exists: `reason` expired, exited with
   `exit_status`/`signal`, closed, or unknown when the daemon keeps no
   record) or `unreachable` (`host` and `ssh_error`; the entry stays).
+  **Relaunch (`capabilities.agent_relaunch`).** A `gone` agent whose
+  launch settings and conversation are known says so (`relaunchable:
+  true`, and its text names the call); `agent_attach {agent, relaunch:
+  true}` then starts it again with what its descriptor holds: the same
+  binary, host, transport, cwd, model, effort, `args`/`env`/`server_args`/
+  `tui_args`, `path_prepend` and login shell, resuming the same
+  conversation (Claude Code `--resume`, opencode's API session; a Claude
+  Code agent that never had a turn starts a fresh one), under the SAME
+  agent id and name (`attach: "relaunched"`, every per-agent fact, a
+  model chosen in the app since re-chosen). The case it is for: the host
+  rebooted, so the daemon has no session (no tombstone either) while the
+  index still names the agent. Without `relaunch` a gone agent stays
+  gone; an agent whose session still runs is reattached instead; an agent
+  whose app ended under this very server is let go and relaunched the
+  same way. A conversation the app no longer has fails as for `resume`
+  (`not_found`) and the descriptor goes; any other failure leaves it, so
+  the relaunch can be tried again.
   Ownership is a held flock on `<id>.lock`, never a pid: an agent another
   LIVE server drives is refused as `conflict` unless `takeover: true`,
   which replaces the lock file; the displaced server notices between
@@ -810,6 +840,11 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   agent started on it (`agent_send timeout_ms:0`; `vocab.WaitOutcome`).
   `timed_out` is true only when a wait ran out; a call asked not to wait
   (`timeout_ms: 0`) reports false, and its outcome says what happened.
+  `agent_open` with a `prompt` and `timeout_ms: 0` is the one-call
+  hand-off (`capabilities.agent_open_handoff`): the start and the wait
+  for the app to be ready stay bounded by the default (60 s), the prompt
+  is submitted, and the call returns `sent` without waiting for the turn
+  (it used to return at once and never send the prompt).
   An event that announces a message (`done`, `message`, `match`:
   `EventKind.announcesRecord`) carries its `record` id and a one-line
   preview (`events.PREVIEW_MAX`, 120 bytes) in results, never the text
@@ -819,7 +854,36 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   handed out before, so no extra read is needed. `agent_wait agents:[...]`
   waits on several agents: the first wake-up of any wins, the result is
   that agent's (`agents` lists the ones waited on) and its
-  `watch_command` waits on all of them with `--any`.
+  `watch_command` waits on all of them with `--any`. With `all: true`
+  (`capabilities.agent_wait_all`) it waits until EVERY one of them has
+  settled (`vocab.State.settled`: idle, waiting on the user, or exited;
+  and the turn of the prompt last sent to it ended in a `done`,
+  `needs_input`, a waking `error` or `exited`, so an agent that has not
+  started on a prompt yet is not settled; one never sent anything that
+  is idle counts at once, as `idle`), and answers `outcome: all_settled`
+  (or `still_working` with `timed_out` when the wait ran out) with
+  `results`, one per agent: `outcome` (the settling kind, else its
+  state), `text` (a done's one-line preview), `record` (its answer:
+  `agent_read final` returns it whole), `settled`, `events`. What it
+  reports is delivered like a waiter's line, and it marks no record. Its
+  `watch_command` is `agent-wait --all`.
+- **One prompt to several agents, and interrupting first
+  (`capabilities.agent_send_many`, `agent_send_interrupt`).** `agent_send
+  interrupt: true` interrupts a busy agent (working, or waiting on the
+  user) FIRST and then sends the text as a NEW prompt: never queued
+  behind the running turn, never dropped (an agent that does not take
+  prompts within 10 s of the interrupt is a `timeout` failure that sent
+  nothing); on an idle agent it just sends; the result says
+  `interrupted` and, when Claude Code's Escape discarded prompts it held
+  queued, `queued_dropped`. `agents: [...]` (instead of `agent`, at most
+  32 ids or names) sends the same text to each in one call: with
+  `interrupt` every busy one is interrupted at once, then each gets the
+  prompt; the call does not wait for the turns and answers with
+  `results`, one per agent named (`outcome` sent, queued, still_working
+  or failed with its `error`; `interrupted`, `queued_dropped`, the
+  `events` no result had handed out), `failed` and a `watch_command`
+  that is `agent-wait --all` on the agents sent to. A failed agent (an
+  unknown name, a refusal) never stops the others.
 - **Messaging a busy agent (`capabilities.agent_send_queue`).**
   `agent_send` to an agent that works (`working`, `waiting_subagent`,
   `retrying`: `vocab.State.queuesPrompt`) puts the prompt in the app's
@@ -965,7 +1029,13 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   An explicit `since` re-reads the jobs with records above it, handed out
   or not; `detail: "all"` returns every assistant message and notice
   above `since` (or above what the previous detail-all read covered) by
-  id, paged by `limit` with `next_since`/`more`. Record ids restart when
+  id, paged by `limit` with `next_since`/`more`. `final: true`
+  (`capabilities.agent_read_final`) returns only the newest job's last
+  assistant message, whole, under the same delivery rule: once, then a
+  read names the job with a `jobs[].earlier` pointer at it; with `since`
+  the newest job above it, handed out or not; refused with `detail:
+  "all"`. It replaces reading an app's own transcript files (opencode's
+  database, Claude Code's jsonl) for "what did it finally say". Record ids restart when
   a durable instance reattaches (the app's transcript is read again), so
   the handed-out state is not persisted: the first read after a reattach
   returns the selection again. The answer a `done` carries is the job's latest
@@ -982,7 +1052,12 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   next needs attention: `sketerm mcp agent-wait --socket <instance>/agents.sock
   [--match X] [--messages] [--retrying] <agent>`, or `--any <agent>
   <agent>...` for several (the first wake-up of any; with `--follow`, all
-  of them), or `--server` for every agent of the server, later ones
+  of them), or `--all <agent> <agent>...` (one wake-up once every one of
+  them settled, as `agent_wait all` decides it: a header line `all N
+  agent(s) settled`, then one line per agent with its outcome, its text
+  and its answer record; no filter, no `--follow`; a server that predates
+  `--all` reads it as `--any`, and the line says so), or `--server` for
+  every agent of the server, later ones
   included, printed as the pushed text below (`--parent PID` finds the
   server PID started instead of `--socket`; `--json` prints the server's
   lines verbatim). Events have ONE delivery state per agent (`Event.delivered`),
@@ -1162,8 +1237,15 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   (the `choice_prompt` rule), and lettered options carry their `key`, the
   letter `agent_answer` types. Answering it waits for the app to be ready.
 - **`agent_list`** gives one short text line per agent and, per agent in
-  `agents`, where and how it runs: `host` (absent: this machine),
-  `transport`, `cwd` (which clone a worker is in), `binary`, `model` and
+  `agents`, by default the compact facts an orchestrator of many agents
+  scans (`capabilities.agent_list_compact`; with 17 agents the full set
+  cost ~5k tokens): `agent` (the id), `name`, `app`, `state`, `host` (or
+  `local`), `cwd` (which clone a worker is in), `idle_s` (seconds since
+  the app last drew or sent anything), `queued` (prompts its app holds),
+  `pending` (the prompt it waits on: `kind` and `title`) and
+  `conversation`; `detail: false` says which. `detail: true` gives every
+  fact: where and how it runs: `host` (absent: this machine),
+  `transport`, `cwd`, `binary`, `model` and
   `effort` when known (Claude Code: the launch value or the model chosen
   since; opencode: the next prompt's), `state`, `session`/`sessions`
   (opencode adds its server's), `started_ms` (kept across a durable
@@ -1212,9 +1294,12 @@ on a free loopback port, read over its HTTP API and SSE stream, with
 
 The server's `instructions` (initialize result) tell the assistant to use
 `agent_open` for Claude Code and opencode, to run `watch_command` in the
-background instead of polling, and that `agent_open` returns an id that
-`agent_attach {agent: id}` resumes after a restart, whenever the agent
-tools are offered.
+background instead of polling (`--any` for several agents, `--all` for
+one wake-up once all settled), that `agent_send` takes `interrupt` and
+`agents`, that `agent_read final:true` returns just the last message and
+`agent_list` is compact unless `detail:true`, and that `agent_open`
+returns an id that `agent_attach {agent: id}` resumes after a restart
+(`relaunch: true` for a gone one), whenever the agent tools are offered.
 
 ## Panels (`ui_*`)
 

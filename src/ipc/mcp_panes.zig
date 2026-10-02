@@ -455,6 +455,11 @@ fn listHeadless(arena: std.mem.Allocator, family: Family) ![]const u8 {
             try std.json.Stringify.value(sn, .{}, w);
             try w.print(",\"integration\":{}", .{t.integration});
         }
+        const exec_shell = mcp_term.term_state.exec_shells.get(id);
+        if (exec_shell) |sh| {
+            try w.writeAll(",\"exec_shell\":");
+            try std.json.Stringify.value(sh, .{}, w);
+        }
         if (t.remote_host) |rh| {
             try w.writeAll(",\"transport\":\"sketerm-mux\",\"host\":");
             try std.json.Stringify.value(rh, .{}, w);
@@ -478,6 +483,7 @@ fn listHeadless(arena: std.mem.Allocator, family: Family) ![]const u8 {
         try res.textf("{s} {d}{s}{s}: {s}", .{ family.addr(), id, if (term_name != null) " " else "", term_name orelse "", if (t.exited) "exited" else "running" });
         if (t.exited and t.exit_status_known) try res.textf("  exit_status: {d}", .{t.exit_status});
         if (t.shell_name) |sn| try res.textf("  shell: {s}, integration: {}", .{ sn, t.integration });
+        if (exec_shell) |sh| try res.textf("  term_exec shell: {s}", .{sh});
         if (t.remote_host) |rh| try res.textf("  host: {s} (sketerm-mux)", .{rh});
         if (t.hasPendingCommand()) try res.text("  pending_command: true");
         if (t.hasPendingExec()) try res.text("  pending_exec: true");

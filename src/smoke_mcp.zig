@@ -6091,7 +6091,13 @@ fn fakeClaude(allocator: std.mem.Allocator, args: []const [*:0]const u8) u8 {
                 },
                 0x1b => {
                     input.clearRetainingCapacity();
-                    writeOut("\r\x1b[2K$");
+                    // Escape during a turn interrupts it, as the real one does:
+                    // what was still to come is dropped and the turn ends.
+                    if (steps.items.len > 0) {
+                        for (steps.items) |st| allocator.free(st.bytes);
+                        steps.clearRetainingCapacity();
+                        writeOut(FC_ERASE ++ "Interrupted \xc2\xb7 What should Claude do instead?\r\n" ++ FC_LIVE ++ FC_END);
+                    } else writeOut("\r\x1b[2K$");
                 },
                 0x7f => {
                     _ = input.pop();
@@ -6164,7 +6170,7 @@ fn fcTurn(allocator: std.mem.Allocator, steps: *std.ArrayList(FcStep), text: []c
                 _ = c.fwrite(rec.ptr, 1, rec.len, file);
             }
         }
-        const delay: i64 = if (has(text, "slow")) 1500 else 300;
+        const delay: i64 = if (has(text, "glacial")) 12_000 else if (has(text, "slow")) 1500 else 300;
         const answer = std.fmt.allocPrint(a, FC_ERASE ++ "claude: {s}\r\n" ++ FC_LIVE, .{reply}) catch return;
         fcSchedule(allocator, steps, delay, answer, false);
         fcSchedule(allocator, steps, delay + 100, FC_END, false);
@@ -7014,6 +7020,163 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
         waitUnlisted(allocator, mux_sock, o1_server, "agent_close opencode server");
         say("smoke-mcp: agents: fake opencode (open, set, send, match, permission, close) ok");
         m.closeStdinWait();
+    }
+
+    // ── several agents: a one-call hand-off, a send to several with
+    // interrupt, a wait for all, the final message, the compact list ──
+    {
+        var m = Mcp.spawn(allocator, exe, &.{});
+        m.initialize();
+        const caps = agentCall(&m, arena, "capabilities", "{}", "capabilities several", false, 15_000);
+        for ([_][]const u8{ "agent_wait_all", "agent_send_many", "agent_send_interrupt", "agent_read_final", "agent_list_compact", "agent_relaunch", "agent_open_handoff", "term_exec_shell_default" }) |k| {
+            const v = caps.get(k) orelse {
+                say(k);
+                fail("capabilities: a fact of the several-agents package is missing");
+            };
+            if (v != .bool or !v.bool) fail("capabilities: a fact of the several-agents package is not true");
+        }
+        // timeout_ms 0 with a prompt: started, waited for, prompt sent, back at once.
+        const fa = agentCall(&m, arena, "agent_open", std.fmt.allocPrint(arena, "{{\"app\":\"claude\",\"name\":\"fan-a\",\"binary\":{s},\"prompt\":\"handed off\",\"timeout_ms\":0}}", .{bin_json}) catch fail("oom"), "agent_open hand-off", false, 90_000);
+        if (!fa.get("prompt_sent").?.bool) fail("agent_open timeout_ms 0: the prompt was not sent");
+        expectSentOrWorking(fa, "agent_open hand-off: outcome");
+        if (fa.get("timed_out").?.bool) fail("agent_open hand-off: timed_out although it was asked not to wait");
+        const a_id = arena.dupe(u8, scStr(fa, "agent", "agent_open hand-off")) catch fail("oom");
+        const fb = agentCall(&m, arena, "agent_open", std.fmt.allocPrint(arena, "{{\"app\":\"claude\",\"name\":\"fan-b\",\"binary\":{s},\"timeout_ms\":30000}}", .{bin_json}) catch fail("oom"), "agent_open fan-b", false, 45_000);
+        const b_id = arena.dupe(u8, scStr(fb, "agent", "agent_open fan-b")) catch fail("oom");
+
+        // all: fan-a once its handed-off turn is done, fan-b (never sent
+        // anything, idle) at once.
+        const both = agentCall(&m, arena, "agent_wait", "{\"agents\":[\"fan-a\",\"fan-b\"],\"all\":true,\"timeout_ms\":20000}", "agent_wait all", false, 45_000);
+        expectFact(both, "outcome", "all_settled", "agent_wait all: outcome");
+        const rs = both.get("results").?.array.items;
+        if (rs.len != 2) fail("agent_wait all: not one result per agent");
+        expectFact(rs[0].object, "outcome", "done", "agent_wait all: fan-a settled by its done");
+        expectFact(rs[0].object, "text", "echo: handed off", "agent_wait all: fan-a's answer preview");
+        expectFact(rs[1].object, "outcome", "idle", "agent_wait all: fan-b was idle all along");
+        if (std.mem.indexOf(u8, scStr(both, "watch_command", "agent_wait all"), " --all ") == null) fail("agent_wait all: watch_command is not an --all waiter");
+
+        // final: just the last message, once; then a pointer; since re-reads.
+        const fin = agentCall(&m, arena, "agent_read", "{\"agent\":\"fan-a\",\"final\":true}", "agent_read final", false, 15_000);
+        const fin_recs = fin.get("records").?.array.items;
+        if (fin_recs.len != 1 or !std.mem.eql(u8, fin_recs[0].object.get("text").?.string, "echo: handed off")) fail("agent_read final: not exactly the last message");
+        const fin_again = agentCall(&m, arena, "agent_read", "{\"agent\":\"fan-a\",\"final\":true}", "agent_read final again", false, 15_000);
+        if (fin_again.get("records").?.array.items.len != 0) fail("agent_read final: repeated a record handed out");
+        if (fin_again.get("jobs").?.array.items.len != 1 or fin_again.get("jobs").?.array.items[0].object.get("earlier") == null) fail("agent_read final: no pointer at the message handed out before");
+        if (agentCall(&m, arena, "agent_read", "{\"agent\":\"fan-a\",\"final\":true,\"since\":0}", "agent_read final since 0", false, 15_000).get("records").?.array.items.len != 1)
+            fail("agent_read final since 0: no re-read");
+        _ = agentCall(&m, arena, "agent_read", "{\"agent\":\"fan-a\",\"final\":true,\"detail\":\"all\"}", "agent_read final + all", true, 15_000);
+
+        // One text to both, fan-a busy on a long turn: interrupted first,
+        // then sent as a new prompt; an unknown name fails alone.
+        const glacial = agentCall(&m, arena, "agent_send", "{\"agent\":\"fan-a\",\"text\":\"glacial work\",\"timeout_ms\":0}", "agent_send glacial", false, 15_000);
+        expectSentOrWorking(glacial, "agent_send glacial: outcome");
+        _ = c.usleep(500_000);
+        const many = agentCall(&m, arena, "agent_send", "{\"agents\":[\"fan-a\",\"fan-b\",\"nope-x\"],\"text\":\"fan out\",\"interrupt\":true,\"timeout_ms\":20000}", "agent_send agents interrupt", false, 45_000);
+        const mr = many.get("results").?.array.items;
+        if (mr.len != 3 or many.get("failed").?.integer != 1) fail("agent_send agents: not three results with one failure");
+        expectFact(mr[0].object, "agent", a_id, "agent_send agents: fan-a's result");
+        if (!mr[0].object.get("interrupted").?.bool) fail("agent_send agents: the busy fan-a was not interrupted");
+        if (mr[1].object.get("interrupted").?.bool) fail("agent_send agents: the idle fan-b was interrupted");
+        for (mr[0..2]) |r| expectSentOrWorking(r.object, "agent_send agents: outcome");
+        expectFact(mr[2].object, "outcome", "failed", "agent_send agents: the unknown agent");
+        expectFact(mr[2].object.get("error").?.object, "code", "not_found", "agent_send agents: the unknown agent's code");
+        const all_cmd = scStr(many, "watch_command", "agent_send agents");
+        if (std.mem.indexOf(u8, all_cmd, " --all ") == null or !std.mem.endsWith(u8, all_cmd, std.fmt.allocPrint(arena, " {s} {s}", .{ a_id, b_id }) catch fail("oom"))) {
+            say(all_cmd);
+            fail("agent_send agents: watch_command is not an --all waiter on the two sent");
+        }
+        var all_waiter = Waiter.start(all_cmd);
+        const all_out = all_waiter.finish(arena, 20_000, "--all waiter");
+        for ([_][]const u8{ a_id, b_id }) |id| {
+            if (std.mem.indexOf(u8, all_out, std.fmt.allocPrint(arena, "{s} done: echo: fan out", .{id}) catch fail("oom")) == null) {
+                say(all_out);
+                fail("the --all waiter did not report each agent's done");
+            }
+        }
+        if (std.mem.indexOf(u8, all_out, "all 2 agent(s) settled") == null or std.mem.indexOf(u8, all_out, "glacial") != null or all_waiter.status != 0) {
+            say(all_out);
+            fail("the --all waiter: no header, the interrupted turn's answer, or a bad exit");
+        }
+        // The waiter marked no record: final returns the new answer.
+        const fin2 = agentCall(&m, arena, "agent_read", "{\"agent\":\"fan-a\",\"final\":true}", "agent_read final after fan out", false, 15_000);
+        const fin2_recs = fin2.get("records").?.array.items;
+        if (fin2_recs.len != 1 or !std.mem.eql(u8, fin2_recs[0].object.get("text").?.string, "echo: fan out")) fail("agent_read final: not the answer to the prompt sent after the interrupt");
+        // interrupt on one idle agent just sends.
+        const solo = agentCall(&m, arena, "agent_send", "{\"agent\":\"fan-b\",\"text\":\"solo\",\"interrupt\":true,\"timeout_ms\":20000}", "agent_send interrupt idle", false, 45_000);
+        expectFact(solo, "outcome", "done", "agent_send interrupt on an idle agent: outcome");
+        if (solo.get("interrupted").?.bool) fail("agent_send interrupt: an idle agent was interrupted");
+
+        // The compact list by default, every fact with detail.
+        const compact = agentCall(&m, arena, "agent_list", "{}", "agent_list compact", false, 15_000);
+        const ca = compact.get("agents").?.array.items;
+        if (ca.len != 2 or compact.get("detail").?.bool) fail("agent_list: not the two agents, compact");
+        expectFact(ca[0].object, "host", "local", "agent_list compact: host");
+        if (ca[0].object.get("queued") == null or ca[0].object.get("idle_s") == null or ca[0].object.get("recordings") != null or ca[0].object.get("sessions") != null)
+            fail("agent_list compact: wrong facts");
+        const full = agentCall(&m, arena, "agent_list", "{\"detail\":true}", "agent_list detail", false, 15_000);
+        if (full.get("agents").?.array.items[0].object.get("recordings") == null) fail("agent_list detail: no recordings");
+        _ = agentCall(&m, arena, "agent_close", "{\"agent\":\"fan-a\"}", "agent_close fan-a", false, 15_000);
+        _ = agentCall(&m, arena, "agent_close", "{\"agent\":\"fan-b\"}", "agent_close fan-b", false, 15_000);
+
+        // term_open exec_shell: term_exec's shell unless a call names one.
+        _ = agentCall(&m, arena, "term_open", "{\"exec_shell\":\"bash;x\"}", "term_open bad exec_shell", true, 15_000);
+        const bt = agentCall(&m, arena, "term_open", "{\"exec_shell\":\"bash\"}", "term_open exec_shell", false, 30_000);
+        expectFact(bt, "exec_shell", "bash", "term_open: exec_shell fact");
+        const bt_id = bt.get("term").?.integer;
+        const by_default = agentCall(&m, arena, "term_exec", std.fmt.allocPrint(arena, "{{\"term\":{d},\"command\":\"cat /proc/$$/comm\",\"timeout_ms\":20000}}", .{bt_id}) catch fail("oom"), "term_exec exec_shell", false, 45_000);
+        if (std.mem.indexOf(u8, scStr(by_default, "output", "term_exec exec_shell"), "bash") == null) fail("term_exec: the terminal's exec_shell was not used");
+        const named = agentCall(&m, arena, "term_exec", std.fmt.allocPrint(arena, "{{\"term\":{d},\"command\":\"cat /proc/$$/comm\",\"shell\":\"sh\",\"timeout_ms\":20000}}", .{bt_id}) catch fail("oom"), "term_exec shell sh", false, 45_000);
+        if (std.mem.indexOf(u8, scStr(named, "output", "term_exec shell sh"), "bash") != null) fail("term_exec: a call's own shell did not win over exec_shell");
+        const tl = agentCall(&m, arena, "term_list", "{}", "term_list exec_shell", false, 15_000);
+        const tl_json = std.json.Stringify.valueAlloc(arena, std.json.Value{ .object = tl }, .{}) catch fail("oom");
+        if (std.mem.indexOf(u8, tl_json, "\"exec_shell\":\"bash\"") == null) fail("term_list: no exec_shell");
+        _ = agentCall(&m, arena, "term_close", std.fmt.allocPrint(arena, "{{\"term\":{d}}}", .{bt_id}) catch fail("oom"), "term_close exec_shell", false, 15_000);
+        m.closeStdinWait();
+        say("smoke-mcp: agents: one-call hand-off, send to several with interrupt, wait all (tool and --all), read final, compact list, term exec_shell ok");
+    }
+
+    // ── a gone agent is relaunched under its id, resuming its conversation ──
+    {
+        const user_sock = std.fmt.allocPrint(arena, "{s}/sketerm/mux.sock", .{rt}) catch fail("oom");
+        var r1 = Mcp.spawn(allocator, exe, &.{});
+        r1.initialize();
+        resetStarts();
+        const opened = agentCall(&r1, arena, "agent_open", std.fmt.allocPrint(arena, "{{\"app\":\"claude\",\"name\":\"phoenix\",\"binary\":{s},\"prompt\":\"before the reboot\",\"timeout_ms\":30000{s}}}", .{ bin_json, extraJson(arena) }) catch fail("oom"), "relaunch: agent_open", false, 45_000);
+        expectFact(opened, "message", "echo: before the reboot", "relaunch: the first answer");
+        const id = arena.dupe(u8, scStr(opened, "agent", "relaunch: agent_open")) catch fail("oom");
+        const conv = arena.dupe(u8, scStr(opened, "conversation", "relaunch: agent_open")) catch fail("oom");
+        const session = std.fmt.allocPrint(arena, "agent-{s}", .{id}) catch fail("oom");
+        _ = c.kill(r1.pid, c.SIGKILL);
+        _ = c.waitpid(r1.pid, null, 0);
+        // The host goes down: the session ends without anyone closing the agent.
+        {
+            var conn = muxclient.Conn.connectProbed(allocator, user_sock) catch fail("relaunch: cannot reach the per-user daemon");
+            defer conn.deinit();
+            conn.sendKill(.{ .name = session }) catch fail("relaunch: kill");
+        }
+        waitUnlisted(allocator, user_sock, session, "relaunch: the session was not ended");
+        var r2 = Mcp.spawn(allocator, exe, &.{});
+        r2.initialize();
+        const gone = agentCall(&r2, arena, "agent_attach", "{\"agent\":\"phoenix\"}", "relaunch: attach a gone agent", false, 30_000);
+        expectFact(gone, "attach", "gone", "relaunch: without relaunch it is gone");
+        if (!gone.get("relaunchable").?.bool) fail("relaunch: the gone agent is not relaunchable");
+        resetStarts();
+        const back = agentCall(&r2, arena, "agent_attach", "{\"agent\":\"phoenix\",\"relaunch\":true,\"timeout_ms\":30000}", "relaunch: agent_attach relaunch", false, 60_000);
+        expectFact(back, "attach", "relaunched", "relaunch: outcome");
+        expectFact(back, "agent", id, "relaunch: the same id");
+        expectFact(back, "name", "phoenix", "relaunch: the same name");
+        expectFact(back, "conversation", conv, "relaunch: the same conversation");
+        // The same wrapper args and env, byte-exact.
+        expectStarts(arena, "claude", 1, "relaunch");
+        const recalled = agentCall(&r2, arena, "agent_send", "{\"agent\":\"phoenix\",\"text\":\"recall\",\"timeout_ms\":20000}", "relaunch: recall", false, 45_000);
+        expectFact(recalled, "message", "first prompt was: before the reboot", "relaunch: the conversation was resumed");
+        _ = agentCall(&r2, arena, "agent_close", "{\"agent\":\"phoenix\"}", "relaunch: agent_close", false, 15_000);
+        var desc_buf: [512]u8 = undefined;
+        const desc = std.fmt.bufPrintZ(&desc_buf, "{s}/sketerm/agents/{s}.json", .{ rt, id }) catch fail("path");
+        var st: c.struct_stat = undefined;
+        if (c.stat(desc.ptr, &st) == 0) fail("relaunch: agent_close left the descriptor in the index");
+        r2.closeStdinWait();
+        say("smoke-mcp: agents: a gone agent is relaunchable, relaunch keeps its id, name, wrapper and conversation ok");
     }
 
     // ── an agent outlives its server: another one resumes it by name ──

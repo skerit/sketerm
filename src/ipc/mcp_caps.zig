@@ -466,6 +466,13 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
         try res.fact("agent_records_once", agents_ok);
         try res.fact("agent_events_shared", agents_ok);
         try res.fact("agent_wait_any", agents_ok);
+        try res.fact("agent_wait_all", agents_ok);
+        try res.fact("agent_send_many", agents_ok);
+        try res.fact("agent_send_interrupt", agents_ok);
+        try res.fact("agent_read_final", agents_ok);
+        try res.fact("agent_list_compact", agents_ok);
+        try res.fact("agent_relaunch", agents_ok);
+        try res.fact("agent_open_handoff", agents_ok);
         try res.fact("agent_send_queue", agents_ok);
         try res.fact("agent_answer_text", agents_ok);
         try res.fact("agent_push", @tagName(if (agents_ok) mcp_agent.state.push else .none));
@@ -482,8 +489,9 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
         if (agents_ok) {
             try res.textf("sub-agents: agent_open runs one of {d} adapter(s) on this machine{s}, directly or through a wrapper (binary + args + env); results carry a watch_command that wakes you when it needs attention", .{ ids.len, if (agent_ssh) " or on an SSH host (host)" else " (no ssh client here, so not on SSH hosts)" });
             try res.textf("agent_read and done results return per job its last message, earlier segment finals of {d}+ chars, messages of {d}+ chars and notices, about {d} chars per read (detail all for every message); each record reaches you once", .{ select.FINAL_MIN_CHARS, select.LONG_MIN_CHARS, select.READ_CAP_CHARS });
-            try res.text("done means settled (no subagents or background tasks left running); results and waiters share one event delivery, and agent_wait agents / agent-wait --any watch several agents");
-            try res.text("agent_send to a busy agent queues the prompt in its app for the next turn (outcome queued), and agent_answer takes free text where the prompt allows it");
+            try res.text("done means settled (no subagents or background tasks left running); results and waiters share one event delivery, and agent_wait agents / agent-wait --any watch several agents (all / --all: once every one settled)");
+            try res.text("agent_send to a busy agent queues the prompt in its app for the next turn (outcome queued) unless interrupt, agents sends to several in one call, and agent_answer takes free text where the prompt allows it");
+            try res.text("agent_read final returns just the newest job's last message, agent_list is compact unless detail, and agent_attach relaunch starts a gone agent again under its id");
             if (mcp_agent.state.push == .channel)
                 try res.text("agent events are pushed into this session as Claude Code channel messages: end your turn after delegating instead of running watch_command")
             else if (mcp_agent.followers() > 0)
@@ -495,6 +503,7 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
             try res.text("sub-agents (agent_*) are unavailable in --shared mode: they run on an isolated or durable instance's private daemon");
     }
 
+    try res.fact("term_exec_shell_default", mcp_term.term_state.mux_sock != null);
     try res.fact("open_terms", mcp_term.term_state.terms.count());
     try res.fact("open_apps", mcp_app.app_state.apps.count());
     try res.fact("open_forwards", mcp_term.forward_state.forwards.count());
