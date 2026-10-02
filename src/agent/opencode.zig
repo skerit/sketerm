@@ -309,6 +309,14 @@ pub const Source = struct {
         self.state = .exited;
     }
 
+    /// The server's session is gone from its daemon: `exited`, saying why.
+    pub fn noteGone(self: *Source, now_ms: i64, why: []const u8) !void {
+        if (self.exited) return;
+        _ = try self.queue.push(now_ms, .exited, null, why, "");
+        self.exited = true;
+        self.state = .exited;
+    }
+
     /// The event stream dropped (the caller reconnects and resyncs).
     pub fn noteDisconnected(self: *Source, now_ms: i64, reason: []const u8) !void {
         if (self.disconnected or self.exited) return;
@@ -1466,6 +1474,12 @@ pub const Api = struct {
         self.stream.close();
         self.reconnect_at_ms = null;
         try self.source.noteExited(now_ms, status);
+    }
+
+    pub fn noteGone(self: *Api, now_ms: i64, why: []const u8) !void {
+        self.stream.close();
+        self.reconnect_at_ms = null;
+        try self.source.noteGone(now_ms, why);
     }
 
     // ── actions ──────────────────────────────────────────────────

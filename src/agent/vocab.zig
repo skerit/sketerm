@@ -153,6 +153,9 @@ pub const ErrorClass = enum {
     auth,
     /// Only surfaced when it persists.
     retrying,
+    /// The provider was overloaded or unavailable (a 5xx) and the turn
+    /// ended on it: what `retry_on_overload` answers with a continue prompt.
+    overloaded,
     api,
     crashed,
     unknown,
@@ -162,7 +165,7 @@ pub const ErrorClass = enum {
     pub fn surfaceAfterMs(self: ErrorClass) i64 {
         return switch (self) {
             .retrying => 10_000,
-            .limit, .auth, .api, .crashed, .unknown => 0,
+            .limit, .auth, .overloaded, .api, .crashed, .unknown => 0,
         };
     }
 
@@ -172,10 +175,23 @@ pub const ErrorClass = enum {
     pub fn wakesByDefault(self: ErrorClass) bool {
         return switch (self) {
             .retrying => false,
-            .limit, .auth, .api, .crashed, .unknown => true,
+            .limit, .auth, .overloaded, .api, .crashed, .unknown => true,
+        };
+    }
+
+    /// A turn that ended on it may be continued by `retry_on_overload`;
+    /// a usage limit or an auth failure never is.
+    pub fn retriedOnOverload(self: ErrorClass) bool {
+        return switch (self) {
+            .overloaded => true,
+            .limit, .auth, .retrying, .api, .crashed, .unknown => false,
         };
     }
 };
+
+/// What a permission policy says about one tool or permission name
+/// (`agent_open permissions`), mapped to each app by its adapter.
+pub const PermissionAction = enum { allow, ask, deny };
 
 pub const InteractionKind = enum { permission, question, choice };
 
@@ -234,7 +250,12 @@ test "only retrying waits before it is surfaced, and only it does not wake by de
     for (std.enums.values(ErrorClass)) |cls| {
         try t.expectEqual(cls == .retrying, cls.surfaceAfterMs() > 0);
         try t.expectEqual(cls != .retrying, cls.wakesByDefault());
+        // A retried class always wakes once retries give up; limits and
+        // auth failures are never retried.
+        if (cls.retriedOnOverload()) try t.expect(cls.wakesByDefault());
     }
+    try t.expect(!ErrorClass.limit.retriedOnOverload());
+    try t.expect(!ErrorClass.auth.retriedOnOverload());
 }
 
 test "a wait outcome never shares a name with an event kind" {

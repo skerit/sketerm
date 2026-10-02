@@ -13,6 +13,13 @@
     "effort_values": ["low", "medium", "high", "xhigh", "max"],
     "unset_env": ["CLAUDE*"],
     "version_args": ["--version"],
+    "permissions": {
+      "names": ["Agent", "Bash", "Edit", "Glob", "Grep", "NotebookEdit", "Read", "Skill", "TodoWrite", "WebFetch", "WebSearch", "Write"],
+      "patterns": ["^[A-Z][A-Za-z]*(.+)$", "^mcp__[A-Za-z0-9_-]+$"],
+      "shape": "by_action",
+      "path": ["permissions"],
+      "arg": "--settings"
+    },
     "exit": [
       { "clear_input": ["escape", "escape"] },
       { "command": "/exit" },
@@ -130,6 +137,8 @@
     { "class": "limit", "pattern": "You've hit your |Usage limit reached|usage limit reached|You're out of usage credits|Credit balance is too low|spend limit reached", "reset_marker": "resets " },
     { "class": "auth", "pattern": "Please run /login|Not logged in|Invalid API key|Invalid auth token|Authentication required|Failed to authenticate|OAuth token has expired" },
     { "class": "retrying", "pattern": "Retrying in [0-9]" },
-    { "class": "api", "pattern": "^API Error|Repeated 529 Overloaded errors|is experiencing high load|^Prompt is too long" }
-  ]
+    { "class": "overloaded", "pattern": "Repeated 529 Overloaded errors|is experiencing high load|^API Error[: (]+5[0-9][0-9]|overloaded_error" },
+    { "class": "api", "pattern": "^API Error|^Prompt is too long" }
+  ],
+  "retry": { "prompt": "continue" }
 }

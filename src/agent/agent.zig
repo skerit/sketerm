@@ -137,6 +137,24 @@ pub const Agent = struct {
         };
     }
 
+    /// Record something sketerm did for the agent that the app shows no
+    /// trace of (a retry it sent).
+    pub fn addNotice(self: *Agent, text: []const u8) !void {
+        switch (self.source) {
+            .screen => |*e| try e.addNotice(text),
+            .opencode_api => |*a| try a.source.addNotice(text),
+        }
+    }
+
+    /// Its session no longer exists where it ran (found on a reconnect):
+    /// one `exited` with `why`, and the agent is over.
+    pub fn noteGone(self: *Agent, now_ms: i64, why: []const u8) !void {
+        switch (self.source) {
+            .screen => |*e| try e.noteGone(now_ms, why),
+            .opencode_api => |*a| try a.noteGone(now_ms, why),
+        }
+    }
+
     /// Prompts the app holds queued for a later turn.
     pub fn queuedPrompts(self: *const Agent) u32 {
         return switch (self.source) {

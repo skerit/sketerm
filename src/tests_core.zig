@@ -329,6 +329,7 @@ comptime {
     _ = @import("agent/opencode.zig");
     _ = @import("agent/agent.zig");
     _ = @import("agent/launch.zig");
+    _ = @import("agent/retry.zig");
     _ = @import("ipc/agentwait.zig");
     _ = @import("ipc/agentpush.zig");
     _ = @import("ipc/agentindex.zig");

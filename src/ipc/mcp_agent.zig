@@ -42,6 +42,7 @@ const select = @import("../agent/select.zig");
 const launch = @import("../agent/launch.zig");
 const screen_source = @import("../agent/screen_source.zig");
 const opencode = @import("../agent/opencode.zig");
+const retry_mod = @import("../agent/retry.zig");
 const wire = @import("../mux/wire.zig");
 const Screen = @import("../grid/screen.zig").Screen;
 const clock = @import("../util/clock.zig");
@@ -230,6 +231,14 @@ pub const Entry = struct {
     /// When the agent was found ended (`clock.wallMs`), its descriptor kept
     /// for `agent_attach relaunch`; 0 while it runs.
     ended_ms: i64 = 0,
+    /// `retry_on_overload`: the policy and its episode on the agent's queue.
+    retry: retry_mod.Tracker = .{},
+    /// An action (a recipe, an API call) runs on the agent now: a retry
+    /// never types into it.
+    acting: u32 = 0,
+    /// A reconnect found its session gone from the daemon: what that
+    /// daemon remembered of its end.
+    gone_why: ?GoneFacts = null,
 
     fn visibleTerm(self: *const Entry) ?*termdrive.Term {
         const l = self.visible orelse return null;
@@ -288,6 +297,24 @@ pub const Entry = struct {
     }
 };
 
+/// Why a session is gone, as its daemon's tombstone says (all null: it
+/// keeps no record, as a daemon fresh after a reboot).
+const GoneFacts = struct {
+    reason: ?tombstones.Reason = null,
+    ended_ms: ?i64 = null,
+    exit_status: ?i32 = null,
+    signal: ?i32 = null,
+
+    fn of(tomb: ?tombstones.Reply) GoneFacts {
+        const tb = tomb orelse return .{};
+        return .{ .reason = tb.reason orelse .unknown, .ended_ms = tb.ended_ms, .exit_status = tb.exit_status, .signal = tb.signal };
+    }
+
+    fn reasonName(self: GoneFacts) []const u8 {
+        return @tagName(self.reason orelse .unknown);
+    }
+};
+
 /// Where an agent's sessions run.
 const Where = struct {
     host: ?[]const u8 = null,
@@ -336,6 +363,9 @@ const State = struct {
     push_live: bool = false,
     /// Where a channel notification line goes (the MCP server's stdout).
     push_sink: ?*const fn ([]const u8) void = null,
+    /// A retry is typing its continue prompt: the service it pumps does
+    /// not start another (nor count that prompt as the caller's).
+    retry_busy: bool = false,
 };
 
 /// Agents one agent_wait or waiter watches at most.
@@ -529,6 +559,10 @@ pub fn dueInMs(now_ms: i64) ?i64 {
             .opencode_api => |*api| api.serviceDueIn(now_ms),
         };
         if (d) |x| due = if (due) |y| @min(x, y) else x;
+        if (e.retry.due_ms) |at| {
+            const x = @max(0, at - now_ms);
+            due = if (due) |y| @min(x, y) else x;
+        }
         if (e.forward) |f| if (f.exited) {
             const x = @max(0, e.forward_retry_ms - now_ms);
             due = if (due) |y| @min(x, y) else x;
@@ -567,8 +601,98 @@ pub fn service(now_ms: i64) void {
             } else removeDescriptor(e);
         }
     }
+    serviceRetries(now_ms);
     servicePush(now_ms);
     state.waiter.service(now_ms);
+}
+
+// ── retry on overload ────────────────────────────────────────────
+
+/// Advance every agent's `retry_on_overload` episode and type a due
+/// continue prompt. Not while a retry is typing one (its recipe pumps
+/// this loop).
+fn serviceRetries(now_ms: i64) void {
+    if (state.retry_busy) return;
+    for (state.entries.items) |e| serviceRetry(e, now_ms) catch {};
+}
+
+fn serviceRetry(e: *Entry, now_ms: i64) !void {
+    if (e.retry.policy == null and !e.retry.active) return;
+    var arena_state = std.heap.ArenaAllocator.init(state.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const q = e.agent.queue();
+    const prompt = e.loaded.spec.retry.prompt;
+    while (true) {
+        const note: []const u8 = switch (e.retry.next(q, now_ms)) {
+            .none => break,
+            .scheduled => |s| try std.fmt.allocPrint(arena, "the turn ended on a provider overload ({s}): retry {d} of {d}, sending \"{s}\" in {d} s (retry_on_overload)", .{ events.preview(s.text), s.attempt, s.max, prompt, @divTrunc(s.delay_ms, 1000) }),
+            .recovered => |r| try std.fmt.allocPrint(arena, "the turn went on after {d} retr{s} on overload (retry_on_overload)", .{ r.attempts, if (r.attempts == 1) "y" else "ies" }),
+            .gave_up => |g| switch (g.why) {
+                .exhausted => try std.fmt.allocPrint(arena, "retry_on_overload gave up: the provider was still overloaded after {d} retr{s} in this job", .{ g.attempts, if (g.attempts == 1) "y" else "ies" }),
+                .other_error, .exited, .off => try std.fmt.allocPrint(arena, "retry_on_overload stopped after {d} retr{s}: {s}", .{ g.attempts, if (g.attempts == 1) "y" else "ies", switch (g.why) {
+                    .other_error => "the continued turn ended on another error",
+                    .exited => "the app is gone",
+                    else => "it was turned off",
+                } }),
+            },
+        };
+        e.agent.addNotice(note) catch {};
+    }
+    const due = e.retry.due_ms orelse return;
+    if (now_ms < due or e.acting > 0 or e.relaunching or gone(e) or !e.agent.state().takesPrompt()) return;
+    state.retry_busy = true;
+    defer state.retry_busy = false;
+    const from = q.next_seq;
+    switch (try submitPrompt(arena, e, prompt, clock.nowMs() + STEP_WAIT_MS, true)) {
+        .ok => e.retry.sent(from),
+        .fail => |f| {
+            e.retry.abandon(q);
+            e.agent.addNotice(try std.fmt.allocPrint(arena, "retry_on_overload could not send \"{s}\": {s}", .{ prompt, f.msg })) catch {};
+        },
+    }
+}
+
+/// agent_open's / agent_set's `retry_on_overload`: an object (`max`,
+/// `backoff_s`; `max` 0 turns it off) or null for off.
+fn retryPolicyFrom(arena: std.mem.Allocator, v: std.json.Value, why: *Fail) !?retry_mod.Policy {
+    if (v == .null) return null;
+    if (v != .object) {
+        why.* = .{ .code = .invalid_args, .msg = "retry_on_overload must be an object {max, backoff_s} (or null to turn it off)" };
+        return error.Refused;
+    }
+    var p: retry_mod.Policy = .{};
+    var it = v.object.iterator();
+    while (it.next()) |kv| {
+        const key = kv.key_ptr.*;
+        const n: i64 = switch (kv.value_ptr.*) {
+            .integer => |x| x,
+            else => -1,
+        };
+        if (std.mem.eql(u8, key, "max")) {
+            if (n < 0 or n > retry_mod.MAX_RETRIES) {
+                why.* = .{ .code = .invalid_args, .msg = try std.fmt.allocPrint(arena, "retry_on_overload.max must be an integer 0-{d} (0 turns it off)", .{retry_mod.MAX_RETRIES}) };
+                return error.Refused;
+            }
+            p.max = @intCast(n);
+        } else if (std.mem.eql(u8, key, "backoff_s")) {
+            if (n < 1 or n > retry_mod.BACKOFF_CAP_S) {
+                why.* = .{ .code = .invalid_args, .msg = try std.fmt.allocPrint(arena, "retry_on_overload.backoff_s must be an integer 1-{d}", .{retry_mod.BACKOFF_CAP_S}) };
+                return error.Refused;
+            }
+            p.backoff_s = @intCast(n);
+        } else {
+            why.* = .{ .code = .invalid_args, .msg = try std.fmt.allocPrint(arena, "retry_on_overload takes max and backoff_s, not {f}", .{std.json.fmt(key, .{})}) };
+            return error.Refused;
+        }
+    }
+    return if (p.max == 0) null else p;
+}
+
+/// Set `e`'s retry policy; a pending retry of a policy turned off gives up.
+fn setRetryPolicy(e: *Entry, p: ?retry_mod.Policy) void {
+    if (e.retry.policy == null and !e.retry.active) e.retry.catchUp(e.agent.queue());
+    e.retry.policy = p;
 }
 
 // ── push delivery ────────────────────────────────────────────────
@@ -690,14 +814,25 @@ const ReconnectJob = struct {
     done: std.atomic.Value(bool) = .init(false),
     conn: ?muxclient.Conn = null,
     snapshot: ?[]u8 = null,
+    /// The host's daemon answered, and has no such session (any more):
+    /// what its tombstone says. Never set when the host did not answer.
+    gone: ?GoneFacts = null,
 
     fn run(self: *ReconnectJob) void {
         defer self.done.store(true, .release);
         const a = self.allocator;
         var conn = muxconnect.connectSshOnce(a, self.host) catch return;
         conn.setNonBlocking();
+        conn.last_err_len = 0;
         conn.sendAttach(self.name, .{ .origin_id = &self.origin, .kind = "mcp" }) catch return conn.deinit();
-        const snap = conn.recvExpectFor(&.{.snapshot}, 15_000) catch return conn.deinit();
+        const snap = conn.recvExpectFor(&.{.snapshot}, 15_000) catch {
+            if (conn.last_err_len > 0) {
+                var arena_state = std.heap.ArenaAllocator.init(a);
+                defer arena_state.deinit();
+                self.gone = GoneFacts.of(askWhyGone(&conn, arena_state.allocator(), self.name, &self.origin));
+            }
+            return conn.deinit();
+        };
         defer snap.deinit(a);
         self.snapshot = a.dupe(u8, snap.payload) catch return conn.deinit();
         self.conn = conn;
@@ -735,7 +870,6 @@ fn entryOfTerm(t: *const termdrive.Term) ?*Entry {
 /// Hand finished reconnects to their terminals (the link is back: the
 /// screen engine sees a resync and reports `connection_restored`).
 fn serviceReconnects(now_ms: i64) void {
-    _ = now_ms;
     var i: usize = 0;
     while (i < state.reconnects.items.len) {
         const j = state.reconnects.items[i];
@@ -744,13 +878,47 @@ fn serviceReconnects(now_ms: i64) void {
             continue;
         }
         _ = state.reconnects.swapRemove(i);
-        if (j.term) |t| if (j.conn) |conn| {
-            t.adoptReattached(conn, j.snapshot.?);
-            j.conn = null;
-            if (entryOfTerm(t)) |e| e.reconnect_delay_ms = RECONNECT_MIN_MS;
-        };
+        if (j.term) |t| {
+            if (j.conn) |conn| {
+                t.adoptReattached(conn, j.snapshot.?);
+                j.conn = null;
+                if (entryOfTerm(t)) |e| e.reconnect_delay_ms = RECONNECT_MIN_MS;
+            } else if (j.gone) |g| goneOnReconnect(t, g, j.host, now_ms);
+        }
         j.free();
     }
+}
+
+/// A reconnect reached `t`'s daemon and it has no such session (the host
+/// rebooted, the session was closed or expired meanwhile): the link is not
+/// what is lost, so retrying stops, and an agent whose app ran there is
+/// over, with one `exited` saying why.
+fn goneOnReconnect(t: *termdrive.Term, g: GoneFacts, host: []const u8, now_ms: i64) void {
+    t.markGone(g.exit_status);
+    const e = entryOfTerm(t) orelse return;
+    // An API source's attached TUI is not the agent: its server is.
+    const main = switch (e.agent.source) {
+        .screen => e.visibleTerm() == t,
+        .opencode_api => e.server == t,
+    };
+    if (!main) return;
+    e.gone_why = g;
+    var buf: [512]u8 = undefined;
+    const why = std.fmt.bufPrint(&buf, "the agent's session is gone from {s}'s daemon (reason {s}: {s}); it reconnected to find no such session", .{
+        host, g.reasonName(), goneDetail(g),
+    }) catch "the agent's session is gone from its daemon";
+    e.agent.noteGone(now_ms, why) catch {};
+}
+
+/// What a gone session's reason means, in words.
+fn goneDetail(g: GoneFacts) []const u8 {
+    const r = g.reason orelse return "its daemon keeps no record of it (a daemon started fresh, after a reboot, or an older one)";
+    return switch (r) {
+        .expired => "it had no client attached for its idle lifetime (mcp_agent_idle_ttl_hours) and its daemon ended it",
+        .closed => "it was closed (agent_close, or a kill)",
+        .exited => "its app exited",
+        .unknown => "its daemon does not know why it ended",
+    };
 }
 
 /// Start a background reconnect for each of `e`'s lost links that is due,
@@ -1520,6 +1688,8 @@ fn finish(arena: std.mem.Allocator, res: *Res, e: *Entry, dv: Delivered, watch: 
     if (e.host) |h| try res.fact("host", h);
     if (conversationOf(e)) |cv| try res.fact("conversation", cv);
     try res.fact("transport", @tagName(e.transport));
+    try goneFacts(arena, res, e);
+    try retryFacts(res, e);
 
     var message: ?[]const u8 = null;
     var job_block: ?Block = null;
@@ -1633,6 +1803,46 @@ fn conversationOf(e: *Entry) ?[]const u8 {
     };
 }
 
+/// A permission policy as the `permissions` fact: name to action.
+fn permissionsValue(arena: std.mem.Allocator, perms: []const launch.Permission) !std.json.Value {
+    var obj: std.json.ObjectMap = .empty;
+    for (perms) |p| try obj.put(arena, p.name, .{ .string = @tagName(p.action) });
+    return .{ .object = obj };
+}
+
+/// Whether a gone agent can be started again, as agent_attach answers it:
+/// its descriptor was kept (`ended_ms`).
+fn relaunchableOf(e: *const Entry) ?bool {
+    return if (gone(e)) e.ended_ms != 0 else null;
+}
+
+/// A gone agent's `relaunchable` and, when a reconnect found its session
+/// gone, `gone_reason`, with a line saying what to do.
+fn goneFacts(arena: std.mem.Allocator, res: *Res, e: *Entry) !void {
+    const can = relaunchableOf(e) orelse return;
+    try res.fact("relaunchable", can);
+    if (e.gone_why) |g| try res.fact("gone_reason", g.reasonName());
+    const key = e.name orelse e.id;
+    if (can)
+        try res.textf("{s} is gone{s}{s}{s}: agent_attach with agent \"{s}\" and relaunch: true starts it again with its launch settings, resuming its conversation", .{
+            e.id, if (e.gone_why != null) " (" else "", if (e.gone_why) |g| g.reasonName() else "", if (e.gone_why != null) ")" else "", key,
+        })
+    else
+        try res.textf("{s} is gone and cannot be relaunched{s}; agent_open a new one", .{ e.id, if (e.gone_why) |g| try std.fmt.allocPrint(arena, " ({s})", .{g.reasonName()}) else "" });
+}
+
+/// The retry policy and where its episode stands, when one is set.
+fn retryFacts(res: *Res, e: *const Entry) !void {
+    const p = e.retry.policy orelse return;
+    try res.fact("retry_on_overload", .{
+        .max = p.max,
+        .backoff_s = p.backoff_s,
+        .used = e.retry.used,
+        .pending = e.retry.active,
+        .next_in_ms = if (e.retry.due_ms) |d| @max(0, d - clock.nowMs()) else null,
+    });
+}
+
 /// A job block's header: the jobs it holds (`job 3`, `jobs 2, 4`, `jobs 2-4`).
 fn jobsName(arena: std.mem.Allocator, jobs: []const select.JobSummary) ![]const u8 {
     if (jobs.len == 0) return "jobs";
@@ -1702,6 +1912,8 @@ fn adaptersTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
         installed: bool,
         binary: ?[]const u8,
         actions: []const []const u8,
+        /// The names agent_open `permissions` takes; null: none.
+        permissions: ?struct { names: []const []const u8, patterns: []const []const u8 },
     };
     const items = try arena.alloc(Item, set.items.items.len);
     var res = Res.init(arena);
@@ -1725,6 +1937,7 @@ fn adaptersTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
             .installed = bin != null,
             .binary = bin,
             .actions = acts.items,
+            .permissions = if (l.spec.launch.permissions) |p| .{ .names = p.names, .patterns = p.patterns } else null,
         };
         if (i > 0) try listing.writer.writeAll("\n");
         try listing.writer.print("{s} ({s}, {s} source, {s}): {s}", .{
@@ -1771,6 +1984,8 @@ const OpenOpts = struct {
     name: ?[]const u8 = null,
     /// A relaunch keeps the agent's id instead of minting one.
     keep_id: ?[]const u8 = null,
+    /// `retry_on_overload`; null = off.
+    retry: ?retry_mod.Policy = null,
 };
 
 /// A conversation id travels on the app's argv and in an API path, so only
@@ -1833,6 +2048,24 @@ fn extraOpts(arena: std.mem.Allocator, args: std.json.Value, loaded: *const adap
             o.* = item.string;
         }
         x.path_prepend = out;
+    };
+    if (mcp.argValue(args, "permissions")) |v| if (v != .null) {
+        const shape = "permissions must be an object of tool or permission names to allow, ask or deny";
+        if (v != .object) {
+            why.* = .{ .code = .invalid_args, .msg = shape };
+            return error.Refused;
+        }
+        const out = try arena.alloc(launch.Permission, v.object.count());
+        var it = v.object.iterator();
+        var i: usize = 0;
+        while (it.next()) |kv| : (i += 1) {
+            const action = if (kv.value_ptr.* == .string) std.meta.stringToEnum(vocab.PermissionAction, kv.value_ptr.string) else null;
+            out[i] = .{ .name = kv.key_ptr.*, .action = action orelse {
+                why.* = .{ .code = .invalid_args, .msg = try std.fmt.allocPrint(arena, "permissions {f}: the value must be allow, ask or deny", .{std.json.fmt(kv.key_ptr.*, .{})}) };
+                return error.Refused;
+            } };
+        }
+        x.permissions = out;
     };
     // Default true: only an explicit false opts out.
     x.login_shell = if (mcp.argValue(args, "login_shell")) |v| !(v == .bool and !v.bool) else true;
@@ -1914,7 +2147,9 @@ fn openOpts(arena: std.mem.Allocator, args: std.json.Value, loaded: *const adapt
             return error.Refused;
         }
     }
+    const retry = if (mcp.argValue(args, "retry_on_overload")) |v| try retryPolicyFrom(arena, v, why) else null;
     return .{
+        .retry = retry,
         .name = name,
         .resume_id = resume_id,
         .override = override,
@@ -2079,6 +2314,7 @@ fn startAgent(arena: std.mem.Allocator, loaded: *const adapter.Loaded, o: *OpenO
         e.destroy(true);
         return err;
     };
+    setRetryPolicy(e, o.retry);
     if (claim.*) |cl| {
         e.claim = cl;
         claim.* = null;
@@ -2177,6 +2413,12 @@ fn openResult(arena: std.mem.Allocator, e: *Entry, ready: bool, sent: bool, note
     if (e.extra.server_args.len > 0) try res.fact("server_args", e.extra.server_args);
     if (e.extra.tui_args.len > 0) try res.fact("tui_args", e.extra.tui_args);
     try res.fact("env_names", env_names);
+    if (e.extra.permissions.len > 0) {
+        try res.raw("permissions", try toJson(arena, try permissionsValue(arena, e.extra.permissions)));
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        for (e.extra.permissions, 0..) |p, i| try aw.writer.print("{s}{s} {s}", .{ if (i > 0) ", " else "", p.name, @tagName(p.action) });
+        try res.textf("permissions: {s}", .{aw.written()});
+    }
     if (e.extra.args.len > 0 or env_names.len > 0)
         try res.textf("launched with {d} extra arg(s) and env {s}", .{ e.extra.args.len, if (env_names.len == 0) "(none)" else try std.mem.join(arena, ", ", env_names) });
     if (e.recordings.items.len > 0) try res.fact("recordings", e.recordings.items);
@@ -2457,13 +2699,14 @@ fn spawnScreen(arena: std.mem.Allocator, loaded: *const adapter.Loaded, binary: 
     // A conversation id the agent owns, so a relaunch resumes exactly it;
     // `resume` continues the caller's existing one instead.
     const conversation: ?[]const u8 = if (o.resume_id) |r| r else if (spec.launch.session_args.len > 0) try newUuid(arena) else null;
-    const argv = try launch.startArgv(arena, spec.launch, binary, o.extra, .{
+    const x = try launch.applyPermissions(arena, spec.launch, o.extra);
+    const argv = try launch.startArgv(arena, spec.launch, binary, x, .{
         .model = o.model,
         .effort = o.effort,
         .cwd = o.cwd,
         .session = conversation,
     }, .{ .main = if (o.resume_id != null) .resumed else .fresh });
-    const t = try spawnOn(arena, where, o.choice, argv, .{ .name = session, .cwd = o.cwd.?, .extra = o.extra, .title = o.name orelse "" }, why);
+    const t = try spawnOn(arena, where, o.choice, argv, .{ .name = session, .cwd = o.cwd.?, .extra = x, .title = o.name orelse "" }, why);
     errdefer t.deinit();
     const e = try newEntry(loaded, id, session, binary, o.cwd.?);
     errdefer dropBare(e);
@@ -2561,13 +2804,14 @@ fn spawnApi(arena: std.mem.Allocator, loaded: *const adapter.Loaded, binary: []c
     const session = try std.fmt.allocPrint(arena, "agent-{s}", .{id});
     const server_session = try std.fmt.allocPrint(arena, "agent-{s}-server", .{id});
     const what = try std.fmt.allocPrint(arena, "the {s} server", .{spec.name});
-    const server_argv = try launch.startArgv(arena, spec.launch, binary, o.extra, .{
+    const x = try launch.applyPermissions(arena, spec.launch, o.extra);
+    const server_argv = try launch.startArgv(arena, spec.launch, binary, x, .{
         .port = port_str,
         .cwd = cwd,
         .model = o.model,
         .effort = o.effort,
     }, .{ .main = .fresh });
-    const server = try spawnOn(arena, where, o.choice, server_argv, .{ .name = server_session, .cwd = cwd, .env = env, .secret_env = secret_env, .extra = o.extra, .title = o.name orelse "" }, why);
+    const server = try spawnOn(arena, where, o.choice, server_argv, .{ .name = server_session, .cwd = cwd, .env = env, .secret_env = secret_env, .extra = x, .title = o.name orelse "" }, why);
     errdefer server.deinit();
     if (secret_env != null) try typeSecret(arena, server, password, deadline, what, why);
 
@@ -2616,12 +2860,12 @@ fn spawnApi(arena: std.mem.Allocator, loaded: *const adapter.Loaded, binary: []c
         why.* = .{ .code = .failed, .msg = "the app's API created no session" };
         return error.Refused;
     };
-    const tui_argv = try launch.startArgv(arena, spec.launch, binary, o.extra, .{
+    const tui_argv = try launch.startArgv(arena, spec.launch, binary, x, .{
         .port = port_str,
         .cwd = cwd,
         .session = sid,
     }, .attach);
-    const tui: ?*termdrive.Term = if (spec.launch.attach_args.len == 0) null else try spawnOn(arena, where, o.choice, tui_argv, .{ .name = session, .cwd = cwd, .env = env, .secret_env = secret_env, .extra = o.extra, .title = o.name orelse "" }, why);
+    const tui: ?*termdrive.Term = if (spec.launch.attach_args.len == 0) null else try spawnOn(arena, where, o.choice, tui_argv, .{ .name = session, .cwd = cwd, .env = env, .secret_env = secret_env, .extra = x, .title = o.name orelse "" }, why);
     errdefer if (tui) |t| t.deinit();
     if (tui) |t| if (secret_env != null) try typeSecret(arena, t, password, deadline, "the attached client", why);
 
@@ -2729,6 +2973,8 @@ fn submitAndWait(arena: std.mem.Allocator, e: *Entry, text: []const u8, filter: 
 /// The recipe's keys get at least `STEP_WAIT_MS` to land even when the
 /// caller does not wait for the turn.
 fn submitPrompt(arena: std.mem.Allocator, e: *Entry, text: []const u8, deadline: i64, no_queue: bool) !Submitted {
+    // The caller's own prompt starts a new job: a new retry budget.
+    if (!state.retry_busy) e.retry.newPrompt();
     _ = waitReady(e, deadline);
     // A busy agent's app queues the prompt for its next turn, when it can.
     const queued = !no_queue and e.agent.state().queuesPrompt() and e.agent.supports(.queue);
@@ -2852,6 +3098,8 @@ const Outcome = struct {
 /// Take `action` through the agent's source: an API call, or the
 /// adapter's recipe run against the terminal.
 fn act(arena: std.mem.Allocator, e: *Entry, action: agent_mod.Action, deadline: i64) anyerror!Acted {
+    e.acting += 1;
+    defer e.acting -= 1;
     switch (e.agent.driver()) {
         .opencode_api => |d| {
             d.perform(action) catch |err| return .{ .fail = try apiFail(arena, d.api, err) };
@@ -3068,14 +3316,15 @@ fn relaunch(arena: std.mem.Allocator, e: *Entry, action: agent_mod.Action, deadl
 const Restart = struct { argv: []const []const u8, spec: SpawnSpec };
 
 fn restartOf(arena: std.mem.Allocator, e: *const Entry, model: ?[]const u8, effort: ?[]const u8, conversation: ?[]const u8, start: launch.Start) !Restart {
+    const x = try launch.applyPermissions(arena, e.loaded.spec.launch, e.extra);
     return .{
-        .argv = try launch.startArgv(arena, e.loaded.spec.launch, e.binary, e.extra, .{
+        .argv = try launch.startArgv(arena, e.loaded.spec.launch, e.binary, x, .{
             .model = model,
             .effort = effort,
             .cwd = e.cwd,
             .session = conversation,
         }, .{ .main = start }),
-        .spec = .{ .name = e.session, .cwd = e.cwd, .extra = e.extra, .title = e.name orelse "" },
+        .spec = .{ .name = e.session, .cwd = e.cwd, .extra = x, .title = e.name orelse "" },
     };
 }
 
@@ -3530,12 +3779,32 @@ fn joinDeliveries(arena: std.mem.Allocator, a: ?events.Delivery, b: ?events.Deli
 fn setTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]const u8 {
     const model = argStr(args, "model");
     const effort = argStr(args, "effort");
-    if (model == null and effort == null) return errRes(arena, .invalid_args, "agent_set needs 'model' and/or 'effort'");
+    const retry_arg = mcp.argValue(args, "retry_on_overload");
+    if (model == null and effort == null and retry_arg == null) return errRes(arena, .invalid_args, "agent_set needs 'model', 'effort' and/or 'retry_on_overload'");
     inline for (.{ "model", "effort" }) |key| {
         if (argStr(args, key)) |v| if (!launch.validValue(v)) return errRes(arena, .invalid_args, key ++ " must be 1-256 printable characters");
     }
     // Refused before anything is typed, stopped or restarted.
     if (effort) |x| if (!launch.validEffort(e.loaded.spec.launch, x)) return errRes(arena, .invalid_args, try effortRefusal(arena, e.loaded));
+    if (retry_arg) |v| {
+        var why: Fail = undefined;
+        const p = retryPolicyFrom(arena, v, &why) catch |err| switch (err) {
+            error.Refused => return errRes(arena, why.code, why.msg),
+            else => return err,
+        };
+        setRetryPolicy(e, p);
+        writeDescriptor(e);
+        service(clock.nowMs());
+        if (model == null and effort == null) {
+            var res = Res.init(arena);
+            if (p) |x|
+                try res.textf("{s}: retry_on_overload on: up to {d} retr{s} per job, the first after {d} s, doubling", .{ e.id, x.max, if (x.max == 1) "y" else "ies", x.backoff_s })
+            else
+                try res.textf("{s}: retry_on_overload off", .{e.id});
+            try res.fact("relaunched", false);
+            return finish(arena, &res, e, try pending(arena, e), .{}, &.{});
+        }
+    }
     const deadline = deadlineFrom(args, DEFAULT_WAIT_MS);
     // A screen app is typed at: only while it is idle.
     if (e.agent.kind() == .screen) {
@@ -3582,6 +3851,8 @@ fn setTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]const u
 
 fn interruptTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]const u8 {
     service(clock.nowMs());
+    // An interrupted turn is not continued behind the caller's back.
+    e.retry.newPrompt();
     const queued_before = e.agent.queuedPrompts();
     switch (try act(arena, e, .interrupt, deadlineFrom(args, DEFAULT_WAIT_MS))) {
         .fail => |f| return errRes(arena, f.code, f.msg),
@@ -3755,6 +4026,10 @@ fn listTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
         queued_prompts: u32,
         conversation: ?[]const u8,
         recordings: []const []const u8,
+        permissions: ?std.json.Value,
+        retry_on_overload: ?retry_mod.Policy,
+        relaunchable: ?bool,
+        gone_reason: ?[]const u8,
     };
     const items = try arena.alloc(Item, state.entries.items.len);
     var res = Res.init(arena);
@@ -3798,6 +4073,10 @@ fn listTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
             .queued_prompts = e.agent.queuedPrompts(),
             .conversation = conversationOf(e),
             .recordings = e.recordings.items,
+            .permissions = if (e.extra.permissions.len > 0) try permissionsValue(arena, e.extra.permissions) else null,
+            .retry_on_overload = e.retry.policy,
+            .relaunchable = relaunchableOf(e),
+            .gone_reason = if (e.gone_why) |g| g.reasonName() else null,
         };
         try res.textf("{s} ({s}{s}{s}): {s} on {s} in {s}, up {d}s, active {s} ago, {d} undelivered event(s)", .{
             out.agent,                         out.app,                    if (model != null) ", " else "",                          model orelse "",
@@ -3828,6 +4107,8 @@ fn listCompact(arena: std.mem.Allocator) ![]const u8 {
         queued: u32,
         pending: ?Pending,
         conversation: ?[]const u8,
+        relaunchable: ?bool,
+        gone_reason: ?[]const u8,
     };
     const items = try arena.alloc(Item, state.entries.items.len);
     var res = Res.init(arena);
@@ -3847,12 +4128,16 @@ fn listCompact(arena: std.mem.Allocator) ![]const u8 {
             .queued = e.agent.queuedPrompts(),
             .pending = if (it) |x| .{ .kind = @tagName(x.kind), .title = x.title } else null,
             .conversation = conversationOf(e),
+            .relaunchable = relaunchableOf(e),
+            .gone_reason = if (e.gone_why) |g| g.reasonName() else null,
         };
         var aw: std.Io.Writer.Allocating = .init(arena);
         const w = &aw.writer;
         try w.print("{s}", .{e.id});
         if (e.name) |n| try w.print(" ({s})", .{n});
         try w.print(" {s} {s} on {s} in {s}", .{ out.app, out.state, out.host, out.cwd });
+        if (out.gone_reason) |r| try w.print(" (gone: {s})", .{r});
+        if (out.relaunchable) |can| try w.print(", {s}", .{if (can) "relaunchable (agent_attach relaunch: true)" else "not relaunchable"});
         if (out.idle_s) |x| try w.print(", idle {d}s", .{x});
         if (out.queued > 0) try w.print(", {d} queued", .{out.queued});
         if (out.pending) |p| try w.print(", pending {s}: {s}", .{ p.kind, agentwait.clip(events.firstLine(p.title), 80) });
@@ -3979,6 +4264,8 @@ fn writeDescriptor(e: *Entry) void {
         .env = e.extra.env,
         .path_prepend = e.extra.path_prepend,
         .login_shell = e.extra.login_shell,
+        .permissions = e.extra.permissions,
+        .retry_on_overload = e.retry.policy,
         .started_ms = e.started_ms,
         .gone_ms = e.ended_ms,
     };
@@ -4275,10 +4562,17 @@ fn attachSession(arena: std.mem.Allocator, transport: Transport, host: ?[]const 
     }
     // The daemon answered: no such session (lifetime). Ask it why.
     why.* = .{ .kind = .gone, .session = name, .msg = try arena.dupe(u8, conn.last_err[0..conn.last_err_len]) };
-    if (conn.tombstone(arena, name, origin.?, TOMBSTONE_WAIT_MS) catch null) |r| {
-        if (r.value.found) why.tomb = r.value;
-    }
+    why.tomb = askWhyGone(&conn, arena, name, origin.?);
     return error.SessionGone;
+}
+
+/// A daemon refused to attach session `name` (lifetime `origin`), so it does
+/// not have it: why it ended, from its tombstone, or null when it keeps no
+/// record (an older daemon, or a fresh one after a reboot). The one rule of
+/// agent_attach and of a lost link's reconnect.
+fn askWhyGone(conn: *muxclient.Conn, arena: std.mem.Allocator, name: []const u8, origin: []const u8) ?tombstones.Reply {
+    const r = (conn.tombstone(arena, name, origin, TOMBSTONE_WAIT_MS) catch return null) orelse return null;
+    return if (r.value.found) r.value else null;
 }
 
 /// Pick a running agent up from descriptor `d`, holding `claim` (moved into
@@ -4289,7 +4583,7 @@ fn reattachOne(arena: std.mem.Allocator, d: Descriptor, claim: ?agentindex.Claim
     const loaded = (try adapters()).get(d.app) orelse return error.UnknownAdapter;
     const transport: Transport = if (d.transport) |s| std.meta.stringToEnum(Transport, s) orelse return error.BadDescriptor else .local;
     if (transport != .local and d.host == null) return error.BadDescriptor;
-    const extra = launch.Extra{ .args = d.args, .server_args = d.server_args, .tui_args = d.tui_args, .env = d.env, .path_prepend = d.path_prepend, .login_shell = d.login_shell };
+    const extra = launch.Extra{ .args = d.args, .server_args = d.server_args, .tui_args = d.tui_args, .env = d.env, .path_prepend = d.path_prepend, .login_shell = d.login_shell, .permissions = d.permissions };
     if ((try launch.checkExtra(arena, loaded.spec.launch, extra)) != null) return error.BadDescriptor;
     const socket = d.socket orelse state.mux_sock;
     var parts: Parts = .{};
@@ -4347,6 +4641,7 @@ fn reattachOne(arena: std.mem.Allocator, d: Descriptor, claim: ?agentindex.Claim
     e.claim = claim;
     parts = .{};
     state.entries.appendAssumeCapacity(e);
+    setRetryPolicy(e, d.retry_on_overload);
     // An adopted session's past is history: it arms no turn. A server
     // whose forward is down answers once `service` brings it back.
     if (loaded.spec.source == .opencode_api) {
@@ -4460,7 +4755,8 @@ fn relaunchFrom(arena: std.mem.Allocator, args: std.json.Value, d: Descriptor, c
             .ssh => .ssh,
             .@"sketerm-mux" => .mux,
         },
-        .extra = .{ .args = d.args, .server_args = d.server_args, .tui_args = d.tui_args, .env = d.env, .path_prepend = d.path_prepend, .login_shell = d.login_shell },
+        .extra = .{ .args = d.args, .server_args = d.server_args, .tui_args = d.tui_args, .env = d.env, .path_prepend = d.path_prepend, .login_shell = d.login_shell, .permissions = d.permissions },
+        .retry = d.retry_on_overload,
         .name = d.name,
         .keep_id = d.id,
     };
@@ -4546,12 +4842,11 @@ fn goneResult(arena: std.mem.Allocator, d: Descriptor, why: *const AttachWhy, re
         if (tb.exit_status) |s| try res.fact("exit_status", s);
         if (tb.signal) |s| try res.fact("signal", s);
     }
-    const detail: []const u8 = if (why.tomb) |tb| switch (tb.reason orelse .unknown) {
-        .expired => "it had no client attached for its idle lifetime (mcp_agent_idle_ttl_hours) and its daemon ended it",
-        .closed => "it was closed (agent_close, or a kill)",
-        .exited => if (tb.signal) |s| try std.fmt.allocPrint(arena, "its app was killed by signal {d}", .{s}) else try std.fmt.allocPrint(arena, "its app exited with status {d}", .{tb.exit_status orelse 0}),
-        .unknown => "its daemon does not know why it ended",
-    } else "reason unknown: the daemon keeps no record of it (an older daemon, or it ended long ago)";
+    const g = GoneFacts.of(why.tomb);
+    const detail: []const u8 = if (g.reason == .exited)
+        (if (g.signal) |s| try std.fmt.allocPrint(arena, "its app was killed by signal {d}", .{s}) else try std.fmt.allocPrint(arena, "its app exited with status {d}", .{g.exit_status orelse 0}))
+    else
+        goneDetail(g);
     try res.textf("agent {s} is gone: {s}", .{ d.id, detail });
     if (why.msg.len > 0) try res.textf("the daemon said: {s}", .{why.msg});
     if (relaunchable)

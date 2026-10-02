@@ -8,11 +8,19 @@
     "args": ["serve", "--port", "{port}"],
     "password_env": "OPENCODE_SERVER_PASSWORD",
     "attach_args": ["attach", "http://127.0.0.1:{port}", "--dir", "{cwd}", "-s", "{session}"],
-    "version_args": ["--version"]
+    "version_args": ["--version"],
+    "permissions": {
+      "names": ["*", "read", "edit", "glob", "grep", "list", "bash", "task", "external_directory", "todowrite", "question", "webfetch", "websearch", "lsp", "doom_loop", "skill"],
+      "shape": "by_name",
+      "path": ["permission"],
+      "env": "OPENCODE_CONFIG_CONTENT"
+    }
   },
   "errors": [
     { "class": "auth", "pattern": "^ProviderAuthError|^APIError 401|^APIError 403" },
     { "class": "limit", "pattern": "^APIError 429|[Rr]ate limit|[Uu]sage limit|[Qq]uota|Too Many Requests", "reset_marker": "resets " },
+    { "class": "overloaded", "pattern": "^APIError 5[0-9][0-9]|[Oo]verloaded|Service Unavailable" },
     { "class": "api", "pattern": "^APIError|^ContextOverflowError|^MessageOutputLengthError|^ContentFilterError|^StructuredOutputError" }
-  ]
+  ],
+  "retry": { "prompt": "continue" }
 }

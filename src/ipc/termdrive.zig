@@ -1076,6 +1076,18 @@ pub const Term = struct {
         return true;
     }
 
+    /// A reconnect reached the session's daemon and it no longer has the
+    /// session: the link is not what is gone, so no reconnect follows.
+    pub fn markGone(self: *Term, exit_status: ?i32) void {
+        self.lost = false;
+        self.exited = true;
+        self.reattach_spent = false;
+        if (exit_status) |s| {
+            self.exit_status = s;
+            self.exit_status_known = true;
+        }
+    }
+
     /// Take over a connection a background reconnect already attached to
     /// this session, and the snapshot it answered with: the link is back.
     pub fn adoptReattached(self: *Term, conn: muxclient.Conn, snapshot_payload: []const u8) void {

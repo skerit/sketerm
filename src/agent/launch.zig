@@ -8,6 +8,8 @@
 
 const std = @import("std");
 const adapter = @import("adapter.zig");
+const vocab = @import("vocab.zig");
+const pattern = @import("../util/pattern.zig");
 const shellquote = @import("../util/shellquote.zig");
 const c = @import("../c.zig").c;
 
@@ -47,6 +49,9 @@ pub const MAX_EXEC_STRING = 128 * 1024;
 
 pub const EnvVar = struct { name: []const u8, value: []const u8 };
 
+/// One entry of `agent_open permissions`.
+pub const Permission = struct { name: []const u8, action: vocab.PermissionAction };
+
 /// A caller's additions to every launch of the agent's binary: `args`
 /// right after the binary, `env` exempt from `unset_env`, `path_prepend`
 /// in front of the PATH the binary is looked up in and runs with.
@@ -60,10 +65,17 @@ pub const Extra = struct {
     path_prepend: []const []const u8 = &.{},
     /// Remote probes and starts run in the user's login shell environment.
     login_shell: bool = true,
+    /// The caller's permission policy, which `applyPermissions` turns into
+    /// the app's own mechanism at every start.
+    permissions: []const Permission = &.{},
 
     pub fn clone(self: Extra, a: std.mem.Allocator) !Extra {
         var out: Extra = .{ .login_shell = self.login_shell };
         errdefer out.free(a);
+        const perms = try a.alloc(Permission, self.permissions.len);
+        @memset(perms, .{ .name = "", .action = .ask });
+        out.permissions = perms;
+        for (self.permissions, perms) |s, *d| d.* = .{ .name = try a.dupe(u8, s.name), .action = s.action };
         inline for (.{ "args", "server_args", "tui_args" }) |f| {
             const list = try a.alloc([]const u8, @field(self, f).len);
             @memset(list, "");
@@ -97,6 +109,8 @@ pub const Extra = struct {
             a.free(v.value);
         }
         a.free(self.env);
+        for (self.permissions) |p| a.free(p.name);
+        a.free(self.permissions);
     }
 
     pub fn names(self: Extra, arena: std.mem.Allocator) ![]const []const u8 {
@@ -143,7 +157,106 @@ pub fn checkExtra(arena: std.mem.Allocator, launch: adapter.Launch, x: Extra) !?
         if (d[0] != '/') return try std.fmt.allocPrint(arena, "path_prepend[{d}] must be an absolute directory", .{i});
         if (std.mem.indexOfScalar(u8, d, ':') != null) return try std.fmt.allocPrint(arena, "path_prepend[{d}] contains ':', the PATH separator", .{i});
     }
+    return permissionProblem(arena, launch, x);
+}
+
+/// Why `x.permissions` cannot reach `launch`'s app, or null.
+fn permissionProblem(arena: std.mem.Allocator, launch: adapter.Launch, x: Extra) !?[]const u8 {
+    if (x.permissions.len == 0) return null;
+    const spec = launch.permissions orelse
+        return try std.fmt.allocPrint(arena, "{s} takes no permissions: its adapter declares no launch.permissions mapping", .{launch.binary});
+    if (x.permissions.len > MAX_EXTRA) return try std.fmt.allocPrint(arena, "permissions: at most {d} entries (got {d})", .{ MAX_EXTRA, x.permissions.len });
+    for (x.permissions, 0..) |p, i| {
+        for (x.permissions[0..i]) |prev| if (std.mem.eql(u8, prev.name, p.name))
+            return try std.fmt.allocPrint(arena, "permissions: {s} is given twice", .{p.name});
+        if (!try permissionNameTaken(arena, spec, p.name))
+            return try std.fmt.allocPrint(arena, "permissions: {f} is not a name {s} takes; it takes {s}{s}{s}", .{
+                std.json.fmt(p.name, .{}),
+                launch.binary,
+                try std.mem.join(arena, ", ", spec.names),
+                if (spec.patterns.len > 0) ", or a name matching " else "",
+                try std.mem.join(arena, " or ", spec.patterns),
+            });
+    }
+    // Never clobbered: the caller's own copy of the mechanism must leave
+    // room to merge the policy in.
+    if (spec.arg) |opt| for ([_][]const []const u8{ x.args, x.server_args }) |list| for (list) |s| {
+        if (std.mem.eql(u8, s, opt) or (std.mem.startsWith(u8, s, opt) and s.len > opt.len and s[opt.len] == '='))
+            return try std.fmt.allocPrint(arena, "permissions: args already pass {s}, which is where {s}'s permissions go; put them into that value yourself, or drop it", .{ opt, launch.binary });
+    };
+    if (spec.env) |name| for (x.env) |v| if (std.mem.eql(u8, v.name, name)) {
+        _ = documentWithPath(arena, v.value, spec.path) catch
+            return try std.fmt.allocPrint(arena, "permissions: env {s} must be a JSON object (with an object at {s}) for the permissions to be merged into it", .{ name, if (spec.path.len == 0) "its top level" else try std.mem.join(arena, ".", spec.path) });
+    };
     return null;
+}
+
+fn permissionNameTaken(arena: std.mem.Allocator, spec: adapter.Permissions, name: []const u8) !bool {
+    if (name.len == 0 or name.len > MAX_EXTRA_BYTES) return false;
+    if (try textProblem(arena, name) != null) return false;
+    for (spec.names) |n| if (std.mem.eql(u8, n, name)) return true;
+    for (spec.patterns) |pat| {
+        const m = pattern.compile(arena, pat, false) catch continue;
+        if (m.matches(name)) return true;
+    }
+    return false;
+}
+
+/// `doc` parsed as a JSON object, and the object at `path` in it (created
+/// where missing).
+/// @throws NotAnObject when either is something else.
+fn documentWithPath(arena: std.mem.Allocator, doc: ?[]const u8, path: []const []const u8) !struct { root: *std.json.Value, at: *std.json.ObjectMap } {
+    const root = try arena.create(std.json.Value);
+    root.* = if (doc) |d| (std.json.parseFromSliceLeaky(std.json.Value, arena, d, .{}) catch return error.NotAnObject) else .{ .object = .empty };
+    if (root.* != .object) return error.NotAnObject;
+    var at: *std.json.ObjectMap = &root.object;
+    for (path) |key| {
+        const gop = try at.getOrPut(arena, key);
+        if (!gop.found_existing) gop.value_ptr.* = .{ .object = .empty };
+        if (gop.value_ptr.* != .object) return error.NotAnObject;
+        at = &gop.value_ptr.object;
+    }
+    return .{ .root = root, .at = at };
+}
+
+/// `x` with its permission policy turned into `launch`'s mechanism: the
+/// option and its JSON appended to `server_args` (the main process), or
+/// the policy merged into the environment variable's document (the
+/// caller's own value of it kept, a name given in both taking the
+/// policy's action). `checkExtra` must have accepted `x`.
+pub fn applyPermissions(arena: std.mem.Allocator, launch: adapter.Launch, x: Extra) !Extra {
+    if (x.permissions.len == 0) return x;
+    const spec = launch.permissions orelse return error.NoPermissionMapping;
+    var out = x;
+    out.permissions = &.{};
+    var existing: ?[]const u8 = null;
+    if (spec.env) |name| for (x.env) |v| if (std.mem.eql(u8, v.name, name)) {
+        existing = v.value;
+    };
+    const doc = try documentWithPath(arena, existing, spec.path);
+    switch (spec.shape) {
+        .by_name => for (x.permissions) |p| try doc.at.put(arena, p.name, .{ .string = @tagName(p.action) }),
+        .by_action => for (std.enums.values(vocab.PermissionAction)) |action| {
+            var list = std.json.Array.init(arena);
+            if (doc.at.get(@tagName(action))) |old| if (old == .array) for (old.array.items) |item| {
+                const named = item == .string and for (x.permissions) |p| {
+                    if (std.mem.eql(u8, p.name, item.string)) break true;
+                } else false;
+                if (!named) try list.append(item);
+            };
+            for (x.permissions) |p| if (p.action == action) try list.append(.{ .string = p.name });
+            if (list.items.len > 0) try doc.at.put(arena, @tagName(action), .{ .array = list });
+        },
+    }
+    const json = try std.json.Stringify.valueAlloc(arena, doc.root.*, .{});
+    if (spec.arg) |opt| out.server_args = try std.mem.concat(arena, []const u8, &.{ x.server_args, &.{ opt, json } });
+    if (spec.env) |name| {
+        var env: std.ArrayList(EnvVar) = .empty;
+        for (x.env) |v| if (!std.mem.eql(u8, v.name, name)) try env.append(arena, v);
+        try env.append(arena, .{ .name = name, .value = json });
+        out.env = env.items;
+    }
+    return out;
 }
 
 /// Carries a script past the login shell's profile; the script unsets it.
@@ -1291,4 +1404,87 @@ test "the remote start script exports the caller's env and execs args byte-exact
     // Plain ssh: no spawn environment, the script carries it.
     const run = try remoteScript(a, argv, .{ .cwd = root, .env = &WEIRD_ENV });
     try t.expectEqualStrings(try expectedEcho(a), try runSh(a, "CLAUDE_DROP=1 CLAUDE_KEEP=old", run));
+}
+
+const claude_like = adapter.Launch{
+    .binary = "claude",
+    .candidates = &.{"$PATH"},
+    .permissions = .{
+        .names = &.{ "Bash", "Edit", "Read" },
+        .patterns = &.{ "^[A-Z][A-Za-z]*(.+)$", "^mcp__[A-Za-z0-9_-]+$" },
+        .shape = .by_action,
+        .path = &.{"permissions"},
+        .arg = "--settings",
+    },
+};
+const opencode_like = adapter.Launch{
+    .binary = "opencode",
+    .candidates = &.{"$PATH"},
+    .attach_args = &.{"attach"},
+    .permissions = .{
+        .names = &.{ "*", "bash", "edit", "external_directory" },
+        .shape = .by_name,
+        .path = &.{"permission"},
+        .env = "OPENCODE_CONFIG_CONTENT",
+    },
+};
+
+test "permissions: unknown names, a clobbered mechanism and an app without one are refused" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const ok = [_]Permission{ .{ .name = "Bash(git *)", .action = .allow }, .{ .name = "mcp__sketerm__term_run", .action = .deny }, .{ .name = "Edit", .action = .ask } };
+    try t.expect((try checkExtra(a, claude_like, .{ .permissions = &ok })) == null);
+    const unknown = (try checkExtra(a, claude_like, .{ .permissions = &.{.{ .name = "bash", .action = .allow }} })).?;
+    // The refusal names what the app takes.
+    try t.expect(std.mem.indexOf(u8, unknown, "Bash, Edit, Read") != null);
+    try t.expect(std.mem.indexOf(u8, unknown, "^mcp__") != null);
+    try t.expect((try checkExtra(a, claude_like, .{ .permissions = &.{ .{ .name = "Bash", .action = .allow }, .{ .name = "Bash", .action = .deny } } })) != null);
+    // The caller's own --settings is never overwritten.
+    try t.expect((try checkExtra(a, claude_like, .{ .args = &.{ "--settings", "{}" }, .permissions = &ok })) != null);
+    try t.expect((try checkExtra(a, claude_like, .{ .args = &.{"--settings={}"}, .permissions = &ok })) != null);
+    try t.expect((try checkExtra(a, claude_like, .{ .args = &.{ "--settings", "{}" } })) == null);
+    // An env document that cannot take the policy.
+    const bad_doc = [_]EnvVar{.{ .name = "OPENCODE_CONFIG_CONTENT", .value = "{\"permission\":\"allow\"}" }};
+    try t.expect((try checkExtra(a, opencode_like, .{ .env = &bad_doc, .permissions = &.{.{ .name = "bash", .action = .allow }} })) != null);
+    const adapterless = adapter.Launch{ .binary = "x", .candidates = &.{"$PATH"} };
+    try t.expect((try checkExtra(a, adapterless, .{ .permissions = &.{.{ .name = "bash", .action = .allow }} })) != null);
+}
+
+test "permissions become Claude Code's --settings lists and merge into opencode's own config document" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const cl = try applyPermissions(a, claude_like, .{
+        .args = &.{"--wrap"},
+        .permissions = &.{ .{ .name = "Bash(git *)", .action = .allow }, .{ .name = "Read", .action = .allow }, .{ .name = "Edit", .action = .deny } },
+    });
+    try t.expectEqual(@as(usize, 0), cl.permissions.len);
+    try t.expectEqual(@as(usize, 2), cl.server_args.len);
+    try t.expectEqualStrings("--settings", cl.server_args[0]);
+    try t.expectEqualStrings("{\"permissions\":{\"allow\":[\"Bash(git *)\",\"Read\"],\"deny\":[\"Edit\"]}}", cl.server_args[1]);
+    // Only the main process gets it.
+    const argv = try startArgv(a, claude_like, "/c", cl, .{}, .{ .main = .fresh });
+    try t.expectEqualStrings("--settings", argv[2]);
+    try t.expectEqual(@as(usize, 2), (try startArgv(a, opencode_like, "/o", try applyPermissions(a, opencode_like, .{ .permissions = &.{.{ .name = "bash", .action = .ask }} }), .{}, .attach)).len);
+
+    // opencode: a document of its own, or merged into the caller's.
+    const fresh = try applyPermissions(a, opencode_like, .{ .permissions = &.{ .{ .name = "external_directory", .action = .allow }, .{ .name = "bash", .action = .ask } } });
+    try t.expectEqual(@as(usize, 1), fresh.env.len);
+    try t.expectEqualStrings("{\"permission\":{\"external_directory\":\"allow\",\"bash\":\"ask\"}}", fresh.env[0].value);
+    const mine = [_]EnvVar{
+        .{ .name = "OTHER", .value = "1" },
+        .{ .name = "OPENCODE_CONFIG_CONTENT", .value = "{\"model\":\"p/m\",\"permission\":{\"edit\":\"deny\",\"bash\":\"allow\"}}" },
+    };
+    const merged = try applyPermissions(a, opencode_like, .{ .env = &mine, .permissions = &.{.{ .name = "bash", .action = .deny }} });
+    try t.expectEqual(@as(usize, 2), merged.env.len);
+    try t.expectEqualStrings("OTHER", merged.env[0].name);
+    try t.expectEqualStrings("{\"model\":\"p/m\",\"permission\":{\"edit\":\"deny\",\"bash\":\"deny\"}}", merged.env[1].value);
+    // The variable it sets is spared by unset_env like any caller env.
+    try t.expectEqualStrings("OPENCODE_CONFIG_CONTENT", (try merged.names(a))[1]);
+    // A policy at the document's top level.
+    var top = opencode_like;
+    top.permissions.?.path = &.{};
+    const flat = try applyPermissions(a, top, .{ .env = &.{.{ .name = "OPENCODE_CONFIG_CONTENT", .value = "{\"x\":1}" }}, .permissions = &.{.{ .name = "bash", .action = .allow }} });
+    try t.expectEqualStrings("{\"x\":1,\"bash\":\"allow\"}", flat.env[0].value);
 }

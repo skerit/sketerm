@@ -352,6 +352,11 @@ fn daemonUnderRt(allocator: std.mem.Allocator, rt: []const u8) bool {
 }
 
 fn killDaemonsUnderRt(rt: []const u8, allocator: std.mem.Allocator) void {
+    killUnderRt(rt, allocator, c.SIGTERM);
+}
+
+/// Signal every process whose XDG_RUNTIME_DIR starts with `rt`.
+fn killUnderRt(rt: []const u8, allocator: std.mem.Allocator, sig: c_int) void {
     const d = c.opendir("/proc") orelse return;
     defer _ = c.closedir(d);
     var needle_buf: [4096]u8 = undefined;
@@ -373,7 +378,7 @@ fn killDaemonsUnderRt(rt: []const u8, allocator: std.mem.Allocator) void {
         }
         if (std.mem.indexOf(u8, content.items, needle) != null) {
             const pid = std.fmt.parseInt(c.pid_t, name, 10) catch continue;
-            _ = c.kill(pid, c.SIGTERM);
+            _ = c.kill(pid, sig);
         }
     }
 }
@@ -6185,6 +6190,8 @@ const FakeOc = struct {
     allocator: std.mem.Allocator,
     lock: SpinLock = .init,
     turn: u32 = 0,
+    /// Turns still to end on a provider overload (`overload N` sets it).
+    overload_left: u32 = 0,
     due: [256]Due = undefined,
     n_due: usize = 0,
 
@@ -6256,13 +6263,20 @@ const FakeOc = struct {
             self.lock.lock();
             self.turn += 1;
             const n = self.turn;
+            if (std.mem.startsWith(u8, text, "overload ")) self.overload_left = std.fmt.parseInt(u32, text["overload ".len..], 10) catch 1;
+            const overloaded = self.overload_left > 0;
+            if (overloaded) self.overload_left -= 1;
             self.lock.unlock();
             const model = if (p.model) |m| std.fmt.allocPrint(a, "{s}/{s}", .{ m.providerID, m.modelID }) catch "?" else "default";
             self.ev(0, "{{\"type\":\"message.updated\",\"properties\":{{\"sessionID\":\"" ++ SES ++ "\",\"info\":{{\"id\":\"msg_u{d}\",\"role\":\"user\",\"sessionID\":\"" ++ SES ++ "\"}}}}}}", .{n});
             self.ev(0, "{{\"type\":\"message.part.updated\",\"properties\":{{\"sessionID\":\"" ++ SES ++ "\",\"part\":{{\"type\":\"text\",\"text\":{f},\"messageID\":\"msg_u{d}\",\"sessionID\":\"" ++ SES ++ "\",\"id\":\"prt_u{d}\"}}}}}}", .{ std.json.fmt(text, .{}), n, n });
             self.status(0, "busy");
             const id1 = std.fmt.allocPrint(a, "msg_a{d}_1", .{n}) catch return .{ .status = 500 };
-            if (std.mem.indexOf(u8, text, "permission") != null) {
+            if (overloaded) {
+                // The provider gave up on the turn: opencode's APIError.
+                self.ev(200, "{{\"type\":\"message.updated\",\"properties\":{{\"sessionID\":\"" ++ SES ++ "\",\"info\":{{\"id\":\"{s}\",\"role\":\"assistant\",\"sessionID\":\"" ++ SES ++ "\",\"time\":{{\"created\":1,\"completed\":2}},\"error\":{{\"name\":\"APIError\",\"data\":{{\"message\":\"Service Unavailable\",\"statusCode\":503}}}}}}}}}}", .{id1});
+                self.status(300, "idle");
+            } else if (std.mem.indexOf(u8, text, "permission") != null) {
                 self.ev(200, "{{\"type\":\"permission.asked\",\"properties\":{{\"id\":\"per_{d}\",\"sessionID\":\"" ++ SES ++ "\",\"permission\":\"bash\",\"patterns\":[\"rm notes.md\"]}}}}", .{n});
             } else if (std.mem.indexOf(u8, text, "two messages") != null) {
                 self.answer(200, id1, "alpha one");
@@ -6295,6 +6309,8 @@ const FakeOc = struct {
 const FAKE_OC_DEAF_ENV = "SKETERM_SMOKE_OC_DEAF_MS";
 /// Every password a fake server was started with, one per line.
 const FAKE_OC_PASSWORDS = "oc-passwords";
+/// The OPENCODE_CONFIG_CONTENT each fake server was started with, one per line.
+const FAKE_OC_CONFIG = "oc-config";
 
 const FAKE_OC_PROVIDERS =
     \\{"all":[{"id":"fakeprov","models":{"m1":{"name":"Fake One","variants":{"low":{},"high":{}}}}}],"connected":["fakeprov"]}
@@ -6345,6 +6361,8 @@ fn fakeOpencodeServe(allocator: std.mem.Allocator, args: []const [*:0]const u8) 
         const dir = fcPath(&dir_buf, "");
         _ = c.mkdir(dir.ptr, 0o700);
         fcAppend(FAKE_OC_PASSWORDS, pw);
+        // The config document it was handed (agent_open permissions).
+        fcAppend(FAKE_OC_CONFIG, if (c.getenv("OPENCODE_CONFIG_CONTENT")) |v| std.mem.span(@as([*:0]const u8, @ptrCast(v))) else "<unset>");
     }
     var oc = FakeOc{ .allocator = allocator };
     var srv: testserver.Server = .{};
@@ -7266,6 +7284,80 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
         d2.closeStdinWait();
         say("smoke-mcp: agents: a durable instance re-attaches its running agent ok");
     }
+
+    // ── a permission policy per app, and retry on overload ───────────
+    {
+        var m = Mcp.spawn(allocator, exe, &.{});
+        m.initialize();
+        const caps = agentCall(&m, arena, "capabilities", "{}", "capabilities permissions", false, 15_000);
+        if (!caps.get("agent_permissions").?.bool) fail("capabilities: agent_permissions is false");
+        if (!caps.get("agent_gone_on_reconnect").?.bool) fail("capabilities: agent_gone_on_reconnect is false");
+        const rc = caps.get("agent_retry_on_overload").?.object;
+        if (!rc.get("available").?.bool or rc.get("classes").?.array.items.len != 1 or !std.mem.eql(u8, rc.get("classes").?.array.items[0].string, "overloaded"))
+            fail("capabilities: agent_retry_on_overload does not name the overloaded class");
+
+        // A name the app does not take is refused, naming the ones it does.
+        const bad = agentCall(&m, arena, "agent_open", std.fmt.allocPrint(arena, "{{\"app\":\"opencode\",\"binary\":{s},\"permissions\":{{\"Bash\":\"allow\"}}}}", .{bin_json}) catch fail("oom"), "agent_open unknown permission", true, 15_000);
+        const bad_msg = bad.get("error").?.object.get("message").?.string;
+        if (std.mem.indexOf(u8, bad_msg, "external_directory") == null) {
+            say(bad_msg);
+            fail("agent_open permissions: the refusal does not name what opencode takes");
+        }
+        // Claude Code's own --settings in args is never overwritten.
+        _ = agentCall(&m, arena, "agent_open", std.fmt.allocPrint(arena, "{{\"app\":\"claude\",\"binary\":{s},\"args\":[\"--settings\",\"{{}}\"],\"permissions\":{{\"Edit\":\"deny\"}}}}", .{bin_json}) catch fail("oom"), "agent_open clobbered settings", true, 15_000);
+
+        // Claude Code: --settings permissions lists on its argv.
+        resetStarts();
+        const cl = agentCall(&m, arena, "agent_open", std.fmt.allocPrint(arena, "{{\"app\":\"claude\",\"name\":\"perm-claude\",\"binary\":{s},\"permissions\":{{\"Bash(git *)\":\"allow\",\"Edit\":\"deny\"}},\"timeout_ms\":30000}}", .{bin_json}) catch fail("oom"), "agent_open claude permissions", false, 45_000);
+        if (!std.mem.eql(u8, cl.get("permissions").?.object.get("Edit").?.string, "deny")) fail("agent_open claude: no permissions fact");
+        {
+            var buf: [1024]u8 = undefined;
+            const starts = readfile.cappedAlloc(arena, fcPath(&buf, FC_STARTS), 1 << 20) catch fail("no starts recorded");
+            if (std.mem.indexOf(u8, starts, "\x00--settings\x00{\"permissions\":{\"allow\":[\"Bash(git *)\"],\"deny\":[\"Edit\"]}}\x00") == null) {
+                say(starts);
+                fail("agent_open claude permissions: --settings did not reach Claude Code's argv");
+            }
+        }
+        _ = agentCall(&m, arena, "agent_close", "{\"agent\":\"perm-claude\"}", "agent_close perm-claude", false, 15_000);
+
+        // opencode: merged into the caller's own config document.
+        const oc = agentCall(&m, arena, "agent_open", std.fmt.allocPrint(arena, "{{\"app\":\"opencode\",\"name\":\"retry-oc\",\"binary\":{s},\"env\":{{\"OPENCODE_CONFIG_CONTENT\":\"{{\\\"model\\\":\\\"fakeprov/m1\\\"}}\"}},\"permissions\":{{\"external_directory\":\"allow\",\"bash\":\"ask\"}},\"retry_on_overload\":{{\"max\":2,\"backoff_s\":1}},\"timeout_ms\":30000}}", .{bin_json}) catch fail("oom"), "agent_open opencode permissions", false, 45_000);
+        if (!std.mem.eql(u8, oc.get("permissions").?.object.get("external_directory").?.string, "allow")) fail("agent_open opencode: no permissions fact");
+        if (oc.get("retry_on_overload").?.object.get("max").?.integer != 2) fail("agent_open opencode: no retry_on_overload fact");
+        {
+            var buf: [1024]u8 = undefined;
+            const cfg = readfile.cappedAlloc(arena, fcPath(&buf, FAKE_OC_CONFIG), 1 << 20) catch fail("no opencode config recorded");
+            const want = "{\"model\":\"fakeprov/m1\",\"permission\":{\"external_directory\":\"allow\",\"bash\":\"ask\"}}\n";
+            if (!std.mem.endsWith(u8, cfg, want)) {
+                say(cfg);
+                fail("agent_open opencode permissions: the server's OPENCODE_CONFIG_CONTENT is not the caller's document with the policy merged in");
+            }
+        }
+        // One overload: retried after 1 s, the turn goes on, and the
+        // error reads as a notice, never a wake.
+        const once = agentCall(&m, arena, "agent_send", "{\"agent\":\"retry-oc\",\"text\":\"overload 1\",\"timeout_ms\":30000}", "agent_send overload once", false, 45_000);
+        expectFact(once, "outcome", "done", "retry on overload: the retried turn's done");
+        expectFact(once, "message", "echo: continue model=default variant=default", "retry on overload: the continue prompt's answer");
+        if (eventKinds(once, "error") != 0) fail("retry on overload: a retried overload woke the caller");
+        {
+            const all = agentCall(&m, arena, "agent_read", "{\"agent\":\"retry-oc\",\"detail\":\"all\",\"since\":0}", "agent_read retry notices", false, 15_000);
+            const json = std.json.Stringify.valueAlloc(arena, all.get("records").?, .{}) catch fail("oom");
+            if (std.mem.indexOf(u8, json, "retry 1 of 2") == null or std.mem.indexOf(u8, json, "went on after 1 retry") == null) {
+                say(json);
+                fail("retry on overload: no notice records of the retry");
+            }
+        }
+        // More overloads than retries: it gives up and every error wakes.
+        const many = agentCall(&m, arena, "agent_send", "{\"agent\":\"retry-oc\",\"text\":\"overload 5\",\"timeout_ms\":30000}", "agent_send overload many", false, 45_000);
+        expectFact(many, "outcome", "error", "retry on overload: giving up wakes with the error");
+        if (eventKinds(many, "error") != 3) fail("retry on overload: not the first error and both retries' errors");
+        // agent_set turns it off.
+        const off = agentCall(&m, arena, "agent_set", "{\"agent\":\"retry-oc\",\"retry_on_overload\":null}", "agent_set retry off", false, 15_000);
+        if (off.get("retry_on_overload") != null) fail("agent_set retry_on_overload null: still on");
+        _ = agentCall(&m, arena, "agent_close", "{\"agent\":\"retry-oc\"}", "agent_close retry-oc", false, 15_000);
+        m.closeStdinWait();
+        say("smoke-mcp: agents: permissions (claude --settings, opencode config merged, refusals) and retry on overload (recovered, gave up, off) ok");
+    }
 }
 
 // ── sub-agents on an SSH host: both transports, a faked remote ──────
@@ -7713,6 +7805,38 @@ fn writeExecutable(path: [:0]const u8, body: []const u8) void {
 /// binary resolution through the candidates, the typed (never argv)
 /// opencode password, the port forward and its revival, connection loss
 /// and recovery, and a durable re-attach over SSH.
+/// The fake remote host's daemon, its dirs under `rrt`; returns once
+/// `rsock` exists.
+fn startRemoteDaemon(rrt: [:0]const u8, rsock: []const u8) c.pid_t {
+    const pid = c.fork();
+    if (pid < 0) fail("fork remote daemon");
+    if (pid == 0) {
+        _ = c.setenv("XDG_RUNTIME_DIR", rrt.ptr, 1);
+        _ = c.setenv("XDG_STATE_HOME", rrt.ptr, 1);
+        _ = c.setenv("XDG_CONFIG_HOME", rrt.ptr, 1);
+        const argv = [_:null]?[*:0]const u8{ "sketerm-mux", "--broker", null };
+        _ = c.execv("zig-out/bin/sketerm-mux", @ptrCast(@constCast(&argv)));
+        c._exit(127);
+    }
+    const deadline = nowMs() + 10_000;
+    while (!fileExists(rsock)) {
+        if (nowMs() > deadline) fail("the remote daemon's socket never appeared");
+        _ = c.usleep(50_000);
+    }
+    return pid;
+}
+
+/// Cut the agents' link to the fake host and make it refuse until `down`
+/// is removed.
+fn cutRemoteLink(down: [:0]const u8, rt_env: []const u8) void {
+    const f = c.fopen(down.ptr, "w") orelse fail("flag");
+    _ = c.fclose(f);
+    var pids_buf: [32]c.pid_t = undefined;
+    const proxies = findProcs(&.{"--proxy"}, rt_env, &pids_buf);
+    if (proxies.len == 0) fail("no ssh bridge to the remote daemon to cut");
+    for (proxies) |p| _ = c.kill(p, c.SIGKILL);
+}
+
 fn agentSshStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) void {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -7765,24 +7889,8 @@ fn agentSshStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u
     _ = c.mkdir(rrt.ptr, 0o700);
     var mux_abs_buf: [4096]u8 = undefined;
     const mux_abs = std.mem.span(@as([*:0]const u8, @ptrCast(c.realpath("zig-out/bin/sketerm-mux", &mux_abs_buf) orelse fail("zig-out/bin/sketerm-mux missing"))));
-    const rpid = c.fork();
-    if (rpid < 0) fail("fork remote daemon");
-    if (rpid == 0) {
-        _ = c.setenv("XDG_RUNTIME_DIR", rrt.ptr, 1);
-        _ = c.setenv("XDG_STATE_HOME", rrt.ptr, 1);
-        _ = c.setenv("XDG_CONFIG_HOME", rrt.ptr, 1);
-        const argv = [_:null]?[*:0]const u8{ "sketerm-mux", "--broker", null };
-        _ = c.execv("zig-out/bin/sketerm-mux", @ptrCast(@constCast(&argv)));
-        c._exit(127);
-    }
     const rsock = std.fmt.allocPrint(arena, "{s}/sketerm/mux.sock", .{rrt}) catch fail("oom");
-    {
-        const deadline = nowMs() + 10_000;
-        while (!fileExists(rsock)) {
-            if (nowMs() > deadline) fail("the remote daemon's socket never appeared");
-            _ = c.usleep(50_000);
-        }
-    }
+    var rpid = startRemoteDaemon(rrt, rsock);
     const down = std.fmt.allocPrintSentinel(arena, "{s}/ssh-down", .{rt}, 0) catch fail("oom");
     const bridge = std.fmt.allocPrintSentinel(arena, "{s}/fake-mux-ssh", .{rt}, 0) catch fail("oom");
     {
@@ -7981,7 +8089,7 @@ fn agentSshStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u
         d1.closeStdinWait();
         var d2 = Mcp.spawn(allocator, exe, &.{ "--name", "agentssh" });
         d2.initialize();
-        const listed = agentCall(&d2, arena, "agent_list", "{}", "durable remote agent_list", false, 30_000);
+        const listed = agentCall(&d2, arena, "agent_list", "{\"detail\":true}", "durable remote agent_list", false, 30_000);
         if (listed.get("count").?.integer != 1) fail("durable remote: the restarted server did not pick its remote agent up");
         const item = listed.get("agents").?.array.items[0].object;
         if (!std.mem.eql(u8, item.get("transport").?.string, "sketerm-mux")) fail("durable remote: re-attached over another transport");
@@ -7990,6 +8098,65 @@ fn agentSshStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u
         _ = agentCall(&d2, arena, "agent_close", "{\"agent\":\"claude-1\"}", "durable remote agent_close", false, 15_000);
         d2.closeStdinWait();
         say("smoke-mcp: agents over ssh: a durable instance re-attaches its remote agent ok");
+    }
+
+    // ── a lost link that comes back to find the session gone ─────────
+    {
+        var m = Mcp.spawn(allocator, exe, &.{});
+        m.initialize();
+        const opened = agentCall(&m, arena, "agent_open", "{\"app\":\"claude\",\"name\":\"claude-gone\",\"host\":\"fakehost\",\"prompt\":\"before the loss\",\"timeout_ms\":45000}", "gone: agent_open", false, 60_000);
+        expectFact(opened, "transport", "sketerm-mux", "gone: transport");
+        const session = arena.dupe(u8, scStr(opened, "session", "gone: agent_open")) catch fail("oom");
+        cutRemoteLink(down, rt_env);
+        const lost = agentCall(&m, arena, "agent_wait", "{\"agent\":\"claude-gone\",\"timeout_ms\":20000}", "gone: agent_wait lost", false, 45_000);
+        expectFact(lost, "outcome", "connection_lost", "gone: the lost link is connection_lost");
+        // An unreachable host: still disconnected (every call retries it at once).
+        _ = c.usleep(2_500_000);
+        const still = agentCall(&m, arena, "agent_read", "{\"agent\":\"claude-gone\"}", "gone: agent_read while unreachable", false, 30_000);
+        expectFact(still, "state", "disconnected", "gone: an unreachable host stays disconnected");
+        if (still.get("relaunchable") != null) fail("gone: a disconnected agent reads as gone");
+        // Meanwhile its session is closed on the host.
+        {
+            var conn = muxclient.Conn.connectProbed(allocator, rsock) catch fail("gone: cannot reach the remote daemon");
+            defer conn.deinit();
+            conn.sendKill(.{ .name = session }) catch fail("gone: kill");
+        }
+        waitUnlisted(allocator, rsock, session, "gone: the remote session was not closed");
+        _ = c.unlink(down.ptr);
+        const ended = agentCall(&m, arena, "agent_wait", "{\"agent\":\"claude-gone\",\"timeout_ms\":30000}", "gone: agent_wait after the host answers", false, 45_000);
+        expectFact(ended, "outcome", "exited", "gone: a reconnect that finds no session ends the agent");
+        expectFact(ended, "state", "exited", "gone: state");
+        expectFact(ended, "gone_reason", "closed", "gone: the daemon's tombstone reason");
+        if (!ended.get("relaunchable").?.bool) fail("gone: not relaunchable");
+        if (eventKinds(ended, "exited") != 1) fail("gone: not exactly one exited event");
+        const listed = agentCall(&m, arena, "agent_list", "{}", "gone: agent_list", false, 15_000);
+        const item = listed.get("agents").?.array.items[0].object;
+        if (!std.mem.eql(u8, item.get("state").?.string, "exited") or !item.get("relaunchable").?.bool or !std.mem.eql(u8, item.get("gone_reason").?.string, "closed"))
+            fail("gone: agent_list does not say exited, relaunchable, closed");
+        // agent_attach relaunch starts it again on the host under its id.
+        const back = agentCall(&m, arena, "agent_attach", "{\"agent\":\"claude-gone\",\"relaunch\":true,\"timeout_ms\":45000}", "gone: relaunch", false, 60_000);
+        expectFact(back, "attach", "relaunched", "gone: relaunched");
+        const recalled = agentCall(&m, arena, "agent_send", "{\"agent\":\"claude-gone\",\"text\":\"recall\",\"timeout_ms\":20000}", "gone: recall", false, 45_000);
+        expectFact(recalled, "message", "first prompt was: before the loss", "gone: the relaunch resumed the conversation");
+
+        // The host reboots while the link is down: a fresh daemon that has
+        // neither the session nor a record of it.
+        cutRemoteLink(down, rt_env);
+        const lost2 = agentCall(&m, arena, "agent_wait", "{\"agent\":\"claude-gone\",\"timeout_ms\":20000}", "gone: agent_wait lost again", false, 45_000);
+        expectFact(lost2, "outcome", "connection_lost", "gone: lost again");
+        killUnderRt(rrt, allocator, c.SIGKILL);
+        _ = c.waitpid(rpid, null, 0);
+        _ = c.usleep(500_000);
+        _ = c.unlink((std.fmt.allocPrintSentinel(arena, "{s}", .{rsock}, 0) catch fail("oom")).ptr);
+        rpid = startRemoteDaemon(rrt, rsock);
+        _ = c.unlink(down.ptr);
+        const rebooted = agentCall(&m, arena, "agent_wait", "{\"agent\":\"claude-gone\",\"timeout_ms\":30000}", "gone: agent_wait after the reboot", false, 45_000);
+        expectFact(rebooted, "outcome", "exited", "gone: a rebooted host's fresh daemon ends the agent");
+        expectFact(rebooted, "gone_reason", "unknown", "gone: a fresh daemon keeps no record");
+        if (!rebooted.get("relaunchable").?.bool) fail("gone: not relaunchable after the reboot");
+        _ = agentCall(&m, arena, "agent_close", "{\"agent\":\"claude-gone\"}", "gone: agent_close", false, 15_000);
+        m.closeStdinWait();
+        say("smoke-mcp: agents over ssh: a reconnect that finds the session closed, or a rebooted host, ends the agent as relaunchable; an unreachable host stays disconnected ok");
     }
     _ = c.kill(rpid, c.SIGTERM);
     _ = c.waitpid(rpid, null, 0);

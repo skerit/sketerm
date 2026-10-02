@@ -80,10 +80,13 @@ pub const Event = struct {
     background_tasks: ?u32 = null,
     /// Handed to the assistant by some consumer.
     delivered: bool = false,
+    /// A retry (`retry.zig`) answers what it reports: it wakes nobody
+    /// unless the retries give up, and settles no turn meanwhile.
+    held: bool = false,
 
     /// Wakes every consumer without being asked for.
     pub fn wakesByDefault(self: *const Event) bool {
-        if (!self.kind.alwaysOn()) return false;
+        if (self.held or !self.kind.alwaysOn()) return false;
         const cls = self.class orelse return true;
         return cls.wakesByDefault();
     }
@@ -136,7 +139,8 @@ pub const Queue = struct {
                 i -= 1;
                 const ev = &self.events.items[i];
                 if (ev.last_ms < now_ms - self.limits.dedupe_window_ms) break;
-                if (ev.kind == kind and ev.class == class and std.mem.eql(u8, ev.text, text)) {
+                // A held one is a retry's: a repeat is the next attempt's.
+                if (!ev.held and ev.kind == kind and ev.class == class and std.mem.eql(u8, ev.text, text)) {
                     ev.count +|= 1;
                     ev.last_ms = now_ms;
                     return ev.seq;
@@ -234,9 +238,10 @@ pub const Filter = struct {
         return if (self.messages) .message else null;
     }
 
-    /// An always-on kind held back by its class, which this filter opts into.
+    /// An error held back by its class or by a retry, which this filter
+    /// opts into (a done a retry holds is never delivered).
     fn wantsQuiet(self: Filter, ev: *const Event) bool {
-        return self.retrying and ev.kind.alwaysOn() and !ev.wakesByDefault();
+        return self.retrying and ev.kind == .@"error" and !ev.wakesByDefault();
     }
 };
 

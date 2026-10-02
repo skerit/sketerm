@@ -82,6 +82,33 @@ pub const Launch = struct {
     /// Arguments that make the binary print its version, whose first line
     /// is reported with the resolved path; empty = not asked.
     version_args: []const []const u8 = &.{},
+    /// How `agent_open permissions` reaches the app; null = it takes none.
+    permissions: ?Permissions = null,
+};
+
+/// The JSON a permission policy becomes: `by_name` is `{name: action}`
+/// (opencode's `permission` block), `by_action` is `{action: [names]}`
+/// (Claude Code's `permissions.allow/ask/deny` lists).
+pub const PermissionShape = enum { by_name, by_action };
+
+/// An app's permission mechanism: which names it takes and where the
+/// policy JSON goes, as exactly one of an environment variable holding a
+/// JSON document (merged into a caller's own value of it) or an option
+/// whose value is the JSON (main process only).
+pub const Permissions = struct {
+    names: []const []const u8,
+    /// Further names it takes, by rule (a `util/pattern.zig` pattern each).
+    patterns: []const []const u8 = &.{},
+    shape: PermissionShape,
+    /// Object keys the policy sits under in the document.
+    path: []const []const u8 = &.{},
+    env: ?[]const u8 = null,
+    arg: ?[]const u8 = null,
+};
+
+/// What `retry_on_overload` types to continue a turn an overload ended.
+pub const Retry = struct {
+    prompt: []const u8 = "continue",
 };
 
 pub const TurnEnd = enum {
@@ -204,6 +231,7 @@ pub const Spec = struct {
     screen: ?ScreenSpec = null,
     actions: Actions = .{},
     errors: []const ErrorRule = &.{},
+    retry: Retry = .{},
 };
 
 /// The `{name}`s a recipe or launch argument may use. `port` and `cwd` are
@@ -363,6 +391,12 @@ const Validator = struct {
             const base = if (std.mem.endsWith(u8, name, "*")) name[0 .. name.len - 1] else name;
             if (!validEnvName(base)) return self.fail("launch.unset_env \"{s}\" is not a variable name (a trailing * matches a prefix)", .{name});
         }
+        if (s.launch.permissions) |p| try self.permissions(p);
+        {
+            const pr = s.retry.prompt;
+            if (std.mem.trim(u8, pr, " \t").len == 0) return self.fail("retry.prompt is empty", .{});
+            for (pr) |ch| if (ch < 0x20 or ch == 0x7f) return self.fail("retry.prompt contains a control character", .{});
+        }
         try self.recipe(s, s.launch.exit, "launch.exit");
         inline for (@typeInfo(Actions).@"struct".fields) |f| try self.recipe(s, @field(s.actions, f.name), "actions." ++ f.name);
         const errs = try self.arena.alloc(ErrorMatcher, s.errors.len);
@@ -387,6 +421,17 @@ const Validator = struct {
                 if (s.launch.password_env == null) return self.fail("source \"opencode_api\" needs launch.password_env", .{});
             },
         }
+    }
+
+    fn permissions(self: *Validator, p: Permissions) !void {
+        if (p.names.len == 0) return self.fail("launch.permissions.names is empty", .{});
+        for (p.names) |n| if (n.len == 0) return self.fail("launch.permissions.names: empty name", .{});
+        for (p.patterns) |pat| _ = pattern.compile(self.arena, pat, false) catch
+            return self.fail("launch.permissions.patterns: bad pattern \"{s}\"", .{pat});
+        for (p.path) |k| if (k.len == 0) return self.fail("launch.permissions.path: empty key", .{});
+        if ((p.env == null) == (p.arg == null)) return self.fail("launch.permissions needs exactly one of \"env\" or \"arg\"", .{});
+        if (p.env) |name| if (!validEnvName(name)) return self.fail("launch.permissions.env \"{s}\" is not an environment variable name", .{name});
+        if (p.arg) |a| if (a.len == 0 or a[0] != '-') return self.fail("launch.permissions.arg \"{s}\" is not an option", .{a});
     }
 
     fn recipe(self: *Validator, s: *const Spec, steps: []const Step, where: []const u8) !void {
@@ -732,6 +777,12 @@ test "expand fills known placeholders and leaves other braces alone" {
     try t.expectEqualStrings("/model opus {x}", s);
 }
 
+/// The class of the first error rule matching `text`, as the sources pick it.
+fn firstClass(l: *const Loaded, text: []const u8) ?vocab.ErrorClass {
+    for (l.errors) |r| if (r.matcher.matches(text)) return r.class;
+    return null;
+}
+
 test "every shipped adapter loads, and a user file overrides by id" {
     var set = Set.init(t.allocator);
     defer set.deinit();
@@ -747,6 +798,25 @@ test "every shipped adapter loads, and a user file overrides by id" {
     const oc = set.get("opencode").?;
     try t.expectEqual(vocab.SourceKind.opencode_api, oc.spec.source);
     try t.expectEqualStrings("OPENCODE_SERVER_PASSWORD", oc.spec.launch.password_env.?);
+
+    // Overloads are their own class, ahead of the generic API rule, and a
+    // limit or an auth failure never reads as one.
+    const cl = set.get("claude").?;
+    try t.expectEqual(vocab.ErrorClass.overloaded, firstClass(cl, "API Error: Repeated 529 Overloaded errors").?);
+    try t.expectEqual(vocab.ErrorClass.overloaded, firstClass(cl, "API Error: 503 Service Unavailable").?);
+    try t.expectEqual(vocab.ErrorClass.overloaded, firstClass(cl, "API Error (529 {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"}})").?);
+    try t.expectEqual(vocab.ErrorClass.api, firstClass(cl, "API Error: 400 invalid request").?);
+    try t.expectEqual(vocab.ErrorClass.limit, firstClass(cl, "You've hit your limit, resets 5pm").?);
+    try t.expectEqual(vocab.ErrorClass.overloaded, firstClass(oc, "APIError 503: Service Unavailable").?);
+    try t.expectEqual(vocab.ErrorClass.overloaded, firstClass(oc, "APIError 529: Overloaded").?);
+    try t.expectEqual(vocab.ErrorClass.limit, firstClass(oc, "APIError 429: Rate limit exceeded").?);
+    try t.expectEqual(vocab.ErrorClass.auth, firstClass(oc, "APIError 401: Unauthorized").?);
+    try t.expectEqual(vocab.ErrorClass.api, firstClass(oc, "APIError 400: bad request").?);
+    // Each declares its permission mechanism and its continue prompt.
+    try t.expectEqualStrings("--settings", cl.spec.launch.permissions.?.arg.?);
+    try t.expectEqualStrings("OPENCODE_CONFIG_CONTENT", oc.spec.launch.permissions.?.env.?);
+    try t.expectEqualStrings("continue", cl.spec.retry.prompt);
+    try t.expectEqualStrings("continue", oc.spec.retry.prompt);
 
     const user = std.mem.replaceOwned(u8, t.allocator, minimal, "\"demo\"", "\"claude\"") catch unreachable;
     defer t.allocator.free(user);

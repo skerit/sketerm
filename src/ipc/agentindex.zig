@@ -17,6 +17,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const launch = @import("../agent/launch.zig");
+const retry = @import("../agent/retry.zig");
 const xdg = @import("../util/xdg.zig");
 const pathz = @import("../util/pathz.zig");
 const readfile = @import("../util/readfile.zig");
@@ -76,6 +77,8 @@ pub const Descriptor = struct {
     env: []const launch.EnvVar = &.{},
     path_prepend: []const []const u8 = &.{},
     login_shell: bool = true,
+    permissions: []const launch.Permission = &.{},
+    retry_on_overload: ?retry.Policy = null,
     started_ms: i64 = 0,
     /// When its sessions were found gone (Unix ms); 0 while it runs. Such a
     /// descriptor stays for `agent_attach relaunch` until the idle TTL.

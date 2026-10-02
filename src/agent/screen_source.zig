@@ -213,6 +213,15 @@ pub const Engine = struct {
         self.state = .exited;
     }
 
+    /// The session is gone from its daemon (a lost link that came back to
+    /// find nothing): `exited`, saying why.
+    pub fn noteGone(self: *Engine, now_ms: i64, why: []const u8) !void {
+        if (self.exited) return;
+        _ = try self.queue.push(now_ms, .exited, null, why, "");
+        self.exited = true;
+        self.state = .exited;
+    }
+
     /// The connection to the terminal session was lost.
     pub fn noteDisconnected(self: *Engine, now_ms: i64, reason: []const u8) !void {
         if (self.disconnected) return;

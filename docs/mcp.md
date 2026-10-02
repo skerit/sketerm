@@ -244,7 +244,7 @@ is kept by a `:ro` policy term. The full descriptions and schemas are in
 
 ### `core`
 
-- `capabilities` (read-only): Preflight report of what THIS MCP server can do right now: isolation mode, headless GUI-app support (headless_gui — launch_app renders apps into the mux daemon and NEVER needs a display, an X server or a sketerm window), whether a direct sketerm GUI control socket is attached (gui_socket; independent of the session panel relay and of headless GUI apps), the live panel transport (panels + panel_transport) and the saved-panel store (panels_store + panel_store), OCR (tesseract) availability, whether the web_* tools can run and against what (web + web_backend "gui"/"session"/"headless"/"none" — "session" adds web_session, the watchable Wayland app session the helper renders into — plus the sketerm-webengine path in web_helper; web_gui says whether the user granted the web_* tools their OWN browser and logins, web_gui_source where that came from and web_gui_transport which GUI socket they hold now; web_profiles says whether named cookie jars work, web_routes which per-tab network routes web_open can honour, web_engine_broker whether the mux daemon owns the engine's lifetime and web_engine_owner who started the one in use; web_downloads whether web_download can pull a url through a view; web_capture whether web_open can record the response bodies a headless view's page receives; web_engine_started whether an engine exists YET, since web_backend/web_watch/web_session are undetermined until it does), ssh/scp presence, the directory terminal asciicast recordings land in, the EFFECTIVE input-timing defaults (hold_ms/settle_ms/timeout_ms/click_retry, each marked when a SKETERM_MCP_* env override changed it from the built-in), whether sub-agents run here (agents, agent_adapters, agent_waiter, agent_ssh, agent_open_args_env for a wrapper's args and env, agent_open_resume for continuing an existing conversation (agent_resume_checked: an unknown id fails instead of starting afresh), agent_open_process_args for server_args/tui_args, agent_conversation for the conversation id results report, user_daemon_env_scrubbed for a per-user daemon started without the assistant's environment, agent_resume_by_id for agent_attach {agent} from any server, agent_idle_ttl_hours for how long an unattached agent lives, tombstones for agent_attach saying why a gone agent ended) and how agent_read selects what it returns (agent_read_select), how sub-agent output is delivered (agent_records_once, agent_events_shared), whether agent_wait can watch several agents (agent_wait_any; agent_wait_all: once every one settled), whether agent_send queues a prompt for a busy agent (agent_send_queue), reaches several agents in one call (agent_send_many) and interrupts a busy one first (agent_send_interrupt), whether agent_read returns just the final message (agent_read_final), agent_list is compact by default (agent_list_compact), agent_attach relaunches a gone agent (agent_relaunch) and agent_open hands a prompt off with timeout_ms 0 (agent_open_handoff), whether agent_answer takes free text (agent_answer_text), when done fires (agent_done), and whether agent events are pushed into this session (agent_push: channel = Claude Code channel messages; agent_push_follow / agent_push_followers for the agent-wait --server follower the opencode plugin runs), whether term_open takes exec_shell (term_exec_shell_default), and open session counts.
+- `capabilities` (read-only): Preflight report of what THIS MCP server can do right now: isolation mode, headless GUI-app support (headless_gui — launch_app renders apps into the mux daemon and NEVER needs a display, an X server or a sketerm window), whether a direct sketerm GUI control socket is attached (gui_socket; independent of the session panel relay and of headless GUI apps), the live panel transport (panels + panel_transport) and the saved-panel store (panels_store + panel_store), OCR (tesseract) availability, whether the web_* tools can run and against what (web + web_backend "gui"/"session"/"headless"/"none" — "session" adds web_session, the watchable Wayland app session the helper renders into — plus the sketerm-webengine path in web_helper; web_gui says whether the user granted the web_* tools their OWN browser and logins, web_gui_source where that came from and web_gui_transport which GUI socket they hold now; web_profiles says whether named cookie jars work, web_routes which per-tab network routes web_open can honour, web_engine_broker whether the mux daemon owns the engine's lifetime and web_engine_owner who started the one in use; web_downloads whether web_download can pull a url through a view; web_capture whether web_open can record the response bodies a headless view's page receives; web_engine_started whether an engine exists YET, since web_backend/web_watch/web_session are undetermined until it does), ssh/scp presence, the directory terminal asciicast recordings land in, the EFFECTIVE input-timing defaults (hold_ms/settle_ms/timeout_ms/click_retry, each marked when a SKETERM_MCP_* env override changed it from the built-in), whether sub-agents run here (agents, agent_adapters, agent_waiter, agent_ssh, agent_open_args_env for a wrapper's args and env, agent_open_resume for continuing an existing conversation (agent_resume_checked: an unknown id fails instead of starting afresh), agent_open_process_args for server_args/tui_args, agent_conversation for the conversation id results report, user_daemon_env_scrubbed for a per-user daemon started without the assistant's environment, agent_resume_by_id for agent_attach {agent} from any server, agent_idle_ttl_hours for how long an unattached agent lives, tombstones for agent_attach saying why a gone agent ended) and how agent_read selects what it returns (agent_read_select), how sub-agent output is delivered (agent_records_once, agent_events_shared), whether agent_wait can watch several agents (agent_wait_any; agent_wait_all: once every one settled), whether agent_send queues a prompt for a busy agent (agent_send_queue), reaches several agents in one call (agent_send_many) and interrupts a busy one first (agent_send_interrupt), whether agent_read returns just the final message (agent_read_final), agent_list is compact by default (agent_list_compact), agent_attach relaunches a gone agent (agent_relaunch) and agent_open hands a prompt off with timeout_ms 0 (agent_open_handoff), whether agent_answer takes free text (agent_answer_text), agent_open takes a permission policy (agent_permissions) and retry_on_overload (agent_retry_on_overload: the error classes it retries and its bounds), a lost link that finds its session gone ends the agent (agent_gone_on_reconnect), when done fires (agent_done), and whether agent events are pushed into this session (agent_push: channel = Claude Code channel messages; agent_push_follow / agent_push_followers for the agent-wait --server follower the opencode plugin runs), whether term_open takes exec_shell (term_exec_shell_default), and open session counts.
 <!-- tool-reference:end -->
 
 ## Tool exposure policy
@@ -1215,12 +1215,78 @@ on a free loopback port, read over its HTTP API and SSE stream, with
 - **Connection loss.** A remote-mux session whose link drops is
   reattached once at once; when that fails the agent reports
   `connection_lost` (state `disconnected`) and a background thread retries
-  (2 s, doubling to 60 s, forever while the agent is in this server; an
+  (2 s, doubling to 60 s, for as long as the host does not answer; an
   `agent_*` call on it retries at once without waiting); a recovered link
   re-syncs like a wipe (nothing is captured twice) and raises the always-on
   `connection_restored`, so a waiter learns it is back. A plain-ssh agent
   whose ssh lost the connection (status 255) reports `connection_lost` and
   `exited`.
+- **Disconnected or gone (`capabilities.agent_gone_on_reconnect`).** A
+  retry that REACHES the host's daemon and is refused the attach (no such
+  session for that lifetime: it was closed or expired meanwhile, or the
+  host rebooted and its daemon is a fresh one) ends the agent instead of
+  retrying forever: the daemon's tombstone is asked why (the same rule as
+  `agent_attach`, `askWhyGone`; a fresh daemon has no record, so
+  `unknown`), the terminal is marked gone (no further retry), and the
+  agent raises ONE always-on `exited` whose text names the host, the
+  reason and what it means. From then on every per-agent result and
+  `agent_list` (compact and detail) carry `gone_reason` (`closed`,
+  `expired`, `exited`, `unknown`) and, as for any agent whose app ended,
+  `relaunchable` exactly as `agent_attach` answers it, so `agent_attach
+  {agent, relaunch: true}` starts it again under its id. A host that does
+  not answer (ssh fails, or the daemon does not answer the attach in time)
+  is still only `disconnected`, retried with the backoff above.
+- **A permission policy (`permissions`, `capabilities.agent_permissions`).**
+  `agent_open permissions: {"<name>": "allow"|"ask"|"deny", ...}` is
+  app-neutral; each adapter maps it declaratively
+  (`launch.permissions`: the `names` it takes plus `patterns`, the JSON
+  `shape`, the object `path`, and exactly one of `env` or `arg`), and
+  `launch.applyPermissions` is the one mapping, applied at every start
+  (relaunches and reattaches included; the policy is kept in the
+  descriptor). opencode (`by_name` under `permission`, env
+  `OPENCODE_CONFIG_CONTENT`; its config schema's keys `*`, `read`, `edit`,
+  `glob`, `grep`, `list`, `bash`, `task`, `external_directory`,
+  `todowrite`, `question`, `webfetch`, `websearch`, `lsp`, `doom_loop`,
+  `skill`): the policy is merged into an `OPENCODE_CONFIG_CONTENT` the
+  caller passes in `env` (its other keys kept; a name in both takes the
+  policy's action), so `{"external_directory": "allow"}` ends the
+  `/tmp/*` prompts. Claude Code (`by_action` under `permissions`, option
+  `--settings`, which 2.1.287 takes as a JSON string of additional
+  settings whose `permissions.allow/ask/deny` are rule lists; read from
+  its `--help` and bundled settings schema): the known tool names plus any
+  rule `Tool(specifier)` (`Bash(git *)`) or `mcp__...` name. Refused as
+  `invalid_args`, naming what that app takes (`agent_adapters` lists it
+  per adapter as `permissions`): an unknown name or action, a name given
+  twice, an app whose adapter declares no mapping, `args` that already
+  pass the app's `--settings` (never overwritten), and an
+  `OPENCODE_CONFIG_CONTENT` that is not a JSON object. `agent_open` and
+  `agent_list detail` report the policy as `permissions` (names and
+  actions; nothing secret).
+- **Retry on overload (`retry_on_overload`,
+  `capabilities.agent_retry_on_overload`).** Off by default. `agent_open`
+  or `agent_set` `retry_on_overload: {max, backoff_s}` (max 0-10, default
+  3, 0 or null = off; backoff_s 1-600, default 15): when a turn ends on an
+  `error` of class `overloaded` (the adapter's error rules: opencode
+  `APIError 5xx`/`Overloaded`/`Service Unavailable`, Claude Code `Repeated
+  529 Overloaded errors`, `API Error: 5xx`, `overloaded_error`), sketerm
+  types the adapter's `retry.prompt` (`continue`) once the agent is idle,
+  after the backoff (doubling, capped at 600 s), at most `max` times per
+  job (a prompt the caller sends starts a new budget; `agent_interrupt`
+  cancels a pending retry). Usage limits and auth failures are never
+  retried (`vocab.ErrorClass.retriedOnOverload`). While a retry is
+  pending, the overload `error` and the `done` of the turn it ended are
+  HELD (`events.Event.held`: they wake nobody and settle no turn); a
+  continued turn that ends in a `done` recovers: the errors stay held
+  (they read as notices; a `retrying: true` consumer still gets them) and
+  that done covers every job the retries spanned. Running out of retries,
+  another error class in the continued turn or the app's exit gives up:
+  every held error wakes with the one that ended it. Each step is a
+  notice record (`retry 1 of 3, sending "continue" in 15 s`, `the turn
+  went on after 1 retry`, `gave up`), and every per-agent result and
+  `agent_list detail` carry `retry_on_overload` (`max`, `backoff_s`,
+  `used`, `pending`, `next_in_ms`). `src/agent/retry.zig` is the one
+  policy, unit-tested on fake error sequences; the MCP layer only types the
+  prompt (never while a recipe runs on the agent).
 - **Remote agents never die with the link.** With `host`, `auto` runs the
   agent on the host's own sketerm-mux, deploying the portable one there
   when the host has none (`src/mux/deploy.zig`, the deployer every first

@@ -475,6 +475,22 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
         try res.fact("agent_open_handoff", agents_ok);
         try res.fact("agent_send_queue", agents_ok);
         try res.fact("agent_answer_text", agents_ok);
+        try res.fact("agent_permissions", agents_ok);
+        {
+            const retry = @import("../agent/retry.zig");
+            const vocab_r = @import("../agent/vocab.zig");
+            var classes: std.ArrayList([]const u8) = .empty;
+            for (std.enums.values(vocab_r.ErrorClass)) |cls| if (cls.retriedOnOverload()) try classes.append(arena, @tagName(cls));
+            try res.fact("agent_retry_on_overload", .{
+                .available = agents_ok,
+                .classes = classes.items,
+                .default_max = retry.DEFAULT_MAX,
+                .max_retries = retry.MAX_RETRIES,
+                .default_backoff_s = retry.DEFAULT_BACKOFF_S,
+                .backoff_cap_s = retry.BACKOFF_CAP_S,
+            });
+        }
+        try res.fact("agent_gone_on_reconnect", agents_ok);
         try res.fact("agent_push", @tagName(if (agents_ok) mcp_agent.state.push else .none));
         try res.fact("agent_push_follow", agents_ok and mcp_agent.state.waiter.path != null);
         try res.fact("agent_push_followers", if (agents_ok) mcp_agent.followers() else 0);
@@ -492,6 +508,7 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
             try res.text("done means settled (no subagents or background tasks left running); results and waiters share one event delivery, and agent_wait agents / agent-wait --any watch several agents (all / --all: once every one settled)");
             try res.text("agent_send to a busy agent queues the prompt in its app for the next turn (outcome queued) unless interrupt, agents sends to several in one call, and agent_answer takes free text where the prompt allows it");
             try res.text("agent_read final returns just the newest job's last message, agent_list is compact unless detail, and agent_attach relaunch starts a gone agent again under its id");
+            try res.text("agent_open takes permissions (name to allow/ask/deny, mapped to each app's own mechanism) and retry_on_overload (continue a turn a provider overload ended, off by default); a lost remote link that comes back to find the session gone ends the agent as exited, relaunchable");
             if (mcp_agent.state.push == .channel)
                 try res.text("agent events are pushed into this session as Claude Code channel messages: end your turn after delegating instead of running watch_command")
             else if (mcp_agent.followers() > 0)
