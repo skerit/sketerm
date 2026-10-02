@@ -238,6 +238,11 @@ pub const Session = struct {
     fg_sampled_ms: i64 = 0,
     exited: bool = false,
     exit_status: i32 = 0,
+    /// A terminal viewer has attached at least once.
+    viewed: bool = false,
+    /// Monotonic ms until which an exited, never-viewed session is kept for
+    /// its spawner's attach (0 = not held); see `Daemon.exit_hold_ms`.
+    exit_hold_until_ms: i64 = 0,
     /// Spawned via `sketerm app -u` — a forwarded GUI app, not a shell.
     app: bool = false,
     /// The child relaxed Yama before exec (SpawnReq.debuggable), so
@@ -3086,6 +3091,11 @@ pub const Daemon = struct {
     /// behind an MCP client's between-tool-calls backlog) keeps
     /// serving until everything drained or this deadline passes.
     drain_deadline_ms: i64 = 0,
+    /// How long a session whose child exits before any terminal viewer
+    /// attached keeps its final screen and exit for the attach its spawner
+    /// sends right after the spawn `.ok`; the exit used to beat that attach
+    /// and the spawner saw "no such session" (or a closed socket).
+    exit_hold_ms: i64 = 10_000,
     /// Lazily-opened web store (history/bookmarks/site settings) under
     /// $XDG_STATE_HOME/sketerm/web — see daemon_web.handleWebOp.
     web_store: ?@import("webstore.zig").WebStore = null,
@@ -7005,35 +7015,42 @@ pub const Daemon = struct {
             }
         }
         self.reportEnd(tombstones.End.exited(s.exit_status));
-        var st: [4]u8 = undefined;
-        std.mem.writeInt(i32, &st, s.exit_status, .little);
         // A crash mid-line must keep the tail in the log ring.
         s.log.flush(wallMs());
+        // Nobody has seen this session yet: its spawner's attach is still
+        // on the way (it follows the spawn `.ok`), so keep the corpse for it.
+        if (!s.viewed) s.exit_hold_until_ms = nowMs() + self.exit_hold_ms;
         // Deliver the exit, then force-detach: nothing will ever flow
         // on this session again, and a client that vanished without a
         // clean goodbye (UDP peer roamed away for good) must not pin
         // the dead session in the list forever.
         for (self.clients.items) |cl| {
-            if (cl.attached == s) {
-                if (!cl.dead) {
-                    if (cl.panel_only) {
-                        cl.queueJson(.gone, .{ .reason = "session exited" });
-                        clearClientAttachment(cl);
-                        continue;
-                    }
-                    // A backlogged client had events withheld; clients
-                    // stop pumping after `.exit`, so the resync snapshot
-                    // (the FINAL screen — the crash post-mortem) must go
-                    // out ahead of the exit frame, not after.
-                    if (cl.needs_resync) self.queueSnapshot(cl, s);
-                    // Post-mortem log push: the exit force-detaches the
-                    // client, so a later log_get would find no session.
-                    self.queueLogData(cl, s, .{ .tail = 300, .max_chars = 1000 });
-                    cl.queueFrame(.exit, &st);
-                }
-                clearClientAttachment(cl);
-            }
+            if (cl.attached == s) self.deliverExit(cl, s);
         }
+    }
+
+    /// Send one attached client an exited session's post-mortem and exit,
+    /// then detach it.
+    pub fn deliverExit(self: *Daemon, cl: *Client, s: *Session) void {
+        if (!cl.dead) {
+            if (cl.panel_only) {
+                cl.queueJson(.gone, .{ .reason = "session exited" });
+                clearClientAttachment(cl);
+                return;
+            }
+            // A backlogged client had events withheld; clients
+            // stop pumping after `.exit`, so the resync snapshot
+            // (the FINAL screen — the crash post-mortem) must go
+            // out ahead of the exit frame, not after.
+            if (cl.needs_resync) self.queueSnapshot(cl, s);
+            // Post-mortem log push: the exit force-detaches the
+            // client, so a later log_get would find no session.
+            self.queueLogData(cl, s, .{ .tail = 300, .max_chars = 1000 });
+            var st: [4]u8 = undefined;
+            std.mem.writeInt(i32, &st, s.exit_status, .little);
+            cl.queueFrame(.exit, &st);
+        }
+        clearClientAttachment(cl);
     }
 
     /// Kill sessions whose idle TTL has run out. An attached mux viewer or
@@ -7324,13 +7341,15 @@ pub const Daemon = struct {
         self.ttlSweep();
         // Exited sessions are removed outright — sessionExited
         // already detached every client (defensively re-checked here
-        // so a dangling cl.attached is impossible). Live sessions are
-        // NEVER reaped, attached or not: surviving client-less for
-        // days is the whole point of the daemon.
+        // so a dangling cl.attached is impossible) — unless held for
+        // their spawner's attach. Live sessions are NEVER reaped,
+        // attached or not: surviving client-less for days is the
+        // whole point of the daemon.
         i = 0;
+        const reap_now = nowMs();
         while (i < self.sessions.items.len) {
             const s = self.sessions.items[i];
-            if (s.exited) {
+            if (s.exited and s.exit_hold_until_ms <= reap_now) {
                 for (self.clients.items) |cl| {
                     if (cl.attached == s) cl.attached = null;
                 }

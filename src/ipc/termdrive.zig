@@ -16,6 +16,7 @@ const Screen = @import("../grid/screen.zig").Screen;
 const Pool = @import("../grid/style_pool.zig").Pool;
 const keys = @import("keys.zig");
 const launch_cleanup = @import("launch_cleanup.zig");
+const tombstones = @import("../mux/tombstones.zig");
 const muxconnect = @import("muxconnect.zig");
 const readfile = @import("../util/readfile.zig");
 
@@ -536,6 +537,16 @@ pub const SpawnOpts = struct {
 /// The orphan bound of a remote session spawned without an explicit one.
 pub const REMOTE_TTL_SECS: u32 = 3600;
 
+/// What a spawn produced.
+pub const Spawned = union(enum) {
+    term: *Term,
+    /// The daemon spawned the session but the attach never landed: a
+    /// daemon that predates holding an exited session for its spawner lets
+    /// a short-lived child exit first. Carries how it ended when the daemon
+    /// remembers (`tombstones`); null when it cannot say.
+    unattached: ?tombstones.End,
+};
+
 pub const Term = struct {
     allocator: std.mem.Allocator,
     conn: muxclient.Conn,
@@ -606,6 +617,22 @@ pub const Term = struct {
         local_sock: ?[]const u8,
         opts: SpawnOpts,
     ) Error!*Term {
+        return switch (try spawnOutcome(allocator, argv, cols, rows, local_sock, opts)) {
+            .term => |t| t,
+            .unattached => Error.SpawnFailed,
+        };
+    }
+
+    /// `spawnWith` that tells a session which ended before its attach
+    /// landed apart from a spawn that failed.
+    pub fn spawnOutcome(
+        allocator: std.mem.Allocator,
+        argv: ?[]const []const u8,
+        cols: u16,
+        rows: u16,
+        local_sock: ?[]const u8,
+        opts: SpawnOpts,
+    ) Error!Spawned {
         var conn = muxclient.Conn.connectLocalAutostartAt(allocator, local_sock) catch return Error.SpawnFailed;
         errdefer conn.deinit();
         // Non-blocking + deadline recv everywhere: a wedged daemon
@@ -644,7 +671,7 @@ pub const Term = struct {
         }
         const ok = conn.recvExpectFor(&.{.ok}, 15_000) catch return Error.SpawnFailed;
         defer ok.deinit(allocator);
-        return finishSpawn(
+        const out = try finishSpawn(
             allocator,
             &conn,
             name,
@@ -655,6 +682,11 @@ pub const Term = struct {
             ok.payload,
             15_000,
         );
+        if (out == .unattached) {
+            conn.deinit();
+            allocator.free(name);
+        }
+        return out;
     }
 
     /// Spawn a session on `host`'s OWN sketerm-mux daemon (found via
@@ -691,7 +723,7 @@ pub const Term = struct {
         conn.sendJson(.spawn, .{ .name = name, .argv = argv, .rows = rows, .cols = cols, .ttl_secs = opts.ttl_secs orelse REMOTE_TTL_SECS, .env = opts.env, .cwd = opts.cwd, .title = opts.title }) catch return Error.SpawnFailed;
         const ok = conn.recvExpectFor(&.{.ok}, 15_000) catch return Error.SpawnFailed;
         defer ok.deinit(allocator);
-        return finishSpawn(
+        return switch (try finishSpawn(
             allocator,
             &conn,
             name,
@@ -701,7 +733,10 @@ pub const Term = struct {
             .{ .target = .{ .remote = host } },
             ok.payload,
             15_000,
-        );
+        )) {
+            .term => |t| t,
+            .unattached => Error.SpawnFailed,
+        };
     }
 
     fn finishSpawn(
@@ -714,13 +749,19 @@ pub const Term = struct {
         endpoint: launch_cleanup.Endpoint,
         spawn_payload: []const u8,
         timeout_ms: i64,
-    ) Error!*Term {
+    ) Error!Spawned {
         const meta = launch_cleanup.parseSpawnMeta(spawn_payload) catch return Error.SpawnFailed;
         var cleanup = launch_cleanup.Guard.init(conn, name, meta.origin_id, endpoint, timeout_ms);
         errdefer cleanup.rollback();
-        const self = try attachBuild(allocator, conn, name, meta.origin_id, shell, integration, remote_host, timeout_ms);
+        const self = attachBuild(allocator, conn, name, meta.origin_id, shell, integration, remote_host, timeout_ms) catch |err| {
+            if (err != Error.SpawnFailed) return err;
+            // `conn` and `name` stay the caller's, as on an error.
+            const end = cleanup.ended(allocator);
+            cleanup.rollback();
+            return .{ .unattached = end };
+        };
         cleanup.disarm();
-        return self;
+        return .{ .term = self };
     }
 
     /// Attach to a session that is already running on the daemon at
@@ -1454,7 +1495,8 @@ fn testSpawnFailure(failure: SpawnFailure) !void {
         },
     }
 
-    try t.expectError(Error.SpawnFailed, Term.finishSpawn(
+    // Spawned, never attached, and this daemon keeps no tombstones.
+    const out = try Term.finishSpawn(
         t.allocator,
         &conn,
         name,
@@ -1464,7 +1506,8 @@ fn testSpawnFailure(failure: SpawnFailure) !void {
         endpoint,
         fake.SPAWN_REPLY,
         5,
-    ));
+    );
+    try t.expect(out == .unattached and out.unattached == null);
     switch (failure) {
         .attach_send => try daemon.expectFreshKill(name),
         .snapshot_timeout => {
@@ -1482,7 +1525,7 @@ fn spawnFakeTerm(daemon: *@import("launch_cleanup_test.zig").Harness, conn: *mux
     const a = std.testing.allocator;
     const name = try a.dupe(u8, "fake-term");
     errdefer a.free(name);
-    return Term.finishSpawn(
+    return switch (try Term.finishSpawn(
         a,
         conn,
         name,
@@ -1492,7 +1535,10 @@ fn spawnFakeTerm(daemon: *@import("launch_cleanup_test.zig").Harness, conn: *mux
         daemon.localEndpoint(),
         @import("launch_cleanup_test.zig").SPAWN_REPLY,
         1_000,
-    );
+    )) {
+        .term => |term| term,
+        .unattached => error.TestUnexpectedResult,
+    };
 }
 
 test "a desynced mirror resyncs instead of serving a frozen screen" {
@@ -1574,7 +1620,7 @@ test "Term spawn survives a snapshot it cannot decode" {
     // The mirror backs term_read; it is not the session. A snapshot skew
     // against a pre-upgrade daemon used to kill a shell that had spawned
     // and was running fine.
-    const term = try Term.finishSpawn(
+    const term = (try Term.finishSpawn(
         t.allocator,
         &conn,
         name,
@@ -1584,7 +1630,7 @@ test "Term spawn survives a snapshot it cannot decode" {
         endpoint,
         fake.SPAWN_REPLY,
         5,
-    );
+    )).term;
     try t.expect(term.screen == null);
     try t.expectEqual(@as(u64, 0), term.seq);
     try daemon.expectAttach(name, false);
@@ -1596,7 +1642,7 @@ test "Term spawn rolls back a timed-out snapshot over a fresh connection" {
     try testSpawnFailure(.snapshot_timeout);
 }
 
-test "Term spawn preserves its error when cleanup cannot connect" {
+test "Term spawn reports a spawned, unattached session when cleanup cannot connect" {
     try testSpawnFailure(.cleanup_connect);
 }
 
@@ -1615,7 +1661,7 @@ fn testSpawnAllocationFailures(remote: bool) !void {
     try baseline_daemon.queueSnapshot(snapshot_payload);
     var baseline_conn = baseline_daemon.takePrimary(baseline_allocator);
     const baseline_endpoint = if (remote) baseline_daemon.remoteEndpoint() else baseline_daemon.localEndpoint();
-    const term = try Term.finishSpawn(
+    const term = (try Term.finishSpawn(
         baseline_allocator,
         &baseline_conn,
         baseline_name,
@@ -1625,7 +1671,7 @@ fn testSpawnAllocationFailures(remote: bool) !void {
         baseline_endpoint,
         fake.SPAWN_REPLY,
         20,
-    );
+    )).term;
     const allocation_end = baseline.alloc_index;
     try t.expect(allocation_end > first_post_spawn);
     try baseline_daemon.expectAttach(baseline_name, false);

@@ -833,10 +833,18 @@ pub fn runArgvTerms(arena: std.mem.Allocator, argvs: []const []const []const u8,
     var done: usize = 0;
     while (done < argvs.len) {
         while (running < @max(max_par, 1) and next < argvs.len) : (next += 1) {
-            const t = termdrive.Term.spawn(term_state.allocator, argvs[next], 120, 30, term_state.mux_sock) catch {
+            const spawned = termdrive.Term.spawnOutcome(term_state.allocator, argvs[next], 120, 30, term_state.mux_sock, .{}) catch {
                 out[next] = .{ .err = "spawn failed (mux daemon unreachable?)" };
                 done += 1;
                 continue;
+            };
+            const t = switch (spawned) {
+                .term => |t| t,
+                .unattached => |end| {
+                    out[next] = unattachedOutcome(end);
+                    done += 1;
+                    continue;
+                },
             };
             recordAuxTerm(t, std.fs.path.basename(argvs[next][0]));
             live[next] = t;
@@ -869,6 +877,29 @@ pub fn runArgvTerms(arena: std.mem.Allocator, argvs: []const []const []const u8,
         }
     }
     return out;
+}
+
+/// What a command whose session ended before its attach landed (an older
+/// mux daemon lets a short-lived child win that race) reports: its exit as
+/// the daemon remembers it, never a spawn failure; the output is lost.
+fn unattachedOutcome(end: ?@import("../mux/tombstones.zig").End) ArgvOutcome {
+    const lost = "(the command ended before its output could be read: the mux daemon predates keeping a quick command's exit for its spawner; restart it)";
+    const e = end orelse return .{ .err = "the command's session spawned but could not be attached (an older mux daemon loses a command that exits at once; restart it)" };
+    if (e.reason != .exited) return .{ .err = "the command's session spawned but ended before it could be attached" };
+    const status: i32 = if (e.signal) |sig| -sig else e.exit_status orelse return .{ .run = .{ .exited = true, .status = 0, .status_known = false, .output = lost } };
+    return .{ .run = .{ .exited = true, .status = status, .status_known = true, .output = lost } };
+}
+
+test "a command that ended before its attach reports its exit, not a spawn failure" {
+    const t = std.testing;
+    const ok = unattachedOutcome(.{ .reason = .exited, .exit_status = 0 });
+    try t.expect(ok == .run and ok.run.exited and ok.run.status_known and ok.run.status == 0);
+    const failed = unattachedOutcome(.{ .reason = .exited, .exit_status = 1 });
+    try t.expectEqual(@as(i32, 1), failed.run.status);
+    const killed = unattachedOutcome(.{ .reason = .exited, .signal = 9 });
+    try t.expectEqual(@as(i32, -9), killed.run.status);
+    try t.expect(unattachedOutcome(null) == .err);
+    try t.expect(unattachedOutcome(.{ .reason = .closed }) == .err);
 }
 
 /// Shell-quote into an arena string.

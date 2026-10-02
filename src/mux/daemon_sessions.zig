@@ -1833,6 +1833,11 @@ pub const AttachSpec = struct {
 /// both arrival paths share, so a step added here reaches a re-attach
 /// on a worker connection and a broker handoff alike.
 pub fn attachClientToSession(self: *Daemon, cl: *Client, s: *Session, spec: AttachSpec, how: []const u8) void {
+    if (s.exited and spec.panel_only) {
+        log.info("client attach REFUSED session='{s}' kind={s}: session has exited ({s})", .{ s.name, @tagName(spec.kind), how });
+        cl.queueErr("session has exited");
+        return;
+    }
     cl.attached = s;
     cl.panel_only = spec.panel_only;
     cl.panel_rpc = spec.panel_rpc;
@@ -1843,6 +1848,15 @@ pub fn attachClientToSession(self: *Daemon, cl: *Client, s: *Session, spec: Atta
     log.info("client attached session='{s}' kind={s} proto={d} video_codecs={d} panel_only={} panel_rpc={d} view_only={} ({s})", .{
         s.name, @tagName(spec.kind), cl.proto, cl.video_codecs.len, cl.panel_only, cl.panel_rpc, cl.view_only, how,
     });
+    if (!cl.panel_only) s.viewed = true;
+    if (s.exited) {
+        // Its child exited before this attach landed (the spawner's attach
+        // racing a short-lived command): the final screen, then the exit.
+        self.queueSnapshot(cl, s);
+        self.deliverExit(cl, s);
+        s.exit_hold_until_ms = 0;
+        return;
+    }
     if (cl.panel_only) {
         cl.queueJson(.ok, .{
             .ok = true,
@@ -1918,13 +1932,8 @@ pub fn handleAttach(self: *Daemon, cl: *Client, payload: []const u8) void {
         cl.queueErr("session origin identity changed");
         return;
     }
-    if (s.exited) {
-        // The corpse only lingers until the next reap; attaching
-        // to it would wedge the client on a dead screen.
-        log.info("client attach REFUSED session='{s}' kind={s}: session has exited", .{ parsed.value.name, parsed.value.kind });
-        cl.queueErr("session has exited");
-        return;
-    }
+    // An exited session still here is answered with its final screen and
+    // exit by the shared tail, never left wedged on a dead screen.
     self.detachClientAttachment(cl, "panel presenter reattached after request delivery; delivery is uncertain, the mutation may have applied, and the request was NOT resent");
     attachClientToSession(self, cl, s, .{
         .kind = clientKindNamed(parsed.value.kind),

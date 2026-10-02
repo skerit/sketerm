@@ -4,6 +4,9 @@ const std = @import("std");
 const muxclient = @import("../mux/client.zig");
 const wire = @import("../mux/wire.zig");
 const muxconnect = @import("muxconnect.zig");
+const tombstones = @import("../mux/tombstones.zig");
+const c = @import("../c.zig").c;
+const nowMs = @import("../util/clock.zig").nowMs;
 
 pub const Reconnect = struct {
     ctx: *anyopaque,
@@ -120,6 +123,33 @@ pub const Guard = struct {
         defer fresh.deinit();
         fresh.setNonBlocking();
         _ = self.killOn(&fresh);
+    }
+
+    /// How the guarded session ended, from its daemon's tombstone; null from
+    /// a daemon without `tombstones` or when it has no record.
+    /// The broker records the end only once it reaps the worker, which can
+    /// trail the client seeing its attach fail, so a miss is retried briefly.
+    pub fn ended(self: *const Guard, allocator: std.mem.Allocator) ?tombstones.End {
+        if (!self.conn.caps.tombstones) return null;
+        const budget = @min(self.timeout_ms, 1_500);
+        if (self.endOn(self.conn, allocator, budget)) |e| return e;
+        var fresh = self.connectFresh() catch return null;
+        defer fresh.deinit();
+        fresh.setNonBlocking();
+        const deadline = nowMs() + budget;
+        while (true) {
+            if (self.endOn(&fresh, allocator, budget)) |e| return e;
+            if (nowMs() >= deadline) return null;
+            _ = c.usleep(100_000);
+        }
+    }
+
+    fn endOn(self: *const Guard, conn: *muxclient.Conn, allocator: std.mem.Allocator, timeout_ms: i64) ?tombstones.End {
+        const parsed = (conn.tombstone(allocator, self.name, &self.origin_id, timeout_ms) catch return null) orelse return null;
+        defer parsed.deinit();
+        const r = parsed.value;
+        if (!r.found) return null;
+        return .{ .reason = r.reason orelse .unknown, .exit_status = r.exit_status, .signal = r.signal };
     }
 
     fn killOn(self: *const Guard, conn: *muxclient.Conn) bool {

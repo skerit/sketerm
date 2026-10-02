@@ -779,6 +779,132 @@ fn runWorkerInner(
     self.run() catch return error.RunFailed;
 }
 
+/// Tick `d` until `done(d)` or `ms` pass; false on timeout.
+fn testTickUntil(d: *Daemon, ms: i64, comptime done: fn (*Daemon) bool) !bool {
+    const deadline = nowMs() + ms;
+    while (!done(d)) {
+        if (nowMs() > deadline) return false;
+        try d.tick(20);
+    }
+    return true;
+}
+
+fn testSessionExited(d: *Daemon) bool {
+    return d.sessions.items.len > 0 and d.sessions.items[0].exited;
+}
+
+fn testWorkerRetired(d: *Daemon) bool {
+    return !d.running;
+}
+
+test "a child that exits before the broker hands its spawner over still delivers screen, log and exit" {
+    const t = std.testing;
+    const a = t.allocator;
+    var pair: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), platform.controlSocketpair(&pair, WORKER_META_BUF));
+    defer _ = c.close(pair[0]);
+    const worker = try initWorker(a, pair[1], "", "");
+    defer worker.deinit();
+    const s = try worker.spawnSession(.{ .name = "quick", .argv = &.{ "/bin/sh", "-c", "echo QUICK-OUT; exit 3" }, .local = true, .rows = 24, .cols = 80 });
+    try worker.sessions.append(a, s);
+    const origin = s.origin_id;
+
+    // The exact order scp_put lost: the child is gone and reaped before
+    // the spawner's attach reaches the worker. The session is held.
+    try t.expect(try testTickUntil(worker, 5_000, testSessionExited));
+    try worker.tick(0);
+    try worker.tick(0);
+    try t.expectEqual(@as(usize, 1), worker.sessions.items.len);
+    try t.expect(worker.running);
+
+    // The broker routes the attach through the real 'A' handoff.
+    var empty: [0]u8 = .{};
+    var broker = Daemon{ .allocator = a, .listen_fd = -1, .sock_path = empty[0..] };
+    defer broker.workers.deinit(a);
+    var record = Worker{
+        .allocator = a,
+        .name = @constCast("quick"),
+        .origin_name = @constCast("quick"),
+        .origin_id = origin,
+        .pid = 1,
+        .control_fd = pair[0],
+        .ready = true,
+    };
+    try broker.workers.append(a, &record);
+    var conn: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), platform.socketpairCloexec(&conn));
+    defer _ = c.close(conn[1]);
+    var spawner = Client{ .allocator = a, .fd = conn[0], .id = 1, .proto = wire.PROTO_VERSION, .snapshot_version = snapshot.SNAPSHOT_VERSION };
+    defer spawner.rbuf.deinit(a);
+    defer spawner.wbuf.deinit(a);
+    defer spawner.audio_wbuf.deinit(a);
+    var attach_buf: [160]u8 = undefined;
+    const attach = try std.fmt.bufPrint(&attach_buf, "{{\"name\":\"quick\",\"origin_id\":\"{s}\",\"kind\":\"mcp\"}}", .{&origin});
+    broker.handleAttach(&spawner, attach);
+    try t.expect(spawner.dead); // handed off, nothing queued on the broker side
+    try t.expectEqual(@as(usize, 0), spawner.wbuf.items.len);
+    _ = c.close(conn[0]);
+
+    // The worker answers it with the final screen, the log and the exit,
+    // then retires.
+    try t.expect(try testTickUntil(worker, 5_000, testWorkerRetired));
+    try t.expectEqual(@as(usize, 0), worker.sessions.items.len);
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(a);
+    var chunk: [4096]u8 = undefined;
+    while (true) {
+        const n = c.recv(conn[1], &chunk, chunk.len, c.MSG_DONTWAIT);
+        if (n <= 0) break;
+        try got.appendSlice(a, chunk[0..@intCast(n)]);
+    }
+    var pos: usize = 0;
+    var saw_snapshot = false;
+    var saw_log = false;
+    var status: ?i32 = null;
+    while (try wire.peelFrame(got.items[pos..])) |p| {
+        pos += p.consumed;
+        switch (p.frame.ftype) {
+            .snapshot => saw_snapshot = status == null,
+            .log_data => saw_log = std.mem.indexOf(u8, p.frame.payload, "QUICK-OUT") != null,
+            .exit => status = std.mem.readInt(i32, p.frame.payload[0..4], .little),
+            else => {},
+        }
+    }
+    try t.expect(saw_snapshot);
+    try t.expect(saw_log);
+    try t.expectEqual(@as(?i32, 3), status);
+}
+
+test "an exited session nobody attaches to is held only for the hold, and a viewed one not at all" {
+    const t = std.testing;
+    const a = t.allocator;
+    var pair: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), platform.controlSocketpair(&pair, WORKER_META_BUF));
+    defer _ = c.close(pair[0]);
+    const worker = try initWorker(a, pair[1], "", "");
+    defer worker.deinit();
+    worker.exit_hold_ms = 300;
+    const s = try worker.spawnSession(.{ .name = "orphan", .argv = &.{"/bin/true"}, .local = true, .rows = 24, .cols = 80 });
+    try worker.sessions.append(a, s);
+    try t.expect(try testTickUntil(worker, 5_000, testSessionExited));
+    const exited_at = nowMs();
+    try t.expect(try testTickUntil(worker, 5_000, testWorkerRetired));
+    try t.expect(nowMs() - exited_at >= 200);
+
+    // A session a viewer already saw exits as before: nobody is owed it,
+    // so its worker retires long before the (default) hold would end.
+    var pair2: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), platform.controlSocketpair(&pair2, WORKER_META_BUF));
+    defer _ = c.close(pair2[0]);
+    const viewed = try initWorker(a, pair2[1], "", "");
+    defer viewed.deinit();
+    const s2 = try viewed.spawnSession(.{ .name = "seen", .argv = &.{"/bin/true"}, .local = true, .rows = 24, .cols = 80 });
+    try viewed.sessions.append(a, s2);
+    s2.viewed = true;
+    try t.expect(try testTickUntil(viewed, @divTrunc(viewed.exit_hold_ms, 2), testWorkerRetired));
+    try t.expectEqual(@as(usize, 0), viewed.sessions.items.len);
+}
+
 test "control datagrams carry their bytes and at most one passed fd" {
     const t = std.testing;
     var pair: [2]c_int = undefined;
