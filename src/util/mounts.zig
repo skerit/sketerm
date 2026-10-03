@@ -109,7 +109,8 @@ pub fn forEach(ctx: anytype) void {
     }
 }
 
-fn unescape(buf: []u8, src: []const u8) []const u8 {
+/// Decode /proc/mounts octal escapes (\040 = space, ...) into `buf`, truncating at its end.
+pub fn unescape(buf: []u8, src: []const u8) []const u8 {
     var w: usize = 0;
     var r: usize = 0;
     while (r < src.len and w < buf.len) {
@@ -222,4 +223,16 @@ test "mount source parsing handles ssh, bracketed IPv6, and root mapping" {
     try std.testing.expectEqualStrings("/srv/data/x/y", deep.path());
     try std.testing.expectEqualStrings("/srv/data", deep.root());
     try std.testing.expectEqualStrings("/mnt/box", deep.mountpoint());
+}
+
+test "unescape decodes /proc/mounts octal escapes" {
+    const t = std.testing;
+    var buf: [64]u8 = undefined;
+    try t.expectEqualStrings("/mnt/my disk", unescape(&buf, "/mnt/my\\040disk"));
+    try t.expectEqualStrings("/mnt/a\tb", unescape(&buf, "/mnt/a\\011b"));
+    // A backslash that is not a complete octal triple stays literal.
+    try t.expectEqualStrings("/mnt/a\\zz", unescape(&buf, "/mnt/a\\zz"));
+    // Output is capped by the destination buffer.
+    var small: [4]u8 = undefined;
+    try t.expectEqualStrings("/mnt", unescape(&small, "/mnt/x"));
 }

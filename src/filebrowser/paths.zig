@@ -73,30 +73,6 @@ pub fn completionMatches(name: []const u8, prefix: []const u8) bool {
 /// whether the reroute happens is `filebrowser/bypass.zig`'s call.
 pub const BypassHit = mounts.Hit;
 
-/// Decode /proc/mounts octal escapes (\040 = space, …) in place.
-pub fn unescapeMnt(buf: []u8, src: []const u8) []const u8 {
-    var w: usize = 0;
-    var r: usize = 0;
-    while (r < src.len and w < buf.len) {
-        if (src[r] == '\\' and r + 3 < src.len) {
-            const v = std.fmt.parseInt(u8, src[r + 1 .. r + 4], 8) catch {
-                buf[w] = src[r];
-                w += 1;
-                r += 1;
-                continue;
-            };
-            buf[w] = v;
-            w += 1;
-            r += 4;
-        } else {
-            buf[w] = src[r];
-            w += 1;
-            r += 1;
-        }
-    }
-    return buf[0..w];
-}
-
 /// Detect an sshfs/NFS mount covering `p` and rewrite to direct mux
 /// access: the mount source ("user@host:/remote") names both the ssh
 /// host and the remote prefix. Longest mountpoint wins.
@@ -550,18 +526,6 @@ test "browserHost strips transport prefixes and localizes sock sessions" {
     try t.expectEqualStrings("dalaran", browserHost("ssh:dalaran").?);
     try t.expectEqualStrings("me@dalaran", browserHost("udp:me@dalaran").?);
     try t.expectEqualStrings("tor:me@dalaran", browserHost("tor:me@dalaran").?);
-}
-
-test "unescapeMnt decodes /proc/mounts octal escapes" {
-    const t = std.testing;
-    var buf: [64]u8 = undefined;
-    try t.expectEqualStrings("/mnt/my disk", unescapeMnt(&buf, "/mnt/my\\040disk"));
-    try t.expectEqualStrings("/mnt/a\tb", unescapeMnt(&buf, "/mnt/a\\011b"));
-    // A backslash that is not a complete octal triple stays literal.
-    try t.expectEqualStrings("/mnt/a\\zz", unescapeMnt(&buf, "/mnt/a\\zz"));
-    // Output is capped by the destination buffer.
-    var small: [4]u8 = undefined;
-    try t.expectEqualStrings("/mnt", unescapeMnt(&small, "/mnt/x"));
 }
 
 test "mount coverage handles root and path boundaries" {
