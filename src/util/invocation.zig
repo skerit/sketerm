@@ -13,14 +13,7 @@
 //! terminal, and `sketerm-webengine` is the CEF helper, not the browser.
 
 const std = @import("std");
-
-/// The last path component of `argv0`, or all of it when there is no `/`.
-pub fn baseName(argv0: []const u8) []const u8 {
-    return if (std.mem.lastIndexOfScalar(u8, argv0, '/')) |slash|
-        argv0[slash + 1 ..]
-    else
-        argv0;
-}
+const baseName = @import("pathz.zig").baseName;
 
 /// Index of the first argument belonging to this identity.
 /// @return 1 when argv0 IS `binary`, 2 when argv[1] is one of
@@ -39,13 +32,6 @@ pub fn start(args: []const []const u8, binary: []const u8, subcommands: []const 
 // ─── tests ──────────────────────────────────────────────────────
 
 const t = std.testing;
-
-test "baseName takes the last component only" {
-    try t.expectEqualStrings("sketerm-web", baseName("sketerm-web"));
-    try t.expectEqualStrings("sketerm-web", baseName("/usr/bin/sketerm-web"));
-    try t.expectEqualStrings("sketerm", baseName("/opt/sketerm-web/bin/sketerm"));
-    try t.expectEqualStrings("", baseName("/usr/bin/"));
-}
 
 test "start matches every shipped identity and refuses the others" {
     const web: []const []const u8 = &.{"web"};

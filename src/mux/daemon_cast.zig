@@ -250,11 +250,6 @@ fn resolveCastPath(buf: []u8, path: []const u8) ![]const u8 {
     return error.CastPathNotAbsolute;
 }
 
-fn baseName(path: []const u8) []const u8 {
-    const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return path;
-    return path[slash + 1 ..];
-}
-
 /// Spawn a cast-playback session: validate the header EAGERLY (a bad
 /// file is a spawn error back to the client, never a dead session),
 /// size the Screen from the recorded dims, start PAUSED at 0.
@@ -318,7 +313,7 @@ pub fn spawnCastSessionWithOrigin(self: *Daemon, req: SpawnReq, origin_id: dmod.
     screen.defer_gui_queries = true;
     // Title from the cast filename (the recording's own OSC titles
     // may overwrite it during playback, exactly like a live app).
-    screen.last_title = allocator.dupe(u8, baseName(path)) catch null;
+    screen.last_title = allocator.dupe(u8, pathz.baseName(path)) catch null;
 
     const s = try allocator.create(Session);
     errdefer allocator.destroy(s);

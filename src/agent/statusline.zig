@@ -61,9 +61,7 @@ fn envRead(name: []const u8, x: launch.Extra, unset: []const []const u8) EnvRead
     return .host;
 }
 
-fn baseName(path: []const u8) []const u8 {
-    return path[(std.mem.lastIndexOfScalar(u8, path, '/') orelse return path) + 1 ..];
-}
+const baseName = pathz.baseName;
 
 /// The settings files on this machine, in precedence order; null for one
 /// that cannot be placed (a `~/` path without a home).

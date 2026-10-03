@@ -224,10 +224,7 @@ fn onAdded(_: ?*anyopaque, ok: bool, _: []const u8) void {
     webface.client().refreshUserContent();
 }
 
-fn basename(path: []const u8) []const u8 {
-    const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return path;
-    return path[slash + 1 ..];
-}
+const basename = @import("../util/pathz.zig").baseName;
 
 fn readFileBounded(gpa: std.mem.Allocator, path: []const u8) ?[]u8 {
     var z: [4096:0]u8 = undefined;

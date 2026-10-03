@@ -12,6 +12,14 @@ const c = @import("cbindings");
 
 pub const Error = error{ PathTooLong, MkdirFailed };
 
+/// The last `/`-separated component of `path`, all of it when there is no `/`, and "" after a trailing `/`.
+pub fn baseName(path: []const u8) []const u8 {
+    return if (std.mem.lastIndexOfScalar(u8, path, '/')) |slash|
+        path[slash + 1 ..]
+    else
+        path;
+}
+
 /// NUL-terminate `path` into the caller's stack buffer.
 /// @return pointer into `buf`, valid only while `buf` lives.
 pub fn pathZ(buf: *[4096]u8, path: []const u8) Error![*:0]const u8 {
@@ -173,6 +181,13 @@ pub const TempDir = struct {
         removeTree(self.path());
     }
 };
+
+test "baseName takes the last component only" {
+    try std.testing.expectEqualStrings("sketerm-web", baseName("sketerm-web"));
+    try std.testing.expectEqualStrings("sketerm-web", baseName("/usr/bin/sketerm-web"));
+    try std.testing.expectEqualStrings("sketerm", baseName("/opt/sketerm-web/bin/sketerm"));
+    try std.testing.expectEqualStrings("", baseName("/usr/bin/"));
+}
 
 test "pathZ round-trips and rejects oversize" {
     var buf: [4096]u8 = undefined;

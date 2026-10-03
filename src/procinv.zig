@@ -9,7 +9,7 @@
 const std = @import("std");
 const c = @import("c.zig").c;
 const platform = @import("util/platform.zig");
-const invocation = @import("util/invocation.zig");
+const pathz = @import("util/pathz.zig");
 const selfexec = @import("mux/selfexec.zig");
 const sockpath = @import("mux/sockpath.zig");
 const findbin = @import("web/findbin.zig");
@@ -116,8 +116,8 @@ fn isSketermName(base: []const u8) bool {
 pub fn identify(exe: []const u8, argv: []const u8) ?Identity {
     const replaced = std.mem.endsWith(u8, exe, platform.deleted_exe_suffix);
     const exe_path = if (replaced) exe[0 .. exe.len - platform.deleted_exe_suffix.len] else exe;
-    const exe_name = invocation.baseName(exe_path);
-    const argv0_name = invocation.baseName(std.mem.sliceTo(argv, 0));
+    const exe_name = pathz.baseName(exe_path);
+    const argv0_name = pathz.baseName(std.mem.sliceTo(argv, 0));
     const name = if (isSketermName(exe_name))
         exe_name
     else if (isSketermName(argv0_name))
