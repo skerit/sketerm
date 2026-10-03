@@ -102,7 +102,7 @@ pub const Event = struct {
         return switch (self.kind) {
             .@"error" => .retrying,
             .done => if (self.held) null else .background,
-            .needs_input, .exited, .connection_lost, .connection_restored, .message, .match => null,
+            .needs_input, .exited, .connection_lost, .connection_restored, .stalled, .message, .match => null,
         };
     }
 

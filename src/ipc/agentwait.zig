@@ -320,7 +320,8 @@ pub const HELP =
     \\pointer to agent_read), a prompt's options, an error's whole text.
     \\A message it printed in full is handed out: agent_read does not repeat
     \\it. It wakes on done (the agent settled: idle with no subagents or
-    \\background tasks), needs_input, error, exited and connection_lost,
+    \\background tasks), needs_input, error, exited, connection_lost and
+    \\(for an agent opened with stall_after_min) stalled,
     \\plus every completed message with --messages or a message containing
     \\TEXT with --match (rate limited: the rest are summarised), and on the
     \\errors an agent recovers from by itself (retrying) with --retrying.

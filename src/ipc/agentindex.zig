@@ -79,6 +79,8 @@ pub const Descriptor = struct {
     login_shell: bool = true,
     permissions: []const launch.Permission = &.{},
     retry_on_overload: ?retry.Policy = null,
+    /// `stall_after_min`; 0 = off.
+    stall_after_min: u32 = 0,
     started_ms: i64 = 0,
     /// When its sessions were found gone (Unix ms); 0 while it runs. Such a
     /// descriptor stays for `agent_attach relaunch` until the idle TTL.

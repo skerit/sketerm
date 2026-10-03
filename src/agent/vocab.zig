@@ -54,6 +54,15 @@ pub const State = enum {
             .starting, .working, .waiting_subagent, .waiting_background, .retrying, .disconnected => false,
         };
     }
+
+    /// Long silence here is worth a `stalled` event (`stall_after_min`): the
+    /// agent should be doing something. A lost link raises its own events.
+    pub fn stallWatched(self: State) bool {
+        return switch (self) {
+            .starting, .working, .waiting_subagent, .waiting_background, .retrying => true,
+            .idle, .waiting_user, .exited, .disconnected => false,
+        };
+    }
 };
 
 pub const RecordKind = enum {
@@ -73,6 +82,9 @@ pub const EventKind = enum {
     /// A lost link to the agent's session is back (always on, so a waiter
     /// learns it without polling).
     connection_restored,
+    /// No screen or record change for the caller's `stall_after_min` while
+    /// the agent should be working (`State.stallWatched`); once per silence.
+    stalled,
     /// Every completed assistant message (opt-in).
     message,
     /// A completed assistant message containing the caller's text (opt-in).
@@ -82,7 +94,7 @@ pub const EventKind = enum {
     /// never be suppressed; the rest are opt-in and rate limited.
     pub fn alwaysOn(self: EventKind) bool {
         return switch (self) {
-            .done, .needs_input, .@"error", .exited, .connection_lost, .connection_restored => true,
+            .done, .needs_input, .@"error", .exited, .connection_lost, .connection_restored, .stalled => true,
             .message, .match => false,
         };
     }
@@ -93,7 +105,7 @@ pub const EventKind = enum {
     pub fn coalesces(self: EventKind) bool {
         return switch (self) {
             .@"error", .connection_lost, .connection_restored => true,
-            .done, .needs_input, .exited, .message, .match => false,
+            .done, .needs_input, .exited, .stalled, .message, .match => false,
         };
     }
 
@@ -102,7 +114,7 @@ pub const EventKind = enum {
     pub fn announcesRecord(self: EventKind) bool {
         return switch (self) {
             .done, .message, .match => true,
-            .needs_input, .@"error", .exited, .connection_lost, .connection_restored => false,
+            .needs_input, .@"error", .exited, .connection_lost, .connection_restored, .stalled => false,
         };
     }
 
@@ -111,10 +123,11 @@ pub const EventKind = enum {
     /// prompt waiting for an answer, which outranks a finished turn).
     pub fn outcomeRank(self: EventKind) u8 {
         return switch (self) {
-            .exited => 7,
-            .connection_lost => 6,
-            .needs_input => 5,
-            .@"error" => 4,
+            .exited => 8,
+            .connection_lost => 7,
+            .needs_input => 6,
+            .@"error" => 5,
+            .stalled => 4,
             .done => 3,
             .connection_restored => 2,
             .match => 1,
@@ -128,7 +141,7 @@ pub const EventKind = enum {
     pub fn settlesTurn(self: EventKind) bool {
         return switch (self) {
             .done, .needs_input, .@"error", .exited => true,
-            .connection_lost, .connection_restored, .message, .match => false,
+            .connection_lost, .connection_restored, .stalled, .message, .match => false,
         };
     }
 };
@@ -218,7 +231,7 @@ test "event kinds: always-on and coalescing facts" {
         // Only always-on kinds bypass the limiter, so only they may coalesce.
         if (k.coalesces()) try t.expect(k.alwaysOn());
     }
-    try t.expectEqual(@as(usize, 6), always);
+    try t.expectEqual(@as(usize, 7), always);
     try t.expect(EventKind.connection_restored.alwaysOn());
     try t.expect(!EventKind.message.alwaysOn());
     try t.expect(!EventKind.done.coalesces());
@@ -226,7 +239,7 @@ test "event kinds: always-on and coalescing facts" {
 
 test "outcome ranks are distinct and put an ended agent first" {
     const t = std.testing;
-    var seen = std.StaticBitSet(8).initEmpty();
+    var seen = std.StaticBitSet(9).initEmpty();
     for (std.enums.values(EventKind)) |k| {
         try t.expect(!seen.isSet(k.outcomeRank()));
         seen.set(k.outcomeRank());
@@ -282,4 +295,8 @@ test "an idle agent and one with background tasks take prompts; a busy one does 
     for (std.enums.values(EventKind)) |k| if (k.settlesTurn()) try t.expect(k.alwaysOn());
     try t.expect(State.working.queuesPrompt());
     try t.expect(!State.waiting_user.queuesPrompt());
+    // A settled agent is never watched for a stall; a stall settles nothing.
+    for (std.enums.values(State)) |s| if (s.settled()) try t.expect(!s.stallWatched());
+    try t.expect(State.waiting_background.stallWatched());
+    try t.expect(!EventKind.stalled.settlesTurn());
 }

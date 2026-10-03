@@ -43,6 +43,7 @@ const launch = @import("../agent/launch.zig");
 const screen_source = @import("../agent/screen_source.zig");
 const opencode = @import("../agent/opencode.zig");
 const retry_mod = @import("../agent/retry.zig");
+const stall_mod = @import("../agent/stall.zig");
 const brief = @import("../agent/brief.zig");
 const mcpassets = @import("mcpassets.zig");
 const wire = @import("../mux/wire.zig");
@@ -236,6 +237,8 @@ pub const Entry = struct {
     ended_ms: i64 = 0,
     /// `retry_on_overload`: the policy and its episode on the agent's queue.
     retry: retry_mod.Tracker = .{},
+    /// `stall_after_min`: one `stalled` event per silence.
+    stall: stall_mod.Tracker = .{},
     /// An action (a recipe, an API call) runs on the agent now: a retry
     /// never types into it.
     acting: u32 = 0,
@@ -566,6 +569,7 @@ pub fn dueInMs(now_ms: i64) ?i64 {
             const x = @max(0, at - now_ms);
             due = if (due) |y| @min(x, y) else x;
         }
+        if (e.stall.dueIn(e.agent.state(), e.agent.lastActivityMs(), now_ms)) |x| due = if (due) |y| @min(x, y) else x;
         if (e.forward) |f| if (f.exited) {
             const x = @max(0, e.forward_retry_ms - now_ms);
             due = if (due) |y| @min(x, y) else x;
@@ -605,6 +609,10 @@ pub fn service(now_ms: i64) void {
         }
     }
     serviceRetries(now_ms);
+    for (state.entries.items) |e| {
+        // A relaunch swaps the terminal: its silence is the adapter's.
+        if (!e.relaunching) _ = e.stall.check(e.agent.queue(), e.agent.state(), e.agent.lastActivityMs(), now_ms) catch {};
+    }
     servicePush(now_ms);
     state.waiter.service(now_ms);
 }
@@ -690,6 +698,20 @@ fn retryPolicyFrom(arena: std.mem.Allocator, v: std.json.Value, why: *Fail) !?re
         }
     }
     return if (p.max == 0) null else p;
+}
+
+/// agent_open's / agent_set's `stall_after_min`: minutes, 0 or null = off.
+fn stallFrom(arena: std.mem.Allocator, v: std.json.Value, why: *Fail) !?u32 {
+    const n: i64 = switch (v) {
+        .null => return null,
+        .integer => |x| x,
+        else => -1,
+    };
+    if (n < 0 or n > stall_mod.MAX_MIN) {
+        why.* = .{ .code = .invalid_args, .msg = try std.fmt.allocPrint(arena, "stall_after_min must be an integer 0-{d} (minutes; 0 turns it off)", .{stall_mod.MAX_MIN}) };
+        return error.Refused;
+    }
+    return if (n == 0) null else @intCast(n);
 }
 
 /// Set `e`'s retry policy; a pending retry of a policy turned off gives up.
@@ -1728,6 +1750,7 @@ fn finish(arena: std.mem.Allocator, res: *Res, e: *Entry, dv: Delivered, watch: 
     try res.fact("transport", @tagName(e.transport));
     try goneFacts(arena, res, e);
     try retryFacts(res, e);
+    if (e.stall.after_min) |m| try res.fact("stall_after_min", m);
 
     var message: ?[]const u8 = null;
     var job_block: ?Block = null;
@@ -2025,6 +2048,8 @@ const OpenOpts = struct {
     keep_id: ?[]const u8 = null,
     /// `retry_on_overload`; null = off.
     retry: ?retry_mod.Policy = null,
+    /// `stall_after_min`; null = off.
+    stall: ?u32 = null,
 };
 
 /// A conversation id travels on the app's argv and in an API path, so only
@@ -2183,8 +2208,10 @@ fn openOpts(arena: std.mem.Allocator, args: std.json.Value, loaded: *const adapt
         }
     }
     const retry = if (mcp.argValue(args, "retry_on_overload")) |v| try retryPolicyFrom(arena, v, why) else null;
+    const stall = if (mcp.argValue(args, "stall_after_min")) |v| try stallFrom(arena, v, why) else null;
     return .{
         .retry = retry,
+        .stall = stall,
         .name = name,
         .resume_id = resume_id,
         .override = override,
@@ -2350,6 +2377,7 @@ fn startAgent(arena: std.mem.Allocator, loaded: *const adapter.Loaded, o: *OpenO
         return err;
     };
     setRetryPolicy(e, o.retry);
+    e.stall.set(o.stall, clock.nowMs());
     if (claim.*) |cl| {
         e.claim = cl;
         claim.* = null;
@@ -3952,27 +3980,42 @@ fn setTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]const u
     const model = argStr(args, "model");
     const effort = argStr(args, "effort");
     const retry_arg = mcp.argValue(args, "retry_on_overload");
-    if (model == null and effort == null and retry_arg == null) return errRes(arena, .invalid_args, "agent_set needs 'model', 'effort' and/or 'retry_on_overload'");
+    const stall_arg = mcp.argValue(args, "stall_after_min");
+    if (model == null and effort == null and retry_arg == null and stall_arg == null) return errRes(arena, .invalid_args, "agent_set needs 'model', 'effort', 'retry_on_overload' and/or 'stall_after_min'");
     inline for (.{ "model", "effort" }) |key| {
         if (argStr(args, key)) |v| if (!launch.validValue(v)) return errRes(arena, .invalid_args, key ++ " must be 1-256 printable characters");
     }
     // Refused before anything is typed, stopped or restarted.
     if (effort) |x| if (!launch.validEffort(e.loaded.spec.launch, x)) return errRes(arena, .invalid_args, try effortRefusal(arena, e.loaded));
-    if (retry_arg) |v| {
+    // The settings that apply at any time: both checked before either is set.
+    if (retry_arg != null or stall_arg != null) {
         var why: Fail = undefined;
-        const p = retryPolicyFrom(arena, v, &why) catch |err| switch (err) {
+        const p = if (retry_arg) |v| retryPolicyFrom(arena, v, &why) catch |err| switch (err) {
             error.Refused => return errRes(arena, why.code, why.msg),
             else => return err,
-        };
-        setRetryPolicy(e, p);
+        } else null;
+        const stall = if (stall_arg) |v| stallFrom(arena, v, &why) catch |err| switch (err) {
+            error.Refused => return errRes(arena, why.code, why.msg),
+            else => return err,
+        } else null;
+        if (retry_arg != null) setRetryPolicy(e, p);
+        if (stall_arg != null) e.stall.set(stall, clock.nowMs());
         writeDescriptor(e);
         service(clock.nowMs());
         if (model == null and effort == null) {
             var res = Res.init(arena);
-            if (p) |x|
-                try res.textf("{s}: retry_on_overload on: up to {d} retr{s} per job, the first after {d} s, doubling", .{ e.id, x.max, if (x.max == 1) "y" else "ies", x.backoff_s })
-            else
-                try res.textf("{s}: retry_on_overload off", .{e.id});
+            if (retry_arg != null) {
+                if (p) |x|
+                    try res.textf("{s}: retry_on_overload on: up to {d} retr{s} per job, the first after {d} s, doubling", .{ e.id, x.max, if (x.max == 1) "y" else "ies", x.backoff_s })
+                else
+                    try res.textf("{s}: retry_on_overload off", .{e.id});
+            }
+            if (stall_arg != null) {
+                if (stall) |m|
+                    try res.textf("{s}: stall_after_min {d}: one stalled event when it shows nothing for {d} minutes while busy", .{ e.id, m, m })
+                else
+                    try res.textf("{s}: stall_after_min off", .{e.id});
+            }
             try res.fact("relaunched", false);
             return finish(arena, &res, e, try pending(arena, e), .{}, &.{});
         }
@@ -4200,6 +4243,7 @@ fn listTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
         recordings: []const []const u8,
         permissions: ?std.json.Value,
         retry_on_overload: ?retry_mod.Policy,
+        stall_after_min: ?u32,
         relaunchable: ?bool,
         gone_reason: ?[]const u8,
     };
@@ -4247,6 +4291,7 @@ fn listTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
             .recordings = e.recordings.items,
             .permissions = if (e.extra.permissions.len > 0) try permissionsValue(arena, e.extra.permissions) else null,
             .retry_on_overload = e.retry.policy,
+            .stall_after_min = e.stall.after_min,
             .relaunchable = relaunchableOf(e),
             .gone_reason = if (e.gone_why) |g| g.reasonName() else null,
         };
@@ -4443,6 +4488,7 @@ fn writeDescriptor(e: *Entry) void {
         .login_shell = e.extra.login_shell,
         .permissions = e.extra.permissions,
         .retry_on_overload = e.retry.policy,
+        .stall_after_min = e.stall.after_min orelse 0,
         .started_ms = e.started_ms,
         .gone_ms = e.ended_ms,
     };
@@ -4819,6 +4865,7 @@ fn reattachOne(arena: std.mem.Allocator, d: Descriptor, claim: ?agentindex.Claim
     parts = .{};
     state.entries.appendAssumeCapacity(e);
     setRetryPolicy(e, d.retry_on_overload);
+    e.stall.set(if (d.stall_after_min > 0) d.stall_after_min else null, clock.nowMs());
     // An adopted session's past is history: it arms no turn. A server
     // whose forward is down answers once `service` brings it back.
     if (loaded.spec.source == .opencode_api) {
@@ -4934,6 +4981,7 @@ fn relaunchFrom(arena: std.mem.Allocator, args: std.json.Value, d: Descriptor, c
         },
         .extra = .{ .args = d.args, .server_args = d.server_args, .tui_args = d.tui_args, .env = d.env, .path_prepend = d.path_prepend, .login_shell = d.login_shell, .permissions = d.permissions },
         .retry = d.retry_on_overload,
+        .stall = if (d.stall_after_min > 0) d.stall_after_min else null,
         .name = d.name,
         .keep_id = d.id,
     };
@@ -5263,6 +5311,7 @@ test "argument validation refuses before anything is spawned" {
     try expectError(a, "agent_open", try rig.call(.agent_open, "{\"app\":\"claude\",\"binary\":\"/nonexistent/claude\"}"), "unavailable");
     try expectError(a, "agent_open", try rig.call(.agent_open, "{\"app\":\"claude\",\"cwd\":\"relative\"}"), "invalid_args");
     try expectError(a, "agent_open", try rig.call(.agent_open, "{\"app\":\"claude\",\"model\":\"a\\nb\"}"), "invalid_args");
+    try expectError(a, "agent_open", try rig.call(.agent_open, "{\"app\":\"claude\",\"stall_after_min\":100000}"), "invalid_args");
     // A wrapper's args and env: refused whole, never cleaned up (the rules
     // themselves are launch.checkExtra's, tested there).
     for ([_][]const u8{
@@ -5452,6 +5501,15 @@ test "every per-agent result shape is declared: a live agent on a scripted scree
     try expectError(a, "agent_send", try rig.call(.agent_send, "{\"text\":\"hi\"}"), "unavailable");
     try expectError(a, "agent_answer", try rig.call(.agent_answer, "{\"choice\":\"Yes\"}"), "conflict");
     try expectError(a, "agent_set", try rig.call(.agent_set, "{}"), "invalid_args");
+    // The stall alarm: set at any time, a fact while on, refused out of range.
+    const stall_on = try shaped(a, "agent_set", try rig.call(.agent_set, "{\"stall_after_min\":30}"));
+    try testing.expectEqual(@as(i64, 30), stall_on.get("stall_after_min").?.integer);
+    try testing.expectEqual(@as(?u32, 30), e.stall.after_min);
+    try expectError(a, "agent_set", try rig.call(.agent_set, "{\"stall_after_min\":-1}"), "invalid_args");
+    try expectError(a, "agent_set", try rig.call(.agent_set, "{\"stall_after_min\":\"5\"}"), "invalid_args");
+    try testing.expectEqual(@as(?u32, 30), e.stall.after_min);
+    const stall_off = try shaped(a, "agent_set", try rig.call(.agent_set, "{\"stall_after_min\":0}"));
+    try testing.expect(stall_off.get("stall_after_min") == null);
 
     const closed = try mcp.expectToolResultShape(a, "agent_close", try rig.call(.agent_close, "{}"));
     try testing.expect(closed.object.get("structuredContent").?.object.get("closed").?.bool);

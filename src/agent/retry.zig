@@ -200,7 +200,7 @@ pub const Tracker = struct {
                     self.release(q);
                     return .{ .gave_up = .{ .why = .exited, .attempts = n, .text = ev.text } };
                 },
-                .connection_lost, .connection_restored, .message, .match => {},
+                .connection_lost, .connection_restored, .stalled, .message, .match => {},
             }
         }
         return .none;

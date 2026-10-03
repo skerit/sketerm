@@ -1044,7 +1044,8 @@ on a free loopback port, read over its HTTP API and SSE stream, with
 - **Waiting.** `agent_send`, `agent_answer`, `agent_open prompt` and
   `agent_wait` wait (bounded, default 60 s, at most 120 s) on the agent's
   event queue. Always-on wake-ups (`done`, `needs_input`, `error`,
-  `exited`, `connection_lost`, `connection_restored`) end every wait, except an `error` whose
+  `exited`, `connection_lost`, `connection_restored`, and `stalled` for
+  an agent opened with `stall_after_min`) end every wait, except an `error` whose
   class the agent recovers from by itself (`retrying`: "servers
   overloaded", a provider retry; `vocab.ErrorClass.wakesByDefault`),
   which wakes only a caller that passes `retrying:true` (waiter
@@ -1523,6 +1524,21 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   `used`, `pending`, `next_in_ms`). `src/agent/retry.zig` is the one
   policy, unit-tested on fake error sequences; the MCP layer only types the
   prompt (never while a recipe runs on the agent).
+- **Stall alarm (`stall_after_min`, `capabilities.agent_stall`).** Off by
+  default. `agent_open` or `agent_set` `stall_after_min: N` (minutes,
+  1-1440; 0 or null = off) raises ONE always-on `stalled` event when the
+  agent shows no screen or record change for N minutes while it should
+  be busy (`vocab.State.stallWatched`: starting, working, waiting on
+  subagents or background tasks, retrying; never idle, waiting on the
+  user, exited or disconnected), with the minutes and the state in its
+  text (the state also as `detail`). It wakes every waiter and wait like
+  `done` (the caller opted in by setting it) but settles no turn, and it
+  re-arms only after the agent shows something again, so a wedged app
+  costs one wake-up, not one per wait. It is silence only, no process
+  inspection: an agent thinking for longer than N minutes without drawing
+  raises it too. The value is kept in the descriptor (relaunches and
+  reattaches keep it), reported as `stall_after_min` on every per-agent
+  result and `agent_list detail`; `src/agent/stall.zig` is the one rule.
 - **Remote agents never die with the link.** With `host`, `auto` runs the
   agent on the host's own sketerm-mux, deploying the portable one there
   when the host has none (`src/mux/deploy.zig`, the deployer every first
