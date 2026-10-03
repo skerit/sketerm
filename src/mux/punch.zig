@@ -61,6 +61,15 @@ pub fn clientEndpoint(ssh_connection: []const u8, port: u16) ?Endpoint {
     return .{ .ip = ip, .port = port };
 }
 
+/// The "lo:hi" shape `--udp-port` takes: two all-digit halves around one colon; values are the listener's to judge.
+pub fn validPortRange(value: []const u8) bool {
+    const colon = std.mem.indexOfScalar(u8, value, ':') orelse return false;
+    if (colon == 0 or colon + 1 == value.len or std.mem.indexOfScalarPos(u8, value, colon + 1, ':') != null) return false;
+    for (value[0..colon]) |byte| if (byte < '0' or byte > '9') return false;
+    for (value[colon + 1 ..]) |byte| if (byte < '0' or byte > '9') return false;
+    return true;
+}
+
 const nowMs = @import("../util/clock.zig").nowMs;
 
 /// Bounded single-line read: first '\n'-terminated line within
@@ -88,6 +97,27 @@ pub fn readLine(fd: c_int, timeout_ms: i64, buf: []u8) ?[]const u8 {
         if (std.mem.indexOfScalar(u8, buf[0..len], '\n')) |nl| return buf[0..nl];
     }
     return null;
+}
+
+test "validPortRange accepts only two all-digit halves around one colon" {
+    const t = std.testing;
+    try t.expect(validPortRange("1:1"));
+    try t.expect(validPortRange("0:65535"));
+    try t.expect(validPortRange("40000:40100"));
+    // Digits only: the range is passed to a listener, never parsed here.
+    try t.expect(validPortRange("99999999:1"));
+    // No colon, an empty half on either side, or a second colon.
+    try t.expect(!validPortRange(""));
+    try t.expect(!validPortRange("40000"));
+    try t.expect(!validPortRange(":40000"));
+    try t.expect(!validPortRange("40000:"));
+    try t.expect(!validPortRange("1:2:3"));
+    // Anything non-digit in either half.
+    try t.expect(!validPortRange("40000:4x100"));
+    try t.expect(!validPortRange("60000:61k"));
+    try t.expect(!validPortRange("-1:5"));
+    try t.expect(!validPortRange("4 0:50"));
+    try t.expect(!validPortRange(" 60000:61000"));
 }
 
 test "punch line round-trips through format and parse" {

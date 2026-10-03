@@ -43,16 +43,6 @@ const capabilities = @import("capabilities.zig");
 
 // === UDP connection tickets ================================
 
-/// "lo:hi", digits only — same shape --udp-port accepts.
-fn validTicketRange(value: []const u8) bool {
-    const colon = std.mem.indexOfScalar(u8, value, ':') orelse return false;
-    if (colon == 0 or colon + 1 == value.len) return false;
-    if (std.mem.indexOfScalarPos(u8, value, colon + 1, ':') != null) return false;
-    for (value[0..colon]) |byte| if (byte < '0' or byte > '9') return false;
-    for (value[colon + 1 ..]) |byte| if (byte < '0' or byte > '9') return false;
-    return true;
-}
-
 fn udpTicketErr(cl: *Client, msg: []const u8) void {
     cl.queueJson(.udp_ticket, .{ .ok = false, .@"error" = msg });
 }
@@ -86,7 +76,7 @@ pub fn handleUdpTicketReq(self: *Daemon, cl: *Client, payload: []const u8) void 
         if (std.json.parseFromSlice(Req, self.allocator, payload, .{ .ignore_unknown_fields = true })) |p| {
             defer p.deinit();
             if (p.value.range) |r| {
-                if (!validTicketRange(r)) return udpTicketErr(cl, "bad port range");
+                if (!punch.validPortRange(r)) return udpTicketErr(cl, "bad port range");
                 range = std.fmt.bufPrintZ(&range_buf, "{s}", .{r}) catch return udpTicketErr(cl, "bad port range");
             }
         } else |_| return udpTicketErr(cl, "bad request");
@@ -188,19 +178,6 @@ pub fn handleUdpTicketReq(self: *Daemon, cl: *Client, payload: []const u8) void 
     };
     log.info("udp ticket minted: port {d}", .{ann.port});
     cl.queueJson(.udp_ticket, .{ .ok = true, .port = ann.port, .key = ann.keyhex });
-}
-
-test "a ticket port range is exactly the lo:hi shape --udp-port takes" {
-    const t = std.testing;
-    try t.expect(validTicketRange("60000:61000"));
-    try t.expect(validTicketRange("1:1"));
-    try t.expect(!validTicketRange(""));
-    try t.expect(!validTicketRange("60000"));
-    try t.expect(!validTicketRange(":61000"));
-    try t.expect(!validTicketRange("60000:"));
-    try t.expect(!validTicketRange("60000:61000:62000"));
-    try t.expect(!validTicketRange("60000:61k"));
-    try t.expect(!validTicketRange(" 60000:61000"));
 }
 
 test "a ticket refusal is answered on the udp_ticket frame the client waits for" {

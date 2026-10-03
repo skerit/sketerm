@@ -947,7 +947,7 @@ pub const Conn = struct {
         // A live route's background UDP upgrade lands here: refuse at once.
         if (RouteSpec.isRoute(host)) return error.RouteIsSshOnly;
         if (!validSshHost(host)) return error.BadPath;
-        if (port_range) |r| if (!validPortRange(r)) return error.BadPath;
+        if (port_range) |r| if (!@import("punch.zig").validPortRange(r)) return error.BadPath;
 
         // 0. Resolve the UDP target through the user's ssh config
         //    FIRST: a proxied host can never work over UDP, and
@@ -1227,14 +1227,6 @@ pub const Conn = struct {
         var port_buf: [8]u8 = undefined;
         const port = std.fmt.bufPrint(&port_buf, "{d}", .{ticket.port}) catch unreachable;
         return connectUdpBridge(allocator, udp_host, port, ticket.keyhex(), -1, deadline);
-    }
-
-    fn validPortRange(value: []const u8) bool {
-        const colon = std.mem.indexOfScalar(u8, value, ':') orelse return false;
-        if (colon == 0 or colon + 1 == value.len or std.mem.indexOfScalarPos(u8, value, colon + 1, ':') != null) return false;
-        for (value[0..colon]) |byte| if (byte < '0' or byte > '9') return false;
-        for (value[colon + 1 ..]) |byte| if (byte < '0' or byte > '9') return false;
-        return true;
     }
 
     /// Connect to a REMOTE host's daemon by running
@@ -2332,25 +2324,6 @@ fn panelIdentitySupport(allocator: std.mem.Allocator, payload: []const u8) !Pane
     if (panel_rpc >= wire.PANEL_RPC_VERSION) return .current;
     if (!(parsed.value.attach_identity orelse false)) return .legacy;
     return .unsupported;
-}
-
-test "validPortRange accepts only two all-digit halves around one colon" {
-    const t = std.testing;
-    try t.expect(Conn.validPortRange("1:1"));
-    try t.expect(Conn.validPortRange("0:65535"));
-    try t.expect(Conn.validPortRange("40000:40100"));
-    // Digits only: the range is passed to a remote listener, never parsed here.
-    try t.expect(Conn.validPortRange("99999999:1"));
-    // No colon, an empty half on either side, or a second colon.
-    try t.expect(!Conn.validPortRange(""));
-    try t.expect(!Conn.validPortRange("40000"));
-    try t.expect(!Conn.validPortRange(":40000"));
-    try t.expect(!Conn.validPortRange("40000:"));
-    try t.expect(!Conn.validPortRange("1:2:3"));
-    // Anything non-digit in either half.
-    try t.expect(!Conn.validPortRange("40000:4x100"));
-    try t.expect(!Conn.validPortRange("-1:5"));
-    try t.expect(!Conn.validPortRange("4 0:50"));
 }
 
 test "panel identity support requires a valid positive capability classification" {
