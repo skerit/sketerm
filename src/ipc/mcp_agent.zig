@@ -263,7 +263,9 @@ pub const Entry = struct {
 
     /// Free the entry. `kill` ends the sessions it owns; otherwise they
     /// keep running on the daemon (this server exiting, or another one
-    /// taking the agent over). Its index claim is let go either way.
+    /// taking the agent over). Its index claim is let go either way, and
+    /// its port forward always ends: it is this server's own ssh, whose
+    /// session name the agent's next start or attach asks for again.
     fn destroy(self: *Entry, kill: bool) void {
         const a = self.allocator;
         self.agent.deinit();
@@ -280,7 +282,7 @@ pub const Entry = struct {
             .borrowed => {},
         };
         if (self.server) |t| if (kill) t.deinit() else t.detach();
-        if (self.forward) |t| if (kill) t.deinit() else t.detach();
+        if (self.forward) |t| t.deinit();
         self.freeFields();
         a.destroy(self);
     }
@@ -1048,7 +1050,8 @@ fn lostReason(e: *const Entry, buf: []u8) []const u8 {
 fn reviveForward(e: *Entry, now_ms: i64) void {
     const f = e.forward orelse return;
     f.drain();
-    if (!f.exited or now_ms < e.forward_retry_ms) return;
+    // A gone agent's server is not coming back behind it.
+    if (!f.exited or now_ms < e.forward_retry_ms or gone(e)) return;
     e.forward_retry_ms = now_ms + FORWARD_RETRY_MS;
     var arena_state = std.heap.ArenaAllocator.init(state.allocator);
     defer arena_state.deinit();
@@ -1063,6 +1066,30 @@ fn reviveForward(e: *Entry, now_ms: i64) void {
 
 fn forwardName(arena: std.mem.Allocator, id: []const u8) ![]const u8 {
     return std.fmt.allocPrint(arena, "agent-{s}-forward", .{id});
+}
+
+/// How long a start waits for a stale session to give up its forward name.
+const FORWARD_NAME_WAIT_MS: i64 = 5_000;
+
+/// Start agent `id`'s port forward under its one name on this server's
+/// private daemon. A session still holding that name (a dead agent's
+/// forward, a previous server's on a durable instance's daemon) is ended
+/// first, so a relaunch or reattach under the same id gets its forward.
+fn spawnForward(arena: std.mem.Allocator, id: []const u8, host: []const u8, port: u16, remote_port: u16) !*termdrive.Term {
+    const name = try forwardName(arena, id);
+    if (mcp_term.spawnForwardTermNamed(arena, host, port, "127.0.0.1", remote_port, name)) |t| return t else |_| {}
+    if (state.mux_sock) |sock| if (muxclient.Conn.connectProbed(state.allocator, sock)) |conn_val| {
+        var conn = conn_val;
+        defer conn.deinit();
+        conn.sendKill(.{ .name = name }) catch {};
+    } else |_| {};
+    const until = clock.nowMs() + FORWARD_NAME_WAIT_MS;
+    while (true) {
+        pumpFor(200);
+        if (mcp_term.spawnForwardTermNamed(arena, host, port, "127.0.0.1", remote_port, name)) |t| return t else |err| {
+            if (clock.nowMs() >= until) return err;
+        }
+    }
 }
 
 /// A call on an agent whose link is lost retries it at once (in the
@@ -2888,7 +2915,7 @@ fn spawnApi(arena: std.mem.Allocator, loaded: *const adapter.Loaded, binary: []c
     var forward: ?*termdrive.Term = null;
     errdefer if (forward) |f| f.deinit();
     if (where.host) |h| {
-        const f = mcp_term.spawnForwardTermNamed(arena, h, port, "127.0.0.1", server_port, try forwardName(arena, id)) catch {
+        const f = spawnForward(arena, id, h, port, server_port) catch {
             why.* = .{ .code = .unavailable, .msg = "could not start the port forward to the app's server" };
             return error.Refused;
         };
@@ -4858,8 +4885,7 @@ fn reattachOne(arena: std.mem.Allocator, d: Descriptor, claim: ?agentindex.Claim
         // free local port (the previous server's may still hold its port).
         if (d.host != null) {
             port = mcp_term.pickFreePort() orelse return error.NoFreePort;
-            const fname = try forwardName(arena, d.id);
-            parts.forward = mcp_term.spawnForwardTermNamed(arena, d.host.?, port, "127.0.0.1", d.remote_port, fname) catch null;
+            parts.forward = spawnForward(arena, d.id, d.host.?, port, d.remote_port) catch null;
             if (parts.forward) |f| _ = mcp_term.waitForwardReady(arena, f, port, 10_000) catch {};
         }
     }

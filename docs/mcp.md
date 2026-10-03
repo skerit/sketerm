@@ -1557,6 +1557,34 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   raises it too. The value is kept in the descriptor (relaunches and
   reattaches keep it), reported as `stall_after_min` on every per-agent
   result and `agent_list detail`; `src/agent/stall.zig` is the one rule.
+- **Relaunching after a reboot.** A relaunch of an agent whose app ended
+  under THIS server keeps that entry's hold on the agent's lock (it is never
+  let go and taken again), so it never needs `takeover`; an agent a live
+  OTHER server holds is still refused as `conflict` without it. Its port
+  forward (opencode on a host) is this server's own ssh under one name per
+  agent, `agent-<id>-forward`: a dropped entry always ends it, and a start
+  ends a session still holding the name first, so the relaunch sets the
+  forward up again under the same id and name (the old one, left running,
+  made every opencode relaunch fail with "could not start the port
+  forward"). What the resumed app reprints is history, never news: from
+  the start until the first prompt or answer sketerm sends (or a turn the
+  app starts itself) every record it shows is marked handed out and every
+  `done`/`message` event announcing one delivered (`foldHistory`; a long
+  reprint lands after the app reads ready, which once put a `done` with an
+  hours-old answer in the relaunch result and `agent_read final`), and a
+  relaunch from the same server also carries the gone entry's handed-out
+  content keys.
+- **Unreachable hosts (`capabilities.ssh_connect_timeout_s`).** Every ssh
+  and scp leg passes `ConnectTimeout=10` (`sshroute.Args.options`), so a
+  host that is down fails within that bound instead of the kernel's ~2
+  minutes; a leg riding a live ControlMaster opens no TCP connection and
+  is unaffected. When ssh's own line says it could not reach the host
+  (`sshroute.unreachableLine`: connect to host, unknown name, banner
+  timeout), the connect is not retried and `term_open`, `agent_open`
+  (probe or spawn) and `agent_attach` answer error `host_unreachable` with
+  the host and ssh's line (`term_open`: details `host`, `ssh_error`)
+  instead of falling back to a plain ssh session that would only fail
+  later.
 - **Remote agents never die with the link.** With `host`, `auto` runs the
   agent on the host's own sketerm-mux, deploying the portable one there
   when the host has none (`src/mux/deploy.zig`, the deployer every first

@@ -8430,6 +8430,14 @@ fn agentSshStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u
         const recalled = agentCall(&m, arena, "agent_send", "{\"agent\":\"claude-gone\",\"text\":\"recall\",\"timeout_ms\":20000}", "gone: recall", false, 45_000);
         expectFact(recalled, "message", "first prompt was: before the loss", "gone: the relaunch resumed the conversation");
 
+        // An opencode agent on the same host: its API rides this server's
+        // own port forward, which outlives the host's reboot.
+        const oc = agentCall(&m, arena, "agent_open", "{\"app\":\"opencode\",\"name\":\"oc-gone\",\"host\":\"fakehost\",\"binary\":\"sk-fake-opencode\",\"timeout_ms\":45000}", "gone: agent_open opencode", false, 60_000);
+        if (!oc.get("ready").?.bool) fail("gone: the remote opencode is not ready");
+        const oc_id = arena.dupe(u8, scStr(oc, "agent", "gone: agent_open opencode")) catch fail("oom");
+        const oc_sent = agentCall(&m, arena, "agent_send", "{\"agent\":\"oc-gone\",\"text\":\"before the reboot\",\"timeout_ms\":20000}", "gone: opencode prompt", false, 45_000);
+        expectFact(oc_sent, "outcome", "done", "gone: opencode answers before the reboot");
+
         // The host reboots while the link is down: a fresh daemon that has
         // neither the session nor a record of it.
         cutRemoteLink(down, rt_env);
@@ -8445,9 +8453,45 @@ fn agentSshStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u
         expectFact(rebooted, "outcome", "exited", "gone: a rebooted host's fresh daemon ends the agent");
         expectFact(rebooted, "gone_reason", "unknown", "gone: a fresh daemon keeps no record");
         if (!rebooted.get("relaunchable").?.bool) fail("gone: not relaunchable after the reboot");
+        {
+            const until = nowMs() + 30_000;
+            while (true) {
+                const l = agentCall(&m, arena, "agent_list", "{\"detail\":true}", "gone: agent_list after the reboot", false, 15_000);
+                var oc_exited = false;
+                for (l.get("agents").?.array.items) |it| {
+                    if (std.mem.eql(u8, it.object.get("agent").?.string, oc_id) and std.mem.eql(u8, it.object.get("state").?.string, "exited")) oc_exited = true;
+                }
+                if (oc_exited) break;
+                if (nowMs() > until) fail("gone: the remote opencode never read as exited after the reboot");
+                _ = c.usleep(500_000);
+            }
+        }
+        // Relaunched under the same id and name, its forward set up again
+        // (the dead agent's forward session still held the name).
+        const oc_back = agentCall(&m, arena, "agent_attach", "{\"agent\":\"oc-gone\",\"relaunch\":true,\"timeout_ms\":45000}", "gone: relaunch opencode", false, 60_000);
+        expectFact(oc_back, "attach", "relaunched", "gone: opencode relaunched");
+        expectFact(oc_back, "agent", oc_id, "gone: opencode keeps its id");
+        expectFact(oc_back, "name", "oc-gone", "gone: opencode keeps its name");
+        const oc_after = agentCall(&m, arena, "agent_send", "{\"agent\":\"oc-gone\",\"text\":\"after the reboot\",\"timeout_ms\":20000}", "gone: opencode prompt after relaunch", false, 45_000);
+        expectFact(oc_after, "outcome", "done", "gone: the relaunched opencode answers");
+        // This server's own gone entry never blocks its relaunch: no takeover.
+        const cl_back = agentCall(&m, arena, "agent_attach", "{\"agent\":\"claude-gone\",\"relaunch\":true,\"timeout_ms\":45000}", "gone: relaunch claude after the reboot", false, 60_000);
+        expectFact(cl_back, "attach", "relaunched", "gone: claude relaunched without takeover");
+        if (eventKinds(cl_back, "done") != 0) fail("gone: the relaunch result replays an old done");
+        // The fake reprints its last past turn only after it is ready.
+        _ = c.usleep(3_500_000);
+        const old_final = agentCall(&m, arena, "agent_read", "{\"agent\":\"claude-gone\",\"final\":true}", "gone: agent_read final after relaunch", false, 15_000);
+        if (old_final.get("records").?.array.items.len != 0 or eventKinds(old_final, "done") != 0) {
+            say(std.json.Stringify.valueAlloc(arena, old_final.get("records").?, .{}) catch "?");
+            fail("gone: agent_read final after a relaunch hands out an old message as new");
+        }
+        // What it answers next is news again.
+        const fresh = agentCall(&m, arena, "agent_send", "{\"agent\":\"claude-gone\",\"text\":\"after the reboot\",\"timeout_ms\":20000}", "gone: claude prompt after relaunch", false, 45_000);
+        expectFact(fresh, "message", "echo: after the reboot", "gone: the relaunched claude's answer is delivered");
+        _ = agentCall(&m, arena, "agent_close", "{\"agent\":\"oc-gone\"}", "gone: agent_close opencode", false, 15_000);
         _ = agentCall(&m, arena, "agent_close", "{\"agent\":\"claude-gone\"}", "gone: agent_close", false, 15_000);
         m.closeStdinWait();
-        say("smoke-mcp: agents over ssh: a reconnect that finds the session closed, or a rebooted host, ends the agent as relaunchable; an unreachable host stays disconnected ok");
+        say("smoke-mcp: agents over ssh: a reconnect that finds the session closed, or a rebooted host, ends the agent as relaunchable; an unreachable host stays disconnected; both apps relaunch after a reboot under their id and name, nothing old handed out ok");
     }
     _ = c.kill(rpid, c.SIGTERM);
     _ = c.waitpid(rpid, null, 0);
