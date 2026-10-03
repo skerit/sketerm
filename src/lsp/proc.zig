@@ -295,6 +295,13 @@ pub fn resolveOnPath(alloc: std.mem.Allocator, command: []const u8) ?[]u8 {
     return null;
 }
 
+/// `servers.ExistsFn` against this host's filesystem: does `<dir>/<name>` exist?
+pub fn rootMarkerExists(_: ?*anyopaque, dir: []const u8, name: []const u8) bool {
+    var buf: [4096]u8 = undefined;
+    const full = std.fmt.bufPrintZ(&buf, "{s}/{s}", .{ dir, name }) catch return false;
+    return c.access(full.ptr, c.F_OK) == 0;
+}
+
 /// Whether `command` resolves on PATH (or is an existing absolute
 /// path). Used to skip a server SILENTLY when it is not installed —
 /// the one place we can tell "not configured" from "not present".

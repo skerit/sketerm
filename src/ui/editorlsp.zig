@@ -619,12 +619,6 @@ pub const Manager = struct {
         return @import("../lsp/proc.zig").onPath(self.alloc, command);
     }
 
-    fn dirExists(_: ?*anyopaque, dir: []const u8, name: []const u8) bool {
-        var buf: [4096]u8 = undefined;
-        const full = std.fmt.bufPrintZ(&buf, "{s}/{s}", .{ dir, name }) catch return false;
-        return c.access(full.ptr, c.F_OK) == 0;
-    }
-
     /// `cn` finished initializing: open every document of this face that
     /// was waiting for it (didOpen is refused before `.ready`).
     pub fn onServerReady(self: *Manager, cn: *Conn) void {
@@ -701,7 +695,7 @@ pub const Manager = struct {
         const srv = conf.lspServerForInstalled(lang, self, commandInstalled) orelse return;
 
         const dir = servers.dirnameOf(loc.path);
-        const root = servers.findRoot(dir, srv.root_files, dirExists, null);
+        const root = servers.findRoot(dir, srv.root_files, @import("../lsp/proc.zig").rootMarkerExists, null);
         dbg("{s} -> {s} ({s}) root={s}", .{ spec, srv.name, srv.command, root });
         const cn = registry.findConn(srv.name, root) orelse registry.spawnConn(srv, root) orelse {
             dbg("could not spawn {s}", .{srv.command});

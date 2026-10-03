@@ -6262,12 +6262,6 @@ pub const Daemon = struct {
         servers: []const LspOpenSrv = &.{},
     };
 
-    fn lspRootExists(_: ?*anyopaque, dir: []const u8, name: []const u8) bool {
-        var buf: [4096]u8 = undefined;
-        const full = std.fmt.bufPrintZ(&buf, "{s}/{s}", .{ dir, name }) catch return false;
-        return c.access(full.ptr, c.F_OK) == 0;
-    }
-
     /// Spawn a language server NEAR THE FILES: resolve the first
     /// installed candidate on THIS host's PATH, walk `dir` up for its
     /// root markers on THIS host's filesystem, fork it with stdio on a
@@ -6291,7 +6285,7 @@ pub const Daemon = struct {
         for (req.servers) |srv| {
             if (srv.command.len == 0) continue;
             if (!lsp_proc.onPath(self.allocator, srv.command)) continue;
-            const root = lsp_servers.findRoot(req.dir, srv.root_files, lspRootExists, null);
+            const root = lsp_servers.findRoot(req.dir, srv.root_files, lsp_proc.rootMarkerExists, null);
             var argv: std.ArrayList([]const u8) = .empty;
             defer argv.deinit(self.allocator);
             lsp_proc.splitArgs(self.allocator, srv.args, &argv) catch {};
