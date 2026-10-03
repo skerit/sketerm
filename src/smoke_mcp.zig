@@ -5916,7 +5916,61 @@ const FC_PERMISSION = FC_ERASE ++ "tool: Bash (rm notes.md)\r\nPermission Requir
 
 /// `history`: the late part of a resumed conversation's reprint, dropped
 /// once a prompt is typed (the real one reprints before its first turn).
-const FcStep = struct { at_ms: i64, bytes: []u8, picker: bool = false, history: bool = false };
+/// `side`: a step of the `/btw` panel, which fires while the panel holds
+/// back the turn's own steps; `side_erase` is the panel's erase count once
+/// it fired (`FcSide.erase`).
+const FcStep = struct { at_ms: i64, bytes: []u8, picker: bool = false, history: bool = false, side: bool = false, side_erase: ?usize = null };
+
+/// The `/btw` panel the fake shows, as Claude Code 2.1.288 draws it in ax
+/// mode (measured): below a running turn, above its live block (busy); or
+/// after a `you: /btw` echo, in place of the live block (idle).
+const FcSide = struct {
+    /// Rows to erase from the cursor to take the panel away, the live block
+    /// included while it shows (busy, or before an idle panel opened).
+    erase: usize,
+};
+
+const FC_SIDE_FOOTER_BUSY = "\xe2\x86\x91/\xe2\x86\x93 to scroll \xc2\xb7 c to copy \xc2\xb7 f to fork \xc2\xb7 Esc to close";
+const FC_SIDE_FOOTER_IDLE_PENDING = "\xe2\x87\xa7\xe2\x86\x90/\xe2\x86\x92 to browse \xc2\xb7 x to clear history \xc2\xb7 Esc to close";
+const FC_SIDE_FOOTER_IDLE = "\xe2\x87\xa7\xe2\x86\x90/\xe2\x86\x92 to browse \xc2\xb7 c to copy \xc2\xb7 f to fork \xc2\xb7 x to clear history \xc2\xb7 Esc to close";
+
+/// `n` rows erased upward from the cursor's, the cursor left at the top one.
+fn fcEraseRows(a: std.mem.Allocator, n: usize) []const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (1..n) |_| out.appendSlice(a, "\x1b[2K\x1b[1A") catch return "";
+    out.appendSlice(a, "\x1b[2K\x1b[G") catch return "";
+    return out.items;
+}
+
+/// Open the `/btw` panel for `text` (the typed line): pending first, its
+/// answer a moment later. A busy panel answers about the running turn, an
+/// idle one in two paragraphs and lists the earlier questions above it.
+fn fcSideOpen(allocator: std.mem.Allocator, steps: *std.ArrayList(FcStep), history: []const []const u8, text: []const u8, busy: bool) FcSide {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const asked = text["/btw ".len..];
+    if (busy) {
+        writeOut(std.fmt.allocPrint(a, FC_ERASE ++ "{s}\r\nAnswering\xe2\x80\xa6\r\nEsc to close\r\n" ++ FC_LIVE, .{text}) catch return .{ .erase = 4 });
+        const answer = std.fmt.allocPrint(a, "{s}{s}\r\nside answer to: {s}\r\nwhile working on the current turn\r\n" ++ FC_SIDE_FOOTER_BUSY ++ "\r\n" ++ FC_LIVE, .{ fcEraseRows(a, 7), text, asked }) catch return .{ .erase = 7 };
+        fcScheduleSide(allocator, steps, 400, answer, 8);
+        return .{ .erase = 7 };
+    }
+    writeOut(std.fmt.allocPrint(a, FC_ERASE ++ "you: {s}\r\nPerambulating\xe2\x80\xa6\r\n" ++ FC_LIVE, .{text}) catch return .{ .erase = 6 });
+    var open: std.ArrayList(u8) = .empty;
+    open.appendSlice(a, fcEraseRows(a, 5)) catch return .{ .erase = 6 };
+    for (history) |h| open.print(a, "{s}\r\n", .{h}) catch return .{ .erase = 6 };
+    open.print(a, "{s}\r\nAnswering\xe2\x80\xa6\r\n" ++ FC_SIDE_FOOTER_IDLE_PENDING, .{text}) catch return .{ .erase = 6 };
+    fcScheduleSide(allocator, steps, 100, open.items, history.len + 4);
+    const answer = std.fmt.allocPrint(a, "\x1b[2K\x1b[1A\x1b[2K\x1b[Gside answer to: {s}\r\n\r\nnothing is running\r\n" ++ FC_SIDE_FOOTER_IDLE, .{asked}) catch return .{ .erase = 6 };
+    fcScheduleSide(allocator, steps, 600, answer, history.len + 6);
+    return .{ .erase = 6 };
+}
+
+fn fcScheduleSide(allocator: std.mem.Allocator, steps: *std.ArrayList(FcStep), delay_ms: i64, bytes: []const u8, erase: usize) void {
+    const owned = allocator.dupe(u8, bytes) catch return;
+    steps.append(allocator, .{ .at_ms = nowMs() + delay_ms, .bytes = owned, .side = true, .side_erase = erase }) catch allocator.free(owned);
+}
 
 /// Where the fake Claude Code keeps what a real one keeps in ~/.claude:
 /// one transcript per conversation id, every launch's argv, and a marker
@@ -6100,16 +6154,25 @@ fn fakeClaude(allocator: std.mem.Allocator, args: []const [*:0]const u8) u8 {
     var model_choice: u8 = 0;
     // `go deaf` answered: every later byte is swallowed, nothing is drawn.
     var deaf = false;
+    // The `/btw` panel while it shows (it has the keyboard), and the
+    // questions asked so far (an idle panel lists them).
+    var side: ?FcSide = null;
+    var btw_history: std.ArrayList([]const u8) = .empty;
     while (true) {
         const now = nowMs();
         var i: usize = 0;
         while (i < steps.items.len) {
-            if (steps.items[i].at_ms > now) {
+            // The turn goes on behind the panel and draws once it closed.
+            const held = side != null and !steps.items[i].side and !steps.items[i].history;
+            if (steps.items[i].at_ms > now or held) {
                 i += 1;
                 continue;
             }
             const s = steps.orderedRemove(i);
             writeOut(s.bytes);
+            if (s.side_erase) |n| if (side) |*sd| {
+                sd.erase = n;
+            };
             if (s.picker) picker = true;
             if (std.mem.indexOf(u8, s.bytes, "\x1b]133;D") != null) fcStatus(allocator, args, true);
             allocator.free(s.bytes);
@@ -6122,6 +6185,25 @@ fn fakeClaude(allocator: std.mem.Allocator, args: []const [*:0]const u8) u8 {
         if (n < 0) continue;
         for (buf[0..@intCast(n)]) |b| {
             if (deaf) continue;
+            if (side) |sd| {
+                // Only Escape reaches the panel's owner; it closes the panel
+                // and nothing else (the real one's c/f/x are not modelled).
+                if (b != 0x1b) continue;
+                var k: usize = 0;
+                while (k < steps.items.len) {
+                    if (!steps.items[k].side) {
+                        k += 1;
+                        continue;
+                    }
+                    allocator.free(steps.orderedRemove(k).bytes);
+                }
+                var eb: [64 * 16]u8 = undefined;
+                var fba = std.heap.FixedBufferAllocator.init(&eb);
+                writeOut(fcEraseRows(fba.allocator(), sd.erase));
+                writeOut(FC_LIVE);
+                side = null;
+                continue;
+            }
             if (model_picker) {
                 const label = if (model_choice == 1) "Sonnet 4.5" else "Haiku 4.5";
                 switch (b) {
@@ -6173,7 +6255,12 @@ fn fakeClaude(allocator: std.mem.Allocator, args: []const [*:0]const u8) u8 {
                         allocator.free(steps.orderedRemove(k).bytes);
                     }
                     const text = input.items;
-                    if (std.mem.eql(u8, text, "/model")) {
+                    if (std.mem.startsWith(u8, text, "/btw ")) {
+                        var turn_running = false;
+                        for (steps.items) |st| turn_running = turn_running or (!st.history and !st.side);
+                        side = fcSideOpen(allocator, &steps, if (turn_running) &.{} else btw_history.items, text, turn_running);
+                        btw_history.append(allocator, allocator.dupe(u8, text) catch "") catch {};
+                    } else if (std.mem.eql(u8, text, "/model")) {
                         model_picker = true;
                         writeOut("\x1b]133;A\x07" ++ FC_ERASE ++ "you: /model\r\nSelect model\r\n1. Sonnet 4.5\r\n2. Haiku 4.5 (selected)\r\n" ++
                             "Select with numbers [1-2]. Then Enter to submit or Escape to cancel:\r\nEnter to set as default \xc2\xb7 s to use this session only \xc2\xb7 Esc to cancel");
@@ -6531,6 +6618,62 @@ fn fakeOpencodeAttach(args: []const [*:0]const u8) u8 {
     var buf: [256]u8 = undefined;
     while (c.read(0, &buf, buf.len) > 0) {}
     return 0;
+}
+
+/// agent_ask against the fake Claude Code `claude-1` (idle when called):
+/// answered from its panel, idle and behind a running turn, without a
+/// record, a job, an event or a state change, the turn keeping its done.
+fn sideQuestions(m: *Mcp, arena: std.mem.Allocator, caps: std.json.ObjectMap) void {
+    const sq = (caps.get("agent_side_question") orelse fail("capabilities: no agent_side_question")).object;
+    if (!sq.get("available").?.bool) fail("capabilities: agent_side_question is not available");
+    var claude_side = false;
+    for (sq.get("apps").?.array.items) |x| {
+        if (std.mem.eql(u8, x.string, "opencode")) fail("capabilities: agent_side_question names opencode");
+        claude_side = claude_side or std.mem.eql(u8, x.string, "claude");
+    }
+    if (!claude_side) fail("capabilities: agent_side_question does not name claude");
+    const recordCount = struct {
+        fn f(mm: *Mcp, ar: std.mem.Allocator) usize {
+            return agentCall(mm, ar, "agent_read", "{\"agent\":\"claude-1\",\"since\":0,\"detail\":\"all\",\"limit\":500}", "agent_read all", false, 15_000).get("records").?.array.items.len;
+        }
+    }.f;
+    const recs_before = recordCount(m, arena);
+
+    // Idle: the echo looks like a prompt and is none; the answer keeps its
+    // blank line; the panel is closed again.
+    const idle = agentCall(m, arena, "agent_ask", "{\"agent\":\"claude-1\",\"text\":\"which command did you just run?\",\"timeout_ms\":20000}", "agent_ask idle", false, 45_000);
+    expectFact(idle, "answer", "side answer to: which command did you just run?\n\nnothing is running", "agent_ask idle: answer");
+    expectFact(idle, "state", "idle", "agent_ask idle: state");
+    if (!idle.get("panel_closed").?.bool) fail("agent_ask idle: the panel was not closed");
+    if (idle.get("watch_command") != null or idle.get("events") != null) fail("agent_ask: a side question handed out a watch_command or events");
+    const quiet = agentCall(m, arena, "agent_wait", "{\"agent\":\"claude-1\",\"timeout_ms\":1500}", "agent_wait after agent_ask", false, 15_000);
+    expectFact(quiet, "outcome", "still_working", "agent_wait after agent_ask: a side question raised a wake-up");
+    if (quiet.get("events").?.array.items.len != 0) fail("agent_wait after agent_ask: a side question raised an event");
+    if (recordCount(m, arena) != recs_before) fail("agent_ask idle: the side question left a record");
+
+    // Busy: a long turn runs; the question does not interrupt it, the
+    // agent stays working, and the turn ends with its own done.
+    const glacial = agentCall(m, arena, "agent_send", "{\"agent\":\"claude-1\",\"text\":\"glacial side work\",\"timeout_ms\":0}", "agent_send glacial", false, 15_000);
+    expectSentOrWorking(glacial, "agent_send glacial: outcome");
+    const busy = agentCall(m, arena, "agent_ask", "{\"agent\":\"claude-1\",\"text\":\"what are you doing right now?\",\"timeout_ms\":20000}", "agent_ask busy", false, 45_000);
+    expectFact(busy, "answer", "side answer to: what are you doing right now?\nwhile working on the current turn", "agent_ask busy: answer");
+    expectFact(busy, "state", "working", "agent_ask busy: the agent did not stay working");
+    if (!busy.get("panel_closed").?.bool) fail("agent_ask busy: the panel was not closed");
+    const fin = agentCall(m, arena, "agent_wait", "{\"agent\":\"claude-1\",\"timeout_ms\":30000}", "agent_wait glacial", false, 45_000);
+    expectFact(fin, "outcome", "done", "agent_wait glacial: the turn behind the side question did not finish");
+    expectFact(fin, "message", "echo: glacial side work", "agent_wait glacial: final message");
+    const all = agentCall(m, arena, "agent_read", "{\"agent\":\"claude-1\",\"since\":0,\"detail\":\"all\",\"limit\":500}", "agent_read after agent_ask", false, 15_000);
+    for (all.get("records").?.array.items) |r| {
+        const tx = r.object.get("text").?.string;
+        if (std.mem.indexOf(u8, tx, "/btw") != null or std.mem.indexOf(u8, tx, "side answer") != null) {
+            say(tx);
+            fail("agent_read: a side question reached the transcript");
+        }
+    }
+    // Refusals: several agents at once, a multi-line question.
+    _ = agentCall(m, arena, "agent_ask", "{\"agents\":[\"claude-1\"],\"text\":\"how far?\"}", "agent_ask agents", true, 15_000);
+    _ = agentCall(m, arena, "agent_ask", "{\"agent\":\"claude-1\",\"text\":\"one\\ntwo\"}", "agent_ask two lines", true, 15_000);
+    say("smoke-mcp: agents: agent_ask side questions (idle, busy behind a turn that keeps its done, no record or event) ok");
 }
 
 /// One agent_* call: its structuredContent, the reply line kept in `arena`.
@@ -6976,6 +7119,8 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
         expectFact(rest, "outcome", "done", "agent_wait: outcome");
         expectFact(rest, "message", "part two", "agent_wait: final message");
 
+        sideQuestions(&m, arena, caps);
+
         // An opt-in flood: a few messages, the rest as a digest.
         const flood = agentCall(&m, arena, "agent_send", "{\"agent\":\"claude-1\",\"text\":\"flood 7\",\"messages\":true,\"timeout_ms\":20000}", "agent_send flood", false, 45_000);
         expectFact(flood, "outcome", "done", "agent_send flood: outcome");
@@ -7269,6 +7414,11 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
         const o1_server = std.fmt.allocPrint(arena, "agent-{s}-server", .{o1}) catch fail("oom");
         expectFact(oc, "session", o1_session, "agent_open opencode: session");
         expectFact(oc, "server_session", o1_server, "agent_open opencode: server session");
+        // opencode's API has no side question: refused, nothing sent.
+        {
+            const refused = agentCall(&m, arena, "agent_ask", "{\"agent\":\"opencode-1\",\"text\":\"how far are you?\"}", "agent_ask opencode", true, 15_000);
+            expectFact((refused.get("error") orelse fail("agent_ask opencode: no error")).object, "code", "invalid_args", "agent_ask opencode: code");
+        }
         // The fake server swallowed every request of its first 4.5 s: the
         // open waited it out on health probes instead of failing.
         if (!oc.get("ready").?.bool) fail("agent_open opencode: not ready");

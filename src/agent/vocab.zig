@@ -45,6 +45,15 @@ pub const State = enum {
         };
     }
 
+    /// A side question can be asked now: the app is up, and no prompt of
+    /// its own holds the keyboard (a permission dialog would take the keys).
+    pub fn takesSideQuestion(self: State) bool {
+        return switch (self) {
+            .idle, .waiting_background, .working, .waiting_subagent, .retrying => true,
+            .starting, .waiting_user, .exited, .disconnected => false,
+        };
+    }
+
     /// Nothing more happens without the caller (`agent_wait all`, `agent-wait
     /// --all`): its turn is over, it asks something, or it is gone. A
     /// lost link may come back, and background tasks still end the turn.

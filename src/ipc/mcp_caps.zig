@@ -458,6 +458,8 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
         try res.fact("agent_login_shell", agent_ssh);
         const ids: []const []const u8 = if (agents_ok) mcp_agent.adapterIds(arena) catch &.{} else &.{};
         try res.fact("agent_adapters", ids);
+        const side_apps: []const []const u8 = if (agents_ok) mcp_agent.sideQuestionApps(arena) catch &.{} else &.{};
+        try res.fact("agent_side_question", .{ .available = side_apps.len > 0, .apps = side_apps });
         if (agents_ok) {
             if (try mcp_agent.waiterTemplate(arena)) |w| try res.fact("agent_waiter", w) else try res.raw("agent_waiter", "null");
         } else try res.raw("agent_waiter", "null");
@@ -541,6 +543,7 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
             try res.text("agent_read final returns just the newest job's last message, agent_list is compact unless detail, and agent_attach relaunch starts a gone agent again under its id");
             try res.text("agent_open takes permissions (name to allow/ask/deny, mapped to each app's own mechanism) and retry_on_overload (continue a turn a provider overload ended, off by default); a lost remote link that comes back to find the session gone ends the agent as exited, relaunchable");
             try res.text("agent_template_save keeps named briefs (placeholders in braces) that agent_send and agent_open take as template + vars");
+            if (side_apps.len > 0) try res.textf("agent_ask asks an agent a side question (how far are you?) answered from its current context without a turn, busy or idle, recording nothing: {s}", .{try std.mem.join(arena, ", ", side_apps)});
             try res.text("every per-agent result and agent_list carry facts: what the app reports about its context use, rate limits and cost (agent_facts names them per adapter), the context percent also in agent_list's one-line form");
             if (mcp_agent.state.push == .channel)
                 try res.text("agent events are pushed into this session as Claude Code channel messages: end your turn after delegating instead of running watch_command")

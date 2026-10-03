@@ -497,6 +497,14 @@ fn adapters() !*adapter.Set {
     return &state.set.?;
 }
 
+/// The adapters that answer side questions (`agent_ask`), for `capabilities`.
+pub fn sideQuestionApps(arena: std.mem.Allocator) ![]const []const u8 {
+    const set = try adapters();
+    var out: std.ArrayList([]const u8) = .empty;
+    for (set.items.items) |l| if (agent_mod.supportsAction(l, .side_question)) try out.append(arena, l.spec.id);
+    return out.items;
+}
+
 /// The adapter ids this server can open, for `capabilities`.
 pub fn adapterIds(arena: std.mem.Allocator) ![]const []const u8 {
     const set = try adapters();
@@ -1994,6 +2002,10 @@ pub fn agentTool(arena: std.mem.Allocator, tool: Tool, args: std.json.Value) ![]
         .agent_answer => withEntry(arena, args, answerTool),
         .agent_set => withEntry(arena, args, setTool),
         .agent_interrupt => withEntry(arena, args, interruptTool),
+        .agent_ask => if (mcp.argValue(args, "agents") != null)
+            errRes(arena, .invalid_args, "agent_ask asks ONE agent: pass 'agent' (a side question is answered in that agent's own panel)")
+        else
+            withEntry(arena, args, askTool),
         .agent_close => if (entryFromArgs(args) == null and argStr(args, "agent") != null) closeGoneTool(arena, argStr(args, "agent").?) else withEntry(arena, args, closeTool),
         .agent_template_save => templateSaveTool(arena, args),
         .agent_templates => templatesTool(arena, args),
@@ -3747,6 +3759,10 @@ fn submitPrompt(arena: std.mem.Allocator, e: *Entry, p: Prompt, deadline: i64, n
     _ = waitReady(e, deadline);
     // A busy agent's app queues the prompt for its next turn, when it can.
     const queued = !no_queue and e.agent.state().queuesPrompt() and e.agent.supports(.queue);
+    switch (e.agent.driver()) {
+        .screen => |d| if (d.sideOpen()) return .{ .fail = .{ .code = .conflict, .msg = try std.fmt.allocPrint(arena, "agent {s} shows a side-question panel, which has the keyboard; nothing was sent (it closes with Escape in its session)", .{e.id}) } },
+        .opencode_api => {},
+    }
     if (queued) {
         if (try queueRefusal(arena, e)) |f| return .{ .fail = f };
     } else if (try busy(arena, e)) |f| return .{ .fail = f };
@@ -4778,6 +4794,58 @@ fn interruptTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]c
     try res.fact("interrupted", true);
     try res.fact("queued_dropped", dropped);
     return finish(arena, &res, e, try pending(arena, e), .{}, &.{});
+}
+
+/// agent_ask: a side question answered from the agent's current context
+/// without a turn. Nothing is recorded, no event is raised or taken, the
+/// handed-out state and the remembered waiter filter stay as they were.
+fn askTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]const u8 {
+    const text = argStr(args, "text") orelse return errRes(arena, .invalid_args, "agent_ask needs 'text', the question");
+    if (std.mem.trim(u8, text, " \t").len == 0) return errRes(arena, .invalid_args, "text is empty");
+    for (text) |ch| if (ch < 0x20 or ch == 0x7f)
+        return errRes(arena, .invalid_args, "a side question is one line of text (no line breaks or control characters)");
+    if (!e.agent.supports(.side_question))
+        return errRes(arena, .invalid_args, try std.fmt.allocPrint(arena, "the {s} adapter has no side questions (capabilities.agent_side_question lists the apps that do); agent_send asks it as a prompt", .{e.loaded.spec.id}));
+    if (e.loaded.spec.screen) |sc| if (sc.paste) |p| if (p.collapses(text))
+        return errRes(arena, .invalid_args, try std.fmt.allocPrint(arena, "a side question is at most {d} bytes (the app would collapse a longer one into a paste its panel cannot show)", .{p.over_chars}));
+    service(clock.nowMs());
+    const st = e.agent.state();
+    if (!st.takesSideQuestion()) return switch (st) {
+        .waiting_user => errRes(arena, .conflict, try std.fmt.allocPrint(arena, "agent {s} is waiting for an answer: its prompt has the keyboard, so nothing was typed (agent_answer it first)", .{e.id})),
+        .starting => errRes(arena, .conflict, try std.fmt.allocPrint(arena, "agent {s} is not ready yet (state starting); nothing was typed", .{e.id})),
+        else => errRes(arena, .unavailable, try std.fmt.allocPrint(arena, "agent {s} is {s}; agent_close it", .{ e.id, @tagName(st) })),
+    };
+    const d = e.agent.driver().screen;
+    if (d.sideOpen())
+        return errRes(arena, .conflict, try std.fmt.allocPrint(arena, "agent {s} already shows a side panel (someone else's question) and it has the keyboard; nothing was typed", .{e.id}));
+    if (!d.inputShowing())
+        return errRes(arena, .conflict, try std.fmt.allocPrint(arena, "agent {s} shows no input box; nothing was typed", .{e.id}));
+    if (!d.inputEmpty())
+        return errRes(arena, .conflict, try std.fmt.allocPrint(arena, "agent {s}'s input box holds text someone is typing; nothing was typed (it would merge with theirs)", .{e.id}));
+    const t0 = clock.nowMs();
+    const o = switch (try act(arena, e, .{ .side_question = text }, deadlineFrom(args, DEFAULT_WAIT_MS))) {
+        .fail => |f| {
+            if (!d.sideOpen()) return sendFailRes(arena, e, f);
+            return sendFailRes(arena, e, .{ .code = f.code, .msg = try std.fmt.allocPrint(arena, "{s}\n(its side panel still shows and has the keyboard: Escape in its session closes it)", .{f.msg}) });
+        },
+        .ok => |o| o,
+    };
+    service(clock.nowMs());
+    const answer = o.answer orelse "";
+    const closed = o.side_closed orelse !d.sideOpen();
+    var res = Res.init(arena);
+    try res.textf("{s} answered the side question from its current context: no turn, nothing recorded (state {s})", .{ e.id, @tagName(e.agent.state()) });
+    if (!closed) try res.textf("its side panel did not close and has the keyboard: {s} takes no input until it does (Escape in its session closes it)", .{e.id});
+    try res.fact("agent", e.id);
+    if (e.name) |n| try res.fact("name", n);
+    try res.fact("app", e.loaded.spec.id);
+    try res.fact("state", @tagName(e.agent.state()));
+    try res.fact("question", text);
+    try res.fact("answer", answer);
+    try res.fact("panel_closed", closed);
+    try res.fact("waited_ms", clock.nowMs() - t0);
+    try block(&res, .{ .name = "answer", .body = answer });
+    return res.finish();
 }
 
 const RecordJson = struct {
