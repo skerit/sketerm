@@ -208,7 +208,10 @@ pub const Host = struct {
         // Teardown flushes: an extension removed inside the coalescing
         // window must not lose the write it already saw succeed.
         if (e.store_dirty) {
-            if (e.store) |*s| self.persistStore(e, s) catch {};
+            if (e.store) |*s| self.persistStore(e, s) catch |err| diag.print(
+                "sketerm-webengine: storage.local write failed for {s}: {s}\n",
+                .{ e.id, @errorName(err) },
+            );
             e.store_dirty = false;
         }
         // ORDER IS THE SAFETY PROPERTY: the slot must leave the

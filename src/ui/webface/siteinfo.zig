@@ -115,7 +115,7 @@ pub fn onMenuSiteInfo(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
 
 pub fn onMenuTorTab(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
     const win = cast.userData(MenuCtx, user).face.ownerWindow() orelse return;
-    win.newTorWebTab() catch {};
+    win.newTorWebTab() catch |err| @import("../window.zig").logActionError("new_tor_web_tab", err);
 }
 
 /// Act on a route choice the user made from a one-click surface

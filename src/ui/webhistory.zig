@@ -75,7 +75,7 @@ const List = struct {
                 return;
             }
         }
-        self.win.newWebTabAt(url) catch {};
+        self.win.newWebTabAt(url) catch |err| @import("window.zig").logActionError("history open", err);
     }
 
     fn setStatus(self: *List, text: [*:0]const u8) void {

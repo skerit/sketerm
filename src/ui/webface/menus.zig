@@ -234,7 +234,7 @@ pub fn appendContainerRows(self: *WebFace, root: *classicmenu.Root, tabs: classi
 
 pub fn onMenuIncognito(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
     const win = cast.userData(MenuCtx, user).face.ownerWindow() orelse return;
-    win.newIncognitoWebTab() catch {};
+    win.newIncognitoWebTab() catch |err| @import("../window.zig").logActionError("new_incognito_web_tab", err);
 }
 
 pub fn onMenuContainers(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
@@ -261,7 +261,7 @@ pub fn onMenuExtensions(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
 pub fn onMenuOpenInContainer(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
     const rc = cast.userData(ContainerRowCtx, user);
     const win = rc.face.ownerWindow() orelse return;
-    win.newWebTabInContainer(rc.container, null) catch {};
+    win.newWebTabInContainer(rc.container, null) catch |err| @import("../window.zig").logActionError("open_in_container", err);
 }
 
 pub fn copyText(self: *WebFace, text: []const u8) void {

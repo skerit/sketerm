@@ -1677,11 +1677,11 @@ pub const WebFace = struct {
         const win = self.ownerWindow() orelse return;
         if (win.browserPagesInSidebar()) {
             if (self.group()) |g| {
-                _ = g.newPage(url, self) catch {};
+                _ = g.newPage(url, self) catch |err| @import("window.zig").logActionError("open_in_new_tab", err);
                 return;
             }
         }
-        win.newWebTabFrom(url, self.ownerPage()) catch {};
+        win.newWebTabFrom(url, self.ownerPage()) catch |err| @import("window.zig").logActionError("open_in_new_tab", err);
     }
 
     /// Snapshot for layout persistence. The address falls back to the

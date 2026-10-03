@@ -2219,7 +2219,8 @@ pub const Host = struct {
             .url = if (v.url.len != 0) v.url else "",
             .frame_name = "",
         });
-        self.allocBuffer(v) catch {};
+        // The popup is already announced; without a buffer it never paints.
+        self.allocBuffer(v) catch |err| logLine("popup view {d}: frame buffer allocation failed ({s}); it cannot paint", .{ v.id, @errorName(err) });
         self.observeViewPresent(v);
         return true;
     }

@@ -462,7 +462,7 @@ pub const Group = struct {
 
     fn hostNewCb(ctx: ?*anyopaque) void {
         const self = cast.userData(Group, ctx);
-        _ = self.newPage(null, null) catch {};
+        _ = self.newPage(null, null) catch |err| @import("window.zig").logActionError("new_web_page", err);
     }
 
     /// A strip drag reordered the pages: keep the model list in the
@@ -563,12 +563,12 @@ pub const Group = struct {
         const self = cast.userData(Group, ctx);
         const face = self.faceForWidget(page) orelse return;
         const url = face.url orelse face.pending_url;
-        _ = self.newPage(url, face) catch {};
+        _ = self.newPage(url, face) catch |err| @import("window.zig").logActionError("duplicate_web_page", err);
     }
 
     fn onPageMenuNewTab(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
         const cx = cast.userData(PageMenuCtx, user);
-        _ = cx.group.newPage(null, null) catch {};
+        _ = cx.group.newPage(null, null) catch |err| @import("window.zig").logActionError("new_web_page", err);
     }
 
     fn onPageMenuReload(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
