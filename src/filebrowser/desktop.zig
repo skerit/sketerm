@@ -2,6 +2,7 @@
 //! Exec field-code substitution for host-side application launches.
 
 const std = @import("std");
+const shellquote = @import("../util/shellquote.zig");
 
 /// True when a ';'-separated .desktop MimeType list contains `mime`.
 pub fn mimeListContains(list: []const u8, mime: []const u8) bool {
@@ -35,7 +36,7 @@ fn buildHostExecCmdAlloc(allocator: std.mem.Allocator, exec: []const u8, path: [
         i += 1;
         switch (exec[i]) {
             'f', 'F', 'u', 'U' => {
-                try appendQuoted(&out, allocator, path);
+                try shellquote.appendAlwaysQuoted(&out, allocator, path);
                 substituted = true;
             },
             '%' => try out.append(allocator, '%'),
@@ -44,17 +45,9 @@ fn buildHostExecCmdAlloc(allocator: std.mem.Allocator, exec: []const u8, path: [
     }
     if (!substituted) {
         try out.append(allocator, ' ');
-        try appendQuoted(&out, allocator, path);
+        try shellquote.appendAlwaysQuoted(&out, allocator, path);
     }
     return out.toOwnedSlice(allocator);
-}
-
-pub fn appendQuoted(out: *std.ArrayList(u8), allocator: std.mem.Allocator, path: []const u8) !void {
-    try out.append(allocator, '\'');
-    for (path) |ch| {
-        if (ch == '\'') try out.appendSlice(allocator, "'\\''") else try out.append(allocator, ch);
-    }
-    try out.append(allocator, '\'');
 }
 
 test "buildHostExecCmd substitutes and quotes field codes" {
@@ -84,17 +77,4 @@ test "mimeListContains matches ';'-separated segments" {
     try t.expect(!mimeListContains("", "image/png"));
     // Surrounding spaces in a hand-edited .desktop are tolerated.
     try t.expect(mimeListContains("text/plain; image/png ", "image/png"));
-}
-
-test "appendQuoted makes any path one shell word" {
-    const t = std.testing;
-    const a = t.allocator;
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(a);
-    try appendQuoted(&out, a, "/tmp/a b;rm -rf /");
-    try t.expectEqualStrings("'/tmp/a b;rm -rf /'", out.items);
-    out.clearRetainingCapacity();
-    // A single quote closes, escapes and reopens; the word never splits.
-    try appendQuoted(&out, a, "it's");
-    try t.expectEqualStrings("'it'\\''s'", out.items);
 }

@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const c = @import("../../c.zig").c;
-const appendQuoted = @import("../../filebrowser/desktop.zig").appendQuoted;
+const appendAlwaysQuoted = @import("../../util/shellquote.zig").appendAlwaysQuoted;
 const hostEq = @import("../../filebrowser/paths.zig").hostEq;
 const parseSpec = @import("../../filebrowser/paths.zig").parseSpec;
 const BTab = @import("types.zig").BTab;
@@ -239,7 +239,7 @@ pub fn provider(tab: *BTab, dragged: []const u8) ?*c.GdkContentProvider {
             c.g_object_unref(vector_provider);
             return null;
         };
-        appendQuoted(&text, allocator, spec) catch {
+        appendAlwaysQuoted(&text, allocator, spec) catch {
             c.g_object_unref(vector_provider);
             return null;
         };
@@ -349,7 +349,7 @@ test "a lone spec is quoted too, and decodes back to itself" {
     // unquoted spelling submitted everything past the newline.
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(t.allocator);
-    try appendQuoted(&text, t.allocator, "/tmp/od d\nrm -rf x");
+    try appendAlwaysQuoted(&text, t.allocator, "/tmp/od d\nrm -rf x");
     try text.append(t.allocator, 0);
     try t.expectEqualStrings("'/tmp/od d\nrm -rf x'", text.items[0 .. text.items.len - 1]);
 

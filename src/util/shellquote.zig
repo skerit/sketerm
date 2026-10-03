@@ -23,7 +23,18 @@ pub fn appendQuoted(list: *std.ArrayList(u8), allocator: std.mem.Allocator, s: [
         try list.appendSlice(allocator, s);
         return;
     }
+    try appendAlwaysQuoted(list, allocator, s);
+}
+
+/// Single-quote `s` as one shell word even when every byte is safe bare.
+pub fn appendAlwaysQuoted(list: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
     try list.append(allocator, '\'');
+    try appendQuotedBody(list, allocator, s);
+    try list.append(allocator, '\'');
+}
+
+/// The inside of a single-quoted word: `s` with each `'` written as `'\''`, no surrounding quotes.
+pub fn appendQuotedBody(list: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
     for (s) |b| {
         if (b == '\'') {
             try list.appendSlice(allocator, "'\\''");
@@ -31,7 +42,6 @@ pub fn appendQuoted(list: *std.ArrayList(u8), allocator: std.mem.Allocator, s: [
             try list.append(allocator, b);
         }
     }
-    try list.append(allocator, '\'');
 }
 
 test "appendQuoted: bare when safe, quoted + escaped otherwise" {
@@ -53,4 +63,21 @@ test "appendQuoted: bare when safe, quoted + escaped otherwise" {
     out.clearRetainingCapacity();
     try appendQuoted(&out, a, "");
     try std.testing.expectEqualStrings("''", out.items);
+}
+
+test "appendAlwaysQuoted makes any path one shell word" {
+    const t = std.testing;
+    const a = t.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try appendAlwaysQuoted(&out, a, "/tmp/a b;rm -rf /");
+    try t.expectEqualStrings("'/tmp/a b;rm -rf /'", out.items);
+    out.clearRetainingCapacity();
+    // A single quote closes, escapes and reopens; the word never splits.
+    try appendAlwaysQuoted(&out, a, "it's");
+    try t.expectEqualStrings("'it'\\''s'", out.items);
+    out.clearRetainingCapacity();
+    // Unlike appendQuoted, a safe-bare word is still quoted.
+    try appendAlwaysQuoted(&out, a, "/safe/path.txt");
+    try t.expectEqualStrings("'/safe/path.txt'", out.items);
 }

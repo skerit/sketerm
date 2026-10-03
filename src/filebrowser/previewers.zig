@@ -24,11 +24,11 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const cast_play = @import("../mux/cast_play.zig");
-const desktop = @import("desktop.zig");
 const globMatch = @import("../util/glob.zig").matchName;
 const paths = @import("paths.zig");
 const pathz = @import("../util/pathz.zig");
 const profile = @import("../util/profile.zig");
+const shellquote = @import("../util/shellquote.zig");
 
 pub const Output = enum { text, image };
 
@@ -227,17 +227,17 @@ fn substituteAlloc(
         i += 1;
         switch (cmd[i]) {
             'f' => {
-                try desktop.appendQuoted(&out, allocator, file);
+                try shellquote.appendAlwaysQuoted(&out, allocator, file);
                 saw_file = true;
             },
-            'o' => try desktop.appendQuoted(&out, allocator, out_path),
+            'o' => try shellquote.appendAlwaysQuoted(&out, allocator, out_path),
             '%' => try out.append(allocator, '%'),
             else => {},
         }
     }
     if (!saw_file) {
         try out.append(allocator, ' ');
-        try desktop.appendQuoted(&out, allocator, file);
+        try shellquote.appendAlwaysQuoted(&out, allocator, file);
     }
     return out.toOwnedSlice(allocator);
 }
@@ -261,7 +261,7 @@ pub fn hostScript(
     defer allocator.free(body);
     var quoted: std.ArrayList(u8) = .empty;
     defer quoted.deinit(allocator);
-    desktop.appendQuoted(&quoted, allocator, out_path) catch return null;
+    shellquote.appendAlwaysQuoted(&quoted, allocator, out_path) catch return null;
     return switch (output) {
         .text => std.fmt.allocPrint(allocator, "{{ {s} ; }} > {s} 2>&1; printf '%s\\n' {s}", .{
             body, quoted.items, quoted.items,

@@ -10,6 +10,7 @@
 //! top), which would receive the keys as commands of its own.
 
 const std = @import("std");
+const shellquote = @import("../util/shellquote.zig");
 
 pub const Verdict = enum {
     ok,
@@ -41,14 +42,6 @@ pub fn verdict(live: bool, shell_host: ?[]const u8, tab_host: ?[]const u8, alt_s
     return .ok;
 }
 
-pub fn appendQuoted(out: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
-    try out.append(allocator, '\'');
-    for (s) |ch| {
-        if (ch == '\'') try out.appendSlice(allocator, "'\\''") else try out.append(allocator, ch);
-    }
-    try out.append(allocator, '\'');
-}
-
 /// A typed line starts with Ctrl+U: whatever half-typed input sat at
 /// the prompt is cleared instead of being prefixed to our command.
 pub const KILL_LINE = "\x15";
@@ -58,7 +51,7 @@ pub fn cdLine(allocator: std.mem.Allocator, dir: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, KILL_LINE ++ "cd ");
-    try appendQuoted(&out, allocator, dir);
+    try shellquote.appendAlwaysQuoted(&out, allocator, dir);
     try out.append(allocator, '\n');
     return out.toOwnedSlice(allocator);
 }
@@ -69,13 +62,11 @@ pub fn exportLine(allocator: std.mem.Allocator, paths: []const []const u8) ![]u8
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, KILL_LINE ++ "SK_SEL=");
-    try appendQuoted(&out, allocator, if (paths.len > 0) paths[0] else "");
+    try shellquote.appendAlwaysQuoted(&out, allocator, if (paths.len > 0) paths[0] else "");
     try out.appendSlice(allocator, "; SK_SEL_ALL='");
     for (paths, 0..) |p, i| {
         if (i > 0) try out.append(allocator, ' ');
-        for (p) |ch| {
-            if (ch == '\'') try out.appendSlice(allocator, "'\\''") else try out.append(allocator, ch);
-        }
+        try shellquote.appendQuotedBody(&out, allocator, p);
     }
     try out.appendSlice(allocator, "'\n");
     return out.toOwnedSlice(allocator);
@@ -86,9 +77,9 @@ pub fn editorLine(allocator: std.mem.Allocator, list: []const u8, done: []const 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, KILL_LINE ++ "\"${EDITOR:-vi}\" ");
-    try appendQuoted(&out, allocator, list);
+    try shellquote.appendAlwaysQuoted(&out, allocator, list);
     try out.appendSlice(allocator, " && touch ");
-    try appendQuoted(&out, allocator, done);
+    try shellquote.appendAlwaysQuoted(&out, allocator, done);
     try out.append(allocator, '\n');
     return out.toOwnedSlice(allocator);
 }

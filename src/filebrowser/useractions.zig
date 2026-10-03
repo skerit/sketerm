@@ -26,6 +26,7 @@
 //!   %h  the host ("" on this machine)  %%  a literal %
 
 const std = @import("std");
+const shellquote = @import("../util/shellquote.zig");
 
 pub const Kind = enum { any, file, dir };
 pub const Selection = enum { any, single, multiple };
@@ -134,14 +135,6 @@ pub fn applies(a: Action, targets: []const Target, remote: bool) bool {
     return true;
 }
 
-pub fn appendQuoted(out: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
-    try out.append(allocator, '\'');
-    for (s) |ch| {
-        if (ch == '\'') try out.appendSlice(allocator, "'\\''") else try out.append(allocator, ch);
-    }
-    try out.append(allocator, '\'');
-}
-
 /// Substitute the tokens of `exec` for `targets` (non-empty).
 pub fn expand(allocator: std.mem.Allocator, exec: []const u8, targets: []const Target, host: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
@@ -155,14 +148,14 @@ pub fn expand(allocator: std.mem.Allocator, exec: []const u8, targets: []const T
         }
         i += 1;
         switch (exec[i]) {
-            'f' => try appendQuoted(&out, allocator, first),
+            'f' => try shellquote.appendAlwaysQuoted(&out, allocator, first),
             'F' => for (targets, 0..) |t, k| {
                 if (k > 0) try out.append(allocator, ' ');
-                try appendQuoted(&out, allocator, t.path);
+                try shellquote.appendAlwaysQuoted(&out, allocator, t.path);
             },
-            'n' => try appendQuoted(&out, allocator, std.fs.path.basename(first)),
-            'd' => try appendQuoted(&out, allocator, std.fs.path.dirname(first) orelse "/"),
-            'h' => try appendQuoted(&out, allocator, host),
+            'n' => try shellquote.appendAlwaysQuoted(&out, allocator, std.fs.path.basename(first)),
+            'd' => try shellquote.appendAlwaysQuoted(&out, allocator, std.fs.path.dirname(first) orelse "/"),
+            'h' => try shellquote.appendAlwaysQuoted(&out, allocator, host),
             '%' => try out.append(allocator, '%'),
             else => {
                 try out.append(allocator, '%');

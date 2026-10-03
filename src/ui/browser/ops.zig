@@ -18,7 +18,6 @@ const colview = @import("colview.zig");
 const UndoOp = @import("types.zig").UndoOp;
 const WireJobEv = @import("types.zig").WireJobEv;
 const WireReply = @import("types.zig").WireReply;
-const appendQuoted = @import("../../filebrowser/desktop.zig").appendQuoted;
 const clipboard = @import("../../filebrowser/clipboard.zig");
 const confirm = @import("../confirm.zig");
 const conflict = @import("conflict.zig");
