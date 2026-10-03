@@ -1439,18 +1439,26 @@ pub const Api = struct {
         };
         self.reconnect_at_ms = null;
         self.backoff_ms = RECONNECT_MIN_MS;
-        self.resync(now_ms) catch {};
+        self.resync(now_ms) catch |err| self.noteResyncFailed("session statuses and pending requests", err);
         if (self.source.root) |root| {
             var path_buf: [256]u8 = undefined;
             if (std.fmt.bufPrint(&path_buf, "/session/{s}/message", .{root})) |path| {
                 if (self.getJson(path)) |msgs_const| {
                     var msgs = msgs_const;
                     defer msgs.deinit();
-                    self.source.resyncMessages(msgs.value, now_ms, false) catch {};
-                } else |_| {}
+                    self.source.resyncMessages(msgs.value, now_ms, false) catch |err| self.noteResyncFailed("messages", err);
+                } else |err| self.noteResyncFailed("messages", err);
             } else |_| {}
         }
         self.source.noteReconnected(now_ms) catch {};
+    }
+
+    /// Part of the resync after a reconnect failed: what happened while the
+    /// stream was down may be missing, so the agent's records say so.
+    fn noteResyncFailed(self: *Api, what: []const u8, err: anyerror) void {
+        var buf: [256]u8 = undefined;
+        const text = std.fmt.bufPrint(&buf, "after the event stream came back, re-reading the server's {s} failed ({s}): what changed while it was down may be missing", .{ what, @errorName(err) }) catch return;
+        self.source.addNotice(text) catch {};
     }
 
     /// Statuses and pending requests as the server has them now.

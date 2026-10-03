@@ -438,6 +438,15 @@ pub const McpLog = struct {
 
 pub var mcp_log: ?McpLog = null;
 
+/// One warning line on stderr, mirrored into the `--log` trace. Main thread
+/// only (`mcp_log` is main-thread-owned).
+pub fn warn(comptime fmt: []const u8, args: anytype) void {
+    var buf: [1024]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, fmt, args) catch buf[0..];
+    _ = c.fprintf(platform.stderr(), "sketerm mcp: %.*s\n", @as(c_int, @intCast(msg.len)), msg.ptr);
+    if (mcp_log) |*l| l.logNote(msg);
+}
+
 /// Seconds an isolated instance's daemon may sit with no sessions and
 /// no clients before it exits on its own (see `setupIsolation`'s caller).
 const ISOLATED_IDLE_EXIT_SECS = "120";

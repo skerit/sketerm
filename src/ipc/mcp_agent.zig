@@ -251,6 +251,9 @@ pub const Entry = struct {
     /// A reconnect found its session gone from the daemon: what that
     /// daemon remembered of its end.
     gone_why: ?GoneFacts = null,
+    /// The error `serviceEntry` last failed with, reported once until it
+    /// succeeds again (`noteServiceFailure`).
+    service_failed: ?anyerror = null,
     /// Started resuming its conversation, and no prompt went in since:
     /// whatever the app shows meanwhile is its past (`foldHistory`).
     history: bool = false,
@@ -684,7 +687,9 @@ fn screenNeedsTick(e: *const screen_source.Engine) bool {
 pub fn service(now_ms: i64) void {
     serviceReconnects(now_ms);
     for (state.entries.items) |e| {
-        serviceEntry(e, now_ms) catch {};
+        if (serviceEntry(e, now_ms)) |_| {
+            e.service_failed = null;
+        } else |err| noteServiceFailure(e, err);
         kickReconnects(e, now_ms);
         // An agent that ended is no longer one to resume; one that can be
         // started again keeps its descriptor for `agent_attach relaunch`.
@@ -997,7 +1002,15 @@ fn factsOf(arena: std.mem.Allocator, e: *Entry) !FactsRead {
 /// this loop).
 fn serviceRetries(now_ms: i64) void {
     if (state.retry_busy) return;
-    for (state.entries.items) |e| serviceRetry(e, now_ms) catch {};
+    for (state.entries.items) |e| serviceRetry(e, now_ms) catch |err| {
+        // Held events wake nobody: a retry that cannot run must release
+        // them, or the overload error and its done never reach the caller.
+        e.retry.abandon(e.agent.queue());
+        mcp.warn("agent {s}: retry_on_overload failed ({s}) and was abandoned", .{ e.id, @errorName(err) });
+        var buf: [160]u8 = undefined;
+        const text = std.fmt.bufPrint(&buf, "retry_on_overload failed ({s}) and was abandoned", .{@errorName(err)}) catch continue;
+        e.agent.addNotice(text) catch {};
+    };
 }
 
 fn serviceRetry(e: *Entry, now_ms: i64) !void {
@@ -1350,6 +1363,17 @@ fn startReconnect(t: *termdrive.Term) void {
     const th = std.Thread.spawn(.{}, ReconnectJob.run, .{j}) catch return j.free();
     th.detach();
     state.reconnects.appendAssumeCapacity(j);
+}
+
+/// Observing `e` failed, so it stops updating until a later pass succeeds:
+/// say so once per distinct error, on stderr (and `--log`) and as a notice.
+fn noteServiceFailure(e: *Entry, err: anyerror) void {
+    if (e.service_failed) |prev| if (prev == err) return;
+    e.service_failed = err;
+    mcp.warn("agent {s}: reading its app failed ({s}); it shows no updates until a later read succeeds", .{ e.id, @errorName(err) });
+    var buf: [256]u8 = undefined;
+    const text = std.fmt.bufPrint(&buf, "sketerm could not read this agent's app ({s}): its state and records stop updating until a later read succeeds", .{@errorName(err)}) catch return;
+    e.agent.addNotice(text) catch {};
 }
 
 fn serviceEntry(e: *Entry, now_ms: i64) !void {
@@ -5478,7 +5502,10 @@ fn retireDescriptor(arena: std.mem.Allocator, index_dir: []const u8, d: Descript
         if (d.gone_ms == 0) {
             var kept = d;
             kept.gone_ms = clock.wallMs();
-            agentindex.write(arena, index_dir, kept) catch {};
+            // Unstamped, the descriptor never ages out of the index (the
+            // next sweep retries the stamp): say why it lingers.
+            agentindex.write(arena, index_dir, kept) catch |err|
+                mcp.warn("agent {s}: could not stamp its descriptor gone ({s}); it stays in the index until a later sweep stamps it", .{ d.id, @errorName(err) });
         }
         claimed.release(lp, false);
         return true;
