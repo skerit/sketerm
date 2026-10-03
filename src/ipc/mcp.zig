@@ -1337,11 +1337,14 @@ pub const ErrCode = enum {
     io_failed,
     unknown_tool,
     failed,
+    /// Typed into an agent that showed no sign of taking it: never resent
+    /// blindly, since a late uptake would submit it twice.
+    not_delivered,
 
     pub fn retryable(self: ErrCode) bool {
         return switch (self) {
             .timeout, .unavailable, .io_failed => true,
-            .invalid_args, .not_found, .refused, .conflict, .unknown_tool, .failed => false,
+            .invalid_args, .not_found, .refused, .conflict, .unknown_tool, .failed, .not_delivered => false,
         };
     }
 };

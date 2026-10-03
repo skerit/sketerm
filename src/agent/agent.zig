@@ -163,6 +163,22 @@ pub const Agent = struct {
         };
     }
 
+    /// What would show a prompt typed now reached the app (`Uptake.tookBy`).
+    pub fn uptake(self: *const Agent) Uptake {
+        var users: usize = 0;
+        for (self.records()) |r| {
+            if (r.kind == .user) users += 1;
+        }
+        return .{
+            .turns = switch (self.source) {
+                .screen => |*e| e.starts,
+                .opencode_api => |*a| a.source.turns,
+            },
+            .users = users,
+            .queued = self.queuedPrompts(),
+        };
+    }
+
     /// When the app last showed or sent anything (monotonic `clock.nowMs`).
     pub fn lastActivityMs(self: *const Agent) i64 {
         return switch (self.source) {
@@ -190,6 +206,28 @@ pub const Agent = struct {
         return switch (self.source) {
             .screen => |*e| .{ .screen = .{ .engine = e, .loaded = self.loaded } },
             .opencode_api => |*a| .{ .opencode_api = .{ .api = a } },
+        };
+    }
+};
+
+/// The marks a prompt leaves once the app took it: a turn started (a screen
+/// app's OSC 133 prompt mark, an API source's root user message), a user
+/// record, a prompt it holds queued.
+pub const Uptake = struct {
+    turns: u64,
+    users: usize,
+    queued: u32,
+
+    /// Whether `now` (the agent in state `st`) shows the app took the
+    /// prompt typed at `self`: a new turn or user record, or for a queued
+    /// one its queue preview, else for a fresh one the state leaving the
+    /// prompt-taking ones (a turn under way, a prompt asking the user).
+    pub fn tookBy(self: Uptake, now: Uptake, st: vocab.State, queued: bool) bool {
+        if (now.turns > self.turns or now.users > self.users) return true;
+        if (queued) return now.queued > self.queued;
+        return switch (st) {
+            .working, .waiting_subagent, .waiting_user, .retrying => true,
+            .starting, .waiting_background, .idle, .exited, .disconnected => false,
         };
     }
 };
@@ -371,6 +409,22 @@ test "screen: a plan is the adapter's recipe with placeholders filled, picks res
     try t.expectEqual(@as(u32, 1), try d.pickNumber("1"));
     try t.expectError(error.NoSuchOption, d.pickNumber("haiku"));
     d.engine.interaction = null;
+}
+
+test "a prompt counts as taken only on the app's own evidence" {
+    const before: Uptake = .{ .turns = 3, .users = 3, .queued = 0 };
+    // Nothing moved and the app sits idle: a wedged app looks exactly so.
+    try t.expect(!before.tookBy(before, .idle, false));
+    try t.expect(!before.tookBy(before, .waiting_background, false));
+    try t.expect(!before.tookBy(before, .exited, false));
+    // The turn started, or ended already with its user record captured.
+    try t.expect(before.tookBy(before, .working, false));
+    try t.expect(before.tookBy(before, .waiting_user, false));
+    try t.expect(before.tookBy(.{ .turns = 4, .users = 3, .queued = 0 }, .idle, false));
+    try t.expect(before.tookBy(.{ .turns = 3, .users = 4, .queued = 0 }, .idle, false));
+    // Queued behind a busy turn: working proves nothing, the preview does.
+    try t.expect(!before.tookBy(before, .working, true));
+    try t.expect(before.tookBy(.{ .turns = 3, .users = 3, .queued = 1 }, .working, true));
 }
 
 test "screen: an action without a recipe is unsupported" {

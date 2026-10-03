@@ -483,6 +483,13 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
         }
         try res.fact("agent_list_preview", agents_ok);
         try res.fact("agent_waiter_content", agents_ok);
+        try res.fact("agent_delivery", .{
+            .available = agents_ok,
+            .confirm_ms = mcp_agent.DELIVERY_CONFIRM_MS,
+            .error_code = @tagName(@import("mcp.zig").ErrCode.not_delivered),
+            .screen = "app_evidence",
+            .api = "http_accepted",
+        });
         try res.fact("agent_send_interrupt", agents_ok);
         try res.fact("agent_read_final", agents_ok);
         try res.fact("agent_list_compact", agents_ok);
@@ -524,6 +531,7 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
             try res.textf("sub-agents: agent_open runs one of {d} adapter(s) on this machine{s}, directly or through a wrapper (binary + args + env); results carry a watch_command that wakes you when it needs attention", .{ ids.len, if (agent_ssh) " or on an SSH host (host)" else " (no ssh client here, so not on SSH hosts)" });
             try res.textf("agent_read and done results return per job its last message, earlier segment finals of {d}+ chars, messages of {d}+ chars and notices, about {d} chars per read (detail all for every message); each record reaches you once", .{ select.FINAL_MIN_CHARS, select.LONG_MIN_CHARS, select.READ_CAP_CHARS });
             try res.text("done means settled (no subagents or background tasks left running; the done after 30 minutes idle with background tasks is quiet unless background:true / --background); results and waiters share one event delivery, and agent_wait agents / agent-wait --any watch several agents (all / --all: once every one settled)");
+            try res.textf("a prompt counts as sent only once the app shows it took it (a turn, a user record, a queue preview) within {d} s; otherwise the send fails as not_delivered and is never typed again", .{@divTrunc(mcp_agent.DELIVERY_CONFIRM_MS, 1000)});
             try res.text("agent_send to a busy agent queues the prompt in its app for the next turn (outcome queued) unless interrupt, agents sends to several in one call (agents \"*\": every live agent), and agent_answer takes free text where the prompt allows it");
             try res.text("agent_read final returns just the newest job's last message, agent_list is compact unless detail, and agent_attach relaunch starts a gone agent again under its id");
             try res.text("agent_open takes permissions (name to allow/ask/deny, mapped to each app's own mechanism) and retry_on_overload (continue a turn a provider overload ended, off by default); a lost remote link that comes back to find the session gone ends the agent as exited, relaunchable");

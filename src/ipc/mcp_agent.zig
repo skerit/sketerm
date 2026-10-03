@@ -88,6 +88,9 @@ const TICK_MS: i64 = 250;
 const CLEAR_SETTLE_MS: i64 = 200;
 /// Pause after an interrupt so the reply shows the state it caused.
 const INTERRUPT_SETTLE_MS: i64 = 300;
+/// How long a screen app gets to show it took a typed prompt (a turn, a
+/// user record, a queue preview) before the send is `not_delivered`.
+pub const DELIVERY_CONFIRM_MS: i64 = 10_000;
 const DEFAULT_COLS: u16 = 120;
 const DEFAULT_ROWS: u16 = 40;
 /// Records one agent_read returns by default, and at most.
@@ -2284,7 +2287,11 @@ fn openTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
     if (o.prompt) |p| {
         if (ready) {
             switch (try submitAndWait(arena, e, p, filter, deadline, false)) {
-                .fail => |f| {
+                // Opened, but the prompt may or may not be in: an error that
+                // names the agent, which stays open for the caller to look at.
+                .fail => |f| if (f.code == .not_delivered) {
+                    return sendFailRes(arena, e, .{ .code = f.code, .msg = try std.fmt.allocPrint(arena, "agent {s} was opened, but its prompt was not delivered: {s}", .{ e.id, f.msg }) });
+                } else {
                     try notes.append(arena, try std.fmt.allocPrint(arena, "prompt not sent: {s}", .{f.msg}));
                     dv = try pending(arena, e);
                 },
@@ -3181,11 +3188,13 @@ fn submitPrompt(arena: std.mem.Allocator, e: *Entry, p: Prompt, deadline: i64, n
     } else if (try busy(arena, e)) |f| return .{ .fail = f };
     const act_deadline = @max(deadline, clock.nowMs() + STEP_WAIT_MS);
     const from = e.agent.queue().next_seq;
+    const before = e.agent.uptake();
     switch (try act(arena, e, if (queued) .{ .queue = text } else .{ .submit = text }, act_deadline)) {
         .fail => |f| return .{ .fail = f },
         .ok => {},
     }
     if (queued) if (try confirmQueued(arena, e, act_deadline)) |f| return .{ .fail = f };
+    if (try confirmDelivery(arena, e, before, queued)) |f| return .{ .fail = f };
     e.sent_seq = from;
     // The conversation has a turn now: a relaunch resumes it.
     if (!e.conversed) {
@@ -3193,6 +3202,35 @@ fn submitPrompt(arena: std.mem.Allocator, e: *Entry, p: Prompt, deadline: i64, n
         writeDescriptor(e);
     }
     return .{ .ok = queued };
+}
+
+/// A screen app showed it took the prompt typed at `before`
+/// (`agent_mod.Uptake.tookBy`); `not_delivered`, with its state and screen,
+/// when nothing shows within `DELIVERY_CONFIRM_MS`. Never retyped: a late
+/// uptake would submit it twice. An API source's HTTP acceptance (a 2xx,
+/// else `act` failed) is the app's own evidence.
+fn confirmDelivery(arena: std.mem.Allocator, e: *Entry, before: agent_mod.Uptake, queued: bool) !?Fail {
+    if (e.agent.kind() != .screen) return null;
+    const until = clock.nowMs() + DELIVERY_CONFIRM_MS;
+    service(clock.nowMs());
+    while (!before.tookBy(e.agent.uptake(), e.agent.state(), queued)) {
+        if (gone(e) or clock.nowMs() >= until) return Fail{ .code = .not_delivered, .msg = try std.fmt.allocPrint(arena, "agent {s} did not take the prompt: no turn started, no user record{s} within {d} ms after it was typed (state {s}); it is NOT delivered and was not typed again (a late uptake would submit it twice): look at the agent (agent_list, or watch its session) before sending again; the screen shows:\n{s}", .{
+            e.id, if (queued) " and no queue preview" else "", DELIVERY_CONFIRM_MS, @tagName(e.agent.state()), try screenTail(arena, e),
+        }) };
+        pump(until - clock.nowMs());
+    }
+    return null;
+}
+
+/// A failed send as its error result: `not_delivered` carries the agent,
+/// its state and the bound as details.
+fn sendFailRes(arena: std.mem.Allocator, e: *Entry, f: Fail) ![]const u8 {
+    if (f.code != .not_delivered) return errRes(arena, f.code, f.msg);
+    return mcp.errResDetails(arena, f.code, f.msg, @as(?struct { agent: []const u8, state: []const u8, waited_ms: i64 }, .{
+        .agent = e.id,
+        .state = @tagName(e.agent.state()),
+        .waited_ms = DELIVERY_CONFIRM_MS,
+    }));
 }
 
 /// What agent_send `interrupt` did to one agent before its prompt.
@@ -3611,7 +3649,7 @@ fn sendTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]const 
         if (stop[0].fail) |f| return errRes(arena, f.code, f.msg);
     }
     switch (try submitAndWait(arena, e, text, filter, deadlineFrom(args, DEFAULT_WAIT_MS), interrupt)) {
-        .fail => |f| return errRes(arena, f.code, f.msg),
+        .fail => |f| return sendFailRes(arena, e, f),
         .ok => |dv| {
             var res = Res.init(arena);
             const queued = if (dv.wait) |w| w.queued else false;

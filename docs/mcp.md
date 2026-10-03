@@ -1088,6 +1088,24 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   `agent_read final` returns it whole), `settled`, `events`. What it
   reports is delivered like a waiter's line, and it marks no record. Its
   `watch_command` is `agent-wait --all`.
+- **Delivery is confirmed (`capabilities.agent_delivery`).** `sent` and
+  `queued` mean the app TOOK the prompt, never only that it was typed: a
+  wedged Claude Code once showed `idle` while three `agent_send` calls
+  answered `sent` and nothing arrived. After typing, a screen app must
+  show it took the prompt within 10 s (`DELIVERY_CONFIRM_MS`): a turn
+  starting (its OSC 133 prompt mark, or a state that leaves the
+  prompt-taking ones: working, waiting on the user), a user record, or
+  for a queued prompt its queue preview (`agent_mod.Uptake`). Otherwise
+  the call fails with error code `not_delivered` (details `agent`,
+  `state`, `waited_ms`; the message carries the screen) and the prompt is
+  NOT typed again, since an app that wakes up late would then run it
+  twice: look at the agent before resending. This holds for every send
+  path: `agent_send` (one agent, `agents` where it is that agent's
+  `failed` line, `timeout_ms: 0`, a queued send), `agent_open`'s prompt
+  (an error naming the agent, which stays open) and a
+  `retry_on_overload` continue (a notice). opencode's prompt is an HTTP
+  call whose 2xx is the server's own acceptance; any other answer already
+  fails the send.
 - **One prompt to several agents, and interrupting first
   (`capabilities.agent_send_many`, `agent_send_interrupt`).** `agent_send
   interrupt: true` interrupts a busy agent (working, or waiting on the

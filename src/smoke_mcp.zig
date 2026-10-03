@@ -5972,8 +5972,9 @@ fn fcConversation(buf: []u8, id: []const u8) [:0]const u8 {
 /// a `$` box, `you:`/`claude:`/`tool:` lines, busy/idle title glyphs,
 /// OSC 133 turn marks with BEL, a numbered permission prompt that waits
 /// for its answer, a subagent wait, a message flood, the `/model` picker
-/// (applied a moment after `s`, as the real one does), `/exit`, and
-/// conversations kept per `--session-id` that `--resume` reprints. It
+/// (applied a moment after `s`, as the real one does), `/exit`,
+/// conversations kept per `--session-id` that `--resume` reprints, and
+/// `go deaf`, after which it swallows all input as a wedged one did. It
 /// refuses to start with a CLAUDE* variable a nested Claude Code must not
 /// inherit, and marks anything that would save the user's defaults
 /// (`/effort`, a picker's Enter).
@@ -6030,6 +6031,8 @@ fn fakeClaude(allocator: std.mem.Allocator, args: []const [*:0]const u8) u8 {
     var choice: u8 = 0;
     var model_picker = false;
     var model_choice: u8 = 0;
+    // `go deaf` answered: every later byte is swallowed, nothing is drawn.
+    var deaf = false;
     while (true) {
         const now = nowMs();
         var i: usize = 0;
@@ -6050,6 +6053,7 @@ fn fakeClaude(allocator: std.mem.Allocator, args: []const [*:0]const u8) u8 {
         if (n == 0) return 0;
         if (n < 0) continue;
         for (buf[0..@intCast(n)]) |b| {
+            if (deaf) continue;
             if (model_picker) {
                 const label = if (model_choice == 1) "Sonnet 4.5" else "Haiku 4.5";
                 switch (b) {
@@ -6105,6 +6109,9 @@ fn fakeClaude(allocator: std.mem.Allocator, args: []const [*:0]const u8) u8 {
                         const saved = std.fmt.allocPrint(allocator, FC_ERASE ++ "you: {s}\r\nSet effort level to {s} (saved as your default for new sessions)\r\n" ++ FC_LIVE, .{ text, std.mem.trim(u8, text["/effort".len..], " ") }) catch return 1;
                         writeOut(saved);
                         allocator.free(saved);
+                    } else if (std.mem.eql(u8, text, "go deaf")) {
+                        fcTurn(allocator, &steps, text, conv_path);
+                        deaf = true;
                     } else fcTurn(allocator, &steps, text, conv_path);
                     input.clearRetainingCapacity();
                 },
@@ -6937,6 +6944,29 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
         if (std.mem.indexOf(u8, any_out, std.fmt.allocPrint(arena, "{s} done: echo: slow from two", .{c2}) catch fail("oom")) == null) {
             say(any_out);
             fail("the --any waiter did not wake on the second agent, by name");
+        }
+        // Delivery is confirmed: every send above needed the app's evidence
+        // (a turn, a record), and a prompt the app swallows (the fake goes
+        // deaf, as a wedged Claude Code did) fails as not_delivered, on the
+        // one-agent path with timeout_ms 0 and on the agents path, never
+        // as `sent`.
+        const deafened = agentCall(&m, arena, "agent_send", "{\"agent\":\"claude-2\",\"text\":\"go deaf\",\"timeout_ms\":20000}", "agent_send go deaf", false, 45_000);
+        expectFact(deafened, "outcome", "done", "agent_send go deaf: outcome");
+        const caps_d = agentCall(&m, arena, "capabilities", "{}", "capabilities delivery", false, 15_000);
+        const deliv = (caps_d.get("agent_delivery") orelse fail("capabilities: no agent_delivery")).object;
+        expectFact(deliv, "error_code", "not_delivered", "capabilities: agent_delivery error code");
+        {
+            const t0 = nowMs();
+            const lost = agentCall(&m, arena, "agent_send", "{\"agent\":\"claude-2\",\"text\":\"are you there\",\"timeout_ms\":0}", "agent_send to a deaf app", true, 45_000);
+            const err = (lost.get("error") orelse fail("agent_send to a deaf app: no error")).object;
+            expectFact(err, "code", "not_delivered", "agent_send to a deaf app: code");
+            const details = (err.get("details") orelse fail("agent_send to a deaf app: no details")).object;
+            expectFact(details, "state", "idle", "agent_send to a deaf app: the state it was left in");
+            if (nowMs() - t0 < deliv.get("confirm_ms").?.integer) fail("agent_send to a deaf app: failed before the confirmation bound");
+            const many_lost = agentCall(&m, arena, "agent_send", "{\"agents\":[\"claude-2\"],\"text\":\"still there\"}", "agent_send agents to a deaf app", false, 45_000);
+            const r0 = many_lost.get("results").?.array.items[0].object;
+            expectFact(r0, "outcome", "failed", "agent_send agents to a deaf app: outcome");
+            expectFact(r0.get("error").?.object, "code", "not_delivered", "agent_send agents to a deaf app: code");
         }
         _ = agentCall(&m, arena, "agent_close", "{\"agent\":\"claude-2\"}", "agent_close claude-2", false, 15_000);
 
