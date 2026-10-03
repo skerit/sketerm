@@ -85,7 +85,8 @@
     "text_options": [
       { "kind": "permission", "pattern": "^No$" }
     ],
-    "resume_refused": { "prefix": "No conversation found with session ID: " }
+    "resume_refused": { "prefix": "No conversation found with session ID: " },
+    "paste": { "lead_in": "Here are my instructions: ", "over_chars": 800, "pause_ms": 300 }
   },
   "actions": {
     "submit": [

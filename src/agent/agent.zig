@@ -278,12 +278,16 @@ pub const ScreenDriver = struct {
             .set_model => |x| values.model = x,
             .set_effort => |x| values.effort = x,
         }
-        return planSteps(allocator, steps, values);
+        // A prompt the app would collapse into a paste placeholder is led
+        // in by typed words (`screen.paste`), so it reads as the user's.
+        const paste: ?adapter.Paste = if (self.loaded.spec.screen) |sc| sc.paste else null;
+        const lead = if (paste) |p| (if (values.text) |x| p.collapses(x) else false) else false;
+        return planSteps(allocator, steps, values, if (lead) paste else null);
     }
 
     /// The adapter's `launch.exit` recipe (empty when it has none).
     pub fn exitPlan(self: ScreenDriver, allocator: std.mem.Allocator) !Plan {
-        return planSteps(allocator, self.loaded.spec.launch.exit, .{});
+        return planSteps(allocator, self.loaded.spec.launch.exit, .{}, null);
     }
 
     pub fn inputEmpty(self: ScreenDriver) bool {
@@ -321,18 +325,26 @@ pub const ScreenDriver = struct {
     }
 };
 
-fn planSteps(allocator: std.mem.Allocator, steps: []const adapter.Step, values: std.enums.EnumFieldStruct(adapter.Placeholder, ?[]const u8, @as(?[]const u8, null))) !Plan {
+/// @param lead_in the step typing exactly `{text}` gets this paste's lead-in
+/// and pause before it.
+fn planSteps(allocator: std.mem.Allocator, steps: []const adapter.Step, values: std.enums.EnumFieldStruct(adapter.Placeholder, ?[]const u8, @as(?[]const u8, null)), lead_in: ?adapter.Paste) !Plan {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
     const a = arena.allocator();
-    const out = try a.alloc(adapter.Step, steps.len);
-    for (steps, out) |s, *o| o.* = switch (s) {
-        .text => |x| .{ .text = try adapter.expand(a, x, values) },
-        .command => |x| .{ .command = try adapter.expand(a, x, values) },
-        .pick => |x| .{ .pick = try adapter.expand(a, x, values) },
-        .key, .sleep_ms, .clear_input, .wait, .confirm, .relaunch => s,
-    };
-    return .{ .arena = arena, .steps = out };
+    var out: std.ArrayList(adapter.Step) = .empty;
+    for (steps) |s| {
+        if (lead_in) |p| if (s == .text and std.mem.eql(u8, s.text, "{text}")) {
+            try out.append(a, .{ .text = p.lead_in });
+            try out.append(a, .{ .sleep_ms = p.pause_ms });
+        };
+        try out.append(a, switch (s) {
+            .text => |x| .{ .text = try adapter.expand(a, x, values) },
+            .command => |x| .{ .command = try adapter.expand(a, x, values) },
+            .pick => |x| .{ .pick = try adapter.expand(a, x, values) },
+            .key, .sleep_ms, .clear_input, .wait, .confirm, .relaunch => s,
+        });
+    }
+    return .{ .arena = arena, .steps = out.items };
 }
 
 pub const Plan = struct {
@@ -425,6 +437,37 @@ test "a prompt counts as taken only on the app's own evidence" {
     // Queued behind a busy turn: working proves nothing, the preview does.
     try t.expect(!before.tookBy(before, .working, true));
     try t.expect(before.tookBy(.{ .turns = 3, .users = 3, .queued = 1 }, .working, true));
+}
+
+test "screen: a prompt the app would collapse into a paste is led in by typed words" {
+    var set = adapter.Set.init(t.allocator);
+    defer set.deinit();
+    try set.loadShipped();
+    const claude = set.get("claude").?;
+    var agent = try Agent.initScreen(t.allocator, claude, .{});
+    defer agent.deinit();
+    const p = claude.spec.screen.?.paste.?;
+    // Over the char threshold.
+    const long = "x" ** 801;
+    for ([_][]const u8{long}) |text| {
+        var plan = try agent.driver().screen.plan(t.allocator, .{ .submit = text });
+        defer plan.deinit();
+        var at: ?usize = null;
+        for (plan.steps, 0..) |s, i| if (s == .text and std.mem.eql(u8, s.text, text)) {
+            at = i;
+        };
+        try t.expect(at.? >= 2);
+        try t.expectEqualStrings(p.lead_in, plan.steps[at.? - 2].text);
+        try t.expectEqual(p.pause_ms, plan.steps[at.? - 1].sleep_ms);
+    }
+    // Short prompts (a retry's "continue", several typed lines: measured,
+    // Claude Code 2.1.288 collapses only a chunk over 800 bytes) are typed
+    // as they are.
+    for ([_][]const u8{ "continue", "x" ** 800, "one\ntwo\nthree\nfour" }) |text| {
+        var plan = try agent.driver().screen.plan(t.allocator, .{ .queue = text });
+        defer plan.deinit();
+        for (plan.steps) |s| if (s == .text) try t.expect(!std.mem.eql(u8, s.text, p.lead_in));
+    }
 }
 
 test "screen: an action without a recipe is unsupported" {

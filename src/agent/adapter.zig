@@ -163,6 +163,31 @@ pub const ScreenSpec = struct {
     /// it does not have: `agent_open resume` then fails naming the id, and
     /// no new conversation is left running in its name.
     resume_refused: ?LineRule = null,
+    /// Input the app collapses into a paste placeholder, which the model
+    /// then reads as pasted text: a prompt over the threshold gets
+    /// `lead_in` typed first (by the recipe step that types `{text}`).
+    paste: ?Paste = null,
+};
+
+/// When an app collapses typed input into a paste placeholder, and the
+/// words typed before such a prompt so that it reads as the user's.
+pub const Paste = struct {
+    lead_in: []const u8,
+    /// Collapsed when longer than this many bytes ...
+    over_chars: u32,
+    /// ... or holding more than this many line breaks (null: line breaks
+    /// alone never collapse it).
+    over_newlines: ?u32 = null,
+    /// Between the lead-in and the prompt, so the app takes them as two
+    /// inputs instead of merging the lead-in into the paste.
+    pause_ms: u32 = 300,
+
+    /// Whether the app would collapse `text`.
+    pub fn collapses(self: Paste, text: []const u8) bool {
+        if (text.len > self.over_chars) return true;
+        const lines = self.over_newlines orelse return false;
+        return std.mem.count(u8, text, "\n") > lines;
+    }
 };
 
 /// An interaction option that takes free text: its label matches exactly
@@ -478,6 +503,10 @@ const Validator = struct {
         for (sc.chrome, chrome, 0..) |r, *out, i| out.* = try self.rule(r, "screen.chrome", i);
         const texts = try self.arena.alloc(TextOptionMatcher, sc.text_options.len);
         for (sc.text_options, texts, 0..) |r, *out, i| out.* = .{ .kind = r.kind, .matcher = try self.rule(.{ .prefix = r.prefix, .pattern = r.pattern }, "screen.text_options", i) };
+        if (sc.paste) |p| {
+            if (p.lead_in.len == 0) return self.fail("screen.paste.lead_in is empty", .{});
+            if (p.over_chars == 0) return self.fail("screen.paste.over_chars is 0", .{});
+        }
         return .{
             .spec = sc,
             .footer = if (sc.footer) |r| try self.rule(r, "screen.footer", null) else null,

@@ -1598,6 +1598,21 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   ssh said), never a silent plain-ssh agent. `transport: "ssh"` asks for
   the plain ssh session explicitly. A remote opencode's port forward is
   this server's own ssh, re-created on a free local port on attach.
+- **Long prompts and Claude Code's paste collapse.** Claude Code 2.1.288
+  collapses typed input it reads as a paste into `[Pasted text #N]`, and
+  the model receives it inside `<pasted_content>` (measured: a single
+  write over 800 bytes collapses, a 99-byte four-line one does not; the
+  threshold is `bJ=800` in the bundled CLI's paste handler, which also
+  collapses more than `min(rows-10, 2)` line breaks of a real bracketed
+  paste). The adapter's `screen.paste` (`lead_in`, `over_chars`,
+  optional `over_newlines`, `pause_ms`) makes the recipe step that types
+  `{text}` type `Here are my instructions: ` first and pause 300 ms, so the
+  message reads as typed words followed by the pasted block; short prompts
+  (a retry's `continue`) get nothing, and no sender line is ever added.
+  One real Haiku 4.5 run showed the transcript as `Here are my
+  instructions: ` + `<pasted_content>`, yet Haiku still declined to act on
+  pasted instructions, so the lead-in is a declaration an adapter can
+  change.
 - **Startup prompts.** A prompt the app shows before it is ready is still
   an interaction (state `waiting_user`, `needs_input`), so `agent_open`
   returns instead of sitting in `starting`: Claude Code's "trust this
