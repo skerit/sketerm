@@ -19,6 +19,7 @@
 
 const std = @import("std");
 const c = @import("../c.zig").c;
+const managerwin = @import("managerwin.zig");
 const cast = @import("../util/cast.zig");
 const webstore = @import("webstore.zig");
 const webface = @import("webface.zig");
@@ -107,18 +108,9 @@ pub fn openManager(win: *Window) void {
 
     const root = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
 
-    const scroller = c.gtk_scrolled_window_new();
-    c.gtk_widget_set_vexpand(scroller, 1);
-    c.gtk_scrolled_window_set_policy(@ptrCast(scroller), c.GTK_POLICY_NEVER, c.GTK_POLICY_AUTOMATIC);
-    c.gtk_list_box_set_selection_mode(@ptrCast(self.listbox), c.GTK_SELECTION_NONE);
-    c.gtk_scrolled_window_set_child(@ptrCast(scroller), self.listbox);
-    c.gtk_box_append(@ptrCast(root), scroller);
+    c.gtk_box_append(@ptrCast(root), managerwin.scrolledList(self.listbox));
 
-    const footer = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8);
-    c.gtk_widget_set_margin_start(footer, 10);
-    c.gtk_widget_set_margin_end(footer, 10);
-    c.gtk_widget_set_margin_top(footer, 6);
-    c.gtk_widget_set_margin_bottom(footer, 8);
+    const footer = managerwin.paddedRow(6, 8);
     c.gtk_entry_set_placeholder_text(@ptrCast(self.new_name), "New container name");
     c.gtk_widget_set_hexpand(self.new_name, 1);
     _ = c.g_signal_connect_data(self.new_name, "activate", @ptrCast(&onCreateClicked), self, null, c.G_CONNECT_DEFAULT);
@@ -169,11 +161,7 @@ fn rebuild(self: *Manager) void {
         if (ctn.ephemeral) continue;
         shown += 1;
 
-        const row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8);
-        c.gtk_widget_set_margin_start(row, 10);
-        c.gtk_widget_set_margin_end(row, 10);
-        c.gtk_widget_set_margin_top(row, 4);
-        c.gtk_widget_set_margin_bottom(row, 4);
+        const row = managerwin.paddedRow(4, 4);
 
         const color = c.gtk_drop_down_new_from_strings(@ptrCast(&palette_names));
         c.gtk_drop_down_set_selected(@ptrCast(color), colorIndex(ctn.color));

@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const c = @import("../c.zig").c;
+const managerwin = @import("managerwin.zig");
 const cast = @import("../util/cast.zig");
 const filtersub = @import("../web/filtersub.zig");
 const Window = @import("window.zig").Window;
@@ -63,16 +64,9 @@ pub fn openManager(win: *Window) void {
     c.gtk_widget_set_margin_top(intro, 8);
     c.gtk_box_append(@ptrCast(root), intro);
 
-    const scroller = c.gtk_scrolled_window_new();
-    c.gtk_widget_set_vexpand(scroller, 1);
-    c.gtk_scrolled_window_set_policy(@ptrCast(scroller), c.GTK_POLICY_NEVER, c.GTK_POLICY_AUTOMATIC);
-    c.gtk_list_box_set_selection_mode(@ptrCast(self.listbox), c.GTK_SELECTION_NONE);
-    c.gtk_scrolled_window_set_child(@ptrCast(scroller), self.listbox);
-    c.gtk_box_append(@ptrCast(root), scroller);
+    c.gtk_box_append(@ptrCast(root), managerwin.scrolledList(self.listbox));
 
-    const add_row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8);
-    c.gtk_widget_set_margin_start(add_row, 10);
-    c.gtk_widget_set_margin_end(add_row, 10);
+    const add_row = managerwin.paddedRow(0, 0);
     c.gtk_entry_set_placeholder_text(@ptrCast(self.entry), "https://easylist.to/easylist/easylist.txt");
     c.gtk_widget_set_hexpand(self.entry, 1);
     _ = c.g_signal_connect_data(self.entry, "activate", @ptrCast(&onEntryActivate), self, null, c.G_CONNECT_DEFAULT);
@@ -111,11 +105,7 @@ fn rebuild(self: *Manager) void {
         c.gtk_list_box_remove(@ptrCast(self.listbox), @ptrCast(row));
     const lists = self.win.config.filter_lists.items;
     for (lists, 0..) |url, i| {
-        const row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8);
-        c.gtk_widget_set_margin_start(row, 10);
-        c.gtk_widget_set_margin_end(row, 10);
-        c.gtk_widget_set_margin_top(row, 4);
-        c.gtk_widget_set_margin_bottom(row, 4);
+        const row = managerwin.paddedRow(4, 4);
         var zbuf: [2048]u8 = undefined;
         const z = std.fmt.bufPrintZ(&zbuf, "{s}", .{url[0..@min(url.len, 2000)]}) catch continue;
         const label = c.gtk_label_new(z.ptr);

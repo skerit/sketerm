@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const c = @import("../c.zig").c;
+const managerwin = @import("managerwin.zig");
 const cast = @import("../util/cast.zig");
 const webstore = @import("webstore.zig");
 const webface = @import("webface.zig");
@@ -63,18 +64,9 @@ pub fn openManager(win: *Window) void {
 
     const root = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
 
-    const scroller = c.gtk_scrolled_window_new();
-    c.gtk_widget_set_vexpand(scroller, 1);
-    c.gtk_scrolled_window_set_policy(@ptrCast(scroller), c.GTK_POLICY_NEVER, c.GTK_POLICY_AUTOMATIC);
-    c.gtk_list_box_set_selection_mode(@ptrCast(self.listbox), c.GTK_SELECTION_NONE);
-    c.gtk_scrolled_window_set_child(@ptrCast(scroller), self.listbox);
-    c.gtk_box_append(@ptrCast(root), scroller);
+    c.gtk_box_append(@ptrCast(root), managerwin.scrolledList(self.listbox));
 
-    const footer = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8);
-    c.gtk_widget_set_margin_start(footer, 10);
-    c.gtk_widget_set_margin_end(footer, 10);
-    c.gtk_widget_set_margin_top(footer, 6);
-    c.gtk_widget_set_margin_bottom(footer, 8);
+    const footer = managerwin.paddedRow(6, 8);
     c.gtk_label_set_xalign(@ptrCast(self.status), 0.0);
     c.gtk_widget_set_hexpand(self.status, 1);
     c.gtk_widget_add_css_class(self.status, "dim-label");
@@ -115,11 +107,7 @@ fn onListReply(ctx: ?*anyopaque, ok: bool, payload: []const u8) void {
         c.gtk_list_box_remove(@ptrCast(self.listbox), @ptrCast(row));
 
     for (scripts) |s| {
-        const row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8);
-        c.gtk_widget_set_margin_start(row, 10);
-        c.gtk_widget_set_margin_end(row, 10);
-        c.gtk_widget_set_margin_top(row, 4);
-        c.gtk_widget_set_margin_bottom(row, 4);
+        const row = managerwin.paddedRow(4, 4);
 
         var name_z: [280]u8 = undefined;
         const shown = if (s.name.len > 0) s.name else "(unnamed script)";
@@ -297,11 +285,7 @@ pub fn openSiteStyle(win: *Window, host: []const u8) void {
     c.gtk_scrolled_window_set_child(@ptrCast(scroller), self.text);
     c.gtk_box_append(@ptrCast(root), scroller);
 
-    const footer = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8);
-    c.gtk_widget_set_margin_start(footer, 10);
-    c.gtk_widget_set_margin_end(footer, 10);
-    c.gtk_widget_set_margin_top(footer, 6);
-    c.gtk_widget_set_margin_bottom(footer, 8);
+    const footer = managerwin.paddedRow(6, 8);
     c.gtk_check_button_set_active(@ptrCast(self.enabled), 1);
     c.gtk_box_append(@ptrCast(footer), self.enabled);
     c.gtk_label_set_xalign(@ptrCast(self.status), 0.0);
