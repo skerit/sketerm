@@ -1,4 +1,4 @@
-//! Lenient JSON number coercions for LSP and other wire payloads,
+//! Lenient JSON number (and string) coercions for LSP and other wire payloads,
 //! where a missing field and a wrongly typed field must both degrade
 //! to a usable value rather than fail the whole message.
 
@@ -9,6 +9,15 @@ pub fn intOf(v: ?std.json.Value) ?i64 {
     const val = v orelse return null;
     return switch (val) {
         .integer => |i| i,
+        else => null,
+    };
+}
+
+/// @return the text of a `string` node, null for anything else.
+pub fn strOf(v: ?std.json.Value) ?[]const u8 {
+    const val = v orelse return null;
+    return switch (val) {
+        .string => |s| s,
         else => null,
     };
 }
@@ -40,6 +49,13 @@ test "intOf accepts only integer nodes" {
     try t.expectEqual(@as(?i64, null), intOf(.{ .float = 7.5 }));
     try t.expectEqual(@as(?i64, null), intOf(.{ .string = "7" }));
     try t.expectEqual(@as(?i64, null), intOf(.null));
+}
+
+test "strOf accepts only string nodes" {
+    try t.expectEqual(@as(?[]const u8, null), strOf(null));
+    try t.expectEqualStrings("7", strOf(.{ .string = "7" }).?);
+    try t.expectEqual(@as(?[]const u8, null), strOf(.{ .integer = 7 }));
+    try t.expectEqual(@as(?[]const u8, null), strOf(.null));
 }
 
 test "countOf floors at zero" {

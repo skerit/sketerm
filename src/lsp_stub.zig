@@ -891,13 +891,7 @@ fn objGet(v: std.json.Value, key: []const u8) ?std.json.Value {
     };
 }
 
-fn strOf(v: ?std.json.Value) ?[]const u8 {
-    const val = v orelse return null;
-    return switch (val) {
-        .string => |s| s,
-        else => null,
-    };
-}
+const strOf = jsonnum.strOf;
 
 const intOf = jsonnum.countOf;
 

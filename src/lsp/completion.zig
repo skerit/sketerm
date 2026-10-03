@@ -182,13 +182,7 @@ pub fn assemble(
     return edits;
 }
 
-fn strOf(v: ?std.json.Value) ?[]const u8 {
-    const val = v orelse return null;
-    return switch (val) {
-        .string => |s| s,
-        else => null,
-    };
-}
+const strOf = @import("../util/jsonnum.zig").strOf;
 
 // ======================================================================
 // Tests

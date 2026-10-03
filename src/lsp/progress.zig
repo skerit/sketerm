@@ -106,13 +106,7 @@ fn copyInto(dst: anytype, len: *usize, src: []const u8) void {
     len.* = n;
 }
 
-fn strOf(v: ?std.json.Value) ?[]const u8 {
-    const val = v orelse return null;
-    return switch (val) {
-        .string => |s| s,
-        else => null,
-    };
-}
+const strOf = @import("../util/jsonnum.zig").strOf;
 
 /// A progress token as text: strings verbatim, integers in decimal.
 fn tokenOf(v: std.json.Value, buf: []u8) ?[]const u8 {

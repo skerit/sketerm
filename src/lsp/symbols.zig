@@ -80,13 +80,7 @@ fn walk(
     }
 }
 
-fn strOf(v: ?std.json.Value) ?[]const u8 {
-    const val = v orelse return null;
-    return switch (val) {
-        .string => |s| s,
-        else => null,
-    };
-}
+const strOf = jsonnum.strOf;
 
 const intOf = jsonnum.intOf;
 

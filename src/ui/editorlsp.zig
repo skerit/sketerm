@@ -3884,13 +3884,7 @@ fn firstLine(s: []const u8) []const u8 {
     return s[0 .. std.mem.indexOfScalar(u8, s, '\n') orelse s.len];
 }
 
-fn strOf(v: ?std.json.Value) ?[]const u8 {
-    const val = v orelse return null;
-    return switch (val) {
-        .string => |s| s,
-        else => null,
-    };
-}
+const strOf = @import("../util/jsonnum.zig").strOf;
 
 const TextDocumentVersion = union(enum) {
     unversioned,
