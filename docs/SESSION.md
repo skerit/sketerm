@@ -1,5 +1,38 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-03: sub-agent fixes from an overnight run of 28 agents
+
+`sent` now means the app took the prompt: a wedged Claude Code had shown
+`idle` while three `agent_send` calls answered `sent` and nothing arrived.
+Every send path (one agent, `agents`, `timeout_ms: 0`, queued, agent_open's
+prompt, a retry's continue) waits up to 10 s (`DELIVERY_CONFIRM_MS`) for a
+screen app's evidence (`agent.Uptake`: a turn, a user record, a queue
+preview) and otherwise fails with the new error code `not_delivered`,
+never retyping; opencode's 2xx stays its evidence
+(`capabilities.agent_delivery`). The background cap's `done` after 30
+minutes is quiet (`events.Quiet.background`, opted into like a retrying
+error with `background` / `--background`) and settles no turn; the settled
+done once the tasks end still wakes. The plain waiter prints
+`agentpush.compose`'s text, so a done carries its answer (and a message
+its text, a prompt its options) and hands that record out like the push
+routes. opencode's `Connection reset by server` / `ECONNRESET` are
+`overloaded`, so `retry_on_overload` answers them. `agents: "*"` on
+agent_send and agent_wait is every live agent; compact `agent_list` has a
+`preview` of each newest job's last message (`select.newestFinal`, handing
+nothing out); `stall_after_min` raises one `stalled` event per silence
+while busy (`src/agent/stall.zig`, kept in the descriptor).
+
+Some reported false dones showed state `idle` while a background job ran,
+a mode-line detection miss; without a capture no grammar was changed.
+
+Validation (2026-10-03): test-core 3,123 pass (3 skips), test 3,968 pass
+(19 skips). smoke-mcp stopped at stage 1 on a doctor warning about an
+unrelated 17-day-old daemon whose socket was removed, so its agent stages
+ran focused: `SKETERM_SMOKE_MCP_AGENT_ONLY` (the fake Claude Code gone deaf
+fails `not_delivered` on both send paths) and `..._AGENTSSH_ONLY`, both
+green. The background cap and the stall alarm need 30 / N minutes and are
+unit-tested only.
+
 ## 2026-10-02: restricted headless rendering and native media emulation
 
 `policy.untrusted:true` selects a Linux-only, direct-route, ephemeral helper.
