@@ -4281,6 +4281,8 @@ fn listCompact(arena: std.mem.Allocator) ![]const u8 {
         conversation: ?[]const u8,
         relaunchable: ?bool,
         gone_reason: ?[]const u8,
+        /// The newest job's last assistant message, first line, clipped.
+        preview: ?[]const u8,
     };
     const items = try arena.alloc(Item, state.entries.items.len);
     var res = Res.init(arena);
@@ -4302,6 +4304,8 @@ fn listCompact(arena: std.mem.Allocator) ![]const u8 {
             .conversation = conversationOf(e),
             .relaunchable = relaunchableOf(e),
             .gone_reason = if (e.gone_why) |g| g.reasonName() else null,
+            // A glance, never a delivery: nothing is marked handed.
+            .preview = if (select.newestFinal(e.agent.records())) |i| events.preview(e.agent.records()[i].text) else null,
         };
         var aw: std.Io.Writer.Allocating = .init(arena);
         const w = &aw.writer;
@@ -4313,6 +4317,7 @@ fn listCompact(arena: std.mem.Allocator) ![]const u8 {
         if (out.idle_s) |x| try w.print(", idle {d}s", .{x});
         if (out.queued > 0) try w.print(", {d} queued", .{out.queued});
         if (out.pending) |p| try w.print(", pending {s}: {s}", .{ p.kind, agentwait.clip(events.firstLine(p.title), 80) });
+        if (out.preview) |p| try w.print("; last: {s}", .{p});
         try res.text(aw.written());
     }
     try res.raw("agents", try toJson(arena, items));
@@ -5613,6 +5618,10 @@ test "the plain waiter prints the push text: a done's answer in full, then hande
     const eng = &ag.source.screen;
     const answer = "Both fixes are in and the suite is green; the flaky socket test was a real ordering bug.";
     try eng.records.append(state.allocator, .{ .id = 7, .kind = .assistant, .text = try state.allocator.dupe(u8, answer), .job = 0 });
+    // The compact list's preview is a glance: it hands nothing out.
+    const listed = try shaped(a, "agent_list", try rig.call(.agent_list, "{}"));
+    try testing.expectEqualStrings(answer, listed.get("agents").?.array.items[0].object.get("preview").?.string);
+    try testing.expect(!e.handed.has(eng.records.items[0]));
 
     const fd = c.socket(c.AF_UNIX, c.SOCK_STREAM, 0);
     defer _ = c.close(fd);

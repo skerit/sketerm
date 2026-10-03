@@ -1544,8 +1544,12 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   cost ~5k tokens): `agent` (the id), `name`, `app`, `state`, `host` (or
   `local`), `cwd` (which clone a worker is in), `idle_s` (seconds since
   the app last drew or sent anything), `queued` (prompts its app holds),
-  `pending` (the prompt it waits on: `kind` and `title`) and
-  `conversation`; `detail: false` says which. `detail: true` gives every
+  `pending` (the prompt it waits on: `kind` and `title`), `preview` (the
+  first line, at most 120 bytes, of its newest job's last assistant
+  message, `select.newestFinal`: a glance that hands nothing out, so
+  `agent_read final` still returns it whole; absent before that job has
+  one; `capabilities.agent_list_preview`) and `conversation`;
+  `detail: false` says which. `detail: true` gives every
   fact: where and how it runs: `host` (absent: this machine),
   `transport`, `cwd`, `binary`, `model` and
   `effort` when known (Claude Code: the launch value or the model chosen

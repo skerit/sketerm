@@ -475,6 +475,7 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
         try res.fact("agent_wait_all", agents_ok);
         try res.fact("agent_send_many", agents_ok);
         try res.fact("agent_agents_every", agents_ok);
+        try res.fact("agent_list_preview", agents_ok);
         try res.fact("agent_waiter_content", agents_ok);
         try res.fact("agent_send_interrupt", agents_ok);
         try res.fact("agent_read_final", agents_ok);

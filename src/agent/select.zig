@@ -84,6 +84,16 @@ fn lastMessage(records: []const Record, job: u32) ?usize {
     return null;
 }
 
+/// The index of the newest job's last assistant message (what a `final`
+/// read returns), or null when that job has none yet. Looking it up hands
+/// nothing out.
+pub fn newestFinal(records: []const Record) ?usize {
+    if (records.len == 0) return null;
+    var newest: u32 = 0;
+    for (records) |r| newest = @max(newest, r.job);
+    return lastMessage(records, newest);
+}
+
 /// The job's answer: its most recent selected message of at least
 /// `FINAL_MIN_CHARS`, else its last message ("" when it has none).
 pub fn answer(records: []const Record, job: u32) []const u8 {
@@ -880,6 +890,18 @@ test "final only: the job's last assistant message, once, then a pointer at it" 
     const reread = try select(t.allocator, &records, &one, .{ .final_only = true });
     defer reread.deinit(t.allocator);
     try t.expectEqual(@as(usize, 1), reread.picked.len);
+}
+
+test "the newest job's final: its last assistant message, none while it has not answered" {
+    var records = [_]Record{
+        rec(1, 0, .user, "one"),
+        rec(2, 0, .assistant, "first answer"),
+        rec(3, 0, .notice, "compacted"),
+    };
+    try t.expectEqual(@as(?usize, 1), newestFinal(&records));
+    var more = [_]Record{ records[0], records[1], rec(4, 1, .user, "two"), rec(5, 1, .tool, "Bash (ls)") };
+    try t.expect(newestFinal(&more) == null);
+    try t.expect(newestFinal(records[0..0]) == null);
 }
 
 test "chars counts code points" {
