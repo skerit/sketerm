@@ -94,6 +94,7 @@ const clock = @import("../util/clock.zig");
 const webprofiles = @import("webprofiles.zig");
 const webremote = @import("webprofilesremote.zig");
 const netpolicy = @import("../web/netpolicy.zig");
+const download_policy = @import("../web/download.zig");
 const capture = @import("../web/capture.zig");
 const webroute = @import("../web/route.zig");
 const socksbridge = @import("socksbridge.zig");
@@ -3126,27 +3127,6 @@ pub const Engine = struct {
         return dir;
     }
 
-    /// `<dir>/<name>`, with " (n)" before the extension while the plain
-    /// name is taken — a download must never silently overwrite a file
-    /// the user already has.
-    fn uniqueDownloadPath(buf: []u8, dir: []const u8, name: []const u8) ?[]const u8 {
-        const dot = blk: {
-            const at = std.mem.lastIndexOfScalar(u8, name, '.') orelse break :blk name.len;
-            break :blk if (at == 0) name.len else at;
-        };
-        var n: u32 = 0;
-        while (n < 1000) : (n += 1) {
-            const candidate = if (n == 0)
-                std.fmt.bufPrint(buf, "{s}/{s}", .{ dir, name }) catch return null
-            else
-                std.fmt.bufPrint(buf, "{s}/{s} ({d}){s}", .{ dir, name[0..dot], n, name[dot..] }) catch return null;
-            var z: [4096:0]u8 = undefined;
-            const zp = pathz.pathZ(&z, candidate) catch return null;
-            if (c.access(zp, c.F_OK) != 0) return candidate;
-        }
-        return null;
-    }
-
     /// A suggested file name reduced to a leaf that is safe to join
     /// onto a directory: no separators, no `..`, never empty.
     fn safeLeaf(name: []const u8) []const u8 {
@@ -3207,7 +3187,7 @@ pub const Engine = struct {
                 return;
             };
             var path_buf: [4608]u8 = undefined;
-            const chosen = uniqueDownloadPath(&path_buf, dir, safeLeaf(if (ev.name.len != 0) ev.name else "download")) orelse {
+            const chosen = download_policy.uniquePath(&path_buf, dir, safeLeaf(if (ev.name.len != 0) ev.name else "download"), 1000) orelse {
                 self.send(proto.DownloadDecide{ .view = ev.view, .id = ev.id, .path = "" }) catch {};
                 d.failed = true;
                 d.fail_reason = "no free file name in the download directory";
@@ -4162,28 +4142,13 @@ test "an offer for an asked-for download is DECIDED into the caller's path" {
     try std.testing.expect(eng.download(5).?.done); // a finished one is untouched
 }
 
-test "a suggested download name is a leaf, and an existing file is never overwritten" {
-    var buf: [512]u8 = undefined;
+test "a suggested download name is a leaf" {
     try std.testing.expectEqualStrings("f.bin", Engine.safeLeaf("f.bin"));
     // A path in the engine's suggested name must never escape the
     // download directory.
     try std.testing.expectEqualStrings("passwd", Engine.safeLeaf("../../etc/passwd"));
     try std.testing.expectEqualStrings("download", Engine.safeLeaf(".."));
     try std.testing.expectEqualStrings("download", Engine.safeLeaf(""));
-
-    const dir = "/tmp/webdrive-uniq-test";
-    var z: [256:0]u8 = undefined;
-    const zp = std.fmt.bufPrintZ(&z, "{s}", .{dir}) catch unreachable;
-    _ = c.mkdir(zp.ptr, 0o700);
-    defer pathz.removeTree(dir);
-    const first = Engine.uniqueDownloadPath(&buf, dir, "f.bin").?;
-    try std.testing.expectEqualStrings("/tmp/webdrive-uniq-test/f.bin", first);
-    var fz: [512:0]u8 = undefined;
-    const fzp = std.fmt.bufPrintZ(&fz, "{s}", .{first}) catch unreachable;
-    const f = c.fopen(fzp.ptr, "wb") orelse return error.SkipZigTest;
-    _ = c.fclose(f);
-    const second = Engine.uniqueDownloadPath(&buf, dir, "f.bin").?;
-    try std.testing.expectEqualStrings("/tmp/webdrive-uniq-test/f (1).bin", second);
 }
 
 test "console mirror: bounded, drop-oldest, paged by id" {

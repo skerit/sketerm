@@ -472,7 +472,7 @@ pub fn autoAcceptDownload(self: *WebFace, id: u32, name: []const u8, url: []cons
     // The suggestion is page-controlled: joining it to `dir` with a
     // separator still in it would let a page pick the destination.
     const leaf = download_policy.safeName(name);
-    const path = uniquePath(&path_buf, dir, leaf) orelse {
+    const path = download_policy.uniquePath(&path_buf, dir, leaf, 100) orelse {
         declineDownload(self.view, id);
         return;
     };
@@ -1025,24 +1025,3 @@ pub fn onDlRevealClicked(_: ?*c.GtkButton, user: ?*anyopaque) callconv(.c) void 
     _ = @import("../siblingapp.zig").showInFiles(s);
 }
 
-/// Fill `buf` with `<dir>/<name>`, appending " (n)" before the
-/// extension while the plain path already exists.
-pub fn uniquePath(buf: []u8, dir: []const u8, name: []const u8) ?[]const u8 {
-    var z: [4608:0]u8 = undefined;
-    const dot = blk: {
-        const at = std.mem.lastIndexOfScalar(u8, name, '.') orelse break :blk name.len;
-        break :blk if (at == 0) name.len else at;
-    };
-    var n: u32 = 0;
-    while (n < 100) : (n += 1) {
-        const candidate = if (n == 0)
-            std.fmt.bufPrint(buf, "{s}/{s}", .{ dir, name }) catch return null
-        else
-            std.fmt.bufPrint(buf, "{s}/{s} ({d}){s}", .{ dir, name[0..dot], n, name[dot..] }) catch return null;
-        if (candidate.len + 1 > z.len) return null;
-        @memcpy(z[0..candidate.len], candidate);
-        z[candidate.len] = 0;
-        if (c.access(&z, c.F_OK) != 0) return candidate;
-    }
-    return null;
-}

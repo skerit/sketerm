@@ -1,6 +1,8 @@
 //! Download presentation policy shared by browser clients. Values are CEF's
 //! download interrupt reasons, carried as integers so this stays CEF-free.
 const std = @import("std");
+const c = @import("cbindings");
+const pathz = @import("../util/pathz.zig");
 
 pub fn failureReason(code: i32) []const u8 {
     return switch (code) {
@@ -40,6 +42,25 @@ pub fn safeName(name: []const u8) []const u8 {
     return s;
 }
 
+/// Fill `buf` with `<dir>/<name>`, or with " (n)" before the extension for the first n below `tries` whose path is free, so a download never overwrites a file the user already has.
+pub fn uniquePath(buf: []u8, dir: []const u8, name: []const u8, tries: u32) ?[]const u8 {
+    const dot = blk: {
+        const at = std.mem.lastIndexOfScalar(u8, name, '.') orelse break :blk name.len;
+        break :blk if (at == 0) name.len else at;
+    };
+    var n: u32 = 0;
+    while (n < tries) : (n += 1) {
+        const candidate = if (n == 0)
+            std.fmt.bufPrint(buf, "{s}/{s}", .{ dir, name }) catch return null
+        else
+            std.fmt.bufPrint(buf, "{s}/{s} ({d}){s}", .{ dir, name[0..dot], n, name[dot..] }) catch return null;
+        var z: [4096]u8 = undefined;
+        const zp = pathz.pathZ(&z, candidate) catch return null;
+        if (c.access(zp, c.F_OK) != 0) return candidate;
+    }
+    return null;
+}
+
 pub const Retry = enum { unavailable, download, delivery };
 
 pub fn retryAction(downloaded: bool, has_url: bool, can_start: bool) Retry {
@@ -75,4 +96,20 @@ test "completed downloads retry delivery without reissuing the web request" {
     try std.testing.expect(std.mem.indexOf(u8, failureReason(3), "disk space") != null);
     try std.testing.expect(std.mem.indexOf(u8, failureReason(34), "Sign in") != null);
     try std.testing.expect(failureReason(9999).len != 0);
+}
+
+test "uniquePath never hands back an existing file" {
+    const td = pathz.TempDir.make("dl-uniq") orelse return error.SkipZigTest;
+    defer td.remove();
+    var buf: [512]u8 = undefined;
+    const first = uniquePath(&buf, td.path(), "f.bin", 100).?;
+    try std.testing.expect(std.mem.endsWith(u8, first, "/f.bin"));
+    var fz: [512:0]u8 = undefined;
+    const fzp = std.fmt.bufPrintZ(&fz, "{s}", .{first}) catch unreachable;
+    const f = c.fopen(fzp.ptr, "wb") orelse return error.SkipZigTest;
+    _ = c.fclose(f);
+    const second = uniquePath(&buf, td.path(), "f.bin", 100).?;
+    try std.testing.expect(std.mem.endsWith(u8, second, "/f (1).bin"));
+    // A leading-dot name has no extension to keep apart.
+    try std.testing.expect(std.mem.endsWith(u8, uniquePath(&buf, td.path(), ".rc", 100).?, "/.rc"));
 }

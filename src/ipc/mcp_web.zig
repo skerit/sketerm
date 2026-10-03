@@ -5463,7 +5463,7 @@ test "nameFromUrl strips the query, decodes escapes and never returns a path" {
 
 /// `<dir>/<name>`, made unique among the paths `used` so far AND the
 /// files already on disk by a ` (n)` suffix before the extension (the
-/// GUI's `uniquePath` shape). A batch of urls that share a leaf
+/// `download.uniquePath` shape). A batch of urls that share a leaf
 /// (`/a/report.pdf`, `/b/report.pdf`) would otherwise write one over
 /// the other while the reply reported both as done, and a second call
 /// into the same `dir` would overwrite the first call's files. A
