@@ -653,7 +653,7 @@ fn onReveal(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
     const r = TabCtx.resolve(user) orelse return;
     const spec = r.tab.spec orelse return;
     if (r.view.ownerWindow()) |win| {
-        win.newBrowserTabFromReveal(r.view.pane, spec, spec) catch {};
+        win.newBrowserTabFromReveal(r.view.pane, spec, spec) catch |err| @import("window.zig").logActionError("reveal_in_files", err);
         return;
     }
     _ = siblingapp.showInFiles(spec);

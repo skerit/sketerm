@@ -869,14 +869,14 @@ pub const Sidebar = struct {
         const cx = cast.userData(EmptyMenuCtx, user);
         const win = cx.sidebar.win orelse return;
         if (!win.newTabInBrowser())
-            win.newShellTab(null) catch {};
+            win.newShellTab(null) catch |err| @import("window.zig").logActionError("new_tab", err);
     }
 
     fn onPlusClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         const self = cast.userData(Sidebar, user);
         const win = self.win orelse return;
         if (!win.newTabInBrowser())
-            win.newShellTab(null) catch {};
+            win.newShellTab(null) catch |err| @import("window.zig").logActionError("new_tab", err);
     }
 
     fn onEmptyMenuCollapseAll(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {

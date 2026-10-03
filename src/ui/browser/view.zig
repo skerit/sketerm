@@ -1681,7 +1681,7 @@ pub const BrowserView = struct {
         const self = cast.userData(BrowserView, user);
         const win = self.ownerWindow() orelse return;
         self.focusOwnPane();
-        win.newBrowserSplit(@intCast(c.GTK_ORIENTATION_VERTICAL)) catch {};
+        win.newBrowserSplit(@intCast(c.GTK_ORIENTATION_VERTICAL)) catch |err| @import("../window.zig").logActionError("new_browser_split", err);
     }
 
     /// Point the window's focus at THIS pane, so pane-scoped window

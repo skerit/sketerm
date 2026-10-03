@@ -402,15 +402,15 @@ fn onItem(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const target = targetBrowser(win, ctx.target_pane);
     const bv = target;
     switch (ctx.verb) {
-        .new_tab => win.newBrowserTabFrom(if (target) |v| v.pane else null, null) catch {},
-        .new_window => _ = win.openFilesWindow(null, null) catch {},
+        .new_tab => win.newBrowserTabFrom(if (target) |v| v.pane else null, null) catch |err| @import("../window.zig").logActionError("new_browser_tab", err),
+        .new_window => _ = win.openFilesWindow(null, null) catch |err| @import("../window.zig").logActionError("new_files_window", err),
         .split_pane => if (target) |v| {
             v.focusOwnPane();
-            win.newBrowserSplit(@intCast(c.GTK_ORIENTATION_HORIZONTAL)) catch {};
+            win.newBrowserSplit(@intCast(c.GTK_ORIENTATION_HORIZONTAL)) catch |err| @import("../window.zig").logActionError("new_browser_split", err);
         },
         .split_pane_v => if (target) |v| {
             v.focusOwnPane();
-            win.newBrowserSplit(@intCast(c.GTK_ORIENTATION_VERTICAL)) catch {};
+            win.newBrowserSplit(@intCast(c.GTK_ORIENTATION_VERTICAL)) catch |err| @import("../window.zig").logActionError("new_browser_split", err);
         },
         .close_pane => if (bv) |v| v.closePaneDeferred(),
         .close_window => c.gtk_window_close(@ptrCast(win.app_window)),

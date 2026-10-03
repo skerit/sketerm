@@ -236,7 +236,7 @@ pub fn focusOrAttachSession(self: *Window, name: []const u8) void {
         }
     }
     const conn = muxConnect(self, null) catch return;
-    self.attachMux(conn, name, null, null) catch {};
+    self.attachMux(conn, name, null, null) catch |err| winmod.logActionError("attach_session", err);
 }
 
 /// Tabless forwarded-app session (window view mode): the mux

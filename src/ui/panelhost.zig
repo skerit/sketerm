@@ -1034,6 +1034,20 @@ fn startHydrationOperation(
     pumpHydrations();
 }
 
+/// `prepareDirectLocalImages` for callers that cannot fail: a refusal
+/// (`error.Busy` included) leaves the panel's images unloaded with no
+/// placeholder, so it is logged like a failed asset.
+fn hydrateDirectLocalImages(
+    self: *Window,
+    origin: *DrainHandle,
+    entry: *Entry,
+    document: []const u8,
+    changed_paths: ?*const assets.Paths,
+) void {
+    prepareDirectLocalImages(self, origin, entry, document, changed_paths) catch |err|
+        std.debug.print("sketerm: panel {d}: local images not loaded: {s}\n", .{ entry.panel_id, @errorName(err) });
+}
+
 fn prepareDirectLocalImages(
     self: *Window,
     origin: *DrainHandle,
@@ -2696,7 +2710,7 @@ fn panelShow(
     if (!replacing) presentEntry(host, entry);
     if (relay == null and resolver == null) if (origin orelse host.focusedPane()) |pane| {
         entry.asset_origin = pane.terminal.drain;
-        prepareDirectLocalImages(host, pane.terminal.drain, entry, document, null) catch {};
+        hydrateDirectLocalImages(host, pane.terminal.drain, entry, document, null);
     };
     if (report) |asset_report| {
         try protocol.writeOkFlat(out, allocator, .{
@@ -2748,7 +2762,7 @@ pub fn showDocument(
     const entry = try showDocumentOrigin(self, origin, session, name, document, target, .direct, null, null, diag);
     if (origin) |pane| {
         entry.asset_origin = pane.terminal.drain;
-        prepareDirectLocalImages(self, pane.terminal.drain, entry, document, null) catch {};
+        hydrateDirectLocalImages(self, pane.terminal.drain, entry, document, null);
     }
     return entry;
 }
@@ -3026,7 +3040,7 @@ fn panelPatch(
         if (direct_origin_live and changed.items.len > 0) if (direct_origin) |origin| {
             if (entry.view.documentJson(allocator) catch null) |json| {
                 defer allocator.free(json);
-                prepareDirectLocalImages(self, origin, entry, json, changed) catch {};
+                hydrateDirectLocalImages(self, origin, entry, json, changed);
             }
         };
     }

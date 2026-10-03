@@ -474,7 +474,7 @@ fn reopenForProfile(ctx: *Ctx, name: []const u8) void {
     // Destroying the window frees ctx via onClosed — no Ctx access
     // past here.
     if (dialog) |d| c.gtk_window_destroy(@ptrCast(d));
-    openForProfile(allocator, parent_window, win, snapshot, apply, name_buf[0..n]) catch {};
+    openForProfile(allocator, parent_window, win, snapshot, apply, name_buf[0..n]) catch |err| std.debug.print("sketerm: preferences: reopening for profile failed: {s}\n", .{@errorName(err)});
 }
 
 const NewProfileCtx = struct {

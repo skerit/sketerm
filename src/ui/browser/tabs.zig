@@ -323,7 +323,7 @@ fn menuNewWindow(ctx: ?*anyopaque, page: *c.GtkWidget) void {
     const win = self.ownerWindow() orelse return;
     var spec_buf: [4096]u8 = undefined;
     const spec = paths.formatSpec(&spec_buf, tab.hc.host, tab.root.path);
-    _ = win.openFilesWindow(spec, null) catch {};
+    _ = win.openFilesWindow(spec, null) catch |err| @import("../window.zig").logActionError("open_in_new_window", err);
 }
 
 fn menuCanNewWindow(ctx: ?*anyopaque, page: *c.GtkWidget) bool {
