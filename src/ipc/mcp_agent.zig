@@ -6644,41 +6644,6 @@ test "every agent tool answers in its declared shape: a scripted Claude Code on 
     try testing.expectEqualStrings("started the slow one", q_recs[0].object.get("text").?.string);
     try testing.expectEqualStrings("echo: queued one", q_recs[1].object.get("text").?.string);
     try testing.expectEqual(@as(usize, 2), queued.get("jobs").?.array.items.len);
-    // An interrupt throws the app's queue away: the urgent prompt goes in
-    // first, then the prompts THIS server had queued, in their order.
-    const glacial = try shaped(a, "agent_send", try rig.call(.agent_send, "{\"text\":\"a glacial one\",\"timeout_ms\":300}"));
-    try testing.expect(!glacial.get("queued").?.bool);
-    polls = 0;
-    while (polls < 50) : (polls += 1) {
-        const l = try shaped(a, "agent_list", try rig.call(.agent_list, "{}"));
-        if (std.mem.eql(u8, l.get("agents").?.array.items[0].object.get("state").?.string, "working")) break;
-        _ = c.usleep(50_000);
-    }
-    for ([_][]const u8{ "held one", "held two" }) |t| {
-        const h = try shaped(a, "agent_send", try rig.call(.agent_send, try std.fmt.allocPrint(a, "{{\"text\":\"{s}\",\"timeout_ms\":300}}", .{t})));
-        try testing.expect(h.get("queued").?.bool);
-    }
-    const urgent = try shaped(a, "agent_send", try rig.call(.agent_send, "{\"text\":\"urgent\",\"interrupt\":true,\"timeout_ms\":10000}"));
-    try testing.expect(urgent.get("interrupted").?.bool);
-    try testing.expectEqual(@as(i64, 2), urgent.get("queued_dropped").?.integer);
-    const rq = urgent.get("requeued").?.array.items;
-    try testing.expectEqual(@as(usize, 2), rq.len);
-    try testing.expectEqualStrings("held one", rq[0].object.get("text").?.string);
-    try testing.expectEqualStrings("held two", rq[1].object.get("text").?.string);
-    try testing.expect(urgent.get("requeue_failed") == null);
-    // All three answered, the urgent one first.
-    _ = try shaped(a, "agent_wait", try rig.call(.agent_wait, "{\"timeout_ms\":3000}"));
-    const after_rq = try shaped(a, "agent_read", try rig.call(.agent_read, "{\"detail\":\"all\",\"since\":0}"));
-    var order: [3]?usize = .{ null, null, null };
-    for (after_rq.get("records").?.array.items, 0..) |r, i| {
-        const txt = r.object.get("text").?.string;
-        for ([_][]const u8{ "echo: urgent", "echo: held one", "echo: held two" }, 0..) |want, k| {
-            if (std.mem.eql(u8, txt, want)) order[k] = i;
-        }
-    }
-    try testing.expect(order[0] != null and order[1] != null and order[2] != null);
-    try testing.expect(order[0].? < order[1].? and order[1].? < order[2].?);
-
     // Effort only takes at launch; a term_open terminal cannot be relaunched.
     try expectError(a, "agent_set", try rig.call(.agent_set, "{\"effort\":\"high\"}"), "refused");
     try expectError(a, "agent_set", try rig.call(.agent_set, "{\"effort\":\"turbo\"}"), "invalid_args");
@@ -6711,6 +6676,41 @@ test "every agent tool answers in its declared shape: a scripted Claude Code on 
     try testing.expectEqual(@as(usize, 1), fin_since.get("records").?.array.items.len);
     try testing.expectEqualStrings("echo: queued one", fin_since.get("records").?.array.items[0].object.get("text").?.string);
     try expectError(a, "agent_read", try rig.call(.agent_read, "{\"final\":true,\"detail\":\"all\"}"), "invalid_args");
+
+    // An interrupt throws the app's queue away: the urgent prompt goes in
+    // first, then the prompts THIS server had queued, in their order.
+    const glacial = try shaped(a, "agent_send", try rig.call(.agent_send, "{\"text\":\"a glacial one\",\"timeout_ms\":300}"));
+    try testing.expect(!glacial.get("queued").?.bool);
+    var glacial_polls: usize = 0;
+    while (glacial_polls < 50) : (glacial_polls += 1) {
+        const l = try shaped(a, "agent_list", try rig.call(.agent_list, "{}"));
+        if (std.mem.eql(u8, l.get("agents").?.array.items[0].object.get("state").?.string, "working")) break;
+        _ = c.usleep(50_000);
+    }
+    for ([_][]const u8{ "held one", "held two" }) |t| {
+        const h = try shaped(a, "agent_send", try rig.call(.agent_send, try std.fmt.allocPrint(a, "{{\"text\":\"{s}\",\"timeout_ms\":300}}", .{t})));
+        try testing.expect(h.get("queued").?.bool);
+    }
+    const urgent = try shaped(a, "agent_send", try rig.call(.agent_send, "{\"text\":\"urgent\",\"interrupt\":true,\"timeout_ms\":10000}"));
+    try testing.expect(urgent.get("interrupted").?.bool);
+    try testing.expectEqual(@as(i64, 2), urgent.get("queued_dropped").?.integer);
+    const rq = urgent.get("requeued").?.array.items;
+    try testing.expectEqual(@as(usize, 2), rq.len);
+    try testing.expectEqualStrings("held one", rq[0].object.get("text").?.string);
+    try testing.expectEqualStrings("held two", rq[1].object.get("text").?.string);
+    try testing.expect(urgent.get("requeue_failed") == null);
+    // All three answered, the urgent one first.
+    _ = try shaped(a, "agent_wait", try rig.call(.agent_wait, "{\"timeout_ms\":3000}"));
+    const after_rq = try shaped(a, "agent_read", try rig.call(.agent_read, "{\"detail\":\"all\",\"since\":0}"));
+    var order: [3]?usize = .{ null, null, null };
+    for (after_rq.get("records").?.array.items, 0..) |r, i| {
+        const txt = r.object.get("text").?.string;
+        for ([_][]const u8{ "echo: urgent", "echo: held one", "echo: held two" }, 0..) |want, k| {
+            if (std.mem.eql(u8, txt, want)) order[k] = i;
+        }
+    }
+    try testing.expect(order[0] != null and order[1] != null and order[2] != null);
+    try testing.expect(order[0].? < order[1].? and order[1].? < order[2].?);
 
     // One text to several (an unknown one fails alone), then a wait for all.
     const id = try a.dupe(u8, attached.get("agent").?.string);
