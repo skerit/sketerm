@@ -1070,7 +1070,7 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   `done`, `message` is the job's answer and `records`/`jobs`/`cut_ids`
   are the job exactly as `agent_read` selects it (below), minus what was
   handed out before, so no extra read is needed. `agent_wait agents:[...]`
-  waits on several agents: the first wake-up of any wins, the result is
+  (or `agents: "*"`, every live agent of this server) waits on several agents: the first wake-up of any wins, the result is
   that agent's (`agents` lists the ones waited on) and its
   `watch_command` waits on all of them with `--any`. With `all: true`
   (`capabilities.agent_wait_all`) it waits until EVERY one of them has
@@ -1094,7 +1094,9 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   nothing); on an idle agent it just sends; the result says
   `interrupted` and, when Claude Code's Escape discarded prompts it held
   queued, `queued_dropped`. `agents: [...]` (instead of `agent`, at most
-  32 ids or names) sends the same text to each in one call: with
+  32 ids or names; `agents: "*"` is every live agent of this server,
+  `capabilities.agent_agents_every`, and with none live, more than 32 or
+  any other string it is an error) sends the same text to each in one call: with
   `interrupt` every busy one is interrupted at once, then each gets the
   prompt; the call does not wait for the turns and answers with
   `results`, one per agent named (`outcome` sent, queued, still_working

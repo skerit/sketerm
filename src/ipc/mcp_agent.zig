@@ -1495,16 +1495,16 @@ pub fn agentTool(arena: std.mem.Allocator, tool: Tool, args: std.json.Value) ![]
         .agent_open => openTool(arena, args),
         .agent_attach => if (argStr(args, "agent") != null) attachIdTool(arena, args) else attachTool(arena, args),
         .agent_list => listTool(arena, args),
-        .agent_send => if (mcp.argValue(args, "agents")) |v| switch (v) {
-            .array => |list| if (argStr(args, "agent") != null)
+        .agent_send => if (mcp.argValue(args, "agents")) |v| switch (try agentsList(arena, v)) {
+            .fail => |f| errRes(arena, f.code, f.msg),
+            .ok => |list| if (argStr(args, "agent") != null)
                 errRes(arena, .invalid_args, "pass either 'agent' or 'agents', not both")
             else
-                sendManyTool(arena, args, list.items),
-            else => errRes(arena, .invalid_args, "agents must be an array of agent ids or names"),
+                sendManyTool(arena, args, list),
         } else withEntry(arena, args, sendTool),
-        .agent_wait => if (mcp.argValue(args, "agents")) |v| switch (v) {
-            .array => |list| if (argBool(args, "all")) waitAllTool(arena, args, list.items) else waitAnyTool(arena, args, list.items),
-            else => errRes(arena, .invalid_args, "agents must be an array of agent ids"),
+        .agent_wait => if (mcp.argValue(args, "agents")) |v| switch (try agentsList(arena, v)) {
+            .fail => |f| errRes(arena, f.code, f.msg),
+            .ok => |list| if (argBool(args, "all")) waitAllTool(arena, args, list) else waitAnyTool(arena, args, list),
         } else if (argBool(args, "all"))
             errRes(arena, .invalid_args, "all waits on several agents: pass them as 'agents'")
         else
@@ -1518,6 +1518,28 @@ pub fn agentTool(arena: std.mem.Allocator, tool: Tool, args: std.json.Value) ![]
         .agent_templates => templatesTool(arena, args),
         .agent_template_delete => templateDeleteTool(arena, args),
     };
+}
+
+/// agent_send's and agent_wait's `agents`: the array given, or for
+/// `mcp_tools.AGENTS_EVERY` the ids of every live (not exited) agent here.
+fn agentsList(arena: std.mem.Allocator, v: std.json.Value) !union(enum) { ok: []const std.json.Value, fail: Fail } {
+    switch (v) {
+        .array => |list| return .{ .ok = list.items },
+        // No service here: it would hand a waiter what this call's own
+        // wait (which holds the agents first) should get.
+        .string => |x| if (std.mem.eql(u8, x, mcp_tools.AGENTS_EVERY)) {
+            var out: std.ArrayList(std.json.Value) = .empty;
+            for (state.entries.items) |e| if (!gone(e)) try out.append(arena, .{ .string = e.id });
+            if (out.items.len == 0) return .{ .fail = .{ .code = .not_found, .msg = if (state.entries.items.len == 0)
+                "agents \"*\" means every live agent of this server, and none is open; start one with agent_open"
+            else
+                try std.fmt.allocPrint(arena, "agents \"*\" means every live agent of this server, and none is live (open, all exited: {s})", .{try idList(arena)}) } };
+            if (out.items.len > MAX_ANY) return .{ .fail = .{ .code = .invalid_args, .msg = try std.fmt.allocPrint(arena, "agents \"*\" names {d} live agents, more than the {d} one call takes: list them in batches", .{ out.items.len, MAX_ANY }) } };
+            return .{ .ok = out.items };
+        },
+        else => {},
+    }
+    return .{ .fail = .{ .code = .invalid_args, .msg = "agents must be an array of agent ids or names, or \"*\" for every live agent of this server" } };
 }
 
 fn withEntry(
@@ -5253,6 +5275,11 @@ test "argument validation refuses before anything is spawned" {
     inline for (.{ Tool.agent_send, Tool.agent_wait, Tool.agent_read, Tool.agent_answer, Tool.agent_set, Tool.agent_interrupt, Tool.agent_close }) |tool| {
         try expectError(a, @tagName(tool), try rig.call(tool, "{\"agent\":\"claude-9\"}"), "not_found");
     }
+    // agents "*" with nothing live is a clear not_found; any other string is no list.
+    try expectError(a, "agent_send", try rig.call(.agent_send, "{\"agents\":\"*\",\"text\":\"hi\"}"), "not_found");
+    try expectError(a, "agent_wait", try rig.call(.agent_wait, "{\"agents\":\"*\"}"), "not_found");
+    try expectError(a, "agent_send", try rig.call(.agent_send, "{\"agents\":\"all\",\"text\":\"hi\"}"), "invalid_args");
+    try expectError(a, "agent_wait", try rig.call(.agent_wait, "{\"agents\":7}"), "invalid_args");
 }
 
 test "a relaunch and a durable descriptor keep the caller's args and env" {
@@ -5605,6 +5632,12 @@ test "the waiter --any: the first wake-up of several agents names its agent; a c
     try testing.expectEqual(@as(usize, 1), waited.get("agents").?.array.items.len);
     try expectError(rig.arena.allocator(), "agent_wait", try rig.call(.agent_wait, "{\"agents\":[\"nope-9\"]}"), "not_found");
     try expectError(rig.arena.allocator(), "agent_wait", try rig.call(.agent_wait, "{\"agents\":\"claude-1\"}"), "invalid_args");
+    // "*" is every live agent of this server: the one left open.
+    _ = try ags[0].source.screen.queue.push(clock.nowMs(), .needs_input, null, "permission: y", "");
+    const star = try shaped(rig.arena.allocator(), "agent_wait", try rig.call(.agent_wait, "{\"agents\":\"*\",\"timeout_ms\":0}"));
+    try testing.expectEqual(@as(usize, 1), star.get("agents").?.array.items.len);
+    try testing.expectEqualStrings("claude-1", star.get("agents").?.array.items[0].string);
+    try testing.expectEqualStrings("needs_input", star.get("outcome").?.string);
 }
 
 test "a job block names exactly the jobs it holds" {
