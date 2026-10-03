@@ -316,12 +316,25 @@ pub const Entry = struct {
         }
         self.extra.free(a);
         self.handed.deinit(a);
+        self.dropQueued(self.queued_sent.items.len);
+        self.queued_sent.deinit(a);
         for (self.recordings.items) |r| a.free(r);
         self.recordings.deinit(a);
         a.free(self.id);
         a.free(self.session);
         a.free(self.binary);
         a.free(self.cwd);
+    }
+};
+
+/// A prompt sketerm queued in an agent's app (`Entry.queued_sent`).
+const QueuedPrompt = struct {
+    text: []u8,
+    template: ?[]u8 = null,
+
+    fn free(self: QueuedPrompt, a: std.mem.Allocator) void {
+        a.free(self.text);
+        if (self.template) |t| a.free(t);
     }
 };
 
@@ -630,6 +643,14 @@ pub fn service(now_ms: i64) void {
             } else removeDescriptor(e);
         }
     }
+    // What the app took out of its queue is no longer sketerm's to retype.
+    for (state.entries.items) |e| {
+        const held = e.agent.queuedPrompts();
+        if (e.queued_sent.items.len > held) e.dropQueued(e.queued_sent.items.len - held);
+    }
+    for (state.entries.items) |e| if (e.history) {
+        if (e.agent.uptake().turns > e.history_turns) e.history = false else foldHistory(e);
+    };
     serviceRetries(now_ms);
     for (state.entries.items) |e| {
         // A relaunch swaps the terminal: its silence is the adapter's.
@@ -2365,7 +2386,8 @@ fn openTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
     var sent = false;
     if (o.prompt) |p| {
         if (ready) {
-            switch (try submitAndWait(arena, e, p, filter, deadline, false)) {
+            var none: Requeued = .{};
+            switch (try submitAndWait(arena, e, p, filter, deadline, false, &.{}, &none)) {
                 // Opened, but the prompt may or may not be in: an error that
                 // names the agent, which stays open for the caller to look at.
                 .fail => |f| if (f.code == .not_delivered) {
@@ -3249,19 +3271,60 @@ const Sent = union(enum) { ok: Delivered, fail: Fail };
 
 /// @param no_queue a busy agent is refused instead of queued (agent_send
 /// interrupt: it was stopped for this prompt).
-fn submitAndWait(arena: std.mem.Allocator, e: *Entry, p: Prompt, filter: events.Filter, deadline: i64, no_queue: bool) !Sent {
+/// @param requeue prompts an interrupt made the app drop, typed again into
+/// its queue once it took `p` and before the wait (what it did: `requeued`).
+fn submitAndWait(arena: std.mem.Allocator, e: *Entry, p: Prompt, filter: events.Filter, deadline: i64, no_queue: bool, requeue: []const Prompt, requeued: *Requeued) !Sent {
     service(clock.nowMs());
     const pre = try e.cursor.take(e.agent.queue(), .{}, clock.nowMs(), arena);
     const queued = switch (try submitPrompt(arena, e, p, deadline, no_queue)) {
         .fail => |f| return .{ .fail = f },
         .ok => |q| q,
     };
+    requeued.* = try requeueDropped(arena, e, requeue, deadline);
     var dv = try waitAfter(arena, e, pre, filter, deadline);
     if (dv.wait) |*w| {
         w.sent = true;
         w.queued = queued;
     }
     return .{ .ok = dv };
+}
+
+/// What `requeueDropped` typed again, and the failure that stopped it.
+const Requeued = struct {
+    done: []const Prompt = &.{},
+    fail: ?Fail = null,
+    /// Prompts after the failure, not typed again (order is kept).
+    left: usize = 0,
+
+    /// What was typed again, as results list it.
+    fn items(self: Requeued, arena: std.mem.Allocator) ![]const RequeuedItem {
+        const out = try arena.alloc(RequeuedItem, self.done.len);
+        // A rendered template is never echoed: only its name.
+        for (self.done, out) |p, *it| it.* = if (p.template) |t| .{ .template = t } else .{ .text = p.text };
+        return out;
+    }
+
+    /// The facts and the text line a send result carries for it.
+    fn report(self: Requeued, arena: std.mem.Allocator, res: *Res) !void {
+        if (self.done.len == 0 and self.fail == null) return;
+        try res.raw("requeued", try toJson(arena, try self.items(arena)));
+        if (self.done.len > 0) try res.textf("{d} prompt(s) this server had queued were dropped by the interrupt and queued again behind the new one, in their order", .{self.done.len});
+        if (self.fail) |f| {
+            try res.raw("requeue_failed", try toJson(arena, .{ .code = @tagName(f.code), .message = f.msg, .not_requeued = self.left }));
+            try res.textf("queuing the dropped prompts again stopped ({s}): {d} of them were not typed again: {s}", .{ @tagName(f.code), self.left, f.msg });
+        }
+    }
+};
+
+/// Type `dropped` (prompts THIS server had queued that an interrupt made
+/// the app throw away) again, oldest first, after the urgent prompt: into
+/// the app's queue while it works on that one. The first failure stops it.
+fn requeueDropped(arena: std.mem.Allocator, e: *Entry, dropped: []const Prompt, deadline: i64) !Requeued {
+    for (dropped, 0..) |p, i| switch (try submitPrompt(arena, e, p, deadline, false)) {
+        .ok => {},
+        .fail => |f| return .{ .done = dropped[0..i], .fail = f, .left = dropped.len - i },
+    };
+    return .{ .done = dropped };
 }
 
 /// Put `text` in as the agent's next prompt, or into its app's queue
@@ -3288,12 +3351,26 @@ fn submitPrompt(arena: std.mem.Allocator, e: *Entry, p: Prompt, deadline: i64, n
     if (queued) if (try confirmQueued(arena, e, act_deadline)) |f| return .{ .fail = f };
     if (try confirmDelivery(arena, e, before, queued)) |f| return .{ .fail = f };
     e.sent_seq = from;
+    if (queued) rememberQueued(e, p);
     // The conversation has a turn now: a relaunch resumes it.
     if (!e.conversed) {
         e.conversed = true;
         writeDescriptor(e);
     }
     return .{ .ok = queued };
+}
+
+/// Keep `p`, which the app now holds queued, for `stopForSend` to retype
+/// should an interrupt throw the queue away. Best effort: a prompt that
+/// cannot be kept is only not retyped.
+fn rememberQueued(e: *Entry, p: Prompt) void {
+    const a = e.allocator;
+    const text = a.dupe(u8, p.text) catch return;
+    const tpl: ?[]u8 = if (p.template) |t| (a.dupe(u8, t) catch {
+        a.free(text);
+        return;
+    }) else null;
+    e.queued_sent.append(a, .{ .text = text, .template = tpl }) catch (QueuedPrompt{ .text = text, .template = tpl }).free(a);
 }
 
 /// A screen app showed it took the prompt typed at `before`
@@ -3330,6 +3407,9 @@ const Stopped = struct {
     interrupted: bool = false,
     /// Prompts the app held queued that the interrupt discarded.
     queued_dropped: u32 = 0,
+    /// The ones of them THIS server had typed, oldest first: `requeue`
+    /// types them again behind the urgent prompt (owned by the call's arena).
+    dropped_sent: []const Prompt = &.{},
     fail: ?Fail = null,
 };
 
@@ -3348,6 +3428,9 @@ fn stopForSend(arena: std.mem.Allocator, list: []const *Entry, out: []Stopped) !
         o.* = .{};
         if (!needsInterrupt(e)) continue;
         o.queued_dropped = e.agent.queuedPrompts();
+        const mine = try arena.alloc(Prompt, e.queued_sent.items.len);
+        for (e.queued_sent.items, mine) |q, *m| m.* = .{ .text = try arena.dupe(u8, q.text), .template = if (q.template) |t| try arena.dupe(u8, t) else null };
+        o.dropped_sent = mine;
         switch (try act(arena, e, .interrupt, clock.nowMs() + STEP_WAIT_MS)) {
             .fail => |f| o.fail = f,
             .ok => o.interrupted = true,
@@ -3364,10 +3447,18 @@ fn stopForSend(arena: std.mem.Allocator, list: []const *Entry, out: []Stopped) !
         pump(until - clock.nowMs());
     }
     for (list, out) |e, *o| {
-        if (!o.interrupted) continue;
+        if (!o.interrupted) {
+            o.dropped_sent = &.{};
+            continue;
+        }
         o.queued_dropped -|= e.agent.queuedPrompts();
+        // Only an app that let its whole queue go dropped sketerm's prompts
+        // (`service` then forgets them on its own).
+        if (e.agent.queuedPrompts() != 0) o.dropped_sent = &.{};
         const st = e.agent.state();
-        if (!st.takesPrompt()) o.fail = .{ .code = .timeout, .msg = try std.fmt.allocPrint(arena, "agent {s} was interrupted but did not become idle within {d} ms (state {s}); nothing was sent", .{ e.id, STEP_WAIT_MS, @tagName(st) }) };
+        if (!st.takesPrompt()) o.fail = .{ .code = .timeout, .msg = try std.fmt.allocPrint(arena, "agent {s} was interrupted but did not become idle within {d} ms (state {s}); nothing was sent{s}", .{
+            e.id, STEP_WAIT_MS, @tagName(st), if (o.dropped_sent.len > 0) try std.fmt.allocPrint(arena, ", and the {d} prompt(s) this server had queued that its app dropped were not typed again", .{o.dropped_sent.len}) else "",
+        }) };
     }
 }
 
@@ -3746,10 +3837,12 @@ fn sendTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]const 
         try stopForSend(arena, &one, &stop);
         if (stop[0].fail) |f| return errRes(arena, f.code, f.msg);
     }
-    switch (try submitAndWait(arena, e, text, filter, deadlineFrom(args, DEFAULT_WAIT_MS), interrupt)) {
+    var requeued: Requeued = .{};
+    switch (try submitAndWait(arena, e, text, filter, deadlineFrom(args, DEFAULT_WAIT_MS), interrupt, stop[0].dropped_sent, &requeued)) {
         .fail => |f| return sendFailRes(arena, e, f),
         .ok => |dv| {
             var res = Res.init(arena);
+            try requeued.report(arena, &res);
             const queued = if (dv.wait) |w| w.queued else false;
             try res.fact("queued", queued);
             if (interrupt) try res.fact("interrupted", stop[0].interrupted);
@@ -3761,6 +3854,10 @@ fn sendTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]const 
     }
 }
 
+/// A prompt typed again after an interrupt, as results list it: its text,
+/// or for a rendered template only the template's name.
+const RequeuedItem = struct { text: ?[]const u8 = null, template: ?[]const u8 = null };
+
 /// One agent's line of a multi-agent agent_send.
 const SendResult = struct {
     agent: []const u8,
@@ -3771,6 +3868,10 @@ const SendResult = struct {
     queued: bool = false,
     interrupted: bool = false,
     queued_dropped: ?u32 = null,
+    /// The prompts this server had queued that the interrupt made the app
+    /// drop, queued again behind this one (`requeueDropped`).
+    requeued: ?[]const RequeuedItem = null,
+    requeue_failed: ?struct { code: []const u8, message: []const u8, not_requeued: usize } = null,
     /// Events no result had handed out, taken with the send.
     events: ?[]const EventJson = null,
     @"error": ?struct { code: []const u8, message: []const u8 } = null,
@@ -3820,6 +3921,14 @@ fn sendManyTool(arena: std.mem.Allocator, args: std.json.Value, list: []const st
         // What no result handed out yet rides with this agent's line.
         if (try e.cursor.take(e.agent.queue(), .{}, clock.nowMs(), arena)) |d| r.events = try eventsJson(arena, d.items);
         const outcome = if (stop.fail) |f| Submitted{ .fail = f } else try submitPrompt(arena, e, text, deadline, interrupt);
+        switch (outcome) {
+            .fail => {},
+            .ok => {
+                const rq = try requeueDropped(arena, e, stop.dropped_sent, deadline);
+                if (rq.done.len > 0) r.requeued = try rq.items(arena);
+                if (rq.fail) |f| r.requeue_failed = .{ .code = @tagName(f.code), .message = f.msg, .not_requeued = rq.left };
+            },
+        }
         r.state = @tagName(e.agent.state());
         switch (outcome) {
             .fail => |f| r.@"error" = .{ .code = @tagName(f.code), .message = f.msg },
@@ -5987,6 +6096,10 @@ const FakeApp = struct {
     typed: std.ArrayList(u8) = .empty,
     /// A slow turn is under way: the next line is queued behind it.
     slow: bool = false,
+    /// A glacial turn is under way: lines are held in the queue (as
+    /// previews) until an Escape throws them away with the turn.
+    held: std.ArrayList([]u8) = .empty,
+    holding: bool = false,
     stop: std.atomic.Value(bool) = .init(false),
     failed: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
@@ -6014,6 +6127,8 @@ const FakeApp = struct {
         self.stop.store(true, .release);
         if (self.thread) |th| th.join();
         self.typed.deinit(testing.allocator);
+        for (self.held.items) |h| testing.allocator.free(h);
+        self.held.deinit(testing.allocator);
         self.writer.deinit();
         self.parser.deinit();
         self.daemon.deinit();
@@ -6069,16 +6184,47 @@ const FakeApp = struct {
                         self.respond(self.typed.items) catch self.failed.store(true, .release);
                         self.typed.clearRetainingCapacity();
                     },
-                    0x1b => self.typed.clearRetainingCapacity(),
+                    0x1b => {
+                        self.typed.clearRetainingCapacity();
+                        if (self.holding) self.interruptHeld() catch self.failed.store(true, .release);
+                    },
                     else => self.typed.append(testing.allocator, b) catch self.failed.store(true, .release),
                 }
             }
         }
     }
 
+    /// Erase the live region and the queue previews above it.
+    fn erasePreviews(self: *FakeApp, out: *std.ArrayList(u8)) !void {
+        try out.appendSlice(testing.allocator, erase);
+        if (self.held.items.len > 0) for (0..self.held.items.len + 1) |_| try out.appendSlice(testing.allocator, "\x1b[1A\x1b[2K");
+        try out.appendSlice(testing.allocator, "\x1b[G");
+    }
+
+    /// Claude Code's Escape: the turn ends and its queue is thrown away.
+    fn interruptHeld(self: *FakeApp) !void {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(testing.allocator);
+        try self.erasePreviews(&out);
+        try out.appendSlice(testing.allocator, "Interrupted \xc2\xb7 What should Claude do instead?\r\n" ++ live ++ APP_END);
+        for (self.held.items) |h| testing.allocator.free(h);
+        self.held.clearRetainingCapacity();
+        self.holding = false;
+        try self.draw(out.items);
+    }
+
     /// What the app draws for a submitted line.
     fn respond(self: *FakeApp, line: []const u8) !void {
         var buf: [512]u8 = undefined;
+        if (self.holding) {
+            var out: std.ArrayList(u8) = .empty;
+            defer out.deinit(testing.allocator);
+            try self.erasePreviews(&out);
+            try self.held.append(testing.allocator, try testing.allocator.dupe(u8, line));
+            for (self.held.items) |h| try out.print(testing.allocator, "you: {s}\r\n", .{h});
+            try out.appendSlice(testing.allocator, "ctrl+enter to send now\r\n" ++ live);
+            return self.draw(out.items);
+        }
         if (self.slow) {
             // Typed while working: queued (a preview above the status
             // block), then taken at the turn's end as Claude Code 2.1.287
@@ -6101,6 +6247,10 @@ const FakeApp = struct {
         if (std.mem.indexOf(u8, line, "slow") != null) {
             self.slow = true;
             return self.draw(erase ++ "claude: started the slow one\r\n" ++ live);
+        }
+        if (std.mem.indexOf(u8, line, "glacial") != null) {
+            self.holding = true;
+            return self.draw(erase ++ "claude: started the glacial one\r\n" ++ live);
         }
         try self.draw(try std.fmt.bufPrint(&buf, erase ++ "claude: echo: {s}\r\n" ++ live, .{line}));
         return self.draw(APP_END);
@@ -6243,6 +6393,41 @@ test "every agent tool answers in its declared shape: a scripted Claude Code on 
     try testing.expectEqualStrings("started the slow one", q_recs[0].object.get("text").?.string);
     try testing.expectEqualStrings("echo: queued one", q_recs[1].object.get("text").?.string);
     try testing.expectEqual(@as(usize, 2), queued.get("jobs").?.array.items.len);
+    // An interrupt throws the app's queue away: the urgent prompt goes in
+    // first, then the prompts THIS server had queued, in their order.
+    const glacial = try shaped(a, "agent_send", try rig.call(.agent_send, "{\"text\":\"a glacial one\",\"timeout_ms\":300}"));
+    try testing.expect(!glacial.get("queued").?.bool);
+    polls = 0;
+    while (polls < 50) : (polls += 1) {
+        const l = try shaped(a, "agent_list", try rig.call(.agent_list, "{}"));
+        if (std.mem.eql(u8, l.get("agents").?.array.items[0].object.get("state").?.string, "working")) break;
+        _ = c.usleep(50_000);
+    }
+    for ([_][]const u8{ "held one", "held two" }) |t| {
+        const h = try shaped(a, "agent_send", try rig.call(.agent_send, try std.fmt.allocPrint(a, "{{\"text\":\"{s}\",\"timeout_ms\":300}}", .{t})));
+        try testing.expect(h.get("queued").?.bool);
+    }
+    const urgent = try shaped(a, "agent_send", try rig.call(.agent_send, "{\"text\":\"urgent\",\"interrupt\":true,\"timeout_ms\":10000}"));
+    try testing.expect(urgent.get("interrupted").?.bool);
+    try testing.expectEqual(@as(i64, 2), urgent.get("queued_dropped").?.integer);
+    const rq = urgent.get("requeued").?.array.items;
+    try testing.expectEqual(@as(usize, 2), rq.len);
+    try testing.expectEqualStrings("held one", rq[0].object.get("text").?.string);
+    try testing.expectEqualStrings("held two", rq[1].object.get("text").?.string);
+    try testing.expect(urgent.get("requeue_failed") == null);
+    // All three answered, the urgent one first.
+    _ = try shaped(a, "agent_wait", try rig.call(.agent_wait, "{\"timeout_ms\":3000}"));
+    const after_rq = try shaped(a, "agent_read", try rig.call(.agent_read, "{\"detail\":\"all\",\"since\":0}"));
+    var order: [3]?usize = .{ null, null, null };
+    for (after_rq.get("records").?.array.items, 0..) |r, i| {
+        const txt = r.object.get("text").?.string;
+        for ([_][]const u8{ "echo: urgent", "echo: held one", "echo: held two" }, 0..) |want, k| {
+            if (std.mem.eql(u8, txt, want)) order[k] = i;
+        }
+    }
+    try testing.expect(order[0] != null and order[1] != null and order[2] != null);
+    try testing.expect(order[0].? < order[1].? and order[1].? < order[2].?);
+
     // Effort only takes at launch; a term_open terminal cannot be relaunched.
     try expectError(a, "agent_set", try rig.call(.agent_set, "{\"effort\":\"high\"}"), "refused");
     try expectError(a, "agent_set", try rig.call(.agent_set, "{\"effort\":\"turbo\"}"), "invalid_args");

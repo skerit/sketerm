@@ -1114,7 +1114,13 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   prompts within 10 s of the interrupt is a `timeout` failure that sent
   nothing); on an idle agent it just sends; the result says
   `interrupted` and, when Claude Code's Escape discarded prompts it held
-  queued, `queued_dropped`. `agents: [...]` (instead of `agent`, at most
+  queued, `queued_dropped`. The prompts THIS server had queued there
+  (`Entry.queued_sent`, forgotten as the app takes them) are queued again
+  right after the urgent one went in, in their original order, and listed
+  as `requeued` (`text`, or for a rendered template only its `template`);
+  a failure stops it and is `requeue_failed` (`code`, `message`,
+  `not_requeued`). Nothing the app held from elsewhere is ever typed
+  (`capabilities.agent_send_requeue`). `agents: [...]` (instead of `agent`, at most
   32 ids or names; `agents: "*"` is every live agent of this server,
   `capabilities.agent_agents_every`, and with none live, more than 32 or
   any other string it is an error) sends the same text to each in one call: with
