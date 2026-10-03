@@ -29,6 +29,7 @@ comptime {
     _ = @import("agent/launch.zig");
     _ = @import("agent/retry.zig");
     _ = @import("agent/stall.zig");
+    _ = @import("agent/hoststats.zig");
     _ = @import("agent/brief.zig");
     _ = @import("ipc/agentwait.zig");
     _ = @import("ipc/agentpush.zig");

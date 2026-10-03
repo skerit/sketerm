@@ -45,6 +45,7 @@ const opencode = @import("../agent/opencode.zig");
 const retry_mod = @import("../agent/retry.zig");
 const stall_mod = @import("../agent/stall.zig");
 const brief = @import("../agent/brief.zig");
+const hoststats = @import("../agent/hoststats.zig");
 const mcpassets = @import("mcpassets.zig");
 const wire = @import("../mux/wire.zig");
 const Screen = @import("../grid/screen.zig").Screen;
@@ -407,6 +408,11 @@ const State = struct {
     /// A retry is typing its continue prompt: the service it pumps does
     /// not start another (nor count that prompt as the caller's).
     retry_busy: bool = false,
+    /// `mcp_agent_max_per_host` / `mcp_agent_min_free_mb`; 0 = no cap.
+    max_per_host: u32 = 0,
+    min_free_mb: u32 = 0,
+    /// Each host's last memory and load reading (`HostProbe`).
+    hosts: std.ArrayList(*HostProbe) = .empty,
 };
 
 /// Agents one agent_wait or waiter watches at most.
@@ -437,6 +443,8 @@ pub fn configure(allocator: std.mem.Allocator, dir: []const u8, mux_sock: []cons
     var cfg = Config.load(allocator);
     defer cfg.deinit();
     state.ttl_secs = cfg.mcp_agent_idle_ttl_hours * 3600;
+    state.max_per_host = cfg.mcp_agent_max_per_host;
+    state.min_free_mb = cfg.mcp_agent_min_free_mb;
     state.waiter.listen(allocator, dir);
 }
 
@@ -450,6 +458,9 @@ pub fn shutdown() void {
     for (state.entries.items) |e| e.destroy(false);
     state.entries.deinit(a);
     state.entries = .empty;
+    for (state.hosts.items) |h| h.free(a);
+    state.hosts.deinit(a);
+    state.hosts = .empty;
     // A job whose thread still runs cannot be freed: it is abandoned
     // (the process is exiting), a finished one is.
     serviceReconnects(clock.nowMs());
@@ -657,7 +668,191 @@ pub fn service(now_ms: i64) void {
         if (!e.relaunching) _ = e.stall.check(e.agent.queue(), e.agent.state(), e.agent.lastActivityMs(), now_ms) catch {};
     }
     servicePush(now_ms);
+    serviceHostProbes(now_ms);
     state.waiter.service(now_ms);
+}
+
+// ── hosts: memory, load and the optional caps ────────────────────
+
+/// A reading this young is reused, never probed again.
+const HOST_STATS_TTL_MS: i64 = 15_000;
+/// A probe that has not printed its line by then is ended: unknown.
+const HOST_PROBE_MAX_MS: i64 = 15_000;
+/// How long agent_list waits for readings of its hosts.
+const HOST_LIST_WAIT_MS: i64 = 1_500;
+/// How long agent_open waits for the reading its memory cap needs.
+const HOST_CAP_WAIT_MS: i64 = 5_000;
+
+/// One host's memory and load (`hoststats.SCRIPT`), read by a short-lived
+/// terminal on this server's private daemon (over ssh for a remote host),
+/// never inline, so a slow host costs a bounded wait and an unknown.
+const HostProbe = struct {
+    /// null = this machine (owned).
+    host: ?[]u8,
+    stats: ?hoststats.Stats = null,
+    read_ms: i64 = 0,
+    /// Why the last reading is missing, if it is (static).
+    problem: []const u8 = "not read yet",
+    term: ?*termdrive.Term = null,
+    started_ms: i64 = 0,
+
+    fn free(self: *HostProbe, a: std.mem.Allocator) void {
+        if (self.term) |t| t.deinit();
+        if (self.host) |h| a.free(h);
+        a.destroy(self);
+    }
+
+    fn same(self: *const HostProbe, host: ?[]const u8) bool {
+        if (self.host == null or host == null) return self.host == null and host == null;
+        return std.mem.eql(u8, self.host.?, host.?);
+    }
+};
+
+fn hostProbe(host: ?[]const u8) !*HostProbe {
+    for (state.hosts.items) |p| if (p.same(host)) return p;
+    const a = state.allocator;
+    const p = try a.create(HostProbe);
+    errdefer a.destroy(p);
+    p.* = .{ .host = if (host) |h| try a.dupe(u8, h) else null };
+    errdefer if (p.host) |h| a.free(h);
+    try state.hosts.append(a, p);
+    return p;
+}
+
+/// Start a reading of `p` unless a fresh one is there or one runs.
+fn kickProbe(p: *HostProbe, now_ms: i64) void {
+    if (p.term != null) return;
+    if (p.stats != null and now_ms - p.read_ms < HOST_STATS_TTL_MS) return;
+    var arena_state = std.heap.ArenaAllocator.init(state.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const argv: []const []const u8 = if (p.host) |h|
+        (mcp_term.remoteShArgv(arena, h, hoststats.SCRIPT) catch return)
+    else
+        &.{ "/bin/sh", "-c", hoststats.SCRIPT };
+    p.term = termdrive.Term.spawnWith(state.allocator, argv, 200, 10, state.mux_sock, .{ .shell_integration = false }) catch {
+        p.problem = "its probe could not be started";
+        return;
+    };
+    p.started_ms = now_ms;
+}
+
+fn serviceHostProbes(now_ms: i64) void {
+    for (state.hosts.items) |p| {
+        const t = p.term orelse continue;
+        t.drain();
+        if (t.exited) {
+            const text = t.readScreen(true) catch "";
+            defer if (text.len > 0) t.allocator.free(text);
+            if (hoststats.parse(text)) |st| {
+                p.stats = st;
+                p.read_ms = now_ms;
+                p.problem = if (st.empty()) "it gave no numbers" else "";
+            } else p.problem = "it did not answer the probe (ssh failed?)";
+        } else if (now_ms - p.started_ms < HOST_PROBE_MAX_MS) continue else {
+            p.problem = "its probe did not finish in time";
+        }
+        t.deinit();
+        p.term = null;
+    }
+}
+
+/// Wait up to `max_ms` for the probes of `list` that run.
+fn waitProbes(list: []const *HostProbe, max_ms: i64) void {
+    const until = clock.nowMs() + max_ms;
+    while (clock.nowMs() < until) {
+        var running = false;
+        for (list) |p| running = running or p.term != null;
+        if (!running) return;
+        pump(until - clock.nowMs());
+    }
+}
+
+fn sameHost(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.mem.eql(u8, a.?, b.?);
+}
+
+/// This server's live (not gone) agents on `host`.
+fn agentsOn(host: ?[]const u8) u32 {
+    var n: u32 = 0;
+    for (state.entries.items) |e| {
+        if (!gone(e) and sameHost(e.host, host)) n += 1;
+    }
+    return n;
+}
+
+/// agent_list's `hosts`: one line per host this server has agents on,
+/// with its agent count, available memory and load (unknown when the host
+/// cannot say), each reading at most `HOST_STATS_TTL_MS` old or waited for
+/// at most `HOST_LIST_WAIT_MS`.
+fn hostsReport(arena: std.mem.Allocator, res: *Res) !void {
+    var hosts: std.ArrayList(?[]const u8) = .empty;
+    for (state.entries.items) |e| {
+        if (gone(e)) continue;
+        for (hosts.items) |h| {
+            if (sameHost(h, e.host)) break;
+        } else try hosts.append(arena, e.host);
+    }
+    const probes = try arena.alloc(*HostProbe, hosts.items.len);
+    const now = clock.nowMs();
+    for (hosts.items, probes) |h, *p| {
+        p.* = try hostProbe(h);
+        kickProbe(p.*, now);
+    }
+    waitProbes(probes, HOST_LIST_WAIT_MS);
+    const Item = struct {
+        host: []const u8,
+        agents: u32,
+        mem_available_mb: ?u64 = null,
+        mem_total_mb: ?u64 = null,
+        load: ?[3]?f64 = null,
+        /// Seconds since the reading; null = none.
+        age_s: ?i64 = null,
+        unknown: ?[]const u8 = null,
+    };
+    const items = try arena.alloc(Item, probes.len);
+    const later = clock.nowMs();
+    for (hosts.items, probes, items) |h, p, *it| {
+        it.* = .{ .host = h orelse "local", .agents = agentsOn(h) };
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        const w = &aw.writer;
+        try w.print("host {s}: {d} agent(s)", .{ it.host, it.agents });
+        if (p.stats) |st| {
+            it.mem_available_mb = st.availMb();
+            it.mem_total_mb = st.totalMb();
+            it.load = .{ st.load1, st.load5, st.load15 };
+            it.age_s = @divTrunc(later - p.read_ms, 1000);
+            if (st.availMb()) |m| try w.print(", {d} MB available", .{m}) else try w.writeAll(", memory unknown");
+            if (st.totalMb()) |m| try w.print(" of {d} MB", .{m});
+            if (st.load1) |l| try w.print(", load {d:.2} {d:.2} {d:.2}", .{ l, st.load5 orelse 0, st.load15 orelse 0 }) else try w.writeAll(", load unknown");
+        } else {
+            it.unknown = p.problem;
+            try w.print(", memory and load unknown ({s})", .{p.problem});
+        }
+        try res.text(aw.written());
+    }
+    try res.raw("hosts", try toJson(arena, items));
+}
+
+/// Whether opening one more agent on `host` crosses a cap; `ok` carries a
+/// note when the memory cap could not be checked.
+fn capCheck(arena: std.mem.Allocator, host: ?[]const u8) !union(enum) { ok: ?[]const u8, fail: Fail } {
+    const where = host orelse "this machine";
+    if (state.max_per_host > 0) {
+        const n = agentsOn(host);
+        if (n >= state.max_per_host)
+            return .{ .fail = .{ .code = .refused, .msg = try std.fmt.allocPrint(arena, "{s} already runs {d} agent(s) of this server, the cap (mcp_agent_max_per_host = {d}); close or wait for one, or raise the cap", .{ where, n, state.max_per_host }) } };
+    }
+    if (state.min_free_mb == 0) return .{ .ok = null };
+    const p = try hostProbe(host);
+    kickProbe(p, clock.nowMs());
+    waitProbes(&.{p}, HOST_CAP_WAIT_MS);
+    const avail = if (p.stats) |st| st.availMb() else null;
+    const mb = avail orelse return .{ .ok = try std.fmt.allocPrint(arena, "the memory cap (mcp_agent_min_free_mb = {d}) was not checked: {s}'s available memory is unknown ({s})", .{ state.min_free_mb, where, if (p.stats == null) p.problem else "it gave no number" }) };
+    if (mb < state.min_free_mb)
+        return .{ .fail = .{ .code = .refused, .msg = try std.fmt.allocPrint(arena, "{s} has {d} MB available, below the cap (mcp_agent_min_free_mb = {d}); free memory there or lower the cap", .{ where, mb, state.min_free_mb }) } };
+    return .{ .ok = null };
 }
 
 // ── retry on overload ────────────────────────────────────────────
@@ -2369,6 +2564,10 @@ fn openTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
     // wait for the app to take it stay bounded by the default, so a prompt
     // is handed off in one call (`sent`) instead of never being sent.
     const start_deadline = if (state.no_wait) clock.nowMs() + DEFAULT_WAIT_MS else deadline;
+    const cap_note = switch (try capCheck(arena, o.host)) {
+        .fail => |f| return errRes(arena, f.code, f.msg),
+        .ok => |n| n,
+    };
     var facts: LaunchFacts = .{};
     var claim: ?agentindex.Claim = null;
     const st = startAgent(arena, loaded, &o, &claim, .{
@@ -2382,6 +2581,7 @@ fn openTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
     const e = st.entry;
     const ready = st.ready;
     var notes = st.notes;
+    if (cap_note) |n| try notes.append(arena, n);
     const filter = filterFrom(args);
 
     var dv: Delivered = undefined;
@@ -4548,6 +4748,7 @@ fn listTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
             if (out.last_activity_ms) |x| try std.fmt.allocPrint(arena, "{d}s", .{@divTrunc(@max(0, wall - x), 1000)}) else "never", out.pending_events,
         });
     }
+    try hostsReport(arena, &res);
     try res.raw("agents", try toJson(arena, items));
     try res.fact("count", items.len);
     try res.fact("detail", true);
@@ -4620,8 +4821,22 @@ fn listCompact(arena: std.mem.Allocator) ![]const u8 {
         if (out.preview) |p| try w.print("; last: {s}", .{p});
         try res.text(aw.written());
     }
+    if (gone_list.items.len > 0) {
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        const w = &aw.writer;
+        try w.writeAll("gone:");
+        for (gone_list.items, 0..) |g, i| {
+            try w.print("{s} {s}", .{ if (i > 0) "," else "", g.agent });
+            if (g.name) |n| try w.print(" ({s})", .{n});
+            if (g.relaunchable) try w.writeAll(" relaunchable");
+        }
+        try w.writeAll(" (agent_attach {agent, relaunch: true} starts a relaunchable one again; agent_close forgets one)");
+        try res.text(aw.written());
+    }
+    try hostsReport(arena, &res);
     try res.raw("agents", try toJson(arena, items));
-    try res.fact("count", items.len);
+    try res.raw("gone", try toJson(arena, gone_list.items));
+    try res.fact("count", state.entries.items.len);
     try res.fact("detail", false);
     return res.finish();
 }

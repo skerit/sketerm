@@ -8417,6 +8417,37 @@ fn agentSshStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u
         say("smoke-mcp: agents over ssh: plain ssh (opencode with a typed password, claude, drop) ok");
     }
 
+    // ── the host view and the per-host cap ──────────────────────────
+    {
+        writeSmokeConfig(rt, "mcp_agent_max_per_host = 1\n");
+        defer removeSmokeConfig(rt);
+        var m = Mcp.spawn(allocator, exe, &.{});
+        m.initialize();
+        const caps = agentCall(&m, arena, "capabilities", "{}", "capabilities caps", false, 15_000);
+        if (capInt(caps.get("agent_caps").?.object, "max_per_host") != 1) fail("capabilities: agent_caps.max_per_host is not the configured 1");
+        _ = agentCall(&m, arena, "agent_open", "{\"app\":\"claude\",\"name\":\"cap-1\",\"host\":\"fakehost\",\"timeout_ms\":45000}", "cap: first agent_open", false, 60_000);
+        const over = agentCall(&m, arena, "agent_open", "{\"app\":\"claude\",\"name\":\"cap-2\",\"host\":\"fakehost\",\"timeout_ms\":45000}", "cap: second agent_open", true, 60_000);
+        const err = (over.get("error") orelse fail("cap: no error")).object;
+        expectFact(err, "code", "refused", "cap: code");
+        if (std.mem.indexOf(u8, scStr(err, "message", "cap"), "mcp_agent_max_per_host") == null) fail("cap: the refusal does not name the cap");
+        // One line per host: its agents, memory and load (the fake host is
+        // this Linux machine, so the numbers are known).
+        var known = false;
+        var tries: usize = 0;
+        while (!known and tries < 5) : (tries += 1) {
+            const l = agentCall(&m, arena, "agent_list", "{}", "cap: agent_list hosts", false, 30_000);
+            for (l.get("hosts").?.array.items) |h| {
+                if (!std.mem.eql(u8, h.object.get("host").?.string, "fakehost")) continue;
+                if (h.object.get("agents").?.integer != 1) fail("cap: agent_list hosts counts the wrong number of agents");
+                known = h.object.get("mem_available_mb").? == .integer and h.object.get("load").? == .array;
+            }
+        }
+        if (!known) fail("cap: agent_list never read the host's memory and load");
+        _ = agentCall(&m, arena, "agent_close", "{\"agent\":\"cap-1\"}", "cap: agent_close", false, 15_000);
+        m.closeStdinWait();
+        say("smoke-mcp: agents over ssh: agent_list's host lines and the per-host cap ok");
+    }
+
     // ── a durable instance re-attaches a remote agent over ssh ───────
     {
         var d1 = Mcp.spawn(allocator, exe, &.{ "--name", "agentssh" });

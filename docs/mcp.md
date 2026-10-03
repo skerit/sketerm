@@ -1606,6 +1606,30 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   No, exit` and `Enter y/n:`) is declared in `data/agents/claude.json`
   (the `choice_prompt` rule), and lettered options carry their `key`, the
   letter `agent_answer` types. Answering it waits for the app to be ready.
+- **Hosts and caps (`capabilities.agent_hosts`, `agent_caps`).** `agent_list`
+  (compact and detail) adds one line per host this server has live agents
+  on (`local` for this machine) and `hosts`: its agent count,
+  `mem_available_mb`/`mem_total_mb`, `load` (1, 5, 15 min) and `age_s`.
+  The numbers come from one POSIX sh script (`src/agent/hoststats.zig`:
+  `/proc` on Linux, `sysctl`/`vm_stat` on macOS) run by a short-lived
+  terminal on this server's private daemon, over ssh for a remote host,
+  cached 15 s per host; agent_list waits at most 1.5 s for them, and a host
+  that cannot say, or did not answer, reads `unknown` with the reason,
+  never a failed list. Config `mcp_agent_max_per_host` and
+  `mcp_agent_min_free_mb` (0 = off, the default) make `agent_open` refuse
+  (`refused`, naming the host, the number and the key) a host already at
+  that many live agents of this server or with less memory available; a
+  host whose memory is unknown is not refused, and the result's notes say
+  the cap was not checked.
+- **Gone agents in `agent_list`.** Compact, every gone agent of this server
+  shares ONE line (`gone: claude-qx9z (claude-8) relaunchable, ...`) and
+  the `gone` fact (`agent`, `name`, `relaunchable`) instead of a full entry
+  each; `count` still counts them, and `detail: true` lists them in full.
+  `agent_open name:` that a gone agent holds is a `conflict` naming that
+  agent: `agent_attach {agent, relaunch: true}` starts it again under the
+  name, `agent_close {agent}` forgets it (also for a gone agent only the
+  index still knows, unless another live server holds it) and frees the
+  name. `resume` never takes a gone entry over by itself.
 - **`agent_list`** gives one short text line per agent and, per agent in
   `agents`, by default the compact facts an orchestrator of many agents
   scans (`capabilities.agent_list_compact`; with 17 agents the full set

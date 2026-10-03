@@ -492,6 +492,9 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
             .api = "http_accepted",
         });
         try res.fact("agent_send_interrupt", agents_ok);
+        try res.fact("agent_send_requeue", agents_ok);
+        try res.fact("agent_hosts", agents_ok);
+        try res.fact("agent_caps", .{ .max_per_host = mcp_agent.state.max_per_host, .min_free_mb = mcp_agent.state.min_free_mb });
         try res.fact("agent_read_final", agents_ok);
         try res.fact("agent_list_compact", agents_ok);
         try res.fact("agent_relaunch", agents_ok);
