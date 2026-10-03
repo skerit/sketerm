@@ -224,6 +224,14 @@ pub const Queue = struct {
         return n;
     }
 
+    /// Mark every event announcing a record (`EventKind.announcesRecord`)
+    /// delivered: what they announce is history a resumed app reprinted.
+    pub fn deliverAnnounced(self: *Queue) void {
+        for (self.events.items) |*ev| {
+            if (ev.kind.announcesRecord()) ev.delivered = true;
+        }
+    }
+
     /// The newest event at or after `from_seq` that settles a turn
     /// (`Event.settlesTurn`), delivered or not; null when none.
     pub fn lastSettle(self: *const Queue, from_seq: u64) ?*const Event {
@@ -501,6 +509,20 @@ test "one delivery state: what one consumer delivered never wakes another" {
     defer t.allocator.free(r.items);
     try t.expectEqual(@as(usize, 2), r.items.len);
     try t.expect((try again.take(&q, .{}, 3, t.allocator)) == null);
+}
+
+test "history a resumed app reprints is delivered, a prompt it shows is not" {
+    var q = Queue.init(t.allocator, .{});
+    defer q.deinit();
+    _ = try q.pushDone(0, 0, 0, "an answer from hours ago", 7, null);
+    _ = try q.pushMessage(0, "an older message", 5);
+    _ = try q.push(0, .needs_input, null, "trust this folder?", "");
+    q.deliverAnnounced();
+    var c: Cursor = .{};
+    const d = (try c.take(&q, .{ .messages = true }, 0, t.allocator)).?;
+    defer t.allocator.free(d.items);
+    try t.expectEqual(@as(usize, 1), d.items.len);
+    try t.expectEqual(vocab.EventKind.needs_input, d.items[0].kind);
 }
 
 test "a retrying error wakes only a consumer that opted in; other errors always" {

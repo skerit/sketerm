@@ -248,6 +248,23 @@ pub const Entry = struct {
     /// A reconnect found its session gone from the daemon: what that
     /// daemon remembered of its end.
     gone_why: ?GoneFacts = null,
+    /// Started resuming its conversation, and no prompt went in since:
+    /// whatever the app shows meanwhile is its past (`foldHistory`).
+    history: bool = false,
+    /// The turns the app had started when the history window opened: one
+    /// more is a turn of its own (a human's prompt), which closes it.
+    history_turns: u64 = 0,
+    /// Prompts THIS server typed into the app's own queue that it has not
+    /// taken yet, oldest first (owned): an interrupt that throws the queue
+    /// away types them again. Never anything the app holds from elsewhere.
+    queued_sent: std.ArrayList(QueuedPrompt) = .empty,
+
+    /// Forget the oldest `n` prompts of `queued_sent`.
+    fn dropQueued(self: *Entry, n: usize) void {
+        const k = @min(n, self.queued_sent.items.len);
+        for (self.queued_sent.items[0..k]) |q| q.free(self.allocator);
+        self.queued_sent.replaceRangeAssumeCapacity(0, k, &.{});
+    }
 
     fn visibleTerm(self: *const Entry) ?*termdrive.Term {
         const l = self.visible orelse return null;
@@ -1098,6 +1115,25 @@ fn reconnectIfLost(e: *Entry) void {
     e.reconnect_ms = 0;
     e.reconnect_delay_ms = RECONNECT_MIN_MS;
     kickReconnects(e, clock.nowMs());
+}
+
+/// What a resumed app showed so far is its past: every record handed out
+/// and every event announcing one delivered, so no read, result or waiter
+/// hands the conversation's history out as new.
+fn foldHistory(e: *Entry) void {
+    for (e.agent.records()) |r| {
+        if (e.handed.has(r)) continue;
+        e.handed.markRecord(e.allocator, r) catch return;
+    }
+    e.agent.queue().deliverAnnounced();
+}
+
+/// The resumed app is about to get a prompt or an answer: fold what it
+/// showed until now, and what comes after is news.
+fn closeHistory(e: *Entry) void {
+    if (!e.history) return;
+    foldHistory(e);
+    e.history = false;
 }
 
 /// Wait up to `max_ms` for any agent or waiter fd, then service.
@@ -2080,7 +2116,21 @@ const OpenOpts = struct {
     retry: ?retry_mod.Policy = null,
     /// `stall_after_min`; null = off.
     stall: ?u32 = null,
+    /// A relaunch from this server: the content keys of what the gone
+    /// entry handed out, moved into the new one (`select.Handed.texts`).
+    handed: ?*std.AutoHashMapUnmanaged(u64, void) = null,
 };
+
+/// Which agent holds name (or id) `key` on this machine: this server's
+/// entry, else a descriptor of the per-user index; null when it is free.
+const NameHolder = struct { id: []const u8, gone: bool, relaunchable: bool };
+
+fn nameHolder(arena: std.mem.Allocator, key: []const u8) !?NameHolder {
+    if (findByName(key)) |e| return .{ .id = try arena.dupe(u8, e.id), .gone = gone(e), .relaunchable = e.ended_ms > 0 };
+    const dir = state.index_dir orelse return null;
+    const d = (try agentindex.resolve(arena, dir, key)) orelse return null;
+    return .{ .id = d.id, .gone = d.gone_ms > 0, .relaunchable = d.gone_ms > 0 and descRelaunchable(d) };
+}
 
 /// A conversation id travels on the app's argv and in an API path, so only
 /// plain id characters are accepted.
@@ -2410,6 +2460,17 @@ fn startAgent(arena: std.mem.Allocator, loaded: *const adapter.Loaded, o: *OpenO
         e.destroy(true);
         return err;
     };
+    if (o.handed) |h| {
+        e.handed.texts.deinit(e.allocator);
+        e.handed.texts = h.*;
+        h.* = .empty;
+    }
+    // An adopted conversation's past was the caller's before: it is
+    // history, never a first delivery (`since`/`detail:"all"` re-read it).
+    if (o.resume_id != null) {
+        e.history = true;
+        e.history_turns = e.agent.uptake().turns;
+    }
     setRetryPolicy(e, o.retry);
     e.stall.set(o.stall, clock.nowMs());
     if (claim.*) |cl| {
@@ -2428,13 +2489,11 @@ fn startAgent(arena: std.mem.Allocator, loaded: *const adapter.Loaded, o: *OpenO
         why.* = .{ .code = .not_found, .msg = msg };
         return error.Refused;
     };
-    // An adopted conversation's past was the caller's before: it is
-    // history, never a first delivery (`since`/`detail:"all"` re-read it).
-    if (o.resume_id != null and ready) {
+    if (e.history) {
         // A screen source only folds turns at a turn end; fold the
         // reprinted history now, or the first new turn delivers it.
-        try e.agent.syncHistory();
-        for (e.agent.records()) |r| try e.handed.markRecord(e.allocator, r);
+        if (ready) try e.agent.syncHistory();
+        foldHistory(e);
     }
     var notes: std.ArrayList([]const u8) = .empty;
     // A model or effort the launch cannot take goes through the app.
@@ -3363,6 +3422,12 @@ const Outcome = struct {
 fn act(arena: std.mem.Allocator, e: *Entry, action: agent_mod.Action, deadline: i64) anyerror!Acted {
     e.acting += 1;
     defer e.acting -= 1;
+    // A prompt or an answer starts what the resumed app does next: from
+    // here on what it shows is news.
+    switch (action) {
+        .submit, .queue, .answer, .answer_text => closeHistory(e),
+        .interrupt, .set_model, .set_effort => {},
+    }
     switch (e.agent.driver()) {
         .opencode_api => |d| {
             d.perform(action) catch |err| return .{ .fail = try apiFail(arena, d.api, err) };
@@ -5009,7 +5074,7 @@ fn attachIdTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
     var why: AttachWhy = .{};
     const e = reattachOne(arena, d, claimed, &why) catch |err| switch (err) {
         error.SessionGone => {
-            if (relaunch_asked and descRelaunchable(d)) return relaunchFrom(arena, args, d, &claimed, lp, &why);
+            if (relaunch_asked and descRelaunchable(d)) return relaunchFrom(arena, args, d, &claimed, lp, &why, &carried);
             const kept = retireDescriptor(arena, index_dir, d, &claimed, lp);
             return goneResult(arena, d, &why, kept);
         },
@@ -5039,7 +5104,8 @@ fn attachIdTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
 /// with its launch settings, resuming its conversation, under the same id
 /// and name. `claimed` moves into the agent; on a failure it is released
 /// and the descriptor stays, so the relaunch can be tried again.
-fn relaunchFrom(arena: std.mem.Allocator, args: std.json.Value, d: Descriptor, claimed: *agentindex.Claim, lp: []const u8, gone_why: *const AttachWhy) ![]const u8 {
+/// `handed` (moved in on success) is what a gone entry of this server handed out.
+fn relaunchFrom(arena: std.mem.Allocator, args: std.json.Value, d: Descriptor, claimed: *agentindex.Claim, lp: []const u8, gone_why: *const AttachWhy, handed: *std.AutoHashMapUnmanaged(u64, void)) ![]const u8 {
     const loaded = (try adapters()).get(d.app).?;
     const transport: Transport = if (d.transport) |s| std.meta.stringToEnum(Transport, s).? else .local;
     var o = OpenOpts{
@@ -5067,6 +5133,7 @@ fn relaunchFrom(arena: std.mem.Allocator, args: std.json.Value, d: Descriptor, c
         .stall = if (d.stall_after_min > 0) d.stall_after_min else null,
         .name = d.name,
         .keep_id = d.id,
+        .handed = handed,
     };
     const deadline = deadlineFrom(args, DEFAULT_WAIT_MS);
     var claim: ?agentindex.Claim = claimed.*;

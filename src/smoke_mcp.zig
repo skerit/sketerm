@@ -5913,7 +5913,9 @@ const FC_END = "\x1b]133;C\x07\x1b]133;D\x07\x07" ++ FC_IDLE ++ FC_ERASE ++ "Bre
 const FC_PERMISSION = FC_ERASE ++ "tool: Bash (rm notes.md)\r\nPermission Required: Bash command\r\n> rm notes.md\r\n" ++
     "Do you want to proceed?\r\n1. Yes\r\n2. No\r\nSelect with numbers [1-2]. Then Enter to submit or Escape to cancel:\x07";
 
-const FcStep = struct { at_ms: i64, bytes: []u8, picker: bool = false };
+/// `history`: the late part of a resumed conversation's reprint, dropped
+/// once a prompt is typed (the real one reprints before its first turn).
+const FcStep = struct { at_ms: i64, bytes: []u8, picker: bool = false, history: bool = false };
 
 /// Where the fake Claude Code keeps what a real one keeps in ~/.claude:
 /// one transcript per conversation id, every launch's argv, and a marker
@@ -6007,6 +6009,7 @@ fn fakeClaude(allocator: std.mem.Allocator, args: []const [*:0]const u8) u8 {
         _ = c.tcsetattr(0, c.TCSANOW, &tio);
     }
     _ = c.usleep(300_000);
+    var steps: std.ArrayList(FcStep) = .empty;
     if (resumed) |id| {
         const past = readfile.cappedAlloc(allocator, conv_path, 1 << 20) catch {
             writeOut("No conversation found with session ID: ");
@@ -6017,16 +6020,34 @@ fn fakeClaude(allocator: std.mem.Allocator, args: []const [*:0]const u8) u8 {
         };
         defer allocator.free(past);
         writeOut(FC_IDLE ++ "Claude Code v0.0.0 (smoke fake, resumed)\r\n");
+        // Each past turn reprinted with its footer, as the real one does;
+        // the last one only a while after the input box shows, which is how
+        // a long reprint reaches a reader that already saw the app ready.
+        var turns: std.ArrayList([]const u8) = .empty;
         var it = std.mem.splitScalar(u8, std.mem.trimEnd(u8, past, "\n"), '\n');
-        while (it.next()) |l| {
+        while (it.next()) |l| turns.append(allocator, l) catch return 1;
+        const split = if (turns.items.len >= 4) turns.items.len - 2 else turns.items.len;
+        for (turns.items[0..split]) |l| {
             writeOut(l);
             writeOut("\r\n");
+            if (std.mem.startsWith(u8, l, "claude: ")) writeOut("Baked for 1s \xc2\xb7 done\r\n");
         }
         writeOut(FC_LIVE);
+        if (split < turns.items.len) {
+            var late: std.ArrayList(u8) = .empty;
+            late.appendSlice(allocator, FC_ERASE) catch return 1;
+            for (turns.items[split..]) |l| {
+                late.appendSlice(allocator, l) catch return 1;
+                late.appendSlice(allocator, "\r\n") catch return 1;
+                if (std.mem.startsWith(u8, l, "claude: ")) late.appendSlice(allocator, "Baked for 1s \xc2\xb7 done\r\n") catch return 1;
+            }
+            late.appendSlice(allocator, FC_LIVE) catch return 1;
+            steps.append(allocator, .{ .at_ms = nowMs() + 2500, .bytes = late.toOwnedSlice(allocator) catch return 1, .history = true }) catch return 1;
+        }
+        turns.deinit(allocator);
     } else writeOut(FC_IDLE ++ "Claude Code v0.0.0 (smoke fake)\r\n" ++ FC_LIVE);
 
     var input: std.ArrayList(u8) = .empty;
-    var steps: std.ArrayList(FcStep) = .empty;
     var picker = false;
     var choice: u8 = 0;
     var model_picker = false;
@@ -6096,6 +6117,14 @@ fn fakeClaude(allocator: std.mem.Allocator, args: []const [*:0]const u8) u8 {
             switch (b) {
                 '\r' => {
                     if (input.items.len == 0) continue;
+                    var k: usize = 0;
+                    while (k < steps.items.len) {
+                        if (!steps.items[k].history) {
+                            k += 1;
+                            continue;
+                        }
+                        allocator.free(steps.orderedRemove(k).bytes);
+                    }
                     const text = input.items;
                     if (std.mem.eql(u8, text, "/model")) {
                         model_picker = true;
@@ -6119,7 +6148,9 @@ fn fakeClaude(allocator: std.mem.Allocator, args: []const [*:0]const u8) u8 {
                     input.clearRetainingCapacity();
                     // Escape during a turn interrupts it, as the real one does:
                     // what was still to come is dropped and the turn ends.
-                    if (steps.items.len > 0) {
+                    var turn_running = false;
+                    for (steps.items) |st| turn_running = turn_running or !st.history;
+                    if (turn_running) {
                         for (steps.items) |st| allocator.free(st.bytes);
                         steps.clearRetainingCapacity();
                         writeOut(FC_ERASE ++ "Interrupted \xc2\xb7 What should Claude do instead?\r\n" ++ FC_LIVE ++ FC_END);
