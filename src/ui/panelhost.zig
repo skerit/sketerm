@@ -608,10 +608,7 @@ fn byKey(scope: Scope, session: ?[]const u8, name: []const u8) ?*Entry {
 
 /// Two scopes are the same panel key. Sessionless matches ONLY
 /// sessionless: it is a different shape, not a name.
-fn sameSession(a: ?[]const u8, b: ?[]const u8) bool {
-    if (a == null or b == null) return a == null and b == null;
-    return std.mem.eql(u8, a.?, b.?);
-}
+const sameSession = @import("../util/strz.zig").eqOpt;
 
 /// The daemon session a pane renders — the identity behind
 /// `$SKETERM_SESSION`.

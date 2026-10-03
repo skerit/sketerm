@@ -30,10 +30,7 @@ pub const Verdict = enum {
     }
 };
 
-fn hostEq(a: ?[]const u8, b: ?[]const u8) bool {
-    if (a == null or b == null) return a == null and b == null;
-    return std.mem.eql(u8, a.?, b.?);
-}
+const hostEq = @import("../util/strz.zig").eqOpt;
 
 /// `shell_host` is the browser host identity of the pane's session
 /// (`paths.browserHost`), `tab_host` the tab's (null = this machine).

@@ -1177,10 +1177,7 @@ fn addDaemon(self: *Switcher, host: ?[]const u8, origin: []const u8) void {
     };
 }
 
-fn optionalEql(a: ?[]const u8, b: ?[]const u8) bool {
-    if (a == null or b == null) return a == null and b == null;
-    return std.mem.eql(u8, a.?, b.?);
-}
+const optionalEql = @import("../util/strz.zig").eqOpt;
 
 fn discoverDaemons(self: *Switcher) void {
     addDaemon(self, null, "local daemon");

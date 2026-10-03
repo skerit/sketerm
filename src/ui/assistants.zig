@@ -354,10 +354,7 @@ pub const Assistant = struct {
     }
 };
 
-fn strEqOpt(a: ?[]const u8, b: ?[]const u8) bool {
-    if (a == null or b == null) return a == null and b == null;
-    return std.mem.eql(u8, a.?, b.?);
-}
+const strEqOpt = @import("../util/strz.zig").eqOpt;
 
 fn agentsFingerprint(src: ?[]const mcp_registry.Agent) u64 {
     const agents = src orelse return 1;

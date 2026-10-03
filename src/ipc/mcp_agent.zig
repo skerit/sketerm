@@ -821,10 +821,7 @@ fn waitProbes(list: []const *HostProbe, max_ms: i64) void {
     }
 }
 
-fn sameHost(a: ?[]const u8, b: ?[]const u8) bool {
-    if (a == null or b == null) return a == null and b == null;
-    return std.mem.eql(u8, a.?, b.?);
-}
+const sameHost = @import("../util/strz.zig").eqOpt;
 
 /// This server's live (not gone) agents on `host`.
 fn agentsOn(host: ?[]const u8) u32 {

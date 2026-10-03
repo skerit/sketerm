@@ -72,10 +72,7 @@ pub const OwnedFontSettings = struct {
     }
 };
 
-fn eqlOpt(a: ?[]const u8, b: ?[]const u8) bool {
-    if (a == null or b == null) return a == null and b == null;
-    return std.mem.eql(u8, a.?, b.?);
-}
+const eqlOpt = @import("../util/strz.zig").eqOpt;
 
 test "editor font config owns set change and removed paths with layout decisions" {
     const t = std.testing;
