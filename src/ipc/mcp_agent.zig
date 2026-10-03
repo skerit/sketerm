@@ -46,6 +46,8 @@ const retry_mod = @import("../agent/retry.zig");
 const stall_mod = @import("../agent/stall.zig");
 const brief = @import("../agent/brief.zig");
 const hoststats = @import("../agent/hoststats.zig");
+const facts_mod = @import("../agent/facts.zig");
+const statusline = @import("../agent/statusline.zig");
 const mcpassets = @import("mcpassets.zig");
 const wire = @import("../mux/wire.zig");
 const Screen = @import("../grid/screen.zig").Screen;
@@ -259,6 +261,14 @@ pub const Entry = struct {
     /// taken yet, oldest first (owned): an interrupt that throws the queue
     /// away types them again. Never anything the app holds from elsewhere.
     queued_sent: std.ArrayList(QueuedPrompt) = .empty,
+    /// The status command's facts file on the agent's host (owned); null
+    /// when its adapter has none or the start could not set it up.
+    facts_file: ?[]u8 = null,
+    /// The user's own status object the command chains, as JSON (owned;
+    /// null: they have none). Every restart builds the same command.
+    status_user: ?[]u8 = null,
+    /// Why the start set no status command up (static).
+    facts_skipped: ?[]const u8 = null,
 
     /// Forget the oldest `n` prompts of `queued_sent`.
     fn dropQueued(self: *Entry, n: usize) void {
@@ -312,7 +322,7 @@ pub const Entry = struct {
             std.crypto.secureZero(u8, p);
             a.free(p);
         }
-        for ([_]?[]u8{ self.server_session, self.host, self.conversation, self.launch_model, self.launch_effort, self.picked_model, self.name, self.socket, self.push_match }) |o| {
+        for ([_]?[]u8{ self.server_session, self.host, self.conversation, self.launch_model, self.launch_effort, self.picked_model, self.name, self.socket, self.push_match, self.facts_file, self.status_user }) |o| {
             if (o) |s| a.free(s);
         }
         self.extra.free(a);
@@ -558,6 +568,29 @@ fn localHost() launch.Host {
     };
 }
 
+/// This process's non-empty value of a variable: the host environment a
+/// local start's settings lookup sees (`statusline.localPaths`).
+fn envValue(name: []const u8) ?[]const u8 {
+    var buf: [256]u8 = undefined;
+    const z = std.fmt.bufPrintZ(&buf, "{s}", .{name}) catch return null;
+    return @import("../util/env.zig").nonEmpty(z.ptr);
+}
+
+/// The adapter's status command (a screen app's facts source), if any.
+fn statusCommandOf(loaded: *const adapter.Loaded) ?adapter.StatusCommand {
+    return (loaded.spec.facts orelse return null).status_command;
+}
+
+/// Largest settings file read for the user's own status command.
+const SETTINGS_MAX_BYTES: usize = 1 << 20;
+
+/// The status command a start passes: saving to `facts_file`, chaining
+/// `user` (JSON); null without a file (none set up) or a status command.
+fn statusOf(arena: std.mem.Allocator, loaded: *const adapter.Loaded, facts_file: ?[]const u8, user: ?[]const u8) !?launch.Status {
+    const f = facts_file orelse return null;
+    return try statusline.status(arena, statusCommandOf(loaded) orelse return null, f, user);
+}
+
 // ── the server loop's view ───────────────────────────────────────
 
 /// What a screen agent's terminal shows now, for `observeScreen`.
@@ -695,10 +728,14 @@ const HostProbe = struct {
     problem: []const u8 = "not read yet",
     term: ?*termdrive.Term = null,
     started_ms: i64 = 0,
+    /// The last reading's whole output (owned): a remote host's probe also
+    /// prints its agents' facts files (`facts_mod.probeScript`).
+    output: ?[]const u8 = null,
 
     fn free(self: *HostProbe, a: std.mem.Allocator) void {
         if (self.term) |t| t.deinit();
         if (self.host) |h| a.free(h);
+        if (self.output) |o| a.free(o);
         a.destroy(self);
     }
 
@@ -726,10 +763,16 @@ fn kickProbe(p: *HostProbe, now_ms: i64) void {
     var arena_state = std.heap.ArenaAllocator.init(state.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const argv: []const []const u8 = if (p.host) |h|
-        (mcp_term.remoteShArgv(arena, h, hoststats.SCRIPT) catch return)
-    else
-        &.{ "/bin/sh", "-c", hoststats.SCRIPT };
+    // A remote host's agents' facts files ride the same reading; local
+    // ones are read directly (`factsOf`).
+    const argv: []const []const u8 = if (p.host) |h| blk: {
+        var files: std.ArrayList(facts_mod.ProbeFile) = .empty;
+        for (state.entries.items) |e| if (e.facts_file) |f| if (!gone(e) and sameHost(e.host, h)) {
+            files.append(arena, .{ .id = e.id, .path = f }) catch return;
+        };
+        const script = std.mem.concat(arena, u8, &.{ hoststats.SCRIPT, "\n", facts_mod.probeScript(arena, files.items) catch return }) catch return;
+        break :blk mcp_term.remoteShArgv(arena, h, script) catch return;
+    } else &.{ "/bin/sh", "-c", hoststats.SCRIPT };
     p.term = termdrive.Term.spawnWith(state.allocator, argv, 200, 10, state.mux_sock, .{ .shell_integration = false }) catch {
         p.problem = "its probe could not be started";
         return;
@@ -743,7 +786,9 @@ fn serviceHostProbes(now_ms: i64) void {
         t.drain();
         if (t.exited) {
             const text = t.readScreen(true) catch "";
-            defer if (text.len > 0) t.allocator.free(text);
+            if (p.output) |o| state.allocator.free(o);
+            p.output = null;
+            if (text.len > 0) p.output = text;
             if (hoststats.parse(text)) |st| {
                 p.stats = st;
                 p.read_ms = now_ms;
@@ -782,11 +827,11 @@ fn agentsOn(host: ?[]const u8) u32 {
     return n;
 }
 
-/// agent_list's `hosts`: one line per host this server has agents on,
-/// with its agent count, available memory and load (unknown when the host
-/// cannot say), each reading at most `HOST_STATS_TTL_MS` old or waited for
-/// at most `HOST_LIST_WAIT_MS`.
-fn hostsReport(arena: std.mem.Allocator, res: *Res) !void {
+/// Every host this server has live agents on, each with its probe kicked
+/// (a reading at most `HOST_STATS_TTL_MS` old is kept) and waited for
+/// until `until`: agent_list reads hosts once, for `hosts` and for the
+/// facts files of remote agents alike.
+fn readHosts(arena: std.mem.Allocator, until: i64) !struct { hosts: []const ?[]const u8, probes: []const *HostProbe } {
     var hosts: std.ArrayList(?[]const u8) = .empty;
     for (state.entries.items) |e| {
         if (gone(e)) continue;
@@ -800,7 +845,17 @@ fn hostsReport(arena: std.mem.Allocator, res: *Res) !void {
         p.* = try hostProbe(h);
         kickProbe(p.*, now);
     }
-    waitProbes(probes, HOST_LIST_WAIT_MS);
+    waitProbes(probes, @max(0, until - clock.nowMs()));
+    return .{ .hosts = hosts.items, .probes = probes };
+}
+
+/// agent_list's `hosts`: one line per host this server has agents on,
+/// with its agent count, available memory and load (unknown when the host
+/// cannot say), from `readHosts`.
+fn hostsReport(arena: std.mem.Allocator, res: *Res, until: i64) !void {
+    const read = try readHosts(arena, until);
+    const hosts = read.hosts;
+    const probes = read.probes;
     const Item = struct {
         host: []const u8,
         agents: u32,
@@ -813,7 +868,7 @@ fn hostsReport(arena: std.mem.Allocator, res: *Res) !void {
     };
     const items = try arena.alloc(Item, probes.len);
     const later = clock.nowMs();
-    for (hosts.items, probes, items) |h, p, *it| {
+    for (hosts, probes, items) |h, p, *it| {
         it.* = .{ .host = h orelse "local", .agents = agentsOn(h) };
         var aw: std.Io.Writer.Allocating = .init(arena);
         const w = &aw.writer;
@@ -853,6 +908,81 @@ fn capCheck(arena: std.mem.Allocator, host: ?[]const u8) !union(enum) { ok: ?[]c
     if (mb < state.min_free_mb)
         return .{ .fail = .{ .code = .refused, .msg = try std.fmt.allocPrint(arena, "{s} has {d} MB available, below the cap (mcp_agent_min_free_mb = {d}); free memory there or lower the cap", .{ where, mb, state.min_free_mb }) } };
     return .{ .ok = null };
+}
+
+// ── facts ────────────────────────────────────────────────────────
+
+/// Largest facts file read.
+const FACTS_MAX_BYTES: usize = 256 * 1024;
+
+/// `capabilities.agent_facts`: the vocabulary (type, meaning, compact
+/// label per name) and the names each loaded adapter can give.
+pub fn factsCapability(arena: std.mem.Allocator) !std.json.Value {
+    var out: std.json.ObjectMap = .empty;
+    var vocab_obj: std.json.ObjectMap = .empty;
+    var by_adapter: std.json.ObjectMap = .empty;
+    if (facts_mod.shipped()) |v| {
+        for (v.names, v.decls) |n, d| {
+            var o: std.json.ObjectMap = .empty;
+            try o.put(arena, "type", .{ .string = @tagName(d.type) });
+            try o.put(arena, "meaning", .{ .string = d.meaning });
+            if (d.compact) |cp| try o.put(arena, "compact", .{ .string = cp });
+            try vocab_obj.put(arena, n, .{ .object = o });
+        }
+        if (available()) {
+            const set = try adapters();
+            for (set.items.items) |l| {
+                var names = std.json.Array.init(arena);
+                if (l.spec.facts) |f| for (try facts_mod.provided(arena, v, f.map)) |n| try names.append(.{ .string = n });
+                try by_adapter.put(arena, l.spec.id, .{ .array = names });
+            }
+        }
+    } else |_| {}
+    try out.put(arena, "facts", .{ .object = vocab_obj });
+    try out.put(arena, "adapters", .{ .object = by_adapter });
+    return .{ .object = out };
+}
+
+/// An agent's facts as its source says them now: known values, or why
+/// there are none.
+const FactsRead = struct {
+    /// The known ones as a JSON object; null when none is known.
+    json: ?std.json.Value = null,
+    /// The `compact`-labelled ones on one line (`facts_mod.compactLine`).
+    line: ?[]const u8 = null,
+    /// Why nothing is known (agent_list detail's `facts_unknown`).
+    unknown: ?[]const u8 = null,
+};
+
+/// Read `e`'s facts. Never waits: a local status command's file is read
+/// directly, a remote one from its host's last probe (kicked here when
+/// stale), an API source's from what its event stream already gave.
+fn factsOf(arena: std.mem.Allocator, e: *Entry) !FactsRead {
+    const decl = e.loaded.spec.facts orelse return .{ .unknown = "its adapter declares no facts" };
+    const vocab_f = facts_mod.shipped() catch return .{ .unknown = "data/agents/facts.json does not load" };
+    const values: facts_mod.Values = switch (e.agent.source) {
+        .opencode_api => |*api| blk: {
+            const doc = (api.factsDocument(arena) catch null) orelse return .{ .unknown = "no answer has reported token counts yet" };
+            break :blk try facts_mod.read(arena, vocab_f, decl.map, doc);
+        },
+        .screen => blk: {
+            const path = e.facts_file orelse return .{ .unknown = e.facts_skipped orelse "no status command was set up at its start (an older sketerm opened it)" };
+            const text = if (e.host == null)
+                readfile.capped(arena, path, FACTS_MAX_BYTES) orelse return .{ .unknown = "the app has not run its status command yet" }
+            else remote: {
+                const p = try hostProbe(e.host);
+                kickProbe(p, clock.nowMs());
+                const out = p.output orelse return .{ .unknown = try std.fmt.allocPrint(arena, "its host has not been read yet ({s})", .{p.problem}) };
+                const content = facts_mod.probeContent(out, e.id) orelse return .{ .unknown = "its host has not been read since the agent started" };
+                if (content.len == 0) return .{ .unknown = "the app has not run its status command yet" };
+                break :remote content;
+            };
+            break :blk (try facts_mod.readText(arena, vocab_f, decl.map, text)) orelse return .{ .unknown = "its facts file is not JSON" };
+        },
+    };
+    const json = try facts_mod.toJson(arena, vocab_f, values);
+    if (json.object.count() == 0) return .{ .unknown = "the app has reported none of them yet" };
+    return .{ .json = json, .line = try facts_mod.compactLine(arena, vocab_f, values) };
 }
 
 // ── retry on overload ────────────────────────────────────────────
@@ -2033,6 +2163,8 @@ fn finish(arena: std.mem.Allocator, res: *Res, e: *Entry, dv: Delivered, watch: 
     try goneFacts(arena, res, e);
     try retryFacts(res, e);
     if (e.stall.after_min) |m| try res.fact("stall_after_min", m);
+    const fr = try factsOf(arena, e);
+    if (fr.json) |j| try res.raw("facts", try toJson(arena, j));
 
     var message: ?[]const u8 = null;
     var job_block: ?Block = null;
@@ -2085,6 +2217,7 @@ fn finish(arena: std.mem.Allocator, res: *Res, e: *Entry, dv: Delivered, watch: 
                 try res.text("still working when the wait ran out: run watch_command in the background (or as a Monitor with --follow) to be woken instead of polling");
         }
     } else try res.textf("{s}: state {s}", .{ e.id, @tagName(st) });
+    if (fr.line) |l| try res.textf("{s}: {s}", .{ e.id, l });
     if (watch.template) |x| try res.fact("template", x);
 
     try res.raw("events", try toJson(arena, try eventsJson(arena, dv.items)));
@@ -2337,7 +2470,22 @@ const OpenOpts = struct {
     /// A relaunch from this server: the content keys of what the gone
     /// entry handed out, moved into the new one (`select.Handed.texts`).
     handed: ?*std.AutoHashMapUnmanaged(u64, void) = null,
+    /// The status command a screen start sets up (`startAgent` finds it on
+    /// the agent's host); null: none, `facts_skipped` says why.
+    status: ?StatusPlan = null,
+    facts_skipped: ?[]const u8 = null,
 };
+
+/// Where a start's status command saves its document, and what it chains.
+const StatusPlan = struct {
+    /// The agent's host's per-user runtime dir.
+    run_dir: []const u8,
+    /// The user's own status object as JSON; null: they have none.
+    user: ?[]const u8,
+};
+
+/// Why a start sets up no status command although the adapter has one.
+const FACTS_ARG_TAKEN = "the launch args pass the app's own settings option, where the status command would go";
 
 /// Which agent holds name (or id) `key` on this machine: this server's
 /// entry, else a descriptor of the per-user index; null when it is free.
@@ -2640,13 +2788,20 @@ fn startAgent(arena: std.mem.Allocator, loaded: *const adapter.Loaded, o: *OpenO
     // Before the first connection: which login the agent's legs ride, and a
     // fresh one when sketerm's master is too old or the caller asks.
     if (o.host) |h| facts.master = try mcp_term.sshMasterCheck(arena, h, mcp_term.legs.script, bounds.fresh_login);
+    // A status command (the facts source of a screen app) needs the app's
+    // settings option free and the user's own command from their files.
+    const status_cmd = statusCommandOf(loaded);
+    if (status_cmd != null and launch.settingsArgTaken(loaded.spec.launch, o.extra)) o.facts_skipped = FACTS_ARG_TAKEN;
+    const wants_status = status_cmd != null and o.facts_skipped == null;
     const binary = if (o.host) |h| blk: {
         // One probe on the host, in its login environment: the binary from
-        // the adapter's candidates, its version, the dir, the home.
+        // the adapter's candidates, its version, the dir, the home, and
+        // the settings files the user's status command may be in.
         const r = switch (try probeRemote(arena, h, &.{.{ .launch = loaded.spec.launch, .override = o.override, .version = true }}, .{
             .dir = o.cwd,
             .login = o.extra.login_shell,
             .path_prepend = o.extra.path_prepend,
+            .files = if (wants_status) try statusline.probeSnippets(arena, status_cmd.?, o.cwd, o.extra, loaded.spec.launch.unset_env) else &.{},
         })) {
             .fail => |f| {
                 why.* = f;
@@ -2659,6 +2814,7 @@ fn startAgent(arena: std.mem.Allocator, loaded: *const adapter.Loaded, o: *OpenO
             return error.Refused;
         };
         if (o.cwd == null) o.cwd = r.home orelse "/";
+        if (wants_status) o.status = .{ .run_dir = r.run_dir orelse "/tmp", .user = try statusline.userJson(arena, status_cmd.?, r.files) };
         facts.version = r.versions[0];
         facts.login = r.login;
         facts.shell = r.shell;
@@ -2674,6 +2830,12 @@ fn startAgent(arena: std.mem.Allocator, loaded: *const adapter.Loaded, o: *OpenO
             return error.Refused;
         };
         facts.version = try localVersion(arena, loaded.spec.launch, found);
+        if (wants_status) {
+            const paths = try statusline.localPaths(arena, status_cmd.?, o.cwd.?, localHost().home, o.extra, loaded.spec.launch.unset_env, envValue);
+            const contents = try arena.alloc(?[]const u8, paths.len);
+            for (paths, contents) |p, *ct| ct.* = if (p) |path| readfile.capped(arena, path, SETTINGS_MAX_BYTES) else null;
+            o.status = .{ .run_dir = platform.runtimeDir(), .user = try statusline.userJson(arena, status_cmd.?, contents) };
+        }
         break :blk found;
     };
 
@@ -3085,7 +3247,8 @@ fn spawnScreen(arena: std.mem.Allocator, loaded: *const adapter.Loaded, binary: 
     // A conversation id the agent owns, so a relaunch resumes exactly it;
     // `resume` continues the caller's existing one instead.
     const conversation: ?[]const u8 = if (o.resume_id) |r| r else if (spec.launch.session_args.len > 0) try newUuid(arena) else null;
-    const x = try launch.applySettings(arena, spec, o.extra, null);
+    const facts_file: ?[]const u8 = if (o.status) |p| try statusline.filePath(arena, p.run_dir, id) else null;
+    const x = try launch.applySettings(arena, spec, o.extra, try statusOf(arena, loaded, facts_file, if (o.status) |p| p.user else null));
     const argv = try launch.startArgv(arena, spec.launch, binary, x, .{
         .model = o.model,
         .effort = o.effort,
@@ -3098,6 +3261,11 @@ fn spawnScreen(arena: std.mem.Allocator, loaded: *const adapter.Loaded, binary: 
     errdefer dropBare(e);
     try setPlace(e, where.*, o);
     if (conversation) |cv| e.conversation = try a.dupe(u8, cv);
+    if (facts_file) |f| e.facts_file = try a.dupe(u8, f);
+    if (o.status) |p| if (p.user) |u| {
+        e.status_user = try a.dupe(u8, u);
+    };
+    e.facts_skipped = o.facts_skipped;
     // A resumed conversation has turns: a relaunch must resume it too.
     if (o.resume_id != null) e.conversed = true;
     const ag = try a.create(agent_mod.Agent);
@@ -3943,7 +4111,7 @@ fn relaunch(arena: std.mem.Allocator, e: *Entry, action: agent_mod.Action, deadl
 const Restart = struct { argv: []const []const u8, spec: SpawnSpec };
 
 fn restartOf(arena: std.mem.Allocator, e: *const Entry, model: ?[]const u8, effort: ?[]const u8, conversation: ?[]const u8, start: launch.Start) !Restart {
-    const x = try launch.applySettings(arena, &e.loaded.spec, e.extra, null);
+    const x = try launch.applySettings(arena, &e.loaded.spec, e.extra, try statusOf(arena, e.loaded, e.facts_file, e.status_user));
     return .{
         .argv = try launch.startArgv(arena, e.loaded.spec.launch, e.binary, x, .{
             .model = model,
@@ -4663,7 +4831,10 @@ fn readTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]const 
 
 fn listTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
     service(clock.nowMs());
-    if (!argBool(args, "detail")) return listCompact(arena);
+    // One bounded read of every host, for `hosts` and for remote facts.
+    const until = clock.nowMs() + HOST_LIST_WAIT_MS;
+    _ = try readHosts(arena, until);
+    if (!argBool(args, "detail")) return listCompact(arena, until);
     const Item = struct {
         agent: []const u8,
         name: ?[]const u8,
@@ -4693,6 +4864,8 @@ fn listTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
         stall_after_min: ?u32,
         relaunchable: ?bool,
         gone_reason: ?[]const u8,
+        facts: ?std.json.Value,
+        facts_unknown: ?[]const u8,
     };
     const items = try arena.alloc(Item, state.entries.items.len);
     var res = Res.init(arena);
@@ -4713,7 +4886,10 @@ fn listTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
         try sessions.append(arena, e.session);
         if (e.server_session) |s| try sessions.append(arena, s);
         const act_ms = e.agent.lastActivityMs();
+        const fr = try factsOf(arena, e);
         out.* = .{
+            .facts = fr.json,
+            .facts_unknown = fr.unknown,
             .agent = e.id,
             .name = e.name,
             .app = e.loaded.spec.id,
@@ -4747,8 +4923,9 @@ fn listTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
             out.state,                         e.host orelse "this machine", out.cwd,                                                   @divTrunc(@max(0, wall - e.started_ms), 1000),
             if (out.last_activity_ms) |x| try std.fmt.allocPrint(arena, "{d}s", .{@divTrunc(@max(0, wall - x), 1000)}) else "never", out.pending_events,
         });
+        if (fr.line) |l| try res.textf("{s}: {s}", .{ out.agent, l });
     }
-    try hostsReport(arena, &res);
+    try hostsReport(arena, &res, until);
     try res.raw("agents", try toJson(arena, items));
     try res.fact("count", items.len);
     try res.fact("detail", true);
@@ -4757,7 +4934,7 @@ fn listTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
 
 /// agent_list's default: what an orchestrator of many agents scans each
 /// turn (with 17 agents the full facts cost ~5k tokens), one line each.
-fn listCompact(arena: std.mem.Allocator) ![]const u8 {
+fn listCompact(arena: std.mem.Allocator, until: i64) ![]const u8 {
     const Pending = struct { kind: []const u8, title: []const u8 };
     const Item = struct {
         agent: []const u8,
@@ -4776,6 +4953,7 @@ fn listCompact(arena: std.mem.Allocator) ![]const u8 {
         gone_reason: ?[]const u8,
         /// The newest job's last assistant message, first line, clipped.
         preview: ?[]const u8,
+        facts: ?std.json.Value,
     };
     // Gone agents are one line together: id, name and whether a relaunch
     // starts them again (detail:true lists them in full).
@@ -4792,7 +4970,9 @@ fn listCompact(arena: std.mem.Allocator) ![]const u8 {
     for (running.items, items) |e, *out| {
         const act_ms = e.agent.lastActivityMs();
         const it = e.agent.interaction();
+        const fr = try factsOf(arena, e);
         out.* = .{
+            .facts = fr.json,
             .agent = e.id,
             .name = e.name,
             .app = e.loaded.spec.id,
@@ -4817,6 +4997,7 @@ fn listCompact(arena: std.mem.Allocator) ![]const u8 {
         if (out.relaunchable) |can| try w.print(", {s}", .{if (can) "relaunchable (agent_attach relaunch: true)" else "not relaunchable"});
         if (out.idle_s) |x| try w.print(", idle {d}s", .{x});
         if (out.queued > 0) try w.print(", {d} queued", .{out.queued});
+        if (fr.line) |l| try w.print(", {s}", .{l});
         if (out.pending) |p| try w.print(", pending {s}: {s}", .{ p.kind, agentwait.clip(events.firstLine(p.title), 80) });
         if (out.preview) |p| try w.print("; last: {s}", .{p});
         try res.text(aw.written());
@@ -4833,7 +5014,7 @@ fn listCompact(arena: std.mem.Allocator) ![]const u8 {
         try w.writeAll(" (agent_attach {agent, relaunch: true} starts a relaunchable one again; agent_close forgets one)");
         try res.text(aw.written());
     }
-    try hostsReport(arena, &res);
+    try hostsReport(arena, &res, until);
     try res.raw("agents", try toJson(arena, items));
     try res.raw("gone", try toJson(arena, gone_list.items));
     try res.fact("count", state.entries.items.len);
@@ -4846,6 +5027,8 @@ fn listCompact(arena: std.mem.Allocator) ![]const u8 {
 fn discard(e: *Entry) void {
     endWaitersOf(e.id, "agent closed");
     removeDescriptor(e);
+    // A remote host's facts file stays: a few KB under its runtime dir.
+    if (e.host == null) if (e.facts_file) |f| pathz.unlinkPath(f);
     for (state.entries.items, 0..) |x, i| if (x == e) {
         _ = state.entries.orderedRemove(i);
         break;
@@ -4985,6 +5168,8 @@ fn writeDescriptor(e: *Entry) void {
         .permissions = e.extra.permissions,
         .retry_on_overload = e.retry.policy,
         .stall_after_min = e.stall.after_min orelse 0,
+        .facts_file = e.facts_file,
+        .status_user = e.status_user,
         .started_ms = e.started_ms,
         .gone_ms = e.ended_ms,
     };
@@ -5341,6 +5526,8 @@ fn reattachOne(arena: std.mem.Allocator, d: Descriptor, claim: ?agentindex.Claim
     if (d.launch_model) |s| e.launch_model = try a.dupe(u8, s);
     if (d.launch_effort) |s| e.launch_effort = try a.dupe(u8, s);
     if (d.picked_model) |s| e.picked_model = try a.dupe(u8, s);
+    if (d.facts_file) |s| e.facts_file = try a.dupe(u8, s);
+    if (d.status_user) |s| e.status_user = try a.dupe(u8, s);
     e.extra = try extra.clone(a);
     e.transport = transport;
     e.conversed = d.conversed;

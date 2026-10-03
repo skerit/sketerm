@@ -210,6 +210,9 @@ pub const Source = struct {
     /// Replaying history (an adopted session's past): no turn is armed and
     /// no `message` event is pushed.
     quiet: bool = false,
+    /// The latest root assistant message that carried token counts, as
+    /// JSON: the facts document's `message` (`Api.factsDocument`).
+    last_answer: ?[]u8 = null,
 
     /// @param root the session to drive; null adopts the first parentless one.
     pub fn init(allocator: std.mem.Allocator, loaded: *const adapter.Loaded, limits: events.Limits, root: ?[]const u8) !Source {
@@ -254,6 +257,7 @@ pub const Source = struct {
             a.free(m[1]);
         }
         if (self.seen_variant) |v| a.free(v);
+        if (self.last_answer) |s| a.free(s);
         self.queue.deinit();
     }
 
@@ -618,6 +622,11 @@ pub const Source = struct {
         if (role == .user) {
             if (get(info, "model")) |model| try self.noteModel(str(model, "providerID"), str(model, "modelID"), str(info, "variant"));
             return;
+        }
+        if (get(info, "tokens") != null) {
+            const json = try std.json.Stringify.valueAlloc(self.allocator, info, .{});
+            if (self.last_answer) |old| self.allocator.free(old);
+            self.last_answer = json;
         }
         const completed = if (get(info, "time")) |tm| get(tm, "completed") != null else false;
         if (completed and !m.completed) {
@@ -1202,6 +1211,8 @@ pub const ModelInfo = struct {
     name: []const u8,
     /// The model's effort levels (`variant` names).
     variants: []const []const u8,
+    /// The provider's whole entry for the model, as JSON (the facts document's `model`).
+    raw: []const u8 = "{}",
 };
 
 pub const CommandInfo = struct {
@@ -1250,6 +1261,8 @@ pub const Api = struct {
     reconnect_at_ms: ?i64 = null,
     backoff_ms: i64 = RECONNECT_MIN_MS,
     catalog: ?Catalog = null,
+    /// `factsDocument` could not load the catalog: it does not ask again.
+    catalog_failed: bool = false,
     chosen_model: ?[2][]u8 = null,
     chosen_variant: ?[]u8 = null,
     /// Tickets of `runCommand` requests in flight (the route answers when
@@ -1643,6 +1656,30 @@ pub const Api = struct {
         self.chosen_model = null;
     }
 
+    /// The document the adapter's `facts.map` paths read: `message`, the
+    /// latest answer that carried token counts, and `model`, that answer's
+    /// model as the connected providers list it. Null before any answer.
+    /// Gotcha: the first call loads the provider catalog (one loopback
+    /// request per agent; a failure is not retried and leaves `model` out).
+    pub fn factsDocument(self: *Api, arena: std.mem.Allocator) !?Value {
+        const text = self.source.last_answer orelse return null;
+        const info = std.json.parseFromSliceLeaky(Value, arena, text, .{}) catch return null;
+        var doc: std.json.ObjectMap = .empty;
+        try doc.put(arena, "message", info);
+        const provider = str(info, "providerID");
+        const model = str(info, "modelID");
+        if (provider != null and model != null and !self.catalog_failed) {
+            const cat = self.loadCatalog(false) catch blk: {
+                self.catalog_failed = true;
+                break :blk null;
+            };
+            if (cat) |cg| if (cg.find(provider.?, model.?)) |m| {
+                if (std.json.parseFromSliceLeaky(Value, arena, m.raw, .{})) |v| try doc.put(arena, "model", v) else |_| {}
+            };
+        }
+        return .{ .object = doc };
+    }
+
     /// The connected providers' models with their effort levels. Borrowed:
     /// valid until the catalog is reloaded (a model lookup that misses).
     pub fn listModels(self: *Api) ![]const ModelInfo {
@@ -1756,6 +1793,7 @@ pub const Api = struct {
                         .id = try a.dupe(u8, e.key_ptr.*),
                         .name = try a.dupe(u8, str(e.value_ptr.*, "name") orelse e.key_ptr.*),
                         .variants = variants.items,
+                        .raw = try std.json.Stringify.valueAlloc(a, e.value_ptr.*, .{}),
                     });
                 }
             }
@@ -2332,6 +2370,42 @@ const provider_json =
     \\{"all":[{"id":"openai","name":"OpenAI","models":{"gpt-x":{"name":"GPT X","variants":{"low":{},"high":{}}},"gpt-y":{"name":"GPT Y"}}},
     \\ {"id":"other","name":"Other","models":{"gpt-x":{"name":"GPT X"}}}],"default":{},"connected":["openai"]}
 ;
+
+test "api: the facts document is the latest answer's tokens and its model's catalog entry" {
+    var srv: testserver.Server = .{};
+    try srv.start(t.allocator);
+    defer srv.deinit();
+    srv.route("POST /session", .{ .body = "{\"id\":\"ses_root\",\"title\":\"agent\"}" });
+    srv.route("GET /session/status", .{ .body = "{}" });
+    srv.route("GET /permission", .{ .body = "[]" });
+    srv.route("GET /question", .{ .body = "[]" });
+    srv.route("GET /session/ses_root/message", .{ .body = "[]" });
+    srv.route("GET /provider", .{ .body = "{\"all\":[{\"id\":\"openai\",\"models\":{\"gpt-x\":{\"name\":\"GPT X\",\"limit\":{\"context\":400000,\"output\":128000}}}}],\"connected\":[\"openai\"]}" });
+    var set = adapter.Set.init(t.allocator);
+    defer set.deinit();
+    try set.loadShipped();
+    const loaded = set.get("opencode").?;
+    var api = try Api.init(t.allocator, loaded, .{}, .{ .port = srv.port(), .password = "secret" });
+    defer api.deinit();
+    try api.connect(null, clock.nowMs());
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const facts = @import("facts.zig");
+    const vocab_f = try facts.shipped();
+    try t.expect((try api.factsDocument(a)) == null);
+    const ev = try std.json.parseFromSliceLeaky(Value, a,
+        \\{"type":"message.updated","properties":{"sessionID":"ses_root","info":{"id":"msg_a1","role":"assistant","sessionID":"ses_root","providerID":"openai","modelID":"gpt-x",
+        \\ "tokens":{"input":2000,"output":500,"reasoning":0,"cache":{"read":97500,"write":0}},"time":{"created":1,"completed":2}}}}
+    , .{});
+    try api.source.apply(ev, clock.nowMs());
+    const doc = (try api.factsDocument(a)).?;
+    const vals = try facts.read(a, vocab_f, loaded.spec.facts.?.map, doc);
+    try t.expectEqual(@as(f64, 100000), vals[vocab_f.index("context_used_tokens").?].?);
+    try t.expectEqual(@as(f64, 400000), vals[vocab_f.index("context_window_tokens").?].?);
+    try t.expectEqual(@as(f64, 25), vals[vocab_f.index("context_used_percent").?].?);
+    try t.expect(vals[vocab_f.index("rate_7d_used_percent").?] == null);
+}
 
 test "api: connect, submit with a chosen model and effort, answer, interrupt, commands, reconnect" {
     var srv: testserver.Server = .{};

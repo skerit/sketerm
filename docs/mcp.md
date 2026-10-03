@@ -1500,7 +1500,7 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   app-neutral; each adapter maps it declaratively
   (`launch.permissions`: the `names` it takes plus `patterns`, the JSON
   `shape`, the object `path`, and exactly one of `env` or `arg`), and
-  `launch.applyPermissions` is the one mapping, applied at every start
+  `launch.applySettings` is the one mapping, applied at every start
   (relaunches and reattaches included; the policy is kept in the
   descriptor). opencode (`by_name` under `permission`, env
   `OPENCODE_CONFIG_CONTENT`; its config schema's keys `*`, `read`, `edit`,
@@ -1521,6 +1521,51 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   `OPENCODE_CONFIG_CONTENT` that is not a JSON object. `agent_open` and
   `agent_list detail` report the policy as `permissions` (names and
   actions; nothing secret).
+- **Facts: context use, rate limits, cost (`facts`,
+  `capabilities.agent_facts`).** Every per-agent result and `agent_list`
+  (compact and detail) carry `facts`: what the agent's app reports about
+  itself, only known values (a null or absent value is unknown and left
+  out, never 0); `agent_list`'s one-line form adds `context 14%, 7d limit
+  98%` when known, and `detail` adds `facts_unknown`, why none is known
+  yet. The names live in ONE file, `data/agents/facts.json` (type
+  `int`/`percent`/`tokens`/`usd`/`unix_time`, a one-line meaning, an
+  optional `derive: {ratio: [a, b]}` = `100 * a / b` used when no path
+  gives the fact, an optional `compact` label for the one-line form):
+  `context_used_percent`, `context_window_tokens`, `context_used_tokens`,
+  `rate_5h_used_percent`, `rate_5h_resets_at`, `rate_7d_used_percent`,
+  `rate_7d_resets_at`, `cost_usd`. An adapter's `facts.map` maps names
+  to dotted JSON paths into its source's document (a list of paths is
+  summed); a name facts.json does not declare fails the adapter's load.
+  `capabilities.agent_facts` gives the vocabulary and, per adapter, the
+  names it can give (derived ones included). Adding a fact is a line in
+  facts.json and a mapping in an adapter, no code
+  (`src/agent/facts.zig`). Claude Code's source is its status line:
+  2.1.288 in `--ax-screen-reader` mode runs the `statusLine` command
+  from `--settings` at startup and after each turn with a JSON document
+  on stdin (`context_window`, `rate_limits` after the first answer,
+  `cost`, ...; measured). The adapter's `facts.status_command` puts
+  sketerm's command (`src/agent/statusline.zig` `COMMAND`, plain POSIX
+  sh) into the ONE `--settings` document the permissions use; it saves
+  the JSON atomically (temp file + rename) to the file
+  `$SKETERM_AGENT_FACTS` names (`<runtime dir>/sketerm/agent-facts/<id>.json`
+  on the agent's host) and runs the user's own status command
+  (`$SKETERM_AGENT_STATUS`) with the same JSON, so the screen shows what
+  it always showed; with none it prints nothing. The user's command is
+  looked up at each start on the agent's host, the way Claude Code does:
+  the first of `{cwd}/.claude/settings.local.json`,
+  `{cwd}/.claude/settings.json` and `~/.claude/settings.json` (its
+  directory replaced by `CLAUDE_CONFIG_DIR` when the agent's environment
+  sets it, which `unset_env` means only through `env`) with a
+  `statusLine.command`; its other keys (`padding`) are kept. A caller
+  whose `args` pass `--settings` gets no status command (facts unknown,
+  `facts_unknown` says why), never a refusal. A local agent's file is
+  read directly; a remote one's rides its host's probe (the same
+  terminal, 15 s cache and 1.5 s `agent_list` wait as `hosts`), so
+  remote facts can be up to 15 s old. opencode's source is its API:
+  `message` (the latest root assistant message with `tokens`) and
+  `model` (that model's entry in `GET /provider`, loaded once per
+  agent); its percent is derived. No daemon wire change: the file path
+  and the user's command ride the spawn's environment like `env`.
 - **Retry on overload (`retry_on_overload`,
   `capabilities.agent_retry_on_overload`).** Off by default. `agent_open`
   or `agent_set` `retry_on_overload: {max, backoff_s}` (max 0-10, default
@@ -1657,8 +1702,8 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   first line, at most 120 bytes, of its newest job's last assistant
   message, `select.newestFinal`: a glance that hands nothing out, so
   `agent_read final` still returns it whole; absent before that job has
-  one; `capabilities.agent_list_preview`) and `conversation`;
-  `detail: false` says which. `detail: true` gives every
+  one; `capabilities.agent_list_preview`), `conversation` and `facts`
+  (above); `detail: false` says which. `detail: true` gives every
   fact: where and how it runs: `host` (absent: this machine),
   `transport`, `cwd`, `binary`, `model` and
   `effort` when known (Claude Code: the launch value or the model chosen

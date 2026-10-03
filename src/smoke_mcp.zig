@@ -25,6 +25,7 @@ const wlcomp = @import("wlhost/compositor.zig");
 const wlpipe = @import("wlhost/pipe.zig");
 const platform = @import("util/platform.zig");
 const testserver = @import("agent/testserver.zig");
+const facts = @import("agent/facts.zig");
 const readfile = @import("util/readfile.zig");
 const SpinLock = @import("util/spinlock.zig").SpinLock;
 const termdrive = @import("ipc/termdrive.zig");
@@ -5964,6 +5965,50 @@ fn fcRecordStart(tag: []const u8, args: []const [*:0]const u8) void {
 }
 
 /// The conversation file of the session id this launch names.
+/// Set in an agent_open's `env`: the fake runs the status line command of
+/// its `--settings` (it never does otherwise, so the developer's own
+/// command is never run by the smoke).
+const FC_STATUS_ENV = "SKETERM_SMOKE_FC_STATUS";
+/// What that command printed, one entry per run.
+const FC_STATUS_OUT = "status-out";
+
+/// Run the `statusLine.command` of `--settings` with a status document on
+/// stdin, as Claude Code 2.1.288 does in ax mode at startup (before any
+/// prompt: usage null, no rate limits) and after each turn (`after`).
+fn fcStatus(allocator: std.mem.Allocator, args: []const [*:0]const u8, after: bool) void {
+    if (c.getenv(FC_STATUS_ENV) == null) return;
+    const settings = argAfter(args, "--settings") orelse return;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const doc = std.json.parseFromSliceLeaky(std.json.Value, a, settings, .{}) catch return;
+    const sl = (if (doc == .object) doc.object.get("statusLine") else null) orelse return;
+    const cmd = (if (sl == .object) sl.object.get("command") else null) orelse return;
+    if (cmd != .string) return;
+    var in_buf: [1024]u8 = undefined;
+    const in_name = std.fmt.bufPrint(&in_buf, "status-in-{d}.json", .{c.getpid()}) catch return;
+    var path_buf: [1024]u8 = undefined;
+    const in_path = fcPath(&path_buf, in_name);
+    {
+        const f = c.fopen(in_path.ptr, "w") orelse return;
+        const json = if (after) facts.CLAUDE_SAMPLE else facts.CLAUDE_SAMPLE_FRESH;
+        _ = c.fwrite(json.ptr, 1, json.len, f);
+        _ = c.fclose(f);
+    }
+    defer _ = c.unlink(in_path.ptr);
+    const line = std.fmt.allocPrintSentinel(a, "( {s} ) < '{s}'", .{ cmd.string, in_path }, 0) catch return;
+    const p = c.popen(line.ptr, "r") orelse return;
+    var out: std.ArrayList(u8) = .empty;
+    var buf: [1024]u8 = undefined;
+    while (true) {
+        const n = c.fread(&buf, 1, buf.len, p);
+        if (n == 0) break;
+        out.appendSlice(a, buf[0..n]) catch break;
+    }
+    _ = c.pclose(p);
+    fcAppend(FC_STATUS_OUT, out.items);
+}
+
 fn fcConversation(buf: []u8, id: []const u8) [:0]const u8 {
     var nbuf: [200]u8 = undefined;
     const name = std.fmt.bufPrint(&nbuf, "conv-{s}", .{id}) catch "conv-x";
@@ -6046,6 +6091,7 @@ fn fakeClaude(allocator: std.mem.Allocator, args: []const [*:0]const u8) u8 {
         }
         turns.deinit(allocator);
     } else writeOut(FC_IDLE ++ "Claude Code v0.0.0 (smoke fake)\r\n" ++ FC_LIVE);
+    fcStatus(allocator, args, false);
 
     var input: std.ArrayList(u8) = .empty;
     var picker = false;
@@ -6065,6 +6111,7 @@ fn fakeClaude(allocator: std.mem.Allocator, args: []const [*:0]const u8) u8 {
             const s = steps.orderedRemove(i);
             writeOut(s.bytes);
             if (s.picker) picker = true;
+            if (std.mem.indexOf(u8, s.bytes, "\x1b]133;D") != null) fcStatus(allocator, args, true);
             allocator.free(s.bytes);
         }
         var pfd = c.struct_pollfd{ .fd = 0, .events = c.POLLIN, .revents = 0 };
@@ -6311,7 +6358,8 @@ const FakeOc = struct {
     fn answer(self: *FakeOc, delay_ms: i64, id: []const u8, text: []const u8) void {
         self.ev(delay_ms, "{{\"type\":\"message.updated\",\"properties\":{{\"sessionID\":\"" ++ SES ++ "\",\"info\":{{\"id\":\"{s}\",\"role\":\"assistant\",\"sessionID\":\"" ++ SES ++ "\"}}}}}}", .{id});
         self.ev(delay_ms, "{{\"type\":\"message.part.updated\",\"properties\":{{\"sessionID\":\"" ++ SES ++ "\",\"part\":{{\"type\":\"text\",\"text\":{f},\"messageID\":\"{s}\",\"sessionID\":\"" ++ SES ++ "\",\"id\":\"prt_{s}\",\"time\":{{\"start\":1,\"end\":2}}}}}}}}", .{ std.json.fmt(text, .{}), id, id });
-        self.ev(delay_ms, "{{\"type\":\"message.updated\",\"properties\":{{\"sessionID\":\"" ++ SES ++ "\",\"info\":{{\"id\":\"{s}\",\"role\":\"assistant\",\"sessionID\":\"" ++ SES ++ "\",\"time\":{{\"created\":1,\"completed\":2}}}}}}}}", .{id});
+        self.ev(delay_ms, "{{\"type\":\"message.updated\",\"properties\":{{\"sessionID\":\"" ++ SES ++ "\",\"info\":{{\"id\":\"{s}\",\"role\":\"assistant\",\"sessionID\":\"" ++ SES ++ "\",\"providerID\":\"fakeprov\",\"modelID\":\"m1\"," ++
+            "\"tokens\":{{\"input\":1000,\"output\":200,\"reasoning\":0,\"cache\":{{\"read\":8800,\"write\":0}}}},\"time\":{{\"created\":1,\"completed\":2}}}}}}}}", .{id});
     }
 
     fn hook(ctx: ?*anyopaque, _: *testserver.Server, method: []const u8, path: []const u8, body: []const u8) ?testserver.Reply {
@@ -6385,7 +6433,7 @@ const FAKE_OC_PASSWORDS = "oc-passwords";
 const FAKE_OC_CONFIG = "oc-config";
 
 const FAKE_OC_PROVIDERS =
-    \\{"all":[{"id":"fakeprov","models":{"m1":{"name":"Fake One","variants":{"low":{},"high":{}}}}}],"connected":["fakeprov"]}
+    \\{"all":[{"id":"fakeprov","models":{"m1":{"name":"Fake One","limit":{"context":100000,"output":32000},"variants":{"low":{},"high":{}}}}}],"connected":["fakeprov"]}
 ;
 
 fn argAfter(args: []const [*:0]const u8, flag: []const u8) ?[]const u8 {
@@ -6689,6 +6737,109 @@ fn countStarts(arena: std.mem.Allocator, tag: []const u8, comptime what: []const
     return seen;
 }
 
+/// The user's own status line command the facts checks chain: it prints
+/// how many bytes of JSON it got on stdin.
+const FACTS_USER_SETTINGS =
+    \\{"statusLine":{"type":"command","command":"printf 'USER-STATUS %s' \"$(wc -c | tr -d ' ')\"","padding":0}}
+;
+
+/// The `facts` object of agent `id` in a compact agent_list, and the list's
+/// raw reply (its text lane carries the one-line form).
+fn listedFacts(m: *Mcp, arena: std.mem.Allocator, id: []const u8) struct { facts: ?std.json.ObjectMap, raw: []const u8 } {
+    m.sendToolAllocated("agent_list", "{}");
+    const raw = arena.dupe(u8, m.recvLine(20_000)) catch fail("oom");
+    const sc = capSc(arena, raw, "agent_list facts", false);
+    for (sc.get("agents").?.array.items) |item| {
+        if (!std.mem.eql(u8, item.object.get("agent").?.string, id)) continue;
+        const f = item.object.get("facts") orelse return .{ .facts = null, .raw = raw };
+        return .{ .facts = f.object, .raw = raw };
+    }
+    fail("agent_list facts: the agent is not listed");
+}
+
+fn factNum(o: ?std.json.ObjectMap, key: []const u8) ?f64 {
+    const v = (o orelse return null).get(key) orelse return null;
+    return switch (v) {
+        .integer => |i| @floatFromInt(i),
+        .float => |f| f,
+        else => null,
+    };
+}
+
+/// Claude Code's facts through its status line: the fake runs the status
+/// command sketerm put in `--settings` with a document before any prompt
+/// (window size known, usage and rate limits unknown) and after each turn;
+/// `agent_list` reads unknown first, then 14% and the 7-day limit, and the
+/// user's own command (a project-local setting here, never the
+/// developer's) still ran with the same JSON. `place` is the JSON tail
+/// that puts the agent somewhere (`"binary":...` or `"host":...`).
+fn agentFactsCheck(m: *Mcp, arena: std.mem.Allocator, rt: []const u8, place: []const u8, local: bool, comptime what: []const u8) void {
+    const proj = std.fmt.allocPrint(arena, "{s}/factsproj", .{rt}) catch fail("oom");
+    const dot = std.fmt.allocPrintSentinel(arena, "{s}/.claude", .{proj}, 0) catch fail("oom");
+    pathz.makeDirs(dot, 0o700) catch fail(what ++ ": mkdir factsproj");
+    {
+        const p = std.fmt.allocPrintSentinel(arena, "{s}/settings.local.json", .{dot}, 0) catch fail("oom");
+        const f = c.fopen(p.ptr, "w") orelse fail(what ++ ": write settings.local.json");
+        _ = c.fwrite(FACTS_USER_SETTINGS.ptr, 1, FACTS_USER_SETTINGS.len, f);
+        _ = c.fclose(f);
+    }
+    var out_buf: [1024]u8 = undefined;
+    _ = c.unlink(fcPath(&out_buf, FC_STATUS_OUT).ptr);
+    const opened = agentCall(m, arena, "agent_open", std.fmt.allocPrint(arena, "{{\"app\":\"claude\",\"name\":\"facts-1\",\"cwd\":\"{s}\",\"env\":{{\"" ++ FC_STATUS_ENV ++ "\":\"1\"}},\"timeout_ms\":45000,{s}}}", .{ proj, place }) catch fail("oom"), what ++ ": agent_open", false, 60_000);
+    const id = arena.dupe(u8, scStr(opened, "agent", what ++ ": agent_open")) catch fail("oom");
+    if (factNum(if (opened.get("facts")) |f| f.object else null, "context_used_percent") != null) fail(what ++ ": agent_open reports a context percent before any prompt");
+
+    // Before the first prompt: the window size, never a 0 percent.
+    const deadline = nowMs() + 25_000;
+    var before: ?std.json.ObjectMap = null;
+    while (nowMs() < deadline) {
+        before = listedFacts(m, arena, id).facts;
+        if (factNum(before, "context_window_tokens") != null) break;
+        _ = c.usleep(500_000);
+    }
+    if (factNum(before, "context_window_tokens") != 200000) fail(what ++ ": agent_list never showed the context window size the status line reported");
+    if (factNum(before, "context_used_percent") != null or factNum(before, "rate_7d_used_percent") != null)
+        fail(what ++ ": agent_list shows usage before the first prompt (unknown must be absent, never 0)");
+    if (factNum(before, "cost_usd") != 0) fail(what ++ ": the reported cost of 0 is missing");
+
+    const sent = agentCall(m, arena, "agent_send", std.fmt.allocPrint(arena, "{{\"agent\":\"{s}\",\"text\":\"facts please\",\"timeout_ms\":20000}}", .{id}) catch fail("oom"), what ++ ": agent_send", false, 45_000);
+    expectFact(sent, "outcome", "done", what ++ ": agent_send outcome");
+    var after: ?std.json.ObjectMap = null;
+    var raw: []const u8 = "";
+    const deadline2 = nowMs() + 25_000;
+    while (nowMs() < deadline2) {
+        const l = listedFacts(m, arena, id);
+        after = l.facts;
+        raw = l.raw;
+        if (factNum(after, "context_used_percent") != null) break;
+        _ = c.usleep(500_000);
+    }
+    if (factNum(after, "context_used_percent") != 14) fail(what ++ ": agent_list never showed the 14% the status line reported after the turn");
+    if (factNum(after, "context_used_tokens") != 27656) fail(what ++ ": context_used_tokens is not the summed current usage");
+    if (factNum(after, "rate_7d_used_percent") != 98 or factNum(after, "rate_7d_resets_at") != 1791169200) fail(what ++ ": the 7-day rate limit facts are wrong");
+    if (std.mem.indexOf(u8, raw, "context 14%, 7d limit 98%") == null) {
+        say(raw);
+        fail(what ++ ": the compact line does not show the context percent and the 7-day limit");
+    }
+    // The per-agent results carry them too.
+    const read = agentCall(m, arena, "agent_read", std.fmt.allocPrint(arena, "{{\"agent\":\"{s}\"}}", .{id}) catch fail("oom"), what ++ ": agent_read", false, 15_000);
+    if (factNum(if (read.get("facts")) |f| f.object else null, "context_used_percent") != 14) fail(what ++ ": agent_read carries no facts");
+
+    // The user's own command ran on both documents, stdin intact.
+    const log = readfile.cappedAlloc(arena, fcPath(&out_buf, FC_STATUS_OUT), 1 << 16) catch fail(what ++ ": the status command never ran");
+    for ([_][]const u8{ facts.CLAUDE_SAMPLE_FRESH, facts.CLAUDE_SAMPLE }) |doc| {
+        if (std.mem.indexOf(u8, log, std.fmt.allocPrint(arena, "USER-STATUS {d}\n", .{doc.len}) catch fail("oom")) == null) {
+            say(log);
+            fail(what ++ ": the user's status command did not get the whole document");
+        }
+    }
+    const file = std.fmt.allocPrintSentinel(arena, "{s}/sketerm/agent-facts/{s}.json", .{ rt, id }, 0) catch fail("oom");
+    if (local and c.access(file.ptr, c.F_OK) != 0) fail(what ++ ": no facts file under the runtime dir");
+    _ = agentCall(m, arena, "agent_close", std.fmt.allocPrint(arena, "{{\"agent\":\"{s}\"}}", .{id}) catch fail("oom"), what ++ ": agent_close", false, 15_000);
+    if (local and c.access(file.ptr, c.F_OK) == 0) fail(what ++ ": agent_close left the facts file");
+    say("smoke-mcp: " ++ what ++ ": facts unknown before the first prompt, then 14% and the 7-day limit; the user's status command still ran ok");
+}
+
 fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) void {
     var self_buf: [4096]u8 = undefined;
     const self_exe = platform.exePath(&self_buf) orelse fail("agent stage: own executable path");
@@ -6739,6 +6890,18 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
 
         const ad = agentCall(&m, arena, "agent_adapters", "{}", "agent_adapters", false, 15_000);
         if (ad.get("count").?.integer < 2) fail("agent_adapters lists fewer than two adapters");
+
+        // Facts: the vocabulary and each adapter's share.
+        {
+            const af = (caps.get("agent_facts") orelse fail("capabilities: no agent_facts")).object;
+            if (af.get("facts").?.object.get("context_used_percent") == null) fail("capabilities: agent_facts lacks context_used_percent");
+            const per = af.get("adapters").?.object;
+            var claude_has = false;
+            for (per.get("claude").?.array.items) |n| claude_has = claude_has or std.mem.eql(u8, n.string, "rate_7d_used_percent");
+            var oc_derived = false;
+            for (per.get("opencode").?.array.items) |n| oc_derived = oc_derived or std.mem.eql(u8, n.string, "context_used_percent");
+            if (!claude_has or !oc_derived) fail("capabilities: agent_facts does not name claude's rate limit or opencode's derived context percent");
+        }
 
         // ── Claude Code (screen source) ─────────────────────────────
         // A wrapper's args and env: byte-exact, the CLAUDE* one kept while
@@ -7094,6 +7257,10 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
             say("smoke-mcp: agents: push routes (channel notification with the answer once, --server follower with later agents) ok");
         }
 
+        // Claude Code's facts through its status line command (after the
+        // checks above that read the fake's launch log from its start).
+        agentFactsCheck(&m, arena, rt, std.fmt.allocPrint(arena, "\"binary\":{s}", .{bin_json}) catch fail("oom"), true, "facts (local)");
+
         // ── opencode (API source) ───────────────────────────────────
         resetStarts();
         const oc = agentCall(&m, arena, "agent_open", std.fmt.allocPrint(arena, "{{\"app\":\"opencode\",\"name\":\"opencode-1\",\"binary\":{s},\"timeout_ms\":30000{s}}}", .{ bin_json, extraJson(arena) }) catch fail("oom"), "agent_open opencode", false, 45_000);
@@ -7118,6 +7285,16 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
         const oc_sent = agentCall(&m, arena, "agent_send", "{\"agent\":\"opencode-1\",\"text\":\"what model\",\"timeout_ms\":20000}", "agent_send opencode", false, 45_000);
         expectFact(oc_sent, "outcome", "done", "agent_send opencode: outcome");
         expectFact(oc_sent, "message", "echo: what model model=fakeprov/m1 variant=high", "agent_send opencode: the model and variant reached the server");
+        // Facts from the API: the answer's tokens against its model's
+        // context limit, the percent derived through facts.json.
+        {
+            const f = if (oc_sent.get("facts")) |v| v.object else fail("agent_send opencode: no facts");
+            if (factNum(f, "context_used_tokens") != 10000 or factNum(f, "context_window_tokens") != 100000 or factNum(f, "context_used_percent") != 10) {
+                say(std.json.Stringify.valueAlloc(arena, std.json.Value{ .object = f }, .{}) catch "?");
+                fail("agent_send opencode: facts are not the answer's tokens over the model's limit");
+            }
+            if (f.get("rate_7d_used_percent") != null) fail("agent_send opencode: a fact opencode never reports is present");
+        }
         const oc_match = agentCall(&m, arena, "agent_send", "{\"agent\":\"opencode-1\",\"text\":\"two messages\",\"match\":\"alpha\",\"timeout_ms\":20000}", "agent_send opencode match", false, 45_000);
         expectFact(oc_match, "outcome", "match", "agent_send opencode: match outcome");
         const oc_rest = agentCall(&m, arena, "agent_wait", "{\"agent\":\"opencode-1\",\"timeout_ms\":20000}", "agent_wait opencode", false, 45_000);
@@ -7410,7 +7587,10 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
         {
             var buf: [1024]u8 = undefined;
             const starts = readfile.cappedAlloc(arena, fcPath(&buf, FC_STARTS), 1 << 20) catch fail("no starts recorded");
-            if (std.mem.indexOf(u8, starts, "\x00--settings\x00{\"permissions\":{\"allow\":[\"Bash(git *)\"],\"deny\":[\"Edit\"]}}\x00") == null) {
+            // ONE settings document: the policy and the facts' status command.
+            if (std.mem.indexOf(u8, starts, "\x00--settings\x00{\"permissions\":{\"allow\":[\"Bash(git *)\"],\"deny\":[\"Edit\"]},\"statusLine\":{\"type\":\"command\",\"command\":\"/bin/sh -c ") == null or
+                std.mem.count(u8, starts, "\x00--settings\x00") != 1)
+            {
                 say(starts);
                 fail("agent_open claude permissions: --settings did not reach Claude Code's argv");
             }
@@ -8295,6 +8475,8 @@ fn agentSshStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u
             say(std.json.Stringify.valueAlloc(arena, ad.get("adapters").?, .{}) catch "?");
             fail("agent_adapters host: claude not resolved through the ~/.local/bin candidate");
         }
+        // A remote agent's facts file rides its host's probe.
+        agentFactsCheck(&m, arena, rt, "\"host\":\"fakehost\"", false, "facts (remote)");
 
         resetStarts();
         const opened = agentCall(&m, arena, "agent_open", std.fmt.allocPrint(arena, "{{\"app\":\"claude\",\"name\":\"claude-1\",\"host\":\"fakehost\",\"timeout_ms\":45000{s}}}", .{extraJson(arena)}) catch fail("oom"), "agent_open claude on host", false, 60_000);

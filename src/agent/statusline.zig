@@ -155,6 +155,12 @@ pub fn userObject(arena: std.mem.Allocator, sc: adapter.StatusCommand, contents:
     return null;
 }
 
+/// `userObject` as JSON text (what a start keeps), null for none.
+pub fn userJson(arena: std.mem.Allocator, sc: adapter.StatusCommand, contents: []const ?[]const u8) !?[]const u8 {
+    const u = userObject(arena, sc, contents) orelse return null;
+    return try std.json.Stringify.valueAlloc(arena, std.json.Value{ .object = u }, .{});
+}
+
 /// The user's command in their status object, if any.
 pub fn userCommand(sc: adapter.StatusCommand, user: ?std.json.ObjectMap) ?[]const u8 {
     const o = user orelse return null;

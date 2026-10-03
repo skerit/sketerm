@@ -503,6 +503,7 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
         try res.fact("agent_answer_text", agents_ok);
         try res.fact("agent_permissions", agents_ok);
         try res.fact("agent_templates", agents_ok);
+        try res.raw("agent_facts", try std.json.Stringify.valueAlloc(arena, try mcp_agent.factsCapability(arena), .{}));
         {
             const retry = @import("../agent/retry.zig");
             const vocab_r = @import("../agent/vocab.zig");
@@ -540,6 +541,7 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
             try res.text("agent_read final returns just the newest job's last message, agent_list is compact unless detail, and agent_attach relaunch starts a gone agent again under its id");
             try res.text("agent_open takes permissions (name to allow/ask/deny, mapped to each app's own mechanism) and retry_on_overload (continue a turn a provider overload ended, off by default); a lost remote link that comes back to find the session gone ends the agent as exited, relaunchable");
             try res.text("agent_template_save keeps named briefs (placeholders in braces) that agent_send and agent_open take as template + vars");
+            try res.text("every per-agent result and agent_list carry facts: what the app reports about its context use, rate limits and cost (agent_facts names them per adapter), the context percent also in agent_list's one-line form");
             if (mcp_agent.state.push == .channel)
                 try res.text("agent events are pushed into this session as Claude Code channel messages: end your turn after delegating instead of running watch_command")
             else if (mcp_agent.followers() > 0)
