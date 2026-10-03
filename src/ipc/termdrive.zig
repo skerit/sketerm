@@ -953,6 +953,15 @@ pub const Term = struct {
         self.applySnapshot(snap.payload) catch return self.transportLost();
     }
 
+    /// A snapshot the mirror cannot apply leaves it stale, exactly like an
+    /// event desync, so it takes the same resync path.
+    fn applySnapshotOrResync(self: *Term, payload: []const u8) void {
+        self.applySnapshot(payload) catch {
+            self.events_desynced = true;
+            self.resyncMirror();
+        };
+    }
+
     fn applyEvents(self: *Term, payload: []const u8) void {
         if (self.events_desynced) return;
         const screen = self.screen orelse return;
@@ -972,7 +981,7 @@ pub const Term = struct {
 
     fn handleFrame(self: *Term, ftype: wire.FrameType, payload: []const u8) void {
         switch (ftype) {
-            .snapshot => self.applySnapshot(payload) catch {},
+            .snapshot => self.applySnapshotOrResync(payload),
             .events => self.applyEvents(payload),
             .exit => {
                 self.exited = true;
@@ -1057,9 +1066,14 @@ pub const Term = struct {
             return false;
         };
         defer snap.deinit(self.allocator);
+        // A snapshot that cannot be applied is a failed reattach, never a
+        // live link over a stale mirror.
+        self.applySnapshot(snap.payload) catch {
+            conn.deinit();
+            return false;
+        };
         self.conn.deinit();
         self.conn = conn;
-        self.applySnapshot(snap.payload) catch {};
         return true;
     }
 
@@ -1093,10 +1107,10 @@ pub const Term = struct {
     pub fn adoptReattached(self: *Term, conn: muxclient.Conn, snapshot_payload: []const u8) void {
         self.conn.deinit();
         self.conn = conn;
-        self.applySnapshot(snapshot_payload) catch {};
         self.lost = false;
         self.exited = false;
         self.reattach_spent = false;
+        self.applySnapshotOrResync(snapshot_payload);
     }
 
     /// Time-boxed like appdrive.drain: a flooding shell (`cat` of a

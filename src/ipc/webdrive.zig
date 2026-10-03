@@ -3204,7 +3204,12 @@ pub const Engine = struct {
             // A caller-chosen path: its directory must exist before the
             // engine writes into it, or the download fails with an
             // engine error nobody can act on.
-            pathz.makeParentDirs(d.path) catch {};
+            pathz.makeParentDirs(d.path) catch {
+                self.send(proto.DownloadDecide{ .view = ev.view, .id = ev.id, .path = "" }) catch {};
+                d.failed = true;
+                d.fail_reason = "the download path is too long";
+                return;
+            };
         }
         self.send(proto.DownloadDecide{ .view = ev.view, .id = ev.id, .path = d.path }) catch {
             d.failed = true;
