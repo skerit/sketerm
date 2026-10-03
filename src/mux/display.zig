@@ -10,6 +10,7 @@
 const std = @import("std");
 const nowMs = @import("../util/clock.zig").nowMs;
 const c = @import("../c.zig").c;
+const fdio = @import("../util/fdio.zig");
 const client = @import("client.zig");
 const daemon = @import("daemon.zig");
 const wire = @import("wire.zig");
@@ -165,13 +166,7 @@ fn errPrint(comptime fmt: []const u8, args: anytype) void {
 }
 
 fn outPrint(bytes: []const u8) !void {
-    var off: usize = 0;
-    while (off < bytes.len) {
-        const n = c.write(1, bytes.ptr + off, bytes.len - off);
-        if (n < 0 and std.posix.errno(n) == .INTR) continue;
-        if (n <= 0) return error.WriteFailed;
-        off += @intCast(n);
-    }
+    if (!fdio.writeAll(1, bytes)) return error.WriteFailed;
 }
 
 /// Shared "WxH" parser (also used by MCP launch_app's `size`); caps

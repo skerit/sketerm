@@ -32,6 +32,7 @@
 
 const std = @import("std");
 const c = @import("../c.zig").c;
+const fdio = @import("../util/fdio.zig");
 const vocab = @import("../agent/vocab.zig");
 const events = @import("../agent/events.zig");
 const shellquote = @import("../util/shellquote.zig");
@@ -429,15 +430,7 @@ pub const Cli = struct {
 };
 
 fn say(fd: c_int, bytes: []const u8) void {
-    var off: usize = 0;
-    while (off < bytes.len) {
-        const n = c.write(fd, bytes[off..].ptr, bytes.len - off);
-        if (n <= 0) {
-            if (n < 0 and std.posix.errno(n) == .INTR) continue;
-            return;
-        }
-        off += @intCast(n);
-    }
+    _ = fdio.writeAll(fd, bytes);
 }
 
 fn ended(reason: []const u8, status: u8) u8 {

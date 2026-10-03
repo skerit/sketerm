@@ -18,6 +18,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const c = @import("c.zig").c;
+const fdio = @import("util/fdio.zig");
 const muxclient = @import("mux/client.zig");
 const fsdrive = @import("ipc/fsdrive.zig");
 const platform = @import("util/platform.zig");
@@ -394,22 +395,12 @@ fn fuseTimeMs(sec: u64, nsec: u32) ?i64 {
 
 // ── reply plumbing ──────────────────────────────────────────────
 
-fn writeAll(fd: c_int, bytes: []const u8) void {
-    var off: usize = 0;
-    while (off < bytes.len) {
-        const n = c.write(fd, bytes.ptr + off, bytes.len - off);
-        if (n < 0 and std.posix.errno(n) == .INTR) continue;
-        if (n <= 0) return;
-        off += @intCast(n);
-    }
-}
-
 fn replyErr(fd: c_int, unique: u64, errno_pos: i32) void {
     var hdr = std.mem.zeroes(c.struct_fuse_out_header);
     hdr.len = @sizeOf(c.struct_fuse_out_header);
     hdr.@"error" = -errno_pos;
     hdr.unique = unique;
-    writeAll(fd, std.mem.asBytes(&hdr));
+    _ = fdio.writeAll(fd, std.mem.asBytes(&hdr));
 }
 
 fn replyBytes(fd: c_int, unique: u64, payload: []const u8) void {
@@ -421,7 +412,7 @@ fn replyBytes(fd: c_int, unique: u64, payload: []const u8) void {
         hdr.len = @intCast(total);
         hdr.unique = unique;
         @memcpy(buf[@sizeOf(c.struct_fuse_out_header)..][0..payload.len], payload);
-        writeAll(fd, buf[0..total]);
+        _ = fdio.writeAll(fd, buf[0..total]);
         return;
     }
     // Large read replies: header + payload in one writev.
