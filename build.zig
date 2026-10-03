@@ -2182,13 +2182,17 @@ fn addVideo(b: *std.Build, mod: *std.Build.Module) void {
 /// Embed the shipped agent adapters (every `data/agents/*.json`) into a
 /// module as the generated `agent_adapters` import that
 /// `src/agent/adapter.zig` reads: shipping a screen app is dropping a JSON
-/// file there, no list to keep in sync. Every module that loads adapters
-/// needs this call.
+/// file there, no list to keep in sync. `facts.json` is not an adapter but
+/// the facts vocabulary (`src/agent/facts.zig`), embedded as `facts_json`.
+/// Every module that loads adapters needs this call.
 fn addAgentAdapters(b: *std.Build, mod: *std.Build.Module) void {
     mod.addAnonymousImport("agent_adapters", .{ .root_source_file = agentAdaptersSource(b) });
 }
 
 var agent_adapters_src: ?std.Build.LazyPath = null;
+
+/// The facts vocabulary's file in `data/agents` (never loaded as an adapter).
+const FACTS_FILE = "facts.json";
 
 fn agentAdaptersSource(b: *std.Build) std.Build.LazyPath {
     if (agent_adapters_src) |p| return p;
@@ -2213,9 +2217,10 @@ fn agentAdaptersSource(b: *std.Build) std.Build.LazyPath {
         "pub const shipped = [_]Shipped{\n") catch @panic("OOM");
     for (names.items) |n| {
         _ = wf.addCopyFile(b.path(b.fmt("data/agents/{s}", .{n})), n);
+        if (std.mem.eql(u8, n, FACTS_FILE)) continue;
         src.appendSlice(b.allocator, b.fmt("    .{{ .file = \"{s}\", .json = @embedFile(\"{s}\") }},\n", .{ n, n })) catch @panic("OOM");
     }
-    src.appendSlice(b.allocator, "};\n") catch @panic("OOM");
+    src.appendSlice(b.allocator, "};\npub const facts_json = @embedFile(\"" ++ FACTS_FILE ++ "\");\n") catch @panic("OOM");
     const p = wf.add("agent_adapters.zig", src.items);
     agent_adapters_src = p;
     return p;

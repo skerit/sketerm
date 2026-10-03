@@ -1,0 +1,12 @@
+{
+  "facts": {
+    "context_used_percent": { "type": "percent", "meaning": "How full the agent's context window is", "derive": { "ratio": ["context_used_tokens", "context_window_tokens"] }, "compact": "context" },
+    "context_window_tokens": { "type": "tokens", "meaning": "The size of the agent's context window" },
+    "context_used_tokens": { "type": "tokens", "meaning": "Tokens the agent's context holds as of its latest answer" },
+    "rate_5h_used_percent": { "type": "percent", "meaning": "How much of the account's 5-hour rate limit is used" },
+    "rate_5h_resets_at": { "type": "unix_time", "meaning": "When the account's 5-hour rate limit resets (Unix seconds)" },
+    "rate_7d_used_percent": { "type": "percent", "meaning": "How much of the account's 7-day rate limit is used", "compact": "7d limit" },
+    "rate_7d_resets_at": { "type": "unix_time", "meaning": "When the account's 7-day rate limit resets (Unix seconds)" },
+    "cost_usd": { "type": "usd", "meaning": "What the agent's conversation has cost so far, in US dollars" }
+  }
+}

@@ -22,5 +22,11 @@
     { "class": "overloaded", "pattern": "^APIError 5[0-9][0-9]|[Oo]verloaded|Service Unavailable|Connection reset by server|ECONNRESET" },
     { "class": "api", "pattern": "^APIError|^ContextOverflowError|^MessageOutputLengthError|^ContentFilterError|^StructuredOutputError" }
   ],
-  "retry": { "prompt": "continue" }
+  "retry": { "prompt": "continue" },
+  "facts": {
+    "map": {
+      "context_used_tokens": ["message.tokens.input", "message.tokens.output", "message.tokens.reasoning", "message.tokens.cache.read", "message.tokens.cache.write"],
+      "context_window_tokens": "model.limit.context"
+    }
+  }
 }

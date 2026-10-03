@@ -65,7 +65,7 @@ pub const Extra = struct {
     path_prepend: []const []const u8 = &.{},
     /// Remote probes and starts run in the user's login shell environment.
     login_shell: bool = true,
-    /// The caller's permission policy, which `applyPermissions` turns into
+    /// The caller's permission policy, which `applySettings` turns into
     /// the app's own mechanism at every start.
     permissions: []const Permission = &.{},
 
@@ -180,10 +180,8 @@ fn permissionProblem(arena: std.mem.Allocator, launch: adapter.Launch, x: Extra)
     }
     // Never clobbered: the caller's own copy of the mechanism must leave
     // room to merge the policy in.
-    if (spec.arg) |opt| for ([_][]const []const u8{ x.args, x.server_args }) |list| for (list) |s| {
-        if (std.mem.eql(u8, s, opt) or (std.mem.startsWith(u8, s, opt) and s.len > opt.len and s[opt.len] == '='))
-            return try std.fmt.allocPrint(arena, "permissions: args already pass {s}, which is where {s}'s permissions go; put them into that value yourself, or drop it", .{ opt, launch.binary });
-    };
+    if (settingsArgTaken(launch, x))
+        return try std.fmt.allocPrint(arena, "permissions: args already pass {s}, which is where {s}'s permissions go; put them into that value yourself, or drop it", .{ spec.arg.?, launch.binary });
     if (spec.env) |name| for (x.env) |v| if (std.mem.eql(u8, v.name, name)) {
         _ = documentWithPath(arena, v.value, spec.path) catch
             return try std.fmt.allocPrint(arena, "permissions: env {s} must be a JSON object (with an object at {s}) for the permissions to be merged into it", .{ name, if (spec.path.len == 0) "its top level" else try std.mem.join(arena, ".", spec.path) });
@@ -206,26 +204,61 @@ fn permissionNameTaken(arena: std.mem.Allocator, spec: adapter.Permissions, name
 /// where missing).
 /// @throws NotAnObject when either is something else.
 fn documentWithPath(arena: std.mem.Allocator, doc: ?[]const u8, path: []const []const u8) !struct { root: *std.json.Value, at: *std.json.ObjectMap } {
+    const root = try parseDocument(arena, doc);
+    return .{ .root = root, .at = try objectAt(arena, &root.object, path) };
+}
+
+/// `doc` parsed as a JSON object (an empty one for null).
+/// @throws NotAnObject when it is something else.
+fn parseDocument(arena: std.mem.Allocator, doc: ?[]const u8) !*std.json.Value {
     const root = try arena.create(std.json.Value);
     root.* = if (doc) |d| (std.json.parseFromSliceLeaky(std.json.Value, arena, d, .{}) catch return error.NotAnObject) else .{ .object = .empty };
     if (root.* != .object) return error.NotAnObject;
-    var at: *std.json.ObjectMap = &root.object;
+    return root;
+}
+
+/// The object at `path` under `obj`, created where missing.
+/// @throws NotAnObject when a key on the way holds something else.
+fn objectAt(arena: std.mem.Allocator, obj: *std.json.ObjectMap, path: []const []const u8) !*std.json.ObjectMap {
+    var at = obj;
     for (path) |key| {
         const gop = try at.getOrPut(arena, key);
         if (!gop.found_existing) gop.value_ptr.* = .{ .object = .empty };
         if (gop.value_ptr.* != .object) return error.NotAnObject;
         at = &gop.value_ptr.object;
     }
-    return .{ .root = root, .at = at };
+    return at;
 }
 
-/// `x` with its permission policy turned into `launch`'s mechanism: the
-/// option and its JSON appended to `server_args` (the main process), or
-/// the policy merged into the environment variable's document (the
-/// caller's own value of it kept, a name given in both taking the
-/// policy's action). `checkExtra` must have accepted `x`.
-pub fn applyPermissions(arena: std.mem.Allocator, launch: adapter.Launch, x: Extra) !Extra {
-    if (x.permissions.len == 0) return x;
+/// Whether the caller's own `args` already pass the option that carries
+/// the app's settings document (`launch.permissions.arg`).
+pub fn settingsArgTaken(launch: adapter.Launch, x: Extra) bool {
+    const spec = launch.permissions orelse return false;
+    const opt = spec.arg orelse return false;
+    for ([_][]const []const u8{ x.args, x.server_args }) |list| for (list) |s| {
+        if (std.mem.eql(u8, s, opt) or (std.mem.startsWith(u8, s, opt) and s.len > opt.len and s[opt.len] == '=')) return true;
+    };
+    return false;
+}
+
+/// A status command for the settings document (`src/agent/statusline.zig`):
+/// the object placed at the adapter's `facts.status_command.settings_path`
+/// and the variables the app's environment gets with it.
+pub const Status = struct {
+    value: std.json.Value,
+    env: []const EnvVar,
+};
+
+/// `x` with the app's settings document built in: the permission policy
+/// in `launch.permissions`' shape and the status command at its path, as
+/// ONE document whose mechanism `launch.permissions` declares: the option
+/// and its JSON appended to `server_args` (the main process), or merged
+/// into the environment variable's document (the caller's own value of it
+/// kept, a name given in both taking the policy's action). `checkExtra`
+/// must have accepted `x`; a `status` needs `settingsArgTaken` false.
+pub fn applySettings(arena: std.mem.Allocator, spec_all: *const adapter.Spec, x: Extra, status: ?Status) !Extra {
+    if (x.permissions.len == 0 and status == null) return x;
+    const launch = spec_all.launch;
     const spec = launch.permissions orelse return error.NoPermissionMapping;
     var out = x;
     out.permissions = &.{};
@@ -233,29 +266,36 @@ pub fn applyPermissions(arena: std.mem.Allocator, launch: adapter.Launch, x: Ext
     if (spec.env) |name| for (x.env) |v| if (std.mem.eql(u8, v.name, name)) {
         existing = v.value;
     };
-    const doc = try documentWithPath(arena, existing, spec.path);
-    switch (spec.shape) {
-        .by_name => for (x.permissions) |p| try doc.at.put(arena, p.name, .{ .string = @tagName(p.action) }),
-        .by_action => for (std.enums.values(vocab.PermissionAction)) |action| {
-            var list = std.json.Array.init(arena);
-            if (doc.at.get(@tagName(action))) |old| if (old == .array) for (old.array.items) |item| {
-                const named = item == .string and for (x.permissions) |p| {
-                    if (std.mem.eql(u8, p.name, item.string)) break true;
-                } else false;
-                if (!named) try list.append(item);
-            };
-            for (x.permissions) |p| if (p.action == action) try list.append(.{ .string = p.name });
-            if (list.items.len > 0) try doc.at.put(arena, @tagName(action), .{ .array = list });
-        },
+    const root = try parseDocument(arena, existing);
+    if (x.permissions.len > 0) {
+        const at = try objectAt(arena, &root.object, spec.path);
+        switch (spec.shape) {
+            .by_name => for (x.permissions) |p| try at.put(arena, p.name, .{ .string = @tagName(p.action) }),
+            .by_action => for (std.enums.values(vocab.PermissionAction)) |action| {
+                var list = std.json.Array.init(arena);
+                if (at.get(@tagName(action))) |old| if (old == .array) for (old.array.items) |item| {
+                    const named = item == .string and for (x.permissions) |p| {
+                        if (std.mem.eql(u8, p.name, item.string)) break true;
+                    } else false;
+                    if (!named) try list.append(item);
+                };
+                for (x.permissions) |p| if (p.action == action) try list.append(.{ .string = p.name });
+                if (list.items.len > 0) try at.put(arena, @tagName(action), .{ .array = list });
+            },
+        }
     }
-    const json = try std.json.Stringify.valueAlloc(arena, doc.root.*, .{});
+    var env: std.ArrayList(EnvVar) = .empty;
+    for (x.env) |v| if (spec.env == null or !std.mem.eql(u8, v.name, spec.env.?)) try env.append(arena, v);
+    if (status) |st| {
+        const sp = (spec_all.facts orelse return error.NoStatusCommand).status_command orelse return error.NoStatusCommand;
+        const parent = try objectAt(arena, &root.object, sp.settings_path[0 .. sp.settings_path.len - 1]);
+        try parent.put(arena, sp.settings_path[sp.settings_path.len - 1], st.value);
+        for (st.env) |v| try env.append(arena, v);
+    }
+    const json = try std.json.Stringify.valueAlloc(arena, root.*, .{});
     if (spec.arg) |opt| out.server_args = try std.mem.concat(arena, []const u8, &.{ x.server_args, &.{ opt, json } });
-    if (spec.env) |name| {
-        var env: std.ArrayList(EnvVar) = .empty;
-        for (x.env) |v| if (!std.mem.eql(u8, v.name, name)) try env.append(arena, v);
-        try env.append(arena, .{ .name = name, .value = json });
-        out.env = env.items;
-    }
+    if (spec.env) |name| try env.append(arena, .{ .name = name, .value = json });
+    out.env = env.items;
     return out;
 }
 
@@ -438,6 +478,9 @@ pub const ProbeOpts = struct {
     login: bool = true,
     path_prepend: []const []const u8 = &.{},
     login_secs: u32 = LOGIN_PROBE_SECS,
+    /// POSIX sh snippets that each set `f` to a file whose content (line
+    /// breaks dropped) comes back in `ProbeResult.files`.
+    files: []const []const u8 = &.{},
 };
 
 /// A POSIX sh script that does `resolve` ON THE HOST IT RUNS ON, for every
@@ -519,11 +562,18 @@ fn innerProbe(arena: std.mem.Allocator, lookups: []const Lookup, opts: ProbeOpts
         try s.appendSlice(arena, " ]; then echo '" ++ PROBE_DIR ++ "ok'; else echo '" ++ PROBE_DIR ++ "missing'; fi\n");
     }
     try s.appendSlice(arena, "printf '" ++ PROBE_HOME ++ "%s\\n' \"$HOME\"\n");
+    // The per-user runtime dir, near enough to `platform.runtimeDirFrom`.
+    try s.appendSlice(arena, "printf '" ++ PROBE_RUN ++ "%s\\n' \"${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}\"\n");
+    for (opts.files, 0..) |snippet, i| {
+        try s.print(arena, "f=''; {s}\nprintf '" ++ PROBE_FILE ++ "{d} '; [ -r \"$f\" ] && tr -d '\\r\\n' < \"$f\" 2>/dev/null; echo\n", .{ snippet, i });
+    }
     try s.appendSlice(arena, "echo '" ++ PROBE_END ++ "'\n");
     return s.items;
 }
 
 const PROBE_HOME = "SK_HOME ";
+const PROBE_RUN = "SK_RUN ";
+const PROBE_FILE = "SK_FILE ";
 
 pub const ProbeResult = struct {
     /// Per lookup: the executable found, or null.
@@ -538,23 +588,43 @@ pub const ProbeResult = struct {
     dir_ok: ?bool = null,
     /// The host's `$HOME` (the default working directory there).
     home: ?[]const u8 = null,
+    /// The host's per-user runtime dir.
+    run_dir: ?[]const u8 = null,
+    /// Per `ProbeOpts.files` entry: its content, null when missing or empty.
+    files: []?[]const u8 = &.{},
     /// Every lookup answered (a probe cut short is not "not installed").
     complete: bool,
 };
 
 /// Read a probe's output; paths borrow from `output`.
-pub fn parseProbe(arena: std.mem.Allocator, output: []const u8, n: usize) !ProbeResult {
+/// @param n_files how many `ProbeOpts.files` the probe was given.
+pub fn parseProbe(arena: std.mem.Allocator, output: []const u8, n: usize, n_files: usize) !ProbeResult {
     const bins = try arena.alloc(?[]const u8, n);
     @memset(bins, null);
     const vers = try arena.alloc(?[]const u8, n);
     @memset(vers, null);
     const seen = try arena.alloc(bool, n);
     @memset(seen, false);
-    var r = ProbeResult{ .binaries = bins, .versions = vers, .complete = false };
+    const files = try arena.alloc(?[]const u8, n_files);
+    @memset(files, null);
+    var r = ProbeResult{ .binaries = bins, .versions = vers, .files = files, .complete = false };
     var lines = std.mem.splitScalar(u8, output, '\n');
     while (lines.next()) |raw| {
         // A terminal transcript: CR line ends, and the marker may follow noise.
         const line = std.mem.trim(u8, raw, " \r\t");
+        if (std.mem.indexOf(u8, line, PROBE_FILE)) |at| {
+            const rest = line[at + PROBE_FILE.len ..];
+            const sp = std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len;
+            const i = std.fmt.parseInt(usize, rest[0..sp], 10) catch continue;
+            const v = if (sp < rest.len) std.mem.trim(u8, rest[sp + 1 ..], " ") else "";
+            if (i < n_files and v.len > 0) files[i] = v;
+            continue;
+        }
+        if (std.mem.indexOf(u8, line, PROBE_RUN)) |at| {
+            const v = line[at + PROBE_RUN.len ..];
+            if (v.len > 0 and v[0] == '/') r.run_dir = v;
+            continue;
+        }
         if (std.mem.indexOf(u8, line, PROBE_ENV)) |at| {
             const v = line[at + PROBE_ENV.len ..];
             if (std.mem.eql(u8, v, "login")) r.login = true else if (std.mem.eql(u8, v, "plain")) r.login = false;
@@ -924,8 +994,8 @@ test "argv: args, then model and effort arguments only when given" {
     try t.expect(validEffort(test_launch, "anything"));
 }
 
-/// Run `script` under /bin/sh with `env` and return its stdout.
-fn runSh(a: std.mem.Allocator, env: []const u8, script: []const u8) ![]u8 {
+/// Run `script` under /bin/sh with `env` and return its stdout (tests only).
+pub fn runSh(a: std.mem.Allocator, env: []const u8, script: []const u8) ![]u8 {
     var cmd: std.ArrayList(u8) = .empty;
     try cmd.appendSlice(a, env);
     try cmd.appendSlice(a, " /bin/sh -c ");
@@ -971,7 +1041,7 @@ test "the remote probe resolves candidates on the host it runs on, in one script
     // The script uses shell builtins only: PATH is just the "remote" one.
     const env = try std.fmt.allocPrint(a, "HOME='{s}/home' PATH='{s}'", .{ root, usr });
     const out = try runSh(a, env, script);
-    const r = try parseProbe(a, out, 5);
+    const r = try parseProbe(a, out, 5, 0);
     if (!r.complete) std.debug.print("probe output:\n{s}\n", .{out});
     try t.expect(r.complete);
     try t.expectEqualStrings(try std.fmt.allocPrint(a, "{s}/skprobe-a", .{bin}), r.binaries[0].?);
@@ -982,7 +1052,7 @@ test "the remote probe resolves candidates on the host it runs on, in one script
     try t.expectEqual(@as(?bool, false), r.dir_ok);
     try t.expectEqualStrings(try std.fmt.allocPrint(a, "{s}/home", .{root}), r.home.?);
     // A cut-off transcript (CR line ends, a lookup missing) is incomplete.
-    const cut = try parseProbe(a, "noise SK_BIN 0 /x/claude\r\nSK_NONE 1\r\n", 3);
+    const cut = try parseProbe(a, "noise SK_BIN 0 /x/claude\r\nSK_NONE 1\r\n", 3, 0);
     try t.expect(!cut.complete);
     try t.expectEqualStrings("/x/claude", cut.binaries[0].?);
 }
@@ -1031,7 +1101,7 @@ test "the probe resolves in the login shell's environment, profile noise and all
 
     const shell = try fakeLoginShell(a, root, login_dir, false);
     const env = try std.fmt.allocPrint(a, "SHELL='{s}' PATH=/usr/bin:/bin", .{shell});
-    const r = try parseProbe(a, try runSh(a, env, try probeScript(a, &lookups, .{})), 1);
+    const r = try parseProbe(a, try runSh(a, env, try probeScript(a, &lookups, .{})), 1, 0);
     try t.expect(r.complete);
     try t.expectEqual(@as(?bool, true), r.login);
     try t.expectEqualStrings(shell, r.shell.?);
@@ -1040,12 +1110,12 @@ test "the probe resolves in the login shell's environment, profile noise and all
 
     // path_prepend wins over the login PATH (applied after it).
     try writeExec(a, try std.fmt.allocPrint(a, "{s}/skapp", .{pre_dir}), "#!/bin/sh\necho 'skapp 1.0 (pre)'\n");
-    const pre = try parseProbe(a, try runSh(a, env, try probeScript(a, &lookups, .{ .path_prepend = &.{pre_dir} })), 1);
+    const pre = try parseProbe(a, try runSh(a, env, try probeScript(a, &lookups, .{ .path_prepend = &.{pre_dir} })), 1, 0);
     try t.expectEqualStrings(try std.fmt.allocPrint(a, "{s}/skapp", .{pre_dir}), pre.binaries[0].?);
     try t.expectEqualStrings("skapp 1.0 (pre)", pre.versions[0].?);
 
     // Without the login shell the plain PATH has no app: reported as such.
-    const plain = try parseProbe(a, try runSh(a, env, try probeScript(a, &lookups, .{ .login = false })), 1);
+    const plain = try parseProbe(a, try runSh(a, env, try probeScript(a, &lookups, .{ .login = false })), 1, 0);
     try t.expect(plain.complete);
     try t.expectEqual(@as(?bool, false), plain.login);
     try t.expect(plain.binaries[0] == null);
@@ -1053,7 +1123,7 @@ test "the probe resolves in the login shell's environment, profile noise and all
     // A profile that never returns costs the bound, then the plain run answers.
     const hang = try fakeLoginShell(a, root, login_dir, true);
     const started = @import("../util/clock.zig").nowMs();
-    const hung = try parseProbe(a, try runSh(a, try std.fmt.allocPrint(a, "SHELL='{s}' PATH=/usr/bin:/bin", .{hang}), try probeScript(a, &lookups, .{ .login_secs = 1 })), 1);
+    const hung = try parseProbe(a, try runSh(a, try std.fmt.allocPrint(a, "SHELL='{s}' PATH=/usr/bin:/bin", .{hang}), try probeScript(a, &lookups, .{ .login_secs = 1 })), 1, 0);
     try t.expect(hung.complete);
     try t.expectEqual(@as(?bool, false), hung.login);
     try t.expect(@import("../util/clock.zig").nowMs() - started < 8_000);
@@ -1114,7 +1184,7 @@ test "real login shells on this machine: bash, zsh, dash and fish profiles reach
         try writeExec(a, try std.fmt.allocPrint(a, "{s}/{s}", .{ root, cs.profile }), try std.fmt.allocPrint(a, cs.line, .{dir}));
         const env = try std.fmt.allocPrint(a, "env -i HOME='{s}' SHELL='{s}' PATH=/usr/bin:/bin", .{ root, cs.shell });
         const out = try runSh(a, env, try probeScript(a, &.{.{ .launch = app, .version = true }}, .{}));
-        const r = try parseProbe(a, out, 1);
+        const r = try parseProbe(a, out, 1, 0);
         if (r.binaries[0] == null or r.login != true) std.debug.print("{s} probe output:\n{s}\n", .{ cs.shell, out });
         try t.expectEqual(@as(?bool, true), r.login);
         try t.expectEqualStrings(try std.fmt.allocPrint(a, "{s}/skreal", .{dir}), r.binaries[0].?);
@@ -1429,6 +1499,12 @@ const opencode_like = adapter.Launch{
     },
 };
 
+fn specOf(l: adapter.Launch) adapter.Spec {
+    return .{ .id = "x", .name = "X", .source = .screen, .launch = l };
+}
+const claude_spec = specOf(claude_like);
+const opencode_spec = specOf(opencode_like);
+
 test "permissions: unknown names, a clobbered mechanism and an app without one are refused" {
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);
     defer arena_state.deinit();
@@ -1455,10 +1531,10 @@ test "permissions become Claude Code's --settings lists and merge into opencode'
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    const cl = try applyPermissions(a, claude_like, .{
+    const cl = try applySettings(a, &claude_spec, .{
         .args = &.{"--wrap"},
         .permissions = &.{ .{ .name = "Bash(git *)", .action = .allow }, .{ .name = "Read", .action = .allow }, .{ .name = "Edit", .action = .deny } },
-    });
+    }, null);
     try t.expectEqual(@as(usize, 0), cl.permissions.len);
     try t.expectEqual(@as(usize, 2), cl.server_args.len);
     try t.expectEqualStrings("--settings", cl.server_args[0]);
@@ -1466,17 +1542,17 @@ test "permissions become Claude Code's --settings lists and merge into opencode'
     // Only the main process gets it.
     const argv = try startArgv(a, claude_like, "/c", cl, .{}, .{ .main = .fresh });
     try t.expectEqualStrings("--settings", argv[2]);
-    try t.expectEqual(@as(usize, 2), (try startArgv(a, opencode_like, "/o", try applyPermissions(a, opencode_like, .{ .permissions = &.{.{ .name = "bash", .action = .ask }} }), .{}, .attach)).len);
+    try t.expectEqual(@as(usize, 2), (try startArgv(a, opencode_like, "/o", try applySettings(a, &opencode_spec, .{ .permissions = &.{.{ .name = "bash", .action = .ask }} }, null), .{}, .attach)).len);
 
     // opencode: a document of its own, or merged into the caller's.
-    const fresh = try applyPermissions(a, opencode_like, .{ .permissions = &.{ .{ .name = "external_directory", .action = .allow }, .{ .name = "bash", .action = .ask } } });
+    const fresh = try applySettings(a, &opencode_spec, .{ .permissions = &.{ .{ .name = "external_directory", .action = .allow }, .{ .name = "bash", .action = .ask } } }, null);
     try t.expectEqual(@as(usize, 1), fresh.env.len);
     try t.expectEqualStrings("{\"permission\":{\"external_directory\":\"allow\",\"bash\":\"ask\"}}", fresh.env[0].value);
     const mine = [_]EnvVar{
         .{ .name = "OTHER", .value = "1" },
         .{ .name = "OPENCODE_CONFIG_CONTENT", .value = "{\"model\":\"p/m\",\"permission\":{\"edit\":\"deny\",\"bash\":\"allow\"}}" },
     };
-    const merged = try applyPermissions(a, opencode_like, .{ .env = &mine, .permissions = &.{.{ .name = "bash", .action = .deny }} });
+    const merged = try applySettings(a, &opencode_spec, .{ .env = &mine, .permissions = &.{.{ .name = "bash", .action = .deny }} }, null);
     try t.expectEqual(@as(usize, 2), merged.env.len);
     try t.expectEqualStrings("OTHER", merged.env[0].name);
     try t.expectEqualStrings("{\"model\":\"p/m\",\"permission\":{\"edit\":\"deny\",\"bash\":\"deny\"}}", merged.env[1].value);
@@ -1485,6 +1561,55 @@ test "permissions become Claude Code's --settings lists and merge into opencode'
     // A policy at the document's top level.
     var top = opencode_like;
     top.permissions.?.path = &.{};
-    const flat = try applyPermissions(a, top, .{ .env = &.{.{ .name = "OPENCODE_CONFIG_CONTENT", .value = "{\"x\":1}" }}, .permissions = &.{.{ .name = "bash", .action = .allow }} });
+    const top_spec = specOf(top);
+    const flat = try applySettings(a, &top_spec, .{ .env = &.{.{ .name = "OPENCODE_CONFIG_CONTENT", .value = "{\"x\":1}" }}, .permissions = &.{.{ .name = "bash", .action = .allow }} }, null);
     try t.expectEqualStrings("{\"x\":1,\"bash\":\"allow\"}", flat.env[0].value);
+}
+
+test "a status command joins the permissions in ONE settings document, with its variables" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var spec = claude_spec;
+    spec.facts = .{ .map = .{}, .status_command = .{ .settings_path = &.{"statusLine"} } };
+    var obj: std.json.ObjectMap = .empty;
+    try obj.put(a, "type", .{ .string = "command" });
+    try obj.put(a, "command", .{ .string = "save-it" });
+    const st = Status{ .value = .{ .object = obj }, .env = &.{.{ .name = "SKETERM_AGENT_FACTS", .value = "/run/f.json" }} };
+    const both = try applySettings(a, &spec, .{
+        .env = &.{.{ .name = "MINE", .value = "1" }},
+        .permissions = &.{.{ .name = "Read", .action = .allow }},
+    }, st);
+    try t.expectEqual(@as(usize, 2), both.server_args.len);
+    try t.expectEqualStrings("{\"permissions\":{\"allow\":[\"Read\"]},\"statusLine\":{\"type\":\"command\",\"command\":\"save-it\"}}", both.server_args[1]);
+    try t.expectEqual(@as(usize, 2), both.env.len);
+    try t.expectEqualStrings("MINE", both.env[0].name);
+    try t.expectEqualStrings("SKETERM_AGENT_FACTS", both.env[1].name);
+    // Without permissions: the status command alone, no empty policy.
+    const alone = try applySettings(a, &spec, .{}, st);
+    try t.expectEqualStrings("{\"statusLine\":{\"type\":\"command\",\"command\":\"save-it\"}}", alone.server_args[1]);
+    // Neither: the start is untouched.
+    try t.expectEqual(@as(usize, 0), (try applySettings(a, &spec, .{}, null)).server_args.len);
+    // The caller's own --settings is where the document would go.
+    try t.expect(settingsArgTaken(claude_like, .{ .args = &.{"--settings={}"} }));
+    try t.expect(!settingsArgTaken(claude_like, .{ .args = &.{"--settingsx"} }));
+    try t.expect(!settingsArgTaken(opencode_like, .{ .args = &.{"--settings"} }));
+}
+
+test "the probe reads the files it is given and reports the runtime dir" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const file = try std.fmt.allocPrint(a, "/tmp/.sk_probe_files_{d}.json", .{c.getpid()});
+    defer @import("../util/pathz.zig").unlinkPath(file);
+    try @import("../util/atomicwrite.zig").writeFile(file, "{\"statusLine\":\n {\"command\": \"x\"}}\n", 0o600);
+    const lookups = [_]Lookup{.{ .launch = test_launch }};
+    const snippet = try std.fmt.allocPrint(a, "f='{s}'", .{file});
+    const script = try probeScript(a, &lookups, .{ .login = false, .files = &.{ snippet, "f=/nonexistent/x" } });
+    const r = try parseProbe(a, try runSh(a, "XDG_RUNTIME_DIR=/run/user/77 PATH=/usr/bin:/bin", script), 1, 2);
+    try t.expectEqualStrings("/run/user/77", r.run_dir.?);
+    try t.expectEqualStrings("{\"statusLine\": {\"command\": \"x\"}}", r.files[0].?);
+    try t.expect(r.files[1] == null);
+    const noxdg = try parseProbe(a, try runSh(a, "env -u XDG_RUNTIME_DIR TMPDIR=/tmp/me PATH=/usr/bin:/bin", script), 1, 2);
+    try t.expectEqualStrings("/tmp/me", noxdg.run_dir.?);
 }

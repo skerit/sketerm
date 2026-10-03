@@ -2223,7 +2223,7 @@ fn probeRemote(arena: std.mem.Allocator, host: []const u8, lookups: []const laun
     switch (try mcp_term.runArgvTerm(arena, argv, PROBE_WAIT_MS)) {
         .err => |m| return .{ .fail = .{ .code = .unavailable, .msg = m } },
         .run => |r| {
-            const res = try launch.parseProbe(arena, r.output, lookups.len);
+            const res = try launch.parseProbe(arena, r.output, lookups.len, opts.files.len);
             if (r.exited and r.status_known and r.status == 0 and res.complete) return .{ .ok = res };
             if (sshroute.unreachableLine(r.output)) |said|
                 return .{ .fail = .{ .code = .host_unreachable, .msg = try mcp_term.unreachableMsg(arena, host, said) } };
@@ -3085,7 +3085,7 @@ fn spawnScreen(arena: std.mem.Allocator, loaded: *const adapter.Loaded, binary: 
     // A conversation id the agent owns, so a relaunch resumes exactly it;
     // `resume` continues the caller's existing one instead.
     const conversation: ?[]const u8 = if (o.resume_id) |r| r else if (spec.launch.session_args.len > 0) try newUuid(arena) else null;
-    const x = try launch.applyPermissions(arena, spec.launch, o.extra);
+    const x = try launch.applySettings(arena, spec, o.extra, null);
     const argv = try launch.startArgv(arena, spec.launch, binary, x, .{
         .model = o.model,
         .effort = o.effort,
@@ -3190,7 +3190,7 @@ fn spawnApi(arena: std.mem.Allocator, loaded: *const adapter.Loaded, binary: []c
     const session = try std.fmt.allocPrint(arena, "agent-{s}", .{id});
     const server_session = try std.fmt.allocPrint(arena, "agent-{s}-server", .{id});
     const what = try std.fmt.allocPrint(arena, "the {s} server", .{spec.name});
-    const x = try launch.applyPermissions(arena, spec.launch, o.extra);
+    const x = try launch.applySettings(arena, spec, o.extra, null);
     const server_argv = try launch.startArgv(arena, spec.launch, binary, x, .{
         .port = port_str,
         .cwd = cwd,
@@ -3943,7 +3943,7 @@ fn relaunch(arena: std.mem.Allocator, e: *Entry, action: agent_mod.Action, deadl
 const Restart = struct { argv: []const []const u8, spec: SpawnSpec };
 
 fn restartOf(arena: std.mem.Allocator, e: *const Entry, model: ?[]const u8, effort: ?[]const u8, conversation: ?[]const u8, start: launch.Start) !Restart {
-    const x = try launch.applyPermissions(arena, e.loaded.spec.launch, e.extra);
+    const x = try launch.applySettings(arena, &e.loaded.spec, e.extra, null);
     return .{
         .argv = try launch.startArgv(arena, e.loaded.spec.launch, e.binary, x, .{
             .model = model,

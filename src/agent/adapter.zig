@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const vocab = @import("vocab.zig");
+const facts_mod = @import("facts.zig");
 const pattern = @import("../util/pattern.zig");
 const readfile = @import("../util/readfile.zig");
 const xdg = @import("../util/xdg.zig");
@@ -248,6 +249,37 @@ pub const Actions = struct {
     set_effort: []const Step = &.{},
 };
 
+/// A settings file the user's own status command may be in, highest
+/// precedence first: `{cwd}/...`, `~/...` or absolute. When the app's
+/// environment sets `dir_env`, its value replaces the file's directory.
+pub const SettingsFile = struct {
+    path: []const u8,
+    dir_env: ?[]const u8 = null,
+};
+
+/// A screen app that runs a configured command with a JSON document on
+/// stdin (Claude Code's `statusLine`): sketerm's own command takes its
+/// place in the settings document `launch.permissions` declares, saves the
+/// document for the facts and runs the user's command after it.
+pub const StatusCommand = struct {
+    /// Object keys the command's object sits under in the document.
+    settings_path: []const []const u8,
+    /// The key of the command string in that object.
+    command_key: []const u8 = "command",
+    /// The object's other keys when the user has none of their own.
+    fields: std.json.ArrayHashMap([]const u8) = .{},
+    /// Where the user's own object is looked up, highest precedence first.
+    user_settings: []const SettingsFile = &.{},
+};
+
+/// The facts an adapter reports (`src/agent/facts.zig`): `map` names facts
+/// of `data/agents/facts.json` and their paths into the source's document,
+/// which is the status command's for a screen source.
+pub const Facts = struct {
+    map: facts_mod.Map,
+    status_command: ?StatusCommand = null,
+};
+
 pub const Spec = struct {
     id: []const u8,
     name: []const u8,
@@ -257,6 +289,7 @@ pub const Spec = struct {
     actions: Actions = .{},
     errors: []const ErrorRule = &.{},
     retry: Retry = .{},
+    facts: ?Facts = null,
 };
 
 /// The `{name}`s a recipe or launch argument may use. `port` and `cwd` are
@@ -417,6 +450,7 @@ const Validator = struct {
             if (!validEnvName(base)) return self.fail("launch.unset_env \"{s}\" is not a variable name (a trailing * matches a prefix)", .{name});
         }
         if (s.launch.permissions) |p| try self.permissions(p);
+        if (s.facts) |f| try self.facts(s, f);
         {
             const pr = s.retry.prompt;
             if (std.mem.trim(u8, pr, " \t").len == 0) return self.fail("retry.prompt is empty", .{});
@@ -457,6 +491,33 @@ const Validator = struct {
         if ((p.env == null) == (p.arg == null)) return self.fail("launch.permissions needs exactly one of \"env\" or \"arg\"", .{});
         if (p.env) |name| if (!validEnvName(name)) return self.fail("launch.permissions.env \"{s}\" is not an environment variable name", .{name});
         if (p.arg) |a| if (a.len == 0 or a[0] != '-') return self.fail("launch.permissions.arg \"{s}\" is not an option", .{a});
+    }
+
+    fn facts(self: *Validator, s: *const Spec, f: Facts) !void {
+        const v = facts_mod.shipped() catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidFacts => return self.fail("facts: data/agents/facts.json does not validate", .{}),
+        };
+        if (try facts_mod.mapProblem(self.arena, v, f.map)) |p| return self.fail("{s}", .{p});
+        switch (s.source) {
+            .screen => if (f.status_command == null) return self.fail("facts on a screen source need facts.status_command, the only document a screen app hands over", .{}),
+            .opencode_api => if (f.status_command != null) return self.fail("facts.status_command is for screen sources (an API source's facts come from its API)", .{}),
+        }
+        const sc = f.status_command orelse return;
+        if (s.launch.permissions == null) return self.fail("facts.status_command goes into the settings document launch.permissions declares, and there is none", .{});
+        if (sc.settings_path.len == 0) return self.fail("facts.status_command.settings_path is empty", .{});
+        for (sc.settings_path) |k| if (k.len == 0) return self.fail("facts.status_command.settings_path: empty key", .{});
+        if (sc.command_key.len == 0) return self.fail("facts.status_command.command_key is empty", .{});
+        if (sc.fields.map.contains(sc.command_key)) return self.fail("facts.status_command.fields sets the command key, which is sketerm's", .{});
+        for (sc.user_settings, 0..) |file, i| {
+            const p = file.path;
+            const rest = if (std.mem.startsWith(u8, p, "{cwd}/")) p["{cwd}/".len..] else if (std.mem.startsWith(u8, p, "~/")) p[2..] else if (p.len > 1 and p[0] == '/') p[1..] else
+                return self.fail("facts.status_command.user_settings[{d}]: \"{s}\" must start with {{cwd}}/, ~/ or /", .{ i, p });
+            if (rest.len == 0 or rest[rest.len - 1] == '/' or std.mem.indexOfAny(u8, rest, "{}") != null)
+                return self.fail("facts.status_command.user_settings[{d}]: \"{s}\" must name a file, with no placeholder but a leading {{cwd}}", .{ i, p });
+            if (file.dir_env) |name| if (!validEnvName(name))
+                return self.fail("facts.status_command.user_settings[{d}].dir_env \"{s}\" is not an environment variable name", .{ i, name });
+        }
     }
 
     fn recipe(self: *Validator, s: *const Spec, steps: []const Step, where: []const u8) !void {
@@ -800,6 +861,38 @@ test "an API source needs a password variable and checks its attach arguments" {
     try expectProblem(unset_bad, "launch.unset_env \"A;B*\" is not a variable name");
 }
 
+test "facts: only declared names, a status command needs a settings document and a screen source" {
+    // A screen adapter's facts come from a status command in its settings
+    // document, which launch.permissions declares.
+    const perms = "\"model_args\": [\"--model\", \"{model}\"], \"permissions\": { \"names\": [\"Bash\"], \"shape\": \"by_action\", \"arg\": \"--settings\" }";
+    const base = try std.mem.replaceOwned(u8, t.allocator, minimal, "\"model_args\": [\"--model\", \"{model}\"]", perms);
+    defer t.allocator.free(base);
+    const status = "\"status_command\": { \"settings_path\": [\"statusLine\"], \"fields\": { \"type\": \"command\" }, \"user_settings\": [ { \"path\": \"{cwd}/.demo/settings.json\" }, { \"path\": \"~/.demo/settings.json\", \"dir_env\": \"DEMO_DIR\" } ] }";
+    const ok = try std.fmt.allocPrint(t.allocator, "{s}, \"facts\": {{ {s}, \"map\": {{ \"context_used_percent\": \"ctx.pct\", \"cost_usd\": [\"a.b\", \"c\"] }} }} }}", .{ base[0..std.mem.lastIndexOfScalar(u8, base, '}').?], status });
+    defer t.allocator.free(ok);
+    var problem: ?[]u8 = null;
+    const l = try load(t.allocator, "demo.json", ok, .user, &problem);
+    defer l.destroy(t.allocator);
+    try t.expectEqual(@as(usize, 2), l.spec.facts.?.map.map.count());
+
+    // An undeclared fact name fails the whole adapter (fail closed).
+    const unknown = try std.mem.replaceOwned(u8, t.allocator, ok, "\"cost_usd\"", "\"cost_eur\"");
+    defer t.allocator.free(unknown);
+    try expectProblem(unknown, "\"cost_eur\" is not a fact facts.json declares");
+    const no_doc = try std.mem.replaceOwned(u8, t.allocator, ok, "\"permissions\": { \"names\": [\"Bash\"], \"shape\": \"by_action\", \"arg\": \"--settings\" }", "\"args\": []");
+    defer t.allocator.free(no_doc);
+    try expectProblem(no_doc, "settings document launch.permissions declares");
+    const no_source = try std.mem.replaceOwned(u8, t.allocator, ok, status ++ ", ", "");
+    defer t.allocator.free(no_source);
+    try expectProblem(no_source, "need facts.status_command");
+    const bad_path = try std.mem.replaceOwned(u8, t.allocator, ok, "{cwd}/.demo/settings.json", "{home}/.demo/settings.json");
+    defer t.allocator.free(bad_path);
+    try expectProblem(bad_path, "must start with {cwd}/, ~/ or /");
+    const own_cmd = try std.mem.replaceOwned(u8, t.allocator, ok, "\"type\": \"command\"", "\"command\": \"x\"");
+    defer t.allocator.free(own_cmd);
+    try expectProblem(own_cmd, "sets the command key");
+}
+
 test "expand fills known placeholders and leaves other braces alone" {
     const s = try expand(t.allocator, "/model {model} {x}", .{ .model = "opus" });
     defer t.allocator.free(s);
@@ -850,6 +943,13 @@ test "every shipped adapter loads, and a user file overrides by id" {
     try t.expectEqualStrings("OPENCODE_CONFIG_CONTENT", oc.spec.launch.permissions.?.env.?);
     try t.expectEqualStrings("continue", cl.spec.retry.prompt);
     try t.expectEqualStrings("continue", oc.spec.retry.prompt);
+
+    // Both report facts: Claude Code through its status command, opencode
+    // from its API, its percent derived through facts.json.
+    try t.expectEqualStrings("statusLine", cl.spec.facts.?.status_command.?.settings_path[0]);
+    try t.expect(cl.spec.facts.?.map.map.contains("rate_7d_used_percent"));
+    try t.expect(oc.spec.facts.?.status_command == null);
+    try t.expect(oc.spec.facts.?.map.map.contains("context_window_tokens"));
 
     const user = std.mem.replaceOwned(u8, t.allocator, minimal, "\"demo\"", "\"claude\"") catch unreachable;
     defer t.allocator.free(user);
