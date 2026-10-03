@@ -1,5 +1,38 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-03: shipped-code helper dedup (zemble dupes, all lanes)
+
+A second sweep over `zemble dupes` (exact, renamed, logic) folded copies
+into their homes without changing behaviour. Into existing homes:
+`mounts.unescape` (filebrowser's `unescapeMnt`), `jsonnum.u32Of`
+(semantic tokens) and new `jsonnum.strOf` (5 LSP copies), `strz.eqOpt`
+(6 private optional-slice equalities), new `strz.clipUtf8` (agent events,
+web store, reader), `shellquote.appendAlwaysQuoted`/`appendQuotedBody`
+(3 filebrowser always-quote copies), `pathz.baseName` (from invocation,
+plus daemon_cast/webuserscripts/statusline) and `pathz.isDir`,
+`readfile.sizedOrNull` (register and view-memory stores),
+`fdio.writeAll` (fsmount, agent-wait, display CLI), browser/open's launch
+helpers (file_transfers). New shared homes: `web/download.zig
+uniquePath` (GUI and headless downloads, each keeping its attempt
+budget), `lsp/proc.zig rootMarkerExists` (daemon and editor LSP roots),
+`mux/punch.zig validPortRange` (client and daemon UDP range shape),
+`util/scmrights.zig` (SCM_RIGHTS pack/collect/recv for the daemon's
+native pipe, the broker control channel and the web presenter) and
+`ui/managerwin.zig` (the web manager windows' scrolled list and rows).
+
+Left on purpose: ctlclient/socks5 `pollUntil` (POLLHUP is an error in one,
+readable in the other), the two CEF resource-type maps (different target
+vocabularies), the CEF header-map walks (three output formats), the
+per-protocol `peelUnit` wrappers (framing.zig's declared compatibility
+surface), the render passes' realize/releaseGL (already on gl.zig; only
+per-pass uniforms remain), `input.isModifierKey` vs `modes.isBareModifier`
+(the latter omits AltGr/Level5/Scroll_Lock: an open question, not a copy)
+and test-only fixtures.
+
+Validation (2026-10-03): test-core, test, mux, mux-portable (musl and
+aarch64-macos), web and the default GUI build green; `ldd sketerm-mux` is
+libc/libm only. zemble dupes: exact 436 -> 421 classes, renamed 170 -> 163.
+
 ## 2026-10-03: side questions (`agent_ask`, Claude Code's `/btw`)
 
 An orchestrator could only learn how far a busy sub-agent was by waiting
