@@ -13,6 +13,7 @@ const c = @import("../c.zig").c;
 const atomicwrite = @import("../util/atomicwrite.zig");
 const model = @import("model.zig");
 const pathz = @import("../util/pathz.zig");
+const readfile = @import("../util/readfile.zig");
 const xdg = @import("../util/xdg.zig");
 
 /// Remembered folders kept; the lowest `seq` is evicted first.
@@ -246,15 +247,9 @@ pub const Store = struct {
     }
 
     fn loadFromPath(allocator: std.mem.Allocator, path: []const u8) Store {
-        var pbuf: [4096]u8 = undefined;
-        const fp = c.fopen(pathz.pathZ(&pbuf, path) catch return Store.init(allocator), "rb") orelse
-            return Store.init(allocator);
-        defer _ = c.fclose(fp);
-        const bytes = allocator.alloc(u8, FILE_CAP) catch return Store.init(allocator);
+        const bytes = readfile.sizedOrNull(allocator, path, FILE_CAP) orelse return Store.init(allocator);
         defer allocator.free(bytes);
-        const n = c.fread(bytes.ptr, 1, bytes.len, fp);
-        if (n == 0) return Store.init(allocator);
-        return decode(allocator, bytes[0..n]);
+        return decode(allocator, bytes);
     }
 
     pub fn save(self: *const Store) !void {
