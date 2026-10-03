@@ -38,6 +38,8 @@ pub const Action = union(ActionKind) {
     set_model: []const u8,
     /// An effort level.
     set_effort: []const u8,
+    /// The question, asked aside: no turn, no record.
+    side_question: []const u8,
 };
 
 pub const AnswerText = struct {
@@ -236,7 +238,16 @@ pub const Uptake = struct {
 pub fn supportsAction(loaded: *const adapter.Loaded, action: ActionKind) bool {
     return switch (loaded.spec.source) {
         .screen => recipe(loaded, action).len > 0,
-        .opencode_api => true,
+        .opencode_api => apiPerforms(action),
+    };
+}
+
+/// The actions `ApiDriver.perform` implements.
+fn apiPerforms(action: ActionKind) bool {
+    return switch (action) {
+        .submit, .queue, .answer, .answer_text, .interrupt, .set_model, .set_effort => true,
+        // opencode's API has no side question.
+        .side_question => false,
     };
 }
 
@@ -268,7 +279,7 @@ pub const ScreenDriver = struct {
         if (steps.len == 0) return error.Unsupported;
         var values: std.enums.EnumFieldStruct(adapter.Placeholder, ?[]const u8, @as(?[]const u8, null)) = .{};
         switch (action) {
-            .submit, .queue => |x| values.text = x,
+            .submit, .queue, .side_question => |x| values.text = x,
             .answer => |x| values.choice = x,
             .answer_text => |x| {
                 values.choice = x.option;
@@ -307,6 +318,11 @@ pub const ScreenDriver = struct {
         return self.engine.input_row != null;
     }
 
+    /// The side-question panel shows, and has the keyboard.
+    pub fn sideOpen(self: ScreenDriver) bool {
+        return self.engine.sideOpen();
+    }
+
     /// The number to type for `choice` (label, 1-based index or a unique
     /// part of a label) in the interaction showing now.
     pub fn pickNumber(self: ScreenDriver, choice: []const u8) Error!u32 {
@@ -341,7 +357,7 @@ fn planSteps(allocator: std.mem.Allocator, steps: []const adapter.Step, values: 
             .text => |x| .{ .text = try adapter.expand(a, x, values) },
             .command => |x| .{ .command = try adapter.expand(a, x, values) },
             .pick => |x| .{ .pick = try adapter.expand(a, x, values) },
-            .key, .sleep_ms, .clear_input, .wait, .confirm, .relaunch => s,
+            .key, .sleep_ms, .clear_input, .close_side, .wait, .confirm, .relaunch => s,
         });
     }
     return .{ .arena = arena, .steps = out.items };
@@ -373,6 +389,7 @@ pub const ApiDriver = struct {
             .interrupt => try self.api.interrupt(),
             .set_model => |x| try self.api.setModel(x),
             .set_effort => |x| try self.api.setEffort(x),
+            .side_question => return error.Unsupported,
         }
     }
 };
@@ -489,7 +506,17 @@ test "screen: an action without a recipe is unsupported" {
     var set = adapter.Set.init(t.allocator);
     defer set.deinit();
     try set.loadShipped();
-    for (std.enums.values(ActionKind)) |k| try t.expect(supportsAction(set.get("opencode").?, k));
+    // The API source performs every action but a side question, which
+    // opencode's API has no route for; Claude Code declares one.
+    for (std.enums.values(ActionKind)) |k| try t.expectEqual(k != .side_question, supportsAction(set.get("opencode").?, k));
+    try t.expect(supportsAction(set.get("claude").?, .side_question));
+    var cl_agent = try Agent.initScreen(t.allocator, set.get("claude").?, .{});
+    defer cl_agent.deinit();
+    var side = try cl_agent.driver().screen.plan(t.allocator, .{ .side_question = "how far are you?" });
+    defer side.deinit();
+    try t.expectEqualStrings("/btw how far are you?", side.steps[0].text);
+    try t.expectEqual(adapter.WaitFor.side_answer, side.steps[4].wait);
+    try t.expectEqualStrings("escape", side.steps[5].close_side[0]);
 }
 
 test "api: the common read side and performed actions over HTTP" {

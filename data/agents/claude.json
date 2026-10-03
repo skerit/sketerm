@@ -86,7 +86,14 @@
       { "kind": "permission", "pattern": "^No$" }
     ],
     "resume_refused": { "prefix": "No conversation found with session ID: " },
-    "paste": { "lead_in": "Please carry out the instructions in this text: ", "over_chars": 800, "pause_ms": 300 }
+    "paste": { "lead_in": "Please carry out the instructions in this text: ", "over_chars": 800, "pause_ms": 300 },
+    "side_question": {
+      "question": { "prefix": "/btw " },
+      "footer": { "pattern": "^Esc to close$| · Esc to close$" },
+      "pending": { "pattern": "^Answering…$" },
+      "echo": { "prefix": "you: /btw " },
+      "settle_ms": 1000
+    }
   },
   "actions": {
     "submit": [
@@ -132,6 +139,14 @@
     ],
     "set_effort": [
       { "relaunch": {} }
+    ],
+    "side_question": [
+      { "text": "/btw {text}" },
+      { "sleep_ms": 800 },
+      { "key": "enter" },
+      { "wait": "side_asked" },
+      { "wait": "side_answer" },
+      { "close_side": ["escape"] }
     ]
   },
   "errors": [

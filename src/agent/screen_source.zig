@@ -95,6 +95,9 @@ pub const Engine = struct {
     background_capped: bool = false,
     /// Prompts the app shows queued for its next turn (`screen.queued`).
     queued_visible: u32 = 0,
+    /// The side-question panel on screen (indexes `rows`): live, never
+    /// transcript, and a turn end waits for it to close.
+    side_panel: ?grammar.SidePanel = null,
 
     // Counters from the Screen, relative to the first feed.
     primed: bool = false,
@@ -428,7 +431,10 @@ pub const Engine = struct {
             self.last_change_ms = now_ms;
         }
         const sc = self.sc;
-        self.input_row = grammar.findInput(sc, self.rows.items, INPUT_SEARCH_ROWS);
+        // A side panel drawn last replaced the input box (an idle app): a
+        // `$` line in its answer is no input box.
+        const panel_last = if (sc.side) |s| self.rows.items.len > 0 and s.footer.matches(self.rows.items[self.rows.items.len - 1].text) else false;
+        self.input_row = if (panel_last) null else grammar.findInput(sc, self.rows.items, INPUT_SEARCH_ROWS);
         self.allocator.free(self.input_text);
         self.input_text = &.{};
         self.queued_visible = 0;
@@ -437,6 +443,10 @@ pub const Engine = struct {
             grammar.markLive(sc, self.rows.items, in, self.status_rows);
             self.queued_visible = grammar.markQueued(sc, self.rows.items, in);
             self.input_text = try grammar.inputText(self.allocator, sc, self.rows.items, in);
+        }
+        self.side_panel = grammar.findSidePanel(sc, self.rows.items);
+        if (self.side_panel) |p| {
+            for (self.rows.items[p.top .. p.footer + 1]) |*l| l.live = true;
         }
         self.subagent_visible = self.subagentInTail();
         self.background_tasks = self.backgroundInTail();
@@ -456,11 +466,29 @@ pub const Engine = struct {
         var i = self.rows.items.len;
         while (i > 0) {
             i -= 1;
+            if (self.inSidePanel(i)) continue;
             const l = self.rows.items[i];
             if (m.matches(l.text)) return true;
             if (grammar.classify(self.sc, l) == .record) return false;
         }
         return false;
+    }
+
+    /// Row `i` of `rows` is part of the side panel (whatever it says).
+    fn inSidePanel(self: *const Engine, i: usize) bool {
+        const p = self.side_panel orelse return false;
+        return p.contains(i);
+    }
+
+    pub fn sideOpen(self: *const Engine) bool {
+        return self.side_panel != null;
+    }
+
+    /// The side panel's answer to `asked` (the typed line), or null while
+    /// no panel names that question.
+    pub fn sideAnswer(self: *const Engine, alloc: std.mem.Allocator, asked: []const u8) !?grammar.SideAnswer {
+        const p = self.side_panel orelse return null;
+        return grammar.sideAnswer(alloc, self.sc, self.rows.items, p, asked);
     }
 
     /// The background tasks shown after the last record start: the numbers
@@ -472,6 +500,7 @@ pub const Engine = struct {
         var i = self.rows.items.len;
         while (i > 0) {
             i -= 1;
+            if (self.inSidePanel(i)) continue;
             const l = self.rows.items[i];
             if (self.sc.background_agent) |m| if (m.matches(l.text)) {
                 n += 1;
@@ -509,8 +538,9 @@ pub const Engine = struct {
 
         // A turn end is captured once the footer shows below its last record
         // (all text drawn), or after the settle guard. An adapter command's
-        // turn has no answer still to draw: it is captured at once.
-        if (self.end_pending and (self.adopting or self.footerBelowRecords() or now_ms - self.end_at_ms >= settle)) {
+        // turn has no answer still to draw: it is captured at once. An open
+        // side panel may hide what the turn still draws: it waits for it.
+        if (self.end_pending and self.side_panel == null and (self.adopting or self.footerBelowRecords() or now_ms - self.end_at_ms >= settle)) {
             try self.capture(true);
             self.end_pending = false;
             self.captured_since_end = true;
@@ -641,7 +671,9 @@ pub const Engine = struct {
                 if (self.sc.records[ri].kind == .user) start = i + 1;
             }
         }
-        for (self.rows.items[start..]) |l| {
+        for (self.rows.items[start..], start..) |l, row| {
+            // The side panel's answer quotes whatever it is asked about.
+            if (self.inSidePanel(row)) continue;
             const text = stripRecordPrefix(self.sc, l.text);
             const hit = grammar.matchError(self.loaded.errors, text) orelse continue;
             if (hit.class == .retrying) {
@@ -1139,10 +1171,23 @@ const Rig = struct {
     engine: Engine,
 
     fn init(self: *Rig, cols: u16, rows: u16) !void {
+        try self.initWith(cols, rows, try grammar.testAdapter());
+    }
+
+    /// With the shipped adapter `file` (its measured declarations).
+    fn initShipped(self: *Rig, cols: u16, rows: u16, file: []const u8) !void {
+        for (@import("agent_adapters").shipped) |f| if (std.mem.eql(u8, f.file, file)) {
+            var problem: ?[]u8 = null;
+            return self.initWith(cols, rows, try adapter.load(t.allocator, file, f.json, .shipped, &problem));
+        };
+        return error.NoSuchShippedAdapter;
+    }
+
+    fn initWith(self: *Rig, cols: u16, rows: u16, loaded: *adapter.Loaded) !void {
         self.pool = try StylePool.init(t.allocator);
         self.screen = try Screen.init(t.allocator, &self.pool, cols, rows);
         self.parser = Parser.init(t.allocator);
-        self.loaded = try grammar.testAdapter();
+        self.loaded = loaded;
         self.engine = try Engine.init(t.allocator, self.loaded, .{});
     }
 
@@ -1976,4 +2021,150 @@ test "a restart in place re-arms readiness without an event" {
     try rig.engine.tick(3000);
     try t.expect(rig.engine.ready);
     try t.expectEqual(@as(usize, 0), rig.engine.queue.events.items.len);
+}
+
+// ── side questions (Claude Code 2.1.288 /btw, measured: term-6.cast) ──
+
+/// Claude Code's live block as the measured session drew it.
+const live_btw = "[Haiku 4.5]\r\n[\xe2\x96\xa0\xe2\x96\xa1] 14% | 172k free\r\nmanual mode on\r\n$";
+const title_btw_busy = "\x1b]0;\xe2\x97\x90 Sleep test\x07";
+const title_btw_idle = "\x1b]0;\xe2\x9c\xb3 Sleep test\x07";
+const BTW_Q1 = "/btw what are you doing right now?";
+const BTW_Q2 = "/btw which command did you just run?";
+const BTW_A1 = "I'm answering your side question. The main agent is running the python3 command in the\nforeground and waiting for it to complete.";
+const BTW_A2 = "I ran: python3 -c \"import time; time.sleep(40)\"\n\nIt's a Python command that sleeps for 40 seconds.";
+
+/// No record of `e` mentions the side question or its panel.
+fn expectNoSideRecord(e: *const Engine) !void {
+    for (e.records.items) |r| {
+        try t.expect(std.mem.indexOf(u8, r.text, "/btw") == null);
+        try t.expect(std.mem.indexOf(u8, r.text, "side question") == null);
+        try t.expect(std.mem.indexOf(u8, r.text, "I ran:") == null);
+    }
+}
+
+/// A Claude Code agent mid-turn: a foreground command running below its
+/// prompt, the panel of `BTW_Q1` answered below the turn.
+fn busyWithAnsweredPanel(rig: *Rig) !void {
+    rig.write(title_btw_idle ++ "Claude Code v2.1.288\r\n" ++ live_btw);
+    try rig.feed(0);
+    try rig.engine.tick(1000);
+    try t.expectEqual(vocab.State.idle, rig.engine.state);
+    rig.write("\x1b]133;A\x07" ++ title_btw_busy ++ erase ++ "you: run the sleep in the foreground, then say finished\r\n" ++
+        "tool: Bash (python3 -c \"import time; time.sleep(40)\")\r\nRunning\xe2\x80\xa6  (11s)\r\n(ctrl+b to run in background)\r\nGrooving\xe2\x80\xa6\r\n" ++ live_btw);
+    try rig.feed(1100);
+    try t.expectEqual(vocab.State.working, rig.engine.state);
+    // Typed and submitted: the panel opens below the turn, pending.
+    rig.write(erase ++ BTW_Q1 ++ "\r\nAnswering\xe2\x80\xa6\r\nEsc to close\r\n" ++ live_btw);
+    try rig.feed(1200);
+    try t.expect(rig.engine.sideOpen());
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    try t.expect((try rig.engine.sideAnswer(arena.allocator(), BTW_Q1)).?.pending);
+    try t.expectEqual(vocab.State.working, rig.engine.state);
+    rig.write(comptime eraseRows(7) ++ BTW_Q1 ++ "\r\nI'm answering your side question. The main agent is running the python3 command in the\r\n" ++
+        "foreground and waiting for it to complete.\r\n\xe2\x86\x91/\xe2\x86\x93 to scroll \xc2\xb7 c to copy \xc2\xb7 f to fork \xc2\xb7 Esc to close\r\n" ++ live_btw);
+    try rig.feed(3300);
+}
+
+test "a side question to a busy agent: live panel, state working, no record or event; the turn keeps its own done" {
+    var rig: Rig = undefined;
+    try rig.initShipped(120, 40, "claude.json");
+    defer rig.deinit();
+    try busyWithAnsweredPanel(&rig);
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const ans = (try rig.engine.sideAnswer(arena.allocator(), BTW_Q1)).?;
+    try t.expect(!ans.pending);
+    try t.expectEqualStrings(BTW_A1, ans.text);
+    // However long it stays open, the agent is still working on its turn.
+    try rig.engine.tick(10_000);
+    try t.expectEqual(vocab.State.working, rig.engine.state);
+    try t.expectEqual(@as(usize, 0), rig.engine.queue.events.items.len);
+    try expectNoSideRecord(&rig.engine);
+    // Escape closes only the panel.
+    rig.write(comptime eraseRows(8) ++ live_btw);
+    try rig.feed(10_100);
+    try t.expect(!rig.engine.sideOpen());
+    try t.expectEqual(vocab.State.working, rig.engine.state);
+    // The turn finishes on its own: its done, its records, nothing of the panel.
+    rig.write(erase ++ "claude: finished\r\n" ++ live_btw ++ "\x1b]133;C\x07\x1b]133;D\x07\x07" ++ title_btw_idle ++ erase ++ "Baked for 43s \xc2\xb7 done 4:31 PM\r\n" ++ live_btw);
+    try rig.feed(12_000);
+    try rig.engine.tick(20_000);
+    try t.expectEqual(vocab.State.idle, rig.engine.state);
+    try t.expectEqual(@as(usize, 1), countKind(&rig.engine, .done));
+    try t.expectEqualStrings("finished", rig.engine.queue.events.items[rig.engine.queue.events.items.len - 1].text);
+    const recs = rig.engine.records.items;
+    try t.expectEqual(@as(usize, 3), recs.len);
+    try t.expectEqual(vocab.RecordKind.user, recs[0].kind);
+    try t.expectEqual(vocab.RecordKind.tool, recs[1].kind);
+    try t.expectEqualStrings("finished", recs[2].text);
+    try t.expectEqual(@as(usize, 1), rig.engine.turns.items.len);
+    try expectNoSideRecord(&rig.engine);
+}
+
+test "a turn that ends while the side panel is open settles once it closes" {
+    var rig: Rig = undefined;
+    try rig.initShipped(120, 40, "claude.json");
+    defer rig.deinit();
+    try busyWithAnsweredPanel(&rig);
+    // The end mark arrives while the panel covers what the turn still draws.
+    rig.write("\x1b]133;C\x07\x1b]133;D\x07\x07" ++ title_btw_idle);
+    try rig.feed(4000);
+    try rig.engine.tick(9000);
+    try t.expectEqual(vocab.State.working, rig.engine.state);
+    try t.expectEqual(@as(usize, 0), countKind(&rig.engine, .done));
+    rig.write(comptime eraseRows(8) ++ "claude: finished\r\nBaked for 43s \xc2\xb7 done 4:31 PM\r\n" ++ live_btw);
+    try rig.feed(9100);
+    try rig.engine.tick(15_000);
+    try t.expectEqual(vocab.State.idle, rig.engine.state);
+    try t.expectEqual(@as(usize, 1), countKind(&rig.engine, .done));
+    try t.expectEqualStrings("finished", rig.engine.queue.events.items[rig.engine.queue.events.items.len - 1].text);
+    try expectNoSideRecord(&rig.engine);
+}
+
+test "a side question to an idle agent: its prompt-like echo opens no job, the panel raises nothing" {
+    var rig: Rig = undefined;
+    try rig.initShipped(120, 40, "claude.json");
+    defer rig.deinit();
+    rig.write(title_btw_idle ++ "Claude Code v2.1.288\r\n" ++ live_btw);
+    try rig.feed(0);
+    try rig.engine.tick(1000);
+    rig.write("\x1b]133;A\x07" ++ title_btw_busy ++ erase ++ "you: say hi\r\nclaude: hello\r\n" ++ live_btw ++
+        "\x1b]133;C\x07\x1b]133;D\x07\x07" ++ title_btw_idle ++ erase ++ "Baked for 1s \xc2\xb7 done\r\n" ++ live_btw);
+    try rig.feed(1100);
+    try rig.engine.tick(5000);
+    try t.expectEqual(@as(usize, 1), countKind(&rig.engine, .done));
+    const n_events = rig.engine.queue.events.items.len;
+    // The echo, as measured: a prompt line below the footer (no turn mark).
+    rig.write(title_btw_busy ++ erase ++ "you: " ++ BTW_Q2 ++ "\r\nPerambulating\xe2\x80\xa6\r\n" ++
+        "Tip: Double-tap esc to rewind the code and/or conversation to a previous point in time\r\n" ++ live_btw ++ title_btw_idle);
+    try rig.feed(6000);
+    try t.expectEqual(vocab.State.idle, rig.engine.state);
+    // The panel replaces the live block and lists the earlier question too.
+    rig.write(comptime eraseRows(6) ++ BTW_Q1 ++ "\r\n" ++ BTW_Q2 ++ "\r\nAnswering\xe2\x80\xa6\r\n\xe2\x87\xa7\xe2\x86\x90/\xe2\x86\x92 to browse \xc2\xb7 x to clear history \xc2\xb7 Esc to close");
+    try rig.feed(6100);
+    try t.expect(rig.engine.sideOpen());
+    try t.expect(rig.engine.input_row == null);
+    rig.write("\x1b[2K\x1b[1A\x1b[2K\x1b[G" ++ "I ran: python3 -c \"import time; time.sleep(40)\"\r\n\r\nIt's a Python command that sleeps for 40 seconds.\r\n" ++
+        "\xe2\x87\xa7\xe2\x86\x90/\xe2\x86\x92 to browse \xc2\xb7 c to copy \xc2\xb7 f to fork \xc2\xb7 x to clear history \xc2\xb7 Esc to close");
+    try rig.feed(7700);
+    try rig.engine.tick(30_000);
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    try t.expectEqualStrings(BTW_A2, (try rig.engine.sideAnswer(arena.allocator(), BTW_Q2)).?.text);
+    try t.expectEqual(vocab.State.idle, rig.engine.state);
+    try t.expectEqual(n_events, rig.engine.queue.events.items.len);
+    try t.expectEqual(@as(usize, 2), rig.engine.records.items.len);
+    try t.expectEqual(@as(usize, 1), rig.engine.turns.items.len);
+    // Escape: the panel and the echo go.
+    rig.write(comptime eraseRows(7) ++ live_btw);
+    try rig.feed(31_000);
+    try rig.engine.tick(40_000);
+    try t.expect(!rig.engine.sideOpen());
+    try t.expect(rig.engine.input_row != null);
+    try t.expectEqual(vocab.State.idle, rig.engine.state);
+    try t.expectEqual(n_events, rig.engine.queue.events.items.len);
+    try t.expectEqual(@as(usize, 2), rig.engine.records.items.len);
+    try expectNoSideRecord(&rig.engine);
 }

@@ -168,6 +168,27 @@ pub const ScreenSpec = struct {
     /// then reads as pasted text: a prompt over the threshold gets
     /// `lead_in` typed first (by the recipe step that types `{text}`).
     paste: ?Paste = null,
+    /// The panel a side question (`actions.side_question`) is answered in;
+    /// declared together with that action.
+    side_question: ?SideQuestion = null,
+};
+
+/// A question the app answers from the current context in a panel below
+/// the transcript, without a turn and without it entering the conversation
+/// (Claude Code's `/btw`). The panel keeps focus until it is closed, which
+/// is the only time its close keys are safe to send.
+pub const SideQuestion = struct {
+    /// A panel line naming a question; the panel lists earlier ones too.
+    question: LineRule,
+    /// The panel's last line, in every variant.
+    footer: LineRule,
+    /// A line the panel shows instead of the answer while it is pending.
+    pending: LineRule,
+    /// What an idle app prints for the question as if it were a prompt:
+    /// never a record.
+    echo: ?LineRule = null,
+    /// The answer is read once it has not changed for this long.
+    settle_ms: u32 = 1000,
 };
 
 /// When an app collapses typed input into a paste placeholder, and the
@@ -205,6 +226,28 @@ pub const WaitFor = enum {
     idle,
     /// The interaction showing when the recipe started is gone.
     answered,
+    /// The side panel shows the question the recipe typed last: the app
+    /// took it (the delivery evidence of a side question).
+    side_asked,
+    /// That question's answer is drawn and has settled.
+    side_answer,
+
+    /// Bounded by one step's wait, or (an answer the model is still
+    /// writing) by the whole call's deadline.
+    pub fn stepBounded(self: WaitFor) bool {
+        return switch (self) {
+            .ready, .choice, .idle, .answered, .side_asked => true,
+            .side_answer => false,
+        };
+    }
+
+    /// Needs the adapter's `screen.side_question`.
+    pub fn needsSidePanel(self: WaitFor) bool {
+        return switch (self) {
+            .side_asked, .side_answer => true,
+            .ready, .choice, .idle, .answered => false,
+        };
+    }
 };
 
 /// One step of an action recipe, run by the MCP layer. `text`, `command`
@@ -221,6 +264,9 @@ pub const Step = union(enum) {
     sleep_ms: u32,
     /// Keys that empty the input box, sent only when it is not empty.
     clear_input: []const []const u8,
+    /// Keys that close the side panel, sent only while its footer shows
+    /// (Claude Code's Escape interrupts a turn anywhere else).
+    close_side: []const []const u8,
     wait: WaitFor,
     /// Choose an option of the pending interaction by label or 1-based
     /// index (types its number).
@@ -247,6 +293,9 @@ pub const Actions = struct {
     interrupt: []const Step = &.{},
     set_model: []const Step = &.{},
     set_effort: []const Step = &.{},
+    /// `{text}` asked aside (`screen.side_question`): answered without a
+    /// turn, busy or idle; its `wait: side_answer` step reads the answer.
+    side_question: []const Step = &.{},
 };
 
 /// A settings file the user's own status command may be in, highest
@@ -351,6 +400,15 @@ pub const Screen = struct {
     queued: ?Matcher,
     text_options: []const TextOptionMatcher,
     resume_refused: ?Matcher,
+    side: ?SideMatchers,
+};
+
+pub const SideMatchers = struct {
+    spec: *const SideQuestion,
+    question: Matcher,
+    footer: Matcher,
+    pending: Matcher,
+    echo: ?Matcher,
 };
 
 pub const TextOptionMatcher = struct {
@@ -474,6 +532,13 @@ const Validator = struct {
                 l.screen = try self.screen(sc);
                 if ((sc.text_options.len == 0) != (s.actions.answer_text.len == 0))
                     return self.fail("screen.text_options and actions.answer_text go together (the recipe answers through the option the rules match)", .{});
+                if ((sc.side_question == null) != (s.actions.side_question.len == 0))
+                    return self.fail("screen.side_question and actions.side_question go together (the recipe reads its answer off the panel the screen rules find)", .{});
+                if (s.actions.side_question.len > 0) {
+                    var answers = false;
+                    for (s.actions.side_question) |st| answers = answers or (st == .wait and st.wait == .side_answer);
+                    if (!answers) return self.fail("actions.side_question needs a wait: side_answer step (it is what reads the answer)", .{});
+                }
             },
             .opencode_api => {
                 if (s.screen != null) return self.fail("source \"opencode_api\" takes no \"screen\" section", .{});
@@ -530,11 +595,14 @@ const Validator = struct {
                 commanded = true;
             },
             .key => |x| if (x.len == 0) return self.fail("{s}: empty key", .{where}),
-            .clear_input => |keys| {
-                if (keys.len == 0) return self.fail("{s}: clear_input names no key", .{where});
+            .clear_input, .close_side => |keys| {
+                if (keys.len == 0) return self.fail("{s}: {s} names no key", .{ where, @tagName(step) });
                 for (keys) |k| if (k.len == 0) return self.fail("{s}: empty key", .{where});
+                if (step == .close_side and !sidePanel(s)) return self.fail("{s}: close_side needs screen.side_question (it is sent only while that panel shows)", .{where});
             },
-            .sleep_ms, .wait => {},
+            .sleep_ms => {},
+            .wait => |w| if (w.needsSidePanel() and !sidePanel(s))
+                return self.fail("{s}: wait {s} needs screen.side_question", .{ where, @tagName(w) }),
             .confirm => |r| {
                 if (!commanded) return self.fail("{s}: confirm needs a command step before it (it looks below that command)", .{where});
                 _ = try self.rule(r, where, i);
@@ -568,6 +636,13 @@ const Validator = struct {
             if (p.lead_in.len == 0) return self.fail("screen.paste.lead_in is empty", .{});
             if (p.over_chars == 0) return self.fail("screen.paste.over_chars is 0", .{});
         }
+        const side: ?SideMatchers = if (sc.side_question) |*q| .{
+            .spec = q,
+            .question = try self.rule(q.question, "screen.side_question.question", null),
+            .footer = try self.rule(q.footer, "screen.side_question.footer", null),
+            .pending = try self.rule(q.pending, "screen.side_question.pending", null),
+            .echo = if (q.echo) |r| try self.rule(r, "screen.side_question.echo", null) else null,
+        } else null;
         return .{
             .spec = sc,
             .footer = if (sc.footer) |r| try self.rule(r, "screen.footer", null) else null,
@@ -581,6 +656,7 @@ const Validator = struct {
             .queued = if (sc.queued) |r| try self.rule(r, "screen.queued", null) else null,
             .text_options = texts,
             .resume_refused = if (sc.resume_refused) |r| try self.rule(r, "screen.resume_refused", null) else null,
+            .side = side,
         };
     }
 
@@ -607,6 +683,11 @@ const Validator = struct {
         }
     }
 };
+
+fn sidePanel(s: *const Spec) bool {
+    const sc = s.screen orelse return false;
+    return sc.side_question != null;
+}
 
 fn validEnvName(name: []const u8) bool {
     if (name.len == 0 or std.ascii.isDigit(name[0])) return false;
@@ -891,6 +972,38 @@ test "facts: only declared names, a status command needs a settings document and
     const own_cmd = try std.mem.replaceOwned(u8, t.allocator, ok, "\"type\": \"command\"", "\"command\": \"x\"");
     defer t.allocator.free(own_cmd);
     try expectProblem(own_cmd, "sets the command key");
+}
+
+test "a side question goes with its panel rules, reads its answer, and closes the panel only through them" {
+    const panel_rule = "\"choice_prompt\": { \"prefix\": \"Select with numbers\" }, \"side_question\": { \"question\": { \"prefix\": \"/btw \" }, \"footer\": { \"pattern\": \"^Esc to close$| · Esc to close$\" }, \"pending\": { \"pattern\": \"^Answering…$\" }, \"echo\": { \"prefix\": \"you: /btw \" } }";
+    const recipe = "{ \"key\": \"enter\" } ], \"side_question\": [ { \"text\": \"/btw {text}\" }, { \"key\": \"enter\" }, { \"wait\": \"side_asked\" }, { \"wait\": \"side_answer\" }, { \"close_side\": [\"escape\"] } ] },";
+    const with_panel = try std.mem.replaceOwned(u8, t.allocator, minimal, "\"choice_prompt\": { \"prefix\": \"Select with numbers\" }", panel_rule);
+    defer t.allocator.free(with_panel);
+    const both = try std.mem.replaceOwned(u8, t.allocator, with_panel, "{ \"key\": \"enter\" } ] },", recipe);
+    defer t.allocator.free(both);
+    var problem: ?[]u8 = null;
+    const l = try load(t.allocator, "demo.json", both, .user, &problem);
+    defer l.destroy(t.allocator);
+    const side = l.screen.?.side.?;
+    try t.expect(side.footer.matches("Esc to close"));
+    try t.expect(side.footer.matches("↑/↓ to scroll · c to copy · Esc to close"));
+    try t.expect(!side.footer.matches("press Esc to close"));
+    try t.expectEqual(@as(u32, 1000), side.spec.settle_ms);
+    try t.expect(side.echo.?.matches("you: /btw how far are you?"));
+
+    // Either half alone is refused.
+    try expectProblem(with_panel, "screen.side_question and actions.side_question go together");
+    const action_only = try std.mem.replaceOwned(u8, t.allocator, minimal, "{ \"key\": \"enter\" } ] },", recipe);
+    defer t.allocator.free(action_only);
+    try expectProblem(action_only, "side_asked needs screen.side_question");
+    // A recipe that never reads the answer.
+    const no_answer = try std.mem.replaceOwned(u8, t.allocator, both, "{ \"wait\": \"side_answer\" }, ", "");
+    defer t.allocator.free(no_answer);
+    try expectProblem(no_answer, "needs a wait: side_answer step");
+    // The panel's keys and waits only where a panel is declared.
+    const stray = try std.mem.replaceOwned(u8, t.allocator, minimal, "{ \"key\": \"enter\" } ] },", "{ \"key\": \"enter\" }, { \"wait\": \"side_answer\" } ] },");
+    defer t.allocator.free(stray);
+    try expectProblem(stray, "wait side_answer needs screen.side_question");
 }
 
 test "expand fills known placeholders and leaves other braces alone" {

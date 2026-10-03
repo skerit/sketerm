@@ -1587,10 +1587,49 @@ fn waitStep(e: *Entry, what: adapter.WaitFor, asked: ?u64, deadline: i64) bool {
             .choice => e.agent.interaction() != null,
             .idle => e.agent.state() == .idle,
             .answered => if (e.agent.interaction()) |it| asked == null or it.hash() != asked.? else true,
+            // `runStepsIn` waits for these itself (they read the panel).
+            .side_asked, .side_answer => return false,
         };
         if (met) return true;
         if (gone(e) or clock.nowMs() >= deadline) return false;
         pump(deadline - clock.nowMs());
+    }
+}
+
+/// Wait (at most `DELIVERY_CONFIRM_MS`, the bound every send's evidence
+/// gets) until the side panel names the question typed as `asked`.
+fn waitSideAsked(arena: std.mem.Allocator, e: *Entry, asked: []const u8) !bool {
+    const eng = &e.agent.source.screen;
+    const until = clock.nowMs() + DELIVERY_CONFIRM_MS;
+    service(clock.nowMs());
+    while (true) {
+        if (try eng.sideAnswer(arena, asked) != null) return true;
+        if (gone(e) or clock.nowMs() >= until) return false;
+        pump(until - clock.nowMs());
+    }
+}
+
+/// The answer to `asked` once it is drawn (not pending, not empty) and has
+/// not changed for the adapter's `side_question.settle_ms`, owned by
+/// `arena`; null at the deadline.
+fn waitSideAnswer(arena: std.mem.Allocator, e: *Entry, asked: []const u8, deadline: i64) !?[]const u8 {
+    const eng = &e.agent.source.screen;
+    const settle: i64 = if (eng.sc.side) |sd| sd.spec.settle_ms else 0;
+    var last: ?[]const u8 = null;
+    var since: i64 = 0;
+    service(clock.nowMs());
+    while (true) {
+        const now = clock.nowMs();
+        const got = try eng.sideAnswer(arena, asked);
+        if (got != null and !got.?.pending and got.?.text.len > 0) {
+            if (last == null or !std.mem.eql(u8, last.?, got.?.text)) {
+                last = got.?.text;
+                since = now;
+            } else if (now - since >= settle) return last;
+        } else last = null;
+        if (gone(e) or now >= deadline) return null;
+        // Wake for the settle bound even when the screen is quiet.
+        pump(@min(deadline - now, 100));
     }
 }
 
@@ -3882,6 +3921,11 @@ const Outcome = struct {
     confirmation: ?[]const u8 = null,
     /// The app was restarted with the change (a recipe's `relaunch`).
     relaunched: bool = false,
+    /// A side question's answer (a recipe's `wait: side_answer`), owned by
+    /// the call's arena.
+    answer: ?[]const u8 = null,
+    /// A recipe's `close_side` closed the panel (false: it still shows).
+    side_closed: ?bool = null,
 };
 
 /// Take `action` through the agent's source: an API call, or the
@@ -3893,7 +3937,8 @@ fn act(arena: std.mem.Allocator, e: *Entry, action: agent_mod.Action, deadline: 
     // here on what it shows is news.
     switch (action) {
         .submit, .queue, .answer, .answer_text => closeHistory(e),
-        .interrupt, .set_model, .set_effort => {},
+        // A side question leaves no trace in the conversation.
+        .interrupt, .set_model, .set_effort, .side_question => {},
     }
     switch (e.agent.driver()) {
         .opencode_api => |d| {
@@ -3938,6 +3983,8 @@ fn apiFail(arena: std.mem.Allocator, api: *opencode.Api, err: anyerror) !Fail {
 const Run = struct {
     /// The adapter command typed last (`confirm` looks below it).
     command: ?[]const u8 = null,
+    /// The text typed last (`wait: side_asked` looks for it in the panel).
+    typed: ?[]const u8 = null,
 };
 
 /// Run recipe `steps` (of `action`, or the exit recipe for null) against
@@ -3947,6 +3994,14 @@ fn runSteps(arena: std.mem.Allocator, e: *Entry, action: ?agent_mod.Action, step
     var run: Run = .{};
     const result = try runStepsIn(arena, e, action, steps, deadline, &run);
     const eng = &e.agent.source.screen;
+    // A recipe that fails with the side panel it opened still showing
+    // closes it (its close_side keys are safe exactly then): a panel left
+    // open would take every key typed at the agent afterwards.
+    if (result == .fail and eng.sideOpen() and e.visibleTerm() != null) {
+        for (steps) |st| if (st == .close_side) {
+            _ = try runStepsIn(arena, e, action, &.{st}, clock.nowMs() + STEP_WAIT_MS, &run);
+        };
+    }
     if (run.command != null) {
         if (result == .fail and e.agent.interaction() != null and e.visibleTerm() != null) {
             if (e.loaded.spec.actions.interrupt.len > 0) {
@@ -3972,7 +4027,10 @@ fn runStepsIn(arena: std.mem.Allocator, e: *Entry, action: ?agent_mod.Action, st
         const t = e.visibleTerm() orelse return gone_fail;
         const step_deadline = @min(deadline, clock.nowMs() + STEP_WAIT_MS);
         switch (step) {
-            .text => |s| t.sendText(s) catch return gone_fail,
+            .text => |s| {
+                t.sendText(s) catch return gone_fail;
+                run.typed = s;
+            },
             .command => |s| {
                 try d.engine.beginCommand(s);
                 run.command = s;
@@ -3990,8 +4048,30 @@ fn runStepsIn(arena: std.mem.Allocator, e: *Entry, action: ?agent_mod.Action, st
                     pumpFor(CLEAR_SETTLE_MS);
                 }
             },
-            .wait => |w| if (!waitStep(e, w, asked, step_deadline))
-                return .{ .fail = .{ .code = .timeout, .msg = try std.fmt.allocPrint(arena, "the agent did not become {s} while running its {s} recipe; the screen shows:\n{s}", .{ @tagName(w), what, try screenTail(arena, e) }) } },
+            .close_side => |ks| {
+                service(clock.nowMs());
+                if (d.sideOpen()) {
+                    for (ks) |k| {
+                        t.sendKeys(k) catch |err| return .{ .fail = try keyFail(arena, err, k) };
+                        pumpFor(50);
+                    }
+                    const until = clock.nowMs() + STEP_WAIT_MS;
+                    while (d.sideOpen() and !gone(e) and clock.nowMs() < until) pump(until - clock.nowMs());
+                }
+                out.side_closed = !d.sideOpen();
+            },
+            .wait => |w| switch (w) {
+                .side_asked => if (!try waitSideAsked(arena, e, run.typed orelse "")) return .{ .fail = .{
+                    .code = .not_delivered,
+                    .msg = try std.fmt.allocPrint(arena, "agent {s} did not take the side question: its panel did not show it within {d} ms after it was typed (state {s}); it is NOT delivered and was not typed again; the screen shows:\n{s}", .{ e.id, DELIVERY_CONFIRM_MS, @tagName(e.agent.state()), try screenTail(arena, e) }),
+                } },
+                .side_answer => out.answer = (try waitSideAnswer(arena, e, run.typed orelse "", if (w.stepBounded()) step_deadline else deadline)) orelse return .{ .fail = .{
+                    .code = .timeout,
+                    .msg = try std.fmt.allocPrint(arena, "agent {s} took the side question but showed no settled answer in time; the screen shows:\n{s}", .{ e.id, try screenTail(arena, e) }),
+                } },
+                .ready, .choice, .idle, .answered => if (!waitStep(e, w, asked, if (w.stepBounded()) step_deadline else deadline))
+                    return .{ .fail = .{ .code = .timeout, .msg = try std.fmt.allocPrint(arena, "the agent did not become {s} while running its {s} recipe; the screen shows:\n{s}", .{ @tagName(w), what, try screenTail(arena, e) }) } },
+            },
             .pick => |choice| {
                 service(clock.nowMs());
                 var nb: [16]u8 = undefined;
@@ -4049,7 +4129,7 @@ fn relaunch(arena: std.mem.Allocator, e: *Entry, action: agent_mod.Action, deadl
     switch (action) {
         .set_effort => |x| effort = x,
         .set_model => |x| model = x,
-        .submit, .queue, .answer, .answer_text, .interrupt => return .{ .fail = .{ .code = .refused, .msg = "the adapter relaunches for an action that is no launch value" } },
+        .submit, .queue, .answer, .answer_text, .interrupt, .side_question => return .{ .fail = .{ .code = .refused, .msg = "the adapter relaunches for an action that is no launch value" } },
     }
     // A conversation with a turn is resumed; an empty one starts afresh
     // under a new id (the old id may already be taken by the app).
@@ -4156,7 +4236,7 @@ fn noteSetting(arena: std.mem.Allocator, e: *Entry, action: agent_mod.Action, o:
                     break :blk try std.fmt.allocPrint(arena, "model set to {s} for this session{s}{s}", .{ m, if (o.confirmation != null) ": " else "", o.confirmation orelse "" });
                 },
                 .set_effort => |x| try std.fmt.allocPrint(arena, "effort set to {s} for this session{s}", .{ x, if (o.relaunched) " (the app was restarted with it and the conversation resumed)" else "" }),
-                .submit, .queue, .answer, .answer_text, .interrupt => return,
+                .submit, .queue, .answer, .answer_text, .interrupt, .side_question => return,
             };
             try eng.addNotice(text);
             writeDescriptor(e);
@@ -6137,7 +6217,10 @@ test "agent_adapters and agent_list speak both lanes" {
         if (!std.mem.eql(u8, item.object.get("id").?.string, "opencode")) continue;
         saw_opencode = true;
         try testing.expectEqualStrings("opencode_api", item.object.get("source").?.string);
-        try testing.expectEqual(@as(usize, std.enums.values(agent_mod.ActionKind).len), item.object.get("actions").?.array.items.len);
+        // Every action but a side question, which its API has no route for.
+        const acts = item.object.get("actions").?.array.items;
+        try testing.expectEqual(@as(usize, std.enums.values(agent_mod.ActionKind).len - 1), acts.len);
+        for (acts) |x| try testing.expect(!std.mem.eql(u8, x.string, "side_question"));
     }
     try testing.expect(saw_opencode);
     const ls = try mcp.expectToolResultShape(a, "agent_list", try rig.call(.agent_list, "{}"));

@@ -29,9 +29,12 @@ pub const Class = union(enum) {
 };
 
 /// Record rules win over chrome; footer, subagent, background,
-/// choice-prompt and permission lines are chrome without being listed as such.
+/// choice-prompt and permission lines are chrome without being listed as
+/// such. A side question's echo wins over the records: it looks exactly
+/// like a prompt and never is one.
 pub fn classify(sc: *const adapter.Screen, line: Line) Class {
     if (line.live) return .chrome;
+    if (sc.side) |s| if (s.echo) |m| if (m.matches(line.text)) return .chrome;
     for (sc.records, 0..) |r, i| {
         if (r.matcher.matches(line.text)) return .{ .record = i };
     }
@@ -48,6 +51,8 @@ pub fn isChrome(sc: *const adapter.Screen, text: []const u8) bool {
             if (m.matches(text)) return true;
         }
     }
+    // The side panel's footer, so the panel is never counted as status rows.
+    if (sc.side) |s| if (s.footer.matches(text)) return true;
     return sc.choice_prompt.matches(text);
 }
 
@@ -322,6 +327,102 @@ pub fn markQueued(sc: *const adapter.Screen, lines: []Line, input: usize) u32 {
     }
     for (lines[top..i]) |*l| l.live = true;
     return n;
+}
+
+// ── side questions ───────────────────────────────────────────────
+
+/// The side panel's rows: its topmost question line to its footer.
+pub const SidePanel = struct {
+    top: usize,
+    footer: usize,
+
+    pub fn contains(self: SidePanel, row: usize) bool {
+        return row >= self.top and row <= self.footer;
+    }
+};
+
+/// The side panel showing, or null: its footer is the last non-blank line
+/// that is not live (a busy app keeps its status block and input below
+/// it), with a question line above it. Earlier questions and their wrapped
+/// lines are part of it; text above the topmost question is not.
+pub fn findSidePanel(sc: *const adapter.Screen, lines: []const Line) ?SidePanel {
+    const s = sc.side orelse return null;
+    var f = lines.len;
+    while (f > 0) {
+        f -= 1;
+        if (lines[f].live or lines[f].text.len == 0) continue;
+        break;
+    } else return null;
+    if (!s.footer.matches(lines[f].text)) return null;
+    // The nearest question above the footer; the answer between them may
+    // look like anything (a blank line, a spinner-shaped word).
+    var q = f;
+    while (q > 0) {
+        q -= 1;
+        if (s.question.matches(lines[q].text)) break;
+    } else return null;
+    var top = q;
+    var k = q;
+    while (k > 0) {
+        k -= 1;
+        if (s.question.matches(lines[k].text)) {
+            top = k;
+            continue;
+        }
+        if (lines[k].text.len == 0 or classify(sc, lines[k]) != .text) break;
+    }
+    return .{ .top = top, .footer = f };
+}
+
+pub const SideAnswer = struct {
+    /// Allocated from the caller's allocator; "" while nothing is drawn.
+    text: []u8,
+    /// The panel still says the answer is coming.
+    pending: bool,
+};
+
+/// The answer to `asked` (the typed line, `/btw ...`) in `panel`: the rows
+/// after the LAST question line(s) spelling it (compared by alphanumerics,
+/// so a wrapped question matches) up to the footer. Null when the panel
+/// names no such question.
+pub fn sideAnswer(alloc: std.mem.Allocator, sc: *const adapter.Screen, lines: []const Line, panel: SidePanel, asked: []const u8) !?SideAnswer {
+    const s = sc.side orelse return null;
+    var after: ?usize = null;
+    var i = panel.top;
+    while (i < panel.footer) : (i += 1) {
+        if (!s.question.matches(lines[i].text)) continue;
+        if (spells(lines[i..panel.footer], asked)) |n| after = i + n;
+    }
+    const first = after orelse return null;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+    var pending = false;
+    for (lines[first..panel.footer], first..) |l, row| {
+        if (s.pending.matches(l.text)) {
+            pending = true;
+            continue;
+        }
+        if (row > first and !lines[row - 1].joins_next) try buf.append(alloc, '\n');
+        try buf.appendSlice(alloc, l.text);
+    }
+    return .{ .text = try alloc.dupe(u8, std.mem.trim(u8, buf.items, " \n")), .pending = pending };
+}
+
+/// How many of `rows` (from the first) spell exactly `text`'s lowercase
+/// alphanumerics, the last of them ending with it; null when they do not.
+fn spells(rows: []const Line, text: []const u8) ?usize {
+    var at: usize = 0;
+    for (rows, 1..) |r, n| {
+        for (r.text) |ch| {
+            if (!std.ascii.isAlphanumeric(ch)) continue;
+            while (at < text.len and !std.ascii.isAlphanumeric(text[at])) at += 1;
+            if (at == text.len or std.ascii.toLower(ch) != std.ascii.toLower(text[at])) return null;
+            at += 1;
+        }
+        while (at < text.len and !std.ascii.isAlphanumeric(text[at])) at += 1;
+        if (at == text.len) return n;
+    }
+    return null;
 }
 
 // ── interactions ─────────────────────────────────────────────────
@@ -868,4 +969,117 @@ test "prompt keys ignore wrapping and truncation" {
     defer t.allocator.free(b);
     try t.expect(samePrompt(a, b));
     try t.expect(!samePrompt(a, ""));
+}
+
+// Claude Code 2.1.288 `--ax-screen-reader`, `/btw` measured on 2026-10-03
+// (term-6.cast): busy below a running foreground command, then idle.
+const BTW_BUSY = "/btw what are you doing right now?";
+const BTW_IDLE = "/btw which command did you just run?";
+
+test "side panel: a busy agent's answered panel below its turn, never status rows or records" {
+    var set = adapter.Set.init(t.allocator);
+    defer set.deinit();
+    try set.loadShipped();
+    const sc = &set.get("claude").?.screen.?;
+    const lines = try mk(&.{
+        "you: Run this exact command with Bash in the FOREGROUND (not in the background), wait for it, then reply with the word",
+        "finished: python3 -c \"import time; time.sleep(40)\"",
+        "tool: Bash (python3 -c \"import time; time.sleep(40)\")",
+        "Running…  (13s)",
+        "(ctrl+b to run in background)",
+        "Grooving…",
+        BTW_BUSY,
+        "I'm answering your side question. The main agent is running the python3 -c \"import time; time.sleep(40)\" command in the",
+        "foreground and waiting for it to complete.",
+        "↑/↓ to scroll · c to copy · f to fork · Esc to close",
+        "[Haiku 4.5]",
+        "[■■■■■□□□□□] 14% | 172k free | 0h 0m | $0.02 | 5h:0% 7d:98%",
+        "manual mode on",
+        "$",
+    });
+    defer t.allocator.free(lines);
+    const input = findInput(sc, lines, 8).?;
+    // The footer is chrome: the status block is its two rows, not the panel.
+    try t.expectEqual(@as(?usize, 2), measureStatusRows(sc, lines, input, 10));
+    markLive(sc, lines, input, 2);
+    const p = findSidePanel(sc, lines).?;
+    try t.expectEqual(@as(usize, 6), p.top);
+    try t.expectEqual(@as(usize, 9), p.footer);
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const ans = (try sideAnswer(a, sc, lines, p, BTW_BUSY)).?;
+    try t.expect(!ans.pending);
+    try t.expectEqualStrings("I'm answering your side question. The main agent is running the python3 -c \"import time; time.sleep(40)\" command in the\nforeground and waiting for it to complete.", ans.text);
+    // A question the panel does not name has no answer there.
+    try t.expect((try sideAnswer(a, sc, lines, p, "/btw how far are you?")) == null);
+    // The panel rows marked live, as the engine does: the turn's records only.
+    for (lines[p.top .. p.footer + 1]) |*l| l.live = true;
+    const recs = try parseRecords(a, sc, lines);
+    try t.expectEqual(@as(usize, 2), recs.len);
+    try t.expectEqual(vocab.RecordKind.tool, recs[1].kind);
+    for (recs) |r| try t.expect(std.mem.indexOf(u8, r.text, "side question") == null);
+
+    // Before the answer: "Answering…" over the bare footer.
+    const asking = try mk(&.{ "Grooving…", BTW_BUSY, "Answering…", "Esc to close", "[Haiku 4.5]", "[■■□□] 14%", "manual mode on", "$" });
+    defer t.allocator.free(asking);
+    markLive(sc, asking, 7, 2);
+    const pa = findSidePanel(sc, asking).?;
+    const pending = (try sideAnswer(a, sc, asking, pa, BTW_BUSY)).?;
+    try t.expect(pending.pending);
+    try t.expectEqualStrings("", pending.text);
+    // No panel: a footer-shaped line that is not last, or no question above it.
+    const none = try mk(&.{ "claude: press Esc to close", "manual mode on", "$" });
+    defer t.allocator.free(none);
+    try t.expect(findSidePanel(sc, none) == null);
+}
+
+test "side panel: an idle agent's panel lists earlier questions; its echo is never a prompt" {
+    var set = adapter.Set.init(t.allocator);
+    defer set.deinit();
+    try set.loadShipped();
+    const sc = &set.get("claude").?.screen.?;
+    const lines = try mk(&.{
+        "you: Run this exact command, then reply with the word finished",
+        "tool: Bash (python3 -c \"import time; time.sleep(40)\")",
+        "claude: finished",
+        "Baked for 43s · done 4:31 PM",
+        "you: " ++ BTW_IDLE,
+        BTW_BUSY,
+        BTW_IDLE,
+        "I ran: python3 -c \"import time; time.sleep(40)\"",
+        "",
+        "It's a Python command that sleeps for 40 seconds.",
+        "⇧←/→ to browse · c to copy · f to fork · x to clear history · Esc to close",
+    });
+    defer t.allocator.free(lines);
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Even unmarked, the echo is chrome and the panel text after it is
+    // dropped: the transcript is the turn, never `/btw`.
+    const raw = try parseRecords(a, sc, lines);
+    try t.expectEqual(@as(usize, 3), raw.len);
+    try t.expectEqualStrings("finished", raw[2].text);
+    // The panel replaced the input box.
+    try t.expect(findInput(sc, lines, 8) == null);
+    const p = findSidePanel(sc, lines).?;
+    try t.expectEqual(@as(usize, 5), p.top);
+    try t.expectEqual(@as(usize, 10), p.footer);
+    // Ours is the last question: its answer keeps its blank line.
+    const ans = (try sideAnswer(a, sc, lines, p, BTW_IDLE)).?;
+    try t.expect(!ans.pending);
+    try t.expectEqualStrings("I ran: python3 -c \"import time; time.sleep(40)\"\n\nIt's a Python command that sleeps for 40 seconds.", ans.text);
+    // The same question asked again: the newest copy answers.
+    const twice = try mk(&.{ BTW_IDLE, "old answer", BTW_IDLE, "new answer", "Esc to close" });
+    defer t.allocator.free(twice);
+    try t.expectEqualStrings("new answer", (try sideAnswer(a, sc, twice, findSidePanel(sc, twice).?, BTW_IDLE)).?.text);
+    // A question the panel wrapped onto a second row still matches.
+    const wrapped = try mk(&.{ "Grooving…", "/btw how far along are you with the", "screen engine refactor?", "About halfway.", "Esc to close" });
+    defer t.allocator.free(wrapped);
+    const pw = findSidePanel(sc, wrapped).?;
+    try t.expectEqual(@as(usize, 1), pw.top);
+    try t.expectEqualStrings("About halfway.", (try sideAnswer(a, sc, wrapped, pw, "/btw how far along are you with the screen engine refactor?")).?.text);
+    // An earlier, longer question that merely starts like ours is not ours.
+    try t.expect((try sideAnswer(a, sc, wrapped, pw, "/btw how far along are you")) == null);
 }
