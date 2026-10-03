@@ -38,6 +38,7 @@ const wire = @import("../wlhost/wire.zig");
 const xkblayout = @import("../ipc/xkblayout.zig");
 const clock = @import("../util/clock.zig");
 const platform = @import("../util/platform.zig");
+const scmrights = @import("../util/scmrights.zig");
 
 /// The environment flag that arms the presenter. Set by webdrive for a
 /// session-mode helper; nothing else may set it.
@@ -499,17 +500,11 @@ pub const Presenter = struct {
         if (!self.flushOutBlocking()) return false;
         var iov = c.struct_iovec{ .iov_base = @constCast(msg.ptr), .iov_len = msg.len };
         var cbuf: [32]u8 align(@alignOf(c.struct_cmsghdr)) = std.mem.zeroes([32]u8);
-        const hdr_size: usize = @sizeOf(c.struct_cmsghdr);
-        const cmsg: *c.struct_cmsghdr = @ptrCast(&cbuf);
-        cmsg.cmsg_len = @intCast(hdr_size + @sizeOf(c_int));
-        cmsg.cmsg_level = c.SOL_SOCKET;
-        cmsg.cmsg_type = c.SCM_RIGHTS;
-        @memcpy(cbuf[hdr_size..][0..@sizeOf(c_int)], std.mem.asBytes(&fd));
         var mh = std.mem.zeroes(c.struct_msghdr);
         mh.msg_iov = @ptrCast(&iov);
         mh.msg_iovlen = 1;
         mh.msg_control = &cbuf;
-        mh.msg_controllen = @intCast(std.mem.alignForward(usize, hdr_size + @sizeOf(c_int), @sizeOf(usize)));
+        mh.msg_controllen = @intCast(scmrights.pack(&cbuf, &.{fd}));
         const deadline = clock.nowMs() + FLUSH_MS;
         while (true) {
             const n = c.sendmsg(self.fd, &mh, if (@hasDecl(c, "MSG_NOSIGNAL")) c.MSG_NOSIGNAL else 0);
@@ -538,14 +533,7 @@ pub const Presenter = struct {
         var rounds: u8 = 0;
         while (rounds < 8) : (rounds += 1) {
             var data: [16384]u8 = undefined;
-            var cbuf: [256]u8 align(@alignOf(c.struct_cmsghdr)) = undefined;
-            var iov = c.struct_iovec{ .iov_base = &data, .iov_len = data.len };
-            var mh = std.mem.zeroes(c.struct_msghdr);
-            mh.msg_iov = @ptrCast(&iov);
-            mh.msg_iovlen = 1;
-            mh.msg_control = &cbuf;
-            mh.msg_controllen = cbuf.len;
-            const r = c.recvmsg(self.fd, &mh, 0);
+            const r = scmrights.recv(self.fd, &data, self.gpa, &self.in_fds);
             if (r < 0) {
                 const e = std.posix.errno(r);
                 if (e == .AGAIN) return true;
@@ -553,40 +541,10 @@ pub const Presenter = struct {
                 return self.disarm("display read failed");
             }
             if (r == 0) return self.disarm("the display went away");
-            self.collectFds(&mh);
             self.inbuf.appendSlice(self.gpa, data[0..@intCast(r)]) catch return self.disarm("oom");
             if (@as(usize, @intCast(r)) < data.len) return true;
         }
         return true;
-    }
-
-    /// Hand-rolled CMSG walk (the CMSG_* macros do not survive
-    /// translate-c): on 64-bit glibc and musl the header is 16 bytes and
-    /// data follows it directly.
-    fn collectFds(self: *Presenter, mh: *const c.struct_msghdr) void {
-        const ctl: [*]const u8 = @ptrCast(mh.msg_control orelse return);
-        const clen: usize = @intCast(mh.msg_controllen);
-        const hdr_size: usize = @sizeOf(c.struct_cmsghdr);
-        const alignment: usize = @sizeOf(usize);
-        var off: usize = 0;
-        while (off + hdr_size <= clen) {
-            const hdr: *const c.struct_cmsghdr = @ptrCast(@alignCast(ctl + off));
-            const cl: usize = @intCast(hdr.cmsg_len);
-            if (cl < hdr_size or off + cl > clen) break;
-            if (hdr.cmsg_level == c.SOL_SOCKET and hdr.cmsg_type == c.SCM_RIGHTS) {
-                const n_fds = (cl - hdr_size) / @sizeOf(c_int);
-                var i: usize = 0;
-                while (i < n_fds) : (i += 1) {
-                    var fd: c_int = undefined;
-                    @memcpy(std.mem.asBytes(&fd), ctl[off + hdr_size + i * @sizeOf(c_int) ..][0..@sizeOf(c_int)]);
-                    _ = c.fcntl(fd, c.F_SETFD, c.FD_CLOEXEC);
-                    self.in_fds.append(self.gpa, fd) catch {
-                        _ = c.close(fd);
-                    };
-                }
-            }
-            off += (cl + alignment - 1) & ~(alignment - 1);
-        }
     }
 
     fn takeFd(self: *Presenter) ?c_int {

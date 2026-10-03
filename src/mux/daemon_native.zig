@@ -18,6 +18,7 @@ const Session = dmod.Session;
 const Channel = dmod.Channel;
 const Native = dmod.Native;
 const nowMs = @import("../util/clock.zig").nowMs;
+const scmrights = @import("../util/scmrights.zig");
 const dmabuf_egl = @import("dmabuf_egl.zig");
 const wlproto = @import("../wlhost/protocol.zig");
 const wlcomp = @import("../wlhost/compositor.zig");
@@ -37,17 +38,9 @@ pub fn nativeReadable(self: *Daemon, ch: *Channel) void {
     var rounds: u8 = 0;
     while (rounds < 4) : (rounds += 1) {
         var data: [16384]u8 = undefined;
-        var cbuf: [256]u8 align(@alignOf(c.struct_cmsghdr)) = undefined;
-        var iov = c.struct_iovec{ .iov_base = &data, .iov_len = data.len };
-        var mh = std.mem.zeroes(c.struct_msghdr);
-        mh.msg_iov = @ptrCast(&iov);
-        mh.msg_iovlen = 1;
-        mh.msg_control = &cbuf;
-        mh.msg_controllen = cbuf.len;
-        // No MSG_CMSG_CLOEXEC: Darwin lacks it, and the daemon
-        // is single-threaded — collectFds sets FD_CLOEXEC before
-        // anything can fork.
-        const r = c.recvmsg(ch.fd, &mh, 0);
+        // The daemon is single-threaded, so the FD_CLOEXEC that
+        // scmrights sets lands before anything can fork.
+        const r = scmrights.recv(ch.fd, &data, nv.allocator, &nv.fds);
         if (r < 0) {
             if (std.posix.errno(r) != .AGAIN) self.closeChannel(ch, true);
             break;
@@ -56,7 +49,6 @@ pub fn nativeReadable(self: *Daemon, ch: *Channel) void {
             self.closeChannel(ch, true);
             break;
         }
-        collectFds(nv, &mh);
         nv.inbuf.appendSlice(nv.allocator, data[0..@intCast(r)]) catch {
             self.closeChannel(ch, true);
             return;
@@ -64,36 +56,6 @@ pub fn nativeReadable(self: *Daemon, ch: *Channel) void {
         if (@as(usize, @intCast(r)) < data.len) break;
     }
     if (!ch.dead) nativeProcess(self, ch);
-}
-
-/// Hand-rolled CMSG walk (the CMSG_* macros don't survive
-/// translate-c). On both 64-bit glibc and musl the cmsghdr is 16
-/// bytes and CMSG_ALIGN(sizeof cmsghdr) == sizeof cmsghdr, so
-/// data follows the header directly.
-pub fn collectFds(nv: *Native, mh: *const c.struct_msghdr) void {
-    const ctl: [*]const u8 = @ptrCast(mh.msg_control orelse return);
-    const clen: usize = @intCast(mh.msg_controllen);
-    const hdr_size: usize = @sizeOf(c.struct_cmsghdr);
-    const alignment: usize = @sizeOf(usize);
-    var off: usize = 0;
-    while (off + hdr_size <= clen) {
-        const hdr: *const c.struct_cmsghdr = @ptrCast(@alignCast(ctl + off));
-        const cl: usize = @intCast(hdr.cmsg_len);
-        if (cl < hdr_size or off + cl > clen) break;
-        if (hdr.cmsg_level == c.SOL_SOCKET and hdr.cmsg_type == c.SCM_RIGHTS) {
-            const n_fds = (cl - hdr_size) / @sizeOf(c_int);
-            var i: usize = 0;
-            while (i < n_fds) : (i += 1) {
-                var fd: c_int = undefined;
-                @memcpy(std.mem.asBytes(&fd), ctl[off + hdr_size + i * @sizeOf(c_int) ..][0..@sizeOf(c_int)]);
-                _ = c.fcntl(fd, c.F_SETFD, c.FD_CLOEXEC);
-                nv.fds.append(nv.allocator, fd) catch {
-                    _ = c.close(fd);
-                };
-            }
-        }
-        off += (cl + alignment - 1) & ~(alignment - 1);
-    }
 }
 
 /// Peel complete Wayland messages off the reassembly buffer,

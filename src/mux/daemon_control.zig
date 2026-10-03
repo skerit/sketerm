@@ -662,15 +662,8 @@ pub fn controlSend(fd: c_int, bytes: []const u8, pass_fd: c_int) bool {
     mh.msg_iov = @ptrCast(&iov);
     mh.msg_iovlen = 1;
     if (pass_fd >= 0) {
-        const hdr_size: usize = @sizeOf(c.struct_cmsghdr);
-        const cmsg: *c.struct_cmsghdr = @ptrCast(&cbuf);
-        cmsg.cmsg_len = @intCast(hdr_size + @sizeOf(c_int));
-        cmsg.cmsg_level = c.SOL_SOCKET;
-        cmsg.cmsg_type = c.SCM_RIGHTS;
-        @memcpy(cbuf[hdr_size..][0..@sizeOf(c_int)], std.mem.asBytes(&pass_fd));
         mh.msg_control = &cbuf;
-        const space = (cmsg.cmsg_len + @sizeOf(usize) - 1) & ~@as(usize, @sizeOf(usize) - 1);
-        mh.msg_controllen = @intCast(space);
+        mh.msg_controllen = @intCast(@import("../util/scmrights.zig").pack(&cbuf, &.{pass_fd}));
     }
     var flags: c_int = 0;
     if (comptime @hasDecl(c, "MSG_NOSIGNAL")) flags |= c.MSG_NOSIGNAL;

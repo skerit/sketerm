@@ -313,6 +313,7 @@ comptime {
     _ = @import("util/dirsweep.zig");
     _ = @import("util/ocr.zig");
     _ = @import("util/pathz.zig");
+    _ = @import("util/scmrights.zig");
     _ = @import("util/readfile.zig");
     _ = @import("util/fdio.zig");
     _ = @import("util/b64.zig");

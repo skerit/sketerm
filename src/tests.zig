@@ -39,6 +39,7 @@ comptime {
     _ = @import("util/headers.zig");
     _ = @import("util/glob.zig");
     _ = @import("util/pathz.zig");
+    _ = @import("util/scmrights.zig");
     _ = @import("util/readfile.zig");
     _ = @import("util/fdio.zig");
     _ = @import("util/b64.zig");

@@ -4785,21 +4785,12 @@ pub const Daemon = struct {
             .iov_base = ch.pending.items.ptr,
             .iov_len = ch.pending.items.len,
         };
-        const hdr_size: usize = @sizeOf(c.struct_cmsghdr);
         var cbuf: [128]u8 align(@alignOf(c.struct_cmsghdr)) = std.mem.zeroes([128]u8);
-        const cmsg: *c.struct_cmsghdr = @ptrCast(&cbuf);
-        cmsg.cmsg_len = @intCast(hdr_size + n_fds * @sizeOf(c_int));
-        cmsg.cmsg_level = c.SOL_SOCKET;
-        cmsg.cmsg_type = c.SCM_RIGHTS;
-        for (nv.out_fds.items[0..n_fds], 0..) |fd, i| {
-            @memcpy(cbuf[hdr_size + i * @sizeOf(c_int) ..][0..@sizeOf(c_int)], std.mem.asBytes(&fd));
-        }
         var mh = std.mem.zeroes(c.struct_msghdr);
         mh.msg_iov = @ptrCast(&iov);
         mh.msg_iovlen = 1;
         mh.msg_control = &cbuf;
-        const space = (cmsg.cmsg_len + @sizeOf(usize) - 1) & ~@as(usize, @sizeOf(usize) - 1);
-        mh.msg_controllen = @intCast(space);
+        mh.msg_controllen = @intCast(@import("../util/scmrights.zig").pack(&cbuf, nv.out_fds.items[0..n_fds]));
         const r = c.sendmsg(ch.fd, &mh, 0);
         if (r > 0) {
             // Kernel duplicated them into the receiver's queue.
@@ -4813,7 +4804,6 @@ pub const Daemon = struct {
     const daemon_native = @import("daemon_native.zig");
     pub const nativeClientData = daemon_native.nativeClientData;
     const nativeReadable = daemon_native.nativeReadable;
-    const collectFds = daemon_native.collectFds;
     const nativeProcess = daemon_native.nativeProcess;
     const flushBrain = daemon_native.flushBrain;
     const flushPendingBrains = daemon_native.flushPendingBrains;
