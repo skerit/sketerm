@@ -25,6 +25,7 @@ const wire = @import("../mux/wire.zig");
 const store = @import("../filebrowser/transfers.zig");
 const transfer = @import("../filebrowser/transfer.zig");
 const xferqueue = @import("../filebrowser/xferqueue.zig");
+const open = @import("browser/open.zig");
 const pathz = @import("../util/pathz.zig");
 const cast = @import("../util/cast.zig");
 const nowMs = @import("../util/clock.zig").nowMs;
@@ -1398,7 +1399,7 @@ pub const Service = struct {
         }
         if (!self.retire(it)) return;
         if (it.kind == .download) {
-            if (it.app_id.len > 0) launchWithApp(it.app_id, it.dst_path) else launchDefault(it.dst_path);
+            if (it.app_id.len > 0) open.launchLocalWithApp(it.app_id, it.dst_path) else open.launchLocal(it.dst_path);
             self.notify("download complete: {s}", .{std.fs.path.basename(it.dst_path)});
         } else if (self.watchByToken(it.watch_token)) |w| {
             self.notify("synced back: {s}", .{std.fs.path.basename(w.remote_path)});
@@ -1505,7 +1506,7 @@ pub const Service = struct {
             // size and timestamps. Never replace it implicitly; opening
             // the existing local copy is the only lossless choice.
             if (current != null) {
-                if (app_id) |id| launchWithApp(id, w.cache_path) else launchDefault(w.cache_path);
+                if (app_id) |id| open.launchLocalWithApp(id, w.cache_path) else open.launchLocal(w.cache_path);
                 if (w.dirty_generation > w.synced_generation)
                     self.notify("opened local edits while sync-back is pending: {s}", .{std.fs.path.basename(w.cache_path)})
                 else
@@ -1521,7 +1522,7 @@ pub const Service = struct {
         }
         if (self.foreignWatchCache(self.allocator, host, remote_path)) |cached| {
             defer self.allocator.free(cached);
-            if (app_id) |id| launchWithApp(id, cached) else launchDefault(cached);
+            if (app_id) |id| open.launchLocalWithApp(id, cached) else open.launchLocal(cached);
             self.notify("opened the copy another sketerm window already holds: {s}", .{std.fs.path.basename(cached)});
             return;
         }
@@ -3870,38 +3871,6 @@ pub fn release(service: *Service, notify_ctx: *anyopaque) void {
     if (service.refs > 0) return;
     shared = null;
     service.deinit();
-}
-
-fn launchDefault(path: []const u8) void {
-    const uri = filenameUri(path) orelse return;
-    defer c.g_free(uri);
-    _ = c.g_app_info_launch_default_for_uri(uri, null, null);
-}
-
-fn launchWithApp(app_id: []const u8, path: []const u8) void {
-    const uri = filenameUri(path) orelse return;
-    defer c.g_free(uri);
-    const apps = c.g_app_info_get_all();
-    defer if (apps != null) c.g_list_free_full(apps, @ptrCast(&c.g_object_unref));
-    var it = apps;
-    while (it != null) : (it = it.*.next) {
-        const app: *c.GAppInfo = @ptrCast(@alignCast(it.*.data orelse continue));
-        const id = c.g_app_info_get_id(app) orelse continue;
-        if (!std.mem.eql(u8, std.mem.span(id), app_id)) continue;
-        var list: ?*c.GList = null;
-        list = c.g_list_append(list, @ptrCast(uri));
-        _ = c.g_app_info_launch_uris(app, list, null, null);
-        c.g_list_free(list);
-        return;
-    }
-    launchDefault(path);
-}
-
-fn filenameUri(path: []const u8) ?[*c]c.gchar {
-    var path_buf: [4096:0]u8 = undefined;
-    const path_z = std.fmt.bufPrintZ(&path_buf, "{s}", .{path}) catch return null;
-    const uri = c.g_filename_to_uri(path_z.ptr, null, null);
-    return if (uri == null) null else uri;
 }
 
 test "a browser copy's record moves through legal phases and is admitted process-wide" {
