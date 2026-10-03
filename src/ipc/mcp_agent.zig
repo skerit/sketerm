@@ -4951,6 +4951,15 @@ fn attachIdTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
     const key = argStr(args, "agent").?;
     const deadline = deadlineFrom(args, ATTACH_WAIT_MS);
     const relaunch_asked = argBool(args, "relaunch");
+    // This server's own hold on a gone entry moves into its relaunch: it is
+    // never let go and taken again, so nothing comes between the two.
+    var own_claim: ?agentindex.Claim = null;
+    var kept_lp: []const u8 = "";
+    defer if (own_claim) |*k| k.release(kept_lp, false);
+    // And what it handed out, by content: record ids restart with the new
+    // terminal, the app's reprinted past does not.
+    var carried: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    defer carried.deinit(state.allocator);
     // Already ours: nothing to resume, unless its app ended here and the
     // caller asks to start it again.
     if (findByName(key)) |e| {
@@ -4959,6 +4968,13 @@ fn attachIdTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
             return reattachedResult(arena, e, if (relaunch_asked) "already attached and not gone: relaunch only starts an agent whose session ended" else "already attached to this server");
         if (e.ended_ms == 0)
             return errRes(arena, .refused, try std.fmt.allocPrint(arena, "agent {s} ended and cannot be relaunched (no conversation to resume, or it runs on a term_open terminal); agent_open a new one", .{e.id}));
+        kept_lp = try lockPath(arena, e.id);
+        if (e.claim) |cl| if (cl.stillOwned(kept_lp)) {
+            own_claim = cl;
+            e.claim = null;
+        };
+        carried = e.handed.texts;
+        e.handed.texts = .empty;
         // Let it go (its descriptor stays) and start it again below.
         endWaitersOf(e.id, "the agent is being relaunched");
         for (state.entries.items, 0..) |x, i| if (x == e) {
@@ -4983,7 +4999,10 @@ fn attachIdTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
         return errRes(arena, .not_found, try std.fmt.allocPrint(arena, "no live agent '{s}' on this machine (known: {s})", .{ key, if (known.items.len > 0) known.items else "none" }));
     };
     const lp = try lockPath(arena, d.id);
-    var claimed = agentindex.claim(lp, argBool(args, "takeover")) catch |err| switch (err) {
+    // Only the lock of the very agent the gone entry was.
+    const own = if (std.mem.eql(u8, kept_lp, lp)) own_claim else null;
+    if (own != null) own_claim = null;
+    var claimed = own orelse agentindex.claim(lp, argBool(args, "takeover")) catch |err| switch (err) {
         error.Held => return errRes(arena, .conflict, try std.fmt.allocPrint(arena, "agent {s} is in use by another live MCP server; agent_attach with takeover:true takes it over (that server then lets it go)", .{d.id})),
         error.LockFailed => return errRes(arena, .io_failed, "could not lock the agent in the index"),
     };
