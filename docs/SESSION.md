@@ -1,5 +1,40 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-03: sub-agent fixes after a host rebooted twice
+
+An orchestrator driving agents on several hosts lost one host (aeor) twice.
+Every opencode relaunch failed with "could not start the port forward": a
+dropped entry only detached its forward, so `agent-<id>-forward` still held
+the name on the private daemon (reproduced in smoke before the fix);
+`Entry.destroy` now always ends the forward and `spawnForward` ends a stale
+holder first. Claude agents refused their relaunch as "in use by another
+live MCP server" until `takeover`; the orchestrator was the only process
+holding agent lock fds and no other server had attached them, but no code
+path that would hold a second lock was found, so the fix removes the
+release-then-reclaim gap instead: a relaunch from this server's own gone
+entry moves its claim into the relaunch. A relaunch reprinting hours of
+history handed an old answer out (a done in the relaunch result, then
+`agent_read final`): a resumed start now folds everything it shows until
+the first prompt or answer (`foldHistory`, `Queue.deliverAnnounced`) and
+carries the gone entry's content keys. Every ssh/scp leg passes
+`ConnectTimeout=10`, a connect ssh could not reach is not retried, and
+term_open/agent_* answer the new `host_unreachable`. `agent_send interrupt`
+retypes the prompts this server had queued (`requeued`). Compact
+`agent_list` collapses gone agents into one line and adds per-host memory
+and load (`src/agent/hoststats.zig`, one sh script for Linux and macOS);
+`mcp_agent_max_per_host` / `mcp_agent_min_free_mb` cap agent_open. Claude
+Code collapses a typed chunk over 800 bytes into `<pasted_content>` (bJ=800
+in its bundled paste handler; a four-line 99-byte chunk is not collapsed),
+so `screen.paste` in claude.json types `Here are my instructions: ` first.
+One real Haiku run confirmed the transcript shape (typed lead-in, then the
+pasted block), and that Haiku still declined to act on pasted instructions.
+
+Validation (2026-10-03): test-core green, test green (3,991 tests, 19 skips; its
+first run failed once on the new requeue unit test's placement, fixed);
+smoke-mcp focused `SKETERM_SMOKE_MCP_AGENTSSH_ONLY` (down host, host lines
+and cap, opencode + claude relaunch after a reboot with nothing old handed
+out) and `..._AGENT_ONLY` green.
+
 ## 2026-10-03: sub-agent fixes from an overnight run of 28 agents
 
 `sent` now means the app took the prompt: a wedged Claude Code had shown
