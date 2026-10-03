@@ -41,8 +41,9 @@ pub const LONG_MIN_CHARS: usize = 1500;
 /// newest job's last message is returned whole even beyond it.
 pub const READ_CAP_CHARS: usize = 12_000;
 /// A `done` waits while the agent sits idle with background tasks still
-/// running, at most this long; then it fires with their count, so a
-/// server left running on purpose never means silence forever.
+/// running; after this long a QUIET one fires with their count
+/// (`events.Quiet.background`: only an opted-in consumer gets it), and the
+/// done that settles the turn once they end still wakes everyone.
 pub const BACKGROUND_DONE_CAP_MS: i64 = 30 * 60_000;
 
 pub const Detail = enum {
@@ -208,16 +209,22 @@ pub const Waker = struct {
     /// @param records the source's records, chronological.
     pub fn segmentEnd(self: *Waker, records: []Record, job: u32) SegmentEnd {
         markFinal(records, job);
+        const end = self.peek(records, job);
+        for (records) |r| self.mark = @max(self.mark, r.id);
+        self.job = job;
+        if (end.wake) self.woke = job;
+        return end;
+    }
+
+    /// What `segmentEnd` would answer now, remembering nothing: the
+    /// background cap's quiet done, which must leave the settled done of
+    /// the same job its wake.
+    pub fn peek(self: *const Waker, records: []const Record, job: u32) SegmentEnd {
         var wake = self.job == null or self.job.? != job;
-        var high = self.mark;
         for (records) |r| {
-            high = @max(high, r.id);
             if (!wake and r.job == job and r.id > self.mark and substantive(r)) wake = true;
         }
-        self.job = job;
-        self.mark = high;
         const first: u32 = if (self.woke) |w| @min(w + 1, job) else 0;
-        if (wake) self.woke = job;
         const i = answerIndex(records, job);
         return .{ .wake = wake, .answer = if (i) |x| records[x].text else "", .answer_id = if (i) |x| records[x].id else null, .first_job = first };
     }
@@ -543,6 +550,18 @@ test "re-wake: the first done always wakes, a substantive later one does, a triv
     var more = [_]Record{ rec(1, 0, .assistant, "a"), rec(2, 0, .assistant, filled(1500, 'c')), rec(3, 0, .assistant, "b") };
     _ = w2.segmentEnd(more[0..1], 0);
     try t.expect(w2.segmentEnd(&more, 0).wake);
+}
+
+test "a peek decides nothing: the segment end after it still wakes" {
+    var records = [_]Record{ rec(1, 0, .user, "build it"), rec(2, 0, .assistant, "started the build in the background") };
+    var w: Waker = .{};
+    const p = w.peek(&records, 0);
+    try t.expect(p.wake);
+    try t.expectEqualStrings(records[1].text, p.answer);
+    try t.expect(w.job == null);
+    try t.expect(w.peek(&records, 0).wake);
+    try t.expect(w.segmentEnd(&records, 0).wake);
+    try t.expect(!w.peek(&records, 0).wake);
 }
 
 test "a done covers every job since the previous one that woke: a superseded job is not lost" {

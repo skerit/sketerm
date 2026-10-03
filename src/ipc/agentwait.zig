@@ -10,7 +10,7 @@
 //! `events.Cursor.take` that `agent_wait` uses.
 //!
 //! Wire, newline-delimited JSON. Client -> server, once:
-//! `{"agent":"claude-1","match":"x","messages":true,"retrying":false,"follow":false,"since":7}`,
+//! `{"agent":"claude-1","match":"x","messages":true,"retrying":false,"background":false,"follow":false,"since":7}`,
 //! with `"agents":[...]` added for `--any` (`agent` stays the first, so a
 //! server that predates `agents` watches that one) and `"server":true`
 //! for every agent of the server, later ones included (`--server`, the
@@ -54,6 +54,8 @@ pub const Subscribe = struct {
     messages: bool = false,
     /// Also wake on errors that do not wake by default (retrying).
     retrying: bool = false,
+    /// Also wake on the background cap's quiet done.
+    background: bool = false,
     follow: bool = false,
     /// Wake for events after this seq, delivered or not; null = for what
     /// nobody has delivered yet.
@@ -273,6 +275,7 @@ pub fn watchCommand(arena: std.mem.Allocator, exe: []const u8, socket: []const u
         }
         if (filter.messages) try out.appendSlice(arena, " --messages");
         if (filter.retrying) try out.appendSlice(arena, " --retrying");
+        if (filter.background) try out.appendSlice(arena, " --background");
         if (agents.len > 1) try out.appendSlice(arena, " --any");
     }
     for (agents) |agent| {
@@ -286,7 +289,8 @@ pub fn watchCommand(arena: std.mem.Allocator, exe: []const u8, socket: []const u
 
 pub const HELP =
     \\Usage: sketerm mcp agent-wait --socket PATH [--match TEXT] [--messages]
-    \\                              [--retrying] [--follow] [--timeout SECONDS]
+    \\                              [--retrying] [--background] [--follow]
+    \\                              [--timeout SECONDS]
     \\                              [--since SEQ] AGENT
     \\       sketerm mcp agent-wait --socket PATH [...] --any AGENT AGENT...
     \\       sketerm mcp agent-wait --socket PATH [--timeout SECONDS] [--json]
@@ -301,6 +305,9 @@ pub const HELP =
     \\plus every completed message with --messages or a message containing
     \\TEXT with --match (rate limited: the rest are summarised), and on the
     \\errors an agent recovers from by itself (retrying) with --retrying.
+    \\An agent idle for 30 minutes with background tasks still running
+    \\raises a quiet done (with their count) that wakes only --background;
+    \\its turn is not settled, and the done once they end wakes everyone.
     \\--any watches several agents and wakes on the first of them. --all
     \\wakes ONCE, when every agent named has settled (done, needs_input, an
     \\error, exited or closed), and prints a line per agent with how it
@@ -336,6 +343,7 @@ pub const Cli = struct {
     match: ?[]const u8 = null,
     messages: bool = false,
     retrying: bool = false,
+    background: bool = false,
     follow: bool = false,
     timeout_s: ?u32 = null,
     since: ?u64 = null,
@@ -363,6 +371,8 @@ pub const Cli = struct {
                 o.messages = true;
             } else if (eql(u8, a, "--retrying")) {
                 o.retrying = true;
+            } else if (eql(u8, a, "--background")) {
+                o.background = true;
             } else if (eql(u8, a, "--any")) {
                 o.any = true;
             } else if (eql(u8, a, "--all")) {
@@ -393,7 +403,7 @@ pub const Cli = struct {
         // Several agents only with --any or --all (a typo is not a second
         // agent); --server names none, it watches them all. --all wakes
         // once and waits for settling only: no filter, no --follow.
-        if (o.all and (o.any or o.server or o.follow or o.messages or o.retrying or o.match != null or o.since != null)) return error.Conflicting;
+        if (o.all and (o.any or o.server or o.follow or o.messages or o.retrying or o.background or o.match != null or o.since != null)) return error.Conflicting;
         if (o.agent_count > 1 and !o.any and !o.all) return error.ExtraArgument;
         if (o.server and o.agent_count > 0) return error.ExtraArgument;
         return o;
@@ -474,6 +484,7 @@ pub fn cli(allocator: std.mem.Allocator, args: []const []const u8) u8 {
         .match = o.match,
         .messages = o.messages,
         .retrying = o.retrying,
+        .background = o.background,
         .follow = o.follow,
         .since = o.since,
         .server = o.server,
@@ -607,15 +618,16 @@ test "the watch command round-trips through the cli grammar and bakes in no curs
 
     // Several agents: --any, and the subscribe line names them all while
     // `agent` keeps the first for a server that predates `agents`.
-    const many = try watchCommand(a, "/x/sketerm-mcp", "/s.sock", &.{ "claude-1", "opencode-1" }, .{ .retrying = true }, .any);
-    try t.expectEqualStrings("/x/sketerm-mcp mcp agent-wait --socket /s.sock --retrying --any claude-1 opencode-1", many);
-    const p = try Cli.parse(&.{ "--socket", "/s.sock", "--retrying", "--any", "claude-1", "opencode-1" });
-    const sub = Subscribe{ .agent = p.agents()[0], .agents = p.agents(), .retrying = p.retrying };
+    const many = try watchCommand(a, "/x/sketerm-mcp", "/s.sock", &.{ "claude-1", "opencode-1" }, .{ .retrying = true, .background = true }, .any);
+    try t.expectEqualStrings("/x/sketerm-mcp mcp agent-wait --socket /s.sock --retrying --background --any claude-1 opencode-1", many);
+    const p = try Cli.parse(&.{ "--socket", "/s.sock", "--retrying", "--background", "--any", "claude-1", "opencode-1" });
+    try t.expect(p.background);
+    const sub = Subscribe{ .agent = p.agents()[0], .agents = p.agents(), .retrying = p.retrying, .background = p.background };
     const line = try std.fmt.allocPrint(a, "{f}", .{std.json.fmt(sub, .{ .emit_null_optional_fields = false })});
     const back = try std.json.parseFromSliceLeaky(Subscribe, a, line, .{ .ignore_unknown_fields = true });
     try t.expectEqual(@as(usize, 2), back.names().len);
     try t.expectEqualStrings("opencode-1", back.names()[1]);
-    try t.expect(back.retrying);
+    try t.expect(back.retrying and back.background);
     // An old CLI's line: one agent.
     const old = try std.json.parseFromSliceLeaky(Subscribe, a, "{\"agent\":\"claude-1\"}", .{ .ignore_unknown_fields = true });
     try t.expectEqual(@as(usize, 1), old.names().len);
@@ -629,6 +641,7 @@ test "the watch command round-trips through the cli grammar and bakes in no curs
     try t.expectError(error.Conflicting, Cli.parse(&.{ "--all", "--follow", "a", "b" }));
     try t.expectError(error.Conflicting, Cli.parse(&.{ "--all", "--any", "a", "b" }));
     try t.expectError(error.Conflicting, Cli.parse(&.{ "--all", "--messages", "a" }));
+    try t.expectError(error.Conflicting, Cli.parse(&.{ "--all", "--background", "a", "b" }));
 }
 
 test "an all wake: one line, then one line per agent with how it settled" {

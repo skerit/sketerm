@@ -168,6 +168,8 @@ pub const Tracker = struct {
                     }
                 },
                 .done => {
+                    // The background cap's done ends no turn (`events.Quiet.background`).
+                    if (ev.background_tasks != null) continue;
                     if (!self.active) {
                         self.coverJobs(ev, self.carry_first_job);
                         self.carry_first_job = null;

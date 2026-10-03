@@ -1050,7 +1050,9 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   which wakes only a caller that passes `retrying:true` (waiter
   `--retrying`); the `retrying` STATE still shows in every result and
   `agent_list`, and a retry that turns into a real error or a limit wakes
-  through that class. `messages:true` and `match:"text"` add opt-in
+  through that class. The quiet `done` of the background cap (below) is
+  the other opt-in, `background:true` (waiter `--background`);
+  `capabilities.agent_done.quiet_opt_ins` names both. `messages:true` and `match:"text"` add opt-in
   wake-ups, rate limited per agent (burst 3, then one per 30 s; the rest
   ride the next wake-up as a `digest`). `outcome` is the highest-ranked
   kind delivered (`vocab.EventKind.outcomeRank`), else `still_working`,
@@ -1173,9 +1175,16 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   no longer does. The segment's
   final is flagged when the agent goes idle, so the job's summary is
   still selected. An agent idle with background tasks for 30 minutes
-  (`select.BACKGROUND_DONE_CAP_MS`) fires its `done` anyway, with
-  `background_tasks` (their count) on the event, so a server left running
-  on purpose never means silence. opencode has no background shells; its
+  (`select.BACKGROUND_DONE_CAP_MS`) raises a QUIET `done` with
+  `background_tasks` (their count) on the event: like a `retrying` error
+  it reaches only a caller that opts in (`background: true` on the
+  waiting calls, waiter `--background`; `events.Quiet`), it settles no
+  turn (`agent_wait all` and `--all` keep waiting), and it leaves the
+  job's first wake to the `done` that settles the turn once the tasks end
+  (`select.Waker.peek`), so a long build no longer wakes the orchestrator
+  with "the build is running in the background"
+  (`capabilities.agent_done.background_cap_quiet`). The state stays
+  `waiting_background` meanwhile. opencode has no background shells; its
   background subagents are child sessions, whose busy status already
   holds the root as `waiting_subagent`.
 - **Compaction is a notice, never a message.** A compaction summary is
@@ -1270,7 +1279,7 @@ on a free loopback port, read over its HTTP API and SSE stream, with
 - **Being woken.** Every per-agent result carries `watch_command`, the
   exact command (this executable, absolute) that blocks until the agent
   next needs attention: `sketerm mcp agent-wait --socket <instance>/agents.sock
-  [--match X] [--messages] [--retrying] <agent>`, or `--any <agent>
+  [--match X] [--messages] [--retrying] [--background] <agent>`, or `--any <agent>
   <agent>...` for several (the first wake-up of any; with `--follow`, all
   of them), or `--all <agent> <agent>...` (one wake-up once every one of
   them settled, as `agent_wait all` decides it: a header line `all N

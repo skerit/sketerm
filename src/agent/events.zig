@@ -14,8 +14,10 @@
 //! `since`) re-reads everything after it, delivered or not.
 //!
 //! Default-wake events (`wakesByDefault`: an always-on kind, and for an
-//! `error` a class that `vocab.ErrorClass.wakesByDefault`) wake every
-//! consumer, never rate limited; repeats of a coalescing kind within
+//! `error` a class that `vocab.ErrorClass.wakesByDefault`, for a `done` one
+//! that settled rather than ran into the background cap) wake every
+//! consumer, never rate limited; a quiet one (`Event.quiet`) reaches only a
+//! consumer whose `Filter` opts into its kind of quiet; repeats of a coalescing kind within
 //! `dedupe_window_ms` fold into the earlier event's `count` at push time.
 //! Opt-in messages go through the agent's ONE `TokenBucket` (shared by all
 //! its consumers); a blocked one is not dropped but counted into the
@@ -76,7 +78,8 @@ pub const Event = struct {
     /// `done` and `message`: the record whose text `text` is (the job's
     /// answer, the completed message); null for a done without one.
     record: ?u64 = null,
-    /// `done` fired at the background cap: background tasks still running.
+    /// `done` fired at the background cap: background tasks still running,
+    /// so the turn is not settled and the done is quiet (`Event.quiet`).
     background_tasks: ?u32 = null,
     /// Handed to the assistant by some consumer.
     delivered: bool = false,
@@ -87,8 +90,20 @@ pub const Event = struct {
     /// Wakes every consumer without being asked for.
     pub fn wakesByDefault(self: *const Event) bool {
         if (self.held or !self.kind.alwaysOn()) return false;
+        if (self.kind == .done and self.background_tasks != null) return false;
         const cls = self.class orelse return true;
         return cls.wakesByDefault();
+    }
+
+    /// The opt-in that delivers this always-on event although it does not
+    /// wake by default, or null (a done a retry holds is never delivered).
+    pub fn quiet(self: *const Event) ?Quiet {
+        if (!self.kind.alwaysOn() or self.wakesByDefault()) return null;
+        return switch (self.kind) {
+            .@"error" => .retrying,
+            .done => if (self.held) null else .background,
+            .needs_input, .exited, .connection_lost, .connection_restored, .message, .match => null,
+        };
     }
 
     /// It ends what a prompt started (`vocab.EventKind.settlesTurn`); an
@@ -96,6 +111,15 @@ pub const Event = struct {
     pub fn settlesTurn(self: *const Event) bool {
         return self.kind.settlesTurn() and self.wakesByDefault();
     }
+};
+
+/// Why an always-on event is quiet, named as the `Filter` field that opts in.
+pub const Quiet = enum {
+    /// An `error` the agent recovers from by itself, or one a retry holds.
+    retrying,
+    /// A `done` fired at `select.BACKGROUND_DONE_CAP_MS` while background
+    /// tasks still run: the turn is not settled.
+    background,
 };
 
 pub const Limits = struct {
@@ -229,6 +253,8 @@ pub const Filter = struct {
     match: ?[]const u8 = null,
     /// Also `error` events whose class does not wake by default.
     retrying: bool = false,
+    /// Also a `done` the background cap fired (background tasks still run).
+    background: bool = false,
 
     /// The kind a stored message is delivered as, or null when not wanted.
     fn classify(self: Filter, text: []const u8) ?vocab.EventKind {
@@ -238,10 +264,13 @@ pub const Filter = struct {
         return if (self.messages) .message else null;
     }
 
-    /// An error held back by its class or by a retry, which this filter
-    /// opts into (a done a retry holds is never delivered).
+    /// A quiet event (`Event.quiet`) this filter opts into.
     fn wantsQuiet(self: Filter, ev: *const Event) bool {
-        return self.retrying and ev.kind == .@"error" and !ev.wakesByDefault();
+        const why = ev.quiet() orelse return false;
+        return switch (why) {
+            .retrying => self.retrying,
+            .background => self.background,
+        };
     }
 };
 
@@ -491,6 +520,40 @@ test "a retrying error wakes only a consumer that opted in; other errors always"
     const e = (try plain.take(&q, .{}, 1, t.allocator)).?;
     defer t.allocator.free(e.items);
     try t.expectEqual(vocab.ErrorClass.api, e.items[0].event.class.?);
+}
+
+test "a done fired at the background cap wakes only a consumer that opted in, and settles no turn" {
+    var q = Queue.init(t.allocator, .{});
+    defer q.deinit();
+    _ = try q.pushDone(0, 3, 3, "build started in the background", 9, 2);
+    const capped = &q.events.items[0];
+    try t.expect(!capped.wakesByDefault());
+    try t.expectEqual(Quiet.background, capped.quiet().?);
+    try t.expect(!capped.settlesTurn());
+    try t.expectEqual(@as(usize, 0), q.undelivered());
+    try t.expect(q.lastSettle(0) == null);
+    var plain: Cursor = .{};
+    try t.expect((try plain.take(&q, .{}, 0, t.allocator)) == null);
+    // The retrying opt-in is another quiet kind: it does not reach this one.
+    var retrying: Cursor = .{};
+    try t.expect((try retrying.take(&q, .{ .retrying = true }, 0, t.allocator)) == null);
+    var opted: Cursor = .{};
+    const d = (try opted.take(&q, .{ .background = true }, 0, t.allocator)).?;
+    defer t.allocator.free(d.items);
+    try t.expectEqual(@as(?u32, 2), d.items[0].event.background_tasks);
+    // The settled done of the same job wakes everyone and settles the turn.
+    _ = try q.pushDone(1, 3, 3, "build green", 11, null);
+    try t.expect(q.events.items[1].quiet() == null);
+    const e = (try plain.take(&q, .{}, 1, t.allocator)).?;
+    defer t.allocator.free(e.items);
+    try t.expectEqualStrings("build green", e.items[0].event.text);
+    try t.expectEqual(vocab.EventKind.done, q.lastSettle(0).?.kind);
+    // A done a retry holds reaches no filter at all.
+    _ = try q.pushDone(2, 4, 4, "partial", null, null);
+    q.events.items[2].held = true;
+    try t.expect(q.events.items[2].quiet() == null);
+    var all: Cursor = .{};
+    try t.expect((try all.take(&q, .{ .background = true, .retrying = true }, 2, t.allocator)) == null);
 }
 
 test "a preview is the first line, cut on a UTF-8 boundary at PREVIEW_MAX bytes" {

@@ -91,6 +91,8 @@ pub const Engine = struct {
     background_tasks: u32 = 0,
     /// When the agent went idle with its turn unsettled by them.
     background_since_ms: ?i64 = null,
+    /// The background cap's quiet done went out for this idle stretch.
+    background_capped: bool = false,
     /// Prompts the app shows queued for its next turn (`screen.queued`).
     queued_visible: u32 = 0,
 
@@ -488,8 +490,9 @@ pub const Engine = struct {
         return n;
     }
 
-    /// Milliseconds until the background cap fires a `done`, or null.
+    /// Milliseconds until the background cap fires its quiet `done`, or null.
     pub fn backgroundDueIn(self: *const Engine, now_ms: i64) ?i64 {
+        if (self.background_capped) return null;
         const since = self.background_since_ms orelse return null;
         return @max(0, since + select.BACKGROUND_DONE_CAP_MS - now_ms);
     }
@@ -558,13 +561,16 @@ pub const Engine = struct {
         const ended = self.done_armed and self.captured_since_end;
         if (self.state == .waiting_background and ended) {
             // Idle but unsettled: the segment's final is known now, the
-            // done waits for the background tasks (or the cap).
+            // done waits for the background tasks (the cap's is quiet).
             if (self.visibleJob()) |job| select.markFinal(self.records.items, job);
             const since = self.background_since_ms orelse now_ms;
             self.background_since_ms = since;
-            if (now_ms - since >= select.BACKGROUND_DONE_CAP_MS) try self.segmentDone(now_ms, self.background_tasks);
-        } else self.background_since_ms = null;
-        if (self.state == .idle and ended) try self.segmentDone(now_ms, null);
+            if (!self.background_capped and now_ms - since >= select.BACKGROUND_DONE_CAP_MS) try self.backgroundCapped(now_ms);
+        } else {
+            self.background_since_ms = null;
+            self.background_capped = false;
+        }
+        if (self.state == .idle and ended) try self.segmentDone(now_ms);
     }
 
     /// The latest job, unless it is an adapter command's hidden turn.
@@ -574,15 +580,24 @@ pub const Engine = struct {
         return @intCast(n - 1);
     }
 
-    /// The turn settled (or the background cap ran out): push its done
-    /// when the re-wake rule says so.
-    fn segmentDone(self: *Engine, now_ms: i64, background: ?u32) !void {
+    /// The turn settled: push its done when the re-wake rule says so.
+    fn segmentDone(self: *Engine, now_ms: i64) !void {
         self.done_armed = false;
         self.background_since_ms = null;
         // An adapter command's turn is not a turn the assistant asked for.
         const job = self.visibleJob() orelse return;
         const end = self.waker.segmentEnd(self.records.items, job);
-        if (end.wake) _ = try self.queue.pushDone(now_ms, job, end.first_job, end.answer, end.answer_id, background);
+        if (end.wake) _ = try self.queue.pushDone(now_ms, job, end.first_job, end.answer, end.answer_id, null);
+    }
+
+    /// The background cap ran out: a quiet done with their count
+    /// (`events.Quiet.background`), once per idle stretch. The turn stays
+    /// armed and the waker untouched, so the done that settles it wakes.
+    fn backgroundCapped(self: *Engine, now_ms: i64) !void {
+        self.background_capped = true;
+        const job = self.visibleJob() orelse return;
+        const end = self.waker.peek(self.records.items, job);
+        if (end.wake) _ = try self.queue.pushDone(now_ms, job, end.first_job, end.answer, end.answer_id, self.background_tasks);
     }
 
     fn ackBells(self: *Engine) void {
@@ -1447,7 +1462,7 @@ test "done means settled: idle with a background shell is waiting_background, th
     try t.expectEqual(@as(usize, 1), rig.engine.turns.items.len);
 }
 
-test "a background task that never ends: done fires at the cap with the count" {
+test "a background task past the cap: a quiet done with the count, and the settled done still wakes" {
     var rig: Rig = undefined;
     try rig.init(100, 30);
     defer rig.deinit();
@@ -1458,13 +1473,30 @@ test "a background task that never ends: done fires at the cap with the count" {
     try t.expectEqual(@as(usize, 0), countKind(&rig.engine, .done));
     try rig.engine.tick(since + select.BACKGROUND_DONE_CAP_MS);
     try t.expectEqual(@as(usize, 1), countKind(&rig.engine, .done));
-    const done = rig.engine.queue.events.items[rig.engine.queue.events.items.len - 1];
-    try t.expectEqual(@as(?u32, 1), done.background_tasks);
+    const capped = rig.engine.queue.events.items[rig.engine.queue.events.items.len - 1];
+    try t.expectEqual(@as(?u32, 1), capped.background_tasks);
+    // Quiet: it wakes nobody by default and settles no turn.
+    try t.expect(!capped.wakesByDefault());
+    try t.expect(rig.engine.queue.lastSettle(0) == null);
     try t.expect(rig.engine.backgroundDueIn(since) == null);
     // Once: still waiting_background, no second done.
     try rig.engine.tick(since + 2 * select.BACKGROUND_DONE_CAP_MS);
     try t.expectEqual(@as(usize, 1), countKind(&rig.engine, .done));
     try t.expectEqual(vocab.State.waiting_background, rig.engine.state);
+
+    // The shell ends at last, with no wake turn: the turn settles, and its
+    // done wakes everyone (the quiet one did not use up the job's first wake).
+    const later = since + 3 * select.BACKGROUND_DONE_CAP_MS;
+    rig.write(erase ++ "Cogitated for 10s \xc2\xb7 done\r\n" ++ live);
+    try rig.feed(later);
+    try rig.engine.tick(later + 5000);
+    try t.expectEqual(vocab.State.idle, rig.engine.state);
+    try t.expectEqual(@as(usize, 2), countKind(&rig.engine, .done));
+    const settled = rig.engine.queue.events.items[rig.engine.queue.events.items.len - 1];
+    try t.expect(settled.background_tasks == null);
+    try t.expect(settled.wakesByDefault());
+    try t.expectEqualStrings(capped.text, settled.text);
+    try t.expectEqual(vocab.EventKind.done, rig.engine.queue.lastSettle(0).?.kind);
 }
 
 /// Erase `n` live rows before a redraw, as claude does.

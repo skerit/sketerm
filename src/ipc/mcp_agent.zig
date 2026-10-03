@@ -746,7 +746,7 @@ fn rememberFilter(e: *Entry, f: events.Filter) void {
     const owned: ?[]u8 = if (f.match) |m| (e.allocator.dupe(u8, m) catch return) else null;
     if (e.push_match) |old| e.allocator.free(old);
     e.push_match = owned;
-    e.push_filter = .{ .messages = f.messages, .retrying = f.retrying, .match = owned };
+    e.push_filter = .{ .messages = f.messages, .retrying = f.retrying, .background = f.background, .match = owned };
 }
 
 /// The push for `d`, its answer marked handed out (agent_read and done
@@ -1178,6 +1178,7 @@ const Sub = struct {
     match: ?[]u8 = null,
     messages: bool = false,
     retrying: bool = false,
+    background: bool = false,
     follow: bool = false,
     /// Every agent of the server, later ones included, with pushed text.
     server: bool = false,
@@ -1188,11 +1189,12 @@ const Sub = struct {
     /// What wakes it for `e`: its own filter, and for a server follower
     /// also what the assistant's last call on `e` asked for.
     fn filterFor(self: *const Sub, e: *const Entry) events.Filter {
-        const own: events.Filter = .{ .messages = self.messages, .match = self.match, .retrying = self.retrying };
+        const own: events.Filter = .{ .messages = self.messages, .match = self.match, .retrying = self.retrying, .background = self.background };
         if (!self.server) return own;
         return .{
             .messages = own.messages or e.push_filter.messages,
             .retrying = own.retrying or e.push_filter.retrying,
+            .background = own.background or e.push_filter.background,
             .match = own.match orelse e.push_filter.match,
         };
     }
@@ -1367,6 +1369,7 @@ fn serviceSub(a: std.mem.Allocator, s: *Sub, now_ms: i64) void {
         if (sub.match) |m| s.match = a.dupe(u8, m) catch return endSub(s, "out of memory");
         s.messages = sub.messages;
         s.retrying = sub.retrying;
+        s.background = sub.background;
         s.follow = sub.follow;
         s.server = sub.server;
         s.all = sub.all and !sub.server;
@@ -1585,7 +1588,7 @@ fn notFound(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
 
 fn filterFrom(args: std.json.Value) events.Filter {
     const m = argStr(args, "match");
-    return .{ .messages = argBool(args, "messages"), .match = if (m != null and m.?.len > 0) m else null, .retrying = argBool(args, "retrying") };
+    return .{ .messages = argBool(args, "messages"), .match = if (m != null and m.?.len > 0) m else null, .retrying = argBool(args, "retrying"), .background = argBool(args, "background") };
 }
 
 fn deadlineFrom(args: std.json.Value, default_ms: i64) i64 {
@@ -1760,7 +1763,7 @@ fn finish(arena: std.mem.Allocator, res: *Res, e: *Entry, dv: Delivered, watch: 
         try res.fact("timed_out", w.timed_out and !state.no_wait);
         try res.textf("{s}: {s} (state {s})", .{ e.id, outcome, @tagName(st) });
         if (background) |n|
-            try res.textf("done after {d} minutes idle with {d} background task(s) still running", .{ @divTrunc(select.BACKGROUND_DONE_CAP_MS, 60_000), n });
+            try res.textf("a quiet done (background): {d} minutes idle with {d} background task(s) still running; the turn is not settled, and its done wakes you once they end", .{ @divTrunc(select.BACKGROUND_DONE_CAP_MS, 60_000), n });
         if (w.timed_out and pushing()) {
             try res.textf("{s}: its events are pushed into this session as they happen, so end your turn here; no watch_command, Monitor or agent_wait is needed", .{outcome});
         } else if (w.timed_out) {
@@ -5586,6 +5589,35 @@ test "an event announcing a record carries its id and a one-line preview, never 
     // Nothing of the long text anywhere in the result.
     const raw = try std.json.Stringify.valueAlloc(a, read, .{});
     try testing.expect(std.mem.indexOf(u8, raw, "xxxxxxxxxx") == null);
+}
+
+test "the background cap's done is quiet: only background:true gets it, and its watch_command keeps the opt-in" {
+    var rig: ToolRig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    const a = rig.arena.allocator();
+    const set = try adapters();
+    const e = try newEntry(set.get("claude").?, "claude-1", "agent-claude-1", "/bin/claude", "/");
+    const ag = try state.allocator.create(agent_mod.Agent);
+    ag.* = try agent_mod.Agent.initScreen(state.allocator, set.get("claude").?, .{});
+    e.agent = ag;
+    e.visible = .{ .borrowed = 4242 };
+    try state.entries.append(state.allocator, e);
+    // The terminal names nothing: take the connection_lost first.
+    service(clock.nowMs());
+    _ = try e.cursor.take(e.agent.queue(), .{}, clock.nowMs(), a);
+    _ = try ag.source.screen.queue.pushDone(clock.nowMs(), 0, 0, "the build runs in the background", null, 2);
+    const plain = try shaped(a, "agent_wait", try rig.call(.agent_wait, "{\"timeout_ms\":0}"));
+    try testing.expectEqualStrings("still_working", plain.get("outcome").?.string);
+    try testing.expectEqual(@as(usize, 0), plain.get("events").?.array.items.len);
+    // The results' cursor examined that one without wanting it (as for a
+    // retrying error); the next quiet done reaches a call that opts in.
+    _ = try ag.source.screen.queue.pushDone(clock.nowMs(), 0, 0, "the build runs in the background", null, 2);
+    const opted = try shaped(a, "agent_wait", try rig.call(.agent_wait, "{\"background\":true,\"timeout_ms\":0}"));
+    try testing.expectEqualStrings("done", opted.get("outcome").?.string);
+    try testing.expectEqual(@as(i64, 2), opted.get("events").?.array.items[0].object.get("background_tasks").?.integer);
+    try testing.expect(std.mem.indexOf(u8, opted.get("watch_command").?.string, " --background ") != null);
+    try testing.expect(e.push_filter.background);
 }
 
 test "the waiter --any: the first wake-up of several agents names its agent; a closed one is dropped" {
