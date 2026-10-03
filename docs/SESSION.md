@@ -1,5 +1,26 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-04: swallowed-error audit (`catch {}` in shipped code)
+
+Every `catch {}` outside the smoke/bench rigs and test blocks was visited
+(519 sites). Most stay bare: teardown, notifications to a peer that may be
+gone, fixed-buffer label formatting, and allocation-only failures. The ones
+that hid a behaviour change now say so or are handled. MCP agents: a failing
+`serviceEntry` (the agent silently stopped updating) warns once per distinct
+error on stderr/`--log` (`mcp.warn`) and adds an agent notice; a failing
+overload retry releases the events it held (they woke nobody before) and
+says why; a failed gone stamp in `retireDescriptor` is logged; an opencode
+reconnect whose resync fails adds a notice. Daemon: a presenter reply that
+cannot be relayed ends the requester's wait as an uncertain delivery
+instead of a timeout, and a failed fs job journal write is logged once per
+failure run. termdrive: a snapshot that cannot be applied takes the desync
+resync path (a reattach with a bad snapshot is a failed reattach) instead of
+leaving the mirror frozen. GUI: menu, sidebar, history and reveal actions
+that failed now log like palette actions (`logActionError`), and a refused
+local panel image hydration is logged. Web helper: a popup without a frame
+buffer and a teardown `storage.local` flush failure are logged; headless
+downloads refuse a too-long path with a reason.
+
 ## 2026-10-03: shipped-code helper dedup (zemble dupes, all lanes)
 
 A second sweep over `zemble dupes` (exact, renamed, logic) folded copies
