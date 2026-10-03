@@ -1297,11 +1297,18 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   already delivered; two waiters on one agent wake once between them;
   and a tool call on an agent holds that agent's waiters while it runs,
   so its own result gets what happens meanwhile. `--since SEQ` re-reads
-  every event after SEQ, delivered or not. A waiter prints one line per
-  wake-up (`claude-1 done: <first line> [state idle]`) and marks no
-  RECORD as handed out: `agent_read` afterwards returns the messages in
-  full. A text the line shortens is cut between words and marked ` ...`,
-  never inside a value its own brackets would make read as a field. It exits after the first wake-up unless `--follow`, and always
+  every event after SEQ, delivered or not. A waiter prints each wake-up
+  as exactly the text a push delivers (below; `capabilities.agent_waiter_content`):
+  one line (`claude-1 done: <first line> [state idle]`), then what the
+  line cuts short: a `done`'s answer or a `message` in full when under
+  2000 characters (that record is then handed out, so `agent_read` points
+  at it instead of repeating it; a longer one gets a pointer to
+  `agent_read`), a prompt's options, an error's whole text and detail.
+  So a wake-up needs no extra read to act on. The CLI asks for that text
+  in its subscribe line (`content`); a CLI that predates it gets the bare
+  line and no record is marked. A text the line shortens is cut between
+  words and marked ` ...`, never inside a value its own brackets would
+  make read as a field. It exits after the first wake-up unless `--follow`, and always
   prints `watch ended: <reason>` when its agents close or the server goes
   away. `sketerm-mcp agent-wait` and `sketerm-mcp mcp agent-wait` are the
   same command; the subscribe line keeps `agent` (the first) beside
@@ -1315,11 +1322,9 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   limiter, the hold during a call on the agent), and a push goes through
   the agent's ONE delivery state like a waiter: what it delivered no
   result, `agent_wait` or waiter hands out again, and the first of them
-  to take an event delivers it. A pushed wake-up is the waiter's line,
-  and for a `done` the job's answer in full when it is under 2000
-  characters (that record is then handed out: `agent_read` points at it
-  instead of repeating it; a longer answer gets a pointer to
-  `agent_read`) (`src/ipc/agentpush.zig`). Results of a call that
+  to take an event delivers it. A pushed wake-up is the waiter's text
+  above, composed once for every route (`agentpush.compose`; a record it
+  carries in full is handed out, whichever route carried it). Results of a call that
   returned before its agent finished say the events are pushed instead
   of asking for a waiter, and the server instructions tell the
   orchestrator to end its turn and rely on them.

@@ -6787,15 +6787,16 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
         const slow = agentCall(&m, arena, "agent_send", "{\"agent\":\"claude-1\",\"text\":\"slow reply\",\"timeout_ms\":0}", "agent_send slow", false, 15_000);
         expectSentOrWorking(slow, "agent_send slow: outcome");
         // Everything before the slow turn, handed out now.
-        _ = agentCall(&m, arena, "agent_read", "{\"agent\":\"claude-1\"}", "agent_read before slow", false, 15_000);
+        const before_slow = agentCall(&m, arena, "agent_read", "{\"agent\":\"claude-1\"}", "agent_read before slow", false, 15_000).get("next_since").?.integer;
         var one_shot = Waiter.start(scStr(slow, "watch_command", "agent_send slow"));
         const term = agentCall(&m, arena, "term_open", "{}", "term_open", false, 30_000);
         const term_id = term.get("term").?.integer;
         _ = agentCall(&m, arena, "term_exec", std.fmt.allocPrint(arena, "{{\"term\":{d},\"command\":\"sleep 3\",\"timeout_ms\":20000}}", .{term_id}) catch fail("oom"), "term_exec sleep", false, 45_000);
         const woke = one_shot.finish(arena, 15_000, "one-shot waiter");
-        if (std.mem.indexOf(u8, woke, std.fmt.allocPrint(arena, "{s} done: echo: slow reply", .{c1}) catch fail("oom")) == null) {
+        // The plain waiter prints the push's text: the line, then the answer.
+        if (std.mem.indexOf(u8, woke, std.fmt.allocPrint(arena, "{s} done: echo: slow reply [state idle]\n\necho: slow reply\n", .{c1}) catch fail("oom")) == null) {
             say(woke);
-            fail("the one-shot waiter did not print the done wake-up");
+            fail("the one-shot waiter did not print the done wake-up with its answer in full");
         }
         if (one_shot.status != 0) fail("the one-shot waiter did not exit 0");
         // ONE delivery state: the waiter's line went into the assistant's
@@ -6803,16 +6804,17 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
         const slow_done = agentCall(&m, arena, "agent_wait", "{\"agent\":\"claude-1\",\"timeout_ms\":1500}", "agent_wait slow", false, 15_000);
         expectFact(slow_done, "outcome", "still_working", "agent_wait slow: the waiter's done woke the tool again");
         if (eventKinds(slow_done, "done") != 0) fail("agent_wait slow: repeated the done the waiter delivered");
-        // ...but the waiter marks no record: the read returns the answer,
-        // captured once though observed late, and a second read nothing.
+        // ...and the answer it printed is handed out like a push's: the read
+        // has nothing new, and a deliberate re-read returns exactly that
+        // answer, captured once though observed late.
         const slow_read = agentCall(&m, arena, "agent_read", "{\"agent\":\"claude-1\"}", "agent_read slow", false, 15_000);
-        const slow_recs = slow_read.get("records").?.array.items;
+        if (slow_read.get("records").?.array.items.len != 0) fail("agent_read: repeated the answer the waiter printed");
+        const slow_again = agentCall(&m, arena, "agent_read", std.fmt.allocPrint(arena, "{{\"agent\":\"claude-1\",\"since\":{d}}}", .{before_slow}) catch fail("oom"), "agent_read slow since", false, 15_000);
+        const slow_recs = slow_again.get("records").?.array.items;
         if (slow_recs.len != 1 or !std.mem.eql(u8, slow_recs[0].object.get("text").?.string, "echo: slow reply")) {
-            say(std.json.Stringify.valueAlloc(arena, slow_read.get("records").?, .{}) catch "?");
+            say(std.json.Stringify.valueAlloc(arena, slow_again.get("records").?, .{}) catch "?");
             fail("agent_read: the late-observed turn is not exactly its answer");
         }
-        const slow_again = agentCall(&m, arena, "agent_read", "{\"agent\":\"claude-1\"}", "agent_read slow again", false, 15_000);
-        if (slow_again.get("records").?.array.items.len != 0) fail("agent_read: a second read repeated a record");
         _ = agentCall(&m, arena, "term_close", std.fmt.allocPrint(arena, "{{\"term\":{d}}}", .{term_id}) catch fail("oom"), "term_close", false, 15_000);
 
         // Two waiters armed on one agent: the first delivers, the other

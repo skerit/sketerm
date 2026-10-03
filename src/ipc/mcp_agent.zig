@@ -133,7 +133,7 @@ pub const INSTRUCTIONS =
     "When a result says still_working (or sent: the agent had not started yet), run its watch_command in the background (or as a Monitor with --follow) " ++
     "to be woken when the agent finishes (done means settled: idle with no subagents or background tasks) or needs input, " ++
     "instead of polling with agent_wait; to watch several agents at once use agent-wait --any with their ids (--all: one wake-up once every one settled). " ++
-    "A wake-up the waiter printed is not repeated by agent_* results, so read the agent afterwards. " ++
+    "A wake-up the waiter printed is not repeated by agent_* results; it carries a done's answer in full when short, and agent_read returns what it did not carry. " ++
     "agent_send to a busy agent queues the prompt for its next turn without interrupting it (interrupt:true stops it first; agents:[...] sends to several at once), and agent_answer takes text when a prompt's right answer is none of its options. " ++
     "agent_read final:true returns just the newest job's last message, and agent_list is compact unless detail:true. " ++
     "Rules every brief repeats belong in a template (agent_template_save, then template + vars on agent_send/agent_open). " ++
@@ -1184,6 +1184,8 @@ const Sub = struct {
     server: bool = false,
     /// One wake once every target settled (`--all`).
     all: bool = false,
+    /// Its CLI prints the pushed text (`agentwait.Subscribe.content`).
+    content: bool = false,
     done: bool = false,
 
     /// What wakes it for `e`: its own filter, and for a server follower
@@ -1373,6 +1375,7 @@ fn serviceSub(a: std.mem.Allocator, s: *Sub, now_ms: i64) void {
         s.follow = sub.follow;
         s.server = sub.server;
         s.all = sub.all and !sub.server;
+        s.content = sub.content;
     }
     if (s.all) return serviceAll(arena, s);
     if (s.server) s.adoptAll(a);
@@ -1387,7 +1390,9 @@ fn serviceSub(a: std.mem.Allocator, s: *Sub, now_ms: i64) void {
         // A tool call on this agent is under way: its result gets this.
         if (isHeld(e)) continue;
         const d = (tg.cursor.take(e.agent.queue(), s.filterFor(e), now_ms, arena) catch continue) orelse continue;
-        const pushed: ?agentwait.Pushed = if (s.server) blk: {
+        // The text a push composes, and what it carries in full handed out:
+        // what the waiter prints is the push's text exactly.
+        const pushed: ?agentwait.Pushed = if (s.server or s.content) blk: {
             const p = pushOf(arena, e, d) catch continue;
             break :blk .{ .content = p.content, .meta = p.meta };
         } else null;
@@ -5589,6 +5594,45 @@ test "an event announcing a record carries its id and a one-line preview, never 
     // Nothing of the long text anywhere in the result.
     const raw = try std.json.Stringify.valueAlloc(a, read, .{});
     try testing.expect(std.mem.indexOf(u8, raw, "xxxxxxxxxx") == null);
+}
+
+test "the plain waiter prints the push text: a done's answer in full, then handed out" {
+    var rig: ToolRig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    const a = rig.arena.allocator();
+    const set = try adapters();
+    const e = try newEntry(set.get("claude").?, "claude-1", "agent-claude-1", "/bin/claude", "/");
+    const ag = try state.allocator.create(agent_mod.Agent);
+    ag.* = try agent_mod.Agent.initScreen(state.allocator, set.get("claude").?, .{});
+    e.agent = ag;
+    e.visible = .{ .borrowed = 4242 };
+    try state.entries.append(state.allocator, e);
+    service(clock.nowMs());
+    _ = try e.cursor.take(e.agent.queue(), .{}, clock.nowMs(), a);
+    const eng = &ag.source.screen;
+    const answer = "Both fixes are in and the suite is green; the flaky socket test was a real ordering bug.";
+    try eng.records.append(state.allocator, .{ .id = 7, .kind = .assistant, .text = try state.allocator.dupe(u8, answer), .job = 0 });
+
+    const fd = c.socket(c.AF_UNIX, c.SOCK_STREAM, 0);
+    defer _ = c.close(fd);
+    var addr: c.struct_sockaddr_un = undefined;
+    try @import("../mux/sockpath.zig").fillSockaddrUn(&addr, state.waiter.path.?);
+    try testing.expect(c.connect(fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un)) == 0);
+    const line = "{\"agent\":\"claude-1\",\"content\":true}\n";
+    _ = c.write(fd, line, line.len);
+    var buf: [8192]u8 = undefined;
+    try testing.expectError(error.Timeout, readLineFor(fd, &buf, 200));
+    _ = try eng.queue.pushDone(clock.nowMs(), 0, 0, answer, 7, null);
+    const woke = try readLineFor(fd, &buf, 3000);
+    const m = try std.json.parseFromSliceLeaky(agentwait.Message, a, std.mem.trimEnd(u8, woke, "\n"), .{ .ignore_unknown_fields = true });
+    var printed: std.Io.Writer.Allocating = .init(a);
+    try agentwait.formatPrinted(&printed.writer, m);
+    try testing.expectEqualStrings("claude-1 done: " ++ answer ++ " [state disconnected]\n\n" ++ answer, printed.written());
+    // Printed in full: handed out, so the default read does not repeat it.
+    try testing.expect(e.handed.has(eng.records.items[0]));
+    const read = try shaped(a, "agent_read", try rig.call(.agent_read, "{}"));
+    try testing.expectEqual(@as(usize, 0), read.get("records").?.array.items.len);
 }
 
 test "the background cap's done is quiet: only background:true gets it, and its watch_command keeps the opt-in" {

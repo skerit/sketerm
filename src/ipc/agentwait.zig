@@ -1,7 +1,9 @@
 //! The agent waiter: how an assistant is WOKEN by a sub-agent instead of
 //! polling it. The MCP server serves a unix socket in its instance dir;
 //! `sketerm mcp agent-wait` (and `sketerm-mcp agent-wait`) connects,
-//! subscribes to one agent with a filter, and prints one line per wake-up.
+//! subscribes to one agent with a filter, and prints each wake-up as the
+//! text a push delivers (`agentpush.compose`): one line, then what that
+//! line cuts short (a done's answer, a message, a prompt's options).
 //!
 //! This module is the one home of both halves' shared vocabulary: the
 //! subscribe line, the server's wake/end lines, the CLI's argument
@@ -14,9 +16,12 @@
 //! with `"agents":[...]` added for `--any` (`agent` stays the first, so a
 //! server that predates `agents` watches that one) and `"server":true`
 //! for every agent of the server, later ones included (`--server`, the
-//! follower push route: its wakes carry `content` and `meta`, composed by
-//! `agentpush.zig`), and `"all":true` beside `agents` for `--all` (one
-//! wake once EVERY agent settled). Server -> client:
+//! follower push route), `"content":true` from a CLI that prints a wake's
+//! `content` (every wake then carries `content` and `meta`, composed by
+//! `agentpush.zig`, and a record it carries in full is handed out; a CLI
+//! that predates it gets the bare wake and nothing is marked), and
+//! `"all":true` beside `agents` for `--all` (one wake once EVERY agent
+//! settled). Server -> client:
 //! `{"type":"wake","agent":...}` per wake-up, `{"type":"all","results":[...]}`
 //! for `--all`, and a final `{"type":"end","reason":"..."}` before it
 //! closes. A server that predates `all` reads the line as `--any`.
@@ -67,6 +72,9 @@ pub const Subscribe = struct {
     /// `--all`: one wake once every agent named settled
     /// (`vocab.State.settled`), with each one's outcome.
     all: bool = false,
+    /// The client prints `content`: every wake carries the pushed text, and
+    /// a record it carries in full is handed out (agent_read skips it).
+    content: bool = false,
 
     /// The agents it names.
     pub fn names(self: *const Subscribe) []const []const u8 {
@@ -236,6 +244,13 @@ pub fn formatWake(w: *std.Io.Writer, m: Message) !void {
     if (m.state.len > 0) try w.print(" [state {s}]", .{m.state});
 }
 
+/// A wake as the CLI prints it: the pushed text when the server composed
+/// one, else the one-line form (a server that predates `content`).
+pub fn formatPrinted(w: *std.Io.Writer, m: Message) !void {
+    if (m.content) |text| return w.writeAll(text);
+    try formatWake(w, m);
+}
+
 /// `s`, or when longer than `max` its head cut at the last space (a
 /// character boundary when it has none nearby) and an explicit `...`: a
 /// cut inside a word reads as a value of the line's own fields.
@@ -299,8 +314,12 @@ pub const HELP =
     \\                              [--follow] [--json] [...]
     \\
     \\Waits for an agent that an MCP server (`sketerm mcp`) runs, and prints
-    \\one line per wake-up: the agent, the event that woke it and a short
-    \\text. It wakes on done (the agent settled: idle with no subagents or
+    \\each wake-up as the text a push delivers: one line (the agent, the
+    \\event that woke it, a short text), then what that line cuts short: a
+    \\done's answer or a message in full when under 2000 characters (else a
+    \\pointer to agent_read), a prompt's options, an error's whole text.
+    \\A message it printed in full is handed out: agent_read does not repeat
+    \\it. It wakes on done (the agent settled: idle with no subagents or
     \\background tasks), needs_input, error, exited and connection_lost,
     \\plus every completed message with --messages or a message containing
     \\TEXT with --match (rate limited: the rest are summarised), and on the
@@ -323,9 +342,7 @@ pub const HELP =
     \\The agent_* tools hand out the exact command as `watch_command`.
     \\
     \\--server follows every agent of the server, those opened later too,
-    \\and prints each wake-up as the text a push delivers: the line, and for
-    \\a done the job's answer when it is short (agent_read then does not
-    \\repeat it). --parent PID finds the server that process started (how
+    \\printing each wake-up the same way. --parent PID finds the server that process started (how
     \\an MCP client's plugin finds its own server) instead of --socket.
     \\--json prints every server line as it arrives, one JSON object each.
     \\
@@ -489,6 +506,7 @@ pub fn cli(allocator: std.mem.Allocator, args: []const []const u8) u8 {
         .since = o.since,
         .server = o.server,
         .all = o.all,
+        .content = true,
     };
     const line = std.fmt.allocPrint(arena, "{f}\n", .{std.json.fmt(sub, .{ .emit_null_optional_fields = false })}) catch return ended("out of memory", 1);
     say(fd, line);
@@ -517,7 +535,7 @@ pub fn cli(allocator: std.mem.Allocator, args: []const []const u8) u8 {
             if (std.mem.eql(u8, m.type, "all")) {
                 formatAll(&aw.writer, m) catch continue;
             } else if (std.mem.eql(u8, m.type, "wake")) {
-                if (m.content) |text| aw.writer.writeAll(text) catch continue else formatWake(&aw.writer, m) catch continue;
+                formatPrinted(&aw.writer, m) catch continue;
                 // A server that predates --all read the line as --any.
                 if (o.all) aw.writer.writeAll("\n(this MCP server predates --all: it woke on the first agent only)") catch continue;
             } else continue;
@@ -598,6 +616,19 @@ test "a server subscription and its pushed wake round-trip" {
     const m = try std.json.parseFromSliceLeaky(Message, a, wake[0 .. wake.len - 1], .{ .ignore_unknown_fields = true });
     try t.expectEqualStrings("claude-1 done: ok [state idle]\n\nok", m.content.?);
     try t.expectEqualStrings("done", m.meta.?.kind);
+    // The plain waiter prints exactly that text; without it, the one line.
+    var printed: std.Io.Writer.Allocating = .init(a);
+    try formatPrinted(&printed.writer, m);
+    try t.expectEqualStrings(m.content.?, printed.written());
+    var bare = m;
+    bare.content = null;
+    var one_line: std.Io.Writer.Allocating = .init(a);
+    try formatPrinted(&one_line.writer, bare);
+    try t.expectEqualStrings("claude-1 done: ok [state idle]", one_line.written());
+    // Every CLI asks for the content; an old subscribe line reads as not.
+    const plain = try std.fmt.allocPrint(a, "{f}", .{std.json.fmt(Subscribe{ .agent = "claude-1", .content = true }, .{ .emit_null_optional_fields = false })});
+    try t.expect((try std.json.parseFromSliceLeaky(Subscribe, a, plain, .{ .ignore_unknown_fields = true })).content);
+    try t.expect(!(try std.json.parseFromSliceLeaky(Subscribe, a, "{\"agent\":\"claude-1\"}", .{ .ignore_unknown_fields = true })).content);
 }
 
 test "the watch command round-trips through the cli grammar and bakes in no cursor" {

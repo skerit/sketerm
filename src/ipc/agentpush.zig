@@ -3,7 +3,8 @@
 //! text composed here and the agent's one delivery state: a Claude Code
 //! channel notification (`notifications/claude/channel`, written by the
 //! MCP server itself) and an `agent-wait --server` follower (the opencode
-//! plugin runs one and prompts the session with each wake-up).
+//! plugin runs one and prompts the session with each wake-up). The plain
+//! waiter prints the same text (`agentwait.Subscribe.content`).
 //!
 //! Claude Code tells a server nothing about channels: it only registers a
 //! listener when the session was started with `--channels server:<name>`
@@ -34,7 +35,8 @@ pub const CHANNEL_FLAGS = [_][]const u8{ "--channels", "--dangerously-load-devel
 /// The MCP server name a channel entry is matched against by default
 /// (`sketerm mcp --channel-name` overrides it).
 pub const DEFAULT_CHANNEL_NAME = "sketerm";
-/// A `done` carries its job's answer in full below this many characters.
+/// A `done` carries its job's answer (a `message` its text) in full below
+/// this many characters.
 pub const ANSWER_MAX_CHARS = 2000;
 /// Ancestors searched for the channel option (a wrapper shell or two
 /// may sit between Claude Code and this server).
@@ -92,11 +94,11 @@ pub fn ancestorNamesChannel(name: []const u8) bool {
 
 /// One wake-up as a push delivers it.
 pub const Push = struct {
-    /// The waiter's line, then a done's answer when it is short enough.
+    /// The waiter's line, then what it cuts short (`compose`).
     content: []const u8,
     meta: agentwait.Meta,
-    /// Index into the records of the answer `content` carries in full:
-    /// the caller marks it handed out.
+    /// Index into the records of the record `content` carries in full (a
+    /// done's answer, a message): the caller marks it handed out.
     answer: ?usize = null,
 };
 
@@ -117,29 +119,22 @@ fn decisive(items: []const events.Item) ?events.Item {
     return best;
 }
 
-/// Compose the push for `d`: the waiter's one line, and for a `done` the
-/// job's answer in full when under `ANSWER_MAX_CHARS` and not handed out
-/// before (else a pointer to agent_read).
+/// Compose the push for `d`: the waiter's one line, then for an event
+/// that announces a record (a `done`'s answer, a `message`) that record in
+/// full when under `ANSWER_MAX_CHARS` and not handed out before (else a
+/// pointer to agent_read), and for any other the text the line cut and
+/// its detail (a prompt's options, a limit's reset time).
 pub fn compose(arena: std.mem.Allocator, who: Subject, d: events.Delivery, q: *const events.Queue, records: []const output.Record, handed: *const select.Handed) !Push {
     const m = try agentwait.wakeMessage(arena, who.agent, who.state, d, q);
     var aw: std.Io.Writer.Allocating = .init(arena);
     try agentwait.formatWake(&aw.writer, m);
     const best = decisive(d.items);
     var answer: ?usize = null;
-    if (best) |b| if (b.kind == .done) if (b.event.record) |rid| {
-        for (records, 0..) |r, i| {
-            if (r.id != rid) continue;
-            if (handed.has(r) or r.text.len == 0) break;
-            const chars = std.unicode.utf8CountCodepoints(r.text) catch r.text.len;
-            if (chars < ANSWER_MAX_CHARS) {
-                try aw.writer.print("\n\n{s}", .{r.text});
-                answer = i;
-            } else {
-                try aw.writer.print("\n\n(the answer is {d} characters: agent_read {{agent: \"{s}\"}} returns it)", .{ chars, who.agent });
-            }
-            break;
-        }
-    };
+    if (best) |b| {
+        if (b.kind.announcesRecord()) {
+            if (b.event.record) |rid| answer = try carryRecord(&aw.writer, who.agent, records, handed, rid);
+        } else try carryText(&aw.writer, b.event);
+    }
     var seq_buf: [24]u8 = undefined;
     const seq: u64 = if (best) |b| b.event.seq else if (d.digest) |g| g.latest_seq else 0;
     return .{
@@ -156,6 +151,34 @@ pub fn compose(arena: std.mem.Allocator, who: Subject, d: events.Delivery, q: *c
             .conversation = who.conversation,
         },
     };
+}
+
+/// Record `rid` in full below the line, or a pointer when it is too long.
+/// @return its index when carried in full; null when handed out before,
+/// empty, too long or not found.
+fn carryRecord(w: *std.Io.Writer, agent: []const u8, records: []const output.Record, handed: *const select.Handed, rid: u64) !?usize {
+    for (records, 0..) |r, i| {
+        if (r.id != rid) continue;
+        if (handed.has(r) or r.text.len == 0) return null;
+        const chars = select.chars(r.text);
+        if (chars < ANSWER_MAX_CHARS) {
+            try w.print("\n\n{s}", .{r.text});
+            return i;
+        }
+        try w.print("\n\n(the answer is {d} characters: agent_read {{agent: \"{s}\"}} returns it)", .{ chars, agent });
+        return null;
+    }
+    return null;
+}
+
+/// What the one line cut of `ev`'s text (more lines, or a first line past
+/// `agentwait.LINE_TEXT_MAX`), then its detail.
+fn carryText(w: *std.Io.Writer, ev: *const events.Event) !void {
+    const text = std.mem.trim(u8, ev.text, " \t\r\n");
+    const first = events.firstLine(ev.text);
+    if (text.len > first.len or first.len > agentwait.LINE_TEXT_MAX) try w.print("\n\n{s}", .{events.clip(text, ANSWER_MAX_CHARS * 4)});
+    const detail = std.mem.trim(u8, ev.detail, " \t\r\n");
+    if (detail.len > 0) try w.print("\n\n{s}", .{events.clip(detail, ANSWER_MAX_CHARS * 4)});
 }
 
 /// The channel notification for `p`, one newline-free JSON-RPC line.
@@ -223,4 +246,42 @@ test "a done push carries its short answer once, a long one by pointer" {
     const p2 = try compose(a, .{ .agent = "claude-k3f9", .state = .idle }, d2, &q, &big, &handed);
     try t.expect(p2.answer == null);
     try t.expect(std.mem.endsWith(u8, p2.content, "(the answer is 2000 characters: agent_read {agent: \"claude-k3f9\"} returns it)"));
+}
+
+test "a wake carries what its line cuts: a message in full, a prompt's options, a long error" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var q = events.Queue.init(t.allocator, .{});
+    defer q.deinit();
+    var handed: select.Handed = .{};
+    defer handed.deinit(t.allocator);
+    var text = "Halfway: the parser is fixed.\nNow the tests.".*;
+    const recs = [_]output.Record{.{ .id = 4, .kind = .assistant, .text = &text, .job = 1 }};
+    var cur: events.Cursor = .{};
+
+    // An opt-in message: its record in full, to be marked handed.
+    _ = try q.pushMessage(0, &text, 4);
+    const dm = (try cur.take(&q, .{ .messages = true }, 0, a)).?;
+    const pm = try compose(a, .{ .agent = "claude-k3f9", .state = .working }, dm, &q, &recs, &handed);
+    try t.expectEqualStrings("claude-k3f9 message: Halfway: the parser is fixed. [state working]\n\nHalfway: the parser is fixed.\nNow the tests.", pm.content);
+    try t.expectEqual(@as(?usize, 0), pm.answer);
+
+    // A prompt: its options, which the line never shows.
+    _ = try q.push(1, .needs_input, null, "permission: Bash (rm notes.md)", "1. Yes\n2. No");
+    const dn = (try cur.take(&q, .{}, 1, a)).?;
+    const pn = try compose(a, .{ .agent = "claude-k3f9", .state = .waiting_user }, dn, &q, &recs, &handed);
+    try t.expectEqualStrings("claude-k3f9 needs_input: permission: Bash (rm notes.md) [state waiting_user]\n\n1. Yes\n2. No", pn.content);
+    try t.expect(pn.answer == null);
+
+    // An error the line cuts: its whole text; a short one adds nothing.
+    const long = "API Error: " ++ "x" ** 200;
+    _ = try q.push(2, .@"error", .api, long, "");
+    const de = (try cur.take(&q, .{}, 2, a)).?;
+    const pe = try compose(a, .{ .agent = "claude-k3f9", .state = .idle }, de, &q, &recs, &handed);
+    try t.expect(std.mem.endsWith(u8, pe.content, "[state idle]\n\n" ++ long));
+    _ = try q.push(3, .exited, null, "", "");
+    const dx = (try cur.take(&q, .{}, 3, a)).?;
+    const px = try compose(a, .{ .agent = "claude-k3f9", .state = .exited }, dx, &q, &recs, &handed);
+    try t.expectEqualStrings("claude-k3f9 exited [state exited]", px.content);
 }
