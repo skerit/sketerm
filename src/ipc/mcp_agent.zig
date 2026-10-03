@@ -2727,12 +2727,7 @@ fn effortRefusal(arena: std.mem.Allocator, loaded: *const adapter.Loaded) ![]con
     return std.fmt.allocPrint(arena, "effort must be one of: {s}", .{try std.mem.join(arena, ", ", loaded.spec.launch.effort_values)});
 }
 
-fn isDir(path: []const u8) bool {
-    var buf: [4096]u8 = undefined;
-    const z = std.fmt.bufPrintZ(&buf, "{s}", .{path}) catch return false;
-    var st: c.struct_stat = undefined;
-    return c.stat(z.ptr, &st) == 0 and (st.st_mode & c.S_IFMT) == c.S_IFDIR;
-}
+const isDir = @import("../util/pathz.zig").isDir;
 
 fn candidateList(arena: std.mem.Allocator, loaded: *const adapter.Loaded) ![]const u8 {
     return std.mem.join(arena, ", ", loaded.spec.launch.candidates);

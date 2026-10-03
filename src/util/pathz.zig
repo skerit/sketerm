@@ -135,6 +135,14 @@ pub fn fsyncParent(path: []const u8) bool {
     return c.fsync(dfd) == 0;
 }
 
+/// Whether `path` names a directory, following symlinks; an unstatable or oversize path is not one.
+pub fn isDir(path: []const u8) bool {
+    var buf: [4096]u8 = undefined;
+    const z = std.fmt.bufPrintZ(&buf, "{s}", .{path}) catch return false;
+    var st: c.struct_stat = undefined;
+    return c.stat(z.ptr, &st) == 0 and (st.st_mode & c.S_IFMT) == c.S_IFDIR;
+}
+
 /// Whether `name` resolves to an executable through `$PATH`.
 ///
 /// Empty `$PATH` entries are SKIPPED rather than read as ".": every
@@ -289,6 +297,12 @@ test "fsyncParent syncs a real parent and reports an unopenable one" {
     // No directory component: the current directory is the parent.
     try std.testing.expect(fsyncParent("f"));
     try std.testing.expect(!fsyncParent("/definitely/not/a/directory/f"));
+}
+
+test "isDir tells a directory from a file and a missing path" {
+    try std.testing.expect(isDir("/"));
+    try std.testing.expect(!isDir("/proc/self/status"));
+    try std.testing.expect(!isDir("/nonexistent-sketerm-path"));
 }
 
 test "executableOnPath finds a real binary and misses a made-up one" {

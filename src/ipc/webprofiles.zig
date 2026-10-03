@@ -621,12 +621,7 @@ const ScratchState = struct {
     }
 };
 
-fn dirExists(path: []const u8) bool {
-    var z: [4096:0]u8 = undefined;
-    const p = std.fmt.bufPrintZ(&z, "{s}", .{path}) catch return false;
-    var st: c.struct_stat = undefined;
-    return c.stat(p.ptr, &st) == 0 and (st.st_mode & c.S_IFDIR) != 0;
-}
+const dirExists = pathz.isDir;
 
 fn makeJar(store: *const Store, name: []const u8, id: u32) !void {
     var buf: [4096]u8 = undefined;
