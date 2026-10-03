@@ -18,6 +18,7 @@
 //! GTK-free and in both test roots (src/lsp/CLAUDE.md).
 
 const std = @import("std");
+const jsonnum = @import("../util/jsonnum.zig");
 const Allocator = std.mem.Allocator;
 
 /// One decoded token, in LSP coordinates.
@@ -167,7 +168,7 @@ pub const Data = struct {
         };
         self.raw.clearRetainingCapacity();
         self.raw.ensureTotalCapacity(self.alloc, arr.items.len) catch return false;
-        for (arr.items) |v| self.raw.appendAssumeCapacity(uintOf(v));
+        for (arr.items) |v| self.raw.appendAssumeCapacity(jsonnum.u32Of(v));
         self.setResultId(o.get("resultId") orelse .null);
         self.valid = true;
         return true;
@@ -197,8 +198,8 @@ pub const Data = struct {
         defer list.deinit(self.alloc);
         for (edits.items) |e| {
             if (e != .object) return false;
-            const start: usize = @intCast(uintOf(e.object.get("start") orelse .null));
-            const del: usize = @intCast(uintOf(e.object.get("deleteCount") orelse .null));
+            const start: usize = @intCast(jsonnum.u32Of(e.object.get("start")));
+            const del: usize = @intCast(jsonnum.u32Of(e.object.get("deleteCount")));
             if (start > self.raw.items.len or start + del > self.raw.items.len) return false;
             const data: ?[]const std.json.Value = switch (e.object.get("data") orelse std.json.Value.null) {
                 .array => |a| a.items,
@@ -218,7 +219,7 @@ pub const Data = struct {
             const src = s.data orelse &.{};
             const buf = self.alloc.alloc(u32, src.len) catch return false;
             defer self.alloc.free(buf);
-            for (src, 0..) |v, k| buf[k] = uintOf(v);
+            for (src, 0..) |v, k| buf[k] = jsonnum.u32Of(v);
             self.raw.replaceRange(self.alloc, s.start, s.del, buf) catch return false;
         }
         self.setResultId(o.get("resultId") orelse .null);
@@ -255,14 +256,6 @@ pub const Data = struct {
         return out.toOwnedSlice(alloc);
     }
 };
-
-fn uintOf(v: std.json.Value) u32 {
-    return switch (v) {
-        .integer => |i| if (i < 0) 0 else if (i > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(i),
-        .float => |f| if (f < 0) 0 else @intFromFloat(@min(f, @as(f64, std.math.maxInt(u32)))),
-        else => 0,
-    };
-}
 
 // ======================================================================
 // Tests
