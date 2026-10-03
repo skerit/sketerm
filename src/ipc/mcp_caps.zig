@@ -353,6 +353,7 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
         try res.fact("ssh_master_max_age_s", cfg.mux_ssh_master_max_age_secs);
     }
     try res.fact("ssh_no_x11", true);
+    try res.fact("ssh_connect_timeout_s", @import("../mux/sshroute.zig").CONNECT_TIMEOUT_SECS);
     try res.fact("scp_put_targets", @as(u32, mcp_term.MAX_TARGETS));
     try res.fact("file_sync", headless_terms);
     try res.fact("file_sync_local_rsync", @import("../util/pathz.zig").executableOnPath("rsync"));

@@ -8218,6 +8218,7 @@ fn agentSshStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u
         const body = std.fmt.allocPrint(arena,
             \\#!/bin/sh
             \\if [ "$1" = "-G" ]; then printf 'hostname 127.0.0.1\n'; exit 0; fi
+            \\case " $* " in *" downhost "*) echo 'ssh: connect to host downhost port 22: Connection timed out' >&2; exit 255;; esac
             \\[ -e '{s}' ] && exit 255
             \\export XDG_RUNTIME_DIR='{s}' XDG_STATE_HOME='{s}' XDG_CONFIG_HOME='{s}' SKETERM_MUX_BIN='{s}'
             \\exec '{s}' --proxy
@@ -8239,6 +8240,21 @@ fn agentSshStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u
         if (!caps.get("agent_ssh").?.bool) fail("capabilities: agent_ssh is false with an ssh client on PATH");
         if (!caps.get("agent_login_shell").?.bool) fail("capabilities: agent_login_shell is false with an ssh client on PATH");
         if (capInt(caps, "scp_put_targets") != 32) fail("capabilities: scp_put_targets is not 32");
+        if (capInt(caps, "ssh_connect_timeout_s") != 10) fail("capabilities: ssh_connect_timeout_s is not 10");
+
+        // A host ssh cannot reach fails term_open at once, naming the host
+        // and what ssh said, instead of falling back to a plain ssh session.
+        {
+            const t0 = nowMs();
+            const refused = agentCall(&m, arena, "term_open", "{\"host\":\"downhost\"}", "term_open to a down host", true, 60_000);
+            const err = (refused.get("error") orelse fail("term_open to a down host: no error")).object;
+            expectFact(err, "code", "host_unreachable", "term_open to a down host: code");
+            const details = (err.get("details") orelse fail("term_open to a down host: no details")).object;
+            expectFact(details, "host", "downhost", "term_open to a down host: host");
+            if (std.mem.indexOf(u8, scStr(details, "ssh_error", "term_open to a down host"), "Connection timed out") == null) fail("term_open to a down host: ssh's message is missing");
+            if (nowMs() - t0 > 10_000) fail("term_open to a down host: not fast (it retried, or fell back to plain ssh)");
+            say("smoke-mcp: term_open to an unreachable host fails fast as host_unreachable with ssh's message ok");
+        }
 
         // scp_put to several targets: each verified and moved on its own,
         // a failing one (its directory does not exist) stops none of the others.

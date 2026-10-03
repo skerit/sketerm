@@ -241,6 +241,25 @@ pub const Leg = struct {
     multiplex: bool = false,
 };
 
+/// Seconds every sketerm ssh/scp leg waits for its TCP connection.
+pub const CONNECT_TIMEOUT_SECS: u32 = 10;
+const CONNECT_TIMEOUT_OPTION = std.fmt.comptimePrint("ConnectTimeout={d}", .{CONNECT_TIMEOUT_SECS});
+
+/// The line of ssh's stderr saying it could not reach the host at all (no
+/// route, refused, timed out, unknown name), or null: anything else (auth,
+/// a missing remote binary) means the host answered.
+pub fn unreachableLine(stderr: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, stderr, '\n');
+    while (it.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        for ([_][]const u8{ "ssh: connect to host ", "ssh: Could not resolve hostname " }) |p| {
+            if (std.mem.startsWith(u8, line, p)) return line;
+        }
+        if (std.mem.indexOf(u8, line, "Connection timed out during banner exchange") != null) return line;
+    }
+    return null;
+}
+
 /// Moves sketerm's ControlPath directory (default `~/.ssh`), so a test can
 /// run masters the user's own sessions never see.
 pub const CONTROL_DIR_ENV = "SKETERM_SSH_CONTROL_DIR";
@@ -388,6 +407,11 @@ pub const Args = struct {
         // or a script's output. `-o` works for scp too, unlike `-x`.
         put(out, &n, "-o");
         put(out, &n, "ForwardX11=no");
+        // A host that is down answers no SYN: without a bound ssh waits for
+        // the kernel's ~2 min of retries. A multiplexed leg that reuses a
+        // live master opens no TCP connection, so this never touches it.
+        put(out, &n, "-o");
+        put(out, &n, CONNECT_TIMEOUT_OPTION);
         if (leg.batch) {
             put(out, &n, "-o");
             put(out, &n, "BatchMode=yes");
@@ -582,6 +606,7 @@ test "every leg disables X11 and keeps its own differences explicit" {
         var args = try plan.args(leg);
         const text = try joinedOptions(a, &args);
         try t.expect(std.mem.indexOf(u8, text, "-o ForwardX11=no ") != null);
+        try t.expect(std.mem.indexOf(u8, text, "-o ConnectTimeout=10 ") != null);
         try t.expectEqual(leg.batch, std.mem.indexOf(u8, text, "BatchMode=yes") != null);
         try t.expectEqual(leg.keepalive, std.mem.indexOf(u8, text, "ServerAliveInterval=15") != null);
         try t.expectEqual(leg.clear_forwardings, std.mem.indexOf(u8, text, "ClearAllForwardings=yes") != null);
@@ -590,6 +615,19 @@ test "every leg disables X11 and keeps its own differences explicit" {
         // Tor never rides a direct master, whatever the leg asks.
         if (route == .tor) try t.expect(std.mem.indexOf(u8, text, "ControlMaster=auto") == null);
     };
+}
+
+test "an unreachable host is told apart from a host that answered" {
+    const t = std.testing;
+    try t.expectEqualStrings("ssh: connect to host 10.255.255.1 port 22: Connection timed out", unreachableLine("Warning: noise\nssh: connect to host 10.255.255.1 port 22: Connection timed out\r\n").?);
+    try t.expect(unreachableLine("ssh: connect to host box port 22: No route to host\n") != null);
+    try t.expect(unreachableLine("ssh: connect to host box port 22: Connection refused\n") != null);
+    try t.expect(unreachableLine("ssh: Could not resolve hostname nope: Name or service not known\n") != null);
+    try t.expect(unreachableLine("Connection timed out during banner exchange\nConnection to 10.0.0.1 port 22 timed out\n") != null);
+    // The host answered: auth, a missing command, nothing at all.
+    try t.expect(unreachableLine("me@box: Permission denied (publickey).\n") == null);
+    try t.expect(unreachableLine("sh: 1: sketerm-mux: not found\n") == null);
+    try t.expect(unreachableLine("") == null);
 }
 
 test "multiplexing uses sketerm's own ControlPath under the control dir" {

@@ -23,6 +23,7 @@ const nowMs = @import("../util/clock.zig").nowMs;
 const shellquote = mcp.shellquote;
 const sshroute = @import("../mux/sshroute.zig");
 const sshmaster = @import("../mux/sshmaster.zig");
+const muxclient = @import("../mux/client.zig");
 const Config = @import("../config.zig").Config;
 const transport_mod = @import("transport.zig");
 const filesync = @import("filesync.zig");
@@ -356,6 +357,9 @@ fn termOpen(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
         }
         id = spawnRegisteredRemoteTerm(host.?, margv, cols, rows, .{ .title = name orelse "" }) catch {
             remote_integration = false;
+            // A host ssh cannot reach fails the open: a plain ssh session
+            // would only show the same refusal later.
+            if (muxclient.sshUnreachable().len > 0) return hostUnreachable(arena, host.?, muxclient.sshUnreachable());
             if (choice == .mux)
                 return mcp.errRes(arena, .unavailable, NO_REMOTE_MUX);
             break :mux;
@@ -980,6 +984,17 @@ fn forwardElemJson(
     try w.print(",\"local_port\":{d},\"remote_host\":", .{local_port});
     try std.json.Stringify.value(remote_host, .{}, w);
     try w.print(",\"remote_port\":{d},\"alive\":{},\"reconnects\":{d}}}", .{ remote_port, alive, reconnects });
+}
+
+/// The error result for a host ssh could not reach at all: `host_unreachable`
+/// naming the host and ssh's own line (`sshroute.unreachableLine`), with both
+/// as details; every term_* and agent_* leg answers it the same way.
+pub fn hostUnreachable(arena: std.mem.Allocator, host: []const u8, ssh_said: []const u8) ![]const u8 {
+    return mcp.errResDetails(arena, .host_unreachable, try unreachableMsg(arena, host, ssh_said), @as(?struct { host: []const u8, ssh_error: []const u8 }, .{ .host = host, .ssh_error = ssh_said }));
+}
+
+pub fn unreachableMsg(arena: std.mem.Allocator, host: []const u8, ssh_said: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(arena, "{s} is unreachable: ssh could not connect (ConnectTimeout {d} s): {s}", .{ host, sshroute.CONNECT_TIMEOUT_SECS, ssh_said });
 }
 
 /// Full ssh argv running `script` on `host`, honouring the host's

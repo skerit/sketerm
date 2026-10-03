@@ -1340,10 +1340,13 @@ pub const ErrCode = enum {
     /// Typed into an agent that showed no sign of taking it: never resent
     /// blindly, since a late uptake would submit it twice.
     not_delivered,
+    /// ssh could not reach the host at all (`sshroute.unreachableLine`):
+    /// down, no route, refused, or an unknown name.
+    host_unreachable,
 
     pub fn retryable(self: ErrCode) bool {
         return switch (self) {
-            .timeout, .unavailable, .io_failed => true,
+            .timeout, .unavailable, .io_failed, .host_unreachable => true,
             .invalid_args, .not_found, .refused, .conflict, .unknown_tool, .failed, .not_delivered => false,
         };
     }

@@ -2009,6 +2009,8 @@ fn probeRemote(arena: std.mem.Allocator, host: []const u8, lookups: []const laun
         .run => |r| {
             const res = try launch.parseProbe(arena, r.output, lookups.len);
             if (r.exited and r.status_known and r.status == 0 and res.complete) return .{ .ok = res };
+            if (sshroute.unreachableLine(r.output)) |said|
+                return .{ .fail = .{ .code = .host_unreachable, .msg = try mcp_term.unreachableMsg(arena, host, said) } };
             return .{ .fail = .{ .code = .unavailable, .msg = try std.fmt.allocPrint(arena, "could not look the agent up on {s} over ssh (key or agent auth is required; {s}):\n{s}", .{
                 host,
                 if (!r.exited) "the probe did not finish in time" else "the probe failed",
@@ -2743,6 +2745,10 @@ fn spawnOn(arena: std.mem.Allocator, where: *Where, choice: transport_mod.Choice
             .ttl_secs = state.ttl_secs,
             .title = spec.title,
         }) catch {
+            if (muxclient.sshUnreachable().len > 0) {
+                why.* = .{ .code = .host_unreachable, .msg = try mcp_term.unreachableMsg(arena, host, muxclient.sshUnreachable()) };
+                return error.Refused;
+            }
             // Never a silent plain-ssh agent: it would die with the link.
             why.* = .{ .code = .unavailable, .msg = try noRemoteMux(arena, host) };
             return error.Refused;
@@ -4891,7 +4897,8 @@ fn attachSession(arena: std.mem.Allocator, transport: Transport, host: ?[]const 
     why.session = name;
     var conn = if (remote)
         muxconnect.connectSsh(a, host orelse return error.BadDescriptor) catch {
-            why.* = .{ .kind = .unreachable_host, .session = name, .msg = try sshDiagnose(arena, host.?) };
+            const said = muxclient.sshUnreachable();
+            why.* = .{ .kind = .unreachable_host, .session = name, .msg = if (said.len > 0) try arena.dupe(u8, said) else try sshDiagnose(arena, host.?) };
             return error.Unreachable;
         }
     else blk: {

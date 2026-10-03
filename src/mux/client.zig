@@ -139,6 +139,17 @@ fn noteRouteFailure(comptime fmt: []const u8, args: anytype) void {
     route_failure_len = text.len;
 }
 
+/// What ssh said when the last direct ssh connect on this thread could not
+/// reach its host at all (`sshroute.unreachableLine`).
+threadlocal var ssh_unreachable_buf: [384]u8 = undefined;
+threadlocal var ssh_unreachable_len: usize = 0;
+
+/// ssh's line saying the host could not be reached, after a direct ssh
+/// connect on this thread failed that way; empty otherwise.
+pub fn sshUnreachable() []const u8 {
+    return ssh_unreachable_buf[0..ssh_unreachable_len];
+}
+
 pub const ConnectOptions = struct {
     udp_port_range: ?[]const u8 = null,
     tor_socks_endpoint: []const u8 = @import("socks5_client.zig").DEFAULT_ENDPOINT,
@@ -1244,6 +1255,7 @@ pub const Conn = struct {
 
     /// Route-aware SSH connect with every connect option (`udp_port_range` unused).
     pub fn connectSshWith(allocator: std.mem.Allocator, spec: []const u8, options: ConnectOptions) !Conn {
+        ssh_unreachable_len = 0;
         if (RouteSpec.isRoute(spec)) return connectRoute(allocator, spec, options);
         const remote = RemoteSpec.parse(spec);
         const route: sshroute.Route = switch (remote.mode) {
@@ -1275,13 +1287,16 @@ pub const Conn = struct {
             // transient sshd stall on the first attempt must not
             // demote every remaining attempt to fast "command not
             // found" failures.
+            // A host ssh cannot reach at all does not answer a retry either.
             if (prepared) |p| {
-                if (connectSshOnceUsing(allocator, &plan, p.path, 20_000, options.ssh_master)) |conn| return conn else |_| {}
+                if (connectSshOnceUsing(allocator, &plan, p.path, 20_000, options.ssh_master)) |conn| return conn else |err| {
+                    if (err == error.HostUnreachable) return err;
+                }
             }
             if (connectSshOnceUsing(allocator, &plan, null, 20_000, options.ssh_master)) |conn| {
                 return conn;
             } else |err| {
-                if (attempt + 1 >= 3) return err;
+                if (err == error.HostUnreachable or attempt + 1 >= 3) return err;
                 _ = c.usleep(400_000);
             }
         }
@@ -1300,6 +1315,7 @@ pub const Conn = struct {
 
     /// `connectSshOnceWithEndpoint` with every connect option.
     pub fn connectSshOnceWith(allocator: std.mem.Allocator, spec: []const u8, options: ConnectOptions) !Conn {
+        ssh_unreachable_len = 0;
         if (RouteSpec.isRoute(spec)) return connectRoute(allocator, spec, options);
         const remote = RemoteSpec.parse(spec);
         const route: sshroute.Route = switch (remote.mode) {
@@ -1312,7 +1328,9 @@ pub const Conn = struct {
         var prepared = deploy.localPath(allocator);
         defer if (prepared) |*p| p.deinit();
         if (prepared) |p| {
-            if (connectSshOnceUsing(allocator, &plan, p.path, 5_000, options.ssh_master)) |conn| return conn else |_| {}
+            if (connectSshOnceUsing(allocator, &plan, p.path, 5_000, options.ssh_master)) |conn| return conn else |err| {
+                if (err == error.HostUnreachable) return err;
+            }
         }
         return connectSshOnceUsing(allocator, &plan, null, 15_000, options.ssh_master);
     }
@@ -1352,19 +1370,25 @@ pub const Conn = struct {
         }
         argv_buf[n] = null;
 
-        var conn = try spawnOverSocketpair(allocator, ssh_bin, @ptrCast(&argv_buf));
+        // ssh's stderr in an unlinked file, as for routes: what it said
+        // tells an unreachable host from one that answered.
+        const err_fd = scratchFile();
+        defer if (err_fd >= 0) {
+            _ = c.close(err_fd);
+        };
+        var conn = try spawnOverSocketpairErr(allocator, ssh_bin, @ptrCast(&argv_buf), err_fd);
         errdefer conn.deinit();
 
         // Probe the bridge: hello → welcome proves ssh + remote
         // binary + daemon all came up before we hand the conn out.
         // Bound the welcome wait so a stalled banner surfaces as a
         // retryable error instead of hanging the blocking read forever.
-        conn.sendHello() catch return error.SshTransportFailed;
+        conn.sendHello() catch return sshBroke(err_fd);
         const deadline = nowMs() + timeout_ms;
-        try waitReadable(conn.fd, deadline);
+        waitReadable(conn.fd, deadline) catch return sshBroke(err_fd);
         const remain = deadline - nowMs();
-        if (remain <= 0) return error.SshTransportFailed;
-        const w = conn.recvExpectFor(&.{.welcome}, remain) catch return error.SshTransportFailed;
+        if (remain <= 0) return sshBroke(err_fd);
+        const w = conn.recvExpectFor(&.{.welcome}, remain) catch return sshBroke(err_fd);
         defer w.deinit(allocator);
         conn.applyWelcome(allocator, w.payload);
         conn.transport = if (plan.route == .tor) .tor else .ssh;
@@ -1486,6 +1510,16 @@ pub const Conn = struct {
         }
         noteRouteFailure("route hop {s} did not answer: {s}", .{ host, lastLine(said) });
         return error.RouteHopUnreachable;
+    }
+
+    /// A direct ssh connect failed: `HostUnreachable` (noted for
+    /// `sshUnreachable`) when ssh could not reach it at all.
+    fn sshBroke(err_fd: c_int) anyerror {
+        var buf: [1024]u8 = undefined;
+        const line = sshroute.unreachableLine(scratchRead(err_fd, &buf)) orelse return error.SshTransportFailed;
+        const text = std.fmt.bufPrint(&ssh_unreachable_buf, "{s}", .{line}) catch ssh_unreachable_buf[0..];
+        ssh_unreachable_len = text.len;
+        return error.HostUnreachable;
     }
 
     fn lastLine(text: []const u8) []const u8 {
