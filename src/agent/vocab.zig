@@ -153,8 +153,9 @@ pub const ErrorClass = enum {
     auth,
     /// Only surfaced when it persists.
     retrying,
-    /// The provider was overloaded or unavailable (a 5xx) and the turn
-    /// ended on it: what `retry_on_overload` answers with a continue prompt.
+    /// The provider was overloaded or unavailable (a 5xx), or the
+    /// connection to it dropped, and the turn ended on it: what
+    /// `retry_on_overload` answers with a continue prompt.
     overloaded,
     api,
     crashed,

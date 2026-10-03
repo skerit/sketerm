@@ -809,6 +809,10 @@ test "every shipped adapter loads, and a user file overrides by id" {
     try t.expectEqual(vocab.ErrorClass.limit, firstClass(cl, "You've hit your limit, resets 5pm").?);
     try t.expectEqual(vocab.ErrorClass.overloaded, firstClass(oc, "APIError 503: Service Unavailable").?);
     try t.expectEqual(vocab.ErrorClass.overloaded, firstClass(oc, "APIError 529: Overloaded").?);
+    // A dropped provider connection (seen killing opencode turns overnight)
+    // is retried like an overload, never the generic API class.
+    try t.expectEqual(vocab.ErrorClass.overloaded, firstClass(oc, "APIError: Connection reset by server").?);
+    try t.expectEqual(vocab.ErrorClass.overloaded, firstClass(oc, "APIError: read ECONNRESET").?);
     try t.expectEqual(vocab.ErrorClass.limit, firstClass(oc, "APIError 429: Rate limit exceeded").?);
     try t.expectEqual(vocab.ErrorClass.auth, firstClass(oc, "APIError 401: Unauthorized").?);
     try t.expectEqual(vocab.ErrorClass.api, firstClass(oc, "APIError 400: bad request").?);

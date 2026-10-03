@@ -1485,8 +1485,10 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   or `agent_set` `retry_on_overload: {max, backoff_s}` (max 0-10, default
   3, 0 or null = off; backoff_s 1-600, default 15): when a turn ends on an
   `error` of class `overloaded` (the adapter's error rules: opencode
-  `APIError 5xx`/`Overloaded`/`Service Unavailable`, Claude Code `Repeated
-  529 Overloaded errors`, `API Error: 5xx`, `overloaded_error`), sketerm
+  `APIError 5xx`/`Overloaded`/`Service Unavailable` and a dropped provider
+  connection, `APIError: Connection reset by server`/`ECONNRESET`, Claude
+  Code `Repeated 529 Overloaded errors`, `API Error: 5xx`,
+  `overloaded_error`), sketerm
   types the adapter's `retry.prompt` (`continue`) once the agent is idle,
   after the backoff (doubling, capped at 600 s), at most `max` times per
   job (a prompt the caller sends starts a new budget; `agent_interrupt`

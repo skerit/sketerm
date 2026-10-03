@@ -19,7 +19,7 @@
   "errors": [
     { "class": "auth", "pattern": "^ProviderAuthError|^APIError 401|^APIError 403" },
     { "class": "limit", "pattern": "^APIError 429|[Rr]ate limit|[Uu]sage limit|[Qq]uota|Too Many Requests", "reset_marker": "resets " },
-    { "class": "overloaded", "pattern": "^APIError 5[0-9][0-9]|[Oo]verloaded|Service Unavailable" },
+    { "class": "overloaded", "pattern": "^APIError 5[0-9][0-9]|[Oo]verloaded|Service Unavailable|Connection reset by server|ECONNRESET" },
     { "class": "api", "pattern": "^APIError|^ContextOverflowError|^MessageOutputLengthError|^ContentFilterError|^StructuredOutputError" }
   ],
   "retry": { "prompt": "continue" }
