@@ -1606,13 +1606,15 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   collapses more than `min(rows-10, 2)` line breaks of a real bracketed
   paste). The adapter's `screen.paste` (`lead_in`, `over_chars`,
   optional `over_newlines`, `pause_ms`) makes the recipe step that types
-  `{text}` type `Here are my instructions: ` first and pause 300 ms, so the
-  message reads as typed words followed by the pasted block; short prompts
-  (a retry's `continue`) get nothing, and no sender line is ever added.
-  One real Haiku 4.5 run showed the transcript as `Here are my
-  instructions: ` + `<pasted_content>`, yet Haiku still declined to act on
-  pasted instructions, so the lead-in is a declaration an adapter can
-  change.
+  `{text}` type `Please carry out the instructions in this text: ` first
+  and pause 300 ms, so the message reads as typed words followed by the
+  pasted block; short prompts (a retry's `continue`) get nothing, and no
+  sender line is ever added. The lead-in must ASK for the pasted
+  instructions to be followed: Claude Code tells the model to act on
+  instructions inside `<pasted_content>` only where the user's own words
+  ask it to. Measured on Haiku 4.5: `Here are my instructions: ` + paste
+  was declined as "no explicit instruction"; the current wording + the
+  same kind of paste was carried out exactly.
 - **Startup prompts.** A prompt the app shows before it is ready is still
   an interaction (state `waiting_user`, `needs_input`), so `agent_open`
   returns instead of sitting in `starting`: Claude Code's "trust this

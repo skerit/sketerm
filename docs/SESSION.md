@@ -25,9 +25,10 @@ and load (`src/agent/hoststats.zig`, one sh script for Linux and macOS);
 `mcp_agent_max_per_host` / `mcp_agent_min_free_mb` cap agent_open. Claude
 Code collapses a typed chunk over 800 bytes into `<pasted_content>` (bJ=800
 in its bundled paste handler; a four-line 99-byte chunk is not collapsed),
-so `screen.paste` in claude.json types `Here are my instructions: ` first.
-One real Haiku run confirmed the transcript shape (typed lead-in, then the
-pasted block), and that Haiku still declined to act on pasted instructions.
+so `screen.paste` in claude.json types a lead-in first. Claude Code tells
+the model to act on pasted instructions only where the user's own words ask,
+so the lead-in asks: `Here are my instructions: ` was declined by Haiku, and
+`Please carry out the instructions in this text: ` was carried out exactly.
 
 Validation (2026-10-03): test-core green, test green (3,991 tests, 19 skips; its
 first run failed once on the new requeue unit test's placement, fixed);
