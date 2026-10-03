@@ -8467,10 +8467,24 @@ fn agentSshStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u
         expectFact(ended, "gone_reason", "closed", "gone: the daemon's tombstone reason");
         if (!ended.get("relaunchable").?.bool) fail("gone: not relaunchable");
         if (eventKinds(ended, "exited") != 1) fail("gone: not exactly one exited event");
+        // Compact: the gone agent is on the one gone line, not a full entry.
         const listed = agentCall(&m, arena, "agent_list", "{}", "gone: agent_list", false, 15_000);
-        const item = listed.get("agents").?.array.items[0].object;
+        if (listed.get("agents").?.array.items.len != 0) fail("gone: compact agent_list still lists the gone agent in full");
+        const gone_item = listed.get("gone").?.array.items[0].object;
+        if (!std.mem.eql(u8, gone_item.get("name").?.string, "claude-gone") or !gone_item.get("relaunchable").?.bool)
+            fail("gone: compact agent_list's gone line does not name it relaunchable");
+        const listed_full = agentCall(&m, arena, "agent_list", "{\"detail\":true}", "gone: agent_list detail", false, 15_000);
+        const item = listed_full.get("agents").?.array.items[0].object;
         if (!std.mem.eql(u8, item.get("state").?.string, "exited") or !item.get("relaunchable").?.bool or !std.mem.eql(u8, item.get("gone_reason").?.string, "closed"))
-            fail("gone: agent_list does not say exited, relaunchable, closed");
+            fail("gone: agent_list detail does not say exited, relaunchable, closed");
+        // Its name stays its own: agent_open names the gone agent and the relaunch.
+        {
+            const clash = agentCall(&m, arena, "agent_open", "{\"app\":\"claude\",\"name\":\"claude-gone\",\"host\":\"fakehost\",\"timeout_ms\":5000}", "gone: agent_open with the gone agent's name", true, 30_000);
+            const err = (clash.get("error") orelse fail("gone: name clash: no error")).object;
+            expectFact(err, "code", "conflict", "gone: name clash: code");
+            const msg = scStr(err, "message", "gone: name clash");
+            if (std.mem.indexOf(u8, msg, "is gone") == null or std.mem.indexOf(u8, msg, "relaunch: true") == null) fail("gone: the name clash does not name the gone agent and its relaunch");
+        }
         // agent_attach relaunch starts it again on the host under its id.
         const back = agentCall(&m, arena, "agent_attach", "{\"agent\":\"claude-gone\",\"relaunch\":true,\"timeout_ms\":45000}", "gone: relaunch", false, 60_000);
         expectFact(back, "attach", "relaunched", "gone: relaunched");

@@ -1630,7 +1630,7 @@ pub fn agentTool(arena: std.mem.Allocator, tool: Tool, args: std.json.Value) ![]
         .agent_answer => withEntry(arena, args, answerTool),
         .agent_set => withEntry(arena, args, setTool),
         .agent_interrupt => withEntry(arena, args, interruptTool),
-        .agent_close => withEntry(arena, args, closeTool),
+        .agent_close => if (entryFromArgs(args) == null and argStr(args, "agent") != null) closeGoneTool(arena, argStr(args, "agent").?) else withEntry(arena, args, closeTool),
         .agent_template_save => templateSaveTool(arena, args),
         .agent_templates => templatesTool(arena, args),
         .agent_template_delete => templateDeleteTool(arena, args),
@@ -2288,10 +2288,12 @@ fn openOpts(arena: std.mem.Allocator, args: std.json.Value, loaded: *const adapt
             why.* = .{ .code = .invalid_args, .msg = "name must be 1-64 letters, digits, '.', '-' or '_', starting with a letter or digit" };
             return error.Refused;
         }
-        // Unique among this machine's live agents, ids included.
-        const in_index = if (state.index_dir) |d| try agentindex.taken(arena, d, n) else false;
-        if (knownHere(n) or in_index) {
-            why.* = .{ .code = .conflict, .msg = try std.fmt.allocPrint(arena, "the name '{s}' is taken by a live agent on this machine (agent_attach {{agent: \"{s}\"}} resumes it); pick another", .{ n, n }) };
+        // Unique among this machine's agents, ids included.
+        if (try nameHolder(arena, n)) |h| {
+            why.* = .{ .code = .conflict, .msg = if (h.gone)
+                try std.fmt.allocPrint(arena, "the name '{s}' belongs to agent {s}, which is gone{s}: agent_attach {{agent: \"{s}\", relaunch: true}} starts it again under this name, or agent_close {{agent: \"{s}\"}} forgets it and frees the name", .{ n, h.id, if (h.relaunchable) " (relaunchable)" else "", h.id, h.id })
+            else
+                try std.fmt.allocPrint(arena, "the name '{s}' is taken by live agent {s} on this machine (agent_attach {{agent: \"{s}\"}} resumes it); pick another", .{ n, h.id, n }) };
             return error.Refused;
         }
     }
@@ -4574,11 +4576,19 @@ fn listCompact(arena: std.mem.Allocator) ![]const u8 {
         /// The newest job's last assistant message, first line, clipped.
         preview: ?[]const u8,
     };
-    const items = try arena.alloc(Item, state.entries.items.len);
+    // Gone agents are one line together: id, name and whether a relaunch
+    // starts them again (detail:true lists them in full).
+    const Gone = struct { agent: []const u8, name: ?[]const u8, relaunchable: bool };
+    var gone_list: std.ArrayList(Gone) = .empty;
+    var running: std.ArrayList(*Entry) = .empty;
+    for (state.entries.items) |e| {
+        if (gone(e)) try gone_list.append(arena, .{ .agent = e.id, .name = e.name, .relaunchable = e.ended_ms > 0 }) else try running.append(arena, e);
+    }
+    const items = try arena.alloc(Item, running.items.len);
     var res = Res.init(arena);
-    try res.textf("{d} agent(s)", .{items.len});
+    try res.textf("{d} agent(s){s}", .{ state.entries.items.len, if (gone_list.items.len > 0) try std.fmt.allocPrint(arena, ", {d} of them gone", .{gone_list.items.len}) else "" });
     const mono = clock.nowMs();
-    for (state.entries.items, items) |e, *out| {
+    for (running.items, items) |e, *out| {
         const act_ms = e.agent.lastActivityMs();
         const it = e.agent.interaction();
         out.* = .{
@@ -4660,6 +4670,32 @@ fn closeTool(arena: std.mem.Allocator, _: std.json.Value, e: *Entry) ![]const u8
     try res.fact("closed", true);
     try res.fact("sessions", sessions.items);
     return res.finish();
+}
+
+/// agent_close of an agent this server does not hold: a GONE one in the
+/// index is forgotten (descriptor, password, lock), which frees its name;
+/// anything else is not found here, as before.
+fn closeGoneTool(arena: std.mem.Allocator, key: []const u8) ![]const u8 {
+    const dir = state.index_dir orelse return notFoundKey(arena, key);
+    const d = (try agentindex.resolve(arena, dir, key)) orelse return notFoundKey(arena, key);
+    if (d.gone_ms == 0) return notFoundKey(arena, key);
+    const lp = try lockPath(arena, d.id);
+    var claimed = agentindex.claim(lp, false) catch |err| switch (err) {
+        error.Held => return errRes(arena, .conflict, try std.fmt.allocPrint(arena, "agent {s} is held by another live MCP server; agent_close it there", .{d.id})),
+        error.LockFailed => return errRes(arena, .io_failed, "could not lock the agent in the index"),
+    };
+    agentindex.remove(arena, dir, d.id);
+    claimed.release(lp, true);
+    var res = Res.init(arena);
+    try res.textf("forgot gone agent {s}{s}{s}{s}: it is out of the index and its name is free", .{ d.id, if (d.name != null) " (" else "", d.name orelse "", if (d.name != null) ")" else "" });
+    try res.fact("agent", d.id);
+    try res.fact("closed", true);
+    try res.fact("sessions", @as([]const []const u8, &.{}));
+    return res.finish();
+}
+
+fn notFoundKey(arena: std.mem.Allocator, key: []const u8) ![]const u8 {
+    return errRes(arena, .not_found, try std.fmt.allocPrint(arena, "no agent '{s}' on this server (open: {s})", .{ key, try idList(arena) }));
 }
 
 // ── the per-user index: descriptors, ownership and reattach ──────
