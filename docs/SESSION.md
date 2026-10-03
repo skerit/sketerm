@@ -1,5 +1,38 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-03: side questions (`agent_ask`, Claude Code's `/btw`)
+
+An orchestrator could only learn how far a busy sub-agent was by waiting
+for its turn or interrupting it. `agent_ask {agent, text}` now asks it a
+side question and returns `{answer}` in the result: no job, queue slot,
+record, event or watch_command, the state untouched (a busy agent stays
+`working`), the handed-out state and the waiter filter as they were.
+Measured on Claude Code 2.1.288 in ax mode (term-6.cast): `/btw <q>` opens
+a panel below a running turn (or, idle, after a `you: /btw` echo, in place
+of the input box, with earlier questions listed), Escape closes only the
+panel and the turn ends normally, and neither transcript records it. All of
+it is claude.json (`screen.side_question`, `actions.side_question`: type,
+Enter, `wait: side_asked` as the delivery evidence, `wait: side_answer`
+settled for 1 s, `close_side` only while the footer shows); the engine
+marks the panel live, makes the echo and the footer chrome, defers a turn
+end until the panel closes, and every send path refuses while it shows.
+opencode has no route and refuses (`invalid_args`);
+`capabilities.agent_side_question` names the apps.
+
+Also checked term-5.cast (Haiku re-ran a blocked `sleep 45` in the
+background and said "finished"): the adapter already ends it in
+`waiting_background` with no done (footer `· 1 shell still running` is
+skipped, the mode line `· 1 shell` counts), so nothing changed there.
+
+Validation (2026-10-03): test-core green (3,147 tests, 3 skips), test
+green (3,992, 19 skips; its first run caught the generated tool reference
+in docs/mcp.md not yet re-rendered for the extended `capabilities`
+description), smoke-mcp `..._AGENT_ONLY` green (the fake Claude
+Code draws both panel variants: idle answer with its blank line, busy
+answer behind a 12 s turn that then ends with its own done, no record or
+event, opencode and `agents` refused). term-6.cast through the new adapter
+reads exactly as before (one job, one done, no `/btw` record).
+
 ## 2026-10-03: sub-agent facts (context use, rate limits, cost)
 
 An orchestrator could not see how full a sub-agent's context was, or how
