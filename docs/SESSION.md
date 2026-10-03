@@ -1,5 +1,38 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-03: sub-agent facts (context use, rate limits, cost)
+
+An orchestrator could not see how full a sub-agent's context was, or how
+much of the account's rate limit was left, without reading its screen.
+Every per-agent result and `agent_list` now carry `facts` (only known
+values; agent_list's one line adds `context 14%, 7d limit 98%`), with
+`capabilities.agent_facts` naming them per adapter. Nothing in Zig names a
+fact or an app: the vocabulary is `data/agents/facts.json` (type, meaning,
+a ratio derivation, a compact label; `src/agent/facts.zig`), and each
+adapter maps fact names to JSON paths into its source's document (an
+undeclared name fails the adapter). Claude Code 2.1.288 in ax mode runs the
+`statusLine` command of `--settings` at startup and after each turn with a
+JSON document on stdin (measured): claude.json's `facts.status_command`
+puts sketerm's POSIX sh command (`src/agent/statusline.zig`) into the one
+settings document the permissions use; it saves the JSON atomically to a
+per-agent file and runs the user's own status command (looked up at start
+on the agent's host: local project > project > user settings,
+`CLAUDE_CONFIG_DIR` honoured) with the same JSON, so the screen is
+unchanged. Remote files ride the host probe that reads memory and load.
+opencode's facts are its latest answer's token counts over its model's
+context limit from `GET /provider`, the percent derived.
+
+Validation (2026-10-03): test-core green (3,141 tests, 3 skips), test green
+(3,986, 19 skips); smoke-mcp focused `..._AGENT_ONLY` (the fake Claude Code
+runs the injected status command before and after a turn: unknown, then
+14% and the 7-day limit; the user's command got the same JSON; opencode
+10% from tokens over the model limit) and `..._AGENTSSH_ONLY` (the same for
+a remote agent through the host probe) green; their first run failed on two
+smoke expectations the change moved (launch-log order, the one `--settings`
+document). One zero-token run of the real Claude Code 2.1.288: the facts
+file appeared at startup with the window size, the user's own status line
+still showed on screen, and agent_close removed the file.
+
 ## 2026-10-03: sub-agent fixes after a host rebooted twice
 
 An orchestrator driving agents on several hosts lost one host (aeor) twice.
