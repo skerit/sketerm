@@ -2769,6 +2769,9 @@ pub const FsJob = struct {
     acknowledged: bool = false,
     ack_req: u32 = 0,
     terminal_pending: bool = false,
+    /// The last non-terminal journal write failed and was logged; reset by
+    /// the next one that lands (`journalFsJob`).
+    journal_failed: bool = false,
     /// A durable move cancel fence is waiting for the helper to restore
     /// an intact quarantine or finish cleanup, then publish terminal state.
     cancel_pending: bool = false,
@@ -5144,7 +5147,8 @@ pub const Daemon = struct {
                 ) catch break :blk,
             }
             w.writeAll("}") catch break :blk;
-            _ = self.queuePanelEnvelope(cl, .panel_reply, caller_id, aw.written()) catch {};
+            _ = self.queuePanelEnvelope(cl, .panel_reply, caller_id, aw.written()) catch |err| if (err != error.ClientGone)
+                log.warn("panel failure reply to client {d} dropped: {s}", .{ cl.id, @errorName(err) });
         }
     }
 
@@ -5342,8 +5346,14 @@ pub const Daemon = struct {
                 return;
             }
             _ = self.panel_routes.swapRemove(i);
-            if (!route.requester.dead and route.requester.attached == route.session)
-                _ = self.queuePanelEnvelope(route.requester, .panel_reply, route.caller_id, envelope.json) catch {};
+            if (!route.requester.dead and route.requester.attached == route.session) {
+                // The route is gone: a reply that cannot be relayed must
+                // still end the requester's wait, as an uncertain delivery.
+                _ = self.queuePanelEnvelope(route.requester, .panel_reply, route.caller_id, envelope.json) catch |err| if (err != error.ClientGone) {
+                    log.warn("panel reply for route {d} not relayed to its requester: {s}", .{ route.route_id, @errorName(err) });
+                    self.queuePanelUncertain(route.requester, route.caller_id, "the presenter answered but its reply could not be relayed (too large or the requester's queue is full)");
+                };
+            }
             return;
         }
         presenter.queueErr("unknown or expired panel route");

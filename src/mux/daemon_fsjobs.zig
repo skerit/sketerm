@@ -556,7 +556,13 @@ pub fn journalFsJob(self: *Daemon, job: *FsJob) void {
     // installed and until stdout closes. Two independent load/merge/save
     // writers can each be atomic yet still overwrite the stronger phase.
     if (moveHelperOwnsJournal(job)) return;
-    saveFsJob(self, job) catch {};
+    saveFsJob(self, job) catch |err| {
+        if (!job.journal_failed)
+            log.warn("fs job {d}: journal write failed ({s}); a daemon restart resumes it from its last saved state", .{ job.id, @errorName(err) });
+        job.journal_failed = true;
+        return;
+    };
+    job.journal_failed = false;
 }
 
 pub fn saveFsJob(self: *Daemon, job: *FsJob) !void {
