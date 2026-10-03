@@ -20,6 +20,7 @@ const c = @import("../c.zig").c;
 const cast = @import("../util/cast.zig");
 const cssutil = @import("cssutil.zig");
 const markdown = @import("../util/markdown.zig");
+const strz = @import("../util/strz.zig");
 
 /// Reading measure: the width the article text is clamped to, in
 /// logical px. Wider than this and the eye loses the line start.
@@ -200,7 +201,9 @@ pub const Reader = struct {
             // content the extraction kept, and a reader that reloads
             // assets is a second network client on the page.
             var buf: [512]u8 = undefined;
-            const alt = clampUtf8(span.text, 400);
+            // A GtkTextBuffer rejects invalid UTF-8 outright, so a naive
+            // slice of the alt text would silently drop the whole label.
+            const alt = strz.clipUtf8(span.text, 400);
             const label = if (alt.len != 0)
                 std.fmt.bufPrint(&buf, "[image: {s}]", .{alt}) catch "[image]"
             else
@@ -401,16 +404,6 @@ pub const Reader = struct {
     }
 };
 
-/// `s` cut to at most `max` bytes WITHOUT splitting a codepoint: a
-/// GtkTextBuffer rejects invalid UTF-8 outright, so a naive slice of a
-/// page's alt text would silently drop the whole label.
-fn clampUtf8(s: []const u8, max: usize) []const u8 {
-    if (s.len <= max) return s;
-    var n = max;
-    while (n > 0 and s[n] & 0xc0 == 0x80) n -= 1;
-    return s[0..n];
-}
-
 /// Resolve `href` against the page address `base`, writing into `buf`.
 /// Null means "not something to navigate to" — an in-page anchor, a
 /// `javascript:` URL, or an address longer than the buffer.
@@ -484,15 +477,6 @@ test "webreader: relative links resolve against the page address" {
     try std.testing.expect(resolveUrl(&buf, base, "#section") == null);
     try std.testing.expect(resolveUrl(&buf, base, "javascript:void(0)") == null);
     try std.testing.expect(resolveUrl(&buf, "about:blank", "next.html") == null);
-}
-
-test "webreader: a byte cap never splits a codepoint" {
-    // Four 3-byte codepoints; every cap lands back on a boundary.
-    const s = "\u{4e00}\u{4e8c}\u{4e09}\u{56db}";
-    try std.testing.expectEqual(@as(usize, 12), clampUtf8(s, 99).len);
-    try std.testing.expectEqual(@as(usize, 9), clampUtf8(s, 11).len);
-    try std.testing.expectEqual(@as(usize, 9), clampUtf8(s, 9).len);
-    try std.testing.expectEqual(@as(usize, 0), clampUtf8(s, 2).len);
 }
 
 test "webreader: a bare-origin base still joins" {

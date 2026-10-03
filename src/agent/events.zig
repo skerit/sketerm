@@ -39,12 +39,7 @@ const TokenBucket = @import("../util/tokenbucket.zig").TokenBucket;
 pub const PREVIEW_MAX = 120;
 
 /// `s` cut to at most `max` bytes on a UTF-8 boundary.
-pub fn clip(s: []const u8, max: usize) []const u8 {
-    if (s.len <= max) return s;
-    var end = max;
-    while (end > 0 and (s[end] & 0xC0) == 0x80) end -= 1;
-    return s[0..end];
-}
+pub const clip = @import("../util/strz.zig").clipUtf8;
 
 /// The first line of `s`, trimmed.
 pub fn firstLine(s: []const u8) []const u8 {

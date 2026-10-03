@@ -10,6 +10,14 @@ pub fn eqOpt(a: ?[]const u8, b: ?[]const u8) bool {
     return std.mem.eql(u8, a.?, b.?);
 }
 
+/// `s` cut to at most `max` bytes, backed off to a UTF-8 boundary so no codepoint splits.
+pub fn clipUtf8(s: []const u8, max: usize) []const u8 {
+    if (s.len <= max) return s;
+    var end = max;
+    while (end > 0 and (s[end] & 0xC0) == 0x80) end -= 1;
+    return s[0..end];
+}
+
 /// Membership of `needle` in an unsorted list of strings.
 pub fn contains(list: []const []const u8, needle: []const u8) bool {
     for (list) |s| {
@@ -77,4 +85,13 @@ test "isWordByte at the ASCII boundary" {
     try t.expect(!isWordByte(0x7f));
     try t.expect(isWordByte(0x80));
     try t.expect(isWordByte(0xff));
+}
+
+test "clipUtf8 never splits a codepoint" {
+    // Four 3-byte codepoints; every cap lands back on a boundary.
+    const s = "\u{4e00}\u{4e8c}\u{4e09}\u{56db}";
+    try std.testing.expectEqual(@as(usize, 12), clipUtf8(s, 99).len);
+    try std.testing.expectEqual(@as(usize, 9), clipUtf8(s, 11).len);
+    try std.testing.expectEqual(@as(usize, 9), clipUtf8(s, 9).len);
+    try std.testing.expectEqual(@as(usize, 0), clipUtf8(s, 2).len);
 }

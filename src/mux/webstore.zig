@@ -19,6 +19,7 @@ const c = @import("../c.zig").c;
 const atomicwrite = @import("../util/atomicwrite.zig");
 const pathz = @import("../util/pathz.zig");
 const readfile = @import("../util/readfile.zig");
+const strz = @import("../util/strz.zig");
 
 /// Hard cap on live history entries; compaction prunes oldest-by-visit.
 pub const MAX_HISTORY: usize = 50_000;
@@ -79,14 +80,6 @@ pub fn originOf(buf: []u8, url: []const u8) ?[]const u8 {
     if (end > buf.len) return null;
     for (url[0..end], 0..) |ch, i| buf[i] = std.ascii.toLower(ch);
     return buf[0..end];
-}
-
-/// Truncate to `max` bytes without splitting a UTF-8 sequence.
-fn capUtf8(s: []const u8, max: usize) []const u8 {
-    if (s.len <= max) return s;
-    var end = max;
-    while (end > 0 and (s[end] & 0xC0) == 0x80) end -= 1;
-    return s[0..end];
 }
 
 fn ensureDir(dir: []const u8) bool {
@@ -363,7 +356,7 @@ pub const WebStore = struct {
 
     /// Upsert the in-memory index only (no log write).
     fn indexVisit(self: *WebStore, url: []const u8, title: []const u8, t: i64, n: u32) !void {
-        const capped = capUtf8(title, MAX_TITLE);
+        const capped = strz.clipUtf8(title, MAX_TITLE);
         if (self.history.getPtr(url)) |e| {
             e.visits +|= n;
             if (t > e.last_ms) e.last_ms = t;
@@ -411,7 +404,7 @@ pub const WebStore = struct {
     pub fn addVisit(self: *WebStore, url: []const u8, title: []const u8, now_ms: i64) !void {
         if (url.len == 0 or url.len > MAX_URL) return;
         try self.indexVisit(url, title, now_ms, 1);
-        try self.appendLog(HistRec{ .url = url, .title = capUtf8(title, MAX_TITLE), .t = now_ms });
+        try self.appendLog(HistRec{ .url = url, .title = strz.clipUtf8(title, MAX_TITLE), .t = now_ms });
         self.maybeCompact();
     }
 
@@ -420,7 +413,7 @@ pub const WebStore = struct {
     pub fn setTitle(self: *WebStore, url: []const u8, title: []const u8) !void {
         if (url.len == 0 or url.len > MAX_URL or title.len == 0) return;
         const e = self.history.getPtr(url) orelse return;
-        const capped = capUtf8(title, MAX_TITLE);
+        const capped = strz.clipUtf8(title, MAX_TITLE);
         if (std.mem.eql(u8, e.title, capped)) return;
         try self.indexVisit(url, capped, 0, 0);
         try self.appendLog(HistRec{ .url = url, .title = capped, .t = 0, .n = 0 });
@@ -604,7 +597,7 @@ pub const WebStore = struct {
         for (parsed.value.bookmarks) |b| {
             if (b.url.len == 0 or b.url.len > MAX_URL) continue;
             const url = self.allocator.dupe(u8, b.url) catch continue;
-            const title = self.allocator.dupe(u8, capUtf8(b.title, MAX_TITLE)) catch {
+            const title = self.allocator.dupe(u8, strz.clipUtf8(b.title, MAX_TITLE)) catch {
                 self.allocator.free(url);
                 continue;
             };
@@ -653,7 +646,7 @@ pub const WebStore = struct {
         if (url.len == 0 or url.len > MAX_URL) return error.BadUrl;
         const u = try self.allocator.dupe(u8, url);
         errdefer self.allocator.free(u);
-        const t = try self.allocator.dupe(u8, capUtf8(title, MAX_TITLE));
+        const t = try self.allocator.dupe(u8, strz.clipUtf8(title, MAX_TITLE));
         errdefer self.allocator.free(t);
         const f = try self.allocator.dupe(u8, folder);
         errdefer self.allocator.free(f);
@@ -694,7 +687,7 @@ pub const WebStore = struct {
             b.url = nu;
         }
         if (upd.title) |t| {
-            const nt = try self.allocator.dupe(u8, capUtf8(t, MAX_TITLE));
+            const nt = try self.allocator.dupe(u8, strz.clipUtf8(t, MAX_TITLE));
             self.allocator.free(b.title);
             b.title = nt;
         }
@@ -909,7 +902,7 @@ pub const WebStore = struct {
         self.next_userscript_id = @max(parsed.value.next_id, 1);
         for (parsed.value.scripts) |s| {
             if (s.source.len == 0 or s.source.len > MAX_SOURCE) continue;
-            const name = self.allocator.dupe(u8, capUtf8(s.name, MAX_TITLE)) catch continue;
+            const name = self.allocator.dupe(u8, strz.clipUtf8(s.name, MAX_TITLE)) catch continue;
             const source = self.allocator.dupe(u8, s.source) catch {
                 self.allocator.free(name);
                 continue;
@@ -953,7 +946,7 @@ pub const WebStore = struct {
     /// GUI parses the metadata block), the source is opaque bytes.
     pub fn userscriptAdd(self: *WebStore, name: []const u8, source: []const u8) !u64 {
         if (source.len == 0 or source.len > MAX_SOURCE) return error.BadSource;
-        const n = try self.allocator.dupe(u8, capUtf8(name, MAX_TITLE));
+        const n = try self.allocator.dupe(u8, strz.clipUtf8(name, MAX_TITLE));
         errdefer self.allocator.free(n);
         const s = try self.allocator.dupe(u8, source);
         errdefer self.allocator.free(s);
