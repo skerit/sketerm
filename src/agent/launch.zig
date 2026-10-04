@@ -878,21 +878,23 @@ fn usageHeader(line: []const u8) bool {
 /// @param unset entries `adapter` validated (variable names, optional `*`).
 /// @param keep names `checkExtra` validated: the caller's `env`, which the
 /// spawn (or the remote script) sets, so it reads as applied after `unset`.
+/// Every case arm opens with `(`: macOS `/bin/sh` is bash 3.2, which reads
+/// a bare `pattern)` inside `$(...)` as the end of the substitution.
 pub fn withUnsetEnv(arena: std.mem.Allocator, unset: []const []const u8, keep: []const []const u8, argv: []const []const u8) ![]const []const u8 {
     if (unset.len == 0) return argv;
     var script: std.ArrayList(u8) = .empty;
-    try script.appendSlice(arena, "names=$(env | while IFS= read -r l; do case \"$l\" in ");
+    try script.appendSlice(arena, "names=$(env | while IFS= read -r l; do case \"$l\" in (");
     for (unset, 0..) |u, i| {
         if (i > 0) try script.append(arena, '|');
         try script.appendSlice(arena, u);
         try script.appendSlice(arena, "=*");
     }
-    try script.appendSlice(arena, ") printf '%s\\n' \"${l%%=*}\";; esac; done); for n in $names; do case \"$n\" in ");
+    try script.appendSlice(arena, ") printf '%s\\n' \"${l%%=*}\";; esac; done); for n in $names; do case \"$n\" in (");
     for (keep) |k| {
         try script.appendSlice(arena, k);
         try script.append(arena, '|');
     }
-    try script.appendSlice(arena, "*[!A-Za-z0-9_]*) ;; *) unset \"$n\";; esac; done; exec \"$@\"");
+    try script.appendSlice(arena, "*[!A-Za-z0-9_]*) ;; (*) unset \"$n\";; esac; done; exec \"$@\"");
     var out: std.ArrayList([]const u8) = .empty;
     try out.appendSlice(arena, &.{ "/bin/sh", "-c", script.items, WRAPPER_NAME });
     try out.appendSlice(arena, argv);
@@ -1234,6 +1236,10 @@ test "the unset wrapper removes exact names and prefixes in the child" {
     const argv = try withUnsetEnv(a, &.{ "CLAUDE*", "DROP_ME" }, &.{}, &.{"env"});
     try t.expectEqualStrings("/bin/sh", argv[0]);
     try t.expectEqualStrings("env", argv[4]);
+    // bash 3.2 (macOS /bin/sh) only parses a case inside `$(...)` when every
+    // arm opens with `(`; the shells this test runs under accept both forms.
+    try t.expect(std.mem.indexOf(u8, argv[2], "case \"$l\" in (CLAUDE*=*|DROP_ME=*) ") != null);
+    try t.expect(std.mem.indexOf(u8, argv[2], "case \"$n\" in (*[!A-Za-z0-9_]*) ;; (*) unset") != null);
     // Run it: the environment is the child's own, set on the command line.
     var cmd: std.ArrayList(u8) = .empty;
     try cmd.appendSlice(a, "CLAUDE_CODE_CHILD_SESSION=1 CLAUDECONFIG=2 DROP_ME=3 KEEP_ME=4 DROP_ME_NOT=5 ");

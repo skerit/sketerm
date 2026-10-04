@@ -818,7 +818,7 @@ test "a relaunch and a durable descriptor keep the caller's args and env" {
     try testing.expectEqualStrings("/bin/sh", r.argv[0]);
     try testing.expectEqual(want.len, r.argv.len - 4);
     for (want, r.argv[4..]) |w, g| try testing.expectEqualStrings(w, g);
-    try testing.expect(std.mem.indexOf(u8, r.argv[2], "case \"$n\" in CLAUDE_CAPTURE_PROFILE|") != null);
+    try testing.expect(std.mem.indexOf(u8, r.argv[2], "case \"$n\" in (CLAUDE_CAPTURE_PROFILE|") != null);
     try testing.expectEqual(@as(usize, 1), r.spec.extra.env.len);
     try testing.expectEqualStrings("w o'rk $x", r.spec.extra.env[0].value);
     try testing.expectEqualStrings("agent-claude-1", r.spec.name);
