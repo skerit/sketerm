@@ -900,8 +900,8 @@ pub fn listTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
             .gone_reason = if (e.gone_why) |g| g.reasonName() else null,
         };
         try res.textf("{s} ({s}{s}{s}): {s} on {s} in {s}, up {d}s, active {s} ago, {d} undelivered event(s)", .{
-            out.agent,                         out.app,                    if (model != null) ", " else "",                          model orelse "",
-            out.state,                         e.host orelse "this machine", out.cwd,                                                   @divTrunc(@max(0, wall - e.started_ms), 1000),
+            out.agent,                                                                                                               out.app,                      if (model != null) ", " else "", model orelse "",
+            out.state,                                                                                                               e.host orelse "this machine", out.cwd,                         @divTrunc(@max(0, wall - e.started_ms), 1000),
             if (out.last_activity_ms) |x| try std.fmt.allocPrint(arena, "{d}s", .{@divTrunc(@max(0, wall - x), 1000)}) else "never", out.pending_events,
         });
         if (fr.line) |l| try res.textf("{s}: {s}", .{ out.agent, l });

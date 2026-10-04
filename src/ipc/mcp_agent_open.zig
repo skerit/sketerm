@@ -942,14 +942,17 @@ pub fn spawnOn(arena: std.mem.Allocator, where: *Where, choice: transport_mod.Ch
         const relay = login and spec.extra.env.len > 0;
         const needs_script = spec.secret_env != null or login or spec.extra.path_prepend.len > 0;
         const margv: []const []const u8 = if (needs_script)
-            try arena.dupe([]const u8, &.{ "/bin/sh", "-c", try launch.remoteScript(arena, argv, .{
-                .secret_env = spec.secret_env,
-                // A profile may change directory; the spawn's cwd comes first.
-                .cwd = if (login) spec.cwd else null,
-                .login = login,
-                .path_prepend = spec.extra.path_prepend,
-                .env_relay = if (relay) try spec.extra.names(arena) else &.{},
-            }) })
+            try arena.dupe([]const u8, &.{
+                "/bin/sh", "-c",
+                try launch.remoteScript(arena, argv, .{
+                    .secret_env = spec.secret_env,
+                    // A profile may change directory; the spawn's cwd comes first.
+                    .cwd = if (login) spec.cwd else null,
+                    .login = login,
+                    .path_prepend = spec.extra.path_prepend,
+                    .env_relay = if (relay) try spec.extra.names(arena) else &.{},
+                }),
+            })
         else
             argv;
         if (!try fitsExec(arena, margv, why)) return error.Refused;

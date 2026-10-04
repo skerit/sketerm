@@ -707,7 +707,6 @@ test "jobs after a since; all honours since and limit" {
     try t.expect(all.more);
 }
 
-
 test "a record re-captured under a new id with unchanged text is not delivered again" {
     const long = "Both review defects are fixed and pushed: the address-class fact moved into AddressScope and the tests cover both databases.";
     const recs = [_]Record{

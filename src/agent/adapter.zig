@@ -582,8 +582,7 @@ const Validator = struct {
         if (sc.fields.map.contains(sc.command_key)) return self.fail("facts.status_command.fields sets the command key, which is sketerm's", .{});
         for (sc.user_settings, 0..) |file, i| {
             const p = file.path;
-            const rest = if (std.mem.startsWith(u8, p, "{cwd}/")) p["{cwd}/".len..] else if (std.mem.startsWith(u8, p, "~/")) p[2..] else if (p.len > 1 and p[0] == '/') p[1..] else
-                return self.fail("facts.status_command.user_settings[{d}]: \"{s}\" must start with {{cwd}}/, ~/ or /", .{ i, p });
+            const rest = if (std.mem.startsWith(u8, p, "{cwd}/")) p["{cwd}/".len..] else if (std.mem.startsWith(u8, p, "~/")) p[2..] else if (p.len > 1 and p[0] == '/') p[1..] else return self.fail("facts.status_command.user_settings[{d}]: \"{s}\" must start with {{cwd}}/, ~/ or /", .{ i, p });
             if (rest.len == 0 or rest[rest.len - 1] == '/' or std.mem.indexOfAny(u8, rest, "{}") != null)
                 return self.fail("facts.status_command.user_settings[{d}]: \"{s}\" must name a file, with no placeholder but a leading {{cwd}}", .{ i, p });
             if (file.dir_env) |name| if (!validEnvName(name))

@@ -560,8 +560,7 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
             else
                 try res.text("agent events are not pushed into this session: Claude Code needs --dangerously-load-development-channels server:sketerm (or --channels), opencode the sketerm agents plugin; until then use watch_command");
             try res.textf("agents outlive this server on their host's per-user daemon for {d} h unattached (mcp_agent_idle_ttl_hours): agent_open returns an id, and agent_attach {{agent: id}} resumes it after a restart", .{mcp_agent.state.ttl_secs / 3600});
-        } else
-            try res.text("sub-agents (agent_*) are unavailable in --shared mode: they run on an isolated or durable instance's private daemon");
+        } else try res.text("sub-agents (agent_*) are unavailable in --shared mode: they run on an isolated or durable instance's private daemon");
     }
 
     try res.fact("term_exec_shell_default", mcp_term.term_state.mux_sock != null);
