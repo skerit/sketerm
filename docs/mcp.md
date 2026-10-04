@@ -887,10 +887,39 @@ raw screens.
 Claude Code is a `screen` source (launched with `--ax-screen-reader`, read
 off its terminal); opencode is an `opencode_api` source (`opencode serve`
 on a free loopback port, read over its HTTP API and SSE stream; its
-`opencode attach` TUI for a human to watch is optional, see below).
+TUI attached to that server for a human to watch is optional, see below).
+
+- **opencode's server generations (`api_version`,
+  `capabilities.agent_api_versions`).** opencode 2.x moved its API under
+  `/api/` and reshaped it (replies wrapped in `{data}`; prompts admitted
+  to a session inbox and taken later; one assistant message per model
+  step; questions are forms; the model is set on the session; the TUI
+  connects with `opencode --server <url>`, there is no `attach`), while
+  1.x builds (the oc11 fork among them) keep the old routes. Both are
+  declared in the adapter as data (`api.generations`, newest first: a
+  name, a dialect, a probe path, the TUI's `attach_args` and every
+  route), and the shapes each dialect speaks live in ONE module
+  (`src/agent/opencode_dialect.zig`), which translates 2.x into the 1.x
+  vocabulary the source reads, so the turn, done and record rules are the
+  same code for both. The generation is detected once, from the running
+  server, when it first answers: each generation's probe in order, the
+  first answered 200 with a JSON object wins (2.x answers every unknown
+  path, the old ones included, with its web UI's HTML; 1.x answers
+  `/api/info` that way), and never from `--version`. A server that
+  answers every probe without matching one is refused at once
+  (`unavailable`, naming what each probe got). Per-agent results carry
+  `api_version` (`"2"` or `"1"`). Differences: a prompt sent to a busy
+  2.x session waits in its inbox (`delivery: queue`) and starts its job
+  only when the loop takes it, so `queued_prompts` counts the inbox; an
+  interrupt PARKS queued prompts there (2.x runs them after the next
+  prompt), so they are neither dropped nor typed again; a model or
+  effort chosen with `agent_set` is set on the session before the next
+  prompt or command; a 2.x form's field types (string with options,
+  multi-select, boolean, number) map onto the question interaction, and
+  answers are sent as the fields' option values.
 
 - **opencode's attached TUI is optional (`capabilities.agent_tui`).**
-  The adapter declares it (`launch.attach_args`, and
+  The adapter declares it (`attach_args` per server generation, and
   `launch.attach_default`: opencode's is `false`, because the TUI burns
   about 45% of a core while it runs and the agent is driven over the API
   either way), so an agent starts WITHOUT it: its `session` is then the
@@ -987,8 +1016,8 @@ on a free loopback port, read over its HTTP API and SSE stream; its
   has `model_args`/`effort_args` (Claude Code: `--model`, `--effort`,
   session-scoped; an effort outside `effort_values` is refused up front);
   otherwise they are applied through the app once it is ready.
-  opencode's server is only waited for once it answers `GET
-  /global/health` (short probes, each on a fresh connection: a starting
+  opencode's server is only waited for until it answers one of its
+  generations' probes (short probes, each on a fresh connection: a starting
   opencode listens seconds before it answers and never answers what it
   received in between); a server that never does is a `timeout` saying it
   did not become ready. One that EXITS first is a `failed` naming its exit
@@ -1045,7 +1074,8 @@ on a free loopback port, read over its HTTP API and SSE stream; its
   the open (`not_found`, naming the id, the binary and where it looked)
   and nothing is left running, never a new conversation started under the
   old id's name (`capabilities.agent_resume_checked`): opencode's server
-  is asked `GET /session/<id>` once it is up, and a 404 stops it before
+  is asked for the session (its generation's `session_get` route) once it
+  is up, and a 404 stops it before
   anything is adopted; Claude Code started with `--resume <unknown id>`
   prints `No conversation found with session ID: <id>` and exits with
   status 1 (measured, 2.1.287 in `--ax-screen-reader` mode: no picker, no
@@ -1182,7 +1212,7 @@ on a free loopback port, read over its HTTP API and SSE stream; its
   server had queued are typed again once it stopped, in their order, and
   listed as `requeued` / `requeue_failed` exactly as for `agent_send
   interrupt`, `capabilities.agent_interrupt_requeue`);
-  opencode (oc11) answers `prompt_async` on a busy session with 204,
+  opencode 1.x (oc11) answers `prompt_async` on a busy session with 204,
   creates the user message at once and runs it after the current answer
   (its records keep the job of the prompt they answer, by `parentID`). A
   queued prompt is a user prompt like any other: it starts a new job when
