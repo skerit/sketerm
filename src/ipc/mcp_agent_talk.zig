@@ -988,42 +988,109 @@ fn listCompact(arena: std.mem.Allocator, until: i64) ![]const u8 {
     return res.finish();
 }
 
-pub fn closeTool(arena: std.mem.Allocator, _: std.json.Value, e: *Entry) ![]const u8 {
+/// One agent agent_close ended or forgot, or why not.
+const Closed = struct {
+    agent: []const u8,
+    name: ?[]const u8 = null,
+    closed: bool = false,
+    /// Sessions killed.
+    sessions: []const []const u8 = &.{},
+    /// A gone agent only in the index: forgotten, nothing was running.
+    forgotten: bool = false,
+    @"error": ?struct { code: []const u8, message: []const u8 } = null,
+};
+
+/// End `e`: its sessions (an agent_attach'd term_open terminal stays) and
+/// waiters; the entry is freed.
+fn closeEntry(arena: std.mem.Allocator, e: *Entry) !Closed {
     const id = try arena.dupe(u8, e.id);
+    const name = if (e.name) |n| try arena.dupe(u8, n) else null;
     var sessions: std.ArrayList([]const u8) = .empty;
     if (e.visible) |l| if (l == .owned) try sessions.append(arena, try arena.dupe(u8, e.session));
     if (e.server_session) |s| try sessions.append(arena, try arena.dupe(u8, s));
     discard(e);
-    var res = Res.init(arena);
-    try res.textf("closed {s}{s}", .{ id, if (sessions.items.len == 0) " (its terminal belongs to term_open and stays)" else "" });
-    try res.fact("agent", id);
-    try res.fact("closed", true);
-    try res.fact("sessions", sessions.items);
-    return res.finish();
+    return .{ .agent = id, .name = name, .closed = true, .sessions = sessions.items };
 }
 
-/// agent_close of an agent this server does not hold: a GONE one in the
-/// index is forgotten (descriptor, password, lock), which frees its name;
-/// anything else is not found here, as before.
-pub fn closeGoneTool(arena: std.mem.Allocator, key: []const u8) ![]const u8 {
-    const dir = state.index_dir orelse return notFoundKey(arena, key);
-    const d = (try agentindex.resolve(arena, dir, key)) orelse return notFoundKey(arena, key);
-    if (d.gone_ms == 0) return notFoundKey(arena, key);
+/// Forget an agent this server does not hold: a GONE one in the index
+/// (descriptor, password, lock), which frees its name; anything else is
+/// not found here.
+fn forgetGone(arena: std.mem.Allocator, key: []const u8) !Closed {
+    const not_found: Closed = .{ .agent = key, .@"error" = .{ .code = @tagName(mcp.ErrCode.not_found), .message = try std.fmt.allocPrint(arena, "no agent '{s}' on this server (open: {s})", .{ key, try idList(arena) }) } };
+    const dir = state.index_dir orelse return not_found;
+    const d = (try agentindex.resolve(arena, dir, key)) orelse return not_found;
+    if (d.gone_ms == 0) return not_found;
     const lp = try lockPath(arena, d.id);
-    var claimed = agentindex.claim(lp, false) catch |err| switch (err) {
-        error.Held => return errRes(arena, .conflict, try std.fmt.allocPrint(arena, "agent {s} is held by another live MCP server; agent_close it there", .{d.id})),
-        error.LockFailed => return errRes(arena, .io_failed, "could not lock the agent in the index"),
-    };
+    var claimed = agentindex.claim(lp, false) catch |err| return .{ .agent = d.id, .name = d.name, .@"error" = switch (err) {
+        error.Held => .{ .code = @tagName(mcp.ErrCode.conflict), .message = try std.fmt.allocPrint(arena, "agent {s} is held by another live MCP server; agent_close it there", .{d.id}) },
+        error.LockFailed => .{ .code = @tagName(mcp.ErrCode.io_failed), .message = "could not lock the agent in the index" },
+    } };
     agentindex.remove(arena, dir, d.id);
     claimed.release(lp, true);
+    return .{ .agent = d.id, .name = d.name, .closed = true, .forgotten = true };
+}
+
+/// One agent's close as a whole result.
+fn closedRes(arena: std.mem.Allocator, one: Closed) ![]const u8 {
+    if (one.@"error") |er| return errRes(arena, std.meta.stringToEnum(mcp.ErrCode, er.code).?, er.message);
     var res = Res.init(arena);
-    try res.textf("forgot gone agent {s}{s}{s}{s}: it is out of the index and its name is free", .{ d.id, if (d.name != null) " (" else "", d.name orelse "", if (d.name != null) ")" else "" });
-    try res.fact("agent", d.id);
+    if (one.forgotten)
+        try res.textf("forgot gone agent {s}{s}{s}{s}: it is out of the index and its name is free", .{ one.agent, if (one.name != null) " (" else "", one.name orelse "", if (one.name != null) ")" else "" })
+    else
+        try res.textf("closed {s}{s}", .{ one.agent, if (one.sessions.len == 0) " (its terminal belongs to term_open and stays)" else "" });
+    try res.fact("agent", one.agent);
     try res.fact("closed", true);
-    try res.fact("sessions", @as([]const []const u8, &.{}));
+    try res.fact("sessions", one.sessions);
     return res.finish();
 }
 
-fn notFoundKey(arena: std.mem.Allocator, key: []const u8) ![]const u8 {
-    return errRes(arena, .not_found, try std.fmt.allocPrint(arena, "no agent '{s}' on this server (open: {s})", .{ key, try idList(arena) }));
+pub fn closeTool(arena: std.mem.Allocator, _: std.json.Value, e: *Entry) ![]const u8 {
+    return closedRes(arena, try closeEntry(arena, e));
+}
+
+/// agent_close of an agent this server does not hold (`forgetGone`).
+pub fn closeGoneTool(arena: std.mem.Allocator, key: []const u8) ![]const u8 {
+    return closedRes(arena, try forgetGone(arena, key));
+}
+
+/// agent_close with `agents` (ids, names or a selector) or `exited: true`
+/// (every gone agent of this server): one result per agent, a failure is
+/// that agent's, never the call's.
+pub fn closeManyTool(arena: std.mem.Allocator, list: []const std.json.Value) ![]const u8 {
+    var results: std.ArrayList(Closed) = .empty;
+    for (list) |v| {
+        if (v != .string) {
+            try results.append(arena, .{ .agent = "", .@"error" = .{ .code = @tagName(mcp.ErrCode.invalid_args), .message = "not an agent id or name (a string)" } });
+            continue;
+        }
+        // A repeat of one already closed names nothing any more.
+        var seen = false;
+        for (results.items) |r| {
+            if (r.closed and (std.mem.eql(u8, r.agent, v.string) or (r.name != null and std.mem.eql(u8, r.name.?, v.string)))) seen = true;
+        }
+        if (seen) continue;
+        try results.append(arena, if (findByName(v.string)) |e| try closeEntry(arena, e) else try forgetGone(arena, v.string));
+    }
+    var res = Res.init(arena);
+    var closed: usize = 0;
+    for (results.items) |r| closed += @intFromBool(r.closed);
+    try res.textf("closed {d} of {d} agent(s)", .{ closed, results.items.len });
+    for (results.items) |r| {
+        if (r.@"error") |er|
+            try res.textf("{s}: failed ({s}): {s}", .{ if (r.agent.len > 0) r.agent else "?", er.code, er.message })
+        else
+            try res.textf("{s}: {s}", .{ r.agent, if (r.forgotten) "forgotten (gone)" else "closed" });
+    }
+    try res.raw("results", try toJson(arena, results.items));
+    try res.fact("count", results.items.len);
+    try res.fact("failed", results.items.len - closed);
+    return res.finish();
+}
+
+/// The ids of every gone (exited) agent of this server (agent_close
+/// `exited: true`).
+pub fn exitedIds(arena: std.mem.Allocator) ![]const std.json.Value {
+    var out: std.ArrayList(std.json.Value) = .empty;
+    for (state.entries.items) |e| if (gone(e)) try out.append(arena, .{ .string = try arena.dupe(u8, e.id) });
+    return out.items;
 }

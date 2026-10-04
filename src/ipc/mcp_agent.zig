@@ -49,6 +49,7 @@ const adapter = @import("../agent/adapter.zig");
 const agent_mod = @import("../agent/agent.zig");
 const events = @import("../agent/events.zig");
 const select = @import("../agent/select.zig");
+const selector = @import("../agent/selector.zig");
 const launch = @import("../agent/launch.zig");
 const retry_mod = @import("../agent/retry.zig");
 const stall_mod = @import("../agent/stall.zig");
@@ -108,6 +109,8 @@ const readTool = mcp_agent_talk.readTool;
 const listTool = mcp_agent_talk.listTool;
 const closeTool = mcp_agent_talk.closeTool;
 const closeGoneTool = mcp_agent_talk.closeGoneTool;
+const closeManyTool = mcp_agent_talk.closeManyTool;
+const exitedIds = mcp_agent_talk.exitedIds;
 pub const Observation = mcp_agent_loop.Observation;
 pub const observeScreen = mcp_agent_loop.observeScreen;
 pub const pollFds = mcp_agent_loop.pollFds;
@@ -651,7 +654,20 @@ pub fn agentTool(arena: std.mem.Allocator, tool: Tool, args: std.json.Value) ![]
             errRes(arena, .invalid_args, "agent_ask asks ONE agent: pass 'agent' (a side question is answered in that agent's own panel)")
         else
             withEntry(arena, args, askTool),
-        .agent_close => if (entryFromArgs(args) == null and argStr(args, "agent") != null) closeGoneTool(arena, argStr(args, "agent").?) else withEntry(arena, args, closeTool),
+        .agent_close => if (argBool(args, "exited")) (if (mcp.argValue(args, "agents") != null or argStr(args, "agent") != null)
+            errRes(arena, .invalid_args, "exited:true closes every gone agent of this server: pass it without 'agent' or 'agents'")
+        else
+            closeManyTool(arena, try exitedIds(arena))) else if (mcp.argValue(args, "agents")) |v| switch (try agentsList(arena, v)) {
+            .fail => |f| errRes(arena, f.code, f.msg),
+            .ok => |list| if (argStr(args, "agent") != null)
+                errRes(arena, .invalid_args, "pass either 'agent' or 'agents', not both")
+            else if (list.len == 0)
+                errRes(arena, .invalid_args, "agents is empty: name at least one agent")
+            else if (list.len > MAX_ANY)
+                errRes(arena, .invalid_args, try std.fmt.allocPrint(arena, "agents names at most {d} agents", .{MAX_ANY}))
+            else
+                closeManyTool(arena, list),
+        } else if (entryFromArgs(args) == null and argStr(args, "agent") != null) closeGoneTool(arena, argStr(args, "agent").?) else withEntry(arena, args, closeTool),
         .agent_template_save => templateSaveTool(arena, args),
         .agent_templates => templatesTool(arena, args),
         .agent_template_delete => templateDeleteTool(arena, args),
@@ -659,25 +675,44 @@ pub fn agentTool(arena: std.mem.Allocator, tool: Tool, args: std.json.Value) ![]
 }
 
 /// agent_send's and agent_wait's `agents`: the array given, or for
-/// `mcp_tools.AGENTS_EVERY` the ids of every live (not exited) agent here.
-fn agentsList(arena: std.mem.Allocator, v: std.json.Value) !union(enum) { ok: []const std.json.Value, fail: Fail } {
+/// a selector (`selector.zig`) the ids of the agents it names here.
+pub fn agentsList(arena: std.mem.Allocator, v: std.json.Value) !union(enum) { ok: []const std.json.Value, fail: Fail } {
     switch (v) {
         .array => |list| return .{ .ok = list.items },
         // No service here: it would hand a waiter what this call's own
         // wait (which holds the agents first) should get.
-        .string => |x| if (std.mem.eql(u8, x, mcp_tools.AGENTS_EVERY)) {
+        .string => |x| {
+            const sel = switch (try selector.parse(arena, x)) {
+                .ok => |s| s,
+                .err => |why| return .{ .fail = .{ .code = .invalid_args, .msg = try std.fmt.allocPrint(arena, "agents must be an array of agent ids or names, or a selector: {s}", .{why}) } },
+            };
             var out: std.ArrayList(std.json.Value) = .empty;
-            for (state.entries.items) |e| if (!gone(e)) try out.append(arena, .{ .string = e.id });
+            for (state.entries.items) |e| if (selects(sel, e)) try out.append(arena, .{ .string = e.id });
             if (out.items.len == 0) return .{ .fail = .{ .code = .not_found, .msg = if (state.entries.items.len == 0)
-                "agents \"*\" means every live agent of this server, and none is open; start one with agent_open"
+                try std.fmt.allocPrint(arena, "agents \"{s}\" matches no agent: none is open on this server; start one with agent_open", .{x})
             else
-                try std.fmt.allocPrint(arena, "agents \"*\" means every live agent of this server, and none is live (open, all exited: {s})", .{try idList(arena)}) } };
-            if (out.items.len > MAX_ANY) return .{ .fail = .{ .code = .invalid_args, .msg = try std.fmt.allocPrint(arena, "agents \"*\" names {d} live agents, more than the {d} one call takes: list them in batches", .{ out.items.len, MAX_ANY }) } };
+                try std.fmt.allocPrint(arena, "agents \"{s}\" matches none of this server's agents ({s})", .{ x, try stateList(arena) }) } };
+            if (out.items.len > MAX_ANY) return .{ .fail = .{ .code = .invalid_args, .msg = try std.fmt.allocPrint(arena, "agents \"{s}\" names {d} agents, more than the {d} one call takes: list them in batches", .{ x, out.items.len, MAX_ANY }) } };
             return .{ .ok = out.items };
         },
         else => {},
     }
-    return .{ .fail = .{ .code = .invalid_args, .msg = "agents must be an array of agent ids or names, or \"*\" for every live agent of this server" } };
+    return .{ .fail = .{ .code = .invalid_args, .msg = "agents must be an array of agent ids or names, or a selector: " ++ selector.SYNTAX } };
+}
+
+/// Whether selector `sel` names `e`.
+pub fn selects(sel: selector.Selector, e: *const Entry) bool {
+    return sel.matches(.{ .host = e.host, .state = e.agent.state() });
+}
+
+/// Every agent of this server with its state, for a selector that matched none.
+fn stateList(arena: std.mem.Allocator) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (state.entries.items, 0..) |e, i| {
+        if (i > 0) try out.appendSlice(arena, ", ");
+        try out.print(arena, "{s} {s} on {s}", .{ e.id, @tagName(e.agent.state()), e.host orelse selector.LOCAL });
+    }
+    return out.items;
 }
 
 fn withEntry(
@@ -818,6 +853,58 @@ test "agent_adapters and agent_list speak both lanes" {
     const tmpl = (try waiterTemplate(a)).?;
     try testing.expect(std.mem.indexOf(u8, tmpl, WAITER_SOCKET) != null);
     try testing.expect(std.mem.endsWith(u8, tmpl, " AGENT"));
+}
+
+test "selectors name agents by host and state; agent_close takes several, and exited:true the gone ones" {
+    var rig: ToolRig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    const a = rig.arena.allocator();
+    const set = try adapters();
+    var ags: [3]*agent_mod.Agent = undefined;
+    for ([_][]const u8{ "claude-1", "claude-2", "claude-3" }, 0..) |id, i| {
+        const e = try newEntry(set.get("claude").?, id, id, "/bin/claude", "/");
+        const ag = try state.allocator.create(agent_mod.Agent);
+        ag.* = try agent_mod.Agent.initScreen(state.allocator, set.get("claude").?, .{});
+        e.agent = ag;
+        e.visible = .{ .borrowed = 4242 };
+        if (i == 1) e.host = try state.allocator.dupe(u8, "box");
+        try state.entries.append(state.allocator, e);
+        ags[i] = ag;
+    }
+    service(clock.nowMs());
+    try ags[2].source.screen.noteExited(clock.nowMs(), 0);
+    for (state.entries.items) |e| _ = try e.cursor.take(e.agent.queue(), .{}, clock.nowMs(), a);
+
+    _ = try ags[1].source.screen.queue.push(clock.nowMs(), .needs_input, null, "permission: z", "");
+    const on_box = try shaped(a, "agent_wait", try rig.call(.agent_wait, "{\"agents\":\"host:box\",\"timeout_ms\":0}"));
+    try testing.expectEqual(@as(usize, 1), on_box.get("agents").?.array.items.len);
+    try testing.expectEqualStrings("claude-2", on_box.get("agents").?.array.items[0].string);
+    // An unknown state fails closed, naming the states; no match is not_found.
+    const bad = try mcp_agent_testkit.errorMessage(a, "agent_wait", try rig.call(.agent_wait, "{\"agents\":\"state:busy\"}"), "invalid_args");
+    try testing.expect(std.mem.indexOf(u8, bad, "one of starting, working") != null);
+    try expectError(a, "agent_wait", try rig.call(.agent_wait, "{\"agents\":\"host:nowhere\"}"), "not_found");
+    try expectError(a, "agent_close", try rig.call(.agent_close, "{\"agents\":\"everything\"}"), "invalid_args");
+
+    // Several at once by selector: the one on box.
+    const boxed = try shaped(a, "agent_close", try rig.call(.agent_close, "{\"agents\":\"host:box\"}"));
+    const br = boxed.get("results").?.array.items;
+    try testing.expectEqual(@as(usize, 1), br.len);
+    try testing.expectEqualStrings("claude-2", br[0].object.get("agent").?.string);
+    try testing.expect(br[0].object.get("closed").?.bool);
+    try testing.expectEqual(@as(i64, 0), boxed.get("failed").?.integer);
+    // Every gone one: claude-3 only.
+    try expectError(a, "agent_close", try rig.call(.agent_close, "{\"exited\":true,\"agent\":\"claude-1\"}"), "invalid_args");
+    const swept = try shaped(a, "agent_close", try rig.call(.agent_close, "{\"exited\":true}"));
+    const sr = swept.get("results").?.array.items;
+    try testing.expectEqual(@as(usize, 1), sr.len);
+    try testing.expectEqualStrings("claude-3", sr[0].object.get("agent").?.string);
+    // A list: one closed, an unknown one fails alone.
+    const listed = try shaped(a, "agent_close", try rig.call(.agent_close, "{\"agents\":[\"claude-1\",\"nope-9\"]}"));
+    try testing.expectEqual(@as(i64, 2), listed.get("count").?.integer);
+    try testing.expectEqual(@as(i64, 1), listed.get("failed").?.integer);
+    try testing.expectEqualStrings("not_found", listed.get("results").?.array.items[1].object.get("error").?.object.get("code").?.string);
+    try testing.expectEqual(@as(usize, 0), state.entries.items.len);
 }
 
 test "shared mode answers unavailable for every agent tool" {

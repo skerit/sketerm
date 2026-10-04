@@ -1769,6 +1769,15 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   name, `agent_close {agent}` forgets it (also for a gone agent only the
   index still knows, unless another live server holds it) and frees the
   name. `resume` never takes a gone entry over by itself.
+- **Closing in batches (`capabilities.agent_close_many`).** `agent_close
+  agents: [...]` (ids or names, at most 32) or `agents: "<selector>"`
+  (see Selectors) closes each, and `exited: true` (without `agent` or
+  `agents`) forgets every gone (exited) agent of this server in one call.
+  Both answer like `agent_send agents`: `results`, one per agent named
+  (`agent`, `name`, `closed`, `sessions` killed, `forgotten` for a gone
+  one only the index knew, or its `error`), `count` and `failed`; one
+  agent's failure (an unknown name, another server's agent) never stops
+  the others.
 - **`agent_list`** gives one short text line per agent and, per agent in
   `agents`, by default the compact facts an orchestrator of many agents
   scans (`capabilities.agent_list_compact`; with 17 agents the full set
