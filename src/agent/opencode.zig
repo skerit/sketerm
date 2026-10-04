@@ -1202,6 +1202,8 @@ pub const HEALTH_PATH = "/global/health";
 /// One readiness probe's deadline: short, because a request the starting
 /// server swallowed is never answered.
 pub const HEALTH_PROBE_MS: i64 = 1000;
+/// How many of a session's newest messages a resume or a resync reads.
+pub const RESUME_MESSAGES: u32 = 50;
 const RECONNECT_MIN_MS: i64 = 500;
 const RECONNECT_MAX_MS: i64 = 10_000;
 
@@ -1348,9 +1350,7 @@ pub const Api = struct {
         };
         if (session) |id| {
             try self.source.setRoot(id);
-            var path_buf: [256]u8 = undefined;
-            const path = std.fmt.bufPrint(&path_buf, "/session/{s}/message", .{id}) catch return error.NoSession;
-            var msgs = try self.getJson(path);
+            var msgs = try self.recentMessages(id);
             defer msgs.deinit();
             try self.source.resyncMessages(msgs.value, now_ms, true);
         } else {
@@ -1441,16 +1441,29 @@ pub const Api = struct {
         self.backoff_ms = RECONNECT_MIN_MS;
         self.resync(now_ms) catch |err| self.noteResyncFailed("session statuses and pending requests", err);
         if (self.source.root) |root| {
-            var path_buf: [256]u8 = undefined;
-            if (std.fmt.bufPrint(&path_buf, "/session/{s}/message", .{root})) |path| {
-                if (self.getJson(path)) |msgs_const| {
-                    var msgs = msgs_const;
-                    defer msgs.deinit();
-                    self.source.resyncMessages(msgs.value, now_ms, false) catch |err| self.noteResyncFailed("messages", err);
-                } else |err| self.noteResyncFailed("messages", err);
-            } else |_| {}
+            if (self.recentMessages(root)) |msgs_const| {
+                var msgs = msgs_const;
+                defer msgs.deinit();
+                self.source.resyncMessages(msgs.value, now_ms, false) catch |err| self.noteResyncFailed("messages", err);
+            } else |err| self.noteResyncFailed("messages", err);
         }
         self.source.noteReconnected(now_ms) catch {};
+    }
+
+    /// The newest messages of session `id`, oldest first: `?limit=` (newest
+    /// N, opencode's page form), halved while the reply exceeds
+    /// `http.MAX_BODY`. A whole long session is far over that cap, and only
+    /// its recent end matters to a resume or a resync.
+    fn recentMessages(self: *Api, id: []const u8) !std.json.Parsed(Value) {
+        var limit: u32 = RESUME_MESSAGES;
+        while (true) : (limit /= 2) {
+            var path_buf: [256]u8 = undefined;
+            const path = std.fmt.bufPrint(&path_buf, "/session/{s}/message?limit={d}", .{ id, limit }) catch return error.NoSession;
+            return self.getJson(path) catch |err| {
+                if (err != error.TooLarge or limit <= 1) return err;
+                continue;
+            };
+        }
     }
 
     /// Part of the resync after a reconnect failed: what happened while the
@@ -2350,6 +2363,37 @@ test "adopted history arms no turn and announces nothing" {
     try t.expectEqual(@as(usize, 2), rig.src.records.items.len);
     try t.expectEqual(@as(usize, 0), rig.src.queue.events.items.len);
     try t.expectEqual(vocab.State.idle, rig.src.state);
+}
+
+test "api: resuming a session too large to fetch whole reads only its recent end" {
+    var srv: testserver.Server = .{};
+    try srv.start(t.allocator);
+    defer srv.deinit();
+    srv.route("GET /session/status", .{ .body = "{}" });
+    srv.route("GET /permission", .{ .body = "[]" });
+    srv.route("GET /question", .{ .body = "[]" });
+    // The whole session, and even its newest RESUME_MESSAGES, exceed the
+    // body cap; half of that fits.
+    const huge: testserver.Reply = .{ .claim_length = http.MAX_BODY + 1, .close_after = true };
+    srv.route("GET /session/ses_big/message", huge);
+    srv.route(std.fmt.comptimePrint("GET /session/ses_big/message?limit={d}", .{RESUME_MESSAGES}), huge);
+    srv.route(std.fmt.comptimePrint("GET /session/ses_big/message?limit={d}", .{RESUME_MESSAGES / 2}), .{ .body =
+        \\[{"info":{"id":"msg_u9","role":"user","sessionID":"ses_big"},"parts":[{"type":"text","text":"old question","id":"prt_u9","sessionID":"ses_big","messageID":"msg_u9"}]},
+        \\ {"info":{"id":"msg_a9","role":"assistant","sessionID":"ses_big","time":{"created":1,"completed":2}},"parts":[{"type":"text","text":"old answer","time":{"start":1,"end":2},"id":"prt_a9","sessionID":"ses_big","messageID":"msg_a9"}]}]
+    });
+    var set = adapter.Set.init(t.allocator);
+    defer set.deinit();
+    try set.loadShipped();
+    var api = try Api.init(t.allocator, set.get("opencode").?, .{}, .{ .port = srv.port(), .password = "" });
+    defer api.deinit();
+    try api.connect("ses_big", clock.nowMs());
+    try t.expectEqualStrings("ses_big", api.sessionId().?);
+    try t.expectEqual(@as(usize, 2), api.source.records.items.len);
+    try t.expectEqualStrings("old answer", api.source.records.items[1].text);
+    // History stays history: nothing announced, no turn armed.
+    try api.source.tick(clock.nowMs() + 10_000);
+    try t.expectEqual(@as(usize, 0), api.source.queue.events.items.len);
+    try t.expectEqual(vocab.State.idle, api.source.state);
 }
 
 /// Service `api` until `cond` holds or three seconds pass.

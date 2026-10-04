@@ -29,6 +29,9 @@ pub const Reply = struct {
     keep_alive_header: bool = false,
     /// SSE event payloads pushed onto every stream once answered.
     events: []const []const u8 = &.{},
+    /// Announce this Content-Length instead of the body's (a body too
+    /// large to send, without sending it).
+    claim_length: ?usize = null,
 };
 
 const Route = struct { key: []const u8, reply: Reply };
@@ -91,8 +94,10 @@ pub const Server = struct {
         return self.lis.port;
     }
 
-    /// Answer `key` (`"POST /session/ses_1/abort"`, query ignored) with
-    /// `reply`; a later route for the same key wins.
+    /// Answer `key` (`"POST /session/ses_1/abort"`) with `reply`; a later
+    /// route for the same key wins. A key without a query answers every
+    /// query; one with a query (`"GET /x?limit=5"`) answers only that exact
+    /// target and wins over the bare one.
     pub fn route(self: *Server, key: []const u8, reply: Reply) void {
         self.lock.lock();
         defer self.lock.unlock();
@@ -221,8 +226,11 @@ pub const Server = struct {
             }
             var key_buf: [512]u8 = undefined;
             const key = std.fmt.bufPrint(&key_buf, "{s} {s}", .{ method, path }) catch return;
+            var full_buf: [512]u8 = undefined;
+            const full = std.fmt.bufPrint(&full_buf, "{s} {s}", .{ method, target }) catch return;
             const hooked = if (self.hook) |h| h(self.hook_ctx, self, method, path, req[head_end + 4 ..]) else null;
-            const reply = hooked orelse self.lookup(key) orelse Reply{ .status = 404, .body = "{\"name\":\"NotFoundError\",\"data\":{\"message\":\"no route\"}}" };
+            const exact = if (full.len != key.len) self.lookup(full) else null;
+            const reply = hooked orelse exact orelse self.lookup(key) orelse Reply{ .status = 404, .body = "{\"name\":\"NotFoundError\",\"data\":{\"message\":\"no route\"}}" };
             var waited: u32 = 0;
             while (waited < reply.delay_ms and !self.stopping.load(.acquire)) : (waited += 5) _ = c.usleep(5000);
             const body = if (reply.echo) req[head_end + 4 ..] else reply.body;
@@ -341,7 +349,7 @@ fn writeResponse(fd: c_int, reply: Reply, body: []const u8) void {
         }
         return writeAllFd(fd, "0\r\n\r\n");
     }
-    const h = std.fmt.bufPrint(&head, "HTTP/1.1 {d} {s}\r\ncontent-type: application/json\r\ncontent-length: {d}\r\nConnection: {s}\r\n\r\n", .{ reply.status, reason, body.len, conn }) catch return;
+    const h = std.fmt.bufPrint(&head, "HTTP/1.1 {d} {s}\r\ncontent-type: application/json\r\ncontent-length: {d}\r\nConnection: {s}\r\n\r\n", .{ reply.status, reason, reply.claim_length orelse body.len, conn }) catch return;
     writeAllFd(fd, h);
     writeAllFd(fd, body);
 }
