@@ -140,9 +140,9 @@ pub fn retryPolicyFrom(arena: std.mem.Allocator, v: std.json.Value, why: *Fail) 
 }
 
 /// agent_open's / agent_set's `tui`: a boolean, for an adapter whose app
-/// has a separate TUI (`launch.attach_args`); refused for any other.
+/// has a separate TUI (`Spec.hasTui`); refused for any other.
 pub fn tuiFrom(arena: std.mem.Allocator, loaded: *const adapter.Loaded, v: std.json.Value, why: *Fail) !bool {
-    if (loaded.spec.launch.attach_args.len == 0) {
+    if (!loaded.spec.hasTui()) {
         why.* = .{ .code = .invalid_args, .msg = try std.fmt.allocPrint(arena, "tui starts a separate attached TUI, and {s} has none: its terminal is the app itself", .{loaded.spec.name}) };
         return error.Refused;
     }
@@ -415,7 +415,7 @@ fn extraOpts(arena: std.mem.Allocator, args: std.json.Value, loaded: *const adap
     };
     // Default true: only an explicit false opts out.
     x.login_shell = if (mcp.argValue(args, "login_shell")) |v| !(v == .bool and !v.bool) else true;
-    if (try launch.checkExtra(arena, loaded.spec.launch, x)) |msg| {
+    if (try launch.checkExtra(arena, &loaded.spec, x)) |msg| {
         why.* = .{ .code = .invalid_args, .msg = msg };
         return error.Refused;
     }
@@ -1117,9 +1117,11 @@ fn spawnScreen(arena: std.mem.Allocator, loaded: *const adapter.Loaded, binary: 
     return e;
 }
 
-/// Wait until an API server answers its health route (`probeHealth`),
-/// watching its session: a server that swallows the requests of its
-/// first seconds is waited out, one that exits is reported as such.
+/// Wait until an API server answers the probe of a generation its adapter
+/// declares (`probeReady`, which keeps the generation), watching its
+/// session: a server that swallows the requests of its first seconds is
+/// waited out, one that exits is reported as such, one that answers no
+/// declared generation is refused at once.
 fn waitServerReady(arena: std.mem.Allocator, api: *opencode.Api, server: *termdrive.Term, what: []const u8, argv: []const []const u8, deadline: i64, why: *Fail) !void {
     const started = clock.nowMs();
     while (true) {
@@ -1130,14 +1132,18 @@ fn waitServerReady(arena: std.mem.Allocator, api: *opencode.Api, server: *termdr
         }
         const now = clock.nowMs();
         if (now >= deadline) {
-            why.* = .{ .code = .timeout, .msg = try std.fmt.allocPrint(arena, "{s} did not become ready within {d} ms (no answer to GET {s}: {s}; its last line: {s})", .{
-                what, now - started, opencode.HEALTH_PATH, api.problem(), mcp_term.termLastLine(arena, server),
+            why.* = .{ .code = .timeout, .msg = try std.fmt.allocPrint(arena, "{s} did not become ready within {d} ms (no answer to its readiness probes: {s}; its last line: {s})", .{
+                what, now - started, api.problem(), mcp_term.termLastLine(arena, server),
             }) };
             return error.Refused;
         }
-        const ok = api.probeHealth(@min(deadline, now + opencode.HEALTH_PROBE_MS)) catch |err| switch (err) {
+        const ok = api.probeReady(@min(deadline, now + opencode.HEALTH_PROBE_MS)) catch |err| switch (err) {
             error.Unauthorized => {
                 why.* = .{ .code = .failed, .msg = try std.fmt.allocPrint(arena, "{s} refused the password it was started with: {s}", .{ what, api.problem() }) };
+                return error.Refused;
+            },
+            error.UnknownApi => {
+                why.* = .{ .code = .unavailable, .msg = try std.fmt.allocPrint(arena, "{s} answers, but {s}; this sketerm does not know how to drive it", .{ what, api.problem() }) };
                 return error.Refused;
             },
             else => return err,
@@ -1241,7 +1247,7 @@ fn spawnApi(arena: std.mem.Allocator, loaded: *const adapter.Loaded, binary: []c
             return error.Refused;
         };
         if (!known) {
-            why.* = .{ .code = .not_found, .msg = try std.fmt.allocPrint(arena, "{s} has no conversation {s}: {s} serve, started in {s} on {s}, answered 404 for GET /session/{s} (it looks in its own storage of that user on that host); nothing was resumed and the server was stopped", .{ what, rid, binary, cwd, where.host orelse "this machine", rid }) };
+            why.* = .{ .code = .not_found, .msg = try std.fmt.allocPrint(arena, "{s} has no conversation {s}: {s} serve, started in {s} on {s}, answered 404 for {s} with {s} (it looks in its own storage of that user on that host); nothing was resumed and the server was stopped", .{ what, rid, binary, cwd, where.host orelse "this machine", api.gen.?.routes.session_get, rid }) };
             return error.Refused;
         }
     }
@@ -1253,8 +1259,8 @@ fn spawnApi(arena: std.mem.Allocator, loaded: *const adapter.Loaded, binary: []c
         why.* = .{ .code = .failed, .msg = "the app's API created no session" };
         return error.Refused;
     };
-    const want_tui = spec.launch.attach_args.len > 0 and (o.tui orelse spec.launch.attach_default);
-    const tui: ?*termdrive.Term = if (want_tui) try spawnTui(arena, loaded, where, o.choice, binary, x, port_str, cwd, sid, session, password, o.name orelse "", deadline, why) else null;
+    const want_tui = spec.hasTui() and (o.tui orelse spec.launch.attach_default);
+    const tui: ?*termdrive.Term = if (want_tui) try spawnTui(arena, loaded, api, where, o.choice, binary, x, port_str, cwd, sid, session, password, o.name orelse "", deadline, why) else null;
     errdefer if (tui) |t| t.deinit();
 
     const e = try newEntry(loaded, id, if (tui != null) session else server_session, binary, cwd);
@@ -1274,14 +1280,23 @@ fn spawnApi(arena: std.mem.Allocator, loaded: *const adapter.Loaded, binary: []c
     return e;
 }
 
-/// Start an API agent's attached TUI (the adapter's `attach_args`) in
-/// session `session` on `where`, against the server at `port_str` (its
-/// port on its own host) driving `sid`; the password rides the spawn's
-/// environment here and is typed on a remote host, never argv.
-fn spawnTui(arena: std.mem.Allocator, loaded: *const adapter.Loaded, where: *Where, choice: transport_mod.Choice, binary: []const u8, x: launch.Extra, port_str: []const u8, cwd: []const u8, sid: []const u8, session: []const u8, password: []const u8, title: []const u8, deadline: i64, why: *Fail) !*termdrive.Term {
+/// Start an API agent's attached TUI (the `attach_args` of the server
+/// generation `api` speaks) in session `session` on `where`, against the
+/// server at `port_str` (its port on its own host) driving `sid`; the
+/// password rides the spawn's environment here and is typed on a remote
+/// host, never argv.
+fn spawnTui(arena: std.mem.Allocator, loaded: *const adapter.Loaded, api: *const opencode.Api, where: *Where, choice: transport_mod.Choice, binary: []const u8, x: launch.Extra, port_str: []const u8, cwd: []const u8, sid: []const u8, session: []const u8, password: []const u8, title: []const u8, deadline: i64, why: *Fail) !*termdrive.Term {
     const spec = &loaded.spec;
     const pw_env = spec.launch.password_env orelse unreachable; // adapter.zig requires it for API sources
-    const argv = try launch.startArgv(arena, spec.launch, binary, x, .{ .port = port_str, .cwd = cwd, .session = sid }, .attach);
+    const gen = api.gen orelse {
+        why.* = .{ .code = .unavailable, .msg = "the app's server generation is not known yet, so neither is how to attach its TUI" };
+        return error.Refused;
+    };
+    if (gen.attach_args.len == 0) {
+        why.* = .{ .code = .unavailable, .msg = try std.fmt.allocPrint(arena, "{s} API generation {s} declares no attached TUI", .{ spec.name, gen.name }) };
+        return error.Refused;
+    }
+    const argv = try launch.startArgv(arena, spec.launch, binary, x, .{ .port = port_str, .cwd = cwd, .session = sid }, .{ .attach = gen.attach_args });
     const env_kv = try std.fmt.allocPrint(arena, "{s}={s}", .{ pw_env, password });
     defer std.crypto.secureZero(u8, env_kv);
     const env: []const []const u8 = if (where.host == null) try arena.dupe([]const u8, &.{env_kv}) else &.{};
@@ -1319,7 +1334,7 @@ pub fn setTui(arena: std.mem.Allocator, e: *Entry, want: bool, deadline: i64) !?
     const session = try std.fmt.allocPrint(arena, "agent-{s}", .{e.id});
     var where = e.where();
     var why: Fail = undefined;
-    const t = spawnTui(arena, e.loaded, &where, .auto, e.binary, x, port_str, e.cwd, sid, session, password, e.name orelse "", deadline, &why) catch |err| switch (err) {
+    const t = spawnTui(arena, e.loaded, api, &where, .auto, e.binary, x, port_str, e.cwd, sid, session, password, e.name orelse "", deadline, &why) catch |err| switch (err) {
         error.Refused => return why,
         else => return err,
     };

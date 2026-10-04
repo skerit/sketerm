@@ -535,17 +535,32 @@ pub fn sideQuestionApps(arena: std.mem.Allocator) ![]const []const u8 {
     return out.items;
 }
 
-/// The adapters whose app has a separate attached TUI (`launch.attach_args`),
+/// The adapters whose app has a separate attached TUI (`Spec.hasTui`),
 /// and the ones that start it by default, for `capabilities.agent_tui`.
 pub fn tuiApps(arena: std.mem.Allocator) !struct { apps: []const []const u8, on_by_default: []const []const u8 } {
     const set = try adapters();
     var apps: std.ArrayList([]const u8) = .empty;
     var on: std.ArrayList([]const u8) = .empty;
-    for (set.items.items) |l| if (l.spec.launch.attach_args.len > 0) {
+    for (set.items.items) |l| if (l.spec.hasTui()) {
         try apps.append(arena, l.spec.id);
         if (l.spec.launch.attach_default) try on.append(arena, l.spec.id);
     };
     return .{ .apps = apps.items, .on_by_default = on.items };
+}
+
+/// An API adapter and the server generations it speaks, newest first.
+pub const ApiVersions = struct { app: []const u8, versions: []const []const u8 };
+
+/// Every API adapter's server generations, for `capabilities.agent_api_versions`.
+pub fn apiVersions(arena: std.mem.Allocator) ![]const ApiVersions {
+    const set = try adapters();
+    var out: std.ArrayList(ApiVersions) = .empty;
+    for (set.items.items) |l| if (l.spec.api) |api| {
+        const names = try arena.alloc([]const u8, api.generations.len);
+        for (api.generations, names) |g, *n| n.* = g.name;
+        try out.append(arena, .{ .app = l.spec.id, .versions = names });
+    };
+    return out.items;
 }
 
 /// The adapter ids this server can open, for `capabilities`.

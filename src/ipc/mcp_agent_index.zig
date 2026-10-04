@@ -472,7 +472,7 @@ fn reattachOne(arena: std.mem.Allocator, d: Descriptor, claim: ?agentindex.Claim
     const transport: Transport = if (d.transport) |s| std.meta.stringToEnum(Transport, s) orelse return error.BadDescriptor else .local;
     if (transport != .local and d.host == null) return error.BadDescriptor;
     const extra = launch.Extra{ .args = d.args, .server_args = d.server_args, .tui_args = d.tui_args, .env = d.env, .path_prepend = d.path_prepend, .login_shell = d.login_shell, .permissions = d.permissions };
-    if ((try launch.checkExtra(arena, loaded.spec.launch, extra)) != null) return error.BadDescriptor;
+    if ((try launch.checkExtra(arena, &loaded.spec, extra)) != null) return error.BadDescriptor;
     const socket = d.socket orelse state.mux_sock;
     var parts: Parts = .{};
     errdefer parts.release(a);
@@ -833,7 +833,7 @@ test "a relaunch and a durable descriptor keep the caller's args and env" {
     for (x.args, parsed.value.args) |w, g| try testing.expectEqualStrings(w, g);
     try testing.expectEqualStrings("CLAUDE_CAPTURE_PROFILE", parsed.value.env[0].name);
     try testing.expectEqualStrings(x.env[0].value, parsed.value.env[0].value);
-    try testing.expect((try launch.checkExtra(a, set.get("claude").?.spec.launch, .{ .args = parsed.value.args, .env = parsed.value.env })) == null);
+    try testing.expect((try launch.checkExtra(a, &set.get("claude").?.spec, .{ .args = parsed.value.args, .env = parsed.value.env })) == null);
     // One written before args/env existed reads as none.
     const old = try std.json.parseFromSlice(Descriptor, testing.allocator, "{\"id\":\"claude-1\",\"app\":\"claude\",\"session\":\"s\",\"origin\":\"o\",\"binary\":\"/x\"}", .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
     defer old.deinit();

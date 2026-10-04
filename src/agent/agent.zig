@@ -189,7 +189,7 @@ pub const Agent = struct {
     pub fn queuedPrompts(self: *const Agent) u32 {
         return switch (self.source) {
             .screen => |*e| e.queued_visible,
-            .opencode_api => |*a| a.source.queuedPrompts(),
+            .opencode_api => |*a| a.queuedPrompts(),
         };
     }
 
@@ -551,6 +551,7 @@ test "api: the common read side and performed actions over HTTP" {
     var srv: testserver.Server = .{};
     try srv.start(t.allocator);
     defer srv.deinit();
+    srv.route("GET /global/health", .{ .body = "{\"healthy\":true}" });
     srv.route("POST /session", .{ .body = "{\"id\":\"ses_a\"}" });
     srv.route("GET /session/status", .{ .body = "{}" });
     srv.route("GET /permission", .{ .body = "[]" });

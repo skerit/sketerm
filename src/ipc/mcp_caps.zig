@@ -462,6 +462,8 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
         try res.fact("agent_side_question", .{ .available = side_apps.len > 0, .apps = side_apps });
         const tui = if (agents_ok) mcp_agent.tuiApps(arena) catch null else null;
         try res.fact("agent_tui", .{ .available = if (tui) |x| x.apps.len > 0 else false, .apps = if (tui) |x| x.apps else &.{}, .on_by_default = if (tui) |x| x.on_by_default else &.{} });
+        const gens: []const mcp_agent.ApiVersions = if (agents_ok) mcp_agent.apiVersions(arena) catch &.{} else &.{};
+        try res.fact("agent_api_versions", gens);
         if (agents_ok) {
             if (try mcp_agent.waiterTemplate(arena)) |w| try res.fact("agent_waiter", w) else try res.raw("agent_waiter", "null");
         } else try res.raw("agent_waiter", "null");

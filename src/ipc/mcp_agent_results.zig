@@ -151,7 +151,8 @@ pub fn finish(arena: std.mem.Allocator, res: *Res, e: *Entry, dv: Delivered, wat
     try res.fact("session", e.session);
     if (e.server_session) |s| try res.fact("server_session", s);
     // An app with a separate TUI: whether it runs (`agent_set tui`).
-    if (e.loaded.spec.launch.attach_args.len > 0) try res.fact("tui", e.visibleTerm() != null);
+    if (e.loaded.spec.hasTui()) try res.fact("tui", e.visibleTerm() != null);
+    if (apiVersionOf(e)) |v| try res.fact("api_version", v);
     if (e.host) |h| try res.fact("host", h);
     if (conversationOf(e)) |cv| try res.fact("conversation", cv);
     try res.fact("transport", @tagName(e.transport));
@@ -273,6 +274,15 @@ pub fn conversationOf(e: *Entry) ?[]const u8 {
     return switch (e.agent.source) {
         .opencode_api => |*api| api.sessionId(),
         .screen => e.conversation,
+    };
+}
+
+/// The server generation an API agent's app speaks (the adapter's
+/// `api.generations[].name`), or null for a screen app or before it is known.
+pub fn apiVersionOf(e: *const Entry) ?[]const u8 {
+    return switch (e.agent.source) {
+        .opencode_api => |*api| api.apiVersion(),
+        .screen => null,
     };
 }
 

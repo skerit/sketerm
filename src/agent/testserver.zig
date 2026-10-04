@@ -1,6 +1,7 @@
 //! A scripted loopback HTTP/1.1 server for the agent tests: routes answer
-//! fixed responses, and every `GET /event` connection streams the pushed
-//! SSE events as chunked `data:` lines, like opencode's server. A route can
+//! fixed responses, and every `GET <event_path>` connection streams the
+//! pushed SSE events as chunked `data:` lines, like opencode's server
+//! (`event_path` and `hello` speak 1.x by default; `v2` switches both). A route can
 //! push events when it is hit, so a reply the client sends is answered on
 //! the stream the way the real server answers it; a `hook` answers what a
 //! fixed route cannot (it sees the request body).
@@ -70,6 +71,15 @@ pub const Server = struct {
     /// answers a request that arrives (it holds the connection open): a
     /// starting opencode does exactly that for a few seconds.
     deaf_until_ms: i64 = 0,
+    /// The event stream's route and the event each new stream starts with.
+    event_path: []const u8 = "/event",
+    hello: []const u8 = "{\"type\":\"server.connected\",\"properties\":{}}",
+
+    /// Speak opencode 2.x's event stream (`/api/event`, its hello).
+    pub fn v2(self: *Server) void {
+        self.event_path = "/api/event";
+        self.hello = "{\"id\":\"evt_0\",\"type\":\"server.connected\",\"data\":{}}";
+    }
 
     pub fn start(self: *Server, allocator: std.mem.Allocator) !void {
         self.allocator = allocator;
@@ -220,7 +230,7 @@ pub const Server = struct {
                 writeResponse(fd, .{ .status = 401, .close_after = true }, "{\"name\":\"Unauthorized\"}");
                 return;
             }
-            if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/event")) {
+            if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, self.event_path)) {
                 self.stream(fd);
                 return;
             }
@@ -279,7 +289,7 @@ pub const Server = struct {
         }
     }
 
-    /// Like opencode: a new stream starts with `server.connected` and then
+    /// Like opencode: a new stream starts with `hello` and then
     /// carries only events pushed after it opened (taken before the head is
     /// written, so nothing pushed once the client has the head is missed).
     fn stream(self: *Server, fd: c_int) void {
@@ -287,10 +297,11 @@ pub const Server = struct {
         var next: usize = self.n_events;
         self.lock.unlock();
         writeAllFd(fd, "HTTP/1.1 200 OK\r\ncache-control: no-cache\r\ncontent-type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n");
-        const hello = "data: {\"type\":\"server.connected\",\"properties\":{}}\n\n";
         var size_buf: [16]u8 = undefined;
-        writeAllFd(fd, std.fmt.bufPrint(&size_buf, "{x}\r\n", .{hello.len}) catch return);
-        writeAllFd(fd, hello ++ "\r\n");
+        writeAllFd(fd, std.fmt.bufPrint(&size_buf, "{x}\r\n", .{self.hello.len + 8}) catch return);
+        writeAllFd(fd, "data: ");
+        writeAllFd(fd, self.hello);
+        writeAllFd(fd, "\n\n\r\n");
         while (!self.stopping.load(.acquire)) {
             var batch: [MAX_EVENTS][]const u8 = undefined;
             var n: usize = 0;

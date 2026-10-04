@@ -22,6 +22,7 @@ const output = @import("output.zig");
 const select = @import("select.zig");
 const grammar = @import("grammar.zig");
 const http = @import("http.zig");
+const dialect = @import("opencode_dialect.zig");
 const c = @import("../c.zig").c;
 const clock = @import("../util/clock.zig");
 
@@ -106,6 +107,15 @@ pub const Question = struct {
     multiple: bool,
     /// A free-text answer is accepted.
     custom: bool,
+    /// 2.x forms: the field's key, type and option values (parallel to
+    /// `options`), which its reply is written in.
+    key: []const u8 = "",
+    kind: dialect.FieldKind = .string,
+    values: []const []const u8 = &.{},
+
+    fn asked(self: Question) dialect.Asked {
+        return .{ .key = self.key, .kind = self.kind, .options = self.options, .values = self.values };
+    }
 };
 
 /// A permission or question request of some session (root or not).
@@ -988,10 +998,13 @@ pub const Source = struct {
         if (list == .array) {
             for (list.array.items) |q| {
                 var labels: std.ArrayList([]const u8) = .empty;
+                var values: std.ArrayList([]const u8) = .empty;
                 const opts = get(q, "options") orelse Value{ .null = {} };
                 if (opts == .array) {
                     for (opts.array.items) |o| {
-                        if (str(o, "label")) |l| try labels.append(a, try a.dupe(u8, l));
+                        const l = str(o, "label") orelse continue;
+                        try labels.append(a, try a.dupe(u8, l));
+                        try values.append(a, try a.dupe(u8, str(o, "value") orelse l));
                     }
                 }
                 try qs.append(a, .{
@@ -1000,6 +1013,9 @@ pub const Source = struct {
                     .options = labels.items,
                     .multiple = boolean(q, "multiple") orelse false,
                     .custom = boolean(q, "custom") orelse true,
+                    .key = try a.dupe(u8, str(q, "key") orelse ""),
+                    .kind = std.meta.stringToEnum(dialect.FieldKind, str(q, "kind") orelse "string") orelse .external,
+                    .values = values.items,
                 });
             }
         }
@@ -1212,8 +1228,6 @@ pub const Endpoint = struct {
 /// Every synchronous request's deadline (loopback; `/provider` is the
 /// slowest at a few MiB).
 pub const REQUEST_TIMEOUT_MS: i64 = 10_000;
-/// The readiness route (`probeHealth`).
-pub const HEALTH_PATH = "/global/health";
 /// One readiness probe's deadline: short, because a request the starting
 /// server swallowed is never answered.
 pub const HEALTH_PROBE_MS: i64 = 1000;
@@ -1282,17 +1296,26 @@ pub const Api = struct {
     catalog_failed: bool = false,
     chosen_model: ?[2][]u8 = null,
     chosen_variant: ?[]u8 = null,
+    /// A dialect that `selectsOnSession`: the chosen model or effort is not
+    /// set on the session yet (the next prompt or command sets it).
+    select_pending: bool = false,
     /// Tickets of `runCommand` requests in flight (the route answers when
     /// the command's turn ends).
     commands: std.ArrayList(u64) = .empty,
+    /// The server generation the running server speaks, from the adapter's
+    /// `api.generations` (`probeReady`, once); null until known.
+    gen: ?*const adapter.Generation = null,
+    /// Turns a newer dialect's events into the ones `source` reads.
+    translator: dialect.Translator,
     problem_buf: [512]u8 = undefined,
     problem_len: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, loaded: *const adapter.Loaded, limits: events.Limits, endpoint: Endpoint) !Api {
         var source = try Source.init(allocator, loaded, limits, null);
         errdefer source.deinit();
+        if (loaded.spec.api == null) return error.NotAnApiAdapter;
         const client = try http.Client.init(allocator, .{ .port = endpoint.port, .user = endpoint.user, .password = endpoint.password });
-        return .{ .allocator = allocator, .source = source, .client = client, .stream = http.EventStream.init(allocator) };
+        return .{ .allocator = allocator, .source = source, .client = client, .stream = http.EventStream.init(allocator), .translator = dialect.Translator.init(allocator) };
     }
 
     pub fn deinit(self: *Api) void {
@@ -1304,6 +1327,7 @@ pub const Api = struct {
         self.clearChosenModel();
         if (self.chosen_variant) |v| self.allocator.free(v);
         self.commands.deinit(self.allocator);
+        self.translator.deinit();
         self.source.deinit();
     }
 
@@ -1317,40 +1341,77 @@ pub const Api = struct {
         self.problem_len = s.len;
     }
 
-    /// One readiness probe: `GET /global/health` with its own deadline.
-    /// A starting opencode accepts connections seconds before it answers,
+    /// The name of the server generation it speaks (`api_version`), once known.
+    pub fn apiVersion(self: *const Api) ?[]const u8 {
+        const g = self.gen orelse return null;
+        return g.name;
+    }
+
+    /// One readiness probe round: each generation's `probe` in the
+    /// adapter's order, each with its own deadline; the first answered 200
+    /// with a JSON object is the generation it speaks, kept for good. A
+    /// starting opencode accepts connections seconds before it answers,
     /// and a request sent in that window is never answered at all; a
     /// probe that times out drops its connection, so the next one dials
     /// fresh. Call it until true before `connect`.
-    /// @return true once the server answered 200; error.Unauthorized when
-    /// it refuses the password (no point waiting).
-    pub fn probeHealth(self: *Api, deadline_ms: i64) !bool {
-        const r = self.client.call(.{ .method = .GET, .path = HEALTH_PATH }, deadline_ms) catch |err| {
-            if (err == error.OutOfMemory) return err;
-            self.fail("GET " ++ HEALTH_PATH ++ ": {s}", .{@errorName(err)});
-            return false;
-        };
-        defer r.deinit(self.allocator);
-        if (r.status == 200) return true;
-        self.fail("GET " ++ HEALTH_PATH ++ ": {d} {s}", .{ r.status, r.body[0..@min(r.body.len, 200)] });
-        if (r.status == 401) return error.Unauthorized;
-        return false;
+    /// @return true once the generation is known; error.Unauthorized when
+    /// it refuses the password, error.UnknownApi when every probe was
+    /// answered and none matched (`problem` lists the answers): no point
+    /// waiting for either.
+    pub fn probeReady(self: *Api, deadline_ms: i64) !bool {
+        if (self.gen != null) return true;
+        const gens = self.source.loaded.spec.api.?.generations;
+        var seen: std.ArrayList(u8) = .empty;
+        defer seen.deinit(self.allocator);
+        for (gens) |*g| {
+            const r = self.client.call(.{ .method = .GET, .path = g.probe }, deadline_ms) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                self.fail("GET {s}: {s}", .{ g.probe, @errorName(err) });
+                return false;
+            };
+            defer r.deinit(self.allocator);
+            if (r.status == 401) {
+                self.fail("GET {s}: 401 {s}", .{ g.probe, r.body[0..@min(r.body.len, 200)] });
+                return error.Unauthorized;
+            }
+            if (r.status == 200 and isJsonObject(self.allocator, r.body)) {
+                self.gen = g;
+                return true;
+            }
+            // Still starting: ask again.
+            if (r.status >= 500) {
+                self.fail("GET {s}: {d} {s}", .{ g.probe, r.status, r.body[0..@min(r.body.len, 200)] });
+                return false;
+            }
+            try seen.print(self.allocator, "{s}GET {s} answered {d} {s}", .{ if (seen.items.len > 0) "; " else "", g.probe, r.status, if (r.status == 200) "but not with JSON" else "" });
+        }
+        self.fail("the server speaks no API generation the {s} adapter declares: {s}", .{ self.source.loaded.spec.id, seen.items });
+        return error.UnknownApi;
     }
 
-    /// Whether the server knows session `id` (`GET /session/<id>`): false on
-    /// a 404, an error (`problem` says which) on any other failure.
+    /// The generation, probed now (one bounded round) when not known yet.
+    fn generation(self: *Api) !*const adapter.Generation {
+        if (self.gen) |g| return g;
+        if (!try self.probeReady(clock.nowMs() + REQUEST_TIMEOUT_MS)) return error.NotReady;
+        return self.gen.?;
+    }
+
+    /// Whether the server knows session `id` (`routes.session_get`): false
+    /// on a 404, an error (`problem` says which) on any other failure.
     pub fn sessionExists(self: *Api, id: []const u8) !bool {
-        var path_buf: [256]u8 = undefined;
-        const path = std.fmt.bufPrint(&path_buf, "/session/{s}", .{id}) catch return error.NoSession;
-        const r = self.client.call(.{ .method = .GET, .path = path }, clock.nowMs() + REQUEST_TIMEOUT_MS) catch |err| {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const g = try self.generation();
+        const req = try dialect.request(arena.allocator(), g.routes.session_get, .{ .session = id }, null);
+        const r = self.client.call(req, clock.nowMs() + REQUEST_TIMEOUT_MS) catch |err| {
             if (err == error.OutOfMemory) return err;
-            self.fail("GET {s}: {s}", .{ path, @errorName(err) });
+            self.fail("GET {s}: {s}", .{ req.path, @errorName(err) });
             return error.Rejected;
         };
         defer r.deinit(self.allocator);
         if (r.ok()) return true;
         if (r.status == 404) return false;
-        self.fail("GET {s}: {d} {s}", .{ path, r.status, r.body[0..@min(r.body.len, 300)] });
+        self.fail("GET {s}: {d} {s}", .{ req.path, r.status, r.body[0..@min(r.body.len, 300)] });
         return error.Rejected;
     }
 
@@ -1359,20 +1420,20 @@ pub const Api = struct {
     /// @param session an existing session to adopt; its past is history.
     pub fn connect(self: *Api, session: ?[]const u8, now_ms: i64) !void {
         self.problem_len = 0;
-        self.stream.open(&self.client, "/event", now_ms + REQUEST_TIMEOUT_MS) catch |err| {
-            self.fail("GET /event: {s}", .{@errorName(err)});
-            return err;
-        };
+        const g = try self.generation();
+        try self.openStream(g, now_ms);
         if (session) |id| {
             try self.source.setRoot(id);
             var msgs = try self.recentMessages(id);
             defer msgs.deinit();
             try self.source.resyncMessages(msgs.value, now_ms, true);
         } else {
-            var created = try self.requestJson(.{ .method = .POST, .path = "/session", .body = "{}" });
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            var created = try self.getReply(.session_info, try dialect.request(arena.allocator(), g.routes.session_create, .{}, "{}"), null);
             defer created.deinit();
             const id = str(created.value, "id") orelse {
-                self.fail("POST /session: no id in the reply", .{});
+                self.fail("{s}: no id in the reply", .{g.routes.session_create});
                 return error.BadReply;
             };
             try self.source.setRoot(id);
@@ -1381,9 +1442,26 @@ pub const Api = struct {
         try self.source.noteReconnected(now_ms);
     }
 
+    fn openStream(self: *Api, g: *const adapter.Generation, now_ms: i64) !void {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const req = try dialect.request(arena.allocator(), g.routes.events, .{}, null);
+        self.stream.open(&self.client, req.path, now_ms + REQUEST_TIMEOUT_MS) catch |err| {
+            self.fail("GET {s}: {s}", .{ req.path, @errorName(err) });
+            return err;
+        };
+    }
+
     /// The session the agent drives.
     pub fn sessionId(self: *const Api) ?[]const u8 {
         return self.source.root;
+    }
+
+    /// Root prompts the server holds for a later turn: the ones its
+    /// answers show queued, and (2.x) the ones its inbox has not delivered.
+    pub fn queuedPrompts(self: *const Api) u32 {
+        const parked = if (self.source.root) |r| self.translator.parked(r) else 0;
+        return self.source.queuedPrompts() + parked;
     }
 
     /// The fds to watch for input (the event stream, async requests).
@@ -1424,13 +1502,14 @@ pub const Api = struct {
         }
         try self.client.service(now_ms);
         while (self.client.takeCompletion()) |done| try self.finished(done, now_ms);
-        while (self.source.unresolvedSession()) |id| {
-            var path_buf: [256]u8 = undefined;
-            const path = std.fmt.bufPrint(&path_buf, "/session/{s}", .{id}) catch continue;
-            var info = self.getJson(path) catch continue;
+        if (self.gen) |g| while (self.source.unresolvedSession()) |id| {
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            const req = dialect.request(arena.allocator(), g.routes.session_get, .{ .session = id }, null) catch continue;
+            var info = self.getReply(.session_info, req, null) catch continue;
             defer info.deinit();
             try self.source.applySessionObject(info.value, now_ms);
-        }
+        };
         try self.source.tick(now_ms);
     }
 
@@ -1439,15 +1518,26 @@ pub const Api = struct {
             for (self.inbox.items) |e| e.deinit(self.allocator);
             self.inbox.clearRetainingCapacity();
         }
+        const d: adapter.Dialect = if (self.gen) |g| g.dialect else .v1;
         for (self.inbox.items) |e| {
             var parsed = std.json.parseFromSlice(Value, self.allocator, e.data, .{}) catch continue;
             defer parsed.deinit();
-            try self.source.apply(parsed.value, now_ms);
+            switch (d) {
+                .v1 => try self.source.apply(parsed.value, now_ms),
+                .v2 => {
+                    var arena = std.heap.ArenaAllocator.init(self.allocator);
+                    defer arena.deinit();
+                    var out: std.ArrayList(Value) = .empty;
+                    try self.translator.translate(arena.allocator(), parsed.value, self.source.root, &out);
+                    for (out.items) |ev| try self.source.apply(ev, now_ms);
+                },
+            }
         }
     }
 
     fn reconnect(self: *Api, now_ms: i64) void {
-        self.stream.open(&self.client, "/event", now_ms + REQUEST_TIMEOUT_MS) catch {
+        const g = self.gen orelse return;
+        self.openStream(g, now_ms) catch {
             self.backoff_ms = @min(self.backoff_ms * 2, RECONNECT_MAX_MS);
             self.reconnect_at_ms = now_ms + self.backoff_ms;
             return;
@@ -1465,16 +1555,18 @@ pub const Api = struct {
         self.source.noteReconnected(now_ms) catch {};
     }
 
-    /// The newest messages of session `id`, oldest first: `?limit=` (newest
-    /// N, opencode's page form), halved while the reply exceeds
+    /// The newest messages of session `id`, oldest first: `{limit}` of the
+    /// newest (opencode's page form), halved while the reply exceeds
     /// `http.MAX_BODY`. A whole long session is far over that cap, and only
     /// its recent end matters to a resume or a resync.
     fn recentMessages(self: *Api, id: []const u8) !std.json.Parsed(Value) {
+        const g = try self.generation();
         var limit: u32 = RESUME_MESSAGES;
         while (true) : (limit /= 2) {
-            var path_buf: [256]u8 = undefined;
-            const path = std.fmt.bufPrint(&path_buf, "/session/{s}/message?limit={d}", .{ id, limit }) catch return error.NoSession;
-            return self.getJson(path) catch |err| {
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            const req = try dialect.request(arena.allocator(), g.routes.messages, .{ .session = id, .limit = limit }, null);
+            return self.getReply(.messages, req, id) catch |err| {
                 if (err != error.TooLarge or limit <= 1) return err;
                 continue;
             };
@@ -1491,12 +1583,16 @@ pub const Api = struct {
 
     /// Statuses and pending requests as the server has them now.
     fn resync(self: *Api, now_ms: i64) !void {
-        var status = try self.getJson("/session/status");
+        const g = try self.generation();
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var status = try self.getReply(.status, try dialect.request(a, g.routes.status, .{}, null), null);
         defer status.deinit();
         try self.source.resyncStatus(status.value, now_ms);
-        var perms = try self.getJson("/permission");
+        var perms = try self.getReply(.permissions, try dialect.request(a, g.routes.permissions, .{}, null), null);
         defer perms.deinit();
-        var questions = try self.getJson("/question");
+        var questions = try self.getReply(.questions, try dialect.request(a, g.routes.questions, .{}, null), null);
         defer questions.deinit();
         try self.source.resyncPending(perms.value, questions.value, now_ms);
     }
@@ -1537,20 +1633,36 @@ pub const Api = struct {
     /// @param agent_name an opencode agent (`build`, `plan`), or the session's.
     pub fn submit(self: *Api, text: []const u8, agent_name: ?[]const u8) !void {
         const root = self.source.root orelse return error.NoSession;
-        const TextPart = struct { type: []const u8 = "text", text: []const u8 };
-        const ModelRef = struct { providerID: []const u8, modelID: []const u8 };
-        const model: ?ModelRef = if (self.chosenModel()) |m| .{ .providerID = m.provider, .modelID = m.model } else null;
-        const body = try std.json.Stringify.valueAlloc(self.allocator, .{
-            .parts = [1]TextPart{.{ .text = text }},
-            .model = model,
-            .variant = self.chosen_variant,
-            .agent = agent_name,
-        }, .{ .emit_null_optional_fields = false });
-        defer self.allocator.free(body);
-        var path_buf: [256]u8 = undefined;
-        const path = std.fmt.bufPrint(&path_buf, "/session/{s}/prompt_async", .{root}) catch return error.NoSession;
-        const r = try self.request(.{ .method = .POST, .path = path, .body = body });
+        const g = try self.generation();
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        try self.selectOnSession(a, g, agent_name);
+        const body = try dialect.promptBody(g.dialect, a, text, self.modelChoice(), agent_name);
+        const r = try self.request(try dialect.request(a, g.routes.prompt, .{ .session = root }, body));
         r.deinit(self.allocator);
+    }
+
+    /// The chosen model with its effort level, as a request names it.
+    fn modelChoice(self: *const Api) ?dialect.ModelChoice {
+        const m = self.chosenModel() orelse return null;
+        return .{ .provider = m.provider, .model = m.model, .variant = self.chosen_variant };
+    }
+
+    /// A dialect that takes the model and agent on the session: set what
+    /// was chosen since the last time, before the prompt or command.
+    fn selectOnSession(self: *Api, a: std.mem.Allocator, g: *const adapter.Generation, agent_name: ?[]const u8) !void {
+        if (!g.dialect.selectsOnSession()) return;
+        const root = self.source.root orelse return error.NoSession;
+        if (self.select_pending) if (self.modelChoice()) |m| {
+            const r = try self.request(try dialect.request(a, g.routes.model_select.?, .{ .session = root }, try dialect.selectModelBody(a, m)));
+            r.deinit(self.allocator);
+            self.select_pending = false;
+        };
+        if (agent_name) |name| {
+            const r = try self.request(try dialect.request(a, g.routes.agent_select.?, .{ .session = root }, try dialect.selectAgentBody(a, name)));
+            r.deinit(self.allocator);
+        }
     }
 
     /// Answer the pending interaction by option label, 1-based index or (for
@@ -1558,34 +1670,40 @@ pub const Api = struct {
     /// one answer per line; a multi-select one takes comma-separated labels.
     pub fn answer(self: *Api, choice: []const u8) !void {
         const p = self.source.pendingRequest() orelse return error.NoPendingInteraction;
-        var path_buf: [256]u8 = undefined;
-        switch (p.interaction.kind) {
-            .permission => {
+        const g = try self.generation();
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const holes: dialect.Holes = .{ .session = p.session, .request = p.id };
+        const req: http.Request = switch (p.interaction.kind) {
+            .permission => blk: {
                 const reply = PermissionReply.fromChoice(p.interaction, choice) orelse return error.NoSuchOption;
-                const path = std.fmt.bufPrint(&path_buf, "/permission/{s}/reply", .{p.id}) catch return error.NoSuchOption;
-                const body = try std.json.Stringify.valueAlloc(self.allocator, .{ .reply = @tagName(reply) }, .{});
-                defer self.allocator.free(body);
-                const r = try self.request(.{ .method = .POST, .path = path, .body = body });
-                r.deinit(self.allocator);
+                break :blk try dialect.request(a, g.routes.permission_reply, holes, try dialect.permissionBody(g.dialect, a, @tagName(reply), null));
             },
-            .question => {
-                var arena = std.heap.ArenaAllocator.init(self.allocator);
-                defer arena.deinit();
-                const answers = questionAnswers(arena.allocator(), p.questions, choice) catch |err| {
-                    if (err == error.NoSuchOption) self.fail("{s}", .{try questionsHelp(arena.allocator(), p.questions, choice)});
+            .question => blk: {
+                const answers = questionAnswers(a, p.questions, choice) catch |err| {
+                    if (err == error.NoSuchOption) self.fail("{s}", .{try questionsHelp(a, p.questions, choice)});
                     return err;
                 };
-                const path = std.fmt.bufPrint(&path_buf, "/question/{s}/reply", .{p.id}) catch return error.NoSuchOption;
-                const body = try std.json.Stringify.valueAlloc(arena.allocator(), .{ .answers = answers }, .{});
-                const r = try self.request(.{ .method = .POST, .path = path, .body = body });
-                r.deinit(self.allocator);
+                break :blk try dialect.request(a, g.routes.question_reply, holes, try self.questionBody(a, g, p.questions, answers, choice));
             },
             .choice => return error.NoSuchOption,
-        }
+        };
+        const r = try self.request(req);
+        r.deinit(self.allocator);
         // Gone now; the replied event that follows is a no-op.
         const id = try self.allocator.dupe(u8, p.id);
         defer self.allocator.free(id);
         self.source.removePending(id);
+    }
+
+    fn questionBody(self: *Api, a: std.mem.Allocator, g: *const adapter.Generation, questions: []const Question, answers: []const []const []const u8, choice: []const u8) ![]u8 {
+        const asked = try a.alloc(dialect.Asked, questions.len);
+        for (questions, asked) |q, *x| x.* = q.asked();
+        return dialect.questionBody(g.dialect, a, asked, answers) catch |err| {
+            if (err == error.NoSuchOption) self.fail("{s}", .{try questionsHelp(a, questions, choice)});
+            return err;
+        };
     }
 
     /// Answer the pending interaction in free text: a permission is rejected
@@ -1594,22 +1712,17 @@ pub const Api = struct {
     pub fn answerText(self: *Api, text: []const u8) !void {
         const p = self.source.pendingRequest() orelse return error.NoPendingInteraction;
         if (!p.interaction.free_text) return error.NoFreeText;
+        const g = try self.generation();
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const a = arena.allocator();
-        var path_buf: [256]u8 = undefined;
-        const path: []const u8, const body: []const u8 = switch (p.interaction.kind) {
-            .permission => .{
-                std.fmt.bufPrint(&path_buf, "/permission/{s}/reply", .{p.id}) catch return error.NoSuchOption,
-                try std.json.Stringify.valueAlloc(a, .{ .reply = @tagName(PermissionReply.reject), .message = text }, .{}),
-            },
-            .question => .{
-                std.fmt.bufPrint(&path_buf, "/question/{s}/reply", .{p.id}) catch return error.NoSuchOption,
-                try std.json.Stringify.valueAlloc(a, .{ .answers = try customAnswers(a, p.questions, text) }, .{}),
-            },
+        const holes: dialect.Holes = .{ .session = p.session, .request = p.id };
+        const req: http.Request = switch (p.interaction.kind) {
+            .permission => try dialect.request(a, g.routes.permission_reply, holes, try dialect.permissionBody(g.dialect, a, @tagName(PermissionReply.reject), text)),
+            .question => try dialect.request(a, g.routes.question_reply, holes, try self.questionBody(a, g, p.questions, try customAnswers(a, p.questions, text), text)),
             .choice => return error.NoFreeText,
         };
-        const r = try self.request(.{ .method = .POST, .path = path, .body = body });
+        const r = try self.request(req);
         r.deinit(self.allocator);
         const id = try self.allocator.dupe(u8, p.id);
         defer self.allocator.free(id);
@@ -1619,9 +1732,10 @@ pub const Api = struct {
     /// Abort the running turn (subagents included).
     pub fn interrupt(self: *Api) !void {
         const root = self.source.root orelse return error.NoSession;
-        var path_buf: [256]u8 = undefined;
-        const path = std.fmt.bufPrint(&path_buf, "/session/{s}/abort", .{root}) catch return error.NoSession;
-        const r = try self.request(.{ .method = .POST, .path = path });
+        const g = try self.generation();
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const r = try self.request(try dialect.request(arena.allocator(), g.routes.interrupt, .{ .session = root }, null));
         r.deinit(self.allocator);
     }
 
@@ -1641,6 +1755,7 @@ pub const Api = struct {
                 self.chosen_variant = null;
             }
         }
+        self.select_pending = true;
     }
 
     /// Use effort `level` (a variant of the current model; `default`
@@ -1654,6 +1769,7 @@ pub const Api = struct {
         if (std.ascii.eqlIgnoreCase(level, "default")) {
             if (self.chosen_variant) |v| self.allocator.free(v);
             self.chosen_variant = null;
+            self.select_pending = true;
             return;
         }
         if (!hasVariant(m, level)) {
@@ -1670,6 +1786,7 @@ pub const Api = struct {
         const v = try self.allocator.dupe(u8, level);
         if (self.chosen_variant) |old| self.allocator.free(old);
         self.chosen_variant = v;
+        self.select_pending = true;
     }
 
     /// The model the next prompt runs with, when known.
@@ -1726,9 +1843,10 @@ pub const Api = struct {
         return cat.models;
     }
 
-    /// The server's commands (`GET /command`), allocated from `arena`.
+    /// The server's commands (`routes.commands`), allocated from `arena`.
     pub fn listCommands(self: *Api, arena: std.mem.Allocator) ![]CommandInfo {
-        var parsed = try self.getJson("/command");
+        const g = try self.generation();
+        var parsed = try self.getReply(.commands, try dialect.request(arena, g.routes.commands, .{}, null), null);
         defer parsed.deinit();
         var out: std.ArrayList(CommandInfo) = .empty;
         if (parsed.value == .array) {
@@ -1745,29 +1863,21 @@ pub const Api = struct {
         return out.toOwnedSlice(arena);
     }
 
-    /// Run command `name` with `arguments` in the session. The route
-    /// answers only when the command's turn ends, so it runs in the
+    /// Run command `name` with `arguments` in the session. The route may
+    /// answer only when the command's turn ends (1.x), so it runs in the
     /// background: its outcome streams in as events, and a refusal
     /// becomes an `error` event.
     pub fn runCommand(self: *Api, name: []const u8, arguments: []const u8) !void {
         const root = self.source.root orelse return error.NoSession;
-        var model_buf: [256]u8 = undefined;
-        const model: ?[]const u8 = if (self.chosenModel()) |m|
-            std.fmt.bufPrint(&model_buf, "{s}/{s}", .{ m.provider, m.model }) catch null
-        else
-            null;
-        const body = try std.json.Stringify.valueAlloc(self.allocator, .{
-            .command = name,
-            .arguments = arguments,
-            .model = model,
-            .variant = self.chosen_variant,
-        }, .{ .emit_null_optional_fields = false });
-        defer self.allocator.free(body);
-        var path_buf: [256]u8 = undefined;
-        const path = std.fmt.bufPrint(&path_buf, "/session/{s}/command", .{root}) catch return error.NoSession;
+        const g = try self.generation();
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        try self.selectOnSession(a, g, null);
+        const req = try dialect.request(a, g.routes.command_run, .{ .session = root }, try dialect.commandBody(g.dialect, a, name, arguments, self.modelChoice()));
         try self.commands.ensureUnusedCapacity(self.allocator, 1);
-        const ticket = self.client.start(.{ .method = .POST, .path = path, .body = body }, null) catch |err| {
-            self.fail("POST {s}: {s}", .{ path, @errorName(err) });
+        const ticket = self.client.start(req, null) catch |err| {
+            self.fail("POST {s}: {s}", .{ req.path, @errorName(err) });
             return err;
         };
         self.commands.appendAssumeCapacity(ticket);
@@ -1788,24 +1898,33 @@ pub const Api = struct {
         return error.Rejected;
     }
 
-    fn requestJson(self: *Api, req: http.Request) !std.json.Parsed(Value) {
+    /// The JSON reply to `req` in the shape `Source` reads (the dialect's
+    /// `reply`), allocated in the returned arena.
+    fn getReply(self: *Api, which: dialect.Reply, req: http.Request, session: ?[]const u8) !std.json.Parsed(Value) {
         const r = try self.request(req);
         defer r.deinit(self.allocator);
-        return std.json.parseFromSlice(Value, self.allocator, r.body, .{}) catch {
+        var parsed = std.json.parseFromSlice(Value, self.allocator, r.body, .{}) catch {
             self.fail("{s} {s}: the reply is not JSON", .{ @tagName(req.method), req.path });
             return error.BadReply;
         };
-    }
-
-    fn getJson(self: *Api, path: []const u8) !std.json.Parsed(Value) {
-        return self.requestJson(.{ .method = .GET, .path = path });
+        errdefer parsed.deinit();
+        const d: adapter.Dialect = if (self.gen) |g| g.dialect else .v1;
+        parsed.value = dialect.reply(d, which, parsed.arena.allocator(), parsed.value, session) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            self.fail("{s} {s}: the reply has an unexpected shape ({s})", .{ @tagName(req.method), req.path, @errorName(err) });
+            return error.BadReply;
+        };
+        return parsed;
     }
 
     fn loadCatalog(self: *Api, refresh: bool) !*const Catalog {
         if (self.catalog) |*cat| {
             if (!refresh) return cat;
         }
-        var parsed = try self.getJson("/provider");
+        const g = try self.generation();
+        var req_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer req_arena.deinit();
+        var parsed = try self.getReply(.models, try dialect.request(req_arena.allocator(), g.routes.models, .{}, null), null);
         defer parsed.deinit();
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
@@ -1875,6 +1994,13 @@ pub const Api = struct {
         return error.UnknownModel;
     }
 };
+
+/// Whether `body` is a JSON object (a generation probe's match).
+fn isJsonObject(allocator: std.mem.Allocator, body: []const u8) bool {
+    var parsed = std.json.parseFromSlice(Value, allocator, body, .{}) catch return false;
+    defer parsed.deinit();
+    return parsed.value == .object;
+}
 
 fn hasVariant(m: *const ModelInfo, level: []const u8) bool {
     for (m.variants) |v| {
@@ -1983,6 +2109,9 @@ pub fn questionsHelp(arena: std.mem.Allocator, questions: []const Question, choi
 
 const t = std.testing;
 const testserver = @import("testserver.zig");
+
+/// The shipped adapter's 1.x probe route, as the fake servers answer it.
+const V1_PROBE = "GET /global/health";
 
 /// The shipped opencode adapter plus a Source fed hand-written events.
 const Rig = struct {
@@ -2434,6 +2563,7 @@ test "api: resuming a session too large to fetch whole reads only its recent end
     var srv: testserver.Server = .{};
     try srv.start(t.allocator);
     defer srv.deinit();
+    srv.route(V1_PROBE, .{ .body = "{\"healthy\":true}" });
     srv.route("GET /session/status", .{ .body = "{}" });
     srv.route("GET /permission", .{ .body = "[]" });
     srv.route("GET /question", .{ .body = "[]" });
@@ -2492,6 +2622,7 @@ test "api: the facts document is the latest answer's tokens and its model's cata
     var srv: testserver.Server = .{};
     try srv.start(t.allocator);
     defer srv.deinit();
+    srv.route(V1_PROBE, .{ .body = "{\"healthy\":true}" });
     srv.route("POST /session", .{ .body = "{\"id\":\"ses_root\",\"title\":\"agent\"}" });
     srv.route("GET /session/status", .{ .body = "{}" });
     srv.route("GET /permission", .{ .body = "[]" });
@@ -2528,6 +2659,7 @@ test "api: connect, submit with a chosen model and effort, answer, interrupt, co
     var srv: testserver.Server = .{};
     try srv.start(t.allocator);
     defer srv.deinit();
+    srv.route(V1_PROBE, .{ .body = "{\"healthy\":true}" });
     srv.route("POST /session", .{ .body = "{\"id\":\"ses_root\",\"title\":\"agent\"}" });
     srv.route("GET /session/status", .{ .body = "{}" });
     srv.route("GET /permission", .{ .body = "[]" });
@@ -2560,8 +2692,11 @@ test "api: connect, submit with a chosen model and effort, answer, interrupt, co
     defer api.deinit();
     try api.connect(null, clock.nowMs());
     try t.expectEqualStrings("ses_root", api.sessionId().?);
-    try t.expect(std.mem.startsWith(u8, srv.request(0), "GET /event HTTP/1.1"));
-    try t.expect(std.mem.indexOf(u8, srv.request(0), "Authorization: Basic b3BlbmNvZGU6c2VjcmV0\r\n") != null);
+    // The probes found 1.x (2.x's probe answered 404) before the stream opened.
+    try t.expect(std.mem.startsWith(u8, srv.request(0), "GET /api/info HTTP/1.1"));
+    try t.expectEqualStrings("1", api.apiVersion().?);
+    const stream_req = srv.lastRequest("GET /event HTTP/1.1").?;
+    try t.expect(std.mem.indexOf(u8, stream_req, "Authorization: Basic b3BlbmNvZGU6c2VjcmV0\r\n") != null);
     try t.expectEqual(vocab.State.idle, api.source.state);
 
     // Model and effort: validated against the connected providers only.
@@ -2646,6 +2781,7 @@ test "api: a session to resume is checked first; an unknown one is false, never 
     var srv: testserver.Server = .{};
     try srv.start(t.allocator);
     defer srv.deinit();
+    srv.route(V1_PROBE, .{ .body = "{\"healthy\":true}" });
     srv.route("GET /session/ses_known", .{ .body = "{\"id\":\"ses_known\",\"title\":\"t\"}" });
     srv.route("GET /session/ses_nope", .{ .status = 404, .body = "{\"name\":\"NotFoundError\"}" });
     srv.route("GET /session/ses_err", .{ .status = 500, .body = "boom" });
@@ -2664,6 +2800,7 @@ test "api: a refused session create is Rejected with the status in problem()" {
     var srv: testserver.Server = .{};
     try srv.start(t.allocator);
     defer srv.deinit();
+    srv.route(V1_PROBE, .{ .body = "{\"healthy\":true}" });
     srv.route("POST /session", .{ .status = 401, .body = "{\"_tag\":\"UnauthorizedError\",\"message\":\"no\"}" });
     var set = adapter.Set.init(t.allocator);
     defer set.deinit();
@@ -2682,7 +2819,7 @@ test "api: a starting server that swallows requests is waited out by short fresh
     srv.deaf_until_ms = clock.nowMs() + 1200;
     try srv.start(t.allocator);
     defer srv.deinit();
-    srv.route("GET " ++ HEALTH_PATH, .{ .body = "{\"healthy\":true}" });
+    srv.route(V1_PROBE, .{ .body = "{\"healthy\":true}" });
     var set = adapter.Set.init(t.allocator);
     defer set.deinit();
     try set.loadShipped();
@@ -2691,11 +2828,11 @@ test "api: a starting server that swallows requests is waited out by short fresh
 
     // The first probe lands in the deaf window: it times out, not hangs.
     const t0 = clock.nowMs();
-    try t.expect(!try api.probeHealth(t0 + 300));
+    try t.expect(!try api.probeReady(t0 + 300));
     try t.expect(clock.nowMs() - t0 < 1000);
     try t.expect(std.mem.indexOf(u8, api.problem(), "Timeout") != null);
     var probes: u32 = 1;
-    while (!try api.probeHealth(clock.nowMs() + 300)) {
+    while (!try api.probeReady(clock.nowMs() + 300)) {
         probes += 1;
         if (clock.nowMs() - t0 > 5000) return error.TestServerNeverAnswered;
     }
@@ -2712,7 +2849,7 @@ test "api: a starting server that swallows requests is waited out by short fresh
     defer bad.deinit();
     var api2 = try Api.init(t.allocator, set.get("opencode").?, .{}, .{ .port = bad.port(), .password = "wrong" });
     defer api2.deinit();
-    try t.expectError(error.Unauthorized, api2.probeHealth(clock.nowMs() + 1000));
+    try t.expectError(error.Unauthorized, api2.probeReady(clock.nowMs() + 1000));
 }
 
 /// A root assistant message answering prompt `parent` (`msg_u<n>`).
@@ -2768,6 +2905,7 @@ test "api: free-text answers reject a permission with a message and give a quest
     var srv: testserver.Server = .{};
     try srv.start(t.allocator);
     defer srv.deinit();
+    srv.route(V1_PROBE, .{ .body = "{\"healthy\":true}" });
     srv.route("POST /session", .{ .body = "{\"id\":\"ses_root\"}" });
     srv.route("GET /session/status", .{ .body = "{}" });
     srv.route("GET /permission", .{ .body = "[{\"id\":\"per_1\",\"sessionID\":\"ses_root\",\"permission\":\"bash\",\"patterns\":[\"touch x\"],\"always\":[]}]" });
@@ -2791,4 +2929,399 @@ test "api: free-text answers reject a permission with a message and give a quest
     const q = srv.lastRequest("POST /question/que_1/reply").?;
     try t.expect(std.mem.indexOf(u8, q, "{\"answers\":[[\"green, actually\"]]}") != null);
     try t.expectError(error.NoPendingInteraction, api.answerText("x"));
+}
+
+// ── opencode 2.x ─────────────────────────────────────────────────
+
+/// The shipped adapter plus a Source fed 2.x events through the dialect's
+/// translator, as `Api.drainInbox` feeds them.
+const V2Rig = struct {
+    set: adapter.Set,
+    src: Source,
+    tr: dialect.Translator,
+
+    fn init(self: *V2Rig) !void {
+        self.set = adapter.Set.init(t.allocator);
+        errdefer self.set.deinit();
+        try self.set.loadShipped();
+        self.src = try Source.init(t.allocator, self.set.get("opencode").?, .{}, null);
+        self.tr = dialect.Translator.init(t.allocator);
+        try self.src.setRoot("ses_2");
+        try self.feed(0, "{\"id\":\"e0\",\"type\":\"server.connected\",\"data\":{}}");
+    }
+
+    fn deinit(self: *V2Rig) void {
+        self.tr.deinit();
+        self.src.deinit();
+        self.set.deinit();
+    }
+
+    fn feed(self: *V2Rig, now: i64, json: []const u8) !void {
+        var arena = std.heap.ArenaAllocator.init(t.allocator);
+        defer arena.deinit();
+        const ev = try std.json.parseFromSliceLeaky(Value, arena.allocator(), json, .{});
+        var out: std.ArrayList(Value) = .empty;
+        try self.tr.translate(arena.allocator(), ev, self.src.root, &out);
+        for (out.items) |x| try self.src.apply(x, now);
+    }
+
+    /// `{type, data}` of session ses_2 at wall time 1791127800000 + now.
+    fn send(self: *V2Rig, now: i64, comptime ty: []const u8, comptime data: []const u8) !void {
+        var buf: [2048]u8 = undefined;
+        try self.feed(now, try std.fmt.bufPrint(&buf, "{{\"id\":\"evt_{d}\",\"created\":{d},\"type\":\"{s}\",\"data\":{{\"sessionID\":\"ses_2\"{s}}}}}", .{ now, 1791127800000 + now, ty, data }));
+    }
+
+    fn prompt(self: *V2Rig, now: i64, comptime id: []const u8, comptime text: []const u8, comptime delivery: []const u8) !void {
+        try self.send(now, "session.inbox.enqueued", ",\"inboxID\":\"" ++ id ++ "\",\"item\":{\"type\":\"user\",\"payload\":{\"text\":\"" ++ text ++ "\"},\"delivery\":\"" ++ delivery ++ "\"}");
+    }
+
+    fn deliver(self: *V2Rig, now: i64, comptime id: []const u8) !void {
+        try self.send(now, "session.inbox.delivered", ",\"inboxID\":\"" ++ id ++ "\"");
+    }
+
+    fn step(self: *V2Rig, now: i64, comptime msg: []const u8) !void {
+        try self.send(now, "session.step.started", ",\"agent\":\"build\",\"model\":{\"id\":\"gpt-x\",\"providerID\":\"openai\",\"variant\":\"default\"},\"assistantMessageID\":\"" ++ msg ++ "\"");
+    }
+
+    fn reply(self: *V2Rig, now: i64, comptime msg: []const u8, comptime body: []const u8) !void {
+        try self.send(now, "session.text.delta", ",\"assistantMessageID\":\"" ++ msg ++ "\",\"ordinal\":0,\"delta\":\"" ++ body ++ "\"");
+        try self.send(now, "session.text.ended", ",\"assistantMessageID\":\"" ++ msg ++ "\",\"ordinal\":0,\"text\":\"" ++ body ++ "\"");
+    }
+
+    fn stepEnded(self: *V2Rig, now: i64, comptime msg: []const u8) !void {
+        try self.send(now, "session.step.ended", ",\"assistantMessageID\":\"" ++ msg ++ "\",\"finish\":\"stop\",\"cost\":0,\"tokens\":{\"input\":10,\"output\":2,\"reasoning\":0,\"cache\":{\"read\":0,\"write\":0}}");
+    }
+
+    fn count(self: *const V2Rig, kind: vocab.EventKind) usize {
+        return countKind(&self.src.queue, kind);
+    }
+
+    fn last(self: *const V2Rig, kind: vocab.EventKind) ?events.Event {
+        var i = self.src.queue.events.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (self.src.queue.events.items[i].kind == kind) return self.src.queue.events.items[i];
+        }
+        return null;
+    }
+};
+
+test "2.x events: a prompt queued behind a busy turn opens its job only when delivered, one done covers both" {
+    var rig: V2Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    try t.expectEqual(vocab.State.idle, rig.src.state);
+    try rig.prompt(1, "msg_u1", "write an essay", "queue");
+    // Admitted, not taken: no job yet.
+    try t.expectEqual(@as(u32, 0), rig.src.turns);
+    try rig.send(2, "session.execution.started", "");
+    try rig.deliver(3, "msg_u1");
+    try t.expectEqual(@as(u32, 1), rig.src.turns);
+    try t.expectEqual(vocab.State.working, rig.src.state);
+    try rig.step(4, "msg_a1");
+    try t.expectEqualStrings("openai", rig.src.seenModel().?.provider);
+    // A second prompt while it works waits in the inbox.
+    try rig.prompt(5, "msg_u2", "then say PINEAPPLE", "queue");
+    try t.expectEqual(@as(u32, 1), rig.tr.parked("ses_2"));
+    try rig.reply(6, "msg_a1", "The essay.");
+    try rig.stepEnded(7, "msg_a1");
+    try rig.deliver(8, "msg_u2");
+    try t.expectEqual(@as(u32, 0), rig.tr.parked("ses_2"));
+    try rig.step(9, "msg_a2");
+    try rig.reply(10, "msg_a2", "PINEAPPLE");
+    try rig.stepEnded(11, "msg_a2");
+    try t.expectEqual(@as(usize, 0), rig.count(.done));
+    try rig.send(12, "session.execution.succeeded", "");
+    try rig.src.tick(5000);
+    try t.expectEqual(@as(usize, 1), rig.count(.done));
+    const done = rig.last(.done).?;
+    try t.expectEqual(@as(?u32, 1), done.job);
+    try t.expectEqual(@as(?u32, 0), done.first_job);
+    try t.expectEqualStrings("PINEAPPLE", done.text);
+    const Want = struct { kind: vocab.RecordKind, job: u32, text: []const u8 };
+    const want = [_]Want{
+        .{ .kind = .user, .job = 0, .text = "write an essay" },
+        .{ .kind = .assistant, .job = 0, .text = "The essay." },
+        .{ .kind = .user, .job = 1, .text = "then say PINEAPPLE" },
+        .{ .kind = .assistant, .job = 1, .text = "PINEAPPLE" },
+    };
+    try t.expectEqual(want.len, rig.src.records.items.len);
+    for (rig.src.records.items, want) |r, w| {
+        try t.expectEqual(w.kind, r.kind);
+        try t.expectEqual(w.job, r.job);
+        try t.expectEqualStrings(w.text, r.text);
+    }
+    // The step's token counts are the facts document's message.
+    try t.expect(std.mem.indexOf(u8, rig.src.last_answer.?, "\"modelID\":\"gpt-x\"") != null);
+}
+
+test "2.x events: tools, a permission and a form, an interrupt and a failed step" {
+    var rig: V2Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    try rig.prompt(1, "msg_u1", "delete notes", "queue");
+    try rig.send(2, "session.execution.started", "");
+    try rig.deliver(3, "msg_u1");
+    try rig.step(4, "msg_a1");
+    try rig.send(5, "session.tool.input.started", ",\"assistantMessageID\":\"msg_a1\",\"id\":\"call_1\",\"name\":\"shell\"");
+    try rig.send(6, "session.tool.called", ",\"assistantMessageID\":\"msg_a1\",\"id\":\"call_1\",\"input\":{\"command\":\"rm notes.md\"}");
+    try t.expectEqual(vocab.ToolStatus.running, rig.src.records.items[1].tool.?.status);
+    try rig.send(7, "permission.asked", ",\"id\":\"per_1\",\"action\":\"external_directory\",\"resources\":[\"/etc/*\"],\"save\":[\"/etc/*\"]");
+    try t.expectEqual(vocab.State.waiting_user, rig.src.state);
+    try t.expectEqualStrings("permission: external_directory: /etc/*", rig.last(.needs_input).?.text);
+    try rig.send(8, "permission.replied", ",\"requestID\":\"per_1\",\"reply\":\"once\"");
+    try t.expectEqual(vocab.State.working, rig.src.state);
+    try rig.send(9, "session.tool.success", ",\"assistantMessageID\":\"msg_a1\",\"id\":\"call_1\",\"content\":[{\"type\":\"text\",\"text\":\"removed\\n\"}]");
+    const tool = rig.src.records.items[1];
+    try t.expectEqualStrings("shell: rm notes.md", tool.text);
+    try t.expectEqual(vocab.ToolStatus.completed, tool.tool.?.status);
+    try t.expectEqualStrings("removed\n", tool.tool.?.output);
+    try t.expectEqualStrings("{\"command\":\"rm notes.md\"}", tool.tool.?.input);
+
+    // A form: fields with keys and option values.
+    try rig.send(10, "form.created", ",\"form\":{\"id\":\"frm_1\",\"sessionID\":\"ses_2\",\"title\":\"Questions\",\"fields\":[{\"key\":\"q0\",\"title\":\"Preference\",\"description\":\"A or B?\",\"type\":\"string\",\"options\":[{\"value\":\"A\",\"label\":\"Alpha\"},{\"value\":\"B\",\"label\":\"Beta\"}],\"custom\":true}]}");
+    const p = rig.src.pendingRequest().?;
+    try t.expectEqual(vocab.InteractionKind.question, p.interaction.kind);
+    try t.expectEqualStrings("A or B?", p.interaction.title);
+    try t.expectEqualStrings("Beta", p.interaction.options[1].label);
+    try t.expectEqualStrings("q0", p.questions[0].key);
+    try t.expectEqualStrings("B", p.questions[0].values[1]);
+    try rig.send(11, "form.replied", ",\"id\":\"frm_1\",\"answer\":{\"q0\":\"B\"}");
+    try t.expect(rig.src.interaction() == null);
+
+    // An interrupt ends the open step as an interrupted message.
+    try rig.send(12, "session.execution.interrupted", ",\"reason\":\"user\"");
+    try rig.src.tick(5000);
+    try t.expectEqual(vocab.State.idle, rig.src.state);
+    try t.expectEqual(@as(usize, 1), rig.count(.done));
+    const recs = rig.src.records.items;
+    try t.expectEqualStrings("interrupted", recs[recs.len - 1].text);
+
+    // A failed step reports its error once, not again for the execution.
+    try rig.prompt(6000, "msg_u2", "again", "queue");
+    try rig.send(6001, "session.execution.started", "");
+    try rig.deliver(6002, "msg_u2");
+    try rig.step(6003, "msg_a2");
+    const err_json = ",\"error\":{\"type\":\"provider.auth\",\"message\":\"This model is not available in your country\",\"status\":403}";
+    try rig.send(6004, "session.step.failed", ",\"assistantMessageID\":\"msg_a2\"" ++ err_json);
+    try rig.send(6005, "session.execution.failed", err_json);
+    try t.expectEqual(@as(usize, 1), rig.count(.@"error"));
+    const e = rig.last(.@"error").?;
+    try t.expectEqual(vocab.ErrorClass.auth, e.class.?);
+    try t.expectEqualStrings("provider.auth 403: This model is not available in your country", e.text);
+    try rig.src.tick(20_000);
+    try t.expectEqual(@as(usize, 2), rig.count(.done));
+}
+
+test "2.x events: a retry surfaces as retrying, a compaction is a notice only" {
+    var rig: V2Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    try rig.prompt(100_000, "msg_u1", "hi", "queue");
+    try rig.send(100_000, "session.execution.started", "");
+    try rig.deliver(100_000, "msg_u1");
+    try rig.step(100_001, "msg_a1");
+    try rig.send(100_002, "session.retry.scheduled", ",\"assistantMessageID\":\"msg_a1\",\"attempt\":1,\"at\":1,\"error\":{\"type\":\"provider.overloaded\",\"message\":\"Provider is overloaded\",\"status\":529}");
+    try rig.src.tick(111_000);
+    try t.expectEqual(vocab.State.retrying, rig.src.state);
+    try t.expectEqual(vocab.ErrorClass.retrying, rig.last(.@"error").?.class.?);
+    try rig.step(111_001, "msg_a1");
+    try t.expectEqual(vocab.State.working, rig.src.state);
+    try rig.send(111_002, "session.compaction.delta", ",\"text\":\"SUMMARY-TEXT\"");
+    try rig.send(111_003, "session.compaction.ended", ",\"reason\":\"auto\",\"text\":\"SUMMARY-TEXT\"");
+    for (rig.src.records.items) |r| try t.expect(std.mem.indexOf(u8, r.text, "SUMMARY-TEXT") == null);
+    try t.expectEqualStrings("conversation compacted", rig.src.records.items[rig.src.records.items.len - 1].text);
+}
+
+/// A fake opencode 2.x server: `/api/*` routes, `{data}` replies, the 2.x
+/// stream, and the 1.x routes answered with the web UI's HTML fallback.
+fn v2Server(srv: *testserver.Server) !void {
+    srv.v2();
+    try srv.start(t.allocator);
+    const html: testserver.Reply = .{ .body = "<!doctype html><html></html>" };
+    srv.route("GET /global/health", html);
+    srv.route("GET /event", html);
+    srv.route("GET /api/info", .{ .body = "{\"version\":\"2.0.18\",\"pid\":1,\"urls\":[],\"paths\":{\"tmp\":\"/tmp\"}}" });
+    srv.route("POST /api/session", .{ .body = "{\"data\":{\"id\":\"ses_2\",\"projectID\":\"p\",\"time\":{\"created\":1,\"updated\":1}}}" });
+    srv.route("GET /api/session/active", .{ .body = "{\"data\":{}}" });
+    srv.route("GET /api/permission/request", .{ .body = "{\"location\":{\"directory\":\"/w\"},\"data\":[]}" });
+    srv.route("GET /api/form", .{ .body = "{\"location\":{\"directory\":\"/w\"},\"data\":[]}" });
+    srv.route("GET /api/session/ses_2/message", .{ .body = "{\"data\":[],\"cursor\":{}}" });
+    srv.route("GET /api/model", .{ .body =
+        \\{"location":{"directory":"/w"},"data":[{"id":"gpt-x","modelID":"gpt-x","providerID":"openai","name":"GPT X","enabled":true,"variants":[{"id":"low"},{"id":"high"}],"limit":{"context":400000,"output":128000}},
+        \\ {"id":"off","modelID":"off","providerID":"other","name":"Off","enabled":false,"variants":[],"limit":{"context":1,"output":1}}]}
+    });
+}
+
+test "api 2.x: detected from the server, prompt with a chosen model, permission, done, commands, interrupt" {
+    var srv: testserver.Server = .{};
+    try v2Server(&srv);
+    defer srv.deinit();
+    const ev = struct {
+        fn f(comptime ty: []const u8, comptime data: []const u8) []const u8 {
+            return "{\"id\":\"e\",\"created\":1791127800000,\"type\":\"" ++ ty ++ "\",\"data\":{\"sessionID\":\"ses_2\"" ++ data ++ "}}";
+        }
+    }.f;
+    srv.route("POST /api/session/ses_2/model", .{ .status = 204 });
+    srv.route("POST /api/session/ses_2/prompt", .{ .body = "{\"data\":{\"id\":\"msg_u1\",\"sessionID\":\"ses_2\",\"type\":\"user\",\"delivery\":\"queue\"}}", .events = &.{
+        ev("session.inbox.enqueued", ",\"inboxID\":\"msg_u1\",\"item\":{\"type\":\"user\",\"payload\":{\"text\":\"hello\"},\"delivery\":\"queue\"}"),
+        ev("session.execution.started", ""),
+        ev("session.inbox.delivered", ",\"inboxID\":\"msg_u1\""),
+        ev("session.step.started", ",\"agent\":\"build\",\"model\":{\"id\":\"gpt-x\",\"providerID\":\"openai\",\"variant\":\"high\"},\"assistantMessageID\":\"msg_a1\""),
+        ev("session.tool.input.started", ",\"assistantMessageID\":\"msg_a1\",\"id\":\"call_1\",\"name\":\"shell\""),
+        ev("session.tool.called", ",\"assistantMessageID\":\"msg_a1\",\"id\":\"call_1\",\"input\":{\"command\":\"rm x\"}"),
+        ev("permission.asked", ",\"id\":\"per_1\",\"action\":\"bash\",\"resources\":[\"rm x\"],\"save\":[\"rm *\"]"),
+    } });
+    srv.route("POST /api/session/ses_2/permission/per_1/reply", .{ .status = 204, .events = &.{
+        ev("permission.replied", ",\"requestID\":\"per_1\",\"reply\":\"once\""),
+        ev("session.tool.success", ",\"assistantMessageID\":\"msg_a1\",\"id\":\"call_1\",\"content\":[{\"type\":\"text\",\"text\":\"\"}]"),
+        ev("session.step.ended", ",\"assistantMessageID\":\"msg_a1\",\"finish\":\"tool-calls\",\"tokens\":{\"input\":5,\"output\":1,\"reasoning\":0,\"cache\":{\"read\":0,\"write\":0}}"),
+        ev("session.step.started", ",\"agent\":\"build\",\"model\":{\"id\":\"gpt-x\",\"providerID\":\"openai\",\"variant\":\"high\"},\"assistantMessageID\":\"msg_a2\""),
+        ev("session.text.delta", ",\"assistantMessageID\":\"msg_a2\",\"ordinal\":0,\"delta\":\"po\""),
+        ev("session.text.ended", ",\"assistantMessageID\":\"msg_a2\",\"ordinal\":0,\"text\":\"pong\""),
+        ev("session.step.ended", ",\"assistantMessageID\":\"msg_a2\",\"finish\":\"stop\",\"tokens\":{\"input\":2000,\"output\":500,\"reasoning\":0,\"cache\":{\"read\":97500,\"write\":0}}"),
+        ev("session.execution.succeeded", ""),
+    } });
+    srv.route("POST /api/session/ses_2/interrupt", .{ .body = "{\"interrupted\":false}" });
+    srv.route("GET /api/command", .{ .body = "{\"location\":{},\"data\":[{\"name\":\"review\",\"description\":\"review changes\"}]}" });
+    srv.route("POST /api/session/ses_2/command", .{ .status = 404, .body = "{\"_tag\":\"CommandNotFoundError\",\"message\":\"Command not found: reveiw\"}" });
+
+    var set = adapter.Set.init(t.allocator);
+    defer set.deinit();
+    try set.loadShipped();
+    const loaded = set.get("opencode").?;
+    var api = try Api.init(t.allocator, loaded, .{}, .{ .port = srv.port(), .password = "secret" });
+    defer api.deinit();
+    // The newest generation's probe answers: 2.x, without asking the 1.x one.
+    try t.expect(try api.probeReady(clock.nowMs() + 2000));
+    try t.expectEqualStrings("2", api.apiVersion().?);
+    try t.expect(srv.lastRequest("GET /global/health") == null);
+    try api.connect(null, clock.nowMs());
+    try t.expectEqualStrings("ses_2", api.sessionId().?);
+    try t.expect(srv.lastRequest("GET /api/event HTTP/1.1") != null);
+    try t.expectEqual(vocab.State.idle, api.source.state);
+
+    // The catalog: enabled models only, variants as effort levels.
+    try api.setModel("gpt-x");
+    try api.setEffort("high");
+    try t.expectError(error.UnknownModel, api.setModel("other/off"));
+    try api.submit("hello", null);
+    try t.expect(std.mem.endsWith(u8, srv.lastRequest("POST /api/session/ses_2/model").?, "{\"model\":{\"providerID\":\"openai\",\"id\":\"gpt-x\",\"variant\":\"high\"}}"));
+    try t.expect(std.mem.endsWith(u8, srv.lastRequest("POST /api/session/ses_2/prompt").?, "{\"text\":\"hello\",\"delivery\":\"queue\"}"));
+    try pumpUntil(&api, struct {
+        fn f(a: *Api) bool {
+            return countKind(&a.source.queue, .needs_input) == 1;
+        }
+    }.f);
+    try t.expectEqualStrings("bash: rm x", api.source.interaction().?.title);
+    try api.answer("yes");
+    try t.expect(std.mem.endsWith(u8, srv.lastRequest("POST /api/session/ses_2/permission/per_1/reply").?, "{\"decision\":\"once\"}"));
+    try pumpUntil(&api, struct {
+        fn f(a: *Api) bool {
+            return countKind(&a.source.queue, .done) == 1;
+        }
+    }.f);
+    var done_text: []const u8 = "";
+    for (api.source.queue.events.items) |e| if (e.kind == .done) {
+        done_text = e.text;
+    };
+    try t.expectEqualStrings("pong", done_text);
+    // A second prompt sets no model again (nothing changed since).
+    const selects = countRequests(&srv, "POST /api/session/ses_2/model");
+    try api.submit("again", null);
+    try t.expectEqual(selects, countRequests(&srv, "POST /api/session/ses_2/model"));
+
+    // Facts: the answer's tokens and its model's catalog entry.
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const facts = @import("facts.zig");
+    const vocab_f = try facts.shipped();
+    const vals = try facts.read(a, vocab_f, loaded.spec.facts.?.map, (try api.factsDocument(a)).?);
+    try t.expectEqual(@as(f64, 100000), vals[vocab_f.index("context_used_tokens").?].?);
+    try t.expectEqual(@as(f64, 400000), vals[vocab_f.index("context_window_tokens").?].?);
+
+    const cmds = try api.listCommands(a);
+    try t.expectEqual(@as(usize, 1), cmds.len);
+    try t.expectEqualStrings("review", cmds[0].name);
+    try api.runCommand("reveiw", "x");
+    try t.expect(std.mem.endsWith(u8, srv.waitRequest("POST /api/session/ses_2/command", clock.nowMs() + 2000).?, "{\"name\":\"reveiw\",\"text\":\"x\"}"));
+    try pumpUntil(&api, struct {
+        fn f(x: *Api) bool {
+            return countKind(&x.source.queue, .@"error") == 1;
+        }
+    }.f);
+    try t.expect(std.mem.indexOf(u8, api.problem(), "Command not found") != null);
+
+    try api.interrupt();
+    try t.expect(srv.lastRequest("POST /api/session/ses_2/interrupt") != null);
+}
+
+test "api 2.x: resume reads history newest-first pages oldest first, an unknown session is false, forms answer with values" {
+    var srv: testserver.Server = .{};
+    try v2Server(&srv);
+    defer srv.deinit();
+    srv.route("GET /api/session/ses_nope", .{ .status = 404, .body = "{\"_tag\":\"SessionNotFoundError\",\"sessionID\":\"ses_nope\",\"message\":\"Session not found: ses_nope\"}" });
+    srv.route("GET /api/session/ses_old", .{ .body = "{\"data\":{\"id\":\"ses_old\"}}" });
+    srv.route(std.fmt.comptimePrint("GET /api/session/ses_old/message?limit={d}&order=desc", .{RESUME_MESSAGES}), .{ .body =
+        \\{"data":[{"id":"msg_i","time":{"created":30},"type":"idle","outcome":"succeeded"},
+        \\ {"id":"msg_a","time":{"created":20,"completed":25},"type":"assistant","agent":"build","model":{"id":"gpt-x","providerID":"openai"},
+        \\  "content":[{"type":"tool","id":"call_1","name":"shell","state":{"status":"completed","input":{"command":"ls"},"content":[{"type":"text","text":"a\n"}]},"time":{"created":21}},
+        \\             {"type":"text","text":"old answer"}],"finish":"stop"},
+        \\ {"id":"msg_u","time":{"created":10},"text":"old question","type":"user"}],"cursor":{}}
+    });
+    srv.route("GET /api/form", .{ .body =
+        \\{"location":{},"data":[{"id":"frm_1","sessionID":"ses_old","title":"Questions","fields":[
+        \\ {"key":"q0","title":"Pick","description":"Which?","type":"string","options":[{"value":"A","label":"Alpha"},{"value":"B","label":"Beta"}],"custom":true},
+        \\ {"key":"q1","title":"Checks","description":"Run which?","type":"multiselect","options":[{"value":"l","label":"lint"},{"value":"t","label":"test"}]},
+        \\ {"key":"q2","title":"Sure","description":"Sure?","type":"boolean"}]}]}
+    });
+    srv.route("POST /api/session/ses_old/form/frm_1/reply", .{ .status = 204 });
+
+    var set = adapter.Set.init(t.allocator);
+    defer set.deinit();
+    try set.loadShipped();
+    var api = try Api.init(t.allocator, set.get("opencode").?, .{}, .{ .port = srv.port(), .password = "pw" });
+    defer api.deinit();
+    // Asked before the first connect, the generation is probed on demand.
+    try t.expect(!try api.sessionExists("ses_nope"));
+    try t.expectEqualStrings("2", api.apiVersion().?);
+    try t.expect(try api.sessionExists("ses_old"));
+
+    try api.connect("ses_old", clock.nowMs());
+    const recs = api.source.records.items;
+    try t.expectEqual(@as(usize, 3), recs.len);
+    try t.expectEqualStrings("old question", recs[0].text);
+    try t.expectEqualStrings("shell: ls", recs[1].text);
+    try t.expectEqualStrings("a\n", recs[1].tool.?.output);
+    try t.expectEqualStrings("old answer", recs[2].text);
+    // History: nothing announced.
+    try api.source.tick(clock.nowMs() + 10_000);
+    try t.expectEqual(@as(usize, 1), countKind(&api.source.queue, .needs_input));
+    try t.expectEqual(@as(usize, 0), countKind(&api.source.queue, .done));
+
+    // The pending form: labels map to values, a multi-select is a list,
+    // a boolean is true or false.
+    const p = api.source.pendingRequest().?;
+    try t.expectEqual(@as(usize, 3), p.questions.len);
+    try t.expectEqualStrings("yes", p.questions[2].options[0]);
+    try api.answer("Beta\nlint, test\nyes");
+    const sent = srv.lastRequest("POST /api/session/ses_old/form/frm_1/reply").?;
+    try t.expect(std.mem.endsWith(u8, sent, "{\"answer\":{\"q0\":\"B\",\"q1\":[\"l\",\"t\"],\"q2\":true}}"));
+}
+
+test "api: a server that answers no declared generation is refused at once, naming what it answered" {
+    var srv: testserver.Server = .{};
+    try srv.start(t.allocator);
+    defer srv.deinit();
+    srv.route("GET /global/health", .{ .body = "<!doctype html>" });
+    srv.route("GET /api/info", .{ .body = "<!doctype html>" });
+    var set = adapter.Set.init(t.allocator);
+    defer set.deinit();
+    try set.loadShipped();
+    var api = try Api.init(t.allocator, set.get("opencode").?, .{}, .{ .port = srv.port(), .password = "pw" });
+    defer api.deinit();
+    try t.expectError(error.UnknownApi, api.probeReady(clock.nowMs() + 2000));
+    try t.expect(std.mem.indexOf(u8, api.problem(), "GET /api/info answered 200 but not with JSON; GET /global/health answered 200 but not with JSON") != null);
+    try t.expect(api.apiVersion() == null);
 }

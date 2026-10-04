@@ -14,6 +14,7 @@
 const std = @import("std");
 const vocab = @import("vocab.zig");
 const facts_mod = @import("facts.zig");
+const http = @import("http.zig");
 const pattern = @import("../util/pattern.zig");
 const readfile = @import("../util/readfile.zig");
 const xdg = @import("../util/xdg.zig");
@@ -77,12 +78,10 @@ pub const Launch = struct {
     /// password (required for them; a password never goes on argv). The
     /// attached client reads the same variable.
     password_env: ?[]const u8 = null,
-    /// API sources: arguments of a second, visible process the human
-    /// watches (opencode's TUI attached to the server); empty for none.
-    attach_args: []const []const u8 = &.{},
-    /// Whether an agent starts with that visible process when the caller
-    /// does not say (`agent_open tui`); `agent_set tui` starts or stops it
-    /// on a live agent. Only with `attach_args`.
+    /// Whether an API agent starts with the visible process its server
+    /// generation declares (`api.generations[].attach_args`) when the
+    /// caller does not say (`agent_open tui`); `agent_set tui` starts or
+    /// stops it on a live agent. Only for an adapter that declares one.
     attach_default: bool = true,
     /// Arguments that make the binary print its version, whose first line
     /// is reported with the resolved path; empty = not asked.
@@ -333,17 +332,107 @@ pub const Facts = struct {
     status_command: ?StatusCommand = null,
 };
 
+/// The request, reply and event shapes an API generation speaks. Routes
+/// and arguments are data (`Generation`); a shape is code
+/// (`opencode_dialect.zig`), so a generation that only moves routes is a
+/// data edit and one that reshapes its bodies adds a member here.
+pub const Dialect = enum {
+    /// opencode 1.x: bare JSON replies, `{type, properties}` events.
+    v1,
+    /// opencode 2.x: replies wrapped in `{data}`, `{type, data}` events of
+    /// an execution/step/inbox model.
+    v2,
+
+    /// Model, effort and agent are set on the session before a prompt
+    /// (`routes.model_select`/`agent_select`) instead of riding in it.
+    pub fn selectsOnSession(self: Dialect) bool {
+        return switch (self) {
+            .v1 => false,
+            .v2 => true,
+        };
+    }
+};
+
+/// The holes a route may have.
+pub const RouteHole = enum { session, request, limit };
+
+/// An API generation's routes, each `"METHOD /path"` with `{session}`,
+/// `{request}` and `{limit}` holes.
+pub const Routes = struct {
+    /// The SSE stream.
+    events: []const u8,
+    session_create: []const u8,
+    session_get: []const u8,
+    /// The newest `{limit}` messages.
+    messages: []const u8,
+    /// Which sessions are busy.
+    status: []const u8,
+    /// Pending permission requests.
+    permissions: []const u8,
+    /// Pending questions (2.x: forms).
+    questions: []const u8,
+    prompt: []const u8,
+    interrupt: []const u8,
+    permission_reply: []const u8,
+    question_reply: []const u8,
+    /// The model catalog.
+    models: []const u8,
+    commands: []const u8,
+    command_run: []const u8,
+    /// Required by a dialect that `selectsOnSession`.
+    model_select: ?[]const u8 = null,
+    agent_select: ?[]const u8 = null,
+};
+
+/// One generation of an API source's server.
+pub const Generation = struct {
+    /// What the agent results report as `api_version`.
+    name: []const u8,
+    dialect: Dialect,
+    /// A `GET` path only this generation answers 200 with a JSON object.
+    probe: []const u8,
+    /// Arguments after the binary of the visible client a human watches
+    /// (opencode's TUI against the server); empty = none.
+    attach_args: []const []const u8 = &.{},
+    routes: Routes,
+};
+
+/// An API source's server: its generations, probed in this order after
+/// the server answers (`opencode.Api.probeReady`); list the newest first.
+pub const ApiSpec = struct {
+    generations: []const Generation,
+};
+
 pub const Spec = struct {
     id: []const u8,
     name: []const u8,
     source: vocab.SourceKind,
     launch: Launch,
     screen: ?ScreenSpec = null,
+    /// Present exactly for an `opencode_api` source.
+    api: ?ApiSpec = null,
     actions: Actions = .{},
     errors: []const ErrorRule = &.{},
     retry: Retry = .{},
     facts: ?Facts = null,
+
+    /// Some generation of its server has a visible client (`attach_args`).
+    pub fn hasTui(self: *const Spec) bool {
+        const api = self.api orelse return false;
+        for (api.generations) |g| if (g.attach_args.len > 0) return true;
+        return false;
+    }
 };
+
+/// A route's method and path template (`"POST /x/{session}"`), or null
+/// when it is not one.
+pub fn splitRoute(route: []const u8) ?struct { method: http.Method, path: []const u8 } {
+    const sp = std.mem.indexOfScalar(u8, route, ' ') orelse return null;
+    const method = std.meta.stringToEnum(http.Method, route[0..sp]) orelse return null;
+    const path = route[sp + 1 ..];
+    if (path.len == 0 or path[0] != '/') return null;
+    return .{ .method = method, .path = path };
+}
 
 /// The `{name}`s a recipe or launch argument may use. `port` and `cwd` are
 /// an API source's server port and working directory; `session` is the
@@ -497,9 +586,9 @@ const Validator = struct {
         for (s.launch.args) |x| try self.placeholders(x, "launch.args");
         for (s.launch.model_args) |x| try self.placeholders(x, "launch.model_args");
         for (s.launch.effort_args) |x| try self.placeholders(x, "launch.effort_args");
-        for (s.launch.attach_args) |x| try self.placeholders(x, "launch.attach_args");
-        if (!s.launch.attach_default and s.launch.attach_args.len == 0)
-            return self.fail("launch.attach_default is about the process launch.attach_args starts, and there is none", .{});
+        if (s.api) |api| try self.apiSpec(api);
+        if (!s.launch.attach_default and !s.hasTui())
+            return self.fail("launch.attach_default is about the process api.generations[].attach_args starts, and there is none", .{});
         for (s.launch.session_args) |x| try self.placeholders(x, "launch.session_args");
         for (s.launch.resume_args) |x| try self.placeholders(x, "launch.resume_args");
         if ((s.launch.session_args.len == 0) != (s.launch.resume_args.len == 0))
@@ -549,7 +638,39 @@ const Validator = struct {
             .opencode_api => {
                 if (s.screen != null) return self.fail("source \"opencode_api\" takes no \"screen\" section", .{});
                 if (s.launch.password_env == null) return self.fail("source \"opencode_api\" needs launch.password_env", .{});
+                if (s.api == null) return self.fail("source \"opencode_api\" needs an \"api\" section (its server generations)", .{});
             },
+        }
+        if (s.source != .opencode_api and s.api != null) return self.fail("an \"api\" section is for source \"opencode_api\"", .{});
+    }
+
+    fn apiSpec(self: *Validator, api: ApiSpec) !void {
+        if (api.generations.len == 0) return self.fail("api.generations is empty", .{});
+        for (api.generations, 0..) |g, i| {
+            if (g.name.len == 0) return self.fail("api.generations[{d}].name is empty", .{i});
+            for (api.generations[0..i]) |o| if (std.mem.eql(u8, o.name, g.name))
+                return self.fail("api.generations: \"{s}\" is named twice", .{g.name});
+            if (g.probe.len == 0 or g.probe[0] != '/') return self.fail("api.generations[{d}].probe \"{s}\" is not a path", .{ i, g.probe });
+            for (g.attach_args) |x| try self.placeholders(x, "api.generations[].attach_args");
+            inline for (@typeInfo(Routes).@"struct".fields) |f| {
+                const v: ?[]const u8 = @field(g.routes, f.name);
+                if (v) |r| try self.route(r, g.name, f.name);
+            }
+            if (g.dialect.selectsOnSession() and (g.routes.model_select == null or g.routes.agent_select == null))
+                return self.fail("api.generations \"{s}\": dialect {s} sets the model and agent on the session, so routes.model_select and routes.agent_select are required", .{ g.name, @tagName(g.dialect) });
+        }
+    }
+
+    fn route(self: *Validator, r: []const u8, gen: []const u8, name: []const u8) !void {
+        const sr = splitRoute(r) orelse
+            return self.fail("api.generations \"{s}\": routes.{s} \"{s}\" is not \"METHOD /path\" (GET, POST, PATCH or DELETE)", .{ gen, name, r });
+        var i: usize = 0;
+        while (std.mem.indexOfScalarPos(u8, sr.path, i, '{')) |open| {
+            const close = std.mem.indexOfScalarPos(u8, sr.path, open, '}') orelse
+                return self.fail("api.generations \"{s}\": routes.{s}: unclosed \"{{\"", .{ gen, name });
+            if (std.meta.stringToEnum(RouteHole, sr.path[open + 1 .. close]) == null)
+                return self.fail("api.generations \"{s}\": routes.{s}: unknown hole {{{s}}} (session, request, limit)", .{ gen, name, sr.path[open + 1 .. close] });
+            i = close + 1;
         }
     }
 
@@ -917,34 +1038,58 @@ test "semantic errors name the rule" {
     try expectProblem(noscreen, "unknown key \"screenx\"");
 }
 
-test "an API source needs a password variable and checks its attach arguments" {
+test "an API source needs a password variable, its server generations and checks their routes and attach arguments" {
     const api =
         \\{ "id": "api", "name": "API", "source": "opencode_api",
         \\  "launch": { "binary": "x", "candidates": ["$PATH"], "args": ["serve", "--port", "{port}"],
-        \\              "password_env": "X_PASSWORD", "attach_args": ["attach", "{session}"] } }
+        \\              "password_env": "X_PASSWORD" },
+        \\  "api": { "generations": [ { "name": "1", "dialect": "v1", "probe": "/health", "attach_args": ["attach", "{session}"],
+        \\    "routes": { "events": "GET /event", "session_create": "POST /session", "session_get": "GET /session/{session}",
+        \\      "messages": "GET /session/{session}/message?limit={limit}", "status": "GET /session/status", "permissions": "GET /permission",
+        \\      "questions": "GET /question", "prompt": "POST /session/{session}/prompt", "interrupt": "POST /session/{session}/abort",
+        \\      "permission_reply": "POST /permission/{request}/reply", "question_reply": "POST /question/{request}/reply",
+        \\      "models": "GET /provider", "commands": "GET /command", "command_run": "POST /session/{session}/command" } } ] } }
     ;
     var problem: ?[]u8 = null;
     const l = try load(t.allocator, "api.json", api, .user, &problem);
+    try t.expect(l.spec.hasTui());
     l.destroy(t.allocator);
 
-    const no_pw = std.mem.replaceOwned(u8, t.allocator, api, "\"password_env\": \"X_PASSWORD\", ", "") catch unreachable;
+    const no_pw = std.mem.replaceOwned(u8, t.allocator, api, "\"password_env\": \"X_PASSWORD\" ", "\"version_args\": [] ") catch unreachable;
     defer t.allocator.free(no_pw);
     try expectProblem(no_pw, "needs launch.password_env");
     const bad_env = std.mem.replaceOwned(u8, t.allocator, api, "X_PASSWORD", "X-PASSWORD") catch unreachable;
     defer t.allocator.free(bad_env);
     try expectProblem(bad_env, "is not an environment variable name");
-    const bad_ph = std.mem.replaceOwned(u8, t.allocator, api, "{session}", "{sesion}") catch unreachable;
+    const bad_ph = std.mem.replaceOwned(u8, t.allocator, api, "\"attach\", \"{session}\"", "\"attach\", \"{sesion}\"") catch unreachable;
     defer t.allocator.free(bad_ph);
-    try expectProblem(bad_ph, "launch.attach_args: unknown placeholder {sesion}");
+    try expectProblem(bad_ph, "api.generations[].attach_args: unknown placeholder {sesion}");
+    // Routes: a method, a path, and only the holes a route has.
+    const bad_hole = std.mem.replaceOwned(u8, t.allocator, api, "/permission/{request}/reply", "/permission/{req}/reply") catch unreachable;
+    defer t.allocator.free(bad_hole);
+    try expectProblem(bad_hole, "routes.permission_reply: unknown hole {req}");
+    const bad_method = std.mem.replaceOwned(u8, t.allocator, api, "\"GET /command\"", "\"FETCH /command\"") catch unreachable;
+    defer t.allocator.free(bad_method);
+    try expectProblem(bad_method, "routes.commands \"FETCH /command\" is not \"METHOD /path\"");
+    const missing = std.mem.replaceOwned(u8, t.allocator, api, ", \"commands\": \"GET /command\"", "") catch unreachable;
+    defer t.allocator.free(missing);
+    try expectProblem(missing, "MissingField");
+    // A dialect that sets the model on the session needs those routes.
+    const v2 = std.mem.replaceOwned(u8, t.allocator, api, "\"dialect\": \"v1\"", "\"dialect\": \"v2\"") catch unreachable;
+    defer t.allocator.free(v2);
+    try expectProblem(v2, "routes.model_select and routes.agent_select are required");
+    const no_api = std.mem.replaceOwned(u8, t.allocator, api, api[std.mem.indexOf(u8, api, ",\n  \"api\"").? .. api.len - 2], "") catch unreachable;
+    defer t.allocator.free(no_api);
+    try expectProblem(no_api, "needs an \"api\" section");
     // The attached process can be off by default; there must be one to be.
-    const off = std.mem.replaceOwned(u8, t.allocator, api, "\"attach_args\"", "\"attach_default\": false, \"attach_args\"") catch unreachable;
+    const off = std.mem.replaceOwned(u8, t.allocator, api, "\"password_env\"", "\"attach_default\": false, \"password_env\"") catch unreachable;
     defer t.allocator.free(off);
     const l_off = try load(t.allocator, "api.json", off, .user, &problem);
     try t.expect(!l_off.spec.launch.attach_default);
     l_off.destroy(t.allocator);
-    const no_attach = std.mem.replaceOwned(u8, t.allocator, api, ", \"attach_args\": [\"attach\", \"{session}\"]", ", \"attach_default\": false") catch unreachable;
+    const no_attach = std.mem.replaceOwned(u8, t.allocator, off, "\"attach_args\": [\"attach\", \"{session}\"],", "") catch unreachable;
     defer t.allocator.free(no_attach);
-    try expectProblem(no_attach, "launch.attach_default is about the process launch.attach_args starts");
+    try expectProblem(no_attach, "launch.attach_default is about the process api.generations[].attach_args starts");
     // unset_env entries are names with an optional trailing * (they end up
     // in a shell case pattern), never anything else.
     const unset_ok = std.mem.replaceOwned(u8, t.allocator, api, "\"password_env\"", "\"unset_env\": [\"CLAUDE*\", \"X_TOKEN\"], \"password_env\"") catch unreachable;

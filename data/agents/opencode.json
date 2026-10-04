@@ -7,7 +7,6 @@
     "candidates": ["$PATH", "~/.opencode/bin/opencode", "~/.local/bin/opencode"],
     "args": ["serve", "--port", "{port}"],
     "password_env": "OPENCODE_SERVER_PASSWORD",
-    "attach_args": ["attach", "http://127.0.0.1:{port}", "--dir", "{cwd}", "-s", "{session}"],
     "attach_default": false,
     "version_args": ["--version"],
     "permissions": {
@@ -17,11 +16,61 @@
       "env": "OPENCODE_CONFIG_CONTENT"
     }
   },
+  "api": {
+    "generations": [
+      {
+        "name": "2",
+        "dialect": "v2",
+        "probe": "/api/info",
+        "attach_args": ["--server", "http://127.0.0.1:{port}", "-s", "{session}"],
+        "routes": {
+          "events": "GET /api/event",
+          "session_create": "POST /api/session",
+          "session_get": "GET /api/session/{session}",
+          "messages": "GET /api/session/{session}/message?limit={limit}&order=desc",
+          "status": "GET /api/session/active",
+          "permissions": "GET /api/permission/request",
+          "questions": "GET /api/form",
+          "prompt": "POST /api/session/{session}/prompt",
+          "interrupt": "POST /api/session/{session}/interrupt",
+          "permission_reply": "POST /api/session/{session}/permission/{request}/reply",
+          "question_reply": "POST /api/session/{session}/form/{request}/reply",
+          "models": "GET /api/model",
+          "commands": "GET /api/command",
+          "command_run": "POST /api/session/{session}/command",
+          "model_select": "POST /api/session/{session}/model",
+          "agent_select": "POST /api/session/{session}/agent"
+        }
+      },
+      {
+        "name": "1",
+        "dialect": "v1",
+        "probe": "/global/health",
+        "attach_args": ["attach", "http://127.0.0.1:{port}", "--dir", "{cwd}", "-s", "{session}"],
+        "routes": {
+          "events": "GET /event",
+          "session_create": "POST /session",
+          "session_get": "GET /session/{session}",
+          "messages": "GET /session/{session}/message?limit={limit}",
+          "status": "GET /session/status",
+          "permissions": "GET /permission",
+          "questions": "GET /question",
+          "prompt": "POST /session/{session}/prompt_async",
+          "interrupt": "POST /session/{session}/abort",
+          "permission_reply": "POST /permission/{request}/reply",
+          "question_reply": "POST /question/{request}/reply",
+          "models": "GET /provider",
+          "commands": "GET /command",
+          "command_run": "POST /session/{session}/command"
+        }
+      }
+    ]
+  },
   "errors": [
-    { "class": "auth", "pattern": "^ProviderAuthError|^APIError 401|^APIError 403" },
-    { "class": "limit", "pattern": "^APIError 429|[Rr]ate limit|[Uu]sage limit|[Qq]uota|Too Many Requests", "reset_marker": "resets " },
-    { "class": "overloaded", "pattern": "^APIError 5[0-9][0-9]|[Oo]verloaded|Service Unavailable|Connection reset by server|ECONNRESET" },
-    { "class": "api", "pattern": "^APIError|^ContextOverflowError|^MessageOutputLengthError|^ContentFilterError|^StructuredOutputError" }
+    { "class": "auth", "pattern": "^ProviderAuthError|^APIError 401|^APIError 403|^provider\\.auth" },
+    { "class": "limit", "pattern": "^APIError 429|^[a-z._]+ 429|[Rr]ate limit|[Uu]sage limit|[Qq]uota|Too Many Requests", "reset_marker": "resets " },
+    { "class": "overloaded", "pattern": "^APIError 5[0-9][0-9]|^[a-z._]+ 5[0-9][0-9]|[Oo]verloaded|Service Unavailable|Connection reset by server|ECONNRESET" },
+    { "class": "api", "pattern": "^APIError|^provider\\.|^ContextOverflowError|^MessageOutputLengthError|^ContentFilterError|^StructuredOutputError" }
   ],
   "retry": { "prompt": "continue" },
   "facts": {

@@ -129,7 +129,8 @@ pub const Extra = struct {
 
 /// Why `x` cannot be passed to a launch of `launch`'s binary, or null when
 /// it can: the one rule for caller `args`/`env`, refused, never sanitized.
-pub fn checkExtra(arena: std.mem.Allocator, launch: adapter.Launch, x: Extra) !?[]const u8 {
+pub fn checkExtra(arena: std.mem.Allocator, spec: *const adapter.Spec, x: Extra) !?[]const u8 {
+    const launch = spec.launch;
     inline for (.{ "args", "server_args", "tui_args" }) |f| {
         const list = @field(x, f);
         if (list.len > MAX_EXTRA) return try std.fmt.allocPrint(arena, f ++ ": at most {d} entries (got {d})", .{ MAX_EXTRA, list.len });
@@ -139,7 +140,7 @@ pub fn checkExtra(arena: std.mem.Allocator, launch: adapter.Launch, x: Extra) !?
         }
     }
     // Only an app started as two processes has a second one to target.
-    if (launch.attach_args.len == 0 and (x.server_args.len > 0 or x.tui_args.len > 0))
+    if (!spec.hasTui() and (x.server_args.len > 0 or x.tui_args.len > 0))
         return try std.fmt.allocPrint(arena, "{s} runs as one process: server_args and tui_args are for an app with an attached client (opencode); pass args", .{launch.binary});
     if (x.env.len > MAX_EXTRA) return try std.fmt.allocPrint(arena, "env: at most {d} entries (got {d})", .{ MAX_EXTRA, x.env.len });
     for (x.env, 0..) |v, i| {
@@ -766,18 +767,19 @@ pub fn remoteScript(arena: std.mem.Allocator, argv: []const []const u8, opts: st
     return s.items;
 }
 
-/// `binary` + the caller's `extra_args` + the adapter's `attach_args`,
-/// placeholders filled.
-pub fn attachArgv(arena: std.mem.Allocator, launch: adapter.Launch, binary: []const u8, extra_args: []const []const u8, values: Values) ![]const []const u8 {
+/// `binary` + the caller's `extra_args` + `attach_args` (the running
+/// server generation's), placeholders filled.
+pub fn attachArgv(arena: std.mem.Allocator, binary: []const u8, extra_args: []const []const u8, attach_args: []const []const u8, values: Values) ![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     try out.append(arena, binary);
     try out.appendSlice(arena, extra_args);
-    try appendExpanded(arena, &out, launch.attach_args, values);
+    try appendExpanded(arena, &out, attach_args, values);
     return out.items;
 }
 
-/// Which of the adapter's argv a start runs.
-pub const Run = union(enum) { main: Start, attach };
+/// Which of the adapter's argv a start runs: the main process, or the
+/// attached client with the server generation's `attach_args`.
+pub const Run = union(enum) { main: Start, attach: []const []const u8 };
 
 /// The argv that starts the binary for `run` with the caller's `x`:
 /// `mainArgv`/`attachArgv` inside the `unset_env` wrapper that spares the
@@ -785,7 +787,7 @@ pub const Run = union(enum) { main: Start, attach };
 pub fn startArgv(arena: std.mem.Allocator, launch: adapter.Launch, binary: []const u8, x: Extra, values: Values, run: Run) ![]const []const u8 {
     const argv = switch (run) {
         .main => |start| try mainArgv(arena, launch, binary, try std.mem.concat(arena, []const u8, &.{ x.args, x.server_args }), values, start),
-        .attach => try attachArgv(arena, launch, binary, try std.mem.concat(arena, []const u8, &.{ x.args, x.tui_args }), values),
+        .attach => |attach_args| try attachArgv(arena, binary, try std.mem.concat(arena, []const u8, &.{ x.args, x.tui_args }), attach_args, values),
     };
     return withUnsetEnv(arena, launch.unset_env, try x.names(arena), argv);
 }
@@ -921,8 +923,24 @@ const test_launch = adapter.Launch{
     .candidates = &.{ "$PATH", "~/.opencode/bin/opencode", "~/.local/bin/opencode" },
     .args = &.{ "serve", "--port", "{port}" },
     .model_args = &.{ "--model", "{model}" },
-    .attach_args = &.{ "attach", "http://127.0.0.1:{port}", "-s", "{session}" },
 };
+const test_attach: []const []const u8 = &.{ "attach", "http://127.0.0.1:{port}", "-s", "{session}" };
+
+fn specOf(l: adapter.Launch) adapter.Spec {
+    return .{ .id = "x", .name = "X", .source = .screen, .launch = l };
+}
+
+/// An API spec whose server has an attached client.
+fn tuiSpecOf(l: adapter.Launch) adapter.Spec {
+    const r = "GET /x";
+    return .{ .id = "x", .name = "X", .source = .opencode_api, .launch = l, .api = .{ .generations = &.{.{
+        .name = "1",
+        .dialect = .v1,
+        .probe = "/x",
+        .attach_args = test_attach,
+        .routes = .{ .events = r, .session_create = r, .session_get = r, .messages = r, .status = r, .permissions = r, .questions = r, .prompt = r, .interrupt = r, .permission_reply = r, .question_reply = r, .models = r, .commands = r, .command_run = r },
+    }} } };
+}
 
 test "binary overrides: bare names and absolute paths of safe bytes" {
     try t.expect(validBinary("opencode-oc11"));
@@ -966,7 +984,7 @@ test "argv: args, then model and effort arguments only when given" {
     const with_model = try mainArgv(a, test_launch, "/bin/oc", &.{}, .{ .port = "4100", .model = "p/m" }, .fresh);
     try t.expectEqual(@as(usize, 6), with_model.len);
     try t.expectEqualStrings("p/m", with_model[5]);
-    const attach = try attachArgv(a, test_launch, "/bin/oc", &.{}, .{ .port = "4100", .session = "ses_1" });
+    const attach = try attachArgv(a, "/bin/oc", &.{}, test_attach, .{ .port = "4100", .session = "ses_1" });
     try t.expectEqualStrings("http://127.0.0.1:4100", attach[2]);
     try t.expectEqualStrings("ses_1", attach[4]);
     try t.expect(launchTakes(test_launch, .model));
@@ -1201,11 +1219,11 @@ test "path_prepend is refused, never cleaned: relative, PATH separator, control 
     defer arena_state.deinit();
     const a = arena_state.allocator();
     const l = adapter.Launch{ .binary = "x", .candidates = &.{} };
-    try t.expect((try checkExtra(a, l, .{ .path_prepend = &.{ "/opt/my tools/bin", "/a" } })) == null);
-    try t.expect(std.mem.indexOf(u8, (try checkExtra(a, l, .{ .path_prepend = &.{"rel/bin"} })).?, "absolute") != null);
-    try t.expect(std.mem.indexOf(u8, (try checkExtra(a, l, .{ .path_prepend = &.{"/a:/b"} })).?, "PATH separator") != null);
-    try t.expect(std.mem.indexOf(u8, (try checkExtra(a, l, .{ .path_prepend = &.{"/a\nb"} })).?, "control character") != null);
-    try t.expect(std.mem.indexOf(u8, (try checkExtra(a, l, .{ .path_prepend = &.{""} })).?, "1-4096 bytes") != null);
+    try t.expect((try checkExtra(a, &specOf(l), .{ .path_prepend = &.{ "/opt/my tools/bin", "/a" } })) == null);
+    try t.expect(std.mem.indexOf(u8, (try checkExtra(a, &specOf(l), .{ .path_prepend = &.{"rel/bin"} })).?, "absolute") != null);
+    try t.expect(std.mem.indexOf(u8, (try checkExtra(a, &specOf(l), .{ .path_prepend = &.{"/a:/b"} })).?, "PATH separator") != null);
+    try t.expect(std.mem.indexOf(u8, (try checkExtra(a, &specOf(l), .{ .path_prepend = &.{"/a\nb"} })).?, "control character") != null);
+    try t.expect(std.mem.indexOf(u8, (try checkExtra(a, &specOf(l), .{ .path_prepend = &.{""} })).?, "1-4096 bytes") != null);
     const copy = try (Extra{ .path_prepend = &.{"/a"}, .login_shell = false }).clone(t.allocator);
     defer copy.free(t.allocator);
     try t.expectEqualStrings("/a", copy.path_prepend[0]);
@@ -1273,17 +1291,17 @@ test "caller args and env: every refusal, never a sanitized value" {
         .args = &.{ "--profile", "a b 'c' \"d\" $e ;f `g` *h \\i caf\xc3\xa9" },
         .env = &.{ .{ .name = "CLAUDE_CAPTURE_PROFILE", .value = "work" }, .{ .name = "_x9", .value = "" } },
     };
-    try t.expect((try checkExtra(a, oc, ok)) == null);
-    try t.expect((try checkExtra(a, oc, .{})) == null);
+    try t.expect((try checkExtra(a, &specOf(oc), ok)) == null);
+    try t.expect((try checkExtra(a, &specOf(oc), .{})) == null);
 
     const many = try a.alloc([]const u8, MAX_EXTRA + 1);
     @memset(many, "x");
-    try t.expect((try checkExtra(a, oc, .{ .args = many[0..MAX_EXTRA] })) == null);
+    try t.expect((try checkExtra(a, &specOf(oc), .{ .args = many[0..MAX_EXTRA] })) == null);
     const long = try a.alloc(u8, MAX_EXTRA_BYTES + 1);
     @memset(long, 'y');
     const max_env = try a.alloc(EnvVar, MAX_EXTRA + 1);
     for (max_env, 0..) |*v, i| v.* = .{ .name = try std.fmt.allocPrint(a, "V{d}", .{i}), .value = long[0..MAX_EXTRA_BYTES] };
-    try t.expect((try checkExtra(a, oc, .{ .args = &.{long[0..MAX_EXTRA_BYTES]}, .env = max_env[0..MAX_EXTRA] })) == null);
+    try t.expect((try checkExtra(a, &specOf(oc), .{ .args = &.{long[0..MAX_EXTRA_BYTES]}, .env = max_env[0..MAX_EXTRA] })) == null);
 
     const Case = struct { x: Extra, says: []const u8 };
     const cases = [_]Case{
@@ -1308,7 +1326,7 @@ test "caller args and env: every refusal, never a sanitized value" {
         .{ .x = .{ .env = &.{.{ .name = "X", .value = "\xc3" }} }, .says = "env X: the value is not valid UTF-8" },
     };
     for (cases) |cs| {
-        const msg = (try checkExtra(a, oc, cs.x)) orelse {
+        const msg = (try checkExtra(a, &specOf(oc), cs.x)) orelse {
             std.debug.print("accepted, expected a refusal saying: {s}\n", .{cs.says});
             return error.TestUnexpectedResult;
         };
@@ -1339,7 +1357,7 @@ test "caller args come right after the binary, before the adapter's own" {
     const want_main = [_][]const u8{ "/w", "--profile", "work", "serve", "--port", "4100", "--model", "p/m" };
     try t.expectEqual(want_main.len, main.len);
     for (want_main, main) |w, g| try t.expectEqualStrings(w, g);
-    const attach = try attachArgv(a, test_launch, "/w", extra, .{ .port = "4100", .session = "s" });
+    const attach = try attachArgv(a, "/w", extra, test_attach, .{ .port = "4100", .session = "s" });
     try t.expectEqualStrings("--profile", attach[1]);
     try t.expectEqualStrings("attach", attach[3]);
     // Placeholders are the adapter's: a caller's `{port}` stays literal.
@@ -1352,22 +1370,22 @@ test "server_args and tui_args reach one process each; args reach both; a one-pr
     defer arena_state.deinit();
     const a = arena_state.allocator();
     const x = Extra{ .args = &.{"--wrap"}, .server_args = &.{ "--cors", "x" }, .tui_args = &.{"--tui-only"} };
-    try t.expect((try checkExtra(a, test_launch, x)) == null);
+    try t.expect((try checkExtra(a, &tuiSpecOf(test_launch), x)) == null);
     const server = try startArgv(a, test_launch, "/w", x, .{ .port = "4100" }, .{ .main = .fresh });
     const want_server = [_][]const u8{ "/w", "--wrap", "--cors", "x", "serve", "--port", "4100" };
     try t.expectEqual(want_server.len, server.len);
     for (want_server, server) |w, g| try t.expectEqualStrings(w, g);
-    const tui = try startArgv(a, test_launch, "/w", x, .{ .port = "4100", .session = "s" }, .attach);
+    const tui = try startArgv(a, test_launch, "/w", x, .{ .port = "4100", .session = "s" }, .{ .attach = test_attach });
     try t.expectEqualStrings("--wrap", tui[1]);
     try t.expectEqualStrings("--tui-only", tui[2]);
     try t.expectEqualStrings("attach", tui[3]);
     // The same validation as args, and a clone carries them.
-    try t.expect((try checkExtra(a, test_launch, .{ .tui_args = &.{"a\nb"} })) != null);
+    try t.expect((try checkExtra(a, &tuiSpecOf(test_launch), .{ .tui_args = &.{"a\nb"} })) != null);
     const copy = try x.clone(t.allocator);
     defer copy.free(t.allocator);
     try t.expectEqualStrings("--tui-only", copy.tui_args[0]);
     const claude = adapter.Launch{ .binary = "claude", .candidates = &.{"$PATH"} };
-    const refused = (try checkExtra(a, claude, .{ .server_args = &.{"--x"} })).?;
+    const refused = (try checkExtra(a, &specOf(claude), .{ .server_args = &.{"--x"} })).?;
     try t.expect(std.mem.indexOf(u8, refused, "one process") != null);
 }
 
@@ -1439,7 +1457,7 @@ fn expectedEcho(a: std.mem.Allocator) ![]const u8 {
 /// The weird args and env through the unset wrapper, in a fresh dir.
 fn weirdArgv(a: std.mem.Allocator, root: []const u8) ![]const []const u8 {
     const x = Extra{ .args = &WEIRD_ARGS, .env = &WEIRD_ENV };
-    try t.expect((try checkExtra(a, .{ .binary = "x", .candidates = &.{} }, x)) == null);
+    try t.expect((try checkExtra(a, &specOf(.{ .binary = "x", .candidates = &.{} }), x)) == null);
     const l = adapter.Launch{ .binary = "x", .candidates = &.{}, .args = &.{"--adapter-arg"}, .unset_env = &.{"CLAUDE*"} };
     return startArgv(a, l, try echoScript(a, root), x, .{}, .{ .main = .fresh });
 }
@@ -1496,7 +1514,6 @@ const claude_like = adapter.Launch{
 const opencode_like = adapter.Launch{
     .binary = "opencode",
     .candidates = &.{"$PATH"},
-    .attach_args = &.{"attach"},
     .permissions = .{
         .names = &.{ "*", "bash", "edit", "external_directory" },
         .shape = .by_name,
@@ -1505,9 +1522,6 @@ const opencode_like = adapter.Launch{
     },
 };
 
-fn specOf(l: adapter.Launch) adapter.Spec {
-    return .{ .id = "x", .name = "X", .source = .screen, .launch = l };
-}
 const claude_spec = specOf(claude_like);
 const opencode_spec = specOf(opencode_like);
 
@@ -1516,21 +1530,21 @@ test "permissions: unknown names, a clobbered mechanism and an app without one a
     defer arena_state.deinit();
     const a = arena_state.allocator();
     const ok = [_]Permission{ .{ .name = "Bash(git *)", .action = .allow }, .{ .name = "mcp__sketerm__term_run", .action = .deny }, .{ .name = "Edit", .action = .ask } };
-    try t.expect((try checkExtra(a, claude_like, .{ .permissions = &ok })) == null);
-    const unknown = (try checkExtra(a, claude_like, .{ .permissions = &.{.{ .name = "bash", .action = .allow }} })).?;
+    try t.expect((try checkExtra(a, &specOf(claude_like), .{ .permissions = &ok })) == null);
+    const unknown = (try checkExtra(a, &specOf(claude_like), .{ .permissions = &.{.{ .name = "bash", .action = .allow }} })).?;
     // The refusal names what the app takes.
     try t.expect(std.mem.indexOf(u8, unknown, "Bash, Edit, Read") != null);
     try t.expect(std.mem.indexOf(u8, unknown, "^mcp__") != null);
-    try t.expect((try checkExtra(a, claude_like, .{ .permissions = &.{ .{ .name = "Bash", .action = .allow }, .{ .name = "Bash", .action = .deny } } })) != null);
+    try t.expect((try checkExtra(a, &specOf(claude_like), .{ .permissions = &.{ .{ .name = "Bash", .action = .allow }, .{ .name = "Bash", .action = .deny } } })) != null);
     // The caller's own --settings is never overwritten.
-    try t.expect((try checkExtra(a, claude_like, .{ .args = &.{ "--settings", "{}" }, .permissions = &ok })) != null);
-    try t.expect((try checkExtra(a, claude_like, .{ .args = &.{"--settings={}"}, .permissions = &ok })) != null);
-    try t.expect((try checkExtra(a, claude_like, .{ .args = &.{ "--settings", "{}" } })) == null);
+    try t.expect((try checkExtra(a, &specOf(claude_like), .{ .args = &.{ "--settings", "{}" }, .permissions = &ok })) != null);
+    try t.expect((try checkExtra(a, &specOf(claude_like), .{ .args = &.{"--settings={}"}, .permissions = &ok })) != null);
+    try t.expect((try checkExtra(a, &specOf(claude_like), .{ .args = &.{ "--settings", "{}" } })) == null);
     // An env document that cannot take the policy.
     const bad_doc = [_]EnvVar{.{ .name = "OPENCODE_CONFIG_CONTENT", .value = "{\"permission\":\"allow\"}" }};
-    try t.expect((try checkExtra(a, opencode_like, .{ .env = &bad_doc, .permissions = &.{.{ .name = "bash", .action = .allow }} })) != null);
+    try t.expect((try checkExtra(a, &specOf(opencode_like), .{ .env = &bad_doc, .permissions = &.{.{ .name = "bash", .action = .allow }} })) != null);
     const adapterless = adapter.Launch{ .binary = "x", .candidates = &.{"$PATH"} };
-    try t.expect((try checkExtra(a, adapterless, .{ .permissions = &.{.{ .name = "bash", .action = .allow }} })) != null);
+    try t.expect((try checkExtra(a, &specOf(adapterless), .{ .permissions = &.{.{ .name = "bash", .action = .allow }} })) != null);
 }
 
 test "permissions become Claude Code's --settings lists and merge into opencode's own config document" {
@@ -1548,7 +1562,7 @@ test "permissions become Claude Code's --settings lists and merge into opencode'
     // Only the main process gets it.
     const argv = try startArgv(a, claude_like, "/c", cl, .{}, .{ .main = .fresh });
     try t.expectEqualStrings("--settings", argv[2]);
-    try t.expectEqual(@as(usize, 2), (try startArgv(a, opencode_like, "/o", try applySettings(a, &opencode_spec, .{ .permissions = &.{.{ .name = "bash", .action = .ask }} }, null), .{}, .attach)).len);
+    try t.expectEqual(@as(usize, 2), (try startArgv(a, opencode_like, "/o", try applySettings(a, &opencode_spec, .{ .permissions = &.{.{ .name = "bash", .action = .ask }} }, null), .{}, .{ .attach = &.{"attach"} })).len);
 
     // opencode: a document of its own, or merged into the caller's.
     const fresh = try applySettings(a, &opencode_spec, .{ .permissions = &.{ .{ .name = "external_directory", .action = .allow }, .{ .name = "bash", .action = .ask } } }, null);

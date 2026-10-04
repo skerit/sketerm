@@ -6600,7 +6600,7 @@ fn fakeOpencodeServe(allocator: std.mem.Allocator, args: []const [*:0]const u8) 
         const deaf = std.fmt.parseInt(i64, std.mem.span(@as([*:0]const u8, @ptrCast(ms))), 10) catch 0;
         srv.deaf_until_ms = nowMs() + deaf;
     }
-    srv.route("GET " ++ @import("agent/opencode.zig").HEALTH_PATH, .{ .body = "{\"healthy\":true,\"version\":\"smoke\"}" });
+    srv.route("GET /global/health", .{ .body = "{\"healthy\":true,\"version\":\"smoke\"}" });
     srv.hook = FakeOc.hook;
     srv.hook_ctx = &oc;
     srv.route("POST /session", .{ .body = "{\"id\":\"" ++ FakeOc.SES ++ "\"}" });
