@@ -799,6 +799,73 @@ element.remove();return result;
             self.assertEqual(server.matching(path), [], "Forbidden request reached fixture")
             time.sleep(0.05)
 
+    def test_fetch_metadata(self):
+        self.maxDiff = None
+        observed = []
+        for mode in (False, True):
+            page = self.path("metadata-page-" + str(mode))
+            frame = self.path("metadata-frame-" + str(mode))
+            script = self.path("metadata-script-" + str(mode) + ".js")
+            scripted = self.path("metadata-scripted-" + str(mode))
+            explicit = self.path("metadata-explicit-" + str(mode))
+            target = self.path("metadata-click-" + str(mode))
+            self.p1.asset(page, ('''<!doctype html><title>Untrusted integration fixture</title>
+<script src="%s"></script><iframe src="%s"></iframe><a href="%s">Navigate</a>'''
+                                % (script, frame, target)).encode(), "text/html")
+            self.p1.asset(frame, b"<!doctype html><title>Frame loaded</title>", "text/html")
+            self.p1.asset(scripted, ('<!doctype html><title>Script navigation loaded</title><a href="%s">Navigate</a>'
+                                    % target).encode(), "text/html")
+            self.p1.asset(explicit, b"<!doctype html><title>Explicit navigation loaded</title>", "text/html")
+            self.p1.asset(target, b"<!doctype html><title>Navigation loaded</title>", "text/html")
+            pane = self.open(untrusted=mode, url=self.p1.url(page), policy_patch={
+                "allow_subresource_hosts": ["127.0.0.1:%d" % self.p2.server_port,
+                                            "localhost:%d" % self.p2.server_port]})
+            self.assertEqual(self.mcp.evaluate(pane, "return document.querySelector('iframe').contentDocument.title;"),
+                             "Frame loaded")
+            resources = []
+            for label, kind, server, host in (("module-extra", "module", self.p1, "127.0.0.1"),
+                                               ("style-extra", "style", self.p1, "127.0.0.1"),
+                                               ("script-extra", "script", self.p2, "127.0.0.1"),
+                                               ("script-cross", "script", self.p2, "localhost")):
+                suffix = ".css" if kind == "style" else ".js"
+                path = self.path("metadata-%s-%s%s" % (label, mode, suffix))
+                marker = "metadata_marker_" + kind
+                self.assert_resource_control(self.resource(pane, kind, server.url(path, host=host, marker=marker), marker), kind)
+                resources.append((label, server, path))
+            xhr = self.path("metadata-xhr-" + str(mode))
+            self.assertTrue(self.fetch(pane, self.p1.url(xhr))["ok"])
+            self.mcp.evaluate(pane, "setTimeout(()=>location.href=%s,0); return true;" % json.dumps(self.p1.url(scripted)))
+            self.mcp.tool("web_wait", pane=pane, **{"for": "title", "arg": "Script navigation loaded"})
+            self.mcp.tool("web_act", pane=pane, name="Navigate", role="link")
+            eventually(lambda: self.p1.matching(target), 5, "user-activated navigation")
+            self.mcp.tool("web_navigate", pane=pane, url=self.p1.url(explicit))
+            metadata = {}
+            paths = [(kind, self.p1, path) for kind, path in (
+                ("document", page), ("iframe", frame), ("script", script), ("scripted", scripted),
+                ("click", target), ("explicit", explicit), ("xhr", xhr))] + resources
+            for kind, server, path in paths:
+                events = server.matching(path, "GET")
+                self.assertEqual(len(events), 1, (kind, events))
+                metadata[kind] = {name.lower(): value for name, value in events[0]["headers"].items()
+                                  if name.lower() in ("sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site", "sec-fetch-user")}
+            observed.append(metadata)
+            self.mcp.tool("web_close", pane=pane)
+        expected = {
+            "document": {"sec-fetch-dest": "document", "sec-fetch-mode": "navigate", "sec-fetch-site": "none", "sec-fetch-user": "?1"},
+            "iframe": {"sec-fetch-dest": "iframe", "sec-fetch-mode": "navigate", "sec-fetch-site": "same-origin"},
+            "script": {"sec-fetch-dest": "script", "sec-fetch-mode": "no-cors", "sec-fetch-site": "same-origin"},
+            "click": {"sec-fetch-dest": "document", "sec-fetch-mode": "navigate", "sec-fetch-site": "same-origin", "sec-fetch-user": "?1"},
+            "scripted": {"sec-fetch-dest": "document", "sec-fetch-mode": "navigate", "sec-fetch-site": "same-origin"},
+            "explicit": {"sec-fetch-dest": "document", "sec-fetch-mode": "navigate", "sec-fetch-site": "none", "sec-fetch-user": "?1"},
+            "module-extra": {"sec-fetch-dest": "script", "sec-fetch-mode": "cors", "sec-fetch-site": "same-origin"},
+            "style-extra": {"sec-fetch-dest": "style", "sec-fetch-mode": "no-cors", "sec-fetch-site": "same-origin"},
+            "script-extra": {"sec-fetch-dest": "script", "sec-fetch-mode": "no-cors", "sec-fetch-site": "same-site"},
+            "script-cross": {"sec-fetch-dest": "script", "sec-fetch-mode": "no-cors", "sec-fetch-site": "cross-site"},
+            "xhr": {"sec-fetch-dest": "empty", "sec-fetch-mode": "cors", "sec-fetch-site": "same-origin"},
+        }
+        self.assertEqual(observed[0], expected, "Ordinary browser control")
+        self.assertEqual(observed[1], observed[0], "Untrusted Fetch Metadata differs from Chromium")
+
     def test_01_http_ports_and_stable_handles(self):
         ordinary = self.open(hosts=["127.0.0.1"])
         target = self.path("port-control")

@@ -262,6 +262,84 @@ static void validation(void) {
     puts("PASS trusted initiator/type/navigation, 135-byte navigation Accept, author-header and Origin spoof rejection");
 }
 
+static void fetch_metadata(void) {
+    struct sk_curl a;
+    assert(sk_curl_load(&a));
+    struct sk_origin target;
+    struct sk_request q = {.url = "https://example.com/", .initiator = "https://example.com",
+        .method = "GET", .resource_type = RT_SCRIPT};
+    const struct { int type, navigation; const char *dest, *mode; } cases[] = {
+        {RT_MAIN_FRAME, 1, "document", "navigate"}, {RT_SUB_FRAME, 1, "iframe", "navigate"},
+        {RT_SCRIPT, 0, "script", "no-cors"}, {RT_STYLESHEET, 0, "style", "no-cors"},
+        {RT_FONT_RESOURCE, 0, "font", "cors"}, {RT_IMAGE, 0, "image", "no-cors"},
+        {RT_XHR, 0, "empty", "cors"}, {RT_SUB_RESOURCE, 0, "empty", "no-cors"}
+    };
+    assert(sk_parse_url(q.url, &target, 0));
+    for (size_t i = 0; i < sizeof(cases) / sizeof(*cases); ++i) {
+        q.resource_type = cases[i].type; q.navigation = cases[i].navigation;
+        for (int active = 0; active < 2; ++active) {
+            q.user_activation = active;
+            struct curl_slist *headers = NULL;
+            assert(sk_fetch_metadata(&a, &headers, &q, 0, &target));
+            char line[128];
+            snprintf(line, sizeof(line), "Sec-Fetch-Dest: %s", cases[i].dest);
+            assert(headers && !strcmp(headers->data, line));
+            snprintf(line, sizeof(line), "Sec-Fetch-Mode: %s", cases[i].mode);
+            assert(headers->next && !strcmp(headers->next->data, line));
+            assert(headers->next->next && !strcmp(headers->next->next->data, "Sec-Fetch-Site: same-origin"));
+            struct curl_slist *user = headers->next->next->next;
+            if (active && q.navigation) assert(user && !strcmp(user->data, "Sec-Fetch-User: ?1") && !user->next);
+            else assert(!user);
+            a.slist_free_all(headers);
+        }
+    }
+    q.navigation = 0; q.resource_type = RT_SCRIPT;
+    const char cors[] = "Origin\0https://example.com\0";
+    struct curl_slist *headers = NULL;
+    q.headers = (char *)cors;
+    assert(sk_fetch_metadata(&a, &headers, &q, sizeof(cors) - 1, &target));
+    assert(!strcmp(headers->next->data, "Sec-Fetch-Mode: cors"));
+    a.slist_free_all(headers);
+    const struct { const char *source, *url, *site; } sites[] = {
+        {"", "https://example.com/", "none"}, {"null", "https://example.com/", "cross-site"},
+        {"https://EXAMPLE.com:443", "https://example.com/", "same-origin"},
+        {"https://example.com:444", "https://example.com/", "same-site"},
+        {"http://example.com", "https://example.com/", "cross-site"},
+        {"https://a.example.co.uk", "https://b.example.co.uk/", "same-site"},
+        {"https://a.github.io", "https://b.github.io/", "cross-site"},
+        {"https://other.com", "https://example.com/", "cross-site"},
+        {"https://127.0.0.1", "https://127.0.0.2/", "cross-site"},
+        {"https://[::1]:444", "https://[::1]/", "same-site"}
+    };
+    for (size_t i = 0; i < sizeof(sites) / sizeof(*sites); ++i) {
+        q.initiator = (char *)sites[i].source;
+        assert(sk_parse_url(sites[i].url, &target, 0));
+        const char *site = i == 5 && (!a.psl_builtin || !a.psl_registrable_domain) ? "cross-site" : sites[i].site;
+        assert(!strcmp(sk_fetch_site(&a, &q, &target), site));
+    }
+    struct sk_curl no_psl = a;
+    no_psl.psl_builtin = NULL; no_psl.psl_registrable_domain = NULL;
+    q.initiator = "https://a.example.com";
+    assert(sk_parse_url("https://b.example.com/", &target, 0));
+    assert(!strcmp(sk_fetch_site(&no_psl, &q, &target), "cross-site"));
+    const struct { const char *url; int trusted; } urls[] = {
+        {"https://example.com/", 1}, {"http://example.com/", 0},
+        {"http://localhost/", 1}, {"http://a.localhost./", 1}, {"http://notlocalhost/", 0},
+        {"http://127.0.0.2/", 1}, {"http://127.0.0.1./", 1}, {"http://[::1]/", 1},
+        {"http://[::ffff:127.0.0.1]/", 0}
+    };
+    for (size_t i = 0; i < sizeof(urls) / sizeof(*urls); ++i) {
+        assert(sk_parse_url(urls[i].url, &target, 0));
+        assert(sk_trustworthy(&target) == urls[i].trusted);
+        if (!urls[i].trusted) {
+            headers = NULL;
+            assert(sk_fetch_metadata(&a, &headers, &q, 0, &target) && !headers);
+        }
+    }
+    dlclose(a.handle);
+    puts("PASS Fetch Metadata destinations, CORS libraries, activation, schemeful PSL sites and trustworthy origins");
+}
+
 static atomic_int socket_thread_go;
 static void *socket_thread(void *unused) {
     (void)unused;
@@ -384,6 +462,10 @@ static void server(int listener, pid_t parent) {
         if (strstr(input, " /slow ")) {
             /* Keep independent sockets open without delaying later accepts. */
             continue;
+        } else if (strstr(input, " /metadata ")) {
+            char response[256];
+            int n = snprintf(response, sizeof(response), "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n", used);
+            if (sk_io(fd, response, (size_t)n, 1, deadline)) sk_io(fd, input, used, 1, deadline);
         } else if (strstr(input, " /redirect ")) {
             char response[] = "HTTP/1.1 302 Found\r\nLocation: /target\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             sk_io(fd, response, sizeof(response) - 1, 1, deadline);
@@ -494,12 +576,14 @@ static struct sk_response exchange_budget(const char *url, const char *method, c
     int fd = broker_connect();
     struct sk_wire_request w = {SK_MAGIC, (uint32_t)strlen(url), (uint32_t)strlen(method),
         (uint32_t)header_len, (uint32_t)body_len, (uint32_t)allow,
-        (uint32_t)strlen(initiator), (uint32_t)navigation, (uint32_t)resource_type, budget_ms};
+        (uint32_t)strlen(initiator), (uint32_t)navigation, (uint32_t)resource_type, budget_ms, 0,
+        (uint32_t)strlen(initiator)};
     int64_t deadline = sk_now_ms() + 3000;
     assert(sk_io(fd, &w, sizeof(w), 1, deadline));
     assert(sk_io(fd, (void *)url, w.url_len, 1, deadline));
     assert(sk_io(fd, (void *)method, w.method_len, 1, deadline));
     assert(sk_io(fd, (void *)initiator, w.initiator_len, 1, deadline));
+    assert(sk_io(fd, (void *)initiator, w.fetch_initiator_len, 1, deadline));
     assert(sk_io(fd, (void *)headers, header_len, 1, deadline));
     assert(sk_io(fd, (void *)body, body_len, 1, deadline));
     struct sk_wire_response answer;
@@ -587,6 +671,27 @@ static unsigned header_count(struct sk_response *r, const char *key) {
 }
 static void response_free(struct sk_response *r) { free(r->headers); free(r->body); }
 
+static void broker_metadata(const char *url) {
+    char path[512], source[256];
+    snprintf(path, sizeof(path), "%smetadata", url);
+    snprintf(source, sizeof(source), "%.*s", (int)strlen(url) - 1, url);
+    const char spoofed[] = "sec-fetch-dest\0worker\0Sec-Fetch-Mode\0same-origin\0"
+        "SEC-FETCH-SITE\0none\0Sec-Fetch-User\0?1\0";
+    struct sk_response r = exchange_as(path, "GET", spoofed, sizeof(spoofed) - 1, NULL, 0, 1, source, 0, RT_SCRIPT);
+    assert(!r.reason && r.body_len);
+    assert(strstr((char *)r.body, "\r\nSec-Fetch-Dest: script\r\n"));
+    assert(strstr((char *)r.body, "\r\nSec-Fetch-Mode: no-cors\r\n"));
+    assert(strstr((char *)r.body, "\r\nSec-Fetch-Site: same-origin\r\n"));
+    assert(!strstr((char *)r.body, "Sec-Fetch-User") && !strstr((char *)r.body, "worker"));
+    response_free(&r);
+    r = exchange_as(path, "GET", "", 0, NULL, 0, 1, source, 1, RT_SUB_FRAME);
+    assert(!r.reason && strstr((char *)r.body, "\r\nSec-Fetch-Dest: iframe\r\n"));
+    assert(strstr((char *)r.body, "\r\nSec-Fetch-Mode: navigate\r\n"));
+    assert(!strstr((char *)r.body, "Sec-Fetch-User"));
+    response_free(&r);
+    puts("PASS broker sends reconstructed Fetch Metadata and replaces spoofed fields without duplicates");
+}
+
 struct fake_request { cef_request_t cef; atomic_int refs; const char *url, *method, *headers; size_t header_len; cef_post_data_t *post; cef_resource_type_t type; };
 static void CEF_CALLBACK req_add(cef_base_ref_counted_t *base) { atomic_fetch_add(&((struct fake_request *)base)->refs, 1); }
 static int CEF_CALLBACK req_release(cef_base_ref_counted_t *base) { return atomic_fetch_sub(&((struct fake_request *)base)->refs, 1) == 1; }
@@ -638,6 +743,53 @@ static cef_resource_handler_t *resource_as(struct fake_request *req, int allow,
 
 static cef_resource_handler_t *resource(struct fake_request *req, int allow) {
     return resource_as(req, allow, "", 1);
+}
+
+struct navigation_frame { cef_frame_t cef; const char *url; };
+static cef_string_userfree_t CEF_CALLBACK navigation_url(cef_frame_t *self) {
+    const char *url = ((struct navigation_frame *)self)->url;
+    return url ? user_string(url) : NULL;
+}
+static cef_transition_type_t CEF_CALLBACK navigation_transition(cef_request_t *self) {
+    (void)self; return TT_EXPLICIT;
+}
+
+static void navigation_metadata(void) {
+    struct fake_request req; request_init(&req, "https://example.com/target", "GET");
+    struct navigation_frame frame = {.url = "https://example.com/source?secret"};
+    frame.cef.get_url = navigation_url;
+    sk_web_untrusted_navigation(&req.cef, &frame.cef, 17, 1);
+    cef_resource_handler_t *h = resource_as(&req, 0, "null", 1); assert(h);
+    struct sk_handler *internal = (struct sk_handler *)h;
+    assert(!strcmp(internal->request.initiator, "null"));
+    assert(!strcmp(internal->request.fetch_initiator, "https://example.com"));
+    assert(internal->request.user_activation && h->base.release(&h->base));
+    sk_web_untrusted_navigation(&req.cef, &frame.cef, 18, 0);
+    h = resource_as(&req, 0, "null", 1); assert(h);
+    assert(((struct sk_handler *)h)->request.user_activation && h->base.release(&h->base));
+    sk_web_untrusted_navigation(&req.cef, &frame.cef, 17, 0);
+    h = resource_as(&req, 0, "null", 1); assert(h);
+    assert(!((struct sk_handler *)h)->request.user_activation && h->base.release(&h->base));
+    req.method = "POST";
+    h = resource_as(&req, 0, "null", 1); assert(h);
+    assert(((struct sk_handler *)h)->response.reason == SK_WEB_UNTRUSTED_UNSUPPORTED);
+    assert(h->base.release(&h->base));
+    req.method = "GET";
+    req.cef.get_transition_type = navigation_transition;
+    sk_web_untrusted_navigation(&req.cef, &frame.cef, 17, 0);
+    h = resource_as(&req, 0, "null", 1); assert(h);
+    internal = (struct sk_handler *)h;
+    assert(!*internal->request.fetch_initiator && internal->request.user_activation);
+    assert(h->base.release(&h->base));
+    req.cef.get_transition_type = NULL;
+    frame.url = NULL;
+    sk_web_untrusted_navigation(&req.cef, &frame.cef, 17, 0);
+    h = resource_as(&req, 0, "null", 1); assert(h);
+    internal = (struct sk_handler *)h;
+    assert(!*internal->request.fetch_initiator && internal->request.user_activation);
+    assert(atomic_load(&req.refs) == 1 && h->base.release(&h->base));
+    memset(sk_navigations, 0, sizeof(sk_navigations));
+    puts("PASS native navigation activation/origin attribution, browser isolation, NULL frame URL and unchanged POST authority");
 }
 
 struct fake_callback { cef_callback_t cef; atomic_int refs, continued; };
@@ -1213,7 +1365,7 @@ static void broker_tests(void) {
     r = exchange(url, "PUT", "", 0, NULL, 0, 1); assert(r.reason == 2); response_free(&r);
     r = exchange(url, "POST", "", 0, "abc", 3, 1); assert(r.reason == 2); response_free(&r);
     r = exchange("file:///etc/passwd", "GET", "", 0, NULL, 0, 1); assert(r.reason == 2); response_free(&r);
-    for (unsigned i = 0; i < 10; ++i) {
+    for (unsigned i = 0; i < 12; ++i) {
         struct sk_wire_request w = {.magic = SK_MAGIC, .url_len = 1, .method_len = 3, .budget_ms = SK_TIMEOUT_MS};
         if (!i) w.url_len = UINT32_MAX;
         if (i == 1) w.headers_len = SK_HEADER_CAP + 1;
@@ -1225,6 +1377,8 @@ static void broker_tests(void) {
         if (i == 7) w.resource_type = RT_NUM_VALUES;
         if (i == 8) w.budget_ms = 0;
         if (i == 9) w.budget_ms = SK_TIMEOUT_MS + 1;
+        if (i == 10) w.user_activation = 2;
+        if (i == 11) w.fetch_initiator_len = SK_URL_CAP + 1;
         int fd = broker_connect(); int64_t deadline = sk_now_ms() + 2000;
         assert(sk_io(fd, &w, sizeof(w), 1, deadline));
         struct sk_wire_response answer; assert(sk_io(fd, &answer, sizeof(answer), 0, deadline));
@@ -1258,6 +1412,8 @@ static void broker_tests(void) {
     uploads(url);
     handlers(url);
     trusted_metadata(url);
+    navigation_metadata();
+    broker_metadata(url);
     cross_origin_contract(url);
     worker_classification(url);
     cancellation_slots(url, 0);
@@ -1332,7 +1488,7 @@ int main(int argc, char **argv) {
         return 0;
     }
     assert(sk_curl_load(&curl)); dlclose(curl.handle);
-    addresses(); own_addresses(); validation(); confinement(); stdio_null(); broker_tests();
+    addresses(); own_addresses(); validation(); fetch_metadata(); confinement(); stdio_null(); broker_tests();
     puts("All web-untrusted native tests passed.");
     return 0;
 }

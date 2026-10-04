@@ -72,14 +72,14 @@ struct sk_wire_request {
     uint32_t magic, url_len, method_len, headers_len, body_len, allow_private;
     uint32_t initiator_len, navigation, resource_type;
     /* Milliseconds left of the loader's deadline when the request was sent. */
-    uint32_t budget_ms;
+    uint32_t budget_ms, user_activation, fetch_initiator_len;
 };
 struct sk_wire_response { uint32_t magic, reason, status, headers_len, body_len; };
 struct sk_request {
-    char *url, *method, *headers, *initiator;
+    char *url, *method, *headers, *initiator, *fetch_initiator;
     unsigned char *body;
     size_t body_len;
-    int allow_private, navigation, resource_type;
+    int allow_private, navigation, resource_type, user_activation;
 };
 struct sk_response {
     int reason, status, port, allow_private, cross_static;
@@ -88,8 +88,11 @@ struct sk_response {
     size_t headers_len, header_total, body_len, body_capacity;
 };
 struct sk_origin { char host[256]; unsigned port; int tls; };
+struct psl_ctx_st;
 struct sk_curl {
     void *handle;
+    const struct psl_ctx_st *(*psl_builtin)(void);
+    const char *(*psl_registrable_domain)(const struct psl_ctx_st *, const char *);
     CURLcode (*global_init)(long);
     void (*global_cleanup)(void);
     curl_version_info_data *(*version_info)(CURLversion);
@@ -143,6 +146,9 @@ static int sk_curl_load(struct sk_curl *a) {
     SK_BIND(easy_perform); SK_BIND(easy_getinfo);
     SK_BIND(slist_append); SK_BIND(slist_free_all);
 #undef SK_BIND
+    /* Many curl builds already load libpsl; no additional hard dependency. */
+    a->psl_builtin = dlsym(a->handle, "psl_builtin");
+    a->psl_registrable_domain = dlsym(a->handle, "psl_registrable_domain");
     curl_version_info_data *v = a->version_info(CURLVERSION_FIRST);
     int http = 0, https = 0;
     if (!v || v->version_num < 0x075500 || !(v->features & CURL_VERSION_SSL) || !v->protocols)
@@ -431,6 +437,96 @@ static int sk_same_origin(const struct sk_origin *a, const struct sk_origin *b) 
     return a->tls == b->tls && a->port == b->port && !strcmp(a->host, b->host);
 }
 
+static int sk_trustworthy(const struct sk_origin *o) {
+    if (o->tls) return 1;
+    size_t n = strlen(o->host);
+    if (n && o->host[n - 1] == '.') --n;
+    if ((n == 9 && !memcmp(o->host, "localhost", n)) ||
+        (n > 10 && !memcmp(o->host + n - 10, ".localhost", 10))) return 1;
+    struct in_addr v4;
+    struct in6_addr v6;
+    char host[256]; memcpy(host, o->host, n); host[n] = 0;
+    return (inet_pton(AF_INET, host, &v4) == 1 && ((unsigned char *)&v4)[0] == 127) ||
+        (inet_pton(AF_INET6, host, &v6) == 1 && IN6_IS_ADDR_LOOPBACK(&v6));
+}
+
+static const char *sk_fetch_site(struct sk_curl *a, const struct sk_request *q,
+                                const struct sk_origin *target) {
+    const char *initiator = q->fetch_initiator ? q->fetch_initiator : q->initiator;
+    if (!*initiator) return "none";
+    struct sk_origin source;
+    if (!sk_parse_url(initiator, &source, 1)) return "cross-site";
+    if (sk_same_origin(&source, target)) return "same-origin";
+    if (source.tls != target->tls) return "cross-site";
+    if (!strcmp(source.host, target->host)) return "same-site";
+    /* IP addresses and private PSL entries must not be grouped by suffix. */
+    struct in_addr v4;
+    struct in6_addr v6;
+    if (inet_pton(AF_INET, source.host, &v4) == 1 || inet_pton(AF_INET6, source.host, &v6) == 1 ||
+        inet_pton(AF_INET, target->host, &v4) == 1 || inet_pton(AF_INET6, target->host, &v6) == 1)
+        return "cross-site";
+    if (a->psl_builtin && a->psl_registrable_domain) {
+        const struct psl_ctx_st *psl = a->psl_builtin();
+        if (!psl) return "cross-site";
+        const char *s = a->psl_registrable_domain(psl, source.host);
+        const char *t = a->psl_registrable_domain(psl, target->host);
+        if (s && t && !strcmp(s, t)) return "same-site";
+    }
+    return "cross-site";
+}
+
+static int sk_append_header(struct sk_curl *a, struct curl_slist **headers,
+                            const char *name, const char *value) {
+    size_t n = strlen(name), v = strlen(value);
+    char *line = malloc(n + v + 3);
+    if (!line) return 0;
+    memcpy(line, name, n); line[n] = ':'; line[n + 1] = ' ';
+    memcpy(line + n + 2, value, v + 1);
+    /* curl's "Name;" preserves an empty header instead of removing it. */
+    if (!v) { line[n] = ';'; line[n + 1] = 0; }
+    struct curl_slist *next = a->slist_append(*headers, line);
+    free(line);
+    if (!next) return 0;
+    *headers = next;
+    return 1;
+}
+
+/* CEF omits metadata that Chromium's network service adds after interception;
+ * its API also lacks arbitrary Fetch modes and the audio/video destination. */
+static int sk_fetch_metadata(struct sk_curl *a, struct curl_slist **headers,
+                             const struct sk_request *q, size_t header_len,
+                             const struct sk_origin *target) {
+    if (!sk_trustworthy(target)) return 1;
+    const char *dest = "empty", *mode = "no-cors";
+    int has_origin = 0;
+    for (size_t at = 0; at < header_len;) {
+        const char *name = q->headers + at; at += strlen(name) + 1;
+        at += strlen(q->headers + at) + 1;
+        if (!strcasecmp(name, "origin")) has_origin = 1;
+    }
+    if (q->navigation) {
+        dest = q->resource_type == RT_MAIN_FRAME ? "document" : "iframe";
+        mode = "navigate";
+    } else {
+        switch (q->resource_type) {
+        case RT_SCRIPT: dest = "script"; break;
+        case RT_STYLESHEET: dest = "style"; break;
+        case RT_FONT_RESOURCE: dest = "font"; mode = "cors"; break;
+        case RT_IMAGE: dest = "image"; break;
+        case RT_OBJECT: dest = "object"; break;
+        case RT_XHR: mode = "cors"; break;
+        case RT_CSP_REPORT: dest = "report"; break;
+        default: break;
+        }
+        if (has_origin && q->resource_type != RT_PING && q->resource_type != RT_CSP_REPORT)
+            mode = "cors";
+    }
+    return sk_append_header(a, headers, "Sec-Fetch-Dest", dest) &&
+        sk_append_header(a, headers, "Sec-Fetch-Mode", mode) &&
+        sk_append_header(a, headers, "Sec-Fetch-Site", sk_fetch_site(a, q, target)) &&
+        (!q->navigation || !q->user_activation || sk_append_header(a, headers, "Sec-Fetch-User", "?1"));
+}
+
 static int sk_token(const char *s, size_t len) {
     if (!len) return 0;
     for (size_t i = 0; i < len; ++i) {
@@ -486,7 +582,8 @@ static int sk_validate(struct sk_request *r, size_t header_len, struct sk_origin
         (strcmp(r->method, "GET") && strcmp(r->method, "HEAD") && strcmp(r->method, "POST")) ||
         r->body_len > SK_UPLOAD_CAP || (r->body_len && strcmp(r->method, "POST")) ||
         (r->allow_private != 0 && r->allow_private != 1) ||
-        (r->navigation != 0 && r->navigation != 1) || !r->initiator) return 0;
+        (r->navigation != 0 && r->navigation != 1) ||
+        (r->user_activation != 0 && r->user_activation != 1) || !r->initiator) return 0;
     struct sk_origin source;
     int known = sk_parse_url(r->initiator, &source, 1);
     int same = known && sk_same_origin(target, &source);
@@ -545,7 +642,7 @@ static int sk_validate(struct sk_request *r, size_t header_len, struct sk_origin
 }
 
 static void sk_request_free(struct sk_request *r) {
-    free(r->url); free(r->method); free(r->headers); free(r->initiator); free(r->body);
+    free(r->url); free(r->method); free(r->headers); free(r->initiator); free(r->fetch_initiator); free(r->body);
     memset(r, 0, sizeof(*r));
 }
 
@@ -689,21 +786,12 @@ static void sk_fetch(struct sk_curl *a, struct sk_request *q, size_t header_len,
     for (size_t at = 0; at < header_len;) {
         const char *name = q->headers + at; at += strlen(name) + 1;
         const char *value = q->headers + at; at += strlen(value) + 1;
-        if (!strcasecmp(name, "accept-encoding")) continue;
+        if (!strcasecmp(name, "accept-encoding") || !strncasecmp(name, "sec-fetch-", 10)) continue;
         if (r->cross_static && (!strcasecmp(name, "cookie") || !strcasecmp(name, "referer") ||
                                 !strcasecmp(name, "origin"))) continue;
-        size_t n = strlen(name), v = strlen(value);
-        char *line = malloc(n + v + 3);
-        if (!line) goto done;
-        memcpy(line, name, n); line[n] = ':'; line[n + 1] = ' ';
-        memcpy(line + n + 2, value, v + 1);
-        /* curl's "Name;" preserves an empty header instead of removing it. */
-        if (!v) { line[n] = ';'; line[n + 1] = 0; }
-        struct curl_slist *next = a->slist_append(headers, line);
-        free(line);
-        if (!next) goto done;
-        headers = next;
+        if (!sk_append_header(a, &headers, name, value)) goto done;
     }
+    if (!sk_fetch_metadata(a, &headers, q, header_len, &origin)) goto done;
     struct curl_slist *next = a->slist_append(headers, "Expect:");
     if (!next) goto done;
     headers = next;
@@ -776,7 +864,7 @@ static void sk_job(int fd, struct sk_curl *a) {
     if (w.magic != SK_MAGIC || !w.url_len || w.url_len > SK_URL_CAP ||
         !w.method_len || w.method_len > 4 || w.headers_len > SK_HEADER_CAP ||
         w.body_len > SK_UPLOAD_CAP || w.allow_private > 1 || w.initiator_len > SK_URL_CAP ||
-        w.navigation > 1 || w.resource_type >= RT_NUM_VALUES ||
+        w.navigation > 1 || w.user_activation > 1 || w.fetch_initiator_len > SK_URL_CAP || w.resource_type >= RT_NUM_VALUES ||
         !w.budget_ms || w.budget_ms > SK_TIMEOUT_MS) goto reply;
     {
         /* The loader's deadline, which may be nearer than ours after queueing. */
@@ -788,7 +876,8 @@ static void sk_job(int fd, struct sk_curl *a) {
     }
     if (!sk_recv_text(fd, &q.url, w.url_len, deadline) ||
         !sk_recv_text(fd, &q.method, w.method_len, deadline) ||
-        !sk_recv_text(fd, &q.initiator, w.initiator_len, deadline)) goto reply;
+        !sk_recv_text(fd, &q.initiator, w.initiator_len, deadline) ||
+        !sk_recv_text(fd, &q.fetch_initiator, w.fetch_initiator_len, deadline)) goto reply;
     q.headers = malloc((size_t)w.headers_len + 1);
     q.body = w.body_len ? malloc(w.body_len) : NULL;
     if (!q.headers || (w.body_len && !q.body)) { r.reason = SK_WEB_UNTRUSTED_BROKER_FAILURE; goto reply; }
@@ -797,6 +886,7 @@ static void sk_job(int fd, struct sk_curl *a) {
     q.headers[w.headers_len] = 0;
     q.body_len = w.body_len; q.allow_private = (int)w.allow_private;
     q.navigation = (int)w.navigation; q.resource_type = (int)w.resource_type;
+    q.user_activation = (int)w.user_activation;
     sk_fetch(a, &q, w.headers_len, &r, deadline);
 reply:;
     struct sk_wire_response answer = {SK_MAGIC, (uint32_t)r.reason, (uint32_t)r.status,
@@ -1038,10 +1128,12 @@ static int sk_send_request(int fd, struct sk_handler *h, uint32_t budget_ms, int
     struct sk_request *q = &h->request;
     struct sk_wire_request w = {SK_MAGIC, (uint32_t)strlen(q->url), (uint32_t)strlen(q->method),
         (uint32_t)h->header_len, (uint32_t)q->body_len, (uint32_t)q->allow_private,
-        (uint32_t)strlen(q->initiator), (uint32_t)q->navigation, (uint32_t)q->resource_type, budget_ms};
+        (uint32_t)strlen(q->initiator), (uint32_t)q->navigation, (uint32_t)q->resource_type, budget_ms,
+        (uint32_t)q->user_activation, (uint32_t)strlen(q->fetch_initiator)};
     return sk_io(fd, &w, sizeof(w), 1, deadline) && sk_io(fd, q->url, w.url_len, 1, deadline) &&
         sk_io(fd, q->method, w.method_len, 1, deadline) &&
         sk_io(fd, q->initiator, w.initiator_len, 1, deadline) &&
+        sk_io(fd, q->fetch_initiator, w.fetch_initiator_len, 1, deadline) &&
         sk_io(fd, q->headers, w.headers_len, 1, deadline) && sk_io(fd, q->body, w.body_len, 1, deadline);
 }
 
@@ -1302,6 +1394,95 @@ struct sk_request_handler {
     int navigation, resource_type;
 };
 
+/* UI-thread navigation callbacks precede IO-thread resource callbacks. CEF's
+ * navigation request has identifier 0, so match its browser, URL and type. */
+static pthread_mutex_t sk_navigation_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct {
+    char url[SK_URL_CAP + 1], initiator[512];
+    int browser_id, resource_type, user_gesture;
+    int64_t deadline;
+} sk_navigations[SK_QUEUE_CAP];
+
+void sk_web_untrusted_navigation(cef_request_t *request, cef_frame_t *frame, int browser_id, int user_gesture) {
+    if (!request || !request->get_url || !request->get_resource_type || browser_id <= 0) return;
+    cef_string_userfree_t raw = request->get_url(request);
+    char *url = sk_utf8(raw, SK_URL_CAP);
+    if (raw) cef_string_userfree_free(raw);
+    if (!url) return;
+    int type = request->get_resource_type(request);
+    char initiator[512] = "";
+    cef_frame_t *current = frame;
+    int owned = 0;
+    for (unsigned depth = 0; current && depth < 32; ++depth) {
+        raw = current->get_url ? current->get_url(current) : NULL;
+        char *source = raw ? sk_utf8(raw, SK_URL_CAP) : NULL;
+        if (raw) cef_string_userfree_free(raw);
+        struct sk_origin origin;
+        if (source && sk_parse_url(source, &origin, 0)) {
+            size_t n = strcspn(source + (origin.tls ? 8 : 7), "/?#") + (origin.tls ? 8 : 7);
+            if (n < sizeof(initiator)) { memcpy(initiator, source, n); initiator[n] = 0; }
+            free(source);
+            break;
+        }
+        int inherited = !source || !*source || !strcmp(source, "about:blank") || !strcmp(source, "about:srcdoc");
+        free(source);
+        if (!inherited) { strcpy(initiator, "null"); break; }
+        cef_frame_t *parent = current->get_parent ? current->get_parent(current) : NULL;
+        if (owned) sk_release_arg(&current->base);
+        current = parent; owned = 1;
+    }
+    if (owned && current) sk_release_arg(&current->base);
+    if (type == RT_MAIN_FRAME && request->get_transition_type &&
+        (request->get_transition_type(request) & TT_SOURCE_MASK) == TT_EXPLICIT)
+        initiator[0] = 0;
+    int64_t now = sk_now_ms();
+    pthread_mutex_lock(&sk_navigation_lock);
+    unsigned slot = 0;
+    for (unsigned i = 0; i < SK_QUEUE_CAP; ++i) {
+        if (sk_navigations[i].browser_id == browser_id && sk_navigations[i].resource_type == type &&
+            !strcmp(sk_navigations[i].url, url)) { slot = i; break; }
+        if (sk_navigations[i].deadline < sk_navigations[slot].deadline) slot = i;
+    }
+    memcpy(sk_navigations[slot].url, url, strlen(url) + 1);
+    memcpy(sk_navigations[slot].initiator, initiator, strlen(initiator) + 1);
+    sk_navigations[slot].browser_id = browser_id;
+    sk_navigations[slot].resource_type = type;
+    sk_navigations[slot].user_gesture = user_gesture != 0;
+    sk_navigations[slot].deadline = now + SK_TIMEOUT_MS;
+    pthread_mutex_unlock(&sk_navigation_lock);
+    free(url);
+}
+
+static int sk_navigation_metadata(struct sk_request *r, int browser_id) {
+    if (!r->navigation) {
+        r->fetch_initiator = strdup(r->initiator);
+        return r->fetch_initiator != NULL;
+    }
+    char initiator[512] = "null";
+    int active = 0, found = 0;
+    int64_t now = sk_now_ms();
+    pthread_mutex_lock(&sk_navigation_lock);
+    for (unsigned i = 0; i < SK_QUEUE_CAP; ++i) {
+        if (sk_navigations[i].browser_id == browser_id && sk_navigations[i].deadline > now &&
+            sk_navigations[i].resource_type == r->resource_type && !strcmp(sk_navigations[i].url, r->url)) {
+            active = sk_navigations[i].user_gesture;
+            memcpy(initiator, sk_navigations[i].initiator, sizeof(initiator));
+            found = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&sk_navigation_lock);
+    /* CEF reports "null" even for browser-initiated navigations. */
+    if (r->resource_type == RT_MAIN_FRAME && (found ? !*initiator : !*r->initiator)) {
+        initiator[0] = 0;
+        active = 1;
+    }
+    /* Presentation metadata never replaces the CEF initiator used by policy. */
+    r->fetch_initiator = strdup(found || active ? initiator : r->initiator);
+    r->user_activation = active;
+    return r->fetch_initiator != NULL;
+}
+
 static void CEF_CALLBACK sk_request_add_ref(cef_base_ref_counted_t *base) {
     atomic_fetch_add_explicit(&((struct sk_request_handler *)base)->refs, 1, memory_order_relaxed);
 }
@@ -1398,7 +1579,7 @@ static int sk_copy_request(struct sk_handler *h, cef_request_t *request) {
         free(elements); sk_release_arg(&post->base);
     }
     struct sk_origin target;
-    return ok && sk_validate(r, h->header_len, &target);
+    return ok && sk_navigation_metadata(r, h->browser_id) && sk_validate(r, h->header_len, &target);
 }
 
 cef_resource_handler_t *sk_web_untrusted_resource(cef_request_t *request,
@@ -1465,6 +1646,9 @@ void sk_web_untrusted_stop(void) {
     while (sk_worker_count || sk_queue_count) pthread_cond_wait(&sk_workers_done, &sk_workers_lock);
     pthread_mutex_unlock(&sk_workers_lock);
     sk_broker_pid = 0;
+    pthread_mutex_lock(&sk_navigation_lock);
+    memset(sk_navigations, 0, sizeof(sk_navigations));
+    pthread_mutex_unlock(&sk_navigation_lock);
     if (sk_socket_path[0]) unlink(sk_socket_path);
     sk_socket_path[0] = 0;
     /* Restart is supported only at the same pre-thread lifecycle boundary. */
@@ -1481,6 +1665,9 @@ int sk_web_untrusted_no_core(void) { return 0; }
 int sk_web_untrusted_start(const char *private_dir) { (void)private_dir; return 0; }
 int sk_web_untrusted_confine(void) { return 0; }
 void sk_web_untrusted_stop(void) {}
+void sk_web_untrusted_navigation(cef_request_t *request, cef_frame_t *frame, int browser_id, int user_gesture) {
+    (void)request; (void)frame; (void)browser_id; (void)user_gesture;
+}
 cef_resource_request_handler_t *sk_web_untrusted_request_handler(
     const cef_resource_request_handler_t *callbacks, cef_request_t *request,
     int is_navigation, int is_download, const cef_string_t *request_initiator) {

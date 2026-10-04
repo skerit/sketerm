@@ -7072,7 +7072,7 @@ fn onBeforeBrowse(
     browser: [*c]cef.cef_browser_t,
     frame: [*c]cef.cef_frame_t,
     request: [*c]cef.cef_request_t,
-    _: c_int,
+    user_gesture: c_int,
     _: c_int,
 ) callconv(.c) c_int {
     defer releaseArg(browser);
@@ -7092,6 +7092,9 @@ fn onBeforeBrowse(
     // A refusal settles it terminally inside `refuseNavigation`.
     const settles = main and v.initial_url != null and !Host.bootstrapLoad(v, url.slice());
     if (!host.refuseNavigation(v, url.slice(), main)) {
+        if (untrusted.enabled and browser != null) {
+            if (browser.*.get_identifier) |get_id| cef.sk_web_untrusted_navigation(req, frame, get_id(browser), user_gesture);
+        }
         if (settles) host.settleInitialNavigation(v, false);
         return 0;
     }

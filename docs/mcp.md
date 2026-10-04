@@ -818,6 +818,18 @@ the navigation hook. Native Chromium extensions and default background
 components are disabled in addition to withholding Sketerm extension APIs;
 this does not claim that Chromium contains no internal component-extension code.
 
+The HTTP broker reconstructs `Sec-Fetch-Dest`, `Sec-Fetch-Mode`,
+`Sec-Fetch-Site` and activated-navigation `Sec-Fetch-User` because CEF's
+intercepted header map precedes Chromium's network-service metadata step.
+Document/iframe navigation, classic and CORS/module libraries, images, fonts
+and default fetch/XHR receive metadata on HTTPS and trustworthy loopback HTTP
+origins. Copied `Sec-Fetch-*` fields are replaced. Navigation origin and
+activation come from native callbacks and do not change policy authorization.
+Same-site subdomain classification uses curl's runtime libpsl when available;
+without it, different hosts are conservatively classified cross-site. CEF
+does not expose arbitrary fetch modes or audio/video destination distinctions,
+so this is not full Fetch Metadata fidelity for every resource shape.
+
 Untrusted refusals are counted in `web_policy` and `web_network` under these
 reasons, beside the ordinary ones: `resolved_private_address`,
 `untrusted_http` (an unsupported HTTP shape), `untrusted_transport` (a lane

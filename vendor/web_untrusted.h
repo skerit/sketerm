@@ -2,6 +2,7 @@
 #define SK_WEB_UNTRUSTED_H
 
 #include "include/capi/cef_resource_request_handler_capi.h"
+#include "include/capi/cef_frame_capi.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -51,6 +52,9 @@ int sk_web_untrusted_job_landlock(void);
 int sk_web_untrusted_confine(void);
 /* Call outside CEF callbacks, before cef_shutdown; joins outstanding loader work. */
 void sk_web_untrusted_stop(void);
+
+/* Borrows the UI-thread navigation request; resource requests have different IDs. */
+void sk_web_untrusted_navigation(cef_request_t *request, cef_frame_t *frame, int browser_id, int user_gesture);
 
 /* Borrows all arguments, copies stateless callbacks and trusted CEF metadata, and returns
  * one owned reference; NULL leaves disable_default_handling in force. */
