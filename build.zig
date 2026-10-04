@@ -791,6 +791,31 @@ pub fn build(b: *std.Build) void {
     const smoke_lsp_step = b.step("smoke-lsp-gui", "Drive the real editor GUI against a real language server (headless, no X)");
     smoke_lsp_step.dependOn(&smoke_lsp_run.step);
 
+    // Agent glance GUI smoke — `zig build smoke-agents-gui`. Same rig as
+    // smoke-lsp-gui; plays an MCP server through the registry's own
+    // writer and asserts the pane titlebar chip, the tab badge and the
+    // chip's popover follow its record (src/smoke_agents_gui.zig).
+    const smoke_agents_mod = b.createModule(.{
+        .root_source_file = b.path("src/smoke_agents_gui.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    configureSysDeps(b, smoke_agents_mod, cbindings_mod);
+    smoke_agents_mod.addImport("build_options", glib_opts_mod);
+    addVideo(b, smoke_agents_mod); // runtime-loaded video codec shims (no-op without -Dvideo)
+    const smoke_agents = b.addExecutable(.{
+        .name = "sketerm-smoke-agents-gui",
+        .root_module = smoke_agents_mod,
+        .use_lld = use_lld,
+    });
+    const smoke_agents_run = b.addRunArtifact(smoke_agents);
+    smoke_agents_run.step.dependOn(&install_exe.step);
+    smoke_agents_run.step.dependOn(&install_mux.step);
+    smoke_agents_run.setCwd(b.path("."));
+    const smoke_agents_step = b.step("smoke-agents-gui", "Sub-agent titlebar chip, tab badge and popover on the real GUI (headless, no X)");
+    smoke_agents_step.dependOn(&smoke_agents_run.step);
+
     // AT-SPI accessibility smoke — `zig build smoke-atspi` (Linux).
     // Same self-hosted rig as smoke-e2e, PLUS a private accessibility
     // bus (dbus-daemon + at-spi2-registryd via mux/a11yhub.zig): the
