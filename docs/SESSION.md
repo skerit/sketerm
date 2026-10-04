@@ -1,5 +1,28 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-04: agent tools: resume, answers, times, activity, selectors, optional TUI
+
+Resuming a huge opencode session no longer fails `TooLarge`: resume and a
+stream resync read the session's newest 50 messages (`?limit=`, halved while
+the reply exceeds `http.MAX_BODY`), and history still arms nothing. A refused
+`agent_answer` says what would have worked: an opencode prompt with several
+questions lists each with its options and accepted forms, a bad choice names
+the forms, and `agent_send` to an asking agent points at `agent_answer` with
+the prompt. A plain `agent_interrupt` now types this server's dropped queued
+prompts again, as `agent_send interrupt` did. Records and events carry `at`
+(ISO-8601 local with offset), `agent_list` adds `last_activity_at` /
+`active_at`, and the waiter line says `done at 11:32`. `agent_read detail:
+"activity"` is a small glance (state, last activity, last tool calls by name
+and time) that hands nothing out; a busy Claude turn's calls are read off its
+screen (`Agent.recentTools`), which the `stalled` event now names too, with
+the last activity's time. One selector grammar (`src/agent/selector.zig`:
+`*`, `host:<name>`, `state:<state>`) serves `agent_send`/`agent_wait`/
+`agent_close` and `agent_list`'s filters; `agent_close` takes several or
+`exited: true`, and `agent_list` hides gone agents unless `include_exited`.
+opencode's attached TUI is off by default (`launch.attach_default`):
+`agent_open tui` / `agent_set tui` start and stop it, the descriptor keeps the
+setting, and a TUI that is gone no longer fails a re-attach.
+
 ## 2026-10-04: mcp_agent.zig split by concern (no behaviour change)
 
 The 7,121-line `src/ipc/mcp_agent.zig` is now a facade plus eight sibling
