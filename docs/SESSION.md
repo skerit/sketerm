@@ -1,5 +1,23 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-04: mcp_agent.zig split by concern (no behaviour change)
+
+The 7,121-line `src/ipc/mcp_agent.zig` is now a facade plus eight sibling
+modules, following the `daemon.zig` + `daemon_*.zig` shape: the facade keeps
+the shared state (`state`, `Entry`), the tool dispatch (`agentTool`) and the
+public entry points, re-exported so `mcp.zig`/`mcp_caps.zig` still call
+`mcp_agent.*`; siblings import it for `state`/`Entry` and alias what they use
+from each other. `mcp_agent_loop` (server loop, pump and waits,
+reconnection, retry, sweep), `_open` (agent_adapters/agent_open/spawn),
+`_act` (prompts, the send path, recipes, relaunch, templates), `_talk` (the
+tools on a running agent), `_results`, `_waiter` (push + waiter socket),
+`_index` (per-user index, ownership, reattach), `_hosts` (host stats, caps,
+facts) and `_testkit` (shared test rigs). Bodies moved verbatim: every
+original line is in exactly one file; the additions are module docs,
+imports, alias lines, `pub` on what crosses a file, and two section headers.
+Tests moved with their code; `dist/test-test-roots.sh` classifies
+`ipc/mcp_agent_*.zig` like `mcp_agent.zig` (GUI root only).
+
 ## 2026-10-04: swallowed-error audit (`catch {}` in shipped code)
 
 Every `catch {}` outside the smoke/bench rigs and test blocks was visited
