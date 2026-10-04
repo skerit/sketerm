@@ -205,6 +205,13 @@ fn onPaneChipClicked(ctx: ?*anyopaque, pane: *Pane) void {
     @import("assistants.zig").openForPane(self, pane);
 }
 
+/// The pane's agents chip is opening its popover: fill it with the
+/// agents of that session.
+fn onPaneAgentsPopover(ctx: ?*anyopaque, pane: *Pane, popover: *c.GtkWidget) void {
+    const self = cast.userData(Window, ctx);
+    @import("assistants.zig").fillPaneAgents(self, pane, popover);
+}
+
 fn onPaneContinuousFrames(ctx: ?*anyopaque, _: *Pane) void {
     const self = cast.userData(Window, ctx);
     self.syncWindowGraphicsOffload();
@@ -1843,6 +1850,7 @@ pub const Window = struct {
             .on_cmd_status = termsinks_mod.onTermCmdStatus,
             .on_bell = termsinks_mod.onTermBell,
             .on_chip = onPaneChipClicked,
+            .on_agents = onPaneAgentsPopover,
             .on_child_exit = termsinks_mod.onTermChildExit,
             .on_continuous_frames = onPaneContinuousFrames,
             .on_crashed = onPaneCrashed,

@@ -46,6 +46,8 @@ else
 const menu = @import("menu.zig");
 const paneface = @import("paneface.zig");
 const panetitlebar = @import("panetitlebar.zig");
+const agentbadge = @import("agentbadge.zig");
+const AgentTally = @import("../ipc/agentglance.zig").Tally;
 const clipboard = @import("clipboard.zig");
 const MouseAction = @import("../config.zig").MouseAction;
 pub const InputCtx = input.Ctx;
@@ -92,6 +94,9 @@ pub const WindowSinks = struct {
     /// The titlebar lease chip was clicked (Window opens the assistant
     /// surface for this pane's session).
     on_chip: ?*const fn (ctx: ?*anyopaque, pane: *Pane) void = null,
+    /// The titlebar agents chip's popover is opening: Window fills it
+    /// with this session's agents.
+    on_agents: ?*const fn (ctx: ?*anyopaque, pane: *Pane, popover: *c.GtkWidget) void = null,
     /// BEL, for tab-bar attention.
     on_bell: ?*const fn (ctx: ?*anyopaque, pane: *Pane) void = null,
     /// The pane gained keyboard focus: Window records it as its tab's
@@ -255,6 +260,9 @@ pub const Pane = struct {
     app: AppView = .{},
     /// The per-pane title bar (src/ui/panetitlebar.zig).
     titlebar: panetitlebar.Titlebar = .{},
+    /// Sub-agents of the MCP servers running in this pane's session, as
+    /// last handed in by `setAgentTally`.
+    agent_tally: AgentTally = .{},
     /// The terminal was a watcher at the last roster update; its end is
     /// when the grid starts following the allocation again.
     was_watching: bool = false,
@@ -358,6 +366,13 @@ pub const Pane = struct {
         const tb_apps = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 2);
         c.gtk_widget_set_visible(tb_apps, 0);
         c.gtk_box_append(@ptrCast(tb_box), tb_apps);
+
+        // Sub-agents chip: what the assistants running in this session
+        // have delegated, and the way to their agents. Its popover is
+        // filled by the Window each time it opens.
+        const tb_agents = agentbadge.Chip.build();
+        _ = c.g_signal_connect_data(tb_agents.popover, "show", @ptrCast(&onAgentsPopoverShow), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        c.gtk_box_append(@ptrCast(tb_box), tb_agents.button);
 
         // Lease/roster chip: who is driving this session, and the way
         // back to the controller lease from a view-only attach.
@@ -466,6 +481,7 @@ pub const Pane = struct {
         self.titlebar.chip = tb_chip;
         self.titlebar.chip_label = @ptrCast(@alignCast(tb_chip_label));
         self.titlebar.take_btn = tb_take;
+        self.titlebar.agents = tb_agents;
 
         // The widgets-dead fence: closing a pane destroys its widget
         // subtree immediately while Pane.deinit is deferred, so late
@@ -771,6 +787,17 @@ pub const Pane = struct {
     /// Re-read the lease chip (a watch's lease changed, a page ended).
     pub fn refreshLeaseChip(self: *Pane) void {
         updateTitlebarActivity(self);
+    }
+
+    /// The agents of this pane's session (`assistants.zig`, every roster
+    /// refresh). An unchanged tally touches no widget, so the 3 s tick
+    /// can never flap the titlebar or resize the grid.
+    pub fn setAgentTally(self: *Pane, tally: AgentTally) void {
+        if (self.widgets_dead or self.agent_tally.eql(tally)) return;
+        const was_shown = self.agent_tally.total > 0;
+        self.agent_tally = tally;
+        if (self.titlebar.agents) |*chip| _ = chip.set(tally);
+        if (was_shown != (tally.total > 0)) updateTitlebarActivity(self);
     }
 
     pub fn severFaces(self: *Pane) void {
@@ -1902,7 +1929,7 @@ fn updateTitlebarActivity(self: *Pane) void {
     rebuildTitlebarApps(self);
     const view_only = updateControlChip(self);
     self.titlebar.auto = self.titlebar.apps_shown or view_only or
-        self.terminal.peer_drivers > 0;
+        self.terminal.peer_drivers > 0 or self.agent_tally.total > 0;
     self.applyTitlebarVisibility();
 }
 
@@ -2023,6 +2050,13 @@ fn onChipClicked(gesture: ?*c.GtkGestureClick, _: c_int, _: f64, _: f64, user: ?
     if (self.widgets_dead) return;
     if (gesture) |g| _ = c.gtk_gesture_set_state(@ptrCast(g), c.GTK_EVENT_SEQUENCE_CLAIMED);
     if (self.sinks.on_chip) |f| f(self.sinks.ctx, self);
+}
+
+/// The agents chip's popover is opening: let the Window fill it.
+fn onAgentsPopoverShow(popover: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
+    const self = cast.userData(Pane, user);
+    if (self.widgets_dead) return;
+    if (self.sinks.on_agents) |f| f(self.sinks.ctx, self, popover);
 }
 
 /// Titlebar "Take control": acquire the lease if free, evict the

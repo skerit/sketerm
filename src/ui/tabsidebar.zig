@@ -35,6 +35,7 @@
 //! rather than rebuilding the list under the user's pointer.
 
 const std = @import("std");
+const agentbadge = @import("agentbadge.zig");
 const c = @import("../c.zig").c;
 const cast = @import("../util/cast.zig");
 const cssutil = @import("cssutil.zig");
@@ -253,6 +254,8 @@ pub const Sidebar = struct {
         item: Item,
         row: *c.GtkWidget,
         label: *c.GtkWidget,
+        /// A window tab's sub-agent badge; null on a browser page row.
+        agents: ?agentbadge.Badge = null,
     };
 
     const TitleCtx = struct {
@@ -507,6 +510,13 @@ pub const Sidebar = struct {
         c.gtk_widget_add_css_class(label, "sketerm-tst-title");
         c.gtk_box_append(@ptrCast(box), label);
 
+        // The same badge the strip's tab wears, from the same page state.
+        const agents: ?agentbadge.Badge = switch (item) {
+            .tab => |page| agentbadge.Badge.build(agentbadge.pageGlance(page)),
+            .page => null,
+        };
+        if (agents) |b| c.gtk_box_append(@ptrCast(box), b.box);
+
         const close = c.gtk_button_new_from_icon_name("window-close-symbolic");
         c.gtk_button_set_has_frame(@ptrCast(close), 0);
         c.gtk_widget_add_css_class(close, "flat");
@@ -531,6 +541,7 @@ pub const Sidebar = struct {
             .item = item,
             .row = row,
             .label = label,
+            .agents = agents,
         };
         self.retain();
         c.g_object_set_data_full(@ptrCast(row), ROW_QDATA, @ptrCast(r), @ptrCast(&freeRow));
@@ -602,6 +613,18 @@ pub const Sidebar = struct {
                 defer sidebar.allocator.free(z);
                 c.gtk_label_set_text(@ptrCast(r.label), z.ptr);
             },
+        }
+    }
+
+    /// A page's agent glance changed (`assistants.zig`): repaint its row's badge.
+    pub fn refreshAgents(self: *Sidebar, page: *c.AdwTabPage) void {
+        for (self.rows.items) |r| {
+            switch (r.item) {
+                .tab => |p| if (p == page) {
+                    if (r.agents) |*b| b.set(agentbadge.pageGlance(page));
+                },
+                .page => {},
+            }
         }
     }
 

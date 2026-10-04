@@ -20,9 +20,12 @@
 //! agent's sessions attach where `watchSpec` says: the instance daemon,
 //! or `route:A/B` for one placed on B.
 //!
-//! The result feeds three surfaces: the chip at the end of the tab bar
-//! with its popover, the per-pane "AI attached" chip's click, and the
-//! Session Overview's assistant daemons and agent rows.
+//! The result feeds four surfaces: the chip at the end of the tab bar
+//! with its popover, the per-pane "AI attached" chip's click, the
+//! Session Overview's assistant daemons and agent rows, and the agent
+//! glance: each pane whose session an assistant runs in gets its
+//! agents' tally (titlebar chip + popover, `agentbadge.zig`), each tab
+//! the sum over its panes (`refreshGlances`, `ipc/agentglance.zig`).
 //!
 //! Disappearance is normal, not an error: an isolated instance's
 //! daemon retires after 120 s idle and a web session has a 60 s
@@ -48,6 +51,11 @@ const muxtabs = @import("muxtabs.zig");
 const editorio = @import("editorio.zig");
 const webwatch = @import("webwatch.zig");
 const webpresence = @import("../web/webpresence.zig");
+const sockpath = @import("../mux/sockpath.zig");
+const strz = @import("../util/strz.zig");
+const vocab = @import("../agent/vocab.zig");
+const glance = @import("../ipc/agentglance.zig");
+const agentbadge = @import("agentbadge.zig");
 const winmod = @import("window.zig");
 const Window = winmod.Window;
 const Pane = @import("pane.zig").Pane;
@@ -109,6 +117,9 @@ pub const Agent = struct {
     sessions: [][]u8,
     /// Host spec its sessions attach at (`sshroute.watchSpec`).
     watch: []u8,
+    /// Null = unknown (a server that predates publishing it).
+    attention: ?vocab.Attention = null,
+    state: ?vocab.State = null,
 
     fn deinit(self: *Agent, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
@@ -174,6 +185,11 @@ pub const Assistant = struct {
     instance: []const u8 = &.{},
     agents: std.ArrayList(Agent) = .empty,
     agents_fp: u64 = 0,
+    /// The pane session it was started from and that session's daemon
+    /// socket (on its own host); null = none, or a server or daemon
+    /// too old to say (then no pane shows its agents).
+    session: ?[]u8 = null,
+    session_socket: ?[]u8 = null,
     /// The last poll of its own daemon; for a remote one only while a
     /// surface that shows it is open.
     listing: ?Listing = null,
@@ -213,12 +229,33 @@ pub const Assistant = struct {
         allocator.free(self.host);
         if (self.reached) |r| allocator.free(r);
         allocator.free(self.instance);
+        if (self.session) |v| allocator.free(v);
+        if (self.session_socket) |v| allocator.free(v);
         self.clearAgents(allocator);
         self.agents.deinit(allocator);
         if (self.listing) |*l| l.deinit();
         self.clearSessions(allocator);
         self.sessions.deinit(allocator);
         if (self.conn) |*conn| conn.deinit();
+    }
+
+    pub fn origin(self: *const Assistant) glance.Origin {
+        return .{ .reached = self.reached, .session = self.session, .session_socket = self.session_socket };
+    }
+
+    /// Record where the server was started. @return whether it changed.
+    fn setOrigin(self: *Assistant, allocator: std.mem.Allocator, session: ?[]const u8, socket: ?[]const u8) bool {
+        if (strEqOpt(self.session, session) and strEqOpt(self.session_socket, socket)) return false;
+        const new_session = if (session) |v| allocator.dupe(u8, v) catch return false else null;
+        const new_socket = if (socket) |v| allocator.dupe(u8, v) catch {
+            if (new_session) |ns| allocator.free(ns);
+            return false;
+        } else null;
+        if (self.session) |v| allocator.free(v);
+        if (self.session_socket) |v| allocator.free(v);
+        self.session = new_session;
+        self.session_socket = new_socket;
+        return true;
     }
 
     fn clearSessions(self: *Assistant, allocator: std.mem.Allocator) void {
@@ -287,7 +324,14 @@ pub const Assistant = struct {
             sessions[n] = try allocator.dupe(u8, s);
             n += 1;
         }
-        try self.agents.append(allocator, .{ .id = id, .app = app, .sessions = sessions, .watch = watch });
+        try self.agents.append(allocator, .{
+            .id = id,
+            .app = app,
+            .sessions = sessions,
+            .watch = watch,
+            .attention = ag.attentionOrState(),
+            .state = ag.stateFact(),
+        });
     }
 
     /// Rebuild the rows from the last listing and the agents: the
@@ -364,23 +408,15 @@ fn agentsFingerprint(src: ?[]const mcp_registry.Agent) u64 {
         hash = std.hash.Wyhash.hash(hash, ag.app);
         hash = std.hash.Wyhash.hash(hash, ag.location);
         for (ag.sessions) |s| hash = std.hash.Wyhash.hash(hash, s);
+        // Absent and empty must differ: an older server's agent is unknown.
+        hash = std.hash.Wyhash.hash(hash, ag.attention orelse "\x00");
+        hash = std.hash.Wyhash.hash(hash, ag.state orelse "\x00");
     }
     return hash;
 }
 
-/// Whether `host`'s list reply describes ANOTHER machine's registry, i.e.
-/// a remote per-user daemon. Null and `sock:` are this machine (the
-/// local registry already covers it); a route ending in an instance is
-/// a daemon some report already led here.
-pub fn reportsRemote(host: ?[]const u8) bool {
-    const h = host orelse return false;
-    if (h.len == 0 or std.mem.startsWith(u8, h, "sock:")) return false;
-    if (sshroute.RouteSpec.isRoute(h)) {
-        const r = sshroute.RouteSpec.parse(h) catch return false;
-        return r.instance == null;
-    }
-    return true;
-}
+/// Whether `host`'s list reply describes ANOTHER machine's registry.
+pub const reportsRemote = glance.remotePerUser;
 
 /// The machine a host spec reaches, for people: `box`, `b via a`, or
 /// `this machine`; a route's instance is not a place.
@@ -489,6 +525,7 @@ fn refreshRemote(allocator: std.mem.Allocator, a: *Assistant, host: []const u8, 
     var changed = false;
     a.pid = rep.pid;
     a.mode = modeOf(rep.mode);
+    if (a.setOrigin(allocator, rep.session, rep.session_socket)) changed = true;
     if (remoteName(allocator, host, rep)) |name| {
         if (std.mem.eql(u8, name, a.name)) allocator.free(name) else {
             allocator.free(a.name);
@@ -524,6 +561,7 @@ fn addRemote(allocator: std.mem.Allocator, roster: *std.ArrayList(Assistant), ho
         .instance = instance,
     });
     const a = &roster.items[roster.items.len - 1];
+    _ = a.setOrigin(allocator, rep.session, rep.session_socket);
     _ = a.setAgents(allocator, rep.agents);
     a.rebuildRows(allocator);
 }
@@ -803,7 +841,9 @@ pub const Watcher = struct {
                 changed = true;
             }
         }
-        if (changed) self.refreshChip();
+        // Every tick, changed or not: a pane opened since the last one
+        // needs its tally, and an unchanged one costs no widget work.
+        if (changed) self.refreshChip() else self.refreshGlances();
     }
 
     fn applyRegistry(self: *Watcher, entries: []const mcp_registry.Entry) bool {
@@ -814,6 +854,7 @@ pub const Watcher = struct {
         for (entries) |entry| {
             if (self.findByPid(entry.pid)) |a| {
                 a.seen = true;
+                if (a.setOrigin(self.allocator, entry.session, entry.session_socket)) changed = true;
                 if (a.setAgents(self.allocator, entry.agents)) {
                     a.rebuildRows(self.allocator);
                     changed = true;
@@ -861,6 +902,7 @@ pub const Watcher = struct {
             .host = host,
         });
         const a = &self.roster.items[self.roster.items.len - 1];
+        _ = a.setOrigin(allocator, entry.session, entry.session_socket);
         _ = a.setAgents(allocator, entry.agents);
         a.rebuildRows(allocator);
     }
@@ -969,6 +1011,7 @@ pub const Watcher = struct {
     /// Paint the chip from the roster. Hidden while nothing is live.
     fn refreshChip(self: *Watcher) void {
         if (self.dead or self.widgets_dead) return;
+        self.refreshGlances();
         var buf: [128:0]u8 = undefined;
         const text = chipLabel(buf[0 .. buf.len - 1], self.roster.items.len, summarize(self.roster.items));
         if (text.len == 0) {
@@ -992,6 +1035,152 @@ pub const Watcher = struct {
         c.gtk_widget_set_tooltip_text(self.chip, tip[0..n :0].ptr);
         c.gtk_widget_set_visible(self.chip, 1);
         if (c.gtk_widget_get_visible(self.popover) != 0) self.buildPopover();
+    }
+
+    // ── agent glance (pane chips, tab badges) ──────────────────
+
+    /// Hand every pane its session's agent tally and every tab the sum
+    /// over its panes; only a changed tally or badge touches a widget.
+    fn refreshGlances(self: *Watcher) void {
+        if (self.dead or self.widgets_dead) return;
+        var sock_buf: [640]u8 = undefined;
+        const default_socket = defaultSocket(&sock_buf);
+        for (self.win.panes.items) |pane| pane.setAgentTally(self.tallyFor(pane, default_socket));
+        self.refreshTabGlances();
+    }
+
+    fn refreshTabGlances(self: *Watcher) void {
+        var leaves: std.ArrayList(*Pane) = .empty;
+        defer leaves.deinit(self.allocator);
+        const n = c.adw_tab_view_get_n_pages(self.win.tab_view);
+        var i: c_int = 0;
+        while (i < n) : (i += 1) {
+            const page = c.adw_tab_view_get_nth_page(self.win.tab_view, i) orelse continue;
+            const tree = Window.tabTreeOf(page) orelse continue;
+            leaves.clearRetainingCapacity();
+            tree.appendLeaves(self.allocator, &leaves) catch continue;
+            var total: glance.Tally = .{};
+            for (leaves.items, 0..) |pane, k| {
+                // Two panes viewing one session show its agents once.
+                if (viewsSameSession(leaves.items[0..k], pane)) continue;
+                total.merge(pane.agent_tally);
+            }
+            if (agentbadge.setPageGlance(page, .of(total))) {
+                self.win.tabbar.refreshAgents(page);
+                if (self.win.tab_sidebar) |sb| sb.refreshAgents(page);
+            }
+        }
+    }
+
+    /// The agents of every server running in `pane`'s session.
+    fn tallyFor(self: *Watcher, pane: *Pane, default_socket: []const u8) glance.Tally {
+        const at = paneSession(pane) orelse return .{};
+        var tally: glance.Tally = .{};
+        for (self.roster.items) |*a| {
+            if (!glance.runsIn(a.origin(), at, default_socket)) continue;
+            for (a.agents.items) |ag| tally.add(ag.attention);
+        }
+        return tally;
+    }
+
+    /// Fill a pane's agents popover: one row per agent of the servers
+    /// running in its session, and the way to the whole roster.
+    fn buildPaneAgents(self: *Watcher, pane: *Pane, popover: *c.GtkWidget) void {
+        if (self.dead or self.widgets_dead) return;
+        const pop: *c.GtkPopover = @ptrCast(popover);
+        c.gtk_popover_set_child(pop, null);
+        const root = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 4).?;
+        c.gtk_widget_set_margin_start(root, 6);
+        c.gtk_widget_set_margin_end(root, 6);
+        c.gtk_widget_set_margin_top(root, 6);
+        c.gtk_widget_set_margin_bottom(root, 6);
+        const head = c.gtk_label_new("Agents of this pane").?;
+        c.gtk_label_set_xalign(@ptrCast(head), 0);
+        c.gtk_widget_add_css_class(head, "heading");
+        c.gtk_box_append(@ptrCast(root), head);
+        var sock_buf: [640]u8 = undefined;
+        const default_socket = defaultSocket(&sock_buf);
+        var rows: usize = 0;
+        var first_key: []const u8 = "";
+        if (paneSession(pane)) |at| {
+            for (self.roster.items) |*a| {
+                if (!glance.runsIn(a.origin(), at, default_socket)) continue;
+                if (first_key.len == 0) first_key = a.host;
+                var sub_buf: [320:0]u8 = undefined;
+                const sub = std.fmt.bufPrintZ(&sub_buf, "{s}, pid {d}", .{ a.label(), a.pid }) catch "sketerm mcp";
+                const sub_label = c.gtk_label_new(sub.ptr).?;
+                c.gtk_label_set_xalign(@ptrCast(sub_label), 0);
+                c.gtk_label_set_ellipsize(@ptrCast(sub_label), c.PANGO_ELLIPSIZE_MIDDLE);
+                c.gtk_widget_add_css_class(sub_label, "dim-label");
+                c.gtk_widget_add_css_class(sub_label, "caption");
+                c.gtk_box_append(@ptrCast(root), sub_label);
+                for (a.agents.items, 0..) |*ag, i| {
+                    self.appendAgentRow(root, a, ag, @intCast(i));
+                    rows += 1;
+                }
+            }
+        }
+        if (rows == 0) {
+            const none = c.gtk_label_new("No agents are running in this session.").?;
+            c.gtk_label_set_xalign(@ptrCast(none), 0);
+            c.gtk_widget_add_css_class(none, "dim-label");
+            c.gtk_box_append(@ptrCast(root), none);
+        }
+        c.gtk_box_append(@ptrCast(root), c.gtk_separator_new(c.GTK_ORIENTATION_HORIZONTAL).?);
+        const foot = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8).?;
+        const all = c.gtk_button_new_with_label("All assistants and agents").?;
+        c.gtk_widget_add_css_class(all, "flat");
+        c.gtk_widget_set_hexpand(all, 1);
+        c.gtk_widget_set_halign(all, c.GTK_ALIGN_START);
+        if (RosterCtx.create(self.allocator, self, popover, first_key)) |ctx| {
+            _ = c.g_signal_connect_data(all, "clicked", @ptrCast(&onRosterClicked), @ptrCast(ctx), @ptrCast(cast.destroyCtx(RosterCtx)), c.G_CONNECT_DEFAULT);
+        }
+        c.gtk_box_append(@ptrCast(foot), all);
+        const note = c.gtk_label_new("Watching never sends input").?;
+        c.gtk_widget_set_valign(note, c.GTK_ALIGN_CENTER);
+        c.gtk_widget_add_css_class(note, "dim-label");
+        c.gtk_widget_add_css_class(note, "caption");
+        c.gtk_box_append(@ptrCast(foot), note);
+        c.gtk_box_append(@ptrCast(root), foot);
+        c.gtk_popover_set_child(pop, root);
+    }
+
+    fn appendAgentRow(self: *Watcher, root: *c.GtkWidget, a: *Assistant, ag: *const Agent, index: u16) void {
+        const row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 10).?;
+        c.gtk_widget_set_margin_top(row, 4);
+        c.gtk_widget_set_margin_bottom(row, 4);
+        const glyph = agentbadge.newGlyph(ag.attention, .theme);
+        c.gtk_widget_set_size_request(glyph, 16, 16);
+        c.gtk_box_append(@ptrCast(row), glyph);
+        const identity = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 2).?;
+        c.gtk_widget_set_hexpand(identity, 1);
+        const title = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 0).?;
+        var id_buf: [128:0]u8 = undefined;
+        const id_label = c.gtk_label_new(strz.copyZ(&id_buf, ag.id)).?;
+        c.gtk_widget_add_css_class(id_label, "monospace");
+        c.gtk_box_append(@ptrCast(title), id_label);
+        var place_buf: [256]u8 = undefined;
+        var on_buf: [280:0]u8 = undefined;
+        const on = std.fmt.bufPrintZ(&on_buf, " on {s}", .{placeLabel(&place_buf, ag.watch)}) catch "";
+        const on_label = c.gtk_label_new(on.ptr).?;
+        c.gtk_widget_add_css_class(on_label, "heading");
+        c.gtk_box_append(@ptrCast(title), on_label);
+        c.gtk_box_append(@ptrCast(identity), title);
+        var status_buf: [64:0]u8 = undefined;
+        const status = c.gtk_label_new(statusText(&status_buf, ag.attention).ptr).?;
+        c.gtk_label_set_xalign(@ptrCast(status), 0);
+        c.gtk_widget_add_css_class(status, "caption");
+        c.gtk_widget_add_css_class(status, agentbadge.themeClass(ag.attention));
+        c.gtk_box_append(@ptrCast(identity), status);
+        c.gtk_box_append(@ptrCast(row), identity);
+        // The agent's first session (its app; opencode's server is the
+        // second) is what Watch and Take control attach.
+        for (a.sessions.items) |*s| {
+            if (s.agent != index) continue;
+            self.appendAttachButtons(row, a, s, false);
+            break;
+        }
+        c.gtk_box_append(@ptrCast(root), row);
     }
 
     fn preferred(self: *const Watcher) []const u8 {
@@ -1137,6 +1326,13 @@ pub const Watcher = struct {
             c.gtk_box_append(@ptrCast(card), row);
             c.gtk_box_append(@ptrCast(card), controls);
         }
+        self.appendAttachButtons(controls, a, s, s.kind == .web and a.reached == null);
+        c.gtk_box_append(@ptrCast(section), card);
+    }
+
+    /// Watch and Take control for one roster row (and Show beside pane
+    /// when `beside_ok`), each button owning its `RowCtx`.
+    fn appendAttachButtons(self: *Watcher, controls: *c.GtkWidget, a: *Assistant, s: *Session, beside_ok: bool) void {
         const placement = self.win.sessionPlacement(s.name, s.attachHost(a));
         const actions = [_]struct { lease: muxtabs.Lease, beside: bool = false }{
             .{ .lease = .read_only }, .{ .lease = .control }, .{ .lease = .read_only, .beside = true },
@@ -1144,7 +1340,7 @@ pub const Watcher = struct {
         for (actions) |action| {
             // Beside relocates a LOCAL helper's observer; a remote watch
             // has no such placement yet.
-            if (action.beside and (s.kind != .web or a.reached != null)) continue;
+            if (action.beside and !beside_ok) continue;
             const lease = action.lease;
             const verb: AttachVerb = if (action.beside) .{
                 .icon = "view-dual-symbolic",
@@ -1168,7 +1364,6 @@ pub const Watcher = struct {
             _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onRowClicked), @ptrCast(ctx), @ptrCast(&freeRowCtx), c.G_CONNECT_DEFAULT);
             c.gtk_box_append(@ptrCast(controls), btn);
         }
-        c.gtk_box_append(@ptrCast(section), card);
     }
 
     /// Attach `session` of the assistant keyed `key` (at `attach_host`)
@@ -1346,7 +1541,7 @@ fn freeRowCtx(user: ?*anyopaque, _: ?*c.GClosure) callconv(.c) void {
     ctx.allocator.destroy(ctx);
 }
 
-fn onRowClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+fn onRowClicked(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const ctx = cast.userData(RowCtx, user);
     // The popover is rebuilt while it is open, which frees this row's
     // button and with it this context: copy what the attach needs
@@ -1360,7 +1555,78 @@ fn onRowClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const key = copyInto(&key_buf, ctx.key) orelse return;
     const name = copyInto(&name_buf, ctx.session) orelse return;
     const host = copyInto(&host_buf, ctx.attach_host) orelse return;
+    // A pane's agents popover is not the watcher's own: close it now
+    // (the watcher's closes when the attach lands, a failure is a toast).
+    if (c.gtk_widget_get_ancestor(@ptrCast(btn), c.gtk_popover_get_type())) |pop| {
+        const w: *c.GtkWidget = @ptrCast(pop);
+        if (w != watcher.popover) c.gtk_popover_popdown(@ptrCast(w));
+    }
     watcher.startAttach(key, name, host, lease, beside);
+}
+
+/// "All assistants and agents" in a pane's agents popover.
+const RosterCtx = struct {
+    allocator: std.mem.Allocator,
+    watcher: *Watcher,
+    /// The pane's agents popover; the button lives inside it.
+    popover: *c.GtkWidget,
+    /// The assistant to list first (`Assistant.host`), possibly empty.
+    key_buf: [512]u8 = undefined,
+    key_len: usize = 0,
+
+    fn create(allocator: std.mem.Allocator, watcher: *Watcher, popover: *c.GtkWidget, key: []const u8) ?*RosterCtx {
+        if (key.len > 512) return null;
+        const ctx = allocator.create(RosterCtx) catch return null;
+        ctx.* = .{ .allocator = allocator, .watcher = watcher, .popover = popover, .key_len = key.len };
+        @memcpy(ctx.key_buf[0..key.len], key);
+        return ctx;
+    }
+};
+
+fn onRosterClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx = cast.userData(RosterCtx, user);
+    const watcher = ctx.watcher;
+    var key_buf: [512]u8 = undefined;
+    const key = key_buf[0..ctx.key_len];
+    @memcpy(key, ctx.key_buf[0..ctx.key_len]);
+    c.gtk_popover_popdown(@ptrCast(ctx.popover));
+    watcher.open(key);
+}
+
+/// This machine's per-user daemon socket, into `buf`; empty when the
+/// path cannot be formed (then no local pane matches).
+fn defaultSocket(buf: []u8) []const u8 {
+    var fba = std.heap.FixedBufferAllocator.init(buf);
+    return sockpath.defaultSocketPath(fba.allocator()) catch "";
+}
+
+/// The session `pane` shows and its daemon; null = no daemon session.
+fn paneSession(pane: *Pane) ?glance.PaneSession {
+    const remote = pane.terminal.remote orelse return null;
+    return .{ .host = remote.host, .session = remote.session };
+}
+
+fn viewsSameSession(earlier: []const *Pane, pane: *Pane) bool {
+    const at = paneSession(pane) orelse return false;
+    for (earlier) |p| {
+        const other = paneSession(p) orelse continue;
+        if (std.mem.eql(u8, other.session, at.session) and strEqOpt(other.host, at.host)) return true;
+    }
+    return false;
+}
+
+/// An agent row's status line: the attention's words, capitalized.
+fn statusText(buf: [:0]u8, attention: ?vocab.Attention) [:0]const u8 {
+    const words = if (attention) |a| a.label() else "state unknown (an older sketerm mcp)";
+    const z = std.fmt.bufPrintZ(buf, "{s}", .{words}) catch return "";
+    if (z.len > 0) z[0] = std.ascii.toUpper(z[0]);
+    return z;
+}
+
+/// The pane's agents chip is opening its popover.
+pub fn fillPaneAgents(win: *Window, pane: *Pane, popover: *c.GtkWidget) void {
+    const watcher = win.assistants orelse return;
+    watcher.buildPaneAgents(pane, popover);
 }
 
 /// A truncated key or host would name something else: refuse instead.
@@ -1694,19 +1960,6 @@ test "attach verbs give watch and control distinct icons" {
     try t.expectEqualStrings("Take control", std.mem.span(attachVerb(.control).text));
 }
 
-test "only a remote per-user daemon's report describes another machine" {
-    try t.expect(!reportsRemote(null));
-    try t.expect(!reportsRemote(""));
-    try t.expect(!reportsRemote("sock:/run/user/1/sketerm/mcp-tmp-4/mux.sock"));
-    try t.expect(reportsRemote("box"));
-    try t.expect(reportsRemote("ssh:user@box"));
-    try t.expect(reportsRemote("udp:box"));
-    try t.expect(reportsRemote("route:a/b"));
-    try t.expect(!reportsRemote("route:a#tmp-4"));
-    try t.expect(!reportsRemote("route:a/b#hub"));
-    try t.expect(!reportsRemote("route:"));
-}
-
 test "place labels name the machine, through its hops" {
     var buf: [128]u8 = undefined;
     try t.expectEqualStrings("box", placeLabel(&buf, "box"));
@@ -1823,3 +2076,4 @@ test "local registry agents attach at the instance socket or the plain host" {
     a.rebuildRows(t.allocator);
     try t.expectEqual(@as(usize, 0), a.sessions.items.len);
 }
+

@@ -9,6 +9,7 @@
 //! Config.title_*_* (`winconfig.refreshTitlebarCss`).
 
 const c = @import("../c.zig").c;
+const agentbadge = @import("agentbadge.zig");
 
 pub const Titlebar = struct {
     box: ?*c.GtkWidget = null,
@@ -21,7 +22,8 @@ pub const Titlebar = struct {
     /// surface the bar on panes that keep it hidden otherwise.
     config_visible: bool = false,
     /// Activity wants the titlebar shown: floating app windows, a
-    /// view-only lease, or an attached assistant. Replaces the old
+    /// view-only lease, an attached assistant, or sub-agents running
+    /// for an assistant in this session. Replaces the old
     /// "App window open — click to raise" banner.
     auto: bool = false,
     /// Per-window taskbar buttons for the session's floating app
@@ -33,6 +35,11 @@ pub const Titlebar = struct {
     chip: ?*c.GtkWidget = null,
     chip_label: ?*c.GtkLabel = null,
     take_btn: ?*c.GtkWidget = null,
+    /// The sub-agents of the MCP servers running in this pane's session
+    /// (`agentbadge.Chip`, fed by `assistants.zig`). A sibling of the
+    /// lease chip, never its text: the two answer different questions
+    /// and both can be true at once.
+    agents: ?agentbadge.Chip = null,
 
     /// Set the config-driven baseline (see `config_visible`).
     pub fn setConfigVisible(self: *Titlebar, visible: bool) void {

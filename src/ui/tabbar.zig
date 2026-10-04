@@ -16,6 +16,7 @@ const profile = @import("../util/profile.zig");
 const Config = @import("../config.zig").Config;
 const tab_effects = @import("tab_effects.zig");
 const cssutil = @import("cssutil.zig");
+const agentbadge = @import("agentbadge.zig");
 
 const TAB_W: c_int = 170;
 
@@ -207,6 +208,7 @@ fn tabMeasure(widget: [*c]c.GtkWidget, orientation: c.GtkOrientation, for_size: 
         // tab keeps a consistent height even when it's hidden/pinned).
         measureChildV(tt.icon, for_size, &min, &nat);
         measureChildV(tt.label, for_size, &min, &nat);
+        measureChildV(tt.agents.box, for_size, &min, &nat);
         if (tt.close_btn) |cb| measureChildV(cb, for_size, &min, &nat);
     }
     if (minimum != null) minimum.* = min;
@@ -222,15 +224,21 @@ fn tabSizeAllocate(widget: [*c]c.GtkWidget, width: c_int, height: c_int, baselin
 
     // No indicator button and title_inverted is false, so neither the
     // close button nor anything else reserves space: the close button is
-    // placed at the end and the title may extend under it.
+    // placed at the end and the title may extend under it. The agents
+    // badge may not: while it shows, the group keeps clear of the close
+    // button so a hovered tab cannot cover its count.
+    const badge_shown = c.gtk_widget_get_visible(@ptrCast(t.agents.box)) != 0;
+    const badge_w = if (badge_shown) measureChildWidth(t.agents.box, height) else 0;
+    var end_w: c_int = 0;
     if (t.close_btn) |cb| {
         if (c.gtk_widget_get_visible(@ptrCast(cb)) != 0) {
             const close_w = measureChildWidth(cb, height);
             allocateChild(cb, width - close_w, close_w, height, baseline);
+            if (badge_shown) end_w = close_w;
         }
     }
 
-    const group = centerGroup(width, icon_w + title_w);
+    const group = centerGroup(width - end_w, icon_w + title_w + badge_w);
     var center_x = group.x;
     var center_width = group.width;
 
@@ -238,6 +246,11 @@ fn tabSizeAllocate(widget: [*c]c.GtkWidget, width: c_int, height: c_int, baselin
         allocateChild(t.icon, center_x, icon_w, height, baseline);
         center_x += icon_w;
         center_width -= icon_w;
+    }
+    if (badge_shown) {
+        center_width -= badge_w;
+        if (center_width < 0) center_width = 0;
+        allocateChild(t.agents.box, center_x + center_width, badge_w, height, baseline);
     }
     if (c.gtk_widget_get_visible(@ptrCast(t.label)) != 0) {
         if (center_width < 0) center_width = 0;
@@ -443,6 +456,8 @@ pub const TabBar = struct {
         tab_box: *c.GtkWidget,
         label: *c.GtkWidget,
         icon: *c.GtkWidget,
+        /// Sub-agent count of the page's panes (`agentbadge.pageGlance`).
+        agents: agentbadge.Badge,
         /// Always present (so it sets the tab height like AdwTab); hidden
         /// on pinned tabs.
         close_btn: ?*c.GtkWidget = null,
@@ -734,6 +749,16 @@ pub const TabBar = struct {
         }
     }
 
+    /// A page's agent glance changed (`assistants.zig`): repaint its badge.
+    pub fn refreshAgents(self: *TabBar, page: *c.AdwTabPage) void {
+        if (self.callbacks_severed) return;
+        for (self.tabs.items) |t| {
+            if (t.page != page) continue;
+            t.agents.set(agentbadge.pageGlance(page));
+            c.gtk_widget_queue_allocate(t.tab_box);
+        }
+    }
+
     /// Apply the tree-collapse hidden state to the strip: a hidden
     /// tab's widget (and its leading separator) goes invisible. Cheap
     /// enough to run after any collapse/expand without a rebuild.
@@ -785,6 +810,10 @@ pub const TabBar = struct {
         c.gtk_widget_set_can_target(label, 0);
         c.gtk_widget_set_parent(label, tab_box);
 
+        // Sub-agents badge, after the title: the page carries its state.
+        const agents = agentbadge.Badge.build(agentbadge.pageGlance(page));
+        c.gtk_widget_set_parent(agents.box, tab_box);
+
         // Close — flat button, revealed on hover (CSS). Always created so
         // it sets the tab height (AdwTab measures it unconditionally);
         // hidden per `closeButtonShown`.
@@ -803,6 +832,7 @@ pub const TabBar = struct {
             .tab_box = @ptrCast(tab_box),
             .label = @ptrCast(label),
             .icon = @ptrCast(icon),
+            .agents = agents,
             .close_btn = @ptrCast(close),
         };
         // The tab node finds its Tab here to draw the glow; the child
