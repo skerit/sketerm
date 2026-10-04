@@ -439,14 +439,15 @@ pub fn endWaitersOf(id: []const u8, reason: []const u8) void {
 const testing = std.testing;
 const mcp_agent_testkit = @import("mcp_agent_testkit.zig");
 const mcp_agent_open = @import("mcp_agent_open.zig");
+const mcp_agent_talk = @import("mcp_agent_talk.zig");
 const hold = mcp_agent.hold;
 const adapters = mcp_agent.adapters;
 const waiterTemplate = mcp_agent.waiterTemplate;
-const closeTool = mcp_agent.closeTool;
 const ToolRig = mcp_agent_testkit.ToolRig;
 const expectError = mcp_agent_testkit.expectError;
 const shaped = mcp_agent_testkit.shaped;
 const newEntry = mcp_agent_open.newEntry;
+const closeTool = mcp_agent_talk.closeTool;
 
 test "the waiter socket: subscribe, wake once, and end when the agent closes" {
     var rig: ToolRig = undefined;
