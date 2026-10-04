@@ -10,6 +10,7 @@ const vocab = @import("../agent/vocab.zig");
 const select = @import("../agent/select.zig");
 const launch = @import("../agent/launch.zig");
 const opencode = @import("../agent/opencode.zig");
+const output = @import("../agent/output.zig");
 const retry_mod = @import("../agent/retry.zig");
 const clock = @import("../util/clock.zig");
 const agentindex = @import("agentindex.zig");
@@ -381,14 +382,22 @@ pub fn answerTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]
     const title = try arena.dupe(u8, it.title);
     const label: []const u8 = switch (e.agent.kind()) {
         .screen => blk: {
-            const i = it.pick(choice) orelse
-                return errRes(arena, .invalid_args, try std.fmt.allocPrint(arena, "'{s}' names none of the options ({s})", .{ choice, try optionList(arena, it) }));
+            const i = it.pick(choice) orelse return noSuchOption(arena, e, it, choice);
             break :blk try arena.dupe(u8, it.options[i].label);
         },
-        .opencode_api => if (kind == .permission)
-            (if (opencode.PermissionReply.fromChoice(it, choice)) |r| r.label() else return errRes(arena, .invalid_args, try std.fmt.allocPrint(arena, "'{s}' names none of the options ({s})", .{ choice, try optionList(arena, it) })))
-        else
-            try arena.dupe(u8, choice),
+        .opencode_api => switch (kind) {
+            .permission => if (opencode.PermissionReply.fromChoice(it, choice)) |r| r.label() else return noSuchOption(arena, e, it, choice),
+            .question => blk: {
+                // Checked before acting: the refusal lists every question.
+                const qs = e.agent.driver().opencode_api.api.source.pendingRequest().?.questions;
+                _ = opencode.questionAnswers(arena, qs, choice) catch |err| switch (err) {
+                    error.NoSuchOption => return errRes(arena, .invalid_args, try opencode.questionsHelp(arena, qs, choice)),
+                    else => return err,
+                };
+                break :blk try arena.dupe(u8, choice);
+            },
+            .choice => try arena.dupe(u8, choice),
+        },
     };
     // A prompt before the app is ready (Claude Code's trust dialog): the
     // answer leads to the app getting ready, not to a turn.
@@ -418,6 +427,11 @@ pub fn answerTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]
     try res.fact("answered", label);
     const answer = try std.fmt.allocPrint(arena, "{s}\n-> {s}", .{ title, label });
     return finish(arena, &res, e, dv, .{ .filter = filter }, &.{.{ .name = "answer", .body = answer }});
+}
+
+/// The refusal of a choice that names no option of `it`.
+fn noSuchOption(arena: std.mem.Allocator, e: *Entry, it: output.Interaction, choice: []const u8) ![]const u8 {
+    return errRes(arena, .invalid_args, try std.fmt.allocPrint(arena, "'{s}' names none of the options ({s}); answer with {s}", .{ choice, try optionList(arena, it), mcp_agent_act.answerForms(e, it) }));
 }
 
 /// agent_answer `text`: a free-text answer through the route the app
@@ -602,7 +616,7 @@ pub fn askTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]con
     service(clock.nowMs());
     const st = e.agent.state();
     if (!st.takesSideQuestion()) return switch (st) {
-        .waiting_user => errRes(arena, .conflict, try std.fmt.allocPrint(arena, "agent {s} is waiting for an answer: its prompt has the keyboard, so nothing was typed (agent_answer it first)", .{e.id})),
+        .waiting_user => errRes(arena, .conflict, (try busy(arena, e)).?.msg),
         .starting => errRes(arena, .conflict, try std.fmt.allocPrint(arena, "agent {s} is not ready yet (state starting); nothing was typed", .{e.id})),
         else => errRes(arena, .unavailable, try std.fmt.allocPrint(arena, "agent {s} is {s}; agent_close it", .{ e.id, @tagName(st) })),
     };

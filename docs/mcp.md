@@ -1221,6 +1221,17 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   free-text route). Claude Code's AskUserQuestion dialog was not available
   to measure (the tool is not offered in this setup), so no text rule
   exists for its questions yet.
+- **Answers that do not fit.** A `choice` that names no option is
+  `invalid_args` listing the options and the accepted forms (label,
+  1-based number, unique part of a label; `text` too when the prompt takes
+  free text). An opencode question request that asks several questions
+  takes ONE LINE PER QUESTION in `choice` (each a label/number, a
+  comma-separated list where several may be chosen, or free text where
+  allowed); a refusal says how many questions there are and how many lines
+  came, then lists each question with its options and what it accepts,
+  one per line. `agent_send` to an agent with a pending prompt is
+  `conflict`, nothing sent, and its message names `agent_answer` (choice,
+  or text where taken) and shows the prompt briefly.
 - **`done` means settled.** An agent is done when it is idle with no
   subagents and no background tasks running. Claude Code shows the shells
   and monitors it started in the background on its mode line (`manual

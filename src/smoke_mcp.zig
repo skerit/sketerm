@@ -6479,6 +6479,10 @@ const FakeOc = struct {
                 // The provider gave up on the turn: opencode's APIError.
                 self.ev(200, "{{\"type\":\"message.updated\",\"properties\":{{\"sessionID\":\"" ++ SES ++ "\",\"info\":{{\"id\":\"{s}\",\"role\":\"assistant\",\"sessionID\":\"" ++ SES ++ "\",\"time\":{{\"created\":1,\"completed\":2}},\"error\":{{\"name\":\"APIError\",\"data\":{{\"message\":\"Service Unavailable\",\"statusCode\":503}}}}}}}}}}", .{id1});
                 self.status(300, "idle");
+            } else if (std.mem.indexOf(u8, text, "two questions") != null) {
+                self.ev(200, "{{\"type\":\"question.asked\",\"properties\":{{\"id\":\"que_{d}\",\"sessionID\":\"" ++ SES ++ "\",\"questions\":[" ++
+                    "{{\"question\":\"Which file?\",\"header\":\"File\",\"options\":[{{\"label\":\"a.zig\"}},{{\"label\":\"b.zig\"}}]}}," ++
+                    "{{\"question\":\"Which checks?\",\"header\":\"Checks\",\"multiple\":true,\"custom\":false,\"options\":[{{\"label\":\"lint\"}},{{\"label\":\"test\"}}]}}]}}}}", .{n});
             } else if (std.mem.indexOf(u8, text, "permission") != null) {
                 self.ev(200, "{{\"type\":\"permission.asked\",\"properties\":{{\"id\":\"per_{d}\",\"sessionID\":\"" ++ SES ++ "\",\"permission\":\"bash\",\"patterns\":[\"rm notes.md\"]}}}}", .{n});
             } else if (briefTail(text)) |tail| {
@@ -6505,6 +6509,22 @@ const FakeOc = struct {
             const msg_id = std.fmt.allocPrint(a, "msg_{s}", .{id}) catch return .{ .status = 500 };
             const text = std.fmt.allocPrint(a, "permission {s}", .{r.reply}) catch return .{ .status = 500 };
             self.answer(100, msg_id, text);
+            self.status(200, "idle");
+            return .{ .body = "true" };
+        }
+        if (std.mem.startsWith(u8, path, "/question/") and std.mem.endsWith(u8, path, "/reply")) {
+            const id = path["/question/".len .. path.len - "/reply".len];
+            const Reply = struct { answers: []const []const []const u8 = &.{} };
+            const r = std.json.parseFromSliceLeaky(Reply, a, body, .{ .ignore_unknown_fields = true }) catch return .{ .status = 400 };
+            self.ev(0, "{{\"type\":\"question.replied\",\"properties\":{{\"sessionID\":\"" ++ SES ++ "\",\"requestID\":{f}}}}}", .{std.json.fmt(id, .{})});
+            var text: std.ArrayList(u8) = .empty;
+            text.appendSlice(a, "answers") catch return .{ .status = 500 };
+            for (r.answers) |one| {
+                text.appendSlice(a, " |") catch return .{ .status = 500 };
+                for (one) |x| text.print(a, " {s}", .{x}) catch return .{ .status = 500 };
+            }
+            const msg_id = std.fmt.allocPrint(a, "msg_{s}", .{id}) catch return .{ .status = 500 };
+            self.answer(100, msg_id, text.items);
             self.status(200, "idle");
             return .{ .body = "true" };
         }
@@ -7456,6 +7476,30 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
         expectFact(oc_ans, "answered", "Reject", "agent_answer opencode: answered");
         expectFact(oc_ans, "outcome", "done", "agent_answer opencode: outcome");
         expectFact(oc_ans, "message", "permission reject", "agent_answer opencode: message");
+        // Several questions in one prompt: a one-line answer is refused
+        // with every question and what it takes; a send is refused toward
+        // agent_answer; one line per question answers.
+        {
+            const q_asked = agentCall(&m, arena, "agent_send", "{\"agent\":\"opencode-1\",\"text\":\"ask two questions\",\"timeout_ms\":20000}", "agent_send opencode questions", false, 45_000);
+            expectFact(q_asked, "outcome", "needs_input", "agent_send opencode questions: outcome");
+            const one = agentCall(&m, arena, "agent_answer", "{\"agent\":\"opencode-1\",\"choice\":\"a.zig\"}", "agent_answer opencode one line", true, 15_000);
+            const one_msg = scStr((one.get("error") orelse fail("agent_answer one line: no error")).object, "message", "agent_answer one line");
+            for ([_][]const u8{ "asks 2 questions and the answer has 1 line", "\n1. Which file? options: 1. a.zig, 2. b.zig (free text accepted)", "\n2. Which checks? options: 1. lint, 2. test (several, comma-separated)" }) |want| {
+                if (std.mem.indexOf(u8, one_msg, want) == null) {
+                    say(one_msg);
+                    fail("agent_answer opencode one line: the refusal does not list the questions");
+                }
+            }
+            const q_sent = agentCall(&m, arena, "agent_send", "{\"agent\":\"opencode-1\",\"text\":\"hello\"}", "agent_send opencode while asked", true, 15_000);
+            const sent_msg = scStr((q_sent.get("error") orelse fail("agent_send while asked: no error")).object, "message", "agent_send while asked");
+            if (std.mem.indexOf(u8, sent_msg, "answer it with agent_answer") == null or std.mem.indexOf(u8, sent_msg, "pending question: \"Which file?\"") == null) {
+                say(sent_msg);
+                fail("agent_send while asked: the refusal does not point at agent_answer with the prompt");
+            }
+            const q_both = agentCall(&m, arena, "agent_answer", "{\"agent\":\"opencode-1\",\"choice\":\"2\\nlint, test\",\"timeout_ms\":20000}", "agent_answer opencode two lines", false, 45_000);
+            expectFact(q_both, "outcome", "done", "agent_answer opencode two lines: outcome");
+            expectFact(q_both, "message", "answers | b.zig | lint test", "agent_answer opencode two lines: the answers reached the server");
+        }
         const oc_closed = agentCall(&m, arena, "agent_close", "{\"agent\":\"opencode-1\"}", "agent_close opencode", false, 15_000);
         if (oc_closed.get("sessions").?.array.items.len != 2) fail("agent_close opencode: not both sessions");
         waitUnlisted(allocator, mux_sock, o1_session, "agent_close opencode");

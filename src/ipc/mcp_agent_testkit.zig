@@ -58,9 +58,15 @@ pub const ToolRig = struct {
 };
 
 pub fn expectError(arena: std.mem.Allocator, tool: []const u8, result: []const u8, code: []const u8) !void {
+    _ = try errorMessage(arena, tool, result, code);
+}
+
+/// The message of an error result with `code`.
+pub fn errorMessage(arena: std.mem.Allocator, tool: []const u8, result: []const u8, code: []const u8) ![]const u8 {
     const parsed = try mcp.expectToolResultShape(arena, tool, result);
     const err = parsed.object.get("structuredContent").?.object.get("error") orelse return error.ExpectedError;
     try testing.expectEqualStrings(code, err.object.get("code").?.string);
+    return err.object.get("message").?.string;
 }
 
 const fake_daemon = @import("launch_cleanup_test.zig");

@@ -949,8 +949,13 @@ test "every agent tool answers in its declared shape: a scripted Claude Code on 
     try testing.expectEqualStrings("needs_input", asked.get("outcome").?.string);
     try testing.expectEqualStrings("permission", asked.get("interaction").?.object.get("kind").?.string);
     // An agent waiting for an answer refuses a prompt: its keys would answer it.
-    try expectError(a, "agent_send", try rig.call(.agent_send, "{\"text\":\"again\"}"), "conflict");
-    try expectError(a, "agent_answer", try rig.call(.agent_answer, "{\"choice\":\"Maybe\"}"), "invalid_args");
+    // The refusal says how to answer and shows the prompt.
+    const refused = try mcp_agent_testkit.errorMessage(a, "agent_send", try rig.call(.agent_send, "{\"text\":\"again\"}"), "conflict");
+    try testing.expect(std.mem.indexOf(u8, refused, "nothing was sent: answer it with agent_answer with choice (an option label, its 1-based number or a unique part of a label) or text (a free-text answer)") != null);
+    try testing.expect(std.mem.indexOf(u8, refused, "pending permission: \"") != null);
+    try testing.expect(std.mem.indexOf(u8, refused, "options: 1. Yes, 2. No") != null);
+    const maybe = try mcp_agent_testkit.errorMessage(a, "agent_answer", try rig.call(.agent_answer, "{\"choice\":\"Maybe\"}"), "invalid_args");
+    try testing.expectEqualStrings("'Maybe' names none of the options (1. Yes, 2. No); answer with agent_answer with choice (an option label, its 1-based number or a unique part of a label) or text (a free-text answer)", maybe);
     try testing.expect(asked.get("interaction").?.object.get("free_text").?.bool);
     try expectError(a, "agent_answer", try rig.call(.agent_answer, "{\"choice\":\"no\",\"text\":\"x\"}"), "invalid_args");
     // A free-text answer: No, then the text as the next prompt. The wait is

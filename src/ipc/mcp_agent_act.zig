@@ -71,7 +71,7 @@ pub fn busy(arena: std.mem.Allocator, e: *Entry) !?Fail {
         .idle, .waiting_background => null,
         .starting => Fail{ .code = .timeout, .msg = try std.fmt.allocPrint(arena, "agent {s} is not ready yet (state starting); nothing was sent", .{e.id}) },
         .working, .waiting_subagent, .retrying => Fail{ .code = .conflict, .msg = try std.fmt.allocPrint(arena, "agent {s} is busy (state {s}){s}: agent_wait for its turn to finish, or agent_interrupt it", .{ e.id, @tagName(st), if (e.agent.supports(.queue)) "" else try std.fmt.allocPrint(arena, " and the {s} adapter cannot queue a prompt", .{e.loaded.spec.id}) }) },
-        .waiting_user => Fail{ .code = .conflict, .msg = try std.fmt.allocPrint(arena, "agent {s} is waiting for an answer: agent_answer its prompt first", .{e.id}) },
+        .waiting_user => Fail{ .code = .conflict, .msg = try std.fmt.allocPrint(arena, "agent {s} is waiting for an answer, so nothing was sent: answer it with {s} ({s})", .{ e.id, if (e.agent.interaction()) |it| answerForms(e, it) else "agent_answer", try pendingBrief(arena, e) }) },
         .exited, .disconnected => Fail{ .code = .unavailable, .msg = try std.fmt.allocPrint(arena, "agent {s} is {s}; agent_close it", .{ e.id, @tagName(st) }) },
     };
 }
@@ -801,6 +801,29 @@ pub fn optionList(arena: std.mem.Allocator, it: ?output.Interaction) ![]const u8
         try out.print(arena, "{d}. {s}", .{ n, o.label });
     }
     return out.items;
+}
+
+/// How agent_answer takes an answer to `it` on `e` (choice, and text when
+/// the prompt has a free-text route).
+pub fn answerForms(e: *Entry, it: output.Interaction) []const u8 {
+    const choice = "agent_answer with choice (an option label, its 1-based number or a unique part of a label)";
+    return if (it.free_text and e.agent.supports(.answer_text)) choice ++ " or text (a free-text answer)" else choice;
+}
+
+/// The pending prompt in brief, for a refusal that points at agent_answer.
+pub fn pendingBrief(arena: std.mem.Allocator, e: *Entry) ![]const u8 {
+    const it = e.agent.interaction() orelse return "no prompt shows";
+    const max = 120;
+    var cut = @min(it.title.len, max);
+    while (cut > 0 and cut < it.title.len and (it.title[cut] & 0xc0) == 0x80) cut -= 1;
+    return std.fmt.allocPrint(arena, "pending {s}: \"{s}{s}\", options: {s}{s}{s}", .{
+        @tagName(it.kind),
+        it.title[0..cut],
+        if (cut < it.title.len) " ..." else "",
+        try optionList(arena, it),
+        if (it.hint.len > 0) "; " else "",
+        it.hint,
+    });
 }
 
 /// A prompt typed again after an interrupt, as results list it: its text,

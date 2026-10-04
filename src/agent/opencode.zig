@@ -1556,7 +1556,10 @@ pub const Api = struct {
             .question => {
                 var arena = std.heap.ArenaAllocator.init(self.allocator);
                 defer arena.deinit();
-                const answers = try questionAnswers(arena.allocator(), p.questions, choice);
+                const answers = questionAnswers(arena.allocator(), p.questions, choice) catch |err| {
+                    if (err == error.NoSuchOption) self.fail("{s}", .{try questionsHelp(arena.allocator(), p.questions, choice)});
+                    return err;
+                };
                 const path = std.fmt.bufPrint(&path_buf, "/question/{s}/reply", .{p.id}) catch return error.NoSuchOption;
                 const body = try std.json.Stringify.valueAlloc(arena.allocator(), .{ .answers = answers }, .{});
                 const r = try self.request(.{ .method = .POST, .path = path, .body = body });
@@ -1896,29 +1899,69 @@ fn customAnswers(arena: std.mem.Allocator, questions: []const Question, text: []
 /// The reply body's `answers` for a question request: one line of `choice`
 /// per question; each line is an option label or index, a comma-separated
 /// list of them for a multi-select question, or free text where allowed.
-fn questionAnswers(arena: std.mem.Allocator, questions: []const Question, choice: []const u8) ![]const []const []const u8 {
+pub fn questionAnswers(arena: std.mem.Allocator, questions: []const Question, choice: []const u8) ![]const []const []const u8 {
     var lines = std.mem.splitScalar(u8, std.mem.trim(u8, choice, "\n"), '\n');
     const out = try arena.alloc([]const []const u8, questions.len);
     for (questions, out) |q, *slot| {
-        const line = std.mem.trim(u8, lines.next() orelse return error.NoSuchOption, " \t\r");
-        const opts = try arena.alloc(output.Option, q.options.len);
-        for (q.options, opts) |l, *o| o.* = .{ .label = l, .selected = false };
-        const it = Interaction{ .kind = .question, .title = q.text, .detail = q.header, .hint = "", .options = opts };
-        var picked: std.ArrayList([]const u8) = .empty;
-        if (it.pick(line)) |i| {
-            try picked.append(arena, q.options[i]);
-        } else if (q.multiple and std.mem.indexOfScalar(u8, line, ',') != null) {
-            var parts = std.mem.splitScalar(u8, line, ',');
-            while (parts.next()) |part| {
-                const i = it.pick(part) orelse return error.NoSuchOption;
-                try picked.append(arena, q.options[i]);
-            }
-        } else if (q.custom and line.len > 0) {
-            try picked.append(arena, line);
-        } else return error.NoSuchOption;
-        slot.* = picked.items;
+        slot.* = try answerLine(arena, q, lines.next() orelse return error.NoSuchOption);
     }
     return out;
+}
+
+/// One question's answer from its line of a `questionAnswers` choice.
+fn answerLine(arena: std.mem.Allocator, q: Question, raw: []const u8) ![]const []const u8 {
+    const line = std.mem.trim(u8, raw, " \t\r");
+    const opts = try arena.alloc(output.Option, q.options.len);
+    for (q.options, opts) |l, *o| o.* = .{ .label = l, .selected = false };
+    const it = Interaction{ .kind = .question, .title = q.text, .detail = q.header, .hint = "", .options = opts };
+    var picked: std.ArrayList([]const u8) = .empty;
+    if (it.pick(line)) |i| {
+        try picked.append(arena, q.options[i]);
+    } else if (q.multiple and std.mem.indexOfScalar(u8, line, ',') != null) {
+        var parts = std.mem.splitScalar(u8, line, ',');
+        while (parts.next()) |part| {
+            const i = it.pick(part) orelse return error.NoSuchOption;
+            try picked.append(arena, q.options[i]);
+        }
+    } else if (q.custom and line.len > 0) {
+        try picked.append(arena, line);
+    } else return error.NoSuchOption;
+    return picked.items;
+}
+
+/// Why `choice` does not answer `questions` (`questionAnswers` refused it):
+/// what was wrong, the accepted forms, then one line per question with
+/// what it accepts.
+pub fn questionsHelp(arena: std.mem.Allocator, questions: []const Question, choice: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var n_lines: usize = 0;
+    var bad: ?usize = null;
+    var lines = std.mem.splitScalar(u8, std.mem.trim(u8, choice, "\n"), '\n');
+    while (lines.next()) |line| : (n_lines += 1) {
+        if (bad == null and n_lines < questions.len) {
+            _ = answerLine(arena, questions[n_lines], line) catch |err| switch (err) {
+                error.NoSuchOption => bad = n_lines,
+                else => return err,
+            };
+        }
+    }
+    if (n_lines < questions.len) {
+        try out.print(arena, "this prompt asks {d} questions and the answer has {d} line{s}: answer each question on its own line, in order", .{ questions.len, n_lines, if (n_lines == 1) "" else "s" });
+    } else if (bad) |i| {
+        if (questions.len == 1)
+            try out.print(arena, "'{s}' answers none of the question's options", .{std.mem.trim(u8, choice, " \t\r\n")})
+        else
+            try out.print(arena, "line {d} answers none of question {d}'s options", .{ i + 1, i + 1 });
+    } else try out.appendSlice(arena, "the answer does not fit the prompt's questions");
+    try out.appendSlice(arena, ". A line is an option label, its 1-based number or a unique part of a label; a comma-separated list of them where several may be chosen; free text where it is accepted.");
+    for (questions, 1..) |q, n| {
+        try out.print(arena, "\n{d}. {s} options: ", .{ n, q.text });
+        for (q.options, 1..) |l, k| try out.print(arena, "{s}{d}. {s}", .{ if (k > 1) ", " else "", k, l });
+        if (q.options.len == 0) try out.appendSlice(arena, "none");
+        if (q.multiple) try out.appendSlice(arena, " (several, comma-separated)");
+        if (q.custom) try out.appendSlice(arena, " (free text accepted)");
+    }
+    return out.items;
 }
 
 // ── tests ────────────────────────────────────────────────────────
@@ -2339,6 +2382,13 @@ test "a question request: options, custom answers and several questions" {
     try t.expectEqualStrings("c.zig", custom[0][0]);
     try t.expectError(error.NoSuchOption, questionAnswers(arena.allocator(), p.questions, "a.zig\nbuild"));
     try t.expectError(error.NoSuchOption, questionAnswers(arena.allocator(), p.questions, "a.zig"));
+    // The refusal says how many questions there are and what each takes.
+    const short = try questionsHelp(arena.allocator(), p.questions, "a.zig");
+    try t.expect(std.mem.startsWith(u8, short, "this prompt asks 2 questions and the answer has 1 line: answer each question on its own line, in order. "));
+    try t.expect(std.mem.indexOf(u8, short, "\n1. Which file? options: 1. a.zig, 2. b.zig (free text accepted)\n2. Which checks? options: 1. lint, 2. test (several, comma-separated)") != null);
+    try t.expect(std.mem.endsWith(u8, short, "(several, comma-separated)"));
+    const wrong = try questionsHelp(arena.allocator(), p.questions, "a.zig\nbuild");
+    try t.expect(std.mem.startsWith(u8, wrong, "line 2 answers none of question 2's options. "));
     try rig.feed(2, "{\"type\":\"question.rejected\",\"properties\":{\"sessionID\":\"ses_root\",\"requestID\":\"que_1\"}}");
     try t.expect(rig.src.interaction() == null);
 }
