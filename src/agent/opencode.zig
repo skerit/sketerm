@@ -1245,6 +1245,18 @@ pub const Endpoint = struct {
 /// Every synchronous request's deadline (loopback; `/provider` is the
 /// slowest at a few MiB).
 pub const REQUEST_TIMEOUT_MS: i64 = 10_000;
+/// How long a prompt whose acceptance never arrived (`REQUEST_TIMEOUT_MS`
+/// ran out, the connection dropped) is looked up by its message id before
+/// it counts as not delivered: a busy server takes a prompt and answers late.
+pub const DELIVERY_LOOKUP_MS: i64 = 10_000;
+/// The pause between two lookups of an unanswered prompt.
+const LOOKUP_POLL_MS: i64 = 250;
+/// How long a prompt POST found by the lookup may still answer before its
+/// connection is let go.
+const PROMPT_LINGER_MS: i64 = 60_000;
+/// Test only: lowers the prompt POST's deadline (ms) so a real server's
+/// answer arrives too late and the lookup path runs.
+const PROMPT_TIMEOUT_ENV = "SKETERM_TEST_AGENT_PROMPT_TIMEOUT_MS";
 /// One readiness probe's deadline: short, because a request the starting
 /// server swallowed is never answered.
 pub const HEALTH_PROBE_MS: i64 = 1000;
@@ -1285,7 +1297,28 @@ pub const ActionError = error{
     /// The server answered with a non-2xx status; `Api.problem` says why.
     Rejected,
     BadReply,
+    /// A prompt's acceptance never arrived and the session does not hold
+    /// its message id: not delivered, and never sent again.
+    NotDelivered,
 };
+
+/// What the last `Api.submit` came to.
+pub const Submitted = struct {
+    id_buf: [64]u8 = undefined,
+    id_len: usize = 0,
+    /// The server's acceptance never arrived; the lookup found the message.
+    confirmed_late: bool = false,
+    /// A re-send whose message id the session already held: nothing was sent.
+    already: bool = false,
+
+    /// The prompt's message id ("" before any submit).
+    pub fn id(self: *const Submitted) []const u8 {
+        return self.id_buf[0..self.id_len];
+    }
+};
+
+/// Whether the session holds a message id (`Api.messageKnown`).
+const Known = enum { found, absent, unknown };
 
 /// The models of the connected providers (`GET /provider`), cached.
 const Catalog = struct {
@@ -1328,13 +1361,22 @@ pub const Api = struct {
     translator: dialect.Translator,
     problem_buf: [512]u8 = undefined,
     problem_len: usize = 0,
+    /// The wall ms and sequence of the last minted message id (`mintId`).
+    id_ms: i64 = 0,
+    id_seq: u12 = 0,
+    last_submit: Submitted = .{},
+    /// The prompt POST's deadline (`PROMPT_TIMEOUT_ENV` lowers it).
+    prompt_timeout_ms: i64 = REQUEST_TIMEOUT_MS,
+    lookup_ms: i64 = DELIVERY_LOOKUP_MS,
 
     pub fn init(allocator: std.mem.Allocator, loaded: *const adapter.Loaded, limits: events.Limits, endpoint: Endpoint) !Api {
         var source = try Source.init(allocator, loaded, limits, null);
         errdefer source.deinit();
         if (loaded.spec.api == null) return error.NotAnApiAdapter;
         const client = try http.Client.init(allocator, .{ .port = endpoint.port, .user = endpoint.user, .password = endpoint.password });
-        return .{ .allocator = allocator, .source = source, .client = client, .stream = http.EventStream.init(allocator), .translator = dialect.Translator.init(allocator) };
+        var self: Api = .{ .allocator = allocator, .source = source, .client = client, .stream = http.EventStream.init(allocator), .translator = dialect.Translator.init(allocator) };
+        if (c.getenv(PROMPT_TIMEOUT_ENV)) |v| self.prompt_timeout_ms = std.fmt.parseInt(i64, std.mem.span(v), 10) catch REQUEST_TIMEOUT_MS;
+        return self;
     }
 
     pub fn deinit(self: *Api) void {
@@ -1648,18 +1690,143 @@ pub const Api = struct {
 
     // ── actions ──────────────────────────────────────────────────
 
-    /// Send a prompt; the reply streams in as events.
+    /// Send a prompt under a message id; the reply streams in as events.
+    /// A POST whose answer never arrives is looked up by that id
+    /// (`lookUpUnanswered`), never sent again; `last_submit` says how it went.
     /// @param agent_name an opencode agent (`build`, `plan`), or the session's.
-    pub fn submit(self: *Api, text: []const u8, agent_name: ?[]const u8) !void {
+    /// @param given_id the id an earlier send of this prompt used (a re-send:
+    /// nothing is sent when the session holds it), null to mint one.
+    /// @throws NotDelivered when the lookup does not find it.
+    pub fn submit(self: *Api, text: []const u8, agent_name: ?[]const u8, given_id: ?[]const u8) !void {
         const root = self.source.root orelse return error.NoSession;
         const g = try self.generation();
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const a = arena.allocator();
+        self.last_submit = .{};
+        var minted: [dialect.MESSAGE_ID_LEN]u8 = undefined;
+        const id = given_id orelse self.mintId(&minted);
+        if (id.len > self.last_submit.id_buf.len) return error.BadReply;
+        @memcpy(self.last_submit.id_buf[0..id.len], id);
+        self.last_submit.id_len = id.len;
+        if (given_id != null and try self.messageKnown(g, root, id, clock.nowMs() + REQUEST_TIMEOUT_MS) == .found) {
+            self.last_submit.already = true;
+            return;
+        }
         try self.selectOnSession(a, g, agent_name);
-        const body = try dialect.promptBody(g.dialect, a, text, self.modelChoice(), agent_name);
-        const r = try self.request(try dialect.request(a, g.routes.prompt, .{ .session = root }, body));
-        r.deinit(self.allocator);
+        const body = try dialect.promptBody(g.dialect, a, id, text, self.modelChoice(), agent_name);
+        const req = try dialect.request(a, g.routes.prompt, .{ .session = root }, body);
+        // Async, so a late answer does not close the connection: opencode
+        // 2.x drops a request whose client went away before it answered.
+        const ticket = self.client.start(req, clock.nowMs() + self.prompt_timeout_ms + self.lookup_ms + PROMPT_LINGER_MS) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            self.fail("{s} {s}: {s}", .{ @tagName(req.method), req.path, @errorName(err) });
+            return err;
+        };
+        if (try self.awaitTicket(ticket, clock.nowMs() + self.prompt_timeout_ms)) |done| return self.promptAnswered(req, done, false);
+        return self.lookUpUnanswered(g, req, ticket, root, id);
+    }
+
+    /// Wait until `until` for async request `ticket` to finish.
+    fn awaitTicket(self: *Api, ticket: u64, until: i64) !?http.Completion.Result {
+        while (true) {
+            try self.client.service(clock.nowMs());
+            if (self.client.takeCompletionOf(ticket)) |done| return done.result;
+            const left = until - clock.nowMs();
+            if (left <= 0) return null;
+            var pfds: [http.MAX_CONNS]c.struct_pollfd = undefined;
+            const n = self.client.pollFds(&pfds);
+            _ = c.poll(&pfds, @intCast(n), @intCast(@min(left, LOOKUP_POLL_MS)));
+        }
+    }
+
+    /// The prompt POST's answer: a 2xx went in (`late`: after its deadline).
+    fn promptAnswered(self: *Api, req: http.Request, done: http.Completion.Result, late: bool) !void {
+        switch (done) {
+            .response => |r| {
+                defer r.deinit(self.allocator);
+                if (r.ok()) {
+                    self.last_submit.confirmed_late = late;
+                    return;
+                }
+                self.fail("{s} {s}: {d} {s}", .{ @tagName(req.method), req.path, r.status, r.body[0..@min(r.body.len, 300)] });
+                return error.Rejected;
+            },
+            .failed => |err| {
+                self.fail("{s} {s}: {s}", .{ @tagName(req.method), req.path, @errorName(err) });
+                return err;
+            },
+        }
+    }
+
+    /// A fresh message id, ascending within this agent.
+    fn mintId(self: *Api, out: *[dialect.MESSAGE_ID_LEN]u8) []const u8 {
+        const now = clock.wallMs();
+        if (now > self.id_ms) {
+            self.id_ms = now;
+            self.id_seq = 0;
+        } else if (self.id_seq == std.math.maxInt(u12)) {
+            self.id_ms += 1;
+            self.id_seq = 0;
+        }
+        self.id_seq += 1;
+        var rnd: [14]u8 = undefined;
+        _ = c.getentropy(&rnd, rnd.len);
+        dialect.newMessageId(out, self.id_ms, self.id_seq, &rnd);
+        return out;
+    }
+
+    /// The prompt POST `req` (async `ticket`) got no answer in time, yet the
+    /// server may have taken it: until `lookup_ms` runs out, ask the session
+    /// for message `id` while still listening for the answer. Either is the
+    /// delivery (`confirmed_late`); neither is `error.NotDelivered`, the
+    /// request given up, never a second send.
+    fn lookUpUnanswered(self: *Api, g: *const adapter.Generation, req: http.Request, ticket: u64, root: []const u8, id: []const u8) !void {
+        const until = clock.nowMs() + self.lookup_ms;
+        var why: []const u8 = "no answer";
+        while (true) {
+            if (try self.awaitTicket(ticket, @min(until, clock.nowMs() + LOOKUP_POLL_MS))) |done| switch (done) {
+                .response => return self.promptAnswered(req, done, true),
+                // The connection is gone: only the lookup can tell now.
+                .failed => |err| why = @errorName(err),
+            };
+            if (try self.messageKnown(g, root, id, until) == .found) {
+                self.last_submit.confirmed_late = true;
+                // Its answer is let to arrive (`finished` drops it).
+                return;
+            }
+            if (clock.nowMs() >= until) break;
+        }
+        self.client.cancel(ticket);
+        if (g.routes.message_get == null)
+            self.fail("{s} {s}: {s} within {d} ms, and generation {s} declares no message_get route to look message {s} up: NOT delivered as far as is known, and not sent again", .{ @tagName(req.method), req.path, why, self.prompt_timeout_ms + self.lookup_ms, g.name, id })
+        else
+            self.fail("{s} {s}: {s} within {d} ms, and the session did not hold message {s}: NOT delivered, and not sent again", .{ @tagName(req.method), req.path, why, self.prompt_timeout_ms + self.lookup_ms, id });
+        return error.NotDelivered;
+    }
+
+    /// Whether session `root` holds message `id`: a message (`message_get`)
+    /// or a prompt its inbox has not delivered yet (`inbox`, when declared).
+    fn messageKnown(self: *Api, g: *const adapter.Generation, root: []const u8, id: []const u8, deadline_ms: i64) !Known {
+        const route = g.routes.message_get orelse return .unknown;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const req = try dialect.request(a, route, .{ .session = root, .message = id }, null);
+        const r = self.client.call(req, @max(deadline_ms, clock.nowMs() + LOOKUP_POLL_MS)) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return .unknown;
+        };
+        defer r.deinit(self.allocator);
+        if (r.ok()) return .found;
+        if (r.status != 404) return .unknown;
+        const inbox = g.routes.inbox orelse return .absent;
+        var list = self.getReply(.inbox, try dialect.request(a, inbox, .{ .session = root }, null), null) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return .unknown;
+        };
+        defer list.deinit();
+        return if (dialect.listHasId(list.value, id)) .found else .absent;
     }
 
     /// The chosen model with its effort level, as a request names it.
@@ -2740,9 +2907,16 @@ test "api: connect, submit with a chosen model and effort, answer, interrupt, co
     try t.expectEqual(@as(usize, 2), models.len);
     try t.expectEqual(@as(usize, 2), models[0].variants.len);
 
-    try api.submit("hello", null);
+    try api.submit("hello", null, null);
     const sent = srv.lastRequest("POST /session/ses_root/prompt_async").?;
-    try t.expect(std.mem.endsWith(u8, sent, "{\"parts\":[{\"type\":\"text\",\"text\":\"hello\"}],\"model\":{\"providerID\":\"openai\",\"modelID\":\"gpt-x\"},\"variant\":\"high\"}"));
+    // Under the id it minted (opencode's form), so a lost answer can be looked up.
+    const minted = api.last_submit.id();
+    try t.expectEqual(dialect.MESSAGE_ID_LEN, minted.len);
+    try t.expect(std.mem.startsWith(u8, minted, "msg_"));
+    const want_body = try std.fmt.allocPrint(t.allocator, "{{\"messageID\":\"{s}\",\"parts\":[{{\"type\":\"text\",\"text\":\"hello\"}}],\"model\":{{\"providerID\":\"openai\",\"modelID\":\"gpt-x\"}},\"variant\":\"high\"}}", .{minted});
+    defer t.allocator.free(want_body);
+    try t.expect(std.mem.endsWith(u8, sent, want_body));
+    try t.expect(!api.last_submit.confirmed_late);
     try pumpUntil(&api, struct {
         fn f(a: *Api) bool {
             return countKind(&a.source.queue, .needs_input) == 1;
@@ -3233,9 +3407,10 @@ test "api 2.x: detected from the server, prompt with a chosen model, permission,
     try api.setModel("gpt-x");
     try api.setEffort("high");
     try t.expectError(error.UnknownModel, api.setModel("other/off"));
-    try api.submit("hello", null);
+    try api.submit("hello", null, null);
     try t.expect(std.mem.endsWith(u8, srv.lastRequest("POST /api/session/ses_2/model").?, "{\"model\":{\"providerID\":\"openai\",\"id\":\"gpt-x\",\"variant\":\"high\"}}"));
-    try t.expect(std.mem.endsWith(u8, srv.lastRequest("POST /api/session/ses_2/prompt").?, "{\"text\":\"hello\",\"delivery\":\"queue\"}"));
+    try t.expect(std.mem.endsWith(u8, srv.lastRequest("POST /api/session/ses_2/prompt").?, "\",\"text\":\"hello\",\"delivery\":\"queue\"}"));
+    try t.expect(std.mem.indexOf(u8, srv.lastRequest("POST /api/session/ses_2/prompt").?, "{\"id\":\"msg_") != null);
     try pumpUntil(&api, struct {
         fn f(a: *Api) bool {
             return countKind(&a.source.queue, .needs_input) == 1;
@@ -3256,7 +3431,7 @@ test "api 2.x: detected from the server, prompt with a chosen model, permission,
     try t.expectEqualStrings("pong", done_text);
     // A second prompt sets no model again (nothing changed since).
     const selects = countRequests(&srv, "POST /api/session/ses_2/model");
-    try api.submit("again", null);
+    try api.submit("again", null, null);
     try t.expectEqual(selects, countRequests(&srv, "POST /api/session/ses_2/model"));
 
     // Facts: the answer's tokens and its model's catalog entry.
@@ -3352,6 +3527,135 @@ test "api: a server that answers no declared generation is refused at once, nami
     try t.expectError(error.UnknownApi, api.probeReady(clock.nowMs() + 2000));
     try t.expect(std.mem.indexOf(u8, api.problem(), "GET /api/info answered 200 but not with JSON; GET /global/health answered 200 but not with JSON") != null);
     try t.expect(api.apiVersion() == null);
+}
+
+// ── delivery of a prompt whose acceptance never arrives ─────────
+
+/// Answers the message lookups of a fake server whose prompt route replies
+/// too late: the session holds the id the last prompt POST carried, unless
+/// `lost`; with `v2` the prompt is still in the inbox (no message yet).
+const LateCtx = struct {
+    lost: bool = false,
+    v2: bool = false,
+    buf: [512]u8 = undefined,
+
+    const not_found: testserver.Reply = .{ .status = 404, .body = "{\"name\":\"NotFoundError\",\"data\":{\"message\":\"Message not found\"}}" };
+
+    fn hook(ctx: ?*anyopaque, srv: *testserver.Server, method: []const u8, path: []const u8, body: []const u8) ?testserver.Reply {
+        _ = body;
+        const self: *LateCtx = @ptrCast(@alignCast(ctx.?));
+        if (!std.mem.eql(u8, method, "GET")) return null;
+        const prefix = if (self.v2) "/api/session/ses_2/message/" else "/session/ses_root/message/";
+        const sent = srv.lastRequest(if (self.v2) "POST /api/session/ses_2/prompt" else "POST /session/ses_root/prompt_async");
+        const id = if (sent) |s| idOf(s) else null;
+        if (std.mem.startsWith(u8, path, prefix)) {
+            const there = !self.lost and !self.v2 and id != null and std.mem.eql(u8, id.?, path[prefix.len..]);
+            return if (there) .{ .body = "{\"info\":{\"role\":\"user\"},\"parts\":[]}" } else not_found;
+        }
+        if (self.v2 and std.mem.eql(u8, path, "/api/session/ses_2/inbox")) {
+            if (self.lost or id == null) return .{ .body = "{\"data\":[]}" };
+            return .{ .body = std.fmt.bufPrint(&self.buf, "{{\"data\":[{{\"id\":\"{s}\",\"sessionID\":\"ses_2\",\"type\":\"user\"}}]}}", .{id.?}) catch return null };
+        }
+        return null;
+    }
+
+    /// The message id a prompt request's body carries.
+    fn idOf(req: []const u8) ?[]const u8 {
+        const at = std.mem.indexOf(u8, req, "\"msg_") orelse return null;
+        const end = std.mem.indexOfScalarPos(u8, req, at + 1, '"') orelse return null;
+        return req[at + 1 .. end];
+    }
+};
+
+test "api: a prompt answered too late is looked up by its id: found is sent once, a re-send reuses the id, lost is NotDelivered" {
+    var srv: testserver.Server = .{};
+    try srv.start(t.allocator);
+    defer srv.deinit();
+    var ctx: LateCtx = .{};
+    srv.hook = LateCtx.hook;
+    srv.hook_ctx = &ctx;
+    srv.route(V1_PROBE, .{ .body = "{\"healthy\":true}" });
+    srv.route("POST /session", .{ .body = "{\"id\":\"ses_root\",\"title\":\"agent\"}" });
+    srv.route("GET /session/status", .{ .body = "{}" });
+    srv.route("GET /permission", .{ .body = "[]" });
+    srv.route("GET /question", .{ .body = "[]" });
+    srv.route("GET /session/ses_root/message", .{ .body = "[]" });
+    // A busy server: it takes the prompt and answers after the deadline.
+    srv.route("POST /session/ses_root/prompt_async", .{ .status = 204, .delay_ms = 600 });
+    var set = adapter.Set.init(t.allocator);
+    defer set.deinit();
+    try set.loadShipped();
+    var api = try Api.init(t.allocator, set.get("opencode").?, .{}, .{ .port = srv.port(), .password = "pw" });
+    defer api.deinit();
+    api.prompt_timeout_ms = 100;
+    api.lookup_ms = 2000;
+    try api.connect(null, clock.nowMs());
+
+    try api.submit("hello", null, null);
+    try t.expect(api.last_submit.confirmed_late);
+    try t.expect(!api.last_submit.already);
+    try t.expectEqual(@as(usize, 1), countRequests(&srv, "POST /session/ses_root/prompt_async"));
+    var id_buf: [64]u8 = undefined;
+    const id = id_buf[0..api.last_submit.id_len];
+    @memcpy(id, api.last_submit.id());
+
+    // A re-send under the same id the session holds: nothing is sent.
+    try api.submit("hello", null, id);
+    try t.expect(api.last_submit.already);
+    try t.expectEqual(@as(usize, 1), countRequests(&srv, "POST /session/ses_root/prompt_async"));
+
+    // The request is lost: not answered in time, never in the session.
+    ctx.lost = true;
+    srv.route("POST /session/ses_root/prompt_async", .{ .status = 204, .delay_ms = 3000 });
+    api.lookup_ms = 400;
+    try t.expectError(error.NotDelivered, api.submit("again", null, null));
+    try t.expect(std.mem.indexOf(u8, api.problem(), "NOT delivered, and not sent again") != null);
+    try t.expectEqual(@as(usize, 2), countRequests(&srv, "POST /session/ses_root/prompt_async"));
+
+    // A re-send the session does not hold goes out under its own id.
+    srv.route("POST /session/ses_root/prompt_async", .{ .status = 204 });
+    try api.submit("hello", null, id);
+    try t.expect(!api.last_submit.already and !api.last_submit.confirmed_late);
+    const sent = srv.lastRequest("POST /session/ses_root/prompt_async").?;
+    try t.expectEqualStrings(id, LateCtx.idOf(sent).?);
+}
+
+test "api 2.x: a prompt answered too late is found in the session's inbox and sent once" {
+    var srv: testserver.Server = .{};
+    try v2Server(&srv);
+    defer srv.deinit();
+    var ctx: LateCtx = .{ .v2 = true };
+    srv.hook = LateCtx.hook;
+    srv.hook_ctx = &ctx;
+    // Answered long after the lookup found it in the inbox.
+    srv.route("POST /api/session/ses_2/prompt", .{ .body = "{\"data\":{}}", .delay_ms = 3000 });
+    var set = adapter.Set.init(t.allocator);
+    defer set.deinit();
+    try set.loadShipped();
+    var api = try Api.init(t.allocator, set.get("opencode").?, .{}, .{ .port = srv.port(), .password = "pw" });
+    defer api.deinit();
+    api.prompt_timeout_ms = 100;
+    api.lookup_ms = 2000;
+    try api.connect(null, clock.nowMs());
+    try api.submit("hello", null, null);
+    try t.expect(api.last_submit.confirmed_late);
+    try t.expectEqual(@as(usize, 1), countRequests(&srv, "POST /api/session/ses_2/prompt"));
+    try t.expect(srv.lastRequest("GET /api/session/ses_2/inbox") != null);
+    ctx.lost = true;
+    api.lookup_ms = 300;
+    try t.expectError(error.NotDelivered, api.submit("again", null, null));
+    try t.expectEqual(@as(usize, 2), countRequests(&srv, "POST /api/session/ses_2/prompt"));
+}
+
+test "message ids: opencode's ascending form, its stamp cut to 48 bits like opencode's" {
+    const rnd: [14]u8 = @splat(61);
+    var out: [dialect.MESSAGE_ID_LEN]u8 = undefined;
+    // (1791144154628 * 0x1000 + 1) mod 2^48, as opencode's `create` cuts it.
+    dialect.newMessageId(&out, 1791144154628, 1, &rnd);
+    try t.expectEqualStrings("msg_10882d604001zzzzzzzzzzzzzz", &out);
+    var earlier: [dialect.MESSAGE_ID_LEN]u8 = undefined;
+    dialect.newMessageId(&earlier, 1791144154627, 4095, &rnd);
+    try t.expect(std.mem.order(u8, &earlier, &out) == .lt);
 }
 
 // ── context facts ────────────────────────────────────────────────

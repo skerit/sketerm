@@ -151,6 +151,8 @@ const SendResult = struct {
     outcome: []const u8 = "failed",
     state: ?[]const u8 = null,
     queued: bool = false,
+    /// The app's acceptance never came; a lookup of the prompt's message id found it.
+    delivery_confirmed_late: ?bool = null,
     interrupted: bool = false,
     queued_dropped: ?u32 = null,
     /// The prompts this server had queued that the interrupt made the app
@@ -217,9 +219,10 @@ pub fn sendManyTool(arena: std.mem.Allocator, args: std.json.Value, list: []cons
         r.state = @tagName(e.agent.state());
         switch (outcome) {
             .fail => |f| r.@"error" = .{ .code = @tagName(f.code), .message = f.msg },
-            .ok => |queued| {
-                r.queued = queued;
-                r.outcome = outcomeOf(&.{}, e.agent.state(), true, queued and e.agent.queuedPrompts() > 0);
+            .ok => |took| {
+                r.queued = took.queued;
+                if (took.confirmed_late) r.delivery_confirmed_late = true;
+                r.outcome = outcomeOf(&.{}, e.agent.state(), true, took.queued and e.agent.queuedPrompts() > 0);
                 rememberFilter(e, .{});
                 try sent.append(arena, e.id);
             },
@@ -240,7 +243,7 @@ pub fn sendManyTool(arena: std.mem.Allocator, args: std.json.Value, list: []cons
         if (r.@"error") |er|
             try res.textf("{s}: failed ({s}): {s}", .{ if (r.agent.len > 0) r.agent else "?", er.code, er.message })
         else
-            try res.textf("{s}: {s}{s}{s}", .{ r.agent, r.outcome, if (r.interrupted) " (interrupted first)" else "", if (r.queued_dropped != null) "; its app dropped the prompts it held queued" else "" });
+            try res.textf("{s}: {s}{s}{s}{s}", .{ r.agent, r.outcome, if (r.interrupted) " (interrupted first)" else "", if (r.delivery_confirmed_late != null) " (its acceptance came late: found by its message id, sent once)" else "", if (r.queued_dropped != null) "; its app dropped the prompts it held queued" else "" });
     }
     var cmd: ?[]const u8 = null;
     if (sent.items.len > 0) if (state.exe) |exe| if (state.waiter.path) |sock| {

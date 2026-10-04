@@ -83,6 +83,9 @@ pub const Prompt = struct {
     text: []const u8,
     /// The template it was rendered from (results name it, never echo it).
     template: ?[]const u8 = null,
+    /// The message id an API source took it under before: a re-send
+    /// (`requeueDropped`) reuses it, so the app can never hold it twice.
+    id: ?[]const u8 = null,
 };
 
 pub fn refuse(why: *Fail, code: mcp.ErrCode, msg: []const u8) error{Refused} {
@@ -219,15 +222,16 @@ const Sent = union(enum) { ok: Delivered, fail: Fail };
 pub fn submitAndWait(arena: std.mem.Allocator, e: *Entry, p: Prompt, filter: events.Filter, deadline: i64, no_queue: bool, requeue: []const Prompt, requeued: *Requeued) !Sent {
     service(clock.nowMs());
     const pre = try e.cursor.take(e.agent.queue(), .{}, clock.nowMs(), arena);
-    const queued = switch (try submitPrompt(arena, e, p, deadline, no_queue)) {
+    const took = switch (try submitPrompt(arena, e, p, deadline, no_queue)) {
         .fail => |f| return .{ .fail = f },
-        .ok => |q| q,
+        .ok => |x| x,
     };
     requeued.* = try requeueDropped(arena, e, requeue, deadline);
     var dv = try waitAfter(arena, e, pre, filter, deadline);
     if (dv.wait) |*w| {
         w.sent = true;
-        w.queued = queued;
+        w.queued = took.queued;
+        w.confirmed_late = took.confirmed_late;
     }
     return .{ .ok = dv };
 }
@@ -235,6 +239,9 @@ pub fn submitAndWait(arena: std.mem.Allocator, e: *Entry, p: Prompt, filter: eve
 /// What `requeueDropped` typed again, and the failure that stopped it.
 pub const Requeued = struct {
     done: []const Prompt = &.{},
+    /// Prompts the app's session still held under their message id (an API
+    /// source): not dropped after all, so not sent again.
+    kept: usize = 0,
     fail: ?Fail = null,
     /// Prompts after the failure, not typed again (order is kept).
     left: usize = 0,
@@ -249,6 +256,7 @@ pub const Requeued = struct {
 
     /// The facts and the text line a send result carries for it.
     pub fn report(self: Requeued, arena: std.mem.Allocator, res: *Res) !void {
+        if (self.kept > 0) try res.textf("{d} prompt(s) this server had queued were still in the app's session under their message id, so they were not sent again", .{self.kept});
         if (self.done.len == 0 and self.fail == null) return;
         try res.raw("requeued", try toJson(arena, try self.items(arena)));
         if (self.done.len > 0) try res.textf("{d} prompt(s) this server had queued were dropped by the interrupt and typed again in their order (behind the new prompt, if any)", .{self.done.len});
@@ -263,15 +271,19 @@ pub const Requeued = struct {
 /// the app throw away) again, oldest first, after the urgent prompt: into
 /// the app's queue while it works on that one. The first failure stops it.
 pub fn requeueDropped(arena: std.mem.Allocator, e: *Entry, dropped: []const Prompt, deadline: i64) !Requeued {
+    var done: std.ArrayList(Prompt) = .empty;
+    var kept: usize = 0;
     for (dropped, 0..) |p, i| switch (try submitPrompt(arena, e, p, deadline, false)) {
-        .ok => {},
-        .fail => |f| return .{ .done = dropped[0..i], .fail = f, .left = dropped.len - i },
+        .ok => |took| if (took.already) {
+            kept += 1;
+        } else try done.append(arena, p),
+        .fail => |f| return .{ .done = done.items, .kept = kept, .fail = f, .left = dropped.len - i },
     };
-    return .{ .done = dropped };
+    return .{ .done = done.items, .kept = kept };
 }
 
 /// Put `text` in as the agent's next prompt, or into its app's queue
-/// while it works (unless `no_queue`); `ok` says whether it was queued.
+/// while it works (unless `no_queue`); `ok` says how it went in.
 /// The recipe's keys get at least `STEP_WAIT_MS` to land even when the
 /// caller does not wait for the turn.
 pub fn submitPrompt(arena: std.mem.Allocator, e: *Entry, p: Prompt, deadline: i64, no_queue: bool) !Submitted {
@@ -291,40 +303,52 @@ pub fn submitPrompt(arena: std.mem.Allocator, e: *Entry, p: Prompt, deadline: i6
     const act_deadline = @max(deadline, clock.nowMs() + STEP_WAIT_MS);
     const from = e.agent.queue().next_seq;
     const before = e.agent.uptake();
-    switch (try act(arena, e, if (queued) .{ .queue = text } else .{ .submit = text }, act_deadline)) {
+    const pa: agent_mod.Prompt = .{ .text = text, .id = p.id };
+    const acted = switch (try act(arena, e, if (queued) .{ .queue = pa } else .{ .submit = pa }, act_deadline)) {
         .fail => |f| return .{ .fail = f },
-        .ok => {},
-    }
+        .ok => |o| o,
+    };
+    const took: Took = .{ .queued = queued, .confirmed_late = acted.confirmed_late, .already = acted.already };
+    // Already in the app under its id: nothing went in now.
+    if (took.already) return .{ .ok = took };
     if (queued) if (try confirmQueued(arena, e, act_deadline)) |f| return .{ .fail = f };
     if (try confirmDelivery(arena, e, before, queued)) |f| return .{ .fail = f };
     e.sent_seq = from;
-    if (queued) rememberQueued(e, p);
+    if (queued) rememberQueued(e, p, acted.prompt_id);
     // The conversation has a turn now: a relaunch resumes it.
     if (!e.conversed) {
         e.conversed = true;
         writeDescriptor(e);
     }
-    return .{ .ok = queued };
+    return .{ .ok = took };
 }
 
-/// Keep `p`, which the app now holds queued, for `stopForSend` to retype
-/// should an interrupt throw the queue away. Best effort: a prompt that
-/// cannot be kept is only not retyped.
-fn rememberQueued(e: *Entry, p: Prompt) void {
+/// Keep `p`, which the app now holds queued (an API source: under message
+/// `id`), for `stopForSend` to retype should an interrupt throw the queue
+/// away. Best effort: a prompt that cannot be kept is only not retyped.
+fn rememberQueued(e: *Entry, p: Prompt, id: ?[]const u8) void {
     const a = e.allocator;
-    const text = a.dupe(u8, p.text) catch return;
-    const tpl: ?[]u8 = if (p.template) |t| (a.dupe(u8, t) catch {
-        a.free(text);
-        return;
-    }) else null;
-    e.queued_sent.append(a, .{ .text = text, .template = tpl }) catch (QueuedPrompt{ .text = text, .template = tpl }).free(a);
+    var q: QueuedPrompt = .{ .text = a.dupe(u8, p.text) catch return };
+    q.template = if (p.template) |t| (a.dupe(u8, t) catch return q.free(a)) else null;
+    q.id = if (id) |x| (a.dupe(u8, x) catch return q.free(a)) else null;
+    e.queued_sent.append(a, q) catch q.free(a);
+}
+
+/// How long a send waits for its evidence before it is `not_delivered`:
+/// a screen app's uptake, or an API source's lookup of an unanswered POST.
+pub fn deliveryBoundOf(e: *const Entry) i64 {
+    return switch (e.agent.kind()) {
+        .screen => DELIVERY_CONFIRM_MS,
+        .opencode_api => opencode.DELIVERY_LOOKUP_MS,
+    };
 }
 
 /// A screen app showed it took the prompt typed at `before`
 /// (`agent_mod.Uptake.tookBy`); `not_delivered`, with its state and screen,
 /// when nothing shows within `DELIVERY_CONFIRM_MS`. Never retyped: a late
-/// uptake would submit it twice. An API source's HTTP acceptance (a 2xx,
-/// else `act` failed) is the app's own evidence.
+/// uptake would submit it twice. An API source's evidence is its HTTP
+/// acceptance, or a lookup that finds the prompt's message id when that
+/// answer never came (`opencode.Api.submit`); else `act` failed.
 fn confirmDelivery(arena: std.mem.Allocator, e: *Entry, before: agent_mod.Uptake, queued: bool) !?Fail {
     if (e.agent.kind() != .screen) return null;
     const until = clock.nowMs() + DELIVERY_CONFIRM_MS;
@@ -345,7 +369,7 @@ pub fn sendFailRes(arena: std.mem.Allocator, e: *Entry, f: Fail) ![]const u8 {
     return mcp.errResDetails(arena, f.code, f.msg, @as(?struct { agent: []const u8, state: []const u8, waited_ms: i64 }, .{
         .agent = e.id,
         .state = @tagName(e.agent.state()),
-        .waited_ms = DELIVERY_CONFIRM_MS,
+        .waited_ms = deliveryBoundOf(e),
     }));
 }
 
@@ -364,7 +388,11 @@ pub const Stopped = struct {
 /// interrupt (`service` forgets them once the app's queue empties).
 pub fn queuedSnapshot(arena: std.mem.Allocator, e: *Entry) ![]const Prompt {
     const mine = try arena.alloc(Prompt, e.queued_sent.items.len);
-    for (e.queued_sent.items, mine) |q, *m| m.* = .{ .text = try arena.dupe(u8, q.text), .template = if (q.template) |t| try arena.dupe(u8, t) else null };
+    for (e.queued_sent.items, mine) |q, *m| m.* = .{
+        .text = try arena.dupe(u8, q.text),
+        .template = if (q.template) |t| try arena.dupe(u8, t) else null,
+        .id = if (q.id) |x| try arena.dupe(u8, x) else null,
+    };
     return mine;
 }
 
@@ -467,6 +495,12 @@ const Acted = union(enum) {
 const Outcome = struct {
     /// The app's line confirming the action (a recipe's `confirm`).
     confirmation: ?[]const u8 = null,
+    /// An API source's prompt: the message id it went in under (arena).
+    prompt_id: ?[]const u8 = null,
+    /// Its HTTP acceptance never came; a lookup found the message.
+    confirmed_late: bool = false,
+    /// A re-send the session already held under its id: nothing was sent.
+    already: bool = false,
     /// The app was restarted with the change (a recipe's `relaunch`).
     relaunched: bool = false,
     /// A side question's answer (a recipe's `wait: side_answer`), owned by
@@ -491,7 +525,14 @@ pub fn act(arena: std.mem.Allocator, e: *Entry, action: agent_mod.Action, deadli
     switch (e.agent.driver()) {
         .opencode_api => |d| {
             d.perform(action) catch |err| return .{ .fail = try apiFail(arena, d.api, err) };
-            return .{ .ok = .{} };
+            return switch (action) {
+                .submit, .queue => .{ .ok = .{
+                    .prompt_id = try arena.dupe(u8, d.api.last_submit.id()),
+                    .confirmed_late = d.api.last_submit.confirmed_late,
+                    .already = d.api.last_submit.already,
+                } },
+                else => .{ .ok = .{} },
+            };
         },
         .screen => |d| {
             var plan = d.plan(state.allocator, action) catch |err| switch (err) {
@@ -515,10 +556,11 @@ pub fn applySet(arena: std.mem.Allocator, e: *Entry, action: agent_mod.Action, d
     };
 }
 
-fn apiFail(arena: std.mem.Allocator, api: *opencode.Api, err: anyerror) !Fail {
+pub fn apiFail(arena: std.mem.Allocator, api: *opencode.Api, err: anyerror) !Fail {
     const code: mcp.ErrCode = switch (err) {
         error.UnknownModel, error.AmbiguousModel, error.UnknownEffort, error.NoCurrentModel, error.NoSuchOption, error.NoFreeText => .invalid_args,
         error.NoPendingInteraction => .conflict,
+        error.NotDelivered => .not_delivered,
         error.NoSession => .unavailable,
         error.OutOfMemory => return err,
         else => .failed,
@@ -840,5 +882,15 @@ pub fn pendingBrief(arena: std.mem.Allocator, e: *Entry) ![]const u8 {
 /// or for a rendered template only the template's name.
 pub const RequeuedItem = struct { text: ?[]const u8 = null, template: ?[]const u8 = null };
 
-/// A prompt that went in (queued or not), or why not.
-pub const Submitted = union(enum) { ok: bool, fail: Fail };
+/// How a prompt went in.
+pub const Took = struct {
+    /// Into the app's queue for its next turn.
+    queued: bool = false,
+    /// An API source's acceptance never came; a lookup found the message.
+    confirmed_late: bool = false,
+    /// A re-send the app already held under its message id: nothing went in.
+    already: bool = false,
+};
+
+/// A prompt that went in, or why not.
+pub const Submitted = union(enum) { ok: Took, fail: Fail };

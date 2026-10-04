@@ -44,6 +44,9 @@ const WaitPart = struct {
     sent: bool = false,
     /// The prompt went into the app's queue (an outcome may be `queued`).
     queued: bool = false,
+    /// An API source's acceptance of the prompt never came; a lookup of its
+    /// message id found it (the `delivery_confirmed_late` fact).
+    confirmed_late: bool = false,
 };
 
 /// A payload block of the text lane (after the prose).
@@ -169,6 +172,10 @@ pub fn finish(arena: std.mem.Allocator, res: *Res, e: *Entry, dv: Delivered, wat
         const post = dv.items[w.post_from..];
         const outcome = outcomeOf(post, st, w.sent, w.queued and e.agent.queuedPrompts() > 0);
         try res.fact("outcome", outcome);
+        if (w.confirmed_late) {
+            try res.fact("delivery_confirmed_late", true);
+            try res.text("the app did not answer the prompt in time, but its session holds the prompt's message: it was delivered once (looked up, not sent again)");
+        }
         var job: ?u32 = null;
         var first: ?u32 = null;
         var background: ?u32 = null;

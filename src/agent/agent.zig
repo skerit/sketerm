@@ -26,10 +26,9 @@ const opencode = @import("opencode.zig");
 pub const ActionKind = std.meta.FieldEnum(adapter.Actions);
 
 pub const Action = union(ActionKind) {
-    /// The prompt text.
-    submit: []const u8,
+    submit: Prompt,
     /// A prompt typed while the app works, for its next turn.
-    queue: []const u8,
+    queue: Prompt,
     /// An option label, a 1-based index, or (API permissions) yes/no/always.
     answer: []const u8,
     answer_text: AnswerText,
@@ -40,6 +39,13 @@ pub const Action = union(ActionKind) {
     set_effort: []const u8,
     /// The question, asked aside: no turn, no record.
     side_question: []const u8,
+};
+
+pub const Prompt = struct {
+    text: []const u8,
+    /// The message id an API source sent this prompt under before (a
+    /// re-send reuses it, so the server can never hold it twice); null mints one.
+    id: ?[]const u8 = null,
 };
 
 pub const AnswerText = struct {
@@ -307,7 +313,8 @@ pub const ScreenDriver = struct {
         if (steps.len == 0) return error.Unsupported;
         var values: std.enums.EnumFieldStruct(adapter.Placeholder, ?[]const u8, @as(?[]const u8, null)) = .{};
         switch (action) {
-            .submit, .queue, .side_question => |x| values.text = x,
+            .submit, .queue => |x| values.text = x.text,
+            .side_question => |x| values.text = x,
             .answer => |x| values.choice = x,
             .answer_text => |x| {
                 values.choice = x.option;
@@ -411,7 +418,7 @@ pub const ApiDriver = struct {
     pub fn perform(self: ApiDriver, action: Action) !void {
         switch (action) {
             // The server queues a prompt sent while it works.
-            .submit, .queue => |x| try self.api.submit(x, null),
+            .submit, .queue => |x| try self.api.submit(x.text, null, x.id),
             .answer => |x| try self.api.answer(x),
             .answer_text => |x| try self.api.answerText(x.text),
             .interrupt => try self.api.interrupt(),
@@ -442,7 +449,7 @@ test "screen: a plan is the adapter's recipe with placeholders filled, picks res
         .opencode_api => return error.TestUnexpectedDriver,
     };
 
-    var submit = try d.plan(t.allocator, .{ .submit = "say hi" });
+    var submit = try d.plan(t.allocator, .{ .submit = .{ .text = "say hi" } });
     defer submit.deinit();
     try t.expectEqual(@as(usize, 4), submit.steps.len);
     try t.expectEqualStrings("say hi", submit.steps[1].text);
@@ -495,7 +502,7 @@ test "screen: a prompt the app would collapse into a paste is led in by typed wo
     // Over the char threshold.
     const long = "x" ** 801;
     for ([_][]const u8{long}) |text| {
-        var plan = try agent.driver().screen.plan(t.allocator, .{ .submit = text });
+        var plan = try agent.driver().screen.plan(t.allocator, .{ .submit = .{ .text = text } });
         defer plan.deinit();
         var at: ?usize = null;
         for (plan.steps, 0..) |s, i| if (s == .text and std.mem.eql(u8, s.text, text)) {
@@ -509,7 +516,7 @@ test "screen: a prompt the app would collapse into a paste is led in by typed wo
     // Claude Code 2.1.288 collapses only a chunk over 800 bytes) are typed
     // as they are.
     for ([_][]const u8{ "continue", "x" ** 800, "one\ntwo\nthree\nfour" }) |text| {
-        var plan = try agent.driver().screen.plan(t.allocator, .{ .queue = text });
+        var plan = try agent.driver().screen.plan(t.allocator, .{ .queue = .{ .text = text } });
         defer plan.deinit();
         for (plan.steps) |s| if (s == .text) try t.expect(!std.mem.eql(u8, s.text, p.lead_in));
     }
@@ -578,7 +585,7 @@ test "api: the common read side and performed actions over HTTP" {
     try t.expect(agent.ready());
     try t.expectEqual(vocab.State.idle, agent.state());
 
-    try d.perform(.{ .submit = "ping" });
+    try d.perform(.{ .submit = .{ .text = "ping" } });
     const deadline = clock.nowMs() + 3000;
     while (agent.state() != .working and clock.nowMs() < deadline) {
         var pfds: [8]@import("../c.zig").c.struct_pollfd = undefined;

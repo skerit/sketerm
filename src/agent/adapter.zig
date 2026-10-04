@@ -354,10 +354,10 @@ pub const Dialect = enum {
 };
 
 /// The holes a route may have.
-pub const RouteHole = enum { session, request, limit };
+pub const RouteHole = enum { session, request, limit, message };
 
 /// An API generation's routes, each `"METHOD /path"` with `{session}`,
-/// `{request}` and `{limit}` holes.
+/// `{request}`, `{limit}` and `{message}` holes.
 pub const Routes = struct {
     /// The SSE stream.
     events: []const u8,
@@ -382,6 +382,12 @@ pub const Routes = struct {
     /// Required by a dialect that `selectsOnSession`.
     model_select: ?[]const u8 = null,
     agent_select: ?[]const u8 = null,
+    /// One message by its id (`{message}`): how a prompt whose acceptance
+    /// never arrived is looked up; without it such a send is not delivered.
+    message_get: ?[]const u8 = null,
+    /// Prompts the session admitted but has not made messages yet (2.x's
+    /// inbox), consulted when `message_get` does not know the id.
+    inbox: ?[]const u8 = null,
 };
 
 /// One generation of an API source's server.
@@ -422,6 +428,13 @@ pub const Spec = struct {
         for (api.generations) |g| if (g.attach_args.len > 0) return true;
         return false;
     }
+};
+
+/// The `RouteHole` names, for the validator's refusal.
+const hole_names = blk: {
+    var out: []const u8 = "";
+    for (std.meta.fieldNames(RouteHole), 0..) |n, i| out = out ++ (if (i > 0) ", " else "") ++ n;
+    break :blk out;
 };
 
 /// A route's method and path template (`"POST /x/{session}"`), or null
@@ -669,7 +682,7 @@ const Validator = struct {
             const close = std.mem.indexOfScalarPos(u8, sr.path, open, '}') orelse
                 return self.fail("api.generations \"{s}\": routes.{s}: unclosed \"{{\"", .{ gen, name });
             if (std.meta.stringToEnum(RouteHole, sr.path[open + 1 .. close]) == null)
-                return self.fail("api.generations \"{s}\": routes.{s}: unknown hole {{{s}}} (session, request, limit)", .{ gen, name, sr.path[open + 1 .. close] });
+                return self.fail("api.generations \"{s}\": routes.{s}: unknown hole {{{s}}} (" ++ hole_names ++ ")", .{ gen, name, sr.path[open + 1 .. close] });
             i = close + 1;
         }
     }

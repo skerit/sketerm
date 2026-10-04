@@ -1167,7 +1167,22 @@ TUI attached to that server for a human to watch is optional, see below).
   (an error naming the agent, which stays open) and a
   `retry_on_overload` continue (a notice). opencode's prompt is an HTTP
   call whose 2xx is the server's own acceptance; any other answer already
-  fails the send.
+  fails the send. A busy server takes a prompt and answers too late, so
+  every prompt carries a client message id in opencode's own ascending
+  form (`msg_` + 48-bit time stamp + random; 1.x `messageID`, 2.x `id`,
+  both checked only for the prefix, measured); when the answer never
+  comes in time (or the connection drops) the id is looked up for at
+  most 10 s more (`opencode.DELIVERY_LOOKUP_MS`; `routes.message_get`,
+  and 2.x's `routes.inbox` for a prompt queued behind a turn) while the
+  request stays open: 2.x drops a request whose client goes away before
+  it answers (measured), so a timed-out POST is never closed while it
+  may still land. Found, or its 2xx arriving late: the send succeeds
+  with `delivery_confirmed_late: true`. Not found: `not_delivered`, never sent again
+  (`capabilities.agent_delivery.api_unanswered: "message_lookup"`). A
+  prompt an interrupt made the app drop is sent again under its first
+  id, and not at all when the session still holds it. Measured: 2.x answers a repeated id
+  with the item it holds; 1.x appends the text to that message as
+  another part, so the id alone does not make a 1.x re-send harmless.
 - **One prompt to several agents, and interrupting first
   (`capabilities.agent_send_many`, `agent_send_interrupt`).** `agent_send
   interrupt: true` interrupts a busy agent (working, or waiting on the

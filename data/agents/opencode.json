@@ -39,7 +39,9 @@
           "commands": "GET /api/command",
           "command_run": "POST /api/session/{session}/command",
           "model_select": "POST /api/session/{session}/model",
-          "agent_select": "POST /api/session/{session}/agent"
+          "agent_select": "POST /api/session/{session}/agent",
+          "message_get": "GET /api/session/{session}/message/{message}",
+          "inbox": "GET /api/session/{session}/inbox"
         }
       },
       {
@@ -61,7 +63,8 @@
           "question_reply": "POST /question/{request}/reply",
           "models": "GET /provider",
           "commands": "GET /command",
-          "command_run": "POST /session/{session}/command"
+          "command_run": "POST /session/{session}/command",
+          "message_get": "GET /session/{session}/message/{message}"
         }
       }
     ]

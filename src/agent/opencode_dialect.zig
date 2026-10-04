@@ -33,6 +33,7 @@ pub const Holes = struct {
     session: ?[]const u8 = null,
     request: ?[]const u8 = null,
     limit: ?u32 = null,
+    message: ?[]const u8 = null,
 };
 
 /// `route` (`"METHOD /path"`, validated by the adapter) with its holes
@@ -49,6 +50,7 @@ pub fn request(a: std.mem.Allocator, route: []const u8, holes: Holes, body: ?[]c
                         .session => try out.appendSlice(a, holes.session orelse return error.NoSession),
                         .request => try out.appendSlice(a, holes.request orelse return error.NoRequest),
                         .limit => try out.print(a, "{d}", .{holes.limit orelse return error.NoLimit}),
+                        .message => try out.appendSlice(a, holes.message orelse return error.NoMessage),
                     }
                     i = close + 1;
                     continue;
@@ -64,19 +66,19 @@ pub fn request(a: std.mem.Allocator, route: []const u8, holes: Holes, body: ?[]c
 // ── replies ──────────────────────────────────────────────────────
 
 /// What a reply answers, for `reply`.
-pub const Reply = enum { session_info, messages, status, permissions, questions, models, commands };
+pub const Reply = enum { session_info, messages, status, permissions, questions, models, commands, inbox };
 
 /// A reply in the 1.x shape `Source` and `Api` read: the session object, a
 /// `[{info, parts}]` list oldest first, a `{id: {type}}` status map, the
 /// 1.x permission and question request lists, a `{all, connected}`
-/// provider catalog, a command list.
+/// provider catalog, a command list, the inbox's item list.
 /// @param session the session a `messages` reply belongs to (2.x messages
 /// do not name it).
 pub fn reply(d: Dialect, which: Reply, a: std.mem.Allocator, v: Value, session: ?[]const u8) !Value {
     if (d == .v1) return v;
     const data = get(v, "data") orelse return error.BadReply;
     return switch (which) {
-        .session_info, .commands => data,
+        .session_info, .commands, .inbox => data,
         .messages => try messagesV1(a, data, session orelse return error.NoSession),
         .status => try statusV1(a, data),
         .permissions => try mapList(a, data, permissionV1),
@@ -667,23 +669,53 @@ fn pushStatus(a: std.mem.Allocator, out: *std.ArrayList(Value), sid: []const u8,
 
 pub const ModelChoice = struct { provider: []const u8, model: []const u8, variant: ?[]const u8 = null };
 
-/// A prompt. 1.x carries the model, effort and agent; 2.x takes them on
-/// the session (`selectModelBody`/`selectAgentBody` first) and queues a
-/// prompt sent while the session works for its next turn, like 1.x.
-pub fn promptBody(d: Dialect, a: std.mem.Allocator, text: []const u8, model: ?ModelChoice, agent: ?[]const u8) ![]u8 {
+/// A prompt with the client's message `id` (`newMessageId`), so a send
+/// whose acceptance never arrived can be looked up instead of sent twice.
+/// 1.x carries the model, effort and agent; 2.x takes them on the session
+/// (`selectModelBody`/`selectAgentBody` first) and queues a prompt sent
+/// while the session works for its next turn, like 1.x.
+/// Gotcha (measured): 2.x answers a repeated id with the item it already
+/// holds; 1.x upserts the message and appends the text as another part.
+pub fn promptBody(d: Dialect, a: std.mem.Allocator, id: []const u8, text: []const u8, model: ?ModelChoice, agent: ?[]const u8) ![]u8 {
     return switch (d) {
         .v1 => {
             const TextPart = struct { type: []const u8 = "text", text: []const u8 };
             const ModelRef = struct { providerID: []const u8, modelID: []const u8 };
             return stringify(a, .{
+                .messageID = id,
                 .parts = [1]TextPart{.{ .text = text }},
                 .model = if (model) |m| ModelRef{ .providerID = m.provider, .modelID = m.model } else null,
                 .variant = if (model) |m| m.variant else null,
                 .agent = agent,
             });
         },
-        .v2 => stringify(a, .{ .text = text, .delivery = "queue" }),
+        .v2 => stringify(a, .{ .id = id, .text = text, .delivery = "queue" }),
     };
+}
+
+/// The length of a `newMessageId`.
+pub const MESSAGE_ID_LEN = "msg_".len + 12 + 14;
+
+/// A message id in opencode's own ascending form, which both generations
+/// accept from a client (they check only the `msg_` prefix, measured):
+/// `msg_`, 12 hex digits of `(wall_ms * 0x1000 + seq)` cut to 48 bits
+/// (opencode cuts the same way), 14 random base62 characters. Gotcha: the
+/// time is THIS host's wall clock, not the server's; 1.x orders a turn's
+/// messages by its own `time.created` (the id only breaks ties), so a
+/// remote host's clock skew can only reorder ids.
+pub fn newMessageId(out: *[MESSAGE_ID_LEN]u8, wall_ms: i64, seq: u12, random: *const [14]u8) void {
+    const base62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    const stamp: u48 = @truncate(@as(u64, @intCast(@max(0, wall_ms))) *% 0x1000 +% seq);
+    @memcpy(out[0..4], "msg_");
+    _ = std.fmt.bufPrint(out[4..16], "{x:0>12}", .{stamp}) catch unreachable;
+    for (random, out[16..]) |r, *o| o.* = base62[r % base62.len];
+}
+
+/// Whether a list reply (`reply(.inbox)`) holds an item with `id`.
+pub fn listHasId(list: Value, id: []const u8) bool {
+    if (list != .array) return false;
+    for (list.array.items) |x| if (str(x, "id")) |xid| if (std.mem.eql(u8, xid, id)) return true;
+    return false;
 }
 
 pub fn selectModelBody(a: std.mem.Allocator, m: ModelChoice) ![]u8 {

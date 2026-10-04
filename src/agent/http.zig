@@ -533,6 +533,25 @@ pub const Client = struct {
         return self.completions.orderedRemove(0);
     }
 
+    /// The completion of `ticket` once it finished; the others stay queued.
+    pub fn takeCompletionOf(self: *Client, ticket: u64) ?Completion {
+        for (self.completions.items, 0..) |done, i| {
+            if (done.ticket == ticket) return self.completions.orderedRemove(i);
+        }
+        return null;
+    }
+
+    /// Give up on async request `ticket`. Gotcha: its connection is closed,
+    /// and a server may stop handling a request whose client went away
+    /// (opencode 2.x does, measured).
+    pub fn cancel(self: *Client, ticket: u64) void {
+        if (self.connOf(ticket)) |cn| self.release(cn, false);
+        if (self.takeCompletionOf(ticket)) |done| switch (done.result) {
+            .response => |r| r.deinit(self.allocator),
+            .failed => {},
+        };
+    }
+
     /// The fds of async requests in flight (for the caller's poll).
     pub fn pollFds(self: *const Client, out: []c.struct_pollfd) usize {
         var n: usize = 0;

@@ -496,6 +496,8 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
             .error_code = @tagName(@import("mcp.zig").ErrCode.not_delivered),
             .screen = "app_evidence",
             .api = "http_accepted",
+            .api_unanswered = "message_lookup",
+            .api_lookup_ms = @import("../agent/opencode.zig").DELIVERY_LOOKUP_MS,
         });
         try res.fact("agent_send_interrupt", agents_ok);
         try res.fact("agent_send_requeue", agents_ok);

@@ -375,10 +375,13 @@ pub const Entry = struct {
 pub const QueuedPrompt = struct {
     text: []u8,
     template: ?[]u8 = null,
+    /// The message id an API source took it under.
+    id: ?[]u8 = null,
 
     pub fn free(self: QueuedPrompt, a: std.mem.Allocator) void {
         a.free(self.text);
         if (self.template) |t| a.free(t);
+        if (self.id) |x| a.free(x);
     }
 };
 
@@ -1345,4 +1348,16 @@ test "every agent tool answers in its declared shape: a scripted Claude Code on 
     // An attached terminal belongs to term_open: nothing was killed.
     try testing.expectEqual(@as(usize, 0), closed.get("sessions").?.array.items.len);
     try testing.expect(!app.failed.load(.acquire));
+}
+
+test "an API prompt whose acceptance never came and that the lookup did not find fails not_delivered" {
+    var set = adapter.Set.init(testing.allocator);
+    defer set.deinit();
+    try set.loadShipped();
+    var api = try @import("../agent/opencode.zig").Api.init(testing.allocator, set.get("opencode").?, .{}, .{ .port = 1, .password = "" });
+    defer api.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const f = try mcp_agent_act.apiFail(arena.allocator(), &api, error.NotDelivered);
+    try testing.expectEqual(mcp.ErrCode.not_delivered, f.code);
 }
