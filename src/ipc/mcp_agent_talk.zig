@@ -57,6 +57,7 @@ const permissionsValue = mcp_agent_results.permissionsValue;
 const relaunchableOf = mcp_agent_results.relaunchableOf;
 const block = mcp_agent_results.block;
 const eventsJson = mcp_agent_results.eventsJson;
+const isoAt = mcp_agent_results.isoAt;
 const writeSelection = mcp_agent_results.writeSelection;
 const pushing = mcp_agent_waiter.pushing;
 const rememberFilter = mcp_agent_waiter.rememberFilter;
@@ -323,7 +324,7 @@ pub fn waitAllTool(arena: std.mem.Allocator, args: std.json.Value, list: []const
         const st = e.agent.state();
         o.* = .{ .agent = e.id, .name = e.name, .outcome = outcomeOf(&.{}, st, e.sent_seq != null, false), .state = @tagName(st), .settled = false, .text = "", .record = null, .conversation = conversationOf(e), .events = &.{} };
         if (settleOf(e)) |s| {
-            const line = settledOf(e, s);
+            const line = try settledOf(arena, e, s);
             o.outcome = line.outcome;
             o.text = line.text;
             o.record = line.record;
@@ -749,6 +750,7 @@ pub fn listTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
         sessions: []const []const u8,
         started_ms: i64,
         last_activity_ms: ?i64,
+        last_activity_at: ?[]const u8,
         pending_events: usize,
         waiting_on_user: bool,
         queued_prompts: u32,
@@ -802,6 +804,7 @@ pub fn listTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
             .sessions = sessions.items,
             .started_ms = e.started_ms,
             .last_activity_ms = if (act_ms > 0) wall - @max(0, mono - act_ms) else null,
+            .last_activity_at = if (act_ms > 0) try isoAt(arena, wall - @max(0, mono - act_ms)) else null,
             .pending_events = e.agent.queue().undelivered(),
             .waiting_on_user = e.agent.interaction() != null,
             .queued_prompts = e.agent.queuedPrompts(),
@@ -841,6 +844,8 @@ fn listCompact(arena: std.mem.Allocator, until: i64) ![]const u8 {
         cwd: []const u8,
         /// Seconds since the app last drew or sent anything.
         idle_s: ?i64,
+        /// The local HH:MM of that activity.
+        active_at: ?[]const u8,
         queued: u32,
         pending: ?Pending,
         conversation: ?[]const u8,
@@ -875,6 +880,7 @@ fn listCompact(arena: std.mem.Allocator, until: i64) ![]const u8 {
             .host = e.host orelse "local",
             .cwd = e.cwd,
             .idle_s = if (act_ms > 0) @divTrunc(@max(0, mono - act_ms), 1000) else null,
+            .active_at = if (act_ms > 0) if (try isoAt(arena, clock.wallOfMono(act_ms))) |iso| clock.isoClock(iso) else null else null,
             .queued = e.agent.queuedPrompts(),
             .pending = if (it) |x| .{ .kind = @tagName(x.kind), .title = x.title } else null,
             .conversation = conversationOf(e),
@@ -891,6 +897,7 @@ fn listCompact(arena: std.mem.Allocator, until: i64) ![]const u8 {
         if (out.gone_reason) |r| try w.print(" (gone: {s})", .{r});
         if (out.relaunchable) |can| try w.print(", {s}", .{if (can) "relaunchable (agent_attach relaunch: true)" else "not relaunchable"});
         if (out.idle_s) |x| try w.print(", idle {d}s", .{x});
+        if (out.active_at) |hm| try w.print(" (since {s})", .{hm});
         if (out.queued > 0) try w.print(", {d} queued", .{out.queued});
         if (fr.line) |l| try w.print(", {s}", .{l});
         if (out.pending) |p| try w.print(", pending {s}: {s}", .{ p.kind, agentwait.clip(events.firstLine(p.title), 80) });

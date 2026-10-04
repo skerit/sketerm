@@ -210,6 +210,9 @@ pub const Source = struct {
     /// Replaying history (an adopted session's past): no turn is armed and
     /// no `message` event is pushed.
     quiet: bool = false,
+    /// The app's own wall time of the part being applied (`partTime`), 0
+    /// when it gave none: a record it creates is stamped with it.
+    part_at_ms: i64 = 0,
     /// The latest root assistant message that carried token counts, as
     /// JSON: the facts document's `message` (`Api.factsDocument`).
     last_answer: ?[]u8 = null,
@@ -679,6 +682,8 @@ pub const Source = struct {
 
     fn applyPart(self: *Source, part: Value, now_ms: i64) !void {
         _ = now_ms;
+        self.part_at_ms = partTime(part);
+        defer self.part_at_ms = 0;
         const pid = str(part, "id") orelse return;
         const sid = str(part, "sessionID") orelse return;
         if (!self.isRoot(sid)) return;
@@ -862,6 +867,7 @@ pub const Source = struct {
             .job = job,
             .synthetic = synthetic,
             .tool = owned_tool,
+            .at_ms = if (self.part_at_ms > 0) self.part_at_ms else clock.wallMs(),
         });
         return &self.records.items[self.records.items.len - 1];
     }
@@ -1174,6 +1180,15 @@ fn int(v: Value, key: []const u8) ?i64 {
         .float => |f| @intFromFloat(f),
         else => null,
     };
+}
+
+/// A part's start as the app timed it (`time.start`, a tool's
+/// `state.time.start`), epoch ms; 0 when absent or not an epoch time.
+fn partTime(part: Value) i64 {
+    const tm = get(part, "time") orelse if (get(part, "state")) |s| get(s, "time") orelse return 0 else return 0;
+    const start = int(tm, "start") orelse return 0;
+    // Anything before 2001 is a counter, not a wall time.
+    return if (start > 1_000_000_000_000) start else 0;
 }
 
 fn boolean(v: Value, key: []const u8) ?bool {

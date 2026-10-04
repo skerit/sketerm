@@ -6703,6 +6703,21 @@ fn agentCall(m: *Mcp, arena: std.mem.Allocator, name: []const u8, args_json: []c
     return capSc(arena, line, what, want_error);
 }
 
+/// `s` without the ` at HH:MM` a wake line puts after its kind.
+fn untimed(arena: std.mem.Allocator, s: []const u8) []const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < s.len) {
+        if (i + 9 <= s.len and std.mem.startsWith(u8, s[i..], " at ") and std.ascii.isDigit(s[i + 4]) and std.ascii.isDigit(s[i + 5]) and s[i + 6] == ':' and std.ascii.isDigit(s[i + 7]) and std.ascii.isDigit(s[i + 8])) {
+            i += 9;
+            continue;
+        }
+        out.append(arena, s[i]) catch fail("oom");
+        i += 1;
+    }
+    return out.items;
+}
+
 fn scStr(o: std.json.ObjectMap, key: []const u8, comptime what: []const u8) []const u8 {
     const v = o.get(key) orelse fail(what ++ ": a fact is missing");
     if (v != .string) fail(what ++ ": a fact is not a string");
@@ -7160,7 +7175,9 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
         _ = agentCall(&m, arena, "term_exec", std.fmt.allocPrint(arena, "{{\"term\":{d},\"command\":\"sleep 3\",\"timeout_ms\":20000}}", .{term_id}) catch fail("oom"), "term_exec sleep", false, 45_000);
         const woke = one_shot.finish(arena, 15_000, "one-shot waiter");
         // The plain waiter prints the push's text: the line, then the answer.
-        if (std.mem.indexOf(u8, woke, std.fmt.allocPrint(arena, "{s} done: echo: slow reply [state idle]\n\necho: slow reply\n", .{c1}) catch fail("oom")) == null) {
+        if (std.mem.indexOf(u8, untimed(arena, woke), std.fmt.allocPrint(arena, "{s} done: echo: slow reply [state idle]\n\necho: slow reply\n", .{c1}) catch fail("oom")) == null or
+            std.mem.indexOf(u8, woke, " done at ") == null)
+        {
             say(woke);
             fail("the one-shot waiter did not print the done wake-up with its answer in full");
         }
@@ -7300,7 +7317,7 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
         _ = c.usleep(300_000);
         _ = agentCall(&m, arena, "agent_send", "{\"agent\":\"claude-2\",\"text\":\"slow from two\",\"timeout_ms\":0}", "agent_send claude-2", false, 15_000);
         const any_out = any_waiter.finish(arena, 15_000, "--any waiter");
-        if (std.mem.indexOf(u8, any_out, std.fmt.allocPrint(arena, "{s} done: echo: slow from two", .{c2}) catch fail("oom")) == null) {
+        if (std.mem.indexOf(u8, untimed(arena, any_out), std.fmt.allocPrint(arena, "{s} done: echo: slow from two", .{c2}) catch fail("oom")) == null) {
             say(any_out);
             fail("the --any waiter did not wake on the second agent, by name");
         }
@@ -7351,8 +7368,8 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
                 say(bg3);
                 fail("agent_send with a follower: the prose still asks for a waiter");
             }
-            const want = std.fmt.allocPrint(arena, "\"content\":\"{s} done: echo: push to three [state idle]\\n\\necho: push to three\"", .{c3}) catch fail("oom");
-            if (!pushed.waitFor(arena, want, 1, 15_000)) {
+            const want = std.fmt.allocPrint(arena, "\"content\":\"{s} done at ", .{c3}) catch fail("oom");
+            if (!pushed.waitFor(arena, want, 1, 15_000) or std.mem.indexOf(u8, untimed(arena, pushed.out.items), ": echo: push to three [state idle]\\n\\necho: push to three\"") == null) {
                 say(pushed.out.items);
                 fail("the --server follower did not push the later agent's done with its answer");
             }
@@ -7401,7 +7418,7 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
             _ = agentCall(&ch, arena, "agent_send", "{\"agent\":\"claude-ch\",\"text\":\"channel ping\",\"timeout_ms\":0}", "agent_send channel", false, 15_000);
             const note = arena.dupe(u8, ch.recvLine(15_000)) catch fail("oom");
             const want_note = std.fmt.allocPrint(arena, "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/claude/channel\",\"params\":{{\"content\":\"{s} done: echo: channel ping [state idle]\\n\\necho: channel ping\",\"meta\":{{\"agent\":\"{s}\",\"name\":\"claude-ch\",\"kind\":\"done\"", .{ pid_ch, pid_ch }) catch fail("oom");
-            if (!std.mem.startsWith(u8, note, want_note)) {
+            if (!std.mem.startsWith(u8, untimed(arena, note), want_note) or std.mem.indexOf(u8, note, " done at ") == null) {
                 say(note);
                 fail("the channel notification is not the done with its answer");
             }
@@ -7574,7 +7591,7 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
         var all_waiter = Waiter.start(all_cmd);
         const all_out = all_waiter.finish(arena, 20_000, "--all waiter");
         for ([_][]const u8{ a_id, b_id }) |id| {
-            if (std.mem.indexOf(u8, all_out, std.fmt.allocPrint(arena, "{s} done: echo: fan out", .{id}) catch fail("oom")) == null) {
+            if (std.mem.indexOf(u8, untimed(arena, all_out), std.fmt.allocPrint(arena, "{s} done: echo: fan out", .{id}) catch fail("oom")) == null) {
                 say(all_out);
                 fail("the --all waiter did not report each agent's done");
             }

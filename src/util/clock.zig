@@ -73,6 +73,52 @@ pub fn localStamp(buf: []u8, ms: i64) ?[]const u8 {
     return buf[0..n];
 }
 
+/// The wall time (`wallMs` epoch) a `nowMs` reading `mono_ms` stands for,
+/// by the offset between the two clocks now (a wall step since moves it).
+pub fn wallOfMono(mono_ms: i64) i64 {
+    return wallMs() - (nowMs() - mono_ms);
+}
+
+/// The length of an `isoLocal` stamp.
+pub const ISO_LEN = 25;
+
+/// ISO-8601 LOCAL time with its UTC offset, to the second
+/// (`2026-10-04T11:32:50+02:00`), for `ms` epoch milliseconds.
+/// @return null when `ms` has no local representation.
+pub fn isoLocal(buf: *[ISO_LEN]u8, ms: i64) ?[]const u8 {
+    var t: c.time_t = @intCast(@divFloor(ms, 1000));
+    var tm: c.struct_tm = undefined;
+    if (c.localtime_r(&t, &tm) == null) return null;
+    var raw: [32]u8 = undefined;
+    // `%z` is `+0200`: the colon ISO-8601's extended form wants goes in.
+    const n = c.strftime(&raw, raw.len, "%Y-%m-%dT%H:%M:%S%z", &tm);
+    if (n != ISO_LEN - 1) return null;
+    @memcpy(buf[0..22], raw[0..22]);
+    buf[22] = ':';
+    @memcpy(buf[23..25], raw[22..24]);
+    return buf[0..];
+}
+
+/// The `HH:MM` of an `isoLocal` stamp (the compact lines' time).
+pub fn isoClock(iso: []const u8) []const u8 {
+    return if (iso.len == ISO_LEN) iso[11..16] else "";
+}
+
+test "isoLocal writes local time with its offset, and isoClock its HH:MM" {
+    const t = std.testing;
+    var buf: [ISO_LEN]u8 = undefined;
+    const s = isoLocal(&buf, 1_000_000_000_000).?;
+    try t.expectEqual(@as(usize, ISO_LEN), s.len);
+    try t.expectEqual(@as(u8, 'T'), s[10]);
+    try t.expect(s[19] == '+' or s[19] == '-');
+    try t.expectEqual(@as(u8, ':'), s[22]);
+    var short: [40]u8 = undefined;
+    // The same local minute as localStamp's.
+    try t.expectEqualStrings(localStamp(&short, 1_000_000_000_000).?[11..16], isoClock(s));
+    try t.expectEqualStrings("", isoClock("11:32"));
+    try t.expect(@abs(wallOfMono(nowMs()) - wallMs()) < 1000);
+}
+
 test "nowMs is monotonic and reads as milliseconds" {
     const t = std.testing;
     const a = nowMs();

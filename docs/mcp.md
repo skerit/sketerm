@@ -1224,6 +1224,19 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   free-text route). Claude Code's AskUserQuestion dialog was not available
   to measure (the tool is not offered in this setup), so no text rule
   exists for its questions yet.
+- **Wall-clock times.** Every record and event in a result (and
+  `agent_read`) carries `at`: ISO-8601 LOCAL time with its UTC offset, to
+  the second (`2026-10-04T11:32:50+02:00`), one format everywhere
+  (`clock.isoLocal`). An event's is when it first happened; a record's is
+  the app's own time where it gives one (opencode's part `time.start`),
+  else when sketerm first read it (a screen app's record; one re-captured
+  unchanged keeps its time). `agent_list detail` adds `last_activity_at`
+  beside `last_activity_ms`; compact `agent_list` adds `active_at` (local
+  `HH:MM`), and its line says `idle 40s (since 11:32)`. The waiter's
+  printed line (and the pushed text, a channel's `meta.at`) puts the
+  deciding event's `HH:MM` after its kind: `claude-k3f9 done at 11:32:
+  ...`; the wire events carry the full `at`. `agent_read`'s text lane
+  writes `[id HH:MM] kind: text`.
 - **Answers that do not fit.** A `choice` that names no option is
   `invalid_args` listing the options and the accepted forms (label,
   1-based number, unique part of a label; `text` too when the prompt takes

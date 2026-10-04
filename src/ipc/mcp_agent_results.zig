@@ -95,6 +95,8 @@ pub fn outcomeOf(items: []const events.Item, st: vocab.State, sent: bool, queued
 pub const EventJson = struct {
     seq: u64,
     kind: []const u8,
+    /// When it first happened (`isoAt`).
+    at: ?[]const u8 = null,
     text: []const u8,
     detail: []const u8,
     count: u32,
@@ -331,12 +333,20 @@ pub fn block(res: *Res, b: Block) !void {
     try res.text(b.body);
 }
 
+/// `wall_ms` as results write a time: `clock.isoLocal`, null when it has
+/// no local representation.
+pub fn isoAt(arena: std.mem.Allocator, wall_ms: i64) !?[]const u8 {
+    var buf: [clock.ISO_LEN]u8 = undefined;
+    return if (clock.isoLocal(&buf, wall_ms)) |s| try arena.dupe(u8, s) else null;
+}
+
 /// Delivered events as results list them (`finish`'s `events`).
 pub fn eventsJson(arena: std.mem.Allocator, items: []const events.Item) ![]const EventJson {
     const evs = try arena.alloc(EventJson, items.len);
     for (items, evs) |it, *out| out.* = .{
         .seq = it.event.seq,
         .kind = @tagName(it.kind),
+        .at = try agentwait.eventAt(arena, it.event),
         .text = eventText(it),
         .record = it.event.record,
         .detail = it.event.detail,
@@ -351,6 +361,7 @@ pub fn eventsJson(arena: std.mem.Allocator, items: []const events.Item) ![]const
 const RecordJson = struct {
     id: u64,
     kind: []const u8,
+    at: ?[]const u8 = null,
     text: []const u8,
     job: u32,
     synthetic: bool,
@@ -366,6 +377,7 @@ pub fn writeSelection(arena: std.mem.Allocator, res: *Res, recs: []const output.
         j.* = .{
             .id = r.id,
             .kind = @tagName(r.kind),
+            .at = if (r.at_ms > 0) try isoAt(arena, r.at_ms) else null,
             .text = r.text,
             .job = r.job,
             .synthetic = r.synthetic,
@@ -392,7 +404,10 @@ pub fn writeSelection(arena: std.mem.Allocator, res: *Res, recs: []const output.
         try w.writeAll(" ==");
         for (sel.picked) |i| {
             const r = recs[i];
-            if (r.job == s.job) try w.print("\n[{d}] {s}: {s}", .{ r.id, @tagName(r.kind), r.text });
+            if (r.job != s.job) continue;
+            var iso: [clock.ISO_LEN]u8 = undefined;
+            const hm = if (r.at_ms > 0) clock.isoClock(clock.isoLocal(&iso, r.at_ms) orelse "") else "";
+            try w.print("\n[{d}{s}{s}] {s}: {s}", .{ r.id, if (hm.len > 0) " " else "", hm, @tagName(r.kind), r.text });
         }
         // What was handed out before is never repeated: one pointer.
         if (s.earlier) |x| {

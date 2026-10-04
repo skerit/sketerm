@@ -374,7 +374,7 @@ fn serviceAll(arena: std.mem.Allocator, s: *Sub) void {
             o.* = .{ .agent = tg.id, .outcome = "closed", .state = "" };
             continue;
         };
-        o.* = settledOf(e, settleOf(e).?);
+        o.* = settledOf(arena, e, settleOf(e).?) catch return endSub(s, "out of memory");
         // Delivered like any wake-up: no result repeats it.
         if (tg.cursor.take(e.agent.queue(), .{}, clock.nowMs(), arena)) |_| {} else |_| {}
     }
@@ -629,7 +629,8 @@ test "the plain waiter prints the push text: a done's answer in full, then hande
     const m = try std.json.parseFromSliceLeaky(agentwait.Message, a, std.mem.trimEnd(u8, woke, "\n"), .{ .ignore_unknown_fields = true });
     var printed: std.Io.Writer.Allocating = .init(a);
     try agentwait.formatPrinted(&printed.writer, m);
-    try testing.expectEqualStrings("claude-1 done: " ++ answer ++ " [state disconnected]\n\n" ++ answer, printed.written());
+    const hm = clock.isoClock(m.events[0].at.?);
+    try testing.expectEqualStrings(try std.fmt.allocPrint(a, "claude-1 done at {s}: " ++ answer ++ " [state disconnected]\n\n" ++ answer, .{hm}), printed.written());
     // Printed in full: handed out, so the default read does not repeat it.
     try testing.expect(e.handed.has(eng.records.items[0]));
     const read = try shaped(a, "agent_read", try rig.call(.agent_read, "{}"));

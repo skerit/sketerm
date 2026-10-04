@@ -640,7 +640,7 @@ pub fn settleOf(e: *Entry) ?Settle {
 }
 
 /// One agent's line of an `all` wake: the settling kind (else the state).
-pub fn settledOf(e: *const Entry, s: Settle) agentwait.Settled {
+pub fn settledOf(arena: std.mem.Allocator, e: *const Entry, s: Settle) !agentwait.Settled {
     const ev = s.event orelse return .{ .agent = e.id, .outcome = @tagName(s.state), .state = @tagName(s.state) };
     return .{
         .agent = e.id,
@@ -648,6 +648,7 @@ pub fn settledOf(e: *const Entry, s: Settle) agentwait.Settled {
         .state = @tagName(s.state),
         .text = if (ev.kind.announcesRecord()) events.preview(ev.text) else ev.text,
         .record = ev.record,
+        .at = try agentwait.eventAt(arena, ev),
     };
 }
 

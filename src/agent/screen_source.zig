@@ -21,6 +21,7 @@ const events = @import("events.zig");
 const grammar = @import("grammar.zig");
 const output = @import("output.zig");
 const select = @import("select.zig");
+const clock = @import("../util/clock.zig");
 const Screen = @import("../grid/screen.zig").Screen;
 const cell_mod = @import("../grid/cell.zig");
 
@@ -242,7 +243,7 @@ pub const Engine = struct {
         const owned = try self.allocator.dupe(u8, text);
         errdefer self.allocator.free(owned);
         const turn: u32 = if (self.turns.items.len > 0) @intCast(self.turns.items.len - 1) else 0;
-        try self.records.append(self.allocator, .{ .id = self.nextId(), .kind = .notice, .text = owned, .job = turn, .synthetic = true });
+        try self.records.append(self.allocator, .{ .id = self.nextId(), .kind = .notice, .text = owned, .job = turn, .synthetic = true, .at_ms = clock.wallMs() });
     }
 
     /// The adapter is about to type `text` as its own command: the turn it
@@ -997,6 +998,7 @@ pub const Engine = struct {
                 .job = @intCast(ti),
                 .announced = if (kept) |k| k.announced else false,
                 .segment_final = if (kept) |k| k.segment_final else false,
+                .at_ms = if (kept) |k| k.at_ms else clock.wallMs(),
             }) catch |err| {
                 self.allocator.free(text);
                 return err;

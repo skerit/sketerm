@@ -42,6 +42,9 @@ pub const Record = struct {
     segment_final: bool = false,
     /// Owned by the source; null for records without a structured call.
     tool: ?ToolCall = null,
+    /// Wall time (`clock.wallMs`) it appeared: the app's own time where it
+    /// gives one (opencode), else when it was first read; 0 = unknown.
+    at_ms: i64 = 0,
 
     /// Frees the text and the tool call.
     pub fn deinit(self: Record, allocator: std.mem.Allocator) void {

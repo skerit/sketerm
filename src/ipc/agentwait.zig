@@ -90,7 +90,18 @@ pub const WireEvent = struct {
     kind: []const u8,
     text: []const u8,
     count: u32 = 1,
+    /// When it first happened (`clock.isoLocal`); absent from an older
+    /// server and for an event without a time.
+    at: ?[]const u8 = null,
 };
+
+/// When event `ev` first happened, as the wire and results write it;
+/// null for an event without a time (`t_ms` 0).
+pub fn eventAt(arena: std.mem.Allocator, ev: *const events.Event) !?[]const u8 {
+    if (ev.t_ms <= 0) return null;
+    var buf: [clock.ISO_LEN]u8 = undefined;
+    return if (clock.isoLocal(&buf, clock.wallOfMono(ev.t_ms))) |s| try arena.dupe(u8, s) else null;
+}
 
 pub const WireDigest = struct { count: u32, latest: []const u8 };
 
@@ -106,6 +117,8 @@ pub const Meta = struct {
     record: ?[]const u8 = null,
     job: ?[]const u8 = null,
     conversation: ?[]const u8 = null,
+    /// When the deciding event happened (`eventAt`).
+    at: ?[]const u8 = null,
 };
 
 /// What a `server` subscription's wake carries besides the events.
@@ -121,6 +134,8 @@ pub const Settled = struct {
     text: []const u8 = "",
     /// A done's answer record (agent_read final returns it whole).
     record: ?u64 = null,
+    /// When the settling event happened (`eventAt`).
+    at: ?[]const u8 = null,
 };
 
 /// Every server line; `type` is "wake", "all" or "end".
@@ -153,6 +168,8 @@ pub fn formatAll(w: *std.Io.Writer, m: Message) !void {
     try w.print("all {d} agent(s) settled", .{m.results.len});
     for (m.results) |r| {
         try w.print("\n{s} {s}", .{ r.agent, r.outcome });
+        const hm = clock.isoClock(r.at orelse "");
+        if (hm.len > 0) try w.print(" at {s}", .{hm});
         const first = firstLine(r.text);
         if (first.len > 0) {
             try w.writeAll(": ");
@@ -185,6 +202,7 @@ pub fn wakeMessage(arena: std.mem.Allocator, agent: []const u8, state: vocab.Sta
         .kind = @tagName(it.kind),
         .text = clip(it.event.text, WIRE_TEXT_MAX),
         .count = it.event.count,
+        .at = try eventAt(arena, it.event),
     };
     const digest: ?WireDigest = if (d.digest) |g| .{
         .count = g.count,
@@ -214,6 +232,8 @@ pub fn formatWake(w: *std.Io.Writer, m: Message) !void {
     try w.writeAll(m.agent);
     if (best) |b| {
         try w.print(" {s}", .{b.kind});
+        const hm = clock.isoClock(b.at orelse "");
+        if (hm.len > 0) try w.print(" at {s}", .{hm});
         const first = firstLine(b.text);
         if (first.len > 0) {
             try w.writeAll(": ");
@@ -687,6 +707,27 @@ test "an all wake: one line, then one line per agent with how it settled" {
     // The subscribe line carries all beside agents; an old line has none.
     const sub = try std.json.parseFromSliceLeaky(Subscribe, a, "{\"agent\":\"a\",\"agents\":[\"a\",\"b\"],\"all\":true}", .{ .ignore_unknown_fields = true });
     try t.expect(sub.all and sub.names().len == 2);
+}
+
+test "a timed event carries its wall time on the wire and HH:MM in the line" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var q = events.Queue.init(t.allocator, .{});
+    defer q.deinit();
+    const now = clock.nowMs();
+    _ = try q.push(now, .done, null, "All done.", "");
+    var cur: events.Cursor = .{};
+    const d = (try cur.take(&q, .{}, now, a)).?;
+    const line = try encodeWake(a, "claude-1", .idle, d, &q, null);
+    const m = try std.json.parseFromSliceLeaky(Message, a, line[0 .. line.len - 1], .{ .ignore_unknown_fields = true });
+    const at = m.events[0].at.?;
+    var want: [clock.ISO_LEN]u8 = undefined;
+    // Same second, give or take the one the call may have crossed.
+    try t.expectEqualStrings(clock.isoLocal(&want, clock.wallMs()).?[0..16], at[0..16]);
+    var aw: std.Io.Writer.Allocating = .init(a);
+    try formatWake(&aw.writer, m);
+    try t.expectEqualStrings(try std.fmt.allocPrint(a, "claude-1 done at {s}: All done. [state idle]", .{clock.isoClock(at)}), aw.written());
 }
 
 test "wake lines: encode, parse, and one compact printed line" {

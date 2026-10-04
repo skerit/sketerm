@@ -149,6 +149,7 @@ pub fn compose(arena: std.mem.Allocator, who: Subject, d: events.Delivery, q: *c
             .record = if (best) |b| if (b.event.record) |r| try std.fmt.allocPrint(arena, "{d}", .{r}) else null else null,
             .job = if (best) |b| if (b.event.job) |j| try std.fmt.allocPrint(arena, "{d}", .{j}) else null else null,
             .conversation = who.conversation,
+            .at = if (best) |b| try agentwait.eventAt(arena, b.event) else null,
         },
     };
 }
@@ -268,7 +269,7 @@ test "a wake carries what its line cuts: a message in full, a prompt's options, 
     try t.expectEqual(@as(?usize, 0), pm.answer);
 
     // A prompt: its options, which the line never shows.
-    _ = try q.push(1, .needs_input, null, "permission: Bash (rm notes.md)", "1. Yes\n2. No");
+    _ = try q.push(0, .needs_input, null, "permission: Bash (rm notes.md)", "1. Yes\n2. No");
     const dn = (try cur.take(&q, .{}, 1, a)).?;
     const pn = try compose(a, .{ .agent = "claude-k3f9", .state = .waiting_user }, dn, &q, &recs, &handed);
     try t.expectEqualStrings("claude-k3f9 needs_input: permission: Bash (rm notes.md) [state waiting_user]\n\n1. Yes\n2. No", pn.content);
@@ -276,11 +277,11 @@ test "a wake carries what its line cuts: a message in full, a prompt's options, 
 
     // An error the line cuts: its whole text; a short one adds nothing.
     const long = "API Error: " ++ "x" ** 200;
-    _ = try q.push(2, .@"error", .api, long, "");
+    _ = try q.push(0, .@"error", .api, long, "");
     const de = (try cur.take(&q, .{}, 2, a)).?;
     const pe = try compose(a, .{ .agent = "claude-k3f9", .state = .idle }, de, &q, &recs, &handed);
     try t.expect(std.mem.endsWith(u8, pe.content, "[state idle]\n\n" ++ long));
-    _ = try q.push(3, .exited, null, "", "");
+    _ = try q.push(0, .exited, null, "", "");
     const dx = (try cur.take(&q, .{}, 3, a)).?;
     const px = try compose(a, .{ .agent = "claude-k3f9", .state = .exited }, dx, &q, &recs, &handed);
     try t.expectEqualStrings("claude-k3f9 exited [state exited]", px.content);

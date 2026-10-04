@@ -928,6 +928,12 @@ test "every agent tool answers in its declared shape: a scripted Claude Code on 
     try testing.expectEqual(@as(usize, 1), sent_recs.len);
     try testing.expectEqualStrings("echo: hello", sent_recs[0].object.get("text").?.string);
     try testing.expectEqual(@as(i64, 0), sent.get("jobs").?.array.items[0].object.get("job").?.integer);
+    // Records and events say when, in local wall time with its offset.
+    var today: [clock.ISO_LEN]u8 = undefined;
+    const day = clock.isoLocal(&today, clock.wallMs()).?[0..10];
+    try testing.expect(std.mem.startsWith(u8, sent_recs[0].object.get("at").?.string, day));
+    try testing.expectEqual(@as(usize, clock.ISO_LEN), sent_recs[0].object.get("at").?.string.len);
+    for (sent.get("events").?.array.items) |ev| try testing.expect(std.mem.startsWith(u8, ev.object.get("at").?.string, day));
 
     // The done result handed the answer out: a read right after has
     // nothing new (it used to repeat the job), and says so.
@@ -1031,6 +1037,7 @@ test "every agent tool answers in its declared shape: a scripted Claude Code on 
     try testing.expectEqualStrings("fake-claude", item.get("sessions").?.array.items[0].string);
     try testing.expect(item.get("started_ms").?.integer > 0);
     try testing.expect(item.get("last_activity_ms").?.integer >= item.get("started_ms").?.integer - 1000);
+    try testing.expectEqual(@as(usize, clock.ISO_LEN), item.get("last_activity_at").?.string.len);
     try testing.expectEqual(@as(i64, 0), item.get("queued_prompts").?.integer);
     // The default list: the compact facts only.
     const compact = try shaped(a, "agent_list", try rig.call(.agent_list, "{}"));
@@ -1039,6 +1046,7 @@ test "every agent tool answers in its declared shape: a scripted Claude Code on 
     try testing.expectEqualStrings("local", citem.get("host").?.string);
     try testing.expectEqual(@as(i64, 0), citem.get("queued").?.integer);
     try testing.expect(citem.get("idle_s").?.integer >= 0);
+    try testing.expectEqual(@as(u8, 0x3a), citem.get("active_at").?.string[2]);
     try testing.expect(citem.get("sessions") == null and citem.get("recordings") == null and citem.get("pending") == null);
 
     // final: the newest job's last message, under the handed-out state.
