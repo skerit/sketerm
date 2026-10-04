@@ -35,6 +35,7 @@ const mcp_agent = @import("mcp_agent.zig");
 const mcp_agent_results = @import("mcp_agent_results.zig");
 const mcp_agent_waiter = @import("mcp_agent_waiter.zig");
 const mcp_agent_act = @import("mcp_agent_act.zig");
+const mcp_agent_open = @import("mcp_agent_open.zig");
 
 const DEFAULT_WAIT_MS = mcp_agent.DEFAULT_WAIT_MS;
 const ATTACH_WAIT_MS = mcp_agent.ATTACH_WAIT_MS;
@@ -46,25 +47,25 @@ const adapters = mcp_agent.adapters;
 const findByName = mcp_agent.findByName;
 const lockPath = mcp_agent.lockPath;
 const findById = mcp_agent.findById;
-const setRetryPolicy = mcp_agent.setRetryPolicy;
 const goneDetail = mcp_agent.goneDetail;
 const spawnForward = mcp_agent.spawnForward;
 const gone = mcp_agent.gone;
 const waitReady = mcp_agent.waitReady;
 const Fail = mcp_agent.Fail;
 const deadlineFrom = mcp_agent.deadlineFrom;
-const OpenOpts = mcp_agent.OpenOpts;
-const startAgent = mcp_agent.startAgent;
-const LaunchFacts = mcp_agent.LaunchFacts;
-const newEntry = mcp_agent.newEntry;
-const dropBare = mcp_agent.dropBare;
-const sshDiagnose = mcp_agent.sshDiagnose;
 const Block = mcp_agent_results.Block;
 const pending = mcp_agent_results.pending;
 const finish = mcp_agent_results.finish;
 const writeSelection = mcp_agent_results.writeSelection;
 const endWaitersOf = mcp_agent_waiter.endWaitersOf;
 const applySet = mcp_agent_act.applySet;
+const setRetryPolicy = mcp_agent_open.setRetryPolicy;
+const OpenOpts = mcp_agent_open.OpenOpts;
+const startAgent = mcp_agent_open.startAgent;
+const LaunchFacts = mcp_agent_open.LaunchFacts;
+const newEntry = mcp_agent_open.newEntry;
+const dropBare = mcp_agent_open.dropBare;
+const sshDiagnose = mcp_agent_open.sshDiagnose;
 
 /// Legacy descriptors (durable instances before the per-user index) live
 /// here, in the instance dir.

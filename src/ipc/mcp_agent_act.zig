@@ -22,6 +22,7 @@ const argStr = mcp.argStr;
 const mcp_agent = @import("mcp_agent.zig");
 const mcp_agent_results = @import("mcp_agent_results.zig");
 const mcp_agent_index = @import("mcp_agent_index.zig");
+const mcp_agent_open = @import("mcp_agent_open.zig");
 
 const STEP_WAIT_MS = mcp_agent.STEP_WAIT_MS;
 const INTERRUPT_SETTLE_MS = mcp_agent.INTERRUPT_SETTLE_MS;
@@ -41,16 +42,16 @@ const waitStep = mcp_agent.waitStep;
 const waitSideAsked = mcp_agent.waitSideAsked;
 const waitSideAnswer = mcp_agent.waitSideAnswer;
 const Fail = mcp_agent.Fail;
-const newUuid = mcp_agent.newUuid;
-const record = mcp_agent.record;
-const SpawnSpec = mcp_agent.SpawnSpec;
-const spawnOn = mcp_agent.spawnOn;
 const Delivered = mcp_agent_results.Delivered;
 const combine = mcp_agent_results.combine;
 const toJson = mcp_agent_results.toJson;
 const block = mcp_agent_results.block;
 const writeDescriptor = mcp_agent_index.writeDescriptor;
 const publishAgents = mcp_agent_index.publishAgents;
+const newUuid = mcp_agent_open.newUuid;
+const record = mcp_agent_open.record;
+const SpawnSpec = mcp_agent_open.SpawnSpec;
+const spawnOn = mcp_agent_open.spawnOn;
 
 /// Pause after the keys that clear an input box: an Escape followed at
 /// once by text reads as Alt+key to the app.
