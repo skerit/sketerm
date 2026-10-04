@@ -210,10 +210,10 @@ const AGENT_INTERACTION = "{\"type\":\"object\",\"description\":\"What the agent
 /// The app's conversation an agent runs, for `agent_open resume` after a restart.
 const AGENT_CONVERSATION = "{\"type\":\"string\",\"description\":\"The conversation the agent runs, fresh or resumed: Claude Code's session id (its --session-id / --resume value) or opencode's API session id (ses_...); agent_open resume takes it. Absent while unknown\"}";
 
-/// An agent's `retry_on_overload` policy and where it stands (`mcp_agent.retryFacts`).
+/// An agent's `retry_on_overload` policy and where it stands (`mcp_agent_results.retryFacts`).
 const AGENT_RETRY_FACT = "\"retry_on_overload\":{\"type\":\"object\",\"description\":\"Set: a turn a provider overload (error class overloaded) ends is continued with the adapter's continue prompt after backoff_s, doubling, at most max times per job (a prompt you send starts a new job); absent: off\",\"properties\":{\"max\":{\"type\":\"integer\"},\"backoff_s\":{\"type\":\"integer\"},\"used\":{\"type\":\"integer\",\"description\":\"Retries spent in the current job\"},\"pending\":{\"type\":\"boolean\",\"description\":\"An overload is being retried: its error wakes nobody unless the retries give up\"},\"next_in_ms\":{\"type\":[\"integer\",\"null\"],\"description\":\"When the next continue prompt goes in; null when none is scheduled\"}},\"required\":[\"max\",\"backoff_s\"]}";
 
-/// A gone agent's facts (`mcp_agent.goneFacts`), as agent_attach answers them.
+/// A gone agent's facts (`mcp_agent_results.goneFacts`), as agent_attach answers them.
 const AGENT_GONE_FACTS = "\"relaunchable\":{\"type\":\"boolean\",\"description\":\"Present once the agent is gone (state exited): its launch settings and conversation are kept, so agent_attach {agent, relaunch: true} starts it again\"},\"gone_reason\":{\"type\":\"string\",\"enum\":[" ++ enumItems(@import("../mux/tombstones.zig").Reason) ++ "],\"description\":\"A reconnect reached its daemon and found its session gone: why, as that daemon's record says (unknown: no record, as a daemon fresh after a reboot)\"}";
 
 /// The template the call's prompt was rendered from (`Watch.template`).
@@ -222,14 +222,14 @@ const AGENT_TEMPLATE_PROP = "\"template\":{\"type\":\"string\",\"description\":\
 /// agent_send's and agent_open's template arguments.
 const AGENT_BRIEF_INPUT = "\"template\":{\"type\":\"string\",\"description\":\"A saved brief template (agent_templates) to render as the prompt; with text/prompt too, that text is appended after it\"},\"vars\":{\"type\":\"object\",\"additionalProperties\":{\"type\":\"string\"},\"description\":\"The template's variables, name to value; one without a default must be passed, an unknown one is invalid_args\"}";
 
-/// An agent's known facts (`mcp_agent.factsOf`); `capabilities.agent_facts` is the vocabulary.
+/// An agent's known facts (`mcp_agent_hosts.factsOf`); `capabilities.agent_facts` is the vocabulary.
 const AGENT_FACTS_PROP = "\"facts\":{\"type\":\"object\",\"additionalProperties\":{\"type\":\"number\"},\"description\":\"What the agent's app reports about itself, by fact name (capabilities.agent_facts lists the names, their types and which adapter gives which): context_used_percent, rate limits, cost. Only known values; a fact not reported yet is absent, never 0\"}";
 
 /// `capabilities.agent_facts` (`mcp_caps`): the vocabulary of `data/agents/facts.json` and each adapter's share of it.
 const AGENT_FACTS_CAP = "\"agent_facts\":{\"type\":\"object\",\"description\":\"The facts agents report (the facts object of every per-agent result and agent_list): each name's type and meaning, and per adapter the names it can give (Claude Code through its status line command, opencode from its API); a fact an agent has not reported yet is absent\",\"properties\":{\"facts\":{\"type\":\"object\",\"additionalProperties\":{\"type\":\"object\",\"properties\":{\"type\":{\"type\":\"string\",\"enum\":[" ++
     enumItems(@import("../agent/facts.zig").FactType) ++ "]},\"meaning\":{\"type\":\"string\"},\"compact\":{\"type\":\"string\",\"description\":\"Its label in agent_list's one-line form\"}}}},\"adapters\":{\"type\":\"object\",\"additionalProperties\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}}}}";
 
-/// The facts `mcp_agent.finish` writes on every per-agent result.
+/// The facts `mcp_agent_results.finish` writes on every per-agent result.
 const AGENT_PROPS = AGENT_TEMPLATE_PROP ++ "," ++ AGENT_FACTS_PROP ++ "," ++ AGENT_RETRY_FACT ++ "," ++ AGENT_STALL_FACT ++ "," ++ AGENT_GONE_FACTS ++ ",\"agent\":{\"type\":\"string\",\"description\":\"The agent id every agent_* tool takes (unique on this machine; agent_attach resumes it from any server)\"},\"name\":{\"type\":\"string\",\"description\":\"agent_open's name: usable wherever the id is\"},\"app\":{\"type\":\"string\"},\"source\":{\"type\":\"string\",\"enum\":[" ++ enumItems(vocab.SourceKind) ++
     "]},\"state\":{\"type\":\"string\",\"enum\":[" ++ enumItems(vocab.State) ++
     "]},\"ready\":{\"type\":\"boolean\",\"description\":\"Input sent now is not lost\"},\"session\":{\"type\":\"string\",\"description\":\"The terminal session the user can watch in the sketerm GUI\"},\"server_session\":{\"type\":\"string\",\"description\":\"API sources: the session running the app's server\"},\"host\":{\"type\":\"string\",\"description\":\"The SSH host the agent runs on (absent: this machine)\"},\"conversation\":" ++ AGENT_CONVERSATION ++ "," ++ TRANSPORT_FACT ++ ",\"interaction\":" ++ AGENT_INTERACTION ++
@@ -239,7 +239,7 @@ const AGENT_RECORD_ITEM = "{\"type\":\"object\",\"properties\":{\"id\":{\"type\"
     "]},\"text\":{\"type\":\"string\"},\"job\":{\"type\":\"integer\",\"description\":\"The job: one user prompt and everything the agent did until the next, turns it started on its own included\"},\"synthetic\":{\"type\":\"boolean\",\"description\":\"Recorded by the adapter, not read from the app (an answered permission)\"},\"tool\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"input\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[" ++
     enumItems(vocab.ToolStatus) ++ "]},\"output\":{\"type\":\"string\"}}}},\"required\":[\"id\",\"kind\",\"text\",\"job\"]}";
 
-/// A `select.Selection` as `mcp_agent.writeSelection` writes it.
+/// A `select.Selection` as `mcp_agent_results.writeSelection` writes it.
 const AGENT_SELECTION_PROPS = "\"records\":{\"type\":\"array\",\"items\":" ++ AGENT_RECORD_ITEM ++ ",\"description\":\"Chronological; never a user prompt, never one handed to you before\"},\"jobs\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"job\":{\"type\":\"integer\"},\"omitted_messages\":{\"type\":\"integer\",\"description\":\"Assistant messages of the job not in records\"},\"omitted_tools\":{\"type\":\"integer\",\"description\":\"Tool calls of the job not in records\"},\"returned_before\":{\"type\":\"integer\",\"description\":\"Selected records of the job left out because an earlier result handed them to you\"},\"earlier\":{\"type\":\"object\",\"description\":\"The one of those to point at: the job's answer, else the latest\",\"properties\":{\"id\":{\"type\":\"integer\"},\"kind\":{\"type\":\"string\",\"enum\":[" ++ enumItems(vocab.RecordKind) ++ "]},\"chars\":{\"type\":\"integer\"}},\"required\":[\"id\",\"kind\",\"chars\"]}},\"required\":[\"job\",\"omitted_messages\",\"omitted_tools\",\"returned_before\"]}},\"cut_ids\":{\"type\":\"array\",\"items\":{\"type\":\"integer\"},\"description\":\"Selected records of the listed jobs the size cap left out; the next agent_read returns them\"},\"jobs_pending\":{\"type\":\"integer\",\"description\":\"Jobs with new records the cap kept out entirely (not in jobs or cut_ids); the next agent_read returns them\"}";
 
 /// The facts of a result that waited.
@@ -258,7 +258,7 @@ fn agentSchemaSeveral(comptime extra: []const u8, comptime required: []const u8)
     return "{\"type\":\"object\",\"properties\":{" ++ AGENT_PROPS ++ extra ++ "},\"required\":[" ++ required ++ "]}";
 }
 
-/// One agent's line of agent_send `agents` (`mcp_agent.SendResult`).
+/// One agent's line of agent_send `agents` (`mcp_agent_talk.SendResult`).
 /// What `agent_send interrupt` queued again: the prompts this server had queued that the interrupt made the app drop.
 const AGENT_REQUEUED = "\"requeued\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"},\"template\":{\"type\":\"string\",\"description\":\"A rendered brief template: only its name\"}}},\"description\":\"interrupt: the prompts THIS server had queued that the interrupt made the app drop, queued again behind the new one in their order\"},\"requeue_failed\":{\"type\":\"object\",\"properties\":{\"code\":{\"type\":\"string\"},\"message\":{\"type\":\"string\"},\"not_requeued\":{\"type\":\"integer\"}},\"description\":\"Queuing them again stopped at this failure; not_requeued were not typed again\"}";
 

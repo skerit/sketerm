@@ -8,7 +8,7 @@
 //! This module is the one home of both halves' shared vocabulary: the
 //! subscribe line, the server's wake/end lines, the CLI's argument
 //! grammar and the exact `watch_command` a tool result hands out. The
-//! server side (which events wake whom) is `mcp_agent.zig` over the same
+//! server side (which events wake whom) is `mcp_agent_waiter.zig` over the same
 //! `events.Cursor.take` that `agent_wait` uses.
 //!
 //! Wire, newline-delimited JSON. Client -> server, once:
