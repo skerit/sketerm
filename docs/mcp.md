@@ -1739,9 +1739,16 @@ TUI attached to that server for a human to watch is optional, see below).
   read directly; a remote one's rides its host's probe (the same
   terminal, 15 s cache and 1.5 s `agent_list` wait as `hosts`), so
   remote facts can be up to 15 s old. opencode's source is its API:
-  `message` (the latest root assistant message with `tokens`) and
-  `model` (that model's entry in `GET /provider`, loaded once per
-  agent); its percent is derived. No daemon wire change: the file path
+  `message` (the latest root assistant message with a token count above
+  0) and `model` (that model's entry in `GET /provider`, read again at
+  the first facts read, since a catalog loaded while the server starts
+  can hold another window, then kept); its percent is derived. Measured on both generations: each
+  model step is its own message, created with every count 0 (1.x) and
+  filled when the step ends, and its counts are that one request's
+  (input without the cache read), so the sum of input, output,
+  reasoning and both cache counts of the latest counted step is what
+  the window holds, as opencode's own UI reads it; a lifetime total is
+  never the context. No daemon wire change: the file path
   and the user's command ride the spawn's environment like `env`.
 - **Retry on overload (`retry_on_overload`,
   `capabilities.agent_retry_on_overload`).** Off by default. `agent_open`

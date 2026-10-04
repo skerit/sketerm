@@ -223,7 +223,7 @@ pub const Source = struct {
     /// The app's own wall time of the part being applied (`partTime`), 0
     /// when it gave none: a record it creates is stamped with it.
     part_at_ms: i64 = 0,
-    /// The latest root assistant message that carried token counts, as
+    /// The latest root assistant message with a token count above 0, as
     /// JSON: the facts document's `message` (`Api.factsDocument`).
     last_answer: ?[]u8 = null,
 
@@ -636,7 +636,11 @@ pub const Source = struct {
             if (get(info, "model")) |model| try self.noteModel(str(model, "providerID"), str(model, "modelID"), str(info, "variant"));
             return;
         }
-        if (get(info, "tokens") != null) {
+        // opencode creates each step's message with every count 0 and
+        // fills them when the step ends (measured, 1.x and 2.x): until then
+        // the context is still the previous step's, as opencode's own UI
+        // reads it (its latest assistant message with any count above 0).
+        if (anyCountAboveZero(get(info, "tokens"))) {
             const json = try std.json.Stringify.valueAlloc(self.allocator, info, .{});
             if (self.last_answer) |old| self.allocator.free(old);
             self.last_answer = json;
@@ -1125,6 +1129,19 @@ pub const Source = struct {
     }
 };
 
+/// Some number inside `v` (a `tokens` object, nested `cache` included) is above 0.
+fn anyCountAboveZero(v: ?Value) bool {
+    const x = v orelse return false;
+    return switch (x) {
+        .integer => |i| i > 0,
+        .float => |f| f > 0,
+        .object => |o| for (o.values()) |y| {
+            if (anyCountAboveZero(y)) break true;
+        } else false,
+        else => false,
+    };
+}
+
 fn sameContent(r: Record, text: []const u8, tool: ?Source.ToolFields) bool {
     if (!std.mem.eql(u8, r.text, text)) return false;
     const a = r.tool orelse return tool == null;
@@ -1294,6 +1311,8 @@ pub const Api = struct {
     catalog: ?Catalog = null,
     /// `factsDocument` could not load the catalog: it does not ask again.
     catalog_failed: bool = false,
+    /// `factsDocument` has read the catalog once itself.
+    catalog_for_facts: bool = false,
     chosen_model: ?[2][]u8 = null,
     chosen_variant: ?[]u8 = null,
     /// A dialect that `selectsOnSession`: the chosen model or effort is not
@@ -1813,10 +1832,13 @@ pub const Api = struct {
     }
 
     /// The document the adapter's `facts.map` paths read: `message`, the
-    /// latest answer that carried token counts, and `model`, that answer's
+    /// latest answer with a token count above 0, and `model`, that answer's
     /// model as the connected providers list it. Null before any answer.
-    /// Gotcha: the first call loads the provider catalog (one loopback
-    /// request per agent; a failure is not retried and leaves `model` out).
+    /// Gotcha: the first call (re)loads the provider catalog (one loopback
+    /// request per agent; a failure is not retried and leaves `model` out):
+    /// one loaded while the server was starting (a model chosen at open)
+    /// may not be the one it settles on (observed on 2.0.18: an agent
+    /// reported models.dev's 1050000 window while its server answers 400000).
     pub fn factsDocument(self: *Api, arena: std.mem.Allocator) !?Value {
         const text = self.source.last_answer orelse return null;
         const info = std.json.parseFromSliceLeaky(Value, arena, text, .{}) catch return null;
@@ -1825,10 +1847,11 @@ pub const Api = struct {
         const provider = str(info, "providerID");
         const model = str(info, "modelID");
         if (provider != null and model != null and !self.catalog_failed) {
-            const cat = self.loadCatalog(false) catch blk: {
+            const cat = self.loadCatalog(!self.catalog_for_facts) catch blk: {
                 self.catalog_failed = true;
                 break :blk null;
             };
+            self.catalog_for_facts = true;
             if (cat) |cg| if (cg.find(provider.?, model.?)) |m| {
                 if (std.json.parseFromSliceLeaky(Value, arena, m.raw, .{})) |v| try doc.put(arena, "model", v) else |_| {}
             };
@@ -2636,6 +2659,11 @@ test "api: the facts document is the latest answer's tokens and its model's cata
     var api = try Api.init(t.allocator, loaded, .{}, .{ .port = srv.port(), .password = "secret" });
     defer api.deinit();
     try api.connect(null, clock.nowMs());
+    // A catalog loaded while the server starts (a model chosen at open)...
+    srv.route("GET /provider", .{ .body = "{\"all\":[{\"id\":\"openai\",\"models\":{\"gpt-x\":{\"name\":\"GPT X\",\"limit\":{\"context\":1050000}}}}],\"connected\":[\"openai\"]}" });
+    _ = try api.listModels();
+    // ...is read again for the facts once the server has settled.
+    srv.route("GET /provider", .{ .body = "{\"all\":[{\"id\":\"openai\",\"models\":{\"gpt-x\":{\"name\":\"GPT X\",\"limit\":{\"context\":400000,\"output\":128000}}}}],\"connected\":[\"openai\"]}" });
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -3324,4 +3352,80 @@ test "api: a server that answers no declared generation is refused at once, nami
     try t.expectError(error.UnknownApi, api.probeReady(clock.nowMs() + 2000));
     try t.expect(std.mem.indexOf(u8, api.problem(), "GET /api/info answered 200 but not with JSON; GET /global/health answered 200 but not with JSON") != null);
     try t.expect(api.apiVersion() == null);
+}
+
+// ── context facts ────────────────────────────────────────────────
+
+/// `context_used_tokens` and `context_used_percent` of `src`'s latest
+/// answer against a 400000-token window.
+fn contextFacts(src: *const Source, a: std.mem.Allocator) ![2]?f64 {
+    const facts = @import("facts.zig");
+    const v = try facts.shipped();
+    var doc: std.json.ObjectMap = .empty;
+    try doc.put(a, "message", if (src.last_answer) |j| try std.json.parseFromSliceLeaky(Value, a, j, .{}) else .null);
+    try doc.put(a, "model", try std.json.parseFromSliceLeaky(Value, a, "{\"limit\":{\"context\":400000}}", .{}));
+    const vals = try facts.read(a, v, src.loaded.spec.facts.?.map, .{ .object = doc });
+    return .{ vals[v.index("context_used_tokens").?], vals[v.index("context_used_percent").?] };
+}
+
+test "facts 1.x: a step's new message with all-zero tokens leaves the context at the last step that counted" {
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    try connectRoot(&rig);
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try feedPrompt(&rig, 10, 1, "list the files, then say done");
+    // Measured (oc11 fork): each step's message is created with every
+    // count 0 and filled when the step ends; 1.x also sends a total.
+    const msg = struct {
+        fn f(comptime id: []const u8, comptime tokens: []const u8, comptime done: bool) []const u8 {
+            return "{\"type\":\"message.updated\",\"properties\":{\"info\":{\"id\":\"" ++ id ++ "\",\"role\":\"assistant\",\"sessionID\":\"ses_root\",\"parentID\":\"msg_u1\",\"providerID\":\"openai\",\"modelID\":\"gpt-x\",\"tokens\":" ++ tokens ++ ",\"time\":{\"created\":1" ++ (if (done) ",\"completed\":2" else "") ++ "}}}}";
+        }
+    }.f;
+    const zero = "{\"input\":0,\"output\":0,\"reasoning\":0,\"cache\":{\"read\":0,\"write\":0}}";
+    try rig.feed(11, msg("msg_a1", zero, false));
+    try t.expect((try contextFacts(&rig.src, a))[0] == null);
+    try rig.feed(12, msg("msg_a1", "{\"total\":13770,\"input\":13752,\"output\":18,\"reasoning\":0,\"cache\":{\"write\":0,\"read\":0}}", true));
+    try t.expectEqual(@as(?f64, 13770), (try contextFacts(&rig.src, a))[0]);
+    // The next step starts at 0: the context is still the last step's.
+    try rig.feed(13, msg("msg_a2", zero, false));
+    const mid = try contextFacts(&rig.src, a);
+    try t.expectEqual(@as(?f64, 13770), mid[0]);
+    try t.expectEqual(@as(?f64, 3.4), mid[1]);
+    try rig.feed(14, msg("msg_a2", "{\"total\":13839,\"input\":266,\"output\":5,\"reasoning\":0,\"cache\":{\"write\":0,\"read\":13568}}", true));
+    const end = try contextFacts(&rig.src, a);
+    try t.expectEqual(@as(?f64, 13839), end[0]);
+    try t.expectEqual(@as(?f64, 3.5), end[1]);
+    // An aborted step that counted nothing keeps the last real figure.
+    try rig.feed(15, msg("msg_a3", zero, true));
+    try t.expectEqual(@as(?f64, 13839), (try contextFacts(&rig.src, a))[0]);
+}
+
+test "facts 2.x: per-step tokens from step.ended; a started or failed step that counted nothing changes nothing" {
+    var rig: V2Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try rig.prompt(1, "msg_u1", "list the files, then say done", "queue");
+    try rig.send(2, "session.execution.started", "");
+    try rig.deliver(3, "msg_u1");
+    // Measured (v2.0.18): tokens ride step.ended, per step, input
+    // without the cache read.
+    try rig.step(4, "msg_a1");
+    try t.expect((try contextFacts(&rig.src, a))[0] == null);
+    try rig.send(5, "session.step.ended", ",\"assistantMessageID\":\"msg_a1\",\"finish\":\"tool-calls\",\"cost\":0,\"tokens\":{\"input\":5280,\"output\":25,\"reasoning\":0,\"cache\":{\"read\":2048,\"write\":0}}");
+    try t.expectEqual(@as(?f64, 7353), (try contextFacts(&rig.src, a))[0]);
+    try rig.step(6, "msg_a2");
+    try t.expectEqual(@as(?f64, 7353), (try contextFacts(&rig.src, a))[0]);
+    try rig.send(7, "session.step.failed", ",\"assistantMessageID\":\"msg_a2\",\"cost\":0,\"tokens\":{\"input\":0,\"output\":0,\"reasoning\":0,\"cache\":{\"read\":0,\"write\":0}},\"error\":{\"type\":\"APIError\",\"message\":\"boom\"}");
+    try t.expectEqual(@as(?f64, 7353), (try contextFacts(&rig.src, a))[0]);
+    try rig.step(8, "msg_a3");
+    try rig.send(9, "session.step.ended", ",\"assistantMessageID\":\"msg_a3\",\"finish\":\"stop\",\"cost\":0,\"tokens\":{\"input\":223,\"output\":5,\"reasoning\":0,\"cache\":{\"read\":7168,\"write\":0}}");
+    const end = try contextFacts(&rig.src, a);
+    try t.expectEqual(@as(?f64, 7396), end[0]);
+    try t.expectEqual(@as(?f64, 1.8), end[1]);
 }
