@@ -13,6 +13,14 @@
 //! quoted heredoc — heredocs are parsed as script text, read-ahead
 //! safe — and the upload phase runs that uploader as a bare word
 //! whose stdin is purely the raw binary, `head -c <size>` exact.
+//!
+//! One install can carry several artifacts (`portable.zig`: a Linux one
+//! plus macOS); the ONE check script cases on the remote `uname` over all
+//! of them and answers which it matched through its exit code, so picking
+//! the artifact costs no extra round trip. Every generated line must parse
+//! under macOS's bash 3.2 as well as dash: case arms are `(pattern)`, the
+//! hasher falls back to `shasum -a 256`, and `wc -c` output (space-padded
+//! on BSD) is compared unquoted.
 
 const std = @import("std");
 const c = @import("../c.zig").c;
@@ -20,17 +28,64 @@ const platform = @import("../util/platform.zig");
 const pathZ = @import("../util/pathz.zig").pathZ;
 const filehash = @import("../util/filehash.zig");
 const sshroute = @import("sshroute.zig");
+const portable = @import("portable.zig");
 
-const CHECK_MISSING: u8 = 66;
 const CHECK_UNSUPPORTED: u8 = 65;
+/// Check exit = base + index of the matched artifact: present and current.
+const CHECK_READY_BASE: u8 = 80;
+/// Check exit = base + index of the matched artifact: absent/stale, uploader staged.
+const CHECK_MISSING_BASE: u8 = 90;
 const SSH_TIMEOUT_MS: i64 = 20_000;
 
-const Arch = enum { x86_64, aarch64 };
+const MAX_ARTIFACTS = portable.targets.len;
+comptime {
+    std.debug.assert(CHECK_READY_BASE + MAX_ARTIFACTS <= CHECK_MISSING_BASE);
+    std.debug.assert(CHECK_MISSING_BASE + MAX_ARTIFACTS < 126); // below the shell's own codes
+}
 
 const Artifact = struct {
     path: []const u8,
-    arch: Arch,
-    hash: filehash.Sha256,
+    target: *const portable.Target,
+    hash: filehash.Sha256 = undefined,
+};
+
+/// The artifacts of the first install location that has any, classified by header.
+const Found = struct {
+    path_bufs: [MAX_ARTIFACTS][4096:0]u8 = undefined,
+    items: [MAX_ARTIFACTS]Artifact = undefined,
+    len: usize = 0,
+
+    fn slice(self: *const Found) []const Artifact {
+        return self.items[0..self.len];
+    }
+
+    /// Add `path` if it is a recognized artifact for a target not yet found.
+    fn add(self: *Found, path: []const u8) void {
+        if (self.len == MAX_ARTIFACTS) return;
+        const target = classify(path) orelse return;
+        for (self.slice()) |a| if (a.target == target) return;
+        const buf = &self.path_bufs[self.len];
+        const owned = std.fmt.bufPrintZ(buf, "{s}", .{path}) catch return;
+        self.items[self.len] = .{ .path = owned, .target = target };
+        self.len += 1;
+    }
+
+    /// Hash every artifact, dropping any that cannot be read.
+    fn hashAll(self: *Found) void {
+        var kept: usize = 0;
+        for (0..self.len) |i| {
+            const hash = filehash.sha256File(self.items[i].path) orelse continue;
+            if (kept != i) {
+                self.path_bufs[kept] = self.path_bufs[i];
+                const len = self.items[i].path.len;
+                self.items[kept] = self.items[i];
+                self.items[kept].path = self.path_bufs[kept][0..len];
+            }
+            self.items[kept].hash = hash;
+            kept += 1;
+        }
+        self.len = kept;
+    }
 };
 
 pub const Prepared = struct {
@@ -67,13 +122,29 @@ fn deployMemoPath(buf: []u8, plan: *const sshroute.Plan, hash: []const u8) ?[:0]
     return std.fmt.bufPrintZ(buf, "{s}/.cache/sketerm/mux/deployed-{x:0>16}-{s}", .{ home, h, tail }) catch null;
 }
 
-fn deployMemoFresh(plan: *const sshroute.Plan, hash: []const u8) bool {
+/// Seconds since this route last verified `hash`, or null when it never did.
+fn deployMemoAge(plan: *const sshroute.Plan, hash: []const u8) ?i64 {
     var buf: [4096]u8 = undefined;
-    const path = deployMemoPath(&buf, plan, hash) orelse return false;
+    const path = deployMemoPath(&buf, plan, hash) orelse return null;
     var st: c.struct_stat = undefined;
-    if (c.stat(path.ptr, &st) != 0) return false;
+    if (c.stat(path.ptr, &st) != 0) return null;
     const mtime = if (@hasField(c.struct_stat, "st_mtim")) st.st_mtim.tv_sec else st.st_mtimespec.tv_sec;
-    return @divTrunc(wallMs(), 1000) - @as(i64, mtime) <= DEPLOY_MEMO_TTL_S;
+    return @divTrunc(wallMs(), 1000) - @as(i64, mtime);
+}
+
+fn deployMemoFresh(plan: *const sshroute.Plan, hash: []const u8) bool {
+    const age = deployMemoAge(plan, hash) orelse return false;
+    return age <= DEPLOY_MEMO_TTL_S;
+}
+
+fn remotePathFor(allocator: std.mem.Allocator, artifact: *const Artifact) ?Prepared {
+    const remote_path = std.fmt.allocPrintSentinel(
+        allocator,
+        "$HOME/.cache/sketerm/mux/sketerm-mux-{s}",
+        .{&artifact.hash.hex},
+        0,
+    ) catch return null;
+    return .{ .allocator = allocator, .path = remote_path };
 }
 
 fn deployMemoStamp(plan: *const sshroute.Plan, hash: []const u8) void {
@@ -131,25 +202,22 @@ pub fn prepare(allocator: std.mem.Allocator, plan: *const sshroute.Plan) ?Prepar
     if (c.getenv("SKETERM_SSH") != null and c.getenv("SKETERM_MUX_PORTABLE") == null) return null;
 
     last_outcome = .no_portable;
-    var artifact_path_buf: [4096:0]u8 = undefined;
-    const artifact_path = findPortable(&artifact_path_buf) orelse return null;
-    const artifact = inspectArtifact(artifact_path) orelse return null;
-    // A recent verified deploy of this exact artifact skips the ssh
-    // check leg entirely (content-addressed path, so a stale memo can
+    var found: Found = .{};
+    findArtifacts(&found);
+    found.hashAll();
+    if (found.len == 0) return null;
+    // A recent verified deploy of one of these exact artifacts skips the
+    // ssh check leg entirely (content-addressed path, so a stale memo can
     // only name a binary that once passed its own --help probe).
-    if (deployMemoFresh(plan, &artifact.hash.hex)) {
-        const remote_path = std.fmt.allocPrintSentinel(
-            allocator,
-            "$HOME/.cache/sketerm/mux/sketerm-mux-{s}",
-            .{&artifact.hash.hex},
-            0,
-        ) catch return null;
+    for (found.slice()) |*artifact| {
+        if (!deployMemoFresh(plan, &artifact.hash.hex)) continue;
+        const prepared = remotePathFor(allocator, artifact) orelse return null;
         last_outcome = .ready;
-        return .{ .allocator = allocator, .path = remote_path };
+        return prepared;
     }
-    const prepared = ensureUsing(allocator, plan, sshroute.sshBinary(), artifact, .{ .run = runSshCommand });
-    if (prepared != null) deployMemoStamp(plan, &artifact.hash.hex);
-    return prepared;
+    const deployed = ensureUsing(allocator, plan, sshroute.sshBinary(), found.slice(), .{ .run = runSshCommand }) orelse return null;
+    deployMemoStamp(plan, &found.items[deployed.index].hash.hex);
+    return deployed.prepared;
 }
 
 /// Whether this install can auto-deploy a daemon at all.
@@ -159,156 +227,160 @@ pub fn prepare(allocator: std.mem.Allocator, plan: *const sshroute.Plan) ?Prepar
 /// sketerm-mux. Callers use this to say that instead of leaving the user with
 /// ssh's bare "command not found".
 pub fn portableAvailable() bool {
-    var buf: [4096:0]u8 = undefined;
-    return findPortable(&buf) != null;
+    var found: Found = .{};
+    findArtifacts(&found);
+    return found.len > 0;
 }
 
 /// Resolve the expected content-addressed path without touching the network.
-pub fn localPath(allocator: std.mem.Allocator) ?Prepared {
+///
+/// With several artifacts the remote platform is unknown here, so the one
+/// this route last verified wins; a never-deployed route gets the first.
+pub fn localPath(allocator: std.mem.Allocator, plan: *const sshroute.Plan) ?Prepared {
     if (c.getenv("SKETERM_SSH") != null and c.getenv("SKETERM_MUX_PORTABLE") == null) return null;
-    var artifact_path_buf: [4096:0]u8 = undefined;
-    const artifact_path = findPortable(&artifact_path_buf) orelse return null;
-    const artifact = inspectArtifact(artifact_path) orelse return null;
-    const remote_path = std.fmt.allocPrintSentinel(
-        allocator,
-        "$HOME/.cache/sketerm/mux/sketerm-mux-{s}",
-        .{&artifact.hash.hex},
-        0,
-    ) catch return null;
-    return .{ .allocator = allocator, .path = remote_path };
+    var found: Found = .{};
+    findArtifacts(&found);
+    found.hashAll();
+    if (found.len == 0) return null;
+    for (found.slice()) |*artifact| {
+        if (deployMemoAge(plan, &artifact.hash.hex) != null) return remotePathFor(allocator, artifact);
+    }
+    return remotePathFor(allocator, &found.items[0]);
 }
 
-fn findPortable(buf: *[4096:0]u8) ?[:0]const u8 {
+/// `$SKETERM_MUX_PORTABLE` (one file), else the first of the sibling, the
+/// relative install and the system install directory holding any artifact.
+fn findArtifacts(found: *Found) void {
     if (c.getenv("SKETERM_MUX_PORTABLE")) |raw| {
-        const value = std.mem.span(@as([*:0]const u8, @ptrCast(raw)));
-        const path = std.fmt.bufPrintZ(buf, "{s}", .{value}) catch return null;
-        return if (c.access(path.ptr, c.R_OK) == 0) path else null;
+        found.add(std.mem.span(@as([*:0]const u8, @ptrCast(raw))));
+        return;
     }
-
     var exe_buf: [4096]u8 = undefined;
     if (platform.exePath(&exe_buf)) |exe| {
         if (std.mem.lastIndexOfScalar(u8, exe, '/')) |slash| {
-            const dir = exe[0..slash];
-            const sibling = std.fmt.bufPrintZ(buf, "{s}/sketerm-mux-portable", .{dir}) catch return null;
-            if (c.access(sibling.ptr, c.R_OK) == 0) return sibling;
-            const installed = std.fmt.bufPrintZ(buf, "{s}/../lib/sketerm/sketerm-mux-portable", .{dir}) catch return null;
-            if (c.access(installed.ptr, c.R_OK) == 0) return installed;
+            var dir_buf: [4096]u8 = undefined;
+            addFromDir(found, exe[0..slash]);
+            if (found.len > 0) return;
+            const installed = std.fmt.bufPrint(&dir_buf, "{s}/../lib/sketerm", .{exe[0..slash]}) catch return;
+            addFromDir(found, installed);
+            if (found.len > 0) return;
         }
     }
-    const installed = std.fmt.bufPrintZ(buf, "/usr/lib/sketerm/sketerm-mux-portable", .{}) catch return null;
-    return if (c.access(installed.ptr, c.R_OK) == 0) installed else null;
+    addFromDir(found, "/usr/lib/sketerm");
 }
 
-fn inspectArtifact(path: []const u8) ?Artifact {
+fn addFromDir(found: *Found, dir: []const u8) void {
+    var path_buf: [4096]u8 = undefined;
+    for (portable.artifact_names) |name| {
+        const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir, name }) catch continue;
+        found.add(path);
+    }
+}
+
+/// The table row a readable regular file's executable header names.
+fn classify(path: []const u8) ?*const portable.Target {
     var path_buf: [4096]u8 = undefined;
     const fd = c.open(pathZ(&path_buf, path) catch return null, c.O_RDONLY | c.O_CLOEXEC | c.O_NONBLOCK);
     if (fd < 0) return null;
     defer _ = c.close(fd);
     var st: c.struct_stat = undefined;
     if (c.fstat(fd, &st) != 0 or (st.st_mode & c.S_IFMT) != c.S_IFREG) return null;
-    var header: [20]u8 = undefined;
+    var header: [portable.HEADER_LEN]u8 = undefined;
     if (c.read(fd, &header, header.len) != header.len) return null;
-    const arch = elfArch(&header) orelse return null;
-    const hash = filehash.sha256File(path) orelse return null;
-    return .{ .path = path, .arch = arch, .hash = hash };
+    return portable.ofHeader(&header);
 }
 
-fn elfArch(header: []const u8) ?Arch {
-    if (header.len < 20 or !std.mem.eql(u8, header[0..4], "\x7fELF")) return null;
-    if (header[4] != 2 or header[5] != 1) return null; // ELF64, little-endian
-    return switch (std.mem.readInt(u16, header[18..20], .little)) {
-        62 => .x86_64,
-        183 => .aarch64,
-        else => null,
-    };
+/// Body of the check script after the per-artifact `case` set i/h/n.
+///
+/// The uploader's first lines are printf'd (they carry this host's h/n/s),
+/// the rest is a quoted heredoc so $HOME/$$ expand at ITS runtime; the
+/// staging mv is atomic, so concurrent connects write identical bytes.
+const CHECK_BODY =
+    "if command -v sha256sum >/dev/null 2>&1; then s=sha256sum\n" ++
+    "elif command -v shasum >/dev/null 2>&1; then s='shasum -a 256'\n" ++
+    "else exit 67; fi\n" ++
+    "p=\"$HOME/.cache/sketerm/mux/sketerm-mux-$h\"\n" ++
+    "if [ -x \"$p\" ]; then c=$($s \"$p\" 2>/dev/null) && [ \"${{c%% *}}\" = \"$h\" ] && \"$p\" --help >/dev/null 2>&1 && exit $(({d}+i)); fi\n" ++
+    "umask 077; d=\"$HOME/.cache/sketerm/mux\"; mkdir -p \"$d\" || exit 68\n" ++
+    "chmod 700 \"$HOME/.cache/sketerm\" \"$d\" 2>/dev/null || true\n" ++
+    "u=\"$d/.upload-$h\"; ut=\"$u.$$\"\n" ++
+    "printf '%s\\n' '#!/bin/sh' \"h=$h n=$n s='$s'\" >\"$ut\" || exit 76\n" ++
+    "cat >>\"$ut\" <<'SKETERM_UPLOADER'\n" ++
+    "umask 077\n" ++
+    "p=\"$HOME/.cache/sketerm/mux/sketerm-mux-$h\"; t=\"$p.part.$$\"\n" ++
+    "trap 'rm -f \"$t\"' EXIT HUP INT TERM\n" ++
+    "head -c \"$n\" >\"$t\" || exit 69\n" ++
+    "[ $(wc -c <\"$t\") = \"$n\" ] || exit 70\n" ++
+    "c=$($s \"$t\") || exit 71\n" ++
+    "[ \"${{c%% *}}\" = \"$h\" ] || exit 72\n" ++
+    "chmod 700 \"$t\" || exit 73\n" ++
+    "mv -f \"$t\" \"$p\" || exit 74\n" ++
+    "\"$p\" --help >/dev/null 2>&1 || exit 75\n" ++
+    "trap - EXIT\n" ++
+    "SKETERM_UPLOADER\n" ++
+    "chmod 700 \"$ut\" || exit 76; mv -f \"$ut\" \"$u\" || exit 77\n" ++
+    "exit $(({d}+i))\n";
+
+/// The check-and-stage script riding stdin into `sh` (no payload follows,
+/// so shell read-ahead is harmless).
+fn checkScript(allocator: std.mem.Allocator, artifacts: []const Artifact) ![:0]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "case \"$(uname -s 2>/dev/null):$(uname -m 2>/dev/null)\" in\n");
+    for (artifacts, 0..) |a, i| {
+        try out.print(allocator, "({s}) i={d} h={s} n={d};;\n", .{ a.target.uname, i, &a.hash.hex, a.hash.size });
+    }
+    try out.print(allocator, "(*) exit {d};;\nesac\n", .{CHECK_UNSUPPORTED});
+    try out.print(allocator, CHECK_BODY, .{ CHECK_READY_BASE, CHECK_MISSING_BASE });
+    return out.toOwnedSliceSentinel(allocator, 0);
 }
+
+const Deployed = struct {
+    prepared: Prepared,
+    /// Which of the offered artifacts the host matched.
+    index: usize,
+};
 
 fn ensureUsing(
     allocator: std.mem.Allocator,
     plan: *const sshroute.Plan,
     ssh_bin: [*:0]const u8,
-    artifact: Artifact,
+    artifacts: []const Artifact,
     runner: Runner,
-) ?Prepared {
+) ?Deployed {
     last_outcome = .failed;
-    const hash = &artifact.hash.hex;
-    const arch_case = switch (artifact.arch) {
-        .x86_64 => "Linux:x86_64|Linux:amd64",
-        .aarch64 => "Linux:aarch64|Linux:arm64",
-    };
-    const remote_path = std.fmt.allocPrintSentinel(
-        allocator,
-        "$HOME/.cache/sketerm/mux/sketerm-mux-{s}",
-        .{hash},
-        0,
-    ) catch return null;
-    var keep_remote_path = false;
-    defer if (!keep_remote_path) allocator.free(remote_path);
-
-    // Check-and-stage, riding stdin into `sh` (no payload follows, so
-    // shell read-ahead is harmless). Exit 0 = current binary present.
-    // Exit CHECK_MISSING = absent/stale AND the uploader script for
-    // this exact artifact is now staged at a content-addressed path.
-    // The quoted heredoc keeps $HOME/$$ literal in the uploader so
-    // they expand at ITS runtime; the staging mv is atomic, so
-    // concurrent connects write identical bytes and cannot corrupt.
-    const check = std.fmt.allocPrintSentinel(
-        allocator,
-        "case \"$(uname -s 2>/dev/null):$(uname -m 2>/dev/null)\" in {s}) ;; *) exit {d};; esac\n" ++
-            "command -v sha256sum >/dev/null 2>&1 || exit 67\n" ++
-            "p=\"{s}\"\n" ++
-            "if [ -x \"$p\" ]; then h=$(sha256sum \"$p\" 2>/dev/null) && [ \"${{h%% *}}\" = \"{s}\" ] && \"$p\" --help >/dev/null 2>&1 && exit 0; fi\n" ++
-            "umask 077; d=\"$HOME/.cache/sketerm/mux\"; mkdir -p \"$d\" || exit 68\n" ++
-            "chmod 700 \"$HOME/.cache/sketerm\" \"$d\" 2>/dev/null || true\n" ++
-            "u=\"$d/.upload-{s}\"; ut=\"$u.$$\"\n" ++
-            "cat >\"$ut\" <<'SKETERM_UPLOADER'\n" ++
-            "#!/bin/sh\n" ++
-            "umask 077\n" ++
-            "p=\"$HOME/.cache/sketerm/mux/sketerm-mux-{s}\"; t=\"$p.part.$$\"\n" ++
-            "trap 'rm -f \"$t\"' EXIT HUP INT TERM\n" ++
-            "head -c {d} >\"$t\" || exit 69\n" ++
-            "[ \"$(wc -c <\"$t\")\" = \"{d}\" ] || exit 70\n" ++
-            "h=$(sha256sum \"$t\") || exit 71\n" ++
-            "[ \"${{h%% *}}\" = \"{s}\" ] || exit 72\n" ++
-            "chmod 700 \"$t\" || exit 73\n" ++
-            "mv -f \"$t\" \"$p\" || exit 74\n" ++
-            "\"$p\" --help >/dev/null 2>&1 || exit 75\n" ++
-            "trap - EXIT\n" ++
-            "SKETERM_UPLOADER\n" ++
-            "chmod 700 \"$ut\" || exit 76; mv -f \"$ut\" \"$u\" || exit 77\n" ++
-            "exit {d}\n",
-        .{ arch_case, CHECK_UNSUPPORTED, remote_path, hash, hash, hash, artifact.hash.size, artifact.hash.size, hash, CHECK_MISSING },
-        0,
-    ) catch return null;
+    std.debug.assert(artifacts.len > 0 and artifacts.len <= MAX_ARTIFACTS);
+    const check = checkScript(allocator, artifacts) catch return null;
     defer allocator.free(check);
 
     const checked = runner.run(runner.ctx, plan, ssh_bin, check, null);
-    if (checked == 0) {
-        keep_remote_path = true;
-        last_outcome = .ready;
-        return .{ .allocator = allocator, .path = remote_path };
-    }
     if (checked == CHECK_UNSUPPORTED) last_outcome = .unsupported_platform;
-    if (checked != CHECK_MISSING) return null;
+    const ready = checked >= CHECK_READY_BASE and checked < CHECK_READY_BASE + artifacts.len;
+    const missing = checked >= CHECK_MISSING_BASE and checked < CHECK_MISSING_BASE + artifacts.len;
+    if (!ready and !missing) return null;
+    const index: usize = checked - if (ready) CHECK_READY_BASE else CHECK_MISSING_BASE;
+    const artifact = &artifacts[index];
 
-    // Upload: the remote command is the staged uploader as one bare
-    // word (no shell has anything to parse; bare-word $HOME expands
-    // in every login shell), and stdin carries ONLY the raw binary —
-    // `head -c` reads the exact byte count, wc cross-checks it (head
-    // exits 0 on a truncated stream), sha256sum proves integrity
-    // before the atomic publish, and the --help probe proves the
-    // published file actually executes.
-    const upload_word = std.fmt.allocPrintSentinel(
-        allocator,
-        "$HOME/.cache/sketerm/mux/.upload-{s}",
-        .{hash},
-        0,
-    ) catch return null;
-    defer allocator.free(upload_word);
-    if (runner.run(runner.ctx, plan, ssh_bin, upload_word, artifact.path) != 0) return null;
-    keep_remote_path = true;
+    if (missing) {
+        // Upload: the remote command is the staged uploader as one bare
+        // word (no shell has anything to parse; bare-word $HOME expands
+        // in every login shell), and stdin carries ONLY the raw binary —
+        // `head -c` reads the exact byte count, wc cross-checks it (head
+        // exits 0 on a truncated stream), the hash proves integrity
+        // before the atomic publish, and the --help probe proves the
+        // published file actually executes.
+        const upload_word = std.fmt.allocPrintSentinel(
+            allocator,
+            "$HOME/.cache/sketerm/mux/.upload-{s}",
+            .{&artifact.hash.hex},
+            0,
+        ) catch return null;
+        defer allocator.free(upload_word);
+        if (runner.run(runner.ctx, plan, ssh_bin, upload_word, artifact.path) != 0) return null;
+    }
+    const prepared = remotePathFor(allocator, artifact) orelse return null;
     last_outcome = .ready;
-    return .{ .allocator = allocator, .path = remote_path };
+    return .{ .prepared = prepared, .index = index };
 }
 
 const nowMs = @import("../util/clock.zig").nowMs;
@@ -465,6 +537,7 @@ const FakeRunner = struct {
     expected_route: ?sshroute.Route = null,
     calls: usize = 0,
     uploads: usize = 0,
+    uploaded: ?[]const u8 = null,
     upload_script_ok: bool = false,
     check_script_ok: bool = false,
     arch_guard_ok: bool = false,
@@ -473,8 +546,9 @@ const FakeRunner = struct {
     fn run(raw: ?*anyopaque, plan: *const sshroute.Plan, _: [*:0]const u8, command: [:0]const u8, input: ?[]const u8) u8 {
         const self: *FakeRunner = @ptrCast(@alignCast(raw.?));
         if (self.expected_route) |route| self.route_ok = self.route_ok and plan.route == route;
-        if (input != null) {
+        if (input) |path| {
             self.uploads += 1;
+            self.uploaded = path;
             // The upload command must be ONE bare word (dialect-proof)
             // naming the staged uploader — never script text, which
             // would put the payload behind a shell's stdin buffering.
@@ -483,7 +557,8 @@ const FakeRunner = struct {
         } else {
             // The check script stages an uploader with an exact-count
             // payload read, and ends in a newline.
-            self.check_script_ok = std.mem.indexOf(u8, command, "head -c 1234 ") != null and
+            self.check_script_ok = std.mem.indexOf(u8, command, " n=1234;;") != null and
+                std.mem.indexOf(u8, command, "head -c \"$n\" ") != null and
                 command.len > 0 and command[command.len - 1] == '\n';
             self.arch_guard_ok = self.expected_arch_case.len == 0 or
                 std.mem.indexOf(u8, command, self.expected_arch_case) != null;
@@ -494,10 +569,15 @@ const FakeRunner = struct {
     }
 };
 
+fn targetOf(triple: []const u8) *const portable.Target {
+    for (&portable.targets) |*t| if (std.mem.eql(u8, t.triple, triple)) return t;
+    unreachable;
+}
+
 fn fakeArtifact(fill: u8) Artifact {
     return .{
         .path = "/tmp/mux-portable",
-        .arch = .x86_64,
+        .target = targetOf("x86_64-linux-musl"),
         .hash = .{ .hex = [_]u8{fill} ** 64, .size = 1234 },
     };
 }
@@ -507,31 +587,63 @@ fn testPlan(host: []const u8) sshroute.Plan {
 }
 
 test "deployment reuses a current content-addressed mux" {
-    var fake = FakeRunner{ .statuses = .{ 0, 0 } };
+    var fake = FakeRunner{ .statuses = .{ CHECK_READY_BASE, 0 } };
     const plan = testPlan("box");
-    var result = ensureUsing(std.testing.allocator, &plan, "ssh", fakeArtifact('a'), .{ .ctx = &fake, .run = FakeRunner.run }).?;
-    defer result.deinit();
+    var result = ensureUsing(std.testing.allocator, &plan, "ssh", &.{fakeArtifact('a')}, .{ .ctx = &fake, .run = FakeRunner.run }).?;
+    defer result.prepared.deinit();
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
     try std.testing.expectEqual(@as(usize, 0), fake.uploads);
-    try std.testing.expect(std.mem.endsWith(u8, result.path, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+    try std.testing.expect(std.mem.endsWith(u8, result.prepared.path, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
 }
 
 test "deployment uploads an absent or stale mux" {
-    var fake = FakeRunner{ .statuses = .{ CHECK_MISSING, 0 } };
+    var fake = FakeRunner{ .statuses = .{ CHECK_MISSING_BASE, 0 } };
     const plan = testPlan("box");
-    var result = ensureUsing(std.testing.allocator, &plan, "ssh", fakeArtifact('b'), .{ .ctx = &fake, .run = FakeRunner.run }).?;
-    defer result.deinit();
+    var result = ensureUsing(std.testing.allocator, &plan, "ssh", &.{fakeArtifact('b')}, .{ .ctx = &fake, .run = FakeRunner.run }).?;
+    defer result.prepared.deinit();
     try std.testing.expectEqual(@as(usize, 2), fake.calls);
     try std.testing.expectEqual(@as(usize, 1), fake.uploads);
     try std.testing.expect(fake.upload_script_ok);
     try std.testing.expect(fake.check_script_ok);
 }
 
+test "deployment picks the artifact the host's platform matched" {
+    const linux = fakeArtifact('1');
+    const mac = Artifact{
+        .path = "/tmp/mux-portable-mac",
+        .target = targetOf("aarch64-macos"),
+        .hash = .{ .hex = [_]u8{'2'} ** 64, .size = 1234 },
+    };
+    const plan = testPlan("mac");
+    var missing = FakeRunner{ .statuses = .{ CHECK_MISSING_BASE + 1, 0 }, .expected_arch_case = "(Darwin:arm64) i=1 h=" };
+    var result = ensureUsing(std.testing.allocator, &plan, "ssh", &.{ linux, mac }, .{ .ctx = &missing, .run = FakeRunner.run }).?;
+    defer result.prepared.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.index);
+    try std.testing.expect(missing.arch_guard_ok);
+    try std.testing.expectEqualStrings(mac.path, missing.uploaded.?);
+    try std.testing.expect(std.mem.endsWith(u8, result.prepared.path, &mac.hash.hex));
+
+    var ready = FakeRunner{ .statuses = .{ CHECK_READY_BASE, 0 }, .expected_arch_case = "(Linux:x86_64|Linux:amd64) i=0 h=" };
+    var first = ensureUsing(std.testing.allocator, &plan, "ssh", &.{ linux, mac }, .{ .ctx = &ready, .run = FakeRunner.run }).?;
+    defer first.prepared.deinit();
+    try std.testing.expectEqual(@as(usize, 0), first.index);
+    try std.testing.expect(ready.arch_guard_ok);
+    try std.testing.expectEqual(@as(usize, 0), ready.uploads);
+
+    // An index past the offered artifacts (or a bare 0) is a failure, not a pick.
+    for ([_]u8{ CHECK_READY_BASE + 2, CHECK_MISSING_BASE + 2, 0 }) |status| {
+        var stray = FakeRunner{ .statuses = .{ status, 0 } };
+        try std.testing.expect(ensureUsing(std.testing.allocator, &plan, "ssh", &.{ linux, mac }, .{ .ctx = &stray, .run = FakeRunner.run }) == null);
+        try std.testing.expectEqual(@as(usize, 0), stray.uploads);
+        try std.testing.expectEqual(Outcome.failed, lastOutcome());
+    }
+}
+
 test "Tor deployment keeps check and upload on the forced route" {
-    var fake = FakeRunner{ .statuses = .{ CHECK_MISSING, 0 }, .expected_route = .tor };
+    var fake = FakeRunner{ .statuses = .{ CHECK_MISSING_BASE, 0 }, .expected_route = .tor };
     const plan = sshroute.Plan.init("work-alias", .tor, "127.0.0.1:9150") catch unreachable;
-    var result = ensureUsing(std.testing.allocator, &plan, "ssh", fakeArtifact('7'), .{ .ctx = &fake, .run = FakeRunner.run }).?;
-    defer result.deinit();
+    var result = ensureUsing(std.testing.allocator, &plan, "ssh", &.{fakeArtifact('7')}, .{ .ctx = &fake, .run = FakeRunner.run }).?;
+    defer result.prepared.deinit();
     try std.testing.expectEqual(@as(usize, 2), fake.calls);
     try std.testing.expect(fake.route_ok);
     try std.testing.expect(fake.upload_script_ok);
@@ -541,21 +653,22 @@ test "check and upload run through a real sh with the payload on stdin" {
     // Full-fidelity dialect proof: the REAL runSshCommand streams the
     // REAL scripts + payload into a real `sh` (the fake ssh ignores
     // every argument — a login shell has nothing to parse when the
-    // remote command is one word), against an isolated $HOME.
+    // remote command is one word), against an isolated $HOME. The
+    // remote-platform case runs on THIS host, so the test needs a table
+    // row for it; /usr/bin/true stands in for the payload because its
+    // `--help` probe exits 0.
     const builtin = @import("builtin");
-    // Linux-gated for a REASON, and NOT because of the /bin/true below:
-    // the fake ssh runs the check script on THIS host, and that script
-    // opens with `case "$(uname -s):$(uname -m)" in Linux:<arch>)`. On a
-    // Mac the guard correctly answers CHECK_UNSUPPORTED, so the test
-    // would FAIL rather than prove anything -- deploy targets Linux
-    // hosts. Do not "fix" this skip by resolving a stand-in binary; the
-    // remote-case guard is what is unsatisfiable here, not the payload.
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
-    const arch: Arch = switch (builtin.cpu.arch) {
-        .x86_64 => .x86_64,
-        .aarch64 => .aarch64,
+    const host_os: portable.Target.Os = switch (builtin.os.tag) {
+        .linux => .linux,
+        .macos => .macos,
         else => return error.SkipZigTest,
     };
+    const host_target = for (&portable.targets) |*t| {
+        if (t.os == host_os and std.mem.startsWith(u8, t.triple, @tagName(builtin.cpu.arch))) break t;
+    } else return error.SkipZigTest;
+    const other_target = for (&portable.targets) |*t| {
+        if (t != host_target) break t;
+    } else unreachable;
 
     var home_buf: [128:0]u8 = undefined;
     const home = std.fmt.bufPrintZ(&home_buf, "/tmp/sketerm-deploy-home-{d}", .{c.getpid()}) catch unreachable;
@@ -567,7 +680,7 @@ test "check and upload run through a real sh with the payload on stdin" {
     const script = std.fmt.bufPrintZ(
         &script_buf,
         "#!/bin/sh\nHOME={s}; export HOME\n" ++
-            "for a in \"$@\"; do case \"$a\" in ControlMaster=*|ControlPath=*|ControlPersist=*) exit 78;; esac; cmd=\"$a\"; done\n" ++
+            "for a in \"$@\"; do case \"$a\" in (ControlMaster=*|ControlPath=*|ControlPersist=*) exit 78;; esac; cmd=\"$a\"; done\n" ++
             "exec sh -c \"$cmd\"\n",
         .{home},
     ) catch unreachable;
@@ -578,17 +691,22 @@ test "check and upload run through a real sh with the payload on stdin" {
         if (c.chmod(ssh.ptr, 0o755) != 0) return error.SkipZigTest;
     }
 
-    // /bin/true is a real executable whose `--help` probe exits 0, so
-    // the deployed file passes the post-publish validation.
-    const hash = filehash.sha256File("/bin/true") orelse return error.SkipZigTest;
-    const artifact = Artifact{ .path = "/bin/true", .arch = arch, .hash = hash };
+    const payload = "/usr/bin/true";
+    const hash = filehash.sha256File(payload) orelse return error.SkipZigTest;
+    // The host's artifact sits SECOND, behind one for another platform:
+    // the script must select it by the host's uname, not by position.
+    const artifacts = [_]Artifact{
+        .{ .path = payload, .target = other_target, .hash = .{ .hex = [_]u8{'0'} ** 64, .size = 1 } },
+        .{ .path = payload, .target = host_target, .hash = hash },
+    };
 
     // Round 1: check misses and stages the uploader, upload streams
     // the raw payload into it and publishes.
     const plan = testPlan("box");
-    var first = ensureUsing(std.testing.allocator, &plan, ssh.ptr, artifact, .{ .run = runSshCommand }) orelse
+    var first = ensureUsing(std.testing.allocator, &plan, ssh.ptr, &artifacts, .{ .run = runSshCommand }) orelse
         return error.TestUnexpectedResult;
-    first.deinit();
+    first.prepared.deinit();
+    try std.testing.expectEqual(@as(usize, 1), first.index);
     var deployed_buf: [256:0]u8 = undefined;
     const deployed = std.fmt.bufPrintZ(
         &deployed_buf,
@@ -602,69 +720,69 @@ test "check and upload run through a real sh with the payload on stdin" {
 
     // Round 2: the check recognizes the deployed copy — no re-upload
     // (proven by mtime staying put would race; size+success suffices).
-    var second = ensureUsing(std.testing.allocator, &plan, ssh.ptr, artifact, .{ .run = runSshCommand }) orelse
+    var second = ensureUsing(std.testing.allocator, &plan, ssh.ptr, &artifacts, .{ .run = runSshCommand }) orelse
         return error.TestUnexpectedResult;
-    second.deinit();
+    second.prepared.deinit();
+    try std.testing.expectEqual(@as(usize, 1), second.index);
 
-    // Wrong-architecture artifact is refused by the remote case guard
+    // Only an other-platform artifact: refused by the remote case guard
     // before any payload flows.
-    const other: Arch = if (arch == .x86_64) .aarch64 else .x86_64;
-    const mismatched = Artifact{ .path = "/bin/true", .arch = other, .hash = hash };
-    try std.testing.expect(ensureUsing(std.testing.allocator, &plan, ssh.ptr, mismatched, .{ .run = runSshCommand }) == null);
+    try std.testing.expect(ensureUsing(std.testing.allocator, &plan, ssh.ptr, artifacts[0..1], .{ .run = runSshCommand }) == null);
+    try std.testing.expectEqual(Outcome.unsupported_platform, lastOutcome());
 }
 
 test "deployment leaves unsupported hosts and failed checks untouched" {
     const plan = testPlan("box");
     var unsupported = FakeRunner{ .statuses = .{ CHECK_UNSUPPORTED, 0 } };
-    try std.testing.expect(ensureUsing(std.testing.allocator, &plan, "ssh", fakeArtifact('c'), .{ .ctx = &unsupported, .run = FakeRunner.run }) == null);
+    try std.testing.expect(ensureUsing(std.testing.allocator, &plan, "ssh", &.{fakeArtifact('c')}, .{ .ctx = &unsupported, .run = FakeRunner.run }) == null);
     try std.testing.expectEqual(@as(usize, 1), unsupported.calls);
     try std.testing.expectEqual(Outcome.unsupported_platform, lastOutcome());
     var failed = FakeRunner{ .statuses = .{ 255, 0 } };
-    try std.testing.expect(ensureUsing(std.testing.allocator, &plan, "ssh", fakeArtifact('d'), .{ .ctx = &failed, .run = FakeRunner.run }) == null);
+    try std.testing.expect(ensureUsing(std.testing.allocator, &plan, "ssh", &.{fakeArtifact('d')}, .{ .ctx = &failed, .run = FakeRunner.run }) == null);
     try std.testing.expectEqual(@as(usize, 1), failed.calls);
     try std.testing.expectEqual(Outcome.failed, lastOutcome());
 }
 
 test "deployment falls back when an upload fails" {
     const plan = testPlan("box");
-    var fake = FakeRunner{ .statuses = .{ CHECK_MISSING, 74 } };
-    try std.testing.expect(ensureUsing(std.testing.allocator, &plan, "ssh", fakeArtifact('e'), .{ .ctx = &fake, .run = FakeRunner.run }) == null);
+    var fake = FakeRunner{ .statuses = .{ CHECK_MISSING_BASE, 74 } };
+    try std.testing.expect(ensureUsing(std.testing.allocator, &plan, "ssh", &.{fakeArtifact('e')}, .{ .ctx = &fake, .run = FakeRunner.run }) == null);
     try std.testing.expectEqual(@as(usize, 2), fake.calls);
     try std.testing.expectEqual(@as(usize, 1), fake.uploads);
+    try std.testing.expectEqual(Outcome.failed, lastOutcome());
 }
 
-test "deployment accepts supported portable ELF architectures" {
-    const cases = [_]struct { machine: u16, arch: Arch, remote_names: []const u8 }{
-        .{ .machine = 62, .arch = .x86_64, .remote_names = "Linux:x86_64|Linux:amd64" },
-        .{ .machine = 183, .arch = .aarch64, .remote_names = "Linux:aarch64|Linux:arm64" },
-    };
-    for (cases) |case| {
-        var header = [_]u8{0} ** 20;
-        @memcpy(header[0..4], "\x7fELF");
-        header[4] = 2;
-        header[5] = 1;
-        std.mem.writeInt(u16, header[18..20], case.machine, .little);
-        const arch = elfArch(&header).?;
-        try std.testing.expectEqual(case.arch, arch);
-
-        var fake = FakeRunner{
-            .statuses = .{ 0, 0 },
-            .expected_arch_case = case.remote_names,
-        };
+test "every portable target's remote guard is in the check script" {
+    for (&portable.targets) |*target| {
+        var fake = FakeRunner{ .statuses = .{ CHECK_READY_BASE, 0 }, .expected_arch_case = target.uname };
         const plan = testPlan("box");
-        var result = ensureUsing(std.testing.allocator, &plan, "ssh", .{
+        var result = ensureUsing(std.testing.allocator, &plan, "ssh", &.{.{
             .path = "/tmp/mux-portable",
-            .arch = arch,
+            .target = target,
             .hash = .{ .hex = [_]u8{'f'} ** 64, .size = 1234 },
-        }, .{ .ctx = &fake, .run = FakeRunner.run }).?;
-        result.deinit();
+        }}, .{ .ctx = &fake, .run = FakeRunner.run }).?;
+        result.prepared.deinit();
         try std.testing.expect(fake.arch_guard_ok);
+        try std.testing.expect(fake.check_script_ok);
     }
+}
 
-    var header = [_]u8{0} ** 20;
-    @memcpy(header[0..4], "\x7fELF");
-    header[4] = 2;
-    header[5] = 1;
-    std.mem.writeInt(u16, header[18..20], 3, .little);
-    try std.testing.expect(elfArch(&header) == null);
+test "classify reads the artifact header from disk" {
+    var path_buf: [128:0]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-deploy-classify-{d}", .{c.getpid()}) catch unreachable;
+    defer _ = c.unlink(path.ptr);
+    var header = [_]u8{0} ** 32;
+    std.mem.writeInt(u32, header[0..4], 0xfeedfacf, .little);
+    std.mem.writeInt(u32, header[4..8], 0x0100000c, .little);
+    {
+        const f = c.fopen(path.ptr, "w") orelse return error.SkipZigTest;
+        _ = c.fwrite(&header, 1, header.len, f);
+        _ = c.fclose(f);
+    }
+    try std.testing.expectEqualStrings("aarch64-macos", classify(path).?.triple);
+    var found: Found = .{};
+    found.add(path);
+    found.add(path); // a second artifact for the same target is ignored
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    try std.testing.expect(classify("/nonexistent/sketerm-mux-portable") == null);
 }

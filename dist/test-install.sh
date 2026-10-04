@@ -194,7 +194,14 @@ ln -s "$root/build.zig.zon" "$fixture/build.zig.zon"
 [ "$(grep -m1 minimum_zig_version "$root/build.zig.zon")" = \
     '    .minimum_zig_version = "0.16.0",' ] \
     || fail "build.zig.zon does not require Zig 0.16.0"
-for binary in sketerm sketerm-mux sketerm-mux-portable sketerm-webengine; do
+source "$here/stage.sh"
+mapfile -t foreign_portables < <(
+    for target in $(sketerm_portable_foreign_targets); do
+        sketerm_portable_artifact_name "$target"
+    done)
+[ "${#foreign_portables[@]}" -ge 1 ] || fail "stage.sh lists no foreign portable targets"
+for binary in sketerm sketerm-mux sketerm-mux-portable sketerm-webengine \
+        "${foreign_portables[@]}"; do
     cp /bin/true "$fixture/zig-out/bin/$binary"
 done
 
@@ -285,8 +292,7 @@ fi
 cp "$stagedir/DEBIAN/control" "$INSTALL_TEST_CONTROL_LOG"
 printf '%s\n' "$debfile" > "$INSTALL_TEST_DEB_LOG"
 if [ -n "${INSTALL_TEST_STAGED_PORTABLE_LOG:-}" ]; then
-    cp "$stagedir/usr/lib/sketerm/sketerm-mux-portable" \
-        "$INSTALL_TEST_STAGED_PORTABLE_LOG"
+    cp -r "$stagedir/usr/lib/sketerm" "$INSTALL_TEST_STAGED_PORTABLE_LOG"
 fi
 if [ -n "${INSTALL_TEST_REAL_DPKG_DEB:-}" ]; then
     exec "$INSTALL_TEST_REAL_DPKG_DEB" "$@"
@@ -438,10 +444,10 @@ printf '%s\n' \
     > "$work/expected-mux-apt.log"
 cmp -s "$work/expected-mux-apt.log" "$INSTALL_TEST_APT_LOG" \
     || fail "--mux-only --deps package list or apt order did not match"
-printf '%s\n' \
-    '<pkg-config> <--cflags-only-I> <fribidi>' \
-    '<pkg-config> <--cflags-only-I> <fribidi>' \
-    > "$work/expected-mux-pkg-config.log"
+# One probe per zig build: the daemon, then each portable target.
+for build in mux x86_64-linux-musl $(sketerm_portable_foreign_targets); do
+    printf '%s\n' '<pkg-config> <--cflags-only-I> <fribidi>'
+done > "$work/expected-mux-pkg-config.log"
 cmp -s "$work/expected-mux-pkg-config.log" "$work/pkg-config.log" \
     || fail "mux builds did not probe fribidi cleanly after dependency installation"
 
@@ -1045,6 +1051,29 @@ set -e
 [[ "$(<"$work/unsupported-arch.err")" == *"unsupported Linux package architecture"* ]] \
     || fail "unsupported packaging architecture failure was not explicit"
 
+# src/mux/portable.zig declares the portable target set (build naming and
+# deployment both read it); stage.sh's two views of that set must match it.
+mapfile -t table_rows < <(
+    sed -nE 's/^[[:space:]]*row\("([^"]+)", \.([a-z]+),.*/\2 \1/p' \
+        "$root/src/mux/portable.zig")
+[ "${#table_rows[@]}" -ge 3 ] || fail "could not read the portable target table"
+table_linux=$(printf '%s\n' "${table_rows[@]}" | sed -n 's/^linux //p' | sort)
+table_foreign=$(printf '%s\n' "${table_rows[@]}" | grep -v '^linux ' | cut -d' ' -f2 | sort)
+stage_linux=$(for arch in x86_64 aarch64; do
+    sketerm_portable_target_for_arch "$arch"; done | sort)
+[ "$table_linux" = "$stage_linux" ] \
+    || fail "stage.sh Linux portable targets diverged from src/mux/portable.zig"
+[ "$table_foreign" = "$(sketerm_portable_foreign_targets | sort)" ] \
+    || fail "stage.sh foreign portable targets diverged from src/mux/portable.zig"
+
+# Both Arch and plain staging carry every foreign artifact.
+for name in "${foreign_portables[@]}"; do
+    [ -x "${plain_stage[0]}/usr/lib/sketerm/$name" ] \
+        || fail "plain stage omitted $name"
+    [ -x "$work/pkg/usr/lib/sketerm/$name" ] \
+        || fail "PKGBUILD package() omitted $name"
+done
+
 shared_ver=$(sketerm_pkgver "$fixture")
 [ -n "$shared_ver" ] || fail "sketerm_pkgver produced no version"
 [ "$shared_ver" = "$(grep -m1 '\.version' "$root/build.zig.zon" \
@@ -1133,6 +1162,22 @@ elf_machine() {
     printf '%s\n' "$((lo + hi * 256))"
 }
 
+# The macOS artifact is one build for every package architecture. Its real
+# output name proves build.zig and stage.sh agree on the naming rule.
+mac_target=aarch64-macos
+mac_name=$(sketerm_portable_artifact_name "$mac_target")
+(
+    cd "$root"
+    zig build mux-portable -Doptimize=ReleaseFast \
+        -Dportable-target="$mac_target" --prefix "$work/cross-macos"
+)
+macho_arm64() {
+    [ "$(od -An -tx1 -N8 "$1" | tr -d ' \n')" = cffaedfe0c000001 ]
+}
+macho_arm64 "$work/cross-macos/bin/$mac_name" \
+    || fail "$mac_target build is not a Mach-O arm64 $mac_name"
+cp "$work/cross-macos/bin/$mac_name" "$fixture/zig-out/bin/$mac_name"
+
 for spec in \
         'x86_64 x86_64-linux-musl 62 amd64' \
         'aarch64 aarch64-linux-musl 183 arm64'; do
@@ -1143,7 +1188,7 @@ for spec in \
         zig build mux-portable -Doptimize=ReleaseFast \
             -Dportable-target="$portable_target" --prefix "$cross_prefix"
     )
-    cross_artifact="$cross_prefix/bin/sketerm-mux-portable"
+    cross_artifact="$cross_prefix/bin/$(sketerm_portable_artifact_name "$portable_target")"
     [ "$(elf_machine "$cross_artifact")" -eq "$machine" ] \
         || fail "$portable_target build has the wrong ELF e_machine"
 
@@ -1167,6 +1212,8 @@ for spec in \
     plain_portable="${plain_arch_stages[0]}/usr/lib/sketerm/sketerm-mux-portable"
     [ "$(elf_machine "$plain_portable")" -eq "$machine" ] \
         || fail "$host_arch plain stage has the wrong portable ELF e_machine"
+    macho_arm64 "${plain_arch_stages[0]}/usr/lib/sketerm/$mac_name" \
+        || fail "$host_arch plain stage lacks the macOS portable artifact"
     [[ "$(<"$work/plain-$host_arch-zig.log")" == \
         *"<call> <build> <mux-portable> <-Doptimize=ReleaseFast> <-Dportable-target=$portable_target>"* ]] \
         || fail "$host_arch plain packaging did not pass $portable_target"
@@ -1189,11 +1236,16 @@ for spec in \
         || fail "$host_arch Debian control architecture is inconsistent"
     [[ "$(basename "$(<"$INSTALL_TEST_DEB_LOG")")" == *"_${deb_arch}.deb" ]] \
         || fail "$host_arch Debian filename architecture is inconsistent"
-    [ "$(elf_machine "$staged_portable")" -eq "$machine" ] \
+    [ "$(elf_machine "$staged_portable/sketerm-mux-portable")" -eq "$machine" ] \
         || fail "$host_arch Debian stage has the wrong portable ELF e_machine"
+    macho_arm64 "$staged_portable/$mac_name" \
+        || fail "$host_arch Debian stage lacks the macOS portable artifact"
     [[ "$(<"$work/debian-$host_arch-zig.log")" == \
         *"<call> <build> <mux-portable> <-Doptimize=ReleaseFast> <-Dportable-target=$portable_target>"* ]] \
         || fail "$host_arch Debian packaging did not pass $portable_target"
+    [[ "$(<"$work/debian-$host_arch-zig.log")" == \
+        *"<call> <build> <mux-portable> <-Doptimize=ReleaseFast> <-Dportable-target=$mac_target>"* ]] \
+        || fail "$host_arch Debian packaging did not build $mac_target"
 
     if [ -n "$real_dpkg_deb" ]; then
         deb_extract="$work/debian-$host_arch-extract"

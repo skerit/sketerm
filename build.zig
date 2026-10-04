@@ -364,7 +364,9 @@ pub fn build(b: *std.Build) void {
     portable_opts.addOption(bool, "webm_rec", false);
     mux_portable_mod.addImport("build_options", portable_opts.createModule());
     const mux_portable_exe = b.addExecutable(.{
-        .name = "sketerm-mux-portable",
+        // Linux keeps `sketerm-mux-portable`; other OSes get a suffixed
+        // name so a macOS cross build never clobbers the Linux artifact.
+        .name = portable_targets.artifactNameForTriple(portable_triple),
         .root_module = mux_portable_mod,
         // Keyed on the PORTABLE triple, not the host target — a
         // `-Dportable-target=aarch64-macos` cross build needs the
@@ -373,7 +375,7 @@ pub fn build(b: *std.Build) void {
     });
     const mux_portable_step = b.step(
         "mux-portable",
-        "Build a baseline-CPU static-musl sketerm-mux for scp-to-server",
+        "Build a baseline-CPU sketerm-mux (static musl on Linux) for remote deployment",
     );
     mux_portable_step.dependOn(&atomicwrite_portable_tests.step);
     mux_portable_step.dependOn(&b.addInstallArtifact(mux_portable_exe, .{}).step);
@@ -1983,6 +1985,7 @@ fn addZstd(b: *std.Build, mod: *std.Build.Module) void {
 /// `tree_sitter/parser.h` pins the language ABI its table was generated
 /// against.
 const ts_grammars = @import("src/editor/grammars.zig");
+const portable_targets = @import("src/mux/portable.zig");
 
 const TS_CFLAGS = [_][]const u8{
     // gnu11, not c11: the runtime calls fdopen() and the byte-order

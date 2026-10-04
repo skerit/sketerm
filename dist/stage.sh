@@ -112,6 +112,25 @@ sketerm_portable_target_for_arch() {
     esac
 }
 
+# The non-Linux portable targets every package carries beside its own Linux
+# one, so deployment reaches those hosts too (cross builds need no SDK; Zig
+# ad-hoc signs the Mach-O, which Apple Silicon requires to exec it). The
+# declaring home of the target set is src/mux/portable.zig; stage.sh cannot
+# import it, so dist/test-install.sh drift-tests this list and the Linux
+# mapping above against that table.
+sketerm_portable_foreign_targets() {
+    printf 'aarch64-macos\n'
+}
+
+# The file `zig build mux-portable -Dportable-target=$1` installs: portable.zig's
+# rule, Linux unsuffixed and every other OS suffixed by its triple.
+sketerm_portable_artifact_name() {
+    case "$1" in
+        *-linux-*) printf 'sketerm-mux-portable\n' ;;
+        *) printf 'sketerm-mux-portable-%s\n' "$1" ;;
+    esac
+}
+
 # The one derivation of the semver whose one source of truth is .version in
 # build.zig.zon. A non-git tree (release tarball) simply has no .r<n>.g<sha>.
 sketerm_pkgver() {
@@ -135,7 +154,7 @@ sketerm_pkgver() {
 # libgtk4-layer-shell-dev; Arch always has it, so PKGBUILD passes 1).
 sketerm_build() {
     local root=$1 kind=$2 web_ok=$3 cef_include=$4 cef_lib=$5 web_skip_reason=${6:-}
-    local package_arch=$7 layer_shell=${8:-1} portable_target
+    local package_arch=$7 layer_shell=${8:-1} portable_target target
     local gui_flags=()
     portable_target=$(sketerm_portable_target_for_arch "$package_arch") || portable_target=
     cd "$root"
@@ -172,8 +191,10 @@ sketerm_build() {
     # The portable daemon compiles the Opus and video probes out and stays
     # static/codec-free by design; it is what gets scp'd to servers.
     if [ -n "$portable_target" ]; then
-        zig build mux-portable -Doptimize=ReleaseFast \
-            -Dportable-target="$portable_target"
+        for target in "$portable_target" $(sketerm_portable_foreign_targets); do
+            zig build mux-portable -Doptimize=ReleaseFast \
+                -Dportable-target="$target"
+        done
     else
         sketerm_warn "packaging without sketerm-mux-portable; \`sketerm ssh <host>\` will need sketerm-mux already installed there"
     fi
@@ -205,9 +226,15 @@ sketerm_stage() {
     install -Dm755 zig-out/bin/sketerm-mux "$dest/usr/bin/sketerm-mux"
     # Told explicitly rather than probed: a zig-out left over from a build on
     # another architecture must not be packaged as this one's artifact.
+    # The foreign (macOS) artifacts ride the same gate: a package either can
+    # deploy the daemon or says it cannot, never half of it.
     if [ "$with_portable" -eq 1 ]; then
         install -Dm755 zig-out/bin/sketerm-mux-portable \
             "$dest/usr/lib/sketerm/sketerm-mux-portable"
+        for i in $(sketerm_portable_foreign_targets); do
+            i=$(sketerm_portable_artifact_name "$i")
+            install -Dm755 "zig-out/bin/$i" "$dest/usr/lib/sketerm/$i"
+        done
     fi
 
     if [ "$kind" = gui ]; then

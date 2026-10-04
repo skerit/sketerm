@@ -8,27 +8,35 @@ restarts, and suspends.
 ## Automatic deployment
 
 Sketerm automatically deploys its **portable** mux when connecting to a
-supported Linux server with key or agent authentication. The local artifact is
-SHA-256 hashed, the remote architecture is checked, and the binary is uploaded
-atomically under `$HOME/.cache/sketerm/mux/`. Content-addressed names let old
-and new binaries coexist, so an upgrade never overwrites a binary that may
-still back durable sessions.
+supported Linux or Apple Silicon macOS host with key or agent authentication.
+The local artifacts are SHA-256 hashed, the remote platform (`uname -s:uname
+-m`) picks which one applies, and the binary is uploaded atomically under
+`$HOME/.cache/sketerm/mux/`. Content-addressed names let old and new binaries
+coexist, so an upgrade never overwrites a binary that may still back durable
+sessions.
 
-The packaged artifact matches the package host architecture: x86_64 packages
-carry an x86_64 Linux artifact and aarch64 packages carry an aarch64 Linux
-artifact. An explicit cross-built artifact can be selected with
-`SKETERM_MUX_PORTABLE`; its ELF architecture is checked before deployment. If
-the artifact is unavailable, the server architecture is unsupported,
-`sha256sum` is absent, or deployment is prohibited, Sketerm falls back to
-`sketerm-mux` on the remote non-interactive PATH.
+Packages carry the Linux artifact of the package host architecture
+(`/usr/lib/sketerm/sketerm-mux-portable`: x86_64 packages an x86_64 one,
+aarch64 packages an aarch64 one) plus `sketerm-mux-portable-aarch64-macos`
+beside it. The target set is declared once in `src/mux/portable.zig`; each
+file is classified by its ELF or Mach-O header, never by its name. Zig's
+linker ad-hoc signs the Mach-O, which Apple Silicon requires to run it. An
+explicit artifact can be selected with `SKETERM_MUX_PORTABLE` (one file,
+header-checked the same way). If no artifact matches, the server platform is
+unsupported, neither `sha256sum` nor `shasum` exists, or deployment is
+prohibited, Sketerm falls back to `sketerm-mux` on the remote non-interactive
+PATH.
 
 Deployment is independent of the remote login shell (fish, csh, anything):
 the ssh command is always a single word — `sh` with the script on stdin for
 the check, or the staged uploader's bare path for the upload — so no shell
 dialect ever parses script text. The binary payload never shares a stream
 with script text either (dash buffers stdin scripts), riding a dedicated
-connection into an exact-count `head -c`. Remote requirements are just a
-POSIX `sh`, coreutils, and `sha256sum`.
+connection into an exact-count `head -c`. One check script covers every
+artifact (it answers which one matched in its exit status), so several
+artifacts cost no extra round trip. Remote requirements are just a POSIX
+`sh` (macOS's bash 3.2 included), `head`/`wc`, and `sha256sum` or
+`shasum -a 256`.
 
 `SKETERM_SSH` transport wrappers retain their historical argv by default. Set
 `SKETERM_MUX_PORTABLE` explicitly to opt such a wrapper into deployment.
@@ -49,7 +57,9 @@ ssh server sudo install -m755 /tmp/sketerm-mux-portable /usr/local/bin/sketerm-m
 
 (From the repo instead: `zig build mux-portable`, artifact at
 `zig-out/bin/sketerm-mux-portable`. That direct command defaults to x86_64;
-pass `-Dportable-target=aarch64-linux-musl` for aarch64.)
+pass `-Dportable-target=aarch64-linux-musl` for aarch64, or
+`-Dportable-target=aarch64-macos` for
+`zig-out/bin/sketerm-mux-portable-aarch64-macos`.)
 
 Do NOT copy `/usr/bin/sketerm-mux`: the default build is optimized
 for the CPU it was built on, so a binary from a recent machine dies

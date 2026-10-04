@@ -1319,7 +1319,7 @@ pub const Conn = struct {
         };
         if (!validSshHost(remote.host)) return error.BadPath;
         const plan = sshroute.Plan.init(remote.host, route, options.tor_socks_endpoint) catch return error.BadPath;
-        var prepared = deploy.localPath(allocator);
+        var prepared = deploy.localPath(allocator, &plan);
         defer if (prepared) |*p| p.deinit();
         if (prepared) |p| {
             if (connectSshOnceUsing(allocator, &plan, p.path, 5_000, options.ssh_master)) |conn| return conn else |err| {
