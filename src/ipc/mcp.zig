@@ -40,6 +40,7 @@ const mcp_caps = @import("mcp_caps.zig");
 const mcp_ui = @import("mcp_ui.zig");
 const mcp_agent = @import("mcp_agent.zig");
 const agentwait = @import("agentwait.zig");
+const agentsline = @import("agentsline.zig");
 const agentpush = @import("agentpush.zig");
 const mcp_testkit = @import("mcp_testkit.zig");
 const FakeBackend = mcp_testkit.FakeBackend;
@@ -54,6 +55,8 @@ const MCP_HELP =
     \\                   [--channel-name NAME]
     \\       sketerm mcp agent-wait --socket PATH [--match TEXT] [--messages]
     \\                   [--follow] [--timeout SECONDS] [--since SEQ] AGENT
+    \\       sketerm mcp agents [--format line|compact|json] [--parent PID]
+    \\                   [--hosts] [--no-color]
     \\
     \\Runs a Model Context Protocol server on stdio. Register it in an
     \\MCP client (Claude Code, etc.) as command "sketerm" with args
@@ -127,7 +130,9 @@ const MCP_HELP =
     \\adapter on a term_open terminal); agent_list and
     \\agent_adapters report. `sketerm mcp agent-wait ... AGENT` blocks until
     \\the agent next needs attention (the tools return the exact command as
-    \\watch_command); see `sketerm mcp agent-wait --help`.
+    \\watch_command); see `sketerm mcp agent-wait --help`. `sketerm mcp
+    \\agents` summarizes the agents your process tree's servers run, for a
+    \\status line; see `sketerm mcp agents --help`.
     \\
     \\Pushed agent events: in a Claude Code session started with
     \\`--dangerously-load-development-channels server:sketerm` (or
@@ -767,6 +772,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     // the entry point so both binaries (`sketerm mcp`, `sketerm-mcp`)
     // answer the exact watch_command the agent tools hand out.
     if (args.len > 0 and std.mem.eql(u8, args[0], agentwait.SUBCOMMAND)) return agentwait.cli(allocator, args[1..]);
+    // Likewise a reader of the registry files: a status line's segment.
+    if (args.len > 0 and std.mem.eql(u8, args[0], agentsline.SUBCOMMAND)) return agentsline.cli(allocator, args[1..]);
     const opts = Opts.parse(args) catch |err| {
         const msg = switch (err) {
             error.UnknownFlag => "sketerm mcp: unknown flag (see --help)\n",
@@ -862,6 +869,9 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
         .profile = opts.profile orelse "",
         .log_dir = opts.log_dir orelse "",
         .mux_socket = registry_sock,
+        // The pane this server was started from (a GUI finds its agents' pane by it).
+        .session = if (c.getenv("SKETERM_SESSION")) |v| std.mem.span(v) else "",
+        .session_socket = if (c.getenv("SKETERM_MUX_SOCKET")) |v| std.mem.span(v) else "",
     })) |lease| {
         registry_lease = lease;
     } else |_| {

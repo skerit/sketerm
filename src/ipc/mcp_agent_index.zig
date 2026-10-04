@@ -343,10 +343,13 @@ pub fn publishTo(lease: ?*mcp_registry.Lease) void {
 }
 
 /// Rewrite the registry record's agent list from `state.entries`: called
-/// after every open, attach, close, relaunch and the startup reattach.
+/// after every open, attach, close, relaunch and the startup reattach, and
+/// by `service` when an agent's state moved since (`publishedStale`).
 /// Best effort: a failed rewrite leaves the previous list, never the server.
 pub fn publishAgents() void {
     const lease = state.registry orelse return;
+    // Marked first: a failed write is not retried every pass.
+    for (state.entries.items) |e| e.published_state = e.agent.state();
     var arena_state = std.heap.ArenaAllocator.init(state.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -368,9 +371,24 @@ pub fn publishAgents() void {
             .instance;
         var buf: [300]u8 = undefined;
         const location = arena.dupe(u8, where.format(&buf) catch continue) catch return;
-        out.append(arena, .{ .id = e.id, .app = e.loaded.spec.id, .sessions = sessions.items, .location = location }) catch return;
+        const st = e.published_state.?;
+        out.append(arena, .{
+            .id = e.id,
+            .app = e.loaded.spec.id,
+            .sessions = sessions.items,
+            .location = location,
+            .attention = @tagName(st.attention()),
+            .state = @tagName(st),
+        }) catch return;
     }
     lease.publishAgents(out.items) catch {};
+}
+
+/// Some agent's state moved since the record last published it.
+pub fn publishedStale() bool {
+    if (state.registry == null) return false;
+    for (state.entries.items) |e| if (e.published_state != e.agent.state()) return true;
+    return false;
 }
 
 /// A descriptor's lifetime fence: null when its session's daemon had none.

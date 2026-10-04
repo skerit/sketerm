@@ -15,6 +15,52 @@ pub const SourceKind = enum {
     opencode_api,
 };
 
+/// How an agent is doing, as a human glancing at it needs to know: the
+/// registry record, `sketerm mcp agents` and the GUI's badges all read it.
+/// Declaration order IS the urgency order, most urgent first.
+pub const Attention = enum {
+    needs_input,
+    lost,
+    working,
+    idle,
+
+    /// The words a person reads for it ("2 needs input").
+    pub fn label(self: Attention) []const u8 {
+        return switch (self) {
+            .needs_input => "needs input",
+            .lost => "disconnected",
+            .working => "working",
+            .idle => "idle",
+        };
+    }
+
+    /// Its one-character mark where a label does not fit ("2▶ 1?").
+    pub fn glyph(self: Attention) []const u8 {
+        return switch (self) {
+            .needs_input => "?",
+            .lost => "\u{2717}",
+            .working => "\u{25B6}",
+            .idle => "\u{2713}",
+        };
+    }
+
+    /// Position in a one-line summary, which reads "2 working · 1 needs
+    /// input" (the busy count first), unlike the urgency order.
+    pub fn summaryRank(self: Attention) u8 {
+        return switch (self) {
+            .working => 0,
+            .needs_input => 1,
+            .lost => 2,
+            .idle => 3,
+        };
+    }
+
+    /// Ranks above `other` (needs it sooner).
+    pub fn moreUrgent(self: Attention, other: Attention) bool {
+        return @intFromEnum(self) < @intFromEnum(other);
+    }
+};
+
 pub const State = enum {
     starting,
     working,
@@ -27,6 +73,17 @@ pub const State = enum {
     idle,
     exited,
     disconnected,
+
+    /// What this state asks of a person; an exited agent counts as lost
+    /// until it is closed.
+    pub fn attention(self: State) Attention {
+        return switch (self) {
+            .waiting_user => .needs_input,
+            .disconnected, .exited => .lost,
+            .starting, .working, .waiting_subagent, .waiting_background, .retrying => .working,
+            .idle => .idle,
+        };
+    }
 
     /// A prompt typed now is taken as the next one (not refused as busy).
     pub fn takesPrompt(self: State) bool {
@@ -279,6 +336,32 @@ test "only retrying waits before it is surfaced, and only it does not wake by de
     }
     try t.expect(!ErrorClass.limit.retriedOnOverload());
     try t.expect(!ErrorClass.auth.retriedOnOverload());
+}
+
+test "attention: every state classified, urgency follows declaration order" {
+    const t = std.testing;
+    try t.expectEqual(Attention.needs_input, State.waiting_user.attention());
+    try t.expectEqual(Attention.lost, State.disconnected.attention());
+    try t.expectEqual(Attention.lost, State.exited.attention());
+    try t.expectEqual(Attention.idle, State.idle.attention());
+    for ([_]State{ .starting, .working, .waiting_subagent, .waiting_background, .retrying }) |s|
+        try t.expectEqual(Attention.working, s.attention());
+    // Every attention is reachable from some state.
+    var seen = std.EnumSet(Attention).initEmpty();
+    for (std.enums.values(State)) |s| seen.insert(s.attention());
+    try t.expectEqual(@as(usize, std.enums.values(Attention).len), seen.count());
+    try t.expect(Attention.needs_input.moreUrgent(.lost));
+    try t.expect(Attention.lost.moreUrgent(.working));
+    try t.expect(Attention.working.moreUrgent(.idle));
+    try t.expect(!Attention.idle.moreUrgent(.idle));
+    try t.expectEqualStrings("disconnected", Attention.lost.label());
+    try t.expectEqualStrings("needs input", Attention.needs_input.label());
+    // Summary ranks are a permutation.
+    var ranks = std.StaticBitSet(std.enums.values(Attention).len).initEmpty();
+    for (std.enums.values(Attention)) |a| {
+        try t.expect(!ranks.isSet(a.summaryRank()));
+        ranks.set(a.summaryRank());
+    }
 }
 
 test "a wait outcome never shares a name with an event kind" {

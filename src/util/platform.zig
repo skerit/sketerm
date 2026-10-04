@@ -790,6 +790,33 @@ pub fn infoOfPid(pid: c.pid_t) ?ProcessInfo {
     return .{ .ppid = fields.ppid, .uid = st.st_uid, .age_ms = @max(0, uptime_ms - started_ms) };
 }
 
+/// The parent of a live process; null when it is gone or cannot be read.
+/// macOS reads `kinfo_proc.kp_eproc.e_ppid` from `sysctl` KERN_PROC_PID at its
+/// LP64 offset (the struct is not in our headers), unverified on hardware.
+pub fn parentOf(pid: c.pid_t) ?c.pid_t {
+    if (pid <= 0) return null;
+    if (is_macos) {
+        const CTL_KERN: c_int = 1;
+        const KERN_PROC: c_int = 14;
+        const KERN_PROC_PID: c_int = 1;
+        // sizeof(struct kinfo_proc) and offsetof(kp_eproc.e_ppid) on LP64:
+        // extern_proc (296) + e_paddr, e_sess (16) + _pcred (104) +
+        // _ucred (76) + padding (4) + vmspace (64).
+        const KINFO_PROC_SIZE = 648;
+        const E_PPID_OFFSET = 560;
+        var mib = [4]c_int{ CTL_KERN, KERN_PROC, KERN_PROC_PID, pid };
+        var buf: [KINFO_PROC_SIZE]u8 align(8) = undefined;
+        var len: usize = buf.len;
+        if (sysctl(&mib, mib.len, &buf, &len, null, 0) != 0) return null;
+        // A pid that does not exist answers 0 bytes, not an error.
+        if (len < E_PPID_OFFSET + @sizeOf(c.pid_t)) return null;
+        return std.mem.readInt(i32, buf[E_PPID_OFFSET..][0..4], builtin.cpu.arch.endian());
+    }
+    var stat_buf: [2048]u8 = undefined;
+    const fields = parseProcStat(readProcBlock(pid, "stat", &stat_buf) orelse return null) orelse return null;
+    return fields.ppid;
+}
+
 const ProcStatFields = struct { ppid: c.pid_t, start_ticks: u64 };
 
 /// Parent pid (field 4) and start time in clock ticks (field 22) of a /proc/<pid>/stat line.
@@ -834,6 +861,19 @@ test "parseProcStat counts fields from the last parenthesis" {
     try std.testing.expectEqual(@as(u64, 987654), fields.start_ticks);
     try std.testing.expect(parseProcStat("4242 (short) S 17\n") == null);
     try std.testing.expect(parseProcStat("no parenthesis") == null);
+}
+
+test "parseProcStat takes the parent after a comm holding ') ' and spaces" {
+    // A process may name itself anything, including a fake field run.
+    const line = "77 (node) S 1 2 3) R 4242 77 77 0 -1 4194560 1 0 0 0 5 3 0 0 20 0 1 0 555 12345678 900\n";
+    const fields = parseProcStat(line) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(c.pid_t, 4242), fields.ppid);
+}
+
+test "parentOf answers this process's parent and nothing for a bad pid" {
+    try std.testing.expectEqual(@as(?c.pid_t, c.getppid()), parentOf(c.getpid()));
+    try std.testing.expectEqual(@as(?c.pid_t, null), parentOf(0));
+    try std.testing.expectEqual(@as(?c.pid_t, null), parentOf(-5));
 }
 
 test "parseUptimeMs keeps millisecond precision" {

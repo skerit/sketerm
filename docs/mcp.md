@@ -249,7 +249,7 @@ is kept by a `:ro` policy term. The full descriptions and schemas are in
 
 ### `core`
 
-- `capabilities` (read-only): Preflight report of what THIS MCP server can do right now: isolation mode, headless GUI-app support (headless_gui — launch_app renders apps into the mux daemon and NEVER needs a display, an X server or a sketerm window), whether a direct sketerm GUI control socket is attached (gui_socket; independent of the session panel relay and of headless GUI apps), the live panel transport (panels + panel_transport) and the saved-panel store (panels_store + panel_store), OCR (tesseract) availability, whether the web_* tools can run and against what (web + web_backend "gui"/"session"/"headless"/"none" — "session" adds web_session, the watchable Wayland app session the helper renders into — plus the sketerm-webengine path in web_helper; web_gui says whether the user granted the web_* tools their OWN browser and logins, web_gui_source where that came from and web_gui_transport which GUI socket they hold now; web_profiles says whether named cookie jars work, web_routes which per-tab network routes web_open can honour, web_engine_broker whether the mux daemon owns the engine's lifetime and web_engine_owner who started the one in use; web_downloads whether web_download can pull a url through a view; web_capture whether web_open can record the response bodies a headless view's page receives; web_engine_started whether an engine exists YET, since web_backend/web_watch/web_session are undetermined until it does), ssh/scp presence, the directory terminal asciicast recordings land in, the EFFECTIVE input-timing defaults (hold_ms/settle_ms/timeout_ms/click_retry, each marked when a SKETERM_MCP_* env override changed it from the built-in), whether sub-agents run here (agents, agent_adapters, agent_waiter, agent_ssh, agent_open_args_env for a wrapper's args and env, agent_open_resume for continuing an existing conversation (agent_resume_checked: an unknown id fails instead of starting afresh), agent_open_process_args for server_args/tui_args, agent_conversation for the conversation id results report, user_daemon_env_scrubbed for a per-user daemon started without the assistant's environment, agent_resume_by_id for agent_attach {agent} from any server, agent_idle_ttl_hours for how long an unattached agent lives, tombstones for agent_attach saying why a gone agent ended) and how agent_read selects what it returns (agent_read_select), how sub-agent output is delivered (agent_records_once, agent_events_shared), whether agent_wait can watch several agents (agent_wait_any; agent_wait_all: once every one settled), whether agent_send queues a prompt for a busy agent (agent_send_queue), reaches several agents in one call (agent_send_many) and interrupts a busy one first (agent_send_interrupt), whether agent_read returns just the final message (agent_read_final), agent_list is compact by default (agent_list_compact), agent_attach relaunches a gone agent (agent_relaunch) and agent_open hands a prompt off with timeout_ms 0 (agent_open_handoff), whether agent_answer takes free text (agent_answer_text), agent_open takes a permission policy (agent_permissions), brief templates (agent_templates), side questions (agent_side_question: the apps agent_ask works with) and retry_on_overload (agent_retry_on_overload: the error classes it retries and its bounds), a lost link that finds its session gone ends the agent (agent_gone_on_reconnect), when done fires (agent_done), and whether agent events are pushed into this session (agent_push: channel = Claude Code channel messages; agent_push_follow / agent_push_followers for the agent-wait --server follower the opencode plugin runs), whether term_open takes exec_shell (term_exec_shell_default), and open session counts.
+- `capabilities` (read-only): Preflight report of what THIS MCP server can do right now: isolation mode, headless GUI-app support (headless_gui — launch_app renders apps into the mux daemon and NEVER needs a display, an X server or a sketerm window), whether a direct sketerm GUI control socket is attached (gui_socket; independent of the session panel relay and of headless GUI apps), the live panel transport (panels + panel_transport) and the saved-panel store (panels_store + panel_store), OCR (tesseract) availability, whether the web_* tools can run and against what (web + web_backend "gui"/"session"/"headless"/"none" — "session" adds web_session, the watchable Wayland app session the helper renders into — plus the sketerm-webengine path in web_helper; web_gui says whether the user granted the web_* tools their OWN browser and logins, web_gui_source where that came from and web_gui_transport which GUI socket they hold now; web_profiles says whether named cookie jars work, web_routes which per-tab network routes web_open can honour, web_engine_broker whether the mux daemon owns the engine's lifetime and web_engine_owner who started the one in use; web_downloads whether web_download can pull a url through a view; web_capture whether web_open can record the response bodies a headless view's page receives; web_engine_started whether an engine exists YET, since web_backend/web_watch/web_session are undetermined until it does), ssh/scp presence, the directory terminal asciicast recordings land in, the EFFECTIVE input-timing defaults (hold_ms/settle_ms/timeout_ms/click_retry, each marked when a SKETERM_MCP_* env override changed it from the built-in), whether sub-agents run here (agents, agent_adapters, agent_waiter, agent_ssh, agent_open_args_env for a wrapper's args and env, agent_open_resume for continuing an existing conversation (agent_resume_checked: an unknown id fails instead of starting afresh), agent_open_process_args for server_args/tui_args, agent_conversation for the conversation id results report, user_daemon_env_scrubbed for a per-user daemon started without the assistant's environment, agent_resume_by_id for agent_attach {agent} from any server, agent_idle_ttl_hours for how long an unattached agent lives, tombstones for agent_attach saying why a gone agent ended) and how agent_read selects what it returns (agent_read_select), how sub-agent output is delivered (agent_records_once, agent_events_shared), whether agent_wait can watch several agents (agent_wait_any; agent_wait_all: once every one settled), whether agent_send queues a prompt for a busy agent (agent_send_queue), reaches several agents in one call (agent_send_many) and interrupts a busy one first (agent_send_interrupt), whether agent_read returns just the final message (agent_read_final), agent_list is compact by default (agent_list_compact), each agent's attention is published for `sketerm mcp agents` (agent_attention), agent_attach relaunches a gone agent (agent_relaunch) and agent_open hands a prompt off with timeout_ms 0 (agent_open_handoff), whether agent_answer takes free text (agent_answer_text), agent_open takes a permission policy (agent_permissions), brief templates (agent_templates), side questions (agent_side_question: the apps agent_ask works with) and retry_on_overload (agent_retry_on_overload: the error classes it retries and its bounds), a lost link that finds its session gone ends the agent (agent_gone_on_reconnect), when done fires (agent_done), and whether agent events are pushed into this session (agent_push: channel = Claude Code channel messages; agent_push_follow / agent_push_followers for the agent-wait --server follower the opencode plugin runs), whether term_open takes exec_shell (term_exec_shell_default), and open session counts.
 <!-- tool-reference:end -->
 
 ## Tool exposure policy
@@ -1477,6 +1477,44 @@ TUI attached to that server for a human to watch is optional, see below).
   away. `sketerm-mcp agent-wait` and `sketerm-mcp mcp agent-wait` are the
   same command; the subscribe line keeps `agent` (the first) beside
   `agents`, so an older server watches the first one.
+- **At a glance: `sketerm mcp agents` (`capabilities.agent_attention`).**
+  Every server publishes, per agent in its registry record
+  (`$XDG_RUNTIME_DIR/sketerm/mcp-servers/<pid>.json`), its `state` and its
+  `attention`, the one classification a person needs: `needs_input`
+  (waiting_user), `lost` (disconnected, or exited until closed),
+  `working` (starting, working, waiting_subagent, waiting_background,
+  retrying) and `idle`, in that order of urgency (`vocab.Attention`). The
+  record is rewritten when an agent's state moves (at most once per loop
+  pass), and also carries the pane session the server was started from
+  (`session`, `session_socket`, from `SKETERM_SESSION` /
+  `SKETERM_MUX_SOCKET`; absent when unset). `sketerm mcp agents` (also
+  `sketerm-mcp agents`) reads those files, nothing else (no socket, no
+  daemon), and summarizes the agents of every live server that one of
+  its own ANCESTOR processes started, so a Claude Code status line
+  (claude -> sh -> node -> sketerm) sees exactly that Claude Code's
+  agents, wherever they run; `--parent PID` matches only servers PID
+  started. Formats:
+  - `--format line` (the default): `agents 2 working · 1 needs input ·
+    1 disconnected · 1 idle` in ANSI colour (`--no-color` for none),
+    groups with no agents left out, `N unknown` for agents of an older
+    server, and NOTHING at all (exit 0) when there are no agents.
+    `--hosts` appends `(dalaran 2, local 1)`.
+  - `--format compact`: `ag 2▶ 1? 1✗ 1✓` (`~` for unknown); the default
+    turns into it when `$COLUMNS` is set and below 100.
+  - `--format json`, a CONTRACT for scripts, one line:
+    `{"total":N,"by_attention":{"needs_input":n,"lost":n,"working":n,"idle":n},
+    "most_urgent":"needs_input"|"lost"|"working"|"idle"|null,
+    "agents":[{"id","app","host","attention","state"}]}`. `host` is the
+    SSH destination the agent runs on, null for this machine. An agent
+    from a server that predates publishing attention counts in `total`
+    with `attention` and `state` null (and in no `by_attention` group);
+    a server that predates publishing its agents at all contributes
+    none. No agents: `{"total":0,...,"most_urgent":null,"agents":[]}`.
+
+  It exits 0 whatever it finds (an unreadable registry reads as no
+  agents) and 2 only on bad usage. A status line runs it on every
+  refresh, e.g. `execFileSync('sketerm', ['mcp', 'agents', '--format',
+  'json'], {timeout: 500})`, and treats any failure as no segment.
 - **Pushed events (`capabilities.agent_push`, `agent_push_follow`,
   `agent_push_followers`).** Instead of a waiter the orchestrator
   re-arms (a Monitor stops after 30 minutes, a background command after

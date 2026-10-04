@@ -176,6 +176,8 @@ pub fn service(now_ms: i64) void {
     servicePush(now_ms);
     serviceHostProbes(now_ms);
     state.waiter.service(now_ms);
+    // One rewrite per pass, however many agents moved.
+    if (mcp_agent_index.publishedStale()) publishAgents();
 }
 
 // ── retry on overload ────────────────────────────────────────────

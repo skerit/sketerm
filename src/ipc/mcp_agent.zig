@@ -291,6 +291,9 @@ pub const Entry = struct {
     status_user: ?[]u8 = null,
     /// Why the start set no status command up (static).
     facts_skipped: ?[]const u8 = null,
+    /// The state the registry record last published for it: `service`
+    /// republishes when the state moved (`mcp_agent_index.publishAgents`).
+    published_state: ?@import("../agent/vocab.zig").State = null,
 
     /// Forget the oldest `n` prompts of `queued_sent`.
     pub fn dropQueued(self: *Entry, n: usize) void {

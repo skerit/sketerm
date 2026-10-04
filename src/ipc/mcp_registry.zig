@@ -12,6 +12,7 @@ const pathz = @import("../util/pathz.zig");
 const readfile = @import("../util/readfile.zig");
 const sockpath = @import("../mux/sockpath.zig");
 const webpresence = @import("../web/webpresence.zig");
+const vocab = @import("../agent/vocab.zig");
 const pathZ = pathz.pathZ;
 const unlinkPath = pathz.unlinkPath;
 
@@ -31,6 +32,10 @@ pub const Registration = struct {
     profile: []const u8 = "",
     log_dir: []const u8 = "",
     mux_socket: []const u8,
+    /// The pane session the server was started from (`SKETERM_SESSION`)
+    /// and its daemon (`SKETERM_MUX_SOCKET`); empty = not started from one.
+    session: []const u8 = "",
+    session_socket: []const u8 = "",
 };
 
 /// One sub-agent as the record publishes it, so a viewer on any host can
@@ -42,6 +47,21 @@ pub const Agent = struct {
     sessions: []const []const u8 = &.{},
     /// `sshroute.Location` text: `instance` or `host:<destination>`.
     location: []const u8,
+    /// `vocab.Attention` and `vocab.State` names, kept as text so a member
+    /// a newer server adds reads as unknown instead of failing the whole
+    /// record. Null = unknown (a server that predates them).
+    attention: ?[]const u8 = null,
+    state: ?[]const u8 = null,
+
+    /// Null when unknown or a name this build does not know.
+    pub fn attentionFact(self: Agent) ?vocab.Attention {
+        return std.meta.stringToEnum(vocab.Attention, self.attention orelse return null);
+    }
+
+    /// Null when unknown or a name this build does not know.
+    pub fn stateFact(self: Agent) ?vocab.State {
+        return std.meta.stringToEnum(vocab.State, self.state orelse return null);
+    }
 };
 
 /// More agents than this are not published: an oversized record would
@@ -67,6 +87,10 @@ const Record = struct {
     ppid: ?c.pid_t = null,
     /// The agent waiter socket (`agentwait.zig`); absent without one.
     agent_socket: ?[]const u8 = null,
+    /// `Registration.session`/`session_socket`; absent when unset or
+    /// written by an older server (unknown, never "no session").
+    session: ?[]const u8 = null,
+    session_socket: ?[]const u8 = null,
 };
 
 pub const Entry = struct {
@@ -83,6 +107,9 @@ pub const Entry = struct {
     ppid: c.pid_t = 0,
     /// Empty = no waiter socket, or an older build.
     agent_socket: []u8 = &.{},
+    /// Null = not started from a pane session, or an older build.
+    session: ?[]u8 = null,
+    session_socket: ?[]u8 = null,
 
     pub fn deinit(self: *Entry, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
@@ -90,6 +117,8 @@ pub const Entry = struct {
         allocator.free(self.log_dir);
         allocator.free(self.mux_socket);
         allocator.free(self.agent_socket);
+        if (self.session) |v| allocator.free(v);
+        if (self.session_socket) |v| allocator.free(v);
         if (self.agents) |owned| freeAgents(allocator, owned);
     }
 
@@ -116,6 +145,8 @@ fn freeAgents(allocator: std.mem.Allocator, agents: []Agent) void {
         for (agent.sessions) |s| allocator.free(s);
         allocator.free(agent.sessions);
         allocator.free(agent.location);
+        if (agent.attention) |v| allocator.free(v);
+        if (agent.state) |v| allocator.free(v);
     }
     allocator.free(agents);
 }
@@ -131,6 +162,10 @@ fn dupeAgents(allocator: std.mem.Allocator, src: []const Agent) ![]Agent {
         errdefer allocator.free(app);
         const location = try allocator.dupe(u8, agent.location);
         errdefer allocator.free(location);
+        const attention = try dupeOpt(allocator, agent.attention);
+        errdefer if (attention) |v| allocator.free(v);
+        const st = try dupeOpt(allocator, agent.state);
+        errdefer if (st) |v| allocator.free(v);
         const sessions = try allocator.alloc([]const u8, agent.sessions.len);
         var n: usize = 0;
         errdefer {
@@ -141,10 +176,14 @@ fn dupeAgents(allocator: std.mem.Allocator, src: []const Agent) ![]Agent {
             sessions[n] = try allocator.dupe(u8, s);
             n += 1;
         }
-        slot.* = .{ .id = id, .app = app, .sessions = sessions, .location = location };
+        slot.* = .{ .id = id, .app = app, .sessions = sessions, .location = location, .attention = attention, .state = st };
         done += 1;
     }
     return out;
+}
+
+fn dupeOpt(allocator: std.mem.Allocator, v: ?[]const u8) !?[]u8 {
+    return if (v) |s| try allocator.dupe(u8, s) else null;
 }
 
 pub const Lease = struct {
@@ -190,11 +229,15 @@ pub const Lease = struct {
             .profile = &.{},
             .log_dir = &.{},
             .mux_socket = &.{},
+            .session = &.{},
+            .session_socket = &.{},
         };
         errdefer lease.freeRegistration();
         lease.registration.profile = try allocator.dupe(u8, registration.profile);
         lease.registration.log_dir = try allocator.dupe(u8, registration.log_dir);
         lease.registration.mux_socket = try allocator.dupe(u8, registration.mux_socket);
+        lease.registration.session = try allocator.dupe(u8, registration.session);
+        lease.registration.session_socket = try allocator.dupe(u8, registration.session_socket);
         try lease.write(null);
         return lease;
     }
@@ -225,6 +268,8 @@ pub const Lease = struct {
             .agents = agents,
             .ppid = self.ppid,
             .agent_socket = if (self.agent_socket.len > 0) self.agent_socket else null,
+            .session = if (self.registration.session.len > 0) self.registration.session else null,
+            .session_socket = if (self.registration.session_socket.len > 0) self.registration.session_socket else null,
         }, .{ .emit_null_optional_fields = false }, &aw.writer);
         // Runtime-only publication: the held flock is authoritative and the
         // record is deleted at process exit, so `writeCacheFile` — the shared
@@ -239,6 +284,8 @@ pub const Lease = struct {
         a.free(self.registration.profile);
         a.free(self.registration.log_dir);
         a.free(self.registration.mux_socket);
+        a.free(self.registration.session);
+        a.free(self.registration.session_socket);
         self.registration = .{ .mode = .isolated, .mux_socket = "" };
         a.free(self.agent_socket);
         self.agent_socket = &.{};
@@ -424,6 +471,10 @@ fn ownedEntry(allocator: std.mem.Allocator, record: Record, legacy: bool) !Entry
     const agents = if (record.agents) |src| try dupeAgents(allocator, src) else null;
     errdefer if (agents) |owned| freeAgents(allocator, owned);
     const agent_socket = try allocator.dupe(u8, record.agent_socket orelse "");
+    errdefer allocator.free(agent_socket);
+    const session = try dupeOpt(allocator, record.session);
+    errdefer if (session) |v| allocator.free(v);
+    const session_socket = try dupeOpt(allocator, record.session_socket);
     return .{
         .pid = record.pid,
         .mode = record.mode,
@@ -435,6 +486,8 @@ fn ownedEntry(allocator: std.mem.Allocator, record: Record, legacy: bool) !Entry
         .agents = agents,
         .ppid = record.ppid orelse 0,
         .agent_socket = agent_socket,
+        .session = session,
+        .session_socket = session_socket,
     };
 }
 
@@ -480,6 +533,10 @@ pub const Report = struct {
     pid: c.pid_t,
     /// Null = the server predates publishing agents: list its daemon.
     agents: ?[]const Agent = null,
+    /// The pane session the server runs in and its daemon; null = none,
+    /// or a server (or daemon) that predates reporting them.
+    session: ?[]const u8 = null,
+    session_socket: ?[]const u8 = null,
 };
 
 /// Reports for `entries`, which must outlive them. A server without a
@@ -496,6 +553,8 @@ pub fn reports(arena: std.mem.Allocator, entries: []const Entry, anchor: []const
             .mode = entry.mode.text(),
             .pid = entry.pid,
             .agents = entry.agents,
+            .session = entry.session,
+            .session_socket = entry.session_socket,
         });
     }
     return out.toOwnedSlice(arena);
@@ -628,6 +687,62 @@ test "mcp registry publishes agents and still reads a record that predates them"
     try std.testing.expectEqualStrings("old", old.name);
     try std.testing.expectEqual(@as(c.pid_t, 0), old.ppid);
     try std.testing.expectEqual(@as(usize, 0), old.agent_socket.len);
+}
+
+test "mcp registry round-trips attention, state and the pane session; old records read as unknown" {
+    const allocator = std.testing.allocator;
+    var scope = try ScopedRuntime.init(allocator, "attention");
+    defer scope.deinit();
+    var lease = try Lease.acquire(allocator, .{
+        .mode = .isolated,
+        .mux_socket = "/x/mcp-tmp-1/mux.sock",
+        .session = "Cruiser",
+        .session_socket = "/run/user/1/sketerm/mux.sock",
+    });
+    defer lease.deinit();
+    try lease.publishAgents(&.{
+        .{ .id = "claude-1", .app = "claude", .location = "instance", .attention = "needs_input", .state = "waiting_user" },
+        // A member a newer build added: unknown here, the record still reads.
+        .{ .id = "claude-2", .app = "claude", .location = "host:dalaran", .attention = "pondering", .state = "dreaming" },
+        .{ .id = "opencode-1", .app = "opencode", .location = "user" },
+    });
+    {
+        const bytes = try readfile.cappedAlloc(allocator, lease.record_path, MAX_RECORD_BYTES);
+        defer allocator.free(bytes);
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "\"session\":\"Cruiser\"") != null);
+        // Unknown stays absent, never a null or a default that reads as a fact.
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "null") == null);
+    }
+    const entries = try list(allocator, false);
+    defer freeEntries(allocator, entries);
+    try std.testing.expectEqualStrings("Cruiser", entries[0].session.?);
+    try std.testing.expectEqualStrings("/run/user/1/sketerm/mux.sock", entries[0].session_socket.?);
+    const agents = entries[0].agents.?;
+    try std.testing.expectEqual(@as(?vocab.Attention, .needs_input), agents[0].attentionFact());
+    try std.testing.expectEqual(@as(?vocab.State, .waiting_user), agents[0].stateFact());
+    try std.testing.expectEqual(@as(?vocab.Attention, null), agents[1].attentionFact());
+    try std.testing.expectEqualStrings("pondering", agents[1].attention.?);
+    try std.testing.expectEqual(@as(?vocab.Attention, null), agents[2].attentionFact());
+    try std.testing.expect(agents[2].state == null);
+
+    // A record from before these fields: no session, agents of unknown attention.
+    var old_buf: [512]u8 = undefined;
+    const old_path = try std.fmt.bufPrint(&old_buf, "{s}/sketerm/mcp-servers/1.json", .{scope.path});
+    try atomicwrite.writeCacheFile(old_path, "{\"version\":1,\"pid\":1,\"mode\":\"isolated\",\"mux_socket\":\"/x/m.sock\",\"ppid\":7," ++
+        "\"agents\":[{\"id\":\"claude-9\",\"app\":\"claude\",\"sessions\":[\"agent-claude-9\"],\"location\":\"instance\"}]}", 0o600);
+    var old = readEntry(allocator, old_path).?;
+    defer old.deinit(allocator);
+    try std.testing.expect(old.session == null and old.session_socket == null);
+    try std.testing.expect(old.agents.?[0].attention == null and old.agents.?[0].state == null);
+
+    // What an older reader sees: the new fields are ignored, not refused.
+    const OldAgent = struct { id: []const u8, app: []const u8, sessions: []const []const u8 = &.{}, location: []const u8 };
+    const OldRecord = struct { version: u8 = 1, pid: c.pid_t, mode: Mode, mux_socket: []const u8, agents: ?[]const OldAgent = null };
+    const bytes = try readfile.cappedAlloc(allocator, lease.record_path, MAX_RECORD_BYTES);
+    defer allocator.free(bytes);
+    const parsed = try std.json.parseFromSlice(OldRecord, allocator, bytes, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 3), parsed.value.agents.?.len);
 }
 
 test "an instance key resolves only to a live server's daemon" {
