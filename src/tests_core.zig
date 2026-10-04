@@ -342,6 +342,7 @@ comptime {
     _ = @import("agent/statusline.zig");
     _ = @import("ipc/agentwait.zig");
     _ = @import("ipc/agentsline.zig");
+    _ = @import("ipc/agentglance.zig");
     _ = @import("ipc/agentpush.zig");
     _ = @import("ipc/agentindex.zig");
     _ = @import("util/headers.zig");

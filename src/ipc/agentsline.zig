@@ -20,6 +20,7 @@ const platform = @import("../util/platform.zig");
 const vocab = @import("../agent/vocab.zig");
 const registry = @import("mcp_registry.zig");
 const sshroute = @import("../mux/sshroute.zig");
+const agentglance = @import("agentglance.zig");
 const Attention = vocab.Attention;
 
 /// The argv word after `mcp` that selects this command.
@@ -43,22 +44,8 @@ pub const Row = struct {
 };
 
 pub const Summary = struct {
-    total: u32 = 0,
-    by_attention: std.EnumArray(Attention, u32) = .initFill(0),
+    tally: agentglance.Tally = .{},
     rows: []const Row = &.{},
-
-    /// The most urgent attention any agent has; null when none is known.
-    pub fn mostUrgent(self: *const Summary) ?Attention {
-        for (std.enums.values(Attention)) |a| if (self.by_attention.get(a) > 0) return a;
-        return null;
-    }
-
-    /// Agents counted in `total` whose attention is unknown.
-    pub fn unknown(self: *const Summary) u32 {
-        var known: u32 = 0;
-        for (std.enums.values(Attention)) |a| known += self.by_attention.get(a);
-        return self.total - known;
-    }
 };
 
 /// The parents of `start`, nearest first, up to (not including) init.
@@ -85,15 +72,13 @@ pub fn summarize(arena: std.mem.Allocator, entries: []const registry.Entry, star
         if (e.ppid <= 0 or std.mem.indexOfScalar(c.pid_t, starters, e.ppid) == null) continue;
         for (e.agents orelse continue) |ag| {
             const st = ag.stateFact();
-            // A newer server's attention name is unknown here; its state may not be.
-            const att = ag.attentionFact() orelse if (st) |x| x.attention() else null;
+            const att = ag.attentionOrState();
             const host: ?[]const u8 = if (sshroute.Location.parse(ag.location)) |loc| switch (loc) {
                 .host => |h| h,
                 .instance, .user => null,
             } else null;
             try rows.append(arena, .{ .id = ag.id, .app = ag.app, .host = host, .attention = att, .state = st });
-            s.total += 1;
-            if (att) |a| s.by_attention.getPtr(a).* += 1;
+            s.tally.add(att);
         }
     }
     s.rows = rows.items;
@@ -124,20 +109,20 @@ fn summaryOrder() [std.enums.values(Attention).len]Attention {
 
 /// `line` or `compact`; nothing at all when there are no agents.
 pub fn renderText(w: *std.Io.Writer, s: *const Summary, format: Format, color: bool, hosts: bool) !void {
-    if (s.total == 0) return;
+    if (s.tally.total == 0) return;
     const compact = format == .compact;
     const reset = if (color) Ansi.reset else "";
     const dim = if (color) Ansi.dim else "";
     try w.print("{s}{s}{s}", .{ if (color) Ansi.bold else "", if (compact) "ag" else "agents", reset });
     var first = true;
     for (summaryOrder()) |a| {
-        const n = s.by_attention.get(a);
+        const n = s.tally.count(a);
         if (n == 0) continue;
         try sep(w, &first, compact, dim, reset);
         const col = if (color) Ansi.of(a) else "";
         if (compact) try w.print("{s}{d}{s}{s}", .{ col, n, a.glyph(), reset }) else try w.print("{s}{d} {s}{s}", .{ col, n, a.label(), reset });
     }
-    const unknown = s.unknown();
+    const unknown = s.tally.unknown();
     if (unknown > 0) {
         try sep(w, &first, compact, dim, reset);
         try w.print("{s}{d}{s}{s}", .{ dim, unknown, if (compact) "~" else " unknown", reset });
@@ -181,16 +166,16 @@ pub fn renderJson(w: *std.Io.Writer, s: *const Summary) !void {
     var j: std.json.Stringify = .{ .writer = w };
     try j.beginObject();
     try j.objectField("total");
-    try j.write(s.total);
+    try j.write(s.tally.total);
     try j.objectField("by_attention");
     try j.beginObject();
     for (std.enums.values(Attention)) |a| {
         try j.objectField(@tagName(a));
-        try j.write(s.by_attention.get(a));
+        try j.write(s.tally.count(a));
     }
     try j.endObject();
     try j.objectField("most_urgent");
-    try j.write(if (s.mostUrgent()) |a| @tagName(a) else null);
+    try j.write(if (s.tally.mostUrgent()) |a| @tagName(a) else null);
     try j.objectField("agents");
     try j.beginArray();
     for (s.rows) |r| {
@@ -384,12 +369,12 @@ test "summary keeps only servers an ancestor started, and every format renders i
     const entries = try fixture(arena);
     var buf: [MAX_ANCESTRY]c.pid_t = undefined;
     const s = try summarize(arena, entries, ancestry(&buf, 50, fakeParent));
-    try t.expectEqual(@as(u32, 5), s.total);
-    try t.expectEqual(@as(u32, 2), s.by_attention.get(.working));
-    try t.expectEqual(@as(u32, 1), s.by_attention.get(.needs_input));
-    try t.expectEqual(@as(u32, 0), s.by_attention.get(.lost));
-    try t.expectEqual(@as(u32, 1), s.unknown());
-    try t.expectEqual(@as(?Attention, .needs_input), s.mostUrgent());
+    try t.expectEqual(@as(u32, 5), s.tally.total);
+    try t.expectEqual(@as(u32, 2), s.tally.count(.working));
+    try t.expectEqual(@as(u32, 1), s.tally.count(.needs_input));
+    try t.expectEqual(@as(u32, 0), s.tally.count(.lost));
+    try t.expectEqual(@as(u32, 1), s.tally.unknown());
+    try t.expectEqual(@as(?Attention, .needs_input), s.tally.mostUrgent());
 
     try t.expectEqualStrings("agents 2 working \u{00B7} 1 needs input \u{00B7} 1 idle \u{00B7} 1 unknown\n", try render(arena, &s, .line, false, false));
     try t.expectEqualStrings("agents 2 working \u{00B7} 1 needs input \u{00B7} 1 idle \u{00B7} 1 unknown (local 2, dalaran 2, peregrin 1)\n", try render(arena, &s, .line, false, true));
@@ -425,7 +410,7 @@ test "no agents: no text at all, and a JSON document with total 0" {
     try t.expectEqualStrings("{\"total\":0,\"by_attention\":{\"needs_input\":0,\"lost\":0,\"working\":0,\"idle\":0},\"most_urgent\":null,\"agents\":[]}\n", try render(arena, &none, .json, false, false));
     // A server that predates publishing agents contributes none.
     const old = try summarize(arena, entries[3..4], &.{20});
-    try t.expectEqual(@as(u32, 0), old.total);
+    try t.expectEqual(@as(u32, 0), old.tally.total);
 }
 
 test "an attention name this build does not know falls back to the state's" {

@@ -62,6 +62,12 @@ pub const Agent = struct {
     pub fn stateFact(self: Agent) ?vocab.State {
         return std.meta.stringToEnum(vocab.State, self.state orelse return null);
     }
+
+    /// The attention to show: the published one, else (a newer server's
+    /// name this build does not know) its state's; null = unknown.
+    pub fn attentionOrState(self: Agent) ?vocab.Attention {
+        return self.attentionFact() orelse if (self.stateFact()) |st| st.attention() else null;
+    }
 };
 
 /// More agents than this are not published: an oversized record would
