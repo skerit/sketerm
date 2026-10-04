@@ -14,6 +14,7 @@ const readfile = @import("../util/readfile.zig");
 const Res = mcp.Res;
 
 const mcp_agent = @import("mcp_agent.zig");
+const mcp_agent_results = @import("mcp_agent_results.zig");
 
 const Entry = mcp_agent.Entry;
 const state = &mcp_agent.state;
@@ -22,7 +23,7 @@ const adapters = mcp_agent.adapters;
 const pump = mcp_agent.pump;
 const gone = mcp_agent.gone;
 const Fail = mcp_agent.Fail;
-const toJson = mcp_agent.toJson;
+const toJson = mcp_agent_results.toJson;
 
 // ── hosts: memory, load and the optional caps ────────────────────
 

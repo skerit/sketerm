@@ -273,6 +273,7 @@ comptime {
     _ = @import("ipc/mcp_web.zig");
     _ = @import("ipc/mcp_webgui.zig");
     _ = @import("ipc/mcp_agent.zig");
+    _ = @import("ipc/mcp_agent_results.zig");
     _ = @import("ipc/paneldrive.zig");
     _ = @import("ipc/evkeys.zig");
     _ = @import("ipc/xkblayout.zig");
