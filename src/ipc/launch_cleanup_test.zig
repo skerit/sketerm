@@ -14,6 +14,8 @@ pub const REPLACEMENT_ID = "20000000000000000000000000000002";
 pub const SPAWN_REPLY =
     "{\"ok\":true,\"origin_id\":\"" ++ ORIGIN_ID ++
     "\",\"pid\":321,\"output_width\":800,\"output_height\":600}";
+/// A daemon that predates `kill_origin_fence` mints no lifetime id.
+pub const LEGACY_SPAWN_REPLY = "{\"ok\":true,\"pid\":321}";
 
 pub const Harness = struct {
     allocator: std.mem.Allocator,
@@ -25,8 +27,19 @@ pub const Harness = struct {
     reconnect_fails: bool = false,
     session_alive: bool = true,
     replacement_alive: bool = true,
+    /// A pre-fence daemon: no `kill_origin_fence`, no origin_id anywhere.
+    legacy: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) !Harness {
+        return initAs(allocator, false);
+    }
+
+    /// A daemon that predates lifetime fences.
+    pub fn initLegacy(allocator: std.mem.Allocator) !Harness {
+        return initAs(allocator, true);
+    }
+
+    fn initAs(allocator: std.mem.Allocator, legacy: bool) !Harness {
         var primary: [2]c_int = undefined;
         try std.testing.expectEqual(@as(c_int, 0), c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &primary));
         errdefer {
@@ -38,9 +51,10 @@ pub const Harness = struct {
         return .{
             .allocator = allocator,
             .primary_fd = primary[0],
-            .primary_peer = conn(allocator, primary[1]),
+            .primary_peer = conn(allocator, primary[1], legacy),
             .fresh_fd = fresh[0],
-            .fresh_peer = conn(allocator, fresh[1]),
+            .fresh_peer = conn(allocator, fresh[1], legacy),
+            .legacy = legacy,
         };
     }
 
@@ -54,7 +68,16 @@ pub const Harness = struct {
     pub fn takePrimary(self: *Harness, allocator: std.mem.Allocator) muxclient.Conn {
         const fd = self.primary_fd;
         self.primary_fd = -1;
-        return conn(allocator, fd);
+        return conn(allocator, fd, self.legacy);
+    }
+
+    /// The spawn `.ok` this daemon answers with.
+    pub fn spawnReply(self: *const Harness) []const u8 {
+        return if (self.legacy) LEGACY_SPAWN_REPLY else SPAWN_REPLY;
+    }
+
+    fn expectedOrigin(self: *const Harness) []const u8 {
+        return if (self.legacy) "" else ORIGIN_ID;
     }
 
     pub fn localEndpoint(self: *Harness) launch_cleanup.Endpoint {
@@ -89,7 +112,7 @@ pub const Harness = struct {
 
     pub fn closePrimaryPeer(self: *Harness) void {
         self.primary_peer.deinit();
-        self.primary_peer = conn(self.allocator, -1);
+        self.primary_peer = conn(self.allocator, -1, self.legacy);
     }
 
     pub fn expectAttach(self: *Harness, name: []const u8, control: bool) !void {
@@ -98,17 +121,17 @@ pub const Harness = struct {
         var parsed = try std.json.parseFromSlice(wire.AttachReq, self.allocator, frame.payload, .{});
         defer parsed.deinit();
         try std.testing.expectEqualStrings(name, parsed.value.name);
-        try std.testing.expectEqualStrings(ORIGIN_ID, parsed.value.origin_id);
+        try std.testing.expectEqualStrings(self.expectedOrigin(), parsed.value.origin_id);
         try std.testing.expectEqual(control, parsed.value.control);
     }
 
     pub fn expectPrimaryKill(self: *Harness, name: []const u8) !void {
-        try expectKill(&self.primary_peer, self.allocator, name);
+        try expectKill(&self.primary_peer, self.allocator, name, self.expectedOrigin());
         self.session_alive = false;
     }
 
     pub fn expectFreshKill(self: *Harness, name: []const u8) !void {
-        try expectKill(&self.fresh_peer, self.allocator, name);
+        try expectKill(&self.fresh_peer, self.allocator, name, self.expectedOrigin());
         self.session_alive = false;
     }
 
@@ -129,28 +152,28 @@ pub const Harness = struct {
         if (self.fresh_fd < 0) return error.NoFreshConnection;
         const fd = self.fresh_fd;
         self.fresh_fd = -1;
-        return conn(allocator, fd);
+        return conn(allocator, fd, self.legacy);
     }
 };
 
-fn conn(allocator: std.mem.Allocator, fd: c_int) muxclient.Conn {
+fn conn(allocator: std.mem.Allocator, fd: c_int, legacy: bool) muxclient.Conn {
     return .{
         .allocator = allocator,
         .fd = fd,
         .proto = wire.PROTO_VERSION,
         .server_proto = wire.PROTO_VERSION,
         .snapshot_version = snapshot.SNAPSHOT_VERSION,
-        .caps = .{ .kill_origin_fence = true },
+        .caps = .{ .kill_origin_fence = !legacy },
     };
 }
 
-fn expectKill(peer: *muxclient.Conn, allocator: std.mem.Allocator, name: []const u8) !void {
+fn expectKill(peer: *muxclient.Conn, allocator: std.mem.Allocator, name: []const u8, origin: []const u8) !void {
     const frame = try peer.recvExpectFor(&.{.kill}, 1_000);
     defer frame.deinit(allocator);
     var parsed = try std.json.parseFromSlice(wire.KillReq, allocator, frame.payload, .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings(name, parsed.value.name);
-    try std.testing.expectEqualStrings(ORIGIN_ID, parsed.value.origin_id);
+    try std.testing.expectEqualStrings(origin, parsed.value.origin_id);
     try std.testing.expect(!std.mem.eql(u8, parsed.value.origin_id, REPLACEMENT_ID));
 }
 

@@ -307,6 +307,14 @@ pub const Entry = struct {
         };
     }
 
+    /// False when a session of the agent runs on a daemon without lifetime fences.
+    pub fn lifetimeFenced(self: *const Entry) bool {
+        for ([_]?*termdrive.Term{ self.visibleTerm(), self.server }) |o| {
+            if (o) |t| if (!t.lifetimeFenced()) return false;
+        }
+        return true;
+    }
+
     pub fn where(self: *const Entry) Where {
         return .{ .host = self.host, .transport = self.transport, .cols = self.cols, .rows = self.rows };
     }

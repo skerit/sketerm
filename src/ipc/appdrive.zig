@@ -675,11 +675,6 @@ pub const App = struct {
             setStepErr("hello handshake", &conn, err);
             return Error.SpawnFailed;
         }).deinit(allocator);
-        if (!conn.caps.kill_origin_fence) {
-            setLaunchErr("spawn: daemon does not support lifetime-fenced cleanup", .{});
-            return Error.SpawnFailed;
-        }
-
         name_counter += 1;
         const name = std.fmt.allocPrint(allocator, "mcpapp-{d}-{d}", .{ c.getpid(), name_counter }) catch
             return Error.OutOfMemory;
@@ -743,7 +738,9 @@ pub const App = struct {
         // MCP drives the seat: ask for the controller lease outright
         // (takeover), which is what every app tool already assumes.
         conn.sendAttach(name, .{
-            .origin_id = &meta.origin_id,
+            // Absent on a pre-fence daemon: the attach and the rollback go
+            // by name, which `mcpapp-<pid>-<n>` keeps unique.
+            .origin_id = if (meta.origin_id) |*id| id else "",
             .kind = "mcp",
             .control = true,
         }) catch return Error.SpawnFailed;
@@ -785,8 +782,8 @@ pub const App = struct {
             .allocator = allocator,
             .conn = conn.*,
             .name = name,
-            .origin_id = meta.origin_id,
-            .origin_id_valid = true,
+            .origin_id = meta.origin_id orelse undefined,
+            .origin_id_valid = meta.origin_id != null,
             .layout = layout.*,
             .pid = meta.pid,
             .output_width = meta.output_width,
@@ -3918,9 +3915,13 @@ test "post-mortem log push + exit are peeled when EOF lands in the same read" {
 const LaunchFailure = enum { attach_send, snapshot_timeout, cleanup_connect };
 
 fn testLaunchFailure(failure: LaunchFailure) !void {
+    try testLaunchFailureOn(failure, false);
+}
+
+fn testLaunchFailureOn(failure: LaunchFailure, legacy: bool) !void {
     const t = std.testing;
     const fake = @import("launch_cleanup_test.zig");
-    var daemon = try fake.Harness.init(t.allocator);
+    var daemon = if (legacy) try fake.Harness.initLegacy(t.allocator) else try fake.Harness.init(t.allocator);
     defer daemon.deinit();
     const name = try t.allocator.dupe(u8, "fake-app");
     defer t.allocator.free(name);
@@ -3950,7 +3951,7 @@ fn testLaunchFailure(failure: LaunchFailure) !void {
         &layout,
         opts,
         endpoint,
-        fake.SPAWN_REPLY,
+        daemon.spawnReply(),
     ));
     switch (failure) {
         .attach_send => try daemon.expectFreshKill(name),
@@ -3964,6 +3965,10 @@ fn testLaunchFailure(failure: LaunchFailure) !void {
         },
     }
     if (failure != .cleanup_connect) try daemon.expectSessionGone();
+}
+
+test "an app launch on a pre-fence daemon rolls a failed attach back by name" {
+    try testLaunchFailureOn(.snapshot_timeout, true);
 }
 
 test "an app whose mirror lost sync refuses to serve it" {

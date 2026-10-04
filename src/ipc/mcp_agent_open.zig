@@ -25,7 +25,6 @@ const readfile = @import("../util/readfile.zig");
 const transport_mod = @import("transport.zig");
 const agentindex = @import("agentindex.zig");
 const muxclient = @import("../mux/client.zig");
-const deploy = @import("../mux/deploy.zig");
 const sshroute = @import("../mux/sshroute.zig");
 const Res = mcp.Res;
 const errRes = mcp.errRes;
@@ -1012,12 +1011,15 @@ pub fn spawnOn(arena: std.mem.Allocator, where: *Where, choice: transport_mod.Ch
     return t;
 }
 
-/// Why no agent could start on `host`'s own daemon, naming what ssh said.
+/// Why no agent could start on `host`'s own daemon; ssh's own word only
+/// when no daemon answered (one that answered proves ssh worked).
 fn noRemoteMux(arena: std.mem.Allocator, host: []const u8) ![]const u8 {
-    const said = try sshDiagnose(arena, host);
-    if (!deploy.portableAvailable())
-        return std.fmt.allocPrint(arena, "no sketerm-mux daemon answered on {s}, and this install has no portable sketerm-mux to deploy there (put sketerm-mux on the remote PATH); transport \"ssh\" runs the agent in a plain ssh session instead, which ends with the connection. ssh: {s}", .{ host, said });
-    return std.fmt.allocPrint(arena, "could not start the agent on {s}'s sketerm-mux (the portable daemon is deployed there automatically, and that failed); transport \"ssh\" runs it in a plain ssh session instead, which ends with the connection. ssh: {s}", .{ host, said });
+    const why = try mcp_term.remoteMuxFailure(arena, host);
+    const tail = "transport \"ssh\" runs the agent in a plain ssh session instead, which ends with the connection";
+    return switch (termdrive.lastSpawnFailure().stage) {
+        .none, .connect => std.fmt.allocPrint(arena, "{s}; {s}. ssh: {s}", .{ why, tail, try sshDiagnose(arena, host) }),
+        else => std.fmt.allocPrint(arena, "{s}; {s}", .{ why, tail }),
+    };
 }
 
 /// What a plain `ssh host true` says: its error, or that it connected.

@@ -23,6 +23,7 @@ const nowMs = @import("../util/clock.zig").nowMs;
 const shellquote = mcp.shellquote;
 const sshroute = @import("../mux/sshroute.zig");
 const sshmaster = @import("../mux/sshmaster.zig");
+const deploy = @import("../mux/deploy.zig");
 const muxclient = @import("../mux/client.zig");
 const Config = @import("../config.zig").Config;
 const transport_mod = @import("transport.zig");
@@ -361,7 +362,7 @@ fn termOpen(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
             // would only show the same refusal later.
             if (muxclient.sshUnreachable().len > 0) return hostUnreachable(arena, host.?, muxclient.sshUnreachable());
             if (choice == .mux)
-                return mcp.errRes(arena, .unavailable, NO_REMOTE_MUX);
+                return mcp.errRes(arena, .unavailable, try std.fmt.allocPrint(arena, "{s} (transport 'auto' would fall back to plain ssh)", .{try remoteMuxFailure(arena, host.?)}));
             break :mux;
         };
         via_mux = true;
@@ -455,17 +456,15 @@ fn termOpen(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
     if (host) |h| try res.fact("host", h);
     if (t.shell_name) |sn| try res.fact("shell", sn);
     try res.fact("integration", t.integration);
+    try res.fact("lifetime_fenced", t.lifetimeFenced());
     if (exec_shell) |sh| try res.fact("exec_shell", sh);
     if (rec_state.casts.get(id)) |p| try res.fact("recording", p);
     try res.textf("opened headless terminal {d} ({d}x{d}{s}){s}{s}", .{ id, cols, rows, shell_note, where, rec_note });
+    if (!t.lifetimeFenced()) try res.text("its daemon predates lifetime fences: the session is attached and closed by its unique name alone");
     if (exec_shell) |sh| try res.textf("term_exec runs its commands with {s} here unless a call names another shell", .{sh});
     if (master) |*m| try masterFacts(&res, m);
     return res.finish();
 }
-
-
-
-
 
 fn termExec(arena: std.mem.Allocator, args: std.json.Value, t: *termdrive.Term, _: u32) ![]const u8 {
     const cmd = argStr(args, "command") orelse return mcp.errRes(arena, .invalid_args, "term_exec requires 'command'");
@@ -600,7 +599,6 @@ fn termWaitCommand(arena: std.mem.Allocator, args: std.json.Value, t: *termdrive
         return mcp.errRes(arena, .not_found, "no timed-out command is being tracked");
     return completionReply(arena, t, result, argBool(args, "output_only"));
 }
-
 
 fn termResize(arena: std.mem.Allocator, args: std.json.Value, t: *termdrive.Term, term_id: u32) ![]const u8 {
     const cols: u16 = @intCast(std.math.clamp(argInt(args, "cols") orelse 120, 10, 500));
@@ -819,8 +817,29 @@ pub fn masterFacts(res: *mcp.Res, m: *const sshmaster.Report) !void {
     }
 }
 
-/// The refusal of a remote open that required the host's own daemon.
-pub const NO_REMOTE_MUX = "no reachable sketerm-mux daemon on the remote host (needs key/agent auth and sketerm-mux in the remote PATH; transport 'auto' would fall back to plain ssh)";
+/// Why the last remote spawn on `host`'s own daemon failed: no daemon
+/// reachable (and what the portable deployment did about it), or a daemon
+/// that answered and then refused a named step.
+pub fn remoteMuxFailure(arena: std.mem.Allocator, host: []const u8) ![]const u8 {
+    const f = termdrive.lastSpawnFailure();
+    const build = if (f.build.len > 0)
+        try std.fmt.allocPrint(arena, "build {s}", .{f.build})
+    else
+        "a build too old to announce its version";
+    const step: []const u8 = switch (f.stage) {
+        .none, .connect => return switch (deploy.lastOutcome()) {
+            .not_attempted => std.fmt.allocPrint(arena, "no sketerm-mux daemon answered on {s} (key/agent auth and sketerm-mux on the remote PATH are needed; no deployment is attempted over this ssh transport)", .{host}),
+            .no_portable => std.fmt.allocPrint(arena, "no sketerm-mux daemon answered on {s}, and this install has no portable sketerm-mux to deploy there (put sketerm-mux on the remote PATH)", .{host}),
+            .unsupported_platform => std.fmt.allocPrint(arena, "no sketerm-mux daemon answered on {s}, and the portable sketerm-mux cannot be deployed to its platform (it is built for Linux only; put sketerm-mux on the remote PATH)", .{host}),
+            .failed => std.fmt.allocPrint(arena, "no sketerm-mux daemon answered on {s}, and deploying the portable sketerm-mux there failed", .{host}),
+            .ready => std.fmt.allocPrint(arena, "the portable sketerm-mux is deployed on {s}, but no daemon answered through it", .{host}),
+        },
+        .handshake => "did not complete the handshake",
+        .refused => "refused the session spawn",
+        .attach => "spawned the session, but the attach failed",
+    };
+    return std.fmt.allocPrint(arena, "the sketerm-mux daemon on {s} ({s}) answered but {s}: {s}", .{ host, build, step, f.detail });
+}
 
 /// The `transport` argument, default auto; null when it names no choice.
 pub fn transportChoice(args: std.json.Value) ?transport_mod.Choice {

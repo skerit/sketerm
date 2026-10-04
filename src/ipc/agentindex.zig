@@ -43,7 +43,8 @@ pub const Descriptor = struct {
     /// The caller's alias (`agent_open name`), usable wherever the id is.
     name: ?[]const u8 = null,
     session: []const u8,
-    origin: []const u8,
+    /// The session's lifetime fence; null when its daemon predates them.
+    origin: ?[]const u8 = null,
     /// The local daemon socket the sessions run on (absent: the writing
     /// instance's private daemon, as instance descriptors were written).
     socket: ?[]const u8 = null,

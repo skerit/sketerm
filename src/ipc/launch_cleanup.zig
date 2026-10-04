@@ -23,7 +23,9 @@ pub const Endpoint = struct {
 };
 
 pub const SpawnMeta = struct {
-    origin_id: wire.SessionOriginId,
+    /// The session's lifetime fence; null from a daemon that predates
+    /// `kill_origin_fence` and so mints none.
+    origin_id: ?wire.SessionOriginId,
     pid: i32 = 0,
     output_width: u32 = 0,
     output_height: u32 = 0,
@@ -53,15 +55,17 @@ pub fn parseSpawnMeta(payload: []const u8) !SpawnMeta {
         .ignore_unknown_fields = true,
     }) catch return error.MalformedSpawnReply;
     defer parsed.deinit();
-    if (!wire.validSessionOriginId(parsed.value.origin_id))
-        return error.MalformedSpawnReply;
     var meta = SpawnMeta{
-        .origin_id = undefined,
+        .origin_id = null,
         .pid = parsed.value.pid,
         .output_width = parsed.value.output_width,
         .output_height = parsed.value.output_height,
     };
-    @memcpy(&meta.origin_id, parsed.value.origin_id);
+    // Absent is a pre-fence daemon; present but malformed is a broken one.
+    if (parsed.value.origin_id.len > 0) {
+        if (!wire.validSessionOriginId(parsed.value.origin_id)) return error.MalformedSpawnReply;
+        meta.origin_id = parsed.value.origin_id[0..wire.SESSION_ORIGIN_ID_LEN].*;
+    }
     const xd = parsed.value.x_display;
     const xa = parsed.value.xauthority;
     if (xd.len > 0 and xd.len <= meta.x_display.len and xa.len <= meta.xauthority.len) {
@@ -84,10 +88,19 @@ test "parseSpawnMeta carries the rootless X11 identity when present" {
     try t.expectEqual(@as(u16, 0), without.xauthority_len);
 }
 
+test "parseSpawnMeta reports a pre-fence daemon's reply as unfenced, a bad id as malformed" {
+    const t = std.testing;
+    const legacy = try parseSpawnMeta("{\"ok\":true,\"pid\":7}");
+    try t.expect(legacy.origin_id == null);
+    try t.expectEqual(@as(i32, 7), legacy.pid);
+    try t.expectError(error.MalformedSpawnReply, parseSpawnMeta("{\"origin_id\":\"nope\"}"));
+}
+
 pub const Guard = struct {
     conn: *muxclient.Conn,
     name: []const u8,
-    origin_id: wire.SessionOriginId,
+    /// Null: the daemon has no lifetime fence, so rollback kills by name.
+    origin_id: ?wire.SessionOriginId,
     endpoint: Endpoint,
     timeout_ms: i64,
     armed: bool = true,
@@ -95,7 +108,7 @@ pub const Guard = struct {
     pub fn init(
         conn: *muxclient.Conn,
         name: []const u8,
-        origin_id: wire.SessionOriginId,
+        origin_id: ?wire.SessionOriginId,
         endpoint: Endpoint,
         timeout_ms: i64,
     ) Guard {
@@ -145,19 +158,26 @@ pub const Guard = struct {
     }
 
     fn endOn(self: *const Guard, conn: *muxclient.Conn, allocator: std.mem.Allocator, timeout_ms: i64) ?tombstones.End {
-        const parsed = (conn.tombstone(allocator, self.name, &self.origin_id, timeout_ms) catch return null) orelse return null;
+        const parsed = (conn.tombstone(allocator, self.name, self.originSlice(), timeout_ms) catch return null) orelse return null;
         defer parsed.deinit();
         const r = parsed.value;
         if (!r.found) return null;
         return .{ .reason = r.reason orelse .unknown, .exit_status = r.exit_status, .signal = r.signal };
     }
 
+    fn originSlice(self: *const Guard) []const u8 {
+        return if (self.origin_id) |*id| id else "";
+    }
+
     fn killOn(self: *const Guard, conn: *muxclient.Conn) bool {
-        if (!conn.caps.kill_origin_fence) return false;
+        // A fenced kill needs the fence on THIS connection (a fresh one may
+        // reach a different daemon build); an unfenced one is a by-name kill,
+        // safe because every spawner here mints a unique session name.
+        if (self.origin_id != null and !conn.caps.kill_origin_fence) return false;
         conn.write_timeout_ms = @intCast(@min(self.timeout_ms, std.math.maxInt(c_int)));
         conn.sendKill(.{
             .name = self.name,
-            .origin_id = &self.origin_id,
+            .origin_id = self.originSlice(),
         }) catch return false;
         const frame = conn.recvExpectFor(&.{ .ok, .gone }, self.timeout_ms) catch |err| {
             // An error reply means the exact lifetime is already gone or was

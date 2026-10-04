@@ -843,6 +843,7 @@ pub fn listTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
         stall_after_min: ?u32,
         relaunchable: ?bool,
         gone_reason: ?[]const u8,
+        lifetime_fenced: ?bool,
         facts: ?std.json.Value,
         facts_unknown: ?[]const u8,
     };
@@ -898,6 +899,7 @@ pub fn listTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
             .stall_after_min = e.stall.after_min,
             .relaunchable = relaunchableOf(e),
             .gone_reason = if (e.gone_why) |g| g.reasonName() else null,
+            .lifetime_fenced = if (e.lifetimeFenced()) null else false,
         };
         try res.textf("{s} ({s}{s}{s}): {s} on {s} in {s}, up {d}s, active {s} ago, {d} undelivered event(s)", .{
             out.agent,                                                                                                               out.app,                      if (model != null) ", " else "", model orelse "",

@@ -97,12 +97,40 @@ fn deployMemoStamp(plan: *const sshroute.Plan, hash: []const u8) void {
     _ = c.fclose(fp);
 }
 
+/// What the last `prepare` on this thread did.
+pub const Outcome = enum {
+    /// Deployment is off for this transport (a `$SKETERM_SSH` wrapper).
+    not_attempted,
+    /// This install has no usable portable artifact to deploy.
+    no_portable,
+    /// The host is not a platform the portable daemon is built for.
+    unsupported_platform,
+    /// The current portable daemon is in place on the host.
+    ready,
+    /// The check or the upload failed.
+    failed,
+};
+
+threadlocal var last_outcome: Outcome = .not_attempted;
+
+/// What the last `prepare` on this thread did, for a caller explaining a failed connect.
+pub fn lastOutcome() Outcome {
+    return last_outcome;
+}
+
+/// Reset `lastOutcome` before a connect that may not reach `prepare`.
+pub fn forgetOutcome() void {
+    last_outcome = .not_attempted;
+}
+
 /// Ensure the matching portable mux exists remotely; null preserves PATH fallback.
 pub fn prepare(allocator: std.mem.Allocator, plan: *const sshroute.Plan) ?Prepared {
+    last_outcome = .not_attempted;
     // Existing test/transport wrappers expect only the historical proxy argv.
     // An explicit artifact opts a wrapper into deployment testing or use.
     if (c.getenv("SKETERM_SSH") != null and c.getenv("SKETERM_MUX_PORTABLE") == null) return null;
 
+    last_outcome = .no_portable;
     var artifact_path_buf: [4096:0]u8 = undefined;
     const artifact_path = findPortable(&artifact_path_buf) orelse return null;
     const artifact = inspectArtifact(artifact_path) orelse return null;
@@ -116,6 +144,7 @@ pub fn prepare(allocator: std.mem.Allocator, plan: *const sshroute.Plan) ?Prepar
             .{&artifact.hash.hex},
             0,
         ) catch return null;
+        last_outcome = .ready;
         return .{ .allocator = allocator, .path = remote_path };
     }
     const prepared = ensureUsing(allocator, plan, sshroute.sshBinary(), artifact, .{ .run = runSshCommand });
@@ -201,6 +230,7 @@ fn ensureUsing(
     artifact: Artifact,
     runner: Runner,
 ) ?Prepared {
+    last_outcome = .failed;
     const hash = &artifact.hash.hex;
     const arch_case = switch (artifact.arch) {
         .x86_64 => "Linux:x86_64|Linux:amd64",
@@ -255,8 +285,10 @@ fn ensureUsing(
     const checked = runner.run(runner.ctx, plan, ssh_bin, check, null);
     if (checked == 0) {
         keep_remote_path = true;
+        last_outcome = .ready;
         return .{ .allocator = allocator, .path = remote_path };
     }
+    if (checked == CHECK_UNSUPPORTED) last_outcome = .unsupported_platform;
     if (checked != CHECK_MISSING) return null;
 
     // Upload: the remote command is the staged uploader as one bare
@@ -275,6 +307,7 @@ fn ensureUsing(
     defer allocator.free(upload_word);
     if (runner.run(runner.ctx, plan, ssh_bin, upload_word, artifact.path) != 0) return null;
     keep_remote_path = true;
+    last_outcome = .ready;
     return .{ .allocator = allocator, .path = remote_path };
 }
 
@@ -585,9 +618,11 @@ test "deployment leaves unsupported hosts and failed checks untouched" {
     var unsupported = FakeRunner{ .statuses = .{ CHECK_UNSUPPORTED, 0 } };
     try std.testing.expect(ensureUsing(std.testing.allocator, &plan, "ssh", fakeArtifact('c'), .{ .ctx = &unsupported, .run = FakeRunner.run }) == null);
     try std.testing.expectEqual(@as(usize, 1), unsupported.calls);
+    try std.testing.expectEqual(Outcome.unsupported_platform, lastOutcome());
     var failed = FakeRunner{ .statuses = .{ 255, 0 } };
     try std.testing.expect(ensureUsing(std.testing.allocator, &plan, "ssh", fakeArtifact('d'), .{ .ctx = &failed, .run = FakeRunner.run }) == null);
     try std.testing.expectEqual(@as(usize, 1), failed.calls);
+    try std.testing.expectEqual(Outcome.failed, lastOutcome());
 }
 
 test "deployment falls back when an upload fails" {

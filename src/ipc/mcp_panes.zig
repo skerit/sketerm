@@ -464,6 +464,7 @@ fn listHeadless(arena: std.mem.Allocator, family: Family) ![]const u8 {
             try w.writeAll(",\"transport\":\"sketerm-mux\",\"host\":");
             try std.json.Stringify.value(rh, .{}, w);
         }
+        if (!t.lifetimeFenced()) try w.writeAll(",\"lifetime_fenced\":false");
         if (t.exited and t.exit_status_known) try w.print(",\"exit_status\":{d}", .{t.exit_status});
         if (t.hasPendingCommand()) try w.writeAll(",\"pending_command\":true");
         if (t.hasPendingExec()) try w.writeAll(",\"pending_exec\":true");

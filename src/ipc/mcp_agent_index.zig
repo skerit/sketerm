@@ -114,11 +114,11 @@ pub fn writeDescriptor(e: *Entry) void {
         .app = e.loaded.spec.id,
         .name = e.name,
         .session = vis.name,
-        .origin = &vis.origin_id,
+        .origin = if (vis.origin_id) |*o| o else null,
         .socket = e.socket,
         .instance = state.instance,
         .server_session = if (e.server) |s| s.name else null,
-        .server_origin = if (e.server) |s| @as([]const u8, &s.origin_id) else null,
+        .server_origin = if (e.server) |s| (if (s.origin_id) |*o| @as([]const u8, o) else null) else null,
         .port = e.port,
         .password_file = pw_path,
         .api_session = switch (e.agent.source) {
@@ -285,7 +285,7 @@ fn sweepIndex() void {
             var conn = conn_val;
             defer conn.deinit();
             conn.setNonBlocking();
-            if (conn.tombstone(arena, d.session, d.origin, TOMBSTONE_WAIT_MS) catch null) |r| ended = r.value.found;
+            if (conn.tombstone(arena, d.session, d.origin orelse "", TOMBSTONE_WAIT_MS) catch null) |r| ended = r.value.found;
         } else |_| {}
         if (ended) {
             _ = retireDescriptor(arena, index_dir, d, &claimed, lp);
@@ -373,12 +373,11 @@ pub fn publishAgents() void {
     lease.publishAgents(out.items) catch {};
 }
 
-fn originOf(s: ?[]const u8) !wire.SessionOriginId {
-    const v = s orelse return error.BadDescriptor;
+/// A descriptor's lifetime fence: null when its session's daemon had none.
+fn originOf(s: ?[]const u8) !?wire.SessionOriginId {
+    const v = s orelse return null;
     if (!wire.validSessionOriginId(v)) return error.BadDescriptor;
-    var id: wire.SessionOriginId = undefined;
-    @memcpy(&id, v);
-    return id;
+    return v[0..wire.SESSION_ORIGIN_ID_LEN].*;
 }
 
 /// What `reattachOne` has acquired so far, released together on failure.
@@ -451,7 +450,7 @@ fn attachSession(arena: std.mem.Allocator, transport: Transport, host: ?[]const 
     }
     // The daemon answered: no such session (lifetime). Ask it why.
     why.* = .{ .kind = .gone, .session = name, .msg = try arena.dupe(u8, conn.last_err[0..conn.last_err_len]) };
-    why.tomb = askWhyGone(&conn, arena, name, origin.?);
+    why.tomb = askWhyGone(&conn, arena, name, origin orelse "");
     return error.SessionGone;
 }
 
@@ -598,7 +597,7 @@ pub fn attachIdTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 
     const d = (try agentindex.resolve(arena, index_dir, key)) orelse {
         // No longer in the index: this host's daemon may still say why it
         // ended (its tombstone knows the session name and the agent's name).
-        if (try localTombstone(arena, key)) |why| return goneResult(arena, .{ .id = key, .app = "", .session = why.session, .origin = "" }, &why, false);
+        if (try localTombstone(arena, key)) |why| return goneResult(arena, .{ .id = key, .app = "", .session = why.session }, &why, false);
         var known: std.ArrayList(u8) = .empty;
         for (try agentindex.ids(arena, index_dir), 0..) |id, i| {
             if (i > 0) try known.appendSlice(arena, ", ");

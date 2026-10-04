@@ -155,6 +155,7 @@ pub fn finish(arena: std.mem.Allocator, res: *Res, e: *Entry, dv: Delivered, wat
     if (e.host) |h| try res.fact("host", h);
     if (conversationOf(e)) |cv| try res.fact("conversation", cv);
     try res.fact("transport", @tagName(e.transport));
+    if (!e.lifetimeFenced()) try res.fact("lifetime_fenced", false);
     try goneFacts(arena, res, e);
     try retryFacts(res, e);
     if (e.stall.after_min) |m| try res.fact("stall_after_min", m);

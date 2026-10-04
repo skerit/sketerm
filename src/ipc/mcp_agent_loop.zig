@@ -272,7 +272,8 @@ pub const ReconnectJob = struct {
     allocator: std.mem.Allocator,
     host: []u8,
     name: []u8,
-    origin: wire.SessionOriginId,
+    /// Null: the session's daemon has no lifetime fence (attach by name).
+    origin: ?wire.SessionOriginId,
     /// Null once the Term went away: the result is dropped.
     term: ?*termdrive.Term,
     done: std.atomic.Value(bool) = .init(false),
@@ -288,12 +289,13 @@ pub const ReconnectJob = struct {
         var conn = muxconnect.connectSshOnce(a, self.host) catch return;
         conn.setNonBlocking();
         conn.last_err_len = 0;
-        conn.sendAttach(self.name, .{ .origin_id = &self.origin, .kind = "mcp" }) catch return conn.deinit();
+        const origin: []const u8 = if (self.origin) |*o| o else "";
+        conn.sendAttach(self.name, .{ .origin_id = origin, .kind = "mcp" }) catch return conn.deinit();
         const snap = conn.recvExpectFor(&.{.snapshot}, 15_000) catch {
             if (conn.last_err_len > 0) {
                 var arena_state = std.heap.ArenaAllocator.init(a);
                 defer arena_state.deinit();
-                self.gone = GoneFacts.of(askWhyGone(&conn, arena_state.allocator(), self.name, &self.origin));
+                self.gone = GoneFacts.of(askWhyGone(&conn, arena_state.allocator(), self.name, origin));
             }
             return conn.deinit();
         };
@@ -404,7 +406,6 @@ fn kickReconnects(e: *Entry, now_ms: i64) void {
 fn startReconnect(t: *termdrive.Term) void {
     const a = state.allocator;
     const host = t.remote_host orelse return;
-    if (!t.origin_id_valid) return;
     state.reconnects.ensureUnusedCapacity(a, 1) catch return;
     const j = a.create(ReconnectJob) catch return;
     const h = a.dupe(u8, host) catch return a.destroy(j);

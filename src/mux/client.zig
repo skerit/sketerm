@@ -1248,6 +1248,8 @@ pub const Conn = struct {
     /// Route-aware SSH connect with every connect option (`udp_port_range` unused).
     pub fn connectSshWith(allocator: std.mem.Allocator, spec: []const u8, options: ConnectOptions) !Conn {
         ssh_unreachable_len = 0;
+        // A route never deploys: no earlier connect's outcome may describe it.
+        deploy.forgetOutcome();
         if (RouteSpec.isRoute(spec)) return connectRoute(allocator, spec, options);
         const remote = RemoteSpec.parse(spec);
         const route: sshroute.Route = switch (remote.mode) {
