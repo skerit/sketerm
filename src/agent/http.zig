@@ -29,6 +29,14 @@ pub const Request = struct {
     path: []const u8,
     /// JSON body; null sends none.
     body: ?[]const u8 = null,
+    /// A duplicate is harmless, so one lost on a stale kept-alive
+    /// connection may be sent again on a fresh one; null means only a GET.
+    /// Anything else is resent only when provably none of it was written.
+    idempotent: ?bool = null,
+
+    pub fn retryable(self: Request) bool {
+        return self.idempotent orelse (self.method == .GET);
+    }
 };
 
 pub const Response = struct {
@@ -420,6 +428,10 @@ const Conn = struct {
     async_: bool = false,
     /// It served a response before this request.
     reused: bool = false,
+    /// The request in flight may be sent again (`Request.retryable`).
+    retryable: bool = false,
+    /// Bytes of the request the kernel took on this connection.
+    sent: usize = 0,
     deadline: ?i64 = null,
     /// The request bytes, kept for the one retry on a stale connection.
     request: []u8 = &.{},
@@ -582,6 +594,7 @@ pub const Client = struct {
         cn.ticket = ticket;
         cn.async_ = is_async;
         cn.deadline = deadline;
+        cn.retryable = req.retryable();
         cn.parser.reset();
         self.send(cn, deadline) catch |err| {
             if (!self.canRetry(cn)) {
@@ -612,14 +625,36 @@ pub const Client = struct {
         return error.Busy;
     }
 
+    /// Write the request, counting what the kernel took (`Conn.sent`).
     fn send(self: *Client, cn: *Conn, deadline: i64) !void {
         _ = self;
-        dbusconn.writeAll(cn.fd, cn.request, deadline) catch |err| return if (err == error.Timeout) error.Timeout else error.Closed;
+        cn.sent = 0;
+        const bytes = cn.request;
+        while (cn.sent < bytes.len) {
+            const n = if (comptime @hasDecl(c, "MSG_NOSIGNAL"))
+                c.send(cn.fd, bytes[cn.sent..].ptr, bytes.len - cn.sent, c.MSG_NOSIGNAL)
+            else
+                c.write(cn.fd, bytes[cn.sent..].ptr, bytes.len - cn.sent);
+            if (n > 0) {
+                cn.sent += @intCast(n);
+                continue;
+            }
+            const e = std.posix.errno(n);
+            if (e == .INTR) continue;
+            if (e == .AGAIN) {
+                dbusconn.waitFd(cn.fd, c.POLLOUT, deadline) catch |err| return if (err == error.Timeout) error.Timeout else error.Closed;
+                continue;
+            }
+            return error.Closed;
+        }
     }
 
+    /// A stale reused connection failed the request before any answer: it
+    /// may go again on a fresh one when a duplicate is harmless, or when
+    /// none of it was written (the server cannot have seen it).
     fn canRetry(self: *const Client, cn: *const Conn) bool {
         _ = self;
-        return cn.reused and cn.parser.received == 0;
+        return cn.reused and cn.parser.received == 0 and (cn.retryable or cn.sent == 0);
     }
 
     /// Send the request again on a fresh connection (the reused one was
@@ -969,6 +1004,80 @@ test "client: a stale keep-alive connection is retried once on a fresh one" {
     defer b.deinit(t.allocator);
     try t.expectEqualStrings("b", b.body);
     try t.expectEqual(@as(u32, 2), srv.connections());
+}
+
+/// Drops the first request to `/flaky` on a kept-alive connection, answers the rest.
+const DropOnce = struct {
+    dropped: bool = false,
+
+    fn hook(ctx: ?*anyopaque, srv: *testserver.Server, method: []const u8, path: []const u8, body: []const u8) ?testserver.Reply {
+        _ = srv;
+        _ = method;
+        _ = body;
+        const self: *DropOnce = @ptrCast(@alignCast(ctx.?));
+        if (!std.mem.eql(u8, path, "/flaky")) return null;
+        if (!self.dropped) {
+            self.dropped = true;
+            return .{ .drop = true };
+        }
+        return .{ .body = "ok" };
+    }
+};
+
+fn countPrefix(srv: *testserver.Server, prefix: []const u8) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < srv.requestCount()) : (i += 1) {
+        if (std.mem.startsWith(u8, srv.request(i), prefix)) n += 1;
+    }
+    return n;
+}
+
+test "client: a request a stale reused connection lost is resent only when a duplicate is harmless" {
+    var srv: testserver.Server = .{};
+    try srv.start(t.allocator);
+    defer srv.deinit();
+    var drop: DropOnce = .{};
+    srv.hook = DropOnce.hook;
+    srv.hook_ctx = &drop;
+    srv.route("GET /warm", .{ .body = "w" });
+    var client = try Client.init(t.allocator, .{ .port = srv.port() });
+    defer client.deinit();
+    const deadline = nowMs() + 5000;
+
+    // A GET is resent transparently on a fresh connection.
+    const w = try client.call(.{ .method = .GET, .path = "/warm" }, deadline);
+    w.deinit(t.allocator);
+    const g = try client.call(.{ .method = .GET, .path = "/flaky" }, deadline);
+    defer g.deinit(t.allocator);
+    try t.expectEqualStrings("ok", g.body);
+    try t.expectEqual(@as(usize, 2), countPrefix(&srv, "GET /flaky"));
+    try t.expectEqual(@as(u32, 2), srv.connections());
+
+    // A POST that reached the server is never sent twice, sync or async.
+    drop.dropped = false;
+    try t.expectError(error.Closed, client.call(.{ .method = .POST, .path = "/flaky", .body = "{}" }, deadline));
+    try t.expectEqual(@as(usize, 1), countPrefix(&srv, "POST /flaky"));
+    const w2 = try client.call(.{ .method = .GET, .path = "/warm" }, deadline);
+    w2.deinit(t.allocator);
+    drop.dropped = false;
+    const ticket = try client.start(.{ .method = .POST, .path = "/flaky", .body = "{}" }, deadline);
+    const done = while (nowMs() < deadline) {
+        try client.service(nowMs());
+        if (client.takeCompletionOf(ticket)) |d| break d;
+        _ = c.usleep(2000);
+    } else return error.TestTimeout;
+    try t.expectEqual(error.Closed, done.result.failed);
+    try t.expectEqual(@as(usize, 2), countPrefix(&srv, "POST /flaky"));
+
+    // One declared idempotent goes again like a GET.
+    const w3 = try client.call(.{ .method = .GET, .path = "/warm" }, deadline);
+    w3.deinit(t.allocator);
+    drop.dropped = false;
+    const p = try client.call(.{ .method = .POST, .path = "/flaky", .body = "{}", .idempotent = true }, deadline);
+    defer p.deinit(t.allocator);
+    try t.expectEqualStrings("ok", p.body);
+    try t.expectEqual(@as(usize, 4), countPrefix(&srv, "POST /flaky"));
 }
 
 test "client: an async request does not block a quick one, and completes later" {

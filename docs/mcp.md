@@ -1177,7 +1177,11 @@ TUI attached to that server for a human to watch is optional, see below).
   request stays open: 2.x drops a request whose client goes away before
   it answers (measured), so a timed-out POST is never closed while it
   may still land. Found, or its 2xx arriving late: the send succeeds
-  with `delivery_confirmed_late: true`. Not found: `not_delivered`, never sent again
+  with `delivery_confirmed_late: true`. The HTTP layer never resends a
+  request whose duplicate has effects (`http.Request.retryable`: GETs
+  and requests declared `idempotent` only, else only when provably none
+  of it was written), so a prompt a stale kept-alive connection lost is
+  settled by the same lookup. Not found: `not_delivered`, never sent again
   (`capabilities.agent_delivery.api_unanswered: "message_lookup"`). A
   prompt an interrupt made the app drop is sent again under its first
   id, and not at all when the session still holds it. Measured: 2.x answers a repeated id

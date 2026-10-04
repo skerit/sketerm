@@ -28,6 +28,10 @@ pub const Reply = struct {
     close_after: bool = false,
     /// Claim `Connection: keep-alive` even when closing (a stale reuse).
     keep_alive_header: bool = false,
+    /// Close the connection without answering (after any delay): a kept-
+    /// alive connection the server shut as the request arrived. The request
+    /// still counts as received.
+    drop: bool = false,
     /// SSE event payloads pushed onto every stream once answered.
     events: []const []const u8 = &.{},
     /// Announce this Content-Length instead of the body's (a body too
@@ -243,6 +247,7 @@ pub const Server = struct {
             const reply = hooked orelse exact orelse self.lookup(key) orelse Reply{ .status = 404, .body = "{\"name\":\"NotFoundError\",\"data\":{\"message\":\"no route\"}}" };
             var waited: u32 = 0;
             while (waited < reply.delay_ms and !self.stopping.load(.acquire)) : (waited += 5) _ = c.usleep(5000);
+            if (reply.drop) return;
             const body = if (reply.echo) req[head_end + 4 ..] else reply.body;
             writeResponse(fd, reply, body);
             for (reply.events) |e| self.pushEvent(e);

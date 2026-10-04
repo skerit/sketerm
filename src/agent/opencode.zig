@@ -1718,13 +1718,22 @@ pub const Api = struct {
         const req = try dialect.request(a, g.routes.prompt, .{ .session = root }, body);
         // Async, so a late answer does not close the connection: opencode
         // 2.x drops a request whose client went away before it answered.
-        const ticket = self.client.start(req, clock.nowMs() + self.prompt_timeout_ms + self.lookup_ms + PROMPT_LINGER_MS) catch |err| {
-            if (err == error.OutOfMemory) return err;
-            self.fail("{s} {s}: {s}", .{ @tagName(req.method), req.path, @errorName(err) });
-            return err;
+        // The HTTP layer never resends it (a POST is not `retryable`): any
+        // failure after a byte may have gone out is settled by the lookup.
+        const ticket = self.client.start(req, clock.nowMs() + self.prompt_timeout_ms + self.lookup_ms + PROMPT_LINGER_MS) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            // Nothing was written.
+            error.ConnectFailed, error.Busy => {
+                self.fail("{s} {s}: {s}", .{ @tagName(req.method), req.path, @errorName(err) });
+                return err;
+            },
+            else => return self.lookUpUnanswered(g, req, null, @errorName(err), root, id),
         };
-        if (try self.awaitTicket(ticket, clock.nowMs() + self.prompt_timeout_ms)) |done| return self.promptAnswered(req, done, false);
-        return self.lookUpUnanswered(g, req, ticket, root, id);
+        if (try self.awaitTicket(ticket, clock.nowMs() + self.prompt_timeout_ms)) |done| switch (done) {
+            .response => return self.promptAnswered(req, done, false),
+            .failed => |err| return self.lookUpUnanswered(g, req, null, @errorName(err), root, id),
+        };
+        return self.lookUpUnanswered(g, req, ticket, "no answer", root, id);
     }
 
     /// Wait until `until` for async request `ticket` to finish.
@@ -1776,20 +1785,28 @@ pub const Api = struct {
         return out;
     }
 
-    /// The prompt POST `req` (async `ticket`) got no answer in time, yet the
-    /// server may have taken it: until `lookup_ms` runs out, ask the session
-    /// for message `id` while still listening for the answer. Either is the
-    /// delivery (`confirmed_late`); neither is `error.NotDelivered`, the
-    /// request given up, never a second send.
-    fn lookUpUnanswered(self: *Api, g: *const adapter.Generation, req: http.Request, ticket: u64, root: []const u8, id: []const u8) !void {
+    /// The prompt POST `req` got no answer in time (`ticket`, still open) or
+    /// failed after a byte may have reached the server (`ticket` null, `why`),
+    /// so the server may have taken it: until `lookup_ms` runs out, ask the
+    /// session for message `id`, still listening for an open request's
+    /// answer. Either is the delivery (`confirmed_late`); neither is
+    /// `error.NotDelivered`, the request given up, never a second send.
+    fn lookUpUnanswered(self: *Api, g: *const adapter.Generation, req: http.Request, ticket_in: ?u64, why_in: []const u8, root: []const u8, id: []const u8) !void {
         const until = clock.nowMs() + self.lookup_ms;
-        var why: []const u8 = "no answer";
+        var why = why_in;
+        var ticket = ticket_in;
         while (true) {
-            if (try self.awaitTicket(ticket, @min(until, clock.nowMs() + LOOKUP_POLL_MS))) |done| switch (done) {
-                .response => return self.promptAnswered(req, done, true),
-                // The connection is gone: only the lookup can tell now.
-                .failed => |err| why = @errorName(err),
-            };
+            const step_until = @min(until, clock.nowMs() + LOOKUP_POLL_MS);
+            if (ticket) |tk| {
+                if (try self.awaitTicket(tk, step_until)) |done| switch (done) {
+                    .response => return self.promptAnswered(req, done, true),
+                    // The connection is gone: only the lookup can tell now.
+                    .failed => |err| {
+                        why = @errorName(err);
+                        ticket = null;
+                    },
+                };
+            } else if (step_until > clock.nowMs()) _ = c.usleep(@intCast((step_until - clock.nowMs()) * 1000));
             if (try self.messageKnown(g, root, id, until) == .found) {
                 self.last_submit.confirmed_late = true;
                 // Its answer is let to arrive (`finished` drops it).
@@ -1797,7 +1814,7 @@ pub const Api = struct {
             }
             if (clock.nowMs() >= until) break;
         }
-        self.client.cancel(ticket);
+        if (ticket) |tk| self.client.cancel(tk);
         if (g.routes.message_get == null)
             self.fail("{s} {s}: {s} within {d} ms, and generation {s} declares no message_get route to look message {s} up: NOT delivered as far as is known, and not sent again", .{ @tagName(req.method), req.path, why, self.prompt_timeout_ms + self.lookup_ms, g.name, id })
         else
@@ -1840,13 +1857,18 @@ pub const Api = struct {
     fn selectOnSession(self: *Api, a: std.mem.Allocator, g: *const adapter.Generation, agent_name: ?[]const u8) !void {
         if (!g.dialect.selectsOnSession()) return;
         const root = self.source.root orelse return error.NoSession;
+        // Setting a value twice is harmless: these may be resent.
         if (self.select_pending) if (self.modelChoice()) |m| {
-            const r = try self.request(try dialect.request(a, g.routes.model_select.?, .{ .session = root }, try dialect.selectModelBody(a, m)));
+            var req = try dialect.request(a, g.routes.model_select.?, .{ .session = root }, try dialect.selectModelBody(a, m));
+            req.idempotent = true;
+            const r = try self.request(req);
             r.deinit(self.allocator);
             self.select_pending = false;
         };
         if (agent_name) |name| {
-            const r = try self.request(try dialect.request(a, g.routes.agent_select.?, .{ .session = root }, try dialect.selectAgentBody(a, name)));
+            var req = try dialect.request(a, g.routes.agent_select.?, .{ .session = root }, try dialect.selectAgentBody(a, name));
+            req.idempotent = true;
+            const r = try self.request(req);
             r.deinit(self.allocator);
         }
     }
@@ -3618,6 +3640,40 @@ test "api: a prompt answered too late is looked up by its id: found is sent once
     try t.expect(!api.last_submit.already and !api.last_submit.confirmed_late);
     const sent = srv.lastRequest("POST /session/ses_root/prompt_async").?;
     try t.expectEqualStrings(id, LateCtx.idOf(sent).?);
+}
+
+test "api: a prompt POST a stale reused connection lost is never resent: the lookup settles it" {
+    var srv: testserver.Server = .{};
+    try srv.start(t.allocator);
+    defer srv.deinit();
+    var ctx: LateCtx = .{};
+    srv.hook = LateCtx.hook;
+    srv.hook_ctx = &ctx;
+    srv.route(V1_PROBE, .{ .body = "{\"healthy\":true}" });
+    srv.route("POST /session", .{ .body = "{\"id\":\"ses_root\",\"title\":\"agent\"}" });
+    srv.route("GET /session/status", .{ .body = "{}" });
+    srv.route("GET /permission", .{ .body = "[]" });
+    srv.route("GET /question", .{ .body = "[]" });
+    srv.route("GET /session/ses_root/message", .{ .body = "[]" });
+    // The server shuts the kept-alive connection as the prompt arrives.
+    srv.route("POST /session/ses_root/prompt_async", .{ .drop = true });
+    var set = adapter.Set.init(t.allocator);
+    defer set.deinit();
+    try set.loadShipped();
+    var api = try Api.init(t.allocator, set.get("opencode").?, .{}, .{ .port = srv.port(), .password = "pw" });
+    defer api.deinit();
+    api.lookup_ms = 2000;
+    try api.connect(null, clock.nowMs());
+    // It went out on a connection the setup requests kept, and the server
+    // took it before it closed: found, sent once.
+    try api.submit("hello", null, null);
+    try t.expect(api.last_submit.confirmed_late);
+    try t.expectEqual(@as(usize, 1), countRequests(&srv, "POST /session/ses_root/prompt_async"));
+    // It did not: not delivered, still one POST more.
+    ctx.lost = true;
+    api.lookup_ms = 400;
+    try t.expectError(error.NotDelivered, api.submit("again", null, null));
+    try t.expectEqual(@as(usize, 2), countRequests(&srv, "POST /session/ses_root/prompt_async"));
 }
 
 test "api 2.x: a prompt answered too late is found in the session's inbox and sent once" {
