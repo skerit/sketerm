@@ -192,6 +192,10 @@ pub const Entry = struct {
     /// the app's attached TUI (API sources).
     session: []u8,
     visible: ?Link,
+    /// API sources: the attached TUI is wanted (`agent_open tui`, the
+    /// adapter's `attach_default`, `agent_set tui`); kept in the descriptor
+    /// so a relaunch or reattach starts it again. `visible` is it running.
+    tui: bool = false,
     /// API sources: the session running the app's server.
     server: ?*termdrive.Term = null,
     server_session: ?[]u8 = null,
@@ -523,6 +527,19 @@ pub fn sideQuestionApps(arena: std.mem.Allocator) ![]const []const u8 {
     return out.items;
 }
 
+/// The adapters whose app has a separate attached TUI (`launch.attach_args`),
+/// and the ones that start it by default, for `capabilities.agent_tui`.
+pub fn tuiApps(arena: std.mem.Allocator) !struct { apps: []const []const u8, on_by_default: []const []const u8 } {
+    const set = try adapters();
+    var apps: std.ArrayList([]const u8) = .empty;
+    var on: std.ArrayList([]const u8) = .empty;
+    for (set.items.items) |l| if (l.spec.launch.attach_args.len > 0) {
+        try apps.append(arena, l.spec.id);
+        if (l.spec.launch.attach_default) try on.append(arena, l.spec.id);
+    };
+    return .{ .apps = apps.items, .on_by_default = on.items };
+}
+
 /// The adapter ids this server can open, for `capabilities`.
 pub fn adapterIds(arena: std.mem.Allocator) ![]const []const u8 {
     const set = try adapters();
@@ -796,6 +813,10 @@ test "argument validation refuses before anything is spawned" {
     try expectError(a, "agent_open", try rig.call(.agent_open, "{\"app\":\"claude\",\"cwd\":\"relative\"}"), "invalid_args");
     try expectError(a, "agent_open", try rig.call(.agent_open, "{\"app\":\"claude\",\"model\":\"a\\nb\"}"), "invalid_args");
     try expectError(a, "agent_open", try rig.call(.agent_open, "{\"app\":\"claude\",\"stall_after_min\":100000}"), "invalid_args");
+    // Claude Code's terminal is the app itself: no separate TUI to start.
+    const no_tui = try mcp_agent_testkit.errorMessage(a, "agent_open", try rig.call(.agent_open, "{\"app\":\"claude\",\"tui\":true}"), "invalid_args");
+    try testing.expect(std.mem.indexOf(u8, no_tui, "has none") != null);
+    try expectError(a, "agent_open", try rig.call(.agent_open, "{\"app\":\"opencode\",\"tui\":\"yes\"}"), "invalid_args");
     // A wrapper's args and env: refused whole, never cleaned up (the rules
     // themselves are launch.checkExtra's, tested there).
     for ([_][]const u8{

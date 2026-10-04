@@ -140,6 +140,20 @@ pub fn retryPolicyFrom(arena: std.mem.Allocator, v: std.json.Value, why: *Fail) 
     return if (p.max == 0) null else p;
 }
 
+/// agent_open's / agent_set's `tui`: a boolean, for an adapter whose app
+/// has a separate TUI (`launch.attach_args`); refused for any other.
+pub fn tuiFrom(arena: std.mem.Allocator, loaded: *const adapter.Loaded, v: std.json.Value, why: *Fail) !bool {
+    if (loaded.spec.launch.attach_args.len == 0) {
+        why.* = .{ .code = .invalid_args, .msg = try std.fmt.allocPrint(arena, "tui starts a separate attached TUI, and {s} has none: its terminal is the app itself", .{loaded.spec.name}) };
+        return error.Refused;
+    }
+    if (v != .bool) {
+        why.* = .{ .code = .invalid_args, .msg = "tui must be true or false" };
+        return error.Refused;
+    }
+    return v.bool;
+}
+
 /// agent_open's / agent_set's `stall_after_min`: minutes, 0 or null = off.
 pub fn stallFrom(arena: std.mem.Allocator, v: std.json.Value, why: *Fail) !?u32 {
     const n: i64 = switch (v) {
@@ -287,6 +301,9 @@ pub const OpenOpts = struct {
     retry: ?retry_mod.Policy = null,
     /// `stall_after_min`; null = off.
     stall: ?u32 = null,
+    /// API sources: start the attached TUI; null = the adapter's
+    /// `attach_default`.
+    tui: ?bool = null,
     /// A relaunch from this server: the content keys of what the gone
     /// entry handed out, moved into the new one (`select.Handed.texts`).
     handed: ?*std.AutoHashMapUnmanaged(u64, void) = null,
@@ -477,9 +494,11 @@ fn openOpts(arena: std.mem.Allocator, args: std.json.Value, loaded: *const adapt
     }
     const retry = if (mcp.argValue(args, "retry_on_overload")) |v| try retryPolicyFrom(arena, v, why) else null;
     const stall = if (mcp.argValue(args, "stall_after_min")) |v| try stallFrom(arena, v, why) else null;
+    const tui = if (mcp.argValue(args, "tui")) |v| try tuiFrom(arena, loaded, v, why) else null;
     return .{
         .retry = retry,
         .stall = stall,
+        .tui = tui,
         .name = name,
         .resume_id = resume_id,
         .override = override,
@@ -1229,14 +1248,9 @@ fn spawnApi(arena: std.mem.Allocator, loaded: *const adapter.Loaded, binary: []c
         why.* = .{ .code = .failed, .msg = "the app's API created no session" };
         return error.Refused;
     };
-    const tui_argv = try launch.startArgv(arena, spec.launch, binary, x, .{
-        .port = port_str,
-        .cwd = cwd,
-        .session = sid,
-    }, .attach);
-    const tui: ?*termdrive.Term = if (spec.launch.attach_args.len == 0) null else try spawnOn(arena, where, o.choice, tui_argv, .{ .name = session, .cwd = cwd, .env = env, .secret_env = secret_env, .extra = x, .title = o.name orelse "" }, why);
+    const want_tui = spec.launch.attach_args.len > 0 and (o.tui orelse spec.launch.attach_default);
+    const tui: ?*termdrive.Term = if (want_tui) try spawnTui(arena, loaded, where, o.choice, binary, x, port_str, cwd, sid, session, password, o.name orelse "", deadline, why) else null;
     errdefer if (tui) |t| t.deinit();
-    if (tui) |t| if (secret_env != null) try typeSecret(arena, t, password, deadline, "the attached client", why);
 
     const e = try newEntry(loaded, id, if (tui != null) session else server_session, binary, cwd);
     errdefer dropBare(e);
@@ -1244,6 +1258,7 @@ fn spawnApi(arena: std.mem.Allocator, loaded: *const adapter.Loaded, binary: []c
     e.server_session = try a.dupe(u8, server_session);
     e.agent = ag;
     e.visible = if (tui) |t| .{ .owned = t } else null;
+    e.tui = want_tui;
     e.server = server;
     e.port = port;
     e.remote_port = if (where.host != null) server_port else 0;
@@ -1252,6 +1267,69 @@ fn spawnApi(arena: std.mem.Allocator, loaded: *const adapter.Loaded, binary: []c
     if (tui) |t| record(e, t, session);
     record(e, server, server_session);
     return e;
+}
+
+/// Start an API agent's attached TUI (the adapter's `attach_args`) in
+/// session `session` on `where`, against the server at `port_str` (its
+/// port on its own host) driving `sid`; the password rides the spawn's
+/// environment here and is typed on a remote host, never argv.
+fn spawnTui(arena: std.mem.Allocator, loaded: *const adapter.Loaded, where: *Where, choice: transport_mod.Choice, binary: []const u8, x: launch.Extra, port_str: []const u8, cwd: []const u8, sid: []const u8, session: []const u8, password: []const u8, title: []const u8, deadline: i64, why: *Fail) !*termdrive.Term {
+    const spec = &loaded.spec;
+    const pw_env = spec.launch.password_env orelse unreachable; // adapter.zig requires it for API sources
+    const argv = try launch.startArgv(arena, spec.launch, binary, x, .{ .port = port_str, .cwd = cwd, .session = sid }, .attach);
+    const env_kv = try std.fmt.allocPrint(arena, "{s}={s}", .{ pw_env, password });
+    defer std.crypto.secureZero(u8, env_kv);
+    const env: []const []const u8 = if (where.host == null) try arena.dupe([]const u8, &.{env_kv}) else &.{};
+    const secret_env: ?[]const u8 = if (where.host == null) null else pw_env;
+    const t = try spawnOn(arena, where, choice, argv, .{ .name = session, .cwd = cwd, .env = env, .secret_env = secret_env, .extra = x, .title = title }, why);
+    errdefer t.deinit();
+    if (secret_env != null) try typeSecret(arena, t, password, deadline, "the attached client", why);
+    return t;
+}
+
+/// `agent_set tui`: start an API agent's attached TUI (again, when one
+/// ended) or stop it; the setting goes into the descriptor either way.
+/// @return why it could not start, or null.
+pub fn setTui(arena: std.mem.Allocator, e: *Entry, want: bool, deadline: i64) !?Fail {
+    e.tui = want;
+    defer {
+        writeDescriptor(e);
+        publishAgents();
+    }
+    if (want) if (e.visibleTerm()) |t| if (!t.exited) return null;
+    if (e.visible) |l| switch (l) {
+        .owned => |t| t.deinit(),
+        .borrowed => {},
+    };
+    e.visible = null;
+    const server_session = e.server_session orelse return Fail{ .code = .unavailable, .msg = "the agent has no server session" };
+    try renameSession(e, server_session);
+    if (!want) return null;
+    const api = &e.agent.source.opencode_api;
+    const sid = api.sessionId() orelse return Fail{ .code = .unavailable, .msg = "the app's server drives no session yet" };
+    const password = e.password orelse return Fail{ .code = .unavailable, .msg = "the agent's server password is not known here" };
+    var port_buf: [8]u8 = undefined;
+    const port_str = std.fmt.bufPrint(&port_buf, "{d}", .{if (e.host != null) e.remote_port else e.port}) catch unreachable;
+    const x = try launch.applySettings(arena, &e.loaded.spec, e.extra, null);
+    const session = try std.fmt.allocPrint(arena, "agent-{s}", .{e.id});
+    var where = e.where();
+    var why: Fail = undefined;
+    const t = spawnTui(arena, e.loaded, &where, .auto, e.binary, x, port_str, e.cwd, sid, session, password, e.name orelse "", deadline, &why) catch |err| switch (err) {
+        error.Refused => return why,
+        else => return err,
+    };
+    e.visible = .{ .owned = t };
+    try renameSession(e, session);
+    record(e, t, session);
+    return null;
+}
+
+/// Point `e.session` (what the user watches) at `name`.
+fn renameSession(e: *Entry, name: []const u8) !void {
+    if (std.mem.eql(u8, e.session, name)) return;
+    const owned = try e.allocator.dupe(u8, name);
+    e.allocator.free(e.session);
+    e.session = owned;
 }
 
 /// A port for an API server on a remote host, other than `local` (on a

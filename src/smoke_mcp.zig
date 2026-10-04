@@ -7445,7 +7445,15 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
 
         // ── opencode (API source) ───────────────────────────────────
         resetStarts();
-        const oc = agentCall(&m, arena, "agent_open", std.fmt.allocPrint(arena, "{{\"app\":\"opencode\",\"name\":\"opencode-1\",\"binary\":{s},\"timeout_ms\":30000{s}}}", .{ bin_json, extraJson(arena) }) catch fail("oom"), "agent_open opencode", false, 45_000);
+        // The attached TUI is off by default (capabilities.agent_tui): asked for here.
+        {
+            const caps_tui = (agentCall(&m, arena, "capabilities", "{}", "capabilities agent_tui", false, 15_000).get("agent_tui") orelse fail("capabilities: no agent_tui")).object;
+            const apps = caps_tui.get("apps").?.array.items;
+            if (!caps_tui.get("available").?.bool or apps.len != 1 or !std.mem.eql(u8, apps[0].string, "opencode") or caps_tui.get("on_by_default").?.array.items.len != 0)
+                fail("capabilities.agent_tui: not opencode alone, off by default");
+        }
+        const oc = agentCall(&m, arena, "agent_open", std.fmt.allocPrint(arena, "{{\"app\":\"opencode\",\"name\":\"opencode-1\",\"binary\":{s},\"tui\":true,\"timeout_ms\":30000{s}}}", .{ bin_json, extraJson(arena) }) catch fail("oom"), "agent_open opencode", false, 45_000);
+        if (!oc.get("tui").?.bool) fail("agent_open opencode tui:true: tui is not true");
         const o1 = arena.dupe(u8, scStr(oc, "agent", "agent_open opencode")) catch fail("oom");
         const o1_session = std.fmt.allocPrint(arena, "agent-{s}", .{o1}) catch fail("oom");
         const o1_server = std.fmt.allocPrint(arena, "agent-{s}-server", .{o1}) catch fail("oom");
@@ -7517,11 +7525,39 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
             expectFact(q_both, "outcome", "done", "agent_answer opencode two lines: outcome");
             expectFact(q_both, "message", "answers | b.zig | lint test", "agent_answer opencode two lines: the answers reached the server");
         }
+        // The TUI stops and starts on a live agent; the agent is driven over
+        // the API either way, and what the user watches follows it.
+        {
+            const off = agentCall(&m, arena, "agent_set", "{\"agent\":\"opencode-1\",\"tui\":false}", "agent_set tui false", false, 15_000);
+            if (off.get("tui").?.bool) fail("agent_set tui:false: tui is still true");
+            expectFact(off, "session", o1_server, "agent_set tui:false: the session to watch is the server's");
+            waitUnlisted(allocator, mux_sock, o1_session, "agent_set tui:false");
+            const no_tui = agentCall(&m, arena, "agent_send", "{\"agent\":\"opencode-1\",\"text\":\"no tui here\",\"timeout_ms\":20000}", "agent_send without tui", false, 45_000);
+            expectFact(no_tui, "outcome", "done", "agent_send without the TUI: outcome");
+            const on = agentCall(&m, arena, "agent_set", "{\"agent\":\"opencode-1\",\"tui\":true}", "agent_set tui true", false, 30_000);
+            if (!on.get("tui").?.bool) fail("agent_set tui:true: tui is not true");
+            expectFact(on, "session", o1_session, "agent_set tui:true: the session to watch is the TUI's");
+            expectStarts(arena, "attach", 2, "agent_set tui:true: the TUI started again");
+            if (!sessionListed(allocator, mux_sock, o1_session)) fail("agent_set tui:true: no TUI session on the daemon");
+        }
         const oc_closed = agentCall(&m, arena, "agent_close", "{\"agent\":\"opencode-1\"}", "agent_close opencode", false, 15_000);
         if (oc_closed.get("sessions").?.array.items.len != 2) fail("agent_close opencode: not both sessions");
         waitUnlisted(allocator, mux_sock, o1_session, "agent_close opencode");
         waitUnlisted(allocator, mux_sock, o1_server, "agent_close opencode server");
-        say("smoke-mcp: agents: fake opencode (open, set, send, match, permission, close) ok");
+        // By default: no TUI process at all, the server's session is the
+        // one to watch, and close ends just that.
+        {
+            const plain = agentCall(&m, arena, "agent_open", std.fmt.allocPrint(arena, "{{\"app\":\"opencode\",\"name\":\"opencode-2\",\"binary\":{s},\"timeout_ms\":30000}}", .{bin_json}) catch fail("oom"), "agent_open opencode without tui", false, 45_000);
+            if (plain.get("tui").?.bool) fail("agent_open opencode: a TUI by default");
+            expectFact(plain, "session", scStr(plain, "server_session", "agent_open opencode without tui"), "agent_open opencode without tui: session");
+            expectStarts(arena, "attach", 2, "agent_open opencode without tui: an attach was started");
+            const said = agentCall(&m, arena, "agent_send", "{\"agent\":\"opencode-2\",\"text\":\"headless\",\"timeout_ms\":20000}", "agent_send opencode without tui", false, 45_000);
+            expectFact(said, "message", "echo: headless model=default variant=default", "agent_send opencode without tui: message");
+            for (agentCall(&m, arena, "agent_list", "{\"detail\":true}", "agent_list opencode without tui", false, 15_000).get("agents").?.array.items) |li| if (std.mem.eql(u8, li.object.get("name").?.string, "opencode-2") and li.object.get("sessions").?.array.items.len != 1) fail("agent_list opencode without tui: the server session listed twice");
+            const closed2 = agentCall(&m, arena, "agent_close", "{\"agent\":\"opencode-2\"}", "agent_close opencode without tui", false, 15_000);
+            if (closed2.get("sessions").?.array.items.len != 1) fail("agent_close opencode without tui: not the one server session");
+        }
+        say("smoke-mcp: agents: fake opencode (open, set, send, match, permission, TUI on/off, no TUI by default, close) ok");
         m.closeStdinWait();
     }
 
@@ -7770,6 +7806,38 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
         if (c.stat(desc.ptr, &st) == 0) fail("durable: agent_close left the descriptor behind");
         d2.closeStdinWait();
         say("smoke-mcp: agents: a durable instance re-attaches its running agent ok");
+    }
+
+    // ── an opencode agent without its TUI re-attaches, and its TUI setting
+    // (agent_set tui) survives the next re-attach ──
+    {
+        const mux_sock = std.fmt.allocPrint(arena, "{s}/sketerm/mux.sock", .{rt}) catch fail("oom");
+        var d1 = Mcp.spawn(allocator, exe, &.{ "--name", "ocdur" });
+        d1.initialize();
+        const opened = agentCall(&d1, arena, "agent_open", std.fmt.allocPrint(arena, "{{\"app\":\"opencode\",\"name\":\"oc-dur\",\"binary\":{s},\"prompt\":\"before restart\",\"timeout_ms\":30000}}", .{bin_json}) catch fail("oom"), "durable opencode agent_open", false, 45_000);
+        const server = arena.dupe(u8, scStr(opened, "server_session", "durable opencode agent_open")) catch fail("oom");
+        const tui_session = std.fmt.allocPrint(arena, "agent-{s}", .{scStr(opened, "agent", "durable opencode agent_open")}) catch fail("oom");
+        expectFact(opened, "session", server, "durable opencode: no TUI, the server's session");
+        d1.closeStdinWait();
+        var d2 = Mcp.spawn(allocator, exe, &.{ "--name", "ocdur" });
+        d2.initialize();
+        const back = agentCall(&d2, arena, "agent_send", "{\"agent\":\"oc-dur\",\"text\":\"after restart\",\"timeout_ms\":20000}", "durable opencode agent_send", false, 45_000);
+        expectFact(back, "message", "echo: after restart model=default variant=default", "durable opencode: the re-attached agent answers");
+        expectFact(back, "session", server, "durable opencode: re-attached without a TUI");
+        if (back.get("tui").?.bool) fail("durable opencode: a TUI appeared on re-attach");
+        const on = agentCall(&d2, arena, "agent_set", "{\"agent\":\"oc-dur\",\"tui\":true}", "durable opencode agent_set tui", false, 30_000);
+        expectFact(on, "session", tui_session, "durable opencode: agent_set tui started it");
+        d2.closeStdinWait();
+        var d3 = Mcp.spawn(allocator, exe, &.{ "--name", "ocdur" });
+        d3.initialize();
+        const again = agentCall(&d3, arena, "agent_list", "{\"detail\":true}", "durable opencode agent_list", false, 15_000).get("agents").?.array.items;
+        if (again.len != 1 or !std.mem.eql(u8, again[0].object.get("session").?.string, tui_session)) fail("durable opencode: the TUI was not re-attached");
+        const closed = agentCall(&d3, arena, "agent_close", "{\"agent\":\"oc-dur\"}", "durable opencode agent_close", false, 15_000);
+        if (closed.get("sessions").?.array.items.len != 2) fail("durable opencode agent_close: not the TUI and the server");
+        waitUnlisted(allocator, mux_sock, tui_session, "durable opencode agent_close TUI");
+        waitUnlisted(allocator, mux_sock, server, "durable opencode agent_close server");
+        d3.closeStdinWait();
+        say("smoke-mcp: agents: an opencode agent without its TUI re-attaches; agent_set tui survives the next ok");
     }
 
     // ── a permission policy per app, and retry on overload ───────────
@@ -8742,11 +8810,14 @@ fn agentSshStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u
         expectStarts(arena, "claude", 2, "agent_set effort relaunch on the host");
 
         // opencode on the host: password typed, server behind a forward.
-        const oc = agentCall(&m, arena, "agent_open", "{\"app\":\"opencode\",\"name\":\"opencode-1\",\"host\":\"fakehost\",\"binary\":\"sk-fake-opencode\",\"timeout_ms\":45000}", "agent_open opencode on host", false, 60_000);
+        // With its attached TUI, asked for: the password typed into it too.
+        const oc = agentCall(&m, arena, "agent_open", "{\"app\":\"opencode\",\"name\":\"opencode-1\",\"host\":\"fakehost\",\"binary\":\"sk-fake-opencode\",\"tui\":true,\"timeout_ms\":45000}", "agent_open opencode on host", false, 60_000);
         expectFact(oc, "transport", "sketerm-mux", "agent_open opencode host: transport");
         if (!oc.get("ready").?.bool) fail("agent_open opencode host: not ready");
         const r_server = arena.dupe(u8, scStr(oc, "server_session", "agent_open opencode on host")) catch fail("oom");
         if (!sessionListed(allocator, rsock, r_server)) fail("the opencode server is not a session on the remote daemon");
+        const r_tui = arena.dupe(u8, scStr(oc, "session", "agent_open opencode on host")) catch fail("oom");
+        if (std.mem.eql(u8, r_tui, r_server) or !oc.get("tui").?.bool or !sessionListed(allocator, rsock, r_tui)) fail("the remote opencode's TUI is not a session on the remote daemon");
         const oc_sent = agentCall(&m, arena, "agent_send", "{\"agent\":\"opencode-1\",\"text\":\"over the forward\",\"timeout_ms\":20000}", "agent_send opencode remote", false, 45_000);
         expectFact(oc_sent, "outcome", "done", "agent_send opencode on the host: outcome");
         expectPasswordsHidden(arena, &.{}, "opencode on the host's daemon");
@@ -8762,6 +8833,7 @@ fn agentSshStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u
         _ = agentCall(&m, arena, "agent_close", "{\"agent\":\"claude-1\"}", "agent_close claude remote", false, 15_000);
         waitUnlisted(allocator, rsock, r_session, "agent_close remote claude");
         waitUnlisted(allocator, rsock, r_server, "agent_close remote opencode");
+        waitUnlisted(allocator, rsock, r_tui, "agent_close remote opencode TUI");
         m.closeStdinWait();
         say("smoke-mcp: agents over ssh: host daemon (probe, open, send, drop + recovery, effort relaunch, opencode forward + revival, password hidden, close) ok");
     }

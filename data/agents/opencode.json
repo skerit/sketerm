@@ -8,6 +8,7 @@
     "args": ["serve", "--port", "{port}"],
     "password_env": "OPENCODE_SERVER_PASSWORD",
     "attach_args": ["attach", "http://127.0.0.1:{port}", "--dir", "{cwd}", "-s", "{session}"],
+    "attach_default": false,
     "version_args": ["--version"],
     "permissions": {
       "names": ["*", "read", "edit", "glob", "grep", "list", "bash", "task", "external_directory", "todowrite", "question", "webfetch", "websearch", "lsp", "doom_loop", "skill"],

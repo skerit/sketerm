@@ -81,6 +81,10 @@ pub const Descriptor = struct {
     retry_on_overload: ?retry.Policy = null,
     /// `stall_after_min`; 0 = off.
     stall_after_min: u32 = 0,
+    /// API sources: the attached TUI is wanted (`agent_open tui`,
+    /// `agent_set tui`); absent (an older descriptor): it is iff `session`
+    /// is not `server_session`.
+    tui: ?bool = null,
     /// The status command's facts file on the agent's host, and the
     /// user's own status object it chains (JSON); absent: none was set up.
     facts_file: ?[]const u8 = null,

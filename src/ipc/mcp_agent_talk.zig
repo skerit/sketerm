@@ -82,6 +82,8 @@ const RequeuedItem = mcp_agent_act.RequeuedItem;
 const Submitted = mcp_agent_act.Submitted;
 const retryPolicyFrom = mcp_agent_open.retryPolicyFrom;
 const stallFrom = mcp_agent_open.stallFrom;
+const tuiFrom = mcp_agent_open.tuiFrom;
+const setTui = mcp_agent_open.setTui;
 const setRetryPolicy = mcp_agent_open.setRetryPolicy;
 const effortRefusal = mcp_agent_open.effortRefusal;
 const discard = mcp_agent_open.discard;
@@ -502,15 +504,20 @@ pub fn setTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]con
     const effort = argStr(args, "effort");
     const retry_arg = mcp.argValue(args, "retry_on_overload");
     const stall_arg = mcp.argValue(args, "stall_after_min");
-    if (model == null and effort == null and retry_arg == null and stall_arg == null) return errRes(arena, .invalid_args, "agent_set needs 'model', 'effort', 'retry_on_overload' and/or 'stall_after_min'");
+    const tui_arg = mcp.argValue(args, "tui");
+    if (model == null and effort == null and retry_arg == null and stall_arg == null and tui_arg == null) return errRes(arena, .invalid_args, "agent_set needs 'model', 'effort', 'retry_on_overload', 'stall_after_min' and/or 'tui'");
     inline for (.{ "model", "effort" }) |key| {
         if (argStr(args, key)) |v| if (!launch.validValue(v)) return errRes(arena, .invalid_args, key ++ " must be 1-256 printable characters");
     }
     // Refused before anything is typed, stopped or restarted.
     if (effort) |x| if (!launch.validEffort(e.loaded.spec.launch, x)) return errRes(arena, .invalid_args, try effortRefusal(arena, e.loaded));
     // The settings that apply at any time: both checked before either is set.
-    if (retry_arg != null or stall_arg != null) {
+    if (retry_arg != null or stall_arg != null or tui_arg != null) {
         var why: Fail = undefined;
+        const tui = if (tui_arg) |v| tuiFrom(arena, e.loaded, v, &why) catch |err| switch (err) {
+            error.Refused => return errRes(arena, why.code, why.msg),
+            else => return err,
+        } else null;
         const p = if (retry_arg) |v| retryPolicyFrom(arena, v, &why) catch |err| switch (err) {
             error.Refused => return errRes(arena, why.code, why.msg),
             else => return err,
@@ -521,6 +528,8 @@ pub fn setTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]con
         } else null;
         if (retry_arg != null) setRetryPolicy(e, p);
         if (stall_arg != null) e.stall.set(stall, clock.nowMs());
+        if (tui) |want| if (try setTui(arena, e, want, deadlineFrom(args, DEFAULT_WAIT_MS))) |f|
+            return errRes(arena, f.code, try std.fmt.allocPrint(arena, "the attached TUI did not start: {s}", .{f.msg}));
         writeDescriptor(e);
         service(clock.nowMs());
         if (model == null and effort == null) {
@@ -537,6 +546,7 @@ pub fn setTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]con
                 else
                     try res.textf("{s}: stall_after_min off", .{e.id});
             }
+            if (tui) |want| try res.textf("{s}: attached TUI {s} (session {s})", .{ e.id, if (want) "running" else "stopped", e.session });
             try res.fact("relaunched", false);
             return finish(arena, &res, e, try pending(arena, e), .{}, &.{});
         }
@@ -854,7 +864,7 @@ pub fn listTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
         }
         var sessions: std.ArrayList([]const u8) = .empty;
         try sessions.append(arena, e.session);
-        if (e.server_session) |s| try sessions.append(arena, s);
+        if (e.server_session) |s| if (!std.mem.eql(u8, s, e.session)) try sessions.append(arena, s);
         const act_ms = e.agent.lastActivityMs();
         const fr = try factsOf(arena, e);
         out.* = .{

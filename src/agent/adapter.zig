@@ -80,6 +80,10 @@ pub const Launch = struct {
     /// API sources: arguments of a second, visible process the human
     /// watches (opencode's TUI attached to the server); empty for none.
     attach_args: []const []const u8 = &.{},
+    /// Whether an agent starts with that visible process when the caller
+    /// does not say (`agent_open tui`); `agent_set tui` starts or stops it
+    /// on a live agent. Only with `attach_args`.
+    attach_default: bool = true,
     /// Arguments that make the binary print its version, whose first line
     /// is reported with the resolved path; empty = not asked.
     version_args: []const []const u8 = &.{},
@@ -494,6 +498,8 @@ const Validator = struct {
         for (s.launch.model_args) |x| try self.placeholders(x, "launch.model_args");
         for (s.launch.effort_args) |x| try self.placeholders(x, "launch.effort_args");
         for (s.launch.attach_args) |x| try self.placeholders(x, "launch.attach_args");
+        if (!s.launch.attach_default and s.launch.attach_args.len == 0)
+            return self.fail("launch.attach_default is about the process launch.attach_args starts, and there is none", .{});
         for (s.launch.session_args) |x| try self.placeholders(x, "launch.session_args");
         for (s.launch.resume_args) |x| try self.placeholders(x, "launch.resume_args");
         if ((s.launch.session_args.len == 0) != (s.launch.resume_args.len == 0))
@@ -931,6 +937,15 @@ test "an API source needs a password variable and checks its attach arguments" {
     const bad_ph = std.mem.replaceOwned(u8, t.allocator, api, "{session}", "{sesion}") catch unreachable;
     defer t.allocator.free(bad_ph);
     try expectProblem(bad_ph, "launch.attach_args: unknown placeholder {sesion}");
+    // The attached process can be off by default; there must be one to be.
+    const off = std.mem.replaceOwned(u8, t.allocator, api, "\"attach_args\"", "\"attach_default\": false, \"attach_args\"") catch unreachable;
+    defer t.allocator.free(off);
+    const l_off = try load(t.allocator, "api.json", off, .user, &problem);
+    try t.expect(!l_off.spec.launch.attach_default);
+    l_off.destroy(t.allocator);
+    const no_attach = std.mem.replaceOwned(u8, t.allocator, api, ", \"attach_args\": [\"attach\", \"{session}\"]", ", \"attach_default\": false") catch unreachable;
+    defer t.allocator.free(no_attach);
+    try expectProblem(no_attach, "launch.attach_default is about the process launch.attach_args starts");
     // unset_env entries are names with an optional trailing * (they end up
     // in a shell case pattern), never anything else.
     const unset_ok = std.mem.replaceOwned(u8, t.allocator, api, "\"password_env\"", "\"unset_env\": [\"CLAUDE*\", \"X_TOKEN\"], \"password_env\"") catch unreachable;

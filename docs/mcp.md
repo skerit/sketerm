@@ -874,8 +874,26 @@ notice) grouped into jobs, a state, the pending prompt and events, never
 raw screens.
 Claude Code is a `screen` source (launched with `--ax-screen-reader`, read
 off its terminal); opencode is an `opencode_api` source (`opencode serve`
-on a free loopback port, read over its HTTP API and SSE stream, with
-`opencode attach` in a second session for the human).
+on a free loopback port, read over its HTTP API and SSE stream; its
+`opencode attach` TUI for a human to watch is optional, see below).
+
+- **opencode's attached TUI is optional (`capabilities.agent_tui`).**
+  The adapter declares it (`launch.attach_args`, and
+  `launch.attach_default`: opencode's is `false`, because the TUI burns
+  about 45% of a core while it runs and the agent is driven over the API
+  either way), so an agent starts WITHOUT it: its `session` is then the
+  server's (`agent-<id>-server`, the one the GUI watches), and `tui` is
+  `false` on every per-agent result. `agent_open tui: true` starts it
+  (session `agent-<id>`), and `agent_set tui: true|false` starts or
+  stops it on a live agent (its password rides the spawn here and is
+  typed on a remote host, as for the server). The setting is kept in the
+  descriptor (`tui`), so a relaunch or re-attach starts it again; a TUI
+  that is not running any more (a human quit it) never fails a re-attach,
+  it is just not there, and an older descriptor reads as "a TUI when its
+  session is not the server's". Readiness, delivery (the API's 2xx),
+  facts, the port forward of a remote agent and `agent_close` never
+  depended on it. `tui` is `invalid_args` for an app whose terminal is
+  the app itself (Claude Code).
 
 - **Sessions and ids.** An agent's id is machine-unique and short:
   `<app>-xxxx` (four lowercase base32 characters, `claude-k3f9`), checked
@@ -890,7 +908,8 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   `term_open name:` does the same for a terminal (unique among this
   server's terminals; `term` takes it, `term_list` shows it).
 - **Agents outlive their MCP server.** A server that exits only detaches:
-  every agent session (Claude Code, opencode's server and TUI, the local
+  every agent session (Claude Code, opencode's server and its TUI when it
+  runs, the local
   end of a plain-ssh agent) is spawned with the daemon-enforced
   `ttl_secs` of `mcp_agent_idle_ttl_hours` (config, default 24), so it
   ends after that long with no client attached. `agent_close` ends one at
@@ -1004,8 +1023,8 @@ on a free loopback port, read over its HTTP API and SSE stream, with
 - **Resuming a conversation.** `agent_open resume: "<id>"` continues an
   EXISTING conversation of the app instead of starting one: Claude Code is
   launched with `--resume <id>` (and later relaunches keep resuming it),
-  opencode's server adopts session `<id>` (`ses_...`) and its TUI attaches to
-  it. The earlier turns are history, not new records. Ids are plain
+  opencode's server adopts session `<id>` (`ses_...`) and its TUI, when
+  it runs, attaches to it. The earlier turns are history, not new records. Ids are plain
   `[A-Za-z0-9_-]`, at most 128 characters (`capabilities.agent_open_resume`).
   Every per-agent result and `agent_list` report the conversation an agent
   runs as `conversation`, fresh or resumed (Claude Code's session id,

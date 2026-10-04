@@ -150,6 +150,8 @@ pub fn finish(arena: std.mem.Allocator, res: *Res, e: *Entry, dv: Delivered, wat
     try res.fact("ready", e.agent.ready());
     try res.fact("session", e.session);
     if (e.server_session) |s| try res.fact("server_session", s);
+    // An app with a separate TUI: whether it runs (`agent_set tui`).
+    if (e.loaded.spec.launch.attach_args.len > 0) try res.fact("tui", e.visibleTerm() != null);
     if (e.host) |h| try res.fact("host", h);
     if (conversationOf(e)) |cv| try res.fact("conversation", cv);
     try res.fact("transport", @tagName(e.transport));

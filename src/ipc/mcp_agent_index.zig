@@ -147,6 +147,7 @@ pub fn writeDescriptor(e: *Entry) void {
         .permissions = e.extra.permissions,
         .retry_on_overload = e.retry.policy,
         .stall_after_min = e.stall.after_min orelse 0,
+        .tui = if (e.server != null) e.tui else null,
         .facts_file = e.facts_file,
         .status_user = e.status_user,
         .started_ms = e.started_ms,
@@ -353,7 +354,8 @@ pub fn publishAgents() void {
     for (state.entries.items) |e| {
         var sessions: std.ArrayList([]const u8) = .empty;
         sessions.append(arena, e.session) catch return;
-        if (e.server_session) |s| sessions.append(arena, s) catch return;
+        // Without an attached TUI the server's session is the one to watch.
+        if (e.server_session) |s| if (!std.mem.eql(u8, s, e.session)) sessions.append(arena, s) catch return;
         // The term's own fact: it runs on a host's daemon, on this host's
         // per-user daemon, or on our private one (a term_open terminal, a
         // legacy durable agent). `ssh:box` is reached at `box`.
@@ -475,7 +477,12 @@ fn reattachOne(arena: std.mem.Allocator, d: Descriptor, claim: ?agentindex.Claim
     const socket = d.socket orelse state.mux_sock;
     var parts: Parts = .{};
     errdefer parts.release(a);
-    parts.vis = try attachSession(arena, transport, d.host, socket, d.session, d.origin, why);
+    // An API source's attached TUI is not the agent (its server is): one
+    // that is not running any more (a human quit it, or none was wanted)
+    // leaves the agent without one; `agent_set tui` starts it again.
+    const api_source = loaded.spec.source == .opencode_api;
+    const no_tui = api_source and std.mem.eql(u8, d.session, d.server_session orelse "");
+    if (!no_tui) parts.vis = attachSession(arena, transport, d.host, socket, d.session, d.origin, why) catch |err| if (api_source) null else return err;
     var port = d.port;
     if (loaded.spec.source == .opencode_api) {
         parts.server = try attachSession(arena, transport, d.host, socket, d.server_session orelse return error.BadDescriptor, d.server_origin, why);
@@ -496,7 +503,7 @@ fn reattachOne(arena: std.mem.Allocator, d: Descriptor, claim: ?agentindex.Claim
     parts.ag_live = true;
 
     try state.entries.ensureUnusedCapacity(a, 1);
-    const e = try newEntry(loaded, d.id, d.session, d.binary, d.cwd);
+    const e = try newEntry(loaded, d.id, if (parts.vis == null) d.server_session orelse d.session else d.session, d.binary, d.cwd);
     errdefer dropBare(e);
     if (d.name) |s| e.name = try a.dupe(u8, s);
     if (socket) |s| if (transport != .@"sketerm-mux") {
@@ -520,8 +527,9 @@ fn reattachOne(arena: std.mem.Allocator, d: Descriptor, claim: ?agentindex.Claim
     if (d.started_ms > 0) e.started_ms = d.started_ms;
     // Nothing below fails: the parts move into the entry.
     e.agent = parts.ag.?;
-    e.visible = .{ .owned = parts.vis.? };
-    e.seen_snapshots = parts.vis.?.snapshots;
+    e.visible = if (parts.vis) |t| .{ .owned = t } else null;
+    if (parts.vis) |t| e.seen_snapshots = t.snapshots;
+    e.tui = api_source and (d.tui orelse !no_tui);
     e.server = parts.server;
     e.forward = parts.forward;
     e.port = port;
@@ -667,6 +675,7 @@ fn relaunchFrom(arena: std.mem.Allocator, args: std.json.Value, d: Descriptor, c
         .extra = .{ .args = d.args, .server_args = d.server_args, .tui_args = d.tui_args, .env = d.env, .path_prepend = d.path_prepend, .login_shell = d.login_shell, .permissions = d.permissions },
         .retry = d.retry_on_overload,
         .stall = if (d.stall_after_min > 0) d.stall_after_min else null,
+        .tui = if (loaded.spec.source == .opencode_api) d.tui orelse !std.mem.eql(u8, d.session, d.server_session orelse "") else null,
         .name = d.name,
         .keep_id = d.id,
         .handed = handed,

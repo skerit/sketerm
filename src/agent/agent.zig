@@ -164,7 +164,7 @@ pub const Agent = struct {
         }
         for (recs[0..upto]) |r| if (r.kind == .tool) try all.append(arena, .{ .name = r.toolName(), .at_ms = r.at_ms });
         for (live) |lt| try all.append(arena, .{ .name = output.summaryTool(lt.text), .at_ms = lt.at_ms });
-        return all.items[all.items.len -| limit ..];
+        return all.items[all.items.len -| limit..];
     }
 
     /// Record something sketerm did for the agent that the app shows no
