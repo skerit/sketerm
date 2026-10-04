@@ -139,6 +139,34 @@ pub const Agent = struct {
         };
     }
 
+    /// A tool call `recentTools` reports.
+    pub const ToolSeen = struct {
+        name: []const u8,
+        /// Wall time (`output.Record.at_ms`); 0 = unknown.
+        at_ms: i64,
+    };
+
+    /// The newest `limit` tool calls, oldest first: the records, plus for a
+    /// screen app the busy turn's calls its screen shows before they are
+    /// captured. Read-only: nothing is captured or handed out.
+    pub fn recentTools(self: *const Agent, arena: std.mem.Allocator, limit: usize) ![]const ToolSeen {
+        var all: std.ArrayList(ToolSeen) = .empty;
+        const recs = self.records();
+        var upto = recs.len;
+        var live: []const screen_source.Engine.LiveTool = &.{};
+        switch (self.source) {
+            .screen => |*e| if (try e.liveTools(arena)) |lt| {
+                live = lt;
+                // The newest turn's captured records are in `live` already.
+                if (e.turns.items.len > 0) upto = @min(upto, e.turns.items[e.turns.items.len - 1].first);
+            },
+            .opencode_api => {},
+        }
+        for (recs[0..upto]) |r| if (r.kind == .tool) try all.append(arena, .{ .name = r.toolName(), .at_ms = r.at_ms });
+        for (live) |lt| try all.append(arena, .{ .name = output.summaryTool(lt.text), .at_ms = lt.at_ms });
+        return all.items[all.items.len -| limit ..];
+    }
+
     /// Record something sketerm did for the agent that the app shows no
     /// trace of (a retry it sent).
     pub fn addNotice(self: *Agent, text: []const u8) !void {

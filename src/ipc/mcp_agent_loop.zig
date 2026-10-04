@@ -17,6 +17,8 @@ const screen_source = @import("../agent/screen_source.zig");
 const wire = @import("../mux/wire.zig");
 const Screen = @import("../grid/screen.zig").Screen;
 const clock = @import("../util/clock.zig");
+const agent_mod = @import("../agent/agent.zig");
+const stall = @import("../agent/stall.zig");
 const muxconnect = @import("muxconnect.zig");
 const muxclient = @import("../mux/client.zig");
 
@@ -163,7 +165,13 @@ pub fn service(now_ms: i64) void {
     serviceRetries(now_ms);
     for (state.entries.items) |e| {
         // A relaunch swaps the terminal: its silence is the adapter's.
-        if (!e.relaunching) _ = e.stall.check(e.agent.queue(), e.agent.state(), e.agent.lastActivityMs(), now_ms) catch {};
+        if (e.relaunching) continue;
+        const act = e.agent.lastActivityMs();
+        if (!e.stall.isDue(e.agent.state(), act, now_ms)) continue;
+        var arena_state = std.heap.ArenaAllocator.init(state.allocator);
+        defer arena_state.deinit();
+        const last = stallLast(arena_state.allocator(), e.agent, act) catch stall.Tracker.Last{};
+        _ = e.stall.check(e.agent.queue(), e.agent.state(), act, now_ms, last) catch {};
     }
     servicePush(now_ms);
     serviceHostProbes(now_ms);
@@ -639,6 +647,17 @@ pub fn settleOf(e: *Entry) ?Settle {
     return .{ .event = q.lastSettle(0), .state = st };
 }
 
+/// What a `stalled` event says `ag` last did: when (`activity_ms`, a
+/// `clock.nowMs` reading; 0 = never) and its newest tool call's tool (a
+/// busy screen app's included, `Agent.recentTools`).
+fn stallLast(arena: std.mem.Allocator, ag: *const agent_mod.Agent, activity_ms: i64) !stall.Tracker.Last {
+    const tools = try ag.recentTools(arena, 1);
+    return .{
+        .activity_wall_ms = if (activity_ms > 0) clock.wallOfMono(activity_ms) else 0,
+        .tool = if (tools.len > 0) tools[0].name else null,
+    };
+}
+
 /// One agent's line of an `all` wake: the settling kind (else the state).
 pub fn settledOf(arena: std.mem.Allocator, e: *const Entry, s: Settle) !agentwait.Settled {
     const ev = s.event orelse return .{ .agent = e.id, .outcome = @tagName(s.state), .state = @tagName(s.state) };
@@ -783,6 +802,46 @@ fn startRig(rig: *ScreenRig) !void {
     try rig.observe(0);
     try rig.observe(1000);
     try testing.expect(rig.engine.ready);
+}
+
+test "a stalled event names the last activity's wall time and the busy turn's last tool" {
+    var rig: ScreenRig = undefined;
+    try startRig(&rig);
+    defer rig.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    rig.write(turn_chunks[0]);
+    try rig.observe(2000);
+    rig.write(turn_chunks[1]);
+    try rig.observe(3000);
+    // Busy: the call is on screen, not a record yet.
+    try testing.expectEqual(vocab.State.working, rig.engine.state);
+    try testing.expectEqual(@as(usize, 0), rig.engine.records.items.len);
+    // A read-only view of the same engine, as the loop has it.
+    const ag: agent_mod.Agent = .{ .allocator = testing.allocator, .loaded = rig.set.get("claude").?, .source = .{ .screen = rig.engine } };
+    const act = clock.nowMs();
+    const last = try stallLast(a, &ag, act);
+    try testing.expectEqualStrings("Read", last.tool.?);
+    try testing.expectEqual(@as(usize, 0), rig.engine.records.items.len);
+    var tracker: stall.Tracker = .{};
+    tracker.set(1, act);
+    try testing.expect(!tracker.isDue(.working, act, act + 59_999));
+    try testing.expect(tracker.isDue(.working, act, act + 60_000));
+    try testing.expect(try tracker.check(&rig.engine.queue, .working, act, act + 60_000, last));
+    const ev = rig.engine.queue.events.items[rig.engine.queue.events.items.len - 1];
+    var iso: [clock.ISO_LEN]u8 = undefined;
+    try testing.expect(std.mem.indexOf(u8, ev.text, clock.isoLocal(&iso, last.activity_wall_ms).?) != null);
+    try testing.expect(std.mem.indexOf(u8, ev.text, ", last tool Read: ") != null);
+    // Captured at the turn's end: the same call, now with its record's time.
+    rig.write(turn_chunks[2]);
+    try rig.observe(4000);
+    try rig.observe(9000);
+    const ag2: agent_mod.Agent = .{ .allocator = testing.allocator, .loaded = rig.set.get("claude").?, .source = .{ .screen = rig.engine } };
+    const seen = try ag2.recentTools(a, 10);
+    try testing.expectEqual(@as(usize, 1), seen.len);
+    try testing.expectEqualStrings("Read", seen[0].name);
+    try testing.expect(seen[0].at_ms > 0);
 }
 
 test "a backlog observed late yields the records and events of a live stream" {

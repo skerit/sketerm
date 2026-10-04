@@ -482,7 +482,7 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
             const vocab_s = @import("../agent/vocab.zig");
             var watched: std.ArrayList([]const u8) = .empty;
             for (std.enums.values(vocab_s.State)) |s| if (s.stallWatched()) try watched.append(arena, @tagName(s));
-            try res.fact("agent_stall", .{ .available = agents_ok, .max_min = @import("../agent/stall.zig").MAX_MIN, .states = watched.items });
+            try res.fact("agent_stall", .{ .available = agents_ok, .max_min = @import("../agent/stall.zig").MAX_MIN, .states = watched.items, .names_last = agents_ok });
         }
         try res.fact("agent_list_preview", agents_ok);
         try res.fact("agent_waiter_content", agents_ok);

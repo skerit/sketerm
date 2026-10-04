@@ -46,12 +46,11 @@ pub const Record = struct {
     /// gives one (opencode), else when it was first read; 0 = unknown.
     at_ms: i64 = 0,
 
-    /// A tool record's tool: the structured call's name, else its summary
-    /// up to the arguments (`Bash (ls)` -> `Bash`).
+    /// A tool record's tool: the structured call's name, else
+    /// `summaryTool` of its text.
     pub fn toolName(self: Record) []const u8 {
         if (self.tool) |tc| if (tc.name.len > 0) return tc.name;
-        const end = std.mem.indexOfAny(u8, self.text, " (\n") orelse self.text.len;
-        return self.text[0..end];
+        return summaryTool(self.text);
     }
 
     /// Frees the text and the tool call.
@@ -60,6 +59,12 @@ pub const Record = struct {
         if (self.tool) |tc| tc.deinit(allocator);
     }
 };
+
+/// A tool call summary's tool: up to its arguments (`Bash (ls)` -> `Bash`).
+pub fn summaryTool(text: []const u8) []const u8 {
+    const end = std.mem.indexOfAny(u8, text, " (\n") orelse text.len;
+    return text[0..end];
+}
 
 pub const Option = struct {
     label: []const u8,

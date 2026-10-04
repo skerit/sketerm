@@ -1678,7 +1678,14 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   be busy (`vocab.State.stallWatched`: starting, working, waiting on
   subagents or background tasks, retrying; never idle, waiting on the
   user, exited or disconnected), with the minutes and the state in its
-  text (the state also as `detail`). It wakes every waiter and wait like
+  text (the state also as `detail`) and, when known, the last
+  activity's wall time (`isoLocal`) and the last tool the agent called
+  (`silent for 16 minutes while working, last activity
+  2026-10-04T11:32:50+02:00, last tool Bash: ...`;
+  `capabilities.agent_stall.names_last`). A busy Claude Code turn's calls
+  are records only at the turn's end, so the last tool is read off its
+  screen (`Agent.recentTools`, read-only, worked out only when the event
+  fires); `agent_read detail "activity"` lists its calls the same way. It wakes every waiter and wait like
   `done` (the caller opted in by setting it) but settles no turn, and it
   re-arms only after the agent shows something again, so a wedged app
   costs one wake-up, not one per wait. It is silence only, no process

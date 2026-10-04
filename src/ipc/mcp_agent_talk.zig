@@ -745,17 +745,13 @@ fn activityRead(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]co
         return errRes(arena, .invalid_args, "detail \"activity\" takes only limit (the tool calls to list)");
     const limit: usize = @intCast(std.math.clamp(argInt(args, "limit") orelse ACTIVITY_DEFAULT, 1, ACTIVITY_MAX));
     const Tool = struct { name: []const u8, at: ?[]const u8 };
-    const recs = e.agent.records();
+    // A busy screen app's calls included: they are records only at its end.
+    const seen = try e.agent.recentTools(arena, limit);
     var tools: std.ArrayList(Tool) = .empty;
-    var i = recs.len;
-    while (i > 0 and tools.items.len < limit) {
-        i -= 1;
-        const r = recs[i];
-        if (r.kind != .tool) continue;
-        const iso = if (r.at_ms > 0) try isoAt(arena, r.at_ms) else null;
-        try tools.append(arena, .{ .name = r.toolName(), .at = if (iso) |s| clock.isoTime(s) else null });
+    for (seen) |x| {
+        const iso = if (x.at_ms > 0) try isoAt(arena, x.at_ms) else null;
+        try tools.append(arena, .{ .name = x.name, .at = if (iso) |s| clock.isoTime(s) else null });
     }
-    std.mem.reverse(Tool, tools.items);
     const act_ms = e.agent.lastActivityMs();
     const st = e.agent.state();
     var res = Res.init(arena);

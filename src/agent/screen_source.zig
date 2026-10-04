@@ -714,6 +714,48 @@ pub const Engine = struct {
         try self.capture(false);
     }
 
+    /// A tool call of the newest turn as the screen shows it now.
+    pub const LiveTool = struct {
+        /// Its one-line summary (`Bash (ls)`), from `arena`.
+        text: []const u8,
+        /// The time of the record it already is, else 0.
+        at_ms: i64,
+    };
+
+    /// The newest turn's tool calls as the screen shows them now, read-only:
+    /// a turn is captured into records at its end, so a busy turn's calls
+    /// are on screen long before they are records.
+    /// @return null when the screen shows no turn.
+    pub fn liveTools(self: *const Engine, arena: std.mem.Allocator) !?[]const LiveTool {
+        var lines: std.ArrayList(Line) = .empty;
+        try lines.appendSlice(arena, self.hist.items);
+        try lines.appendSlice(arena, self.rows.items);
+        const recs = try grammar.parseRecords(arena, self.sc, lines.items);
+        var start: ?usize = null;
+        for (recs, 0..) |r, i| if (r.kind == .user) {
+            start = i;
+        };
+        const s = start orelse return null;
+        const turn = try grammar.dropStaleCopies(arena, recs[s..]);
+        // The records of that turn, if any were captured: their times.
+        const known: []const Record = if (self.turns.items.len > 0) self.records.items[self.turns.items[self.turns.items.len - 1].first..] else &.{};
+        var used = try arena.alloc(bool, known.len);
+        @memset(used, false);
+        var out: std.ArrayList(LiveTool) = .empty;
+        for (turn) |r| {
+            if (r.kind != .tool) continue;
+            var at: i64 = 0;
+            for (known, 0..) |k, i| {
+                if (used[i] or k.kind != .tool or !std.mem.eql(u8, k.text, r.text)) continue;
+                used[i] = true;
+                at = k.at_ms;
+                break;
+            }
+            try out.append(arena, .{ .text = r.text, .at_ms = at });
+        }
+        return out.items;
+    }
+
     /// Parse history + screen and fold the turns into `records`.
     /// @param complete the latest turn has ended (announce its messages).
     fn capture(self: *Engine, complete: bool) !void {
