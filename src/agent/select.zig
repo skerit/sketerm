@@ -51,6 +51,14 @@ pub const Detail = enum {
     selected,
     /// Every assistant message and notice (tools on request).
     all,
+    /// No records: what the agent is doing (agent_read's activity summary,
+    /// built from the records without selecting or handing out any).
+    activity,
+
+    /// Whether `select` takes it (`activity` never reaches it).
+    pub fn selects(self: Detail) bool {
+        return self != .activity;
+    }
 };
 
 /// Characters as a reader counts them: code points, bytes when not UTF-8.
@@ -336,6 +344,7 @@ pub fn select(alloc: std.mem.Allocator, records: []const Record, jobs: []const u
             const take = visible(r.kind, opts.include_tools) and switch (opts.detail) {
                 .selected => if (opts.final_only) i == last else r.kind != .assistant or i == last or substantive(r),
                 .all => true,
+                .activity => false,
             };
             if (take and handed != null and handed.?.has(r)) {
                 s.returned_before += 1;
@@ -377,6 +386,7 @@ pub fn select(alloc: std.mem.Allocator, records: []const Record, jobs: []const u
                 picked.shrinkRetainingCapacity(opts.limit);
             }
         },
+        .activity => {},
     }
     return .{
         .picked = try picked.toOwnedSlice(alloc),

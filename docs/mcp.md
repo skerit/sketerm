@@ -1358,7 +1358,15 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   read names the job with a `jobs[].earlier` pointer at it; with `since`
   the newest job above it, handed out or not; refused with `detail:
   "all"`. It replaces reading an app's own transcript files (opencode's
-  database, Claude Code's jsonl) for "what did it finally say". Record ids restart when
+  database, Claude Code's jsonl) for "what did it finally say".
+  `detail: "activity"` (`capabilities.agent_read_activity`) is a glance at
+  what the agent is doing, a few hundred bytes: `state`, `idle_s` and
+  `last_activity_at` (since the app last drew or sent anything), and
+  `tools`, the newest `limit` (default 10, at most 50) tool calls oldest
+  first as `name` + local `at` (`HH:MM:SS`), never their inputs or
+  outputs; `records`/`jobs`/`events` are empty, it takes no event and
+  hands no record out, and it refuses `since`, `final` and
+  `include_tools`. Record ids restart when
   a durable instance reattaches (the app's transcript is read again), so
   the handed-out state is not persisted: the first read after a reattach
   returns the selection again. The answer a `done` carries is the job's latest

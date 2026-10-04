@@ -104,6 +104,11 @@ pub fn isoClock(iso: []const u8) []const u8 {
     return if (iso.len == ISO_LEN) iso[11..16] else "";
 }
 
+/// The `HH:MM:SS` of an `isoLocal` stamp.
+pub fn isoTime(iso: []const u8) []const u8 {
+    return if (iso.len == ISO_LEN) iso[11..19] else "";
+}
+
 test "isoLocal writes local time with its offset, and isoClock its HH:MM" {
     const t = std.testing;
     var buf: [ISO_LEN]u8 = undefined;

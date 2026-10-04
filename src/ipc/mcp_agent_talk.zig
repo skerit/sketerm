@@ -97,6 +97,9 @@ const settledOf = mcp_agent_loop.settledOf;
 /// Records one agent_read returns by default, and at most.
 const READ_DEFAULT: usize = 100;
 const READ_MAX: usize = 500;
+/// agent_read detail "activity": tool calls listed by default, and at most.
+const ACTIVITY_DEFAULT: usize = 10;
+const ACTIVITY_MAX: usize = 50;
 
 // ── agent_send / agent_wait / agent_answer / agent_set / ... ─────
 
@@ -662,9 +665,10 @@ pub fn askTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]con
 
 pub fn readTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]const u8 {
     const detail = if (argStr(args, "detail")) |d|
-        std.meta.stringToEnum(select.Detail, d) orelse return errRes(arena, .invalid_args, "detail must be selected or all")
+        std.meta.stringToEnum(select.Detail, d) orelse return errRes(arena, .invalid_args, "detail must be one of: " ++ comptime enumList(select.Detail))
     else
         select.Detail.selected;
+    if (!detail.selects()) return activityRead(arena, args, e);
     const explicit = argInt(args, "since");
     // Only the newest job's last assistant message.
     const final = argBool(args, "final");
@@ -723,6 +727,66 @@ pub fn readTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]co
     try res.fact("more", sel.more);
     const blocks = [1]Block{.{ .name = "records", .body = body }};
     return finish(arena, &res, e, try pending(arena, e), .{}, blocks[0..@intFromBool(sel.jobs.len > 0)]);
+}
+
+/// `E`'s member names, comma-separated (an error naming the choices).
+fn enumList(comptime E: type) []const u8 {
+    var out: []const u8 = "";
+    for (std.meta.fieldNames(E), 0..) |n, i| out = out ++ (if (i > 0) ", " else "") ++ n;
+    return out;
+}
+
+/// agent_read detail "activity": the state, the time since the last
+/// activity and the newest `limit` tool calls as name + time. A glance:
+/// it takes no event and hands no record out.
+fn activityRead(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) ![]const u8 {
+    if (argBool(args, "final") or argInt(args, "since") != null or argBool(args, "include_tools"))
+        return errRes(arena, .invalid_args, "detail \"activity\" takes only limit (the tool calls to list)");
+    const limit: usize = @intCast(std.math.clamp(argInt(args, "limit") orelse ACTIVITY_DEFAULT, 1, ACTIVITY_MAX));
+    const Tool = struct { name: []const u8, at: ?[]const u8 };
+    const recs = e.agent.records();
+    var tools: std.ArrayList(Tool) = .empty;
+    var i = recs.len;
+    while (i > 0 and tools.items.len < limit) {
+        i -= 1;
+        const r = recs[i];
+        if (r.kind != .tool) continue;
+        const iso = if (r.at_ms > 0) try isoAt(arena, r.at_ms) else null;
+        try tools.append(arena, .{ .name = r.toolName(), .at = if (iso) |s| clock.isoTime(s) else null });
+    }
+    std.mem.reverse(Tool, tools.items);
+    const act_ms = e.agent.lastActivityMs();
+    const st = e.agent.state();
+    var res = Res.init(arena);
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    try w.print("{s} {s}", .{ e.id, @tagName(st) });
+    const last_at = if (act_ms > 0) try isoAt(arena, clock.wallOfMono(act_ms)) else null;
+    const idle_s: ?i64 = if (act_ms > 0) @divTrunc(@max(0, clock.nowMs() - act_ms), 1000) else null;
+    if (idle_s) |s| try w.print(", last activity {s} ({d}s ago)", .{ clock.isoTime(last_at orelse ""), s }) else try w.writeAll(", no activity yet");
+    try w.writeAll(if (tools.items.len == 0) "; no tool calls" else "; tools:");
+    for (tools.items) |t| try w.print(" {s} {s},", .{ t.name, t.at orelse "?" });
+    try res.text(std.mem.trimEnd(u8, aw.written(), ","));
+    // The keys every agent_read declares, kept small: no records, no
+    // events taken (a glance delivers nothing).
+    try res.fact("agent", e.id);
+    try res.fact("app", e.loaded.spec.id);
+    try res.fact("source", @tagName(e.agent.kind()));
+    try res.fact("state", @tagName(st));
+    try res.fact("ready", e.agent.ready());
+    try res.fact("session", e.session);
+    try res.fact("transport", @tagName(e.transport));
+    try res.raw("events", "[]");
+    try res.raw("records", "[]");
+    try res.raw("jobs", "[]");
+    try res.raw("cut_ids", "[]");
+    try res.fact("detail", @tagName(select.Detail.activity));
+    try res.fact("next_since", e.read_cursor);
+    try res.fact("more", false);
+    if (idle_s) |x| try res.fact("idle_s", x);
+    if (last_at) |x| try res.fact("last_activity_at", x);
+    try res.raw("tools", try toJson(arena, tools.items));
+    return res.finish();
 }
 
 pub fn listTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {

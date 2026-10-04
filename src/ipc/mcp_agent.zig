@@ -981,6 +981,24 @@ test "every agent tool answers in its declared shape: a scripted Claude Code on 
     try testing.expectEqualStrings("done", answered.get("outcome").?.string);
     try testing.expectEqualStrings("permission answered No", answered.get("message").?.string);
 
+    // The activity glance: state, last activity, the tool calls by name
+    // and time; small, and it hands nothing out.
+    const glance_raw = try rig.call(.agent_read, "{\"detail\":\"activity\"}");
+    const glance = try shaped(a, "agent_read", glance_raw);
+    try testing.expectEqualStrings("activity", glance.get("detail").?.string);
+    try testing.expectEqualStrings("idle", glance.get("state").?.string);
+    try testing.expectEqual(@as(usize, 0), glance.get("records").?.array.items.len);
+    const gtools = glance.get("tools").?.array.items;
+    try testing.expect(gtools.len >= 1);
+    try testing.expectEqualStrings("Bash", gtools[gtools.len - 1].object.get("name").?.string);
+    try testing.expectEqual(@as(usize, 8), gtools[gtools.len - 1].object.get("at").?.string.len);
+    try testing.expectEqual(@as(usize, clock.ISO_LEN), glance.get("last_activity_at").?.string.len);
+    try testing.expect(glance.get("idle_s").?.integer >= 0);
+    try testing.expect(glance_raw.len < 1200);
+    const one_tool = try shaped(a, "agent_read", try rig.call(.agent_read, "{\"detail\":\"activity\",\"limit\":1}"));
+    try testing.expectEqual(@as(usize, 1), one_tool.get("tools").?.array.items.len);
+    try expectError(a, "agent_read", try rig.call(.agent_read, "{\"detail\":\"activity\",\"since\":0}"), "invalid_args");
+
     // The model picker: agent_set returns only once the app confirmed the
     // change (it does so 400 ms after `s`), so the next call finds it idle.
     const before_set = (try shaped(a, "agent_read", try rig.call(.agent_read, "{}"))).get("next_since").?.integer;
