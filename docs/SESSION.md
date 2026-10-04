@@ -1,5 +1,26 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-04: agents on Macs and old daemons, opencode 2.x, agent visibility
+
+`agent_open` on a Mac failed to parse its start script: macOS `/bin/sh` is
+bash 3.2, which misreads a bare `pattern)` inside `$(...)`, so the unset-env
+wrapper's case arms now open with `(`. Terminal and agent spawns no longer
+refuse a daemon older than the lifetime fence (dalaran's v0.1.0, peregrin's
+June build): such a session is unfenced, rolled back and closed by its unique
+name, and reported as `lifetime_fenced: false`; spawn errors now say whether
+no daemon answered, one answered and refused (naming the step), or a deploy
+was impossible or failed. Packages ship an aarch64-macos portable mux beside
+the Linux one (`src/mux/portable.zig` is the one target table) and the deploy
+picks it by the remote `uname` in one check script, falling back to `shasum`.
+opencode 2.x moved its API under `/api/`: both generations are declared in
+`data/agents/opencode.json`, detected from the running server, translated in
+`opencode_dialect.zig`, and reported as `api_version`. Remote agents are now
+visible where they were started: `State.attention()` groups states into
+needs input / disconnected / working / idle, the registry publishes it with
+the server's pane session, `sketerm mcp agents` prints a line, compact or
+JSON summary for a statusline, and the GUI shows a chip in the pane titlebar,
+a count badge on the tab and a per-pane agent popover (`smoke-agents-gui`).
+
 ## 2026-10-04: agent tools: resume, answers, times, activity, selectors, optional TUI
 
 Resuming a huge opencode session no longer fails `TooLarge`: resume and a
