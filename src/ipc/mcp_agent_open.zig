@@ -39,6 +39,7 @@ const mcp_agent_results = @import("mcp_agent_results.zig");
 const mcp_agent_waiter = @import("mcp_agent_waiter.zig");
 const mcp_agent_index = @import("mcp_agent_index.zig");
 const mcp_agent_act = @import("mcp_agent_act.zig");
+const mcp_agent_loop = @import("mcp_agent_loop.zig");
 
 const DEFAULT_WAIT_MS = mcp_agent.DEFAULT_WAIT_MS;
 const ATTACH_WAIT_MS = mcp_agent.ATTACH_WAIT_MS;
@@ -55,11 +56,6 @@ const localHost = mcp_agent.localHost;
 const envValue = mcp_agent.envValue;
 const statusCommandOf = mcp_agent.statusCommandOf;
 const statusOf = mcp_agent.statusOf;
-const spawnForward = mcp_agent.spawnForward;
-const foldHistory = mcp_agent.foldHistory;
-const pumpFor = mcp_agent.pumpFor;
-const gone = mcp_agent.gone;
-const waitReady = mcp_agent.waitReady;
 const Fail = mcp_agent.Fail;
 const filterFrom = mcp_agent.filterFrom;
 const deadlineFrom = mcp_agent.deadlineFrom;
@@ -85,6 +81,11 @@ const submitAndWait = mcp_agent_act.submitAndWait;
 const Requeued = mcp_agent_act.Requeued;
 const sendFailRes = mcp_agent_act.sendFailRes;
 const applySet = mcp_agent_act.applySet;
+const spawnForward = mcp_agent_loop.spawnForward;
+const foldHistory = mcp_agent_loop.foldHistory;
+const pumpFor = mcp_agent_loop.pumpFor;
+const gone = mcp_agent_loop.gone;
+const waitReady = mcp_agent_loop.waitReady;
 
 /// Bound on an API server's port starting to listen.
 const PORT_WAIT_MS: i64 = 20_000;

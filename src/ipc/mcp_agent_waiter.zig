@@ -16,6 +16,7 @@ const pathz = @import("../util/pathz.zig");
 
 const mcp_agent = @import("mcp_agent.zig");
 const mcp_agent_results = @import("mcp_agent_results.zig");
+const mcp_agent_loop = @import("mcp_agent_loop.zig");
 
 const WAITER_SOCKET = mcp_agent.WAITER_SOCKET;
 const INSTRUCTIONS = mcp_agent.INSTRUCTIONS;
@@ -25,11 +26,11 @@ const isHeld = mcp_agent.isHeld;
 const state = &mcp_agent.state;
 const findByName = mcp_agent.findByName;
 const findById = mcp_agent.findById;
-const pollFds = mcp_agent.pollFds;
-const service = mcp_agent.service;
-const settleOf = mcp_agent.settleOf;
-const settledOf = mcp_agent.settledOf;
 const conversationOf = mcp_agent_results.conversationOf;
+const pollFds = mcp_agent_loop.pollFds;
+const service = mcp_agent_loop.service;
+const settleOf = mcp_agent_loop.settleOf;
+const settledOf = mcp_agent_loop.settledOf;
 
 const MAX_SUBS = 32;
 

@@ -16,13 +16,14 @@ const Res = mcp.Res;
 const mcp_agent = @import("mcp_agent.zig");
 const mcp_agent_hosts = @import("mcp_agent_hosts.zig");
 const mcp_agent_waiter = @import("mcp_agent_waiter.zig");
+const mcp_agent_loop = @import("mcp_agent_loop.zig");
 
 const Entry = mcp_agent.Entry;
 const state = &mcp_agent.state;
-const gone = mcp_agent.gone;
 const factsOf = mcp_agent_hosts.factsOf;
 const pushing = mcp_agent_waiter.pushing;
 const rememberFilter = mcp_agent_waiter.rememberFilter;
+const gone = mcp_agent_loop.gone;
 
 // ── results ──────────────────────────────────────────────────────
 

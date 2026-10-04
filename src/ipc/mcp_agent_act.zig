@@ -23,6 +23,7 @@ const mcp_agent = @import("mcp_agent.zig");
 const mcp_agent_results = @import("mcp_agent_results.zig");
 const mcp_agent_index = @import("mcp_agent_index.zig");
 const mcp_agent_open = @import("mcp_agent_open.zig");
+const mcp_agent_loop = @import("mcp_agent_loop.zig");
 
 const STEP_WAIT_MS = mcp_agent.STEP_WAIT_MS;
 const INTERRUPT_SETTLE_MS = mcp_agent.INTERRUPT_SETTLE_MS;
@@ -31,16 +32,6 @@ const Entry = mcp_agent.Entry;
 const QueuedPrompt = mcp_agent.QueuedPrompt;
 const state = &mcp_agent.state;
 const statusOf = mcp_agent.statusOf;
-const service = mcp_agent.service;
-const closeHistory = mcp_agent.closeHistory;
-const pump = mcp_agent.pump;
-const pumpFor = mcp_agent.pumpFor;
-const gone = mcp_agent.gone;
-const waitReady = mcp_agent.waitReady;
-const waitDelivery = mcp_agent.waitDelivery;
-const waitStep = mcp_agent.waitStep;
-const waitSideAsked = mcp_agent.waitSideAsked;
-const waitSideAnswer = mcp_agent.waitSideAnswer;
 const Fail = mcp_agent.Fail;
 const Delivered = mcp_agent_results.Delivered;
 const combine = mcp_agent_results.combine;
@@ -52,6 +43,16 @@ const newUuid = mcp_agent_open.newUuid;
 const record = mcp_agent_open.record;
 const SpawnSpec = mcp_agent_open.SpawnSpec;
 const spawnOn = mcp_agent_open.spawnOn;
+const service = mcp_agent_loop.service;
+const closeHistory = mcp_agent_loop.closeHistory;
+const pump = mcp_agent_loop.pump;
+const pumpFor = mcp_agent_loop.pumpFor;
+const gone = mcp_agent_loop.gone;
+const waitReady = mcp_agent_loop.waitReady;
+const waitDelivery = mcp_agent_loop.waitDelivery;
+const waitStep = mcp_agent_loop.waitStep;
+const waitSideAsked = mcp_agent_loop.waitSideAsked;
+const waitSideAnswer = mcp_agent_loop.waitSideAnswer;
 
 /// Pause after the keys that clear an input box: an Escape followed at
 /// once by text reads as Alt+key to the app.

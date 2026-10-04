@@ -36,6 +36,7 @@ const mcp_agent_results = @import("mcp_agent_results.zig");
 const mcp_agent_waiter = @import("mcp_agent_waiter.zig");
 const mcp_agent_act = @import("mcp_agent_act.zig");
 const mcp_agent_open = @import("mcp_agent_open.zig");
+const mcp_agent_loop = @import("mcp_agent_loop.zig");
 
 const DEFAULT_WAIT_MS = mcp_agent.DEFAULT_WAIT_MS;
 const ATTACH_WAIT_MS = mcp_agent.ATTACH_WAIT_MS;
@@ -47,10 +48,6 @@ const adapters = mcp_agent.adapters;
 const findByName = mcp_agent.findByName;
 const lockPath = mcp_agent.lockPath;
 const findById = mcp_agent.findById;
-const goneDetail = mcp_agent.goneDetail;
-const spawnForward = mcp_agent.spawnForward;
-const gone = mcp_agent.gone;
-const waitReady = mcp_agent.waitReady;
 const Fail = mcp_agent.Fail;
 const deadlineFrom = mcp_agent.deadlineFrom;
 const Block = mcp_agent_results.Block;
@@ -66,6 +63,10 @@ const LaunchFacts = mcp_agent_open.LaunchFacts;
 const newEntry = mcp_agent_open.newEntry;
 const dropBare = mcp_agent_open.dropBare;
 const sshDiagnose = mcp_agent_open.sshDiagnose;
+const goneDetail = mcp_agent_loop.goneDetail;
+const spawnForward = mcp_agent_loop.spawnForward;
+const gone = mcp_agent_loop.gone;
+const waitReady = mcp_agent_loop.waitReady;
 
 /// Legacy descriptors (durable instances before the per-user index) live
 /// here, in the instance dir.
