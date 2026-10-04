@@ -868,7 +868,7 @@ test "selectors name agents by host and state; agent_close takes several, and ex
         ag.* = try agent_mod.Agent.initScreen(state.allocator, set.get("claude").?, .{});
         e.agent = ag;
         e.visible = .{ .borrowed = 4242 };
-        if (i == 1) e.host = try state.allocator.dupe(u8, "box");
+        if (i == 1) e.host = try state.allocator.dupe(u8, "box.invalid");
         try state.entries.append(state.allocator, e);
         ags[i] = ag;
     }
@@ -877,7 +877,7 @@ test "selectors name agents by host and state; agent_close takes several, and ex
     for (state.entries.items) |e| _ = try e.cursor.take(e.agent.queue(), .{}, clock.nowMs(), a);
 
     _ = try ags[1].source.screen.queue.push(clock.nowMs(), .needs_input, null, "permission: z", "");
-    const on_box = try shaped(a, "agent_wait", try rig.call(.agent_wait, "{\"agents\":\"host:box\",\"timeout_ms\":0}"));
+    const on_box = try shaped(a, "agent_wait", try rig.call(.agent_wait, "{\"agents\":\"host:box.invalid\",\"timeout_ms\":0}"));
     try testing.expectEqual(@as(usize, 1), on_box.get("agents").?.array.items.len);
     try testing.expectEqualStrings("claude-2", on_box.get("agents").?.array.items[0].string);
     // An unknown state fails closed, naming the states; no match is not_found.
@@ -886,8 +886,29 @@ test "selectors name agents by host and state; agent_close takes several, and ex
     try expectError(a, "agent_wait", try rig.call(.agent_wait, "{\"agents\":\"host:nowhere\"}"), "not_found");
     try expectError(a, "agent_close", try rig.call(.agent_close, "{\"agents\":\"everything\"}"), "invalid_args");
 
-    // Several at once by selector: the one on box.
-    const boxed = try shaped(a, "agent_close", try rig.call(.agent_close, "{\"agents\":\"host:box\"}"));
+    // agent_list: gone agents are counted, not listed, unless asked for;
+    // state and host filter through the same grammar.
+    const plain_raw = try rig.call(.agent_list, "{}");
+    const plain = try shaped(a, "agent_list", plain_raw);
+    try testing.expectEqual(@as(i64, 2), plain.get("count").?.integer);
+    try testing.expectEqual(@as(i64, 1), plain.get("exited_hidden").?.integer);
+    try testing.expectEqual(@as(usize, 0), plain.get("gone").?.array.items.len);
+    const with_gone = try shaped(a, "agent_list", try rig.call(.agent_list, "{\"include_exited\":true}"));
+    try testing.expectEqual(@as(i64, 3), with_gone.get("count").?.integer);
+    try testing.expectEqualStrings("claude-3", with_gone.get("gone").?.array.items[0].object.get("agent").?.string);
+    const only_gone = try shaped(a, "agent_list", try rig.call(.agent_list, "{\"state\":\"exited\",\"detail\":true}"));
+    try testing.expectEqual(@as(usize, 1), only_gone.get("agents").?.array.items.len);
+    try testing.expectEqualStrings("claude-3", only_gone.get("agents").?.array.items[0].object.get("agent").?.string);
+    const boxed_list = try shaped(a, "agent_list", try rig.call(.agent_list, "{\"host\":\"box.invalid\"}"));
+    try testing.expectEqual(@as(usize, 1), boxed_list.get("agents").?.array.items.len);
+    try testing.expectEqualStrings("claude-2", boxed_list.get("agents").?.array.items[0].object.get("agent").?.string);
+    const local_list = try shaped(a, "agent_list", try rig.call(.agent_list, "{\"host\":\"local\",\"detail\":true}"));
+    try testing.expectEqual(@as(usize, 1), local_list.get("agents").?.array.items.len);
+    try testing.expectEqual(@as(i64, 1), local_list.get("exited_hidden").?.integer);
+    try expectError(a, "agent_list", try rig.call(.agent_list, "{\"state\":\"busy\"}"), "invalid_args");
+
+    // Several at once by selector: the one on box.invalid.
+    const boxed = try shaped(a, "agent_close", try rig.call(.agent_close, "{\"agents\":\"host:box.invalid\"}"));
     const br = boxed.get("results").?.array.items;
     try testing.expectEqual(@as(usize, 1), br.len);
     try testing.expectEqualStrings("claude-2", br[0].object.get("agent").?.string);

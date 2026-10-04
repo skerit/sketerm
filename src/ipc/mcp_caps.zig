@@ -499,6 +499,7 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
         try res.fact("agent_wall_times", agents_ok);
         try res.fact("agent_read_activity", agents_ok);
         try res.fact("agent_close_many", agents_ok);
+        try res.fact("agent_list_filters", agents_ok);
         try res.fact("agent_selectors", @import("../agent/selector.zig").FORMS);
         try res.fact("agent_hosts", agents_ok);
         try res.fact("agent_caps", .{ .max_per_host = mcp_agent.state.max_per_host, .min_free_mb = mcp_agent.state.min_free_mb });

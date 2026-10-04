@@ -11,6 +11,7 @@ const select = @import("../agent/select.zig");
 const launch = @import("../agent/launch.zig");
 const opencode = @import("../agent/opencode.zig");
 const output = @import("../agent/output.zig");
+const selector = @import("../agent/selector.zig");
 const retry_mod = @import("../agent/retry.zig");
 const clock = @import("../util/clock.zig");
 const agentindex = @import("agentindex.zig");
@@ -794,7 +795,18 @@ pub fn listTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
     // One bounded read of every host, for `hosts` and for remote facts.
     const until = clock.nowMs() + HOST_LIST_WAIT_MS;
     _ = try readHosts(arena, until);
-    if (!argBool(args, "detail")) return listCompact(arena, until);
+    const filter = switch (try listFilter(arena, args)) {
+        .ok => |f| f,
+        .fail => |why| return errRes(arena, .invalid_args, why),
+    };
+    var shown: std.ArrayList(*Entry) = .empty;
+    var hidden: usize = 0;
+    for (state.entries.items) |e| switch (filter.shows(e)) {
+        .yes => try shown.append(arena, e),
+        .hidden => hidden += 1,
+        .no => {},
+    };
+    if (!argBool(args, "detail")) return listCompact(arena, until, shown.items, hidden);
     const Item = struct {
         agent: []const u8,
         name: ?[]const u8,
@@ -828,12 +840,13 @@ pub fn listTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
         facts: ?std.json.Value,
         facts_unknown: ?[]const u8,
     };
-    const items = try arena.alloc(Item, state.entries.items.len);
+    const items = try arena.alloc(Item, shown.items.len);
     var res = Res.init(arena);
     try res.textf("{d} agent(s)", .{items.len});
+    try hiddenLine(&res, hidden);
     const wall = clock.wallMs();
     const mono = clock.nowMs();
-    for (state.entries.items, items) |e, *out| {
+    for (shown.items, items) |e, *out| {
         var model: ?[]const u8 = e.picked_model orelse e.launch_model;
         var effort: ?[]const u8 = e.launch_effort;
         switch (e.agent.source) {
@@ -890,13 +903,53 @@ pub fn listTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
     try hostsReport(arena, &res, until);
     try res.raw("agents", try toJson(arena, items));
     try res.fact("count", items.len);
+    try res.fact("exited_hidden", hidden);
     try res.fact("detail", true);
     return res.finish();
 }
 
+/// agent_list's filters (`state`, `host`: the selector grammar's own
+/// parse) and whether gone (exited) agents show.
+const ListFilter = struct {
+    state: ?selector.Selector = null,
+    host: ?selector.Selector = null,
+    include_exited: bool = false,
+
+    const Shows = enum { yes, no, hidden };
+
+    /// `hidden`: a gone agent the filters take, left out only because
+    /// include_exited is off (counted, never listed).
+    fn shows(self: ListFilter, e: *const Entry) Shows {
+        const a: selector.Selector.Agent = .{ .host = e.host, .state = e.agent.state() };
+        if (self.state) |x| if (!x.matchesAny(a)) return .no;
+        if (self.host) |x| if (!x.matchesAny(a)) return .no;
+        if (!gone(e) or self.include_exited) return .yes;
+        if (self.state) |x| if (x.takesExited()) return .yes;
+        return .hidden;
+    }
+};
+
+fn listFilter(arena: std.mem.Allocator, args: std.json.Value) !union(enum) { ok: ListFilter, fail: []const u8 } {
+    var f: ListFilter = .{ .include_exited = argBool(args, "include_exited") };
+    if (argStr(args, "state")) |v| f.state = switch (try selector.stateOf(arena, v)) {
+        .ok => |x| x,
+        .err => |why| return .{ .fail = why },
+    };
+    if (argStr(args, "host")) |v| f.host = switch (try selector.hostOf(arena, v)) {
+        .ok => |x| x,
+        .err => |why| return .{ .fail = why },
+    };
+    return .{ .ok = f };
+}
+
+/// The line saying how many gone agents the list left out.
+fn hiddenLine(res: *Res, hidden: usize) !void {
+    if (hidden > 0) try res.textf("{d} gone (exited) agent(s) not listed: include_exited:true lists them (agent_close exited:true forgets them)", .{hidden});
+}
+
 /// agent_list's default: what an orchestrator of many agents scans each
 /// turn (with 17 agents the full facts cost ~5k tokens), one line each.
-fn listCompact(arena: std.mem.Allocator, until: i64) ![]const u8 {
+fn listCompact(arena: std.mem.Allocator, until: i64, shown: []const *Entry, hidden: usize) ![]const u8 {
     const Pending = struct { kind: []const u8, title: []const u8 };
     const Item = struct {
         agent: []const u8,
@@ -924,12 +977,13 @@ fn listCompact(arena: std.mem.Allocator, until: i64) ![]const u8 {
     const Gone = struct { agent: []const u8, name: ?[]const u8, relaunchable: bool };
     var gone_list: std.ArrayList(Gone) = .empty;
     var running: std.ArrayList(*Entry) = .empty;
-    for (state.entries.items) |e| {
+    for (shown) |e| {
         if (gone(e)) try gone_list.append(arena, .{ .agent = e.id, .name = e.name, .relaunchable = e.ended_ms > 0 }) else try running.append(arena, e);
     }
     const items = try arena.alloc(Item, running.items.len);
     var res = Res.init(arena);
-    try res.textf("{d} agent(s){s}", .{ state.entries.items.len, if (gone_list.items.len > 0) try std.fmt.allocPrint(arena, ", {d} of them gone", .{gone_list.items.len}) else "" });
+    try res.textf("{d} agent(s){s}", .{ shown.len, if (gone_list.items.len > 0) try std.fmt.allocPrint(arena, ", {d} of them gone", .{gone_list.items.len}) else "" });
+    try hiddenLine(&res, hidden);
     const mono = clock.nowMs();
     for (running.items, items) |e, *out| {
         const act_ms = e.agent.lastActivityMs();
@@ -977,13 +1031,14 @@ fn listCompact(arena: std.mem.Allocator, until: i64) ![]const u8 {
             if (g.name) |n| try w.print(" ({s})", .{n});
             if (g.relaunchable) try w.writeAll(" relaunchable");
         }
-        try w.writeAll(" (agent_attach {agent, relaunch: true} starts a relaunchable one again; agent_close forgets one)");
+        try w.writeAll(" (agent_attach with relaunch: true starts a relaunchable one again; agent_close forgets one)");
         try res.text(aw.written());
     }
     try hostsReport(arena, &res, until);
     try res.raw("agents", try toJson(arena, items));
     try res.raw("gone", try toJson(arena, gone_list.items));
-    try res.fact("count", state.entries.items.len);
+    try res.fact("count", shown.len);
+    try res.fact("exited_hidden", hidden);
     try res.fact("detail", false);
     return res.finish();
 }

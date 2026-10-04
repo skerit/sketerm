@@ -40,11 +40,22 @@ pub const Selector = union(enum) {
     };
 
     pub fn matches(self: Selector, a: Agent) bool {
+        return self.matchesAny(a) and (self.takesExited() or a.state != .exited);
+    }
+
+    /// Whether `a` fits, exited or not (agent_list filters; `matches` adds
+    /// the liveness).
+    pub fn matchesAny(self: Selector, a: Agent) bool {
         return switch (self) {
-            .every => a.state != .exited,
-            .host => |h| a.state != .exited and if (h) |want| (if (a.host) |got| std.mem.eql(u8, got, want) else false) else a.host == null,
+            .every => true,
+            .host => |h| if (h) |want| (if (a.host) |got| std.mem.eql(u8, got, want) else false) else a.host == null,
             .state => |s| a.state == s,
         };
+    }
+
+    /// It names exited agents too (only `state:exited` does).
+    pub fn takesExited(self: Selector) bool {
+        return self == .state and self.state == .exited;
     }
 };
 

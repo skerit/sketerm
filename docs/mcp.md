@@ -1122,9 +1122,10 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   a failure stops it and is `requeue_failed` (`code`, `message`,
   `not_requeued`). Nothing the app held from elsewhere is ever typed
   (`capabilities.agent_send_requeue`). `agents: [...]` (instead of `agent`, at most
-  32 ids or names; `agents: "*"` is every live agent of this server,
-  `capabilities.agent_agents_every`, and with none live, more than 32 or
-  any other string it is an error) sends the same text to each in one call: with
+  32 ids or names, or a selector string, see Selectors: `agents: "*"` is
+  every live agent of this server, `capabilities.agent_agents_every`;
+  one matching none, more than 32 or a string that is no selector is an
+  error) sends the same text to each in one call: with
   `interrupt` every busy one is interrupted at once, then each gets the
   prompt; the call does not wait for the turns and answers with
   `results`, one per agent named (`outcome` sent, queued, still_working
@@ -1760,15 +1761,31 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   that many live agents of this server or with less memory available; a
   host whose memory is unknown is not refused, and the result's notes say
   the cap was not checked.
-- **Gone agents in `agent_list`.** Compact, every gone agent of this server
-  shares ONE line (`gone: claude-qx9z (claude-8) relaunchable, ...`) and
-  the `gone` fact (`agent`, `name`, `relaunchable`) instead of a full entry
-  each; `count` still counts them, and `detail: true` lists them in full.
+- **Gone agents in `agent_list`.** By default they are left out and only
+  counted (`exited_hidden`, one line). With `include_exited: true` (or
+  `state: "exited"`), compact, every gone agent shown shares ONE line
+  (`gone: claude-qx9z (claude-8) relaunchable, ...`) and the `gone` fact
+  (`agent`, `name`, `relaunchable`) instead of a full entry each, and
+  `detail: true` lists them in full.
   `agent_open name:` that a gone agent holds is a `conflict` naming that
   agent: `agent_attach {agent, relaunch: true}` starts it again under the
   name, `agent_close {agent}` forgets it (also for a gone agent only the
   index still knows, unless another live server holds it) and frees the
   name. `resume` never takes a gone entry over by itself.
+- **Selectors (`capabilities.agent_selectors`).** ONE grammar names a
+  set of agents by what they are (`src/agent/selector.zig`, the only
+  place it is parsed): `"*"` every live agent of this server (any state
+  but `exited`); `"host:<name>"` the live agents on that SSH host,
+  `host:local` the ones on this machine; `"state:<state>"` the agents
+  in that state, one of the `vocab.State` names (`starting working
+  waiting_subagent waiting_background waiting_user retrying idle exited
+  disconnected`), `state:exited` the gone ones. Anything else, an
+  unknown state included, fails closed (`invalid_args`) naming what is
+  accepted; a selector that matches none is `not_found` listing this
+  server's agents with their states and hosts. `agent_send`,
+  `agent_wait` and `agent_close` take one as their `agents` string;
+  `agent_list`'s `state` and `host` filters go through the same parse
+  (both given: both must hold).
 - **Closing in batches (`capabilities.agent_close_many`).** `agent_close
   agents: [...]` (ids or names, at most 32) or `agents: "<selector>"`
   (see Selectors) closes each, and `exited: true` (without `agent` or
@@ -1797,6 +1814,10 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   (opencode adds its server's), `started_ms` (kept across a durable
   reattach), `last_activity_ms` (the app last drew or sent anything; both
   Unix ms), `queued_prompts`, `pending_events` and `recordings`.
+  Both forms take `state` and `host` (Selectors) and leave gone
+  (exited) agents out unless `include_exited: true` (or `state:
+  "exited"`): they are only counted, `exited_hidden`, with one line
+  saying so; `count` is the agents the list names.
 - **`agent_attach`** with `agent` resumes an agent (above); with `term`
   and `app` it puts a screen adapter on a terminal `term_open` created
   (you started the app yourself), `attach: "adapter"`, and `agent_close`

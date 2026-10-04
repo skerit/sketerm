@@ -7618,8 +7618,10 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
             fail("agent_list compact: wrong facts");
         const full = agentCall(&m, arena, "agent_list", "{\"detail\":true}", "agent_list detail", false, 15_000);
         if (full.get("agents").?.array.items[0].object.get("recordings") == null) fail("agent_list detail: no recordings");
-        _ = agentCall(&m, arena, "agent_close", "{\"agent\":\"fan-a\"}", "agent_close fan-a", false, 15_000);
-        _ = agentCall(&m, arena, "agent_close", "{\"agent\":\"fan-b\"}", "agent_close fan-b", false, 15_000);
+        // Both in one call, by selector: every live agent here.
+        const shut = agentCall(&m, arena, "agent_close", "{\"agents\":\"*\"}", "agent_close agents *", false, 15_000);
+        if (shut.get("count").?.integer != 2 or shut.get("failed").?.integer != 0) fail("agent_close agents *: not both closed");
+        for (shut.get("results").?.array.items) |r| if (r.object.get("sessions").?.array.items.len == 0) fail("agent_close agents *: a session was not killed");
 
         // term_open exec_shell: term_exec's shell unless a call names one.
         _ = agentCall(&m, arena, "term_open", "{\"exec_shell\":\"bash;x\"}", "term_open bad exec_shell", true, 15_000);
@@ -8892,12 +8894,16 @@ fn agentSshStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u
         if (!ended.get("relaunchable").?.bool) fail("gone: not relaunchable");
         if (eventKinds(ended, "exited") != 1) fail("gone: not exactly one exited event");
         // Compact: the gone agent is on the one gone line, not a full entry.
-        const listed = agentCall(&m, arena, "agent_list", "{}", "gone: agent_list", false, 15_000);
+        // By default a gone agent is only counted; include_exited lists it.
+        const hiding = agentCall(&m, arena, "agent_list", "{}", "gone: agent_list default", false, 15_000);
+        if (hiding.get("agents").?.array.items.len != 0 or hiding.get("gone").?.array.items.len != 0 or hiding.get("exited_hidden").?.integer != 1)
+            fail("gone: the default agent_list does not leave the gone agent out as a count");
+        const listed = agentCall(&m, arena, "agent_list", "{\"include_exited\":true}", "gone: agent_list", false, 15_000);
         if (listed.get("agents").?.array.items.len != 0) fail("gone: compact agent_list still lists the gone agent in full");
         const gone_item = listed.get("gone").?.array.items[0].object;
         if (!std.mem.eql(u8, gone_item.get("name").?.string, "claude-gone") or !gone_item.get("relaunchable").?.bool)
             fail("gone: compact agent_list's gone line does not name it relaunchable");
-        const listed_full = agentCall(&m, arena, "agent_list", "{\"detail\":true}", "gone: agent_list detail", false, 15_000);
+        const listed_full = agentCall(&m, arena, "agent_list", "{\"detail\":true,\"include_exited\":true}", "gone: agent_list detail", false, 15_000);
         const item = listed_full.get("agents").?.array.items[0].object;
         if (!std.mem.eql(u8, item.get("state").?.string, "exited") or !item.get("relaunchable").?.bool or !std.mem.eql(u8, item.get("gone_reason").?.string, "closed"))
             fail("gone: agent_list detail does not say exited, relaunchable, closed");
@@ -8941,7 +8947,7 @@ fn agentSshStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u
         {
             const until = nowMs() + 30_000;
             while (true) {
-                const l = agentCall(&m, arena, "agent_list", "{\"detail\":true}", "gone: agent_list after the reboot", false, 15_000);
+                const l = agentCall(&m, arena, "agent_list", "{\"detail\":true,\"include_exited\":true}", "gone: agent_list after the reboot", false, 15_000);
                 var oc_exited = false;
                 for (l.get("agents").?.array.items) |it| {
                     if (std.mem.eql(u8, it.object.get("agent").?.string, oc_id) and std.mem.eql(u8, it.object.get("state").?.string, "exited")) oc_exited = true;
