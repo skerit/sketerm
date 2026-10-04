@@ -34,6 +34,7 @@ const argBool = mcp.argBool;
 const mcp_agent = @import("mcp_agent.zig");
 const mcp_agent_results = @import("mcp_agent_results.zig");
 const mcp_agent_waiter = @import("mcp_agent_waiter.zig");
+const mcp_agent_act = @import("mcp_agent_act.zig");
 
 const DEFAULT_WAIT_MS = mcp_agent.DEFAULT_WAIT_MS;
 const ATTACH_WAIT_MS = mcp_agent.ATTACH_WAIT_MS;
@@ -58,12 +59,12 @@ const LaunchFacts = mcp_agent.LaunchFacts;
 const newEntry = mcp_agent.newEntry;
 const dropBare = mcp_agent.dropBare;
 const sshDiagnose = mcp_agent.sshDiagnose;
-const applySet = mcp_agent.applySet;
 const Block = mcp_agent_results.Block;
 const pending = mcp_agent_results.pending;
 const finish = mcp_agent_results.finish;
 const writeSelection = mcp_agent_results.writeSelection;
 const endWaitersOf = mcp_agent_waiter.endWaitersOf;
+const applySet = mcp_agent_act.applySet;
 
 /// Legacy descriptors (durable instances before the per-user index) live
 /// here, in the instance dir.
@@ -781,8 +782,8 @@ fn unreachableResult(arena: std.mem.Allocator, d: Descriptor, why: *const Attach
 
 const testing = std.testing;
 const mcp_agent_testkit = @import("mcp_agent_testkit.zig");
-const restartOf = mcp_agent.restartOf;
 const ToolRig = mcp_agent_testkit.ToolRig;
+const restartOf = mcp_agent_act.restartOf;
 
 test "a relaunch and a durable descriptor keep the caller's args and env" {
     var rig: ToolRig = undefined;
