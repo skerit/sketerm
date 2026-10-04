@@ -791,26 +791,16 @@ pub fn infoOfPid(pid: c.pid_t) ?ProcessInfo {
 }
 
 /// The parent of a live process; null when it is gone or cannot be read.
-/// macOS reads `kinfo_proc.kp_eproc.e_ppid` from `sysctl` KERN_PROC_PID at its
-/// LP64 offset (the struct is not in our headers), unverified on hardware.
 pub fn parentOf(pid: c.pid_t) ?c.pid_t {
     if (pid <= 0) return null;
     if (is_macos) {
-        const CTL_KERN: c_int = 1;
-        const KERN_PROC: c_int = 14;
-        const KERN_PROC_PID: c_int = 1;
-        // sizeof(struct kinfo_proc) and offsetof(kp_eproc.e_ppid) on LP64:
-        // extern_proc (296) + e_paddr, e_sess (16) + _pcred (104) +
-        // _ucred (76) + padding (4) + vmspace (64).
-        const KINFO_PROC_SIZE = 648;
-        const E_PPID_OFFSET = 560;
-        var mib = [4]c_int{ CTL_KERN, KERN_PROC, KERN_PROC_PID, pid };
-        var buf: [KINFO_PROC_SIZE]u8 align(8) = undefined;
-        var len: usize = buf.len;
-        if (sysctl(&mib, mib.len, &buf, &len, null, 0) != 0) return null;
+        var mib = [4]c_int{ c.CTL_KERN, c.KERN_PROC, c.KERN_PROC_PID, pid };
+        var info: c.struct_kinfo_proc = undefined;
+        var len: usize = @sizeOf(c.struct_kinfo_proc);
+        if (sysctl(&mib, mib.len, &info, &len, null, 0) != 0) return null;
         // A pid that does not exist answers 0 bytes, not an error.
-        if (len < E_PPID_OFFSET + @sizeOf(c.pid_t)) return null;
-        return std.mem.readInt(i32, buf[E_PPID_OFFSET..][0..4], builtin.cpu.arch.endian());
+        if (len < @sizeOf(c.struct_kinfo_proc)) return null;
+        return info.kp_eproc.e_ppid;
     }
     var stat_buf: [2048]u8 = undefined;
     const fields = parseProcStat(readProcBlock(pid, "stat", &stat_buf) orelse return null) orelse return null;

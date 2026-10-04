@@ -362,7 +362,23 @@ pub fn build(b: *std.Build) void {
     portable_opts.addOption(bool, "audio_opus", false);
     portable_opts.addOption(bool, "dmabuf_import", false);
     portable_opts.addOption(bool, "webm_rec", false);
-    mux_portable_mod.addImport("build_options", portable_opts.createModule());
+    const portable_opts_mod = portable_opts.createModule();
+    mux_portable_mod.addImport("build_options", portable_opts_mod);
+    // The OS-specific process primitives (`platform.parentOf` and the
+    // `sketerm mcp agents` walk over it) compiled for the portable target,
+    // like atomicwrite above; nothing the daemon links reaches them.
+    const portable_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/tests_portable.zig"),
+        .target = portable_target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    configureShippableCoreDeps(b, portable_test_mod, portable_cbindings);
+    portable_test_mod.addImport("build_options", portable_opts_mod);
+    const portable_tests = b.addTest(.{
+        .root_module = portable_test_mod,
+        .use_lld = portable_target.result.os.tag == .linux,
+    });
     const mux_portable_exe = b.addExecutable(.{
         // Linux keeps `sketerm-mux-portable`; other OSes get a suffixed
         // name so a macOS cross build never clobbers the Linux artifact.
@@ -378,6 +394,11 @@ pub fn build(b: *std.Build) void {
         "Build a baseline-CPU sketerm-mux (static musl on Linux) for remote deployment",
     );
     mux_portable_step.dependOn(&atomicwrite_portable_tests.step);
+    mux_portable_step.dependOn(&portable_tests.step);
+    // `zig build portable-tests -Dportable-target=...` installs that test
+    // binary to copy onto the target and run there.
+    const portable_tests_step = b.step("portable-tests", "Install the -Dportable-target test binary (platform + agents walk) to run on that target");
+    portable_tests_step.dependOn(&b.addInstallArtifact(portable_tests, .{ .dest_sub_path = b.fmt("sketerm-portable-tests-{s}", .{portable_triple}) }).step);
     mux_portable_step.dependOn(&b.addInstallArtifact(mux_portable_exe, .{}).step);
 
     // Mux end-to-end smoke — `zig build smoke-mux` (headless).

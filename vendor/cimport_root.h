@@ -119,6 +119,7 @@
  * only ever builds natively against the real SDK (as <util.h> above
  * already assumes), so take the header and let it define the truth. */
 #include <sys/event.h>
+#include <sys/sysctl.h>  /* platform.parentOf: kinfo_proc.kp_eproc.e_ppid */
 #endif
 /* Extended attributes (fsserve: user.sketerm.tags file tags).
  * Both glibc/musl and Darwin ship <sys/xattr.h>; the FUNCTIONS
