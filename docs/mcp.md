@@ -1146,7 +1146,10 @@ on a free loopback port, read over its HTTP API and SSE stream, with
   Escapes that would interrupt, and `screen.queued` marks the preview
   live, never a record; an idle app still showing one is not done; an
   `agent_interrupt` throws Claude Code's queue away with the turn, and its
-  result says how many prompts went as `queued_dropped`);
+  result says how many prompts went as `queued_dropped`; the ones THIS
+  server had queued are typed again once it stopped, in their order, and
+  listed as `requeued` / `requeue_failed` exactly as for `agent_send
+  interrupt`, `capabilities.agent_interrupt_requeue`);
   opencode (oc11) answers `prompt_async` on a busy session with 204,
   creates the user message at once and runs it after the current answer
   (its records keep the job of the prompt they answer, by `parentID`). A

@@ -584,18 +584,24 @@ pub fn interruptTool(arena: std.mem.Allocator, args: std.json.Value, e: *Entry) 
     service(clock.nowMs());
     // An interrupted turn is not continued behind the caller's back.
     e.retry.newPrompt();
+    const deadline = deadlineFrom(args, DEFAULT_WAIT_MS);
     const queued_before = e.agent.queuedPrompts();
-    switch (try act(arena, e, .interrupt, deadlineFrom(args, DEFAULT_WAIT_MS))) {
+    const mine = try mcp_agent_act.queuedSnapshot(arena, e);
+    switch (try act(arena, e, .interrupt, deadline)) {
         .fail => |f| return errRes(arena, f.code, f.msg),
         .ok => {},
     }
     pumpFor(INTERRUPT_SETTLE_MS);
-    // Claude Code's Escape throws its queue away with the turn: say so,
-    // never leave the caller believing those prompts still wait.
+    // Claude Code's Escape throws its queue away with the turn: the ones
+    // this server queued are typed again, as agent_send interrupt does;
+    // never leave the caller believing the others still wait.
     const dropped = queued_before -| e.agent.queuedPrompts();
+    const requeued = try requeueDropped(arena, e, mcp_agent_act.droppedOf(e, mine), deadline);
     var res = Res.init(arena);
     try res.textf("{s}: interrupted", .{e.id});
-    if (dropped > 0) try res.textf("{d} queued prompt(s) were dropped by the interrupt (the app discards its queue with the turn): agent_send them again", .{dropped});
+    const lost = dropped -| @as(u32, @intCast(requeued.done.len));
+    if (lost > 0) try res.textf("{d} queued prompt(s) were dropped by the interrupt and not typed again (the app discards its queue with the turn): agent_send them again", .{lost});
+    try requeued.report(arena, &res);
     try res.fact("interrupted", true);
     try res.fact("queued_dropped", dropped);
     return finish(arena, &res, e, try pending(arena, e), .{}, &.{});

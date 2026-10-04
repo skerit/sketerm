@@ -251,7 +251,7 @@ pub const Requeued = struct {
     pub fn report(self: Requeued, arena: std.mem.Allocator, res: *Res) !void {
         if (self.done.len == 0 and self.fail == null) return;
         try res.raw("requeued", try toJson(arena, try self.items(arena)));
-        if (self.done.len > 0) try res.textf("{d} prompt(s) this server had queued were dropped by the interrupt and queued again behind the new one, in their order", .{self.done.len});
+        if (self.done.len > 0) try res.textf("{d} prompt(s) this server had queued were dropped by the interrupt and typed again in their order (behind the new prompt, if any)", .{self.done.len});
         if (self.fail) |f| {
             try res.raw("requeue_failed", try toJson(arena, .{ .code = @tagName(f.code), .message = f.msg, .not_requeued = self.left }));
             try res.textf("queuing the dropped prompts again stopped ({s}): {d} of them were not typed again: {s}", .{ @tagName(f.code), self.left, f.msg });
@@ -360,6 +360,20 @@ pub const Stopped = struct {
     fail: ?Fail = null,
 };
 
+/// The prompts THIS server has queued in `e`'s app, copied before an
+/// interrupt (`service` forgets them once the app's queue empties).
+pub fn queuedSnapshot(arena: std.mem.Allocator, e: *Entry) ![]const Prompt {
+    const mine = try arena.alloc(Prompt, e.queued_sent.items.len);
+    for (e.queued_sent.items, mine) |q, *m| m.* = .{ .text = try arena.dupe(u8, q.text), .template = if (q.template) |t| try arena.dupe(u8, t) else null };
+    return mine;
+}
+
+/// Which of `snapshot` (`queuedSnapshot` before the interrupt) the app
+/// dropped: all of them when it let its whole queue go, else none.
+pub fn droppedOf(e: *Entry, snapshot: []const Prompt) []const Prompt {
+    return if (e.agent.queuedPrompts() == 0) snapshot else &.{};
+}
+
 /// Whether `interrupt` must stop `e` before a prompt can go in as a new
 /// one: it works, or a prompt waits on the user.
 fn needsInterrupt(e: *Entry) bool {
@@ -375,9 +389,7 @@ pub fn stopForSend(arena: std.mem.Allocator, list: []const *Entry, out: []Stoppe
         o.* = .{};
         if (!needsInterrupt(e)) continue;
         o.queued_dropped = e.agent.queuedPrompts();
-        const mine = try arena.alloc(Prompt, e.queued_sent.items.len);
-        for (e.queued_sent.items, mine) |q, *m| m.* = .{ .text = try arena.dupe(u8, q.text), .template = if (q.template) |t| try arena.dupe(u8, t) else null };
-        o.dropped_sent = mine;
+        o.dropped_sent = try queuedSnapshot(arena, e);
         switch (try act(arena, e, .interrupt, clock.nowMs() + STEP_WAIT_MS)) {
             .fail => |f| o.fail = f,
             .ok => o.interrupted = true,
@@ -399,9 +411,7 @@ pub fn stopForSend(arena: std.mem.Allocator, list: []const *Entry, out: []Stoppe
             continue;
         }
         o.queued_dropped -|= e.agent.queuedPrompts();
-        // Only an app that let its whole queue go dropped sketerm's prompts
-        // (`service` then forgets them on its own).
-        if (e.agent.queuedPrompts() != 0) o.dropped_sent = &.{};
+        o.dropped_sent = droppedOf(e, o.dropped_sent);
         const st = e.agent.state();
         if (!st.takesPrompt()) o.fail = .{ .code = .timeout, .msg = try std.fmt.allocPrint(arena, "agent {s} was interrupted but did not become idle within {d} ms (state {s}); nothing was sent{s}", .{
             e.id, STEP_WAIT_MS, @tagName(st), if (o.dropped_sent.len > 0) try std.fmt.allocPrint(arena, ", and the {d} prompt(s) this server had queued that its app dropped were not typed again", .{o.dropped_sent.len}) else "",

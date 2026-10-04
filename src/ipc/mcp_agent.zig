@@ -1086,6 +1086,35 @@ test "every agent tool answers in its declared shape: a scripted Claude Code on 
     try testing.expect(order[0] != null and order[1] != null and order[2] != null);
     try testing.expect(order[0].? < order[1].? and order[1].? < order[2].?);
 
+    // A plain agent_interrupt types this server's dropped prompts again too.
+    _ = try shaped(a, "agent_send", try rig.call(.agent_send, "{\"text\":\"another glacial one\",\"timeout_ms\":300}"));
+    glacial_polls = 0;
+    while (glacial_polls < 50) : (glacial_polls += 1) {
+        const l = try shaped(a, "agent_list", try rig.call(.agent_list, "{}"));
+        if (std.mem.eql(u8, l.get("agents").?.array.items[0].object.get("state").?.string, "working")) break;
+        _ = c.usleep(50_000);
+    }
+    for ([_][]const u8{ "held three", "held four" }) |t| {
+        const h = try shaped(a, "agent_send", try rig.call(.agent_send, try std.fmt.allocPrint(a, "{{\"text\":\"{s}\",\"timeout_ms\":300}}", .{t})));
+        try testing.expect(h.get("queued").?.bool);
+    }
+    const halted = try shaped(a, "agent_interrupt", try rig.call(.agent_interrupt, "{}"));
+    try testing.expectEqual(@as(i64, 2), halted.get("queued_dropped").?.integer);
+    const hrq = halted.get("requeued").?.array.items;
+    try testing.expectEqual(@as(usize, 2), hrq.len);
+    try testing.expectEqualStrings("held three", hrq[0].object.get("text").?.string);
+    try testing.expectEqualStrings("held four", hrq[1].object.get("text").?.string);
+    _ = try shaped(a, "agent_wait", try rig.call(.agent_wait, "{\"timeout_ms\":3000}"));
+    const after_halt = try shaped(a, "agent_read", try rig.call(.agent_read, "{\"detail\":\"all\",\"since\":0}"));
+    var halt_order: [2]?usize = .{ null, null };
+    for (after_halt.get("records").?.array.items, 0..) |r, i| {
+        const txt = r.object.get("text").?.string;
+        for ([_][]const u8{ "echo: held three", "echo: held four" }, 0..) |want, k| {
+            if (std.mem.eql(u8, txt, want)) halt_order[k] = i;
+        }
+    }
+    try testing.expect(halt_order[0] != null and halt_order[1] != null and halt_order[0].? < halt_order[1].?);
+
     // One text to several (an unknown one fails alone), then a wait for all.
     const id = try a.dupe(u8, attached.get("agent").?.string);
     const many = try shaped(a, "agent_send", try rig.call(.agent_send, try std.fmt.allocPrint(a, "{{\"agents\":[\"{s}\",\"nope-zz\"],\"text\":\"fanned\",\"interrupt\":true,\"timeout_ms\":10000}}", .{id})));
