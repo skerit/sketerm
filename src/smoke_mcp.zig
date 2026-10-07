@@ -18,11 +18,12 @@ const wire = @import("mux/wire.zig");
 const panelstore = @import("ipc/panelstore.zig");
 const protocol = @import("ipc/protocol.zig");
 const webproto = @import("web/protocol.zig");
+const webstream = @import("web/stream.zig");
+const opuscodec = @import("mux/opuscodec.zig");
 const netpolicy = @import("web/netpolicy.zig");
 const version = @import("version.zig");
 const smoke_tls = @import("smoke_tls.zig");
-const wlcomp = @import("wlhost/compositor.zig");
-const wlpipe = @import("wlhost/pipe.zig");
+const appdrive = @import("ipc/appdrive.zig");
 const platform = @import("util/platform.zig");
 const testserver = @import("agent/testserver.zig");
 const facts = @import("agent/facts.zig");
@@ -293,7 +294,11 @@ fn doctorOutput(exe: [*:0]const u8, buf: []u8) []const u8 {
         }
     }
     var status: c_int = 0;
-    if (c.waitpid(pid, &status, 0) != pid or status != 0) fail("doctor failed");
+    // Doctor also inventories unrelated processes; warnings have exit status 1.
+    if (c.waitpid(pid, &status, 0) != pid or (status != 0 and status != 256)) {
+        say(buf[0..used]);
+        fail("doctor failed");
+    }
     return buf[0..used];
 }
 
@@ -676,6 +681,23 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     const cfg_home = std.fmt.bufPrintZ(&cfg_home_buf, "{s}/config", .{rt}) catch return 1;
     _ = c.mkdir(cfg_home.ptr, 0o700);
     _ = c.setenv("XDG_CONFIG_HOME", cfg_home.ptr, 1);
+    // Later fake agents inherit the first default broker's environment.
+    _ = c.setenv("SKETERM_SMOKE_FAKE_AGENT", "1", 1);
+    var fake_exe_buf: [4096:0]u8 = undefined;
+    const fake_exe = platform.exePathZ(&fake_exe_buf) orelse fail("fake SSH executable path");
+    const fake_bin = std.fmt.allocPrintSentinel(allocator, "{s}/fakebin", .{rt}, 0) catch fail("fake SSH directory");
+    defer allocator.free(fake_bin);
+    _ = c.mkdir(fake_bin.ptr, 0o700);
+    for ([_][]const u8{ "ssh", "scp" }) |name| {
+        const link = std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ fake_bin, name }, 0) catch fail("fake SSH link");
+        defer allocator.free(link);
+        if (c.symlink(fake_exe.ptr, link.ptr) != 0) fail("could not link the fake SSH executable");
+    }
+    const prior_path = if (c.getenv("PATH")) |p| std.mem.span(p) else "/usr/bin:/bin";
+    const fixture_path = std.fmt.allocPrintSentinel(allocator, "{s}:{s}", .{ fake_bin, prior_path }, 0) catch fail("fake SSH PATH");
+    defer allocator.free(fixture_path);
+    _ = c.setenv("PATH", fixture_path.ptr, 1);
+    _ = c.setenv(FAKE_SSH_ENV, "1", 1);
     clearInheritedOrigin();
     g_rt = rt;
     defer killDaemonsUnderRt(rt, allocator);
@@ -743,6 +765,15 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         defer _ = c.unsetenv("SKETERM_WEB_BROKER_ENGINE");
         webCaptureStage(allocator, exe, rt);
         say("smoke-mcp: focused response-body capture ok");
+        return 0;
+    }
+    if (c.getenv("SKETERM_SMOKE_MCP_WEBSTREAM_ONLY") != null) {
+        var bin_buf: [4096:0]u8 = undefined;
+        const web_bin = resolveWebBin(&bin_buf) orelse fail("built sketerm-webengine missing for the stream stage");
+        _ = c.setenv("SKETERM_WEB_BIN", web_bin, 1);
+        defer _ = c.unsetenv("SKETERM_WEB_BIN");
+        webStreamStage(allocator, exe, rt);
+        say("smoke-mcp: focused pushed web stream ok");
         return 0;
     }
     if (c.getenv("SKETERM_SMOKE_MCP_WEBPRESENTER_ONLY") != null) {
@@ -3391,6 +3422,975 @@ fn webReviewStage(m: *Mcp, rt: []const u8) void {
     say("smoke-mcp: review inspection, shadow controls, SPA/reload checkpoints and durable export ok");
 }
 
+/// The unsigned number after `"key":` in a reply, or null when absent.
+fn uintField(json: []const u8, key: []const u8) ?u64 {
+    var needle_buf: [64]u8 = undefined;
+    const needle = std.fmt.bufPrint(&needle_buf, "\"{s}\":", .{key}) catch return null;
+    const at = std.mem.indexOf(u8, json, needle) orelse return null;
+    var i = at + needle.len;
+    if (i >= json.len or json[i] < '0' or json[i] > '9') return null;
+    var v: u64 = 0;
+    while (i < json.len and json[i] >= '0' and json[i] <= '9') : (i += 1) v = v * 10 + (json[i] - '0');
+    return v;
+}
+
+/// Driving a page by hand against the REAL helper: web_frame long-polls
+/// painted frames (and answers unchanged on a still page), web_input's
+/// pointer edges, a held Shift, text at the caret and a wheel step reach
+/// the page as trusted input the page itself observes.
+fn webHandStage(m: *Mcp, rt: []const u8) void {
+    var path_buf: [512]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/hand-fixture.html", .{rt}) catch unreachable;
+    const html =
+        "<!doctype html><html><head><title>hand</title></head><body style='margin:0;height:4000px'>" ++
+        "<div id=pad style='position:fixed;left:0;top:0;width:200px;height:100px;background:#00ff00'></div>" ++
+        "<input id=field style='position:fixed;left:0;top:150px;width:200px;height:30px'><script>" ++
+        "const pad=document.getElementById('pad');" ++
+        "pad.addEventListener('pointerdown',e=>{document.title='down '+e.clientX+','+e.clientY+(e.shiftKey?' shift':'')+(e.isTrusted?' trusted':'');pad.style.background='#ff0000'});" ++
+        "pad.addEventListener('pointerup',()=>{document.title+=' up'});" ++
+        "addEventListener('keydown',e=>{if(e.key==='Shift')document.body.dataset.shift='held'});" ++
+        "addEventListener('keyup',e=>{if(e.key==='Shift')document.body.dataset.shift='released'});" ++
+        "</script></body></html>";
+    @import("util/atomicwrite.zig").writeFileExact(path, html, 0o600) catch fail("cannot write hand fixture");
+    var args: [2048]u8 = undefined;
+    m.sendTool("web_open", std.fmt.bufPrint(&args, "{{\"url\":\"file://{s}\",\"ephemeral\":true,\"width\":800,\"height\":600}}", .{path}) catch unreachable);
+    const opened = m.recvLine(60_000);
+    if (std.mem.indexOf(u8, opened, "isError") != null) fail("hand fixture failed to open");
+    const view = viewHandleOf(opened);
+
+    // 1. The first frame comes back as a JPEG of the logical viewport.
+    const first = m.callTool("web_frame", "{\"timeout_ms\":5000}");
+    if (std.mem.indexOf(u8, first, "\"mimeType\":\"image/jpeg\"") == null or
+        std.mem.indexOf(u8, first, "\"unchanged\":false") == null or
+        std.mem.indexOf(u8, first, "\"viewport_width\":800") == null)
+    {
+        say(first[0..@min(first.len, 600)]);
+        fail("web_frame did not return the first frame as a JPEG of the viewport");
+    }
+    var serial = uintField(first, "frame") orelse fail("web_frame named no frame serial");
+    if (serial == 0) fail("web_frame answered a frame with serial 0");
+
+    // 2. Once the page has settled, asking past the frame already drawn answers unchanged, never that frame
+    //    again; a late layout paint is simply the next frame to draw.
+    var still_seen = false;
+    var settle: usize = 0;
+    while (settle < 10 and !still_seen) : (settle += 1) {
+        const still = m.callTool("web_frame", std.fmt.bufPrint(&args, "{{\"since\":{d},\"timeout_ms\":400}}", .{serial}) catch unreachable);
+        if (std.mem.indexOf(u8, still, "\"unchanged\":true") != null) {
+            if (std.mem.indexOf(u8, still, "image/") != null) fail("an unchanged web_frame carried an image");
+            still_seen = true;
+        } else {
+            const next = uintField(still, "frame") orelse fail("web_frame named no frame serial");
+            if (next == serial) fail("web_frame answered the frame it was told was already drawn");
+            serial = next;
+        }
+    }
+    if (!still_seen) fail("web_frame never answered unchanged on a still page");
+
+    // 3. Shift held across a click on the pad: the page sees a trusted shift-click and the release.
+    // One line: the transport is newline-delimited JSON-RPC.
+    const clicked = m.callTool("web_input", "{\"events\":[{\"type\":\"key\",\"action\":\"down\",\"key\":\"Shift\"}," ++
+        "{\"type\":\"pointer\",\"action\":\"move\",\"x\":50,\"y\":40,\"modifiers\":[\"shift\"]}," ++
+        "{\"type\":\"pointer\",\"action\":\"down\",\"x\":50,\"y\":40,\"modifiers\":[\"shift\"]}," ++
+        "{\"type\":\"pointer\",\"action\":\"up\",\"x\":50,\"y\":40,\"modifiers\":[\"shift\"]}," ++
+        "{\"type\":\"key\",\"action\":\"up\",\"key\":\"Shift\"}]}");
+    if (std.mem.indexOf(u8, clicked, "\"sent\":5") == null) {
+        say(clicked[0..@min(clicked.len, 600)]);
+        fail("web_input did not send the shift-click batch");
+    }
+    var seen = false;
+    var tries: usize = 0;
+    while (tries < 40 and !seen) : (tries += 1) {
+        const title = m.callTool("web_eval", "{\"code\":\"document.title + '|' + document.body.dataset.shift\"}");
+        seen = std.mem.indexOf(u8, title, "down 50,40 shift trusted up|released") != null;
+        if (!seen) _ = c.usleep(50_000);
+    }
+    if (!seen) fail("the page did not observe a trusted shift-click at 50,40 and the Shift release");
+
+    // 4. The click repainted the pad: the next frame is newer than the still one.
+    const after = m.callTool("web_frame", std.fmt.bufPrint(&args, "{{\"since\":{d},\"timeout_ms\":3000,\"format\":\"png\",\"max_width\":400}}", .{serial}) catch unreachable);
+    if (std.mem.indexOf(u8, after, "\"unchanged\":false") == null or
+        std.mem.indexOf(u8, after, "\"mimeType\":\"image/png\"") == null or
+        std.mem.indexOf(u8, after, "\"width\":400") == null)
+    {
+        say(after[0..@min(after.len, 600)]);
+        fail("web_frame did not answer the repaint the click caused, downscaled as asked");
+    }
+    if ((uintField(after, "frame") orelse 0) == serial) fail("web_frame answered the frame it was told was already drawn");
+
+    // 5. Text lands at the caret of the field a click focused.
+    const typed = m.callTool("web_input", "{\"events\":[{\"type\":\"pointer\",\"action\":\"down\",\"x\":100,\"y\":165}," ++
+        "{\"type\":\"pointer\",\"action\":\"up\",\"x\":100,\"y\":165}," ++
+        "{\"type\":\"text\",\"text\":\"h\\u00e9llo\"},{\"type\":\"key\",\"key\":\"!\"}]}");
+    if (std.mem.indexOf(u8, typed, "isError") != null) {
+        say(typed[0..@min(typed.len, 600)]);
+        fail("web_input could not type into the field");
+    }
+    var value_ok = false;
+    tries = 0;
+    while (tries < 40 and !value_ok) : (tries += 1) {
+        const value = m.callTool("web_eval", "{\"code\":\"document.getElementById('field').value\"}");
+        value_ok = std.mem.indexOf(u8, value, "h\u{e9}llo!") != null;
+        if (!value_ok) _ = c.usleep(50_000);
+    }
+    if (!value_ok) fail("text and a typed key did not land in the focused field");
+
+    // 6. A wheel step over the page scrolls the document.
+    _ = m.callTool("web_input", "{\"events\":[{\"type\":\"wheel\",\"x\":400,\"y\":400,\"dy\":600}]}");
+    var scrolled = false;
+    tries = 0;
+    while (tries < 40 and !scrolled) : (tries += 1) {
+        const y = m.callTool("web_eval", "{\"code\":\"String(scrollY > 0)\"}");
+        scrolled = std.mem.indexOf(u8, y, "true") != null;
+        if (!scrolled) _ = c.usleep(50_000);
+    }
+    if (!scrolled) fail("a web_input wheel step did not scroll the page");
+
+    // 7. A refused batch sends nothing and says which event was wrong.
+    const refused = m.callTool("web_input", "{\"events\":[{\"type\":\"pointer\",\"x\":1,\"y\":1},{\"type\":\"pointer\",\"action\":\"hover\",\"x\":1,\"y\":1}]}");
+    if (std.mem.indexOf(u8, refused, "\"code\":\"invalid_args\"") == null or std.mem.indexOf(u8, refused, "events[1]") == null)
+        fail("a bad web_input event was not refused by index");
+
+    _ = m.callTool("web_close", std.fmt.bufPrint(&args, "{{\"pane\":{d}}}", .{view}) catch unreachable);
+    say("smoke-mcp: hand-driven input (pointer, held keys, text, wheel) and the pulled frame stream ok");
+}
+
+const StreamRig = struct {
+    allocator: std.mem.Allocator,
+    fd: c_int = -1,
+    packet: []u8 = &.{},
+    pixels: []u8 = &.{},
+    w: u32 = 0,
+    h: u32 = 0,
+    serial: u64 = 0,
+    damage: webstream.Dirty = .{},
+    cursor_seen: bool = false,
+    audio_packets: usize = 0,
+    audio_signal: bool = false,
+    audio_pts: u64 = 0,
+    decoder: ?opuscodec.Decoder = null,
+    /// Surface the next SURFACE frame must announce: pixel w/h, logical w/h.
+    expect: [4]u32 = .{ 800, 600, 800, 600 },
+
+    fn connect(allocator: std.mem.Allocator, path: []const u8) StreamRig {
+        var addr = std.mem.zeroes(c.struct_sockaddr_un);
+        if (path.len >= addr.sun_path.len) fail("stream socket path too long");
+        addr.sun_family = c.AF_UNIX;
+        @memcpy(addr.sun_path[0..path.len], path);
+        const fd = c.socket(c.AF_UNIX, c.SOCK_STREAM, 0);
+        if (fd < 0) fail("stream socket");
+        _ = c.fcntl(fd, c.F_SETFD, c.FD_CLOEXEC);
+        _ = c.fcntl(fd, c.F_SETFL, c.O_NONBLOCK);
+        const rc = c.connect(fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un));
+        if (rc != 0 and std.posix.errno(rc) != .INPROGRESS) fail("connect to helper stream");
+        var pfd = c.struct_pollfd{ .fd = fd, .events = c.POLLOUT, .revents = 0 };
+        if (c.poll(&pfd, 1, 3000) <= 0) fail("stream connect deadline");
+        var err: c_int = 0;
+        var len: c.socklen_t = @sizeOf(c_int);
+        if (c.getsockopt(fd, c.SOL_SOCKET, c.SO_ERROR, &err, &len) != 0 or err != 0) fail("stream connect refused");
+        return .{ .allocator = allocator, .fd = fd };
+    }
+
+    fn deinit(self: *StreamRig) void {
+        self.disconnect();
+        if (self.decoder) |*d| d.deinit();
+        self.allocator.free(self.packet);
+        self.allocator.free(self.pixels);
+    }
+
+    fn disconnect(self: *StreamRig) void {
+        if (self.fd >= 0) _ = c.close(self.fd);
+        self.fd = -1;
+    }
+
+    fn send(self: *StreamRig, tag: webstream.Tag, body: []const u8) void {
+        const bytes = self.allocator.alloc(u8, webstream.HEADER + body.len) catch fail("stream send allocation");
+        defer self.allocator.free(bytes);
+        std.mem.writeInt(u32, bytes[0..4], @intCast(body.len + 1), .little);
+        bytes[4] = @intFromEnum(tag);
+        @memcpy(bytes[5..], body);
+        // The same strict codec validates every smoke input before it is sent.
+        _ = webstream.decode(bytes[4], body) catch fail("invalid smoke stream input");
+        var off: usize = 0;
+        const deadline = nowMs() + 3000;
+        while (off < bytes.len) {
+            const n = c.write(self.fd, bytes.ptr + off, bytes.len - off);
+            if (n > 0) {
+                off += @intCast(n);
+                continue;
+            }
+            if (n == 0 or nowMs() >= deadline) fail("stream send did not finish");
+            const err = std.posix.errno(n);
+            if (err != .AGAIN and err != .INTR) fail("stream send failed");
+            var pfd = c.struct_pollfd{ .fd = self.fd, .events = c.POLLOUT, .revents = 0 };
+            _ = c.poll(&pfd, 1, 20);
+        }
+    }
+
+    fn readExact(self: *StreamRig, dst: []u8, deadline: i64) bool {
+        var off: usize = 0;
+        while (off < dst.len) {
+            const n = c.recv(self.fd, dst.ptr + off, dst.len - off, 0);
+            if (n > 0) {
+                off += @intCast(n);
+                continue;
+            }
+            if (n == 0) fail("stream closed during a frame");
+            const err = std.posix.errno(n);
+            if (err != .AGAIN and err != .INTR) fail("stream receive failed");
+            const left = deadline - nowMs();
+            if (left <= 0) {
+                if (off != 0) fail("partial stream frame exceeded deadline");
+                return false;
+            }
+            var pfd = c.struct_pollfd{ .fd = self.fd, .events = c.POLLIN, .revents = 0 };
+            _ = c.poll(&pfd, 1, @intCast(@min(left, 100)));
+        }
+        return true;
+    }
+
+    fn next(self: *StreamRig, timeout_ms: i64) ?webstream.Tag {
+        const deadline = nowMs() + timeout_ms;
+        var head: [4]u8 = undefined;
+        if (!self.readExact(&head, deadline)) return null;
+        const n = std.mem.readInt(u32, &head, .little);
+        if (n == 0 or n > webstream.MAX_FRAME) fail("invalid stream frame length");
+        self.allocator.free(self.packet);
+        self.packet = self.allocator.alloc(u8, 4 + @as(usize, n)) catch fail("stream frame allocation");
+        @memcpy(self.packet[0..4], &head);
+        if (!self.readExact(self.packet[4..], deadline)) fail("missing stream frame body");
+        const raw = (webstream.split(self.packet) catch fail("invalid stream framing")) orelse fail("incomplete stream frame");
+        const b = raw.body;
+        const tag: webstream.Tag = @enumFromInt(raw.tag);
+        switch (tag) {
+            .surface => {
+                if (b.len != webstream.SURFACE_BODY or b[16] != webstream.FORMAT_BGRA_PREMUL) fail("invalid stream surface");
+                self.w = std.mem.readInt(u32, b[0..4], .little);
+                self.h = std.mem.readInt(u32, b[4..8], .little);
+                if (self.w != self.expect[0] or self.h != self.expect[1] or std.mem.readInt(u32, b[8..12], .little) != self.expect[2] or
+                    std.mem.readInt(u32, b[12..16], .little) != self.expect[3]) fail("stream surface coordinate spaces differ from requested viewport");
+                self.allocator.free(self.pixels);
+                self.pixels = self.allocator.alloc(u8, @as(usize, self.w) * self.h * 4) catch fail("stream pixels allocation");
+                @memset(self.pixels, 0);
+            },
+            .damage => {
+                if (b.len < webstream.DAMAGE_HEAD or self.pixels.len == 0) fail("damage before surface");
+                const r = webstream.Rect{
+                    .x = std.mem.readInt(u32, b[0..4], .little),
+                    .y = std.mem.readInt(u32, b[4..8], .little),
+                    .w = std.mem.readInt(u32, b[8..12], .little),
+                    .h = std.mem.readInt(u32, b[12..16], .little),
+                };
+                if (r.empty() or @as(u64, r.x) + r.w > self.w or @as(u64, r.y) + r.h > self.h or
+                    b.len != webstream.DAMAGE_HEAD + @as(usize, r.w) * r.h * 4 or b.len - webstream.DAMAGE_HEAD > webstream.MAX_BAND_BYTES)
+                    fail("stream damage is out of bounds or not tightly packed BGRA");
+                const stride = @as(usize, r.w) * 4;
+                for (0..r.h) |y| {
+                    const off = ((@as(usize, r.y) + y) * self.w + r.x) * 4;
+                    @memcpy(self.pixels[off..][0..stride], b[webstream.DAMAGE_HEAD + y * stride ..][0..stride]);
+                }
+                self.damage.add(r);
+            },
+            .frame_end => {
+                if (b.len != webstream.FRAME_END_BODY) fail("invalid stream frame end");
+                const serial = std.mem.readInt(u64, b[0..8], .little);
+                if (serial != self.serial + 1) fail("stream frame serials are not contiguous");
+                self.serial = serial;
+            },
+            .cursor => {
+                if (b.len < 4 or b[0] > 1 or b[1] > 1) fail("invalid stream cursor");
+                if (b[1] == 0) {
+                    const len = std.mem.readInt(u16, b[2..4], .little);
+                    if (b.len != 4 + @as(usize, len)) fail("invalid named cursor length");
+                    if (b[0] == 1 and std.mem.eql(u8, b[4..], "crosshair")) self.cursor_seen = true;
+                } else {
+                    if (b.len < webstream.CURSOR_IMAGE_HEAD) fail("invalid image cursor length");
+                    const w = std.mem.readInt(u32, b[2..6], .little);
+                    const h = std.mem.readInt(u32, b[6..10], .little);
+                    if (w > webstream.MAX_CURSOR_DIM or h > webstream.MAX_CURSOR_DIM or b.len != webstream.CURSOR_IMAGE_HEAD + @as(usize, w) * h * 4)
+                        fail("invalid image cursor dimensions");
+                }
+            },
+            .audio => {
+                if (b.len <= webstream.AUDIO_HEAD or b.len > webstream.AUDIO_HEAD + webstream.MAX_OPUS) fail("invalid stream audio packet size");
+                const pts = std.mem.readInt(u64, b[0..8], .little);
+                const rate = std.mem.readInt(u32, b[8..12], .little);
+                const samples = std.mem.readInt(u16, b[13..15], .little);
+                if (rate != 48_000 or b[12] != 2 or samples != 960 or
+                    (self.audio_packets != 0 and pts <= self.audio_pts)) fail("invalid stream audio format or monotonic capture time");
+                self.audio_pts = pts;
+                if (self.decoder == null) self.decoder = opuscodec.Decoder.init(rate, b[12]) orelse fail("advertised stream audio cannot be decoded with runtime Opus");
+                var pcm: [opuscodec.MAX_DECODE_SAMPLES]i16 = undefined;
+                const decoded = self.decoder.?.decode(b[15..], &pcm) orelse fail("stream Opus decode failed");
+                if (decoded.len != 960 * 2 * 2) fail("stream Opus packet did not decode to 20ms stereo");
+                for (pcm[0 .. decoded.len / 2]) |sample| if (@abs(@as(i32, sample)) > 200) {
+                    self.audio_signal = true;
+                    break;
+                };
+                self.audio_packets += 1;
+            },
+            else => fail("unexpected helper-to-client stream tag"),
+        }
+        return tag;
+    }
+
+    fn frame(self: *StreamRig) webstream.Rect {
+        const deadline = nowMs() + 5000;
+        while (nowMs() < deadline) {
+            if (self.next(@max(1, deadline - nowMs()))) |tag| if (tag == .frame_end)
+                return self.damage.take() orelse fail("stream frame end had no damage");
+        }
+        fail("helper did not push the next painted stream frame");
+    }
+
+    fn ack(self: *StreamRig) void {
+        var b: [8]u8 = undefined;
+        std.mem.writeInt(u64, &b, self.serial, .little);
+        self.send(.ack, &b);
+    }
+
+    fn pointer(self: *StreamRig, action: webstream.PointerAction, x: i32, y: i32, mods: u32) void {
+        var b: [15]u8 = undefined;
+        b[0] = @intFromEnum(action);
+        std.mem.writeInt(i32, b[1..5], x, .little);
+        std.mem.writeInt(i32, b[5..9], y, .little);
+        b[9] = 0;
+        b[10] = 1;
+        std.mem.writeInt(u32, b[11..15], mods, .little);
+        self.send(.pointer, &b);
+    }
+
+    fn key(self: *StreamRig, action: webstream.KeyAction, name: []const u8, mods: u32) void {
+        var b: [7 + webstream.MAX_KEY_NAME]u8 = undefined;
+        b[0] = @intFromEnum(action);
+        std.mem.writeInt(u32, b[1..5], mods, .little);
+        std.mem.writeInt(u16, b[5..7], @intCast(name.len), .little);
+        @memcpy(b[7..][0..name.len], name);
+        self.send(.key, b[0 .. 7 + name.len]);
+    }
+
+    fn ended(self: *StreamRig) void {
+        const deadline = nowMs() + 5000;
+        var bytes: [65536]u8 = undefined;
+        while (nowMs() < deadline) {
+            const n = c.recv(self.fd, &bytes, bytes.len, 0);
+            if (n == 0) return;
+            if (n < 0 and std.posix.errno(n) != .AGAIN and std.posix.errno(n) != .INTR) return;
+            var pfd = c.struct_pollfd{ .fd = self.fd, .events = c.POLLIN, .revents = 0 };
+            _ = c.poll(&pfd, 1, 50);
+        }
+        fail("stream socket survived its owning view or MCP server");
+    }
+};
+
+fn streamOffer(m: *Mcp, arena: std.mem.Allocator) std.json.ObjectMap {
+    const deadline = nowMs() + 3000;
+    while (nowMs() < deadline) {
+        const line = m.callTool("web_stream", "{}");
+        if (std.mem.indexOf(u8, line, "\"isError\":true") == null) return capSc(arena, line, "web_stream", false);
+        if (std.mem.indexOf(u8, line, "\"code\":\"conflict\"") == null) {
+            say(line);
+            fail("real helper refused a supported web stream");
+        }
+        _ = c.usleep(20_000);
+    }
+    fail("closed stream never released its view slot");
+}
+
+fn streamPaint(m: *Mcp, color: []const u8) void {
+    var args: [512]u8 = undefined;
+    const line = m.callTool("web_eval", std.fmt.bufPrint(&args, "{{\"body\":\"block.style.background='{s}';await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));return true\"}}", .{color}) catch unreachable);
+    if (std.mem.indexOf(u8, line, "isError") != null) fail("stream fixture mutation failed");
+}
+
+fn streamBlock(rig: *StreamRig, damage: webstream.Rect, before: []const u8, bgra: [4]u8) void {
+    if (damage.x != 40 or damage.y != 40 or damage.w != 20 or damage.h != 20) fail("20x20 mutation did not produce exact stream damage");
+    var changed: usize = 0;
+    for (0..rig.h) |y| for (0..rig.w) |x| {
+        const off = (y * rig.w + x) * 4;
+        const px = rig.pixels[off..][0..4];
+        if (x >= 40 and x < 60 and y >= 40 and y < 60) {
+            if (!std.mem.eql(u8, px, &bgra)) fail("stream damage did not carry the newest exact BGRA pixel");
+        } else if (!std.mem.eql(u8, px, before[off..][0..4])) fail("stream changed pixels outside the 20x20 mutation");
+        if (!std.mem.eql(u8, px, before[off..][0..4])) changed += 1;
+    };
+    if (changed != 400) fail("20x20 stream mutation did not change exactly 400 pixels");
+}
+
+fn streamInputEvidence(m: *Mcp, arena: std.mem.Allocator, rt: []const u8, wait_reply: []const u8) void {
+    const line = m.callTool("web_eval", "{\"code\":\"({checks:window.streamChecks(),observed:window.seen,field_value:window.field.value,scroll_y:scrollY,active_element:document.activeElement.id||document.activeElement.tagName,goal:window.streamGoal,title:document.title})\",\"strict\":true,\"max_chars\":60000}");
+    const result = capSc(arena, line, "stream input evidence", false);
+    const value = result.get("value").?.object.get("value").?.object;
+    const checks = value.get("checks").?.object;
+    var failed = std.mem.indexOf(u8, wait_reply, "\"isError\":true") != null;
+    const required = [_][]const u8{ "pointer_down", "pointer_up", "shift_down", "shift_up", "click", "field_down", "field_up", "text", "wheel", "scroll", "focus" };
+    const release_phase = std.mem.eql(u8, value.get("goal").?.string, "stream-release-ok");
+    for (required[0..if (release_phase) 4 else required.len]) |name| {
+        const ok = if (checks.get(name)) |check| check == .bool and check.bool else false;
+        if (!ok) {
+            std.debug.print("smoke-mcp: stream input requirement failed: {s}\n", .{name});
+            failed = true;
+        }
+    }
+    if (!failed) return;
+    say(wait_reply);
+    say(line);
+    const path = std.fmt.allocPrint(arena, "{s}/stream-input-evidence.json", .{rt}) catch fail("stream evidence path");
+    @import("util/atomicwrite.zig").writeFileExact(path, line, 0o600) catch say("smoke-mcp: could not save stream input evidence");
+    fail("page did not observe every trusted stream input requirement (stream-input-evidence.json has individual checks and events)");
+}
+
+const StreamPixelDiff = struct {
+    count: usize = 0,
+    bounds: ?webstream.Rect = null,
+    first: ?struct { x: u32, y: u32, before: [4]u8, after: [4]u8 } = null,
+};
+
+fn streamPixelDiff(w: u32, h: u32, before: []const u8, after: []const u8, region: webstream.Rect) StreamPixelDiff {
+    const r = region.clip(w, h);
+    var diff = StreamPixelDiff{};
+    for (r.y..r.y + r.h) |y| for (r.x..r.x + r.w) |x| {
+        const off = (y * w + x) * 4;
+        if (std.mem.eql(u8, before[off..][0..4], after[off..][0..4])) continue;
+        const pixel = webstream.Rect{ .x = @intCast(x), .y = @intCast(y), .w = 1, .h = 1 };
+        diff.count += 1;
+        diff.bounds = if (diff.bounds) |b| b.unite(pixel) else pixel;
+        if (diff.first == null) diff.first = .{ .x = @intCast(x), .y = @intCast(y), .before = before[off..][0..4].*, .after = after[off..][0..4].* };
+    };
+    return diff;
+}
+
+fn streamPopupDom(m: *Mcp, arena: std.mem.Allocator) []const u8 {
+    const line = m.callTool("web_eval", "{\"body\":\"const el=document.getElementById('select'),r=el.getBoundingClientRect(),s=getComputedStyle(el);return {active_element:document.activeElement.id||document.activeElement.tagName,scroll_y:scrollY,native_popup_visibility:null,select:{focused:document.activeElement===el,hover:el.matches(':hover'),focus_visible:el.matches(':focus-visible'),active:el.matches(':active'),selected_index:el.selectedIndex,value:el.value,rect:{x:r.x,y:r.y,width:r.width,height:r.height},outline:s.outline,outline_offset:s.outlineOffset,border:s.border,box_sizing:s.boxSizing},events:window.seen.events.slice(-16)}\",\"strict\":true,\"max_chars\":60000}");
+    _ = capSc(arena, line, "popup DOM evidence", false);
+    return arena.dupe(u8, line) catch fail("popup DOM evidence allocation");
+}
+
+const StreamPopupShot = struct { name: []const u8, pixels: []const u8, frame: u64, dom: []const u8 };
+
+fn streamPopupEvidence(arena: std.mem.Allocator, rt: []const u8, rig: *const StreamRig, shots: []const StreamPopupShot, reason: []const u8, last_damage: ?webstream.Rect) void {
+    const roi = webstream.Rect{ .x = 300, .y = 180, .w = 180, .h = 60 };
+    const State = struct { phase: []const u8, frame: u64, full_diff: StreamPixelDiff, roi_diff: StreamPixelDiff, dom: std.json.Value };
+    var states: std.ArrayList(State) = .empty;
+    const png = @import("util/png.zig");
+    for (shots) |shot| {
+        states.append(arena, .{
+            .phase = shot.name,
+            .frame = shot.frame,
+            .full_diff = streamPixelDiff(rig.w, rig.h, shots[0].pixels, shot.pixels, .{ .x = 0, .y = 0, .w = rig.w, .h = rig.h }),
+            .roi_diff = streamPixelDiff(rig.w, rig.h, shots[0].pixels, shot.pixels, roi),
+            .dom = std.json.parseFromSliceLeaky(std.json.Value, arena, shot.dom, .{}) catch fail("popup DOM evidence JSON"),
+        }) catch fail("popup evidence allocation");
+        const image = png.encodeShm(arena, shot.pixels, rig.w, rig.h, rig.w * 4, @intFromEnum(png.ShmFormat.argb8888)) catch {
+            say("smoke-mcp: could not encode popup evidence PNG");
+            continue;
+        };
+        const path = std.fmt.allocPrint(arena, "{s}/stream-popup-{s}.png", .{ rt, shot.name }) catch fail("popup image path");
+        @import("util/atomicwrite.zig").writeFileExact(path, image, 0o600) catch say("smoke-mcp: could not save popup evidence PNG");
+    }
+    const report = std.json.Stringify.valueAlloc(arena, .{
+        .reason = reason,
+        .roi = roi,
+        .last_damage = last_damage,
+        .diff_reference = "baseline",
+        .dom_and_pixels_atomic = false,
+        .states = states.items,
+    }, .{}) catch fail("popup evidence JSON");
+    say("smoke-mcp: popup changed-pixel counts, bounds, first BGRA difference and DOM evidence:");
+    say(report);
+    const path = std.fmt.allocPrint(arena, "{s}/stream-popup-evidence.json", .{rt}) catch fail("popup report path");
+    @import("util/atomicwrite.zig").writeFileExact(path, report, 0o600) catch say("smoke-mcp: could not save popup evidence JSON");
+}
+
+/// Pixels of `px` (4 bytes each, `w` wide) equal to `want`, and their bounds.
+fn streamColorBounds(px: []const u8, w: u32, h: u32, want: [4]u8) StreamPixelDiff {
+    var out = StreamPixelDiff{};
+    for (0..h) |y| for (0..w) |x| {
+        if (!std.mem.eql(u8, px[(y * w + x) * 4 ..][0..4], &want)) continue;
+        const r = webstream.Rect{ .x = @intCast(x), .y = @intCast(y), .w = 1, .h = 1 };
+        out.count += 1;
+        out.bounds = if (out.bounds) |b| b.unite(r) else r;
+    };
+    return out;
+}
+
+/// The fixture's 20x20 logical green block must be exactly 40x40 at (80,80).
+fn streamScaledBlock(px: []const u8, w: u32, h: u32, want: [4]u8, comptime what: []const u8) void {
+    const g = streamColorBounds(px, w, h, want);
+    const b = g.bounds orelse fail(what ++ ": the green block is missing at device scale 2");
+    if (g.count != 1600 or b.x != 80 or b.y != 80 or b.w != 40 or b.h != 40) {
+        std.debug.print("smoke-mcp: {s}: {d} green pixels, bounds {d},{d} {d}x{d}\n", .{ what, g.count, b.x, b.y, b.w, b.h });
+        fail(what ++ ": the 20x20 logical block is not 40x40 physical pixels at (80,80)");
+    }
+}
+
+/// The WebGL canvas occupies a distinct 64x64 logical rectangle, not a CSS colour substitute.
+fn streamWebglPixels(px: []const u8, w: u32, h: u32, scale: u32, comptime what: []const u8) void {
+    if (@import("builtin").os.tag != .linux) return;
+    const g = streamColorBounds(px, w, h, .{ 255, 0, 255, 255 });
+    const b = g.bounds orelse fail(what ++ ": WebGL pixels are missing");
+    if (g.count != 4096 * scale * scale or b.x != 500 * scale or b.y != 40 * scale or b.w != 64 * scale or b.h != 64 * scale)
+        fail(what ++ ": WebGL canvas does not contain the exact known-colour rectangle");
+}
+
+/// Device scale 2 on the CPU path: DPR, screenshot, stream surface and pixels, then resize.
+fn streamScaleStage(allocator: std.mem.Allocator, arena: std.mem.Allocator, m: *Mcp, path: []const u8) void {
+    var args: [1024]u8 = undefined;
+    m.sendTool("web_open", std.fmt.bufPrint(&args, "{{\"url\":\"file://{s}\",\"ephemeral\":true,\"width\":800,\"height\":600,\"device_scale_factor\":2,\"snapshot\":\"none\"}}", .{path}) catch unreachable);
+    _ = capSc(arena, m.recvLine(60_000), "scale 2 stream fixture open", false);
+    const dpr_code = "{\"code\":\"[devicePixelRatio,innerWidth,innerHeight].join('x')\"}";
+    const dpr = capSc(arena, m.callTool("web_eval", dpr_code), "scale 2 page metrics", false);
+    const dpr_s = dpr.get("value").?.object.get("value").?.string;
+    if (!std.mem.eql(u8, dpr_s, "2x800x600")) {
+        std.debug.print("smoke-mcp: scale 2 page metrics {s}\n", .{dpr_s});
+        fail("scale 2 page does not lay out at DPR 2 over an 800x600 viewport");
+    }
+
+    inline for (.{ "web_screenshot", "web_frame" }) |tool| {
+        const shot_line = m.callTool(tool, if (std.mem.eql(u8, tool, "web_frame")) "{\"format\":\"png\",\"max_width\":1600,\"timeout_ms\":5000}" else "{}");
+        _ = capSc(arena, shot_line, "scale 2 " ++ tool, false);
+        const shot = std.json.parseFromSliceLeaky(std.json.Value, arena, shot_line, .{}) catch fail("scale 2 image: reply is not JSON");
+        var png_bytes: ?[]u8 = null;
+        for (shot.object.get("result").?.object.get("content").?.array.items) |item| {
+            if (!std.mem.eql(u8, item.object.get("type").?.string, "image")) continue;
+            const b64 = item.object.get("data").?.string;
+            const dec = std.base64.standard.Decoder;
+            const buf = arena.alloc(u8, dec.calcSizeForSlice(b64) catch fail("scale 2 screenshot base64")) catch fail("scale 2 screenshot allocation");
+            dec.decode(buf, b64) catch fail("scale 2 screenshot base64");
+            png_bytes = buf;
+        }
+        const img = @import("util/png.zig").decodeRgba(arena, png_bytes orelse fail("scale 2 screenshot carried no image")) catch fail("scale 2 screenshot PNG decode");
+        if (img.w != 1600 or img.h != 1200) {
+            std.debug.print("smoke-mcp: scale 2 screenshot {d}x{d}\n", .{ img.w, img.h });
+            fail("scale 2 screenshot is not 1600x1200 physical pixels");
+        }
+        streamScaledBlock(img.rgba, img.w, img.h, .{ 0, 255, 0, 255 }, "scale 2 " ++ tool);
+        streamWebglPixels(img.rgba, img.w, img.h, 2, "scale 2 " ++ tool);
+    }
+
+    const offer = streamOffer(m, arena);
+    var rig = StreamRig.connect(allocator, offer.get("socket_path").?.string);
+    defer rig.deinit();
+    rig.expect = .{ 1600, 1200, 800, 600 };
+    rig.send(.auth, offer.get("token").?.string);
+    const full = rig.frame();
+    if (full.x != 0 or full.y != 0 or full.w != 1600 or full.h != 1200) fail("scale 2 first stream frame is not the full 1600x1200 surface");
+    rig.ack();
+    while (rig.next(300)) |tag| if (tag == .frame_end) {
+        _ = rig.damage.take();
+        rig.ack();
+    };
+    if (!std.mem.eql(u8, rig.pixels[0..4], &.{ 0x33, 0x22, 0x11, 0xff })) fail("scale 2 stream frame is not the real page");
+    streamScaledBlock(rig.pixels, rig.w, rig.h, .{ 0, 255, 0, 255 }, "scale 2 stream");
+    streamWebglPixels(rig.pixels, rig.w, rig.h, 2, "scale 2 stream");
+
+    // A resize keeps the scale: a 400x300 viewport is an 800x600 surface.
+    rig.expect = .{ 800, 600, 400, 300 };
+    const resized = m.callTool("web_resize", "{\"width\":400,\"height\":300}");
+    _ = capSc(arena, resized, "scale 2 resize", false);
+    const deadline = nowMs() + 5000;
+    var settled = false;
+    while (!settled and nowMs() < deadline) {
+        const tag = rig.next(300) orelse continue;
+        if (tag != .frame_end) continue;
+        _ = rig.damage.take();
+        rig.ack();
+        settled = rig.w == 800 and streamColorBounds(rig.pixels, rig.w, rig.h, .{ 0, 255, 0, 255 }).count == 1600;
+    }
+    if (rig.w != 800 or rig.h != 600) fail("scale 2 resize did not announce an 800x600 stream surface");
+    streamScaledBlock(rig.pixels, rig.w, rig.h, .{ 0, 255, 0, 255 }, "scale 2 resized stream");
+    const after = capSc(arena, m.callTool("web_eval", dpr_code), "scale 2 resized page metrics", false);
+    if (!std.mem.eql(u8, after.get("value").?.object.get("value").?.string, "2x400x300"))
+        fail("scale 2 page did not keep DPR 2 over a 400x300 viewport after resize");
+    _ = capSc(arena, m.callTool("web_close", "{}"), "scale 2 view teardown", false);
+    rig.ended();
+    say("smoke-mcp: REAL scale 2 CPU view: DPR 2, 1600x1200 screenshot/frame/stream pixels, resize to 800x600 at DPR 2 ok");
+}
+
+/// The existing binary reader measures CEF's cap, not a client-side timer or a JSON frame rate.
+fn streamFpsStage(allocator: std.mem.Allocator, arena: std.mem.Allocator, m: *Mcp, exe: [*:0]const u8, rt: []const u8) void {
+    const path = std.fmt.allocPrint(arena, "{s}/stream-fps.html", .{rt}) catch unreachable;
+    @import("util/atomicwrite.zig").writeFileExact(path, "<!doctype html><style>body{margin:0;background:#112233}div{width:50px;height:50px;background:red;animation:slide 1s linear infinite}@keyframes slide{to{transform:translateX(200px)}}</style><div></div>", 0o600) catch fail("write FPS fixture");
+    var args: [1024]u8 = undefined;
+    var views: [3]u32 = undefined;
+    for ([_]u16{ 15, 30, 60 }, 0..) |fps, i| {
+        m.sendTool("web_open", std.fmt.bufPrint(&args, "{{\"url\":\"file://{s}\",\"width\":800,\"height\":600,\"snapshot\":\"none\",\"max_fps\":{d}}}", .{ path, fps }) catch unreachable);
+        const opened = capSc(arena, m.recvLine(60_000), "FPS fixture open", false);
+        if (capInt(opened, "max_fps") != fps) fail("open did not report the requested CEF cap");
+        views[i] = @intCast(capInt(opened, "view"));
+    }
+    // All three animated views stay alive while each stream is sampled.
+    for ([_]u16{ 15, 30, 60 }, 0..) |fps, i| {
+        const line = m.callTool("web_stream", std.fmt.bufPrint(&args, "{{\"pane\":{d},\"audio\":false}}", .{views[i]}) catch unreachable);
+        const offer = capSc(arena, line, "FPS stream offer", false);
+        if (capInt(offer, "max_fps") != fps) fail("stream did not preserve its view's cap");
+        var rig = StreamRig.connect(allocator, offer.get("socket_path").?.string);
+        rig.send(.auth, offer.get("token").?.string);
+        _ = rig.frame();
+        rig.ack();
+        const start = nowMs();
+        var count: u32 = 0;
+        while (nowMs() - start < 2100) {
+            const tag = rig.next(100) orelse continue;
+            if (tag != .frame_end) continue;
+            _ = rig.damage.take();
+            rig.ack();
+            count += 1;
+        }
+        const actual = @as(f64, @floatFromInt(count)) * 1000 / @as(f64, @floatFromInt(nowMs() - start));
+        std.debug.print("smoke-mcp: CSS stream view {d}: cap {d}, measured {d:.2} FPS\n", .{ views[i], fps, actual });
+        if (actual < @as(f64, @floatFromInt(fps)) * 0.75 or actual > @as(f64, @floatFromInt(fps)) * 1.2) fail("CSS stream FPS does not match the per-view CEF cap");
+        rig.deinit();
+    }
+    for (views) |view| _ = capSc(arena, m.callTool("web_close", std.fmt.bufPrint(&args, "{{\"pane\":{d}}}", .{view}) catch unreachable), "FPS view close", false);
+
+    const config = std.fmt.allocPrint(arena, "{s}/config/sketerm/config.conf", .{rt}) catch unreachable;
+    @import("util/pathz.zig").makeParentDirs(config) catch fail("FPS config parent");
+    @import("util/atomicwrite.zig").writeFileExact(config, "[mcp]\nweb_max_fps = 30\n[mcp.streamfps]\nweb_max_fps = 15\n", 0o600) catch fail("write FPS config");
+    var z: [4096:0]u8 = undefined;
+    defer _ = c.unlink(pathz.pathZ(&z, config) catch unreachable);
+    var configured = Mcp.spawn(allocator, exe, &.{ "--profile", "streamfps" });
+    configured.initialize();
+    const caps = capSc(arena, configured.callTool("capabilities", "{}"), "configured FPS preflight", false);
+    if (capInt(caps, "web_default_max_fps") != 15) fail("named MCP FPS profile did not override the bare config");
+    configured.sendTool("web_open", std.fmt.bufPrint(&args, "{{\"url\":\"file://{s}\",\"width\":800,\"height\":600,\"snapshot\":\"none\"}}", .{path}) catch unreachable);
+    if (capInt(capSc(arena, configured.recvLine(60_000), "configured FPS open", false), "max_fps") != 15) fail("configured FPS did not propagate into the new view");
+    _ = capSc(arena, configured.callTool("web_close", "{}"), "configured FPS close", false);
+    configured.closeStdinWait();
+    _ = c.unlink(pathz.pathZ(&z, config) catch unreachable);
+    _ = c.setenv("SKETERM_WEB_DISABLE_MAX_FPS", "1", 1);
+    defer _ = c.unsetenv("SKETERM_WEB_DISABLE_MAX_FPS");
+    var unsupported = Mcp.spawn(allocator, exe, &.{});
+    unsupported.initialize();
+    const refused = capSc(arena, unsupported.callTool("web_open", "{\"url\":\"about:blank\",\"max_fps\":15,\"snapshot\":\"none\"}"), "unsupported FPS open", true);
+    if (!std.mem.eql(u8, refused.get("error").?.object.get("code").?.string, "unavailable")) fail("unsupported FPS open did not fail closed");
+    if (capInt(capSc(arena, unsupported.callTool("web_tabs", "{}"), "unsupported FPS empty views", false), "count") != 0) fail("unsupported FPS request minted a view");
+    unsupported.sendTool("web_open", "{\"url\":\"about:blank\",\"snapshot\":\"none\"}");
+    _ = capSc(arena, unsupported.recvLine(60_000), "legacy helper default open", false);
+    const stream_refused = capSc(arena, unsupported.callTool("web_stream", "{\"max_fps\":30}"), "unsupported FPS stream", true);
+    if (!std.mem.eql(u8, stream_refused.get("error").?.object.get("code").?.string, "unavailable")) fail("unsupported FPS stream did not fail closed");
+    _ = capSc(arena, unsupported.callTool("web_close", "{}"), "legacy FPS close", false);
+    unsupported.closeStdinWait();
+    say("smoke-mcp: per-view FPS, config/profile propagation and unsupported-helper refusals ok");
+}
+
+/// Real CEF streams keep painting and accepting trusted input while MCP itself is waiting.
+fn webStreamStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) void {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var m = Mcp.spawn(allocator, exe, if (c.getenv("SKETERM_SMOKE_MCP_WEBSTREAM_NAMED") != null) &.{ "--name", "stream-webgl" } else &.{});
+    m.initialize();
+    const before_caps = capSc(arena, m.callTool("capabilities", "{}"), "stream preflight", false);
+    if (!before_caps.get("web_stream").?.bool or before_caps.get("web_stream_audio").? != .null or before_caps.get("web_software_webgl").? != .null)
+        fail("stream preflight fabricated negotiated audio before startup");
+    var args: [2048]u8 = undefined;
+    const path = std.fmt.allocPrint(arena, "{s}/stream-fixture.html", .{rt}) catch fail("stream fixture path");
+    const html = "<!doctype html><html><head><title>stream-ready</title><style>body{margin:0;height:4000px;background:#112233}" ++
+        "#block{position:fixed;left:40px;top:40px;width:20px;height:20px;background:#00ff00}" ++
+        "#pad{position:fixed;left:200px;top:40px;width:80px;height:60px;background:#445566;cursor:crosshair}" ++
+        "#field{position:fixed;left:40px;top:150px;width:180px;height:30px}" ++
+        "#gl{position:fixed;left:500px;top:40px;width:64px;height:64px}" ++
+        "#select{position:fixed;left:300px;top:150px;width:180px;height:30px}</style></head><body>" ++
+        "<canvas id=gl width=64 height=64></canvas><div id=block></div><div id=pad></div><input id=field><select id=select><option>first</option><option>second</option><option>third</option></select><script>" ++
+        "window.gl=document.getElementById('gl').getContext('webgl',{preserveDrawingBuffer:true});" ++
+        "if(window.gl){gl.clearColor(1,0,1,1);gl.clear(gl.COLOR_BUFFER_BIT);gl.finish()}" ++
+        "window.block=document.getElementById('block');window.pad=document.getElementById('pad');window.field=document.getElementById('field');" ++
+        "window.seen={pad_down:null,pad_up:null,click:null,field_down:null,field_up:null,shift_down:null,shift_up:null,wheel:null," ++
+        "pad_down_count:0,pad_up_count:0,field_down_count:0,field_up_count:0,shift_down_count:0,shift_up_count:0,text_events:0,text_trusted:true,scroll_events:0,events:[]};" ++
+        "window.streamGoal='stream-input-ok';window.streamInitialScrollY=scrollY;" ++
+        "window.streamChecks=()=>{const s=window.seen,down=s.pad_down,up=s.pad_up,kd=s.shift_down,ku=s.shift_up;" ++
+        "const base=window.streamReleaseBase||{pad_down:0,pad_up:0,shift_down:0,shift_up:0};const c={" ++
+        "pointer_down:s.pad_down_count===base.pad_down+1&&!!down&&down.trusted&&down.shift&&down.x===230&&down.y===60&&down.button===0&&down.buttons===1," ++
+        "pointer_up:s.pad_up_count===base.pad_up+1&&!!up&&up.trusted&&up.x===230&&up.y===60&&up.button===0&&up.buttons===0," ++
+        "shift_down:s.shift_down_count===base.shift_down+1&&!!kd&&kd.trusted&&kd.key==='Shift'&&kd.shift," ++
+        "shift_up:s.shift_up_count===base.shift_up+1&&!!ku&&ku.trusted&&ku.key==='Shift'&&!ku.shift};" ++
+        "if(window.streamGoal==='stream-release-ok')return c;" ++
+        "const click=s.click,fd=s.field_down,fu=s.field_up,w=s.wheel;return Object.assign(c,{" ++
+        "click:!!click&&click.trusted&&click.shift&&click.x===230&&click.y===60&&click.button===0," ++
+        "field_down:s.field_down_count===1&&!!fd&&fd.trusted&&fd.x===100&&fd.y===165&&!fd.shift&&fd.buttons===1," ++
+        "field_up:s.field_up_count===1&&!!fu&&fu.trusted&&fu.x===100&&fu.y===165&&!fu.shift&&fu.buttons===0," ++
+        "text:s.text_events>0&&s.text_trusted&&window.field.value==='stream text'," ++
+        "wheel:!!w&&w.trusted&&w.x===400&&w.y===400&&w.dy>0&&!w.shift&&w.buttons===0," ++
+        "scroll:s.scroll_events>0&&scrollY>window.streamInitialScrollY,focus:document.activeElement===window.field})};" ++
+        "function done(){if(Object.values(window.streamChecks()).every(Boolean))document.title=window.streamGoal}" ++
+        "function remember(e){const r={type:e.type,target:e.target.id||e.target.nodeName||'window',trusted:e.isTrusted," ++
+        "x:e.clientX??null,y:e.clientY??null,key:e.key||'',shift:!!e.shiftKey,button:e.button??null,buttons:e.buttons??null," ++
+        "dx:e.deltaX??null,dy:e.deltaY??null,value:window.field.value,scroll_y:scrollY};" ++
+        "window.seen.events.push(r);if(window.seen.events.length>64)window.seen.events.shift();return r}" ++
+        "for(const type of ['pointerdown','pointerup','click','keydown','keyup','input','wheel','scroll','focusin'])addEventListener(type,e=>{" ++
+        "const s=window.seen,r=remember(e);if(e.target===window.pad){" ++
+        "if(type==='pointerdown'){s.pad_down=r;s.pad_down_count++}if(type==='pointerup'){s.pad_up=r;s.pad_up_count++}if(type==='click')s.click=r}" ++
+        "if(e.target===window.field){if(type==='pointerdown'){s.field_down=r;s.field_down_count++}if(type==='pointerup'){s.field_up=r;s.field_up_count++}" ++
+        "if(type==='input'){s.text_events++;s.text_trusted=s.text_trusted&&e.isTrusted}}" ++
+        "if(e.key==='Shift'){if(type==='keydown'){s.shift_down=r;s.shift_down_count++}if(type==='keyup'){s.shift_up=r;s.shift_up_count++}}" ++
+        "if(type==='wheel')s.wheel=r;if(type==='scroll')s.scroll_events++;done()},true);" ++
+        "pad.addEventListener('click',e=>{if(e.isTrusted&&!window.audio){window.audio=new AudioContext({sampleRate:48000});" ++
+        "const o=audio.createOscillator(),g=audio.createGain();g.gain.value=.25;o.frequency.value=440;o.connect(g).connect(audio.destination);o.start();audio.resume()}});" ++
+        "</script></body></html>";
+    @import("util/atomicwrite.zig").writeFileExact(path, html, 0o600) catch fail("write stream fixture");
+    m.sendTool("web_open", std.fmt.bufPrint(&args, "{{\"url\":\"file://{s}\",\"ephemeral\":true,\"width\":800,\"height\":600,\"snapshot\":\"none\"}}", .{path}) catch unreachable);
+    _ = capSc(arena, m.recvLine(60_000), "stream fixture open", false);
+    const default_rate = capSc(arena, m.callTool("capabilities", "{}"), "default FPS preflight", false);
+    if (!default_rate.get("web_max_fps").?.bool or capInt(default_rate, "web_default_max_fps") != 60) fail("headless default is not the configured CEF cap of 60 FPS");
+    if (@import("builtin").os.tag == .linux) {
+        const gl_probe = m.callTool("web_eval", "{\"body\":\"if(!window.gl)return {webgl:false};const d=gl.getExtension('WEBGL_debug_renderer_info');return {webgl:true,renderer:d?gl.getParameter(d.UNMASKED_RENDERER_WEBGL):gl.getParameter(gl.RENDERER),version:gl.getParameter(gl.VERSION)}\",\"strict\":true}");
+        const gl_value = capSc(arena, gl_probe, "WebGL renderer", false).get("value").?.object.get("value").?.object;
+        if (!gl_value.get("webgl").?.bool) {
+            say(gl_probe);
+            fail("ordinary MCP CPU view lost WebGL");
+        }
+        const renderer = gl_value.get("renderer").?.string;
+        std.debug.print("smoke-mcp: WebGL renderer: {s}; version: {s}\n", .{ renderer, gl_value.get("version").?.string });
+        if (std.mem.indexOf(u8, renderer, "SwiftShader") == null) fail("MCP WebGL did not use the requested software renderer");
+    }
+    const caps = capSc(arena, m.callTool("capabilities", "{}"), "stream handshake", false);
+    if (!caps.get("web_stream").?.bool) fail("built real helper did not negotiate web-stream");
+    if (@import("builtin").os.tag == .linux and !caps.get("web_software_webgl").?.bool) fail("ordinary helper did not report its software WebGL policy");
+    const audio = caps.get("web_stream_audio").?.bool;
+    const offer = streamOffer(&m, arena);
+    if (offer.get("audio").?.bool != audio or capInt(offer, "protocol_version") != 1 or capInt(offer, "max_unacked_frames") != 2 or
+        !std.mem.eql(u8, offer.get("pixel_format").?.string, "bgra-premultiplied")) fail("web_stream result differs from negotiated V1 contract");
+    const socket_path = offer.get("socket_path").?.string;
+    const token = offer.get("token").?.string;
+    const helper_socket = caps.get("web_socket").?.string;
+    const dir_end = std.mem.lastIndexOfScalar(u8, helper_socket, '/') orelse fail("helper has no instance socket directory");
+    if (!std.mem.startsWith(u8, socket_path, helper_socket[0 .. dir_end + 1]) or
+        std.mem.indexOfScalar(u8, socket_path[dir_end + 1 ..], '/') != null)
+        fail("stream socket was not placed directly in this MCP instance directory");
+    if (!webstream.isToken(token)) fail("web_stream returned an invalid token");
+    var rig = StreamRig.connect(allocator, socket_path);
+    defer rig.deinit();
+    rig.send(.auth, token);
+    const full = rig.frame();
+    if (full.x != 0 or full.y != 0 or full.w != 800 or full.h != 600 or !std.mem.eql(u8, rig.pixels[0..4], &.{ 0x33, 0x22, 0x11, 0xff }))
+        fail("first stream frame was not the full real page");
+    rig.ack();
+    // Late layout paints are consumed before the exact damage assertion.
+    while (rig.next(300)) |tag| if (tag == .frame_end) {
+        _ = rig.damage.take();
+        rig.ack();
+    };
+    if (@import("builtin").os.tag == .linux) {
+        streamWebglPixels(rig.pixels, rig.w, rig.h, 1, "binary stream");
+        const stream_png = @import("util/png.zig").encodeShm(arena, rig.pixels, rig.w, rig.h, rig.w * 4, @intFromEnum(@import("util/png.zig").ShmFormat.argb8888)) catch fail("WebGL stream evidence encode");
+        @import("util/atomicwrite.zig").writeFileExact(std.fmt.allocPrint(arena, "{s}/stream-webgl-binary.png", .{rt}) catch unreachable, stream_png, 0o600) catch fail("WebGL stream evidence write");
+        inline for (.{ "web_screenshot", "web_frame" }) |tool| {
+            const line = m.callTool(tool, if (std.mem.eql(u8, tool, "web_frame")) "{\"format\":\"png\",\"max_width\":800,\"timeout_ms\":5000}" else "{}");
+            _ = capSc(arena, line, "WebGL " ++ tool, false);
+            const result = std.json.parseFromSliceLeaky(std.json.Value, arena, line, .{}) catch fail("WebGL image JSON");
+            var checked = false;
+            for (result.object.get("result").?.object.get("content").?.array.items) |item| {
+                if (!std.mem.eql(u8, item.object.get("type").?.string, "image")) continue;
+                const b64 = item.object.get("data").?.string;
+                const dec = std.base64.standard.Decoder;
+                const bytes = arena.alloc(u8, dec.calcSizeForSlice(b64) catch fail("WebGL PNG base64")) catch fail("WebGL PNG allocation");
+                dec.decode(bytes, b64) catch fail("WebGL PNG base64");
+                const img = @import("util/png.zig").decodeRgba(arena, bytes) catch fail("WebGL PNG decode");
+                streamWebglPixels(img.rgba, img.w, img.h, 1, tool);
+                @import("util/atomicwrite.zig").writeFileExact(std.fmt.allocPrint(arena, "{s}/stream-webgl-" ++ tool ++ ".png", .{rt}) catch unreachable, bytes, 0o600) catch fail("WebGL image evidence write");
+                checked = true;
+            }
+            if (!checked) fail("WebGL screenshot/frame had no image");
+        }
+        // A subsequent WebGL clear must reach the existing pushed damage path too.
+        _ = capSc(arena, m.callTool("web_eval", "{\"body\":\"gl.clearColor(0,1,1,1);gl.clear(gl.COLOR_BUFFER_BIT);gl.finish();await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));return true\"}"), "WebGL repaint", false);
+        const gl_deadline = nowMs() + 5000;
+        var gl_repaint = false;
+        while (!gl_repaint and nowMs() < gl_deadline) {
+            const tag = rig.next(100) orelse continue;
+            if (tag != .frame_end) continue;
+            _ = rig.damage.take();
+            rig.ack();
+            gl_repaint = std.mem.eql(u8, rig.pixels[(40 * rig.w + 500) * 4 ..][0..4], &.{ 255, 255, 0, 255 });
+        }
+        if (!gl_repaint) fail("WebGL repaint never reached binary stream CPU pixels");
+        say("smoke-mcp: REAL SwiftShader WebGL: exact 64x64 magenta screenshot/frame/stream, subsequent cyan stream repaint ok");
+        std.debug.print("smoke-mcp: WebGL PNG evidence: {s}/stream-webgl-*.png\n", .{rt});
+    } else say("smoke-mcp: SwiftShader WebGL policy is Linux-only; existing stream journey still runs");
+    if (fileExists(socket_path)) fail("stream token authentication did not unlink its single-use listener");
+    const conflict = capSc(arena, m.callTool("web_stream", "{}"), "second stream conflict", true);
+    if (!std.mem.eql(u8, conflict.get("error").?.object.get("code").?.string, "conflict")) fail("second stream was not refused as conflict");
+
+    const baseline = allocator.dupe(u8, rig.pixels) catch fail("stream baseline");
+    defer allocator.free(baseline);
+    streamPaint(&m, "#ff0000");
+    streamBlock(&rig, rig.frame(), baseline, .{ 0, 0, 255, 255 });
+    // Withhold both frame ACKs; newer paints must merge without a third send.
+    streamPaint(&m, "#0000ff");
+    const second = rig.frame();
+    if (second.x != 40 or second.y != 40 or second.w != 20 or second.h != 20) fail("second stream mutation damage differs");
+    streamPaint(&m, "#00ffff");
+    streamPaint(&m, "#ffff00");
+    while (rig.next(300)) |tag| if (tag == .damage or tag == .frame_end or tag == .surface)
+        fail("stream sent a third frame while two were unacknowledged");
+    rig.ack();
+    streamBlock(&rig, rig.frame(), baseline, .{ 0, 255, 255, 255 });
+    rig.ack();
+
+    // No more MCP requests can be dispatched until this wait finishes.
+    m.sendTool("web_wait", "{\"for\":\"title\",\"arg\":\"stream-input-ok\",\"timeout_ms\":10000}");
+    var pending = c.struct_pollfd{ .fd = m.from_child, .events = c.POLLIN, .revents = 0 };
+    if (c.poll(&pending, 1, 200) > 0) fail("stream input wait completed before any stream input");
+    rig.send(.focus, &.{1});
+    rig.key(.down, "Shift", webstream.CEF_SHIFT);
+    rig.pointer(.move, 230, 60, webstream.CEF_SHIFT);
+    // Leave time for the crosshair callback before moving to the text field.
+    const cursor_deadline = nowMs() + 2000;
+    while (!rig.cursor_seen and nowMs() < cursor_deadline) {
+        if (rig.next(100)) |tag| if (tag == .frame_end) {
+            _ = rig.damage.take();
+            rig.ack();
+        };
+    }
+    if (!rig.cursor_seen) fail("CSS crosshair was not pushed on the stream");
+    rig.pointer(.down, 230, 60, webstream.CEF_SHIFT);
+    rig.pointer(.up, 230, 60, webstream.CEF_SHIFT);
+    rig.key(.up, "Shift", 0);
+    rig.pointer(.move, 100, 165, 0);
+    rig.pointer(.down, 100, 165, 0);
+    rig.pointer(.up, 100, 165, 0);
+    rig.send(.text, "stream text");
+    var wheel: [20]u8 = undefined;
+    std.mem.writeInt(i32, wheel[0..4], 400, .little);
+    std.mem.writeInt(i32, wheel[4..8], 400, .little);
+    std.mem.writeInt(i32, wheel[8..12], 0, .little);
+    std.mem.writeInt(i32, wheel[12..16], 600, .little);
+    std.mem.writeInt(u32, wheel[16..20], 0, .little);
+    rig.pointer(.move, 400, 400, 0);
+    rig.send(.wheel, &wheel);
+    const input_wait = arena.dupe(u8, m.recvLine(12_000)) catch fail("stream input wait reply");
+    streamInputEvidence(&m, arena, rt, input_wait);
+    if (audio) {
+        const deadline = nowMs() + 5000;
+        while ((!rig.audio_signal or rig.audio_packets < 3) and nowMs() < deadline) {
+            if (rig.next(100)) |tag| if (tag == .frame_end) {
+                _ = rig.damage.take();
+                rig.ack();
+            };
+        }
+        if (!rig.audio_signal or rig.audio_packets < 3) fail("advertised stream audio produced no decoded WebAudio oscillator signal");
+        say("smoke-mcp: stream WebAudio oscillator decoded as non-silent 20ms stereo Opus");
+    } else say("smoke-mcp: stream audio unavailable at runtime (reported false, audio decode skipped)");
+
+    rig.pointer(.move, 350, 165, 0);
+    const focus = capSc(arena, m.callTool("web_eval", "{\"body\":\"window.field.blur();if(window.audio)await audio.suspend();document.getElementById('select').focus();await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));return document.activeElement.id\"}"), "focus closed select before popup baseline", false);
+    if (!std.mem.eql(u8, focus.get("value").?.object.get("value").?.string, "select")) fail("popup baseline could not focus the closed select");
+    // Match the keyboard focus indication Escape leaves after popup close.
+    rig.key(.down, "Escape", 0);
+    rig.key(.up, "Escape", 0);
+    const settle_deadline = nowMs() + 3000;
+    while (nowMs() < settle_deadline) {
+        const tag = rig.next(300) orelse break;
+        if (tag == .frame_end) {
+            _ = rig.damage.take();
+            rig.ack();
+        }
+    }
+    const popup_base = allocator.dupe(u8, rig.pixels) catch fail("popup baseline");
+    defer allocator.free(popup_base);
+    const popup_base_frame = rig.serial;
+    const popup_base_dom = streamPopupDom(&m, arena);
+    const popup_pixels = allocator.dupe(u8, rig.pixels) catch fail("popup open snapshot");
+    defer allocator.free(popup_pixels);
+    const popup_roi = webstream.Rect{ .x = 300, .y = 180, .w = 180, .h = 60 };
+    var popup_damage: ?webstream.Rect = null;
+    rig.pointer(.down, 350, 165, 0);
+    rig.pointer(.up, 350, 165, 0);
+    var popup_seen = false;
+    const popup_deadline = nowMs() + 5000;
+    while (!popup_seen and nowMs() < popup_deadline) {
+        const tag = rig.next(100) orelse continue;
+        if (tag != .frame_end) continue;
+        popup_damage = rig.damage.take();
+        rig.ack();
+        const diff = streamPixelDiff(rig.w, rig.h, popup_base, rig.pixels, popup_roi);
+        // A thin control focus/pressed border is not proof of a popup.
+        popup_seen = diff.count > 100 and diff.bounds.?.h >= 10;
+    }
+    @memcpy(popup_pixels, rig.pixels);
+    const popup_open_frame = rig.serial;
+    const popup_open_dom = streamPopupDom(&m, arena);
+    if (!popup_seen) {
+        streamPopupEvidence(arena, rt, &rig, &.{
+            .{ .name = "baseline", .pixels = popup_base, .frame = popup_base_frame, .dom = popup_base_dom },
+            .{ .name = "open", .pixels = popup_pixels, .frame = popup_open_frame, .dom = popup_open_dom },
+        }, "popup pixels not observed", popup_damage);
+        fail("native select popup was not composed into pushed stream pixels");
+    }
+    rig.key(.down, "Escape", 0);
+    rig.key(.up, "Escape", 0);
+    var popup_gone = false;
+    const close_deadline = nowMs() + 5000;
+    while (!popup_gone and nowMs() < close_deadline) {
+        const tag = rig.next(100) orelse continue;
+        if (tag != .frame_end) continue;
+        popup_damage = rig.damage.take();
+        rig.ack();
+        popup_gone = streamPixelDiff(rig.w, rig.h, popup_base, rig.pixels, popup_roi).count == 0;
+    }
+    if (!popup_gone) {
+        const popup_closed_dom = streamPopupDom(&m, arena);
+        streamPopupEvidence(arena, rt, &rig, &.{
+            .{ .name = "baseline", .pixels = popup_base, .frame = popup_base_frame, .dom = popup_base_dom },
+            .{ .name = "open", .pixels = popup_pixels, .frame = popup_open_frame, .dom = popup_open_dom },
+            .{ .name = "closed", .pixels = rig.pixels, .frame = rig.serial, .dom = popup_closed_dom },
+        }, "popup close did not restore exact underlay pixels", popup_damage);
+        fail("native popup close did not restore the page below it (stream-popup-evidence.json and baseline/open/closed PNGs retained)");
+    }
+
+    // Disconnect releases a held modifier and mouse button on the real page.
+    _ = capSc(arena, m.callTool("web_eval", "{\"body\":\"window.streamReleaseBase={pad_down:window.seen.pad_down_count,pad_up:window.seen.pad_up_count,shift_down:window.seen.shift_down_count,shift_up:window.seen.shift_up_count};window.streamGoal='stream-release-ok';document.title='stream-release-pending';return true\"}"), "start release phase", false);
+    m.sendTool("web_wait", "{\"for\":\"title\",\"arg\":\"stream-release-ok\",\"timeout_ms\":10000}");
+    pending.revents = 0;
+    if (c.poll(&pending, 1, 200) > 0) fail("stream release wait completed before held input was released");
+    rig.key(.down, "Shift", webstream.CEF_SHIFT);
+    rig.pointer(.move, 230, 60, webstream.CEF_SHIFT);
+    rig.pointer(.down, 230, 60, webstream.CEF_SHIFT);
+    _ = c.usleep(100_000);
+    rig.disconnect();
+    const release_wait = arena.dupe(u8, m.recvLine(12_000)) catch fail("stream release wait reply");
+    streamInputEvidence(&m, arena, rt, release_wait);
+    const next_offer = streamOffer(&m, arena);
+
+    // Wrong AUTH consumes its token, then a replayed AUTH ends a fresh stream.
+    var wrong = StreamRig.connect(allocator, next_offer.get("socket_path").?.string);
+    defer wrong.deinit();
+    var bad = next_offer.get("token").?.string[0..webstream.TOKEN_LEN].*;
+    bad[0] = if (bad[0] == '0') '1' else '0';
+    wrong.send(.auth, &bad);
+    wrong.ended();
+    if (fileExists(next_offer.get("socket_path").?.string)) fail("wrong AUTH left the listener reusable");
+    const replay_offer = streamOffer(&m, arena);
+    var replay = StreamRig.connect(allocator, replay_offer.get("socket_path").?.string);
+    defer replay.deinit();
+    replay.send(.auth, replay_offer.get("token").?.string);
+    _ = replay.frame();
+    replay.send(.auth, replay_offer.get("token").?.string);
+    replay.ended();
+    const view_offer = streamOffer(&m, arena);
+    var view_end = StreamRig.connect(allocator, view_offer.get("socket_path").?.string);
+    defer view_end.deinit();
+    view_end.send(.auth, view_offer.get("token").?.string);
+    _ = view_end.frame();
+    _ = capSc(arena, m.callTool("web_close", "{}"), "stream view teardown", false);
+    view_end.ended();
+    streamScaleStage(allocator, arena, &m, path);
+    streamFpsStage(allocator, arena, &m, exe, rt);
+
+    m.sendTool("web_open", "{\"url\":\"about:blank\",\"snapshot\":\"none\",\"width\":800,\"height\":600}");
+    _ = capSc(arena, m.recvLine(60_000), "server teardown view", false);
+    const server_offer = streamOffer(&m, arena);
+    var server_end = StreamRig.connect(allocator, server_offer.get("socket_path").?.string);
+    defer server_end.deinit();
+    server_end.send(.auth, server_offer.get("token").?.string);
+    _ = server_end.frame();
+    m.closeStdinWait();
+    server_end.ended();
+    if (fileExists(server_offer.get("socket_path").?.string)) fail("MCP server teardown leaked a stream socket");
+    say("smoke-mcp: REAL pushed stream full paint, exact damage, two-ACK backpressure, popup/cursor, trusted input during web_wait, auth and teardown ok");
+}
+
 /// Fresh roots in both launch modes: a warm cache hides Chromium's first-run
 /// path, which used to hang before the helper could bind its control socket.
 fn webStartupStage(allocator: std.mem.Allocator, exe: [*:0]const u8) void {
@@ -3613,6 +4613,8 @@ fn webStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) vo
         fail("web_tabs does not list the headless view");
 
     webReviewStage(&m, rt);
+    webHandStage(&m, rt);
+    webStreamStage(allocator, exe, rt);
 
     // ── named profiles against REAL CEF ─────────────────────────────
     //
@@ -4347,90 +5349,6 @@ const PRESENTER_BODY =
 /// The page colour above, in wl_shm byte order (B, G, R).
 const PRESENTER_BGR = [3]u8{ 0xc0, 0x60, 0x30 };
 
-/// A viewer of the MCP's web session: a replica compositor fed from
-/// the attach's `wayland_native` channel, recording what the presenter
-/// showed. The same shape the GUI's app host and appdrive use.
-const PresenterWatch = struct {
-    allocator: std.mem.Allocator,
-    replica: wlcomp.Compositor,
-    chan: u32 = 0,
-    sid: u32 = 0,
-    frames: usize = 0,
-    w: i32 = 0,
-    h: i32 = 0,
-    center: [4]u8 = .{ 0, 0, 0, 0 },
-    title: [128]u8 = undefined,
-    title_len: usize = 0,
-
-    fn init(allocator: std.mem.Allocator) PresenterWatch {
-        var replica = wlcomp.Compositor.init(allocator, .{}) catch fail("presenter watch: replica init");
-        replica.lenient = true;
-        return .{ .allocator = allocator, .replica = replica };
-    }
-
-    /// Register the callbacks once the struct sits at its final address.
-    fn bind(self: *PresenterWatch) void {
-        self.replica.view = .{ .ctx = self, .toplevel_frame = onFrame, .toplevel_title = onTitle };
-    }
-
-    fn deinit(self: *PresenterWatch) void {
-        self.replica.deinit();
-    }
-
-    fn onFrame(ctx: ?*anyopaque, surface: u32, w: i32, h: i32, _: i32, _: i32, _: i32, _: u32, pixels: []const u8) void {
-        const self: *PresenterWatch = @ptrCast(@alignCast(ctx.?));
-        self.sid = surface;
-        self.frames += 1;
-        self.w = w;
-        self.h = h;
-        if (w <= 0 or h <= 0) return;
-        const cx: usize = @intCast(@divTrunc(w, 2));
-        const cy: usize = @intCast(@divTrunc(h, 2));
-        const off = (cy * @as(usize, @intCast(w)) + cx) * 4;
-        if (off + 4 <= pixels.len) @memcpy(&self.center, pixels[off..][0..4]);
-    }
-
-    fn onTitle(ctx: ?*anyopaque, _: u32, title: []const u8) void {
-        const self: *PresenterWatch = @ptrCast(@alignCast(ctx.?));
-        self.title_len = @min(title.len, self.title.len);
-        @memcpy(self.title[0..self.title_len], title[0..self.title_len]);
-    }
-
-    fn titleSlice(self: *const PresenterWatch) []const u8 {
-        return self.title[0..self.title_len];
-    }
-
-    /// One mux frame from the viewer connection.
-    fn feed(self: *PresenterWatch, f: muxclient.Conn.OwnedFrame) void {
-        switch (f.ftype) {
-            .chan_open => {
-                const open = wire.decodeChanOpen(f.payload) orelse return;
-                if (open.kind != .wayland_native) return;
-                self.chan = open.id;
-                self.replica.conn_id = open.id;
-            },
-            .chan_data => {
-                if (self.chan == 0 or f.payload.len < 4) return;
-                if ((wire.decodeChanId(f.payload) orelse return) != self.chan) return;
-                self.replica.feed(f.payload[4..]) catch fail("presenter watch: the replica refused a unit");
-                self.replica.clearOut();
-            },
-            else => {},
-        }
-    }
-
-    /// Ship seat intents toward the session's brain.
-    fn intents(self: *PresenterWatch, conn: *muxclient.Conn, units: []const u8) void {
-        var payload: std.ArrayList(u8) = .empty;
-        defer payload.deinit(self.allocator);
-        var idb: [4]u8 = undefined;
-        std.mem.writeInt(u32, &idb, self.chan, .little);
-        payload.appendSlice(self.allocator, &idb) catch fail("oom");
-        payload.appendSlice(self.allocator, units) catch fail("oom");
-        conn.sendFrame(.chan_data, payload.items) catch fail("presenter watch: could not send seat intents");
-    }
-};
-
 fn presenterCenterMatches(px: [4]u8) bool {
     var i: usize = 0;
     while (i < 3) : (i += 1) {
@@ -4440,37 +5358,18 @@ fn presenterCenterMatches(px: [4]u8) bool {
     return true;
 }
 
-/// Pump the viewer until `cond` holds or the deadline passes.
-fn presenterPumpUntil(
-    conn: *muxclient.Conn,
-    watch: *PresenterWatch,
-    allocator: std.mem.Allocator,
-    deadline_ms: i64,
-    comptime cond: fn (*const PresenterWatch) bool,
-) bool {
-    while (nowMs() < deadline_ms) {
-        if (cond(watch)) return true;
-        const f = conn.recvFrameFor(200) catch continue;
-        defer f.deinit(allocator);
-        watch.feed(f);
+fn presenterAwait(app: *appdrive.App, title: []const u8, deadline_ms: i64) ?u32 {
+    while (true) {
+        for (app.windows.items) |win| {
+            if (win.frames == 0 or win.w <= 0 or win.h <= 0 or
+                !std.mem.eql(u8, win.title orelse "", title)) continue;
+            const off = (@as(usize, @intCast(@divTrunc(win.h, 2))) * @as(usize, @intCast(win.w)) +
+                @as(usize, @intCast(@divTrunc(win.w, 2)))) * 4;
+            if (off + 4 <= win.pixels.items.len and presenterCenterMatches(win.pixels.items[off..][0..4].*)) return win.id;
+        }
+        if (nowMs() >= deadline_ms or app.exited) return null;
+        _ = app.pumpOnce(@intCast(@min(200, @max(0, deadline_ms - nowMs()))));
     }
-    return cond(watch);
-}
-
-fn presenterHasChan(w: *const PresenterWatch) bool {
-    return w.chan != 0;
-}
-
-fn presenterPainted(w: *const PresenterWatch) bool {
-    return w.frames > 0 and presenterCenterMatches(w.center) and std.mem.eql(u8, w.titleSlice(), "PRESENTER-PAGE");
-}
-
-fn presenterClicked(w: *const PresenterWatch) bool {
-    return std.mem.eql(u8, w.titleSlice(), "PRESENTER-CLICKED");
-}
-
-fn presenterKeyed(w: *const PresenterWatch) bool {
-    return std.mem.eql(u8, w.titleSlice(), "PRESENTER-KEY-a");
 }
 
 /// A JSON string field's value out of `web.json` (no escapes in the
@@ -4493,6 +5392,9 @@ fn presenceField(json: []const u8, key: []const u8, buf: []u8) ?[]const u8 {
 /// and a key injected through the viewer's seat reach the page (its
 /// title answers), and the assistant's own tools still work after.
 fn webPresenterStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) void {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
     var http = TinyHttp.start() orelse fail("could not bind a loopback HTTP server for the presenter stage");
     defer http.deinit();
     http.body = PRESENTER_BODY;
@@ -4526,57 +5428,27 @@ fn webPresenterStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []con
     var sock_buf: [512]u8 = undefined;
     const mux_sock = presenceField(presence, "mux_socket", &sock_buf) orelse fail("presenter: web.json names no mux_socket");
 
-    // A viewer, the way the GUI's Watch button attaches: hello, attach
-    // with the controller lease (kind mcp, control) so its seat intents
-    // are applied rather than dropped.
-    var conn = muxclient.Conn.connectProbed(allocator, mux_sock) catch fail("presenter: could not connect a viewer to the private daemon");
-    defer conn.deinit();
-    conn.setNonBlocking();
-    conn.sendJson(.hello, .{ .proto = wire.PROTO_VERSION }) catch fail("presenter: viewer hello");
-    (conn.recvExpectFor(&.{.welcome}, 15_000) catch fail("presenter: viewer got no welcome")).deinit(allocator);
-    conn.sendAttach(session, .{ .kind = "mcp", .control = true }) catch fail("presenter: viewer attach");
-    (conn.recvExpectFor(&.{.snapshot}, 15_000) catch fail("presenter: viewer attach got no snapshot")).deinit(allocator);
-
-    var watch = PresenterWatch.init(allocator);
-    defer watch.deinit();
-    watch.bind();
-    if (!presenterPumpUntil(&conn, &watch, allocator, nowMs() + 20_000, presenterHasChan))
-        fail("presenter: the web session announced no wayland_native channel to the viewer");
-    if (!presenterPumpUntil(&conn, &watch, allocator, nowMs() + 30_000, presenterPainted)) {
-        std.debug.print("smoke-mcp: presenter watch: frames={d} size={d}x{d} center=({d},{d},{d}) title=\"{s}\"\n", .{
-            watch.frames, watch.w, watch.h, watch.center[2], watch.center[1], watch.center[0], watch.titleSlice(),
-        });
+    const viewer = appdrive.App.attachExisting(allocator, session, null, mux_sock, null) catch
+        fail("presenter: could not attach the multi-channel viewer");
+    defer viewer.detach();
+    const win_id = presenterAwait(viewer, "PRESENTER-PAGE", nowMs() + 30_000) orelse
         fail("presenter: no toplevel titled PRESENTER-PAGE painted in the page colour reached the viewer");
+    const win = viewer.winById(win_id) orelse fail("presenter: the page window vanished");
+    const chan = win.chan;
+    const sid = win.sid;
+    viewer.clickEx(win_id, @floatFromInt(@divTrunc(win.w, 2)), @floatFromInt(@divTrunc(win.h, 2)), 1, 100, 1) catch
+        fail("presenter: could not inject the viewer's click");
+    if (presenterAwait(viewer, "PRESENTER-CLICKED", nowMs() + 15_000) == null) {
+        std.debug.print("smoke-mcp: presenter input channel={d} surface={d}\n", .{ chan, sid });
+        say(m.callTool("web_wait", "{\"for\":\"title\",\"arg\":\"PRESENTER-CLICKED\",\"timeout_ms\":1000}"));
+        fail("presenter: the viewer did not receive the clicked page title");
     }
-
-    // Click the page through the viewer's seat: enter + motion at the
-    // centre, press and release the left button.
-    {
-        var units: std.ArrayList(u8) = .empty;
-        defer units.deinit(allocator);
-        const cx: f64 = @floatFromInt(@divTrunc(watch.w, 2));
-        const cy: f64 = @floatFromInt(@divTrunc(watch.h, 2));
-        wlpipe.appendSeatEnter(&units, allocator, watch.sid, cx, cy) catch fail("oom");
-        wlpipe.appendSeatMotion(&units, allocator, cx, cy) catch fail("oom");
-        wlpipe.appendSeatButton(&units, allocator, 0x110, true) catch fail("oom");
-        wlpipe.appendSeatButton(&units, allocator, 0x110, false) catch fail("oom");
-        watch.intents(&conn, units.items);
-    }
-    if (!presenterPumpUntil(&conn, &watch, allocator, nowMs() + 15_000, presenterClicked))
-        fail("presenter: a click injected through the viewer's seat never reached the page (title stayed put)");
-
-    // A key, through the hub's keymap: evdev 30 is `a` on every layout
-    // the hub ships.
-    {
-        var units: std.ArrayList(u8) = .empty;
-        defer units.deinit(allocator);
-        wlpipe.appendSeatKbdEnter(&units, allocator, watch.sid) catch fail("oom");
-        wlpipe.appendSeatKey(&units, allocator, 30, true) catch fail("oom");
-        wlpipe.appendSeatKey(&units, allocator, 30, false) catch fail("oom");
-        watch.intents(&conn, units.items);
-    }
-    if (!presenterPumpUntil(&conn, &watch, allocator, nowMs() + 15_000, presenterKeyed))
-        fail("presenter: a key injected through the viewer's seat never reached the page");
+    const clicked = capSc(arena, m.callTool("web_wait", "{\"for\":\"title\",\"arg\":\"PRESENTER-CLICKED\",\"timeout_ms\":1000}"), "presenter page click", false);
+    if (!clicked.get("settled").?.bool or !std.mem.eql(u8, clicked.get("title").?.string, "PRESENTER-CLICKED"))
+        fail("presenter: the page did not confirm the viewer's click");
+    viewer.pressKey(win_id, "a") catch fail("presenter: could not inject the viewer's key");
+    if (presenterAwait(viewer, "PRESENTER-KEY-a", nowMs() + 15_000) == null)
+        fail("presenter: the viewer did not receive the keyed page title");
 
     // The assistant's own tools keep working underneath the viewer.
     if (std.mem.indexOf(u8, m.callTool("web_eval", "{\"code\":\"document.title\"}"), "PRESENTER-KEY-a") == null)
@@ -4768,6 +5640,7 @@ fn fakeWebengine(allocator: std.mem.Allocator, sock_path: []const u8) u8 {
     var pol_views: [8]u32 = @splat(0);
     var pol_serials: [8]u32 = @splat(0);
     var pol_n: usize = 0;
+    const policy_ack = c.getenv("SKETERM_FAKE_WEB_POLICY") != null and c.getenv("SKETERM_FAKE_WEB_POLICY_LEGACY") == null;
     while (true) {
         var tmp: [65536]u8 = undefined;
         const n = c.read(fd, &tmp, tmp.len);
@@ -4785,14 +5658,16 @@ fn fakeWebengine(allocator: std.mem.Allocator, sock_path: []const u8) u8 {
                     const with_policy = c.getenv("SKETERM_FAKE_WEB_POLICY") != null;
                     const base = [_][]const u8{ webproto.CAP_FRAMES_SHM, webproto.CAP_SEMANTIC, webproto.CAP_VIEW_CREATE_URL };
                     const ctx = base ++ [_][]const u8{ webproto.CAP_CONTEXTS, webproto.CAP_CONTEXTS_FAIL_CLOSED };
-                    const pol = base ++ [_][]const u8{webproto.CAP_NET_POLICY};
-                    const both = ctx ++ [_][]const u8{webproto.CAP_NET_POLICY};
+                    const legacy_pol = base ++ [_][]const u8{webproto.CAP_NET_POLICY};
+                    const legacy_both = ctx ++ [_][]const u8{webproto.CAP_NET_POLICY};
+                    const pol = legacy_pol ++ [_][]const u8{webproto.CAP_NET_POLICY_ACK};
+                    const both = legacy_both ++ [_][]const u8{webproto.CAP_NET_POLICY_ACK};
                     const caps: []const []const u8 = if (with_contexts and with_policy)
-                        &both
+                        (if (policy_ack) &both else &legacy_both)
                     else if (with_contexts)
                         &ctx
                     else if (with_policy)
-                        &pol
+                        (if (policy_ack) &pol else &legacy_pol)
                     else
                         &base;
                     webproto.encode(allocator, &out, webproto.HelloAck{
@@ -4816,6 +5691,20 @@ fn fakeWebengine(allocator: std.mem.Allocator, sock_path: []const u8) u8 {
                         pol_serials[pol_n] = req.serial;
                         pol_n += 1;
                     }
+                    if (policy_ack) {
+                        webproto.encode(allocator, &out, webproto.EvNetPolicy{
+                            .view = req.view,
+                            .serial = req.serial,
+                            .active = 1,
+                            .exhausted = 0,
+                            .requests = 0,
+                            .bytes = 0,
+                            .navigations = 0,
+                            .ms_left = 0,
+                            .denied = @splat(0),
+                        }) catch return 1;
+                        fakeFrameLog("net_policy_ack view={d} serial={d}\n", .{ req.view, req.serial });
+                    }
                 },
                 .net_policy_req => {
                     const req = webproto.decode(webproto.NetPolicyReq, frame.payload) catch return 1;
@@ -4823,11 +5712,13 @@ fn fakeWebengine(allocator: std.mem.Allocator, sock_path: []const u8) u8 {
                     for (pol_views[0..pol_n], pol_serials[0..pol_n]) |v, s| {
                         if (v == req.view) serial = s;
                     }
+                    const active = serial != 0;
+                    if (req.serial != 0) serial = req.serial;
                     const exhausted = c.getenv("SKETERM_FAKE_WEB_POLICY_EXHAUST") != null;
                     webproto.encode(allocator, &out, webproto.EvNetPolicy{
                         .view = req.view,
                         .serial = serial,
-                        .active = if (serial != 0) 1 else 0,
+                        .active = @intFromBool(active),
                         .exhausted = if (exhausted) @intFromEnum(webproto.NetReason.request_cap) else 0,
                         .requests = if (exhausted) 5 else 1,
                         .bytes = 100,
@@ -5051,8 +5942,9 @@ fn webSessionFakeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []c
         // file, and a missing presence file names no session either.
         if (std.mem.indexOf(u8, pj, "\"mcp_pid\":") == null)
             fail("no presence file was written for the opted-out helper");
-        if (std.mem.indexOf(u8, pj, "\"session\"") != null)
-            fail("opt-out still advertised a session in web.json");
+        if (presenceField(pj, "session", &args_buf)) |session| {
+            if (session.len != 0) fail("opt-out still advertised a session in web.json");
+        }
         m.closeStdinWait();
     }
 }
@@ -5264,6 +6156,9 @@ fn webProfileFakeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []c
 /// contract (traffic refused, reads loud). Same fake-helper setup as
 /// `webProfileFakeStage`.
 fn webPolicyFakeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) void {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
     var self_buf: [4096:0]u8 = undefined;
     const self_len = c.readlink("/proc/self/exe", &self_buf, self_buf.len - 1);
     if (self_len <= 0) fail("cannot resolve the smoke binary path");
@@ -5307,9 +6202,7 @@ fn webPolicyFakeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []co
     _ = c.setenv("SKETERM_FAKE_WEB_FRAMES", frames.ptr, 1);
     defer _ = c.unsetenv("SKETERM_FAKE_WEB_FRAMES");
 
-    // (15) With the capability: net_policy_set travels STRICTLY before
-    // the view_create_url naming the same view (there is no ack; frame
-    // order is the entire install-before-first-request guarantee).
+    // (15) The capable fake acknowledges installation before the first view.
     {
         var m = Mcp.spawn(allocator, exe, &.{});
         m.initialize();
@@ -5321,6 +6214,12 @@ fn webPolicyFakeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []co
             std.mem.indexOf(u8, opened, "\"policy_source\":\"call\"") == null or
             std.mem.indexOf(u8, opened, "\"max_requests\":5") == null)
             fail("web_open does not echo the enforced policy");
+        const caps_reply = m.callTool("capabilities", "{}");
+        const caps = capSc(arena, caps_reply, "capable policy preflight", false);
+        if (caps.get("web_policy_ack").? != .bool or !caps.get("web_policy_ack").?.bool) {
+            say(caps_reply);
+            fail("policy-capable fake did not advertise correlated acknowledgements");
+        }
         const log = readSmall(frames, &file_buf);
         const ps = std.mem.indexOf(u8, log, "net_policy_set view=1") orelse
             fail("no net_policy_set reached the helper");
@@ -5336,6 +6235,34 @@ fn webPolicyFakeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []co
             std.mem.indexOf(u8, pol, "\"policy_source\":\"call\"") == null or
             std.mem.indexOf(u8, pol, "\"durable\":false") == null)
             fail("web_policy does not report the live policy");
+        m.closeStdinWait();
+    }
+
+    // Older helpers can install policies, but cannot acknowledge live updates.
+    {
+        _ = c.setenv("SKETERM_FAKE_WEB_POLICY_LEGACY", "1", 1);
+        defer _ = c.unsetenv("SKETERM_FAKE_WEB_POLICY_LEGACY");
+        var m = Mcp.spawn(allocator, exe, &.{});
+        m.initialize();
+        m.sendTool("web_open", "{\"url\":\"https://smoke.invalid/p\",\"policy\":{\"allow_hosts\":[\"smoke.invalid\"],\"max_requests\":9}}");
+        _ = capSc(arena, m.recvLine(60_000), "legacy policy open", false);
+        const caps = capSc(arena, m.callTool("capabilities", "{}"), "legacy policy preflight", false);
+        if (caps.get("web_policy_ack").? != .bool or caps.get("web_policy_ack").?.bool)
+            fail("legacy policy fake incorrectly advertised correlated acknowledgements");
+        const reply = m.callTool("web_policy_set", "{\"policy\":{\"max_requests\":3}}");
+        const refusal = capSc(arena, reply, "legacy live policy update", true).get("error").?.object;
+        if (!std.mem.eql(u8, refusal.get("code").?.string, "unavailable") or
+            std.mem.indexOf(u8, refusal.get("message").?.string, "net-policy-ack") == null)
+        {
+            say(reply);
+            fail("legacy live policy update did not report its missing ACK capability");
+        }
+        const after_reply = m.callTool("web_policy", "{}");
+        const after = capSc(arena, after_reply, "legacy policy after refused update", false);
+        if (capInt(after.get("policy").?.object, "max_requests") != 9) {
+            say(after_reply);
+            fail("legacy live policy refusal changed the installed budget");
+        }
         m.closeStdinWait();
     }
 
@@ -5383,15 +6310,24 @@ fn webPolicyFakeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []co
             std.mem.indexOf(u8, opened, "\"max_requests\":9") == null)
             fail("the profile default did not ride its web_open");
         const loosen = m.callTool("web_policy_set", "{\"policy\":{\"max_requests\":5000}}");
-        if (std.mem.indexOf(u8, loosen, "\"code\":\"refused\"") == null or
-            std.mem.indexOf(u8, loosen, "LOOSEN") == null)
+        const refusal = capSc(arena, loosen, "pure policy loosening", true).get("error").?.object;
+        if (!std.mem.eql(u8, refusal.get("code").?.string, "refused") or
+            std.mem.indexOf(u8, refusal.get("message").?.string, "LOOSEN") == null or
+            std.mem.indexOf(u8, refusal.get("message").?.string, "max_requests") == null)
+        {
+            say(loosen);
             fail("web_policy_set applied (or silently ignored) a pure loosening");
+        }
+        const after_reply = m.callTool("web_policy", "{}");
+        const after = capSc(arena, after_reply, "live policy after refused loosening", false);
+        if (capInt(after.get("policy").?.object, "max_requests") != 9) {
+            say(after_reply);
+            fail("refused pure loosening still changed the live policy budget");
+        }
         const tighten = m.callTool("web_policy_set", "{\"policy\":{\"max_requests\":3}}");
         if (std.mem.indexOf(u8, tighten, "\"tightened\":[\"max_requests\"]") == null)
             fail("web_policy_set did not tighten the live view's budget");
-        // The re-sent, tightened policy is on the wire with a new
-        // serial. The send is fire-and-forget (no ack by design), so
-        // give the helper a bounded moment to log it.
+        // The update was acknowledged; its wire log must show the tighter limit.
         var tries: u32 = 0;
         while (tries < 100) : (tries += 1) {
             if (std.mem.indexOf(u8, readSmall(frames, &file_buf), "max_requests=3") != null) break;
@@ -5743,7 +6679,7 @@ fn sshToolsStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: [:0]const
     _ = c.setenv(FAKE_SSH_ENV, "1", 1);
     defer {
         _ = c.setenv("PATH", saved_path.ptr, 1);
-        _ = c.unsetenv(FAKE_SSH_ENV);
+        _ = c.setenv(FAKE_SSH_ENV, "1", 1);
     }
 
     const banner = Banner.start();
@@ -8290,7 +9226,7 @@ fn routeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
     defer {
         _ = c.setenv("PATH", saved_path.ptr, 1);
         _ = c.setenv("XDG_RUNTIME_DIR", saved_rt.ptr, 1);
-        _ = c.unsetenv(FAKE_SSH_ENV);
+        _ = c.setenv(FAKE_SSH_ENV, "1", 1);
         _ = c.unsetenv(FAKE_AGENT_ENV);
         _ = c.unsetenv("SKETERM_SSH");
     }
@@ -8658,7 +9594,7 @@ fn agentSshStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u
     defer {
         _ = c.unsetenv(NORSYNC_BIN_ENV);
         _ = c.setenv("PATH", saved_path.ptr, 1);
-        _ = c.unsetenv(FAKE_SSH_ENV);
+        _ = c.setenv(FAKE_SSH_ENV, "1", 1);
         _ = c.unsetenv(FAKE_AGENT_ENV);
         _ = c.unsetenv(FAKE_OC_DEAF_ENV);
         _ = c.unsetenv("CLAUDE_CODE_CHILD_SESSION");

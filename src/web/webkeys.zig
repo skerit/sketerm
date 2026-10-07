@@ -54,6 +54,15 @@ const NAMED = [_]Named{
     .{ .name = "arrowleft", .keysym = 0xff51 },
     .{ .name = "arrowright", .keysym = 0xff53 },
     .{ .name = "space", .keysym = ' ' },
+    // The modifiers as keys of their own, for a caller that HOLDS one
+    // (a down edge now, the up later) rather than chording it.
+    .{ .name = "shift", .keysym = 0xffe1 },
+    .{ .name = "control", .keysym = 0xffe3 },
+    .{ .name = "ctrl", .keysym = 0xffe3 },
+    .{ .name = "alt", .keysym = 0xffe9 },
+    .{ .name = "meta", .keysym = 0xffeb },
+    .{ .name = "super", .keysym = 0xffeb },
+    .{ .name = "capslock", .keysym = 0xffe5 },
 };
 
 pub const Error = error{ UnknownKey, UnknownModifier, EmptyChord };
@@ -135,6 +144,14 @@ test "webkeys parses named keys, chords and characters" {
     const sh_tab = try parseChord("Shift+Tab");
     try t.expectEqual(@as(u32, 0xff09), sh_tab.keysym);
     try t.expectEqual(proto.mod_shift, sh_tab.mods);
+
+    // A modifier named alone is that key, typing nothing; as a prefix it stays a modifier.
+    const shift = try parseChord("Shift");
+    try t.expectEqual(@as(u32, 0xffe1), shift.keysym);
+    try t.expectEqual(@as(u32, 0), shift.mods);
+    try t.expectEqual(@as(usize, 0), shift.textSlice().len);
+    try t.expectEqual(@as(u32, 0xffe3), (try parseChord("Control")).keysym);
+    try t.expectEqual(proto.mod_ctrl, (try parseChord("ctrl+Shift")).mods);
 
     const q = try parseChord("?");
     try t.expectEqualStrings("?", q.textSlice());

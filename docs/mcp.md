@@ -206,6 +206,9 @@ is kept by a `:ro` policy term. The full descriptions and schemas are in
 - `web_wait` (read-only): Wait until the view reaches a state: "load" (no load in flight), "title" (its title contains 'arg', or any title when arg is omitted), "text" ('arg' appears in the page's semantic tree), "idle" (the DOM stopped changing for 600ms) or "response" (headless, a view opened with a capture: a CAPTURED exchange matching the 'response' filter finished after cursor 'since' - default: after this call starts - or, with after_seq, one whose request came after that web_network seq; the reply carries the exchange, read its body with web_capture seq:N).
 - `web_scroll`: Scroll a web view and report the SETTLED position (before/after scrollX/scrollY plus the maximum), so "nothing moved" and "moved to the end" are different answers.
 - `web_key`: Send named key chords to a web view as TRUSTED key events (the same input path a real keystroke rides), so Tab order, Escape-to-dismiss and Enter-to-submit are testable.
+- `web_input`: Drive a web view by hand at VIEWPORT coordinates, for a human watching through web_frame (a remote-control viewer) or a canvas no accessibility tree describes.
+- `web_frame` (read-only): The view's newest painted frame as an image, for watching a page live: pass the 'frame' serial of the last answer as 'since' and the call waits (up to timeout_ms, default 1000) for a newer paint, answering unchanged:true when the page stayed still - a long-poll frame stream.
+- `web_stream`: Open a helper-owned local Unix socket for a pushed binary V1 web stream: premultiplied BGRA damage, frame ends, cursor, trusted input and optional Opus audio.
 - `web_resize`: Resize a web view's viewport IN PLACE (width x height, logical px).
 - `web_inspect`: Compact UI review: focused control, landmarks, accessible-name approximations, disclosure wrapper/control mismatches, horizontal overflow and new page/console errors.
 - `web_checkpoint`: Without id, create a soft-navigation checkpoint.
@@ -487,6 +490,153 @@ authenticated, so a page cannot forge a snapshot or intercept a reply,
 but a page owns its own DOM and can label a "Confirm payment" button
 "Cancel". No server can adjudicate that, which is why `web_act` reports
 what it clicked instead of refusing on content grounds.
+
+### Pushed binary web streams
+
+Headless `web_open` and `web_stream` accept `max_fps`, an integer from 1 to
+240. This caps the view's existing CEF paint scheduler, not just stream
+delivery. New views default to 60 FPS; `[mcp] web_max_fps = 30` changes that
+default, and a selected `[mcp.<name>]` section can override it. Explicit
+`web_open.max_fps` wins over config. Omitting `web_stream.max_fps` preserves
+the view's cap; a stream override persists after close. Successful opens
+and stream offers report the known `max_fps`.
+
+`capabilities.web_max_fps` reports headless adapter support before startup,
+then the current helper's `view-max-fps` capability.
+`web_default_max_fps` reports the resolved config default (60 when omitted).
+Unsupported helpers refuse explicit call/config caps before creating a view
+or stream. A legacy helper can retain its old pacing only when no cap was
+explicitly requested; its results omit the unknown applied rate. GUI-owned
+views refuse explicit caps and retain their existing monitor-driven policy.
+
+The helper uses an optional trailing `max_fps:u16` on `ViewCreate` and
+`ViewCreateUrl` so the cap applies at browser creation. Zero/absent preserves
+the legacy GUI policy. Stream overrides reuse `view_max_fps` and
+`set_windowless_frame_rate`; binary V1 is unchanged.
+
+`web_stream {"pane":12,"audio":true}` opens one helper-owned Unix stream
+socket for an existing headless view. Omit `pane` for the current view;
+`audio` defaults to true. The result includes the common browser head facts
+(`backend:"headless"`, `view`, `pane`, `route`, `origin`, `url`, `title`,
+`loading`) plus `socket_path`, a single-use `token`, `protocol_version:1`,
+`max_unacked_frames:2`, `pixel_format:"bgra-premultiplied"` and `audio`.
+Only the token in structured content authorizes the connection; it is not
+repeated in the text lane. Treat it as a local credential.
+
+`capabilities.web_stream` is a boolean code-support fact before a helper
+starts, then the current helper's negotiated `web-stream` capability.
+`web_stream_audio` is null before the handshake, then a runtime boolean
+from `stream-audio` (Opus available), not a promise that the page is audible.
+`web_software_webgl` is null before the current helper's handshake, then
+reports its `software-webgl` launch policy: ordinary Linux MCP helpers use
+ANGLE SwiftShader WebGL with software compositing and CPU-readable paints.
+It is false for GUI-backed or restricted helpers, and is not a guarantee
+that every page can allocate a WebGL context. GUI rendering and the
+untrusted helper's no-GPU/security policy are unchanged.
+The result's `audio` is true only if requested and negotiated. A GUI-owned
+browser refuses the tool; an older helper without `web-stream` also refuses
+without opening a socket. Socket paths belong to the helper's host; MCP's
+headless routes use local helpers and do not relay remote stream sockets.
+`--stream-dir PATH` overrides placement. Otherwise sockets sit beside
+`--socket`; a `--socket-fd` helper mints a private 0700 directory under
+`XDG_RUNTIME_DIR` (or `/tmp` when unset), removed at helper teardown.
+Launchers should pass their existing per-instance runtime/state directory
+explicitly instead of relying on that fallback.
+
+The helper's continuous CEF loop owns the stream, including its input and
+audio processing. MCP creates no pump thread and sends no unsolicited
+pixels on stdio. A binary peer can drive and watch the view while an MCP
+call such as `web_wait` is still in flight. One stream per view is allowed;
+a second open returns `conflict`. MCP correlates the control reply by
+request id, ignores stale replies, and sends `stream_close` on an uncertain
+open/timeout rather than leaking a slot whose path was never returned.
+
+The helper control protocol (`src/web/protocol.zig`) adds these messages:
+
+| Tag | Direction | Body |
+| --- | --- | --- |
+| `0xF8 StreamOpen` | client -> helper | `view:u32, req:u32, audio:u8` |
+| `0xF9 EvStreamOpen` | helper -> client | `view:u32, req:u32, path:str, token:str, err:str` |
+| `0xFA StreamClose` | client -> helper | `view:u32` |
+| `0xFB EvStreamClosed` | helper -> client | `view:u32, reason:str` |
+
+The socket uses V1 framing from `src/web/stream.zig`: `u32 LE length`
+(tag plus body, excluding the length field), then a one-byte tag and body.
+Helper-to-peer lengths are 1 through 4 MiB; peer-to-helper lengths are at
+most 4097 bytes including the tag. All integers are little-endian;
+coordinates and deltas are signed `i32`. Pixel rows are tightly packed
+premultiplied BGRA, not PNG/JPEG, with no row stride field. Unknown tags, malformed
+lengths, invalid UTF-8 and invalid values end the connection.
+
+| Tag | Direction | Body |
+| --- | --- | --- |
+| `1 AUTH` | peer -> helper | Exactly 32 lowercase hex token bytes, no length prefix inside the body |
+| `2 SURFACE` | helper -> peer | `pixel_w:u32, pixel_h:u32, logical_w:u32, logical_h:u32, format:u8` (`1` = BGRA premultiplied) |
+| `3 DAMAGE` | helper -> peer | `x:u32, y:u32, w:u32, h:u32`, then `w*h*4` BGRA bytes; at most 1 MiB of pixels per band |
+| `4 FRAME_END` | helper -> peer | `serial:u64`, starting at 1 and increasing per completed frame |
+| `5 CURSOR` | helper -> peer | `visible:u8, kind:u8`; kind `0`: `name_len:u16, name:UTF-8`; kind `1`: `w:u32, h:u32, hot_x:i32, hot_y:i32, bgra:w*h*4` (premultiplied, like DAMAGE); hidden is visible `0`, kind `0`, empty name |
+| `6 AUDIO` | helper -> peer | `pts_us:u64` (CEF capture clock in microseconds; do not assume its epoch), `rate:u32, channels:u8, samples_per_channel:u16`, then raw Opus packet bytes (not Ogg); current format is 48 kHz, stereo, 960 samples (20 ms) |
+| `16 POINTER` | peer -> helper | `action:u8, x:i32, y:i32, button:u8, clicks:u8, mods:u32`; action `0` move, `1` down, `2` up, `3` leave; button `0` left, `1` middle, `2` right; clicks `1..3` |
+| `17 WHEEL` | peer -> helper | `x:i32, y:i32, dx:i32, dy:i32, mods:u32`; positive `dy` scrolls down |
+| `18 KEY` | peer -> helper | `action:u8, mods:u32, name_len:u16, name:UTF-8`; action `0` down, `1` up; name is a `webkeys.parseChord` key/chord, at most 64 bytes |
+| `19 TEXT` | peer -> helper | At most 4096 UTF-8 bytes inserted at the focused caret, no inner length field |
+| `20 FOCUS` | peer -> helper | `focused:u8`, `0` or `1` |
+| `21 RESIZE` | peer -> helper | `logical_w:u32, logical_h:u32`; width `320..3840`, height `240..2160` |
+| `22 ACK` | peer -> helper | `serial:u64`, cumulatively acknowledging that outstanding frame and every older one |
+
+Stream `mods` are **CEF event-flag bits**, not the control protocol's
+internal modifier bits: caps lock `1`, Shift `2`, Control `4`, Alt `8`,
+left/middle/right held buttons `16/32/64`, Command/Meta `128`, Num Lock
+`256`. Other bits are refused. Pointer/wheel positions use the logical
+viewport; damage and cursor images use physical pixels. Coordinates and
+wheel deltas must be within +/-1048576. Send explicit up edges for every
+held key/button; blur, disconnect and stream teardown release them too.
+Per poll turn the helper reads at most 64 KiB and dispatches at most 64
+client frames with a 16 KiB TEXT budget; excess buffered input waits for the
+next turn instead of starving paint/control traffic.
+
+Connect and send AUTH within 10 seconds. The 0600 socket and token are
+single-use: the first authentication attempt spends the token and removes
+the listener, even if the token is wrong. A second AUTH is a protocol
+violation. AUTH success begins with SURFACE and full-page damage; later
+damage bands apply to the current surface and become a completed frame
+at FRAME_END. ACK only after consuming all of that frame's bands.
+At most two frame ends may remain unacknowledged. While they are held,
+new paints union damage and retain the live newest pixels; they do not
+queue obsolete frames. Duplicate, old or unknown ACK serials end the
+connection. Cursor/audio are independent of the frame ACK window and
+bounded by the helper's transmit/audio buffers.
+
+Closing the binary socket ends the stream without closing its view.
+Closing the view or the owning MCP/helper control connection ends the
+stream too. GPU-only helpers refuse because their dma-buf pixels are not
+CPU-readable. Audio begins on the next audible transition unless the page
+is already being captured, in which case a new audio stream joins that
+capture. After stream close, normal page output stays muted until the
+capture stops following two seconds of quiet; uncaptured pages are unaffected.
+
+`smoke-mcp` includes `webStreamStage` against the build's real helper, not
+a mocked pixel source. `SKETERM_SMOKE_MCP_WEBSTREAM_ONLY=1` selects it.
+The stage checks full paint, exact 20x20 damage, withheld-ACK coalescing,
+native popup composition/removal, CSS cursor, trusted Shift-click/text/wheel
+during `web_wait`, wrong/replayed AUTH, held-input release, view/server
+teardown, per-instance socket placement, and non-silent decoded WebAudio
+Opus with increasing capture timestamps when runtime audio is advertised.
+A supported but broken stream is a test failure, never an installed-helper
+fallback. The full smoke suite verifies these alongside the legacy tools.
+Input completion requires trusted down/up/click events at the pad, Shift
+down/up, a focused field with exact inserted text, and both a trusted wheel
+event and actual scrolling. Moves precede each pointer target. Failures print
+the individual checks and event trace and retain `stream-input-evidence.json`
+in the smoke runtime directory, including the disconnect-release phase.
+Popup comparison starts with the closed select already focused and hovered,
+including the keyboard focus indication an Escape close leaves behind,
+and still requires exact underlay pixels after Escape. Failures retain
+`stream-popup-evidence.json` with full-frame/ROI changed-pixel counts, bounds,
+first BGRA differences, frame serials and DOM focus/style facts, plus
+`stream-popup-baseline.png`, `stream-popup-open.png` and
+`stream-popup-closed.png` for a close failure. PNGs are written only on failure;
+DOM evidence does not claim to detect a native popup's visibility.
 
 ### Browser review and durable evidence
 

@@ -261,6 +261,8 @@ comptime {
     // itself is opt-in (`zig build web`) but its wire format and key
     // mapping are testable everywhere.
     _ = @import("web/protocol.zig");
+    _ = @import("web/stream.zig");
+    _ = @import("web/streamsrv.zig");
     _ = @import("web/cefargs.zig");
     _ = @import("web/webkeys.zig");
     _ = @import("web/ozone.zig");

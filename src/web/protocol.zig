@@ -352,6 +352,25 @@ pub const CAP_OBSERVE = "observe";
 pub const CAP_LOAD_RETRY = "load-retry";
 pub const CAP_UNTRUSTED_WEB = "untrusted-web";
 pub const CAP_WEB_EMULATION = "web-emulation";
+/// The helper pushes one view's pixels, cursor and (with
+/// `stream-audio`) audio over a private per-view socket and takes input
+/// back on it (0xF8 block, `src/web/stream.zig` is the V1 stream format).
+/// `stream_open` answers with the socket path and a single-use token;
+/// the helper's own poll loop serves the stream, so a client blocked on
+/// a control-socket reply never stalls the stream, nor the other way round.
+pub const CAP_WEB_STREAM = "web-stream";
+/// Streams can carry the page's audio as 20ms Opus packets. Advertised
+/// only when libopus loaded at runtime. The engine decides capture when
+/// a page turns audible, so a page already playing at `stream_open` is
+/// captured from its next inaudible->audible edge (>100ms of silence or
+/// a paused output stream); a captured page is MUTED on the
+/// helper's own output until it has been quiet for 2s after the stream
+/// closes. See src/web/CLAUDE.md.
+pub const CAP_STREAM_AUDIO = "stream-audio";
+pub const CAP_SOFTWARE_WEBGL = "software-webgl";
+pub const CAP_VIEW_MAX_FPS = "view-max-fps";
+pub const MAX_VIEW_FPS: u16 = 240;
+pub const DEFAULT_HEADLESS_FPS: u16 = 60;
 
 /// Every capability this protocol names, as one enum: the declaring home
 /// every client tracks a helper's `hello_ack` through (`Caps`,
@@ -411,6 +430,10 @@ pub const Cap = enum {
     untrusted_web,
     web_emulation,
     net_policy_ack,
+    web_stream,
+    stream_audio,
+    software_webgl,
+    view_max_fps,
 
     /// The wire name `hello_ack` carries.
     pub fn name(self: Cap) []const u8 {
@@ -466,7 +489,10 @@ comptime {
         n += 1;
         var found = false;
         for (@typeInfo(Cap).@"enum".fields) |f| {
-            if (std.mem.eql(u8, capConstName(f.name), d.name)) found = true;
+            if (std.mem.eql(u8, capConstName(f.name), d.name)) {
+                found = true;
+                break;
+            }
         }
         if (!found) @compileError(d.name ++ " has no member in protocol.Cap");
     }
@@ -483,6 +509,23 @@ test "every capability round-trips through its wire name and parseCaps skips unk
     try std.testing.expect(set.contains(.tls));
     try std.testing.expectEqual(@as(usize, 2), set.count());
     try std.testing.expectEqualStrings("contexts-fail-closed", Cap.contexts_fail_closed.name());
+}
+
+test "view creation frame-rate tails retain legacy decoding and reject a partial cap" {
+    const gpa = std.testing.allocator;
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(gpa);
+    const legacy = ViewCreate{ .view = 1, .w = 800, .h = 600, .scale_x1000 = 2000, .context = 7 };
+    try encodePayload(gpa, &bytes, legacy);
+    try std.testing.expectEqual(@as(usize, 14), bytes.items.len);
+    try std.testing.expectEqual(@as(u16, 0), (try decode(ViewCreate, bytes.items)).max_fps);
+    try putU16(gpa, &bytes, 30);
+    try std.testing.expectEqual(@as(u16, 30), (try decode(ViewCreate, bytes.items)).max_fps);
+    try std.testing.expectError(error.Truncated, decode(ViewCreate, bytes.items[0..15]));
+    bytes.clearRetainingCapacity();
+    try encodePayload(gpa, &bytes, ViewCreateUrl{ .view = 1, .w = 800, .h = 600, .scale_x1000 = 1000, .context = 0, .url = "about:blank", .max_fps = 15 });
+    try std.testing.expectEqual(@as(u16, 15), (try decode(ViewCreateUrl, bytes.items)).max_fps);
+    try std.testing.expectEqual(@as(u16, 0), (try decode(ViewCreateUrl, bytes.items[0 .. bytes.items.len - 2])).max_fps);
 }
 
 /// Per-connection id window under `multi-client`: connection k owns
@@ -723,6 +766,12 @@ pub const Tag = enum(u8) {
     observe_subscribe = 0xF2,
     ev_observe_state = 0xF3,
     observe_control = 0xF4,
+    // 0xF8-0xFB: pushed per-view binary stream, capability "web-stream"
+    // (see CAP_WEB_STREAM). 0xF5-0xF7 stay with the observe block.
+    stream_open = 0xF8,
+    ev_stream_open = 0xF9,
+    stream_close = 0xFA,
+    ev_stream_closed = 0xFB,
     _,
 
     /// Whether this build knows the frame; unknown tags are skipped.
@@ -971,6 +1020,22 @@ pub const ViewCreate = struct {
     h: u16,
     scale_x1000: u16,
     context: u32,
+    /// Optional trailing cap; zero preserves the GUI's monitor-driven policy.
+    max_fps: u16 = 0,
+
+    pub fn encodeTo(self: ViewCreate, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        try putU32(gpa, out, self.view);
+        try putU16(gpa, out, self.w);
+        try putU16(gpa, out, self.h);
+        try putU16(gpa, out, self.scale_x1000);
+        try putU32(gpa, out, self.context);
+        if (self.max_fps != 0) try putU16(gpa, out, self.max_fps);
+    }
+
+    pub fn decodeFrom(payload: []const u8) !ViewCreate {
+        var cur = Cur{ .buf = payload };
+        return .{ .view = try cur.readU32(), .w = try cur.readU16(), .h = try cur.readU16(), .scale_x1000 = try cur.readU16(), .context = try cur.readU32(), .max_fps = if (cur.pos == payload.len) 0 else try cur.readU16() };
+    }
 };
 
 /// `view_create` with the first url built in, gated by
@@ -995,6 +1060,22 @@ pub const ViewCreateUrl = struct {
     scale_x1000: u16,
     context: u32,
     url: []const u8,
+    max_fps: u16 = 0,
+
+    pub fn encodeTo(self: ViewCreateUrl, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        try putU32(gpa, out, self.view);
+        try putU16(gpa, out, self.w);
+        try putU16(gpa, out, self.h);
+        try putU16(gpa, out, self.scale_x1000);
+        try putU32(gpa, out, self.context);
+        try putStr(gpa, out, self.url);
+        if (self.max_fps != 0) try putU16(gpa, out, self.max_fps);
+    }
+
+    pub fn decodeFrom(payload: []const u8) !ViewCreateUrl {
+        var cur = Cur{ .buf = payload };
+        return .{ .view = try cur.readU32(), .w = try cur.readU16(), .h = try cur.readU16(), .scale_x1000 = try cur.readU16(), .context = try cur.readU32(), .url = try cur.readStr(), .max_fps = if (cur.pos == payload.len) 0 else try cur.readU16() };
+    }
 };
 
 pub const ViewDestroy = struct {
@@ -1599,7 +1680,7 @@ pub const FindStop = struct {
 /// USER zoom for a view, as the engine's log-scale zoom LEVEL x100:
 /// factor = 1.2 ^ (level_x100 / 100), so +100 is one conventional
 /// browser zoom step (120%) and 0 resets. Distinct from the DPR zoom
-/// the helper applies internally in accelerated mode — the helper adds
+/// the helper applies internally — the helper adds
 /// the two, so the client only ever speaks user intent.
 pub const SetZoom = struct {
     pub const tag: Tag = .set_zoom;
@@ -4207,6 +4288,79 @@ test "observe tags occupy the 0xF0 block and leave 0xE6-0xEF free" {
     try std.testing.expectEqual(@as(u8, 0xF4), @intFromEnum(Tag.observe_control));
     try std.testing.expect(!@as(Tag, @enumFromInt(0xE6)).known());
     try std.testing.expect(!@as(Tag, @enumFromInt(0xEF)).known());
+}
+
+// -- pushed per-view stream (0xF8 block, capability "web-stream") ------
+//
+// The control socket only negotiates; pixels, cursor, audio and input
+// travel on the stream socket named in `ev_stream_open`, in the V1
+// format of `stream.zig`. A view has at most one stream. It ends when
+// the client closes it (`stream_close`), the view is destroyed, the
+// owning connection leaves, the stream peer disconnects or misbehaves,
+// or nobody authenticated within `STREAM_CONNECT_MS`; every end is
+// announced once with `ev_stream_closed`.
+
+/// How long an opened stream waits for its client to connect and
+/// authenticate before it is closed and its token is spent.
+pub const STREAM_CONNECT_MS: i64 = 10_000;
+
+/// Client -> helper: open the stream of `view`. `req` is echoed in the
+/// reply; `audio = 1` asks for the page's audio (only honoured with
+/// `stream-audio`). Answered by exactly one `ev_stream_open`.
+pub const StreamOpen = struct {
+    pub const tag: Tag = .stream_open;
+    view: u32,
+    req: u32,
+    audio: u8,
+};
+
+/// Helper -> client: the answer to `stream_open`. Success has an empty
+/// `err`, a 0600 unix socket `path` beside the helper's own socket and a
+/// single-use `token` (32 lowercase hex characters) the stream client
+/// must send as its first frame. A refusal has empty `path`/`token` and
+/// says why in `err`.
+pub const EvStreamOpen = struct {
+    pub const tag: Tag = .ev_stream_open;
+    view: u32,
+    req: u32,
+    path: []const u8,
+    token: []const u8,
+    err: []const u8,
+};
+
+/// Client -> helper: end `view`'s stream. Unanswered except by the
+/// `ev_stream_closed` every end posts; a view with no stream is a no-op.
+pub const StreamClose = struct {
+    pub const tag: Tag = .stream_close;
+    view: u32,
+};
+
+/// Helper -> client: `view`'s stream ended, and why. Sent once per
+/// successful `stream_open`; the view may then open a new stream.
+pub const EvStreamClosed = struct {
+    pub const tag: Tag = .ev_stream_closed;
+    view: u32,
+    reason: []const u8,
+};
+
+test "round-trip: stream frames" {
+    try roundTrip(StreamOpen, .{ .view = 3, .req = 77, .audio = 1 });
+    try roundTrip(EvStreamOpen, .{
+        .view = 3,
+        .req = 77,
+        .path = "/run/user/1000/sketerm/ws-0003-1a2b3c4d.sock",
+        .token = "0123456789abcdef0123456789abcdef",
+        .err = "",
+    });
+    try roundTrip(EvStreamOpen, .{ .view = 3, .req = 78, .path = "", .token = "", .err = "this view already has a stream" });
+    try roundTrip(StreamClose, .{ .view = 3 });
+    try roundTrip(EvStreamClosed, .{ .view = 3, .reason = "the stream client disconnected" });
+    try std.testing.expectEqual(@as(u8, 0xF8), @intFromEnum(Tag.stream_open));
+    try std.testing.expectEqual(@as(u8, 0xFB), @intFromEnum(Tag.ev_stream_closed));
+    try std.testing.expectEqualStrings("web-stream", Cap.web_stream.name());
+    try std.testing.expectEqualStrings("stream-audio", Cap.stream_audio.name());
+    // An observer can never open the owner's stream.
+    try std.testing.expect(!observerAllows(.stream_open, true));
 }
 
 // -- WebExtensions (0xB0 block, capability "webext") ------------------

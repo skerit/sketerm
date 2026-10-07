@@ -105,11 +105,9 @@ EGL/X-display errors were not the cause of that hang.
 
 Measured, not inferred:
 
-- `--ozone-platform=headless` — **no `--type=gpu-process` is ever
-  spawned.** Everything rasterises on the CPU. `--enable-gpu`,
-  `--ignore-gpu-blocklist` and `--use-angle=` change nothing, which is
-  also why an old experiment concluded `--disable-gpu` "does nothing":
-  the GPU was already gone.
+- The default `--ozone-platform=headless` software path has no usable
+  hardware GPU. The earlier `--use-angle=gl-egl/vulkan` experiments did
+  not establish anything about SwiftShader WebGL.
 - `--ozone-platform=x11` — a GPU process appears but hands out no
   shared textures, so no dma-buf path.
 - `--ozone-platform=wayland` — a GPU process appears and
@@ -119,10 +117,36 @@ Measured, not inferred:
 So a headless smoke run exercises the software path by construction. It
 cannot prove anything about the GPU path.
 
+Ordinary MCP launchers set `SKETERM_WEB_SOFTWARE_WEBGL=1`: the helper
+selects `--use-angle=swiftshader --enable-unsafe-swiftshader
+--disable-gpu-compositing`, omits the forced-Wayland `--disable-gpu`, and
+keeps `shared_texture_enabled=0`. This restores WebGL without changing
+the CPU `on_paint` source used by screenshots, pulled frames, streams,
+observers and the presenter. Measured on distro CEF/Chromium 152:
+WebGL 1 and 2 work; the renderer is ANGLE Vulkan SwiftShader Device
+(Subzero), not the host GPU. A WebGL GPU-service process is not proof of
+accelerated OSR paints. `software-webgl` reports the selected launch
+policy, not a guarantee that a page can allocate a context.
+
+GUI launchers do not set this knob. Untrusted mode ignores it and keeps
+its existing no-GPU/security policy; enabling unsafe SwiftShader there
+would require a separate security decision. `smoke-mcp`'s existing
+web-stream journey asserts exact known-colour WebGL pixels through PNG
+screenshots, pulled frames and binary streams at DPR 1 and 2, plus a
+subsequent WebGL repaint on the binary stream.
+
 ## Pacing: the engine paces itself
 
 CEF's internal scheduler owns painting; the cap travels as
 `view_max_fps` and is applied with `set_windowless_frame_rate`.
+
+Headless MCP views use `view-max-fps`: an optional trailing cap on
+`ViewCreate`/`ViewCreateUrl` sets `windowless_frame_rate` before the first
+document paints. Default 60, config `[mcp] web_max_fps`, explicit MCP
+`max_fps` in 1-240. Stream overrides reuse `view_max_fps` and persist on
+the view. Zero/absent still means the GUI's existing uncapped/monitor-driven
+policy, so no GUI default changes. The `SKETERM_WEB_WFPS` measurement knob
+only overrides a zero cap; it must not silently undo a requested limit.
 
 **Do not make external begin frames the default again.** With
 `external_begin_frame_enabled` the paint landed only on the 2nd-3rd
@@ -1470,6 +1494,78 @@ the CSP-spliced retry must carry the SAME budget (it is part of
 whose JSON exceeds `proto.MAX_EVAL_JSON` is answered as an error naming
 its size rather than dropped by `post`'s `catch {}` — a dropped reply
 costs the caller its entire 120s deadline and explains nothing.
+
+## Pushed per-view stream (0xF8 block, capabilities "web-stream" + "stream-audio")
+
+`stream_open{view, req, audio}` answers `ev_stream_open{view, req, path,
+token, err}` (posted by `server.zig` in the client's own ids, because a
+refusal may name no view); `stream_close{view}`; every end of an opened
+stream posts `ev_stream_closed{view, reason}` once. The stream itself is
+the binary V1 format in `stream.zig` (pure, both test roots) served by
+`streamsrv.zig` (sockets, CEF-free, both test roots) with the engine
+half in `cefhost/stream.zig`.
+
+- **The poll loop owns every stream.** Stream fds join `server.step`'s
+  poll set and `Host.streamPump` services them non-blocking after
+  `flushInline`, so an MCP client waiting on a control reply never
+  stalls input or paint, and no thread exists.
+- **One stream per view, one attempt per token.** The socket is a 0600
+  node beside the helper socket with a random name; the first frame must
+  be AUTH with the 32-hex token, and that frame spends the token and
+  unlinks the socket whether it matched or not. Nobody authenticated
+  within `proto.STREAM_CONNECT_MS` also ends it.
+- **No frame is ever queued.** Damage unions in `stream.Dirty`; a frame
+  is cut from the LIVE `View.map` (plus the `<select>` widget composed
+  over it, `View.widget_*`) only when fewer than two frame ends are
+  unacknowledged and the bounded transmit buffer takes the next 1MiB
+  band. ACK is cumulative and must name an outstanding serial.
+- **Stream mods are CEF event-flag bits**, translated to `proto.mod_*`
+  by `stream.modsToProto` at the engine seam; key names go through
+  `webkeys.parseChord`. A client disconnect, a blur, a view teardown or
+  any stream end releases every key and button the client still holds.
+- **Audio is the engine's loopback capture, and it MUTES the page.**
+  Read from the CEF source at the installed commit (708dc14,
+  `alloy_browser_host_impl.cc` / `audio_capturer.cc` /
+  `audio_loopback_stream_creator.cc`): `GetAudioParameters` is asked
+  ONLY when a page turns audible and no capturer exists, the capturer
+  lives until the page has been quiet for 2s (`kRecentlyAudibleTimeout`)
+  or the browser dies, and the loopback stream is created with
+  `mute_source = true`. There is no API to start or stop it on demand.
+  Consequences, all deliberate: the audio slot is claimed at
+  `stream_open` (not AUTH) so an audible edge in between is caught; a
+  page ALREADY audible when the stream opens is captured from its next
+  inaudible->audible edge, unless a capture is still live from an
+  earlier stream, which the new stream attaches to
+  (`AudioTable.captures`); after the stream closes the page stays
+  muted until it has been quiet for 2s. "Inaudible" is the audio
+  service's own measure (`services/audio/output_stream.cc`): power
+  below -72.2 dBFS for more than 100ms, or the page's output stream
+  pausing; the 2s only applies while a capturer exists.
+  **`set_audio_muted` cannot force an edge** (checked, Chromium
+  152.0.7977.83): muting only toggles the controller's LOCAL output
+  (`OutputController::ToggleLocalOutput`) while `power_monitor_` keeps
+  scanning the rendered data, so a muted page stays audible. `pts` is `capture_time - TimeTicks()` in ms;
+  MEASURED on Linux (2026-10-07) it reads as epoch milliseconds, so a
+  client must treat it as an increasing capture clock only, never as a
+  wall time or a monotonic-clock reading. PCM crosses from CEF's audio thread through
+  `streamsrv.audio`, static, bounded (0.5s per stream) and spinlocked;
+  a drop or a timestamp jump resets the queue instead of stitching a
+  gap, and the loop encodes 20ms Opus with `mux/opuscodec.zig`.
+  `SKETERM_WEB_STREAM_DEBUG=1` logs each audio step to stderr (capture
+  asked/granted/started, packets, queue depth, encodes, drops). It found
+  the 2026-10-07 silence: a `@min` against a comptime 1024 narrowed a
+  frame count to u11 and every real 1024-frame packet was queued empty.
+- **Input is budgeted per poll turn** (`streamsrv.EVENTS_PER_TURN`,
+  `TEXT_BYTES_PER_TURN`, reads bounded by `IN_CAP`; a Text frame is at
+  most `stream.MAX_TEXT` bytes), so a flooding client cannot starve the
+  control sockets or CEF's pump. Held mouse buttons reach the engine as
+  CEF button flags reconstructed from `stream.Held`, never from the
+  client's mods. Releases never revive a discarded view.
+- **Where the sockets go:** `--stream-dir`, else beside `--socket`, else
+  (a `--socket-fd` helper) a private `mkdtemp` directory under
+  `$XDG_RUNTIME_DIR` (or `/tmp`), removed at exit.
+- **GPU helpers refuse streams**: dma-buf frames never enter this
+  process, so there is nothing to cut bands from.
 
 ## Rules that outlive any one change
 

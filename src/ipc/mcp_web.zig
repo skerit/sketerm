@@ -52,6 +52,7 @@ const webkeys = @import("../web/webkeys.zig");
 const semantic = @import("../web/semantic.zig");
 const webroute = @import("../web/route.zig");
 const clock = @import("../util/clock.zig");
+const png_codec = @import("../util/png.zig");
 const atomicwrite = @import("../util/atomicwrite.zig");
 const mcp_term = @import("mcp_term.zig");
 
@@ -125,6 +126,7 @@ var g_engines: std.ArrayList(*RouteEngine) = .empty;
 /// current inside one engine.
 var g_current_engine: usize = 0;
 var g_headless_alloc: ?std.mem.Allocator = null;
+var g_default_max_fps: ?u16 = null;
 var g_headless_dir: ?[]const u8 = null;
 var g_headless_instance: ?[]const u8 = null;
 var g_headless_mux_sock: ?[]const u8 = null;
@@ -212,11 +214,12 @@ test "treeSection bounds a tree at a line boundary and says so" {
 /// itself is spawned lazily on the first web tool call that needs it;
 /// `mux_sock` is the instance daemon its watchable Wayland session is
 /// created on (null = plain headless only).
-pub fn configureHeadless(allocator: std.mem.Allocator, dir: []const u8, instance: ?[]const u8, mux_sock: ?[]const u8) void {
+pub fn configureHeadless(allocator: std.mem.Allocator, dir: []const u8, instance: ?[]const u8, mux_sock: ?[]const u8, max_fps: ?u16) void {
     g_headless_alloc = allocator;
     g_headless_dir = dir;
     g_headless_instance = instance;
     g_headless_mux_sock = mux_sock;
+    g_default_max_fps = max_fps;
 }
 
 /// Name of the live watchable web session, when the headless engine is
@@ -370,6 +373,32 @@ pub fn downloadCapability() struct { supported: bool, started: bool } {
     return .{ .supported = e.has(.downloads) and e.has(.download_start), .started = true };
 }
 
+/// Stream support is a code fact before startup and negotiated thereafter; audio is unknown before the handshake.
+pub fn streamCapability() struct { supported: bool, audio: ?bool } {
+    if (guiDrivesWeb() or g_headless_alloc == null) return .{ .supported = false, .audio = false };
+    const e = currentEngine() orelse return .{ .supported = true, .audio = null };
+    if (e.state != .ready) return .{ .supported = true, .audio = null };
+    return .{ .supported = e.has(.web_stream), .audio = e.has(.web_stream) and e.has(.stream_audio) };
+}
+
+/// Null until the current headless helper reports its software WebGL launch policy.
+pub fn softwareWebglCapability() ?bool {
+    if (guiDrivesWeb() or g_headless_alloc == null) return false;
+    const e = currentEngine() orelse return null;
+    if (e.state != .ready) return null;
+    return e.has(.software_webgl);
+}
+
+/// The adapter supports frame-rate options before startup and requires the helper's capability afterwards.
+pub fn frameRateCapability() struct { supported: bool, default: u16 } {
+    const supported = !guiDrivesWeb() and g_headless_alloc != null;
+    const default_fps = g_default_max_fps orelse web_proto.DEFAULT_HEADLESS_FPS;
+    if (currentEngine()) |e| {
+        if (e.state == .ready) return .{ .supported = supported and e.has(.view_max_fps), .default = default_fps };
+    }
+    return .{ .supported = supported, .default = default_fps };
+}
+
 /// The engine-lifecycle half of the preflight: whether the broker lane
 /// is available (the daemon would spawn and keep the engine), and who
 /// owns the engine this server is connected to right now.
@@ -465,6 +494,7 @@ fn headlessEngineForMode(spec: webroute.Spec, untrusted: bool) ?*webdrive.Engine
         },
     };
     re.engine.untrusted = untrusted;
+    re.engine.default_max_fps = g_default_max_fps;
     @memcpy(re.slug[0..slug.len], slug);
     re.slug_len = slug.len;
     g_engines.append(alloc, re) catch {
@@ -559,6 +589,7 @@ pub const View = struct {
     policy_active: bool = false,
     untrusted: bool = false,
     emulation: webdrive.Emulation = .{},
+    max_fps: ?u16 = null,
     policy_serial: u32 = 0,
     policy_install_failed: bool = false,
     policy_exhausted: []const u8 = "",
@@ -911,6 +942,7 @@ fn appendEngineViews(
             .policy_active = v.pol_active,
             .untrusted = e.untrusted and e.has(.untrusted_web),
             .emulation = v.emulation,
+            .max_fps = v.max_fps,
             .policy_serial = v.pol_serial,
             .policy_install_failed = v.pol_install_failed,
             .policy_exhausted = if (v.pol_exhausted != 0)
@@ -991,6 +1023,12 @@ fn headlessFail(arena: std.mem.Allocator, e: *webdrive.Engine, err: anyerror) !F
         error.NoIntercept => fail(.unavailable, "the browser helper does not advertise the network-intercept capability"),
         error.LegacySemanticReplyPending => fail(.conflict, "an older browser helper still owes the previous timed-out semantic reply; wait for it or restart the helper before retrying this operation kind"),
         error.NoFrame => fail(.unavailable, "the view has not painted a frame yet (a page must load first; try web_wait for:\"load\")"),
+        error.NoTextInput => fail(.unavailable, "the browser helper does not advertise the clipboard capability text insertion rides on"),
+        error.NoStream => fail(.unavailable, "the browser helper does not advertise web-stream; no stream was opened"),
+        error.FrameRateUnsupported => fail(.unavailable, "the helper did not advertise view-max-fps; no stream was opened"),
+        error.InvalidFrameRate => fail(.invalid_args, "max_fps must be an integer from 1 to 240"),
+        error.StreamPending => fail(.conflict, "a stream open is already pending for this view"),
+        error.StreamEnded => fail(.unavailable, "the stream ended before its socket could be returned"),
         error.Timeout => try diagnosticFail(arena, e, .timeout, "the browser helper did not answer in time"),
         error.PolicyAckUnsupported => fail(.unavailable, "the helper does not advertise net-policy-ack; live policy updates and untrusted opens are refused without a correlated installation acknowledgement"),
         error.PolicyRefused => fail(.refused, "the helper rejected the network policy; the affected view was closed fail-closed and no replacement was reported as applied"),
@@ -1234,10 +1272,11 @@ fn headlessRouteEngine(arena: std.mem.Allocator, text: []const u8) RouteEngineOu
 }
 
 fn openView(drv: Driver, arena: std.mem.Allocator, url: ?[]const u8, where: []const u8, w: u16, h: u16, spec: webdrive.ProfileSpec, policy: ?*const webdrive.NetPolicy, cap: ?*const webdrive.CaptureFilter, route: ?[]const u8) !OpenOutcome {
-    return openViewConfigured(drv, arena, url, where, w, h, spec, policy, cap, route, .{});
+    return openViewConfigured(drv, arena, url, where, w, h, spec, policy, cap, route, .{}, null);
 }
 
-fn openViewConfigured(drv: Driver, arena: std.mem.Allocator, url: ?[]const u8, where: []const u8, w: u16, h: u16, spec: webdrive.ProfileSpec, policy: ?*const webdrive.NetPolicy, cap: ?*const webdrive.CaptureFilter, route: ?[]const u8, emulation: webdrive.Emulation) !OpenOutcome {
+fn openViewConfigured(drv: Driver, arena: std.mem.Allocator, url: ?[]const u8, where: []const u8, w: u16, h: u16, spec: webdrive.ProfileSpec, policy: ?*const webdrive.NetPolicy, cap: ?*const webdrive.CaptureFilter, route: ?[]const u8, emulation: webdrive.Emulation, max_fps: ?u16) !OpenOutcome {
+    if (drv == .gui and max_fps != null) return .{ .err = fail(.unavailable, "max_fps is headless only; GUI monitor-driven pacing is unchanged") };
     if (drv == .gui and emulation.present()) return .{ .err = fail(.unavailable, "web emulation is headless only; nothing was opened") };
     if (drv == .gui and spec != .default) return .{ .err = fail(.invalid_args, GUI_PROFILE_REFUSAL) };
     if (drv == .gui and policy != null) return .{ .err = fail(.unavailable, GUI_POLICY_REFUSAL) };
@@ -1280,7 +1319,7 @@ fn openViewConfigured(drv: Driver, arena: std.mem.Allocator, url: ?[]const u8, w
                     }
                 }
             }
-            const v = e.openViewConfigured(url orelse "", w, h, spec, policy, cap, emulation) catch |err| {
+            const v = e.openViewConfigured(url orelse "", w, h, spec, policy, cap, emulation, max_fps) catch |err| {
                 const name: []const u8 = if (spec == .named) spec.named else "";
                 return .{ .err = switch (err) {
                     error.UntrustedRestrictions => fail(.refused, "untrusted opens require policy.untrusted:true, ephemeral:true, route direct and HTTP/HTTPS only; nothing was opened"),
@@ -1288,6 +1327,8 @@ fn openViewConfigured(drv: Driver, arena: std.mem.Allocator, url: ?[]const u8, w
                     error.UntrustedUnsupported => fail(.unavailable, "the helper did not advertise untrusted-web; nothing was opened"),
                     error.EmulationUnsupported => fail(.unavailable, "the helper did not advertise web-emulation; nothing was opened"),
                     error.InvalidEmulation => fail(.invalid_args, "invalid web emulation options; nothing was opened"),
+                    error.FrameRateUnsupported => fail(.unavailable, "the helper did not advertise view-max-fps; nothing was opened"),
+                    error.InvalidFrameRate => fail(.invalid_args, "max_fps must be an integer from 1 to 240; nothing was opened"),
                     error.RouteRefused => fail(.unavailable, try std.fmt.allocPrint(
                         arena,
                         "{s}. Nothing was opened; the next web_open on this route starts a fresh browser that tries the route again.",
@@ -1692,6 +1733,7 @@ fn openResult(
         try res.fact("profile_kind", v.profile_kind);
         try res.fact("context", v.context);
         try res.fact("untrusted", v.untrusted);
+        if (v.max_fps) |fps| try res.fact("max_fps", fps);
         if (v.emulation.color_scheme) |value| try res.fact("color_scheme", @tagName(value));
         if (v.emulation.reduced_motion) |value| try res.fact("reduced_motion", if (value == .reduce) "reduce" else "no-preference");
         if (v.emulation.device_scale_factor != null) try res.fact("device_scale_factor", @as(f64, @floatFromInt(v.emulation.scale())) / 1000);
@@ -2925,6 +2967,11 @@ pub fn webTool(
     // Diagnostics must remain readable after helper death, without spawning a
     // replacement (which would overwrite precisely the evidence requested).
     if (eql(u8, name, "web_diagnostic")) return diagnosticTool(arena, args);
+    if (eql(u8, name, "web_stream")) {
+        if (mcp.argValue(args, "audio")) |value| if (value != .bool)
+            return mcp.errRes(arena, .invalid_args, "web_stream audio must be a boolean when present");
+        if (guiDrivesWeb()) return mcp.errRes(arena, .unavailable, "web_stream is headless only; the user's GUI browser cannot expose a stream socket");
+    }
     // `pane` stays the argument name in both modes (headless it selects
     // the helper view id); `view` is accepted as a synonym.
     const handle_key: []const u8 = if (mcp.argInt(args, "pane") != null) "pane" else "view";
@@ -2943,6 +2990,11 @@ pub fn webTool(
     }
 
     if (eql(u8, name, "web_open")) {
+        const max_fps: ?u16 = switch (try parseMaxFps(arena, args)) {
+            .absent => null,
+            .err => |f| return failRes(arena, f),
+            .value => |fps| fps,
+        };
         const emulation = switch (try parseEmulation(arena, args)) {
             .err => |f| return failRes(arena, f),
             .value => |v| v,
@@ -3029,7 +3081,7 @@ pub fn webTool(
             if (drv == .gui) return mcp.errRes(arena, .invalid_args, "accept_cert is headless only: with a GUI attached the user answers certificate errors in the pane's interstitial");
             if (!navfault.validFingerprint(fp)) return mcp.errRes(arena, .invalid_args, "accept_cert must be the certificate's SHA-256 as 64 hex digits (the 'cert.fingerprint' a refused open reported)");
         }
-        const new_handle: u32 = switch (try openViewConfigured(drv, arena, url, where, vw, vh, spec, if (policy) |*p| p else null, if (cap) |*f| f else null, route, emulation)) {
+        const new_handle: u32 = switch (try openViewConfigured(drv, arena, url, where, vw, vh, spec, if (policy) |*p| p else null, if (cap) |*f| f else null, route, emulation, max_fps)) {
             .err => |e| return failRes(arena, e),
             .opened => |p| p,
         };
@@ -3654,7 +3706,10 @@ pub fn webTool(
     }
 
     if (eql(u8, name, "web_scroll")) return scrollTool(drv, arena, args, view);
+    if (eql(u8, name, "web_stream")) return streamTool(drv, arena, args, view);
     if (eql(u8, name, "web_key")) return keyTool(drv, arena, args, view);
+    if (eql(u8, name, "web_input")) return inputTool(drv, arena, args, view);
+    if (eql(u8, name, "web_frame")) return frameTool(drv, arena, args, view);
     if (eql(u8, name, "web_resize")) return resizeTool(drv, arena, args, view);
     if (eql(u8, name, "web_console")) return consoleTool(drv, arena, args, view);
     if (eql(u8, name, "web_inspect") or eql(u8, name, "web_checkpoint"))
@@ -3674,6 +3729,50 @@ pub fn webTool(
     }
 
     return mcp.errRes(arena, .unknown_tool, "unknown web tool");
+}
+
+fn streamResult(arena: std.mem.Allocator, view: View, offer: web_proto.EvStreamOpen, audio: bool) ![]const u8 {
+    var res = mcp.Res.init(arena);
+    try head(&res, arena, .headless, view);
+    try res.fact("pane", view.pane);
+    try res.fact("socket_path", offer.path);
+    try res.fact("token", offer.token);
+    try res.fact("protocol_version", @as(u32, 1));
+    try res.fact("max_unacked_frames", @as(u32, @import("../web/stream.zig").MAX_UNACKED));
+    try res.fact("pixel_format", "bgra-premultiplied");
+    try res.fact("audio", audio);
+    if (view.max_fps) |fps| try res.fact("max_fps", fps);
+    try res.text("opened a single-use local binary stream socket; authenticate with the token as the first frame, ACK frame ends, and close the socket to end the stream");
+    return res.finish();
+}
+
+fn streamTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view: View) ![]const u8 {
+    const e = switch (drv) {
+        .gui => return mcp.errRes(arena, .unavailable, "web_stream is headless only; the user's GUI browser cannot expose a stream socket"),
+        .headless => |engine| engine,
+    };
+    if (try policyGate(arena, view)) |f| return failRes(arena, f);
+    const max_fps: ?u16 = switch (try parseMaxFps(arena, args)) {
+        .absent => null,
+        .err => |f| return failRes(arena, f),
+        .value => |fps| fps,
+    };
+    if (max_fps != null and !e.has(.view_max_fps)) return mcp.errRes(arena, .unavailable, "the helper did not advertise view-max-fps; no stream was opened");
+    const audio = if (mcp.argValue(args, "audio")) |v| v.bool else true;
+    const offer = e.openStream(arena, view.pane, audio, 5000, max_fps) catch |err|
+        return failRes(arena, try headlessFail(arena, e, err));
+    if (offer.err.len > 0) return mcp.errRes(arena, if (std.mem.indexOf(u8, offer.err, "already has a stream") != null) .conflict else .refused, offer.err);
+    var streamed_view = view;
+    const live = e.findView(view.pane) orelse return mcp.errRes(arena, .not_found, "the view ended while opening its stream");
+    streamed_view.max_fps = live.max_fps;
+    return streamResult(arena, streamed_view, offer, audio and e.has(.stream_audio));
+}
+
+fn parseMaxFps(arena: std.mem.Allocator, args: std.json.Value) !union(enum) { absent, value: u16, err: Fail } {
+    const value = mcp.argValue(args, "max_fps") orelse return .absent;
+    if (value != .integer or value.integer < 1 or value.integer > web_proto.MAX_VIEW_FPS)
+        return .{ .err = fail(.invalid_args, try std.fmt.allocPrint(arena, "max_fps must be an integer from 1 to {d}", .{web_proto.MAX_VIEW_FPS})) };
+    return .{ .value = @intCast(value.integer) };
 }
 
 pub fn capturePng(drv: Driver, arena: std.mem.Allocator, view: View, timeout: i64) !union(enum) { done: []const u8, err: Fail } {
@@ -5075,6 +5174,271 @@ fn keyTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view: Vi
     try res.textf("sent {d} key chord(s): {s}", .{ n, try clip(arena, keys, 200) });
     try renderAfter(&res, arena, after);
     return res.finish();
+}
+
+/// The most events one `web_input` call carries.
+pub const MAX_INPUT_EVENTS = 64;
+
+/// The longest text one `web_input` text event inserts, in bytes.
+pub const MAX_INPUT_TEXT = 4096;
+
+/// One `web_input` event, parsed and checked before anything is sent.
+pub const InputEvent = union(enum) {
+    pointer: struct { kind: web_proto.PointerKind, x: i32, y: i32, button: u8, clicks: u8, mods: u32 },
+    wheel: struct { x: i32, y: i32, dx: i32, dy: i32, mods: u32 },
+    key: struct { kind: web_proto.KeyKind, keysym: u32, mods: u32, text: []const u8 },
+    text: []const u8,
+};
+
+const InputParse = union(enum) { events: []const InputEvent, err: Fail };
+
+/// Coordinates and deltas a client may send: wider than any viewport,
+/// narrow enough that no scaling on the helper side overflows.
+const INPUT_COORD_LIMIT: i64 = 65_535;
+
+fn inputRefusal(arena: std.mem.Allocator, index: usize, comptime what: []const u8, args: anytype) !InputParse {
+    return .{ .err = fail(.invalid_args, try std.fmt.allocPrint(arena, "web_input events[{d}] " ++ what, .{index} ++ args)) };
+}
+
+/// The `modifiers` list of one event as wire bits; null when a member is unknown.
+fn inputMods(item: std.json.Value) ?u32 {
+    const list = mcp.argValue(item, "modifiers") orelse return 0;
+    if (list != .array) return null;
+    var mods: u32 = 0;
+    for (list.array.items) |m| {
+        if (m != .string) return null;
+        const name = m.string;
+        if (std.ascii.eqlIgnoreCase(name, "shift")) {
+            mods |= web_proto.mod_shift;
+        } else if (std.ascii.eqlIgnoreCase(name, "ctrl") or std.ascii.eqlIgnoreCase(name, "control")) {
+            mods |= web_proto.mod_ctrl;
+        } else if (std.ascii.eqlIgnoreCase(name, "alt")) {
+            mods |= web_proto.mod_alt;
+        } else if (std.ascii.eqlIgnoreCase(name, "meta") or std.ascii.eqlIgnoreCase(name, "super")) {
+            mods |= web_proto.mod_super;
+        } else return null;
+    }
+    return mods;
+}
+
+fn inputCoord(item: std.json.Value, key: []const u8) ?i32 {
+    const v = mcp.argInt(item, key) orelse return null;
+    if (v < -INPUT_COORD_LIMIT or v > INPUT_COORD_LIMIT) return null;
+    return @intCast(v);
+}
+
+/// Parse `web_input`'s `events`. One bad event refuses the whole call,
+/// so a batch is never half-sent because of its own arguments.
+pub fn parseInputEvents(arena: std.mem.Allocator, args: std.json.Value) !InputParse {
+    const eql = std.mem.eql;
+    const list = mcp.argValue(args, "events") orelse
+        return .{ .err = fail(.invalid_args, "web_input needs 'events': a list of pointer, wheel, key or text events") };
+    if (list != .array or list.array.items.len == 0)
+        return .{ .err = fail(.invalid_args, "web_input 'events' must be a non-empty list") };
+    if (list.array.items.len > MAX_INPUT_EVENTS)
+        return .{ .err = fail(.invalid_args, try std.fmt.allocPrint(arena, "web_input takes at most {d} events per call, got {d}", .{ MAX_INPUT_EVENTS, list.array.items.len })) };
+    var out: std.ArrayList(InputEvent) = .empty;
+    for (list.array.items, 0..) |item, i| {
+        if (item != .object) return inputRefusal(arena, i, "is not an object", .{});
+        const kind = mcp.argStr(item, "type") orelse return inputRefusal(arena, i, "needs 'type': pointer, wheel, key or text", .{});
+        const mods = inputMods(item) orelse return inputRefusal(arena, i, "has an unknown modifier (shift, ctrl, alt, meta)", .{});
+        if (eql(u8, kind, "pointer")) {
+            const action = mcp.argStr(item, "action") orelse "move";
+            const pk: web_proto.PointerKind = if (eql(u8, action, "move"))
+                .move
+            else if (eql(u8, action, "down"))
+                .down
+            else if (eql(u8, action, "up"))
+                .up
+            else if (eql(u8, action, "leave"))
+                .leave
+            else
+                return inputRefusal(arena, i, "has an unknown pointer action '{s}' (move, down, up, leave)", .{action});
+            const x = inputCoord(item, "x") orelse return inputRefusal(arena, i, "needs whole-number 'x' and 'y' in viewport pixels", .{});
+            const y = inputCoord(item, "y") orelse return inputRefusal(arena, i, "needs whole-number 'x' and 'y' in viewport pixels", .{});
+            const button_name = mcp.argStr(item, "button") orelse "left";
+            const button: u8 = if (eql(u8, button_name, "left"))
+                0
+            else if (eql(u8, button_name, "middle"))
+                1
+            else if (eql(u8, button_name, "right"))
+                2
+            else
+                return inputRefusal(arena, i, "has an unknown button '{s}' (left, middle, right)", .{button_name});
+            const clicks: u8 = @intCast(std.math.clamp(mcp.argInt(item, "clicks") orelse 1, 1, 3));
+            try out.append(arena, .{ .pointer = .{ .kind = pk, .x = x, .y = y, .button = button, .clicks = clicks, .mods = mods } });
+        } else if (eql(u8, kind, "wheel")) {
+            const x = inputCoord(item, "x") orelse return inputRefusal(arena, i, "needs whole-number 'x' and 'y' in viewport pixels", .{});
+            const y = inputCoord(item, "y") orelse return inputRefusal(arena, i, "needs whole-number 'x' and 'y' in viewport pixels", .{});
+            const dx = if (mcp.argValue(item, "dx") == null) 0 else inputCoord(item, "dx") orelse
+                return inputRefusal(arena, i, "has a 'dx' that is not a whole number in range", .{});
+            const dy = if (mcp.argValue(item, "dy") == null) 0 else inputCoord(item, "dy") orelse
+                return inputRefusal(arena, i, "has a 'dy' that is not a whole number in range", .{});
+            try out.append(arena, .{ .wheel = .{ .x = x, .y = y, .dx = dx, .dy = dy, .mods = mods } });
+        } else if (eql(u8, kind, "key")) {
+            const name = mcp.argStr(item, "key") orelse
+                return inputRefusal(arena, i, "needs 'key': a named key (Enter, Tab, Shift, F5, ...) or one character", .{});
+            const chord = webkeys.parseChord(name) catch |err| return switch (err) {
+                error.UnknownModifier => inputRefusal(arena, i, "has an unknown modifier in '{s}'", .{name}),
+                error.UnknownKey, error.EmptyChord => inputRefusal(arena, i, "names an unknown key '{s}'", .{name}),
+            };
+            const action = mcp.argStr(item, "action") orelse "press";
+            const text = try arena.dupe(u8, if (mods & (web_proto.mod_ctrl | web_proto.mod_alt) != 0) "" else chord.textSlice());
+            const all_mods = mods | chord.mods;
+            if (eql(u8, action, "down") or eql(u8, action, "press"))
+                try out.append(arena, .{ .key = .{ .kind = .down, .keysym = chord.keysym, .mods = all_mods, .text = text } });
+            if (eql(u8, action, "up") or eql(u8, action, "press"))
+                try out.append(arena, .{ .key = .{ .kind = .up, .keysym = chord.keysym, .mods = all_mods, .text = "" } });
+            if (!eql(u8, action, "down") and !eql(u8, action, "up") and !eql(u8, action, "press"))
+                return inputRefusal(arena, i, "has an unknown key action '{s}' (down, up, press)", .{action});
+        } else if (eql(u8, kind, "text")) {
+            const text = mcp.argStr(item, "text") orelse return inputRefusal(arena, i, "needs a non-empty 'text'", .{});
+            if (text.len == 0) return inputRefusal(arena, i, "needs a non-empty 'text'", .{});
+            if (text.len > MAX_INPUT_TEXT) return inputRefusal(arena, i, "has a text longer than {d} bytes", .{MAX_INPUT_TEXT});
+            if (!std.unicode.utf8ValidateSlice(text)) return inputRefusal(arena, i, "has a text that is not UTF-8", .{});
+            try out.append(arena, .{ .text = text });
+        } else return inputRefusal(arena, i, "has an unknown type '{s}' (pointer, wheel, key, text)", .{kind});
+    }
+    return .{ .events = out.items };
+}
+
+/// Coordinate input: pointer edges, wheel steps, single key edges and
+/// text at the caret, as the trusted frames a GUI's own input rides.
+///
+/// AIDEV-NOTE: deliberately no settle wait and no delta: a watcher that
+/// drives a page by hand reads the outcome from `web_frame`, and a
+/// settle per event would make a drag crawl. A batch stops at the first
+/// event the engine could not take; the refusal says how many went out,
+/// because input already sent cannot be taken back (a held button or key
+/// is the caller's to release).
+fn inputTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view: View) ![]const u8 {
+    if (try policyGate(arena, view)) |f| return failRes(arena, f);
+    const e = switch (drv) {
+        .gui => return mcp.errRes(arena, .unavailable, GUI_ONLY_HEADLESS),
+        .headless => |e| e,
+    };
+    const events = switch (try parseInputEvents(arena, args)) {
+        .err => |f| return failRes(arena, f),
+        .events => |ev| ev,
+    };
+    var focused = false;
+    for (events, 0..) |ev, i| {
+        const sent: anyerror!void = switch (ev) {
+            .pointer => |p| e.pointerAt(view.pane, p.kind, p.x, p.y, p.button, p.clicks, p.mods),
+            .wheel => |w| e.wheelAt(view.pane, w.x, w.y, w.dx, w.dy, w.mods),
+            .key, .text => blk: {
+                if (!focused) {
+                    e.focusView(view.pane) catch |err| break :blk err;
+                    focused = true;
+                }
+                break :blk switch (ev) {
+                    .key => |k| e.keyEdge(view.pane, k.kind, k.keysym, k.mods, k.text),
+                    .text => |t| e.insertText(view.pane, t),
+                    else => unreachable,
+                };
+            },
+        };
+        sent catch |err| {
+            const f = try headlessFail(arena, e, err);
+            return failRes(arena, fail(f.code, try std.fmt.allocPrint(arena, "{s} (event {d} of {d}; the {d} before it were sent)", .{ f.text, i + 1, events.len, i })));
+        };
+    }
+    return inputResult(arena, drv.mode(), view, events);
+}
+
+fn inputResult(arena: std.mem.Allocator, mode: Mode, v: View, events: []const InputEvent) ![]const u8 {
+    var counts = [4]usize{ 0, 0, 0, 0 };
+    for (events) |ev| counts[@intFromEnum(std.meta.activeTag(ev))] += 1;
+    var res = mcp.Res.init(arena);
+    try head(&res, arena, mode, v);
+    try res.fact("sent", events.len);
+    try res.fact("pointer", counts[0]);
+    try res.fact("wheel", counts[1]);
+    try res.fact("key", counts[2]);
+    try res.fact("text", counts[3]);
+    try res.textf("sent {d} input event(s) as trusted engine input ({d} pointer, {d} wheel, {d} key, {d} text); nothing waited for the page, web_frame shows what it did", .{ events.len, counts[0], counts[1], counts[2], counts[3] });
+    return res.finish();
+}
+
+/// What `web_frame` answers: a newer frame, or the fact that none came.
+const FrameAnswer = struct {
+    serial: u32,
+    unchanged: bool,
+    format: []const u8 = "jpeg",
+    image: []const u8 = "",
+    width: u32 = 0,
+    height: u32 = 0,
+    viewport_width: u32 = 0,
+    viewport_height: u32 = 0,
+};
+
+/// The pulled frame source: the view's newest frame once its paint
+/// serial differs from `since`, as JPEG (or PNG), long-polling up to
+/// `timeout_ms`. See `webdrive.Engine.frameAfter`.
+fn frameTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view: View) ![]const u8 {
+    const e = switch (drv) {
+        .gui => return mcp.errRes(arena, .unavailable, GUI_ONLY_HEADLESS),
+        .headless => |e| e,
+    };
+    const since: u32 = switch (try argU32(arena, args, "since")) {
+        .absent => 0,
+        .err => |f| return failRes(arena, f),
+        .value => |v| v,
+    };
+    const format = mcp.argStr(args, "format") orelse "jpeg";
+    const jpeg = std.mem.eql(u8, format, "jpeg");
+    if (!jpeg and !std.mem.eql(u8, format, "png"))
+        return mcp.errRes(arena, .invalid_args, "web_frame 'format' must be jpeg or png");
+    const quality: u8 = @intCast(std.math.clamp(mcp.argInt(args, "quality") orelse 70, 1, 100));
+    const max_width: ?u32 = if (mcp.argInt(args, "max_width")) |mw| @intCast(std.math.clamp(mw, 64, 3840)) else null;
+    const budget = timeoutOf(args, 1000);
+    const frame = (e.frameAfter(arena, view.pane, since, budget) catch |err|
+        return failRes(arena, try headlessFail(arena, e, err))) orelse
+        return frameResult(arena, drv.mode(), view, .{ .serial = since, .unchanged = true, .format = format });
+    var rgba = frame.rgba;
+    var w: u32 = frame.w;
+    var h: u32 = frame.h;
+    if (max_width) |mw| if (mw < w) {
+        const dst_h: u32 = @max(1, @as(u32, @intCast(@as(u64, h) * mw / w)));
+        rgba = try png_codec.downscaleRgba(arena, rgba, w, h, mw, dst_h);
+        w = mw;
+        h = dst_h;
+    };
+    const image = if (jpeg)
+        try png_codec.encodeRgbaJpeg(arena, rgba, w, h, quality)
+    else
+        try png_codec.encodeRgba(arena, rgba, w, h);
+    return frameResult(arena, drv.mode(), view, .{
+        .serial = frame.gen,
+        .unchanged = false,
+        .format = format,
+        .image = image,
+        .width = w,
+        .height = h,
+        .viewport_width = frame.view_w,
+        .viewport_height = frame.view_h,
+    });
+}
+
+fn frameResult(arena: std.mem.Allocator, mode: Mode, v: View, a: FrameAnswer) ![]const u8 {
+    var res = mcp.Res.init(arena);
+    try head(&res, arena, mode, v);
+    try res.fact("frame", a.serial);
+    try res.fact("unchanged", a.unchanged);
+    try res.fact("format", a.format);
+    if (a.unchanged) {
+        try res.textf("no frame newer than {d} was painted in time; the page is still", .{a.serial});
+        return res.finish();
+    }
+    try res.fact("width", a.width);
+    try res.fact("height", a.height);
+    try res.fact("viewport_width", a.viewport_width);
+    try res.fact("viewport_height", a.viewport_height);
+    try res.fact("bytes", a.image.len);
+    try res.textf("frame {d}, {d}x{d} {s} of a {d}x{d} viewport (input coordinates are viewport pixels)", .{ a.serial, a.width, a.height, a.format, a.viewport_width, a.viewport_height });
+    try res.text(TRUST_LINE);
+    const jpeg = std.mem.eql(u8, a.format, "jpeg");
+    return res.finishWithImagesOf(&.{a.image}, if (jpeg) "image/jpeg" else "image/png", if (jpeg) ".jpg" else ".png", &.{"frame"});
 }
 
 /// In-place viewport resize: media queries and layout re-evaluate,
@@ -6802,6 +7166,114 @@ test "web_screenshot: image block plus structured pixel facts" {
     try t.expect(mcp.pngSize("short") == null);
 }
 
+test "web_input parses a hand-driven batch whole, and refuses it whole" {
+    var arena_state = testArena();
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const t = std.testing;
+
+    // 1. A drag with shift held, a wheel step, a key press and text: every edge in order, a press as two.
+    const ok = try std.json.parseFromSliceLeaky(std.json.Value, arena,
+        \\{"events":[{"type":"key","action":"down","key":"Shift"},
+        \\{"type":"pointer","action":"down","x":10,"y":20,"modifiers":["shift"]},
+        \\{"type":"pointer","x":40,"y":20},{"type":"pointer","action":"up","x":40,"y":20,"button":"left"},
+        \\{"type":"key","action":"up","key":"Shift"},{"type":"wheel","x":5,"y":6,"dy":120},
+        \\{"type":"key","key":"ctrl+a"},{"type":"text","text":"h\u00e9"}]}
+    , .{});
+    const events = switch (try parseInputEvents(arena, ok)) {
+        .events => |ev| ev,
+        .err => |f| {
+            std.debug.print("{s}\n", .{f.text});
+            return error.TestUnexpectedResult;
+        },
+    };
+    try t.expectEqual(@as(usize, 9), events.len);
+    try t.expectEqual(@as(u32, 0xffe1), events[0].key.keysym);
+    try t.expectEqual(web_proto.KeyKind.down, events[0].key.kind);
+    try t.expectEqual(web_proto.PointerKind.down, events[1].pointer.kind);
+    try t.expectEqual(web_proto.mod_shift, events[1].pointer.mods);
+    try t.expectEqual(web_proto.PointerKind.move, events[2].pointer.kind);
+    try t.expectEqual(@as(i32, 40), events[3].pointer.x);
+    try t.expectEqual(web_proto.KeyKind.up, events[4].key.kind);
+    try t.expectEqual(@as(i32, 120), events[5].wheel.dy);
+    try t.expectEqual(@as(i32, 0), events[5].wheel.dx);
+    // ctrl+a: a press is its down and its up, the chord's modifier on both, and no text typed.
+    try t.expectEqual(web_proto.mod_ctrl, events[6].key.mods);
+    try t.expectEqualStrings("", events[6].key.text);
+    try t.expectEqual(web_proto.KeyKind.up, events[7].key.kind);
+    try t.expectEqualStrings("h\u{e9}", events[8].text);
+
+    // 2. One bad event refuses the batch and names it.
+    const cases = [_]struct { json: []const u8, says: []const u8 }{
+        .{ .json = "{}", .says = "needs 'events'" },
+        .{ .json = "{\"events\":[]}", .says = "non-empty" },
+        .{ .json = "{\"events\":[{\"type\":\"pointer\",\"x\":1}]}", .says = "events[0] needs whole-number 'x' and 'y'" },
+        .{ .json = "{\"events\":[{\"type\":\"wheel\",\"x\":1,\"y\":1},{\"type\":\"pointer\",\"action\":\"hover\",\"x\":1,\"y\":1}]}", .says = "events[1] has an unknown pointer action 'hover'" },
+        .{ .json = "{\"events\":[{\"type\":\"pointer\",\"x\":1,\"y\":1,\"button\":\"back\"}]}", .says = "unknown button 'back'" },
+        .{ .json = "{\"events\":[{\"type\":\"key\",\"key\":\"Hyper\"}]}", .says = "unknown key 'Hyper'" },
+        .{ .json = "{\"events\":[{\"type\":\"key\",\"key\":\"a\",\"action\":\"hold\"}]}", .says = "unknown key action 'hold'" },
+        .{ .json = "{\"events\":[{\"type\":\"text\",\"text\":\"\"}]}", .says = "non-empty 'text'" },
+        .{ .json = "{\"events\":[{\"type\":\"pointer\",\"x\":1,\"y\":1,\"modifiers\":[\"hyper\"]}]}", .says = "unknown modifier" },
+        .{ .json = "{\"events\":[{\"type\":\"pointer\",\"x\":99999999,\"y\":1}]}", .says = "needs whole-number 'x' and 'y'" },
+        .{ .json = "{\"events\":[{\"type\":\"gesture\"}]}", .says = "unknown type 'gesture'" },
+    };
+    for (cases) |case| {
+        const args = try std.json.parseFromSliceLeaky(std.json.Value, arena, case.json, .{});
+        switch (try parseInputEvents(arena, args)) {
+            .events => return error.TestUnexpectedResult,
+            .err => |f| {
+                try t.expectEqual(mcp.ErrCode.invalid_args, f.code);
+                if (std.mem.indexOf(u8, f.text, case.says) == null) {
+                    std.debug.print("{s} answered: {s}\n", .{ case.json, f.text });
+                    return error.TestUnexpectedResult;
+                }
+            },
+        }
+    }
+
+    // 3. The result counts what went out, per kind, against its declared schema.
+    const out = try inputResult(arena, .headless, EXAMPLE, events);
+    const sc = (try mcp.expectToolResultShape(arena, "web_input", out)).object.get("structuredContent").?.object;
+    try t.expectEqual(@as(i64, 9), sc.get("sent").?.integer);
+    try t.expectEqual(@as(i64, 3), sc.get("pointer").?.integer);
+    try t.expectEqual(@as(i64, 4), sc.get("key").?.integer);
+    try t.expectEqual(@as(i64, 1), sc.get("text").?.integer);
+}
+
+test "web_frame: a frame rides as a JPEG block with both coordinate spaces, an unchanged answer carries none" {
+    var arena_state = testArena();
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const t = std.testing;
+
+    const jpg = "\xff\xd8\xff\xe0 not really a jpeg \xff\xd9";
+    const out = try frameResult(arena, .headless, EXAMPLE, .{
+        .serial = 7,
+        .unchanged = false,
+        .format = "jpeg",
+        .image = jpg,
+        .width = 640,
+        .height = 400,
+        .viewport_width = 1280,
+        .viewport_height = 800,
+    });
+    const parsed = try mcp.expectToolResultShape(arena, "web_frame", out);
+    const sc = parsed.object.get("structuredContent").?.object;
+    try t.expectEqual(@as(i64, 7), sc.get("frame").?.integer);
+    try t.expect(!sc.get("unchanged").?.bool);
+    try t.expectEqual(@as(i64, 640), sc.get("width").?.integer);
+    try t.expectEqual(@as(i64, 1280), sc.get("viewport_width").?.integer);
+    const content = parsed.object.get("content").?.array.items;
+    try t.expectEqual(@as(usize, 2), content.len);
+    try t.expectEqualStrings("image/jpeg", content[1].object.get("mimeType").?.string);
+
+    const still = try frameResult(arena, .headless, EXAMPLE, .{ .serial = 7, .unchanged = true });
+    const ssc = (try mcp.expectToolResultShape(arena, "web_frame", still)).object.get("structuredContent").?.object;
+    try t.expect(ssc.get("unchanged").?.bool);
+    try t.expectEqual(@as(i64, 7), ssc.get("frame").?.integer);
+    try t.expect(ssc.get("width") == null);
+}
+
 test "web_wait / web_expand / web_query shapes" {
     var arena_state = testArena();
     defer arena_state.deinit();
@@ -6939,6 +7411,53 @@ const ONE_VIEW = "{\"ok\":true,\"views\":[{\"pane\":7,\"view\":7,\"url\":\"https
 
 fn jsonArgs(arena: std.mem.Allocator, text: []const u8) !std.json.Value {
     return std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{});
+}
+
+test "stream capability is code support before startup and a negotiated runtime fact afterwards" {
+    configureHeadless(std.testing.allocator, "/tmp/sketerm-stream-cap-test", null, null, null);
+    defer {
+        shutdownHeadless();
+        g_headless_alloc = null;
+        g_headless_dir = null;
+    }
+    try std.testing.expect(streamCapability().supported);
+    try std.testing.expect(streamCapability().audio == null);
+    const e = headlessEngine().?;
+    e.state = .ready;
+    try std.testing.expect(!streamCapability().supported);
+    try std.testing.expectEqual(@as(?bool, false), streamCapability().audio);
+    e.caps.insert(.web_stream);
+    try std.testing.expect(streamCapability().supported);
+    try std.testing.expectEqual(@as(?bool, false), streamCapability().audio);
+    e.caps.insert(.stream_audio);
+    try std.testing.expectEqual(@as(?bool, true), streamCapability().audio);
+    e.state = .idle;
+}
+
+test "web_stream returns common view facts and refuses GUI and malformed audio without IPC" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const out = try streamResult(arena, .{ .pane = 7, .view = 7, .url = "https://example.com/", .route = "via:box" }, .{
+        .view = 7, .req = 1, .path = "/tmp/web-stream.sock",
+        .token = "0123456789abcdef0123456789abcdef", .err = "",
+    }, false);
+    const sc = (try mcp.expectToolResultShape(arena, "web_stream", out)).object.get("structuredContent").?.object;
+    try std.testing.expectEqualStrings("headless", sc.get("backend").?.string);
+    try std.testing.expectEqualStrings("via:box", sc.get("route").?.string);
+    try std.testing.expectEqual(@as(i64, 7), sc.get("pane").?.integer);
+    try std.testing.expectEqual(@as(i64, 7), sc.get("view").?.integer);
+    try std.testing.expect(!sc.get("audio").?.bool);
+    mcp.mcp_webgui.configure(std.testing.allocator, .{ .granted = true, .source = .flag }, NoGuiOps.ops);
+    defer mcp.mcp_webgui.shutdown();
+    var fake = ScriptedBackend{ .allocator = std.testing.allocator, .responses = &.{} };
+    defer fake.deinit();
+    for ([_][]const u8{ "{}", "{\"audio\":\"yes\"}" }, 0..) |args, i| {
+        const result = try webTool(arena, fake.backend(), "web_stream", try jsonArgs(arena, args));
+        const parsed = try mcp.expectToolResultShape(arena, "web_stream", result);
+        try std.testing.expectEqualStrings(if (i == 0) "unavailable" else "invalid_args", parsed.object.get("structuredContent").?.object.get("error").?.object.get("code").?.string);
+    }
+    try std.testing.expectEqual(@as(usize, 0), fake.requests.items.len);
 }
 
 test "web_expand reports an unknown node id instead of an empty success" {
@@ -7089,7 +7608,7 @@ test "the headless backend keeps one engine per route, keyed by its slug" {
 
     // No helper is started here: an engine binds its socket lazily, on
     // the first call that needs one.
-    configureHeadless(t.allocator, "/tmp/sketerm-route-table-test", null, null);
+    configureHeadless(t.allocator, "/tmp/sketerm-route-table-test", null, null, null);
     defer {
         shutdownHeadless();
         g_headless_alloc = null;
@@ -7157,7 +7676,7 @@ test "a headless tor or via: route resolves to its own engine, on: does not reso
     const arena = arena_state.allocator();
     const t = std.testing;
 
-    configureHeadless(t.allocator, "/tmp/sketerm-route-pick-test", null, null);
+    configureHeadless(t.allocator, "/tmp/sketerm-route-pick-test", null, null, null);
     defer {
         shutdownHeadless();
         g_headless_alloc = null;
@@ -7542,7 +8061,7 @@ test "every tool this module serves declares an output schema" {
             return error.MissingOutputSchema;
         }
     }
-    try std.testing.expectEqual(@as(usize, 28), seen);
+    try std.testing.expectEqual(@as(usize, 31), seen);
 }
 
 test "parsePolicy fails closed on unknown names and invalid host authorities" {
@@ -7774,7 +8293,7 @@ test "ordinary and untrusted engine addresses remain stable across route table g
     const saved_instance = g_headless_instance;
     const saved_mux = g_headless_mux_sock;
     if (g_engines.items.len != 0) return error.SkipZigTest;
-    configureHeadless(std.testing.allocator, "/tmp/webdrive-mode-test", null, null);
+    configureHeadless(std.testing.allocator, "/tmp/webdrive-mode-test", null, null, null);
     defer {
         shutdownHeadless();
         g_headless_alloc = saved_alloc;
@@ -7822,7 +8341,7 @@ test "web_untrusted is a build fact, and lifecycle facts never come from the unt
     const gpa = std.testing.allocator;
     var pin = try WebBinPin.set(gpa, "/bin/sh");
     defer pin.restore(gpa);
-    configureHeadless(gpa, "/tmp/webdrive-mode-test", null, null);
+    configureHeadless(gpa, "/tmp/webdrive-mode-test", null, null, null);
     defer {
         shutdownHeadless();
         g_headless_alloc = saved_alloc;

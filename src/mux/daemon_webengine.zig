@@ -199,6 +199,9 @@ pub fn handleWebEngineOpen(self: *Daemon, cl: *Client, r: WebOpReq) void {
     var cache_z: [4096:0]u8 = undefined;
     const cache_arg = std.fmt.bufPrintZ(&cache_z, "{s}", .{store.root}) catch
         return webReplyErr(cl, r.req, "engine cache path too long");
+    var stream_z: [4096:0]u8 = undefined;
+    const stream_arg = std.fmt.bufPrintZ(&stream_z, "{s}", .{self.sock_path[0..dir_end]}) catch
+        return webReplyErr(cl, r.req, "engine stream directory too long");
     var linger_z: [24:0]u8 = undefined;
     const linger_arg = std.fmt.bufPrintZ(&linger_z, "{d}", .{engineLingerMs()}) catch unreachable;
 
@@ -237,6 +240,10 @@ pub fn handleWebEngineOpen(self: *Daemon, cl: *Client, r: WebOpReq) void {
     }
     if (pid == 0) {
         entry.diagnostic.child();
+        // Named MCP helpers need readable CPU pixels, just like ephemeral ones.
+        if (c.setenv("SKETERM_WEB_GPU", "0", 1) != 0 or
+            c.setenv("SKETERM_WEB_OZONE", "headless", 1) != 0 or
+            c.setenv("SKETERM_WEB_SOFTWARE_WEBGL", "1", 1) != 0) c._exit(127);
         // Own process group so a future teardown can take CEF's whole
         // subprocess tree; stdio to /dev/null (CEF noise), like the
         // remote-helper spawn above.
@@ -247,7 +254,7 @@ pub fn handleWebEngineOpen(self: *Daemon, cl: *Client, r: WebOpReq) void {
             _ = c.dup2(devnull, 1);
             if (devnull > 2) _ = c.close(devnull);
         }
-        var argv: [8:null]?[*:0]const u8 = .{ bin, "--socket", sock_arg.ptr, "--cache-dir", cache_arg.ptr, "--linger-ms", linger_z[0..linger_arg.len :0].ptr, null };
+        var argv: [10:null]?[*:0]const u8 = .{ bin, "--socket", sock_arg.ptr, "--cache-dir", cache_arg.ptr, "--linger-ms", linger_z[0..linger_arg.len :0].ptr, "--stream-dir", stream_arg.ptr, null };
         _ = c.execv(bin, @ptrCast(@constCast(&argv)));
         @import("../web/diagnostic.zig").Capture.execFailed();
         c._exit(127);

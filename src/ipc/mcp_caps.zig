@@ -305,6 +305,15 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
         // the refusal.
         const cp = @import("mcp_web.zig").captureCapability();
         try res.fact("web_capture", cp.supported);
+        const stream = @import("mcp_web.zig").streamCapability();
+        try res.fact("web_stream", web_ok and stream.supported);
+        try res.fact("web_stream_audio", stream.audio);
+        try res.fact("web_software_webgl", @import("mcp_web.zig").softwareWebglCapability());
+        const frame_rate = @import("mcp_web.zig").frameRateCapability();
+        try res.fact("web_max_fps", frame_rate.supported);
+        try res.fact("web_default_max_fps", frame_rate.default);
+        if (web_ok and stream.supported)
+            try res.text("web_stream opens a helper-owned local binary socket for pushed BGRA damage, trusted input and optional runtime Opus audio; audio support is unknown until the helper handshake");
         if (cp.supported)
             try res.text(if (cp.started)
                 "web_open capture:{...} records the response bodies a headless view's page receives; web_capture reads them, web_wait for:\"response\" waits for the next one"
@@ -314,6 +323,13 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
             try res.text("response-body capture is headless only: the web tools drive the user's own tabs here")
         else
             try res.text("this browser helper cannot capture response bodies (capability 'capture'); a captured web_open is refused");
+        // Driving a page by hand (web_input) and watching it (web_frame)
+        // are headless tools: with a GUI the pane owns its mouse and its
+        // pixels. A remote-control viewer preflights both here.
+        try res.fact("web_input", web_ok and !gui_web);
+        try res.fact("web_frames", web_ok and !gui_web);
+        if (web_ok and !gui_web)
+            try res.text("web_input drives a view by hand at viewport coordinates (pointer, wheel, held keys, text) and web_frame long-polls its newest painted frame as JPEG or PNG");
         try res.fact("web_accept_cert", !gui_web);
         try res.text(if (gui_web)
             "certificate errors: the user's interstitial decides; results carry cert facts while a load is held"

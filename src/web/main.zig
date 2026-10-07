@@ -36,6 +36,8 @@ const untrusted_env = @import("untrusted_env.zig");
 
 const USAGE =
     \\sketerm-web --socket PATH [--cache-dir PATH] [--proxy URL] [--linger-ms N]
+    \\           [--stream-dir PATH]  (pushed-stream sockets; default: beside
+    \\            --socket, or a private dir under $XDG_RUNTIME_DIR)
     \\           (--socket-fd N and --frames-inline are the daemon's
     \\            remote-helper launch shape)
     \\
@@ -113,6 +115,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var cache_buf: [4096]u8 = undefined;
     var socket_path: ?[]const u8 = null;
     var cache_dir: ?[]const u8 = null;
+    var stream_buf: [4096]u8 = undefined;
+    var stream_dir: ?[]const u8 = null;
     var socket_fd: c_int = -1;
     var proxy_buf: [96]u8 = undefined;
     var instance_proxy: []const u8 = "";
@@ -142,6 +146,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         } else if (std.mem.eql(u8, a, "--cache-dir") and i + 1 < argv.len) {
             i += 1;
             cache_dir = copyArg(&cache_buf, std.mem.span(argv[i]));
+        } else if (std.mem.eql(u8, a, "--stream-dir") and i + 1 < argv.len) {
+            i += 1;
+            stream_dir = copyArg(&stream_buf, std.mem.span(argv[i]));
         } else if (std.mem.eql(u8, a, "--proxy") and i + 1 < argv.len) {
             // This whole helper instance's route (tor / mux egress): the
             // proxy is applied to the GLOBAL context and to every
@@ -275,6 +282,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         srv.instance_proxy = instance_proxy;
         srv.force_inline = frames_inline;
         srv.linger_ms = linger_ms;
+        srv.stream_dir = stream_dir;
         defer srv.deinit();
         if (socket_fd >= 0) {
             srv.adoptClientFd(socket_fd);
@@ -339,12 +347,13 @@ fn reexecPreloaded(argv: []const [*:0]const u8) void {
 /// which coalesces them so Chromium's last-switch-wins parser loses none.
 /// The pointer list is truncated rather than overflowed.
 ///
-/// THE OZONE PLATFORM IS THE WHOLE GPU DECISION, and it is a runtime one
+/// The default accelerated-paint decision is runtime-probed
 /// because the helper must keep working with no display at all (headless
 /// CI, the smoke rig, a future remote helper). MEASURED 2026-08-10 on
 /// Arch with CEF 150, an animating page at 3840x2160 physical:
 ///
-///   --ozone-platform=headless   no `--type=gpu-process` is EVER
+///   --ozone-platform=headless   without an explicit SwiftShader policy,
+///                               no `--type=gpu-process` is
 ///                               spawned — not with --enable-gpu, not
 ///                               with --ignore-gpu-blocklist, not with
 ///                               --use-angle=gl-egl/vulkan (those make
@@ -459,7 +468,18 @@ fn buildCefArgv(argv: []const [*:0]const u8, disable_features: [:0]u8, buf: *[64
             n += 1;
         }
     }
-    if (choice.disable_gpu and n < buf.len) {
+    const software_webgl = !untrusted.enabled and if (c.getenv("SKETERM_WEB_SOFTWARE_WEBGL")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
+    cefhost.software_webgl = software_webgl;
+    if (software_webgl) {
+        // Keep WebGL's SwiftShader process, but deliver CPU OnPaint pixels.
+        const switches = [_][*:0]const u8{ "--use-angle=swiftshader", "--enable-unsafe-swiftshader", "--disable-gpu-compositing" };
+        if (n + switches.len > buf.len) c._exit(2);
+        for (switches) |value| {
+            buf[n] = @ptrCast(@constCast(value));
+            n += 1;
+        }
+    }
+    if (choice.disable_gpu and !software_webgl and n < buf.len) {
         buf[n] = @ptrCast(@constCast("--disable-gpu"));
         n += 1;
     }
@@ -476,9 +496,8 @@ fn buildCefArgv(argv: []const [*:0]const u8, disable_features: [:0]u8, buf: *[64
         buf[n] = @ptrCast(@constCast("--enable-lcd-text"));
         n += 1;
     }
-    // Only a real ozone platform ever produces a GPU process here, and
-    // only wayland was measured to deliver shared textures.
-    cefhost.setAccelerated(choice.accelerated);
+    // WebGL can use a SwiftShader process without enabling shared OSR textures.
+    cefhost.setAccelerated(choice.accelerated and !software_webgl);
     return buf[0..n];
 }
 

@@ -404,11 +404,17 @@ pub const McpLog = struct {
     /// entry. `tag` names what triggered the shot ("click", "move");
     /// "" for plain captures.
     fn logImage(self: *McpLog, caption: []const u8, png: []const u8, tag: []const u8) void {
+        self.logImageAs(caption, png, tag, ".png");
+    }
+
+    /// `logImage` for an image whose file extension is not `.png` (a JPEG frame).
+    fn logImageAs(self: *McpLog, caption: []const u8, png: []const u8, tag: []const u8, ext: []const u8) void {
         self.img_seq += 1;
         var nbuf: [64]u8 = undefined;
-        const fname = std.fmt.bufPrint(&nbuf, "img-{d}-{d:0>4}{s}{s}.png", .{
+        const fname = std.fmt.bufPrint(&nbuf, "img-{d}-{d:0>4}{s}{s}{s}", .{
             c.getpid(),                   self.img_seq,
             if (tag.len > 0) "-" else "", tag,
+            ext,
         }) catch return;
         var z: [4096]u8 = undefined;
         const path = std.fmt.bufPrintZ(&z, "{s}/{s}", .{ self.dir, fname }) catch return;
@@ -803,6 +809,11 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
         policy_source = "none";
     };
     const web_gui_grant = resolveWebGuiGrant(opts, &cfg) catch return 2;
+    var web_max_fps = cfg.mcp.web_max_fps;
+    if (opts.profile) |name| {
+        const prof = mcpProfileRecord(&cfg, name) catch return 2;
+        if (prof.web_max_fps) |fps| web_max_fps = fps;
+    }
 
     if (opts.log_dir) |ld| {
         mcp_log = McpLog.open(allocator, ld) orelse {
@@ -956,7 +967,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     // lazily on first use). Isolated/durable modes only — --shared
     // explicitly asks for the user's GUI and has no instance dir.
     if (iso) |i| {
-        @import("mcp_web.zig").configureHeadless(allocator, i.dir, opts.name, i.sock);
+        @import("mcp_web.zig").configureHeadless(allocator, i.dir, opts.name, i.sock, web_max_fps);
     }
     defer @import("mcp_web.zig").shutdownHeadless();
     // The web_gui grant: the web_* tools alone may use the user's own
@@ -1495,6 +1506,18 @@ pub const Res = struct {
     /// finish plus inline PNG content blocks after the text block.
     /// `tags` (parallel to `pngs`) names the --log trace files.
     pub fn finishWithImages(self: *Res, pngs: []const []const u8, tags: ?[]const []const u8) ![]const u8 {
+        return self.finishWithImagesOf(pngs, "image/png", ".png", tags);
+    }
+
+    /// `finishWithImages` for images of another type: `mime` is the
+    /// block's mimeType, `ext` the session log's file extension.
+    pub fn finishWithImagesOf(
+        self: *Res,
+        pngs: []const []const u8,
+        mime: []const u8,
+        ext: []const u8,
+        tags: ?[]const []const u8,
+    ) ![]const u8 {
         var aw: std.Io.Writer.Allocating = .init(self.arena);
         const w = &aw.writer;
         const t = self.tl.written();
@@ -1503,10 +1526,12 @@ pub const Res = struct {
         try w.writeAll("}");
         const enc = std.base64.standard.Encoder;
         for (pngs, 0..) |p, i| {
-            if (mcp_log) |*l| l.logImage(t, p, if (tags) |ts| (if (i < ts.len) ts[i] else "") else "");
+            if (mcp_log) |*l| l.logImageAs(t, p, if (tags) |ts| (if (i < ts.len) ts[i] else "") else "", ext);
             const b64 = try self.arena.alloc(u8, enc.calcSize(p.len));
             _ = enc.encode(b64, p);
-            try w.writeAll(",{\"type\":\"image\",\"mimeType\":\"image/png\",\"data\":\"");
+            try w.writeAll(",{\"type\":\"image\",\"mimeType\":");
+            try std.json.Stringify.value(mime, .{}, w);
+            try w.writeAll(",\"data\":\"");
             try w.writeAll(b64);
             try w.writeAll("\"}");
         }

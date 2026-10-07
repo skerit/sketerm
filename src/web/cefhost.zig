@@ -52,6 +52,8 @@ const host_sem = @import("cefhost/semlayer.zig");
 const host_wreq = @import("cefhost/webrequest.zig");
 const host_webext = @import("cefhost/webext.zig");
 const host_cookies = @import("cefhost/cookies.zig");
+const host_stream = @import("cefhost/stream.zig");
+const streamsrv = @import("streamsrv.zig");
 pub const untrusted = @import("cefhost/untrusted.zig");
 const emulation = @import("cefhost/emulation.zig");
 const SpinLock = @import("../util/spinlock.zig").SpinLock;
@@ -249,18 +251,33 @@ pub const discarded_msg = "view discarded: its browser was destroyed to free mem
 /// 150). 240 is CEF's maximum; the REAL pacing lever is the client's
 /// `view_max_fps` (its `browser_max_fps` clamped to the display's
 /// refresh), applied through `set_windowless_frame_rate` per view.
-const windowless_fps: c_int = 240;
+const windowless_fps: c_int = proto.MAX_VIEW_FPS;
 
 /// The `windowless_frame_rate` for a view whose client cap is
 /// `max_fps` (0 = uncapped): the cap clamped into CEF's valid 1-240
-/// band. `SKETERM_WEB_WFPS` overrides outright (measurement knob).
+/// band. `SKETERM_WEB_WFPS` only overrides an uncapped view (measurement knob).
 fn effectiveWindowlessFps(max_fps: u16) c_int {
+    if (max_fps != 0) return std.math.clamp(@as(c_int, max_fps), 1, windowless_fps);
     if (c.getenv("SKETERM_WEB_WFPS")) |v| {
         const n = std.fmt.parseInt(c_int, std.mem.span(v), 10) catch 0;
         if (n > 0) return n;
     }
-    if (max_fps == 0) return windowless_fps;
-    return std.math.clamp(@as(c_int, max_fps), 1, windowless_fps);
+    return windowless_fps;
+}
+
+test "explicit view caps override the measurement knob without changing uncapped GUI defaults" {
+    const saved = if (c.getenv("SKETERM_WEB_WFPS")) |v| try std.testing.allocator.dupeZ(u8, std.mem.span(v)) else null;
+    defer if (saved) |v| {
+        _ = c.setenv("SKETERM_WEB_WFPS", v.ptr, 1);
+        std.testing.allocator.free(v);
+    } else {
+        _ = c.unsetenv("SKETERM_WEB_WFPS");
+    };
+    _ = c.unsetenv("SKETERM_WEB_WFPS");
+    try std.testing.expectEqual(@as(c_int, 240), effectiveWindowlessFps(0));
+    _ = c.setenv("SKETERM_WEB_WFPS", "240", 1);
+    for ([_]u16{ 15, 30, 60, proto.MAX_VIEW_FPS }) |fps|
+        try std.testing.expectEqual(@as(c_int, fps), effectiveWindowlessFps(fps));
 }
 
 /// How long a `devtools_show` may go without the engine producing the
@@ -278,11 +295,13 @@ const adopt_timeout_ms: i64 = 8000;
 /// behave differently.
 ///
 /// MEASURED (2026-08-10, CEF 150, Arch, hybrid-GPU laptop):
-///   `--ozone-platform=headless` spawns no GPU process at all, whatever
-///   else is passed, so accelerated paints are impossible there;
+///   the default `--ozone-platform=headless` software compositor delivers
+///   CPU paints; a SwiftShader WebGL process does not imply shared textures;
 ///   `--ozone-platform=wayland` gets a GPU process that holds
 ///   /dev/dri render nodes and delivers 1-plane BGRA dma-bufs.
 var accelerated: bool = false;
+/// SwiftShader was explicitly selected with CPU compositing, not a page-level context guarantee.
+pub var software_webgl: bool = false;
 
 /// Called by `main.zig` before `Host.install`.
 pub fn setAccelerated(on: bool) void {
@@ -354,31 +373,7 @@ pub fn isAccelerated() bool {
 /// used to impose.)
 /// How the engine is told what DPR to lay out at.
 ///
-/// The protocol's scale contract (`protocol.ViewCreate`) is
-/// "view rect LOGICAL, buffers PHYSICAL, DPR from `get_screen_info`".
-/// That works exactly as documented under headless ozone, and NOT under
-/// any real ozone platform: MEASURED under `--ozone-platform=wayland`,
-/// `get_screen_info`'s `device_scale_factor` is ignored outright — the
-/// page reports `devicePixelRatio === 1` and the engine renders the view
-/// rect one buffer pixel per DIP, i.e. at logical resolution. That is
-/// the "why is the browser blurry" bug all over again, and no
-/// combination of `--force-device-scale-factor` moves it.
-///
-/// So in accelerated mode the same contract is honoured through a
-/// different lever: `get_view_rect` reports PHYSICAL pixels and the
-/// browser's ZOOM LEVEL carries the scale (Chromium's zoom multiplies
-/// `devicePixelRatio` and divides the layout viewport, which is exactly
-/// a device scale factor). MEASURED at logical 1280x720 scale 1.5:
-/// dpr 1.5, innerWidth 1280, dma-buf 1920x1080 — the contract, intact.
-///
-/// Everything the client sees is unchanged: wire sizes stay logical,
-/// buffers stay physical. Only input needs a conversion, because CEF's
-/// mouse coordinates live in view-rect space — see `viewPoint`.
-fn scaleViaZoom() bool {
-    return accelerated;
-}
-
-/// CEF's zoom LEVEL for a device scale factor: zoom factor = 1.2^level.
+/// OSR ignores screen-info DPR, so physical view geometry plus zoom preserves logical layout on both CPU and GPU.
 fn zoomLevelFor(scale_x1000: u16) f64 {
     const f = @as(f64, @floatFromInt(scale_x1000)) / 1000.0;
     return @log(f) / @log(@as(f64, 1.2));
@@ -442,12 +437,12 @@ pub const View = struct {
     cef_id: c_int = 0,
     /// Owned reference from create_browser_sync; released on destroy.
     browser: ?*cef.cef_browser_t = null,
-    /// LOGICAL (DIP) size: what `get_view_rect` reports, what input
-    /// coordinates are in, and what the client sends on the wire.
+    /// LOGICAL (DIP) size: what input coordinates are in and what the
+    /// client sends on the wire.
     w: u16,
     h: u16,
-    /// Device scale factor x1000, reported to the engine through
-    /// `get_screen_info` so the PAGE lays out at that DPR.
+    /// Device scale factor x1000, carried to the engine as zoom so the
+    /// PAGE lays out at that DPR (see `zoomLevelFor`).
     scale_x1000: u16,
     media: proto.ViewEmulation = .{ .view = 0 },
     media_observer: ?*emulation.Observer = null,
@@ -458,7 +453,8 @@ pub const View = struct {
     /// `initial_url` is a navigation deferred behind a LIVE media change, not the view's first document.
     initial_live: bool = false,
     /// PHYSICAL size: the frame buffer's real pixel dimensions, what
-    /// `frame_buffer` announces, and the size CEF's OnPaint delivers.
+    /// `frame_buffer` announces, what `get_view_rect` reports, and the
+    /// size CEF's OnPaint delivers.
     pw: u16,
     ph: u16,
     buf_id: u32 = 0,
@@ -625,6 +621,20 @@ pub const View = struct {
     popup_answered: bool = false,
     /// When the popup's browser was claimed, for that watchdog.
     popup_opened_ms: i64 = 0,
+
+    /// The engine's popup WIDGET (a `<select>` dropdown), which OSR
+    /// paints as its own `PET_POPUP` buffer: shown flag, position in view
+    /// coordinates (`on_popup_size`), physical size and a copy of its
+    /// pixels. Only the stream composes it (`cefhost/stream.zig`).
+    widget_shown: bool = false,
+    widget_x: c_int = 0,
+    widget_y: c_int = 0,
+    widget_w: u32 = 0,
+    widget_h: u32 = 0,
+    widget_map: []u8 = &.{},
+    /// The page's current cursor, kept whether or not a stream exists so
+    /// a stream starts from it (freed in `freeViewOpts`).
+    cursor: streamsrv.CursorCache = .{},
 
     /// A browser-action popup: real extension document and ordinary
     /// frame/input path, but no tab/navigation chrome on the client.
@@ -1097,6 +1107,12 @@ pub const Host = struct {
     /// view is mirrored as a toplevel on the session hub. Null when the
     /// helper was not started as a session client, or once it disarmed.
     presenter: ?*presenter.Presenter = null,
+    /// Pushed per-view streams (capability "web-stream"), and the
+    /// directory their sockets are created in (the helper socket's).
+    streams: std.ArrayList(*streamsrv.Stream) = .empty,
+    stream_dir: []const u8 = "",
+    /// Set while `streamPump` services the streams; defers reaping.
+    stream_busy: bool = false,
 
     /// User content (capability "userscripts"): the enabled userscript
     /// and userstyle sets, replaced whole by `us_script_set` /
@@ -1323,6 +1339,7 @@ pub const Host = struct {
     }
 
     pub fn deinit(self: *Host) void {
+        self.streamCloseAll();
         self.destroyAll();
         if (self.presenter) |p| {
             p.deinit();
@@ -1580,6 +1597,11 @@ pub const Host = struct {
         std.debug.print("sketerm-web: {s}\n", .{self.route_refusal});
     }
 
+    pub const streamOpen = host_stream.streamOpen;
+    pub const streamClose = host_stream.streamClose;
+    pub const streamPump = host_stream.streamPump;
+    pub const streamPollFds = host_stream.streamPollFds;
+    pub const streamCloseAll = host_stream.streamCloseAll;
     pub const presenterStart = host_obs.presenterStart;
     pub const presenterActive = host_obs.presenterActive;
     pub const presenterFd = host_obs.presenterFd;
@@ -1722,6 +1744,7 @@ pub const Host = struct {
             .h = req.h,
             .scale_x1000 = req.scale_x1000,
             .context = req.context,
+            .max_fps = req.max_fps,
         }, req.url);
     }
 
@@ -1734,6 +1757,10 @@ pub const Host = struct {
 
     fn createViewAtWith(self: *Host, req: proto.ViewCreate, initial_url: []const u8, ops: *const BrowserSpawnOps) !void {
         if (req.view == 0 or self.find(req.view) != null) return;
+        if (req.max_fps > proto.MAX_VIEW_FPS) {
+            self.post(proto.EvViewCreateFailed{ .view = req.view, .context = req.context, .reason = "frame rate exceeds the CEF cap" });
+            return;
+        }
         if (self.route_refusal.len != 0) {
             self.post(proto.EvViewCreateFailed{ .view = req.view, .context = req.context, .reason = self.route_refusal });
             return;
@@ -1815,6 +1842,7 @@ pub const Host = struct {
             .ph = physicalOf(lh, scale),
             .context = req.context,
             .sem = semantic.View.init(self.gpa),
+            .max_fps = req.max_fps,
         };
         for (&self.pending_media) |*slot| {
             if (slot.view == req.view) {
@@ -1877,6 +1905,7 @@ pub const Host = struct {
             // context itself, and `on_before_popup` has no out-param
             // for one.
             .context = opener.context,
+            .max_fps = opener.max_fps,
         }) catch return false;
         // `registerView` derives these from dispatch state, which is
         // zero inside a CEF callback. An owner of 0 also disables the
@@ -2091,6 +2120,9 @@ pub const Host = struct {
             slot.* = .{ .view = 0 };
         };
         self.abandonViewWaiters(id);
+        // Its stream ends while the record exists, so the stream
+        // client's held keys and buttons are released into the page.
+        host_stream.streamDropView(self, id);
         // A page owns every browser-action popup it opened. Close those
         // first so no floating extension page survives its toolbar.
         while (self.popupForOwner(id)) |popup| self.destroyView(popup.id);
@@ -2763,6 +2795,10 @@ pub const Host = struct {
             v.map = &.{};
         }
         v.buf_unpainted = false;
+        host_stream.popupForget(self, v);
+        // The browser that held the stream client's keys and buttons is
+        // gone; there is nothing left to release them into.
+        host_stream.streamBrowserGone(self, v.id);
         v.forgetPool();
         for (v.pending.items) |p| self.failPending(v, p, "semantic request canceled because the browser closed");
         v.pending.clearRetainingCapacity();
@@ -2799,6 +2835,7 @@ pub const Host = struct {
         if (v.url.len != 0) self.gpa.free(v.url);
         if (v.title.len != 0) self.gpa.free(v.title);
         if (v.sel_text.len != 0) self.gpa.free(v.sel_text);
+        v.cursor.deinit(self.gpa);
         v.pending.deinit(self.gpa);
         for (v.exec_at_start.items) |js| self.gpa.free(js);
         v.exec_at_start.deinit(self.gpa);
@@ -3403,13 +3440,20 @@ pub const Host = struct {
     // -- input ---------------------------------------------------------
 
     pub fn pointer(self: *Host, req: proto.InputPointer) void {
+        self.pointerFlags(req, 0);
+    }
+
+    /// `pointer` with engine event flags OR'd in that the wire's mods
+    /// cannot express: the stream passes its held mouse buttons here, so
+    /// a drag carries them on every move.
+    pub fn pointerFlags(self: *Host, req: proto.InputPointer, extra_flags: u32) void {
         latStamp("input");
         const v = self.findWake(req.view) orelse return;
         const pt = viewPoint(v, req.x, req.y);
         var ev = cef.cef_mouse_event_t{
             .x = pt.x,
             .y = pt.y,
-            .modifiers = keymap.eventFlags(req.mods),
+            .modifiers = keymap.eventFlags(req.mods) | extra_flags,
         };
         const button: cef.cef_mouse_button_type_t = switch (req.button) {
             1 => cef.MBT_MIDDLE,
@@ -3427,12 +3471,17 @@ pub const Host = struct {
     }
 
     pub fn scroll(self: *Host, req: proto.InputScroll) void {
+        self.scrollFlags(req, 0);
+    }
+
+    /// `scroll` with extra engine event flags (see `pointerFlags`).
+    pub fn scrollFlags(self: *Host, req: proto.InputScroll, extra_flags: u32) void {
         const v = self.findWake(req.view) orelse return;
         const pt = viewPoint(v, req.x, req.y);
         var ev = cef.cef_mouse_event_t{
             .x = pt.x,
             .y = pt.y,
-            .modifiers = keymap.eventFlags(req.mods),
+            .modifiers = keymap.eventFlags(req.mods) | extra_flags,
         };
         // Protocol dy is positive DOWN; CEF's wheel delta is positive UP.
         // The deltas live in view-rect space too, so they scale with it.
@@ -6035,7 +6084,7 @@ pub fn HeapRef(comptime Owner: type, comptime field: []const u8) type {
     };
 }
 
-fn staticBase(comptime T: type) cef.cef_base_ref_counted_t {
+pub fn staticBase(comptime T: type) cef.cef_base_ref_counted_t {
     return .{
         .size = @sizeOf(T),
         .add_ref = baseAddRef,
@@ -6156,6 +6205,11 @@ fn installHandlers() void {
     render_handler.on_scroll_offset_changed = onScrollOffsetChanged;
     render_handler.on_text_selection_changed = onTextSelectionChanged;
     render_handler.get_accessibility_handler = getAccessibilityHandler;
+    // Only the stream draws the `<select>` widget; recording it costs a
+    // copy of its pixels while one is open.
+    render_handler.on_popup_show = host_stream.onPopupShow;
+    render_handler.on_popup_size = host_stream.onPopupSize;
+    host_stream.installAudio();
 
     accessibility_handler = std.mem.zeroes(cef.cef_accessibility_handler_t);
     accessibility_handler.base = staticBase(cef.cef_accessibility_handler_t);
@@ -6253,6 +6307,9 @@ fn installHandlers() void {
     client.get_context_menu_handler = getContextMenuHandler;
     client.get_permission_handler = getPermissionHandler;
     client.get_download_handler = getDownloadHandler;
+    // Asked per audio stream; it captures only for a view whose stream
+    // asked for audio and leaves every other page playing normally.
+    client.get_audio_handler = host_stream.getAudioHandler;
     client.on_process_message_received = onProcessMessage;
 }
 
@@ -6347,11 +6404,8 @@ pub fn viewOf(browser: [*c]cef.cef_browser_t) ?*View {
     return host.pending orelse host.adopting;
 }
 
-/// The view rect the engine renders: LOGICAL (DIP) in software mode,
-/// where CEF multiplies it by `get_screen_info`'s device_scale_factor to
-/// get the paint size, and PHYSICAL in accelerated mode, where that
-/// factor is ignored and the zoom level carries the scale instead. See
-/// `scaleViaZoom`.
+/// The view rect the engine renders: PHYSICAL, the zoom level carrying
+/// the scale (see `zoomLevelFor`).
 fn onGetViewRect(
     _: [*c]cef.cef_render_handler_t,
     browser: [*c]cef.cef_browser_t,
@@ -6366,16 +6420,15 @@ fn onGetViewRect(
 }
 
 fn viewRect(v: *const View) cef.cef_rect_t {
-    if (scaleViaZoom()) return .{ .x = 0, .y = 0, .width = v.pw, .height = v.ph };
-    return .{ .x = 0, .y = 0, .width = v.w, .height = v.h };
+    return .{ .x = 0, .y = 0, .width = v.pw, .height = v.ph };
 }
 
 /// The DPR the PAGE lays out at (and picks 2x images / hints text for).
 /// `rect`/`available_rect` are in the same space as the view rect.
 ///
-/// In accelerated mode the factor is deliberately 1: the engine ignores
-/// it there, and reporting the real scale as well as zooming would
-/// double-apply it on any build that ever started honouring it again.
+/// The factor is deliberately 1: CEF 151 ignores it, and reporting the
+/// real scale as well as zooming would double-apply it on any build that
+/// ever started honouring it again.
 fn onGetScreenInfo(
     _: [*c]cef.cef_render_handler_t,
     browser: [*c]cef.cef_browser_t,
@@ -6385,10 +6438,7 @@ fn onGetScreenInfo(
     const v = viewOf(browser) orelse return 0;
     info.* = std.mem.zeroes(cef.cef_screen_info_t);
     info.*.size = @sizeOf(cef.cef_screen_info_t);
-    info.*.device_scale_factor = if (scaleViaZoom())
-        1.0
-    else
-        @as(f32, @floatFromInt(v.scale_x1000)) / 1000.0;
+    info.*.device_scale_factor = 1.0;
     info.*.depth = 32;
     info.*.depth_per_component = 8;
     info.*.rect = viewRect(v);
@@ -6397,24 +6447,23 @@ fn onGetScreenInfo(
 }
 
 /// Put the view's zoom into the browser: the device scale (which lives
-/// in the zoom level in accelerated mode — see `scaleViaZoom`) plus the
+/// in the zoom level — see `zoomLevelFor`) plus the
 /// client's user zoom (`set_zoom`, log-scale level x100). The two ADD,
 /// because Chromium zoom levels are logarithmic (factor = 1.2^level).
 ///
 /// Chromium resets zoom per navigation, so this runs on every load start
 /// as well as at creation, on a scale change and on `set_zoom`.
 fn applyZoom(v: *View) void {
-    const base: f64 = if (scaleViaZoom()) zoomLevelFor(v.scale_x1000) else 0.0;
+    const base: f64 = zoomLevelFor(v.scale_x1000);
     const user: f64 = @as(f64, @floatFromInt(v.user_zoom_x100)) / 100.0;
     const host = browserHost(v) orelse return;
     defer release(&host.base);
     if (host.set_zoom_level) |sz| sz(host, base + user);
 }
 
-/// Convert LOGICAL wire coordinates into the engine's view-rect space.
-/// The two differ exactly when the view rect is physical.
+/// Convert LOGICAL wire coordinates into the engine's (physical)
+/// view-rect space.
 pub fn viewPoint(v: *const View, x: i32, y: i32) struct { x: c_int, y: c_int } {
-    if (!scaleViaZoom()) return .{ .x = x, .y = y };
     const s: i64 = @intCast(v.scale_x1000);
     return .{
         .x = @intCast(@divTrunc(@as(i64, x) * s, 1000)),
@@ -6425,7 +6474,6 @@ pub fn viewPoint(v: *const View, x: i32, y: i32) struct { x: c_int, y: c_int } {
 /// The inverse of `viewPoint`: view-rect coordinates (what the engine's
 /// hit tests report) back into LOGICAL wire coordinates.
 fn logicalPoint(v: *const View, x: c_int, y: c_int) struct { x: i32, y: i32 } {
-    if (!scaleViaZoom()) return .{ .x = x, .y = y };
     const s: i64 = @intCast(@max(@as(i64, v.scale_x1000), 1));
     return .{
         .x = @intCast(@divTrunc(@as(i64, x) * 1000, s)),
@@ -6615,17 +6663,21 @@ fn onPaint(
     height: c_int,
 ) callconv(.c) void {
     defer releaseArg(browser);
-    if (ptype != cef.PET_VIEW) return;
     const host = g_host orelse return;
+    if (ptype == cef.PET_POPUP) {
+        const pv = viewOf(browser) orelse return;
+        host_stream.popupPaint(host, pv, buffer, width, height);
+        return;
+    }
+    if (ptype != cef.PET_VIEW) return;
     const v = viewOf(browser) orelse return;
     if (v.map.len == 0) return;
     // A paint for the pre-resize geometry: the resize triggers its own
     // full repaint, so dropping this one loses nothing. The comparison
     // is against the PHYSICAL size — OnPaint's width/height and its
-    // dirty rects are device pixels, i.e. the view rect times the screen
-    // info's device_scale_factor. Comparing them with the LOGICAL size
-    // is what forced the v1 scale pin (every paint at scale != 1 was
-    // dropped and the view stayed black).
+    // dirty rects are view-rect pixels, and the view rect is physical
+    // (`zoomLevelFor`). A logical-sized paint here is what kept a
+    // software view at scale != 1 black.
     if (width != @as(c_int, v.pw) or height != @as(c_int, v.ph)) return;
     const src: [*]const u8 = @ptrCast(buffer orelse return);
     const stride: usize = v.stride();
@@ -6658,6 +6710,7 @@ fn onPaint(
     v.gen +%= 1;
     host.presentPaint(v, list[0..n]);
     host.observeDamage(v, list[0..n]);
+    host_stream.streamDamage(host, v, list[0..n]);
     if (host.viewInline(v)) {
         // Union rather than queue: a slow bridge coalesces bursts into
         // one damage rect instead of growing the outbox without bound.
@@ -6881,11 +6934,12 @@ fn onCursorChange(
     browser: [*c]cef.cef_browser_t,
     _: cef.cef_cursor_handle_t,
     ctype: cef.cef_cursor_type_t,
-    _: [*c]const cef.cef_cursor_info_t,
+    info: [*c]const cef.cef_cursor_info_t,
 ) callconv(.c) c_int {
     defer releaseArg(browser);
     const host = g_host orelse return 0;
     const v = viewOf(browser) orelse return 0;
+    host_stream.streamCursor(host, v, ctype, info);
     const mapped: proto.Cursor = switch (ctype) {
         cef.CT_HAND => .pointer,
         cef.CT_IBEAM => .text,
@@ -7196,9 +7250,9 @@ fn onLoadStart(
     if (!v.sem_nav.takeExpectedLoadStart()) {
         host.semanticNavigationStarted(v);
     }
-    // Chromium's zoom is per origin and resets across a navigation; in
-    // accelerated mode the zoom IS the device scale factor, so a page
-    // that lost it would render at logical resolution.
+    // Chromium's zoom is per origin and resets across a navigation; the
+    // zoom IS the device scale factor, so a page that lost it would
+    // render at logical resolution.
     applyZoom(v);
     // Cosmetic hiding, userstyles and userscripts go in per document,
     // as early as this path can put them (see `injectUserContent`).

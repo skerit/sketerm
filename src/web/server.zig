@@ -27,6 +27,7 @@ const c = @import("cbindings");
 const proto = @import("protocol.zig");
 const cefhost = @import("cefhost.zig");
 const clock = @import("../util/clock.zig");
+const streamsrv = @import("streamsrv.zig");
 
 /// Poll timeout while at least one view exists — CEF wants to be
 /// pumped at roughly frame rate. With no view there is nothing to
@@ -152,6 +153,8 @@ const unconditional_caps = [_]proto.Cap{
     .observe,
     .load_retry,
     .web_emulation,
+    .web_stream,
+    .view_max_fps,
 };
 
 /// Test-only negotiation seam: an environment switch that withholds one
@@ -166,6 +169,9 @@ fn withheld(cap: proto.Cap) bool {
         .capture => "SKETERM_WEB_DISABLE_CAPTURE",
         .untrusted_web => "SKETERM_WEB_DISABLE_UNTRUSTED",
         .web_emulation => "SKETERM_WEB_DISABLE_EMULATION",
+        .web_stream => "SKETERM_WEB_DISABLE_STREAM",
+        .stream_audio => "SKETERM_WEB_DISABLE_STREAM_AUDIO",
+        .view_max_fps => "SKETERM_WEB_DISABLE_MAX_FPS",
         else => return false,
     };
     return c.getenv(env) != null;
@@ -295,6 +301,12 @@ pub const Server = struct {
     linger_ms: i64 = 0,
     /// Monotonic ms of the last periodic jar flush (see step()).
     last_flush_ms: i64 = 0,
+    /// `--stream-dir`: where pushed-stream sockets go. Unset, they go
+    /// beside `--socket`, or for a `--socket-fd` helper into a private
+    /// directory minted at run (`minted_dir`) and removed at deinit.
+    stream_dir: ?[]const u8 = null,
+    minted_dir: [256]u8 = undefined,
+    minted_len: usize = 0,
 
     pub fn init(gpa: std.mem.Allocator, path: []const u8) Server {
         return .{ .gpa = gpa, .path = path, .out = proto.Outbox.init(gpa) };
@@ -309,6 +321,25 @@ pub const Server = struct {
         self.out.deinit();
         if (self.preset_client >= 0) _ = c.close(self.preset_client);
         if (self.listen_fd >= 0) _ = c.close(self.listen_fd);
+        // Every stream socket in it was unlinked when its stream closed.
+        if (self.minted_len != 0) _ = c.rmdir(@ptrCast(&self.minted_dir));
+    }
+
+    /// Where stream sockets are created; "" when there is nowhere
+    /// (stream_open is then refused, saying so).
+    fn resolveStreamDir(self: *Server) []const u8 {
+        if (self.stream_dir) |d| return d;
+        if (!self.preset_fd) {
+            if (std.mem.lastIndexOfScalar(u8, self.path, '/')) |slash| return self.path[0..slash];
+            return ".";
+        }
+        // A pre-connected helper has no socket on this host to sit
+        // beside: mint a private (0700, mkdtemp) directory instead.
+        const base: []const u8 = if (c.getenv("XDG_RUNTIME_DIR")) |r| std.mem.span(r) else "/tmp";
+        const tmpl = std.fmt.bufPrintZ(&self.minted_dir, "{s}/sketerm-ws-XXXXXX", .{std.mem.trimEnd(u8, base, "/")}) catch return "";
+        if (c.mkdtemp(tmpl.ptr) == null) return "";
+        self.minted_len = tmpl.len;
+        return self.minted_dir[0..self.minted_len];
     }
 
     fn drainOutboxFds(out: *proto.Outbox) void {
@@ -372,6 +403,10 @@ pub const Server = struct {
             .mapView = routerMapView,
         };
         if (self.force_inline) self.host.setInlineMode(true);
+        // Stream sockets live beside the helper's own socket, in the
+        // directory its launcher already made private, unless told
+        // otherwise (see `resolveStreamDir`).
+        self.host.stream_dir = self.resolveStreamDir();
         defer self.host.deinit();
         self.host.install();
         // The Wayland presenter (session-mode helpers only): armed after
@@ -536,7 +571,7 @@ pub const Server = struct {
         // loading, and the decision can only be dispatched from this
         // thread — the wake byte ends the poll the instant a hold
         // appears), then one per connection.
-        var pfds: [3 + max_conns]c.struct_pollfd = undefined;
+        var pfds: [3 + max_conns + streamsrv.MAX_STREAMS]c.struct_pollfd = undefined;
         var n_pfds: usize = 0;
         const listen_idx: ?usize = if (self.listen_fd >= 0) blk: {
             pfds[n_pfds] = .{ .fd = self.listen_fd, .events = c.POLLIN, .revents = 0 };
@@ -568,6 +603,10 @@ pub const Server = struct {
             };
             n_pfds += 1;
         }
+        // Stream sockets: input wakes the loop at once, and a backed-up
+        // transmit buffer asks for POLLOUT. They are serviced
+        // non-blocking in `streamPump` whatever the revents say.
+        n_pfds += self.host.streamPollFds(pfds[n_pfds..]);
         const timeout: c_int = if (self.step_nonblocking)
             0
         else if (cefhost.webrequestBusy())
@@ -641,6 +680,9 @@ pub const Server = struct {
         // Inline mode: ship damage the paint-time flush held back while
         // the outbox was backed up (union-and-flush backpressure).
         self.host.flushInline();
+        // Pushed streams cut their frames from the buffers the pump
+        // above just painted.
+        self.host.streamPump();
         // Periodic jar flush: a long-lived engine must not sit on the
         // ~30s Chromium commit window forever (Phase 0 measured cookies
         // lost to a kill inside it). Cheap when nothing is persistent —
@@ -840,7 +882,9 @@ pub const Server = struct {
                 }
                 if (cefhost.untrusted.enabled and !withheld(.untrusted_web)) caps.add(.untrusted_web);
                 if (cefhost.isAccelerated()) caps.add(.frames_dmabuf);
+                if (cefhost.software_webgl) caps.add(.software_webgl);
                 if (self.host.presenterActive()) caps.add(.presenter);
+                if (!withheld(.web_stream) and !withheld(.stream_audio) and streamsrv.audioAvailable()) caps.add(.stream_audio);
                 try cn.out.post(proto.HelloAck{
                     .proto = proto.PROTO_VERSION,
                     .engine_name = cefhost.engineName(),
@@ -986,6 +1030,23 @@ pub const Server = struct {
                 const req = try proto.decode(proto.ObserveSubscribe, frame.payload);
                 self.host.observeSubscribe(cn.id, try cn.mapView(req.view), req.target, req.control != 0);
             },
+            // Pushed stream (0xF8). The reply is posted HERE in the
+            // client's own id namespace, because a refused open may name
+            // no view at all and the host routes replies by view.
+            .stream_open => {
+                const raw = try proto.decode(proto.StreamOpen, frame.payload);
+                const req = self.dec(cn, proto.StreamOpen, frame.payload) catch |err| {
+                    if (err != error.ObserveDropped) return err;
+                    return cn.out.post(proto.EvStreamOpen{ .view = raw.view, .req = raw.req, .path = "", .token = "", .err = "an observer cannot stream another connection's view" }, null);
+                };
+                if (withheld(.web_stream)) {
+                    try cn.out.post(proto.EvStreamOpen{ .view = raw.view, .req = raw.req, .path = "", .token = "", .err = "this helper does not stream" }, null);
+                } else switch (self.host.streamOpen(req.view, req.audio != 0)) {
+                    .ok => |st| try cn.out.post(proto.EvStreamOpen{ .view = raw.view, .req = raw.req, .path = st.path(), .token = &st.token, .err = "" }, null),
+                    .err => |why| try cn.out.post(proto.EvStreamOpen{ .view = raw.view, .req = raw.req, .path = "", .token = "", .err = why }, null),
+                }
+            },
+            .stream_close => self.host.streamClose((try self.dec(cn, proto.StreamClose, frame.payload)).view),
             .observe_control => {
                 const req = try proto.decode(proto.ObserveControl, frame.payload);
                 self.host.observeControl(cn.id, try cn.mapView(req.view), req.control != 0);

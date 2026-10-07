@@ -1,4 +1,4 @@
-//! In-memory PNG encoding on vendored stb_image_write. Importable
+//! In-memory PNG (and JPEG) encoding on vendored stb_image_write. Importable
 //! from both dependency sets (GUI cbindings and the lean mux core
 //! set) — libc + stb only, no GTK/GLib.
 
@@ -41,6 +41,31 @@ pub fn encodeRgba(allocator: std.mem.Allocator, rgba: []const u8, w: u32, h: u32
         4,
         rgba.ptr,
         @intCast(w * 4),
+    );
+    if (ok == 0 or sink.failed) {
+        sink.buf.deinit(allocator);
+        return Error.EncodeFailed;
+    }
+    return sink.buf.toOwnedSlice(allocator);
+}
+
+/// Encode tightly-packed RGBA pixels to baseline JPEG at `quality`
+/// (clamped to 1..100). Alpha is dropped, so only opaque pixels (a
+/// browser frame, `xrgb` already) survive unchanged. Caller owns the
+/// result.
+pub fn encodeRgbaJpeg(allocator: std.mem.Allocator, rgba: []const u8, w: u32, h: u32, quality: u8) Error![]u8 {
+    if (w == 0 or h == 0) return Error.BadGeometry;
+    if (rgba.len < @as(usize, w) * h * 4) return Error.BadGeometry;
+    var sink = Sink{ .allocator = allocator };
+    errdefer sink.buf.deinit(allocator);
+    const ok = c.stbi_write_jpg_to_func(
+        Sink.write,
+        &sink,
+        @intCast(w),
+        @intCast(h),
+        4,
+        rgba.ptr,
+        @as(c_int, std.math.clamp(quality, 1, 100)),
     );
     if (ok == 0 or sink.failed) {
         sink.buf.deinit(allocator);
@@ -320,6 +345,40 @@ test "upscaleRgba blocks pixels without smoothing" {
             try std.testing.expectEqual(@as(u8, 255), big[o + 1]);
         }
     }
+}
+
+test "jpeg round-trips through stb_image decode with its colour kept" {
+    const allocator = std.testing.allocator;
+    // 16x8 of one saturated colour: JPEG is lossy, but a flat field
+    // survives within a few levels.
+    var px: [16 * 8 * 4]u8 = undefined;
+    var i: usize = 0;
+    while (i < px.len) : (i += 4) {
+        px[i] = 0x33;
+        px[i + 1] = 0x66;
+        px[i + 2] = 0xcc;
+        px[i + 3] = 255;
+    }
+    const jpg = try encodeRgbaJpeg(allocator, &px, 16, 8, 80);
+    defer allocator.free(jpg);
+    // SOI first, EOI last: a whole baseline stream, not a fragment.
+    try std.testing.expectEqualSlices(u8, &.{ 0xff, 0xd8 }, jpg[0..2]);
+    try std.testing.expectEqualSlices(u8, &.{ 0xff, 0xd9 }, jpg[jpg.len - 2 ..]);
+    const back = try decodeRgba(allocator, jpg);
+    defer allocator.free(back.rgba);
+    try std.testing.expectEqual(@as(u32, 16), back.w);
+    try std.testing.expectEqual(@as(u32, 8), back.h);
+    const mid = (4 * 16 + 8) * 4;
+    try std.testing.expect(@abs(@as(i32, back.rgba[mid]) - 0x33) < 8);
+    try std.testing.expect(@abs(@as(i32, back.rgba[mid + 1]) - 0x66) < 8);
+    try std.testing.expect(@abs(@as(i32, back.rgba[mid + 2]) - 0xcc) < 8);
+
+    // A lower quality is a smaller stream of the same picture.
+    const rough = try encodeRgbaJpeg(allocator, &px, 16, 8, 5);
+    defer allocator.free(rough);
+    try std.testing.expect(rough.len <= jpg.len);
+    try std.testing.expectError(Error.BadGeometry, encodeRgbaJpeg(allocator, px[0..12], 16, 8, 80));
+    try std.testing.expectError(Error.BadGeometry, encodeRgbaJpeg(allocator, &px, 0, 8, 80));
 }
 
 test "geometry that disagrees with the buffer is refused, not read past" {

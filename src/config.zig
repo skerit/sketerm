@@ -713,10 +713,12 @@ pub const McpProfile = struct {
     /// a `[mcp.<name>]` section only overrides the bare `[mcp]` value
     /// when it says so explicitly. Nothing else is granted by it.
     web_gui: ?bool = null,
+    /// Headless browser cap; null leaves the MCP default of 60 FPS.
+    web_max_fps: ?u16 = null,
 
     /// Whether serializing this record writes anything.
     pub fn isEmpty(self: *const McpProfile) bool {
-        return self.tools.len == 0 and self.web_gui == null;
+        return self.tools.len == 0 and self.web_gui == null and self.web_max_fps == null;
     }
 
     pub fn cloneInto(self: *const McpProfile, arena: std.mem.Allocator) error{OutOfMemory}!McpProfile {
@@ -2282,6 +2284,10 @@ fn applyMcpKv(prof: *McpProfile, arena: std.mem.Allocator, key: []const u8, valu
         prof.tools = try arena.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "web_gui")) {
         prof.web_gui = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "web_max_fps")) {
+        const fps = std.fmt.parseInt(u16, value, 10) catch return error.BadValue;
+        if (fps == 0 or fps > @import("web/protocol.zig").MAX_VIEW_FPS) return error.BadValue;
+        prof.web_max_fps = fps;
     } else return error.UnknownKey;
 }
 
@@ -2290,6 +2296,7 @@ fn applyMcpKv(prof: *McpProfile, arena: std.mem.Allocator, key: []const u8, valu
 fn serialiseMcpKeys(prof: *const McpProfile, w: *std.Io.Writer) !void {
     if (prof.tools.len > 0) try w.print("tools = {s}\n", .{prof.tools});
     if (prof.web_gui) |v| try w.print("web_gui = {s}\n", .{if (v) "true" else "false"});
+    if (prof.web_max_fps) |v| try w.print("web_max_fps = {d}\n", .{v});
 }
 
 fn applyDomainKv(dom: *Domain, arena: std.mem.Allocator, key: []const u8, value: []const u8) !void {
@@ -4432,10 +4439,12 @@ test "config: bare [mcp] defaults and web_gui parse and round-trip" {
     const body =
         \\[mcp]
         \\web_gui = true
+        \\web_max_fps = 30
         \\
         \\[mcp.locked]
         \\tools = files:ro
         \\web_gui = off
+        \\web_max_fps = 15
         \\
         \\[mcp.quiet]
         \\tools = app
@@ -4444,6 +4453,9 @@ test "config: bare [mcp] defaults and web_gui parse and round-trip" {
     var cfg = try Config.loadFromBytes(std.testing.allocator, body);
     defer cfg.deinit();
     try std.testing.expectEqual(true, cfg.mcp.web_gui.?);
+    try std.testing.expectEqual(@as(u16, 30), cfg.mcp.web_max_fps.?);
+    try std.testing.expectEqual(@as(u16, 15), cfg.mcpProfile("locked").?.web_max_fps.?);
+    try std.testing.expect(cfg.mcpProfile("quiet").?.web_max_fps == null);
     try std.testing.expectEqualStrings("", cfg.mcp.tools);
     try std.testing.expectEqual(false, cfg.mcpProfile("locked").?.web_gui.?);
     // A section that does not mention the key leaves it unstated (null),
@@ -4458,6 +4470,8 @@ test "config: bare [mcp] defaults and web_gui parse and round-trip" {
     var cfg2 = try Config.loadFromBytes(std.testing.allocator, w.buffered());
     defer cfg2.deinit();
     try std.testing.expectEqual(true, cfg2.mcp.web_gui.?);
+    try std.testing.expectEqual(@as(u16, 30), cfg2.mcp.web_max_fps.?);
+    try std.testing.expectEqual(@as(u16, 15), cfg2.mcpProfile("locked").?.web_max_fps.?);
     try std.testing.expectEqual(false, cfg2.mcpProfile("locked").?.web_gui.?);
     try std.testing.expect(cfg2.mcpProfile("quiet").?.web_gui == null);
 }

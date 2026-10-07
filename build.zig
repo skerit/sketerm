@@ -1201,7 +1201,7 @@ pub fn build(b: *std.Build) void {
     // step, the binary distribution is never downloaded unless the fetch
     // step is asked for by name, and the CEF headers are only translated
     // when that distribution is already on disk.
-    addCef(b, target, optimize, strip, use_lld, core_cbindings_mod, mux_exe, mcp_exe, smoke_mcp_run, &test_roots.step, &lint_errdefer.step);
+    addCef(b, target, optimize, strip, use_lld, have_opus, core_cbindings_mod, mux_exe, mcp_exe, smoke_mcp_run, &test_roots.step, &lint_errdefer.step);
 }
 
 /// Pinned CEF binary distribution ("minimal" distro). SINGLE source of
@@ -1273,6 +1273,7 @@ fn addCef(
     optimize: std.builtin.OptimizeMode,
     strip: bool,
     use_lld: bool,
+    have_opus: bool,
     core_cbindings_mod: *std.Build.Module,
     mux_exe: *std.Build.Step.Compile,
     mcp_exe: *std.Build.Step.Compile,
@@ -1620,6 +1621,9 @@ fn addCef(
     const web_opts = b.addOptions();
     web_opts.addOption([]const u8, "version", semver);
     web_opts.addOption([]const u8, "cef_release_dir", runtime_dir);
+    // Stream audio (web-stream + stream-audio) reuses mux/opuscodec.zig,
+    // which probes libopus at runtime: nothing new is linked.
+    web_opts.addOption(bool, "audio_opus", have_opus);
     web_mod.addImport("build_options", web_opts.createModule());
     if (is_mac_cef) {
         // macOS links the framework DIRECTLY, and the framework's own

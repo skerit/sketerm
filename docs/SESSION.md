@@ -1,5 +1,63 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-08: per-view headless frame rate, CPU views at any scale, WebGL
+
+`web_open` and `web_stream` take `max_fps` (1-240): the CEF paint cap of
+that view, carried as an optional trailing `max_fps` on `ViewCreate` and
+`view_max_fps` for a live override. New headless views default to 60, or
+`[mcp] web_max_fps`, which a selected `[mcp.<name>]` section overrides;
+`capabilities` reports `web_max_fps` and `web_default_max_fps`, and a
+helper without `view-max-fps` refuses an explicit cap (fail closed). The
+CPU-rendered MCP views now carry their device scale factor as zoom (DPR 2
+gives 1600x1200 pixels for 800x600) instead of painting black, and WebGL
+runs on ANGLE SwiftShader with software compositing. Verification:
+`zig build test test-core test-web`, smoke-mcp WEB/WEBSTREAM/WEBCAPTURE/
+WEBENGINE stages; a streamed CSS animation measured 14.83, 29.66 and 59.89
+FPS at caps 15, 30 and 60.
+
+## 2026-10-07: helper-owned pushed web streams through MCP
+
+`web_stream` returns a local helper-owned binary V1 socket and a single-use
+token for a headless view; capabilities report stream support and negotiated
+runtime Opus. The helper's own loop sends raw BGRA damage, frame ends,
+cached cursors and captured page audio independently of MCP waits. Two
+unacknowledged frames bound video delivery; pending damage rereads live
+pixels, and disconnect/blur releases held input. Popups are composed, and
+resize finishes a partial frame before announcing the new surface. Named
+and plain MCP helpers force CPU rendering. CEF captures at an audible
+transition and diverts normal output until two seconds of quiet.
+
+The Java SDK adds PageStream with borrowed pixel buffers, explicit ACKs,
+socket input, shared protoblast binary/key types and scripted test fixtures.
+The smoke harness now uses appdrive for presenter channel ownership and
+initializes its fake-agent/SSH environment before starting brokers.
+Verification: GUI/helper/portable builds, 7694 Zig tests (21 skipped), the
+full smoke-mcp including exact damage/concurrent input/non-silent Opus,
+macOS portable cross-build, and all 125 Java tests passed. docs/mcp.md and
+the SDK README document the protocol, lifecycle and audio limitations.
+
+## 2026-10-07: web_input and web_frame, a page driven and watched by hand
+
+A headless view could only be acted on semantically (`web_act` by id,
+`web_key` chords), so a person watching an assistant's browser from a web
+page had no way to click a canvas, drag, hold Shift or see the page move.
+The helper's wire already carried everything a GUI mouse and keyboard send;
+the MCP side now exposes it. `web_input` takes an ordered batch of up to 64
+pointer edges (move/down/up/leave at viewport coordinates, button, clicks),
+wheel steps, SINGLE key edges (a held key is a down now and an up later;
+`webkeys` names Shift/Control/Alt/Meta/CapsLock as keys of their own) and
+text at the caret (`input_paste`, the char-event path `Host.paste` measured
+to work; a bare IME commit inserts nothing windowless). It parses the whole
+batch before sending, never settles and returns no delta: the watcher reads
+the outcome from `web_frame`, the PULLED frame source (the MCP backlog rule
+holds): the newest frame once its paint serial differs from `since`, as JPEG
+(`png.encodeRgbaJpeg`, stb) or PNG, optionally downscaled, long-polling up to
+`timeout_ms` and answering `unchanged:true` on a still page. It reports the
+image's pixels and the logical viewport input uses. `capabilities` reports
+`web_input` and `web_frames` (headless only). smoke-mcp `webHandStage` proves
+a trusted shift-click the page observes, text in a focused field, a wheel
+scroll, a repaint answered as a newer frame and a still page as unchanged.
+
 ## 2026-10-04: agents on Macs and old daemons, opencode 2.x, agent visibility
 
 `agent_open` on a Mac failed to parse its start script: macOS `/bin/sh` is

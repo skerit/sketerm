@@ -203,6 +203,7 @@ const Sem = struct {
 };
 
 pub const View = struct {
+    max_fps: ?u16 = null,
     id: u32,
     w: u16,
     h: u16,
@@ -230,8 +231,8 @@ pub const View = struct {
     load_seq: u32 = 0,
 
     // Last software frame. FRAME DELIVERY SEAM: this driver receives
-    // pixels ONLY as an shm memfd (`frames-shm`; headless ozone spawns
-    // no GPU, so `frames-dmabuf` never applies), and every fd/mmap
+    // pixels ONLY as an shm memfd (`frames-shm`; software compositing means
+    // `frames-dmabuf` never applies), and every fd/mmap
     // assumption lives in these four fields, the `.frame_buffer`
     // dispatch arm and `screenshotPng`. A future inline-bytes frame
     // family (needed once frames must cross a mux relay, where fds
@@ -310,6 +311,10 @@ pub const View = struct {
     cap_list: ?[]u8 = null,
     cap_body: ?[]u8 = null,
 
+    stream_request: u32 = 0,
+    stream_reply: ?[]u8 = null,
+    stream_closed: bool = false,
+
     /// Bounded mirror of the page's `ev_console` stream, so a tool can
     /// answer "what did the page log" after the fact. Drop-oldest; ids
     /// keep increasing so a reader can page with `since`.
@@ -354,6 +359,7 @@ pub const View = struct {
         if (self.cap) |*f| freeCapture(gpa, f);
         if (self.cap_list) |b| gpa.free(b);
         if (self.cap_body) |b| gpa.free(b);
+        if (self.stream_reply) |b| gpa.free(b);
         self.reader_guards.deinit(gpa);
         if (self.net_log) |e| gpa.free(e);
         if (self.buf_fd >= 0) _ = c.close(self.buf_fd);
@@ -894,6 +900,7 @@ fn nextViewId() u32 {
 }
 
 pub const Engine = struct {
+    default_max_fps: ?u16 = null,
     gpa: std.mem.Allocator,
     /// Directory holding the helper socket and its cache; owned.
     dir: []u8,
@@ -978,6 +985,7 @@ pub const Engine = struct {
     downloads: std.ArrayList(Download) = .empty,
     next_download_req: u32 = 1,
     next_sem_request: u32 = 1,
+    next_stream_request: u32 = 1,
     /// Stamps every `net_policy_set`; `ev_net_policy` echoes it so a
     /// stale event for a replaced policy is ignorable.
     next_policy_serial: u32 = 1,
@@ -1888,7 +1896,7 @@ pub const Engine = struct {
             // as a client of a hub nobody else renders into, so its
             // toplevels are the watch-along surface and not a stray
             // desktop window.
-            var sets: [8][2][]const u8 = undefined;
+            var sets: [9][2][]const u8 = undefined;
             var n: usize = 0;
             sets[n] = .{ "WAYLAND_DISPLAY", std.mem.sliceTo(&env.wl, 0) };
             n += 1;
@@ -1905,13 +1913,18 @@ pub const Engine = struct {
                 .{ "LIBGL_ALWAYS_SOFTWARE", "1" },
                 .{ "SKETERM_WEB_OZONE", "wayland" },
                 .{ "SKETERM_WEB_GPU", "0" },
+                .{ "SKETERM_WEB_SOFTWARE_WEBGL", "1" },
                 .{ proto.PRESENTER_ENV, "1" },
             }) |kv| {
                 sets[n] = kv;
                 n += 1;
             }
             break :blk ChildEnv.build(self.gpa, &sessionDropped, sets[0..n]);
-        } else ChildEnv.build(self.gpa, &keepAll, &.{})) catch {
+        } else ChildEnv.build(self.gpa, &keepAll, &.{
+            .{ "SKETERM_WEB_GPU", "0" },
+            .{ "SKETERM_WEB_OZONE", "headless" },
+            .{ "SKETERM_WEB_SOFTWARE_WEBGL", "1" },
+        })) catch {
             if (lifetime[0] >= 0) _ = c.close(lifetime[0]);
             if (lifetime[1] >= 0) _ = c.close(lifetime[1]);
             return self.failStart("could not prepare the browser helper's environment");
@@ -2110,11 +2123,13 @@ pub const Engine = struct {
     /// policy, and refused (nothing opened) on a helper that cannot
     /// honour it.
     pub fn openViewWith(self: *Engine, url: []const u8, w: u16, h: u16, spec: ProfileSpec, policy_arg: ?*const NetPolicy, capture_arg: ?*const CaptureFilter) !*View {
-        return self.openViewConfigured(url, w, h, spec, policy_arg, capture_arg, .{});
+        return self.openViewConfigured(url, w, h, spec, policy_arg, capture_arg, .{}, null);
     }
 
-    pub fn openViewConfigured(self: *Engine, url: []const u8, w: u16, h: u16, spec: ProfileSpec, policy_arg: ?*const NetPolicy, capture_arg: ?*const CaptureFilter, emulation: Emulation) !*View {
+    pub fn openViewConfigured(self: *Engine, url: []const u8, w: u16, h: u16, spec: ProfileSpec, policy_arg: ?*const NetPolicy, capture_arg: ?*const CaptureFilter, emulation: Emulation, max_fps: ?u16) !*View {
         if (!emulation.valid()) return error.InvalidEmulation;
+        const requested_fps: ?u16 = max_fps orelse self.default_max_fps;
+        if (requested_fps) |fps| if (fps == 0 or fps > proto.MAX_VIEW_FPS) return error.InvalidFrameRate;
         var policy: ?*const NetPolicy = policy_arg;
         if (policy == null and spec == .named) policy = self.profile_policy.getPtr(spec.named);
         const wants_untrusted = if (policy) |p| p.untrusted else false;
@@ -2130,6 +2145,7 @@ pub const Engine = struct {
         errdefer if (self.untrusted and self.views.items.len == 0) self.stopUntrusted();
         if (wants_untrusted and !self.has(.untrusted_web)) return error.UntrustedUnsupported;
         if (emulation.present() and !self.has(.web_emulation)) return error.EmulationUnsupported;
+        if (requested_fps != null and !self.has(.view_max_fps)) return error.FrameRateUnsupported;
         // A routed helper that refused its route says so right after
         // the handshake; read that before minting a view it would refuse.
         self.pumpOnce(0);
@@ -2181,6 +2197,7 @@ pub const Engine = struct {
             .w = w,
             .h = h,
             .emulation = emulation,
+            .max_fps = if (self.has(.view_max_fps)) requested_fps orelse proto.DEFAULT_HEADLESS_FPS else null,
             .context = ctx_id,
             .ephemeral_ctx = ctx_ephemeral,
             .pol = owned_pol,
@@ -2229,6 +2246,7 @@ pub const Engine = struct {
                 .scale_x1000 = emulation.scale(),
                 .context = ctx_id,
                 .url = url,
+                .max_fps = v.max_fps orelse 0,
             }) catch return error.Unavailable;
         } else {
             self.send(proto.ViewCreate{
@@ -2237,6 +2255,7 @@ pub const Engine = struct {
                 .h = h,
                 .scale_x1000 = emulation.scale(),
                 .context = ctx_id,
+                .max_fps = v.max_fps orelse 0,
             }) catch return error.Unavailable;
         }
         // A hidden view is never painted; headless views are always
@@ -2267,6 +2286,7 @@ pub const Engine = struct {
             // the record must say so or a later lookup would disagree
             // with where the cookies actually are.
             .context = if (opener) |o| o.context else 0,
+            .max_fps = if (opener) |o| o.max_fps else null,
         };
         errdefer v.deinit(self.gpa);
         if (opener) |o| {
@@ -2963,6 +2983,97 @@ pub const Engine = struct {
         }) catch return error.Unavailable;
     }
 
+    /// One pointer frame at view coordinates (the logical viewport, not
+    /// the frame's pixels) through the ordinary input path a GUI mouse
+    /// rides: move, leave, or one button edge (0 left, 1 middle, 2 right).
+    pub fn pointerAt(self: *Engine, id: u32, kind: proto.PointerKind, x: i32, y: i32, button: u8, clicks: u8, mods: u32) !void {
+        if (!self.ensure()) return error.Unavailable;
+        if (self.findView(id) == null) return error.NoView;
+        self.awaitFirstPaint(id, 5_000);
+        self.send(proto.InputPointer{
+            .view = id,
+            .kind = @intFromEnum(kind),
+            .x = x,
+            .y = y,
+            .button = button,
+            .clicks = clicks,
+            .mods = mods,
+        }) catch return error.Unavailable;
+    }
+
+    /// A wheel step at a view point; `dy` is positive DOWN, as the wire
+    /// says (the helper flips it for CEF).
+    pub fn wheelAt(self: *Engine, id: u32, x: i32, y: i32, dx: i32, dy: i32, mods: u32) !void {
+        if (!self.ensure()) return error.Unavailable;
+        if (self.findView(id) == null) return error.NoView;
+        self.awaitFirstPaint(id, 5_000);
+        self.send(proto.InputScroll{ .view = id, .x = x, .y = y, .dx = dx, .dy = dy, .mods = mods }) catch
+            return error.Unavailable;
+    }
+
+    /// ONE edge of a key, down or up alone: unlike `sendKey`'s chord, a
+    /// caller can hold a key across other input (shift+click, a game) and
+    /// release it later. `text` rides the down edge only.
+    pub fn keyEdge(self: *Engine, id: u32, kind: proto.KeyKind, keysym: u32, mods: u32, text: []const u8) !void {
+        if (!self.ensure()) return error.Unavailable;
+        if (self.findView(id) == null) return error.NoView;
+        self.awaitFirstPaint(id, 5_000);
+        self.send(proto.InputKey{
+            .view = id,
+            .kind = @intFromEnum(kind),
+            .keyval = keysym,
+            .keycode = 0,
+            .mods = mods,
+            .text = if (kind == .down) text else "",
+        }) catch return error.Unavailable;
+    }
+
+    /// Insert `text` at the caret as trusted char events (`input_paste`,
+    /// the path `Host.paste` measured to work; a bare IME commit inserts
+    /// nothing in a windowless browser).
+    pub fn insertText(self: *Engine, id: u32, text: []const u8) !void {
+        if (!self.ensure()) return error.Unavailable;
+        if (self.findView(id) == null) return error.NoView;
+        if (!self.has(.clipboard)) return error.NoTextInput;
+        self.awaitFirstPaint(id, 5_000);
+        self.send(proto.InputPaste{ .view = id, .text = .{ .s = text } }) catch return error.Unavailable;
+    }
+
+    /// One painted frame of a view, as straight RGBA in its PIXEL size
+    /// (`w`x`h`), beside the logical viewport input coordinates use.
+    pub const Frame = struct { gen: u32, w: u16, h: u16, view_w: u16, view_h: u16, rgba: []u8 };
+
+    /// The view's newest frame once its paint serial differs from
+    /// `since` (what a previous answer named; 0 takes any painted
+    /// frame), waiting at most `budget_ms` for a paint.
+    ///
+    /// AIDEV-NOTE: this is the PULLED frame source (the MCP backlog rule:
+    /// never stream toward an MCP client). A watcher long-polls with the
+    /// last serial it drew, so an idle page costs one answer per budget
+    /// and a busy one at most one frame per call; the newest pixels win.
+    /// @return null when no newer frame was painted within the budget
+    pub fn frameAfter(self: *Engine, arena: std.mem.Allocator, view_id: u32, since: u32, budget_ms: i64) !?Frame {
+        if (!self.ensure()) return error.Unavailable;
+        if (self.findView(view_id) == null) return error.NoView;
+        const deadline = clock.nowMs() + @max(budget_ms, 0);
+        while (true) {
+            const v = self.findView(view_id) orelse return error.NoView;
+            if (v.buf_fd >= 0 and v.frame_gen != 0 and v.frame_gen != since) break;
+            if (clock.nowMs() >= deadline) return null;
+            if (self.state != .ready) return error.Unavailable;
+            self.pumpOnce(20);
+        }
+        const v = self.findView(view_id) orelse return error.NoView;
+        return .{
+            .gen = v.frame_gen,
+            .w = v.buf_w,
+            .h = v.buf_h,
+            .view_w = v.w,
+            .view_h = v.h,
+            .rgba = try frameRgba(arena, v),
+        };
+    }
+
     /// Tell the engine the view has keyboard focus; keys are dropped
     /// into the void without it (a GUI sends this on focus-in).
     pub fn focusView(self: *Engine, id: u32) !void {
@@ -3305,6 +3416,59 @@ pub const Engine = struct {
         return error.Timeout;
     }
 
+    /// Set the view's CEF scheduler cap without changing stream transport or pacing.
+    pub fn setMaxFps(self: *Engine, id: u32, fps: u16) !void {
+        if (fps == 0 or fps > proto.MAX_VIEW_FPS) return error.InvalidFrameRate;
+        if (!self.ensure()) return error.Unavailable;
+        if (!self.has(.view_max_fps)) return error.FrameRateUnsupported;
+        const v = self.findView(id) orelse return error.NoView;
+        try self.send(proto.ViewMaxFps{ .view = id, .fps = fps });
+        v.max_fps = fps;
+    }
+
+    /// Open a helper-owned socket without consuming any binary stream traffic.
+    pub fn openStream(self: *Engine, arena: std.mem.Allocator, id: u32, audio: bool, budget_ms: i64, max_fps: ?u16) !proto.EvStreamOpen {
+        if (max_fps) |fps| if (fps == 0 or fps > proto.MAX_VIEW_FPS) return error.InvalidFrameRate;
+        if (!self.ensure()) return error.Unavailable;
+        if (!self.has(.web_stream)) return error.NoStream;
+        if (max_fps != null and !self.has(.view_max_fps)) return error.FrameRateUnsupported;
+        const v = self.findView(id) orelse return error.NoView;
+        if (v.stream_request != 0) return error.StreamPending;
+        if (self.next_stream_request == std.math.maxInt(u32)) return error.RequestIdsExhausted;
+        const req = self.next_stream_request;
+        self.next_stream_request += 1;
+        v.stream_request = req;
+        v.stream_closed = false;
+        defer if (self.findView(id)) |live| {
+            live.stream_request = 0;
+            if (live.stream_reply) |raw| self.gpa.free(raw);
+            live.stream_reply = null;
+        };
+        // An uncertain open must not leave an unnamed stream slot behind.
+        var answered = false;
+        errdefer if (!answered) self.send(proto.StreamClose{ .view = id }) catch {};
+        self.send(proto.StreamOpen{ .view = id, .req = req, .audio = @intFromBool(audio and self.has(.stream_audio)) }) catch return error.Unavailable;
+        const deadline = clock.nowMs() + @max(budget_ms, 1);
+        while (clock.nowMs() < deadline) {
+            const live = self.findView(id) orelse return error.NoView;
+            if (live.stream_reply) |raw| {
+                const reply = try proto.decode(proto.EvStreamOpen, try arena.dupe(u8, raw));
+                if (reply.err.len == 0) {
+                    const stream = @import("../web/stream.zig");
+                    if (live.stream_closed) return error.StreamEnded;
+                    if (!stream.isToken(reply.token) or reply.path.len == 0 or reply.path[0] != '/' or
+                        std.mem.indexOfScalar(u8, reply.path, 0) != null) return error.BadStreamReply;
+                    if (max_fps) |fps| try self.setMaxFps(id, fps);
+                } else if (reply.path.len != 0 or reply.token.len != 0) return error.BadStreamReply;
+                answered = true;
+                return reply;
+            }
+            if (self.state != .ready) return error.Unavailable;
+            self.pumpOnce(@intCast(@min(40, @max(0, deadline - clock.nowMs()))));
+        }
+        return error.Timeout;
+    }
+
     // ---- response-body capture ---------------------------------------
 
     /// One metadata page of the view's finished exchanges (and, with
@@ -3540,6 +3704,13 @@ pub const Engine = struct {
             self.pumpOnce(40);
         }
         const v = self.findView(view_id) orelse return error.NoView;
+        const rgba = try frameRgba(arena, v);
+        return png.encodeRgba(arena, rgba, v.buf_w, v.buf_h);
+    }
+
+    /// The view's shm frame as straight opaque RGBA; the one reader of
+    /// the frame buffer (`screenshotPng` and `frameAfter` share it).
+    fn frameRgba(arena: std.mem.Allocator, v: *const View) ![]u8 {
         if (v.buf_fd < 0) return error.NoFrame;
         // A stride below `w * 4` would make the row walk in `shmToRgba`
         // read past the mapping; `proto.frameSize` is the one place that
@@ -3551,8 +3722,7 @@ pub const Engine = struct {
         defer _ = c.munmap(mapped, size);
         // CEF software frames are BGRA with an opaque page background;
         // xrgb forces alpha to 255 so a PNG viewer never composites it.
-        const rgba = try png.shmToRgba(arena, pixels[0..size], v.buf_w, v.buf_h, v.buf_stride, @intFromEnum(png.ShmFormat.xrgb8888));
-        return png.encodeRgba(arena, rgba, v.buf_w, v.buf_h);
+        return png.shmToRgba(arena, pixels[0..size], v.buf_w, v.buf_h, v.buf_stride, @intFromEnum(png.ShmFormat.xrgb8888));
     }
 
     // ---- socket plumbing --------------------------------------------
@@ -3717,6 +3887,17 @@ pub const Engine = struct {
 
     fn dispatch(self: *Engine, frame: proto.Frame) void {
         switch (frame.tag) {
+            .ev_stream_open => {
+                const ev = proto.decode(proto.EvStreamOpen, frame.payload) catch return;
+                const v = self.findView(ev.view) orelse return;
+                if (v.stream_request == 0 or ev.req != v.stream_request or v.stream_reply != null) return;
+                v.stream_closed = false;
+                self.setOwned(&v.stream_reply, frame.payload);
+            },
+            .ev_stream_closed => {
+                const ev = proto.decode(proto.EvStreamClosed, frame.payload) catch return;
+                if (self.findView(ev.view)) |v| v.stream_closed = true;
+            },
             .hello_ack => {
                 const ack = proto.HelloAck.decodeAlloc(frame.payload, self.gpa) catch return;
                 defer self.gpa.free(ack.caps);
@@ -3751,7 +3932,7 @@ pub const Engine = struct {
                 v.buf_stride = fb.stride;
             },
             .frame_dmabuf => {
-                // Headless ozone spawns no GPU process, so this should
+                // MCP software compositing delivers no dma-bufs, so this should
                 // never arrive; if it does, the planes' descriptors
                 // must not leak into this process.
                 const f = proto.FrameDmabuf.decodeFrom(frame.payload) catch return;
@@ -4408,6 +4589,137 @@ const Pair = struct {
         return self.eng.openViewIn("https://site.example/", 800, 600, if (pol.untrusted) .ephemeral else .default, pol);
     }
 };
+
+const StreamPeer = struct {
+    peer: c_int,
+    audio: u8 = 0,
+    err: []const u8 = "",
+
+    fn run(self: *StreamPeer) void {
+        var buf: [4096]u8 = undefined;
+        const deadline = clock.nowMs() + 2000;
+        while (clock.nowMs() < deadline) {
+            const n = c.recv(self.peer, &buf, buf.len, c.MSG_PEEK | c.MSG_DONTWAIT);
+            if (n > 0) {
+                var reader = proto.Reader.init(buf[0..@intCast(n)]);
+                while (reader.next() catch null) |f| {
+                    if (f.tag != .stream_open) continue;
+                    const req = proto.decode(proto.StreamOpen, f.payload) catch return;
+                    self.audio = req.audio;
+                    var out: std.ArrayList(u8) = .empty;
+                    defer out.deinit(std.heap.page_allocator);
+                    // A stale success must not satisfy this request.
+                    proto.encode(std.heap.page_allocator, &out, proto.EvStreamOpen{
+                        .view = req.view, .req = req.req - 1, .path = "/tmp/stale.sock",
+                        .token = "00000000000000000000000000000000", .err = "",
+                    }) catch return;
+                    proto.encode(std.heap.page_allocator, &out, proto.EvStreamClosed{ .view = req.view, .reason = "previous stream ended" }) catch return;
+                    proto.encode(std.heap.page_allocator, &out, proto.EvStreamOpen{
+                        .view = req.view, .req = req.req,
+                        .path = if (self.err.len == 0) "/tmp/current.sock" else "",
+                        .token = if (self.err.len == 0) "0123456789abcdef0123456789abcdef" else "",
+                        .err = self.err,
+                    }) catch return;
+                    _ = c.write(self.peer, out.items.ptr, out.items.len);
+                    return;
+                }
+            }
+            _ = c.usleep(1000);
+        }
+    }
+};
+
+test "stream opens correlate replies, negotiate audio, and do not cancel a conflict" {
+    const gpa = std.testing.allocator;
+    var pair = try Pair.init(gpa);
+    defer pair.deinit();
+    const v = try gpa.create(View);
+    v.* = .{ .id = 1, .w = 800, .h = 600 };
+    try pair.eng.views.append(gpa, v);
+    pair.eng.caps.insert(.web_stream);
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    for ([_]bool{ false, true }) |has_audio| {
+        pair.eng.caps.setPresent(.stream_audio, has_audio);
+        var peer = StreamPeer{ .peer = pair.peer };
+        const reply = blk: {
+            const thread = try std.Thread.spawn(.{}, StreamPeer.run, .{&peer});
+            defer thread.join();
+            break :blk try pair.eng.openStream(arena_state.allocator(), 1, true, 1000, null);
+        };
+        try std.testing.expectEqualStrings("/tmp/current.sock", reply.path);
+        try std.testing.expectEqual(@as(u8, @intFromBool(has_audio)), peer.audio);
+        try std.testing.expectEqual(@as(u32, 0), v.stream_request);
+        try std.testing.expect(v.stream_reply == null);
+        var buf: [4096]u8 = undefined;
+        var reader = proto.Reader.init(pair.drain(&buf));
+        try std.testing.expectEqual(proto.Tag.stream_open, (try reader.next()).?.tag);
+        try std.testing.expect((try reader.next()) == null);
+    }
+    var peer = StreamPeer{ .peer = pair.peer, .err = "this view already has a stream" };
+    const reply = blk: {
+        const thread = try std.Thread.spawn(.{}, StreamPeer.run, .{&peer});
+        defer thread.join();
+        break :blk try pair.eng.openStream(arena_state.allocator(), 1, false, 1000, null);
+    };
+    try std.testing.expectEqualStrings(peer.err, reply.err);
+    var buf: [4096]u8 = undefined;
+    var reader = proto.Reader.init(pair.drain(&buf));
+    try std.testing.expectEqual(proto.Tag.stream_open, (try reader.next()).?.tag);
+    try std.testing.expect((try reader.next()) == null);
+}
+
+test "frame rates are per-view, pre-create, bounded and fail closed on unsupported helpers" {
+    const t = std.testing;
+    var pair = try Pair.init(t.allocator);
+    defer pair.deinit();
+    var buf: [4096]u8 = undefined;
+    try t.expectError(error.FrameRateUnsupported, pair.eng.openViewConfigured("about:blank", 800, 600, .default, null, null, .{}, 15));
+    try t.expectEqual(@as(usize, 0), pair.drain(&buf).len);
+    pair.eng.default_max_fps = 30;
+    try t.expectError(error.FrameRateUnsupported, pair.eng.openView("about:blank", 800, 600));
+    pair.eng.caps.insert(.view_max_fps);
+    const view = try pair.eng.openView("about:blank", 800, 600);
+    var reader = proto.Reader.init(pair.drain(&buf));
+    const create = try proto.decode(proto.ViewCreateUrl, (try reader.next()).?.payload);
+    try t.expectEqual(@as(u16, 30), create.max_fps);
+    try t.expectEqual(@as(u16, 30), view.max_fps.?);
+    try t.expectError(error.InvalidFrameRate, pair.eng.setMaxFps(view.id, 0));
+    try t.expectError(error.InvalidFrameRate, pair.eng.setMaxFps(view.id, proto.MAX_VIEW_FPS + 1));
+    try pair.eng.setMaxFps(view.id, 15);
+    reader = proto.Reader.init(pair.drain(&buf));
+    try t.expectEqual(@as(u16, 15), (try proto.decode(proto.ViewMaxFps, (try reader.next()).?.payload)).fps);
+    try t.expectEqual(@as(u16, 15), view.max_fps.?);
+    pair.eng.caps.insert(.web_stream);
+    pair.eng.caps.remove(.view_max_fps);
+    try t.expectError(error.FrameRateUnsupported, pair.eng.openStream(t.allocator, view.id, false, 10, 60));
+    try t.expectEqual(@as(usize, 0), pair.drain(&buf).len);
+}
+
+test "stream timeout cancels the slot and late replies cannot satisfy another open" {
+    const gpa = std.testing.allocator;
+    var pair = try Pair.init(gpa);
+    defer pair.deinit();
+    const v = try gpa.create(View);
+    v.* = .{ .id = 1, .w = 800, .h = 600 };
+    try pair.eng.views.append(gpa, v);
+    try std.testing.expectError(error.NoStream, pair.eng.openStream(gpa, 1, true, 10, null));
+    pair.eng.caps.insert(.web_stream);
+    try std.testing.expectError(error.Timeout, pair.eng.openStream(gpa, 1, true, 10, null));
+    try std.testing.expectEqual(@as(u32, 0), v.stream_request);
+    var buf: [4096]u8 = undefined;
+    var reader = proto.Reader.init(pair.drain(&buf));
+    const req = try proto.decode(proto.StreamOpen, (try reader.next()).?.payload);
+    try std.testing.expectEqual(proto.Tag.stream_close, (try reader.next()).?.tag);
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(gpa);
+    try proto.encodePayload(gpa, &payload, proto.EvStreamOpen{
+        .view = 1, .req = req.req, .path = "/tmp/late.sock",
+        .token = "00000000000000000000000000000000", .err = "",
+    });
+    pair.eng.dispatch(.{ .tag = .ev_stream_open, .payload = payload.items });
+    try std.testing.expect(v.stream_reply == null);
+}
 
 const PolicyPeer = struct {
     const Action = enum { success, reject, timeout, disappear, create_failed };
@@ -5748,12 +6060,12 @@ test "emulation capability refuses before publication and precedes the first doc
     defer pair.deinit();
     const emulation = Emulation{ .color_scheme = .dark, .reduced_motion = .reduce, .device_scale_factor = 1.5 };
     var buf: [16384]u8 = undefined;
-    try std.testing.expectError(error.EmulationUnsupported, pair.eng.openViewConfigured("https://site.example/", 800, 600, .ephemeral, null, null, emulation));
+    try std.testing.expectError(error.EmulationUnsupported, pair.eng.openViewConfigured("https://site.example/", 800, 600, .ephemeral, null, null, emulation, null));
     try std.testing.expectEqual(@as(usize, 0), pair.drain(&buf).len);
     pair.eng.caps.insert(.web_emulation);
     pair.eng.caps.insert(.net_policy);
     const policy = NetPolicy{ .allow_top = &.{"site.example"} };
-    const view = try pair.eng.openViewConfigured("https://site.example/", 800, 600, .ephemeral, &policy, null, emulation);
+    const view = try pair.eng.openViewConfigured("https://site.example/", 800, 600, .ephemeral, &policy, null, emulation, null);
     var tags: [8]proto.Tag = undefined;
     try std.testing.expectEqualSlices(proto.Tag, &.{ .context_create, .view_emulation, .net_policy_set, .view_create_url, .view_show }, tagsOf(pair.drain(&buf), &tags));
     try pair.eng.resize(view.id, 900, 700);
@@ -6042,4 +6354,102 @@ test "untrusted teardown tolerates socket loss while destroying a view or contex
         try std.testing.expectEqual(@as(usize, 0), pair.eng.live.items.len);
         try std.testing.expectEqual(@as(c_int, -1), pair.eng.fd);
     }
+}
+
+test "coordinate input reaches the wire as the GUI's own frames, one edge at a time" {
+    var pair = try Pair.init(std.testing.allocator);
+    defer pair.deinit();
+    var buf: [8192]u8 = undefined;
+    const view = try pair.eng.openViewIn("https://site.example/", 800, 600, .default, null);
+    // Painted once already, so no input waits for a first frame.
+    view.frame_gen = 1;
+    _ = pair.drain(&buf);
+
+    // 1. A button edge at a point, then a move, keep the protocol's vocabulary.
+    try pair.eng.pointerAt(view.id, .down, 120, 45, 2, 1, proto.mod_shift);
+    try pair.eng.pointerAt(view.id, .move, 130, 50, 0, 0, 0);
+    // 2. A wheel step at a point and a held key: down now, up later.
+    try pair.eng.wheelAt(view.id, 400, 300, 0, 120, 0);
+    try pair.eng.keyEdge(view.id, .down, 0xffe1, 0, "x");
+    try pair.eng.keyEdge(view.id, .up, 0xffe1, 0, "x");
+    {
+        var reader = proto.Reader.init(pair.drain(&buf));
+        const down = try proto.decode(proto.InputPointer, (try reader.next()).?.payload);
+        try std.testing.expectEqual(@as(u8, @intFromEnum(proto.PointerKind.down)), down.kind);
+        try std.testing.expectEqual(@as(i32, 120), down.x);
+        try std.testing.expectEqual(@as(i32, 45), down.y);
+        try std.testing.expectEqual(@as(u8, 2), down.button);
+        try std.testing.expectEqual(proto.mod_shift, down.mods);
+        const move = try proto.decode(proto.InputPointer, (try reader.next()).?.payload);
+        try std.testing.expectEqual(@as(u8, @intFromEnum(proto.PointerKind.move)), move.kind);
+        const wheel_frame = (try reader.next()).?;
+        try std.testing.expectEqual(proto.Tag.input_scroll, wheel_frame.tag);
+        const wheel = try proto.decode(proto.InputScroll, wheel_frame.payload);
+        try std.testing.expectEqual(@as(i32, 400), wheel.x);
+        try std.testing.expectEqual(@as(i32, 120), wheel.dy);
+        const key_down = try proto.decode(proto.InputKey, (try reader.next()).?.payload);
+        try std.testing.expectEqual(@as(u8, @intFromEnum(proto.KeyKind.down)), key_down.kind);
+        try std.testing.expectEqual(@as(u32, 0xffe1), key_down.keyval);
+        try std.testing.expectEqualStrings("x", key_down.text);
+        // The text rides the down edge only, never the release.
+        const key_up = try proto.decode(proto.InputKey, (try reader.next()).?.payload);
+        try std.testing.expectEqual(@as(u8, @intFromEnum(proto.KeyKind.up)), key_up.kind);
+        try std.testing.expectEqualStrings("", key_up.text);
+        try std.testing.expect((try reader.next()) == null);
+    }
+
+    // 3. Text insertion needs the helper's clipboard capability; without it nothing is sent.
+    try std.testing.expectError(error.NoTextInput, pair.eng.insertText(view.id, "hallo"));
+    try std.testing.expectEqual(@as(usize, 0), pair.drain(&buf).len);
+    pair.eng.caps.insert(.clipboard);
+    try pair.eng.insertText(view.id, "h\u{e9}llo");
+    {
+        var reader = proto.Reader.init(pair.drain(&buf));
+        const paste = (try reader.next()).?;
+        try std.testing.expectEqual(proto.Tag.input_paste, paste.tag);
+        try std.testing.expectEqualStrings("h\u{e9}llo", (try proto.decode(proto.InputPaste, paste.payload)).text.s);
+    }
+    try std.testing.expectError(error.NoView, pair.eng.pointerAt(view.id + 99, .move, 0, 0, 0, 0, 0));
+}
+
+test "frameAfter answers a newer paint at once, and nothing when the page stayed still" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var pair = try Pair.init(std.testing.allocator);
+    defer pair.deinit();
+    const view = try pair.eng.openViewIn("https://site.example/", 800, 600, .default, null);
+
+    // 1. No frame painted yet: a short wait answers "nothing newer", never an error.
+    try std.testing.expect((try pair.eng.frameAfter(arena, view.id, 0, 30)) == null);
+
+    // 2. A 4x2 BGRX buffer at serial 3 is returned for any older serial, as RGBA with the logical viewport.
+    const fd = platform.anonFileFd(4 * 2 * 4);
+    try std.testing.expect(fd >= 0);
+    var pixels: [4 * 2 * 4]u8 = undefined;
+    var i: usize = 0;
+    while (i < pixels.len) : (i += 4) {
+        pixels[i] = 0xcc; // B
+        pixels[i + 1] = 0x66; // G
+        pixels[i + 2] = 0x33; // R
+        pixels[i + 3] = 0;
+    }
+    try std.testing.expectEqual(@as(isize, pixels.len), c.write(fd, &pixels, pixels.len));
+    view.buf_fd = fd;
+    view.buf_w = 4;
+    view.buf_h = 2;
+    view.buf_stride = 16;
+    view.frame_gen = 3;
+    const frame = (try pair.eng.frameAfter(arena, view.id, 0, 30)).?;
+    try std.testing.expectEqual(@as(u32, 3), frame.gen);
+    try std.testing.expectEqual(@as(u16, 4), frame.w);
+    try std.testing.expectEqual(@as(u16, 800), frame.view_w);
+    try std.testing.expectEqual(@as(u16, 600), frame.view_h);
+    try std.testing.expectEqualSlices(u8, &.{ 0x33, 0x66, 0xcc, 0xff }, frame.rgba[0..4]);
+
+    // 3. Asking past the serial already drawn waits for a paint that never comes: null, not the same frame again.
+    try std.testing.expect((try pair.eng.frameAfter(arena, view.id, 3, 30)) == null);
+    // 4. The next paint is answered.
+    view.frame_gen = 4;
+    try std.testing.expectEqual(@as(u32, 4), (try pair.eng.frameAfter(arena, view.id, 3, 30)).?.gen);
 }
