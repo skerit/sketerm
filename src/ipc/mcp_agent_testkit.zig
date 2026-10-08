@@ -8,6 +8,9 @@ const mcp = @import("mcp.zig");
 const termdrive = @import("termdrive.zig");
 const wire = @import("../mux/wire.zig");
 const pathz = @import("../util/pathz.zig");
+const platform = @import("../util/platform.zig");
+const clock = @import("../util/clock.zig");
+const muxclient = @import("../mux/client.zig");
 
 const mcp_agent = @import("mcp_agent.zig");
 
@@ -46,8 +49,13 @@ pub const ToolRig = struct {
 
     pub fn deinit(self: *ToolRig) void {
         shutdown();
+        retireDaemon(self.sockPath());
         self.arena.deinit();
         self.dir.remove();
+    }
+
+    fn sockPath(self: *const ToolRig) []const u8 {
+        return self.sock_buf[0 .. self.dir.path().len + "/mux.sock".len];
     }
 
     pub fn call(self: *ToolRig, tool: Tool, json: []const u8) ![]const u8 {
@@ -56,6 +64,32 @@ pub const ToolRig = struct {
         return agentTool(a, tool, args);
     }
 };
+
+/// Stop the private broker a tool call autostarted on the rig's socket.
+///
+/// It is a setsid'd child of this test process that nothing else ever
+/// retires: the rig arms no lifetime fence, a test sets no
+/// `--idle-exit`, and removing its socket directory does not reach it.
+/// Every `zig build test` used to leave four behind, reparented to init.
+fn retireDaemon(sock: []const u8) void {
+    var conn = muxclient.Conn.connect(testing.allocator, sock) catch return;
+    const peer = platform.unixPeerPid(conn.fd);
+    conn.deinit();
+    const pid = peer orelse return;
+    if (pid == c.getpid()) return;
+    _ = c.kill(pid, c.SIGTERM);
+    const deadline = clock.nowMs() + 3000;
+    while (clock.nowMs() < deadline) {
+        var status: c_int = 0;
+        const r = c.waitpid(pid, &status, c.WNOHANG);
+        if (r == pid) return;
+        // Not our child after all: wait for it to be gone instead.
+        if (r < 0 and c.kill(pid, 0) != 0) return;
+        _ = c.usleep(20_000);
+    }
+    _ = c.kill(pid, c.SIGKILL);
+    _ = c.waitpid(pid, null, c.WNOHANG);
+}
 
 pub fn expectError(arena: std.mem.Allocator, tool: []const u8, result: []const u8, code: []const u8) !void {
     _ = try errorMessage(arena, tool, result, code);
