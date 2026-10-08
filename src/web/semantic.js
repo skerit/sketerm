@@ -1,62 +1,52 @@
 // Semantic-layer content script for sketerm-web.
 //
 // This file is a FUNCTION EXPRESSION, not a statement: cefhost's
-// render-process handler evaluates it in the V8 context of every main
-// frame (on_context_created) and calls the resulting function with the
-// two per-process secrets and the native reply function. Everything
+// render-process handler evaluates it in the V8 context of every frame
+// (on_context_created), calls the resulting function with the native
+// reply function, and keeps the command handler it RETURNS. Everything
 // here is engine-agnostic DOM work: the script walks the document,
 // assigns per-document engine-local ids (WeakMap + counter) and answers
 // commands. It owns NO stable ids and computes NO deltas -- those live
 // in src/web/semantic.zig, which diffs the full walks this script
 // emits.
 //
-// Transport: JSON strings both ways. Out through `post`, the V8
-// extension's global handed in as an argument here and unpublished
-// immediately below, so page script has no reply channel; in through
-// the command entry point, installed under the random name SLOT because
-// the browser process can only reach a frame by evaluating source in
-// it. Every reply is prefixed with NONCE, which the browser checks and
-// without which the reply is dropped.
+// Transport: strings both ways. Out through `post`, in through the
+// returned `handle`, which the renderer calls for each `sketerm.cmd`
+// process message. Both are values only this closure and the renderer
+// hold: nothing is installed on `window`, a prototype or any other
+// object page script can reach, so the page can neither call the
+// handler nor forge a reply, and it cannot even tell the layer is
+// there by enumerating its own globals (smoke-web's globals stage
+// asserts exactly that). The one page-facing hook is the extension
+// bootstrap's one-shot event, and it exists only in an extension's own
+// documents (see `extBootListen`).
 //
 // SECURITY: this runs at context creation, BEFORE any page script, so
-// the capture below wins the race and the intrinsics captured are the
-// pristine ones. Page script can still lie about its OWN DOM (that is
-// not defensible from inside the page), but it cannot forge, alter or
-// observe a reply.
+// the intrinsics captured below are the pristine ones. Page script can
+// still lie about its OWN DOM (that is not defensible from inside the
+// page), but it cannot forge, alter or observe a reply.
 
-(function (NONCE, SLOT, post) {
+(function (post, testHooks) {
   if (typeof window === "undefined") return;
   if (typeof post !== "function") return;
-  if (window[SLOT]) return;
-
-  // Unpublish the transport. `delete` is tried first and fails on a
-  // global function declaration (non-configurable); the assignment is
-  // what actually bites, and the redefine is there for a future
-  // transport declared some other way. Whichever wins, page script must
-  // find nothing callable -- smoke-web stage 14 asserts exactly that.
-  try {
-    delete window.__sketermSemPost;
-  } catch (e) {}
-  if (typeof window.__sketermSemPost !== "undefined") {
-    try {
-      window.__sketermSemPost = undefined;
-    } catch (e2) {}
-  }
-  if (typeof window.__sketermSemPost !== "undefined") {
-    try {
-      Object.defineProperty(window, "__sketermSemPost", {
-        value: undefined,
-        writable: false,
-        configurable: false
-      });
-    } catch (e3) {}
-  }
 
   // Captured while they are still the originals: a page that later
   // patches JSON.stringify must not get to rewrite our replies.
   var stringify = JSON.stringify;
   var parseJson = JSON.parse;
   var ownDescriptor = Object.getOwnPropertyDescriptor;
+  var applyFn = Reflect.apply;
+  // The event accessors the error hooks read. Read through a patched
+  // prototype getter, every page error would call page code from here.
+  function getterOf(C, key) {
+    try {
+      return ownDescriptor(C.prototype, key).get || null;
+    } catch (e) {
+      return null;
+    }
+  }
+  var errorMessageOf = getterOf(ErrorEvent, "message");
+  var rejectionReasonOf = getterOf(PromiseRejectionEvent, "reason");
 
   // Per-context token: a fresh document means a fresh script instance,
   // which is exactly how the helper detects a navigation.
@@ -68,18 +58,40 @@
   var reviewDocument = Array.prototype.map.call(reviewNonce, function (n) {
     return ("00000000" + n.toString(16)).slice(-8);
   }).join("");
-  var reviewErrors = [], reviewErrorId = 0;
+  // The last REVIEW_KEEP page errors, by id. This runs on every page
+  // error whether or not anyone is driving the page, so it touches no
+  // page-patchable binding: a prototype-less record table instead of an
+  // Array (push/shift and index setters live on prototypes), and the
+  // String intrinsics captured above instead of the globals.
+  var REVIEW_KEEP = 32;
+  var reviewErrors = Object.create(null), reviewErrorId = 0;
+  var toStr = String, strSlice = String.prototype.slice;
   function reviewError(kind, message) {
-    reviewErrors.push({ id: ++reviewErrorId, kind: kind, message: String(message || "").slice(0, 400) });
-    if (reviewErrors.length > 32) reviewErrors.shift();
+    var id = ++reviewErrorId;
+    reviewErrors[id] = { id: id, kind: kind, message: applyFn(strSlice, toStr(message || ""), [0, 400]) };
+    delete reviewErrors[id - REVIEW_KEEP];
+  }
+  function reviewErrorsSince(since) {
+    var out = [];
+    for (var id = Math.max(since, reviewErrorId - REVIEW_KEEP) + 1; id <= reviewErrorId; id++) {
+      if (reviewErrors[id]) out.push(reviewErrors[id]);
+    }
+    return out;
   }
   window.addEventListener("error", function (e) {
-    // Resource-error events have no message; don't mislabel them JS exceptions.
-    if (e.message) reviewError("uncaught_exception", e.message);
+    // Resource-error events are plain Events with no message; don't
+    // mislabel them JS exceptions.
+    var message;
+    if (!errorMessageOf) return;
+    try { message = applyFn(errorMessageOf, e, []); } catch (x) { return; }
+    if (message) reviewError("uncaught_exception", message);
   });
   window.addEventListener("unhandledrejection", function (e) {
     // Don't enumerate arbitrary rejection objects or storage-bearing properties.
-    var reason = e.reason, desc = reason && typeof reason === "object" ? ownDescriptor(reason, "message") : null;
+    var reason;
+    if (!rejectionReasonOf) return;
+    try { reason = applyFn(rejectionReasonOf, e, []); } catch (x) { return; }
+    var desc = reason && typeof reason === "object" ? ownDescriptor(reason, "message") : null;
     reviewError("unhandled_rejection", typeof reason === "string" ? reason :
       (desc && typeof desc.value === "string" ? desc.value : "unhandled promise rejection"));
   });
@@ -120,7 +132,7 @@
   // Test-only latency hook used by smoke-web to put a navigation
   // deterministically between command receipt and reply production.
   function delayed(kind, req, fn) {
-    if (!window.__sketerm_test_hooks) return false;
+    if (!testHooks) return false;
     var attr = document.documentElement && document.documentElement.getAttribute("data-sketerm-delay-" + kind);
     var ms = attr ? parseInt(attr, 10) : 0;
     if (ms > 0) {
@@ -131,13 +143,11 @@
     return false;
   }
 
-  // Replies carry the browser's nonce as a bare prefix; concatenation
-  // of two primitives is the one step no page patch can intercept.
   function send(obj) {
     try {
       obj.doc = DOC;
       obj.gen = NAVGEN;
-      post(NONCE + stringify(obj));
+      post(stringify(obj));
     } catch (e) {}
   }
 
@@ -831,9 +841,9 @@
       landmarks: landmarks, controls: controls, issues: issues,
       document_overflow: Math.max(0, (document.documentElement ? document.documentElement.scrollWidth : 0) - innerWidth),
       truncated: truncated, visited: visited,
-      page_errors: reviewErrors.filter(function (e) { return e.id > since; }),
+      page_errors: reviewErrorsSince(since),
       error_cursor: reviewErrorId,
-      errors_dropped: Math.max(0, reviewErrorId - reviewErrors.length - since),
+      errors_dropped: Math.max(0, reviewErrorId - Math.min(reviewErrorId, REVIEW_KEEP) - since),
       coverage: "main document and open shadow roots; accname-lite (same as snapshots), not a full accessibility audit; URL query/userinfo/fragment omitted"
     };
     return out;
@@ -1661,11 +1671,10 @@
 
   // -- WebExtensions content-script runtime ----------------------------
   //
-  // Reuses this SAME authenticated channel: the browser process injects
-  // an extension's content scripts by evaluating source in this frame's
-  // SLOT (op "ext-inject"), the injected `browser`/`chrome` object posts
-  // async calls back over the nonce-prefixed transport, and replies
-  // arrive as further SLOT commands. Each extension runs in its own
+  // Reuses this SAME channel: the browser process injects an
+  // extension's content scripts with an "ext-inject" command, the
+  // injected `browser`/`chrome` object posts async calls back over
+  // `post`, and replies arrive as further commands. Each extension runs in its own
   // closure with its own `browser`, so extensions do not see each
   // other's state. This is NOT a separate V8 world (a CEF OSR limit,
   // see src/web/CLAUDE.md): the closure isolates the API surface, not
@@ -2782,28 +2791,16 @@
     fireAll(action.onClicked, [m.tab || {}]);
   }
 
-  // An `ext-inject` carrying the process NONCE is PRIVILEGED: it may
-  // publish `browser`/`chrome` as real globals on this document, which
-  // is what an extension page (background, popup, options) needs before
-  // its own first statement runs. The nonce is the same secret every
-  // reply is authenticated with, and only the browser process — which
-  // generated the served document — knows it.
-  //
-  // Without it, `ext-inject` still runs its scripts in a closure, as it
-  // always has. That distinction matters because `window[SLOT]` is a
-  // non-enumerable but discoverable own property: a page can find it
-  // and call it. Being able to run its OWN code in its OWN closure
-  // costs a page nothing, but a `browser` object bound to an installed
-  // extension's id would reach that extension's `storage.local`, so
-  // that half is gated.
-  // The nonce AUTHENTICATES an ext-inject; `priv` AUTHORIZES the
-  // globals. Both are needed and they are not the same question.
-  function extAuthentic(m) {
-    return typeof m.tok === "string" && m.tok === NONCE;
-  }
-
+  // A PRIVILEGED `ext-inject` may publish `browser`/`chrome` as real
+  // globals on this document, which is what an extension page
+  // (background, popup, options) needs before its own first statement
+  // runs. Content scripts must not get them: this is the page's main
+  // world, and a page holding `browser` would reach the extension's
+  // storage.local. Commands arrive only from the browser process, and
+  // the bootstrap event only in the extension's own document, so `priv`
+  // needs no authentication beyond the origin match below.
   function extPrivileged(m) {
-    if (m.priv !== true || !extAuthentic(m)) return false;
+    if (m.priv !== true) return false;
     try {
       var u = new URL(m.base || "");
       return location.protocol === "sketerm-extension:" &&
@@ -2813,18 +2810,37 @@
     }
   }
 
+  // The extension API bootstrap (`buildExtBootstrap` in
+  // cefhost/webext.zig) is a classic script spliced ahead of every
+  // author script of an extension document, and must hand its
+  // privileged `ext-inject` over SYNCHRONOUSLY, before the author's
+  // first statement. With no global to call it dispatches this event:
+  // heard only in an extension document, and only ONCE, so by the time
+  // any author script runs the listener is gone and a forged event
+  // reaches nothing.
+  function extBootListen() {
+    if (location.protocol !== "sketerm-extension:") return;
+    var name = "sketerm-ext-boot";
+    function onBoot(e) {
+      window.removeEventListener(name, onBoot, true);
+      var m;
+      try {
+        m = parseJson(e.detail);
+      } catch (x) {
+        return;
+      }
+      if (m && m.op === "ext-inject" && m.priv === true) extInject(m);
+    }
+    window.addEventListener(name, onBoot, true);
+  }
+
   function extInject(m) {
-    // EVERY ext-inject must carry the nonce, not just the privileged
-    // one. The scripts this runs are handed `api` — a live `browser.*`
-    // bound to `m.ext` — as their `browser`/`chrome`/`self` arguments,
-    // so the closure isolates NOTHING from a caller who chose the
-    // script text. `window[SLOT]` is a discoverable own property, so
-    // before this check any page could post
-    // `{op:"ext-inject",ext:"uBlock0@raymondhill.net",scripts:[...]}`
-    // and read the user's whole tab list, navigate the active tab, or
-    // rewrite that extension's storage.local. Only the browser process
-    // knows the nonce, and it is on all three legitimate producers.
-    if (!extAuthentic(m)) return;
+    // The scripts this runs are handed `api`, a live `browser.*` bound
+    // to `m.ext`, so whoever chooses the script text holds that
+    // extension's authority. That is why the command handler must stay
+    // unreachable from page script: when it was a discoverable
+    // `window` property, any page could post
+    // `{op:"ext-inject",ext:"uBlock0@raymondhill.net",scripts:[...]}`.
     var extId = m.ext;
     if (typeof m.cap !== "string" || m.cap.length !== 32) return;
     if (m.dbg) extDebug = true;
@@ -2865,7 +2881,7 @@
   }
 
   function extRevoke(m) {
-    if (!extAuthentic(m) || typeof m.cap !== "string") return;
+    if (typeof m.cap !== "string") return;
     invalidateExtContext(m.ext, m.cap, m.reason || "extension context was revoked");
   }
 
@@ -2959,8 +2975,8 @@
     var m;
     // An object command is the CSP lane: code the browser process could
     // not ship as data (eval() is blocked) arrives pre-compiled as a
-    // function literal inside the command script itself. Same authority
-    // as the string form; a page that found the slot gains nothing new.
+    // function literal inside the command itself. Same authority as the
+    // string form.
     if (json !== null && typeof json === "object") {
       m = json;
     } else {
@@ -3074,19 +3090,6 @@
     }
   }
 
-  // The one page-reachable name, and only because a browser-process
-  // command can reach a frame ONLY by evaluating source in it. It is
-  // random per process, non-writable and takes commands, never replies:
-  // the worst a page that finds it can do is ask for a walk of its own
-  // document.
-  try {
-    Object.defineProperty(window, SLOT, {
-      value: handle,
-      writable: false,
-      configurable: false,
-      enumerable: false
-    });
-  } catch (e) {
-    window[SLOT] = handle;
-  }
+  extBootListen();
+  return handle;
 })

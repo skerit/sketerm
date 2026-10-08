@@ -42,7 +42,6 @@ const physicalOf = host_mod.physicalOf;
 const release = host_mod.release;
 const releaseArg = host_mod.releaseArg;
 const route_reply_timeout_ms = host_mod.route_reply_timeout_ms;
-const runJs = host_mod.runJs;
 const setStr = host_mod.setStr;
 const userfreeInto = host_mod.userfreeInto;
 const webext_max_asset = host_mod.webext_max_asset;
@@ -187,9 +186,7 @@ pub fn revokeExtension(self: *Host, e: *const webexthost.Extension, reason: []co
     var cmd: std.Io.Writer.Allocating = .init(self.gpa);
     defer cmd.deinit();
     const w = &cmd.writer;
-    w.writeAll("{\"op\":\"ext-revoke\",\"tok\":\"") catch return;
-    w.writeAll(&host_mod.sem_secret.nonce) catch return;
-    w.writeAll("\",\"ext\":") catch return;
+    w.writeAll("{\"op\":\"ext-revoke\",\"ext\":") catch return;
     jsonStr(w, e.id) catch return;
     w.writeAll(",\"cap\":") catch return;
     jsonStr(w, &e.capability) catch return;
@@ -815,16 +812,11 @@ pub fn injectExtInto(
     }
     if (!any) return;
 
-    // The nonce AUTHENTICATES the command; `priv` (deliberately
-    // absent here) AUTHORIZES publishing the globals. Content
-    // scripts must not get `window.browser`, but they must still
-    // prove they came from this process: `ext-inject` hands the
-    // scripts it runs a live `browser.*` bound to `ext`, so an
-    // unauthenticated one let ANY page pass its own source and get
-    // that extension's tabs and storage.local.
-    w.writeAll("{\"op\":\"ext-inject\",\"tok\":\"") catch return;
-    w.writeAll(&host_mod.sem_secret.nonce) catch return;
-    w.writeAll("\",\"ext\":") catch return;
+    // `priv` (deliberately absent here) AUTHORIZES publishing the
+    // globals: content scripts must not get `window.browser`. No
+    // authentication is needed, because only this process can reach
+    // the frame's command handler at all.
+    w.writeAll("{\"op\":\"ext-inject\",\"ext\":") catch return;
     jsonStr(w, e.id) catch return;
     w.writeAll(",\"cap\":") catch return;
     jsonStr(w, &e.capability) catch return;
@@ -906,9 +898,7 @@ pub fn injectBackground(self: *Host, v: *View, e: *webexthost.Extension) void {
     var cmd: std.Io.Writer.Allocating = .init(self.gpa);
     defer cmd.deinit();
     const w = &cmd.writer;
-    w.writeAll("{\"op\":\"ext-inject\",\"tok\":\"") catch return;
-    w.writeAll(&host_mod.sem_secret.nonce) catch return;
-    w.writeAll("\",\"priv\":true,") catch return;
+    w.writeAll("{\"op\":\"ext-inject\",\"priv\":true,") catch return;
     if (c.getenv("SKETERM_WEB_EXT_DEBUG") != null) w.writeAll("\"dbg\":true,") catch return;
     w.writeAll("\"ext\":") catch return;
     jsonStr(w, e.id) catch return;
@@ -1515,12 +1505,11 @@ pub fn extTabsExec(self: *Host, v: *View, e: *webexthost.Extension, req: u32, me
     var cmd: std.Io.Writer.Allocating = .init(self.gpa);
     defer cmd.deinit();
     const w = &cmd.writer;
-    const slot: []const u8 = &host_mod.sem_secret.slot;
     // An OBJECT command, so script code can travel as a function
     // literal compiled with the command itself: a page whose CSP
     // forbids eval() still runs it (the result is then undefined,
     // because only eval yields a completion value).
-    w.print("window[\"{s}\"]&&window[\"{s}\"]({{\"op\":\"ext-exec\",\"ext\":", .{ slot, slot }) catch return;
+    w.writeAll("{\"op\":\"ext-exec\",\"ext\":") catch return;
     jsonStr(w, e.id) catch return;
     w.writeAll(",\"cap\":") catch return;
     jsonStr(w, &e.capability) catch return;
@@ -1536,7 +1525,7 @@ pub fn extTabsExec(self: *Host, v: *View, e: *webexthost.Extension, req: u32, me
         w.writeAll(code) catch return;
         w.writeAll("\n}") catch return;
     }
-    w.writeAll("},0)") catch return;
+    w.writeByte('}') catch return;
 
     const ext_copy = self.gpa.dupe(u8, e.id) catch {
         self.extReplyErr(v, req, e.id, &e.capability, "out of memory");
@@ -1574,7 +1563,7 @@ pub fn extTabsExec(self: *Host, v: *View, e: *webexthost.Extension, req: u32, me
         };
     };
     defer release(&frame.base);
-    runJs(frame, cmd.written());
+    self.sendExprToFrame(frame, cmd.written(), 0);
 }
 
 /// Run the `document_start` scripts queued for a view's next
@@ -1586,7 +1575,7 @@ pub fn flushExecAtStart(self: *Host, v: *View, frame: *cef.cef_frame_t) void {
         for (list) |js| self.gpa.free(js);
         self.gpa.free(list);
     }
-    for (list) |js| runJs(frame, js);
+    for (list) |js| self.sendExprToFrame(frame, js, 0);
 }
 
 /// A frame answered `tabs.executeScript`/`insertCSS`/`removeCSS`.
@@ -2209,8 +2198,7 @@ pub fn extSchemeCreate(
     // relaxation to it is what stops a hostile page creating an
     // about:blank iframe and `fetch()`ing any file in any installed
     // package — including the generated bootstrap, which carries the
-    // bridge NONCE in plaintext and would defeat every nonce gate in
-    // semantic.js.
+    // extension's capability in plaintext.
     const rtype_raw = if (req.get_resource_type) |grt| grt(req) else cef.RT_SUB_RESOURCE;
     const is_navigation = rtype_raw == cef.RT_MAIN_FRAME or rtype_raw == cef.RT_SUB_FRAME;
     // Measured 2026-08-12 with this print: the generated background
@@ -2268,9 +2256,9 @@ pub fn extSchemeCreate(
     // and they are checked before the file lookup so a package cannot
     // shadow either with a file of its own.
     if (std.mem.eql(u8, path, extorigins.BOOTSTRAP_PATH)) {
-        // STRICT only. This body contains the bridge nonce, so it is the
-        // one path where "close enough to same-origin" is not good
-        // enough: it is always a `<script src>` from the extension's own
+        // STRICT only. This body carries the extension's capability, so
+        // it is the one path where "close enough to same-origin" is not
+        // good enough: it is always a `<script src>` from the extension's own
         // document, where the frame reports the extension origin. A
         // manifest publishing `"/*"` must not put it in reach either,
         // which is why this is checked AFTER the WAR gate.
@@ -2416,18 +2404,22 @@ pub fn buildGeneratedBackgroundAlloc(slot: *const extorigins.Lookup) ![]u8 {
 
 /// IO THREAD. Build the extension API bootstrap script.
 ///
-/// It calls the semantic bridge's own command entry point, which
-/// `on_context_created` has already installed on this frame, so
-/// `browser` exists SYNCHRONOUSLY before the document's first author
-/// statement. A command sent the usual way — `execute_java_script` from
-/// the browser process — would race that statement and lose.
+/// It dispatches `ext_boot_event` with a privileged `ext-inject`, which
+/// semantic.js (run at context creation) hears ONCE and only in an
+/// extension-origin document, so `browser` exists SYNCHRONOUSLY before
+/// the document's first author statement. A command sent the usual way,
+/// a process message from the browser process, would race that
+/// statement and lose.
 ///
-/// Every input is a file on disk or a process-global secret; nothing
-/// here reads main-thread state.
+/// Every input is a file on disk; nothing here reads main-thread state.
 pub fn buildExtBootstrap(slot: *const extorigins.Lookup, host: []const u8) ?[]u8 {
-    if (!host_mod.sem_secret.ok) return null;
     return buildExtBootstrapAlloc(slot, host) catch null;
 }
+
+/// The one-shot event the bootstrap hands its command through. Not a
+/// secret: semantic.js listens for it only in a `sketerm-extension:`
+/// document, before any author script, and stops at the first one.
+pub const ext_boot_event = "sketerm-ext-boot";
 
 /// Error-returning so the `errdefer` runs; as a `?[]u8` body each of
 /// the twenty-odd `catch return null` paths leaked the script so far.
@@ -2452,11 +2444,8 @@ pub fn buildExtBootstrapAlloc(slot: *const extorigins.Lookup, host: []const u8) 
         } else |_| {}
     }
 
-    try w.writeAll("(function(){try{var f=window[\"");
-    try w.writeAll(&host_mod.sem_secret.slot);
-    try w.writeAll("\"];if(!f)return;f(JSON.stringify({op:\"ext-inject\",tok:\"");
-    try w.writeAll(&host_mod.sem_secret.nonce);
-    try w.writeAll("\",priv:true,");
+    try w.writeAll("(function(){try{dispatchEvent(new CustomEvent(\"" ++ ext_boot_event ++
+        "\",{detail:JSON.stringify({op:\"ext-inject\",priv:true,");
     if (c.getenv("SKETERM_WEB_EXT_DEBUG") != null) try w.writeAll("dbg:true,");
     try w.writeAll("ext:");
     try jsonStr(w, slot.idSlice());
@@ -2473,7 +2462,7 @@ pub fn buildExtBootstrapAlloc(slot: *const extorigins.Lookup, host: []const u8) 
     // A bootstrap that fails silently is an extension that is enabled,
     // loads, and does nothing at all — the exact failure mode this whole
     // area kept producing. Say so instead.
-    try w.writeAll(",scripts:[],css:[]}));}catch(e){try{console.error(" ++
+    try w.writeAll(",scripts:[],css:[]})}));}catch(e){try{console.error(" ++
         "'[sketerm-webext] API bootstrap failed: '+(e&&e.stack||e));}catch(e2){}}})()");
     return out.toOwnedSlice();
 }

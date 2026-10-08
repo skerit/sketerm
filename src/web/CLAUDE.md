@@ -375,10 +375,10 @@ dispatch, and the blocking half is documented in its own section below).
 
 - **Content scripts and the `browser.*` bridge reuse the semantic
   channel, they are NOT a second transport.** `semantic.js` gained an
-  `ext-*` sub-protocol; the browser process drives injection with
-  `execute_java_script` (the same `sendScript` path) and receives calls
-  over the same nonce-authenticated process message. Do not add a
-  separate V8 extension or secret for webext.
+  `ext-*` sub-protocol; the browser process drives injection with the
+  same `sketerm.cmd` process message (`sendScript`) and receives calls
+  over the same `sketerm.sem` reply message. Do not add a second
+  transport, global or secret for webext.
 - **An extension gets a real ORIGIN, and its scheme is
   `sketerm-extension://`, NOT `chrome-extension://`.** MEASURED on CEF
   151.3.16 (2026-08-12): `add_custom_scheme("chrome-extension")` returns
@@ -414,8 +414,9 @@ dispatch, and the blocking half is documented in its own section below).
     never filtered. `web_accessible_resources` gates only loads that DO
     have a frame on another origin.
 - **`browser`/`chrome` are published as globals only for a PRIVILEGED
-  `ext-inject`** — one carrying the process nonce, which only the
-  browser process (which generated the served document) can produce.
+  `ext-inject`** (`priv:true`, from the browser process or the
+  extension document's own bootstrap event, and only when the document
+  IS that extension's origin).
   Extension pages need the globals before their first statement;
   content scripts must NOT have them, because this is the shared main
   world and a page could then reach an extension's `storage.local`.
@@ -585,7 +586,7 @@ dispatch, and the blocking half is documented in its own section below).
   `getFrame`/`getAllFrames` (frameId 0 = main, others a hash of CEF's
   frame identifier), gated on the `webNavigation` permission;
   `tabs.executeScript`/`insertCSS`/`removeCSS` (one frame, host
-  permission required, run through the semantic slot as an OBJECT
+  permission required, run through the semantic bridge as an OBJECT
   command whose `fn` is the code compiled into the command, so a CSP
   forbidding eval still runs it with an undefined result;
   `runAt:"document_start"` after a main-frame `onResponseStarted` waits
@@ -639,7 +640,7 @@ dispatch, and the blocking half is documented in its own section below).
   `get_first_party_for_cookies` fallback in `extSchemeCreate` is required
   because CEF can expose the previous frame URL while a parser-blocking
   extension script loads. It must stay exact-origin: broadening it would
-  reopen the bootstrap nonce to another origin.
+  hand the bootstrap (and the capability in it) to another origin.
   Smoke-e2e drives two real split panes and two real GTK toplevels: focus
   moves the sole presented action, inactive toolbars clear, the second
   window's trusted action opens its popup there, and closing it restores the
@@ -659,10 +660,10 @@ page is a hidden windowless browser THIS process owns, so a decision goes
 CEF IO thread (on_before_resource_load, holds the request)
   -> hold slot + a byte down the wake pipe
 helper main thread (next poll turn)
-  -> execute_java_script into the background page
+  -> a `sketerm.cmd` command into the background page
 that page's RENDERER process
   -> the MV2 listener runs, returns a BlockingResponse
-  -> back over the nonce-authenticated bridge
+  -> back over the semantic bridge
 helper main thread
   -> apply to the cef_request_t, then cont() or cancel()
 ```
@@ -1821,11 +1822,30 @@ half in `cefhost/stream.zig`.
   "unknown id" rather than acting on something arbitrary, and its id is
   keyed on the CONTAINER element so a re-walk reuses it instead of
   churning the delta stream with a remove+add every snapshot.
-- The injected bridge script is published at context-creation time,
-  before any page script runs, then unpublished, with a per-request
-  nonce authenticating replies. Page scripts otherwise win the race and
-  can MITM every reply. Channel integrity is guaranteed; page HONESTY
+- **The semantic bridge leaves NOTHING page script can see** (P9).
+  `onContextCreated` evaluates semantic.js, calls it with
+  `execute_function_with_context` and the native `post` as an
+  ARGUMENT, and keeps the command handler it RETURNS per V8 context in
+  the renderer (`SemHandlers`, dropped in `onContextReleased`).
+  Commands are a `sketerm.cmd` process message (`sendCommand`, kind
+  json or expr) that `onRenderMessage` hands to that handler. There is
+  no V8 extension global, no `window[<slot>]`, no secret on the
+  renderer command line and no nonce: page script never holds a
+  reference to the handler or to `post`, so it can neither command the
+  layer nor forge a reply. MEASURED on claude.ai (2026-10): with the
+  old two globals visible its invisible hCaptcha served a challenge
+  11/11 runs, with them gone 0/10, and the slot alone was enough to
+  trigger it. Smoke-web stage gl fingerprints `window`'s own names and
+  symbols, main frame and iframe, against `SKETERM_WEB_SEMANTIC=off`
+  (the bare engine); never install anything on `window`, a prototype or
+  `Symbol.for` again. A plain `execute_function` in `onContextCreated`
+  killed the renderer silently; the `_with_context` call does not.
+  The one page-facing hook is `ext_boot_event`, a one-shot listener
+  that exists only in `sketerm-extension:` documents (the bootstrap is
+  their first script). Channel integrity is guaranteed; page HONESTY
   never can be, so page content is untrusted input to every consumer.
+  `SKETERM_WEB_TEST_HOOKS` arms semantic.js's `data-sketerm-delay-*`
+  latency hooks for the smoke rig (it was a page-readable window flag).
 - `--keep` must return immediately: a daemon spawning `/proc/self/exe`
   as a display keeper must never get a browser helper instead.
 - **Filter-list subscription (0xC4, capability "filter-subscribe")** is
@@ -1871,7 +1891,7 @@ half in `cefhost/stream.zig`.
   scripts run in the page's MAIN world — no isolated world exists on
   this path. **GM_* is real (capability `userscripts-gm`, smoke-web
   stage 44):** each script is its own object command to the semantic
-  slot (`us-run`) with its SOURCE spliced in as a function literal, so
+  bridge (`us-run`) with its SOURCE spliced in as a function literal, so
   a page with `script-src 'none'` still runs it (the old `new Function`
   path ran nothing there, silently). `semantic.js usRun` builds only the
   `@grant`ed functions (an ungranted `GM_x` is `undefined` inside the

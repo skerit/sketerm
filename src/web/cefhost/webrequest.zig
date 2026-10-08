@@ -662,16 +662,8 @@ pub fn broadcastChanged(self: *Host, e: *webexthost.Extension, changes_json: []c
 /// Whether a bridge payload is an `ext-*` op. The cheap prefix test
 /// `onProcessMessage` uses to decide whether a SUBFRAME may be heard
 /// at all, without parsing the JSON first.
-pub fn payloadIsExt(self: *Host, raw: []const u8) bool {
+pub fn payloadIsExt(self: *Host, json: []const u8) bool {
     _ = self;
-    // The payload is still NONCE-PREFIXED here — `onScriptMessage`
-    // is what strips and checks it — so the test has to skip the
-    // nonce first. Looking at the raw head instead silently answered
-    // "not an extension message" for everything, which is how the
-    // subframe half of `all_frames` stayed broken after the frames
-    // were already being injected.
-    if (raw.len <= host_mod.sem_secret.nonce.len) return false;
-    const json = raw[host_mod.sem_secret.nonce.len..];
     // The script always emits `op` first, so this is a prefix test
     // rather than a parse: `{"op":"ext-`.
     const head = json[0..@min(json.len, 24)];
@@ -687,10 +679,10 @@ pub fn payloadIsExt(self: *Host, raw: []const u8) bool {
 //   CEF IO thread (on_before_resource_load)
 //     -> hold slot + wake byte
 //   helper main thread (between two poll iterations)
-//     -> execute_java_script into the extension's BACKGROUND PAGE
+//     -> a `sketerm.cmd` command into the extension's BACKGROUND PAGE
 //   that page's RENDERER process
 //     -> the MV2 listener runs, returns a BlockingResponse
-//   back over the nonce-authenticated bridge to the main thread
+//   back over the semantic bridge to the main thread
 //     -> apply the decision to the cef_request_t, cont()/cancel()
 //
 // The background page is a hidden windowless browser THIS HELPER owns

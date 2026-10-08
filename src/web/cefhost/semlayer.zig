@@ -18,8 +18,6 @@ const discarded_msg = host_mod.discarded_msg;
 const jsonStr = host_mod.jsonStr;
 const max_expand = host_mod.max_expand;
 const release = host_mod.release;
-const runJs = host_mod.runJs;
-const secretEql = host_mod.secretEql;
 const semantic_request_timeout_ms = host_mod.semantic_request_timeout_ms;
 const sendClick = host_mod.sendClick;
 const sendMove = host_mod.sendMove;
@@ -31,15 +29,10 @@ const withHostArgs = host_mod.withHostArgs;
 
 // -- semantic layer ------------------------------------------------
 
-/// Hand one JSON command to the view's main frame, as a call into
-/// the script's command entry point (`window[<slot>]`).
-///
-/// `execute_java_script` works straight from the browser process
-/// (CEF routes it to the frame's renderer), which is why the
-/// command direction needs no process message and no V8 call at
-/// all — only the REPLY direction does.
+/// Hand one JSON command to the view's main frame's semantic.js
+/// handler, over the `sketerm.cmd` process message (see "SEMANTIC
+/// LAYER PROCESS FLOW" in cefhost.zig).
 pub fn sendScript(self: *Host, v: *View, json: []const u8) void {
-    if (!host_mod.sem_secret.ok) return;
     const b = v.browser orelse return;
     const gf = b.get_main_frame orelse return;
     const frame: *cef.cef_frame_t = gf(b) orelse return;
@@ -53,14 +46,15 @@ pub fn sendScriptToFrame(self: *Host, frame: *cef.cef_frame_t, json: []const u8)
 }
 
 pub fn sendScriptToFrameGen(self: *Host, frame: *cef.cef_frame_t, json: []const u8, nav_gen: u32) void {
-    if (!host_mod.sem_secret.ok) return;
-    var code: std.Io.Writer.Allocating = .init(self.gpa);
-    defer code.deinit();
-    const slot: []const u8 = &host_mod.sem_secret.slot;
-    code.writer.print("window[\"{s}\"]&&window[\"{s}\"](", .{ slot, slot }) catch return;
-    jsonStr(&code.writer, json) catch return;
-    code.writer.print(",{d})", .{nav_gen}) catch return;
-    runJs(frame, code.written());
+    host_mod.sendCommand(self.gpa, frame, .json, json, nav_gen);
+}
+
+/// Hand an OBJECT command to one frame: `literal` is the source of one
+/// object literal, so code that cannot travel as data (a page whose CSP
+/// forbids eval()) is compiled as a function member of the command
+/// itself, in the renderer, outside the page's CSP.
+pub fn sendExprToFrame(self: *Host, frame: *cef.cef_frame_t, literal: []const u8, nav_gen: u32) void {
+    host_mod.sendCommand(self.gpa, frame, .expr, literal, nav_gen);
 }
 
 /// Hand a command to every frame of a view.
@@ -71,7 +65,6 @@ pub fn sendScriptToFrameGen(self: *Host, frame: *cef.cef_frame_t, json: []const 
 /// rather than a document, where a content script in an ad iframe is
 /// as much a recipient as the top one.
 pub fn sendScriptAllFrames(self: *Host, v: *View, json: []const u8) void {
-    if (!host_mod.sem_secret.ok) return;
     const b = v.browser orelse return;
     const gfi = b.get_frame_identifiers orelse {
         self.sendScript(v, json);
@@ -684,29 +677,26 @@ pub fn semEval(self: *Host, req: proto.SemEval) !void {
     self.sendScript(v, cmd.written());
 }
 
-/// The CSP lane of `sem_eval`: the code compiled INTO the command
-/// script as a function literal, which `execute_java_script` runs
-/// regardless of the page's CSP - only eval()-of-a-string is
-/// governed. Restricted to a single expression by construction; the
-/// `evalprobe` sent right behind it turns a parse failure (the
-/// whole script dies, nothing replies) into a clear answer instead
-/// of a 120s timeout.
+/// The CSP lane of `sem_eval`: the code compiled INTO the command as
+/// a function literal, which the renderer compiles regardless of the
+/// page's CSP - only eval()-of-a-string is governed. Restricted to a
+/// single expression by construction; the `evalprobe` sent right
+/// behind it turns a parse failure (the command never arrives) into a
+/// clear answer instead of a 120s timeout.
 pub fn sendEvalSpliced(self: *Host, v: *View, rid: u32, code: []const u8, want_await: bool, timeout: u32, max_str: u32) void {
-    if (!host_mod.sem_secret.ok) return;
     const b = v.browser orelse return;
     const gf = b.get_main_frame orelse return;
     const frame: *cef.cef_frame_t = gf(b) orelse return;
     defer release(&frame.base);
-    const slot: []const u8 = &host_mod.sem_secret.slot;
     var script: std.Io.Writer.Allocating = .init(self.gpa);
     defer script.deinit();
     script.writer.print(
-        "window[\"{s}\"]&&window[\"{s}\"](({{\"op\":\"eval\",\"req\":{d},\"await\":{s},\"timeout\":{d},\"maxstr\":{d},\"fn\":function(){{return(\n",
-        .{ slot, slot, rid, if (want_await) "true" else "false", timeout, max_str },
+        "{{\"op\":\"eval\",\"req\":{d},\"await\":{s},\"timeout\":{d},\"maxstr\":{d},\"fn\":function(){{return(\n",
+        .{ rid, if (want_await) "true" else "false", timeout, max_str },
     ) catch return;
     script.writer.writeAll(code) catch return;
-    script.writer.print("\n)}}}}),{d})", .{v.sem_nav.generation}) catch return;
-    runJs(frame, script.written());
+    script.writer.writeAll("\n)}}") catch return;
+    self.sendExprToFrame(frame, script.written(), v.sem_nav.generation);
     var probe: [64]u8 = undefined;
     const cmd = std.fmt.bufPrint(&probe, "{{\"op\":\"evalprobe\",\"req\":{d}}}", .{rid}) catch return;
     self.sendScriptToFrameGen(frame, cmd, v.sem_nav.generation);
@@ -810,18 +800,13 @@ pub fn semanticStopped(self: *Host, v: *View) void {
     }
 }
 
-/// One reply from the injected script: `<nonce><json>`.
+/// One reply from the injected script.
 ///
-/// The nonce gate is the whole reason the render side has a secret.
-/// A page cannot reach the native reply function, but if it ever
-/// did, an unprefixed message buys it nothing: everything below is
-/// reached only by a message that carries the browser's own nonce,
-/// and only for a request id the browser is actually waiting on.
-pub fn onScriptMessage(self: *Host, v: *View, raw: []const u8) void {
-    if (!host_mod.sem_secret.ok) return;
-    if (raw.len <= host_mod.sem_secret.nonce.len) return;
-    if (!secretEql(raw[0..host_mod.sem_secret.nonce.len], &host_mod.sem_secret.nonce)) return;
-    const json = raw[host_mod.sem_secret.nonce.len..];
+/// It needs no authentication: `post` is only ever an argument and a
+/// closure variable of semantic.js, never a property page script can
+/// reach, so a reply can only come from the script. Everything below
+/// still acts only on a request id the browser is actually waiting on.
+pub fn onScriptMessage(self: *Host, v: *View, json: []const u8) void {
     const Head = struct { op: []const u8 = "", req: u32 = 0, doc: u32 = 0, gen: u32 = 0 };
     const head = std.json.parseFromSlice(Head, self.gpa, json, .{
         .ignore_unknown_fields = true,

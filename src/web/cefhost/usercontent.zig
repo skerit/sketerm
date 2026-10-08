@@ -157,22 +157,19 @@ pub fn injectUserContent(self: *Host, v: *View, frame: *cef.cef_frame_t) void {
 }
 
 /// One userscript into one document, CSP-SAFE: its source is spliced
-/// into the command as the body of a function literal and handed to
-/// the semantic slot (`us-run`), so no `eval`/`new Function` ever
-/// runs — a page whose CSP forbids eval still gets its scripts (the
-/// old `new Function` path silently ran nothing there). One
-/// `execute_java_script` per script: a syntax error in one cannot
-/// take the others down. The GM API is built in `semantic.js`
+/// into an OBJECT command (`us-run`) as the body of a function literal,
+/// so no `eval`/`new Function` ever runs: a page whose CSP forbids
+/// eval still gets its scripts (the old `new Function` path silently
+/// ran nothing there). One command per script: a syntax error in one
+/// cannot take the others down. The GM API is built in `semantic.js`
 /// (`usRun`) and holds only what `@grant` asked for.
 pub fn injectUserscript(self: *Host, v: *View, frame: *cef.cef_frame_t, sc: *const ScriptRec, page_host: []const u8) void {
     _ = page_host;
-    if (!host_mod.sem_secret.ok) return;
     var code: std.Io.Writer.Allocating = .init(self.gpa);
     defer code.deinit();
     const w = &code.writer;
-    const slot: []const u8 = &host_mod.sem_secret.slot;
-    w.print("window[\"{s}\"]&&window[\"{s}\"]({{\"op\":\"us-run\",\"sid\":{d},\"cap\":\"{s}\",\"run\":\"{s}\",\"name\":", .{
-        slot, slot, sc.id, &sc.cap,
+    w.print("{{\"op\":\"us-run\",\"sid\":{d},\"cap\":\"{s}\",\"run\":\"{s}\",\"name\":", .{
+        sc.id, &sc.cap,
         switch (sc.meta.run_at) {
             .document_start => "start",
             .document_end => "end",
@@ -216,9 +213,9 @@ pub fn injectUserscript(self: *Host, v: *View, frame: *cef.cef_frame_t, sc: *con
     w.writeAll(",\"fn\":function(GM_info,GM_getValue,GM_setValue,GM_deleteValue,GM_listValues," ++
         "GM_addStyle,GM_xmlhttpRequest,GM,unsafeWindow){\n") catch return;
     w.writeAll(sc.source) catch return;
-    w.writeAll("\n}},0)") catch return;
+    w.writeAll("\n}}") catch return;
     _ = v;
-    runJs(frame, code.written());
+    self.sendExprToFrame(frame, code.written(), 0);
 }
 
 /// A `GM_*` call from a userscript (`us-call`): the value store and

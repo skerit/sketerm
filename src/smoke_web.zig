@@ -4810,15 +4810,16 @@ const action_bg =
     \\  try { await browser.windows.create({}); } catch (e) { unsupportedRejected = String(e).includes("windows.create is not supported"); }
     \\  try {
     \\    var source = await (await fetch(browser.runtime.getURL("__sketerm-extapi.js"))).text();
-    \\    var tok = source.match(/tok:"([0-9a-f]{32})"/);
     \\    var cap = source.match(/,cap:"([0-9a-f]{32})"/);
-    \\    var slot = source.match(/window\["([0-9a-f]{32})"\]/);
-    \\    if (!tok || !cap || !slot || typeof window[slot[1]] !== "function") throw new Error("bootstrap parse");
+    \\    var boot = source.match(/CustomEvent\("([a-z-]+)"/);
+    \\    if (!cap || !boot) throw new Error("bootstrap parse");
+    \\    var reachable = Object.getOwnPropertyNames(window).filter(function (n) { return /^[0-9a-f]{32}$/.test(n); });
+    \\    // The boot listener runs a forged inject's scripts synchronously,
+    \\    // so "ran" would be visible right after dispatchEvent returns.
     \\    window.__sketermImpersonation = "pending";
-    \\    var attack = "browser.storage.local.set({stolen:true}).then(function(){window.__sketermImpersonation='resolved'},function(e){window.__sketermImpersonation='rejected:'+String(e)})";
-    \\    window[slot[1]](JSON.stringify({op:"ext-inject",tok:tok[1],ext:"click@sketerm.test",cap:cap[1],base:browser.runtime.getURL(""),manifest:{},scripts:[attack],css:[]}));
-    \\    for (var i=0;i<100 && window.__sketermImpersonation==="pending";i++) await new Promise(function(r){setTimeout(r,25)});
-    \\    impersonationRejected = String(window.__sketermImpersonation).includes("extension capability does not authorize");
+    \\    var attack = "window.__sketermImpersonation='ran';browser.storage.local.set({stolen:true})";
+    \\    dispatchEvent(new CustomEvent(boot[1], {detail: JSON.stringify({op:"ext-inject",priv:true,ext:"click@sketerm.test",cap:cap[1],base:browser.runtime.getURL(""),manifest:{},scripts:[attack],css:[]})}));
+    \\    impersonationRejected = reachable.length === 0 && window.__sketermImpersonation === "pending";
     \\  } catch (e) {}
     \\  browser.browserAction.setTitle({title:helperRejected && unsupportedRejected && impersonationRejected ? "Security Checks Passed" : "Security Checks Failed"});
     \\}
@@ -6529,6 +6530,123 @@ fn runMultiClientStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const 
 /// changing the page for both, new pages announced, a destroyed page
 /// ending the subscription, and an observer leaving without touching
 /// the owner's views.
+// ---------------------------------------------------------------------
+// Stage gl: our instrumentation leaves no page-visible global
+// ---------------------------------------------------------------------
+
+/// One document serves as both the top page and its iframe. Each frame
+/// fingerprints its own `window` (own property names and own symbols:
+/// count/count/FNV-1a) after load; the frame posts its print to the top,
+/// which titles itself with both. A V8-extension global or a command
+/// slot on `window` changes the print, which is how claude.ai's
+/// invisible hCaptcha told the instrumented engine apart (P9).
+const globals_page =
+    "<!doctype html><html><head><title>gl:loading</title></head><body>" ++
+    "<h1>Globals Probe</h1>" ++
+    "<button id=go onclick=\"this.textContent='Pressed Now'\">Press Me</button>" ++
+    "<script>" ++
+    "function shape(w){var n=Object.getOwnPropertyNames(w).sort();" ++
+    "var s=Object.getOwnPropertySymbols(w).map(String).sort();" ++
+    "var t=n.join(',')+'|'+s.join(','),h=0x811c9dc5;" ++
+    "for(var i=0;i<t.length;i++){h^=t.charCodeAt(i);h=Math.imul(h,0x01000193)>>>0;}" ++
+    "return n.length+'/'+s.length+'/'+h.toString(16);}" ++
+    "var main=null,frame=null;" ++
+    "function report(){if(main&&frame)document.title='gl:main='+main+' frame='+frame;}" ++
+    "if(window.top!==window){addEventListener('load',function(){setTimeout(function(){" ++
+    "parent.postMessage('frame='+shape(window),'*');},100);});}" ++
+    "else{addEventListener('message',function(e){" ++
+    "if(typeof e.data==='string'&&e.data.indexOf('frame=')===0){frame=e.data.slice(6);report();}});" ++
+    "addEventListener('load',function(){setTimeout(function(){main=shape(window);report();},100);});" ++
+    "var f=document.createElement('iframe');f.src='/frame';document.body.appendChild(f);}" ++
+    "</script></body></html>";
+
+/// Load `globals_page` in a fresh helper and return the title it set
+/// (`gl:main=... frame=...`), copied into `out`. `bare` runs the helper
+/// with the semantic layer off: the engine exactly as it ships.
+fn globalsPrint(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8, url: []const u8, bare: bool, out: []u8) []const u8 {
+    var sock_buf: [96]u8 = undefined;
+    const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/gl{d}.sock", .{ dir, @intFromBool(bare) }) catch fail("gl sock path");
+    var cache_buf: [96]u8 = undefined;
+    const cache = std.fmt.bufPrintZ(&cache_buf, "{s}/gl{d}-cache", .{ dir, @intFromBool(bare) }) catch fail("gl cache path");
+    if (bare) _ = c.setenv("SKETERM_WEB_SEMANTIC", "off", 1);
+    const pid = spawnHelper(exe, sock.ptr, cache.ptr, "--ozone-platform=headless", null, false);
+    _ = c.unsetenv("SKETERM_WEB_SEMANTIC");
+    g_pid = pid;
+    var cl = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
+    cl.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web-gl" });
+    {
+        const d = nowMs() + 15_000;
+        while (cl.ack_proto == 0 and nowMs() < d) cl.pump(100);
+    }
+    if (cl.ack_proto != proto.PROTO_VERSION) fail("stage gl: no hello_ack");
+    cl.send(proto.ViewCreate{ .view = view_id, .w = 640, .h = 480, .scale_x1000 = 1000, .context = 0 });
+    if (!cl.waitBufferAfter(0, 20_000)) fail("stage gl: no frame_buffer");
+    cl.navigate(url);
+    if (!cl.waitTitle("gl:main=", 20_000)) {
+        std.debug.print("smoke-web: stage gl title was \"{s}\"\n", .{cl.titleSlice()});
+        fail("stage gl: the probe page never reported its globals");
+    }
+    const t = cl.titleSlice();
+    const n = @min(t.len, out.len);
+    @memcpy(out[0..n], t[0..n]);
+    if (!bare) globalsDrive(&cl);
+    cl.deinit();
+    reapHelperTimeout(pid, "stage gl", 30_000);
+    return out[0..n];
+}
+
+/// The instrumented run must still do its job on the same page.
+fn globalsDrive(cl: *Client) void {
+    cl.resetSem();
+    cl.snapshot(@intFromEnum(proto.SnapMode.full), 1);
+    const go = cl.idOfLine("button \"Press Me\"") orelse {
+        std.debug.print("smoke-web: stage gl snapshot was:\n{s}\n", .{cl.semLog()});
+        fail("stage gl: web_snapshot lost the probe page's button");
+    };
+    if (std.mem.indexOf(u8, cl.semLog(), "Globals Probe") == null) fail("stage gl: web_snapshot lost the heading");
+    {
+        const seq = cl.query_seq;
+        cl.send(proto.SemQueryReq{ .view = view_id, .kind = @intFromEnum(proto.SemQuery.find_text), .arg = "Press Me" });
+        if (!cl.waitSeq(&cl.query_seq, seq, 20_000)) fail("stage gl: no sem_query_result");
+        if (std.mem.indexOf(u8, cl.queryPayload(), "button \"Press Me\"") == null) {
+            std.debug.print("smoke-web: query result was:\n{s}\n", .{cl.queryPayload()});
+            fail("stage gl: web_query did not find the button");
+        }
+    }
+    const acted = cl.act_seq;
+    cl.send(proto.SemAction{ .view = view_id, .id = go, .action = @intFromEnum(proto.SemAct.click), .arg = "" });
+    if (!cl.waitSeq(&cl.act_seq, acted, 20_000) or cl.act_ok != 1) fail("stage gl: web_act click failed");
+    // The act answers once the click is dispatched; the page handles it
+    // a beat later.
+    var text: []const u8 = "";
+    const deadline = nowMs() + 10_000;
+    while (nowMs() < deadline) {
+        text = cl.evalWait("document.getElementById('go').textContent", false, 15_000);
+        if (std.mem.indexOf(u8, text, "Pressed Now") != null) break;
+        _ = cl.drive(200, 0);
+    } else {
+        std.debug.print("smoke-web: eval said {s}\n", .{text});
+        fail("stage gl: the web_act click never reached the page");
+    }
+}
+
+fn runGlobalsStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) void {
+    var http = HttpProbe{ .body = globals_page };
+    if (!http.start()) fail("stage gl: HTTP fixture did not start");
+    defer http.shutdown();
+    var url_buf: [64]u8 = undefined;
+    const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{http.lis.port}) catch fail("stage gl url");
+    var bare_buf: [256]u8 = undefined;
+    var live_buf: [256]u8 = undefined;
+    const bare = globalsPrint(gpa, exe, dir, url, true, &bare_buf);
+    const live = globalsPrint(gpa, exe, dir, url, false, &live_buf);
+    if (!std.mem.eql(u8, bare, live)) {
+        std.debug.print("smoke-web: bare engine \"{s}\"\n          instrumented \"{s}\"\n", .{ bare, live });
+        fail("stage gl: the instrumentation changed what page script sees on window (main frame or iframe)");
+    }
+    pass("stage gl no page-visible globals (main frame and iframe match the bare engine; snapshot/query/act/eval work)");
+}
+
 fn runObserveStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) void {
     var sock_buf: [96]u8 = undefined;
     const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/ob.sock", .{dir}) catch fail("ob sock path");
@@ -7861,6 +7979,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // legitimately not exist (the stage then reports itself skipped).
     const ubo_xpi: []const u8 = if (argv.len > 3) std.mem.span(argv[3]) else "";
     g_echo_console = c.getenv("SKETERM_SMOKE_WEB_CONSOLE") != null;
+    // Every helper below inherits it: semantic.js's latency hooks (the
+    // `data-sketerm-delay-*` attributes) answer only when it is set.
+    _ = c.setenv("SKETERM_WEB_TEST_HOOKS", "1", 1);
 
     var gpa_state: std.heap.DebugAllocator(.{ .safety = true }) = .{};
     const gpa = gpa_state.allocator();
@@ -7931,6 +8052,16 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             return 1;
         }
         say("smoke-web: PASS (encoded frames only)");
+        return 0;
+    }
+    if (c.getenv("SKETERM_SMOKE_WEB_GLOBALS_ONLY") != null) {
+        runGlobalsStage(gpa, exe, dir);
+        cleanup();
+        if (gpa_state.deinit() == .leak) {
+            say("smoke-web: FAIL leaked memory (see GPA report above)");
+            return 1;
+        }
+        say("smoke-web: PASS (globals only)");
         return 0;
     }
     if (c.getenv("SKETERM_SMOKE_WEB_OBSERVE_ONLY") != null) {
@@ -8629,7 +8760,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         // Two same-kind operations can overlap on the correlated wire.
         // Delay the first so the second answers first, then prove both
         // late callbacks retain their own client request identity.
-        _ = cl.evalWait("window.__sketerm_test_hooks=true;document.documentElement.setAttribute('data-sketerm-delay-read','1200');'armed'", false, 20_000);
+        _ = cl.evalWait("document.documentElement.setAttribute('data-sketerm-delay-read','1200');'armed'", false, 20_000);
         const concurrent = cl.md_seq;
         cl.sendSemantic(4103, proto.SemReadIds{ .view = view_id });
         cl.sendSemantic(4104, proto.SemReadIds{ .view = view_id });
@@ -8669,7 +8800,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         // navigates must be reissued against the new context, not hang
         // or accept the old page's late reply.
         cl.navigate(reader_ids_page);
-        _ = cl.evalWait("window.__sketerm_test_hooks=true;document.documentElement.setAttribute('data-sketerm-delay-read','1200');'armed'", false, 20_000);
+        _ = cl.evalWait("document.documentElement.setAttribute('data-sketerm-delay-read','1200');'armed'", false, 20_000);
         const legacy_nav = cl.md_seq;
         cl.send(proto.SemRead{ .view = view_id });
         cl.send(proto.Navigate{ .view = view_id, .url = reader_nav_page });
@@ -8678,7 +8809,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             fail("stage 41 reader ids: legacy read was not reissued on the new document");
 
         cl.navigate(reader_ids_page);
-        _ = cl.evalWait("window.__sketerm_test_hooks=true;document.documentElement.setAttribute('data-sketerm-delay-read','1200');'armed'", false, 20_000);
+        _ = cl.evalWait("document.documentElement.setAttribute('data-sketerm-delay-read','1200');'armed'", false, 20_000);
         const rich_nav = cl.md_seq;
         cl.send(proto.SemReadIds{ .view = view_id });
         cl.send(proto.Navigate{ .view = view_id, .url = reader_nav_page });
@@ -8693,7 +8824,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         const read3 = cl.md_seq;
         cl.send(proto.SemReadIds{ .view = view_id });
         if (!cl.waitSeq(&cl.md_seq, read3, 20_000)) fail("stage 41 reader ids: no rich read for guarded navigation race");
-        _ = cl.evalWait("window.__sketerm_test_hooks=true;document.documentElement.setAttribute('data-sketerm-delay-snapshot','1200');'armed'", false, 20_000);
+        _ = cl.evalWait("document.documentElement.setAttribute('data-sketerm-delay-snapshot','1200');'armed'", false, 20_000);
         const interrupted = cl.act_seq;
         cl.send(proto.SemActGuarded{
             .view = view_id,
@@ -8930,8 +9061,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         if (!cl.waitTitle("attack ", 15_000)) fail("stage 14 hostile page: the page never reported its attempts");
         const report = cl.titleSlice();
         const want = [_][]const u8{
-            "early:hit=0 posted=0 slots=1 ovr=0",
-            "late:hit=0 posted=0 slots=1 ovr=0",
+            "early:hit=0 posted=0 slots=0 ovr=0",
+            "late:hit=0 posted=0 slots=0 ovr=0",
         };
         for (want) |needle| {
             if (std.mem.indexOf(u8, report, needle) == null) {
@@ -11003,6 +11134,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // ── Stage mc: multi-client serving ────────────────────────────
     runMultiClientStage(gpa, exe, dir);
     runObserveStage(gpa, exe, dir);
+    runGlobalsStage(gpa, exe, dir);
     runEncodedStage(gpa, exe, dir);
     // ── Stage fl: flush + linger (broker-owned lifecycle) ─────────
     runFlushLingerStage(gpa, exe, dir);
