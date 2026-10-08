@@ -3895,9 +3895,15 @@ pub const Engine = struct {
                     // Adopting it is what makes an OAuth flow work
                     // headlessly at all: it is the window the identity
                     // provider posts its result back through.
+                    // Showing it is also the CLAIM: the helper closes a
+                    // popup no client frame has named within its adopt
+                    // timeout, which killed every sign-in popup after 8s
+                    // while a human typed into it through the presenter.
                     self.adoptPopupView(ev) catch {
                         self.send(proto.ViewDestroy{ .view = ev.popup_view }) catch {};
+                        return;
                     };
+                    self.send(proto.ViewShow{ .view = ev.popup_view }) catch {};
                 } else if (self.findView(ev.popup_view)) |v| {
                     self.abandonView(v);
                 }
@@ -4932,6 +4938,45 @@ test "ev_view_create_failed marks the view and its close rolls the context back"
     for (p.eng.live.items) |ctx| {
         if (std.mem.eql(u8, ctx.name, "work")) try std.testing.expectEqual(@as(u32, 0), ctx.views);
     }
+}
+
+test "an adopted page popup is claimed with view_show so the helper keeps it past its adopt timeout" {
+    const gpa = std.testing.allocator;
+    var p = try Pair.init(gpa);
+    defer p.deinit();
+    var buf: [8192]u8 = undefined;
+
+    const opener = try p.eng.openViewIn("https://claude.test/login", 800, 600, .default, null);
+    _ = p.drain(&buf);
+    const popup_id: u32 = proto.ENGINE_VIEW_BASE + 1;
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(gpa);
+    try proto.encodePayload(gpa, &payload, proto.EvPagePopup{
+        .owner_view = opener.id,
+        .popup_view = popup_id,
+        .state = proto.page_popup_opened,
+        .disposition = 0,
+        .user_gesture = 1,
+        .chromeless = 1,
+        .w = 500,
+        .h = 600,
+        .url = "https://accounts.test/signin",
+        .frame_name = "",
+    });
+    p.eng.dispatch(.{ .tag = .ev_page_popup, .payload = payload.items });
+    try std.testing.expect(p.eng.findView(popup_id) != null);
+    // The helper destroys a popup no client frame names within 8s, and
+    // a human typing into it through the presenter names nothing.
+    const shown = frameOf(proto.ViewShow, p.drain(&buf)) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(popup_id, shown.view);
+
+    // A repeated announcement re-claims; it does not adopt twice.
+    p.eng.dispatch(.{ .tag = .ev_page_popup, .payload = payload.items });
+    var count: usize = 0;
+    for (p.eng.views.items) |v| {
+        if (v.id == popup_id) count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), count);
 }
 
 /// The first frame of tag `tag` in `bytes`, decoded.
