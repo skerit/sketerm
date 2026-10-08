@@ -1204,8 +1204,9 @@ The shape, and why each part is what it is:
 - **Observers ALWAYS get `frame_inline`**, whatever their own views
   use: no memfd to dup, no dma-buf to share, identical over a bridged
   remote helper. `shipInline` is the one band encoder for the owner's
-  inline path and the observer path; each subscription keeps a
-  union-and-flush `dirty` rect with the same `max_frame_backlog`
+  inline path and the observer path (`shipDamage` drains a
+  `frameflow.Damage` rect list into it); each subscription keeps a
+  merge-and-flush `dirty` list with the same `max_frame_backlog`
   backpressure, refilled per paint in `observeDamage` and drained per
   poll in `flushObservers`. A subscribe (and a resume) seeds the alias
   with the stored nav state, title (`View.title`/`nav_*` exist for

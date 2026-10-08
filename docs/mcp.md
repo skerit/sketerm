@@ -601,9 +601,10 @@ single-use: the first authentication attempt spends the token and removes
 the listener, even if the token is wrong. A second AUTH is a protocol
 violation. AUTH success begins with SURFACE and full-page damage; later
 damage bands apply to the current surface and become a completed frame
-at FRAME_END. ACK only after consuming all of that frame's bands.
+at FRAME_END. ACK only after consuming all of that frame's bands; one
+frame may carry bands for several separate damaged rects.
 At most two frame ends may remain unacknowledged. While they are held,
-new paints union damage and retain the live newest pixels; they do not
+new paints merge into the pending damage and retain the live newest pixels; they do not
 queue obsolete frames. Duplicate, old or unknown ACK serials end the
 connection. Cursor/audio are independent of the frame ACK window and
 bounded by the helper's transmit/audio buffers.

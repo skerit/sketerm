@@ -6,8 +6,10 @@
 //! raw premultiplied BGRA, frame ends, cursor and Opus audio; the client
 //! answers with input and an ACK per frame end. Never more than
 //! `MAX_UNACKED` frames are in flight and no frame is ever queued:
-//! damage is unioned and the LIVE buffer is read when a frame is sent,
-//! so a slow reader sees fewer, newer frames.
+//! damage is merged and the LIVE buffer is read when a frame is sent,
+//! so a slow reader sees fewer, newer frames. The window and the damage
+//! list themselves are the shared `frameflow.zig`; a frame carries one
+//! band run per pending damage rect.
 //!
 //! Pure code: std plus the repo spinlock, no CEF, no sockets. The
 //! socket half is `streamsrv.zig`; the engine glue `cefhost/stream.zig`.
@@ -15,6 +17,8 @@
 const std = @import("std");
 const SpinLock = @import("../util/spinlock.zig").SpinLock;
 const keymap = @import("keymap.zig");
+const frameflow = @import("frameflow.zig");
+const Rect = frameflow.Rect;
 
 /// Largest frame on the stream, length field included in neither
 /// direction's count (the length covers tag + body).
@@ -336,40 +340,7 @@ pub fn encodeAudio(dst: []u8, pts_us: u64, rate: u32, channels: u8, samples: u16
     @memcpy(dst[20..][0..opus.len], opus);
 }
 
-// -- damage and frame flow ----------------------------------------------
-
-pub const Rect = struct {
-    x: u32,
-    y: u32,
-    w: u32,
-    h: u32,
-
-    pub fn empty(self: Rect) bool {
-        return self.w == 0 or self.h == 0;
-    }
-
-    /// The smallest rect covering both.
-    pub fn unite(a: Rect, b: Rect) Rect {
-        if (a.empty()) return b;
-        if (b.empty()) return a;
-        const x0 = @min(a.x, b.x);
-        const y0 = @min(a.y, b.y);
-        const x1 = @max(@as(u64, a.x) + a.w, @as(u64, b.x) + b.w);
-        const y1 = @max(@as(u64, a.y) + a.h, @as(u64, b.y) + b.h);
-        return .{ .x = x0, .y = y0, .w = @intCast(x1 - x0), .h = @intCast(y1 - y0) };
-    }
-
-    /// `self` clipped to a `w`x`h` surface; empty when fully outside.
-    pub fn clip(self: Rect, w: u32, h: u32) Rect {
-        if (self.x >= w or self.y >= h) return .{ .x = 0, .y = 0, .w = 0, .h = 0 };
-        return .{
-            .x = self.x,
-            .y = self.y,
-            .w = @intCast(@min(@as(u64, self.w), w - self.x)),
-            .h = @intCast(@min(@as(u64, self.h), h - self.y)),
-        };
-    }
-};
+// -- damage bands and frame flow ------------------------------------------
 
 /// Splits one damage rect into bands whose pixel payload stays within
 /// `MAX_BAND_BYTES`: full-width row bands normally, column-split only
@@ -409,55 +380,8 @@ pub const Bands = struct {
     }
 };
 
-/// The two-unacked-frames window. Serials start at 1 and grow by one
-/// per frame end; an ACK names one outstanding serial and retires it
-/// and every older one. Anything else is a protocol violation.
-pub const Flow = struct {
-    next: u64 = 1,
-    inflight: [MAX_UNACKED]u64 = @splat(0),
-    n: usize = 0,
-
-    pub fn canSend(self: *const Flow) bool {
-        return self.n < MAX_UNACKED;
-    }
-
-    /// Record a sent frame end and return its serial.
-    pub fn sent(self: *Flow) u64 {
-        std.debug.assert(self.canSend());
-        const s = self.next;
-        self.next += 1;
-        self.inflight[self.n] = s;
-        self.n += 1;
-        return s;
-    }
-
-    pub fn ack(self: *Flow, serial: u64) error{InvalidAck}!void {
-        for (self.inflight[0..self.n], 0..) |s, i| {
-            if (s != serial) continue;
-            const keep = self.n - (i + 1);
-            std.mem.copyForwards(u64, self.inflight[0..keep], self.inflight[i + 1 .. self.n]);
-            self.n = keep;
-            return;
-        }
-        return error.InvalidAck;
-    }
-};
-
-/// Union-and-flush damage: everything painted since the last frame
-/// started, as one rect.
-pub const Dirty = struct {
-    rect: ?Rect = null,
-
-    pub fn add(self: *Dirty, r: Rect) void {
-        if (r.empty()) return;
-        self.rect = if (self.rect) |d| d.unite(r) else r;
-    }
-
-    pub fn take(self: *Dirty) ?Rect {
-        defer self.rect = null;
-        return self.rect;
-    }
-};
+/// V1's ack window: at most `MAX_UNACKED` frame ends in flight.
+pub const Flow = frameflow.Flow(MAX_UNACKED);
 
 // -- held input ---------------------------------------------------------
 
@@ -1032,32 +956,7 @@ test "encoders lay frames out as V1 says" {
     try t.expectEqualSlices(u8, &.{ 9, 8, 7 }, af.body[15..]);
 }
 
-test "flow allows two unacked frames and rejects unknown ACKs" {
-    var f: Flow = .{};
-    try t.expectEqual(@as(u64, 1), f.sent());
-    try t.expectEqual(@as(u64, 2), f.sent());
-    try t.expect(!f.canSend());
-    try t.expectError(error.InvalidAck, f.ack(3));
-    try t.expectError(error.InvalidAck, f.ack(0));
-    // ACKing the newer one retires both.
-    try f.ack(2);
-    try t.expect(f.canSend());
-    try t.expectError(error.InvalidAck, f.ack(1));
-    try t.expectEqual(@as(u64, 3), f.sent());
-    try f.ack(3);
-    try t.expectError(error.InvalidAck, f.ack(3));
-}
-
-test "damage unions, clips and splits into bands under the band cap" {
-    var d: Dirty = .{};
-    d.add(.{ .x = 10, .y = 10, .w = 5, .h = 5 });
-    d.add(.{ .x = 0, .y = 20, .w = 2, .h = 2 });
-    d.add(.{ .x = 0, .y = 0, .w = 0, .h = 9 });
-    const u = d.take().?;
-    try t.expectEqual(Rect{ .x = 0, .y = 10, .w = 15, .h = 12 }, u);
-    try t.expect(d.take() == null);
-    try t.expectEqual(Rect{ .x = 10, .y = 10, .w = 6, .h = 2 }, (Rect{ .x = 10, .y = 10, .w = 50, .h = 50 }).clip(16, 12));
-    try t.expect((Rect{ .x = 20, .y = 0, .w = 5, .h = 5 }).clip(16, 12).empty());
+test "damage splits into bands under the band cap" {
 
     // A 4K full frame: every band within the cap, rows tiling the rect.
     var bands = Bands.init(.{ .x = 0, .y = 0, .w = 3840, .h = 2160 });

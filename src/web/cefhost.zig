@@ -61,6 +61,7 @@ const builtin = @import("builtin");
 const cef = @import("cef");
 const c = @import("cbindings");
 const proto = @import("protocol.zig");
+const frameflow = @import("frameflow.zig");
 // The raw-deflate codec pool updates on the native app pipe use
 // (src/wlhost/zpool.zig), mapped in as a named module because the
 // helper's module root is src/web/.
@@ -587,10 +588,10 @@ pub const View = struct {
     next_buf_id: u32 = 0,
 
     /// Inline mode only: damage accumulated since the last posted
-    /// `frame_inline`, as one union rect. Damage is unioned rather
-    /// than queued so a slow link coalesces bursts instead of
-    /// ballooning the outbox; the flush (`flushInlineView`) clears it.
-    inline_dirty: ?proto.Rect = null,
+    /// `frame_inline`. Damage is merged rather than queued so a slow
+    /// link coalesces bursts instead of ballooning the outbox; the
+    /// flush (`flushInlineView`) takes it.
+    inline_dirty: frameflow.Damage = .{},
     /// A hidden WebExtensions background page: a 1x1 windowless browser
     /// that hosts the extension's background scripts and never paints or
     /// is announced to the client. It has no frame buffer, so `onPaint`
@@ -932,8 +933,8 @@ const RouteTo = struct {
 /// One observer subscription (capability "observe"): connection `conn`
 /// sees the view `target` under the engine-global alias id `alias`
 /// (in `conn`'s own id window). Frames toward the observer are ALWAYS
-/// inline; `dirty` is the union of damage not yet shipped, the same
-/// union-and-flush backpressure the owner's inline path uses.
+/// inline; `dirty` is the damage not yet shipped, the same
+/// merge-and-flush backpressure the owner's inline path uses.
 pub const Sub = struct {
     conn: u32,
     alias: u32,
@@ -942,7 +943,7 @@ pub const Sub = struct {
     /// `view_hide` from the observer: nothing is shipped until its
     /// `view_show`, which re-seeds the whole surface.
     paused: bool = false,
-    dirty: ?proto.Rect = null,
+    dirty: frameflow.Damage = .{},
 };
 
 pub const Host = struct {
@@ -2869,7 +2870,7 @@ pub const Host = struct {
             v.buf_unpainted = true;
             v.buf_id +%= 1;
             if (v.buf_id == 0) v.buf_id = 1;
-            v.inline_dirty = null;
+            v.inline_dirty.clear();
             if (!v.hidden) withHost(v, struct {
                 fn f(host: *cef.cef_browser_host_t) void {
                     if (host.invalidate) |inv| inv(host, cef.PET_VIEW);
@@ -3127,28 +3128,34 @@ pub const Host = struct {
 
     /// Encode `v.inline_dirty` (if any) into banded `frame_inline`
     /// messages, unless the outbox is already backed up — then the
-    /// damage stays accumulated and a later flush ships the union.
+    /// damage stays accumulated and a later flush ships it merged.
     fn flushInlineView(self: *Host, v: *View) void {
-        const d = v.inline_dirty orelse return;
+        if (!v.inline_dirty.pending()) return;
         if (v.map.len == 0) {
-            v.inline_dirty = null;
+            v.inline_dirty.clear();
             return;
         }
         const route = self.routeFor(v.id) orelse {
-            v.inline_dirty = null;
+            v.inline_dirty.clear();
             return;
         };
         if (route.out.pending() >= max_frame_backlog) return;
-        v.inline_dirty = null;
         const wire_view = if (route.alias_view != 0) route.alias_view else v.id - route.base;
-        self.shipInline(v, d, route.out, wire_view);
+        self.shipDamage(v, &v.inline_dirty, route.out, wire_view);
+    }
+
+    /// Take `d` against `v`'s live surface and ship each rect with
+    /// `shipInline`; the one drain for owner-inline and observer damage.
+    pub fn shipDamage(self: *Host, v: *View, d: *frameflow.Damage, out: *proto.Outbox, wire_view: u32) void {
+        var rects: [frameflow.Damage.MAX_RECTS]frameflow.Rect = undefined;
+        for (d.take(v.pw, v.ph, &rects)) |r| self.shipInline(v, r, out, wire_view);
     }
 
     /// Encode `d` of `v`'s live buffer into banded `frame_inline`
     /// messages on `out`, carrying `wire_view` (the RECEIVER's id for
     /// the view). Shared by the owner's inline path and the observer
     /// path, so both ship byte-identical frames.
-    pub fn shipInline(self: *Host, v: *View, d: proto.Rect, out: *proto.Outbox, wire_view: u32) void {
+    pub fn shipInline(self: *Host, v: *View, d: frameflow.Rect, out: *proto.Outbox, wire_view: u32) void {
         const stride: usize = v.stride();
         // Clamp against the live buffer: a dirty rect can predate a
         // resize by one poll iteration.
@@ -6712,9 +6719,9 @@ fn onPaint(
     host.observeDamage(v, list[0..n]);
     host_stream.streamDamage(host, v, list[0..n]);
     if (host.viewInline(v)) {
-        // Union rather than queue: a slow bridge coalesces bursts into
-        // one damage rect instead of growing the outbox without bound.
-        for (list[0..n]) |r| unionDirty(v, r);
+        // Merge rather than queue: a slow bridge coalesces bursts into
+        // a bounded rect list instead of growing the outbox without bound.
+        v.inline_dirty.addAll(list[0..n]);
         host.flushInlineView(v);
         return;
     }
@@ -6724,24 +6731,6 @@ fn onPaint(
         .gen = v.gen,
         .rects = list[0..n],
     });
-}
-
-/// Grow `v.inline_dirty` to cover `r`.
-fn unionDirty(v: *View, r: proto.Rect) void {
-    const d = v.inline_dirty orelse {
-        v.inline_dirty = r;
-        return;
-    };
-    const x0 = @min(d.x, r.x);
-    const y0 = @min(d.y, r.y);
-    const x1 = @max(@as(u32, d.x) + d.w, @as(u32, r.x) + r.w);
-    const y1 = @max(@as(u32, d.y) + d.h, @as(u32, r.y) + r.h);
-    v.inline_dirty = .{
-        .x = x0,
-        .y = y0,
-        .w = @intCast(x1 - x0),
-        .h = @intCast(y1 - y0),
-    };
 }
 
 /// A GPU frame: hand the engine's dma-buf planes straight to the client.

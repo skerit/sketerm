@@ -10,6 +10,8 @@ const std = @import("std");
 const cef = @import("cef");
 const proto = @import("../protocol.zig");
 const st = @import("../stream.zig");
+const frameflow = @import("../frameflow.zig");
+const Rect = frameflow.Rect;
 const srv = @import("../streamsrv.zig");
 const webkeys = @import("../webkeys.zig");
 const clock = @import("../../util/clock.zig");
@@ -171,10 +173,10 @@ pub fn streamBrowserGone(self: *Host, view: u32) void {
 /// View damage in physical pixels, from `onPaint`.
 pub fn streamDamage(self: *Host, v: *const View, rects: []const proto.Rect) void {
     const s = streamOf(self, v.id) orelse return;
-    for (rects) |r| s.damage(.{ .x = r.x, .y = r.y, .w = r.w, .h = r.h });
+    for (rects) |r| s.damage(Rect.of(r));
 }
 
-fn damageRect(self: *Host, v: *const View, r: st.Rect) void {
+fn damageRect(self: *Host, v: *const View, r: Rect) void {
     const s = streamOf(self, v.id) orelse return;
     s.damage(r);
 }
@@ -195,14 +197,14 @@ fn popupPhys(v: *const View) PopupRect {
 }
 
 /// The part of the popup on the surface, as damage (empty when none).
-fn popupDamage(v: *const View) st.Rect {
+fn popupDamage(v: *const View) Rect {
     const p = popupPhys(v);
     const x0 = @max(p.x, 0);
     const y0 = @max(p.y, 0);
     const x1 = p.x + p.w;
     const y1 = p.y + p.h;
     if (x1 <= x0 or y1 <= y0) return .{ .x = 0, .y = 0, .w = 0, .h = 0 };
-    return (st.Rect{ .x = @intCast(x0), .y = @intCast(y0), .w = @intCast(x1 - x0), .h = @intCast(y1 - y0) }).clip(v.pw, v.ph);
+    return (Rect{ .x = @intCast(x0), .y = @intCast(y0), .w = @intCast(x1 - x0), .h = @intCast(y1 - y0) }).clip(v.pw, v.ph);
 }
 
 fn dropPopup(self: *Host, v: *View) void {
@@ -367,7 +369,7 @@ fn surface(ctx: *anyopaque, view: u32) ?st.Surface {
     return .{ .pixel_w = v.pw, .pixel_h = v.ph, .logical_w = v.w, .logical_h = v.h };
 }
 
-fn compose(ctx: *anyopaque, view: u32, r: st.Rect, dst: []u8) void {
+fn compose(ctx: *anyopaque, view: u32, r: Rect, dst: []u8) void {
     const self: *Host = @ptrCast(@alignCast(ctx));
     const v = self.findAny(view) orelse return @memset(dst, 0);
     const stride = @as(usize, v.pw) * 4;

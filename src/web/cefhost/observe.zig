@@ -228,7 +228,7 @@ pub fn seedObserver(self: *Host, sub: *Sub, v: *View) void {
     }, null) catch {};
     if (v.title.len != 0) out.post(proto.EvTitle{ .view = aliasWire(sub), .title = v.title }, null) catch {};
     if (v.map.len != 0 and !v.buf_unpainted) {
-        sub.dirty = .{ .x = 0, .y = 0, .w = v.pw, .h = v.ph };
+        sub.dirty.full(v.pw, v.ph);
         self.flushSub(sub, v);
     }
 }
@@ -261,12 +261,12 @@ pub fn observePause(self: *Host, conn: u32, alias: u32, paused: bool) void {
     const sub = self.aliasOf(conn, alias) orelse return;
     sub.paused = paused;
     if (paused) {
-        sub.dirty = null;
+        sub.dirty.clear();
         return;
     }
     const v = self.findAny(sub.target) orelse return;
     if (v.map.len != 0 and !v.buf_unpainted) {
-        sub.dirty = .{ .x = 0, .y = 0, .w = v.pw, .h = v.ph };
+        sub.dirty.full(v.pw, v.ph);
         self.flushSub(sub, v);
     }
 }
@@ -297,52 +297,39 @@ pub fn observeDropConn(self: *Host, conn: u32) void {
     }
 }
 
-/// New pixels landed in `v.map`: widen every subscriber's pending
-/// damage and ship what the backpressure allows. Union rather than
-/// queue, exactly like the owner's inline path.
+/// New pixels landed in `v.map`: add them to every subscriber's
+/// pending damage and ship what the backpressure allows. Merged rather
+/// than queued, exactly like the owner's inline path.
 pub fn observeDamage(self: *Host, v: *View, rects: []const proto.Rect) void {
     if (self.subs.items.len == 0) return;
     for (self.subs.items) |*s| {
         if (s.target != v.id or s.paused) continue;
-        for (rects) |r| unionSubDirty(s, r);
+        s.dirty.addAll(rects);
         self.flushSub(s, v);
     }
 }
 
-pub fn unionSubDirty(s: *Sub, r: proto.Rect) void {
-    const d = s.dirty orelse {
-        s.dirty = r;
-        return;
-    };
-    const x0 = @min(d.x, r.x);
-    const y0 = @min(d.y, r.y);
-    const x1 = @max(@as(u32, d.x) + d.w, @as(u32, r.x) + r.w);
-    const y1 = @max(@as(u32, d.y) + d.h, @as(u32, r.y) + r.h);
-    s.dirty = .{ .x = x0, .y = y0, .w = @intCast(x1 - x0), .h = @intCast(y1 - y0) };
-}
-
 /// Ship a subscriber's pending damage as inline bands, unless its
-/// outbox is backed up (then the union waits for the next flush).
+/// outbox is backed up (then the damage waits for the next flush).
 pub fn flushSub(self: *Host, s: *Sub, v: *View) void {
-    const d = s.dirty orelse return;
+    if (!s.dirty.pending()) return;
     if (v.map.len == 0) {
-        s.dirty = null;
+        s.dirty.clear();
         return;
     }
     const out = self.observerOut(s.conn) orelse {
-        s.dirty = null;
+        s.dirty.clear();
         return;
     };
     if (out.pending() >= max_frame_backlog) return;
-    s.dirty = null;
-    self.shipInline(v, d, out, aliasWire(s));
+    self.shipDamage(v, &s.dirty, out, aliasWire(s));
 }
 
 /// The drain-side half for observers: called once per poll beside
 /// `flushInline`, so damage held back by backpressure goes out.
 pub fn flushObservers(self: *Host) void {
     for (self.subs.items) |*s| {
-        if (s.dirty == null or s.paused) continue;
+        if (!s.dirty.pending() or s.paused) continue;
         const v = self.findAny(s.target) orelse continue;
         self.flushSub(s, v);
     }

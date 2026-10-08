@@ -19,6 +19,7 @@ const panelstore = @import("ipc/panelstore.zig");
 const protocol = @import("ipc/protocol.zig");
 const webproto = @import("web/protocol.zig");
 const webstream = @import("web/stream.zig");
+const frameflow = @import("web/frameflow.zig");
 const opuscodec = @import("mux/opuscodec.zig");
 const netpolicy = @import("web/netpolicy.zig");
 const version = @import("version.zig");
@@ -3563,7 +3564,7 @@ const StreamRig = struct {
     w: u32 = 0,
     h: u32 = 0,
     serial: u64 = 0,
-    damage: webstream.Dirty = .{},
+    damage: frameflow.Damage = .{},
     cursor_seen: bool = false,
     audio_packets: usize = 0,
     audio_signal: bool = false,
@@ -3675,7 +3676,7 @@ const StreamRig = struct {
             },
             .damage => {
                 if (b.len < webstream.DAMAGE_HEAD or self.pixels.len == 0) fail("damage before surface");
-                const r = webstream.Rect{
+                const r = frameflow.Rect{
                     .x = std.mem.readInt(u32, b[0..4], .little),
                     .y = std.mem.readInt(u32, b[4..8], .little),
                     .w = std.mem.readInt(u32, b[8..12], .little),
@@ -3734,11 +3735,11 @@ const StreamRig = struct {
         return tag;
     }
 
-    fn frame(self: *StreamRig) webstream.Rect {
+    fn frame(self: *StreamRig) frameflow.Rect {
         const deadline = nowMs() + 5000;
         while (nowMs() < deadline) {
             if (self.next(@max(1, deadline - nowMs()))) |tag| if (tag == .frame_end)
-                return self.damage.take() orelse fail("stream frame end had no damage");
+                return self.damage.takeBounds() orelse fail("stream frame end had no damage");
         }
         fail("helper did not push the next painted stream frame");
     }
@@ -3803,7 +3804,7 @@ fn streamPaint(m: *Mcp, color: []const u8) void {
     if (std.mem.indexOf(u8, line, "isError") != null) fail("stream fixture mutation failed");
 }
 
-fn streamBlock(rig: *StreamRig, damage: webstream.Rect, before: []const u8, bgra: [4]u8) void {
+fn streamBlock(rig: *StreamRig, damage: frameflow.Rect, before: []const u8, bgra: [4]u8) void {
     if (damage.x != 40 or damage.y != 40 or damage.w != 20 or damage.h != 20) {
         std.debug.print("smoke-mcp: stream damage {d},{d} {d}x{d}\n", .{ damage.x, damage.y, damage.w, damage.h });
         fail("20x20 mutation did not produce exact stream damage");
@@ -3843,16 +3844,16 @@ fn streamInputEvidence(m: *Mcp, arena: std.mem.Allocator, wait_reply: []const u8
 
 const StreamPixelDiff = struct {
     count: usize = 0,
-    bounds: ?webstream.Rect = null,
+    bounds: ?frameflow.Rect = null,
 };
 
-fn streamPixelDiff(w: u32, h: u32, before: []const u8, after: []const u8, region: webstream.Rect) StreamPixelDiff {
+fn streamPixelDiff(w: u32, h: u32, before: []const u8, after: []const u8, region: frameflow.Rect) StreamPixelDiff {
     const r = region.clip(w, h);
     var diff = StreamPixelDiff{};
     for (r.y..r.y + r.h) |y| for (r.x..r.x + r.w) |x| {
         const off = (y * w + x) * 4;
         if (std.mem.eql(u8, before[off..][0..4], after[off..][0..4])) continue;
-        const pixel = webstream.Rect{ .x = @intCast(x), .y = @intCast(y), .w = 1, .h = 1 };
+        const pixel = frameflow.Rect{ .x = @intCast(x), .y = @intCast(y), .w = 1, .h = 1 };
         diff.count += 1;
         diff.bounds = if (diff.bounds) |b| b.unite(pixel) else pixel;
     };
@@ -3864,7 +3865,7 @@ fn streamColorBounds(px: []const u8, w: u32, h: u32, want: [4]u8) StreamPixelDif
     var out = StreamPixelDiff{};
     for (0..h) |y| for (0..w) |x| {
         if (!std.mem.eql(u8, px[(y * w + x) * 4 ..][0..4], &want)) continue;
-        const r = webstream.Rect{ .x = @intCast(x), .y = @intCast(y), .w = 1, .h = 1 };
+        const r = frameflow.Rect{ .x = @intCast(x), .y = @intCast(y), .w = 1, .h = 1 };
         out.count += 1;
         out.bounds = if (out.bounds) |b| b.unite(r) else r;
     };
@@ -3982,7 +3983,7 @@ fn streamScaleStage(allocator: std.mem.Allocator, arena: std.mem.Allocator, m: *
     if (full.x != 0 or full.y != 0 or full.w != 1600 or full.h != 1200) fail("scale 2 first stream frame is not the full 1600x1200 surface");
     rig.ack();
     while (rig.next(300)) |tag| if (tag == .frame_end) {
-        _ = rig.damage.take();
+        _ = rig.damage.takeBounds();
         rig.ack();
     };
     if (!std.mem.eql(u8, rig.pixels[0..4], &.{ 0x33, 0x22, 0x11, 0xff })) fail("scale 2 stream frame is not the real page");
@@ -3998,7 +3999,7 @@ fn streamScaleStage(allocator: std.mem.Allocator, arena: std.mem.Allocator, m: *
     while (!settled and nowMs() < deadline) {
         const tag = rig.next(300) orelse continue;
         if (tag != .frame_end) continue;
-        _ = rig.damage.take();
+        _ = rig.damage.takeBounds();
         rig.ack();
         settled = rig.w == 800 and streamColorBounds(rig.pixels, rig.w, rig.h, .{ 0, 255, 0, 255 }).count == 1600;
     }
@@ -4038,7 +4039,7 @@ fn streamFpsStage(allocator: std.mem.Allocator, arena: std.mem.Allocator, m: *Mc
         while (nowMs() - start < 2100) {
             const tag = rig.next(100) orelse continue;
             if (tag != .frame_end) continue;
-            _ = rig.damage.take();
+            _ = rig.damage.takeBounds();
             rig.ack();
             count += 1;
         }
@@ -4173,7 +4174,7 @@ fn webStreamStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const 
     rig.ack();
     // Late layout paints are consumed before the exact damage assertion.
     while (rig.next(300)) |tag| if (tag == .frame_end) {
-        _ = rig.damage.take();
+        _ = rig.damage.takeBounds();
         rig.ack();
     };
     const linux = @import("builtin").os.tag == .linux;
@@ -4213,7 +4214,7 @@ fn webStreamStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const 
         while (!gl_repaint and nowMs() < gl_deadline) {
             const tag = rig.next(100) orelse continue;
             if (tag != .frame_end) continue;
-            _ = rig.damage.take();
+            _ = rig.damage.takeBounds();
             rig.ack();
             gl_repaint = std.mem.eql(u8, rig.pixels[(40 * rig.w + 500) * 4 ..][0..4], &.{ 255, 255, 0, 255 });
         }
@@ -4254,7 +4255,7 @@ fn webStreamStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const 
         _ = capSc(arena, m.callTool("web_eval", "{\"body\":\"clearInterval(window.iv);return true\"}"), "stall painter stop", false);
         rig.ack();
         while (rig.next(300)) |tag| if (tag == .frame_end) {
-            _ = rig.damage.take();
+            _ = rig.damage.takeBounds();
             rig.ack();
         };
         std.debug.print("smoke-mcp: stalled stream helper RSS growth: {d} KiB\n", .{peak - rss});
@@ -4272,7 +4273,7 @@ fn webStreamStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const 
     const cursor_deadline = nowMs() + 2000;
     while (!rig.cursor_seen and nowMs() < cursor_deadline) {
         if (rig.next(100)) |tag| if (tag == .frame_end) {
-            _ = rig.damage.take();
+            _ = rig.damage.takeBounds();
             rig.ack();
         };
     }
@@ -4298,7 +4299,7 @@ fn webStreamStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const 
         const deadline = nowMs() + 5000;
         while ((!rig.audio_signal or rig.audio_packets < 3) and nowMs() < deadline) {
             if (rig.next(100)) |tag| if (tag == .frame_end) {
-                _ = rig.damage.take();
+                _ = rig.damage.takeBounds();
                 rig.ack();
             };
         }
@@ -4316,13 +4317,13 @@ fn webStreamStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const 
     while (nowMs() < settle_deadline) {
         const tag = rig.next(300) orelse break;
         if (tag == .frame_end) {
-            _ = rig.damage.take();
+            _ = rig.damage.takeBounds();
             rig.ack();
         }
     }
     const popup_base = allocator.dupe(u8, rig.pixels) catch fail("popup baseline");
     defer allocator.free(popup_base);
-    const popup_roi = webstream.Rect{ .x = 300, .y = 180, .w = 180, .h = 60 };
+    const popup_roi = frameflow.Rect{ .x = 300, .y = 180, .w = 180, .h = 60 };
     rig.pointer(.down, 350, 165, 0);
     rig.pointer(.up, 350, 165, 0);
     var popup_seen = false;
@@ -4330,7 +4331,7 @@ fn webStreamStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const 
     while (!popup_seen and nowMs() < popup_deadline) {
         const tag = rig.next(100) orelse continue;
         if (tag != .frame_end) continue;
-        _ = rig.damage.take();
+        _ = rig.damage.takeBounds();
         rig.ack();
         const diff = streamPixelDiff(rig.w, rig.h, popup_base, rig.pixels, popup_roi);
         // A thin control focus/pressed border is not proof of a popup.
@@ -4344,7 +4345,7 @@ fn webStreamStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const 
     while (!popup_gone and nowMs() < close_deadline) {
         const tag = rig.next(100) orelse continue;
         if (tag != .frame_end) continue;
-        _ = rig.damage.take();
+        _ = rig.damage.takeBounds();
         rig.ack();
         popup_gone = streamPixelDiff(rig.w, rig.h, popup_base, rig.pixels, popup_roi).count == 0;
     }

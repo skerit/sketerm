@@ -4,16 +4,18 @@
 //! own poll loop. CEF-free; what a stream shows and what its input does
 //! come from a `Source` the engine glue (`cefhost/stream.zig`) supplies.
 //!
-//! Nothing here queues frames. Damage is unioned in `stream.Dirty` and
-//! a frame is cut from the LIVE buffer only when the flow window has
-//! room AND the bounded transmit buffer can take the next band, so the
-//! newest pixels always win and a stalled reader costs a fixed amount
-//! of memory.
+//! Nothing here queues frames. Damage is merged in a `frameflow.Damage`
+//! list and a frame is cut from the LIVE buffer only when the flow window
+//! has room AND the bounded transmit buffer can take the next band, so
+//! the newest pixels always win and a stalled reader costs a fixed
+//! amount of memory.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const c = @import("cbindings");
 const st = @import("stream.zig");
+const frameflow = @import("frameflow.zig");
+const Rect = frameflow.Rect;
 const opus = @import("../mux/opuscodec.zig");
 
 /// Streams one helper serves at once; also the audio slot count.
@@ -58,7 +60,7 @@ pub const Source = struct {
     surface: *const fn (ctx: *anyopaque, view: u32) ?st.Surface,
     /// Copy `r` (pixels, inside the surface) of the composed live frame
     /// into `dst`, packed `r.w * 4` bytes per row.
-    compose: *const fn (ctx: *anyopaque, view: u32, r: st.Rect, dst: []u8) void,
+    compose: *const fn (ctx: *anyopaque, view: u32, r: Rect, dst: []u8) void,
     /// One validated input frame; never `auth` or `ack`.
     input: *const fn (ctx: *anyopaque, s: *Stream, in: st.Input) void,
     /// The view's current cursor, read when the Cursor frame is cut;
@@ -161,7 +163,12 @@ pub const Stream = struct {
     tx_head: usize = 0,
     tx_len: usize = 0,
     flow: st.Flow = .{},
-    dirty: st.Dirty = .{},
+    dirty: frameflow.Damage = .{},
+    /// The frame being cut: its damage rects, and the bands of the one
+    /// at `frame_next - 1`; null `bands` means no frame in progress.
+    frame: [frameflow.Damage.MAX_RECTS]Rect = undefined,
+    frame_n: usize = 0,
+    frame_next: usize = 0,
     bands: ?st.Bands = null,
     /// At least one band of the frame in `bands` is already queued, so
     /// that frame must be ENDED before anything resets the surface.
@@ -286,7 +293,7 @@ pub const Stream = struct {
     }
 
     /// Paint damage in surface pixels.
-    pub fn damage(self: *Stream, r: st.Rect) void {
+    pub fn damage(self: *Stream, r: Rect) void {
         self.dirty.add(r);
     }
 
@@ -381,7 +388,7 @@ pub const Stream = struct {
                 }
                 self.authed = true;
                 if (self.audio_slot) |slot| audio.flush(slot);
-                self.dirty = .{};
+                self.dirty.clear();
                 self.announced = null;
                 self.cursor_pending = true;
                 continue;
@@ -461,8 +468,7 @@ pub const Stream = struct {
                 self.announced = sf;
                 self.bands = null;
                 self.frame_open = false;
-                self.dirty = .{};
-                self.dirty.add(.{ .x = 0, .y = 0, .w = sf.pixel_w, .h = sf.pixel_h });
+                self.dirty.full(sf.pixel_w, sf.pixel_h);
             }
         }
         if (self.cursor_pending) {
@@ -477,16 +483,24 @@ pub const Stream = struct {
         if (surf == null) return;
         if (self.bands == null) {
             if (!self.flow.canSend()) return;
-            const d = (self.dirty.take() orelse return).clip(sf.pixel_w, sf.pixel_h);
-            if (d.empty()) return;
-            self.bands = st.Bands.init(d);
+            const rects = self.dirty.take(sf.pixel_w, sf.pixel_h, &self.frame);
+            if (rects.len == 0) return;
+            self.frame_n = rects.len;
+            self.frame_next = 1;
+            self.bands = st.Bands.init(rects[0]);
         }
-        const bands = &self.bands.?;
-        while (bands.peek()) |b| {
-            const dst = self.reserve(st.damageLen(b)) orelse return;
-            src.compose(src.ctx, self.view, b, st.encodeDamageHead(dst, b));
-            bands.advance();
-            self.frame_open = true;
+        // One band run per damage rect, all in this one frame.
+        while (true) {
+            const bands = &self.bands.?;
+            while (bands.peek()) |b| {
+                const dst = self.reserve(st.damageLen(b)) orelse return;
+                src.compose(src.ctx, self.view, b, st.encodeDamageHead(dst, b));
+                bands.advance();
+                self.frame_open = true;
+            }
+            if (self.frame_next == self.frame_n) break;
+            self.bands = st.Bands.init(self.frame[self.frame_next]);
+            self.frame_next += 1;
         }
         const dst = self.reserve(st.FRAME_END_LEN) orelse return;
         st.encodeFrameEnd(dst[0..st.FRAME_END_LEN], self.flow.sent());
@@ -558,7 +572,7 @@ const Fake = struct {
         return self.surf;
     }
 
-    fn compose(_: *anyopaque, _: u32, r: st.Rect, dst: []u8) void {
+    fn compose(_: *anyopaque, _: u32, r: Rect, dst: []u8) void {
         var i: usize = 0;
         for (0..r.h) |y| for (0..r.w) |x| {
             dst[i] = @truncate(r.x + x);
@@ -683,7 +697,7 @@ test "stream: auth, first full frame, two-frame window, held release, bad token"
     try t.expectEqual(@as(u64, 1), std.mem.readInt(u64, fe1.body[0..8], .little));
 
     // Two frames may be in flight, the third waits for an ACK and then
-    // carries the UNION of what was damaged meanwhile.
+    // carries what was damaged meanwhile, near rects merged.
     s.damage(.{ .x = 0, .y = 0, .w = 1, .h = 1 });
     s.service(fake.source(), 3);
     s.damage(.{ .x = 1, .y = 1, .w = 1, .h = 1 });
@@ -702,7 +716,7 @@ test "stream: auth, first full frame, two-frame window, held release, bad token"
     rd.pull(fd);
     const d3 = rd.next().?;
     try t.expectEqual(@as(u8, 3), d3.tag);
-    try t.expectEqual(st.Rect{ .x = 1, .y = 1, .w = 6, .h = 3 }, st.Rect{
+    try t.expectEqual(Rect{ .x = 1, .y = 1, .w = 6, .h = 3 }, Rect{
         .x = std.mem.readInt(u32, d3.body[0..4], .little),
         .y = std.mem.readInt(u32, d3.body[4..8], .little),
         .w = std.mem.readInt(u32, d3.body[8..12], .little),
@@ -755,6 +769,50 @@ test "stream: auth, first full frame, two-frame window, held release, bad token"
     defer s3.deinit();
     s3.service(fake.source(), @import("protocol.zig").STREAM_CONNECT_MS);
     try t.expectEqualStrings("no client authenticated in time", s3.closed.?);
+}
+
+test "stream: far-apart damage is two band runs in ONE frame, not their bounding box" {
+    var dbuf: [64]u8 = undefined;
+    const dir = try tmpDir(&dbuf);
+    defer _ = c.rmdir(@ptrCast(dir.ptr));
+    var fake: Fake = .{ .surf = .{ .pixel_w = 200, .pixel_h = 100, .logical_w = 200, .logical_h = 100 } };
+    defer fake.inputs.deinit(t.allocator);
+    defer fake.texts.deinit(t.allocator);
+    const s = try Stream.open(t.allocator, dir, 5, 1, false, 0);
+    defer s.deinit();
+    const fd = try connectTo(s.path());
+    defer _ = c.close(fd);
+    try sendFrame(fd, .auth, &s.token);
+    s.service(fake.source(), 1);
+    var rd: Reader = .{};
+    defer rd.buf.deinit(t.allocator);
+    rd.pull(fd);
+    while (rd.next()) |f| if (f.tag == 4) break;
+
+    s.damage(.{ .x = 2, .y = 3, .w = 4, .h = 5 });
+    s.damage(.{ .x = 190, .y = 90, .w = 6, .h = 7 });
+    s.service(fake.source(), 2);
+    rd.pull(fd);
+    var area: u64 = 0;
+    var bands: usize = 0;
+    while (rd.next()) |f| {
+        if (f.tag == 4) break;
+        try t.expectEqual(@as(u8, 3), f.tag);
+        const r = Rect{
+            .x = std.mem.readInt(u32, f.body[0..4], .little),
+            .y = std.mem.readInt(u32, f.body[4..8], .little),
+            .w = std.mem.readInt(u32, f.body[8..12], .little),
+            .h = std.mem.readInt(u32, f.body[12..16], .little),
+        };
+        // Each band's pixels are exactly its own rect's.
+        try t.expectEqual(@as(usize, 16 + r.area() * 4), f.body.len);
+        try t.expectEqual(@as(u8, @truncate(r.x)), f.body[16]);
+        area += r.area();
+        bands += 1;
+    } else return error.NoFrameEnd;
+    try t.expectEqual(@as(usize, 2), bands);
+    try t.expectEqual(@as(u64, 4 * 5 + 6 * 7), area);
+    try t.expect(rd.next() == null);
 }
 
 test "cursor cache: a stream starts from the view's cursor, unchanged reports cost nothing" {
