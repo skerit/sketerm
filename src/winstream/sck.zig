@@ -14,9 +14,7 @@ const build_options = @import("build_options");
 const proto = @import("proto.zig");
 const keymap = @import("keymap.zig");
 const pixcodec = @import("../wlhost/pixcodec.zig");
-const vcodec = @import("../wlhost/vcodec.zig");
-const churn = @import("../util/churn.zig");
-const content = @import("../util/content.zig");
+const surfenc = @import("../wlhost/surfenc.zig");
 const log = @import("../mux/log.zig");
 
 /// VideoToolbox H.264 encode is available (native macOS). The video
@@ -119,17 +117,12 @@ const notice_body =
 /// False = context creation failed; the caller keeps a plain card.
 extern fn sketerm_sck_render_notice(text: [*:0]const u8, w: i32, h: i32, out: [*]u8) bool;
 
-/// Per-window lossy-video state: a churn tracker + a fixed-resolution
-/// H.264 encoder (VideoToolbox), mirroring daemon.zig's Wayland
-/// VideoSurface. Hot, photographic windows route through here to
+/// Per-window lossy-video state: the shared surface encoder
+/// (wlhost/surfenc.zig, opened on VideoToolbox) plus winstream's own
+/// wire gates. Hot, photographic windows route through here to
 /// win_vtile instead of the lossless win_frame_c/win_patch_c.
 const WinVid = struct {
-    churn: churn.Tracker,
-    enc: vcodec.Encoder,
-    w: i32,
-    h: i32,
-    seq: u32 = 0,
-    needs_kf: bool = true,
+    enc: surfenc.Surface,
     /// A full lossless frame (win_frame_c) has established this window's
     /// backing buffer on the CURRENT client. The receiver DROPS a
     /// win_vtile until then (it blits into the backing, like a patch), so
@@ -142,7 +135,6 @@ const WinVid = struct {
     route_video: bool = false,
 
     fn deinit(self: *WinVid) void {
-        self.churn.deinit();
         self.enc.deinit();
     }
 };
@@ -210,7 +202,7 @@ pub const Source = struct {
         // that must be a keyframe.
         var it = self.vstate.valueIterator();
         while (it.next()) |v| {
-            v.needs_kf = true;
+            v.enc.forceKeyframe();
             v.base_sent = false;
         }
     }
@@ -314,11 +306,11 @@ pub const Source = struct {
                     }
                 },
                 1 => if (self.videoState(ev.win, ev.w, ev.h)) |vs| {
-                    vs.churn.noteDamage(0, 0, ev.w, ev.h); // whole-frame change
+                    vs.enc.noteDamage(0, 0, ev.w, ev.h); // whole-frame change
                     vs.touched = true;
                 },
                 5 => if (self.vstate.getPtr(ev.win)) |vs| {
-                    vs.churn.noteDamage(ev.x, ev.y, ev.w, ev.h);
+                    vs.enc.noteDamage(ev.x, ev.y, ev.w, ev.h);
                     vs.touched = true;
                 },
                 else => {},
@@ -333,30 +325,19 @@ pub const Source = struct {
             vs.route_video = false;
             if (!vs.touched) continue;
             vs.touched = false;
-            vs.churn.endFrame();
-            if (!vs.base_sent) continue; // no backing on the client yet → lossless
-            if (!vs.churn.hot(0, 0, vs.w, vs.h)) continue;
+            vs.enc.endFrame();
+            if (!vs.base_sent) continue; // no backing on the client yet -> lossless
+            if (!vs.enc.wantsPixels(.h264)) continue;
             var sw: i32 = 0;
             var sh: i32 = 0;
             var slen: usize = 0;
             const snap = sketerm_sck_snapshot(self.ctx, e.key_ptr.*, &sw, &sh, &slen) orelse continue;
-            if (sw != vs.w or sh != vs.h) continue; // resized mid-poll → lossless
-            const pixels = snap[0..slen];
-            if (!content.looksPhotographic(pixels, .{})) continue;
-            const res = vs.enc.encodeTile(vs.w, vs.h, pixels, vs.needs_kf) catch continue;
-            vs.needs_kf = false;
+            if (sw != vs.enc.w or sh != vs.enc.h) continue; // resized mid-poll -> lossless
             self.vblob.clearRetainingCapacity();
-            vcodec.appendTile(&self.vblob, self.allocator, .{
-                .codec = vs.enc.codec(),
-                .keyframe = res.keyframe,
-                .x = 0,
-                .y = 0,
-                .w = vs.w,
-                .h = vs.h,
-                .seq = vs.seq,
-                .payload = res.bytes,
-            }) catch continue;
-            vs.seq +%= 1;
+            switch (vs.enc.encode(&self.vblob, .h264, snap[0..slen])) {
+                .video => {},
+                .lossless, .open_failed => continue,
+            }
             try proto.appendWinVtile(out, out_allocator, e.key_ptr.*, self.vblob.items);
             vs.route_video = true;
         }
@@ -393,8 +374,7 @@ pub const Source = struct {
                 // patch-fallback). Tight w*4 stride → codec frame.
                 const d = ev.data orelse return;
                 if (ev.w <= 0 or ev.h <= 0) return;
-                const enc = pixcodec.encodeRegion(&self.sc, self.allocator, d[0..ev.len], @intCast(ev.w * 4)) catch
-                    pixcodec.Encoded{ .coder = .raw, .filter = .none, .bytes = d[0..ev.len] };
+                const enc = pixcodec.encodeOrRaw(&self.sc, self.allocator, d[0..ev.len], @intCast(ev.w * 4));
                 try proto.appendWinFrameC(out, out_allocator, ev.win, ev.w, ev.h, enc);
             },
             5 => {
@@ -403,8 +383,7 @@ pub const Source = struct {
                 // frame (kind 1) must have established.
                 const d = ev.data orelse return;
                 if (ev.w <= 0 or ev.h <= 0) return;
-                const enc = pixcodec.encodeRegion(&self.sc, self.allocator, d[0..ev.len], @intCast(ev.w * 4)) catch
-                    pixcodec.Encoded{ .coder = .raw, .filter = .none, .bytes = d[0..ev.len] };
+                const enc = pixcodec.encodeOrRaw(&self.sc, self.allocator, d[0..ev.len], @intCast(ev.w * 4));
                 try proto.appendWinPatchC(out, out_allocator, ev.win, ev.x, ev.y, ev.w, ev.h, enc);
             },
             2 => {
@@ -439,25 +418,20 @@ pub const Source = struct {
         }
     }
 
-    /// Get-or-create the per-window video state, sized to w×h. Null for odd
-    /// dims (the H.264 encoder needs even) or on encoder-open failure — the
-    /// window then stays on the lossless path.
+    /// Get-or-create the per-window video state, sized to w x h. Null for
+    /// dims no codec takes or on allocation failure: the window then stays
+    /// on the lossless path. The encoder itself opens lazily (surfenc).
     fn videoState(self: *Source, win: u32, w: i32, h: i32) ?*WinVid {
         if (comptime !have_vtenc) return null;
-        if (w <= 0 or h <= 0 or @rem(w, 2) != 0 or @rem(h, 2) != 0) return null;
+        if (!surfenc.sizeOk(w, h)) return null;
         const gop = self.vstate.getOrPut(self.allocator, win) catch return null;
-        if (!gop.found_existing or gop.value_ptr.w != w or gop.value_ptr.h != h) {
+        if (!gop.found_existing or gop.value_ptr.enc.w != w or gop.value_ptr.enc.h != h) {
             if (gop.found_existing) gop.value_ptr.deinit();
-            var tracker = churn.Tracker.init(self.allocator, @intCast(w), @intCast(h), .{}) catch {
+            const enc = surfenc.Surface.init(self.allocator, surfenc.openVtoolbox, w, h) catch {
                 _ = self.vstate.remove(win);
                 return null;
             };
-            const enc = vcodec.Encoder.initVtoolbox(self.allocator, w, h, 30) catch {
-                tracker.deinit();
-                _ = self.vstate.remove(win);
-                return null;
-            };
-            gop.value_ptr.* = .{ .churn = tracker, .enc = enc, .w = w, .h = h };
+            gop.value_ptr.* = .{ .enc = enc };
         }
         return gop.value_ptr;
     }

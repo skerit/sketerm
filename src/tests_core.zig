@@ -374,6 +374,7 @@ comptime {
     _ = @import("wlhost/protocol.zig");
     _ = @import("wlhost/track.zig");
     _ = @import("wlhost/vcodec.zig");
+    _ = @import("wlhost/surfenc.zig");
     _ = @import("wlhost/wire.zig");
     _ = @import("wlhost/zpool.zig");
 }

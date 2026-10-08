@@ -811,8 +811,7 @@ pub fn nativeAction(self: *Daemon, nv: *Native, units: *std.ArrayList(u8), msgb:
                                 const end = @min(off +| len, mirror.size);
                                 if (off < end) {
                                     const raw = mirror.ptr[off..end];
-                                    const enc = wlpixcodec.encodeRegion(sc, a, raw, stride) catch
-                                        wlpixcodec.Encoded{ .coder = .raw, .filter = .none, .bytes = raw };
+                                    const enc = wlpixcodec.encodeOrRaw(sc, a, raw, stride);
                                     if (orphan_route)
                                         try wlpipe.appendPoolUpdateS(units, a, cm.info.serial, @intCast(off), enc, @intCast(raw.len), @intCast(stride))
                                     else

@@ -41,8 +41,7 @@ const fs_boundary = @import("fs_boundary.zig");
 const build_options = @import("build_options");
 const version = @import("../version.zig");
 const wlvcodec = @import("../wlhost/vcodec.zig");
-const churnmod = @import("../util/churn.zig");
-const contentmod = @import("../util/content.zig");
+const surfenc = @import("../wlhost/surfenc.zig");
 const wsproto = @import("../winstream/proto.zig");
 const wssource = @import("../winstream/source.zig");
 const WsSource = wssource.Source;
@@ -2008,7 +2007,7 @@ pub const Native = struct {
     /// uses one pool per buffer) must feed each pool a self-consistent
     /// stream, or every other frame references a picture that decoder
     /// never saw.
-    vstate: std.AutoHashMapUnmanaged(u64, VideoSurface) = .empty,
+    vstate: std.AutoHashMapUnmanaged(u64, surfenc.Surface) = .empty,
     /// Scratch reused across commits: tight full-surface BGRA, and the
     /// encoded vcodec tile blob.
     vscratch: std.ArrayList(u8) = .empty,
@@ -2049,27 +2048,6 @@ pub const Native = struct {
     foreign_parents: std.AutoHashMapUnmanaged(u32, ForeignParent) = .empty,
 
     pub const ForeignParent = struct { conn: u32, surface: u32 };
-
-    const VideoSurface = struct {
-        churn: churnmod.Tracker,
-        /// Opened lazily, the first time the surface is hot AND
-        /// photographic, for the channel's negotiated codec; reopened
-        /// when that codec changes (a viewer joins or leaves).
-        enc: ?wlvcodec.Encoder = null,
-        /// The codec an open FAILED for at this size (e.g. below an
-        /// encoder's minimum): the surface stays lossless instead of
-        /// retrying an expensive open on every commit.
-        failed: ?wlvcodec.Codec = null,
-        w: i32,
-        h: i32,
-        seq: u32 = 0,
-        needs_kf: bool = true,
-
-        pub fn deinit(self: *VideoSurface) void {
-            self.churn.deinit();
-            if (self.enc) |*e| e.deinit();
-        }
-    };
 
     const ClipRead = struct {
         fd: c_int,
@@ -2314,7 +2292,7 @@ pub const Native = struct {
     pub fn forceSurfaceKeyframe(nv: *Native, surface: u32) void {
         var it = nv.vstate.iterator();
         while (it.next()) |e| {
-            if (e.key_ptr.* >> 32 == surface) e.value_ptr.needs_kf = true;
+            if (e.key_ptr.* >> 32 == surface) e.value_ptr.forceKeyframe();
         }
     }
 
@@ -2322,7 +2300,7 @@ pub const Native = struct {
         const codec = nv.video_codec orelse return false; // no common codec with the viewers
         const w = cm.info.width;
         const h = cm.info.height;
-        if (w <= 0 or h <= 0 or @rem(w, 2) != 0 or @rem(h, 2) != 0) return false; // codec needs even dims
+        if (!surfenc.sizeOk(w, h)) return false;
         const stride: usize = @intCast(cm.info.stride);
         const base: usize = @intCast(cm.info.offset);
         const uw: usize = @intCast(w);
@@ -2334,62 +2312,33 @@ pub const Native = struct {
         const gop = try nv.vstate.getOrPut(nv.allocator, key);
         if (!gop.found_existing or gop.value_ptr.w != w or gop.value_ptr.h != h) {
             if (gop.found_existing) gop.value_ptr.deinit();
-            const tracker = churnmod.Tracker.init(nv.allocator, @intCast(w), @intCast(h), .{}) catch {
+            gop.value_ptr.* = surfenc.Surface.init(nv.allocator, surfenc.openNegotiated, w, h) catch {
                 _ = nv.vstate.remove(key);
                 return false;
             };
-            gop.value_ptr.* = .{ .churn = tracker, .w = w, .h = h };
         }
         const vs = gop.value_ptr;
 
         // Advance churn with this commit's damage (full-width rows).
-        vs.churn.noteDamage(0, @intCast(y0), w, @intCast(y1 - y0));
-        vs.churn.endFrame();
-        if (!vs.churn.hot(0, 0, w, h)) return false;
+        vs.noteDamage(0, @intCast(y0), w, @intCast(y1 - y0));
+        vs.endFrame();
+        if (!vs.wantsPixels(codec)) return false;
 
         // Extract the whole surface tightly (drop stride padding).
         try nv.vscratch.resize(nv.allocator, uw * uh * 4);
         for (0..uh) |r| {
             @memcpy(nv.vscratch.items[r * tight ..][0..tight], mirror.ptr[base + r * stride ..][0..tight]);
         }
-        if (!contentmod.looksPhotographic(nv.vscratch.items, .{})) return false;
-
-        // The negotiated codec moved (a viewer joined/left): reopen, and
-        // the new stream starts with a keyframe.
-        if (vs.enc) |*e| {
-            if (e.codec() != codec) {
-                e.deinit();
-                vs.enc = null;
-            }
-        }
-        if (vs.enc == null) {
-            if (vs.failed == codec) return false;
-            vs.enc = wlvcodec.Encoder.init(nv.allocator, codec, w, h, 30) catch |err| {
-                log.warn("video: {s} encoder for a {d}x{d} surface failed ({s}); it stays lossless", .{ wlvcodec.codecName(codec), w, h, @errorName(err) });
-                vs.failed = codec;
-                return false;
-            };
-            vs.needs_kf = true;
-            log.info("video: streaming a {d}x{d} surface as {s}", .{ w, h, wlvcodec.codecName(codec) });
-        }
-        const enc = &vs.enc.?;
-
-        const res = enc.encodeTile(w, h, nv.vscratch.items, vs.needs_kf) catch return false;
-        vs.needs_kf = false;
 
         nv.vblob.clearRetainingCapacity();
-        wlvcodec.appendTile(&nv.vblob, nv.allocator, .{
-            .codec = enc.codec(),
-            .keyframe = res.keyframe,
-            .x = 0,
-            .y = 0,
-            .w = w,
-            .h = h,
-            .seq = vs.seq,
-            .payload = res.bytes,
-        }) catch return false;
-        vs.seq +%= 1;
-
+        switch (vs.encode(&nv.vblob, codec, nv.vscratch.items)) {
+            .lossless => return false,
+            .open_failed => |f| {
+                log.warn("video: {s} encoder for a {d}x{d} surface failed ({s}); it stays lossless", .{ wlvcodec.codecName(f.codec), w, h, @errorName(f.err) });
+                return false;
+            },
+            .video => |v| if (v.opened) log.info("video: streaming a {d}x{d} surface as {s}", .{ w, h, wlvcodec.codecName(codec) }),
+        }
         try wlpipe.appendPoolVtile(units, a, cm.info.pool, @intCast(base), @intCast(stride), nv.vblob.items);
         return true;
     }
@@ -5503,8 +5452,7 @@ pub const Daemon = struct {
                     const raw = mirror.ptr[off..][0..len];
                     var sc: wlpixcodec.Scratch = .{};
                     defer sc.deinit(self.allocator);
-                    const enc = wlpixcodec.encodeRegion(&sc, self.allocator, raw, len) catch
-                        wlpixcodec.Encoded{ .coder = .raw, .filter = .none, .bytes = raw };
+                    const enc = wlpixcodec.encodeOrRaw(&sc, self.allocator, raw, len);
                     wlpipe.appendPoolUpdateC(&units, self.allocator, pool_id, @intCast(off), enc, @intCast(len), @intCast(len)) catch {
                         ok = false;
                         break;
@@ -5531,8 +5479,7 @@ pub const Daemon = struct {
                         const raw = mirror.ptr[off..][0..len];
                         var sc: wlpixcodec.Scratch = .{};
                         defer sc.deinit(self.allocator);
-                        const enc = wlpixcodec.encodeRegion(&sc, self.allocator, raw, len) catch
-                            wlpixcodec.Encoded{ .coder = .raw, .filter = .none, .bytes = raw };
+                        const enc = wlpixcodec.encodeOrRaw(&sc, self.allocator, raw, len);
                         wlpipe.appendPoolUpdateS(&units, self.allocator, serial, @intCast(off), enc, @intCast(len), @intCast(len)) catch {
                             ok = false;
                             break;
@@ -5566,8 +5513,7 @@ pub const Daemon = struct {
                         const raw = mirror.staging[off..][0..len];
                         var sc: wlpixcodec.Scratch = .{};
                         defer sc.deinit(self.allocator);
-                        const enc = wlpixcodec.encodeRegion(&sc, self.allocator, raw, len) catch
-                            wlpixcodec.Encoded{ .coder = .raw, .filter = .none, .bytes = raw };
+                        const enc = wlpixcodec.encodeOrRaw(&sc, self.allocator, raw, len);
                         wlpipe.appendPoolUpdateC(&units, self.allocator, pool_id, @intCast(off), enc, @intCast(len), @intCast(len)) catch {
                             ok = false;
                             break;

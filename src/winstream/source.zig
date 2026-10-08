@@ -166,8 +166,7 @@ pub const Stub = struct {
                 self.frame_buf.items[i + 3] = 0xff;
             }
         }
-        const enc = pixcodec.encodeRegion(&self.sc, self.allocator, self.frame_buf.items, @intCast(self.w * 4)) catch
-            pixcodec.Encoded{ .coder = .raw, .filter = .none, .bytes = self.frame_buf.items };
+        const enc = pixcodec.encodeOrRaw(&self.sc, self.allocator, self.frame_buf.items, @intCast(self.w * 4));
         try proto.appendWinFrameC(out, out_allocator, 1, self.w, self.h, enc);
     }
 

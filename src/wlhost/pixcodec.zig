@@ -191,6 +191,12 @@ pub fn encodeRegion(s: *Scratch, a: std.mem.Allocator, pixels: []const u8, row_s
     return .{ .coder = .raw, .filter = .none, .bytes = pixels };
 }
 
+/// `encodeRegion` that never fails: any error (scratch allocation
+/// included) ships `pixels` verbatim, which every receiver decodes.
+pub fn encodeOrRaw(s: *Scratch, a: std.mem.Allocator, pixels: []const u8, row_stride: usize) Encoded {
+    return encodeRegion(s, a, pixels, row_stride) catch .{ .coder = .raw, .filter = .none, .bytes = pixels };
+}
+
 // ─── self-describing body ───────────────────────────────────────
 //
 // What both pixel carriers (pool_update_c, win_frame_c) embed. Carrying

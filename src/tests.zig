@@ -423,6 +423,7 @@ comptime {
     _ = @import("wlhost/zpool.zig");
     _ = @import("wlhost/pixcodec.zig");
     _ = @import("wlhost/vcodec.zig");
+    _ = @import("wlhost/surfenc.zig");
     _ = @import("winstream/proto.zig");
     _ = @import("winstream/source.zig");
     _ = @import("winstream/sck.zig");
