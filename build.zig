@@ -813,7 +813,7 @@ pub fn build(b: *std.Build) void {
     smoke_agents_run.step.dependOn(&install_exe.step);
     smoke_agents_run.step.dependOn(&install_mux.step);
     smoke_agents_run.setCwd(b.path("."));
-    const smoke_agents_step = b.step("smoke-agents-gui", "Sub-agent titlebar chip, tab badge and popover on the real GUI (headless, no X)");
+    const smoke_agents_step = b.step("smoke-agents-gui", "Sub-agent titlebar chip, tab badge and popover on the real GUI, once per colour theme (headless, no X)");
     smoke_agents_step.dependOn(&smoke_agents_run.step);
 
     // AT-SPI accessibility smoke — `zig build smoke-atspi` (Linux).

@@ -27,6 +27,9 @@ const platform = @import("util/platform.zig");
 const protocol = @import("ipc/protocol.zig");
 const version = @import("version.zig");
 const appdrive = @import("ipc/appdrive.zig");
+const A11yHub = @import("mux/a11yhub.zig").Hub;
+const a11ynode = @import("smoke/a11ynode.zig");
+const mcp_registry = @import("ipc/mcp_registry.zig");
 const ctlsock = @import("smoke/ctlsock.zig");
 const tcpserver = @import("smoke/tcpserver.zig");
 const editorlang_stage = @import("smoke/editorlang.zig");
@@ -156,6 +159,7 @@ fn reap(pid: c.pid_t, sig: c_int, grace_ms: u32) void {
 /// no-op there and cannot be otherwise (see its doc comment) — the
 /// sweeps, not PDEATHSIG, are what hold on macOS.
 fn teardown() void {
+    killIdleProbes();
     dkTeardown();
     themeTeardown();
     if (tor_stub_up) {
@@ -197,6 +201,10 @@ fn teardown() void {
     if (child_pid > 0) {
         reap(child_pid, c.SIGKILL, 0);
         child_pid = 0;
+    }
+    if (a11y_hub) |*hub| {
+        hub.deinit();
+        a11y_hub = null;
     }
     if (web2_pid > 0) {
         reap(web2_pid, c.SIGTERM, 2000);
@@ -736,6 +744,15 @@ pub fn main() u8 {
     const offload_lib = std.fmt.bufPrintZ(&offload_lib_buf, "{s}/offload-probe.so", .{rt}) catch return fail("offload observer path");
     if (!platform.is_macos and !prepareOffloadProbe(rt, offload_lib)) return fail("building the private GTK offload observer failed");
 
+    // The AI popovers' icon-only actions are pressed by accessible name:
+    // the runs that drive them publish the GUI's tree on a private bus,
+    // set up before the GUI (toolkits check once, at startup).
+    if (!platform.is_macos and popoverA11yRun() and @import("mux/a11yhub.zig").toolingPresent()) {
+        // dbus-broker would reuse the HOST a11y bus otherwise.
+        _ = c.setenv("ATSPI_DBUS_IMPLEMENTATION", "dbus-daemon", 1);
+        a11y_hub = A11yHub.setup(allocator, rt, "e2e") orelse return fail("could not start the private a11y bus");
+    }
+
     // Spawn the freshly-built binary with its own app id so it
     // doesn't join a running user instance via GApplication.
     const pid = c.fork();
@@ -795,7 +812,11 @@ pub fn main() u8 {
         // must isolate that too. Nothing here asserts a11y behaviour —
         // if that is ever wanted it needs its own test with its own
         // private bus (src/mux/a11yhub.zig spawns one per app session).
-        _ = c.setenv("GTK_A11Y", "none", 1);
+        // The runs that press the AI popovers' buttons have one.
+        if (a11y_hub) |*hub| {
+            _ = c.setenv("GTK_A11Y", "atspi", 1);
+            _ = c.setenv("DBUS_SESSION_BUS_ADDRESS", hub.bus_addr_z.ptr, 1);
+        } else _ = c.setenv("GTK_A11Y", "none", 1);
         if (c.getenv("SKETERM_SMOKE_E2E_KILL_IMAGES") != null or c.getenv("SKETERM_SMOKE_E2E_OFFLOAD_ONLY") != null) {
             const path: [*:0]const u8 = if (c.getenv("SKETERM_SMOKE_E2E_OFFLOAD_ONLY") != null) "zig-out/smoke-e2e-offload-wayland.log" else "zig-out/smoke-e2e-kill-wayland.log";
             const trace = c.open(path, c.O_WRONLY | c.O_CREAT | c.O_TRUNC, @as(c_uint, 0o600));
@@ -861,8 +882,16 @@ pub fn main() u8 {
         teardown();
         return 0;
     }
+    // The AI badge popover's layout alone.
+    if (c.getenv("SKETERM_SMOKE_E2E_BADGE_ONLY") != null) {
+        const app = drive orelse return fail("focused badge layout smoke has no display driver");
+        if (badgeLayoutStage(allocator, app, mainWin(app).id, rt)) |why| return failMsg(why);
+        teardown();
+        return 0;
+    }
     if (c.getenv("SKETERM_SMOKE_E2E_WATCH_ONLY") != null) {
         const app = drive orelse return fail("focused assistant-watch smoke has no display driver");
+        if (badgeLayoutStage(allocator, app, mainWin(app).id, rt)) |why| return failMsg(why);
         if (assistantChipStage(allocator, app, sock_path)) |why| return failMsg(why);
         say("assistant chip: focused embedded-app watch stage passed");
         if (assistantLocalTermStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
@@ -1316,6 +1345,7 @@ pub fn main() u8 {
         if (watchAlongStage(allocator, app, sock_path)) |why| return failMsg(why);
         say("watch-along: driver attach raised the accent indicator, detach retired it, and a read-only watch pane showed the view-only chip");
 
+        if (badgeLayoutStage(allocator, app, mainWin(app).id, rt)) |why| return failMsg(why);
         if (assistantChipStage(allocator, app, sock_path)) |why| return failMsg(why);
         say("assistant chip: an isolated MCP app raised the tab-bar chip, Watch forced a closable view-only tab under app_view=window with the app EMBEDDED, and closing it left the app alive");
         if (assistantLocalTermStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
@@ -3688,18 +3718,7 @@ fn assistantChipStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_pat
     // and click it by its own window id, never through the toplevel.
     const pop_id = waitPopup(app, true, 10_000) orelse
         return "the assistant chip opened no popover surface";
-    const watch = waitOcrWordCenter(allocator, app, pop_id, "Watch", 10_000) orelse {
-        if (app.screenshotPng(pop_id, 0, null, 0)) |shot| {
-            defer allocator.free(shot.png);
-            writePng("zig-out/smoke-e2e-assistant-nopopover.png", shot.png);
-        } else |_| {}
-        return "the assistant popover showed no Watch button (see zig-out/smoke-e2e-assistant-nopopover.png)";
-    };
-    if (app.screenshotPng(pop_id, 0, null, 0)) |shot| {
-        defer allocator.free(shot.png);
-        writePng("zig-out/smoke-e2e-assistant-popover.png", shot.png);
-    } else |_| {}
-    app.click(pop_id, watch.x, watch.y, 1) catch return "clicking Watch failed";
+    if (pressNamed(allocator, app, "Watch ", pop_id, "zig-out/smoke-e2e-assistant-popover.png", 10_000)) |why| return why;
     var waited: u32 = 0;
     var tabs_now: usize = tabs_before;
     while (waited < 15_000) : (waited += 250) {
@@ -3997,11 +4016,9 @@ fn assistantLocalTermStage(allocator: std.mem.Allocator, app: *appdrive.App, soc
     if (openPopup(app) != null) return "a popup was already open before the chip click";
     app.click(win_id, chip.x + chip.w / 2, chip.y + chip.h / 2, 1) catch return "clicking the assistant chip failed";
     const pop_id = waitPopup(app, true, 10_000) orelse return "the assistant chip opened no popover";
-    const watch = waitOcrRowAction(allocator, app, pop_id, agent, "Watch", 15_000) orelse {
-        shotTo(allocator, app, pop_id, "zig-out/smoke-e2e-localterm-popover.png");
-        return whyf("no Watch button on the local {s} row (see zig-out/smoke-e2e-localterm-popover.png)", .{agent});
-    };
-    app.click(pop_id, watch.x, watch.y, 1) catch return "clicking Watch failed";
+    var watch_name_buf: [96]u8 = undefined;
+    const watch_name = std.fmt.bufPrint(&watch_name_buf, "Watch {s} (", .{agent}) catch return "watch name";
+    if (pressNamed(allocator, app, watch_name, pop_id, "zig-out/smoke-e2e-localterm-popover.png", 15_000)) |why| return why;
     const pane = waitNewPaneText(allocator, sock_path, keep_ids[0..keep_n], &.{}, "manual mode on", 30_000) orelse {
         shotTo(allocator, app, win_id, "zig-out/smoke-e2e-localterm-watch.png");
         return whyf("Watch opened no pane showing the local {s} (see zig-out/smoke-e2e-localterm-watch.png)", .{agent});
@@ -4109,14 +4126,7 @@ fn assistantWebWatchStage(allocator: std.mem.Allocator, app: *appdrive.App, sock
         defer allocator.free(shot.png);
         writePng("zig-out/smoke-e2e-webwatch-menu.png", shot.png);
     } else |_| {}
-    const watch = waitOcrWordCenter(allocator, app, pop_id, "Watch", 10_000) orelse {
-        if (app.screenshotPng(pop_id, 0, null, 0)) |shot| {
-            defer allocator.free(shot.png);
-            writePng("zig-out/smoke-e2e-webwatch-nopopover.png", shot.png);
-        } else |_| {}
-        return "the assistant popover showed no Watch button (see zig-out/smoke-e2e-webwatch-nopopover.png)";
-    };
-    app.click(pop_id, watch.x, watch.y, 1) catch return "clicking Watch failed";
+    if (pressNamed(allocator, app, "Watch Login", pop_id, "zig-out/smoke-e2e-webwatch-popover.png", 10_000)) |why| return why;
 
     // A WEB tab: a face whose address bar carries the page's url.
     var waited: u32 = 0;
@@ -4216,8 +4226,7 @@ fn assistantWebWatchStage(allocator: std.mem.Allocator, app: *appdrive.App, sock
     const readonly_chip = waitAssistantChip(app, win_id, true, 10_000) orelse return "no badge for returning to Watch";
     app.click(win_id, readonly_chip.x + readonly_chip.w / 2, readonly_chip.y + readonly_chip.h / 2, 1) catch return "opening Watch menu failed";
     const readonly_pop = waitPopup(app, true, 10_000) orelse return "no Watch menu";
-    const readonly_button = waitOcrWordCenter(allocator, app, readonly_pop, "Watch", 10_000) orelse return "no Watch action";
-    app.click(readonly_pop, readonly_button.x, readonly_button.y, 1) catch return "selecting Watch failed";
+    if (pressNamed(allocator, app, "Watch Login", readonly_pop, "zig-out/smoke-e2e-webwatch-readonly-menu.png", 10_000)) |why| return why;
     _ = waitPopup(app, false, 5_000);
     pumpFor(app, 500);
     app.click(win_id, red.x + red.w / 2, red.y + red.h / 2, 1) catch return "clicking after Watch failed";
@@ -4317,8 +4326,7 @@ fn assistantWebWatchStage(allocator: std.mem.Allocator, app: *appdrive.App, sock
         } else |_| {}
         return whyf("no move popover after clicking {d:.0},{d:.0}", .{ move_chip.x + move_chip.w / 2, move_chip.y + move_chip.h / 2 });
     };
-    const beside = waitOcrWordCenter(allocator, app, move_pop, "Beside", 10_000) orelse return "the badge offered no Beside placement";
-    app.click(move_pop, beside.x, beside.y, 1) catch return "clicking Beside failed";
+    if (pressNamed(allocator, app, "Show beside pane Login", move_pop, "zig-out/smoke-e2e-webwatch-move-menu.png", 10_000)) |why| return why;
     if (waitColorBox(app, win_id, isLime, 15_000) == null) {
         if (app.screenshotPng(win_id, 0, null, 0)) |shot| {
             defer allocator.free(shot.png);
@@ -17780,6 +17788,194 @@ fn ocrContains(hay: []const u8, needle: []const u8) bool {
     return false;
 }
 
+// -- the AI popovers, driven by accessible name --
+//
+// Their actions are icon-only buttons named `<verb> <row title>`
+// (`assistants.accessibleName`), so there is no word to OCR: the GUI
+// publishes its tree on a private accessibility bus in the runs that
+// drive them, and the rig presses buttons through AT-SPI.
+
+/// The private a11y bus of a run that drives the AI popovers; null in
+/// every other run (the GUI then keeps GTK_A11Y=none).
+var a11y_hub: ?A11yHub = null;
+
+/// Whether this run includes the assistant stages: a focused watch run,
+/// or the full run (no `SKETERM_SMOKE_E2E_*_ONLY` selector at all).
+fn popoverA11yRun() bool {
+    for ([_][*:0]const u8{ "SKETERM_SMOKE_E2E_WATCH_ONLY", "SKETERM_SMOKE_E2E_WEB_WATCH_ONLY", "SKETERM_SMOKE_E2E_REMOTE_WEB_WATCH_ONLY", "SKETERM_SMOKE_E2E_BADGE_ONLY" }) |key| {
+        if (c.getenv(key) != null) return true;
+    }
+    var i: usize = 0;
+    while (std.c.environ[i]) |entry| : (i += 1) {
+        const kv = std.mem.span(entry);
+        const key = kv[0 .. std.mem.indexOfScalar(u8, kv, '=') orelse kv.len];
+        if (std.mem.startsWith(u8, key, "SKETERM_SMOKE_E2E_") and std.mem.endsWith(u8, key, "_ONLY")) return false;
+    }
+    return true;
+}
+
+/// One dump of the GUI's accessibility tree (caller frees).
+fn a11yDump(allocator: std.mem.Allocator, app: *appdrive.App) ?[]u8 {
+    const hub = if (a11y_hub) |*h| h else return null;
+    app.drain();
+    return hub.treeJson(allocator);
+}
+
+/// Press the sensitive button whose accessible name starts with
+/// `name`, through AT-SPI's default action; `shot` saves the popover
+/// `pop` first as evidence. @return why not, or null.
+fn pressNamed(allocator: std.mem.Allocator, app: *appdrive.App, name: []const u8, pop: u32, shot: [*:0]const u8, budget_ms: u32) ?[]const u8 {
+    if (a11y_hub == null) return "this run has no private accessibility bus (dbus-daemon or at-spi2-registryd is not installed)";
+    const deadline = clock.nowMs() + budget_ms;
+    var insensitive = false;
+    while (clock.nowMs() < deadline) {
+        if (a11yDump(allocator, app)) |json| {
+            defer allocator.free(json);
+            var hits: [8]a11ynode.Hit = undefined;
+            const n = @min(a11ynode.scan(json, name, .prefix, a11ynode.ROLE_PUSH_BUTTON, &hits), hits.len);
+            for (hits[0..n]) |hit| {
+                if (hit.states_lo & a11ynode.STATE_SENSITIVE_BIT == 0) {
+                    insensitive = true;
+                    continue;
+                }
+                shotTo(allocator, app, pop, shot);
+                if (a11y_hub.?.doAction(allocator, hit.id, 0)) return null;
+                return whyf("pressing \"{s}\" over AT-SPI failed", .{hit.name});
+            }
+        }
+        pumpFor(app, 250);
+    }
+    shotTo(allocator, app, pop, shot);
+    if (insensitive) return whyf("the button \"{s}...\" stayed insensitive (see {s})", .{ name, std.mem.span(shot) });
+    return whyf("no button named \"{s}...\" in the accessibility tree (see {s})", .{ name, std.mem.span(shot) });
+}
+
+/// Instances the badge layout stage registers: live servers whose
+/// daemon never runs, i.e. idle ones, all with one name.
+const IDLE_PROBES = 24;
+const IDLE_PROBE_NAME = "p8-idle";
+var idle_probe_pids: [IDLE_PROBES]c.pid_t = @splat(0);
+
+fn spawnIdleProbes(rt: []const u8) bool {
+    for (&idle_probe_pids, 0..) |*slot, i| {
+        var sock_buf: [256]u8 = undefined;
+        const sock = std.fmt.bufPrint(&sock_buf, "{s}/p8-idle-{d}/mux.sock", .{ rt, i }) catch return false;
+        const pid = c.fork();
+        if (pid < 0) return false;
+        if (pid == 0) {
+            platform.dieWithParent();
+            @import("util/lifetime.zig").dropWriteEnd();
+            // Held until SIGKILL: the record is a live server whose
+            // private daemon was never started.
+            var lease = mcp_registry.Lease.acquire(std.heap.c_allocator, .{ .mode = .isolated, .name = IDLE_PROBE_NAME, .mux_socket = sock }) catch c._exit(3);
+            _ = &lease;
+            while (true) _ = c.pause();
+        }
+        slot.* = pid;
+    }
+    return true;
+}
+
+fn killIdleProbes() void {
+    for (&idle_probe_pids) |*pid| {
+        if (pid.* > 0) reap(pid.*, c.SIGKILL, 0);
+        pid.* = 0;
+    }
+}
+
+/// The AI badge popover's layout, read through its accessibility tree
+/// and its surface size: idle instances collapse into ONE line that
+/// starts closed, no instance heading repeats, and the open list stays
+/// within the scroll cap (about 60% of the window) however long it is.
+fn badgeLayoutStage(allocator: std.mem.Allocator, app: *appdrive.App, win_id: u32, rt: []const u8) ?[]const u8 {
+    if (a11y_hub == null) return "this run has no private accessibility bus (dbus-daemon or at-spi2-registryd is not installed)";
+    if (!spawnIdleProbes(rt)) return "could not start the idle-instance probes";
+    defer killIdleProbes();
+    const chip = waitAssistantChip(app, win_id, true, 30_000) orelse {
+        shotTo(allocator, app, win_id, "zig-out/smoke-e2e-badge-nochip.png");
+        return "the idle instances raised no assistant chip (see zig-out/smoke-e2e-badge-nochip.png)";
+    };
+    // Let the first polls classify every probe (3 s tick).
+    pumpFor(app, 4_000);
+    if (openPopup(app) != null) return "a popup was already open before the badge layout stage";
+    app.click(win_id, chip.x + chip.w / 2, chip.y + chip.h / 2, 1) catch return "clicking the assistant chip failed";
+    const pop_id = waitPopup(app, true, 10_000) orelse return "the assistant chip opened no popover";
+    const shot = "zig-out/smoke-e2e-badge-collapsed.png";
+    var want_buf: [32]u8 = undefined;
+    const want = std.fmt.bufPrint(&want_buf, "{d} idle", .{IDLE_PROBES}) catch return "summary text";
+    var expander_id: ?[]u8 = null;
+    defer if (expander_id) |id| allocator.free(id);
+    const deadline = clock.nowMs() + 20_000;
+    while (clock.nowMs() < deadline and expander_id == null) {
+        if (a11yDump(allocator, app)) |json| {
+            defer allocator.free(json);
+            // One heading per instance, never two alike.
+            var heads: [64]a11ynode.Hit = undefined;
+            const nh = @min(a11ynode.scan(json, "", .prefix, a11ynode.ROLE_HEADING, &heads), heads.len);
+            for (heads[0..nh], 0..) |h, i| {
+                for (heads[0..i]) |prev| if (std.mem.eql(u8, prev.name, h.name)) {
+                    shotTo(allocator, app, pop_id, shot);
+                    return whyf("the badge repeats the instance heading \"{s}\" (see {s})", .{ h.name, shot });
+                };
+                if (std.mem.startsWith(u8, h.name, IDLE_PROBE_NAME)) {
+                    shotTo(allocator, app, pop_id, shot);
+                    return whyf("idle instance \"{s}\" got a heading of its own instead of the collapsed line (see {s})", .{ h.name, shot });
+                }
+            }
+            if (a11ynode.first(json, want, .prefix, null)) |hit| {
+                if (hit.states_lo & a11ynode.STATE_EXPANDED_BIT != 0) {
+                    shotTo(allocator, app, pop_id, shot);
+                    return whyf("the \"{s}\" line starts expanded (see {s})", .{ hit.name, shot });
+                }
+                expander_id = allocator.dupe(u8, hit.id) catch return "oom";
+            }
+        }
+        if (expander_id == null) pumpFor(app, 250);
+    }
+    shotTo(allocator, app, pop_id, shot);
+    const id = expander_id orelse return whyf("no collapsed \"{s}...\" line in the badge (see {s})", .{ want, shot });
+    const collapsed_h = popupHeight(app, pop_id);
+    if (!a11y_hub.?.doAction(allocator, id, 0)) return "expanding the idle line over AT-SPI failed";
+    _ = app.waitWindowSettle(pop_id, 400, 5_000);
+    pumpFor(app, 500);
+    const open_shot = "zig-out/smoke-e2e-badge-expanded.png";
+    shotTo(allocator, app, pop_id, open_shot);
+    // Expanded, the probes' names are listed, each told apart by pid.
+    if (a11yDump(allocator, app)) |json| {
+        defer allocator.free(json);
+        var named: [IDLE_PROBES + 2]a11ynode.Hit = undefined;
+        const n = a11ynode.scan(json, IDLE_PROBE_NAME ++ " (pid ", .prefix, a11ynode.ROLE_LABEL, &named);
+        if (n != IDLE_PROBES) return whyf("expanded, the idle line lists {d} probes by pid, not {d} (see {s})", .{ n, IDLE_PROBES, open_shot });
+    } else return "the accessibility tree could not be read after expanding";
+    const win_h = windowHeight(app, win_id);
+    const open_h = popupHeight(app, pop_id);
+    // The list is capped at 60% of the window; the popover adds its
+    // margins, arrow and the help line under the list.
+    const cap = @divTrunc(win_h * 3, 5) + 120;
+    if (win_h <= 0 or open_h <= collapsed_h or open_h > cap)
+        return whyf("the expanded popover is {d}px (collapsed {d}px) in a {d}px window, cap {d}px (see {s})", .{ open_h, collapsed_h, win_h, cap, open_shot });
+    _ = app.pressKey(pop_id, "Escape") catch {};
+    if (waitPopup(app, false, 5_000) == null) return "the badge popover did not close on Escape";
+    killIdleProbes();
+    // The probes' records go stale with them; the chip retires.
+    if (waitAssistantChip(app, win_id, false, 30_000) == null) return "the chip outlived the idle probes";
+    // Off the chip's spot: the next stage's chip would show its tooltip
+    // under a resting pointer, an open popup surface of its own.
+    _ = app.moveMouse(win_id, 40, @as(f64, @floatFromInt(windowHeight(app, win_id))) / 2) catch {};
+    _ = waitPopup(app, false, 5_000);
+    say(std.fmt.bufPrint(&why_buf, "badge layout: {d} idle instances collapsed into one closed line with no repeated heading; expanded to {d}px, within the {d}px cap of a {d}px window", .{ IDLE_PROBES, open_h, cap, win_h }) catch "badge layout");
+    return null;
+}
+
+fn popupHeight(app: *appdrive.App, id: u32) i32 {
+    for (app.windows.items) |w| if (w.id == id) return w.h;
+    return 0;
+}
+
+fn windowHeight(app: *appdrive.App, id: u32) i32 {
+    return popupHeight(app, id);
+}
+
 /// The OCR word `action` on the same row as the first word containing
 /// `row` (nearest vertically), from one recognition pass.
 fn waitOcrRowAction(allocator: std.mem.Allocator, app: *appdrive.App, win_id: u32, row: []const u8, action: []const u8, timeout_ms: i64) ?OcrPoint {
@@ -17980,12 +18176,7 @@ fn assistantRemoteWebWatchStage(allocator: std.mem.Allocator, app: *appdrive.App
     if (openPopup(app) != null) return "a popup was already open before the remote web chip click";
     app.click(win_id, chip.x + chip.w / 2, chip.y + chip.h / 2, 1) catch return "clicking the assistant chip failed";
     const pop_id = waitPopup(app, true, 10_000) orelse return "the assistant chip opened no popover";
-    const beside = waitOcrWordCenter(allocator, app, pop_id, "beside", 20_000) orelse {
-        shotTo(allocator, app, pop_id, "zig-out/smoke-e2e-rwatch-popover.png");
-        return "the badge offered no Show beside pane for the remote browser (see zig-out/smoke-e2e-rwatch-popover.png)";
-    };
-    shotTo(allocator, app, pop_id, "zig-out/smoke-e2e-rwatch-popover.png");
-    app.click(pop_id, beside.x, beside.y, 1) catch return "clicking Show beside pane failed";
+    if (pressNamed(allocator, app, "Show beside pane ", pop_id, "zig-out/smoke-e2e-rwatch-popover.png", 20_000)) |why| return why;
 
     var web_pane: u32 = 0;
     {
@@ -18324,9 +18515,8 @@ fn assistantRemoteStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_p
         }
     }
     shotTo(allocator, app, pop_id, "zig-out/smoke-e2e-remote-popover.png");
-    const watch = waitOcrRowAction(allocator, app, pop_id, agent_a, "Watch", 15_000) orelse
-        return whyf("no Watch button on {s}'s row (see zig-out/smoke-e2e-remote-popover.png)", .{agent_a});
-    app.click(pop_id, watch.x, watch.y, 1) catch return "clicking Watch failed";
+    const watch_name = std.fmt.allocPrint(arena, "Watch {s} (", .{agent_a}) catch return "oom";
+    if (pressNamed(allocator, app, watch_name, pop_id, "zig-out/smoke-e2e-remote-popover.png", 15_000)) |why| return why;
     const watch_pane = waitNewPaneText(allocator, sock_path, keep_ids[0..keep_n], skip_ids[0..skip_n], "manual mode on", 30_000) orelse {
         shotTo(allocator, app, win_id, "zig-out/smoke-e2e-remote-watch.png");
         return whyf("Watch opened no pane showing {s}'s screen (see zig-out/smoke-e2e-remote-watch.png)", .{agent_a});
@@ -18340,11 +18530,8 @@ fn assistantRemoteStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_p
     // ── Take control of the agent placed on hostb, through hosta ──
     app.click(win_id, chip.x + chip.w / 2, chip.y + chip.h / 2, 1) catch return "clicking the assistant chip again failed";
     pop_id = waitPopup(app, true, 10_000) orelse return "the assistant chip opened no popover the second time";
-    const take = waitOcrRowAction(allocator, app, pop_id, agent_b, "control", 15_000) orelse {
-        shotTo(allocator, app, pop_id, "zig-out/smoke-e2e-remote-popover2.png");
-        return whyf("no Take control button on {s}'s row (see zig-out/smoke-e2e-remote-popover2.png)", .{agent_b});
-    };
-    app.click(pop_id, take.x, take.y, 1) catch return "clicking Take control failed";
+    const take_name = std.fmt.allocPrint(arena, "Take control {s} (", .{agent_b}) catch return "oom";
+    if (pressNamed(allocator, app, take_name, pop_id, "zig-out/smoke-e2e-remote-popover2.png", 15_000)) |why| return why;
     const ctl_pane = waitNewPaneText(allocator, sock_path, keep_ids[0..keep_n], skip_ids[0..skip_n], "manual mode on", 40_000) orelse {
         shotTo(allocator, app, win_id, "zig-out/smoke-e2e-remote-control.png");
         return whyf("Take control opened no pane showing {s}'s screen (see zig-out/smoke-e2e-remote-control.png)", .{agent_b});

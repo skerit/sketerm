@@ -37,6 +37,7 @@ const platform = @import("util/platform.zig");
 const appdrive = @import("ipc/appdrive.zig");
 const ctlsock = @import("smoke/ctlsock.zig");
 const A11yHub = @import("mux/a11yhub.zig").Hub;
+const a11ynode = @import("smoke/a11ynode.zig");
 
 const DISPLAY_SESSION = "a11y-display";
 const DISPLAY_TTL = "900";
@@ -99,20 +100,6 @@ const CliResult = smokecli.CliResult;
 const CreateReply = smokecli.CreateReply;
 const runDisplayCli = smokecli.runDisplayCli;
 
-/// The bus/registry binaries this smoke depends on. Absent = SKIP, not
-/// FAIL: a11y infrastructure is an optional install on minimal hosts.
-fn busToolingPresent() bool {
-    if (c.system("command -v dbus-daemon >/dev/null 2>&1") != 0) return false;
-    const candidates = [_][*:0]const u8{
-        "/usr/lib/at-spi2-registryd",
-        "/usr/libexec/at-spi2-registryd",
-        "/usr/lib/at-spi2-core/at-spi2-registryd",
-        "/usr/lib64/at-spi2-registryd",
-    };
-    for (candidates) |p| if (c.access(p, c.X_OK) == 0) return true;
-    return false;
-}
-
 pub fn main() u8 {
     var gpa_state: std.heap.DebugAllocator(.{}) = .{};
     defer _ = gpa_state.deinit();
@@ -123,7 +110,7 @@ pub fn main() u8 {
         say("SKIP: AT-SPI is Linux-only (macOS is covered by smoke-a11y)");
         return 0;
     }
-    if (!busToolingPresent()) {
+    if (!@import("mux/a11yhub.zig").toolingPresent()) {
         say("SKIP: dbus-daemon / at-spi2-registryd not installed");
         return 0;
     }
@@ -545,8 +532,6 @@ const STATE_EDITABLE_BIT: u32 = 1 << 7;
 /// that maps `GTK_ACCESSIBLE_ROLE_TEXT_BOX` somewhere else says so
 /// instead of just timing out.
 fn findNamedNode(allocator: std.mem.Allocator, name: []const u8, want_role: u32, budget_ms: u32) ?NodeRef {
-    var needle_buf: [256]u8 = undefined;
-    const needle = std.fmt.bufPrint(&needle_buf, ",\"name\":\"{s}\"", .{name}) catch return null;
     var seen: [8]u32 = undefined;
     var n_seen: usize = 0;
     var waited: u32 = 0;
@@ -554,33 +539,15 @@ fn findNamedNode(allocator: std.mem.Allocator, name: []const u8, want_role: u32,
         if (drive) |app| app.drain();
         if (hub.?.treeJson(allocator)) |json| {
             defer allocator.free(json);
-            var from: usize = 0;
-            while (std.mem.indexOfPos(u8, json, from, needle)) |at| {
-                from = at + needle.len;
-                const id_key = "{\"id\":\"";
-                const istart = std.mem.lastIndexOf(u8, json[0..at], id_key) orelse continue;
-                const vstart = istart + id_key.len;
-                const vend = std.mem.indexOfScalarPos(u8, json, vstart, '"') orelse continue;
-                const role_key = "\",\"role\":";
-                var role: u32 = 0;
-                if (std.mem.indexOfPos(u8, json, vend, role_key)) |rk| {
-                    var i = rk + role_key.len;
-                    while (i < json.len and json[i] >= '0' and json[i] <= '9') : (i += 1)
-                        role = role * 10 + (json[i] - '0');
-                }
-                if (role == want_role) {
-                    const st_key = ",\"states\":[";
-                    var st_lo: u32 = 0;
-                    if (std.mem.indexOfPos(u8, json, vend, st_key)) |sk| {
-                        var i = sk + st_key.len;
-                        while (i < json.len and json[i] >= '0' and json[i] <= '9') : (i += 1)
-                            st_lo = st_lo * 10 + (json[i] - '0');
-                    }
-                    const id = allocator.dupe(u8, json[vstart..vend]) catch return null;
-                    return .{ .id = id, .role = role, .states_lo = st_lo };
+            var hits: [8]a11ynode.Hit = undefined;
+            const n = @min(a11ynode.scan(json, name, .exact, null, &hits), hits.len);
+            for (hits[0..n]) |hit| {
+                if (hit.role == want_role) {
+                    const id = allocator.dupe(u8, hit.id) catch return null;
+                    return .{ .id = id, .role = hit.role, .states_lo = hit.states_lo };
                 }
                 if (n_seen < seen.len) {
-                    seen[n_seen] = role;
+                    seen[n_seen] = hit.role;
                     n_seen += 1;
                 }
             }
@@ -597,12 +564,12 @@ fn findNamedNode(allocator: std.mem.Allocator, name: []const u8, want_role: u32,
 /// this rig tells "greyed out" from "absent", which is the difference
 /// between a menu row that explains itself and one that silently does
 /// nothing.
-const STATE_SENSITIVE_BIT: u32 = 1 << 24;
+const STATE_SENSITIVE_BIT = a11ynode.STATE_SENSITIVE_BIT;
 
 /// ATSPI_ROLE_PUSH_BUTTON. The pane menu builds its rows as
 /// GtkButtons (GtkPopoverMenu cannot render per-item icons), so every
 /// row is a push button in the tree.
-const ROLE_PUSH_BUTTON: u32 = 43;
+const ROLE_PUSH_BUTTON = a11ynode.ROLE_PUSH_BUTTON;
 
 /// A context-menu row, located by its visible label.
 fn findMenuRow(allocator: std.mem.Allocator, label: []const u8, budget_ms: u32) ?NodeRef {

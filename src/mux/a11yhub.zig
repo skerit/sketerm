@@ -22,6 +22,22 @@ const REGISTRY_ROOT = "/org/a11y/atspi/accessible/root";
 const MAX_NODES = 4000;
 const MAX_DEPTH = 40;
 
+/// at-spi2-registryd is not on $PATH; these are the usual install dirs.
+const REGISTRYD_PATHS = [_][*:0]const u8{
+    "/usr/lib/at-spi2-registryd",
+    "/usr/libexec/at-spi2-registryd",
+    "/usr/lib/at-spi2-core/at-spi2-registryd",
+    "/usr/lib64/at-spi2-registryd",
+};
+
+/// Whether a `Hub` can be set up here (dbus-daemon and at-spi2-registryd
+/// installed); a rig without them skips its a11y assertions.
+pub fn toolingPresent() bool {
+    if (c.system("command -v dbus-daemon >/dev/null 2>&1") != 0) return false;
+    for (REGISTRYD_PATHS) |p| if (c.access(p, c.X_OK) == 0) return true;
+    return false;
+}
+
 pub const Hub = struct {
     allocator: std.mem.Allocator,
     /// Session bus socket path (also the child's
@@ -199,12 +215,6 @@ pub const Hub = struct {
     /// ("unix:path=..."). Not on $PATH — try the usual install dirs.
     /// Returns -1 if none exists (a11y then just yields empty trees).
     fn spawnRegistry(addr: [:0]const u8, rt_dir: [:0]const u8) c_int {
-        const candidates = [_][*:0]const u8{
-            "/usr/lib/at-spi2-registryd",
-            "/usr/libexec/at-spi2-registryd",
-            "/usr/lib/at-spi2-core/at-spi2-registryd",
-            "/usr/lib64/at-spi2-registryd",
-        };
         const pid = c.fork();
         if (pid < 0) return -1;
         if (pid == 0) {
@@ -217,7 +227,7 @@ pub const Hub = struct {
             _ = c.setenv("ATSPI_DBUS_IMPLEMENTATION", "dbus-daemon", 1);
             _ = c.setenv("XDG_RUNTIME_DIR", rt_dir.ptr, 1);
             const argv = [_:null]?[*:0]const u8{ "at-spi2-registryd", null };
-            for (candidates) |path| _ = c.execv(path, @ptrCast(&argv));
+            for (REGISTRYD_PATHS) |path| _ = c.execv(path, @ptrCast(&argv));
             c._exit(127);
         }
         return pid;

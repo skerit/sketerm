@@ -15,7 +15,12 @@
 //!   3. clicking the chip opens the popover listing both agent ids;
 //!   4. removing the record hides the chip, the badge and the titlebar.
 //!
-//! Screenshots of every state land in zig-out/smoke-agents-gui-*.png.
+//! The chip's and the popover's text must also READ: each word's glyphs
+//! against the background behind them, at WCAG AA. The whole rig runs
+//! once per `Theme` (libadwaita light, dark, and GTK's built-in dark
+//! theme that `GTK_THEME` selects), each in its own re-exec.
+//!
+//! Screenshots of every state land in zig-out/smoke-agents-gui-<theme>-*.png.
 //! Everything created here is destroyed by exact pid / session name.
 
 const std = @import("std");
@@ -100,10 +105,137 @@ fn pumpFor(app: *appdrive.App, ms: i64) void {
     while (clock.nowMs() - t0 < ms) _ = app.pumpOnce(20);
 }
 
-fn savePng(app: *appdrive.App, win_id: u32, path: [*:0]const u8) void {
+/// Save `zig-out/smoke-agents-gui-<theme>-<stem>.png`.
+fn savePng(app: *appdrive.App, win_id: u32, stem: []const u8) void {
     const png = app.screenshotPng(win_id, 1600, null, 0) catch return;
     defer g_alloc.free(png.png);
-    _ = writeFile(path, png.png);
+    var path_buf: [256]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buf, "zig-out/smoke-agents-gui-{s}-{s}.png", .{ g_theme.name(), stem }) catch return;
+    _ = writeFile(path.ptr, png.png);
+}
+
+/// The colour setup the GUI runs under (`SKETERM_SMOKE_AGENTS_THEME`):
+/// libadwaita light or dark, or GTK's built-in dark theme (`GTK_THEME`
+/// set, libadwaita's stylesheet off), which painted the chip's white
+/// pill over with a dark button image.
+const Theme = enum {
+    light,
+    dark,
+    @"gtk-dark",
+
+    fn name(self: Theme) []const u8 {
+        return @tagName(self);
+    }
+
+    const ENV = "SKETERM_SMOKE_AGENTS_THEME";
+
+    /// In the GUI child, before exec.
+    fn apply(self: Theme) void {
+        _ = c.unsetenv("GTK_THEME");
+        switch (self) {
+            .light => _ = c.setenv("ADW_DEBUG_COLOR_SCHEME", "prefer-light", 1),
+            .dark => _ = c.setenv("ADW_DEBUG_COLOR_SCHEME", "prefer-dark", 1),
+            .@"gtk-dark" => {
+                _ = c.setenv("ADW_DEBUG_COLOR_SCHEME", "prefer-dark", 1);
+                _ = c.setenv("GTK_THEME", "Adwaita:dark", 1);
+            },
+        }
+    }
+};
+var g_theme: Theme = .light;
+
+/// The least contrast a popover word's glyphs may have against the
+/// background around them (WCAG AA for body text).
+const MIN_TEXT_CONTRAST: f64 = 4.5;
+
+fn linear(v: u8) f64 {
+    const x = @as(f64, @floatFromInt(v)) / 255.0;
+    return if (x <= 0.04045) x / 12.92 else std.math.pow(f64, (x + 0.055) / 1.055, 2.4);
+}
+
+fn luminance(px: []const u8, i: usize) f64 {
+    return 0.2126 * linear(px[i]) + 0.7152 * linear(px[i + 1]) + 0.0722 * linear(px[i + 2]);
+}
+
+/// Inside one OCR word box: the background is its most common colour,
+/// the glyph core its pixel least like it. @return their WCAG contrast.
+fn boxContrast(shot: appdrive.App.RgbaShot, x0: u32, y0: u32, w: u32, h: u32) f64 {
+    var counts: std.AutoHashMapUnmanaged(u32, u32) = .empty;
+    defer counts.deinit(g_alloc);
+    var y = y0;
+    while (y < @min(y0 + h, shot.h)) : (y += 1) {
+        var x = x0;
+        while (x < @min(x0 + w, shot.w)) : (x += 1) {
+            const i = (@as(usize, y) * shot.w + x) * 4;
+            const key = @as(u32, shot.px[i]) << 16 | @as(u32, shot.px[i + 1]) << 8 | shot.px[i + 2];
+            const gop = counts.getOrPut(g_alloc, key) catch return 0;
+            gop.value_ptr.* = if (gop.found_existing) gop.value_ptr.* + 1 else 1;
+        }
+    }
+    var bg: u32 = 0;
+    var best: u32 = 0;
+    var it = counts.iterator();
+    while (it.next()) |e| if (e.value_ptr.* > best) {
+        best = e.value_ptr.*;
+        bg = e.key_ptr.*;
+    };
+    const bg_px = [4]u8{ @truncate(bg >> 16), @truncate(bg >> 8), @truncate(bg), 255 };
+    const bg_l = luminance(&bg_px, 0);
+    var most: f64 = 1;
+    y = y0;
+    while (y < @min(y0 + h, shot.h)) : (y += 1) {
+        var x = x0;
+        while (x < @min(x0 + w, shot.w)) : (x += 1) {
+            const l = luminance(shot.px, (@as(usize, y) * shot.w + x) * 4);
+            most = @max(most, (@max(l, bg_l) + 0.05) / (@min(l, bg_l) + 0.05));
+        }
+    }
+    return most;
+}
+
+/// The lowest glyph contrast among the OCR words containing any of
+/// `words` in `win_id`; null when OCR found none of them.
+fn wordsContrast(app: *appdrive.App, win_id: u32, region: ?appdrive.App.Region, words: []const []const u8) ?f64 {
+    const shot = app.snapshotRgba(win_id, region) catch return null;
+    defer g_alloc.free(shot.px);
+    const up: u32 = 3;
+    const px = png_util.upscaleRgba(g_alloc, shot.px, shot.w, shot.h, up) catch return null;
+    defer g_alloc.free(px);
+    var res = ocr.recognize(g_alloc, px, shot.w * up, shot.h * up, .{ .psm = 11 }) catch return null;
+    defer res.deinit(g_alloc);
+    var lowest: ?f64 = null;
+    for (res.words) |word| {
+        var wanted = false;
+        for (words) |needle| wanted = wanted or containsIgnoreCase(word.text, needle);
+        if (!wanted) continue;
+        const ratio = boxContrast(shot, word.x / up, word.y / up, word.w / up + 1, word.h / up + 1);
+        lowest = if (lowest) |l| @min(l, ratio) else ratio;
+    }
+    return lowest;
+}
+
+/// Re-run this executable once per `Theme`; any failure fails the rig.
+fn runEveryTheme() u8 {
+    var failed = false;
+    for (std.enums.values(Theme)) |theme| {
+        const pid = c.fork();
+        if (pid < 0) return fail("fork", .{});
+        if (pid == 0) {
+            platform.dieWithParent();
+            var name_z: [32:0]u8 = undefined;
+            _ = c.setenv(Theme.ENV, @import("util/strz.zig").copyZ(&name_z, theme.name()), 1);
+            const argv = [_:null]?[*:0]const u8{ "sketerm-smoke-agents-gui", null };
+            _ = c.execv("/proc/self/exe", @ptrCast(@constCast(&argv)));
+            c._exit(127);
+        }
+        var st: c_int = 0;
+        _ = c.waitpid(pid, &st, 0);
+        if (!(c.WIFEXITED(st) and c.WEXITSTATUS(st) == 0)) {
+            say("theme {s} FAILED", .{theme.name()});
+            failed = true;
+        }
+    }
+    return @intFromBool(failed);
 }
 
 fn near(px: []const u8, i: usize, want: [3]u8, tol: i32) bool {
@@ -263,6 +395,11 @@ pub fn main() u8 {
         say("skipped (no Wayland display sessions on macOS)", .{});
         return 0;
     }
+    // Without a theme, run this whole rig once per theme, one after
+    // another (each run owns the display session name).
+    const raw_theme = c.getenv(Theme.ENV) orelse return runEveryTheme();
+    g_theme = std.meta.stringToEnum(Theme, std.mem.span(raw_theme)) orelse return fail("unknown " ++ Theme.ENV ++ " value", .{});
+    say("theme: {s}", .{g_theme.name()});
     if (!@import("util/lifetime.zig").arm()) return fail("lifetime fence", .{});
 
     // Short isolated runtime dir: a long socket path cannot bind and the
@@ -328,6 +465,7 @@ pub fn main() u8 {
         _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
         _ = c.setenv("GTK_A11Y", "none", 1);
         _ = c.setenv("SKETERM_WELCOME", "0", 1);
+        g_theme.apply();
         const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", null };
         _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
         c._exit(127);
@@ -356,7 +494,7 @@ pub fn main() u8 {
         defer allocator.free(shot.px);
         if (barRows(shot) != null) return fail("the titlebar shows before any agent exists", .{});
     }
-    savePng(app, win_id, "zig-out/smoke-agents-gui-0-none.png");
+    savePng(app, win_id, "0-none");
 
     // ── 1. two agents working: the titlebar appears with the chip ─
     var inst_buf: [256]u8 = undefined;
@@ -370,11 +508,11 @@ pub fn main() u8 {
     }) catch |err| return fail("registry lease: {s}", .{@errorName(err)});
     publish("working", "working") catch return fail("publish", .{});
     if (!waitShot(app, win_id, 15_000, Want{ .bar = true, .ring = true }, stateHolds)) {
-        savePng(app, win_id, "zig-out/smoke-agents-gui-1-FAIL.png");
-        return fail("no titlebar with a working chip (zig-out/smoke-agents-gui-1-FAIL.png)", .{});
+        savePng(app, win_id, "1-FAIL");
+        return fail("no titlebar with a working chip (zig-out/smoke-agents-gui-<theme>-1-FAIL.png)", .{});
     }
     pumpFor(app, 400);
-    savePng(app, win_id, "zig-out/smoke-agents-gui-1-working.png");
+    savePng(app, win_id, "1-working");
     const rows1 = blk: {
         const shot = app.snapshotRgba(win_id, null) catch return fail("no pixels", .{});
         defer allocator.free(shot.px);
@@ -389,16 +527,25 @@ pub fn main() u8 {
             return fail("the chip does not read '2 agents working'", .{});
         }
     }
-    say("PASS 1: titlebar appeared with '2 agents working' -> zig-out/smoke-agents-gui-1-working.png", .{});
+    {
+        // The chip's own pill colours must survive the theme: GTK's
+        // built-in theme once covered its white with a dark button image.
+        const ratio = wordsContrast(app, win_id, .{ .x = 0, .y = rows1[0], .w = @intCast(app.winById(win_id).?.w), .h = rows1[1] - rows1[0] }, &.{ "agents", "working" }) orelse
+            return fail("OCR found no chip words (zig-out/smoke-agents-gui-<theme>-1-working.png)", .{});
+        say("chip text: lowest glyph contrast {d:.2}", .{ratio});
+        if (ratio < MIN_TEXT_CONTRAST)
+            return fail("the chip's text is hard to read: contrast {d:.2} < {d:.1} (zig-out/smoke-agents-gui-<theme>-1-working.png)", .{ ratio, MIN_TEXT_CONTRAST });
+    }
+    say("PASS 1: titlebar appeared with '2 agents working' -> zig-out/smoke-agents-gui-<theme>-1-working.png", .{});
 
     // ── 2. one needs input: amber pill on the chip and the tab ────
     publish("needs_input", "waiting_user") catch return fail("publish", .{});
     if (!waitShot(app, win_id, 15_000, Want{ .bar = true, .ring = true, .amber_chip = true, .amber_tab = true }, stateHolds)) {
-        savePng(app, win_id, "zig-out/smoke-agents-gui-2-FAIL.png");
-        return fail("no amber chip pill + tab badge (zig-out/smoke-agents-gui-2-FAIL.png)", .{});
+        savePng(app, win_id, "2-FAIL");
+        return fail("no amber chip pill + tab badge (zig-out/smoke-agents-gui-<theme>-2-FAIL.png)", .{});
     }
     pumpFor(app, 400);
-    savePng(app, win_id, "zig-out/smoke-agents-gui-2-needs-input.png");
+    savePng(app, win_id, "2-needs-input");
     const chip_box = blk: {
         const shot = app.snapshotRgba(win_id, null) catch return fail("no pixels", .{});
         defer allocator.free(shot.px);
@@ -415,7 +562,7 @@ pub fn main() u8 {
         }
         break :blk amber;
     };
-    say("PASS 2: amber '1 needs input' pill and amber tab badge -> zig-out/smoke-agents-gui-2-needs-input.png", .{});
+    say("PASS 2: amber '1 needs input' pill and amber tab badge -> zig-out/smoke-agents-gui-<theme>-2-needs-input.png", .{});
 
     // ── 3. click the chip: the popover lists both agents ──────────
     const popups_before = popupCount(app);
@@ -433,7 +580,16 @@ pub fn main() u8 {
     }
     const pop_id = popup orelse return fail("clicking the chip opened no popover", .{});
     pumpFor(app, 600);
-    savePng(app, pop_id, "zig-out/smoke-agents-gui-3-popover.png");
+    savePng(app, pop_id, "3-popover");
+    {
+        // Readable in every theme: each agent's text against the
+        // background right behind it, not merely present for OCR.
+        const ratio = wordsContrast(app, pop_id, null, &.{ "Agents", "claude-kilo", "claude-mike" }) orelse
+            return fail("OCR found none of the popover's words (zig-out/smoke-agents-gui-<theme>-3-popover.png)", .{});
+        say("popover text: lowest glyph contrast {d:.2}", .{ratio});
+        if (ratio < MIN_TEXT_CONTRAST)
+            return fail("the popover's text is hard to read: contrast {d:.2} < {d:.1} (zig-out/smoke-agents-gui-<theme>-3-popover.png)", .{ ratio, MIN_TEXT_CONTRAST });
+    }
     {
         const text = ocrText(app, pop_id, null) orelse return fail("OCR of the popover failed", .{});
         defer allocator.free(text);
@@ -442,7 +598,7 @@ pub fn main() u8 {
             return fail("the popover does not list both agents", .{});
         }
     }
-    say("PASS 3: the chip's popover lists claude-kilo and claude-mike -> zig-out/smoke-agents-gui-3-popover.png", .{});
+    say("PASS 3: the chip's popover lists claude-kilo and claude-mike -> zig-out/smoke-agents-gui-<theme>-3-popover.png", .{});
     app.pressKey(win_id, "Escape") catch {};
     pumpFor(app, 500);
 
@@ -450,12 +606,12 @@ pub fn main() u8 {
     if (lease) |*l| l.deinit();
     lease = null;
     if (!waitShot(app, win_id, 15_000, Want{ .bar = false }, stateHolds)) {
-        savePng(app, win_id, "zig-out/smoke-agents-gui-4-FAIL.png");
-        return fail("titlebar or badge still shown after the record left (zig-out/smoke-agents-gui-4-FAIL.png)", .{});
+        savePng(app, win_id, "4-FAIL");
+        return fail("titlebar or badge still shown after the record left (zig-out/smoke-agents-gui-<theme>-4-FAIL.png)", .{});
     }
     pumpFor(app, 400);
-    savePng(app, win_id, "zig-out/smoke-agents-gui-4-gone.png");
-    say("PASS 4: record removed, chip + badge + titlebar hidden -> zig-out/smoke-agents-gui-4-gone.png", .{});
+    savePng(app, win_id, "4-gone");
+    say("PASS 4: record removed, chip + badge + titlebar hidden -> zig-out/smoke-agents-gui-<theme>-4-gone.png", .{});
 
     teardown();
     say("all stages passed", .{});

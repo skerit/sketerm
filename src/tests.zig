@@ -57,6 +57,7 @@ comptime {
     _ = @import("util/clock.zig");
     _ = @import("util/env.zig");
     _ = @import("util/strz.zig");
+    _ = @import("smoke/a11ynode.zig");
     _ = @import("util/jsonnum.zig");
     _ = @import("util/spinlock.zig");
     _ = @import("util/fdcancel.zig");
