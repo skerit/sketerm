@@ -213,6 +213,12 @@ pub const Assistant = struct {
         return self.name;
     }
 
+    /// The browser `session` of this assistant as a watch target: through the reporting daemon when it is remote.
+    pub fn watchTarget(self: *const Assistant, session: []const u8) webwatch.Target {
+        if (self.reached) |reached| return .{ .remote = .{ .host = reached, .instance = self.instance, .session = session } };
+        return .{ .local = .{ .mux_socket = self.host["sock:".len..], .session = session } };
+    }
+
     pub fn why(self: *const Assistant) []const u8 {
         return self.why_buf[0..self.why_len];
     }
@@ -630,6 +636,38 @@ pub fn chipLabel(buf: []u8, live: usize, counts: Counts) []const u8 {
 /// Icon and tooltip for each attach intent, shared by the tab-bar
 /// popover and the Session Overview so the two never disagree.
 pub const AttachVerb = struct { icon: [*:0]const u8, tip: [*:0]const u8, text: [*:0]const u8 };
+
+/// The attach actions a session row offers, in display order: the one
+/// list the tab-bar popover and the Session Overview both iterate.
+pub const AttachAction = enum {
+    watch,
+    control,
+    /// Open or move a browser watch next to the selected pane.
+    beside,
+
+    pub fn lease(self: AttachAction) muxtabs.Lease {
+        return switch (self) {
+            .watch, .beside => .read_only,
+            .control => .control,
+        };
+    }
+
+    /// Whether a row of `kind` offers it: only a browser watch has a placement of its own.
+    pub fn appliesTo(self: AttachAction, kind: Kind) bool {
+        return self != .beside or kind == .web;
+    }
+
+    pub fn verb(self: AttachAction) AttachVerb {
+        return switch (self) {
+            .watch, .control => attachVerb(self.lease()),
+            .beside => .{
+                .icon = "view-dual-symbolic",
+                .text = "Show beside pane",
+                .tip = "Open or move this browser next to the selected pane. Starts read-only for a new viewer; keeps your current mode when moving.",
+            },
+        };
+    }
+};
 
 pub fn attachVerb(lease: muxtabs.Lease) AttachVerb {
     return switch (lease) {
@@ -1177,7 +1215,7 @@ pub const Watcher = struct {
         // second) is what Watch and Take control attach.
         for (a.sessions.items) |*s| {
             if (s.agent != index) continue;
-            self.appendAttachButtons(row, a, s, false);
+            self.appendAttachButtons(row, a, s);
             break;
         }
         c.gtk_box_append(@ptrCast(root), row);
@@ -1326,27 +1364,18 @@ pub const Watcher = struct {
             c.gtk_box_append(@ptrCast(card), row);
             c.gtk_box_append(@ptrCast(card), controls);
         }
-        self.appendAttachButtons(controls, a, s, s.kind == .web and a.reached == null);
+        self.appendAttachButtons(controls, a, s);
         c.gtk_box_append(@ptrCast(section), card);
     }
 
-    /// Watch and Take control for one roster row (and Show beside pane
-    /// when `beside_ok`), each button owning its `RowCtx`.
-    fn appendAttachButtons(self: *Watcher, controls: *c.GtkWidget, a: *Assistant, s: *Session, beside_ok: bool) void {
+    /// The `AttachAction`s that apply to one roster row, each button
+    /// owning its `RowCtx`.
+    fn appendAttachButtons(self: *Watcher, controls: *c.GtkWidget, a: *Assistant, s: *Session) void {
         const placement = self.win.sessionPlacement(s.name, s.attachHost(a));
-        const actions = [_]struct { lease: muxtabs.Lease, beside: bool = false }{
-            .{ .lease = .read_only }, .{ .lease = .control }, .{ .lease = .read_only, .beside = true },
-        };
-        for (actions) |action| {
-            // Beside relocates a LOCAL helper's observer; a remote watch
-            // has no such placement yet.
-            if (action.beside and !beside_ok) continue;
-            const lease = action.lease;
-            const verb: AttachVerb = if (action.beside) .{
-                .icon = "view-dual-symbolic",
-                .text = "Show beside pane",
-                .tip = "Open or move this browser next to the selected pane. Starts read-only for a new viewer; keeps your current mode when moving.",
-            } else attachVerb(lease);
+        for (std.enums.values(AttachAction)) |action| {
+            if (!action.appliesTo(s.kind)) continue;
+            const lease = action.lease();
+            const verb = action.verb();
             // Labelled, not icon-only: the popover is the one place a
             // person reads these verbs cold, and a rig drives them by text.
             const btn = c.gtk_button_new_with_label(verb.text).?;
@@ -1360,29 +1389,30 @@ pub const Watcher = struct {
                 .pane => false,
             };
             c.gtk_widget_set_sensitive(btn, @intFromBool(sensitive));
-            const ctx = RowCtx.create(self.allocator, self, a.host, s.name, s.attachHost(a), lease, action.beside) orelse continue;
+            const ctx = RowCtx.create(self.allocator, self, a.host, s.name, s.attachHost(a), action) orelse continue;
             _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onRowClicked), @ptrCast(ctx), @ptrCast(&freeRowCtx), c.G_CONNECT_DEFAULT);
             c.gtk_box_append(@ptrCast(controls), btn);
         }
     }
 
     /// Attach `session` of the assistant keyed `key` (at `attach_host`)
-    /// into this window with `lease`, off-thread; the popover closes
+    /// into this window as `action`, off-thread; the popover closes
     /// when the attach lands, and a failure is a toast naming why.
-    fn startAttach(self: *Watcher, key: []const u8, session: []const u8, attach_host: []const u8, lease: muxtabs.Lease, beside: bool) void {
+    fn startAttach(self: *Watcher, key: []const u8, session: []const u8, attach_host: []const u8, action: AttachAction) void {
         if (self.dead) return;
         const a = self.findByHost(key) orelse return;
+        const lease = action.lease();
         // The assistant's browser opens as a browser: a second client
         // of its own helper, its pages as web pages (webwatch.zig).
         // The mux app session behind it is never attached from here.
         if (kindOf(session, true) == .web) {
-            const target = a.findSession(session) orelse return;
-            const opened = if (a.reached) |reached|
-                webwatch.openRemote(self.win, a.label(), reached, a.instance, session, lease)
-            else if (beside)
-                webwatch.openLocalBeside(self.win, target.browser.title(), a.host["sock:".len..], session)
+            const row = a.findSession(session) orelse return;
+            const label = if (a.reached != null) a.label() else row.browser.title();
+            const target = a.watchTarget(session);
+            const opened = if (action == .beside)
+                webwatch.openBeside(self.win, label, target)
             else
-                webwatch.openLocal(self.win, target.browser.title(), a.host["sock:".len..], session, lease);
+                webwatch.open(self.win, label, target, lease);
             if (opened)
                 c.gtk_popover_popdown(@ptrCast(self.popover));
             return;
@@ -1500,10 +1530,9 @@ const RowCtx = struct {
     key: []u8,
     session: []u8,
     attach_host: []u8,
-    lease: muxtabs.Lease,
-    beside: bool = false,
+    action: AttachAction,
 
-    fn create(allocator: std.mem.Allocator, watcher: *Watcher, key: []const u8, session: []const u8, attach_host: []const u8, lease: muxtabs.Lease, beside: bool) ?*RowCtx {
+    fn create(allocator: std.mem.Allocator, watcher: *Watcher, key: []const u8, session: []const u8, attach_host: []const u8, action: AttachAction) ?*RowCtx {
         const ctx = allocator.create(RowCtx) catch return null;
         const key_owned = allocator.dupe(u8, key) catch {
             allocator.destroy(ctx);
@@ -1526,8 +1555,7 @@ const RowCtx = struct {
             .key = key_owned,
             .session = session_owned,
             .attach_host = host_owned,
-            .lease = lease,
-            .beside = beside,
+            .action = action,
         };
         return ctx;
     }
@@ -1547,8 +1575,7 @@ fn onRowClicked(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     // button and with it this context: copy what the attach needs
     // before anything can rebuild.
     const watcher = ctx.watcher;
-    const lease = ctx.lease;
-    const beside = ctx.beside;
+    const action = ctx.action;
     var key_buf: [512]u8 = undefined;
     var name_buf: [256]u8 = undefined;
     var host_buf: [512]u8 = undefined;
@@ -1561,7 +1588,7 @@ fn onRowClicked(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         const w: *c.GtkWidget = @ptrCast(pop);
         if (w != watcher.popover) c.gtk_popover_popdown(@ptrCast(w));
     }
-    watcher.startAttach(key, name, host, lease, beside);
+    watcher.startAttach(key, name, host, action);
 }
 
 /// "All assistants and agents" in a pane's agents popover.
@@ -1960,6 +1987,17 @@ test "attach verbs give watch and control distinct icons" {
     try t.expectEqualStrings("Take control", std.mem.span(attachVerb(.control).text));
 }
 
+test "show beside pane is a browser row's action alone, read-only for a new viewer" {
+    try t.expect(AttachAction.beside.appliesTo(.web));
+    try t.expect(!AttachAction.beside.appliesTo(.app));
+    try t.expect(!AttachAction.beside.appliesTo(.terminal));
+    for (std.enums.values(AttachAction)) |action| {
+        if (action != .beside) try t.expect(action.appliesTo(.terminal));
+    }
+    try t.expectEqual(muxtabs.Lease.read_only, AttachAction.beside.lease());
+    try t.expectEqualStrings("Show beside pane", std.mem.span(AttachAction.beside.verb().text));
+}
+
 test "place labels name the machine, through its hops" {
     var buf: [128]u8 = undefined;
     try t.expectEqualStrings("box", placeLabel(&buf, "box"));
@@ -2076,4 +2114,3 @@ test "local registry agents attach at the instance socket or the plain host" {
     a.rebuildRows(t.allocator);
     try t.expectEqual(@as(usize, 0), a.sessions.items.len);
 }
-

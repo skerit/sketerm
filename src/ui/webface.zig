@@ -785,17 +785,24 @@ pub const ObserverSpec = union(enum) {
     /// A remote assistant: mux host spec + its web session name, and
     /// the MCP instance name when the assistant is a named instance
     /// beside the host's per-user daemon (empty otherwise).
-    remote: struct { host: []const u8, session: []const u8, instance: []const u8 = "" },
+    remote: Remote,
+
+    pub const Remote = struct { host: []const u8, session: []const u8, instance: []const u8 = "" };
+
+    /// The helper's identity, `sock:<path>` or `host:<host>|<instance>|<session>`; null when it does not fit `buf`.
+    pub fn key(self: ObserverSpec, buf: []u8) ?[]const u8 {
+        return switch (self) {
+            .local => |path| std.fmt.bufPrint(buf, "sock:{s}", .{path}) catch null,
+            .remote => |r| std.fmt.bufPrint(buf, "host:{s}|{s}|{s}", .{ r.host, r.instance, r.session }) catch null,
+        };
+    }
 };
 
 /// An idle or fresh observer client for `spec`. Null when the spec
 /// does not fit the client's fixed buffers or memory is out.
 pub fn observerClient(gpa: std.mem.Allocator, spec: ObserverSpec) ?*Client {
     var key_buf: [384]u8 = undefined;
-    const key = switch (spec) {
-        .local => |path| std.fmt.bufPrint(&key_buf, "sock:{s}", .{path}) catch return null,
-        .remote => |r| std.fmt.bufPrint(&key_buf, "host:{s}|{s}|{s}", .{ r.host, r.instance, r.session }) catch return null,
-    };
+    const key = spec.key(&key_buf) orelse return null;
     for (g_observer_clients.items) |cl| {
         if (cl.watch == null and cl.state == .idle and std.mem.eql(u8, cl.obs_key[0..cl.obs_key_len], key)) return cl;
     }
@@ -1126,6 +1133,8 @@ pub const WebFace = struct {
     enc_fail: u8 = 0,
     /// A keyframe was asked for (`frame_encode` resent) and has not come.
     enc_kf_asked: bool = false,
+    /// Video tiles decoded into this face, for the stats line.
+    enc_video_tiles: u32 = 0,
 
     /// The last texture handed to the picture: the `update_texture`
     /// GSK diffs the next software frame against (that diff is what

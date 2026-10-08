@@ -275,96 +275,78 @@ fn find(win: *Window, key: []const u8) ?*Watch {
     return null;
 }
 
-pub fn placementLocal(win: *Window, mux_socket: []const u8, session: []const u8) Placement {
-    var key_buf: [MAX_KEY]u8 = undefined;
-    const key = localKey(&key_buf, mux_socket, session) orelse return .none;
-    const w = find(win, key) orelse return .none;
-    return .{ .watching = w.lease };
-}
+/// Which assistant browser a watch observes: a LOCAL assistant's
+/// private daemon socket and web session (its helper socket is resolved
+/// through the presence files beside it), or a REMOTE one whose host
+/// daemon connects to the helper serving `session` beside its own
+/// socket, or beside the named MCP `instance`'s daemon, and bridges it.
+/// Everything past `spec` is the same for both.
+pub const Target = union(enum) {
+    local: struct { mux_socket: []const u8, session: []const u8 },
+    remote: webface.ObserverSpec.Remote,
 
-pub fn placementRemote(win: *Window, host: []const u8, session: []const u8) Placement {
-    var key_buf: [MAX_KEY]u8 = undefined;
-    const key = remoteKey(&key_buf, host, "", session) orelse return .none;
-    const w = find(win, key) orelse return .none;
-    return .{ .watching = w.lease };
-}
+    /// The Session Overview's host vocabulary: `sock:<mux socket>` for a
+    /// local assistant's private daemon, a mux host spec for one on
+    /// another machine, null for the local default. The one place that
+    /// vocabulary is split.
+    pub fn of(host: ?[]const u8, session: []const u8) Target {
+        const h = host orelse return .{ .local = .{ .mux_socket = "", .session = session } };
+        if (std.mem.startsWith(u8, h, "sock:")) return .{ .local = .{ .mux_socket = h["sock:".len..], .session = session } };
+        return .{ .remote = .{ .host = h, .session = session } };
+    }
 
-/// Where an assistant's web session lives, in the host vocabulary the
-/// Session Overview carries: `sock:<mux socket>` for a local assistant's
-/// private daemon, a mux host spec for one on another machine, null for
-/// the local default. The one place that vocabulary is split, for both
-/// the placement query and the watch itself.
-const HostRef = union(enum) {
-    local: []const u8,
-    remote: []const u8,
-
-    fn of(host: ?[]const u8) HostRef {
-        const h = host orelse return .{ .local = "" };
-        if (std.mem.startsWith(u8, h, "sock:")) return .{ .local = h["sock:".len..] };
-        return .{ .remote = h };
+    /// The observer spec, a local helper socket resolved into `buf`; null when there is no helper to observe.
+    fn spec(self: Target, buf: *[webpresence.MAX_PATH]u8) ?webface.ObserverSpec {
+        return switch (self) {
+            .local => |l| .{ .local = webpresence.helperSocketFor(buf, l.mux_socket, l.session) orelse return null },
+            .remote => |r| .{ .remote = r },
+        };
     }
 };
 
-/// What this window already shows for the web session `session` on
-/// `host` (the Session Overview's vocabulary, see `HostRef`).
-pub fn placementFor(win: *Window, host: ?[]const u8, session: []const u8) Placement {
-    return switch (HostRef.of(host)) {
-        .local => |sock| placementLocal(win, sock, session),
-        .remote => |h| placementRemote(win, h, session),
-    };
-}
-
-/// Watch (or take control of) the web session `session` on `host`, in
-/// the Session Overview's vocabulary; `label` names the assistant.
-pub fn openFor(win: *Window, label: []const u8, host: ?[]const u8, session: []const u8, lease: muxtabs.Lease) bool {
-    return switch (HostRef.of(host)) {
-        .local => |sock| openLocal(win, label, sock, session, lease),
-        .remote => |h| openRemote(win, label, h, "", session, lease),
-    };
-}
-
-/// `host:<host>|<instance>|<session>`, the key of a REMOTE assistant's
-/// watch (instance empty for the helper beside the host's own daemon).
-fn remoteKey(buf: []u8, host: []const u8, instance: []const u8, session: []const u8) ?[]const u8 {
-    return std.fmt.bufPrint(buf, "host:{s}|{s}|{s}", .{ host, instance, session }) catch null;
-}
-
 test "the overview's host vocabulary splits into a local socket or a remote host" {
-    try std.testing.expectEqualStrings("/run/x/mux.sock", HostRef.of("sock:/run/x/mux.sock").local);
-    try std.testing.expectEqualStrings("", HostRef.of(null).local);
-    try std.testing.expectEqualStrings("box", HostRef.of("box").remote);
+    try std.testing.expectEqualStrings("/run/x/mux.sock", Target.of("sock:/run/x/mux.sock", "web-a").local.mux_socket);
+    try std.testing.expectEqualStrings("", Target.of(null, "web-a").local.mux_socket);
+    const r = Target.of("box", "web-a").remote;
+    try std.testing.expectEqualStrings("box", r.host);
+    var path: [webpresence.MAX_PATH]u8 = undefined;
     var buf: [64]u8 = undefined;
-    try std.testing.expectEqualStrings("host:box||web-a", remoteKey(&buf, "box", "", "web-a").?);
-    try std.testing.expectEqualStrings("host:box|hub|", remoteKey(&buf, "box", "hub", "").?);
+    try std.testing.expectEqualStrings("host:box||web-a", Target.of("box", "web-a").spec(&path).?.key(&buf).?);
+    const named: Target = .{ .remote = .{ .host = "box", .instance = "hub", .session = "" } };
+    try std.testing.expectEqualStrings("host:box|hub|", named.spec(&path).?.key(&buf).?);
 }
 
-/// `sock:<helper socket>` for a LOCAL assistant session, resolved
-/// through the presence files beside its mux socket.
-fn localKey(buf: []u8, mux_socket: []const u8, session: []const u8) ?[]const u8 {
-    var sock_buf: [webpresence.MAX_PATH]u8 = undefined;
-    const sock = webpresence.helperSocketFor(&sock_buf, mux_socket, session) orelse return null;
-    return std.fmt.bufPrint(buf, "sock:{s}", .{sock}) catch null;
-}
-
-/// Watch (or take control of) a LOCAL assistant's browser: the
-/// assistant whose private daemon is `mux_socket`, its web session
-/// `session`. An existing watch is focused and, for `.control`,
-/// escalated. Returns false when nothing could be started.
-pub fn openLocal(win: *Window, label: []const u8, mux_socket: []const u8, session: []const u8, lease: muxtabs.Lease) bool {
+/// What this window already shows for `target`.
+pub fn placement(win: *Window, target: Target) Placement {
+    var path_buf: [webpresence.MAX_PATH]u8 = undefined;
     var key_buf: [MAX_KEY]u8 = undefined;
-    const key = localKey(&key_buf, mux_socket, session) orelse return false;
+    const key = (target.spec(&path_buf) orelse return .none).key(&key_buf) orelse return .none;
+    const w = find(win, key) orelse return .none;
+    return .{ .watching = w.lease };
+}
+
+/// Watch (or take control of) the browser of `target`; `label` names
+/// the assistant. An existing watch is focused and, for `.control`,
+/// escalated. Returns false when nothing could be started.
+pub fn open(win: *Window, label: []const u8, target: Target, lease: muxtabs.Lease) bool {
+    var path_buf: [webpresence.MAX_PATH]u8 = undefined;
+    var key_buf: [MAX_KEY]u8 = undefined;
+    const spec = target.spec(&path_buf) orelse return false;
+    const key = spec.key(&key_buf) orelse return false;
     if (find(win, key)) |w| return reuse(w, lease);
-    const cl = webface.observerClient(win.allocator, .{ .local = key["sock:".len..] }) orelse return false;
+    const cl = webface.observerClient(win.allocator, spec) orelse return false;
     return start(win, cl, label, key, lease);
 }
 
-/// Open or relocate the viewer beside the active pane. Only the observation
-/// is replaced: the assistant's pages and login state stay in its helper.
-pub fn openLocalBeside(win: *Window, label: []const u8, mux_socket: []const u8, session: []const u8) bool {
+/// Open or relocate the viewer of `target` beside the active pane. Only
+/// the observation is replaced: the assistant's pages and login state
+/// stay in its helper, and a moved watch keeps its lease.
+pub fn openBeside(win: *Window, label: []const u8, target: Target) bool {
     const source = win.focusedPane() orelse win.selectedTabPane() orelse return false;
     const source_id = source.id;
+    var path_buf: [webpresence.MAX_PATH]u8 = undefined;
     var key_buf: [MAX_KEY]u8 = undefined;
-    const key = localKey(&key_buf, mux_socket, session) orelse return false;
+    const key = (target.spec(&path_buf) orelse return false).key(&key_buf) orelse return false;
     var lease: muxtabs.Lease = .read_only;
     if (find(win, key)) |w| {
         if (w.pane == source) {
@@ -380,21 +362,9 @@ pub fn openLocalBeside(win: *Window, label: []const u8, mux_socket: []const u8, 
             w.teardown();
         }
     }
-    if (!openLocal(win, label, mux_socket, session, lease)) return false;
+    if (!open(win, label, target, lease)) return false;
     if (find(win, key)) |w| w.split_source_id = source_id;
     return true;
-}
-
-/// Same for an assistant on a REMOTE mux host (`host` in the mux host
-/// vocabulary): the remote daemon connects to the helper serving
-/// `session` beside its own socket, or beside the private daemon of
-/// the named MCP `instance` next to it, and bridges it.
-pub fn openRemote(win: *Window, label: []const u8, host: []const u8, instance: []const u8, session: []const u8, lease: muxtabs.Lease) bool {
-    var key_buf: [MAX_KEY]u8 = undefined;
-    const key = remoteKey(&key_buf, host, instance, session) orelse return false;
-    if (find(win, key)) |w| return reuse(w, lease);
-    const cl = webface.observerClient(win.allocator, .{ .remote = .{ .host = host, .session = session, .instance = instance } }) orelse return false;
-    return start(win, cl, label, key, lease);
 }
 
 /// Watch (or take control of) the browser of the NAMED MCP instance
@@ -405,12 +375,12 @@ pub fn openRemote(win: *Window, label: []const u8, host: []const u8, instance: [
 /// web session; empty = the direct route.
 pub fn openInstance(win: *Window, host: ?[]const u8, instance: []const u8, session: []const u8, lease: muxtabs.Lease) bool {
     if (!webpresence.validInstance(instance)) return false;
-    if (host) |h| return openRemote(win, instance, h, instance, session, lease);
+    if (host) |h| return open(win, instance, .{ .remote = .{ .host = h, .instance = instance, .session = session } }, lease);
     const default_sock = sockpath.defaultSocketPath(win.allocator) catch return false;
     defer win.allocator.free(default_sock);
     var buf: [webpresence.MAX_PATH]u8 = undefined;
     const inst_sock = webpresence.instanceMuxSocket(&buf, default_sock, instance) orelse return false;
-    return openLocal(win, instance, inst_sock, session, lease);
+    return open(win, instance, .{ .local = .{ .mux_socket = inst_sock, .session = session } }, lease);
 }
 
 fn reuse(w: *Watch, lease: muxtabs.Lease) bool {

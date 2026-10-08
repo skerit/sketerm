@@ -585,7 +585,7 @@ fn populateFetched(self: *Switcher) void {
             // An assistant's browser shown as a watch already: the watch
             // tab's own chip owns the lease, exactly as a pane's does.
             if (assistants.kindOf(session.name, session.app) == .web and
-                webwatch.placementFor(self.win, host, session.name) != .none) continue;
+                webwatch.placement(self.win, .of(host, session.name)) != .none) continue;
             var running_apps: usize = 0;
             for (session.audio_streams, 0..) |info, index| {
                 if (!info.running) continue;
@@ -817,41 +817,41 @@ fn setSessionTarget(
     c.gtk_box_insert_child_after(@ptrCast(body), button, c.gtk_widget_get_prev_sibling(c.gtk_widget_get_last_child(body)));
 }
 
-/// Add the Watch (read-only) and Take Control actions to an
-/// attachable row. A watch attach mirrors the session without taking
-/// the controller lease, so it never steals input from whoever is
-/// driving (an assistant included); Take Control is the deliberate
-/// escalation, the same lease the pane chip's button asks for. Both
-/// icons and tooltips come from `assistants.attachVerb`, the one home
-/// for that vocabulary.
+/// Add the `assistants.AttachAction`s that apply to an attachable row.
+/// A watch attach mirrors the session without taking the controller
+/// lease, so it never steals input from whoever is driving (an
+/// assistant included); Take Control is the deliberate escalation, the
+/// same lease the pane chip's button asks for; a browser row also
+/// offers Show beside pane. The list, icons and tooltips come from
+/// `assistants.AttachAction`, the one home shared with the tab-bar
+/// popover.
 fn addWatchButton(self: *Switcher, entry: *Entry) void {
     const body = c.gtk_list_box_row_get_child(@ptrCast(entry.row)) orelse return;
-    inline for (.{ muxtabs.Lease.control, muxtabs.Lease.read_only }) |lease| {
-        const verb = assistants.attachVerb(lease);
+    const target = entry.target orelse return;
+    const kind = assistants.kindOf(target.session, true);
+    for (std.enums.values(assistants.AttachAction)) |action| {
+        if (!action.appliesTo(kind)) continue;
+        const verb = action.verb();
         const button = c.gtk_button_new_from_icon_name(verb.icon).?;
         c.gtk_widget_set_valign(button, c.GTK_ALIGN_CENTER);
         c.gtk_widget_add_css_class(button, "flat");
         c.gtk_widget_set_tooltip_text(button, verb.tip);
         c.g_object_set_data(@ptrCast(button), "sketerm-overview-entry", @ptrCast(entry));
-        _ = c.g_signal_connect_data(button, "clicked", @ptrCast(if (lease == .control) &onTakeControlClicked else &onWatchClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        c.g_object_set_data(@ptrCast(button), "sketerm-overview-action", @ptrFromInt(@intFromEnum(action) + 1));
+        _ = c.g_signal_connect_data(button, "clicked", @ptrCast(&onAttachClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         c.gtk_box_insert_child_after(@ptrCast(body), button, c.gtk_widget_get_prev_sibling(c.gtk_widget_get_last_child(body)));
     }
 }
 
-fn onWatchClicked(button: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    attachClicked(button, user, .read_only);
-}
-
-fn onTakeControlClicked(button: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    attachClicked(button, user, .control);
-}
-
-fn attachClicked(button: *c.GtkButton, user: ?*anyopaque, lease: muxtabs.Lease) void {
+fn onAttachClicked(button: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const self = cast.userData(Switcher, user);
     const data = c.g_object_get_data(@ptrCast(button), "sketerm-overview-entry") orelse return;
     const entry: *Entry = @ptrCast(@alignCast(data));
+    const tag = @intFromPtr(c.g_object_get_data(@ptrCast(button), "sketerm-overview-action"));
+    if (tag == 0) return;
+    const action = std.enums.fromInt(assistants.AttachAction, tag - 1) orelse return;
     const target = entry.target orelse return;
-    startAttach(self, target, lease, .tab);
+    startAttach(self, target, action);
 }
 
 fn applySearch(self: *Switcher, preferred: ?[]const u8) void {
@@ -1044,7 +1044,7 @@ fn activateEntry(self: *Switcher, entry: *Entry) void {
         },
         .attach => {
             const target = entry.target orelse return;
-            startAttach(self, target, .default, .policy);
+            startAttach(self, target, null);
             return;
         },
     }
@@ -1506,18 +1506,26 @@ fn onOpIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
     return 0;
 }
 
-/// Submit a Watch (read-only) or Take Control attach for a row. The
-/// dial + handshake run on `muxtabs.AttachJob`; this side only owns the
-/// dialog state around it (one attach at a time, sensitivity, note).
-fn startAttach(self: *Switcher, target: SessionTarget, lease: muxtabs.Lease, placement: muxtabs.AttachJob.Placement) void {
+/// Submit a row's attach `action` (null: the row itself was activated,
+/// default lease and placement policy). The dial + handshake run on
+/// `muxtabs.AttachJob`; this side only owns the dialog state around it
+/// (one attach at a time, sensitivity, note).
+fn startAttach(self: *Switcher, target: SessionTarget, action: ?assistants.AttachAction) void {
     if (self.attaching) return;
+    const lease: muxtabs.Lease = if (action) |a| a.lease() else .default;
+    const placement: muxtabs.AttachJob.Placement = if (action != null) .tab else .policy;
     const target_host: ?[]const u8 = if (target.host) |value| value else null;
     // An assistant's web session is a BROWSER: watched through its own
     // helper (webwatch.zig), locally by socket, remotely through the
     // host's daemon. The app session is never attached for it.
     if (assistants.kindOf(target.session, true) == .web) {
         const label = if (target_host) |h| labelForHost(self, h) else "assistant";
-        if (webwatch.openFor(self.win, label, target_host, target.session, lease)) {
+        const watch_target = webwatch.Target.of(target_host, target.session);
+        const opened = if (action == @as(?assistants.AttachAction, .beside))
+            webwatch.openBeside(self.win, label, watch_target)
+        else
+            webwatch.open(self.win, label, watch_target, lease);
+        if (opened) {
             c.gtk_window_close(@ptrCast(self.window));
         } else {
             self.note = "the assistant's browser could not be watched";

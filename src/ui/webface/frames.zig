@@ -416,7 +416,12 @@ pub fn onEncoded(self: *WebFace, fe: proto.FrameEncoded) void {
         switch (got) {
             .rect => |r| {
                 changed.add(r);
-                if (p.kind == proto.encoded_video) self.enc_fail = 0;
+                if (p.kind == proto.encoded_video) {
+                    self.enc_fail = 0;
+                    self.enc_video_tiles +|= 1;
+                    if (self.enc_video_tiles == 1 and host_mod.g_stats.enabled())
+                        std.debug.print("webface: view {d} decoded its first video tile\n", .{self.view});
+                }
             },
             .dropped => |why| encodedDropped(self, why),
             .malformed => {},
