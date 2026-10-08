@@ -1,5 +1,21 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-08: encoded, acknowledged frames for watched and remote pages
+
+Watching an assistant's browser (and remote browsing `on:<host>`) lagged by
+seconds on video or animated pages: every frame was a lossless deflated
+`frame_inline` band and nothing paced the helper but its local outbox. A helper
+with the new `frames-encoded` capability accepts `frame_encode` (0xD2) per owned
+inline view or observer alias, then sends `frame_encoded` (0xD3) logical frames,
+pixcodec regions or one video tile from `wlhost/surfenc.zig`, and at most two
+stay unacknowledged until `frame_ack` (0xD4); damage merges meanwhile and every
+frame is cut from the live buffer (`src/web/frameenc.zig`). The GUI opts in every
+in-band view, offering video codecs only across a link, decodes through the
+shared `vcodec.StreamDecoder` (now also the forwarded-app decoder) and falls
+back to lossless when it cannot decode. smoke-web stage enc measured a click on
+a 640x400 noise page through a 2 MiB/s relay: 146 ms with H.264 tiles, 1179 ms
+lossless only, 3610 ms for legacy `frame_inline`.
+
 ## 2026-10-08: per-view headless frame rate, CPU views at any scale, WebGL
 
 `web_open` and `web_stream` take `max_fps` (1-240): the CEF paint cap of
