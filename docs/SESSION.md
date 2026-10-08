@@ -1,5 +1,20 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-08: Show beside pane for remote assistants' browsers
+
+The AI badge offered Show beside pane only for an assistant on this machine.
+`webwatch.Target` (local daemon socket + session, or the remote
+`ObserverSpec`) now feeds one `open`/`openBeside`/`placement`, so a watch of a
+remote or named-instance assistant is placed beside the selected pane exactly
+like a local one; `openLocal`/`openRemote`/`openLocalBeside` are gone and the
+helper key format has one home (`ObserverSpec.key`). The badge and the Session
+Overview iterate one action list, `assistants.AttachAction`, so the Overview's
+browser rows gained the beside button too. smoke-e2e
+`SKETERM_SMOKE_E2E_REMOTE_WEB_WATCH_ONLY` (also part of `WATCH_ONLY`) drives a
+browser on fake host `hosta` through the real GUI: beside placement, encoded
+frames with video offered and decoded, an animating page, Take control. The
+`WATCH_ONLY` agent stages read minted agent ids off `agent_open`.
+
 ## 2026-10-08: encoded, acknowledged frames for watched and remote pages
 
 Watching an assistant's browser (and remote browsing `on:<host>`) lagged by
