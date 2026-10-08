@@ -956,6 +956,9 @@ pub const Client = struct {
                 // Container views wait until the strict context guarantee
                 // is known, so release (or visibly refuse) those now.
                 for (self.faces.items) |face| face.ensureView();
+                // Views minted before the ack learn only now that their
+                // pixels may travel encoded.
+                for (self.faces.items) |face| face.syncFrameEncode();
             },
             .ev_webext_state => {
                 const st = proto.decode(proto.EvWebextState, frame.payload) catch return;
@@ -1036,6 +1039,15 @@ pub const Client = struct {
                         if (candidate.onWebextPopupInline(fi)) return;
                     }
                 }
+            },
+            .frame_encoded => {
+                const fe = proto.FrameEncoded.decodeAlloc(frame.payload, self.gpa) catch return;
+                defer self.gpa.free(fe.parts);
+                if (self.findFace(fe.view)) |face| face.onEncoded(fe);
+                // Acknowledged once APPLIED, whatever became of it: the
+                // helper sends the next frame only on this, and a face
+                // that is gone must not leave its window waiting.
+                if (fe.last != 0) self.post(proto.FrameAck{ .view = fe.view, .serial = fe.serial });
             },
             .ev_title => {
                 const ev = proto.decode(proto.EvTitle, frame.payload) catch return;

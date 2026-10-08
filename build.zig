@@ -1624,7 +1624,18 @@ fn addCef(
     // Stream audio (web-stream + stream-audio) reuses mux/opuscodec.zig,
     // which probes libopus at runtime: nothing new is linked.
     web_opts.addOption(bool, "audio_opus", have_opus);
-    web_mod.addImport("build_options", web_opts.createModule());
+    // Encoded watch frames (frames-encoded) reuse wlhost/surfenc.zig:
+    // pixcodec needs the vendored zstd, and the video route the same
+    // runtime-loaded codec shims as every other target, so CEF stays the
+    // only library this binary links. VideoToolbox is not wired here; a
+    // macOS helper encodes lossless unless x264 is loadable.
+    web_opts.addOption(bool, "video", video_cfg.enabled);
+    web_opts.addOption(bool, "video_av1enc", video_cfg.av1enc);
+    web_opts.addOption(bool, "vtenc", false);
+    const web_opts_mod = web_opts.createModule();
+    web_mod.addImport("build_options", web_opts_mod);
+    addZstd(b, web_mod);
+    addVideo(b, web_mod);
     if (is_mac_cef) {
         // macOS links the framework DIRECTLY, and the framework's own
         // install name is what makes that work:
@@ -1772,6 +1783,11 @@ fn addCef(
         .link_libc = true,
     });
     smoke_web_mod.addImport("cbindings", core_cbindings_mod);
+    // The encoded-frames stage decodes what the helper sends exactly as
+    // the GUI does (pixcodec regions, vcodec tiles).
+    smoke_web_mod.addImport("build_options", web_opts_mod);
+    addZstd(b, smoke_web_mod);
+    addVideo(b, smoke_web_mod);
     const smoke_web = b.addExecutable(.{
         .name = "sketerm-smoke-web",
         .root_module = smoke_web_mod,

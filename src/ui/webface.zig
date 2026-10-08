@@ -233,6 +233,8 @@ const input = @import("input.zig");
 const toolbtn = @import("toolbtn.zig");
 const cssutil = @import("cssutil.zig");
 const proto = @import("../web/protocol.zig");
+const frameenc = @import("../web/frameenc.zig");
+const vcodec = @import("../wlhost/vcodec.zig");
 const download_policy = @import("../web/download.zig");
 const quarantine = @import("../web/quarantine.zig");
 const reader_model = @import("../web/reader.zig");
@@ -1114,6 +1116,16 @@ pub const WebFace = struct {
     buf_w: u16 = 0,
     buf_h: u16 = 0,
     buf_stride: u32 = 0,
+    /// Encoded frames (`frame_encode`, capability "frames-encoded") were
+    /// asked for the CURRENT view, offering `enc_offer` (empty = lossless).
+    enc_on: bool = false,
+    enc_offer: vcodec.CodecList = .{},
+    /// Decodes the encoded parts into the in-band buffer.
+    enc_recv: frameenc.Receiver = .{},
+    /// Video tiles that failed to decode since the last good one.
+    enc_fail: u8 = 0,
+    /// A keyframe was asked for (`frame_encode` resent) and has not come.
+    enc_kf_asked: bool = false,
 
     /// The last texture handed to the picture: the `update_texture`
     /// GSK diffs the next software frame against (that diff is what
@@ -1636,6 +1648,7 @@ pub const WebFace = struct {
             self.view_live = cl.state == .ready;
             cl.register(self);
             if (cl.state != .ready) self.onAttachedLost();
+            self.syncFrameEncode();
             return self;
         }
         self.view = g_next_view;
@@ -1838,6 +1851,7 @@ pub const WebFace = struct {
         }
         self.dl_asked.deinit(self.allocator);
         self.dropMap();
+        self.enc_recv.deinit(self.allocator);
         self.cancelHints();
         self.hints_items.deinit(self.allocator);
         if (self.pending_url) |u| self.allocator.free(u);
@@ -2865,6 +2879,10 @@ pub const WebFace = struct {
             .context = self.container,
         });
         self.view_live = true;
+        // A fresh view streams the frame family its helper defaults to
+        // until it asks again (which waits for `hello_ack`).
+        self.enc_on = false;
+        self.syncFrameEncode();
         // A fresh helper connection knows no cap; force the send.
         self.sent_max_fps = 0xffff;
         self.syncMaxFps();
@@ -2911,6 +2929,8 @@ pub const WebFace = struct {
     pub const onDmabuf = wf_frames.onDmabuf;
     pub const importDmabuf = wf_frames.importDmabuf;
     pub const onInline = wf_frames.onInline;
+    pub const onEncoded = wf_frames.onEncoded;
+    pub const syncFrameEncode = wf_frames.syncFrameEncode;
     pub const onDamage = wf_frames.onDamage;
     pub fn onTitle(self: *WebFace, title: []const u8) void {
         if (self.title) |t| self.allocator.free(t);

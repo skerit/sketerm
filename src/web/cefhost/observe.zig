@@ -166,7 +166,8 @@ pub fn observeViewGone(self: *Host, v: *const View, reason: []const u8) void {
             continue;
         }
         self.postObserveState(&s, v, proto.observe_ended, reason);
-        _ = self.subs.orderedRemove(i);
+        var gone = self.subs.orderedRemove(i);
+        gone.deinit(self.gpa);
     }
     if (!observable(v)) return;
     for (self.observers.items) |o| {
@@ -249,7 +250,8 @@ pub fn observeControl(self: *Host, conn: u32, alias: u32, control: bool) void {
 pub fn observeUnsubscribe(self: *Host, conn: u32, alias: u32) void {
     for (self.subs.items, 0..) |s, i| {
         if (s.conn == conn and s.alias == alias) {
-            _ = self.subs.orderedRemove(i);
+            var gone = self.subs.orderedRemove(i);
+            gone.deinit(self.gpa);
             return;
         }
     }
@@ -266,7 +268,7 @@ pub fn observePause(self: *Host, conn: u32, alias: u32, paused: bool) void {
     }
     const v = self.findAny(sub.target) orelse return;
     if (v.map.len != 0 and !v.buf_unpainted) {
-        sub.dirty.full(v.pw, v.ph);
+        if (sub.enc) |st| st.restart(v.pw, v.ph) else sub.dirty.full(v.pw, v.ph);
         self.flushSub(sub, v);
     }
 }
@@ -286,7 +288,8 @@ pub fn observeDropConn(self: *Host, conn: u32) void {
     var i: usize = 0;
     while (i < self.subs.items.len) {
         if (self.subs.items[i].conn == conn) {
-            _ = self.subs.orderedRemove(i);
+            var gone = self.subs.orderedRemove(i);
+            gone.deinit(self.gpa);
         } else i += 1;
     }
     for (self.observers.items, 0..) |o, k| {
@@ -304,23 +307,27 @@ pub fn observeDamage(self: *Host, v: *View, rects: []const proto.Rect) void {
     if (self.subs.items.len == 0) return;
     for (self.subs.items) |*s| {
         if (s.target != v.id or s.paused) continue;
-        s.dirty.addAll(rects);
+        if (s.enc) |st| st.paint(v.pw, v.ph, rects) else s.dirty.addAll(rects);
         self.flushSub(s, v);
     }
 }
 
-/// Ship a subscriber's pending damage as inline bands, unless its
-/// outbox is backed up (then the damage waits for the next flush).
+/// Ship a subscriber's pending damage: an encoded frame when its ack
+/// window has room, else inline bands unless its outbox is backed up
+/// (then the damage waits for the next flush).
 pub fn flushSub(self: *Host, s: *Sub, v: *View) void {
-    if (!s.dirty.pending()) return;
+    if (!s.pending()) return;
     if (v.map.len == 0) {
         s.dirty.clear();
+        if (s.enc) |st| st.damage.clear();
         return;
     }
     const out = self.observerOut(s.conn) orelse {
         s.dirty.clear();
+        if (s.enc) |st| st.damage.clear();
         return;
     };
+    if (s.enc) |st| return Host.cutEncoded(v, st, out, aliasWire(s));
     if (out.pending() >= max_frame_backlog) return;
     self.shipDamage(v, &s.dirty, out, aliasWire(s));
 }
@@ -329,7 +336,7 @@ pub fn flushSub(self: *Host, s: *Sub, v: *View) void {
 /// `flushInline`, so damage held back by backpressure goes out.
 pub fn flushObservers(self: *Host) void {
     for (self.subs.items) |*s| {
-        if (!s.dirty.pending() or s.paused) continue;
+        if (s.paused or !s.pending()) continue;
         const v = self.findAny(s.target) orelse continue;
         self.flushSub(s, v);
     }

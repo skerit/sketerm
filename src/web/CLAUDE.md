@@ -1201,9 +1201,9 @@ The shape, and why each part is what it is:
   synchronous reply to an observer's request never reaches the owner.
   `view_destroy`/`view_show`/`view_hide` on an alias are served at the
   edge as unsubscribe/resume/pause and never reach the engine.
-- **Observers ALWAYS get `frame_inline`**, whatever their own views
-  use: no memfd to dup, no dma-buf to share, identical over a bridged
-  remote helper. `shipInline` is the one band encoder for the owner's
+- **Observers ALWAYS get in-band frames** (`frame_inline`, or encoded
+  frames once they ask, below), whatever their own views use: no memfd
+  to dup, no dma-buf to share, identical over a bridged remote helper. `shipInline` is the one band encoder for the owner's
   inline path and the observer path (`shipDamage` drains a
   `frameflow.Damage` rect list into it); each subscription keeps a
   merge-and-flush `dirty` list with the same `max_frame_backlog`
@@ -1211,6 +1211,35 @@ The shape, and why each part is what it is:
   poll in `flushObservers`. A subscribe (and a resume) seeds the alias
   with the stored nav state, title (`View.title`/`nav_*` exist for
   this) and the whole live surface.
+- **Encoded, acknowledged frames replace `frame_inline` on request**
+  (capability `frames-encoded`, 0xD2-0xD4). `frame_encode{view,
+  codecs}` names an observer alias (allowed whatever the lease: it
+  changes only how THIS connection receives pixels it may see) or an
+  owned INLINE view (a memfd/dma-buf view is left alone), with the
+  vcodec ids the client decodes in its order; empty is lossless only.
+  The helper then keeps a `frameenc.Stream` on the `Sub`/`View`
+  (`enc`): paints only feed churn and merge damage, and a logical
+  frame is cut from the LIVE `View.map` only while fewer than
+  `proto.ENCODED_WINDOW` (2) are unacknowledged. The route is
+  `surfenc.Surface`'s: hot AND photographic AND a negotiated codec AND
+  even dims is ONE whole-surface tile, else pixcodec regions banded
+  and split across messages under `ENCODED_MSG_BUDGET`; the final
+  message has `last = 1` and `frame_ack` (cumulative, a stale serial
+  ignored) answers it. The first lossless frame after video repaints
+  the whole surface, so lossy pixels never outlive an animation. A
+  new subscription, a resume, a resize and every `frame_encode`
+  (re-opt) restart at a keyframe of the whole surface, which is also
+  how a client that cannot decode asks for one or drops to lossless.
+  The GUI opts in every in-band view once `hello_ack` advertises the
+  capability, offering video only when the connection is REMOTE
+  (`Client.isRemote`: a bridged observer or a `web_helper_open`
+  helper); a local watch gets lossless + the ack window. It decodes
+  through `frameenc.Receiver` (the shared `vcodec.StreamDecoder`) and
+  acks after applying, whatever became of the frame. A helper without
+  the capability, and a client that never asks, keep `frame_inline`
+  exactly as before. smoke-web stage enc measures a click through a
+  throttled 2 MiB/s relay on a noise page: encoded+video ~150 ms,
+  encoded lossless ~1.2 s, legacy `frame_inline` ~3.6 s.
 - **Which events fan out is `observedEvent`**: page state (title, nav
   state, load, load error, cursor, favicon, scroll, crash) to every
   subscriber; input answers (context menu, find results) to
@@ -1625,7 +1654,8 @@ half in `cefhost/stream.zig`.
   The allocation was audited against `Tag` and its full git history:
   0x6A was explicitly left unused when `sem_eval` moved to the 0xA0
   debugging block, 0x6B/0x6C were never assigned, and 0xD0-0xD7 stays
-  reserved for the remote-helper inline-frame family.
+  reserved for the remote-helper inline-frame family (0xD2-0xD4 are its
+  `frames-encoded` members).
   Semantic requests are navigation-generation stamped: snapshots,
   hints and both read forms are reissued after the fresh main document
   loads, while actions/eval/expand are explicitly failed. Renderer

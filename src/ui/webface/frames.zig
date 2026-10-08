@@ -9,6 +9,10 @@ const c = @import("../../c.zig").c;
 const cast = @import("../../util/cast.zig");
 const clock = @import("../../util/clock.zig");
 const proto = @import("../../web/protocol.zig");
+const frameenc = @import("../../web/frameenc.zig");
+const frameflow = @import("../../web/frameflow.zig");
+const vcodec = @import("../../wlhost/vcodec.zig");
+const mux_client = @import("../../mux/client.zig");
 const webframe = @import("../webframe.zig");
 const host_mod = @import("../webface.zig");
 const WebFace = host_mod.WebFace;
@@ -311,54 +315,138 @@ pub fn importDmabuf(self: *WebFace, f: proto.FrameDmabuf, fds: []const c_int) ?*
     return tex;
 }
 
-/// An inline frame (capability "frames-inline", remote helpers):
-/// pixels arrived in-band, so the face materialises the buffer the
-/// memfd path would have mapped — an anonymous mapping in the SAME
-/// `MapRef` shape — decodes the damaged rects into it, and then
-/// takes the ordinary `onDamage` presentation path (GSK uploads
-/// only the damaged region, exactly as for shm frames).
-pub fn onInline(self: *WebFace, fi: proto.FrameInline) void {
-    if (self.widgets_dead) return;
-    if (fi.w == 0 or fi.h == 0) return;
-    const stride: u32 = @as(u32, fi.w) * 4;
-    const size: usize = @as(usize, stride) * @as(usize, fi.h);
-    const need_new = self.map == null or self.buf_w != fi.w or self.buf_h != fi.h;
-    if (need_new) {
-        const mref = webframe.mapAnon(self.allocator, size) orelse return;
+/// The buffer in-band frames decode into: the anonymous mapping the
+/// memfd path would have mapped, (re)made for a `w`x`h` surface.
+const InlineSurface = struct { m: *webframe.Map, fresh: bool };
+
+fn inlineSurface(self: *WebFace, w: u16, h: u16) ?InlineSurface {
+    if (w == 0 or h == 0) return null;
+    const stride: u32 = @as(u32, w) * 4;
+    const fresh = self.map == null or self.buf_w != w or self.buf_h != h;
+    if (fresh) {
+        const mref = webframe.mapAnon(self.allocator, @as(usize, stride) * h) orelse return null;
         self.dropMap();
         self.map = mref;
-        self.buf_w = fi.w;
-        self.buf_h = fi.h;
+        self.buf_w = w;
+        self.buf_h = h;
         self.buf_stride = stride;
         // Local id only — the helper never announced this buffer, so
         // no frame_release goes back for it either.
         self.buf_id +%= 1;
         if (self.buf_id == 0) self.buf_id = 1;
-        self.noteBufferGeometry(fi.w, fi.h);
+        self.noteBufferGeometry(w, h);
     }
-    const m = self.map orelse return;
+    return .{ .m = self.map orelse return null, .fresh = fresh };
+}
+
+/// Present what an in-band frame changed through the ordinary
+/// `onDamage` path (GSK uploads only the damaged region).
+fn presentInline(self: *WebFace, view: u32, gen: u32, rects: []proto.Rect, fresh: bool) void {
+    if (rects.len == 0) return;
+    // A fresh buffer has undefined pixels outside this frame's rects;
+    // present the WHOLE surface once so nothing stale shows.
+    const all = [_]proto.Rect{.{ .x = 0, .y = 0, .w = self.buf_w, .h = self.buf_h }};
+    self.onDamage(.{
+        .view = view,
+        .buf_id = self.buf_id,
+        .gen = gen,
+        .rects = if (fresh) &all else rects,
+    });
+}
+
+/// An inline frame (capability "frames-inline", remote helpers):
+/// pixels arrived in-band, so the face materialises the buffer the
+/// memfd path would have mapped, decodes the damaged rects into it, and
+/// then takes the ordinary `onDamage` presentation path.
+pub fn onInline(self: *WebFace, fi: proto.FrameInline) void {
+    if (self.widgets_dead) return;
+    const surf = inlineSurface(self, fi.w, fi.h) orelse return;
+    const stride: u32 = @as(u32, fi.w) * 4;
     var rects_buf: [32]proto.Rect = undefined;
     var n: usize = 0;
     for (fi.rects) |r| {
-        if (!webframe.decodeInlineRect(self.allocator, m, stride, fi.w, fi.h, r)) continue;
+        if (!webframe.decodeInlineRect(self.allocator, surf.m, stride, fi.w, fi.h, r)) continue;
         if (n < rects_buf.len) {
             rects_buf[n] = .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h };
             n += 1;
         }
     }
-    if (n == 0) return;
-    // A fresh buffer has undefined pixels outside this frame's
-    // rects; present the WHOLE surface once so nothing stale shows.
-    if (need_new) {
-        rects_buf[0] = .{ .x = 0, .y = 0, .w = fi.w, .h = fi.h };
-        n = 1;
+    presentInline(self, fi.view, fi.gen, rects_buf[0..n], surf.fresh);
+}
+
+/// Opt this face's view into encoded frames once its helper offers them
+/// (capability "frames-encoded"). Only in-band pixels can be encoded:
+/// observed pages and every view of a remote helper. Video is offered
+/// only across a link (a remote helper or a remote assistant's bridge):
+/// on a local socket its encode latency buys nothing, so local watches
+/// take lossless regions with the ack window alone.
+pub fn syncFrameEncode(self: *WebFace) void {
+    const cl = self.cl;
+    if (self.enc_on or !self.view_live or !cl.hello_done or !cl.has(.frames_encoded)) return;
+    if (!self.observed and !cl.isRemote()) return;
+    const offer: vcodec.CodecList = if (cl.isRemote()) vcodec.offer(mux_client.video_preference, vcodec.decodableHere()) else .{};
+    postFrameEncode(self, offer);
+}
+
+/// (Re)send `frame_encode`: the helper restarts the stream at a keyframe
+/// of the whole surface, offering `offer`.
+fn postFrameEncode(self: *WebFace, offer: vcodec.CodecList) void {
+    var ids: [vcodec.CodecList.cap]u8 = undefined;
+    for (offer.items(), 0..) |cd, i| ids[i] = @intFromEnum(cd);
+    self.cl.post(proto.FrameEncode{ .view = self.view, .codecs = ids[0..offer.len] });
+    if (host_mod.g_stats.enabled())
+        std.debug.print("webface: view {d} takes encoded frames, {d} video codec(s) offered\n", .{ self.view, offer.len });
+    self.enc_on = true;
+    self.enc_offer = offer;
+    self.enc_kf_asked = false;
+}
+
+/// Decode failures past which this face stops taking video.
+const ENC_MAX_FAILURES = 3;
+
+/// An encoded frame (capability "frames-encoded"): parts decode into the
+/// same buffer `onInline` uses and present the same way. The client
+/// acknowledges the logical frame after this returns.
+pub fn onEncoded(self: *WebFace, fe: proto.FrameEncoded) void {
+    if (self.widgets_dead) return;
+    const surf = inlineSurface(self, fe.w, fe.h) orelse return;
+    var changed: frameflow.Damage = .{};
+    for (fe.parts) |p| {
+        const got = self.enc_recv.apply(self.allocator, surf.m.ptr[0..surf.m.len], fe.w, fe.h, p) catch continue;
+        switch (got) {
+            .rect => |r| {
+                changed.add(r);
+                if (p.kind == proto.encoded_video) self.enc_fail = 0;
+            },
+            .dropped => |why| encodedDropped(self, why),
+            .malformed => {},
+        }
     }
-    self.onDamage(.{
-        .view = fi.view,
-        .buf_id = self.buf_id,
-        .gen = fi.gen,
-        .rects = rects_buf[0..n],
-    });
+    var taken: [frameflow.Damage.MAX_RECTS]frameflow.Rect = undefined;
+    var rects: [frameflow.Damage.MAX_RECTS]proto.Rect = undefined;
+    const list = changed.take(fe.w, fe.h, &taken);
+    for (list, 0..) |r, i| rects[i] = .{ .x = @intCast(r.x), .y = @intCast(r.y), .w = @intCast(r.w), .h = @intCast(r.h) };
+    presentInline(self, fe.view, fe.gen, rects[0..list.len], surf.fresh);
+}
+
+/// A video tile was dropped. The picture keeps its pixels; what the
+/// stream needs next is asked for, so it can never stay stuck: a
+/// keyframe, or (no decoder here, or tiles that keep failing) the same
+/// stream without video.
+fn encodedDropped(self: *WebFace, why: vcodec.StreamDecoder.Outcome) void {
+    switch (why) {
+        .decoded => {},
+        .unsupported => postFrameEncode(self, .{}),
+        .failed, .need_keyframe => {
+            if (why == .failed) self.enc_fail +|= 1;
+            if (self.enc_fail >= ENC_MAX_FAILURES) {
+                postFrameEncode(self, .{});
+            } else if (!self.enc_kf_asked) {
+                postFrameEncode(self, self.enc_offer);
+                self.enc_kf_asked = true;
+            }
+        },
+    }
 }
 
 /// A software damage batch: wrap the mapping as a `GdkMemoryTexture`

@@ -222,6 +222,15 @@ pub const CAP_FILTER_SUBSCRIBE = "filter-subscribe";
 /// posting `frame_buffer` frames whose descriptors were silently eaten
 /// by the bridge, i.e. a black pane forever).
 pub const CAP_FRAMES_INLINE = "frames-inline";
+/// The helper accepts `frame_encode` for a view that receives in-band
+/// pixels (an owner's inline view, or an observer alias) and from then on
+/// sends that view as `frame_encoded` logical frames instead of
+/// `frame_inline`: lossless pixcodec regions, or one video tile in a codec
+/// the client listed, each logical frame ended by `last` and acknowledged
+/// with `frame_ack`. At most `ENCODED_WINDOW` logical frames are ever
+/// unacknowledged and damage merges while the window is full, so a slow
+/// link sees fewer, newer frames instead of a growing queue.
+pub const CAP_FRAMES_ENCODED = "frames-encoded";
 /// The helper hosts MV2-flavor WebExtensions: it accepts the 0xB0-block
 /// frames (`webext_set`/`webext_remove`/`webext_list_req`), loads an
 /// unpacked extension directory, runs its background scripts in a hidden
@@ -324,7 +333,8 @@ pub const CAP_COOKIE_SYNC = "cookie-sync";
 /// `view` id in the observer's own namespace; from the acknowledging
 /// `ev_observe_state` onward the observer receives that view's frames
 /// and events under ITS id, exactly as if it were the observer's own
-/// view. Frames for an observed view are ALWAYS `frame_inline`, whatever
+/// view. Frames for an observed view are ALWAYS in-band (`frame_inline`,
+/// or `frame_encoded` once the observer sends `frame_encode`), whatever
 /// frame family the observer's own views use: nothing to share a memfd
 /// or dma-buf with, and identical over a bridged remote helper.
 ///
@@ -414,6 +424,7 @@ pub const Cap = enum {
     scroll,
     filter_subscribe,
     frames_inline,
+    frames_encoded,
     webext,
     webext_tabs,
     reader_ids,
@@ -748,6 +759,10 @@ pub const Tag = enum(u8) {
     // "frames-inline" — the historically reserved remote-helper block.
     frame_mode = 0xD0,
     frame_inline = 0xD1,
+    // Encoded + acknowledged frames, capability "frames-encoded".
+    frame_encode = 0xD2,
+    frame_encoded = 0xD3,
+    frame_ack = 0xD4,
     // 0xE0-0xE7: cross-instance cookie synchronisation, capability
     // "cookie-sync". A fresh block rather than a 0xC8 continuation:
     // 0xC6/0xC7 are the only gaps left in the 0xC0 block and the
@@ -792,8 +807,9 @@ pub const Tag = enum(u8) {
 /// mints the alias and `observe_control` addresses it directly.
 pub fn observerAllows(tag: Tag, control: bool) bool {
     return switch (tag) {
-        // Any observer: its own pacing, pause and unsubscribe.
-        .frame_request, .frame_release, .view_show, .view_hide, .view_destroy => true,
+        // Any observer: its own pacing, pause and unsubscribe, and how
+        // it receives the pixels it is already allowed to see.
+        .frame_request, .frame_release, .view_show, .view_hide, .view_destroy, .frame_encode, .frame_ack => true,
         // A controlling observer drives the page as the owner would.
         .input_pointer,
         .input_scroll,
@@ -821,6 +837,8 @@ test "observerAllows: read-only observers pace and pause, control drives, geomet
     try std.testing.expect(observerAllows(.input_key, true));
     try std.testing.expect(observerAllows(.navigate, true));
     try std.testing.expect(observerAllows(.find, true));
+    try std.testing.expect(observerAllows(.frame_encode, false));
+    try std.testing.expect(observerAllows(.frame_ack, false));
     // Never, whatever the lease.
     try std.testing.expect(!observerAllows(.view_resize, true));
     try std.testing.expect(!observerAllows(.view_discard, true));
@@ -1503,6 +1521,115 @@ pub const FrameInline = struct {
         }
         return .{ .view = view, .gen = gen, .w = w, .h = h, .rects = rects };
     }
+};
+
+/// Logical `frame_encoded` frames a helper keeps unacknowledged at most,
+/// per view; damage merges while the window is full.
+pub const ENCODED_WINDOW = 2;
+
+/// Payload bytes one `frame_encoded` message carries at most; a larger
+/// logical frame is split across messages, only the final one `last`.
+pub const ENCODED_MSG_BUDGET: usize = 4 << 20;
+
+/// Client -> helper, capability "frames-encoded": receive `view` (an
+/// owned inline view or an observer alias) as `frame_encoded` from now
+/// on. `codecs` lists the `vcodec.Codec` ids the client decodes, in its
+/// preference order; empty means lossless only. Sending it again changes
+/// the list and restarts the stream at a keyframe of the whole surface,
+/// which is also how a client recovers a stream it could not decode.
+pub const FrameEncode = struct {
+    pub const tag: Tag = .frame_encode;
+    view: u32,
+    codecs: []const u8,
+};
+
+/// `EncodedPart.kind`: a pixcodec body (`wlhost/pixcodec.zig`
+/// `appendBody`) decoding to `w*h*4` tight BGRA at x,y, or one
+/// length-prefixed vcodec tile (`vcodec.appendTile`) for the whole
+/// surface. Append-only values.
+pub const encoded_lossless: u8 = 0;
+pub const encoded_video: u8 = 1;
+
+/// One piece of an encoded frame; `data` borrows from the payload.
+pub const EncodedPart = struct {
+    kind: u8,
+    x: u16,
+    y: u16,
+    w: u16,
+    h: u16,
+    data: []const u8,
+};
+
+/// Helper -> client, capability "frames-encoded": one message of logical
+/// frame `serial` for `view` (in the receiver's namespace, as
+/// `frame_inline`). w/h are the physical surface; `gen` the paint
+/// counter. A logical frame spans one or more messages sharing `serial`,
+/// the final one with `last = 1`, which is what `frame_ack` answers.
+pub const FrameEncoded = struct {
+    pub const tag: Tag = .frame_encoded;
+    view: u32,
+    serial: u64,
+    gen: u32,
+    w: u16,
+    h: u16,
+    last: u8,
+    parts: []const EncodedPart,
+
+    pub fn encodeTo(self: FrameEncoded, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        try putU32(gpa, out, self.view);
+        try putU64(gpa, out, self.serial);
+        try putU32(gpa, out, self.gen);
+        try putU16(gpa, out, self.w);
+        try putU16(gpa, out, self.h);
+        try putU8(gpa, out, self.last);
+        try putU16(gpa, out, @intCast(self.parts.len));
+        for (self.parts) |p| {
+            try putU8(gpa, out, p.kind);
+            try putU16(gpa, out, p.x);
+            try putU16(gpa, out, p.y);
+            try putU16(gpa, out, p.w);
+            try putU16(gpa, out, p.h);
+            try putText(gpa, out, .{ .s = p.data });
+        }
+    }
+
+    /// Caller owns the returned `parts` slice; each part's `data` still
+    /// borrows from `payload`. Bytes past the parts are a newer helper's
+    /// trailing fields and are ignored.
+    pub fn decodeAlloc(payload: []const u8, gpa: std.mem.Allocator) !FrameEncoded {
+        var cur = Cur{ .buf = payload };
+        var out: FrameEncoded = .{
+            .view = try cur.readU32(),
+            .serial = try cur.readU64(),
+            .gen = try cur.readU32(),
+            .w = try cur.readU16(),
+            .h = try cur.readU16(),
+            .last = try cur.readU8(),
+            .parts = &.{},
+        };
+        const n = try cur.readU16();
+        const parts = try gpa.alloc(EncodedPart, n);
+        errdefer gpa.free(parts);
+        for (parts) |*p| {
+            p.kind = try cur.readU8();
+            p.x = try cur.readU16();
+            p.y = try cur.readU16();
+            p.w = try cur.readU16();
+            p.h = try cur.readU16();
+            p.data = (try cur.readText()).s;
+        }
+        out.parts = parts;
+        return out;
+    }
+};
+
+/// Client -> helper, capability "frames-encoded": logical frame `serial`
+/// of `view` was applied. Cumulative: it retires every older serial too.
+/// A serial the helper no longer waits for is ignored.
+pub const FrameAck = struct {
+    pub const tag: Tag = .frame_ack;
+    view: u32,
+    serial: u64,
 };
 
 pub const EvLoad = struct {
@@ -6234,6 +6361,47 @@ test "inline frame round-trips rects, encodings and pixel payloads" {
     try std.testing.expectError(error.Truncated, FrameInline.decodeAlloc(frame.payload[0 .. frame.payload.len - 1], gpa));
 }
 
+test "encoded frames round-trip parts, tolerate a newer helper's tail and pin their tags" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectEqual(@as(u8, 0xD2), @intFromEnum(Tag.frame_encode));
+    try std.testing.expectEqual(@as(u8, 0xD3), @intFromEnum(Tag.frame_encoded));
+    try std.testing.expectEqual(@as(u8, 0xD4), @intFromEnum(Tag.frame_ack));
+    try std.testing.expectEqualStrings("frames-encoded", Cap.frames_encoded.name());
+    try roundTrip(FrameEncode, .{ .view = 3, .codecs = &.{ 2, 1 } });
+    try roundTrip(FrameEncode, .{ .view = 3, .codecs = "" });
+    try roundTrip(FrameAck, .{ .view = 3, .serial = 1 << 40 });
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    const body = [_]u8{ 9, 8, 7 };
+    const parts = [_]EncodedPart{
+        .{ .kind = encoded_lossless, .x = 4, .y = 5, .w = 6, .h = 7, .data = &body },
+        .{ .kind = encoded_video, .x = 0, .y = 0, .w = 640, .h = 480, .data = "" },
+    };
+    try encode(gpa, &buf, FrameEncoded{ .view = 7, .serial = 12, .gen = 99, .w = 640, .h = 480, .last = 1, .parts = &parts });
+    var r = Reader.init(buf.items);
+    const frame = (try r.next()).?;
+    try std.testing.expectEqual(Tag.frame_encoded, frame.tag);
+    const got = try FrameEncoded.decodeAlloc(frame.payload, gpa);
+    defer gpa.free(got.parts);
+    try std.testing.expectEqual(@as(u64, 12), got.serial);
+    try std.testing.expectEqual(@as(u8, 1), got.last);
+    try std.testing.expectEqual(@as(usize, 2), got.parts.len);
+    try std.testing.expectEqualSlices(u8, &body, got.parts[0].data);
+    try std.testing.expectEqual(@as(u16, 7), got.parts[0].h);
+    try std.testing.expectEqual(encoded_video, got.parts[1].kind);
+
+    try std.testing.expectError(error.Truncated, FrameEncoded.decodeAlloc(frame.payload[0 .. frame.payload.len - 1], gpa));
+    // A trailing field from a newer helper is skipped, not an error.
+    var longer: std.ArrayList(u8) = .empty;
+    defer longer.deinit(gpa);
+    try longer.appendSlice(gpa, frame.payload);
+    try longer.appendSlice(gpa, &.{ 1, 2, 3 });
+    const tail = try FrameEncoded.decodeAlloc(longer.items, gpa);
+    defer gpa.free(tail.parts);
+    try std.testing.expectEqual(@as(usize, 2), tail.parts.len);
+}
+
 test "reader ids extend the semantic family and leave 0xD0 reserved" {
     try std.testing.expectEqual(@as(u8, 0x68), @intFromEnum(Tag.sem_read));
     try std.testing.expectEqual(@as(u8, 0x69), @intFromEnum(Tag.sem_read_result));
@@ -6244,7 +6412,9 @@ test "reader ids extend the semantic family and leave 0xD0 reserved" {
     try std.testing.expectEqual(@as(u8, 0x6E), @intFromEnum(Tag.sem_result));
     try std.testing.expectEqual(@as(u8, 0xD0), @intFromEnum(Tag.frame_mode));
     try std.testing.expectEqual(@as(u8, 0xD1), @intFromEnum(Tag.frame_inline));
-    for (0xD2..0xD8) |raw| {
+    // 0xD2-0xD4 went to the same family (frames-encoded); the rest wait.
+    try std.testing.expectEqual(@as(u8, 0xD4), @intFromEnum(Tag.frame_ack));
+    for (0xD5..0xD8) |raw| {
         try std.testing.expect(!(@as(Tag, @enumFromInt(raw))).known());
     }
 }

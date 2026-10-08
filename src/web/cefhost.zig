@@ -62,6 +62,9 @@ const cef = @import("cef");
 const c = @import("cbindings");
 const proto = @import("protocol.zig");
 const frameflow = @import("frameflow.zig");
+const frameenc = @import("frameenc.zig");
+const surfenc = @import("../wlhost/surfenc.zig");
+const vcodec = @import("../wlhost/vcodec.zig");
 // The raw-deflate codec pool updates on the native app pipe use
 // (src/wlhost/zpool.zig), mapped in as a named module because the
 // helper's module root is src/web/.
@@ -592,6 +595,9 @@ pub const View = struct {
     /// link coalesces bursts instead of ballooning the outbox; the
     /// flush (`flushInlineView`) takes it.
     inline_dirty: frameflow.Damage = .{},
+    /// The owner asked for encoded frames (`frame_encode`, inline views
+    /// only): set, it replaces `inline_dirty` and `frame_inline` for good.
+    enc: ?*frameenc.Stream = null,
     /// A hidden WebExtensions background page: a 1x1 windowless browser
     /// that hosts the extension's background scripts and never paints or
     /// is announced to the client. It has no frame buffer, so `onPaint`
@@ -944,6 +950,23 @@ pub const Sub = struct {
     /// `view_show`, which re-seeds the whole surface.
     paused: bool = false,
     dirty: frameflow.Damage = .{},
+    /// The observer asked for encoded frames (`frame_encode` on the
+    /// alias): set, it replaces `dirty` and `frame_inline`.
+    enc: ?*frameenc.Stream = null,
+
+    /// Pixels are waiting AND may be sent now.
+    pub fn pending(self: *const Sub) bool {
+        if (self.enc) |st| return st.ready();
+        return self.dirty.pending();
+    }
+
+    pub fn deinit(self: *Sub, gpa: std.mem.Allocator) void {
+        if (self.enc) |st| {
+            st.deinit();
+            gpa.destroy(st);
+        }
+        self.enc = null;
+    }
 };
 
 pub const Host = struct {
@@ -1347,6 +1370,7 @@ pub const Host = struct {
             self.presenter = null;
         }
         self.views.deinit(self.gpa);
+        for (self.subs.items) |*s| s.deinit(self.gpa);
         self.subs.deinit(self.gpa);
         self.observers.deinit(self.gpa);
         self.webext.deinit();
@@ -2842,6 +2866,10 @@ pub const Host = struct {
         v.exec_at_start.deinit(self.gpa);
         v.forgetFrames(self.gpa);
         v.sem.deinit();
+        if (v.enc) |st| {
+            st.deinit();
+            self.gpa.destroy(st);
+        }
         self.gpa.destroy(v);
     }
 
@@ -3130,18 +3158,72 @@ pub const Host = struct {
     /// messages, unless the outbox is already backed up — then the
     /// damage stays accumulated and a later flush ships it merged.
     fn flushInlineView(self: *Host, v: *View) void {
-        if (!v.inline_dirty.pending()) return;
+        const pending = if (v.enc) |st| st.ready() else v.inline_dirty.pending();
+        if (!pending) return;
         if (v.map.len == 0) {
             v.inline_dirty.clear();
+            if (v.enc) |st| st.damage.clear();
             return;
         }
         const route = self.routeFor(v.id) orelse {
             v.inline_dirty.clear();
+            if (v.enc) |st| st.damage.clear();
             return;
         };
-        if (route.out.pending() >= max_frame_backlog) return;
         const wire_view = if (route.alias_view != 0) route.alias_view else v.id - route.base;
+        if (v.enc) |st| return cutEncoded(v, st, route.out, wire_view);
+        if (route.out.pending() >= max_frame_backlog) return;
         self.shipDamage(v, &v.inline_dirty, route.out, wire_view);
+    }
+
+    /// Cut `st`'s next logical frame from `v`'s live surface onto `out`
+    /// (the ack window and the merged damage decide whether there is
+    /// one); the one drain for owner-inline and observer encoded frames.
+    pub fn cutEncoded(v: *View, st: *frameenc.Stream, out: *proto.Outbox, wire_view: u32) void {
+        st.cut(out, wire_view, v.gen, v.map, v.pw, v.ph);
+    }
+
+    /// `frame_encode` (capability "frames-encoded"): this connection's
+    /// in-band pixels of the named view, owned inline view or observer
+    /// alias, become encoded, acknowledged frames from the whole surface
+    /// on. A view whose owner receives memfd/dma-buf frames is left alone:
+    /// there are no in-band pixels to encode.
+    pub fn frameEncode(self: *Host, req: proto.FrameEncode) void {
+        const v = self.find(req.view) orelse return;
+        const slot: *?*frameenc.Stream = if (self.dispatch_alias != 0) blk: {
+            const sub = self.aliasOf(self.dispatch_conn, self.dispatch_alias) orelse return;
+            sub.dirty.clear();
+            break :blk &sub.enc;
+        } else blk: {
+            if (!self.viewInline(v)) return;
+            v.inline_dirty.clear();
+            break :blk &v.enc;
+        };
+        if (slot.* == null) {
+            const st = self.gpa.create(frameenc.Stream) catch return;
+            st.* = frameenc.Stream.init(self.gpa, surfenc.openNegotiated);
+            slot.* = st;
+        }
+        slot.*.?.configure(req.codecs, vcodec.encodableHere(), v.pw, v.ph);
+        self.flushEncodedFor(v);
+    }
+
+    /// `frame_ack`: retire the serial and cut what waited for the window.
+    pub fn frameAck(self: *Host, req: proto.FrameAck) void {
+        const v = self.find(req.view) orelse return;
+        if (self.dispatch_alias != 0) {
+            const sub = self.aliasOf(self.dispatch_conn, self.dispatch_alias) orelse return;
+            (sub.enc orelse return).ack(req.serial);
+        } else (v.enc orelse return).ack(req.serial);
+        self.flushEncodedFor(v);
+    }
+
+    /// The dispatching connection's stream of `v` may have room or work.
+    fn flushEncodedFor(self: *Host, v: *View) void {
+        if (self.dispatch_alias != 0) {
+            const sub = self.aliasOf(self.dispatch_conn, self.dispatch_alias) orelse return;
+            if (!sub.paused) self.flushSub(sub, v);
+        } else self.flushInlineView(v);
     }
 
     /// Take `d` against `v`'s live surface and ship each rect with
@@ -6721,7 +6803,7 @@ fn onPaint(
     if (host.viewInline(v)) {
         // Merge rather than queue: a slow bridge coalesces bursts into
         // a bounded rect list instead of growing the outbox without bound.
-        v.inline_dirty.addAll(list[0..n]);
+        if (v.enc) |st| st.paint(v.pw, v.ph, list[0..n]) else v.inline_dirty.addAll(list[0..n]);
         host.flushInlineView(v);
         return;
     }

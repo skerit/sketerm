@@ -139,6 +139,7 @@ const unconditional_caps = [_]proto.Cap{
     .sitedata,
     .flush,
     .frames_inline,
+    .frames_encoded,
     .webext,
     .webext_tabs,
     .webext_action,
@@ -172,6 +173,7 @@ fn withheld(cap: proto.Cap) bool {
         .web_stream => "SKETERM_WEB_DISABLE_STREAM",
         .stream_audio => "SKETERM_WEB_DISABLE_STREAM_AUDIO",
         .view_max_fps => "SKETERM_WEB_DISABLE_MAX_FPS",
+        .frames_encoded => "SKETERM_WEB_DISABLE_FRAMES_ENCODED",
         else => return false,
     };
     return c.getenv(env) != null;
@@ -938,6 +940,11 @@ pub const Server = struct {
                     self.host.latchInlineForConn(cn.id);
                 }
             },
+            // Encoded frames (0xD2-0xD4). On an observer alias both pass
+            // the lease gate whatever the lease: they change only how THIS
+            // connection receives pixels it may already see.
+            .frame_encode => if (!withheld(.frames_encoded)) self.host.frameEncode(try self.dec(cn, proto.FrameEncode, frame.payload)),
+            .frame_ack => self.host.frameAck(try self.dec(cn, proto.FrameAck, frame.payload)),
             .sem_snapshot_req => try self.host.semSnapshot(try self.dec(cn, proto.SemSnapshotReq, frame.payload)),
             .sem_act => try self.host.semAct(try self.dec(cn, proto.SemAction, frame.payload)),
             .sem_expand => try self.host.semExpand(try self.dec(cn, proto.SemExpand, frame.payload)),
