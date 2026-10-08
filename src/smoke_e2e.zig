@@ -844,6 +844,15 @@ pub fn main() u8 {
         teardown();
         return 0;
     }
+    // The browser half of WATCH_ONLY alone (encoded frames ride it).
+    if (c.getenv("SKETERM_SMOKE_E2E_WEB_WATCH_ONLY") != null) {
+        const app = drive orelse return fail("focused assistant web watch smoke has no display driver");
+        if (!have_web_action) return fail("the assistant web watch stage needs sketerm-webengine (zig build web)");
+        if (assistantWebWatchStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
+        say("assistant web watch: focused browser watch stage passed");
+        teardown();
+        return 0;
+    }
     if (c.getenv("SKETERM_SMOKE_E2E_WATCH_ONLY") != null) {
         const app = drive orelse return fail("focused assistant-watch smoke has no display driver");
         if (assistantChipStage(allocator, app, sock_path)) |why| return failMsg(why);

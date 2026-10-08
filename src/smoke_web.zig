@@ -58,6 +58,9 @@ const tcpserver = @import("smoke/tcpserver.zig");
 const unixsock = @import("smoke/unixsock.zig");
 const proto = @import("web/protocol.zig");
 const zpool = @import("wlhost/zpool.zig");
+const vcodec = @import("wlhost/vcodec.zig");
+const frameenc = @import("web/frameenc.zig");
+const TokenBucket = @import("util/tokenbucket.zig").TokenBucket;
 const mux_wire = @import("mux/wire.zig");
 const webhints = @import("web/hints.zig");
 const axtree = @import("web/axtree.zig");
@@ -1434,6 +1437,15 @@ const Client = struct {
     inline_seq: u32 = 0,
     inline_last_area: u32 = 0,
     inline_deflate_seen: bool = false,
+    /// Encoded frames (stage enc) decode into the same mirror; logical
+    /// frames seen, parts per kind, video tiles dropped, and whether
+    /// each logical frame is acknowledged (the GUI always does).
+    enc_recv: frameenc.Receiver = .{},
+    enc_seq: u32 = 0,
+    enc_video_parts: u32 = 0,
+    enc_lossless_parts: u32 = 0,
+    enc_dropped: u32 = 0,
+    enc_ack: bool = true,
     /// Accessibility stream: every `ev_a11y_tree` node rendered as one
     /// `[id] role "name"` line, so assertions can grep roles + names.
     ax_log: [64 * 1024]u8 = @splat(0),
@@ -1482,6 +1494,7 @@ const Client = struct {
             self.ax_mirror_live = false;
         }
         if (self.inline_pix.len != 0) self.gpa.free(self.inline_pix);
+        self.enc_recv.deinit(self.gpa);
         self.unmap();
         if (self.fb_fd >= 0) _ = c.close(self.fb_fd);
         if (self.dev_fb_fd >= 0) _ = c.close(self.dev_fb_fd);
@@ -1566,6 +1579,16 @@ const Client = struct {
     /// happened.
     fn paintCount(self: *const Client) u32 {
         return self.dmg_seq +% self.dma_seq +% self.inline_seq;
+    }
+
+    /// (Re)size the in-band mirror to a `w`x`h` surface, zeroed.
+    fn inlineMirror(self: *Client, w: u16, h: u16) void {
+        if (w == self.iw and h == self.ih) return;
+        if (self.inline_pix.len != 0) self.gpa.free(self.inline_pix);
+        self.inline_pix = self.gpa.alloc(u8, @as(usize, w) * @as(usize, h) * 4) catch fail("oom");
+        @memset(self.inline_pix, 0);
+        self.iw = w;
+        self.ih = h;
     }
 
     /// BGRA pixel of the reassembled INLINE surface.
@@ -1723,14 +1746,7 @@ const Client = struct {
                 const fi = proto.FrameInline.decodeAlloc(frame.payload, self.gpa) catch fail("frame_inline decode");
                 defer self.gpa.free(fi.rects);
                 if (fi.w == 0 or fi.h == 0) fail("frame_inline with a zero surface");
-                const size: usize = @as(usize, fi.w) * @as(usize, fi.h) * 4;
-                if (fi.w != self.iw or fi.h != self.ih) {
-                    if (self.inline_pix.len != 0) self.gpa.free(self.inline_pix);
-                    self.inline_pix = self.gpa.alloc(u8, size) catch fail("oom");
-                    @memset(self.inline_pix, 0);
-                    self.iw = fi.w;
-                    self.ih = fi.h;
-                }
+                self.inlineMirror(fi.w, fi.h);
                 var area: u32 = 0;
                 for (fi.rects) |r| {
                     if (@as(u32, r.x) + r.w > fi.w or @as(u32, r.y) + r.h > fi.h)
@@ -1763,6 +1779,29 @@ const Client = struct {
                 self.inline_last_area = area;
                 self.inline_view = fi.view;
                 self.inline_seq += 1;
+            },
+            .frame_encoded => {
+                const fe = proto.FrameEncoded.decodeAlloc(frame.payload, self.gpa) catch fail("frame_encoded decode");
+                defer self.gpa.free(fe.parts);
+                if (fe.w == 0 or fe.h == 0) fail("frame_encoded with a zero surface");
+                self.inlineMirror(fe.w, fe.h);
+                for (fe.parts) |p| {
+                    switch (p.kind) {
+                        proto.encoded_video => self.enc_video_parts += 1,
+                        proto.encoded_lossless => self.enc_lossless_parts += 1,
+                        else => fail("frame_encoded part of an unknown kind"),
+                    }
+                    switch (self.enc_recv.apply(self.gpa, self.inline_pix, fe.w, fe.h, p) catch fail("oom")) {
+                        .rect => {},
+                        .dropped => self.enc_dropped += 1,
+                        .malformed => fail("frame_encoded part does not describe the surface"),
+                    }
+                }
+                self.inline_view = fe.view;
+                if (fe.last != 0) {
+                    self.enc_seq += 1;
+                    if (self.enc_ack) self.send(proto.FrameAck{ .view = fe.view, .serial = fe.serial });
+                }
             },
             .ev_a11y_tree => {
                 const ev = proto.decode(proto.EvA11yTree, frame.payload) catch fail("ev_a11y_tree decode");
@@ -6808,6 +6847,306 @@ fn runObserveStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) 
     pass("stage ob7 an observer disconnecting leaves the owner's views intact");
 }
 
+/// A byte relay between a rig `Client` and a helper whose helper-to-rig
+/// direction is throttled to `rate` bytes/s through a small buffer, so
+/// backpressure reaches the helper the way a bounded bridge's does (a
+/// daemon that stops reading a channel whose client is backed up).
+const ThrottledRelay = struct {
+    up: c_int,
+    down: c_int,
+    /// The socketpair end the rig `Client` speaks on.
+    rig_fd: c_int,
+    rate: f64,
+    thread: ?std.Thread = null,
+    stop_flag: std.atomic.Value(bool) = .init(false),
+
+    /// Bytes one token releases.
+    const CHUNK = 4096;
+
+    fn open(sock: [*:0]const u8, sock_len: usize, rate: f64) *ThrottledRelay {
+        var sp: [2]c_int = undefined;
+        if (c.socketpair(c.AF_UNIX, c.SOCK_STREAM | c.SOCK_CLOEXEC, 0, &sp) != 0) fail("relay socketpair");
+        const up = connectWithRetry(sock, sock_len);
+        for ([_]c_int{ up, sp[1] }) |fd| _ = c.fcntl(fd, c.F_SETFL, c.fcntl(fd, c.F_GETFL, @as(c_int, 0)) | c.O_NONBLOCK);
+        const self = std.heap.page_allocator.create(ThrottledRelay) catch fail("oom");
+        self.* = .{ .up = up, .down = sp[1], .rig_fd = sp[0], .rate = rate };
+        self.thread = std.Thread.spawn(.{}, ThrottledRelay.run, .{self}) catch fail("relay thread");
+        return self;
+    }
+
+    fn run(self: *ThrottledRelay) void {
+        var buf: [64 * 1024]u8 = undefined;
+        var head: usize = 0;
+        var len: usize = 0;
+        var ubuf: [64 * 1024]u8 = undefined;
+        var ulen: usize = 0;
+        var bucket = TokenBucket.init(4, self.rate / CHUNK);
+        while (!self.stop_flag.load(.acquire)) {
+            const now = nowMs();
+            const can_send = len > 0 and bucket.available(now);
+            var fds: [2]c.struct_pollfd = .{
+                .{ .fd = self.up, .events = @intCast((if (head + len < buf.len) c.POLLIN else 0) | (if (ulen > 0) c.POLLOUT else 0)), .revents = 0 },
+                .{ .fd = self.down, .events = @intCast((if (ulen < ubuf.len) c.POLLIN else 0) | (if (can_send) c.POLLOUT else 0)), .revents = 0 },
+            };
+            const timeout: c_int = if (len > 0 and !can_send) @intCast(std.math.clamp(bucket.msUntilToken(now), 1, 50)) else 50;
+            if (c.poll(&fds, fds.len, timeout) < 0) {
+                if (std.c._errno().* == c.EINTR) continue;
+                return;
+            }
+            if (fds[0].revents & (c.POLLIN | c.POLLHUP) != 0 and head + len < buf.len) {
+                const n = c.read(self.up, &buf[head + len], buf.len - head - len);
+                if (n == 0) return;
+                if (n > 0) len += @intCast(n);
+            }
+            if (fds[1].revents & (c.POLLIN | c.POLLHUP) != 0 and ulen < ubuf.len) {
+                const n = c.read(self.down, &ubuf[ulen], ubuf.len - ulen);
+                if (n == 0) return;
+                if (n > 0) ulen += @intCast(n);
+            }
+            if (ulen > 0) {
+                const n = c.write(self.up, &ubuf, ulen);
+                if (n > 0) {
+                    const w: usize = @intCast(n);
+                    std.mem.copyForwards(u8, ubuf[0 .. ulen - w], ubuf[w..ulen]);
+                    ulen -= w;
+                }
+            }
+            if (len > 0 and bucket.take(nowMs())) {
+                const n = c.write(self.down, &buf[head], @min(len, CHUNK));
+                if (n > 0) {
+                    head += @intCast(n);
+                    len -= @intCast(n);
+                }
+                if (len == 0) head = 0;
+            }
+            if (head != 0 and head + len == buf.len) {
+                std.mem.copyForwards(u8, buf[0..len], buf[head .. head + len]);
+                head = 0;
+            }
+        }
+    }
+
+    /// Join and close; the rig `Client` closes `rig_fd` itself.
+    fn stop(self: *ThrottledRelay) void {
+        self.stop_flag.store(true, .release);
+        if (self.thread) |t| t.join();
+        _ = c.close(self.up);
+        _ = c.close(self.down);
+        std.heap.page_allocator.destroy(self);
+    }
+};
+
+/// Stage enc: a page that animates photographic noise over its whole
+/// surface, with a target whose colour steps through `enc_click_colors`
+/// on every press.
+const enc_noise_page = "data:text/html,<html><head><title>enc:noise</title><style>html,body{margin:0;overflow:hidden;background:%23000}canvas{position:fixed;left:0;top:0}%23t{position:fixed;left:20px;top:20px;width:120px;height:80px;background:%230000ff}</style></head>" ++
+    "<body><canvas id=c width=640 height=400></canvas><div id=t></div><script>var k=['%23ff0000','%2300ff00','%23ffff00','%23ff00ff'],n=0;" ++
+    "t.onmousedown=function(){t.style.background=k[n%254];n++;document.title='enc:click'+n};" ++
+    "var x=c.getContext('2d'),d=x.createImageData(640,400),u=new Uint32Array(d.data.buffer);" ++
+    "function f(){for(var i=0;i<u.length;i++)u[i]=(Math.random()*16777215)|0xff000000;x.putImageData(d,0,0);requestAnimationFrame(f)}requestAnimationFrame(f)</script></body></html>";
+/// BGR of each press's colour, in page order.
+const enc_click_colors = [_][3]u8{ .{ 0, 0, 0xff }, .{ 0, 0xff, 0 }, .{ 0, 0xff, 0xff }, .{ 0xff, 0, 0xff } };
+/// A static page with text, so a lossy route would show.
+const enc_text_page = "data:text/html,<html><head><title>enc:text</title></head><body style='margin:8px;background:%23fdfdf8;color:%23123;font:15px sans-serif'>" ++
+    "<h1 style='color:%23a01010'>Encoded frames</h1><p>The quick brown fox jumps over the lazy dog. 0123456789 ABCDEFGHIJKLMNOPQRSTUVWXYZ</p>" ++
+    "<p style='background:%23e0f0ff'>Lossless means every one of these pixels arrives exactly as the helper painted it.</p>" ++
+    "<div style='width:200px;height:40px;background:linear-gradient(90deg,%23f00,%2300f)'></div></body></html>";
+const enc_rate: f64 = 2 * 1024 * 1024;
+
+/// Pump both clients until `b` has received nothing for `quiet_ms`.
+fn encSettle(b: *Client, a: *Client, quiet_ms: i64, timeout_ms: i64) void {
+    const deadline = nowMs() + timeout_ms;
+    var last = b.enc_seq +% b.inline_seq;
+    var since = nowMs();
+    while (nowMs() < deadline) {
+        b.pump(20);
+        a.pump(0);
+        const now_seq = b.enc_seq +% b.inline_seq;
+        if (now_seq != last) {
+            last = now_seq;
+            since = nowMs();
+        } else if (nowMs() - since >= quiet_ms) return;
+    }
+}
+
+/// Pump both clients for `ms`.
+fn encPump(b: *Client, a: *Client, ms: i64) void {
+    const end = nowMs() + ms;
+    while (nowMs() < end) {
+        b.pump(10);
+        a.pump(0);
+    }
+}
+
+/// Press the noise page's target through `b` (a controlling observer of
+/// alias 1) and return the milliseconds until `b`'s mirror shows press
+/// number `press`'s colour within `tol`, or -1 past `timeout_ms`.
+fn encClickLatency(b: *Client, a: *Client, press: usize, tol: u8, timeout_ms: i64) i64 {
+    const x = 80;
+    const y = 60;
+    b.send(proto.InputPointer{ .view = 1, .kind = @intFromEnum(proto.PointerKind.move), .x = x, .y = y, .button = 0, .clicks = 0, .mods = 0 });
+    b.send(proto.InputPointer{ .view = 1, .kind = @intFromEnum(proto.PointerKind.down), .x = x, .y = y, .button = 0, .clicks = 1, .mods = 0 });
+    const t0 = nowMs();
+    b.send(proto.InputPointer{ .view = 1, .kind = @intFromEnum(proto.PointerKind.up), .x = x, .y = y, .button = 0, .clicks = 1, .mods = 0 });
+    const want = enc_click_colors[press % enc_click_colors.len];
+    while (nowMs() - t0 < timeout_ms) {
+        b.pump(5);
+        a.pump(0);
+        if (b.iw <= x or b.ih <= y) continue;
+        const px = b.inlinePixel(x, y);
+        var ok = true;
+        for (0..3) |i| {
+            if (@abs(@as(i32, px[i]) - @as(i32, want[i])) > tol) ok = false;
+        }
+        if (ok) return nowMs() - t0;
+    }
+    return -1;
+}
+
+/// Connect an observer through a throttled relay and subscribe it to
+/// A's view 1 under its own alias 1 with control.
+fn encObserver(gpa: std.mem.Allocator, relay: *ThrottledRelay, a: *Client, name: []const u8, comptime stage: []const u8) Client {
+    var b = Client{ .gpa = gpa, .fd = relay.rig_fd };
+    b.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = name });
+    b.send(proto.ObserveEnable{ .enable = 1 });
+    b.send(proto.ObserveSubscribe{ .view = 1, .target = proto.CONN_ID_WINDOW + 1, .control = 1 });
+    const d = nowMs() + 20_000;
+    while (b.ost_seq == 0 and nowMs() < d) {
+        b.pump(50);
+        a.pump(0);
+    }
+    if (b.ost_seq == 0 or b.ost_state != proto.observe_subscribed) fail("stage " ++ stage ++ ": the throttled observer was not subscribed");
+    return b;
+}
+
+/// Stage enc (capability "frames-encoded"): an observer behind a
+/// throttled relay opts into encoded, acknowledged frames. A static text
+/// page arrives EXACTLY (lossless), a noise page without a codec offered
+/// is lossless only, with a codec offered it is video, and the time from
+/// a click to the first frame showing its effect stays bounded; an
+/// observer that never opts in still gets `frame_inline`, and the same
+/// measurement on it is reported for comparison.
+fn runEncodedStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) void {
+    var sock_buf: [96]u8 = undefined;
+    const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/enc.sock", .{dir}) catch fail("enc sock path");
+    var cache_buf: [96]u8 = undefined;
+    const cache = std.fmt.bufPrintZ(&cache_buf, "{s}/enc-cache", .{dir}) catch fail("enc cache path");
+    const pid = spawnHelper(exe, sock.ptr, cache.ptr, "--ozone-platform=headless", null, false);
+    g_pid = pid;
+
+    var a = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
+    a.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web-enc-owner" });
+    {
+        const d = nowMs() + 15_000;
+        while (a.ack_proto == 0 and nowMs() < d) a.pump(100);
+    }
+    if (!a.acks(.frames_encoded)) fail("stage enc1: hello_ack lacks the frames-encoded capability");
+    a.send(proto.ViewCreate{ .view = 1, .w = 640, .h = 400, .scale_x1000 = 1000, .context = 0 });
+    a.send(proto.Navigate{ .view = 1, .url = enc_text_page });
+    if (!a.waitTitle("enc:text", 30_000)) fail("stage enc1: the owner's text page never loaded");
+
+    // ── enc1: lossless-only opt-in reproduces the text page exactly ──
+    const relay_b = ThrottledRelay.open(sock.ptr, sock.len, enc_rate);
+    var b = encObserver(gpa, relay_b, &a, "smoke-web-enc-b", "enc1");
+    b.send(proto.FrameEncode{ .view = 1, .codecs = "" });
+    {
+        const d = nowMs() + 20_000;
+        while (b.enc_seq == 0 and nowMs() < d) {
+            b.pump(20);
+            a.pump(0);
+        }
+    }
+    if (b.enc_seq == 0) fail("stage enc1: an opted-in observer received no frame_encoded");
+    encSettle(&b, &a, 800, 20_000);
+    if (a.fb == null) fail("stage enc1: the owner has no frame buffer to compare against");
+    a.mapBuffer();
+    const fb = a.fb.?;
+    if (b.iw != fb.w or b.ih != fb.h) fail("stage enc1: the encoded surface is not the owner's size");
+    {
+        const row: usize = @as(usize, fb.w) * 4;
+        var y: usize = 0;
+        while (y < fb.h) : (y += 1) {
+            const want = a.map[y * fb.stride ..][0..row];
+            const got = b.inline_pix[y * row ..][0..row];
+            if (!std.mem.eql(u8, want, got)) {
+                const xi = std.mem.indexOfDiff(u8, want, got).? / 4;
+                std.debug.print("smoke-web: enc1 first differing pixel at {d},{d}\n", .{ xi, y });
+                fail("stage enc1: the lossless encoded page differs from the helper's pixels");
+            }
+        }
+    }
+    if (b.enc_video_parts != 0) fail("stage enc1: a lossless-only observer received a video tile");
+    pass("stage enc1 an observer opted into lossless encoded frames reproduces the helper's pixels exactly");
+
+    // ── enc2: noise with no codec offered stays lossless ──────────────
+    a.send(proto.Navigate{ .view = 1, .url = enc_noise_page });
+    if (!a.waitTitle("enc:noise", 30_000)) fail("stage enc2: the owner's noise page never loaded");
+    const seq2 = b.enc_seq;
+    encPump(&b, &a, 2500);
+    const frames_lossless = b.enc_seq - seq2;
+    if (frames_lossless < 2) fail("stage enc2: the animating page produced no encoded frames through the relay");
+    if (b.enc_video_parts != 0) fail("stage enc2: a lossless-only observer received a video tile");
+    const lat_lossless = encClickLatency(&b, &a, 0, 8, 30_000);
+    pass("stage enc2 with no codec offered the animating page arrives as lossless regions only");
+
+    // ── enc3: a codec offered: video tiles, and a bounded click latency ──
+    var lat_video: i64 = -1;
+    var frames_video: u32 = 0;
+    if (vcodec.canEncode(.h264) and vcodec.canDecode(.h264)) {
+        b.send(proto.FrameEncode{ .view = 1, .codecs = &.{@intFromEnum(vcodec.Codec.h264)} });
+        {
+            const d = nowMs() + 15_000;
+            while (b.enc_video_parts == 0 and nowMs() < d) {
+                b.pump(10);
+                a.pump(0);
+            }
+        }
+        if (b.enc_video_parts == 0) fail("stage enc3: the hot photographic page produced no video tile with h264 offered");
+        const seq3 = b.enc_seq;
+        encPump(&b, &a, 2500);
+        frames_video = b.enc_seq - seq3;
+        lat_video = encClickLatency(&b, &a, 1, 70, 30_000);
+        std.debug.print("smoke-web: enc3 video tiles {d}, dropped {d}\n", .{ b.enc_video_parts, b.enc_dropped });
+        if (lat_video < 0 or lat_video > 1000) {
+            std.debug.print("smoke-web: enc3 click-to-pixels {d} ms\n", .{lat_video});
+            fail("stage enc3: the click took longer than 1s to show through a 2 MiB/s link with encoded frames");
+        }
+        pass("stage enc3 with h264 offered the noise page streams video tiles and a click shows within 1s at 2 MiB/s");
+    } else say("smoke-web: SKIP stage enc3 (no loadable x264/libavcodec here; the video route is unexercised)");
+
+    // ── enc4: an observer that never opts in still gets frame_inline ──
+    b.send(proto.ViewDestroy{ .view = 1 });
+    encPump(&b, &a, 300);
+    const relay_c = ThrottledRelay.open(sock.ptr, sock.len, enc_rate);
+    var cl = encObserver(gpa, relay_c, &a, "smoke-web-enc-legacy", "enc4");
+    {
+        const d = nowMs() + 20_000;
+        while (cl.inline_seq == 0 and nowMs() < d) {
+            cl.pump(20);
+            a.pump(0);
+        }
+    }
+    if (cl.inline_seq == 0) fail("stage enc4: an observer that never opted in received no frame_inline");
+    const seq4 = cl.inline_seq;
+    encPump(&cl, &a, 2500);
+    const legacy_msgs = cl.inline_seq - seq4;
+    const lat_legacy = encClickLatency(&cl, &a, 2, 8, 30_000);
+    if (cl.enc_seq != 0) fail("stage enc4: an observer that never opted in received frame_encoded");
+    pass("stage enc4 an observer that never opts in still receives frame_inline");
+
+    std.debug.print(
+        "smoke-web: enc click-to-pixels at {d} KiB/s on a 640x400 noise page: encoded+video {d} ms ({d} frames/2.5s), encoded lossless {d} ms ({d} frames/2.5s), legacy frame_inline {d} ms ({d} messages/2.5s)\n",
+        .{ @as(u32, @intFromFloat(enc_rate / 1024)), lat_video, frames_video, lat_lossless, frames_lossless, lat_legacy, legacy_msgs },
+    );
+
+    cl.deinit();
+    relay_c.stop();
+    b.deinit();
+    relay_b.stop();
+    a.deinit();
+    reapHelperTimeout(pid, "stage enc last-client exit", 30_000);
+}
+
 /// Spawn a helper with an explicit argv tail — the flush/linger stages
 /// need three extra tokens (`--ozone-platform=headless --linger-ms N`),
 /// which outgrows spawnHelper's two optional slots.
@@ -7582,6 +7921,16 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             return 1;
         }
         say("smoke-web: PASS (capture only)");
+        return 0;
+    }
+    if (c.getenv("SKETERM_SMOKE_WEB_ENCODED_ONLY") != null) {
+        runEncodedStage(gpa, exe, dir);
+        cleanup();
+        if (gpa_state.deinit() == .leak) {
+            say("smoke-web: FAIL leaked memory (see GPA report above)");
+            return 1;
+        }
+        say("smoke-web: PASS (encoded frames only)");
         return 0;
     }
     if (c.getenv("SKETERM_SMOKE_WEB_OBSERVE_ONLY") != null) {
@@ -10654,6 +11003,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // ── Stage mc: multi-client serving ────────────────────────────
     runMultiClientStage(gpa, exe, dir);
     runObserveStage(gpa, exe, dir);
+    runEncodedStage(gpa, exe, dir);
     // ── Stage fl: flush + linger (broker-owned lifecycle) ─────────
     runFlushLingerStage(gpa, exe, dir);
     // ── Stage 42: cross-instance cookie sync (two real helpers) ───
