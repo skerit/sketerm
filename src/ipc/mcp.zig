@@ -874,11 +874,16 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     defer if (shared_mux_sock) |path| allocator.free(path);
     var registry_lease: ?mcp_registry.Lease = null;
     const registry_sock = if (iso) |i| i.sock else shared_mux_sock orelse "";
+    var cwd_buf: [4096]u8 = undefined;
+    const cwd_ptr = c.getcwd(&cwd_buf, cwd_buf.len);
+    const cwd: []const u8 = if (cwd_ptr != null) std.mem.span(@as([*:0]const u8, @ptrCast(cwd_ptr))) else "";
     if (mcp_registry.Lease.acquire(allocator, .{
         .mode = if (opts.shared) .shared else if (opts.durable) .durable else .isolated,
         .name = opts.name orelse "",
         .profile = opts.profile orelse "",
         .log_dir = opts.log_dir orelse "",
+        // How a surface names an unnamed server: its project directory.
+        .cwd = cwd,
         .mux_socket = registry_sock,
         // The pane this server was started from (a GUI finds its agents' pane by it).
         .session = if (c.getenv("SKETERM_SESSION")) |v| std.mem.span(v) else "",

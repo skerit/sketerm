@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- An application window with a title bar: an assistant's launched
+       app session in the AI popovers. Bundled so it renders under any
+       icon theme. -->
+  <g fill="#2e3436">
+    <path d="M2 1.5h12A1.5 1.5 0 0 1 15.5 3v10a1.5 1.5 0 0 1-1.5 1.5H2A1.5 1.5 0 0 1 .5 13V3A1.5 1.5 0 0 1 2 1.5zM2 5v8h12V5z"/>
+  </g>
+</svg>

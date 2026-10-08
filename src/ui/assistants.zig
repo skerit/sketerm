@@ -56,6 +56,7 @@ const strz = @import("../util/strz.zig");
 const vocab = @import("../agent/vocab.zig");
 const glance = @import("../ipc/agentglance.zig");
 const agentbadge = @import("agentbadge.zig");
+const a11y = @import("../a11y/atspi.zig");
 const winmod = @import("window.zig");
 const Window = winmod.Window;
 const Pane = @import("pane.zig").Pane;
@@ -84,11 +85,14 @@ pub const Kind = enum {
     app,
     terminal,
 
+    /// Bundled icons (data/icons): theme icons such as
+    /// utilities-terminal-symbolic sit in Adwaita's legacy set, which a
+    /// Breeze theme chain never reaches, and rendered as placeholders.
     pub fn icon(self: Kind) [*:0]const u8 {
         return switch (self) {
-            .web => "web-browser-symbolic",
-            .app => "application-x-executable-symbolic",
-            .terminal => "utilities-terminal-symbolic",
+            .web => "sketerm-web-symbolic",
+            .app => "sketerm-app-symbolic",
+            .terminal => "sketerm-terminal-symbolic",
         };
     }
 
@@ -167,6 +171,17 @@ const Listing = struct {
     }
 };
 
+/// How the last poll of an instance's own daemon went.
+pub const Reach = enum {
+    pending,
+    ok,
+    /// The server is live but its private daemon is not running: it
+    /// retires after a while without sessions, which is normal.
+    idle,
+    /// Unreachable: no answer, or a refusal other than "not running".
+    failed,
+};
+
 pub const Assistant = struct {
     pid: c.pid_t,
     mode: mcp_registry.Mode,
@@ -202,7 +217,7 @@ pub const Assistant = struct {
     /// attach, exactly like the Overview's per-daemon connection. Local
     /// only: a remote instance's idles in `editorio.pool`.
     conn: ?mux_client.Conn = null,
-    failed: bool = false,
+    reach: Reach = .pending,
     /// Why the last poll failed (a route names the refusing hop).
     why_buf: [160]u8 = undefined,
     why_len: usize = 0,
@@ -211,6 +226,23 @@ pub const Assistant = struct {
 
     pub fn label(self: *const Assistant) []const u8 {
         return self.name;
+    }
+
+    /// Whether it has a session row to act on; the rest are listed apart.
+    pub fn usable(self: *const Assistant) bool {
+        return self.sessions.items.len > 0;
+    }
+
+    /// Why an instance without sessions has none, for people.
+    pub fn absence(self: *const Assistant, buf: []u8) []const u8 {
+        return switch (self.reach) {
+            .failed => if (self.why().len > 0)
+                std.fmt.bufPrint(buf, "unreachable: {s}", .{self.why()}) catch "unreachable"
+            else
+                "unreachable: its daemon did not answer",
+            .idle => "idle: its daemon is not running (it stops after a while without sessions)",
+            .pending, .ok => "no sessions yet",
+        };
     }
 
     /// The browser `session` of this assistant as a watch target: through the reporting daemon when it is remote.
@@ -633,8 +665,62 @@ pub fn chipLabel(buf: []u8, live: usize, counts: Counts) []const u8 {
     return std.fmt.bufPrint(buf, "AI: {s}", .{desc}) catch "AI";
 }
 
+/// An instance's one header line name: its label, plus its pid when
+/// another instance in `roster` carries the same label (two servers
+/// started with one `--log` directory read alike otherwise).
+pub fn headerName(buf: []u8, roster: []const Assistant, a: *const Assistant) []const u8 {
+    for (roster) |*other| {
+        if (other == a or !std.mem.eql(u8, other.label(), a.label())) continue;
+        return std.fmt.bufPrint(buf, "{s} (pid {d})", .{ a.label(), a.pid }) catch a.label();
+    }
+    return a.label();
+}
+
+/// The collapsed line for the instances without sessions:
+/// `2 idle, 1 unreachable`; empty when every instance is usable.
+pub fn restSummary(buf: []u8, roster: []const Assistant) []const u8 {
+    var idle: usize = 0;
+    var unreachable_n: usize = 0;
+    for (roster) |*a| {
+        if (a.usable()) continue;
+        if (a.reach == .failed) unreachable_n += 1 else idle += 1;
+    }
+    var w: std.Io.Writer = .fixed(buf);
+    if (idle > 0) w.print("{d} idle", .{idle}) catch return w.buffered();
+    if (unreachable_n > 0) w.print("{s}{d} unreachable", .{ if (idle > 0) ", " else "", unreachable_n }) catch return w.buffered();
+    return w.buffered();
+}
+
+/// An instance's tooltip: everything its one header line leaves out.
+pub fn instanceTip(buf: []u8, a: *const Assistant) []const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    var place_buf: [256]u8 = undefined;
+    w.print("{s}\n{s} mode, pid {d}, on {s}", .{ a.label(), a.mode.text(), a.pid, placeLabel(&place_buf, a.reached orelse a.host) }) catch return w.buffered();
+    if (a.detail.len > 0) w.print("\n{s}", .{a.detail}) catch return w.buffered();
+    if (a.session) |session| w.print("\nstarted in session {s}", .{session}) catch return w.buffered();
+    var why_buf: [224]u8 = undefined;
+    if (!a.usable()) w.print("\n{s}", .{a.absence(&why_buf)}) catch return w.buffered();
+    return w.buffered();
+}
+
+/// The tallest the popovers' scrolled list grows: about 60% of the window.
+pub fn listCap(window_height: c_int) c_int {
+    return if (window_height > 0) @divTrunc(window_height * 3, 5) else 480;
+}
+
+/// An action button's accessible name: its verb and the row it acts
+/// on (`Watch claude-1 (claude)`), so a screen reader (and a rig) can
+/// tell one row's Watch from the next.
+pub fn accessibleName(buf: []u8, action: AttachAction, row: []const u8) [:0]const u8 {
+    const text = std.mem.span(action.verb().text);
+    if (row.len == 0) return std.fmt.bufPrintZ(buf, "{s}", .{text}) catch "";
+    return std.fmt.bufPrintZ(buf, "{s} {s}", .{ text, row }) catch std.fmt.bufPrintZ(buf, "{s}", .{text}) catch "";
+}
+
 /// Icon and tooltip for each attach intent, shared by the tab-bar
-/// popover and the Session Overview so the two never disagree.
+/// popover and the Session Overview so the two never disagree. The
+/// icons are bundled: the buttons are icon-only, so a theme without
+/// them would leave empty buttons.
 pub const AttachVerb = struct { icon: [*:0]const u8, tip: [*:0]const u8, text: [*:0]const u8 };
 
 /// The attach actions a session row offers, in display order: the one
@@ -661,7 +747,7 @@ pub const AttachAction = enum {
         return switch (self) {
             .watch, .control => attachVerb(self.lease()),
             .beside => .{
-                .icon = "view-dual-symbolic",
+                .icon = "sketerm-split-left-right-symbolic",
                 .text = "Show beside pane",
                 .tip = "Open or move this browser next to the selected pane. Starts read-only for a new viewer; keeps your current mode when moving.",
             },
@@ -672,12 +758,12 @@ pub const AttachAction = enum {
 pub fn attachVerb(lease: muxtabs.Lease) AttachVerb {
     return switch (lease) {
         .read_only => .{
-            .icon = "view-reveal-symbolic",
+            .icon = "sketerm-watch-symbolic",
             .tip = "View without sending keyboard or mouse input; also gives up control if you were controlling this session",
             .text = "Watch",
         },
         .control, .default => .{
-            .icon = "input-keyboard-symbolic",
+            .icon = "sketerm-control-symbolic",
             .tip = "Use your keyboard and mouse in this session, for example to sign in",
             .text = "Take control",
         },
@@ -1066,7 +1152,7 @@ pub const Watcher = struct {
             for (a.sessions.items) |s| counts.add(s.kind);
             var desc_buf: [96]u8 = undefined;
             const desc = counts.describe(&desc_buf);
-            w.print("{s}: {s}{s}\n", .{ a.label(), if (desc.len > 0) desc else "idle", if (a.failed) " (daemon unreachable)" else "" }) catch break;
+            w.print("{s}: {s}{s}\n", .{ a.label(), if (desc.len > 0) desc else "idle", if (a.reach == .failed) " (unreachable)" else "" }) catch break;
         }
         const n = w.buffered().len;
         tip[n] = 0;
@@ -1121,21 +1207,20 @@ pub const Watcher = struct {
         return tally;
     }
 
-    /// Fill a pane's agents popover: one row per agent of the servers
-    /// running in its session, and the way to the whole roster.
+    /// Fill a pane's agents popover: each server running in its session
+    /// as one header line, its agents as session rows, and the way to
+    /// the whole roster.
     fn buildPaneAgents(self: *Watcher, pane: *Pane, popover: *c.GtkWidget) void {
         if (self.dead or self.widgets_dead) return;
         const pop: *c.GtkPopover = @ptrCast(popover);
         c.gtk_popover_set_child(pop, null);
         const root = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 4).?;
-        c.gtk_widget_set_margin_start(root, 6);
-        c.gtk_widget_set_margin_end(root, 6);
-        c.gtk_widget_set_margin_top(root, 6);
-        c.gtk_widget_set_margin_bottom(root, 6);
+        setMargins(root, 6);
         const head = c.gtk_label_new("Agents of this pane").?;
         c.gtk_label_set_xalign(@ptrCast(head), 0);
         c.gtk_widget_add_css_class(head, "heading");
         c.gtk_box_append(@ptrCast(root), head);
+        const content = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 2).?;
         var sock_buf: [640]u8 = undefined;
         const default_socket = defaultSocket(&sock_buf);
         var rows: usize = 0;
@@ -1144,26 +1229,23 @@ pub const Watcher = struct {
             for (self.roster.items) |*a| {
                 if (!glance.runsIn(a.origin(), at, default_socket)) continue;
                 if (first_key.len == 0) first_key = a.host;
-                var sub_buf: [320:0]u8 = undefined;
-                const sub = std.fmt.bufPrintZ(&sub_buf, "{s}, pid {d}", .{ a.label(), a.pid }) catch "sketerm mcp";
-                const sub_label = c.gtk_label_new(sub.ptr).?;
-                c.gtk_label_set_xalign(@ptrCast(sub_label), 0);
-                c.gtk_label_set_ellipsize(@ptrCast(sub_label), c.PANGO_ELLIPSIZE_MIDDLE);
-                c.gtk_widget_add_css_class(sub_label, "dim-label");
-                c.gtk_widget_add_css_class(sub_label, "caption");
-                c.gtk_box_append(@ptrCast(root), sub_label);
+                self.appendHeader(content, a);
+                const list = newSessionList();
                 for (a.agents.items, 0..) |*ag, i| {
-                    self.appendAgentRow(root, a, ag, @intCast(i));
+                    self.appendAgentRow(list, a, ag, @intCast(i));
                     rows += 1;
                 }
+                c.gtk_box_append(@ptrCast(content), list);
             }
         }
         if (rows == 0) {
             const none = c.gtk_label_new("No agents are running in this session.").?;
             c.gtk_label_set_xalign(@ptrCast(none), 0);
             c.gtk_widget_add_css_class(none, "dim-label");
-            c.gtk_box_append(@ptrCast(root), none);
+            c.gtk_box_append(@ptrCast(content), none);
         }
+        const sw = self.scroller(content);
+        c.gtk_box_append(@ptrCast(root), sw);
         c.gtk_box_append(@ptrCast(root), c.gtk_separator_new(c.GTK_ORIENTATION_HORIZONTAL).?);
         const foot = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8).?;
         const all = c.gtk_button_new_with_label("All assistants and agents").?;
@@ -1181,44 +1263,28 @@ pub const Watcher = struct {
         c.gtk_box_append(@ptrCast(foot), note);
         c.gtk_box_append(@ptrCast(root), foot);
         c.gtk_popover_set_child(pop, root);
+        fitScroller(sw);
     }
 
-    fn appendAgentRow(self: *Watcher, root: *c.GtkWidget, a: *Assistant, ag: *const Agent, index: u16) void {
-        const row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 10).?;
-        c.gtk_widget_set_margin_top(row, 4);
-        c.gtk_widget_set_margin_bottom(row, 4);
+    /// One agent as a session row: its state glyph, `id on place`, its
+    /// attention as the chip's own pill (palette colours, so it reads on
+    /// any theme), and the actions of its first session (its app;
+    /// opencode's server is the second).
+    fn appendAgentRow(self: *Watcher, list: *c.GtkWidget, a: *Assistant, ag: *const Agent, index: u16) void {
         const glyph = agentbadge.newGlyph(ag.attention, .theme);
         c.gtk_widget_set_size_request(glyph, 16, 16);
-        c.gtk_box_append(@ptrCast(row), glyph);
-        const identity = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 2).?;
-        c.gtk_widget_set_hexpand(identity, 1);
-        const title = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 0).?;
-        var id_buf: [128:0]u8 = undefined;
-        const id_label = c.gtk_label_new(strz.copyZ(&id_buf, ag.id)).?;
-        c.gtk_widget_add_css_class(id_label, "monospace");
-        c.gtk_box_append(@ptrCast(title), id_label);
         var place_buf: [256]u8 = undefined;
-        var on_buf: [280:0]u8 = undefined;
-        const on = std.fmt.bufPrintZ(&on_buf, " on {s}", .{placeLabel(&place_buf, ag.watch)}) catch "";
-        const on_label = c.gtk_label_new(on.ptr).?;
-        c.gtk_widget_add_css_class(on_label, "heading");
-        c.gtk_box_append(@ptrCast(title), on_label);
-        c.gtk_box_append(@ptrCast(identity), title);
+        var title_buf: [400]u8 = undefined;
+        const title = std.fmt.bufPrint(&title_buf, "{s} on {s}", .{ ag.id, placeLabel(&place_buf, ag.watch) }) catch ag.id;
         var status_buf: [64:0]u8 = undefined;
-        const status = c.gtk_label_new(statusText(&status_buf, ag.attention).ptr).?;
-        c.gtk_label_set_xalign(@ptrCast(status), 0);
-        c.gtk_widget_add_css_class(status, "caption");
-        c.gtk_widget_add_css_class(status, agentbadge.themeClass(ag.attention));
-        c.gtk_box_append(@ptrCast(identity), status);
-        c.gtk_box_append(@ptrCast(row), identity);
-        // The agent's first session (its app; opencode's server is the
-        // second) is what Watch and Take control attach.
+        const status = statusText(&status_buf, ag.attention);
+        var first: ?*Session = null;
         for (a.sessions.items) |*s| {
             if (s.agent != index) continue;
-            self.appendAttachButtons(row, a, s);
+            first = s;
             break;
         }
-        c.gtk_box_append(@ptrCast(root), row);
+        self.appendSessionRow(list, glyph, title, .{ .pill = .{ .text = status, .attention = ag.attention } }, null, a, first);
     }
 
     fn preferred(self: *const Watcher) []const u8 {
@@ -1244,26 +1310,31 @@ pub const Watcher = struct {
         for (self.roster.items) |*a| if (a.reached != null) self.startFetch(a);
     }
 
+    /// The badge popover: usable instances first (the preferred one at
+    /// the top), each a header line over its session rows; the rest as
+    /// one collapsed line at the bottom; all inside the capped scroller.
     fn buildPopover(self: *Watcher) void {
         const pop: *c.GtkPopover = @ptrCast(self.popover);
         c.gtk_popover_set_child(pop, null);
         const root = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 8).?;
-        c.gtk_widget_set_margin_start(root, 6);
-        c.gtk_widget_set_margin_end(root, 6);
-        c.gtk_widget_set_margin_top(root, 6);
-        c.gtk_widget_set_margin_bottom(root, 6);
-        // Preferred assistant first, then roster order.
+        setMargins(root, 6);
+        const content = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 10).?;
         const first = self.findByHost(self.preferred());
-        if (first) |a| self.appendAssistant(root, a);
+        if (first) |a| if (a.usable()) self.appendAssistant(content, a);
         for (self.roster.items) |*a| {
-            if (first == a) continue;
-            self.appendAssistant(root, a);
+            if (first == a or !a.usable()) continue;
+            self.appendAssistant(content, a);
         }
+        const rest = self.appendRest(content);
         if (self.roster.items.len == 0) {
             const none = c.gtk_label_new("No assistant is running.").?;
             c.gtk_widget_add_css_class(none, "dim-label");
-            c.gtk_box_append(@ptrCast(root), none);
+            c.gtk_box_append(@ptrCast(content), none);
         }
+        const sw = self.scroller(content);
+        c.gtk_box_append(@ptrCast(root), sw);
+        // Expanding the rest grows the list without a rebuild.
+        if (rest) |expander| _ = c.g_signal_connect_data(expander, "notify::expanded", @ptrCast(&onRestExpanded), @ptrCast(sw), null, c.G_CONNECT_DEFAULT);
         if (summarize(self.roster.items).web != 0) {
             const help = c.gtk_label_new("Watch is read-only. Take control to type or sign in.\nFor side by side, select a destination pane first.").?;
             c.gtk_label_set_xalign(@ptrCast(help), 0);
@@ -1274,125 +1345,192 @@ pub const Watcher = struct {
             c.gtk_box_append(@ptrCast(root), help);
         }
         c.gtk_popover_set_child(pop, root);
+        fitScroller(sw);
     }
 
-    fn appendAssistant(self: *Watcher, root: *c.GtkWidget, a: *Assistant) void {
+    /// The scrolled area both popovers list into: natural size up to
+    /// `listCap` of the window's height, so a long roster scrolls
+    /// instead of running off screen.
+    fn scroller(self: *Watcher, child: *c.GtkWidget) *c.GtkWidget {
+        const sw = c.gtk_scrolled_window_new().?;
+        c.gtk_scrolled_window_set_policy(@ptrCast(sw), c.GTK_POLICY_NEVER, c.GTK_POLICY_AUTOMATIC);
+        c.gtk_scrolled_window_set_propagate_natural_height(@ptrCast(sw), 1);
+        c.gtk_scrolled_window_set_propagate_natural_width(@ptrCast(sw), 1);
+        c.gtk_scrolled_window_set_max_content_height(@ptrCast(sw), listCap(c.gtk_widget_get_height(self.win.app_window)));
+        c.gtk_scrolled_window_set_child(@ptrCast(sw), child);
+        return sw;
+    }
+
+    fn appendAssistant(self: *Watcher, content: *c.GtkWidget, a: *Assistant) void {
         const section = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 2).?;
-        var head_buf: [256:0]u8 = undefined;
-        const head = std.fmt.bufPrintZ(&head_buf, "{s}", .{a.label()}) catch "assistant";
-        const head_label = c.gtk_label_new(head.ptr).?;
-        c.gtk_label_set_xalign(@ptrCast(head_label), 0);
-        c.gtk_widget_add_css_class(head_label, "heading");
-        c.gtk_box_append(@ptrCast(section), head_label);
-        var sub_buf: [512:0]u8 = undefined;
-        const sub = std.fmt.bufPrintZ(&sub_buf, "{s}{s}{s}", .{
-            a.mode.text(),
-            if (a.detail.len > 0) " - " else "",
-            a.detail,
-        }) catch "";
-        const sub_label = c.gtk_label_new(sub.ptr).?;
-        c.gtk_label_set_xalign(@ptrCast(sub_label), 0);
-        c.gtk_label_set_ellipsize(@ptrCast(sub_label), c.PANGO_ELLIPSIZE_MIDDLE);
-        c.gtk_label_set_max_width_chars(@ptrCast(sub_label), 48);
-        c.gtk_widget_add_css_class(sub_label, "dim-label");
-        c.gtk_box_append(@ptrCast(section), sub_label);
-        if (a.failed) {
-            var fail_buf: [224:0]u8 = undefined;
-            const text = if (a.why().len > 0)
-                std.fmt.bufPrintZ(&fail_buf, "unreachable: {s}", .{a.why()}) catch "daemon unreachable"
+        self.appendHeader(section, a);
+        const list = newSessionList();
+        for (a.sessions.items) |*s| {
+            const icon = c.gtk_image_new_from_icon_name(s.kind.icon()).?;
+            var title_buf: [320]u8 = undefined;
+            const title = rowTitle(&title_buf, a, s);
+            var tip_buf: [400]u8 = undefined;
+            const tip = if (s.kind == .web)
+                s.browser.title()
             else
-                "daemon unreachable";
-            const failed = c.gtk_label_new(text.ptr).?;
-            c.gtk_label_set_xalign(@ptrCast(failed), 0);
-            c.gtk_label_set_wrap(@ptrCast(failed), 1);
-            c.gtk_label_set_max_width_chars(@ptrCast(failed), 48);
-            c.gtk_widget_add_css_class(failed, "dim-label");
-            c.gtk_widget_add_css_class(failed, "error");
-            c.gtk_box_append(@ptrCast(section), failed);
-        } else if (a.sessions.items.len == 0) {
-            const idle = c.gtk_label_new("no sessions yet").?;
-            c.gtk_label_set_xalign(@ptrCast(idle), 0);
-            c.gtk_widget_add_css_class(idle, "dim-label");
-            c.gtk_box_append(@ptrCast(section), idle);
+                std.fmt.bufPrint(&tip_buf, "{s} ({s}) at {s}, {d} viewer(s)", .{ s.name, @tagName(s.kind), s.attachHost(a), s.viewers }) catch s.name;
+            const sub: RowSubtitle = if (s.kind == .web) .{ .text = s.browser.subtitle() } else .none;
+            self.appendSessionRow(list, icon, title, sub, tip, a, s);
         }
-        for (a.sessions.items) |*s| self.appendSessionRow(section, a, s);
-        c.gtk_box_append(@ptrCast(root), section);
+        c.gtk_box_append(@ptrCast(section), list);
+        c.gtk_box_append(@ptrCast(content), section);
     }
 
-    fn appendSessionRow(self: *Watcher, section: *c.GtkWidget, a: *Assistant, s: *Session) void {
-        const row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 6).?;
-        const icon = c.gtk_image_new_from_icon_name(s.kind.icon()).?;
-        c.gtk_box_append(@ptrCast(row), icon);
-        var title_buf: [320]u8 = undefined;
-        var text_buf: [320:0]u8 = undefined;
-        const text = std.fmt.bufPrintZ(&text_buf, "{s}", .{rowTitle(&title_buf, a, s)}) catch "session";
-        const label = c.gtk_label_new(text.ptr).?;
-        c.gtk_label_set_xalign(@ptrCast(label), 0);
-        c.gtk_label_set_ellipsize(@ptrCast(label), c.PANGO_ELLIPSIZE_END);
-        c.gtk_label_set_max_width_chars(@ptrCast(label), 36);
-        c.gtk_widget_set_hexpand(label, 1);
-        if (s.kind == .web) c.gtk_widget_add_css_class(label, "heading");
-        var tip_buf: [400:0]u8 = undefined;
-        const tip = if (s.kind == .web)
-            std.fmt.bufPrintZ(&tip_buf, "{s}", .{s.browser.title()}) catch null
-        else
-            std.fmt.bufPrintZ(&tip_buf, "{s} ({s}) at {s}, {d} viewer(s)", .{ s.name, @tagName(s.kind), s.attachHost(a), s.viewers }) catch null;
-        if (tip) |tz| c.gtk_widget_set_tooltip_text(label, tz.ptr);
-        const identity = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 2).?;
-        c.gtk_widget_set_hexpand(identity, 1);
-        c.gtk_box_append(@ptrCast(identity), label);
-        if (s.kind == .web) {
-            var domain_buf: [320:0]u8 = undefined;
-            const domain = std.fmt.bufPrintZ(&domain_buf, "{s}", .{s.browser.subtitle()}) catch "Browser";
-            const sub = c.gtk_label_new(domain.ptr).?;
-            c.gtk_label_set_xalign(@ptrCast(sub), 0);
-            c.gtk_label_set_ellipsize(@ptrCast(sub), c.PANGO_ELLIPSIZE_END);
-            c.gtk_label_set_max_width_chars(@ptrCast(sub), 36);
-            c.gtk_widget_add_css_class(sub, "dim-label");
-            c.gtk_widget_add_css_class(sub, "caption");
-            c.gtk_widget_set_tooltip_text(sub, domain.ptr);
-            c.gtk_box_append(@ptrCast(identity), sub);
-        }
-        c.gtk_box_append(@ptrCast(row), identity);
-        // Identity above actions: long names no longer compete for width
-        // with the buttons, and each browser reads as one compact group.
-        const card = if (s.kind == .web) c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 6).? else row;
-        const controls = if (s.kind == .web) c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 6).? else row;
-        if (s.kind == .web) {
-            c.gtk_widget_set_margin_top(card, 8);
-            c.gtk_widget_set_margin_bottom(card, 8);
-            c.gtk_box_append(@ptrCast(card), row);
-            c.gtk_box_append(@ptrCast(card), controls);
-        }
-        self.appendAttachButtons(controls, a, s);
-        c.gtk_box_append(@ptrCast(section), card);
+    /// An instance's one header line: its name, what it runs, and its
+    /// mode only when that is not the default; the rest is the tooltip.
+    fn appendHeader(self: *Watcher, box: *c.GtkWidget, a: *const Assistant) void {
+        const line = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8).?;
+        var name_buf: [320]u8 = undefined;
+        var name_z: [320:0]u8 = undefined;
+        const name = headingLabel(strz.copyZ(&name_z, headerName(&name_buf, self.roster.items, a)));
+        c.gtk_label_set_xalign(@ptrCast(name), 0);
+        c.gtk_label_set_ellipsize(@ptrCast(name), c.PANGO_ELLIPSIZE_END);
+        c.gtk_widget_add_css_class(name, "heading");
+        c.gtk_box_append(@ptrCast(line), name);
+        var counts: Counts = .{};
+        for (a.sessions.items) |s| counts.add(s.kind);
+        var desc_buf: [96]u8 = undefined;
+        const desc = counts.describe(&desc_buf);
+        var facts_z: [160:0]u8 = undefined;
+        const facts = std.fmt.bufPrintZ(&facts_z, "{s}{s}{s}", .{
+            if (desc.len > 0) desc else "no sessions",
+            if (a.mode.isDefault()) "" else ", ",
+            if (a.mode.isDefault()) "" else a.mode.text(),
+        }) catch "";
+        const facts_label = c.gtk_label_new(facts.ptr).?;
+        c.gtk_label_set_xalign(@ptrCast(facts_label), 0);
+        c.gtk_widget_set_hexpand(facts_label, 1);
+        c.gtk_widget_add_css_class(facts_label, "dim-label");
+        c.gtk_widget_add_css_class(facts_label, "caption");
+        c.gtk_box_append(@ptrCast(line), facts_label);
+        var tip_buf: [1024]u8 = undefined;
+        var tip_z: [1024:0]u8 = undefined;
+        c.gtk_widget_set_tooltip_text(line, strz.copyZ(&tip_z, instanceTip(&tip_buf, a)));
+        c.gtk_box_append(@ptrCast(box), line);
     }
 
-    /// The `AttachAction`s that apply to one roster row, each button
-    /// owning its `RowCtx`.
-    fn appendAttachButtons(self: *Watcher, controls: *c.GtkWidget, a: *Assistant, s: *Session) void {
-        const placement = self.win.sessionPlacement(s.name, s.attachHost(a));
+    /// The instances without sessions (idle or unreachable) as ONE
+    /// collapsed line; expanded, a name per instance, the reason in its
+    /// tooltip. Never `error` styling: nothing here needs the reader.
+    fn appendRest(self: *Watcher, content: *c.GtkWidget) ?*c.GtkWidget {
+        var sum_buf: [64]u8 = undefined;
+        var sum_z: [64:0]u8 = undefined;
+        const summary = restSummary(&sum_buf, self.roster.items);
+        if (summary.len == 0) return null;
+        const expander = c.gtk_expander_new(strz.copyZ(&sum_z, summary)).?;
+        c.gtk_widget_add_css_class(expander, "dim-label");
+        const inner = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 2).?;
+        c.gtk_widget_set_margin_start(inner, 18);
+        for (self.roster.items) |*a| {
+            if (a.usable()) continue;
+            var name_buf: [320]u8 = undefined;
+            var name_z: [320:0]u8 = undefined;
+            const name = c.gtk_label_new(strz.copyZ(&name_z, headerName(&name_buf, self.roster.items, a))).?;
+            c.gtk_label_set_xalign(@ptrCast(name), 0);
+            c.gtk_label_set_ellipsize(@ptrCast(name), c.PANGO_ELLIPSIZE_END);
+            c.gtk_widget_add_css_class(name, "caption");
+            var tip_buf: [1024]u8 = undefined;
+            var tip_z: [1024:0]u8 = undefined;
+            c.gtk_widget_set_tooltip_text(name, strz.copyZ(&tip_z, instanceTip(&tip_buf, a)));
+            c.gtk_box_append(@ptrCast(inner), name);
+        }
+        c.gtk_expander_set_child(@ptrCast(expander), inner);
+        c.gtk_box_append(@ptrCast(content), expander);
+        return expander;
+    }
+
+    /// The one session row layout every popover uses: icon, title and
+    /// subtitle, then the icon-only actions that apply; activating the
+    /// row itself is Watch. `s` null = nothing to attach (no buttons).
+    fn appendSessionRow(self: *Watcher, list: *c.GtkWidget, icon: *c.GtkWidget, title: []const u8, sub: RowSubtitle, tip: ?[]const u8, a: *Assistant, s: ?*Session) void {
+        const body = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8).?;
+        c.gtk_widget_set_margin_top(body, 3);
+        c.gtk_widget_set_margin_bottom(body, 3);
+        c.gtk_widget_set_valign(icon, c.GTK_ALIGN_CENTER);
+        c.gtk_box_append(@ptrCast(body), icon);
+        const text = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 1).?;
+        c.gtk_widget_set_hexpand(text, 1);
+        c.gtk_widget_set_valign(text, c.GTK_ALIGN_CENTER);
+        var title_z: [400:0]u8 = undefined;
+        const title_label = c.gtk_label_new(strz.copyZ(&title_z, title)).?;
+        c.gtk_label_set_xalign(@ptrCast(title_label), 0);
+        c.gtk_label_set_ellipsize(@ptrCast(title_label), c.PANGO_ELLIPSIZE_END);
+        c.gtk_label_set_max_width_chars(@ptrCast(title_label), 36);
+        c.gtk_box_append(@ptrCast(text), title_label);
+        switch (sub) {
+            .none => {},
+            .text => |line| {
+                var sub_z: [320:0]u8 = undefined;
+                const label = c.gtk_label_new(strz.copyZ(&sub_z, line)).?;
+                c.gtk_label_set_xalign(@ptrCast(label), 0);
+                c.gtk_label_set_ellipsize(@ptrCast(label), c.PANGO_ELLIPSIZE_END);
+                c.gtk_label_set_max_width_chars(@ptrCast(label), 36);
+                c.gtk_widget_add_css_class(label, "dim-label");
+                c.gtk_widget_add_css_class(label, "caption");
+                c.gtk_box_append(@ptrCast(text), label);
+            },
+            .pill => |p| {
+                const label = c.gtk_label_new(p.text.ptr).?;
+                c.gtk_widget_set_halign(label, c.GTK_ALIGN_START);
+                c.gtk_widget_add_css_class(label, "caption");
+                c.gtk_widget_add_css_class(label, "sketerm-agents-pill");
+                c.gtk_widget_add_css_class(label, agentbadge.attentionClass(p.attention));
+                agentbadge.installCss(label);
+                c.gtk_box_append(@ptrCast(text), label);
+            },
+        }
+        c.gtk_box_append(@ptrCast(body), text);
+        const row = c.gtk_list_box_row_new().?;
+        c.gtk_list_box_row_set_child(@ptrCast(row), body);
+        if (tip) |words| {
+            var tip_z: [400:0]u8 = undefined;
+            c.gtk_widget_set_tooltip_text(text, strz.copyZ(&tip_z, words));
+        }
+        var watchable = false;
+        if (s) |session| {
+            watchable = self.appendAttachButtons(body, a, session, title);
+            if (watchable) {
+                if (RowCtx.create(self.allocator, self, a.host, session.name, session.attachHost(a), .watch)) |ctx| {
+                    c.g_object_set_data_full(@ptrCast(row), ROW_ATTACH_KEY, @ptrCast(ctx), &destroyRowCtx);
+                } else watchable = false;
+            }
+        }
+        c.gtk_list_box_row_set_activatable(@ptrCast(row), @intFromBool(watchable));
+        c.gtk_list_box_append(@ptrCast(list), row);
+    }
+
+    /// Whether `action` may run on row `s`: browser actions focus,
+    /// escalate or relocate the existing watch; other session kinds keep
+    /// their attachment policy.
+    fn actionSensitive(self: *Watcher, a: *Assistant, s: *Session, action: AttachAction) bool {
+        if (s.kind == .web) return true;
+        return switch (self.win.sessionPlacement(s.name, s.attachHost(a))) {
+            .none => true,
+            .tabless => action.lease() == .control,
+            .pane => false,
+        };
+    }
+
+    /// The `AttachAction`s that apply to one row, icon-only, each owning
+    /// its `RowCtx`. @return whether Watch is available on it.
+    fn appendAttachButtons(self: *Watcher, controls: *c.GtkWidget, a: *Assistant, s: *Session, row_title: []const u8) bool {
+        var watchable = false;
         for (std.enums.values(AttachAction)) |action| {
             if (!action.appliesTo(s.kind)) continue;
-            const lease = action.lease();
-            const verb = action.verb();
-            // Labelled, not icon-only: the popover is the one place a
-            // person reads these verbs cold, and a rig drives them by text.
-            const btn = c.gtk_button_new_with_label(verb.text).?;
-            c.gtk_widget_add_css_class(btn, "flat");
-            c.gtk_widget_set_tooltip_text(btn, verb.tip);
-            // Browser actions focus, escalate, or relocate the existing
-            // watch. Other session kinds retain their attachment policy.
-            const sensitive = if (s.kind == .web) true else switch (placement) {
-                .none => true,
-                .tabless => lease == .control,
-                .pane => false,
-            };
+            const sensitive = self.actionSensitive(a, s, action);
+            if (action == .watch) watchable = sensitive;
+            const btn = attachButton(action, row_title);
             c.gtk_widget_set_sensitive(btn, @intFromBool(sensitive));
             const ctx = RowCtx.create(self.allocator, self, a.host, s.name, s.attachHost(a), action) orelse continue;
             _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onRowClicked), @ptrCast(ctx), @ptrCast(&freeRowCtx), c.G_CONNECT_DEFAULT);
             c.gtk_box_append(@ptrCast(controls), btn);
         }
+        return watchable;
     }
 
     /// Attach `session` of the assistant keyed `key` (at `attach_host`)
@@ -1482,10 +1620,18 @@ pub const Watcher = struct {
                 op.conn = null;
             }
         }
-        const failed = !op.ok;
-        var changed = a.failed != failed;
-        a.failed = failed;
-        if (failed) a.noteFailure(op.why_buf[0..op.why_len]);
+        const reach: Reach = if (op.ok) .ok else if (op.idle) .idle else .failed;
+        var changed = a.reach != reach;
+        a.reach = reach;
+        if (reach == .failed) a.noteFailure(op.why_buf[0..op.why_len]);
+        if (reach == .idle and a.listing != null) {
+            // A retired daemon took its sessions with it.
+            a.listing.?.deinit();
+            a.listing = null;
+            a.listing_fp = 0;
+            a.rebuildRows(self.allocator);
+            changed = true;
+        }
         if (op.parsed) |parsed| {
             const fp = std.hash.Wyhash.hash(rosterFingerprint(parsed.value.sessions), std.mem.sliceAsBytes(op.browsers));
             if (fp != a.listing_fp or a.listing == null) {
@@ -1561,7 +1707,10 @@ const RowCtx = struct {
     }
 };
 
-fn freeRowCtx(user: ?*anyopaque, _: ?*c.GClosure) callconv(.c) void {
+/// A session row's Watch context, owned by the row (qdata).
+const ROW_ATTACH_KEY = "sketerm-row-attach";
+
+fn destroyRowCtx(user: ?*anyopaque) callconv(.c) void {
     const ctx = cast.userData(RowCtx, user);
     ctx.allocator.free(ctx.key);
     ctx.allocator.free(ctx.session);
@@ -1569,10 +1718,23 @@ fn freeRowCtx(user: ?*anyopaque, _: ?*c.GClosure) callconv(.c) void {
     ctx.allocator.destroy(ctx);
 }
 
+fn freeRowCtx(user: ?*anyopaque, _: ?*c.GClosure) callconv(.c) void {
+    destroyRowCtx(user);
+}
+
 fn onRowClicked(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const ctx = cast.userData(RowCtx, user);
+    fireRow(@ptrCast(btn), cast.userData(RowCtx, user));
+}
+
+/// Activating a session row itself (click or Enter) is its Watch.
+fn onSessionRowActivated(_: *c.GtkListBox, row: *c.GtkListBoxRow, _: ?*anyopaque) callconv(.c) void {
+    const data = c.g_object_get_data(@ptrCast(row), ROW_ATTACH_KEY) orelse return;
+    fireRow(@ptrCast(row), cast.userData(RowCtx, data));
+}
+
+fn fireRow(widget: *c.GtkWidget, ctx: *RowCtx) void {
     // The popover is rebuilt while it is open, which frees this row's
-    // button and with it this context: copy what the attach needs
+    // widgets and with them this context: copy what the attach needs
     // before anything can rebuild.
     const watcher = ctx.watcher;
     const action = ctx.action;
@@ -1584,11 +1746,78 @@ fn onRowClicked(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const host = copyInto(&host_buf, ctx.attach_host) orelse return;
     // A pane's agents popover is not the watcher's own: close it now
     // (the watcher's closes when the attach lands, a failure is a toast).
-    if (c.gtk_widget_get_ancestor(@ptrCast(btn), c.gtk_popover_get_type())) |pop| {
+    if (c.gtk_widget_get_ancestor(widget, c.gtk_popover_get_type())) |pop| {
         const w: *c.GtkWidget = @ptrCast(pop);
         if (w != watcher.popover) c.gtk_popover_popdown(@ptrCast(w));
     }
     watcher.startAttach(key, name, host, action);
+}
+
+/// What a session row shows under its title.
+const RowSubtitle = union(enum) {
+    none,
+    text: []const u8,
+    /// An agent's attention in the chip's own palette.
+    pill: struct { text: [:0]const u8, attention: ?vocab.Attention },
+};
+
+/// A label screen readers (and rigs) find as a heading: an instance's
+/// name, one per instance.
+fn headingLabel(text: [*:0]const u8) *c.GtkWidget {
+    const obj = c.g_object_new(c.gtk_label_get_type(), "accessible-role", @as(c_int, c.GTK_ACCESSIBLE_ROLE_HEADING), "label", text, @as(?*anyopaque, null));
+    return @ptrCast(@alignCast(obj));
+}
+
+/// Scroll only once the list outgrows its cap: an AUTOMATIC vertical
+/// policy makes the scrollbar's own minimum height the list's, which
+/// padded a one-line list with empty space.
+fn fitScroller(sw: *c.GtkWidget) void {
+    const child = c.gtk_scrolled_window_get_child(@ptrCast(sw)) orelse return;
+    var min: c_int = 0;
+    var nat: c_int = 0;
+    c.gtk_widget_measure(child, c.GTK_ORIENTATION_VERTICAL, -1, &min, &nat, null, null);
+    const scroll = nat > c.gtk_scrolled_window_get_max_content_height(@ptrCast(sw));
+    c.gtk_scrolled_window_set_policy(@ptrCast(sw), c.GTK_POLICY_NEVER, if (scroll) c.GTK_POLICY_AUTOMATIC else c.GTK_POLICY_NEVER);
+}
+
+/// The scroller is an ancestor of the expander, so it outlives this
+/// connection: no context to own.
+fn onRestExpanded(_: *c.GObject, _: *c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
+    fitScroller(@ptrCast(@alignCast(user.?)));
+}
+
+fn setMargins(w: *c.GtkWidget, px: c_int) void {
+    c.gtk_widget_set_margin_start(w, px);
+    c.gtk_widget_set_margin_end(w, px);
+    c.gtk_widget_set_margin_top(w, px);
+    c.gtk_widget_set_margin_bottom(w, px);
+}
+
+/// The list one instance's session rows go in; a row's activation is
+/// its Watch (`onSessionRowActivated`).
+fn newSessionList() *c.GtkWidget {
+    const list = c.gtk_list_box_new().?;
+    c.gtk_list_box_set_selection_mode(@ptrCast(list), c.GTK_SELECTION_NONE);
+    c.gtk_list_box_set_activate_on_single_click(@ptrCast(list), 1);
+    c.gtk_widget_add_css_class(list, "navigation-sidebar");
+    _ = c.g_signal_connect_data(list, "row-activated", @ptrCast(&onSessionRowActivated), null, null, c.G_CONNECT_DEFAULT);
+    return list;
+}
+
+/// An icon-only attach button: the verb's bundled icon, its words and
+/// tip as the tooltip, and `accessibleName` as its accessible label.
+/// The one builder the popovers and the Session Overview share.
+pub fn attachButton(action: AttachAction, row: []const u8) *c.GtkWidget {
+    const verb = action.verb();
+    const btn = c.gtk_button_new_from_icon_name(verb.icon).?;
+    c.gtk_widget_add_css_class(btn, "flat");
+    c.gtk_widget_set_valign(btn, c.GTK_ALIGN_CENTER);
+    var tip_buf: [400:0]u8 = undefined;
+    const tip: [*:0]const u8 = if (std.fmt.bufPrintZ(&tip_buf, "{s}: {s}", .{ verb.text, verb.tip })) |z| z.ptr else |_| verb.tip;
+    c.gtk_widget_set_tooltip_text(btn, tip);
+    var name_buf: [400]u8 = undefined;
+    a11y.setLabel(btn, accessibleName(&name_buf, action, row).ptr);
+    return btn;
 }
 
 /// "All assistants and agents" in a pane's agents popover.
@@ -1724,6 +1953,8 @@ const FetchOp = struct {
     conn: ?mux_client.Conn = null,
     parsed: ?std.json.Parsed(mux_cli.Welcome) = null,
     ok: bool = false,
+    /// The dial found the server's daemon not running (`Reach.idle`).
+    idle: bool = false,
     browsers: []webpresence.Metadata = &.{},
     why_buf: [160]u8 = undefined,
     why_len: usize = 0,
@@ -1739,7 +1970,13 @@ const FetchOp = struct {
 
     fn dial(self: *FetchOp) ?mux_client.Conn {
         const key = self.key.?;
-        if (self.local) return dialSocket(key["sock:".len..]);
+        self.idle = false;
+        if (self.local) {
+            return dialSocket(key["sock:".len..]) catch |err| {
+                self.idle = err == error.NoDaemon;
+                return null;
+            };
+        }
         // Connect only: a route ends in `--proxy --instance`, which never
         // starts a daemon; its refusal names the hop and why.
         if (mux_cli.muxConnect(std.heap.c_allocator, key)) |conn| {
@@ -1747,6 +1984,7 @@ const FetchOp = struct {
             cc.setNonBlocking();
             return cc;
         }
+        self.idle = mux_client.routeRefusal() == .instance_down;
         const why = mux_client.routeFailure();
         const text = if (why.len > 0) why else "cannot connect";
         const n = @min(text.len, self.why_buf.len);
@@ -1781,10 +2019,10 @@ fn fetchThreadMain(op: *FetchOp) void {
     _ = c.g_idle_add(@ptrCast(&onFetchIdle), @ptrCast(op));
 }
 
-/// Connect-only: a dead assistant daemon is never resurrected by a
-/// viewer, and its absence is silent (the roster shows it unreachable).
-fn dialSocket(path: []const u8) ?mux_client.Conn {
-    var conn = mux_client.Conn.connectProbed(std.heap.c_allocator, path) catch return null;
+/// Connect-only: a retired assistant daemon is never resurrected by a
+/// viewer; `error.NoDaemon` reads as an idle instance, not a broken one.
+fn dialSocket(path: []const u8) !mux_client.Conn {
+    var conn = try mux_client.Conn.connectProbed(std.heap.c_allocator, path);
     conn.setNonBlocking();
     return conn;
 }
@@ -2113,4 +2351,79 @@ test "local registry agents attach at the instance socket or the plain host" {
     try t.expect(a.setAgents(t.allocator, null));
     a.rebuildRows(t.allocator);
     try t.expectEqual(@as(usize, 0), a.sessions.items.len);
+}
+
+fn testAssistant(pid: c.pid_t, name: []const u8, host: []const u8) !Assistant {
+    return .{
+        .pid = pid,
+        .mode = .isolated,
+        .name = try t.allocator.dupe(u8, name),
+        .detail = try t.allocator.dupe(u8, ""),
+        .host = try t.allocator.dupe(u8, host),
+    };
+}
+
+test "two servers sharing a name read apart by pid; one alone keeps its name" {
+    var roster = [_]Assistant{
+        try testAssistant(11, "claudehere", "sock:/r/mcp-tmp-11/mux.sock"),
+        try testAssistant(12, "claudehere", "sock:/r/mcp-tmp-12/mux.sock"),
+        try testAssistant(13, "sketerm", "sock:/r/mcp-tmp-13/mux.sock"),
+    };
+    defer for (&roster) |*r| r.deinit(t.allocator);
+    var buf: [64]u8 = undefined;
+    try t.expectEqualStrings("claudehere (pid 11)", headerName(&buf, &roster, &roster[0]));
+    try t.expectEqualStrings("claudehere (pid 12)", headerName(&buf, &roster, &roster[1]));
+    try t.expectEqualStrings("sketerm", headerName(&buf, &roster, &roster[2]));
+}
+
+test "instances without sessions collapse into one idle/unreachable line" {
+    var roster = [_]Assistant{
+        try testAssistant(1, "a", "sock:/r/a"),
+        try testAssistant(2, "b", "sock:/r/b"),
+        try testAssistant(3, "c", "sock:/r/c"),
+        try testAssistant(4, "d", "sock:/r/d"),
+    };
+    defer for (&roster) |*r| r.deinit(t.allocator);
+    var buf: [64]u8 = undefined;
+    // Pending, idle and unreachable alike have nothing to act on.
+    try t.expectEqualStrings("4 idle", restSummary(&buf, &roster));
+    roster[0].reach = .idle;
+    roster[1].reach = .failed;
+    roster[1].noteFailure("box refused the route (bad_route): no");
+    try roster[2].appendRow(t.allocator, "s", "", "", .terminal, 0, .{}, null, null);
+    roster[2].reach = .ok;
+    try t.expectEqualStrings("2 idle, 1 unreachable", restSummary(&buf, &roster));
+    try t.expect(roster[2].usable());
+    try t.expect(!roster[1].usable());
+    var why: [224]u8 = undefined;
+    try t.expectEqualStrings("unreachable: box refused the route (bad_route): no", roster[1].absence(&why));
+    try t.expect(std.mem.startsWith(u8, roster[0].absence(&why), "idle:"));
+    for (&roster) |*r| r.reach = .ok;
+    roster[0].reach = .failed;
+    roster[0].why_len = 0;
+    try roster[1].appendRow(t.allocator, "s", "", "", .terminal, 0, .{}, null, null);
+    try roster[3].appendRow(t.allocator, "s", "", "", .web, 0, .{}, null, null);
+    try t.expectEqualStrings("1 unreachable", restSummary(&buf, &roster));
+    roster[0].reach = .ok;
+    try roster[0].appendRow(t.allocator, "s", "", "", .app, 0, .{}, null, null);
+    try t.expectEqualStrings("", restSummary(&buf, &roster));
+}
+
+test "the tooltip carries the mode, the pid and why an instance is empty" {
+    var a = try testAssistant(42, "claudehere", "sock:/r/mcp-tmp-42/mux.sock");
+    defer a.deinit(t.allocator);
+    a.reach = .idle;
+    var buf: [512]u8 = undefined;
+    const tip = instanceTip(&buf, &a);
+    try t.expect(std.mem.indexOf(u8, tip, "isolated mode, pid 42, on this machine") != null);
+    try t.expect(std.mem.indexOf(u8, tip, "idle:") != null);
+}
+
+test "action buttons are named by verb and row; the list caps at 60% of the window" {
+    var buf: [128]u8 = undefined;
+    try t.expectEqualStrings("Watch claude-1 (claude)", accessibleName(&buf, .watch, "claude-1 (claude)"));
+    try t.expectEqualStrings("Take control", accessibleName(&buf, .control, ""));
+    try t.expectEqualStrings("Show beside pane Login", accessibleName(&buf, .beside, "Login"));
+    try t.expectEqual(@as(c_int, 600), listCap(1000));
+    try t.expectEqual(@as(c_int, 480), listCap(0));
 }

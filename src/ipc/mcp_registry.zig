@@ -24,6 +24,11 @@ pub const Mode = enum {
     pub fn text(self: Mode) []const u8 {
         return @tagName(self);
     }
+
+    /// What a bare `sketerm mcp` runs, so a surface need not name it.
+    pub fn isDefault(self: Mode) bool {
+        return self == .isolated;
+    }
 };
 
 pub const Registration = struct {
@@ -31,6 +36,8 @@ pub const Registration = struct {
     name: []const u8 = "",
     profile: []const u8 = "",
     log_dir: []const u8 = "",
+    /// The server's working directory (its MCP client's project).
+    cwd: []const u8 = "",
     mux_socket: []const u8,
     /// The pane session the server was started from (`SKETERM_SESSION`)
     /// and its daemon (`SKETERM_MUX_SOCKET`); empty = not started from one.
@@ -86,6 +93,8 @@ const Record = struct {
     name: []const u8 = "",
     profile: []const u8 = "",
     log_dir: []const u8 = "",
+    /// Absent = an older server (unknown).
+    cwd: []const u8 = "",
     mux_socket: []const u8,
     agents: ?[]const Agent = null,
     /// The process that started the server (an MCP client): how a client's
@@ -105,6 +114,8 @@ pub const Entry = struct {
     name: []u8,
     profile: []u8,
     log_dir: []u8,
+    /// Empty = unknown (an older server, or a legacy entry).
+    cwd: []u8 = &.{},
     mux_socket: []u8,
     legacy: bool = false,
     /// Null = the server does not publish its agents (older build).
@@ -121,6 +132,7 @@ pub const Entry = struct {
         allocator.free(self.name);
         allocator.free(self.profile);
         allocator.free(self.log_dir);
+        allocator.free(self.cwd);
         allocator.free(self.mux_socket);
         allocator.free(self.agent_socket);
         if (self.session) |v| allocator.free(v);
@@ -128,16 +140,23 @@ pub const Entry = struct {
         if (self.agents) |owned| freeAgents(allocator, owned);
     }
 
-    /// Short operator-facing identity, preferring explicit configuration.
+    /// Short operator-facing identity: explicit configuration, else the
+    /// working directory's name, else the log directory's; empty if none.
     pub fn displayName(self: Entry) []const u8 {
         if (self.name.len > 0) return self.name;
         if (self.profile.len > 0) return self.profile;
-        if (self.log_dir.len == 0) return "";
-        const trimmed = std.mem.trimEnd(u8, self.log_dir, "/");
-        if (std.mem.lastIndexOfScalar(u8, trimmed, '/')) |slash| return trimmed[slash + 1 ..];
-        return trimmed;
+        const cwd = lastComponent(self.cwd);
+        if (cwd.len > 0) return cwd;
+        return lastComponent(self.log_dir);
     }
 };
+
+/// A path's last component, trailing slashes ignored; "/" and "" give "".
+fn lastComponent(path: []const u8) []const u8 {
+    const trimmed = std.mem.trimEnd(u8, path, "/");
+    if (std.mem.lastIndexOfScalar(u8, trimmed, '/')) |slash| return trimmed[slash + 1 ..];
+    return trimmed;
+}
 
 pub fn freeEntries(allocator: std.mem.Allocator, entries: []Entry) void {
     for (entries) |*entry| entry.deinit(allocator);
@@ -234,6 +253,7 @@ pub const Lease = struct {
             .name = try allocator.dupe(u8, registration.name),
             .profile = &.{},
             .log_dir = &.{},
+            .cwd = &.{},
             .mux_socket = &.{},
             .session = &.{},
             .session_socket = &.{},
@@ -241,6 +261,7 @@ pub const Lease = struct {
         errdefer lease.freeRegistration();
         lease.registration.profile = try allocator.dupe(u8, registration.profile);
         lease.registration.log_dir = try allocator.dupe(u8, registration.log_dir);
+        lease.registration.cwd = try allocator.dupe(u8, registration.cwd);
         lease.registration.mux_socket = try allocator.dupe(u8, registration.mux_socket);
         lease.registration.session = try allocator.dupe(u8, registration.session);
         lease.registration.session_socket = try allocator.dupe(u8, registration.session_socket);
@@ -270,6 +291,7 @@ pub const Lease = struct {
             .name = self.registration.name,
             .profile = self.registration.profile,
             .log_dir = self.registration.log_dir,
+            .cwd = self.registration.cwd,
             .mux_socket = self.registration.mux_socket,
             .agents = agents,
             .ppid = self.ppid,
@@ -289,6 +311,7 @@ pub const Lease = struct {
         a.free(self.registration.name);
         a.free(self.registration.profile);
         a.free(self.registration.log_dir);
+        a.free(self.registration.cwd);
         a.free(self.registration.mux_socket);
         a.free(self.registration.session);
         a.free(self.registration.session_socket);
@@ -472,6 +495,8 @@ fn ownedEntry(allocator: std.mem.Allocator, record: Record, legacy: bool) !Entry
     errdefer allocator.free(profile);
     const log_dir = try allocator.dupe(u8, record.log_dir);
     errdefer allocator.free(log_dir);
+    const cwd = try allocator.dupe(u8, record.cwd);
+    errdefer allocator.free(cwd);
     const mux_socket = try allocator.dupe(u8, record.mux_socket);
     errdefer allocator.free(mux_socket);
     const agents = if (record.agents) |src| try dupeAgents(allocator, src) else null;
@@ -487,6 +512,7 @@ fn ownedEntry(allocator: std.mem.Allocator, record: Record, legacy: bool) !Entry
         .name = name,
         .profile = profile,
         .log_dir = log_dir,
+        .cwd = cwd,
         .mux_socket = mux_socket,
         .legacy = legacy,
         .agents = agents,
@@ -792,4 +818,27 @@ test "mcp registry includes a live pre-registry ephemeral instance" {
     try std.testing.expect(entries[0].legacy);
     try std.testing.expectEqual(c.getpid(), entries[0].pid);
     try std.testing.expect(std.mem.endsWith(u8, entries[0].mux_socket, "/mux.sock"));
+}
+
+test "display name: configuration, then the working directory, then the log directory" {
+    var entry: Entry = .{
+        .pid = 9,
+        .mode = .isolated,
+        .name = @constCast("named"),
+        .profile = @constCast("prof"),
+        .log_dir = @constCast("/logs/claudehere/"),
+        .cwd = @constCast("/home/u/project-x/"),
+        .mux_socket = @constCast("/x/mux.sock"),
+    };
+    try std.testing.expectEqualStrings("named", entry.displayName());
+    entry.name = @constCast("");
+    try std.testing.expectEqualStrings("prof", entry.displayName());
+    entry.profile = @constCast("");
+    try std.testing.expectEqualStrings("project-x", entry.displayName());
+    entry.cwd = @constCast("/");
+    try std.testing.expectEqualStrings("claudehere", entry.displayName());
+    entry.log_dir = @constCast("");
+    try std.testing.expectEqualStrings("", entry.displayName());
+    try std.testing.expect(Mode.isolated.isDefault());
+    try std.testing.expect(!Mode.durable.isDefault());
 }

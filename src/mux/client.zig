@@ -127,6 +127,16 @@ const proxyroute = @import("proxyroute.zig");
 /// Why the last route connect on this thread failed (`Conn.connectRoute`).
 threadlocal var route_failure_buf: [384]u8 = undefined;
 threadlocal var route_failure_len: usize = 0;
+threadlocal var route_refusal: ?proxyroute.Code = null;
+
+/// A hop's refusal code (`proxyroute.Code`), the wire word of a route refusal.
+pub const RouteRefusal = proxyroute.Code;
+
+/// The code a hop refused the last route connect on this thread with;
+/// null after a success, a non-route connect, or a failure no hop named.
+pub fn routeRefusal() ?RouteRefusal {
+    return route_refusal;
+}
 
 /// The sentence naming the failing hop and the reason, after a route connect
 /// on this thread failed; empty after a success or a non-route connect.
@@ -443,7 +453,15 @@ pub const Conn = struct {
         errdefer _ = c.close(fd);
         var addr: c.struct_sockaddr_un = undefined;
         try sockpath.fillSockaddrUn(&addr, sock_path);
-        if (c.connect(fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un)) != 0) return error.ConnectFailed;
+        if (c.connect(fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un)) != 0) {
+            // No socket file, or nobody listening on it: no daemon runs
+            // there (never started, or retired), as opposed to one that
+            // exists and refuses or breaks.
+            return switch (std.posix.errno(@as(c_int, -1))) {
+                .NOENT, .CONNREFUSED => error.NoDaemon,
+                else => error.ConnectFailed,
+            };
+        }
         return .{ .allocator = allocator, .fd = fd };
     }
 
@@ -1399,6 +1417,7 @@ pub const Conn = struct {
     /// `routeFailure()` names the failing hop and why after an error.
     pub fn connectRoute(allocator: std.mem.Allocator, spec: []const u8, options: ConnectOptions) !Conn {
         route_failure_len = 0;
+        route_refusal = null;
         const route = RouteSpec.parse(spec) catch |err| {
             noteRouteFailure("invalid route '{s}': {s}", .{ spec, @errorName(err) });
             return error.BadRoute;
@@ -1472,6 +1491,7 @@ pub const Conn = struct {
                 .ok => break,
                 .err => |e| {
                     noteRouteFailure("{s} refused the route ({s}): {s}", .{ hops[@min(seen, hops.len - 1)], @tagName(e.code), e.msg });
+                    route_refusal = e.code;
                     return error.RouteRefused;
                 },
             }

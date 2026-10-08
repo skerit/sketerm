@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- An eye: Watch, a read-only view of an assistant's session.
+       Bundled so the icon-only button never renders empty under a
+       theme without view-reveal-symbolic. -->
+  <g fill="#2e3436">
+    <path d="M8 3C4.4 3 1.6 5.4.5 8c1.1 2.6 3.9 5 7.5 5s6.4-2.4 7.5-5C14.4 5.4 11.6 3 8 3zm0 1.5c2.6 0 4.7 1.6 5.8 3.5-1.1 1.9-3.2 3.5-5.8 3.5S3.3 9.9 2.2 8C3.3 6.1 5.4 4.5 8 4.5z"/>
+    <circle cx="8" cy="8" r="2.2"/>
+  </g>
+</svg>

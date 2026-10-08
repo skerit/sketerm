@@ -565,7 +565,7 @@ fn addPaneRow(self: *Switcher, pane: *Pane) void {
     var subtitle_buf: [768:0]u8 = undefined;
     const kind = if (remote.is_app) "Application session" else "Shell session";
     const subtitle = std.fmt.bufPrintZ(&subtitle_buf, "{s} - {s} - {s}", .{ kind, hostLabel(term), remote.session }) catch "Attached mux session";
-    const entry = appendRow(self, .attached, title, subtitle, null, if (remote.is_app) "application-x-executable-symbolic" else "utilities-terminal-symbolic", false) orelse return;
+    const entry = appendRow(self, .attached, title, subtitle, null, std.mem.span((if (remote.is_app) assistants.Kind.app else assistants.Kind.terminal).icon()), false) orelse return;
     entry.kind = .pane;
     entry.pane = pane;
     setIdentity(self, entry, "pane:{s}\x00{s}\x00{d}", .{ remote.host orelse "", remote.session, pane.id });
@@ -686,7 +686,7 @@ fn addAvailableRow(self: *Switcher, daemon: *DaemonState, session: *const mux_cl
     const kind = if (session.app) "Application" else "Shell";
     const cwd = if (session.cwd.len > 0) session.cwd else "working directory unavailable";
     const subtitle = std.fmt.bufPrintZ(&subtitle_buf, "{s} - {s} - session {s} - {s} - {d} viewer(s)", .{ kind, daemon.origin, session.name, cwd, session.viewerCount() }) catch "Available mux session";
-    const entry = appendRow(self, .available, title, subtitle, null, if (session.app) "application-x-executable-symbolic" else "utilities-terminal-symbolic", false) orelse return;
+    const entry = appendRow(self, .available, title, subtitle, null, std.mem.span((if (session.app) assistants.Kind.app else assistants.Kind.terminal).icon()), false) orelse return;
     entry.kind = .attach;
     setSessionTarget(self, entry, session.name, daemon.host, session.origin_id, true);
     addWatchButton(self, entry);
@@ -831,11 +831,7 @@ fn addWatchButton(self: *Switcher, entry: *Entry) void {
     const kind = assistants.kindOf(target.session, true);
     for (std.enums.values(assistants.AttachAction)) |action| {
         if (!action.appliesTo(kind)) continue;
-        const verb = action.verb();
-        const button = c.gtk_button_new_from_icon_name(verb.icon).?;
-        c.gtk_widget_set_valign(button, c.GTK_ALIGN_CENTER);
-        c.gtk_widget_add_css_class(button, "flat");
-        c.gtk_widget_set_tooltip_text(button, verb.tip);
+        const button = assistants.attachButton(action, target.session);
         c.g_object_set_data(@ptrCast(button), "sketerm-overview-entry", @ptrCast(entry));
         c.g_object_set_data(@ptrCast(button), "sketerm-overview-action", @ptrFromInt(@intFromEnum(action) + 1));
         _ = c.g_signal_connect_data(button, "clicked", @ptrCast(&onAttachClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
