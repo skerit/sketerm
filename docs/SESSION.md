@@ -22159,3 +22159,26 @@ when it repeats an earlier part. It follows tab relabels, tab switches
 and every focus move, including IPC/MCP focus while the window is not
 active, which a pane's focus-enter never saw. smoke-e2e WINDOW_TITLE
 drives it; `titlefmt.composeWindowTitle` is unit-tested.
+
+## 2026-10-08: AI popovers: one row layout, idle instances apart, themed chips
+
+The AI badge popover lists instances with sessions first, each as ONE
+heading line (name, what it runs, the mode only when not `isolated`; the
+rest in the tooltip) over its session rows; instances without sessions
+fold into one closed "N idle, M unreachable" line whose entries carry
+their reason as a tooltip. An instance whose private daemon retired
+(local `error.NoDaemon`, a route's `instance_down` refusal) now reads as
+idle instead of unreachable, which was four of the eight "broken" entries
+in the report. Two servers with one name show their pids. A server names
+itself after its working directory (registry `cwd`) when unnamed.
+
+Both popovers share one row builder: icon, title and subtitle, then
+icon-only Watch / Take control / Show beside pane from `AttachAction`
+(bundled icons, accessible names `<verb> <row>`), activating the row is
+Watch, all inside a scroller capped at 60% of the window. The Session
+Overview uses the same `attachButton`. The dark text was GTK's built-in
+theme (`GTK_THEME` set): it paints buttons with a background image that
+covered the agents chip's white; the chips now clear it. smoke-agents-gui
+runs light, dark and GTK built-in dark with glyph-contrast checks, and the
+smoke-e2e watch stages press the popover's buttons over a private AT-SPI
+bus, with a new BADGE stage for the layout.
