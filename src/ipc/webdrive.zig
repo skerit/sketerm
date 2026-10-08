@@ -313,7 +313,8 @@ pub const View = struct {
 
     stream_request: u32 = 0,
     stream_reply: ?[]u8 = null,
-    stream_closed: bool = false,
+    /// From a successful open until `ev_stream_closed`: one stream per view.
+    streaming: bool = false,
 
     /// Bounded mirror of the page's `ev_console` stream, so a tool can
     /// answer "what did the page log" after the fact. Drop-oldest; ids
@@ -2921,15 +2922,7 @@ pub const Engine = struct {
     pub fn scroll(self: *Engine, id: u32, dx: i32, dy: i32) !void {
         if (!self.ensure()) return error.Unavailable;
         const v = self.findView(id) orelse return error.NoView;
-        self.awaitFirstPaint(id, 5_000);
-        self.send(proto.InputScroll{
-            .view = id,
-            .x = @intCast(v.w / 2),
-            .y = @intCast(v.h / 2),
-            .dx = dx,
-            .dy = dy,
-            .mods = 0,
-        }) catch return error.Unavailable;
+        try self.sendInput(proto.InputScroll{ .view = id, .x = @intCast(v.w / 2), .y = @intCast(v.h / 2), .dx = dx, .dy = dy, .mods = 0 });
     }
 
     /// Mirror one `ev_console` line into the view's bounded ring.
@@ -2962,81 +2955,20 @@ pub const Engine = struct {
     /// Focus + a trusted key chord (down with text, then up) through
     /// the ordinary input path - the same frames a GUI keystroke rides.
     pub fn sendKey(self: *Engine, id: u32, keysym: u32, mods: u32, text: []const u8) !void {
-        if (!self.ensure()) return error.Unavailable;
-        if (self.findView(id) == null) return error.NoView;
-        self.awaitFirstPaint(id, 5_000);
-        self.send(proto.InputKey{
-            .view = id,
-            .kind = @intFromEnum(proto.KeyKind.down),
-            .keyval = keysym,
-            .keycode = 0,
-            .mods = mods,
-            .text = text,
-        }) catch return error.Unavailable;
-        self.send(proto.InputKey{
-            .view = id,
-            .kind = @intFromEnum(proto.KeyKind.up),
-            .keyval = keysym,
-            .keycode = 0,
-            .mods = mods,
-            .text = "",
-        }) catch return error.Unavailable;
+        try self.sendInput(proto.InputKey{ .view = id, .kind = @intFromEnum(proto.KeyKind.down), .keyval = keysym, .keycode = 0, .mods = mods, .text = text });
+        try self.sendInput(proto.InputKey{ .view = id, .kind = @intFromEnum(proto.KeyKind.up), .keyval = keysym, .keycode = 0, .mods = mods, .text = "" });
     }
 
-    /// One pointer frame at view coordinates (the logical viewport, not
-    /// the frame's pixels) through the ordinary input path a GUI mouse
-    /// rides: move, leave, or one button edge (0 left, 1 middle, 2 right).
-    pub fn pointerAt(self: *Engine, id: u32, kind: proto.PointerKind, x: i32, y: i32, button: u8, clicks: u8, mods: u32) !void {
+    /// One input frame (`InputPointer`, `InputScroll`, `InputKey`,
+    /// `InputPaste`) through the ordinary path a GUI's own input rides,
+    /// once the view has painted. Coordinates are logical viewport pixels.
+    pub fn sendInput(self: *Engine, frame: anytype) !void {
         if (!self.ensure()) return error.Unavailable;
-        if (self.findView(id) == null) return error.NoView;
-        self.awaitFirstPaint(id, 5_000);
-        self.send(proto.InputPointer{
-            .view = id,
-            .kind = @intFromEnum(kind),
-            .x = x,
-            .y = y,
-            .button = button,
-            .clicks = clicks,
-            .mods = mods,
-        }) catch return error.Unavailable;
-    }
-
-    /// A wheel step at a view point; `dy` is positive DOWN, as the wire
-    /// says (the helper flips it for CEF).
-    pub fn wheelAt(self: *Engine, id: u32, x: i32, y: i32, dx: i32, dy: i32, mods: u32) !void {
-        if (!self.ensure()) return error.Unavailable;
-        if (self.findView(id) == null) return error.NoView;
-        self.awaitFirstPaint(id, 5_000);
-        self.send(proto.InputScroll{ .view = id, .x = x, .y = y, .dx = dx, .dy = dy, .mods = mods }) catch
-            return error.Unavailable;
-    }
-
-    /// ONE edge of a key, down or up alone: unlike `sendKey`'s chord, a
-    /// caller can hold a key across other input (shift+click, a game) and
-    /// release it later. `text` rides the down edge only.
-    pub fn keyEdge(self: *Engine, id: u32, kind: proto.KeyKind, keysym: u32, mods: u32, text: []const u8) !void {
-        if (!self.ensure()) return error.Unavailable;
-        if (self.findView(id) == null) return error.NoView;
-        self.awaitFirstPaint(id, 5_000);
-        self.send(proto.InputKey{
-            .view = id,
-            .kind = @intFromEnum(kind),
-            .keyval = keysym,
-            .keycode = 0,
-            .mods = mods,
-            .text = if (kind == .down) text else "",
-        }) catch return error.Unavailable;
-    }
-
-    /// Insert `text` at the caret as trusted char events (`input_paste`,
-    /// the path `Host.paste` measured to work; a bare IME commit inserts
-    /// nothing in a windowless browser).
-    pub fn insertText(self: *Engine, id: u32, text: []const u8) !void {
-        if (!self.ensure()) return error.Unavailable;
-        if (self.findView(id) == null) return error.NoView;
-        if (!self.has(.clipboard)) return error.NoTextInput;
-        self.awaitFirstPaint(id, 5_000);
-        self.send(proto.InputPaste{ .view = id, .text = .{ .s = text } }) catch return error.Unavailable;
+        if (self.findView(frame.view) == null) return error.NoView;
+        // A bare IME commit inserts nothing in a windowless browser; text rides the clipboard path.
+        if (@TypeOf(frame) == proto.InputPaste and !self.has(.clipboard)) return error.NoTextInput;
+        self.awaitFirstPaint(frame.view, 5_000);
+        self.send(frame) catch return error.Unavailable;
     }
 
     /// One painted frame of a view, as straight RGBA in its PIXEL size
@@ -3432,21 +3364,22 @@ pub const Engine = struct {
         if (!self.ensure()) return error.Unavailable;
         if (!self.has(.web_stream)) return error.NoStream;
         if (max_fps != null and !self.has(.view_max_fps)) return error.FrameRateUnsupported;
+        // A stream that ended is only known once its `ev_stream_closed` is read.
+        self.pumpOnce(0);
         const v = self.findView(id) orelse return error.NoView;
         if (v.stream_request != 0) return error.StreamPending;
+        if (v.streaming) return error.StreamActive;
         if (self.next_stream_request == std.math.maxInt(u32)) return error.RequestIdsExhausted;
         const req = self.next_stream_request;
         self.next_stream_request += 1;
         v.stream_request = req;
-        v.stream_closed = false;
         defer if (self.findView(id)) |live| {
             live.stream_request = 0;
             if (live.stream_reply) |raw| self.gpa.free(raw);
             live.stream_reply = null;
         };
         // An uncertain open must not leave an unnamed stream slot behind.
-        var answered = false;
-        errdefer if (!answered) self.send(proto.StreamClose{ .view = id }) catch {};
+        errdefer self.send(proto.StreamClose{ .view = id }) catch {};
         self.send(proto.StreamOpen{ .view = id, .req = req, .audio = @intFromBool(audio and self.has(.stream_audio)) }) catch return error.Unavailable;
         const deadline = clock.nowMs() + @max(budget_ms, 1);
         while (clock.nowMs() < deadline) {
@@ -3455,12 +3388,11 @@ pub const Engine = struct {
                 const reply = try proto.decode(proto.EvStreamOpen, try arena.dupe(u8, raw));
                 if (reply.err.len == 0) {
                     const stream = @import("../web/stream.zig");
-                    if (live.stream_closed) return error.StreamEnded;
+                    if (!live.streaming) return error.StreamEnded;
                     if (!stream.isToken(reply.token) or reply.path.len == 0 or reply.path[0] != '/' or
                         std.mem.indexOfScalar(u8, reply.path, 0) != null) return error.BadStreamReply;
                     if (max_fps) |fps| try self.setMaxFps(id, fps);
                 } else if (reply.path.len != 0 or reply.token.len != 0) return error.BadStreamReply;
-                answered = true;
                 return reply;
             }
             if (self.state != .ready) return error.Unavailable;
@@ -3891,12 +3823,12 @@ pub const Engine = struct {
                 const ev = proto.decode(proto.EvStreamOpen, frame.payload) catch return;
                 const v = self.findView(ev.view) orelse return;
                 if (v.stream_request == 0 or ev.req != v.stream_request or v.stream_reply != null) return;
-                v.stream_closed = false;
+                if (ev.err.len == 0) v.streaming = true;
                 self.setOwned(&v.stream_reply, frame.payload);
             },
             .ev_stream_closed => {
                 const ev = proto.decode(proto.EvStreamClosed, frame.payload) catch return;
-                if (self.findView(ev.view)) |v| v.stream_closed = true;
+                if (self.findView(ev.view)) |v| v.streaming = false;
             },
             .hello_ack => {
                 const ack = proto.HelloAck.decodeAlloc(frame.payload, self.gpa) catch return;
@@ -4619,6 +4551,7 @@ const StreamPeer = struct {
                         .path = if (self.err.len == 0) "/tmp/current.sock" else "",
                         .token = if (self.err.len == 0) "0123456789abcdef0123456789abcdef" else "",
                         .err = self.err,
+                        .audio = req.audio,
                     }) catch return;
                     _ = c.write(self.peer, out.items.ptr, out.items.len);
                     return;
@@ -4629,7 +4562,7 @@ const StreamPeer = struct {
     }
 };
 
-test "stream opens correlate replies, negotiate audio, and do not cancel a conflict" {
+test "stream opens correlate replies, negotiate audio, and refuse a second stream without asking" {
     const gpa = std.testing.allocator;
     var pair = try Pair.init(gpa);
     defer pair.deinit();
@@ -4649,14 +4582,24 @@ test "stream opens correlate replies, negotiate audio, and do not cancel a confl
         };
         try std.testing.expectEqualStrings("/tmp/current.sock", reply.path);
         try std.testing.expectEqual(@as(u8, @intFromBool(has_audio)), peer.audio);
+        try std.testing.expectEqual(@as(u8, @intFromBool(has_audio)), reply.audio);
         try std.testing.expectEqual(@as(u32, 0), v.stream_request);
         try std.testing.expect(v.stream_reply == null);
         var buf: [4096]u8 = undefined;
         var reader = proto.Reader.init(pair.drain(&buf));
         try std.testing.expectEqual(proto.Tag.stream_open, (try reader.next()).?.tag);
         try std.testing.expect((try reader.next()) == null);
+        // While it lives a second open is a conflict, decided here: nothing is sent.
+        try std.testing.expectError(error.StreamActive, pair.eng.openStream(arena_state.allocator(), 1, true, 10, null));
+        try std.testing.expectEqual(@as(usize, 0), pair.drain(&buf).len);
+        // Its end frees the view for the next open.
+        var closed: std.ArrayList(u8) = .empty;
+        defer closed.deinit(gpa);
+        try proto.encodePayload(gpa, &closed, proto.EvStreamClosed{ .view = 1, .reason = "the stream client disconnected" });
+        pair.eng.dispatch(.{ .tag = .ev_stream_closed, .payload = closed.items });
     }
-    var peer = StreamPeer{ .peer = pair.peer, .err = "this view already has a stream" };
+    // A refusal the helper decided is handed back as such, and cancels nothing.
+    var peer = StreamPeer{ .peer = pair.peer, .err = "too many open streams" };
     const reply = blk: {
         const thread = try std.Thread.spawn(.{}, StreamPeer.run, .{&peer});
         defer thread.join();
@@ -6356,7 +6299,7 @@ test "untrusted teardown tolerates socket loss while destroying a view or contex
     }
 }
 
-test "coordinate input reaches the wire as the GUI's own frames, one edge at a time" {
+test "coordinate input reaches the wire as the GUI's own frames" {
     var pair = try Pair.init(std.testing.allocator);
     defer pair.deinit();
     var buf: [8192]u8 = undefined;
@@ -6365,51 +6308,31 @@ test "coordinate input reaches the wire as the GUI's own frames, one edge at a t
     view.frame_gen = 1;
     _ = pair.drain(&buf);
 
-    // 1. A button edge at a point, then a move, keep the protocol's vocabulary.
-    try pair.eng.pointerAt(view.id, .down, 120, 45, 2, 1, proto.mod_shift);
-    try pair.eng.pointerAt(view.id, .move, 130, 50, 0, 0, 0);
-    // 2. A wheel step at a point and a held key: down now, up later.
-    try pair.eng.wheelAt(view.id, 400, 300, 0, 120, 0);
-    try pair.eng.keyEdge(view.id, .down, 0xffe1, 0, "x");
-    try pair.eng.keyEdge(view.id, .up, 0xffe1, 0, "x");
+    // 1. A button edge, a wheel step and one key edge go out as given.
+    try pair.eng.sendInput(proto.InputPointer{ .view = view.id, .kind = @intFromEnum(proto.PointerKind.down), .x = 120, .y = 45, .button = 2, .clicks = 1, .mods = proto.mod_shift });
+    try pair.eng.sendInput(proto.InputScroll{ .view = view.id, .x = 400, .y = 300, .dx = 0, .dy = 120, .mods = 0 });
+    try pair.eng.sendInput(proto.InputKey{ .view = view.id, .kind = @intFromEnum(proto.KeyKind.down), .keyval = 0xffe1, .keycode = 0, .mods = 0, .text = "" });
     {
         var reader = proto.Reader.init(pair.drain(&buf));
         const down = try proto.decode(proto.InputPointer, (try reader.next()).?.payload);
-        try std.testing.expectEqual(@as(u8, @intFromEnum(proto.PointerKind.down)), down.kind);
-        try std.testing.expectEqual(@as(i32, 120), down.x);
         try std.testing.expectEqual(@as(i32, 45), down.y);
-        try std.testing.expectEqual(@as(u8, 2), down.button);
         try std.testing.expectEqual(proto.mod_shift, down.mods);
-        const move = try proto.decode(proto.InputPointer, (try reader.next()).?.payload);
-        try std.testing.expectEqual(@as(u8, @intFromEnum(proto.PointerKind.move)), move.kind);
-        const wheel_frame = (try reader.next()).?;
-        try std.testing.expectEqual(proto.Tag.input_scroll, wheel_frame.tag);
-        const wheel = try proto.decode(proto.InputScroll, wheel_frame.payload);
-        try std.testing.expectEqual(@as(i32, 400), wheel.x);
-        try std.testing.expectEqual(@as(i32, 120), wheel.dy);
-        const key_down = try proto.decode(proto.InputKey, (try reader.next()).?.payload);
-        try std.testing.expectEqual(@as(u8, @intFromEnum(proto.KeyKind.down)), key_down.kind);
-        try std.testing.expectEqual(@as(u32, 0xffe1), key_down.keyval);
-        try std.testing.expectEqualStrings("x", key_down.text);
-        // The text rides the down edge only, never the release.
-        const key_up = try proto.decode(proto.InputKey, (try reader.next()).?.payload);
-        try std.testing.expectEqual(@as(u8, @intFromEnum(proto.KeyKind.up)), key_up.kind);
-        try std.testing.expectEqualStrings("", key_up.text);
+        try std.testing.expectEqual(@as(i32, 120), (try proto.decode(proto.InputScroll, (try reader.next()).?.payload)).dy);
+        try std.testing.expectEqual(@as(u32, 0xffe1), (try proto.decode(proto.InputKey, (try reader.next()).?.payload)).keyval);
         try std.testing.expect((try reader.next()) == null);
     }
 
-    // 3. Text insertion needs the helper's clipboard capability; without it nothing is sent.
-    try std.testing.expectError(error.NoTextInput, pair.eng.insertText(view.id, "hallo"));
+    // 2. Text insertion needs the helper's clipboard capability; without it nothing is sent.
+    const paste = proto.InputPaste{ .view = view.id, .text = .{ .s = "h\u{e9}llo" } };
+    try std.testing.expectError(error.NoTextInput, pair.eng.sendInput(paste));
     try std.testing.expectEqual(@as(usize, 0), pair.drain(&buf).len);
     pair.eng.caps.insert(.clipboard);
-    try pair.eng.insertText(view.id, "h\u{e9}llo");
+    try pair.eng.sendInput(paste);
     {
         var reader = proto.Reader.init(pair.drain(&buf));
-        const paste = (try reader.next()).?;
-        try std.testing.expectEqual(proto.Tag.input_paste, paste.tag);
-        try std.testing.expectEqualStrings("h\u{e9}llo", (try proto.decode(proto.InputPaste, paste.payload)).text.s);
+        try std.testing.expectEqualStrings("h\u{e9}llo", (try proto.decode(proto.InputPaste, (try reader.next()).?.payload)).text.s);
     }
-    try std.testing.expectError(error.NoView, pair.eng.pointerAt(view.id + 99, .move, 0, 0, 0, 0, 0));
+    try std.testing.expectError(error.NoView, pair.eng.sendInput(proto.InputScroll{ .view = view.id + 99, .x = 0, .y = 0, .dx = 0, .dy = 0, .mods = 0 }));
 }
 
 test "frameAfter answers a newer paint at once, and nothing when the page stayed still" {

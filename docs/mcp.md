@@ -533,7 +533,8 @@ ANGLE SwiftShader WebGL with software compositing and CPU-readable paints.
 It is false for GUI-backed or restricted helpers, and is not a guarantee
 that every page can allocate a WebGL context. GUI rendering and the
 untrusted helper's no-GPU/security policy are unchanged.
-The result's `audio` is true only if requested and negotiated. A GUI-owned
+The result's `audio` is true only when it was requested and the helper
+started the stream's Opus encoder. A GUI-owned
 browser refuses the tool; an older helper without `web-stream` also refuses
 without opening a socket. Socket paths belong to the helper's host; MCP's
 headless routes use local helpers and do not relay remote stream sockets.
@@ -556,7 +557,7 @@ The helper control protocol (`src/web/protocol.zig`) adds these messages:
 | Tag | Direction | Body |
 | --- | --- | --- |
 | `0xF8 StreamOpen` | client -> helper | `view:u32, req:u32, audio:u8` |
-| `0xF9 EvStreamOpen` | helper -> client | `view:u32, req:u32, path:str, token:str, err:str` |
+| `0xF9 EvStreamOpen` | helper -> client | `view:u32, req:u32, path:str, token:str, err:str`, optional `audio:u8` (1 = Opus encoder running) |
 | `0xFA StreamClose` | client -> helper | `view:u32` |
 | `0xFB EvStreamClosed` | helper -> client | `view:u32, reason:str` |
 
@@ -622,21 +623,19 @@ native popup composition/removal, CSS cursor, trusted Shift-click/text/wheel
 during `web_wait`, wrong/replayed AUTH, held-input release, view/server
 teardown, per-instance socket placement, and non-silent decoded WebAudio
 Opus with increasing capture timestamps when runtime audio is advertised.
+On Linux it also holds the helper to its budgets: almost no CPU on a still
+page, flat memory while a reader withholds ACKs under a fast-painting page,
+and no descriptor growth across repeated stream open/close cycles.
 A supported but broken stream is a test failure, never an installed-helper
 fallback. The full smoke suite verifies these alongside the legacy tools.
 Input completion requires trusted down/up/click events at the pad, Shift
 down/up, a focused field with exact inserted text, and both a trusted wheel
 event and actual scrolling. Moves precede each pointer target. Failures print
-the individual checks and event trace and retain `stream-input-evidence.json`
-in the smoke runtime directory, including the disconnect-release phase.
-Popup comparison starts with the closed select already focused and hovered,
-including the keyboard focus indication an Escape close leaves behind,
-and still requires exact underlay pixels after Escape. Failures retain
-`stream-popup-evidence.json` with full-frame/ROI changed-pixel counts, bounds,
-first BGRA differences, frame serials and DOM focus/style facts, plus
-`stream-popup-baseline.png`, `stream-popup-open.png` and
-`stream-popup-closed.png` for a close failure. PNGs are written only on failure;
-DOM evidence does not claim to detect a native popup's visibility.
+the individual checks and the page's event trace, including the
+disconnect-release phase. Popup comparison starts with the closed select
+already focused and hovered, including the keyboard focus indication an
+Escape close leaves behind, and still requires exact underlay pixels after
+Escape.
 
 ### Browser review and durable evidence
 

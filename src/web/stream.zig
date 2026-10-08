@@ -23,8 +23,6 @@ pub const MAX_FRAME: u32 = 4 * 1024 * 1024;
 pub const MAX_BAND_BYTES: usize = 1024 * 1024;
 /// Frame ends the helper may have outstanding without an ACK.
 pub const MAX_UNACKED = 2;
-/// Upper bound on one Opus packet, equal to `opuscodec.MAX_PACKET`.
-pub const MAX_OPUS: usize = 4000;
 /// Hex characters in a stream token (16 random bytes).
 pub const TOKEN_LEN = 32;
 /// The only surface format V1 defines.
@@ -330,7 +328,6 @@ pub fn audioLen(opus_len: usize) usize {
 }
 
 pub fn encodeAudio(dst: []u8, pts_us: u64, rate: u32, channels: u8, samples: u16, opus: []const u8) void {
-    std.debug.assert(opus.len <= MAX_OPUS);
     putHeader(dst, .audio, AUDIO_HEAD + opus.len);
     std.mem.writeInt(u64, dst[5..13], pts_us, .little);
     put32(dst, 13, rate);
@@ -371,15 +368,6 @@ pub const Rect = struct {
             .w = @intCast(@min(@as(u64, self.w), w - self.x)),
             .h = @intCast(@min(@as(u64, self.h), h - self.y)),
         };
-    }
-
-    pub fn intersect(a: Rect, b: Rect) Rect {
-        const x0 = @max(a.x, b.x);
-        const y0 = @max(a.y, b.y);
-        const x1 = @min(@as(u64, a.x) + a.w, @as(u64, b.x) + b.w);
-        const y1 = @min(@as(u64, a.y) + a.h, @as(u64, b.y) + b.h);
-        if (x1 <= x0 or y1 <= y0) return .{ .x = 0, .y = 0, .w = 0, .h = 0 };
-        return .{ .x = x0, .y = y0, .w = @intCast(x1 - x0), .h = @intCast(y1 - y0) };
     }
 };
 
@@ -794,11 +782,10 @@ pub fn AudioTable(comptime slots: usize, comptime cap_frames: usize) type {
             return pts;
         }
 
-        /// Frames queued in slot `i`, and the browser it is bound to.
-        pub fn queued(self: *Self, i: usize) struct { frames: usize, browser: i32 } {
+        pub fn queued(self: *Self, i: usize) usize {
             self.lock.lock();
             defer self.lock.unlock();
-            return .{ .frames = self.slot[i].frames, .browser = self.slot[i].browser };
+            return self.slot[i].frames;
         }
 
         pub fn dropped(self: *Self, i: usize) u64 {
@@ -1144,10 +1131,10 @@ test "audio table takes CEF's real 1024-frame packets and longer ones" {
     var r: [2500]f32 = @splat(-0.25);
     const planes = [_][*]const f32{ &l, &r };
     tab.push(3, &planes, 1024, 1_791_382_245_089);
-    try t.expectEqual(@as(usize, 1024), tab.queued(i).frames);
+    try t.expectEqual(@as(usize, 1024), tab.queued(i));
     // Longer than the conversion scratch: split, and still contiguous.
     tab.push(3, &planes, 2500, 1_791_382_245_110);
-    try t.expectEqual(@as(usize, 3524), tab.queued(i).frames);
+    try t.expectEqual(@as(usize, 3524), tab.queued(i));
     var out: [1920]i16 = undefined;
     try t.expectEqual(@as(u64, 1_791_382_245_089_000), tab.pop(i, &out).?);
     try t.expectEqual(@as(i16, 8191), out[0]);

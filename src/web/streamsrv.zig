@@ -27,21 +27,6 @@ pub const Audio = st.AudioTable(MAX_STREAMS, AUDIO_CAP_FRAMES);
 /// outlive the memory it writes.
 pub var audio: Audio = .{};
 
-/// `SKETERM_WEB_STREAM_DEBUG=1`: one stderr line per audio milestone
-/// (capture asked, started, first and every 250th packet, first encode,
-/// every drop reason), so a silent stream says where the audio stopped.
-pub var debug: bool = false;
-
-pub fn readDebugEnv() void {
-    const v = c.getenv("SKETERM_WEB_STREAM_DEBUG") orelse return;
-    const sv = std.mem.span(v);
-    debug = sv.len != 0 and !std.mem.eql(u8, sv, "0");
-}
-
-pub fn note(comptime fmt: []const u8, args: anytype) void {
-    if (debug) std.debug.print("sketerm-web stream: " ++ fmt ++ "\n", args);
-}
-
 /// Samples per channel in one 20ms frame at `Audio.RATE`.
 const OPUS_FRAME = Audio.RATE / 50;
 
@@ -186,12 +171,8 @@ pub const Stream = struct {
     /// on every change; the pixels live in the view's `CursorCache`).
     cursor_pending: bool = true,
     held: st.Held = .{},
-    want_audio: bool,
     audio_slot: ?usize = null,
-    /// Opus packets sent (diagnostics only).
-    audio_sent: u64 = 0,
-    dbg_last_queued: usize = 0,
-    dbg_queued_notes: usize = 0,
+    /// Set only while audio is actually encoded: what the open reports.
     encoder: ?opus.Encoder = null,
 
     pub fn path(self: *const Stream) []const u8 {
@@ -217,7 +198,6 @@ pub const Stream = struct {
             .token = st.mintToken(rnd[0..16].*),
             .deadline_ms = now_ms + @import("protocol.zig").STREAM_CONNECT_MS,
             .tx = tx,
-            .want_audio = want_audio and audioAvailable(),
         };
         const name = st.mintToken(rnd[16..32].*);
         const p = std.fmt.bufPrint(s.path_buf[0 .. s.path_buf.len - 1], "{s}/ws-{s}.sock", .{ std.mem.trimEnd(u8, dir, "/"), name[0..16] }) catch
@@ -229,7 +209,7 @@ pub const Stream = struct {
         // engine asks once, when the page becomes audible, and a page
         // that does so before the client authenticated must still be
         // captured.
-        if (s.want_audio) s.startAudio();
+        if (want_audio and audioAvailable()) s.startAudio();
         return s;
     }
 
@@ -426,14 +406,9 @@ pub const Stream = struct {
     }
 
     fn startAudio(self: *Stream) void {
-        const slot = audio.claim() orelse return note("view {d}: no free audio slot", .{self.view});
-        const enc = opus.Encoder.init(Audio.RATE, Audio.CHANNELS) orelse {
-            audio.unclaim(slot);
-            return note("view {d}: Opus encoder init failed", .{self.view});
-        };
+        const slot = audio.claim() orelse return;
+        self.encoder = opus.Encoder.init(Audio.RATE, Audio.CHANNELS) orelse return audio.unclaim(slot);
         self.audio_slot = slot;
-        self.encoder = enc;
-        note("view {d}: audio slot {d} claimed", .{ self.view, slot });
     }
 
     /// Bytes the transmit buffer can take once its sent head is
@@ -526,30 +501,14 @@ pub const Stream = struct {
         const enc = if (self.encoder) |*e| e else return;
         var pcm: [OPUS_FRAME * 2]i16 = undefined;
         var packet: [opus.MAX_PACKET]u8 = undefined;
-        if (debug) {
-            const q = audio.queued(slot);
-            if (q.frames != self.dbg_last_queued and self.dbg_queued_notes < 20) {
-                self.dbg_queued_notes += 1;
-                self.dbg_last_queued = q.frames;
-                note("view {d}: slot {d} bound to browser {d}, {d} frames queued, dropped {d}", .{ self.view, slot, q.browser, q.frames, audio.dropped(slot) });
-            }
-        }
         // Pop only while a packet of ANY size still fits: a popped frame
         // that cannot be sent is lost, while one left queued waits in the
         // bounded ring (whose overflow is honest about the gap).
-        while (self.freeRoom() >= st.audioLen(st.MAX_OPUS)) {
+        while (self.freeRoom() >= st.audioLen(opus.MAX_PACKET)) {
             const pts = audio.pop(slot, &pcm) orelse break;
-            const out = enc.encode(std.mem.sliceAsBytes(&pcm), &packet) orelse {
-                note("view {d}: Opus encode failed", .{self.view});
-                continue;
-            };
-            const dst = self.reserve(st.audioLen(out.len)) orelse {
-                note("view {d}: audio packet dropped, transmit buffer full", .{self.view});
-                continue;
-            };
+            const out = enc.encode(std.mem.sliceAsBytes(&pcm), &packet) orelse continue;
+            const dst = self.reserve(st.audioLen(out.len)) orelse continue;
             st.encodeAudio(dst, pts, Audio.RATE, Audio.CHANNELS, OPUS_FRAME, out);
-            if (self.audio_sent % 250 == 0) note("view {d}: audio packet {d} sent ({d} bytes, pts {d}us)", .{ self.view, self.audio_sent, out.len, pts });
-            self.audio_sent += 1;
         }
     }
 

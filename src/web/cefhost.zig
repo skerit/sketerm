@@ -6940,20 +6940,31 @@ fn onCursorChange(
     const host = g_host orelse return 0;
     const v = viewOf(browser) orelse return 0;
     host_stream.streamCursor(host, v, ctype, info);
-    const mapped: proto.Cursor = switch (ctype) {
-        cef.CT_HAND => .pointer,
-        cef.CT_IBEAM => .text,
-        cef.CT_WAIT => .wait,
-        cef.CT_CROSS => .crosshair,
-        cef.CT_NOTALLOWED => .not_allowed,
-        cef.CT_GRAB => .grab,
-        cef.CT_GRABBING => .grabbing,
-        cef.CT_EASTWESTRESIZE, cef.CT_COLUMNRESIZE => .ew_resize,
-        cef.CT_NORTHSOUTHRESIZE, cef.CT_ROWRESIZE => .ns_resize,
-        else => .default,
-    };
-    host.post(proto.EvCursor{ .view = v.id, .cursor = @intFromEnum(mapped) });
+    host.post(proto.EvCursor{ .view = v.id, .cursor = @intFromEnum(guiCursor(host_stream.cursorName(ctype))) });
     return 0;
+}
+
+/// The `proto.Cursor` subset of a CSS cursor name; column and row resizes fold into their axis.
+fn guiCursor(name: []const u8) proto.Cursor {
+    if (std.mem.eql(u8, name, "col-resize")) return .ew_resize;
+    if (std.mem.eql(u8, name, "row-resize")) return .ns_resize;
+    inline for (std.meta.fields(proto.Cursor)) |f| {
+        const css = comptime blk: {
+            var b = f.name[0..f.name.len].*;
+            std.mem.replaceScalar(u8, &b, '_', '-');
+            break :blk b;
+        };
+        if (std.mem.eql(u8, name, &css)) return @enumFromInt(f.value);
+    }
+    return .default;
+}
+
+test "the GUI cursor comes from the stream's CSS cursor table" {
+    try std.testing.expectEqual(proto.Cursor.pointer, guiCursor(host_stream.cursorName(cef.CT_HAND)));
+    try std.testing.expectEqual(proto.Cursor.not_allowed, guiCursor(host_stream.cursorName(cef.CT_NOTALLOWED)));
+    try std.testing.expectEqual(proto.Cursor.ew_resize, guiCursor(host_stream.cursorName(cef.CT_COLUMNRESIZE)));
+    try std.testing.expectEqual(proto.Cursor.ns_resize, guiCursor(host_stream.cursorName(cef.CT_NORTHSOUTHRESIZE)));
+    try std.testing.expectEqual(proto.Cursor.default, guiCursor(host_stream.cursorName(cef.CT_ZOOMIN)));
 }
 
 /// Popups are NEVER opened by the helper: it cancels them and reports

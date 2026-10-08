@@ -3712,7 +3712,7 @@ const StreamRig = struct {
                 }
             },
             .audio => {
-                if (b.len <= webstream.AUDIO_HEAD or b.len > webstream.AUDIO_HEAD + webstream.MAX_OPUS) fail("invalid stream audio packet size");
+                if (b.len <= webstream.AUDIO_HEAD or b.len > webstream.AUDIO_HEAD + opuscodec.MAX_PACKET) fail("invalid stream audio packet size");
                 const pts = std.mem.readInt(u64, b[0..8], .little);
                 const rate = std.mem.readInt(u32, b[8..12], .little);
                 const samples = std.mem.readInt(u16, b[13..15], .little);
@@ -3804,7 +3804,10 @@ fn streamPaint(m: *Mcp, color: []const u8) void {
 }
 
 fn streamBlock(rig: *StreamRig, damage: webstream.Rect, before: []const u8, bgra: [4]u8) void {
-    if (damage.x != 40 or damage.y != 40 or damage.w != 20 or damage.h != 20) fail("20x20 mutation did not produce exact stream damage");
+    if (damage.x != 40 or damage.y != 40 or damage.w != 20 or damage.h != 20) {
+        std.debug.print("smoke-mcp: stream damage {d},{d} {d}x{d}\n", .{ damage.x, damage.y, damage.w, damage.h });
+        fail("20x20 mutation did not produce exact stream damage");
+    }
     var changed: usize = 0;
     for (0..rig.h) |y| for (0..rig.w) |x| {
         const off = (y * rig.w + x) * 4;
@@ -3817,7 +3820,7 @@ fn streamBlock(rig: *StreamRig, damage: webstream.Rect, before: []const u8, bgra
     if (changed != 400) fail("20x20 stream mutation did not change exactly 400 pixels");
 }
 
-fn streamInputEvidence(m: *Mcp, arena: std.mem.Allocator, rt: []const u8, wait_reply: []const u8) void {
+fn streamInputEvidence(m: *Mcp, arena: std.mem.Allocator, wait_reply: []const u8) void {
     const line = m.callTool("web_eval", "{\"code\":\"({checks:window.streamChecks(),observed:window.seen,field_value:window.field.value,scroll_y:scrollY,active_element:document.activeElement.id||document.activeElement.tagName,goal:window.streamGoal,title:document.title})\",\"strict\":true,\"max_chars\":60000}");
     const result = capSc(arena, line, "stream input evidence", false);
     const value = result.get("value").?.object.get("value").?.object;
@@ -3835,15 +3838,12 @@ fn streamInputEvidence(m: *Mcp, arena: std.mem.Allocator, rt: []const u8, wait_r
     if (!failed) return;
     say(wait_reply);
     say(line);
-    const path = std.fmt.allocPrint(arena, "{s}/stream-input-evidence.json", .{rt}) catch fail("stream evidence path");
-    @import("util/atomicwrite.zig").writeFileExact(path, line, 0o600) catch say("smoke-mcp: could not save stream input evidence");
-    fail("page did not observe every trusted stream input requirement (stream-input-evidence.json has individual checks and events)");
+    fail("page did not observe every trusted stream input requirement");
 }
 
 const StreamPixelDiff = struct {
     count: usize = 0,
     bounds: ?webstream.Rect = null,
-    first: ?struct { x: u32, y: u32, before: [4]u8, after: [4]u8 } = null,
 };
 
 fn streamPixelDiff(w: u32, h: u32, before: []const u8, after: []const u8, region: webstream.Rect) StreamPixelDiff {
@@ -3855,51 +3855,8 @@ fn streamPixelDiff(w: u32, h: u32, before: []const u8, after: []const u8, region
         const pixel = webstream.Rect{ .x = @intCast(x), .y = @intCast(y), .w = 1, .h = 1 };
         diff.count += 1;
         diff.bounds = if (diff.bounds) |b| b.unite(pixel) else pixel;
-        if (diff.first == null) diff.first = .{ .x = @intCast(x), .y = @intCast(y), .before = before[off..][0..4].*, .after = after[off..][0..4].* };
     };
     return diff;
-}
-
-fn streamPopupDom(m: *Mcp, arena: std.mem.Allocator) []const u8 {
-    const line = m.callTool("web_eval", "{\"body\":\"const el=document.getElementById('select'),r=el.getBoundingClientRect(),s=getComputedStyle(el);return {active_element:document.activeElement.id||document.activeElement.tagName,scroll_y:scrollY,native_popup_visibility:null,select:{focused:document.activeElement===el,hover:el.matches(':hover'),focus_visible:el.matches(':focus-visible'),active:el.matches(':active'),selected_index:el.selectedIndex,value:el.value,rect:{x:r.x,y:r.y,width:r.width,height:r.height},outline:s.outline,outline_offset:s.outlineOffset,border:s.border,box_sizing:s.boxSizing},events:window.seen.events.slice(-16)}\",\"strict\":true,\"max_chars\":60000}");
-    _ = capSc(arena, line, "popup DOM evidence", false);
-    return arena.dupe(u8, line) catch fail("popup DOM evidence allocation");
-}
-
-const StreamPopupShot = struct { name: []const u8, pixels: []const u8, frame: u64, dom: []const u8 };
-
-fn streamPopupEvidence(arena: std.mem.Allocator, rt: []const u8, rig: *const StreamRig, shots: []const StreamPopupShot, reason: []const u8, last_damage: ?webstream.Rect) void {
-    const roi = webstream.Rect{ .x = 300, .y = 180, .w = 180, .h = 60 };
-    const State = struct { phase: []const u8, frame: u64, full_diff: StreamPixelDiff, roi_diff: StreamPixelDiff, dom: std.json.Value };
-    var states: std.ArrayList(State) = .empty;
-    const png = @import("util/png.zig");
-    for (shots) |shot| {
-        states.append(arena, .{
-            .phase = shot.name,
-            .frame = shot.frame,
-            .full_diff = streamPixelDiff(rig.w, rig.h, shots[0].pixels, shot.pixels, .{ .x = 0, .y = 0, .w = rig.w, .h = rig.h }),
-            .roi_diff = streamPixelDiff(rig.w, rig.h, shots[0].pixels, shot.pixels, roi),
-            .dom = std.json.parseFromSliceLeaky(std.json.Value, arena, shot.dom, .{}) catch fail("popup DOM evidence JSON"),
-        }) catch fail("popup evidence allocation");
-        const image = png.encodeShm(arena, shot.pixels, rig.w, rig.h, rig.w * 4, @intFromEnum(png.ShmFormat.argb8888)) catch {
-            say("smoke-mcp: could not encode popup evidence PNG");
-            continue;
-        };
-        const path = std.fmt.allocPrint(arena, "{s}/stream-popup-{s}.png", .{ rt, shot.name }) catch fail("popup image path");
-        @import("util/atomicwrite.zig").writeFileExact(path, image, 0o600) catch say("smoke-mcp: could not save popup evidence PNG");
-    }
-    const report = std.json.Stringify.valueAlloc(arena, .{
-        .reason = reason,
-        .roi = roi,
-        .last_damage = last_damage,
-        .diff_reference = "baseline",
-        .dom_and_pixels_atomic = false,
-        .states = states.items,
-    }, .{}) catch fail("popup evidence JSON");
-    say("smoke-mcp: popup changed-pixel counts, bounds, first BGRA difference and DOM evidence:");
-    say(report);
-    const path = std.fmt.allocPrint(arena, "{s}/stream-popup-evidence.json", .{rt}) catch fail("popup report path");
-    @import("util/atomicwrite.zig").writeFileExact(path, report, 0o600) catch say("smoke-mcp: could not save popup evidence JSON");
 }
 
 /// Pixels of `px` (4 bytes each, `w` wide) equal to `want`, and their bounds.
@@ -3931,6 +3888,54 @@ fn streamWebglPixels(px: []const u8, w: u32, h: u32, scale: u32, comptime what: 
     const b = g.bounds orelse fail(what ++ ": WebGL pixels are missing");
     if (g.count != 4096 * scale * scale or b.x != 500 * scale or b.y != 40 * scale or b.w != 64 * scale or b.h != 64 * scale)
         fail(what ++ ": WebGL canvas does not contain the exact known-colour rectangle");
+}
+
+/// The primary helper serving `socket` (its CEF subprocesses carry `--type=`).
+fn streamHelperPid(socket: []const u8) c.pid_t {
+    var want_buf: [4200]u8 = undefined;
+    const want = std.fmt.bufPrint(&want_buf, "--socket\x00{s}\x00", .{socket}) catch fail("helper socket path");
+    const d = c.opendir("/proc") orelse fail("cannot list /proc");
+    defer _ = c.closedir(d);
+    while (c.readdir(d)) |ent| {
+        const pid = std.fmt.parseInt(c.pid_t, std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name))), 10) catch continue;
+        var path: [64]u8 = undefined;
+        var buf: [16384]u8 = undefined;
+        const argv = readSmall(std.fmt.bufPrint(&path, "/proc/{d}/cmdline", .{pid}) catch continue, &buf);
+        if (std.mem.indexOf(u8, argv, want) != null and std.mem.indexOf(u8, argv, "--type=") == null) return pid;
+    }
+    fail("the stream's helper process was not found");
+}
+
+/// utime + stime of `pid`, in clock ticks.
+fn procCpuTicks(pid: c.pid_t) u64 {
+    var path: [64]u8 = undefined;
+    var buf: [4096]u8 = undefined;
+    const stat = readSmall(std.fmt.bufPrint(&path, "/proc/{d}/stat", .{pid}) catch unreachable, &buf);
+    var it = std.mem.tokenizeScalar(u8, stat[(std.mem.lastIndexOfScalar(u8, stat, ')') orelse fail("helper stat")) + 1 ..], ' ');
+    var ticks: u64 = 0;
+    var i: usize = 0;
+    while (it.next()) |field| : (i += 1) {
+        if (i == 11 or i == 12) ticks += std.fmt.parseInt(u64, field, 10) catch fail("helper stat");
+    }
+    return ticks;
+}
+
+fn procRssKib(pid: c.pid_t) u64 {
+    var path: [64]u8 = undefined;
+    var buf: [8192]u8 = undefined;
+    const status = readSmall(std.fmt.bufPrint(&path, "/proc/{d}/status", .{pid}) catch unreachable, &buf);
+    const at = std.mem.indexOf(u8, status, "VmRSS:") orelse fail("helper has no VmRSS");
+    const line = std.mem.sliceTo(status[at + 6 ..], '\n');
+    return std.fmt.parseInt(u64, std.mem.trim(u8, line, " \tkB"), 10) catch fail("helper VmRSS");
+}
+
+fn procFds(pid: c.pid_t) usize {
+    var path: [64:0]u8 = undefined;
+    const d = c.opendir((std.fmt.bufPrintZ(&path, "/proc/{d}/fd", .{pid}) catch unreachable).ptr) orelse fail("helper fd list");
+    defer _ = c.closedir(d);
+    var n: usize = 0;
+    while (c.readdir(d)) |_| n += 1;
+    return n;
 }
 
 /// Device scale 2 on the CPU path: DPR, screenshot, stream surface and pixels, then resize.
@@ -4171,10 +4176,19 @@ fn webStreamStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const 
         _ = rig.damage.take();
         rig.ack();
     };
-    if (@import("builtin").os.tag == .linux) {
+    const linux = @import("builtin").os.tag == .linux;
+    const helper = if (linux) streamHelperPid(helper_socket) else 0;
+    if (linux) {
+        // A still page streams nothing and costs the helper almost no CPU.
+        const ticks = procCpuTicks(helper);
+        const idle_end = nowMs() + 1500;
+        while (nowMs() < idle_end) if (rig.next(idle_end - nowMs())) |tag| if (tag == .damage or tag == .frame_end) fail("a still page pushed a stream frame");
+        const idle = procCpuTicks(helper) - ticks;
+        std.debug.print("smoke-mcp: idle stream helper CPU: {d} ticks in 1.5s\n", .{idle});
+        if (idle >= 30) fail("the helper spins while its stream is idle");
+    }
+    if (linux) {
         streamWebglPixels(rig.pixels, rig.w, rig.h, 1, "binary stream");
-        const stream_png = @import("util/png.zig").encodeShm(arena, rig.pixels, rig.w, rig.h, rig.w * 4, @intFromEnum(@import("util/png.zig").ShmFormat.argb8888)) catch fail("WebGL stream evidence encode");
-        @import("util/atomicwrite.zig").writeFileExact(std.fmt.allocPrint(arena, "{s}/stream-webgl-binary.png", .{rt}) catch unreachable, stream_png, 0o600) catch fail("WebGL stream evidence write");
         inline for (.{ "web_screenshot", "web_frame" }) |tool| {
             const line = m.callTool(tool, if (std.mem.eql(u8, tool, "web_frame")) "{\"format\":\"png\",\"max_width\":800,\"timeout_ms\":5000}" else "{}");
             _ = capSc(arena, line, "WebGL " ++ tool, false);
@@ -4188,7 +4202,6 @@ fn webStreamStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const 
                 dec.decode(bytes, b64) catch fail("WebGL PNG base64");
                 const img = @import("util/png.zig").decodeRgba(arena, bytes) catch fail("WebGL PNG decode");
                 streamWebglPixels(img.rgba, img.w, img.h, 1, tool);
-                @import("util/atomicwrite.zig").writeFileExact(std.fmt.allocPrint(arena, "{s}/stream-webgl-" ++ tool ++ ".png", .{rt}) catch unreachable, bytes, 0o600) catch fail("WebGL image evidence write");
                 checked = true;
             }
             if (!checked) fail("WebGL screenshot/frame had no image");
@@ -4206,7 +4219,6 @@ fn webStreamStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const 
         }
         if (!gl_repaint) fail("WebGL repaint never reached binary stream CPU pixels");
         say("smoke-mcp: REAL SwiftShader WebGL: exact 64x64 magenta screenshot/frame/stream, subsequent cyan stream repaint ok");
-        std.debug.print("smoke-mcp: WebGL PNG evidence: {s}/stream-webgl-*.png\n", .{rt});
     } else say("smoke-mcp: SwiftShader WebGL policy is Linux-only; existing stream journey still runs");
     if (fileExists(socket_path)) fail("stream token authentication did not unlink its single-use listener");
     const conflict = capSc(arena, m.callTool("web_stream", "{}"), "second stream conflict", true);
@@ -4227,6 +4239,27 @@ fn webStreamStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const 
     rig.ack();
     streamBlock(&rig, rig.frame(), baseline, .{ 0, 255, 255, 255 });
     rig.ack();
+    if (linux) {
+        // A reader that stopped ACKing under a fast-painting page costs the helper bounded memory.
+        _ = capSc(arena, m.callTool("web_eval", "{\"body\":\"let h=0;window.iv=setInterval(()=>{block.style.background='hsl('+(h=(h+7)%360)+',80%,50%)'},5);return true\"}"), "stall painter", false);
+        _ = rig.frame();
+        _ = rig.frame();
+        const rss = procRssKib(helper);
+        var peak = rss;
+        const stall_end = nowMs() + 3000;
+        while (nowMs() < stall_end) {
+            if (rig.next(250)) |tag| if (tag == .damage or tag == .frame_end or tag == .surface) fail("stream sent a third frame while two were unacknowledged");
+            peak = @max(peak, procRssKib(helper));
+        }
+        _ = capSc(arena, m.callTool("web_eval", "{\"body\":\"clearInterval(window.iv);return true\"}"), "stall painter stop", false);
+        rig.ack();
+        while (rig.next(300)) |tag| if (tag == .frame_end) {
+            _ = rig.damage.take();
+            rig.ack();
+        };
+        std.debug.print("smoke-mcp: stalled stream helper RSS growth: {d} KiB\n", .{peak - rss});
+        if (peak - rss >= 64 * 1024) fail("a stalled stream reader grew the helper");
+    }
 
     // No more MCP requests can be dispatched until this wait finishes.
     m.sendTool("web_wait", "{\"for\":\"title\",\"arg\":\"stream-input-ok\",\"timeout_ms\":10000}");
@@ -4260,7 +4293,7 @@ fn webStreamStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const 
     rig.pointer(.move, 400, 400, 0);
     rig.send(.wheel, &wheel);
     const input_wait = arena.dupe(u8, m.recvLine(12_000)) catch fail("stream input wait reply");
-    streamInputEvidence(&m, arena, rt, input_wait);
+    streamInputEvidence(&m, arena, input_wait);
     if (audio) {
         const deadline = nowMs() + 5000;
         while ((!rig.audio_signal or rig.audio_packets < 3) and nowMs() < deadline) {
@@ -4289,12 +4322,7 @@ fn webStreamStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const 
     }
     const popup_base = allocator.dupe(u8, rig.pixels) catch fail("popup baseline");
     defer allocator.free(popup_base);
-    const popup_base_frame = rig.serial;
-    const popup_base_dom = streamPopupDom(&m, arena);
-    const popup_pixels = allocator.dupe(u8, rig.pixels) catch fail("popup open snapshot");
-    defer allocator.free(popup_pixels);
     const popup_roi = webstream.Rect{ .x = 300, .y = 180, .w = 180, .h = 60 };
-    var popup_damage: ?webstream.Rect = null;
     rig.pointer(.down, 350, 165, 0);
     rig.pointer(.up, 350, 165, 0);
     var popup_seen = false;
@@ -4302,22 +4330,13 @@ fn webStreamStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const 
     while (!popup_seen and nowMs() < popup_deadline) {
         const tag = rig.next(100) orelse continue;
         if (tag != .frame_end) continue;
-        popup_damage = rig.damage.take();
+        _ = rig.damage.take();
         rig.ack();
         const diff = streamPixelDiff(rig.w, rig.h, popup_base, rig.pixels, popup_roi);
         // A thin control focus/pressed border is not proof of a popup.
         popup_seen = diff.count > 100 and diff.bounds.?.h >= 10;
     }
-    @memcpy(popup_pixels, rig.pixels);
-    const popup_open_frame = rig.serial;
-    const popup_open_dom = streamPopupDom(&m, arena);
-    if (!popup_seen) {
-        streamPopupEvidence(arena, rt, &rig, &.{
-            .{ .name = "baseline", .pixels = popup_base, .frame = popup_base_frame, .dom = popup_base_dom },
-            .{ .name = "open", .pixels = popup_pixels, .frame = popup_open_frame, .dom = popup_open_dom },
-        }, "popup pixels not observed", popup_damage);
-        fail("native select popup was not composed into pushed stream pixels");
-    }
+    if (!popup_seen) fail("native select popup was not composed into pushed stream pixels");
     rig.key(.down, "Escape", 0);
     rig.key(.up, "Escape", 0);
     var popup_gone = false;
@@ -4325,19 +4344,11 @@ fn webStreamStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const 
     while (!popup_gone and nowMs() < close_deadline) {
         const tag = rig.next(100) orelse continue;
         if (tag != .frame_end) continue;
-        popup_damage = rig.damage.take();
+        _ = rig.damage.take();
         rig.ack();
         popup_gone = streamPixelDiff(rig.w, rig.h, popup_base, rig.pixels, popup_roi).count == 0;
     }
-    if (!popup_gone) {
-        const popup_closed_dom = streamPopupDom(&m, arena);
-        streamPopupEvidence(arena, rt, &rig, &.{
-            .{ .name = "baseline", .pixels = popup_base, .frame = popup_base_frame, .dom = popup_base_dom },
-            .{ .name = "open", .pixels = popup_pixels, .frame = popup_open_frame, .dom = popup_open_dom },
-            .{ .name = "closed", .pixels = rig.pixels, .frame = rig.serial, .dom = popup_closed_dom },
-        }, "popup close did not restore exact underlay pixels", popup_damage);
-        fail("native popup close did not restore the page below it (stream-popup-evidence.json and baseline/open/closed PNGs retained)");
-    }
+    if (!popup_gone) fail("native popup close did not restore the page below it");
 
     // Disconnect releases a held modifier and mouse button on the real page.
     _ = capSc(arena, m.callTool("web_eval", "{\"body\":\"window.streamReleaseBase={pad_down:window.seen.pad_down_count,pad_up:window.seen.pad_up_count,shift_down:window.seen.shift_down_count,shift_up:window.seen.shift_up_count};window.streamGoal='stream-release-ok';document.title='stream-release-pending';return true\"}"), "start release phase", false);
@@ -4350,8 +4361,22 @@ fn webStreamStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const 
     _ = c.usleep(100_000);
     rig.disconnect();
     const release_wait = arena.dupe(u8, m.recvLine(12_000)) catch fail("stream release wait reply");
-    streamInputEvidence(&m, arena, rt, release_wait);
+    streamInputEvidence(&m, arena, release_wait);
+    // Repeated streams leak no helper descriptors.
+    var fds: usize = 0;
+    for (0..9) |round| {
+        const o = streamOffer(&m, arena);
+        if (round == 1 and linux) fds = procFds(helper);
+        var cycle = StreamRig.connect(allocator, o.get("socket_path").?.string);
+        cycle.send(.auth, o.get("token").?.string);
+        _ = cycle.frame();
+        cycle.deinit();
+    }
     const next_offer = streamOffer(&m, arena);
+    if (linux and procFds(helper) > fds + 2) {
+        std.debug.print("smoke-mcp: helper descriptors {d} -> {d}\n", .{ fds, procFds(helper) });
+        fail("repeated stream open/close leaked helper descriptors");
+    }
 
     // Wrong AUTH consumes its token, then a replayed AUTH ends a fresh stream.
     var wrong = StreamRig.connect(allocator, next_offer.get("socket_path").?.string);

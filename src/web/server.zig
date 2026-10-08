@@ -1042,7 +1042,7 @@ pub const Server = struct {
                 if (withheld(.web_stream)) {
                     try cn.out.post(proto.EvStreamOpen{ .view = raw.view, .req = raw.req, .path = "", .token = "", .err = "this helper does not stream" }, null);
                 } else switch (self.host.streamOpen(req.view, req.audio != 0)) {
-                    .ok => |st| try cn.out.post(proto.EvStreamOpen{ .view = raw.view, .req = raw.req, .path = st.path(), .token = &st.token, .err = "" }, null),
+                    .ok => |st| try cn.out.post(proto.EvStreamOpen{ .view = raw.view, .req = raw.req, .path = st.path(), .token = &st.token, .err = "", .audio = @intFromBool(st.encoder != null) }, null),
                     .err => |why| try cn.out.post(proto.EvStreamOpen{ .view = raw.view, .req = raw.req, .path = "", .token = "", .err = why }, null),
                 }
             },

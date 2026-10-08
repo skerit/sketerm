@@ -220,7 +220,6 @@ pub fn onPopupShow(_: [*c]cef.cef_render_handler_t, browser: [*c]cef.cef_browser
     const host = host_mod.g_host orelse return;
     const v = viewOf(browser) orelse return;
     v.widget_shown = show != 0;
-    srv.note("view {d}: popup widget {s}", .{ v.id, if (v.widget_shown) "shown" else "hidden" });
     if (!v.widget_shown) dropPopup(host, v);
 }
 
@@ -233,17 +232,13 @@ pub fn onPopupSize(_: [*c]cef.cef_render_handler_t, browser: [*c]cef.cef_browser
     if (v.widget_map.len != 0) damageRect(host, v, popupDamage(v));
     v.widget_x = r.x;
     v.widget_y = r.y;
-    srv.note("view {d}: popup widget at {d},{d} size {d}x{d} (view coordinates)", .{ v.id, r.x, r.y, r.width, r.height });
     if (v.widget_map.len != 0) damageRect(host, v, popupDamage(v));
 }
 
 /// A `PET_POPUP` paint: keep the popup's pixels (they are composed over
 /// the view at send time) and damage where it sits.
 pub fn popupPaint(self: *Host, v: *View, buffer: ?*const anyopaque, width: c_int, height: c_int) void {
-    if (!v.widget_shown or width <= 0 or height <= 0) {
-        srv.note("view {d}: popup paint {d}x{d} ignored (shown={})", .{ v.id, width, height, v.widget_shown });
-        return;
-    }
+    if (!v.widget_shown or width <= 0 or height <= 0) return;
     const src: [*]const u8 = @ptrCast(buffer orelse return);
     const w: u32 = @intCast(width);
     const h: u32 = @intCast(height);
@@ -342,8 +337,8 @@ fn cursorOf(ctype: cef.cef_cursor_type_t, info: [*c]const cef.cef_cursor_info_t)
         return .{ .image = .{
             .w = w,
             .h = h,
-            .hot_x = inf.hotspot.x,
-            .hot_y = inf.hotspot.y,
+            .hot_x = std.math.clamp(inf.hotspot.x, 0, @as(i32, @intCast(w)) - 1),
+            .hot_y = std.math.clamp(inf.hotspot.y, 0, @as(i32, @intCast(h)) - 1),
             .bgra = buf[0 .. @as(usize, w) * h * 4],
         } };
     }
@@ -496,11 +491,7 @@ fn input(ctx: *anyopaque, s: *srv.Stream, in: st.Input) void {
 
 pub var audio_handler: cef.cef_audio_handler_t = undefined;
 
-/// Packets the capture thread delivered (diagnostics only).
-var packets_seen = std.atomic.Value(u64).init(0);
-
 pub fn installAudio() void {
-    srv.readDebugEnv();
     audio_handler = std.mem.zeroes(cef.cef_audio_handler_t);
     audio_handler.base = host_mod.staticBase(cef.cef_audio_handler_t);
     audio_handler.get_audio_parameters = onGetAudioParameters;
@@ -525,32 +516,20 @@ fn browserId(browser: [*c]cef.cef_browser_t) i32 {
 /// every other page must stay uncaptured.
 fn onGetAudioParameters(_: [*c]cef.cef_audio_handler_t, browser: [*c]cef.cef_browser_t, params: [*c]cef.cef_audio_parameters_t) callconv(.c) c_int {
     defer releaseArg(browser);
-    const id = browserId(browser);
     const host = host_mod.g_host orelse return 0;
-    const v = viewOf(browser) orelse {
-        srv.note("capture asked for browser {d}: no view, refused", .{id});
-        return 0;
-    };
-    const s = streamOf(host, v.id) orelse {
-        srv.note("capture asked for view {d}: no stream, refused (page plays normally)", .{v.id});
-        return 0;
-    };
-    const slot = s.audio_slot orelse {
-        srv.note("capture asked for view {d}: its stream has no audio slot, refused", .{v.id});
-        return 0;
-    };
+    const v = viewOf(browser) orelse return 0;
+    const s = streamOf(host, v.id) orelse return 0;
+    const slot = s.audio_slot orelse return 0;
     const p: *cef.cef_audio_parameters_t = @ptrCast(params orelse return 0);
     p.sample_rate = srv.Audio.RATE;
     p.channel_layout = cef.CEF_CHANNEL_LAYOUT_STEREO;
-    srv.audio.bind(slot, id);
-    srv.note("capture granted for view {d} (browser {d}) into slot {d}", .{ v.id, id, slot });
+    srv.audio.bind(slot, browserId(browser));
     return 1;
 }
 
 fn onAudioStarted(_: [*c]cef.cef_audio_handler_t, browser: [*c]cef.cef_browser_t, params: [*c]const cef.cef_audio_parameters_t, channels: c_int) callconv(.c) void {
     defer releaseArg(browser);
     const p: *const cef.cef_audio_parameters_t = @ptrCast(params orelse return);
-    srv.note("capture started for browser {d}: {d}Hz, {d} channels, {d} frames/buffer", .{ browserId(browser), p.sample_rate, channels, p.frames_per_buffer });
     if (p.sample_rate <= 0 or channels <= 0) return;
     srv.audio.start(browserId(browser), @intCast(p.sample_rate), @intCast(channels));
 }
@@ -561,27 +540,19 @@ fn onAudioPacket(_: [*c]cef.cef_audio_handler_t, browser: [*c]cef.cef_browser_t,
     const id = browserId(browser);
     // `data` holds exactly as many planes as the stream has channels;
     // two at most are read and mono duplicates its one plane.
-    const seen = packets_seen.fetchAdd(1, .monotonic);
-    if (seen % 250 == 0) srv.note("capture packet {d} for browser {d}: {d} frames, pts {d}ms", .{ seen, id, frames, pts });
     const n = @min(srv.audio.channelsOf(id), 2);
-    if (n == 0) {
-        if (seen % 250 == 0) srv.note("capture packet for browser {d} dropped: no live 48kHz capture recorded", .{id});
-        return;
-    }
+    if (n == 0) return;
     var planes: [2][*]const f32 = undefined;
     for (0..n) |i| planes[i] = @ptrCast(data[i] orelse return);
     srv.audio.push(id, planes[0..n], @intCast(frames), pts);
-    if (seen < 4) srv.note("capture packet {d} for browser {d} pushed, {d} channels", .{ seen, id, n });
 }
 
 fn onAudioStopped(_: [*c]cef.cef_audio_handler_t, browser: [*c]cef.cef_browser_t) callconv(.c) void {
     defer releaseArg(browser);
-    srv.note("capture stopped for browser {d}", .{browserId(browser)});
     srv.audio.stop(browserId(browser));
 }
 
 fn onAudioError(_: [*c]cef.cef_audio_handler_t, browser: [*c]cef.cef_browser_t, _: [*c]const cef.cef_string_t) callconv(.c) void {
     defer releaseArg(browser);
-    srv.note("capture error for browser {d}", .{browserId(browser)});
     srv.audio.stop(browserId(browser));
 }

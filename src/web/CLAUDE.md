@@ -1550,11 +1550,8 @@ half in `cefhost/stream.zig`.
   wall time or a monotonic-clock reading. PCM crosses from CEF's audio thread through
   `streamsrv.audio`, static, bounded (0.5s per stream) and spinlocked;
   a drop or a timestamp jump resets the queue instead of stitching a
-  gap, and the loop encodes 20ms Opus with `mux/opuscodec.zig`.
-  `SKETERM_WEB_STREAM_DEBUG=1` logs each audio step to stderr (capture
-  asked/granted/started, packets, queue depth, encodes, drops). It found
-  the 2026-10-07 silence: a `@min` against a comptime 1024 narrowed a
-  frame count to u11 and every real 1024-frame packet was queued empty.
+  gap, and the loop encodes 20ms Opus with `mux/opuscodec.zig`. The
+  open reports audio only when that encoder started.
 - **Input is budgeted per poll turn** (`streamsrv.EVENTS_PER_TURN`,
   `TEXT_BYTES_PER_TURN`, reads bounded by `IN_CAP`; a Text frame is at
   most `stream.MAX_TEXT` bytes), so a flooding client cannot starve the

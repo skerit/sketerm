@@ -67,6 +67,16 @@ const NAMED = [_]Named{
 
 pub const Error = error{ UnknownKey, UnknownModifier, EmptyChord };
 
+/// The `proto.mod_*` bit a modifier name stands for, any case.
+pub fn modBit(name: []const u8) ?u32 {
+    const eq = std.ascii.eqlIgnoreCase;
+    if (eq(name, "ctrl") or eq(name, "control")) return proto.mod_ctrl;
+    if (eq(name, "shift")) return proto.mod_shift;
+    if (eq(name, "alt")) return proto.mod_alt;
+    if (eq(name, "meta") or eq(name, "super") or eq(name, "cmd")) return proto.mod_super;
+    return null;
+}
+
 /// One `mod+key` chord. A single character stands for itself; a
 /// bare-shift chord over a printable produces that character's text
 /// (the caller writes the character they mean, "?" not "shift+/").
@@ -76,17 +86,7 @@ pub fn parseChord(spec: []const u8) Error!Chord {
     while (std.mem.indexOfScalar(u8, rest, '+')) |plus| {
         // A trailing '+' means the KEY is '+' ("ctrl++" or a bare "+").
         if (plus + 1 == rest.len) break;
-        const m = rest[0..plus];
-        if (std.ascii.eqlIgnoreCase(m, "ctrl") or std.ascii.eqlIgnoreCase(m, "control"))
-            mods |= proto.mod_ctrl
-        else if (std.ascii.eqlIgnoreCase(m, "shift"))
-            mods |= proto.mod_shift
-        else if (std.ascii.eqlIgnoreCase(m, "alt"))
-            mods |= proto.mod_alt
-        else if (std.ascii.eqlIgnoreCase(m, "meta") or std.ascii.eqlIgnoreCase(m, "super") or std.ascii.eqlIgnoreCase(m, "cmd"))
-            mods |= proto.mod_super
-        else
-            return error.UnknownModifier;
+        mods |= modBit(rest[0..plus]) orelse return error.UnknownModifier;
         rest = rest[plus + 1 ..];
     }
     if (rest.len == 0) return error.EmptyChord;

@@ -45,23 +45,27 @@ const ANCESTOR_DEPTH = 8;
 /// Whether a NUL-separated argv lists `name`'s channel: `server:<name>`
 /// or `plugin:<name>@<marketplace>` after one of `CHANNEL_FLAGS`, which
 /// take every following word up to the next option (or `=value`).
-pub fn argvNamesChannel(argv: []const u8, name: []const u8) bool {
+/// @return null when the argv has no channel option at all
+pub fn argvNamesChannel(argv: []const u8, name: []const u8) ?bool {
     var it = std.mem.splitScalar(u8, argv, 0);
     var listing = false;
+    var lists = false;
     while (it.next()) |word| {
         if (word.len > 0 and word[0] == '-') {
             listing = false;
             for (CHANNEL_FLAGS) |flag| {
                 if (std.mem.eql(u8, word, flag)) listing = true;
                 if (word.len > flag.len and std.mem.startsWith(u8, word, flag) and word[flag.len] == '=') {
+                    lists = true;
                     if (entryNames(word[flag.len + 1 ..], name)) return true;
                 }
             }
+            lists = lists or listing;
             continue;
         }
         if (listing and entryNames(word, name)) return true;
     }
-    return false;
+    return if (lists) false else null;
 }
 
 /// One `--channels` entry (Claude Code splits a word on nothing else).
@@ -75,16 +79,17 @@ fn entryNames(entry: []const u8, name: []const u8) bool {
     return false;
 }
 
-/// Whether this process's parent, or one of its nearest ancestors, was
-/// started with `name`'s channel. Always false where processes cannot be
-/// inspected (`platform.can_inspect_processes`).
+/// Whether the nearest ancestor started with a channel option names
+/// `name`'s channel. Farther ancestors are another session (an outer
+/// Claude Code), whose channel never reaches this one. Always false where
+/// processes cannot be inspected (`platform.can_inspect_processes`).
 pub fn ancestorNamesChannel(name: []const u8) bool {
     var pid = c.getppid();
     var buf: [64 * 1024]u8 = undefined;
     var depth: usize = 0;
     while (depth < ANCESTOR_DEPTH and pid > 1) : (depth += 1) {
         if (platform.argvOfPid(pid, &buf)) |argv| {
-            if (argvNamesChannel(argv, name)) return true;
+            if (argvNamesChannel(argv, name)) |named| return named;
         }
         const info = platform.infoOfPid(pid) orelse return false;
         pid = info.ppid;
@@ -195,17 +200,21 @@ const t = std.testing;
 
 test "the channel option is read the way Claude Code parses it" {
     const name = "sketerm";
-    try t.expect(argvNamesChannel("claude\x00--dangerously-load-development-channels\x00server:sketerm", name));
-    try t.expect(argvNamesChannel("claude\x00--channels\x00server:tg\x00server:sketerm\x00--model\x00haiku", name));
-    try t.expect(argvNamesChannel("claude\x00--channels=plugin:sketerm@market", name));
-    try t.expect(argvNamesChannel("claude\x00--channels\x00plugin:sketerm@m", name));
-    // Another server's channel, a bare name, or the entry after the list ended.
-    try t.expect(!argvNamesChannel("claude\x00--channels\x00server:telegram", name));
-    try t.expect(!argvNamesChannel("claude\x00--channels\x00sketerm", name));
-    try t.expect(!argvNamesChannel("claude\x00--channels\x00server:tg\x00--model\x00server:sketerm", name));
-    try t.expect(!argvNamesChannel("claude\x00--model\x00server:sketerm", name));
-    try t.expect(!argvNamesChannel("claude\x00--channels\x00server:sketerm2", name));
-    try t.expect(!argvNamesChannel("claude\x00--channels\x00plugin:sketerm", name));
+    try t.expectEqual(@as(?bool, true), argvNamesChannel("claude\x00--dangerously-load-development-channels\x00server:sketerm", name));
+    try t.expectEqual(@as(?bool, true), argvNamesChannel("claude\x00--channels\x00server:tg\x00server:sketerm\x00--model\x00haiku", name));
+    try t.expectEqual(@as(?bool, true), argvNamesChannel("claude\x00--channels=plugin:sketerm@market", name));
+    try t.expectEqual(@as(?bool, true), argvNamesChannel("claude\x00--channels\x00plugin:sketerm@m", name));
+    // Another server's channel, a bare name, or the entry after the list
+    // ended: a session with channels, not ours, so the walk stops there.
+    try t.expectEqual(@as(?bool, false), argvNamesChannel("claude\x00--channels\x00server:telegram", name));
+    try t.expectEqual(@as(?bool, false), argvNamesChannel("claude\x00--channels=server:telegram", name));
+    try t.expectEqual(@as(?bool, false), argvNamesChannel("claude\x00--channels\x00sketerm", name));
+    try t.expectEqual(@as(?bool, false), argvNamesChannel("claude\x00--channels\x00server:tg\x00--model\x00server:sketerm", name));
+    try t.expectEqual(@as(?bool, false), argvNamesChannel("claude\x00--channels\x00server:sketerm2", name));
+    try t.expectEqual(@as(?bool, false), argvNamesChannel("claude\x00--channels\x00plugin:sketerm", name));
+    // No channel option: a wrapper, the walk goes on.
+    try t.expectEqual(@as(?bool, null), argvNamesChannel("claude\x00--model\x00server:sketerm", name));
+    try t.expectEqual(@as(?bool, null), argvNamesChannel("/bin/sh\x00-c\x00exec sketerm mcp", name));
 }
 
 test "a done push carries its short answer once, a long one by pointer" {

@@ -4318,7 +4318,8 @@ pub const StreamOpen = struct {
 /// `err`, a 0600 unix socket `path` beside the helper's own socket and a
 /// single-use `token` (32 lowercase hex characters) the stream client
 /// must send as its first frame. A refusal has empty `path`/`token` and
-/// says why in `err`.
+/// says why in `err`. Optional trailing `audio` is 1 only when the stream's
+/// Opus encoder started (absent from an older helper: 0).
 pub const EvStreamOpen = struct {
     pub const tag: Tag = .ev_stream_open;
     view: u32,
@@ -4326,6 +4327,14 @@ pub const EvStreamOpen = struct {
     path: []const u8,
     token: []const u8,
     err: []const u8,
+    audio: u8 = 0,
+
+    pub fn decodeFrom(payload: []const u8) !EvStreamOpen {
+        var cur = Cur{ .buf = payload };
+        var out: EvStreamOpen = .{ .view = try cur.readU32(), .req = try cur.readU32(), .path = try cur.readStr(), .token = try cur.readStr(), .err = try cur.readStr() };
+        out.audio = cur.readU8() catch 0;
+        return out;
+    }
 };
 
 /// Client -> helper: end `view`'s stream. Unanswered except by the
@@ -4353,6 +4362,12 @@ test "round-trip: stream frames" {
         .err = "",
     });
     try roundTrip(EvStreamOpen, .{ .view = 3, .req = 78, .path = "", .token = "", .err = "this view already has a stream" });
+    try roundTrip(EvStreamOpen, .{ .view = 3, .req = 79, .path = "/p", .token = "t", .err = "", .audio = 1 });
+    // An older helper sends no audio byte: no audio.
+    var old: std.ArrayList(u8) = .empty;
+    defer old.deinit(std.testing.allocator);
+    try encodePayload(std.testing.allocator, &old, EvStreamOpen{ .view = 3, .req = 80, .path = "/p", .token = "t", .err = "", .audio = 1 });
+    try std.testing.expectEqual(@as(u8, 0), (try decode(EvStreamOpen, old.items[0 .. old.items.len - 1])).audio);
     try roundTrip(StreamClose, .{ .view = 3 });
     try roundTrip(EvStreamClosed, .{ .view = 3, .reason = "the stream client disconnected" });
     try std.testing.expectEqual(@as(u8, 0xF8), @intFromEnum(Tag.stream_open));

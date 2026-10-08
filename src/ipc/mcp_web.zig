@@ -1028,6 +1028,7 @@ fn headlessFail(arena: std.mem.Allocator, e: *webdrive.Engine, err: anyerror) !F
         error.FrameRateUnsupported => fail(.unavailable, "the helper did not advertise view-max-fps; no stream was opened"),
         error.InvalidFrameRate => fail(.invalid_args, "max_fps must be an integer from 1 to 240"),
         error.StreamPending => fail(.conflict, "a stream open is already pending for this view"),
+        error.StreamActive => fail(.conflict, "this view already has a stream; close it first"),
         error.StreamEnded => fail(.unavailable, "the stream ended before its socket could be returned"),
         error.Timeout => try diagnosticFail(arena, e, .timeout, "the browser helper did not answer in time"),
         error.PolicyAckUnsupported => fail(.unavailable, "the helper does not advertise net-policy-ack; live policy updates and untrusted opens are refused without a correlated installation acknowledgement"),
@@ -3731,7 +3732,7 @@ pub fn webTool(
     return mcp.errRes(arena, .unknown_tool, "unknown web tool");
 }
 
-fn streamResult(arena: std.mem.Allocator, view: View, offer: web_proto.EvStreamOpen, audio: bool) ![]const u8 {
+fn streamResult(arena: std.mem.Allocator, view: View, offer: web_proto.EvStreamOpen) ![]const u8 {
     var res = mcp.Res.init(arena);
     try head(&res, arena, .headless, view);
     try res.fact("pane", view.pane);
@@ -3740,7 +3741,7 @@ fn streamResult(arena: std.mem.Allocator, view: View, offer: web_proto.EvStreamO
     try res.fact("protocol_version", @as(u32, 1));
     try res.fact("max_unacked_frames", @as(u32, @import("../web/stream.zig").MAX_UNACKED));
     try res.fact("pixel_format", "bgra-premultiplied");
-    try res.fact("audio", audio);
+    try res.fact("audio", offer.audio != 0);
     if (view.max_fps) |fps| try res.fact("max_fps", fps);
     try res.text("opened a single-use local binary stream socket; authenticate with the token as the first frame, ACK frame ends, and close the socket to end the stream");
     return res.finish();
@@ -3757,15 +3758,14 @@ fn streamTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view:
         .err => |f| return failRes(arena, f),
         .value => |fps| fps,
     };
-    if (max_fps != null and !e.has(.view_max_fps)) return mcp.errRes(arena, .unavailable, "the helper did not advertise view-max-fps; no stream was opened");
     const audio = if (mcp.argValue(args, "audio")) |v| v.bool else true;
     const offer = e.openStream(arena, view.pane, audio, 5000, max_fps) catch |err|
         return failRes(arena, try headlessFail(arena, e, err));
-    if (offer.err.len > 0) return mcp.errRes(arena, if (std.mem.indexOf(u8, offer.err, "already has a stream") != null) .conflict else .refused, offer.err);
+    if (offer.err.len > 0) return mcp.errRes(arena, .refused, offer.err);
     var streamed_view = view;
     const live = e.findView(view.pane) orelse return mcp.errRes(arena, .not_found, "the view ended while opening its stream");
     streamed_view.max_fps = live.max_fps;
-    return streamResult(arena, streamed_view, offer, audio and e.has(.stream_audio));
+    return streamResult(arena, streamed_view, offer);
 }
 
 fn parseMaxFps(arena: std.mem.Allocator, args: std.json.Value) !union(enum) { absent, value: u16, err: Fail } {
@@ -5207,16 +5207,7 @@ fn inputMods(item: std.json.Value) ?u32 {
     var mods: u32 = 0;
     for (list.array.items) |m| {
         if (m != .string) return null;
-        const name = m.string;
-        if (std.ascii.eqlIgnoreCase(name, "shift")) {
-            mods |= web_proto.mod_shift;
-        } else if (std.ascii.eqlIgnoreCase(name, "ctrl") or std.ascii.eqlIgnoreCase(name, "control")) {
-            mods |= web_proto.mod_ctrl;
-        } else if (std.ascii.eqlIgnoreCase(name, "alt")) {
-            mods |= web_proto.mod_alt;
-        } else if (std.ascii.eqlIgnoreCase(name, "meta") or std.ascii.eqlIgnoreCase(name, "super")) {
-            mods |= web_proto.mod_super;
-        } else return null;
+        mods |= webkeys.modBit(m.string) orelse return null;
     }
     return mods;
 }
@@ -5324,16 +5315,16 @@ fn inputTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view: 
     var focused = false;
     for (events, 0..) |ev, i| {
         const sent: anyerror!void = switch (ev) {
-            .pointer => |p| e.pointerAt(view.pane, p.kind, p.x, p.y, p.button, p.clicks, p.mods),
-            .wheel => |w| e.wheelAt(view.pane, w.x, w.y, w.dx, w.dy, w.mods),
+            .pointer => |p| e.sendInput(web_proto.InputPointer{ .view = view.pane, .kind = @intFromEnum(p.kind), .x = p.x, .y = p.y, .button = p.button, .clicks = p.clicks, .mods = p.mods }),
+            .wheel => |w| e.sendInput(web_proto.InputScroll{ .view = view.pane, .x = w.x, .y = w.y, .dx = w.dx, .dy = w.dy, .mods = w.mods }),
             .key, .text => blk: {
                 if (!focused) {
                     e.focusView(view.pane) catch |err| break :blk err;
                     focused = true;
                 }
                 break :blk switch (ev) {
-                    .key => |k| e.keyEdge(view.pane, k.kind, k.keysym, k.mods, k.text),
-                    .text => |t| e.insertText(view.pane, t),
+                    .key => |k| e.sendInput(web_proto.InputKey{ .view = view.pane, .kind = @intFromEnum(k.kind), .keyval = k.keysym, .keycode = 0, .mods = k.mods, .text = k.text }),
+                    .text => |t| e.sendInput(web_proto.InputPaste{ .view = view.pane, .text = .{ .s = t } }),
                     else => unreachable,
                 };
             },
@@ -7441,7 +7432,7 @@ test "web_stream returns common view facts and refuses GUI and malformed audio w
     const out = try streamResult(arena, .{ .pane = 7, .view = 7, .url = "https://example.com/", .route = "via:box" }, .{
         .view = 7, .req = 1, .path = "/tmp/web-stream.sock",
         .token = "0123456789abcdef0123456789abcdef", .err = "",
-    }, false);
+    });
     const sc = (try mcp.expectToolResultShape(arena, "web_stream", out)).object.get("structuredContent").?.object;
     try std.testing.expectEqualStrings("headless", sc.get("backend").?.string);
     try std.testing.expectEqualStrings("via:box", sc.get("route").?.string);
