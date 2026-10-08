@@ -1075,6 +1075,10 @@ pub const Channel = struct {
     dead: bool = false,
     /// A fatal Wayland error is queued; stop reading and close once written.
     close_after_flush: bool = false,
+    /// The peer hung up while reads were paused (`relayPaused`): the fd
+    /// leaves the poll set until the client drains, then the unread tail
+    /// and the EOF are read as usual, so a hangup never drops bytes.
+    peer_hup: bool = false,
     /// Non-null on a Wayland app channel: the app speaks raw Wayland
     /// to us and the byte stream toward the GUI is wlhost/pipe units.
     native: ?*Native = null,
@@ -1824,15 +1828,64 @@ test "web_helper_connect: bridges a helper serving beside the daemon socket, des
         try t.expectEqual(@as(u32, 7), parsed.value.req);
         try t.expectEqual(chan_id, parsed.value.chan);
     }
-    const afd = c.accept(lfd, null, null);
+    var afd = c.accept(lfd, null, null);
     try t.expect(afd >= 0);
-    defer _ = c.close(afd);
+    defer if (afd >= 0) {
+        _ = c.close(afd);
+    };
     try t.expectEqual(@as(usize, 1), d.channels.items.len);
     // A bridged channel owns no process: nothing to kill on close.
     try t.expectEqual(@as(c.pid_t, -1), d.channels.items[0].child_pid);
 
+    // 1b. Backpressure: the client reads nothing, so once its queue passes
+    // CHANNEL_BACKLOG the daemon stops reading the helper, whose own
+    // socket then fills; a hangup meanwhile loses nothing; the drain
+    // resumes reading and delivers every byte in order, then the close.
+    {
+        _ = c.fcntl(afd, c.F_SETFL, c.O_NONBLOCK);
+        const cl = d.clients.items[0];
+        const ch = d.channels.items[0];
+        var buf: [64 << 10]u8 = undefined;
+        var sent: usize = 0;
+        var refused: usize = 0;
+        var turns: usize = 0;
+        while (refused < 50 and turns < 20_000) : (turns += 1) {
+            for (&buf, 0..) |*b, k| b.* = @intCast((sent + k) % 251);
+            const n = c.write(afd, &buf, buf.len);
+            if (n > 0) {
+                sent += @intCast(n);
+                refused = 0;
+            } else refused += 1;
+            try d.tick(0);
+            // At most one read past the cap, plus its frame header.
+            try t.expect(cl.queuedBytes() <= Daemon.CHANNEL_BACKLOG + buf.len + 64);
+        }
+        try t.expect(refused >= 50);
+        try t.expect(cl.queuedBytes() > Daemon.CHANNEL_BACKLOG);
+        try t.expect(sent > Daemon.CHANNEL_BACKLOG);
+
+        _ = c.close(afd);
+        afd = -1;
+        for (0..20) |_| try d.tick(0);
+        try t.expect(!ch.dead);
+        try t.expect(ch.peer_hup);
+
+        var got: usize = 0;
+        while (true) {
+            const f = try Pump.next(d, &conn);
+            defer f.deinit(t.allocator);
+            try t.expectEqual(chan_id, std.mem.readInt(u32, f.payload[0..4], .little));
+            if (f.ftype == .chan_close) break;
+            try t.expectEqual(wire.FrameType.chan_data, f.ftype);
+            for (f.payload[4..], 0..) |b, k| {
+                if (b != @as(u8, @intCast((got + k) % 251))) return error.OutOfOrder;
+            }
+            got += f.payload.len - 4;
+        }
+        try t.expectEqual(sent, got);
+    }
+
     // 2. No helper: a described refusal, no channel.
-    _ = c.close(afd);
     _ = c.unlink(helper_path.ptr);
     try conn.sendJson(.web_helper_connect, .{ .req = @as(u32, 8), .session = "web-1-nope" });
     while (true) {
@@ -3554,10 +3607,11 @@ pub const Daemon = struct {
         const chan_base = fds.items.len;
         const n_channels_built = self.channels.items.len;
         for (self.channels.items) |ch| {
-            var ev: c_short = if (ch.close_after_flush) 0 else c.POLLIN;
+            const paused = relayPaused(ch);
+            var ev: c_short = if (ch.close_after_flush or paused) 0 else c.POLLIN;
             if (ch.pending.items.len > 0) ev |= c.POLLOUT;
             try fds.append(self.allocator, .{
-                .fd = if (ch.dead) -1 else ch.fd,
+                .fd = if (ch.dead or (paused and ch.peer_hup)) -1 else ch.fd,
                 .events = ev,
                 .revents = 0,
             });
@@ -3707,8 +3761,12 @@ pub const Daemon = struct {
             if (ch.dead) continue;
             if (re & c.POLLIN != 0 and !ch.close_after_flush) self.channelReadable(ch);
             if (!ch.dead and re & c.POLLOUT != 0) self.channelWritable(ch);
-            if (!ch.dead and re & (c.POLLHUP | c.POLLERR) != 0 and re & c.POLLIN == 0)
-                self.closeChannel(ch, true);
+            if (!ch.dead and re & (c.POLLHUP | c.POLLERR) != 0 and re & c.POLLIN == 0) {
+                // Polled without POLLIN for backpressure: unread bytes may
+                // still sit before the hangup, so park it until the drain.
+                const read_paused = fds.items[chan_base + i].events & c.POLLIN == 0 and !ch.close_after_flush;
+                if (read_paused) ch.peer_hup = true else self.closeChannel(ch, true);
+            }
         }
 
         // Clipboard-fetch pipes (snapshot the count: clip_reads may
@@ -4465,6 +4523,21 @@ pub const Daemon = struct {
     /// falls behind doesn't need every intermediate frame: it catches
     /// up on the NEXT commit it can receive (or via reattach replay).
     const NATIVE_BACKLOG: usize = 8 << 20;
+
+    /// Queued outbound bytes past which a byte relay (tcp forward, LSP,
+    /// web helper bridge) is no longer read, so the peer's own socket
+    /// fills and ITS backpressure engages instead of the backlog piling
+    /// up toward MAX_WBUF; the same per-client production bound as
+    /// NATIVE_BACKLOG and Client.EVENTS_BACKLOG.
+    const CHANNEL_BACKLOG: usize = NATIVE_BACKLOG;
+
+    /// Whether `ch` relays bytes to one client that already has more
+    /// than `CHANNEL_BACKLOG` queued; reading resumes once it drains.
+    fn relayPaused(ch: *const Channel) bool {
+        if (!ch.tcp or ch.dead) return false;
+        const cl = ch.client orelse return false;
+        return cl.queuedBytes() > CHANNEL_BACKLOG;
+    }
 
     /// The gap threshold for "mcp"-kind clients is far LOWER: an MCP
     /// client consumes its queue at replica-compose speed (a full
