@@ -23,6 +23,7 @@ const stall = @import("../agent/stall.zig");
 const transport = @import("transport.zig");
 const sshmaster = @import("../mux/sshmaster.zig");
 const web_proto = @import("../web/protocol.zig");
+const vcodec = @import("../wlhost/vcodec.zig");
 
 /// Every name `web_proto.reasonName` can render (each `NetReason`, plus
 /// "unknown" for a newer helper's byte), as a JSON enum body: generated, so
@@ -33,7 +34,7 @@ const NET_REASON_ENUM = blk: {
     break :blk out ++ "\"unknown\"";
 };
 
-const WEB_STREAM_CAP_PROPS = "\"web_stream\":{\"type\":\"boolean\",\"description\":\"Headless stream adapter support before helper startup; negotiated web-stream capability afterwards\"},\"web_stream_audio\":{\"type\":[\"boolean\",\"null\"],\"description\":\"Runtime stream-audio capability; null before the helper handshake\"},\"web_software_webgl\":{\"type\":[\"boolean\",\"null\"],\"description\":\"Current headless helper selected SwiftShader with CPU compositing; null before handshake, false for GUI or restricted helpers; not a guarantee every page can create a context\"},\"web_max_fps\":{\"type\":\"boolean\",\"description\":\"Headless frame-rate option support before startup; negotiated view-max-fps afterwards\"},\"web_default_max_fps\":{\"type\":\"integer\",\"description\":\"Resolved MCP headless cap, 60 unless [mcp] or the selected profile sets web_max_fps\"},";
+const WEB_STREAM_CAP_PROPS = "\"web_stream\":{\"type\":\"boolean\",\"description\":\"Headless stream adapter support before helper startup; negotiated web-stream capability afterwards\"},\"web_stream_audio\":{\"type\":[\"boolean\",\"null\"],\"description\":\"Runtime stream-audio capability; null before the helper handshake\"},\"web_stream_encoded\":{\"type\":[\"boolean\",\"null\"],\"description\":\"The current helper honours web_stream encoding:encoded (stream-encoded capability); null before the helper handshake\"},\"web_software_webgl\":{\"type\":[\"boolean\",\"null\"],\"description\":\"Current headless helper selected SwiftShader with CPU compositing; null before handshake, false for GUI or restricted helpers; not a guarantee every page can create a context\"},\"web_max_fps\":{\"type\":\"boolean\",\"description\":\"Headless frame-rate option support before startup; negotiated view-max-fps afterwards\"},\"web_default_max_fps\":{\"type\":\"integer\",\"description\":\"Resolved MCP headless cap, 60 unless [mcp] or the selected profile sets web_max_fps\"},";
 const WEB_MAX_FPS_PROP = std.fmt.comptimePrint("\"max_fps\":{{\"type\":\"integer\",\"minimum\":1,\"maximum\":{d},\"description\":\"Headless per-view CEF paint cap. Default 60 or config web_max_fps at open; omitted at stream open preserves the view cap. Stream overrides persist after close. Unsupported helpers refuse explicit caps. GUI monitor-driven pacing is unchanged.\"}},", .{@import("../web/protocol.zig").MAX_VIEW_FPS});
 
 const REVIEW_INPUT =
@@ -190,6 +191,14 @@ fn enumItems(comptime E: type) []const u8 {
         return out;
     }
 }
+
+/// `"h264","av1"`: the video codecs a stream consumer can name, derived
+/// from the one negotiable list (`vcodec.negotiable`).
+const VIDEO_CODEC_ITEMS = blk: {
+    var out: []const u8 = "";
+    for (vcodec.negotiable, 0..) |cd, i| out = out ++ (if (i > 0) "," else "") ++ "\"" ++ vcodec.codecName(cd) ++ "\"";
+    break :blk out;
+};
 
 /// Agents one agent_wait `agents` (and one `agent-wait --any`) watches at most.
 pub const AGENT_WAIT_MAX_ANY: usize = 32;
@@ -2034,9 +2043,9 @@ const TOOL_DECLS = [_]ToolDef{
         .name = "web_stream",
         .group = .browser,
         .mutates = true,
-        .description = "Open a helper-owned local Unix socket for a pushed binary V1 web stream: premultiplied BGRA damage, frame ends, cursor, trusted input and optional Opus audio. Headless only; pane selects the view (omitting it means CURRENT). audio defaults true but is enabled only when the helper advertises runtime stream-audio. Returns socket_path and a single-use token; send AUTH first, ACK frame ends (at most two unacknowledged), and close the socket to end. The helper serves it independently of MCP calls, including web_wait; no pixels travel on MCP stdio. One stream per view; the view or owning MCP connection closing ends it. The socket is local to the helper host, including broker-owned helpers, and is never relayed through MCP. Text input is limited to 4096 UTF-8 bytes per message. Audio capture begins at the next audible transition and diverts normal page output until the page has been quiet for two seconds.",
-        .input_schema = "{\"type\":\"object\",\"properties\":{" ++ WEB_MAX_FPS_PROP ++ "\"pane\":{\"type\":\"integer\"},\"audio\":{\"type\":\"boolean\",\"default\":true}}}",
-        .output_schema = WEB_RESULT_HEAD ++ WEB_MAX_FPS_PROP ++ "\"socket_path\":{\"type\":\"string\"},\"token\":{\"type\":\"string\"},\"protocol_version\":{\"type\":\"integer\",\"enum\":[1]},\"max_unacked_frames\":{\"type\":\"integer\",\"enum\":[2]},\"pixel_format\":{\"type\":\"string\",\"enum\":[\"bgra-premultiplied\"]},\"audio\":{\"type\":\"boolean\"}},\"required\":[\"backend\",\"view\",\"pane\",\"origin\",\"url\",\"title\",\"loading\",\"route\",\"socket_path\",\"token\",\"protocol_version\",\"max_unacked_frames\",\"pixel_format\",\"audio\"]}",
+        .description = "Open a helper-owned local Unix socket for a pushed binary V1 web stream: premultiplied BGRA damage, frame ends, cursor, trusted input and optional Opus audio. Headless only; pane selects the view (omitting it means CURRENT). audio defaults true but is enabled only when the helper advertises runtime stream-audio. Returns socket_path and a single-use token; send AUTH first, ACK frame ends (at most two unacknowledged), and close the socket to end. The helper serves it independently of MCP calls, including web_wait; no pixels travel on MCP stdio. One stream per view; the view or owning MCP connection closing ends it. The socket is local to the helper host, including broker-owned helpers, and is never relayed through MCP. Text input is limited to 4096 UTF-8 bytes per message. Audio capture begins at the next audible transition and diverts normal page output until the page has been quiet for two seconds. encoding defaults to raw (the V1 BGRA bands above, unchanged); encoding:\"encoded\" asks for ENCODED frames instead (lossless zstd/PNG-filtered regions, or one H.264/AV1 video tile when video_codecs names a codec you decode and the page is animated photographic content), acknowledged under the same two-frame window. The result's encoding is what the helper actually streams: an older helper answers raw. docs/mcp.md documents both formats.",
+        .input_schema = "{\"type\":\"object\",\"properties\":{" ++ WEB_MAX_FPS_PROP ++ "\"pane\":{\"type\":\"integer\"},\"audio\":{\"type\":\"boolean\",\"default\":true},\"encoding\":{\"type\":\"string\",\"enum\":[" ++ enumItems(web_proto.StreamEncoding) ++ "],\"default\":\"raw\",\"description\":\"raw: DAMAGE bands of premultiplied BGRA (V1, the default). encoded: ENCODED frames, lossless regions or video tiles\"},\"video_codecs\":{\"type\":\"array\",\"items\":{\"type\":\"string\",\"enum\":[" ++ VIDEO_CODEC_ITEMS ++ "]},\"description\":\"encoding encoded only: video codecs you decode, in preference order; omitted or empty = lossless regions only\"}}}",
+        .output_schema = WEB_RESULT_HEAD ++ WEB_MAX_FPS_PROP ++ "\"encoding\":{\"type\":\"string\",\"enum\":[" ++ enumItems(web_proto.StreamEncoding) ++ "],\"description\":\"How THIS stream carries pixels; raw when the helper does not stream encoded\"},\"video_codec\":{\"type\":[\"string\",\"null\"],\"enum\":[" ++ VIDEO_CODEC_ITEMS ++ ",null],\"description\":\"Encoded streams: the codec its video tiles use; null = lossless regions only\"},\"socket_path\":{\"type\":\"string\"},\"token\":{\"type\":\"string\"},\"protocol_version\":{\"type\":\"integer\",\"enum\":[1]},\"max_unacked_frames\":{\"type\":\"integer\",\"enum\":[2]},\"pixel_format\":{\"type\":\"string\",\"enum\":[\"bgra-premultiplied\"]},\"audio\":{\"type\":\"boolean\"}},\"required\":[\"backend\",\"view\",\"pane\",\"origin\",\"url\",\"title\",\"loading\",\"route\",\"socket_path\",\"token\",\"protocol_version\",\"max_unacked_frames\",\"pixel_format\",\"audio\",\"encoding\"]}",
     },
     .{
         .name = "web_resize",
@@ -2487,7 +2496,18 @@ test "web_stream schemas register the headless socket contract and nullable runt
         try testing.expectEqual(@as(i64, 1), fps.get("minimum").?.integer);
         try testing.expectEqual(@as(i64, @import("../web/protocol.zig").MAX_VIEW_FPS), fps.get("maximum").?.integer);
     }
-    for ([_][]const u8{ "web_stream_audio", "web_software_webgl" }) |name| {
+    // The encoding and codec enums are the protocol's and vcodec's own.
+    const in_props = input.object.get("properties").?.object;
+    const enc_items = in_props.get("encoding").?.object.get("enum").?.array.items;
+    const enc_fields = @typeInfo(web_proto.StreamEncoding).@"enum".fields;
+    try testing.expectEqual(enc_fields.len, enc_items.len);
+    inline for (enc_fields, 0..) |f, i| try testing.expectEqualStrings(f.name, enc_items[i].string);
+    try testing.expectEqualStrings("raw", in_props.get("encoding").?.object.get("default").?.string);
+    const codec_items = in_props.get("video_codecs").?.object.get("items").?.object.get("enum").?.array.items;
+    try testing.expectEqual(vcodec.negotiable.len, codec_items.len);
+    for (vcodec.negotiable, codec_items) |cd, item| try testing.expectEqualStrings(vcodec.codecName(cd), item.string);
+    try testing.expectEqual(enc_fields.len, props.get("encoding").?.object.get("enum").?.array.items.len);
+    for ([_][]const u8{ "web_stream_audio", "web_stream_encoded", "web_software_webgl" }) |name| {
         const types = cp.get(name).?.object.get("type").?.array.items;
         try testing.expectEqualStrings("boolean", types[0].string);
         try testing.expectEqualStrings("null", types[1].string);

@@ -9,7 +9,7 @@
 //! route is `surfenc.Surface`'s: hot AND photographic AND a codec both
 //! sides speak AND even dims is ONE whole-surface video tile, anything
 //! else is pixcodec regions for the damage, banded and split across
-//! messages under `proto.ENCODED_MSG_BUDGET`.
+//! messages under the stream's `Limits`.
 //!
 //! Pure: no CEF, no sockets; posts into a `proto.Outbox`.
 
@@ -28,12 +28,24 @@ const BAND_RAW_MAX: usize = 1 << 20;
 const MSG_OVERHEAD: usize = 64;
 const PART_OVERHEAD: usize = 16;
 
-/// A video tile rides alone in one message; past this it goes lossless.
-const TILE_MAX: usize = proto.MAX_FRAME - 4096;
+/// How large one message of a stream may get: the control socket takes
+/// `proto.MAX_FRAME`, a V1 stream socket only its own smaller frame cap.
+pub const Limits = struct {
+    /// Bytes of one lossless message, length prefix and tag included.
+    msg: usize = proto.ENCODED_MSG_BUDGET,
+    /// Bytes of one video tile; past this the frame goes lossless.
+    tile: usize = proto.MAX_FRAME - 4096,
+
+    /// Limits for a carrier whose frame (tag + body) is at most `max_frame`.
+    pub fn within(max_frame: usize) Limits {
+        return .{ .msg = max_frame - 4096, .tile = max_frame - 4096 };
+    }
+};
 
 pub const Stream = struct {
     gpa: std.mem.Allocator,
     open: surfenc.Opener,
+    limits: Limits = .{},
     flow: frameflow.Flow(proto.ENCODED_WINDOW) = .{},
     damage: frameflow.Damage = .{},
     /// Churn + encoder state, sized to the surface; only while a codec is
@@ -141,7 +153,7 @@ pub const Stream = struct {
             },
             .video => {},
         }
-        if (self.tile.items.len > TILE_MAX) {
+        if (self.tile.items.len > self.limits.tile) {
             // The encoder advanced past a frame nobody will see.
             s.forceKeyframe();
             return false;
@@ -183,7 +195,8 @@ pub const Stream = struct {
                 const band: surfenc.Rect = .{ .x = @intCast(r.x), .y = @intCast(y), .w = @intCast(r.w), .h = @intCast(rows) };
                 const enc = self.lossless.encodeRect(self.gpa, pixels, stride, band) catch continue;
                 const need = enc.bytes.len + pixcodec.body_header + PART_OVERHEAD;
-                if (spans.items.len != 0 and self.bodies.items.len + need + MSG_OVERHEAD > proto.ENCODED_MSG_BUDGET) {
+                const queued = self.bodies.items.len + spans.items.len * PART_OVERHEAD;
+                if (spans.items.len != 0 and queued + need + MSG_OVERHEAD > self.limits.msg) {
                     if (!msg.post(spans.items, 0)) return;
                     spans.clearRetainingCapacity();
                     self.bodies.clearRetainingCapacity();
@@ -348,7 +361,7 @@ const Rx = struct {
             try t.expectEqual(proto.Tag.frame_encoded, f.tag);
             const fe = try proto.FrameEncoded.decodeAlloc(f.payload, t.allocator);
             defer t.allocator.free(fe.parts);
-            try t.expect(m.bytes.len <= proto.ENCODED_MSG_BUDGET + 4096);
+            try t.expect(m.bytes.len <= proto.ENCODED_MSG_BUDGET);
             if (open_serial) |s| try t.expectEqual(s, fe.serial) else try t.expect(fe.serial > self.last_serial);
             for (fe.parts) |p| try self.apply(p);
             self.messages += 1;

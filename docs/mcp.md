@@ -558,8 +558,8 @@ The helper control protocol (`src/web/protocol.zig`) adds these messages:
 
 | Tag | Direction | Body |
 | --- | --- | --- |
-| `0xF8 StreamOpen` | client -> helper | `view:u32, req:u32, audio:u8` |
-| `0xF9 EvStreamOpen` | helper -> client | `view:u32, req:u32, path:str, token:str, err:str`, optional `audio:u8` (1 = Opus encoder running) |
+| `0xF8 StreamOpen` | client -> helper | `view:u32, req:u32, audio:u8`, optional `encoding:u8, codecs:str` (sent only for an encoded open; see Encoded streams) |
+| `0xF9 EvStreamOpen` | helper -> client | `view:u32, req:u32, path:str, token:str, err:str`, optional `audio:u8` (1 = Opus encoder running), optional `encoding:u8, codec:u8` (present only for an encoded stream) |
 | `0xFA StreamClose` | client -> helper | `view:u32` |
 | `0xFB EvStreamClosed` | helper -> client | `view:u32, reason:str` |
 
@@ -639,6 +639,98 @@ disconnect-release phase. Popup comparison starts with the closed select
 already focused and hovered, including the keyboard focus indication an
 Escape close leaves behind, and still requires exact underlay pixels after
 Escape.
+
+#### Encoded streams (opt-in)
+
+Raw BGRA is the default and does not change: without `encoding` (or with
+`encoding:"raw"`) the control frame, the socket bytes and every rule
+above are exactly V1. `web_stream {"encoding":"encoded","video_codecs":["h264"]}`
+asks for compressed frames instead. `video_codecs` lists the codecs the
+consumer decodes, in its preference order (`h264`, `av1`); omit it or pass
+`[]` for lossless regions only. Passing `video_codecs` without
+`encoding:"encoded"`, an unknown codec name or an unknown encoding is
+`invalid_args`.
+
+The result says what the helper actually does: `encoding` is `"raw"` or
+`"encoded"`, and an encoded result adds `video_codec` (the negotiated
+codec name, or null for lossless only: none of the offered codecs is
+encodable on the helper's host). A helper without the capability ignores
+the request and streams raw; the result then says `encoding:"raw"` and the
+text lane says so, so a consumer must branch on `encoding`, never on what
+it asked for. `capabilities.web_stream_encoded` is null before the helper
+handshake, then the helper's `stream-encoded` capability.
+
+On the wire the choice is the optional trailing `encoding:u8` (`0` raw,
+`1` encoded) plus `codecs:str` (u16 length, then one `vcodec.Codec` id
+byte per codec: `1` H.264, `2` AV1) on `StreamOpen`, written only for an
+encoded open, so a raw open is the 9-byte V1 payload and an older helper
+reads its three fields and ignores the rest. `EvStreamOpen` appends
+`encoding:u8, codec:u8` (`0` = lossless only) only for an encoded stream.
+
+An encoded stream uses the same socket, AUTH, SURFACE, CURSOR, AUDIO and
+input frames, and adds one helper-to-peer tag; it never sends DAMAGE or
+FRAME_END:
+
+| Tag | Direction | Body |
+| --- | --- | --- |
+| `7 ENCODED` | helper -> peer | One message of a logical frame, byte-identical to the control protocol's `frame_encoded` payload (below) |
+
+ENCODED body, little-endian:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `view` | u32 | The view id the stream was opened for (the client's id) |
+| `serial` | u64 | Logical frame serial; every message of one logical frame carries the same serial, and serials increase across logical frames |
+| `gen` | u32 | The view's paint counter when the frame was cut |
+| `w`, `h` | u16, u16 | Physical surface size; always the last SURFACE's `pixel_w`/`pixel_h` |
+| `last` | u8 | `1` on the final message of the logical frame, else `0` |
+| `count` | u16 | Number of parts |
+| parts | repeated | `kind:u8, x:u16, y:u16, w:u16, h:u16, len:u32, data:len bytes` |
+
+A logical frame is one or more ENCODED messages; apply every part of every
+message into a `w*h*4` BGRA buffer (premultiplied, like DAMAGE) at
+`x,y`, and the frame is complete at the message with `last = 1`. A
+stream frame never exceeds the 4 MiB frame cap: a large frame is split
+across messages. No SURFACE ever arrives between the messages of one
+logical frame. Part kinds (append-only; refuse an unknown kind):
+
+- `0` lossless region: `data` is a pixcodec body (`src/wlhost/pixcodec.zig`):
+  `coder:u8, filter:u8, raw_len:u32, row_stride:u32`, then the coded bytes.
+  Coder `0` is the bytes verbatim, `1` one zstd frame (`ZSTD_decompress`
+  to exactly `raw_len`). Then undo the filter in place over rows of
+  `row_stride` bytes with 4 bytes per pixel, left to right and top to
+  bottom, adding (mod 256) the PNG predictor of the already reconstructed
+  neighbours (missing neighbours read as 0): filter `0` none, `1` Sub
+  (left), `2` Up (above), `3` Paeth (left, above, upper-left). The result is
+  `raw_len = w*h*4` tight BGRA bytes for the part's rect (`row_stride = w*4`).
+- `1` video tile: `data` is one tile (`src/wlhost/vcodec.zig appendTile`):
+  `body_len:u32` (bytes after this field), then `codec:u8` (`1` H.264, `2`
+  AV1), `flags:u8` (bit 0 keyframe), `x:i32, y:i32, w:i32, h:i32` (equal to
+  the part's rect; today always the whole surface), `seq:u32`, then the
+  codec bitstream for exactly one frame: H.264 Annex-B NAL units (every
+  keyframe repeats SPS/PPS), or an
+  AV1 temporal unit of OBUs (low-delay, no reordering). The encoder input is
+  I420 converted from BGRA with full-range BT.601 coefficients; decode to
+  I420 and convert back with full range, alpha 255. A decoder starts at a
+  keyframe: drop delta tiles until one arrives.
+
+Video is chosen per logical frame by the helper: only when a codec was
+negotiated, the page is changing continuously (hot) AND looks
+photographic, and both dimensions are even. Everything else, including
+any still page and any text, is lossless. When video stops, the next
+lossless frame repaints the whole surface, so lossy pixels never outlive
+an animation. A new stream, a SURFACE change and a resize restart at a
+keyframe of the whole surface.
+
+ACK is the same `22 ACK` frame naming a logical frame's `serial`, sent
+after applying its `last` message; it is cumulative. At most two logical
+frames are unacknowledged, and paints merge while the window is full,
+exactly as for raw streams. Unlike raw streams, an ACK naming a serial the
+helper no longer waits for is ignored rather than fatal: a frame the
+helper could not queue whole is abandoned and the stream resends the whole
+surface from a keyframe under a new serial. `src/web/frameenc.zig`
+`Receiver.apply` is the reference decoder; `smoke-mcp`'s encoded stage
+decodes a real helper's stream with it.
 
 ### Browser review and durable evidence
 

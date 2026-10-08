@@ -1593,6 +1593,21 @@ half in `cefhost/stream.zig`.
   `$XDG_RUNTIME_DIR` (or `/tmp`), removed at exit.
 - **GPU helpers refuse streams**: dma-buf frames never enter this
   process, so there is nothing to cut bands from.
+- **Encoded streams are opt-in and reuse frameenc** (capability
+  `stream-encoded`). `stream_open`'s optional trailing `encoding` +
+  `codecs` (written only for an encoded open, so a raw open stays the V1
+  bytes) gives the `srv.Stream` a `frameenc.Stream`: the SAME encoder,
+  route and ack window as encoded watch-along frames, bounded to the
+  stream's 4 MiB frame cap (`frameenc.Limits.within`). Its messages are
+  `frame_encoded` payloads under stream tag 7 (`ENCODED`); only the tag
+  byte is patched. A logical frame is cut into `enc_out` only once the
+  previous one is fully written, and SURFACE waits for that too, so a
+  client never sees SURFACE inside a logical frame. Raw DAMAGE/FRAME_END
+  never appear on an encoded stream, and its ACK of a serial no longer
+  awaited is ignored (frameenc may abandon a frame). The cut reads the
+  live map, composing the `<select>` popup over a scratch copy only while
+  one shows. smoke-mcp's `streamEncodedStage` decodes a real helper's
+  stream and proves the raw fallback with `SKETERM_WEB_DISABLE_STREAM_ENCODED`.
 
 ## Rules that outlive any one change
 

@@ -41,6 +41,7 @@ const protocol = @import("protocol.zig");
 const webdrive = @import("webdrive.zig");
 const navfault = @import("../web/navfault.zig");
 const web_proto = @import("../web/protocol.zig");
+const vcodec = @import("../wlhost/vcodec.zig");
 const netpolicy = @import("../web/netpolicy.zig");
 const capture = @import("../web/capture.zig");
 const pathz = @import("../util/pathz.zig");
@@ -374,11 +375,13 @@ pub fn downloadCapability() struct { supported: bool, started: bool } {
 }
 
 /// Stream support is a code fact before startup and negotiated thereafter; audio is unknown before the handshake.
-pub fn streamCapability() struct { supported: bool, audio: ?bool } {
-    if (guiDrivesWeb() or g_headless_alloc == null) return .{ .supported = false, .audio = false };
-    const e = currentEngine() orelse return .{ .supported = true, .audio = null };
-    if (e.state != .ready) return .{ .supported = true, .audio = null };
-    return .{ .supported = e.has(.web_stream), .audio = e.has(.web_stream) and e.has(.stream_audio) };
+/// `encoded` likewise: whether the helper honours an encoded open.
+pub fn streamCapability() struct { supported: bool, audio: ?bool, encoded: ?bool } {
+    if (guiDrivesWeb() or g_headless_alloc == null) return .{ .supported = false, .audio = false, .encoded = false };
+    const e = currentEngine() orelse return .{ .supported = true, .audio = null, .encoded = null };
+    if (e.state != .ready) return .{ .supported = true, .audio = null, .encoded = null };
+    const stream = e.has(.web_stream);
+    return .{ .supported = stream, .audio = stream and e.has(.stream_audio), .encoded = stream and e.has(.stream_encoded) };
 }
 
 /// Null until the current headless helper reports its software WebGL launch policy.
@@ -2971,6 +2974,10 @@ pub fn webTool(
     if (eql(u8, name, "web_stream")) {
         if (mcp.argValue(args, "audio")) |value| if (value != .bool)
             return mcp.errRes(arena, .invalid_args, "web_stream audio must be a boolean when present");
+        switch (try streamEncodingArg(arena, args)) {
+            .err => |f| return failRes(arena, f),
+            .value => {},
+        }
         if (guiDrivesWeb()) return mcp.errRes(arena, .unavailable, "web_stream is headless only; the user's GUI browser cannot expose a stream socket");
     }
     // `pane` stays the argument name in both modes (headless it selects
@@ -3732,7 +3739,41 @@ pub fn webTool(
     return mcp.errRes(arena, .unknown_tool, "unknown web tool");
 }
 
-fn streamResult(arena: std.mem.Allocator, view: View, offer: web_proto.EvStreamOpen) ![]const u8 {
+/// `encoding` + `video_codecs`: null for a raw stream, else the codec ids
+/// (consumer preference order, possibly empty) an encoded open sends.
+fn streamEncodingArg(arena: std.mem.Allocator, args: std.json.Value) !union(enum) { value: ?[]const u8, err: Fail } {
+    var encoding: web_proto.StreamEncoding = .raw;
+    if (mcp.argValue(args, "encoding")) |value| {
+        const named = if (value == .string) std.meta.stringToEnum(web_proto.StreamEncoding, value.string) else null;
+        encoding = named orelse return .{ .err = fail(.invalid_args, "web_stream encoding must be one of: " ++ comptime encodingNames()) };
+    }
+    const list = mcp.argValue(args, "video_codecs") orelse return .{ .value = if (encoding == .encoded) "" else null };
+    if (list != .array) return .{ .err = fail(.invalid_args, "web_stream video_codecs must be an array of codec names") };
+    if (encoding != .encoded) return .{ .err = fail(.invalid_args, "web_stream video_codecs needs encoding \"encoded\"; a raw stream carries no video") };
+    var ids: std.ArrayList(u8) = .empty;
+    for (list.array.items) |item| {
+        const cd = if (item == .string) vcodec.codecFromName(item.string) else null;
+        if (cd == null) return .{ .err = fail(.invalid_args, try std.fmt.allocPrint(arena, "web_stream video_codecs: unknown codec (known: {s})", .{comptime knownCodecs()})) };
+        if (std.mem.indexOfScalar(u8, ids.items, @intFromEnum(cd.?)) == null) try ids.append(arena, @intFromEnum(cd.?));
+    }
+    return .{ .value = ids.items };
+}
+
+fn encodingNames() []const u8 {
+    var out: []const u8 = "";
+    for (@typeInfo(web_proto.StreamEncoding).@"enum".fields, 0..) |f, i| out = out ++ (if (i > 0) ", " else "") ++ f.name;
+    return out;
+}
+
+fn knownCodecs() []const u8 {
+    var out: []const u8 = "";
+    for (vcodec.negotiable, 0..) |cd, i| out = out ++ (if (i > 0) ", " else "") ++ vcodec.codecName(cd);
+    return out;
+}
+
+/// `asked_encoded`: the consumer asked for encoded frames, so a raw answer
+/// (an older helper) is said in the text lane as well as in `encoding`.
+fn streamResult(arena: std.mem.Allocator, view: View, offer: web_proto.EvStreamOpen, asked_encoded: bool) ![]const u8 {
     var res = mcp.Res.init(arena);
     try head(&res, arena, .headless, view);
     try res.fact("pane", view.pane);
@@ -3742,8 +3783,17 @@ fn streamResult(arena: std.mem.Allocator, view: View, offer: web_proto.EvStreamO
     try res.fact("max_unacked_frames", @as(u32, @import("../web/stream.zig").MAX_UNACKED));
     try res.fact("pixel_format", "bgra-premultiplied");
     try res.fact("audio", offer.audio != 0);
+    const encoded = offer.encoding == .encoded;
+    try res.fact("encoding", @tagName(if (encoded) web_proto.StreamEncoding.encoded else .raw));
+    const codec: ?[]const u8 = if (encoded and offer.codec != 0) vcodec.codecName(@enumFromInt(offer.codec)) else null;
+    if (encoded) try res.fact("video_codec", codec);
     if (view.max_fps) |fps| try res.fact("max_fps", fps);
-    try res.text("opened a single-use local binary stream socket; authenticate with the token as the first frame, ACK frame ends, and close the socket to end the stream");
+    try res.text(if (encoded)
+        "opened a single-use local binary stream socket carrying ENCODED frames; authenticate with the token as the first frame, ACK each logical frame, and close the socket to end the stream"
+    else
+        "opened a single-use local binary stream socket; authenticate with the token as the first frame, ACK frame ends, and close the socket to end the stream");
+    if (asked_encoded and !encoded)
+        try res.text("encoded frames were asked for, but this browser helper does not stream them (capability 'stream-encoded'): the stream is RAW BGRA");
     return res.finish();
 }
 
@@ -3759,13 +3809,17 @@ fn streamTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view:
         .value => |fps| fps,
     };
     const audio = if (mcp.argValue(args, "audio")) |v| v.bool else true;
-    const offer = e.openStream(arena, view.pane, audio, 5000, max_fps) catch |err|
+    const codecs = switch (try streamEncodingArg(arena, args)) {
+        .err => |f| return failRes(arena, f),
+        .value => |ids| ids,
+    };
+    const offer = e.openStream(arena, view.pane, audio, 5000, max_fps, codecs) catch |err|
         return failRes(arena, try headlessFail(arena, e, err));
     if (offer.err.len > 0) return mcp.errRes(arena, .refused, offer.err);
     var streamed_view = view;
     const live = e.findView(view.pane) orelse return mcp.errRes(arena, .not_found, "the view ended while opening its stream");
     streamed_view.max_fps = live.max_fps;
-    return streamResult(arena, streamed_view, offer);
+    return streamResult(arena, streamed_view, offer, codecs != null);
 }
 
 fn parseMaxFps(arena: std.mem.Allocator, args: std.json.Value) !union(enum) { absent, value: u16, err: Fail } {
@@ -7422,7 +7476,11 @@ test "stream capability is code support before startup and a negotiated runtime 
     try std.testing.expectEqual(@as(?bool, false), streamCapability().audio);
     e.caps.insert(.stream_audio);
     try std.testing.expectEqual(@as(?bool, true), streamCapability().audio);
+    try std.testing.expectEqual(@as(?bool, false), streamCapability().encoded);
+    e.caps.insert(.stream_encoded);
+    try std.testing.expectEqual(@as(?bool, true), streamCapability().encoded);
     e.state = .idle;
+    try std.testing.expect(streamCapability().encoded == null);
 }
 
 test "web_stream returns common view facts and refuses GUI and malformed audio without IPC" {
@@ -7432,13 +7490,49 @@ test "web_stream returns common view facts and refuses GUI and malformed audio w
     const out = try streamResult(arena, .{ .pane = 7, .view = 7, .url = "https://example.com/", .route = "via:box" }, .{
         .view = 7, .req = 1, .path = "/tmp/web-stream.sock",
         .token = "0123456789abcdef0123456789abcdef", .err = "",
-    });
+    }, false);
     const sc = (try mcp.expectToolResultShape(arena, "web_stream", out)).object.get("structuredContent").?.object;
     try std.testing.expectEqualStrings("headless", sc.get("backend").?.string);
     try std.testing.expectEqualStrings("via:box", sc.get("route").?.string);
     try std.testing.expectEqual(@as(i64, 7), sc.get("pane").?.integer);
     try std.testing.expectEqual(@as(i64, 7), sc.get("view").?.integer);
     try std.testing.expect(!sc.get("audio").?.bool);
+    try std.testing.expectEqualStrings("raw", sc.get("encoding").?.string);
+    try std.testing.expect(sc.get("video_codec") == null);
+    // An encoded stream names its codec (null = lossless regions only).
+    for ([_]u8{ 0, @intFromEnum(vcodec.Codec.h264) }) |codec| {
+        const enc_out = try streamResult(arena, .{ .pane = 7, .view = 7, .url = "https://example.com/", .route = "direct" }, .{
+            .view = 7, .req = 2, .path = "/tmp/web-stream.sock",
+            .token = "0123456789abcdef0123456789abcdef", .err = "", .encoding = .encoded, .codec = codec,
+        }, true);
+        const esc = (try mcp.expectToolResultShape(arena, "web_stream", enc_out)).object.get("structuredContent").?.object;
+        try std.testing.expectEqualStrings("encoded", esc.get("encoding").?.string);
+        if (codec == 0) try std.testing.expect(esc.get("video_codec").? == .null) else try std.testing.expectEqualStrings("h264", esc.get("video_codec").?.string);
+    }
+    // Asked for encoded, answered raw (an older helper): the facts say raw and the prose says why.
+    const fell_back = try streamResult(arena, .{ .pane = 7, .view = 7, .url = "https://example.com/", .route = "direct" }, .{
+        .view = 7, .req = 3, .path = "/tmp/web-stream.sock",
+        .token = "0123456789abcdef0123456789abcdef", .err = "",
+    }, true);
+    const fsc = (try mcp.expectToolResultShape(arena, "web_stream", fell_back)).object.get("structuredContent").?.object;
+    try std.testing.expectEqualStrings("raw", fsc.get("encoding").?.string);
+    try std.testing.expect(std.mem.indexOf(u8, fell_back, "RAW BGRA") != null);
+    // The encoding choice is validated before anything is asked of a helper.
+    var no_ipc = ScriptedBackend{ .allocator = std.testing.allocator, .responses = &.{} };
+    defer no_ipc.deinit();
+    for ([_][]const u8{
+        "{\"encoding\":\"zip\"}",
+        "{\"encoding\":3}",
+        "{\"video_codecs\":[\"h264\"]}",
+        "{\"encoding\":\"raw\",\"video_codecs\":[]}",
+        "{\"encoding\":\"encoded\",\"video_codecs\":[\"vp9\"]}",
+        "{\"encoding\":\"encoded\",\"video_codecs\":\"h264\"}",
+    }) |args| {
+        const result = try webTool(arena, no_ipc.backend(), "web_stream", try jsonArgs(arena, args));
+        const parsed = try mcp.expectToolResultShape(arena, "web_stream", result);
+        try std.testing.expectEqualStrings("invalid_args", parsed.object.get("structuredContent").?.object.get("error").?.object.get("code").?.string);
+    }
+    try std.testing.expectEqual(@as(usize, 0), no_ipc.requests.items.len);
     mcp.mcp_webgui.configure(std.testing.allocator, .{ .granted = true, .source = .flag }, NoGuiOps.ops);
     defer mcp.mcp_webgui.shutdown();
     var fake = ScriptedBackend{ .allocator = std.testing.allocator, .responses = &.{} };

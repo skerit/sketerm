@@ -377,6 +377,13 @@ pub const CAP_WEB_STREAM = "web-stream";
 /// helper's own output until it has been quiet for 2s after the stream
 /// closes. See src/web/CLAUDE.md.
 pub const CAP_STREAM_AUDIO = "stream-audio";
+/// `stream_open` honours its optional trailing `encoding`/`codecs`: an
+/// `encoded` stream carries `frame_encoded` payloads (stream tag
+/// `ENCODED`) instead of raw DAMAGE bands and FRAME_END, under the same
+/// two-frame ACK window. `ev_stream_open` then reports `encoding` and the
+/// negotiated video codec. A helper without it streams raw whatever was
+/// asked, and its reply carries no encoding (raw).
+pub const CAP_STREAM_ENCODED = "stream-encoded";
 pub const CAP_SOFTWARE_WEBGL = "software-webgl";
 pub const CAP_VIEW_MAX_FPS = "view-max-fps";
 pub const MAX_VIEW_FPS: u16 = 240;
@@ -443,6 +450,7 @@ pub const Cap = enum {
     net_policy_ack,
     web_stream,
     stream_audio,
+    stream_encoded,
     software_webgl,
     view_max_fps,
 
@@ -4431,14 +4439,50 @@ test "observe tags occupy the 0xF0 block and leave 0xE6-0xEF free" {
 /// authenticate before it is closed and its token is spent.
 pub const STREAM_CONNECT_MS: i64 = 10_000;
 
+/// How a stream carries pixels. Append-only values; the MCP `encoding`
+/// argument and result use the tag names.
+pub const StreamEncoding = enum(u8) {
+    /// DAMAGE bands of raw premultiplied BGRA closed by FRAME_END (V1).
+    raw = 0,
+    /// ENCODED frames: `frame_encoded` payloads (lossless pixcodec
+    /// regions or one video tile), capability `stream-encoded`.
+    encoded = 1,
+    _,
+};
+
 /// Client -> helper: open the stream of `view`. `req` is echoed in the
 /// reply; `audio = 1` asks for the page's audio (only honoured with
-/// `stream-audio`). Answered by exactly one `ev_stream_open`.
+/// `stream-audio`). Optional trailing `encoding` + `codecs` (capability
+/// `stream-encoded`): `encoded` with the `vcodec.Codec` ids the client
+/// decodes in its preference order, empty = lossless only. They are
+/// written only for a non-raw request, so a raw open is byte-identical to
+/// the V1 frame; a helper without the capability ignores them and
+/// streams raw. Answered by exactly one `ev_stream_open`.
 pub const StreamOpen = struct {
     pub const tag: Tag = .stream_open;
     view: u32,
     req: u32,
     audio: u8,
+    encoding: StreamEncoding = .raw,
+    codecs: []const u8 = "",
+
+    pub fn encodeTo(self: StreamOpen, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        try putU32(gpa, out, self.view);
+        try putU32(gpa, out, self.req);
+        try putU8(gpa, out, self.audio);
+        if (self.encoding == .raw and self.codecs.len == 0) return;
+        try putU8(gpa, out, @intFromEnum(self.encoding));
+        try putStr(gpa, out, self.codecs);
+    }
+
+    pub fn decodeFrom(payload: []const u8) !StreamOpen {
+        var cur = Cur{ .buf = payload };
+        var out: StreamOpen = .{ .view = try cur.readU32(), .req = try cur.readU32(), .audio = try cur.readU8() };
+        if (cur.pos == payload.len) return out;
+        out.encoding = @enumFromInt(try cur.readU8());
+        out.codecs = if (cur.pos == payload.len) "" else try cur.readStr();
+        return out;
+    }
 };
 
 /// Helper -> client: the answer to `stream_open`. Success has an empty
@@ -4446,7 +4490,11 @@ pub const StreamOpen = struct {
 /// single-use `token` (32 lowercase hex characters) the stream client
 /// must send as its first frame. A refusal has empty `path`/`token` and
 /// says why in `err`. Optional trailing `audio` is 1 only when the stream's
-/// Opus encoder started (absent from an older helper: 0).
+/// Opus encoder started (absent from an older helper: 0). Optional
+/// trailing `encoding` and `codec` (capability `stream-encoded`) say how
+/// the stream carries pixels and which `vcodec.Codec` its video tiles use
+/// (0 = lossless only); written only for an encoded stream, so absent
+/// means raw.
 pub const EvStreamOpen = struct {
     pub const tag: Tag = .ev_stream_open;
     view: u32,
@@ -4455,11 +4503,27 @@ pub const EvStreamOpen = struct {
     token: []const u8,
     err: []const u8,
     audio: u8 = 0,
+    encoding: StreamEncoding = .raw,
+    codec: u8 = 0,
+
+    pub fn encodeTo(self: EvStreamOpen, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        try putU32(gpa, out, self.view);
+        try putU32(gpa, out, self.req);
+        try putStr(gpa, out, self.path);
+        try putStr(gpa, out, self.token);
+        try putStr(gpa, out, self.err);
+        try putU8(gpa, out, self.audio);
+        if (self.encoding == .raw) return;
+        try putU8(gpa, out, @intFromEnum(self.encoding));
+        try putU8(gpa, out, self.codec);
+    }
 
     pub fn decodeFrom(payload: []const u8) !EvStreamOpen {
         var cur = Cur{ .buf = payload };
         var out: EvStreamOpen = .{ .view = try cur.readU32(), .req = try cur.readU32(), .path = try cur.readStr(), .token = try cur.readStr(), .err = try cur.readStr() };
         out.audio = cur.readU8() catch 0;
+        out.encoding = @enumFromInt(cur.readU8() catch 0);
+        out.codec = cur.readU8() catch 0;
         return out;
     }
 };
@@ -4497,6 +4561,33 @@ test "round-trip: stream frames" {
     try std.testing.expectEqual(@as(u8, 0), (try decode(EvStreamOpen, old.items[0 .. old.items.len - 1])).audio);
     try roundTrip(StreamClose, .{ .view = 3 });
     try roundTrip(EvStreamClosed, .{ .view = 3, .reason = "the stream client disconnected" });
+
+    // Encoded opens: the trailing choice round-trips, and a raw open is
+    // byte-identical to the V1 frame an older client sends.
+    try roundTrip(StreamOpen, .{ .view = 3, .req = 81, .audio = 0, .encoding = .encoded, .codecs = &.{ 2, 1 } });
+    try roundTrip(StreamOpen, .{ .view = 3, .req = 82, .audio = 1, .encoding = .encoded });
+    var raw_open: std.ArrayList(u8) = .empty;
+    defer raw_open.deinit(std.testing.allocator);
+    try encodePayload(std.testing.allocator, &raw_open, StreamOpen{ .view = 3, .req = 83, .audio = 1 });
+    try std.testing.expectEqual(@as(usize, 9), raw_open.items.len);
+    // An older helper's generic decode reads the V1 fields and ignores the tail.
+    var enc_open: std.ArrayList(u8) = .empty;
+    defer enc_open.deinit(std.testing.allocator);
+    try encodePayload(std.testing.allocator, &enc_open, StreamOpen{ .view = 3, .req = 84, .audio = 1, .encoding = .encoded, .codecs = &.{1} });
+    var v1 = Cur{ .buf = enc_open.items };
+    try std.testing.expectEqual(@as(u32, 3), try v1.readU32());
+    try std.testing.expectEqual(@as(u32, 84), try v1.readU32());
+    try std.testing.expectEqual(@as(u8, 1), try v1.readU8());
+    try std.testing.expectEqual(StreamEncoding.encoded, (try decode(StreamOpen, enc_open.items)).encoding);
+    // A reply without the trailing encoding (any raw stream, any older
+    // helper) reads as raw; an encoded reply names its codec.
+    try roundTrip(EvStreamOpen, .{ .view = 3, .req = 85, .path = "/p", .token = "t", .err = "", .audio = 0, .encoding = .encoded, .codec = 1 });
+    var raw_reply: std.ArrayList(u8) = .empty;
+    defer raw_reply.deinit(std.testing.allocator);
+    try encodePayload(std.testing.allocator, &raw_reply, EvStreamOpen{ .view = 3, .req = 86, .path = "/p", .token = "t", .err = "", .audio = 1 });
+    try std.testing.expectEqual(old.items.len, raw_reply.items.len);
+    try std.testing.expectEqual(StreamEncoding.raw, (try decode(EvStreamOpen, raw_reply.items)).encoding);
+    try std.testing.expectEqualStrings("stream-encoded", Cap.stream_encoded.name());
     try std.testing.expectEqual(@as(u8, 0xF8), @intFromEnum(Tag.stream_open));
     try std.testing.expectEqual(@as(u8, 0xFB), @intFromEnum(Tag.ev_stream_closed));
     try std.testing.expectEqualStrings("web-stream", Cap.web_stream.name());

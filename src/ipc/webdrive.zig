@@ -3359,7 +3359,10 @@ pub const Engine = struct {
     }
 
     /// Open a helper-owned socket without consuming any binary stream traffic.
-    pub fn openStream(self: *Engine, arena: std.mem.Allocator, id: u32, audio: bool, budget_ms: i64, max_fps: ?u16) !proto.EvStreamOpen {
+    /// `codecs` non-null asks for an encoded stream (`vcodec.Codec` ids the
+    /// consumer decodes, empty = lossless only); a helper without
+    /// `stream-encoded` is asked for raw, and its reply says raw.
+    pub fn openStream(self: *Engine, arena: std.mem.Allocator, id: u32, audio: bool, budget_ms: i64, max_fps: ?u16, codecs: ?[]const u8) !proto.EvStreamOpen {
         if (max_fps) |fps| if (fps == 0 or fps > proto.MAX_VIEW_FPS) return error.InvalidFrameRate;
         if (!self.ensure()) return error.Unavailable;
         if (!self.has(.web_stream)) return error.NoStream;
@@ -3380,7 +3383,14 @@ pub const Engine = struct {
         };
         // An uncertain open must not leave an unnamed stream slot behind.
         errdefer self.send(proto.StreamClose{ .view = id }) catch {};
-        self.send(proto.StreamOpen{ .view = id, .req = req, .audio = @intFromBool(audio and self.has(.stream_audio)) }) catch return error.Unavailable;
+        const encoded = codecs != null and self.has(.stream_encoded);
+        self.send(proto.StreamOpen{
+            .view = id,
+            .req = req,
+            .audio = @intFromBool(audio and self.has(.stream_audio)),
+            .encoding = if (encoded) .encoded else .raw,
+            .codecs = if (encoded) codecs.? else "",
+        }) catch return error.Unavailable;
         const deadline = clock.nowMs() + @max(budget_ms, 1);
         while (clock.nowMs() < deadline) {
             const live = self.findView(id) orelse return error.NoView;
@@ -4532,6 +4542,10 @@ const StreamPeer = struct {
     peer: c_int,
     audio: u8 = 0,
     err: []const u8 = "",
+    /// What the open asked for, and the raw payload length it arrived in.
+    encoding: proto.StreamEncoding = .raw,
+    codecs: [4]u8 = @splat(0),
+    payload_len: usize = 0,
 
     fn run(self: *StreamPeer) void {
         var buf: [4096]u8 = undefined;
@@ -4544,6 +4558,9 @@ const StreamPeer = struct {
                     if (f.tag != .stream_open) continue;
                     const req = proto.decode(proto.StreamOpen, f.payload) catch return;
                     self.audio = req.audio;
+                    self.encoding = req.encoding;
+                    self.payload_len = f.payload.len;
+                    @memcpy(self.codecs[0..@min(4, req.codecs.len)], req.codecs[0..@min(4, req.codecs.len)]);
                     var out: std.ArrayList(u8) = .empty;
                     defer out.deinit(std.heap.page_allocator);
                     // A stale success must not satisfy this request.
@@ -4558,6 +4575,8 @@ const StreamPeer = struct {
                         .token = if (self.err.len == 0) "0123456789abcdef0123456789abcdef" else "",
                         .err = self.err,
                         .audio = req.audio,
+                        .encoding = req.encoding,
+                        .codec = if (req.codecs.len != 0) req.codecs[0] else 0,
                     }) catch return;
                     _ = c.write(self.peer, out.items.ptr, out.items.len);
                     return;
@@ -4584,7 +4603,7 @@ test "stream opens correlate replies, negotiate audio, and refuse a second strea
         const reply = blk: {
             const thread = try std.Thread.spawn(.{}, StreamPeer.run, .{&peer});
             defer thread.join();
-            break :blk try pair.eng.openStream(arena_state.allocator(), 1, true, 1000, null);
+            break :blk try pair.eng.openStream(arena_state.allocator(), 1, true, 1000, null, null);
         };
         try std.testing.expectEqualStrings("/tmp/current.sock", reply.path);
         try std.testing.expectEqual(@as(u8, @intFromBool(has_audio)), peer.audio);
@@ -4596,7 +4615,7 @@ test "stream opens correlate replies, negotiate audio, and refuse a second strea
         try std.testing.expectEqual(proto.Tag.stream_open, (try reader.next()).?.tag);
         try std.testing.expect((try reader.next()) == null);
         // While it lives a second open is a conflict, decided here: nothing is sent.
-        try std.testing.expectError(error.StreamActive, pair.eng.openStream(arena_state.allocator(), 1, true, 10, null));
+        try std.testing.expectError(error.StreamActive, pair.eng.openStream(arena_state.allocator(), 1, true, 10, null, null));
         try std.testing.expectEqual(@as(usize, 0), pair.drain(&buf).len);
         // Its end frees the view for the next open.
         var closed: std.ArrayList(u8) = .empty;
@@ -4609,13 +4628,52 @@ test "stream opens correlate replies, negotiate audio, and refuse a second strea
     const reply = blk: {
         const thread = try std.Thread.spawn(.{}, StreamPeer.run, .{&peer});
         defer thread.join();
-        break :blk try pair.eng.openStream(arena_state.allocator(), 1, false, 1000, null);
+        break :blk try pair.eng.openStream(arena_state.allocator(), 1, false, 1000, null, null);
     };
     try std.testing.expectEqualStrings(peer.err, reply.err);
     var buf: [4096]u8 = undefined;
     var reader = proto.Reader.init(pair.drain(&buf));
     try std.testing.expectEqual(proto.Tag.stream_open, (try reader.next()).?.tag);
     try std.testing.expect((try reader.next()) == null);
+}
+
+test "an encoded stream is asked for only from a helper that streams encoded, and a raw open stays V1" {
+    const gpa = std.testing.allocator;
+    var pair = try Pair.init(gpa);
+    defer pair.deinit();
+    const v = try gpa.create(View);
+    v.* = .{ .id = 1, .w = 800, .h = 600 };
+    try pair.eng.views.append(gpa, v);
+    pair.eng.caps.insert(.web_stream);
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const Case = struct { cap: bool, codecs: ?[]const u8, want: proto.StreamEncoding, len: usize };
+    for ([_]Case{
+        // An older helper: the request goes out as the 9-byte V1 open.
+        .{ .cap = false, .codecs = &.{1}, .want = .raw, .len = 9 },
+        .{ .cap = true, .codecs = &.{ 1, 2 }, .want = .encoded, .len = 9 + 1 + 2 + 2 },
+        .{ .cap = true, .codecs = &.{}, .want = .encoded, .len = 9 + 1 + 2 },
+        // A raw request is byte-identical to V1 even on a capable helper.
+        .{ .cap = true, .codecs = null, .want = .raw, .len = 9 },
+    }) |case| {
+        pair.eng.caps.setPresent(.stream_encoded, case.cap);
+        var peer = StreamPeer{ .peer = pair.peer };
+        const reply = blk: {
+            const thread = try std.Thread.spawn(.{}, StreamPeer.run, .{&peer});
+            defer thread.join();
+            break :blk try pair.eng.openStream(arena_state.allocator(), 1, false, 1000, null, case.codecs);
+        };
+        try std.testing.expectEqual(case.want, peer.encoding);
+        try std.testing.expectEqual(case.len, peer.payload_len);
+        try std.testing.expectEqual(case.want, reply.encoding);
+        if (case.want == .encoded and case.codecs.?.len != 0) try std.testing.expectEqual(case.codecs.?[0], reply.codec);
+        var buf: [4096]u8 = undefined;
+        _ = pair.drain(&buf);
+        var closed: std.ArrayList(u8) = .empty;
+        defer closed.deinit(gpa);
+        try proto.encodePayload(gpa, &closed, proto.EvStreamClosed{ .view = 1, .reason = "the stream client disconnected" });
+        pair.eng.dispatch(.{ .tag = .ev_stream_closed, .payload = closed.items });
+    }
 }
 
 test "frame rates are per-view, pre-create, bounded and fail closed on unsupported helpers" {
@@ -4641,7 +4699,7 @@ test "frame rates are per-view, pre-create, bounded and fail closed on unsupport
     try t.expectEqual(@as(u16, 15), view.max_fps.?);
     pair.eng.caps.insert(.web_stream);
     pair.eng.caps.remove(.view_max_fps);
-    try t.expectError(error.FrameRateUnsupported, pair.eng.openStream(t.allocator, view.id, false, 10, 60));
+    try t.expectError(error.FrameRateUnsupported, pair.eng.openStream(t.allocator, view.id, false, 10, 60, null));
     try t.expectEqual(@as(usize, 0), pair.drain(&buf).len);
 }
 
@@ -4652,9 +4710,9 @@ test "stream timeout cancels the slot and late replies cannot satisfy another op
     const v = try gpa.create(View);
     v.* = .{ .id = 1, .w = 800, .h = 600 };
     try pair.eng.views.append(gpa, v);
-    try std.testing.expectError(error.NoStream, pair.eng.openStream(gpa, 1, true, 10, null));
+    try std.testing.expectError(error.NoStream, pair.eng.openStream(gpa, 1, true, 10, null, null));
     pair.eng.caps.insert(.web_stream);
-    try std.testing.expectError(error.Timeout, pair.eng.openStream(gpa, 1, true, 10, null));
+    try std.testing.expectError(error.Timeout, pair.eng.openStream(gpa, 1, true, 10, null, null));
     try std.testing.expectEqual(@as(u32, 0), v.stream_request);
     var buf: [4096]u8 = undefined;
     var reader = proto.Reader.init(pair.drain(&buf));

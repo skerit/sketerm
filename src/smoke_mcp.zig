@@ -20,6 +20,8 @@ const protocol = @import("ipc/protocol.zig");
 const webproto = @import("web/protocol.zig");
 const webstream = @import("web/stream.zig");
 const frameflow = @import("web/frameflow.zig");
+const frameenc = @import("web/frameenc.zig");
+const vcodec = @import("wlhost/vcodec.zig");
 const opuscodec = @import("mux/opuscodec.zig");
 const netpolicy = @import("web/netpolicy.zig");
 const version = @import("version.zig");
@@ -3572,6 +3574,15 @@ const StreamRig = struct {
     decoder: ?opuscodec.Decoder = null,
     /// Surface the next SURFACE frame must announce: pixel w/h, logical w/h.
     expect: [4]u32 = .{ 800, 600, 800, 600 },
+    /// The stream was opened encoded: ENCODED frames are expected and RAW
+    /// damage is a failure (and the other way round).
+    encoded: bool = false,
+    recv: frameenc.Receiver = .{},
+    video_parts: usize = 0,
+    video_dropped: usize = 0,
+    lossless_parts: usize = 0,
+    /// Serial of the logical frame whose messages are still arriving.
+    open_serial: ?u64 = null,
 
     fn connect(allocator: std.mem.Allocator, path: []const u8) StreamRig {
         var addr = std.mem.zeroes(c.struct_sockaddr_un);
@@ -3595,6 +3606,7 @@ const StreamRig = struct {
     fn deinit(self: *StreamRig) void {
         self.disconnect();
         if (self.decoder) |*d| d.deinit();
+        self.recv.deinit(self.allocator);
         self.allocator.free(self.packet);
         self.allocator.free(self.pixels);
     }
@@ -3665,6 +3677,7 @@ const StreamRig = struct {
         const tag: webstream.Tag = @enumFromInt(raw.tag);
         switch (tag) {
             .surface => {
+                if (self.open_serial != null) fail("SURFACE arrived inside an ENCODED logical frame");
                 if (b.len != webstream.SURFACE_BODY or b[16] != webstream.FORMAT_BGRA_PREMUL) fail("invalid stream surface");
                 self.w = std.mem.readInt(u32, b[0..4], .little);
                 self.h = std.mem.readInt(u32, b[4..8], .little);
@@ -3674,7 +3687,40 @@ const StreamRig = struct {
                 self.pixels = self.allocator.alloc(u8, @as(usize, self.w) * self.h * 4) catch fail("stream pixels allocation");
                 @memset(self.pixels, 0);
             },
+            .encoded => {
+                if (!self.encoded) fail("a raw stream sent an ENCODED frame");
+                if (self.pixels.len == 0) fail("encoded frame before surface");
+                const fe = webproto.FrameEncoded.decodeAlloc(b, self.allocator) catch fail("malformed ENCODED frame");
+                defer self.allocator.free(fe.parts);
+                if (fe.w != self.w or fe.h != self.h) fail("ENCODED frame geometry differs from the announced surface");
+                if (self.open_serial) |open| {
+                    if (fe.serial != open) fail("ENCODED messages of one logical frame changed serial");
+                } else if (fe.serial <= self.serial) fail("ENCODED logical frame serials do not increase");
+                for (fe.parts) |p| {
+                    switch (p.kind) {
+                        webproto.encoded_video => self.video_parts += 1,
+                        webproto.encoded_lossless => self.lossless_parts += 1,
+                        else => fail("unknown ENCODED part kind"),
+                    }
+                    const got = self.recv.apply(self.allocator, self.pixels, @intCast(self.w), @intCast(self.h), p) catch fail("ENCODED part decode allocation");
+                    switch (got) {
+                        .rect => |r| self.damage.add(r),
+                        .dropped => self.video_dropped += 1,
+                        .malformed => fail("ENCODED part does not describe pixels of the surface"),
+                    }
+                }
+                if (fe.last == 0) {
+                    self.open_serial = fe.serial;
+                } else {
+                    self.open_serial = null;
+                    self.serial = fe.serial;
+                    // The final message closes a logical frame exactly as
+                    // FRAME_END closes a raw one.
+                    return .frame_end;
+                }
+            },
             .damage => {
+                if (self.encoded) fail("an encoded stream sent raw DAMAGE");
                 if (b.len < webstream.DAMAGE_HEAD or self.pixels.len == 0) fail("damage before surface");
                 const r = frameflow.Rect{
                     .x = std.mem.readInt(u32, b[0..4], .little),
@@ -3693,6 +3739,7 @@ const StreamRig = struct {
                 self.damage.add(r);
             },
             .frame_end => {
+                if (self.encoded) fail("an encoded stream sent raw FRAME_END");
                 if (b.len != webstream.FRAME_END_BODY) fail("invalid stream frame end");
                 const serial = std.mem.readInt(u64, b[0..8], .little);
                 if (serial != self.serial + 1) fail("stream frame serials are not contiguous");
@@ -3939,6 +3986,105 @@ fn procFds(pid: c.pid_t) usize {
     return n;
 }
 
+/// Read logical frames for `ms`, ACKing each; how many arrived.
+fn streamPump(rig: *StreamRig, ms: i64) u32 {
+    var n: u32 = 0;
+    const end = nowMs() + ms;
+    while (nowMs() < end) {
+        const tag = rig.next(@max(1, @min(100, end - nowMs()))) orelse continue;
+        if (tag != .frame_end) continue;
+        _ = rig.damage.takeBounds();
+        rig.ack();
+        n += 1;
+    }
+    return n;
+}
+
+/// `encoding:"encoded"`: frames decode back to the exact page, animation
+/// arrives (as video tiles when a codec was negotiated), lossless pixels
+/// return when it stops, and a helper without the capability answers raw.
+fn streamEncodedStage(allocator: std.mem.Allocator, arena: std.mem.Allocator, m: *Mcp, exe: [*:0]const u8, rt: []const u8, caps: std.json.ObjectMap) void {
+    if (!caps.get("web_stream_encoded").?.bool) fail("built real helper did not negotiate stream-encoded");
+    const path = std.fmt.allocPrint(arena, "{s}/stream-encoded.html", .{rt}) catch unreachable;
+    // A solid page with an exact 20x20 block, and a whole-viewport canvas
+    // that paints noise every animation frame while go() runs (hot AND
+    // photographic: the video route when a codec was negotiated).
+    const html = "<!doctype html><style>body{margin:0;overflow:hidden;background:#112233}#b{position:fixed;left:40px;top:40px;width:20px;height:20px;background:#00ff00}" ++
+        "#c{position:fixed;left:0;top:0;display:none}</style><div id=b></div><canvas id=c width=800 height=600></canvas><script>" ++
+        "const x=c.getContext('2d'),d=x.createImageData(800,600),u=new Uint32Array(d.data.buffer);let run=false;" ++
+        "function tick(){if(!run)return;for(let i=0;i<u.length;i++)u[i]=(Math.random()*16777215)|0xff000000;x.putImageData(d,0,0);requestAnimationFrame(tick)}" ++
+        "window.go=()=>{run=true;c.style.display='block';requestAnimationFrame(tick)};window.halt=()=>{run=false;c.style.display='none'};</script>";
+    @import("util/atomicwrite.zig").writeFileExact(path, html, 0o600) catch fail("write encoded stream fixture");
+    var args: [1024]u8 = undefined;
+    m.sendTool("web_open", std.fmt.bufPrint(&args, "{{\"url\":\"file://{s}\",\"width\":800,\"height\":600,\"snapshot\":\"none\"}}", .{path}) catch unreachable);
+    _ = capSc(arena, m.recvLine(60_000), "encoded stream fixture open", false);
+
+    // Offer every codec this process decodes, in vcodec's default order.
+    var names: [vcodec.CodecList.cap][]const u8 = undefined;
+    const decodable = vcodec.decodableHere();
+    var list: []const u8 = "";
+    for (decodable.names(&names), 0..) |n, i| list = std.fmt.allocPrint(arena, "{s}{s}\"{s}\"", .{ list, if (i > 0) "," else "", n }) catch unreachable;
+    const offer = capSc(arena, m.callTool("web_stream", std.fmt.bufPrint(&args, "{{\"audio\":false,\"encoding\":\"encoded\",\"video_codecs\":[{s}]}}", .{list}) catch unreachable), "encoded web_stream", false);
+    if (!std.mem.eql(u8, offer.get("encoding").?.string, "encoded")) fail("a stream-encoded helper answered an encoded open with a raw stream");
+    const codec = offer.get("video_codec").?;
+    if (codec != .null and vcodec.codecFromName(codec.string) == null) fail("encoded stream named an unknown video codec");
+    if (codec != .null and !decodable.contains(vcodec.codecFromName(codec.string).?)) fail("encoded stream picked a codec the consumer did not offer");
+    std.debug.print("smoke-mcp: encoded stream offered [{s}], helper picked {s}\n", .{ list, if (codec == .null) "lossless only" else codec.string });
+
+    var rig = StreamRig.connect(allocator, offer.get("socket_path").?.string);
+    defer rig.deinit();
+    rig.encoded = true;
+    rig.send(.auth, offer.get("token").?.string);
+    const full = rig.frame();
+    if (full.x != 0 or full.y != 0 or full.w != 800 or full.h != 600) fail("first encoded frame is not the whole surface");
+    rig.ack();
+    _ = streamPump(&rig, 600);
+    if (!std.mem.eql(u8, rig.pixels[0..4], &.{ 0x33, 0x22, 0x11, 0xff })) fail("encoded frames did not decode to the page's solid colour");
+    const green = streamColorBounds(rig.pixels, rig.w, rig.h, .{ 0, 255, 0, 255 });
+    if (green.count != 400 or green.bounds.?.x != 40 or green.bounds.?.y != 40) fail("encoded frames did not decode the exact 20x20 block");
+
+    // Animated content arrives, and keeps arriving under the ACK window.
+    _ = capSc(arena, m.callTool("web_eval", "{\"code\":\"go(),true\"}"), "start encoded animation", false);
+    const before = allocator.dupe(u8, rig.pixels) catch fail("encoded baseline");
+    defer allocator.free(before);
+    const frames = streamPump(&rig, 3000);
+    const moved = streamPixelDiff(rig.w, rig.h, before, rig.pixels, .{ .x = 0, .y = 0, .w = 800, .h = 600 });
+    std.debug.print("smoke-mcp: encoded animation: {d} logical frames in 3s, {d} video parts ({d} dropped), {d} lossless parts\n", .{ frames, rig.video_parts, rig.video_dropped, rig.lossless_parts });
+    if (frames < 10 or moved.count < 800 * 600 / 2) fail("animated content did not arrive on the encoded stream");
+    if (codec != .null and (rig.video_parts == 0 or rig.video_dropped == rig.video_parts)) fail("a negotiated codec produced no decodable video tile for animated noise");
+    // Video is lossy: once the animation stops, the first lossless frame
+    // repaints the whole surface and the page is exact again.
+    _ = capSc(arena, m.callTool("web_eval", "{\"code\":\"halt(),true\"}"), "stop encoded animation", false);
+    _ = streamPump(&rig, 1500);
+    if (!std.mem.eql(u8, rig.pixels[0..4], &.{ 0x33, 0x22, 0x11, 0xff }) or
+        !std.mem.eql(u8, rig.pixels[(599 * 800 + 799) * 4 ..][0..4], &.{ 0x33, 0x22, 0x11, 0xff }) or
+        streamColorBounds(rig.pixels, rig.w, rig.h, .{ 0, 255, 0, 255 }).count != 400)
+        fail("the stream did not settle back to exact lossless pixels after the animation");
+    rig.disconnect();
+    _ = capSc(arena, m.callTool("web_close", "{}"), "encoded stream view close", false);
+
+    // A helper without the capability ignores the request: raw, and said so.
+    _ = c.setenv("SKETERM_WEB_DISABLE_STREAM_ENCODED", "1", 1);
+    defer _ = c.unsetenv("SKETERM_WEB_DISABLE_STREAM_ENCODED");
+    var old = Mcp.spawn(allocator, exe, &.{});
+    defer old.closeStdinWait();
+    old.initialize();
+    old.sendTool("web_open", std.fmt.bufPrint(&args, "{{\"url\":\"file://{s}\",\"width\":800,\"height\":600,\"snapshot\":\"none\"}}", .{path}) catch unreachable);
+    _ = capSc(arena, old.recvLine(60_000), "raw-only helper open", false);
+    if (capSc(arena, old.callTool("capabilities", "{}"), "raw-only preflight", false).get("web_stream_encoded").?.bool) fail("withheld stream-encoded was still reported");
+    const raw_line = old.callTool("web_stream", "{\"audio\":false,\"encoding\":\"encoded\"}");
+    const raw_offer = capSc(arena, raw_line, "encoded open on a raw-only helper", false);
+    if (!std.mem.eql(u8, raw_offer.get("encoding").?.string, "raw") or std.mem.indexOf(u8, raw_line, "RAW BGRA") == null) fail("a raw-only helper's stream was not reported raw");
+    var raw_rig = StreamRig.connect(allocator, raw_offer.get("socket_path").?.string);
+    defer raw_rig.deinit();
+    raw_rig.send(.auth, raw_offer.get("token").?.string);
+    _ = raw_rig.frame();
+    if (!std.mem.eql(u8, raw_rig.pixels[0..4], &.{ 0x33, 0x22, 0x11, 0xff })) fail("raw fallback stream is not the page");
+    raw_rig.disconnect();
+    _ = capSc(arena, old.callTool("web_close", "{}"), "raw-only view close", false);
+    say("smoke-mcp: REAL encoded stream: exact solid colour and block decoded, animation arrived, lossless settle, raw fallback on a helper without stream-encoded ok");
+}
+
 /// Device scale 2 on the CPU path: DPR, screenshot, stream surface and pixels, then resize.
 fn streamScaleStage(allocator: std.mem.Allocator, arena: std.mem.Allocator, m: *Mcp, path: []const u8) void {
     var args: [1024]u8 = undefined;
@@ -4157,6 +4303,8 @@ fn webStreamStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const 
     const offer = streamOffer(&m, arena);
     if (offer.get("audio").?.bool != audio or capInt(offer, "protocol_version") != 1 or capInt(offer, "max_unacked_frames") != 2 or
         !std.mem.eql(u8, offer.get("pixel_format").?.string, "bgra-premultiplied")) fail("web_stream result differs from negotiated V1 contract");
+    // The default stays the raw V1 stream; StreamRig fails on any ENCODED frame.
+    if (!std.mem.eql(u8, offer.get("encoding").?.string, "raw") or offer.get("video_codec") != null) fail("a default web_stream is not raw");
     const socket_path = offer.get("socket_path").?.string;
     const token = offer.get("token").?.string;
     const helper_socket = caps.get("web_socket").?.string;
@@ -4401,6 +4549,7 @@ fn webStreamStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const 
     _ = view_end.frame();
     _ = capSc(arena, m.callTool("web_close", "{}"), "stream view teardown", false);
     view_end.ended();
+    streamEncodedStage(allocator, arena, &m, exe, rt, caps);
     streamScaleStage(allocator, arena, &m, path);
     streamFpsStage(allocator, arena, &m, exe, rt);
 

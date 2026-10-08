@@ -172,6 +172,7 @@ fn withheld(cap: proto.Cap) bool {
         .web_emulation => "SKETERM_WEB_DISABLE_EMULATION",
         .web_stream => "SKETERM_WEB_DISABLE_STREAM",
         .stream_audio => "SKETERM_WEB_DISABLE_STREAM_AUDIO",
+        .stream_encoded => "SKETERM_WEB_DISABLE_STREAM_ENCODED",
         .view_max_fps => "SKETERM_WEB_DISABLE_MAX_FPS",
         .frames_encoded => "SKETERM_WEB_DISABLE_FRAMES_ENCODED",
         else => return false,
@@ -887,6 +888,7 @@ pub const Server = struct {
                 if (cefhost.software_webgl) caps.add(.software_webgl);
                 if (self.host.presenterActive()) caps.add(.presenter);
                 if (!withheld(.web_stream) and !withheld(.stream_audio) and streamsrv.audioAvailable()) caps.add(.stream_audio);
+                if (!withheld(.web_stream) and !withheld(.stream_encoded)) caps.add(.stream_encoded);
                 try cn.out.post(proto.HelloAck{
                     .proto = proto.PROTO_VERSION,
                     .engine_name = cefhost.engineName(),
@@ -1046,10 +1048,25 @@ pub const Server = struct {
                     if (err != error.ObserveDropped) return err;
                     return cn.out.post(proto.EvStreamOpen{ .view = raw.view, .req = raw.req, .path = "", .token = "", .err = "an observer cannot stream another connection's view" }, null);
                 };
+                // Without the capability the trailing choice is ignored
+                // exactly as an older helper ignores it: the stream is raw.
+                const encode: ?cefhost.Host.StreamEncoded = if (raw.encoding == .encoded and !withheld(.stream_encoded))
+                    .{ .wire_view = raw.view, .codecs = raw.codecs }
+                else
+                    null;
                 if (withheld(.web_stream)) {
                     try cn.out.post(proto.EvStreamOpen{ .view = raw.view, .req = raw.req, .path = "", .token = "", .err = "this helper does not stream" }, null);
-                } else switch (self.host.streamOpen(req.view, req.audio != 0)) {
-                    .ok => |st| try cn.out.post(proto.EvStreamOpen{ .view = raw.view, .req = raw.req, .path = st.path(), .token = &st.token, .err = "", .audio = @intFromBool(st.encoder != null) }, null),
+                } else switch (self.host.streamOpen(req.view, req.audio != 0, encode)) {
+                    .ok => |st| try cn.out.post(proto.EvStreamOpen{
+                        .view = raw.view,
+                        .req = raw.req,
+                        .path = st.path(),
+                        .token = &st.token,
+                        .err = "",
+                        .audio = @intFromBool(st.encoder != null),
+                        .encoding = st.encoding(),
+                        .codec = if (st.codec()) |cd| @intFromEnum(cd) else 0,
+                    }, null),
                     .err => |why| try cn.out.post(proto.EvStreamOpen{ .view = raw.view, .req = raw.req, .path = "", .token = "", .err = why }, null),
                 }
             },

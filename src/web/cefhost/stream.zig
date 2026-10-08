@@ -14,12 +14,18 @@ const frameflow = @import("../frameflow.zig");
 const Rect = frameflow.Rect;
 const srv = @import("../streamsrv.zig");
 const webkeys = @import("../webkeys.zig");
+const vcodec = @import("../../wlhost/vcodec.zig");
+const surfenc = @import("../../wlhost/surfenc.zig");
 const clock = @import("../../util/clock.zig");
 const host_mod = @import("../cefhost.zig");
 const Host = host_mod.Host;
 const View = host_mod.View;
 const releaseArg = host_mod.releaseArg;
 const viewOf = host_mod.viewOf;
+
+/// An encoded stream's request: the client's id for the view and the
+/// `vcodec.Codec` ids it decodes, in its preference order.
+pub const Encoded = struct { wire_view: u32, codecs: []const u8 };
 
 pub const OpenResult = union(enum) {
     ok: *srv.Stream,
@@ -34,8 +40,9 @@ fn streamOf(self: *Host, view: u32) ?*srv.Stream {
 }
 
 /// Open `view`'s stream for the dispatching connection. The view id is
-/// already engine-global; ownership was checked by `find`.
-pub fn streamOpen(self: *Host, view: u32, want_audio: bool) OpenResult {
+/// already engine-global; ownership was checked by `find`. `encode` (the
+/// client's view id and codec list) makes it an encoded stream.
+pub fn streamOpen(self: *Host, view: u32, want_audio: bool, encode: ?Encoded) OpenResult {
     const v = self.find(view) orelse return .{ .err = "no such view" };
     if (v.webext_bg or v.webext_popup or v.windowed) return .{ .err = "this view has no page to stream" };
     // GPU frames never enter this process's memory, so there is nothing
@@ -47,7 +54,13 @@ pub fn streamOpen(self: *Host, view: u32, want_audio: bool) OpenResult {
         if (s.closed == null) live += 1;
     }
     if (live >= srv.MAX_STREAMS) return .{ .err = "too many open streams" };
-    const s = srv.Stream.open(self.gpa, self.stream_dir, v.id, self.dispatch_conn, want_audio, clock.nowMs()) catch |err|
+    const enc: ?srv.Encode = if (encode) |e| .{
+        .wire_view = e.wire_view,
+        .codecs = e.codecs,
+        .encodable = vcodec.encodableHere(),
+        .open = surfenc.openNegotiated,
+    } else null;
+    const s = srv.Stream.open(self.gpa, self.stream_dir, v.id, self.dispatch_conn, want_audio, enc, clock.nowMs()) catch |err|
         return .{ .err = switch (err) {
             error.NoDirectory => "this helper has no socket directory to put a stream in",
             error.PathTooLong => "the stream socket path is too long",
@@ -170,15 +183,15 @@ pub fn streamBrowserGone(self: *Host, view: u32) void {
 
 // -- paint hooks ---------------------------------------------------------
 
-/// View damage in physical pixels, from `onPaint`.
+/// View damage in physical pixels, from `onPaint`: one paint.
 pub fn streamDamage(self: *Host, v: *const View, rects: []const proto.Rect) void {
     const s = streamOf(self, v.id) orelse return;
-    for (rects) |r| s.damage(Rect.of(r));
+    s.paint(v.pw, v.ph, rects);
 }
 
 fn damageRect(self: *Host, v: *const View, r: Rect) void {
     const s = streamOf(self, v.id) orelse return;
-    s.damage(r);
+    s.paint(v.pw, v.ph, &[_]Rect{r});
 }
 
 /// The popup rect in physical pixels, origin SIGNED: position from
@@ -350,7 +363,14 @@ fn cursorOf(ctype: cef.cef_cursor_type_t, info: [*c]const cef.cef_cursor_info_t)
 // -- what the stream reads and drives -------------------------------------
 
 fn source(self: *Host) srv.Source {
-    return .{ .ctx = self, .surface = surface, .compose = compose, .input = input, .cursor = cursor };
+    return .{ .ctx = self, .surface = surface, .compose = compose, .input = input, .cursor = cursor, .live = liveSurface };
+}
+
+fn liveSurface(ctx: *anyopaque, view: u32) ?srv.Live {
+    if (surface(ctx, view) == null) return null;
+    const self: *Host = @ptrCast(@alignCast(ctx));
+    const v = self.findAny(view) orelse return null;
+    return .{ .map = v.map[0 .. @as(usize, v.pw) * v.ph * 4], .gen = v.gen, .overlay = v.widget_map.len != 0 };
 }
 
 fn cursor(ctx: *anyopaque, view: u32) st.Cursor {

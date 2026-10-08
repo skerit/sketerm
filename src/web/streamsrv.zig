@@ -9,6 +9,12 @@
 //! has room AND the bounded transmit buffer can take the next band, so
 //! the newest pixels always win and a stalled reader costs a fixed
 //! amount of memory.
+//!
+//! An encoded stream (capability "stream-encoded") hands pixels to a
+//! `frameenc.Stream` instead, the same encoder and ack window as encoded
+//! watch-along frames: it cuts one logical frame into `enc_out` only when
+//! the previous one has been written whole, so at most one encoded frame
+//! is ever buffered.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -17,6 +23,10 @@ const st = @import("stream.zig");
 const frameflow = @import("frameflow.zig");
 const Rect = frameflow.Rect;
 const opus = @import("../mux/opuscodec.zig");
+const proto = @import("protocol.zig");
+const frameenc = @import("frameenc.zig");
+const surfenc = @import("../wlhost/surfenc.zig");
+const vcodec = @import("../wlhost/vcodec.zig");
 
 /// Streams one helper serves at once; also the audio slot count.
 pub const MAX_STREAMS = 16;
@@ -66,6 +76,29 @@ pub const Source = struct {
     /// The view's current cursor, read when the Cursor frame is cut;
     /// borrowed for that one encode.
     cursor: *const fn (ctx: *anyopaque, view: u32) st.Cursor,
+    /// The whole live surface for an encoded cut, or null while it has
+    /// none (exactly when `surface` is null).
+    live: *const fn (ctx: *anyopaque, view: u32) ?Live,
+};
+
+/// The live tight BGRA surface of a view and its paint counter.
+pub const Live = struct {
+    map: []const u8,
+    gen: u32,
+    /// Something is composed over `map` (a `<select>` popup): the cut
+    /// reads the surface through `compose` instead.
+    overlay: bool,
+};
+
+/// An encoded stream's choice at open: the client's view id (what its
+/// ENCODED frames carry), the codecs it decodes in preference order
+/// (`vcodec.Codec` ids, empty = lossless only), what this process encodes
+/// and how an encoder is opened.
+pub const Encode = struct {
+    wire_view: u32,
+    codecs: []const u8,
+    encodable: vcodec.CodecList,
+    open: surfenc.Opener,
 };
 
 pub const OpenError = error{ NoDirectory, PathTooLong, NoEntropy, SocketFailed, OutOfMemory };
@@ -181,14 +214,23 @@ pub const Stream = struct {
     audio_slot: ?usize = null,
     /// Set only while audio is actually encoded: what the open reports.
     encoder: ?opus.Encoder = null,
+    /// Set for an encoded stream: pixels go through it, never `dirty`.
+    enc: ?*frameenc.Stream = null,
+    /// The client's id for the view, carried by ENCODED frames.
+    wire_view: u32 = 0,
+    /// ENCODED messages of the logical frame being written, in stream
+    /// framing; empty before the next frame is cut.
+    enc_out: proto.Outbox,
+    /// The surface with its popup composed, for a cut while one shows.
+    composed: std.ArrayList(u8) = .empty,
 
     pub fn path(self: *const Stream) []const u8 {
         return self.path_buf[0..self.path_len];
     }
 
     /// Bind a fresh 0600 socket under `dir` with a random name and mint
-    /// the token that alone may use it.
-    pub fn open(gpa: std.mem.Allocator, dir: []const u8, view: u32, owner: u32, want_audio: bool, now_ms: i64) OpenError!*Stream {
+    /// the token that alone may use it; `encode` makes it an encoded stream.
+    pub fn open(gpa: std.mem.Allocator, dir: []const u8, view: u32, owner: u32, want_audio: bool, encode: ?Encode, now_ms: i64) OpenError!*Stream {
         if (dir.len == 0) return error.NoDirectory;
         // Token and socket name from DISJOINT random bytes: the name is
         // visible to anyone who can list the directory.
@@ -203,8 +245,9 @@ pub const Stream = struct {
             .view = view,
             .owner = owner,
             .token = st.mintToken(rnd[0..16].*),
-            .deadline_ms = now_ms + @import("protocol.zig").STREAM_CONNECT_MS,
+            .deadline_ms = now_ms + proto.STREAM_CONNECT_MS,
             .tx = tx,
+            .enc_out = proto.Outbox.init(gpa),
         };
         const name = st.mintToken(rnd[16..32].*);
         const p = std.fmt.bufPrint(s.path_buf[0 .. s.path_buf.len - 1], "{s}/ws-{s}.sock", .{ std.mem.trimEnd(u8, dir, "/"), name[0..16] }) catch
@@ -212,6 +255,18 @@ pub const Stream = struct {
         s.path_len = p.len;
         s.path_buf[p.len] = 0;
         try s.bind();
+        errdefer s.closeListener();
+        if (encode) |e| {
+            const enc = try gpa.create(frameenc.Stream);
+            enc.* = frameenc.Stream.init(gpa, e.open);
+            // An ENCODED frame must fit the stream's own frame cap.
+            enc.limits = frameenc.Limits.within(st.MAX_FRAME);
+            // The surface is unknown until the first SURFACE; that
+            // announcement restarts the stream at a keyframe.
+            enc.configure(e.codecs, e.encodable, 0, 0);
+            s.enc = enc;
+            s.wire_view = e.wire_view;
+        }
         // The audio slot exists from the open on, not from AUTH: the
         // engine asks once, when the page becomes audible, and a page
         // that does so before the client authenticated must still be
@@ -249,7 +304,23 @@ pub const Stream = struct {
         self.shut("the stream was freed");
         self.in.deinit(self.gpa);
         self.gpa.free(self.tx);
+        if (self.enc) |e| {
+            e.deinit();
+            self.gpa.destroy(e);
+        }
+        self.enc_out.deinit();
+        self.composed.deinit(self.gpa);
         self.gpa.destroy(self);
+    }
+
+    /// How this stream carries pixels: what the open reports.
+    pub fn encoding(self: *const Stream) proto.StreamEncoding {
+        return if (self.enc != null) .encoded else .raw;
+    }
+
+    /// The video codec an encoded stream negotiated; null = lossless only.
+    pub fn codec(self: *const Stream) ?vcodec.Codec {
+        return (self.enc orelse return null).codec;
     }
 
     /// End the stream with `reason` (the first reason wins). Descriptors
@@ -285,16 +356,18 @@ pub const Stream = struct {
         if (self.closed != null) return null;
         if (self.fd >= 0) return .{
             .fd = self.fd,
-            .events = @as(c_short, c.POLLIN) | (if (self.tx_len != 0) @as(c_short, c.POLLOUT) else @as(c_short, 0)),
+            .events = @as(c_short, c.POLLIN) | (if (self.tx_len != 0 or !self.enc_out.empty()) @as(c_short, c.POLLOUT) else @as(c_short, 0)),
             .revents = 0,
         };
         if (self.listen_fd >= 0) return .{ .fd = self.listen_fd, .events = c.POLLIN, .revents = 0 };
         return null;
     }
 
-    /// Paint damage in surface pixels.
-    pub fn damage(self: *Stream, r: Rect) void {
-        self.dirty.add(r);
+    /// One paint of the `w`x`h` surface damaged `rects` (any x/y/w/h
+    /// rects, surface pixels).
+    pub fn paint(self: *Stream, w: u32, h: u32, rects: anytype) void {
+        if (self.enc) |e| return e.paint(@intCast(w), @intCast(h), rects);
+        self.dirty.addAll(rects);
     }
 
     /// The view's cursor changed; the newest one is what the client gets.
@@ -398,7 +471,10 @@ pub const Stream = struct {
                     self.shut("second authentication on the stream");
                     return false;
                 },
-                .ack => |serial| self.flow.ack(serial) catch {
+                // An encoded stream takes frameenc's cumulative ACK, which
+                // ignores a serial it no longer waits for (a frame it could
+                // not queue whole is abandoned and resent from a keyframe).
+                .ack => |serial| if (self.enc) |e| e.ack(serial) else self.flow.ack(serial) catch {
                     self.shut("stream ACK names no unacknowledged frame");
                     return false;
                 },
@@ -448,6 +524,9 @@ pub const Stream = struct {
         const surf = src.surface(src.ctx, self.view);
         if (surf) |sf| {
             const same = if (self.announced) |a| std.meta.eql(a, sf) else false;
+            // An encoded frame is announced only once its messages are all
+            // written: a client never sees SURFACE inside a logical frame.
+            if (!same and self.enc != null and !self.enc_out.empty()) return;
             if (!same) {
                 // A frame whose bands already went out is closed FIRST,
                 // with its own serial: a client must never see Surface
@@ -468,7 +547,7 @@ pub const Stream = struct {
                 self.announced = sf;
                 self.bands = null;
                 self.frame_open = false;
-                self.dirty.full(sf.pixel_w, sf.pixel_h);
+                if (self.enc) |e| e.restart(@intCast(sf.pixel_w), @intCast(sf.pixel_h)) else self.dirty.full(sf.pixel_w, sf.pixel_h);
             }
         }
         if (self.cursor_pending) {
@@ -481,6 +560,7 @@ pub const Stream = struct {
         self.produceAudio();
         const sf = self.announced orelse return;
         if (surf == null) return;
+        if (self.enc) |e| return self.produceEncoded(src, e, sf);
         if (self.bands == null) {
             if (!self.flow.canSend()) return;
             const rects = self.dirty.take(sf.pixel_w, sf.pixel_h, &self.frame);
@@ -508,6 +588,25 @@ pub const Stream = struct {
         self.frame_open = false;
     }
 
+    /// Cut the next logical encoded frame once the previous one is
+    /// written whole and the ack window has room.
+    fn produceEncoded(self: *Stream, src: Source, e: *frameenc.Stream, sf: st.Surface) void {
+        if (!self.enc_out.empty() or !e.ready()) return;
+        const live = src.live(src.ctx, self.view) orelse return;
+        var pixels = live.map;
+        if (live.overlay) {
+            const full: Rect = .{ .x = 0, .y = 0, .w = sf.pixel_w, .h = sf.pixel_h };
+            self.composed.resize(self.gpa, @as(usize, sf.pixel_w) * sf.pixel_h * 4) catch return;
+            src.compose(src.ctx, self.view, full, self.composed.items);
+            pixels = self.composed.items;
+        }
+        e.cut(&self.enc_out, self.wire_view, live.gen, pixels, @intCast(sf.pixel_w), @intCast(sf.pixel_h));
+        // Each message is a control-protocol `frame_encoded` frame: the
+        // same u32 length (tag included) and payload as the stream's own
+        // framing, so only the tag byte differs.
+        for (self.enc_out.queue.items[self.enc_out.head..]) |m| m.bytes[4] = @intFromEnum(st.Tag.encoded);
+    }
+
     /// Encode every whole 20ms frame the capture thread handed over. A
     /// packet that does not fit is dropped: audio is never queued here.
     fn produceAudio(self: *Stream) void {
@@ -526,19 +625,48 @@ pub const Stream = struct {
         }
     }
 
+    /// Write what is pending without ever splitting a frame: a partly
+    /// written ENCODED message finishes first, then the transmit buffer,
+    /// then the encoded frame's remaining messages.
     fn flush(self: *Stream) void {
+        if (self.enc_out.sent != 0 and !self.flushEncoded(true)) return;
+        if (!self.flushTx()) return;
+        _ = self.flushEncoded(false);
+    }
+
+    /// Whether the transmit buffer drained completely.
+    fn flushTx(self: *Stream) bool {
         while (self.tx_head < self.tx_len) {
-            const n = c.send(self.fd, self.tx[self.tx_head..].ptr, self.tx_len - self.tx_head, send_flags);
-            if (n < 0) {
-                const e = std.c._errno().*;
-                if (e == c.EAGAIN or e == c.EWOULDBLOCK) return;
-                if (e == c.EINTR) continue;
-                return self.shut("the stream client disconnected");
-            }
-            self.tx_head += @intCast(n);
+            const n = self.sendSome(self.tx[self.tx_head..self.tx_len]) orelse return false;
+            self.tx_head += n;
         }
         self.tx_head = 0;
         self.tx_len = 0;
+        return true;
+    }
+
+    /// Whether `enc_out` drained (just its front message when `one`).
+    fn flushEncoded(self: *Stream, one: bool) bool {
+        while (self.enc_out.front()) |m| {
+            const n = self.sendSome(m.bytes) orelse return false;
+            self.enc_out.advance(n);
+            if (one and self.enc_out.sent == 0) return true;
+        }
+        return true;
+    }
+
+    /// Bytes of `bytes` the socket took; null when it takes no more this
+    /// turn (or the stream ended).
+    fn sendSome(self: *Stream, bytes: []const u8) ?usize {
+        while (true) {
+            const n = c.send(self.fd, bytes.ptr, bytes.len, send_flags);
+            if (n >= 0) return @intCast(n);
+            const e = std.c._errno().*;
+            if (e == c.EAGAIN or e == c.EWOULDBLOCK) return null;
+            if (e == c.EINTR) continue;
+            self.shut("the stream client disconnected");
+            return null;
+        }
     }
 };
 
@@ -557,9 +685,24 @@ const Fake = struct {
     inputs: std.ArrayList(st.Input) = .empty,
     texts: std.ArrayList(u8) = .empty,
     cur: CursorCache = .{},
+    /// The live surface `live` hands out, rebuilt from `compose` each call.
+    px: std.ArrayList(u8) = .empty,
+    gen: u32 = 0,
+    /// Blue channel of every pixel, so a test can change the page.
+    tint: u8 = 0,
+    noise: bool = false,
 
     fn source(self: *Fake) Source {
-        return .{ .ctx = self, .surface = surface, .compose = compose, .input = input, .cursor = cursor };
+        return .{ .ctx = self, .surface = surface, .compose = compose, .input = input, .cursor = cursor, .live = live };
+    }
+
+    fn live(ctx: *anyopaque, view: u32) ?Live {
+        const self: *Fake = @ptrCast(@alignCast(ctx));
+        const sf = self.surf orelse return null;
+        self.px.resize(t.allocator, @as(usize, sf.pixel_w) * sf.pixel_h * 4) catch return null;
+        compose(ctx, view, .{ .x = 0, .y = 0, .w = sf.pixel_w, .h = sf.pixel_h }, self.px.items);
+        self.gen += 1;
+        return .{ .map = self.px.items, .gen = self.gen, .overlay = false };
     }
 
     fn cursor(ctx: *anyopaque, _: u32) st.Cursor {
@@ -572,12 +715,23 @@ const Fake = struct {
         return self.surf;
     }
 
-    fn compose(_: *anyopaque, _: u32, r: Rect, dst: []u8) void {
+    fn compose(ctx: *anyopaque, _: u32, r: Rect, dst: []u8) void {
+        const self: *Fake = @ptrCast(@alignCast(ctx));
         var i: usize = 0;
         for (0..r.h) |y| for (0..r.w) |x| {
-            dst[i] = @truncate(r.x + x);
-            dst[i + 1] = @truncate(r.y + y);
-            dst[i + 2] = 0;
+            const px = r.x + x;
+            const py = r.y + y;
+            if (self.noise) {
+                // Incompressible: a hash of the position.
+                const hsh = std.hash.int(@as(u32, @intCast(py * 65536 + px)));
+                dst[i] = @truncate(hsh);
+                dst[i + 1] = @truncate(hsh >> 8);
+                dst[i + 2] = @truncate(hsh >> 16);
+            } else {
+                dst[i] = @truncate(px);
+                dst[i + 1] = @truncate(py);
+                dst[i + 2] = self.tint;
+            }
             dst[i + 3] = 255;
             i += 4;
         };
@@ -659,7 +813,7 @@ test "stream: auth, first full frame, two-frame window, held release, bad token"
     defer fake.inputs.deinit(t.allocator);
     defer fake.texts.deinit(t.allocator);
 
-    const s = try Stream.open(t.allocator, dir, 5, 1, false, 0);
+    const s = try Stream.open(t.allocator, dir, 5, 1, false, null, 0);
     defer s.deinit();
     // The node exists, is a socket, and is private.
     var stb: c.struct_stat = undefined;
@@ -698,11 +852,11 @@ test "stream: auth, first full frame, two-frame window, held release, bad token"
 
     // Two frames may be in flight, the third waits for an ACK and then
     // carries what was damaged meanwhile, near rects merged.
-    s.damage(.{ .x = 0, .y = 0, .w = 1, .h = 1 });
+    s.paint(8, 4, &[_]Rect{.{ .x = 0, .y = 0, .w = 1, .h = 1 }});
     s.service(fake.source(), 3);
-    s.damage(.{ .x = 1, .y = 1, .w = 1, .h = 1 });
+    s.paint(8, 4, &[_]Rect{.{ .x = 1, .y = 1, .w = 1, .h = 1 }});
     s.service(fake.source(), 4);
-    s.damage(.{ .x = 6, .y = 3, .w = 1, .h = 1 });
+    s.paint(8, 4, &[_]Rect{.{ .x = 6, .y = 3, .w = 1, .h = 1 }});
     s.service(fake.source(), 5);
     rd.pull(fd);
     try t.expectEqual(@as(u8, 3), rd.next().?.tag);
@@ -753,7 +907,7 @@ test "stream: auth, first full frame, two-frame window, held release, bad token"
     try t.expectEqualStrings("stream ACK names no unacknowledged frame", s.closed.?);
 
     // A wrong token spends the open: the listener is gone afterwards.
-    const s2 = try Stream.open(t.allocator, dir, 6, 1, false, 0);
+    const s2 = try Stream.open(t.allocator, dir, 6, 1, false, null, 0);
     defer s2.deinit();
     const fd2 = try connectTo(s2.path());
     defer _ = c.close(fd2);
@@ -765,7 +919,7 @@ test "stream: auth, first full frame, two-frame window, held release, bad token"
     try t.expect(c.stat(@ptrCast(&s2.path_buf), &stb) != 0);
 
     // Nobody connecting within the window closes it too.
-    const s3 = try Stream.open(t.allocator, dir, 7, 1, false, 0);
+    const s3 = try Stream.open(t.allocator, dir, 7, 1, false, null, 0);
     defer s3.deinit();
     s3.service(fake.source(), @import("protocol.zig").STREAM_CONNECT_MS);
     try t.expectEqualStrings("no client authenticated in time", s3.closed.?);
@@ -778,7 +932,7 @@ test "stream: far-apart damage is two band runs in ONE frame, not their bounding
     var fake: Fake = .{ .surf = .{ .pixel_w = 200, .pixel_h = 100, .logical_w = 200, .logical_h = 100 } };
     defer fake.inputs.deinit(t.allocator);
     defer fake.texts.deinit(t.allocator);
-    const s = try Stream.open(t.allocator, dir, 5, 1, false, 0);
+    const s = try Stream.open(t.allocator, dir, 5, 1, false, null, 0);
     defer s.deinit();
     const fd = try connectTo(s.path());
     defer _ = c.close(fd);
@@ -789,8 +943,8 @@ test "stream: far-apart damage is two band runs in ONE frame, not their bounding
     rd.pull(fd);
     while (rd.next()) |f| if (f.tag == 4) break;
 
-    s.damage(.{ .x = 2, .y = 3, .w = 4, .h = 5 });
-    s.damage(.{ .x = 190, .y = 90, .w = 6, .h = 7 });
+    s.paint(200, 100, &[_]Rect{.{ .x = 2, .y = 3, .w = 4, .h = 5 }});
+    s.paint(200, 100, &[_]Rect{.{ .x = 190, .y = 90, .w = 6, .h = 7 }});
     s.service(fake.source(), 2);
     rd.pull(fd);
     var area: u64 = 0;
@@ -841,7 +995,7 @@ test "cursor cache: a stream starts from the view's cursor, unchanged reports co
     defer fake.texts.deinit(t.allocator);
     defer fake.cur.deinit(t.allocator);
     _ = fake.cur.set(t.allocator, .{ .named = "pointer" });
-    const s = try Stream.open(t.allocator, dir, 5, 1, false, 0);
+    const s = try Stream.open(t.allocator, dir, 5, 1, false, null, 0);
     defer s.deinit();
     const fd = try connectTo(s.path());
     defer _ = c.close(fd);
@@ -876,7 +1030,7 @@ test "stream: a resize mid-frame ends the started frame before the new surface" 
     var fake: Fake = .{ .surf = .{ .pixel_w = 1024, .pixel_h = 1024, .logical_w = 1024, .logical_h = 1024 } };
     defer fake.inputs.deinit(t.allocator);
     defer fake.texts.deinit(t.allocator);
-    const s = try Stream.open(t.allocator, dir, 5, 1, false, 0);
+    const s = try Stream.open(t.allocator, dir, 5, 1, false, null, 0);
     defer s.deinit();
     const fd = try connectTo(s.path());
     defer _ = c.close(fd);
@@ -939,7 +1093,7 @@ test "stream: a flood of input is served a bounded share per turn" {
     var fake: Fake = .{};
     defer fake.inputs.deinit(t.allocator);
     defer fake.texts.deinit(t.allocator);
-    const s = try Stream.open(t.allocator, dir, 5, 1, false, 0);
+    const s = try Stream.open(t.allocator, dir, 5, 1, false, null, 0);
     defer s.deinit();
     const fd = try connectTo(s.path());
     defer _ = c.close(fd);
@@ -990,7 +1144,7 @@ test "stream: input before auth and hostile frames end the stream" {
     defer fake.inputs.deinit(t.allocator);
     defer fake.texts.deinit(t.allocator);
 
-    const s = try Stream.open(t.allocator, dir, 5, 1, false, 0);
+    const s = try Stream.open(t.allocator, dir, 5, 1, false, null, 0);
     defer s.deinit();
     const fd = try connectTo(s.path());
     defer _ = c.close(fd);
@@ -999,7 +1153,7 @@ test "stream: input before auth and hostile frames end the stream" {
     try t.expectEqualStrings("stream authentication failed", s.closed.?);
     try t.expectEqual(@as(usize, 0), fake.inputs.items.len);
 
-    const s2 = try Stream.open(t.allocator, dir, 6, 1, false, 0);
+    const s2 = try Stream.open(t.allocator, dir, 6, 1, false, null, 0);
     defer s2.deinit();
     const fd2 = try connectTo(s2.path());
     defer _ = c.close(fd2);
@@ -1012,7 +1166,7 @@ test "stream: input before auth and hostile frames end the stream" {
     s2.service(fake.source(), 1);
     try t.expectEqualStrings("malformed stream frame", s2.closed.?);
 
-    const s3 = try Stream.open(t.allocator, dir, 7, 1, false, 0);
+    const s3 = try Stream.open(t.allocator, dir, 7, 1, false, null, 0);
     defer s3.deinit();
     const fd3 = try connectTo(s3.path());
     defer _ = c.close(fd3);
@@ -1020,4 +1174,174 @@ test "stream: input before auth and hostile frames end the stream" {
     try sendFrame(fd3, .surface, &([_]u8{0} ** 17));
     s3.service(fake.source(), 1);
     try t.expectEqualStrings("unknown stream frame", s3.closed.?);
+}
+
+fn openStub(allocator: std.mem.Allocator, codec_: vcodec.Codec, w: i32, h: i32, fps: i32) anyerror!vcodec.Encoder {
+    _ = .{ codec_, w, h, fps };
+    return vcodec.Encoder.initStub(allocator);
+}
+
+/// A client mirror of an encoded stream: applies ENCODED parts through
+/// the shared `frameenc.Receiver`, the way a third-party consumer would.
+const EncMirror = struct {
+    w: u16 = 0,
+    h: u16 = 0,
+    pix: std.ArrayList(u8) = .empty,
+    recv: frameenc.Receiver = .{},
+    frames: u32 = 0,
+    messages: u32 = 0,
+    last_serial: u64 = 0,
+    open_serial: ?u64 = null,
+    surfaces: u32 = 0,
+    area: u64 = 0,
+
+    fn deinit(self: *EncMirror) void {
+        self.pix.deinit(t.allocator);
+        self.recv.deinit(t.allocator);
+    }
+
+    /// Apply every complete frame `rd` holds; a raw DAMAGE or FRAME_END
+    /// is a test failure, as is SURFACE inside a logical frame.
+    fn drain(self: *EncMirror, rd: *Reader) !void {
+        while (true) {
+            const raw = (try st.split(rd.buf.items[rd.pos..])) orelse return;
+            rd.pos += raw.len;
+            switch (@as(st.Tag, @enumFromInt(raw.tag))) {
+                .surface => {
+                    try t.expect(self.open_serial == null);
+                    self.w = @intCast(std.mem.readInt(u32, raw.body[0..4], .little));
+                    self.h = @intCast(std.mem.readInt(u32, raw.body[4..8], .little));
+                    try self.pix.resize(t.allocator, @as(usize, self.w) * self.h * 4);
+                    @memset(self.pix.items, 0);
+                    self.surfaces += 1;
+                },
+                .cursor, .audio => {},
+                .encoded => {
+                    const fe = try proto.FrameEncoded.decodeAlloc(raw.body, t.allocator);
+                    defer t.allocator.free(fe.parts);
+                    try t.expectEqual(@as(u32, 42), fe.view);
+                    try t.expectEqual(self.w, fe.w);
+                    try t.expectEqual(self.h, fe.h);
+                    if (self.open_serial) |sr| try t.expectEqual(sr, fe.serial) else try t.expect(fe.serial > self.last_serial);
+                    for (fe.parts) |p| {
+                        const got = try self.recv.apply(t.allocator, self.pix.items, self.w, self.h, p);
+                        try t.expect(got == .rect);
+                        self.area += @as(u64, p.w) * p.h;
+                    }
+                    self.messages += 1;
+                    if (fe.last != 0) {
+                        self.frames += 1;
+                        self.last_serial = fe.serial;
+                        self.open_serial = null;
+                    } else self.open_serial = fe.serial;
+                },
+                else => return error.UnexpectedTag,
+            }
+        }
+    }
+};
+
+fn sendAck(fd: c_int, serial: u64) !void {
+    var b: [8]u8 = undefined;
+    std.mem.writeInt(u64, &b, serial, .little);
+    try sendFrame(fd, .ack, &b);
+}
+
+test "stream: an encoded stream decodes to the live surface under the two-frame window" {
+    var dbuf: [64]u8 = undefined;
+    const dir = try tmpDir(&dbuf);
+    defer _ = c.rmdir(@ptrCast(dir.ptr));
+    var fake: Fake = .{ .surf = .{ .pixel_w = 64, .pixel_h = 32, .logical_w = 64, .logical_h = 32 } };
+    defer fake.inputs.deinit(t.allocator);
+    defer fake.texts.deinit(t.allocator);
+    defer fake.px.deinit(t.allocator);
+    const s = try Stream.open(t.allocator, dir, 5, 1, false, .{ .wire_view = 42, .codecs = "", .encodable = .{}, .open = openStub }, 0);
+    defer s.deinit();
+    try t.expectEqual(proto.StreamEncoding.encoded, s.encoding());
+    try t.expect(s.codec() == null);
+    const fd = try connectTo(s.path());
+    defer _ = c.close(fd);
+    try sendFrame(fd, .auth, &s.token);
+    s.service(fake.source(), 1);
+    var rd: Reader = .{};
+    defer rd.buf.deinit(t.allocator);
+    var mirror: EncMirror = .{};
+    defer mirror.deinit();
+    rd.pull(fd);
+    try mirror.drain(&rd);
+    // SURFACE, then the whole surface as one logical frame.
+    try t.expectEqual(@as(u32, 1), mirror.surfaces);
+    try t.expectEqual(@as(u32, 1), mirror.frames);
+    try t.expectEqualSlices(u8, Fake.live(&fake, 5).?.map, mirror.pix.items);
+
+    // A small paint ships only its rect; a second fills the window.
+    fake.tint = 9;
+    s.paint(64, 32, &[_]Rect{.{ .x = 3, .y = 4, .w = 2, .h = 2 }});
+    s.service(fake.source(), 2);
+    rd.pull(fd);
+    const area0 = mirror.area;
+    try mirror.drain(&rd);
+    try t.expectEqual(@as(u32, 2), mirror.frames);
+    try t.expectEqual(area0 + 4, mirror.area);
+    // While two frames are unacknowledged nothing more is cut; paints merge.
+    s.paint(64, 32, &[_]Rect{.{ .x = 0, .y = 0, .w = 64, .h = 32 }});
+    s.service(fake.source(), 3);
+    rd.pull(fd);
+    try mirror.drain(&rd);
+    try t.expectEqual(@as(u32, 2), mirror.frames);
+    // A stale ACK is ignored on an encoded stream (not a violation).
+    try sendAck(fd, 77);
+    s.service(fake.source(), 4);
+    try t.expect(s.closed == null);
+    rd.pull(fd);
+    try mirror.drain(&rd);
+    try t.expectEqual(@as(u32, 2), mirror.frames);
+    // ACKing the newest retires both: the merged frame carries the newest pixels.
+    try sendAck(fd, mirror.last_serial);
+    s.service(fake.source(), 5);
+    rd.pull(fd);
+    try mirror.drain(&rd);
+    try t.expectEqual(@as(u32, 3), mirror.frames);
+    try t.expectEqualSlices(u8, Fake.live(&fake, 5).?.map, mirror.pix.items);
+
+    // A resize: SURFACE again, then the whole new surface.
+    fake.surf = .{ .pixel_w = 32, .pixel_h = 16, .logical_w = 32, .logical_h = 16 };
+    try sendAck(fd, mirror.last_serial);
+    s.service(fake.source(), 6);
+    rd.pull(fd);
+    try mirror.drain(&rd);
+    try t.expectEqual(@as(u32, 2), mirror.surfaces);
+    try t.expectEqual(@as(u32, 4), mirror.frames);
+    try t.expectEqualSlices(u8, Fake.live(&fake, 5).?.map, mirror.pix.items);
+}
+
+test "stream: a large encoded frame splits into messages within the stream's frame cap" {
+    var dbuf: [64]u8 = undefined;
+    const dir = try tmpDir(&dbuf);
+    defer _ = c.rmdir(@ptrCast(dir.ptr));
+    // ~5.3 MB of incompressible pixels: more than one stream frame holds.
+    var fake: Fake = .{ .surf = .{ .pixel_w = 1024, .pixel_h = 1300, .logical_w = 1024, .logical_h = 1300 }, .noise = true };
+    defer fake.inputs.deinit(t.allocator);
+    defer fake.texts.deinit(t.allocator);
+    defer fake.px.deinit(t.allocator);
+    const s = try Stream.open(t.allocator, dir, 5, 1, false, .{ .wire_view = 42, .codecs = "", .encodable = .{}, .open = openStub }, 0);
+    defer s.deinit();
+    const fd = try connectTo(s.path());
+    defer _ = c.close(fd);
+    try sendFrame(fd, .auth, &s.token);
+    var rd: Reader = .{};
+    defer rd.buf.deinit(t.allocator);
+    var mirror: EncMirror = .{};
+    defer mirror.deinit();
+    // The client reads while the helper writes: the frame spans turns.
+    var turn: i64 = 1;
+    while (turn < 400 and mirror.frames == 0) : (turn += 1) {
+        s.service(fake.source(), turn);
+        rd.pull(fd);
+        try mirror.drain(&rd);
+    }
+    try t.expect(s.closed == null);
+    try t.expectEqual(@as(u32, 1), mirror.frames);
+    try t.expect(mirror.messages >= 2);
+    try t.expectEqualSlices(u8, Fake.live(&fake, 5).?.map, mirror.pix.items);
 }

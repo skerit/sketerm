@@ -1623,6 +1623,7 @@ pub const Host = struct {
     }
 
     pub const streamOpen = host_stream.streamOpen;
+    pub const StreamEncoded = host_stream.Encoded;
     pub const streamClose = host_stream.streamClose;
     pub const streamPump = host_stream.streamPump;
     pub const streamPollFds = host_stream.streamPollFds;

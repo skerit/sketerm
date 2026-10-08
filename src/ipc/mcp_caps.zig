@@ -308,12 +308,13 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
         const stream = @import("mcp_web.zig").streamCapability();
         try res.fact("web_stream", web_ok and stream.supported);
         try res.fact("web_stream_audio", stream.audio);
+        try res.fact("web_stream_encoded", stream.encoded);
         try res.fact("web_software_webgl", @import("mcp_web.zig").softwareWebglCapability());
         const frame_rate = @import("mcp_web.zig").frameRateCapability();
         try res.fact("web_max_fps", frame_rate.supported);
         try res.fact("web_default_max_fps", frame_rate.default);
         if (web_ok and stream.supported)
-            try res.text("web_stream opens a helper-owned local binary socket for pushed BGRA damage, trusted input and optional runtime Opus audio; audio support is unknown until the helper handshake");
+            try res.text("web_stream opens a helper-owned local binary socket for pushed BGRA damage (or, with encoding encoded, compressed frames), trusted input and optional runtime Opus audio; audio and encoded support are unknown until the helper handshake");
         if (cp.supported)
             try res.text(if (cp.started)
                 "web_open capture:{...} records the response bodies a headless view's page receives; web_capture reads them, web_wait for:\"response\" waits for the next one"

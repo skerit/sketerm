@@ -11,6 +11,13 @@
 //! list themselves are the shared `frameflow.zig`; a frame carries one
 //! band run per pending damage rect.
 //!
+//! An ENCODED stream (opted into at `stream_open`, capability
+//! "stream-encoded") replaces DAMAGE + FRAME_END with ENCODED frames whose
+//! body is exactly the control protocol's `frame_encoded` payload
+//! (`frameenc.zig` cuts them): lossless pixcodec regions or one video
+//! tile, a logical frame ended by `last` and acknowledged with the same
+//! ACK frame. Everything else (SURFACE, CURSOR, AUDIO, input) is shared.
+//!
 //! Pure code: std plus the repo spinlock, no CEF, no sockets. The
 //! socket half is `streamsrv.zig`; the engine glue `cefhost/stream.zig`.
 
@@ -68,6 +75,8 @@ pub const Tag = enum(u8) {
     frame_end = 4,
     cursor = 5,
     audio = 6,
+    /// Encoded streams only: a `protocol.FrameEncoded` payload.
+    encoded = 7,
     pointer = 16,
     wheel = 17,
     key = 18,
