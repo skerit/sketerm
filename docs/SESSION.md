@@ -1,5 +1,19 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-08: opt-in encoded web_stream
+
+`web_stream` takes `encoding:"encoded"` and an ordered `video_codecs` list.
+Raw BGRA stays the default, byte for byte (a raw `stream_open` is still the
+9-byte V1 payload). An encoded stream carries `frame_encoded` payloads under
+stream tag 7 (`ENCODED`), cut by the same `frameenc.Stream` as watch-along
+frames and bounded to the stream's 4 MiB frame cap, under the same two-frame
+ACK window. Capability `stream-encoded` (MCP fact `web_stream_encoded`); a
+helper without it streams raw and the result says `encoding:"raw"`. docs/mcp.md
+documents the frame and part formats for third-party decoders. smoke-mcp's
+encoded stage decoded a real helper: exact page colours, 177 logical frames
+of animated noise in 3s as H.264 tiles, an exact lossless settle, and the raw
+fallback.
+
 ## 2026-10-08: Show beside pane for remote assistants' browsers
 
 The AI badge offered Show beside pane only for an assistant on this machine.
