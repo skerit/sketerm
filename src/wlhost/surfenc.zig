@@ -188,6 +188,33 @@ pub const Lossless = struct {
     }
 };
 
+/// Blit a tight `w`x`h` BGRA `src` into `dst` (a `dst_w`x`dst_h` BGRA
+/// backing buffer, stride dst_w*4) at top-left (x,y). Rows/cols outside
+/// the backing are CLIPPED: a malformed damage rect from the wire can
+/// never write past the buffer. The receiver accumulates damaged rects
+/// here, then presents the whole backing as one texture.
+pub fn blitRect(dst: []u8, dst_w: i32, dst_h: i32, src: []const u8, x: i32, y: i32, w: i32, h: i32) void {
+    const bpp = 4;
+    if (dst_w <= 0 or dst_h <= 0 or w <= 0 or h <= 0) return;
+    const need_src = @as(usize, @intCast(w)) * @as(usize, @intCast(h)) * bpp;
+    const need_dst = @as(usize, @intCast(dst_w)) * @as(usize, @intCast(dst_h)) * bpp;
+    if (src.len < need_src or dst.len < need_dst) return;
+
+    var row: i32 = 0;
+    while (row < h) : (row += 1) {
+        const dy = y + row;
+        if (dy < 0 or dy >= dst_h) continue;
+        const x0 = @max(x, 0);
+        const x1 = @min(x + w, dst_w);
+        if (x1 <= x0) continue;
+        const cols: usize = @intCast(x1 - x0);
+        const src_skip: usize = @intCast(x0 - x);
+        const so = (@as(usize, @intCast(row)) * @as(usize, @intCast(w)) + src_skip) * bpp;
+        const do_ = (@as(usize, @intCast(dy)) * @as(usize, @intCast(dst_w)) + @as(usize, @intCast(x0))) * bpp;
+        @memcpy(dst[do_..][0 .. cols * bpp], src[so..][0 .. cols * bpp]);
+    }
+}
+
 // --- tests ---------------------------------------------------------
 
 const t = std.testing;
@@ -363,4 +390,37 @@ test "Lossless.encodeRect packs a sub-rect tight and round-trips" {
     }
     try t.expectError(error.OutOfBounds, l.encodeRect(t.allocator, &px, W * 4, .{ .x = 60, .y = 0, .w = 8, .h = 1 }));
     try t.expectError(error.OutOfBounds, l.encodeRect(t.allocator, &px, W * 4, .{ .x = 0, .y = 60, .w = 1, .h = 8 }));
+}
+
+test "blitRect places a rect and clips out-of-bounds" {
+    // 4x3 BGRA backing, zeroed.
+    var dst = [_]u8{0} ** (4 * 3 * 4);
+    // 2x2 src of 0xAB bytes.
+    const src = [_]u8{0xAB} ** (2 * 2 * 4);
+
+    blitRect(&dst, 4, 3, &src, 1, 1, 2, 2);
+    // (1,1) and (2,1) on row 1, (1,2)/(2,2) on row 2 are set; corners 0.
+    const px = struct {
+        fn at(d: []const u8, w: usize, cx: usize, cy: usize) u8 {
+            return d[(cy * w + cx) * 4];
+        }
+    };
+    try t.expectEqual(@as(u8, 0xAB), px.at(&dst, 4, 1, 1));
+    try t.expectEqual(@as(u8, 0xAB), px.at(&dst, 4, 2, 2));
+    try t.expectEqual(@as(u8, 0), px.at(&dst, 4, 0, 0));
+    try t.expectEqual(@as(u8, 0), px.at(&dst, 4, 3, 0));
+
+    // Clipping: a rect straddling the right/bottom edge writes only the
+    // in-bounds part and never overflows `dst`.
+    @memset(&dst, 0);
+    blitRect(&dst, 4, 3, &src, 3, 2, 2, 2); // only (3,2) lands
+    try t.expectEqual(@as(u8, 0xAB), px.at(&dst, 4, 3, 2));
+
+    // Fully out of bounds / degenerate: no-op, no crash.
+    @memset(&dst, 0);
+    blitRect(&dst, 4, 3, &src, -5, -5, 2, 2);
+    blitRect(&dst, 4, 3, &src, 0, 0, 0, 0);
+    var sum: u32 = 0;
+    for (dst) |b| sum += b;
+    try t.expectEqual(@as(u32, 0), sum);
 }

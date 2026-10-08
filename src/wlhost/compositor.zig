@@ -459,16 +459,12 @@ const Pool = struct {
     /// while old buffers may still reference the displaced storage
     /// (Vulkan WSI probe pools). Buffers match on this, not the id.
     serial: u64 = 0,
-    /// Lazily-created video decoder for pool_vtile updates to this pool,
-    /// recreated when the tile dimensions or codec change (-Dvideo).
-    vdec: ?vcodec.Decoder = null,
-    vdec_w: i32 = 0,
-    vdec_h: i32 = 0,
-    vdec_codec: vcodec.Codec = .stub,
+    /// The pool_vtile stream decoder for this pool (-Dvideo).
+    vdec: vcodec.StreamDecoder = .{},
 
     pub fn deinit(self: *Pool, a: std.mem.Allocator) void {
         self.bytes.deinit(a);
-        if (self.vdec) |*d| d.deinit();
+        self.vdec.deinit();
     }
 };
 
@@ -1789,26 +1785,19 @@ pub const Compositor = struct {
                 const pool = self.pools.getPtr(vt.pool) orelse return Error.Protocol;
                 const uw: usize = @intCast(tile.w);
                 const uh: usize = @intCast(tile.h);
-                // Per-pool decoder, recreated on a dimension or codec change.
                 // A tile is an UPDATE of pixels the mirror already holds, so
                 // one that cannot be decoded (no decoder for its codec here,
                 // a stream joined mid-GOP, a corrupt packet) is dropped, not
                 // a protocol fault: the mirror keeps the previous frame and
                 // the stream's next keyframe (at most keyint away) recovers.
-                if (pool.vdec == null or pool.vdec_w != tile.w or pool.vdec_h != tile.h or pool.vdec_codec != tile.codec) {
-                    if (pool.vdec) |*d| d.deinit();
-                    pool.vdec = null;
-                    if (!tile.keyframe) return; // a new decoder needs a keyframe first
-                    pool.vdec = vcodec.Decoder.initAvcodec(self.allocator, tile.w, tile.h, tile.codec) catch return;
-                    pool.vdec_w = tile.w;
-                    pool.vdec_h = tile.h;
-                    pool.vdec_codec = tile.codec;
+                switch (try pool.vdec.decode(self.allocator, tile, &self.vscratch)) {
+                    .decoded => {},
+                    .failed => {
+                        self.video_decode_errors += 1;
+                        return;
+                    },
+                    .need_keyframe, .unsupported => return,
                 }
-                try self.vscratch.resize(self.allocator, uw * uh * 4);
-                pool.vdec.?.decodeTile(tile, self.vscratch.items) catch {
-                    self.video_decode_errors += 1;
-                    return;
-                };
                 // Blit the decoded BGRA into the pool mirror at offset,
                 // uw*4 bytes per row stepping by row_stride.
                 const stride: usize = vt.row_stride;

@@ -83,12 +83,8 @@ pub const WsHost = struct {
         /// Same state and same start/stop/save rules as the Wayland
         /// backend — rmenu.WindowRec is shared, not copied.
         rec: rmenu.WindowRec = .{},
-        /// Lazily-created video decoder for win_vtile updates, recreated
-        /// on a dimension/codec change (build_options.video).
-        vdec: ?vcodec.Decoder = null,
-        vdec_w: i32 = 0,
-        vdec_h: i32 = 0,
-        vdec_codec: vcodec.Codec = .stub,
+        /// The win_vtile stream decoder (build_options.video).
+        vdec: vcodec.StreamDecoder = .{},
 
         /// Is (x,y) — picture-local — inside a draggable region? Rects are
         /// in point space; scale to the current frame size so the test
@@ -201,7 +197,7 @@ pub const WsHost = struct {
             w.*.rec.abort();
             self.allocator.free(w.*.drag_rects);
             w.*.backing.deinit(self.allocator);
-            if (w.*.vdec) |*d| d.deinit();
+            w.*.vdec.deinit();
             _ = c.g_object_set_data(@ptrCast(w.*.window), "sketerm-winapp", null);
             c.gtk_window_destroy(w.*.window);
             self.allocator.destroy(w.*);
@@ -311,18 +307,7 @@ pub const WsHost = struct {
                 // Undecodable tiles are dropped (the backing keeps the
                 // previous frame; the next keyframe recovers), never a
                 // protocol fault — same rule as compositor.zig pool_vtile.
-                if (win.vdec == null or win.vdec_w != tile.w or win.vdec_h != tile.h or win.vdec_codec != tile.codec) {
-                    if (win.vdec) |*d| d.deinit();
-                    win.vdec = null;
-                    if (!tile.keyframe) return;
-                    win.vdec = vcodec.Decoder.initAvcodec(self.allocator, tile.w, tile.h, tile.codec) catch return;
-                    win.vdec_w = tile.w;
-                    win.vdec_h = tile.h;
-                    win.vdec_codec = tile.codec;
-                }
-                const need: usize = @as(usize, @intCast(tile.w)) * @as(usize, @intCast(tile.h)) * 4;
-                try self.vscratch.resize(self.allocator, need);
-                win.vdec.?.decodeTile(tile, self.vscratch.items) catch return;
+                if (try win.vdec.decode(self.allocator, tile, &self.vscratch) != .decoded) return;
                 rw.blitRect(win.backing.items, win.w, win.h, self.vscratch.items, tile.x, tile.y, tile.w, tile.h);
                 win.present();
             },
@@ -343,7 +328,7 @@ pub const WsHost = struct {
                 win.rec.abort();
                 self.allocator.free(win.drag_rects);
                 win.backing.deinit(self.allocator);
-                if (win.vdec) |*d| d.deinit();
+                win.vdec.deinit();
                 _ = c.g_object_set_data(@ptrCast(win.window), "sketerm-winapp", null);
                 c.gtk_window_destroy(win.window);
                 self.allocator.destroy(win);

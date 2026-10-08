@@ -706,6 +706,52 @@ pub const Decoder = union(enum) {
     };
 };
 
+/// The receive side of one tile stream (a forwarded pool, a captured
+/// window, a watched web view): the decoder is opened lazily and reopened
+/// on a size or codec change, and only ever at a keyframe.
+pub const StreamDecoder = struct {
+    dec: ?Decoder = null,
+    w: i32 = 0,
+    h: i32 = 0,
+    codec: Codec = .stub,
+
+    pub const Outcome = enum {
+        /// `dst` holds the tile's `w*h*4` BGRA.
+        decoded,
+        /// A new decoder needs a keyframe first; the tile was dropped.
+        need_keyframe,
+        /// No decoder for this codec/size here; the tile was dropped.
+        unsupported,
+        /// The decoder rejected the tile (corrupt, or joined mid-GOP).
+        failed,
+    };
+
+    pub fn deinit(self: *StreamDecoder) void {
+        if (self.dec) |*d| d.deinit();
+        self.* = .{};
+    }
+
+    /// Decode `tile` into `dst`, resized to `w*h*4`. A tile that cannot be
+    /// decoded is reported and dropped, never fatal: the receiver keeps its
+    /// previous pixels and the stream's next keyframe recovers.
+    /// @throws error.OutOfMemory when `dst` cannot grow.
+    pub fn decode(self: *StreamDecoder, a: std.mem.Allocator, tile: Tile, dst: *std.ArrayList(u8)) !Outcome {
+        if (tile.w <= 0 or tile.h <= 0) return .failed;
+        if (self.dec == null or self.w != tile.w or self.h != tile.h or self.codec != tile.codec) {
+            if (self.dec) |*d| d.deinit();
+            self.dec = null;
+            if (!tile.keyframe) return .need_keyframe;
+            self.dec = if (tile.codec == .stub) Decoder.initStub(a) else Decoder.initAvcodec(a, tile.w, tile.h, tile.codec) catch return .unsupported;
+            self.w = tile.w;
+            self.h = tile.h;
+            self.codec = tile.codec;
+        }
+        try dst.resize(a, @as(usize, @intCast(tile.w)) * @as(usize, @intCast(tile.h)) * 4);
+        self.dec.?.decodeTile(tile, dst.items) catch return .failed;
+        return .decoded;
+    }
+};
+
 /// libavcodec software decoder (H.264 or AV1) via vendor/avdec_shim.c.
 /// Fixed tile geometry; decodes a tile to I420 then yuv.zig → BGRA. The
 /// daemon never instantiates this (it encodes); it's the GUI/compositor
