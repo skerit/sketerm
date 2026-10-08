@@ -463,6 +463,12 @@ pub fn main() u8 {
     // The remote-watch stage hands THIS binary to agent_open as Claude
     // Code; started as one, it is a fake of it and nothing else.
     if (c.getenv(FAKE_AGENT_ENV) != null and cmdlineHas("--ax-screen-reader")) return fakeAgent(allocator);
+    // agent_open's host probe asks the binary for its version: answer
+    // as the fake rather than starting a whole nested rig.
+    if (c.getenv(FAKE_AGENT_ENV) != null and cmdlineHas("--version")) {
+        fakeOut("2.1.0 (Claude Code)\n");
+        return 0;
+    }
 
     g_alloc = allocator;
 
@@ -807,10 +813,12 @@ pub fn main() u8 {
         }
         // The watch stages read the GUI's own messages (a route must never
         // report UDP as unavailable), so they keep its stderr.
-        if (c.getenv("SKETERM_SMOKE_E2E_WATCH_ONLY") != null) {
+        if (c.getenv("SKETERM_SMOKE_E2E_WATCH_ONLY") != null or c.getenv("SKETERM_SMOKE_E2E_REMOTE_WEB_WATCH_ONLY") != null) {
             const trace = c.open(WATCH_GUI_LOG.ptr, c.O_WRONLY | c.O_CREAT | c.O_TRUNC, @as(c_uint, 0o600));
             if (trace < 0 or c.dup2(trace, 2) < 0) c._exit(126);
             if (trace != 2) _ = c.close(trace);
+            // The remote web watch reads the face's encoded-frame facts.
+            _ = c.setenv("SKETERM_WEB_STATS", "1", 1);
         }
         const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "--no-save", if (debug_events) "--debug-events" else null, null };
         _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
@@ -867,6 +875,21 @@ pub fn main() u8 {
         }
         if (assistantRemoteStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
         say("assistant remote watch: agents on hosta and hostb (via hosta) listed, watched and controlled");
+        if (have_web_action) {
+            if (assistantRemoteWebWatchStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
+            say("assistant remote web watch: beside, encoded frames, animation and control on hosta's browser");
+        } else {
+            say("SKIP assistant remote web watch stage (sketerm-webengine is not built)");
+        }
+        teardown();
+        return 0;
+    }
+    // The remote browser half of WATCH_ONLY alone.
+    if (c.getenv("SKETERM_SMOKE_E2E_REMOTE_WEB_WATCH_ONLY") != null) {
+        const app = drive orelse return fail("focused remote web watch smoke has no display driver");
+        if (!have_web_action) return fail("the remote web watch stage needs sketerm-webengine (zig build web)");
+        if (assistantRemoteWebWatchStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
+        say("assistant remote web watch: focused remote browser watch stage passed");
         teardown();
         return 0;
     }
@@ -3956,9 +3979,16 @@ fn assistantLocalTermStage(allocator: std.mem.Allocator, app: *appdrive.App, soc
     defer if (m_open) m.close();
     if (!m.initialize()) return "the isolated MCP server never answered initialize";
     var args_buf: [4400]u8 = undefined;
-    const args = std.fmt.bufPrint(&args_buf, "{{\"app\":\"claude\",\"binary\":{f},\"timeout_ms\":30000}}", .{std.json.fmt(self_exe, .{})}) catch return "agent_open args";
+    // The agent's session runs on whichever daemon the server picks, not
+    // under this server's environment: the fake is asked for explicitly.
+    const args = std.fmt.bufPrint(&args_buf, "{{\"app\":\"claude\",\"binary\":{f},\"timeout_ms\":30000,\"env\":{{\"" ++ FAKE_AGENT_ENV ++ "\":\"1\",\"" ++ FAKE_AGENT_LOG_ENV ++ "\":{f}}}}}", .{ std.json.fmt(self_exe, .{}), std.json.fmt(std.mem.span(log_path.ptr), .{}) }) catch return "agent_open args";
     const opened = mcpCallReply(&m, "agent_open", args, 60_000) orelse return "agent_open on the local MCP timed out";
     if (mcpHas(opened, "\"isError\":true")) return whyf("agent_open failed: {s}", .{opened[0..@min(opened.len, 300)]});
+    // Agent ids are minted (`claude-xxxx`): read this one off the reply.
+    var id_buf: [64]u8 = undefined;
+    const agent = mcpStr(opened, "agent", &id_buf) orelse return whyf("agent_open named no agent id: {s}", .{opened[0..@min(opened.len, 300)]});
+    var who_buf: [80]u8 = undefined;
+    const who = std.fmt.bufPrint(&who_buf, "agent-{s} ", .{agent}) catch return "agent session prefix";
 
     const chip = waitAssistantChip(app, win_id, true, 30_000) orelse {
         shotTo(allocator, app, win_id, "zig-out/smoke-e2e-localterm-nochip.png");
@@ -3967,18 +3997,25 @@ fn assistantLocalTermStage(allocator: std.mem.Allocator, app: *appdrive.App, soc
     if (openPopup(app) != null) return "a popup was already open before the chip click";
     app.click(win_id, chip.x + chip.w / 2, chip.y + chip.h / 2, 1) catch return "clicking the assistant chip failed";
     const pop_id = waitPopup(app, true, 10_000) orelse return "the assistant chip opened no popover";
-    const watch = waitOcrRowAction(allocator, app, pop_id, "claude-1", "Watch", 15_000) orelse {
+    const watch = waitOcrRowAction(allocator, app, pop_id, agent, "Watch", 15_000) orelse {
         shotTo(allocator, app, pop_id, "zig-out/smoke-e2e-localterm-popover.png");
-        return "no Watch button on the local claude-1 row (see zig-out/smoke-e2e-localterm-popover.png)";
+        return whyf("no Watch button on the local {s} row (see zig-out/smoke-e2e-localterm-popover.png)", .{agent});
     };
     app.click(pop_id, watch.x, watch.y, 1) catch return "clicking Watch failed";
     const pane = waitNewPaneText(allocator, sock_path, keep_ids[0..keep_n], &.{}, "manual mode on", 30_000) orelse {
         shotTo(allocator, app, win_id, "zig-out/smoke-e2e-localterm-watch.png");
-        return "Watch opened no pane showing the local claude-1 (see zig-out/smoke-e2e-localterm-watch.png)";
+        return whyf("Watch opened no pane showing the local {s} (see zig-out/smoke-e2e-localterm-watch.png)", .{agent});
     };
-    if (watchedTerminalIsReadOnly(allocator, app, sock_path, win_id, pane, log_path, "agent-claude-1 ", "lw", "zig-out/smoke-e2e-watch-readonly-local.png")) |why| return why;
+    if (watchedTerminalIsReadOnly(allocator, app, sock_path, win_id, pane, log_path, who, "lw", "zig-out/smoke-e2e-watch-readonly-local.png")) |why| return why;
 
     closeAddedPanes(allocator, sock_path, app, keep_ids[0..keep_n]);
+    // The agent outlives its server: stop it, or its session lingers in
+    // every later stage's Session Overview.
+    {
+        var close_buf: [128]u8 = undefined;
+        const close_args = std.fmt.bufPrint(&close_buf, "{{\"agent\":\"{s}\"}}", .{agent}) catch return "agent_close args";
+        _ = mcpCallReply(&m, "agent_close", close_args, 30_000) orelse return "agent_close on the local MCP timed out";
+    }
     m.close();
     m_open = false;
     if (waitAssistantChip(app, win_id, false, 30_000) == null) return "the chip survived the local assistant exiting";
@@ -17490,6 +17527,20 @@ fn mcpNum(reply: []const u8, comptime name: []const u8) ?u32 {
         parseNumAfter(reply, "\\\"" ++ name ++ "\\\":");
 }
 
+/// The string after `"name":"` in an MCP reply, either lane, copied into `buf`.
+fn mcpStr(reply: []const u8, comptime name: []const u8, buf: []u8) ?[]const u8 {
+    inline for (.{ "\"" ++ name ++ "\":\"", "\\\"" ++ name ++ "\\\":\\\"" }) |key| {
+        if (std.mem.indexOf(u8, reply, key)) |at| {
+            const rest = reply[at + key.len ..];
+            const end = std.mem.indexOfAny(u8, rest, "\"\\") orelse return null;
+            if (end > buf.len) return null;
+            @memcpy(buf[0..end], rest[0..end]);
+            return buf[0..end];
+        }
+    }
+    return null;
+}
+
 /// How many times an MCP reply carries `fragment`, counted in whichever
 /// lane holds it (the two spellings never overlap, so the larger count
 /// is the lane that carries the fact).
@@ -17650,6 +17701,11 @@ fn mcpCallReply(m: *McpChild, name: []const u8, args: []const u8, timeout_ms: i6
 
 /// Start one fake host's per-user daemon under its own runtime dir.
 fn startFakeHostDaemon(host_rt: [:0]const u8, log_path: [:0]const u8) ?c.pid_t {
+    var sock_buf: [512:0]u8 = undefined;
+    const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/sketerm/mux.sock", .{host_rt}) catch return null;
+    // An earlier stage's daemon here is gone: its socket file must not
+    // pass for this one's.
+    _ = c.unlink(sock.ptr);
     const pid = c.fork();
     if (pid < 0) return null;
     if (pid == 0) {
@@ -17664,8 +17720,6 @@ fn startFakeHostDaemon(host_rt: [:0]const u8, log_path: [:0]const u8) ?c.pid_t {
         _ = c.execv("zig-out/bin/sketerm-mux", @ptrCast(@constCast(&argv)));
         c._exit(127);
     }
-    var sock_buf: [512:0]u8 = undefined;
-    const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/sketerm/mux.sock", .{host_rt}) catch return pid;
     var waited: u32 = 0;
     while (c.access(sock.ptr, c.F_OK) != 0 and waited < 200) : (waited += 1) _ = c.usleep(50_000);
     return pid;
@@ -17700,6 +17754,32 @@ fn spawnHostMcp(allocator: std.mem.Allocator, host_rt: [:0]const u8, path_env: [
     return .{ .pid = pid, .to_child = in_pipe[1], .from_child = out_pipe[0], .allocator = allocator };
 }
 
+/// Lower-cased, with the glyphs OCR confuses folded together (`o`/`0`,
+/// `l`/`i`/`1`, `s`/`5`, `b`/`8`, `z`/`2`): minted ids mix letters and
+/// digits freely, and one misread character must not hide a row.
+fn ocrFold(ch: u8) u8 {
+    return switch (std.ascii.toLower(ch)) {
+        'o' => '0',
+        'l', 'i', '|' => '1',
+        's' => '5',
+        'b' => '8',
+        'z' => '2',
+        else => |l| l,
+    };
+}
+
+/// Whether OCR text `hay` contains `needle`, modulo `ocrFold`.
+fn ocrContains(hay: []const u8, needle: []const u8) bool {
+    if (needle.len > hay.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= hay.len) : (i += 1) {
+        for (needle, 0..) |ch, j| {
+            if (ocrFold(hay[i + j]) != ocrFold(ch)) break;
+        } else return true;
+    }
+    return false;
+}
+
 /// The OCR word `action` on the same row as the first word containing
 /// `row` (nearest vertically), from one recognition pass.
 fn waitOcrRowAction(allocator: std.mem.Allocator, app: *appdrive.App, win_id: u32, row: []const u8, action: []const u8, timeout_ms: i64) ?OcrPoint {
@@ -17719,7 +17799,7 @@ fn waitOcrRowAction(allocator: std.mem.Allocator, app: *appdrive.App, win_id: u3
         const result = ocr.recognize(arena.allocator(), px, shot.w * scale, shot.h * scale, .{ .psm = 11 }) catch continue;
         var row_y: ?f64 = null;
         for (result.words) |w| {
-            if (std.ascii.indexOfIgnoreCase(w.text, row) == null) continue;
+            if (!ocrContains(w.text, row)) continue;
             row_y = @as(f64, @floatFromInt(w.y * 2 + w.h)) / (2 * scale);
             break;
         }
@@ -17727,7 +17807,7 @@ fn waitOcrRowAction(allocator: std.mem.Allocator, app: *appdrive.App, win_id: u3
         var best: ?OcrPoint = null;
         var best_d: f64 = 1e9;
         for (result.words) |w| {
-            if (std.ascii.indexOfIgnoreCase(w.text, action) == null) continue;
+            if (!ocrContains(w.text, action)) continue;
             const p: OcrPoint = .{
                 .x = @as(f64, @floatFromInt(w.x * 2 + w.w)) / (2 * scale),
                 .y = @as(f64, @floatFromInt(w.y * 2 + w.h)) / (2 * scale),
@@ -17784,44 +17864,284 @@ fn focusPane(allocator: std.mem.Allocator, sock_path: [:0]const u8, id: u32) voi
     if (roundtrip(allocator, sock_path, req)) |r| allocator.free(r);
 }
 
-/// Watch-along across hosts, through the real GUI: a pane muxed into
-/// fake host `hosta` (the fake ssh runs each host under its own runtime
-/// dir), on which a real `sketerm mcp` runs one sub-agent locally and
-/// one on `hostb`'s daemon. hosta's `assistants` report must put both
-/// in the Session Overview and the tab-bar popover with their hosts;
-/// Watch shows the hosta agent's screen without the lease; Take control on the hostb agent (through `route:hosta/hostb`)
-/// carries typed text to the fake; the server exiting retires the chip.
-fn assistantRemoteStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]const u8, rt: []const u8) ?[]const u8 {
+/// The remote web watch page: animated colourful noise whose channels
+/// stay inside 80..176 (so no noise pixel passes `isBlue`/`isLime`), and
+/// a solid blue target that a trusted press turns lime and renames.
+const remote_watch_page = "<html><head><title>rwatch:ready</title><style>html,body{margin:0;overflow:hidden;background:#808080}" ++
+    "canvas{position:fixed;left:0;top:0;width:100%;height:100%}#t{position:fixed;left:30%;top:35%;width:40%;height:40%;background:#0000ff}</style></head>" ++
+    "<body><canvas id=c width=320 height=200></canvas><div id=t></div><script>" ++
+    "t.onmousedown=function(){t.style.background='#00ff00';document.title='rwatch:clicked'};" ++
+    "var x=c.getContext('2d'),d=x.createImageData(320,200),u=new Uint32Array(d.data.buffer);" ++
+    "function v(){return 80+((Math.random()*96)|0)}" ++
+    "function f(){for(var i=0;i<u.length;i++)u[i]=0xff000000|(v()<<16)|(v()<<8)|v();x.putImageData(d,0,0);requestAnimationFrame(f)}requestAnimationFrame(f)</script></body></html>";
+
+fn isBlue(r: i32, g: i32, b: i32) bool {
+    return r < 60 and g < 60 and b > 200;
+}
+
+/// Pixels that differ between two same-sized RGBA shots inside `box`.
+fn changedPixels(a: appdrive.App.RgbaShot, b: appdrive.App.RgbaShot, box: ChipBox) usize {
+    if (a.w != b.w or a.h != b.h) return 0;
+    const x0: usize = @intFromFloat(@max(box.x, 0));
+    const y0: usize = @intFromFloat(@max(box.y, 0));
+    const x1: usize = @min(@as(usize, a.w), @as(usize, @intFromFloat(box.x + box.w)));
+    const y1: usize = @min(@as(usize, a.h), @as(usize, @intFromFloat(box.y + box.h)));
+    var n: usize = 0;
+    var y = y0;
+    while (y < y1) : (y += 1) {
+        var x = x0;
+        while (x < x1) : (x += 1) {
+            const i = (y * a.w + x) * 4;
+            if (!std.mem.eql(u8, a.px[i..][0..3], b.px[i..][0..3])) n += 1;
+        }
+    }
+    return n;
+}
+
+/// A REMOTE assistant's browser through the real GUI: `sketerm mcp` on
+/// fake host `hosta` opens an animated page; the GUI reaches hosta over
+/// the fake ssh, the badge's Show beside pane places the watch BESIDE the
+/// selected hosta pane (same tab, no new tab), the bridged observer opts
+/// into encoded frames with a video codec offered (and decodes a video
+/// tile, where codecs load), the page visibly animates and shows its
+/// solid blue target, a read-only click changes nothing, and after Take
+/// control a click turns the target lime and renames the page.
+fn assistantRemoteWebWatchStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]const u8, rt: []const u8) ?[]const u8 {
     if (!@import("util/ocr.zig").available()) {
-        say("SKIP assistant remote watch: tesseract unavailable; the popover is driven by OCR");
+        say("SKIP assistant remote web watch: tesseract unavailable; the popover is driven by OCR");
         return null;
     }
     if (app.windows.items.len == 0) return "the display session lost its window";
     const win_id = mainWin(app).id;
-    if (assistantChipBox(app, win_id) != null) return "an assistant chip was already showing before the remote stage";
+    if (assistantChipBox(app, win_id) != null) return "an assistant chip was already showing before the remote web watch stage";
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+    const log_from = fileLen(WATCH_GUI_LOG);
 
-    // ── two fake hosts, each its own runtime dir and sketerm-mux ──
-    var mux_abs_buf: [4096]u8 = undefined;
-    const mux_abs = std.mem.span(@as([*:0]const u8, @ptrCast(c.realpath("zig-out/bin/sketerm-mux", &mux_abs_buf) orelse return "realpath sketerm-mux")));
-    var self_buf: [4096]u8 = undefined;
-    const self_exe = std.mem.span(@as([*:0]const u8, @ptrCast(c.realpath("/proc/self/exe", &self_buf) orelse return "realpath of the rig binary")));
-    const host_rt = [_][:0]const u8{
-        std.fmt.allocPrintSentinel(arena, "{s}/ha", .{rt}, 0) catch return "oom",
-        std.fmt.allocPrintSentinel(arena, "{s}/hb", .{rt}, 0) catch return "oom",
-    };
-    for (host_rt) |h| {
-        _ = c.mkdir(h.ptr, 0o700);
-        const bin = std.fmt.allocPrintSentinel(arena, "{s}/bin", .{h}, 0) catch return "oom";
-        _ = c.mkdir(bin.ptr, 0o700);
-        const mux = std.fmt.allocPrintSentinel(arena, "{s}/sketerm-mux", .{bin}, 0) catch return "oom";
-        _ = c.unlink(mux.ptr);
-        if (c.symlink((arena.dupeZ(u8, mux_abs) catch return "oom").ptr, mux.ptr) != 0) return "linking a fake host's sketerm-mux";
-    }
-    const route_ssh = std.fmt.allocPrintSentinel(arena, "{s}/route-ssh", .{rt}, 0) catch return "oom";
+    var keep_ids: [64]u32 = undefined;
+    var keep_n: usize = 0;
     {
+        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse return "list before the remote web watch stage failed";
+        defer allocator.free(r);
+        keep_n = listPaneIds(r, &keep_ids);
+    }
+    const page = std.fmt.allocPrintSentinel(arena, "{s}/remote-watch.html", .{rt}, 0) catch return "oom";
+    if (!writeFile(page, remote_watch_page)) return "could not write the remote watch page";
+
+    var hosts = FakeHosts.start(arena, rt) orelse return "could not set up the fake hosts hosta and hostb";
+    defer hosts.stop();
+    var web_bin_buf: [4096]u8 = undefined;
+    const web_bin = c.realpath("zig-out/bin/sketerm-webengine", &web_bin_buf) orelse
+        return "could not resolve sketerm-webengine for the remote web watch stage";
+    _ = c.setenv("SKETERM_WEB_BIN", web_bin, 1);
+    defer _ = c.unsetenv("SKETERM_WEB_BIN");
+    var m = spawnHostMcp(allocator, hosts.rt[0], hosts.path_env, hosts.log_path) orelse return "could not spawn `sketerm mcp` on hosta";
+    var m_open = true;
+    defer if (m_open) m.close();
+    if (!m.initialize()) return "hosta's MCP server never answered initialize";
+    const open_args = std.fmt.allocPrint(arena, "{{\"name\":\"Remote review\",\"url\":\"file://{s}\",\"timeout_ms\":45000,\"snapshot\":\"none\"}}", .{page}) catch return "oom";
+    {
+        const opened = m.call("web_open", open_args, 90_000) orelse return "web_open on hosta timed out";
+        if (mcpHas(opened, "isError")) return whyf("web_open on hosta failed: {s}", .{opened[0..@min(opened.len, 400)]});
+    }
+    say("assistant remote web watch: hosta's MCP server opened the animated page");
+
+    // ── the GUI talks to hosta: a durable pane there, the destination ──
+    {
+        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"new-durable-tab\",\"host\":\"ssh:hosta\"}\n") orelse return "opening a pane on hosta failed";
+        defer allocator.free(r);
+        if (std.mem.indexOf(u8, r, "\"ok\":true") == null) return whyf("opening a pane on hosta was refused: {s}", .{r[0..@min(r.len, 200)]});
+    }
+    var source: u32 = 0;
+    {
+        var waited: u32 = 0;
+        while (waited < 20_000 and source == 0) : (waited += 250) {
+            pumpFor(app, 250);
+            const r = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse continue;
+            defer allocator.free(r);
+            var now: [64]u32 = undefined;
+            const n = listPaneIds(r, &now);
+            for (now[0..n]) |id| if (!contains(keep_ids[0..keep_n], id)) {
+                source = id;
+            };
+        }
+        if (source == 0) return "the hosta pane never appeared";
+    }
+    const tabs_base = tabCount(allocator, sock_path) orelse return "tab count unavailable";
+    if (!wsFocus(allocator, sock_path, source)) return "could not focus the hosta pane";
+    pumpFor(app, 300);
+
+    // ── the badge: Show beside pane on the remote browser ──
+    const chip = waitAssistantChip(app, win_id, true, 40_000) orelse {
+        shotTo(allocator, app, win_id, "zig-out/smoke-e2e-rwatch-nochip.png");
+        return "hosta's browsing assistant raised no chip (see zig-out/smoke-e2e-rwatch-nochip.png)";
+    };
+    if (openPopup(app) != null) return "a popup was already open before the remote web chip click";
+    app.click(win_id, chip.x + chip.w / 2, chip.y + chip.h / 2, 1) catch return "clicking the assistant chip failed";
+    const pop_id = waitPopup(app, true, 10_000) orelse return "the assistant chip opened no popover";
+    const beside = waitOcrWordCenter(allocator, app, pop_id, "beside", 20_000) orelse {
+        shotTo(allocator, app, pop_id, "zig-out/smoke-e2e-rwatch-popover.png");
+        return "the badge offered no Show beside pane for the remote browser (see zig-out/smoke-e2e-rwatch-popover.png)";
+    };
+    shotTo(allocator, app, pop_id, "zig-out/smoke-e2e-rwatch-popover.png");
+    app.click(pop_id, beside.x, beside.y, 1) catch return "clicking Show beside pane failed";
+
+    var web_pane: u32 = 0;
+    {
+        var waited: u32 = 0;
+        while (waited < 40_000 and web_pane == 0) : (waited += 250) {
+            pumpFor(app, 250);
+            const r = roundtrip(allocator, sock_path, "{\"cmd\":\"web-list\"}\n") orelse continue;
+            defer allocator.free(r);
+            const at = std.mem.indexOf(u8, r, "remote-watch.html") orelse continue;
+            const pane_at = std.mem.lastIndexOf(u8, r[0..at], "\"pane\":") orelse continue;
+            web_pane = parseNumAfter(r[pane_at..], "\"pane\":") orelse 0;
+        }
+    }
+    if (web_pane == 0) {
+        shotTo(allocator, app, win_id, "zig-out/smoke-e2e-rwatch-nopane.png");
+        return "Show beside pane opened no web pane showing the remote page (see zig-out/smoke-e2e-rwatch-nopane.png)";
+    }
+    {
+        // Beside: the selected pane's tab gained the viewer; no new tab.
+        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse return "list after Show beside pane failed";
+        defer allocator.free(r);
+        if (countTabs(r) != tabs_base) return "Show beside pane opened a new tab instead of a split";
+        const src_tab = tabOfPane(r, source) orelse return "the hosta pane's tab is not listed";
+        const web_tab = tabOfPane(r, web_pane) orelse return "the viewer pane's tab is not listed";
+        if (src_tab.id != web_tab.id) return whyf("the viewer landed in tab {d}, not beside the selected pane in tab {d}", .{ web_tab.id, src_tab.id });
+    }
+    say("assistant remote web watch: Show beside pane split the selected hosta pane's tab");
+
+    // ── the page is presented: its blue target, and it animates ──
+    const blue = waitColorBox(app, win_id, isBlue, 30_000) orelse {
+        shotTo(allocator, app, win_id, "zig-out/smoke-e2e-rwatch-noframe.png");
+        return "the remote page's blue target never painted (see zig-out/smoke-e2e-rwatch-noframe.png)";
+    };
+    shotTo(allocator, app, win_id, "zig-out/smoke-e2e-rwatch-beside.png");
+    {
+        // The noise band above the target: page pixels, never chrome.
+        const band: ChipBox = .{ .x = blue.x, .y = blue.y - blue.h * 0.5, .w = blue.w, .h = blue.h * 0.5 - 4 };
+        const first = app.snapshotRgba(win_id, null) catch return "snapshot failed";
+        defer allocator.free(first.px);
+        var moved: usize = 0;
+        var waited: u32 = 0;
+        const area: usize = @intFromFloat(band.w * band.h);
+        while (waited < 10_000 and moved * 4 < area) : (waited += 250) {
+            pumpFor(app, 250);
+            const next = app.snapshotRgba(win_id, null) catch continue;
+            defer allocator.free(next.px);
+            moved = changedPixels(first, next, band);
+        }
+        if (moved * 4 < area) return whyf("the remote page did not visibly animate: {d} of {d} pixels changed above its target", .{ moved, area });
+    }
+    say("assistant remote web watch: the page animates and shows its solid blue target");
+
+    // ── encoded frames, video offered on this bridged connection ──
+    var line_buf: [256]u8 = undefined;
+    var codecs: u32 = 0;
+    {
+        var waited: u32 = 0;
+        while (waited < 10_000 and logLineSince(allocator, WATCH_GUI_LOG, log_from, "takes encoded frames", &line_buf) == null) : (waited += 250) pumpFor(app, 250);
+        const line = logLineSince(allocator, WATCH_GUI_LOG, log_from, "takes encoded frames", &line_buf) orelse
+            return whyf("the GUI never opted the remote watch into encoded frames (no `takes encoded frames` in {s})", .{WATCH_GUI_LOG});
+        const comma = std.mem.lastIndexOf(u8, line, ", ") orelse return whyf("unexpected encoded-frames line `{s}`", .{line});
+        codecs = parseNumAfter(line[comma..], ", ") orelse return whyf("unexpected encoded-frames line `{s}`", .{line});
+    }
+    if (codecs == 0) {
+        say("SKIP assistant remote web watch video: no video codec decodes in this GUI (x264/libavcodec not loadable, or built without -Dvideo); encoded lossless frames only");
+    } else {
+        var waited: u32 = 0;
+        while (waited < 20_000 and logLineSince(allocator, WATCH_GUI_LOG, log_from, "decoded its first video tile", &line_buf) == null) : (waited += 250) pumpFor(app, 250);
+        if (logLineSince(allocator, WATCH_GUI_LOG, log_from, "decoded its first video tile", &line_buf) == null)
+            return whyf("{d} video codec(s) offered, but the animated remote page never decoded a video tile in the GUI ({s})", .{ codecs, WATCH_GUI_LOG });
+        var msg: [160]u8 = undefined;
+        say(std.fmt.bufPrint(&msg, "assistant remote web watch: encoded frames with {d} video codec(s) offered; the GUI decoded video tiles", .{codecs}) catch "video decoded");
+    }
+
+    // ── read-only, then Take control and click the target ──
+    const cx = blue.x + blue.w / 2;
+    const cy = blue.y + blue.h / 2;
+    app.click(win_id, cx, cy, 1) catch return "clicking the watched remote page failed";
+    if (waitColorBox(app, win_id, isLime, 2_500) != null) return "a read-only remote watch's click changed the assistant's page";
+    const take = waitPaneChip(app, win_id, 10_000) orelse {
+        shotTo(allocator, app, win_id, "zig-out/smoke-e2e-rwatch-notake.png");
+        return "the remote watch pane offered no Take control (see zig-out/smoke-e2e-rwatch-notake.png)";
+    };
+    app.clickEx(win_id, take.x + take.w - 12, take.y + take.h / 2, 1, 100, 1) catch return "clicking Take control failed";
+    {
+        var waited: u32 = 0;
+        var narrowed = false;
+        while (waited < 10_000 and !narrowed) : (waited += 200) {
+            pumpFor(app, 200);
+            if (paneChipBox(app, win_id)) |now| narrowed = now.w + 20 < take.w else narrowed = true;
+        }
+        if (!narrowed) return "Take control did not flip the remote watch's lease chip";
+    }
+    var lime: ?ChipBox = null;
+    {
+        var waited: u32 = 0;
+        while (waited < 15_000 and lime == null) : (waited += 500) {
+            app.click(win_id, cx, cy, 1) catch return "clicking the controlled remote page failed";
+            lime = waitColorBox(app, win_id, isLime, 500);
+        }
+    }
+    if (lime == null) {
+        shotTo(allocator, app, win_id, "zig-out/smoke-e2e-rwatch-nocontrol.png");
+        return "a click after Take control did not change the remote page (see zig-out/smoke-e2e-rwatch-nocontrol.png)";
+    }
+    {
+        const title = m.call("web_eval", "{\"code\":\"document.title\"}", 30_000) orelse return "web_eval on hosta timed out";
+        if (!mcpHas(title, "rwatch:clicked")) return whyf("the remote page did not see the controlled click: {s}", .{title[0..@min(title.len, 300)]});
+    }
+    shotTo(allocator, app, win_id, "zig-out/smoke-e2e-rwatch-control.png");
+    say("assistant remote web watch: Take control's click reached the remote page (lime target, title rwatch:clicked)");
+
+    // The server exits while hosta's pane keeps its report coming, as in
+    // the agent stage: the chip must follow hosta's next report.
+    {
+        var buf: [64]u8 = undefined;
+        const req = std.fmt.bufPrint(&buf, "{{\"cmd\":\"close-pane\",\"pane\":{d}}}\n", .{web_pane}) catch return "fmt";
+        if (roundtrip(allocator, sock_path, req)) |r| allocator.free(r);
+        _ = app.waitIdle(200, 4_000);
+    }
+    m.close();
+    m_open = false;
+    if (waitAssistantChip(app, win_id, false, 40_000) == null) {
+        shotTo(allocator, app, win_id, "zig-out/smoke-e2e-rwatch-stale.png");
+        return "the chip survived hosta's browsing assistant exiting (see zig-out/smoke-e2e-rwatch-stale.png)";
+    }
+    closeAddedPanes(allocator, sock_path, app, keep_ids[0..keep_n]);
+    return null;
+}
+
+/// Two fake ssh hosts, `hosta` and `hostb`: each its own runtime dir
+/// and per-user `sketerm-mux`, reached through `<rt>/route-ssh` (which
+/// the rig's fake ssh hands both names to), plus a plain `ssh` on
+/// `path_env` for the agent tools' probe.
+const FakeHosts = struct {
+    rt: [2][:0]const u8,
+    path_env: [:0]const u8,
+    log_path: [:0]const u8,
+    pids: [2]c.pid_t,
+
+    fn start(arena: std.mem.Allocator, rt: []const u8) ?FakeHosts {
+        var mux_abs_buf: [4096]u8 = undefined;
+        const mux_abs = std.mem.span(@as([*:0]const u8, @ptrCast(c.realpath("zig-out/bin/sketerm-mux", &mux_abs_buf) orelse return null)));
+        const host_rt = [2][:0]const u8{
+            std.fmt.allocPrintSentinel(arena, "{s}/ha", .{rt}, 0) catch return null,
+            std.fmt.allocPrintSentinel(arena, "{s}/hb", .{rt}, 0) catch return null,
+        };
+        for (host_rt) |h| {
+            _ = c.mkdir(h.ptr, 0o700);
+            const bin = std.fmt.allocPrintSentinel(arena, "{s}/bin", .{h}, 0) catch return null;
+            _ = c.mkdir(bin.ptr, 0o700);
+            const mux = std.fmt.allocPrintSentinel(arena, "{s}/sketerm-mux", .{bin}, 0) catch return null;
+            _ = c.unlink(mux.ptr);
+            if (c.symlink((arena.dupeZ(u8, mux_abs) catch return null).ptr, mux.ptr) != 0) return null;
+        }
+        const route_ssh = std.fmt.allocPrintSentinel(arena, "{s}/route-ssh", .{rt}, 0) catch return null;
         const body = std.fmt.allocPrint(arena,
             \\#!/bin/sh
             \\if [ "$1" = "-G" ]; then printf 'hostname 127.0.0.1\n'; exit 0; fi
@@ -17841,28 +18161,63 @@ fn assistantRemoteStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_p
             \\export XDG_RUNTIME_DIR="$h" XDG_STATE_HOME="$h" XDG_CONFIG_HOME="$h" PATH="$h/bin:$PATH"
             \\exec /bin/sh -c "$*"
             \\
-        , .{ host_rt[0], host_rt[1] }) catch return "oom";
-        if (!writeFile(route_ssh, body)) return "writing the route ssh script";
-        if (c.chmod(route_ssh.ptr, 0o755) != 0) return "chmod the route ssh script";
-    }
-    // Plain `ssh` (the agent tools' probe) is the same dispatcher.
-    const fakebin = std.fmt.allocPrintSentinel(arena, "{s}/fb", .{rt}, 0) catch return "oom";
-    _ = c.mkdir(fakebin.ptr, 0o700);
-    {
-        const link = std.fmt.allocPrintSentinel(arena, "{s}/ssh", .{fakebin}, 0) catch return "oom";
+        , .{ host_rt[0], host_rt[1] }) catch return null;
+        if (!writeFile(route_ssh, body)) return null;
+        if (c.chmod(route_ssh.ptr, 0o755) != 0) return null;
+        // Plain `ssh` (the agent tools' probe) is the same dispatcher.
+        const fakebin = std.fmt.allocPrintSentinel(arena, "{s}/fb", .{rt}, 0) catch return null;
+        _ = c.mkdir(fakebin.ptr, 0o700);
+        const link = std.fmt.allocPrintSentinel(arena, "{s}/ssh", .{fakebin}, 0) catch return null;
         _ = c.unlink(link.ptr);
-        if (c.symlink(route_ssh.ptr, link.ptr) != 0) return "linking the fake plain ssh";
+        if (c.symlink(route_ssh.ptr, link.ptr) != 0) return null;
+        const log_path = std.fmt.allocPrintSentinel(arena, "{s}/agent-prompts.log", .{rt}, 0) catch return null;
+        const path_env = std.fmt.allocPrintSentinel(arena, "{s}:{s}/bin:/usr/bin:/bin", .{ fakebin, host_rt[0] }, 0) catch return null;
+        const pid_a = startFakeHostDaemon(host_rt[0], log_path) orelse return null;
+        const pid_b = startFakeHostDaemon(host_rt[1], log_path) orelse {
+            stopPid(pid_a);
+            return null;
+        };
+        return .{ .rt = host_rt, .path_env = path_env, .log_path = log_path, .pids = .{ pid_a, pid_b } };
     }
-    const log_path = std.fmt.allocPrintSentinel(arena, "{s}/agent-prompts.log", .{rt}, 0) catch return "oom";
-    const pid_a = startFakeHostDaemon(host_rt[0], log_path) orelse return "could not start hosta's daemon";
-    const pid_b = startFakeHostDaemon(host_rt[1], log_path) orelse return "could not start hostb's daemon";
-    defer for ([_]c.pid_t{ pid_a, pid_b }) |p| {
+
+    fn stop(self: *FakeHosts) void {
+        for (self.pids) |p| stopPid(p);
+    }
+
+    fn stopPid(p: c.pid_t) void {
         _ = c.kill(p, c.SIGTERM);
         _ = c.waitpid(p, null, 0);
-    };
+    }
+};
+
+/// Watch-along across hosts, through the real GUI: a pane muxed into
+/// fake host `hosta` (the fake ssh runs each host under its own runtime
+/// dir), on which a real `sketerm mcp` runs one sub-agent locally and
+/// one on `hostb`'s daemon. hosta's `assistants` report must put both
+/// in the Session Overview and the tab-bar popover with their hosts;
+/// Watch shows the hosta agent's screen without the lease; Take control on the hostb agent (through `route:hosta/hostb`)
+/// carries typed text to the fake; the server exiting retires the chip.
+fn assistantRemoteStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]const u8, rt: []const u8) ?[]const u8 {
+    if (!@import("util/ocr.zig").available()) {
+        say("SKIP assistant remote watch: tesseract unavailable; the popover is driven by OCR");
+        return null;
+    }
+    if (app.windows.items.len == 0) return "the display session lost its window";
+    const win_id = mainWin(app).id;
+    if (assistantChipBox(app, win_id) != null) return "an assistant chip was already showing before the remote stage";
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var hosts = FakeHosts.start(arena, rt) orelse return "could not set up the fake hosts hosta and hostb";
+    defer hosts.stop();
+    const host_rt = hosts.rt;
+    const path_env = hosts.path_env;
+    const log_path = hosts.log_path;
+    var self_buf: [4096]u8 = undefined;
+    const self_exe = std.mem.span(@as([*:0]const u8, @ptrCast(c.realpath("/proc/self/exe", &self_buf) orelse return "realpath of the rig binary")));
 
     // ── hosta runs `sketerm mcp`: one agent there, one on hostb ──
-    const path_env = std.fmt.allocPrintSentinel(arena, "{s}:{s}/bin:/usr/bin:/bin", .{ fakebin, host_rt[0] }, 0) catch return "oom";
     var m = spawnHostMcp(allocator, host_rt[0], path_env, log_path) orelse return "could not spawn `sketerm mcp` on hosta";
     var m_open = true;
     defer if (m_open) m.close();
@@ -17874,7 +18229,12 @@ fn assistantRemoteStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_p
     const args_b = std.fmt.allocPrint(arena, "{{\"app\":\"claude\",\"host\":\"hostb\",\"binary\":{s},\"timeout_ms\":45000}}", .{bin_json}) catch return "oom";
     const open_b = arena.dupe(u8, mcpCallReply(&m, "agent_open", args_b, 90_000) orelse return "agent_open with host hostb timed out") catch return "oom";
     if (mcpHas(open_b, "\"isError\":true")) return whyf("agent_open on hostb failed: {s}", .{open_b[0..@min(open_b.len, 400)]});
-    say("assistant remote watch: hosta's MCP server runs claude-1 there and claude-2 on hostb");
+    // Agent ids are minted (`claude-xxxx`): read both off the replies.
+    var id_a_buf: [64]u8 = undefined;
+    var id_b_buf: [64]u8 = undefined;
+    const agent_a = mcpStr(open_a, "agent", &id_a_buf) orelse return "agent_open on hosta named no agent id";
+    const agent_b = mcpStr(open_b, "agent", &id_b_buf) orelse return "agent_open on hostb named no agent id";
+    say(std.fmt.allocPrint(arena, "assistant remote watch: hosta's MCP server runs {s} there and {s} on hostb", .{ agent_a, agent_b }) catch "agents up");
 
     // ── the GUI talks to hosta: a durable pane there ──
     var keep_ids: [64]u32 = undefined;
@@ -17938,7 +18298,10 @@ fn assistantRemoteStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_p
             }
         }
         const ov = ov_id orelse return "the Session Overview opened no window";
-        for ([_][]const u8{ "claude-1", "claude-2", "hostb" }) |word| {
+        // Tall enough that every available row is on screen for OCR.
+        app.resizeWindow(ov, 900, 1400) catch {};
+        _ = app.waitVisualSettle(ov, 400, 5_000, 0.1, null);
+        for ([_][]const u8{ agent_a, agent_b, "hostb" }) |word| {
             if (waitOcrRowAction(allocator, app, ov, word, word, 20_000) == null) {
                 shotTo(allocator, app, ov, "zig-out/smoke-e2e-remote-overview.png");
                 return whyf("the Session Overview does not show {s} (see zig-out/smoke-e2e-remote-overview.png)", .{word});
@@ -17947,10 +18310,10 @@ fn assistantRemoteStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_p
         shotTo(allocator, app, ov, "zig-out/smoke-e2e-remote-overview.png");
         app.closeWindow(ov) catch return "closing the Session Overview failed";
         pumpFor(app, 500);
-        say("assistant remote watch: the Session Overview lists claude-1 and claude-2 on hostb via hosta");
+        say("assistant remote watch: the Session Overview lists both agents, the second on hostb via hosta");
     }
 
-    // ── the popover: both agents by host, then Watch claude-1 ──
+    // ── the popover: both agents by host, then Watch hosta's ──
     if (openPopup(app) != null) return "a popup was already open before the remote chip click";
     app.click(win_id, chip.x + chip.w / 2, chip.y + chip.h / 2, 1) catch return "clicking the assistant chip failed";
     var pop_id = waitPopup(app, true, 10_000) orelse return "the assistant chip opened no popover";
@@ -17961,41 +18324,43 @@ fn assistantRemoteStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_p
         }
     }
     shotTo(allocator, app, pop_id, "zig-out/smoke-e2e-remote-popover.png");
-    const watch = waitOcrRowAction(allocator, app, pop_id, "claude-1", "Watch", 15_000) orelse
-        return "no Watch button on claude-1's row (see zig-out/smoke-e2e-remote-popover.png)";
+    const watch = waitOcrRowAction(allocator, app, pop_id, agent_a, "Watch", 15_000) orelse
+        return whyf("no Watch button on {s}'s row (see zig-out/smoke-e2e-remote-popover.png)", .{agent_a});
     app.click(pop_id, watch.x, watch.y, 1) catch return "clicking Watch failed";
     const watch_pane = waitNewPaneText(allocator, sock_path, keep_ids[0..keep_n], skip_ids[0..skip_n], "manual mode on", 30_000) orelse {
         shotTo(allocator, app, win_id, "zig-out/smoke-e2e-remote-watch.png");
-        return "Watch opened no pane showing claude-1's screen (see zig-out/smoke-e2e-remote-watch.png)";
+        return whyf("Watch opened no pane showing {s}'s screen (see zig-out/smoke-e2e-remote-watch.png)", .{agent_a});
     };
     skip_ids[skip_n] = watch_pane;
     skip_n += 1;
-    say("assistant remote watch: Watch shows claude-1's screen through route:hosta#<instance>");
-    if (watchedTerminalIsReadOnly(allocator, app, sock_path, win_id, watch_pane, log_path, "agent-claude-1 ", "rw", "zig-out/smoke-e2e-watch-readonly-remote.png")) |why| return why;
+    say("assistant remote watch: Watch shows hosta's agent screen through route:hosta#<instance>");
+    const who_a = std.fmt.allocPrint(arena, "agent-{s} ", .{agent_a}) catch return "oom";
+    if (watchedTerminalIsReadOnly(allocator, app, sock_path, win_id, watch_pane, log_path, who_a, "rw", "zig-out/smoke-e2e-watch-readonly-remote.png")) |why| return why;
 
-    // ── Take control of claude-2, placed on hostb, through hosta ──
+    // ── Take control of the agent placed on hostb, through hosta ──
     app.click(win_id, chip.x + chip.w / 2, chip.y + chip.h / 2, 1) catch return "clicking the assistant chip again failed";
     pop_id = waitPopup(app, true, 10_000) orelse return "the assistant chip opened no popover the second time";
-    const take = waitOcrRowAction(allocator, app, pop_id, "claude-2", "control", 15_000) orelse {
+    const take = waitOcrRowAction(allocator, app, pop_id, agent_b, "control", 15_000) orelse {
         shotTo(allocator, app, pop_id, "zig-out/smoke-e2e-remote-popover2.png");
-        return "no Take control button on claude-2's row (see zig-out/smoke-e2e-remote-popover2.png)";
+        return whyf("no Take control button on {s}'s row (see zig-out/smoke-e2e-remote-popover2.png)", .{agent_b});
     };
     app.click(pop_id, take.x, take.y, 1) catch return "clicking Take control failed";
     const ctl_pane = waitNewPaneText(allocator, sock_path, keep_ids[0..keep_n], skip_ids[0..skip_n], "manual mode on", 40_000) orelse {
         shotTo(allocator, app, win_id, "zig-out/smoke-e2e-remote-control.png");
-        return "Take control opened no pane showing claude-2's screen (see zig-out/smoke-e2e-remote-control.png)";
+        return whyf("Take control opened no pane showing {s}'s screen (see zig-out/smoke-e2e-remote-control.png)", .{agent_b});
     };
     focusPane(allocator, sock_path, ctl_pane);
     pumpFor(app, 500);
     app.typeText(null, "viagui\n") catch return "typing into the controlled pane failed";
+    const typed_b = std.fmt.allocPrint(arena, "agent-{s} viagui", .{agent_b}) catch return "oom";
     {
         var waited: u32 = 0;
-        while (waited < 15_000 and !logHas(allocator, log_path, "agent-claude-2 viagui")) : (waited += 250) pumpFor(app, 250);
+        while (waited < 15_000 and !logHas(allocator, log_path, typed_b)) : (waited += 250) pumpFor(app, 250);
     }
     shotTo(allocator, app, win_id, "zig-out/smoke-e2e-remote-control.png");
-    if (!logHas(allocator, log_path, "agent-claude-2 viagui"))
-        return "text typed after Take control never reached claude-2 on hostb (see zig-out/smoke-e2e-remote-control.png)";
-    say("assistant remote watch: Take control typed into claude-2 on hostb through route:hosta/hostb");
+    if (!logHas(allocator, log_path, typed_b))
+        return whyf("text typed after Take control never reached {s} on hostb (see zig-out/smoke-e2e-remote-control.png)", .{agent_b});
+    say("assistant remote watch: Take control typed into hostb's agent through route:hosta/hostb");
     // Routes are ssh end to end: no UDP upgrade, so no UDP notice anywhere.
     {
         var get_buf: [96]u8 = undefined;
