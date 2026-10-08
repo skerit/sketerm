@@ -1301,6 +1301,7 @@ pub fn refreshTitlebarCss(self: *Window) void {
         \\/* Ambient assistant chip at the end of the tab bar: same
         \\   accent family, clickable (it opens the watch popover). */
         \\.sketerm-assistant-chip {{
+        \\    background-image: none;
         \\    background-color: rgba(255, 120, 40, 0.92);
         \\    color: white;
         \\    font-weight: bold;
@@ -1310,7 +1311,7 @@ pub fn refreshTitlebarCss(self: *Window) void {
         \\    margin: 2px 6px;
         \\    min-height: 18px;
         \\}}
-        \\.sketerm-assistant-chip:hover {{ background-color: rgba(255, 140, 70, 1.0); }}
+        \\.sketerm-assistant-chip:hover {{ background-image: none; background-color: rgba(255, 140, 70, 1.0); }}
         \\
         \\/* Assistant-is-driving indicator: accent border on the
         \\   pane whose session has a headless MCP client attached,

@@ -50,9 +50,13 @@ const CSS: [:0]const u8 = blk: {
         \\    box-shadow: none;
         \\    border: none;
         \\
-    ++ "    background-color: " ++ hex(glance.CHIP_BG) ++ ";\n" ++
+    // `background-image: none`: GTK's built-in theme (GTK_THEME set,
+    // libadwaita's stylesheet off) paints buttons with an image, which
+    // covered this white and left the dark text on a dark button.
+    ++ "    background-image: none;\n" ++
+        "    background-color: " ++ hex(glance.CHIP_BG) ++ ";\n" ++
         "    color: " ++ hex(glance.CHIP_FG) ++ ";\n}\n" ++
-        ".sketerm-agents-chip > button:hover { background-color: #ececec; }\n" ++
+        ".sketerm-agents-chip > button:hover { background-image: none; background-color: #ececec; }\n" ++
         ".sketerm-agents-chip.sketerm-agents-idle > button { color: " ++ hex(glance.CHIP_FG_IDLE) ++ "; }\n" ++
         \\.sketerm-agents-pill { border-radius: 7px; padding: 0px 5px; margin-left: 2px; }
         \\.sketerm-agents-badge {
