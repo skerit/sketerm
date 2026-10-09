@@ -6643,6 +6643,210 @@ fn globalsDrive(cl: *Client) void {
     }
 }
 
+/// Stages 22k and 36 on the caller's fresh-a11y view `view_id`; run inline and by `SKETERM_SMOKE_WEB_A11Y_ONLY`.
+fn runA11yStages(cl: *Client) void {
+    // ── Stage 22j: the accessibility tree, only on demand ──────────
+    {
+        if (!cl.acks(.a11y)) fail("stage 22k a11y: hello_ack lacks the a11y capability");
+        const ax_page = "data:text/html,<html><body style='background:%23fff'>" ++
+            "<h1>Axheading</h1><button>Axgo</button>" ++
+            "<input type=checkbox checked aria-label=Axcheck>" ++
+            "<button disabled>Axoff</button></body></html>";
+        cl.navigate(ax_page);
+        // Backlog rule: nothing may stream before a11y_enable.
+        cl.pump(1_500);
+        if (cl.ax_seq != 0) fail("stage 22k a11y: tree events streamed before a11y_enable");
+        cl.send(proto.A11yEnable{ .view = view_id, .enabled = 1 });
+        const deadline = nowMs() + 20_000;
+        while (nowMs() < deadline) {
+            const log = cl.ax_log[0..cl.ax_log_len];
+            if (std.mem.indexOf(u8, log, "heading \"Axheading\"") != null and
+                std.mem.indexOf(u8, log, "button \"Axgo\"") != null and
+                std.mem.indexOf(u8, log, "document") != null) break;
+            cl.pump(100);
+        }
+        const log = cl.ax_log[0..cl.ax_log_len];
+        if (std.mem.indexOf(u8, log, "heading \"Axheading\"") == null or
+            std.mem.indexOf(u8, log, "button \"Axgo\"") == null)
+        {
+            std.debug.print("smoke-web: ax log was:\n{s}\n", .{log});
+            fail("stage 22k a11y: no heading/button nodes in the streamed tree");
+        }
+        if (std.mem.indexOf(u8, log, "document") == null)
+            fail("stage 22k a11y: no document root in the streamed tree");
+        // State-bit translation: checkedState -> ax_checked and
+        // restriction -> ax_disabled must survive the engine's
+        // serializer (these were designed from Chromium's enums; this
+        // is the assertion that keeps them true).
+        if (axLineState(log, "checkbox \"Axcheck\"")) |st| {
+            if (st & proto.ax_checked == 0) fail("stage 22k a11y: checked checkbox lacks the checked bit");
+        } else fail("stage 22k a11y: no checkbox node in the streamed tree");
+        if (axLineState(log, "button \"Axoff\"")) |st| {
+            if (st & proto.ax_disabled == 0) fail("stage 22k a11y: disabled button lacks the disabled bit");
+        } else fail("stage 22k a11y: no disabled-button node in the streamed tree");
+        // Disable stops the stream: churn the page and expect silence.
+        cl.send(proto.A11yEnable{ .view = view_id, .enabled = 0 });
+        cl.pump(500);
+        const seq_after_off = cl.ax_seq;
+        cl.navigate("data:text/html,<html><body style='background:%23fff'><p>quiet</p></body></html>");
+        cl.pump(1_500);
+        if (cl.ax_seq != seq_after_off)
+            fail("stage 22k a11y: tree events kept streaming after disable");
+        pass("stage 22k a11y (enable-gated tree, roles+names, disable silences)");
+    }
+
+    // ── Stage 36: a11y geometry drives real input; the caret is real ──
+    //
+    // The ENGINE half of screen-reader actions and braille. Stage 22k
+    // proved a tree arrives; this proves the two things a reader
+    // actually does with it:
+    //
+    //   a) PRESS. A projected `Action.DoAction` resolves the node to a
+    //      point and posts `input_pointer` — so this stage takes the
+    //      button's rect FROM THE STREAMED TREE, clicks its centre,
+    //      and requires the page's own handler to have run. That is
+    //      the whole routing, against a real engine: if AX geometry
+    //      were wrong or the click were synthetic, the count stays 0.
+    //   b) CARET. `ev_a11y_caret` must carry a real caret and a real
+    //      selection, and must COALESCE — Chromium restates tree_data
+    //      on every update, so an uncoalesced caret would post a frame
+    //      per unrelated tree change.
+    {
+        if (!cl.acks(.a11y_caret)) fail("stage 36 a11y: hello_ack lacks the a11y-caret capability");
+        const page = "data:text/html,<html><body style='background:%23fff;margin:0'>" ++
+            "<button id=b style='position:absolute;left:40px;top:60px;width:140px;height:44px'>Axpress</button>" ++
+            "<input id=t style='position:absolute;left:40px;top:160px;width:240px' value='Axcaret text'>" ++
+            "<div id=e contenteditable style='position:absolute;left:40px;top:220px;width:240px'>Axeditable text</div>" ++
+            "<script>window.hits=0;" ++
+            "document.getElementById('b').addEventListener('click',function(){window.hits++});" ++
+            "</script></body></html>";
+        cl.navigate(page);
+        // Re-enable after 22k turned it off; this also exercises the
+        // helper restating a caret it had already coalesced away.
+        cl.send(proto.A11yEnable{ .view = view_id, .enabled = 1 });
+
+        // Wait for the button to appear in the mirrored tree.
+        var btn: u32 = 0;
+        var field: u32 = 0;
+        const tree_deadline = nowMs() + 20_000;
+        while (nowMs() < tree_deadline and (btn == 0 or field == 0)) {
+            btn = axFindNode(cl, "button", "Axpress");
+            field = axFindNode(cl, "textbox", "");
+            if (btn != 0 and field != 0) break;
+            cl.pump(100);
+        }
+        if (btn == 0) {
+            std.debug.print("smoke-web: ax log was:\n{s}\n", .{cl.ax_log[0..cl.ax_log_len]});
+            fail("stage 36 a11y: the button never appeared in the streamed tree");
+        }
+        if (field == 0) fail("stage 36 a11y: the text field never appeared in the streamed tree");
+
+        // (a) Press it, exactly the way a projected DoAction does.
+        const r = axAbsRect(&cl.ax_mirror, btn) orelse
+            fail("stage 36 a11y: the button node carried no resolvable rect");
+        if (r[2] <= 0 or r[3] <= 0) fail("stage 36 a11y: the button node has an empty rect");
+        const cx = r[0] + @divTrunc(r[2], 2);
+        const cy = r[1] + @divTrunc(r[3], 2);
+        for ([_]proto.PointerKind{ .move, .down, .up }) |kind| {
+            cl.send(proto.InputPointer{
+                .view = view_id,
+                .kind = @intFromEnum(kind),
+                .x = cx,
+                .y = cy,
+                .button = 0,
+                .clicks = 1,
+                .mods = 0,
+            });
+        }
+        var pressed = false;
+        const press_deadline = nowMs() + 10_000;
+        while (nowMs() < press_deadline) {
+            cl.pump(100);
+            const js = cl.evalWait("window.hits", false, 5_000);
+            if (std.mem.indexOf(u8, js, "\"value\":1") != null) {
+                pressed = true;
+                break;
+            }
+        }
+        if (!pressed) {
+            std.debug.print("smoke-web: rect {d},{d} {d}x{d} -> click {d},{d}\n", .{ r[0], r[1], r[2], r[3], cx, cy });
+            fail("stage 36 a11y: a click at the AX node's centre never reached the page");
+        }
+
+        // (b) A real caret, then a real selection.
+        _ = cl.evalWait("(function(){var t=document.getElementById('t');t.focus();t.setSelectionRange(3,3);return 1})()", false, 5_000);
+        var caret_ok = false;
+        const caret_deadline = nowMs() + 15_000;
+        while (nowMs() < caret_deadline) {
+            cl.pump(150);
+            if (cl.ax_caret_seq != 0 and cl.ax_caret_focus_id != 0 and
+                cl.ax_caret_focus_off == 3 and cl.ax_caret_anchor_off == 3)
+            {
+                caret_ok = true;
+                break;
+            }
+        }
+        if (!caret_ok) {
+            std.debug.print(
+                "smoke-web: caret frames={d} focus_id={d} off={d} anchor={d}\n",
+                .{ cl.ax_caret_seq, cl.ax_caret_focus_id, cl.ax_caret_focus_off, cl.ax_caret_anchor_off },
+            );
+            fail("stage 36 a11y: no ev_a11y_caret reported the collapsed caret at offset 3");
+        }
+
+        // (c) SELECTION EXTENT: a MEASURED ENGINE CEILING, reported
+        // rather than asserted — the same shape as the Widevine probe.
+        //
+        // MEASURED on CEF 151.3.16 (2026-08-12): tree_data reports a
+        // text selection COLLAPSED to its anchor. Tried three ways and
+        // every caret frame came back anchor == focus:
+        //   - an <input> via setSelectionRange(2,6)  -> a=2@2 f=2@2
+        //   - a contenteditable via a DOM Range 2..6 -> a=5@2 f=5@2
+        //   - real shift+Right key events            -> no frame at all
+        // The node attributes carry no textSelStart/textSelEnd either.
+        //
+        // The wire, the mirror and org.a11y.atspi.Text all carry and
+        // serve a real range — smoke-webax proves that whole path
+        // against a live bus — so this is the ENGINE's half alone. A
+        // braille display following this browser gets the caret, not
+        // the selected range. Passing while saying so keeps the stage
+        // honest, and it starts announcing the day an engine reports
+        // an extent.
+        cl.ax_sel_seen = false;
+        _ = cl.evalWait("(function(){var t=document.getElementById('t');t.focus();t.setSelectionRange(2,6);return 1})()", false, 5_000);
+        cl.pump(1_500);
+        _ = cl.evalWait(
+            "(function(){var e=document.getElementById('e');e.focus();" ++
+                "var r=document.createRange();var n=e.firstChild;" ++
+                "r.setStart(n,2);r.setEnd(n,6);" ++
+                "var s=window.getSelection();s.removeAllRanges();s.addRange(r);return 1})()",
+            false,
+            5_000,
+        );
+        cl.pump(1_500);
+        if (cl.ax_sel_seen) {
+            say("smoke-web: NOTE stage 36 the engine now reports a selection EXTENT; the ceiling is gone");
+        } else {
+            say("smoke-web: NOTE stage 36 selection extent unavailable (CEF reports it collapsed) - caret only");
+        }
+        if (cl.ax_caret_seq == 0) fail("stage 36 a11y: no caret frame at all");
+
+        // Coalescing: churn the DOM without touching the caret and
+        // require silence on the caret channel.
+        const before = cl.ax_caret_seq;
+        _ = cl.evalWait("(function(){for(var i=0;i<12;i++){var d=document.createElement('p');d.textContent='churn'+i;document.body.appendChild(d)}return 1})()", false, 5_000);
+        cl.pump(2_500);
+        if (cl.ax_caret_seq != before) {
+            std.debug.print("smoke-web: caret frames {d} -> {d} on unrelated churn; every caret frame:\n{s}", .{ before, cl.ax_caret_seq, cl.ax_caret_log[0..cl.ax_caret_log_len] });
+            fail("stage 36 a11y: an unchanged caret was re-posted on unrelated tree churn");
+        }
+
+        cl.send(proto.A11yEnable{ .view = view_id, .enabled = 0 });
+        cl.pump(300);
+        pass("stage 36 a11y (AX rect drives a trusted click; caret reported and coalesced)");
+    }
+}
+
 fn runGlobalsStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) void {
     var http = HttpProbe{ .body = globals_page };
     if (!http.start()) fail("stage gl: HTTP fixture did not start");
@@ -8149,6 +8353,17 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     cl.navigate(red_page);
     if (!cl.waitCenterColor(.{ 0, 0, 255 }, 20_000)) fail("stage 2 paint: centre pixel never turned red");
     pass("stage 2 paint (memfd frame, centre pixel red)");
+    // Focused run for the accessibility family (stages 22k and 36),
+    // the READER_ONLY precedent.
+    if (c.getenv("SKETERM_SMOKE_WEB_A11Y_ONLY") != null) {
+        runA11yStages(&cl);
+        cl.send(proto.ViewDestroy{ .view = view_id });
+        cl.deinit();
+        reapHelperTimeout(pid, "a11y-only teardown", 15_000);
+        cleanup();
+        say("smoke-web: PASS (a11y only)");
+        return 0;
+    }
 
     // ── Stage 3: trusted click ────────────────────────────────────
     cl.navigate(click_page);
@@ -10125,206 +10340,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         if (!std.mem.eql(u8, bytes[0..n], download_bytes)) fail("staged download: wrong bytes");
     }
     pass("stage 22j3 staged download reports a private helper path and delivers exact bytes");
-    // ── Stage 22j: the accessibility tree, only on demand ──────────
-    {
-        if (!cl.acks(.a11y)) fail("stage 22k a11y: hello_ack lacks the a11y capability");
-        const ax_page = "data:text/html,<html><body style='background:%23fff'>" ++
-            "<h1>Axheading</h1><button>Axgo</button>" ++
-            "<input type=checkbox checked aria-label=Axcheck>" ++
-            "<button disabled>Axoff</button></body></html>";
-        cl.navigate(ax_page);
-        // Backlog rule: nothing may stream before a11y_enable.
-        cl.pump(1_500);
-        if (cl.ax_seq != 0) fail("stage 22k a11y: tree events streamed before a11y_enable");
-        cl.send(proto.A11yEnable{ .view = view_id, .enabled = 1 });
-        const deadline = nowMs() + 20_000;
-        while (nowMs() < deadline) {
-            const log = cl.ax_log[0..cl.ax_log_len];
-            if (std.mem.indexOf(u8, log, "heading \"Axheading\"") != null and
-                std.mem.indexOf(u8, log, "button \"Axgo\"") != null and
-                std.mem.indexOf(u8, log, "document") != null) break;
-            cl.pump(100);
-        }
-        const log = cl.ax_log[0..cl.ax_log_len];
-        if (std.mem.indexOf(u8, log, "heading \"Axheading\"") == null or
-            std.mem.indexOf(u8, log, "button \"Axgo\"") == null)
-        {
-            std.debug.print("smoke-web: ax log was:\n{s}\n", .{log});
-            fail("stage 22k a11y: no heading/button nodes in the streamed tree");
-        }
-        if (std.mem.indexOf(u8, log, "document") == null)
-            fail("stage 22k a11y: no document root in the streamed tree");
-        // State-bit translation: checkedState -> ax_checked and
-        // restriction -> ax_disabled must survive the engine's
-        // serializer (these were designed from Chromium's enums; this
-        // is the assertion that keeps them true).
-        if (axLineState(log, "checkbox \"Axcheck\"")) |st| {
-            if (st & proto.ax_checked == 0) fail("stage 22k a11y: checked checkbox lacks the checked bit");
-        } else fail("stage 22k a11y: no checkbox node in the streamed tree");
-        if (axLineState(log, "button \"Axoff\"")) |st| {
-            if (st & proto.ax_disabled == 0) fail("stage 22k a11y: disabled button lacks the disabled bit");
-        } else fail("stage 22k a11y: no disabled-button node in the streamed tree");
-        // Disable stops the stream: churn the page and expect silence.
-        cl.send(proto.A11yEnable{ .view = view_id, .enabled = 0 });
-        cl.pump(500);
-        const seq_after_off = cl.ax_seq;
-        cl.navigate("data:text/html,<html><body style='background:%23fff'><p>quiet</p></body></html>");
-        cl.pump(1_500);
-        if (cl.ax_seq != seq_after_off)
-            fail("stage 22k a11y: tree events kept streaming after disable");
-        pass("stage 22k a11y (enable-gated tree, roles+names, disable silences)");
-    }
-
-    // ── Stage 36: a11y geometry drives real input; the caret is real ──
-    //
-    // The ENGINE half of screen-reader actions and braille. Stage 22k
-    // proved a tree arrives; this proves the two things a reader
-    // actually does with it:
-    //
-    //   a) PRESS. A projected `Action.DoAction` resolves the node to a
-    //      point and posts `input_pointer` — so this stage takes the
-    //      button's rect FROM THE STREAMED TREE, clicks its centre,
-    //      and requires the page's own handler to have run. That is
-    //      the whole routing, against a real engine: if AX geometry
-    //      were wrong or the click were synthetic, the count stays 0.
-    //   b) CARET. `ev_a11y_caret` must carry a real caret and a real
-    //      selection, and must COALESCE — Chromium restates tree_data
-    //      on every update, so an uncoalesced caret would post a frame
-    //      per unrelated tree change.
-    {
-        if (!cl.acks(.a11y_caret)) fail("stage 36 a11y: hello_ack lacks the a11y-caret capability");
-        const page = "data:text/html,<html><body style='background:%23fff;margin:0'>" ++
-            "<button id=b style='position:absolute;left:40px;top:60px;width:140px;height:44px'>Axpress</button>" ++
-            "<input id=t style='position:absolute;left:40px;top:160px;width:240px' value='Axcaret text'>" ++
-            "<div id=e contenteditable style='position:absolute;left:40px;top:220px;width:240px'>Axeditable text</div>" ++
-            "<script>window.hits=0;" ++
-            "document.getElementById('b').addEventListener('click',function(){window.hits++});" ++
-            "</script></body></html>";
-        cl.navigate(page);
-        // Re-enable after 22k turned it off; this also exercises the
-        // helper restating a caret it had already coalesced away.
-        cl.send(proto.A11yEnable{ .view = view_id, .enabled = 1 });
-
-        // Wait for the button to appear in the mirrored tree.
-        var btn: u32 = 0;
-        var field: u32 = 0;
-        const tree_deadline = nowMs() + 20_000;
-        while (nowMs() < tree_deadline and (btn == 0 or field == 0)) {
-            btn = axFindNode(&cl, "button", "Axpress");
-            field = axFindNode(&cl, "textbox", "");
-            if (btn != 0 and field != 0) break;
-            cl.pump(100);
-        }
-        if (btn == 0) {
-            std.debug.print("smoke-web: ax log was:\n{s}\n", .{cl.ax_log[0..cl.ax_log_len]});
-            fail("stage 36 a11y: the button never appeared in the streamed tree");
-        }
-        if (field == 0) fail("stage 36 a11y: the text field never appeared in the streamed tree");
-
-        // (a) Press it, exactly the way a projected DoAction does.
-        const r = axAbsRect(&cl.ax_mirror, btn) orelse
-            fail("stage 36 a11y: the button node carried no resolvable rect");
-        if (r[2] <= 0 or r[3] <= 0) fail("stage 36 a11y: the button node has an empty rect");
-        const cx = r[0] + @divTrunc(r[2], 2);
-        const cy = r[1] + @divTrunc(r[3], 2);
-        for ([_]proto.PointerKind{ .move, .down, .up }) |kind| {
-            cl.send(proto.InputPointer{
-                .view = view_id,
-                .kind = @intFromEnum(kind),
-                .x = cx,
-                .y = cy,
-                .button = 0,
-                .clicks = 1,
-                .mods = 0,
-            });
-        }
-        var pressed = false;
-        const press_deadline = nowMs() + 10_000;
-        while (nowMs() < press_deadline) {
-            cl.pump(100);
-            const js = cl.evalWait("window.hits", false, 5_000);
-            if (std.mem.indexOf(u8, js, "\"value\":1") != null) {
-                pressed = true;
-                break;
-            }
-        }
-        if (!pressed) {
-            std.debug.print("smoke-web: rect {d},{d} {d}x{d} -> click {d},{d}\n", .{ r[0], r[1], r[2], r[3], cx, cy });
-            fail("stage 36 a11y: a click at the AX node's centre never reached the page");
-        }
-
-        // (b) A real caret, then a real selection.
-        _ = cl.evalWait("(function(){var t=document.getElementById('t');t.focus();t.setSelectionRange(3,3);return 1})()", false, 5_000);
-        var caret_ok = false;
-        const caret_deadline = nowMs() + 15_000;
-        while (nowMs() < caret_deadline) {
-            cl.pump(150);
-            if (cl.ax_caret_seq != 0 and cl.ax_caret_focus_id != 0 and
-                cl.ax_caret_focus_off == 3 and cl.ax_caret_anchor_off == 3)
-            {
-                caret_ok = true;
-                break;
-            }
-        }
-        if (!caret_ok) {
-            std.debug.print(
-                "smoke-web: caret frames={d} focus_id={d} off={d} anchor={d}\n",
-                .{ cl.ax_caret_seq, cl.ax_caret_focus_id, cl.ax_caret_focus_off, cl.ax_caret_anchor_off },
-            );
-            fail("stage 36 a11y: no ev_a11y_caret reported the collapsed caret at offset 3");
-        }
-
-        // (c) SELECTION EXTENT: a MEASURED ENGINE CEILING, reported
-        // rather than asserted — the same shape as the Widevine probe.
-        //
-        // MEASURED on CEF 151.3.16 (2026-08-12): tree_data reports a
-        // text selection COLLAPSED to its anchor. Tried three ways and
-        // every caret frame came back anchor == focus:
-        //   - an <input> via setSelectionRange(2,6)  -> a=2@2 f=2@2
-        //   - a contenteditable via a DOM Range 2..6 -> a=5@2 f=5@2
-        //   - real shift+Right key events            -> no frame at all
-        // The node attributes carry no textSelStart/textSelEnd either.
-        //
-        // The wire, the mirror and org.a11y.atspi.Text all carry and
-        // serve a real range — smoke-webax proves that whole path
-        // against a live bus — so this is the ENGINE's half alone. A
-        // braille display following this browser gets the caret, not
-        // the selected range. Passing while saying so keeps the stage
-        // honest, and it starts announcing the day an engine reports
-        // an extent.
-        cl.ax_sel_seen = false;
-        _ = cl.evalWait("(function(){var t=document.getElementById('t');t.focus();t.setSelectionRange(2,6);return 1})()", false, 5_000);
-        cl.pump(1_500);
-        _ = cl.evalWait(
-            "(function(){var e=document.getElementById('e');e.focus();" ++
-                "var r=document.createRange();var n=e.firstChild;" ++
-                "r.setStart(n,2);r.setEnd(n,6);" ++
-                "var s=window.getSelection();s.removeAllRanges();s.addRange(r);return 1})()",
-            false,
-            5_000,
-        );
-        cl.pump(1_500);
-        if (cl.ax_sel_seen) {
-            say("smoke-web: NOTE stage 36 the engine now reports a selection EXTENT; the ceiling is gone");
-        } else {
-            say("smoke-web: NOTE stage 36 selection extent unavailable (CEF reports it collapsed) - caret only");
-        }
-        if (cl.ax_caret_seq == 0) fail("stage 36 a11y: no caret frame at all");
-
-        // Coalescing: churn the DOM without touching the caret and
-        // require silence on the caret channel.
-        const before = cl.ax_caret_seq;
-        _ = cl.evalWait("(function(){for(var i=0;i<12;i++){var d=document.createElement('p');d.textContent='churn'+i;document.body.appendChild(d)}return 1})()", false, 5_000);
-        cl.pump(2_500);
-        if (cl.ax_caret_seq != before) {
-            std.debug.print("smoke-web: caret frames {d} -> {d} on unrelated churn\n", .{ before, cl.ax_caret_seq });
-            fail("stage 36 a11y: an unchanged caret was re-posted on unrelated tree churn");
-        }
-
-        cl.send(proto.A11yEnable{ .view = view_id, .enabled = 0 });
-        cl.pump(300);
-        pass("stage 36 a11y (AX rect drives a trusted click; caret reported and coalesced)");
-    }
+    runA11yStages(&cl);
 
     // ── Stage 28: cookies + site data ─────────────────────────────
     //
