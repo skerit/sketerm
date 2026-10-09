@@ -155,13 +155,15 @@ const Mcp = struct {
         while (true) {
             if (std.mem.indexOfScalar(u8, self.rbuf.items, '\n')) |nl| {
                 const line = self.rbuf.items[0..nl];
+                // A stable copy in the scratch buffer FIRST: the shift
+                // below overwrites `line` whenever a second reply arrived
+                // in the same read (deferred replies do that).
+                scratch_len = @min(line.len, scratch.len);
+                @memcpy(scratch[0..scratch_len], line[0..scratch_len]);
                 // Shift the remainder down for the next call.
                 const rest = self.rbuf.items[nl + 1 ..];
                 std.mem.copyForwards(u8, self.rbuf.items[0..rest.len], rest);
                 self.rbuf.shrinkRetainingCapacity(rest.len);
-                // Return a stable copy in a scratch buffer.
-                scratch_len = @min(line.len, scratch.len);
-                @memcpy(scratch[0..scratch_len], line[0..scratch_len]);
                 return scratch[0..scratch_len];
             }
             if (nowMs() > deadline) fail("timeout waiting for child reply");
