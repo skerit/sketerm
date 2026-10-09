@@ -1,5 +1,27 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-09: untrusted POST bodies go whole or are refused visibly
+
+A field report said untrusted browsing drops every POST body. Measured
+with a new truth table (`dist/test-web-untrusted.py` test_25, trusted
+control beside untrusted, page result against what a recording server
+received): string, JSON, URLSearchParams, ArrayBuffer, string FormData,
+XHR and a 512 KiB body all arrived intact. Three things were wrong. CEF
+151 hands a Blob, a FormData File part or a ReadableStream over as a
+`PDE_TYPE_EMPTY` element without flagging it excluded, and the loader
+took EMPTY as "no bytes": a Blob POST reached the server with an empty
+body, a multipart upload without its file part, both answered 200 to the
+page. No public CEF API reads that data pipe at interception, so such a
+request is now refused. An ArrayBuffer body the page left untyped was
+sent as `application/x-www-form-urlencoded` (curl's default), now
+untyped. And every refusal (cross-origin POST, the 1 MiB cap, those
+bodies, form POST navigations) showed in `web_network` as an unblocked
+row with `net::ERROR_-302`; a refusal decided before the broker sends
+anything is now `blocked:true` with its reason. Form POST navigations
+stay refused: CEF names a `null` initiator for every navigation, and the
+docs' "same-origin POST navigation" row was corrected to say so.
+`SKETERM_SMOKE_WEB_UNTRUSTED_POST_ONLY` runs the stage alone.
+
 ## 2026-10-09: every web reply states what it leaves behind
 
 Sub-agents sharing one browser could not tell from a reply whether what
