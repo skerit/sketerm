@@ -8,10 +8,10 @@
 //! assistants come from the `assistants` report in the list reply of
 //! every remote per-user daemon the window already talks to (a pane's or
 //! app session's host; capability `assistants`, absent = none): polled
-//! every `HOST_POLL_MS` over the host's pooled idle connection
-//! (`editorio.pool`, the one the Session Overview uses, which also feeds
-//! its own list replies in through `applyHostReport`). A remote server
-//! is keyed by the route to its instance daemon (`sshroute.watchSpec`,
+//! every `HOST_POLL_MS` over that pane's own session connection
+//! (`Terminal.requestHostList`), never a dial of its own; the Session
+//! Overview feeds its list replies in through `applyHostReport`. A
+//! remote server is keyed by the route to its instance daemon (`sshroute.watchSpec`,
 //! `route:A#key`), so two specs reaching one machine report it once,
 //! and the local daemon's report is never read (the registry covers this
 //! machine). A remote instance's OWN daemon is polled through its route
@@ -60,6 +60,7 @@ const a11y = @import("../a11y/atspi.zig");
 const winmod = @import("window.zig");
 const Window = winmod.Window;
 const Pane = @import("pane.zig").Pane;
+const Terminal = @import("../terminal.zig").Terminal;
 
 /// Slow fallback for a registry change the monitor missed (no GIO
 /// backend, a lost inotify event) and the roster refresh cadence.
@@ -69,10 +70,8 @@ const RESCAN_DEBOUNCE_MS: c_uint = 150;
 /// Bound on one daemon's `list` reply; past it the daemon reads as
 /// unavailable until the next tick.
 const LIST_TIMEOUT_MS: i64 = 5_000;
-/// A remote daemon's assistants report, over its pooled connection.
+/// A remote daemon's assistants report, over a session connection to it.
 const HOST_POLL_MS: i64 = 6_000;
-/// After a failed poll: a dead link must not spawn ssh every tick.
-const HOST_RETRY_MS: i64 = 30_000;
 /// A daemon without the `assistants` capability is asked again only
 /// this rarely (it may be upgraded and restarted).
 const HOST_UNSUPPORTED_MS: i64 = 120_000;
@@ -773,9 +772,10 @@ pub fn attachVerb(lease: muxtabs.Lease) AttachVerb {
 /// A remote daemon whose `assistants` report this window reads.
 const ReportHost = struct {
     spec: []u8,
-    busy: bool = false,
     seen: bool = true,
     next_ms: i64 = 0,
+    /// The `Terminal.hostList` reply number last read.
+    list_seq: u32 = 0,
 };
 
 /// Window-level registry watcher plus the tab-bar chip it drives.
@@ -1050,7 +1050,7 @@ pub const Watcher = struct {
 
     /// Track every remote daemon a pane or app session talks to, drop
     /// the hosts (and their assistants) the window left, and poll the
-    /// idle ones that are due.
+    /// due ones over a session connection that host already carries.
     fn pollHosts(self: *Watcher) void {
         for (self.hosts.items) |*h| h.seen = false;
         for (self.win.panes.items) |pane| {
@@ -1064,7 +1064,7 @@ pub const Watcher = struct {
         var i: usize = 0;
         while (i < self.hosts.items.len) {
             const h = &self.hosts.items[i];
-            if (h.seen or h.busy) {
+            if (h.seen) {
                 i += 1;
                 continue;
             }
@@ -1074,8 +1074,47 @@ pub const Watcher = struct {
         }
         const now = clock.nowMs();
         for (self.hosts.items) |*h| {
-            if (!h.busy and now >= h.next_ms) self.startReport(h);
+            const term = self.hostTerminal(h.spec) orelse continue;
+            if (term.hostList(h.list_seq)) |reply| {
+                h.list_seq = reply.seq;
+                self.applyListReply(h.spec, reply.payload);
+            }
+            if (now < h.next_ms) continue;
+            if (!term.remote.?.conn.caps.assistants) {
+                // An older daemon says nothing about assistants: none known.
+                h.next_ms = now + HOST_UNSUPPORTED_MS;
+                if (mergeReport(self.allocator, &self.roster, h.spec, &.{})) self.refreshChip();
+                continue;
+            }
+            if (term.requestHostList()) h.next_ms = now + HOST_POLL_MS;
         }
+    }
+
+    /// A live session connection to `spec`, which its pane or app session
+    /// already holds: the report rides it instead of a dial of its own.
+    fn hostTerminal(self: *Watcher, spec: []const u8) ?*Terminal {
+        for (self.win.panes.items) |pane| {
+            if (liveOn(pane.terminal, spec)) return pane.terminal;
+        }
+        for (self.win.app_sessions.items) |as| {
+            if (liveOn(as.terminal, spec)) return as.terminal;
+        }
+        return null;
+    }
+
+    fn liveOn(term: *Terminal, spec: []const u8) bool {
+        const remote = term.remote orelse return false;
+        const host = remote.host orelse return false;
+        return remote.canSend() and std.mem.eql(u8, host, spec);
+    }
+
+    fn applyListReply(self: *Watcher, spec: []const u8, payload: []const u8) void {
+        const parsed = std.json.parseFromSlice(ReportListing, self.allocator, payload, .{
+            .ignore_unknown_fields = true,
+            .allocate = .alloc_always,
+        }) catch return;
+        defer parsed.deinit();
+        self.applyHostReport(spec, parsed.value.assistants);
     }
 
     /// A list reply from `host` that someone (this watcher or the
@@ -1087,47 +1126,6 @@ pub const Watcher = struct {
         const h = self.findHost(spec) orelse return;
         h.next_ms = clock.nowMs() + HOST_POLL_MS;
         if (mergeReport(self.allocator, &self.roster, spec, reports)) self.refreshChip();
-    }
-
-    fn startReport(self: *Watcher, h: *ReportHost) void {
-        const allocator = std.heap.c_allocator;
-        const op = allocator.create(ReportOp) catch return;
-        op.* = .{ .watcher = self, .host = allocator.dupe(u8, h.spec) catch {
-            allocator.destroy(op);
-            return;
-        } };
-        op.conn = takeIdle(h.spec);
-        const thread = std.Thread.spawn(.{}, reportThreadMain, .{op}) catch {
-            op.destroy();
-            return;
-        };
-        thread.detach();
-        h.busy = true;
-        self.pending_ops += 1;
-    }
-
-    fn applyReportOp(self: *Watcher, op: *ReportOp) void {
-        const h = self.findHost(op.host) orelse return;
-        h.busy = false;
-        const now = clock.nowMs();
-        if (!op.ok) {
-            // Its assistants stay as last reported: the pane on that host
-            // shows the broken link, and a stale row's attach names why.
-            h.next_ms = now + HOST_RETRY_MS;
-            return;
-        }
-        if (op.conn) |conn| {
-            editorio.returnConn(op.host, conn);
-            op.conn = null;
-        }
-        if (!op.capable) {
-            // An older daemon says nothing about assistants: none known.
-            h.next_ms = now + HOST_UNSUPPORTED_MS;
-            if (mergeReport(self.allocator, &self.roster, op.host, &.{})) self.refreshChip();
-            return;
-        }
-        const reports = if (op.parsed) |p| p.value.assistants else &.{};
-        self.applyHostReport(op.host, reports);
     }
 
     // ── surfaces ────────────────────────────────────────────────
@@ -2056,88 +2054,6 @@ fn onFetchIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
 
 /// The `assistants` half of a list reply; the sessions are not read.
 const ReportListing = struct { assistants: []const mcp_registry.Report = &.{} };
-
-/// One `assistants` report poll of one remote daemon (C heap, like FetchOp).
-const ReportOp = struct {
-    watcher: *Watcher,
-    host: []u8,
-    conn: ?mux_client.Conn = null,
-    parsed: ?std.json.Parsed(ReportListing) = null,
-    /// The daemon advertises `assistants`; without it the reply is not read.
-    capable: bool = false,
-    ok: bool = false,
-    why_buf: [160]u8 = undefined,
-    why_len: usize = 0,
-
-    fn why(self: *const ReportOp) []const u8 {
-        return self.why_buf[0..self.why_len];
-    }
-
-    fn destroy(self: *ReportOp) void {
-        const allocator = std.heap.c_allocator;
-        if (self.conn) |*conn| conn.deinit();
-        if (self.parsed) |*parsed| parsed.deinit();
-        allocator.free(self.host);
-        allocator.destroy(self);
-    }
-
-    fn dial(self: *ReportOp) ?mux_client.Conn {
-        if (mux_cli.muxConnect(std.heap.c_allocator, self.host)) |conn| {
-            var cc = conn;
-            cc.setNonBlocking();
-            return cc;
-        }
-        const route_why = mux_client.routeFailure();
-        const text = if (route_why.len > 0) route_why else "host unreachable";
-        const n = @min(text.len, self.why_buf.len);
-        @memcpy(self.why_buf[0..n], text[0..n]);
-        self.why_len = n;
-        return null;
-    }
-
-    fn run(self: *ReportOp) bool {
-        const allocator = std.heap.c_allocator;
-        const conn = &self.conn.?;
-        self.capable = conn.caps.assistants;
-        if (!self.capable) {
-            self.ok = true;
-            return true;
-        }
-        conn.sendFrame(.list, "") catch return false;
-        const f = conn.recvExpectFor(&.{.welcome}, LIST_TIMEOUT_MS) catch return false;
-        defer f.deinit(allocator);
-        if (self.parsed) |*old| {
-            old.deinit();
-            self.parsed = null;
-        }
-        self.parsed = std.json.parseFromSlice(ReportListing, allocator, f.payload, .{
-            .ignore_unknown_fields = true,
-            .allocate = .alloc_always,
-        }) catch return false;
-        self.ok = true;
-        return true;
-    }
-};
-
-fn reportThreadMain(op: *ReportOp) void {
-    const reused = op.conn != null;
-    if (op.conn == null) op.conn = op.dial();
-    if (op.conn != null and !op.run() and reused) {
-        op.conn.?.deinit();
-        op.conn = op.dial();
-        if (op.conn != null) _ = op.run();
-    }
-    _ = c.g_idle_add(@ptrCast(&onReportIdle), @ptrCast(op));
-}
-
-fn onReportIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const op = cast.userData(ReportOp, user);
-    const self = op.watcher;
-    if (!self.dead) self.applyReportOp(op);
-    op.destroy();
-    _ = self.opDone();
-    return 0;
-}
 
 fn rosterFingerprint(sessions: []const mux_cli.SessionInfo) u64 {
     var hash: u64 = 0;

@@ -25,6 +25,9 @@ const profile_util = @import("util/profile.zig");
 const clock = @import("util/clock.zig");
 const diag = @import("util/diag.zig");
 
+/// An unanswered `requestHostList` is given up after this long.
+const HOST_LIST_TIMEOUT_MS: i64 = 15_000;
+
 fn nextReconnectDelay(delay_ms: u32) u32 {
     return @min(delay_ms * 2, 30_000);
 }
@@ -321,6 +324,12 @@ pub const Terminal = struct {
         /// requester can free its context unconditionally.
         pending_ticket_cb: ?*const fn (ctx: ?*anyopaque, ticket: ?mux_client.UdpTicket) void = null,
         pending_ticket_ctx: ?*anyopaque = null,
+        /// The newest `.list` reply this session's own connection carried
+        /// (owned; see `requestHostList`), numbered by `host_list_seq`.
+        host_list: ?[]u8 = null,
+        host_list_seq: u32 = 0,
+        /// When the unanswered `.list` went out; 0 = none in flight.
+        host_list_sent_ms: i64 = 0,
         watch_id: c_uint = 0,
         write_watch_id: c_uint = 0,
         idle_kick_id: c_uint = 0,
@@ -960,6 +969,7 @@ pub const Terminal = struct {
         self.endFsLease();
         remote.conn.deinit();
         remote.pending_record = 0;
+        remote.host_list_sent_ms = 0;
         self.failPendingTicket();
         self.cancelRemoteFileReads();
         self.cancelUploads();
@@ -1610,6 +1620,16 @@ pub const Terminal = struct {
                 }
             },
             .file_data => self.downloadData(frame.payload),
+            .welcome => {
+                // Only `requestHostList` asks for one after the handshake.
+                const remote = self.remote orelse return;
+                if (remote.host_list_sent_ms == 0) return;
+                remote.host_list_sent_ms = 0;
+                const copy = self.allocator.dupe(u8, frame.payload) catch return;
+                if (remote.host_list) |old| self.allocator.free(old);
+                remote.host_list = copy;
+                remote.host_list_seq +%= 1;
+            },
             .udp_ticket => {
                 const remote = self.remote orelse return;
                 const cb = remote.pending_ticket_cb orelse return;
@@ -2392,6 +2412,33 @@ pub const Terminal = struct {
             .err = m.@"error",
             .truncated = m.truncated,
         });
+    }
+
+    /// Ask this session's daemon for its `.list` reply over the session's
+    /// own connection, so a poller of the pane's host never dials it.
+    /// The reply is read with `hostList`; at most one is in flight, and an
+    /// unanswered one is given up after `HOST_LIST_TIMEOUT_MS`.
+    /// @return false when nothing was sent (no live link, or one in flight).
+    pub fn requestHostList(self: *Terminal) bool {
+        const remote = self.remote orelse return false;
+        if (!remote.isLive()) return false;
+        const now = clock.nowMs();
+        if (remote.host_list_sent_ms != 0 and now - remote.host_list_sent_ms < HOST_LIST_TIMEOUT_MS) return false;
+        remote.conn.sendFrame(.list, "") catch {
+            self.transportLost("list request write failed");
+            return false;
+        };
+        remote.host_list_sent_ms = now;
+        return true;
+    }
+
+    /// The newest `.list` reply `requestHostList` brought, unless its
+    /// number is still `seen`. The payload lives until the next reply.
+    pub fn hostList(self: *const Terminal, seen: u32) ?struct { seq: u32, payload: []const u8 } {
+        const remote = self.remote orelse return null;
+        const payload = remote.host_list orelse return null;
+        if (remote.host_list_seq == seen) return null;
+        return .{ .seq = remote.host_list_seq, .payload = payload };
     }
 
     /// Request the remote host's installed-app list. Reply → `on_apps`.
@@ -3375,6 +3422,7 @@ pub const Terminal = struct {
             if (remote.port_range.len > 0) self.allocator.free(remote.port_range);
             self.allocator.free(remote.tor_socks_endpoint);
             if (remote.pending_rename) |p| self.allocator.free(p);
+            if (remote.host_list) |l| self.allocator.free(l);
             self.allocator.free(remote.session);
             self.allocator.free(remote.origin_name);
             if (remote.origin_id.len > 0) self.allocator.free(remote.origin_id);
@@ -4115,6 +4163,56 @@ test "a lent file-service lane gets the fs frames the Terminal does not claim, a
     second.release();
     try testing.expect(remote.fs_lease == null);
     try testing.expectEqual(@as(usize, 1), lessee.lost);
+}
+
+test "a host list rides the session connection, one at a time, and keeps only a requested reply" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    var pair: [2]c_int = undefined;
+    try testing.expectEqual(@as(c_int, 0), platform.socketpairCloexec(&pair));
+    var remote = Terminal.Remote{
+        .conn = .{ .allocator = allocator, .fd = pair[0], .proto = mux_wire.PROTO_VERSION },
+        .session = @constCast("work"),
+        .origin_name = @constCast("work"),
+        .predictor = undefined,
+    };
+    defer {
+        if (remote.host_list) |l| allocator.free(l);
+        remote.conn.deinit();
+    }
+    remote.conn.setNonBlocking();
+    var peer = mux_client.Conn{ .allocator = allocator, .fd = pair[1], .proto = mux_wire.PROTO_VERSION };
+    defer peer.deinit();
+    var drain = DrainHandle{};
+    var term: Terminal = undefined;
+    term.allocator = allocator;
+    term.remote = &remote;
+    term.drain = &drain;
+    drain.terminal = &term;
+
+    // A welcome nobody asked for (a handshake echo) is not a reply.
+    term.handleRemoteFrame(.{ .ftype = .welcome, .payload = "{\"stray\":1}" });
+    try testing.expect(term.hostList(0) == null);
+
+    try testing.expect(term.requestHostList());
+    (try peer.recvExpectFor(&.{.list}, 1_000)).deinit(allocator);
+    try testing.expect(!term.requestHostList());
+    term.handleRemoteFrame(.{ .ftype = .welcome, .payload = "{\"assistants\":[]}" });
+    const reply = term.hostList(0) orelse return error.NoReply;
+    try testing.expectEqualStrings("{\"assistants\":[]}", reply.payload);
+    try testing.expect(term.hostList(reply.seq) == null);
+
+    // Answered, the next request goes out on the same connection.
+    try testing.expect(term.requestHostList());
+    (try peer.recvExpectFor(&.{.list}, 1_000)).deinit(allocator);
+    term.handleRemoteFrame(.{ .ftype = .welcome, .payload = "{\"assistants\":[{}]}" });
+    const next = term.hostList(reply.seq) orelse return error.NoReply;
+    try testing.expectEqualStrings("{\"assistants\":[{}]}", next.payload);
+
+    // No link, no request.
+    remote.connected = false;
+    try testing.expect(!term.requestHostList());
+    remote.connected = true;
 }
 
 test "a tagged mux error is never charged to an unrelated pending request" {
