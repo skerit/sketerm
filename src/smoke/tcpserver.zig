@@ -119,6 +119,10 @@ pub fn respondOk(afd: c_int, ctype: []const u8, body: []const u8, extra: []const
 }
 
 /// Any status: `status` is the line after the version ("404 Not Found").
+///
+/// MSG_NOSIGNAL, never write(2): a browser closes a connection it
+/// already has the bytes for (favicon probes especially), and the
+/// SIGPIPE that follows would kill the whole rig, not this one request.
 pub fn respond(afd: c_int, status: []const u8, ctype: []const u8, body: []const u8, extra: []const u8) void {
     var head: [512]u8 = undefined;
     const hdr = std.fmt.bufPrint(
@@ -126,8 +130,8 @@ pub fn respond(afd: c_int, status: []const u8, ctype: []const u8, body: []const 
         "HTTP/1.1 {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nCache-Control: no-store\r\n{s}Connection: close\r\n\r\n",
         .{ status, ctype, body.len, extra },
     ) catch return;
-    _ = c.write(afd, hdr.ptr, hdr.len);
-    _ = c.write(afd, body.ptr, body.len);
+    _ = c.send(afd, hdr.ptr, hdr.len, c.MSG_NOSIGNAL);
+    if (body.len > 0) _ = c.send(afd, body.ptr, body.len, c.MSG_NOSIGNAL);
 }
 
 /// The `extra` header block for a fixture that must be readable

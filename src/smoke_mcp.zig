@@ -3085,13 +3085,9 @@ const PolicyHttp = struct {
             body = "window.SUB_OK=1;";
         }
 
-        var head: [512]u8 = undefined;
-        const hdr = if (location.len > 0)
-            std.fmt.bufPrint(&head, "HTTP/1.1 {s}\r\nLocation: {s}\r\nContent-Length: 0\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n", .{ status, location }) catch return
-        else
-            std.fmt.bufPrint(&head, "HTTP/1.1 {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n", .{ status, ctype, body.len }) catch return;
-        _ = c.send(cfd, hdr.ptr, hdr.len, c.MSG_NOSIGNAL);
-        if (body.len > 0) _ = c.send(cfd, body.ptr, body.len, c.MSG_NOSIGNAL);
+        var extra_buf: [160]u8 = undefined;
+        const extra = if (location.len > 0) std.fmt.bufPrint(&extra_buf, "Location: {s}\r\n", .{location}) catch return else "";
+        tcpserver.respond(cfd, status, ctype, body, extra);
     }
 
     fn deinit(self: *PolicyHttp) void {
