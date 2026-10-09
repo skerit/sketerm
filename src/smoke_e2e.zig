@@ -6680,7 +6680,10 @@ fn offloadPolicyStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:
     const text_reply = roundtrip(allocator, sock, text_req) orelse return "offload text send failed";
     defer allocator.free(text_reply);
     if (!waitPaneText(allocator, sock, panes[1], "OFFLOADOK", 10_000)) return "offload survivor did not execute fresh input";
-    if (waitOcrWordCenter(allocator, app, mainWin(app).id, "OFFLOADOK", 10_000) == null) return "offload survivor text was not visible in rendered pixels";
+    if (waitOcrWordCenter(allocator, app, mainWin(app).id, "OFFLOADOK", 10_000) == null) {
+        shotTo(allocator, app, mainWin(app).id, "zig-out/smoke-e2e-offload-survivor.png");
+        return "offload survivor text was not visible in rendered pixels (see zig-out/smoke-e2e-offload-survivor.png)";
+    }
     say("offload remained enabled across renewal, tab/face switches, reload, Preferences restore and splits; fresh terminal text rendered");
     return null;
 }
@@ -7507,6 +7510,14 @@ fn viewerWaitOcr(allocator: std.mem.Allocator, app: *appdrive.App, win_id: u32, 
 
 const OcrPoint = struct { x: f64, y: f64 };
 
+/// An OCR word without the edge noise tesseract glues onto it.
+/// A pane's 2 px focus border or a bar cursor beside the first or last
+/// glyph reads as `|`, `[` or `]` (the full rig's 1100 px window put
+/// the border flush against `OFFLOADOK`, read as `|OFFLOADOK`).
+fn ocrWordCore(text: []const u8) []const u8 {
+    return std.mem.trim(u8, text, "|[](){}'\"`.,:;_~!");
+}
+
 fn waitOcrWordCenter(
     allocator: std.mem.Allocator,
     app: *appdrive.App,
@@ -7532,7 +7543,7 @@ fn waitOcrWordCenter(
         const px = png_util.upscaleRgba(arena.allocator(), shot.px, shot.w, shot.h, scale) catch continue;
         const result = ocr.recognize(arena.allocator(), px, shot.w * scale, shot.h * scale, .{ .psm = 11 }) catch continue;
         for (result.words) |found| {
-            if (!std.ascii.eqlIgnoreCase(found.text, word)) continue;
+            if (!std.ascii.eqlIgnoreCase(ocrWordCore(found.text), word)) continue;
             return .{
                 .x = @as(f64, @floatFromInt(found.x * 2 + found.w)) / (2 * scale),
                 .y = @as(f64, @floatFromInt(found.y * 2 + found.h)) / (2 * scale),
