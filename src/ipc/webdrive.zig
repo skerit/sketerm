@@ -93,6 +93,7 @@ const quarantine = @import("../web/quarantine.zig");
 const clock = @import("../util/clock.zig");
 const webprofiles = @import("webprofiles.zig");
 const webremote = @import("webprofilesremote.zig");
+const webpersist = @import("webpersist.zig");
 const netpolicy = @import("../web/netpolicy.zig");
 const download_policy = @import("../web/download.zig");
 const capture = @import("../web/capture.zig");
@@ -1460,6 +1461,33 @@ pub const Engine = struct {
         if (self.remote) |*r| return r.root;
         if (self.store) |*s| return s.root;
         return null;
+    }
+
+    /// Where the RUNNING helper keeps its data, which decides whether
+    /// the default identity persists. Mirrors the `--cache-dir` choice in
+    /// `ensure`; the broker spawns with its store root, and a sibling of a
+    /// broker-store instance shares it.
+    pub fn dataRoot(self: *Engine, arena: std.mem.Allocator) !webpersist.Root {
+        if (self.untrusted) return .private;
+        switch (self.owner) {
+            .none => return .{ .unknown = "no browser engine is running yet" },
+            .broker => {
+                if (self.remote) |*r| return .{ .durable = try arena.dupe(u8, r.root) };
+                return .{ .unknown = "the mux broker started this browser engine without a profile store this server knows" };
+            },
+            .adopted => {
+                if (self.remote) |*r| return .{ .durable = try arena.dupe(u8, r.root) };
+                return .{ .unknown = "this browser helper was started by another client of this instance; where it keeps its data is not known to this server" };
+            },
+            .self_spawned => {},
+        }
+        if (self.storeRoot()) |root| return .{ .durable = try arena.dupe(u8, root) };
+        var buf: [4096]u8 = undefined;
+        const cache = self.routePathZ(&buf, "-cache") orelse return .{ .unknown = "the helper's data directory path does not fit" };
+        return .{ .instance = .{
+            .path = try arena.dupe(u8, cache),
+            .why = try arena.dupe(u8, if (self.store_reason.len > 0) self.store_reason else "no durable profile store was opened"),
+        } };
     }
 
     /// The persisted id `name` must be opened with, whichever side

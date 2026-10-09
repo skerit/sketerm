@@ -22,6 +22,7 @@ const web = @import("mcp_web.zig");
 const webdrive = @import("webdrive.zig");
 const webfetch = @import("webfetch.zig");
 const webread = @import("webread.zig");
+const webpersist = @import("webpersist.zig");
 const webnav = @import("webnav.zig");
 const filter = @import("../web/filter.zig");
 const clock = @import("../util/clock.zig");
@@ -131,6 +132,8 @@ const Row = struct {
     truncated: bool = false,
     bytes: u64 = 0,
     path: ?[]const u8 = null,
+    /// Whether `path` survives this MCP instance; null without a file.
+    outlives_instance: ?bool = null,
     content_type: ?[]const u8 = null,
     matches: []const webread.Match = &.{},
     match_count: usize = 0,
@@ -647,8 +650,14 @@ fn answer(job: *Job) !void {
     var rows = try ar.alloc(Row, job.items.len);
     var queued_max: i64 = 0;
     var any_body = false;
+    var lost_files: usize = 0;
     for (job.items, 0..) |it, i| {
         rows[i] = it.row;
+        if (rows[i].path) |p| {
+            const keeps = try web.outlives(ar, p);
+            rows[i].outlives_instance = keeps;
+            if (!keeps) lost_files += 1;
+        }
         counts.getPtr(it.row.status).* += 1;
         queued_max = @max(queued_max, it.row.queued_ms);
         if (it.row.body != null or it.row.matches.len > 0) any_body = true;
@@ -665,10 +674,17 @@ fn answer(job: *Job) !void {
     try res.fact("peak_tabs", peak);
     try res.fact("queued_ms_max", queued_max);
     try res.fact("background_tabs", job.background_honoured);
+    // The fetch tabs browse in the engine's default identity: whatever a
+    // site sets lands in that jar.
+    const persist = try web.enginePersistence(ar, web.headlessEngine(), .default, "", 0);
+    try res.fact("persistence", persist);
     try res.textf("web_fetch: {d} url(s): {d} done, {d} failed, {d} timed out, {d} invalid; at most {d} tab(s) of this call open at once (per call {d}, server-wide {d}); the longest queue wait {d}ms", .{
         rows.len, counts.get(.done), counts.get(.failed), counts.get(.timed_out), counts.get(.invalid_url),
         peak, webfetch.PER_CALL_TABS, g_queue.cap, queued_max,
     });
+    try res.textf("fetch tabs browse in the default identity: {s}", .{try webpersist.sentence(ar, persist)});
+    if (lost_files > 0)
+        try res.textf("{d} saved file(s) {s} (to_dir keeps them)", .{ lost_files, webpersist.DIES_WITH_INSTANCE });
     if (!job.background_honoured)
         try res.text("this browser helper predates background tabs (view-flags): a user watching the assistant's browser may have seen the fetch tabs");
     for (rows) |r| {

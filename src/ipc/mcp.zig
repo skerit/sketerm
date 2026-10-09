@@ -979,7 +979,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     // lazily on first use). Isolated/durable modes only — --shared
     // explicitly asks for the user's GUI and has no instance dir.
     if (iso) |i| {
-        @import("mcp_web.zig").configureHeadless(allocator, i.dir, opts.name, i.sock, web_max_fps);
+        @import("mcp_web.zig").configureHeadless(allocator, i.dir, opts.name, i.sock, web_max_fps, !i.durable);
     }
     defer @import("mcp_web.zig").shutdownHeadless();
     // The web_gui grant: the web_* tools alone may use the user's own

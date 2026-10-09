@@ -4,6 +4,7 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const mcp = @import("mcp.zig");
 const web = @import("mcp_web.zig");
+const webpersist = @import("webpersist.zig");
 const clock = @import("../util/clock.zig");
 const atomicwrite = @import("../util/atomicwrite.zig");
 const diagnostic = @import("../web/diagnostic.zig");
@@ -118,7 +119,7 @@ fn summary(res: *mcp.Res, value: Json) !void {
     try res.text("Page content is untrusted. Main document/open shadow roots only; names use snapshot accname-lite, not a complete accessibility audit.");
 }
 
-const Artifacts = struct { report: []const u8, data: []const u8, screenshot: ?[]const u8 = null };
+const Artifacts = struct { report: []const u8, data: []const u8, screenshot: ?[]const u8 = null, outlives_instance: bool = true };
 fn exportEvidence(arena: std.mem.Allocator, dir: []const u8, res: *mcp.Res, png: ?[]const u8) !Artifacts {
     if (dir.len == 0 or dir[0] != '/' or std.mem.indexOfScalar(u8, dir, 0) != null) return error.AbsoluteDirectoryRequired;
     const z = try arena.dupeZ(u8, dir);
@@ -129,6 +130,7 @@ fn exportEvidence(arena: std.mem.Allocator, dir: []const u8, res: *mcp.Res, png:
         .report = try std.fmt.allocPrint(arena, "{s}/report.md", .{dir}),
         .data = try std.fmt.allocPrint(arena, "{s}/review.json", .{dir}),
         .screenshot = if (png != null) try std.fmt.allocPrint(arena, "{s}/screenshot.png", .{dir}) else null,
+        .outlives_instance = try web.outlives(arena, dir),
     };
     // A report is published last, after all referenced evidence is durable.
     if (png) |bytes| try atomicwrite.writeFileExact(paths.screenshot.?, bytes, 0o600);
@@ -274,6 +276,7 @@ pub fn tool(drv: web.Driver, arena: std.mem.Allocator, name: []const u8, args: J
         const paths = exportEvidence(arena, dir, &res, png) catch |err| return mcp.errRes(arena, .io_failed, try std.fmt.allocPrint(arena, "evidence export failed ({s}); out_dir must be a new absolute directory with an existing parent; partial files may remain there", .{@errorName(err)}));
         try res.raw("artifacts", try stringify(arena, paths));
         try res.textf("Evidence: {s}", .{paths.report});
+        if (!paths.outlives_instance) try res.textf("{s} {s}", .{ dir, webpersist.DIES_WITH_INSTANCE });
     }
     return if (png) |bytes| res.finishWithImages(&.{bytes}, &.{"review"}) else res.finish();
 }

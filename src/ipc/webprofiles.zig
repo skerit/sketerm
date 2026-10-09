@@ -75,6 +75,19 @@ pub const EPHEMERAL_BASE: u32 = @import("../web/protocol.zig").EPHEMERAL_CTX_BAS
 /// anything but ours.
 pub const JAR_PREFIX = "profile-";
 
+/// Where the engine keeps the DEFAULT identity's jar under its data root:
+/// Chromium's own profile directory. Measured, against the CEF header's
+/// "incognito when cache_path is empty": with `root_cache_path` set, the
+/// global context's cookies and localStorage land here and survive a
+/// graceful helper restart.
+pub const DEFAULT_JAR = "Default";
+
+/// `<root>/profile-<name>-<id>`, the jar the helper derives for a
+/// persistent context (the one spelling of that path).
+pub fn jarPathIn(buf: []u8, root: []const u8, name: []const u8, id: u32) error{NoSpaceLeft}![]const u8 {
+    return std.fmt.bufPrint(buf, "{s}/" ++ JAR_PREFIX ++ "{s}-{d}", .{ root, name, id });
+}
+
 /// Names reserved because they NAME the absence of a profile in the
 /// tools' own vocabulary; accepting them would make `profile:"default"`
 /// mean two different things.
@@ -252,8 +265,7 @@ pub const Store = struct {
     /// Absolute path of a profile's jar directory (the helper creates
     /// it; this is how the tools can report and erase it).
     pub fn jarPath(self: *const Store, buf: *[4096]u8, e: Entry) ![]const u8 {
-        return std.fmt.bufPrint(buf, "{s}/" ++ JAR_PREFIX ++ "{s}-{d}", .{ self.root, e.name, e.id }) catch
-            error.Io;
+        return jarPathIn(buf, self.root, e.name, e.id) catch error.Io;
     }
 
     /// What goes on the wire as `context_create.name`: the helper

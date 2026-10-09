@@ -213,6 +213,10 @@ pub const CAP_SITEDATA = "sitedata";
 /// periodic cadence of its own while it lingers past its last client.
 pub const CAP_FLUSH = "flush-store";
 
+/// The periodic jar flush of a `flush-store` helper (`Server.step`),
+/// declared here so the MCP side can state it as a fact.
+pub const FLUSH_INTERVAL_MS: i64 = 20_000;
+
 /// The helper reports `ev_scroll` and accepts `scroll_to` (0xC2 block),
 /// which is what lets session restore put a page back where it was.
 pub const CAP_SCROLL = "scroll";

@@ -297,6 +297,12 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
         // headless view answers them itself (fail closed, fingerprint
         // opt-in). A consumer must not have to hang once to learn that.
         try res.fact("web_cert_facts", true);
+        // What a web_* call leaves behind: every tab-scoped reply says
+        // whether its identity persists, every written file whether it
+        // outlives this instance.
+        const persist = try @import("mcp_web.zig").persistenceCapability(arena);
+        try res.fact("web_persistence", persist);
+        if (persist.default) |d| try res.text(try @import("webpersist.zig").sentence(arena, d)) else try res.text("web persistence: every tab-scoped web_* reply states whether its identity persists (persistence) and every written file whether it outlives this server (outlives_instance); the default identity's answer is known once a browser engine runs");
         // What a navigation produced, on web_open/web_navigate replies.
         try res.fact("web_nav_result", @import("mcp_web.zig").navResultCapability());
         try res.text("web_open and web_navigate report the navigation's outcome (page, http_error, network_error, aborted, replaced, download, blocked, non_http), HTTP status, final url, redirect chain and content type, and take wait:{for,arg} with web_wait's conditions");

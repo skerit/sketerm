@@ -1025,10 +1025,13 @@ over, and both are measured, not assumed:
   live under the helper's own cache dir. That client refuses a named
   profile outright unless BOTH `contexts` and `contexts-fail-closed`
   are advertised, because with only the first an unknown context
-  silently resolves through the shared jar. Context 0 stays an
-  in-memory jar in both modes (`settings.cache_path` is never set), so
-  without a profile nothing about a browsing session survives the
-  helper.
+  silently resolves through the shared jar. Context 0 is NOT an
+  in-memory jar, although `settings.cache_path` is never set and CEF's
+  header calls that "incognito": with `root_cache_path` set, the global
+  context's cookies and localStorage land in `<root>/Default` and
+  survive a graceful helper restart (measured 2026-10-09; smoke-mcp's
+  `webPersistStage` asserts it, and `flushProfileStores` flushes that
+  jar too). Only an ephemeral context is a throwaway.
 **Enforced network policy (0x86 block, capability `net-policy`).** The
 pure decision half lives in `src/web/netpolicy.zig` (std-only, both
 test roots); the gate runs it inline in `on_before_resource_load`, so a

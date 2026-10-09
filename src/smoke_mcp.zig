@@ -822,6 +822,17 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         say("smoke-mcp: focused web reading ok");
         return 0;
     }
+    if (c.getenv("SKETERM_SMOKE_MCP_WEBPERSIST_ONLY") != null) {
+        var bin_buf: [4096:0]u8 = undefined;
+        const web_bin = resolveWebBin(&bin_buf) orelse fail("sketerm-webengine not built for the persistence stage");
+        _ = c.setenv("SKETERM_WEB_BIN", web_bin, 1);
+        defer _ = c.unsetenv("SKETERM_WEB_BIN");
+        _ = c.setenv("SKETERM_WEB_BROKER_ENGINE", "0", 1);
+        defer _ = c.unsetenv("SKETERM_WEB_BROKER_ENGINE");
+        webPersistStage(allocator, exe, rt);
+        say("smoke-mcp: focused web persistence facts ok");
+        return 0;
+    }
     if (c.getenv("SKETERM_SMOKE_MCP_WEBSTREAM_ONLY") != null) {
         var bin_buf: [4096:0]u8 = undefined;
         const web_bin = resolveWebBin(&bin_buf) orelse fail("built sketerm-webengine missing for the stream stage");
@@ -2397,6 +2408,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             say("smoke-mcp: response-body capture (real CEF) ok");
             webTabsStage(allocator, exe, rt);
             say("smoke-mcp: shared-browser tab targeting (real CEF) ok");
+            webPersistStage(allocator, exe, rt);
+            say("smoke-mcp: web persistence facts (real CEF) ok");
             _ = c.unsetenv("SKETERM_WEB_BROKER_ENGINE");
             webSharedProfileStage(allocator, exe, rt);
             say("smoke-mcp: broker-owned shared profiles (real CEF) ok");
@@ -7840,6 +7853,172 @@ fn findAfterNavigation(arena: std.mem.Allocator, m: *Mcp, port: u16, comptime wh
 }
 
 /// Run only the optional browser stage for focused E2E validation.
+/// Stage wp: every tab-scoped web_* reply states what it leaves behind
+/// (`persistence`), and every written file whether it outlives the
+/// instance, against REAL CEF. The facts are PROVEN, not printed: a
+/// cookie written in each identity is read back after a graceful helper
+/// restart, a file the reply called temporary is gone once its server
+/// exits, and a second server on the same instance key, whose store is
+/// flock'd, says its default identity is not durable.
+fn webPersistStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) void {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var http = TinyHttp.start() orelse fail("wp: could not bind the loopback origin");
+    defer http.deinit();
+    http.dl_path = "/wp.bin";
+    http.dl_body = DOWNLOAD_PAYLOAD;
+    http.spawn();
+    var args: [2048]u8 = undefined;
+    const origin = std.fmt.allocPrint(arena, "http://127.0.0.1:{d}/", .{http.port}) catch unreachable;
+    const store_root = std.fmt.allocPrint(arena, "{s}/sketerm/web-profiles/anon", .{rt}) catch unreachable;
+
+    var m = Mcp.spawn(allocator, exe, &.{});
+    m.initialize();
+    {
+        const caps = capSc(arena, m.callTool("capabilities", "{}"), "wp: capabilities", false);
+        const wp = (caps.get("web_persistence") orelse fail("wp: capabilities has no web_persistence")).object;
+        if (!wp.get("facts").?.bool) fail("wp: web_persistence.facts is not true");
+        if (wp.get("default").? != .null) fail("wp: the default identity's persistence was claimed before any engine ran");
+    }
+
+    // One tab per identity; each open states its persistence.
+    const ids = [_][]const u8{ "default", "named", "ephemeral" };
+    const extra = [_][]const u8{ "", ",\"profile\":\"wp-named\"", ",\"ephemeral\":true" };
+    const cookie = [_][]const u8{ "wpd", "wpn", "wpe" };
+    var panes: [3]u32 = undefined;
+    for (ids, extra, 0..) |id, ex, i| {
+        m.sendTool("web_open", std.fmt.bufPrint(&args, "{{\"url\":\"{s}\",\"snapshot\":\"none\"{s}}}", .{ origin, ex }) catch unreachable);
+        const line = m.recvLine(60_000);
+        panes[i] = viewHandleOf(line);
+        const sc = capSc(arena, line, "wp: web_open", false);
+        expectFact(sc, "profile_kind", id, "wp: profile_kind");
+        expectPersist(persistOf(sc, "wp: web_open"), id, i != 2, "wp: web_open persistence");
+    }
+    {
+        const named = persistOf(capSc(arena, m.callTool("web_read", std.fmt.bufPrint(&args, "{{\"pane\":{d}}}", .{panes[1]}) catch unreachable), "wp: web_read named", false), "wp: web_read");
+        expectPersist(named, "named", true, "wp: web_read on the named tab");
+        if (!std.mem.startsWith(u8, scStr(named, "store", "wp: named store"), store_root) or
+            std.mem.indexOf(u8, scStr(named, "store", "wp: named store"), "/profile-wp-named-") == null)
+            fail("wp: the named profile's store is not its jar under the durable store");
+        expectFact(named, "flushed", "periodic", "wp: the named jar is not flushed periodically");
+        const dflt = persistOf(capSc(arena, m.callTool("web_read", std.fmt.bufPrint(&args, "{{\"pane\":{d}}}", .{panes[0]}) catch unreachable), "wp: web_read default", false), "wp: web_read");
+        expectPersist(dflt, "default", true, "wp: web_read on the default tab");
+        expectFact(dflt, "store", std.fmt.allocPrint(arena, "{s}/Default", .{store_root}) catch unreachable, "wp: the default identity's jar");
+        const eph = persistOf(capSc(arena, m.callTool("web_read", std.fmt.bufPrint(&args, "{{\"pane\":{d}}}", .{panes[2]}) catch unreachable), "wp: web_read ephemeral", false), "wp: web_read");
+        expectPersist(eph, "ephemeral", false, "wp: web_read on the ephemeral tab");
+        expectFact(eph, "flushed", "never", "wp: the ephemeral jar is written somewhere");
+    }
+    {
+        const tabs = capSc(arena, m.callTool("web_tabs", "{}"), "wp: web_tabs", false);
+        const views = tabs.get("views").?.array.items;
+        if (views.len != 3) fail("wp: web_tabs does not list three tabs");
+        for (views) |v| {
+            const pane: u32 = @intCast(v.object.get("view").?.integer);
+            const i: usize = for (panes, 0..) |p, k| {
+                if (p == pane) break k;
+            } else fail("wp: web_tabs lists a tab nobody opened");
+            expectPersist(persistOf(v.object, "wp: web_tabs view"), ids[i], i != 2, "wp: web_tabs persistence");
+        }
+    }
+    for (panes, cookie) |p, name| {
+        const set = m.callTool("web_eval", std.fmt.bufPrint(&args, "{{\"pane\":{d},\"code\":\"document.cookie='{s}=1; max-age=86400; path=/'\"}}", .{ p, name }) catch unreachable);
+        _ = capSc(arena, set, "wp: write a cookie", false);
+    }
+
+    // A second server on the same instance key: the store is flock'd, so
+    // its default identity keeps its data in its own instance dir.
+    {
+        var m2 = Mcp.spawn(allocator, exe, &.{});
+        m2.initialize();
+        m2.sendTool("web_open", std.fmt.bufPrint(&args, "{{\"url\":\"{s}\",\"snapshot\":\"none\"}}", .{origin}) catch unreachable);
+        const sc = capSc(arena, m2.recvLine(60_000), "wp: second server web_open", false);
+        const p2 = persistOf(sc, "wp: second server");
+        expectPersist(p2, "default", false, "wp: a second server's default identity");
+        expectContains(scStr(p2, "reason", "wp: second server reason"), "owns the browser profile store", "wp: the second server does not name the held store");
+        expectContains(scStr(p2, "store", "wp: second server store"), "/mcp-tmp-", "wp: the second server's jar is not in its instance dir");
+        const prof = capSc(arena, m2.callTool("web_profiles", "{}"), "wp: second server web_profiles", false);
+        if (prof.get("default_persistence").?.object.get("durable").?.bool) fail("wp: web_profiles on the second server calls the default identity durable");
+        m2.closeStdinWait();
+    }
+
+    // Files: a fetch without to_dir dies with the instance, with it lives.
+    const out_dir = std.fmt.allocPrint(arena, "{s}/wp-out", .{rt}) catch unreachable;
+    var tmp_file: []const u8 = "";
+    var kept_file: []const u8 = "";
+    {
+        const r = capSc(arena, m.callToolTimeout("web_fetch", std.fmt.bufPrint(&args, "{{\"urls\":[\"{s}wp.bin\"]}}", .{origin}) catch unreachable, 60_000), "wp: web_fetch in the instance", false);
+        expectPersist(persistOf(r, "wp: web_fetch"), "default", true, "wp: web_fetch's tabs");
+        const row = fetchResults(r, "wp: fetch")[0].object;
+        tmp_file = arena.dupe(u8, scStr(row, "path", "wp: fetched file")) catch unreachable;
+        if (row.get("outlives_instance").?.bool) fail("wp: a file in the temporary instance dir claims to outlive it");
+        if (!fileExists(tmp_file)) fail("wp: the fetched file is not where the reply says");
+        const r2 = capSc(arena, m.callToolTimeout("web_fetch", std.fmt.bufPrint(&args, "{{\"urls\":[\"{s}\"],\"to_dir\":\"{s}\"}}", .{ origin, out_dir }) catch unreachable, 60_000), "wp: web_fetch to_dir", false);
+        const row2 = fetchResults(r2, "wp: fetch to_dir")[0].object;
+        kept_file = arena.dupe(u8, scStr(row2, "path", "wp: to_dir file")) catch unreachable;
+        if (!row2.get("outlives_instance").?.bool) fail("wp: a to_dir file claims to die with the instance");
+    }
+    {
+        // web_eval out_file: the same helper judges any written file.
+        const inside = std.fmt.allocPrint(arena, "{s}/sketerm/mcp-tmp-{d}/wp-eval.txt", .{ rt, m.pid }) catch unreachable;
+        const ev = capSc(arena, m.callTool("web_eval", std.fmt.bufPrint(&args, "{{\"pane\":{d},\"code\":\"1+1\",\"out_file\":\"{s}\"}}", .{ panes[0], inside }) catch unreachable), "wp: web_eval out_file", false);
+        if (ev.get("outlives_instance").?.bool) fail("wp: web_eval's out_file inside the instance claims to outlive it");
+    }
+    m.closeStdinWait();
+    if (fileExists(tmp_file)) fail("wp: the file the reply called temporary outlived its server");
+    if (!fileExists(kept_file)) fail("wp: the to_dir file did not outlive its server");
+
+    // A whole new server and helper: what said durable is still there,
+    // what said not durable is not.
+    var m3 = Mcp.spawn(allocator, exe, &.{});
+    m3.initialize();
+    for (extra, cookie, 0..) |ex, name, i| {
+        m3.sendTool("web_open", std.fmt.bufPrint(&args, "{{\"url\":\"{s}\",\"snapshot\":\"none\"{s}}}", .{ origin, ex }) catch unreachable);
+        const line = m3.recvLine(60_000);
+        const pane = viewHandleOf(line);
+        _ = capSc(arena, line, "wp: reopen", false);
+        const got = capSc(arena, m3.callTool("web_eval", std.fmt.bufPrint(&args, "{{\"pane\":{d},\"code\":\"document.cookie\"}}", .{pane}) catch unreachable), "wp: read back", false);
+        const jar = scStr(got.get("value").?.object, "value", "wp: cookie string");
+        var want_buf: [16]u8 = undefined;
+        const want = std.fmt.bufPrint(&want_buf, "{s}=1", .{name}) catch unreachable;
+        const has = std.mem.indexOf(u8, jar, want) != null;
+        if (i != 2 and !has) {
+            say(jar);
+            fail("wp: a cookie in an identity the reply called durable did not survive a helper restart");
+        }
+        if (i == 2 and has) fail("wp: an ephemeral cookie survived a helper restart");
+        // The default jar is shared with later stages: leave it clean.
+        if (i == 0) _ = m3.callTool("web_eval", std.fmt.bufPrint(&args, "{{\"pane\":{d},\"code\":\"document.cookie='wpd=; max-age=0; path=/'\"}}", .{pane}) catch unreachable);
+        _ = m3.callTool("web_close", std.fmt.bufPrint(&args, "{{\"pane\":{d}}}", .{pane}) catch unreachable);
+    }
+    {
+        const r = capSc(arena, m3.callTool("web_profile_reset", "{\"profile\":\"wp-named\"}"), "wp: web_profile_reset", false);
+        const er = (r.get("erased") orelse fail("wp: web_profile_reset says nothing about what it erased")).object;
+        expectFact(er, "identity", "named", "wp: erased identity");
+        const jar = scStr(er, "store", "wp: erased store");
+        if (std.mem.indexOf(u8, jar, "/profile-wp-named-") == null) fail("wp: the erased store is not the profile's jar");
+        if (!er.get("store_removed").?.bool or fileExists(jar)) fail("wp: the erased jar is still on disk");
+    }
+    m3.closeStdinWait();
+}
+
+/// A reply's (or a tab row's) `persistence` object.
+fn persistOf(o: std.json.ObjectMap, comptime what: []const u8) std.json.ObjectMap {
+    const v = o.get("persistence") orelse fail(what ++ ": no persistence fact");
+    if (v != .object) fail(what ++ ": persistence is not an object");
+    return v.object;
+}
+
+fn expectPersist(p: std.json.ObjectMap, identity: []const u8, durable: bool, comptime what: []const u8) void {
+    expectFact(p, "identity", identity, what ++ " (identity)");
+    const d = p.get("durable") orelse fail(what ++ ": no durable");
+    if (d != .bool or d.bool != durable) {
+        if (p.get("reason")) |r| if (r == .string) say(r.string);
+        fail(what ++ " (durable)");
+    }
+    if (!durable and p.get("reason").? != .string) fail(what ++ ": not durable without a reason");
+}
+
 fn webOnly(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: [:0]const u8) u8 {
     var bin_buf: [4096:0]u8 = undefined;
     const web_bin = resolveWebBin(&bin_buf) orelse
@@ -7866,6 +8045,8 @@ fn webOnly(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: [:0]const u8) u
     say("smoke-mcp: focused web_fetch ok");
     webReadStage(allocator, exe, rt);
     say("smoke-mcp: focused web reading ok");
+    webPersistStage(allocator, exe, rt);
+    say("smoke-mcp: focused web persistence facts ok");
     killDaemonsUnderRt(rt, allocator);
     _ = c.usleep(500_000);
     g_rt = null;

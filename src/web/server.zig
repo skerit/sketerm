@@ -74,7 +74,7 @@ const drain_deadline_ms: i64 = 5_000;
 /// Chromium's cookie commit timer is ~30s and localStorage's LevelDB
 /// log lands within ~15s; this halves the worst-case loss window of an
 /// uncleanly-killed long-lived engine to ~20s of tail.
-const flush_interval_ms: i64 = 20_000;
+const flush_interval_ms: i64 = proto.FLUSH_INTERVAL_MS;
 
 /// Concurrent connections the poll array carries. A connect past this
 /// is accepted and immediately closed — fail-closed, like every other

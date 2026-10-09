@@ -1119,10 +1119,18 @@ owns and names.
   are swept at open; a corrupt `profiles.json` is rebuilt from the jar
   directories rather than restarting at id 1. Resetting a profile with
   open views is a `conflict` naming them.
-- **Persistence.** Only the directory is durable, and the engine flushes
-  it only on a graceful helper exit. Chromium never persists session
-  cookies. `profile` with `ephemeral`, and the reserved names `default`
-  and `none`, are `invalid_args`.
+- **Persistence.** Only the directory is durable. A helper with the
+  `flush-store` capability commits every persistent jar every 20 s, on
+  `web_profile_save` and at a graceful exit; an older one only through
+  Chromium's own commit timer and a graceful exit. Chromium never
+  persists session cookies. `profile` with `ephemeral`, and the reserved
+  names `default` and `none`, are `invalid_args`.
+- **The default identity persists too.** No `profile` means the engine's
+  shared jar (context 0), and with the store as the helper's data root
+  that jar is `<root>/Default`: its cookies and localStorage survive a
+  graceful helper restart (measured; CEF's header calls an empty
+  `cache_path` "incognito", which is not what happens). `web_fetch` tabs
+  browse in that same jar. Only `ephemeral:true` is a throwaway.
 - **Privacy.** Store directories are 0700, but a profile store is not a
   secret store: Chromium's Linux cookie encryption falls back to a fixed
   key when no keyring is available, which is the headless case.
@@ -1131,6 +1139,48 @@ owns and names.
 label). With a GUI attached it closes one page of the pane (the
 `web-close` control verb; an older GUI without it gets the whole-pane
 `close-pane`), and the pane only with its last page.
+
+### What a web call leaves behind
+
+Several callers share one browser, so every reply says what acting on
+its tab leaves behind. `capabilities.web_persistence` reports the facts
+(`facts`, the `identities` and `flushed` vocabularies, `flush_interval_s`,
+and `default`: the default identity's persistence on the running engine,
+null before one runs).
+
+- **`persistence`** rides on every tab-scoped web_* reply (the same echo
+  that carries the tab's handle, url and label), per tab in `web_tabs`,
+  once for its tabs on `web_fetch`, per profile in `web_profiles` (plus
+  `default_persistence`) and as `default_persistence` on
+  `web_profile_save`:
+  `{identity, durable, profile, store, flushed, reason}`.
+  `identity` is `default | named | ephemeral | gui` (`profile_kind` stays
+  the headless name of it). `durable:true` means cookies, logins, site
+  storage and cache are kept in `store` (the jar directory) and survive
+  the helper, this server and a reboot; `false` and `null` (unknown here)
+  carry `reason`. `flushed` is `periodic` (every 20 s, on
+  `web_profile_save`, at a graceful helper exit), `graceful_exit` (a
+  helper without `flush-store`), or `never` (in memory).
+- **When it is not durable.** `ephemeral` never is. When this server has
+  no durable profile store, because another process on the same
+  instance key holds its lock (`--name` gives this one its own) or no
+  state directory exists, the helper keeps its data in the instance
+  directory: `durable:false`, `store` points there and `reason` names the
+  owning pid. An engine another client started without a broker store is
+  `durable:null`: where it keeps its data is not known here.
+- **GUI tabs** are `identity:"gui"`, `durable:null`: the user's container
+  is not reported by the GUI, so this server does not guess.
+- **Files.** Every reply that names a file it wrote carries
+  `outlives_instance` beside the path: `web_fetch` rows,
+  `web_download` (each download and the single-file shape),
+  `web_eval out_file`, `web_capture` (`out_file`, and each exchange under
+  `out_dir`), `web_inspect`/`web_checkpoint` `artifacts`, and
+  `web_profile_save` (its `store`). `false` means the file sits in a
+  temporary instance's own directory (`mcp-tmp-<pid>`, e.g. a
+  `web_fetch` file without `to_dir`), which is deleted when the server
+  exits; the text lane says so too.
+- **`web_profile_reset`** reports `erased: {identity:"named", profile,
+  store, store_removed}`: the jar directory and whether it is gone.
 
 ### Enforced network policy
 

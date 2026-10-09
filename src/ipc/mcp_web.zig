@@ -48,6 +48,7 @@ const pathz = @import("../util/pathz.zig");
 const filter = @import("../web/filter.zig");
 const urlhost = @import("../web/urlhost.zig");
 const webprofiles = @import("webprofiles.zig");
+const webpersist = @import("webpersist.zig");
 const reader_model = @import("../web/reader.zig");
 const webkeys = @import("../web/webkeys.zig");
 const semantic = @import("../web/semantic.zig");
@@ -134,6 +135,8 @@ var g_headless_alloc: ?std.mem.Allocator = null;
 var g_default_max_fps: ?u16 = null;
 var g_headless_dir: ?[]const u8 = null;
 var g_headless_instance: ?[]const u8 = null;
+/// The instance directory is removed when the server exits (`mcp-tmp-<pid>`).
+var g_headless_temporary: bool = false;
 var g_headless_mux_sock: ?[]const u8 = null;
 
 /// Labels, last-touched times and idle-closed tabs, for both backends
@@ -395,9 +398,10 @@ test "treeSection bounds a tree at a line boundary and says so" {
 /// itself is spawned lazily on the first web tool call that needs it;
 /// `mux_sock` is the instance daemon its watchable Wayland session is
 /// created on (null = plain headless only).
-pub fn configureHeadless(allocator: std.mem.Allocator, dir: []const u8, instance: ?[]const u8, mux_sock: ?[]const u8, max_fps: ?u16) void {
+pub fn configureHeadless(allocator: std.mem.Allocator, dir: []const u8, instance: ?[]const u8, mux_sock: ?[]const u8, max_fps: ?u16, temporary: bool) void {
     g_headless_alloc = allocator;
     g_headless_dir = dir;
+    g_headless_temporary = temporary;
     g_headless_instance = instance;
     g_headless_mux_sock = mux_sock;
     g_default_max_fps = max_fps;
@@ -407,6 +411,53 @@ pub fn configureHeadless(allocator: std.mem.Allocator, dir: []const u8, instance
 /// headless browser is configured (--shared).
 pub fn instanceDir() ?[]const u8 {
     return g_headless_dir;
+}
+
+/// The persistence of `identity` on engine `e` (null: none running),
+/// for replies that name no view: web_fetch's tabs, web_profiles' rows.
+pub fn enginePersistence(arena: std.mem.Allocator, e: ?*webdrive.Engine, identity: webpersist.Identity, profile: []const u8, context: u32) !webpersist.Persistence {
+    const eng = e orelse return webpersist.derive(arena, .{ .identity = identity, .profile = profile, .context = context, .root = .{ .unknown = "this server has no headless browser engine" } });
+    return webpersist.derive(arena, .{
+        .identity = identity,
+        .profile = profile,
+        .context = context,
+        .root = try eng.dataRoot(arena),
+        .flush_on_request = eng.has(.flush),
+    });
+}
+
+/// `capabilities.web_persistence`: the vocabulary, and the default
+/// identity's persistence once an engine runs (null before: it depends on
+/// where that engine keeps its data).
+pub fn persistenceCapability(arena: std.mem.Allocator) !struct {
+    facts: bool = true,
+    identities: []const []const u8 = enumNames(webpersist.Identity),
+    flushed: []const []const u8 = enumNames(webpersist.Flush),
+    flush_interval_s: i64 = webpersist.FLUSH_INTERVAL_S,
+    default: ?webpersist.Persistence,
+} {
+    if (guiDrivesWeb()) return .{ .default = try webpersist.derive(arena, .{ .identity = .gui, .root = .{ .unknown = "" } }) };
+    const e = headlessEngine() orelse return .{ .default = null };
+    if (e.state != .ready) return .{ .default = null };
+    return .{ .default = try enginePersistence(arena, e, .default, "", 0) };
+}
+
+/// This MCP instance as `webpersist` judges files against it.
+pub fn instanceOf() webpersist.Instance {
+    return .{ .dir = g_headless_dir, .temporary = g_headless_temporary };
+}
+
+/// Whether a file this server wrote at `path` survives the instance.
+pub fn outlives(arena: std.mem.Allocator, path: []const u8) !bool {
+    return webpersist.outlivesInstance(arena, path, instanceOf());
+}
+
+/// `outlives_instance` for the one file a reply names, plus the sentence
+/// when it dies with the instance.
+pub fn fileFacts(res: *mcp.Res, path: []const u8) !void {
+    const keeps = try outlives(res.arena, path);
+    try res.fact("outlives_instance", keeps);
+    if (!keeps) try res.textf("{s} {s}", .{ path, webpersist.DIES_WITH_INSTANCE });
 }
 
 /// Name of the live watchable web session, when the headless engine is
@@ -767,8 +818,13 @@ pub const View = struct {
     /// Headless only — the GUI's identity containers are the user's own
     /// and are not reported through these tools yet.
     profile: []const u8 = "",
-    /// "default" (the shared jar), "named" or "ephemeral".
-    profile_kind: []const u8 = "default",
+    /// The identity the view browses in; `profile_kind` is its name.
+    identity: webpersist.Identity = .default,
+    /// Where the engine keeps its data (`webdrive.Engine.dataRoot`);
+    /// headless only, a GUI view's identity is `.gui` whatever this says.
+    data_root: webpersist.Root = .{ .unknown = "this view's browser data root was not reported" },
+    /// The helper flushes its jars on request and periodically.
+    flush_on_request: bool = false,
     /// Engine identity-context id; 0 = the shared default jar.
     context: u32 = 0,
     /// Set when the helper refused to create the view because its
@@ -817,6 +873,17 @@ pub const View = struct {
     /// The requested navigation cannot arrive: a certificate the
     /// caller did not accept, or a load that already failed. Polling
     /// for a settle past this point only burns the timeout.
+    /// The `persistence` fact: `webpersist.derive` over this view.
+    pub fn persistence(self: View, arena: std.mem.Allocator, mode: Mode) !webpersist.Persistence {
+        return webpersist.derive(arena, .{
+            .identity = if (mode == .gui) .gui else self.identity,
+            .profile = self.profile,
+            .context = self.context,
+            .root = self.data_root,
+            .flush_on_request = self.flush_on_request,
+        });
+    }
+
     pub fn loadBlocked(self: View) bool {
         if (self.cert) |ce| if (!std.mem.eql(u8, ce.state, "accepted")) return true;
         return self.load_error != null;
@@ -1423,12 +1490,9 @@ pub fn viewRecord(arena: std.mem.Allocator, e: *webdrive.Engine, v: *const webdr
         .handoff_available = e.session != null and e.observeActive(),
         .browser_name = try arena.dupe(u8, std.mem.sliceTo(&e.browser_label, 0)),
         .profile = if (v.profile) |p| try arena.dupe(u8, p) else "",
-        .profile_kind = if (v.ephemeral_ctx)
-            "ephemeral"
-        else if (v.profile != null)
-            "named"
-        else
-            "default",
+        .identity = if (v.ephemeral_ctx) .ephemeral else if (v.profile != null) .named else .default,
+        .data_root = try e.dataRoot(arena),
+        .flush_on_request = e.has(.flush),
         .context = v.context,
         .create_failed = if (v.create_failed) |f| try arena.dupe(u8, f) else "",
         .policy_active = v.pol_active,
@@ -2135,6 +2199,8 @@ pub fn tabEcho(res: *mcp.Res, mode: Mode, v: View) !void {
     try res.fact(handleKey(mode), v.pane);
     try res.fact("url", v.url);
     if (v.label.len > 0) try res.fact("label", v.label);
+    // What acting on this tab leaves behind, on every tab-scoped reply.
+    try res.fact("persistence", try v.persistence(res.arena, mode));
 }
 
 /// Structured facts + the one-line text header every web result opens
@@ -2287,10 +2353,12 @@ fn tabsResult(arena: std.mem.Allocator, mode: Mode, vs: Views) ![]const u8 {
         if (mode == .headless) {
             try w.writeAll(",\"profile\":");
             try std.json.Stringify.value(v.profile, .{}, w);
-            try w.print(",\"profile_kind\":\"{s}\",\"context\":{d}", .{ v.profile_kind, v.context });
+            try w.print(",\"profile_kind\":\"{s}\",\"context\":{d}", .{ @tagName(v.identity), v.context });
             if (v.policy_active) try w.print(",\"policy_active\":true,\"policy_exhausted\":{}", .{v.policy_exhausted.len > 0});
             if (v.capture_active) try w.writeAll(",\"capture_active\":true");
         }
+        try w.writeAll(",\"persistence\":");
+        try std.json.Stringify.value(try v.persistence(arena, mode), .{}, w);
         try w.print(",\"current\":{}}}", .{!target_required and v.focused});
     }
     try w.writeAll("]");
@@ -2303,7 +2371,7 @@ fn tabsResult(arena: std.mem.Allocator, mode: Mode, vs: Views) ![]const u8 {
     for (vs.views) |v| {
         const title = try clip(arena, v.title, TITLE_MAX);
         const url = try clip(arena, v.url, URL_MAX);
-        try res.textf("{s} {s} {d}{s}: {s}{s}{s}{s}{s}{s}{s}{s}{s}{s}", .{
+        try res.textf("{s} {s} {d}{s}: {s}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}", .{
             if (!target_required and v.focused) "*" else " ",
             handleKey(mode),
             v.pane,
@@ -2316,10 +2384,11 @@ fn tabsResult(arena: std.mem.Allocator, mode: Mode, vs: Views) ![]const u8 {
             try routeMark(arena, v),
             // Only when the view is NOT in the shared jar: the default
             // is the overwhelming case and needs no word per line.
-            if (v.profile.len > 0) " [profile " else if (std.mem.eql(u8, v.profile_kind, "ephemeral")) " [ephemeral identity]" else "",
+            if (v.profile.len > 0) " [profile " else if (v.identity == .ephemeral) " [ephemeral identity]" else "",
             if (v.profile.len > 0) v.profile else "",
             if (v.profile.len > 0) "]" else "",
             try idleMark(arena, v),
+            try persistMark(arena, mode, v),
         });
     }
     if (mode == .headless) {
@@ -2340,6 +2409,14 @@ fn tabsResult(arena: std.mem.Allocator, mode: Mode, vs: Views) ![]const u8 {
             try res.textf("an assistant tab untouched for {d}s closes itself, unless someone is watching it (Watch / Take control); web_idle_close_secs sets the time", .{idleCloseSecs()});
     }
     return res.finish();
+}
+
+/// The per-line persistence marker in the tabs listing: nothing when
+/// unknown (a GUI tab), which `persistence.reason` explains.
+fn persistMark(arena: std.mem.Allocator, mode: Mode, v: View) ![]const u8 {
+    const p = try v.persistence(arena, mode);
+    const durable = p.durable orelse return "";
+    return if (durable) " (logins and storage persist)" else " (nothing persists)";
 }
 
 /// The per-line idle marker in the tabs listing.
@@ -2576,17 +2653,13 @@ fn openResult(
         try res.fact("handoff", .{ .available = v.handoff_available, .name = v.browser_name });
         if (v.handoff_available) try res.text("This is an assistant-owned browser tab. 'headless' describes ownership, not whether you can see it: the user can open Sketerm's orange AI badge and choose Watch or Take control to log in manually. Keep this tab open during handoff; use web_navigate to continue in it. The viewer follows new tabs in the same browser, including after the last tab closes.");
         try res.fact("profile", v.profile);
-        try res.fact("profile_kind", v.profile_kind);
+        try res.fact("profile_kind", @tagName(v.identity));
         try res.fact("context", v.context);
         try res.fact("untrusted", v.untrusted);
         if (v.max_fps) |fps| try res.fact("max_fps", fps);
         if (v.emulation.color_scheme) |value| try res.fact("color_scheme", @tagName(value));
         if (v.emulation.reduced_motion) |value| try res.fact("reduced_motion", if (value == .reduce) "reduce" else "no-preference");
         if (v.emulation.device_scale_factor != null) try res.fact("device_scale_factor", @as(f64, @floatFromInt(v.emulation.scale())) / 1000);
-        if (v.profile.len > 0)
-            try res.textf("profile: {s} (its own cookie jar; logins here survive web_close and MCP restarts)", .{v.profile})
-        else if (std.mem.eql(u8, v.profile_kind, "ephemeral"))
-            try res.text("profile: a fresh throwaway identity, destroyed with this view");
         try res.fact("policy_active", policy != null);
         try res.fact("policy_source", policy_source);
         if (policy) |p| {
@@ -2600,6 +2673,9 @@ fn openResult(
             try res.text("capture: recording matching responses from the first request (web_capture lists and reads them, web_wait for:\"response\" waits for one)");
         }
     }
+    // What browsing in this tab leaves behind, said once in prose where
+    // the tab is born (every reply carries the fact).
+    try res.text(try webpersist.sentence(arena, try v.persistence(arena, mode)));
     try res.field("settled", settled);
     if (!settled and v.loadBlocked())
         try res.text("the requested page did not load (the certificate or load error above says why); nothing was snapshotted")
@@ -2686,6 +2762,7 @@ const ProfileRow = struct {
     views: u32,
     last_used_ms: i64,
     live: bool,
+    persistence: webpersist.Persistence,
 };
 
 fn profilesResult(
@@ -2694,6 +2771,7 @@ fn profilesResult(
     store: []const u8,
     contexts_supported: bool,
     unavailable_reason: []const u8,
+    default_persistence: webpersist.Persistence,
 ) ![]const u8 {
     var res = mcp.Res.init(arena);
     var aw: std.Io.Writer.Allocating = .init(arena);
@@ -2703,15 +2781,18 @@ fn profilesResult(
         if (i != 0) try w.writeAll(",");
         try w.writeAll("{\"name\":");
         try std.json.Stringify.value(p.name, .{}, w);
-        try w.print(",\"context\":{d},\"views\":{d},\"last_used_ms\":{d},\"live\":{}}}", .{
+        try w.print(",\"context\":{d},\"views\":{d},\"last_used_ms\":{d},\"live\":{},\"persistence\":", .{
             p.context, p.views, p.last_used_ms, p.live,
         });
+        try std.json.Stringify.value(p.persistence, .{}, w);
+        try w.writeAll("}");
     }
     try w.writeAll("]");
     try res.raw("profiles", aw.written());
     if (store.len > 0) try res.fact("store", store);
     try res.fact("contexts_supported", contexts_supported);
     if (unavailable_reason.len > 0) try res.fact("unavailable_reason", unavailable_reason);
+    try res.fact("default_persistence", default_persistence);
 
     if (rows.len == 0)
         try res.text("no browser profiles yet: web_open with profile:\"name\" creates one")
@@ -2722,15 +2803,33 @@ fn profilesResult(
     }
     if (store.len > 0) try res.textf("stored in {s}", .{store});
     if (unavailable_reason.len > 0) try res.text(unavailable_reason);
+    try res.text(try webpersist.sentence(arena, default_persistence));
     return res.finish();
 }
 
-fn profileResetResult(arena: std.mem.Allocator, profile: []const u8, retired: u32) ![]const u8 {
+/// What `web_profile_reset` erased, in the persistence vocabulary.
+const Erased = struct {
+    identity: webpersist.Identity = .named,
+    profile: []const u8,
+    /// The jar directory that held it; null when its place was unknown.
+    store: ?[]const u8,
+    /// The directory is gone from disk now.
+    store_removed: ?bool,
+};
+
+fn profileResetResult(arena: std.mem.Allocator, profile: []const u8, retired: u32, erased: Erased) ![]const u8 {
     var res = mcp.Res.init(arena);
     try res.fact("profile", profile);
     try res.fact("deleted", true);
     try res.fact("retired_context", retired);
+    try res.fact("erased", erased);
     try res.textf("erased profile '{s}': cookies, logins and cache are gone", .{profile});
+    if (erased.store) |st| {
+        if (erased.store_removed orelse false)
+            try res.textf("its jar {s} is removed from disk", .{st})
+        else
+            try res.textf("its jar {s} could not be confirmed removed", .{st});
+    }
     try res.text("the name stays usable; the next web_open with it starts from an empty, freshly allocated jar");
     return res.finish();
 }
@@ -3305,6 +3404,7 @@ fn evalToFile(
     try head(&res, arena, mode, v);
     try res.fact("evaluated", true);
     try res.fact("out_file", path);
+    try fileFacts(&res, path);
     try res.fact("bytes", bytes.len);
     try res.fact("format", format);
     if (mcp_term.sha256File(path)) |hex| try res.fact("sha256", hex[0..]);
@@ -4877,7 +4977,7 @@ fn closeTool(drv: Driver, arena: std.mem.Allocator, views: ?Views, handle: ?u32)
             .gui => return closeGuiResult(arena, view, remaining, pane_closed),
             .headless => {
                 const left = totalHeadlessViews();
-                return closeResult(arena, view, left, soleHeadlessView(), std.mem.eql(u8, view.profile_kind, "ephemeral"));
+                return closeResult(arena, view, left, soleHeadlessView(), view.identity == .ephemeral);
             },
         },
     }
@@ -5001,6 +5101,7 @@ fn profilesTool(drv: Driver, arena: std.mem.Allocator) ![]const u8 {
         .views = p.views,
         .last_used_ms = p.last_used_ms,
         .live = p.live,
+        .persistence = try profilePersistence(arena, e, p.name, p.id),
     };
     return profilesResult(
         arena,
@@ -5008,6 +5109,7 @@ fn profilesTool(drv: Driver, arena: std.mem.Allocator) ![]const u8 {
         e.profileStorePath() orelse "",
         e.profilesAvailable(),
         e.profileUnavailableReason(),
+        try enginePersistence(arena, if (e.state == .ready) e else null, .default, "", 0),
     );
 }
 
@@ -5018,6 +5120,10 @@ fn profileResetTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value)
     };
     const name = mcp.argStr(args, "profile") orelse
         return mcp.errRes(arena, .invalid_args, "web_profile_reset needs 'profile' (web_profiles lists them)");
+    var erased: Erased = .{ .profile = name, .store = null, .store_removed = null };
+    for (try e.profileList(arena)) |p| {
+        if (std.mem.eql(u8, p.name, name)) erased.store = (try profilePersistence(arena, e, p.name, p.id)).store;
+    }
     const retired = e.resetProfile(name) catch |err| {
         if (err == error.InUse) return mcp.errRes(arena, .conflict, try std.fmt.allocPrint(
             arena,
@@ -5026,13 +5132,29 @@ fn profileResetTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value)
         ));
         return failRes(arena, try profileFail(arena, e, name, err));
     };
-    return profileResetResult(arena, name, retired);
+    if (erased.store) |st| erased.store_removed = !pathExists(st);
+    return profileResetResult(arena, name, retired, erased);
 }
 
 /// `web_profile_save`: commit the live jars to disk without closing
 /// anything (`webdrive.Engine.saveProfiles`). A named profile is only
 /// CHECKED -- the engine's flush covers every persistent jar at once,
 /// which is what "save this login now" must mean anyway.
+/// A stored profile's persistence, the jar placed under the store root
+/// whether or not an engine runs (the store alone decides where it is).
+fn profilePersistence(arena: std.mem.Allocator, e: *webdrive.Engine, name: []const u8, id: u32) !webpersist.Persistence {
+    if (e.state == .ready) return enginePersistence(arena, e, .named, name, id);
+    const root = e.profileStorePath() orelse return enginePersistence(arena, null, .named, name, id);
+    return webpersist.derive(arena, .{ .identity = .named, .profile = name, .context = id, .root = .{ .durable = root } });
+}
+
+fn pathExists(path: []const u8) bool {
+    var buf: [4096]u8 = undefined;
+    const z = std.fmt.bufPrintZ(&buf, "{s}", .{path}) catch return true;
+    const lc = @import("../c.zig").c;
+    return lc.access(z.ptr, lc.F_OK) == 0;
+}
+
 fn profileSaveTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
     const e = switch (drv) {
         .gui => return mcp.errRes(arena, .unavailable, GUI_PROFILE_REFUSAL),
@@ -5053,11 +5175,31 @@ fn profileSaveTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value) 
         error.Timeout => mcp.errRes(arena, .timeout, "the browser engine did not confirm the flush in time; nothing is known to be lost, but the save is unconfirmed"),
         error.Unavailable => failRes(arena, try headlessFail(arena, e, err)),
     };
-    return profileSaveResult(arena, named, listed, saved);
+    // Where the flush wrote: the engine's data root (the durable store, or
+    // the instance directory when there is none).
+    const root: ?[]const u8 = if (e.state != .ready) e.profileStorePath() else switch (try e.dataRoot(arena)) {
+        .durable => |r| r,
+        .instance => |in| in.path,
+        .private, .unknown => null,
+    };
+    const default_p = try enginePersistence(arena, if (e.state == .ready) e else null, .default, "", 0);
+    return profileSaveResult(arena, named, listed, saved, root, default_p);
 }
 
-fn profileSaveResult(arena: std.mem.Allocator, named: ?[]const u8, listed: []const webdrive.Engine.ProfileInfo, saved: webdrive.Engine.Saved) ![]const u8 {
+fn profileSaveResult(
+    arena: std.mem.Allocator,
+    named: ?[]const u8,
+    listed: []const webdrive.Engine.ProfileInfo,
+    saved: webdrive.Engine.Saved,
+    root: ?[]const u8,
+    default_p: webpersist.Persistence,
+) ![]const u8 {
     var res = mcp.Res.init(arena);
+    if (root) |r| {
+        try res.fact("store", r);
+        try fileFacts(&res, r);
+    }
+    try res.fact("default_persistence", default_p);
     const names = try arena.alloc([]const u8, listed.len);
     for (listed, 0..) |p, i| names[i] = p.name;
     try res.fact("saved", true);
@@ -5065,7 +5207,7 @@ fn profileSaveResult(arena: std.mem.Allocator, named: ?[]const u8, listed: []con
     try res.fact("profiles", names);
     if (named) |n| try res.fact("profile", n);
     switch (saved) {
-        .flushed => try res.text("every persistent jar (cookies and logins of each named profile and of this instance) is committed to disk; a crash from here on keeps them"),
+        .flushed => try res.text("every persistent jar (cookies and logins of each named profile and of the default identity) is committed to disk; a crash from here on keeps them"),
         .nothing_live => try res.text("no browser engine is running, so nothing is held in memory: the profile store on disk is already complete"),
     }
     return res.finish();
@@ -5729,7 +5871,7 @@ fn rtypeName(t: u8) []const u8 {
 }
 
 /// Where one exchange's body was written by `out_dir`.
-const Written = struct { path: []const u8, bytes: usize, sha256: []const u8, encoding: []const u8 };
+const Written = struct { path: []const u8, bytes: usize, sha256: []const u8, encoding: []const u8, outlives_instance: bool = true };
 
 fn exchangeJson(w: *std.Io.Writer, e: web_proto.CaptureEntry, written: ?Written) !void {
     try w.print("{{\"seq\":{d},\"cursor\":{d},\"url\":", .{ e.seq, e.cursor });
@@ -5757,7 +5899,7 @@ fn exchangeJson(w: *std.Io.Writer, e: web_proto.CaptureEntry, written: ?Written)
     if (written) |wr| {
         try w.writeAll(",\"path\":");
         try std.json.Stringify.value(wr.path, .{}, w);
-        try w.print(",\"file_bytes\":{d},\"sha256\":\"{s}\",\"encoding\":\"{s}\"", .{ wr.bytes, wr.sha256, wr.encoding });
+        try w.print(",\"file_bytes\":{d},\"sha256\":\"{s}\",\"encoding\":\"{s}\",\"outlives_instance\":{}", .{ wr.bytes, wr.sha256, wr.encoding, wr.outlives_instance });
     }
     try w.writeByte('}');
 }
@@ -5900,7 +6042,7 @@ fn captureTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view
                 .sha => |s| s,
                 .err => |f| return failRes(arena, f),
             };
-            written[i] = .{ .path = path, .bytes = shown.bytes.len, .sha256 = sha, .encoding = shown.kind };
+            written[i] = .{ .path = path, .bytes = shown.bytes.len, .sha256 = sha, .encoding = shown.kind, .outlives_instance = try outlives(arena, path) };
         }
     }
     return captureListResult(arena, view, e.findView(view.pane).?.cap.?, list, since, written);
@@ -6061,6 +6203,7 @@ fn captureBodyResult(
     if (shown.transcoded_from.len > 0) try res.textf("transcoded to UTF-8 from {s}", .{shown.transcoded_from});
     if (file) |f| {
         try res.fact("out_file", f.path);
+        try fileFacts(&res, f.path);
         try res.fact("bytes", f.bytes);
         try res.fact("sha256", f.sha256);
         try res.textf("wrote {d} bytes ({s}) to {s}; the body is not in this reply", .{ f.bytes, f.encoding, f.path });
@@ -7033,6 +7176,8 @@ const DlOutcome = struct {
     bytes: u64 = 0,
     sha256: []const u8 = "",
     reason: []const u8 = "",
+    /// Null until the download has a path.
+    outlives_instance: ?bool = null,
 };
 
 fn runOneDownload(
@@ -7175,9 +7320,10 @@ fn downloadTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, vie
 /// budget to mean anything.
 const MAX_DOWNLOAD_BATCH: usize = 64;
 
-fn downloadResult(arena: std.mem.Allocator, mode: Mode, v: View, outs: []const DlOutcome) ![]const u8 {
+fn downloadResult(arena: std.mem.Allocator, mode: Mode, v: View, outs_in: []const DlOutcome) ![]const u8 {
     var res = mcp.Res.init(arena);
     try head(&res, arena, mode, v);
+    const outs = try withFates(arena, outs_in);
     var done: usize = 0;
     var failed: usize = 0;
     var pending: usize = 0;
@@ -7192,6 +7338,7 @@ fn downloadResult(arena: std.mem.Allocator, mode: Mode, v: View, outs: []const D
         const o = outs[0];
         // The single-file shape a caller reads without indexing.
         try res.fact("path", o.path);
+        if (o.path.len > 0) try fileFacts(&res, o.path);
         try res.fact("state", o.state);
         try res.fact("bytes", o.bytes);
         if (o.sha256.len != 0) try res.fact("sha256", o.sha256);
@@ -7203,6 +7350,15 @@ fn downloadResult(arena: std.mem.Allocator, mode: Mode, v: View, outs: []const D
         try res.textf("{d} of {d} downloaded into place, {d} failed, {d} unfinished", .{ done, outs.len, failed, pending });
     }
     return res.finish();
+}
+
+/// Each download with its `outlives_instance`.
+fn withFates(arena: std.mem.Allocator, outs: []const DlOutcome) ![]DlOutcome {
+    const out = try arena.dupe(DlOutcome, outs);
+    for (out) |*o| if (o.path.len > 0) {
+        o.outlives_instance = try outlives(arena, o.path);
+    };
+    return out;
 }
 
 fn downloadListResult(drv: Driver, arena: std.mem.Allocator, view: View) ![]const u8 {
@@ -7244,7 +7400,7 @@ fn downloadListResult(drv: Driver, arena: std.mem.Allocator, view: View) ![]cons
     }
     var res = mcp.Res.init(arena);
     try head(&res, arena, drv.mode(), view);
-    try res.fact("downloads", rows.items);
+    try res.fact("downloads", try withFates(arena, rows.items));
     try res.fact("listing", true);
     try res.textf("{d} download(s) known to this view; pass 'url' or 'urls' to fetch one", .{rows.items.len});
     return res.finish();
@@ -8968,7 +9124,7 @@ fn jsonArgs(arena: std.mem.Allocator, text: []const u8) !std.json.Value {
 }
 
 test "stream capability is code support before startup and a negotiated runtime fact afterwards" {
-    configureHeadless(std.testing.allocator, "/tmp/sketerm-stream-cap-test", null, null, null);
+    configureHeadless(std.testing.allocator, "/tmp/sketerm-stream-cap-test", null, null, null, false);
     defer {
         shutdownHeadless();
         g_headless_alloc = null;
@@ -9207,7 +9363,7 @@ test "the headless backend keeps one engine per route, keyed by its slug" {
 
     // No helper is started here: an engine binds its socket lazily, on
     // the first call that needs one.
-    configureHeadless(t.allocator, "/tmp/sketerm-route-table-test", null, null, null);
+    configureHeadless(t.allocator, "/tmp/sketerm-route-table-test", null, null, null, false);
     defer {
         shutdownHeadless();
         g_headless_alloc = null;
@@ -9275,7 +9431,7 @@ test "a headless tor or via: route resolves to its own engine, on: does not reso
     const arena = arena_state.allocator();
     const t = std.testing;
 
-    configureHeadless(t.allocator, "/tmp/sketerm-route-pick-test", null, null, null);
+    configureHeadless(t.allocator, "/tmp/sketerm-route-pick-test", null, null, null, false);
     defer {
         shutdownHeadless();
         g_headless_alloc = null;
@@ -9512,7 +9668,8 @@ test "web_profile_save result shapes: a live flush and a no-engine answer" {
         .{ .name = "reddit-scout-1", .id = 4, .views = 0, .created_ms = 1, .last_used_ms = 2, .live = false },
     };
     // 1. A running engine flushed every jar; the named profile is echoed.
-    const live = try profileSaveResult(arena, "liantis-main", &rows, .flushed);
+    const durable_default = try webpersist.derive(arena, .{ .identity = .default, .root = .{ .durable = "/state/sketerm/web-profiles/anon" }, .flush_on_request = true });
+    const live = try profileSaveResult(arena, "liantis-main", &rows, .flushed, "/state/sketerm/web-profiles/anon", durable_default);
     const lp = try mcp.expectToolResultShape(arena, "web_profile_save", live);
     const lsc = lp.object.get("structuredContent").?.object;
     try t.expect(lsc.get("saved").?.bool);
@@ -9520,9 +9677,12 @@ test "web_profile_save result shapes: a live flush and a no-engine answer" {
     try t.expectEqualStrings("liantis-main", lsc.get("profile").?.string);
     try t.expectEqual(@as(usize, 2), lsc.get("profiles").?.array.items.len);
     try t.expect(std.mem.indexOf(u8, lp.object.get("content").?.array.items[0].object.get("text").?.string, "committed to disk") != null);
+    try t.expectEqualStrings("/state/sketerm/web-profiles/anon", lsc.get("store").?.string);
+    try t.expect(lsc.get("outlives_instance").?.bool);
+    try t.expect(lsc.get("default_persistence").?.object.get("durable").?.bool);
     // 2. No engine: nothing was in memory, and the reply says the disk
     // store is already complete instead of pretending a flush ran.
-    const idle = try profileSaveResult(arena, null, &.{}, .nothing_live);
+    const idle = try profileSaveResult(arena, null, &.{}, .nothing_live, null, try webpersist.derive(arena, .{ .identity = .default, .root = .{ .unknown = "no engine" } }));
     const ip = try mcp.expectToolResultShape(arena, "web_profile_save", idle);
     const isc = ip.object.get("structuredContent").?.object;
     try t.expect(!isc.get("engine_running").?.bool);
@@ -9537,7 +9697,7 @@ test "web_close / web_profiles / web_profile_reset result shapes" {
 
     // A named profile's close keeps its storage and says so, and the
     // reply echoes the closed tab: handle, url, label.
-    const named = try closeResult(arena, .{ .pane = 3, .view = 3, .url = "https://a.test/x", .label = "scan-a", .profile = "work", .profile_kind = "named" }, 1, 2, false);
+    const named = try closeResult(arena, .{ .pane = 3, .view = 3, .url = "https://a.test/x", .label = "scan-a", .profile = "work", .identity = .named }, 1, 2, false);
     const np = try mcp.expectToolResultShape(arena, "web_close", named);
     const nsc = np.object.get("structuredContent").?.object;
     try t.expectEqual(@as(i64, 3), nsc.get("closed").?.integer);
@@ -9560,7 +9720,7 @@ test "web_close / web_profiles / web_profile_reset result shapes" {
 
     // The last ephemeral view takes its identity with it, and the reply
     // states what a handle-less call now means (nothing).
-    const last = try closeResult(arena, .{ .pane = 1, .view = 1, .profile_kind = "ephemeral" }, 0, 0, true);
+    const last = try closeResult(arena, .{ .pane = 1, .view = 1, .identity = .ephemeral }, 0, 0, true);
     const lp = try mcp.expectToolResultShape(arena, "web_close", last);
     try t.expect(lp.object.get("structuredContent").?.object.get("profile_released").?.bool);
     try t.expect(std.mem.indexOf(
@@ -9569,10 +9729,11 @@ test "web_close / web_profiles / web_profile_reset result shapes" {
         "no web views are left",
     ) != null);
 
+    const root: webpersist.Root = .{ .durable = "/state/sketerm/web-profiles/anon" };
     const listed = try profilesResult(arena, &.{
-        .{ .name = "work", .context = 3, .views = 1, .last_used_ms = 1700, .live = true },
-        .{ .name = "shop", .context = 4, .views = 0, .last_used_ms = 1600, .live = false },
-    }, "/state/sketerm/web-profiles/anon", true, "");
+        .{ .name = "work", .context = 3, .views = 1, .last_used_ms = 1700, .live = true, .persistence = try webpersist.derive(arena, .{ .identity = .named, .profile = "work", .context = 3, .root = root, .flush_on_request = true }) },
+        .{ .name = "shop", .context = 4, .views = 0, .last_used_ms = 1600, .live = false, .persistence = try webpersist.derive(arena, .{ .identity = .named, .profile = "shop", .context = 4, .root = root, .flush_on_request = true }) },
+    }, "/state/sketerm/web-profiles/anon", true, "", try webpersist.derive(arena, .{ .identity = .default, .root = root, .flush_on_request = true }));
     const pp = try mcp.expectToolResultShape(arena, "web_profiles", listed);
     const psc = pp.object.get("structuredContent").?.object;
     try t.expect(psc.get("contexts_supported").?.bool);
@@ -9584,10 +9745,15 @@ test "web_close / web_profiles / web_profile_reset result shapes" {
     try t.expect(rows[0].object.get("live").?.bool);
     try t.expect(!rows[1].object.get("live").?.bool);
     try t.expect(psc.get("unavailable_reason") == null);
+    const wp = rows[0].object.get("persistence").?.object;
+    try t.expect(wp.get("durable").?.bool);
+    try t.expectEqualStrings("/state/sketerm/web-profiles/anon/profile-work-3", wp.get("store").?.string);
+    try t.expectEqualStrings("periodic", wp.get("flushed").?.string);
+    try t.expect(psc.get("default_persistence").?.object.get("durable").?.bool);
 
     // Unavailable is not an ERROR here: listing what exists still works,
     // and the reason is what tells a caller why web_open would refuse.
-    const empty = try profilesResult(arena, &.{}, "", false, "this browser helper does not advertise isolated identity contexts");
+    const empty = try profilesResult(arena, &.{}, "", false, "this browser helper does not advertise isolated identity contexts", try webpersist.derive(arena, .{ .identity = .default, .root = .{ .instance = .{ .path = "/rt/mcp-tmp-1/web-cache", .why = "pid 2 owns it" } } }));
     const ep = try mcp.expectToolResultShape(arena, "web_profiles", empty);
     try t.expect(!ep.object.get("structuredContent").?.object.get("contexts_supported").?.bool);
     try t.expect(std.mem.indexOf(
@@ -9596,11 +9762,15 @@ test "web_close / web_profiles / web_profile_reset result shapes" {
         "no browser profiles yet",
     ) != null);
 
-    const reset = try profileResetResult(arena, "work", 3);
+    const reset = try profileResetResult(arena, "work", 3, .{ .profile = "work", .store = "/state/sketerm/web-profiles/anon/profile-work-3", .store_removed = true });
     const rp = try mcp.expectToolResultShape(arena, "web_profile_reset", reset);
     const rsc = rp.object.get("structuredContent").?.object;
     try t.expect(rsc.get("deleted").?.bool);
     try t.expectEqual(@as(i64, 3), rsc.get("retired_context").?.integer);
+    const er = rsc.get("erased").?.object;
+    try t.expectEqualStrings("named", er.get("identity").?.string);
+    try t.expectEqualStrings("/state/sketerm/web-profiles/anon/profile-work-3", er.get("store").?.string);
+    try t.expect(er.get("store_removed").?.bool);
     try t.expect(std.mem.indexOf(
         u8,
         rp.object.get("content").?.array.items[0].object.get("text").?.string,
@@ -9616,8 +9786,10 @@ test "web_open and web_tabs carry the identity a view lives in" {
 
     var in_profile = EXAMPLE;
     in_profile.profile = "work";
-    in_profile.profile_kind = "named";
+    in_profile.identity = .named;
     in_profile.context = 3;
+    in_profile.data_root = .{ .durable = "/state/sketerm/web-profiles/anon" };
+    in_profile.flush_on_request = true;
     const opened = try openResult(arena, .headless, in_profile, true, false, null, null, null, "none", null, 1, .{});
     const op = try mcp.expectToolResultShape(arena, "web_open", opened);
     const osc = op.object.get("structuredContent").?.object;
@@ -9627,8 +9799,11 @@ test "web_open and web_tabs carry the identity a view lives in" {
     try t.expect(std.mem.indexOf(
         u8,
         op.object.get("content").?.array.items[0].object.get("text").?.string,
-        "profile: work",
+        "profile 'work' is DURABLE",
     ) != null);
+    const opp = osc.get("persistence").?.object;
+    try t.expect(opp.get("durable").?.bool);
+    try t.expectEqualStrings("/state/sketerm/web-profiles/anon/profile-work-3", opp.get("store").?.string);
 
     // The default jar spends no words and no keys beyond the honest ones.
     const plain = try openResult(arena, .headless, EXAMPLE, true, false, null, null, null, "none", null, 1, .{});
@@ -9637,7 +9812,7 @@ test "web_open and web_tabs carry the identity a view lives in" {
     try t.expectEqualStrings("default", psc.get("profile_kind").?.string);
     try t.expectEqual(@as(i64, 0), psc.get("context").?.integer);
 
-    const eph = View{ .pane = 5, .url = "https://x.test/", .profile_kind = "ephemeral", .context = 0x4000_0000 };
+    const eph = View{ .pane = 5, .url = "https://x.test/", .identity = .ephemeral, .context = 0x4000_0000 };
     const tabs = try tabsResult(arena, .headless, .{ .views = &.{ in_profile, eph }, .helper = "ready" });
     const tp = try mcp.expectToolResultShape(arena, "web_tabs", tabs);
     const tviews = tp.object.get("structuredContent").?.object.get("views").?.array.items;
@@ -9654,6 +9829,13 @@ test "web_open and web_tabs carry the identity a view lives in" {
         .object.get("structuredContent").?.object.get("views").?.array.items;
     try t.expect(gviews[0].object.get("profile") == null);
     try t.expect(gviews[0].object.get("context") == null);
+    // ...and its persistence is unknown, with the reason, never a guess.
+    const gp = gviews[0].object.get("persistence").?.object;
+    try t.expectEqualStrings("gui", gp.get("identity").?.string);
+    try t.expect(gp.get("durable").? == .null);
+    try t.expectEqualStrings(webpersist.GUI_REASON, gp.get("reason").?.string);
+    try t.expect(tviews[1].object.get("persistence").?.object.get("durable").? == .bool);
+    try t.expect(!tviews[1].object.get("persistence").?.object.get("durable").?.bool);
 }
 
 test "every tool this module serves declares an output schema" {
@@ -9902,7 +10084,7 @@ test "ordinary and untrusted engine addresses remain stable across route table g
     const saved_instance = g_headless_instance;
     const saved_mux = g_headless_mux_sock;
     if (g_engines.items.len != 0) return error.SkipZigTest;
-    configureHeadless(std.testing.allocator, "/tmp/webdrive-mode-test", null, null, null);
+    configureHeadless(std.testing.allocator, "/tmp/webdrive-mode-test", null, null, null, false);
     defer {
         shutdownHeadless();
         g_headless_alloc = saved_alloc;
@@ -9950,7 +10132,7 @@ test "web_untrusted is a build fact, and lifecycle facts never come from the unt
     const gpa = std.testing.allocator;
     var pin = try WebBinPin.set(gpa, "/bin/sh");
     defer pin.restore(gpa);
-    configureHeadless(gpa, "/tmp/webdrive-mode-test", null, null, null);
+    configureHeadless(gpa, "/tmp/webdrive-mode-test", null, null, null, false);
     defer {
         shutdownHeadless();
         g_headless_alloc = saved_alloc;
