@@ -580,12 +580,53 @@ pub fn untrustedReason(reason: c_int) proto.NetReason {
     };
 }
 
-pub fn untrustedDenied(cef_id: c_int, reason: c_int) callconv(.c) void {
+/// Loader/broker refusal callback (`sk_web_untrusted_denied_fn`).
+pub fn untrustedDenied(cef_id: c_int, req_id: u64, reason: c_int, unsent: c_int) callconv(.c) void {
     g_int.acquire();
     defer g_int.release();
     const s = g_int.slotByCef(cef_id) orelse return;
-    netpolicy.deny(&s.pc, untrustedReason(reason));
+    noteUntrustedDenial(s, req_id, untrustedReason(reason), unsent != 0);
+}
+
+/// Under the lock. Counts the refusal and, when nothing left the process, makes the request's log entry a blocked one naming it.
+///
+/// Without that the entry ends with CEF's error for a declined handler (ERR_UNKNOWN_URL_SCHEME), which says nothing about policy.
+fn noteUntrustedDenial(s: *ISlot, req_id: u64, reason: proto.NetReason, unsent: bool) void {
+    netpolicy.deny(&s.pc, reason);
     s.pol_dirty = true;
+    if (!unsent) return;
+    const ring = s.ring orelse return;
+    const e = openEntry(ring, req_id) orelse return;
+    e.blocked = true;
+    // A blocked entry is final; CEF's completion must not overwrite it.
+    e.done = true;
+    e.reason = @intFromEnum(reason);
+    s.blocked +%= 1;
+    s.dirty = true;
+}
+
+test "an untrusted refusal before the broker blocks its log entry; one after it only counts" {
+    const gpa = std.testing.allocator;
+    const ring = try gpa.create([NLOG]LogEntry);
+    defer gpa.destroy(ring);
+    ring.* = @splat(.{});
+    var s = ISlot{ .used = true, .ring = ring };
+    logRequest(&s, 5, 0, .xhr, .none, "POST", "http://h/a");
+    logRequest(&s, 6, 0, .xhr, .none, "POST", "http://h/b");
+    noteUntrustedDenial(&s, 5, .untrusted_http, true);
+    const refused = &ring[0];
+    try std.testing.expect(refused.blocked and refused.done);
+    try std.testing.expectEqual(@intFromEnum(proto.NetReason.untrusted_http), refused.reason);
+    try std.testing.expect(openEntry(ring, 5) == null);
+    try std.testing.expectEqual(@as(u32, 1), s.blocked);
+    noteUntrustedDenial(&s, 6, .untrusted_timeout, false);
+    try std.testing.expect(!ring[1].blocked and !ring[1].done and ring[1].reason == 0);
+    try std.testing.expectEqual(@as(u32, 1), s.blocked);
+    // An unknown id still counts against the policy.
+    noteUntrustedDenial(&s, 99, .untrusted_http, true);
+    try std.testing.expectEqual(@as(u32, 1), s.blocked);
+    try std.testing.expectEqual(@as(u32, 2), s.pc.denied[@intFromEnum(proto.NetReason.untrusted_http)]);
+    try std.testing.expectEqual(@as(u32, 1), s.pc.denied[@intFromEnum(proto.NetReason.untrusted_timeout)]);
 }
 
 test "broker reasons map by the header's enum and unknown values fail closed" {

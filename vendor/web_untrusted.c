@@ -783,9 +783,11 @@ static void sk_fetch(struct sk_curl *a, struct sk_request *q, size_t header_len,
     CURL *easy = a->easy_init();
     struct curl_slist *headers = NULL;
     if (!easy || !r->headers) goto done;
+    int typed = 0;
     for (size_t at = 0; at < header_len;) {
         const char *name = q->headers + at; at += strlen(name) + 1;
         const char *value = q->headers + at; at += strlen(value) + 1;
+        if (!strcasecmp(name, "content-type")) typed = 1;
         if (!strcasecmp(name, "accept-encoding") || !strncasecmp(name, "sec-fetch-", 10)) continue;
         if (r->cross_static && (!strcasecmp(name, "cookie") || !strcasecmp(name, "referer") ||
                                 !strcasecmp(name, "origin"))) continue;
@@ -795,6 +797,13 @@ static void sk_fetch(struct sk_curl *a, struct sk_request *q, size_t header_len,
     struct curl_slist *next = a->slist_append(headers, "Expect:");
     if (!next) goto done;
     headers = next;
+    /* curl labels a POST body x-www-form-urlencoded unless its default is removed;
+     * a body the page left untyped must reach the server untyped. */
+    if (!typed && !strcmp(q->method, "POST")) {
+        next = a->slist_append(headers, "Content-Type:");
+        if (!next) goto done;
+        headers = next;
+    }
     if (r->cross_static) {
         char line[SK_URL_CAP + 9];
         snprintf(line, sizeof(line), "Origin: %s", *q->initiator ? q->initiator : "null");
@@ -1064,7 +1073,8 @@ struct sk_handler {
     int queued; /* Guarded by sk_workers_lock, like next. */
     int browser_id;
     int64_t deadline;
-    void (*denied)(int, int);
+    sk_web_untrusted_denied_fn denied;
+    uint64_t request_id;
     struct sk_handler *next;
 };
 static pthread_mutex_t sk_workers_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -1201,7 +1211,7 @@ done:
     cef_callback_t *callback = h->callback; h->callback = NULL;
     canceled = h->canceled;
     pthread_mutex_unlock(&h->lock);
-    if (!canceled && r.reason && h->denied) h->denied(h->browser_id, r.reason);
+    if (!canceled && r.reason && h->denied) h->denied(h->browser_id, h->request_id, r.reason, 0);
     if (callback) {
         if (!canceled) callback->cont(callback);
         sk_release_arg(&callback->base);
@@ -1248,7 +1258,7 @@ static int CEF_CALLBACK sk_open(cef_resource_handler_t *self, cef_request_t *req
     if (refused) {
         pthread_mutex_unlock(&h->lock); pthread_mutex_unlock(&sk_workers_lock);
         sk_release_arg(callback ? &callback->base : NULL);
-        if (!reason && !canceled && h->denied) h->denied(h->browser_id, refused);
+        if (!reason && !canceled && h->denied) h->denied(h->browser_id, h->request_id, refused, 1);
         return 0;
     }
     if (!callback) { pthread_mutex_unlock(&h->lock); pthread_mutex_unlock(&sk_workers_lock); return 0; }
@@ -1274,7 +1284,7 @@ static int CEF_CALLBACK sk_open(cef_resource_handler_t *self, cef_request_t *req
         sk_workers = h->next; --sk_worker_count; h->callback = NULL;
         pthread_mutex_unlock(&h->lock); pthread_mutex_unlock(&sk_workers_lock);
         sk_release_arg(&callback->base);
-        if (h->denied) h->denied(h->browser_id, SK_WEB_UNTRUSTED_BROKER_FAILURE);
+        if (h->denied) h->denied(h->browser_id, h->request_id, SK_WEB_UNTRUSTED_BROKER_FAILURE, 1);
         sk_release(&h->cef.base);
         return 0;
     }
@@ -1562,7 +1572,8 @@ static int sk_copy_request(struct sk_handler *h, cef_request_t *request) {
                 if (ok) {
                     cef_postdataelement_type_t type = e->get_type(e);
                     size_t n = type == PDE_TYPE_BYTES ? e->get_bytes_count(e) : 0;
-                    if ((type != PDE_TYPE_BYTES && type != PDE_TYPE_EMPTY) || n > SK_UPLOAD_CAP - r->body_len) ok = 0;
+                    /* EMPTY is how CEF surfaces a data-pipe part (Blob, File, stream): never "no bytes". */
+                    if (type != PDE_TYPE_BYTES || n > SK_UPLOAD_CAP - r->body_len) ok = 0;
                     else if (n) {
                         void *p = realloc(r->body, r->body_len + n);
                         if (!p) ok = 0;
@@ -1584,12 +1595,13 @@ static int sk_copy_request(struct sk_handler *h, cef_request_t *request) {
 
 cef_resource_handler_t *sk_web_untrusted_resource(cef_request_t *request,
                                                 const cef_resource_request_handler_t *metadata, int allow_private,
-                                                void (*denied)(int, int), int browser_id) {
+                                                sk_web_untrusted_denied_fn denied, int browser_id) {
+    uint64_t request_id = request && request->get_identifier ? request->get_identifier(request) : 0;
     struct sk_handler *h = calloc(1, sizeof(*h));
     if (!h || pthread_mutex_init(&h->lock, NULL)) {
-        free(h); if (denied) denied(browser_id, SK_WEB_UNTRUSTED_BROKER_FAILURE); return NULL;
+        free(h); if (denied) denied(browser_id, request_id, SK_WEB_UNTRUSTED_BROKER_FAILURE, 1); return NULL;
     }
-    atomic_init(&h->refs, 1); h->fd = -1;
+    atomic_init(&h->refs, 1); h->fd = -1; h->request_id = request_id;
     h->request.allow_private = allow_private;
     h->denied = denied; h->browser_id = browser_id;
     h->cef.base.size = sizeof(h->cef);
@@ -1607,7 +1619,7 @@ cef_resource_handler_t *sk_web_untrusted_resource(cef_request_t *request,
     }
     if (!trusted || !sk_copy_request(h, request)) h->response.reason = SK_WEB_UNTRUSTED_UNSUPPORTED;
     else if (!sk_broker_pid) h->response.reason = SK_WEB_UNTRUSTED_BROKER_FAILURE;
-    if (h->response.reason && denied) denied(browser_id, h->response.reason);
+    if (h->response.reason && denied) denied(browser_id, request_id, h->response.reason, 1);
     return &h->cef;
 }
 
@@ -1676,9 +1688,9 @@ cef_resource_request_handler_t *sk_web_untrusted_request_handler(
 }
 cef_resource_handler_t *sk_web_untrusted_resource(cef_request_t *request,
                                                 const cef_resource_request_handler_t *metadata, int allow_private,
-                                                void (*denied)(int, int), int browser_id) {
+                                                sk_web_untrusted_denied_fn denied, int browser_id) {
     (void)request; (void)metadata; (void)allow_private;
-    if (denied) denied(browser_id, SK_WEB_UNTRUSTED_BROKER_FAILURE);
+    if (denied) denied(browser_id, 0, SK_WEB_UNTRUSTED_BROKER_FAILURE, 1);
     return NULL;
 }
 #endif

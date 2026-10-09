@@ -22,7 +22,9 @@ int sk_missing_curl_placeholder(void) { return 0; }
 #include <assert.h>
 #include <stdio.h>
 static int stub_reason;
-static void stub_denied(int id, int reason) { assert(id == 17); stub_reason = reason; }
+static void stub_denied(int id, uint64_t request_id, int reason, int unsent) {
+    assert(id == 17 && !request_id && unsent); stub_reason = reason;
+}
 int main(void) {
     assert(!sk_web_untrusted_job_landlock() && !sk_web_untrusted_no_core());
     assert(!sk_web_untrusted_core_limit() && !sk_web_untrusted_nondumpable());
@@ -692,6 +694,28 @@ static void broker_metadata(const char *url) {
     puts("PASS broker sends reconstructed Fetch Metadata and replaces spoofed fields without duplicates");
 }
 
+static unsigned occurrences(const char *text, const char *needle) {
+    unsigned n = 0;
+    for (const char *at = strstr(text, needle); at; at = strstr(at + 1, needle)) ++n;
+    return n;
+}
+
+static void broker_post_type(const char *url) {
+    char path[512], source[256];
+    snprintf(path, sizeof(path), "%smetadata", url);
+    snprintf(source, sizeof(source), "%.*s", (int)strlen(url) - 1, url);
+    struct sk_response r = exchange_as(path, "POST", "", 0, "abc", 3, 1, source, 0, RT_XHR);
+    assert(!r.reason && r.body_len && strstr((char *)r.body, "\r\nContent-Length: 3\r\n"));
+    assert(!occurrences((char *)r.body, "Content-Type"));
+    response_free(&r);
+    const char typed[] = "Content-Type\0text/plain;charset=UTF-8\0";
+    r = exchange_as(path, "POST", typed, sizeof(typed) - 1, "abc", 3, 1, source, 0, RT_XHR);
+    assert(!r.reason && strstr((char *)r.body, "\r\nContent-Type: text/plain;charset=UTF-8\r\n"));
+    assert(occurrences((char *)r.body, "Content-Type") == 1);
+    response_free(&r);
+    puts("PASS broker sends an untyped POST body untyped, never curl's form default");
+}
+
 struct fake_request { cef_request_t cef; atomic_int refs; const char *url, *method, *headers; size_t header_len; cef_post_data_t *post; cef_resource_type_t type; };
 static void CEF_CALLBACK req_add(cef_base_ref_counted_t *base) { atomic_fetch_add(&((struct fake_request *)base)->refs, 1); }
 static int CEF_CALLBACK req_release(cef_base_ref_counted_t *base) { return atomic_fetch_sub(&((struct fake_request *)base)->refs, 1) == 1; }
@@ -702,6 +726,8 @@ static cef_string_userfree_t user_string(const char *text) {
 static cef_string_userfree_t CEF_CALLBACK req_url(cef_request_t *self) { return user_string(((struct fake_request *)self)->url); }
 static cef_string_userfree_t CEF_CALLBACK req_method(cef_request_t *self) { return user_string(((struct fake_request *)self)->method); }
 static cef_resource_type_t CEF_CALLBACK req_type(cef_request_t *self) { return ((struct fake_request *)self)->type; }
+#define FAKE_REQUEST_ID 4242u
+static uint64_t CEF_CALLBACK req_identifier(cef_request_t *self) { (void)self; return FAKE_REQUEST_ID; }
 static cef_post_data_t *CEF_CALLBACK req_post(cef_request_t *self) {
     cef_post_data_t *post = ((struct fake_request *)self)->post;
     if (post) post->base.add_ref(&post->base);
@@ -722,10 +748,10 @@ static void request_init(struct fake_request *r, const char *url, const char *me
     r->cef.base.size = sizeof(r->cef); r->cef.base.add_ref = req_add; r->cef.base.release = req_release;
     r->cef.get_url = req_url; r->cef.get_method = req_method;
     r->cef.get_header_map = req_headers; r->cef.get_post_data = req_post;
-    r->cef.get_resource_type = req_type;
+    r->cef.get_resource_type = req_type; r->cef.get_identifier = req_identifier;
 }
 
-static void denied(int id, int reason);
+static void denied(int id, uint64_t request_id, int reason, int unsent);
 
 static cef_resource_handler_t *resource_as(struct fake_request *req, int allow,
                                          const char *initiator, int navigation) {
@@ -804,8 +830,11 @@ static void wait_workers(void) {
     while (sk_worker_count) pthread_cond_wait(&sk_workers_done, &sk_workers_lock);
     pthread_mutex_unlock(&sk_workers_lock);
 }
-static atomic_int denial_count, denial_reason;
-static void denied(int id, int reason) { assert(id == 17); atomic_store(&denial_reason, reason); atomic_fetch_add(&denial_count, 1); }
+static atomic_int denial_count, denial_reason, denial_unsent;
+static void denied(int id, uint64_t request_id, int reason, int unsent) {
+    assert(id == 17 && request_id == FAKE_REQUEST_ID);
+    atomic_store(&denial_reason, reason); atomic_store(&denial_unsent, unsent); atomic_fetch_add(&denial_count, 1);
+}
 
 struct fake_element { cef_post_data_element_t cef; int refs; cef_postdataelement_type_t type; size_t size; };
 struct fake_post { cef_post_data_t cef; int refs, excluded; struct fake_element element; };
@@ -855,18 +884,20 @@ static void uploads(const char *url) {
     assert(atomic_load(&stats->posts) == baseline + 1 && !internal->response.reason);
     assert(h->base.release(&h->base));
     baseline = atomic_load(&stats->hits);
-    for (unsigned i = 0; i < 3; ++i) {
+    for (unsigned i = 0; i < 4; ++i) {
         post_init(&post);
         if (!i) post.element.type = PDE_TYPE_FILE;
         if (i == 1) post.excluded = 1;
         if (i == 2) post.element.size = SK_UPLOAD_CAP + 1;
+        /* CEF's shape for a Blob/File/stream part: EMPTY, not flagged excluded. */
+        if (i == 3) post.element.type = PDE_TYPE_EMPTY;
         h = resource_as(&req, 1, headers + 7, 0); assert(h);
         assert(((struct sk_handler *)h)->response.reason == SK_WEB_UNTRUSTED_UNSUPPORTED);
         assert(post.refs == 1 && post.element.refs == 1);
         assert(h->base.release(&h->base));
     }
     assert(atomic_load(&stats->hits) == baseline);
-    puts("PASS CEF POST bytes/element ownership, file/excluded-upload rejection and upload cap");
+    puts("PASS CEF POST bytes/element ownership, file/excluded/data-pipe upload rejection and upload cap");
 }
 
 struct fake_response { cef_response_t cef; int refs, status, error, length_headers, csp, worker_csp, cookies; char mime[64], charset[64]; };
@@ -931,6 +962,7 @@ static void handlers(const char *url) {
     request_init(&req, url, "POST");
     h = resource(&req, 1); assert(h);
     assert(atomic_load(&req.refs) == 1 && atomic_load(&denial_reason) == SK_WEB_UNTRUSTED_UNSUPPORTED);
+    assert(atomic_load(&denial_unsent) == 1);
     callback_init(&cb); req_add(&req.cef.base);
     assert(!h->open(h, &req.cef, &handle, &cb.cef) && handle);
     assert(atomic_load(&cb.refs) == 0 && !atomic_load(&cb.continued));
@@ -941,7 +973,7 @@ static void handlers(const char *url) {
     callback_init(&cb); req_add(&req.cef.base);
     assert(h->open(h, &req.cef, &handle, &cb.cef)); wait_workers();
     assert(atomic_load(&cb.refs) == 0 && atomic_load(&cb.continued) == 1);
-    assert(atomic_load(&denial_reason) == SK_WEB_UNTRUSTED_PRIVATE);
+    assert(atomic_load(&denial_reason) == SK_WEB_UNTRUSTED_PRIVATE && !atomic_load(&denial_unsent));
     assert(h->base.release(&h->base));
     puts("PASS async handler, borrowed factory request, callback references, duplicate CEF headers and decoded length");
 }
@@ -1200,6 +1232,7 @@ static void queueing(const char *url) {
     assert(!full->open(full, &full_req.cef, &handle, &full_cb.cef) && handle);
     assert(((struct sk_handler *)full)->response.reason == SK_WEB_UNTRUSTED_QUEUE_FULL);
     assert(atomic_load(&denial_reason) == SK_WEB_UNTRUSTED_QUEUE_FULL && atomic_load(&denial_count) == denials + 1);
+    assert(atomic_load(&denial_unsent) == 1);
     assert(!atomic_load(&full_cb.refs) && !atomic_load(&full_cb.continued) && full->base.release(&full->base));
     for (unsigned i = 0; i + 1 < SK_QUEUE_CAP; ++i) {
         fill[i]->cancel(fill[i]);
@@ -1414,6 +1447,7 @@ static void broker_tests(void) {
     trusted_metadata(url);
     navigation_metadata();
     broker_metadata(url);
+    broker_post_type(url);
     cross_origin_contract(url);
     worker_classification(url);
     cancellation_slots(url, 0);

@@ -3,6 +3,7 @@
 
 #include "include/capi/cef_resource_request_handler_capi.h"
 #include "include/capi/cef_frame_capi.h"
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -62,6 +63,11 @@ cef_resource_request_handler_t *sk_web_untrusted_request_handler(
     const cef_resource_request_handler_t *callbacks, cef_request_t *request,
     int is_navigation, int is_download, const cef_string_t *request_initiator);
 
+/* Reports one refused load. unsent is 1 when the loader refused before handing the
+ * request to the broker (nothing left the process), 0 when the broker answered with a
+ * refusal and the request may have been sent. request_id is CEF's request identifier. */
+typedef void (*sk_web_untrusted_denied_fn)(int cef_browser_id, uint64_t request_id, int reason, int unsent);
+
 /* Borrows request/metadata; returns one owned handler reference, including for refusals.
  * NULL is a refusal, never permission to fall back to CEF networking.
  * denied must be thread-safe, nonblocking, and live until stop returns; it may
@@ -82,11 +88,14 @@ cef_resource_request_handler_t *sk_web_untrusted_request_handler(
  * Worker HTTP loads are refused even same-origin; navigation responses add worker-src
  * 'none'. Empty/null initiators cannot load HTTP subresources because CEF gives
  * blob-worker imports the same RT_SCRIPT/frame attribution as document scripts.
- * No ranges, file uploads, authentication, CONNECT or upgrades.
+ * No ranges, file uploads, authentication, CONNECT or upgrades. A request body is
+ * only the BYTES elements CEF hands over: CEF reports a data-pipe body (Blob, File,
+ * ReadableStream) as an EMPTY element without flagging it excluded, so any EMPTY
+ * element refuses the load rather than sending a body with the part missing.
  */
 cef_resource_handler_t *sk_web_untrusted_resource(
     cef_request_t *request, const cef_resource_request_handler_t *metadata, int allow_private,
-    void (*denied)(int cef_browser_id, int reason), int cef_browser_id);
+    sk_web_untrusted_denied_fn denied, int cef_browser_id);
 
 #ifdef __cplusplus
 }
