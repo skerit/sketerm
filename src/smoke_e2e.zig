@@ -673,7 +673,7 @@ pub fn main() u8 {
             \\if [ "$1" = "-G" ]; then printf 'hostname 127.0.0.1\n'; exit 0; fi
             \\for a in "$@"; do case "$a" in hosta|hostb) exec '{s}/route-ssh' "$@";; esac; done
             \\case "$*" in *unreachable-host*) exit 255;; esac
-            \\printf 'dial\n' >> '{s}/ssh-dials'
+            \\printf 'dial wall_ms=%s argv=[%s]\n' "$(date +%s%3N)" "$*" >> '{s}/ssh-dials'
             \\if [ -e '{s}/ssh-delay' ]; then sleep 2; fi
             \\export XDG_RUNTIME_DIR='{s}'
             \\export XDG_STATE_HOME='{s}'
@@ -5710,6 +5710,20 @@ fn sshDials(allocator: std.mem.Allocator, rt: [:0]const u8) usize {
     return std.mem.count(u8, body, "\n");
 }
 
+/// Prints the fake ssh's dial lines (time, argv) after the first `skip`; the dialer double-forks, so no caller is named.
+fn dumpSshDials(allocator: std.mem.Allocator, rt: [:0]const u8, skip: usize) void {
+    var path_buf: [320:0]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buf, "{s}/ssh-dials", .{rt}) catch return;
+    const body = readFileAlloc(allocator, path) orelse return;
+    defer allocator.free(body);
+    var it = std.mem.splitScalar(u8, body, '\n');
+    var i: usize = 0;
+    while (it.next()) |line| : (i += 1) {
+        if (i < skip or line.len == 0) continue;
+        _ = c.fprintf(platform.stderr(), "smoke-e2e: ssh dial #%zu: %.*s\n", i + 1, @as(c_int, @intCast(@min(line.len, 2000))), line.ptr);
+    }
+}
+
 /// "Download File…" on a pane whose session lives on another host,
 /// driven the user's way: the action opens sketerm's own file picker on
 /// that host at the pane's directory, and the pick downloads over the
@@ -5730,6 +5744,13 @@ fn remoteDownloadStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [
     defer allocator.free(opened);
     if (std.mem.indexOf(u8, opened, "\"ok\":true") == null) return "the remote session tab was refused";
     const pane = parseNumAfter(opened, "\"pane\":") orelse return "the remote session reply named no pane";
+    // The tab's own dial is done once it answers. From here to the
+    // finished download nothing may dial the host again: the picker
+    // browses over the pane's session (its own connection and its FUSE
+    // warm-up each used to dial), and so does every background poll of
+    // that host (the assistants watcher's report once dialed it).
+    const opened_at = clock.nowMs();
+    const dials_before = sshDials(allocator, rt);
     // OSC 7 gives the pane the directory the picker opens at. The rig
     // emits it itself: whether the remote login shell's prompt reports
     // its directory depends on the user's shell setup, not on this build.
@@ -5770,10 +5791,6 @@ fn remoteDownloadStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [
     const focus_req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"focus\",\"pane\":{d}}}\n", .{pane}) catch return "focus request";
     if (roundtrip(allocator, sock, focus_req)) |r| allocator.free(r) else return "focusing the remote pane failed";
     _ = app.waitIdle(200, 4_000);
-    // The picker browses over the pane's own session: from here to the
-    // finished download, nothing may dial the host again (the picker's
-    // own connection and its FUSE warm-up each used to).
-    const dials_before = sshDials(allocator, rt);
     if (roundtrip(allocator, sock, "{\"cmd\":\"action\",\"data\":\"download_file\"}\n")) |r| allocator.free(r) else return "download_file roundtrip failed";
     const picker = waitNewToplevel(app, known, 15_000) orelse return "Download File opened no picker";
     if (!viewerWaitOcr(allocator, app, picker, "e2e-remote-dl", 20_000)) {
@@ -5804,9 +5821,14 @@ fn remoteDownloadStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [
         }
     }
     if (!arrived) return "the picked remote file never arrived in the download directory";
+    // Span two assistants-watcher ticks (3 s) since the tab opened, so a
+    // background poll of the new host cannot fall outside the count.
+    while (clock.nowMs() < opened_at + 7_000) pumpFor(app, 250);
     const dials_after = sshDials(allocator, rt);
-    if (dials_after != dials_before)
-        return whyf("Download File dialed the pane's host {d} more time(s) instead of riding the pane's session", .{dials_after -| dials_before});
+    if (dials_after != dials_before) {
+        dumpSshDials(allocator, rt, dials_before);
+        return whyf("the pane's host was dialed {d} more time(s) while its session was open, instead of riding it (see the ssh dial lines above)", .{dials_after -| dials_before});
+    }
     if (!closePaneGone(allocator, sock, pane)) return "the remote session tab survived close-pane";
     if (roundtrip(allocator, sock, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r);
     _ = app.waitIdle(200, 4_000);
