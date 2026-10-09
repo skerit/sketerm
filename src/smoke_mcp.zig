@@ -781,6 +781,17 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         say("smoke-mcp: focused shared-browser tab targeting ok");
         return 0;
     }
+    if (c.getenv("SKETERM_SMOKE_MCP_WEBNAV_ONLY") != null) {
+        var bin_buf: [4096:0]u8 = undefined;
+        const web_bin = resolveWebBin(&bin_buf) orelse fail("sketerm-webengine not built for the navigation-result stage");
+        _ = c.setenv("SKETERM_WEB_BIN", web_bin, 1);
+        defer _ = c.unsetenv("SKETERM_WEB_BIN");
+        _ = c.setenv("SKETERM_WEB_BROKER_ENGINE", "0", 1);
+        defer _ = c.unsetenv("SKETERM_WEB_BROKER_ENGINE");
+        webNavStage(allocator, exe, rt);
+        say("smoke-mcp: focused navigation results ok");
+        return 0;
+    }
     if (c.getenv("SKETERM_SMOKE_MCP_WEBSTREAM_ONLY") != null) {
         var bin_buf: [4096:0]u8 = undefined;
         const web_bin = resolveWebBin(&bin_buf) orelse fail("built sketerm-webengine missing for the stream stage");
@@ -6801,6 +6812,217 @@ fn webPolicyFakeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []co
     }
 }
 
+/// Stage wn's loopback site: one url per way a navigation can end.
+const NavHttp = struct {
+    lis: tcpserver.Listener = .{ .backlog = 32, .poll_ms = 100 },
+
+    const page = "<!doctype html><html><head><title>nav-page</title></head><body>NAV-PAGE</body></html>";
+    const final = "<!doctype html><html><head><title>nav-final</title></head><body>NAV-FINAL</body></html>";
+    const missing = "<!doctype html><html><head><title>nav-404</title></head><body>NOT-FOUND-BODY</body></html>";
+    const late =
+        \\<!doctype html><html><head><title>nav-late</title></head><body>
+        \\<script>setTimeout(() => { const d = document.createElement("div"); d.id = "late"; d.textContent = "LATE"; document.body.appendChild(d); }, 1200);</script>
+        \\</body></html>
+    ;
+    const zip = "PK\x03\x04nav-download-bytes";
+
+    fn start(self: *NavHttp) bool {
+        return self.lis.start(self, &onConn);
+    }
+
+    fn onConn(_: ?*anyopaque, afd: c_int) bool {
+        var buf: [4096]u8 = undefined;
+        const raw = tcpserver.readRequest(afd, &buf, 3000);
+        const path_start = (std.mem.indexOfScalar(u8, raw, ' ') orelse return false) + 1;
+        const path_end = std.mem.indexOfScalarPos(u8, raw, path_start, ' ') orelse return false;
+        const path = raw[path_start..path_end];
+        const eq = std.mem.eql;
+        if (eq(u8, path, "/page")) {
+            tcpserver.respondOk(afd, "text/html", page, "");
+        } else if (eq(u8, path, "/r1")) {
+            tcpserver.respond(afd, "301 Moved Permanently", "text/plain", "", "Location: /r2\r\n");
+        } else if (eq(u8, path, "/r2")) {
+            tcpserver.respond(afd, "302 Found", "text/plain", "", "Location: /final\r\n");
+        } else if (eq(u8, path, "/final")) {
+            tcpserver.respondOk(afd, "text/html", final, "");
+        } else if (eq(u8, path, "/missing")) {
+            tcpserver.respond(afd, "404 Not Found", "text/html", missing, "");
+        } else if (eq(u8, path, "/late")) {
+            tcpserver.respondOk(afd, "text/html", late, "");
+        } else if (eq(u8, path, "/file.zip")) {
+            tcpserver.respondOk(afd, "application/zip", zip, "");
+        } else {
+            tcpserver.respond(afd, "404 Not Found", "text/plain", "?", "");
+        }
+        return false;
+    }
+};
+
+fn navOf(o: std.json.ObjectMap, comptime what: []const u8) std.json.ObjectMap {
+    const n = o.get("navigation") orelse fail(what ++ ": the reply carries no navigation");
+    if (n != .object) fail(what ++ ": navigation is not an object");
+    return n.object;
+}
+
+fn expectNull(o: std.json.ObjectMap, key: []const u8, comptime what: []const u8) void {
+    const v = o.get(key) orelse fail(what ++ ": the key is missing");
+    if (v != .null) fail(what);
+}
+
+/// Stage wn: what a navigation PRODUCED, on web_open / web_navigate,
+/// against the real helper: a 200 page, a 301 -> 302 -> 200 chain, a 404
+/// with a body, a refused connection, a download, a data: url, and the
+/// `wait` option met (a selector that appears late) and not met.
+fn webNavStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) void {
+    _ = rt;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var http = NavHttp{};
+    if (!http.start()) fail("wn: could not bind the loopback navigation fixture");
+    defer http.lis.deinit();
+    // A port nothing listens on: bound, learned, closed.
+    var gone = tcpserver.Listener{};
+    if (!gone.start(null, &NavHttp.onConn)) fail("wn: could not bind the closed-port probe");
+    const closed_port = gone.port;
+    gone.deinit();
+    var args: [1024]u8 = undefined;
+
+    var m = Mcp.spawn(allocator, exe, &.{});
+    m.initialize();
+
+    {
+        const caps = capSc(arena, m.callTool("capabilities", "{}"), "wn: capabilities", false);
+        const f = (caps.get("web_nav_result") orelse fail("wn: capabilities has no web_nav_result")).object;
+        if (!f.get("available").?.bool) fail("wn: web_nav_result is not available");
+    }
+
+    // A bad wait opens nothing.
+    {
+        _ = capSc(arena, m.callTool("web_open", "{\"url\":\"about:blank\",\"wait\":{\"for\":\"response\"}}"), "wn: wait for response", true);
+        _ = capSc(arena, m.callTool("web_open", "{\"url\":\"about:blank\",\"wait\":\"selector\"}"), "wn: selector without arg", true);
+        if (capInt(capSc(arena, m.callTool("web_tabs", "{}"), "wn: tabs", false), "count") != 0) fail("wn: a refused wait still opened a tab");
+    }
+
+    // (1) 200.
+    m.sendTool("web_open", std.fmt.bufPrint(&args, "{{\"url\":\"http://127.0.0.1:{d}/page\",\"snapshot\":\"none\",\"label\":\"wn\"}}", .{http.lis.port}) catch unreachable);
+    {
+        const r = capSc(arena, m.recvLine(60_000), "wn: open 200", false);
+        const n = navOf(r, "wn: open 200");
+        expectFact(n, "outcome", "page", "wn: a 200 page is not outcome page");
+        if (capInt(n, "status") != 200) fail("wn: the 200 page does not report status 200");
+        expectFact(n, "status_text", "OK", "wn: the 200 page does not report status text OK");
+        expectFact(n, "content_type", "text/html", "wn: the 200 page does not report text/html");
+        if (n.get("redirects").?.array.items.len != 0) fail("wn: a direct page reports redirects");
+        if (!n.get("detail").?.bool) fail("wn: the built helper does not report net-log-detail");
+        if (capInt(n, "size") != NavHttp.page.len) fail("wn: the 200 page size is not the body length");
+        const caps = capSc(arena, m.callTool("capabilities", "{}"), "wn: capabilities after start", false);
+        const hd = caps.get("web_nav_result").?.object.get("helper_detail").?;
+        if (hd != .bool or !hd.bool) fail("wn: capabilities does not report helper_detail once the helper runs");
+    }
+
+    // (2) 301 -> 302 -> 200.
+    m.sendTool("web_navigate", std.fmt.bufPrint(&args, "{{\"url\":\"http://127.0.0.1:{d}/r1\"}}", .{http.lis.port}) catch unreachable);
+    {
+        const r = capSc(arena, m.recvLine(40_000), "wn: redirect chain", false);
+        const n = navOf(r, "wn: redirect chain");
+        expectFact(n, "outcome", "page", "wn: a redirect chain to a 200 is not outcome page");
+        if (capInt(n, "status") != 200) fail("wn: the chain's final status is not 200");
+        if (!std.mem.endsWith(u8, scStr(n, "url", "wn: final url"), "/final")) fail("wn: the final url is not /final");
+        const hops = n.get("redirects").?.array.items;
+        if (hops.len != 2) {
+            say(m.callTool("web_network", "{\"max\":20}"));
+            fail("wn: the chain does not report exactly two redirects");
+        }
+        if (capInt(hops[0].object, "status") != 301 or !std.mem.endsWith(u8, scStr(hops[0].object, "url", "wn: hop 1"), "/r1")) fail("wn: hop 1 is not /r1 301");
+        if (capInt(hops[1].object, "status") != 302 or !std.mem.endsWith(u8, scStr(hops[1].object, "url", "wn: hop 2"), "/r2")) fail("wn: hop 2 is not /r2 302");
+        const net = capSc(arena, m.callTool("web_network", "{\"max\":20}"), "wn: web_network", false);
+        if (!net.get("log_detail").?.bool) fail("wn: web_network does not report log_detail");
+        var linked = false;
+        for (net.get("requests").?.array.items) |e| {
+            if (e.object.get("prev_seq") != null) linked = true;
+        }
+        if (!linked) fail("wn: web_network rows carry no prev_seq redirect link");
+    }
+
+    // (3) 404 with a body.
+    m.sendTool("web_navigate", std.fmt.bufPrint(&args, "{{\"url\":\"http://127.0.0.1:{d}/missing\"}}", .{http.lis.port}) catch unreachable);
+    {
+        const r = capSc(arena, m.recvLine(40_000), "wn: 404", false);
+        const n = navOf(r, "wn: 404");
+        expectFact(n, "outcome", "http_error", "wn: a 404 is not outcome http_error");
+        if (capInt(n, "status") != 404) fail("wn: the 404 does not report status 404");
+        expectFact(n, "status_text", "Not Found", "wn: the 404 status text");
+        expectFact(r, "title", "nav-404", "wn: the 404 page's own body is not what the view shows");
+    }
+
+    // (4) Connection refused.
+    m.sendTool("web_navigate", std.fmt.bufPrint(&args, "{{\"url\":\"http://127.0.0.1:{d}/\"}}", .{closed_port}) catch unreachable);
+    {
+        const r = capSc(arena, m.recvLine(40_000), "wn: refused", false);
+        const n = navOf(r, "wn: refused");
+        expectFact(n, "outcome", "network_error", "wn: a refused connection is not outcome network_error");
+        expectNull(n, "status", "wn: a refused connection reports an HTTP status");
+        if (capInt(n, "error_code") != -102) fail("wn: a refused connection is not error_code -102");
+        expectFact(n, "error", "net::ERR_CONNECTION_REFUSED", "wn: the refused error name");
+    }
+
+    // (5) A download instead of a page.
+    m.sendTool("web_navigate", std.fmt.bufPrint(&args, "{{\"url\":\"http://127.0.0.1:{d}/file.zip\",\"timeout_ms\":8000}}", .{http.lis.port}) catch unreachable);
+    {
+        const r = capSc(arena, m.recvLine(40_000), "wn: download", false);
+        const n = navOf(r, "wn: download");
+        expectFact(n, "outcome", "download", "wn: a zip is not outcome download");
+        expectFact(n, "content_type", "application/zip", "wn: the download's content type");
+    }
+
+    // (6) data: has no HTTP status.
+    m.sendTool("web_navigate", "{\"url\":\"data:text/html,<title>nav-data</title>DATA\"}");
+    {
+        const r = capSc(arena, m.recvLine(40_000), "wn: data", false);
+        const n = navOf(r, "wn: data");
+        expectFact(n, "outcome", "non_http", "wn: a data: url is not outcome non_http");
+        expectFact(n, "scheme", "data", "wn: the data: scheme");
+        expectNull(n, "status", "wn: a data: url reports an HTTP status");
+    }
+
+    // (7) wait: a selector that appears 1.2s after load, then one that never does.
+    m.sendTool("web_navigate", std.fmt.bufPrint(&args, "{{\"url\":\"http://127.0.0.1:{d}/late\",\"wait\":{{\"for\":\"selector\",\"arg\":\"#late\",\"timeout_ms\":10000}}}}", .{http.lis.port}) catch unreachable);
+    {
+        const r = capSc(arena, m.recvLine(40_000), "wn: wait met", false);
+        const w = (r.get("wait") orelse fail("wn: no wait fact")).object;
+        if (!w.get("met").?.bool) {
+            say(scStr(w, "detail", "wn: wait detail"));
+            say(m.callTool("web_eval", "{\"code\":\"!!document.querySelector(\\\"#late\\\")\"}"));
+            say(m.callTool("web_eval", "{\"code\":\"document.body.innerHTML\"}"));
+            fail("wn: a selector that appears late was not met");
+        }
+        expectFact(w, "for", "selector", "wn: the wait echo");
+        expectFact(navOf(r, "wn: late"), "outcome", "page", "wn: the late page is not outcome page");
+    }
+    m.sendTool("web_navigate", std.fmt.bufPrint(&args, "{{\"url\":\"http://127.0.0.1:{d}/page\",\"wait\":{{\"for\":\"selector\",\"arg\":\"#never\",\"timeout_ms\":1500}}}}", .{http.lis.port}) catch unreachable);
+    {
+        const r = capSc(arena, m.recvLine(40_000), "wn: wait not met", false);
+        const w = r.get("wait").?.object;
+        if (w.get("met").?.bool) fail("wn: a selector that never appears was met");
+        if (capInt(w, "elapsed_ms") < 1400) fail("wn: an unmet wait returned before its timeout");
+    }
+    // The same code behind web_wait, and network_idle.
+    {
+        _ = capSc(arena, m.callTool("web_wait", "{\"for\":\"network_idle\",\"timeout_ms\":8000}"), "wn: web_wait network_idle", false);
+        const bad = capSc(arena, m.callTool("web_wait", "{\"for\":\"selector\",\"arg\":\"[[[\",\"timeout_ms\":3000}"), "wn: invalid selector", true);
+        expectFact(bad.get("error").?.object, "code", "invalid_args", "wn: an invalid selector is not invalid_args");
+    }
+    // web_open's wait too.
+    m.sendTool("web_open", std.fmt.bufPrint(&args, "{{\"url\":\"http://127.0.0.1:{d}/late\",\"snapshot\":\"none\",\"label\":\"wn\",\"wait\":{{\"for\":\"selector\",\"arg\":\"#late\"}}}}", .{http.lis.port}) catch unreachable);
+    {
+        const r = capSc(arena, m.recvLine(60_000), "wn: open wait", false);
+        if (!r.get("wait").?.object.get("met").?.bool) fail("wn: web_open's wait was not met");
+    }
+    _ = capSc(arena, m.callTool("web_close", "{\"label\":\"wn\"}"), "wn: close", false);
+    m.closeStdinWait();
+}
+
 /// Run only the optional browser stage for focused E2E validation.
 fn webOnly(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: [:0]const u8) u8 {
     var bin_buf: [4096:0]u8 = undefined;
@@ -6822,6 +7044,8 @@ fn webOnly(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: [:0]const u8) u
     say("smoke-mcp: focused response-body capture ok");
     webTabsStage(allocator, exe, rt);
     say("smoke-mcp: focused shared-browser tab targeting ok");
+    webNavStage(allocator, exe, rt);
+    say("smoke-mcp: focused navigation results ok");
     killDaemonsUnderRt(rt, allocator);
     _ = c.usleep(500_000);
     g_rt = null;

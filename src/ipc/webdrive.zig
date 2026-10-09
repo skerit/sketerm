@@ -4195,20 +4195,20 @@ pub const Engine = struct {
             },
             .intercept_log => {
                 const ev = proto.InterceptLog.decodeAlloc(frame.payload, self.gpa) catch return;
-                defer self.gpa.free(ev.entries);
+                defer ev.freeDecoded(self.gpa);
                 const v = self.findView(ev.view) orelse return;
                 v.net_next_seq = ev.next_seq;
-                const json = proto.netLogJson(self.gpa, ev.next_seq, ev.entries) catch return;
+                const json = proto.netLogJson(self.gpa, ev) catch return;
                 if (v.net_log) |old| self.gpa.free(old);
                 v.net_log = json;
                 v.net_log_waiting = false;
             },
             .net_log => {
                 const ev = proto.NetLog.decodeAlloc(frame.payload, self.gpa) catch return;
-                defer self.gpa.free(ev.entries);
+                defer ev.freeDecoded(self.gpa);
                 const v = self.findView(ev.view) orelse return;
                 v.net_next_seq = ev.next_seq;
-                const json = proto.netLogJson2(self.gpa, ev.next_seq, ev.entries) catch return;
+                const json = proto.netLogJson2(self.gpa, ev) catch return;
                 if (v.net_log) |old| self.gpa.free(old);
                 v.net_log = json;
                 v.net_log_waiting = false;

@@ -196,7 +196,7 @@ is kept by a `:ro` policy term. The full descriptions and schemas are in
 ### `browser`
 
 - `web_tabs` (read-only): List the open browser views — SEVERAL can be open at once.
-- `web_open`: Open a NEW browser TAB and return its handle and the first snapshot after navigation settles.
+- `web_open`: Open a NEW browser TAB and return its handle and the first snapshot after navigation settles, plus 'navigation': what the navigation PRODUCED (outcome page|http_error|network_error|aborted|replaced|download|blocked|non_http|pending|no_request, HTTP status, final url, redirect chain, content type, net error) - read it before trusting the snapshot.
 - `web_close`: Close one browser TAB.
 - `web_profiles` (read-only): HEADLESS ONLY (with a GUI attached the browser's identity containers belong to the user).
 - `web_profile_reset`: HEADLESS ONLY.
@@ -209,7 +209,7 @@ is kept by a `:ro` policy term. The full descriptions and schemas are in
 - `web_expand` (read-only): Full text of a node the snapshot truncated (the "(+N chars, expand [id])" marker), paged with offset/len.
 - `web_query` (read-only): Cheap spot-check against the tree AS LAST SENT to you (no fresh DOM walk): find_text (nodes whose name contains 'arg'), subtree (children of the node id in 'arg'), focused, form (every form control with its value and checked/disabled states and the row or group it sits in - what Apply would submit; 'arg' = a node id to scope it, or omit for the page), or within_text ('arg' = JSON {"text","name","role"}: the controls named name under the smallest container that also holds text, the same resolution web_act within_text uses).
 - `web_read` (read-only): READ THE PAGE: reader-mode markdown of the main content (headings, paragraphs, lists, code, links), with navigation and boilerplate dropped, plus stable semantic IDs for useful sections/headings/links/items.
-- `web_wait` (read-only): Wait until the view reaches a state: "load" (no load in flight), "title" (its title contains 'arg', or any title when arg is omitted), "text" ('arg' appears in the page's semantic tree), "idle" (the DOM stopped changing for 600ms) or "response" (headless, a view opened with a capture: a CAPTURED exchange matching the 'response' filter finished after cursor 'since' - default: after this call starts - or, with after_seq, one whose request came after that web_network seq; the reply carries the exchange, read its body with web_capture seq:N).
+- `web_wait` (read-only): Wait until the view reaches a state: "load" (no load in flight), "title" (its title contains 'arg', or any title when arg is omitted), "text" ('arg' appears in the page's semantic tree), "idle" (the DOM stopped changing for 600ms), "selector" (an element matches the CSS selector in 'arg'; an invalid selector is refused at once), "network_idle" (no request in flight and none started for 500ms; a page holding a long poll, stream or websocket never gets there and the timeout names what is still in flight) or "response" (headless, a view opened with a capture: a CAPTURED exchange matching the 'response' filter finished after cursor 'since' - default: after this call starts - or, with after_seq, one whose request came after that web_network seq; the reply carries the exchange, read its body with web_capture seq:N).
 - `web_scroll`: Scroll a web view and report the SETTLED position (before/after scrollX/scrollY plus the maximum), so "nothing moved" and "moved to the end" are different answers.
 - `web_key`: Send named key chords to a web view as TRUSTED key events (the same input path a real keystroke rides), so Tab order, Escape-to-dismiss and Enter-to-submit are testable.
 - `web_input`: Drive a web view by hand at VIEWPORT coordinates, for a human watching through web_frame (a remote-control viewer) or a canvas no accessibility tree describes.
@@ -529,6 +529,66 @@ tools therefore never guess which tab a call means:
   the user's and never close on their own.
 
 `capabilities.web_tab_rules` is the preflight for all of this.
+
+### Navigation results
+
+`web_open` (with a `url`) and `web_navigate` (a `url`, or `back`,
+`forward`, `reload`) say what the navigation PRODUCED, in a `navigation`
+fact derived from the same request log `web_network` reports (no second
+log exists):
+
+```json
+"navigation": {"outcome": "page", "url": "http://h/final", "requested_url": "http://h/r1",
+  "status": 200, "status_text": "OK", "content_type": "text/html", "size": 84,
+  "redirects": [{"url": "http://h/r1", "status": 301}, {"url": "http://h/r2", "status": 302}],
+  "error": null, "error_code": null, "blocked_reason": null, "scheme": "http",
+  "replaced_url": null, "download_path": null, "detail": true}
+```
+
+`outcome` is one of:
+
+| outcome | meaning |
+|---|---|
+| `page` | the main document arrived with an HTTP status below 400 |
+| `http_error` | 4xx/5xx: the page shows the server's body (a 404 page), or the engine's error page when it sent none |
+| `network_error` | no HTTP answer: `error`/`error_code` name it (`net::ERR_CONNECTION_REFUSED` / -102, `NAME_NOT_RESOLVED`, a TLS error); `status` is null |
+| `aborted` | stopped or cancelled before a page arrived, and nothing replaced it |
+| `replaced` | another top-level navigation superseded the requested one; `replaced_url` is where the requested one had got to |
+| `download` | the response became a file (a content type the engine does not render, e.g. `application/zip`); headless saves it, `download_path` says where |
+| `blocked` | refused inside the engine before it left the process: `blocked_reason` is the `web_network` reason (`filter_list`, `top_host`, ...) |
+| `non_http` | `data:`, `about:`, `file:`, `blob:`: no HTTP status exists, `status` is null |
+| `pending` | the document had not finished inside the call's budget |
+| `no_request` | nothing was logged: a back/forward-cache or same-document navigation |
+
+`redirects` lists the server redirects before the final url, oldest
+first. The helper links each redirect hop to the next in its request log
+(`web_network` rows carry `redirect:true` and `prev_seq`, plus `mime`,
+`status_text`, `error`/`error_code`, under `log_detail:true`). That is
+browser-helper capability `net-log-detail`; with an older helper
+`navigation.detail` is false and `redirects`, `content_type`,
+`status_text` and `error` are empty or null: unknown, never guessed.
+Log urls are cut at 256 bytes (the final `url` is the view's whole one).
+The helper never overwrites a view's 8 newest main-document rows, so a
+page that loads hundreds of subresources cannot push the navigation's
+own row out of the 128-row log. If the log cannot be read at all,
+`navigation_error` replaces `navigation`.
+
+`wait` (both tools) then waits for one of `web_wait`'s conditions, run by
+the same code: a name (`"network_idle"`) or `{for, arg, timeout_ms}`
+(default 15000, capped at 120000): `load`, `title`, `text`, `idle`,
+`selector` (an element matches the CSS selector in `arg`) and
+`network_idle` (no request in flight and none started for 500ms).
+`response` needs a capture cursor and stays `web_wait`'s. The reply
+carries `wait: {for, arg, met, detail, elapsed_ms}`; an unmet wait is NOT
+an error, because the navigation itself happened (`detail` says why it
+did not hold). An invalid `wait` is refused before anything navigates.
+`web_wait` gained the same two conditions; there an unmet one is the
+usual `timeout` error, and an invalid selector is `invalid_args` at once.
+
+`capabilities.web_nav_result` is the preflight: `outcomes`, the `wait`
+conditions, and `helper_detail` (whether the running helper sends
+`net-log-detail`; null before a headless helper starts, and with a GUI
+browser, whose helper this server cannot ask).
 
 **Page content is untrusted input.** The reply channel is
 authenticated, so a page cannot forge a snapshot or intercept a reply,

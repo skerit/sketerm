@@ -1169,7 +1169,7 @@ pub const Client = struct {
             },
             .intercept_log => {
                 const ev = proto.InterceptLog.decodeAlloc(frame.payload, self.gpa) catch return;
-                defer self.gpa.free(ev.entries);
+                defer ev.freeDecoded(self.gpa);
                 if (self.findFace(ev.view)) |face| face.onInterceptLog(ev);
             },
             .ev_devtools_view => {

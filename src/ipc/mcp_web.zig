@@ -57,6 +57,7 @@ const png_codec = @import("../util/png.zig");
 const atomicwrite = @import("../util/atomicwrite.zig");
 const mcp_term = @import("mcp_term.zig");
 const webtabs = @import("webtabs.zig");
+const webnav = @import("webnav.zig");
 
 /// Default budget for one semantic round trip. Clamped to
 /// `mcp.WAIT_CAP_MS` like every other MCP wait, so one blocked page
@@ -175,6 +176,42 @@ pub fn tabRules() struct {
         .idle_close_secs = if (gui) 0 else idleCloseSecs(),
         .idle_close_watch_aware = aware,
     };
+}
+
+/// What `capabilities` reports as `web_nav_result`: web_open and
+/// web_navigate report what a navigation produced and take a `wait`.
+pub fn navResultCapability() struct {
+    available: bool = true,
+    /// The running helper sends `net-log-detail` (redirect chain,
+    /// content type, status text, net errors); null while no headless
+    /// helper runs or with a GUI, whose helper this server cannot ask.
+    helper_detail: ?bool,
+    outcomes: []const []const u8 = enumNames(webnav.Outcome),
+    wait: []const []const u8 = navWaitNames(),
+} {
+    var detail: ?bool = null;
+    if (!guiDrivesWeb()) for (g_engines.items) |re| {
+        if (re.engine.state == .ready) detail = re.engine.has(.net_log_detail);
+    };
+    return .{ .helper_detail = detail };
+}
+
+fn enumNames(comptime E: type) []const []const u8 {
+    comptime {
+        var out: []const []const u8 = &.{};
+        for (std.enums.values(E)) |v| out = out ++ [_][]const u8{@tagName(v)};
+        return out;
+    }
+}
+
+fn navWaitNames() []const []const u8 {
+    comptime {
+        var out: []const []const u8 = &.{};
+        for (std.enums.values(webnav.WaitFor)) |v| {
+            if (v.inNavigation()) out = out ++ [_][]const u8{@tagName(v)};
+        }
+        return out;
+    }
 }
 
 /// How often the loop re-checks while a tab is watched: the end of a
@@ -2011,6 +2048,161 @@ fn loadMark(arena: std.mem.Allocator, v: View) ![]const u8 {
 /// are peeled off.
 const Snap = struct { document: i64, revision: i64, tree: []const u8 };
 
+/// What a navigating call learned after it settled: the navigation the
+/// request log shows, and how its optional `wait` went.
+const NavPost = struct {
+    nav: ?NavOutcome = null,
+    wait: ?WaitReport = null,
+};
+
+const NavOutcome = union(enum) {
+    nav: webnav.Nav,
+    /// The log could not be read; the sentence says why.
+    unavailable: []const u8,
+};
+
+/// The `wait` fact of a navigating call.
+const WaitReport = struct {
+    @"for": []const u8,
+    arg: ?[]const u8,
+    met: bool,
+    detail: []const u8,
+    elapsed_ms: i64,
+};
+
+/// A `wait` option: `"load"`, or `{for, arg, timeout_ms}`.
+const NavWait = struct { what: webnav.WaitFor, arg: []const u8 = "", budget: i64 = 15_000 };
+
+const NavWaitParse = union(enum) { none, wait: NavWait, err: Fail };
+
+/// Validated before anything navigates, so a bad `wait` changes nothing.
+fn parseNavWait(args: std.json.Value) NavWaitParse {
+    const v = (if (args == .object) args.object.get("wait") else null) orelse return .none;
+    const bad = fail(.invalid_args, "'wait' must be a condition name or {for, arg, timeout_ms}; for is one of " ++ webnav.NAV_WAIT_ITEMS);
+    var out: NavWait = undefined;
+    const name: []const u8 = switch (v) {
+        .string => |str| str,
+        .object => |o| blk: {
+            const f = o.get("for") orelse return .{ .err = bad };
+            if (f != .string) return .{ .err = bad };
+            break :blk f.string;
+        },
+        else => return .{ .err = bad },
+    };
+    out = .{ .what = std.meta.stringToEnum(webnav.WaitFor, name) orelse return .{ .err = bad } };
+    if (!out.what.inNavigation())
+        return .{ .err = fail(.invalid_args, "wait for:\"response\" needs a capture cursor; call web_wait for:\"response\" after the navigation") };
+    if (v == .object) {
+        if (v.object.get("arg")) |a| {
+            if (a != .string) return .{ .err = fail(.invalid_args, "wait.arg must be a string") };
+            out.arg = a.string;
+        }
+        if (v.object.get("timeout_ms")) |t| {
+            if (t != .integer) return .{ .err = fail(.invalid_args, "wait.timeout_ms must be an integer") };
+            out.budget = @min(@max(t.integer, 100), mcp.WAIT_CAP_MS);
+        }
+    }
+    if (out.what.needsArg() and out.arg.len == 0)
+        return .{ .err = fail(.invalid_args, "wait for:\"selector\" needs arg (a CSS selector)") };
+    return .{ .wait = out };
+}
+
+/// Run a navigating call's `wait` through `waitCore`; never an error
+/// result, because the navigation itself happened: an unmet condition
+/// is `met:false` with the reason.
+fn runNavWait(drv: Driver, arena: std.mem.Allocator, view: View, w: NavWait) !struct { report: WaitReport, view: View } {
+    const t0 = drv.now();
+    const out = try waitCore(drv, arena, view, w.what, w.arg, w.budget);
+    var report: WaitReport = .{
+        .@"for" = @tagName(w.what),
+        .arg = if (w.arg.len > 0) w.arg else null,
+        .met = false,
+        .detail = "",
+        .elapsed_ms = 0,
+    };
+    var v = view;
+    switch (out) {
+        .met => |m| {
+            report.met = true;
+            report.detail = m.detail;
+            v = m.view;
+        },
+        .not_met => |n| {
+            report.detail = n.msg;
+            v = n.view;
+        },
+        .err => |f| report.detail = f.text,
+    }
+    report.elapsed_ms = drv.now() - t0;
+    return .{ .report = report, .view = v };
+}
+
+/// The request-log cursor before a navigation: rows logged after it are
+/// that navigation's. Null when the log cannot be read.
+fn navCursor(drv: Driver, arena: std.mem.Allocator, handle: u32) !?u32 {
+    switch (try netLog(drv, arena, handle, 0, 1, 3000)) {
+        .err => return null,
+        .json => |j| {
+            const log = webnav.parseLog(arena, j) catch return null;
+            return log.next_seq -| 1;
+        },
+    }
+}
+
+/// What the navigation produced, from the view's request log since
+/// `cursor` (the `web_network` records; no second log exists).
+fn navOf(drv: Driver, arena: std.mem.Allocator, v: View, cursor: u32, requested: ?[]const u8, started_ms: i64) !NavOutcome {
+    const json = switch (try netLog(drv, arena, v.pane, cursor, 128, 5000)) {
+        .err => |f| return .{ .unavailable = f.text },
+        .json => |j| j,
+    };
+    const log = webnav.parseLog(arena, json) catch return .{ .unavailable = "the browser helper returned a malformed request log" };
+    var dl: ?[]const u8 = null;
+    if (drv == .headless) {
+        drv.headless.pumpOnce(0);
+        for (drv.headless.downloadList()) |d| {
+            if (d.view == v.pane and d.started_ms >= started_ms and d.path.len > 0) dl = try arena.dupe(u8, d.path);
+        }
+    }
+    return .{ .nav = try webnav.derive(arena, log, .{
+        .requested = requested,
+        .view_url = v.url,
+        .load_error = if (v.load_error) |le| .{ .code = le.code, .msg = le.msg } else null,
+        .loading = v.loading,
+        .download_path = dl,
+    }) };
+}
+
+/// The engine offered a download for `view` since `since_ms` (headless,
+/// whose client answers every offer itself).
+fn downloadSince(e: *webdrive.Engine, view: u32, since_ms: i64) bool {
+    for (e.downloadList()) |d| {
+        if (d.view == view and d.started_ms >= since_ms) return true;
+    }
+    return false;
+}
+
+fn navFacts(res: *mcp.Res, arena: std.mem.Allocator, post: NavPost) !void {
+    if (post.nav) |n| switch (n) {
+        .nav => |nav| {
+            try res.fact("navigation", nav);
+            try res.text(try webnav.sentence(arena, nav));
+        },
+        .unavailable => |why| {
+            try res.fact("navigation_error", why);
+            try res.textf("navigation: unknown, the request log could not be read ({s})", .{why});
+        },
+    };
+    if (post.wait) |w| {
+        try res.fact("wait", w);
+        if (w.met)
+            try res.textf("wait for {s}{s}{s}: met after {d}ms ({s})", .{ w.@"for", if (w.arg != null) " " else "", w.arg orelse "", w.elapsed_ms, firstLine(w.detail, 200) })
+        else
+            try res.textf("wait for {s}{s}{s}: NOT met after {d}ms: {s}", .{ w.@"for", if (w.arg != null) " " else "", w.arg orelse "", w.elapsed_ms, w.detail });
+    }
+}
+
+
 fn openResult(
     arena: std.mem.Allocator,
     mode: Mode,
@@ -2023,9 +2215,11 @@ fn openResult(
     policy_source: []const u8,
     cap: ?*const webdrive.CaptureFilter,
     open_views: usize,
+    post: NavPost,
 ) ![]const u8 {
     var res = mcp.Res.init(arena);
     try head(&res, arena, mode, v);
+    try navFacts(&res, arena, post);
     // The hygiene nudge: views opened for a quick check and never
     // closed outlive the turn that needed them. web_close already
     // reports `remaining`; this is its open-side twin.
@@ -2206,9 +2400,11 @@ fn navigateResult(
     snap: ?Snap,
     snap_kind: []const u8,
     snap_err: ?[]const u8,
+    post: NavPost,
 ) ![]const u8 {
     var res = mcp.Res.init(arena);
     try head(&res, arena, mode, v);
+    try navFacts(&res, arena, post);
     try res.fact("can_back", v.can_back);
     try res.fact("can_fwd", v.can_fwd);
     try res.fact("settled", !v.loading);
@@ -3148,6 +3344,7 @@ fn networkResult(
     if (obj.get("next_seq")) |n| {
         if (n == .integer) try res.fact("next_seq", n.integer);
     }
+    try res.fact("log_detail", if (obj.get("detail")) |d| d == .bool and d.bool else false);
     var entries: []const std.json.Value = &.{};
     var listed = false;
     if (obj.get("entries")) |e| {
@@ -3413,6 +3610,12 @@ pub fn webTool(
             if (drv == .gui) return mcp.errRes(arena, .invalid_args, "accept_cert is headless only: with a GUI attached the user answers certificate errors in the pane's interstitial");
             if (!navfault.validFingerprint(fp)) return mcp.errRes(arena, .invalid_args, "accept_cert must be the certificate's SHA-256 as 64 hex digits (the 'cert.fingerprint' a refused open reported)");
         }
+        const nav_wait: ?NavWait = switch (parseNavWait(args)) {
+            .none => null,
+            .err => |f| return failRes(arena, f),
+            .wait => |w| w,
+        };
+        const nav_started = clock.nowMs();
         const new_handle: u32 = switch (try openViewConfigured(drv, arena, url, where, vw, vh, spec, if (policy) |*p| p else null, if (cap) |*f| f else null, route, emulation, max_fps, browser_name)) {
             .err => |e| return failRes(arena, e),
             .opened => |p| p,
@@ -3494,6 +3697,9 @@ pub fn webTool(
                     // not coming, and the reply must say so NOW rather
                     // than after the whole timeout with "not settled".
                     if (found.loadBlocked()) break;
+                    // A url that became a download never commits a
+                    // document: the offer IS the outcome.
+                    if (drv == .headless and downloadSince(drv.headless, new_handle, nav_started)) break;
                     // A view created blank has load_seq 0 to start
                     // with; anything it has already finished by the
                     // first poll is a load this call caused.
@@ -3512,6 +3718,19 @@ pub fn webTool(
             v.label = l;
         }
         if (drv == .gui) g_tabs.touch(tabs_alloc, tabKey(.gui, v), clock.nowMs()) catch {};
+        var post: NavPost = .{};
+        if (nav_wait) |w| {
+            if (v.loadBlocked()) {
+                post.wait = .{ .@"for" = @tagName(w.what), .arg = if (w.arg.len > 0) w.arg else null, .met = false, .detail = "not waited: the requested page did not load", .elapsed_ms = 0 };
+            } else {
+                const r = try runNavWait(drv, arena, v, w);
+                post.wait = r.report;
+                v = r.view;
+                if (tab_label) |l| v.label = l;
+            }
+        }
+        // A fresh view's log starts with this navigation: cursor 0.
+        if (url != null) post.nav = try navOf(drv, arena, v, 0, url, nav_started);
         const remaining = @max(deadline - drv.now(), 2000);
         var snap: ?Snap = null;
         var snap_err: ?[]const u8 = null;
@@ -3521,7 +3740,7 @@ pub fn webTool(
             // is empty", which is the wrong conclusion.
             snap_err = "skipped: the requested page did not load";
             const echo: ?*const webdrive.NetPolicy = if (policy) |*p| p else if (drv == .headless and std.mem.eql(u8, policy_source, "profile_default")) drv.headless.profilePolicy(profile.?) else null;
-            return openResult(arena, drv.mode(), v, false, drv == .headless and !eql(u8, where, "tab"), null, snap_err, echo, policy_source, if (cap) |*f| f else null, open_views);
+            return openResult(arena, drv.mode(), v, false, drv == .headless and !eql(u8, where, "tab"), null, snap_err, echo, policy_source, if (cap) |*f| f else null, open_views, post);
         }
         // `snapshot:"none"` skips the tree for opens that only need a
         // view (a screenshot, a viewport): the full tree of a page the
@@ -3542,6 +3761,7 @@ pub fn webTool(
             policy_source,
             if (cap) |*f| f else null,
             open_views,
+            post,
         );
         switch (try runOp(drv, arena, new_handle, .{
             .op = "snapshot",
@@ -3580,6 +3800,7 @@ pub fn webTool(
             policy_source,
             if (cap) |*f| f else null,
             open_views,
+            post,
         );
     }
 
@@ -3619,6 +3840,15 @@ pub fn webTool(
         const action = mcp.argStr(args, "action");
         if (url == null and action == null)
             return mcp.errRes(arena, .invalid_args, "web_navigate needs 'url' or 'action' (back|forward|reload|stop)");
+        const nav_wait: ?NavWait = switch (parseNavWait(args)) {
+            .none => null,
+            .err => |f| return failRes(arena, f),
+            .wait => |w| w,
+        };
+        // `stop` navigates nowhere; everything else has a result.
+        const navigates = url != null or !std.mem.eql(u8, action.?, "stop");
+        const cursor: ?u32 = if (navigates) try navCursor(drv, arena, view.pane) else null;
+        const nav_started = clock.nowMs();
         if (try navigateView(drv, arena, view.pane, url, action)) |e|
             return failRes(arena, e);
         // Settle the nav state rather than reporting the pre-navigation
@@ -3632,6 +3862,7 @@ pub fn webTool(
             const found = viewFor(now, view.pane) orelse break;
             settled = found;
             if (found.loadBlocked()) break;
+            if (drv == .headless and downloadSince(drv.headless, view.pane, nav_started)) break;
             if (found.loading) {
                 was_loading = true;
                 continue;
@@ -3639,6 +3870,16 @@ pub fn webTool(
             if (was_loading or url == null) break;
             if (!std.mem.eql(u8, found.url, view.url)) break;
         }
+        var post: NavPost = .{};
+        if (nav_wait) |w| {
+            const r = try runNavWait(drv, arena, settled, w);
+            post.wait = r.report;
+            settled = r.view;
+        }
+        if (navigates) post.nav = if (cursor) |c0|
+            try navOf(drv, arena, settled, c0, url, nav_started)
+        else
+            .{ .unavailable = "the request log was unreadable before the navigation" };
         // `snapshot:"delta"|"full"` folds the follow-up tree the caller
         // was about to ask for into THIS reply; the default stays
         // "none" (the historical shape).
@@ -3665,7 +3906,7 @@ pub fn webTool(
                 },
             }
         }
-        return navigateResult(arena, drv.mode(), settled, nav_snap, nav_snap_kind, nav_snap_err);
+        return navigateResult(arena, drv.mode(), settled, nav_snap, nav_snap_kind, nav_snap_err, post);
     }
 
     if (eql(u8, name, "web_snapshot")) {
@@ -6576,31 +6817,70 @@ fn downloadListResult(drv: Driver, arena: std.mem.Allocator, view: View) ![]cons
 }
 
 fn waitTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view: View) ![]const u8 {
-    const what = mcp.argStr(args, "for") orelse "load";
-    if (std.mem.eql(u8, what, "response")) return waitResponse(drv, arena, args, view);
+    const what_s = mcp.argStr(args, "for") orelse "load";
+    const what = std.meta.stringToEnum(webnav.WaitFor, what_s) orelse
+        return mcp.errRes(arena, .invalid_args, "web_wait 'for' must be " ++ WAIT_FOR_NAMES);
+    if (what == .response) return waitResponse(drv, arena, args, view);
     const arg = mcp.argStr(args, "arg") orelse "";
+    if (what.needsArg() and arg.len == 0)
+        return mcp.errRes(arena, .invalid_args, "web_wait for:\"selector\" needs 'arg' (a CSS selector)");
     // Waiting for a load that policy will refuse would just burn the
     // whole timeout; the other waits read state that already exists.
-    if (std.mem.eql(u8, what, "load")) {
+    if (what == .load) {
         if (try policyGate(arena, view)) |f| return failRes(arena, f);
     }
-    const budget = timeoutOf(args, 15_000);
+    switch (try waitCore(drv, arena, view, what, arg, timeoutOf(args, 15_000))) {
+        .met => |m| return waitResult(arena, drv.mode(), m.view, what_s, arg, m.detail),
+        .not_met => |n| return mcp.errRes(arena, n.code, n.msg),
+        .err => |f| return failRes(arena, f),
+    }
+}
+
+/// `"load", "title", ...`: the `web_wait for` names, for sentences.
+const WAIT_FOR_NAMES = blk: {
+    var out: []const u8 = "";
+    const all = std.enums.values(webnav.WaitFor);
+    for (all, 0..) |w, i| out = out ++ (if (i == 0) "" else if (i + 1 == all.len) " or " else ", ") ++ @tagName(w);
+    break :blk out;
+};
+
+/// How long the request log must hold no request in flight for
+/// `network_idle` to hold.
+const NETWORK_IDLE_MS: i64 = 500;
+
+const WaitOutcome = union(enum) {
+    met: struct { view: View, detail: []const u8 },
+    /// The condition cannot hold or did not inside the budget; `code`
+    /// is what `web_wait` reports it as.
+    not_met: struct { view: View, code: mcp.ErrCode, msg: []const u8 },
+    err: Fail,
+};
+
+/// THE wait: `web_wait` and the `wait` option of `web_open` /
+/// `web_navigate` both run it. Every condition but `response` (which
+/// needs a capture cursor, `waitResponse`).
+fn waitCore(drv: Driver, arena: std.mem.Allocator, view: View, what: webnav.WaitFor, arg: []const u8, budget: i64) !WaitOutcome {
     const deadline = drv.now() + budget;
+    const what_s = @tagName(what);
 
     // `text` and `idle` are answered from the semantic tree, which the
     // helper only keeps updated once a snapshot has been asked for.
     // PEEK, never auto: a wait that consumed the base would silently
     // eat the delta the caller's next snapshot is owed.
-    if (std.mem.eql(u8, what, "text") or std.mem.eql(u8, what, "idle")) {
+    if (what == .text or what == .idle) {
         switch (try runOp(drv, arena, view.pane, .{
             .op = "snapshot",
             .mode = "peek",
             .detail = 1,
         }, @min(budget, 8000))) {
-            .err => |e| return failRes(arena, e),
+            .err => |e| return .{ .err = e },
             .done => {},
         }
     }
+    const selector_expr: []const u8 = if (what == .selector)
+        try std.fmt.allocPrint(arena, "!!document.querySelector({f})", .{std.json.fmt(arg, .{})})
+    else
+        "";
 
     var last: View = view;
     var last_rev: i64 = -1;
@@ -6609,53 +6889,54 @@ fn waitTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view: V
     // that polls never idles, and the timeout must say that rather than
     // read as "slow".
     var rev_changes: u32 = 0;
+    // network_idle: the log head and in-flight count last seen.
+    var net_head: u32 = 0;
+    var net_pending: []const u8 = "";
     const started = drv.now();
     while (true) {
-        if (std.mem.eql(u8, what, "load") or std.mem.eql(u8, what, "title")) {
-            if (try listViews(drv, arena)) |vs| {
+        switch (what) {
+            .load, .title => if (try listViews(drv, arena)) |vs| {
                 if (viewFor(vs, view.pane)) |v| {
                     last = v;
-                    if (std.mem.eql(u8, what, "load")) {
+                    if (what == .load) {
                         // A load that cannot arrive is an error now,
                         // not a timeout later.
                         if (v.cert) |ce| if (!std.mem.eql(u8, ce.state, "accepted"))
-                            return mcp.errRes(arena, .refused, try std.fmt.allocPrint(arena, "the load is {s} on a certificate error for {s}: {s} (sha256 {s}); {s}", .{
+                            return .{ .not_met = .{ .view = v, .code = .refused, .msg = try std.fmt.allocPrint(arena, "the load is {s} on a certificate error for {s}: {s} (sha256 {s}); {s}", .{
                                 if (std.mem.eql(u8, ce.state, "pending")) "HELD" else "REFUSED",
                                 if (ce.host.len > 0) ce.host else ce.url,
                                 ce.msg,
                                 if (ce.fingerprint.len > 0) ce.fingerprint else "unavailable",
                                 if (std.mem.eql(u8, ce.state, "pending")) "only the user can answer the interstitial in that pane" else "web_open again with accept_cert set to that fingerprint to trust exactly this certificate",
-                            }));
+                            }) } };
                         if (v.load_error) |le|
-                            return mcp.errRes(arena, .io_failed, try std.fmt.allocPrint(arena, "the load failed: {s} ({d}) for {s}", .{ le.msg, le.code, if (le.url.len > 0) le.url else v.url }));
-                        if (!v.loading and v.url.len > 0) return waitResult(arena, drv.mode(), v, what, arg, "the view reports no load in flight");
+                            return .{ .not_met = .{ .view = v, .code = .io_failed, .msg = try std.fmt.allocPrint(arena, "the load failed: {s} ({d}) for {s}", .{ le.msg, le.code, if (le.url.len > 0) le.url else v.url }) } };
+                        if (!v.loading and v.url.len > 0) return .{ .met = .{ .view = v, .detail = "the view reports no load in flight" } };
                     } else if (arg.len == 0) {
-                        if (v.title.len > 0) return waitResult(arena, drv.mode(), v, what, arg, "the page has a title");
+                        if (v.title.len > 0) return .{ .met = .{ .view = v, .detail = "the page has a title" } };
                     } else if (std.mem.indexOf(u8, v.title, arg) != null) {
-                        return waitResult(arena, drv.mode(), v, what, arg, "the title contains the text");
+                        return .{ .met = .{ .view = v, .detail = "the title contains the text" } };
                     }
                 }
-            }
-        } else if (std.mem.eql(u8, what, "text")) {
-            switch (try runOp(drv, arena, view.pane, .{
+            },
+            .text => switch (try runOp(drv, arena, view.pane, .{
                 .op = "query",
                 .action = "find_text",
                 .data = arg,
             }, 5000)) {
-                .err => |e| return failRes(arena, e),
+                .err => |e| return .{ .err = e },
                 .done => |r| {
                     if (!r.timed_out and r.payload.len > 0 and
                         std.mem.indexOf(u8, r.payload, "[") != null)
-                        return waitResult(arena, drv.mode(), last, what, arg, r.payload);
+                        return .{ .met = .{ .view = last, .detail = r.payload } };
                 },
-            }
-        } else if (std.mem.eql(u8, what, "idle")) {
-            switch (try runOp(drv, arena, view.pane, .{
+            },
+            .idle => switch (try runOp(drv, arena, view.pane, .{
                 .op = "snapshot",
                 .mode = "peek",
                 .detail = 0,
             }, 5000)) {
-                .err => |e| return failRes(arena, e),
+                .err => |e| return .{ .err = e },
                 .done => |r| {
                     if (!r.timed_out) {
                         if (r.rev != last_rev) {
@@ -6663,31 +6944,91 @@ fn waitTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view: V
                             last_rev = r.rev;
                             quiet_since = drv.now();
                         } else if (drv.now() - quiet_since >= 600) {
-                            return waitResult(arena, drv.mode(), last, what, arg, "the DOM stopped changing for 600ms");
+                            return .{ .met = .{ .view = last, .detail = "the DOM stopped changing for 600ms" } };
                         }
                     }
                 },
-            }
-        } else {
-            return mcp.errRes(arena, .invalid_args, "web_wait 'for' must be load, title, text, idle or response");
+            },
+            .selector => switch (try runOp(drv, arena, view.pane, .{
+                .op = "eval",
+                .data = selector_expr,
+                .timeout_ms = 4000,
+            }, 6000)) {
+                .err => |e| return .{ .err = e },
+                .done => |r| if (!r.timed_out) {
+                    // An invalid selector throws, and will throw on every
+                    // poll: say so now instead of after the timeout.
+                    if (!r.ok) return .{ .not_met = .{ .view = last, .code = .invalid_args, .msg = try std.fmt.allocPrint(arena, "the page refused the selector \"{s}\": {s}", .{ arg, firstLine(r.payload, 300) }) } };
+                    if (evalIsTrue(arena, r.payload))
+                        return .{ .met = .{ .view = last, .detail = "an element matches the selector" } };
+                },
+            },
+            .network_idle => switch (try netLog(drv, arena, view.pane, 0, 128, @min(budget, 5000))) {
+                .err => |e| return .{ .err = e },
+                .json => |json| {
+                    const log = webnav.parseLog(arena, json) catch webnav.Log{};
+                    const pending = webnav.pendingCount(log);
+                    if (pending > 0 or log.next_seq != net_head) {
+                        net_head = log.next_seq;
+                        quiet_since = drv.now();
+                        net_pending = try pendingUrls(arena, log);
+                    } else if (drv.now() - quiet_since >= NETWORK_IDLE_MS) {
+                        return .{ .met = .{ .view = last, .detail = try std.fmt.allocPrint(arena, "no request in flight and none started for {d}ms", .{NETWORK_IDLE_MS}) } };
+                    }
+                },
+            },
+            .response => unreachable,
         }
         if (drv.now() >= deadline) break;
         drv.sleep(150);
     }
     // A condition that never held is an ERROR, not a settled result the
     // caller has to re-read to notice.
-    if (std.mem.eql(u8, what, "idle") and rev_changes > 0) {
+    if (what == .idle and rev_changes > 0) {
         const secs = @max(@divTrunc(drv.now() - started, 1000), 1);
-        return mcp.errRes(arena, .timeout, try std.fmt.allocPrint(
+        return .{ .not_met = .{ .view = last, .code = .timeout, .msg = try std.fmt.allocPrint(
             arena,
             "web_wait for idle never held: the DOM changed {d} times in {d}s (about every {d}ms) - this page updates itself continuously (polling, a clock, an animation), so it never idles; wait for:\"text\" with the content you expect instead, or act directly",
             .{ rev_changes, secs, @divTrunc((drv.now() - started), @as(i64, rev_changes)) },
-        ));
+        ) } };
     }
-    return mcp.errRes(arena, .timeout, if (arg.len > 0)
-        try std.fmt.allocPrint(arena, "web_wait for {s} \"{s}\" never held inside the timeout", .{ what, arg })
+    if (what == .network_idle and net_pending.len > 0)
+        return .{ .not_met = .{ .view = last, .code = .timeout, .msg = try std.fmt.allocPrint(arena, "web_wait for network_idle never held: still in flight: {s} (a long poll, a stream or a websocket never finishes; wait for a selector or text instead)", .{net_pending}) } };
+    return .{ .not_met = .{ .view = last, .code = .timeout, .msg = if (arg.len > 0)
+        try std.fmt.allocPrint(arena, "web_wait for {s} \"{s}\" never held inside the timeout", .{ what_s, arg })
     else
-        try std.fmt.allocPrint(arena, "web_wait for {s} never held inside the timeout", .{what}));
+        try std.fmt.allocPrint(arena, "web_wait for {s} never held inside the timeout", .{what_s}) } };
+}
+
+/// An eval answered `true`: the helper wraps a value as `{"value":...}`;
+/// a bare `true` is accepted too.
+fn evalIsTrue(arena: std.mem.Allocator, payload: []const u8) bool {
+    const v = std.json.parseFromSliceLeaky(std.json.Value, arena, payload, .{}) catch return false;
+    const inner = if (v == .object) v.object.get("value") orelse return false else v;
+    return inner == .bool and inner.bool;
+}
+
+test "evalIsTrue reads the helper's value wrapper" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    try std.testing.expect(evalIsTrue(a.allocator(), "{\"value\":true}"));
+    try std.testing.expect(evalIsTrue(a.allocator(), "true"));
+    try std.testing.expect(!evalIsTrue(a.allocator(), "{\"value\":false}"));
+    try std.testing.expect(!evalIsTrue(a.allocator(), "{\"value\":\"true\"}"));
+}
+
+/// The urls of up to three requests still in flight, for a sentence.
+fn pendingUrls(arena: std.mem.Allocator, log: webnav.Log) ![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    var n: usize = 0;
+    for (log.entries) |e| {
+        if (e.done) continue;
+        n += 1;
+        if (n > 3) continue;
+        try aw.writer.print("{s}{s}", .{ if (n > 1) ", " else "", try clip(arena, e.url, URL_MAX) });
+    }
+    if (n > 3) try aw.writer.print(" and {d} more", .{n - 3});
+    return aw.written();
 }
 
 test "originOf keeps scheme and host only" {
@@ -6733,7 +7074,7 @@ test "every web result opens with the view header and names its backend" {
     const arena = arena_state.allocator();
     const t = std.testing;
 
-    const headless = try navigateResult(arena, .headless, EXAMPLE, null, "", null);
+    const headless = try navigateResult(arena, .headless, EXAMPLE, null, "", null, .{});
     const hp = try mcp.expectToolResultShape(arena, "web_navigate", headless);
     const hsc = hp.object.get("structuredContent").?.object;
     try t.expectEqualStrings("headless", hsc.get("backend").?.string);
@@ -6748,14 +7089,14 @@ test "every web result opens with the view header and names its backend" {
     );
 
     // GUI mode names the handle for what it IS there.
-    const gui = try navigateResult(arena, .gui, EXAMPLE, null, "", null);
+    const gui = try navigateResult(arena, .gui, EXAMPLE, null, "", null, .{});
     const gsc = (try mcp.expectToolResultShape(arena, "web_navigate", gui)).object.get("structuredContent").?.object;
     try t.expectEqualStrings("gui", gsc.get("backend").?.string);
     try t.expectEqual(@as(i64, 12), gsc.get("pane").?.integer);
     try t.expect(gsc.get("view") == null);
 
     // A blank view says so instead of rendering an empty header.
-    const blank = try navigateResult(arena, .headless, .{ .pane = 3 }, null, "", null);
+    const blank = try navigateResult(arena, .headless, .{ .pane = 3 }, null, "", null, .{});
     const btext = (try mcp.expectToolResultShape(arena, "web_navigate", blank))
         .object.get("content").?.array.items[0].object.get("text").?.string;
     try t.expect(std.mem.startsWith(u8, btext, "view 3: (blank document)"));
@@ -6899,7 +7240,7 @@ test "a refused certificate is a fact and a sentence on every result, and web_op
     v.load_error = .{ .code = -202, .url = "https://10.47.0.1/", .msg = "ERR_CERT_AUTHORITY_INVALID" };
     try t.expect(v.loadBlocked());
 
-    const opened = try openResult(arena, .headless, v, false, false, null, "skipped: the requested page did not load", null, "none", null, 1);
+    const opened = try openResult(arena, .headless, v, false, false, null, "skipped: the requested page did not load", null, "none", null, 1, .{});
     const parsed = try mcp.expectToolResultShape(arena, "web_open", opened);
     const sc = parsed.object.get("structuredContent").?.object;
     try t.expect(!sc.get("settled").?.bool);
@@ -6924,14 +7265,14 @@ test "a refused certificate is a fact and a sentence on every result, and web_op
     // A GUI hold reads as HELD, with the way out named.
     v.cert.?.state = "pending";
     v.load_error = null;
-    const held = try navigateResult(arena, .gui, v, null, "", null);
+    const held = try navigateResult(arena, .gui, v, null, "", null, .{});
     const htext = (try mcp.expectToolResultShape(arena, "web_navigate", held)).object.get("content").?.array.items[0].object.get("text").?.string;
     try t.expect(std.mem.indexOf(u8, htext, "HELD until the user answers the interstitial") != null);
 
     // An accepted one is not blocking and says what the page stands on.
     v.cert.?.state = "accepted";
     try t.expect(!v.loadBlocked());
-    const ok = try navigateResult(arena, .headless, v, null, "", null);
+    const ok = try navigateResult(arena, .headless, v, null, "", null, .{});
     const otext = (try mcp.expectToolResultShape(arena, "web_navigate", ok)).object.get("content").?.array.items[0].object.get("text").?.string;
     try t.expect(std.mem.indexOf(u8, otext, "accepted by fingerprint") != null);
 }
@@ -6947,7 +7288,7 @@ test "a network-change retry is a fact and a sentence, and does not block the lo
     v.load_retry = .{ .code = -21, .url = "https://planet.test/", .msg = "ERR_NETWORK_CHANGED" };
     try t.expect(!v.loadBlocked());
 
-    const opened = try openResult(arena, .headless, v, true, false, null, "", null, "none", null, 1);
+    const opened = try openResult(arena, .headless, v, true, false, null, "", null, "none", null, 1, .{});
     const parsed = try mcp.expectToolResultShape(arena, "web_open", opened);
     const sc = parsed.object.get("structuredContent").?.object;
     try t.expect(sc.get("settled").?.bool);
@@ -6977,7 +7318,7 @@ test "web_open: the snapshot rides both lanes, situational notes only in text" {
         .document = 1,
         .revision = 4,
         .tree = tree,
-    }, null, null, "none", null, 1);
+    }, null, null, "none", null, 1, .{});
     const parsed = try mcp.expectToolResultShape(arena, "web_open", settled);
     const sc = parsed.object.get("structuredContent").?.object;
     try t.expect(sc.get("settled").?.bool);
@@ -6998,7 +7339,7 @@ test "web_open: the snapshot rides both lanes, situational notes only in text" {
 
     // Unsettled + an ignored 'where': one short line each, and the
     // ignored placement is also a machine fact.
-    const rough = try openResult(arena, .headless, EXAMPLE, false, true, null, "the page did not answer a first snapshot in time", null, "none", null, 3);
+    const rough = try openResult(arena, .headless, EXAMPLE, false, true, null, "the page did not answer a first snapshot in time", null, "none", null, 3, .{});
     const rp = try mcp.expectToolResultShape(arena, "web_open", rough);
     const rsc = rp.object.get("structuredContent").?.object;
     try t.expect(!rsc.get("settled").?.bool);
@@ -7024,7 +7365,7 @@ test "assistant-owned browser handoff is independent of headless backend" {
     var view = EXAMPLE;
     view.handoff_available = true;
     view.browser_name = "Account login";
-    const result = try openResult(arena, .headless, view, true, false, null, null, null, "none", null, 1);
+    const result = try openResult(arena, .headless, view, true, false, null, null, null, "none", null, 1, .{});
     const parsed = try mcp.expectToolResultShape(arena, "web_open", result);
     const sc = parsed.object.get("structuredContent").?.object;
     try std.testing.expectEqualStrings("headless", sc.get("backend").?.string);
@@ -7436,7 +7777,7 @@ test "web_open echoes the installed capture" {
     const arena = arena_state.allocator();
     const t = std.testing;
     const f = webdrive.CaptureFilter{ .mime_prefixes = &.{"application/json"}, .types = 0 };
-    const out = try openResult(arena, .headless, EXAMPLE, true, false, null, null, null, "none", &f, 1);
+    const out = try openResult(arena, .headless, EXAMPLE, true, false, null, null, null, "none", &f, 1, .{});
     const sc = (try mcp.expectToolResultShape(arena, "web_open", out)).object.get("structuredContent").?.object;
     try t.expect(sc.get("capture_active").?.bool);
     const cap = sc.get("capture").?.object;
@@ -8615,7 +8956,7 @@ test "web_open and web_tabs carry the identity a view lives in" {
     in_profile.profile = "work";
     in_profile.profile_kind = "named";
     in_profile.context = 3;
-    const opened = try openResult(arena, .headless, in_profile, true, false, null, null, null, "none", null, 1);
+    const opened = try openResult(arena, .headless, in_profile, true, false, null, null, null, "none", null, 1, .{});
     const op = try mcp.expectToolResultShape(arena, "web_open", opened);
     const osc = op.object.get("structuredContent").?.object;
     try t.expectEqualStrings("work", osc.get("profile").?.string);
@@ -8628,7 +8969,7 @@ test "web_open and web_tabs carry the identity a view lives in" {
     ) != null);
 
     // The default jar spends no words and no keys beyond the honest ones.
-    const plain = try openResult(arena, .headless, EXAMPLE, true, false, null, null, null, "none", null, 1);
+    const plain = try openResult(arena, .headless, EXAMPLE, true, false, null, null, null, "none", null, 1, .{});
     const psc = (try mcp.expectToolResultShape(arena, "web_open", plain)).object.get("structuredContent").?.object;
     try t.expectEqualStrings("", psc.get("profile").?.string);
     try t.expectEqualStrings("default", psc.get("profile_kind").?.string);
@@ -8886,7 +9227,7 @@ test "emulation parser accepts only specified media values and bounded numeric s
     try std.testing.expectEqual(@as(u16, 1250), parsed.value.scale());
     for ([_][]const u8{ "{\"color_scheme\":\"auto\"}", "{\"reduced_motion\":null}", "{\"device_scale_factor\":0.49}", "{\"device_scale_factor\":4.01}", "{\"device_scale_factor\":\"2\"}" }) |text|
         try std.testing.expect((try parseEmulation(arena, try jsonArgs(arena, text))) == .err);
-    const out = try openResult(arena, .headless, .{ .pane = 1, .untrusted = true, .emulation = parsed.value }, true, false, null, null, null, "none", null, 1);
+    const out = try openResult(arena, .headless, .{ .pane = 1, .untrusted = true, .emulation = parsed.value }, true, false, null, null, null, "none", null, 1, .{});
     const sc = (try mcp.expectToolResultShape(arena, "web_open", out)).object.get("structuredContent").?.object;
     try std.testing.expect(sc.get("untrusted").?.bool);
     try std.testing.expectEqualStrings("dark", sc.get("color_scheme").?.string);

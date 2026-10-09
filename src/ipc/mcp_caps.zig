@@ -297,6 +297,9 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
         // headless view answers them itself (fail closed, fingerprint
         // opt-in). A consumer must not have to hang once to learn that.
         try res.fact("web_cert_facts", true);
+        // What a navigation produced, on web_open/web_navigate replies.
+        try res.fact("web_nav_result", @import("mcp_web.zig").navResultCapability());
+        try res.text("web_open and web_navigate report the navigation's outcome (page, http_error, network_error, aborted, replaced, download, blocked, non_http), HTTP status, final url, redirect chain and content type, and take wait:{for,arg} with web_wait's conditions");
         // Downloading through a view: the only path that carries the
         // page's own session, so a consumer must be able to preflight
         // it rather than discover it by trying.

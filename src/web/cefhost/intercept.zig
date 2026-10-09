@@ -130,58 +130,86 @@ pub fn statusFrame(self: *Host, view_id: u32) proto.InterceptStatus {
     return out;
 }
 
-/// Answer a log pull: entries with seq > `req.since`, oldest first,
-/// up to `req.max` (bounded). The ring is snapshotted under the
-/// lock into a small stack buffer, then encoded outside it.
-pub fn interceptLog(self: *Host, req: proto.InterceptLogReq) void {
-    var snap: [NLOG]proto.NetEntry = undefined;
-    var url_store: [NLOG][LOG_URL_MAX]u8 = undefined;
-    var method_store: [NLOG][8]u8 = undefined;
-    var n: usize = 0;
-    var next_seq: u32 = req.since;
-    const cap: usize = @min(@as(usize, if (req.max == 0) NLOG else req.max), NLOG);
-    {
-        g_int.acquire();
-        defer g_int.release();
-        for (&g_int.slots) |*s| {
-            if (!s.used or s.view_id != req.view) continue;
-            next_seq = s.next_seq;
-            const ring = s.ring orelse break;
-            // Emit in seq order: the ring is a circular buffer, so
-            // walk it and collect, then a caller-side sort would be
-            // overkill — seqs increase with widx, so oldest is at
-            // widx. Simplest correct pass: scan all, filter, insert
-            // sorted (NLOG is tiny).
-            for (ring) |*e| {
-                if (e.seq == 0 or e.seq <= req.since) continue;
-                if (n >= cap) {
-                    // Keep the NEWEST `cap`: replace the oldest held
-                    // if this one is newer.
-                    var oldest: usize = 0;
-                    for (snap[0..n], 0..) |se, i| {
-                        if (se.seq < snap[oldest].seq) oldest = i;
+/// One view's log ring copied out under the lock: entries with seq >
+/// `since`, the NEWEST `max` of them, oldest first, each with its
+/// `net-log-detail` and the string storage both borrow (a ring entry's
+/// own storage is free to change the moment the lock drops). Shared by
+/// `intercept_log` and `net_log`, which differ only in the frame.
+const LogSnap = struct {
+    rows: [NLOG]proto.NetEntry2 = undefined,
+    details: [NLOG]proto.NetDetail = undefined,
+    url: [NLOG][LOG_URL_MAX]u8 = undefined,
+    method: [NLOG][8]u8 = undefined,
+    mime: [NLOG][LOG_MIME_MAX]u8 = undefined,
+    stext: [NLOG][LOG_STEXT_MAX]u8 = undefined,
+    n: usize = 0,
+    next_seq: u32 = 0,
+
+    fn put(self: *LogSnap, i: usize, e: *const LogEntry) void {
+        fillEntry(&self.rows[i].entry, &self.url[i], &self.method[i], e);
+        self.rows[i].reason = e.reason;
+        @memcpy(self.mime[i][0..e.mime_len], e.mime[0..e.mime_len]);
+        @memcpy(self.stext[i][0..e.stext_len], e.stext[0..e.stext_len]);
+        self.details[i] = .{
+            .flags = if (e.redirect) proto.NetDetail.REDIRECT else 0,
+            .err = e.err,
+            .prev_seq = e.prev_seq,
+            .mime = self.mime[i][0..e.mime_len],
+            .status_text = self.stext[i][0..e.stext_len],
+        };
+    }
+
+    fn take(self: *LogSnap, view: u32, since: u32, max: u16) void {
+        self.n = 0;
+        self.next_seq = since;
+        const cap: usize = @min(@as(usize, if (max == 0) NLOG else max), NLOG);
+        {
+            g_int.acquire();
+            defer g_int.release();
+            for (&g_int.slots) |*s| {
+                if (!s.used or s.view_id != view) continue;
+                self.next_seq = s.next_seq;
+                const ring = s.ring orelse break;
+                for (ring) |*e| {
+                    if (e.seq == 0 or e.seq <= since) continue;
+                    if (self.n >= cap) {
+                        // Keep the NEWEST `cap`: replace the oldest held
+                        // if this one is newer.
+                        var oldest: usize = 0;
+                        for (self.rows[0..self.n], 0..) |se, i| {
+                            if (se.entry.seq < self.rows[oldest].entry.seq) oldest = i;
+                        }
+                        if (e.seq <= self.rows[oldest].entry.seq) continue;
+                        self.put(oldest, e);
+                        continue;
                     }
-                    if (e.seq <= snap[oldest].seq) continue;
-                    fillEntry(&snap[oldest], &url_store[oldest], &method_store[oldest], e);
-                    continue;
+                    self.put(self.n, e);
+                    self.n += 1;
                 }
-                fillEntry(&snap[n], &url_store[n], &method_store[n], e);
-                n += 1;
+                break;
             }
-            break;
+        }
+        // Ascending by seq (insertion sort; n <= NLOG). Rows and details
+        // move together; their strings stay in the per-index storage,
+        // which the slices already point into.
+        var i: usize = 1;
+        while (i < self.n) : (i += 1) {
+            var j = i;
+            while (j > 0 and self.rows[j - 1].entry.seq > self.rows[j].entry.seq) : (j -= 1) {
+                std.mem.swap(proto.NetEntry2, &self.rows[j], &self.rows[j - 1]);
+                std.mem.swap(proto.NetDetail, &self.details[j], &self.details[j - 1]);
+            }
         }
     }
-    // Sort ascending by seq (insertion sort; n <= NLOG).
-    var i: usize = 1;
-    while (i < n) : (i += 1) {
-        var j = i;
-        while (j > 0 and snap[j - 1].seq > snap[j].seq) : (j -= 1) {
-            const tmp = snap[j];
-            snap[j] = snap[j - 1];
-            snap[j - 1] = tmp;
-        }
-    }
-    self.post(proto.InterceptLog{ .view = req.view, .next_seq = next_seq, .entries = snap[0..n] });
+};
+
+/// Answer a log pull (`intercept_log`, the frame the GUI face reads).
+pub fn interceptLog(self: *Host, req: proto.InterceptLogReq) void {
+    var snap: LogSnap = .{};
+    snap.take(req.view, req.since, req.max);
+    var entries: [NLOG]proto.NetEntry = undefined;
+    for (snap.rows[0..snap.n], 0..) |r, i| entries[i] = r.entry;
+    self.post(proto.InterceptLog{ .view = req.view, .next_seq = snap.next_seq, .entries = entries[0..snap.n], .details = snap.details[0..snap.n] });
 }
 
 // -- enforced network policy (0x86 block) --------------------------
@@ -635,48 +663,9 @@ test "navigation preflight leaves subframes and unrelated views outside the main
 /// Answer a reason-carrying log pull; the `intercept_log` shape
 /// with the policy verdict per entry.
 pub fn netLog(self: *Host, req: proto.NetLogReq) void {
-    var snap: [NLOG]proto.NetEntry2 = undefined;
-    var url_store: [NLOG][LOG_URL_MAX]u8 = undefined;
-    var method_store: [NLOG][8]u8 = undefined;
-    var n: usize = 0;
-    var next_seq: u32 = req.since;
-    const cap: usize = @min(@as(usize, if (req.max == 0) NLOG else req.max), NLOG);
-    {
-        g_int.acquire();
-        defer g_int.release();
-        for (&g_int.slots) |*s| {
-            if (!s.used or s.view_id != req.view) continue;
-            next_seq = s.next_seq;
-            const ring = s.ring orelse break;
-            for (ring) |*e| {
-                if (e.seq == 0 or e.seq <= req.since) continue;
-                if (n >= cap) {
-                    var oldest: usize = 0;
-                    for (snap[0..n], 0..) |se, i| {
-                        if (se.entry.seq < snap[oldest].entry.seq) oldest = i;
-                    }
-                    if (e.seq <= snap[oldest].entry.seq) continue;
-                    fillEntry(&snap[oldest].entry, &url_store[oldest], &method_store[oldest], e);
-                    snap[oldest].reason = e.reason;
-                    continue;
-                }
-                fillEntry(&snap[n].entry, &url_store[n], &method_store[n], e);
-                snap[n].reason = e.reason;
-                n += 1;
-            }
-            break;
-        }
-    }
-    var i: usize = 1;
-    while (i < n) : (i += 1) {
-        var j = i;
-        while (j > 0 and snap[j - 1].entry.seq > snap[j].entry.seq) : (j -= 1) {
-            const tmp = snap[j];
-            snap[j] = snap[j - 1];
-            snap[j - 1] = tmp;
-        }
-    }
-    self.post(proto.NetLog{ .view = req.view, .next_seq = next_seq, .entries = snap[0..n] });
+    var snap: LogSnap = .{};
+    snap.take(req.view, req.since, req.max);
+    self.post(proto.NetLog{ .view = req.view, .next_seq = snap.next_seq, .entries = snap.rows[0..snap.n], .details = snap.details[0..snap.n] });
 }
 
 pub fn netPolicyFrame(view_id: u32) proto.EvNetPolicy {
@@ -1444,6 +1433,9 @@ pub const seed_filter_list =
 /// ~38KB, allocated only while the view lives.
 pub const NLOG = 128;
 
+/// Main-document rows per view kept out of the ring's overwrite order.
+pub const DOC_PINS = 8;
+
 /// Concurrent views the registry can track. A view past the cap still
 /// gets verdicts (global engine + global enable), just no log/badge —
 /// and can hold no POLICY, which is why the client refuses a policied
@@ -1453,6 +1445,9 @@ pub const MAX_ISLOTS = proto.MAX_POLICY_VIEWS;
 /// Longest URL kept in a log entry; the tail is truncated, the
 /// VERDICT always sees the full url.
 pub const LOG_URL_MAX = 256;
+/// Longest content type / status text a log entry keeps (`net-log-detail`).
+pub const LOG_MIME_MAX = 64;
+pub const LOG_STEXT_MAX = 48;
 
 pub const LogEntry = struct {
     seq: u32 = 0,
@@ -1466,11 +1461,64 @@ pub const LogEntry = struct {
     done: bool = false,
     /// `proto.NetReason` byte; nonzero only on blocked entries.
     reason: u8 = 0,
+    /// This hop ended in a server redirect (`done` with the redirect's
+    /// status); `continued` once the next hop's entry names it.
+    redirect: bool = false,
+    continued: bool = false,
+    /// Net error the load ended with; 0 = none.
+    err: i32 = 0,
+    /// Seq of the hop this one continues; 0 = the request's first.
+    prev_seq: u32 = 0,
     method_len: u8 = 0,
     method: [8]u8 = @splat(0),
     url_len: u16 = 0,
     url: [LOG_URL_MAX]u8 = @splat(0),
+    mime_len: u8 = 0,
+    mime: [LOG_MIME_MAX]u8 = @splat(0),
+    stext_len: u8 = 0,
+    stext: [LOG_STEXT_MAX]u8 = @splat(0),
+
+    fn setResponse(e: *LogEntry, status: u16, mime: []const u8, stext: []const u8) void {
+        if (status != 0) e.status = status;
+        if (mime.len > 0) {
+            e.mime_len = @intCast(@min(mime.len, LOG_MIME_MAX));
+            @memcpy(e.mime[0..e.mime_len], mime[0..e.mime_len]);
+        }
+        if (stext.len > 0) {
+            e.stext_len = @intCast(@min(stext.len, LOG_STEXT_MAX));
+            @memcpy(e.stext[0..e.stext_len], stext[0..e.stext_len]);
+        }
+    }
 };
+
+/// Under the lock. The entry a request with `req_id` is currently on:
+/// its newest entry while that is still open, or ended in a redirect no
+/// later hop has taken up yet. CEF keeps the request identifier across a
+/// server redirect chain (measured on CEF 151), so a re-entry of
+/// `on_before_resource_load` that finds one IS the redirected re-issue.
+fn hopOf(ring: *[NLOG]LogEntry, req_id: u64) ?*LogEntry {
+    var best: ?*LogEntry = null;
+    for (ring) |*e| {
+        if (e.seq == 0 or e.req_id != req_id) continue;
+        if (best == null or e.seq > best.?.seq) best = e;
+    }
+    const e = best orelse return null;
+    if (e.blocked) return null;
+    if (!e.done or (e.redirect and !e.continued)) return e;
+    return null;
+}
+
+/// Under the lock. The newest still-open entry of `req_id`, the one a
+/// response or completion belongs to (a redirect chain leaves several
+/// entries with the same id; the OLDEST is long finished).
+fn openEntry(ring: *[NLOG]LogEntry, req_id: u64) ?*LogEntry {
+    var best: ?*LogEntry = null;
+    for (ring) |*e| {
+        if (e.seq == 0 or e.req_id != req_id or e.done) continue;
+        if (best == null or e.seq > best.?.seq) best = e;
+    }
+    return best;
+}
 
 pub const ISlot = struct {
     used: bool = false,
@@ -1486,6 +1534,12 @@ pub const ISlot = struct {
     next_seq: u32 = 1,
     widx: usize = 0,
     ring: ?*[NLOG]LogEntry = null,
+    /// Seqs of the newest main-document rows, which the ring never
+    /// overwrites (`logRequest`): a navigation's own row must outlive the
+    /// hundreds of subresources a busy page loads after it, or a client
+    /// reading what the navigation produced finds nothing.
+    docs: [DOC_PINS]u32 = @splat(0),
+    docs_w: usize = 0,
     /// Enforced policy, or null (the common case: one branch on the hot
     /// path and nothing else). Swapped whole by the MAIN thread under
     /// the lock, freed outside it, like the filter engine.
@@ -1905,8 +1959,29 @@ const URL_MAX = proto.UNTRUSTED_URL_CAP;
 fn logRequest(s: *ISlot, req_id: u64, now: i64, rtype: filter.RType, reason: proto.NetReason, method: []const u8, url: []const u8) void {
     const ring = s.ring orelse return;
     const blocked = reason != .none;
+    // A redirect hop links back to the entry it continues. That entry
+    // normally ended at `on_resource_redirect`; one that did not (a
+    // webRequest redirect re-issues the request without it) ends here.
+    var prev_seq: u32 = 0;
+    if (hopOf(ring, req_id)) |hop| {
+        prev_seq = hop.seq;
+        hop.continued = true;
+        if (!hop.done) {
+            hop.done = true;
+            hop.redirect = true;
+            hop.dur_ms = @intCast(std.math.clamp(now - hop.start_ms, 0, std.math.maxInt(u32)));
+        }
+    }
+    // Step over pinned document rows; DOC_PINS < NLOG, so a free slot
+    // always exists within one lap.
+    var laps: usize = 0;
+    while (laps < NLOG and pinned(s, &ring[s.widx])) : (laps += 1) s.widx = (s.widx + 1) % NLOG;
     const e = &ring[s.widx];
     s.widx = (s.widx + 1) % NLOG;
+    if (rtype == .document) {
+        s.docs[s.docs_w] = s.next_seq;
+        s.docs_w = (s.docs_w + 1) % DOC_PINS;
+    }
     e.* = .{
         .seq = s.next_seq,
         .req_id = req_id,
@@ -1916,6 +1991,7 @@ fn logRequest(s: *ISlot, req_id: u64, now: i64, rtype: filter.RType, reason: pro
         // A blocked entry never completes; it is final now.
         .done = blocked,
         .reason = @intFromEnum(reason),
+        .prev_seq = prev_seq,
     };
     s.next_seq +%= 1;
     if (s.next_seq == 0) s.next_seq = 1;
@@ -1923,6 +1999,11 @@ fn logRequest(s: *ISlot, req_id: u64, now: i64, rtype: filter.RType, reason: pro
     @memcpy(e.method[0..e.method_len], method[0..e.method_len]);
     e.url_len = @intCast(@min(url.len, e.url.len));
     @memcpy(e.url[0..e.url_len], url[0..e.url_len]);
+}
+
+fn pinned(s: *const ISlot, e: *const LogEntry) bool {
+    if (e.seq == 0 or e.rtype != @intFromEnum(filter.RType.document)) return false;
+    return std.mem.indexOfScalar(u32, &s.docs, e.seq) != null;
 }
 
 /// IO THREAD. Refuse a request before the filter/policy step: counted, latched if a budget, and logged with its reason.
@@ -2066,19 +2147,8 @@ pub fn onBeforeResourceLoad(
             if (slot) |s| {
                 if (s.pol) |pol| {
                     const is_top = rtype == .document;
-                    // CEF keeps the request identifier across a server
-                    // redirect chain (measured on CEF 151): a live ring
-                    // entry with this id means this request IS the
-                    // redirected re-issue.
-                    var is_hop = false;
-                    if (s.ring) |ring| {
-                        for (ring) |*e| {
-                            if (e.seq != 0 and e.req_id == req_id and !e.done) {
-                                is_hop = true;
-                                break;
-                            }
-                        }
-                    }
+                    // A redirected re-issue (`hopOf`).
+                    const is_hop = if (s.ring) |ring| hopOf(ring, req_id) != null else false;
                     // An authority whose port does not parse cannot be
                     // matched against a port-carrying entry: refused, named.
                     const port: ?u16 = if (host.len == 0) 0 else urlhost.portOf(url);
@@ -2156,6 +2226,7 @@ pub fn onResourceResponse(
     defer releaseArg(request);
     defer releaseArg(response);
     const req: *cef.cef_request_t = request orelse return 0;
+    if (response) |resp| noteResponse(browser, req, resp, null);
     if (!webrequest.any_listeners.load(.acquire)) return 0;
 
     var url_raw: [2048]u8 = undefined;
@@ -2190,6 +2261,85 @@ pub fn onResourceResponse(
         });
     }
     return 0;
+}
+
+/// IO THREAD. Record a response's status, status text and content type
+/// on the log entry its request is on; with `redirect`, that entry also
+/// ENDS here as a redirect hop (the next hop's entry links back to it).
+fn noteResponse(browser: ?*cef.cef_browser_t, req: *cef.cef_request_t, resp: *cef.cef_response_t, redirect: ?i64) void {
+    const b = browser orelse return;
+    const gi = b.get_identifier orelse return;
+    const cef_id = gi(b);
+    const req_id: u64 = if (req.get_identifier) |gid| gid(req) else return;
+    var status: u16 = 0;
+    if (resp.get_status) |gs| status = @intCast(std.math.clamp(gs(resp), 0, 999));
+    var mime_buf: [LOG_MIME_MAX]u8 = undefined;
+    var mime: []const u8 = "";
+    if (resp.get_mime_type) |gm| mime = userfreeInto(gm(resp), &mime_buf);
+    var stext_buf: [LOG_STEXT_MAX]u8 = undefined;
+    var stext: []const u8 = "";
+    if (resp.get_status_text) |gt| stext = userfreeInto(gt(resp), &stext_buf);
+    // A redirect names the hop by its OLD url too: should the engine ever
+    // re-enter `on_before_resource_load` first, the open entry would be
+    // the NEW hop, and that one must not be ended as a redirect.
+    var url_buf: [LOG_URL_MAX]u8 = undefined;
+    const url: []const u8 = if (redirect != null) (if (req.get_url) |gu| userfreeInto(gu(req), &url_buf) else "") else "";
+    g_int.acquire();
+    defer g_int.release();
+    const s = g_int.slotByCef(cef_id) orelse return;
+    const ring = s.ring orelse return;
+    const e = if (redirect == null) openEntry(ring, req_id) orelse return else blk: {
+        var best: ?*LogEntry = null;
+        for (ring) |*x| {
+            if (x.seq == 0 or x.req_id != req_id or x.blocked) continue;
+            if (!std.mem.eql(u8, x.url[0..x.url_len], url[0..@min(url.len, x.url_len)])) continue;
+            if (best == null or x.seq > best.?.seq) best = x;
+        }
+        break :blk best orelse return;
+    };
+    e.setResponse(status, mime, stext);
+    if (redirect) |now| {
+        e.redirect = true;
+        if (!e.done) {
+            e.done = true;
+            e.dur_ms = @intCast(std.math.clamp(now - e.start_ms, 0, std.math.maxInt(u32)));
+        }
+    }
+    s.dirty = true;
+}
+
+/// IO THREAD. A server redirect: the hop it ends gets the redirect's
+/// status, and the re-issue `on_before_resource_load` sees next is linked
+/// to it (`hopOf`). The new url is left as the engine chose it.
+pub fn onResourceRedirect(
+    _: [*c]cef.cef_resource_request_handler_t,
+    browser: [*c]cef.cef_browser_t,
+    frame: [*c]cef.cef_frame_t,
+    request: [*c]cef.cef_request_t,
+    response: [*c]cef.cef_response_t,
+    _: [*c]cef.cef_string_t,
+) callconv(.c) void {
+    defer releaseArg(browser);
+    defer releaseArg(frame);
+    defer releaseArg(request);
+    defer releaseArg(response);
+    const req: *cef.cef_request_t = request orelse return;
+    const resp: *cef.cef_response_t = response orelse return;
+    noteResponse(browser, req, resp, nowMs());
+}
+
+/// The net error a finished load ended with: the response's own code,
+/// else ABORTED for a cancelled load and FAILED otherwise; 0 on success.
+fn loadErrCode(response: ?*cef.cef_response_t, ur_status: cef.cef_urlrequest_status_t) i32 {
+    if (ur_status == @as(cef.cef_urlrequest_status_t, @intCast(cef.UR_SUCCESS))) return 0;
+    var code: i32 = if (ur_status == @as(cef.cef_urlrequest_status_t, @intCast(cef.UR_CANCELED))) -3 else -2;
+    if (response) |resp| {
+        if (resp.get_error) |ge| {
+            const e: i32 = @intCast(ge(resp));
+            if (e != 0) code = e;
+        }
+    }
+    return code;
 }
 
 /// `"statusCode":200,"statusLine":"HTTP/1.1 200 OK","fromCache":false`
@@ -2238,19 +2388,13 @@ pub fn notifyLoadComplete(
     var method_buf: [8]u8 = undefined;
     var method: []const u8 = "";
     if (req.get_method) |gm| method = userfreeInto(gm(req), &method_buf);
-    const ok = ur_status == @as(cef.cef_urlrequest_status_t, @intCast(cef.UR_SUCCESS));
+    const code = loadErrCode(response, ur_status);
+    const ok = code == 0;
     var extra_buf: [256]u8 = undefined;
     var extra: []const u8 = "";
     if (ok) {
         extra = responseExtra(&extra_buf, response);
     } else {
-        var code: i32 = if (ur_status == @as(cef.cef_urlrequest_status_t, @intCast(cef.UR_CANCELED))) -3 else -2;
-        if (response) |resp| {
-            if (resp.get_error) |ge| {
-                const e: i32 = @intCast(ge(resp));
-                if (e != 0) code = e;
-            }
-        }
         var w = std.Io.Writer.fixed(&extra_buf);
         w.writeAll("\"fromCache\":false,\"error\":") catch {};
         var name_buf: [64]u8 = undefined;
@@ -2267,28 +2411,7 @@ pub fn notifyLoadComplete(
     });
 }
 
-/// Chromium's `net::ERR_*` spelling for the codes a page actually
-/// meets; anything else keeps its number, never a made-up name.
-pub fn netErrorName(buf: []u8, code: i32) []const u8 {
-    const name: []const u8 = switch (code) {
-        -2 => "FAILED",
-        -3 => "ABORTED",
-        -7 => "TIMED_OUT",
-        -20 => "BLOCKED_BY_CLIENT",
-        -21 => "NETWORK_CHANGED",
-        -100 => "CONNECTION_CLOSED",
-        -101 => "CONNECTION_RESET",
-        -102 => "CONNECTION_REFUSED",
-        -105 => "NAME_NOT_RESOLVED",
-        -106 => "INTERNET_DISCONNECTED",
-        -118 => "CONNECTION_TIMED_OUT",
-        -200 => "CERT_COMMON_NAME_INVALID",
-        -201 => "CERT_DATE_INVALID",
-        -202 => "CERT_AUTHORITY_INVALID",
-        else => return std.fmt.bufPrint(buf, "net::ERROR_{d}", .{code}) catch "net::ERR_FAILED",
-    };
-    return std.fmt.bufPrint(buf, "net::ERR_{s}", .{name}) catch "net::ERR_FAILED";
-}
+pub const netErrorName = proto.netErrorName;
 
 /// IO THREAD. Completes a logged entry with status/size/timing.
 pub fn onResourceLoadComplete(
@@ -2311,11 +2434,18 @@ pub fn onResourceLoadComplete(
     const cef_id = gi(b);
     const req_id: u64 = if (req.get_identifier) |gid| gid(req) else return;
     var status: u16 = 0;
+    var mime_buf: [LOG_MIME_MAX]u8 = undefined;
+    var mime: []const u8 = "";
+    var stext_buf: [LOG_STEXT_MAX]u8 = undefined;
+    var stext: []const u8 = "";
     if (response) |resp| {
         if (resp.*.get_status) |gs| status = @intCast(std.math.clamp(gs(resp), 0, 999));
+        if (resp.*.get_mime_type) |gm| mime = userfreeInto(gm(resp), &mime_buf);
+        if (resp.*.get_status_text) |gt| stext = userfreeInto(gt(resp), &stext_buf);
     }
     const now = nowMs();
-    captureFinish(cef_id, req_id, response, ur_status, status, now);
+    const err = loadErrCode(response, ur_status);
+    captureFinish(cef_id, req_id, err, status, now);
 
     g_int.acquire();
     defer g_int.release();
@@ -2332,42 +2462,22 @@ pub fn onResourceLoadComplete(
             s.pol_dirty = true;
         }
         const ring = s.ring orelse return;
-        for (ring) |*e| {
-            if (e.seq == 0 or e.req_id != req_id or e.done) continue;
-            e.done = true;
-            e.status = status;
-            e.size = @intCast(std.math.clamp(received, 0, std.math.maxInt(u32)));
-            e.dur_ms = @intCast(std.math.clamp(now - e.start_ms, 0, std.math.maxInt(u32)));
-            s.dirty = true;
-            return;
-        }
+        const e = openEntry(ring, req_id) orelse return;
+        e.done = true;
+        e.setResponse(status, mime, stext);
+        e.err = err;
+        e.size = @intCast(std.math.clamp(received, 0, std.math.maxInt(u32)));
+        e.dur_ms = @intCast(std.math.clamp(now - e.start_ms, 0, std.math.maxInt(u32)));
+        s.dirty = true;
         return;
     }
 }
 
 /// IO THREAD. Tell the view's capture, if any, that `req_id` finished.
-fn captureFinish(
-    cef_id: c_int,
-    req_id: u64,
-    response: ?*cef.cef_response_t,
-    ur_status: cef.cef_urlrequest_status_t,
-    status: u16,
-    now: i64,
-) void {
+fn captureFinish(cef_id: c_int, req_id: u64, err: i32, status: u16, now: i64) void {
     const store = captureOf(cef_id) orelse return;
     defer store.release();
-    const ok = ur_status == @as(cef.cef_urlrequest_status_t, @intCast(cef.UR_SUCCESS));
-    var err: i32 = 0;
-    if (!ok) {
-        err = if (ur_status == @as(cef.cef_urlrequest_status_t, @intCast(cef.UR_CANCELED))) -3 else -2;
-        if (response) |resp| {
-            if (resp.get_error) |ge| {
-                const e: i32 = @intCast(ge(resp));
-                if (e != 0) err = e;
-            }
-        }
-    }
-    store.finish(req_id, ok, err, status, now);
+    store.finish(req_id, err == 0, err, status, now);
 }
 
 /// IO THREAD. The capture of the view browser `cef_id` belongs to, with
@@ -2397,4 +2507,40 @@ pub fn fillEntry(out: *proto.NetEntry, url_buf: *[LOG_URL_MAX]u8, method_buf: *[
         .method = method_buf[0..e.method_len],
         .url = url_buf[0..e.url_len],
     };
+}
+
+test "a redirect re-issue links to the hop it continues, and document rows outlive busy pages" {
+    const gpa = std.testing.allocator;
+    const ring = try gpa.create([NLOG]LogEntry);
+    defer gpa.destroy(ring);
+    ring.* = @splat(.{});
+    var s = ISlot{ .used = true, .ring = ring };
+    logRequest(&s, 77, 0, .document, .none, "GET", "http://h/r1");
+    // The engine ends the first hop as a redirect, then re-issues.
+    const first = openEntry(ring, 77).?;
+    first.setResponse(301, "text/html", "Moved Permanently");
+    first.done = true;
+    first.redirect = true;
+    try std.testing.expect(hopOf(ring, 77) == first);
+    logRequest(&s, 77, 1, .document, .none, "GET", "http://h/r2");
+    // A hop without its own redirect callback still ends as one.
+    logRequest(&s, 77, 2, .document, .none, "GET", "http://h/final");
+    const last = openEntry(ring, 77).?;
+    try std.testing.expectEqualStrings("http://h/final", last.url[0..last.url_len]);
+    try std.testing.expectEqual(@as(u32, 2), last.prev_seq);
+    try std.testing.expectEqual(@as(u32, 1), ring[1].prev_seq);
+    try std.testing.expect(ring[1].redirect and ring[1].done and ring[1].continued);
+    try std.testing.expect(first.continued);
+
+    // Hundreds of subresources later every document row is still there.
+    var i: u64 = 0;
+    while (i < 3 * NLOG) : (i += 1) logRequest(&s, 1000 + i, 3, .image, .none, "GET", "http://h/i.png");
+    var docs: usize = 0;
+    for (ring) |*e| {
+        if (e.seq != 0 and e.rtype == @intFromEnum(filter.RType.document)) docs += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), docs);
+    // A finished request is no hop: a new request with an old id starts afresh.
+    last.done = true;
+    try std.testing.expect(hopOf(ring, 77) == null);
 }

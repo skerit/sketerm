@@ -92,6 +92,12 @@ pub const CAP_INTERCEPT = "intercept";
 pub const CAP_NET_POLICY = "net-policy";
 /// Policy installs/replacements acknowledge their serial with active=1 on success or active=0 on fail-closed refusal.
 pub const CAP_NET_POLICY_ACK = "net-policy-ack";
+/// `intercept_log` and `net_log` carry a trailing `NetDetail` block: per
+/// entry the response content type and status text, the net error a load
+/// ended with, whether the hop ended in a server redirect, and the seq of
+/// the previous hop of the same request. Without it a client knows
+/// status/size only and cannot tell a redirect chain from separate loads.
+pub const CAP_NET_LOG_DETAIL = "net-log-detail";
 /// The helper captures response BODIES per view (0x8B block): a
 /// `capture_set` installs a filter (hosts, url substring/regex,
 /// resource types, methods, mime prefixes) and byte caps, and matching
@@ -456,6 +462,7 @@ pub const Cap = enum {
     untrusted_web,
     web_emulation,
     net_policy_ack,
+    net_log_detail,
     web_stream,
     stream_audio,
     stream_encoded,
@@ -2813,22 +2820,102 @@ pub const NetEntry = struct {
     url: []const u8,
 };
 
+/// What `net-log-detail` adds to one log entry. It travels as a trailing
+/// block after ALL entries (a u16 count, then one per entry in order),
+/// never inside `NetEntry`: both log frames decode entries positionally
+/// with no per-entry length, so only a tail is invisible to an older peer.
+pub const NetDetail = struct {
+    /// `REDIRECT`: the hop ended in a server redirect; its `status` is the
+    /// redirect's and the next hop names this one in `prev_seq`.
+    flags: u8 = 0,
+    /// Chromium net error the load ended with (`netErrorName`); 0 = none.
+    err: i32 = 0,
+    /// Seq of the previous hop of the same request; 0 = the first hop.
+    prev_seq: u32 = 0,
+    /// Response content type without parameters; "" when none arrived.
+    mime: []const u8 = "",
+    status_text: []const u8 = "",
+
+    pub const REDIRECT: u8 = 1;
+
+    pub fn redirect(self: NetDetail) bool {
+        return self.flags & REDIRECT != 0;
+    }
+};
+
+fn putNetDetails(gpa: std.mem.Allocator, out: *std.ArrayList(u8), details: ?[]const NetDetail) !void {
+    const ds = details orelse return;
+    try putU16(gpa, out, @intCast(ds.len));
+    for (ds) |d| {
+        try putU8(gpa, out, d.flags);
+        try putI32(gpa, out, d.err);
+        try putU32(gpa, out, d.prev_seq);
+        try putStr(gpa, out, d.mime);
+        try putStr(gpa, out, d.status_text);
+    }
+}
+
+/// The trailing detail block, or null when the sender wrote none (a
+/// helper without `net-log-detail`). A count that disagrees with the
+/// entries is malformed. Caller owns the slice; strings borrow.
+fn readNetDetails(cur: *Cur, gpa: std.mem.Allocator, entries: usize) !?[]NetDetail {
+    if (cur.pos >= cur.buf.len) return null;
+    const n = try cur.readU16();
+    if (n != entries) return error.Malformed;
+    const ds = try gpa.alloc(NetDetail, n);
+    errdefer gpa.free(ds);
+    for (ds) |*d| d.* = .{
+        .flags = try cur.readU8(),
+        .err = try cur.readI32(),
+        .prev_seq = try cur.readU32(),
+        .mime = try cur.readStr(),
+        .status_text = try cur.readStr(),
+    };
+    return ds;
+}
+
+/// Chromium's `net::ERR_*` spelling for the codes a page actually
+/// meets; anything else keeps its number, never a made-up name.
+pub fn netErrorName(buf: []u8, code: i32) []const u8 {
+    const name: []const u8 = switch (code) {
+        -2 => "FAILED",
+        -3 => "ABORTED",
+        -7 => "TIMED_OUT",
+        -20 => "BLOCKED_BY_CLIENT",
+        -21 => "NETWORK_CHANGED",
+        -100 => "CONNECTION_CLOSED",
+        -101 => "CONNECTION_RESET",
+        -102 => "CONNECTION_REFUSED",
+        -105 => "NAME_NOT_RESOLVED",
+        -106 => "INTERNET_DISCONNECTED",
+        -118 => "CONNECTION_TIMED_OUT",
+        -200 => "CERT_COMMON_NAME_INVALID",
+        -201 => "CERT_DATE_INVALID",
+        -202 => "CERT_AUTHORITY_INVALID",
+        else => return std.fmt.bufPrint(buf, "net::ERROR_{d}", .{code}) catch "net::ERR_FAILED",
+    };
+    return std.fmt.bufPrint(buf, "net::ERR_{s}", .{name}) catch "net::ERR_FAILED";
+}
+
 pub const InterceptLog = struct {
     pub const tag: Tag = .intercept_log;
     view: u32,
     /// One past the newest seq in the ring; the client's next `since`.
     next_seq: u32,
     entries: []const NetEntry,
+    /// `net-log-detail`: one per entry; null from an older helper.
+    details: ?[]const NetDetail = null,
 
     pub fn encodeTo(self: InterceptLog, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
         try putU32(gpa, out, self.view);
         try putU32(gpa, out, self.next_seq);
         try putU16(gpa, out, @intCast(self.entries.len));
         for (self.entries) |e| try putNetEntry(gpa, out, e);
+        try putNetDetails(gpa, out, self.details);
     }
 
-    /// Caller owns the returned `entries` slice (strings borrow from
-    /// `payload`).
+    /// Caller owns the returned `entries` and `details` slices (strings
+    /// borrow from `payload`); `freeDecoded` releases both.
     pub fn decodeAlloc(payload: []const u8, gpa: std.mem.Allocator) !InterceptLog {
         var cur = Cur{ .buf = payload };
         const view = try cur.readU32();
@@ -2837,7 +2924,13 @@ pub const InterceptLog = struct {
         const entries = try gpa.alloc(NetEntry, n);
         errdefer gpa.free(entries);
         for (entries) |*e| e.* = try readNetEntry(&cur);
-        return .{ .view = view, .next_seq = next_seq, .entries = entries };
+        const details = try readNetDetails(&cur, gpa, n);
+        return .{ .view = view, .next_seq = next_seq, .entries = entries, .details = details };
+    }
+
+    pub fn freeDecoded(self: InterceptLog, gpa: std.mem.Allocator) void {
+        gpa.free(self.entries);
+        if (self.details) |d| gpa.free(d);
     }
 };
 
@@ -2872,36 +2965,36 @@ fn readNetEntry(cur: *Cur) !NetEntry {
 /// the headless webdrive) hand to the `web_network` MCP tool. Kept
 /// here because both already depend on this module and a third copy of
 /// the format is how the two would drift. Caller frees.
-pub fn netLogJson(gpa: std.mem.Allocator, next_seq: u32, entries: []const NetEntry) ![]u8 {
+pub fn netLogJson(gpa: std.mem.Allocator, log: InterceptLog) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(gpa);
     errdefer aw.deinit();
     const w = &aw.writer;
-    try w.print("{{\"next_seq\":{d},\"entries\":[", .{next_seq});
-    for (entries, 0..) |e, i| {
+    try w.print("{{\"next_seq\":{d},\"detail\":{},\"entries\":[", .{ log.next_seq, log.details != null });
+    for (log.entries, 0..) |e, i| {
         if (i != 0) try w.writeByte(',');
         // The legacy frame carries no reason byte; the only thing that
         // could block one of its entries is the filter engine.
-        try writeNetEntryJson(w, e, if (e.blocked != 0) .filter_list else .none);
+        try writeNetEntryJson(w, e, if (e.blocked != 0) .filter_list else .none, if (log.details) |d| d[i] else null);
     }
     try w.writeAll("]}");
     return aw.toOwnedSlice();
 }
 
 /// `netLogJson` over reason-carrying entries (the `net_log` frame).
-pub fn netLogJson2(gpa: std.mem.Allocator, next_seq: u32, entries: []const NetEntry2) ![]u8 {
+pub fn netLogJson2(gpa: std.mem.Allocator, log: NetLog) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(gpa);
     errdefer aw.deinit();
     const w = &aw.writer;
-    try w.print("{{\"next_seq\":{d},\"entries\":[", .{next_seq});
-    for (entries, 0..) |e, i| {
+    try w.print("{{\"next_seq\":{d},\"detail\":{},\"entries\":[", .{ log.next_seq, log.details != null });
+    for (log.entries, 0..) |e, i| {
         if (i != 0) try w.writeByte(',');
-        try writeNetEntryJson(w, e.entry, @enumFromInt(e.reason));
+        try writeNetEntryJson(w, e.entry, @enumFromInt(e.reason), if (log.details) |d| d[i] else null);
     }
     try w.writeAll("]}");
     return aw.toOwnedSlice();
 }
 
-fn writeNetEntryJson(w: *std.Io.Writer, e: NetEntry, reason: NetReason) !void {
+fn writeNetEntryJson(w: *std.Io.Writer, e: NetEntry, reason: NetReason, detail: ?NetDetail) !void {
     const rt: NetResource = @enumFromInt(e.rtype);
     const rt_name = switch (rt) {
         .other, .document, .subdocument, .stylesheet, .script, .image, .font, .xhr, .media, .websocket, .ping => @tagName(rt),
@@ -2923,6 +3016,22 @@ fn writeNetEntryJson(w: *std.Io.Writer, e: NetEntry, reason: NetReason) !void {
         }
     } else {
         try w.print(",\"reason\":\"{s}\"", .{reasonName(reason)});
+    }
+    if (detail) |d| {
+        if (d.redirect()) try w.writeAll(",\"redirect\":true");
+        if (d.prev_seq != 0) try w.print(",\"prev_seq\":{d}", .{d.prev_seq});
+        if (d.mime.len > 0) {
+            try w.writeAll(",\"mime\":");
+            try std.json.Stringify.value(d.mime, .{}, w);
+        }
+        if (d.status_text.len > 0) {
+            try w.writeAll(",\"status_text\":");
+            try std.json.Stringify.value(d.status_text, .{}, w);
+        }
+        if (d.err != 0) {
+            var nb: [48]u8 = undefined;
+            try w.print(",\"error_code\":{d},\"error\":\"{s}\"", .{ d.err, netErrorName(&nb, d.err) });
+        }
     }
     try w.writeByte('}');
 }
@@ -3155,6 +3264,8 @@ pub const NetLog = struct {
     view: u32,
     next_seq: u32,
     entries: []const NetEntry2,
+    /// `net-log-detail`: one per entry; null from an older helper.
+    details: ?[]const NetDetail = null,
 
     pub fn encodeTo(self: NetLog, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
         try putU32(gpa, out, self.view);
@@ -3164,10 +3275,11 @@ pub const NetLog = struct {
             try putNetEntry(gpa, out, e.entry);
             try putU8(gpa, out, e.reason);
         }
+        try putNetDetails(gpa, out, self.details);
     }
 
-    /// Caller owns the returned `entries` slice (strings borrow from
-    /// `payload`).
+    /// Caller owns the returned `entries` and `details` slices (strings
+    /// borrow from `payload`); `freeDecoded` releases both.
     pub fn decodeAlloc(payload: []const u8, gpa: std.mem.Allocator) !NetLog {
         var cur = Cur{ .buf = payload };
         const view = try cur.readU32();
@@ -3179,7 +3291,13 @@ pub const NetLog = struct {
             e.entry = try readNetEntry(&cur);
             e.reason = try cur.readU8();
         }
-        return .{ .view = view, .next_seq = next_seq, .entries = entries };
+        const details = try readNetDetails(&cur, gpa, n);
+        return .{ .view = view, .next_seq = next_seq, .entries = entries, .details = details };
+    }
+
+    pub fn freeDecoded(self: NetLog, gpa: std.mem.Allocator) void {
+        gpa.free(self.entries);
+        if (self.details) |d| gpa.free(d);
     }
 };
 
@@ -5828,7 +5946,8 @@ test "round-trip: intercept_log entry list" {
     const frame = (try r.next()).?;
     try std.testing.expectEqual(Tag.intercept_log, frame.tag);
     const got = try InterceptLog.decodeAlloc(frame.payload, gpa);
-    defer gpa.free(got.entries);
+    defer got.freeDecoded(gpa);
+    try std.testing.expect(got.details == null);
     try std.testing.expectEqual(@as(u32, 42), got.next_seq);
     try std.testing.expectEqual(@as(usize, 2), got.entries.len);
     try std.testing.expectEqual(@as(u8, 1), got.entries[0].blocked);
@@ -6065,7 +6184,7 @@ test "netLogJson is one newline-free JSON object" {
         .{ .seq = 2, .blocked = 0, .rtype = @intFromEnum(NetResource.script), .done = 0, .status = 0, .dur_ms = 0, .size = 0, .method = "GET", .url = "https://site.example/a\njs" },
         .{ .seq = 3, .blocked = 0, .rtype = 99, .done = 1, .status = 404, .dur_ms = 7, .size = 11, .method = "POST", .url = "https://site.example/api" },
     };
-    const json = try netLogJson(gpa, 4, &entries);
+    const json = try netLogJson(gpa, .{ .view = 1, .next_seq = 4, .entries = &entries });
     defer gpa.free(json);
     try std.testing.expectEqual(@as(?usize, null), std.mem.indexOfScalar(u8, json, '\n'));
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, json, .{});
@@ -6156,20 +6275,76 @@ test "round-trip: net_log carries the reason the old frame cannot" {
     const frame = (try r.next()).?;
     try std.testing.expectEqual(Tag.net_log, frame.tag);
     const got = try NetLog.decodeAlloc(frame.payload, gpa);
-    defer gpa.free(got.entries);
+    defer got.freeDecoded(gpa);
     try std.testing.expectEqual(@as(usize, 2), got.entries.len);
     try std.testing.expectEqual(@intFromEnum(NetReason.sub_host), got.entries[0].reason);
     try std.testing.expectEqualStrings("https://site.example/", got.entries[1].entry.url);
 
     // The one JSON renderer names the reason; a lifted legacy entry can
     // only ever say filter_list.
-    const json = try netLogJson2(gpa, 3, &entries);
+    const json = try netLogJson2(gpa, .{ .view = 4, .next_seq = 3, .entries = &entries });
     defer gpa.free(json);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"reason\":\"sub_host\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"detail\":false") != null);
     const legacy = [_]NetEntry{entries[0].entry};
-    const lifted = try netLogJson(gpa, 2, &legacy);
+    const lifted = try netLogJson(gpa, .{ .view = 4, .next_seq = 2, .entries = &legacy });
     defer gpa.free(lifted);
     try std.testing.expect(std.mem.indexOf(u8, lifted, "\"reason\":\"filter_list\"") != null);
+}
+
+test "round-trip: net-log-detail rides after the entries and an older peer never sees it" {
+    const gpa = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    const entries = [_]NetEntry2{
+        .{ .entry = .{ .seq = 5, .blocked = 0, .rtype = @intFromEnum(NetResource.document), .done = 1, .status = 301, .dur_ms = 3, .size = 0, .method = "GET", .url = "http://a.example/old" }, .reason = 0 },
+        .{ .entry = .{ .seq = 6, .blocked = 0, .rtype = @intFromEnum(NetResource.document), .done = 1, .status = 200, .dur_ms = 4, .size = 77, .method = "GET", .url = "http://a.example/new" }, .reason = 0 },
+        .{ .entry = .{ .seq = 7, .blocked = 0, .rtype = @intFromEnum(NetResource.image), .done = 1, .status = 0, .dur_ms = 1, .size = 0, .method = "GET", .url = "http://a.example/x.png" }, .reason = 0 },
+    };
+    const details = [_]NetDetail{
+        .{ .flags = NetDetail.REDIRECT, .mime = "text/html", .status_text = "Moved Permanently" },
+        .{ .prev_seq = 5, .mime = "text/html", .status_text = "OK" },
+        .{ .err = -102 },
+    };
+    try encode(gpa, &buf, NetLog{ .view = 9, .next_seq = 8, .entries = &entries, .details = &details });
+    var r = Reader.init(buf.items);
+    const frame = (try r.next()).?;
+    const got = try NetLog.decodeAlloc(frame.payload, gpa);
+    defer got.freeDecoded(gpa);
+    const d = got.details.?;
+    try std.testing.expect(d[0].redirect() and !d[1].redirect());
+    try std.testing.expectEqual(@as(u32, 5), d[1].prev_seq);
+    try std.testing.expectEqualStrings("Moved Permanently", d[0].status_text);
+    try std.testing.expectEqual(@as(i32, -102), d[2].err);
+    const json = try netLogJson2(gpa, got);
+    defer gpa.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"redirect\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"prev_seq\":5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"error\":\"net::ERR_CONNECTION_REFUSED\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"mime\":\"text/html\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\n") == null);
+
+    // The same bytes through an OLDER decoder, which stops after the
+    // entries: the trailer is simply never read.
+    var cur = Cur{ .buf = frame.payload };
+    _ = try cur.readU32();
+    _ = try cur.readU32();
+    const n = try cur.readU16();
+    for (0..n) |_| {
+        _ = try readNetEntry(&cur);
+        _ = try cur.readU8();
+    }
+    try std.testing.expect(cur.pos < frame.payload.len);
+
+    // A trailer whose count disagrees with the entries is malformed.
+    var bad: std.ArrayList(u8) = .empty;
+    defer bad.deinit(gpa);
+    try (NetLog{ .view = 9, .next_seq = 8, .entries = entries[0..2], .details = &details }).encodeTo(gpa, &bad);
+    try std.testing.expectError(error.Malformed, NetLog.decodeAlloc(bad.items, gpa));
+
+    var nb: [48]u8 = undefined;
+    try std.testing.expectEqualStrings("net::ERR_ABORTED", netErrorName(&nb, -3));
+    try std.testing.expectEqualStrings("net::ERROR_-999", netErrorName(&nb, -999));
 }
 
 test "round-trip: capture_set carries the whole filter, lists clamped not wrapped" {

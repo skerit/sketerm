@@ -5523,6 +5523,7 @@ pub const jsonStrField = host_icpt.jsonStrField;
 pub const userfreeInto = host_icpt.userfreeInto;
 const onBeforeResourceLoad = host_icpt.onBeforeResourceLoad;
 const onResourceResponse = host_icpt.onResourceResponse;
+const onResourceRedirect = host_icpt.onResourceRedirect;
 const netErrorName = host_icpt.netErrorName;
 const onResourceLoadComplete = host_icpt.onResourceLoadComplete;
 
@@ -6295,6 +6296,8 @@ fn installHandlers() void {
     resource_request_handler.get_resource_handler = onGetResourceHandler;
     readFaultEnv();
     resource_request_handler.on_resource_response = onResourceResponse;
+    // Redirect hops end in the request log with the redirect's status.
+    resource_request_handler.on_resource_redirect = onResourceRedirect;
     // Response-body capture: a filter only for exchanges a view's
     // capture matched, NULL (no filter at all) for everything else.
     resource_request_handler.get_resource_response_filter = host_cap.onGetResourceResponseFilter;

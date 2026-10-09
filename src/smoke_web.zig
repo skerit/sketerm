@@ -2308,9 +2308,9 @@ const Client = struct {
             },
             .intercept_log => {
                 const l = proto.InterceptLog.decodeAlloc(frame.payload, self.gpa) catch fail("intercept_log decode");
-                defer self.gpa.free(l.entries);
+                defer l.freeDecoded(self.gpa);
                 self.int_log_next = l.next_seq;
-                const json = proto.netLogJson(self.gpa, l.next_seq, l.entries) catch fail("intercept_log json");
+                const json = proto.netLogJson(self.gpa, l) catch fail("intercept_log json");
                 defer self.gpa.free(json);
                 self.int_log_len = @min(json.len, self.int_log.len);
                 @memcpy(self.int_log[0..self.int_log_len], json[0..self.int_log_len]);
@@ -3810,7 +3810,7 @@ fn runCaptureStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) 
         cl.send(proto.NetLogReq{ .view = view_id, .since = 0, .max = 128 });
         if (!cl.waitSeq(&cl.net_log_seq, before, 10_000)) fail("stage cap: no net_log reply");
         const log = proto.NetLog.decodeAlloc(cl.net_log_raw.items, gpa) catch fail("stage cap: net_log decode");
-        defer gpa.free(log.entries);
+        defer log.freeDecoded(gpa);
         for (l.entries) |e| {
             var joined = false;
             for (log.entries) |row| {

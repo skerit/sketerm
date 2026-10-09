@@ -1,5 +1,5 @@
 //! A loopback listener with an accept loop on its own thread, plus the
-//! one HTTP 200 response writer the fixture servers share.
+//! one HTTP response writer the fixture servers share.
 //!
 //! Five fixture servers (bench-webreq's HttpServer, smoke-web's
 //! HttpProbe, WreqServer, UboServer and the SOCKS5 ProxyProbe) each had
@@ -115,11 +115,16 @@ pub fn readRequest(afd: c_int, buf: []u8, timeout_ms: c_int) []const u8 {
 /// `Access-Control-Allow-Origin: *` line for the routers, plus
 /// `X-Stage: 34` for the blocking-webRequest one.
 pub fn respondOk(afd: c_int, ctype: []const u8, body: []const u8, extra: []const u8) void {
-    var head: [256]u8 = undefined;
+    respond(afd, "200 OK", ctype, body, extra);
+}
+
+/// Any status: `status` is the line after the version ("404 Not Found").
+pub fn respond(afd: c_int, status: []const u8, ctype: []const u8, body: []const u8, extra: []const u8) void {
+    var head: [512]u8 = undefined;
     const hdr = std.fmt.bufPrint(
         &head,
-        "HTTP/1.1 200 OK\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nCache-Control: no-store\r\n{s}Connection: close\r\n\r\n",
-        .{ ctype, body.len, extra },
+        "HTTP/1.1 {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nCache-Control: no-store\r\n{s}Connection: close\r\n\r\n",
+        .{ status, ctype, body.len, extra },
     ) catch return;
     _ = c.write(afd, hdr.ptr, hdr.len);
     _ = c.write(afd, body.ptr, body.len);
