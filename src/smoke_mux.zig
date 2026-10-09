@@ -2243,6 +2243,15 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     if (c.getenv("SKETERM_MUX_DRM_DEVICE") == null)
         _ = c.setenv("SKETERM_MUX_DRM_DEVICE", "/dev/null", 1);
 
+    // Runtime-dir removal: a daemon that lost its socket path gets it back
+    // and no client starts a second one. Real autostarted daemons, so it
+    // runs before this rig forks its own broker.
+    @import("smoke_relisten.zig").run(allocator);
+    if (c.getenv("SKETERM_SMOKE_MUX_RELISTEN_ONLY") != null) {
+        std.debug.print("smoke-mux: PASS (relisten stage only)\n", .{});
+        return 0;
+    }
+
     var path_buf: [128]u8 = undefined;
     const sock_path = std.fmt.bufPrint(&path_buf, "/tmp/sketerm-mux-smoke-{d}/mux.sock", .{c.getpid()}) catch unreachable;
 
