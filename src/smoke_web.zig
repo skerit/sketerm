@@ -6708,9 +6708,10 @@ fn runA11yStages(cl: *Client) void {
     //      the whole routing, against a real engine: if AX geometry
     //      were wrong or the click were synthetic, the count stays 0.
     //   b) CARET. `ev_a11y_caret` must carry a real caret and a real
-    //      selection, and must COALESCE — Chromium restates tree_data
-    //      on every update, so an uncoalesced caret would post a frame
-    //      per unrelated tree change.
+    //      selection, and must COALESCE: Chromium restates the whole
+    //      tree_data whenever any of it changes (title, focus, load
+    //      state), so an uncoalesced caret would post a frame per
+    //      such unrelated change.
     {
         if (!cl.acks(.a11y_caret)) fail("stage 36 a11y: hello_ack lacks the a11y-caret capability");
         const page = "data:text/html,<html><body style='background:%23fff;margin:0'>" ++
@@ -6843,9 +6844,12 @@ fn runA11yStages(cl: *Client) void {
         if (cl.ax_caret_seq == 0) fail("stage 36 a11y: no caret frame at all");
 
         // Coalescing: churn the DOM without touching the caret and
-        // require silence on the caret channel.
+        // require silence on the caret channel. The title change is
+        // what makes this test the HELPER: MEASURED on CEF 151, an update
+        // carries tree_data only when tree_data changed, so node churn
+        // alone never restates the caret and passes with coalescing off.
         const before = cl.ax_caret_seq;
-        _ = cl.evalWait("(function(){for(var i=0;i<12;i++){var d=document.createElement('p');d.textContent='churn'+i;document.body.appendChild(d)}return 1})()", false, 5_000);
+        _ = cl.evalWait("(function(){for(var i=0;i<12;i++){var d=document.createElement('p');d.textContent='churn'+i;document.body.appendChild(d)}document.title='churned';return 1})()", false, 5_000);
         _ = cl.drive(2_500, 0);
         if (cl.ax_caret_seq != before) {
             std.debug.print("smoke-web: caret frames {d} -> {d} on unrelated churn; every caret frame:\n{s}", .{ before, cl.ax_caret_seq, cl.ax_caret_log[0..cl.ax_caret_log_len] });

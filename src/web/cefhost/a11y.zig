@@ -442,9 +442,9 @@ pub fn axEmitUpdate(
 }
 
 /// Two caret frames describing the same state. Coalescing matters:
-/// Chromium repeats tree_data on every update, so an uncoalesced
-/// caret would post a frame per keystroke-sized tree change even when
-/// the caret never moved.
+/// Chromium restates the whole tree_data whenever any of it changes
+/// (title, focus, load state), so an uncoalesced caret would post a
+/// frame per such change even when the caret never moved.
 pub fn axCaretEql(a: proto.EvA11yCaret, b: proto.EvA11yCaret) bool {
     return a.anchor_id == b.anchor_id and a.anchor_offset == b.anchor_offset and
         a.focus_id == b.focus_id and a.focus_offset == b.focus_offset;
