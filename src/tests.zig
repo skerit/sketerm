@@ -77,6 +77,7 @@ comptime {
     _ = @import("web/presenter.zig");
     _ = @import("web/semantic.zig");
     _ = @import("web/reader.zig");
+    _ = @import("web/pageread.zig");
     _ = @import("web/hints.zig");
     _ = @import("web/filter.zig");
     _ = @import("web/filtersub.zig");
@@ -276,6 +277,7 @@ comptime {
     _ = @import("ipc/webtabs.zig");
     _ = @import("ipc/webnav.zig");
     _ = @import("ipc/webfetch.zig");
+    _ = @import("ipc/webread.zig");
     _ = @import("ipc/mcp.zig");
     _ = @import("ipc/mcp_app.zig");
     _ = @import("ipc/mcp_files.zig");

@@ -152,6 +152,7 @@ pub fn failPending(self: *Host, v: *View, p: Pending, msg: []const u8) void {
         }),
         .hints, .query => self.post(proto.SemQueryResult{ .view = v.id, .payload = .{ .s = msg } }),
         .review => self.post(proto.SemQueryResult{ .view = v.id, .payload = .{ .s = "{\"pending\":true}" } }),
+        .page => postPageError(self, v, msg),
         .click, .hover, .act, .set_value, .commit, .guarded_act, .choose_pick, .choose_done => self.post(proto.SemActResult{ .view = v.id, .id = p.sid, .ok = 0, .msg = msg }),
         .expand => self.post(proto.SemExpandResult{ .view = v.id, .id = p.sid, .off = p.off, .text = msg }),
         .read => self.post(proto.SemReadResult{ .view = v.id, .markdown = .{ .s = msg } }),
@@ -554,12 +555,30 @@ pub fn semExpand(self: *Host, req: proto.SemExpand) !void {
     self.sendScript(v, cmd);
 }
 
-/// Queries are answered from the shadow tree, never by a fresh DOM
-/// walk: a spot-check must not cost a traversal and must not invent
-/// ids the client has never been told about. The ONE exception is
-/// the `visible` (link hints) kind, whose whole answer is rects: it
-/// solicits a walk first, because a scroll moves every box without
-/// a single mutation the observer could have folded.
+/// A page query's refusal, in the JSON shape its answer has.
+fn postPageError(self: *Host, v: *View, msg: []const u8) void {
+    var out: std.Io.Writer.Allocating = .init(self.gpa);
+    defer out.deinit();
+    out.writer.writeAll("{\"code\":\"failed\",\"error\":") catch return;
+    jsonStr(&out.writer, msg) catch return;
+    out.writer.writeByte('}') catch return;
+    self.post(proto.SemQueryResult{ .view = v.id, .payload = .{ .s = out.written() } });
+}
+
+/// The live tree describes the CURRENT document and an observer keeps
+/// it there. Anything else (no walk yet, a navigation since the last
+/// one, no observer to fold a late render) and a tree query must walk
+/// first, or it answers "0 matches" about a page that is not there.
+pub fn treeCurrent(v: *const View) bool {
+    return v.sem.has_tree and v.sem_observing and v.sem_context_doc != 0 and v.sem.doc_token == v.sem_context_doc;
+}
+
+/// Tree queries are answered from the shadow tree, never by a walk of
+/// their own: a spot-check must not cost a traversal while an observer
+/// keeps the tree live. When none does (`treeCurrent`), the query
+/// solicits ONE walk, answers from it and arms the observer. `visible`
+/// (link hints) always walks, because a scroll moves every box without
+/// a mutation; `review` and `page` read the DOM in the page.
 pub fn semQuery(self: *Host, req: proto.SemQueryReq) !void {
     const v = self.find(req.view) orelse return;
     if (v.discarded) {
@@ -570,15 +589,20 @@ pub fn semQuery(self: *Host, req: proto.SemQueryReq) !void {
         self.post(proto.SemQueryResult{ .view = v.id, .payload = .{ .s = "{\"pending\":true}" } });
         return;
     }
+    if (v.sem_nav.loading and req.kind == @intFromEnum(proto.SemQuery.page)) {
+        postPageError(self, v, "page reading unavailable while the page is navigating (web_navigate action:stop clears a stuck one)");
+        return;
+    }
     if (v.sem_nav.loading and req.kind != @intFromEnum(proto.SemQuery.visible)) {
         self.post(proto.SemQueryResult{ .view = v.id, .payload = .{ .s = "semantic query unavailable while the page is navigating (web_navigate action:stop clears a stuck one)" } });
         return;
     }
-    if (req.kind == @intFromEnum(proto.SemQuery.review)) {
-        const rid = try self.pushPending(v, .{ .req = nextReq(v), .kind = .review });
+    if (req.kind == @intFromEnum(proto.SemQuery.review) or req.kind == @intFromEnum(proto.SemQuery.page)) {
+        const page = req.kind == @intFromEnum(proto.SemQuery.page);
+        const rid = try self.pushPending(v, .{ .req = nextReq(v), .kind = if (page) .page else .review });
         var out: std.Io.Writer.Allocating = .init(self.gpa);
         defer out.deinit();
-        try out.writer.print("{{\"op\":\"review\",\"req\":{d},\"options\":", .{rid});
+        try out.writer.print("{{\"op\":\"{s}\",\"req\":{d},\"options\":", .{ if (page) "page" else "review", rid });
         try jsonStr(&out.writer, req.arg);
         try out.writer.writeByte('}');
         self.sendScript(v, out.written());
@@ -598,10 +622,16 @@ pub fn semQuery(self: *Host, req: proto.SemQueryReq) !void {
         self.sendScript(v, cmd);
         return;
     }
-    if (!v.sem.has_tree) {
-        // No walk has happened yet (the view was opened with its
-        // first snapshot skipped): solicit one and answer from it,
-        // so act-by-name does not cost the caller a snapshot turn.
+    if (!treeCurrent(v)) {
+        // No walk of THIS document is being kept live (its first
+        // snapshot was skipped, a navigation replaced the walked one,
+        // or nothing observes it): solicit one walk, answer from it,
+        // and keep the tree live from here on.
+        v.sem_want_observer = true;
+        if (!v.sem_observing) {
+            v.sem_observing = true;
+            self.sendScript(v, "{\"op\":\"observe\",\"on\":true}");
+        }
         const arg = try self.gpa.dupe(u8, req.arg);
         errdefer self.gpa.free(arg);
         const rid = try self.pushPending(v, .{ .req = nextReq(v), .kind = .query, .mode = req.kind, .rearm = v.sem_nav.loading, .arg = arg });
@@ -887,6 +917,13 @@ pub fn onScriptMessage(self: *Host, v: *View, json: []const u8) void {
             .ok = e.value.ok,
             .json = .{ .s = body },
         });
+    } else if (std.mem.eql(u8, op, "page") and p.kind == .page) {
+        if (json.len > proto.MAX_EVAL_JSON) {
+            var msg: [160]u8 = undefined;
+            postPageError(self, v, std.fmt.bufPrint(&msg, "the page read serialized to {d} bytes, past the {d}-byte frame budget; narrow it with a selector", .{ json.len, proto.MAX_EVAL_JSON }) catch "the page read is too large to return");
+            return;
+        }
+        self.post(proto.SemQueryResult{ .view = v.id, .payload = .{ .s = json } });
     } else if (std.mem.eql(u8, op, "review") and p.kind == .review) {
         if (json.len > 131072) {
             self.post(proto.SemQueryResult{ .view = v.id, .payload = .{ .s = "review exceeded its 128KiB response budget" } });

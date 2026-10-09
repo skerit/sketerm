@@ -12,8 +12,8 @@
 //!
 //! Everything a url produces is read with the machinery the tab tools
 //! use: the navigation fact (`mcp_web.navOf`), reader mode
-//! (`mcp_web.readerOp`), the response body from a capture
-//! (`mcp_web.readWholeBody`), downloads through the engine's download
+//! (`mcp_web.readerOp`), the document source (`mcp_web.sourceOf`: a
+//! capture's response body, else the DOM), downloads through the engine's download
 //! path, and `web_open`'s `wait` (`mcp_web.WaitProbe`, stepped here).
 
 const std = @import("std");
@@ -21,6 +21,7 @@ const mcp = @import("mcp.zig");
 const web = @import("mcp_web.zig");
 const webdrive = @import("webdrive.zig");
 const webfetch = @import("webfetch.zig");
+const webread = @import("webread.zig");
 const webnav = @import("webnav.zig");
 const filter = @import("../web/filter.zig");
 const clock = @import("../util/clock.zig");
@@ -51,7 +52,7 @@ pub fn capability() struct {
     per_call_tabs: u16 = webfetch.PER_CALL_TABS,
     max_tabs: u16,
     max_urls: usize = webfetch.MAX_URLS,
-    modes: []const []const u8 = web.enumNames(webfetch.Mode),
+    modes: []const []const u8 = fetchModeNames(),
     statuses: []const []const u8 = web.enumNames(webfetch.Status),
     /// The running helper keeps fetch tabs out of every viewer and can
     /// refuse redirects (view-flags); null before it starts.
@@ -96,14 +97,22 @@ pub fn dueInMs(_: i64) ?i64 {
     return if (active()) TICK_MS else null;
 }
 
+/// The modes `web_fetch` takes (`webread.Mode.fetchable`).
+fn fetchModeNames() []const []const u8 {
+    comptime {
+        var out: []const []const u8 = &.{};
+        for (std.enums.values(webread.Mode)) |m| {
+            if (m.fetchable()) out = out ++ [_][]const u8{@tagName(m)};
+        }
+        return out;
+    }
+}
+
 const Opts = struct {
-    mode: webfetch.Mode = .text,
-    regex_in: webfetch.RegexIn = .text,
-    pattern: []const u8 = "",
-    ignore_case: bool = false,
-    context: usize = webfetch.DEFAULT_CONTEXT,
-    max_matches: usize = webfetch.DEFAULT_MAX_MATCHES,
-    max_chars: usize = webfetch.DEFAULT_MAX_CHARS,
+    mode: webread.Mode = .text,
+    /// Set for mode regex.
+    regex: ?webread.RegexOpts = null,
+    max_chars: usize = webread.DEFAULT_MAX_CHARS,
     follow: bool = true,
     timeout_ms: i64 = webfetch.DEFAULT_TIMEOUT_MS,
     to_dir: ?[]const u8 = null,
@@ -118,12 +127,12 @@ const Row = struct {
     navigation: ?webnav.Nav = null,
     kind: ?webfetch.Kind = null,
     body: ?[]const u8 = null,
-    body_source: ?webfetch.BodySource = null,
+    body_source: ?webread.BodySource = null,
     truncated: bool = false,
     bytes: u64 = 0,
     path: ?[]const u8 = null,
     content_type: ?[]const u8 = null,
-    matches: []const webfetch.Match = &.{},
+    matches: []const webread.Match = &.{},
     match_count: usize = 0,
     matches_capped: bool = false,
     wait: ?web.WaitReport = null,
@@ -175,11 +184,6 @@ fn refuse(arena: std.mem.Allocator, code: mcp.ErrCode, msg: []const u8) !mcp.Cal
     return .{ .reply = try mcp.errRes(arena, code, msg) };
 }
 
-fn clampArg(args: std.json.Value, key: []const u8, dflt: usize, max: usize) usize {
-    const v = mcp.argInt(args, key) orelse return dflt;
-    return @intCast(std.math.clamp(v, 1, @as(i64, @intCast(max))));
-}
-
 /// Validate a call and queue it; nothing opens before every argument
 /// checked out.
 pub fn start(arena: std.mem.Allocator, id: ?std.json.Value, args: std.json.Value) !mcp.Called {
@@ -193,20 +197,17 @@ pub fn start(arena: std.mem.Allocator, id: ?std.json.Value, args: std.json.Value
     for (urls_v.array.items) |u| if (u != .string) return refuse(arena, .invalid_args, "'urls' must hold url STRINGS");
 
     var opts: Opts = .{};
-    if (mcp.argStr(args, "mode")) |m| opts.mode = std.meta.stringToEnum(webfetch.Mode, m) orelse
-        return refuse(arena, .invalid_args, "'mode' must be text, raw or regex");
-    if (mcp.argStr(args, "regex_in")) |m| opts.regex_in = std.meta.stringToEnum(webfetch.RegexIn, m) orelse
-        return refuse(arena, .invalid_args, "'regex_in' must be text or raw");
-    opts.pattern = mcp.argStr(args, "pattern") orelse "";
-    opts.ignore_case = mcp.argBool(args, "ignore_case");
-    if (opts.mode == .regex) {
-        if (opts.pattern.len == 0) return refuse(arena, .invalid_args, "mode regex needs 'pattern'");
-        _ = webfetch.findMatches(arena, "", opts.pattern, .{ .ignore_case = opts.ignore_case }) catch |e|
-            return refuse(arena, .invalid_args, try std.fmt.allocPrint(arena, "'pattern' is not a supported regex ({s}); the syntax is the editor find bar's: classes, groups, alternation, quantifiers, \\b, line anchors; no backreferences or lookaround", .{@errorName(e)}));
-    } else if (opts.pattern.len > 0) return refuse(arena, .invalid_args, "'pattern' is for mode regex");
-    opts.context = if (mcp.argInt(args, "context_chars")) |c| @intCast(std.math.clamp(c, 0, @as(i64, webfetch.MAX_CONTEXT))) else webfetch.DEFAULT_CONTEXT;
-    opts.max_matches = clampArg(args, "max_matches", webfetch.DEFAULT_MAX_MATCHES, webfetch.MAX_MAX_MATCHES);
-    opts.max_chars = clampArg(args, "max_chars", webfetch.DEFAULT_MAX_CHARS, webfetch.MAX_MAX_CHARS);
+    if (mcp.argStr(args, "mode")) |m| {
+        const mode = std.meta.stringToEnum(webread.Mode, m);
+        if (mode == null or !mode.?.fetchable()) return refuse(arena, .invalid_args, "'mode' must be text, raw or regex (the element lists are web_read's, on a tab)");
+        opts.mode = mode.?;
+    }
+    switch (try web.parseRegexArgs(arena, args, opts.mode == .regex)) {
+        .none => {},
+        .err => |why| return refuse(arena, .invalid_args, why),
+        .regex => |r| opts.regex = r,
+    }
+    opts.max_chars = web.argClamped(args, "max_chars", webread.DEFAULT_MAX_CHARS, webread.MAX_MAX_CHARS);
     if (mcp.argValue(args, "follow_redirects")) |f| {
         if (f != .bool) return refuse(arena, .invalid_args, "'follow_redirects' must be a boolean");
         opts.follow = f.bool;
@@ -241,7 +242,7 @@ pub fn start(arena: std.mem.Allocator, id: ?std.json.Value, args: std.json.Value
     var aw: std.Io.Writer.Allocating = .init(ar);
     try std.json.Stringify.value(rid, .{}, &aw.writer);
     job.id_json = aw.written();
-    job.opts.pattern = try ar.dupe(u8, opts.pattern);
+    if (opts.regex) |r| job.opts.regex.?.pattern = try ar.dupe(u8, r.pattern);
     if (opts.to_dir) |d| job.opts.to_dir = try ar.dupe(u8, std.mem.trimEnd(u8, d, "/"));
     if (opts.wait) |w| job.opts.wait.?.arg = try ar.dupe(u8, w.arg);
     job.file_dir = job.opts.to_dir orelse try std.fmt.allocPrint(ar, "{s}/web-fetch", .{web.instanceDir().?});
@@ -531,8 +532,11 @@ fn readBody(job: *Job, it: *Item, e: *webdrive.Engine, kind: webfetch.Kind, nav:
     const o = job.opts;
     // Plain text, XML and JSON ARE their body; a page reads as reader
     // mode unless the caller asked for its source.
-    const want_raw = kind == .text or o.mode == .raw or (o.mode == .regex and o.regex_in == .raw);
-    const got = if (want_raw) try rawBody(e, ar, it, kind) else try readerText(e, ar, it);
+    const want_raw = kind == .text or o.mode == .raw or (o.regex != null and o.regex.?.in == .raw);
+    const got: web.Source = if (want_raw)
+        try web.sourceOf(.{ .headless = e }, ar, it.view, kind == .text, @max(it.deadline, clock.nowMs() + 3000))
+    else
+        try readerText(e, ar, it);
     const body = switch (got) {
         .err => |why| {
             it.row.status = .failed;
@@ -543,8 +547,10 @@ fn readBody(job: *Job, it: *Item, e: *webdrive.Engine, kind: webfetch.Kind, nav:
     };
     it.row.body_source = body.source;
     it.row.bytes = body.text.len;
-    if (o.mode == .regex) {
-        const m = try webfetch.findMatches(ar, body.text, o.pattern, .{ .ignore_case = o.ignore_case, .context = o.context, .max = o.max_matches });
+    // The page serializer's own cut is a cut too.
+    it.row.truncated = body.truncated;
+    if (o.regex) |rx| {
+        const m = try webread.findMatches(ar, body.text, rx.pattern, .{ .ignore_case = rx.ignore_case, .context = rx.context, .max = rx.max_matches });
         it.row.matches = m.items;
         it.row.match_count = m.total;
         it.row.matches_capped = m.capped;
@@ -568,17 +574,12 @@ fn readBody(job: *Job, it: *Item, e: *webdrive.Engine, kind: webfetch.Kind, nav:
         }
         return;
     }
-    const cut = webfetch.truncate(body.text, o.max_chars);
+    const cut = webread.truncate(body.text, o.max_chars);
     it.row.body = cut.text;
-    it.row.truncated = cut.truncated;
+    it.row.truncated = it.row.truncated or cut.truncated;
 }
 
-const Body = union(enum) {
-    ok: struct { text: []const u8, source: webfetch.BodySource },
-    err: []const u8,
-};
-
-fn readerText(e: *webdrive.Engine, ar: std.mem.Allocator, it: *Item) !Body {
+fn readerText(e: *webdrive.Engine, ar: std.mem.Allocator, it: *Item) !web.Source {
     const budget = @max(it.deadline - clock.nowMs(), 3000);
     return switch (try web.readerOp(.{ .headless = e }, ar, it.view, budget)) {
         .err => |f| .{ .err = f.text },
@@ -588,46 +589,6 @@ fn readerText(e: *webdrive.Engine, ar: std.mem.Allocator, it: *Item) !Body {
             break :blk .{ .ok = .{ .text = try ar.dupe(u8, parsed.value.markdown), .source = .reader } };
         },
     };
-}
-
-/// The response body from the tab's capture; the rendered DOM when the
-/// helper captured nothing.
-fn rawBody(e: *webdrive.Engine, ar: std.mem.Allocator, it: *Item, kind: webfetch.Kind) !Body {
-    const deadline = @max(it.deadline, clock.nowMs() + 3000);
-    if (e.findView(it.view)) |v| if (v.cap != null and !v.cap_disabled) {
-        if (e.captureList(ar, it.view, 0, 64, false, deadline - clock.nowMs())) |list| {
-            var seq: ?u32 = null;
-            for (list.entries) |ent| {
-                if (ent.rtype == @intFromEnum(filter.RType.document)) seq = ent.seq;
-            }
-            if (seq) |s| switch (try web.readWholeBody(e, ar, it.view, s, .response, deadline)) {
-                .ok => |b| {
-                    const shown = try web.present(ar, b.mime, b.charset, b.data);
-                    return .{ .ok = .{ .text = shown.bytes, .source = .response } };
-                },
-                .err => {},
-            };
-        } else |_| {}
-    };
-    const expr = if (kind == .text)
-        "document.body ? document.body.innerText : ''"
-    else
-        "document.documentElement ? document.documentElement.outerHTML : ''";
-    switch (try web.runOp(.{ .headless = e }, ar, it.view, .{
-        .op = "eval",
-        .data = expr,
-        .timeout_ms = 5000,
-        .max_chars = @intCast(webfetch.MAX_MAX_CHARS * 4),
-    }, 8000)) {
-        .err => |f| return .{ .err = f.text },
-        .done => |r| {
-            if (r.timed_out or !r.ok) return .{ .err = "the page did not hand over its source" };
-            const parsed = std.json.parseFromSliceLeaky(std.json.Value, ar, r.payload, .{}) catch return .{ .err = "the page's source came back malformed" };
-            const val = if (parsed == .object) parsed.object.get("value") orelse parsed else parsed;
-            if (val != .string) return .{ .err = "the page's source came back malformed" };
-            return .{ .ok = .{ .text = val.string, .source = .dom } };
-        },
-    }
 }
 
 fn fileDone(job: *Job, it: *Item, e: *webdrive.Engine, d: *const webdrive.Download) !void {
@@ -716,7 +677,7 @@ fn answer(job: *Job) !void {
         if (r.path) |p| try res.textf("[{d}] {d} bytes at {s}", .{ r.index, r.bytes, p });
         if (job.opts.mode == .regex and r.status == .done and r.kind != .file) {
             try res.textf("[{d}] {d} match(es){s}", .{ r.index, r.match_count, if (r.matches_capped) " (more than shown)" else "" });
-            for (r.matches) |m| try res.textf("  @{d}: ...{s}[{s}]{s}...", .{ m.offset, m.before, m.match, m.after });
+            try web.writeMatches(&res, r.matches);
         }
         if (r.body) |b| {
             try web.section(&res, try std.fmt.allocPrint(ar, "[{d}] {s}{s}", .{ r.index, @tagName(r.body_source.?), if (r.truncated) " (truncated)" else "" }), b);

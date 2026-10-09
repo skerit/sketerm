@@ -811,6 +811,17 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         say("smoke-mcp: focused web_fetch ok");
         return 0;
     }
+    if (c.getenv("SKETERM_SMOKE_MCP_WEBREAD_ONLY") != null) {
+        var bin_buf: [4096:0]u8 = undefined;
+        const web_bin = resolveWebBin(&bin_buf) orelse fail("sketerm-webengine not built for the reading stage");
+        _ = c.setenv("SKETERM_WEB_BIN", web_bin, 1);
+        defer _ = c.unsetenv("SKETERM_WEB_BIN");
+        _ = c.setenv("SKETERM_WEB_BROKER_ENGINE", "0", 1);
+        defer _ = c.unsetenv("SKETERM_WEB_BROKER_ENGINE");
+        webReadStage(allocator, exe, rt);
+        say("smoke-mcp: focused web reading ok");
+        return 0;
+    }
     if (c.getenv("SKETERM_SMOKE_MCP_WEBSTREAM_ONLY") != null) {
         var bin_buf: [4096:0]u8 = undefined;
         const web_bin = resolveWebBin(&bin_buf) orelse fail("built sketerm-webengine missing for the stream stage");
@@ -7445,6 +7456,389 @@ fn webFetchStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u
     m2.closeStdinWait();
 }
 
+/// Stage wr's loopback site: a long article with every kind of page
+/// chrome, a second page, a page that renders late, and its resources.
+const ReadHttp = struct {
+    lis: tcpserver.Listener = .{ .backlog = 32, .poll_ms = 100 },
+    long: []const u8 = "",
+
+    /// Paragraphs in the long page: enough for several 4000-byte pages.
+    const PARAS = 120;
+
+    fn build(self: *ReadHttp, arena: std.mem.Allocator) void {
+        var w: std.Io.Writer.Allocating = .init(arena);
+        const o = &w.writer;
+        o.writeAll(
+            \\<!doctype html><html><head><title>wr-long</title></head><body>
+            \\<header><a href="/home">Home Link</a> HEADER-MARK</header>
+            \\<nav><a href="/n1">Nav One</a> <a href="https://example.invalid/ext">Nav External</a></nav>
+            \\<main><h1>Long Article Heading</h1><p id="js">waiting-original</p>
+            \\<div id="sel-target"><p>SELECTED-TEXT inside the target</p><nav><a href="/inner">Inner Nav</a> INNER-NAV-MARK</nav></div>
+            \\<p data-secret="RAWONLY-ATTR">The needle NEEDLE-ALPHA-7 sits in this paragraph.</p>
+            \\<p><a href="rel/story">Story Link</a> <a href="/hidden" style="display:none">Hidden Link</a></p>
+            \\
+        ) catch fail("wr: build the long page");
+        for (0..PARAS) |i| o.print("<p>PARA-{d:0>4} lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor.</p>\n", .{i}) catch fail("wr: build the long page");
+        o.writeAll(
+            \\</main>
+            \\<aside>ASIDE-MARK <a href="/aside">Aside Link</a></aside>
+            \\<footer>FOOTER-MARK <a href="https://example.invalid/legal">Legal</a></footer>
+            \\<script>document.getElementById("js").textContent = "JS-" + "CHANGED"; var INLINE_SCRIPT_MARK = 1;</script>
+            \\<script src="/s.js" defer></script>
+            \\<iframe src="/frame" name="fr" title="Frame Title"></iframe>
+            \\</body></html>
+        ) catch fail("wr: build the long page");
+        self.long = w.written();
+    }
+
+    const second = "<!doctype html><html><head><title>wr-b</title></head><body><p>BETA-ONLY-WORD lives here</p></body></html>";
+    const late =
+        \\<!doctype html><html><head><title>wr-late</title></head><body><p>early text</p><div id="l"></div>
+        \\<script>setTimeout(function () { document.getElementById("l").textContent = "LATE-ARRIVAL-WORD"; }, 800);</script>
+        \\</body></html>
+    ;
+
+    var g_long: []const u8 = "";
+
+    fn start(self: *ReadHttp) bool {
+        g_long = self.long;
+        return self.lis.start(self, &onConn);
+    }
+
+    fn onConn(_: ?*anyopaque, afd: c_int) bool {
+        var buf: [4096]u8 = undefined;
+        const raw = tcpserver.readRequest(afd, &buf, 3000);
+        const path_start = (std.mem.indexOfScalar(u8, raw, ' ') orelse return false) + 1;
+        const path_end = std.mem.indexOfScalarPos(u8, raw, path_start, ' ') orelse return false;
+        const path = raw[path_start..path_end];
+        const eq = std.mem.eql;
+        if (eq(u8, path, "/long")) {
+            tcpserver.respondOk(afd, "text/html", g_long, "");
+        } else if (eq(u8, path, "/b")) {
+            tcpserver.respondOk(afd, "text/html", second, "");
+        } else if (eq(u8, path, "/late")) {
+            tcpserver.respondOk(afd, "text/html", late, "");
+        } else if (eq(u8, path, "/s.js")) {
+            tcpserver.respondOk(afd, "application/javascript", "void 0;", "");
+        } else if (eq(u8, path, "/frame")) {
+            tcpserver.respondOk(afd, "text/html", "<!doctype html><title>frame</title><p>FRAME-BODY</p>", "");
+        } else {
+            tcpserver.respond(afd, "404 Not Found", "text/plain", "?", "");
+        }
+        return false;
+    }
+};
+
+fn findTextCount(arena: std.mem.Allocator, m: *Mcp, arg: []const u8, comptime what: []const u8) usize {
+    var args: [512]u8 = undefined;
+    const r = capSc(arena, m.callToolTimeout("web_query", std.fmt.bufPrint(&args, "{{\"kind\":\"find_text\",\"arg\":\"{s}\"}}", .{arg}) catch unreachable, 30_000), what, false);
+    const matches = scStr(r, "matches", what);
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, matches, '\n');
+    while (it.next()) |line| {
+        if (line.len > 0 and line[0] == '[') n += 1;
+    }
+    return n;
+}
+
+/// Every link row the reply carries, by its text.
+fn linkNamed(links: []const std.json.Value, text: []const u8) ?std.json.ObjectMap {
+    for (links) |l| if (std.mem.eql(u8, l.object.get("text").?.string, text)) return l.object;
+    return null;
+}
+
+/// A page-side fingerprint of what script can see: window's own names
+/// and symbols plus the own names of the prototypes a reader could be
+/// tempted to patch. Equal before and after = the reading tools left
+/// nothing behind.
+const GLOBALS_PRINT =
+    \\{"body":"function shape(o){var n=Object.getOwnPropertyNames(o).sort().join(','),s=Object.getOwnPropertySymbols(o).map(String).sort().join(','),t=n+'|'+s,h=0x811c9dc5;for(var i=0;i<t.length;i++){h^=t.charCodeAt(i);h=Math.imul(h,0x01000193)>>>0;}return h.toString(16);} return [window,Object.prototype,Array.prototype,Node.prototype,Element.prototype,HTMLElement.prototype,Document.prototype,EventTarget.prototype,String.prototype,JSON].map(shape).join('/');"}
+;
+
+fn globalsPrint(arena: std.mem.Allocator, m: *Mcp, comptime what: []const u8) []const u8 {
+    const r = capSc(arena, m.callToolTimeout("web_eval", GLOBALS_PRINT, 30_000), what, false);
+    var v = r.get("value") orelse fail(what ++ ": no value");
+    // An awaited body's value arrives in its {value} envelope.
+    if (v == .object) v = v.object.get("value") orelse fail(what ++ ": no value");
+    if (v != .string) fail(what ++ ": the print is not a string");
+    return arena.dupe(u8, v.string) catch fail("oom");
+}
+
+/// Stage wr: the reading tools against the real helper. find_text on a
+/// page never snapshotted (fresh, after a navigation, after a late
+/// render, and through the client-side walk an older helper needs);
+/// web_read paging with no gap or overlap, the size cap, a selector and
+/// an invalid one, the page chrome on and off, regex over text and over
+/// source, links with their areas, scripts and iframes, the source from
+/// the DOM and from a capture; an older helper's explicit refusal; and
+/// no page-visible global after all of it.
+fn webReadStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) void {
+    _ = rt;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var http = ReadHttp{};
+    http.build(arena);
+    if (!http.start()) fail("wr: could not bind the loopback reading fixture");
+    defer http.lis.deinit();
+    const port = http.lis.port;
+    var args: [2048]u8 = undefined;
+
+    var m = Mcp.spawn(allocator, exe, &.{});
+    m.initialize();
+    {
+        const caps = capSc(arena, m.callTool("capabilities", "{}"), "wr: capabilities", false);
+        const rd = (caps.get("web_read") orelse fail("wr: capabilities has no web_read")).object;
+        var have_links = false;
+        for (rd.get("modes").?.array.items) |md| {
+            if (std.mem.eql(u8, md.string, "links")) have_links = true;
+        }
+        if (!have_links) fail("wr: web_read modes lack links");
+        if (rd.get("page_read").? != .null) fail("wr: page_read is claimed before any helper runs");
+    }
+
+    // (1) find_text on pages never snapshotted.
+    m.sendTool("web_open", std.fmt.bufPrint(&args, "{{\"url\":\"http://127.0.0.1:{d}/long\",\"snapshot\":\"none\",\"label\":\"wr\"}}", .{port}) catch unreachable);
+    _ = capSc(arena, m.recvLine(60_000), "wr: open long", false);
+    {
+        const caps = capSc(arena, m.callTool("capabilities", "{}"), "wr: capabilities after start", false);
+        const rd = caps.get("web_read").?.object;
+        if (!rd.get("page_read").?.bool) fail("wr: the built helper does not report page-read");
+        if (!rd.get("query_live").?.bool) fail("wr: the built helper does not report query-live");
+    }
+    const print_before = globalsPrint(arena, &m, "wr: globals before");
+    if (findTextCount(arena, &m, "Long Article Heading", "wr: find_text fresh") != 1) fail("wr: find_text on a fresh page missed its heading");
+    findAfterNavigation(arena, &m, port, "wr");
+    m.sendTool("web_navigate", std.fmt.bufPrint(&args, "{{\"url\":\"http://127.0.0.1:{d}/long\"}}", .{port}) catch unreachable);
+    _ = capSc(arena, m.recvLine(40_000), "wr: back to long", false);
+    const print_long = globalsPrint(arena, &m, "wr: globals on the long page");
+    if (!std.mem.eql(u8, print_before, print_long)) fail("wr: the same page fingerprints differently after find_text");
+
+    // (2) Paging: at least three pages, no gap, no overlap, one hash.
+    const whole = blk: {
+        const r = capSc(arena, m.callToolTimeout("web_read", "{\"max_chars\":900000}", 30_000), "wr: whole text", false);
+        if (r.get("more").?.bool) fail("wr: a 900000-byte page did not hold the whole article");
+        break :blk .{ .text = arena.dupe(u8, scStr(r, "markdown", "wr: whole")) catch fail("oom"), .sha = arena.dupe(u8, scStr(r, "content_sha256", "wr: sha")) catch fail("oom") };
+    };
+    expectContains(whole.text, "PARA-0119", "wr: the whole text lacks the last paragraph");
+    expectContains(whole.text, "JS-CHANGED", "wr: the reader text is not the rendered page");
+    if (std.mem.indexOf(u8, whole.text, "FOOTER-MARK") != null or std.mem.indexOf(u8, whole.text, "Nav One") != null)
+        fail("wr: the default reader text carries the page chrome");
+    {
+        var joined: std.ArrayList(u8) = .empty;
+        var offset: i64 = 0;
+        var pages: usize = 0;
+        while (true) : (pages += 1) {
+            if (pages > 64) fail("wr: paging never ended");
+            const r = capSc(arena, m.callToolTimeout("web_read", std.fmt.bufPrint(&args, "{{\"max_chars\":4000,\"offset\":{d}}}", .{offset}) catch unreachable, 30_000), "wr: a page", false);
+            if (capInt(r, "offset") != offset) fail("wr: a page does not start where next_offset said");
+            if (capInt(r, "max_chars") != 4000) fail("wr: the page size is not the asked max_chars");
+            const md = scStr(r, "markdown", "wr: page text");
+            if (md.len > 4000) fail("wr: a page exceeds max_chars");
+            if (!std.mem.eql(u8, scStr(r, "content_sha256", "wr: page sha"), whole.sha)) fail("wr: content_sha256 changed between pages of an unchanged page");
+            if (pages == 0 and r.get("entities") == null) fail("wr: the first page carries no entities");
+            if (pages > 0 and r.get("entities") != null) fail("wr: a later page repeats the entities");
+            joined.appendSlice(arena, md) catch fail("oom");
+            const next = r.get("next_offset").?;
+            if (next == .null) {
+                if (r.get("more").?.bool) fail("wr: the last page says more");
+                break;
+            }
+            if (!r.get("more").?.bool) fail("wr: a page with a next_offset says no more");
+            offset = next.integer;
+        }
+        if (pages + 1 < 3) fail("wr: the long page did not span three pages");
+        if (!std.mem.eql(u8, joined.items, whole.text)) fail("wr: the pages joined are not the whole text (a gap or an overlap)");
+    }
+    // The size cap: the default, and a clamped request.
+    {
+        const r = capSc(arena, m.callToolTimeout("web_read", "{}", 30_000), "wr: default cap", false);
+        if (capInt(r, "max_chars") != 50_000) fail("wr: the default max_chars is not 50000");
+        const big = capSc(arena, m.callToolTimeout("web_read", "{\"max_chars\":99000000}", 30_000), "wr: clamped cap", false);
+        if (capInt(big, "max_chars") != 1_000_000) fail("wr: max_chars is not clamped to its hard max");
+        const tiny = capSc(arena, m.callToolTimeout("web_read", "{\"max_chars\":100}", 30_000), "wr: tiny cap", false);
+        if (scStr(tiny, "markdown", "wr: tiny").len > 100 or !tiny.get("more").?.bool) fail("wr: a 100-byte cap does not cut");
+    }
+
+    // (3) Selector, an invalid one, one that matches nothing.
+    {
+        const r = capSc(arena, m.callToolTimeout("web_read", "{\"selector\":\"#sel-target\",\"max_chars\":900000}", 30_000), "wr: selector", false);
+        const md = scStr(r, "markdown", "wr: selector text");
+        expectContains(md, "SELECTED-TEXT", "wr: the selector read lacks its scope's text");
+        if (std.mem.indexOf(u8, md, "PARA-0001") != null) fail("wr: the selector read reaches outside its scope");
+        if (std.mem.indexOf(u8, md, "INNER-NAV-MARK") != null) fail("wr: chrome inside the scope survived include_chrome false");
+        if (capInt(r, "selector_matches") != 1) fail("wr: selector_matches is not 1");
+        if (r.get("reader_ids").?.bool) fail("wr: a scoped read claims reader ids");
+        const with = capSc(arena, m.callToolTimeout("web_read", "{\"selector\":\"#sel-target\",\"include_chrome\":true}", 30_000), "wr: selector with chrome", false);
+        expectContains(scStr(with, "markdown", "wr: selector chrome"), "INNER-NAV-MARK", "wr: include_chrome dropped chrome inside the scope");
+        const bad = capSc(arena, m.callToolTimeout("web_read", "{\"selector\":\"[[[\"}", 30_000), "wr: invalid selector", true);
+        expectFact(bad.get("error").?.object, "code", "invalid_args", "wr: an invalid selector is not invalid_args");
+        const none = capSc(arena, m.callToolTimeout("web_read", "{\"selector\":\"#nothing-here\"}", 30_000), "wr: unmatched selector", true);
+        expectFact(none.get("error").?.object, "code", "not_found", "wr: an unmatched selector is not not_found");
+    }
+
+    // (4) Page chrome on and off.
+    {
+        const r = capSc(arena, m.callToolTimeout("web_read", "{\"include_chrome\":true,\"max_chars\":900000}", 30_000), "wr: chrome on", false);
+        const md = scStr(r, "markdown", "wr: chrome text");
+        for ([_][]const u8{ "FOOTER-MARK", "ASIDE-MARK", "Nav One", "HEADER-MARK", "PARA-0119" }) |want| expectContains(md, want, "wr: include_chrome lacks a part of the page");
+        if (!r.get("include_chrome").?.bool) fail("wr: include_chrome is not echoed");
+    }
+
+    // (5) Regex over the text and over the source, with context.
+    {
+        const r = capSc(arena, m.callToolTimeout("web_read", "{\"mode\":\"regex\",\"pattern\":\"NEEDLE-[A-Z]+-\\\\d\",\"context_chars\":12}", 30_000), "wr: regex text", false);
+        if (capInt(r, "match_count") != 1) fail("wr: regex over the text did not find the needle once");
+        const first = r.get("matches").?.array.items[0].object;
+        expectFact(first, "match", "NEEDLE-ALPHA-7", "wr: the regex match");
+        expectContains(scStr(first, "before", "wr: before"), "needle", "wr: the match lacks its context");
+        expectFact(r, "regex_in", "text", "wr: regex_in default");
+        const t0 = capSc(arena, m.callToolTimeout("web_read", "{\"mode\":\"regex\",\"pattern\":\"RAWONLY-ATTR\"}", 30_000), "wr: regex text miss", false);
+        if (capInt(t0, "match_count") != 0) fail("wr: an attribute value matched the readable text");
+        const raw = capSc(arena, m.callToolTimeout("web_read", "{\"mode\":\"regex\",\"regex_in\":\"raw\",\"pattern\":\"data-secret=.RAWONLY-ATTR\",\"context_chars\":5}", 30_000), "wr: regex raw", false);
+        if (capInt(raw, "match_count") != 1) fail("wr: regex over the source missed an attribute");
+        expectFact(raw, "body_source", "dom", "wr: a tab without a capture reads the DOM source");
+    }
+
+    // (6) Links with their areas, paged.
+    {
+        const r = capSc(arena, m.callToolTimeout("web_read", "{\"mode\":\"links\",\"max_items\":1000}", 30_000), "wr: links", false);
+        const links = r.get("links").?.array.items;
+        if (capInt(r, "link_count") != @as(i64, @intCast(links.len)) or links.len != 8) {
+            say(std.fmt.allocPrint(arena, "{f}", .{std.json.fmt(r.get("links").?, .{})}) catch "?");
+            fail("wr: the link list is not the page's eight links");
+        }
+        const checks = [_]struct { text: []const u8, area: []const u8, href_end: []const u8 }{
+            .{ .text = "Home Link", .area = "header", .href_end = "/home" },
+            .{ .text = "Nav One", .area = "nav", .href_end = "/n1" },
+            .{ .text = "Nav External", .area = "nav", .href_end = "example.invalid/ext" },
+            .{ .text = "Inner Nav", .area = "nav", .href_end = "/inner" },
+            .{ .text = "Story Link", .area = "main", .href_end = "/rel/story" },
+            .{ .text = "Aside Link", .area = "aside", .href_end = "/aside" },
+            .{ .text = "Legal", .area = "footer", .href_end = "example.invalid/legal" },
+        };
+        for (checks) |ck| {
+            const l = linkNamed(links, ck.text) orelse fail("wr: a link is missing from the list");
+            expectFact(l, "area", ck.area, "wr: a link's page area");
+            const href = scStr(l, "href", "wr: href");
+            if (!std.mem.startsWith(u8, href, "http") or !std.mem.endsWith(u8, href, ck.href_end)) {
+                say(href);
+                fail("wr: a link's href is not absolute");
+            }
+        }
+        if (linkNamed(links, "Hidden Link").?.get("visible").?.bool) fail("wr: a display:none link reads as visible");
+        if (!linkNamed(links, "Nav One").?.get("visible").?.bool) fail("wr: a visible link reads as hidden");
+        if (capInt(r.get("areas").?.object, "nav") != 3) fail("wr: the nav area count");
+        const pg = capSc(arena, m.callToolTimeout("web_read", "{\"mode\":\"links\",\"max_items\":3,\"offset\":2}", 30_000), "wr: links page", false);
+        if (pg.get("links").?.array.items.len != 3 or capInt(pg, "next_offset") != 5 or capInt(pg, "offset") != 2) fail("wr: links paging");
+        const scoped = capSc(arena, m.callToolTimeout("web_read", "{\"mode\":\"links\",\"selector\":\"footer\"}", 30_000), "wr: scoped links", false);
+        if (scoped.get("links").?.array.items.len != 1) fail("wr: links under a selector");
+    }
+
+    // (7) Scripts and iframes.
+    {
+        const r = capSc(arena, m.callToolTimeout("web_read", "{\"mode\":\"resources\"}", 30_000), "wr: resources", false);
+        const scripts = r.get("scripts").?.array.items;
+        if (scripts.len != 2 or capInt(r, "script_count") != 2) fail("wr: the page's two scripts");
+        const inl = scripts[0].object;
+        if (!inl.get("inline").?.bool or inl.get("src").? != .null or capInt(inl, "size") < 40) fail("wr: the inline script");
+        const ext = scripts[1].object;
+        if (ext.get("inline").?.bool or !ext.get("defer").?.bool) fail("wr: the external script's flags");
+        if (!std.mem.endsWith(u8, scStr(ext, "src", "wr: script src"), "/s.js") or !std.mem.startsWith(u8, scStr(ext, "src", "wr: script src"), "http")) fail("wr: the external script's src is not absolute");
+        const frames = r.get("iframes").?.array.items;
+        if (frames.len != 1) fail("wr: the page's iframe");
+        expectFact(frames[0].object, "name", "fr", "wr: iframe name");
+        expectFact(frames[0].object, "title", "Frame Title", "wr: iframe title");
+        if (!std.mem.endsWith(u8, scStr(frames[0].object, "src", "wr: iframe src"), "/frame")) fail("wr: iframe src");
+    }
+
+    // (8) The source: the rendered DOM here, a subtree's markup.
+    {
+        const r = capSc(arena, m.callToolTimeout("web_read", "{\"mode\":\"raw\",\"max_chars\":900000}", 30_000), "wr: raw", false);
+        expectFact(r, "body_source", "dom", "wr: raw without a capture is the DOM");
+        const body = scStr(r, "body", "wr: raw body");
+        expectContains(body, "INLINE_SCRIPT_MARK", "wr: the source lacks the inline script");
+        expectContains(body, "JS-CHANGED", "wr: the DOM source is not the rendered DOM");
+        const sub = capSc(arena, m.callToolTimeout("web_read", "{\"mode\":\"raw\",\"selector\":\"#sel-target\"}", 30_000), "wr: raw selector", false);
+        const sb = scStr(sub, "body", "wr: raw selector body");
+        if (!std.mem.startsWith(u8, sb, "<div id=\"sel-target\">") or std.mem.indexOf(u8, sb, "PARA-0001") != null) fail("wr: a selector's markup is not its subtree");
+        const pg = capSc(arena, m.callToolTimeout("web_read", "{\"mode\":\"raw\",\"max_chars\":1000}", 30_000), "wr: raw page", false);
+        if (scStr(pg, "body", "wr: raw page body").len > 1000 or !pg.get("more").?.bool) fail("wr: raw is not paged by max_chars");
+    }
+
+    // (9) Nothing page-visible after every reading tool ran.
+    {
+        const after = globalsPrint(arena, &m, "wr: globals after");
+        if (!std.mem.eql(u8, after, print_long)) {
+            say(print_long);
+            say(after);
+            fail("wr: the reading tools left something page script can see");
+        }
+    }
+    _ = capSc(arena, m.callTool("web_close", "{\"label\":\"wr\"}"), "wr: close", false);
+
+    // (10) The response body as received, from a capture.
+    m.sendTool("web_open", std.fmt.bufPrint(&args, "{{\"url\":\"http://127.0.0.1:{d}/long\",\"snapshot\":\"none\",\"label\":\"wr\",\"capture\":{{\"types\":[\"document\"]}}}}", .{port}) catch unreachable);
+    _ = capSc(arena, m.recvLine(60_000), "wr: open captured", false);
+    {
+        const r = capSc(arena, m.callToolTimeout("web_read", "{\"mode\":\"raw\",\"max_chars\":900000}", 30_000), "wr: raw captured", false);
+        if (!std.mem.eql(u8, scStr(r, "body_source", "wr: captured source"), "response")) {
+            say(m.callTool("web_capture", "{}"));
+            fail("wr: a captured tab's source is not the response body");
+        }
+        const body = scStr(r, "body", "wr: captured body");
+        expectContains(body, "waiting-original", "wr: the response body is not the source as received");
+        expectContains(body, "\"JS-\" + \"CHANGED\"", "wr: the response body lacks its script");
+        if (std.mem.indexOf(u8, body, ">JS-CHANGED<") != null) fail("wr: the response body is the rendered DOM");
+        if (capInt(r, "total_chars") != @as(i64, @intCast(http.long.len))) fail("wr: the response body is not the bytes served");
+    }
+    _ = capSc(arena, m.callTool("web_close", "{\"label\":\"wr\"}"), "wr: close captured", false);
+    m.closeStdinWait();
+
+    // (11) An older helper: page reading refuses explicitly, find_text
+    // still reads the current page through the client-side walk.
+    _ = c.setenv("SKETERM_WEB_DISABLE_PAGE_READ", "1", 1);
+    _ = c.setenv("SKETERM_WEB_DISABLE_QUERY_LIVE", "1", 1);
+    var old = Mcp.spawn(allocator, exe, &.{});
+    _ = c.unsetenv("SKETERM_WEB_DISABLE_PAGE_READ");
+    _ = c.unsetenv("SKETERM_WEB_DISABLE_QUERY_LIVE");
+    old.initialize();
+    old.sendTool("web_open", std.fmt.bufPrint(&args, "{{\"url\":\"http://127.0.0.1:{d}/long\",\"snapshot\":\"none\",\"label\":\"wr\"}}", .{port}) catch unreachable);
+    _ = capSc(arena, old.recvLine(60_000), "wr: old open", false);
+    {
+        const caps = capSc(arena, old.callTool("capabilities", "{}"), "wr: old capabilities", false);
+        const rd = caps.get("web_read").?.object;
+        if (rd.get("page_read").?.bool or rd.get("query_live").?.bool) fail("wr: a withheld capability is still reported");
+        const links = capSc(arena, old.callToolTimeout("web_read", "{\"mode\":\"links\"}", 30_000), "wr: old links", true);
+        expectFact(links.get("error").?.object, "code", "unavailable", "wr: links on an old helper is not unavailable");
+        expectContains(scStr(links.get("error").?.object, "message", "wr: old message"), "predates page reading", "wr: the refusal does not say why");
+        const text = capSc(arena, old.callToolTimeout("web_read", "{\"max_chars\":900000}", 30_000), "wr: old text", false);
+        expectContains(scStr(text, "markdown", "wr: old markdown"), "PARA-0119", "wr: plain web_read fails on an old helper");
+    }
+    if (findTextCount(arena, &old, "Long Article Heading", "wr: old find_text fresh") != 1) fail("wr: find_text on an old helper missed the heading");
+    findAfterNavigation(arena, &old, port, "wr: old");
+    _ = capSc(arena, old.callTool("web_close", "{\"label\":\"wr\"}"), "wr: old close", false);
+    old.closeStdinWait();
+}
+
+/// find_text after a navigation and after a late render, never having
+/// snapshotted either page: the answers must describe the CURRENT page.
+fn findAfterNavigation(arena: std.mem.Allocator, m: *Mcp, port: u16, comptime what: []const u8) void {
+    var args: [512]u8 = undefined;
+    m.sendTool("web_navigate", std.fmt.bufPrint(&args, "{{\"url\":\"http://127.0.0.1:{d}/b\"}}", .{port}) catch unreachable);
+    _ = capSc(arena, m.recvLine(40_000), what ++ ": navigate b", false);
+    if (findTextCount(arena, m, "BETA-ONLY-WORD", what ++ ": find_text after navigation") != 1)
+        fail(what ++ ": find_text after a navigation answered from the previous page");
+    if (findTextCount(arena, m, "Long Article Heading", what ++ ": stale heading") != 0)
+        fail(what ++ ": find_text still sees the previous page");
+    m.sendTool("web_navigate", std.fmt.bufPrint(&args, "{{\"url\":\"http://127.0.0.1:{d}/late\"}}", .{port}) catch unreachable);
+    _ = capSc(arena, m.recvLine(40_000), what ++ ": navigate late", false);
+    if (findTextCount(arena, m, "early text", what ++ ": find_text early") != 1) fail(what ++ ": find_text missed the late page's early text");
+    _ = c.usleep(2_000_000);
+    if (findTextCount(arena, m, "LATE-ARRIVAL-WORD", what ++ ": find_text late") != 1)
+        fail(what ++ ": find_text missed text the page rendered after the first query");
+}
+
 /// Run only the optional browser stage for focused E2E validation.
 fn webOnly(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: [:0]const u8) u8 {
     var bin_buf: [4096:0]u8 = undefined;
@@ -7470,6 +7864,8 @@ fn webOnly(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: [:0]const u8) u
     say("smoke-mcp: focused navigation results ok");
     webFetchStage(allocator, exe, rt);
     say("smoke-mcp: focused web_fetch ok");
+    webReadStage(allocator, exe, rt);
+    say("smoke-mcp: focused web reading ok");
     killDaemonsUnderRt(rt, allocator);
     _ = c.usleep(500_000);
     g_rt = null;

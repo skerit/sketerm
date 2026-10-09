@@ -1846,6 +1846,23 @@ half in `cefhost/stream.zig`.
   never can be, so page content is untrusted input to every consumer.
   `SKETERM_WEB_TEST_HOOKS` arms semantic.js's `data-sketerm-delay-*`
   latency hooks for the smoke rig (it was a page-readable window flag).
+- **A tree query must describe the CURRENT document** (capability
+  `query-live`). A navigation does not clear the shadow tree, and a
+  query answered from it whenever `has_tree` held, so `web_query` after
+  a `web_navigate` with no snapshot read the PREVIOUS page and a late
+  render was never folded without an observer: both came back as a
+  plain "0 matches". `semlayer.treeCurrent` (a tree, an observer, and
+  the tree's `doc_token` equal to the context's) now gates the answer;
+  anything else solicits one walk and arms the observer.
+- **Page reading is one query kind, `page` (capability `page-read`).**
+  `pageRead` in semantic.js answers scoped text (the reader's own
+  markdown walk, with `dropChrome` skipping navigation/banner/
+  contentinfo/complementary landmarks), a subtree's markup, links with
+  their landmark area and scripts/iframes, all as one JSON reply posted
+  whole (`postPageError` for refusals, `MAX_EVAL_JSON` as its budget).
+  Its vocabularies live in `pageread.zig`, which a test holds against
+  semantic.js's `PAGE_WHAT`/`LINK_AREAS`/`PAGE_ERRORS`. Like the rest of
+  the layer it defines nothing on `window` and patches nothing.
 - `--keep` must return immediately: a daemon spawning `/proc/self/exe`
   as a display keeper must never get a browser helper instead.
 - **Filter-list subscription (0xC4, capability "filter-subscribe")** is

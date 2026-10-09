@@ -207,8 +207,8 @@ is kept by a `:ro` policy term. The full descriptions and schemas are in
 - `web_snapshot` (read-only): The page's ACCESSIBILITY-style tree as compact text: one line per node with a stable [id], role, name, states (focused/checked/disabled/required/invalid/expanded/current) and value.
 - `web_act`: Act on an element: by semantic ID from web_snapshot/web_read, or by accessible 'name' (with optional 'role' and 'nth') to fold the find-then-act two-step into one call.
 - `web_expand` (read-only): Full text of a node the snapshot truncated (the "(+N chars, expand [id])" marker), paged with offset/len.
-- `web_query` (read-only): Cheap spot-check against the tree AS LAST SENT to you (no fresh DOM walk): find_text (nodes whose name contains 'arg'), subtree (children of the node id in 'arg'), focused, form (every form control with its value and checked/disabled states and the row or group it sits in - what Apply would submit; 'arg' = a node id to scope it, or omit for the page), or within_text ('arg' = JSON {"text","name","role"}: the controls named name under the smallest container that also holds text, the same resolution web_act within_text uses).
-- `web_read` (read-only): READ THE PAGE: reader-mode markdown of the main content (headings, paragraphs, lists, code, links), with navigation and boilerplate dropped, plus stable semantic IDs for useful sections/headings/links/items.
+- `web_query` (read-only): Cheap spot-check against the page's LIVE semantic tree, always the CURRENT document (after a navigation or a late render it walks the page first rather than answer from a stale tree): find_text (nodes whose name contains 'arg'), subtree (children of the node id in 'arg'), focused, form (every form control with its value and checked/disabled states and the row or group it sits in - what Apply would submit; 'arg' = a node id to scope it, or omit for the page), or within_text ('arg' = JSON {"text","name","role"}: the controls named name under the smallest container that also holds text, the same resolution web_act within_text uses).
+- `web_read` (read-only): READ THE PAGE: its readable text by default, or its source, regex matches with context, its links or its scripts and iframes, in pages.
 - `web_wait` (read-only): Wait until the view reaches a state: "load" (no load in flight), "title" (its title contains 'arg', or any title when arg is omitted), "text" ('arg' appears in the page's semantic tree), "idle" (the DOM stopped changing for 600ms), "selector" (an element matches the CSS selector in 'arg'; an invalid selector is refused at once), "network_idle" (no request in flight and none started for 500ms; a page holding a long poll, stream or websocket never gets there and the timeout names what is still in flight) or "response" (headless, a view opened with a capture: a CAPTURED exchange matching the 'response' filter finished after cursor 'since' - default: after this call starts - or, with after_seq, one whose request came after that web_network seq; the reply carries the exchange, read its body with web_capture seq:N).
 - `web_scroll`: Scroll a web view and report the SETTLED position (before/after scrollX/scrollY plus the maximum), so "nothing moved" and "moved to the end" are different answers.
 - `web_key`: Send named key chords to a web view as TRUSTED key events (the same input path a real keystroke rides), so Tab order, Escape-to-dismiss and Enter-to-submit are testable.
@@ -487,8 +487,10 @@ CDP: input is delivered as real engine events, so a page sees
 - `web_act` acts on an id rather than a selector, and echoes what it
   actually hit.
 - `web_expand` fetches text that a snapshot truncated; `web_read`
-  returns the main content as prose; `web_query` spot-checks a subtree
-  without paying for a snapshot; `web_eval` runs script, with DOM
+  returns the main content as prose (paged, scoped by a selector, or as
+  the source, regex matches, the links or the scripts and iframes; see
+  "Reading one tab"); `web_query` spot-checks the live tree without
+  paying for a snapshot; `web_eval` runs script, with DOM
   results returned as `{semantic_id, role, name}` so they feed straight
   back into `web_act`.
 
@@ -668,6 +670,60 @@ with a GUI browser (`web_gui`, `--shared`): its tabs would be the user's.
 `capabilities.web_fetch` reports `available`, the limits, `modes`,
 `statuses`, `background_tabs` and how many fetch tabs are `in_flight` and
 urls `queued` right now.
+
+### Reading one tab: `web_read`
+
+`web_read` reads the tab it names, in one of five `mode`s. The modes and
+the regex arguments are `web_fetch`'s (one vocabulary, `webread.zig`), plus
+two element lists only a tab has:
+
+| mode | answers with |
+|---|---|
+| `text` (default) | reader-mode markdown (`markdown`), plus `entities` with action ids on the first page |
+| `raw` | the document source (`body`): the response body as received when the tab captures its own document (`web_open capture`), else the rendered DOM's markup; `body_source` says `response` or `dom` |
+| `regex` | `pattern` over the readable text (`regex_in: "text"`, default) or the source (`"raw"`): `matches` with `offset`, `match`, `before`/`after` (`context_chars`, default 60), at most `max_matches` while `match_count` keeps counting |
+| `links` | every link: `text`, absolute `href`, `area` (`nav`, `header`, `main`, `footer`, `aside`, `other`: its nearest landmark) and `visible`; `areas` counts them per area |
+| `resources` | every script (`src`, or `inline` with its `size`; `type`, `async`, `defer`) and iframe (`src`, `name`, `title`, `visible`) |
+
+- **Pages.** Text and source come in pages of at most `max_chars` bytes
+  (default 50000, at most 1000000; a larger ask is clamped and the reply's
+  `max_chars` says so) starting at `offset`. Each reply carries `offset`,
+  `next_offset` (null at the end), `more`, `total_chars` and
+  `content_sha256` of the WHOLE text: walking `next_offset` from 0 covers it
+  with no gap and no overlap (both ends sit on UTF-8 boundaries), and an
+  unchanged hash says the page did not change between two pages. Links and
+  resources page by item (`offset`, `max_items`, default 200); resources
+  walk the scripts, then the iframes.
+- **`selector`** (CSS) reads only the matching elements (the outermost
+  ones, open shadow roots included; `selector_matches` counts them), in
+  every mode: their text, their markup for `raw`, the links or resources
+  inside them. An invalid selector is `invalid_args`, one that matches
+  nothing `not_found`.
+- **`include_chrome: true`** keeps what reader mode drops: the navigation,
+  page header, footer and aside landmarks (with no selector: the whole
+  body instead of the main region; with one: the landmarks inside it).
+  It applies to the readable text only; links and resources always cover
+  every area and say which.
+- A scoped or whole-page text read carries no action ids (`reader_ids:
+  false`): act through `web_snapshot` or `web_act name`.
+
+Selector, include_chrome, links and resources are read in the page by the
+semantic layer (browser-helper capability `page-read`; nothing is
+installed where page script can see it). An older helper or GUI answers
+them `unavailable`, naming why; plain text, raw and regex work on any.
+`capabilities.web_read` reports the modes, the caps, `link_areas`,
+`page_read` and `query_live` (null before a headless helper starts, and
+with a GUI browser, whose helper this server cannot ask).
+
+`web_query` answers from the page's live semantic tree, and that tree is
+now always the CURRENT document: a query on a page nothing has walked,
+after a navigation, or after the page rendered more, walks it first and
+keeps it live from then on (browser-helper capability `query-live`). An
+older helper could answer such a query from the PREVIOUS page, as a
+silent "0 matches"; with one (or a GUI) the server walks the page itself
+before each tree query (`query_live: false`). `find_text` matches node
+names, which are clamped, so a phrase deep inside a long paragraph is
+`web_read mode:"regex"`'s job.
 
 **Page content is untrusted input.** The reply channel is
 authenticated, so a page cannot forge a snapshot or intercept a reply,

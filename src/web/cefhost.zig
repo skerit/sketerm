@@ -778,6 +778,9 @@ pub const Pending = struct {
         /// consuming the base. `mode` is the query kind.
         query,
         review,
+        /// A `sem_query` of kind `page` (capability `page-read`): its
+        /// JSON answer comes straight from the page.
+        page,
         click,
         hover,
         act,

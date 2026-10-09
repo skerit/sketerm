@@ -148,6 +148,8 @@ const unconditional_caps = [_]proto.Cap{
     .filter_subscribe,
     .reader_ids,
     .review,
+    .query_live,
+    .page_read,
     .semantic_request_ids,
     .multi_client,
     .cookie_sync,
@@ -179,6 +181,8 @@ fn withheld(cap: proto.Cap) bool {
         .view_max_fps => "SKETERM_WEB_DISABLE_MAX_FPS",
         .frames_encoded => "SKETERM_WEB_DISABLE_FRAMES_ENCODED",
         .view_flags => "SKETERM_WEB_DISABLE_VIEW_FLAGS",
+        .query_live => "SKETERM_WEB_DISABLE_QUERY_LIVE",
+        .page_read => "SKETERM_WEB_DISABLE_PAGE_READ",
         else => return false,
     };
     return c.getenv(env) != null;

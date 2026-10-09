@@ -263,6 +263,19 @@ pub const CAP_WEBEXT_TABS = "webext-tabs";
 /// capability keeps using the legacy `sem_read` / `sem_read_result` pair.
 pub const CAP_READER_IDS = "reader-ids";
 pub const CAP_REVIEW = "review";
+/// A tree query (`SemQuery.readsLiveTree`) solicits a fresh walk whenever
+/// no MutationObserver keeps the live tree current for the CURRENT
+/// document, and arms the observer. Without it a query after a navigation
+/// answered from the previous page's tree, and one after a late render
+/// from a tree that never saw it, both as "0 matches"; a client of such a
+/// helper walks first (`SnapMode.peek`).
+pub const CAP_QUERY_LIVE = "query-live";
+/// The helper answers `sem_query` kind `page`: JSON options in, one JSON
+/// reply out (`web/pageread.zig`): text of a CSS-selected scope with or
+/// without the page chrome, a subtree's markup, every link with the page
+/// area it sits in, every script and iframe. Read straight off the live
+/// DOM; no snapshot base is consumed and nothing is installed in the page.
+pub const CAP_PAGE_READ = "page-read";
 /// The helper accepts `sem_request`, which wraps one existing semantic
 /// request with a client-minted id, and answers with a correlated
 /// `sem_result`. Existing semantic frame layouts remain unchanged.
@@ -456,6 +469,8 @@ pub const Cap = enum {
     webext_tabs,
     reader_ids,
     review,
+    query_live,
+    page_read,
     semantic_request_ids,
     webext_action,
     webext_events,
@@ -1002,14 +1017,27 @@ pub const SemQuery = enum(u8) {
     form = 5,
     /// Bounded live DOM review; JSON options and JSON result, no snapshot base consumed.
     review = 6,
+    /// Page reading (capability `page-read`): `pageread.Options` as JSON
+    /// in, `pageread.Reply` as JSON out, read off the live DOM.
+    page = 7,
     _,
 
-    /// The kinds a client may name in a request, read off this enum so
-    /// a new kind is one edit here. `visible` is the hints walk and
-    /// stays behind its own tool.
+    /// Answered from the live shadow tree (`semantic.View.query`), which
+    /// is what `web_query` exposes and what capability `query-live` keeps
+    /// current. The others walk or read the DOM themselves.
+    pub fn readsLiveTree(self: SemQuery) bool {
+        return switch (self) {
+            .find_text, .subtree, .focused, .within_text, .form => true,
+            .visible, .review, .page => false,
+            _ => false,
+        };
+    }
+
+    /// The kinds a client may name in a `web_query`, read off this enum
+    /// so a new kind is one edit here: the live-tree ones.
     pub fn fromName(name: []const u8) ?SemQuery {
         const qk = fromOperationName(name) orelse return null;
-        return if (qk == .review) null else qk;
+        return if (qk.readsLiveTree()) qk else null;
     }
 
     /// Internal review orchestration uses the query transport, not the public
@@ -1025,6 +1053,9 @@ test "SemQuery.fromName reads the enum and withholds the hints walk" {
     try std.testing.expectEqual(SemQuery.within_text, SemQuery.fromName("within_text").?);
     try std.testing.expect(SemQuery.fromName("visible") == null);
     try std.testing.expect(SemQuery.fromName("bogus") == null);
+    try std.testing.expect(SemQuery.fromName("page") == null);
+    try std.testing.expect(SemQuery.fromName("review") == null);
+    try std.testing.expectEqual(SemQuery.page, SemQuery.fromOperationName("page").?);
 }
 
 // ---------------------------------------------------------------------

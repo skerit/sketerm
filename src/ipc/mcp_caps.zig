@@ -308,6 +308,14 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
             try res.textf("web_fetch reads several urls through background tabs (modes text, raw, regex; files through the download path): at most {d} tabs per call and {d} across every concurrent call of this server, the rest queue; {d} in flight, {d} queued now", .{ fetch.per_call_tabs, fetch.max_tabs, fetch.in_flight, fetch.queued })
         else
             try res.textf("web_fetch is unavailable here: {s}", .{fetch.reason.?});
+        // Reading one tab: modes, caps, and what the running helper can
+        // do, so an old helper's refusal is explicable in advance.
+        const rd = @import("mcp_web.zig").readCapability();
+        try res.fact("web_read", rd);
+        try res.textf("web_read reads a tab in pages of max_chars (default {d}): text (reader mode; selector and include_chrome scope it), raw (the source), regex (over text or source, with context), links (absolute url and page area each), resources (scripts and iframes); {s}", .{
+            rd.max_chars,
+            if (rd.page_read) |p| (if (p) "the running helper reads selectors, links and resources" else "the running helper predates page reading: selector, include_chrome, links and resources answer unavailable") else "page reading is known once a helper runs",
+        });
         // Downloading through a view: the only path that carries the
         // page's own session, so a consumer must be able to preflight
         // it rather than discover it by trying.

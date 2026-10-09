@@ -849,6 +849,254 @@
     return out;
   }
 
+  // -- page reading (sem_query kind "page", capability page-read) -------
+  //
+  // web_read's scoped text, subtree markup, link list and script/iframe
+  // list, read straight off the live DOM. Like everything in this file it
+  // installs nothing a page can reach and consumes no snapshot base. The
+  // three lists below are pageread.zig's vocabularies; a test there holds
+  // them to these spellings.
+
+  var PAGE_WHAT = ["text", "html", "links", "resources"];
+  var LINK_AREAS = ["nav", "header", "main", "footer", "aside", "other"];
+  var PAGE_ERRORS = ["invalid_selector", "no_match", "failed"];
+  var PAGE_TEXT_MAX = 2000000;
+  var PAGE_LINKS_MAX = 5000;
+  var PAGE_SCRIPTS_MAX = 1000;
+  var PAGE_FRAMES_MAX = 500;
+  var PAGE_SCOPE_MAX = 20000;
+  // Set only while a chrome-less page read renders: markdownNode then
+  // drops navigation, banner, footer and aside landmarks, except the
+  // element the caller selected itself.
+  var dropChrome = false;
+  var chromeExempt = null;
+
+  var AREA_ROLE = { navigation: "nav", banner: "header", contentinfo: "footer", complementary: "aside", main: "main" };
+  var SECTIONING = { ARTICLE: 1, ASIDE: 1, MAIN: 1, NAV: 1, SECTION: 1 };
+
+  // The parent element, crossing out of an open shadow root to its host.
+  function parentOf(n) {
+    var p = n.parentNode;
+    if (p && p.nodeType === 11 && p.host) return p.host;
+    return n.parentElement;
+  }
+
+  // <header>/<footer> are page landmarks only outside sectioning content.
+  function inSection(el) {
+    for (var p = parentOf(el); p; p = parentOf(p)) {
+      if (SECTIONING[p.tagName]) return true;
+    }
+    return false;
+  }
+
+  // The area an element IS (not the one it sits in), or null.
+  function landmarkOf(el) {
+    var r = el.getAttribute && el.getAttribute("role");
+    if (r) {
+      var a = AREA_ROLE[r.toLowerCase().split(/\s+/)[0]];
+      if (a) return a;
+    }
+    var t = el.tagName;
+    if (t === "NAV") return "nav";
+    if (t === "ASIDE") return "aside";
+    if (t === "MAIN") return "main";
+    if (t === "HEADER") return inSection(el) ? null : "header";
+    if (t === "FOOTER") return inSection(el) ? null : "footer";
+    return null;
+  }
+
+  function areaOf(el) {
+    for (var n = el; n; n = parentOf(n)) {
+      var a = landmarkOf(n);
+      if (a) return a;
+    }
+    return "other";
+  }
+
+  function isChrome(el) {
+    var a = landmarkOf(el);
+    return a !== null && a !== "main";
+  }
+
+  // Every element matching `sel` under `root`, through open shadow roots,
+  // `root` itself included, at most `cap`.
+  function collectAll(root, sel, out, cap) {
+    if (root.matches && root.matches(sel) && out.length < cap) out.push(root);
+    var stack = [root];
+    while (stack.length && out.length < cap) {
+      var r = stack.pop();
+      if (!r.querySelectorAll) continue;
+      var list = r.querySelectorAll(sel);
+      for (var i = 0; i < list.length && out.length < cap; i++) out.push(list[i]);
+      var all = r.querySelectorAll("*");
+      for (var j = 0; j < all.length; j++) {
+        if (all[j].shadowRoot) stack.push(all[j].shadowRoot);
+      }
+    }
+    return out;
+  }
+
+  // The outermost elements `sel` matches: a match inside another is
+  // already part of it.
+  function pageScope(sel) {
+    var found = collectAll(document, sel, [], PAGE_SCOPE_MAX);
+    var kept = new Set();
+    var out = [];
+    for (var i = 0; i < found.length; i++) {
+      var inside = false;
+      for (var p = parentOf(found[i]); p && !inside; p = parentOf(p)) inside = kept.has(p);
+      if (inside) continue;
+      kept.add(found[i]);
+      out.push(found[i]);
+    }
+    return out;
+  }
+
+  // Elements matching `sel` across the scope (the document without one),
+  // each once.
+  function inScope(scope, sel, cap) {
+    var roots = scope || [document];
+    var out = [];
+    for (var i = 0; i < roots.length && out.length < cap; i++) collectAll(roots[i], sel, out, cap);
+    return Array.from(new Set(out));
+  }
+
+  function absUrl(el, attr) {
+    var v = el[attr];
+    if (typeof v === "string") return v;
+    var raw = el.getAttribute(attr) || el.getAttribute("xlink:" + attr) || "";
+    try {
+      return new URL(raw, document.baseURI).href;
+    } catch (e) {
+      return raw;
+    }
+  }
+
+  function visibleBox(el) {
+    try {
+      return el.getClientRects().length > 0;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function linkText(el) {
+    var name = nameOf(el, "link");
+    if (!name) {
+      var img = el.querySelector && el.querySelector("img[alt]");
+      if (img) name = (img.getAttribute("alt") || "").trim();
+    }
+    return name.slice(0, 300);
+  }
+
+  function pageText(res, scope, chrome) {
+    var out = [];
+    var entities = [];
+    dropChrome = !chrome;
+    try {
+      if (scope) {
+        for (var i = 0; i < scope.length; i++) {
+          chromeExempt = scope[i];
+          markdownNode(scope[i], 0, out, entities);
+        }
+      } else {
+        var title = (document.title || "").trim();
+        if (title) out.push("# " + title);
+        var region = chrome ? document.body || document.documentElement : mainRegion();
+        chromeExempt = region;
+        if (region) markdownNode(region, 0, out, entities);
+      }
+    } finally {
+      dropChrome = false;
+      chromeExempt = null;
+    }
+    var md = out.join("\n\n") + "\n";
+    res.total_chars = md.length;
+    res.truncated = md.length > PAGE_TEXT_MAX;
+    res.text = res.truncated ? md.slice(0, PAGE_TEXT_MAX) : md;
+  }
+
+  function pageHtml(res, scope) {
+    var s;
+    if (scope) {
+      var parts = [];
+      for (var i = 0; i < scope.length; i++) parts.push(scope[i].outerHTML || "");
+      s = parts.join("\n");
+    } else {
+      var dt = document.doctype ? "<!DOCTYPE " + document.doctype.name + ">\n" : "";
+      s = dt + (document.documentElement ? document.documentElement.outerHTML : "");
+    }
+    res.total_chars = s.length;
+    res.truncated = s.length > PAGE_TEXT_MAX;
+    res.text = res.truncated ? s.slice(0, PAGE_TEXT_MAX) : s;
+  }
+
+  function pageLinks(res, scope) {
+    var els = inScope(scope, "a[href],area[href]", PAGE_SCOPE_MAX);
+    var links = [];
+    for (var i = 0; i < els.length && links.length < PAGE_LINKS_MAX; i++) {
+      var el = els[i];
+      if (SKIP_TAG[el.tagName]) continue;
+      links.push({ text: linkText(el), href: absUrl(el, "href").slice(0, 2000), area: areaOf(el), visible: visibleBox(el) });
+    }
+    res.links = links;
+    res.links_total = els.length;
+    res.truncated = els.length > links.length || els.length >= PAGE_SCOPE_MAX;
+  }
+
+  function pageResources(res, scope) {
+    var scripts = inScope(scope, "script", PAGE_SCOPE_MAX);
+    var frames = inScope(scope, "iframe,frame", PAGE_SCOPE_MAX);
+    res.scripts = [];
+    for (var i = 0; i < scripts.length && res.scripts.length < PAGE_SCRIPTS_MAX; i++) {
+      var s = scripts[i];
+      var external = s.hasAttribute("src");
+      res.scripts.push({
+        src: external ? absUrl(s, "src").slice(0, 2000) : null,
+        inline: !external,
+        size: external ? null : (s.textContent || "").length,
+        type: (s.getAttribute("type") || "").slice(0, 100),
+        async: s.hasAttribute("async"),
+        defer: s.hasAttribute("defer")
+      });
+    }
+    res.iframes = [];
+    for (var j = 0; j < frames.length && res.iframes.length < PAGE_FRAMES_MAX; j++) {
+      var f = frames[j];
+      res.iframes.push({
+        src: (f.hasAttribute("src") ? absUrl(f, "src") : "").slice(0, 2000),
+        name: (f.getAttribute("name") || "").slice(0, 200),
+        title: (f.getAttribute("title") || "").slice(0, 200),
+        visible: visibleBox(f)
+      });
+    }
+    res.scripts_total = scripts.length;
+    res.iframes_total = frames.length;
+    res.truncated = scripts.length > res.scripts.length || frames.length > res.iframes.length;
+  }
+
+  function pageRead(options) {
+    var opt = options ? parseJson(options) : {};
+    if (PAGE_WHAT.indexOf(opt.what) < 0) return { error: "unknown page read", code: "failed" };
+    var scope = null;
+    var sel = typeof opt.selector === "string" ? opt.selector : "";
+    if (sel) {
+      try {
+        document.querySelector(sel);
+      } catch (e) {
+        return { error: "'" + sel.slice(0, 200) + "' is not a valid CSS selector", code: "invalid_selector" };
+      }
+      scope = pageScope(sel);
+      if (!scope.length) return { error: "the selector '" + sel.slice(0, 200) + "' matched no element", code: "no_match" };
+    }
+    var res = { what: opt.what, url: String(location.href), selector_matches: scope ? scope.length : 0 };
+    if (opt.what === "text") pageText(res, scope, !!opt.chrome);
+    else if (opt.what === "html") pageHtml(res, scope);
+    else if (opt.what === "links") pageLinks(res, scope);
+    else pageResources(res, scope);
+    return { result: res };
+  }
+
   function norm(s) {
     return String(s == null ? "" : s).replace(/\s+/g, " ").trim().toLowerCase();
   }
@@ -1211,6 +1459,7 @@
   function markdownNode(n, depth, out, entities) {
     var t = n.tagName;
     if (SKIP_TAG[t] || hidden(n)) return;
+    if (dropChrome && n !== chromeExempt && isChrome(n)) return;
     if (/^H[1-6]$/.test(t)) {
       readerEntity(n, "heading", entities);
       out.push(new Array(+t[1] + 1).join("#") + " " + inline(n, entities).trim());
@@ -3015,6 +3264,17 @@
       case "review":
         try { send({ op: "review", req: m.req, result: review(m.options) }); }
         catch (e) { send({ op: "review", req: m.req, error: String(e.message || e).slice(0, 240) }); }
+        break;
+      case "page":
+        var pr;
+        try {
+          pr = pageRead(m.options);
+        } catch (e) {
+          pr = { error: String((e && e.message) || e).slice(0, 240), code: "failed" };
+        }
+        pr.op = "page";
+        pr.req = m.req;
+        send(pr);
         break;
       case "pickoption":
         pickOption(m.req, m.arg || "", m.timeout || 4000);

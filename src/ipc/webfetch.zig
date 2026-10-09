@@ -1,26 +1,11 @@
-//! `web_fetch`'s pure half: the instance-wide queue of fetch tabs, what
-//! a response body is for reading, and the result shaping (size caps,
-//! regex matches with context). std-only and engine-free, so both test
-//! roots import it; `mcp_webfetch.zig` is the driver.
+//! `web_fetch`'s pure half: the instance-wide queue of fetch tabs and
+//! what a response body is for reading. The reading vocabulary it shares
+//! with `web_read` (modes, body sources, caps, regex matches) is
+//! `webread.zig`. std-only and engine-free, so both test roots import
+//! it; `mcp_webfetch.zig` is the driver.
 
 const std = @import("std");
-const regex = @import("../editor/regex.zig");
 const capture = @import("../web/capture.zig");
-
-/// How a url's body comes back. ONE vocabulary: the `mode` schema enum
-/// is generated from it.
-pub const Mode = enum {
-    /// Readable text: reader mode for a page, the body itself for plain
-    /// text, XML or JSON.
-    text,
-    /// The response body as the server sent it (the page source).
-    raw,
-    /// Matches of `pattern` over the text or the raw body.
-    regex,
-};
-
-/// What a `regex` runs over (`regex_in`).
-pub const RegexIn = enum { text, raw };
 
 /// How one url ended. ONE vocabulary (`results[].status`).
 pub const Status = enum {
@@ -38,17 +23,6 @@ pub const Status = enum {
     invalid_url,
 };
 
-/// Where an inline body came from (`results[].body_source`).
-pub const BodySource = enum {
-    /// Reader mode over the rendered page (web_read's extraction).
-    reader,
-    /// The response body as received, from the tab's capture.
-    response,
-    /// The rendered DOM (outerHTML / innerText): the helper could not
-    /// capture the response.
-    dom,
-};
-
 /// Tabs one call keeps in flight at most.
 pub const PER_CALL_TABS: u16 = 4;
 /// Instance-wide fetch tabs when `web_fetch_max_tabs` is not set.
@@ -61,15 +35,6 @@ pub const MAX_MAX_TABS: u16 = 16;
 pub const MAX_URLS: usize = 64;
 
 pub const DEFAULT_TIMEOUT_MS: i64 = 30_000;
-pub const DEFAULT_MAX_CHARS: usize = 50_000;
-pub const MAX_MAX_CHARS: usize = 1_000_000;
-pub const DEFAULT_CONTEXT: usize = 60;
-pub const MAX_CONTEXT: usize = 1000;
-pub const DEFAULT_MAX_MATCHES: usize = 50;
-pub const MAX_MAX_MATCHES: usize = 1000;
-/// Matches counted past the cap before counting stops (`match_count`
-/// then reads as "at least").
-pub const COUNT_CEILING: usize = 100_000;
 
 /// What a response body is, for reading it.
 pub const Kind = enum {
@@ -96,78 +61,6 @@ pub fn kindOf(mime_raw: []const u8) Kind {
 
 pub fn httpUrl(url: []const u8) bool {
     return std.ascii.startsWithIgnoreCase(url, "http://") or std.ascii.startsWithIgnoreCase(url, "https://");
-}
-
-/// `s` cut to at most `max` bytes on a UTF-8 boundary.
-pub fn truncate(s: []const u8, max: usize) struct { text: []const u8, truncated: bool } {
-    if (s.len <= max) return .{ .text = s, .truncated = false };
-    return .{ .text = s[0..utf8Floor(s, max)], .truncated = true };
-}
-
-/// The largest index <= `at` that does not split a UTF-8 sequence.
-fn utf8Floor(s: []const u8, at: usize) usize {
-    var i = @min(at, s.len);
-    while (i > 0 and i < s.len and (s[i] & 0xC0) == 0x80) i -= 1;
-    return i;
-}
-
-/// The smallest index >= `at` that does not split a UTF-8 sequence.
-fn utf8Ceil(s: []const u8, at: usize) usize {
-    var i = @min(at, s.len);
-    while (i < s.len and (s[i] & 0xC0) == 0x80) i += 1;
-    return i;
-}
-
-pub const Match = struct {
-    /// Byte offset of the match in the searched text.
-    offset: usize,
-    match: []const u8,
-    before: []const u8,
-    after: []const u8,
-};
-
-pub const Matches = struct {
-    items: []const Match,
-    /// Every match found, up to `COUNT_CEILING`.
-    total: usize,
-    /// More matches exist than `items` holds.
-    capped: bool,
-};
-
-pub const MatchOpts = struct {
-    ignore_case: bool = false,
-    context: usize = DEFAULT_CONTEXT,
-    max: usize = DEFAULT_MAX_MATCHES,
-};
-
-/// Every match of `pattern` in `text` (the find bar's engine, so the
-/// syntax is `editor/regex.zig`'s), the first `opts.max` with up to
-/// `opts.context` bytes on either side. Slices borrow `text`.
-pub fn findMatches(arena: std.mem.Allocator, text: []const u8, pattern: []const u8, opts: MatchOpts) regex.Error!Matches {
-    var prog = try regex.compile(arena, pattern, .{ .case_insensitive = opts.ignore_case });
-    defer prog.deinit();
-    var m = try regex.Matcher.init(arena, &prog);
-    defer m.deinit();
-    const src_bytes = text;
-    const src = regex.sliceSource(&src_bytes);
-    var out: std.ArrayList(Match) = .empty;
-    var total: usize = 0;
-    var from: usize = 0;
-    while (from <= text.len and total < COUNT_CEILING) {
-        const caps = (try m.search(src, from)) orelse break;
-        const s = caps.start();
-        const e = caps.end();
-        total += 1;
-        if (out.items.len < opts.max) {
-            const b = utf8Floor(text, s -| opts.context);
-            const a = utf8Ceil(text, @min(e + opts.context, text.len));
-            try out.append(arena, .{ .offset = s, .match = text[s..e], .before = text[b..s], .after = text[e..a] });
-        }
-        // An empty match must still move on, by one whole codepoint.
-        from = if (e > s) e else utf8Ceil(text, e + 1);
-        if (e == text.len and e == s) break;
-    }
-    return .{ .items = out.items, .total = total, .capped = total > out.items.len };
 }
 
 /// The instance-wide fetch-tab queue: every `web_fetch` call's urls wait
@@ -330,7 +223,7 @@ test "a removed call releases its tabs and its turn" {
     try t.expect(q.admit() == null);
 }
 
-test "kinds, truncation and http urls" {
+test "kinds and http urls" {
     try t.expectEqual(Kind.html, kindOf("text/html; charset=utf-8"));
     try t.expectEqual(Kind.html, kindOf(""));
     try t.expectEqual(Kind.text, kindOf("text/plain"));
@@ -339,30 +232,5 @@ test "kinds, truncation and http urls" {
     try t.expectEqual(Kind.text, kindOf("application/rss+xml"));
     try t.expectEqual(Kind.file, kindOf("application/pdf"));
     try t.expectEqual(Kind.file, kindOf("application/zip"));
-    const cut = truncate("caf\xc3\xa9!", 4);
-    try t.expect(cut.truncated);
-    try t.expectEqualStrings("caf", cut.text);
-    try t.expect(!truncate("abc", 3).truncated);
     try t.expect(httpUrl("HTTPS://x/") and !httpUrl("file:///etc/passwd") and !httpUrl("data:,x"));
-}
-
-test "regex matches carry context, stop at the cap and keep counting" {
-    var a = std.heap.ArenaAllocator.init(t.allocator);
-    defer a.deinit();
-    const text = "id=1 x id=22 y id=333 z";
-    const m = try findMatches(a.allocator(), text, "id=\\d+", .{ .context = 2, .max = 2 });
-    try t.expectEqual(@as(usize, 3), m.total);
-    try t.expect(m.capped);
-    try t.expectEqual(@as(usize, 2), m.items.len);
-    try t.expectEqualStrings("id=1", m.items[0].match);
-    try t.expectEqualStrings("", m.items[0].before);
-    try t.expectEqualStrings(" x", m.items[0].after);
-    try t.expectEqualStrings("x ", m.items[1].before);
-    try t.expectEqual(@as(usize, 7), m.items[1].offset);
-    const ci = try findMatches(a.allocator(), "Sitemap SITEMAP", "sitemap", .{ .ignore_case = true });
-    try t.expectEqual(@as(usize, 2), ci.total);
-    // An empty-matching pattern advances instead of looping.
-    const empty = try findMatches(a.allocator(), "ab", "x*", .{});
-    try t.expectEqual(@as(usize, 3), empty.total);
-    try t.expectError(error.InvalidPattern, findMatches(a.allocator(), "x", "(", .{}));
 }

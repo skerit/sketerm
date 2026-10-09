@@ -58,6 +58,8 @@ const atomicwrite = @import("../util/atomicwrite.zig");
 const mcp_term = @import("mcp_term.zig");
 const webtabs = @import("webtabs.zig");
 const webnav = @import("webnav.zig");
+const webread = @import("webread.zig");
+const pageread = @import("../web/pageread.zig");
 
 /// Default budget for one semantic round trip. Clamped to
 /// `mcp.WAIT_CAP_MS` like every other MCP wait, so one blocked page
@@ -194,6 +196,31 @@ pub fn navResultCapability() struct {
         if (re.engine.state == .ready) detail = re.engine.has(.net_log_detail);
     };
     return .{ .helper_detail = detail };
+}
+
+/// What `capabilities` reports as `web_read`: its modes and caps, and
+/// whether the running helper reads pages (`page-read`) and keeps tree
+/// queries current itself (`query-live`); null while no headless helper
+/// runs or with a GUI, whose helper this server cannot ask.
+pub fn readCapability() struct {
+    modes: []const []const u8 = enumNames(webread.Mode),
+    max_chars: usize = webread.DEFAULT_MAX_CHARS,
+    max_chars_limit: usize = webread.MAX_MAX_CHARS,
+    max_items: usize = webread.DEFAULT_MAX_ITEMS,
+    max_items_limit: usize = webread.MAX_MAX_ITEMS,
+    link_areas: []const []const u8 = enumNames(pageread.Area),
+    page_read: ?bool,
+    query_live: ?bool,
+} {
+    var page: ?bool = null;
+    var live: ?bool = null;
+    if (!guiDrivesWeb()) for (g_engines.items) |re| {
+        if (re.engine.state == .ready) {
+            page = re.engine.has(.page_read);
+            live = re.engine.has(.query_live);
+        }
+    };
+    return .{ .page_read = page, .query_live = live };
 }
 
 pub fn enumNames(comptime E: type) []const []const u8 {
@@ -957,6 +984,236 @@ pub fn readerOp(drv: Driver, arena: std.mem.Allocator, pane: u32, budget: i64) !
     }
 }
 
+const PAGE_READ_OLD_HELPER = "this browser helper predates page reading (capability page-read): selector, include_chrome, links and resources need a newer sketerm-webengine; plain web_read (reader text), mode raw and mode regex still work";
+const PAGE_READ_OLD_GUI = "the sketerm GUI predates page reading: selector, include_chrome, links and resources need a newer GUI; plain web_read (reader text), mode raw and mode regex still work";
+
+/// One page-reading query (`SemQuery.page`): the scoped text, a
+/// subtree's markup, the links or the scripts and iframes. An older
+/// helper or GUI is an explicit `unavailable`, never an empty answer.
+pub fn pageReadOp(drv: Driver, arena: std.mem.Allocator, pane: u32, opts: pageread.Options, budget: i64) !union(enum) { ok: pageread.Result, err: Fail } {
+    const data = try pageread.encode(arena, opts);
+    switch (try runOp(drv, arena, pane, .{ .op = "query", .action = "page", .data = data }, budget)) {
+        .err => |f| return .{ .err = if (drv == .gui and std.mem.indexOf(u8, f.text, "unknown query kind") != null) fail(.unavailable, PAGE_READ_OLD_GUI) else f },
+        .done => |r| {
+            if (r.timed_out) return .{ .err = fail(.timeout, "the page did not answer the page read in time") };
+            return switch (pageread.parse(arena, r.payload)) {
+                .ok => |res| if (res.what == opts.what) .{ .ok = res } else .{ .err = fail(.io_failed, "the browser helper answered a different page read than the one asked") },
+                .refused => |x| .{ .err = fail(switch (x.code) {
+                    .invalid_selector => .invalid_args,
+                    .no_match => .not_found,
+                    .failed => .failed,
+                }, x.msg) },
+                // An older helper answers the unknown kind from its
+                // find_text arm; anything else is a refusal sentence.
+                .legacy => |txt| .{ .err = if (std.mem.startsWith(u8, txt, "query ")) fail(.unavailable, PAGE_READ_OLD_HELPER) else fail(.failed, txt) },
+                .malformed => .{ .err = fail(.io_failed, "the browser helper returned a malformed page read") },
+            };
+        },
+    }
+}
+
+/// Everything one `web_read` produced, for `readResult`.
+const ReadOut = struct {
+    mode: webread.Mode = .text,
+    /// text/raw/regex: the WHOLE body; paging happens in `readResult`.
+    body: []const u8 = "",
+    body_source: webread.BodySource = .reader,
+    /// The page or its serializer cut the body or a list at its own cap.
+    source_truncated: bool = false,
+    offset: usize = 0,
+    max_chars: usize = webread.DEFAULT_MAX_CHARS,
+    max_items: usize = webread.DEFAULT_MAX_ITEMS,
+    selector: ?[]const u8 = null,
+    selector_matches: u64 = 0,
+    include_chrome: bool = false,
+    /// Reader text with entity ids (unscoped text mode, `reader-ids`).
+    model: ?reader_model.Result = null,
+    note: ?[]const u8 = null,
+    regex: ?webread.RegexOpts = null,
+    /// links/resources.
+    page: ?pageread.Result = null,
+};
+
+/// `web_read`: validate everything, then read the page once.
+fn readTool(drv: Driver, arena: std.mem.Allocator, view: View, args: std.json.Value) ![]const u8 {
+    var out: ReadOut = .{};
+    if (mcp.argStr(args, "mode")) |m| out.mode = std.meta.stringToEnum(webread.Mode, m) orelse
+        return mcp.errRes(arena, .invalid_args, "'mode' must be text, raw, regex, links or resources");
+    switch (try parseRegexArgs(arena, args, out.mode == .regex)) {
+        .none => {},
+        .err => |why| return mcp.errRes(arena, .invalid_args, why),
+        .regex => |r| out.regex = r,
+    }
+    if (mcp.argValue(args, "selector")) |v| {
+        if (v != .string or v.string.len == 0) return mcp.errRes(arena, .invalid_args, "'selector' must be a non-empty CSS selector");
+        out.selector = v.string;
+    }
+    const reads_text = out.mode == .text or (out.regex != null and out.regex.?.in == .text);
+    if (mcp.argValue(args, "include_chrome")) |v| {
+        if (v != .bool) return mcp.errRes(arena, .invalid_args, "'include_chrome' must be a boolean");
+        if (!reads_text) return mcp.errRes(arena, .invalid_args, "'include_chrome' applies to the readable text (mode text, or regex over text); links and resources always cover every page area and say which");
+        out.include_chrome = v.bool;
+    }
+    if (mcp.argInt(args, "offset")) |o| {
+        if (o < 0) return mcp.errRes(arena, .invalid_args, "'offset' must be 0 or more");
+        if (out.mode == .regex) return mcp.errRes(arena, .invalid_args, "mode regex searches the whole text and reports each match's offset; 'offset' pages modes text, raw, links and resources");
+        out.offset = @intCast(o);
+    }
+    out.max_chars = argClamped(args, "max_chars", webread.DEFAULT_MAX_CHARS, webread.MAX_MAX_CHARS);
+    out.max_items = argClamped(args, "max_items", webread.DEFAULT_MAX_ITEMS, webread.MAX_MAX_ITEMS);
+    const budget = timeoutOf(args, DEFAULT_TIMEOUT_MS);
+
+    switch (out.mode) {
+        .links, .resources => {
+            switch (try pageReadOp(drv, arena, view.pane, .{ .what = if (out.mode == .links) .links else .resources, .selector = out.selector }, budget)) {
+                .err => |f| return failRes(arena, f),
+                .ok => |r| {
+                    out.page = r;
+                    out.selector_matches = r.selector_matches;
+                    out.source_truncated = r.truncated;
+                },
+            }
+        },
+        .raw, .text, .regex => if (reads_text) {
+            if (out.selector == null and !out.include_chrome) {
+                switch (try readerOp(drv, arena, view.pane, budget)) {
+                    .err => |f| return failRes(arena, f),
+                    .rich => |parsed| {
+                        out.body = parsed.value.markdown;
+                        if (parsed.value.doc_gen == 0 and parsed.value.rev == 0 and parsed.value.entities.len == 0)
+                            out.note = "the page has no current semantic entities; call web_snapshot before web_act"
+                        else
+                            out.model = parsed.value;
+                    },
+                    .legacy => |markdown| {
+                        out.body = markdown;
+                        out.note = "this browser helper lacks the reader-ids capability; markdown is available, but call web_snapshot before web_act";
+                    },
+                }
+            } else {
+                switch (try pageReadOp(drv, arena, view.pane, .{ .what = .text, .selector = out.selector, .chrome = out.include_chrome }, budget)) {
+                    .err => |f| return failRes(arena, f),
+                    .ok => |r| {
+                        out.body = r.text orelse "";
+                        out.selector_matches = r.selector_matches;
+                        out.source_truncated = r.truncated;
+                        out.note = "a scoped or whole-page read carries no entity ids; act through web_snapshot or web_act name";
+                    },
+                }
+            }
+        } else if (out.selector) |sel| {
+            switch (try pageReadOp(drv, arena, view.pane, .{ .what = .html, .selector = sel }, budget)) {
+                .err => |f| return failRes(arena, f),
+                .ok => |r| {
+                    out.body = r.text orelse "";
+                    out.body_source = .dom;
+                    out.selector_matches = r.selector_matches;
+                    out.source_truncated = r.truncated;
+                },
+            }
+        } else {
+            switch (try sourceOf(drv, arena, view.pane, false, drv.now() + budget)) {
+                .err => |why| return mcp.errRes(arena, .failed, why),
+                .ok => |b| {
+                    out.body = b.text;
+                    out.body_source = b.source;
+                    out.source_truncated = b.truncated;
+                },
+            }
+        },
+    }
+    return readResult(arena, drv.mode(), view, out);
+}
+
+/// An integer argument clamped to [1, max]; `dflt` when absent.
+pub fn argClamped(args: std.json.Value, key: []const u8, dflt: usize, max: usize) usize {
+    const v = mcp.argInt(args, key) orelse return dflt;
+    return @intCast(std.math.clamp(v, 1, @as(i64, @intCast(max))));
+}
+
+/// `mode:"regex"`'s arguments, validated identically for `web_read` and
+/// `web_fetch`: `none` for a call in another mode (which may not name a
+/// pattern), `err` the refusal sentence.
+pub const RegexArgs = union(enum) { none, regex: webread.RegexOpts, err: []const u8 };
+
+pub fn parseRegexArgs(arena: std.mem.Allocator, args: std.json.Value, is_regex: bool) !RegexArgs {
+    const pattern = mcp.argStr(args, "pattern") orelse "";
+    if (!is_regex) return if (pattern.len > 0) .{ .err = "'pattern' is for mode regex" } else .none;
+    if (pattern.len == 0) return .{ .err = "mode regex needs 'pattern'" };
+    var o: webread.RegexOpts = .{ .pattern = pattern, .ignore_case = mcp.argBool(args, "ignore_case") };
+    if (mcp.argStr(args, "regex_in")) |m| o.in = std.meta.stringToEnum(webread.RegexIn, m) orelse
+        return .{ .err = "'regex_in' must be text or raw" };
+    _ = webread.findMatches(arena, "", pattern, .{ .ignore_case = o.ignore_case }) catch |e|
+        return .{ .err = try std.fmt.allocPrint(arena, webread.BAD_PATTERN, .{@errorName(e)}) };
+    o.context = if (mcp.argInt(args, "context_chars")) |c| @intCast(std.math.clamp(c, 0, @as(i64, webread.MAX_CONTEXT))) else webread.DEFAULT_CONTEXT;
+    o.max_matches = argClamped(args, "max_matches", webread.DEFAULT_MAX_MATCHES, webread.MAX_MAX_MATCHES);
+    return .{ .regex = o };
+}
+
+/// One text-lane line per match: `@offset: ...before[match]after...`.
+pub fn writeMatches(res: *mcp.Res, matches: []const webread.Match) !void {
+    for (matches) |m| try res.textf("  @{d}: ...{s}[{s}]{s}...", .{ m.offset, m.before, m.match, m.after });
+}
+
+/// A document's source as one body.
+pub const Source = union(enum) {
+    ok: struct {
+        text: []const u8,
+        source: webread.BodySource,
+        /// The page serializer cut the DOM text at its own budget.
+        truncated: bool = false,
+    },
+    err: []const u8,
+};
+
+/// The current document's source: the response body as received when
+/// the view captures its own document, else the rendered DOM (`plain`:
+/// the body's text, for a text document the engine wrapped in a page).
+/// THE source read of `web_read mode:"raw"` and `web_fetch`.
+pub fn sourceOf(drv: Driver, arena: std.mem.Allocator, view: u32, plain: bool, deadline: i64) !Source {
+    if (drv == .headless) if (drv.headless.findView(view)) |v| if (v.cap != null and !v.cap_disabled) {
+        const e = drv.headless;
+        if (e.captureList(arena, view, 0, 64, false, deadline - clock.nowMs())) |list| {
+            var seq: ?u32 = null;
+            for (list.entries) |ent| {
+                if (ent.rtype == @intFromEnum(filter.RType.document)) seq = ent.seq;
+            }
+            if (seq) |s| switch (try readWholeBody(e, arena, view, s, .response, deadline)) {
+                .ok => |b| {
+                    const shown = try present(arena, b.mime, b.charset, b.data);
+                    return .{ .ok = .{ .text = shown.bytes, .source = .response } };
+                },
+                .err => {},
+            };
+        } else |_| {}
+    };
+    const expr = if (plain)
+        "document.body ? document.body.innerText : ''"
+    else
+        "document.documentElement ? document.documentElement.outerHTML : ''";
+    switch (try runOp(drv, arena, view, .{
+        .op = "eval",
+        .data = expr,
+        .timeout_ms = 5000,
+        .max_chars = @intCast(webread.MAX_MAX_CHARS * 4),
+    }, 8000)) {
+        .err => |f| return .{ .err = f.text },
+        .done => |r| {
+            if (r.timed_out or !r.ok) return .{ .err = "the page did not hand over its source" };
+            const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, r.payload, .{}) catch return .{ .err = "the page's source came back malformed" };
+            const val = if (parsed == .object) parsed.object.get("value") orelse parsed else parsed;
+            if (val == .string) return .{ .ok = .{ .text = val.string, .source = .dom } };
+            // A string past the page serializer's budget arrives as its
+            // cut marker; the cut is reported, never passed off as whole.
+            if (val == .object) if (val.object.get("__kind")) |k| if (k == .string and std.mem.eql(u8, k.string, "string")) {
+                if (val.object.get("text")) |txt| if (txt == .string)
+                    return .{ .ok = .{ .text = txt.string, .source = .dom, .truncated = true } };
+            };
+            return .{ .err = "the page's source came back malformed" };
+        },
+    }
+}
+
 fn readerPayload(arena: std.mem.Allocator, payload: []const u8, negotiated: bool) !?std.json.Parsed(reader_model.Result) {
     return reader_model.parseNegotiated(arena, payload, negotiated);
 }
@@ -981,6 +1238,15 @@ pub const Driver = union(enum) {
         return switch (self) {
             .gui => .gui,
             .headless => .headless,
+        };
+    }
+
+    /// The helper keeps a tree query's answer current itself
+    /// (`query-live`); a GUI's helper cannot be asked, so never assumed.
+    pub fn liveQueries(self: Driver) bool {
+        return switch (self) {
+            .gui => false,
+            .headless => |e| e.has(.query_live),
         };
     }
 
@@ -1359,8 +1625,28 @@ pub fn headlessFail(arena: std.mem.Allocator, e: *webdrive.Engine, err: anyerror
 }
 
 /// Run one semantic operation to completion under `timeout_ms`.
+///
+/// A tree query (`SemQuery.readsLiveTree`) on a helper that cannot keep
+/// its tree current for the current document (no `query-live`; a GUI,
+/// whose helper this server cannot ask) is preceded by a `peek` walk,
+/// which folds the live DOM and consumes nothing: without it a query
+/// after a navigation answered from the previous page as "0 matches".
 pub fn runOp(drv: Driver, arena: std.mem.Allocator, handle: u32, op: Op, timeout_ms: i64) !OpResult {
     const budget = @min(@max(timeout_ms, 100), mcp.WAIT_CAP_MS);
+    if (std.mem.eql(u8, op.op, "query")) if (web_proto.SemQuery.fromOperationName(op.action orelse "find_text")) |qk| {
+        if (qk.readsLiveTree() and !drv.liveQueries()) {
+            const started = drv.now();
+            switch (try runOpOnce(drv, arena, handle, .{ .op = "snapshot", .mode = "peek" }, budget)) {
+                .err => |f| return .{ .err = f },
+                .done => {},
+            }
+            return runOpOnce(drv, arena, handle, op, @max(budget - (drv.now() - started), 100));
+        }
+    };
+    return runOpOnce(drv, arena, handle, op, budget);
+}
+
+fn runOpOnce(drv: Driver, arena: std.mem.Allocator, handle: u32, op: Op, budget: i64) !OpResult {
     switch (drv) {
         .gui => |backend| return runOpGui(backend, arena, handle, op, budget),
         .headless => |e| {
@@ -1409,6 +1695,7 @@ pub fn runOp(drv: Driver, arena: std.mem.Allocator, handle: u32, op: Op, timeout
                 const qk = web_proto.SemQuery.fromOperationName(op.action orelse "find_text") orelse
                     return .{ .err = fail(.invalid_args, "unknown query kind") };
                 if (qk == .review and !e.has(.review)) return .{ .err = fail(.unavailable, "this browser helper does not advertise review support; rebuild/restart the helper") };
+                if (qk == .page and !e.has(.page_read)) return .{ .err = fail(.unavailable, PAGE_READ_OLD_HELPER) };
                 req.action = @intFromEnum(qk);
                 req.arg = op.data orelse "";
             } else if (eql(u8, op.op, "read")) {
@@ -2760,28 +3047,150 @@ fn queryResult(
     return res.finish();
 }
 
-fn readResult(
-    arena: std.mem.Allocator,
-    mode: Mode,
-    v: View,
-    markdown: []const u8,
-    model: ?reader_model.Result,
-    note: ?[]const u8,
-) ![]const u8 {
+fn readResult(arena: std.mem.Allocator, mode: Mode, v: View, r: ReadOut) ![]const u8 {
     var res = mcp.Res.init(arena);
     try head(&res, arena, mode, v);
-    try res.fact("reader_ids", model != null);
-    if (model) |m| {
-        try res.fact("document", m.doc_gen);
-        try res.fact("revision", m.rev);
-        try res.fact("entities", m.entities);
-        try res.textf("document {d}, revision {d}, {d} entities", .{ m.doc_gen, m.rev, m.entities.len });
+    try res.fact("mode", @tagName(r.mode));
+    if (r.selector) |sel| {
+        try res.fact("selector", sel);
+        try res.fact("selector_matches", r.selector_matches);
     }
-    try res.fact("markdown", markdown);
-    if (note) |n| try res.text(n);
-    try section(&res, "article", markdown);
+    if (r.source_truncated) try res.fact("source_truncated", true);
+    switch (r.mode) {
+        .text, .raw => {
+            const pg = webread.page(r.body, r.offset, r.max_chars);
+            const sha = webread.sha256Hex(r.body);
+            try res.fact("offset", pg.offset);
+            if (pg.next) |n| try res.fact("next_offset", n) else try res.raw("next_offset", "null");
+            try res.fact("more", pg.next != null);
+            try res.fact("total_chars", r.body.len);
+            try res.fact("max_chars", r.max_chars);
+            try res.fact("content_sha256", &sha);
+            try res.fact("body_source", @tagName(r.body_source));
+            if (r.mode == .text) {
+                try res.fact("include_chrome", r.include_chrome);
+                try res.fact("reader_ids", r.model != null);
+                if (r.model) |m| {
+                    try res.fact("document", m.doc_gen);
+                    try res.fact("revision", m.rev);
+                    // The ids name the whole page: they ride the first
+                    // page only, or every page would repeat them.
+                    if (pg.offset == 0) try res.fact("entities", m.entities);
+                    try res.textf("document {d}, revision {d}, {d} entities{s}", .{ m.doc_gen, m.rev, m.entities.len, if (pg.offset == 0) "" else " (listed with offset 0)" });
+                }
+                try res.fact("markdown", pg.text);
+            } else try res.fact("body", pg.text);
+            try res.textf("{s}: {d} of {d} bytes from offset {d} ({s}{s}){s}", .{
+                @tagName(r.mode),
+                pg.text.len,
+                r.body.len,
+                pg.offset,
+                @tagName(r.body_source),
+                if (r.source_truncated) ", cut by the page at its own cap" else "",
+                if (pg.next != null) "; more: read on with offset next_offset" else "; the end",
+            });
+            if (pg.next) |n| try res.textf("next_offset {d}", .{n});
+            if (r.note) |n| try res.text(n);
+            try section(&res, if (r.mode == .text) "article" else "source", pg.text);
+        },
+        .regex => {
+            const rx = r.regex.?;
+            const m = try webread.findMatches(arena, r.body, rx.pattern, .{ .ignore_case = rx.ignore_case, .context = rx.context, .max = rx.max_matches });
+            try res.fact("regex_in", @tagName(rx.in));
+            try res.fact("pattern", rx.pattern);
+            try res.fact("body_source", @tagName(r.body_source));
+            if (rx.in == .text) try res.fact("include_chrome", r.include_chrome);
+            try res.fact("total_chars", r.body.len);
+            try res.fact("matches", m.items);
+            try res.fact("match_count", m.total);
+            try res.fact("matches_capped", m.capped);
+            try res.textf("regex over the {s} ({s}, {d} bytes): {d} match(es){s}", .{
+                if (rx.in == .text) "readable text" else "source",
+                @tagName(r.body_source),
+                r.body.len,
+                m.total,
+                if (m.capped) ", more than shown" else "",
+            });
+            try writeMatches(&res, m.items);
+        },
+        .links => {
+            const p = r.page.?;
+            const end = @min(p.links.len, r.offset +| r.max_items);
+            const shown = p.links[@min(r.offset, end)..end];
+            var areas = std.enums.EnumArray(pageread.Area, u64).initFill(0);
+            for (p.links) |l| areas.getPtr(l.area).* += 1;
+            try res.fact("links", shown);
+            try res.fact("link_count", p.links_total);
+            try res.fact("areas", areaCounts(areas));
+            try pageFacts(&res, r.offset, end, p.links.len, r.max_items);
+            try res.textf("{d} link(s) on the page{s}, {d} listed from offset {d}{s}", .{
+                p.links_total,
+                if (r.selector != null) " in the selected scope" else "",
+                shown.len,
+                @min(r.offset, end),
+                if (end < p.links.len) "; more: read on with offset next_offset" else "",
+            });
+            var lines: std.Io.Writer.Allocating = .init(arena);
+            for (shown) |l| try lines.writer.print("[{s}] {s} -> {s}{s}\n", .{ @tagName(l.area), if (l.text.len > 0) l.text else "(no text)", l.href, if (l.visible) "" else " (hidden)" });
+            try section(&res, "links", lines.written());
+        },
+        .resources => {
+            const p = r.page.?;
+            // One offset walks the scripts, then the iframes.
+            const all = p.scripts.len + p.iframes.len;
+            const end = @min(all, r.offset +| r.max_items);
+            const start = @min(r.offset, end);
+            const s_end = @min(end, p.scripts.len);
+            const scripts = p.scripts[@min(start, s_end)..s_end];
+            const iframes = p.iframes[(@max(start, p.scripts.len) - p.scripts.len)..(@max(end, p.scripts.len) - p.scripts.len)];
+            try res.fact("scripts", scripts);
+            try res.fact("iframes", iframes);
+            try res.fact("script_count", p.scripts_total);
+            try res.fact("iframe_count", p.iframes_total);
+            try pageFacts(&res, r.offset, end, all, r.max_items);
+            try res.textf("{d} script(s) and {d} iframe(s){s}; {d} listed from offset {d}{s}", .{
+                p.scripts_total,
+                p.iframes_total,
+                if (r.selector != null) " in the selected scope" else "",
+                scripts.len + iframes.len,
+                start,
+                if (end < all) "; more: read on with offset next_offset" else "",
+            });
+            var lines: std.Io.Writer.Allocating = .init(arena);
+            for (scripts) |sc| {
+                if (sc.src) |src|
+                    try lines.writer.print("script {s}{s}{s}{s}\n", .{ src, if (sc.@"async") " async" else "", if (sc.@"defer") " defer" else "", if (sc.type.len > 0) try std.fmt.allocPrint(arena, " type={s}", .{sc.type}) else "" })
+                else
+                    try lines.writer.print("script inline, {d} chars{s}\n", .{ sc.size orelse 0, if (sc.type.len > 0) try std.fmt.allocPrint(arena, " type={s}", .{sc.type}) else "" });
+            }
+            for (iframes) |f| try lines.writer.print("iframe {s}{s}{s}{s}{s}{s}\n", .{
+                if (f.src.len > 0) f.src else "(no src)",
+                if (f.name.len > 0) " name=" else "",
+                f.name,
+                if (f.title.len > 0) " title=" else "",
+                f.title,
+                if (f.visible) "" else " (hidden)",
+            });
+            try section(&res, "resources", lines.written());
+        },
+    }
     try res.text(TRUST_LINE);
     return res.finish();
+}
+
+/// Paging facts of a list read: where the next page starts, if anywhere.
+fn pageFacts(res: *mcp.Res, offset: usize, end: usize, total: usize, max_items: usize) !void {
+    try res.fact("offset", @min(offset, end));
+    if (end < total) try res.fact("next_offset", end) else try res.raw("next_offset", "null");
+    try res.fact("more", end < total);
+    try res.fact("max_items", max_items);
+}
+
+/// Link counts per page area, keyed by `pageread.Area`'s names.
+fn areaCounts(a: std.enums.EnumArray(pageread.Area, u64)) std.enums.EnumFieldStruct(pageread.Area, u64, 0) {
+    var out: std.enums.EnumFieldStruct(pageread.Area, u64, 0) = .{};
+    inline for (comptime std.enums.values(pageread.Area)) |area| @field(out, @tagName(area)) = a.get(area);
+    return out;
 }
 
 fn evalResult(
@@ -4228,27 +4637,7 @@ pub fn webTool(
         }
     }
 
-    if (eql(u8, name, "web_read")) {
-        switch (try readerOp(drv, arena, view.pane, timeoutOf(args, DEFAULT_TIMEOUT_MS))) {
-            .err => |f| return failRes(arena, f),
-            .rich => |parsed| {
-                defer parsed.deinit();
-                const model = parsed.value;
-                if (model.doc_gen == 0 and model.rev == 0 and model.entities.len == 0) {
-                    return readResult(arena, drv.mode(), view, model.markdown, null, "the page has no current semantic entities; call web_snapshot before web_act");
-                }
-                return readResult(arena, drv.mode(), view, model.markdown, model, null);
-            },
-            .legacy => |markdown| return readResult(
-                arena,
-                drv.mode(),
-                view,
-                markdown,
-                null,
-                "this browser helper lacks the reader-ids capability; markdown is available, but call web_snapshot before web_act",
-            ),
-        }
-    }
+    if (eql(u8, name, "web_read")) return readTool(drv, arena, view, args);
 
     if (eql(u8, name, "web_eval")) {
         // Script can fetch(): running it on an exhausted view would be
@@ -7535,30 +7924,27 @@ test "web_read: rich model and old-helper fallback both satisfy the schema" {
     const arena = arena_state.allocator();
     const t = std.testing;
 
-    const rich = try readResult(arena, .headless, EXAMPLE, "# Heading\n\nprose", .{
-        .doc_gen = 3,
-        .rev = 11,
-        .markdown = "# Heading\n\nprose",
-        .entities = &.{},
-    }, null);
+    const rich = try readResult(arena, .headless, EXAMPLE, .{
+        .body = "# Heading\n\nprose",
+        .model = .{ .doc_gen = 3, .rev = 11, .markdown = "# Heading\n\nprose", .entities = &.{} },
+    });
     const rp = try mcp.expectToolResultShape(arena, "web_read", rich);
     const rsc = rp.object.get("structuredContent").?.object;
     try t.expect(rsc.get("reader_ids").?.bool);
     try t.expectEqual(@as(i64, 3), rsc.get("document").?.integer);
     try t.expectEqual(@as(i64, 11), rsc.get("revision").?.integer);
     try t.expectEqualStrings("# Heading\n\nprose", rsc.get("markdown").?.string);
+    try t.expect(!rsc.get("more").?.bool);
+    try t.expect(rsc.get("next_offset").? == .null);
+    try t.expectEqualStrings("reader", rsc.get("body_source").?.string);
     const rtext = rp.object.get("content").?.array.items[0].object.get("text").?.string;
     try t.expect(std.mem.indexOf(u8, rtext, "document 3, revision 11, 0 entities") != null);
     try t.expect(std.mem.indexOf(u8, rtext, "--- article ---\n# Heading") != null);
 
-    const legacy = try readResult(
-        arena,
-        .headless,
-        EXAMPLE,
-        "plain markdown",
-        null,
-        "this browser helper lacks the reader-ids capability; markdown is available, but call web_snapshot before web_act",
-    );
+    const legacy = try readResult(arena, .headless, EXAMPLE, .{
+        .body = "plain markdown",
+        .note = "this browser helper lacks the reader-ids capability; markdown is available, but call web_snapshot before web_act",
+    });
     const lp = try mcp.expectToolResultShape(arena, "web_read", legacy);
     try t.expect(!lp.object.get("structuredContent").?.object.get("reader_ids").?.bool);
     try t.expect(lp.object.get("structuredContent").?.object.get("entities") == null);
@@ -7567,6 +7953,105 @@ test "web_read: rich model and old-helper fallback both satisfy the schema" {
         lp.object.get("content").?.array.items[0].object.get("text").?.string,
         "lacks the reader-ids capability",
     ) != null);
+}
+
+test "web_read: pages walk the body with no gap or overlap and name where to go on" {
+    var arena_state = testArena();
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const t = std.testing;
+    const body = "0123456789abcdefghij\xc3\xa9tail";
+    var joined: std.ArrayList(u8) = .empty;
+    var offset: usize = 0;
+    var pages: usize = 0;
+    var sha: []const u8 = "";
+    while (true) : (pages += 1) {
+        const out = try readResult(arena, .headless, EXAMPLE, .{ .mode = .raw, .body = body, .body_source = .dom, .offset = offset, .max_chars = 7 });
+        const sc = (try mcp.expectToolResultShape(arena, "web_read", out)).object.get("structuredContent").?.object;
+        try t.expectEqual(@as(i64, @intCast(offset)), sc.get("offset").?.integer);
+        try t.expectEqual(@as(i64, body.len), sc.get("total_chars").?.integer);
+        if (sha.len == 0) sha = sc.get("content_sha256").?.string;
+        try t.expectEqualStrings(sha, sc.get("content_sha256").?.string);
+        try joined.appendSlice(arena, sc.get("body").?.string);
+        const next = sc.get("next_offset").?;
+        if (next == .null) {
+            try t.expect(!sc.get("more").?.bool);
+            break;
+        }
+        try t.expect(sc.get("more").?.bool);
+        offset = @intCast(next.integer);
+    }
+    try t.expectEqualStrings(body, joined.items);
+    try t.expect(pages >= 3);
+}
+
+test "web_read: regex, links and resources results satisfy the schema" {
+    var arena_state = testArena();
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const t = std.testing;
+
+    const rx = try readResult(arena, .headless, EXAMPLE, .{
+        .mode = .regex,
+        .body = "a id=1 b id=22 c",
+        .body_source = .response,
+        .regex = .{ .pattern = "id=\\d+", .in = .raw, .context = 2 },
+    });
+    const rsc = (try mcp.expectToolResultShape(arena, "web_read", rx)).object.get("structuredContent").?.object;
+    try t.expectEqual(@as(i64, 2), rsc.get("match_count").?.integer);
+    try t.expectEqualStrings("id=22", rsc.get("matches").?.array.items[1].object.get("match").?.string);
+    try t.expectEqualStrings("raw", rsc.get("regex_in").?.string);
+
+    const links = [_]pageread.Link{
+        .{ .text = "Home", .href = "https://example.com/", .area = .nav, .visible = true },
+        .{ .text = "Story", .href = "https://example.com/s", .area = .main, .visible = true },
+        .{ .text = "", .href = "https://example.com/f", .area = .footer },
+    };
+    const lr = try readResult(arena, .headless, EXAMPLE, .{
+        .mode = .links,
+        .max_items = 2,
+        .selector = "body",
+        .selector_matches = 1,
+        .page = .{ .what = .links, .links = &links, .links_total = 3 },
+    });
+    const lp = try mcp.expectToolResultShape(arena, "web_read", lr);
+    const lsc = lp.object.get("structuredContent").?.object;
+    try t.expectEqual(@as(usize, 2), lsc.get("links").?.array.items.len);
+    try t.expectEqualStrings("nav", lsc.get("links").?.array.items[0].object.get("area").?.string);
+    try t.expectEqual(@as(i64, 2), lsc.get("next_offset").?.integer);
+    try t.expectEqual(@as(i64, 1), lsc.get("areas").?.object.get("footer").?.integer);
+    try t.expectEqual(@as(i64, 0), lsc.get("areas").?.object.get("aside").?.integer);
+    const ltext = lp.object.get("content").?.array.items[0].object.get("text").?.string;
+    try t.expect(std.mem.indexOf(u8, ltext, "[nav] Home -> https://example.com/") != null);
+
+    const scripts = [_]pageread.Script{
+        .{ .src = "https://example.com/a.js", .@"defer" = true },
+        .{ .@"inline" = true, .size = 12 },
+    };
+    const frames = [_]pageread.Frame{.{ .src = "https://example.com/f", .name = "fr", .title = "Frame", .visible = true }};
+    // Offset 1 of scripts-then-iframes: the inline script and the frame.
+    const res_out = try readResult(arena, .headless, EXAMPLE, .{
+        .mode = .resources,
+        .offset = 1,
+        .page = .{ .what = .resources, .scripts = &scripts, .scripts_total = 2, .iframes = &frames, .iframes_total = 1 },
+    });
+    const xsc = (try mcp.expectToolResultShape(arena, "web_read", res_out)).object.get("structuredContent").?.object;
+    try t.expectEqual(@as(usize, 1), xsc.get("scripts").?.array.items.len);
+    try t.expect(xsc.get("scripts").?.array.items[0].object.get("inline").?.bool);
+    try t.expect(xsc.get("scripts").?.array.items[0].object.get("src").? == .null);
+    try t.expectEqualStrings("fr", xsc.get("iframes").?.array.items[0].object.get("name").?.string);
+    try t.expect(!xsc.get("more").?.bool);
+}
+
+test "web_read: the page-read answer of an older helper is unavailable, never an empty list" {
+    var arena_state = testArena();
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const t = std.testing;
+    // What an old helper's find_text arm answers for the unknown kind.
+    const legacy = pageread.parse(arena, "query find \"{\\\"what\\\":\\\"links\\\"}\" 0 matches\n");
+    try t.expect(legacy == .legacy);
+    try t.expect(std.mem.startsWith(u8, legacy.legacy, "query "));
 }
 
 test "web_eval: a JSON value stays JSON in structuredContent, a long one is paged" {
@@ -7630,6 +8115,84 @@ test "web_eval: a JSON value stays JSON in structuredContent, a long one is page
     try t.expect(xsc.get("truncated") == null);
     const xtext = xp.object.get("content").?.array.items[0].object.get("text").?.string;
     try t.expect(std.mem.indexOf(u8, xtext, "1 string(s) inside the result were cut") != null);
+}
+
+test "a tree query through a GUI walks the live page first, so it never answers from a previous one" {
+    var arena_state = testArena();
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const t = std.testing;
+    var fake = ScriptedBackend{
+        .allocator = t.allocator,
+        .responses = &.{
+            ONE_VIEW,
+            "{\"ok\":true,\"token\":1}",
+            "{\"ok\":true,\"done\":true,\"result_ok\":true,\"payload\":\"\",\"revision\":4}",
+            "{\"ok\":true,\"token\":2}",
+            "{\"ok\":true,\"done\":true,\"result_ok\":true,\"payload\":\"query find \\\"Beta\\\" 1 matches\\n[3] paragraph \\\"Beta\\\"\\n\"}",
+        },
+    };
+    defer fake.deinit();
+    const out = try webTool(arena, fake.backend(), "web_query", try jsonArgs(arena, "{\"pane\":7,\"kind\":\"find_text\",\"arg\":\"Beta\"}"));
+    try t.expect(std.mem.indexOf(u8, out, "\"isError\":true") == null);
+    try t.expect(std.mem.indexOf(u8, fake.requests.items[1], "\"op\":\"snapshot\"") != null);
+    try t.expect(std.mem.indexOf(u8, fake.requests.items[1], "\"mode\":\"peek\"") != null);
+    try t.expect(std.mem.indexOf(u8, fake.requests.items[3], "\"op\":\"query\"") != null);
+}
+
+test "web_read's page reading on an older GUI or helper is unavailable, never an empty answer" {
+    var arena_state = testArena();
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const t = std.testing;
+    {
+        var fake = ScriptedBackend{
+            .allocator = t.allocator,
+            .responses = &.{ ONE_VIEW, "{\"ok\":false,\"error\":\"unknown query kind\",\"error_code\":\"invalid_request\"}" },
+        };
+        defer fake.deinit();
+        const out = try webTool(arena, fake.backend(), "web_read", try jsonArgs(arena, "{\"pane\":7,\"mode\":\"links\"}"));
+        try t.expect(std.mem.indexOf(u8, out, "\"code\":\"unavailable\"") != null);
+        try t.expect(std.mem.indexOf(u8, out, "the sketerm GUI predates page reading") != null);
+    }
+    {
+        // A new GUI over an old helper: the unknown kind comes back from
+        // the helper's find_text arm.
+        var fake = ScriptedBackend{
+            .allocator = t.allocator,
+            .responses = &.{
+                ONE_VIEW,
+                "{\"ok\":true,\"token\":1}",
+                "{\"ok\":true,\"done\":true,\"result_ok\":true,\"payload\":\"query find \\\"x\\\" 0 matches\\n\"}",
+            },
+        };
+        defer fake.deinit();
+        const out = try webTool(arena, fake.backend(), "web_read", try jsonArgs(arena, "{\"pane\":7,\"mode\":\"text\",\"selector\":\"main\"}"));
+        try t.expect(std.mem.indexOf(u8, out, "\"code\":\"unavailable\"") != null);
+        try t.expect(std.mem.indexOf(u8, out, "predates page reading (capability page-read)") != null);
+        try t.expect(std.mem.indexOf(u8, fake.requests.items[1], "\"action\":\"page\"") != null);
+    }
+    {
+        // Refusals before any I/O.
+        var fake = ScriptedBackend{ .allocator = t.allocator, .responses = &.{ONE_VIEW} };
+        defer fake.deinit();
+        for ([_][]const u8{
+            "{\"pane\":7,\"mode\":\"bogus\"}",
+            "{\"pane\":7,\"mode\":\"regex\"}",
+            "{\"pane\":7,\"pattern\":\"x\"}",
+            "{\"pane\":7,\"mode\":\"links\",\"include_chrome\":true}",
+            "{\"pane\":7,\"mode\":\"regex\",\"pattern\":\"x\",\"offset\":5}",
+            "{\"pane\":7,\"selector\":\"\"}",
+            "{\"pane\":7,\"offset\":-1}",
+        }) |args| {
+            fake.idx = 0;
+            const out = try webTool(arena, fake.backend(), "web_read", try jsonArgs(arena, args));
+            if (std.mem.indexOf(u8, out, "\"code\":\"invalid_args\"") == null) {
+                std.debug.print("not refused: {s}\n{s}\n", .{ args, out });
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
 }
 
 test "web_eval body is wrapped in an ASYNC function and asks for a real page budget" {
@@ -8506,8 +9069,11 @@ test "web_expand reports an unknown node id instead of an empty success" {
             "{\"ok\":true,\"token\":1}",
             "{\"ok\":true,\"done\":true,\"result_ok\":true,\"payload\":\"\"}",
             // The subtree query that decides which of the three
-            // zero-byte cases this was.
+            // zero-byte cases this was, after the peek walk a GUI's
+            // tree query always takes.
             "{\"ok\":true,\"token\":2}",
+            "{\"ok\":true,\"done\":true,\"result_ok\":true,\"payload\":\"\"}",
+            "{\"ok\":true,\"token\":3}",
             "{\"ok\":true,\"done\":true,\"result_ok\":true,\"payload\":\"query subtree [42] unknown id\\n\"}",
         },
     };
@@ -8527,6 +9093,8 @@ test "web_expand reports an unknown node id instead of an empty success" {
             "{\"ok\":true,\"token\":1}",
             "{\"ok\":true,\"done\":true,\"result_ok\":true,\"payload\":\"\"}",
             "{\"ok\":true,\"token\":2}",
+            "{\"ok\":true,\"done\":true,\"result_ok\":true,\"payload\":\"\"}",
+            "{\"ok\":true,\"token\":3}",
             "{\"ok\":true,\"done\":true,\"result_ok\":true,\"payload\":\"query subtree [42]\\n[42] group\\n\"}",
         },
     };
