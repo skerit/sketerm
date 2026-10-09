@@ -6812,9 +6812,16 @@ fn runA11yStages(cl: *Client) void {
         // the selected range. Passing while saying so keeps the stage
         // honest, and it starts announcing the day an engine reports
         // an extent.
+        //
+        // Every wait below is `drive`, never `pump`: `pump(ms)` returns
+        // on the FIRST frame batch, and the helper posts the tree frame
+        // before its caret frame, so a `pump` "settle" could end between
+        // the two. The contenteditable's first caret then landed inside
+        // the churn window below and read as a re-post (2 runs in 10).
         cl.ax_sel_seen = false;
         _ = cl.evalWait("(function(){var t=document.getElementById('t');t.focus();t.setSelectionRange(2,6);return 1})()", false, 5_000);
-        cl.pump(1_500);
+        _ = cl.drive(1_500, 0);
+        const ce_seq = cl.ax_caret_seq;
         _ = cl.evalWait(
             "(function(){var e=document.getElementById('e');e.focus();" ++
                 "var r=document.createRange();var n=e.firstChild;" ++
@@ -6823,7 +6830,11 @@ fn runA11yStages(cl: *Client) void {
             false,
             5_000,
         );
-        cl.pump(1_500);
+        // Focus moved to another node, so its caret is a CHANGE and
+        // must arrive before the coalescing window opens.
+        if (!cl.waitSeq(&cl.ax_caret_seq, ce_seq, 10_000))
+            fail("stage 36 a11y: focusing the contenteditable reported no caret");
+        _ = cl.drive(1_500, 0);
         if (cl.ax_sel_seen) {
             say("smoke-web: NOTE stage 36 the engine now reports a selection EXTENT; the ceiling is gone");
         } else {
@@ -6835,7 +6846,7 @@ fn runA11yStages(cl: *Client) void {
         // require silence on the caret channel.
         const before = cl.ax_caret_seq;
         _ = cl.evalWait("(function(){for(var i=0;i<12;i++){var d=document.createElement('p');d.textContent='churn'+i;document.body.appendChild(d)}return 1})()", false, 5_000);
-        cl.pump(2_500);
+        _ = cl.drive(2_500, 0);
         if (cl.ax_caret_seq != before) {
             std.debug.print("smoke-web: caret frames {d} -> {d} on unrelated churn; every caret frame:\n{s}", .{ before, cl.ax_caret_seq, cl.ax_caret_log[0..cl.ax_caret_log_len] });
             fail("stage 36 a11y: an unchanged caret was re-posted on unrelated tree churn");
