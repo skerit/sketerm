@@ -56,6 +56,7 @@ const clock = @import("../util/clock.zig");
 const png_codec = @import("../util/png.zig");
 const atomicwrite = @import("../util/atomicwrite.zig");
 const mcp_term = @import("mcp_term.zig");
+const webtabs = @import("webtabs.zig");
 
 /// Default budget for one semantic round trip. Clamped to
 /// `mcp.WAIT_CAP_MS` like every other MCP wait, so one blocked page
@@ -131,6 +132,115 @@ var g_default_max_fps: ?u16 = null;
 var g_headless_dir: ?[]const u8 = null;
 var g_headless_instance: ?[]const u8 = null;
 var g_headless_mux_sock: ?[]const u8 = null;
+
+/// Labels, last-touched times and idle-closed tabs, for both backends
+/// (`webtabs.zig`). Its own allocator: GUI-attached servers never arm
+/// the headless one, and the table must not mix two.
+var g_tabs: webtabs.Table = .{};
+const tabs_alloc = std.heap.c_allocator;
+
+/// Idle time after which an unwatched HEADLESS tab closes itself; 0 =
+/// never. GUI tabs are the user's own and never auto-close.
+var g_idle_close_ms: i64 = @as(i64, webtabs.DEFAULT_IDLE_CLOSE_SECS) * 1000;
+
+/// `web_idle_close_secs` from config ([mcp] < [mcp.<name>]); null keeps
+/// the built-in default.
+pub fn configureIdleClose(secs: ?u32) void {
+    g_idle_close_ms = @as(i64, secs orelse webtabs.DEFAULT_IDLE_CLOSE_SECS) * 1000;
+}
+
+/// The configured idle time in seconds (0 = off), for `capabilities`.
+pub fn idleCloseSecs() u32 {
+    return @intCast(@divTrunc(g_idle_close_ms, 1000));
+}
+
+
+/// What `capabilities` reports as `web_tab_rules`.
+pub fn tabRules() struct {
+    target_required: bool = true,
+    labels: bool = true,
+    echo: bool = true,
+    ids: []const u8,
+    idle_close_secs: u32,
+    idle_close_watch_aware: ?bool,
+    browser_identity_locked: bool = true,
+} {
+    const gui = guiDrivesWeb();
+    var aware: ?bool = null;
+    if (!gui) for (g_engines.items) |re| {
+        if (re.engine.state == .ready) aware = re.engine.watchKnown();
+    };
+    return .{
+        .ids = @tagName(if (gui) webtabs.TabIds.gui_pane else webtabs.TabIds.random),
+        .idle_close_secs = if (gui) 0 else idleCloseSecs(),
+        .idle_close_watch_aware = aware,
+    };
+}
+
+/// How often the loop re-checks while a tab is watched: the end of a
+/// watch arrives on the helper socket, which the loop does not poll.
+const WATCH_RECHECK_MS: i64 = 1_000;
+
+fn tabKey(mode: Mode, v: View) webtabs.Key {
+    return switch (mode) {
+        .gui => .{ .handle = v.pane, .page = v.view },
+        .headless => .{ .handle = v.pane },
+    };
+}
+
+/// The idle verdict for a headless view right now.
+fn idleOfView(e: *webdrive.Engine, v: *const webdrive.View, now: i64) webtabs.Idle {
+    const watched: ?bool = if (e.watchKnown()) v.watchers > 0 else null;
+    const touched = g_tabs.touchedMs(tabs_alloc, .{ .handle = v.id }, now) catch now;
+    return webtabs.idleOf(g_idle_close_ms, @max(touched, v.watch_changed_ms), now, watched);
+}
+
+/// Close every headless tab that went untouched and unwatched for the
+/// configured time. Called between requests by the server loop and at
+/// the start of every web call, so a due tab is gone before anything
+/// can address it. Never touches a GUI tab.
+pub fn idleSweep(now: i64) void {
+    if (g_idle_close_ms <= 0 or guiDrivesWeb()) return;
+    for (g_engines.items) |re| {
+        const e = &re.engine;
+        if (e.views.items.len == 0) continue;
+        e.pumpOnce(0);
+        var i: usize = 0;
+        while (i < e.views.items.len) {
+            const v = e.views.items[i];
+            switch (idleOfView(e, v, now)) {
+                .closes_in_ms => |left| if (left == 0) {
+                    const key = webtabs.Key{ .handle = v.id };
+                    const touched = g_tabs.touchedMs(tabs_alloc, key, now) catch now;
+                    g_tabs.noteClosed(v.id, g_tabs.labelOf(key), v.url orelse "", now - @max(touched, v.watch_changed_ms), now);
+                    e.closeView(v.id);
+                    continue;
+                },
+                .off, .watched, .unknown => {},
+            }
+            i += 1;
+        }
+    }
+}
+
+/// Milliseconds until the next idle close is due (or a watched tab needs
+/// re-checking); null when nothing is pending.
+pub fn idleDueInMs(now: i64) ?i64 {
+    if (g_idle_close_ms <= 0 or guiDrivesWeb()) return null;
+    var due: ?i64 = null;
+    for (g_engines.items) |re| {
+        const e = &re.engine;
+        for (e.views.items) |v| {
+            const next: i64 = switch (idleOfView(e, v, now)) {
+                .closes_in_ms => |left| left,
+                .watched => WATCH_RECHECK_MS,
+                .off, .unknown => continue,
+            };
+            due = if (due) |d| @min(d, next) else next;
+        }
+    }
+    return due;
+}
 
 /// Verbosity of one `web_snapshot` (0 terse / 1 normal / 2 long text).
 /// Per CALL, never remembered: a sticky default set by a one-off terse
@@ -436,6 +546,7 @@ pub fn shutdownHeadless() void {
     if (alloc) |a| g_engines.deinit(a) else g_engines.clearRetainingCapacity();
     g_engines = .empty;
     g_current_engine = 0;
+    g_tabs.deinit(tabs_alloc);
 }
 
 /// Every live helper socket fd for the central watchdog. A wedged
@@ -616,6 +727,16 @@ pub const View = struct {
     /// `ERR_NETWORK_CHANGED` during the navigation this client last
     /// asked for (headless only; the GUI's faces keep no such record).
     load_retry: ?LoadErrState = null,
+    /// The caller's label from `web_open label:` ("" = none).
+    label: []const u8 = "",
+    /// Headless: a person watches this tab (Watch / Take control); null
+    /// when the helper cannot say. GUI tabs are on the user's screen and
+    /// carry null.
+    watched: ?bool = null,
+    /// Headless: someone holds Take control on it.
+    controlled: bool = false,
+    /// Where the tab stands against idle closing.
+    idle: webtabs.Idle = .off,
 
     /// The requested navigation cannot arrive: a certificate the
     /// caller did not accept, or a load that already failed. Polling
@@ -863,8 +984,10 @@ fn listViews(drv: Driver, arena: std.mem.Allocator) !?Views {
                 helper_reason: []const u8 = "",
             }, arena, resp, .{ .ignore_unknown_fields = true }) catch return null;
             if (!parsed.ok) return null;
+            const own = try arena.dupe(View, parsed.views);
+            try annotate(arena, .gui, own);
             return Views{
-                .views = parsed.views,
+                .views = own,
                 .helper = parsed.helper,
                 .helper_reason = parsed.helper_reason,
             };
@@ -884,6 +1007,7 @@ fn listViews(drv: Driver, arena: std.mem.Allocator) !?Views {
             }
             // An engine outside the table (unit tests build one by hand).
             if (!listed) try appendEngineViews(arena, e, &out, true);
+            try annotate(arena, .headless, out.items);
             return Views{
                 .views = out.items,
                 .helper = @tagName(e.state),
@@ -891,6 +1015,22 @@ fn listViews(drv: Driver, arena: std.mem.Allocator) !?Views {
             };
         },
     }
+}
+
+/// Fill each listed tab's label from the tab table, and drop the table's
+/// entries for tabs that are gone. A listing is always complete (every
+/// engine headless, the GUI's whole `web-list`), which is what makes the
+/// pruning safe.
+fn annotate(arena: std.mem.Allocator, mode: Mode, views: []View) !void {
+    var keys: [256]webtabs.Key = undefined;
+    const n = @min(views.len, keys.len);
+    for (views, 0..) |*v, i| {
+        const key = tabKey(mode, v.*);
+        if (i < keys.len) keys[i] = key;
+        // Copied: a later listing in the same call may prune the entry.
+        v.label = try arena.dupe(u8, g_tabs.labelOf(key));
+    }
+    if (views.len <= keys.len) g_tabs.retain(tabs_alloc, keys[0..n]);
 }
 
 /// One engine's views, as the backend-agnostic record. `current` says
@@ -961,6 +1101,9 @@ fn appendEngineViews(
             .cert = if (v.cert) |*rec| try dupeCert(arena, rec.wire()) else null,
             .load_error = if (v.load_error) |*rec| try dupeLoadErr(arena, rec.wire()) else null,
             .load_retry = if (v.load_retry) |*rec| try dupeLoadErr(arena, rec.wire()) else null,
+            .watched = if (e.watchKnown()) v.watchers > 0 else null,
+            .controlled = v.controllers > 0,
+            .idle = idleOfView(e, v, clock.nowMs()),
         });
     }
 }
@@ -983,6 +1126,96 @@ fn viewFor(views: Views, handle: ?u32) ?View {
         if (v.focused) return v;
     }
     return views.views[0];
+}
+
+/// The tab a tool call acts on, or the error result that refuses it.
+const Target = union(enum) { view: View, err: []const u8 };
+
+/// THE place a call's target tab is decided. A named handle must exist;
+/// a call naming none acts on the only open tab and is REFUSED when
+/// several are open: "the current tab" is whatever another caller (a
+/// sibling sub-agent on the same server) touched last, so acting on it
+/// would be a guess. The refusal lists the tabs to choose from. The
+/// resolved tab counts as used (`webtabs` idle clock).
+fn resolveTarget(drv: Driver, arena: std.mem.Allocator, views: ?Views, handle: ?u32) !Target {
+    const vs = views orelse return .{ .err = try helperErr(drv, arena, views) };
+    const view: View = if (handle) |h|
+        viewFor(vs, h) orelse return .{ .err = try missingTarget(drv, arena, views, h) }
+    else blk: {
+        if (vs.views.len == 0) return .{ .err = try helperErr(drv, arena, views) };
+        var handles: [64]u32 = undefined;
+        var n: usize = 0;
+        for (vs.views) |v| {
+            if (n == handles.len) break;
+            handles[n] = v.pane;
+            n += 1;
+        }
+        if (webtabs.targetRequired(handles[0..n]) or vs.views.len > handles.len)
+            return .{ .err = try targetRequiredErr(arena, drv.mode(), vs) };
+        break :blk viewFor(vs, vs.views[0].pane).?;
+    };
+    g_tabs.touch(tabs_alloc, tabKey(drv.mode(), view), clock.nowMs()) catch {};
+    return .{ .view = view };
+}
+
+/// A named tab that is not open: closed by the idle sweep (said, with
+/// what it was), or simply unknown.
+fn missingTarget(drv: Driver, arena: std.mem.Allocator, views: ?Views, handle: u32) ![]const u8 {
+    if (drv == .headless) {
+        if (g_tabs.closedRecord(handle)) |rec| return mcp.errRes(arena, .not_found, try std.fmt.allocPrint(
+            arena,
+            "view {d}{s}{s}{s} ({s}) was closed automatically after {d}s untouched and unwatched (web_idle_close_secs); web_open opens a new tab",
+            .{
+                handle,
+                if (rec.label().len > 0) " [" else "",
+                rec.label(),
+                if (rec.label().len > 0) "]" else "",
+                if (rec.url().len > 0) rec.url() else "blank",
+                @divTrunc(rec.idle_ms, 1000),
+            },
+        ));
+    }
+    return helperErr(drv, arena, views);
+}
+
+/// One open tab as the `target_required` refusal lists it. Only the
+/// handle key of the answering backend is present.
+const TabRef = struct {
+    view: ?u32 = null,
+    pane: ?u32 = null,
+    label: ?[]const u8 = null,
+    url: []const u8,
+    title: []const u8,
+};
+
+/// The refusal for a call that named no tab while several are open.
+fn targetRequiredErr(arena: std.mem.Allocator, mode: Mode, vs: Views) ![]const u8 {
+    var refs: std.ArrayList(TabRef) = .empty;
+    var msg: std.Io.Writer.Allocating = .init(arena);
+    var seen: std.ArrayList(u32) = .empty;
+    for (vs.views) |v| {
+        // One entry per handle: a GUI pane's other pages are not targets.
+        if (std.mem.indexOfScalar(u32, seen.items, v.pane) != null) continue;
+        try seen.append(arena, v.pane);
+        try refs.append(arena, .{
+            .view = if (mode == .headless) v.pane else null,
+            .pane = if (mode == .gui) v.pane else null,
+            .label = if (v.label.len > 0) v.label else null,
+            .url = v.url,
+            .title = v.title,
+        });
+    }
+    try msg.writer.print("{d} browser tabs are open, so a call that names no tab would act on whichever one another caller touched last. Pass 'pane' with the tab you mean:", .{refs.items.len});
+    for (refs.items, 0..) |r, i| {
+        if (i == 20) {
+            try msg.writer.print(" (and {d} more in details.tabs)", .{refs.items.len - 20});
+            break;
+        }
+        try msg.writer.print("{s} {s} {d}", .{ if (i == 0) "" else ";", handleKey(mode), r.view orelse r.pane.? });
+        if (r.label) |l| try msg.writer.print(" [{s}]", .{try clip(arena, l, webtabs.LABEL_MAX)});
+        try msg.writer.print(" {s}", .{if (r.url.len > 0) try clip(arena, r.url, URL_MAX) else "(blank)"});
+    }
+    return mcp.errResDetails(arena, .target_required, msg.written(), @as(?struct { tabs: []const TabRef }, .{ .tabs = refs.items }));
 }
 
 /// A document that is not a page: what a view holds before anything was
@@ -1276,10 +1509,14 @@ fn headlessRouteEngine(arena: std.mem.Allocator, text: []const u8) RouteEngineOu
 }
 
 fn openView(drv: Driver, arena: std.mem.Allocator, url: ?[]const u8, where: []const u8, w: u16, h: u16, spec: webdrive.ProfileSpec, policy: ?*const webdrive.NetPolicy, cap: ?*const webdrive.CaptureFilter, route: ?[]const u8) !OpenOutcome {
-    return openViewConfigured(drv, arena, url, where, w, h, spec, policy, cap, route, .{}, null);
+    return openViewConfigured(drv, arena, url, where, w, h, spec, policy, cap, route, .{}, null, null);
 }
 
-fn openViewConfigured(drv: Driver, arena: std.mem.Allocator, url: ?[]const u8, where: []const u8, w: u16, h: u16, spec: webdrive.ProfileSpec, policy: ?*const webdrive.NetPolicy, cap: ?*const webdrive.CaptureFilter, route: ?[]const u8, emulation: webdrive.Emulation, max_fps: ?u16) !OpenOutcome {
+/// `browser_name`: the `name` the call gives the (headless) browser.
+/// Checked against the live browser BEFORE anything opens: a name or
+/// identity that differs from the one the browser's tabs run under is
+/// refused, never applied (several callers share one browser).
+fn openViewConfigured(drv: Driver, arena: std.mem.Allocator, url: ?[]const u8, where: []const u8, w: u16, h: u16, spec: webdrive.ProfileSpec, policy: ?*const webdrive.NetPolicy, cap: ?*const webdrive.CaptureFilter, route: ?[]const u8, emulation: webdrive.Emulation, max_fps: ?u16, browser_name: ?[]const u8) !OpenOutcome {
     if (drv == .gui and max_fps != null) return .{ .err = fail(.unavailable, "max_fps is headless only; GUI monitor-driven pacing is unchanged") };
     if (drv == .gui and emulation.present()) return .{ .err = fail(.unavailable, "web emulation is headless only; nothing was opened") };
     if (drv == .gui and spec != .default) return .{ .err = fail(.invalid_args, GUI_PROFILE_REFUSAL) };
@@ -1323,6 +1560,22 @@ fn openViewConfigured(drv: Driver, arena: std.mem.Allocator, url: ?[]const u8, w
                     }
                 }
             }
+            if (browser_name) |n| switch (e.labelConflict(n, spec)) {
+                .none => {},
+                .rename => |current| return .{ .err = fail(.conflict, try std.fmt.allocPrint(
+                    arena,
+                    "this browser is already named '{s}' and has {d} open tab(s) other callers may be working in; renaming it to '{s}' is refused and nothing was opened. Omit 'name' to add a tab to '{s}' (label:\"...\" marks your own tabs), or close its tabs first",
+                    .{ current, e.views.items.len, n, current },
+                )) },
+                .identity => |current| {
+                    var buf: [96]u8 = undefined;
+                    return .{ .err = fail(.conflict, try std.fmt.allocPrint(
+                        arena,
+                        "browser '{s}' runs in {s}; this call asks for {s} under the same name, which would switch the identity its open tabs are shown under. Refused, nothing was opened. Omit 'name' to open a tab with its own identity, or reuse the browser's",
+                        .{ n, current, spec.describe(&buf) },
+                    )) };
+                },
+            };
             const v = e.openViewConfigured(url orelse "", w, h, spec, policy, cap, emulation, max_fps) catch |err| {
                 const name: []const u8 = if (spec == .named) spec.named else "";
                 return .{ .err = switch (err) {
@@ -1354,6 +1607,7 @@ fn openViewConfigured(drv: Driver, arena: std.mem.Allocator, url: ?[]const u8, w
                     else => try profileFail(arena, e, name, err),
                 } };
             };
+            if (browser_name) |n| e.setBrowserLabelFor(n, spec);
             return .{ .opened = v.id };
         },
     }
@@ -1502,13 +1756,21 @@ fn clip(arena: std.mem.Allocator, s: []const u8, max: usize) ![]const u8 {
     return out;
 }
 
+/// Which tab a reply is about: the backend, the tab's handle, its
+/// current url and its label. Every tab-acting reply carries these
+/// (several callers share one browser and must see what they hit).
+pub fn tabEcho(res: *mcp.Res, mode: Mode, v: View) !void {
+    try res.fact("backend", @tagName(mode));
+    try res.fact(handleKey(mode), v.pane);
+    try res.fact("url", v.url);
+    if (v.label.len > 0) try res.fact("label", v.label);
+}
+
 /// Structured facts + the one-line text header every web result opens
 /// with: `view 12: "Example Domain" - https://example.com`.
 fn head(res: *mcp.Res, arena: std.mem.Allocator, mode: Mode, v: View) !void {
-    try res.fact("backend", @tagName(mode));
-    try res.fact(handleKey(mode), v.pane);
+    try tabEcho(res, mode, v);
     try res.fact("origin", originOf(v.url));
-    try res.fact("url", v.url);
     try res.fact("title", v.title);
     try res.fact("loading", v.loading);
     // Where this tab's traffic leaves, on EVERY web result: a caller
@@ -1524,18 +1786,21 @@ fn head(res: *mcp.Res, arena: std.mem.Allocator, mode: Mode, v: View) !void {
     const title = try clip(arena, v.title, TITLE_MAX);
     const url = try clip(arena, v.url, URL_MAX);
     const busy: []const u8 = if (v.loading) " (loading)" else "";
+    const label = if (v.label.len > 0) try std.fmt.allocPrint(arena, " [{s}]", .{try clip(arena, v.label, webtabs.LABEL_MAX)}) else "";
     if (title.len > 0) {
-        try res.textf("{s} {d}: \"{s}\" - {s}{s}", .{
+        try res.textf("{s} {d}{s}: \"{s}\" - {s}{s}", .{
             handleKey(mode),
             v.pane,
+            label,
             title,
             if (url.len > 0) url else "(no url)",
             busy,
         });
     } else {
-        try res.textf("{s} {d}: {s}{s}", .{
+        try res.textf("{s} {d}{s}: {s}{s}", .{
             handleKey(mode),
             v.pane,
+            label,
             if (url.len > 0) url else "(blank document)",
             busy,
         });
@@ -1596,6 +1861,13 @@ fn tabsResult(arena: std.mem.Allocator, mode: Mode, vs: Views) ![]const u8 {
     try res.fact("count", vs.views.len);
     try res.fact("helper", vs.helper);
     if (vs.helper_reason.len > 0) try res.fact("helper_reason", vs.helper_reason);
+    // A handle-less call only means something with ONE tab open.
+    const handles = distinctHandles(vs);
+    const target_required = handles > 1;
+    try res.fact("target_required", target_required);
+    // The idle rule, stated where the tabs are listed: it applies to the
+    // assistant's own (headless) tabs only.
+    try res.fact("idle_close_secs", if (mode == .headless) idleCloseSecs() else 0);
 
     // The view list is machine data; the text lane gets one line each,
     // with `*` marking the view a handle-less call addresses.
@@ -1626,6 +1898,19 @@ fn tabsResult(arena: std.mem.Allocator, mode: Mode, vs: Views) ![]const u8 {
             try w.writeAll(try loadErrJson(arena, lr));
         }
         if (mode == .gui) try w.print(",\"focused\":{},\"visible\":{}", .{ v.focused, v.visible });
+        if (v.label.len > 0) {
+            try w.writeAll(",\"label\":");
+            try std.json.Stringify.value(v.label, .{}, w);
+        }
+        if (mode == .headless) {
+            try w.writeAll(",\"watched\":");
+            try std.json.Stringify.value(v.watched, .{}, w);
+            try w.print(",\"controlled\":{}", .{v.controlled});
+            switch (v.idle) {
+                .closes_in_ms => |ms| try w.print(",\"closes_in_ms\":{d}", .{ms}),
+                .off, .watched, .unknown => try w.writeAll(",\"closes_in_ms\":null"),
+            }
+        }
         // GUI mode omits both: its containers are the user's own, and
         // `web-list` does not report them (yet).
         if (mode == .headless) {
@@ -1635,7 +1920,7 @@ fn tabsResult(arena: std.mem.Allocator, mode: Mode, vs: Views) ![]const u8 {
             if (v.policy_active) try w.print(",\"policy_active\":true,\"policy_exhausted\":{}", .{v.policy_exhausted.len > 0});
             if (v.capture_active) try w.writeAll(",\"capture_active\":true");
         }
-        try w.print(",\"current\":{}}}", .{v.focused});
+        try w.print(",\"current\":{}}}", .{!target_required and v.focused});
     }
     try w.writeAll("]");
     try res.raw("views", aw.written());
@@ -1647,10 +1932,11 @@ fn tabsResult(arena: std.mem.Allocator, mode: Mode, vs: Views) ![]const u8 {
     for (vs.views) |v| {
         const title = try clip(arena, v.title, TITLE_MAX);
         const url = try clip(arena, v.url, URL_MAX);
-        try res.textf("{s} {s} {d}: {s}{s}{s}{s}{s}{s}{s}{s}{s}", .{
-            if (v.focused) "*" else " ",
+        try res.textf("{s} {s} {d}{s}: {s}{s}{s}{s}{s}{s}{s}{s}{s}{s}", .{
+            if (!target_required and v.focused) "*" else " ",
             handleKey(mode),
             v.pane,
+            if (v.label.len > 0) try std.fmt.allocPrint(arena, " [{s}]", .{try clip(arena, v.label, webtabs.LABEL_MAX)}) else "",
             if (title.len > 0) "\"" else "",
             if (title.len > 0) title else "",
             if (title.len > 0) "\" - " else "",
@@ -1662,6 +1948,7 @@ fn tabsResult(arena: std.mem.Allocator, mode: Mode, vs: Views) ![]const u8 {
             if (v.profile.len > 0) " [profile " else if (std.mem.eql(u8, v.profile_kind, "ephemeral")) " [ephemeral identity]" else "",
             if (v.profile.len > 0) v.profile else "",
             if (v.profile.len > 0) "]" else "",
+            try idleMark(arena, v),
         });
     }
     if (mode == .headless) {
@@ -1671,8 +1958,27 @@ fn tabsResult(arena: std.mem.Allocator, mode: Mode, vs: Views) ![]const u8 {
             break;
         }
     }
-    if (vs.views.len > 0) try res.text("* = the view a web_* call with no 'pane' addresses");
+    if (target_required)
+        try res.textf("{d} tabs are open: every web_* call that acts on a tab must name it with 'pane' (a call without one is refused as target_required)", .{handles})
+    else if (vs.views.len > 0)
+        try res.text("* = the view a web_* call with no 'pane' addresses (only while it is the one tab open)");
+    if (mode == .headless) {
+        if (idleCloseSecs() == 0)
+            try res.text("idle closing is off (web_idle_close_secs = 0)")
+        else
+            try res.textf("an assistant tab untouched for {d}s closes itself, unless someone is watching it (Watch / Take control); web_idle_close_secs sets the time", .{idleCloseSecs()});
+    }
     return res.finish();
+}
+
+/// The per-line idle marker in the tabs listing.
+fn idleMark(arena: std.mem.Allocator, v: View) ![]const u8 {
+    return switch (v.idle) {
+        .off => "",
+        .watched => if (v.controlled) " (watched, under Take control: never idle-closed)" else " (watched: never idle-closed)",
+        .unknown => " (idle close paused: this browser helper cannot report watchers)",
+        .closes_in_ms => |ms| try std.fmt.allocPrint(arena, " (closes in {d}s if untouched)", .{@divTrunc(ms + 999, 1000)}),
+    };
 }
 
 /// A view's route text, with a missing or empty field read as direct
@@ -1781,46 +2087,56 @@ fn openResult(
     return res.finish();
 }
 
+/// The closed tab, echoed: its handle, the url it held, its label.
+fn closedFacts(res: *mcp.Res, mode: Mode, v: View) !void {
+    try tabEcho(res, mode, v);
+    try res.fact("closed", v.pane);
+}
+
+/// The sentence about what a call naming no tab addresses now.
+fn nextTargetText(res: *mcp.Res, mode: Mode, remaining: usize, current: u32) !void {
+    if (remaining == 0)
+        try res.text("no web views are left; web_open makes one")
+    else if (current != 0)
+        try res.textf("one tab is left: a web_* call with no '{s}' addresses {s} {d}", .{ "pane", handleKey(mode), current })
+    else
+        try res.textf("{d} tabs are still open: every web_* call must name its tab with 'pane'", .{remaining});
+}
+
 /// `web_close` with a GUI attached: one page of `pane` went, and the pane
 /// with it only when `pane_closed`.
-fn closeGuiResult(arena: std.mem.Allocator, pane: u32, remaining: usize, pane_closed: bool) ![]const u8 {
+fn closeGuiResult(arena: std.mem.Allocator, v: View, remaining: usize, pane_closed: bool) ![]const u8 {
     var res = mcp.Res.init(arena);
-    try res.fact("backend", "gui");
-    try res.fact("closed", pane);
+    try closedFacts(&res, .gui, v);
     try res.fact("remaining", remaining);
     try res.fact("current", @as(u32, 0));
     try res.fact("pane_closed", pane_closed);
     try res.fact("profile_released", false);
+    const url = if (v.url.len > 0) try clip(arena, v.url, URL_MAX) else "(blank)";
     if (pane_closed)
-        try res.textf("closed pane {d} (its last page); {d} web views left", .{ pane, remaining })
+        try res.textf("closed pane {d} ({s}, its last page); {d} web views left", .{ v.pane, url, remaining })
     else
-        try res.textf("closed the active page of pane {d}; the pane stays open with its other pages; {d} web views left", .{ pane, remaining });
+        try res.textf("closed the active page of pane {d} ({s}); the pane stays open with its other pages; {d} web views left", .{ v.pane, url, remaining });
     return res.finish();
 }
 
 fn closeResult(
     arena: std.mem.Allocator,
-    mode: Mode,
-    closed: u32,
+    v: View,
     remaining: usize,
     current: u32,
-    profile: []const u8,
     profile_released: bool,
 ) ![]const u8 {
     var res = mcp.Res.init(arena);
-    try res.fact("backend", @tagName(mode));
-    try res.fact("closed", closed);
+    try closedFacts(&res, .headless, v);
     try res.fact("remaining", remaining);
     try res.fact("current", current);
-    if (profile.len > 0) try res.fact("profile", profile);
+    if (v.profile.len > 0) try res.fact("profile", v.profile);
     try res.fact("profile_released", profile_released);
-    try res.textf("closed {s} {d}; {d} left", .{ handleKey(mode), closed, remaining });
-    if (current != 0)
-        try res.textf("a web_* call with no '{s}' now addresses {s} {d}", .{ handleKey(mode), handleKey(mode), current })
-    else
-        try res.text("no web views are left; web_open makes one");
-    if (profile.len > 0)
-        try res.textf("profile '{s}' keeps its storage (web_profile_reset erases it)", .{profile});
+    try res.textf("closed {s} {d} ({s}); {d} left", .{ handleKey(.headless), v.pane, if (v.url.len > 0) try clip(arena, v.url, URL_MAX) else "(blank)", remaining });
+    try nextTargetText(&res, .headless, remaining, current);
+    if (v.profile.len > 0)
+        try res.textf("profile '{s}' keeps its storage (web_profile_reset erases it)", .{v.profile});
     if (profile_released)
         try res.text("its throwaway identity went with it: cookies, storage and cache are gone");
     return res.finish();
@@ -2968,6 +3284,14 @@ pub fn webTool(
                 return mcp.errRes(arena, .invalid_args, "name must be a non-empty, single-line UTF-8 browser session name without control characters (at most 160 bytes)");
         }
     }
+    if ((eql(u8, name, "web_open") or eql(u8, name, "web_close")) and args == .object) {
+        if (args.object.get("label")) |value| {
+            if (value != .string or !webtabs.validLabel(value.string))
+                return mcp.errRes(arena, .invalid_args, std.fmt.comptimePrint("label must be a single-line string of 1-{d} bytes without control characters", .{webtabs.LABEL_MAX}));
+        }
+    }
+    // A due tab closes before anything can address it.
+    idleSweep(clock.nowMs());
     // Diagnostics must remain readable after helper death, without spawning a
     // replacement (which would overwrite precisely the evidence requested).
     if (eql(u8, name, "web_diagnostic")) return diagnosticTool(arena, args);
@@ -3089,7 +3413,7 @@ pub fn webTool(
             if (drv == .gui) return mcp.errRes(arena, .invalid_args, "accept_cert is headless only: with a GUI attached the user answers certificate errors in the pane's interstitial");
             if (!navfault.validFingerprint(fp)) return mcp.errRes(arena, .invalid_args, "accept_cert must be the certificate's SHA-256 as 64 hex digits (the 'cert.fingerprint' a refused open reported)");
         }
-        const new_handle: u32 = switch (try openViewConfigured(drv, arena, url, where, vw, vh, spec, if (policy) |*p| p else null, if (cap) |*f| f else null, route, emulation, max_fps)) {
+        const new_handle: u32 = switch (try openViewConfigured(drv, arena, url, where, vw, vh, spec, if (policy) |*p| p else null, if (cap) |*f| f else null, route, emulation, max_fps, browser_name)) {
             .err => |e| return failRes(arena, e),
             .opened => |p| p,
         };
@@ -3097,8 +3421,13 @@ pub fn webTool(
         // the rest of this call must address that engine, not the one
         // the call was picked with.
         drv = pick(backend, new_handle) catch return webGuiUnavailable(arena);
+        if (drv == .headless) drv.headless.writePresence();
+        const tab_label = mcp.argStr(args, "label");
+        // Headless: the handle IS the page, so the label lands now. GUI:
+        // keyed by the page too, which the settle loop below learns.
         if (drv == .headless) {
-            if (browser_name) |label| drv.headless.setBrowserLabel(label) else drv.headless.writePresence();
+            if (tab_label) |l| g_tabs.setLabel(tabs_alloc, .{ .handle = new_handle }, l, clock.nowMs()) catch {};
+            g_tabs.touch(tabs_alloc, .{ .handle = new_handle }, clock.nowMs()) catch {};
         }
         // Before the first pump: the hold this navigation raises must
         // be answered against it.
@@ -3178,6 +3507,11 @@ pub fn webTool(
             if (drv == .headless and drv.headless.state == .unavailable)
                 return failRes(arena, try headlessFail(arena, drv.headless, error.Unavailable));
         }
+        if (tab_label) |l| {
+            if (drv == .gui) g_tabs.setLabel(tabs_alloc, tabKey(.gui, v), l, clock.nowMs()) catch {};
+            v.label = l;
+        }
+        if (drv == .gui) g_tabs.touch(tabs_alloc, tabKey(.gui, v), clock.nowMs()) catch {};
         const remaining = @max(deadline - drv.now(), 2000);
         var snap: ?Snap = null;
         var snap_err: ?[]const u8 = null;
@@ -3252,7 +3586,13 @@ pub fn webTool(
     // web_close resolves its own handle (it must answer for a view it
     // is about to remove), and the profile tools work with zero views —
     // both therefore sit ABOVE the "addresses an existing view" cut.
-    if (eql(u8, name, "web_close")) return closeTool(drv, arena, views, handle_u);
+    if (eql(u8, name, "web_close")) {
+        if (mcp.argStr(args, "label")) |label| {
+            if (handle_u != null) return mcp.errRes(arena, .invalid_args, "web_close takes 'pane' (one tab) or 'label' (every tab carrying it), not both");
+            return closeByLabelTool(drv, arena, views, label);
+        }
+        return closeTool(drv, arena, views, handle_u);
+    }
     if (eql(u8, name, "web_profiles")) return profilesTool(drv, arena);
     if (eql(u8, name, "web_profile_reset")) return profileResetTool(drv, arena, args);
     if (eql(u8, name, "web_profile_save")) return profileSaveTool(drv, arena, args);
@@ -3260,8 +3600,10 @@ pub fn webTool(
     if (eql(u8, name, "web_policy_set")) return policySetTool(drv, arena, args, views, handle_u);
 
     // Everything below addresses an existing view.
-    const vs = views orelse return helperErr(drv, arena, views);
-    const view = viewFor(vs, handle_u) orelse return helperErr(drv, arena, views);
+    const view = switch (try resolveTarget(drv, arena, views, handle_u)) {
+        .err => |e| return e,
+        .view => |v| v,
+    };
     // The listing spans every route's engine, so the resolved view fixes
     // which one this call talks to: a handle-less call that fell
     // through to another route's tab would otherwise drive the wrong
@@ -3851,37 +4193,124 @@ pub fn capturePng(drv: Driver, arena: std.mem.Allocator, view: View, timeout: i6
 /// it. A GUI that predates the verb answers "unknown command" and gets
 /// the old whole-pane close instead, which is all it can do.
 fn closeTool(drv: Driver, arena: std.mem.Allocator, views: ?Views, handle: ?u32) ![]const u8 {
+    const view = switch (try resolveTarget(drv, arena, views, handle)) {
+        .err => |r| return r,
+        .view => |v| v,
+    };
+    const remaining = if (views) |vs| distinctHandles(vs) -| 1 else 0;
+    switch (try closeOne(drv, arena, view)) {
+        .err => |f| return failRes(arena, f),
+        .closed => |pane_closed| switch (drv) {
+            .gui => return closeGuiResult(arena, view, remaining, pane_closed),
+            .headless => {
+                const left = totalHeadlessViews();
+                return closeResult(arena, view, left, soleHeadlessView(), std.mem.eql(u8, view.profile_kind, "ephemeral"));
+            },
+        },
+    }
+}
+
+/// `web_close label:` closes every tab carrying that label, and only
+/// those: how a caller that labelled its tabs cleans up after itself
+/// without touching a sibling's.
+fn closeByLabelTool(drv: Driver, arena: std.mem.Allocator, views: ?Views, label: []const u8) ![]const u8 {
     const vs = views orelse return helperErr(drv, arena, views);
-    const view = viewFor(vs, handle) orelse return helperErr(drv, arena, views);
+    var closed: std.ArrayList(View) = .empty;
+    for (vs.views) |v| {
+        if (!std.mem.eql(u8, v.label, label)) continue;
+        // A GUI pane's pages share one handle; each labelled page is its
+        // own close (`web-close` names the page).
+        switch (try closeOne(drv, arena, v)) {
+            .err => |f| return failRes(arena, f),
+            .closed => try closed.append(arena, v),
+        }
+    }
+    const left = switch (drv) {
+        .gui => if (try listViews(drv, arena)) |now| distinctHandles(now) else 0,
+        .headless => totalHeadlessViews(),
+    };
+    var res = mcp.Res.init(arena);
+    try res.fact("backend", @tagName(drv.mode()));
+    try res.fact("label", label);
+    try res.fact("count", closed.items.len);
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    try aw.writer.writeAll("[");
+    for (closed.items, 0..) |v, i| {
+        if (i != 0) try aw.writer.writeAll(",");
+        try aw.writer.print("{{\"{s}\":{d},\"url\":", .{ handleKey(drv.mode()), v.pane });
+        try std.json.Stringify.value(v.url, .{}, &aw.writer);
+        try aw.writer.writeAll("}");
+    }
+    try aw.writer.writeAll("]");
+    try res.raw("closed_tabs", aw.written());
+    try res.fact("remaining", left);
+    try res.fact("current", if (drv == .headless) soleHeadlessView() else 0);
+    if (closed.items.len == 0)
+        try res.textf("no open tab is labelled '{s}'; nothing was closed", .{label})
+    else
+        try res.textf("closed {d} tab(s) labelled '{s}'; {d} left", .{ closed.items.len, label, left });
+    for (closed.items) |v| try res.textf("closed {s} {d}: {s}", .{ handleKey(drv.mode()), v.pane, if (v.url.len > 0) try clip(arena, v.url, URL_MAX) else "(blank)" });
+    return res.finish();
+}
+
+/// Close one tab, on whichever backend holds it.
+fn closeOne(drv: Driver, arena: std.mem.Allocator, view: View) !union(enum) { closed: bool, err: Fail } {
     switch (drv) {
         .gui => |backend| {
-            const remaining = if (vs.views.len > 0) vs.views.len - 1 else 0;
             const reply = mcp.ipcParsed(arena, backend, .{
                 .cmd = "web-close",
                 .pane = view.pane,
                 .view = view.view,
-            }) catch |e| return failRes(arena, try guiUnreachable(arena, e));
+            }) catch |e| return .{ .err = try guiUnreachable(arena, e) };
             if (!reply.ok and std.mem.eql(u8, reply.err, "unknown command")) {
                 const pane = mcp.ipcParsed(arena, backend, .{
                     .cmd = "close-pane",
                     .pane = view.pane,
-                }) catch |e| return failRes(arena, try guiUnreachable(arena, e));
-                if (!pane.ok) return failRes(arena, fail(.failed, pane.err));
-                return closeGuiResult(arena, view.pane, remaining, true);
+                }) catch |e| return .{ .err = try guiUnreachable(arena, e) };
+                if (!pane.ok) return .{ .err = fail(.failed, pane.err) };
+                return .{ .closed = true };
             }
-            if (!reply.ok) return failRes(arena, fail(.failed, reply.err));
-            const pane_closed = if (reply.value.object.get("pane_closed")) |pc| pc == .bool and pc.bool else true;
+            if (!reply.ok) return .{ .err = fail(.failed, reply.err) };
             // The GUI owns what is focused afterwards; asking it again
             // would race the pane teardown it may just have started.
-            return closeGuiResult(arena, view.pane, remaining, pane_closed);
+            return .{ .closed = if (reply.value.object.get("pane_closed")) |pc| pc == .bool and pc.bool else true };
         },
-        .headless => |e| {
-            const released = std.mem.eql(u8, view.profile_kind, "ephemeral");
-            const profile = try arena.dupe(u8, view.profile);
+        .headless => |drv_engine| {
+            const e = engineForView(view.pane) orelse drv_engine;
             e.closeView(view.pane);
-            return closeResult(arena, .headless, view.pane, e.views.items.len, e.current, profile, released);
+            return .{ .closed = true };
         },
     }
+}
+
+/// How many tab HANDLES a listing holds (a GUI pane with several pages
+/// is one).
+fn distinctHandles(vs: Views) usize {
+    var n: usize = 0;
+    for (vs.views, 0..) |v, i| {
+        var dup = false;
+        for (vs.views[0..i]) |w| if (w.pane == v.pane) {
+            dup = true;
+            break;
+        };
+        if (!dup) n += 1;
+    }
+    return n;
+}
+
+/// Headless tabs open across every route's engine.
+fn totalHeadlessViews() usize {
+    var n: usize = 0;
+    for (g_engines.items) |re| n += re.engine.views.items.len;
+    return n;
+}
+
+/// The one headless tab a call naming none now addresses; 0 unless
+/// exactly one is open.
+fn soleHeadlessView() u32 {
+    if (totalHeadlessViews() != 1) return 0;
+    for (g_engines.items) |re| if (re.engine.views.items.len == 1) return re.engine.views.items[0].id;
+    return 0;
 }
 
 fn profilesTool(drv: Driver, arena: std.mem.Allocator) ![]const u8 {
@@ -4178,13 +4607,16 @@ fn policyTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, views
         try res.textf("profile '{s}' session-default policy (in-memory; applied by web_open profile:\"{s}\" when no explicit policy rides the call)", .{ name, name });
         return res.finish();
     }
-    const vs = views orelse return helperErr(drv, arena, views);
-    const listed = viewFor(vs, handle) orelse return helperErr(drv, arena, views);
-    const fresh = e.netPolicyStatus(listed.pane, 500) catch |err| switch (err) {
+    const listed = switch (try resolveTarget(drv, arena, views, handle)) {
+        .err => |r| return r,
+        .view => |v| v,
+    };
+    const e_view = engineForView(listed.pane) orelse e;
+    const fresh = e_view.netPolicyStatus(listed.pane, 500) catch |err| switch (err) {
         // A status read never closes or changes the view, unlike an install.
         error.PolicyAckTimeout => return failRes(arena, fail(.timeout, "the helper did not answer the policy status query in time; the view and its policy are unchanged")),
         error.PolicyRefused => return failRes(arena, fail(.refused, "the helper reports this view's policy as refused or inactive; the view stays fail-closed and unchanged")),
-        else => return failRes(arena, try headlessFail(arena, e, err)),
+        else => return failRes(arena, try headlessFail(arena, e_view, err)),
     };
     return policyViewResult(arena, listed, fresh);
 }
@@ -4324,12 +4756,15 @@ fn policySetTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, vi
         try res.textf("registered the session-default policy for profile '{s}' (in-memory: it lasts until this MCP server exits, deliberately — a durable copy could be silently lost by a store rebuild)", .{name});
         return res.finish();
     }
-    const vs = views orelse return helperErr(drv, arena, views);
-    const view = viewFor(vs, handle) orelse return helperErr(drv, arena, views);
-    const report = e.tightenViewPolicy(view.pane, &parsed) catch |err| return switch (err) {
+    const view = switch (try resolveTarget(drv, arena, views, handle)) {
+        .err => |r| return r,
+        .view => |v| v,
+    };
+    const e_view = engineForView(view.pane) orelse e;
+    const report = e_view.tightenViewPolicy(view.pane, &parsed) catch |err| return switch (err) {
         error.UntrustedModeConflict => mcp.errRes(arena, .refused, "untrusted cannot change on a live view, in either direction; open a new dedicated instance"),
         error.NoPolicy => mcp.errRes(arena, .conflict, "this view runs no policy; one can only be installed at web_open, never added to a live view (its earlier requests would predate it)"),
-        else => failRes(arena, try headlessFail(arena, e, err)),
+        else => failRes(arena, try headlessFail(arena, e_view, err)),
     };
     if (report.n_tightened == 0 and report.n_ignored > 0) {
         return mcp.errRes(arena, .refused, try std.fmt.allocPrint(
@@ -4338,7 +4773,7 @@ fn policySetTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, vi
             .{try joinNames(arena, report.ignored[0..report.n_ignored])},
         ));
     }
-    const fresh = e.findView(view.pane) orelse return helperErr(drv, arena, views);
+    const fresh = e_view.findView(view.pane) orelse return helperErr(drv, arena, views);
     var res = mcp.Res.init(arena);
     try head(&res, arena, .headless, view);
     try res.fact("policy_serial", fresh.pol_serial);
@@ -6326,7 +6761,7 @@ test "every web result opens with the view header and names its backend" {
     try t.expect(std.mem.startsWith(u8, btext, "view 3: (blank document)"));
 }
 
-test "web_tabs: views are structured, the text lane marks the current one" {
+test "web_tabs: views are structured; with two tabs none is current and a target is required" {
     var arena_state = testArena();
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -6335,7 +6770,7 @@ test "web_tabs: views are structured, the text lane marks the current one" {
     const out = try tabsResult(arena, .headless, .{
         .views = &.{
             EXAMPLE,
-            .{ .pane = 2, .url = "https://other.test/", .title = "Other", .focused = true, .loading = true },
+            .{ .pane = 2, .url = "https://other.test/", .title = "Other", .focused = true, .loading = true, .label = "scan-b", .watched = true, .controlled = true, .idle = .watched },
         },
         .helper = "ready",
     });
@@ -6344,10 +6779,17 @@ test "web_tabs: views are structured, the text lane marks the current one" {
     try t.expectEqualStrings("headless", sc.get("backend").?.string);
     try t.expectEqual(@as(i64, 2), sc.get("count").?.integer);
     try t.expectEqualStrings("ready", sc.get("helper").?.string);
+    try t.expect(sc.get("target_required").?.bool);
     const views = sc.get("views").?.array.items;
     try t.expectEqual(@as(i64, 12), views[0].object.get("view").?.integer);
+    // Several tabs: no tab is what a handle-less call means.
     try t.expect(!views[0].object.get("current").?.bool);
-    try t.expect(views[1].object.get("current").?.bool);
+    try t.expect(!views[1].object.get("current").?.bool);
+    try t.expectEqualStrings("scan-b", views[1].object.get("label").?.string);
+    try t.expect(views[0].object.get("label") == null);
+    try t.expect(views[1].object.get("watched").?.bool);
+    try t.expect(views[1].object.get("controlled").?.bool);
+    try t.expect(views[1].object.get("closes_in_ms").? == .null);
     // Headless views have no GUI-only facets to report.
     try t.expect(views[0].object.get("pane") == null);
     try t.expect(views[0].object.get("visible") == null);
@@ -6355,7 +6797,20 @@ test "web_tabs: views are structured, the text lane marks the current one" {
     const text = parsed.object.get("content").?.array.items[0].object.get("text").?.string;
     try t.expect(std.mem.indexOf(u8, text, "2 views (headless backend, helper ready)") != null);
     try t.expect(std.mem.indexOf(u8, text, "  view 12: \"Example Domain\" - https://example.com/a?b=1") != null);
-    try t.expect(std.mem.indexOf(u8, text, "* view 2: \"Other\" - https://other.test/ (loading)") != null);
+    try t.expect(std.mem.indexOf(u8, text, "  view 2 [scan-b]: \"Other\" - https://other.test/ (loading)") != null);
+    try t.expect(std.mem.indexOf(u8, text, "under Take control") != null);
+    try t.expect(std.mem.indexOf(u8, text, "must name it with 'pane'") != null);
+
+    // One tab: it is current, and the countdown is a fact.
+    const one = try tabsResult(arena, .headless, .{
+        .views = &.{.{ .pane = 2, .url = "https://other.test/", .focused = true, .watched = false, .idle = .{ .closes_in_ms = 4200 } }},
+        .helper = "ready",
+    });
+    const osc = (try mcp.expectToolResultShape(arena, "web_tabs", one)).object.get("structuredContent").?.object;
+    try t.expect(!osc.get("target_required").?.bool);
+    const ov = osc.get("views").?.array.items[0].object;
+    try t.expect(ov.get("current").?.bool);
+    try t.expectEqual(@as(i64, 4200), ov.get("closes_in_ms").?.integer);
 
     // GUI mode reports the helper view id beside the pane handle.
     const gui = try tabsResult(arena, .gui, .{ .views = &.{EXAMPLE}, .helper = "ready" });
@@ -6364,6 +6819,62 @@ test "web_tabs: views are structured, the text lane marks the current one" {
     try t.expectEqual(@as(i64, 12), gviews[0].object.get("pane").?.integer);
     try t.expectEqual(@as(i64, 12), gviews[0].object.get("view").?.integer);
     try t.expect(gviews[0].object.get("visible") != null);
+}
+
+test "a call naming no tab is refused while several are open, listing them" {
+    var arena_state = testArena();
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const t = std.testing;
+    const drv = Driver{ .gui = unusedBackend() };
+
+    // Two pages of ONE pane are one target: the default stays.
+    const one_pane: Views = .{ .views = &.{
+        .{ .pane = 5, .view = 50, .url = "https://a.test/" },
+        .{ .pane = 5, .view = 51, .url = "https://b.test/", .active = true },
+    }, .helper = "ready" };
+    const same = try resolveTarget(drv, arena, one_pane, null);
+    try t.expectEqual(@as(u32, 51), same.view.view);
+
+    const two: Views = .{ .views = &.{
+        .{ .pane = 5, .url = "https://a.test/", .title = "A", .label = "scan-a" },
+        .{ .pane = 9, .url = "https://b.test/", .title = "B" },
+    }, .helper = "ready" };
+    const refused = try resolveTarget(drv, arena, two, null);
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, refused.err, .{});
+    try t.expect(parsed.object.get("isError").?.bool);
+    const err = parsed.object.get("structuredContent").?.object.get("error").?.object;
+    try t.expectEqualStrings("target_required", err.get("code").?.string);
+    try t.expect(!err.get("retryable").?.bool);
+    const tabs = err.get("details").?.object.get("tabs").?.array.items;
+    try t.expectEqual(@as(usize, 2), tabs.len);
+    try t.expectEqual(@as(i64, 5), tabs[0].object.get("pane").?.integer);
+    try t.expectEqualStrings("scan-a", tabs[0].object.get("label").?.string);
+    try t.expect(tabs[1].object.get("label") == null);
+    try t.expectEqualStrings("https://b.test/", tabs[1].object.get("url").?.string);
+    const msg = err.get("message").?.string;
+    try t.expect(std.mem.indexOf(u8, msg, "pane 5 [scan-a] https://a.test/; pane 9 https://b.test/") != null);
+    try t.expect(std.mem.indexOfScalar(u8, refused.err, '\n') == null);
+
+    // Naming one always works, whatever else is open.
+    const named = try resolveTarget(drv, arena, two, 9);
+    try t.expectEqualStrings("https://b.test/", named.view.url);
+    // A name that is not open is not_found, never a fallback.
+    const missing = try resolveTarget(drv, arena, two, 77);
+    try t.expect(std.mem.indexOf(u8, missing.err, "\"not_found\"") != null);
+}
+
+test "an idle-closed tab is named as such when a late call addresses it" {
+    var arena_state = testArena();
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const t = std.testing;
+    defer g_tabs.deinit(tabs_alloc);
+    g_tabs.noteClosed(424242, "scan-a", "https://a.test/", 61_000, 5);
+    var engine = webdrive.Engine{ .gpa = arena, .dir = @constCast(""), .client_name = @constCast("") };
+    const out = try resolveTarget(.{ .headless = &engine }, arena, .{ .views = &.{.{ .pane = 1, .url = "x" }}, .helper = "ready" }, 424242);
+    try t.expect(std.mem.indexOf(u8, out.err, "closed automatically after 61s") != null);
+    try t.expect(std.mem.indexOf(u8, out.err, "[scan-a]") != null);
 }
 
 test "a refused certificate is a fact and a sentence on every result, and web_open says the page did not load" {
@@ -8021,22 +8532,32 @@ test "web_close / web_profiles / web_profile_reset result shapes" {
     const arena = arena_state.allocator();
     const t = std.testing;
 
-    // A named profile's close keeps its storage and says so.
-    const named = try closeResult(arena, .headless, 3, 1, 2, "work", false);
+    // A named profile's close keeps its storage and says so, and the
+    // reply echoes the closed tab: handle, url, label.
+    const named = try closeResult(arena, .{ .pane = 3, .view = 3, .url = "https://a.test/x", .label = "scan-a", .profile = "work", .profile_kind = "named" }, 1, 2, false);
     const np = try mcp.expectToolResultShape(arena, "web_close", named);
     const nsc = np.object.get("structuredContent").?.object;
     try t.expectEqual(@as(i64, 3), nsc.get("closed").?.integer);
+    try t.expectEqual(@as(i64, 3), nsc.get("view").?.integer);
+    try t.expectEqualStrings("https://a.test/x", nsc.get("url").?.string);
+    try t.expectEqualStrings("scan-a", nsc.get("label").?.string);
     try t.expectEqual(@as(i64, 1), nsc.get("remaining").?.integer);
     try t.expectEqual(@as(i64, 2), nsc.get("current").?.integer);
     try t.expectEqualStrings("work", nsc.get("profile").?.string);
     try t.expect(!nsc.get("profile_released").?.bool);
     const ntext = np.object.get("content").?.array.items[0].object.get("text").?.string;
-    try t.expect(std.mem.indexOf(u8, ntext, "closed view 3; 1 left") != null);
+    try t.expect(std.mem.indexOf(u8, ntext, "closed view 3 (https://a.test/x); 1 left") != null);
     try t.expect(std.mem.indexOf(u8, ntext, "keeps its storage") != null);
+    try t.expect(std.mem.indexOf(u8, ntext, "addresses view 2") != null);
+
+    // Several left: the reply says every call must name its tab.
+    const several = try closeResult(arena, .{ .pane = 4, .view = 4 }, 3, 0, false);
+    const sp = try mcp.expectToolResultShape(arena, "web_close", several);
+    try t.expect(std.mem.indexOf(u8, sp.object.get("content").?.array.items[0].object.get("text").?.string, "must name its tab") != null);
 
     // The last ephemeral view takes its identity with it, and the reply
     // states what a handle-less call now means (nothing).
-    const last = try closeResult(arena, .headless, 1, 0, 0, "", true);
+    const last = try closeResult(arena, .{ .pane = 1, .view = 1, .profile_kind = "ephemeral" }, 0, 0, true);
     const lp = try mcp.expectToolResultShape(arena, "web_close", last);
     try t.expect(lp.object.get("structuredContent").?.object.get("profile_released").?.bool);
     try t.expect(std.mem.indexOf(

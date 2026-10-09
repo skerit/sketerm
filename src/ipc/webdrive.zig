@@ -343,6 +343,15 @@ pub const View = struct {
     /// proceed on. Every other certificate error is refused; nothing is
     /// remembered engine-side either (`proto.CertDecision`). Owned.
     accept_fingerprint: ?[]u8 = null,
+    /// How many observers (a GUI's Watch / Take control) watch this view
+    /// and how many of them drive it, from `ev_view_watchers`. Only a
+    /// fact when the helper advertised `observe-notify`
+    /// (`Engine.watchKnown`); 0 otherwise means "not told".
+    watchers: u16 = 0,
+    controllers: u16 = 0,
+    /// When either count last changed (monotonic ms): the end of a watch
+    /// counts as the tab being used, so an idle countdown starts there.
+    watch_changed_ms: i64 = 0,
 
     fn deinit(self: *View, gpa: std.mem.Allocator) void {
         for (self.console.items) |line| gpa.free(line.text);
@@ -484,7 +493,33 @@ const SessionEnv = struct {
 
 /// Which identity a view is opened in. `.default` is byte-for-byte
 /// today's behaviour: context 0, the helper's shared in-memory jar.
-pub const ProfileSpec = union(enum) { default, named: []const u8, ephemeral };
+pub const ProfileSpec = union(enum) {
+    default,
+    named: []const u8,
+    ephemeral,
+
+    /// The identity as one human-readable phrase (`default cookie jar`,
+    /// `profile 'work'`, `a throwaway identity`), written into `buf`.
+    pub fn describe(self: ProfileSpec, buf: []u8) []const u8 {
+        return switch (self) {
+            .default => "the default cookie jar",
+            .ephemeral => "a throwaway identity",
+            .named => |n| std.fmt.bufPrint(buf, "profile '{s}'", .{n}) catch "a named profile",
+        };
+    }
+};
+
+/// Why a `web_open` that NAMES the browser cannot be served by the live
+/// one: the browser already carries another name, or that name with
+/// another identity. Either would silently re-label tabs other callers
+/// are working in.
+pub const LabelConflict = union(enum) {
+    none,
+    /// The browser's current name.
+    rename: []const u8,
+    /// The browser's identity, as `ProfileSpec.describe` words it.
+    identity: []const u8,
+};
 
 /// Every way a profile request can be refused BEFORE anything is
 /// opened. There is deliberately no shared-jar fallback: a caller that
@@ -742,9 +777,56 @@ const SpawnLock = struct {
 
 /// View ids are minted PROCESS-WIDE, not per engine: one route is one
 /// engine, and the handle the `web_*` tools hand back must name exactly
-/// one view across all of them. (`webface.zig` mints its ids the same
-/// way, for the same reason.)
-var g_next_view: u32 = 1;
+/// one view across all of them.
+///
+/// They are also RANDOM and NEVER REUSED for the life of the process.
+/// Several assistants (sub-agents) share one server's browser; with
+/// counting ids `1, 2, 3` one of them could act on another's tab by a
+/// guess or a typo, and a closed tab's id came back as somebody else's.
+/// The id is the wire view id too, so it stays inside the window a
+/// `multi-client` helper accepts (`proto.CONN_ID_WINDOW`).
+var g_view_ids: ViewIds = .{};
+
+/// The set of client view ids this process has ever issued, one bit each.
+const ViewIds = struct {
+    const SPACE: u32 = proto.CONN_ID_WINDOW;
+    issued: [SPACE / 8]u8 = @splat(0),
+    count: u32 = 0,
+
+    fn taken(self: *const ViewIds, id: u32) bool {
+        return self.issued[id / 8] & (@as(u8, 1) << @intCast(id % 8)) != 0;
+    }
+
+    /// The first never-issued id at or after `start` (wrapping, 0 is
+    /// never an id), marked issued; null once every id has been used.
+    fn claim(self: *ViewIds, start: u32) ?u32 {
+        if (self.count >= SPACE - 1) return null;
+        var id = start % SPACE;
+        while (true) : (id = (id + 1) % SPACE) {
+            if (id == 0 or self.taken(id)) continue;
+            self.issued[id / 8] |= @as(u8, 1) << @intCast(id % 8);
+            self.count += 1;
+            return id;
+        }
+    }
+};
+
+test "view ids are never reused and never 0, until the space runs out" {
+    const t = std.testing;
+    const ids = try t.allocator.create(ViewIds);
+    defer t.allocator.destroy(ids);
+    ids.* = .{};
+    try t.expectEqual(@as(?u32, 5), ids.claim(5));
+    // The same draw again lands on the next free id, never the old one.
+    try t.expectEqual(@as(?u32, 6), ids.claim(5));
+    try t.expectEqual(@as(?u32, 1), ids.claim(0));
+    try t.expectEqual(@as(?u32, 2), ids.claim(ViewIds.SPACE));
+    // A draw at the top of the space wraps past 0.
+    try t.expectEqual(@as(?u32, ViewIds.SPACE - 1), ids.claim(ViewIds.SPACE - 1));
+    try t.expectEqual(@as(?u32, 3), ids.claim(ViewIds.SPACE - 1));
+    ids.count = ViewIds.SPACE - 1;
+    try t.expect(ids.claim(77) == null);
+}
 
 /// Outcome of retiring an untrusted helper's cleanup owner.
 pub const UntrustedCleanup = enum {
@@ -893,11 +975,31 @@ fn untrustedParent(runtime: []const u8, buf: []u8) ?[:0]const u8 {
     return out;
 }
 
-fn nextViewId() u32 {
-    const id = g_next_view;
-    g_next_view +%= 1;
-    if (g_next_view == 0) g_next_view = 1;
-    return id;
+test "a named browser refuses a rename or an identity switch while it has tabs" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var e = Engine{ .gpa = arena, .dir = @constCast(""), .client_name = @constCast("") };
+    // Nothing named yet: any name is fine.
+    try t.expectEqual(LabelConflict.none, e.labelConflict("Scan A", .default));
+    e.setBrowserLabelFor("Scan A", .{ .named = "work" });
+    // No tabs: nobody works in it, so it may be renamed.
+    try t.expectEqual(LabelConflict.none, e.labelConflict("Scan B", .default));
+    const v = try arena.create(View);
+    v.* = .{ .id = 3, .w = 1, .h = 1 };
+    try e.views.append(arena, v);
+    try t.expectEqualStrings("Scan A", e.labelConflict("Scan B", .{ .named = "work" }).rename);
+    try t.expectEqualStrings("profile 'work'", e.labelConflict("Scan A", .default).identity);
+    try t.expectEqualStrings("profile 'work'", e.labelConflict("Scan A", .ephemeral).identity);
+    try t.expectEqual(LabelConflict.none, e.labelConflict("Scan A", .{ .named = "work" }));
+}
+
+/// A fresh, random, never-issued view id.
+fn nextViewId() error{ NoEntropy, ViewIdsExhausted }!u32 {
+    var raw: [4]u8 = undefined;
+    if (c.getentropy(&raw, raw.len) != 0) return error.NoEntropy;
+    return g_view_ids.claim(std.mem.readInt(u32, &raw, .little)) orelse error.ViewIdsExhausted;
 }
 
 pub const Engine = struct {
@@ -927,6 +1029,8 @@ pub const Engine = struct {
     /// assistant rather than an anonymous client. Owned.
     client_name: []u8,
     browser_label: [161]u8 = @splat(0),
+    /// `ProfileSpec.describe` of the open that set `browser_label`.
+    label_identity: [96]u8 = @splat(0),
     presence_started_ms: i64 = 0,
     /// Mux daemon socket for the watchable web session; null disables
     /// session hosting outright. Owned.
@@ -1383,6 +1487,15 @@ pub const Engine = struct {
         return self.state == .ready and self.has(.observe);
     }
 
+    /// Whether `View.watchers` is a FACT for this helper: it reports
+    /// watchers (`observe-notify`), or nobody can watch at all (no
+    /// `observe`). False before a handshake and on an older helper that
+    /// serves observers without telling the owner.
+    pub fn watchKnown(self: *const Engine) bool {
+        if (self.state != .ready) return false;
+        return self.has(.observe_notify) or !self.has(.observe);
+    }
+
     /// The helper socket a second client connects to, once the helper
     /// is serving; null before that.
     pub fn helperSocketPath(self: *const Engine, buf: []u8) ?[]const u8 {
@@ -1493,6 +1606,27 @@ pub const Engine = struct {
     pub fn setBrowserLabel(self: *Engine, label: []const u8) void {
         @import("../web/webpresence.zig").copyText(&self.browser_label, label);
         self.writePresence();
+    }
+
+    /// Name the browser AND pin the identity the naming open asked for.
+    pub fn setBrowserLabelFor(self: *Engine, label: []const u8, spec: ProfileSpec) void {
+        var buf: [96]u8 = undefined;
+        @import("../web/webpresence.zig").copyText(&self.label_identity, spec.describe(&buf));
+        self.setBrowserLabel(label);
+    }
+
+    /// Whether an open naming the browser `name` in `spec` conflicts with
+    /// the live browser. A browser with no tabs is free to be renamed: no
+    /// caller is working in it.
+    pub fn labelConflict(self: *const Engine, name: []const u8, spec: ProfileSpec) LabelConflict {
+        if (self.views.items.len == 0) return .none;
+        const label = std.mem.sliceTo(&self.browser_label, 0);
+        if (label.len == 0) return .none;
+        if (!std.mem.eql(u8, label, name)) return .{ .rename = label };
+        const pinned = std.mem.sliceTo(&self.label_identity, 0);
+        var buf: [96]u8 = undefined;
+        if (pinned.len > 0 and !std.mem.eql(u8, pinned, spec.describe(&buf))) return .{ .identity = pinned };
+        return .none;
     }
 
     fn removePresence(self: *Engine) void {
@@ -2190,7 +2324,7 @@ pub const Engine = struct {
         errdefer if (owned_pol) |*p| freePolicy(self.gpa, p);
         var owned_cap: ?CaptureFilter = if (capture_arg) |f| try dupeCapture(self.gpa, f.*) else null;
         errdefer if (owned_cap) |*f| freeCapture(self.gpa, f);
-        const new_id = nextViewId();
+        const new_id = try nextViewId();
         const v = try self.gpa.create(View);
         var registered = false;
         v.* = .{
@@ -3893,6 +4027,14 @@ pub const Engine = struct {
             .ev_title => {
                 const ev = proto.decode(proto.EvTitle, frame.payload) catch return;
                 if (self.findView(ev.view)) |v| self.setOwned(&v.title, ev.title);
+            },
+            .ev_view_watchers => {
+                const ev = proto.decode(proto.EvViewWatchers, frame.payload) catch return;
+                if (self.findView(ev.view)) |v| {
+                    v.watchers = ev.watchers;
+                    v.controllers = ev.controllers;
+                    v.watch_changed_ms = clock.nowMs();
+                }
             },
             .ev_flushed => {
                 const ev = proto.decode(proto.EvFlushed, frame.payload) catch return;

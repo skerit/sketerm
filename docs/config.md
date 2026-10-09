@@ -1031,6 +1031,7 @@ pane settings bundle and the two have nothing in common.
 | `tools` | string | Tool-exposure spec. Grammar and group names in `docs/mcp.md`. Empty = every tool. |
 | `web_gui` | bool | Let the `web_*` tools (and ONLY those) use your own browser and logins: a running sketerm GUI, or `sketerm web` started for them. Default false = a private headless browser with its own empty cookie jar. See "Your own browser" in `docs/mcp.md`. |
 | `web_max_fps` | integer 1-240 | Default CEF paint cap for new headless MCP views, 60 when omitted. A named MCP profile overrides the bare `[mcp]` value; `web_open.max_fps` overrides both. GUI monitor-driven pacing is unchanged. |
+| `web_idle_close_secs` | integer 0-604800 | Seconds an assistant-owned (headless) browser tab may go untouched by any web_* call before it closes itself, 1800 when omitted; 0 = never. A tab someone is watching or driving through the AI badge (Watch / Take control) never closes, and its countdown restarts when the watch ends. GUI tabs never close on their own. `web_tabs` shows the countdown per tab. |
 
 ```
 [mcp]

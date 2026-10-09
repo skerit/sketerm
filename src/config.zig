@@ -715,10 +715,14 @@ pub const McpProfile = struct {
     web_gui: ?bool = null,
     /// Headless browser cap; null leaves the MCP default of 60 FPS.
     web_max_fps: ?u16 = null,
+    /// Seconds an unwatched headless tab may go untouched before it
+    /// closes itself; 0 = never. Null leaves the built-in default
+    /// (`ipc/webtabs.zig` DEFAULT_IDLE_CLOSE_SECS).
+    web_idle_close_secs: ?u32 = null,
 
     /// Whether serializing this record writes anything.
     pub fn isEmpty(self: *const McpProfile) bool {
-        return self.tools.len == 0 and self.web_gui == null and self.web_max_fps == null;
+        return self.tools.len == 0 and self.web_gui == null and self.web_max_fps == null and self.web_idle_close_secs == null;
     }
 
     pub fn cloneInto(self: *const McpProfile, arena: std.mem.Allocator) error{OutOfMemory}!McpProfile {
@@ -2288,6 +2292,10 @@ fn applyMcpKv(prof: *McpProfile, arena: std.mem.Allocator, key: []const u8, valu
         const fps = std.fmt.parseInt(u16, value, 10) catch return error.BadValue;
         if (fps == 0 or fps > @import("web/protocol.zig").MAX_VIEW_FPS) return error.BadValue;
         prof.web_max_fps = fps;
+    } else if (std.mem.eql(u8, key, "web_idle_close_secs")) {
+        const secs = std.fmt.parseInt(u32, value, 10) catch return error.BadValue;
+        if (secs > @import("ipc/webtabs.zig").MAX_IDLE_CLOSE_SECS) return error.BadValue;
+        prof.web_idle_close_secs = secs;
     } else return error.UnknownKey;
 }
 
@@ -2297,6 +2305,7 @@ fn serialiseMcpKeys(prof: *const McpProfile, w: *std.Io.Writer) !void {
     if (prof.tools.len > 0) try w.print("tools = {s}\n", .{prof.tools});
     if (prof.web_gui) |v| try w.print("web_gui = {s}\n", .{if (v) "true" else "false"});
     if (prof.web_max_fps) |v| try w.print("web_max_fps = {d}\n", .{v});
+    if (prof.web_idle_close_secs) |v| try w.print("web_idle_close_secs = {d}\n", .{v});
 }
 
 fn applyDomainKv(dom: *Domain, arena: std.mem.Allocator, key: []const u8, value: []const u8) !void {
@@ -4440,11 +4449,13 @@ test "config: bare [mcp] defaults and web_gui parse and round-trip" {
         \\[mcp]
         \\web_gui = true
         \\web_max_fps = 30
+        \\web_idle_close_secs = 600
         \\
         \\[mcp.locked]
         \\tools = files:ro
         \\web_gui = off
         \\web_max_fps = 15
+        \\web_idle_close_secs = 0
         \\
         \\[mcp.quiet]
         \\tools = app
@@ -4472,6 +4483,9 @@ test "config: bare [mcp] defaults and web_gui parse and round-trip" {
     try std.testing.expectEqual(true, cfg2.mcp.web_gui.?);
     try std.testing.expectEqual(@as(u16, 30), cfg2.mcp.web_max_fps.?);
     try std.testing.expectEqual(@as(u16, 15), cfg2.mcpProfile("locked").?.web_max_fps.?);
+    try std.testing.expectEqual(@as(u32, 600), cfg2.mcp.web_idle_close_secs.?);
+    try std.testing.expectEqual(@as(u32, 0), cfg2.mcpProfile("locked").?.web_idle_close_secs.?);
+    try std.testing.expect(cfg2.mcpProfile("quiet").?.web_idle_close_secs == null);
     try std.testing.expectEqual(false, cfg2.mcpProfile("locked").?.web_gui.?);
     try std.testing.expect(cfg2.mcpProfile("quiet").?.web_gui == null);
 }

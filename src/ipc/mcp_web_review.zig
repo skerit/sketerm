@@ -185,6 +185,10 @@ pub fn tool(drv: web.Driver, arena: std.mem.Allocator, name: []const u8, args: J
 
     var console_cursor: u32 = if (previous) |cp| cp.console_cursor else 0;
     var res = mcp.Res.init(arena);
+    try web.tabEcho(&res, switch (drv) {
+        .gui => .gui,
+        .headless => .headless,
+    }, view);
     try res.fact("captured_at_ms", clock.wallMs());
     try res.fact("inspection", value);
     try summary(&res, value);

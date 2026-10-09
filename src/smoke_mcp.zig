@@ -770,6 +770,17 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         say("smoke-mcp: focused response-body capture ok");
         return 0;
     }
+    if (c.getenv("SKETERM_SMOKE_MCP_WEBTABS_ONLY") != null) {
+        var bin_buf: [4096:0]u8 = undefined;
+        const web_bin = resolveWebBin(&bin_buf) orelse fail("sketerm-webengine not built for the tab-targeting stage");
+        _ = c.setenv("SKETERM_WEB_BIN", web_bin, 1);
+        defer _ = c.unsetenv("SKETERM_WEB_BIN");
+        _ = c.setenv("SKETERM_WEB_BROKER_ENGINE", "0", 1);
+        defer _ = c.unsetenv("SKETERM_WEB_BROKER_ENGINE");
+        webTabsStage(allocator, exe, rt);
+        say("smoke-mcp: focused shared-browser tab targeting ok");
+        return 0;
+    }
     if (c.getenv("SKETERM_SMOKE_MCP_WEBSTREAM_ONLY") != null) {
         var bin_buf: [4096:0]u8 = undefined;
         const web_bin = resolveWebBin(&bin_buf) orelse fail("built sketerm-webengine missing for the stream stage");
@@ -2343,6 +2354,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             say("smoke-mcp: enforced network policy (real CEF) ok");
             webCaptureStage(allocator, exe, rt);
             say("smoke-mcp: response-body capture (real CEF) ok");
+            webTabsStage(allocator, exe, rt);
+            say("smoke-mcp: shared-browser tab targeting (real CEF) ok");
             _ = c.unsetenv("SKETERM_WEB_BROKER_ENGINE");
             webSharedProfileStage(allocator, exe, rt);
             say("smoke-mcp: broker-owned shared profiles (real CEF) ok");
@@ -4568,6 +4581,212 @@ fn webStreamStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const 
 
 /// Fresh roots in both launch modes: a warm cache hides Chromium's first-run
 /// path, which used to hang before the helper could bind its control socket.
+/// A second client of the MCP server's browser helper that WATCHES one
+/// page, the way the GUI's Watch does (capability "observe").
+const Watcher = struct {
+    fd: c_int,
+    gpa: std.mem.Allocator,
+    in: std.ArrayList(u8) = .empty,
+    /// Latest announced target whose url contains the wanted marker.
+    target: u32 = 0,
+    subscribed: bool = false,
+
+    fn connect(gpa: std.mem.Allocator, path: []const u8) Watcher {
+        const fd = c.socket(c.AF_UNIX, c.SOCK_STREAM, 0);
+        if (fd < 0) fail("watcher socket");
+        var addr = std.mem.zeroes(c.struct_sockaddr_un);
+        addr.sun_family = c.AF_UNIX;
+        if (path.len >= addr.sun_path.len) fail("watcher socket path too long");
+        @memcpy(addr.sun_path[0..path.len], path);
+        if (c.connect(fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un)) != 0) fail("watcher could not connect to the helper socket");
+        var w = Watcher{ .fd = fd, .gpa = gpa };
+        w.send(webproto.Hello{ .proto = webproto.PROTO_VERSION, .client_name = "smoke-mcp-watch" });
+        w.send(webproto.ObserveEnable{ .enable = 1 });
+        return w;
+    }
+
+    fn send(self: *Watcher, value: anytype) void {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(self.gpa);
+        webproto.encode(self.gpa, &out, value) catch fail("watcher encode");
+        var off: usize = 0;
+        while (off < out.items.len) {
+            const n = c.write(self.fd, out.items.ptr + off, out.items.len - off);
+            if (n <= 0) fail("watcher write");
+            off += @intCast(n);
+        }
+    }
+
+    /// Read for `ms`, remembering the target announced with `marker` in
+    /// its url and whether our subscription was acknowledged.
+    fn pump(self: *Watcher, ms: i64, marker: []const u8) void {
+        const deadline = nowMs() + ms;
+        while (nowMs() < deadline) {
+            var pfd = c.struct_pollfd{ .fd = self.fd, .events = c.POLLIN, .revents = 0 };
+            if (c.poll(&pfd, 1, 50) <= 0) continue;
+            var tmp: [65536]u8 = undefined;
+            const n = c.read(self.fd, &tmp, tmp.len);
+            if (n <= 0) fail("the helper closed the watcher connection");
+            self.in.appendSlice(self.gpa, tmp[0..@intCast(n)]) catch fail("oom");
+            var reader = webproto.Reader.init(self.in.items);
+            while (reader.next() catch fail("watcher frame")) |frame| switch (frame.tag) {
+                .ev_observe_view => {
+                    const ev = webproto.decode(webproto.EvObserveView, frame.payload) catch fail("ev_observe_view");
+                    if (ev.state == webproto.observe_view_present and std.mem.indexOf(u8, ev.url, marker) != null) self.target = ev.target;
+                },
+                .ev_observe_state => {
+                    const ev = webproto.decode(webproto.EvObserveState, frame.payload) catch fail("ev_observe_state");
+                    if (ev.state == webproto.observe_subscribed) self.subscribed = true;
+                },
+                else => {},
+            };
+            const used = reader.consumed();
+            std.mem.copyForwards(u8, self.in.items[0 .. self.in.items.len - used], self.in.items[used..]);
+            self.in.shrinkRetainingCapacity(self.in.items.len - used);
+        }
+    }
+
+    fn close(self: *Watcher) void {
+        _ = c.close(self.fd);
+        self.in.deinit(self.gpa);
+    }
+};
+
+/// Stage wt: several callers sharing one server's browser. Two tabs make
+/// a handle-less call a refusal that lists them; labels tag and bulk
+/// close tabs; ids are random and never come back; every reply echoes
+/// the tab and its url; a rename or identity switch of the live browser
+/// is refused; an idle tab closes itself unless someone watches it.
+fn webTabsStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) void {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // A short idle time, from config like a user would set it.
+    var cfg_dir_buf: [300]u8 = undefined;
+    const cfg_dir = std.fmt.bufPrintZ(&cfg_dir_buf, "{s}/config/sketerm", .{rt}) catch unreachable;
+    _ = c.mkdir(cfg_dir.ptr, 0o700);
+    var cfg_buf: [320]u8 = undefined;
+    const cfg_path = std.fmt.bufPrintZ(&cfg_buf, "{s}/config.conf", .{cfg_dir}) catch unreachable;
+    @import("util/atomicwrite.zig").writeFileExact(cfg_path, "[mcp]\nweb_idle_close_secs = 8\n", 0o600) catch fail("write idle config");
+    defer _ = c.unlink(cfg_path.ptr);
+
+    var m = Mcp.spawn(allocator, exe, &.{});
+    m.initialize();
+    var a: [512]u8 = undefined;
+    var b: [512]u8 = undefined;
+
+    m.sendTool("web_open", "{\"url\":\"data:text/html,<title>wt-a</title>tab-a\",\"label\":\"scan-a\",\"name\":\"Scan\",\"snapshot\":\"none\"}");
+    const open_a = capSc(arena, m.recvLine(60_000), "wt: open a", false);
+    const va: u32 = @intCast(capInt(open_a, "view"));
+    expectFact(open_a, "label", "scan-a", "wt: web_open does not echo its label");
+    if (std.mem.indexOf(u8, scStr(open_a, "url", "wt url"), "wt-a") == null) fail("wt: web_open does not echo the tab's url");
+    m.sendTool("web_open", "{\"url\":\"data:text/html,<title>wt-b</title>tab-b\",\"label\":\"scan-b\",\"snapshot\":\"none\"}");
+    const vb: u32 = @intCast(capInt(capSc(arena, m.recvLine(60_000), "wt: open b", false), "view"));
+    if (va == vb or va == 0 or vb == 0) fail("wt: two tabs did not get two handles");
+
+    // (1) No target with two tabs: refused, listing both with labels.
+    const refused = capSc(arena, m.callTool("web_snapshot", "{}"), "wt: handle-less snapshot", true);
+    const err = refused.get("error").?.object;
+    expectFact(err, "code", "target_required", "wt: a handle-less call with two tabs is not target_required");
+    const listed = err.get("details").?.object.get("tabs").?.array.items;
+    if (listed.len != 2) fail("wt: the refusal does not list both tabs");
+    var saw_a = false;
+    for (listed) |tab| {
+        if (tab.object.get("view").?.integer == va) {
+            saw_a = true;
+            if (!std.mem.eql(u8, tab.object.get("label").?.string, "scan-a")) fail("wt: the refusal lost tab a's label");
+        }
+    }
+    if (!saw_a) fail("wt: the refusal does not list tab a");
+    say("smoke-mcp: wt1 a handle-less call with two tabs is refused as target_required, listing them");
+
+    // (2) Every reply echoes the tab and its current url.
+    const snap_b = capSc(arena, m.callTool("web_snapshot", std.fmt.bufPrint(&a, "{{\"pane\":{d}}}", .{vb}) catch unreachable), "wt: snapshot b", false);
+    if (capInt(snap_b, "view") != vb or std.mem.indexOf(u8, scStr(snap_b, "url", "wt url b"), "wt-b") == null)
+        fail("wt: a tab-acting reply does not echo its tab and url");
+    expectFact(snap_b, "label", "scan-b", "wt: a tab-acting reply does not echo its label");
+    say("smoke-mcp: wt2 replies echo the tab id, url and label");
+
+    // (3) The live browser cannot be renamed or switch identity.
+    const rename = capSc(arena, m.callTool("web_open", "{\"name\":\"Other\",\"snapshot\":\"none\"}"), "wt: rename", true);
+    expectFact(rename.get("error").?.object, "code", "conflict", "wt: a rename of the live browser was not a conflict");
+    if (std.mem.indexOf(u8, scStr(rename.get("error").?.object, "message", "wt rename msg"), "'Scan'") == null) fail("wt: the rename refusal does not name the browser");
+    const ident = capSc(arena, m.callTool("web_open", "{\"name\":\"Scan\",\"ephemeral\":true,\"snapshot\":\"none\"}"), "wt: identity switch", true);
+    expectFact(ident.get("error").?.object, "code", "conflict", "wt: an identity switch under the browser's name was not a conflict");
+    const tabs_now = capSc(arena, m.callTool("web_tabs", "{}"), "wt: tabs after refusals", false);
+    if (capInt(tabs_now, "count") != 2) fail("wt: a refused web_open opened a tab anyway");
+    if (!tabs_now.get("target_required").?.bool or capInt(tabs_now, "idle_close_secs") != 8) fail("wt: web_tabs does not state target_required / idle_close_secs from config");
+    say("smoke-mcp: wt3 renaming the live browser or switching its identity is refused, nothing opened");
+
+    // (4) Bulk close by label, and ids never come back.
+    var seen: [16]u32 = undefined;
+    var n_seen: usize = 0;
+    seen[0] = va;
+    seen[1] = vb;
+    n_seen = 2;
+    var round: usize = 0;
+    while (round < 3) : (round += 1) {
+        // Keep tab a in use: this part is not about idle closing.
+        _ = capSc(arena, m.callTool("web_read", std.fmt.bufPrint(&b, "{{\"pane\":{d}}}", .{va}) catch unreachable), "wt: touch a", false);
+        m.sendTool("web_open", "{\"url\":\"data:text/html,<title>wt-b2</title>b2\",\"label\":\"scan-b\",\"snapshot\":\"none\"}");
+        const v = capInt(capSc(arena, m.recvLine(60_000), "wt: open b2", false), "view");
+        for (seen[0..n_seen]) |old| if (old == v) fail("wt: a tab id was handed out twice");
+        seen[n_seen] = @intCast(v);
+        n_seen += 1;
+        const bulk = capSc(arena, m.callTool("web_close", "{\"label\":\"scan-b\"}"), "wt: close by label", false);
+        if (capInt(bulk, "count") != @as(i64, if (round == 0) 2 else 1)) fail("wt: web_close label did not close exactly the labelled tabs");
+        if (capInt(bulk, "remaining") != 1 or capInt(bulk, "current") != va) fail("wt: web_close label touched another tab or misreports what is left");
+    }
+    var big = false;
+    for (seen[0..n_seen]) |v| if (v > 1000) {
+        big = true;
+    };
+    if (!big) fail("wt: tab ids look like a small counter");
+    say("smoke-mcp: wt4 web_close label closes exactly its tabs; ids are random and never reused");
+
+    // (5) Idle close spares a watched tab. Tab a is watched by a second
+    // helper client (the GUI's Watch); tab d is not.
+    _ = capSc(arena, m.callTool("web_read", std.fmt.bufPrint(&b, "{{\"pane\":{d}}}", .{va}) catch unreachable), "wt: touch a", false);
+    m.sendTool("web_open", "{\"url\":\"data:text/html,<title>wt-d</title>tab-d\",\"label\":\"idle-d\",\"snapshot\":\"none\"}");
+    const vd: u32 = @intCast(capInt(capSc(arena, m.recvLine(60_000), "wt: open d", false), "view"));
+    const caps = capSc(arena, m.callTool("capabilities", "{}"), "wt: caps", false);
+    const rules = caps.get("web_tab_rules").?.object;
+    if (!rules.get("target_required").?.bool or rules.get("idle_close_watch_aware").? != .bool or !rules.get("idle_close_watch_aware").?.bool)
+        fail("wt: capabilities.web_tab_rules does not report a watch-aware idle close");
+    expectFact(rules, "ids", "random", "wt: web_tab_rules.ids is not random");
+    const sock = scStr(caps, "web_socket", "wt web_socket");
+    var w = Watcher.connect(allocator, sock);
+    defer w.close();
+    w.pump(3000, "wt-a");
+    if (w.target == 0) fail("wt: the watcher was not announced tab a");
+    w.send(webproto.ObserveSubscribe{ .view = 1, .target = w.target, .control = 0 });
+    w.pump(1000, "wt-a");
+    if (!w.subscribed) fail("wt: the watcher's subscription was refused");
+    const watched = capSc(arena, m.callTool("web_tabs", "{}"), "wt: tabs watched", false);
+    for (watched.get("views").?.array.items) |tab| {
+        const id = tab.object.get("view").?.integer;
+        const wv = tab.object.get("watched").?;
+        if (id == va and (wv != .bool or !wv.bool)) fail("wt: web_tabs does not report the watched tab");
+        if (id == vd and (wv != .bool or wv.bool or tab.object.get("closes_in_ms").? != .integer)) fail("wt: the unwatched tab has no idle countdown");
+    }
+    // Wait past the idle time without touching either tab.
+    w.pump(11_000, "wt-a");
+    const after_idle = capSc(arena, m.callTool("web_tabs", "{}"), "wt: tabs after idle", false);
+    if (capInt(after_idle, "count") != 1 or after_idle.get("views").?.array.items[0].object.get("view").?.integer != va)
+        fail("wt: idle close did not close exactly the unwatched tab");
+    const late = capSc(arena, m.callTool("web_read", std.fmt.bufPrint(&b, "{{\"pane\":{d}}}", .{vd}) catch unreachable), "wt: late call on idle tab", true);
+    if (std.mem.indexOf(u8, scStr(late.get("error").?.object, "message", "wt late msg"), "closed automatically") == null)
+        fail("wt: a call on an idle-closed tab is not told why it is gone");
+    // The watch ends: the countdown starts then, and the tab goes.
+    w.send(webproto.ViewDestroy{ .view = 1 });
+    w.pump(12_000, "wt-a");
+    const gone = capSc(arena, m.callTool("web_tabs", "{}"), "wt: tabs after unwatch", false);
+    if (capInt(gone, "count") != 0) fail("wt: the formerly watched tab did not close after its watch ended");
+    say("smoke-mcp: wt5 an idle tab closes itself, a watched one is spared until its watch ends");
+
+    m.closeStdinWait();
+}
+
 fn webStartupStage(allocator: std.mem.Allocator, exe: [*:0]const u8) void {
     defer _ = c.unsetenv("SKETERM_WEB_SESSION");
     for ([_][*:0]const u8{ "cold-headless", "cold-session" }, 0..) |name, index| {
@@ -4635,8 +4854,8 @@ fn webStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) vo
     m.sendTool("web_open", std.fmt.bufPrint(&args_buf, "{{\"url\":\"file://{s}\"}}", .{page_path}) catch unreachable);
     const opened = m.recvLine(60_000);
     if (std.mem.indexOf(u8, opened, "isError") != null) fail("web_open failed headlessly (the NoGuiSocket regression)");
-    if (std.mem.indexOf(u8, opened, "\"view\":1") == null)
-        fail("web_open did not hand back a headless view handle in structuredContent");
+    const view1 = viewHandleOf(opened);
+    if (view1 == 0) fail("web_open did not hand back a headless view handle in structuredContent");
     if (std.mem.indexOf(u8, opened, "PressMe") == null or std.mem.indexOf(u8, opened, "BEFORECLICK") == null)
         fail("web_open's first snapshot is missing the page's nodes");
     const btn = nodeIdBefore(opened, "PressMe") orelse fail("cannot read the button's node id from the snapshot");
@@ -4762,30 +4981,36 @@ fn webStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) vo
     if (std.mem.indexOf(u8, slow, "\"document\":1") == null)
         fail("the slow page is not the view's FIRST document (a blank one was minted first)");
 
-    // Two views exist now, and the newest is what a handle-less call
-    // means: web_tabs must SAY so rather than leaving it to be guessed.
+    // Two views exist now: a handle-less call would be a guess, so it
+    // is refused and web_tabs says every call must name its tab.
+    const view2 = viewHandleOf(slow);
+    if (view2 == 0) fail("the slow web_open returned no view handle");
+    if (view2 == view1) fail("two views share one handle");
     const tabs2 = m.callTool("web_tabs", "{}");
-    if (std.mem.indexOf(u8, tabs2, "\"view\":2") == null)
+    if (std.mem.indexOf(u8, tabs2, std.fmt.bufPrint(&probe_buf, "\"view\":{d}", .{view2}) catch unreachable) == null)
         fail("web_tabs does not list the second headless view");
-    if (std.mem.indexOf(u8, tabs2, "\"current\":true") == null)
-        fail("web_tabs does not mark the current view");
-    if (std.mem.indexOf(u8, tabs2, "* = the view a web_* call with no 'pane' addresses") == null)
-        fail("web_tabs does not say which view a handle-less call addresses");
-    // Addressing the FIRST view explicitly makes it current again.
-    const back1 = m.callTool("web_read", "{\"pane\":1}");
+    if (std.mem.indexOf(u8, tabs2, "\"target_required\":true") == null or std.mem.indexOf(u8, tabs2, "\"current\":true") != null)
+        fail("web_tabs still names a current view while two are open");
+    const guessed = m.callTool("web_read", "{}");
+    if (std.mem.indexOf(u8, guessed, "\"target_required\"") == null)
+        fail("a handle-less web_read with two tabs open was not refused");
+    const back1 = m.callTool("web_read", std.fmt.bufPrint(&args_buf, "{{\"pane\":{d}}}", .{view1}) catch unreachable);
     if (std.mem.indexOf(u8, back1, "HEADLESS-READ-MARKER") == null)
         fail("web_read against an explicit handle did not reach that view");
+    // Back to one tab: the rest of this stage addresses it implicitly.
+    const closed2 = m.callTool("web_close", std.fmt.bufPrint(&args_buf, "{{\"pane\":{d}}}", .{view2}) catch unreachable);
+    if (std.mem.indexOf(u8, closed2, "web-slow.html") == null) fail("web_close did not echo the url it closed");
     const tabs3 = m.callTool("web_tabs", "{}");
-    const cur_at = std.mem.indexOf(u8, tabs3, "\"current\":true") orelse
-        fail("web_tabs stopped marking a current view");
-    if (std.mem.lastIndexOf(u8, tabs3[0..cur_at], "\"view\":1") == null)
-        fail("an explicit handle did not become the current view");
+    if (std.mem.indexOf(u8, tabs3, "\"current\":true") == null)
+        fail("web_tabs does not mark the one open view as current");
 
     // web_tabs names the backend and the handle kind honestly.
     const tabs = m.callTool("web_tabs", "{}");
     if (std.mem.indexOf(u8, tabs, "\"backend\":\"headless\"") == null or
-        std.mem.indexOf(u8, tabs, "\"view\":1") == null)
+        std.mem.indexOf(u8, tabs, std.fmt.bufPrint(&probe_buf, "\"view\":{d}", .{view1}) catch unreachable) == null)
         fail("web_tabs does not list the headless view");
+    // The nested stages each open and drive one tab of their own.
+    _ = m.callTool("web_close", std.fmt.bufPrint(&args_buf, "{{\"pane\":{d}}}", .{view1}) catch unreachable);
 
     webReviewStage(&m, rt);
     webHandStage(&m, rt);
@@ -4823,7 +5048,9 @@ fn webStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) vo
             if (std.mem.indexOf(u8, opened_p, "\"profile\":\"smoke\"") == null or
                 std.mem.indexOf(u8, opened_p, "\"profile_kind\":\"named\"") == null)
                 fail("web_open did not report the profile its view lives in");
-            const wrote = m.callTool("web_eval", "{\"code\":\"" ++ COOKIE ++ "\"}");
+            var pa: [256]u8 = undefined;
+            const p1 = viewHandleOf(opened_p);
+            const wrote = m.callTool("web_eval", std.fmt.bufPrint(&pa, "{{\"pane\":{d},\"code\":\"" ++ COOKIE ++ "\"}}", .{p1}) catch unreachable);
             if (std.mem.indexOf(u8, wrote, "isError") != null) fail("could not write a cookie in the profile view");
 
             // The jar is a real directory named {profile}-{id} under the
@@ -4845,20 +5072,24 @@ fn webStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) vo
             if (!fileExists(jar)) fail("the profile's cookie jar directory does not exist on disk");
 
             // Close and reopen the SAME profile: the cookie survives.
-            const closed = m.callTool("web_close", "{}");
+            const closed = m.callTool("web_close", std.fmt.bufPrint(&pa, "{{\"pane\":{d}}}", .{p1}) catch unreachable);
             if (std.mem.indexOf(u8, closed, "\"profile\":\"smoke\"") == null or
                 std.mem.indexOf(u8, closed, "\"profile_released\":false") == null)
                 fail("web_close did not report that a named profile keeps its storage");
             m.sendTool("web_open", std.fmt.bufPrint(&args_buf, "{{\"url\":\"{s}\",\"profile\":\"smoke\"}}", .{origin}) catch unreachable);
-            if (std.mem.indexOf(u8, m.recvLine(60_000), "isError") != null) fail("could not reopen the profile");
-            const reread = m.callTool("web_eval", "{\"code\":\"document.cookie\"}");
+            const reopened = m.recvLine(60_000);
+            if (std.mem.indexOf(u8, reopened, "isError") != null) fail("could not reopen the profile");
+            const p2 = viewHandleOf(reopened);
+            const reread = m.callTool("web_eval", std.fmt.bufPrint(&pa, "{{\"pane\":{d},\"code\":\"document.cookie\"}}", .{p2}) catch unreachable);
             if (std.mem.indexOf(u8, reread, "smoke=inprofile") == null)
                 fail("the profile's cookie did not survive web_close (its jar is not persistent)");
 
             // Isolation: the DEFAULT jar has never seen that cookie.
             m.sendTool("web_open", std.fmt.bufPrint(&args_buf, "{{\"url\":\"{s}\"}}", .{origin}) catch unreachable);
-            if (std.mem.indexOf(u8, m.recvLine(60_000), "isError") != null) fail("could not open a default-jar view");
-            const plain = m.callTool("web_eval", "{\"code\":\"document.cookie\"}");
+            const plain_open = m.recvLine(60_000);
+            if (std.mem.indexOf(u8, plain_open, "isError") != null) fail("could not open a default-jar view");
+            const pd = viewHandleOf(plain_open);
+            const plain = m.callTool("web_eval", std.fmt.bufPrint(&pa, "{{\"pane\":{d},\"code\":\"document.cookie\"}}", .{pd}) catch unreachable);
             if (std.mem.indexOf(u8, plain, "smoke=inprofile") != null)
                 fail("a profile's cookie leaked into the shared default jar");
 
@@ -4869,10 +5100,11 @@ fn webStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) vo
             if (std.mem.indexOf(u8, eph, "isError") != null) fail("could not open an ephemeral view");
             if (std.mem.indexOf(u8, eph, "\"profile_kind\":\"ephemeral\"") == null)
                 fail("web_open did not report the ephemeral identity");
-            const eph_cookie = m.callTool("web_eval", "{\"code\":\"document.cookie\"}");
+            const pe = viewHandleOf(eph);
+            const eph_cookie = m.callTool("web_eval", std.fmt.bufPrint(&pa, "{{\"pane\":{d},\"code\":\"document.cookie\"}}", .{pe}) catch unreachable);
             if (std.mem.indexOf(u8, eph_cookie, "smoke=inprofile") != null)
                 fail("a profile's cookie leaked into an ephemeral identity");
-            const eph_closed = m.callTool("web_close", "{}");
+            const eph_closed = m.callTool("web_close", std.fmt.bufPrint(&pa, "{{\"pane\":{d}}}", .{pe}) catch unreachable);
             if (std.mem.indexOf(u8, eph_closed, "\"profile_released\":true") == null)
                 fail("closing the last ephemeral view did not destroy its identity");
 
@@ -4880,6 +5112,9 @@ fn webStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) vo
             const busy = m.callTool("web_profile_reset", "{\"profile\":\"smoke\"}");
             if (std.mem.indexOf(u8, busy, "\"code\":\"conflict\"") == null)
                 fail("web_profile_reset erased a profile that was in use");
+            // The stages below drive one tab of their own each.
+            _ = m.callTool("web_close", std.fmt.bufPrint(&pa, "{{\"pane\":{d}}}", .{p2}) catch unreachable);
+            _ = m.callTool("web_close", std.fmt.bufPrint(&pa, "{{\"pane\":{d}}}", .{pd}) catch unreachable);
         }
     }
 
@@ -6195,6 +6430,8 @@ fn webProfileFakeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []c
         m.initialize();
         m.sendTool("web_open", "{\"url\":\"https://smoke.invalid/p\",\"profile\":\"work\"}");
         const opened = m.recvLine(60_000);
+        // Read now: the reply lives in the shared scratch buffer.
+        const first_view = viewHandleOf(opened);
         if (std.mem.indexOf(u8, opened, "\"isError\":true") != null)
             fail("web_open with a profile failed against the context-capable fake");
         if (std.mem.indexOf(u8, opened, "\"profile\":\"work\"") == null or
@@ -6236,16 +6473,21 @@ fn webProfileFakeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []c
             std.mem.indexOf(u8, caps, "\"web_profile_store\":") == null)
             fail("capabilities does not advertise browser profiles");
 
-        // (e) web_close removes the view and RE-HOMES current.
+        // (e) web_close removes the named view; with one left, that one
+        // is what a handle-less call means again.
         m.sendTool("web_open", "{\"url\":\"https://smoke.invalid/second\"}");
-        _ = m.recvLine(60_000);
-        const closed = m.callTool("web_close", "{}");
-        if (std.mem.indexOf(u8, closed, "\"closed\":2") == null or
-            std.mem.indexOf(u8, closed, "\"current\":1") == null)
-            fail("web_close did not close the current view and re-home 'current'");
+        const second_view = viewHandleOf(m.recvLine(60_000));
+        if (std.mem.indexOf(u8, m.callTool("web_close", "{}"), "\"target_required\"") == null)
+            fail("a handle-less web_close with two tabs open was not refused");
+        var close_buf: [96]u8 = undefined;
+        const closed = m.callTool("web_close", std.fmt.bufPrint(&close_buf, "{{\"pane\":{d}}}", .{second_view}) catch unreachable);
+        var want_buf2: [96]u8 = undefined;
+        if (std.mem.indexOf(u8, closed, std.fmt.bufPrint(&want_buf2, "\"closed\":{d}", .{second_view}) catch unreachable) == null or
+            std.mem.indexOf(u8, closed, std.fmt.bufPrint(&close_buf, "\"current\":{d}", .{first_view}) catch unreachable) == null)
+            fail("web_close did not close the named view and name the one left");
         const after = m.callTool("web_tabs", "{}");
         if (std.mem.indexOf(u8, after, "\"count\":1") == null or
-            std.mem.indexOf(u8, after, "\"view\":2") != null)
+            std.mem.indexOf(u8, after, std.fmt.bufPrint(&close_buf, "\"view\":{d},", .{second_view}) catch unreachable) != null)
             fail("the closed view is still listed");
         m.closeStdinWait();
     }
@@ -6578,6 +6820,8 @@ fn webOnly(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: [:0]const u8) u
     say("smoke-mcp: focused enforced network policy ok");
     webCaptureStage(allocator, exe, rt);
     say("smoke-mcp: focused response-body capture ok");
+    webTabsStage(allocator, exe, rt);
+    say("smoke-mcp: focused shared-browser tab targeting ok");
     killDaemonsUnderRt(rt, allocator);
     _ = c.usleep(500_000);
     g_rt = null;

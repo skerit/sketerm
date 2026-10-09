@@ -278,6 +278,15 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
         try res.fact("web_routes", routes.name());
         try res.text(routes.describe());
     }
+    // How tabs are addressed when several callers share this browser.
+    {
+        const rules = @import("mcp_web.zig").tabRules();
+        try res.fact("web_tab_rules", rules);
+        try res.text(if (rules.idle_close_secs > 0)
+            "web tabs: with more than one tab open every tab-acting web_* call must name its tab ('pane'; a call without one is refused as target_required, listing the tabs); every reply echoes the tab and its url; web_open label + web_close label group your own tabs; an assistant tab untouched for web_tab_rules.idle_close_secs closes itself unless someone is watching it; a web_open cannot rename the live browser or switch the identity it runs under"
+        else
+            "web tabs: with more than one tab open every tab-acting web_* call must name its tab ('pane'; a call without one is refused as target_required, listing the tabs); every reply echoes the tab and its url; web_open label + web_close label group your own tabs; idle closing is off; a web_open cannot rename the live browser or switch the identity it runs under");
+    }
     // The discoverability half of fail-closed: without this, a
     // web_open that refuses a profile reads as a bug rather than as a
     // capability this server does not have.

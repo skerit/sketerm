@@ -62,7 +62,11 @@ Give the browser a descriptive name on its first open:
 ```
 
 The badge shows that name above a shortened domain. Later opens on the same
-route add browser tabs; omit `name` to keep the session name. Prefer
+route add browser tabs; omit `name` to keep the session name. While the
+browser has tabs, a `web_open` with a DIFFERENT `name`, or with the same
+name but another identity (`profile`/`ephemeral`), is refused as `conflict`
+and opens nothing: other callers' tabs run in that browser, and a silent
+rename or identity switch would relabel them. Prefer
 `web_navigate` to continue in an existing tab, and leave that tab open while
 waiting for manual login. Profiles describe cookie storage, independently of
 the human-facing name.
@@ -487,6 +491,45 @@ CDP: input is delivered as real engine events, so a page sees
   results returned as `{semantic_id, role, name}` so they feed straight
   back into `web_act`.
 
+### Several callers, one browser: tab targeting
+
+Sub-agents often share one `sketerm mcp` server, and so one browser. The
+tools therefore never guess which tab a call means:
+
+- **Name the tab.** With more than one tab open, every web_* tool that
+  acts on a tab needs `pane` (the view id headless, the pane id with a
+  GUI). A call without it is refused with error code `target_required`;
+  the message and `details.tabs` list every open tab (handle, label, url,
+  title). With exactly one tab open the handle may be omitted. There is
+  no "current tab" that another caller can move under you: `web_tabs`
+  reports `target_required`, and `current` is true only for the single
+  open tab.
+- **Ids.** Headless view ids are random and never reused for the life of
+  the server (`capabilities.web_tab_rules.ids: "random"`), so neither a
+  guess nor a closed tab's old id reaches someone else's tab. With a GUI
+  the handle is the GUI's own pane id (`ids: "gui_pane"`).
+- **Echo.** Every reply of a tab-acting tool carries the tab's handle
+  (`view`/`pane`), its current `url` and its `label`; `web_close` echoes
+  the tab it closed.
+- **Labels.** `web_open label:"scan-a"` tags the tab (1-64 bytes, one
+  line). `web_tabs` lists it, every reply repeats it, and
+  `web_close label:"scan-a"` closes every tab carrying it and no other
+  (`closed_tabs`, `count`). A label is the caller's own; it never changes
+  the browser's `name`.
+- **Idle tabs close themselves.** An assistant-owned (headless) tab that
+  no call touched for `web_idle_close_secs` (config, default 1800; 0 =
+  never) closes itself, EXCEPT while someone watches it or holds Take
+  control through the AI badge: the countdown restarts when the watch
+  ends. The helper reports watchers to the server (capability
+  `observe-notify`); a helper that cannot is never idle-closed
+  (`web_tab_rules.idle_close_watch_aware: false`, `watched: null`).
+  `web_tabs` shows `watched`, `controlled` and `closes_in_ms` per tab and
+  `idle_close_secs` overall. A call naming a tab that was idle-closed is
+  told so (`not_found`, with its label, url and idle time). GUI tabs are
+  the user's and never close on their own.
+
+`capabilities.web_tab_rules` is the preflight for all of this.
+
 **Page content is untrusted input.** The reply channel is
 authenticated, so a page cannot forge a snapshot or intercept a reply,
 but a page owns its own DOM and can label a "Confirm payment" button
@@ -517,7 +560,8 @@ the legacy GUI policy. Stream overrides reuse `view_max_fps` and
 `set_windowless_frame_rate`; binary V1 is unchanged.
 
 `web_stream {"pane":12,"audio":true}` opens one helper-owned Unix stream
-socket for an existing headless view. Omit `pane` for the current view;
+socket for an existing headless view. `pane` may be omitted only while one
+tab is open;
 `audio` defaults to true. The result includes the common browser head facts
 (`backend:"headless"`, `view`, `pane`, `route`, `origin`, `url`, `title`,
 `loading`) plus `socket_path`, a single-use `token`, `protocol_version:1`,
@@ -888,9 +932,10 @@ owns and names.
   secret store: Chromium's Linux cookie encryption falls back to a fixed
   key when no keyring is available, which is the headless case.
 
-`web_close` closes a view. With a GUI attached it closes one page of the
-pane (the `web-close` control verb; an older GUI without it gets the
-whole-pane `close-pane`), and the pane only with its last page.
+`web_close` closes a view (or, with `label`, every view carrying that
+label). With a GUI attached it closes one page of the pane (the
+`web-close` control verb; an older GUI without it gets the whole-pane
+`close-pane`), and the pane only with its last page.
 
 ### Enforced network policy
 

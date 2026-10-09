@@ -137,6 +137,7 @@ comptime {
     _ = @import("ipc/launch_cleanup.zig");
     _ = @import("ipc/webdrive.zig");
     _ = @import("ipc/webprofiles.zig");
+    _ = @import("ipc/webtabs.zig");
     _ = @import("ipc/xkblayout.zig");
     // Enforced network policy: std-only decision half of the web
     // helper's request gate, shared with the GUI-side client.

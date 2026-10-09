@@ -273,6 +273,7 @@ comptime {
     _ = @import("ipc/launch_cleanup.zig");
     _ = @import("ipc/webdrive.zig");
     _ = @import("ipc/webprofiles.zig");
+    _ = @import("ipc/webtabs.zig");
     _ = @import("ipc/mcp.zig");
     _ = @import("ipc/mcp_app.zig");
     _ = @import("ipc/mcp_files.zig");

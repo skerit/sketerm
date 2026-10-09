@@ -810,10 +810,13 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     };
     const web_gui_grant = resolveWebGuiGrant(opts, &cfg) catch return 2;
     var web_max_fps = cfg.mcp.web_max_fps;
+    var web_idle_close_secs = cfg.mcp.web_idle_close_secs;
     if (opts.profile) |name| {
         const prof = mcpProfileRecord(&cfg, name) catch return 2;
         if (prof.web_max_fps) |fps| web_max_fps = fps;
+        if (prof.web_idle_close_secs) |secs| web_idle_close_secs = secs;
     }
+    @import("mcp_web.zig").configureIdleClose(web_idle_close_secs);
 
     if (opts.log_dir) |ld| {
         mcp_log = McpLog.open(allocator, ld) orelse {
@@ -1113,6 +1116,13 @@ fn pushRouteFor(client_name: ?[]const u8) agentpush.Route {
 
 const InputWait = enum { more, eof, failed };
 
+/// The sooner of two optional deadlines (null = none).
+fn minDue(a: ?i64, b: ?i64) ?i64 {
+    const x = a orelse return b;
+    const y = b orelse return x;
+    return @min(x, y);
+}
+
 /// Wait for stdin while the agents are served: poll stdin together with
 /// every agent and waiter fd, wake for the agents' timers, then read what
 /// stdin has. EINTR (a quit signal) is `.more`, so the caller re-checks
@@ -1121,11 +1131,16 @@ fn waitInput(input: *std.ArrayList(u8), allocator: std.mem.Allocator) InputWait 
     var pfds: [129]c.struct_pollfd = undefined;
     pfds[0] = .{ .fd = 0, .events = c.POLLIN, .revents = 0 };
     const n = 1 + mcp_agent.pollFds(pfds[1..]);
-    const timeout: c_int = if (mcp_agent.dueInMs(clock.nowMs())) |d| @intCast(std.math.clamp(d, 0, 1000)) else -1;
+    const now = clock.nowMs();
+    const due = minDue(mcp_agent.dueInMs(now), @import("mcp_web.zig").idleDueInMs(now));
+    const timeout: c_int = if (due) |d| @intCast(std.math.clamp(d, 0, 1000)) else -1;
     const rc = c.poll(&pfds, @intCast(n), timeout);
     if (rc < 0) return if (std.posix.errno(rc) == .INTR) .more else .failed;
     mcp_agent.service(clock.nowMs());
     mcp_agent.sweep(clock.nowMs());
+    // Between requests: an idle browser tab closes on time even when no
+    // web call arrives to notice it.
+    @import("mcp_web.zig").idleSweep(clock.nowMs());
     if (pfds[0].revents == 0) return .more;
     var buf: [65536]u8 = undefined;
     const got = c.read(0, &buf, buf.len);
@@ -1378,11 +1393,15 @@ pub const ErrCode = enum {
     /// ssh could not reach the host at all (`sshroute.unreachableLine`):
     /// down, no route, refused, or an unknown name.
     host_unreachable,
+    /// A browser call named no tab while several are open: it would have
+    /// acted on whichever tab another caller touched last. The details
+    /// list the open tabs to choose from.
+    target_required,
 
     pub fn retryable(self: ErrCode) bool {
         return switch (self) {
             .timeout, .unavailable, .io_failed, .host_unreachable => true,
-            .invalid_args, .not_found, .refused, .conflict, .unknown_tool, .failed, .not_delivered => false,
+            .invalid_args, .not_found, .refused, .conflict, .unknown_tool, .failed, .not_delivered, .target_required => false,
         };
     }
 };
