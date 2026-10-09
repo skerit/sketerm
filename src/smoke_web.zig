@@ -1226,6 +1226,12 @@ const Client = struct {
     /// View id the last `ev_title` named — under multi-client this must
     /// arrive in the CLIENT's namespace, so the stage asserts on it.
     title_view: u32 = 0,
+    /// `waitViewTitle`'s watch: matched per decoded frame, because one
+    /// batch can carry the wanted title AND a later one from another
+    /// view, which overwrites `title` before any wait samples it.
+    title_watch_view: u32 = 0,
+    title_watch_prefix: []const u8 = "",
+    title_watch_hit: bool = false,
 
     /// The last `ev_clipboard_text`: the answer to `clipboard_read`,
     /// which must reach whoever ASKED (an observer under its alias).
@@ -2136,6 +2142,8 @@ const Client = struct {
                     @memcpy(self.pp_title[0..self.pp_title_len], t.title[0..self.pp_title_len]);
                     return;
                 }
+                if (self.title_watch_view != 0 and t.view == self.title_watch_view and
+                    std.mem.startsWith(u8, t.title, self.title_watch_prefix)) self.title_watch_hit = true;
                 self.title_view = t.view;
                 self.title_len = @min(t.title.len, self.title.len);
                 @memcpy(self.title[0..self.title_len], t.title[0..self.title_len]);
@@ -2421,6 +2429,21 @@ const Client = struct {
             if (nowMs() > deadline) return false;
             self.pump(50);
         }
+    }
+
+    /// Wait for a title on `view` starting with `prefix`, received after
+    /// this call; other views' titles can neither satisfy nor hide it.
+    fn waitViewTitle(self: *Client, view: u32, prefix: []const u8, timeout_ms: i64) bool {
+        self.title_watch_view = view;
+        self.title_watch_prefix = prefix;
+        self.title_watch_hit = false;
+        defer self.title_watch_view = 0;
+        const deadline = nowMs() + timeout_ms;
+        while (!self.title_watch_hit) {
+            if (nowMs() > deadline) return false;
+            self.pump(50);
+        }
+        return true;
     }
 
     /// Wait until the page popup's own title starts with `prefix`.
@@ -3050,9 +3073,10 @@ const IceCount = struct { total: u32, udp: u32 };
 fn iceProbe(cl: *Client, view: u32, comptime what: []const u8) IceCount {
     // On a loaded document of its own: an eval sent into a fresh view
     // races its first navigation and is interrupted by it.
-    cl.resetTitle();
+    // Per view: the routed instance's other views keep retitling their
+    // error pages, and those titles used to bury this one (1 run in 10).
     cl.send(proto.Navigate{ .view = view, .url = "data:text/html,<title>ice-probe</title>" });
-    if (!cl.waitTitle("ice-probe", 20_000)) fail(what ++ ": the probe page never loaded");
+    if (!cl.waitViewTitle(view, "ice-probe", 20_000)) fail(what ++ ": the probe page never loaded");
     const js =
         "(async()=>{const pc=new RTCPeerConnection({iceServers:[]});pc.createDataChannel('x');" ++
         "const c=[];pc.onicecandidate=e=>{if(e.candidate&&e.candidate.candidate)c.push(e.candidate.candidate)};" ++
