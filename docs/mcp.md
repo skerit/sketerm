@@ -1394,6 +1394,9 @@ The tests do not download dependencies or fixtures:
   followed by native policy/media acknowledgement-failure tests. It requires
   util-linux, iproute2, and Python `aioquic`/`cryptography`; dependencies are not
   downloaded automatically. Host resolver files and interfaces are untouched.
+  `SKETERM_SMOKE_WEB_UNTRUSTED_POST_ONLY=1` runs only `test_25_post_request_bodies`,
+  the POST-body truth table (every body shape, trusted control beside untrusted,
+  what the page saw against what the server received).
 
 ### View Emulation
 

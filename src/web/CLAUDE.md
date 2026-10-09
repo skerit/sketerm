@@ -92,6 +92,18 @@ unconfined. Two constraints that come with it, both measured:
   `strings libcef.so | grep -x <name>` before relying on it;
   `--disable-dns-prefetch` and `--disable-crash-reporter` both looked
   plausible and do not exist.
+- **The untrusted loader sees a request body only as CEF's post-data
+  elements, and CEF 151 turns every data-pipe part (a Blob, a FormData
+  File, a ReadableStream) into a `PDE_TYPE_EMPTY` element while
+  `has_excluded_elements()` stays 0.** No public CEF API reads that pipe
+  at interception time, so `sk_copy_request` refuses any non-BYTES
+  element; accepting EMPTY as "no bytes" sent a Blob POST with an empty
+  body and a multipart upload with its file part missing, both reported
+  to the page as 200. CEF also names a `null` initiator for every
+  navigation, which is why POST navigations are refused (the C test's
+  "unchanged POST authority"). `dist/test-web-untrusted.py`'s
+  `test_25_post_request_bodies` (`SKETERM_SMOKE_WEB_UNTRUSTED_POST_ONLY`)
+  is the truth table for both.
 
 `cefargs.withDefaults` includes `--no-first-run` before either call. On a
 fresh cache, Chromium's first-run path can hold `cef_initialize` in a

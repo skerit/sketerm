@@ -387,6 +387,10 @@ def main():
     for path in (binary, helper):
         if not path.is_file() or not os.access(path, os.X_OK):
             parser.error("Built executable missing: %s (this runner never builds)" % path)
+    if rig.focused_tests() and not options.test:
+        print("Focused gate set (%s): no ACK method selected." % ", ".join(
+            variable for variable in rig.FOCUS_GATES if variable in os.environ), flush=True)
+        return 0
     methods = sorted(name for name in AckTests.__dict__ if name.startswith("test_"))
     for name in options.test or []:
         if name not in methods:

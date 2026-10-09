@@ -33,6 +33,13 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 
 REPO = Path(__file__).resolve().parent.parent
 OPTIONS = None
+# Focused gates in smoke-web's SKETERM_SMOKE_WEB_*_ONLY style: a set variable runs only its stage,
+# through `zig build smoke-web-untrusted` too (the ACK runner then selects nothing).
+FOCUS_GATES = {"SKETERM_SMOKE_WEB_UNTRUSTED_POST_ONLY": "test_25_post_request_bodies"}
+
+
+def focused_tests():
+    return [test for variable, test in FOCUS_GATES.items() if variable in os.environ]
 
 
 def require(condition, message):
@@ -206,6 +213,9 @@ function download(event) {
         status, extra_headers = 200, ()
         if asset:
             payload, content_type, status, extra_headers = asset
+        if query.get("echo") == ["1"]:
+            # Echo the received body so the page-side result shows what arrived.
+            payload, content_type = body, "text/plain; charset=utf-8"
         content_type = query.get("mime", [content_type])[0]
         status = int(query.get("status", [status])[0])
         self.send_response(status)
@@ -508,12 +518,15 @@ class MCP:
         facts = self.tool("web_eval", pane=pane, body=body, strict=True,
                           max_chars=60000, timeout_ms=min(120000, int((self.timeout - 5) * 1000)))
         require("value" in facts and not facts.get("truncated"), "Missing complete eval value: %r" % facts)
-        value = facts["value"]
-        if isinstance(value, dict) and "value" in value:
-            value = value["value"]
+        value = self.eval_value(facts)
         require(not (isinstance(value, dict) and value.get("__kind") == "error"),
                 "Fixture JavaScript threw: %r" % value)
         return value
+
+    @staticmethod
+    def eval_value(facts):
+        value = facts.get("value")
+        return value["value"] if isinstance(value, dict) and "value" in value else value
 
     def untrusted_helper(self):
         def locate():
@@ -1747,6 +1760,174 @@ r.onerror=r.ontimeout=()=>resolve({ok:false});r.send();});
                 self.assertEqual(self.mcp.tool("web_policy", pane=pane)["policy"]["untrusted"], mode)
                 self.mcp.tool("web_close", pane=pane)
 
+    # (label, kind, JS spec, exact body or multipart fields, untrusted outcome). "refuse" is by design:
+    # a cross-origin POST, a body past the 1 MiB upload cap, a body CEF hands over as a data pipe it
+    # cannot read (Blob, File part, stream), and any POST navigation (CEF names no initiator for one).
+    POST_CASES = (
+        ("fetch-string", "fetch", "{method:'POST', body:'string-body \\u00fc'}", "string-body \u00fc".encode(), "deliver"),
+        ("fetch-empty-string", "fetch", "{method:'POST', body:''}", b"", "deliver"),
+        ("fetch-json", "fetch", "{method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({k:'v',n:1})}",
+         b'{"k":"v","n":1}', "deliver"),
+        ("fetch-urlsearchparams", "fetch", "{method:'POST', body:new URLSearchParams({a:'1 2', b:'&'})}", b"a=1+2&b=%26", "deliver"),
+        ("fetch-arraybuffer", "fetch", "{method:'POST', body:new Uint8Array([0,1,2,255]).buffer}", b"\x00\x01\x02\xff", "deliver"),
+        ("fetch-formdata", "fetch", "{method:'POST', body:(()=>{const d=new FormData();d.append('a','fd-a');d.append('b','fd-b');return d;})()}",
+         dict(a=b"fd-a", b=b"fd-b"), "deliver"),
+        ("fetch-large", "fetch", "{method:'POST', body:'L'.repeat(512*1024)}", b"L" * (512 * 1024), "deliver"),
+        ("xhr-string", "xhr", "'xhr-body'", b"xhr-body", "deliver"),
+        ("fetch-blob", "fetch", "{method:'POST', body:new Blob(['blob-body'], {type:'application/octet-stream'})}", b"blob-body", "refuse"),
+        ("fetch-formdata-file", "fetch",
+         "{method:'POST', body:(()=>{const d=new FormData();d.append('a','fd-a');d.append('f',new Blob(['file-part']),'f.txt');return d;})()}",
+         dict(a=b"fd-a", f=b"file-part"), "refuse"),
+        # Chromium streams an upload only over HTTP/2+, so the plain-HTTP trusted control fails too.
+        ("fetch-stream", "fetch",
+         "{method:'POST', duplex:'half', body:new ReadableStream({start(c){c.enqueue(new TextEncoder().encode('stream-body'));c.close();}})}",
+         b"stream-body", "refuse"),
+        ("fetch-oversize", "fetch", "{method:'POST', body:'O'.repeat(1536*1024)}", b"O" * (1536 * 1024), "refuse"),
+        ("fetch-cross-origin", "cross", "{method:'POST', body:'cross-body'}", b"cross-body", "refuse"),
+        ("iframe-form-urlencoded", "iframe", "application/x-www-form-urlencoded", b"a=x+y%26z&b=v", "refuse"),
+        ("iframe-form-multipart", "iframe", "multipart/form-data", dict(a=b"x y&z", b=b"v"), "refuse"),
+        ("form-urlencoded", "form", "application/x-www-form-urlencoded", b"a=x+y%26z&b=v", "refuse"),
+        ("form-multipart", "form", "multipart/form-data", dict(a=b"x y&z", b=b"v"), "refuse"),
+    )
+    POST_TRUSTED_MAY_FAIL = ("fetch-stream",)
+
+    @staticmethod
+    def multipart_fields(content_type, body):
+        match = re.search(r'boundary=("?)([^";]+)\1', content_type or "")
+        if not match:
+            return None
+        fields = {}
+        for part in body.split(b"--" + match.group(2).encode())[1:-1]:
+            head, _, value = part.strip(b"\r\n").partition(b"\r\n\r\n")
+            name = re.search(rb'name="([^"]*)"', head)
+            if name:
+                fields[name.group(1).decode()] = value
+        return fields
+
+    def post_case(self, pane, server, path, kind, spec):
+        url = server.url(path, echo=1)
+        if kind in ("fetch", "cross"):
+            return self.mcp.evaluate(pane, """
+const abort=new AbortController(); const timer=setTimeout(()=>abort.abort(),8000);
+try { const r=await fetch(%s, {...%s, signal:abort.signal}); const b=new Uint8Array(await r.arrayBuffer());
+      return {ok:r.ok, status:r.status, echo_len:b.length,
+              echo_head:Array.from(b.slice(0,24)).map(x=>x.toString(16).padStart(2,'0')).join('')}; }
+catch(e) { return {ok:false, error:e.name+': '+e.message}; } finally {clearTimeout(timer);}
+""" % (json.dumps(url), spec))
+        if kind == "xhr":
+            return self.mcp.evaluate(pane, """
+return await new Promise(resolve=>{const x=new XMLHttpRequest();x.open('POST',%s);x.timeout=8000;
+x.onload=()=>resolve({ok:x.status>=200&&x.status<300,status:x.status,echo_len:x.responseText.length});
+x.onerror=()=>resolve({ok:false,error:'error event'});x.ontimeout=()=>resolve({ok:false,error:'timeout'});
+x.send(%s);});
+""" % (json.dumps(url), spec))
+        form = """
+const f=document.createElement('form'); f.method='post'; f.action=%s; f.enctype=%s;
+for (const [k,v] of [['a','x y&z'],['b','v']]) {
+  const i=document.createElement('input'); i.type='hidden'; i.name=k; i.value=v; f.append(i);
+}
+document.body.append(f);
+""" % (json.dumps(url), json.dumps(spec))
+        if kind == "iframe":
+            return self.mcp.evaluate(pane, form + """
+const frame=document.createElement('iframe'); frame.name='sink'+Date.now(); document.body.append(frame);
+await new Promise(r=>setTimeout(r,100)); f.target=frame.name;
+const loaded=await new Promise(resolve=>{const t=setTimeout(()=>resolve(false),8000);
+  frame.onload=()=>{clearTimeout(t);resolve(true);}; f.submit();});
+let text=null, error=null;
+try {text=frame.contentDocument.body.innerText;} catch(e) {error=e.name+': '+e.message;}
+frame.remove(); f.remove();
+return {ok:loaded && text!==null, loaded, echo_len:text===null?null:text.length, error};
+""")
+        # A top-level form POST replaces the document the eval runs in: submit after replying.
+        self.mcp.evaluate(pane, form + "setTimeout(()=>f.submit(),100); return true;")
+        deadline, last = time.monotonic() + 10, None
+        while time.monotonic() < deadline:
+            time.sleep(0.25)
+            reply = self.mcp.raw_tool("web_eval", pane=pane, timeout_ms=3000, body=
+                "return {href:location.href, ready:document.readyState, title:document.title,"
+                " text:document.body?document.body.innerText:null};")
+            value = self.mcp.eval_value(reply.get("structuredContent", {}))
+            if reply.get("isError") or not isinstance(value, dict) or "href" not in value:
+                continue
+            last = value
+            if value["href"] != self.p1.url("/page/" + self.token) and value["ready"] == "complete":
+                break
+        landed = bool(last) and last["href"] == url and last["text"] is not None
+        return dict(ok=landed, href=last and last["href"], echo_len=len(last["text"]) if landed else None,
+                    error=None if landed else "document: %r" % (last and dict(href=last["href"], title=last["title"])))
+
+    def test_25_post_request_bodies(self):
+        """Each POST shape, trusted control and untrusted: what the page saw, what the server received."""
+        hosts = ["127.0.0.1:%d" % self.p1.server_port, "127.0.0.1:%d" % self.p2.server_port]
+        table, failures = [], []
+        for mode in (False, True):
+            pane = self.open(untrusted=mode, hosts=hosts)
+            page_url = self.p1.url("/page/" + self.token)
+            for label, kind, spec, expected, outcome in self.POST_CASES:
+                server = self.p2 if kind == "cross" else self.p1
+                path = self.path("post-%s-%s" % (label, "untrusted" if mode else "trusted"))
+                try:
+                    page = self.post_case(pane, server, path, kind, spec)
+                except AssertionError as error:
+                    page = dict(ok=False, error="eval failed: %s" % str(error)[:200])
+                time.sleep(0.2)
+                events = server.matching(path, "POST")
+                received = events[0]["body"] if events else None
+                content_type = events[0]["headers"].get("Content-Type") if events else None
+                if isinstance(expected, dict):
+                    exact = received is not None and self.multipart_fields(content_type, received) == expected
+                else:
+                    exact = received == expected
+                # A text/plain document's innerText folds CRLF, so a rendered echo is compared folded.
+                shown = None if received is None else len(received.replace(b"\r\n", b"\n") if kind in ("iframe", "form") else received)
+                table.append(dict(case=label, mode="untrusted" if mode else "trusted",
+                                  expect="deliver" if not mode else outcome, page_ok=page.get("ok"),
+                                  status=page.get("status"), page_error=page.get("error"), echo_len=page.get("echo_len"),
+                                  shown_len=shown, requests=len(events), body_len=None if received is None else len(received),
+                                  body_head=None if received is None else received[:40],
+                                  content_type=content_type, exact=exact))
+                if kind == "form":
+                    self.mcp.tool("web_navigate", pane=pane, url=page_url)
+            network = self.mcp.tool("web_network", pane=pane, max=128)
+            policy = self.mcp.tool("web_policy", pane=pane)
+            for row in table:
+                if row["mode"] != ("untrusted" if mode else "trusted"):
+                    continue
+                marker = "/post-%s-%s?" % (row["case"], row["mode"])
+                row["network"] = [dict(blocked=r["blocked"], status=r.get("status"), reason=r.get("reason"),
+                                       error=r.get("error"))
+                                  for r in network["requests"] if marker in r["url"] and r["method"] == "POST"]
+            denied = policy["denied"].get("untrusted_http", 0)
+            refusals = sum(1 for row in table if row["mode"] == "untrusted" and row["expect"] == "refuse")
+            if mode and denied < refusals:
+                failures.append("web_policy counted %d untrusted_http refusals for %d refused cases" % (denied, refusals))
+            print("\n%s web_policy.denied=%s" % ("untrusted" if mode else "trusted", json.dumps(policy["denied"])),
+                  file=sys.stderr)
+            self.mcp.tool("web_close", pane=pane)
+        print("\nPOST truth table:", file=sys.stderr)
+        for row in table:
+            print(json.dumps(row, default=repr), file=sys.stderr)
+        for row in table:
+            name = "%s/%s" % (row["case"], row["mode"])
+            if row["expect"] == "refuse":
+                # Visible to the page, to the server (nothing arrives) and to the MCP caller (a blocked row naming why).
+                if row["page_ok"] or row["requests"]:
+                    failures.append("%s must be refused, not sent: %r" % (name, row))
+                if row["network"] != [dict(blocked=True, status=None, reason="untrusted_http", error=None)]:
+                    failures.append("%s refusal is not a blocked untrusted_http row in web_network: %r" % (name, row))
+            elif row["mode"] == "trusted" and row["case"] in self.POST_TRUSTED_MAY_FAIL:
+                continue
+            elif not (row["page_ok"] and row["requests"] == 1 and row["exact"] and row["echo_len"] == row["shown_len"]):
+                failures.append("%s lost or changed its body: %r" % (name, row))
+            elif row["mode"] == "untrusted":
+                control = next(r for r in table if r["case"] == row["case"] and r["mode"] == "trusted")
+                media = lambda value: value and re.sub(r"boundary=[^;]+", "boundary=*", value)
+                if media(row["content_type"]) != media(control["content_type"]):
+                    failures.append("%s Content-Type %r differs from the trusted control's %r"
+                                    % (name, row["content_type"], control["content_type"]))
+        self.assertEqual(failures, [], "\n".join(failures))
+
 
 class PacketContext(PacketFixture):
     def __enter__(self):
@@ -1958,6 +2139,7 @@ Use dist/test-web-untrusted.c for native socket/address/loader assertions.""")
         print("SKETERM_WEB_BIN=" + str(OPTIONS.helper), flush=True)
         print("No build, GUI attachment, public-DNS fallback, or process-name cleanup.", flush=True)
         loader = unittest.TestLoader()
+        OPTIONS.test = OPTIONS.test or focused_tests() or None
         if OPTIONS.test:
             for name in OPTIONS.test:
                 if name not in loader.getTestCaseNames(WebUntrustedTests):
