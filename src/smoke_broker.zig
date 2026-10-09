@@ -15,6 +15,8 @@
 const std = @import("std");
 const c = @import("c.zig").c;
 const lifetime = @import("util/lifetime.zig");
+const clock = @import("util/clock.zig");
+const Daemon = @import("mux/daemon.zig").Daemon;
 const muxrig = @import("smoke/muxrig.zig");
 const client_mod = @import("mux/client.zig");
 const wire = @import("mux/wire.zig");
@@ -68,6 +70,17 @@ fn listSessions(allocator: std.mem.Allocator, sock_path: []const u8) std.json.Pa
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,
     }) catch fail("list parse");
+}
+
+const ListedState = enum { absent, live, exited };
+
+fn sessionState(sock_path: []const u8, allocator: std.mem.Allocator, name: []const u8) ListedState {
+    var lst = listSessions(allocator, sock_path);
+    defer lst.deinit();
+    for (lst.value.sessions) |s| {
+        if (std.mem.eql(u8, s.name, name)) return if (s.exited) .exited else .live;
+    }
+    return .absent;
 }
 
 fn hasSession(sock_path: []const u8, allocator: std.mem.Allocator, name: []const u8) bool {
@@ -168,8 +181,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     std.debug.print("smoke-broker: spawn dimension limits before worker fork ok\n", .{});
 
     // ── clean-exit reaping: a worker whose shell exits on its own must tear
-    //    down and be reaped (no orphan, no stale `list` entry) — nobody kills
-    //    it. Done first, on a clean slate, so the ephemeral worker is the
+    //    down and be reaped once its exit hold ends (no orphan, no stale
+    //    `list` entry) — nobody kills it. Done first, on a clean slate, so the ephemeral worker is the
     //    broker's only child and `firstChildOf` finds it unambiguously. ──
     {
         var conn = client_mod.Conn.connect(allocator, sock_path) catch fail("eph connect");
@@ -186,11 +199,32 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     _ = c.usleep(150_000); // still sleeping
     const eph_pid = firstChildOf(bpid);
     if (eph_pid <= 0) fail("eph: no worker process while alive");
-    if (!hasSession(sock_path, allocator, "ephemeral")) fail("eph: not listed while alive");
-    _ = c.usleep(1_200_000); // past the 0.4s sleep + broker reap
-    if (hasSession(sock_path, allocator, "ephemeral")) fail("eph: clean-exited session not dropped from list");
-    if (ppidOf(eph_pid) == bpid) fail("eph: clean-exited worker not reaped (still a child of the broker)");
-    std.debug.print("smoke-broker: clean-exit reaping ok\n", .{});
+    if (sessionState(sock_path, allocator, "ephemeral") != .live) fail("eph: not listed as live while alive");
+    // Nobody ever attached, so the worker holds the exited session for its
+    // spawner's attach (`Daemon.exit_hold_ms`): listed as exited, worker
+    // alive. Only once the hold ends is it dropped and the worker reaped.
+    const hold_ms: i64 = comptime std.meta.fieldInfo(Daemon, .exit_hold_ms).defaultValue().?;
+    var waited: usize = 0;
+    while (sessionState(sock_path, allocator, "ephemeral") == .live) : (waited += 1) {
+        if (waited >= 40) fail("eph: clean exit never listed as exited");
+        _ = c.usleep(50_000);
+    }
+    const exited_seen_ms = clock.nowMs();
+    if (sessionState(sock_path, allocator, "ephemeral") != .exited) fail("eph: clean-exited session dropped before its hold");
+    if (ppidOf(eph_pid) != bpid) fail("eph: worker of a held session is gone");
+    while (sessionState(sock_path, allocator, "ephemeral") != .absent) {
+        if (clock.nowMs() - exited_seen_ms > hold_ms + 3_000) fail("eph: clean-exited session not dropped from list after its hold");
+        _ = c.usleep(100_000);
+    }
+    // The exit was seen at most one poll plus a metadata push after it
+    // happened, so a drop this early means the hold was not applied.
+    if (clock.nowMs() - exited_seen_ms < hold_ms - 500) fail("eph: clean-exited session dropped before its hold ended");
+    waited = 0;
+    while (ppidOf(eph_pid) == bpid) : (waited += 1) {
+        if (waited >= 40) fail("eph: clean-exited worker not reaped (still a child of the broker)");
+        _ = c.usleep(50_000);
+    }
+    std.debug.print("smoke-broker: clean-exit hold + reaping ok\n", .{});
 
     // ── spawn two sessions; each forks a worker ──
     {
