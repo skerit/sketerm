@@ -1,5 +1,24 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-09: a daemon takes its socket back after the runtime dir is removed
+
+On darkshire a 49-day-old daemon holding five shells became unreachable:
+with `Linger=no`, logind removed `/run/user/1000` at the last logout, the
+daemon kept listening on its unlinked `mux.sock`, and the next login's
+`sketerm mux darkshire` autostarted a second daemon whose restored layout
+minted empty sessions under the old names. Now a broker checks its path
+every second and re-binds it (same locked bind as startup) once the
+socket dir's parent exists, never taking over a path another live daemon
+answers; workers re-create their adoption listeners too. A broker
+publishes `$XDG_STATE_HOME/sketerm/mux-daemons/<pid>.json` under a POSIX
+lock, and every autostart path (GUI, `sketerm mcp`'s private brokers,
+`--proxy`/`--udp-listen` on the far side) first finds orphans through
+`procinv` and sends SIGURG only to one holding that record, then waits up
+to 3 s. Older daemons (darkshire's pid 1751 included) are never
+signalled; doctor now says per unreachable daemon whether it recovers or
+is an old build (`reptyr` can move its shells). `src/smoke_relisten.zig`
+in smoke-mux (`SKETERM_SMOKE_MUX_RELISTEN_ONLY`) proves it end to end.
+
 ## 2026-10-09: untrusted POST bodies go whole or are refused visibly
 
 A field report said untrusted browsing drops every POST body. Measured
