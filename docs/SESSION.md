@@ -1,5 +1,23 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-09: every web reply states what it leaves behind
+
+Sub-agents sharing one browser could not tell from a reply whether what
+they did stays on disk. Every tab-scoped web_* reply now carries
+`persistence` `{identity, durable, profile, store, flushed, reason}`
+(the echo that carries the tab's handle and url), per tab in
+`web_tabs`, for its tabs on `web_fetch`, per profile in `web_profiles`;
+`web_profile_reset` reports `erased`, and every reply naming a file it
+wrote carries `outlives_instance` (a `web_fetch` file without `to_dir`
+dies with a temporary instance). One derivation, `src/ipc/webpersist.zig`,
+fed by `webdrive.Engine.dataRoot`; `capabilities.web_persistence`.
+Measured on the way: the headless DEFAULT identity is durable, not
+in-memory as the docs said. With the store as `root_cache_path` its
+cookies and localStorage land in `<root>/Default` and survive a graceful
+helper restart; only a server whose store another process holds keeps
+them in its instance dir. smoke-mcp `SKETERM_SMOKE_MCP_WEBPERSIST_ONLY`
+proves each identity's answer by restarting the helper.
+
 ## 2026-10-09: web_read pages, scopes and lists; web_query reads the current page
 
 `web_query find_text` after a `web_navigate` with no snapshot answered
