@@ -1,5 +1,24 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-09: web_read pages, scopes and lists; web_query reads the current page
+
+`web_query find_text` after a `web_navigate` with no snapshot answered
+from the PREVIOUS page (a navigation never cleared the helper's shadow
+tree) and missed anything rendered after its first walk, both as a plain
+"0 matches". The helper now walks first unless an observer keeps the
+tree current for the current document (`semlayer.treeCurrent`, capability
+`query-live`); for an older helper or a GUI the server peeks first.
+`web_read` grew `mode` (text, raw, regex, links, resources), paging
+(`offset`, `max_chars` default 50000 up to 1000000, `next_offset`,
+`more`, `content_sha256`), `selector` and `include_chrome`. Selectors,
+chrome, links (absolute href + landmark area) and scripts/iframes are one
+new semantic query kind, `page` (capability `page-read`,
+`src/web/pageread.zig`), which installs nothing in the page; an older
+helper or GUI answers them `unavailable`. The modes, regex arguments,
+matcher and source read are shared with `web_fetch` through
+`src/ipc/webread.zig`, `parseRegexArgs` and `sourceOf`.
+`capabilities.web_read`; smoke-mcp `SKETERM_SMOKE_MCP_WEBREAD_ONLY`.
+
 ## 2026-10-09: web_fetch reads several urls through background tabs
 
 A caller that only wanted the content of some urls had to open, drive and
