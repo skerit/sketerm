@@ -1,5 +1,22 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-09: web_fetch reads several urls through background tabs
+
+A caller that only wanted the content of some urls had to open, drive and
+close a tab per url, in sight of a watching user. `web_fetch urls:[...]`
+loads each in a real tab (JS runs) the caller never sees, reads it and
+closes it: `navigation` plus the body by mode (`text` = reader mode, or the
+body itself for plain text/XML/JSON; `raw` = the captured response body;
+`regex` with context), files (zip, PDF) through the download path,
+`to_dir`, `follow_redirects:false` (outcome `redirect`, target never
+requested), `wait`. At most 4 tabs per call and `web_fetch_max_tabs`
+(default 8) across concurrent calls, queued round robin. It is the first
+DEFERRED MCP tool: answered from the server loop, so other calls (and
+other fetches) are served meanwhile. Fetch views are `View.background`:
+out of every tab list, target and idle rule, and (`view-flags`) never
+presented, announced or allowed popups. `capabilities.web_fetch`; smoke-mcp
+`SKETERM_SMOKE_MCP_WEBFETCH_ONLY`.
+
 ## 2026-10-09: navigation results on web_open / web_navigate
 
 A navigating call used to report only url/title/loading, so a 404 page, a
