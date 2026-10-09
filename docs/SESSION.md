@@ -1,5 +1,22 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-09: web tabs for several callers on one browser
+
+Sub-agents sharing one `sketerm mcp` trampled each other's tabs through the
+"last touched = current" default. `mcp_web.resolveTarget` is now the one
+place a call's tab is decided: with more than one tab open a call without
+`pane` is refused as `target_required`, `details.tabs` listing handle, label,
+url and title. Headless view ids are random and never reused per process
+(`webdrive.ViewIds`); every tab-acting reply echoes handle, url and label
+(`tabEcho`); `web_open label` tags a tab and `web_close label` closes exactly
+those. Unwatched headless tabs close after `web_idle_close_secs` (default
+1800): the helper now tells a view's owner how many observers watch it
+(`ev_view_watchers`, capability `observe-notify`), and a helper that cannot is
+never idle-closed. A `web_open name:` that would rename the live browser or
+switch its identity is refused as `conflict`. `capabilities.web_tab_rules`
+reports all of it; smoke-mcp `SKETERM_SMOKE_MCP_WEBTABS_ONLY` proves it on a
+real helper with a second client watching.
+
 ## 2026-10-08: opt-in encoded web_stream
 
 `web_stream` takes `encoding:"encoded"` and an ordered `video_codecs` list.
