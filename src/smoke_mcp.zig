@@ -183,6 +183,12 @@ const Mcp = struct {
         return self.recvLine(15_000);
     }
 
+    /// `callTool` with a reply budget of its own.
+    fn callToolTimeout(self: *Mcp, name: []const u8, args_json: []const u8, timeout_ms: i64) []const u8 {
+        self.sendTool(name, args_json);
+        return self.recvLine(timeout_ms);
+    }
+
     /// Issue a tools/call WITHOUT reading the reply — for calls that
     /// make the server talk to a socket this process must serve first.
     fn sendTool(self: *Mcp, name: []const u8, args_json: []const u8) void {
@@ -792,6 +798,17 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         defer _ = c.unsetenv("SKETERM_WEB_BROKER_ENGINE");
         webNavStage(allocator, exe, rt);
         say("smoke-mcp: focused navigation results ok");
+        return 0;
+    }
+    if (c.getenv("SKETERM_SMOKE_MCP_WEBFETCH_ONLY") != null) {
+        var bin_buf: [4096:0]u8 = undefined;
+        const web_bin = resolveWebBin(&bin_buf) orelse fail("sketerm-webengine not built for the web_fetch stage");
+        _ = c.setenv("SKETERM_WEB_BIN", web_bin, 1);
+        defer _ = c.unsetenv("SKETERM_WEB_BIN");
+        _ = c.setenv("SKETERM_WEB_BROKER_ENGINE", "0", 1);
+        defer _ = c.unsetenv("SKETERM_WEB_BROKER_ENGINE");
+        webFetchStage(allocator, exe, rt);
+        say("smoke-mcp: focused web_fetch ok");
         return 0;
     }
     if (c.getenv("SKETERM_SMOKE_MCP_WEBSTREAM_ONLY") != null) {
@@ -7021,6 +7038,413 @@ fn webNavStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8)
     m.closeStdinWait();
 }
 
+/// Stage wf's loopback site. Every connection is served on its own
+/// thread, and the slow paths count how many requests are in flight at
+/// once: the fixture, not the server's own report, proves the tab caps.
+const FetchHttp = struct {
+    lis: tcpserver.Listener = .{ .backlog = 64, .poll_ms = 100 },
+
+    var target_hits: std.atomic.Value(u32) = .init(0);
+    /// Every slow request (path, start, end), for the failure report.
+    var slow_log: [64]struct { path: [24]u8 = @splat(0), start: i64 = 0, end: i64 = 0 } = @splat(.{});
+    var slow_log_n: std.atomic.Value(u32) = .init(0);
+
+    /// Most slow requests in flight at once since `resetPeak`, from the
+    /// recorded intervals (a request still sleeping counts to the end).
+    fn peak() u32 {
+        const n = @min(slow_log_n.load(.acquire), slow_log.len);
+        var best: u32 = 0;
+        for (slow_log[0..n]) |a| {
+            var k: u32 = 0;
+            for (slow_log[0..n]) |b| {
+                const b_end = if (b.end == 0) std.math.maxInt(i64) else b.end;
+                if (b.start <= a.start and a.start < b_end) k += 1;
+            }
+            best = @max(best, k);
+        }
+        return best;
+    }
+
+    fn dumpSlowLog() void {
+        const n = @min(slow_log_n.load(.acquire), slow_log.len);
+        for (slow_log[0..n]) |e| {
+            var buf: [96]u8 = undefined;
+            say(std.fmt.bufPrint(&buf, "  {s} {d}..{d}", .{ std.mem.sliceTo(&e.path, 0), e.start, e.end }) catch continue);
+        }
+    }
+
+    const page =
+        \\<!doctype html><html><head><title>wf-page</title></head><body>
+        \\<article><h1>Fetch fixture</h1><p>FETCH-ARTICLE alpha 42 and beta 77 here.</p><p id="js">waiting</p></article>
+        \\<script>document.getElementById("js").textContent = "JS-" + "RAN-" + (6 * 7);</script>
+        \\</body></html>
+    ;
+    const missing = "<!doctype html><html><head><title>wf-404</title></head><body><p>NOT-FOUND-BODY</p></body></html>";
+    const robots = "User-agent: *\nDisallow: /private\n";
+    const sitemap = "<?xml version=\"1.0\"?><urlset><url><loc>http://example.invalid/a</loc></url></urlset>";
+    const zip = "PK\x03\x04wf-download-bytes";
+    const pdf = "%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj 2 0 obj<</Type/Pages/Kids[]/Count 0>>endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n";
+
+    fn start(self: *FetchHttp) bool {
+        slow_log_n.store(0, .release);
+        target_hits.store(0, .release);
+        return self.lis.start(self, &onConn);
+    }
+
+    fn resetPeak() void {
+        slow_log_n.store(0, .release);
+    }
+
+    fn onConn(_: ?*anyopaque, afd: c_int) bool {
+        const t = std.Thread.spawn(.{}, serve, .{afd}) catch return false;
+        t.detach();
+        return true;
+    }
+
+    fn serve(afd: c_int) void {
+        defer _ = c.close(afd);
+        var buf: [4096]u8 = undefined;
+        const raw = tcpserver.readRequest(afd, &buf, 3000);
+        const path_start = (std.mem.indexOfScalar(u8, raw, ' ') orelse return) + 1;
+        const path_end = std.mem.indexOfScalarPos(u8, raw, path_start, ' ') orelse return;
+        const path = raw[path_start..path_end];
+        const eq = std.mem.eql;
+        if (std.mem.startsWith(u8, path, "/slow/")) {
+            const slot = slow_log_n.fetchAdd(1, .acq_rel);
+            if (slot < slow_log.len) {
+                const n = @min(path.len, 23);
+                @memcpy(slow_log[slot].path[0..n], path[0..n]);
+                slow_log[slot].start = nowMs();
+            }
+            _ = c.usleep(1_500_000);
+            if (slot < slow_log.len) slow_log[slot].end = nowMs();
+            var body_buf: [256]u8 = undefined;
+            const body = std.fmt.bufPrint(&body_buf, "<!doctype html><html><head><title>slow</title></head><body><p>SLOW-PAGE {s}</p></body></html>", .{path[6..]}) catch return;
+            tcpserver.respondOk(afd, "text/html", body, "");
+        } else if (eq(u8, path, "/page")) {
+            tcpserver.respondOk(afd, "text/html", page, "");
+        } else if (eq(u8, path, "/missing")) {
+            tcpserver.respond(afd, "404 Not Found", "text/html", missing, "");
+        } else if (eq(u8, path, "/redir")) {
+            tcpserver.respond(afd, "302 Found", "text/plain", "", "Location: /target\r\n");
+        } else if (eq(u8, path, "/target")) {
+            _ = target_hits.fetchAdd(1, .acq_rel);
+            tcpserver.respondOk(afd, "text/html", "<title>target</title>TARGET", "");
+        } else if (eq(u8, path, "/robots.txt")) {
+            tcpserver.respondOk(afd, "text/plain", robots, "");
+        } else if (eq(u8, path, "/sitemap.xml")) {
+            tcpserver.respondOk(afd, "application/xml", sitemap, "");
+        } else if (eq(u8, path, "/file.zip")) {
+            tcpserver.respondOk(afd, "application/zip", zip, "");
+        } else if (eq(u8, path, "/doc.pdf")) {
+            tcpserver.respondOk(afd, "application/pdf", pdf, "");
+        } else {
+            tcpserver.respond(afd, "404 Not Found", "text/plain", "?", "");
+        }
+    }
+};
+
+/// One reply line, copied, with its JSON-RPC id.
+fn recvReply(m: *Mcp, arena: std.mem.Allocator, timeout_ms: i64) struct { id: i64, line: []const u8 } {
+    const line = arena.dupe(u8, m.recvLine(timeout_ms)) catch fail("oom");
+    const v = std.json.parseFromSliceLeaky(std.json.Value, arena, line, .{}) catch |err| {
+        say(@errorName(err));
+        const dump = std.fmt.allocPrintSentinel(arena, "{s}/wf-bad-reply.json", .{g_rt orelse "/tmp"}, 0) catch fail("oom");
+        @import("util/atomicwrite.zig").writeFileExact(dump, line, 0o600) catch {};
+        say(dump);
+        fail("wf: a reply is not JSON");
+    };
+    const id = v.object.get("id") orelse fail("wf: a reply carries no id");
+    return .{ .id = if (id == .integer) id.integer else -1, .line = line };
+}
+
+fn fetchResults(o: std.json.ObjectMap, comptime what: []const u8) []const std.json.Value {
+    const r = o.get("results") orelse fail(what ++ ": no results");
+    return r.array.items;
+}
+
+fn expectContains(hay: []const u8, needle: []const u8, comptime what: []const u8) void {
+    if (std.mem.indexOf(u8, hay, needle) == null) {
+        say(hay[0..@min(hay.len, 2000)]);
+        fail(what);
+    }
+}
+
+/// Stage wf: web_fetch against the real helper. Six slow urls in one
+/// call (never more than four in flight, and other calls answered
+/// meanwhile), every mode, a 404, a refused connection, an unfollowed
+/// redirect, a zip and robots.txt/sitemap.xml, to_dir, cancellation,
+/// and two concurrent calls held to a lowered instance-wide cap.
+fn webFetchStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) void {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var http = FetchHttp{};
+    if (!http.start()) fail("wf: could not bind the loopback fetch fixture");
+    defer http.lis.deinit();
+    var gone = tcpserver.Listener{};
+    if (!gone.start(null, &FetchHttp.onConn)) fail("wf: could not bind the closed-port probe");
+    const closed_port = gone.port;
+    gone.deinit();
+    const port = http.lis.port;
+    var args: [4096]u8 = undefined;
+
+    var m = Mcp.spawn(allocator, exe, &.{});
+    m.initialize();
+    {
+        const caps = capSc(arena, m.callTool("capabilities", "{}"), "wf: capabilities", false);
+        const f = (caps.get("web_fetch") orelse fail("wf: capabilities has no web_fetch")).object;
+        if (!f.get("available").?.bool) fail("wf: web_fetch is not available");
+        if (capInt(f, "per_call_tabs") != 4 or capInt(f, "max_tabs") != 8) fail("wf: the default limits are not 4 per call and 8 overall");
+    }
+    // Refused before anything opens.
+    _ = capSc(arena, m.callTool("web_fetch", "{\"urls\":[]}"), "wf: empty urls", true);
+    _ = capSc(arena, m.callTool("web_fetch", "{\"urls\":[\"http://x/\"],\"mode\":\"regex\"}"), "wf: regex without pattern", true);
+    _ = capSc(arena, m.callTool("web_fetch", "{\"urls\":[\"http://x/\"],\"mode\":\"regex\",\"pattern\":\"(\"}"), "wf: bad pattern", true);
+    _ = capSc(arena, m.callTool("web_fetch", "{\"urls\":[\"http://x/\"],\"to_dir\":\"rel\"}"), "wf: relative to_dir", true);
+
+    // A tab of the caller's own: fetches must never join it.
+    m.sendTool("web_open", "{\"url\":\"data:text/html,<title>wf-own</title>own\",\"snapshot\":\"none\",\"label\":\"own\"}");
+    _ = capSc(arena, m.recvLine(60_000), "wf: own tab", false);
+
+    // (1) Six slow urls; web_tabs and a handle-less call answered while they run.
+    {
+        var w = std.Io.Writer.fixed(&args);
+        w.writeAll("{\"urls\":[") catch unreachable;
+        for (0..6) |i| w.print("{s}\"http://127.0.0.1:{d}/slow/{d}\"", .{ if (i > 0) "," else "", port, i }) catch unreachable;
+        w.writeAll("]}") catch unreachable;
+        m.sendTool("web_fetch", w.buffered());
+    }
+    const fetch_id: i64 = m.id;
+    _ = c.usleep(400_000);
+    m.sendTool("web_tabs", "{}");
+    const tabs_id: i64 = m.id;
+    m.sendTool("web_snapshot", "{\"detail\":0}");
+    const snap_id: i64 = m.id;
+    var got_fetch: ?[]const u8 = null;
+    var answered_before_fetch: usize = 0;
+    for (0..3) |_| {
+        const r = recvReply(&m, arena, 90_000);
+        if (r.id == fetch_id) {
+            got_fetch = r.line;
+        } else if (r.id == tabs_id) {
+            if (got_fetch == null) answered_before_fetch += 1;
+            const tabs = capSc(arena, r.line, "wf: web_tabs during a fetch", false);
+            if (capInt(tabs, "count") != 1) {
+                say(r.line);
+                fail("wf: web_tabs lists fetch tabs");
+            }
+        } else if (r.id == snap_id) {
+            if (got_fetch == null) answered_before_fetch += 1;
+            // One tab of the caller's: fetch tabs make no target_required.
+            _ = capSc(arena, r.line, "wf: a handle-less call during a fetch", false);
+        } else fail("wf: an unexpected reply id");
+    }
+    if (answered_before_fetch != 2) fail("wf: the server did not answer other calls while a fetch ran");
+    {
+        const r = capSc(arena, got_fetch.?, "wf: six slow urls", false);
+        const rows = fetchResults(r, "wf: six");
+        if (rows.len != 6 or capInt(r, "done") != 6) {
+            say(got_fetch.?[0..@min(got_fetch.?.len, 3000)]);
+            fail("wf: six slow urls are not six done results");
+        }
+        for (rows, 0..) |row, i| {
+            var want: [32]u8 = undefined;
+            expectContains(scStr(row.object, "body", "wf: slow body"), std.fmt.bufPrint(&want, "SLOW-PAGE {d}", .{i}) catch unreachable, "wf: a slow body is not its page's");
+        }
+        const peak = FetchHttp.peak();
+        if (peak > 4) {
+            FetchHttp.dumpSlowLog();
+            fail("wf: more than four fetch tabs of one call loaded at once");
+        }
+        if (peak < 2) fail("wf: the fetch tabs did not load concurrently");
+        if (capInt(r, "peak_tabs") > 4) fail("wf: the reply reports more than four tabs at once");
+        var queued: usize = 0;
+        for (rows) |row| {
+            if (capInt(row.object, "queued_ms") >= 500) queued += 1;
+        }
+        if (queued < 2) fail("wf: urls five and six did not queue behind the first four");
+        if (!r.get("background_tabs").?.bool) fail("wf: the built helper does not keep fetch tabs in the background");
+    }
+
+    // (2) Text mode over every kind of answer.
+    {
+        const reply = m.callToolTimeout("web_fetch", std.fmt.bufPrint(&args, "{{\"urls\":[\"http://127.0.0.1:{d}/page\",\"http://127.0.0.1:{d}/missing\",\"http://127.0.0.1:{d}/\",\"http://127.0.0.1:{d}/robots.txt\",\"http://127.0.0.1:{d}/sitemap.xml\",\"http://127.0.0.1:{d}/file.zip\",\"ftp://example.invalid/\",\"http://127.0.0.1:{d}/doc.pdf\"]}}", .{ port, port, closed_port, port, port, port, port }) catch unreachable, 90_000);
+        const r = capSc(arena, reply, "wf: text mode", false);
+        const rows = fetchResults(r, "wf: text");
+        if (rows.len != 8) fail("wf: eight urls are not eight results");
+        const page_row = rows[0].object;
+        expectFact(page_row, "status", "done", "wf: the page is not done");
+        expectFact(page_row, "kind", "html", "wf: the page is not kind html");
+        expectFact(page_row, "body_source", "reader", "wf: a page in text mode is not reader mode");
+        expectContains(scStr(page_row, "body", "wf: page body"), "FETCH-ARTICLE", "wf: the page text lacks its article");
+        expectContains(scStr(page_row, "body", "wf: page body"), "JS-RAN-42", "wf: the page's script did not run before the read");
+        expectFact(navOf(page_row, "wf: page nav"), "outcome", "page", "wf: the page navigation");
+        const missing_row = rows[1].object;
+        expectFact(missing_row, "status", "done", "wf: a 404 with a body is not done");
+        expectFact(navOf(missing_row, "wf: 404 nav"), "outcome", "http_error", "wf: the 404 is not http_error");
+        if (capInt(navOf(missing_row, "wf: 404 nav"), "status") != 404) fail("wf: the 404 status");
+        expectContains(scStr(missing_row, "body", "wf: 404 body"), "NOT-FOUND-BODY", "wf: the 404 page's body");
+        const refused_row = rows[2].object;
+        expectFact(refused_row, "status", "failed", "wf: a refused connection is not failed");
+        expectFact(navOf(refused_row, "wf: refused nav"), "outcome", "network_error", "wf: the refused navigation");
+        const robots_row = rows[3].object;
+        expectFact(robots_row, "kind", "text", "wf: robots.txt is not kind text");
+        expectFact(robots_row, "body_source", "response", "wf: robots.txt is not the response body");
+        expectContains(scStr(robots_row, "body", "wf: robots"), "Disallow: /private", "wf: robots.txt body");
+        const sitemap_row = rows[4].object;
+        expectFact(sitemap_row, "kind", "text", "wf: sitemap.xml is not kind text");
+        expectContains(scStr(sitemap_row, "body", "wf: sitemap"), "<loc>http://example.invalid/a</loc>", "wf: sitemap.xml body");
+        const zip_row = rows[5].object;
+        expectFact(zip_row, "status", "done", "wf: the zip is not done");
+        expectFact(zip_row, "kind", "file", "wf: the zip is not kind file");
+        const zpath = scStr(zip_row, "path", "wf: zip path");
+        if (capInt(zip_row, "bytes") != FetchHttp.zip.len) fail("wf: the zip's size");
+        var zbuf: [512]u8 = undefined;
+        const zpz = std.fmt.bufPrintZ(&zbuf, "{s}", .{zpath}) catch fail("wf: zip path too long");
+        if (c.access(zpz.ptr, c.F_OK) != 0) fail("wf: the zip was not saved where the result says");
+        expectFact(rows[6].object, "status", "invalid_url", "wf: an ftp url is not invalid_url");
+        // A PDF, shown by the engine or offered as a download, comes back as a file.
+        const pdf_row = rows[7].object;
+        if (!std.mem.eql(u8, scStr(pdf_row, "status", "wf: pdf status"), "done") or !std.mem.eql(u8, scStr(pdf_row, "kind", "wf: pdf kind"), "file")) {
+            say(std.fmt.allocPrint(arena, "{f}", .{std.json.fmt(rows[7], .{})}) catch "?");
+            fail("wf: the pdf is not a done file");
+        }
+        if (capInt(pdf_row, "bytes") != FetchHttp.pdf.len) fail("wf: the pdf's size");
+        if (capInt(r, "invalid_url") != 1 or capInt(r, "failed") != 1) fail("wf: the counts");
+    }
+
+    // (3) raw, regex over text and over raw.
+    {
+        const reply = m.callToolTimeout("web_fetch", std.fmt.bufPrint(&args, "{{\"urls\":[\"http://127.0.0.1:{d}/page\"],\"mode\":\"raw\"}}", .{port}) catch unreachable, 60_000);
+        const row = fetchResults(capSc(arena, reply, "wf: raw", false), "wf: raw")[0].object;
+        expectFact(row, "body_source", "response", "wf: raw is not the response body");
+        const body = scStr(row, "body", "wf: raw body");
+        expectContains(body, "(6 * 7)", "wf: raw is not the page source");
+        if (std.mem.indexOf(u8, body, "JS-RAN-42") != null) fail("wf: raw holds the rendered DOM, not the source");
+    }
+    {
+        const reply = m.callToolTimeout("web_fetch", std.fmt.bufPrint(&args, "{{\"urls\":[\"http://127.0.0.1:{d}/page\"],\"mode\":\"regex\",\"pattern\":\"(alpha|beta) \\\\d+\",\"context_chars\":10}}", .{port}) catch unreachable, 60_000);
+        const row = fetchResults(capSc(arena, reply, "wf: regex", false), "wf: regex")[0].object;
+        if (capInt(row, "match_count") != 2) {
+            say(reply[0..@min(reply.len, 2000)]);
+            fail("wf: the regex did not find alpha and beta");
+        }
+        const first = row.get("matches").?.array.items[0].object;
+        expectFact(first, "match", "alpha 42", "wf: the first match");
+        expectContains(scStr(first, "before", "wf: before"), "ARTICLE", "wf: a match's context");
+    }
+    {
+        const reply = m.callToolTimeout("web_fetch", std.fmt.bufPrint(&args, "{{\"urls\":[\"http://127.0.0.1:{d}/page\"],\"mode\":\"regex\",\"regex_in\":\"raw\",\"pattern\":\"<script>\"}}", .{port}) catch unreachable, 60_000);
+        const row = fetchResults(capSc(arena, reply, "wf: regex raw", false), "wf: regex raw")[0].object;
+        if (capInt(row, "match_count") != 1) fail("wf: regex_in raw did not search the source");
+    }
+
+    // (4) An unfollowed redirect never reaches its target.
+    {
+        const reply = m.callToolTimeout("web_fetch", std.fmt.bufPrint(&args, "{{\"urls\":[\"http://127.0.0.1:{d}/redir\"],\"follow_redirects\":false}}", .{port}) catch unreachable, 60_000);
+        const row = fetchResults(capSc(arena, reply, "wf: no redirect", false), "wf: no redirect")[0].object;
+        const n = navOf(row, "wf: redirect nav");
+        expectFact(n, "outcome", "redirect", "wf: an unfollowed redirect is not outcome redirect");
+        if (capInt(n, "status") != 302) fail("wf: the unfollowed redirect's status");
+        if (!std.mem.endsWith(u8, scStr(n, "location", "wf: location"), "/target")) fail("wf: the unfollowed redirect's location");
+        if (FetchHttp.target_hits.load(.acquire) != 0) fail("wf: the redirect target was requested");
+    }
+
+    // (5) to_dir.
+    {
+        const dir = std.fmt.allocPrint(arena, "{s}/wf-out", .{rt}) catch unreachable;
+        const reply = m.callToolTimeout("web_fetch", std.fmt.bufPrint(&args, "{{\"urls\":[\"http://127.0.0.1:{d}/page\",\"http://127.0.0.1:{d}/robots.txt\"],\"to_dir\":\"{s}\"}}", .{ port, port, dir }) catch unreachable, 60_000);
+        const rows = fetchResults(capSc(arena, reply, "wf: to_dir", false), "wf: to_dir");
+        for (rows) |row| {
+            if (row.object.get("body").? != .null) fail("wf: to_dir still returned a body inline");
+            const pth = scStr(row.object, "path", "wf: to_dir path");
+            if (!std.mem.startsWith(u8, pth, dir)) fail("wf: a to_dir file is outside to_dir");
+        }
+        if (!std.mem.endsWith(u8, scStr(rows[0].object, "path", "wf: md"), ".md")) fail("wf: a page's text is not written as .md");
+        var pbuf: [512]u8 = undefined;
+        const pz = std.fmt.bufPrintZ(&pbuf, "{s}", .{scStr(rows[0].object, "path", "wf: md")}) catch unreachable;
+        var fbuf: [4096]u8 = undefined;
+        const f = c.fopen(pz.ptr, "r") orelse fail("wf: the to_dir file cannot be opened");
+        const n = c.fread(&fbuf, 1, fbuf.len, f);
+        _ = c.fclose(f);
+        expectContains(fbuf[0..n], "FETCH-ARTICLE", "wf: the to_dir file holds the page text");
+    }
+
+    // (6) Cancellation closes the tabs and answers nothing.
+    {
+        var w = std.Io.Writer.fixed(&args);
+        w.writeAll("{\"urls\":[") catch unreachable;
+        for (0..3) |i| w.print("{s}\"http://127.0.0.1:{d}/slow/c{d}\"", .{ if (i > 0) "," else "", port, i }) catch unreachable;
+        w.writeAll("]}") catch unreachable;
+        m.sendTool("web_fetch", w.buffered());
+        _ = c.usleep(500_000);
+        var nbuf: [128]u8 = undefined;
+        m.send(std.fmt.bufPrint(&nbuf, "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{{\"requestId\":{d}}}}}", .{m.id}) catch unreachable);
+        const caps = capSc(arena, m.callTool("capabilities", "{}"), "wf: capabilities after cancel", false);
+        const f = caps.get("web_fetch").?.object;
+        if (capInt(f, "in_flight") != 0 or capInt(f, "open_tabs") != 0) fail("wf: a cancelled fetch left tabs open");
+    }
+
+    // No fetch tab outlives its call; the caller's own tab is untouched.
+    {
+        const caps = capSc(arena, m.callTool("capabilities", "{}"), "wf: capabilities at the end", false);
+        if (capInt(caps.get("web_fetch").?.object, "open_tabs") != 0) fail("wf: a fetch tab survived its call");
+        const tabs = capSc(arena, m.callTool("web_tabs", "{}"), "wf: tabs at the end", false);
+        if (capInt(tabs, "count") != 1) fail("wf: the caller's own tab is not the only tab");
+    }
+    m.closeStdinWait();
+
+    // (7) Two concurrent calls under a lowered instance-wide cap.
+    var cfg_dir_buf: [300]u8 = undefined;
+    const cfg_dir = std.fmt.bufPrintZ(&cfg_dir_buf, "{s}/config/sketerm", .{rt}) catch unreachable;
+    pathz.makeDirs(cfg_dir, 0o700) catch {};
+    var cfg_buf: [320]u8 = undefined;
+    const cfg_path = std.fmt.bufPrintZ(&cfg_buf, "{s}/config.conf", .{cfg_dir}) catch unreachable;
+    @import("util/atomicwrite.zig").writeFileExact(cfg_path, "[mcp]\nweb_fetch_max_tabs = 3\n", 0o600) catch fail("wf: write the fetch config");
+    defer _ = c.unlink(cfg_path.ptr);
+    var m2 = Mcp.spawn(allocator, exe, &.{});
+    m2.initialize();
+    {
+        const caps = capSc(arena, m2.callTool("capabilities", "{}"), "wf: capped capabilities", false);
+        if (capInt(caps.get("web_fetch").?.object, "max_tabs") != 3) fail("wf: web_fetch_max_tabs from config is not in force");
+    }
+    FetchHttp.resetPeak();
+    var ids: [2]i64 = undefined;
+    for (0..2) |call| {
+        var w = std.Io.Writer.fixed(&args);
+        w.writeAll("{\"urls\":[") catch unreachable;
+        for (0..4) |i| w.print("{s}\"http://127.0.0.1:{d}/slow/m{d}-{d}\"", .{ if (i > 0) "," else "", port, call, i }) catch unreachable;
+        w.writeAll("]}") catch unreachable;
+        m2.sendTool("web_fetch", w.buffered());
+        ids[call] = m2.id;
+    }
+    for (0..2) |_| {
+        const r = recvReply(&m2, arena, 120_000);
+        const o = capSc(arena, r.line, "wf: a concurrent call", false);
+        if (capInt(o, "done") != 4) {
+            say(r.line[0..@min(r.line.len, 3000)]);
+            fail("wf: a concurrent call did not finish all four urls");
+        }
+        if (capInt(o, "max_tabs") != 3) fail("wf: a concurrent call does not report the cap");
+        // Both calls got a tab at once: neither waited for the other.
+        var first_wait: i64 = std.math.maxInt(i64);
+        for (fetchResults(o, "wf: concurrent")) |row| first_wait = @min(first_wait, capInt(row.object, "queued_ms"));
+        if (first_wait > 1000) fail("wf: a concurrent call waited for the other one to finish");
+    }
+    const peak = FetchHttp.peak();
+    if (peak > 3) {
+        FetchHttp.dumpSlowLog();
+        fail("wf: two concurrent calls loaded more than the instance cap at once");
+    }
+    if (peak < 2) fail("wf: two concurrent calls did not load concurrently");
+    {
+        const caps = capSc(arena, m2.callTool("capabilities", "{}"), "wf: capped end", false);
+        if (capInt(caps.get("web_fetch").?.object, "open_tabs") != 0) fail("wf: a fetch tab survived the concurrent calls");
+    }
+    m2.closeStdinWait();
+}
+
 /// Run only the optional browser stage for focused E2E validation.
 fn webOnly(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: [:0]const u8) u8 {
     var bin_buf: [4096:0]u8 = undefined;
@@ -7044,6 +7468,8 @@ fn webOnly(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: [:0]const u8) u
     say("smoke-mcp: focused shared-browser tab targeting ok");
     webNavStage(allocator, exe, rt);
     say("smoke-mcp: focused navigation results ok");
+    webFetchStage(allocator, exe, rt);
+    say("smoke-mcp: focused web_fetch ok");
     killDaemonsUnderRt(rt, allocator);
     _ = c.usleep(500_000);
     g_rt = null;

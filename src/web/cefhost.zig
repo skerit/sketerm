@@ -540,6 +540,10 @@ pub const View = struct {
     /// it — it paints nothing, is never announced to the client, and
     /// takes no frames.
     windowed: bool = false,
+    /// Created with `ViewCreateUrl.FLAG_BACKGROUND` (a fetch the client
+    /// reads and closes): never presented, never announced to
+    /// observers, and every popup it asks for is refused.
+    background: bool = false,
 
     /// dma-buf pool identity (accelerated mode only). The engine renders
     /// into a handful of buffers and cycles through them, handing the
@@ -1724,15 +1728,27 @@ pub const Host = struct {
 
     /// Requested media overrides are acknowledged before the initial URL is loaded.
     pub fn createViewUrl(self: *Host, req: proto.ViewCreateUrl) !void {
-        return self.createViewAt(.{
+        if (req.flags & proto.ViewCreateUrl.FLAG_NO_REDIRECT != 0 and req.view != 0 and self.find(req.view) == null) {
+            // Held in the view's intercept slot BEFORE the browser
+            // exists, so its very first redirect is already refused;
+            // a full table refuses the view rather than follow.
+            if (!host_icpt.refuseRedirects(self.gpa, req.view)) {
+                self.post(proto.EvViewCreateFailed{ .view = req.view, .context = req.context, .reason = "the intercept table is full; a view that must not follow redirects cannot be held" });
+                return;
+            }
+        }
+        return self.createViewFull(.{
             .view = req.view,
             .w = req.w,
             .h = req.h,
             .scale_x1000 = req.scale_x1000,
             .context = req.context,
             .max_fps = req.max_fps,
-        }, req.url);
+        }, req.url, &system_browser_spawn_ops, .{ .background = req.flags & proto.ViewCreateUrl.FLAG_BACKGROUND != 0 });
     }
+
+    /// What a creation sets beyond the `ViewCreate` geometry.
+    const CreateOpts = struct { background: bool = false };
 
     /// Create a windowless browser for `id`. A duplicate id is ignored
     /// (view ids are client-allocated and never reused). An empty
@@ -1742,6 +1758,10 @@ pub const Host = struct {
     }
 
     fn createViewAtWith(self: *Host, req: proto.ViewCreate, initial_url: []const u8, ops: *const BrowserSpawnOps) !void {
+        return self.createViewFull(req, initial_url, ops, .{});
+    }
+
+    fn createViewFull(self: *Host, req: proto.ViewCreate, initial_url: []const u8, ops: *const BrowserSpawnOps, opts: CreateOpts) !void {
         if (req.view == 0 or self.find(req.view) != null) return;
         if (req.max_fps > proto.MAX_VIEW_FPS) {
             self.post(proto.EvViewCreateFailed{ .view = req.view, .context = req.context, .reason = "frame rate exceeds the CEF cap" });
@@ -1767,7 +1787,7 @@ pub const Host = struct {
             self.post(proto.EvViewCreateFailed{ .view = req.view, .context = req.context, .reason = "untrusted view requires an installed untrusted policy and fresh context" });
             return;
         }
-        const v = try self.registerView(req);
+        const v = try self.registerViewWith(req, opts);
         // registerView transferred ownership to Host.views. From here on
         // every failure leaves cleanup to that owner, never to spawnBrowser.
         errdefer self.destroyView(v.id);
@@ -1812,6 +1832,10 @@ pub const Host = struct {
 
     /// Construct a view and transfer ownership only after it is in the list.
     fn registerView(self: *Host, req: proto.ViewCreate) !*View {
+        return self.registerViewWith(req, .{});
+    }
+
+    fn registerViewWith(self: *Host, req: proto.ViewCreate, opts: CreateOpts) !*View {
         const v = try self.gpa.create(View);
         errdefer self.gpa.destroy(v);
         const scale: u16 = if (req.scale_x1000 == 0) 1000 else req.scale_x1000;
@@ -1829,6 +1853,7 @@ pub const Host = struct {
             .context = req.context,
             .sem = semantic.View.init(self.gpa),
             .max_fps = req.max_fps,
+            .background = opts.background,
         };
         for (&self.pending_media) |*slot| {
             if (slot.view == req.view) {
@@ -7019,6 +7044,9 @@ fn onBeforePopup(
     if (untrusted.enabled) return 1;
     const host = g_host orelse return 1;
     const v = viewOf(browser) orelse return 1;
+    // A background fetch reads one document and is closed; a popup
+    // would outlive it as a view nobody owns.
+    if (v.background) return 1;
     var s = Utf8.init(target_url);
     defer s.free();
     var fname = Utf8.init(target_frame_name);

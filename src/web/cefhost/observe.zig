@@ -60,9 +60,10 @@ pub fn presenterPump(self: *Host) void {
 
 /// Views a human may watch: pages, never engine chrome. Background
 /// pages and action popups belong to extensions, inspectors are
-/// engine UI, and a windowed inspector has no frames at all.
+/// engine UI, a windowed inspector has no frames at all, and a
+/// `background` view is a client's fetch, read once and closed.
 pub fn presentable(v: *const View) bool {
-    return !v.webext_bg and !v.webext_popup and v.devtools_of == 0 and !v.windowed;
+    return !v.webext_bg and !v.webext_popup and v.devtools_of == 0 and !v.windowed and !v.background;
 }
 
 // -- observers (capability "observe") ------------------------------

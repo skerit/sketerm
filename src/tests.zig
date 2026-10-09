@@ -275,6 +275,7 @@ comptime {
     _ = @import("ipc/webprofiles.zig");
     _ = @import("ipc/webtabs.zig");
     _ = @import("ipc/webnav.zig");
+    _ = @import("ipc/webfetch.zig");
     _ = @import("ipc/mcp.zig");
     _ = @import("ipc/mcp_app.zig");
     _ = @import("ipc/mcp_files.zig");

@@ -34,6 +34,10 @@ pub const Outcome = enum {
     /// No document request was logged: a back/forward-cache or
     /// same-document navigation, or a view the log does not cover.
     no_request,
+    /// The server redirected and the view was told not to follow
+    /// (`web_fetch follow_redirects:false`): status and url are the
+    /// redirect's own, `location` is where it pointed.
+    redirect,
 };
 
 /// The conditions `web_wait for` takes; `web_open`/`web_navigate` `wait`
@@ -214,11 +218,18 @@ pub const Nav = struct {
     /// The url the requested navigation had reached when another one
     /// superseded it (`replaced` only).
     replaced_url: ?[]const u8 = null,
+    /// Where an unfollowed redirect pointed (`redirect` only).
+    location: ?[]const u8 = null,
     download_path: ?[]const u8 = null,
     /// `net-log-detail` was available: redirects, content type, status
     /// text and net errors are measured; false = they are unknown.
     detail: bool = false,
 };
+
+/// The `reason` a refused redirect hop is logged with
+/// (`web_proto.NetReason.redirect_refused`; this module stays engine-free,
+/// and a test in `mcp_web.zig` pins the two together).
+pub const REDIRECT_REFUSED = "redirect_refused";
 
 fn bySeq(entries: []const Entry, seq: u32) ?*const Entry {
     for (entries) |*e| if (e.seq == seq) return e;
@@ -307,6 +318,24 @@ pub fn derive(arena: std.mem.Allocator, log: Log, in: Input) !Nav {
         if (last.status_text.len > 0) nav.status_text = last.status_text;
     }
 
+    // The refused hop of an unfollowed redirect: the navigation IS the
+    // 3xx before it, and the refused url is where it pointed.
+    if (last.blocked and std.mem.eql(u8, last.reason, REDIRECT_REFUSED) and chain.len >= 2) {
+        const r = chain[chain.len - 2];
+        nav.redirects = hops.items[0 .. hops.items.len - 1];
+        nav.url = r.url;
+        nav.scheme = schemeOf(r.url);
+        nav.status = r.status;
+        nav.status_text = if (r.status_text.len > 0) r.status_text else null;
+        nav.content_type = if (r.mime.len > 0) r.mime else null;
+        nav.size = null;
+        nav.error_code = null;
+        nav.@"error" = null;
+        nav.location = last.url;
+        nav.outcome = .redirect;
+        return nav;
+    }
+
     nav.outcome = blk: {
         if (last.blocked) {
             nav.blocked_reason = last.reason;
@@ -350,6 +379,7 @@ pub fn sentence(arena: std.mem.Allocator, nav: Nav) ![]const u8 {
         .non_http => try w.print("navigation: {s}: url, no HTTP status exists for it", .{if (nav.scheme.len > 0) nav.scheme else "non-HTTP"}),
         .pending => try w.writeAll("navigation: the document had not finished inside the budget"),
         .no_request => try w.writeAll("navigation: no document request was logged (a back/forward-cache or same-document navigation)"),
+        .redirect => try w.print("navigation: REDIRECT {d}{s}{s} to {s}, not followed (follow_redirects:false)", .{ nav.status orelse 0, if (nav.status_text != null) " " else "", nav.status_text orelse "", nav.location orelse "?" }),
     }
     if (nav.redirects.len > 0) {
         try w.writeAll(" after ");
@@ -467,6 +497,25 @@ test "an older helper's log yields status only, flagged as such" {
     try t.expect(!n.detail);
     try t.expectEqual(@as(?[]const u8, null), n.content_type);
     try t.expect(std.mem.indexOf(u8, try sentence(ar, n), "null") != null);
+}
+
+test "an unfollowed redirect reports the 3xx and where it pointed" {
+    var a = std.heap.ArenaAllocator.init(t.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    const log = testLog(ar,
+        \\{"next_seq":3,"detail":true,"entries":[
+        \\{"seq":1,"blocked":false,"type":"document","method":"GET","url":"http://h/r","status":302,"duration_ms":1,"size":0,"redirect":true,"status_text":"Found"},
+        \\{"seq":2,"blocked":true,"type":"document","method":"GET","url":"http://h/target","reason":"redirect_refused","prev_seq":1}]}
+    );
+    const n = try derive(ar, log, .{ .requested = "http://h/r", .view_url = "http://h/r", .load_error = .{ .code = -20, .msg = "BLOCKED_BY_CLIENT" } });
+    try t.expectEqual(Outcome.redirect, n.outcome);
+    try t.expectEqual(@as(?u16, 302), n.status);
+    try t.expectEqualStrings("http://h/r", n.url);
+    try t.expectEqualStrings("http://h/target", n.location.?);
+    try t.expectEqual(@as(usize, 0), n.redirects.len);
+    try t.expect(n.@"error" == null);
+    try t.expect(std.mem.indexOf(u8, try sentence(ar, n), "not followed") != null);
 }
 
 test "wait conditions: a navigation takes every one but response" {

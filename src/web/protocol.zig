@@ -399,6 +399,13 @@ pub const CAP_STREAM_AUDIO = "stream-audio";
 pub const CAP_STREAM_ENCODED = "stream-encoded";
 pub const CAP_SOFTWARE_WEBGL = "software-webgl";
 pub const CAP_VIEW_MAX_FPS = "view-max-fps";
+/// `view_create_url` honours its optional trailing `flags` byte
+/// (`ViewCreateUrl.FLAG_*`): a BACKGROUND view is never presented,
+/// never announced to observers and opens no popups; a NO_REDIRECT view
+/// refuses its main frame's server redirects, logging the refused hop
+/// with reason `redirect_refused`. A client must not send the byte to a
+/// helper without this capability.
+pub const CAP_VIEW_FLAGS = "view-flags";
 pub const MAX_VIEW_FPS: u16 = 240;
 pub const DEFAULT_HEADLESS_FPS: u16 = 60;
 
@@ -468,6 +475,7 @@ pub const Cap = enum {
     stream_encoded,
     software_webgl,
     view_max_fps,
+    view_flags,
 
     /// The wire name `hello_ack` carries.
     pub fn name(self: Cap) []const u8 {
@@ -560,6 +568,14 @@ test "view creation frame-rate tails retain legacy decoding and reject a partial
     try encodePayload(gpa, &bytes, ViewCreateUrl{ .view = 1, .w = 800, .h = 600, .scale_x1000 = 1000, .context = 0, .url = "about:blank", .max_fps = 15 });
     try std.testing.expectEqual(@as(u16, 15), (try decode(ViewCreateUrl, bytes.items)).max_fps);
     try std.testing.expectEqual(@as(u16, 0), (try decode(ViewCreateUrl, bytes.items[0 .. bytes.items.len - 2])).max_fps);
+    // Flags ride after the frame-rate slot, which they force onto the wire.
+    bytes.clearRetainingCapacity();
+    try encodePayload(gpa, &bytes, ViewCreateUrl{ .view = 1, .w = 800, .h = 600, .scale_x1000 = 1000, .context = 0, .url = "about:blank", .flags = ViewCreateUrl.FLAG_BACKGROUND | ViewCreateUrl.FLAG_NO_REDIRECT });
+    const flagged = try decode(ViewCreateUrl, bytes.items);
+    try std.testing.expectEqual(@as(u16, 0), flagged.max_fps);
+    try std.testing.expectEqual(@as(u8, 3), flagged.flags);
+    try std.testing.expectEqual(@as(u8, 0), (try decode(ViewCreateUrl, bytes.items[0 .. bytes.items.len - 1])).flags);
+    try std.testing.expectEqualStrings("view-flags", Cap.view_flags.name());
 }
 
 /// Per-connection id window under `multi-client`: connection k owns
@@ -1104,6 +1120,12 @@ pub const ViewCreateUrl = struct {
     context: u32,
     url: []const u8,
     max_fps: u16 = 0,
+    /// `FLAG_*` bits, gated by `CAP_VIEW_FLAGS`. Nonzero flags force the
+    /// `max_fps` slot onto the wire (0 there still means "no cap").
+    flags: u8 = 0,
+
+    pub const FLAG_BACKGROUND: u8 = 1;
+    pub const FLAG_NO_REDIRECT: u8 = 2;
 
     pub fn encodeTo(self: ViewCreateUrl, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
         try putU32(gpa, out, self.view);
@@ -1112,12 +1134,16 @@ pub const ViewCreateUrl = struct {
         try putU16(gpa, out, self.scale_x1000);
         try putU32(gpa, out, self.context);
         try putStr(gpa, out, self.url);
-        if (self.max_fps != 0) try putU16(gpa, out, self.max_fps);
+        if (self.max_fps != 0 or self.flags != 0) try putU16(gpa, out, self.max_fps);
+        if (self.flags != 0) try putU8(gpa, out, self.flags);
     }
 
     pub fn decodeFrom(payload: []const u8) !ViewCreateUrl {
         var cur = Cur{ .buf = payload };
-        return .{ .view = try cur.readU32(), .w = try cur.readU16(), .h = try cur.readU16(), .scale_x1000 = try cur.readU16(), .context = try cur.readU32(), .url = try cur.readStr(), .max_fps = if (cur.pos == payload.len) 0 else try cur.readU16() };
+        var out: ViewCreateUrl = .{ .view = try cur.readU32(), .w = try cur.readU16(), .h = try cur.readU16(), .scale_x1000 = try cur.readU16(), .context = try cur.readU32(), .url = try cur.readStr() };
+        if (cur.pos != payload.len) out.max_fps = try cur.readU16();
+        if (cur.pos != payload.len) out.flags = try cur.readU8();
+        return out;
     }
 };
 
@@ -3074,6 +3100,9 @@ pub const NetReason = enum(u8) {
     untrusted_timeout = 19,
     /// Every untrusted broker job was busy and its wait queue was full.
     untrusted_queue_full = 20,
+    /// A `FLAG_NO_REDIRECT` view's main frame was redirected; the
+    /// re-issued hop (its url is where the redirect pointed) is refused.
+    redirect_refused = 21,
     _,
 };
 
@@ -3082,6 +3111,10 @@ pub const NREASONS = std.meta.fields(NetReason).len;
 
 /// The counters an `EvNetPolicy` carried before the untrusted reasons were appended.
 pub const NREASONS_LEGACY = 12;
+
+/// Every counter count an `EvNetPolicy` ever shipped with, oldest first;
+/// the last is `NREASONS`. A decoder accepts exactly these.
+pub const NREASONS_SHIPPED = [_]usize{ NREASONS_LEGACY, 21, NREASONS };
 
 pub fn reasonName(r: NetReason) []const u8 {
     return std.enums.tagName(NetReason, r) orelse "unknown";
@@ -3234,8 +3267,8 @@ pub const EvNetPolicy = struct {
         out.ms_left = try cur.readU32();
         out.denied = @splat(0);
         for (&out.denied, 0..) |*d, i| {
-            // A pre-untrusted helper sends exactly the legacy counters.
-            if (cur.buf.len == cur.pos and i == NREASONS_LEGACY) break;
+            // An older helper sends exactly one of the shipped counts.
+            if (cur.buf.len == cur.pos and std.mem.indexOfScalar(usize, &NREASONS_SHIPPED, i) != null) break;
             d.* = try cur.readU32();
         }
         return out;
@@ -6842,10 +6875,18 @@ test "new refusal counters append to legacy policy accounting" {
     const legacy = try decode(EvNetPolicy, payload.items[0 .. payload.items.len - appended]);
     try std.testing.expectEqual(@as(u32, 5), legacy.requests);
     try std.testing.expectEqual(@as(u32, 0), legacy.denied[12]);
-    // Only the shipped legacy length and the full length decode; no intermediate count ever shipped.
+    // Only the shipped lengths decode; no intermediate count ever shipped.
     var cut: usize = 4;
-    while (cut < appended) : (cut += 4)
-        try std.testing.expectError(error.Truncated, decode(EvNetPolicy, payload.items[0 .. payload.items.len - cut]));
+    while (cut < appended) : (cut += 4) {
+        const count = NREASONS - cut / 4;
+        const cutp = payload.items[0 .. payload.items.len - cut];
+        if (std.mem.indexOfScalar(usize, &NREASONS_SHIPPED, count) != null) {
+            const older = try decode(EvNetPolicy, cutp);
+            try std.testing.expectEqual(@as(u32, 7), older.denied[12]);
+            try std.testing.expectEqual(@as(u32, 0), older.denied[count]);
+        } else try std.testing.expectError(error.Truncated, decode(EvNetPolicy, cutp));
+    }
+    try std.testing.expectEqualStrings("redirect_refused", reasonName(.redirect_refused));
     try std.testing.expectError(error.Truncated, decode(EvNetPolicy, payload.items[0 .. payload.items.len - appended + 1]));
     for (std.enums.values(NetReason)) |r| try std.testing.expect(!std.mem.eql(u8, reasonName(r), "unknown"));
     try std.testing.expectEqualStrings("unknown", reasonName(@enumFromInt(NREASONS)));

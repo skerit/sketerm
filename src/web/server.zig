@@ -158,6 +158,7 @@ const unconditional_caps = [_]proto.Cap{
     .web_emulation,
     .web_stream,
     .view_max_fps,
+    .view_flags,
 };
 
 /// Test-only negotiation seam: an environment switch that withholds one
@@ -177,6 +178,7 @@ fn withheld(cap: proto.Cap) bool {
         .stream_encoded => "SKETERM_WEB_DISABLE_STREAM_ENCODED",
         .view_max_fps => "SKETERM_WEB_DISABLE_MAX_FPS",
         .frames_encoded => "SKETERM_WEB_DISABLE_FRAMES_ENCODED",
+        .view_flags => "SKETERM_WEB_DISABLE_VIEW_FLAGS",
         else => return false,
     };
     return c.getenv(env) != null;

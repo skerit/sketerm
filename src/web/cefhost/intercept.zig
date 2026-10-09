@@ -1556,6 +1556,9 @@ pub const ISlot = struct {
     /// before using it outside, so a reinstall or unregister never frees
     /// a store a callback is still writing into.
     cap: ?*capture.Store = null,
+    /// `ViewCreateUrl.FLAG_NO_REDIRECT`: a main-frame redirect hop is
+    /// refused (`redirect_refused`) instead of followed.
+    no_redirect: bool = false,
 };
 
 pub const Intercept = struct {
@@ -1697,6 +1700,16 @@ pub fn interceptSlotFor(gpa: std.mem.Allocator, view_id: u32) ?*ISlot {
     s.* = .{ .used = true, .cef_id = 0, .view_id = view_id, .ring = ring };
     keep = true;
     return s;
+}
+
+/// MAIN thread. Mark `view_id`'s slot (minted now when missing) to
+/// refuse main-frame redirects. False when the table is full.
+pub fn refuseRedirects(gpa: std.mem.Allocator, view_id: u32) bool {
+    const s = interceptSlotFor(gpa, view_id) orelse return false;
+    g_int.acquire();
+    defer g_int.release();
+    s.no_redirect = true;
+    return true;
 }
 
 pub fn interceptUnregister(gpa: std.mem.Allocator, view_id: u32) void {
@@ -2143,6 +2156,14 @@ pub fn onBeforeResourceLoad(
         // urlrequest traffic — documented unpoliced, matching the
         // filter's own exemption above).
         var pol_reason: proto.NetReason = .none;
+        // A view that must not follow redirects refuses the re-issued
+        // main-frame hop; the 3xx before it is already logged.
+        if (!verdict) if (slot) |s| if (s.no_redirect and rtype == .document) {
+            if (s.ring) |ring| if (hopOf(ring, req_id) != null) {
+                pol_reason = .redirect_refused;
+                verdict = true;
+            };
+        };
         if (!verdict) {
             if (slot) |s| {
                 if (s.pol) |pol| {

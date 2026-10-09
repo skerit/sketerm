@@ -39,6 +39,7 @@ const mcp_term = @import("mcp_term.zig");
 const mcp_caps = @import("mcp_caps.zig");
 const mcp_ui = @import("mcp_ui.zig");
 const mcp_agent = @import("mcp_agent.zig");
+const mcp_webfetch = @import("mcp_webfetch.zig");
 const agentwait = @import("agentwait.zig");
 const agentsline = @import("agentsline.zig");
 const agentpush = @import("agentpush.zig");
@@ -811,12 +812,15 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     const web_gui_grant = resolveWebGuiGrant(opts, &cfg) catch return 2;
     var web_max_fps = cfg.mcp.web_max_fps;
     var web_idle_close_secs = cfg.mcp.web_idle_close_secs;
+    var web_fetch_max_tabs = cfg.mcp.web_fetch_max_tabs;
     if (opts.profile) |name| {
         const prof = mcpProfileRecord(&cfg, name) catch return 2;
         if (prof.web_max_fps) |fps| web_max_fps = fps;
         if (prof.web_idle_close_secs) |secs| web_idle_close_secs = secs;
+        if (prof.web_fetch_max_tabs) |n| web_fetch_max_tabs = n;
     }
     @import("mcp_web.zig").configureIdleClose(web_idle_close_secs);
+    mcp_webfetch.configure(web_fetch_max_tabs);
 
     if (opts.log_dir) |ld| {
         mcp_log = McpLog.open(allocator, ld) orelse {
@@ -1061,6 +1065,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     // keeps writing into its cache dir, leaving the dir un-removable.
     // Agents first: an agent may borrow a term_* terminal.
     mcp_agent.shutdown();
+    mcp_webfetch.shutdown();
     @import("mcp_web.zig").shutdownHeadless();
     mcp_term.forward_state.deinit();
     mcp_term.term_state.deinit();
@@ -1132,7 +1137,7 @@ fn waitInput(input: *std.ArrayList(u8), allocator: std.mem.Allocator) InputWait 
     pfds[0] = .{ .fd = 0, .events = c.POLLIN, .revents = 0 };
     const n = 1 + mcp_agent.pollFds(pfds[1..]);
     const now = clock.nowMs();
-    const due = minDue(mcp_agent.dueInMs(now), @import("mcp_web.zig").idleDueInMs(now));
+    const due = minDue(minDue(mcp_agent.dueInMs(now), @import("mcp_web.zig").idleDueInMs(now)), mcp_webfetch.dueInMs(now));
     const timeout: c_int = if (due) |d| @intCast(std.math.clamp(d, 0, 1000)) else -1;
     const rc = c.poll(&pfds, @intCast(n), timeout);
     if (rc < 0) return if (std.posix.errno(rc) == .INTR) .more else .failed;
@@ -1141,6 +1146,13 @@ fn waitInput(input: *std.ArrayList(u8), allocator: std.mem.Allocator) InputWait 
     // Between requests: an idle browser tab closes on time even when no
     // web call arrives to notice it.
     @import("mcp_web.zig").idleSweep(clock.nowMs());
+    // Deferred fetches advance between requests, under the watchdog
+    // like any call.
+    if (mcp_webfetch.active()) {
+        Watchdog.begin();
+        mcp_webfetch.service();
+        Watchdog.end();
+    }
     if (pfds[0].revents == 0) return .more;
     var buf: [65536]u8 = undefined;
     const got = c.read(0, &buf, buf.len);
@@ -1268,6 +1280,12 @@ pub fn handleMessage(arena: std.mem.Allocator, backend: Backend, line: []const u
         w.writeAll("}") catch return null;
         return rpcResult(arena, id, aw.written());
     }
+    // A client that gave up on a call: a deferred one stops and
+    // releases what it holds; it is never answered (MCP cancellation).
+    if (std.mem.eql(u8, method, "notifications/cancelled")) {
+        if (params == .object) if (params.object.get("requestId")) |rid| mcp_webfetch.cancel(arena, rid);
+        return null;
+    }
     if (std.mem.startsWith(u8, method, "notifications/")) return null;
     if (std.mem.eql(u8, method, "ping")) {
         return rpcResult(arena, id, "{}");
@@ -1290,23 +1308,34 @@ pub fn handleMessage(arena: std.mem.Allocator, backend: Backend, line: []const u
             const msg = withheldMessage(arena, name_v.string) catch return null;
             return rpcResult(arena, id, errRes(arena, .refused, msg) catch return null);
         }
-        const outcome = callTool(arena, backend, name_v.string, args) catch |err| {
+        const outcome = callTool(arena, backend, name_v.string, args, if (is_notification) null else id) catch |err| {
             const msg = std.fmt.allocPrint(arena, "tool failed: {s}", .{@errorName(err)}) catch return null;
             return rpcResult(arena, id, errRes(arena, .failed, msg) catch return null);
         };
         if (is_notification) return null;
-        return rpcResult(arena, id, outcome);
+        return switch (outcome) {
+            .reply => |r| rpcResult(arena, id, r),
+            // Answered later from the server loop (`replyLater`).
+            .deferred => null,
+        };
     }
     if (is_notification) return null;
     return rpcError(arena, id, -32601, "method not found");
 }
 
+/// A tool call's answer: now, or later from the server loop.
+pub const Called = union(enum) { reply: []const u8, deferred };
+
 /// Every call goes through the tool table: `mcp_tools.route` names the
 /// group, and each group handler switches exhaustively over that group's
-/// tools, so a table entry without a handler does not compile.
-fn callTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: std.json.Value) ![]const u8 {
-    const routed = mcp_tools.route(name) orelse return errRes(arena, .unknown_tool, "unknown tool");
-    return switch (routed) {
+/// tools, so a table entry without a handler does not compile. `id` is
+/// the request id a deferred answer must carry (null: a notification).
+fn callTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: std.json.Value, id: ?std.json.Value) !Called {
+    const routed = mcp_tools.route(name) orelse return .{ .reply = try errRes(arena, .unknown_tool, "unknown tool") };
+    // The one tool that runs across server-loop turns, so concurrent
+    // calls (and every other tool) are served while it works.
+    if (routed == .browser and routed.browser == .web_fetch) return mcp_webfetch.start(arena, id, args);
+    return .{ .reply = try switch (routed) {
         .panes => |tool| mcp_panes.panesTool(arena, backend, tool, args),
         .app => |tool| mcp_app.appTool(arena, tool, args),
         .term => |tool| mcp_term.termTool(arena, tool, args),
@@ -1319,7 +1348,14 @@ fn callTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: 
         .core => |tool| switch (tool) {
             .capabilities => mcp_caps.capabilitiesTool(arena, backend),
         },
-    };
+    } };
+}
+
+/// Answer a deferred call: `id_json` is its request id as JSON text.
+/// Server loop only (stdout and the trace log are main-thread-owned).
+pub fn replyLater(arena: std.mem.Allocator, id_json: []const u8, result_json: []const u8) void {
+    const id = std.json.parseFromSliceLeaky(std.json.Value, arena, id_json, .{}) catch return;
+    if (rpcResult(arena, id, result_json)) |line| writeOut(line);
 }
 
 /// Refusal text for a tool the policy withholds. Deliberately NOT

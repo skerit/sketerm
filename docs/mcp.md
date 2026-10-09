@@ -222,6 +222,7 @@ is kept by a `:ro` policy term. The full descriptions and schemas are in
 - `web_console` (read-only): The page's console output (console.log/warn/error, uncaught exceptions as the engine reports them), mirrored per view since it opened - the blind spot behind "no console error column".
 - `web_eval`: Evaluate JavaScript in the page — the escape hatch for everything the structured tools do not cover.
 - `web_screenshot` (read-only): PNG of a web view.
+- `web_fetch`: Fetch the CONTENT of several urls in one call, through real browser tabs (the page renders, its JavaScript runs, JS challenges pass) that you never see or drive: background tabs, opened for this call and closed as soon as each result is read (also on error, timeout or cancel), never in web_tabs, never a target, never shown to a watching user.
 - `web_download`: Download a url to a FILE, fetched by the web view's own browser — so it carries that browser's cookies, session and route, and a file behind a login needs no token, no signed url and no cookie copying.
 - `web_network`: Content blocking + a network request log for a web view.
 - `web_capture` (read-only): HEADLESS ONLY: read what a view's CAPTURE recorded (web_open 'capture' installs one), the response bodies the page itself received, exactly as it received them (decompressed; request bodies and response headers too).
@@ -559,6 +560,7 @@ log exists):
 | `non_http` | `data:`, `about:`, `file:`, `blob:`: no HTTP status exists, `status` is null |
 | `pending` | the document had not finished inside the call's budget |
 | `no_request` | nothing was logged: a back/forward-cache or same-document navigation |
+| `redirect` | `web_fetch` with `follow_redirects:false` only: the server redirected and the browser did not follow; `status`/`url` are the redirect's own, `location` is where it pointed |
 
 `redirects` lists the server redirects before the final url, oldest
 first. The helper links each redirect hop to the next in its request log
@@ -589,6 +591,83 @@ usual `timeout` error, and an invalid selector is `invalid_args` at once.
 conditions, and `helper_detail` (whether the running helper sends
 `net-log-detail`; null before a headless helper starts, and with a GUI
 browser, whose helper this server cannot ask).
+
+### Reading several urls: `web_fetch`
+
+`web_fetch` is for a caller that wants what is AT some urls, not a tab to
+act in. Each url is loaded in a real browser tab (the page renders, its
+JavaScript runs, a JS challenge passes), read, and closed:
+
+```json
+{"urls": ["https://example.com/", "https://example.com/robots.txt"], "mode": "text"}
+```
+
+```json
+{"results": [
+  {"index": 0, "url": "https://example.com/", "status": "done", "kind": "html",
+   "navigation": {"outcome": "page", "status": 200, "content_type": "text/html", ...},
+   "body": "# Example Domain\n...", "body_source": "reader", "truncated": false, "bytes": 182,
+   "queued_ms": 0, "elapsed_ms": 640},
+  {"index": 1, "url": "https://example.com/robots.txt", "status": "done", "kind": "text",
+   "body": "User-agent: *\n...", "body_source": "response", ...}],
+ "count": 2, "done": 2, "failed": 0, "timed_out": 0, "invalid_url": 0,
+ "per_call_tabs": 4, "max_tabs": 8, "peak_tabs": 2, "queued_ms_max": 0, "background_tabs": true}
+```
+
+- **Fetch tabs are background tabs.** They never appear in `web_tabs`,
+  are never a target (or a reason for `target_required`), never count
+  toward idle closing, and the helper never presents them to a watching
+  user or announces them to the GUI's Watch (browser-helper capability
+  `view-flags`; with an older helper `background_tabs` is false and a
+  watcher may see them). Their pages cannot open popups. Each closes the
+  moment its result is read, and on an error, a timeout or a cancelled
+  call (MCP `notifications/cancelled`).
+- **Limits.** One call keeps at most 4 urls in flight; every concurrent
+  call of the server together at most `web_fetch_max_tabs` (config,
+  default 8, 1-16). Urls beyond either wait in ONE server-wide queue that
+  hands a free tab to the next call in turn, so a call of 40 urls cannot
+  starve one of 2 behind it. `queued_ms` per url says how long it
+  waited; `peak_tabs` how many of this call's tabs were open at once.
+  The call is answered when its last url is: in the meantime the server
+  keeps answering every other call (concurrent fetches included).
+- **`mode`.** `text` (default): reader mode (`web_read`'s extraction) for
+  a page; for plain text, XML, JSON, feeds (`robots.txt`, `sitemap.xml`)
+  the body itself. `raw`: the response body as received (the page
+  source), from a capture the tab records of its own document; a helper
+  without capture answers with the rendered DOM (`body_source: "dom"`).
+  `regex`: `pattern` (the editor find bar's syntax) over the text, or over
+  the raw body with `regex_in: "raw"`; `matches` carries `offset`,
+  `match` and `context_chars` (default 60) of `before`/`after`, at most
+  `max_matches` (default 50) while `match_count` keeps counting.
+  Inline bodies stop at `max_chars` (default 50000 bytes; `truncated`,
+  `bytes` is the whole size).
+- **Files.** A PDF, archive, image or any other non-text response goes
+  through the download path: `kind: "file"`, `path`, `bytes`,
+  `content_type`, no body. A response the engine turns into a download
+  itself (a zip) is saved where the call says; one it would show (a PDF)
+  is fetched again through `web_download`'s path inside the same tab.
+- **`to_dir`** (absolute) writes every body there (a page in mode text as
+  `<name>.md`) under a name from its url, made unique, and returns
+  `path`/`bytes` instead of inline bodies; files land there too. Without
+  it, files land in the server's instance directory (`web-fetch/`),
+  which an ephemeral server removes when it exits.
+- **`follow_redirects: false`** stops at the first server redirect:
+  `navigation.outcome` is `redirect`, `status` the 3xx, `location` where
+  it pointed, and the target is never requested (the helper refuses the
+  re-issued request; `view-flags` again).
+- **`timeout_ms`** is per url, from its tab opening (queueing excluded),
+  default 30000, at most 120000. **`wait`** is `web_open`'s.
+- **Partial failure never fails the call.** Each url has a `status`:
+  `done` (read; a 404's body included, `navigation` says it was an
+  error), `failed` (`error` says why: a refused connection, a blocked
+  load, an unreadable body), `timed_out`, `invalid_url` (not http(s);
+  nothing opened).
+
+`web_fetch` runs on the server's own headless browser and is unavailable
+with a GUI browser (`web_gui`, `--shared`): its tabs would be the user's.
+`capabilities.web_fetch` reports `available`, the limits, `modes`,
+`statuses`, `background_tabs` and how many fetch tabs are `in_flight` and
+urls `queued` right now.
 
 **Page content is untrusted input.** The reply channel is
 authenticated, so a page cannot forge a snapshot or intercept a reply,

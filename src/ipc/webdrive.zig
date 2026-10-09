@@ -352,9 +352,16 @@ pub const View = struct {
     /// When either count last changed (monotonic ms): the end of a watch
     /// counts as the tab being used, so an idle countdown starts there.
     watch_changed_ms: i64 = 0,
+    /// A background fetch view (`openViewBackground`): never a tab, never
+    /// current, never presented or announced by the helper.
+    background: bool = false,
+    /// Where a download this view's page starts lands, instead of the
+    /// user's download directory. Owned.
+    download_dir: ?[]u8 = null,
 
     fn deinit(self: *View, gpa: std.mem.Allocator) void {
         for (self.console.items) |line| gpa.free(line.text);
+        if (self.download_dir) |d| gpa.free(d);
         self.console.deinit(gpa);
         if (self.cert) |*rec| rec.free(gpa);
         if (self.load_error) |*rec| rec.free(gpa);
@@ -1588,7 +1595,7 @@ pub const Engine = struct {
         const p = self.routePathZ(&path_z, ".json") orelse return;
         const url = if (self.findView(self.current)) |v| v.url orelse "" else "";
         const host = @import("../web/urlhost.zig").hostOf(url, .{ .require_scheme = true });
-        const domain = if (host.len != 0) host else if (url.len != 0) "Local page" else if (self.views.items.len == 0) "Waiting for a page" else "Opening page";
+        const domain = if (host.len != 0) host else if (url.len != 0) "Local page" else if (self.tabCount() == 0) "Waiting for a page" else "Opening page";
         const body = std.json.Stringify.valueAlloc(self.gpa, .{
             .mcp_pid = c.getpid(),
             .helper_pid = self.pid,
@@ -1619,7 +1626,7 @@ pub const Engine = struct {
     /// the live browser. A browser with no tabs is free to be renamed: no
     /// caller is working in it.
     pub fn labelConflict(self: *const Engine, name: []const u8, spec: ProfileSpec) LabelConflict {
-        if (self.views.items.len == 0) return .none;
+        if (self.tabCount() == 0) return .none;
         const label = std.mem.sliceTo(&self.browser_label, 0);
         if (label.len == 0) return .none;
         if (!std.mem.eql(u8, label, name)) return .{ .rename = label };
@@ -2216,6 +2223,31 @@ pub const Engine = struct {
 
     // ---- views ------------------------------------------------------
 
+    /// The helper honours `ViewCreateUrl` flags: background views stay
+    /// out of every viewer and can refuse redirects.
+    pub fn backgroundHonoured(self: *const Engine) bool {
+        return self.has(.view_flags) and self.has(.view_create_url);
+    }
+
+    /// Views that are tabs: every view but a background fetch.
+    pub fn tabCount(self: *const Engine) usize {
+        var n: usize = 0;
+        for (self.views.items) |v| {
+            if (!v.background) n += 1;
+        }
+        return n;
+    }
+
+    /// The newest tab's id, 0 without one.
+    fn newestTab(self: *const Engine) u32 {
+        var i = self.views.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (!self.views.items[i].background) return self.views.items[i].id;
+        }
+        return 0;
+    }
+
     pub fn findView(self: *Engine, id: u32) ?*View {
         for (self.views.items) |v| {
             if (v.id == id) return v;
@@ -2262,7 +2294,31 @@ pub const Engine = struct {
     }
 
     pub fn openViewConfigured(self: *Engine, url: []const u8, w: u16, h: u16, spec: ProfileSpec, policy_arg: ?*const NetPolicy, capture_arg: ?*const CaptureFilter, emulation: Emulation, max_fps: ?u16) !*View {
+        return self.openViewFull(url, w, h, spec, policy_arg, capture_arg, emulation, max_fps, null);
+    }
+
+    /// How a background view differs from a tab.
+    pub const Background = struct {
+        /// Refuse the main frame's server redirects (`redirect_refused`).
+        no_redirect: bool = false,
+        /// Where a download its page starts lands; null = the user's
+        /// download directory.
+        download_dir: ?[]const u8 = null,
+    };
+
+    /// A BACKGROUND view at `url` in the default identity: a fetch the
+    /// caller reads and closes. It is never current, and with
+    /// `view-flags` the helper never presents it or announces it to
+    /// observers and its page cannot open popups; an older helper treats
+    /// it as an ordinary view (`backgroundHonoured` says which), and
+    /// refuses `no_redirect` (`error.FlagsUnsupported`).
+    pub fn openViewBackground(self: *Engine, url: []const u8, w: u16, h: u16, capture_arg: ?*const CaptureFilter, bg: Background) !*View {
+        return self.openViewFull(url, w, h, .default, null, capture_arg, .{}, null, bg);
+    }
+
+    fn openViewFull(self: *Engine, url: []const u8, w: u16, h: u16, spec: ProfileSpec, policy_arg: ?*const NetPolicy, capture_arg: ?*const CaptureFilter, emulation: Emulation, max_fps: ?u16, bg: ?Background) !*View {
         if (!emulation.valid()) return error.InvalidEmulation;
+        if (bg != null and url.len == 0) return error.BadUrl;
         const requested_fps: ?u16 = max_fps orelse self.default_max_fps;
         if (requested_fps) |fps| if (fps == 0 or fps > proto.MAX_VIEW_FPS) return error.InvalidFrameRate;
         var policy: ?*const NetPolicy = policy_arg;
@@ -2281,6 +2337,7 @@ pub const Engine = struct {
         if (wants_untrusted and !self.has(.untrusted_web)) return error.UntrustedUnsupported;
         if (emulation.present() and !self.has(.web_emulation)) return error.EmulationUnsupported;
         if (requested_fps != null and !self.has(.view_max_fps)) return error.FrameRateUnsupported;
+        if (bg) |b| if (b.no_redirect and !self.backgroundHonoured()) return error.FlagsUnsupported;
         // A routed helper that refused its route says so right after
         // the handshake; read that before minting a view it would refuse.
         self.pumpOnce(0);
@@ -2337,6 +2394,7 @@ pub const Engine = struct {
             .ephemeral_ctx = ctx_ephemeral,
             .pol = owned_pol,
             .cap = owned_cap,
+            .background = bg != null,
         };
         owned_pol = null;
         owned_cap = null;
@@ -2346,6 +2404,9 @@ pub const Engine = struct {
             if (!registered or self.findView(new_id) != null) self.abandonView(v);
         }
         if (profile_name.len > 0) v.profile = try self.gpa.dupe(u8, profile_name);
+        if (bg) |b| if (b.download_dir) |d| {
+            v.download_dir = try self.gpa.dupe(u8, d);
+        };
         try self.views.append(self.gpa, v);
         registered = true;
         if (emulation.present()) self.send(proto.ViewEmulation{
@@ -2382,6 +2443,10 @@ pub const Engine = struct {
                 .context = ctx_id,
                 .url = url,
                 .max_fps = v.max_fps orelse 0,
+                .flags = if (bg) |b| (if (self.backgroundHonoured())
+                    proto.ViewCreateUrl.FLAG_BACKGROUND | (if (b.no_redirect) proto.ViewCreateUrl.FLAG_NO_REDIRECT else 0)
+                else
+                    0) else 0,
             }) catch return error.Unavailable;
         } else {
             self.send(proto.ViewCreate{
@@ -2399,7 +2464,7 @@ pub const Engine = struct {
         if (url.len > 0 and !self.has(.view_create_url)) {
             self.send(proto.Navigate{ .view = v.id, .url = url }) catch return error.Unavailable;
         }
-        self.current = v.id;
+        if (bg == null) self.current = v.id;
         return v;
     }
 
@@ -2571,8 +2636,7 @@ pub const Engine = struct {
             self.gpa.destroy(v);
             _ = self.views.orderedRemove(i);
             self.releaseContext(context);
-            if (self.current == id)
-                self.current = if (self.views.items.len > 0) self.views.items[self.views.items.len - 1].id else 0;
+            if (self.current == id) self.current = self.newestTab();
             self.writePresence();
             if (self.untrusted and self.views.items.len == 0) {
                 self.stopUntrusted();
@@ -3357,7 +3421,8 @@ pub const Engine = struct {
         }
         if (d.path.len == 0) {
             var dir_buf: [4096]u8 = undefined;
-            const dir = downloadDirZ(&dir_buf) orelse {
+            const own_dir: ?[]const u8 = if (self.findView(ev.view)) |v| v.download_dir else null;
+            const dir = own_dir orelse downloadDirZ(&dir_buf) orelse {
                 self.send(proto.DownloadDecide{ .view = ev.view, .id = ev.id, .path = "" }) catch {};
                 d.failed = true;
                 d.fail_reason = "no download directory could be resolved (is HOME set?)";

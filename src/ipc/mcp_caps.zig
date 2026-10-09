@@ -300,6 +300,14 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
         // What a navigation produced, on web_open/web_navigate replies.
         try res.fact("web_nav_result", @import("mcp_web.zig").navResultCapability());
         try res.text("web_open and web_navigate report the navigation's outcome (page, http_error, network_error, aborted, replaced, download, blocked, non_http), HTTP status, final url, redirect chain and content type, and take wait:{for,arg} with web_wait's conditions");
+        // Reading several urls without driving a tab: its limits are
+        // what a caller plans a batch around.
+        const fetch = @import("mcp_webfetch.zig").capability();
+        try res.fact("web_fetch", fetch);
+        if (fetch.available)
+            try res.textf("web_fetch reads several urls through background tabs (modes text, raw, regex; files through the download path): at most {d} tabs per call and {d} across every concurrent call of this server, the rest queue; {d} in flight, {d} queued now", .{ fetch.per_call_tabs, fetch.max_tabs, fetch.in_flight, fetch.queued })
+        else
+            try res.textf("web_fetch is unavailable here: {s}", .{fetch.reason.?});
         // Downloading through a view: the only path that carries the
         // page's own session, so a consumer must be able to preflight
         // it rather than discover it by trying.
