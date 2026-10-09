@@ -152,6 +152,7 @@ const unconditional_caps = [_]proto.Cap{
     .multi_client,
     .cookie_sync,
     .observe,
+    .observe_notify,
     .load_retry,
     .web_emulation,
     .web_stream,

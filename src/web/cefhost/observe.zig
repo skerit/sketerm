@@ -214,6 +214,7 @@ pub fn observeSubscribe(self: *Host, conn: u32, alias: u32, target: u32, control
     const sub = &self.subs.items[self.subs.items.len - 1];
     self.postObserveState(sub, v, proto.observe_subscribed, "");
     self.seedObserver(sub, v);
+    notifyWatchers(self, target);
 }
 
 /// What a subscriber needs to draw the page as it is right now:
@@ -234,6 +235,27 @@ pub fn seedObserver(self: *Host, sub: *Sub, v: *View) void {
     }
 }
 
+/// Tell the owner of `target` how many observers watch it now
+/// (capability "observe-notify"). Posted straight to the owner's
+/// connection, never through `post`: inside an observer's own dispatch
+/// `routeFor` answers that observer, and this is the owner's business.
+pub fn notifyWatchers(self: *Host, target: u32) void {
+    const v = self.findAny(target) orelse return;
+    if (v.owner == 0) return;
+    var watchers: u16 = 0;
+    var controllers: u16 = 0;
+    for (self.subs.items) |s| {
+        if (s.target != target) continue;
+        watchers +|= 1;
+        if (s.control) controllers +|= 1;
+    }
+    const out = self.observerOut(v.owner) orelse return;
+    // Engine-minted ids (popups, inspectors) cross untranslated; a
+    // client-minted one reads in the owner's own namespace again.
+    const base: u32 = if (target >= proto.ENGINE_VIEW_BASE) 0 else v.owner * proto.CONN_ID_WINDOW;
+    out.post(proto.EvViewWatchers{ .view = target - base, .watchers = watchers, .controllers = controllers }, null) catch {};
+}
+
 /// `observe_control`: flip the lease of a live alias.
 pub fn observeControl(self: *Host, conn: u32, alias: u32, control: bool) void {
     const sub = self.aliasOf(conn, alias) orelse {
@@ -243,6 +265,7 @@ pub fn observeControl(self: *Host, conn: u32, alias: u32, control: bool) void {
     };
     sub.control = control;
     self.postObserveState(sub, self.findAny(sub.target), proto.observe_subscribed, "");
+    notifyWatchers(self, sub.target);
 }
 
 /// `view_destroy` on an alias: drop the subscription only. The
@@ -252,6 +275,7 @@ pub fn observeUnsubscribe(self: *Host, conn: u32, alias: u32) void {
         if (s.conn == conn and s.alias == alias) {
             var gone = self.subs.orderedRemove(i);
             gone.deinit(self.gpa);
+            notifyWatchers(self, gone.target);
             return;
         }
     }
@@ -290,6 +314,8 @@ pub fn observeDropConn(self: *Host, conn: u32) void {
         if (self.subs.items[i].conn == conn) {
             var gone = self.subs.orderedRemove(i);
             gone.deinit(self.gpa);
+            // After the removal, so the owner hears the count without it.
+            notifyWatchers(self, gone.target);
         } else i += 1;
     }
     for (self.observers.items, 0..) |o, k| {

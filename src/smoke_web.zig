@@ -1134,6 +1134,12 @@ const Client = struct {
     ost_h: u16 = 0,
     ost_reason: [256]u8 = @splat(0),
     ost_reason_len: usize = 0,
+    /// The last `ev_view_watchers` (capability "observe-notify"): bumped
+    /// per frame, with the owner-namespace view and both counts.
+    vw_seq: u32 = 0,
+    vw_view: u32 = 0,
+    vw_watchers: u16 = 0,
+    vw_controllers: u16 = 0,
     /// View id the last `frame_inline` named.
     inline_view: u32 = 0,
     /// Bumped per `ev_flushed`; the token it carried.
@@ -1736,6 +1742,13 @@ const Client = struct {
                 self.ost_h = ev.h;
                 self.ost_reason_len = @min(ev.reason.len, self.ost_reason.len);
                 @memcpy(self.ost_reason[0..self.ost_reason_len], ev.reason[0..self.ost_reason_len]);
+            },
+            .ev_view_watchers => {
+                const ev = proto.decode(proto.EvViewWatchers, frame.payload) catch fail("ev_view_watchers decode");
+                self.vw_seq += 1;
+                self.vw_view = ev.view;
+                self.vw_watchers = ev.watchers;
+                self.vw_controllers = ev.controllers;
             },
             .ev_flushed => {
                 const f = proto.decode(proto.EvFlushed, frame.payload) catch fail("ev_flushed decode");
@@ -6734,7 +6747,17 @@ fn runObserveStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) 
         fail("stage ob2: the observer's frame does not show the red page");
     }
     if (b.fb != null) fail("stage ob2: an observer was announced a memfd buffer (frames must be inline)");
-    pass("stage ob2 a subscriber is seeded with the title and inline pixels under its own alias id");
+    if (!a.acks(.observe_notify)) fail("stage ob2: hello_ack lacks the observe-notify capability");
+    {
+        const d = nowMs() + 5_000;
+        while (a.vw_seq == 0 and nowMs() < d) {
+            a.pump(50);
+            b.pump(0);
+        }
+    }
+    if (a.vw_seq == 0 or a.vw_view != 1 or a.vw_watchers != 1 or a.vw_controllers != 0)
+        fail("stage ob2: the owner was not told its view 1 has one read-only watcher");
+    pass("stage ob2 a subscriber is seeded with the title and inline pixels under its own alias id; the owner hears it is watched");
 
     // ── ob3: a read-only observer's input is dropped ───────────────
     const cx: i32 = @intCast(b.iw / 2);
@@ -6771,6 +6794,14 @@ fn runObserveStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) 
         }
     }
     if (b.ost_seq == ost_before or b.ost_state != proto.observe_subscribed or b.ost_control != 1) fail("stage ob4: observe_control did not grant control");
+    {
+        const d = nowMs() + 5_000;
+        while (a.vw_controllers != 1 and nowMs() < d) {
+            a.pump(50);
+            b.pump(0);
+        }
+    }
+    if (a.vw_view != 1 or a.vw_watchers != 1 or a.vw_controllers != 1) fail("stage ob4: the owner was not told its watcher took control");
     b.send(proto.InputPointer{ .view = 1, .kind = @intFromEnum(proto.PointerKind.move), .x = cx, .y = cy, .button = 0, .clicks = 0, .mods = 0 });
     b.send(proto.InputPointer{ .view = 1, .kind = @intFromEnum(proto.PointerKind.down), .x = cx, .y = cy, .button = 0, .clicks = 1, .mods = 0 });
     b.send(proto.InputPointer{ .view = 1, .kind = @intFromEnum(proto.PointerKind.up), .x = cx, .y = cy, .button = 0, .clicks = 1, .mods = 0 });
@@ -6949,8 +6980,15 @@ fn runObserveStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) 
     pass("stage ob6 the owner destroying a view ends the observer's subscription and only that one");
 
     // ── ob7: the observer leaves; the owner's view is intact ──────
+    const vw_before_leave = a.vw_seq;
     b.deinit();
     _ = c.usleep(300_000);
+    {
+        const d = nowMs() + 5_000;
+        while (a.vw_seq == vw_before_leave and nowMs() < d) a.pump(50);
+    }
+    if (a.vw_seq == vw_before_leave or a.vw_watchers != 0 or a.vw_controllers != 0)
+        fail("stage ob7: the owner was not told its watcher left");
     {
         var status: c_int = 0;
         if (c.waitpid(pid, &status, c.WNOHANG) == pid) {

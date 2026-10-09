@@ -348,10 +348,17 @@ pub const CAP_COOKIE_SYNC = "cookie-sync";
 /// geometry and identity belong to the owner. `observerAllows` is the
 /// one home for that gate.
 ///
-/// The owner never learns of observers. A view the owner destroys ends
-/// every subscription with `ev_observe_state{state = ended}`; an
-/// observer disconnecting leaves the owner's views untouched.
+/// The owner learns only HOW MANY observers watch each of its views
+/// (`observe-notify`), never who. A view the owner destroys ends every
+/// subscription with `ev_observe_state{state = ended}`; an observer
+/// disconnecting leaves the owner's views untouched.
 pub const CAP_OBSERVE = "observe";
+/// The owner of a view is told how many observers watch it and how many
+/// of those hold control (`ev_view_watchers`, 0xF5), whenever either
+/// count changes. An owner that closes idle views must never close one
+/// a person is watching or driving; without this capability it cannot
+/// tell, and must not guess.
+pub const CAP_OBSERVE_NOTIFY = "observe-notify";
 /// The helper re-issues a main-frame load ONCE when it fails with
 /// `ERR_NETWORK_CHANGED` (the local interface list changed under the
 /// engine: a container starting, a VPN coming up) and reports that as
@@ -444,6 +451,7 @@ pub const Cap = enum {
     presenter,
     cookie_sync,
     observe,
+    observe_notify,
     load_retry,
     untrusted_web,
     web_emulation,
@@ -789,8 +797,10 @@ pub const Tag = enum(u8) {
     observe_subscribe = 0xF2,
     ev_observe_state = 0xF3,
     observe_control = 0xF4,
+    // Capability "observe-notify" (see CAP_OBSERVE_NOTIFY).
+    ev_view_watchers = 0xF5,
     // 0xF8-0xFB: pushed per-view binary stream, capability "web-stream"
-    // (see CAP_WEB_STREAM). 0xF5-0xF7 stay with the observe block.
+    // (see CAP_WEB_STREAM). 0xF6-0xF7 stay with the observe block.
     stream_open = 0xF8,
     ev_stream_open = 0xF9,
     stream_close = 0xFA,
@@ -3813,7 +3823,7 @@ pub const EvRequestRefused = struct {
 /// Capabilities an untrusted helper leaves out of `hello_ack`; `untrustedWithheld` refuses their frames.
 pub fn untrustedWithholdsCap(cap: Cap) bool {
     return switch (cap) {
-        .devtools, .print_pdf, .print_pdf_staging, .clipboard, .popup_open, .downloads, .download_start, .download_staging, .download_errors, .userscripts, .userscripts_gm, .webext, .webext_tabs, .webext_action, .webext_events, .webext_transaction, .filter_subscribe, .cookie_sync, .observe => true,
+        .devtools, .print_pdf, .print_pdf_staging, .clipboard, .popup_open, .downloads, .download_start, .download_staging, .download_errors, .userscripts, .userscripts_gm, .webext, .webext_tabs, .webext_action, .webext_events, .webext_transaction, .filter_subscribe, .cookie_sync, .observe, .observe_notify => true,
         else => false,
     };
 }
@@ -4388,7 +4398,18 @@ pub const EvObserveState = struct {
     reason: []const u8,
 };
 
+/// Helper -> OWNER (capability "observe-notify"): `view` (the owner's own
+/// id) is now watched by `watchers` observers, `controllers` of which
+/// hold control. Sent whenever either count changes, 0/0 included.
+pub const EvViewWatchers = struct {
+    pub const tag: Tag = .ev_view_watchers;
+    view: u32,
+    watchers: u16,
+    controllers: u16,
+};
+
 test "round-trip: observe frames" {
+    try roundTrip(EvViewWatchers, .{ .view = 7, .watchers = 2, .controllers = 1 });
     try roundTrip(ObserveEnable, .{ .enable = 1 });
     try roundTrip(EvObserveView, .{
         .target = 0x0010_0003,
@@ -4421,6 +4442,7 @@ test "observe tags occupy the 0xF0 block and leave 0xE6-0xEF free" {
     try std.testing.expectEqual(@as(u8, 0xF2), @intFromEnum(Tag.observe_subscribe));
     try std.testing.expectEqual(@as(u8, 0xF3), @intFromEnum(Tag.ev_observe_state));
     try std.testing.expectEqual(@as(u8, 0xF4), @intFromEnum(Tag.observe_control));
+    try std.testing.expectEqual(@as(u8, 0xF5), @intFromEnum(Tag.ev_view_watchers));
     try std.testing.expect(!@as(Tag, @enumFromInt(0xE6)).known());
     try std.testing.expect(!@as(Tag, @enumFromInt(0xEF)).known());
 }
