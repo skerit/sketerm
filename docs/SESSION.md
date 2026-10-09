@@ -1,5 +1,23 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-09: navigation results on web_open / web_navigate
+
+A navigating call used to report only url/title/loading, so a 404 page, a
+refused connection and a download all read as "a page loaded". Both now
+carry `navigation`: outcome (`webnav.Outcome`: page, http_error,
+network_error, aborted, replaced, download, blocked, non_http, pending,
+no_request), the main document's status and status text, final url,
+redirect chain, content type, size and net error, derived in
+`src/ipc/webnav.zig` from the same request log `web_network` reads. The
+helper's log ring links redirect hops (`on_resource_redirect`, `prev_seq`),
+records content type, status text and net error in a trailing `NetDetail`
+block (capability `net-log-detail`; older helpers give `detail:false`),
+and pins each view's newest document rows. It also fixes completions that
+landed on the FIRST hop of a redirected request. `wait` on both tools runs
+`web_wait`'s code (`waitCore`), which gained `selector` and
+`network_idle`. `capabilities.web_nav_result`; smoke-mcp
+`SKETERM_SMOKE_MCP_WEBNAV_ONLY` proves every outcome on a loopback site.
+
 ## 2026-10-09: web tabs for several callers on one browser
 
 Sub-agents sharing one `sketerm mcp` trampled each other's tabs through the
