@@ -9,6 +9,8 @@ const daemon = @import("mux/daemon.zig");
 const platform = @import("util/platform.zig");
 const selfexec = @import("mux/selfexec.zig");
 const proxyroute = @import("mux/proxyroute.zig");
+const relisten = @import("mux/relisten.zig");
+const log = @import("mux/log.zig");
 const VERSION = @import("version.zig").string;
 
 const HELP =
@@ -236,7 +238,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     };
 
     const d = daemon.Daemon.init(allocator, path) catch |err| {
-        std.debug.print("sketerm-mux: bind {s} failed: {s}\n", .{ path, @errorName(err) });
+        // To mux.log too: a refused start (another daemon already serves
+        // the path, say) is otherwise invisible behind an autostart.
+        log.init();
+        log.warn("not starting: bind {s} failed: {s}", .{ path, @errorName(err) });
         return 1;
     };
     d.idle_exit_ms = idle_exit_ms;
@@ -268,7 +273,10 @@ fn runProxy(allocator: std.mem.Allocator) u8 {
 
     const client = @import("mux/client.zig");
     var conn = client.Conn.connect(allocator, path) catch blk: {
-        // No daemon yet — start one.
+        // A daemon that lost this path gets it back; otherwise start one.
+        if (relisten.reclaim(allocator, path)) {
+            if (client.Conn.connect(allocator, path)) |conn2| break :blk conn2 else |_| {}
+        }
         autostartDaemon();
         var tries: u32 = 0;
         while (tries < 40) : (tries += 1) {
@@ -693,6 +701,14 @@ fn connectDaemonRetry(allocator: std.mem.Allocator, sock_path: ?[]const u8) ?c_i
     } else |_| {}
     if (sock_path != null) return null;
 
+    if (relisten.reclaim(allocator, path)) {
+        if (client.Conn.connect(allocator, path)) |conn_v| {
+            var conn = conn_v;
+            const fd = conn.fd;
+            conn.rbuf.deinit(conn.allocator);
+            return fd;
+        } else |_| {}
+    }
     autostartDaemon();
     var tries: u32 = 0;
     while (tries < 40) : (tries += 1) {

@@ -54,6 +54,7 @@ const webpresence = @import("../web/webpresence.zig");
 const shell_util = @import("shell.zig");
 const platform = @import("../util/platform.zig");
 const lifetime = @import("../util/lifetime.zig");
+const relisten = @import("relisten.zig");
 const Pty = @import("../pty.zig").Pty;
 const Parser = @import("../parser/vt.zig").Parser;
 const Event = @import("../parser/event.zig").Event;
@@ -1342,7 +1343,7 @@ test "daemon startup preserves live owners and socket inode ownership" {
     defer replacement.deinit();
     first.deinit();
     first_live = false;
-    try t.expectEqual(Daemon.SocketPathState.live, Daemon.socketPathState(path));
+    try t.expectEqual(relisten.SocketPathState.live, relisten.socketPathState(path));
 }
 
 test "daemon startup recovers a refused stale socket" {
@@ -2965,8 +2966,10 @@ pub const Daemon = struct {
     sock_path: []u8,
     /// Identity of the bound socket inode; teardown must not unlink a
     /// pathname another daemon acquired later.
-    sock_dev: u128 = 0,
-    sock_ino: u128 = 0,
+    sock_id: relisten.Identity = .{},
+    /// Re-binds `sock_path` after it is removed, and publishes that this
+    /// daemon does (relisten.zig); a worker's keeps its adoption listener.
+    relisten_keeper: relisten.Keeper = .{},
     sessions: std.ArrayList(*Session) = .empty,
     clients: std.ArrayList(*Client) = .empty,
     channels: std.ArrayList(*Channel) = .empty,
@@ -3137,29 +3140,6 @@ pub const Daemon = struct {
         sock: []u8,
     };
 
-    const SocketPathState = enum { live, stale, unknown };
-
-    fn socketPathState(sock_path: []const u8) SocketPathState {
-        const fd = @import("../util/platform.zig").socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
-        if (fd < 0) return .unknown;
-        defer _ = c.close(fd);
-        var addr: c.struct_sockaddr_un = undefined;
-        fillSockaddrUn(&addr, sock_path) catch return .unknown;
-        const rc = c.connect(fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un));
-        if (rc == 0) return .live;
-        return switch (std.posix.errno(rc)) {
-            .CONNREFUSED, .NOENT => .stale,
-            else => .unknown,
-        };
-    }
-
-    fn bindSocket(fd: c_int, addr: *c.struct_sockaddr_un) !void {
-        const rc = c.bind(fd, @ptrCast(addr), @sizeOf(c.struct_sockaddr_un));
-        if (rc == 0) return;
-        if (std.posix.errno(rc) == .ADDRINUSE) return error.AlreadyRunning;
-        return error.BindFailed;
-    }
-
     /// Where this socket's fs-job journals live: under the STATE dir,
     /// not the runtime dir, so an interrupted transfer's staged data
     /// (and a completed-but-uncleaned move's quarantine identity) can
@@ -3249,57 +3229,17 @@ pub const Daemon = struct {
         var path_owned = true;
         errdefer if (path_owned) allocator.free(absolute_path);
         const dir_end = std.mem.lastIndexOfScalar(u8, absolute_path, '/') orelse return error.BadPath;
-        // mkdir -p the parent (one level is enough in practice:
-        // $XDG_RUNTIME_DIR exists; we create the sketerm dir).
-        var z_buf: [4096]u8 = undefined;
-        _ = c.mkdir(try pathZ(&z_buf, absolute_path[0..dir_end]), 0o700);
-
-        // Serialize stale-socket recovery. Without this lock, two starters can
-        // both observe the same stale inode and one can unlink the other's new
-        // listener between its bind and listen calls.
-        var lock_buf: [4096:0]u8 = undefined;
-        const lock_path = std.fmt.bufPrintZ(&lock_buf, "{s}.lock", .{absolute_path}) catch return error.BadPath;
-        const lock_fd = c.open(lock_path.ptr, c.O_CREAT | c.O_RDWR | c.O_CLOEXEC, @as(c_uint, 0o600));
-        if (lock_fd < 0) return error.LockFailed;
-        defer _ = c.close(lock_fd);
-        var lock = std.mem.zeroes(c.struct_flock);
-        lock.l_type = c.F_WRLCK;
-        lock.l_whence = c.SEEK_SET;
-        if (c.fcntl(lock_fd, c.F_SETLKW, &lock) < 0) return error.LockFailed;
-
-        const fd = @import("../util/platform.zig").socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
-        if (fd < 0) return error.SocketFailed;
-        errdefer _ = c.close(fd);
-        var addr: c.struct_sockaddr_un = undefined;
-        try fillSockaddrUn(&addr, absolute_path);
-        bindSocket(fd, &addr) catch |err| switch (err) {
-            error.AlreadyRunning => switch (socketPathState(absolute_path)) {
-                .live, .unknown => return error.AlreadyRunning,
-                .stale => {
-                    var st: c.struct_stat = undefined;
-                    const path = try pathZ(&z_buf, absolute_path);
-                    if (c.lstat(path, &st) != 0 or (st.st_mode & c.S_IFMT) != c.S_IFSOCK)
-                        return error.BindFailed;
-                    if (c.unlink(path) != 0 and std.posix.errno(-1) != .NOENT)
-                        return error.BindFailed;
-                    try bindSocket(fd, &addr);
-                },
-            },
-            else => return err,
-        };
-        if (c.listen(fd, 8) != 0) return error.ListenFailed;
-        var bound_st: c.struct_stat = undefined;
-        if (c.lstat(try pathZ(&z_buf, absolute_path), &bound_st) != 0) return error.StatFailed;
+        const bound = try relisten.bindListener(absolute_path, .wait);
+        errdefer _ = c.close(bound.fd);
 
         const job_dir = try fsJobsDirAlloc(allocator, absolute_path);
         errdefer allocator.free(job_dir);
         const self = try allocator.create(Daemon);
         self.* = .{
             .allocator = allocator,
-            .listen_fd = fd,
+            .listen_fd = bound.fd,
             .sock_path = absolute_path,
-            .sock_dev = @intCast(bound_st.st_dev),
-            .sock_ino = @intCast(bound_st.st_ino),
+            .sock_id = bound.id,
             .fs_job_dir = job_dir,
         };
         path_owned = false;
@@ -3386,6 +3326,7 @@ pub const Daemon = struct {
                 }
             } else |_| {}
         }
+        self.relisten_keeper.stop();
         if (self.listen_fd >= 0) _ = c.close(self.listen_fd);
         if (self.control_fd >= 0) _ = c.close(self.control_fd);
         daemon_adopt.closeListener(self);
@@ -3395,15 +3336,9 @@ pub const Daemon = struct {
         // belongs to another instance and must survive our teardown.
         if (lock_fd >= 0) {
             var z_buf: [4096]u8 = undefined;
-            if (pathZ(&z_buf, self.sock_path)) |p| {
-                var st: c.struct_stat = undefined;
-                if (c.lstat(p, &st) == 0 and
-                    @as(u128, @intCast(st.st_dev)) == self.sock_dev and
-                    @as(u128, @intCast(st.st_ino)) == self.sock_ino)
-                {
-                    _ = c.unlink(p);
-                }
-            } else |_| {}
+            if (relisten.pathState(self.sock_path, self.sock_id) == .ours) {
+                if (pathZ(&z_buf, self.sock_path)) |p| _ = c.unlink(p) else |_| {}
+            }
             _ = c.close(lock_fd);
         }
         self.allocator.free(self.sock_path);
@@ -3418,6 +3353,7 @@ pub const Daemon = struct {
         // A broker replacing one that handed over (or crashed) adopts the
         // session workers it left running before serving anyone.
         if (!self.isWorker() and self.listen_fd >= 0) daemon_adopt.brokerAdoptAtStartup(self);
+        if (!self.isWorker() and self.listen_fd >= 0) self.relisten_keeper.startBroker(self.sock_path);
         log.info("daemon up v{s} mode={s} socket={s}", .{
             version.string,
             @tagName(self.role),
@@ -3528,6 +3464,10 @@ pub const Daemon = struct {
         // open_view → ignored by poll).
         const fs_idx = fds.items.len;
         try fds.append(self.allocator, .{ .fd = self.fs_watch.fd, .events = c.POLLIN, .revents = 0 });
+        // Broker: a client's prompt to re-bind a removed socket path now
+        // (relisten.zig; -1 when unarmed → ignored by poll).
+        const relisten_idx = fds.items.len;
+        try fds.append(self.allocator, .{ .fd = self.relisten_keeper.pollFd(), .events = c.POLLIN, .revents = 0 });
         const client_base = fds.items.len;
         const n_clients_built = self.clients.items.len;
         for (self.clients.items) |cl| {
@@ -3867,6 +3807,23 @@ pub const Daemon = struct {
         self.refreshDetachedFsJobs();
         self.reap();
         self.flushPendingBrains();
+        // Last: the listener swap must not disturb this tick's poll slots.
+        if (self.relisten_keeper.due(nowMs(), fds.items[relisten_idx].revents)) self.keepListening();
+    }
+
+    /// Re-bind the socket path (broker) or the adoption listener (worker) when it was removed.
+    fn keepListening(self: *Daemon) void {
+        if (self.isWorker()) return daemon_adopt.workerRelisten(self);
+        if (self.listen_fd < 0 or self.sock_path.len == 0) return;
+        self.relisten_keeper.keepRecord(self.sock_path);
+        const fresh = self.relisten_keeper.checkListener(nowMs(), self.sock_path, self.sock_id) orelse return;
+        // A client that connected before the unlink still waits on the old inode.
+        var pfd = c.struct_pollfd{ .fd = self.listen_fd, .events = c.POLLIN, .revents = 0 };
+        var drained: usize = 0;
+        while (drained < 64 and c.poll(&pfd, 1, 0) > 0 and pfd.revents & c.POLLIN != 0) : (drained += 1) self.acceptClient();
+        _ = c.close(self.listen_fd);
+        self.listen_fd = fresh.fd;
+        self.sock_id = fresh.id;
     }
 
     fn acceptClient(self: *Daemon) void {

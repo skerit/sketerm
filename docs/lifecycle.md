@@ -119,6 +119,50 @@ by a fresh broker, a reattach and the shell expanding the variable; then
 kill and shutdown on adopted workers, and an orphan reaped by its
 harness's fence with no broker ever adopting it.
 
+## Runtime-dir removal: a daemon takes its socket path back
+
+With `Linger=no`, logind removes `$XDG_RUNTIME_DIR` when the user's last
+login session ends, and `sketerm/mux.sock` with it. The daemon keeps
+listening on the unlinked inode, so its sessions live on and nothing can
+reach them, and the next client used to autostart a SECOND daemon whose
+restored layout minted empty sessions under the old names. Since this
+change (`src/mux/relisten.zig`; the module header is the reference):
+
+- **The daemon re-binds.** Every second, and at once on SIGURG, a broker
+  compares its socket path with the inode it bound. A missing path is
+  bound again, with the same locked routine `Daemon.init` uses, as soon
+  as the socket directory's PARENT exists (it re-creates its own
+  `sketerm/` directory, never the runtime dir, which is root's). A path
+  another live daemon answers is never taken over; it is taken back once
+  that daemon stops serving it. Workers re-create their adoption
+  listeners the same way, so a later handover still finds them.
+- **The capability record.** A broker publishes
+  `$XDG_STATE_HOME/sketerm/mux-daemons/<pid>.json` (the state dir
+  survives the removal) and holds a POSIX write lock on it for life;
+  `F_GETLK` naming that pid is the proof that the process supports this.
+- **Clients prompt before autostarting.** Every autostart path (the GUI's
+  `connectLocalAutostart*`, `sketerm mcp`'s private brokers, and
+  `sketerm-mux --proxy` / `--udp-listen` on a remote host) first runs
+  `relisten.reclaim`: it finds daemons that should serve the path but do
+  not through `procinv` (what `sketerm doctor` uses), sends SIGURG ONLY to
+  those holding a record, and waits up to 3 s for the path to answer.
+  SIGURG's default action is to ignore it, so even a misdirected prompt
+  cannot end an older daemon's shells. A daemon without a record (any
+  build before this one) is never signalled; the client autostarts as
+  before and doctor says that daemon cannot recover.
+- **Not covered.** The per-session hub sockets (`wl-w<pid>`, `pa-w<pid>`)
+  and isolated `rt-w<pid>` dirs live in the removed directory too and are
+  not re-created: running apps keep their connections, a NEW Wayland or
+  audio client started from a recovered shell finds no display. A
+  private instance socket nested deeper (`sketerm/mcp-tmp-<pid>/`) waits
+  until something re-creates `sketerm/`. macOS has no process inventory,
+  so clients there never prompt; the daemon's own re-bind still runs.
+
+`zig build smoke-mux` runs the stage (`src/smoke_relisten.zig`,
+`SKETERM_SMOKE_MUX_RELISTEN_ONLY=1` alone): removal + immediate
+reconnect through the real autostart, the dir absent for 2.5 s, the
+remote `--proxy` bootstrap, and a foreign listener on the path.
+
 ## PTY spawn (worker side)
 
 `Pty.spawn` in `src/pty.zig` is called only from

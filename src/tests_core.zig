@@ -208,6 +208,7 @@ comptime {
     _ = @import("mux/daemon_browse.zig");
     _ = @import("mux/daemon_control.zig");
     _ = @import("mux/daemon_adopt.zig");
+    _ = @import("mux/relisten.zig");
     _ = @import("mux/daemon_fsops.zig");
     _ = @import("mux/daemon_transfer.zig");
     _ = @import("mux/daemon_udp.zig");

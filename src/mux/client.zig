@@ -6,6 +6,7 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const wire = @import("wire.zig");
 const sockpath = @import("sockpath.zig");
+const relisten = @import("relisten.zig");
 const deploy = @import("deploy.zig");
 const rudp = @import("rudp.zig");
 const sshroute = @import("sshroute.zig");
@@ -529,6 +530,11 @@ pub const Conn = struct {
         if (Conn.connect(allocator, path)) |conn| {
             return probe(allocator, conn);
         } else |_| {}
+        // A daemon that lost this path (its runtime dir was removed) still
+        // holds sessions; bring it back instead of starting a second one.
+        if (relisten.reclaim(allocator, path)) {
+            if (Conn.connect(allocator, path)) |conn| return probe(allocator, conn) else |_| {}
+        }
 
         // NUL-terminated socket arg for the child; prepared before fork
         // (no allocation between fork and exec).

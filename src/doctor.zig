@@ -16,6 +16,7 @@ const version = @import("version.zig");
 const opuscodec = @import("mux/opuscodec.zig");
 const vcodec = @import("wlhost/vcodec.zig");
 const procinv = @import("procinv.zig");
+const relisten = @import("mux/relisten.zig");
 
 /// Daemon `list` reply; pre-doctor daemons omit version/caps fields
 /// and show up as version "" (reported as "pre-0.1.0 or stale").
@@ -454,6 +455,8 @@ const DaemonProbe = struct {
     peer: c.pid_t = 0,
     /// Live sessions the daemon listed; null when it could not be asked.
     sessions: ?u32 = null,
+    /// Whether an unreachable daemon gets its socket back by itself (relisten.zig).
+    support: relisten.Support = .old_build,
 };
 
 /// Session names keyed by the listed process holding each session.
@@ -463,14 +466,16 @@ const SessionNames = std.AutoHashMapUnmanaged(c.pid_t, std.ArrayList([]const u8)
 /// process holds each of its sessions. Reads only; a socket it cannot reach is reported.
 fn probeDaemon(a: std.mem.Allocator, inv: *const procinv.Inventory, p: *const procinv.Proc, names: *SessionNames) DaemonProbe {
     const env_buf = a.alloc(u8, 1 << 16) catch return .{};
-    const path = (procinv.daemonSocket(a, p, platform.environOfPid(p.pid, env_buf)) catch null) orelse return .{};
+    const environ = platform.environOfPid(p.pid, env_buf);
+    const path = (procinv.daemonSocket(a, p, environ) catch null) orelse return .{};
+    const support = relisten.support(p.pid, environ);
     const raw = mux_client.Conn.connect(a, path) catch
-        return .{ .path = path, .state = if (pathExists(path)) .refused else .gone };
+        return .{ .path = path, .state = if (pathExists(path)) .refused else .gone, .support = support };
     const peer = platform.unixPeerPid(raw.fd) orelse p.pid;
     if (peer != p.pid) {
         var other = raw;
         other.deinit();
-        return .{ .path = path, .state = .taken, .peer = peer };
+        return .{ .path = path, .state = .taken, .peer = peer, .support = support };
     }
     var probe = DaemonProbe{ .path = path, .state = .serving };
     var conn = mux_client.Conn.probe(a, raw) catch return probe;
@@ -561,9 +566,20 @@ fn writeProcRow(writer: *std.Io.Writer, palette: Palette, p: *const procinv.Proc
         .taken => "another daemon now answers its socket",
         else => "its socket refuses connections",
     };
-    try writer.print("{s}WARN unreachable: {s}; its sessions live on with no way in (kill {d} ends them){s}\n", .{
-        zspan(palette.warn), why, p.pid, zspan(palette.reset),
+    try writer.print("{s}WARN unreachable: {s}; its sessions live on with no way in{s}\n", .{
+        zspan(palette.warn), why, zspan(palette.reset),
     });
+    for (0..indent + 4) |_| try writer.writeByte(' ');
+    switch (probe.support) {
+        .recovers => switch (probe.state) {
+            .taken => try writer.print("recovers: takes the socket back once pid {d} stops serving it; it never takes it over\n", .{probe.peer}),
+            else => if (relisten.parentReady(probe.path))
+                try writer.print("recovers: re-binds {s} within a second, or at once when a client connects\n", .{probe.path})
+            else
+                try writer.print("recovers: re-binds {s} once its runtime directory exists again\n", .{probe.path}),
+        },
+        .old_build => try writer.print("old build: cannot recover; `reptyr` can move its shells to a reachable terminal (kill {d} ends them)\n", .{p.pid}),
+    }
 }
 
 /// List every sketerm process of this user as a tree, warning about daemons nobody can reach.
@@ -742,7 +758,18 @@ test "doctor process rows nest by depth and name what a daemon serves" {
     try contains(warned.written(), "socket gone: /run/user/1000/sketerm/mux.sock");
     try contains(warned.written(), "[binary replaced since start]");
     try contains(warned.written(), "WARN unreachable: its socket file was removed");
+    try contains(warned.written(), "old build: cannot recover; `reptyr` can move its shells");
     try contains(warned.written(), "kill 100");
+
+    var recovering: std.Io.Writer.Allocating = .init(allocator);
+    defer recovering.deinit();
+    try writeProcRow(&recovering.writer, Palette.init(false), &broker, .{ .path = "/nonexistent-rt/sketerm/mux.sock", .state = .gone, .support = .recovers }, &.{});
+    try contains(recovering.written(), "recovers: re-binds /nonexistent-rt/sketerm/mux.sock once its runtime directory exists again");
+    try std.testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, recovering.written(), "kill"));
+    var displaced: std.Io.Writer.Allocating = .init(allocator);
+    defer displaced.deinit();
+    try writeProcRow(&displaced.writer, Palette.init(false), &broker, .{ .path = "/tmp/a/mux.sock", .state = .taken, .peer = 7, .support = .recovers }, &.{});
+    try contains(displaced.written(), "takes the socket back once pid 7 stops serving it");
     try std.testing.expectEqual(@as(u32, 1), probeWarns(&broker, gone));
 
     var serving: std.Io.Writer.Allocating = .init(allocator);

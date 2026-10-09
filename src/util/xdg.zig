@@ -17,10 +17,15 @@ pub const Error = error{ NoStateDir, OutOfMemory };
 /// @return null when neither variable names a directory (an EMPTY
 /// variable counts as unset, as the XDG spec says).
 pub fn stateDir(buf: []u8) ?[]const u8 {
-    if (env.nonEmpty("XDG_STATE_HOME")) |xs|
+    return stateDirFrom(buf, env.nonEmpty("XDG_STATE_HOME"), env.nonEmpty("HOME"));
+}
+
+/// `stateDir` for variables passed by value, so a caller can resolve ANOTHER process's.
+pub fn stateDirFrom(buf: []u8, xdg_state_home: ?[]const u8, home: ?[]const u8) ?[]const u8 {
+    if (xdg_state_home) |xs| if (xs.len > 0)
         return std.fmt.bufPrint(buf, "{s}/sketerm", .{xs}) catch null;
-    if (env.nonEmpty("HOME")) |home|
-        return std.fmt.bufPrint(buf, "{s}/.local/state/sketerm", .{home}) catch null;
+    if (home) |h| if (h.len > 0)
+        return std.fmt.bufPrint(buf, "{s}/.local/state/sketerm", .{h}) catch null;
     return null;
 }
 

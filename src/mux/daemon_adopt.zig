@@ -48,6 +48,7 @@ const c = @import("../c.zig").c;
 const log = @import("log.zig");
 const platform = @import("../util/platform.zig");
 const sockpath = @import("sockpath.zig");
+const relisten = @import("relisten.zig");
 const build_options = @import("build_options");
 const dmod = @import("daemon.zig");
 const daemon_control = @import("daemon_control.zig");
@@ -132,11 +133,19 @@ pub fn closeListener(self: *Daemon) void {
     defer self.allocator.free(p);
     var z: [512]u8 = undefined;
     const pz = std.fmt.bufPrintZ(&z, "{s}", .{p}) catch return;
-    var st: c.struct_stat = undefined;
-    if (c.lstat(pz.ptr, &st) == 0 and
-        @as(u128, @intCast(st.st_dev)) == self.adopt_dev and
-        @as(u128, @intCast(st.st_ino)) == self.adopt_ino)
-        _ = c.unlink(pz.ptr);
+    if (relisten.pathState(p, .{ .dev = self.adopt_dev, .ino = self.adopt_ino }) == .ours) _ = c.unlink(pz.ptr);
+}
+
+/// Bind the adoption listener again when its file was removed (the runtime dir went away),
+/// once the broker's socket directory is back; the worker never creates that directory itself.
+pub fn workerRelisten(self: *Daemon) void {
+    const path = self.adopt_path orelse return;
+    if (self.sessions.items.len == 0) return;
+    if (relisten.pathState(path, .{ .dev = self.adopt_dev, .ino = self.adopt_ino }) != .missing) return;
+    if (!relisten.parentReady(path)) return;
+    closeListener(self);
+    workerListen(self, &self.sessions.items[0].origin_id);
+    if (self.adopt_fd >= 0) log.info("worker pid={d}: adoption listener re-bound after its file was removed", .{c.getpid()});
 }
 
 /// Control EOF on an adoptable worker: the broker is gone. Keep the
