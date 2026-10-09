@@ -6681,6 +6681,9 @@ fn webPolicyFakeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []co
             std.mem.indexOf(u8, opened, "\"policy_source\":\"call\"") == null or
             std.mem.indexOf(u8, opened, "\"max_requests\":5") == null)
             fail("web_open does not echo the enforced policy");
+        // Parsed now: the next call reuses the reply buffer `opened` points into.
+        const view = capInt(capSc(arena, opened, "policied open", false), "view");
+        if (view <= 0) fail("a policied web_open did not report its view id");
         const caps_reply = m.callTool("capabilities", "{}");
         const caps = capSc(arena, caps_reply, "capable policy preflight", false);
         if (caps.get("web_policy_ack").? != .bool or !caps.get("web_policy_ack").?.bool) {
@@ -6688,9 +6691,12 @@ fn webPolicyFakeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []co
             fail("policy-capable fake did not advertise correlated acknowledgements");
         }
         const log = readSmall(frames, &file_buf);
-        const ps = std.mem.indexOf(u8, log, "net_policy_set view=1") orelse
+        var want_buf: [64]u8 = undefined;
+        const want_ps = std.fmt.bufPrint(&want_buf, "net_policy_set view={d} ", .{view}) catch unreachable;
+        const ps = std.mem.indexOf(u8, log, want_ps) orelse
             fail("no net_policy_set reached the helper");
-        const vc = std.mem.indexOf(u8, log, "view_create_url view=1") orelse
+        const want_vc = std.fmt.bufPrint(&want_buf, "view_create_url view={d} ", .{view}) catch unreachable;
+        const vc = std.mem.indexOf(u8, log, want_vc) orelse
             fail("no view_create_url reached the helper");
         if (ps > vc) fail("the view was created before its policy was installed");
         if (std.mem.indexOf(u8, log, "top=1 max_requests=5") == null)
