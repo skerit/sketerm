@@ -358,6 +358,13 @@ pub fn setSigAction(
     }
 }
 
+/// True when ECONNRESET on a connected AF_UNIX stream socket proves the
+/// peer closed with bytes we sent still unread: Linux sets it on the
+/// survivor only when the closing end's receive queue was non-empty
+/// (`unix_release_sock`), and a peer that read everything gives EOF.
+/// Unproven elsewhere, so no other platform claims it.
+pub const unix_reset_means_unread = is_linux;
+
 /// Control socketpair for the broker↔worker channel: every control
 /// message is ONE message carrying at most one SCM_RIGHTS fd, and
 /// messages as large as `capacity` bytes have to survive the trip.

@@ -3,9 +3,9 @@
 //!
 //! libc only, no GLib, so both test roots carry it. Every connect,
 //! write and read is non-blocking under one absolute deadline, and a
-//! failure says whether any request byte left this process: a request
-//! nothing was written for can be resent, one that was partially or
-//! fully written may already have run.
+//! failure says whether the request could have reached the GUI: one
+//! nothing was written for, or that the peer provably closed unread,
+//! can be resent; any other written one may already have run.
 
 const std = @import("std");
 const c = @import("../c.zig").c;
@@ -130,6 +130,11 @@ pub const Conn = struct {
             if (n == 0) return .{ .failure = failure(error.NoResponse, true) };
             const e = std.posix.errno(n);
             if (e == .INTR) continue;
+            // The peer closed with our request still queued unread, so
+            // it never ran: the shape of a peer that hung up between
+            // `peerClosed` and the write.
+            if (e == .CONNRESET and platform.unix_reset_means_unread and self.pending.items.len == 0)
+                return .{ .failure = failure(error.ConnectionReset, false) };
             if (e != .AGAIN) return .{ .failure = failure(error.NoResponse, true) };
             pollUntil(self.fd, c.POLLIN, deadline_ms) catch |err| return .{ .failure = failure(err, true) };
         }
@@ -139,9 +144,9 @@ pub const Conn = struct {
 /// One connection kept open across requests to the same socket: a
 /// long-lived client (the MCP server) pays one connect, not one per
 /// call. A connection the GUI closed while idle is noticed before the
-/// write and replaced; a reused connection that fails before any byte
-/// left is redialed once (the GUI may have closed it between the check
-/// and the write). Anything else drops the connection, since the
+/// write and replaced; a reused connection that fails pre-delivery is
+/// redialed once (the GUI may have closed it between the check and the
+/// write, or with the request unread). Anything else drops it, since the
 /// stream's position is then unknown, and is never resent.
 pub const Persistent = struct {
     allocator: std.mem.Allocator,
@@ -373,6 +378,42 @@ test "an idle connection the peer closed is noticed before the write" {
     const r = client.exchange(t.allocator, l.path(), "{}", 2_000);
     try t.expectEqualStrings("{\"n\":2}", r.reply);
     t.allocator.free(r.reply);
+    try t.expectEqual(@as(u32, 2), client.dials);
+}
+
+test "a reused connection the peer closed with the request unread is resent" {
+    if (!platform.unix_reset_means_unread) return error.SkipZigTest;
+    var l = try TestListener.init();
+    defer l.deinit();
+    var client = Persistent.init(t.allocator);
+    defer client.deinit();
+    // The race `peerClosed` cannot see: the peer answers, then hangs up
+    // with the next request queued unread, then a fresh connection is
+    // answered.
+    const Racer = struct {
+        fn run(listen_fd: c_int) void {
+            const fd = c.accept(listen_fd, null, null);
+            if (fd < 0) return;
+            var buf: [256]u8 = undefined;
+            if (c.read(fd, &buf, buf.len) <= 0) {
+                _ = c.close(fd);
+                return;
+            }
+            _ = c.write(fd, "{\"n\":1}\n", 8);
+            // Wait for the second request to land, then close unread.
+            var pfd = c.struct_pollfd{ .fd = fd, .events = c.POLLIN, .revents = 0 };
+            _ = c.poll(&pfd, 1, 2_000);
+            _ = c.close(fd);
+            Peer.serve(listen_fd, &[_][]const u8{"{\"n\":2}\n"});
+        }
+    };
+    const th = try std.Thread.spawn(.{}, Racer.run, .{l.fd});
+    defer th.join();
+    for ([_][]const u8{ "{\"n\":1}", "{\"n\":2}" }) |want| {
+        const r = client.exchange(t.allocator, l.path(), "{}", 2_000);
+        try t.expectEqualStrings(want, r.reply);
+        t.allocator.free(r.reply);
+    }
     try t.expectEqual(@as(u32, 2), client.dials);
 }
 
