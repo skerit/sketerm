@@ -1,5 +1,18 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-10: the AI badge popover keeps its buttons across roster changes
+
+A click on the AI badge popover could be lost: every roster change
+rebuilt the open popover wholesale, and a press landing while a rebuild
+replaced its button went nowhere (a rig saw a roster fetch land 71 ms
+after an AT-SPI press). The popover is now synced in place: a section
+keeps its widgets while its assistant (`SectionKey`) is still usable, a
+row while its session, attach host and kind (`RowKey`) hold; only labels,
+tooltips and sensitivity change, gone entries are removed and new ones
+added. `matchIdentities` is the pure pairing, unit-tested; each view is
+owned by its widget as qdata. The focused web-watch gate passes without
+the 3.5 s press wait.
+
 ## 2026-10-10: a closing window no longer feeds the AI-badge watcher
 
 A secondary window could SIGSEGV the whole GUI after it closed: the AI
