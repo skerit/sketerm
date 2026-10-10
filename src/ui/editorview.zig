@@ -2099,6 +2099,10 @@ pub const EditorView = struct {
         // Status line.
         const status = c.gtk_label_new("");
         c.gtk_label_set_xalign(@ptrCast(status), 0);
+        // A label that cannot ellipsize asks for its whole text as its
+        // MINIMUM width, so a long message (an LSP server's version
+        // complaint) widened the whole window to fit it.
+        c.gtk_label_set_ellipsize(@ptrCast(status), c.PANGO_ELLIPSIZE_END);
         c.gtk_widget_add_css_class(status, "dim-label");
         c.gtk_widget_set_margin_start(status, 6);
         c.gtk_widget_set_margin_bottom(status, 2);
