@@ -52,6 +52,12 @@ pub const Policy = struct {
     allow_schemes: u16 = default_schemes,
     allow_private: bool = false,
     untrusted: bool = false,
+    /// The helper's route is a caller-given proxy that resolves every
+    /// host and decides which addresses are reachable
+    /// (`webroute.Kind.proxyDecidesAddresses`): a private-looking host
+    /// is the proxy's to refuse or serve, since nothing here connects to
+    /// it. Set by the helper from its instance, never from the wire.
+    proxy_decides_addresses: bool = false,
     max_requests: u32 = 0,
     max_bytes: u64 = 0,
     max_navigations: u32 = 0,
@@ -145,7 +151,7 @@ pub fn decide(p: *const Policy, c: *const Counters, r: Req, now_ms: i64) proto.N
     // Hostless schemes (data:, about:, blob:) are judged by scheme
     // alone: there is no authority to test.
     if (r.host.len > 0) {
-        if (!p.allow_private and isPrivateHostLiteral(r.host)) return .private_address;
+        if (!p.allow_private and !p.proxy_decides_addresses and isPrivateHostLiteral(r.host)) return .private_address;
         const listed = hostAllowed(p, r);
         if (!listed) return if (r.is_redirect_hop) .redirect_host else if (r.is_top) .top_host else .sub_host;
     }
@@ -661,6 +667,26 @@ test "scheme mask, hostless schemes, and the private toggle" {
     const p2 = try testPolicy(testing.allocator, set2);
     defer p2.deinit(testing.allocator);
     try testing.expectEqual(proto.NetReason.none, decide(p2, &c, .{ .host = "127.0.0.1", .scheme = "http", .rtype = .document, .is_top = true }, 0));
+}
+
+test "a proxy that decides addresses takes the private literal refusal, never the allow-list" {
+    var set = baseSet();
+    set.allow_top = &.{ "127.0.0.1", "render.localhost" };
+    const p = try testPolicy(testing.allocator, set);
+    defer p.deinit(testing.allocator);
+    const c = Counters{};
+    const loopback = Req{ .host = "127.0.0.1", .scheme = "http", .rtype = .document, .is_top = true };
+    const named = Req{ .host = "render.localhost", .scheme = "http", .rtype = .document, .is_top = true };
+    // Without the proxy the literal test refuses both, allow-listed or not.
+    try testing.expectEqual(proto.NetReason.private_address, decide(p, &c, loopback, 0));
+    try testing.expectEqual(proto.NetReason.private_address, decide(p, &c, named, 0));
+    // On a proxy route the proxy is asked instead...
+    p.proxy_decides_addresses = true;
+    try testing.expectEqual(proto.NetReason.none, decide(p, &c, loopback, 0));
+    try testing.expectEqual(proto.NetReason.none, decide(p, &c, named, 0));
+    // ...and every other gate still holds on top of it.
+    try testing.expectEqual(proto.NetReason.top_host, decide(p, &c, .{ .host = "10.0.0.1", .scheme = "http", .rtype = .document, .is_top = true }, 0));
+    try testing.expectEqual(proto.NetReason.scheme, decide(p, &c, .{ .host = "127.0.0.1", .scheme = "ftp", .rtype = .document, .is_top = true }, 0));
 }
 
 test "budgets latch and every later decide answers the same reason" {

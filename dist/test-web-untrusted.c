@@ -16,6 +16,10 @@ int sk_missing_curl_placeholder(void) { return 0; }
 #ifdef SK_TEST_PORTABLE
 #include "../vendor/web_untrusted.h"
 #undef __linux__
+#else
+/* Every socket a routed job's curl asks for, refused ones included. */
+static void observe_socket(int purpose, const void *address);
+#define SK_OPEN_SOCKET_OBSERVE(purpose, address) observe_socket((int)(purpose), (address))
 #endif
 #include "../vendor/web_untrusted.c"
 #ifdef SK_TEST_PORTABLE
@@ -28,7 +32,7 @@ static void stub_denied(int id, uint64_t request_id, int reason, int unsent) {
 int main(void) {
     assert(!sk_web_untrusted_job_landlock() && !sk_web_untrusted_no_core());
     assert(!sk_web_untrusted_core_limit() && !sk_web_untrusted_nondumpable());
-    assert(!sk_web_untrusted_start("/unused") && !sk_web_untrusted_confine());
+    assert(!sk_web_untrusted_start("/unused", NULL) && !sk_web_untrusted_confine());
     assert(!sk_web_untrusted_request_handler(NULL, NULL, 0, 0, NULL));
     assert(!sk_web_untrusted_resource(NULL, NULL, 1, stub_denied, 17));
     assert(stub_reason == SK_WEB_UNTRUSTED_BROKER_FAILURE);
@@ -427,8 +431,49 @@ struct server_stats { atomic_uint hits, cookies, posts, dns, origins; };
 static struct server_stats *stats;
 static atomic_int dns_entered;
 
+/* What the routed-broker tests observe, shared with the fake proxy, the
+ * broker and its jobs (all forked from the test). */
+struct proxy_stats {
+    atomic_uint connections, page_dns, proxy_dns, sockets, foreign_sockets;
+    atomic_int observing;
+    /* The one address and port a routed job may dial. */
+    int expect_family; unsigned char expect_addr[16]; unsigned expect_port;
+    unsigned socks_atyp, socks_port;
+    char socks_host[256], request_line[512];
+};
+static struct proxy_stats *pstats;
+
+/* Page hosts the routed tests use: resolvable nowhere, and never asked here. */
+#define PAGE_SUFFIX ".sk-proxy.test"
+/* A proxy NAME, resolved here to 127.0.0.1 (the broker resolves proxies). */
+#define PROXY_NAME "proxy.sk-test.invalid"
+
+static void observe_socket(int purpose, const void *address) {
+    if (!pstats || !atomic_load(&pstats->observing)) return;
+    const struct curl_sockaddr *a = address;
+    atomic_fetch_add(&pstats->sockets, 1);
+    unsigned char bytes[16];
+    int port = a->family == AF_INET ? ntohs(((const struct sockaddr_in *)&a->addr)->sin_port) :
+        a->family == AF_INET6 ? ntohs(((const struct sockaddr_in6 *)&a->addr)->sin6_port) : -1;
+    if (purpose != CURLSOCKTYPE_IPCXN || (a->socktype & ~(SOCK_CLOEXEC | SOCK_NONBLOCK)) != SOCK_STREAM ||
+        a->family != pstats->expect_family || !sk_address_bytes(&a->addr, bytes) ||
+        memcmp(bytes, pstats->expect_addr, 16) || port != (int)pstats->expect_port)
+        atomic_fetch_add(&pstats->foreign_sockets, 1);
+}
+
 /* Exercise the real curl resolver lane without external DNS traffic. */
 int getaddrinfo(const char *name, const char *service, const struct addrinfo *hints, struct addrinfo **result) {
+    int (*resolve)(const char *, const char *, const struct addrinfo *, struct addrinfo **) = dlsym(RTLD_NEXT, "getaddrinfo");
+    assert(resolve);
+    size_t len = name ? strlen(name) : 0;
+    if (pstats && len >= sizeof(PAGE_SUFFIX) - 1 && !strcmp(name + len - (sizeof(PAGE_SUFFIX) - 1), PAGE_SUFFIX)) {
+        atomic_fetch_add(&pstats->page_dns, 1);
+        return EAI_NONAME;
+    }
+    if (pstats && name && !strcmp(name, PROXY_NAME)) {
+        atomic_fetch_add(&pstats->proxy_dns, 1);
+        return resolve("127.0.0.1", service, hints, result);
+    }
     if (name && !strcmp(name, "sk-slow-dns.test")) {
         assert(stats);
         /* curl may resolve A and AAAA on separate threads in the same job. */
@@ -436,8 +481,6 @@ int getaddrinfo(const char *name, const char *service, const struct addrinfo *hi
         pause_ms(20000);
         return EAI_AGAIN;
     }
-    int (*resolve)(const char *, const char *, const struct addrinfo *, struct addrinfo **) = dlsym(RTLD_NEXT, "getaddrinfo");
-    assert(resolve);
     return resolve(name, service, hints, result);
 }
 
@@ -1319,7 +1362,7 @@ static void landlock_job(const char *scratch) {
     pid_t child = fork(); assert(child >= 0);
     if (!child) {
         assert(!prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0));
-        assert(sk_landlock_job(abi, ntohs(a.sin_port)));
+        assert(sk_landlock_job(abi, ntohs(a.sin_port), 1));
         errno = 0; assert(open(file, O_WRONLY | O_CREAT | O_CLOEXEC, 0600) == -1 && errno == EACCES);
         errno = 0; assert(mkdir(file, 0700) == -1 && errno == EACCES);
         int fd = open("/proc/self/exe", O_RDONLY | O_CLOEXEC); assert(fd >= 0); close(fd);
@@ -1359,11 +1402,11 @@ static void broker_tests(void) {
     if (!http) server(listener, parent);
     close(listener);
     char directory[256]; temp_directory(directory, sizeof(directory), "wu");
-    assert(!chmod(directory, 0755) && !sk_web_untrusted_start(directory));
+    assert(!chmod(directory, 0755) && !sk_web_untrusted_start(directory, NULL));
     assert(!chmod(directory, 0700));
     assert(!setenv("http_proxy", "http://127.0.0.1:1", 1));
     assert(!setenv("ALL_PROXY", "socks5h://127.0.0.1:1", 1));
-    assert(sk_web_untrusted_start(directory));
+    assert(sk_web_untrusted_start(directory, NULL));
     /* The browser must stay dumpable for Chromium's namespace sandbox. */
     assert(prctl(PR_GET_DUMPABLE) == 1);
     assert(sk_web_untrusted_job_landlock() == (sk_landlock_probe() > 0));
@@ -1502,6 +1545,268 @@ static void broker_tests(void) {
     puts("PASS confined async fetch, immediate cancellation, broker/worker kill and reap");
 }
 
+/* A forward proxy that serves every request itself: SOCKS5 (any ATYP, logged)
+ * or HTTP (request line logged). CONNECT is refused 403, so https proves the
+ * tunnel target without a certificate. Never connects anywhere. */
+static void proxy_conn(int fd) {
+    int64_t deadline = sk_now_ms() + 3000;
+    unsigned char first;
+    char request[2048];
+    size_t used = 0;
+    if (!sk_io(fd, &first, 1, 0, deadline)) return;
+    if (first == 5) {
+        unsigned char count, methods[255], head[4], port[2];
+        unsigned char choice[2] = {5, 0}, reply[10] = {5, 0, 0, 1, 0, 0, 0, 0, 0, 0};
+        if (!sk_io(fd, &count, 1, 0, deadline) || !sk_io(fd, methods, count, 0, deadline) ||
+            !sk_io(fd, choice, 2, 1, deadline) || !sk_io(fd, head, 4, 0, deadline)) return;
+        pstats->socks_atyp = head[3];
+        if (head[3] == 3) {
+            unsigned char len;
+            if (!sk_io(fd, &len, 1, 0, deadline) || !sk_io(fd, pstats->socks_host, len, 0, deadline)) return;
+            pstats->socks_host[len] = 0;
+        } else {
+            unsigned char raw[16];
+            size_t n = head[3] == 1 ? 4 : 16;
+            if (!sk_io(fd, raw, n, 0, deadline)) return;
+            inet_ntop(head[3] == 1 ? AF_INET : AF_INET6, raw, pstats->socks_host, sizeof(pstats->socks_host));
+        }
+        if (!sk_io(fd, port, 2, 0, deadline)) return;
+        pstats->socks_port = (unsigned)port[0] << 8 | port[1];
+        if (!sk_io(fd, reply, sizeof(reply), 1, deadline)) return;
+    } else request[used++] = (char)first;
+    while (used < sizeof(request) - 1 && !memmem(request, used, "\r\n\r\n", 4)) {
+        struct pollfd f = {fd, POLLIN, 0};
+        if (poll(&f, 1, 3000) <= 0) break;
+        ssize_t n = recv(fd, request + used, sizeof(request) - 1 - used, 0);
+        if (n <= 0) break;
+        used += (size_t)n;
+    }
+    request[used] = 0;
+    size_t line = strcspn(request, "\r\n");
+    if (line >= sizeof(pstats->request_line)) line = sizeof(pstats->request_line) - 1;
+    memcpy(pstats->request_line, request, line);
+    pstats->request_line[line] = 0;
+    atomic_fetch_add(&pstats->connections, 1);
+    if (!strncmp(request, "CONNECT ", 8)) {
+        const char refused[] = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        sk_io(fd, (void *)refused, sizeof(refused) - 1, 1, deadline);
+        return;
+    }
+    const char served[] = "HTTP/1.1 200 OK\r\nContent-Length: 7\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nproxied";
+    sk_io(fd, (void *)served, sizeof(served) - 1, 1, deadline);
+}
+
+static void proxy_server(int listener, pid_t parent) {
+    close(STDIN_FILENO);
+    assert(!prctl(PR_SET_PDEATHSIG, SIGKILL));
+    if (getppid() != parent) _exit(1);
+    signal(SIGPIPE, SIG_IGN);
+    alarm(60);
+    for (;;) {
+        int fd = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
+        if (fd < 0) { if (errno == EINTR) continue; _exit(1); }
+        proxy_conn(fd);
+        close(fd);
+    }
+}
+
+/* A loopback listener on family's loopback, 0 when the family is absent. */
+static int proxy_listener(int family, unsigned *port) {
+    int fd = socket(family, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_storage address = {0};
+    socklen_t len;
+    if (family == AF_INET) {
+        struct sockaddr_in *v4 = (struct sockaddr_in *)&address;
+        v4->sin_family = AF_INET; v4->sin_addr.s_addr = htonl(INADDR_LOOPBACK); len = sizeof(*v4);
+    } else {
+        struct sockaddr_in6 *v6 = (struct sockaddr_in6 *)&address;
+        v6->sin6_family = AF_INET6; v6->sin6_addr = in6addr_loopback; len = sizeof(*v6);
+    }
+    if (bind(fd, (struct sockaddr *)&address, len) || listen(fd, 16) ||
+        getsockname(fd, (struct sockaddr *)&address, &len)) { close(fd); return -1; }
+    *port = ntohs(family == AF_INET ? ((struct sockaddr_in *)&address)->sin_port : ((struct sockaddr_in6 *)&address)->sin6_port);
+    return fd;
+}
+
+static void expect_proxy(int family, const char *address, unsigned port) {
+    struct sockaddr_storage probe;
+    set_address(&probe, address);
+    assert(probe.ss_family == family);
+    pstats->expect_family = family; pstats->expect_port = port;
+    assert(sk_address_bytes((struct sockaddr *)&probe, pstats->expect_addr));
+}
+
+/* One routed exchange; returns the response with every observation reset first. */
+static struct sk_response routed(const char *url, int allow) {
+    pstats->request_line[0] = 0; pstats->socks_host[0] = 0; pstats->socks_atyp = 0; pstats->socks_port = 0;
+    atomic_store(&pstats->sockets, 0); atomic_store(&pstats->foreign_sockets, 0);
+    atomic_store(&pstats->observing, 1);
+    struct sk_response r = exchange(url, "GET", "", 0, NULL, 0, allow);
+    atomic_store(&pstats->observing, 0);
+    return r;
+}
+
+/* sk_open_socket's routed allowance, driven directly: the proxy's address and
+ * port, nothing else, whatever its address class. */
+static void routed_allowance(void) {
+    struct sk_proxy_target target;
+    struct sockaddr_storage probe;
+    set_address(&target.address, "127.0.0.1");
+    struct sk_response r = {.port = 1080, .allow_private = 0, .proxy = &target};
+    const struct { const char *address; unsigned port; int family; int opened; } cases[] = {
+        {"127.0.0.1", 1080, AF_INET, 1},   /* the proxy: loopback, still allowed */
+        {"127.0.0.2", 1080, AF_INET, 0},   /* the neighbour */
+        {"127.0.0.1", 1081, AF_INET, 0},   /* another port */
+        {"8.8.8.8", 1080, AF_INET, 0},     /* public is no excuse */
+        {"::ffff:127.0.0.1", 1080, AF_INET6, 0}, /* same bytes, other family */
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(*cases); ++i) {
+        set_address(&probe, cases[i].address);
+        union { struct curl_sockaddr c; unsigned char room[sizeof(struct curl_sockaddr) + sizeof(struct sockaddr_storage)]; } u;
+        memset(&u, 0, sizeof(u));
+        u.c.family = cases[i].family; u.c.socktype = SOCK_STREAM; u.c.protocol = IPPROTO_TCP;
+        u.c.addrlen = cases[i].family == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
+        memcpy(&u.c.addr, &probe, u.c.addrlen);
+        if (cases[i].family == AF_INET) ((struct sockaddr_in *)&u.c.addr)->sin_port = htons((uint16_t)cases[i].port);
+        else ((struct sockaddr_in6 *)&u.c.addr)->sin6_port = htons((uint16_t)cases[i].port);
+        r.port = 1080;
+        int fd = sk_open_socket(&r, CURLSOCKTYPE_IPCXN, &u.c);
+        assert((fd >= 0) == cases[i].opened);
+        if (fd >= 0) close(fd);
+        /* A refused candidate is never misreported as a private address. */
+        assert(r.reason != SK_WEB_UNTRUSTED_PRIVATE);
+        if (cases[i].opened) {
+            /* Not for a non-connection purpose, nor a datagram socket. */
+            assert(sk_open_socket(&r, CURLSOCKTYPE_ACCEPT, &u.c) == CURL_SOCKET_BAD);
+            u.c.socktype = SOCK_DGRAM;
+            assert(sk_open_socket(&r, CURLSOCKTYPE_IPCXN, &u.c) == CURL_SOCKET_BAD);
+        }
+    }
+    puts("PASS routed connect allowance: exactly the proxy's address, family and port (loopback allowed, neighbours/ports/public/mapped refused)");
+}
+
+static void proxy_routes(void) {
+    alarm(60);
+    pstats = mmap(NULL, sizeof(*pstats), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    stats = mmap(NULL, sizeof(*stats), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    assert(pstats != MAP_FAILED && stats != MAP_FAILED);
+    memset(pstats, 0, sizeof(*pstats)); memset(stats, 0, sizeof(*stats));
+    routed_allowance();
+    pid_t parent = getpid();
+    /* The origin a direct path would reach: it must stay at zero hits. */
+    int origin = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0); assert(origin >= 0);
+    struct sockaddr_in oa = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    socklen_t olen = sizeof(oa);
+    assert(!bind(origin, (struct sockaddr *)&oa, sizeof(oa)) && !listen(origin, 16) && !getsockname(origin, (struct sockaddr *)&oa, &olen));
+    pid_t origin_pid = fork(); assert(origin_pid >= 0);
+    if (!origin_pid) server(origin, parent);
+    close(origin);
+    unsigned proxy_port = 0, proxy6_port = 0;
+    int listener = proxy_listener(AF_INET, &proxy_port); assert(listener >= 0);
+    pid_t proxy_pid = fork(); assert(proxy_pid >= 0);
+    if (!proxy_pid) proxy_server(listener, parent);
+    close(listener);
+    int listener6 = proxy_listener(AF_INET6, &proxy6_port);
+    pid_t proxy6_pid = -1;
+    if (listener6 >= 0) {
+        proxy6_pid = fork(); assert(proxy6_pid >= 0);
+        if (!proxy6_pid) proxy_server(listener6, parent);
+        close(listener6);
+    }
+    /* A port nothing listens on: bound, then closed. */
+    unsigned dead_port = 0;
+    int dead = proxy_listener(AF_INET, &dead_port); assert(dead >= 0); close(dead);
+
+    char directory[256]; temp_directory(directory, sizeof(directory), "wp");
+    assert(!chmod(directory, 0700));
+    char proxy[128], url[256];
+    /* Outside the grammar: refused before any broker exists. */
+    const char *refused[] = {"socks5://127.0.0.1:1080", "https://127.0.0.1:1080", "http://u@127.0.0.1:1080",
+        "http://127.0.0.1", "http://127.0.0.1:", "http://127.0.0.1:1080/", "http://127.0.0.1:0",
+        "http://::1:1080", "http://[::1]", "socks5h://127.1:1080"};
+    for (size_t i = 0; i < sizeof(refused) / sizeof(*refused); ++i)
+        assert(!sk_web_untrusted_start(directory, refused[i]) && !sk_broker_pid && sk_lifetime_fd == -1);
+    puts("PASS routed broker refuses socks5 (local DNS), other schemes, credentials, paths and missing/zero ports");
+
+    /* HTTP proxy, plain http: absolute-form forwarding with the HOSTNAME. */
+    snprintf(proxy, sizeof(proxy), "http://127.0.0.1:%u", proxy_port);
+    assert(sk_web_untrusted_start(directory, proxy) && sk_proxy.on && !sk_proxy.socks);
+    expect_proxy(AF_INET, "127.0.0.1", proxy_port);
+    struct sk_response r = routed("http://origin" PAGE_SUFFIX ":8080/page", 0);
+    assert(!r.reason && r.status == 200 && r.body_len == 7 && !memcmp(r.body, "proxied", 7)); response_free(&r);
+    assert(!strcmp(pstats->request_line, "GET http://origin" PAGE_SUFFIX ":8080/page HTTP/1.1"));
+    assert(atomic_load(&pstats->sockets) >= 1 && !atomic_load(&pstats->foreign_sockets));
+    /* A loopback origin with allow_private 0: the proxy decides, and the real
+     * origin listening at that very address sees nothing. */
+    snprintf(url, sizeof(url), "http://127.0.0.1:%u/direct-would-hit", ntohs(oa.sin_port));
+    r = routed(url, 0);
+    assert(!r.reason && r.status == 200 && !memcmp(r.body, "proxied", 7)); response_free(&r);
+    char line[300]; snprintf(line, sizeof(line), "GET %s HTTP/1.1", url);
+    assert(!strcmp(pstats->request_line, line) && !atomic_load(&pstats->foreign_sockets));
+    /* https: a CONNECT naming the host; the proxy's refusal fails the load. */
+    r = routed("https://secure" PAGE_SUFFIX "/", 0);
+    assert(r.reason == SK_WEB_UNTRUSTED_BROKER_FAILURE && !r.body_len); response_free(&r);
+    assert(!strcmp(pstats->request_line, "CONNECT secure" PAGE_SUFFIX ":443 HTTP/1.1"));
+    assert(!atomic_load(&pstats->foreign_sockets));
+    sk_web_untrusted_stop();
+    printf("PASS http proxy route: forward and CONNECT name the host, only %s:%u is dialled, loopback served by the proxy\n",
+           "127.0.0.1", proxy_port);
+
+    /* SOCKS5 with remote DNS, the proxy named by a hostname the BROKER resolves. */
+    snprintf(proxy, sizeof(proxy), "socks5h://" PROXY_NAME ":%u", proxy_port);
+    unsigned proxy_lookups = atomic_load(&pstats->proxy_dns);
+    assert(sk_web_untrusted_start(directory, proxy) && sk_proxy.socks);
+    r = routed("http://origin" PAGE_SUFFIX ":8080/socks", 0);
+    assert(!r.reason && r.status == 200 && !memcmp(r.body, "proxied", 7)); response_free(&r);
+    assert(pstats->socks_atyp == 3 && !strcmp(pstats->socks_host, "origin" PAGE_SUFFIX) && pstats->socks_port == 8080);
+    assert(!strcmp(pstats->request_line, "GET /socks HTTP/1.1"));
+    assert(atomic_load(&pstats->proxy_dns) > proxy_lookups && !atomic_load(&pstats->foreign_sockets));
+    /* An IPv4 literal page host travels as written to the proxy (curl sends a
+     * literal as ATYP 1; either way no lookup happens here). */
+    snprintf(url, sizeof(url), "http://127.0.0.1:%u/literal", ntohs(oa.sin_port));
+    r = routed(url, 0);
+    assert(!r.reason && !memcmp(r.body, "proxied", 7)); response_free(&r);
+    assert((pstats->socks_atyp == 1 || pstats->socks_atyp == 3) && !strcmp(pstats->socks_host, "127.0.0.1"));
+    assert(pstats->socks_port == ntohs(oa.sin_port) && !atomic_load(&pstats->foreign_sockets));
+    printf("PASS socks5h literal page host forwarded as ATYP %u\n", pstats->socks_atyp);
+    sk_web_untrusted_stop();
+    puts("PASS socks5h proxy route: CONNECT carries ATYP 3 and the hostname; the proxy name is the broker's only lookup");
+
+    if (proxy6_pid > 0) {
+        snprintf(proxy, sizeof(proxy), "socks5h://[::1]:%u", proxy6_port);
+        assert(sk_web_untrusted_start(directory, proxy));
+        expect_proxy(AF_INET6, "::1", proxy6_port);
+        r = routed("http://six" PAGE_SUFFIX "/", 0);
+        assert(!r.reason && !memcmp(r.body, "proxied", 7) && !atomic_load(&pstats->foreign_sockets)); response_free(&r);
+        assert(pstats->socks_atyp == 3 && !strcmp(pstats->socks_host, "six" PAGE_SUFFIX));
+        sk_web_untrusted_stop();
+        puts("PASS socks5h proxy route over an IPv6 literal proxy ([::1])");
+    } else puts("SKIP IPv6 literal proxy: no ::1 on this host");
+
+    /* Unreachable proxy: the load fails; nothing falls back to the origin. */
+    snprintf(proxy, sizeof(proxy), "http://127.0.0.1:%u", dead_port);
+    assert(sk_web_untrusted_start(directory, proxy));
+    expect_proxy(AF_INET, "127.0.0.1", dead_port);
+    snprintf(url, sizeof(url), "http://127.0.0.1:%u/fallback", ntohs(oa.sin_port));
+    r = routed(url, 1);
+    assert(r.reason == SK_WEB_UNTRUSTED_BROKER_FAILURE && !r.body_len); response_free(&r);
+    assert(atomic_load(&pstats->sockets) >= 1 && !atomic_load(&pstats->foreign_sockets));
+    sk_web_untrusted_stop();
+    puts("PASS unreachable proxy fails the load closed, even with allow_private, and dials nothing else");
+
+    /* Never once did this process family resolve a page host, and the origin
+     * the direct path would have reached saw no request at all. */
+    assert(!atomic_load(&pstats->page_dns));
+    assert(!atomic_load(&stats->hits));
+    assert(!rmdir(directory));
+    kill(proxy_pid, SIGKILL); assert(waitpid(proxy_pid, NULL, 0) == proxy_pid);
+    if (proxy6_pid > 0) { kill(proxy6_pid, SIGKILL); assert(waitpid(proxy6_pid, NULL, 0) == proxy6_pid); }
+    kill(origin_pid, SIGKILL); assert(waitpid(origin_pid, NULL, 0) == origin_pid);
+    printf("PASS routed broker never resolved a page host (%u lookups) and the origin got %u direct hits\n",
+           atomic_load(&pstats->page_dns), atomic_load(&stats->hits));
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     alarm(120);
@@ -1509,7 +1814,7 @@ int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--dependency-refusal")) {
         assert(!sk_curl_load(&curl));
         char directory[256]; temp_directory(directory, sizeof(directory), "wu-missing");
-        assert(!sk_web_untrusted_start(directory) && !sk_broker_pid && sk_lifetime_fd == -1);
+        assert(!sk_web_untrusted_start(directory, NULL) && !sk_broker_pid && sk_lifetime_fd == -1);
         assert(!rmdir(directory));
         struct fake_request req; request_init(&req, "https://example.com/", "GET");
         cef_resource_handler_t *h = resource(&req, 0);
@@ -1522,7 +1827,13 @@ int main(int argc, char **argv) {
         return 0;
     }
     assert(sk_curl_load(&curl)); dlclose(curl.handle);
-    addresses(); own_addresses(); validation(); fetch_metadata(); confinement(); stdio_null(); broker_tests();
+    addresses(); own_addresses(); validation(); fetch_metadata(); confinement(); stdio_null();
+    /* Its own process: it starts and stops routed brokers before the main
+     * broker tests confine this one. */
+    pid_t routes = fork(); assert(routes >= 0);
+    if (!routes) { proxy_routes(); _exit(0); }
+    child_ok(routes);
+    broker_tests();
     puts("All web-untrusted native tests passed.");
     return 0;
 }

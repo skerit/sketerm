@@ -247,6 +247,9 @@ pub fn netPolicySet(self: *Host, req: proto.NetPolicySet) void {
         rejectPolicy(self, s, req.serial);
         return;
     };
+    // The instance's route, not the client, says whether a proxy is the
+    // address authority here: it is the same for every view.
+    pol.proxy_decides_addresses = self.proxy_decides_addresses;
     if (s.pol) |old| {
         if (!netpolicy.subsetOf(pol, old)) {
             pol.deinit(self.gpa);

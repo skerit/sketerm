@@ -1090,6 +1090,12 @@ pub const Host = struct {
     /// context at create, so a routed instance has no direct path at
     /// all — the route is the process, never a per-view setting.
     instance_proxy: []const u8 = "",
+    /// `--proxy-decides-addresses`: the instance proxy is a route the
+    /// CALLER runs as its egress policy (`webroute.Kind.proxy`), so the
+    /// net policy's literal private-address refusal steps aside and the
+    /// proxy decides what a page reaches. Every policy installed here
+    /// carries it (`Policy.proxy_decides_addresses`).
+    proxy_decides_addresses: bool = false,
     pending_media: [proto.MAX_POLICY_VIEWS]proto.ViewEmulation = @splat(.{ .view = 0 }),
     next_media_generation: u64 = 0,
     /// Why this ROUTED instance serves nothing (empty while it serves):

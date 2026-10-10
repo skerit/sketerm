@@ -33,9 +33,11 @@ const pathz = @import("../util/pathz.zig");
 const untrusted = @import("cefhost/untrusted.zig");
 const cef = @import("cef");
 const untrusted_env = @import("untrusted_env.zig");
+const webroute = @import("route.zig");
 
 const USAGE =
-    \\sketerm-web --socket PATH [--cache-dir PATH] [--proxy URL] [--linger-ms N]
+    \\sketerm-web --socket PATH [--cache-dir PATH] [--proxy URL [--proxy-decides-addresses]]
+    \\           [--linger-ms N]
     \\           [--stream-dir PATH]  (pushed-stream sockets; default: beside
     \\            --socket, or a private dir under $XDG_RUNTIME_DIR)
     \\           (--socket-fd N and --frames-inline are the daemon's
@@ -118,8 +120,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var stream_buf: [4096]u8 = undefined;
     var stream_dir: ?[]const u8 = null;
     var socket_fd: c_int = -1;
-    var proxy_buf: [96]u8 = undefined;
+    var proxy_buf: [webroute.MAX_PROXY_URL]u8 = undefined;
     var instance_proxy: []const u8 = "";
+    var proxy_decides_addresses = false;
     var frames_inline = false;
     var linger_ms: i64 = 0;
     var i: usize = 1;
@@ -158,6 +161,17 @@ pub fn main(init: std.process.Init.Minimal) u8 {
                 std.debug.print("sketerm-web: --proxy value is too long\n", .{});
                 return 2;
             };
+            // Chromium accepts a malformed proxy preference and then
+            // browses DIRECT, so the shape is checked here, once.
+            if (webroute.ProxyUrl.parseChromium(instance_proxy) == null) {
+                std.debug.print("sketerm-web: --proxy must be socks5://HOST:PORT or http://HOST:PORT\n", .{});
+                return 2;
+            }
+        } else if (std.mem.eql(u8, a, "--proxy-decides-addresses")) {
+            // A caller-given proxy route: the proxy, not the engine's
+            // literal private-address test, decides what a page reaches
+            // (`webroute.Kind.proxyDecidesAddresses`).
+            proxy_decides_addresses = true;
         } else if (std.mem.eql(u8, a, "--linger-ms") and i + 1 < argv.len) {
             // Broker-owned lifecycle: survive the LAST client's exit
             // and keep listening this long for the next one, then run
@@ -177,14 +191,24 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
     // The broker is created before CEF can spawn a thread or subprocess.
     // Every browser descendant inherits the irreversible socket restriction.
+    if (proxy_decides_addresses and instance_proxy.len == 0) return 2;
     if (restricted) {
-        if (instance_proxy.len != 0) return 2;
         if (!subprocess) {
             const dir = cache_dir orelse return 2;
             pathz.makeDirs(dir, 0o700) catch return 1;
             var dir_buf: [4096]u8 = undefined;
             const dir_z = std.fmt.bufPrintZ(&dir_buf, "{s}", .{dir}) catch return 1;
-            if (cef.sk_web_untrusted_start(dir_z) == 0) {
+            // The broker makes every connection of this helper, so a
+            // routed one dials the route's proxy and nothing else, in
+            // curl's spelling (socks5h: the proxy resolves the host).
+            var broker_proxy_buf: [webroute.MAX_PROXY_URL + 1]u8 = undefined;
+            const broker_proxy: [*:0]const u8 = if (instance_proxy.len == 0) "" else blk: {
+                const url = webroute.ProxyUrl.parseChromium(instance_proxy) orelse return 2;
+                const text = url.formatCurl(broker_proxy_buf[0..webroute.MAX_PROXY_URL]) orelse return 2;
+                broker_proxy_buf[text.len] = 0;
+                break :blk @ptrCast(&broker_proxy_buf);
+            };
+            if (cef.sk_web_untrusted_start(dir_z, broker_proxy) == 0) {
                 std.debug.print("sketerm-web: untrusted broker unavailable\n", .{});
                 return 1;
             }
@@ -232,7 +256,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     const disable_features = disable_builder.finish() catch return 1;
 
     var argv_buf: [64][*c]u8 = undefined;
-    const cef_argv = buildCefArgv(argv, disable_features, &argv_buf);
+    const cef_argv = buildCefArgv(argv, disable_features, instance_proxy.len != 0, &argv_buf);
 
     // (5) CEF subprocess passthrough (renderer, gpu, zygote, ...).
     if (cefhost.executeProcess(@intCast(cef_argv.len), cef_argv.ptr)) |code| return code;
@@ -280,6 +304,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         var srv = server.Server.init(gpa, sock);
         srv.profile_dir = cache;
         srv.instance_proxy = instance_proxy;
+        srv.proxy_decides_addresses = proxy_decides_addresses;
         srv.force_inline = frames_inline;
         srv.linger_ms = linger_ms;
         srv.stream_dir = stream_dir;
@@ -378,9 +403,19 @@ fn reexecPreloaded(argv: []const [*:0]const u8) void {
 ///
 /// `--disable-gpu` and an explicit `--ozone-platform=` are passed
 /// through untouched: that is how the smoke rig pins a mode.
-fn buildCefArgv(argv: []const [*:0]const u8, disable_features: [:0]u8, buf: *[64][*c]u8) [][*c]u8 {
+fn buildCefArgv(argv: []const [*:0]const u8, disable_features: [:0]u8, routed: bool, buf: *[64][*c]u8) [][*c]u8 {
     var n = cefargs.withDefaults(argv, disable_features, buf).len;
     if (untrusted.enabled) {
+        // A routed untrusted helper gets its route's proxy as a
+        // preference (`Host.install`, as every routed instance does),
+        // which `--no-proxy-server` would pin to direct at command-line
+        // precedence and so fail the route closed. Its Chromium opens
+        // no Internet socket either way (the seccomp confinement).
+        if (!routed) {
+            if (n + 1 > buf.len) c._exit(2);
+            buf[n] = @ptrCast(@constCast("--no-proxy-server"));
+            n += 1;
+        }
         const switches = [_][*:0]const u8{
             "--disable-blink-features=" ++ untrusted.blink_features,
             "--host-resolver-rules=MAP * ~NOTFOUND",
@@ -393,7 +428,6 @@ fn buildCefArgv(argv: []const [*:0]const u8, disable_features: [:0]u8, buf: *[64
             "--disable-component-extensions-with-background-pages",
             "--disable-quic",
             "--disable-breakpad",
-            "--no-proxy-server",
         };
         if (n + switches.len > buf.len) c._exit(2);
         for (switches) |value| {

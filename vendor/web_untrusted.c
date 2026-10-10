@@ -17,6 +17,7 @@
 #include <linux/filter.h>
 #include <linux/netlink.h>
 #include <linux/seccomp.h>
+#include <netdb.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -81,13 +82,21 @@ struct sk_request {
     size_t body_len;
     int allow_private, navigation, resource_type, user_activation;
 };
+struct sk_origin { char host[256]; unsigned port; int tls; };
+/* The route's proxy as one job resolved it: the ONLY address its curl may
+ * connect to, and the numeric url curl is handed, so curl resolves nothing. */
+struct sk_proxy_target {
+    struct sockaddr_storage address;
+    char url[sizeof("socks5h://[]:65535") + INET6_ADDRSTRLEN];
+};
 struct sk_response {
     int reason, status, port, allow_private, cross_static;
+    /* Non-NULL on a routed broker: connect-time allowance is exactly this. */
+    const struct sk_proxy_target *proxy;
     char *headers;
     unsigned char *body;
     size_t headers_len, header_total, body_len, body_capacity;
 };
-struct sk_origin { char host[256]; unsigned port; int tls; };
 struct psl_ctx_st;
 struct sk_curl {
     void *handle;
@@ -107,6 +116,9 @@ struct sk_curl {
 
 static _Atomic pid_t sk_broker_pid;
 static int sk_lifetime_fd = -1;
+/* The route's proxy, fixed at start and inherited by the broker and every
+ * job: host as sk_parse_url canonicalised it (an IPv6 literal unbracketed). */
+static struct { int on, socks; char host[256]; unsigned port; } sk_proxy;
 static char sk_socket_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
 static volatile sig_atomic_t sk_broker_stop;
 
@@ -193,8 +205,9 @@ static int sk_landlock_probe(void) {
     return abi > 0 && abi < INT_MAX ? (int)abi : 0;
 }
 
-/* Fails only when Landlock was probed available; the job must then refuse. */
-static int sk_landlock_job(int abi, unsigned port) {
+/* Fails only when Landlock was probed available; the job must then refuse.
+ * dns also admits TCP port 53, for a job that resolves the page host itself. */
+static int sk_landlock_job(int abi, unsigned port, int dns) {
     if (!abi) return 1;
     struct sk_ll_ruleset attr = {SK_LL_FS_ABI1, 0, 0};
     if (abi >= 2) attr.fs |= SK_LL_FS_REFER;
@@ -209,7 +222,7 @@ static int sk_landlock_job(int abi, unsigned port) {
     if (abi >= 4) {
         /* glibc falls back to TCP for truncated DNS answers. */
         const unsigned ports[2] = {port, SK_DNS_PORT};
-        for (unsigned i = 0; i < 2 && ok; ++i) {
+        for (unsigned i = 0; i < (dns ? 2u : 1u) && ok; ++i) {
             struct sk_ll_port rule = {SK_LL_NET_CONNECT_TCP, ports[i]};
             ok = syscall(SK_LL_ADD_RULE, (int)fd, SK_LL_RULE_NET_PORT, &rule, 0u) == 0;
         }
@@ -653,8 +666,15 @@ static int sk_recv_text(int fd, char **out, uint32_t len, int64_t deadline) {
     return !memchr(*out, 0, len);
 }
 
+/* Compiled out; dist/test-web-untrusted.c records every socket curl asks for
+ * through it, refused ones included, to prove what a routed job dials. */
+#ifndef SK_OPEN_SOCKET_OBSERVE
+#define SK_OPEN_SOCKET_OBSERVE(purpose, address) ((void)0)
+#endif
+
 static curl_socket_t sk_open_socket(void *user, curlsocktype purpose, struct curl_sockaddr *a) {
     struct sk_response *r = user;
+    SK_OPEN_SOCKET_OBSERVE(purpose, a);
     int port = 0;
     if (a->family == AF_INET && a->addrlen == sizeof(struct sockaddr_in))
         port = ntohs(((struct sockaddr_in *)&a->addr)->sin_port);
@@ -664,6 +684,16 @@ static curl_socket_t sk_open_socket(void *user, curlsocktype purpose, struct cur
         (a->socktype & ~(SOCK_CLOEXEC | SOCK_NONBLOCK)) != SOCK_STREAM ||
         (a->protocol != 0 && a->protocol != IPPROTO_TCP) || port != r->port || !port ||
         a->addr.sa_family != a->family) return CURL_SOCKET_BAD;
+    if (r->proxy) {
+        /* A routed job opens one kind of socket: TCP to the proxy this job
+         * resolved. The proxy may be loopback or private (it is the caller's);
+         * anything else, whatever its class, is refused. */
+        unsigned char want[16], have[16];
+        if (a->family != r->proxy->address.ss_family ||
+            !sk_address_bytes((const struct sockaddr *)&r->proxy->address, want) ||
+            !sk_address_bytes(&a->addr, have) || memcmp(want, have, sizeof(want))) return CURL_SOCKET_BAD;
+        return socket(a->family, a->socktype | SOCK_CLOEXEC, a->protocol);
+    }
     if (!r->allow_private) {
         /* Queried per candidate so an address added since the last load is seen. */
         struct ifaddrs *own = NULL;
@@ -765,6 +795,34 @@ static int sk_static_response(const struct sk_request *q, const struct sk_respon
     return ok;
 }
 
+/* Resolve the route's proxy for one job: its first stream address, and the
+ * numeric url curl dials. curl gets no name to resolve, so a page host only
+ * ever travels to the proxy (socks5h ATYP 3, an HTTP CONNECT or absolute-form
+ * request line). Runs before the job's Landlock, which then admits only the
+ * proxy's port. */
+static int sk_proxy_resolve(struct sk_proxy_target *t) {
+    struct addrinfo hints = {.ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM, .ai_protocol = IPPROTO_TCP}, *list = NULL;
+    if (getaddrinfo(sk_proxy.host, NULL, &hints, &list) || !list) return 0;
+    const struct addrinfo *pick = NULL;
+    for (const struct addrinfo *i = list; i && !pick; i = i->ai_next)
+        if ((i->ai_family == AF_INET && i->ai_addrlen == sizeof(struct sockaddr_in)) ||
+            (i->ai_family == AF_INET6 && i->ai_addrlen == sizeof(struct sockaddr_in6))) pick = i;
+    int ok = 0;
+    char text[INET6_ADDRSTRLEN];
+    if (pick) {
+        memset(&t->address, 0, sizeof(t->address));
+        memcpy(&t->address, pick->ai_addr, pick->ai_addrlen);
+        const void *raw = pick->ai_family == AF_INET ? (const void *)&((struct sockaddr_in *)pick->ai_addr)->sin_addr
+                                                     : (const void *)&((struct sockaddr_in6 *)pick->ai_addr)->sin6_addr;
+        int n = inet_ntop(pick->ai_family, raw, text, sizeof(text)) ?
+            snprintf(t->url, sizeof(t->url), pick->ai_family == AF_INET ? "%s://%s:%u" : "%s://[%s]:%u",
+                     sk_proxy.socks ? "socks5h" : "http", text, sk_proxy.port) : -1;
+        ok = n > 0 && (size_t)n < sizeof(t->url);
+    }
+    freeaddrinfo(list);
+    return ok;
+}
+
 static void sk_fetch(struct sk_curl *a, struct sk_request *q, size_t header_len, struct sk_response *r,
                      int64_t deadline) {
     struct sk_origin origin;
@@ -774,11 +832,16 @@ static void sk_fetch(struct sk_curl *a, struct sk_request *q, size_t header_len,
     r->cross_static = !q->navigation &&
         (!sk_parse_url(q->initiator, &source, 1) || !sk_same_origin(&source, &origin));
     r->reason = SK_WEB_UNTRUSTED_BROKER_FAILURE;
-    r->port = (int)origin.port; r->allow_private = q->allow_private;
+    r->port = (int)(sk_proxy.on ? sk_proxy.port : origin.port); r->allow_private = q->allow_private;
     int64_t now = sk_now_ms();
     long budget = now < 0 ? 0 : (long)(deadline - SK_REPLY_MARGIN_MS - now);
     if (budget <= 0) { r->reason = SK_WEB_UNTRUSTED_TIMEOUT; return; }
-    if (!sk_landlock_job(sk_landlock_abi, origin.port)) return;
+    struct sk_proxy_target proxy;
+    if (sk_proxy.on) {
+        if (!sk_proxy_resolve(&proxy)) return;
+        r->proxy = &proxy;
+    }
+    if (!sk_landlock_job(sk_landlock_abi, (unsigned)r->port, !sk_proxy.on)) return;
     r->headers = malloc(SK_HEADER_CAP);
     CURL *easy = a->easy_init();
     struct curl_slist *headers = NULL;
@@ -814,7 +877,12 @@ static void sk_fetch(struct sk_curl *a, struct sk_request *q, size_t header_len,
 #define SET(option, value) do { if (a->easy_setopt(easy, (option), (value)) != CURLE_OK) goto done; } while (0)
     SET(CURLOPT_URL, q->url);
     SET(CURLOPT_PROTOCOLS_STR, "http,https"); SET(CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
-    SET(CURLOPT_PROXY, ""); SET(CURLOPT_NOPROXY, "*"); SET(CURLOPT_PRE_PROXY, "");
+    /* Routed: every transfer through the proxy, none exempt (an empty
+     * NOPROXY, not curl's default list). Direct: no proxy whatever the
+     * environment says. */
+    SET(CURLOPT_PROXY, sk_proxy.on ? proxy.url : ""); SET(CURLOPT_NOPROXY, sk_proxy.on ? "" : "*");
+    SET(CURLOPT_PRE_PROXY, ""); SET(CURLOPT_HTTPPROXYTUNNEL, 0L);
+    if (sk_proxy.on && !sk_proxy.socks) SET(CURLOPT_SUPPRESS_CONNECT_HEADERS, 1L);
     SET(CURLOPT_NETRC, (long)CURL_NETRC_IGNORED);
     SET(CURLOPT_HTTPAUTH, (long)CURLAUTH_NONE); SET(CURLOPT_PROXYAUTH, (long)CURLAUTH_NONE);
     SET(CURLOPT_FOLLOWLOCATION, 0L); SET(CURLOPT_MAXREDIRS, 0L);
@@ -859,6 +927,8 @@ static void sk_fetch(struct sk_curl *a, struct sk_request *q, size_t header_len,
 done:
     if (easy) a->easy_cleanup(easy);
     if (headers) a->slist_free_all(headers);
+    /* The target dies with this frame; nothing may reach it afterwards. */
+    r->proxy = NULL;
 }
 
 static void sk_job(int fd, struct sk_curl *a) {
@@ -1008,13 +1078,35 @@ static void sk_broker(int listener, int lifetime, int ready, pid_t parent) {
     _exit(0);
 }
 
-int sk_web_untrusted_start(const char *private_dir) {
+/* socks5h://HOST:PORT or http://HOST:PORT with an explicit port and nothing
+ * else; anything else refuses the start rather than browsing direct. */
+static int sk_proxy_configure(const char *url) {
+    memset(&sk_proxy, 0, sizeof(sk_proxy));
+    if (!url || !*url) return 1;
+    int socks = !strncmp(url, "socks5h://", 10);
+    if (!socks && strncmp(url, "http://", 7)) return 0;
+    const char *authority = url + (socks ? 10 : 7);
+    /* sk_parse_url defaults a missing port to 80; a proxy names its own. */
+    const char *close = *authority == '[' ? strchr(authority, ']') : NULL;
+    const char *colon = close ? (close[1] == ':' ? close + 1 : NULL) : strrchr(authority, ':');
+    if (!colon || !colon[1]) return 0;
+    char text[SK_URL_CAP];
+    int n = snprintf(text, sizeof(text), "http://%s", authority);
+    struct sk_origin o;
+    if (n <= 0 || (size_t)n >= sizeof(text) || !sk_parse_url(text, &o, 1)) return 0;
+    memcpy(sk_proxy.host, o.host, sizeof(sk_proxy.host));
+    sk_proxy.port = o.port; sk_proxy.socks = socks; sk_proxy.on = 1;
+    return 1;
+}
+
+int sk_web_untrusted_start(const char *private_dir, const char *proxy) {
 #ifndef SK_AUDIT_ARCH
-    (void)private_dir;
+    (void)private_dir; (void)proxy;
     return 0;
 #else
     if (sk_broker_pid || !private_dir || private_dir[0] != '/' ||
         getuid() != geteuid() || getgid() != getegid() || !sk_web_untrusted_core_limit()) return 0;
+    if (!sk_proxy_configure(proxy)) return 0;
     /* The caller stays dumpable: Chromium's namespace sandbox needs that, and
      * the broker child below makes itself nondumpable. */
     char *canonical = realpath(private_dir, NULL);
@@ -1663,6 +1755,7 @@ void sk_web_untrusted_stop(void) {
     pthread_mutex_unlock(&sk_navigation_lock);
     if (sk_socket_path[0]) unlink(sk_socket_path);
     sk_socket_path[0] = 0;
+    memset(&sk_proxy, 0, sizeof(sk_proxy));
     /* Restart is supported only at the same pre-thread lifecycle boundary. */
     pthread_mutex_lock(&sk_workers_lock);
     sk_stopping = 0;
@@ -1674,7 +1767,7 @@ int sk_web_untrusted_job_landlock(void) { return 0; }
 int sk_web_untrusted_core_limit(void) { return 0; }
 int sk_web_untrusted_nondumpable(void) { return 0; }
 int sk_web_untrusted_no_core(void) { return 0; }
-int sk_web_untrusted_start(const char *private_dir) { (void)private_dir; return 0; }
+int sk_web_untrusted_start(const char *private_dir, const char *proxy) { (void)private_dir; (void)proxy; return 0; }
 int sk_web_untrusted_confine(void) { return 0; }
 void sk_web_untrusted_stop(void) {}
 void sk_web_untrusted_navigation(cef_request_t *request, cef_frame_t *frame, int browser_id, int user_gesture) {

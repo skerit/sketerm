@@ -77,7 +77,8 @@ the cleanup supervisor fork come BEFORE step 1 (only the original process
 owns cleanup; the re-exec and CEF subprocesses must never fork another),
 and the HTTP broker fork plus the seccomp socket confinement come after
 step 3 and before step 2, so no CEF thread or subprocess ever exists
-unconfined. Two constraints that come with it, both measured:
+unconfined. A routed untrusted helper's broker is started with the
+route's proxy, which is why `--proxy` is parsed (step 3) before it. Two constraints that come with it, both measured:
 
 - **Untrusted renderers run Chromium's namespace sandbox** (`no_sandbox`
   is 0 only in that mode). NO_NEW_PRIVS rules out the setuid helper, and
@@ -1031,6 +1032,48 @@ over, and both are measured, not assumed:
   `SKETERM_WEB_FAIL_WEBRTC_POLICY` are the deterministic refusal seams;
   smoke-web's route stage proves both the refusal and, by gathering ICE
   candidates on a routed and a direct helper, that the policy holds.
+- **A caller-given proxy is a route of its own (`proxy:<url>`, `Kind.proxy`).**
+  `proxy:socks5h://HOST:PORT` or `proxy:http://HOST:PORT`, nothing else:
+  `route.ProxyUrl` refuses `socks5://` (local DNS in every client but
+  Chromium), credentials, a path, a missing or leading-zero port. The url
+  is the instance key, so views on one proxy share a helper. The helper's
+  `--proxy` is ALWAYS Chromium's spelling (`ProxyScheme.chromium`:
+  `socks5`, which Chromium resolves remotely, or `http`), so an older
+  helper given a proxy route applies it correctly; `main.zig` now refuses
+  any `--proxy` `ProxyUrl.parseChromium` does not accept, because Chromium
+  takes a malformed one and browses direct. A proxy route also passes
+  `--proxy-decides-addresses` (`Kind.proxyDecidesAddresses`, proxy only:
+  Tor's and `via:`'s proxies are sketerm's plumbing, and `127.0.0.1` via a
+  mux host is that host's loopback): every net policy installed on that
+  instance skips the LITERAL private-address refusal
+  (`Policy.proxy_decides_addresses`, set by the helper, never from the
+  wire), since the proxy resolves every page host and is the authority on
+  what is reachable. The host allow-list, schemes, budgets and every
+  untrusted restriction still apply on top.
+- **Untrusted mode takes direct, tor and proxy routes
+  (`Kind.untrustedServable`).** The restricted helper's Chromium opens no
+  Internet socket (seccomp; `--host-resolver-rules=MAP * ~NOTFOUND`), so
+  its broker is its only network. Started with `--proxy`, `main.zig` hands
+  the broker the curl spelling (`socks5h://`, never curl's local-DNS
+  `socks5://`) through `sk_web_untrusted_start(dir, proxy)`; each job
+  resolves the PROXY host itself (before its Landlock, which then admits
+  the proxy's port alone and no DNS port), gives curl the numeric proxy url
+  with an empty `NOPROXY`, and `sk_open_socket` admits exactly that
+  address, family and port, loopback included, and nothing else;
+  `allow_private` has no effect there. Curl therefore never resolves a page
+  host (the native test interposes `getaddrinfo` and counts zero lookups;
+  its `SK_OPEN_SOCKET_OBSERVE` seam records every socket curl asked for).
+  An unreachable or refusing proxy fails the load as `untrusted_broker`.
+  The Chromium side gets the route's proxy as a preference exactly as any
+  routed instance does (`Host.install`/`routeContext`, fail closed via
+  `route_refusal`), which is why `buildCefArgv` omits `--no-proxy-server`
+  for a routed browser process: it would pin the proxy to direct at
+  command-line precedence. That proxy is defence in depth only: what does
+  not go through the broker (websocket, prefetch, preconnect, DNS
+  prefetch, service workers) is refused by `restrictedRequest`, the
+  context prefs (`network_prediction_options`, `dns_prefetching`) and
+  ultimately the seccomp filter, so it reaches no network on any route.
+  Tor needs no mechanism of its own here; `via:` is not wired in.
 - **A malformed proxy preference is NOT protected by `pac_mandatory`.**
   Of the two PAC forms, only `{mode:"pac_script", pac_url:"data:..."}`
   works: it routes per-URL and fails CLOSED when the proxy is

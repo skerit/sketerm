@@ -296,6 +296,8 @@ pub const Server = struct {
     /// `--proxy`: this instance's route proxy url ("" = direct). Applied
     /// to the global context and to every container context.
     instance_proxy: []const u8 = "",
+    /// `--proxy-decides-addresses`: see `Host.proxy_decides_addresses`.
+    proxy_decides_addresses: bool = false,
     /// `--frames-inline`: inline frame mode forced from spawn (the
     /// remote-helper launch shape — the daemon bridges the socket over
     /// the mux wire, where no descriptor can travel).
@@ -406,6 +408,7 @@ pub const Server = struct {
         self.host = cefhost.Host.init(self.gpa, &self.out);
         self.host.profile_dir = self.profile_dir;
         self.host.instance_proxy = self.instance_proxy;
+        self.host.proxy_decides_addresses = self.proxy_decides_addresses;
         self.host.router = .{
             .ctx = self,
             .route = routerRoute,

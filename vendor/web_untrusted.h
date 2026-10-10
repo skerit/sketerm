@@ -42,11 +42,18 @@ int sk_web_untrusted_no_core(void);
 /* Call before threads/CEF, with an existing, owned, canonical 0700 directory;
  * start/stop are single-owner lifecycle operations, not concurrent factories.
  * Requires Linux x86_64/aarch64, close_range and libcurl >= 7.85 with TLS.
+ * proxy NULL or "" is direct; otherwise socks5h://HOST:PORT or
+ * http://HOST:PORT (explicit port, no credentials or path), else a refusal.
+ * A routed broker hands every page host to that proxy unresolved and its jobs
+ * may connect to the proxy's address alone, loopback or private included; the
+ * per-request allow_private then has no effect, because the proxy is the
+ * authority on which addresses a page reaches.
  */
-int sk_web_untrusted_start(const char *private_dir);
+int sk_web_untrusted_start(const char *private_dir, const char *proxy);
 /* 1 when the running broker confines each job with Landlock (no filesystem
- * writes/creation/exec, TCP limited to the target port and DNS); best-effort,
- * so 0 on kernels without Landlock while loads keep working. */
+ * writes/creation/exec, TCP limited to the target port and DNS, or to the
+ * proxy's port alone when routed); best-effort, so 0 on kernels without
+ * Landlock while loads keep working. */
 int sk_web_untrusted_job_landlock(void);
 /* Irreversible, process-wide (TSYNC), inherited across fork/exec; call before CEF.
  * Applies the core limit but leaves dumpable untouched for Chromium's sandbox. */
