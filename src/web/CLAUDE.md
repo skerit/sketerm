@@ -129,6 +129,18 @@ Measured, not inferred:
 So a headless smoke run exercises the software path by construction. It
 cannot prove anything about the GPU path.
 
+The platform also decides how the device scale reaches the engine
+(`ozone.ScaleLever`, one decision in `ozone.choose`). Headless ozone
+honours `get_screen_info`'s DPR over a LOGICAL view rect, per browser,
+from a document's first layout. Wayland ozone ignores it (a CPU view
+painted at logical size and stayed black), so there the view rect is
+PHYSICAL and the scale rides the zoom level. Zoom is the worse lever:
+Chromium keys it by HOST per profile, so a new host's first document lays
+out at zoom 0 (dpr 1, physical CSS viewport) and two views of one host
+share one level. Measured 2026-10-10: moving headless onto zoom as well
+(8a26f5ef) broke exactly that, which `dist/test-web-untrusted.py`
+`test_10` caught. Use zoom only where screen-info does not work.
+
 Ordinary MCP launchers set `SKETERM_WEB_SOFTWARE_WEBGL=1`: the helper
 selects `--use-angle=swiftshader --enable-unsafe-swiftshader
 --disable-gpu-compositing`, omits the forced-Wayland `--disable-gpu`, and

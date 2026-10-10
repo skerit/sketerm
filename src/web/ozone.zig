@@ -12,6 +12,24 @@
 
 const std = @import("std");
 
+/// How the device scale reaches the engine.
+pub const ScaleLever = enum {
+    /// LOGICAL view rect and the real `get_screen_info` DPR. Headless
+    /// ozone honours it, per browser, from a document's first layout.
+    screen_info,
+    /// PHYSICAL view rect and the scale carried as zoom: Wayland ozone
+    /// ignores screen-info DPR (a CPU view painted at logical size and
+    /// stayed black). Chromium keys zoom by HOST per profile, so a new
+    /// host's first document lays out at zoom 0 and views of one host
+    /// share one level (measured 2026-10-10); never used where
+    /// `screen_info` works.
+    zoom,
+
+    fn of(platform: []const u8) ScaleLever {
+        return if (std.mem.eql(u8, platform, "headless")) .screen_info else .zoom;
+    }
+};
+
 pub const Choice = struct {
     platform: []const u8,
     /// Append `--disable-gpu`: a forced-wayland software helper must
@@ -19,6 +37,8 @@ pub const Choice = struct {
     disable_gpu: bool = false,
     /// What cefhost.setAccelerated is handed.
     accelerated: bool = false,
+    /// What cefhost.setScaleLever is handed; follows `platform`.
+    scale_lever: ScaleLever = .zoom,
 };
 
 /// @param explicit an `--ozone-platform=` value already on argv (wins,
@@ -28,6 +48,18 @@ pub const Choice = struct {
 /// @param wayland_reachable a real connect() succeeded
 /// @param render_node a /dev/dri/renderD* opened
 pub fn choose(
+    explicit: ?[]const u8,
+    env_override: ?[]const u8,
+    gpu_wanted: bool,
+    wayland_reachable: bool,
+    render_node: bool,
+) Choice {
+    var out = pick(explicit, env_override, gpu_wanted, wayland_reachable, render_node);
+    out.scale_lever = ScaleLever.of(out.platform);
+    return out;
+}
+
+fn pick(
     explicit: ?[]const u8,
     env_override: ?[]const u8,
     gpu_wanted: bool,
@@ -81,4 +113,13 @@ test "the default probe chain is unchanged" {
     try t.expectEqualStrings("headless", choose(null, null, true, true, false).platform);
     try t.expectEqualStrings("headless", choose(null, null, false, true, true).platform);
     try t.expectEqualStrings("headless", choose(null, null, true, false, true).platform);
+}
+
+test "the scale lever follows the platform" {
+    const t = std.testing;
+    try t.expectEqual(ScaleLever.screen_info, choose(null, null, false, false, false).scale_lever);
+    try t.expectEqual(ScaleLever.screen_info, choose("headless", null, true, true, true).scale_lever);
+    try t.expectEqual(ScaleLever.zoom, choose(null, "wayland", false, true, false).scale_lever);
+    try t.expectEqual(ScaleLever.zoom, choose(null, null, true, true, true).scale_lever);
+    try t.expectEqual(ScaleLever.zoom, choose("x11", null, false, false, false).scale_lever);
 }

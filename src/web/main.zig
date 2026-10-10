@@ -498,6 +498,7 @@ fn buildCefArgv(argv: []const [*:0]const u8, disable_features: [:0]u8, buf: *[64
     }
     // WebGL can use a SwiftShader process without enabling shared OSR textures.
     cefhost.setAccelerated(choice.accelerated and !software_webgl);
+    cefhost.setScaleLever(choice.scale_lever);
     return buf[0..n];
 }
 

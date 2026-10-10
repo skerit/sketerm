@@ -195,8 +195,8 @@ fn damageRect(self: *Host, v: *const View, r: Rect) void {
 }
 
 /// The popup rect in physical pixels, origin SIGNED: position from
-/// `on_popup_size` (view-rect coordinates, already physical), size from
-/// the popup paint itself. A popup can hang off the top or left of the
+/// `on_popup_size` (converted by `onPopupSize`), size from the popup
+/// paint itself. A popup can hang off the top or left of the
 /// view, and its visible part then starts inside its own pixels.
 const PopupRect = struct { x: i64, y: i64, w: u32, h: u32 };
 
@@ -245,8 +245,9 @@ pub fn onPopupSize(_: [*c]cef.cef_render_handler_t, browser: [*c]cef.cef_browser
     const r: *const cef.cef_rect_t = @ptrCast(rect orelse return);
     // The old position is damage too: the page shows through it again.
     if (v.widget_map.len != 0) damageRect(host, v, popupDamage(v));
-    v.widget_x = r.x;
-    v.widget_y = r.y;
+    const at = host_mod.physicalPoint(v, r.x, r.y);
+    v.widget_x = at.x;
+    v.widget_y = at.y;
     if (v.widget_map.len != 0) damageRect(host, v, popupDamage(v));
 }
 

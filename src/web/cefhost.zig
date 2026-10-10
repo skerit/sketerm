@@ -335,9 +335,17 @@ pub fn isAccelerated() bool {
 /// cap; `view_max_fps` now clamps the internal scheduler to the
 /// display's refresh, which is exactly the spacing external requests
 /// used to impose.)
-/// How the engine is told what DPR to lay out at.
-///
-/// OSR ignores screen-info DPR, so physical view geometry plus zoom preserves logical layout on both CPU and GPU.
+/// How the engine is told what DPR to lay out at; `main.zig` hands over
+/// the ozone decision's answer (`setScaleLever`).
+pub const ScaleLever = @import("ozone.zig").ScaleLever;
+var scale_lever: ScaleLever = .zoom;
+
+/// Called by `main.zig` before `Host.install`.
+pub fn setScaleLever(lever: ScaleLever) void {
+    scale_lever = lever;
+}
+
+/// CEF's zoom LEVEL for a device scale factor: zoom factor = 1.2^level.
 fn zoomLevelFor(scale_x1000: u16) f64 {
     const f = @as(f64, @floatFromInt(scale_x1000)) / 1000.0;
     return @log(f) / @log(@as(f64, 1.2));
@@ -6473,8 +6481,7 @@ pub fn viewOf(browser: [*c]cef.cef_browser_t) ?*View {
     return host.pending orelse host.adopting;
 }
 
-/// The view rect the engine renders: PHYSICAL, the zoom level carrying
-/// the scale (see `zoomLevelFor`).
+/// The view rect the engine renders, in the space `scale_lever` picks.
 fn onGetViewRect(
     _: [*c]cef.cef_render_handler_t,
     browser: [*c]cef.cef_browser_t,
@@ -6489,15 +6496,18 @@ fn onGetViewRect(
 }
 
 fn viewRect(v: *const View) cef.cef_rect_t {
-    return .{ .x = 0, .y = 0, .width = v.pw, .height = v.ph };
+    return switch (scale_lever) {
+        .screen_info => .{ .x = 0, .y = 0, .width = v.w, .height = v.h },
+        .zoom => .{ .x = 0, .y = 0, .width = v.pw, .height = v.ph },
+    };
 }
 
 /// The DPR the PAGE lays out at (and picks 2x images / hints text for).
 /// `rect`/`available_rect` are in the same space as the view rect.
 ///
-/// The factor is deliberately 1: CEF 151 ignores it, and reporting the
-/// real scale as well as zooming would double-apply it on any build that
-/// ever started honouring it again.
+/// Under the zoom lever the factor is deliberately 1: reporting the real
+/// scale as well as zooming would double-apply it on any build that ever
+/// started honouring it there.
 fn onGetScreenInfo(
     _: [*c]cef.cef_render_handler_t,
     browser: [*c]cef.cef_browser_t,
@@ -6507,7 +6517,10 @@ fn onGetScreenInfo(
     const v = viewOf(browser) orelse return 0;
     info.* = std.mem.zeroes(cef.cef_screen_info_t);
     info.*.size = @sizeOf(cef.cef_screen_info_t);
-    info.*.device_scale_factor = 1.0;
+    info.*.device_scale_factor = switch (scale_lever) {
+        .screen_info => @as(f32, @floatFromInt(v.scale_x1000)) / 1000.0,
+        .zoom => 1.0,
+    };
     info.*.depth = 32;
     info.*.depth_per_component = 8;
     info.*.rect = viewRect(v);
@@ -6515,24 +6528,36 @@ fn onGetScreenInfo(
     return 1;
 }
 
-/// Put the view's zoom into the browser: the device scale (which lives
-/// in the zoom level — see `zoomLevelFor`) plus the
-/// client's user zoom (`set_zoom`, log-scale level x100). The two ADD,
+/// Put the view's zoom into the browser: the device scale (under the
+/// zoom lever, see `ScaleLever`) plus the client's user zoom (`set_zoom`, log-scale level x100). The two ADD,
 /// because Chromium zoom levels are logarithmic (factor = 1.2^level).
 ///
 /// Chromium resets zoom per navigation, so this runs on every load start
 /// as well as at creation, on a scale change and on `set_zoom`.
 fn applyZoom(v: *View) void {
-    const base: f64 = zoomLevelFor(v.scale_x1000);
+    const base: f64 = switch (scale_lever) {
+        .screen_info => 0.0,
+        .zoom => zoomLevelFor(v.scale_x1000),
+    };
     const user: f64 = @as(f64, @floatFromInt(v.user_zoom_x100)) / 100.0;
     const host = browserHost(v) orelse return;
     defer release(&host.base);
     if (host.set_zoom_level) |sz| sz(host, base + user);
 }
 
-/// Convert LOGICAL wire coordinates into the engine's (physical)
-/// view-rect space.
+/// Convert LOGICAL wire coordinates into the engine's view-rect space.
 pub fn viewPoint(v: *const View, x: i32, y: i32) struct { x: c_int, y: c_int } {
+    if (scale_lever == .screen_info) return .{ .x = x, .y = y };
+    const s: i64 = @intCast(v.scale_x1000);
+    return .{
+        .x = @intCast(@divTrunc(@as(i64, x) * s, 1000)),
+        .y = @intCast(@divTrunc(@as(i64, y) * s, 1000)),
+    };
+}
+
+/// View-rect coordinates in the frame buffer's PHYSICAL pixels.
+pub fn physicalPoint(v: *const View, x: c_int, y: c_int) struct { x: c_int, y: c_int } {
+    if (scale_lever == .zoom) return .{ .x = x, .y = y };
     const s: i64 = @intCast(v.scale_x1000);
     return .{
         .x = @intCast(@divTrunc(@as(i64, x) * s, 1000)),
@@ -6543,6 +6568,7 @@ pub fn viewPoint(v: *const View, x: i32, y: i32) struct { x: c_int, y: c_int } {
 /// The inverse of `viewPoint`: view-rect coordinates (what the engine's
 /// hit tests report) back into LOGICAL wire coordinates.
 fn logicalPoint(v: *const View, x: c_int, y: c_int) struct { x: i32, y: i32 } {
+    if (scale_lever == .screen_info) return .{ .x = x, .y = y };
     const s: i64 = @intCast(@max(@as(i64, v.scale_x1000), 1));
     return .{
         .x = @intCast(@divTrunc(@as(i64, x) * 1000, s)),
@@ -6744,9 +6770,9 @@ fn onPaint(
     // A paint for the pre-resize geometry: the resize triggers its own
     // full repaint, so dropping this one loses nothing. The comparison
     // is against the PHYSICAL size — OnPaint's width/height and its
-    // dirty rects are view-rect pixels, and the view rect is physical
-    // (`zoomLevelFor`). A logical-sized paint here is what kept a
-    // software view at scale != 1 black.
+    // dirty rects are device pixels under either `ScaleLever`. A
+    // logical-sized paint here is what kept a software view at
+    // scale != 1 black.
     if (width != @as(c_int, v.pw) or height != @as(c_int, v.ph)) return;
     const src: [*]const u8 = @ptrCast(buffer orelse return);
     const stride: usize = v.stride();
@@ -7315,9 +7341,9 @@ fn onLoadStart(
     if (!v.sem_nav.takeExpectedLoadStart()) {
         host.semanticNavigationStarted(v);
     }
-    // Chromium's zoom is per origin and resets across a navigation; the
-    // zoom IS the device scale factor, so a page that lost it would
-    // render at logical resolution.
+    // Chromium's zoom is per host and resets across a navigation; under
+    // the zoom lever it IS the device scale factor, so a page that lost
+    // it would render at logical resolution.
     applyZoom(v);
     // Cosmetic hiding, userstyles and userscripts go in per document,
     // as early as this path can put them (see `injectUserContent`).
