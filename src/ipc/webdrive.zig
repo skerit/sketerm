@@ -547,6 +547,7 @@ pub const ProfileError = error{
 /// serializes. Field semantics live in `web/netpolicy.zig` (the
 /// decision home); this is the transportable value.
 pub const NetPolicy = struct {
+    navigation_guard: ?[]const u8 = null,
     untrusted: bool = false,
     allow_top: []const []const u8 = &.{},
     allow_sub: []const []const u8 = &.{},
@@ -577,6 +578,7 @@ pub const NetPolicy = struct {
 /// defaults to the url's host as before; at tighten time it narrows the
 /// view to NO hosts, the one monotone reading there is.
 pub const NetPolicyPatch = struct {
+    navigation_guard: ?[]const u8 = null,
     untrusted: ?bool = null,
     allow_top: ?[]const []const u8 = null,
     allow_sub: ?[]const []const u8 = null,
@@ -710,10 +712,14 @@ fn dupePolicy(gpa: std.mem.Allocator, p: NetPolicy) !NetPolicy {
     out.allow_top = try dupeHostList(gpa, p.allow_top);
     errdefer freeHostList(gpa, out.allow_top);
     out.allow_sub = try dupeHostList(gpa, p.allow_sub);
+    errdefer freeHostList(gpa, out.allow_sub);
+    if (p.navigation_guard) |guard| out.navigation_guard = try gpa.dupe(u8, guard);
     return out;
 }
 
 fn freePolicy(gpa: std.mem.Allocator, p: *NetPolicy) void {
+    if (p.navigation_guard) |guard| gpa.free(guard);
+    p.navigation_guard = null;
     freeHostList(gpa, p.allow_top);
     freeHostList(gpa, p.allow_sub);
     p.allow_top = &.{};
@@ -2385,6 +2391,7 @@ pub const Engine = struct {
 
         if (policy != null) {
             if (!self.has(.net_policy)) return error.PolicyUnsupported;
+            if (policy.?.navigation_guard != null and (!self.has(.navigation_guard) or !self.has(.net_policy_ack))) return error.PolicyUnsupported;
             if (wants_untrusted and !self.has(.net_policy_ack)) return error.PolicyAckUnsupported;
             // The helper can hold this many policies; past it a policied
             // view would silently run unpoliced, so refuse instead.
@@ -2637,6 +2644,7 @@ pub const Engine = struct {
             .deadline_ms = p.deadline_ms,
             .allow_top = p.allow_top,
             .allow_sub = p.allow_sub,
+            .navigation_guard = p.navigation_guard orelse "",
         };
     }
 
@@ -2921,6 +2929,9 @@ pub const Engine = struct {
         if (!self.has(.net_policy_ack)) return error.PolicyAckUnsupported;
         if (incoming.untrusted) |want| {
             if (want != old.untrusted) return error.UntrustedModeConflict;
+        }
+        if (incoming.navigation_guard) |want| {
+            if (!std.mem.eql(u8, want, old.navigation_guard orelse "")) return error.PolicyRefused;
         }
         var report = TightenReport{};
         var next = try dupePolicy(self.gpa, old.*);

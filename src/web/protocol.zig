@@ -92,6 +92,9 @@ pub const CAP_INTERCEPT = "intercept";
 pub const CAP_NET_POLICY = "net-policy";
 /// Policy installs/replacements acknowledge their serial with active=1 on success or active=0 on fail-closed refusal.
 pub const CAP_NET_POLICY_ACK = "net-policy-ack";
+/// Exact HTTPS navigation/iframe rules, loopback refusal and background-network
+/// blocking carried by the optional NetPolicySet.navigation_guard tail.
+pub const CAP_NAVIGATION_GUARD = "navigation-guard";
 /// `intercept_log` and `net_log` carry a trailing `NetDetail` block: per
 /// entry the response content type and status text, the net error a load
 /// ended with, whether the hop ended in a server redirect, and the seq of
@@ -495,6 +498,7 @@ pub const Cap = enum {
     software_webgl,
     view_max_fps,
     view_flags,
+    navigation_guard,
 
     /// The wire name `hello_ack` carries.
     pub fn name(self: Cap) []const u8 {
@@ -3191,6 +3195,7 @@ pub const NetPolicySet = struct {
     deadline_ms: u32,
     allow_top: []const []const u8,
     allow_sub: []const []const u8,
+    navigation_guard: []const u8 = "",
 
     /// Host lists clamp at u16 (the client validates a far lower cap);
     /// a silent `@intCast` wrap would send a short count and a payload
@@ -3211,6 +3216,7 @@ pub const NetPolicySet = struct {
         const ns: u16 = @intCast(@min(self.allow_sub.len, std.math.maxInt(u16)));
         try putU16(gpa, out, ns);
         for (self.allow_sub[0..ns]) |h| try putStr(gpa, out, h);
+        if (self.navigation_guard.len > 0) try putStr(gpa, out, self.navigation_guard);
     }
 
     /// Caller frees BOTH returned slices (strings borrow from
@@ -3237,6 +3243,7 @@ pub const NetPolicySet = struct {
         for (sub) |*h| h.* = try cur.readStr();
         out.allow_top = top;
         out.allow_sub = sub;
+        out.navigation_guard = if (cur.pos < payload.len) try cur.readStr() else "";
         return out;
     }
 };

@@ -2385,7 +2385,7 @@ pub const TOOLS = blk: {
     @setEvalBranchQuota(4_000_000);
     var tools = TOOL_DECLS;
     for (&tools) |*tool| {
-        if (std.mem.eql(u8, tool.name, "capabilities")) tool.output_schema = schemaProperties(tool.output_schema.?, WEB_PERSISTENCE_CAP ++ "," ++ WEB_ROUTE_PROXY_CAP ++ ",");
+        if (std.mem.eql(u8, tool.name, "capabilities")) tool.output_schema = schemaProperties(tool.output_schema.?, WEB_PERSISTENCE_CAP ++ "," ++ WEB_ROUTE_PROXY_CAP ++ ",\"web_navigation_guard\":{\"type\":[\"boolean\",\"null\"],\"description\":\"Verified native exact-host navigation and iframe rules; null before helper startup\"},");
         for (PERSISTENCE_TOOLS) |n| {
             if (std.mem.eql(u8, tool.name, n)) tool.output_schema = schemaProperties(tool.output_schema.?, PERSISTENCE_PROP ++ ",");
         }
@@ -2395,6 +2395,7 @@ pub const TOOLS = blk: {
             );
             tool.input_schema = schemaInsert(tool.input_schema, "\"policy\":{", "\"additionalProperties\":false,");
             tool.input_schema = schemaReplace(tool.input_schema, "\"properties\":{\"allow_hosts\":", "\"properties\":{\"untrusted\":{\"type\":\"boolean\",\"description\":\"Linux-only restricted loader; requires ephemeral:true and route direct, tor or proxy:<url>\"},\"allow_hosts\":");
+            tool.input_schema = schemaReplace(tool.input_schema, "\"allow_hosts\":{", "\"navigation_guard\":{\"type\":\"object\",\"description\":\"Immutable native navigation authority: hosts and frames arrays of {host,subdomains?,path?}. Navigations require HTTPS without userinfo/nondefault ports. Frame rules never permit a top-level destination. Loopback/private literals and browserless networking are refused; ordinary CDN resources remain available. Requires navigation-guard and net-policy-ack.\"},\"allow_hosts\":{");
             tool.input_schema = schemaReplace(tool.input_schema, "Bare lower-case host names or IP literals; no '*', scheme, port or path", "Host or host:port entries; bracket IPv6 with a port. No wildcard, scheme or path. Explicit ports apply in all modes; bare entries allow all ports ordinarily, default ports only when untrusted. The URL default retains its effective port when untrusted");
             tool.output_schema = schemaProperties(tool.output_schema.?,
                 \\"untrusted":{"type":"boolean"},"color_scheme":{"type":"string","enum":["light","dark"]},"reduced_motion":{"type":"string","enum":["reduce","no-preference"]},"device_scale_factor":{"type":"number","minimum":0.5,"maximum":4},

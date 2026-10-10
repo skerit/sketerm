@@ -314,8 +314,10 @@ pub fn onCanDownload(
     _: [*c]const cef.cef_string_t,
     _: [*c]const cef.cef_string_t,
 ) callconv(.c) c_int {
-    releaseArg(browser);
-    return @intFromBool(!host_mod.untrusted.enabled);
+    defer releaseArg(browser);
+    if (host_mod.untrusted.enabled) return 0;
+    if (viewOf(browser)) |v| if (@import("intercept.zig").guardedView(v.id)) return 0;
+    return 1;
 }
 
 /// The engine's download entry for `id`, minted on first sight — the
@@ -342,6 +344,7 @@ pub fn onBeforeDownload(
     const host = host_mod.g_host orelse return 0;
     const v = viewOf(browser) orelse return 0;
     const item: *cef.cef_download_item_t = download_item orelse return 0;
+    if (@import("intercept.zig").guardedView(v.id)) return 0;
     const cb: *cef.cef_before_download_callback_t = callback orelse return 0;
     const id: u32 = if (item.get_id) |gid| gid(item) else return 0;
     const d = dlSlot(host, v.id, id) orelse return 0;

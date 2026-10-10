@@ -244,6 +244,7 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
     try res.fact("web_engine_started", engine_started);
     try res.fact("web_untrusted", @import("mcp_web.zig").restrictedCapability(.untrusted_web));
     try res.fact("web_policy_ack", @import("mcp_web.zig").restrictedCapability(.net_policy_ack));
+    try res.fact("web_navigation_guard", @import("mcp_web.zig").restrictedCapability(.navigation_guard));
     try res.fact("web_emulation", @import("mcp_web.zig").restrictedCapability(.web_emulation));
     try res.fact("web_untrusted_mode", @import("mcp_web.zig").untrustedMode());
     try res.fact("web_review", .{ .inspection = true, .checkpoints = true, .evidence_export = true, .requires_helper_capability = "review", .gui_console = false });

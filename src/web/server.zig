@@ -117,6 +117,7 @@ const unconditional_caps = [_]proto.Cap{
     .intercept,
     .net_policy,
     .net_policy_ack,
+    .navigation_guard,
     .capture,
     .tls,
     .permissions,

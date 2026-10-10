@@ -5311,7 +5311,7 @@ fn parsePolicy(arena: std.mem.Allocator, args: std.json.Value) !PolicyParse {
     const o = pv.object;
     var keys = o.iterator();
     while (keys.next()) |entry| {
-        const known = [_][]const u8{ "untrusted", "allow_hosts", "allow_subresource_hosts", "block_types", "allow_schemes", "allow_private_addresses", "block_ads", "max_requests", "max_bytes", "max_navigations", "deadline_ms" };
+        const known = [_][]const u8{ "navigation_guard", "untrusted", "allow_hosts", "allow_subresource_hosts", "block_types", "allow_schemes", "allow_private_addresses", "block_ads", "max_requests", "max_bytes", "max_navigations", "deadline_ms" };
         var found = false;
         for (known) |key| if (std.mem.eql(u8, entry.key_ptr.*, key)) {
             found = true;
@@ -5321,6 +5321,13 @@ fn parsePolicy(arena: std.mem.Allocator, args: std.json.Value) !PolicyParse {
     }
 
     var p = webdrive.NetPolicyPatch{};
+    if (o.get("navigation_guard")) |guard| {
+        const json = try std.json.Stringify.valueAlloc(arena, guard, .{});
+        const parsed = std.json.parseFromSliceLeaky(netpolicy.NavigationGuard, arena, json, .{}) catch
+            return .{ .err = fail(.invalid_args, "policy.navigation_guard must carry valid hosts and iframe rules") };
+        parsed.validate() catch return .{ .err = fail(.invalid_args, "invalid policy.navigation_guard rules") };
+        p.navigation_guard = json;
+    }
     if (o.get("untrusted")) |b| {
         if (b != .bool) return .{ .err = fail(.invalid_args, "policy.untrusted must be a boolean") };
         p.untrusted = b.bool;
@@ -5407,6 +5414,10 @@ fn policyJson(arena: std.mem.Allocator, p: *const webdrive.NetPolicy) ![]const u
     try hostListJson(w, p.allow_top);
     try w.writeAll(",\"allow_subresource_hosts\":");
     try hostListJson(w, p.allow_sub);
+    if (p.navigation_guard) |guard| {
+        try w.writeAll(",\"navigation_guard\":");
+        try w.writeAll(guard);
+    }
     try w.writeAll(",\"block_types\":[");
     var first = true;
     inline for (std.meta.fields(filter.RType)) |f| {

@@ -1541,7 +1541,7 @@ pub const Host = struct {
         _: ?*anyopaque,
         settings: *const cef.cef_request_context_settings_t,
     ) ?*cef.cef_request_context_t {
-        return cef.cef_request_context_create_context(settings, untrusted.contextHandler());
+        return cef.cef_request_context_create_context(settings, if (untrusted.enabled) untrusted.contextHandler() else &context_resource_handler);
     }
 
     /// The id the OWNING CLIENT minted for an engine-global context id.
@@ -3297,13 +3297,18 @@ pub const Host = struct {
 
     /// Record a refused attempt without changing the view's actual document or resource-gate counts.
     fn refuseNavigation(self: *Host, v: *View, target: []const u8, main: bool) bool {
-        const reason = host_icpt.navigationBudget(v.id, main, netpolicy.schemeOf(target), nowMs());
-        if (reason == .none) return false;
+        const guarded = host_icpt.navigationGuardReason(v.id, target, main);
+        const reason = if (guarded != .none) guarded else host_icpt.navigationBudget(v.id, main, netpolicy.schemeOf(target), nowMs());
+        if (reason == .none) {
+            if (main and target.len > 0) host_icpt.clearNavigationRefusal(v.id);
+            return false;
+        }
         self.post(host_icpt.netPolicyFrame(v.id));
         // Only the engine path reaches here mid-deferral (client frames are
         // queued behind it): the refused requested document is its terminal.
         if (main and v.initial_url != null and !bootstrapLoad(v, target)) self.settleInitialNavigation(v, true);
         if (main) {
+            host_icpt.recordMainNavigationRefusal(v.id, target);
             var buf: [128]u8 = undefined;
             self.post(proto.EvLoadError{
                 .view = v.id,
@@ -5585,6 +5590,19 @@ pub const wreqAbandonView = host_wreq.wreqAbandonView;
 pub const webrequestDeinit = host_wreq.webrequestDeinit;
 const onGetResourceRequestHandler = host_wreq.onGetResourceRequestHandler;
 
+fn onContextResourceRequestHandler(
+    _: [*c]cef.cef_request_context_handler_t,
+    browser: [*c]cef.cef_browser_t,
+    frame: [*c]cef.cef_frame_t,
+    request: [*c]cef.cef_request_t,
+    is_navigation: c_int,
+    is_download: c_int,
+    initiator: [*c]const cef.cef_string_t,
+    disable_default: [*c]c_int,
+) callconv(.c) [*c]cef.cef_resource_request_handler_t {
+    return onGetResourceRequestHandler(null, browser, frame, request, is_navigation, is_download, initiator, disable_default);
+}
+
 // ---------------------------------------------------------------------
 // Small CEF call helpers
 // ---------------------------------------------------------------------
@@ -6204,6 +6222,7 @@ var display_handler: cef.cef_display_handler_t = undefined;
 var life_span_handler: cef.cef_life_span_handler_t = undefined;
 var load_handler: cef.cef_load_handler_t = undefined;
 var request_handler: cef.cef_request_handler_t = undefined;
+var context_resource_handler: cef.cef_request_context_handler_t = undefined;
 pub var resource_request_handler: cef.cef_resource_request_handler_t = undefined;
 var find_handler: cef.cef_find_handler_t = undefined;
 var context_menu_handler: cef.cef_context_menu_handler_t = undefined;
@@ -6327,6 +6346,12 @@ fn installHandlers() void {
     // request handler, whose IO-thread callbacks run the filter engine
     // inline (see the Intercept registry above).
     request_handler.get_resource_request_handler = onGetResourceRequestHandler;
+    // Named contexts also expose browserless/service-worker requests. The
+    // shared IO-thread handler leaves ordinary helpers unchanged and closes
+    // that lane while an application-owned navigation guard is installed.
+    context_resource_handler = std.mem.zeroes(cef.cef_request_context_handler_t);
+    context_resource_handler.base = staticBase(cef.cef_request_context_handler_t);
+    context_resource_handler.get_resource_request_handler = onContextResourceRequestHandler;
 
     resource_request_handler = std.mem.zeroes(cef.cef_resource_request_handler_t);
     resource_request_handler.base = staticBase(cef.cef_resource_request_handler_t);
@@ -6947,6 +6972,7 @@ fn onAddressChange(
 ) callconv(.c) void {
     defer releaseArg(browser);
     defer releaseArg(frame);
+    if (!isMainFrame(frame)) return;
     const host = g_host orelse return;
     const v = viewOf(browser) orelse return;
     var s = Utf8.init(url);
@@ -7082,6 +7108,9 @@ fn onBeforePopup(
     // A background fetch reads one document and is closed; a popup
     // would outlive it as a view nobody owns.
     if (v.background) return 1;
+    // Guarded application views are single-view surfaces. Do not create an
+    // unpoliced popup, or hand a blocked request to a client to reopen unpoliced.
+    if (host_icpt.guardedView(v.id)) return 1;
     var s = Utf8.init(target_url);
     defer s.free();
     var fname = Utf8.init(target_frame_name);
@@ -7421,6 +7450,14 @@ fn onLoadError(
     const v = viewOf(browser) orelse return;
     var url = Utf8.init(failed_url);
     defer url.free();
+    // A denied HTTP redirect is reported by CEF against the SOURCE URL (or as
+    // ERR_ABORTED). The IO-thread refusal records the actual destination and
+    // the main-thread flush publishes it; never overwrite it with that source.
+    if (host_icpt.hasNavigationRefusal(v.id)) {
+        if (v.initial_url != null) host.settleInitialNavigation(v, true);
+        host.semRearm(v);
+        return;
+    }
     if (Host.bootstrapLoad(v, url.slice())) return;
     // `onBeforeBrowse` normally settled it already. An abort of a URL other
     // than the requested one is a superseded load, not this one's end.

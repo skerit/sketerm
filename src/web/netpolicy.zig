@@ -37,6 +37,76 @@ pub const Scheme = enum(u4) {
 
 pub const default_schemes: u16 = Scheme.http.bit() | Scheme.https.bit();
 
+/// Application-owned sign-in views need exact hosts and iframe-only paths,
+/// while ordinary CDN resources remain available. This is not a wildcard host
+/// policy: it is a separate, capability-negotiated navigation contract.
+pub const NavigationRule = struct { host: []const u8, subdomains: bool = false, path: ?[]const u8 = null };
+pub const NavigationGuard = struct {
+    hosts: []const NavigationRule,
+    frames: []const NavigationRule = &.{},
+
+    pub fn validate(self: NavigationGuard) !void {
+        if (self.hosts.len == 0 or self.hosts.len > MAX_HOSTS or self.frames.len > MAX_HOSTS) return error.BadNavigationGuard;
+        for ([_][]const NavigationRule{ self.hosts, self.frames }) |rules| for (rules) |rule| {
+            if (!validHostEntry(rule.host) or std.mem.indexOfAny(u8, rule.host, ":[]") != null or
+                std.mem.endsWith(u8, rule.host, ".") or !std.ascii.isLower(rule.host[0])) return error.BadNavigationGuard;
+            if (rule.path) |p| if (p.len == 0 or p[0] != '/' or std.mem.indexOfAny(u8, p, "?#") != null) return error.BadNavigationGuard;
+        };
+    }
+
+    fn matches(rules: []const NavigationRule, host: []const u8, path: []const u8) bool {
+        for (rules) |rule| {
+            const host_ok = std.ascii.eqlIgnoreCase(host, rule.host) or (rule.subdomains and filter.hostWithin(host, rule.host));
+            if (host_ok and (rule.path == null or std.mem.eql(u8, path, rule.path.?))) return true;
+        }
+        return false;
+    }
+
+    pub fn decide(self: NavigationGuard, url: []const u8, rtype: filter.RType) proto.NetReason {
+        const navigation = rtype == .document or rtype == .subdocument;
+        if (std.mem.eql(u8, url, "about:blank")) return .none;
+        const host = urlhost.hostOf(url, urlhost.filtering);
+        // This also blocks OAuth callbacks sent by images/fetches, not only
+        // document navigations. The main-frame error event carries the full URL.
+        if (isPrivateHostLiteral(host)) return .private_address;
+        if (!navigation) return .none;
+        if (!std.mem.startsWith(u8, url, "https://")) return .scheme;
+        const rest = url[8..];
+        const end = std.mem.indexOfAny(u8, rest, "/?#") orelse rest.len;
+        if (std.mem.indexOfScalar(u8, rest[0..end], '@') != null) return .malformed_url;
+        if (urlhost.portOf(url) != 443) return .malformed_url;
+        var pathname = rest[end..];
+        if (std.mem.indexOfAny(u8, pathname, "?#")) |i| pathname = pathname[0..i];
+        if (pathname.len == 0) pathname = "/";
+        if (matches(self.hosts, host, pathname)) return .none;
+        if (rtype == .subdocument and matches(self.frames, host, pathname)) return .none;
+        return if (rtype == .document) .top_host else .sub_host;
+    }
+};
+
+test "navigation guard separates exact hosts, iframe paths and resource requests" {
+    const guard = NavigationGuard{
+        .hosts = &.{ .{ .host = "auth.openai.com" }, .{ .host = "claude.ai", .subdomains = true } },
+        .frames = &.{.{ .host = "sentinel.openai.com", .path = "/backend-api/sentinel/frame.html" }},
+    };
+    try guard.validate();
+    const t = std.testing;
+    for ([_][]const u8{ "https://auth.openai.com/login", "https://auth.openai.com:443/login", "https://sub.claude.ai/" }) |url|
+        try t.expectEqual(proto.NetReason.none, guard.decide(url, .document));
+    for ([_][]const u8{ "https://evil.auth.openai.com/", "https://auth.openai.com.evil.test/", "https://auth.openai.com./", "https://user@auth.openai.com/", "https://auth.openai.com:444/", "http://auth.openai.com/", "data:text/html,hello" }) |url|
+        try t.expect(guard.decide(url, .document) != .none);
+    const frame = "https://sentinel.openai.com/backend-api/sentinel/frame.html?version=fixture";
+    try t.expectEqual(proto.NetReason.none, guard.decide(frame, .subdocument));
+    try t.expect(guard.decide(frame, .document) != .none);
+    try t.expect(guard.decide("https://sentinel.openai.com/backend-api/sentinel/frame.html/", .subdocument) != .none);
+    try t.expect(guard.decide("https://sentinel.openai.com/other", .subdocument) != .none);
+    try t.expectEqual(proto.NetReason.none, guard.decide("https://cdn.example.com/script.js", .script));
+    for ([_][]const u8{ "http://localhost:1455/auth/callback?code=secret", "http://127.0.0.1:1455/auth/callback", "http://[::1]/", "https://sub.localhost/" }) |url| {
+        try t.expectEqual(proto.NetReason.private_address, guard.decide(url, .document));
+        try t.expectEqual(proto.NetReason.private_address, guard.decide(url, .xhr));
+    }
+}
+
 /// Immutable after `build`; the helper swaps whole policies under the
 /// intercept spinlock exactly the way filter engines are swapped.
 pub const Policy = struct {
@@ -62,6 +132,8 @@ pub const Policy = struct {
     max_bytes: u64 = 0,
     max_navigations: u32 = 0,
     deadline_ms: u32 = 0,
+    navigation_guard: ?NavigationGuard = null,
+    navigation_guard_json: []const u8 = "",
 
     /// Deep-copy a decoded wire frame into an owned policy. Caller
     /// destroys with `deinit` (outside any lock).
@@ -84,6 +156,12 @@ pub const Policy = struct {
         const arena = p.arena_state.allocator();
         p.allow_top = try dupeHosts(arena, req.allow_top);
         p.allow_sub = try dupeHosts(arena, req.allow_sub);
+        if (req.navigation_guard.len > 0) {
+            if (p.untrusted) return error.BadNavigationGuard;
+            p.navigation_guard_json = try arena.dupe(u8, req.navigation_guard);
+            p.navigation_guard = try std.json.parseFromSliceLeaky(NavigationGuard, arena, p.navigation_guard_json, .{});
+            try p.navigation_guard.?.validate();
+        }
         return p;
     }
 
@@ -115,6 +193,7 @@ pub const Counters = struct {
 
 /// One request as the gate sees it.
 pub const Req = struct {
+    url: []const u8 = "",
     host: []const u8,
     scheme: []const u8,
     port: u16 = 0,
@@ -147,6 +226,12 @@ pub fn decide(p: *const Policy, c: *const Counters, r: Req, now_ms: i64) proto.N
     const scheme = std.meta.stringToEnum(Scheme, r.scheme) orelse return .scheme;
     if (p.untrusted and scheme != .http and scheme != .https) return .untrusted_transport;
     if (p.allow_schemes & scheme.bit() == 0) return .scheme;
+    if (p.navigation_guard) |guard| {
+        const reason = guard.decide(r.url, r.rtype);
+        if (reason != .none) return reason;
+        if (p.block_types & r.rtype.bit() != 0) return .resource_type;
+        return budget;
+    }
 
     // Hostless schemes (data:, about:, blob:) are judged by scheme
     // alone: there is no authority to test.
@@ -209,6 +294,18 @@ pub fn entrySubset(narrow: []const u8, wide: []const u8, untrusted: bool, scheme
 
 /// Compare complete policies without allowing a replacement to expand any request scope.
 pub fn subsetOf(next: *const Policy, old: *const Policy) bool {
+    // Navigation guards are immutable for a view's lifetime. Replacements may
+    // tighten budgets/types but cannot silently replace this authority.
+    if (!std.mem.eql(u8, next.navigation_guard_json, old.navigation_guard_json)) return false;
+    if (old.navigation_guard != null) {
+        // Host-list patches must not claim to narrow an authority supplied by
+        // the immutable navigation rules. Guarded views only tighten budgets,
+        // schemes and resource types; a new authority requires a new view.
+        for ([_][2][]const []const u8{ .{ next.allow_top, old.allow_top }, .{ next.allow_sub, old.allow_sub } }) |pair| {
+            if (pair[0].len != pair[1].len) return false;
+            for (pair[0], pair[1]) |a, b| if (!std.mem.eql(u8, a, b)) return false;
+        }
+    }
     if (next.untrusted != old.untrusted or
         (next.allow_private and !old.allow_private) or
         next.allow_schemes & ~old.allow_schemes != 0 or

@@ -1266,6 +1266,31 @@ capability). Headless only; with a GUI it is `unavailable`, and
   literal-only: a hostname that resolves to a private address is not
   caught.
 
+### Application-owned navigation guards
+
+`web_open policy.navigation_guard` is an immutable, native navigation authority
+for a single-view application-owned sign-in surface. It requires the helper's
+`navigation-guard` and `net-policy-ack` capabilities; the initial policy is
+validated and acknowledged before browser creation. The current helper fact is
+`capabilities.web_navigation_guard` (null before startup).
+
+The object contains `hosts` and `frames` arrays of `{host, subdomains?, path?}`.
+Host matching is exact unless `subdomains:true` is explicitly present, and a
+path matches exactly with queries ignored. Frame rules never authorize a
+top-level destination. Navigations require HTTPS without userinfo or a
+non-default port. Ordinary CDN resources remain available, while private-address
+and loopback requests are refused even for images/fetches. Browserless networking
+is refused while a protected view is active; named contexts install the same
+resource handler so service workers cannot bypass that decision. Popups and
+downloads are refused for guarded single-view surfaces.
+
+A refused main-frame navigation carries its complete destination in
+`load_error.url`, including a localhost OAuth callback that was never requested.
+Clients must validate the callback's exact origin/path and state themselves.
+Do not obtain authentication credentials from `web_network`: its log URLs are
+bounded prefixes. Guard rules and their host authority are immutable; new rules
+require a new view. Budgets, schemes and blocked types may still tighten.
+
 ### Untrusted Loading
 
 `web_open policy:{"untrusted":true} ephemeral:true route:"direct"` selects

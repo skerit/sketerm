@@ -45,6 +45,19 @@ url, and `sk_open_socket` admits that one address and port. The native
 test counts zero page-host lookups and every socket curl asked for; the
 untrusted rig proves hostnames at the proxy and no direct origin hit.
 
+## 2026-10-10: native navigation guards for application-owned sign-in views
+
+`policy.navigation_guard` carries exact HTTPS host rules and iframe-only path
+exceptions, installed and acknowledged before a view is created. Native
+navigation preflight refuses forbidden destinations without contacting them and
+reports the full main-frame URL, so an application can validate and capture a
+localhost OAuth callback without relying on the network log's URL prefix.
+Resource interception closes loopback/private-literal and browserless networking;
+named contexts install that handler too. Guarded single-view surfaces refuse
+popups and downloads, and their navigation authority is immutable. The helper
+advertises `navigation-guard`; MCP reports `web_navigation_guard` and refuses an
+older helper before creating a protected view.
+
 ## 2026-10-10: a closed control connection is resent; editor status no longer widens
 
 The MCP's kept-alive GUI control connection lost a request as

@@ -657,6 +657,97 @@ pub fn netPolicyStatus(self: *Host, req: proto.NetPolicyReq) void {
 }
 
 /// Latch only a refused navigation attempt; allowed preflight leaves resource-gate accounting untouched.
+pub fn navigationGuardReason(view: u32, url: []const u8, main: bool) proto.NetReason {
+    // History controls deliberately do not invent a destination. The real
+    // engine callback/resource gate checks it when one becomes available.
+    if (url.len == 0) return .none;
+    g_int.acquire();
+    defer g_int.release();
+    for (&g_int.slots) |*slot| {
+        if (!slot.used or slot.view_id != view) continue;
+        const policy = slot.pol orelse return .none;
+        const guard = policy.navigation_guard orelse return .none;
+        const reason = guard.decide(url, if (main) .document else .subdocument);
+        if (reason != .none) {
+            netpolicy.deny(&slot.pc, reason);
+            slot.pol_dirty = true;
+        }
+        return reason;
+    }
+    return .none;
+}
+
+pub fn guardedView(view: u32) bool {
+    g_int.acquire();
+    defer g_int.release();
+    for (&g_int.slots) |*slot| {
+        if (!slot.used or slot.view_id != view) continue;
+        return if (slot.pol) |policy| policy.navigation_guard != null else false;
+    }
+    return false;
+}
+
+pub fn clearNavigationRefusal(view: u32) void {
+    g_int.acquire();
+    defer g_int.release();
+    for (&g_int.slots) |*slot| if (slot.used and slot.view_id == view) {
+        slot.refused_main = false;
+        slot.refused_pending = false;
+        return;
+    };
+}
+
+pub fn hasNavigationRefusal(view: u32) bool {
+    g_int.acquire();
+    defer g_int.release();
+    for (&g_int.slots) |*slot| if (slot.used and slot.view_id == view) return slot.refused_main;
+    return false;
+}
+
+fn recordNavigationRefusal(slot: *ISlot, url: []const u8) void {
+    if (slot.pol == null or slot.pol.?.navigation_guard == null) return;
+    slot.refused_main = true;
+    slot.refused_pending = true;
+    // Never return a prefix as an authorization credential. Overlong targets
+    // stay blocked and produce an empty URL with an explicit refusal message.
+    slot.refused_url_len = if (url.len <= slot.refused_url.len) @intCast(url.len) else 0;
+    @memcpy(slot.refused_url[0..slot.refused_url_len], url[0..slot.refused_url_len]);
+}
+
+pub fn recordMainNavigationRefusal(view: u32, url: []const u8) void {
+    g_int.acquire();
+    defer g_int.release();
+    for (&g_int.slots) |*slot| if (slot.used and slot.view_id == view) {
+        recordNavigationRefusal(slot, url);
+        return;
+    };
+}
+
+fn flushNavigationRefusals(self: *Host) void {
+    for (0..MAX_ISLOTS) |i| {
+        var url: [proto.UNTRUSTED_URL_CAP]u8 = undefined;
+        var len: usize = 0;
+        var view: u32 = 0;
+        {
+            g_int.acquire();
+            defer g_int.release();
+            const slot = &g_int.slots[i];
+            if (slot.used and slot.refused_pending) {
+                slot.refused_pending = false;
+                view = slot.view_id;
+                len = slot.refused_url_len;
+                @memcpy(url[0..len], slot.refused_url[0..len]);
+            }
+        }
+        if (view != 0) self.post(proto.EvLoadError{
+            .view = view,
+            .code = cef.ERR_BLOCKED_BY_CLIENT,
+            .url = url[0..len],
+            .msg = if (len > 0) "main-frame destination refused by navigation guard" else "navigation refusal URL too long",
+        });
+    }
+}
+
 pub fn navigationBudget(view: u32, is_main: bool, scheme: []const u8, now_ms: i64) proto.NetReason {
     g_int.acquire();
     defer g_int.release();
@@ -801,6 +892,7 @@ pub fn flushNetPolicy(self: *Host) void {
 /// iteration — a page issuing thousands of requests still costs at
 /// most one status frame per iteration per view.
 pub fn flushInterceptStatus(self: *Host) void {
+    flushNavigationRefusals(self);
     var pending: [MAX_ISLOTS]proto.InterceptStatus = undefined;
     var n: usize = 0;
     {
@@ -1565,6 +1657,10 @@ fn openEntry(ring: *[NLOG]LogEntry, req_id: u64) ?*LogEntry {
 }
 
 pub const ISlot = struct {
+    refused_main: bool = false,
+    refused_pending: bool = false,
+    refused_url_len: u16 = 0,
+    refused_url: [proto.UNTRUSTED_URL_CAP]u8 = undefined,
     used: bool = false,
     cef_id: c_int = 0,
     view_id: u32 = 0,
@@ -2109,7 +2205,14 @@ pub fn onBeforeResourceLoad(
     // Service-worker / urlrequest traffic has no browser and thus no
     // view to attribute it to; it passes unfiltered (matching without
     // a first-party context would misapply domain=/third-party rules).
-    const b: *cef.cef_browser_t = browser orelse return if (untrusted) cef.RV_CANCEL else cef.RV_CONTINUE;
+    const b: *cef.cef_browser_t = browser orelse {
+        g_int.acquire();
+        defer g_int.release();
+        // Browserless requests cannot be attributed safely. A protected helper
+        // refuses that lane, including service-worker networking.
+        for (&g_int.slots) |*slot| if (slot.used) if (slot.pol) |p| if (p.navigation_guard != null) return cef.RV_CANCEL;
+        return if (untrusted) cef.RV_CANCEL else cef.RV_CONTINUE;
+    };
     const gi = b.get_identifier orelse return if (untrusted) cef.RV_CANCEL else cef.RV_CONTINUE;
     const cef_id = gi(b);
 
@@ -2218,6 +2321,7 @@ pub fn onBeforeResourceLoad(
                     // matched against a port-carrying entry: refused, named.
                     const port: ?u16 = if (host.len == 0) 0 else urlhost.portOf(url);
                     pol_reason = if (port) |p| netpolicy.decide(pol, &s.pc, .{
+                        .url = url_unf,
                         .host = host,
                         .scheme = netpolicy.schemeOf(url),
                         .port = p,
@@ -2246,6 +2350,7 @@ pub fn onBeforeResourceLoad(
                 }
             }
             const reason: proto.NetReason = if (pol_reason != .none) pol_reason else if (verdict) .filter_list else .none;
+            if (verdict and rtype == .document) recordNavigationRefusal(s, url_unf);
             logRequest(s, req_id, now, rtype, reason, method, url_unf);
         }
     }
@@ -2332,7 +2437,7 @@ pub fn onResourceResponse(
 /// on the log entry its request is on; with `redirect`, that entry also
 /// ENDS here as a redirect hop (the next hop's entry links back to it).
 fn noteResponse(browser: ?*cef.cef_browser_t, req: *cef.cef_request_t, resp: *cef.cef_response_t, redirect: ?i64) void {
-    const b = browser orelse return;
+    const b: *cef.cef_browser_t = browser orelse return;
     const gi = b.get_identifier orelse return;
     const cef_id = gi(b);
     const req_id: u64 = if (req.get_identifier) |gid| gid(req) else return;
@@ -2382,7 +2487,7 @@ pub fn onResourceRedirect(
     frame: [*c]cef.cef_frame_t,
     request: [*c]cef.cef_request_t,
     response: [*c]cef.cef_response_t,
-    _: [*c]cef.cef_string_t,
+    destination: [*c]cef.cef_string_t,
 ) callconv(.c) void {
     defer releaseArg(browser);
     defer releaseArg(frame);
@@ -2391,6 +2496,22 @@ pub fn onResourceRedirect(
     const req: *cef.cef_request_t = request orelse return;
     const resp: *cef.cef_response_t = response orelse return;
     noteResponse(browser, req, resp, nowMs());
+    // Initial redirected navigations may lose their browser attribution at the
+    // next gate. Record a forbidden main-frame target while this original hop
+    // still identifies its owner, without following it or emitting on the IO
+    // thread. The ordinary gate/context handler still cancels the request.
+    const b: *cef.cef_browser_t = browser orelse return;
+    const get_id = b.get_identifier orelse return;
+    const get_type = req.get_resource_type orelse return;
+    if (rtypeOf(get_type(req)) != .document) return;
+    var target = Utf8.init(destination);
+    defer target.free();
+    g_int.acquire();
+    defer g_int.release();
+    const slot = g_int.slotByCef(get_id(b)) orelse return;
+    const policy = slot.pol orelse return;
+    const guard = policy.navigation_guard orelse return;
+    if (guard.decide(target.slice(), .document) != .none) recordNavigationRefusal(slot, target.slice());
 }
 
 /// The net error a finished load ended with: the response's own code,
