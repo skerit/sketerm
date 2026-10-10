@@ -1,5 +1,21 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-10: proxy:<url> routes, for trusted and untrusted views
+
+A consumer rendering author HTML in an untrusted view wants all of that
+view's traffic to go through a forward proxy it runs, which decides per
+connection what is reachable and pins DNS. `proxy:socks5h://HOST:PORT`
+and `proxy:http://HOST:PORT` are a new route kind (`Kind.proxy`): one
+helper instance per url, the proxy applied like Tor's, failing closed.
+There is no bypass list, so a loopback render host is served through the
+proxy, and on that route the engine's literal private-address refusal
+steps aside (`--proxy-decides-addresses`); `socks5://`, credentials,
+paths and PAC are refused. Untrusted views take direct, tor and proxy
+routes: the broker resolves only the proxy, hands curl a numeric proxy
+url, and `sk_open_socket` admits that one address and port. The native
+test counts zero page-host lookups and every socket curl asked for; the
+untrusted rig proves hostnames at the proxy and no direct origin hit.
+
 ## 2026-10-10: a closed control connection is resent; editor status no longer widens
 
 The MCP's kept-alive GUI control connection lost a request as
