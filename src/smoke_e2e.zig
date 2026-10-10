@@ -16751,13 +16751,30 @@ fn wsFindBar(allocator: std.mem.Allocator, app: *appdrive.App, win: u32, sock_pa
         defer allocator.free(r);
         scrolled = (parseNumAfter(r, "\"view_offset\":") orelse 0) > 0;
     }
-    app.pressKey(win, "escape") catch {};
-    _ = app.waitIdle(200, 3_000);
-    _ = wsAction(allocator, sock_path, "scrollback_bottom", 1);
     if (!scrolled) {
         wsShot(allocator, app, win, "find");
         return "find: searching the scrollback did not scroll back to the match";
     }
+    // Wait for the Escape to CLOSE the bar, not for a quiet spell: the
+    // key and the next step's control-socket requests reach the GUI on
+    // different connections, and an Escape handled after the next
+    // step's new-tab was typed into that tab's shell, eating the first
+    // letter of its command.
+    const strip: appdrive.App.Region = blk: {
+        _ = app.drainLive(500);
+        const w = app.winById(win) orelse return "find: the window is gone";
+        const h: u32 = @intCast(w.h);
+        break :blk .{ .x = 0, .y = h - h / 6, .w = @intCast(w.w), .h = h / 6 };
+    };
+    var esc_ref = app.frameRef(win, true) orelse return "find: no frame before Escape";
+    defer esc_ref.deinit(allocator);
+    app.pressKey(win, "escape") catch return "find: injecting Escape failed";
+    if (!app.waitChangeSince(win, &esc_ref, 8_000, 0.05, strip)) {
+        wsShot(allocator, app, win, "find-escape");
+        return "find: Escape did not close the find bar";
+    }
+    _ = app.waitIdle(200, 3_000);
+    _ = wsAction(allocator, sock_path, "scrollback_bottom", 1);
     return null;
 }
 
@@ -16766,7 +16783,11 @@ fn wsCrossSearch(allocator: std.mem.Allocator, app: *appdrive.App, win: u32, soc
     defer _ = wsClosePane(allocator, sock_path, other);
     _ = app.waitIdle(300, 5_000);
     if (!wsSendText(allocator, sock_path, other, "echo ZWxs$((7*11))\\n")) return "xsearch: send";
-    if (!wsWaitMarkerIn(allocator, app, sock_path, other, "ZWxs77", 1, 10_000)) return "xsearch: marker never ran";
+    if (!wsWaitMarkerIn(allocator, app, sock_path, other, "ZWxs77", 1, 10_000)) {
+        wsShot(allocator, app, win, "xsearch-marker");
+        wsDumpPane(allocator, sock_path, other);
+        return "xsearch: marker never ran";
+    }
     if (!wsFocus(allocator, sock_path, 1)) return "xsearch: focus pane 1";
     _ = app.waitIdle(300, 5_000);
     if (wsFocusedPane(allocator, sock_path) != 1) return "xsearch: pane 1 did not take focus";
