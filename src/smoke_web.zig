@@ -725,6 +725,99 @@ const ProxyProbe = struct {
     }
 };
 
+/// An HTTP forward proxy on loopback that records the FIRST request it is
+/// asked for whose target names `want` (Chromium's own background fetches
+/// go through a routed instance's proxy too) and serves every forward
+/// request itself, so a page load through it completes without any origin.
+/// CONNECT is answered 403: the request line alone is the proof, no TLS.
+const HttpProxyProbe = struct {
+    lis: tcpserver.Listener = .{ .backlog = 16, .poll_ms = 200 },
+    want: []const u8 = "",
+    line: [512]u8 = @splat(0),
+    line_len: usize = 0,
+    got: std.atomic.Value(bool) = .init(false),
+
+    const body = "<html><head><title>via-http-proxy</title></head><body>proxied</body></html>";
+
+    fn start(self: *HttpProxyProbe) bool {
+        return self.lis.start(self, &onConn);
+    }
+
+    fn onConn(ctx: ?*anyopaque, afd: c_int) bool {
+        const self: *HttpProxyProbe = @ptrCast(@alignCast(ctx.?));
+        var buf: [4096]u8 = undefined;
+        var n: usize = 0;
+        const deadline = nowMs() + 5000;
+        while (n < buf.len and std.mem.indexOf(u8, buf[0..n], "\r\n\r\n") == null and nowMs() < deadline) {
+            var pfd = c.struct_pollfd{ .fd = afd, .events = c.POLLIN, .revents = 0 };
+            if (c.poll(@ptrCast(&pfd), 1, 200) <= 0) continue;
+            const r = c.read(afd, buf[n..].ptr, buf.len - n);
+            if (r <= 0) break;
+            n += @intCast(r);
+        }
+        const head = buf[0..n];
+        const line = head[0 .. std.mem.indexOf(u8, head, "\r\n") orelse head.len];
+        if (!self.got.load(.acquire) and self.want.len != 0 and std.mem.indexOf(u8, line, self.want) != null) {
+            const take = @min(line.len, self.line.len);
+            @memcpy(self.line[0..take], line[0..take]);
+            self.line_len = take;
+            self.got.store(true, .release);
+        }
+        const reply = if (std.mem.startsWith(u8, line, "CONNECT "))
+            "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        else
+            std.fmt.comptimePrint("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body });
+        _ = socks5relay.writeAll(afd, reply);
+        return false;
+    }
+
+    /// Record the next request naming `want`.
+    fn arm(self: *HttpProxyProbe, want: []const u8) void {
+        self.want = want;
+        self.line_len = 0;
+        self.got.store(false, .release);
+    }
+
+    fn seenLine(self: *HttpProxyProbe) ?[]const u8 {
+        if (!self.got.load(.acquire)) return null;
+        return self.line[0..self.line_len];
+    }
+
+    fn shutdown(self: *HttpProxyProbe) void {
+        self.lis.deinit();
+    }
+};
+
+/// Wait until `probe` recorded a request line, pumping `cl` meanwhile.
+fn waitProxyLine(probe: *HttpProxyProbe, cl: *Client, timeout_ms: i64) ?[]const u8 {
+    const deadline = nowMs() + timeout_ms;
+    while (nowMs() < deadline) {
+        if (probe.seenLine()) |line| return line;
+        cl.pump(100);
+    }
+    return null;
+}
+
+/// A helper started with these arguments must refuse to start (exit 2)
+/// without ever binding its socket: a malformed route never browses.
+fn expectHelperRefuses(exe: [*:0]const u8, sock: [*:0]const u8, cache: [*:0]const u8, tail: []const [*:0]const u8, comptime what: []const u8) void {
+    const pid = spawnHelperArgs(exe, sock, cache, tail);
+    g_pid = pid;
+    const deadline = nowMs() + 20_000;
+    var status: c_int = 0;
+    while (true) {
+        const r = c.waitpid(pid, &status, c.WNOHANG);
+        if (r == pid) break;
+        if (nowMs() > deadline) fail(what ++ ": the helper did not refuse its arguments");
+        _ = c.usleep(20_000);
+    }
+    g_pid = -1;
+    // Exited (no signal), with code 2.
+    if (status & 0x7f != 0 or (status >> 8) & 0xff != 2) fail(what ++ ": the helper did not exit 2");
+    var st: c.struct_stat = undefined;
+    if (c.stat(sock, &st) == 0) fail(what ++ ": the refusing helper bound its socket");
+}
+
 /// A one-page HTTP server on loopback: the only real ORIGIN this rig
 /// serves, and the reason stages 31 and 33 can exist at all. A `data:`
 /// URL's origin is opaque, so `document.cookie` on one stores nothing
@@ -7188,6 +7281,90 @@ fn runRouteStages(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
         pass("stage 26 webrtc refusal (a refused WebRTC policy fails the route closed and names itself)");
         wc.deinit();
         reapHelper(w_pid, "stage 26 webrtc refusal");
+    }
+
+    // Stage 26h: a caller-given HTTP proxy route (`proxy:http://...`,
+    // whose `--proxy` is Chromium's own `http://` spelling). Plain http
+    // is FORWARDED with the hostname in an absolute-form request line,
+    // https is TUNNELLED with CONNECT naming host:port, and a loopback
+    // destination goes through the proxy as well (no implicit bypass):
+    // nothing is resolved or dialled here but the proxy.
+    {
+        var probe = HttpProxyProbe{};
+        if (!probe.start()) fail("stage 26h http proxy: could not start the probe");
+        defer probe.shutdown();
+        var url_buf: [64:0]u8 = undefined;
+        const url = std.fmt.bufPrintZ(&url_buf, "http://127.0.0.1:{d}", .{probe.lis.port}) catch unreachable;
+        var sock_buf: [96]u8 = undefined;
+        const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/xh.sock", .{dir}) catch fail("socket path");
+        var cache_buf: [128]u8 = undefined;
+        const cache = std.fmt.bufPrintZ(&cache_buf, "{s}/cache-http-proxy", .{dir}) catch fail("cache path");
+        const pid = spawnHelperArgs(exe, sock.ptr, cache.ptr, &[_][*:0]const u8{ "--ozone-platform=headless", "--proxy", url.ptr, "--proxy-decides-addresses" });
+        g_pid = pid;
+        var hc = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
+        hc.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web-http-proxy" });
+        {
+            const deadline = nowMs() + 20_000;
+            while (hc.ack_proto == 0 and nowMs() < deadline) hc.pump(100);
+        }
+        if (hc.ack_proto != proto.PROTO_VERSION) fail("stage 26h http proxy: no hello_ack from the routed helper");
+        if (hc.route_refused_seq != 0) fail("stage 26h http proxy: the engine refused an http:// route proxy");
+        hc.send(proto.ViewCreate{ .view = egress_view_a, .w = 320, .h = 240, .scale_x1000 = 1000, .context = 0 });
+
+        probe.arm("http-proxy-a.example");
+        hc.send(proto.Navigate{ .view = egress_view_a, .url = "http://http-proxy-a.example/page" });
+        const fwd = waitProxyLine(&probe, &hc, 20_000) orelse fail("stage 26h http proxy: plain http never reached the proxy");
+        if (!std.mem.eql(u8, fwd, "GET http://http-proxy-a.example/page HTTP/1.1")) {
+            std.debug.print("smoke-web: http proxy saw \"{s}\"\n", .{fwd});
+            fail("stage 26h http proxy: plain http was not forwarded by hostname in absolute form");
+        }
+        if (!hc.waitTitle("via-http-proxy", 20_000)) fail("stage 26h http proxy: the page the proxy served never loaded");
+
+        probe.arm("http-proxy-b.example");
+        hc.send(proto.Navigate{ .view = egress_view_a, .url = "https://http-proxy-b.example/" });
+        const tunnel = waitProxyLine(&probe, &hc, 20_000) orelse fail("stage 26h http proxy: https never reached the proxy");
+        if (!std.mem.startsWith(u8, tunnel, "CONNECT http-proxy-b.example:443 ")) {
+            std.debug.print("smoke-web: http proxy saw \"{s}\"\n", .{tunnel});
+            fail("stage 26h http proxy: https was not tunnelled with CONNECT naming the host");
+        }
+
+        // The probe's own port: a direct request would arrive there in
+        // origin form (`GET /loopback`), a proxied one in absolute form.
+        probe.arm("/loopback");
+        var loop_url_buf: [64]u8 = undefined;
+        const loop_url = std.fmt.bufPrint(&loop_url_buf, "http://127.0.0.1:{d}/loopback", .{probe.lis.port}) catch unreachable;
+        var loop_want_buf: [96]u8 = undefined;
+        const loop_want = std.fmt.bufPrint(&loop_want_buf, "GET {s} HTTP/1.1", .{loop_url}) catch unreachable;
+        hc.send(proto.Navigate{ .view = egress_view_a, .url = loop_url });
+        const loop = waitProxyLine(&probe, &hc, 20_000) orelse fail("stage 26h http proxy: a loopback page was never requested");
+        if (!std.mem.eql(u8, loop, loop_want)) {
+            std.debug.print("smoke-web: http proxy saw \"{s}\"\n", .{loop});
+            fail("stage 26h http proxy: a loopback page bypassed the proxy (origin-form request line)");
+        }
+        pass("stage 26h http proxy route (http forwarded by hostname, https via CONNECT host:443, loopback through the proxy too)");
+        hc.send(proto.ViewDestroy{ .view = egress_view_a });
+        hc.teardown_allow_close = true;
+        {
+            const d = nowMs() + 2000;
+            while (nowMs() < d and hc.fd >= 0) hc.pump(50);
+        }
+        hc.deinit();
+        reapHelperTimeout(pid, "stage 26h http proxy route instance", 30_000);
+    }
+
+    // A route the helper cannot honour exactly is refused at startup:
+    // `socks5h` is the route grammar's word, not Chromium's (which would
+    // read it as an invalid proxy and browse direct), and an address
+    // authority without a proxy names nothing.
+    {
+        var sock_buf: [96]u8 = undefined;
+        const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/xr.sock", .{dir}) catch fail("socket path");
+        var cache_buf: [128]u8 = undefined;
+        const cache = std.fmt.bufPrintZ(&cache_buf, "{s}/cache-route-refused", .{dir}) catch fail("cache path");
+        expectHelperRefuses(exe, sock.ptr, cache.ptr, &[_][*:0]const u8{ "--ozone-platform=headless", "--proxy", "socks5h://127.0.0.1:9" }, "stage 26r proxy spelling");
+        expectHelperRefuses(exe, sock.ptr, cache.ptr, &[_][*:0]const u8{ "--ozone-platform=headless", "--proxy", "http://u@127.0.0.1:9" }, "stage 26r proxy credentials");
+        expectHelperRefuses(exe, sock.ptr, cache.ptr, &[_][*:0]const u8{ "--ozone-platform=headless", "--proxy-decides-addresses" }, "stage 26r authority without proxy");
+        pass("stage 26r route refusal at startup (a --proxy outside Chromium's spelling, credentials, or an authority without a proxy never serve)");
     }
 }
 

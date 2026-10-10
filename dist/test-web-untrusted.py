@@ -35,11 +35,17 @@ REPO = Path(__file__).resolve().parent.parent
 OPTIONS = None
 # Focused gates in smoke-web's SKETERM_SMOKE_WEB_*_ONLY style: a set variable runs only its stage,
 # through `zig build smoke-web-untrusted` too (the ACK runner then selects nothing).
-FOCUS_GATES = {"SKETERM_SMOKE_WEB_UNTRUSTED_POST_ONLY": "test_25_post_request_bodies"}
+FOCUS_GATES = {
+    "SKETERM_SMOKE_WEB_UNTRUSTED_POST_ONLY": ("test_25_post_request_bodies",),
+    "SKETERM_SMOKE_WEB_UNTRUSTED_PROXY_ONLY": (
+        "test_26_proxy_http_route", "test_27_proxy_socks5h_route", "test_28_proxy_unreachable_fails_closed",
+        "test_29_proxy_serves_loopback_and_refuses_private", "test_30_trusted_view_on_proxy_route",
+        "test_31_tor_route_untrusted"),
+}
 
 
 def focused_tests():
-    return [test for variable, test in FOCUS_GATES.items() if variable in os.environ]
+    return [test for variable, tests in FOCUS_GATES.items() if variable in os.environ for test in tests]
 
 
 def require(condition, message):
@@ -135,7 +141,8 @@ class HTTPHandler(http.server.BaseHTTPRequestHandler):
         body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
         with self.server.lock:
             self.server.events.append(dict(path=parsed.path, method=self.command,
-                                           headers=dict(self.headers.items()), body=body))
+                                           headers=dict(self.headers.items()), body=body,
+                                           peer=self.client_address))
         if self.headers.get("Upgrade", "").lower() == "websocket":
             key = self.headers.get("Sec-WebSocket-Key", "")
             accept = base64.b64encode(hashlib.sha1(
@@ -292,6 +299,177 @@ class PacketFixture:
         self.stopping.set()
         self.thread.join(timeout=2)
         self.sock.close()
+
+
+class ProxyFixture:
+    """A forward proxy that logs every target it is asked for and decides, as
+    the consumer's proxy would, which hosts it serves: it resolves the page
+    host itself (names under PROXY_SUFFIX, render.localhost and 127.0.0.1 all
+    mean this machine) and relays only to `upstream_ports`. Everything else is
+    refused (HTTP 403, SOCKS reply 2). Every upstream connection's local port
+    is kept, so an origin can tell proxied requests from direct ones."""
+
+    SERVED_NAMES = ("render.localhost", "127.0.0.1")
+
+    def __init__(self, kind, upstream_ports, refused_hosts=()):
+        self.kind = kind
+        self.upstream_ports = set(upstream_ports)
+        self.refused_hosts = set(refused_hosts)
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(64)
+        self.sock.settimeout(0.1)
+        self.port = self.sock.getsockname()[1]
+        self.lock = threading.Lock()
+        self.targets = []
+        self.upstream_locals = set()
+        self.stopping = threading.Event()
+        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.thread.start()
+
+    def route(self):
+        return "proxy:%s://127.0.0.1:%d" % ("socks5h" if self.kind == "socks5h" else "http", self.port)
+
+    def run(self):
+        while not self.stopping.is_set():
+            try:
+                conn, _ = self.sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            threading.Thread(target=self.serve, args=(conn,), daemon=True).start()
+
+    def served(self, host, port):
+        return (host not in self.refused_hosts and port in self.upstream_ports and
+                (host.endswith(PROXY_SUFFIX) or host in self.SERVED_NAMES))
+
+    def record(self, **target):
+        with self.lock:
+            self.targets.append(target)
+
+    def upstream(self, port):
+        up = socket.create_connection(("127.0.0.1", port), timeout=5)
+        with self.lock:
+            self.upstream_locals.add(up.getsockname()[1])
+        return up
+
+    @staticmethod
+    def read_exact(conn, n):
+        data = b""
+        while len(data) < n:
+            chunk = conn.recv(n - len(data))
+            if not chunk:
+                raise ConnectionError("short read")
+            data += chunk
+        return data
+
+    @staticmethod
+    def relay(a, b):
+        def pump(src, dst):
+            try:
+                while True:
+                    data = src.recv(65536)
+                    if not data:
+                        break
+                    dst.sendall(data)
+            except OSError:
+                pass
+            finally:
+                try:
+                    dst.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass
+        other = threading.Thread(target=pump, args=(b, a), daemon=True)
+        other.start()
+        pump(a, b)
+        other.join(timeout=15)
+
+    def serve(self, conn):
+        conn.settimeout(15)
+        try:
+            if self.kind == "socks5h":
+                self.serve_socks(conn)
+            else:
+                self.serve_http(conn)
+        except (OSError, ConnectionError, ValueError):
+            pass
+        finally:
+            conn.close()
+
+    def serve_socks(self, conn):
+        version, count = self.read_exact(conn, 2)
+        self.read_exact(conn, count)
+        conn.sendall(b"\x05\x00")
+        version, command, _, atyp = self.read_exact(conn, 4)
+        if atyp == 3:
+            host = self.read_exact(conn, self.read_exact(conn, 1)[0]).decode()
+        elif atyp == 1:
+            host = socket.inet_ntop(socket.AF_INET, self.read_exact(conn, 4))
+        else:
+            host = socket.inet_ntop(socket.AF_INET6, self.read_exact(conn, 16))
+        port = struct.unpack("!H", self.read_exact(conn, 2))[0]
+        self.record(kind="socks5", atyp=atyp, host=host, port=port, command=command)
+        if command != 1 or not self.served(host, port):
+            conn.sendall(b"\x05\x02\x00\x01" + b"\x00" * 6)
+            return
+        up = self.upstream(port)
+        conn.sendall(b"\x05\x00\x00\x01" + b"\x00" * 6)
+        try:
+            self.relay(conn, up)
+        finally:
+            up.close()
+
+    def serve_http(self, conn):
+        head = b""
+        while b"\r\n\r\n" not in head:
+            chunk = conn.recv(65536)
+            if not chunk:
+                return
+            head += chunk
+        line, _, rest = head.partition(b"\r\n")
+        method, target, version = line.decode("latin-1").split(" ", 2)
+        if method == "CONNECT":
+            host, _, port = target.rpartition(":")
+            host = host.strip("[]")
+            self.record(kind="connect", method=method, host=host, port=int(port), target=target)
+            if not self.served(host, int(port)):
+                conn.sendall(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                return
+            up = self.upstream(int(port))
+            conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            leftover = rest.partition(b"\r\n\r\n")[2]
+            if leftover:
+                up.sendall(leftover)
+        else:
+            url = urlsplit(target)
+            host, port = url.hostname or "", url.port or 80
+            self.record(kind="forward", method=method, host=host, port=port, target=target)
+            if url.scheme != "http" or not self.served(host, port):
+                conn.sendall(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                return
+            path = url.path or "/"
+            if url.query:
+                path += "?" + url.query
+            up = self.upstream(port)
+            up.sendall(("%s %s %s\r\n" % (method, path, version)).encode("latin-1") + rest)
+        try:
+            self.relay(conn, up)
+        finally:
+            up.close()
+
+    def matching(self, host):
+        with self.lock:
+            return [t for t in self.targets if t["host"] == host]
+
+    def close(self):
+        self.stopping.set()
+        self.thread.join(timeout=2)
+        self.sock.close()
+
+
+# Page hosts the proxy route tests use: resolvable nowhere but at the proxy.
+PROXY_SUFFIX = ".sk-proxy.test"
 
 
 def process_info(pid):
@@ -702,7 +880,8 @@ class WebUntrustedTests(unittest.TestCase):
     def path(self, label):
         return "/%s/%s" % (self.token, label)
 
-    def open(self, untrusted=False, url=None, hosts=None, private=True, schemes=None, policy_patch=None, profile=None, **extra):
+    def open(self, untrusted=False, url=None, hosts=None, private=True, schemes=None, policy_patch=None, profile=None,
+             route="direct", **extra):
         url = url or self.p1.url("/page/" + self.token)
         hosts = hosts if hosts is not None else ["127.0.0.1:%d" % self.p1.server_port]
         policy = dict(allow_hosts=hosts, allow_private_addresses=private, block_ads=False)
@@ -714,7 +893,8 @@ class WebUntrustedTests(unittest.TestCase):
         require(not untrusted or profile is None, "Untrusted fixtures cannot use persistent profiles")
         identity = dict(ephemeral=True) if profile is None else dict(profile=profile)
         facts = self.mcp.tool("web_open", url=url, snapshot="none", **identity,
-                              route="direct", policy=policy, timeout_ms=20000, **extra)
+                              route=route, policy=policy, timeout_ms=20000, **extra)
+        self.assertEqual(facts["route"], route, "Open did not echo its route: %r" % facts)
         require(facts["backend"] == "headless" and facts["profile_kind"] == ("ephemeral" if profile is None else "named"), facts)
         require(facts.get("untrusted") is untrusted, "Open did not echo its actual mode: %r" % facts)
         require(not facts.get("load_error") and not facts.get("loading"), "Fixture did not load: %r" % facts)
@@ -726,7 +906,7 @@ class WebUntrustedTests(unittest.TestCase):
             self.assertIs(caps["web_untrusted_mode"], True)
             enforced = self.mcp.tool("web_policy", pane=pane)["enforced"]
             self.assertEqual(enforced["internet_sockets"], "denied")
-            self.assertEqual(enforced["http_broker"], "actual-address-validated")
+            self.assertEqual(enforced["http_broker"], "actual-address-validated" if route == "direct" else "route-proxy-only")
             for key in ("service_workers", "websockets", "webrtc", "extensions", "ranges"):
                 self.assertIs(enforced[key], False)
             self.assertEqual(enforced["methods"], "GET/HEAD and same-origin POST only")
@@ -1929,6 +2109,197 @@ return {ok:loaded && text!==null, loaded, echo_len:text===null?null:text.length,
         self.assertEqual(failures, [], "\n".join(failures))
 
 
+    # ---- caller-given proxy routes (and Tor) --------------------------------
+
+    def proxy(self, kind, refused_hosts=()):
+        fixture = ProxyFixture(kind, upstream_ports=(self.p1.server_port,), refused_hosts=refused_hosts)
+        self.addCleanup(fixture.close)
+        return fixture
+
+    def proxied_page(self, label):
+        """A page with same-origin script, stylesheet and image subresources."""
+        page = "/page/%s-%s" % (self.token, label)
+        script = self.path("%s-script.js" % label)
+        style = self.path("%s-style.css" % label)
+        image = self.path("%s-pixel.png" % label)
+        self.p1.asset(page, ("""<!doctype html><html><head><meta charset="utf-8">
+<title>Untrusted integration fixture</title><link rel="stylesheet" href="%s">
+<script src="%s?marker=proxy_marker"></script></head><body><img id="pixel" src="%s"></body></html>"""
+                             % (style, script, image)).encode(), "text/html; charset=utf-8")
+        return page, (page, script, style, image)
+
+    def assert_subresources(self, pane):
+        loaded = self.mcp.evaluate(pane, """
+const img=document.getElementById('pixel');
+if(!img.complete) await new Promise(r=>{img.onload=img.onerror=r; setTimeout(r,5000);});
+return {script:globalThis.proxy_marker===true, style:getComputedStyle(document.body).getPropertyValue('--cdn-control').trim(),
+        image:img.naturalWidth};""")
+        self.assertEqual(loaded, {"script": True, "style": "applied", "image": 1}, "Subresources did not load")
+
+    def assert_only_proxied(self, proxy, paths):
+        """Every origin request for `paths` came over one of the proxy's own
+        upstream connections: the origin saw no direct connection at all."""
+        events = [e for path in paths for e in self.p1.matching(path)]
+        self.assertGreaterEqual(len(events), len(paths), "Origin missed requests: %r" % events)
+        with proxy.lock:
+            upstream = set(proxy.upstream_locals)
+        direct = [e for e in events if e["peer"][1] not in upstream]
+        self.assertEqual(direct, [], "Origin saw a connection the proxy did not make")
+        return events
+
+    def assert_untrusted_helper_routed(self, proxy_url):
+        # The cleanup owner's argv is the helper's as launched; CEF moves the
+        # browser's own switches ahead of their values.
+        supervisor, _, _ = self.mcp.untrusted_helper()
+        argv = supervisor["argv"]
+        self.assertIn("--proxy", argv)
+        self.assertEqual(argv[argv.index("--proxy") + 1], proxy_url)
+
+    def assert_refused(self, result, what):
+        """No page: a tool refusal, a load error, or the proxy's own 403
+        page (a forwarding proxy answers its refusal as a response)."""
+        facts = result.get("structuredContent", {})
+        status = (facts.get("navigation") or {}).get("status")
+        self.assertTrue(result.get("isError") or facts.get("load_error") or status == 403,
+                        "%s loaded: %r" % (what, result))
+
+    def test_26_proxy_http_route(self):
+        """Untrusted view, proxy:http: page + subresources through the proxy, by hostname, nothing direct."""
+        proxy = self.proxy("http")
+        host = "origin" + PROXY_SUFFIX
+        page, paths = self.proxied_page("http")
+        url = self.p1.url(page, host=host)
+        pane = self.open(untrusted=True, url=url, hosts=["%s:%d" % (host, self.p1.server_port)],
+                         private=False, route=proxy.route())
+        self.assert_subresources(pane)
+        self.assert_untrusted_helper_routed("http://127.0.0.1:%d" % proxy.port)
+        self.assert_only_proxied(proxy, paths)
+        with proxy.lock:
+            targets = list(proxy.targets)
+        self.assertGreaterEqual(len(targets), len(paths), targets)
+        # DNS was the proxy's job: every target is the page's NAME, as an
+        # absolute-form request line.
+        for target in targets:
+            self.assertEqual((target["kind"], target["host"]), ("forward", host), target)
+            self.assertTrue(target["target"].startswith("http://%s:%d/" % (host, self.p1.server_port)), target)
+        print("\nproxy:http targets: %s" % json.dumps([t["target"] for t in targets]), file=sys.stderr)
+
+    def test_27_proxy_socks5h_route(self):
+        """Untrusted view, proxy:socks5h: the SOCKS request carries the domain (ATYP 3)."""
+        proxy = self.proxy("socks5h")
+        host = "socks" + PROXY_SUFFIX
+        page, paths = self.proxied_page("socks")
+        url = self.p1.url(page, host=host)
+        pane = self.open(untrusted=True, url=url, hosts=["%s:%d" % (host, self.p1.server_port)],
+                         private=False, route=proxy.route())
+        self.assert_subresources(pane)
+        self.assert_untrusted_helper_routed("socks5://127.0.0.1:%d" % proxy.port)
+        self.assert_only_proxied(proxy, paths)
+        with proxy.lock:
+            targets = list(proxy.targets)
+        self.assertGreaterEqual(len(targets), len(paths), targets)
+        for target in targets:
+            self.assertEqual((target["atyp"], target["host"], target["port"]), (3, host, self.p1.server_port), target)
+        print("\nproxy:socks5h targets: %s" % json.dumps(targets), file=sys.stderr)
+
+    def test_28_proxy_unreachable_fails_closed(self):
+        """An unreachable proxy fails the load; the origin gets no direct hit."""
+        dead = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        dead.bind(("127.0.0.1", 0))
+        dead_port = dead.getsockname()[1]
+        dead.close()
+        for untrusted in (True, False):
+            with self.subTest(untrusted=untrusted):
+                page = "/page/%s-unreachable-%s" % (self.token, untrusted)
+                url = self.p1.url(page)
+                result = self.mcp.raw_tool("web_open", url=url, snapshot="none", ephemeral=True,
+                                           route="proxy:http://127.0.0.1:%d" % dead_port, timeout_ms=15000,
+                                           policy=dict(untrusted=untrusted, allow_hosts=["127.0.0.1:%d" % self.p1.server_port],
+                                                       allow_private_addresses=False, block_ads=False))
+                facts = result.get("structuredContent", {})
+                self.assertTrue(result.get("isError") or facts.get("load_error"),
+                                "A load through an unreachable proxy succeeded: %r" % result)
+                pane = facts.get("view")
+                self.assert_no_hits(self.p1, page)
+                if pane is not None:
+                    self.mcp.tool("web_close", pane=pane)
+
+    def test_29_proxy_serves_loopback_and_refuses_private(self):
+        """The consumer's case: a loopback origin served BY the proxy loads with
+        allow_private_addresses false; a private origin the proxy refuses has no other path."""
+        proxy = self.proxy("http", refused_hosts=("private" + PROXY_SUFFIX,))
+        for host in ("render.localhost", "127.0.0.1"):
+            with self.subTest(host=host):
+                page, paths = self.proxied_page(host.replace(".", "-"))
+                pane = self.open(untrusted=True, url=self.p1.url(page, host=host),
+                                 hosts=["%s:%d" % (host, self.p1.server_port)], private=False, route=proxy.route())
+                self.assert_subresources(pane)
+                self.assert_only_proxied(proxy, paths)
+                self.assertTrue(proxy.matching(host), "The proxy never saw %s" % host)
+                self.mcp.tool("web_close", pane=pane)
+        # Not served by the proxy: refused there, and no other path exists
+        # (the broker dials the proxy alone; p2 listens on loopback and must
+        # see nothing). One refused by name, one by port.
+        for host, server in (("private" + PROXY_SUFFIX, self.p1), ("127.0.0.1", self.p2)):
+            with self.subTest(refused=host, port=server.server_port):
+                page = "/page/%s-refused-%s" % (self.token, uuid.uuid4().hex[:8])
+                result = self.mcp.raw_tool("web_open", url=server.url(page, host=host), snapshot="none", ephemeral=True,
+                                           route=proxy.route(), timeout_ms=15000,
+                                           policy=dict(untrusted=True, allow_hosts=["%s:%d" % (host, server.server_port)],
+                                                       allow_private_addresses=False, block_ads=False))
+                facts = result.get("structuredContent", {})
+                self.assert_refused(result, "A page the proxy refused")
+                self.assert_no_hits(server, page)
+                self.assertTrue(proxy.matching(host), "The refused page never reached the proxy: %r" % proxy.targets)
+                if facts.get("view") is not None:
+                    self.mcp.tool("web_close", pane=facts["view"])
+
+    def test_30_trusted_view_on_proxy_route(self):
+        """A trusted (Chromium-networked) headless view on proxy:http and proxy:socks5h goes through the proxy too."""
+        for kind in ("http", "socks5h"):
+            with self.subTest(kind=kind):
+                proxy = self.proxy(kind)
+                host = "trusted-%s%s" % (kind, PROXY_SUFFIX)
+                page, paths = self.proxied_page("trusted-" + kind)
+                pane = self.open(untrusted=False, url=self.p1.url(page, host=host),
+                                 hosts=["%s:%d" % (host, self.p1.server_port)], private=False, route=proxy.route())
+                self.assert_subresources(pane)
+                self.assert_only_proxied(proxy, paths)
+                mine = proxy.matching(host)
+                self.assertTrue(mine, "Chromium never asked the proxy for %s: %r" % (host, proxy.targets))
+                if kind == "socks5h":
+                    self.assertTrue(all(t["atyp"] == 3 for t in mine), mine)
+                self.mcp.tool("web_close", pane=pane)
+
+    def test_31_tor_route_untrusted(self):
+        """Tor falls out of the same broker path: an untrusted view on route tor dials the
+        configured SOCKS5 endpoint with remote DNS, and nothing else."""
+        proxy = self.proxy("socks5h")
+        config = self.root / "c" / "sketerm"
+        config.mkdir(mode=0o700, exist_ok=True)
+        (config / "config.conf").write_text("mux_tor_socks_endpoint = 127.0.0.1:%d\n" % proxy.port)
+        host = "onion" + PROXY_SUFFIX
+        page, paths = self.proxied_page("tor")
+        pane = self.open(untrusted=True, url=self.p1.url(page, host=host),
+                         hosts=["%s:%d" % (host, self.p1.server_port)], private=False, route="tor")
+        self.assert_subresources(pane)
+        self.assert_untrusted_helper_routed("socks5://127.0.0.1:%d" % proxy.port)
+        self.assert_only_proxied(proxy, paths)
+        with proxy.lock:
+            targets = list(proxy.targets)
+        for target in targets:
+            self.assertEqual((target["atyp"], target["host"]), (3, host), target)
+        # Tor is no address authority: a private literal stays refused locally.
+        page = "/page/%s-tor-literal" % self.token
+        result = self.mcp.raw_tool("web_open", url=self.p1.url(page), snapshot="none", ephemeral=True, route="tor",
+                                   timeout_ms=15000, policy=dict(untrusted=True, allow_hosts=["127.0.0.1:%d" % self.p1.server_port],
+                                                                 allow_private_addresses=False, block_ads=False))
+        navigation = result.get("structuredContent", {}).get("navigation") or {}
+        self.assertEqual((navigation.get("outcome"), navigation.get("blocked_reason")), ("blocked", "private_address"), result)
+        self.assert_no_hits(self.p1, page)
+        self.assertFalse(proxy.matching("127.0.0.1"), "A refused private literal reached the Tor endpoint")
+
+
 class PacketContext(PacketFixture):
     def __enter__(self):
         return self
@@ -2050,6 +2421,46 @@ class RigUnitTests(unittest.TestCase):
                 finally:
                     client.close()
                 self.assertGreater(len(fixture.matching(path, "GET")), 0)
+
+    def test_proxy_fixture_logs_names_and_relays_only_what_it_serves(self):
+        origin = HTTPFixture()
+        self.addCleanup(origin.close)
+        for kind in ("http", "socks5h"):
+            proxy = ProxyFixture(kind, upstream_ports=(origin.server_port,), refused_hosts=("private" + PROXY_SUFFIX,))
+            self.addCleanup(proxy.close)
+            for host, served in (("origin" + PROXY_SUFFIX, True), ("private" + PROXY_SUFFIX, False)):
+                path = "/rig-%s-%s" % (kind, host)
+                conn = socket.create_connection(("127.0.0.1", proxy.port), timeout=5)
+                with conn:
+                    if kind == "http":
+                        conn.sendall(("GET http://%s:%d%s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n"
+                                      % (host, origin.server_port, path, host)).encode())
+                    else:
+                        conn.sendall(b"\x05\x01\x00")
+                        self.assertEqual(ProxyFixture.read_exact(conn, 2), b"\x05\x00")
+                        conn.sendall(b"\x05\x01\x00\x03" + bytes([len(host)]) + host.encode() +
+                                     struct.pack("!H", origin.server_port))
+                        reply = ProxyFixture.read_exact(conn, 10)
+                        self.assertEqual(reply[1], 0 if served else 2)
+                        if served:
+                            conn.sendall(("GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n" % (path, host)).encode())
+                    data = b""
+                    while True:
+                        chunk = conn.recv(65536)
+                        if not chunk:
+                            break
+                        data += chunk
+                events = origin.matching(path)
+                if served:
+                    self.assertTrue(data.startswith(b"HTTP/1.0 200") or data.startswith(b"HTTP/1.1 200"), data[:40])
+                    self.assertEqual(len(events), 1)
+                    self.assertIn(events[0]["peer"][1], proxy.upstream_locals)
+                else:
+                    self.assertEqual(events, [])
+                record = proxy.matching(host)[-1]
+                self.assertEqual(record["host"], host)
+                if kind == "socks5h":
+                    self.assertEqual(record["atyp"], 3)
 
     def test_packet_fixture_answers_real_stun_and_counts_tcp(self):
         with PacketContext(udp=True) as fixture:
