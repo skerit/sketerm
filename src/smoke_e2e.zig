@@ -717,9 +717,7 @@ pub fn main() u8 {
             tor_line = std.fmt.bufPrint(&tor_line_buf, "mux_tor_socks_endpoint = 127.0.0.1:{d}\n", .{tor_stub.lis.port}) catch return fail("tor line");
         }
         var config_buf: [512]u8 = undefined;
-        const config_text = std.fmt.bufPrint(&config_buf, "# smoke-e2e\napp_view = window\ngraphics_offload = true\n{s}{s}{s}{s}", .{
-            // The editor-ops stage drives a command rebound here.
-            editorops_stage.CONFIG_LINE,
+        const config_text = std.fmt.bufPrint(&config_buf, "# smoke-e2e\napp_view = window\ngraphics_offload = true\n{s}{s}{s}", .{
             if (c.getenv("SKETERM_SMOKE_E2E_FILES_ICONS") != null) "files_default_view = icons\n" else "",
             // The quake stage drives `sketerm --toggle` against a window
             // that was placed by quake config from its first map.

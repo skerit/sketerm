@@ -3,7 +3,7 @@
 //! document back (`get-text`).
 //!
 //! Covered: a command REBOUND in config.conf (`editor_keybind.join_lines
-//! = <Control><Alt>j`, written by the rig) runs on its new chord and no
+//! = <Control><Alt>j`, written by this stage) runs on its new chord and no
 //! longer on its default; the find bar's Replace All (Ctrl+H, Tab to the
 //! replace entry, Ctrl+Alt+Enter) is one undo step; Go to Line (Ctrl+G)
 //! puts the caret on the line typed; a fold (Ctrl+Shift+[) is stepped
@@ -16,8 +16,44 @@ const c = @import("../c.zig").c;
 const appdrive = @import("../ipc/appdrive.zig");
 const el = @import("editorlang.zig");
 
-/// What the rig writes into config.conf for this stage.
-pub const CONFIG_LINE = "editor_keybind.join_lines = <Control><Alt>j\n";
+/// What this stage adds to config.conf for its rebound command.
+const CONFIG_LINE = "editor_keybind.join_lines = <Control><Alt>j\n";
+
+/// The stage's own `join_lines` binding, added to whatever config.conf
+/// holds now and taken back out afterwards: earlier full-run stages
+/// (config reload, workspace, editor atlas) reset that file, so a line
+/// written at rig start does not survive to here.
+const Rebind = struct {
+    path: [:0]const u8,
+    /// The file as it was, null when there was none.
+    prior: ?[]u8,
+
+    fn install(ctx: *el.Ctx, rt: []const u8) ?Rebind {
+        const a = ctx.a();
+        const path = std.fmt.allocPrintSentinel(a, "{s}/sketerm/config.conf", .{rt}, 0) catch return null;
+        const prior = readFile(a, path);
+        // readFile caps at 4 KiB; a cut copy must never be written back.
+        if (prior) |p| if (p.len >= 4096) return null;
+        const body = std.mem.concat(a, u8, &.{ prior orelse "", CONFIG_LINE }) catch return null;
+        if (!el.writeFile(path, body)) return null;
+        if (!reload(ctx)) return null;
+        return .{ .path = path, .prior = prior };
+    }
+
+    fn restore(self: Rebind, ctx: *el.Ctx) void {
+        if (self.prior) |body| {
+            _ = el.writeFile(self.path, body);
+        } else _ = c.unlink(self.path.ptr);
+        _ = reload(ctx);
+    }
+
+    /// `reload_config` applies synchronously, so the binding is live once
+    /// it answers (the file watcher's own reload changes nothing after).
+    fn reload(ctx: *el.Ctx) bool {
+        const r = ctx.roundtrip("{\"cmd\":\"action\",\"data\":\"reload_config\"}\n") orelse return false;
+        return std.mem.indexOf(u8, r, "\"ok\":true") != null;
+    }
+};
 
 /// Poll until the document is exactly `want`.
 fn waitText(ctx: *el.Ctx, pane: u32, want: []const u8, what: []const u8) ?[]const u8 {
@@ -96,6 +132,8 @@ pub fn stage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]const u
         return "could not write the editor-ops fixtures";
 
     // ---- a command rebound in config.conf
+    const rebind = Rebind.install(&ctx, rt) orelse return "could not rebind join_lines in config.conf";
+    defer rebind.restore(&ctx);
     {
         const pane = ctx.open(join) orelse return "new-editor-tab for join.txt failed";
         _ = ctx.waitInfo(pane, 0) orelse return "join.txt never finished loading";
