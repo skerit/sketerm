@@ -748,6 +748,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         say("smoke-mcp: focused headless browsing profiles ok");
         return 0;
     }
+    if (c.getenv("SKETERM_SMOKE_MCP_WEBGUI_ONLY") != null) {
+        webGuiGrantStage(allocator, exe, rt);
+        say("smoke-mcp: focused web_gui grant ok");
+        return 0;
+    }
     if (c.getenv("SKETERM_SMOKE_MCP_WEBPOLICY_ONLY") != null) {
         _ = c.setenv("SKETERM_WEB_BROKER_ENGINE", "0", 1);
         defer _ = c.unsetenv("SKETERM_WEB_BROKER_ENGINE");
@@ -2480,42 +2485,77 @@ fn fakeGui(rt: []const u8) u8 {
     if (c.listen(lfd, 8) != 0) return 1;
     defer _ = c.unlink(sock.ptr);
 
-    var next_pane: u32 = 41;
-    var open_urls: [8][512]u8 = undefined;
-    var open_lens: [8]usize = @splat(0);
-    var open_n: usize = 0;
+    // Like the real GUI (`ipc/server.zig`), a connection stays open and
+    // carries any number of request lines until the CLIENT closes it, and
+    // several connections (the MCP's kept-alive one, liveness probes) are
+    // served side by side.
+    const Client = struct { fd: c_int = -1, buf: [8192]u8 = undefined, len: usize = 0 };
+    var clients: [8]Client = @splat(.{});
+    var state: FakeGuiState = .{};
     const deadline = nowMs() + 90_000;
     while (nowMs() < deadline) {
-        var pfd = c.struct_pollfd{ .fd = lfd, .events = c.POLLIN, .revents = 0 };
-        if (c.poll(&pfd, 1, 200) <= 0) continue;
-        const fd = c.accept(lfd, null, null);
-        if (fd < 0) continue;
-        defer _ = c.close(fd);
-        var req: [8192]u8 = undefined;
-        var req_len: usize = 0;
-        const line_deadline = nowMs() + 2_000;
-        while (std.mem.indexOfScalar(u8, req[0..req_len], '\n') == null and nowMs() < line_deadline) {
-            var cp = c.struct_pollfd{ .fd = fd, .events = c.POLLIN, .revents = 0 };
-            if (c.poll(&cp, 1, 100) <= 0) continue;
-            const n = c.read(fd, req[req_len..].ptr, req.len - req_len);
-            if (n <= 0) break;
-            req_len += @intCast(n);
-        }
-        // A liveness probe connects and sends nothing: not a request.
-        if (req_len == 0) continue;
-        const line = req[0..req_len];
-        _ = c.fwrite(line.ptr, 1, line.len, log);
-        if (line[line.len - 1] != '\n') _ = c.fwrite("\n", 1, 1, log);
-        _ = c.fflush(log);
-        var out: [8192]u8 = undefined;
-        var w = std.Io.Writer.fixed(&out);
-        if (std.mem.indexOf(u8, line, "\"cmd\":\"web-list\"") != null) {
-            w.writeAll("{\"ok\":true,\"helper\":\"ready\",\"views\":[") catch return 1;
-            for (0..open_n) |i| {
-                if (i > 0) w.writeAll(",") catch return 1;
-                w.print("{{\"pane\":{d},\"view\":{d},\"url\":\"{s}\",\"title\":\"fake gui\",\"loading\":false,\"load_seq\":1,\"visible\":true,\"focused\":true}}", .{ 41 + i, 41 + i, open_urls[i][0..open_lens[i]] }) catch return 1;
+        var pfds: [1 + clients.len]c.struct_pollfd = undefined;
+        pfds[0] = .{ .fd = lfd, .events = c.POLLIN, .revents = 0 };
+        for (clients, 0..) |cl, i| pfds[1 + i] = .{ .fd = cl.fd, .events = c.POLLIN, .revents = 0 };
+        if (c.poll(&pfds, pfds.len, 200) <= 0) continue;
+        if (pfds[0].revents & c.POLLIN != 0) {
+            const fd = c.accept(lfd, null, null);
+            if (fd >= 0) {
+                for (&clients) |*cl| {
+                    if (cl.fd < 0) {
+                        cl.* = .{ .fd = fd };
+                        break;
+                    }
+                } else _ = c.close(fd);
             }
-            w.writeAll("]}") catch return 1;
+        }
+        for (&clients, 1..) |*cl, i| {
+            if (cl.fd < 0 or pfds[i].revents == 0) continue;
+            const n = c.read(cl.fd, cl.buf[cl.len..].ptr, cl.buf.len - cl.len);
+            if (n <= 0) {
+                // EOF: the client hung up (a liveness probe sends nothing).
+                _ = c.close(cl.fd);
+                cl.fd = -1;
+                continue;
+            }
+            cl.len += @intCast(n);
+            while (std.mem.indexOfScalar(u8, cl.buf[0..cl.len], '\n')) |end| {
+                const line = cl.buf[0 .. end + 1];
+                _ = c.fwrite(line.ptr, 1, line.len, log);
+                _ = c.fflush(log);
+                var out: [8192]u8 = undefined;
+                var w = std.Io.Writer.fixed(&out);
+                state.answer(line, &w) catch return 1;
+                w.writeAll("\n") catch return 1;
+                _ = c.write(cl.fd, w.buffered().ptr, w.buffered().len);
+                const rest = cl.len - (end + 1);
+                std.mem.copyForwards(u8, cl.buf[0..rest], cl.buf[end + 1 .. cl.len]);
+                cl.len = rest;
+            }
+            if (cl.len == cl.buf.len) {
+                _ = c.close(cl.fd);
+                cl.fd = -1;
+            }
+        }
+    }
+    return 0;
+}
+
+/// The fake GUI's tabs: what `web-list` reports and `web-open` adds.
+const FakeGuiState = struct {
+    next_pane: u32 = 41,
+    open_urls: [8][512]u8 = undefined,
+    open_lens: [8]usize = @splat(0),
+    open_n: usize = 0,
+
+    fn answer(self: *FakeGuiState, line: []const u8, w: *std.Io.Writer) !void {
+        if (std.mem.indexOf(u8, line, "\"cmd\":\"web-list\"") != null) {
+            try w.writeAll("{\"ok\":true,\"helper\":\"ready\",\"views\":[");
+            for (0..self.open_n) |i| {
+                if (i > 0) try w.writeAll(",");
+                try w.print("{{\"pane\":{d},\"view\":{d},\"url\":\"{s}\",\"title\":\"fake gui\",\"loading\":false,\"load_seq\":1,\"visible\":true,\"focused\":true}}", .{ 41 + i, 41 + i, self.open_urls[i][0..self.open_lens[i]] });
+            }
+            try w.writeAll("]}");
         } else if (std.mem.indexOf(u8, line, "\"cmd\":\"web-open\"") != null) {
             const key = "\"data\":\"";
             var url: []const u8 = "about:blank";
@@ -2523,22 +2563,19 @@ fn fakeGui(rt: []const u8) u8 {
                 const rest = line[at + key.len ..];
                 if (std.mem.indexOfScalar(u8, rest, '"')) |end| url = rest[0..end];
             }
-            if (open_n < open_urls.len) {
+            if (self.open_n < self.open_urls.len) {
                 const n = @min(url.len, 512);
-                @memcpy(open_urls[open_n][0..n], url[0..n]);
-                open_lens[open_n] = n;
-                open_n += 1;
+                @memcpy(self.open_urls[self.open_n][0..n], url[0..n]);
+                self.open_lens[self.open_n] = n;
+                self.open_n += 1;
             }
-            w.print("{{\"ok\":true,\"pane\":{d}}}", .{next_pane}) catch return 1;
-            next_pane += 1;
+            try w.print("{{\"ok\":true,\"pane\":{d}}}", .{self.next_pane});
+            self.next_pane += 1;
         } else {
-            w.writeAll("{\"ok\":false,\"error\":\"fake gui: unsupported command\"}") catch return 1;
+            try w.writeAll("{\"ok\":false,\"error\":\"fake gui: unsupported command\"}");
         }
-        w.writeAll("\n") catch return 1;
-        _ = c.write(fd, w.buffered().ptr, w.buffered().len);
     }
-    return 0;
-}
+};
 
 /// Start a fake GUI as our own child (the "already running" case) and
 /// wait for its control socket. Returns its pid.
