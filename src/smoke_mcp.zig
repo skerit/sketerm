@@ -2914,11 +2914,8 @@ fn readerIdBefore(hay: []const u8, needle: []const u8) ?u32 {
 /// there is a silent no-op — so an isolation test written against the
 /// smoke page's file URL would pass on an engine that isolates nothing.
 const TinyHttp = struct {
-    fd: c_int = -1,
-    port: u16 = 0,
-    thread: ?std.Thread = null,
-    /// The one document served, whatever the path; a stage that needs
-    /// its own page sets it before `spawn`.
+    lis: tcpserver.Listener = .{ .backlog = 16, .poll_ms = 100 },
+    /// The one document served, whatever the path.
     body: []const u8 = BODY,
     /// One path served as a DOWNLOADABLE attachment (octet-stream +
     /// Content-Disposition) instead of a document; empty = none. The
@@ -2931,78 +2928,29 @@ const TinyHttp = struct {
         "<html><head><title>Profile Origin</title></head><body>" ++
         "<h1>PROFILE-ORIGIN</h1><p id=p>cookie probe page</p></body></html>";
 
-    fn start() ?TinyHttp {
-        var self = TinyHttp{};
-        self.fd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
-        if (self.fd < 0) return null;
-        var one: c_int = 1;
-        _ = c.setsockopt(self.fd, c.SOL_SOCKET, c.SO_REUSEADDR, &one, @sizeOf(c_int));
-        var sa = std.mem.zeroes(c.struct_sockaddr_in);
-        sa.sin_family = c.AF_INET;
-        sa.sin_port = 0;
-        sa.sin_addr.s_addr = std.mem.nativeToBig(u32, c.INADDR_LOOPBACK);
-        if (c.bind(self.fd, @ptrCast(&sa), @sizeOf(c.struct_sockaddr_in)) != 0 or
-            c.listen(self.fd, 16) != 0)
-        {
-            _ = c.close(self.fd);
-            return null;
-        }
-        var got = std.mem.zeroes(c.struct_sockaddr_in);
-        var glen: c.socklen_t = @sizeOf(c.struct_sockaddr_in);
-        if (c.getsockname(self.fd, @ptrCast(&got), &glen) != 0) {
-            _ = c.close(self.fd);
-            return null;
-        }
-        self.port = std.mem.bigToNative(u16, got.sin_port);
-        return self;
+    /// Bind and serve; the fields are read per request, so set them first.
+    fn start(self: *TinyHttp) bool {
+        return self.lis.start(self, &onConn);
     }
 
-    fn spawn(self: *TinyHttp) void {
-        self.thread = std.Thread.spawn(.{}, serve, .{self}) catch null;
+    fn port(self: *const TinyHttp) u16 {
+        return self.lis.port;
     }
 
-    /// One connection at a time is plenty: the browser asks for one
-    /// document per view. Ends when `deinit` closes the listener.
-    fn serve(self: *TinyHttp) void {
-        while (true) {
-            const cfd = c.accept(self.fd, null, null);
-            if (cfd < 0) return;
-            var req: [4096]u8 = undefined;
-            const got = c.read(cfd, &req, req.len);
-            const line = if (got > 0) req[0..@intCast(got)] else "";
-            const want_dl = self.dl_path.len != 0 and std.mem.indexOf(u8, line, self.dl_path) != null;
-            const payload = if (want_dl) self.dl_body else self.body;
-            var head: [320]u8 = undefined;
-            const hdr = if (want_dl)
-                std.fmt.bufPrint(
-                    &head,
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"served.bin\"\r\nContent-Length: {d}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
-                    .{payload.len},
-                ) catch return
-            else
-                std.fmt.bufPrint(
-                    &head,
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {d}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
-                    .{payload.len},
-                ) catch return;
-            // MSG_NOSIGNAL, never write(2): the browser closes a
-            // connection it already has the bytes for (favicon probes
-            // especially), and the SIGPIPE that follows would kill the
-            // smoke process rather than this one request.
-            _ = c.send(cfd, hdr.ptr, hdr.len, c.MSG_NOSIGNAL);
-            _ = c.send(cfd, payload.ptr, payload.len, c.MSG_NOSIGNAL);
-            _ = c.close(cfd);
+    fn onConn(ctx: ?*anyopaque, afd: c_int) bool {
+        const self: *TinyHttp = @ptrCast(@alignCast(ctx.?));
+        var req: [4096]u8 = undefined;
+        const line = tcpserver.readRequest(afd, &req, 3000);
+        if (self.dl_path.len != 0 and std.mem.indexOf(u8, line, self.dl_path) != null) {
+            tcpserver.respondOk(afd, "application/octet-stream", self.dl_body, "Content-Disposition: attachment; filename=\"served.bin\"\r\n");
+        } else {
+            tcpserver.respondOk(afd, "text/html", self.body, "");
         }
+        return false;
     }
 
     fn deinit(self: *TinyHttp) void {
-        if (self.fd >= 0) {
-            _ = c.shutdown(self.fd, c.SHUT_RDWR);
-            _ = c.close(self.fd);
-            self.fd = -1;
-        }
-        if (self.thread) |t| t.detach();
-        self.thread = null;
+        self.lis.deinit();
     }
 };
 
@@ -5077,13 +5025,11 @@ fn webStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) vo
     // file:// carries no cookies in Chromium, so the isolation checks
     // need a real origin or they would pass against an engine that
     // isolates nothing.
-    var http = TinyHttp.start() orelse fail("could not bind a loopback HTTP server for the profile checks");
+    var http: TinyHttp = .{ .dl_path = "/served.bin", .dl_body = DOWNLOAD_PAYLOAD };
+    if (!http.start()) fail("could not bind a loopback HTTP server for the profile checks");
     defer http.deinit();
-    http.dl_path = "/served.bin";
-    http.dl_body = DOWNLOAD_PAYLOAD;
-    http.spawn();
     var origin_buf: [64]u8 = undefined;
-    const origin = std.fmt.bufPrint(&origin_buf, "http://127.0.0.1:{d}/", .{http.port}) catch unreachable;
+    const origin = std.fmt.bufPrint(&origin_buf, "http://127.0.0.1:{d}/", .{http.port()}) catch unreachable;
     {
         m.sendTool("web_open", std.fmt.bufPrint(&args_buf, "{{\"url\":\"{s}\",\"profile\":\"smoke\"}}", .{origin}) catch unreachable);
         const opened_p = m.recvLine(60_000);
@@ -5168,7 +5114,7 @@ fn webStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) vo
         }
     }
 
-    webDownloadStage(&m, rt, http.port);
+    webDownloadStage(&m, rt, http.port());
     webEvalSizeStage(&m, rt);
 
     certStage(&m, rt);
@@ -5727,11 +5673,11 @@ fn webSharedProfileStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: [
     // exit-with-last-client that no longer happens.
     _ = c.setenv("SKETERM_WEB_LINGER_MS", "3000", 1);
     defer _ = c.unsetenv("SKETERM_WEB_LINGER_MS");
-    var http = TinyHttp.start() orelse fail("could not bind a loopback HTTP server for the shared-profile stage");
+    var http: TinyHttp = .{};
+    if (!http.start()) fail("could not bind a loopback HTTP server for the shared-profile stage");
     defer http.deinit();
-    http.spawn();
     var origin_buf: [64]u8 = undefined;
-    const origin = std.fmt.bufPrint(&origin_buf, "http://127.0.0.1:{d}/", .{http.port}) catch unreachable;
+    const origin = std.fmt.bufPrint(&origin_buf, "http://127.0.0.1:{d}/", .{http.port()}) catch unreachable;
     var args_buf: [1024]u8 = undefined;
 
     var a = Mcp.spawn(allocator, exe, &.{ "--name", "smokeshared" });
@@ -5855,12 +5801,11 @@ fn webPresenterStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []con
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var http = TinyHttp.start() orelse fail("could not bind a loopback HTTP server for the presenter stage");
+    var http: TinyHttp = .{ .body = PRESENTER_BODY };
+    if (!http.start()) fail("could not bind a loopback HTTP server for the presenter stage");
     defer http.deinit();
-    http.body = PRESENTER_BODY;
-    http.spawn();
     var url_buf: [96]u8 = undefined;
-    const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/presenter", .{http.port}) catch unreachable;
+    const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/presenter", .{http.port()}) catch unreachable;
 
     var m = Mcp.spawn(allocator, exe, &.{});
     m.initialize();
@@ -5925,11 +5870,11 @@ fn webPresenterStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []con
 fn webEngineLifecycleStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) void {
     _ = c.setenv("SKETERM_WEB_LINGER_MS", "4000", 1);
     defer _ = c.unsetenv("SKETERM_WEB_LINGER_MS");
-    var http = TinyHttp.start() orelse fail("could not bind a loopback HTTP server for the engine-lifecycle stage");
+    var http: TinyHttp = .{};
+    if (!http.start()) fail("could not bind a loopback HTTP server for the engine-lifecycle stage");
     defer http.deinit();
-    http.spawn();
     var origin_buf: [64]u8 = undefined;
-    const origin = std.fmt.bufPrint(&origin_buf, "http://127.0.0.1:{d}/", .{http.port}) catch unreachable;
+    const origin = std.fmt.bufPrint(&origin_buf, "http://127.0.0.1:{d}/", .{http.port()}) catch unreachable;
     var args_buf: [1024]u8 = undefined;
 
     // Generation A: cold engine, write the cookie, leave.
@@ -7870,13 +7815,11 @@ fn webPersistStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var http = TinyHttp.start() orelse fail("wp: could not bind the loopback origin");
+    var http: TinyHttp = .{ .dl_path = "/wp.bin", .dl_body = DOWNLOAD_PAYLOAD };
+    if (!http.start()) fail("wp: could not bind the loopback origin");
     defer http.deinit();
-    http.dl_path = "/wp.bin";
-    http.dl_body = DOWNLOAD_PAYLOAD;
-    http.spawn();
     var args: [2048]u8 = undefined;
-    const origin = std.fmt.allocPrint(arena, "http://127.0.0.1:{d}/", .{http.port}) catch unreachable;
+    const origin = std.fmt.allocPrint(arena, "http://127.0.0.1:{d}/", .{http.port()}) catch unreachable;
     const store_root = std.fmt.allocPrint(arena, "{s}/sketerm/web-profiles/anon", .{rt}) catch unreachable;
 
     var m = Mcp.spawn(allocator, exe, &.{});

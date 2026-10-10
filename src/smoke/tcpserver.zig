@@ -27,7 +27,8 @@ pub const Listener = struct {
     bind_port: u16 = 0,
 
     ctx: ?*anyopaque = null,
-    /// Called with each accepted fd. `Listener` closes the fd after it
+    /// Called with each accepted fd once it is readable or hung up (see
+    /// `serve`). `Listener` closes the fd after it
     /// returns; a handler that hands the fd to a worker thread must
     /// return true to keep it open.
     handler: ?*const fn (?*anyopaque, c_int) bool = null,
@@ -71,14 +72,46 @@ pub const Listener = struct {
         return true;
     }
 
+    /// Accepted connections held until their first byte (or hangup).
+    const MAX_PENDING = 32;
+
+    /// The handler runs only once a connection is readable: a browser
+    /// opens sockets it may never send on (preconnects, the idle pool of
+    /// a profile whose tabs closed), and handling one inline blocked
+    /// every later request behind it.
     fn serve(self: *Listener) void {
+        var pending: [MAX_PENDING]c_int = undefined;
+        var count: usize = 0;
+        defer for (pending[0..count]) |fd| {
+            _ = c.close(fd);
+        };
         while (!self.stop.load(.acquire)) {
-            var pfd = c.struct_pollfd{ .fd = self.fd, .events = c.POLLIN, .revents = 0 };
-            if (c.poll(@ptrCast(&pfd), 1, self.poll_ms) <= 0) continue;
+            var pfds: [1 + MAX_PENDING]c.struct_pollfd = undefined;
+            pfds[0] = .{ .fd = self.fd, .events = c.POLLIN, .revents = 0 };
+            for (pending[0..count], pfds[1 .. 1 + count]) |fd, *p| p.* = .{ .fd = fd, .events = c.POLLIN, .revents = 0 };
+            if (c.poll(&pfds, @intCast(1 + count), self.poll_ms) <= 0) continue;
+            // Downward, so removing entry i leaves the unvisited ones'
+            // poll slots where they were.
+            var i = count;
+            while (i > 0) {
+                i -= 1;
+                if (pfds[1 + i].revents == 0) continue;
+                const afd = pending[i];
+                std.mem.copyForwards(c_int, pending[i .. count - 1], pending[i + 1 .. count]);
+                count -= 1;
+                if (!self.handler.?(self.ctx, afd)) _ = c.close(afd);
+            }
+            if (pfds[0].revents & c.POLLIN == 0) continue;
             const afd = c.accept(self.fd, null, null);
             if (afd < 0) continue;
-            const keep = self.handler.?(self.ctx, afd);
-            if (!keep) _ = c.close(afd);
+            if (count == MAX_PENDING) {
+                // The longest-silent one makes room; its client retries.
+                _ = c.close(pending[0]);
+                std.mem.copyForwards(c_int, pending[0 .. count - 1], pending[1..count]);
+                count -= 1;
+            }
+            pending[count] = afd;
+            count += 1;
         }
     }
 
