@@ -1497,6 +1497,13 @@ fn probeMenuAt(allocator: std.mem.Allocator, points: []const Point, marker: []co
 
 fn editorChromeStage(allocator: std.mem.Allocator, rt: []const u8, sock_path: [:0]const u8) ?[]const u8 {
     const app = drive orelse return "the display session has no driver";
+    // The toplevel's width before the document opens: its status line
+    // fills with LSP messages (zls's version complaint, when zls is on
+    // PATH), and a status line that widened the window also moved the
+    // gutter out from under the probes below.
+    _ = app.drainLive(2_000);
+    if (app.windows.items.len == 0) return "the display session lost its window";
+    const w_before = app.windows.items[0].w;
     var path_buf: [512]u8 = undefined;
     const efile = std.fmt.bufPrintZ(&path_buf, "{s}/chrome.zig", .{rt}) catch return "chrome path";
     {
@@ -1534,6 +1541,11 @@ fn editorChromeStage(allocator: std.mem.Allocator, rt: []const u8, sock_path: [:
     _ = app.drainLive(2_000);
     if (app.windows.items.len == 0) return "the display session lost its window";
     const win = app.windows.items[0];
+    if (win.w != w_before) {
+        shotPopup(allocator, win.id, "/tmp/sketerm-atspi-editor-widened.png");
+        _ = c.fprintf(platform.stderr(), "smoke-atspi: window width %d -> %d\n", @as(c_int, @intCast(w_before)), @as(c_int, @intCast(win.w)));
+        return "the window changed width while the editor document opened (a status line must never widen it)";
+    }
     const w: f64 = @floatFromInt(win.w);
     const h: f64 = @floatFromInt(win.h);
     // Client-side decorations: frame_w is the toplevel width the a11y
@@ -1544,8 +1556,10 @@ fn editorChromeStage(allocator: std.mem.Allocator, rt: []const u8, sock_path: [:
     var probe_err: ?[]const u8 = null;
     var pts: [6]Point = undefined;
     for ([_]f64{ 4, 8, 12, 16, 22, 30 }, 0..) |dx, i| pts[i] = .{ .x = margin + dx, .y = h * 0.5 };
-    const gutter_id = probeMenuAt(allocator, &pts, "Select This Line", &probe_err) orelse
+    const gutter_id = probeMenuAt(allocator, &pts, "Select This Line", &probe_err) orelse {
+        shotPopup(allocator, win.id, "/tmp/sketerm-atspi-editor-gutter-miss.png");
         return probe_err orelse "right-clicking the editor gutter never opened the line menu";
+    };
     _ = app.waitVisualSettle(gutter_id, 300, 5_000, 0.002, null);
     shotPopup(allocator, gutter_id, "/tmp/sketerm-atspi-editor-gutter-menu.png");
 
