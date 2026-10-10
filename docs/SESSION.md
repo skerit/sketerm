@@ -1,5 +1,21 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-10: headless browser views lay out at their device scale again
+
+A headless-ozone helper (the GUI's browser on a host without a Wayland
+GPU path, MCP views with `SKETERM_WEB_SESSION=0`, the untrusted suite)
+reports the device scale as `get_screen_info` DPR over a logical view rect
+again, so `web_open device_scale_factor` holds from the first document and
+two views of one host keep their own scales. 8a26f5ef had moved headless
+onto zoom as well; Chromium keys zoom by host per profile, so a new host's
+first document laid out at dpr 1 with the physical size as its CSS
+viewport, and a scale-1 view switched a scale-2 view on the same host to
+dpr 1. `ozone.choose` now decides the lever; Wayland ozone keeps zoom,
+since it ignores screen-info DPR. Verification: `test_10` of
+`dist/test-web-untrusted.py` (12 failing subtests before) green 9/9
+focused, plus probes of first document, cross-host navigation and two
+views.
+
 ## 2026-10-09: a daemon takes its socket back after the runtime dir is removed
 
 On darkshire a 49-day-old daemon holding five shells became unreachable:
