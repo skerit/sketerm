@@ -1,5 +1,21 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-10: a closing window no longer feeds the AI-badge watcher
+
+A secondary window could SIGSEGV the whole GUI after it closed: the AI
+badge watcher's 3 s roster tick kept running until the deferred window
+free (which a pending page detach delays) and walked the window's
+disposed `AdwTabView` (`refreshTabGlances` -> `adw_tab_view_get_n_pages`).
+Its `widgets_dead` fence was meant to stop that, but the chip destroy that
+raised it cannot fire before `stop`, since the watcher holds its own
+reference on the chip. `Window.beginDestroy` now calls `Watcher.sever`,
+which raises the fence and stops the tick, the rescan timer and the
+registry monitor. Under `SKETERM_VERIFY_WINDOW_TEARDOWN` a rescan of a
+destroying window aborts, and smoke-e2e's theme-singleton stage (new
+gate `SKETERM_SMOKE_E2E_THEME_ONLY`) ticks the watcher every 100 ms
+through the test hook `SKETERM_ASSISTANTS_TICK_MS`: 6/6 aborts before,
+13/13 green after.
+
 ## 2026-10-10: proxy:<url> routes, for trusted and untrusted views
 
 A consumer rendering author HTML in an untrusted view wants all of that
