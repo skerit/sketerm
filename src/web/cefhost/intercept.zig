@@ -723,6 +723,22 @@ pub fn recordMainNavigationRefusal(view: u32, url: []const u8) void {
     };
 }
 
+/// CEF may commit the initial about:blank (or an error document) AFTER a
+/// navigation was refused. Clients clear their previous error on load-start;
+/// republish the retained refusal immediately after that event. An allowed
+/// navigation's preflight clears the latch, so it cannot inherit this error.
+pub fn navigationLoadStarted(self: *Host, view: u32) void {
+    {
+        g_int.acquire();
+        defer g_int.release();
+        for (&g_int.slots) |*slot| if (slot.used and slot.view_id == view) {
+            slot.refused_pending = slot.refused_main;
+            break;
+        };
+    }
+    flushNavigationRefusals(self);
+}
+
 fn flushNavigationRefusals(self: *Host) void {
     for (0..MAX_ISLOTS) |i| {
         var url: [proto.UNTRUSTED_URL_CAP]u8 = undefined;

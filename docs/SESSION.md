@@ -1,5 +1,15 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-11: guarded OAuth refusals survive late bootstrap loads
+
+CEF can commit a fresh view's initial `about:blank` after a blocked HTTP redirect
+has already emitted its destination. That load-start cleared the client's error,
+losing an otherwise correctly blocked OAuth callback. The helper now republishes
+the retained main-frame refusal immediately after load-start; a subsequent
+allowed navigation clears it. A deterministic callback-ordering regression pins
+the full long URL, and Autologin's native suite exercises repeated fresh-view
+redirects without contacting the loopback callback listener.
+
 ## 2026-10-10: the AI badge popover keeps its buttons across roster changes
 
 A click on the AI badge popover could be lost: every roster change

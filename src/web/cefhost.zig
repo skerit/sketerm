@@ -5037,6 +5037,72 @@ test "releaseArg returns exactly one reference and tolerates null" {
     try std.testing.expectEqual(@as(usize, 1), CallbackArgTest.released);
 }
 
+test "late bootstrap load-start retains a guarded redirect refusal until an allowed navigation" {
+    try std.testing.expect(apiHash());
+    CallbackArgTest.reset();
+    var out = proto.Outbox.init(std.testing.allocator);
+    defer out.deinit();
+    var host = Host.init(std.testing.allocator, &out);
+    defer host.deinit();
+    g_host = &host;
+    defer g_host = null;
+    const v = try host.registerView(ViewConstructionTest.req(95, 0));
+    v.cef_id = CallbackArgTest.cef_id;
+    host.setUrl(v, "about:blank");
+    host.netPolicySet(.{
+        .view = v.id,
+        .serial = 1,
+        .flags = 0,
+        .block_types = 0,
+        .allow_schemes = netpolicy.default_schemes,
+        .max_requests = 0,
+        .max_bytes = 0,
+        .max_navigations = 0,
+        .deadline_ms = 0,
+        .allow_top = &.{"auth.openai.com"},
+        .allow_sub = &.{},
+        .navigation_guard = "{\"hosts\":[{\"host\":\"auth.openai.com\"}]}",
+    });
+    const callback = "http://localhost:1455/auth/callback?state=fixture&code=" ++ "x" ** 1000;
+    host_icpt.recordMainNavigationRefusal(v.id, callback);
+    host.flushInterceptStatus();
+    while (out.front()) |msg| out.advance(msg.bytes.len);
+
+    // The IO refusal was already flushed before CEF commits its bootstrap
+    // document. The client must see another refusal AFTER the load-start that
+    // invalidates its previous error, preserving the full authorization URL.
+    onLoadStart(null, &CallbackArgTest.browser, &CallbackArgTest.frame, 0);
+    var started = false;
+    var refused = false;
+    while (out.front()) |msg| {
+        var reader = proto.Reader.init(msg.bytes);
+        const wire = (try reader.next()).?;
+        if (wire.tag == .ev_load) {
+            const ev = try proto.decode(proto.EvLoad, wire.payload);
+            if (ev.state == @intFromEnum(proto.LoadState.started)) {
+                started = true;
+                refused = false;
+            }
+        } else if (wire.tag == .ev_load_error) {
+            const ev = try proto.decode(proto.EvLoadError, wire.payload);
+            try std.testing.expect(started);
+            try std.testing.expectEqual(@as(i32, cef.ERR_BLOCKED_BY_CLIENT), ev.code);
+            try std.testing.expectEqualStrings(callback, ev.url);
+            refused = true;
+        }
+        out.advance(msg.bytes.len);
+    }
+    try std.testing.expect(started and refused);
+    try std.testing.expect(!host.refuseNavigation(v, "https://auth.openai.com/login", true));
+    onLoadStart(null, &CallbackArgTest.browser, &CallbackArgTest.frame, 0);
+    host.flushInterceptStatus();
+    while (out.front()) |msg| {
+        var reader = proto.Reader.init(msg.bytes);
+        try std.testing.expect((try reader.next()).?.tag != .ev_load_error);
+        out.advance(msg.bytes.len);
+    }
+}
+
 test "native navigation budget cancellation preserves the document and rearms explicit reads" {
     try std.testing.expect(apiHash());
     const Fake = struct {
@@ -7388,6 +7454,7 @@ fn onLoadStart(
         .state = @intFromEnum(proto.LoadState.started),
         .url = v.url,
     });
+    host_icpt.navigationLoadStarted(host, v.id);
 }
 
 fn onLoadEnd(
