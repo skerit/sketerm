@@ -445,7 +445,7 @@ pub fn setMaxFps(fps: u16) void {
 /// says `tor` resolves through `torEndpoint` at the moment it is used.
 var g_tor_endpoint: [64]u8 = undefined;
 var g_tor_endpoint_len: usize = 0;
-var g_default_route: [webroute.MAX_HOST + 8]u8 = undefined;
+var g_default_route: [webroute.MAX_TEXT]u8 = undefined;
 var g_default_route_len: usize = 0;
 
 pub fn setRouteDefaults(route_text: []const u8, tor_endpoint: []const u8) void {
@@ -1003,7 +1003,7 @@ pub const WebFace = struct {
     route_kind: webroute.Kind = .direct,
     route_host: [webroute.MAX_HOST]u8 = undefined,
     route_host_len: usize = 0,
-    route_endpoint: [64]u8 = undefined,
+    route_endpoint: [webroute.MAX_PROXY_URL]u8 = undefined,
     route_endpoint_len: usize = 0,
     /// The user (or an MCP caller) chose this tab's route; the
     /// container's default no longer applies to it.
@@ -2323,7 +2323,7 @@ pub const WebFace = struct {
         // route menu.
         self.route_btn = c.gtk_button_new().?;
         const route_row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 4);
-        self.route_icon = c.gtk_image_new_from_icon_name(webroute.Choice.direct.icon()).?;
+        self.route_icon = c.gtk_image_new_from_icon_name(webroute.Kind.direct.icon()).?;
         c.gtk_box_append(@ptrCast(route_row), self.route_icon);
         self.route_text = c.gtk_label_new("Direct").?;
         c.gtk_box_append(@ptrCast(route_row), self.route_text);

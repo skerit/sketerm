@@ -15,6 +15,7 @@ const daemon_fsjobs = @import("daemon_fsjobs.zig");
 const pulse = @import("pulse.zig");
 const snapshot = @import("snapshot.zig");
 const dmod = @import("daemon.zig");
+const webroute = @import("../web/route.zig");
 const Daemon = dmod.Daemon;
 const Client = dmod.Client;
 const Worker = dmod.Worker;
@@ -296,7 +297,7 @@ pub fn handleWebOp(self: *Daemon, cl: *Client, payload: []const u8) void {
             rgbFromU32(r.color orelse 0),
             r.route orelse "",
         ) catch |err| return webReplyErr(cl, r.req, switch (err) {
-            error.BadContainer => "a container needs a name and a route of direct | tor | via:<host> | on:<host>",
+            error.BadContainer => "a container needs a name and a route of " ++ webroute.GRAMMAR,
             else => "container write failed",
         });
         cl.queueJson(.web_reply, .{ .req = r.req, .ok = true, .id = id });
@@ -306,7 +307,7 @@ pub fn handleWebOp(self: *Daemon, cl: *Client, payload: []const u8) void {
             .color = if (r.color) |v| rgbFromU32(v) else null,
             .route = r.route,
         }) catch |err| return webReplyErr(cl, r.req, switch (err) {
-            error.BadContainer => "a container route is direct | tor | via:<host> | on:<host>",
+            error.BadContainer => "a container route is " ++ webroute.GRAMMAR,
             else => "container write failed",
         });
         cl.queueJson(.web_reply, .{ .req = r.req, .ok = true, .found = found });

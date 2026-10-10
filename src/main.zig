@@ -139,8 +139,9 @@ const WEB_HELP =
     \\                         opt-in browser helper (zig build
     \\                         fetch-cef && zig build web); without it
     \\                         the window still opens and says so.
-    \\                         --route tor|direct|via:<host>|on:<host>
-    \\                         picks the tabs' network route (see
+    \\                         --route <route> (direct, tor, via:<host>,
+    \\                         on:<host>, proxy:<url>) picks the tabs'
+    \\                         network route (see
     \\                         `sketerm web --help`).
     \\
 ;
@@ -183,10 +184,14 @@ const WEB_USAGE =
     \\
     \\  --route <route>        Network route every tab of this invocation
     \\                         is born on: direct | tor | via:<host> |
-    \\                         on:<host>. `tor` dials mux_tor_socks_endpoint
-    \\                         (127.0.0.1:9050 by default); via:<host>
-    \\                         egresses through that mux/SSH host; on:<host>
-    \\                         runs the browser there. The page is never
+    \\                         on:<host> | proxy:<url>. `tor` dials
+    \\                         mux_tor_socks_endpoint (127.0.0.1:9050 by
+    \\                         default); via:<host> egresses through that
+    \\                         mux/SSH host; on:<host> runs the browser
+    \\                         there; proxy:socks5h://<host>:<port> or
+    \\                         proxy:http://<host>:<port> sends every
+    \\                         request through your own forward proxy,
+    \\                         which resolves every host. The page is never
     \\                         loaded directly first. Default: web_route
     \\                         from config, or the container's route. The
     \\                         same choices are on the toolbar's route

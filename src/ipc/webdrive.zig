@@ -1207,10 +1207,11 @@ pub const Engine = struct {
         return .{ .kind = self.route_kind, .host = self.route_host, .endpoint = self.route_endpoint };
     }
 
-    /// The route's user-facing text (`direct` | `tor` | `via:<host>` |
-    /// `on:<host>`), rendered into `buf`.
+    /// The route's user-facing text (`webroute.GRAMMAR`), rendered into
+    /// `buf` (`webroute.MAX_TEXT` always fits). A buffer too small says
+    /// the kind, never "direct" for a routed engine.
     pub fn routeText(self: *const Engine, buf: []u8) []const u8 {
-        return self.routeSpec().format(buf) orelse "direct";
+        return self.routeSpec().format(buf) orelse self.route_kind.word();
     }
 
     /// `<dir>/web<ext>` for the direct route, `<dir>/web-<slug><ext>`
@@ -1840,8 +1841,9 @@ pub const Engine = struct {
     }
 
     fn ensureUntrusted(self: *Engine) bool {
-        if (@import("builtin").os.tag != .linux or self.route_kind != .direct)
-            return self.failStart("untrusted browsing requires Linux and route direct");
+        if (@import("builtin").os.tag != .linux) return self.failStart("untrusted browsing requires Linux");
+        if (!self.route_kind.untrustedServable())
+            return self.failStart("untrusted browsing serves the direct, tor and proxy: routes only; nothing was opened");
         if (self.state == .ready) return self.readAvailable() and self.state == .ready;
         // A connection that is not ready was already retired by `lost`;
         // this only releases what a failed start left behind.
@@ -2100,17 +2102,26 @@ pub const Engine = struct {
             return self.failStart("could not prepare the browser helper's environment");
         };
         defer child_env.deinit();
-        var argv: [12:null]?[*:0]const u8 = .{ bin, "--socket", sock_z, "--cache-dir", cache_z, null, null, null, null, null, null, null };
+        var argv: [13:null]?[*:0]const u8 = @splat(null);
+        var argc: usize = 0;
+        for ([_][*:0]const u8{ bin, "--socket", sock_z, "--cache-dir", cache_z }) |arg| {
+            argv[argc] = arg;
+            argc += 1;
+        }
         if (self.untrusted) {
-            argv[5] = "--untrusted";
-            argv[6] = "--untrusted-root";
-            argv[7] = &root_z;
-            argv[8] = "--untrusted-lifetime-fd";
-            argv[9] = &lifetime_z;
+            for ([_][*:0]const u8{ "--untrusted", "--untrusted-root", &root_z, "--untrusted-lifetime-fd", &lifetime_z }) |arg| {
+                argv[argc] = arg;
+                argc += 1;
+            }
         }
         if (proxy) |p| {
-            argv[5] = "--proxy";
-            argv[6] = p;
+            argv[argc] = "--proxy";
+            argv[argc + 1] = p;
+            argc += 2;
+            if (self.route_kind.proxyDecidesAddresses()) {
+                argv[argc] = "--proxy-decides-addresses";
+                argc += 1;
+            }
         }
         const pid = c.fork();
         if (pid == 0) {
@@ -2354,7 +2365,7 @@ pub const Engine = struct {
         const wants_untrusted = if (policy) |p| p.untrusted else false;
         if (wants_untrusted) {
             if (policy.?.allow_schemes & ~netpolicy.default_schemes != 0) return error.UntrustedRestrictions;
-            if (spec != .ephemeral or self.route_kind != .direct) return error.UntrustedRestrictions;
+            if (spec != .ephemeral or !self.route_kind.untrustedServable()) return error.UntrustedRestrictions;
             if (@import("builtin").os.tag != .linux) return error.UntrustedUnsupported;
             // Mode is fixed at engine creation; an ordinary engine is never
             // flipped, whatever state it is in.

@@ -611,8 +611,8 @@ pub const Egress = struct {
     }
 };
 
-/// The proxy url a route's helper instance is started with, or null for
-/// a route that wants none (direct, and `on:`, whose helper runs on the
+/// The proxy url a route's helper instance is started with (Chromium's
+/// spelling, the helper's `--proxy`), or null for a route that wants none (direct, and `on:`, whose helper runs on the
 /// host itself). A `via:` route binds its loopback SOCKS5 -> mux bridge
 /// into `egress` on first use and keeps it across helper restarts, so the
 /// port is known before the helper's argv is built; a bridge that cannot
@@ -628,7 +628,7 @@ pub fn routeProxy(
 ) error{BridgeFailed}!?[]const u8 {
     switch (spec.kind) {
         .direct, .remote_browser => return null,
-        .tor => return spec.proxyUrl(buf) orelse error.BridgeFailed,
+        .tor, .proxy => return spec.proxyUrl(buf) orelse error.BridgeFailed,
         .mux => {
             if (egress.* == null) {
                 const eg = Egress.create(gpa, spec.host, connectFn) orelse return error.BridgeFailed;
@@ -663,6 +663,10 @@ test "routeProxy: tor names its endpoint, direct and on: want no proxy, and noth
     try std.testing.expectEqualStrings("socks5://127.0.0.1:9050", tor.?);
     try std.testing.expect((try routeProxy(std.testing.allocator, .{}, &egress, Never.connect, &buf)) == null);
     try std.testing.expect((try routeProxy(std.testing.allocator, .{ .kind = .remote_browser, .host = "box" }, &egress, Never.connect, &buf)) == null);
+    try std.testing.expect(egress == null);
+    // A caller's proxy is named up front too, in Chromium's spelling.
+    const prx = try routeProxy(std.testing.allocator, .{ .kind = .proxy, .endpoint = "socks5h://127.0.0.1:1080" }, &egress, Never.connect, &buf);
+    try std.testing.expectEqualStrings("socks5://127.0.0.1:1080", prx.?);
     try std.testing.expect(egress == null);
     // A tor url that cannot be formatted is an error, never "no proxy".
     var tiny: [4]u8 = undefined;

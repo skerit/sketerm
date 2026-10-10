@@ -451,9 +451,20 @@ CDP: input is delivered as real engine events, so a page sees
 - `web_open route:` picks the tab's network route. The grammar is one
   string: `direct` (the default), `tor` (through the SOCKS5 endpoint
   `mux_tor_socks_endpoint` names in config.conf), `via:<host>` (egress
-  through that mux/SSH host) or `on:<host>` (the browser process itself
-  runs on that host). Anything else is refused as `invalid_args`; an
-  unparseable route never falls back to direct.
+  through that mux/SSH host), `on:<host>` (the browser process itself
+  runs on that host), or `proxy:socks5h://HOST:PORT` /
+  `proxy:http://HOST:PORT`: every request of the tab through a forward
+  proxy YOU run, which resolves every host (SOCKS5 with the hostname in
+  the request, or HTTP CONNECT for https/wss and absolute-form forwarding
+  for http). There is no bypass list, so a loopback origin is reached
+  through the proxy too, and the proxy, not sketerm, decides which
+  addresses are reachable (`allow_private_addresses` is not consulted for
+  page hosts on that route). `socks5://` is refused (it would resolve
+  locally; use `socks5h://`), as are credentials, a path and a missing
+  port; PAC is not supported. An unreachable proxy fails the load, never
+  direct, and views on the same proxy url share one instance. Anything
+  else is refused as `invalid_args`, with the reason for a `proxy:` url;
+  an unparseable route never falls back to direct.
 
   A route is realized as a whole browser INSTANCE: its own
   `sketerm-webengine` process, its own profile directory and its own
@@ -468,11 +479,14 @@ CDP: input is delivered as real engine events, so a page sees
   was applied.
 
   Which kinds work depends on the backend, and `capabilities` reports
-  that as `web_routes`: `gui` serves all four kinds; `headless` (the
-  default isolated MCP mode) serves `direct` and `tor`, each as its own
-  helper instance, and REFUSES `via:`/`on:`, because `via:` needs the GUI's
-  local SOCKS5 bridge and `on:` a helper on the far host. A refusal
-  opens nothing: a routed tab must never silently browse direct.
+  that as `web_routes`: `gui` serves every kind; `headless` (the default
+  isolated MCP mode) serves `direct`, `tor`, `via:<host>` and
+  `proxy:<url>`, each as its own helper instance, and REFUSES `on:`,
+  which needs a helper on the far host. `capabilities.web_route_proxy`
+  states the `proxy:` grammar, its schemes and whether untrusted views may
+  take it; `web_untrusted_routes` lists the kinds an untrusted open
+  accepts. A refusal opens nothing: a routed tab must never silently
+  browse direct.
 
 - `web_snapshot` returns the page as roles, names and stable ids. The
   FIRST snapshot of a document is complete; every later one is a
@@ -1256,7 +1270,11 @@ capability). Headless only; with a GUI it is `unavailable`, and
 
 `web_open policy:{"untrusted":true} ephemeral:true route:"direct"` selects
 a dedicated restricted helper automatically. This is Linux-only and
-headless-only. Named profiles and the default identity are refused. Every
+headless-only. `route` may also be `tor` or `proxy:<url>`, each with its
+own restricted helper: its HTTP loader then hands every page host to that
+proxy unresolved and may connect to the proxy's address and port alone
+(`web_policy.enforced.http_broker` reads `route-proxy-only`). `via:` and
+`on:` are refused for untrusted views. Named profiles and the default identity are refused. Every
 view in that helper must carry an untrusted policy and an ephemeral identity.
 Ordinary route helpers remain separate; their existing behavior is unchanged,
 and ordinary and untrusted views can coexist with stable handles.

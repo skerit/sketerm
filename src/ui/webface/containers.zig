@@ -63,12 +63,16 @@ pub const Container = struct {
     route_kind: webroute.Kind,
     /// Owned host for `.mux` / `.remote_browser`; "" otherwise.
     route_host: []u8,
+    /// Owned proxy url for `.proxy`, which IS that route (unlike Tor's
+    /// endpoint, it is not config); "" otherwise.
+    route_endpoint: []u8 = &.{},
 
     pub fn route(self: *const Container) webroute.Spec {
         return switch (self.route_kind) {
             .direct => .{},
             .tor => .{ .kind = .tor, .endpoint = torEndpoint() },
             .mux, .remote_browser => .{ .kind = self.route_kind, .host = self.route_host },
+            .proxy => .{ .kind = .proxy, .endpoint = self.route_endpoint },
         };
     }
 };
@@ -123,8 +127,8 @@ pub const ContainerSpec = struct {
     jar: []const u8 = "",
     color: ?[3]u8 = null,
     ephemeral: bool = false,
-    /// Default route; only its kind and host are kept (a Tor endpoint
-    /// is config, not identity).
+    /// Default route; its kind, host and proxy url are kept (a Tor
+    /// endpoint is config, not identity).
     route: webroute.Spec = .{},
 };
 
@@ -163,6 +167,12 @@ pub fn createContainerAt(gpa: std.mem.Allocator, spec: ContainerSpec) u32 {
         gpa.free(jar_owned);
         return 0;
     };
+    const endpoint_owned = gpa.dupe(u8, if (spec.route.kind == .proxy) spec.route.endpoint else "") catch {
+        gpa.free(name_owned);
+        gpa.free(jar_owned);
+        gpa.free(host_owned);
+        return 0;
+    };
 
     g_containers.append(gpa, .{
         .id = id,
@@ -172,10 +182,12 @@ pub fn createContainerAt(gpa: std.mem.Allocator, spec: ContainerSpec) u32 {
         .ephemeral = ephemeral,
         .route_kind = spec.route.kind,
         .route_host = host_owned,
+        .route_endpoint = endpoint_owned,
     }) catch {
         gpa.free(name_owned);
         gpa.free(jar_owned);
         gpa.free(host_owned);
+        gpa.free(endpoint_owned);
         return 0;
     };
     if (!ephemeral and id >= g_next_container_id) g_next_container_id = id + 1;
@@ -218,6 +230,7 @@ pub fn destroyContainer(gpa: std.mem.Allocator, id: u32) bool {
         gpa.free(dead.name);
         gpa.free(dead.jar);
         gpa.free(dead.route_host);
+        gpa.free(dead.route_endpoint);
         // Sweep the per-site rules too, exactly as the daemon store
         // does. Leaving them behind kept routing new tabs for those
         // hosts into a destroyed identity: the helper silently falls
@@ -537,6 +550,28 @@ test "a container's route is the default for its tabs and resolves Tor from conf
     setRouteDefaults("via:gate", "127.0.0.1:9050");
     try t.expectEqual(webroute.Kind.mux, routeForContainer(0).kind);
     try t.expectEqualStrings("gate", routeForContainer(0).host);
+    // A caller-given proxy is the container's own, url and all, and it
+    // round-trips through the stored text unchanged.
+    var url_buf = "socks5h://127.0.0.1:1080".*;
+    const proxied = Container{
+        .id = 0x7fff_ff04,
+        .name = &.{},
+        .jar = &.{},
+        .color = .{ 0, 0, 0 },
+        .ephemeral = true,
+        .route_kind = .proxy,
+        .route_host = &.{},
+        .route_endpoint = &url_buf,
+    };
+    try t.expect(proxied.route().valid());
+    var text_buf: [webroute.MAX_TEXT]u8 = undefined;
+    const text = proxied.route().format(&text_buf).?;
+    try t.expectEqualStrings("proxy:socks5h://127.0.0.1:1080", text);
+    try t.expect(webroute.Spec.parse(text, torEndpoint()).?.eql(proxied.route()));
+    // `web_route` may name one too.
+    setRouteDefaults("proxy:http://127.0.0.1:3128", "127.0.0.1:9050");
+    try t.expectEqual(webroute.Kind.proxy, routeForContainer(0).kind);
+    try t.expectEqualStrings("http://127.0.0.1:3128", routeForContainer(0).endpoint);
     setRouteDefaults("direct", "127.0.0.1:9050");
     try t.expect(routeForContainer(0).isDirect());
 }

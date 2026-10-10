@@ -526,10 +526,11 @@ pub fn profileCapability(arena: std.mem.Allocator) struct {
 pub const RouteSupport = enum {
     /// No web backend at all, so no route either.
     none,
-    /// The GUI backend: every kind (direct, tor, via:<host>, on:<host>).
+    /// The GUI backend: every kind (direct, tor, via:<host>, on:<host>,
+    /// proxy:<url>).
     gui,
-    /// The headless backend: direct, tor and via:<host>, each its own
-    /// local helper instance; on:<host> is refused.
+    /// The headless backend: direct, tor, via:<host> and proxy:<url>,
+    /// each its own local helper instance; on:<host> is refused.
     headless,
 
     pub fn name(self: RouteSupport) []const u8 {
@@ -544,10 +545,53 @@ pub const RouteSupport = enum {
     pub fn describe(self: RouteSupport) []const u8 {
         return switch (self) {
             .none => "per-tab browser routes: none (no browser backend answers here)",
-            .gui => "per-tab browser routes: direct, tor, via:<host> and on:<host> all work (web_open route:); the GUI runs one browser instance per route",
-            .headless => "per-tab browser routes: direct, tor and via:<host> work (web_open route:, each its own browser instance with its own cookie jar); on:<host> is refused headlessly, never downgraded to direct",
+            .gui => "per-tab browser routes: direct, tor, via:<host>, on:<host> and proxy:<url> all work (web_open route:); the GUI runs one browser instance per route",
+            .headless => "per-tab browser routes: direct, tor, via:<host> and proxy:<url> work (web_open route:, each its own browser instance with its own cookie jar); on:<host> is refused headlessly, never downgraded to direct",
         };
     }
+};
+
+/// The `web_route_proxy` capability fact: whether `web_open` accepts a
+/// caller-given `proxy:<url>` route here, its grammar and schemes
+/// (`webroute`), and whether untrusted views may take it.
+pub const RouteProxyFact = struct {
+    available: bool,
+    grammar: []const u8 = webroute.PROXY_GRAMMAR,
+    schemes: []const []const u8 = &PROXY_SCHEME_WORDS,
+    untrusted: bool,
+};
+
+const PROXY_SCHEME_WORDS = blk: {
+    var words: [webroute.ProxyScheme.all.len][]const u8 = undefined;
+    for (webroute.ProxyScheme.all, 0..) |s, i| words[i] = s.word();
+    break :blk words;
+};
+
+/// Every backend that browses at all serves `proxy:` routes (the GUI
+/// and the headless engine alike start a helper with `--proxy`).
+pub fn routeProxyCapability(web_ok: bool) RouteProxyFact {
+    return .{ .available = web_ok, .untrusted = web_ok and untrustedSupported() };
+}
+
+/// The route kinds an untrusted open accepts (`Kind.untrustedServable`),
+/// as route words; empty where no untrusted view can open.
+pub fn untrustedRouteWords() []const []const u8 {
+    return if (untrustedSupported()) &UNTRUSTED_ROUTE_WORDS else &.{};
+}
+
+const UNTRUSTED_ROUTE_WORDS = blk: {
+    var n: usize = 0;
+    for (std.enums.values(webroute.Kind)) |k| {
+        if (k.untrustedServable()) n += 1;
+    }
+    var words: [n][]const u8 = undefined;
+    var i: usize = 0;
+    for (std.enums.values(webroute.Kind)) |k| {
+        if (!k.untrustedServable()) continue;
+        words[i] = k.word();
+        i += 1;
+    }
+    break :blk words;
 };
 
 /// What `capabilities` reports as `web_routes`. `web_ok` is the
@@ -719,7 +763,7 @@ fn headlessEngineFor(spec: webroute.Spec) ?*webdrive.Engine {
 
 fn headlessEngineForMode(spec: webroute.Spec, untrusted: bool) ?*webdrive.Engine {
     if (!spec.valid()) return null;
-    if (untrusted and !spec.isDirect()) return null;
+    if (untrusted and !spec.kind.untrustedServable()) return null;
     var slug_buf: [64]u8 = undefined;
     const slug = spec.slug(&slug_buf) orelse return null;
     for (g_engines.items) |re| {
@@ -1472,7 +1516,7 @@ fn appendEngineViews(
 /// One engine view as the backend-agnostic record; `focused` is whether
 /// a handle-less call on its engine means it.
 pub fn viewRecord(arena: std.mem.Allocator, e: *webdrive.Engine, v: *const webdrive.View, focused: bool) !View {
-    var route_buf: [webroute.MAX_HOST + 8]u8 = undefined;
+    var route_buf: [webroute.MAX_TEXT]u8 = undefined;
     return .{
         .pane = v.id,
         .view = v.id,
@@ -1914,7 +1958,7 @@ test "a route text is direct only when it says so" {
 /// one outcome a route must never produce.
 fn headlessRouteRefusal(kind: webroute.Kind) ?[]const u8 {
     return switch (kind) {
-        .direct, .tor, .mux => null,
+        .direct, .tor, .mux, .proxy => null,
         .remote_browser => "on:<host> needs the GUI backend: it runs the browser ON that host and shows its frames in-band, which the headless engine (a local helper it screenshots from shared memory) cannot present. Use via:<host> to leave from that host with a local browser, or drive the GUI. `capabilities` reports which backend answers (web_backend) and which routes it has (web_routes). Nothing was opened - a routed tab must never silently browse direct.",
     };
 }
@@ -1931,17 +1975,23 @@ fn torEndpoint(arena: std.mem.Allocator) []const u8 {
 /// Resolve route TEXT to the headless engine that serves it.
 const RouteEngineOutcome = union(enum) { engine: *webdrive.Engine, err: Fail };
 
-fn headlessRouteEngine(arena: std.mem.Allocator, text: []const u8) RouteEngineOutcome {
+fn headlessRouteEngine(arena: std.mem.Allocator, text: []const u8, untrusted: bool) RouteEngineOutcome {
     const probe = webroute.Spec.parse(text, "0.0.0.0:1") orelse
-        return .{ .err = fail(.invalid_args, "'route' is not a route: use direct | tor | via:<host> | on:<host>") };
+        return .{ .err = fail(.invalid_args, webroute.Spec.proxyRefusal(text) orelse "'route' is not a route: use " ++ webroute.GRAMMAR) };
     if (headlessRouteRefusal(probe.kind)) |why|
         return .{ .err = fail(.unavailable, why) };
+    if (untrusted and !probe.kind.untrustedServable())
+        return .{ .err = fail(.refused, UNTRUSTED_ROUTE_REFUSAL) };
     const spec = webroute.Spec.parse(text, torEndpoint(arena)) orelse
         return .{ .err = fail(.unavailable, "this machine has no usable Tor SOCKS5 endpoint (config 'mux_tor_socks_endpoint'), so a tor route cannot be built. Nothing was opened - a tor tab must never fall back to the direct path.") };
-    const e = headlessEngineFor(spec) orelse
+    const e = headlessEngineForMode(spec, untrusted) orelse
         return .{ .err = fail(.unavailable, "the headless browser backend could not start an engine for that route") };
     return .{ .engine = e };
 }
+
+/// Why an untrusted open refuses a route kind: its HTTP broker dials one
+/// proxy or none (`webroute.Kind.untrustedServable`).
+const UNTRUSTED_ROUTE_REFUSAL = "untrusted browsing serves the direct, tor and proxy:<url> routes only (via:<host> and on:<host> are refused, never browsed direct); nothing was opened";
 
 fn openView(drv: Driver, arena: std.mem.Allocator, url: ?[]const u8, where: []const u8, w: u16, h: u16, spec: webdrive.ProfileSpec, policy: ?*const webdrive.NetPolicy, cap: ?*const webdrive.CaptureFilter, route: ?[]const u8) !OpenOutcome {
     return openViewConfigured(drv, arena, url, where, w, h, spec, policy, cap, route, .{}, null, null);
@@ -1980,20 +2030,19 @@ fn openViewConfigured(drv: Driver, arena: std.mem.Allocator, url: ?[]const u8, w
             // in; without one it is the engine the call already picked.
             var e = drv_engine;
             const untrusted = if (policy) |p| p.untrusted else false;
-            if (untrusted) {
-                if (@import("builtin").os.tag != .linux or spec != .ephemeral or !isDirectRoute(route orelse "direct"))
-                    return .{ .err = fail(.refused, "untrusted browsing requires Linux, route direct, ephemeral:true and no profile; nothing was opened") };
-                e = headlessEngineForMode(.{}, true) orelse return .{ .err = fail(.unavailable, "could not allocate a dedicated untrusted browser engine") };
-            } else if (e.untrusted or (route != null and isDirectRoute(route.?))) {
-                e = headlessEngine() orelse return .{ .err = fail(.unavailable, "could not allocate an ordinary browser engine") };
-            }
-            if (route) |r| {
-                if (!isDirectRoute(r)) {
-                    switch (headlessRouteEngine(arena, r)) {
-                        .err => |f| return .{ .err = f },
-                        .engine => |routed| e = routed,
-                    }
+            if (untrusted and (@import("builtin").os.tag != .linux or spec != .ephemeral))
+                return .{ .err = fail(.refused, "untrusted browsing requires Linux, ephemeral:true and no profile; nothing was opened") };
+            if (route != null and !isDirectRoute(route.?)) {
+                // An untrusted open on a route gets that route's OWN
+                // dedicated untrusted instance, never an ordinary one.
+                switch (headlessRouteEngine(arena, route.?, untrusted)) {
+                    .err => |f| return .{ .err = f },
+                    .engine => |routed| e = routed,
                 }
+            } else if (untrusted) {
+                e = headlessEngineForMode(.{}, true) orelse return .{ .err = fail(.unavailable, "could not allocate a dedicated untrusted browser engine") };
+            } else if (e.untrusted or route != null) {
+                e = headlessEngine() orelse return .{ .err = fail(.unavailable, "could not allocate an ordinary browser engine") };
             }
             if (browser_name) |n| switch (e.labelConflict(n, spec)) {
                 .none => {},
@@ -2014,7 +2063,7 @@ fn openViewConfigured(drv: Driver, arena: std.mem.Allocator, url: ?[]const u8, w
             const v = e.openViewConfigured(url orelse "", w, h, spec, policy, cap, emulation, max_fps) catch |err| {
                 const name: []const u8 = if (spec == .named) spec.named else "";
                 return .{ .err = switch (err) {
-                    error.UntrustedRestrictions => fail(.refused, "untrusted opens require policy.untrusted:true, ephemeral:true, route direct and HTTP/HTTPS only; nothing was opened"),
+                    error.UntrustedRestrictions => fail(.refused, "untrusted opens require policy.untrusted:true, ephemeral:true, a direct, tor or proxy:<url> route and HTTP/HTTPS only; nothing was opened"),
                     error.UntrustedModeConflict => fail(.conflict, "a running ordinary helper cannot switch to untrusted mode; use a new dedicated engine"),
                     error.UntrustedUnsupported => fail(.unavailable, "the helper did not advertise untrusted-web; nothing was opened"),
                     error.EmulationUnsupported => fail(.unavailable, "the helper did not advertise web-emulation; nothing was opened"),
@@ -4105,8 +4154,8 @@ pub fn webTool(
             if (!webroute.Spec.validText(r))
                 return mcp.errRes(arena, .invalid_args, try std.fmt.allocPrint(
                     arena,
-                    "'{s}' is not a route: use direct | tor | via:<host> | on:<host>",
-                    .{r},
+                    "'{s}' is not a route: {s}. Use " ++ webroute.GRAMMAR,
+                    .{ r, webroute.Spec.proxyRefusal(r) orelse "outside the grammar" },
                 ));
         }
         const profile = mcp.argStr(args, "profile");
@@ -5451,9 +5500,12 @@ fn policyViewResult(arena: std.mem.Allocator, listed: View, fresh: *const webdri
     try res.fact("policy_source", if (fresh.pol != null) "call" else "none");
     try res.fact("policy_serial", fresh.pol_serial);
     if (fresh.pol) |*p| try res.raw("policy", try policyJson(arena, p));
+    // A routed restricted helper's broker dials the route's proxy and
+    // nothing else; the proxy resolves every host (`web_untrusted.c`).
+    const proxied = !isDirectRoute(listed.route);
     if (listed.untrusted) try res.fact("enforced", .{
         .internet_sockets = "denied",
-        .http_broker = "actual-address-validated",
+        .http_broker = if (proxied) "route-proxy-only" else "actual-address-validated",
         .service_workers = false,
         .websockets = false,
         .webrtc = false,
@@ -5510,7 +5562,10 @@ fn policyViewResult(arena: std.mem.Allocator, listed: View, fresh: *const webdri
         .kernel_core_limit_bytes = @as(u64, 0),
         .nondumpable = "browser after initialize, renderers from their first script context; zygotes stay dumpable for the namespace sandbox",
         .renderer_sandbox = "chromium namespace (user/pid/net) + seccomp-bpf",
-        .destinations = "connect-time refusal of special-purpose ranges and this host's own interface addresses unless allow_private_addresses",
+        .destinations = if (proxied)
+            "connect-time allowance of the route proxy's address and port alone; every page host goes to the proxy unresolved, and on a proxy: route the proxy decides which addresses are reachable"
+        else
+            "connect-time refusal of special-purpose ranges and this host's own interface addresses unless allow_private_addresses",
     });
     try res.fact("requests", fresh.pol_requests);
     try res.fact("bytes", fresh.pol_bytes);
@@ -9438,7 +9493,7 @@ test "a headless tor or via: route resolves to its own engine, on: does not reso
         g_headless_dir = null;
     }
 
-    switch (headlessRouteEngine(arena, "tor")) {
+    switch (headlessRouteEngine(arena, "tor", false)) {
         .err => |f| {
             // The one legitimate refusal: this machine configures no
             // usable SOCKS5 endpoint. It must still say so rather than
@@ -9457,23 +9512,71 @@ test "a headless tor or via: route resolves to its own engine, on: does not reso
     // via: is a local helper instance of its own whose proxy is the
     // SOCKS5 bridge to that host; resolving it binds nothing yet (the
     // bridge comes up with the helper, at the first call that needs it).
-    const via = headlessRouteEngine(arena, "via:box").engine;
+    const via = headlessRouteEngine(arena, "via:box", false).engine;
     try t.expectEqual(webroute.Kind.mux, via.routeSpec().kind);
     try t.expect(via != headlessEngine().?);
     try t.expect(via.egress == null);
     var vbuf: [64]u8 = undefined;
     try t.expectEqualStrings("via:box", via.routeText(&vbuf));
-    try t.expect(headlessRouteEngine(arena, "via:box").engine == via);
+    try t.expect(headlessRouteEngine(arena, "via:box", false).engine == via);
 
     // The one kind the headless engine cannot realize: refused with the
     // sentence that names the backend fact, and nothing minted for it.
     const before = g_engines.items.len;
-    const out = headlessRouteEngine(arena, "on:box");
+    const out = headlessRouteEngine(arena, "on:box", false);
     try t.expectEqual(mcp.ErrCode.unavailable, out.err.code);
     try t.expect(std.mem.indexOf(u8, out.err.text, "web_backend") != null);
     try t.expectEqual(before, g_engines.items.len);
     try t.expect(headlessRouteRefusal(.remote_browser) != null);
-    for ([_]webroute.Kind{ .direct, .tor, .mux }) |kind| try t.expect(headlessRouteRefusal(kind) == null);
+    for ([_]webroute.Kind{ .direct, .tor, .mux, .proxy }) |kind| try t.expect(headlessRouteRefusal(kind) == null);
+}
+
+test "a headless proxy: route is one engine per url, untrusted ones their own, never a refused kind" {
+    var arena_state = testArena();
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const t = std.testing;
+
+    configureHeadless(t.allocator, "/tmp/sketerm-route-proxy-test", null, null, null, false);
+    defer {
+        shutdownHeadless();
+        g_headless_alloc = null;
+        g_headless_dir = null;
+    }
+
+    // A proxy url is a whole helper instance, keyed by the url: two
+    // opens on the same proxy share it, another url gets its own.
+    const http = headlessRouteEngine(arena, "proxy:http://127.0.0.1:8080", false).engine;
+    try t.expectEqual(webroute.Kind.proxy, http.routeSpec().kind);
+    try t.expect(http != headlessEngine().?);
+    try t.expect(!http.untrusted);
+    var buf: [webroute.MAX_TEXT]u8 = undefined;
+    try t.expectEqualStrings("proxy:http://127.0.0.1:8080", http.routeText(&buf));
+    try t.expect(headlessRouteEngine(arena, "proxy:http://127.0.0.1:8080", false).engine == http);
+    const socks = headlessRouteEngine(arena, "proxy:socks5h://127.0.0.1:8080", false).engine;
+    try t.expect(socks != http);
+
+    // Untrusted: the same route, its own dedicated restricted instance,
+    // and again shared by every untrusted open on that url.
+    const restricted = headlessRouteEngine(arena, "proxy:http://127.0.0.1:8080", true).engine;
+    try t.expect(restricted.untrusted and restricted != http);
+    try t.expectEqual(webroute.Kind.proxy, restricted.routeSpec().kind);
+    try t.expect(headlessRouteEngine(arena, "proxy:http://127.0.0.1:8080", true).engine == restricted);
+
+    // Refusals open nothing and mint no engine: a local-DNS socks5, a
+    // url outside the grammar, and the kinds untrusted mode cannot serve.
+    const before = g_engines.items.len;
+    const local_dns = headlessRouteEngine(arena, "proxy:socks5://127.0.0.1:1080", false);
+    try t.expectEqual(mcp.ErrCode.invalid_args, local_dns.err.code);
+    try t.expect(std.mem.indexOf(u8, local_dns.err.text, "socks5h") != null);
+    try t.expectEqual(mcp.ErrCode.invalid_args, headlessRouteEngine(arena, "proxy:http://u@127.0.0.1:1", false).err.code);
+    try t.expectEqual(mcp.ErrCode.invalid_args, headlessRouteEngine(arena, "proxy:http://127.0.0.1:1/x", true).err.code);
+    const via = headlessRouteEngine(arena, "via:box", true);
+    try t.expectEqual(mcp.ErrCode.refused, via.err.code);
+    try t.expect(std.mem.indexOf(u8, via.err.text, "proxy:<url>") != null);
+    try t.expectEqual(before, g_engines.items.len);
+    try t.expect(headlessEngineForMode(.{ .kind = .mux, .host = "box" }, true) == null);
+    try t.expect(headlessEngineForMode(.{ .kind = .proxy, .endpoint = "socks5://127.0.0.1:1" }, false) == null);
 }
 
 /// Scripted web_gui side effects for the fail-closed test: no GUI
@@ -9551,6 +9654,37 @@ test "capabilities schema: web_routes enum is RouteSupport, drift-tested" {
     try t.expectEqual(n, std.mem.count(u8, listed, "\"") / 2);
     // Each member also carries the sentence capabilities prints.
     for (std.enums.values(RouteSupport)) |r| try t.expect(r.describe().len > 0);
+}
+
+test "capabilities: the proxy route facts derive from route.zig and match their schema" {
+    const t = std.testing;
+    var arena_state = testArena();
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const mcp_tools = @import("mcp_tools.zig");
+    const tool = for (mcp_tools.TOOLS) |tool| {
+        if (std.mem.eql(u8, tool.name, "capabilities")) break tool;
+    } else return error.MissingCapabilitiesTool;
+    const schema = try std.json.parseFromSliceLeaky(std.json.Value, arena, tool.output_schema.?, .{});
+    const props = schema.object.get("properties").?.object;
+    const proxy = props.get("web_route_proxy").?.object;
+    const schemes = proxy.get("properties").?.object.get("schemes").?.object.get("items").?.object.get("enum").?.array.items;
+    const fact = routeProxyCapability(true);
+    try t.expectEqual(fact.schemes.len, schemes.len);
+    for (fact.schemes, schemes) |word, item| try t.expectEqualStrings(word, item.string);
+    try t.expectEqualStrings(webroute.PROXY_GRAMMAR, fact.grammar);
+    try t.expect(!routeProxyCapability(false).available and !routeProxyCapability(false).untrusted);
+    // Every untrusted route word is a member of the schema's enum, and it
+    // is exactly the kinds the restricted helper realizes.
+    const kinds = props.get("web_untrusted_routes").?.object.get("items").?.object.get("enum").?.array.items;
+    try t.expectEqual(std.enums.values(webroute.Kind).len, kinds.len);
+    try t.expectEqual(@as(usize, 3), UNTRUSTED_ROUTE_WORDS.len);
+    for (UNTRUSTED_ROUTE_WORDS, [_][]const u8{ "direct", "tor", "proxy" }) |word, want| try t.expectEqualStrings(want, word);
+    for (UNTRUSTED_ROUTE_WORDS) |word| {
+        var listed = false;
+        for (kinds) |item| listed = listed or std.mem.eql(u8, item.string, word);
+        try t.expect(listed);
+    }
 }
 
 test "web_tabs reports each view's route" {

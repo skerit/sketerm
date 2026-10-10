@@ -54,7 +54,7 @@ pub const Request = struct {
 };
 
 /// What `--route` accepts, for the usage text and the refusal message.
-pub const ROUTE_GRAMMAR = "direct | tor | via:<host> | on:<host>";
+pub const ROUTE_GRAMMAR = webroute.GRAMMAR;
 
 /// Index of the first `sketerm web` argument, or null for another
 /// entry point. Both spellings count, exactly like the file manager:

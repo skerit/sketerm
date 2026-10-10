@@ -73,7 +73,7 @@ pub const Client = struct {
     route_kind: webroute.Kind = .direct,
     route_host: [256]u8 = undefined,
     route_host_len: usize = 0,
-    route_endpoint: [64]u8 = undefined,
+    route_endpoint: [webroute.MAX_PROXY_URL]u8 = undefined,
     route_endpoint_len: usize = 0,
     /// Cached `--cache-dir`, minted with the socket path.
     cache_dir: [128:0]u8 = undefined,
@@ -221,9 +221,9 @@ pub const Client = struct {
         // The route's proxy, applied by the helper to its GLOBAL request
         // context and to every container context it mints, so no view of
         // this instance has a direct path. Null for a direct instance.
-        var proxy_z: [96:0]u8 = undefined;
+        var proxy_z: [webroute.MAX_PROXY_URL:0]u8 = undefined;
         const proxy: ?[:0]const u8 = blk: {
-            var pbuf: [80]u8 = undefined;
+            var pbuf: [webroute.MAX_PROXY_URL]u8 = undefined;
             const url = (socksbridge.routeProxy(self.gpa, self.routeSpec(), &self.egress, mux_cli.muxConnect, &pbuf) catch {
                 self.fail("Could not start the egress bridge for this route (the mux host is unreachable or the loopback listener would not bind).");
                 return;
@@ -249,6 +249,7 @@ pub const Client = struct {
                 if (devnull > 2) _ = c.close(devnull);
             }
             var argv: [8:null]?[*:0]const u8 = .{ bin, "--socket", &path_z, null, null, null, null, null };
+            const decides = self.routeSpec().kind.proxyDecidesAddresses();
             var n: usize = 3;
             if (cache_dir) |cd| {
                 argv[n] = "--cache-dir";
@@ -259,6 +260,12 @@ pub const Client = struct {
                 argv[n] = "--proxy";
                 argv[n + 1] = pr.ptr;
                 n += 2;
+                // Same instance semantics as the headless engine: a
+                // caller's proxy is the address authority.
+                if (decides) {
+                    argv[n] = "--proxy-decides-addresses";
+                    n += 1;
+                }
             }
             _ = c.execv(bin, @ptrCast(@constCast(&argv)));
             c._exit(127);

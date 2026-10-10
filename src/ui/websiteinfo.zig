@@ -145,6 +145,8 @@ pub const SiteInfo = struct {
     /// True while `refresh` sets the dropdown, so our own write does not
     /// fire the change handler and re-narrow the entry.
     route_syncing: bool = false,
+    /// The host entry shows a `proxy:` url, not a host typed here.
+    route_shows_proxy: bool = false,
     tls_icon: *c.GtkWidget,
     tls_label: *c.GtkWidget,
     block_switch: *c.GtkWidget,
@@ -354,12 +356,18 @@ pub const SiteInfo = struct {
         c.gtk_label_set_text(@ptrCast(self.tls_label), st.tls.text());
 
         self.route_syncing = true;
+        // A `proxy:` route is no dropdown row: nothing is selected and
+        // the url shows (read-only) where a host would; picking a row
+        // moves the tab off it, and Apply alone leaves it in place.
         const choice = webroute.Choice.fromKind(st.route.kind);
-        c.gtk_drop_down_set_selected(@ptrCast(self.route_drop), @intFromEnum(choice));
-        var hz: [webroute.MAX_HOST + 1:0]u8 = undefined;
-        const hb = std.fmt.bufPrintZ(&hz, "{s}", .{st.route.host[0..@min(st.route.host.len, webroute.MAX_HOST)]}) catch "";
+        c.gtk_drop_down_set_selected(@ptrCast(self.route_drop), if (choice) |ch| @intFromEnum(ch) else c.GTK_INVALID_LIST_POSITION);
+        var fz: [webroute.MAX_TEXT]u8 = undefined;
+        var hz: [webroute.MAX_TEXT + 1:0]u8 = undefined;
+        const route_shown: []const u8 = if (choice == null) st.route.format(&fz) orelse "" else st.route.host;
+        const hb = std.fmt.bufPrintZ(&hz, "{s}", .{route_shown[0..@min(route_shown.len, webroute.MAX_TEXT)]}) catch "";
         c.gtk_editable_set_text(@ptrCast(self.route_host), hb.ptr);
-        c.gtk_widget_set_sensitive(self.route_host, if (choice.needsHost()) 1 else 0);
+        self.route_shows_proxy = choice == null;
+        c.gtk_widget_set_sensitive(self.route_host, if (choice != null and choice.?.needsHost()) 1 else 0);
         c.gtk_widget_set_sensitive(self.route_row, if (st.route_movable) 1 else 0);
         self.route_syncing = false;
 
@@ -392,6 +400,10 @@ pub const SiteInfo = struct {
         self.route_syncing = true;
         c.gtk_drop_down_set_selected(@ptrCast(self.route_drop), @intFromEnum(choice));
         self.route_syncing = false;
+        if (self.route_shows_proxy) {
+            c.gtk_editable_set_text(@ptrCast(self.route_host), "");
+            self.route_shows_proxy = false;
+        }
         c.gtk_widget_set_sensitive(self.route_host, if (choice.needsHost()) 1 else 0);
         if (choice.needsHost()) _ = c.gtk_widget_grab_focus(self.route_host);
     }
@@ -520,15 +532,12 @@ pub const SiteInfo = struct {
 /// Route dropdown rows, in `webroute.Choice` order: the dropdown index
 /// IS the choice's integer value, so `refresh`, `preset` and
 /// `applyRoute` never carry a table of their own.
-const route_names = blk: {
-    var names: [webroute.Choice.all.len:null]?[*:0]const u8 = undefined;
-    for (webroute.Choice.all, 0..) |ch, i| names[i] = ch.label();
-    break :blk names;
-};
+const route_names = webroute.Choice.labels;
 
-fn selectedChoice(self: *SiteInfo) webroute.Choice {
+/// The selected row, or null when none is: a tab on a `proxy:` route.
+fn selectedChoice(self: *SiteInfo) ?webroute.Choice {
     const sel = c.gtk_drop_down_get_selected(@ptrCast(self.route_drop));
-    return std.enums.fromInt(webroute.Choice, sel) orelse .direct;
+    return std.enums.fromInt(webroute.Choice, sel);
 }
 
 // ── row / button handlers ───────────────────────────────────────────
@@ -536,8 +545,13 @@ fn selectedChoice(self: *SiteInfo) webroute.Choice {
 fn onRouteChanged(_: *c.GtkWidget, _: *c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
     const self = cast.userData(SiteInfo, user);
     if (self.route_syncing) return;
-    const choice = selectedChoice(self);
+    const choice = selectedChoice(self) orelse return;
     c.gtk_widget_set_sensitive(self.route_host, if (choice.needsHost()) 1 else 0);
+    // The read-only proxy url is not a host to carry into a host row.
+    if (self.route_shows_proxy) {
+        c.gtk_editable_set_text(@ptrCast(self.route_host), "");
+        self.route_shows_proxy = false;
+    }
     // Direct and Tor need no host, so choosing them applies at once;
     // the host-bound ones wait for Apply (or Enter in the entry).
     if (!choice.needsHost()) applyRoute(self);
@@ -549,7 +563,8 @@ fn onRouteApply(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
 
 fn applyRoute(self: *SiteInfo) void {
     const face = webface.faceByView(self.view) orelse return;
-    const choice = selectedChoice(self);
+    // No row selected: the tab stays on the route nobody picked here.
+    const choice = selectedChoice(self) orelse return;
     const host = std.mem.span(c.gtk_editable_get_text(@ptrCast(self.route_host)));
     const spec = choice.spec(std.mem.trim(u8, host, " \t"), webface.torEndpoint()) orelse {
         c.gtk_label_set_text(

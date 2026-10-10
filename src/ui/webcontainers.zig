@@ -37,28 +37,16 @@ const palette_names = [_:null]?[*:0]const u8{
 /// Default route for a container's tabs. Order == the switch in
 /// `apply`. "Via server" (mux egress) and "Browser runs on"
 /// (remote-browser placement) take a host; Direct and Tor do not.
-const Routing = enum(c_uint) {
-    direct = 0,
-    tor = 1,
-    egress = 2,
-    remote = 3,
-};
+/// Route dropdown rows: `webroute.Choice`, whose value IS the index.
+const routing_names = webroute.Choice.labels;
 
-const routing_names = [_:null]?[*:0]const u8{
-    "Direct",
-    "Tor",
-    "Via server",
-    "Browser runs on",
-};
-
-/// The stored route text a dropdown selection plus host spells.
-fn routeText(buf: []u8, mode: Routing, host: []const u8) ?[]const u8 {
-    return switch (mode) {
-        .direct => "direct",
-        .tor => "tor",
-        .egress => if (host.len == 0) null else std.fmt.bufPrint(buf, "via:{s}", .{host}) catch null,
-        .remote => if (host.len == 0) null else std.fmt.bufPrint(buf, "on:{s}", .{host}) catch null,
-    };
+/// The stored route text a dropdown selection plus host spells; null
+/// when the choice needs a host and has none. `Spec.format` is the one
+/// spelling (a `tor` text carries no endpoint, so none is needed here).
+fn routeText(buf: []u8, choice: webroute.Choice, host: []const u8) ?[]const u8 {
+    if (choice.needsHost() and host.len == 0) return null;
+    const spec = webroute.Spec{ .kind = choice.kind(), .host = if (choice.needsHost()) host else "" };
+    return spec.format(buf);
 }
 
 const Manager = struct {
@@ -177,22 +165,27 @@ fn rebuild(self: *Manager) void {
 
         const routing = c.gtk_drop_down_new_from_strings(@ptrCast(&routing_names));
         const spec = ctn.route();
-        const mode: Routing = switch (spec.kind) {
-            .direct => .direct,
-            .tor => .tor,
-            .mux => .egress,
-            .remote_browser => .remote,
-        };
-        c.gtk_drop_down_set_selected(@ptrCast(routing), @intFromEnum(mode));
+        // A `proxy:` route (stored by another client) is no row here:
+        // nothing is selected, the url is the host entry's placeholder,
+        // and edits to the name or colour keep it (see `apply`).
+        const choice = webroute.Choice.fromKind(spec.kind);
+        c.gtk_drop_down_set_selected(@ptrCast(routing), if (choice) |ch| @intFromEnum(ch) else c.GTK_INVALID_LIST_POSITION);
         c.gtk_box_append(@ptrCast(row), routing);
 
         const host = c.gtk_entry_new();
-        c.gtk_entry_set_placeholder_text(@ptrCast(host), "host");
+        var fz: [webroute.MAX_TEXT]u8 = undefined;
+        var pz: [webroute.MAX_TEXT + 1]u8 = undefined;
+        const route_text: []const u8 = spec.format(&fz) orelse "proxy";
+        const placeholder: [*:0]const u8 = if (choice == null) blk: {
+            const z = std.fmt.bufPrintZ(&pz, "{s}", .{route_text}) catch break :blk "proxy";
+            break :blk z.ptr;
+        } else "host";
+        c.gtk_entry_set_placeholder_text(@ptrCast(host), placeholder);
         const cur_host = spec.host;
         var hz: [160]u8 = undefined;
         const hb = std.fmt.bufPrintZ(&hz, "{s}", .{cur_host[0..@min(cur_host.len, 128)]}) catch "";
         c.gtk_editable_set_text(@ptrCast(host), hb.ptr);
-        c.gtk_widget_set_sensitive(host, if (mode == .egress or mode == .remote) 1 else 0);
+        c.gtk_widget_set_sensitive(host, if (choice != null and choice.?.needsHost()) 1 else 0);
         c.gtk_box_append(@ptrCast(row), host);
 
         const rm = c.gtk_button_new_from_icon_name("user-trash-symbolic");
@@ -251,7 +244,8 @@ fn apply(ctx: *RowCtx) void {
     const gpa = ctx.allocator;
     const name = std.mem.span(c.gtk_editable_get_text(@ptrCast(ctx.name)));
     const host = std.mem.span(c.gtk_editable_get_text(@ptrCast(ctx.host)));
-    const mode: Routing = @enumFromInt(c.gtk_drop_down_get_selected(@ptrCast(ctx.routing)));
+    // No row selected: the container keeps the route no row expresses.
+    const choice = std.enums.fromInt(webroute.Choice, c.gtk_drop_down_get_selected(@ptrCast(ctx.routing)));
     const ci = c.gtk_drop_down_get_selected(@ptrCast(ctx.color));
     const rgb = webface.container_palette[@min(ci, webface.container_palette.len - 2)];
 
@@ -259,11 +253,17 @@ fn apply(ctx: *RowCtx) void {
         setStatus(ctx.mgr, "A container needs a name.");
         return;
     }
-    c.gtk_widget_set_sensitive(ctx.host, if (mode == .egress or mode == .remote) 1 else 0);
-    var rbuf: [webroute.MAX_HOST + 8]u8 = undefined;
-    const route = routeText(&rbuf, mode, host) orelse {
+    if (choice) |ch| {
+        c.gtk_widget_set_sensitive(ctx.host, if (ch.needsHost()) 1 else 0);
+        c.gtk_entry_set_placeholder_text(@ptrCast(ctx.host), "host");
+    }
+    var rbuf: [webroute.MAX_TEXT]u8 = undefined;
+    const route = if (choice) |ch| routeText(&rbuf, ch, host) orelse {
         setStatus(ctx.mgr, "That route needs a host.");
         return;
+    } else blk: {
+        const ctn = webface.findContainer(ctx.id) orelse return;
+        break :blk ctn.route().format(&rbuf) orelse return;
     };
 
     _ = webface.renameContainer(gpa, ctx.id, name);
@@ -273,7 +273,7 @@ fn apply(ctx: *RowCtx) void {
     // A live tab keeps the route it was created with (moving it means a
     // new helper instance); the change is the DEFAULT for new tabs, and
     // a per-tab route is the site button's job. Say so.
-    if (mode != .direct)
+    if (choice != webroute.Choice.direct)
         setStatus(ctx.mgr, "Saved. New tabs in this container use the new route; change an open tab from its site button.")
     else
         setStatus(ctx.mgr, "Saved.");

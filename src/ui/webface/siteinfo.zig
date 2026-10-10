@@ -63,7 +63,9 @@ pub fn freeRouteRowCtx(user: ?*anyopaque) callconv(.c) void {
 /// once; the host-bound two open the site popover with that route
 /// pre-selected, since their one missing piece is a host), then
 /// "New Tor Tab" and the full route settings. Same rows, same
-/// order, as the site popover's dropdown and the palette.
+/// order, as the site popover's dropdown and the palette. A tab on a
+/// `proxy:` route (opened by MCP, the CLI or config) ticks no row;
+/// picking one moves it off that proxy like any other route change.
 pub fn showRouteMenu(self: *WebFace, anchor: *c.GtkWidget) void {
     if (self.widgets_dead) return;
     const root = classicmenu.Root.create(self.allocator) orelse return;
@@ -90,7 +92,7 @@ pub fn showRouteMenu(self: *WebFace, anchor: *c.GtkWidget) void {
 /// one ticked; the host-bound choices get an ellipsis because they
 /// open the site popover for a host rather than applying at once.
 /// Rows are disabled on an attached view, which cannot move.
-pub fn appendRouteRows(self: *WebFace, root: *classicmenu.Root, menu: classicmenu.Menu, current: webroute.Choice) void {
+pub fn appendRouteRows(self: *WebFace, root: *classicmenu.Root, menu: classicmenu.Menu, current: ?webroute.Choice) void {
     for (webroute.Choice.all) |choice| {
         const rc = self.allocator.create(RouteRowCtx) catch continue;
         rc.* = .{ .allocator = self.allocator, .face = self, .choice = choice };
@@ -141,8 +143,8 @@ pub fn chooseRoute(self: *WebFace, choice: webroute.Choice) void {
         });
         return;
     };
-    var msg: [96]u8 = undefined;
-    var dbuf: [webroute.MAX_HOST + 16]u8 = undefined;
+    var msg: [webroute.MAX_TEXT + 64]u8 = undefined;
+    var dbuf: [webroute.MAX_TEXT + 16]u8 = undefined;
     const desc = spec.describe(&dbuf);
     self.routeToast(if (desc.len != 0)
         std.fmt.bufPrint(&msg, "This tab now browses {s}.", .{desc}) catch "Route changed."
@@ -215,7 +217,7 @@ pub fn updateSiteButton(self: *WebFace) void {
     // shown here too, and the two read as one duplicated fact).
     toolbtn.setIcon(self.site_btn, self.bar, tls_icon, "Site");
     const route = self.routeSpec();
-    var dbuf: [webroute.MAX_HOST + 16]u8 = undefined;
+    var dbuf: [webroute.MAX_TEXT + 16]u8 = undefined;
     const desc = route.describe(&dbuf);
     // The route button: icon + short word for EVERY route, and a
     // tooltip that spells the route out in full. An attached view
@@ -224,15 +226,15 @@ pub fn updateSiteButton(self: *WebFace) void {
     // icons are sketerm's own, so they resolve; the guard keeps a
     // theme that somehow lacks them from drawing a broken glyph
     // beside a word that already carries the meaning.
-    const choice = webroute.Choice.fromKind(route.kind);
-    const have_icon = toolbtn.iconAvailable(choice.icon());
+    const route_icon = route.kind.icon();
+    const have_icon = toolbtn.iconAvailable(route_icon);
     c.gtk_widget_set_visible(self.route_icon, if (have_icon) 1 else 0);
-    if (have_icon) c.gtk_image_set_from_icon_name(@ptrCast(self.route_icon), choice.icon());
+    if (have_icon) c.gtk_image_set_from_icon_name(@ptrCast(self.route_icon), route_icon);
     var sz: [webroute.HOST_LABEL_MAX + 16:0]u8 = undefined;
     var sbuf: [webroute.HOST_LABEL_MAX + 8]u8 = undefined;
     const short = std.fmt.bufPrintZ(&sz, "{s}", .{route.shortLabel(&sbuf)}) catch "Route";
     c.gtk_label_set_text(@ptrCast(self.route_text), short.ptr);
-    var rtip: [webroute.MAX_HOST + 128]u8 = undefined;
+    var rtip: [webroute.MAX_TEXT + 128]u8 = undefined;
     const rt = if (self.attached)
         std.fmt.bufPrintZ(&rtip, "Route: this view presents another page's browser and cannot change route.", .{}) catch "Route"
     else if (desc.len != 0)
@@ -240,7 +242,7 @@ pub fn updateSiteButton(self: *WebFace) void {
     else
         std.fmt.bufPrintZ(&rtip, "Route: direct, this machine's own network. Click to switch to Tor or a server.", .{}) catch "Route";
     c.gtk_widget_set_tooltip_text(self.route_btn, rt.ptr);
-    var tip: [webroute.MAX_HOST + 96]u8 = undefined;
+    var tip: [webroute.MAX_TEXT + 96]u8 = undefined;
     const t = if (desc.len != 0)
         std.fmt.bufPrintZ(&tip, "Site information, permissions and stored data. This tab browses {s}.", .{desc}) catch "Site information"
     else

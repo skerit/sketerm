@@ -21,6 +21,7 @@
 //! roots and into `config.zig`.
 
 const std = @import("std");
+const netpolicy = @import("netpolicy.zig");
 
 pub const Kind = enum {
     /// The helper's own network, no proxy.
@@ -33,13 +34,241 @@ pub const Kind = enum {
     /// route — it is kept in the same enum because it likewise selects a
     /// distinct helper instance, but its traffic leaves from that host.
     remote_browser,
+    /// Every request through a forward proxy the CALLER runs, named by
+    /// `endpoint` (`ProxyUrl` grammar). The proxy resolves every page
+    /// host and is the authority on which addresses a page may reach,
+    /// so there is no bypass list: a loopback origin is reached through
+    /// the proxy like any other.
+    proxy,
+
+    /// The word route text spells this kind with (`via:`/`on:` carry a
+    /// host, `proxy:` a url): the vocabulary `capabilities` lists.
+    pub fn word(self: Kind) []const u8 {
+        return switch (self) {
+            .direct => "direct",
+            .tor => "tor",
+            .mux => "via",
+            .remote_browser => "on",
+            .proxy => "proxy",
+        };
+    }
+
+    /// Icon of the toolbar route button and of a routed tab. Names
+    /// sketerm SHIPS (`data/icons`): the Adwaita `network-*-symbolic`
+    /// names resolve on no other theme chain. A caller-given proxy is
+    /// egress from another machine, which is what the via icon draws.
+    pub fn icon(self: Kind) [*:0]const u8 {
+        return switch (self) {
+            .direct => "sketerm-route-direct-symbolic",
+            .tor => "sketerm-route-tor-symbolic",
+            .mux, .proxy => "sketerm-route-via-symbolic",
+            .remote_browser => "sketerm-route-on-symbolic",
+        };
+    }
+
+    /// The route's proxy, not sketerm, decides which addresses a page
+    /// may reach, so the engine's literal private-address refusal steps
+    /// aside (the helper's `--proxy-decides-addresses`). Only a proxy
+    /// the caller runs as its egress policy: a Tor or `via:` route's
+    /// proxy is sketerm's own plumbing, and `127.0.0.1` through a mux
+    /// host is that host's loopback.
+    pub fn proxyDecidesAddresses(self: Kind) bool {
+        return self == .proxy;
+    }
+
+    /// Whether a restricted (untrusted) helper can realize this kind.
+    /// Its HTTP broker, not Chromium, makes every connection, and it
+    /// dials exactly one SOCKS5/HTTP proxy or none: direct, Tor's
+    /// endpoint, or a caller's proxy. `via:` is not wired into that
+    /// helper (its bridge would be the only proxy left untested there),
+    /// and `on:` runs the browser on another host altogether.
+    pub fn untrustedServable(self: Kind) bool {
+        return switch (self) {
+            .direct, .tor, .proxy => true,
+            .mux, .remote_browser => false,
+        };
+    }
 };
+
+/// The schemes `proxy:` accepts. Each names a proxy that receives the
+/// page's HOSTNAME, never an address resolved here.
+pub const ProxyScheme = enum {
+    /// SOCKS5 with the hostname in the CONNECT (ATYP 3, remote DNS).
+    socks5h,
+    /// HTTP CONNECT for https and wss; absolute-form forwarding for http.
+    http,
+
+    pub const all = [_]ProxyScheme{ .socks5h, .http };
+
+    /// The scheme as route text spells it.
+    pub fn word(self: ProxyScheme) []const u8 {
+        return @tagName(self);
+    }
+
+    /// Chromium's spelling, the helper's `--proxy`. Chromium's SOCKS5
+    /// always hands the proxy the hostname, so its `socks5` IS socks5h;
+    /// it knows no `socks5h` scheme at all.
+    pub fn chromium(self: ProxyScheme) []const u8 {
+        return switch (self) {
+            .socks5h => "socks5",
+            .http => "http",
+        };
+    }
+
+    /// libcurl's spelling, which the untrusted broker dials with; curl's
+    /// `socks5` would resolve the page host locally.
+    pub fn curl(self: ProxyScheme) []const u8 {
+        return switch (self) {
+            .socks5h => "socks5h",
+            .http => "http",
+        };
+    }
+};
+
+/// Every route text in one line: what every refusal, usage text and
+/// schema says a route is. Drift-tested against `Kind.word` and
+/// `ProxyScheme.word`.
+pub const GRAMMAR = "direct | tor | via:<host> | on:<host> | " ++ PROXY_GRAMMAR;
+
+/// The `proxy:` half of `GRAMMAR`.
+pub const PROXY_GRAMMAR = "proxy:socks5h://<host>:<port> | proxy:http://<host>:<port>";
+
+/// Longest `proxy:` url: the longest scheme, `://`, a host, `:65535`.
+pub const MAX_PROXY_URL: usize = "socks5h://".len + MAX_HOST + ":65535".len;
+
+/// Longest route text any kind formats to, for whoever stores one.
+pub const MAX_TEXT: usize = @max("via:".len + MAX_HOST, "proxy:".len + MAX_PROXY_URL);
+
+/// Why a `proxy:` url is outside the grammar; `ProxyUrl.refusal` says it
+/// in words.
+pub const ProxyError = error{
+    /// `socks5://`: in every client but Chromium it resolves locally.
+    LocalDns,
+    UnknownScheme,
+    Credentials,
+    Path,
+    BadHost,
+    BadPort,
+    TooLong,
+};
+
+/// `<scheme>://<host>:<port>` and nothing else: no credentials, no path,
+/// no query, an explicit nonzero port without leading zeros. HOST is a
+/// DNS name, a canonical dotted IPv4 literal or a bracketed IPv6 one.
+pub const ProxyUrl = struct {
+    scheme: ProxyScheme,
+    /// As written; an IPv6 literal keeps its brackets.
+    host: []const u8,
+    port: u16,
+    /// `host:port` as written: what labels show.
+    authority: []const u8,
+
+    /// The route grammar (`ProxyScheme.word`).
+    pub fn parse(text: []const u8) ProxyError!ProxyUrl {
+        return parseWith(text, .word);
+    }
+
+    /// The helper's `--proxy` (`ProxyScheme.chromium`), which is how a
+    /// Tor or `via:` route arrives there too.
+    pub fn parseChromium(text: []const u8) ?ProxyUrl {
+        return parseWith(text, .chromium) catch null;
+    }
+
+    const Spelling = enum { word, chromium, curl };
+
+    fn spell(scheme: ProxyScheme, spelling: Spelling) []const u8 {
+        return switch (spelling) {
+            .word => scheme.word(),
+            .chromium => scheme.chromium(),
+            .curl => scheme.curl(),
+        };
+    }
+
+    fn parseWith(text: []const u8, spelling: Spelling) ProxyError!ProxyUrl {
+        if (text.len > MAX_PROXY_URL) return error.TooLong;
+        const sep = std.mem.indexOf(u8, text, "://") orelse return error.UnknownScheme;
+        const name = text[0..sep];
+        const scheme: ProxyScheme = for (ProxyScheme.all) |s| {
+            if (std.mem.eql(u8, name, spell(s, spelling))) break s;
+        } else return if (spelling == .word and std.mem.eql(u8, name, "socks5"))
+            error.LocalDns
+        else
+            error.UnknownScheme;
+        const authority = text[sep + 3 ..];
+        if (std.mem.indexOfScalar(u8, authority, '@') != null) return error.Credentials;
+        if (std.mem.indexOfAny(u8, authority, "/?#") != null) return error.Path;
+        const colon = if (authority.len != 0 and authority[0] == '[') blk: {
+            const close = std.mem.indexOfScalar(u8, authority, ']') orelse return error.BadHost;
+            if (close + 1 >= authority.len or authority[close + 1] != ':') return error.BadPort;
+            break :blk close + 1;
+        } else std.mem.lastIndexOfScalar(u8, authority, ':') orelse return error.BadPort;
+        const host = authority[0..colon];
+        if (!validProxyHost(host)) return error.BadHost;
+        const port_text = authority[colon + 1 ..];
+        if (port_text.len == 0 or port_text.len > 5 or port_text[0] == '0') return error.BadPort;
+        for (port_text) |ch| if (!std.ascii.isDigit(ch)) return error.BadPort;
+        const port = std.fmt.parseInt(u16, port_text, 10) catch return error.BadPort;
+        return .{ .scheme = scheme, .host = host, .port = port, .authority = authority };
+    }
+
+    /// `<scheme>://<host>:<port>` in Chromium's spelling: the helper's `--proxy`.
+    pub fn formatChromium(self: ProxyUrl, buf: []u8) ?[]const u8 {
+        return std.fmt.bufPrint(buf, "{s}://{s}", .{ self.scheme.chromium(), self.authority }) catch null;
+    }
+
+    /// The same in libcurl's spelling: the untrusted broker's proxy.
+    pub fn formatCurl(self: ProxyUrl, buf: []u8) ?[]const u8 {
+        return std.fmt.bufPrint(buf, "{s}://{s}", .{ self.scheme.curl(), self.authority }) catch null;
+    }
+
+    /// The sentence a refusal of `err` carries.
+    pub fn refusal(err: ProxyError) []const u8 {
+        return switch (err) {
+            error.LocalDns => "socks5:// would resolve the page's hostname on this machine; use socks5h:// (the proxy resolves every host)",
+            error.UnknownScheme => "a proxy route is proxy:socks5h://HOST:PORT or proxy:http://HOST:PORT",
+            error.Credentials => "a proxy route carries no credentials (proxy authentication is not supported)",
+            error.Path => "a proxy route is scheme://HOST:PORT with no path, query or trailing slash",
+            error.BadHost => "the proxy host must be a DNS name, a dotted IPv4 literal or a bracketed IPv6 literal",
+            error.BadPort => "the proxy needs an explicit port, 1-65535, without leading zeros",
+            error.TooLong => "the proxy url is too long",
+        };
+    }
+};
+
+/// A DNS name, a canonical dotted IPv4 literal, or a bracketed IPv6
+/// literal; never an address spelled any other way a resolver accepts.
+fn validProxyHost(host: []const u8) bool {
+    if (host.len == 0 or host.len > MAX_HOST) return false;
+    if (host[0] == '[') {
+        if (host.len < 4 or host[host.len - 1] != ']') return false;
+        const ip = netpolicy.ipLiteral(host) orelse return false;
+        return ip == .v6;
+    }
+    var labels = std.mem.splitScalar(u8, host, '.');
+    var last: []const u8 = "";
+    while (labels.next()) |label| {
+        if (label.len == 0 or label.len > 63 or label[0] == '-' or label[label.len - 1] == '-') return false;
+        for (label) |ch| switch (ch) {
+            'a'...'z', 'A'...'Z', '0'...'9', '-', '_' => {},
+            else => return false,
+        };
+        last = label;
+    }
+    // A numeric last label is how every URL parser recognises IPv4;
+    // only the canonical dotted quad is one (127.1 and 0x7f.0.0.1 are not).
+    for (last) |ch| if (!std.ascii.isDigit(ch)) return true;
+    const ip = netpolicy.ipLiteral(host) orelse return false;
+    var buf: [16]u8 = undefined;
+    const canonical = std.fmt.bufPrint(&buf, "{d}.{d}.{d}.{d}", .{ ip.v4[0], ip.v4[1], ip.v4[2], ip.v4[3] }) catch return false;
+    return std.mem.eql(u8, canonical, host);
+}
 
 pub const Spec = struct {
     kind: Kind = .direct,
-    /// mux egress host or remote-helper host; empty for direct/tor.
+    /// mux egress host or remote-helper host; empty for every other kind.
     host: []const u8 = "",
-    /// `host:port` of the SOCKS5 proxy; empty unless `kind == .tor`.
+    /// `.tor`: `host:port` of the SOCKS5 proxy. `.proxy`: the proxy url
+    /// (`ProxyUrl` grammar, as written after `proxy:`). Empty otherwise.
     endpoint: []const u8 = "",
 
     pub fn eql(a: Spec, b: Spec) bool {
@@ -60,43 +289,48 @@ pub const Spec = struct {
             .direct => self.host.len == 0 and self.endpoint.len == 0,
             .tor => self.host.len == 0 and validEndpoint(self.endpoint),
             .mux, .remote_browser => validHost(self.host) and self.endpoint.len == 0,
+            .proxy => self.host.len == 0 and if (ProxyUrl.parse(self.endpoint)) |_| true else |_| false,
         };
     }
 
-    /// The proxy URL this route's helper instance is configured with, or
-    /// null when the route wants no proxy at all.
+    /// The proxy URL this route's helper instance is configured with
+    /// (Chromium's spelling, the helper's `--proxy`), or null when the
+    /// route wants no proxy at all.
     ///
     /// `.mux` returns null here on purpose: its proxy is a LOCAL bridge
     /// whose port is not known until the bridge binds, so the caller
-    /// formats that one itself. Only `.tor` names a proxy up front.
+    /// formats that one itself. `.tor` and `.proxy` name theirs up front.
     pub fn proxyUrl(self: Spec, buf: []u8) ?[]const u8 {
         return switch (self.kind) {
             .tor => std.fmt.bufPrint(buf, "socks5://{s}", .{self.endpoint}) catch null,
+            .proxy => (ProxyUrl.parse(self.endpoint) catch return null).formatChromium(buf),
             .direct, .mux, .remote_browser => null,
         };
     }
 
     /// The user-facing spelling, one home for config, the CLI and the
-    /// MCP argument: `direct` | `tor` | `via:<host>` | `on:<host>`.
-    /// Tor carries no endpoint here because the endpoint is a
-    /// machine-wide setting (`mux_tor_socks_endpoint`), supplied by the
-    /// caller at parse time; a spec whose fields do not fit the grammar
-    /// formats to null.
+    /// MCP argument: `direct` | `tor` | `via:<host>` | `on:<host>` |
+    /// `proxy:<url>`. Tor carries no endpoint here because the endpoint
+    /// is a machine-wide setting (`mux_tor_socks_endpoint`), supplied by
+    /// the caller at parse time; a spec whose fields do not fit the
+    /// grammar formats to null.
     pub fn format(self: Spec, buf: []u8) ?[]const u8 {
         return switch (self.kind) {
             .direct => std.fmt.bufPrint(buf, "direct", .{}) catch null,
             .tor => std.fmt.bufPrint(buf, "tor", .{}) catch null,
             .mux => if (self.host.len == 0) null else std.fmt.bufPrint(buf, "via:{s}", .{self.host}) catch null,
             .remote_browser => if (self.host.len == 0) null else std.fmt.bufPrint(buf, "on:{s}", .{self.host}) catch null,
+            .proxy => if (self.endpoint.len == 0) null else std.fmt.bufPrint(buf, "proxy:{s}", .{self.endpoint}) catch null,
         };
     }
 
     /// Inverse of `format`. `tor_endpoint` is the SOCKS5 `host:port` a
     /// `tor` spec resolves to; the returned spec borrows `text` and
     /// `tor_endpoint`. Null for anything outside the grammar, including
-    /// a `tor` whose endpoint is not a valid `host:port` and a `via:` or
-    /// `on:` without a host -- an unparseable route must never quietly
-    /// become direct.
+    /// a `tor` whose endpoint is not a valid `host:port`, a `via:` or
+    /// `on:` without a host and a `proxy:` url `ProxyUrl` refuses
+    /// (`proxyRefusal` says why) -- an unparseable route must never
+    /// quietly become direct.
     pub fn parse(text: []const u8, tor_endpoint: []const u8) ?Spec {
         const t = std.mem.trim(u8, text, " \t");
         if (t.len == 0 or std.mem.eql(u8, t, "direct")) return .{};
@@ -106,6 +340,22 @@ pub const Spec = struct {
         }
         if (std.mem.startsWith(u8, t, "via:")) return hostSpec(.mux, t["via:".len..]);
         if (std.mem.startsWith(u8, t, "on:")) return hostSpec(.remote_browser, t["on:".len..]);
+        if (std.mem.startsWith(u8, t, PROXY_PREFIX)) {
+            const url = t[PROXY_PREFIX.len..];
+            _ = ProxyUrl.parse(url) catch return null;
+            return .{ .kind = .proxy, .endpoint = url };
+        }
+        return null;
+    }
+
+    const PROXY_PREFIX = "proxy:";
+
+    /// Why `text` is not a usable `proxy:` route, or null when it is one
+    /// or is no `proxy:` text at all: the sentence a refusal carries.
+    pub fn proxyRefusal(text: []const u8) ?[]const u8 {
+        const t = std.mem.trim(u8, text, " \t");
+        if (!std.mem.startsWith(u8, t, PROXY_PREFIX)) return null;
+        _ = ProxyUrl.parse(t[PROXY_PREFIX.len..]) catch |err| return ProxyUrl.refusal(err);
         return null;
     }
 
@@ -130,15 +380,16 @@ pub const Spec = struct {
             .tor => "via Tor",
             .mux => std.fmt.bufPrint(buf, "via {s}", .{self.host}) catch "via server",
             .remote_browser => std.fmt.bufPrint(buf, "on {s}", .{self.host}) catch "on server",
+            .proxy => std.fmt.bufPrint(buf, "via proxy {s}", .{self.endpoint}) catch "via proxy",
         };
     }
 
     /// Icon name of a NON-direct route, null for direct: for a surface
     /// that marks routed tabs only. The always-visible route button
-    /// uses `Choice.icon`, which names every route.
+    /// uses `Kind.icon`, which names every route.
     pub fn icon(self: Spec) ?[*:0]const u8 {
         if (self.kind == .direct) return null;
-        return Choice.fromKind(self.kind).icon();
+        return self.kind.icon();
     }
 
     /// What the toolbar's ALWAYS-visible route button says, direct
@@ -153,6 +404,7 @@ pub const Spec = struct {
             .tor => "Tor",
             .mux => hostLabel(buf, "via ", self.host),
             .remote_browser => hostLabel(buf, "on ", self.host),
+            .proxy => hostLabel(buf, "proxy ", if (ProxyUrl.parse(self.endpoint)) |u| u.authority else |_| self.endpoint),
         };
     }
 
@@ -247,12 +499,25 @@ pub const Choice = enum(u8) {
 
     pub const all = [_]Choice{ .direct, .tor, .via, .on };
 
-    pub fn fromKind(k: Kind) Choice {
+    /// Every row's `label`, in `all` order and null-terminated: what a
+    /// dropdown is built from, so its index IS the choice's value.
+    pub const labels = blk: {
+        var names: [all.len:null]?[*:0]const u8 = undefined;
+        for (all, 0..) |ch, i| names[i] = ch.label();
+        break :blk names;
+    };
+
+    /// The picker row a route of kind `k` is, or null for a kind no
+    /// picker offers: a `proxy:` route is given by whoever opened the
+    /// tab (MCP, the CLI, config), shown as-is, and left by picking a
+    /// row like any other.
+    pub fn fromKind(k: Kind) ?Choice {
         return switch (k) {
             .direct => .direct,
             .tor => .tor,
             .mux => .via,
             .remote_browser => .on,
+            .proxy => null,
         };
     }
 
@@ -285,19 +550,10 @@ pub const Choice = enum(u8) {
         };
     }
 
-    /// Icon for the row and for the toolbar button when this is the
-    /// current choice; never null, unlike `Spec.icon`, because the
-    /// button is always there. Names sketerm SHIPS (`data/icons`):
-    /// the Adwaita `network-*-symbolic` names resolve on no other
-    /// theme chain, and the first GUI run of the route button showed
-    /// the broken-image glyph for exactly that reason.
+    /// Icon for the row; never null, unlike `Spec.icon`, because the
+    /// row is always there.
     pub fn icon(self: Choice) [*:0]const u8 {
-        return switch (self) {
-            .direct => "sketerm-route-direct-symbolic",
-            .tor => "sketerm-route-tor-symbolic",
-            .via => "sketerm-route-via-symbolic",
-            .on => "sketerm-route-on-symbolic",
-        };
+        return self.kind().icon();
     }
 
     /// The two host-bound choices cannot be applied from a one-click
@@ -503,10 +759,18 @@ test "a routed tab's title carries a badge, a direct one is untouched" {
 test "Choice is the one order every picker shares and mints valid specs" {
     const t = std.testing;
     const ep = "127.0.0.1:9050";
-    try t.expectEqual(Choice.direct, Choice.fromKind(.direct));
-    try t.expectEqual(Choice.via, Choice.fromKind(.mux));
-    try t.expectEqual(Choice.on, Choice.fromKind(.remote_browser));
-    inline for (Choice.all) |ch| try t.expectEqual(ch, Choice.fromKind(ch.kind()));
+    try t.expectEqual(Choice.direct, Choice.fromKind(.direct).?);
+    try t.expectEqual(Choice.via, Choice.fromKind(.mux).?);
+    try t.expectEqual(Choice.on, Choice.fromKind(.remote_browser).?);
+    // A caller-given proxy is no picker row.
+    try t.expect(Choice.fromKind(.proxy) == null);
+    inline for (Choice.all) |ch| try t.expectEqual(ch, Choice.fromKind(ch.kind()).?);
+    // A dropdown built from `labels` is indexed by the choice's value.
+    for (Choice.all, 0..) |ch, i| {
+        try t.expectEqual(i, @as(usize, @intFromEnum(ch)));
+        try t.expectEqualStrings(std.mem.span(ch.label()), std.mem.span(Choice.labels[i].?));
+    }
+    try t.expect(Choice.labels[Choice.all.len] == null);
     try t.expect(!Choice.direct.needsHost());
     try t.expect(!Choice.tor.needsHost());
     try t.expect(Choice.via.needsHost());
@@ -524,4 +788,154 @@ test "Choice is the one order every picker shares and mints valid specs" {
     var buf: [64]u8 = undefined;
     try t.expectEqualStrings("via:box", Choice.via.spec("box", ep).?.format(&buf).?);
     try t.expect(Spec.parse("on:box", ep).?.eql(Choice.on.spec("box", ep).?));
+}
+
+test "proxy route text round-trips through parse and format" {
+    const t = std.testing;
+    var buf: [MAX_TEXT]u8 = undefined;
+    for ([_][]const u8{
+        "proxy:socks5h://127.0.0.1:1080",
+        "proxy:http://127.0.0.1:8080",
+        "proxy:http://proxy.internal.example:3128",
+        "proxy:socks5h://[::1]:9050",
+        "proxy:http://[2001:db8::7]:65535",
+        "proxy:http://localhost:1",
+    }) |text| {
+        const spec = Spec.parse(text, "").?;
+        try t.expectEqual(Kind.proxy, spec.kind);
+        try t.expect(spec.valid());
+        try t.expectEqualStrings(text, spec.format(&buf).?);
+        try t.expect(Spec.validText(text));
+        try t.expect(Spec.proxyRefusal(text) == null);
+        // What `format` produces parses back to the same route.
+        try t.expect(Spec.parse(spec.format(&buf).?, "").?.eql(spec));
+    }
+    // Surrounding blanks are not part of the url.
+    try t.expectEqualStrings("http://127.0.0.1:8080", Spec.parse("  proxy:http://127.0.0.1:8080 ", "").?.endpoint);
+}
+
+test "a proxy route's helper and broker spellings keep DNS at the proxy" {
+    const t = std.testing;
+    var buf: [MAX_PROXY_URL]u8 = undefined;
+    // Chromium's socks5 is remote-DNS; it knows no socks5h at all.
+    try t.expectEqualStrings("socks5://127.0.0.1:1080", Spec.parse("proxy:socks5h://127.0.0.1:1080", "").?.proxyUrl(&buf).?);
+    try t.expectEqualStrings("http://[::1]:8080", Spec.parse("proxy:http://[::1]:8080", "").?.proxyUrl(&buf).?);
+    // The helper reads its --proxy back and hands curl socks5h, never
+    // curl's local-DNS socks5; a Tor route arrives the same way.
+    const tor = ProxyUrl.parseChromium("socks5://127.0.0.1:9050").?;
+    try t.expectEqual(ProxyScheme.socks5h, tor.scheme);
+    try t.expectEqualStrings("socks5h://127.0.0.1:9050", tor.formatCurl(&buf).?);
+    try t.expectEqualStrings("http://proxy.example:3128", ProxyUrl.parseChromium("http://proxy.example:3128").?.formatCurl(&buf).?);
+    // The helper takes only Chromium's spelling, the route only its own.
+    try t.expect(ProxyUrl.parseChromium("socks5h://127.0.0.1:9050") == null);
+    try t.expectError(error.LocalDns, ProxyUrl.parse("socks5://127.0.0.1:9050"));
+    const u = try ProxyUrl.parse("socks5h://[::1]:9050");
+    try t.expectEqualStrings("[::1]", u.host);
+    try t.expectEqual(@as(u16, 9050), u.port);
+    try t.expectEqualStrings("[::1]:9050", u.authority);
+}
+
+test "proxy route text outside the grammar is refused with its reason" {
+    const t = std.testing;
+    const Case = struct { text: []const u8, err: ProxyError };
+    for ([_]Case{
+        .{ .text = "socks5://127.0.0.1:1080", .err = error.LocalDns },
+        .{ .text = "https://127.0.0.1:8443", .err = error.UnknownScheme },
+        .{ .text = "SOCKS5H://127.0.0.1:1080", .err = error.UnknownScheme },
+        .{ .text = "127.0.0.1:1080", .err = error.UnknownScheme },
+        .{ .text = "http://user:pw@127.0.0.1:8080", .err = error.Credentials },
+        .{ .text = "http://user@127.0.0.1:8080", .err = error.Credentials },
+        .{ .text = "http://127.0.0.1:8080/", .err = error.Path },
+        .{ .text = "http://127.0.0.1:8080/pac", .err = error.Path },
+        .{ .text = "http://127.0.0.1:8080?x", .err = error.Path },
+        .{ .text = "http://127.0.0.1:8080#x", .err = error.Path },
+        .{ .text = "http://127.0.0.1", .err = error.BadPort },
+        .{ .text = "http://127.0.0.1:", .err = error.BadPort },
+        .{ .text = "http://127.0.0.1:0", .err = error.BadPort },
+        .{ .text = "http://127.0.0.1:65536", .err = error.BadPort },
+        .{ .text = "http://127.0.0.1:080", .err = error.BadPort },
+        .{ .text = "http://127.0.0.1:+80", .err = error.BadPort },
+        .{ .text = "http://127.0.0.1:8o", .err = error.BadPort },
+        .{ .text = "http://[::1]", .err = error.BadPort },
+        .{ .text = "http://::1:8080", .err = error.BadHost },
+        .{ .text = "http://[::1:8080", .err = error.BadHost },
+        .{ .text = "http://[127.0.0.1]:8080", .err = error.BadHost },
+        .{ .text = "http://[fe80::1%eth0]:8080", .err = error.BadHost },
+        .{ .text = "http://:8080", .err = error.BadHost },
+        .{ .text = "http://127.1:8080", .err = error.BadHost },
+        .{ .text = "http://0x7f.0.0.1:8080", .err = error.BadHost },
+        .{ .text = "http://bad host:8080", .err = error.BadHost },
+        .{ .text = "http://-lead.example:8080", .err = error.BadHost },
+    }) |case| {
+        try t.expectError(case.err, ProxyUrl.parse(case.text));
+        var buf: [64]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buf, "proxy:{s}", .{case.text});
+        // Never a route, never direct: refused, with the reason's sentence.
+        try t.expect(Spec.parse(text, "") == null);
+        try t.expect(!Spec.validText(text));
+        try t.expectEqualStrings(ProxyUrl.refusal(case.err), Spec.proxyRefusal(text).?);
+    }
+    var long: [MAX_PROXY_URL + 8]u8 = undefined;
+    @memcpy(long[0.."http://".len], "http://");
+    @memset(long["http://".len..], 'a');
+    try t.expectError(error.TooLong, ProxyUrl.parse(&long));
+    try t.expect(Spec.parse("proxy:", "") == null);
+    // A spec built by hand is held to the same grammar.
+    try t.expect(!(Spec{ .kind = .proxy }).valid());
+    try t.expect(!(Spec{ .kind = .proxy, .endpoint = "socks5://127.0.0.1:1" }).valid());
+    try t.expect(!(Spec{ .kind = .proxy, .host = "box", .endpoint = "http://127.0.0.1:1" }).valid());
+    var buf: [16]u8 = undefined;
+    try t.expect((Spec{ .kind = .proxy }).format(&buf) == null);
+    // Text that is no proxy route has no proxy refusal.
+    try t.expect(Spec.proxyRefusal("tor") == null);
+}
+
+test "every proxy url is its own helper instance and says where traffic leaves" {
+    const t = std.testing;
+    var a: [64]u8 = undefined;
+    var b: [64]u8 = undefined;
+    const one = Spec.parse("proxy:http://127.0.0.1:8080", "").?;
+    const two = Spec.parse("proxy:socks5h://127.0.0.1:8080", "").?;
+    try t.expect(!one.eql(two));
+    try t.expect(!std.mem.eql(u8, one.slug(&a).?, two.slug(&b).?));
+    try t.expectEqualStrings(one.slug(&a).?, Spec.parse("proxy:http://127.0.0.1:8080", "").?.slug(&b).?);
+    try t.expect(std.mem.startsWith(u8, one.slug(&a).?, "proxy-"));
+    var buf: [MAX_TEXT + 16]u8 = undefined;
+    try t.expectEqualStrings("via proxy http://127.0.0.1:8080", one.describe(&buf));
+    try t.expectEqualStrings("proxy 127.0.0.1:8080", one.shortLabel(&buf));
+    try t.expectEqualStrings("[proxy 127.0.0.1:8080] Page", one.badgedTitle(&buf, "Page"));
+    try t.expect(one.icon() != null);
+    // The longest legal url fits every buffer sized by MAX_TEXT.
+    var host: [MAX_HOST]u8 = undefined;
+    for (&host, 0..) |*ch, i| ch.* = if (i % 64 == 63) '.' else 'h';
+    var url_buf: [MAX_TEXT]u8 = undefined;
+    const longest = try std.fmt.bufPrint(&url_buf, "proxy:socks5h://{s}:65535", .{host});
+    try t.expectEqual(MAX_TEXT, longest.len);
+    var out: [MAX_TEXT]u8 = undefined;
+    try t.expectEqualStrings(longest, Spec.parse(longest, "").?.format(&out).?);
+}
+
+test "the kind vocabulary: words, address authority and untrusted realization" {
+    const t = std.testing;
+    try t.expectEqualStrings("proxy", Kind.proxy.word());
+    try t.expectEqualStrings("via", Kind.mux.word());
+    // Only a caller's own proxy is the address authority.
+    for (std.enums.values(Kind)) |k| try t.expectEqual(k == .proxy, k.proxyDecidesAddresses());
+    try t.expect(Kind.direct.untrustedServable());
+    try t.expect(Kind.tor.untrustedServable());
+    try t.expect(Kind.proxy.untrustedServable());
+    try t.expect(!Kind.mux.untrustedServable());
+    try t.expect(!Kind.remote_browser.untrustedServable());
+    for (std.enums.values(Kind)) |k| try t.expect(k.word().len > 0);
+}
+
+test "the one-line grammar names every kind and every proxy scheme" {
+    const t = std.testing;
+    for (std.enums.values(Kind)) |k| try t.expect(std.mem.indexOf(u8, GRAMMAR, k.word()) != null);
+    for (ProxyScheme.all) |scheme| {
+        var buf: [32]u8 = undefined;
+        const spelled = try std.fmt.bufPrint(&buf, "proxy:{s}://", .{scheme.word()});
+        try t.expect(std.mem.indexOf(u8, GRAMMAR, spelled) != null);
+    }
+    try t.expectEqual(std.enums.values(ProxyScheme).len, ProxyScheme.all.len);
 }

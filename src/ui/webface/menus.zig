@@ -552,7 +552,7 @@ pub fn showBurgerMenu(self: *WebFace, anchor: *c.GtkWidget) void {
         var rbuf: [64]u8 = undefined;
         var sbuf: [webroute.HOST_LABEL_MAX + 8]u8 = undefined;
         const rlabel = std.fmt.bufPrintZ(&rbuf, "Route: {s}", .{self.routeSpec().shortLabel(&sbuf)}) catch "Route";
-        const rm = tabs.submenuIcon(rlabel.ptr, .{ .name = current.icon() });
+        const rm = tabs.submenuIcon(rlabel.ptr, .{ .name = self.routeSpec().kind.icon() });
         self.appendRouteRows(root, rm, current);
     }
     self.appendContainerRows(root, tabs, ctx);

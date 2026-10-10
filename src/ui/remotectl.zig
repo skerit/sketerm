@@ -1354,7 +1354,7 @@ fn webCmd(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList(u8), all
                         .load_seq = face.load_seq,
                         .cert = if (face.cert_rec) |*rec| rec.wire() else null,
                         .load_error = if (face.load_error_rec) |*rec| rec.wire() else null,
-                        .route = face.routeSpec().format(try arena.alloc(u8, webroute.MAX_HOST + 8)) orelse "direct",
+                        .route = face.routeSpec().format(try arena.alloc(u8, webroute.MAX_TEXT)) orelse face.routeSpec().kind.word(),
                     });
                 }
             }
@@ -1369,7 +1369,7 @@ fn webCmd(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList(u8), all
 
     if (eql(u8, req.cmd, "web-container")) {
         // Create an identity container with a default ROUTE. `route` is
-        // web/route.zig text (direct | tor | via:<host> | on:<host>);
+        // web/route.zig text (`webroute.GRAMMAR`);
         // the legacy `host`+`remote` pair still maps (host = via:, host
         // + remote = on:) so old callers keep working. Process-wide
         // state, so it takes the WINDOW's long-lived allocator.
@@ -1383,7 +1383,7 @@ fn webCmd(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList(u8), all
                 return ipc_protocol.writeErr(out, allocator, .invalid_request, "host too long");
         };
         const spec = webroute.Spec.parse(route_text, webface.torEndpoint()) orelse
-            return ipc_protocol.writeErr(out, allocator, .invalid_request, "route must be direct | tor | via:<host> | on:<host>");
+            return ipc_protocol.writeErr(out, allocator, .invalid_request, "route must be " ++ webroute.GRAMMAR);
         const id = webface.createContainer(self.allocator, name, req.ephemeral, spec);
         if (id == 0)
             return ipc_protocol.writeErr(out, allocator, .failed, "container creation failed");
@@ -1396,7 +1396,7 @@ fn webCmd(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList(u8), all
         // after the pane exists would leave a blank tab behind.
         const route_spec: ?webroute.Spec = if (req.route) |r|
             webroute.Spec.parse(r, webface.torEndpoint()) orelse
-                return ipc_protocol.writeErr(out, allocator, .invalid_request, "route must be direct | tor | via:<host> | on:<host>")
+                return ipc_protocol.writeErr(out, allocator, .invalid_request, "route must be " ++ webroute.GRAMMAR)
         else
             null;
         // A named pane pins the window: splitting it from another
@@ -1443,7 +1443,7 @@ fn webCmd(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList(u8), all
         focusPaneFace(pane);
         // Route first: the page must load on the right instance.
         if (route_spec) |spec| face.setRoute(spec) catch |e| return ipc_protocol.writeErr(out, allocator, .invalid_request, switch (e) {
-            error.InvalidRoute => "route must be direct | tor | via:<host> | on:<host>",
+            error.InvalidRoute => "route must be " ++ webroute.GRAMMAR,
             error.AttachedView => "an attached (inspector) view cannot be routed",
             error.RouteUnavailable => "no browser instance could be started for that route",
         });

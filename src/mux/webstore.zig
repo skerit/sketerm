@@ -35,8 +35,8 @@ pub const MAX_CONTAINER_NAME: usize = 128;
 /// Bound on an egress / remote-helper host and on a site-rule host.
 pub const MAX_HOST: usize = 256;
 
-/// Longest stored route text: the grammar's prefix plus a host.
-const MAX_ROUTE: usize = webroute.MAX_HOST + 8;
+/// Longest stored route text: the longest any kind formats to.
+const MAX_ROUTE: usize = webroute.MAX_TEXT;
 
 /// A stored route must be in the grammar and short; "" is direct.
 fn routeOk(text: []const u8) bool {

@@ -277,6 +277,13 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
         const routes = @import("mcp_web.zig").routeCapability(web_ok);
         try res.fact("web_routes", routes.name());
         try res.text(routes.describe());
+        const proxy = @import("mcp_web.zig").routeProxyCapability(web_ok);
+        try res.fact("web_route_proxy", proxy);
+        try res.fact("web_untrusted_routes", @import("mcp_web.zig").untrustedRouteWords());
+        if (proxy.available) try res.textf("route {s} sends every request of a tab through your own forward proxy, which resolves every host; {s}", .{
+            proxy.grammar,
+            if (proxy.untrusted) "untrusted views may take it too, and their loader then dials that proxy and nothing else" else "untrusted views cannot open here",
+        });
     }
     // How tabs are addressed when several callers share this browser.
     {
