@@ -65,6 +65,13 @@ const Terminal = @import("../terminal.zig").Terminal;
 /// Slow fallback for a registry change the monitor missed (no GIO
 /// backend, a lost inotify event) and the roster refresh cadence.
 const TICK_MS: c_uint = 3000;
+/// `TICK_MS`, or the test hook `SKETERM_ASSISTANTS_TICK_MS=<ms>` (at
+/// least 50), which lets a rig land ticks inside a window's teardown.
+fn tickMs() c_uint {
+    const raw = c.getenv("SKETERM_ASSISTANTS_TICK_MS") orelse return TICK_MS;
+    const ms = std.fmt.parseInt(c_uint, std.mem.span(raw), 10) catch return TICK_MS;
+    return @max(ms, 50);
+}
 /// Coalesces the CREATED + CHANGED + lock events one registration emits.
 const RESCAN_DEBOUNCE_MS: c_uint = 150;
 /// Bound on one daemon's `list` reply; past it the daemon reads as
@@ -796,10 +803,11 @@ pub const Watcher = struct {
     /// ordered first in the popover.
     preferred_buf: [512]u8 = undefined,
     preferred_len: usize = 0,
-    /// The chip's widget tree was disposed (the window closed): no
-    /// label, popover or tooltip may be touched again. `Window.deinit`
-    /// (and so `stop`) runs on a LATER idle than the widget destroy
-    /// chain, which is why this is a flag and not an ordering rule.
+    /// The window's widgets are being disposed (`sever`, or the chip's
+    /// own destroy): no label, popover, tooltip or tab may be touched
+    /// again. `Window.deinit` (and so `stop`) runs on a LATER idle than
+    /// the widget destroy chain, which is why this is a flag and not an
+    /// ordering rule.
     widgets_dead: bool = false,
 
     /// Create the chip at the end of the window's tab bar and start
@@ -855,15 +863,18 @@ pub const Watcher = struct {
         // there must target a live GObject, never a finalized one.
         _ = c.g_object_ref(@ptrCast(chip));
         self.arm();
-        self.tick_id = c.g_timeout_add(TICK_MS, @ptrCast(&onTick), @ptrCast(self));
+        self.tick_id = c.g_timeout_add(tickMs(), @ptrCast(&onTick), @ptrCast(self));
         self.rescan();
         return self;
     }
 
-    /// Stop watching. Widgets are left to the window's own teardown;
-    /// the struct is freed once no worker can still report into it.
-    pub fn stop(self: *Watcher) void {
-        self.dead = true;
+    /// Stop every source that walks the window's widgets: called from
+    /// `Window.beginDestroy`, since the struct lives on until the deferred
+    /// window free while GTK disposes those widgets. The chip's own
+    /// destroy cannot raise `widgets_dead` in time: our reference keeps
+    /// the chip undisposed until `stop`.
+    pub fn sever(self: *Watcher) void {
+        self.widgets_dead = true;
         if (self.tick_id != 0) {
             _ = c.g_source_remove(self.tick_id);
             self.tick_id = 0;
@@ -873,6 +884,13 @@ pub const Watcher = struct {
             self.rescan_id = 0;
         }
         self.disarm();
+    }
+
+    /// Stop watching. Widgets are left to the window's own teardown;
+    /// the struct is freed once no worker can still report into it.
+    pub fn stop(self: *Watcher) void {
+        self.dead = true;
+        self.sever();
         _ = c.g_signal_handlers_disconnect_matched(@ptrCast(self.chip), @intCast(c.G_SIGNAL_MATCH_DATA), 0, 0, null, null, @ptrCast(self));
         c.g_object_unref(@ptrCast(self.chip));
         self.freeRoster();
@@ -945,6 +963,13 @@ pub const Watcher = struct {
     /// sessions a surface needs.
     fn rescan(self: *Watcher) void {
         if (self.dead) return;
+        // Past `beginDestroy` GTK is disposing the window's widgets, and a
+        // rescan walks them (`refreshTabGlances`): `sever` must have
+        // stopped every source that leads here.
+        if (self.win.destroying and c.getenv("SKETERM_VERIFY_WINDOW_TEARDOWN") != null) {
+            std.debug.print("sketerm: assistants watcher rescanned a destroying window\n", .{});
+            c.abort();
+        }
         var changed = false;
         if (mcp_registry.list(self.allocator, true)) |entries| {
             defer mcp_registry.freeEntries(self.allocator, entries);

@@ -1200,6 +1200,7 @@ pub const Window = struct {
         if (self.destroying) return;
         self.destroying = true;
         self.tabbar.sever();
+        if (self.assistants) |watcher| watcher.sever();
         @import("prefs.zig").closeForWindow(@ptrCast(self));
         if (self.tab_sidebar) |sb| sb.sever();
         self.tab_sidebar = null;
