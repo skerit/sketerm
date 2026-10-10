@@ -1,5 +1,23 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-10: a closed control connection is resent; editor status no longer widens
+
+The MCP's kept-alive GUI control connection lost a request as
+`NoResponse` when the peer hung up between the idle check and the write.
+On Linux a unix-stream ECONNRESET proves the request was never read, so
+`ctlclient` now classifies it as pre-delivery and the reused connection
+is redialed once (`platform.unix_reset_means_unread`); a peer that read
+the request and then closed stays uncertain and is never resent. The
+real GUI keeps connections open; smoke-mcp's fake GUI closed after every
+reply, which is why `webGuiGrantStage` failed 10/15, and now models the
+real server.
+
+The editor's status line could not ellipsize, so its whole text was the
+window's minimum width: zls's version complaint grew the window by 122px
+and moved the gutter (smoke-atspi's gutter probes then hit the text). It
+ellipsizes at the end now, and smoke-atspi fails by name when opening a
+document changes the window width.
+
 ## 2026-10-10: headless browser views lay out at their device scale again
 
 A headless-ozone helper (the GUI's browser on a host without a Wayland
