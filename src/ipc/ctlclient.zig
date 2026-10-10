@@ -92,11 +92,7 @@ pub const Conn = struct {
         const total = line.len + 1;
         while (written < total) {
             if (deadline_ms - clock.nowMs() <= 0) return failure(error.Timeout, written > 0);
-            const chunk: []const u8 = if (written < line.len) line[written..] else "\n";
-            const n = if (comptime @hasDecl(c, "MSG_NOSIGNAL"))
-                c.send(self.fd, chunk.ptr, chunk.len, c.MSG_NOSIGNAL)
-            else
-                c.write(self.fd, chunk.ptr, chunk.len);
+            const n = sendFrom(self.fd, line, written);
             if (n > 0) {
                 written += @intCast(n);
                 continue;
@@ -107,6 +103,28 @@ pub const Conn = struct {
             pollUntil(self.fd, c.POLLOUT, deadline_ms) catch |err| return failure(err, written > 0);
         }
         return null;
+    }
+
+    /// Send `line` plus its newline from byte `from` on in ONE gather call.
+    /// Two sends let a peer close between the body and the terminator, so
+    /// the request it never read failed the second send as uncertain and
+    /// was never resent.
+    fn sendFrom(fd: c_int, line: []const u8, from: usize) isize {
+        var iov: [2]c.struct_iovec = undefined;
+        var count: usize = 0;
+        if (from < line.len) {
+            iov[0] = .{ .iov_base = @ptrCast(@constCast(line[from..].ptr)), .iov_len = line.len - from };
+            count = 1;
+        }
+        iov[count] = .{ .iov_base = @ptrCast(@constCast("\n".ptr)), .iov_len = 1 };
+        count += 1;
+        if (comptime @hasDecl(c, "MSG_NOSIGNAL")) {
+            var mh = std.mem.zeroes(c.struct_msghdr);
+            mh.msg_iov = &iov;
+            mh.msg_iovlen = @intCast(count);
+            return c.sendmsg(fd, &mh, c.MSG_NOSIGNAL);
+        }
+        return c.writev(fd, &iov, @intCast(count));
     }
 
     fn readLine(self: *Conn, allocator: std.mem.Allocator, deadline_ms: i64) Result {
@@ -241,6 +259,33 @@ fn pollUntil(fd: c_int, events: c_short, deadline_ms: i64) !void {
 
 const t = std.testing;
 
+/// Checks `r` is the reply `want` and frees it; reading `.reply` off a
+/// failure is unchecked in ReleaseFast and segfaults instead of failing.
+fn expectReply(want: []const u8, r: Result) !void {
+    switch (r) {
+        .reply => |got| {
+            defer t.allocator.free(got);
+            try t.expectEqualStrings(want, got);
+        },
+        .failure => |f| {
+            std.debug.print("expected reply {s}, got {s} ({s})\n", .{ want, @errorName(f.err), @tagName(f.delivery) });
+            return error.TestUnexpectedResult;
+        },
+    }
+}
+
+/// Returns `r`'s failure, or fails the test (freeing the reply) when it succeeded.
+fn expectFailure(r: Result) !Failure {
+    switch (r) {
+        .failure => |f| return f,
+        .reply => |got| {
+            std.debug.print("expected a failure, got reply {s}\n", .{got});
+            t.allocator.free(got);
+            return error.TestUnexpectedResult;
+        },
+    }
+}
+
 /// A listening socket under /tmp (never under cwd: sockaddr_un caps the path).
 const TestListener = struct {
     fd: c_int,
@@ -277,6 +322,7 @@ const Peer = struct {
     /// Replies written after each request line; an empty entry closes
     /// the connection without answering.
     fn serve(listen_fd: c_int, replies: []const []const u8) void {
+        if (!readable(listen_fd)) return;
         const fd = c.accept(listen_fd, null, null);
         if (fd < 0) return;
         defer _ = c.close(fd);
@@ -284,6 +330,7 @@ const Peer = struct {
         var have: usize = 0;
         for (replies) |reply| {
             while (std.mem.indexOfScalar(u8, buf[0..have], '\n') == null) {
+                if (!readable(fd)) return;
                 const n = c.read(fd, buf[have..].ptr, buf.len - have);
                 if (n <= 0) return;
                 have += @intCast(n);
@@ -294,6 +341,13 @@ const Peer = struct {
             if (reply.len == 0) return;
             _ = c.write(fd, reply.ptr, reply.len);
         }
+    }
+
+    /// Bounds every peer-side wait, so a failing test's deferred join
+    /// returns instead of hanging on a peer parked in accept or read.
+    fn readable(fd: c_int) bool {
+        var pfd = c.struct_pollfd{ .fd = fd, .events = c.POLLIN, .revents = 0 };
+        return c.poll(&pfd, 1, 5_000) > 0;
     }
 };
 
@@ -306,17 +360,13 @@ test "one connection carries several exchanges, split replies included" {
     defer th.join();
     var conn = try Conn.open(l.path(), clock.nowMs() + 2_000);
     defer conn.close(t.allocator);
-    const first = conn.exchange(t.allocator, "{\"cmd\":\"a\"}", clock.nowMs() + 2_000);
-    try t.expectEqualStrings("{\"ok\":true,\"n\":1}", first.reply);
-    t.allocator.free(first.reply);
-    const second = conn.exchange(t.allocator, "{\"cmd\":\"b\"}", clock.nowMs() + 2_000);
-    try t.expectEqualStrings("{\"ok\":true,\"n\":2}", second.reply);
-    t.allocator.free(second.reply);
+    try expectReply("{\"ok\":true,\"n\":1}", conn.exchange(t.allocator, "{\"cmd\":\"a\"}", clock.nowMs() + 2_000));
+    try expectReply("{\"ok\":true,\"n\":2}", conn.exchange(t.allocator, "{\"cmd\":\"b\"}", clock.nowMs() + 2_000));
 }
 
 test "a refused connect is pre-delivery and a lost reply is uncertain" {
     const none = exchangeOnce(t.allocator, "/tmp/sk-ctl-no-such-listener.sock", "{}", 500);
-    try t.expectEqual(Delivery.pre_delivery, none.failure.delivery);
+    try t.expectEqual(Delivery.pre_delivery, (try expectFailure(none)).delivery);
     try t.expect(!alive("/tmp/sk-ctl-no-such-listener.sock"));
 
     var l = try TestListener.init();
@@ -328,7 +378,7 @@ test "a refused connect is pre-delivery and a lost reply is uncertain" {
     const th = try std.Thread.spawn(.{}, Peer.serve, .{ l.fd, &[_][]const u8{""} });
     defer th.join();
     const lost = exchangeOnce(t.allocator, l.path(), "{\"cmd\":\"x\"}", 2_000);
-    try t.expectEqual(Delivery.uncertain_delivery, lost.failure.delivery);
+    try t.expectEqual(Delivery.uncertain_delivery, (try expectFailure(lost)).delivery);
 }
 
 test "a persistent client reuses one connection and redials a closed one" {
@@ -341,22 +391,17 @@ test "a persistent client reuses one connection and redials a closed one" {
         // answered, so two replies prove the connection was reused.
         const th = try std.Thread.spawn(.{}, Peer.serve, .{ l.fd, &[_][]const u8{ "{\"n\":1}\n", "{\"n\":2}\n", "" } });
         defer th.join();
-        for ([_][]const u8{ "{\"n\":1}", "{\"n\":2}" }) |want| {
-            const r = client.exchange(t.allocator, l.path(), "{}", 2_000);
-            try t.expectEqualStrings(want, r.reply);
-            t.allocator.free(r.reply);
-        }
+        for ([_][]const u8{ "{\"n\":1}", "{\"n\":2}" }) |want|
+            try expectReply(want, client.exchange(t.allocator, l.path(), "{}", 2_000));
         try t.expectEqual(@as(u32, 1), client.dials);
         // The third request makes the peer hang up without answering.
         const lost = client.exchange(t.allocator, l.path(), "{}", 2_000);
-        try t.expectEqual(Delivery.uncertain_delivery, lost.failure.delivery);
+        try t.expectEqual(Delivery.uncertain_delivery, (try expectFailure(lost)).delivery);
     }
     // A restarted GUI: the next exchange dials afresh.
     const th = try std.Thread.spawn(.{}, Peer.serve, .{ l.fd, &[_][]const u8{"{\"n\":3}\n"} });
     defer th.join();
-    const r = client.exchange(t.allocator, l.path(), "{}", 2_000);
-    try t.expectEqualStrings("{\"n\":3}", r.reply);
-    t.allocator.free(r.reply);
+    try expectReply("{\"n\":3}", client.exchange(t.allocator, l.path(), "{}", 2_000));
     try t.expectEqual(@as(u32, 2), client.dials);
 }
 
@@ -368,16 +413,13 @@ test "an idle connection the peer closed is noticed before the write" {
     {
         const th = try std.Thread.spawn(.{}, Peer.serve, .{ l.fd, &[_][]const u8{"{\"n\":1}\n"} });
         defer th.join();
-        const r = client.exchange(t.allocator, l.path(), "{}", 2_000);
-        t.allocator.free(r.reply);
+        try expectReply("{\"n\":1}", client.exchange(t.allocator, l.path(), "{}", 2_000));
     }
     // The peer thread returned and closed its end while we were idle.
     try t.expect(client.conn.?.peerClosed());
     const th = try std.Thread.spawn(.{}, Peer.serve, .{ l.fd, &[_][]const u8{"{\"n\":2}\n"} });
     defer th.join();
-    const r = client.exchange(t.allocator, l.path(), "{}", 2_000);
-    try t.expectEqualStrings("{\"n\":2}", r.reply);
-    t.allocator.free(r.reply);
+    try expectReply("{\"n\":2}", client.exchange(t.allocator, l.path(), "{}", 2_000));
     try t.expectEqual(@as(u32, 2), client.dials);
 }
 
@@ -392,10 +434,11 @@ test "a reused connection the peer closed with the request unread is resent" {
     // answered.
     const Racer = struct {
         fn run(listen_fd: c_int) void {
+            if (!Peer.readable(listen_fd)) return;
             const fd = c.accept(listen_fd, null, null);
             if (fd < 0) return;
             var buf: [256]u8 = undefined;
-            if (c.read(fd, &buf, buf.len) <= 0) {
+            if (!Peer.readable(fd) or c.read(fd, &buf, buf.len) <= 0) {
                 _ = c.close(fd);
                 return;
             }
@@ -409,11 +452,8 @@ test "a reused connection the peer closed with the request unread is resent" {
     };
     const th = try std.Thread.spawn(.{}, Racer.run, .{l.fd});
     defer th.join();
-    for ([_][]const u8{ "{\"n\":1}", "{\"n\":2}" }) |want| {
-        const r = client.exchange(t.allocator, l.path(), "{}", 2_000);
-        try t.expectEqualStrings(want, r.reply);
-        t.allocator.free(r.reply);
-    }
+    for ([_][]const u8{ "{\"n\":1}", "{\"n\":2}" }) |want|
+        try expectReply(want, client.exchange(t.allocator, l.path(), "{}", 2_000));
     try t.expectEqual(@as(u32, 2), client.dials);
 }
 
@@ -422,7 +462,6 @@ test "a silent peer costs the deadline, not forever" {
     defer l.deinit();
     const start = clock.nowMs();
     const r = exchangeOnce(t.allocator, l.path(), "{}", 200);
-    try t.expect(r == .failure);
-    try t.expectEqual(error.Timeout, r.failure.err);
+    try t.expectEqual(error.Timeout, (try expectFailure(r)).err);
     try t.expect(clock.nowMs() - start < 1_500);
 }
