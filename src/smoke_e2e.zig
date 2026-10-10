@@ -1204,6 +1204,12 @@ pub fn main() u8 {
         teardown();
         return 0;
     }
+    if (c.getenv("SKETERM_SMOKE_E2E_THEME_ONLY") != null) {
+        if (themeSingletonStage(allocator, drive, rt, &wl_z)) |why| return failMsg(why);
+        say("secondary window: one Preferences child, sidebar flush on close, alive through theme flips");
+        teardown();
+        return 0;
+    }
     if (c.getenv("SKETERM_SMOKE_E2E_EDITOR_OPS_ONLY") != null) {
         const app = drive orelse return fail("focused editor ops smoke has no display driver");
         if (editorops_stage.stage(allocator, app, sock_path, rt)) |why| return failMsg(why);
@@ -14597,6 +14603,12 @@ fn themeSingletonStage(
         // can emit notify::dark (libadwaita takes the system preference
         // from the desktop portal only).
         _ = c.setenv("SKETERM_THEME_FLIP_MS", "200", 1);
+        // The AI-badge watcher's roster tick, every 100ms instead of 3s,
+        // so ticks land between a closed window's destroy and its
+        // deferred free (which a pending page detach delays).
+        _ = c.setenv("SKETERM_ASSISTANTS_TICK_MS", "100", 1);
+        // ...and a tick that walks a window past beginDestroy aborts.
+        _ = c.setenv("SKETERM_VERIFY_WINDOW_TEARDOWN", "1", 1);
         const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "--no-save", null };
         _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
         c._exit(127);
