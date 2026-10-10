@@ -33,11 +33,17 @@
 //! instance that died leaves with its host's next report; an attach
 //! that still races it fails with the route's named refusal, as a toast.
 //!
+//! The badge popover is synced, never rebuilt, while it shows: a
+//! section or row whose identity (`SectionKey`, `RowKey`) holds keeps
+//! its widgets and only its labels and state change, so a roster change
+//! cannot replace a button between a press and its release.
+//!
 //! Lifetimes: heap row contexts are owned by their button (mechanism
-//! 1, `GDestroyNotify`); the popover is unparented by the chip's own
-//! destroy handler; every worker handback and timer resolves through
-//! the `dead` fence, and `stop` frees the watcher only once the last
-//! worker has reported.
+//! 1, `GDestroyNotify`), the popover's, a section's and a row's view
+//! by its widget (mechanism 1, qdata); the popover is unparented by
+//! the chip's own destroy handler; every worker handback and timer
+//! resolves through the `dead` fence, and `stop` frees the watcher only
+//! once the last worker has reported.
 
 const std = @import("std");
 const c = @import("../c.zig").c;
@@ -776,6 +782,66 @@ pub fn attachVerb(lease: muxtabs.Lease) AttachVerb {
     };
 }
 
+/// A badge-popover session row's identity: while it holds, a roster
+/// change updates the row's widgets in place instead of replacing them.
+/// The kind is part of it because the row's action buttons follow it.
+pub const RowKey = struct {
+    session: []const u8,
+    attach_host: []const u8,
+    kind: Kind,
+
+    pub fn same(x: RowKey, y: RowKey) bool {
+        return x.kind == y.kind and std.mem.eql(u8, x.session, y.session) and std.mem.eql(u8, x.attach_host, y.attach_host);
+    }
+};
+
+/// A badge-popover section's identity: its assistant's `Assistant.host`.
+pub const SectionKey = struct {
+    host: []const u8,
+
+    pub fn same(x: SectionKey, y: SectionKey) bool {
+        return std.mem.eql(u8, x.host, y.host);
+    }
+};
+
+/// Pair each wanted identity with a shown entry that has it, claiming
+/// each shown entry at most once (a duplicate wanted identity gets a new one).
+/// @param kept receives, per wanted entry, the shown index it keeps, or null for a new entry.
+/// @param claimed receives, per shown entry, whether it is kept; an unclaimed one is gone.
+pub fn matchIdentities(comptime K: type, shown: []const K, wanted: []const K, kept: []?usize, claimed: []bool) void {
+    @memset(claimed, false);
+    for (wanted, kept) |want, *slot| {
+        slot.* = null;
+        for (shown, 0..) |have, i| {
+            if (claimed[i] or !K.same(have, want)) continue;
+            claimed[i] = true;
+            slot.* = i;
+            break;
+        }
+    }
+}
+
+/// `matchIdentities` in scratch memory, for one container's sync.
+fn Match(comptime K: type) type {
+    return struct {
+        kept: []?usize,
+        claimed: []bool,
+
+        fn init(allocator: std.mem.Allocator, shown: []const K, wanted: []const K) !@This() {
+            const kept = try allocator.alloc(?usize, wanted.len);
+            errdefer allocator.free(kept);
+            const claimed = try allocator.alloc(bool, shown.len);
+            matchIdentities(K, shown, wanted, kept, claimed);
+            return .{ .kept = kept, .claimed = claimed };
+        }
+
+        fn deinit(self: @This(), allocator: std.mem.Allocator) void {
+            allocator.free(self.kept);
+            allocator.free(self.claimed);
+        }
+    };
+}
+
 /// A remote daemon whose `assistants` report this window reads.
 const ReportHost = struct {
     spec: []u8,
@@ -1181,7 +1247,7 @@ pub const Watcher = struct {
         tip[n] = 0;
         c.gtk_widget_set_tooltip_text(self.chip, tip[0..n :0].ptr);
         c.gtk_widget_set_visible(self.chip, 1);
-        if (c.gtk_widget_get_visible(self.popover) != 0) self.buildPopover();
+        if (c.gtk_widget_get_visible(self.popover) != 0) self.syncPopover();
     }
 
     // ── agent glance (pane chips, tab badges) ──────────────────
@@ -1252,7 +1318,7 @@ pub const Watcher = struct {
             for (self.roster.items) |*a| {
                 if (!glance.runsIn(a.origin(), at, default_socket)) continue;
                 if (first_key.len == 0) first_key = a.host;
-                self.appendHeader(content, a);
+                self.updateHeader(newHeader(content), a);
                 const list = newSessionList();
                 for (a.agents.items, 0..) |*ag, i| {
                     self.appendAgentRow(list, a, ag, @intCast(i));
@@ -1326,49 +1392,34 @@ pub const Watcher = struct {
             @import("app_switcher.zig").open(self.win);
             return;
         }
-        self.buildPopover();
+        self.syncPopover();
         c.gtk_popover_popup(@ptrCast(self.popover));
         // Remote instances are listed only while this is open: start now
         // rather than on the next tick.
         for (self.roster.items) |*a| if (a.reached != null) self.startFetch(a);
     }
 
-    /// The badge popover: usable instances first (the preferred one at
-    /// the top), each a header line over its session rows; the rest as
-    /// one collapsed line at the bottom; all inside the capped scroller.
-    fn buildPopover(self: *Watcher) void {
-        const pop: *c.GtkPopover = @ptrCast(self.popover);
-        c.gtk_popover_set_child(pop, null);
-        const root = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 8).?;
-        setMargins(root, 6);
-        const content = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 10).?;
-        const first = self.findByHost(self.preferred());
-        if (first) |a| if (a.usable()) self.appendAssistant(content, a);
-        for (self.roster.items) |*a| {
-            if (first == a or !a.usable()) continue;
-            self.appendAssistant(content, a);
+    /// Bring the badge popover in line with the roster: usable instances
+    /// first (the preferred one at the top), each a header line over its
+    /// session rows; the rest as one collapsed line at the bottom; all
+    /// inside the capped scroller. A section or row whose identity holds
+    /// keeps its widgets, so a roster change landing on an open popover
+    /// cannot swallow a click on one of its buttons.
+    fn syncPopover(self: *Watcher) void {
+        const view = self.popoverView() orelse return;
+        self.syncSections(view.sections);
+        var sum_buf: [64]u8 = undefined;
+        var sum_z: [64:0]u8 = undefined;
+        const summary = restSummary(&sum_buf, self.roster.items);
+        c.gtk_widget_set_visible(view.rest, @intFromBool(summary.len > 0));
+        if (summary.len > 0) {
+            c.gtk_expander_set_label(@ptrCast(view.rest), strz.copyZ(&sum_z, summary));
+            c.gtk_expander_set_child(@ptrCast(view.rest), self.restList());
         }
-        const rest = self.appendRest(content);
-        if (self.roster.items.len == 0) {
-            const none = c.gtk_label_new("No assistant is running.").?;
-            c.gtk_widget_add_css_class(none, "dim-label");
-            c.gtk_box_append(@ptrCast(content), none);
-        }
-        const sw = self.scroller(content);
-        c.gtk_box_append(@ptrCast(root), sw);
-        // Expanding the rest grows the list without a rebuild.
-        if (rest) |expander| _ = c.g_signal_connect_data(expander, "notify::expanded", @ptrCast(&onRestExpanded), @ptrCast(sw), null, c.G_CONNECT_DEFAULT);
-        if (summarize(self.roster.items).web != 0) {
-            const help = c.gtk_label_new("Watch is read-only. Take control to type or sign in.\nFor side by side, select a destination pane first.").?;
-            c.gtk_label_set_xalign(@ptrCast(help), 0);
-            c.gtk_label_set_wrap(@ptrCast(help), 1);
-            c.gtk_label_set_max_width_chars(@ptrCast(help), 44);
-            c.gtk_widget_add_css_class(help, "dim-label");
-            c.gtk_widget_add_css_class(help, "caption");
-            c.gtk_box_append(@ptrCast(root), help);
-        }
-        c.gtk_popover_set_child(pop, root);
-        fitScroller(sw);
+        c.gtk_widget_set_visible(view.none, @intFromBool(self.roster.items.len == 0));
+        c.gtk_widget_set_visible(view.help, @intFromBool(summarize(self.roster.items).web != 0));
+        c.gtk_scrolled_window_set_max_content_height(@ptrCast(view.sw), listCap(c.gtk_widget_get_height(self.win.app_window)));
+        fitScroller(view.sw);
     }
 
     /// The scrolled area both popovers list into: natural size up to
@@ -1384,12 +1435,122 @@ pub const Watcher = struct {
         return sw;
     }
 
-    fn appendAssistant(self: *Watcher, content: *c.GtkWidget, a: *Assistant) void {
-        const section = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 2).?;
-        self.appendHeader(section, a);
-        const list = newSessionList();
+    /// The badge popover's skeleton, built on first use and kept: only
+    /// `syncPopover` changes what is inside it.
+    fn popoverView(self: *Watcher) ?*PopoverView {
+        const pop: *c.GtkPopover = @ptrCast(self.popover);
+        if (c.gtk_popover_get_child(pop)) |root| {
+            if (c.g_object_get_data(@ptrCast(root), POPOVER_VIEW_KEY)) |data| return cast.userData(PopoverView, data);
+        }
+        const view = self.allocator.create(PopoverView) catch return null;
+        const root = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 8).?;
+        setMargins(root, 6);
+        const content = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 10).?;
+        const sections = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 10).?;
+        c.gtk_box_append(@ptrCast(content), sections);
+        const rest = c.gtk_expander_new("").?;
+        c.gtk_widget_add_css_class(rest, "dim-label");
+        c.gtk_box_append(@ptrCast(content), rest);
+        const none = c.gtk_label_new("No assistant is running.").?;
+        c.gtk_widget_add_css_class(none, "dim-label");
+        c.gtk_box_append(@ptrCast(content), none);
+        const sw = self.scroller(content);
+        c.gtk_box_append(@ptrCast(root), sw);
+        // Expanding the rest grows the list without a sync.
+        _ = c.g_signal_connect_data(rest, "notify::expanded", @ptrCast(&onRestExpanded), @ptrCast(sw), null, c.G_CONNECT_DEFAULT);
+        const help = c.gtk_label_new("Watch is read-only. Take control to type or sign in.\nFor side by side, select a destination pane first.").?;
+        c.gtk_label_set_xalign(@ptrCast(help), 0);
+        c.gtk_label_set_wrap(@ptrCast(help), 1);
+        c.gtk_label_set_max_width_chars(@ptrCast(help), 44);
+        c.gtk_widget_add_css_class(help, "dim-label");
+        c.gtk_widget_add_css_class(help, "caption");
+        c.gtk_box_append(@ptrCast(root), help);
+        view.* = .{ .allocator = self.allocator, .sw = sw, .sections = sections, .rest = rest, .none = none, .help = help };
+        c.g_object_set_data_full(@ptrCast(root), POPOVER_VIEW_KEY, @ptrCast(view), cast.destroyCtx(PopoverView));
+        c.gtk_popover_set_child(pop, root);
+        return view;
+    }
+
+    /// One section per usable instance, the preferred one first, keeping
+    /// every shown section whose instance is still usable. Out of memory
+    /// leaves the popover as it was.
+    fn syncSections(self: *Watcher, box: *c.GtkWidget) void {
+        const allocator = self.allocator;
+        var wanted: std.ArrayList(*Assistant) = .empty;
+        defer wanted.deinit(allocator);
+        var wanted_keys: std.ArrayList(SectionKey) = .empty;
+        defer wanted_keys.deinit(allocator);
+        var shown: std.ArrayList(*SectionView) = .empty;
+        defer shown.deinit(allocator);
+        var shown_keys: std.ArrayList(SectionKey) = .empty;
+        defer shown_keys.deinit(allocator);
+        const first = self.findByHost(self.preferred());
+        if (first) |a| if (a.usable()) wanted.append(allocator, a) catch return;
+        for (self.roster.items) |*a| {
+            if (first == a or !a.usable()) continue;
+            wanted.append(allocator, a) catch return;
+        }
+        for (wanted.items) |a| wanted_keys.append(allocator, .{ .host = a.host }) catch return;
+        var child = c.gtk_widget_get_first_child(box);
+        while (child) |w| : (child = c.gtk_widget_get_next_sibling(w)) {
+            const data = c.g_object_get_data(@ptrCast(w), SECTION_VIEW_KEY) orelse continue;
+            const section = cast.userData(SectionView, data);
+            shown.append(allocator, section) catch return;
+            shown_keys.append(allocator, .{ .host = section.key }) catch return;
+        }
+        const match = Match(SectionKey).init(allocator, shown_keys.items, wanted_keys.items) catch return;
+        defer match.deinit(allocator);
+        // Removing a section finalizes it and frees its view: none is read again.
+        for (shown.items, match.claimed) |section, kept| {
+            if (!kept) c.gtk_box_remove(@ptrCast(box), section.box);
+        }
+        var prev: ?*c.GtkWidget = null;
+        for (wanted.items, match.kept) |a, kept| {
+            const section = if (kept) |i| shown.items[i] else newSection(allocator, box, a.host) orelse continue;
+            self.updateHeader(section.header, a);
+            self.syncRows(section.list, a);
+            // Moving a child within its box never unparents it.
+            c.gtk_box_reorder_child_after(@ptrCast(box), section.box, prev);
+            prev = section.box;
+        }
+        c.gtk_widget_set_visible(box, @intFromBool(wanted.items.len > 0));
+    }
+
+    /// An instance's session rows in its order, keeping every shown row
+    /// whose `RowKey` still names one of them.
+    fn syncRows(self: *Watcher, list: *c.GtkWidget, a: *Assistant) void {
+        const allocator = self.allocator;
+        var shown: std.ArrayList(*RowView) = .empty;
+        defer shown.deinit(allocator);
+        var shown_keys: std.ArrayList(RowKey) = .empty;
+        defer shown_keys.deinit(allocator);
+        var wanted_keys: std.ArrayList(RowKey) = .empty;
+        defer wanted_keys.deinit(allocator);
+        var index: c_int = 0;
+        while (c.gtk_list_box_get_row_at_index(@ptrCast(list), index)) |row| : (index += 1) {
+            // Every row this list holds came from below, with a view and a key.
+            const view = rowView(@ptrCast(row)) orelse continue;
+            const key = view.key() orelse continue;
+            shown.append(allocator, view) catch return;
+            shown_keys.append(allocator, key) catch return;
+        }
         for (a.sessions.items) |*s| {
-            const icon = c.gtk_image_new_from_icon_name(s.kind.icon()).?;
+            wanted_keys.append(allocator, .{ .session = s.name, .attach_host = s.attachHost(a), .kind = s.kind }) catch return;
+        }
+        const match = Match(RowKey).init(allocator, shown_keys.items, wanted_keys.items) catch return;
+        defer match.deinit(allocator);
+        for (shown.items, match.claimed) |view, kept| {
+            if (!kept) c.gtk_list_box_remove(@ptrCast(list), view.row);
+        }
+        for (a.sessions.items, match.kept, 0..) |*s, kept, order| {
+            const view = if (kept) |i| shown.items[i] else fresh: {
+                const icon = c.gtk_image_new_from_icon_name(s.kind.icon()).?;
+                const made = self.newSessionRow(icon, if (s.kind == .web) .text else .none, a, s) orelse continue;
+                made.order = order;
+                c.gtk_list_box_append(@ptrCast(list), made.row);
+                break :fresh made;
+            };
+            view.order = order;
             var title_buf: [320]u8 = undefined;
             const title = rowTitle(&title_buf, a, s);
             var tip_buf: [400]u8 = undefined;
@@ -1398,23 +1559,18 @@ pub const Watcher = struct {
             else
                 std.fmt.bufPrint(&tip_buf, "{s} ({s}) at {s}, {d} viewer(s)", .{ s.name, @tagName(s.kind), s.attachHost(a), s.viewers }) catch s.name;
             const sub: RowSubtitle = if (s.kind == .web) .{ .text = s.browser.subtitle() } else .none;
-            self.appendSessionRow(list, icon, title, sub, tip, a, s);
+            self.updateSessionRow(view, title, sub, tip, a, s);
         }
-        c.gtk_box_append(@ptrCast(section), list);
-        c.gtk_box_append(@ptrCast(content), section);
+        // Re-sorting moves rows within the list; it never unparents one.
+        c.gtk_list_box_invalidate_sort(@ptrCast(list));
     }
 
     /// An instance's one header line: its name, what it runs, and its
     /// mode only when that is not the default; the rest is the tooltip.
-    fn appendHeader(self: *Watcher, box: *c.GtkWidget, a: *const Assistant) void {
-        const line = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8).?;
+    fn updateHeader(self: *Watcher, h: Header, a: *const Assistant) void {
         var name_buf: [320]u8 = undefined;
         var name_z: [320:0]u8 = undefined;
-        const name = headingLabel(strz.copyZ(&name_z, headerName(&name_buf, self.roster.items, a)));
-        c.gtk_label_set_xalign(@ptrCast(name), 0);
-        c.gtk_label_set_ellipsize(@ptrCast(name), c.PANGO_ELLIPSIZE_END);
-        c.gtk_widget_add_css_class(name, "heading");
-        c.gtk_box_append(@ptrCast(line), name);
+        c.gtk_label_set_text(@ptrCast(h.name), strz.copyZ(&name_z, headerName(&name_buf, self.roster.items, a)));
         var counts: Counts = .{};
         for (a.sessions.items) |s| counts.add(s.kind);
         var desc_buf: [96]u8 = undefined;
@@ -1425,28 +1581,16 @@ pub const Watcher = struct {
             if (a.mode.isDefault()) "" else ", ",
             if (a.mode.isDefault()) "" else a.mode.text(),
         }) catch "";
-        const facts_label = c.gtk_label_new(facts.ptr).?;
-        c.gtk_label_set_xalign(@ptrCast(facts_label), 0);
-        c.gtk_widget_set_hexpand(facts_label, 1);
-        c.gtk_widget_add_css_class(facts_label, "dim-label");
-        c.gtk_widget_add_css_class(facts_label, "caption");
-        c.gtk_box_append(@ptrCast(line), facts_label);
+        c.gtk_label_set_text(@ptrCast(h.facts), facts.ptr);
         var tip_buf: [1024]u8 = undefined;
         var tip_z: [1024:0]u8 = undefined;
-        c.gtk_widget_set_tooltip_text(line, strz.copyZ(&tip_z, instanceTip(&tip_buf, a)));
-        c.gtk_box_append(@ptrCast(box), line);
+        c.gtk_widget_set_tooltip_text(h.line, strz.copyZ(&tip_z, instanceTip(&tip_buf, a)));
     }
 
-    /// The instances without sessions (idle or unreachable) as ONE
-    /// collapsed line; expanded, a name per instance, the reason in its
-    /// tooltip. Never `error` styling: nothing here needs the reader.
-    fn appendRest(self: *Watcher, content: *c.GtkWidget) ?*c.GtkWidget {
-        var sum_buf: [64]u8 = undefined;
-        var sum_z: [64:0]u8 = undefined;
-        const summary = restSummary(&sum_buf, self.roster.items);
-        if (summary.len == 0) return null;
-        const expander = c.gtk_expander_new(strz.copyZ(&sum_z, summary)).?;
-        c.gtk_widget_add_css_class(expander, "dim-label");
+    /// The instances without sessions (idle or unreachable), a name per
+    /// line, the reason in its tooltip. Never `error` styling: nothing
+    /// here needs the reader. Labels only, so it is rebuilt freely.
+    fn restList(self: *Watcher) *c.GtkWidget {
         const inner = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 2).?;
         c.gtk_widget_set_margin_start(inner, 18);
         for (self.roster.items) |*a| {
@@ -1462,15 +1606,35 @@ pub const Watcher = struct {
             c.gtk_widget_set_tooltip_text(name, strz.copyZ(&tip_z, instanceTip(&tip_buf, a)));
             c.gtk_box_append(@ptrCast(inner), name);
         }
-        c.gtk_expander_set_child(@ptrCast(expander), inner);
-        c.gtk_box_append(@ptrCast(content), expander);
-        return expander;
+        return inner;
     }
 
-    /// The one session row layout every popover uses: icon, title and
-    /// subtitle, then the icon-only actions that apply; activating the
-    /// row itself is Watch. `s` null = nothing to attach (no buttons).
+    /// A session row of the pane's agents popover, which is rebuilt on
+    /// every open and so never synced.
     fn appendSessionRow(self: *Watcher, list: *c.GtkWidget, icon: *c.GtkWidget, title: []const u8, sub: RowSubtitle, tip: ?[]const u8, a: *Assistant, s: ?*Session) void {
+        const view = self.newSessionRow(icon, std.meta.activeTag(sub), a, s) orelse return;
+        self.updateSessionRow(view, title, sub, tip, a, s);
+        c.gtk_list_box_append(@ptrCast(list), view.row);
+    }
+
+    /// The one session row layout every popover uses: icon, title, a
+    /// subtitle of shape `sub`, then the icon-only actions `s`'s kind
+    /// offers, each owning its `RowCtx`; activating the row itself is
+    /// Watch. `s` null = nothing to attach (no buttons). The parts that
+    /// change are painted by `updateSessionRow`. Null when out of memory.
+    fn newSessionRow(self: *Watcher, icon: *c.GtkWidget, sub: std.meta.Tag(RowSubtitle), a: *Assistant, s: ?*Session) ?*RowView {
+        const view = self.allocator.create(RowView) catch {
+            dropFloating(icon);
+            return null;
+        };
+        var attach: ?RowCtx = null;
+        if (s) |session| {
+            attach = RowCtx.init(self.allocator, self, a.host, session.name, session.attachHost(a), .watch) catch {
+                self.allocator.destroy(view);
+                dropFloating(icon);
+                return null;
+            };
+        }
         const body = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8).?;
         c.gtk_widget_set_margin_top(body, 3);
         c.gtk_widget_set_margin_bottom(body, 3);
@@ -1479,52 +1643,91 @@ pub const Watcher = struct {
         const text = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 1).?;
         c.gtk_widget_set_hexpand(text, 1);
         c.gtk_widget_set_valign(text, c.GTK_ALIGN_CENTER);
-        var title_z: [400:0]u8 = undefined;
-        const title_label = c.gtk_label_new(strz.copyZ(&title_z, title)).?;
-        c.gtk_label_set_xalign(@ptrCast(title_label), 0);
-        c.gtk_label_set_ellipsize(@ptrCast(title_label), c.PANGO_ELLIPSIZE_END);
-        c.gtk_label_set_max_width_chars(@ptrCast(title_label), 36);
-        c.gtk_box_append(@ptrCast(text), title_label);
-        switch (sub) {
-            .none => {},
-            .text => |line| {
-                var sub_z: [320:0]u8 = undefined;
-                const label = c.gtk_label_new(strz.copyZ(&sub_z, line)).?;
+        const title = c.gtk_label_new("").?;
+        c.gtk_label_set_xalign(@ptrCast(title), 0);
+        c.gtk_label_set_ellipsize(@ptrCast(title), c.PANGO_ELLIPSIZE_END);
+        c.gtk_label_set_max_width_chars(@ptrCast(title), 36);
+        c.gtk_box_append(@ptrCast(text), title);
+        const sub_label: ?*c.GtkWidget = switch (sub) {
+            .none => null,
+            .text => line: {
+                const label = c.gtk_label_new("").?;
                 c.gtk_label_set_xalign(@ptrCast(label), 0);
                 c.gtk_label_set_ellipsize(@ptrCast(label), c.PANGO_ELLIPSIZE_END);
                 c.gtk_label_set_max_width_chars(@ptrCast(label), 36);
                 c.gtk_widget_add_css_class(label, "dim-label");
                 c.gtk_widget_add_css_class(label, "caption");
-                c.gtk_box_append(@ptrCast(text), label);
+                break :line label;
             },
-            .pill => |p| {
-                const label = c.gtk_label_new(p.text.ptr).?;
+            .pill => pill: {
+                const label = c.gtk_label_new("").?;
                 c.gtk_widget_set_halign(label, c.GTK_ALIGN_START);
                 c.gtk_widget_add_css_class(label, "caption");
                 c.gtk_widget_add_css_class(label, "sketerm-agents-pill");
-                c.gtk_widget_add_css_class(label, agentbadge.attentionClass(p.attention));
                 agentbadge.installCss(label);
-                c.gtk_box_append(@ptrCast(text), label);
+                break :pill label;
             },
-        }
+        };
+        if (sub_label) |label| c.gtk_box_append(@ptrCast(text), label);
         c.gtk_box_append(@ptrCast(body), text);
         const row = c.gtk_list_box_row_new().?;
         c.gtk_list_box_row_set_child(@ptrCast(row), body);
-        if (tip) |words| {
-            var tip_z: [400:0]u8 = undefined;
-            c.gtk_widget_set_tooltip_text(text, strz.copyZ(&tip_z, words));
-        }
-        var watchable = false;
+        view.* = .{
+            .allocator = self.allocator,
+            .row = row,
+            .attach = attach,
+            .kind = if (s) |session| session.kind else .terminal,
+            .title = title,
+            .text = text,
+            .sub = sub_label,
+        };
         if (s) |session| {
-            watchable = self.appendAttachButtons(body, a, session, title);
-            if (watchable) {
-                if (RowCtx.create(self.allocator, self, a.host, session.name, session.attachHost(a), .watch)) |ctx| {
-                    c.g_object_set_data_full(@ptrCast(row), ROW_ATTACH_KEY, @ptrCast(ctx), &destroyRowCtx);
-                } else watchable = false;
+            for (std.enums.values(AttachAction)) |action| {
+                if (!action.appliesTo(session.kind)) continue;
+                const ctx = RowCtx.create(self.allocator, self, a.host, session.name, session.attachHost(a), action) orelse continue;
+                const btn = attachButton(action, "");
+                _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onRowClicked), @ptrCast(ctx), @ptrCast(&freeRowCtx), c.G_CONNECT_DEFAULT);
+                c.gtk_box_append(@ptrCast(body), btn);
+                view.buttons[@intFromEnum(action)] = btn;
             }
         }
-        c.gtk_list_box_row_set_activatable(@ptrCast(row), @intFromBool(watchable));
-        c.gtk_list_box_append(@ptrCast(list), row);
+        c.g_object_set_data_full(@ptrCast(row), ROW_VIEW_KEY, @ptrCast(view), &destroyRowView);
+        return view;
+    }
+
+    /// Paint what a row shows now: title, subtitle, tooltip, and which
+    /// of its actions apply (sensitivity, accessible names, and Watch on
+    /// activating the row).
+    fn updateSessionRow(self: *Watcher, view: *RowView, title: []const u8, sub: RowSubtitle, tip: ?[]const u8, a: *Assistant, s: ?*Session) void {
+        var title_z: [400:0]u8 = undefined;
+        c.gtk_label_set_text(@ptrCast(view.title), strz.copyZ(&title_z, title));
+        if (view.sub) |label| switch (sub) {
+            .none => {},
+            .text => |line| {
+                var sub_z: [320:0]u8 = undefined;
+                c.gtk_label_set_text(@ptrCast(label), strz.copyZ(&sub_z, line));
+            },
+            .pill => |p| {
+                c.gtk_label_set_text(@ptrCast(label), p.text.ptr);
+                const class = agentbadge.attentionClass(p.attention);
+                if (view.pill_class) |old| c.gtk_widget_remove_css_class(label, old);
+                c.gtk_widget_add_css_class(label, class);
+                view.pill_class = class;
+            },
+        };
+        var tip_z: [400:0]u8 = undefined;
+        c.gtk_widget_set_tooltip_text(view.text, if (tip) |words| strz.copyZ(&tip_z, words) else null);
+        var watchable = false;
+        if (s) |session| {
+            watchable = self.actionSensitive(a, session, .watch);
+            for (std.enums.values(AttachAction)) |action| {
+                const btn = view.buttons[@intFromEnum(action)] orelse continue;
+                c.gtk_widget_set_sensitive(btn, @intFromBool(self.actionSensitive(a, session, action)));
+                var name_buf: [400]u8 = undefined;
+                a11y.setLabel(btn, accessibleName(&name_buf, action, title).ptr);
+            }
+        }
+        c.gtk_list_box_row_set_activatable(@ptrCast(view.row), @intFromBool(watchable));
     }
 
     /// Whether `action` may run on row `s`: browser actions focus,
@@ -1537,23 +1740,6 @@ pub const Watcher = struct {
             .tabless => action.lease() == .control,
             .pane => false,
         };
-    }
-
-    /// The `AttachAction`s that apply to one row, icon-only, each owning
-    /// its `RowCtx`. @return whether Watch is available on it.
-    fn appendAttachButtons(self: *Watcher, controls: *c.GtkWidget, a: *Assistant, s: *Session, row_title: []const u8) bool {
-        var watchable = false;
-        for (std.enums.values(AttachAction)) |action| {
-            if (!action.appliesTo(s.kind)) continue;
-            const sensitive = self.actionSensitive(a, s, action);
-            if (action == .watch) watchable = sensitive;
-            const btn = attachButton(action, row_title);
-            c.gtk_widget_set_sensitive(btn, @intFromBool(sensitive));
-            const ctx = RowCtx.create(self.allocator, self, a.host, s.name, s.attachHost(a), action) orelse continue;
-            _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onRowClicked), @ptrCast(ctx), @ptrCast(&freeRowCtx), c.G_CONNECT_DEFAULT);
-            c.gtk_box_append(@ptrCast(controls), btn);
-        }
-        return watchable;
     }
 
     /// Attach `session` of the assistant keyed `key` (at `attach_host`)
@@ -1701,24 +1887,13 @@ const RowCtx = struct {
     attach_host: []u8,
     action: AttachAction,
 
-    fn create(allocator: std.mem.Allocator, watcher: *Watcher, key: []const u8, session: []const u8, attach_host: []const u8, action: AttachAction) ?*RowCtx {
-        const ctx = allocator.create(RowCtx) catch return null;
-        const key_owned = allocator.dupe(u8, key) catch {
-            allocator.destroy(ctx);
-            return null;
-        };
-        const session_owned = allocator.dupe(u8, session) catch {
-            allocator.free(key_owned);
-            allocator.destroy(ctx);
-            return null;
-        };
-        const host_owned = allocator.dupe(u8, attach_host) catch {
-            allocator.free(session_owned);
-            allocator.free(key_owned);
-            allocator.destroy(ctx);
-            return null;
-        };
-        ctx.* = .{
+    fn init(allocator: std.mem.Allocator, watcher: *Watcher, key: []const u8, session: []const u8, attach_host: []const u8, action: AttachAction) !RowCtx {
+        const key_owned = try allocator.dupe(u8, key);
+        errdefer allocator.free(key_owned);
+        const session_owned = try allocator.dupe(u8, session);
+        errdefer allocator.free(session_owned);
+        const host_owned = try allocator.dupe(u8, attach_host);
+        return .{
             .allocator = allocator,
             .watcher = watcher,
             .key = key_owned,
@@ -1726,23 +1901,28 @@ const RowCtx = struct {
             .attach_host = host_owned,
             .action = action,
         };
+    }
+
+    fn create(allocator: std.mem.Allocator, watcher: *Watcher, key: []const u8, session: []const u8, attach_host: []const u8, action: AttachAction) ?*RowCtx {
+        const ctx = allocator.create(RowCtx) catch return null;
+        ctx.* = init(allocator, watcher, key, session, attach_host, action) catch {
+            allocator.destroy(ctx);
+            return null;
+        };
         return ctx;
+    }
+
+    fn deinit(self: *RowCtx) void {
+        self.allocator.free(self.key);
+        self.allocator.free(self.session);
+        self.allocator.free(self.attach_host);
     }
 };
 
-/// A session row's Watch context, owned by the row (qdata).
-const ROW_ATTACH_KEY = "sketerm-row-attach";
-
-fn destroyRowCtx(user: ?*anyopaque) callconv(.c) void {
-    const ctx = cast.userData(RowCtx, user);
-    ctx.allocator.free(ctx.key);
-    ctx.allocator.free(ctx.session);
-    ctx.allocator.free(ctx.attach_host);
-    ctx.allocator.destroy(ctx);
-}
-
 fn freeRowCtx(user: ?*anyopaque, _: ?*c.GClosure) callconv(.c) void {
-    destroyRowCtx(user);
+    const ctx = cast.userData(RowCtx, user);
+    ctx.deinit();
+    ctx.allocator.destroy(ctx);
 }
 
 fn onRowClicked(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
@@ -1751,14 +1931,141 @@ fn onRowClicked(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 
 /// Activating a session row itself (click or Enter) is its Watch.
 fn onSessionRowActivated(_: *c.GtkListBox, row: *c.GtkListBoxRow, _: ?*anyopaque) callconv(.c) void {
-    const data = c.g_object_get_data(@ptrCast(row), ROW_ATTACH_KEY) orelse return;
-    fireRow(@ptrCast(row), cast.userData(RowCtx, data));
+    const view = rowView(@ptrCast(row)) orelse return;
+    if (view.attach) |*attach| fireRow(@ptrCast(row), attach);
+}
+
+/// One session row's changing widgets, its Watch and its identity;
+/// owned by the row (qdata, freed at its finalize).
+const RowView = struct {
+    allocator: std.mem.Allocator,
+    row: *c.GtkWidget,
+    /// The row's own Watch, and with `kind` its identity; null =
+    /// nothing to attach.
+    attach: ?RowCtx,
+    kind: Kind,
+    /// Its position in the badge popover's list (the sort key).
+    order: usize = 0,
+    title: *c.GtkWidget,
+    /// Holds the title and subtitle; carries the row's tooltip.
+    text: *c.GtkWidget,
+    sub: ?*c.GtkWidget,
+    /// The attention class a pill subtitle carries now.
+    pill_class: ?[*:0]const u8 = null,
+    /// By `AttachAction`; null = the action does not apply.
+    buttons: [std.enums.values(AttachAction).len]?*c.GtkWidget = @splat(null),
+
+    fn key(self: *const RowView) ?RowKey {
+        const attach = self.attach orelse return null;
+        return .{ .session = attach.session, .attach_host = attach.attach_host, .kind = self.kind };
+    }
+};
+
+const ROW_VIEW_KEY = "sketerm-row-view";
+
+fn rowView(row: *c.GtkWidget) ?*RowView {
+    const data = c.g_object_get_data(@ptrCast(row), ROW_VIEW_KEY) orelse return null;
+    return cast.userData(RowView, data);
+}
+
+fn destroyRowView(user: ?*anyopaque) callconv(.c) void {
+    const view = cast.userData(RowView, user);
+    if (view.attach) |*attach| attach.deinit();
+    view.allocator.destroy(view);
+}
+
+/// The badge popover's lists keep their rows in roster order.
+fn byRowOrder(r1: [*c]c.GtkListBoxRow, r2: [*c]c.GtkListBoxRow, _: c.gpointer) callconv(.c) c_int {
+    const o1 = (rowView(@ptrCast(r1)) orelse return 0).order;
+    const o2 = (rowView(@ptrCast(r2)) orelse return 0).order;
+    return switch (std.math.order(o1, o2)) {
+        .lt => -1,
+        .eq => 0,
+        .gt => 1,
+    };
+}
+
+/// An instance's header line and the labels a sync rewrites.
+const Header = struct { line: *c.GtkWidget, name: *c.GtkWidget, facts: *c.GtkWidget };
+
+/// Append an empty header line to `box`; `Watcher.updateHeader` fills it.
+fn newHeader(box: *c.GtkWidget) Header {
+    const line = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8).?;
+    const name = headingLabel("");
+    c.gtk_label_set_xalign(@ptrCast(name), 0);
+    c.gtk_label_set_ellipsize(@ptrCast(name), c.PANGO_ELLIPSIZE_END);
+    c.gtk_widget_add_css_class(name, "heading");
+    c.gtk_box_append(@ptrCast(line), name);
+    const facts = c.gtk_label_new("").?;
+    c.gtk_label_set_xalign(@ptrCast(facts), 0);
+    c.gtk_widget_set_hexpand(facts, 1);
+    c.gtk_widget_add_css_class(facts, "dim-label");
+    c.gtk_widget_add_css_class(facts, "caption");
+    c.gtk_box_append(@ptrCast(line), facts);
+    c.gtk_box_append(@ptrCast(box), line);
+    return .{ .line = line, .name = name, .facts = facts };
+}
+
+/// One instance's block in the badge popover: its header over its
+/// session list. Owned by its box (qdata, freed at its finalize).
+const SectionView = struct {
+    allocator: std.mem.Allocator,
+    box: *c.GtkWidget,
+    /// `Assistant.host`: the section's identity.
+    key: []u8,
+    header: Header,
+    list: *c.GtkWidget,
+};
+
+const SECTION_VIEW_KEY = "sketerm-section-view";
+
+fn destroySectionView(user: ?*anyopaque) callconv(.c) void {
+    const section = cast.userData(SectionView, user);
+    section.allocator.free(section.key);
+    section.allocator.destroy(section);
+}
+
+/// Append an empty section for the instance keyed `key` to `parent`.
+fn newSection(allocator: std.mem.Allocator, parent: *c.GtkWidget, key: []const u8) ?*SectionView {
+    const section = allocator.create(SectionView) catch return null;
+    const owned = allocator.dupe(u8, key) catch {
+        allocator.destroy(section);
+        return null;
+    };
+    const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 2).?;
+    const header = newHeader(box);
+    const list = newSessionList();
+    c.gtk_list_box_set_sort_func(@ptrCast(list), &byRowOrder, null, null);
+    c.gtk_box_append(@ptrCast(box), list);
+    section.* = .{ .allocator = allocator, .box = box, .key = owned, .header = header, .list = list };
+    c.g_object_set_data_full(@ptrCast(box), SECTION_VIEW_KEY, @ptrCast(section), &destroySectionView);
+    c.gtk_box_append(@ptrCast(parent), box);
+    return section;
+}
+
+/// The badge popover's fixed widgets; owned by its root (qdata).
+const PopoverView = struct {
+    allocator: std.mem.Allocator,
+    sw: *c.GtkWidget,
+    /// Holds one `SectionView` box per usable instance.
+    sections: *c.GtkWidget,
+    rest: *c.GtkWidget,
+    none: *c.GtkWidget,
+    help: *c.GtkWidget,
+};
+
+const POPOVER_VIEW_KEY = "sketerm-popover-view";
+
+/// Release a floating widget that never got a parent.
+fn dropFloating(widget: *c.GtkWidget) void {
+    _ = c.g_object_ref_sink(@ptrCast(widget));
+    c.g_object_unref(@ptrCast(widget));
 }
 
 fn fireRow(widget: *c.GtkWidget, ctx: *RowCtx) void {
-    // The popover is rebuilt while it is open, which frees this row's
-    // widgets and with them this context: copy what the attach needs
-    // before anything can rebuild.
+    // A roster change can remove this row while the popover is open,
+    // which frees its widgets and with them this context: copy what the
+    // attach needs before anything can sync.
     const watcher = ctx.watcher;
     const action = ctx.action;
     var key_buf: [512]u8 = undefined;
@@ -2367,4 +2674,43 @@ test "action buttons are named by verb and row; the list caps at 60% of the wind
     try t.expectEqualStrings("Show beside pane Login", accessibleName(&buf, .beside, "Login"));
     try t.expectEqual(@as(c_int, 600), listCap(1000));
     try t.expectEqual(@as(c_int, 480), listCap(0));
+}
+
+test "a roster change keeps every row whose identity holds" {
+    const shown = [_]RowKey{
+        .{ .session = "web-1-ab", .attach_host = "sock:/r/a", .kind = .web },
+        .{ .session = "agent-1", .attach_host = "sock:/r/a", .kind = .terminal },
+        .{ .session = "gone", .attach_host = "sock:/r/a", .kind = .terminal },
+        .{ .session = "launch-3", .attach_host = "sock:/r/a", .kind = .terminal },
+    };
+    // Reordered, one gone, one new, one whose kind changed (its buttons
+    // differ, so it is a new row), and one placed on another host.
+    const wanted = [_]RowKey{
+        .{ .session = "agent-1", .attach_host = "sock:/r/a", .kind = .terminal },
+        .{ .session = "web-1-ab", .attach_host = "sock:/r/a", .kind = .web },
+        .{ .session = "launch-3", .attach_host = "sock:/r/a", .kind = .app },
+        .{ .session = "new", .attach_host = "sock:/r/a", .kind = .terminal },
+        .{ .session = "agent-1", .attach_host = "route:a/b", .kind = .terminal },
+    };
+    var kept: [wanted.len]?usize = undefined;
+    var claimed: [shown.len]bool = undefined;
+    matchIdentities(RowKey, &shown, &wanted, &kept, &claimed);
+    try t.expectEqualSlices(?usize, &.{ 1, 0, null, null, null }, &kept);
+    try t.expectEqualSlices(bool, &.{ true, true, false, false }, &claimed);
+}
+
+test "a duplicate identity keeps one row and gets a new one" {
+    const shown = [_]SectionKey{.{ .host = "sock:/r/a" }};
+    const wanted = [_]SectionKey{ .{ .host = "sock:/r/a" }, .{ .host = "sock:/r/a" } };
+    var kept: [wanted.len]?usize = undefined;
+    var claimed: [shown.len]bool = undefined;
+    matchIdentities(SectionKey, &shown, &wanted, &kept, &claimed);
+    try t.expectEqualSlices(?usize, &.{ 0, null }, &kept);
+    try t.expectEqualSlices(bool, &.{true}, &claimed);
+    // Nothing shown yet: every entry is new; nothing wanted: all are gone.
+    var none_kept: [1]?usize = undefined;
+    matchIdentities(SectionKey, &.{}, wanted[0..1], &none_kept, &.{});
+    try t.expectEqual(@as(?usize, null), none_kept[0]);
+    matchIdentities(SectionKey, &shown, &.{}, &.{}, &claimed);
+    try t.expectEqualSlices(bool, &.{false}, &claimed);
 }
