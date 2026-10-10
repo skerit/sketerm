@@ -311,6 +311,19 @@ stage() {
 
 # ------------------------------------------------------------- debian path
 
+# dpkg -S also reports diversions (including for the loader on usr-merged
+# systems). Select an actual "package[:arch]: path" ownership record, not
+# the first line; no owner lets the caller retry the resolved symlink path.
+deb_package_of() {
+    { LC_ALL=C dpkg -S "$1" 2>/dev/null || true; } \
+        | awk -F': ' '
+            !found && NF >= 2 && $1 ~ /^[a-z0-9][a-z0-9+.-]+(:[a-z0-9][a-z0-9-]*)?$/ {
+                sub(/:.*/, "", $1)
+                print $1
+                found = 1
+            }'
+}
+
 # Resolve a binary's real shared-library dependencies to package names.
 # Hardcoding a list here rots across releases (libvpx7 vs libvpx9), and
 # dlopen'd optionals (libopus, libtesseract, EGL) must NOT appear --
@@ -320,9 +333,9 @@ deb_depends_of() {
     { ldd "$bin" 2>/dev/null || true; } \
         | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^\//) { print $i; break } }' \
         | while read -r lib; do
-            pkg=$(dpkg -S "$lib" 2>/dev/null | head -1 | cut -d: -f1) || true
+            pkg=$(deb_package_of "$lib")
             if [ -z "$pkg" ]; then
-                pkg=$(dpkg -S "$(readlink -f "$lib")" 2>/dev/null | head -1 | cut -d: -f1) || true
+                pkg=$(deb_package_of "$(readlink -f "$lib")")
             fi
             # "[ -n ] && printf" would leave the loop with status 1 when the
             # LAST library is dpkg-unowned (e.g. a hand-installed libcef.so),

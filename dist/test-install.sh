@@ -184,7 +184,11 @@ set -e
     || fail "Arch --prefix failure was not explicit"
 
 fixture="$work/package-source"
-mkdir -p "$fixture/dist" "$fixture/zig-out/bin" "$work/pkg"
+export INSTALL_TEST_LIBRARY_DIR="$fixture/libraries"
+mkdir -p "$fixture/dist" "$fixture/zig-out/bin" "$work/pkg" "$INSTALL_TEST_LIBRARY_DIR"
+: > "$INSTALL_TEST_LIBRARY_DIR/libdelta-real.so"
+ln -s libdelta-real.so "$INSTALL_TEST_LIBRARY_DIR/libdelta.so"
+: > "$INSTALL_TEST_LIBRARY_DIR/libunowned.so"
 cp "$here/install.sh" "$fixture/dist/install.sh"
 cp "$here/stage.sh" "$fixture/dist/stage.sh"
 ln -s "$root/data" "$fixture/data"
@@ -233,17 +237,32 @@ fi
 printf 'install ok installed'
 EOF
 
+# Ownership searches can emit diversion records before an owner, or only
+# diversions for a symlink whose resolved target is owned. Exercise both,
+# architecture-qualified owners, local diversions and a dpkg-unowned library.
 cat > "$fakebin/dpkg" <<'EOF'
 #!/usr/bin/env bash
 case "${1:-}" in
     --print-architecture) printf '%s\n' "${INSTALL_TEST_DPKG_ARCH:-amd64}" ;;
     -S)
         case "$2" in
-            */libalpha.so) printf 'alpha-runtime:%s\n' "$2" ;;
-            */libbeta.so) printf 'beta-runtime:%s\n' "$2" ;;
-            */libdelta.so) printf 'delta-runtime:%s\n' "$2" ;;
-            */libepsilon.so) printf 'epsilon-runtime:%s\n' "$2" ;;
-            */libgamma.so) printf 'gamma-runtime:%s\n' "$2" ;;
+            */libalpha.so) printf 'alpha-runtime:amd64: %s\n' "$2" ;;
+            */libbeta.so)
+                printf 'diversion by diversion-manager from: %s\n' "$2"
+                printf 'diversion by diversion-manager to: %s.distrib\n' "$2"
+                printf 'beta-runtime:amd64: %s\n' "$2" ;;
+            */libdelta.so)
+                printf 'diversion by delta-runtime from: %s\n' "$2"
+                printf 'diversion by delta-runtime to: %s.usr-is-merged\n' "$2" ;;
+            */libdelta-real.so) printf 'delta-runtime:amd64: %s\n' "$2" ;;
+            */libepsilon.so)
+                printf 'local diversion from: %s\n' "$2"
+                printf 'local diversion to: %s.distrib\n' "$2"
+                printf 'epsilon-runtime: %s\n' "$2" ;;
+            */libgamma.so) printf 'gamma-runtime: %s\n' "$2" ;;
+            */libunowned.so)
+                printf 'local diversion from: %s\n' "$2"
+                printf 'local diversion to: %s.distrib\n' "$2" ;;
             *) exit 1 ;;
         esac ;;
     *) printf 'forbidden dpkg invocation: %s\n' "$*" >> "$INSTALL_TEST_FORBIDDEN"; exit 91 ;;
@@ -266,14 +285,16 @@ case "${1##*/}" in
         printf 'libalpha.so => /lib/libalpha.so (0x0)\n'
         printf 'libbeta.so => /lib/libbeta.so (0x0)\n'
         printf 'libgamma.so => /lib/libgamma.so (0x0)\n'
-        printf 'libdelta.so => /lib/libdelta.so (0x0)\n'
-        printf 'libepsilon.so => /lib/libepsilon.so (0x0)\n' ;;
+        printf 'libdelta.so => %s/libdelta.so (0x0)\n' "$INSTALL_TEST_LIBRARY_DIR"
+        printf 'libepsilon.so => /lib/libepsilon.so (0x0)\n'
+        printf 'libunowned.so => %s/libunowned.so (0x0)\n' "$INSTALL_TEST_LIBRARY_DIR" ;;
     sketerm)
         printf 'libgamma.so => /lib/libgamma.so (0x0)\n'
-        printf 'libdelta.so => /lib/libdelta.so (0x0)\n' ;;
+        printf 'libdelta.so => %s/libdelta.so (0x0)\n' "$INSTALL_TEST_LIBRARY_DIR" ;;
     sketerm-webengine)
         printf 'libepsilon.so => /lib/libepsilon.so (0x0)\n'
-        printf 'libalpha.so => /lib/libalpha.so (0x0)\n' ;;
+        printf 'libalpha.so => /lib/libalpha.so (0x0)\n'
+        printf 'libunowned.so => %s/libunowned.so (0x0)\n' "$INSTALL_TEST_LIBRARY_DIR" ;;
 esac
 EOF
 
@@ -391,6 +412,7 @@ INSTALL_TEST_FORBIDDEN="$work/forbidden.log"
 INSTALL_TEST_APT_LOG="$work/apt.log"
 INSTALL_TEST_DEPS_READY="$work/deps-ready"
 INSTALL_TEST_CONTROL_LOG="$work/control"
+expected_depends='Depends: alpha-runtime, beta-runtime, delta-runtime, epsilon-runtime, gamma-runtime'
 
 # An architecture with no portable musl target still gets its daemon: only
 # the remote-deployment artifact is impossible there, and it is packaged
@@ -417,6 +439,8 @@ BASH_ENV="$work/no-makepkg.bash" \
     || fail "installer did not explain what the omitted artifact costs"
 [ "$(grep '^Architecture:' "$work/unsupported-control")" = 'Architecture: riscv64' ] \
     || fail "unsupported portable architecture produced the wrong package arch"
+[ "$(grep '^Depends:' "$work/unsupported-control")" = "$expected_depends" ] \
+    || fail "Debian Depends included diversion metadata or missed an owner: $(grep '^Depends:' "$work/unsupported-control")"
 
 rm -f "$INSTALL_TEST_DEPS_READY"
 : > "$INSTALL_TEST_APT_LOG"
@@ -493,9 +517,8 @@ grep -q '^<call> <build> <-Doptimize=ReleaseFast>$' "$INSTALL_TEST_ZIG_LOG" \
     || fail "--gui-only --deps did not install GUI dependencies before probing"
 [[ "$(<"$work/debian.out")" == *"staged only, not installed"* ]] \
     || fail "non-Arch --no-install result was not reported"
-expected_depends='Depends: alpha-runtime, beta-runtime, delta-runtime, epsilon-runtime, gamma-runtime'
 [ "$(grep '^Depends:' "$INSTALL_TEST_CONTROL_LOG")" = "$expected_depends" ] \
-    || fail "Debian Depends line was not comma-space separated"
+    || fail "Debian Depends did not contain only owning package names, comma-space separated"
 if [ -n "$real_dpkg_deb" ]; then
     "$real_dpkg_deb" --info "$(<"$INSTALL_TEST_DEB_LOG")" > "$work/deb-info"
     [[ "$(<"$work/deb-info")" == *"$expected_depends"* ]] \
