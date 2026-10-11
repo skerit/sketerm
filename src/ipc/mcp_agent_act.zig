@@ -729,6 +729,7 @@ fn relaunch(arena: std.mem.Allocator, e: *Entry, action: agent_mod.Action, deadl
     // 1. End the app the way a user would, then make sure it is gone.
     e.relaunching = true;
     defer e.relaunching = false;
+    mcp_agent_loop.abandonReconnect(old);
     var exit_plan = try e.agent.driver().screen.exitPlan(state.allocator);
     defer exit_plan.deinit();
     _ = try runSteps(arena, e, null, exit_plan.steps, clock.nowMs() + STEP_WAIT_MS);

@@ -2538,6 +2538,33 @@ pub const Engine = struct {
         if (opener) |o| {
             if (o.profile) |pf| v.profile = try self.gpa.dupe(u8, pf);
         }
+        if (ev.policy) |snapshot| {
+            if (snapshot.s.len != 0) {
+                const inherited = try proto.NetPolicySet.decodeAlloc(snapshot.s, self.gpa);
+                defer self.gpa.free(inherited.allow_top);
+                defer self.gpa.free(inherited.allow_sub);
+                if (inherited.view != ev.popup_view or inherited.serial == 0) return error.InvalidPopupPolicy;
+                v.pol = try dupePolicy(self.gpa, .{
+                    .untrusted = inherited.flags & proto.NetPolicySet.flag_untrusted != 0,
+                    .allow_top = inherited.allow_top,
+                    .allow_sub = inherited.allow_sub,
+                    .allow_private = inherited.flags & proto.NetPolicySet.flag_allow_private != 0,
+                    .block_types = inherited.block_types,
+                    .allow_schemes = inherited.allow_schemes,
+                    .max_requests = inherited.max_requests,
+                    .max_bytes = inherited.max_bytes,
+                    .max_navigations = inherited.max_navigations,
+                    .deadline_ms = inherited.deadline_ms,
+                    .block_ads = ev.block_ads != 0,
+                });
+                v.pol_serial = inherited.serial;
+                v.pol_active = true;
+            }
+        } else if (opener == null or opener.?.pol != null) {
+            // A legacy announcement cannot identify which policy the
+            // popup inherited while its opener was being tightened.
+            return error.PopupPolicySnapshotUnavailable;
+        }
         if (ev.url.len > 0) v.url = try self.gpa.dupe(u8, ev.url);
         try self.views.append(self.gpa, v);
     }
@@ -4822,12 +4849,16 @@ const StreamPeer = struct {
                     defer out.deinit(std.heap.page_allocator);
                     // A stale success must not satisfy this request.
                     proto.encode(std.heap.page_allocator, &out, proto.EvStreamOpen{
-                        .view = req.view, .req = req.req - 1, .path = "/tmp/stale.sock",
-                        .token = "00000000000000000000000000000000", .err = "",
+                        .view = req.view,
+                        .req = req.req - 1,
+                        .path = "/tmp/stale.sock",
+                        .token = "00000000000000000000000000000000",
+                        .err = "",
                     }) catch return;
                     proto.encode(std.heap.page_allocator, &out, proto.EvStreamClosed{ .view = req.view, .reason = "previous stream ended" }) catch return;
                     proto.encode(std.heap.page_allocator, &out, proto.EvStreamOpen{
-                        .view = req.view, .req = req.req,
+                        .view = req.view,
+                        .req = req.req,
                         .path = if (self.err.len == 0) "/tmp/current.sock" else "",
                         .token = if (self.err.len == 0) "0123456789abcdef0123456789abcdef" else "",
                         .err = self.err,
@@ -4978,8 +5009,11 @@ test "stream timeout cancels the slot and late replies cannot satisfy another op
     var payload: std.ArrayList(u8) = .empty;
     defer payload.deinit(gpa);
     try proto.encodePayload(gpa, &payload, proto.EvStreamOpen{
-        .view = 1, .req = req.req, .path = "/tmp/late.sock",
-        .token = "00000000000000000000000000000000", .err = "",
+        .view = 1,
+        .req = req.req,
+        .path = "/tmp/late.sock",
+        .token = "00000000000000000000000000000000",
+        .err = "",
     });
     pair.eng.dispatch(.{ .tag = .ev_stream_open, .payload = payload.items });
     try std.testing.expect(v.stream_reply == null);
@@ -5292,6 +5326,110 @@ test "an adopted page popup is claimed with view_show so the helper keeps it pas
         if (v.id == popup_id) count += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), count);
+}
+
+test "popup policy adoption uses its snapshot across opener replacement and supports accounting and tightening" {
+    const t = std.testing;
+    var pair = try Pair.init(t.allocator);
+    defer pair.deinit();
+    pair.eng.caps.insert(.net_policy);
+    const opener = try pair.eng.openViewIn("https://site.example/", 800, 600, .default, &.{
+        .allow_top = &.{"site.example"},
+        .max_requests = 100,
+        .block_ads = false,
+    });
+    var drained: [16384]u8 = undefined;
+    _ = pair.drain(&drained);
+    const popup_id = proto.ENGINE_VIEW_BASE + 1;
+    const inherited_serial = opener.pol_serial;
+    var snapshot: std.ArrayList(u8) = .empty;
+    defer snapshot.deinit(t.allocator);
+    try proto.encodePayload(t.allocator, &snapshot, Engine.policyFrame(popup_id, inherited_serial, &opener.pol.?));
+    // The helper already cloned this policy, but its announcement is
+    // still in transit when the opener's replacement is acknowledged.
+    freePolicy(t.allocator, &opener.pol.?);
+    opener.pol = try dupePolicy(t.allocator, .{ .allow_top = &.{"narrow.site.example"}, .max_requests = 50 });
+    opener.pol_serial = pair.eng.mintPolicySerial();
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(t.allocator);
+    try proto.encodePayload(t.allocator, &payload, proto.EvPagePopup{
+        .owner_view = opener.id,
+        .popup_view = popup_id,
+        .state = proto.page_popup_opened,
+        .disposition = 0,
+        .user_gesture = 1,
+        .chromeless = 1,
+        .w = 500,
+        .h = 600,
+        .url = "https://site.example/popup",
+        .frame_name = "",
+        .policy = .{ .s = snapshot.items },
+        .block_ads = 0,
+    });
+    pair.eng.dispatch(.{ .tag = .ev_page_popup, .payload = payload.items });
+    const popup = pair.eng.findView(popup_id).?;
+    @memset(snapshot.items, 0);
+    @memset(payload.items, 0);
+    try t.expectEqual(inherited_serial, popup.pol_serial);
+    try t.expectEqualStrings("site.example", popup.pol.?.allow_top[0]);
+    try t.expectEqual(@as(u32, 100), popup.pol.?.max_requests);
+    try t.expectEqual(@as(?bool, false), popup.pol.?.block_ads);
+    try t.expect(popup.pol_active);
+    _ = pair.drain(&drained);
+    var accounting = proto.EvNetPolicy{
+        .view = popup_id,
+        .serial = inherited_serial,
+        .active = 1,
+        .exhausted = 0,
+        .requests = 7,
+        .bytes = 1234,
+        .navigations = 2,
+        .ms_left = 321,
+        .denied = @splat(0),
+    };
+    payload.clearRetainingCapacity();
+    try proto.encodePayload(t.allocator, &payload, accounting);
+    pair.eng.dispatch(.{ .tag = .ev_net_policy, .payload = payload.items });
+    try t.expectEqual(@as(u32, 7), popup.pol_requests);
+    pair.eng.caps.insert(.net_policy_ack);
+    var peer = PolicyPeer{ .peer = pair.peer, .serial = pair.eng.next_policy_serial, .reply = accounting };
+    const thread = try std.Thread.spawn(.{}, PolicyPeer.run, .{&peer});
+    const report = pair.eng.tightenViewPolicy(popup_id, &.{ .max_requests = 25 });
+    thread.join();
+    try t.expectEqual(@as(usize, 1), (try report).n_tightened);
+    try t.expectEqual(@as(u32, 25), popup.pol.?.max_requests);
+    try t.expect(popup.pol_serial != inherited_serial);
+    try t.expectEqual(@as(u32, 7), popup.pol_requests);
+    try t.expectEqual(@as(u32, 50), opener.pol.?.max_requests);
+    pair.eng.closeView(opener.id);
+    try t.expectEqualStrings("site.example", popup.pol.?.allow_top[0]);
+    accounting.requests = 0;
+    payload.clearRetainingCapacity();
+    try proto.encodePayload(t.allocator, &payload, accounting);
+    pair.eng.dispatch(.{ .tag = .ev_net_policy, .payload = payload.items });
+    try t.expectEqual(@as(u32, 7), popup.pol_requests);
+}
+
+test "legacy popup policy adoption refuses an ambiguous inheritance" {
+    const t = std.testing;
+    var pair = try Pair.init(t.allocator);
+    defer pair.deinit();
+    pair.eng.caps.insert(.net_policy);
+    const opener = try pair.eng.openViewIn("https://site.example/", 800, 600, .default, &.{ .allow_top = &.{"site.example"} });
+    const ev = proto.EvPagePopup{
+        .owner_view = opener.id,
+        .popup_view = proto.ENGINE_VIEW_BASE + 1,
+        .state = proto.page_popup_opened,
+        .disposition = 0,
+        .user_gesture = 1,
+        .chromeless = 1,
+        .w = 500,
+        .h = 600,
+        .url = "https://site.example/popup",
+        .frame_name = "",
+    };
+    try t.expectError(error.PopupPolicySnapshotUnavailable, pair.eng.adoptPopupView(ev));
+    try t.expectEqual(@as(usize, 1), pair.eng.views.items.len);
 }
 
 /// The first frame of tag `tag` in `bytes`, decoded.

@@ -30,6 +30,13 @@ pub fn findDl(self: *Host, view: u32, id: u32) ?*Dl {
     return null;
 }
 
+/// A view cannot be discarded while its browser still owns an unfinished download.
+pub fn hasActiveDownloads(self: *const Host, view: u32) bool {
+    for (self.dl_pending.items) |p| if (p.view == view) return true;
+    for (self.downloads.items) |*d| if (d.view == view and !d.terminal()) return true;
+    return false;
+}
+
 /// The client answered an `ev_download_offer`. An id the helper no
 /// longer holds is ignored (the download may already have failed or
 /// its view may be gone).

@@ -540,19 +540,21 @@ pub const Translator = struct {
             },
             .@"session.text.delta" => {
                 const mid = str(d, "assistantMessageID") orelse return;
+                const ordinal = textOrdinal(d) orelse return;
                 try push(a, out, "message.part.delta", .{
                     .sessionID = sid,
                     .messageID = mid,
-                    .partID = try textPartId(a, mid, @intCast(int(d, "ordinal") orelse 0)),
+                    .partID = try textPartId(a, mid, ordinal),
                     .field = "text",
                     .delta = str(d, "delta") orelse "",
                 });
             },
             .@"session.text.ended" => {
                 const mid = str(d, "assistantMessageID") orelse return;
+                const ordinal = textOrdinal(d) orelse return;
                 try push(a, out, "message.part.updated", .{ .sessionID = sid, .part = .{
                     .type = "text",
-                    .id = try textPartId(a, mid, @intCast(int(d, "ordinal") orelse 0)),
+                    .id = try textPartId(a, mid, ordinal),
                     .messageID = mid,
                     .sessionID = sid,
                     .text = str(d, "text") orelse "",
@@ -759,8 +761,12 @@ pub fn questionBody(d: Dialect, a: std.mem.Allocator, asked: []const Asked, answ
             .boolean => .{ .bool = picked.len > 0 and std.mem.eql(u8, valueOf(q, picked[0]), "true") },
             .number, .integer => blk: {
                 const s = if (picked.len > 0) std.mem.trim(u8, picked[0], " ") else "";
+                if (q.kind == .integer) {
+                    break :blk .{ .integer = std.fmt.parseInt(i64, s, 10) catch return error.NoSuchOption };
+                }
                 const f = std.fmt.parseFloat(f64, s) catch return error.NoSuchOption;
-                break :blk if (q.kind == .integer) .{ .integer = @intFromFloat(f) } else .{ .float = f };
+                if (!std.math.isFinite(f)) return error.NoSuchOption;
+                break :blk .{ .float = f };
             },
             .string, .external => .{ .string = if (picked.len > 0) valueOf(q, picked[0]) else "" },
         };
@@ -825,13 +831,22 @@ fn str(v: Value, key: []const u8) ?[]const u8 {
     };
 }
 
-fn int(v: Value, key: []const u8) ?i64 {
-    const x = get(v, key) orelse return null;
+/// Decode numeric API fields without converting non-finite or out-of-range floats.
+pub fn int(v: Value, key: []const u8) ?i64 {
+    return integerNumber(get(v, key) orelse return null);
+}
+
+fn integerNumber(x: Value) ?i64 {
     return switch (x) {
         .integer => |i| i,
-        .float => |f| @intFromFloat(f),
+        .float => |f| if (f >= -0x1p63 and f < 0x1p63) @intFromFloat(f) else null,
         else => null,
     };
+}
+
+fn textOrdinal(v: Value) ?u32 {
+    const x = get(v, "ordinal") orelse return 0;
+    return std.math.cast(u32, integerNumber(x) orelse return null);
 }
 
 fn boolean(v: Value, key: []const u8) ?bool {

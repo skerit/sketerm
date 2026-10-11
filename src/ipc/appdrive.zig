@@ -32,6 +32,7 @@ pub const Error = error{
     NoSuchWindow,
     BadKey,
     BadLayout,
+    BadScrollDelta,
     Timeout,
     NoClipboard,
     NotRecording,
@@ -41,6 +42,32 @@ pub const Error = error{
     /// copy of its terminal output is not.
     Desynced,
 };
+
+/// Refuse wheel deltas that cannot be represented by Wayland's signed value120 field.
+fn scrollValue120(delta: f64) Error!i32 {
+    const scaled = delta * 120.0;
+    if (!(scaled >= std.math.minInt(i32) and scaled <= std.math.maxInt(i32)))
+        return Error.BadScrollDelta;
+    return @intFromFloat(scaled);
+}
+
+test "scroll value120 conversion rejects non-finite and scaled overflow deltas" {
+    const t = std.testing;
+    try t.expectEqual(@as(i32, 120), try scrollValue120(1));
+    try t.expectEqual(@as(i32, -60), try scrollValue120(-0.5));
+    try t.expectEqual(std.math.minInt(i32), try scrollValue120(@as(f64, std.math.minInt(i32)) / 120.0));
+    try t.expectEqual(std.math.maxInt(i32), try scrollValue120(@as(f64, std.math.maxInt(i32)) / 120.0));
+    for ([_]f64{
+        2_147_483_647,
+        1e100,
+        -1e100,
+        std.math.inf(f64),
+        -std.math.inf(f64),
+        std.math.nan(f64),
+        (@as(f64, std.math.maxInt(i32)) + 1) / 120.0,
+        (@as(f64, std.math.minInt(i32)) - 1) / 120.0,
+    }) |delta| try t.expectError(Error.BadScrollDelta, scrollValue120(delta));
+}
 
 /// WHY the last `App.launch`/`attachExisting` failed, human-readable
 /// (the daemon's own error message when there was one). Error enums
@@ -2045,18 +2072,20 @@ pub const App = struct {
 
     /// Pump until at least one toplevel has pixels (or timeout).
     pub fn waitFirstWindow(self: *App, timeout_ms: i64) bool {
-        const deadline = nowMs() + timeout_ms;
-        while (nowMs() < deadline) {
+        return self.waitFirstWindowUntil(nowMs() + timeout_ms);
+    }
+
+    /// Share an outer operation's absolute deadline without restarting its wait budget.
+    pub fn waitFirstWindowUntil(self: *App, deadline: i64) bool {
+        while (true) {
             for (self.windows.items) |w| {
                 if (!w.popup and w.frames > 0) return true;
             }
             if (self.exited or self.presentationGone()) return false;
-            _ = self.pumpOnce(50);
+            const left = deadline - nowMs();
+            if (left <= 0) return false;
+            _ = self.pumpOnce(@intCast(@min(left, 50)));
         }
-        for (self.windows.items) |w| {
-            if (!w.popup and w.frames > 0) return true;
-        }
-        return false;
     }
 
     /// Pump until no frame arrived for `quiet_ms` (bounded by
@@ -2303,6 +2332,8 @@ pub const App = struct {
     }
 
     pub fn scroll(self: *App, win_id: u32, x: f64, y: f64, dx: f64, dy: f64) Error!void {
+        const dx120 = try scrollValue120(dx);
+        const dy120 = try scrollValue120(dy);
         const win = self.winById(win_id) orelse return Error.NoSuchWindow;
         const a = self.allocator;
         var units: std.ArrayList(u8) = .empty;
@@ -2312,8 +2343,8 @@ pub const App = struct {
         // Enter is a no-op when focus is unchanged, so the motion is
         // what actually puts the pointer at the scroll point.
         wlpipe.appendSeatMotion(&units, a, hit.x, hit.y) catch return Error.OutOfMemory;
-        if (dy != 0) wlpipe.appendSeatAxis(&units, a, 0, dy * 10.0, @intFromFloat(dy * 120.0)) catch return Error.OutOfMemory;
-        if (dx != 0) wlpipe.appendSeatAxis(&units, a, 1, dx * 10.0, @intFromFloat(dx * 120.0)) catch return Error.OutOfMemory;
+        if (dy != 0) wlpipe.appendSeatAxis(&units, a, 0, dy * 10.0, dy120) catch return Error.OutOfMemory;
+        if (dx != 0) wlpipe.appendSeatAxis(&units, a, 1, dx * 10.0, dx120) catch return Error.OutOfMemory;
         try self.sendIntents(win.chan, units.items);
         self.rememberPtr(win.id, x, y);
     }
@@ -3125,6 +3156,12 @@ pub const App = struct {
     /// below the threshold do not move the comparison baseline, so a
     /// slow cumulative drift still eventually counts as change.
     pub fn waitVisualSettle(self: *App, win_id: u32, quiet_ms: i64, timeout_ms: i64, max_change_pct: f64, region: ?Region) bool {
+        return self.waitVisualSettleUntil(win_id, quiet_ms, nowMs() + timeout_ms, max_change_pct, region);
+    }
+
+    /// Keep the requested quiet interval while spending only the outer operation's remaining time.
+    pub fn waitVisualSettleUntil(self: *App, win_id: u32, quiet_ms: i64, deadline: i64, max_change_pct: f64, region: ?Region) bool {
+        if (deadline <= nowMs()) return false;
         const a = self.allocator;
         var base: std.ArrayList(u8) = .empty;
         defer base.deinit(a);
@@ -3138,11 +3175,12 @@ pub const App = struct {
             base_h = win.h;
             last_frames = win.frames;
         }
-        const deadline = nowMs() + timeout_ms;
         var quiet_since = nowMs();
-        while (nowMs() < deadline) {
+        while (true) {
             if (self.exited or self.presentationGone()) return true;
-            _ = self.pumpOnce(25);
+            const left = deadline - nowMs();
+            if (left <= 0) break;
+            _ = self.pumpOnce(@intCast(@min(left, 25)));
             const win = self.winById(win_id) orelse return false;
             if (win.frames != last_frames) {
                 last_frames = win.frames;

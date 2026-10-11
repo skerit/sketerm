@@ -165,6 +165,19 @@ pub const Policy = struct {
         return p;
     }
 
+    /// Independently owned deep copy; the copy's `deinit` never touches `self`.
+    pub fn clone(self: *const Policy, gpa: std.mem.Allocator) !*Policy {
+        const p = try gpa.create(Policy);
+        errdefer gpa.destroy(p);
+        p.* = self.*;
+        p.arena_state = std.heap.ArenaAllocator.init(gpa);
+        errdefer p.arena_state.deinit();
+        const arena = p.arena_state.allocator();
+        p.allow_top = try dupeHosts(arena, self.allow_top);
+        p.allow_sub = try dupeHosts(arena, self.allow_sub);
+        return p;
+    }
+
     pub fn deinit(self: *Policy, gpa: std.mem.Allocator) void {
         self.arena_state.deinit();
         gpa.destroy(self);
@@ -891,6 +904,39 @@ test "wire round trip: build copies and clamps" {
     defer p.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, MAX_HOSTS), p.allow_top.len);
     try testing.expectEqualStrings("h.example", p.allow_top[0]);
+}
+
+test "clone is independently owned and keeps every restriction" {
+    var set = baseSet();
+    set.allow_sub = &.{"cdn.example"};
+    set.block_types = filter.RType.script.bit();
+    set.max_requests = 7;
+    set.flags = proto.NetPolicySet.flag_allow_private;
+    const p = try testPolicy(testing.allocator, set);
+    p.proxy_decides_addresses = true;
+    const copy = try p.clone(testing.allocator);
+    // The original goes first: the copy must not read its arena.
+    p.deinit(testing.allocator);
+    defer copy.deinit(testing.allocator);
+    try testing.expectEqualStrings("site.example", copy.allow_top[0]);
+    try testing.expectEqualStrings("cdn.example", copy.allow_sub[0]);
+    try testing.expectEqual(filter.RType.script.bit(), copy.block_types);
+    try testing.expectEqual(@as(u32, 7), copy.max_requests);
+    try testing.expect(copy.allow_private);
+    try testing.expect(copy.proxy_decides_addresses);
+    var pc: Counters = .{};
+    try testing.expectEqual(proto.NetReason.none, decide(copy, &pc, .{ .host = "site.example", .scheme = "https", .rtype = .document, .is_top = true }, 0));
+}
+
+test "clone OOM leaks nothing" {
+    const p = try testPolicy(testing.allocator, baseSet());
+    defer p.deinit(testing.allocator);
+    try testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn f(gpa: std.mem.Allocator, src: *Policy) !void {
+            const copy = try src.clone(gpa);
+            copy.deinit(gpa);
+        }
+    }.f, .{p});
 }
 
 test "policy ports constrain ordinary and untrusted requests without widening defaults" {

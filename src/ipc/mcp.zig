@@ -1755,6 +1755,14 @@ pub fn argStr(args: std.json.Value, key: []const u8) ?[]const u8 {
     };
 }
 
+/// Treat absent and JSON null as absent while refusing other non-integers and values outside the destination type.
+pub fn argIntAs(comptime T: type, args: std.json.Value, key: []const u8) error{InvalidInteger}!?T {
+    const v = argValue(args, key) orelse return null;
+    if (v == .null) return null;
+    if (v != .integer) return error.InvalidInteger;
+    return std.math.cast(T, v.integer) orelse error.InvalidInteger;
+}
+
 /// One argument as its raw JSON value, for the few arguments whose type
 /// is not a scalar (an array of urls).
 pub fn argValue(args: std.json.Value, key: []const u8) ?std.json.Value {

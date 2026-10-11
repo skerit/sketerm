@@ -1476,6 +1476,14 @@ const Client = struct {
     pp_w: u16 = 0,
     pp_h: u16 = 0,
     pp_fb_fd: c_int = -1,
+    pp_fb_seq: u32 = 0,
+    pp_policy_known: bool = false,
+    pp_policy_serial: u32 = 0,
+    pp_policy_max_requests: u32 = 0,
+    stream_open_seq: u32 = 0,
+    stream_open_ok: bool = false,
+    stream_closed_seq: u32 = 0,
+    stream_closed_view: u32 = 0,
     /// Title of the popup's OWN document (`ev_title` for `pp_view`).
     pp_title: [256]u8 = @splat(0),
     pp_title_len: usize = 0,
@@ -2063,6 +2071,7 @@ const Client = struct {
                 if (self.pp_view != 0 and fb.view == self.pp_view) {
                     if (self.pp_fb_fd >= 0) _ = c.close(self.pp_fb_fd);
                     self.pp_fb_fd = fd;
+                    self.pp_fb_seq += 1;
                     return;
                 }
                 self.unmap();
@@ -2126,6 +2135,16 @@ const Client = struct {
                 @memcpy(self.dl_url[0..self.dl_url_len], o.url[0..self.dl_url_len]);
                 self.dl_req = o.req;
                 self.dl_offer_seq += 1;
+            },
+            .ev_stream_open => {
+                const ev = proto.decode(proto.EvStreamOpen, frame.payload) catch fail("ev_stream_open decode");
+                self.stream_open_seq += 1;
+                self.stream_open_ok = ev.err.len == 0;
+            },
+            .ev_stream_closed => {
+                const ev = proto.decode(proto.EvStreamClosed, frame.payload) catch fail("ev_stream_closed decode");
+                self.stream_closed_seq += 1;
+                self.stream_closed_view = ev.view;
             },
             .ev_download_progress => {
                 const p = proto.decode(proto.EvDownloadProgress, frame.payload) catch fail("ev_download_progress decode");
@@ -2224,6 +2243,17 @@ const Client = struct {
                 if (p.state == proto.page_popup_opened) {
                     self.pp_opened_seq += 1;
                     self.pp_title_len = 0;
+                    self.pp_policy_known = p.policy != null;
+                    self.pp_policy_serial = 0;
+                    self.pp_policy_max_requests = 0;
+                    if (p.policy) |inherited| if (inherited.s.len != 0) {
+                        const policy = proto.NetPolicySet.decodeAlloc(inherited.s, self.gpa) catch fail("popup policy snapshot decode");
+                        defer self.gpa.free(policy.allow_top);
+                        defer self.gpa.free(policy.allow_sub);
+                        if (policy.view != p.popup_view) fail("popup policy snapshot names another view");
+                        self.pp_policy_serial = policy.serial;
+                        self.pp_policy_max_requests = policy.max_requests;
+                    };
                 } else if (p.state == proto.page_popup_closed) {
                     self.pp_closed_seq += 1;
                 }
@@ -3580,9 +3610,9 @@ fn runNetChangeStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8
         reapHelper(pid, "stage nc (one blink)");
     }
 
-    // -- two blinks: the retry fails too, and that IS reported ----------
+    // -- consecutive failures: bounded retry, then a fresh hard reload --
     {
-        _ = c.setenv("SKETERM_WEB_FAULT_NET_CHANGED", "2", 1);
+        _ = c.setenv("SKETERM_WEB_FAULT_NET_CHANGED", "3", 1);
         defer _ = c.unsetenv("SKETERM_WEB_FAULT_NET_CHANGED");
         var cache_buf: [4096]u8 = undefined;
         const cache_dir = std.fmt.bufPrintZ(&cache_buf, "{s}/nc2-cache", .{dir}) catch fail("stage nc cache path");
@@ -3608,18 +3638,134 @@ fn runNetChangeStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8
         if (cl.load_err_code != -21) fail("stage nc: the reported failure was not ERR_NETWORK_CHANGED");
         if (cl.load_retry_seq != retry0 + 1) fail("stage nc: the bounded case did not report exactly one retry before failing");
         if (srv.path_hits.load(.acquire) != served0) fail("stage nc: a page request reached the server while both attempts were faulted");
-        // A client navigation is a fresh budget, and no fault is left.
+        // Shift+Reload must renew the budget even though its first
+        // attempt is hit by the remaining third injected failure.
         cl.resetTitle();
-        cl.send(proto.Navigate{ .view = view_id, .url = page_url });
+        cl.send(proto.NavAction{ .view = view_id, .action = @intFromEnum(proto.NavAct.reload_no_cache) });
         if (!cl.waitTitle("nc:page", 20_000)) fail("stage nc: the page did not load once the faults were spent");
-        if (cl.load_retry_seq != retry0 + 1 or cl.load_err_seq != errs0 + 1) fail("stage nc: the recovering load reported a spurious retry or error");
-        pass("stage nc the retry is bounded: a second network change is reported as the failure it is");
+        if (cl.load_retry_seq != retry0 + 2 or cl.load_err_seq != errs0 + 1) fail("stage nc: hard reload did not renew the retry budget");
+        pass("stage nc retry is bounded and hard reload restores its one-shot budget");
 
         cl.send(proto.ViewDestroy{ .view = view_id });
         cl.pump(500);
         cl.deinit();
         reapHelper(pid, "stage nc (two blinks)");
     }
+}
+
+/// Exercise popup policy ownership, engine-close stream retirement and refused-discard recovery against CEF.
+fn runLifecycleStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) void {
+    var child = HttpProbe{ .body = popup_child_page };
+    if (!child.start()) fail("lifecycle: popup fixture did not start");
+    defer child.shutdown();
+    var child_url_buf: [128]u8 = undefined;
+    const child_url = std.fmt.bufPrint(&child_url_buf, "http://127.0.0.1:{d}/popup", .{child.lis.port}) catch fail("lifecycle: popup URL");
+    var html: [2048]u8 = undefined;
+    var opener = HttpProbe{ .body = std.fmt.bufPrint(&html, popup_opener_fmt, .{child_url}) catch fail("lifecycle: opener HTML") };
+    if (!opener.start()) fail("lifecycle: opener fixture did not start");
+    defer opener.shutdown();
+    var url_buf: [128]u8 = undefined;
+    const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{opener.lis.port}) catch fail("lifecycle: opener URL");
+    var cache_buf: [4096]u8 = undefined;
+    const cache = std.fmt.bufPrintZ(&cache_buf, "{s}/lifecycle-cache", .{dir}) catch fail("lifecycle: cache path");
+    var sock_buf: [96]u8 = undefined;
+    const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/lifecycle.sock", .{dir}) catch fail("lifecycle: socket path");
+    const pid = spawnHelper(exe, sock.ptr, cache.ptr, "--ozone-platform=headless", null, false);
+    g_pid = pid;
+    var cl = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
+    cl.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web-lifecycle" });
+    if (!cl.waitSeq(&cl.ack_proto, 0, 15_000)) fail("lifecycle: handshake");
+    var policy = proto.NetPolicySet{
+        .view = view_id,
+        .serial = 1,
+        .flags = proto.NetPolicySet.flag_allow_private,
+        .block_types = 0,
+        .allow_schemes = @import("web/netpolicy.zig").default_schemes,
+        .max_requests = 1000,
+        .max_bytes = 0,
+        .max_navigations = 0,
+        .deadline_ms = 0,
+        .allow_top = &.{"127.0.0.1"},
+        .allow_sub = &.{},
+    };
+    cl.send(policy);
+    cl.send(proto.ViewCreateUrl{ .view = view_id, .w = 640, .h = 480, .scale_x1000 = 1000, .context = 0, .url = url });
+    cl.send(proto.PopupPolicySet{ .view = view_id, .mode = proto.popup_mode_allow });
+    if (!cl.waitTitle("opener:ready", 20_000) or !cl.waitBufferAfter(0, 20_000)) fail("lifecycle: opener did not load");
+    if (!cl.waitCenterColor(.{ 255, 255, 136 }, 20_000)) fail("lifecycle: opener did not paint its click target");
+    cl.send(proto.InputFocus{ .view = view_id, .focused = 1 });
+    cl.clickCenter();
+    if (!cl.waitSeq(&cl.pp_opened_seq, 0, 15_000) or !cl.waitPopupTitle("opener:yes", 20_000)) fail("lifecycle: popup did not load");
+    const popup = cl.pp_view;
+    if (!cl.pp_policy_known or cl.pp_policy_serial != 1 or cl.pp_policy_max_requests != 1000)
+        fail("lifecycle: popup announcement lost its exact inherited policy");
+    policy.serial = 2;
+    policy.max_requests = 500;
+    cl.send(policy);
+    const allowed = cl.evalWaitView(popup, "fetch(location.href).then(r=>r.status)", true, 15_000);
+    if (std.mem.indexOf(u8, allowed, "\"value\":200") == null) fail("lifecycle: replacing opener policy damaged popup policy");
+    const blocked = cl.evalWaitView(popup, "fetch('http://forbidden.invalid/').then(()=> 'bad',()=> 'blocked')", true, 15_000);
+    if (std.mem.indexOf(u8, blocked, "blocked") == null) fail("lifecycle: popup lost inherited host restrictions");
+    var narrowed = policy;
+    narrowed.view = popup;
+    narrowed.serial = 3;
+    narrowed.max_requests = 100;
+    cl.pol_probe_view = popup;
+    cl.send(narrowed);
+    {
+        const deadline = nowMs() + 15_000;
+        while (cl.pol_probe_serial != narrowed.serial and nowMs() < deadline) cl.pump(50);
+    }
+    if (cl.pol_probe_serial != 3 or cl.pol_probe_active != 1) fail("lifecycle: adopted popup policy could not be tightened");
+
+    const popup_fb = cl.pp_fb_seq;
+    cl.send(proto.ViewHide{ .view = popup });
+    cl.send(proto.ViewDiscard{ .view = popup });
+    cl.send(proto.ViewShow{ .view = popup });
+    if (!cl.waitSeq(&cl.pp_fb_seq, popup_fb, 15_000)) fail("lifecycle: refused popup discard did not restore its frame mapping");
+    cl.send(proto.StreamOpen{ .view = popup, .req = 1, .audio = 0 });
+    if (!cl.waitSeq(&cl.stream_open_seq, 0, 15_000) or !cl.stream_open_ok) fail("lifecycle: popup stream did not open");
+    // Exercise accepts while the poll set also contains a stream socket.
+    for (0..8) |_| {
+        var joined = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
+        joined.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "lifecycle-join" });
+        if (!joined.waitSeq(&joined.ack_proto, 0, 15_000)) fail("lifecycle: joining connection was lost");
+        joined.deinit();
+    }
+    _ = cl.evalWaitView(popup, "setTimeout(()=>window.close(),50);1", false, 15_000);
+    if (!cl.waitSeq(&cl.pp_closed_seq, 0, 15_000)) fail("lifecycle: engine close did not retire popup");
+    if (!cl.waitSeq(&cl.stream_closed_seq, 0, 15_000) or cl.stream_closed_view != popup) fail("lifecycle: engine close left popup stream alive");
+    const survivor = cl.evalWait("fetch(location.href).then(r=>r.status)", true, 15_000);
+    if (std.mem.indexOf(u8, survivor, "\"value\":200") == null) fail("lifecycle: closing popup damaged opener policy");
+    pass("lifecycle popup policy survives replacement and self-close; stream ends and refused discard remaps");
+
+    const dl_view: u32 = 711;
+    const fb_before = cl.fb_seq;
+    cl.send(proto.ViewCreateUrl{ .view = dl_view, .w = 320, .h = 240, .scale_x1000 = 1000, .context = 0, .url = red_page });
+    if (!cl.waitBufferAfter(fb_before, 20_000)) fail("lifecycle: download view did not open");
+    cl.send(proto.DownloadStart{ .view = dl_view, .req = 42, .url = "data:application/octet-stream," ++ download_bytes });
+    if (!cl.waitSeq(&cl.dl_offer_seq, 0, 15_000)) fail("lifecycle: download offer missing");
+    const download_id = cl.dl_id;
+    const dl_fb = cl.fb_seq;
+    cl.send(proto.ViewHide{ .view = dl_view });
+    cl.send(proto.ViewDiscard{ .view = dl_view });
+    cl.send(proto.ViewShow{ .view = dl_view });
+    if (!cl.waitBufferAfter(dl_fb, 15_000)) fail("lifecycle: download discard did not remap");
+    if (cl.dl_failed != 0) fail("lifecycle: discard cancelled an offered download");
+    var file_buf: [4096:0]u8 = undefined;
+    const file = std.fmt.bufPrintZ(&file_buf, "{s}/lifecycle-download.bin", .{dir}) catch fail("lifecycle: download path");
+    cl.send(proto.DownloadDecide{ .view = dl_view, .id = download_id, .path = file });
+    if (!cl.waitDlTerminal(download_id, 20_000) or cl.dl_done != 1) fail("lifecycle: preserved download did not complete");
+    const fp = c.fopen(file.ptr, "rb") orelse fail("lifecycle: completed download missing");
+    var bytes: [64]u8 = undefined;
+    const n = c.fread(&bytes, 1, bytes.len, fp);
+    _ = c.fclose(fp);
+    if (!std.mem.eql(u8, bytes[0..n], download_bytes)) fail("lifecycle: preserved download content differs");
+    pass("lifecycle discard preserves held downloads and remaps their live browser");
+    cl.send(proto.ViewDestroy{ .view = dl_view });
+    cl.send(proto.ViewDestroy{ .view = view_id });
+    cl.deinit();
+    reapHelper(pid, "lifecycle");
 }
 
 // ---------------------------------------------------------------------
@@ -4025,9 +4171,18 @@ fn runCaptureStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) 
         if (first.entries.len != 3 or first.more == 0 or first.next_cursor != 3) fail("stage cap: a 3-entry page did not report more and its cursor");
         const stored_before = first.stored;
         cl.send(proto.CaptureSet{
-            .view = view_id, .serial = 1, .op = @intFromEnum(proto.CaptureOp.clear), .upto = first.next_cursor,
-            .types = 0, .max_body = 0, .max_total = 0, .url_contains = "", .url_regex = "",
-            .hosts = &.{}, .methods = &.{}, .mime_prefixes = &.{},
+            .view = view_id,
+            .serial = 1,
+            .op = @intFromEnum(proto.CaptureOp.clear),
+            .upto = first.next_cursor,
+            .types = 0,
+            .max_body = 0,
+            .max_total = 0,
+            .url_contains = "",
+            .url_regex = "",
+            .hosts = &.{},
+            .methods = &.{},
+            .mime_prefixes = &.{},
         });
         const rest = capList(&cl, view_id, 0, 100);
         defer gpa.free(rest.entries);
@@ -4035,9 +4190,18 @@ fn runCaptureStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) 
         if (rest.stored >= stored_before) fail("stage cap: clear did not give the bytes back");
     }
     cl.send(proto.CaptureSet{
-        .view = view_id, .serial = 1, .op = @intFromEnum(proto.CaptureOp.disable), .upto = 0,
-        .types = 0, .max_body = 0, .max_total = 0, .url_contains = "", .url_regex = "",
-        .hosts = &.{}, .methods = &.{}, .mime_prefixes = &.{},
+        .view = view_id,
+        .serial = 1,
+        .op = @intFromEnum(proto.CaptureOp.disable),
+        .upto = 0,
+        .types = 0,
+        .max_body = 0,
+        .max_total = 0,
+        .url_contains = "",
+        .url_regex = "",
+        .hosts = &.{},
+        .methods = &.{},
+        .mime_prefixes = &.{},
     });
     cl.resetTitle();
     cl.send(proto.NavAction{ .view = view_id, .action = @intFromEnum(proto.NavAct.reload) });
@@ -4596,13 +4760,16 @@ fn runExtApiStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
     const want = [_][]const u8{
         // The cancel (B) beat the redirect (A); the lone redirect landed;
         // both extensions' headers arrived.
-        "r1:blocked", "r2:RDST2", "h:AB",
+        "r1:blocked",        "r2:RDST2",         "h:AB",
         // Notifications and webNavigation fired.
-        "rs1", "done1", "sent1", "nav:cd", "navtab:ok",
+        "rs1",               "done1",            "sent1",
+        "nav:cd",            "navtab:ok",
         // The former stubs answer for real, or reject by name.
-        "perm:1", "has-cookies:false", "request:rejected", "cmd:do-thing/\"\"",
-        "win:1/1", "exec:[true]", "css:rgb(1, 2, 3)", "zoom:1", "menu:err",
-        "frames:1/0", "setzoom:rejected",
+               "perm:1",
+        "has-cookies:false", "request:rejected", "cmd:do-thing/\"\"",
+        "win:1/1",           "exec:[true]",      "css:rgb(1, 2, 3)",
+        "zoom:1",            "menu:err",         "frames:1/0",
+        "setzoom:rejected",
     };
     for (want) |w| {
         if (std.mem.indexOf(u8, res, w) == null) {
@@ -4734,9 +4901,8 @@ fn runGmStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) void 
             var want_buf: [32]u8 = undefined;
             const want_runs = std.fmt.bufPrint(&want_buf, "runs={d},", .{runs}) catch fail("fmt");
             const wants = [_][]const u8{
-                want_runs,                     "info=gm-test", "list=runs", "del=undefined",
-                "bg=rgb(4, 5, 6)",             "xhr=200:GDATA:true",
-                "deny=true",
+                want_runs,         "info=gm-test",       "list=runs", "del=undefined",
+                "bg=rgb(4, 5, 6)", "xhr=200:GDATA:true", "deny=true",
             };
             for (wants) |w| {
                 if (std.mem.indexOf(u8, res, w) == null) {
@@ -8756,6 +8922,15 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     if (c.mkdtemp(@ptrCast(&g_dir)) == null) fail("mkdtemp");
     const dir = std.mem.span(@as([*:0]const u8, @ptrCast(&g_dir)));
 
+    if (c.getenv("SKETERM_SMOKE_WEB_LIFECYCLE_ONLY") != null) {
+        runLifecycleStage(gpa, exe, dir);
+        runNetChangeStage(gpa, exe, dir);
+        cleanup();
+        if (gpa_state.deinit() == .leak) return 1;
+        say("smoke-web: PASS (lifecycle only)");
+        return 0;
+    }
+
     // Focused run for the flush/linger family (iterating on a late
     // stage without paying the ~35 before it), the
     // SKETERM_SMOKE_MCP_WEBSHARED_ONLY precedent.
@@ -11412,6 +11587,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     runGmStage(gpa, exe, dir);
     runDownloadHoldStage(gpa, exe, dir);
     runNetChangeStage(gpa, exe, dir);
+    runLifecycleStage(gpa, exe, dir);
     runCaptureStage(gpa, exe, dir);
     // ── Stage 35: real MV2 extensions ─────────────────────────────
     runShapeStage(gpa, exe, dir);

@@ -35,6 +35,7 @@ const marks_mod = mcp.marks_mod;
 const appErr = mcp.appErr;
 const argFloat = mcp.argFloat;
 const argInt = mcp.argInt;
+const BAD_SCROLL_DELTA = "scroll deltas must be finite and fit signed 32-bit value120 units after multiplication by 120";
 
 /// The caller named this path, so an existing file keeps its own mode.
 fn saveRecording(path: []const u8, bytes: []const u8) atomicwrite.Error!void {
@@ -206,9 +207,29 @@ const Need = enum { any, live };
 /// One app-scoped tool body, run once its app is resolved and caught up.
 const AppBody = fn (std.mem.Allocator, Tool, std.json.Value, *appdrive.App) anyerror![]const u8;
 
+/// Validate narrow wire integers before dispatch or replay can mutate an app.
+fn invalidAppInteger(args: std.json.Value) ?[]const u8 {
+    inline for (.{ "app", "window", "button" }) |key| {
+        _ = mcp.argIntAs(u32, args, key) catch return "'" ++ key ++ "' must be a whole number from 0 to 4294967295";
+    }
+    inline for (.{ "w", "h" }) |key| {
+        _ = mcp.argIntAs(i32, args, key) catch return "'" ++ key ++ "' must be a whole number in the signed 32-bit range";
+    }
+    return null;
+}
+
+fn invalidActionInteger(step: std.json.Value) ?[]const u8 {
+    if (invalidAppInteger(step)) |why| return why;
+    inline for (.{ "wait_image", "click_image", "wait_text" }) |key| {
+        if (mcp.argValue(step, key)) |v| if (invalidAppInteger(v)) |why| return why;
+    }
+    return null;
+}
+
 pub fn appTool(arena: std.mem.Allocator, tool: Tool, args: std.json.Value) ![]const u8 {
     if (!app_state.ready)
         return errRes(arena, .unavailable, "app tools unavailable (server not fully started)");
+    if (invalidAppInteger(args)) |why| return errRes(arena, .invalid_args, why);
     return switch (tool) {
         .launch_app => launchApp(arena, args),
         .list_installed_apps => listInstalledApps(arena, args),
@@ -290,7 +311,41 @@ fn withApp(
     return body(arena, tool, args, app);
 }
 
+const LaunchObservation = struct {
+    window: u32,
+    settled: bool = true,
+    settle_clipped: bool = false,
+};
+
+/// Startup, first-window/exit waiting and screenshot settling spend one outer deadline.
+fn observeLaunch(app: *appdrive.App, wait_for_exit: bool, wait_ms: i64, stable_ms: i64, deadline: i64) LaunchObservation {
+    const first_deadline = @min(deadline, nowMs() + wait_ms);
+    if (wait_for_exit) {
+        while (!app.exited) {
+            const left = first_deadline - nowMs();
+            if (left <= 0) break;
+            _ = app.pumpOnce(@intCast(@min(left, 50)));
+        }
+    } else {
+        _ = app.waitFirstWindowUntil(first_deadline);
+    }
+    var result: LaunchObservation = .{ .window = 0 };
+    for (app.windows.items) |win| {
+        if (!win.popup and win.frames > 0) {
+            result.window = win.id;
+            break;
+        }
+    }
+    if (result.window != 0 and stable_ms > 0 and !app.exited) {
+        const settle_until = nowMs() + @max(stable_ms * 4, 2000);
+        result.settle_clipped = deadline < settle_until;
+        result.settled = app.waitVisualSettleUntil(result.window, stable_ms, @min(deadline, settle_until), 0, null);
+    }
+    return result;
+}
+
 fn launchApp(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
+    const observation_deadline = nowMs() + mcp.WAIT_CAP_MS;
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(arena);
     const built = switch (try buildLaunchArgv(arena, &argv, args)) {
@@ -329,7 +384,7 @@ fn launchApp(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
     }
     const cols: u16 = @intCast(std.math.clamp(argInt(args, "cols") orelse 80, 10, 500));
     const rows: u16 = @intCast(std.math.clamp(argInt(args, "rows") orelse 24, 4, 300));
-    const wait_ms: i64 = argInt(args, "wait_ms") orelse 10_000;
+    const wait_ms = mcp.waitCap(argInt(args, "wait_ms"), 10_000);
     var out_w: u32 = 0;
     var out_h: u32 = 0;
     if (argStr(args, "size")) |sz| {
@@ -398,28 +453,14 @@ fn launchApp(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
         app.deinit();
         return error.OutOfMemory;
     };
-    const wait_for = argStr(args, "wait_for") orelse "window";
-    if (eql(u8, wait_for, "exit")) {
-        const deadline = nowMs() + wait_ms;
-        while (!app.exited and nowMs() < deadline) _ = app.pumpOnce(50);
-    } else {
-        _ = app.waitFirstWindow(wait_ms);
-    }
     // Launch-and-look must not return the pre-paint frame: "window
     // exists" is earlier than "window has content" for most apps,
     // and a black frame-1 screenshot reads as a broken app. Let
     // painting quiesce briefly before capturing (0 disables).
     const stable_ms: i64 = std.math.clamp(argInt(args, "stable_ms") orelse 500, 0, 10_000);
-    var shot_win: u32 = 0;
-    for (app.windows.items) |win| {
-        if (!win.popup and win.frames > 0) {
-            shot_win = win.id;
-            break;
-        }
-    }
-    var settled = true;
-    if (shot_win != 0 and stable_ms > 0 and !app.exited)
-        settled = app.waitVisualSettle(shot_win, stable_ms, @max(stable_ms * 4, 2000), 0, null);
+    const observed = observeLaunch(app, eql(u8, argStr(args, "wait_for") orelse "window", "exit"), wait_ms, stable_ms, observation_deadline);
+    const shot_win = observed.window;
+    const settled = observed.settled;
 
     var res = Res.init(arena);
     try addAppSummary(&res, arena, app);
@@ -450,7 +491,9 @@ fn launchApp(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
         for (app.windows.items) |win| {
             if (win.id == shot_win) shot_frames = win.frames;
         }
-        if (!settled)
+        if (!settled and observed.settle_clipped)
+            try res.textf("inline screenshot: the whole-launch deadline expired before {d}ms of quiet could be confirmed; the app remains running and the capture may be mid-paint", .{stable_ms})
+        else if (!settled)
             try res.textf("inline screenshot: window was STILL REPAINTING after the {d}ms settle wait — it may be mid-paint or the app animates continuously; screenshot_app with stable_ms/min_frame gets settled pixels", .{stable_ms})
         else if (shot_frames <= 1)
             try res.text("inline screenshot is the window's FIRST committed frame and may precede the app's real paint — screenshot_app with stable_ms gets settled content");
@@ -1571,8 +1614,10 @@ fn appScroll(arena: std.mem.Allocator, _: Tool, args: std.json.Value, app: *appd
     const dx = argInt(args, "dx") orelse 0;
     const dy = argInt(args, "dy") orelse 0;
     var piw = PostInputWait.begin(args, app, win_id, argBool(args, "screenshot"));
-    app.scroll(win_id, @floatFromInt(x), @floatFromInt(y), @floatFromInt(dx), @floatFromInt(dy)) catch
-        return errRes(arena, .not_found, "scroll failed (bad window?)");
+    app.scroll(win_id, @floatFromInt(x), @floatFromInt(y), @floatFromInt(dx), @floatFromInt(dy)) catch |err| return switch (err) {
+        error.BadScrollDelta => errRes(arena, .invalid_args, BAD_SCROLL_DELTA),
+        else => errRes(arena, .not_found, "scroll failed (bad window?)"),
+    };
     journalStep(app, "{{\"scroll\":[{d},{d}],\"at\":[{d},{d}],\"window\":{d}}}", .{ dx, dy, x, y, win_id });
     var res = Res.init(arena);
     try res.fact("dx", dx);
@@ -2256,6 +2301,11 @@ pub fn runActionSteps(
             stopped = true;
             break;
         }
+        if (invalidActionInteger(st)) |why| {
+            try w.print("step {d}: ERROR - {s}\n", .{ n, why });
+            stopped = true;
+            break;
+        }
         const win_step: ?u32 = if (argInt(st, "window")) |v| @intCast(v) else win_arg;
         const button: u32 = @intCast(argInt(st, "button") orelse 1);
 
@@ -2416,7 +2466,12 @@ pub fn runActionSteps(
                 sy = p.y;
             }
             const wid = win_step orelse firstToplevelId(app);
-            app.scroll(wid, sx, sy, dd[0], dd[1]) catch {
+            app.scroll(wid, sx, sy, dd[0], dd[1]) catch |err| {
+                if (err == error.BadScrollDelta) {
+                    try w.print("step {d}: ERROR - {s}\n", .{ n, BAD_SCROLL_DELTA });
+                    stopped = true;
+                    break;
+                }
                 if (probeAppStop(app, 1_000)) |stop| {
                     try reportActionStop(arena, w, n, "scroll input", stop);
                     app_stop = stop;
@@ -2565,7 +2620,11 @@ pub fn runActionSteps(
             const timeout_ms: i64 = budget.ms;
             // click_image clicks by definition; wait_image opts in.
             const do_click = if (is_wait) argBool(wv, "click") else true;
-            const btn: u32 = @intCast(argInt(wv, "button") orelse 1);
+            const btn = (mcp.argIntAs(u32, wv, "button") catch {
+                try w.print("step {d}: ERROR - button must be a whole number from 0 to 4294967295\n", .{n});
+                stopped = true;
+                break;
+            }) orelse 1;
             const region = regionFrom(wv);
             const wid = win_step orelse firstToplevelId(app);
             const deadline = nowMs() + timeout_ms;
@@ -2632,7 +2691,7 @@ pub fn runActionSteps(
             const do_click = argBool(wv, "click");
             const region = regionFrom(wv);
             const scale: u32 = @intCast(std.math.clamp(argInt(wv, "scale") orelse 0, 0, 8));
-            const psm: i32 = @intCast(argInt(wv, "psm") orelse 6);
+            const psm: i32 = @intCast(std.math.clamp(argInt(wv, "psm") orelse 6, 0, 13));
             const lang = argStr(wv, "lang") orelse "eng";
             const wid = win_step orelse firstToplevelId(app);
             const deadline = nowMs() + timeout_ms;
@@ -3158,10 +3217,10 @@ fn shortFramesVerdict(
     }
     const elapsed = @max(elapsed_ms, 1);
     const fps = @as(f64, @floatFromInt(got)) * 1000.0 / @as(f64, @floatFromInt(elapsed));
-    const need_ms: i64 = @intFromFloat(@as(f64, @floatFromInt(want)) * 1000.0 / @max(fps, 0.001));
+    const need_ms = @as(f64, @floatFromInt(want)) * 1000.0 / @max(fps, 0.001);
     return std.fmt.allocPrint(
         arena,
-        "the app IS painting, at about {d:.1} fps — but {d} frames at that rate needs roughly {d}ms and the timeout was {d}ms, so only {d} arrived. That is arithmetic, not a fault: raise timeout_ms, lower min_frames, or wait on something real (app_wait_log / app_watch).",
+        "the app IS painting, at about {d:.1} fps — but {d} frames at that rate needs roughly {d:.0}ms and the timeout was {d}ms, so only {d} arrived. That is arithmetic, not a fault: raise timeout_ms, lower min_frames, or wait on something real (app_wait_log / app_watch).",
         .{ fps, want, need_ms, timeout_ms, got },
     );
 }
@@ -3378,8 +3437,7 @@ pub fn appFromArgs(args: std.json.Value) ?*appdrive.App {
         }
         return if (live_n == 1) live else null;
     };
-    if (id < 0) return null;
-    return app_state.apps.get(@intCast(id));
+    return app_state.apps.get(std.math.cast(u32, id) orelse return null);
 }
 
 /// "app 7 (alive, 2 windows), app 8 (exited, status 0)" — the roster
@@ -5005,6 +5063,200 @@ test "debuggerSignal parses gdb and valgrind crash headlines" {
     try t.expectEqual(@as(?i32, 11), debuggerSignal("Program received signal SIGSEGV, Segmentation fault."));
     try t.expectEqual(@as(?i32, 6), debuggerSignal("Process terminating with default action of signal 6 (SIGABRT)"));
     try t.expectEqual(@as(?i32, null), debuggerSignal("ordinary app output"));
+}
+
+test "app tools refuse out-of-range wire integers before looking up or driving an app" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const saved = app_state;
+    app_state = .{ .allocator = t.allocator };
+    defer app_state = saved;
+    const cases = .{
+        .{ Tool.app_click, "{\"app\":4294967296,\"window\":1,\"x\":0,\"y\":0}" },
+        .{ Tool.app_wait, "{\"window\":-1}" },
+        .{ Tool.app_drag, "{\"window\":1,\"button\":1099511627776}" },
+        .{ Tool.app_actions, "{\"window\":4294967296,\"actions\":[]}" },
+        .{ Tool.app_macro_run, "{\"window\":-1,\"name\":\"irrelevant\"}" },
+        .{ Tool.app_resize, "{\"window\":1,\"w\":2147483648,\"h\":10}" },
+        .{ Tool.app_resize, "{\"window\":1,\"w\":10,\"h\":-2147483649}" },
+        .{ Tool.app_click, "{\"window\":1e100}" },
+        .{ Tool.close_app_window, "{\"window\":\"1\"}" },
+    };
+    inline for (cases) |case| {
+        const args = try parseTestValue(arena, case[1]);
+        const result = try appTool(arena, case[0], args);
+        const parsed = try expectToolResultShape(arena, @tagName(case[0]), result);
+        const err = parsed.object.get("structuredContent").?.object.get("error").?.object;
+        try t.expectEqualStrings("invalid_args", err.get("code").?.string);
+    }
+    try t.expect(invalidAppInteger(try parseTestValue(arena, "{\"app\":4294967295,\"window\":0,\"w\":2147483647,\"h\":-2147483648}")) == null);
+    // Clients commonly send JSON null for an optional argument; it means absent.
+    try t.expect(invalidAppInteger(try parseTestValue(arena, "{\"app\":null,\"window\":null,\"button\":null,\"w\":null,\"h\":null}")) == null);
+    try t.expect(appFromArgs(try parseTestValue(arena, "{\"app\":4294967296}")) == null);
+}
+
+test "app_actions refuses invalid step integers before sending input" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const fixture = try testActionApp(t.allocator, true);
+    defer _ = c.close(fixture.peer);
+    defer fixture.app.deinit();
+    for ([_][]const u8{
+        "[{\"click\":[0,0],\"window\":-1}]",
+        "[{\"click\":[0,0],\"button\":4294967296}]",
+        "[{\"wait_image\":{\"button\":-1}}]",
+        "[{\"click_image\":{\"button\":1099511627776}}]",
+    }) |json| {
+        const steps = (try parseTestValue(arena, json)).array.items;
+        const result = try runActionSteps(arena, fixture.app, steps, 1, false, null);
+        const parsed = try expectToolResultShape(arena, "app_actions", result);
+        const sc = parsed.object.get("structuredContent").?.object;
+        try t.expectEqualStrings("failed", sc.get("status").?.string);
+        try t.expectEqual(@as(i64, 1), sc.get("step").?.integer);
+        try t.expect(std.mem.indexOf(u8, sc.get("reason").?.string, "whole number") != null);
+        var pfd: c.struct_pollfd = .{ .fd = fixture.peer, .events = c.POLLIN, .revents = 0 };
+        try t.expectEqual(@as(c_int, 0), c.poll(&pfd, 1, 0));
+    }
+}
+
+test "caller waits are capped and enormous frame goals remain printable" {
+    const t = std.testing;
+    try t.expectEqual(@as(i64, 10_000), mcp.waitCap(null, 10_000));
+    try t.expectEqual(@as(i64, 0), mcp.waitCap(-1, 10_000));
+    try t.expectEqual(mcp.WAIT_CAP_MS, mcp.waitCap(std.math.maxInt(i64), 10_000));
+    const verdict = try shortFramesVerdict(t.allocator, 1, 1, std.math.maxInt(u64), 120_000, 120_000);
+    defer t.allocator.free(verdict);
+    try t.expect(std.mem.indexOf(u8, verdict, "IS painting") != null);
+}
+
+test "scroll refuses scaled overflow before moving the pointer or transmitting input" {
+    const t = std.testing;
+    const fixture = try testActionApp(t.allocator, true);
+    defer _ = c.close(fixture.peer);
+    defer fixture.app.deinit();
+    fixture.app.ptr_win = 1;
+    fixture.app.ptr_x = 3;
+    fixture.app.ptr_y = 4;
+    for ([_][2]f64{
+        .{ 0, 2_147_483_647 },
+        .{ 1e100, 0 },
+        .{ 0, -1e100 },
+        .{ std.math.inf(f64), 0 },
+        .{ 0, -std.math.inf(f64) },
+        .{ 1, std.math.nan(f64) },
+    }) |delta| {
+        try t.expectError(error.BadScrollDelta, fixture.app.scroll(1, 20, 30, delta[0], delta[1]));
+        try t.expectEqual(@as(f64, 3), fixture.app.ptr_x);
+        try t.expectEqual(@as(f64, 4), fixture.app.ptr_y);
+        try t.expectEqual(@as(usize, 0), fixture.app.conn.wbuf.items.len);
+        var pfd: c.struct_pollfd = .{ .fd = fixture.peer, .events = c.POLLIN, .revents = 0 };
+        try t.expectEqual(@as(c_int, 0), c.poll(&pfd, 1, 0));
+    }
+}
+
+test "scroll tools and macro steps report overflow without sending input" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const saved = app_state;
+    app_state = .{ .allocator = t.allocator };
+    const fixture = try testActionApp(t.allocator, true);
+    defer _ = c.close(fixture.peer);
+    defer fixture.app.deinit();
+    defer {
+        app_state.apps.deinit(t.allocator);
+        app_state = saved;
+    }
+    try app_state.apps.put(t.allocator, 1, fixture.app);
+    const args = try parseTestValue(arena, "{\"app\":1,\"window\":1,\"dy\":2147483647}");
+    const result = try appTool(arena, .app_scroll, args);
+    const parsed = try expectToolResultShape(arena, "app_scroll", result);
+    const err = parsed.object.get("structuredContent").?.object.get("error").?.object;
+    try t.expectEqualStrings("invalid_args", err.get("code").?.string);
+
+    const actions = try parseTestValue(arena, "{\"app\":1,\"window\":1,\"actions\":[{\"scroll\":[0,1e100]},{\"type\":\"must not run\"}]}");
+    inline for (.{ false, true }) |macro| {
+        const output = if (macro)
+            try runActionSteps(arena, fixture.app, actions.object.get("actions").?.array.items, 1, false, "bad-scroll")
+        else
+            try appTool(arena, .app_actions, actions);
+        const sc = (try expectToolResultShape(arena, if (macro) "app_macro_run" else "app_actions", output)).object.get("structuredContent").?.object;
+        try t.expectEqualStrings("failed", sc.get("status").?.string);
+        try t.expectEqual(@as(i64, 1), sc.get("step").?.integer);
+        try t.expect(std.mem.indexOf(u8, sc.get("reason").?.string, "value120") != null);
+    }
+    try t.expectEqual(@as(u32, 0), fixture.app.ptr_win);
+    var pfd: c.struct_pollfd = .{ .fd = fixture.peer, .events = c.POLLIN, .revents = 0 };
+    try t.expectEqual(@as(c_int, 0), c.poll(&pfd, 1, 0));
+}
+
+test "launch observation cannot add a settle window after its shared deadline" {
+    const t = std.testing;
+    const fixture = try testActionApp(t.allocator, true);
+    defer _ = c.close(fixture.peer);
+    defer fixture.app.deinit();
+    const started = nowMs();
+    // Startup consumed nearly all of the outer budget: a 40s settle
+    // allowance gets only the remaining 30ms, never a fresh deadline.
+    const observed = observeLaunch(fixture.app, false, mcp.WAIT_CAP_MS, 10_000, started + 30);
+    try t.expect(nowMs() - started < 1000);
+    try t.expectEqual(@as(u32, 1), observed.window);
+    try t.expect(!observed.settled and observed.settle_clipped);
+    try t.expect(!fixture.app.exited);
+    // Startup exhausted the budget entirely: capture state, without
+    // another poll wait or a teardown of the still-running app.
+    const exhausted = observeLaunch(fixture.app, true, mcp.WAIT_CAP_MS, 10_000, nowMs() - 1);
+    try t.expect(!exhausted.settled and exhausted.settle_clipped);
+    try t.expect(!fixture.app.exited);
+    var pfd: c.struct_pollfd = .{ .fd = fixture.peer, .events = c.POLLIN, .revents = 0 };
+    try t.expectEqual(@as(c_int, 0), c.poll(&pfd, 1, 0));
+}
+
+test "launch observation bounds both first-window and exit waits without ending the app" {
+    const t = std.testing;
+    const fixture = try testActionApp(t.allocator, false);
+    defer _ = c.close(fixture.peer);
+    defer fixture.app.deinit();
+    inline for (.{ false, true }) |wait_for_exit| {
+        const started = nowMs();
+        const observed = observeLaunch(fixture.app, wait_for_exit, mcp.WAIT_CAP_MS, 10_000, started + 30);
+        try t.expect(nowMs() - started < 1000);
+        try t.expectEqual(@as(u32, 0), observed.window);
+        try t.expect(!fixture.app.exited);
+    }
+}
+
+test "launch observation preserves the quiet interval independently of the first-window allowance" {
+    const t = std.testing;
+    const fixture = try testActionApp(t.allocator, true);
+    defer _ = c.close(fixture.peer);
+    defer fixture.app.deinit();
+    const started = nowMs();
+    const observed = observeLaunch(fixture.app, false, 0, 30, started + 3000);
+    try t.expect(observed.settled and !observed.settle_clipped);
+    try t.expect(nowMs() - started >= 30);
+    try t.expect(nowMs() - started < 1000);
+    const immediate = observeLaunch(fixture.app, false, 0, 0, nowMs());
+    try t.expect(immediate.settled);
+}
+
+test "both screenshot tools expose file-only capture options in their input schemas" {
+    const t = std.testing;
+    for (mcp_tools.TOOLS) |tool| {
+        if (!eql(u8, tool.name, "screenshot_app") and !eql(u8, tool.name, "get_app_state")) continue;
+        var schema = try std.json.parseFromSlice(std.json.Value, t.allocator, tool.input_schema, .{});
+        defer schema.deinit();
+        const props = schema.value.object.get("properties").?.object;
+        try t.expectEqualStrings("string", props.get("path").?.object.get("type").?.string);
+        try t.expectEqualStrings("boolean", props.get("inline").?.object.get("type").?.string);
+        try t.expect(props.get("timeout_ms").?.object.get("path") == null);
+        try t.expect(props.get("timeout_ms").?.object.get("inline") == null);
+    }
 }
 
 test "app_actions stops structurally when a click crashes the app" {

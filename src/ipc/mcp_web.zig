@@ -1046,8 +1046,7 @@ fn diagnosticTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
 /// ReleaseFast build, and every one of these values is whatever a JSON
 /// client (or a page, through the helper) put in the argument.
 fn boundedU32(v: i64) ?u32 {
-    if (v < 0 or v > std.math.maxInt(u32)) return null;
-    return @intCast(v);
+    return std.math.cast(u32, v);
 }
 
 /// `boundedU32` as a tool argument: an absent key stays absent, and out
@@ -1055,13 +1054,14 @@ fn boundedU32(v: i64) ?u32 {
 const U32Arg = union(enum) { absent, value: u32, err: Fail };
 
 fn argU32(arena: std.mem.Allocator, args: std.json.Value, name: []const u8) !U32Arg {
-    const v = mcp.argInt(args, name) orelse return .absent;
-    const n = boundedU32(v) orelse return .{ .err = fail(.invalid_args, try std.fmt.allocPrint(
+    // Some arguments also take keywords, such as web_scroll's to:"bottom".
+    if (mcp.argInt(args, name) == null) return .absent;
+    const n = mcp.argIntAs(u32, args, name) catch return .{ .err = fail(.invalid_args, try std.fmt.allocPrint(
         arena,
-        "'{s}' must be a whole number from 0 to {d} ({d} is out of range)",
-        .{ name, @as(u32, std.math.maxInt(u32)), v },
+        "'{s}' must be a whole number from 0 to {d}",
+        .{ name, @as(u32, std.math.maxInt(u32)) },
     )) };
-    return .{ .value = n };
+    return .{ .value = n orelse return .absent };
 }
 
 /// A GUI control-socket round trip that did not happen at all.
@@ -5218,7 +5218,7 @@ fn profileSaveTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value) 
         }
         if (!found) return failRes(arena, try profileFail(arena, e, want, error.NoProfile));
     }
-    const budget: i64 = mcp.argInt(args, "timeout_ms") orelse 10_000;
+    const budget = mcp.waitCap(mcp.argInt(args, "timeout_ms"), 10_000);
     const saved = e.saveProfiles(budget) catch |err| return switch (err) {
         error.Unsupported => mcp.errRes(arena, .unavailable, "this browser helper cannot flush its jars on request (no 'flush-store' capability); its own periodic flush and a clean exit still persist them"),
         error.Timeout => mcp.errRes(arena, .timeout, "the browser engine did not confirm the flush in time; nothing is known to be lost, but the save is unconfirmed"),

@@ -118,7 +118,6 @@ pub const dueInMs = mcp_agent_loop.dueInMs;
 pub const service = mcp_agent_loop.service;
 pub const sweep = mcp_agent_loop.sweep;
 const ReconnectJob = mcp_agent_loop.ReconnectJob;
-const abandonReconnect = mcp_agent_loop.abandonReconnect;
 const serviceReconnects = mcp_agent_loop.serviceReconnects;
 const reconnectIfLost = mcp_agent_loop.reconnectIfLost;
 const gone = mcp_agent_loop.gone;
@@ -331,7 +330,7 @@ pub const Entry = struct {
         const a = self.allocator;
         self.agent.deinit();
         a.destroy(self.agent);
-        for ([_]?*termdrive.Term{ self.visibleTerm(), self.server }) |o| if (o) |t| abandonReconnect(t);
+        for ([_]?*termdrive.Term{ self.visibleTerm(), self.server }) |o| if (o) |t| t.releaseReconnectOwner();
         if (self.claim) |*cl| {
             var buf: [4096]u8 = undefined;
             var fba = std.heap.FixedBufferAllocator.init(&buf);

@@ -910,6 +910,12 @@ pub const SpawnSpec = struct {
 /// host) never falls back to plain `ssh -tt`: only `choice` ssh runs it
 /// there. The outcome is recorded in `where`.
 pub fn spawnOn(arena: std.mem.Allocator, where: *Where, choice: transport_mod.Choice, argv: []const []const u8, spec: SpawnSpec, why: *Fail) !*termdrive.Term {
+    const t = try spawnUnmanaged(arena, where, choice, argv, spec, why);
+    mcp_agent_loop.manageReconnect(t);
+    return t;
+}
+
+fn spawnUnmanaged(arena: std.mem.Allocator, where: *Where, choice: transport_mod.Choice, argv: []const []const u8, spec: SpawnSpec, why: *Fail) !*termdrive.Term {
     const a = state.allocator;
     const extra_kv = try (launch.Extra{ .env = spec.extra.env }).assignments(arena);
     const login = spec.extra.login_shell;
@@ -1379,18 +1385,19 @@ pub fn attachTool(arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
     };
     const a = state.allocator;
     const id = try mintId(arena, loaded.spec.id);
+    var linked = false;
     const e = try newEntry(loaded, id, t.name, "", "");
-    errdefer dropBare(e);
+    errdefer if (!linked) dropBare(e);
     const ag = try a.create(agent_mod.Agent);
-    errdefer a.destroy(ag);
+    errdefer if (!linked) a.destroy(ag);
     ag.* = try agent_mod.Agent.initScreen(a, loaded, .{});
+    errdefer if (!linked) ag.deinit();
     e.agent = ag;
     e.visible = .{ .borrowed = tid };
     e.seen_snapshots = t.snapshots;
-    state.entries.append(a, e) catch |err| {
-        e.destroy(false);
-        return err;
-    };
+    try state.entries.append(a, e);
+    linked = true;
+    mcp_agent_loop.manageReconnect(t);
     publishAgents();
     const ready = waitReady(e, deadlineFrom(args, ATTACH_WAIT_MS));
     var res = Res.init(arena);

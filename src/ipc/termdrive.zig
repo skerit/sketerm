@@ -619,6 +619,8 @@ pub const Term = struct {
     /// retried, so a dead host costs ONE bounded connect attempt, not
     /// one per drain.
     reattach_spent: bool = false,
+    /// A background owner disables inline reconnects and is notified before this Term is released.
+    reconnect_owner: ?*const fn (*const Term) void = null,
     /// `exited` because the link to a remote-mux session was lost, not
     /// because the session ended: it may still run (`reconnect`).
     lost: bool = false,
@@ -981,6 +983,7 @@ pub const Term = struct {
 
     /// Free the client and leave the session running on its daemon.
     pub fn detach(self: *Term) void {
+        self.releaseReconnectOwner();
         const a = self.allocator;
         if (self.shell_name) |s| a.free(s);
         if (self.remote_host) |h| a.free(h);
@@ -990,6 +993,13 @@ pub const Term = struct {
         a.destroy(self.pool);
         a.free(self.name);
         a.destroy(self);
+    }
+
+    /// Release a background reconnect owner before freeing or returning a borrowed terminal.
+    pub fn releaseReconnectOwner(self: *Term) void {
+        const notify = self.reconnect_owner orelse return;
+        self.reconnect_owner = null;
+        notify(self);
     }
 
     /// Swap the mirror for a freshly restored one. Failure-atomic: the
@@ -1022,6 +1032,8 @@ pub const Term = struct {
     /// said to the caller. A resync that cannot complete is therefore
     /// downgraded to transport loss, which the callers already handle.
     fn resyncMirror(self: *Term) void {
+        if (self.reconnect_owner != null and self.remote_host != null)
+            return self.transportLost();
         self.conn.sendFrame(.detach, "") catch return self.transportLost();
         (self.conn.recvExpectFor(&.{.ok}, 5_000) catch return self.transportLost()).deinit(self.allocator);
         self.conn.sendAttach(self.name, .{
@@ -1086,6 +1098,10 @@ pub const Term = struct {
     /// of calling recvFrame (whose read() would park on a frame tail
     /// a wedged daemon never sends).
     pub fn pumpOnce(self: *Term, wait_ms: i32) bool {
+        // An adapter may return a borrowed terminal while its reconnect
+        // was pending; its ordinary one-shot retry has not been spent yet.
+        if (self.lost and self.reconnect_owner == null and !self.reattach_spent)
+            self.transportLost();
         if (self.exited) return false;
         if (self.takeOne()) return true;
         if (!pollIn(self.conn.fd, wait_ms)) return false;
@@ -1117,7 +1133,7 @@ pub const Term = struct {
             self.exited = true;
             return;
         }
-        if (self.reattach_spent or !self.reattachOnce()) {
+        if (self.reconnect_owner != null or self.reattach_spent or !self.reattachOnce()) {
             // The session may well live on: `lost` says it is the link
             // that is gone, and `reconnect` may bring it back later.
             self.exited = true;
@@ -1125,6 +1141,8 @@ pub const Term = struct {
             return;
         }
         self.reattach_spent = false;
+        self.exited = false;
+        self.lost = false;
     }
 
     /// One bounded reattach of a remote-mux session over a fresh ssh

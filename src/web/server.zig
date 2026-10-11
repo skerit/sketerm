@@ -642,12 +642,8 @@ pub const Server = struct {
             return;
         }
         if (n > 0) {
-            if (listen_idx) |li| {
-                if (pfds[li].revents & c.POLLIN != 0) _ = self.acceptOne();
-            }
             for (self.conns.items, 0..) |cn, i| {
                 const pfd = pfds[conn_base + i];
-                if (pfd.fd != cn.fd) continue; // list changed under an accept
                 if (pfd.revents & (c.POLLERR | c.POLLNVAL) != 0) {
                     connNote("POLLERR/POLLNVAL", cn.id);
                     cn.dead = true;
@@ -657,6 +653,11 @@ pub const Server = struct {
                     connNote("read failed or protocol violation", cn.id);
                     cn.dead = true;
                 }
+            }
+            // Accept only after servicing the polled connections: a new
+            // connection has no entry in this poll snapshot.
+            if (listen_idx) |li| {
+                if (pfds[li].revents & c.POLLIN != 0) _ = self.acceptOne();
             }
         }
         // Nothing paints without a begin frame: keep a floor under every

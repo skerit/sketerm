@@ -460,7 +460,10 @@ fn attachSession(arena: std.mem.Allocator, transport: Transport, host: ?[]const 
     };
     conn.setNonBlocking();
     conn.last_err_len = 0;
-    if (termdrive.Term.attachVia(a, &conn, name, id, if (remote) host else null)) |t| return t else |_| {}
+    if (termdrive.Term.attachVia(a, &conn, name, id, if (remote) host else null)) |t| {
+        mcp_agent_loop.manageReconnect(t);
+        return t;
+    } else |_| {}
     defer conn.deinit();
     if (conn.last_err_len == 0) {
         why.* = .{ .kind = .unreachable_host, .session = name, .msg = "its daemon did not answer the attach in time" };

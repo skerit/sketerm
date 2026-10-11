@@ -469,6 +469,8 @@ pub const View = struct {
     /// forward are empty — the memory is the whole point, and keeping
     /// the history would mean keeping the browser.
     discarded: bool = false,
+    /// A refused discard still made the client release its frame mapping.
+    discard_remap: bool = false,
     /// The one-shot `ERR_NETWORK_CHANGED` reload budget (see
     /// `loadretry.zig`): reset by a client navigation, spent by the
     /// retry, settled by the retried document's commit.
@@ -1952,14 +1954,10 @@ pub const Host = struct {
         // Inherit the opener's shield and enforced policy: without a
         // slot of its own the popup's requests FAIL OPEN, because the
         // whole policy block sits behind `if (slot)`.
-        if (interceptSlotFor(self.gpa, pv.id)) |ps| {
-            if (interceptSlotFor(self.gpa, opener.id)) |os| {
-                host_icpt.g_int.acquire();
-                defer host_icpt.g_int.release();
-                ps.enabled = os.enabled;
-                ps.pol = os.pol;
-            }
-        }
+        host_icpt.inheritPopupPolicy(self.gpa, pv.id, opener.id) catch {
+            self.destroyView(pv.id);
+            return false;
+        };
         window_info.* = windowlessInfo();
         slot.* = .{
             .popup_id = popup_id,
@@ -2144,12 +2142,24 @@ pub const Host = struct {
     }
 
     pub fn destroyView(self: *Host, id: u32) void {
+        self.retireView(id, .{});
+    }
+
+    const Retirement = struct {
+        close_browser: bool = true,
+        reason: []const u8 = "the owner destroyed the view",
+        notify_popup: bool = true,
+    };
+
+    /// Retire every view-owned resource without re-closing a browser already in its close callback.
+    pub fn retireView(self: *Host, id: u32, opts: Retirement) void {
         for (&self.pending_media) |*slot| if (slot.view == id) {
             slot.* = .{ .view = 0 };
         };
         self.abandonViewWaiters(id);
         // Its stream ends while the record exists, so the stream
         // client's held keys and buttons are released into the page.
+        if (!opts.close_browser) host_stream.streamBrowserGone(self, id);
         host_stream.streamDropView(self, id);
         // A page owns every browser-action popup it opened. Close those
         // first so no floating extension page survives its toolbar.
@@ -2163,21 +2173,22 @@ pub const Host = struct {
         // browser will never arrive to claim it.
         for (&self.pending_popups) |*p| {
             const pv = p.view orelse continue;
-            if (pv.opener_view == id) p.* = .{};
+            if (pv.id == id or pv.opener_view == id) p.* = .{};
         }
         for (self.views.items, 0..) |v, i| {
             if (v.id != id) continue;
             _ = self.views.swapRemove(i);
-            self.observeViewGone(v, "the owner destroyed the view");
+            self.observeViewGone(v, opts.reason);
             // An inspector outliving its target inspects nothing and
             // has no client surface left to close it, so it goes too;
             // an inspector being closed simply frees its target's slot.
             const inspector = v.devtools_view;
             if (v.devtools_of != 0) {
-                if (self.find(v.devtools_of)) |src| src.devtools_view = 0;
+                if (self.findAny(v.devtools_of)) |src| src.devtools_view = 0;
             }
             if (self.adopting == v) self.adopting = null;
-            if (v.page_popup) self.post(proto.EvPagePopup{
+            if (self.pending == v) self.pending = null;
+            if (opts.notify_popup and v.page_popup) self.post(proto.EvPagePopup{
                 .owner_view = v.opener_view,
                 .popup_view = v.id,
                 .state = proto.page_popup_closed,
@@ -2189,13 +2200,13 @@ pub const Host = struct {
                 .url = "",
                 .frame_name = "",
             });
-            if (v.webext_popup) self.post(proto.EvWebextPopup{
+            if (opts.notify_popup and v.webext_popup) self.post(proto.EvWebextPopup{
                 .owner_view = v.popup_owner,
                 .popup_view = v.id,
                 .state = proto.webext_popup_closed,
                 .detail = "",
             });
-            self.freeView(v);
+            self.freeViewOpts(v, opts.close_browser);
             if (inspector != 0) self.destroyView(inspector);
             return;
         }
@@ -2216,22 +2227,6 @@ pub const Host = struct {
             if (v.webext_popup and v.popup_owner == owner) return v;
         }
         return null;
-    }
-
-    fn popupClosedByEngine(self: *Host, id: u32) void {
-        for (self.views.items, 0..) |v, i| {
-            if (v.id != id or !v.webext_popup) continue;
-            self.abandonViewWaiters(id);
-            _ = self.views.swapRemove(i);
-            self.post(proto.EvWebextPopup{
-                .owner_view = v.popup_owner,
-                .popup_view = v.id,
-                .state = proto.webext_popup_closed,
-                .detail = "",
-            });
-            self.freeViewOpts(v, false);
-            return;
-        }
     }
 
     /// Bind a popup browser CEF just created to the View armed for it
@@ -2264,6 +2259,11 @@ pub const Host = struct {
         interceptRegister(self.gpa, v.id, v.cef_id);
         applyZoom(v);
         applyA11yState(v);
+        const policy = host_icpt.popupPolicySnapshot(self.gpa, v.id) catch {
+            self.destroyView(v.id);
+            return true;
+        };
+        defer self.gpa.free(policy.bytes);
         // THE ID GOES OUT FIRST, before the frame buffer: a client
         // drops a `frame_buffer` for a view it has never heard of and
         // then waits for a repaint only a geometry change produces.
@@ -2278,42 +2278,21 @@ pub const Host = struct {
             .h = v.h,
             .url = if (v.url.len != 0) v.url else "",
             .frame_name = "",
+            .policy = .{ .s = policy.bytes },
+            .block_ads = policy.block_ads,
         });
+        // Earlier dirty-accounting pushes can precede adoption and be
+        // ignored; send a current snapshot after announcing the view.
+        self.post(host_icpt.netPolicyFrame(v.id));
         // The popup is already announced; without a buffer it never paints.
         self.allocBuffer(v) catch |err| logLine("popup view {d}: frame buffer allocation failed ({s}); it cannot paint", .{ v.id, @errorName(err) });
         self.observeViewPresent(v);
         return true;
     }
 
-    /// The popup closed itself (`window.close()`, which every OAuth
-    /// flow ends with). Tell the client so it can retire the tab, then
-    /// free the record WITHOUT asking the engine to close again.
-    fn pagePopupClosedByEngine(self: *Host, v: *View) void {
-        for (self.views.items, 0..) |it, i| {
-            if (it != v) continue;
-            self.abandonViewWaiters(v.id);
-            _ = self.views.swapRemove(i);
-            self.observeViewGone(v, "the page closed itself");
-            self.post(proto.EvPagePopup{
-                .owner_view = v.opener_view,
-                .popup_view = v.id,
-                .state = proto.page_popup_closed,
-                .disposition = v.popup_disposition,
-                .user_gesture = 0,
-                .chromeless = if (v.popup_chromeless) 1 else 0,
-                .w = v.w,
-                .h = v.h,
-                .url = "",
-                .frame_name = "",
-            });
-            self.freeViewOpts(v, false);
-            return;
-        }
-    }
-
     pub fn destroyAll(self: *Host) void {
         self.adopting = null;
-        while (self.views.pop()) |v| self.freeView(v);
+        while (self.views.items.len != 0) self.destroyView(self.views.items[self.views.items.len - 1].id);
     }
 
     /// One connection is gone: destroy ITS views and contexts, leave
@@ -2404,14 +2383,17 @@ pub const Host = struct {
     pub fn discardView(self: *Host, id: u32) void {
         const v = self.find(id) orelse return;
         if (v.discarded) return;
+        // A revival goes through `create_browser_sync`, which makes a
+        // fresh TOP-LEVEL browser — silently re-breaking the opener
+        // relationship this popup exists for.
+        if (v.page_popup or host_dl.hasActiveDownloads(self, id)) {
+            v.discard_remap = true;
+            return;
+        }
         if (v.initial_url != null and !v.initial_live) {
             self.failView(id, "view discarded before initial media emulation navigation completed");
             return;
         }
-        // A revival goes through `create_browser_sync`, which makes a
-        // fresh TOP-LEVEL browser — silently re-breaking the opener
-        // relationship this popup exists for.
-        if (v.page_popup) return;
         // A live media change still awaiting its ACK is kept in `v.media`
         // and resubmitted by the revival; a navigation deferred behind it
         // becomes the address the view comes back at.
@@ -2496,7 +2478,20 @@ pub const Host = struct {
             v = self.find(id) orelse return null;
         }
         if (v.discarded) return null;
+        if (!self.restoreDiscardedBuffer(v, ops)) return null;
         return v;
+    }
+
+    fn restoreDiscardedBuffer(self: *Host, v: *View, ops: *const BrowserSpawnOps) bool {
+        if (!v.discard_remap) return true;
+        // A discard has no ACK on the legacy wire: even when the browser
+        // stays alive, the client dropped its mapping and dma-buf pool.
+        v.forgetPool();
+        self.allocBufferWith(v, ops) catch {
+            self.failView(v.id, "could not restore the frame buffer after a refused discard");
+            return false;
+        };
+        return true;
     }
 
     // -- devtools ------------------------------------------------------
@@ -2776,7 +2771,7 @@ pub const Host = struct {
     /// document, leaving the record itself untouched. Shared by
     /// `freeViewOpts` (which then frees the record) and `discardView`
     /// (which keeps it). `close` is false only when the engine already
-    /// closed the browser itself (`popupClosedByEngine`), where asking
+    /// closed the browser itself, where asking
     /// it to close again would re-enter a teardown in progress.
     fn dropBrowser(self: *Host, v: *View, close: bool) void {
         // Only a view still creating its first document failed to be
@@ -2902,6 +2897,7 @@ pub const Host = struct {
             v.buf_id +%= 1;
             if (v.buf_id == 0) v.buf_id = 1;
             v.inline_dirty.clear();
+            v.discard_remap = false;
             if (!v.hidden) withHost(v, struct {
                 fn f(host: *cef.cef_browser_host_t) void {
                     if (host.invalidate) |inv| inv(host, cef.PET_VIEW);
@@ -2922,6 +2918,7 @@ pub const Host = struct {
         if (v.buf_id == 0) v.buf_id = 1;
         try ops.announce(ops.ctx, self, v, fd);
         keep_fd = true;
+        v.discard_remap = false;
         // Ask for a repaint INTO the buffer just installed (the fields
         // above already point at it, so this cannot land in the old
         // one). A view whose very first paint raced the buffer into
@@ -3332,6 +3329,7 @@ pub const Host = struct {
 
     pub fn navigate(self: *Host, req: proto.Navigate) void {
         const v = self.find(req.view) orelse return;
+        if (!v.discarded and !self.restoreDiscardedBuffer(v, &system_browser_spawn_ops)) return;
         const waiting_media = if (v.media_observer) |observer| !observer.acknowledged else false;
         if (v.initial_url != null or waiting_media) {
             const url = self.gpa.dupe(u8, req.url) catch {
@@ -3353,11 +3351,15 @@ pub const Host = struct {
         // first and navigating after would mint a document nobody asked
         // for, which is the two-document trap `view_create_url` exists
         // to avoid.
+        self.beginClientNavigation(v);
+        if (v.discarded) return self.reviveAt(v, req.url);
+        _ = self.loadUrl(v, req.url);
+    }
+
+    fn beginClientNavigation(self: *Host, v: *View) void {
         v.load_retry.reset();
         self.semanticNavigationStarted(v);
         v.sem_nav.waiting_load_start = true;
-        if (v.discarded) return self.reviveAt(v, req.url);
-        _ = self.loadUrl(v, req.url);
     }
 
     /// Load `url` in the view's main frame. The semantic side must
@@ -3432,21 +3434,15 @@ pub const Host = struct {
         const b = v.browser orelse return;
         switch (action) {
             .back => if (browserInt(b, "can_go_back") != 0) {
-                v.load_retry.reset();
-                self.semanticNavigationStarted(v);
-                v.sem_nav.waiting_load_start = true;
+                self.beginClientNavigation(v);
                 if (b.go_back) |f| f(b);
             },
             .forward => if (browserInt(b, "can_go_forward") != 0) {
-                v.load_retry.reset();
-                self.semanticNavigationStarted(v);
-                v.sem_nav.waiting_load_start = true;
+                self.beginClientNavigation(v);
                 if (b.go_forward) |f| f(b);
             },
             .reload => {
-                v.load_retry.reset();
-                self.semanticNavigationStarted(v);
-                v.sem_nav.waiting_load_start = true;
+                self.beginClientNavigation(v);
                 if (b.reload) |f| f(b);
             },
             .stop => {
@@ -3460,8 +3456,7 @@ pub const Host = struct {
                 }
             },
             .reload_no_cache => {
-                self.semanticNavigationStarted(v);
-                v.sem_nav.waiting_load_start = true;
+                self.beginClientNavigation(v);
                 if (b.reload_ignore_cache) |f| f(b);
             },
             _ => {},
@@ -4700,6 +4695,217 @@ test "view construction allocation failures preserve prior views" {
         ViewConstructionTest.allocationCase,
         .{},
     );
+}
+
+test "engine-closed page popup retires streams dependents and pending state" {
+    const t = std.testing;
+    const td = pathz.TempDir.make("popup-retire") orelse return error.SkipZigTest;
+    defer td.remove();
+    var out = proto.Outbox.init(t.allocator);
+    defer out.deinit();
+    var host = Host.init(t.allocator, &out);
+    defer host.deinit();
+    host.stream_dir = td.path();
+    g_host = &host;
+    MediaTest.reset();
+
+    _ = try host.registerView(ViewConstructionTest.req(201, 0));
+    const popup = try host.registerView(ViewConstructionTest.req(202, 0));
+    popup.page_popup = true;
+    popup.popup_answered = true;
+    popup.opener_view = 201;
+    popup.browser = &MediaTest.browser;
+    popup.cef_id = browserInt(&MediaTest.browser, "get_identifier");
+    const extension = try host.registerView(ViewConstructionTest.req(203, 0));
+    extension.webext_popup = true;
+    extension.popup_owner = 202;
+    const unclaimed = try host.registerView(ViewConstructionTest.req(204, 0));
+    unclaimed.page_popup = true;
+    unclaimed.opener_view = 202;
+    const claimed = try host.registerView(ViewConstructionTest.req(205, 0));
+    claimed.page_popup = true;
+    claimed.popup_answered = true;
+    claimed.opener_view = 202;
+    const inspector = try host.registerDevtoolsView(popup);
+    const inspector_id = inspector.id;
+    host.pending_media[0] = .{ .view = 202 };
+    host.pending_popups[0] = .{ .view = unclaimed };
+    switch (host.streamOpen(202, false, null)) {
+        .ok => {},
+        .err => return error.StreamOpenFailed,
+    }
+
+    onBeforeClose(null, &MediaTest.browser);
+    try t.expect(host.find(202) == null);
+    try t.expect(host.find(203) == null);
+    try t.expect(host.find(204) == null);
+    try t.expect(host.find(inspector_id) == null);
+    try t.expect(host.find(201) != null and host.find(205) == claimed);
+    try t.expectEqual(@as(usize, 0), host.streams.items.len);
+    try t.expectEqual(@as(u32, 0), host.pending_media[0].view);
+    try t.expect(host.pending_popups[0].view == null);
+    try t.expectEqual(@as(usize, 0), MediaTest.closes);
+    var stream_ends: usize = 0;
+    while (out.front()) |msg| {
+        var reader = proto.Reader.init(msg.bytes);
+        while (try reader.next()) |frame| {
+            if (frame.tag == .ev_stream_closed) {
+                const ev = try proto.decode(proto.EvStreamClosed, frame.payload);
+                try t.expectEqual(@as(u32, 202), ev.view);
+                stream_ends += 1;
+            }
+        }
+        out.advance(msg.bytes.len);
+    }
+    try t.expectEqual(@as(usize, 1), stream_ends);
+}
+
+test "engine-closed inspector frees its target slot and extension popup is retired once" {
+    const t = std.testing;
+    for ([_]bool{ false, true }) |inspector| {
+        var out = proto.Outbox.init(t.allocator);
+        defer out.deinit();
+        var host = Host.init(t.allocator, &out);
+        defer host.deinit();
+        g_host = &host;
+        MediaTest.reset();
+        const owner = try host.registerView(ViewConstructionTest.req(211, 0));
+        const v = if (inspector)
+            try host.registerDevtoolsView(owner)
+        else
+            try host.registerView(ViewConstructionTest.req(212, 0));
+        const id = v.id;
+        v.windowed = inspector;
+        v.webext_popup = !inspector;
+        v.popup_owner = owner.id;
+        v.browser = &MediaTest.browser;
+        v.cef_id = browserInt(&MediaTest.browser, "get_identifier");
+        onBeforeClose(null, &MediaTest.browser);
+        try t.expect(host.find(id) == null);
+        try t.expectEqual(@as(usize, 1), host.viewCount());
+        try t.expectEqual(@as(u32, 0), owner.devtools_view);
+        try t.expectEqual(@as(usize, 0), MediaTest.closes);
+        if (inspector) {
+            const next = try host.registerDevtoolsView(owner);
+            try t.expect(next.id != id);
+            try t.expectEqual(next.id, owner.devtools_view);
+        }
+    }
+}
+
+test "extension popup load failure preserves its error and retires dependent state" {
+    const t = std.testing;
+    try t.expect(apiHash());
+    var out = proto.Outbox.init(t.allocator);
+    defer out.deinit();
+    var host = Host.init(t.allocator, &out);
+    defer host.deinit();
+    g_host = &host;
+    MediaTest.reset();
+    _ = try host.registerView(ViewConstructionTest.req(241, 0));
+    const popup = try host.registerView(ViewConstructionTest.req(242, 0));
+    popup.webext_popup = true;
+    popup.popup_owner = 241;
+    popup.browser = &MediaTest.browser;
+    popup.cef_id = browserInt(&MediaTest.browser, "get_identifier");
+    const inspector_id = (try host.registerDevtoolsView(popup)).id;
+    const child = try host.registerView(ViewConstructionTest.req(243, 0));
+    child.page_popup = true;
+    child.opener_view = 242;
+    host.pending_media[0] = .{ .view = 242 };
+    host.pending_popups[0] = .{ .view = child };
+    var message = std.mem.zeroes(cef.cef_string_t);
+    setStr("popup asset missing", &message);
+    defer cef.cef_string_utf16_clear(&message);
+    onLoadError(null, &MediaTest.browser, &MediaTest.frame, cef.ERR_FILE_NOT_FOUND, &message, null);
+    try t.expect(host.find(242) == null and host.find(243) == null and host.find(inspector_id) == null);
+    try t.expect(host.find(241) != null);
+    try t.expectEqual(@as(u32, 0), host.pending_media[0].view);
+    try t.expect(host.pending_popups[0].view == null);
+    var errors: usize = 0;
+    while (out.front()) |msg| {
+        var reader = proto.Reader.init(msg.bytes);
+        while (try reader.next()) |frame| {
+            if (frame.tag != .ev_webext_popup) continue;
+            const ev = try proto.decode(proto.EvWebextPopup, frame.payload);
+            try t.expectEqual(@as(u32, 242), ev.popup_view);
+            try t.expectEqual(proto.webext_popup_error, ev.state);
+            try t.expectEqualStrings("popup asset missing", ev.detail);
+            errors += 1;
+        }
+        out.advance(msg.bytes.len);
+    }
+    try t.expectEqual(@as(usize, 1), errors);
+}
+
+test "refused discard preserves downloads and remaps on the next wake" {
+    const t = std.testing;
+    for (0..3) |reason| {
+        var out = proto.Outbox.init(t.allocator);
+        defer out.deinit();
+        defer ViewConstructionTest.closeOutboxFds(&out);
+        var host = Host.init(t.allocator, &out);
+        defer host.deinit();
+        var injected: ViewConstructionTest = .{};
+        const ops = injected.ops();
+        try host.createViewAtWith(ViewConstructionTest.req(221, 0), "", &ops);
+        const v = host.find(221).?;
+        const browser = v.browser;
+        const old_buffer = v.buf_id;
+        ViewConstructionTest.closeOutboxFds(&out);
+        switch (reason) {
+            0 => v.page_popup = true,
+            1 => try host.dl_pending.append(t.allocator, .{ .view = 221, .req = 1, .at_ms = nowMs() }),
+            2 => try host.downloads.append(t.allocator, .{ .view = 221, .id = 1, .offered = true, .decided = true }),
+            else => unreachable,
+        }
+        host.discardView(221);
+        try t.expect(!v.discarded and v.discard_remap);
+        try t.expect(v.browser == browser);
+        try t.expect(out.empty());
+        try t.expectEqual(@as(usize, if (reason == 1) 1 else 0), host.dl_pending.items.len);
+        try t.expectEqual(@as(usize, if (reason == 2) 1 else 0), host.downloads.items.len);
+        try t.expect(host.findWakeWith(221, &ops) == v);
+        try t.expect(!v.discard_remap);
+        try t.expect(v.buf_id != old_buffer);
+        var reader = proto.Reader.init(out.front().?.bytes);
+        try t.expectEqual(proto.Tag.frame_buffer, (try reader.next()).?.tag);
+        ViewConstructionTest.closeOutboxFds(&out);
+        if (reason != 0) {
+            host.dl_pending.clearRetainingCapacity();
+            if (reason == 2) host.downloads.items[0].done = true;
+            host.discardView(221);
+            try t.expect(v.discarded);
+        }
+    }
+}
+
+test "every client navigation restores the network-change retry budget" {
+    const t = std.testing;
+    const Fake = struct {
+        fn yes(_: [*c]cef.cef_browser_t) callconv(.c) c_int {
+            return 1;
+        }
+    };
+    var out = proto.Outbox.init(t.allocator);
+    defer out.deinit();
+    var host = Host.init(t.allocator, &out);
+    defer host.deinit();
+    const v = try host.registerView(ViewConstructionTest.req(231, 0));
+    var browser = std.mem.zeroes(cef.cef_browser_t);
+    browser.can_go_back = Fake.yes;
+    browser.can_go_forward = Fake.yes;
+    v.browser = &browser;
+    for ([_]proto.NavAct{ .back, .forward, .reload, .reload_no_cache }) |action| {
+        v.load_retry = .settled;
+        host.navAction(.{ .view = v.id, .action = @intFromEnum(action) });
+        try t.expectEqual(loadretry.State.idle, v.load_retry);
+        try t.expect(v.sem_nav.waiting_load_start);
+        try t.expect(v.load_retry.arm());
+    }
+    v.load_retry = .settled;
+    host.navigate(.{ .view = v.id, .url = "https://next.test/" });
+    try t.expect(v.load_retry.arm());
 }
 
 test "view construction system failures release one owned view" {
@@ -7251,8 +7457,8 @@ fn onBeforeClose(
     // unrelated view and we would close the wrong tab.
     const v = host.findCef(browserInt(browser, "get_identifier")) orelse return;
     if (v.media_observer) |observer| observer.closed();
-    if (v.webext_popup and v.browser != null) host.popupClosedByEngine(v.id);
-    if (v.page_popup and v.browser != null) host.pagePopupClosedByEngine(v);
+    if (v.browser != null and (v.webext_popup or v.page_popup or v.devtools_of != 0))
+        host.retireView(v.id, .{ .close_browser = false, .reason = "the browser closed itself" });
 }
 
 fn onAfterCreated(

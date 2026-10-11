@@ -1858,6 +1858,108 @@ pub fn interceptSlotFor(gpa: std.mem.Allocator, view_id: u32) ?*ISlot {
     return s;
 }
 
+/// MAIN thread: give a new popup an independently owned policy and a fresh per-view budget.
+pub fn inheritPopupPolicy(gpa: std.mem.Allocator, view: u32, opener: u32) !void {
+    const src = interceptSlotFor(gpa, opener) orelse return error.PolicySlotUnavailable;
+    // Only the main thread replaces/frees policies, so the immutable
+    // policy remains alive while its clone allocates outside the lock.
+    g_int.acquire();
+    const refused = g_int.policy_failed or src.pc.exhausted == .policy_refused;
+    const enabled = src.enabled;
+    const original = src.pol;
+    g_int.release();
+    if (refused) return error.PolicyRefused;
+    const owned = if (original) |pol| try pol.clone(gpa) else null;
+    errdefer if (owned) |pol| pol.deinit(gpa);
+    const dst = policySlotFor(view) orelse return error.PolicySlotUnavailable;
+    g_int.acquire();
+    defer g_int.release();
+    dst.enabled = enabled;
+    dst.pol = owned;
+    dst.pc = .{ .started_ms = nowMs() };
+    dst.pol_dirty = owned != null;
+}
+
+pub const PopupPolicy = struct { bytes: []u8, block_ads: u8 };
+
+/// MAIN thread: serialize the popup's own immutable policy, never its possibly changed opener's.
+pub fn popupPolicySnapshot(gpa: std.mem.Allocator, view: u32) !PopupPolicy {
+    const slot = policySlotFor(view) orelse return error.PolicySlotUnavailable;
+    var bytes: std.ArrayList(u8) = .empty;
+    errdefer bytes.deinit(gpa);
+    if (slot.pol) |p| try proto.encodePayload(gpa, &bytes, proto.NetPolicySet{
+        .view = view,
+        .serial = p.serial,
+        .flags = (if (p.allow_private) proto.NetPolicySet.flag_allow_private else @as(u32, 0)) |
+            (if (p.untrusted) proto.NetPolicySet.flag_untrusted else @as(u32, 0)),
+        .block_types = p.block_types,
+        .allow_schemes = p.allow_schemes,
+        .max_requests = p.max_requests,
+        .max_bytes = p.max_bytes,
+        .max_navigations = p.max_navigations,
+        .deadline_ms = p.deadline_ms,
+        .allow_top = p.allow_top,
+        .allow_sub = p.allow_sub,
+    });
+    return .{ .bytes = try bytes.toOwnedSlice(gpa), .block_ads = @intFromBool(slot.enabled) };
+}
+
+test "popup policy survives opener replacement and either teardown order" {
+    const t = std.testing;
+    for ([_]bool{ false, true }) |popup_first| {
+        var out = proto.Outbox.init(t.allocator);
+        defer out.deinit();
+        var host = Host.init(t.allocator, &out);
+        defer host.deinit();
+        defer interceptUnregister(t.allocator, 201);
+        defer interceptUnregister(t.allocator, 202);
+        var req = policyTestSet(201, 1);
+        host.netPolicySet(req);
+        const src = interceptSlotFor(t.allocator, 201).?;
+        src.enabled = false;
+        src.pc.requests = 37;
+        try inheritPopupPolicy(t.allocator, 202, 201);
+        const dst = interceptSlotFor(t.allocator, 202).?;
+        try t.expect(src.pol.? != dst.pol.?);
+        try t.expect(!dst.enabled);
+        try t.expectEqual(@as(u32, 0), dst.pc.requests);
+        try t.expect(dst.pc.started_ms > 0);
+        req.max_requests = 50;
+        req.serial = 2;
+        host.netPolicySet(req);
+        try t.expectEqual(@as(u32, 100), dst.pol.?.max_requests);
+        try t.expectEqual(@as(u32, 50), src.pol.?.max_requests);
+        const snapshot = try popupPolicySnapshot(t.allocator, 202);
+        defer t.allocator.free(snapshot.bytes);
+        const inherited = try proto.NetPolicySet.decodeAlloc(snapshot.bytes, t.allocator);
+        defer t.allocator.free(inherited.allow_top);
+        defer t.allocator.free(inherited.allow_sub);
+        try t.expectEqual(@as(u32, 1), inherited.serial);
+        try t.expectEqual(@as(u32, 100), inherited.max_requests);
+        try t.expectEqual(@as(u8, 0), snapshot.block_ads);
+        interceptUnregister(t.allocator, if (popup_first) 202 else 201);
+        const survivor = if (popup_first) src else dst;
+        try t.expectEqualStrings("site.example", survivor.pol.?.allow_top[0]);
+        try t.expectEqualStrings("cdn.example", survivor.pol.?.allow_sub[0]);
+    }
+}
+
+test "popup policy allocation failure never changes its opener" {
+    const t = std.testing;
+    const src = interceptSlotFor(t.allocator, 201).?;
+    defer interceptUnregister(t.allocator, 201);
+    src.pol = try netpolicy.Policy.build(t.allocator, policyTestSet(201, 1));
+    try t.checkAllAllocationFailures(t.allocator, struct {
+        fn run(gpa: std.mem.Allocator) !void {
+            defer interceptUnregister(gpa, 202);
+            try inheritPopupPolicy(gpa, 202, 201);
+        }
+    }.run, .{});
+    try t.expectEqualStrings("site.example", src.pol.?.allow_top[0]);
+    src.pc.exhausted = .policy_refused;
+    try t.expectError(error.PolicyRefused, inheritPopupPolicy(t.allocator, 202, 201));
+}
+
 /// MAIN thread. Mark `view_id`'s slot (minted now when missing) to
 /// refuse main-frame redirects. False when the table is full.
 pub fn refuseRedirects(gpa: std.mem.Allocator, view_id: u32) bool {

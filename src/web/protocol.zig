@@ -1851,6 +1851,47 @@ pub const EvPagePopup = struct {
     h: u16,
     url: []const u8,
     frame_name: []const u8,
+    /// Null is a legacy announcement; an empty snapshot explicitly means no enforced policy.
+    policy: ?Text = null,
+    block_ads: u8 = 1,
+
+    pub fn encodeTo(self: EvPagePopup, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        try putU32(gpa, out, self.owner_view);
+        try putU32(gpa, out, self.popup_view);
+        try putU8(gpa, out, self.state);
+        try putU8(gpa, out, self.disposition);
+        try putU8(gpa, out, self.user_gesture);
+        try putU8(gpa, out, self.chromeless);
+        try putU16(gpa, out, self.w);
+        try putU16(gpa, out, self.h);
+        try putStr(gpa, out, self.url);
+        try putStr(gpa, out, self.frame_name);
+        if (self.policy) |snapshot| {
+            try putU8(gpa, out, self.block_ads);
+            try putText(gpa, out, snapshot);
+        }
+    }
+
+    pub fn decodeFrom(payload: []const u8) !EvPagePopup {
+        var cur = Cur{ .buf = payload };
+        var ev = EvPagePopup{
+            .owner_view = try cur.readU32(),
+            .popup_view = try cur.readU32(),
+            .state = try cur.readU8(),
+            .disposition = try cur.readU8(),
+            .user_gesture = try cur.readU8(),
+            .chromeless = try cur.readU8(),
+            .w = try cur.readU16(),
+            .h = try cur.readU16(),
+            .url = try cur.readStr(),
+            .frame_name = try cur.readStr(),
+        };
+        if (cur.pos < payload.len) {
+            ev.block_ads = try cur.readU8();
+            ev.policy = try cur.readText();
+        }
+        return ev;
+    }
 };
 
 pub const EvCursor = struct {
@@ -5351,6 +5392,42 @@ fn roundTrip(comptime T: type, value: T) !void {
             try std.testing.expectEqual(@field(value, f.name), @field(got, f.name));
         }
     }
+}
+
+test "page popup policy trailer distinguishes legacy absent and known unpolicied states" {
+    const t = std.testing;
+    var ev = EvPagePopup{
+        .owner_view = 7,
+        .popup_view = ENGINE_VIEW_BASE + 1,
+        .state = page_popup_opened,
+        .disposition = 0,
+        .user_gesture = 1,
+        .chromeless = 1,
+        .w = 400,
+        .h = 500,
+        .url = "https://popup.test",
+        .frame_name = "",
+    };
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(t.allocator);
+    try encodePayload(t.allocator, &payload, ev);
+    const legacy_len = payload.items.len;
+    try t.expect((try decode(EvPagePopup, payload.items)).policy == null);
+    ev.policy = .{ .s = "exact policy bytes" };
+    ev.block_ads = 0;
+    payload.clearRetainingCapacity();
+    try encodePayload(t.allocator, &payload, ev);
+    const got = try decode(EvPagePopup, payload.items);
+    try t.expectEqualStrings("exact policy bytes", got.policy.?.s);
+    try t.expectEqual(@as(u8, 0), got.block_ads);
+    try t.expect((try decode(EvPagePopup, payload.items[0..legacy_len])).policy == null);
+    for (legacy_len + 1..payload.items.len) |end| {
+        if (decode(EvPagePopup, payload.items[0..end])) |_| return error.AcceptedTruncatedPopupPolicy else |_| {}
+    }
+    ev.policy = .{ .s = "" };
+    payload.clearRetainingCapacity();
+    try encodePayload(t.allocator, &payload, ev);
+    try t.expectEqualStrings("", (try decode(EvPagePopup, payload.items)).policy.?.s);
 }
 
 test "round-trip: scalar and string frames" {

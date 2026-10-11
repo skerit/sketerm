@@ -1206,13 +1206,62 @@ fn str(v: Value, key: []const u8) ?[]const u8 {
     };
 }
 
-fn int(v: Value, key: []const u8) ?i64 {
-    const x = get(v, key) orelse return null;
-    return switch (x) {
-        .integer => |i| i,
-        .float => |f| @intFromFloat(f),
-        else => null,
-    };
+const int = dialect.int;
+
+test "opencode numeric fields reject values outside i64 without losing ordinary timestamps" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    for ([_][]const u8{
+        "{\"n\":1e100}", "{\"n\":-1e100}", "{\"n\":9223372036854775808.0}",
+    }) |json| {
+        const v = try std.json.parseFromSliceLeaky(Value, a, json, .{});
+        try std.testing.expect(int(v, "n") == null);
+    }
+    var obj: std.json.ObjectMap = .empty;
+    for ([_]f64{ std.math.inf(f64), -std.math.inf(f64), std.math.nan(f64) }) |f| {
+        try obj.put(a, "n", .{ .float = f });
+        try std.testing.expect(int(.{ .object = obj }, "n") == null);
+    }
+    const valid = try std.json.parseFromSliceLeaky(Value, a, "{\"n\":1700000000000.0,\"lo\":-9223372036854775808,\"hi\":9223372036854775807}", .{});
+    try std.testing.expectEqual(@as(?i64, 1_700_000_000_000), int(valid, "n"));
+    try std.testing.expectEqual(@as(?i64, std.math.minInt(i64)), int(valid, "lo"));
+    try std.testing.expectEqual(@as(?i64, std.math.maxInt(i64)), int(valid, "hi"));
+}
+
+test "opencode numeric answers refuse overflow and keep exact integer bounds" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const asked = [_]dialect.Asked{.{ .key = "n", .kind = .integer, .options = &.{}, .values = &.{} }};
+    for ([_][]const u8{ "1e100", "-1e100", "nan", "inf", "2.5", "9223372036854775808", "-9223372036854775809" }) |bad| {
+        try std.testing.expectError(error.NoSuchOption, dialect.questionBody(.v2, a, &asked, &.{&.{bad}}));
+    }
+    const json = try dialect.questionBody(.v2, a, &asked, &.{&.{"9223372036854775807"}});
+    const v = try std.json.parseFromSliceLeaky(Value, a, json, .{});
+    try std.testing.expectEqual(@as(?i64, std.math.maxInt(i64)), int(get(v, "answer").?, "n"));
+}
+
+test "opencode text events refuse out-of-range part ordinals" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var tr = dialect.Translator.init(std.testing.allocator);
+    defer tr.deinit();
+    var out: std.ArrayList(Value) = .empty;
+    for ([_][]const u8{ "session.text.delta", "session.text.ended" }) |kind| {
+        for ([_][]const u8{ "-1", "4294967296", "1e100" }) |ordinal| {
+            const json = try std.fmt.allocPrint(a, "{{\"type\":\"{s}\",\"data\":{{\"sessionID\":\"s\",\"assistantMessageID\":\"m\",\"ordinal\":{s},\"delta\":\"x\",\"text\":\"x\"}}}}", .{ kind, ordinal });
+            const ev = try std.json.parseFromSliceLeaky(Value, a, json, .{});
+            try tr.translate(a, ev, "s", &out);
+            try std.testing.expectEqual(@as(usize, 0), out.items.len);
+        }
+    }
+    const valid = try std.json.parseFromSliceLeaky(Value, a, "{\"type\":\"session.text.delta\",\"data\":{\"sessionID\":\"s\",\"assistantMessageID\":\"m\",\"ordinal\":4294967295,\"delta\":\"x\"}}", .{});
+    try tr.translate(a, valid, "s", &out);
+    try std.testing.expectEqual(@as(usize, 1), out.items.len);
+    const props = get(out.items[0], "properties").?;
+    try std.testing.expect(std.mem.endsWith(u8, str(props, "partID").?, "4294967295"));
 }
 
 /// A part's start as the app timed it (`time.start`, a tool's

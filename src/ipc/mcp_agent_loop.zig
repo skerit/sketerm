@@ -328,6 +328,11 @@ pub fn abandonReconnect(t: *const termdrive.Term) void {
     };
 }
 
+/// Route this agent terminal's recovery through the loop and fence every terminal-free path.
+pub fn manageReconnect(t: *termdrive.Term) void {
+    t.reconnect_owner = abandonReconnect;
+}
+
 fn entryOfTerm(t: *const termdrive.Term) ?*Entry {
     for (state.entries.items) |e| {
         if (e.visibleTerm() == t or e.server == t) return e;
@@ -392,7 +397,7 @@ pub fn goneDetail(g: GoneFacts) []const u8 {
 /// Start a background reconnect for each of `e`'s lost links that is due,
 /// backing off 2 s doubling to 60 s.
 fn kickReconnects(e: *Entry, now_ms: i64) void {
-    if (now_ms < e.reconnect_ms) return;
+    if (e.relaunching or now_ms < e.reconnect_ms) return;
     var started = false;
     for ([_]?*termdrive.Term{ e.visibleTerm(), e.server }) |o| {
         const t = o orelse continue;
@@ -740,6 +745,110 @@ const erase = mcp_agent_testkit.erase;
 const Parser = @import("../parser/vt.zig").Parser;
 const Event = @import("../parser/event.zig").Event;
 const StylePool = @import("../grid/style_pool.zig").Pool;
+
+fn testReconnectJob(t: *termdrive.Term) !*ReconnectJob {
+    const a = testing.allocator;
+    try state.reconnects.ensureUnusedCapacity(a, 1);
+    const j = try a.create(ReconnectJob);
+    errdefer a.destroy(j);
+    const host = try a.dupe(u8, "unused.invalid");
+    errdefer a.free(host);
+    const name = try a.dupe(u8, t.name);
+    j.* = .{ .allocator = a, .host = host, .name = name, .origin = t.origin_id, .term = t };
+    state.reconnects.appendAssumeCapacity(j);
+    return j;
+}
+
+test "background reconnect jobs are fenced by detach and term_close" {
+    var rig: mcp_agent_testkit.ToolRig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    const a = rig.arena.allocator();
+    const saved_terms = mcp_term.term_state;
+    mcp_term.term_state = .{ .allocator = testing.allocator, .mux_sock = "unused" };
+    defer {
+        mcp_term.term_state.terms.deinit(testing.allocator);
+        mcp_term.term_state = saved_terms;
+    }
+
+    inline for (.{ false, true }) |via_tool| {
+        var app: mcp_agent_testkit.FakeApp = undefined;
+        const term = try app.init();
+        defer app.deinit();
+        manageReconnect(term);
+        const job = try testReconnectJob(term);
+        term.exited = true;
+        if (via_tool) {
+            try mcp_term.term_state.terms.put(testing.allocator, 1, term);
+            const args = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"term\":1}", .{});
+            const result = try mcp_term.termTool(a, .term_close, args);
+            _ = try mcp.expectToolResultShape(a, "term_close", result);
+        } else term.detach();
+        try testing.expect(job.term == null);
+        job.gone = .{ .reason = .closed };
+        job.done.store(true, .release);
+        serviceReconnects(clock.nowMs());
+        try testing.expectEqual(@as(usize, 0), state.reconnects.items.len);
+    }
+}
+
+test "borrowed agent terminals restore inline recovery when their adapter closes" {
+    var rig: mcp_agent_testkit.ToolRig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    var app: mcp_agent_testkit.FakeApp = undefined;
+    const term = try app.init();
+    defer app.deinit();
+    defer term.detach();
+    const saved_terms = mcp_term.term_state;
+    mcp_term.term_state = .{ .allocator = testing.allocator, .mux_sock = "unused" };
+    defer {
+        mcp_term.term_state.terms.deinit(testing.allocator);
+        mcp_term.term_state = saved_terms;
+    }
+    try mcp_term.term_state.terms.put(testing.allocator, 1, term);
+    _ = try rig.call(.agent_attach, "{\"term\":1,\"app\":\"claude\",\"timeout_ms\":0}");
+    try testing.expect(term.reconnect_owner != null);
+    const job = try testReconnectJob(term);
+    _ = try rig.call(.agent_close, "{}");
+    try testing.expect(job.term == null);
+    try testing.expect(term.reconnect_owner == null);
+    try testing.expect(mcp_term.term_state.terms.get(1).? == term);
+    job.done.store(true, .release);
+    serviceReconnects(clock.nowMs());
+}
+
+test "agent transport loss never attempts an inline ssh reconnect" {
+    var rig: mcp_agent_testkit.ToolRig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    var app: mcp_agent_testkit.FakeApp = undefined;
+    const term = try app.init();
+    defer app.deinit();
+    const saved_terms = mcp_term.term_state;
+    mcp_term.term_state = .{ .allocator = testing.allocator, .mux_sock = "unused" };
+    defer {
+        mcp_term.term_state.terms.deinit(testing.allocator);
+        mcp_term.term_state = saved_terms;
+        term.detach();
+    }
+    try mcp_term.term_state.terms.put(testing.allocator, 1, term);
+    _ = try rig.call(.agent_attach, "{\"term\":1,\"app\":\"claude\",\"timeout_ms\":0}");
+    term.remote_host = try testing.allocator.dupe(u8, "unused.invalid");
+    const e = state.entries.items[0];
+    e.reconnect_ms = std.math.maxInt(i64);
+    app.daemon.closePrimaryPeer();
+    const before = clock.nowMs();
+    service(before);
+    try testing.expect(clock.nowMs() - before < 500);
+    try testing.expect(term.lost and term.exited);
+    try testing.expect(!term.reattach_spent);
+    try testing.expectEqual(@as(usize, 0), state.reconnects.items.len);
+    e.relaunching = true;
+    e.reconnect_ms = 0;
+    kickReconnects(e, clock.nowMs());
+    try testing.expectEqual(@as(usize, 0), state.reconnects.items.len);
+}
 
 /// A Screen the tests write Claude-Code-style ax bytes into, observed
 /// through `observeScreen` exactly as the loop does.

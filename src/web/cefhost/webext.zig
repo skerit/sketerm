@@ -476,12 +476,9 @@ pub fn popupError(self: *Host, req: proto.WebextActionActivate, detail: []const 
 }
 
 pub fn removePopupView(self: *Host, popup: *View) void {
-    for (self.views.items, 0..) |v, i| {
-        if (v != popup) continue;
-        _ = self.views.swapRemove(i);
-        self.freeView(v);
-        return;
-    }
+    // The caller already posted its error; do not replace it with a
+    // normal popup-closed event during common resource retirement.
+    self.retireView(popup.id, .{ .reason = "the extension popup failed", .notify_popup = false });
 }
 
 pub fn spawnPopup(self: *Host, v: *View, url_utf8: []const u8) !void {
