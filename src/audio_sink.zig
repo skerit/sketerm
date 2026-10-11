@@ -53,6 +53,7 @@ pub const AudioSink = struct {
         sink: *AudioSink,
         id: u32,
         stream: ?*PaStream = null,
+        failed: bool = false,
         /// PCM not yet accepted by the local stream.
         pending: std.ArrayList(u8) = .empty,
         format: u8 = 3,
@@ -268,7 +269,7 @@ pub const AudioSink = struct {
     }
 
     fn connectVoice(self: *AudioSink, v: *Voice) void {
-        if (v.stream != null or self.ctx_failed) return;
+        if (v.stream != null or v.failed or self.ctx_failed) return;
         // Off Linux this is already unreachable -- create() sets
         // ctx_failed -- but the body must not be analyzed either.
         if (have_pulse) {
@@ -294,30 +295,27 @@ pub const AudioSink = struct {
         }
     }
 
-    /// Local playback is unavailable for this voice: consume silently
-    /// so the remote app never stalls.
+    /// Failed voices keep consuming incoming audio so remote apps cannot stall.
     fn ctxFailVoice(self: *AudioSink, v: *Voice) void {
+        v.failed = true;
         if (have_pulse) {
             if (v.stream) |s| {
                 c.pa_stream_set_write_callback(s, null, null);
                 c.pa_stream_set_state_callback(s, null, null);
+                _ = c.pa_stream_disconnect(s);
                 c.pa_stream_unref(s);
                 v.stream = null;
             }
         }
-        if (v.pending.items.len > 0) {
-            self.reportConsumed(v.id, v.pending.items.len);
-            v.pending.clearRetainingCapacity();
-            self.flush();
-        }
+        self.pump(v);
     }
 
     /// Move pending PCM into the local stream as far as it will go;
     /// report what it accepted (the playback clock).
     fn pump(self: *AudioSink, v: *Voice) void {
-        if (self.ctx_failed or (self.ctx_ready and v.stream == null)) {
+        if (self.ctx_failed or v.failed) {
             // No local audio: swallow, keep the app flowing.
-            if (self.ctx_failed and v.pending.items.len > 0) {
+            if (v.pending.items.len > 0) {
                 self.reportConsumed(v.id, v.pending.items.len);
                 v.pending.clearRetainingCapacity();
                 self.flush();
@@ -410,7 +408,7 @@ pub const AudioSink = struct {
         if (v.sink.dead) return;
         if (have_pulse) switch (c.pa_stream_get_state(stream)) {
             c.PA_STREAM_READY => v.sink.pump(v),
-            c.PA_STREAM_FAILED => v.sink.ctxFailVoice(v),
+            c.PA_STREAM_FAILED, c.PA_STREAM_TERMINATED => v.sink.ctxFailVoice(v),
             else => {},
         };
     }
@@ -457,4 +455,61 @@ test "audio metadata and initial cork state follow stream descriptors" {
     try std.testing.expectEqualStrings("Conference call", infos[0].media);
     try std.testing.expectEqual(@as(u32, 1234), infos[0].pid);
     try std.testing.expect(!infos[0].running);
+}
+
+test "a failed voice consumes later PCM while other voices wait for the context" {
+    const a = std.testing.allocator;
+    const sink = try a.create(AudioSink);
+    sink.* = .{ .allocator = a };
+    defer sink.destroy();
+    var open: [10]u8 = undefined;
+    std.mem.writeInt(u32, open[0..4], 7, .little);
+    open[4] = 3;
+    open[5] = 2;
+    std.mem.writeInt(u32, open[6..10], 48_000, .little);
+    sink.unit(.open, &open);
+    std.mem.writeInt(u32, open[0..4], 8, .little);
+    sink.unit(.open, &open);
+    const failed = sink.voices.get(7).?;
+    try failed.pending.appendSlice(a, "queued");
+    sink.ctxFailVoice(failed);
+    try std.testing.expect(failed.failed);
+    try std.testing.expectEqual(@as(usize, 0), failed.pending.items.len);
+    sink.clearOut();
+
+    var pcm: [8]u8 = [_]u8{0} ** 8;
+    std.mem.writeInt(u32, pcm[0..4], 7, .little);
+    for (0..3) |_| {
+        sink.unit(.pcm, &pcm);
+        try std.testing.expectEqual(@as(usize, 0), failed.pending.items.len);
+        const report = (try pulse.peelUnit(sink.takeOut())).?;
+        try std.testing.expectEqual(pulse.UnitTag.consumed, report.tag);
+        try std.testing.expectEqual(@as(u32, 7), std.mem.readInt(u32, report.payload[0..4], .little));
+        try std.testing.expectEqual(@as(u64, 4), std.mem.readInt(u64, report.payload[4..12], .little));
+        sink.clearOut();
+    }
+    std.mem.writeInt(u32, pcm[0..4], 8, .little);
+    sink.unit(.pcm, &pcm);
+    try std.testing.expectEqual(@as(usize, 4), sink.voices.get(8).?.pending.items.len);
+    try std.testing.expectEqual(@as(usize, 0), sink.takeOut().len);
+}
+
+test "an invalid local sample spec marks only its voice failed" {
+    if (!have_pulse) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const sink = try a.create(AudioSink);
+    sink.* = .{ .allocator = a, .ctx_ready = true };
+    defer sink.destroy();
+    var open: [10]u8 = [_]u8{0} ** 10;
+    std.mem.writeInt(u32, open[0..4], 7, .little);
+    open[4] = 3;
+    std.mem.writeInt(u32, open[6..10], 48_000, .little);
+    sink.unit(.open, &open);
+    try std.testing.expect(sink.voices.get(7).?.failed);
+    try std.testing.expect(!sink.ctx_failed);
+    var pcm: [8]u8 = [_]u8{0} ** 8;
+    std.mem.writeInt(u32, pcm[0..4], 7, .little);
+    sink.unit(.pcm, &pcm);
+    try std.testing.expectEqual(@as(usize, 0), sink.voices.get(7).?.pending.items.len);
+    try std.testing.expectEqual(@as(u64, 4), std.mem.readInt(u64, (try pulse.peelUnit(sink.takeOut())).?.payload[4..12], .little));
 }

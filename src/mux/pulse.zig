@@ -846,7 +846,8 @@ pub const Server = struct {
         // unaligned writes that fail and kill their stream (SDL3
         // zombifies the whole device on the first one).
         const fb = @as(u64, s.channels) * sampleSize(s.format);
-        var pos = s.clock_base_bytes +| elapsed * bps / 1000;
+        const played: u64 = @intCast(@min(@as(u128, elapsed) * bps / 1000, std.math.maxInt(u64)));
+        var pos = s.clock_base_bytes +| played;
         if (fb > 0) pos -= pos % fb;
         if (pos >= s.write_index) {
             s.read_index = s.write_index;
@@ -1110,10 +1111,11 @@ pub const Server = struct {
                 // already-played bytes keep their old rate.
                 const idx = try r.u32be();
                 const rate = try r.u32be();
+                if (!validSampleRate(rate)) return self.sendError(tag, ERR_INVALID);
                 if (self.streams.getPtr(idx)) |s| {
                     if (!s.viewer_clocked) self.advanceSelfClock(s);
                     s.clock_base_ms = null;
-                    if (rate > 0) s.rate = rate;
+                    s.rate = rate;
                 }
                 _ = try self.replyHead(tag);
                 try self.finishFrame();
@@ -1200,6 +1202,7 @@ pub const Server = struct {
             try metadata.setString(self.allocator, &metadata.media_name, Metadata.media_name_bit, name, true);
         }
         const ss = try r.sampleSpec();
+        if (!validSampleSpec(ss.format, ss.channels, ss.rate)) return self.sendError(tag, ERR_INVALID);
         _ = try r.channelMap();
         _ = try r.u32be(); // sink index
         _ = try r.str(); // sink name
@@ -1229,7 +1232,7 @@ pub const Server = struct {
             _ = try r.boolean(); // fail_on_suspend
         }
 
-        const frame_bytes: u32 = @max(@as(u32, ss.channels) * sampleSize(ss.format), 1);
+        const frame_bytes: u32 = @as(u32, ss.channels) * sampleSize(ss.format);
         const bytes_per_sec: u64 = @as(u64, frame_bytes) * ss.rate;
         // A remote sink needs a real jitter window even when the client asks
         // for a tiny low-latency buffer.  Without this floor, replenishing a
@@ -1424,7 +1427,20 @@ pub const Server = struct {
     }
 };
 
-/// Bytes per sample for the PA sample formats we pass through.
+// PulseAudio sample.h's public PA_RATE_MAX and PA_CHANNELS_MAX limits,
+// kept here because the session daemon must never depend on libpulse.
+const MAX_SAMPLE_RATE: u32 = 48_000 * 16;
+const MAX_SAMPLE_CHANNELS: u8 = 32;
+
+fn validSampleRate(rate: u32) bool {
+    return rate > 0 and rate <= MAX_SAMPLE_RATE;
+}
+
+fn validSampleSpec(format: u8, channels: u8, rate: u32) bool {
+    return sampleSize(format) != 0 and channels > 0 and channels <= MAX_SAMPLE_CHANNELS and validSampleRate(rate);
+}
+
+/// Bytes per sample for known PulseAudio formats, or zero for an invalid code.
 fn sampleSize(format: u8) u32 {
     return switch (format) {
         0, 1, 2 => 1, // u8 / alaw / ulaw
@@ -1432,7 +1448,7 @@ fn sampleSize(format: u8) u32 {
         5, 6, 7, 8 => 4, // f32, s32
         9, 10 => 3, // s24 packed
         11, 12 => 4, // s24 in 32
-        else => 2,
+        else => 0,
     };
 }
 
@@ -1590,6 +1606,104 @@ test "set playback stream name rejects invalid UTF-8" {
     try t_.expectEqual(@as(u32, 17), try reply.u32be());
     try t_.expectEqual(@as(u32, ERR_INVALID), try reply.u32be());
     try t_.expectEqualStrings("original", srv.streams.get(0).?.metadata.media_name);
+}
+
+test "playback rejects invalid sample specifications before opening a stream" {
+    const a = t_.allocator;
+    const Spec = struct { format: u8 = 3, channels: u8 = 2, rate: u32 = 48_000 };
+    const cases = [_]Spec{
+        .{ .format = 13 },
+        .{ .format = 255 },
+        .{ .channels = 0 },
+        .{ .channels = 33 },
+        .{ .rate = 0 },
+        .{ .rate = MAX_SAMPLE_RATE + 1 },
+        .{ .rate = std.math.maxInt(u32) },
+    };
+    for (cases) |spec| {
+        var srv = Server.init(a);
+        defer srv.deinit();
+        srv.authorized = true;
+        srv.version = 8;
+        var fields: std.ArrayList(u8) = .empty;
+        defer fields.deinit(a);
+        const w = Tw{ .buf = &fields, .a = a };
+        try w.u32be(CMD_CREATE_PLAYBACK_STREAM);
+        try w.u32be(18);
+        try w.str("invalid sample spec");
+        try w.sampleSpec(spec.format, spec.channels, spec.rate);
+        try w.channelMap(2);
+        try w.u32be(INVALID_INDEX);
+        try w.str(null);
+        try w.u32be(0xffff_ffff);
+        try w.boolean(false);
+        try w.u32be(0xffff_ffff);
+        try w.u32be(0xffff_ffff);
+        try w.u32be(0xffff_ffff);
+        try w.u32be(0);
+        try w.cvolume(2, 0x10000);
+        var frame: std.ArrayList(u8) = .empty;
+        defer frame.deinit(a);
+        try clientFrame(a, &frame, fields.items);
+        try srv.feed(frame.items);
+        var reply = Tr{ .buf = srv.takeOut()[DESC_SIZE..] };
+        try t_.expectEqual(@as(u32, CMD_ERROR), try reply.u32be());
+        try t_.expectEqual(@as(u32, 18), try reply.u32be());
+        try t_.expectEqual(@as(u32, ERR_INVALID), try reply.u32be());
+        try t_.expectEqual(@as(u32, 0), srv.streams.count());
+        try t_.expectEqual(@as(usize, 0), srv.takeUnits().len);
+    }
+    for (0..13) |format| {
+        try t_.expect(validSampleSpec(@intCast(format), 1, 1));
+        try t_.expect(validSampleSpec(@intCast(format), MAX_SAMPLE_CHANNELS, MAX_SAMPLE_RATE));
+    }
+}
+
+test "sample rate updates reject invalid rates without rebasing playback" {
+    const a = t_.allocator;
+    var srv = Server.init(a);
+    defer srv.deinit();
+    srv.authorized = true;
+    try srv.streams.put(a, 0, .{ .rate = 48_000, .clock_base_ms = 7 });
+    for ([_]u32{ 0, MAX_SAMPLE_RATE + 1, std.math.maxInt(u32), MAX_SAMPLE_RATE }) |rate| {
+        var fields: std.ArrayList(u8) = .empty;
+        defer fields.deinit(a);
+        const w = Tw{ .buf = &fields, .a = a };
+        try w.u32be(CMD_UPDATE_PLAYBACK_STREAM_SAMPLE_RATE);
+        try w.u32be(19);
+        try w.u32be(0);
+        try w.u32be(rate);
+        var frame: std.ArrayList(u8) = .empty;
+        defer frame.deinit(a);
+        try clientFrame(a, &frame, fields.items);
+        try srv.feed(frame.items);
+        var reply = Tr{ .buf = srv.takeOut()[DESC_SIZE..] };
+        const valid = rate == MAX_SAMPLE_RATE;
+        try t_.expectEqual(@as(u32, if (valid) CMD_REPLY else CMD_ERROR), try reply.u32be());
+        try t_.expectEqual(@as(u32, 19), try reply.u32be());
+        if (!valid) {
+            try t_.expectEqual(@as(u32, ERR_INVALID), try reply.u32be());
+            try t_.expectEqual(@as(?i64, 7), srv.streams.get(0).?.clock_base_ms);
+        }
+        try t_.expectEqual(@as(u32, if (valid) MAX_SAMPLE_RATE else 48_000), srv.streams.get(0).?.rate);
+        srv.clearOut();
+    }
+}
+
+test "self-clock safely clamps a large elapsed interval at the maximum sample rate" {
+    var srv = Server.init(t_.allocator);
+    defer srv.deinit();
+    srv.now_ms = std.math.maxInt(i64);
+    var stream = Stream{
+        .format = 12,
+        .channels = MAX_SAMPLE_CHANNELS,
+        .rate = MAX_SAMPLE_RATE,
+        .clock_base_ms = 0,
+        .write_index = 1024,
+    };
+    srv.advanceSelfClock(&stream);
+    try t_.expectEqual(stream.write_index, stream.read_index);
+    try t_.expectEqual(@as(?i64, null), stream.clock_base_ms);
 }
 
 test "auth + client name + create stream + pcm flows to units" {
@@ -2039,7 +2153,12 @@ test "audio unit header bytes are the frozen 5-byte layout" {
     try t_.expectEqualSlices(u8, &.{
         0x07, 0x00, 0x00, 0x00, // 6 payload bytes + tag
         0x02, // UnitTag.pcm
-        0x07, 0x00, 0x00, 0x00, 'a', 'b',
+        0x07,
+        0x00,
+        0x00,
+        0x00,
+        'a',
+        'b',
     }, out.items);
 
     const p = (try peelUnit(out.items)).?;

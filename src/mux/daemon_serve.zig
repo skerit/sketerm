@@ -104,37 +104,8 @@ pub fn clientReadable(self: *Daemon, cl: *Client) void {
 }
 
 pub fn clientWritable(self: *Daemon, cl: *Client) void {
-    // Ordinary frames keep FIFO order, but at every wire-frame boundary
-    // pending PCM gets the next slot instead of waiting behind megabytes
-    // of surface updates.
-    if (!cl.startNextWriteFrame()) return;
-
-    const out = if (cl.write_lane == .audio) &cl.audio_wbuf else &cl.wbuf;
-    const amount = @min(out.items.len, cl.write_frame_left);
-    const n_raw = c.write(cl.fd, out.items.ptr, amount);
-    if (n_raw < 0) {
-        // fd is O_NONBLOCK: EAGAIN means the send buffer is full;
-        // keep the active frame and retry on the next POLLOUT.
-        if (std.posix.errno(n_raw) != .AGAIN) cl.dead = true;
-        return;
-    }
-    const n: usize = @intCast(n_raw);
-    if (n > 0) {
-        cl.write_frame_started = true;
-        if (cl.write_lane == .normal) cl.normal_bytes_written +|= n;
-    }
-    const remaining = out.items.len - n;
-    std.mem.copyForwards(u8, out.items[0..remaining], out.items[n..]);
-    out.shrinkRetainingCapacity(remaining);
-    cl.write_frame_left -= n;
-    if (cl.write_frame_left == 0) {
-        cl.write_lane = .none;
-        cl.write_frame_started = false;
-    }
-    // A snapshot/replay burst can leave a many-MB high-water
-    // capacity pinned forever; release it once fully drained.
-    if (remaining == 0 and out.capacity > (4 << 20))
-        out.clearAndFree(cl.allocator);
+    cl.writePending();
+    if (cl.dead) return;
     // Events were withheld while this client was backlogged; it has
     // caught up, so hand it a fresh snapshot (stamped with the
     // current seq) and resume streaming. Sent even for an exited

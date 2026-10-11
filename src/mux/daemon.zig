@@ -398,17 +398,18 @@ pub const Session = struct {
         if (ansi) self.parser.vt52_y_state = 0;
     }
 
-    /// Hand bytes to the child's PTY: delivered now, or queued for the
-    /// poll loop's POLLOUT drain (`Daemon.flushSessionInput`). The only
-    /// refusal is the queue cap, and it is logged once per episode
-    /// rather than swallowed. Cast sessions have no child: dropped.
+    /// Deliver or queue input, logging the first refusal of each drop episode.
     pub fn writeToChild(self: *Session, bytes: []const u8) void {
         const pty = self.ptyPtr() orelse return;
         const r = pty.writeAll(bytes);
         if (r.first_drop) {
-            log.warn("session '{s}': child is not reading its terminal and {d} KiB of input are already waiting; refusing further input until it drains ({d} B dropped)", .{
-                self.name, pty.queuedBytes() / 1024, r.dropped,
-            });
+            if (r.failure) |failure| {
+                log.warn("session '{s}': terminal input write failed ({s}); {d} B dropped", .{ self.name, @tagName(failure), r.dropped });
+            } else {
+                log.warn("session '{s}': input queue is full or unavailable ({d} KiB waiting); {d} B dropped", .{
+                    self.name, pty.queuedBytes() / 1024, r.dropped,
+                });
+            }
         }
     }
 
@@ -934,9 +935,15 @@ pub const Client = struct {
     /// Choose the next complete wire frame. A partially-written frame keeps
     /// its lane; otherwise latency-sensitive audio preempts normal traffic.
     pub fn startNextWriteFrame(self: *Client) bool {
+        return self.startWriteFrame(0, 0);
+    }
+
+    fn startWriteFrame(self: *Client, normal_sent: usize, audio_sent: usize) bool {
         if (self.write_lane != .none) return true;
-        self.write_lane = if (self.audio_wbuf.items.len > 0) .audio else if (self.wbuf.items.len > 0) .normal else return false;
-        const selected = if (self.write_lane == .audio) self.audio_wbuf.items else self.wbuf.items;
+        const audio = self.audio_wbuf.items[audio_sent..];
+        const normal = self.wbuf.items[normal_sent..];
+        self.write_lane = if (audio.len > 0) .audio else if (normal.len > 0) .normal else return false;
+        const selected = if (self.write_lane == .audio) audio else normal;
         if (selected.len < 5) {
             self.dead = true;
             return false;
@@ -950,6 +957,74 @@ pub const Client = struct {
         self.write_frame_left = frame_len;
         self.write_frame_started = false;
         return true;
+    }
+
+    const WRITE_BUDGET: usize = 1 << 20;
+    const WRITE_CALL_BUDGET: usize = 4096;
+
+    const SocketWriter = struct {
+        fd: c_int,
+
+        fn write(self: *@This(), bytes: []const u8) isize {
+            return c.write(self.fd, bytes.ptr, bytes.len);
+        }
+    };
+
+    /// Drain a bounded batch, compacting each lane once and preempting only at frame boundaries.
+    pub fn writePending(self: *Client) void {
+        var writer = SocketWriter{ .fd = self.fd };
+        self.writePendingWith(&writer);
+    }
+
+    fn writePendingWith(self: *Client, writer: anytype) void {
+        var normal_sent: usize = 0;
+        var audio_sent: usize = 0;
+        defer {
+            self.compactWritten(&self.wbuf, normal_sent);
+            self.compactWritten(&self.audio_wbuf, audio_sent);
+        }
+        var calls: usize = 0;
+        while (!self.dead and normal_sent + audio_sent < WRITE_BUDGET and calls < WRITE_CALL_BUDGET) : (calls += 1) {
+            if (!self.startWriteFrame(normal_sent, audio_sent)) break;
+            const audio = self.write_lane == .audio;
+            const out = if (audio) self.audio_wbuf.items[audio_sent..] else self.wbuf.items[normal_sent..];
+            const amount = @min(out.len, self.write_frame_left, WRITE_BUDGET - normal_sent - audio_sent);
+            const n_raw = writer.write(out[0..amount]);
+            if (n_raw < 0) {
+                switch (std.posix.errno(n_raw)) {
+                    .INTR => continue,
+                    .AGAIN => {},
+                    else => self.dead = true,
+                }
+                break;
+            }
+            if (n_raw == 0) {
+                self.dead = true;
+                break;
+            }
+            const n: usize = @intCast(n_raw);
+            self.write_frame_started = true;
+            if (audio) {
+                audio_sent += n;
+            } else {
+                normal_sent += n;
+                self.normal_bytes_written +|= n;
+            }
+            self.write_frame_left -= n;
+            if (self.write_frame_left == 0) {
+                self.write_lane = .none;
+                self.write_frame_started = false;
+            }
+        }
+    }
+
+    fn compactWritten(self: *Client, out: *std.ArrayList(u8), sent: usize) void {
+        if (sent > 0) {
+            const remaining = out.items.len - sent;
+            std.mem.copyForwards(u8, out.items[0..remaining], out.items[sent..]);
+            out.shrinkRetainingCapacity(remaining);
+        }
+        if (out.items.len == 0 and out.capacity > (4 << 20)) out.clearAndFree(self.allocator);
     }
 
     pub fn queueJson(self: *Client, ftype: wire.FrameType, value: anytype) void {
@@ -1013,6 +1088,139 @@ test "client audio lane preempts normal traffic only at frame boundaries" {
     try std.testing.expect(cl.startNextWriteFrame());
     try std.testing.expectEqual(Client.WriteLane.normal, cl.write_lane);
     try std.testing.expectEqual(@as(usize, 3), cl.write_frame_left);
+}
+
+const TestClientWriter = struct {
+    bytes: std.ArrayList(u8) = .empty,
+    max_write: usize = std.math.maxInt(usize),
+    stop_after: usize = std.math.maxInt(usize),
+    interrupts: usize = 0,
+
+    fn write(self: *@This(), bytes: []const u8) isize {
+        if (self.interrupts > 0) {
+            self.interrupts -= 1;
+            std.c._errno().* = c.EINTR;
+            return -1;
+        }
+        if (self.bytes.items.len >= self.stop_after) {
+            std.c._errno().* = c.EAGAIN;
+            return -1;
+        }
+        const n = @min(bytes.len, self.max_write, self.stop_after - self.bytes.items.len);
+        self.bytes.appendSlice(std.testing.allocator, bytes[0..n]) catch {
+            std.c._errno().* = c.ENOMEM;
+            return -1;
+        };
+        return @intCast(n);
+    }
+};
+
+test "client write drains many queued frames in one bounded batch" {
+    const a = std.testing.allocator;
+    var cl = Client{ .allocator = a, .fd = -1 };
+    defer cl.wbuf.deinit(a);
+    defer cl.audio_wbuf.deinit(a);
+    for (0..2000) |_| cl.queueFrame(.events, "small event");
+    const expected = try a.dupe(u8, cl.wbuf.items);
+    defer a.free(expected);
+    var writer: TestClientWriter = .{};
+    defer writer.bytes.deinit(a);
+    cl.writePendingWith(&writer);
+    try std.testing.expect(!cl.dead);
+    try std.testing.expectEqualSlices(u8, expected, writer.bytes.items);
+    try std.testing.expectEqual(@as(usize, 0), cl.queuedBytes());
+    try std.testing.expectEqual(Client.WriteLane.none, cl.write_lane);
+    try std.testing.expectEqual(@as(u64, expected.len), cl.normal_bytes_written);
+}
+
+test "client write preserves frame order through short writes, interruption and backpressure" {
+    const a = std.testing.allocator;
+    var cl = Client{ .allocator = a, .fd = -1 };
+    defer cl.wbuf.deinit(a);
+    defer cl.audio_wbuf.deinit(a);
+    cl.queueFrame(.events, "first");
+    cl.queueFrame(.events, "second");
+    var expected: std.ArrayList(u8) = .empty;
+    defer expected.deinit(a);
+    try wire.appendFrame(&expected, a, .events, "first");
+    try wire.appendFrame(&expected, a, .chan_data, "audio");
+    try wire.appendFrame(&expected, a, .events, "second");
+
+    var writer = TestClientWriter{ .max_write = 3, .stop_after = 7, .interrupts = 1 };
+    defer writer.bytes.deinit(a);
+    cl.writePendingWith(&writer);
+    try std.testing.expect(!cl.dead);
+    try std.testing.expect(cl.write_frame_started);
+    try std.testing.expectEqual(@as(usize, 3), cl.write_frame_left);
+    try std.testing.expectEqual(@as(u64, 7), cl.normal_bytes_written);
+    cl.queueAudioFrame(.chan_data, "audio");
+    writer.stop_after = std.math.maxInt(usize);
+    cl.writePendingWith(&writer);
+    try std.testing.expect(!cl.dead);
+    try std.testing.expectEqualSlices(u8, expected.items, writer.bytes.items);
+    try std.testing.expectEqual(@as(usize, 0), cl.queuedBytes());
+    try std.testing.expectEqual(@as(u64, 21), cl.normal_bytes_written);
+}
+
+test "client write budget leaves a resumable frame and bounds repeated interruptions" {
+    const a = std.testing.allocator;
+    var cl = Client{ .allocator = a, .fd = -1 };
+    defer cl.wbuf.deinit(a);
+    defer cl.audio_wbuf.deinit(a);
+    const payload = try a.alloc(u8, Client.WRITE_BUDGET + 128);
+    defer a.free(payload);
+    @memset(payload, 'n');
+    cl.queueFrame(.events, payload);
+    const expected = try a.dupe(u8, cl.wbuf.items);
+    defer a.free(expected);
+    var writer = TestClientWriter{ .interrupts = Client.WRITE_CALL_BUDGET + 1 };
+    defer writer.bytes.deinit(a);
+    cl.writePendingWith(&writer);
+    try std.testing.expect(!cl.dead);
+    try std.testing.expectEqual(@as(usize, 1), writer.interrupts);
+    try std.testing.expectEqual(@as(u64, 0), cl.normal_bytes_written);
+    cl.writePendingWith(&writer);
+    try std.testing.expectEqual(Client.WRITE_BUDGET, writer.bytes.items.len);
+    try std.testing.expectEqual(@as(usize, 133), cl.write_frame_left);
+    try std.testing.expectEqual(@as(usize, 133), cl.queuedBytes());
+    cl.writePendingWith(&writer);
+    try std.testing.expectEqualSlices(u8, expected, writer.bytes.items);
+    try std.testing.expectEqual(@as(usize, 0), cl.queuedBytes());
+}
+
+test "client write drains a nonblocking socket without dropping queued frames" {
+    const a = std.testing.allocator;
+    var fds: [2]c_int = undefined;
+    try std.testing.expect(c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &fds) == 0);
+    defer _ = c.close(fds[0]);
+    defer _ = c.close(fds[1]);
+    try std.testing.expect(c.fcntl(fds[0], c.F_SETFL, @as(c_int, c.O_NONBLOCK)) == 0);
+    try std.testing.expect(c.fcntl(fds[1], c.F_SETFL, @as(c_int, c.O_NONBLOCK)) == 0);
+    var cl = Client{ .allocator = a, .fd = fds[0] };
+    defer cl.wbuf.deinit(a);
+    defer cl.audio_wbuf.deinit(a);
+    for (0..2000) |_| cl.queueFrame(.events, "batch");
+    const expected = try a.dupe(u8, cl.wbuf.items);
+    defer a.free(expected);
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(a);
+    cl.writePending();
+    try std.testing.expect(cl.normal_bytes_written > 10);
+    for (0..2001) |_| {
+        var buf: [8192]u8 = undefined;
+        while (true) {
+            const n = c.read(fds[1], &buf, buf.len);
+            if (n < 0 and std.posix.errno(n) == .INTR) continue;
+            if (n < 0 and std.posix.errno(n) == .AGAIN) break;
+            try std.testing.expect(n > 0);
+            try got.appendSlice(a, buf[0..@intCast(n)]);
+        }
+        if (cl.queuedBytes() == 0) break;
+        cl.writePending();
+        try std.testing.expect(!cl.dead);
+    }
+    try std.testing.expectEqualSlices(u8, expected, got.items);
+    try std.testing.expectEqual(@as(usize, 0), cl.queuedBytes());
 }
 
 test "hello-less clients default to the protocol-4 envelope with the legacy snapshot body" {

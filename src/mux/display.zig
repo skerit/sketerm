@@ -156,8 +156,6 @@ const Args = struct {
     }
 };
 
-fn sigNoop(_: c_int) callconv(.c) void {}
-
 fn errPrint(comptime fmt: []const u8, args: anytype) void {
     if (!diag.enabled) return;
     var buf: [1024]u8 = undefined;
@@ -1112,7 +1110,7 @@ fn runCommand(allocator: std.mem.Allocator, a_in: Args) u8 {
 
 /// Entry point: `argv` is everything after the `display` keyword.
 pub fn run(allocator: std.mem.Allocator, argv: []const []const u8) u8 {
-    _ = c.signal(c.SIGPIPE, &sigNoop);
+    platform.ignoreSigpipe();
     const a = parseArgs(argv) orelse return 2;
     if (a.help) {
         outPrint(commandHelp(a.cmd)) catch return 1;

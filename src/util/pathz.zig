@@ -29,10 +29,7 @@ pub fn pathZ(buf: *[4096]u8, path: []const u8) Error![*:0]const u8 {
     return @ptrCast(buf);
 }
 
-/// Create `path` and every missing component of it via `mkdir(2)`, like
-/// `mkdir -p path`. Idempotent: EEXIST is ignored.
-/// @return error.MkdirFailed for the first component that could not be
-/// created for any other reason.
+/// Create missing components, accepting existing directories and links to directories.
 pub fn makeDirs(path: []const u8, mode: u32) Error!void {
     if (path.len == 0) return error.MkdirFailed;
     var path_z: [4096]u8 = undefined;
@@ -50,8 +47,12 @@ pub fn makeDirs(path: []const u8, mode: u32) Error!void {
         const slice_len = i;
         @memcpy(path_z[0..slice_len], path[0..slice_len]);
         path_z[slice_len] = 0;
-        if (c.mkdir(@ptrCast(&path_z), @intCast(mode)) != 0 and std.c._errno().* != c.EEXIST)
-            return error.MkdirFailed;
+        if (c.mkdir(@ptrCast(&path_z), @intCast(mode)) != 0) {
+            if (std.c._errno().* != c.EEXIST) return error.MkdirFailed;
+            var st: c.struct_stat = undefined;
+            if (c.stat(@ptrCast(&path_z), &st) != 0 or (st.st_mode & c.S_IFMT) != c.S_IFDIR)
+                return error.MkdirFailed;
+        }
         i += 1;
     }
 }
@@ -155,7 +156,9 @@ pub fn executableOnPath(name: []const u8) bool {
         if (dir.len == 0) continue;
         var z: [4096:0]u8 = undefined;
         const p = std.fmt.bufPrintZ(&z, "{s}/{s}", .{ dir, name }) catch continue;
-        if (c.access(p.ptr, c.X_OK) == 0) return true;
+        var st: c.struct_stat = undefined;
+        if (c.access(p.ptr, c.X_OK) == 0 and c.stat(p.ptr, &st) == 0 and
+            (st.st_mode & c.S_IFMT) == c.S_IFREG) return true;
     }
     return false;
 }
@@ -236,6 +239,26 @@ test "makeDirs is idempotent and reports an uncreatable component" {
 
     try std.testing.expectError(error.MkdirFailed, makeDirs("", 0o700));
     try std.testing.expectError(error.MkdirFailed, makeDirs("/proc/definitely/not/creatable", 0o700));
+}
+
+test "makeDirs rejects files but accepts symlinks to directories" {
+    const td = TempDir.make("mkdirs-kind") orelse return error.SkipZigTest;
+    defer td.remove();
+    var buf: [4096:0]u8 = undefined;
+    const file = try std.fmt.bufPrintZ(&buf, "{s}/file", .{td.path()});
+    const fp = c.fopen(file.ptr, "wb") orelse return error.SkipZigTest;
+    _ = c.fclose(fp);
+    try std.testing.expectError(error.MkdirFailed, makeDirs(file, 0o700));
+    var nested_buf: [4096]u8 = undefined;
+    const nested = try std.fmt.bufPrint(&nested_buf, "{s}/child", .{file});
+    try std.testing.expectError(error.MkdirFailed, makeDirs(nested, 0o700));
+    var link_buf: [4096:0]u8 = undefined;
+    const link = try std.fmt.bufPrintZ(&link_buf, "{s}/link", .{td.path()});
+    try std.testing.expect(c.symlink(file.ptr, link.ptr) == 0);
+    try std.testing.expectError(error.MkdirFailed, makeDirs(link, 0o700));
+    try std.testing.expect(c.unlink(link.ptr) == 0);
+    try std.testing.expect(c.symlink(td.pathZ(), link.ptr) == 0);
+    try makeDirs(link, 0o700);
 }
 
 test "removeTree takes a nested tree, a lone file and a missing path in stride" {
@@ -340,6 +363,11 @@ test "executableOnPath finds a real binary and misses a made-up one" {
 
     // Non-executable file on PATH is not a hit.
     try std.testing.expect(c.chmod(bin.ptr, 0o644) == 0);
+    try std.testing.expect(!executableOnPath("sketerm-fake-tool"));
+
+    // Searchable directories are not executable programs.
+    try std.testing.expect(c.unlink(bin.ptr) == 0);
+    try std.testing.expect(c.mkdir(bin.ptr, 0o755) == 0);
     try std.testing.expect(!executableOnPath("sketerm-fake-tool"));
 
     // Empty PATH: nothing resolves, and "." is not consulted.

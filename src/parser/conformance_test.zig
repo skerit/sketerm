@@ -173,3 +173,16 @@ test "OSC with ESC backslash terminator still dispatches cleanly" {
     h.feed("\x1b]2;title \xE2\x9C\x93 done\x1b\\after");
     try h.expectLine(0, "after");
 }
+
+test "a truncated OSC cannot overwrite a clipboard with its decodable prefix" {
+    var h = try Harness.init(std.testing.allocator, 10, 2);
+    defer h.deinit();
+    h.arm();
+    try h.feedOsc52("kept");
+    h.feed("\x1b]52;c;bG9zdA==");
+    h.parser.osc_truncated = true;
+    h.feed("\x07");
+    try std.testing.expectEqualStrings("kept", h.clipboard.items);
+    h.feed("ok");
+    try h.expectLine(0, "ok");
+}

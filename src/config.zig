@@ -1574,7 +1574,7 @@ pub const Config = struct {
     pub fn loadFromPath(allocator: std.mem.Allocator, path: []const u8) LoadError!Config {
         const bytes = readfile.cappedAlloc(allocator, path, MAX_FILE_BYTES) catch |err| switch (err) {
             error.PathTooLong => return error.PathTooLong,
-            error.OpenFailed, error.MkdirFailed => return error.NotReadable,
+            error.OpenFailed, error.ReadFailed, error.MkdirFailed => return error.NotReadable,
             error.StreamTooLong => {
                 warnConfig("{s} is larger than {d} KiB and was not loaded", .{ path, MAX_FILE_BYTES / 1024 });
                 return error.TooLarge;
@@ -2927,6 +2927,12 @@ fn parseEnum(comptime E: type, text: []const u8) ?E {
     return null;
 }
 
+fn parseFiniteFloat(value: []const u8) !f32 {
+    const f = try std.fmt.parseFloat(f32, value);
+    if (!std.math.isFinite(f)) return error.OutOfRange;
+    return f;
+}
+
 /// One value of a scalar codec as field type `T` (an optional parses as
 /// its child).
 fn parseScalar(comptime codec: Codec, comptime T: type, arena: std.mem.Allocator, value: []const u8) !T {
@@ -2946,7 +2952,7 @@ fn parseScalar(comptime codec: Codec, comptime T: type, arena: std.mem.Allocator
             break :blk std.math.cast(T, n) orelse return error.OutOfRange;
         },
         .float => |spec| blk: {
-            var f = try std.fmt.parseFloat(f32, value);
+            var f = try parseFiniteFloat(value);
             if (spec.min) |m| f = @max(f, m);
             if (spec.max) |m| f = @min(f, m);
             break :blk f;
@@ -3064,7 +3070,7 @@ fn applyFamily(comptime row: Key, target: anytype, arena: std.mem.Allocator, res
                 const rgba = try parseColor(value);
                 col = .{ rgba[0], rgba[1], rgba[2] };
             } else {
-                val = try std.fmt.parseFloat(f32, value);
+                val = try parseFiniteFloat(value);
             }
             for (slot.items) |*entry| {
                 if (std.mem.eql(u8, entry.name, rest)) {
@@ -3832,6 +3838,7 @@ test "config: loadFromPath refuses an unreadable file instead of returning defau
     // Defers unwind in reverse: the file must go before its directory.
     defer _ = c.rmdir(dir);
     defer _ = c.unlink(path.ptr);
+    try std.testing.expectError(error.NotReadable, Config.loadFromPath(std.testing.allocator, base));
     {
         const fp = c.fopen(path.ptr, "wb") orelse return error.SkipZigTest;
         defer _ = c.fclose(fp);
@@ -5638,6 +5645,26 @@ test "config: the default Config serialises to the header line alone" {
     var w = std.Io.Writer.fixed(&buf);
     try cfg.serialise(&w);
     try std.testing.expectEqualStrings("# sketerm config (auto-saved by Preferences dialog)\n", w.buffered());
+}
+
+test "config: nonfinite floating settings are refused before clamping or shader updates" {
+    const t = std.testing;
+    inline for (.{ "nan", "inf", "-inf", "1e999" }) |value| {
+        try t.expectError(error.OutOfRange, parseScalar(.{ .float = .{} }, f32, t.allocator, value));
+        try t.expectError(error.OutOfRange, parseScalar(.{ .float = .{ .min = 0, .max = 1 } }, f32, t.allocator, value));
+    }
+    var cfg = try Config.loadFromBytes(t.allocator,
+        \\padding = 5
+        \\padding = nan
+        \\background_gradient_angle = 45
+        \\background_gradient_angle = inf
+        \\shader_param.gain = 2
+        \\shader_param.gain = -inf
+    );
+    defer cfg.deinit();
+    try t.expectEqual(@as(f32, 5), cfg.settings.padding);
+    try t.expectEqual(@as(f32, 45), cfg.background_gradient_angle);
+    try t.expectEqual(@as(f32, 2), cfg.shader_params.items[0].value);
 }
 
 test "config: every table key round-trips through serialise and parse" {

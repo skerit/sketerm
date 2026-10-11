@@ -20,12 +20,9 @@ const std = @import("std");
 const c = @import("cbindings");
 const pathz = @import("pathz.zig");
 
-pub const Error = error{ OpenFailed, StreamTooLong, OutOfMemory };
+pub const Error = error{ OpenFailed, ReadFailed, StreamTooLong, OutOfMemory };
 
-/// Whole file into memory, streamed; the read stops once more than
-/// `cap` bytes have accumulated.
-/// @return error.StreamTooLong past `cap`, error.OpenFailed when the
-/// file cannot be opened.
+/// Read at most `cap` bytes, rejecting excess data and incomplete reads.
 pub fn cappedAlloc(allocator: std.mem.Allocator, path: []const u8, cap: usize) ![]u8 {
     var z: [4096]u8 = undefined;
     const p = try pathz.pathZ(&z, path);
@@ -35,10 +32,16 @@ pub fn cappedAlloc(allocator: std.mem.Allocator, path: []const u8, cap: usize) !
     errdefer list.deinit(allocator);
     var buf: [16 * 1024]u8 = undefined;
     while (true) {
-        const n = c.fread(&buf, 1, buf.len, fp);
-        if (n == 0) break;
+        const remaining = cap - list.items.len;
+        const n = c.fread(&buf, 1, @min(buf.len, remaining +| 1), fp);
+        const interrupted = c.ferror(fp) != 0;
+        if (interrupted) {
+            if (std.c._errno().* != c.EINTR) return error.ReadFailed;
+            c.clearerr(fp);
+        }
+        if (n > remaining) return error.StreamTooLong;
         try list.appendSlice(allocator, buf[0..n]);
-        if (list.items.len > cap) return error.StreamTooLong;
+        if (n == 0 and !interrupted) break;
     }
     return list.toOwnedSlice(allocator);
 }
@@ -153,6 +156,27 @@ test "cappedAlloc: under, exactly at and over the cap" {
     var missing: [4096]u8 = undefined;
     const gone = try std.fmt.bufPrint(&missing, "{s}/nope", .{td.path()});
     try t.expectError(error.OpenFailed, cappedAlloc(t.allocator, gone, 64));
+}
+
+test "cappedAlloc refuses read errors instead of returning an empty file" {
+    const td = pathz.TempDir.make("readfile-error") orelse return error.SkipZigTest;
+    defer td.remove();
+    try t.expectError(error.ReadFailed, cappedAlloc(t.allocator, td.path(), 64));
+    try t.expectEqual(@as(?[]u8, null), capped(t.allocator, td.path(), 64));
+}
+
+test "cappedAlloc rejects excess bytes before allocating them" {
+    const td = pathz.TempDir.make("readfile-zero") orelse return error.SkipZigTest;
+    defer td.remove();
+    var buf: [4096:0]u8 = undefined;
+    const path = try writeTemp(td.path(), "f", "x", &buf);
+    var failing = t.FailingAllocator.init(t.allocator, .{ .fail_index = 0 });
+    try t.expectError(error.StreamTooLong, cappedAlloc(failing.allocator(), path, 0));
+    try t.expect(!failing.has_induced_failure);
+    const empty_path = try writeTemp(td.path(), "empty", "", &buf);
+    const empty = try cappedAlloc(failing.allocator(), empty_path, 0);
+    defer failing.allocator().free(empty);
+    try t.expectEqual(@as(usize, 0), empty.len);
 }
 
 test "json: round-trips, ignores unknown fields, nulls on garbage" {

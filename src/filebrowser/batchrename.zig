@@ -31,10 +31,12 @@ pub const Problem = enum {
     duplicate_target,
     /// A rename produces an empty basename, "." or "..".
     bad_name,
+    /// Selected paths cannot be moved without first overwriting one another.
+    dependency_cycle,
 };
 
 pub const Plan = struct {
-    /// Entries the pattern changes, in execution order (deepest first).
+    /// Entries in dependency order, with children before their selected parents.
     items: []Item,
     /// Entries the pattern leaves alone.
     unchanged: usize,
@@ -60,8 +62,7 @@ pub fn replaceAll(allocator: std.mem.Allocator, base: []const u8, find: []const 
     return try std.mem.replaceOwned(u8, allocator, base, find, repl);
 }
 
-/// Plan the renames of `paths` (full paths on one host). The order of
-/// `items` is deepest first, the order the renames must run in.
+/// Plan no-replace renames with children and occupied targets moved first.
 pub fn plan(allocator: std.mem.Allocator, paths: []const []const u8, find: []const u8, repl: []const u8) !Plan {
     var items: std.ArrayList(Item) = .empty;
     errdefer {
@@ -135,8 +136,49 @@ pub fn plan(allocator: std.mem.Allocator, paths: []const []const u8, find: []con
             }
         }
     }
+    if (result.problem == .none) {
+        if (try orderForExecution(allocator, items.items)) |blocked| {
+            result.problem = .dependency_cycle;
+            result.problem_at = blocked;
+        }
+    }
     result.items = try items.toOwnedSlice(allocator);
     return result;
+}
+
+fn precedes(first: Item, second: Item) bool {
+    return std.mem.eql(u8, first.from, second.to) or
+        (first.from.len > second.from.len and std.mem.startsWith(u8, first.from, second.from) and
+            first.from[second.from.len] == '/');
+}
+
+/// Return a blocked item's index if no collision-free execution order exists.
+fn orderForExecution(allocator: std.mem.Allocator, items: []Item) !?usize {
+    const pending = try allocator.alloc(usize, items.len);
+    defer allocator.free(pending);
+    const ordered = try allocator.alloc(Item, items.len);
+    defer allocator.free(ordered);
+    for (items, pending, 0..) |item, *dependencies, i| {
+        dependencies.* = 0;
+        for (items, 0..) |other, j| {
+            if (i != j and precedes(other, item)) dependencies.* += 1;
+        }
+    }
+    for (ordered) |*next| {
+        const ready = std.mem.indexOfScalar(usize, pending, 0) orelse {
+            for (pending, 0..) |dependencies, i| {
+                if (dependencies != std.math.maxInt(usize)) return i;
+            }
+            unreachable;
+        };
+        next.* = items[ready];
+        pending[ready] = std.math.maxInt(usize);
+        for (items, pending) |item, *dependencies| {
+            if (dependencies.* != std.math.maxInt(usize) and precedes(next.*, item)) dependencies.* -= 1;
+        }
+    }
+    @memcpy(items, ordered);
+    return null;
 }
 
 /// One-line preview for the dialog: how many change, the first change
@@ -150,6 +192,9 @@ pub fn describe(p: *const Plan, buf: []u8) []const u8 {
             std.fs.path.basename(p.items[p.problem_at].to),
         }) catch "",
         .bad_name => std.fmt.bufPrint(buf, "{s} would get an empty or reserved name", .{
+            std.fs.path.basename(p.items[p.problem_at].from),
+        }) catch "",
+        .dependency_cycle => std.fmt.bufPrint(buf, "renames depend on each other at {s}", .{
             std.fs.path.basename(p.items[p.problem_at].from),
         }) catch "",
         .none => if (p.items.len == 0)
@@ -277,4 +322,33 @@ test "undo pairs round-trip through the NUL-separated encoding" {
     try t.expectEqualStrings("/d/c d", nth(enc.original, 1).?);
     try t.expectEqual(@as(?[]const u8, null), nth(enc.original, 2));
     try t.expectEqual(@as(usize, 0), count(""));
+}
+
+test "rename chains move occupied targets first without moving parents before children" {
+    const paths = [_][]const u8{ "/d/a---b", "/d/a--b", "/d/a---b/x--y", "/d/a--b/x--y" };
+    var p = try plan(t.allocator, &paths, "--", "-");
+    defer p.deinit(t.allocator);
+    try t.expect(p.ok());
+    var live = std.StringHashMap(void).init(t.allocator);
+    defer live.deinit();
+    for (paths) |path| try live.put(path, {});
+    for (p.items, 0..) |item, i| {
+        try t.expect(live.contains(item.from));
+        try t.expect(!live.contains(item.to));
+        _ = live.remove(item.from);
+        try live.put(item.to, {});
+        for (p.items[i + 1 ..]) |later| try t.expect(!precedes(later, item));
+    }
+    try t.expectEqualStrings("/d/a--b", p.items[p.items.len - 2].from);
+    try t.expectEqualStrings("/d/a---b", p.items[p.items.len - 1].from);
+}
+
+test "cyclic rename dependencies are refused without reordering the plan" {
+    var items = [_]Item{
+        .{ .from = "/a", .to = try t.allocator.dupe(u8, "/b") },
+        .{ .from = "/b", .to = try t.allocator.dupe(u8, "/a") },
+    };
+    defer for (items) |item| t.allocator.free(item.to);
+    try t.expectEqual(@as(?usize, 0), try orderForExecution(t.allocator, &items));
+    try t.expectEqualStrings("/a", items[0].from);
 }

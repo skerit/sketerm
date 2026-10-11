@@ -44,16 +44,22 @@ fn errnoOf(err: fsdrive.Error, last: []const u8) i32 {
         error.Conflict => return c.ESTALE,
         error.FsOpFailed => {},
     }
-    const map = .{
-        .{ "NOENT", c.ENOENT },     .{ "ACCES", c.EACCES },
-        .{ "EXIST", c.EEXIST },     .{ "NOTEMPTY", c.ENOTEMPTY },
-        .{ "NOTDIR", c.ENOTDIR },   .{ "ISDIR", c.EISDIR },
-        .{ "INVAL", c.EINVAL },     .{ "PERM", c.EPERM },
-        .{ "NOSPC", c.ENOSPC },     .{ "XDEV", c.EXDEV },
-        .{ "ROFS", c.EROFS },       .{ "NAMETOOLONG", c.ENAMETOOLONG },
-    };
-    inline for (map) |m| {
-        if (std.mem.indexOf(u8, last, m[0]) != null) return m[1];
+    var start: usize = 0;
+    while (start < last.len) {
+        if (!std.ascii.isAlphanumeric(last[start]) and last[start] != '_') {
+            start += 1;
+            continue;
+        }
+        var end = start + 1;
+        while (end < last.len and (std.ascii.isAlphanumeric(last[end]) or last[end] == '_')) end += 1;
+        const token = last[start..end];
+        // Darwin names these aliases differently from Linux.
+        if (std.mem.eql(u8, token, "NOTSUP")) return c.ENOTSUP;
+        if (std.mem.eql(u8, token, "WOULDBLOCK")) return c.EAGAIN;
+        if (std.meta.stringToEnum(std.posix.E, token)) |code| {
+            if (code != .SUCCESS) return @intCast(@intFromEnum(code));
+        }
+        start = end;
     }
     return c.EIO;
 }
@@ -67,6 +73,15 @@ const DirH = struct {
     listing: fsdrive.Listing,
     path: []u8,
     view_id: u32,
+    stale: bool = false,
+
+    fn refresh(self: *DirH, fs: anytype, offset: u64) fsdrive.Error!void {
+        if (offset != 0 or !self.stale) return;
+        const listing = try fs.list(self.path);
+        self.listing.deinit();
+        self.listing = listing;
+        self.stale = false;
+    }
 };
 
 const PendingPin = struct {
@@ -154,6 +169,7 @@ pub const Mount = struct {
     fn pathOf(self: *Mount, nodeid: u64) ?[]const u8 {
         if (nodeid == 0 or nodeid > self.nodes.items.len) return null;
         const n = self.nodes.items[@intCast(nodeid - 1)] orelse return null;
+        if (self.by_path.get(n.path) != nodeid) return null;
         return n.path;
     }
 
@@ -190,33 +206,81 @@ pub const Mount = struct {
     fn forget(self: *Mount, nodeid: u64, n: u64) void {
         if (nodeid <= 1 or nodeid > self.nodes.items.len) return;
         const slot: usize = @intCast(nodeid - 1);
-        const node = &(self.nodes.items[slot] orelse return);
+        const node = if (self.nodes.items[slot]) |*node| node else return;
         node.nlookup -|= n;
         if (node.nlookup == 0) {
-            _ = self.by_path.remove(node.path);
+            self.unmapNode(nodeid, node.path);
             self.allocator.free(node.path);
             self.nodes.items[slot] = null;
             self.free_ids.append(self.allocator, slot) catch {};
         }
     }
 
-    /// Rewrite node paths after a rename (dir renames carry their
-    /// subtree along).
-    fn renamePaths(self: *Mount, old: []const u8, new: []const u8) void {
-        for (self.nodes.items, 0..) |*maybe, i| {
-            const node = &(maybe.* orelse continue);
-            const p = node.path;
-            const hit = std.mem.startsWith(u8, p, old) and
-                (p.len == old.len or p[old.len] == '/');
-            if (!hit) continue;
-            var buf: [4096]u8 = undefined;
-            const np = std.fmt.bufPrint(&buf, "{s}{s}", .{ new, p[old.len..] }) catch continue;
-            const owned = self.allocator.dupe(u8, np) catch continue;
-            _ = self.by_path.remove(p);
-            self.allocator.free(p);
-            node.path = owned;
-            self.by_path.put(owned, i + 1) catch {};
+    fn unmapNode(self: *Mount, id: u64, path: []const u8) void {
+        if (self.by_path.get(path) == id) _ = self.by_path.remove(path);
+    }
+
+    fn within(path: []const u8, root: []const u8) bool {
+        return std.mem.startsWith(u8, path, root) and
+            (path.len == root.len or path[root.len] == '/');
+    }
+
+    const RenamePaths = struct {
+        const Change = struct { slot: usize, path: []u8 };
+        target: []const u8,
+        changes: std.ArrayList(Change) = .empty,
+
+        fn deinit(self: *RenamePaths, allocator: std.mem.Allocator) void {
+            for (self.changes.items) |change| allocator.free(change.path);
+            self.changes.deinit(allocator);
         }
+
+        fn commit(self: *RenamePaths, mount: *Mount) void {
+            // Overwritten nodes remain allocated until FORGET, but no longer
+            // resolve to the replacement's path or own its hash-table key.
+            for (mount.nodes.items, 0..) |maybe, i| {
+                const node = maybe orelse continue;
+                if (within(node.path, self.target)) mount.unmapNode(i + 1, node.path);
+            }
+            for (self.changes.items) |change| {
+                const node = &mount.nodes.items[change.slot].?;
+                mount.unmapNode(change.slot + 1, node.path);
+            }
+            for (self.changes.items) |*change| {
+                const node = &mount.nodes.items[change.slot].?;
+                mount.allocator.free(node.path);
+                node.path = change.path;
+                // Every inserted node had an entry removed above, so the
+                // original map capacity suffices without a fallible commit.
+                mount.by_path.putAssumeCapacity(node.path, change.slot + 1);
+                change.path = &.{};
+            }
+        }
+    };
+
+    /// Allocate every replacement before the remote rename can commit.
+    fn prepareRenamePaths(self: *Mount, old: []const u8, new: []const u8) !RenamePaths {
+        var prepared: RenamePaths = .{ .target = new };
+        errdefer prepared.deinit(self.allocator);
+        for (self.nodes.items, 0..) |maybe, i| {
+            const node = maybe orelse continue;
+            if (self.by_path.get(node.path) != i + 1 or !within(node.path, old)) continue;
+            const owned = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ new, node.path[old.len..] });
+            errdefer self.allocator.free(owned);
+            try prepared.changes.append(self.allocator, .{ .slot = i, .path = owned });
+        }
+        return prepared;
+    }
+
+    /// A successful rename leaves its source present when both names already refer to the same inode.
+    fn renameKeptSource(fs: anytype, allocator: std.mem.Allocator, old: []const u8, new: []const u8) bool {
+        if (std.mem.eql(u8, old, new)) return true;
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const source = fs.statPath(arena.allocator(), old) catch return false;
+        if (source.ino == 0) return false;
+        const target = fs.statPath(arena.allocator(), new) catch return false;
+        return source.dev == target.dev and source.ino == target.ino;
     }
 
     fn renameDirHandles(self: *Mount, old: []const u8, new: []const u8) void {
@@ -230,13 +294,13 @@ pub const Mount = struct {
             const new_view = self.next_view;
             self.next_view +%= 1;
             if (self.next_view == 0) self.next_view = 1;
-            const listing = self.fs.openView(new_view, replacement) catch {
+            var listing = self.fs.openView(new_view, replacement) catch {
                 self.allocator.free(replacement);
                 continue;
             };
             const old_view = dh.view_id;
-            dh.listing.deinit();
-            dh.listing = listing;
+            listing.deinit();
+            dh.stale = true;
             self.allocator.free(dh.path);
             dh.path = replacement;
             dh.view_id = new_view;
@@ -421,7 +485,7 @@ fn replyBytes(fd: c_int, unique: u64, payload: []const u8) void {
     hdr.unique = unique;
     var iov = [_]c.struct_iovec{
         .{ .iov_base = @ptrCast(&hdr), .iov_len = @sizeOf(c.struct_fuse_out_header) },
-        .{ .iov_base = @constCast(@ptrCast(payload.ptr)), .iov_len = payload.len },
+        .{ .iov_base = @ptrCast(@constCast(payload.ptr)), .iov_len = payload.len },
     };
     while (true) {
         const n = c.writev(fd, &iov, 2);
@@ -459,7 +523,7 @@ fn notifyInvalEntry(fd: c_int, parent: u64, name: []const u8) void {
     var iov = [_]c.struct_iovec{
         .{ .iov_base = @ptrCast(&hdr), .iov_len = @sizeOf(c.struct_fuse_out_header) },
         .{ .iov_base = @ptrCast(&out), .iov_len = @sizeOf(c.struct_fuse_notify_inval_entry_out) },
-        .{ .iov_base = @constCast(@ptrCast(name.ptr)), .iov_len = name.len },
+        .{ .iov_base = @ptrCast(@constCast(name.ptr)), .iov_len = name.len },
     };
     _ = c.writev(fd, &iov, iov.len);
 }
@@ -591,12 +655,8 @@ fn processDeltas(m: *Mount) void {
                 invalidateCached(m, full);
                 if (m.by_path.get(full)) |nodeid| queueInvalInode(m, nodeid);
             }
-            if (!delta.gone) {
-                if (m.fs.list(dh.path)) |listing| {
-                    dh.listing.deinit();
-                    dh.listing = listing;
-                } else |_| {}
-            }
+            // READDIR cookies index this handle's snapshot until rewind.
+            dh.stale = true;
             break;
         }
     }
@@ -884,6 +944,8 @@ fn dispatch(m: *Mount, req: []align(8) u8) void {
         c.FUSE_READDIR => {
             const in: *const c.struct_fuse_read_in = @ptrCast(@alignCast(body.ptr));
             const dh = m.dirs.get(in.fh) orelse return replyErr(fd, u, c.EBADF);
+            dh.refresh(m.fs, in.offset) catch |err|
+                return replyErr(fd, u, errnoOf(err, m.fs.lastErr()));
             var out_buf: [64 * 1024]u8 align(8) = undefined;
             var w: usize = 0;
             var idx: u64 = in.offset;
@@ -915,7 +977,7 @@ fn dispatch(m: *Mount, req: []align(8) u8) void {
                 de.ino = ino;
                 de.off = idx + 1;
                 de.namelen = @intCast(name.len);
-                de.@"type" = mode_type;
+                de.type = mode_type;
                 @memcpy(out_buf[w + @sizeOf(c.struct_fuse_dirent) ..][0..name.len], name);
                 @memset(out_buf[w + rec .. w + padded], 0);
                 w += padded;
@@ -1121,12 +1183,18 @@ fn dispatch(m: *Mount, req: []align(8) u8) void {
             var b2: [4096]u8 = undefined;
             const oldp = Mount.joinChild(&b1, parent, old_name) orelse return replyErr(fd, u, c.ENAMETOOLONG);
             const newp = Mount.joinChild(&b2, nparent, new_name) orelse return replyErr(fd, u, c.ENAMETOOLONG);
+            var renamed = m.prepareRenamePaths(oldp, newp) catch return replyErr(fd, u, c.ENOMEM);
+            defer renamed.deinit(m.allocator);
             m.fs.rename(oldp, newp) catch |err| return replyErr(fd, u, errnoOf(err, m.fs.lastErr()));
-            m.renameCachedPaths(oldp, newp);
             queueInvalEntry(m, hdr.nodeid, old_name);
             queueInvalEntry(m, newdir, new_name);
-            m.renameDirHandles(oldp, newp);
-            m.renamePaths(oldp, newp);
+            // Our node ids are per path, so the kernel cannot detect remote
+            // hardlink aliases itself; preserve both handles on that no-op.
+            if (!Mount.renameKeptSource(m.fs, m.allocator, oldp, newp)) {
+                m.renameCachedPaths(oldp, newp);
+                m.renameDirHandles(oldp, newp);
+                renamed.commit(m);
+            }
             replyBytes(fd, u, "");
         },
         c.FUSE_SYMLINK => {
@@ -1338,7 +1406,9 @@ test "renamePaths rewrites the subtree" {
     _ = try m.ensureNode("/old");
     _ = try m.ensureNode("/old/child");
     _ = try m.ensureNode("/oldish"); // prefix but NOT under /old
-    m.renamePaths("/old", "/new");
+    var renamed = try m.prepareRenamePaths("/old", "/new");
+    defer renamed.deinit(t.allocator);
+    renamed.commit(m);
     try t.expect(m.by_path.get("/new") != null);
     try t.expect(m.by_path.get("/new/child") != null);
     try t.expect(m.by_path.get("/oldish") != null);
@@ -1350,6 +1420,155 @@ test "errnoOf maps daemon errno names" {
     if (comptime !is_linux) return error.SkipZigTest;
     try t.expectEqual(@as(i32, c.ENOENT), errnoOf(error.FsOpFailed, "NOENT"));
     try t.expectEqual(@as(i32, c.EACCES), errnoOf(error.FsOpFailed, "open src: ACCES"));
+    try t.expectEqual(@as(i32, c.ELOOP), errnoOf(error.FsOpFailed, "open: LOOP"));
+    try t.expectEqual(@as(i32, c.EBUSY), errnoOf(error.FsOpFailed, "remove (BUSY)"));
+    try t.expectEqual(@as(i32, c.ENOTSUP), errnoOf(error.FsOpFailed, "copy: NOTSUP"));
+    try t.expectEqual(@as(i32, c.EOPNOTSUPP), errnoOf(error.FsOpFailed, "copy: OPNOTSUPP"));
+    try t.expectEqual(@as(i32, c.EIO), errnoOf(error.FsOpFailed, "NOTPERMITTED"));
+    try t.expectEqual(@as(i32, c.EIO), errnoOf(error.FsOpFailed, "NOENT_suffix"));
+    try t.expectEqual(@as(i32, c.EIO), errnoOf(error.FsOpFailed, "SUCCESS"));
     try t.expectEqual(@as(i32, c.EIO), errnoOf(error.FsOpFailed, "weird"));
     try t.expectEqual(@as(i32, c.EIO), errnoOf(error.Timeout, ""));
+}
+
+test "rename-over preserves the replacement node and its owned key after forget" {
+    const t = std.testing;
+    if (comptime !is_linux) return error.SkipZigTest;
+    var fs_dummy: fsdrive.Fs = undefined;
+    const m = try Mount.init(t.allocator, &fs_dummy, "/", "test-rename-over", -1);
+    defer m.deinit();
+    const target = try m.ensureNode("/target");
+    const target_child = try m.ensureNode("/target/old-child");
+    const source = try m.ensureNode("/source");
+    const source_child = try m.ensureNode("/source/new-child");
+    m.nodes.items[@intCast(target - 1)].?.nlookup = 2;
+    m.nodes.items[@intCast(source - 1)].?.nlookup = 1;
+    var renamed = try m.prepareRenamePaths("/source", "/target");
+    defer renamed.deinit(t.allocator);
+    renamed.commit(m);
+    try t.expectEqual(source, m.by_path.get("/target").?);
+    try t.expectEqual(source_child, m.by_path.get("/target/new-child").?);
+    try t.expect(m.by_path.get("/target/old-child") == null);
+    try t.expect(m.pathOf(target) == null);
+    try t.expect(m.pathOf(target_child) == null);
+    try t.expect(m.by_path.getEntry("/target").?.key_ptr.ptr == m.nodes.items[@intCast(source - 1)].?.path.ptr);
+    m.forget(target, 1);
+    try t.expectEqual(@as(u64, 1), m.nodes.items[@intCast(target - 1)].?.nlookup);
+    m.forget(target, 1);
+    m.forget(target_child, 1);
+    try t.expectEqual(source, try m.ensureNode("/target"));
+    try t.expectEqualStrings("/target", m.pathOf(source).?);
+    const recreated = try m.ensureNode("/target/old-child");
+    try t.expectEqualStrings("/target/old-child", m.pathOf(recreated).?);
+}
+
+test "rename preparation leaves every old mapping intact on allocation failure" {
+    if (comptime !is_linux) return error.SkipZigTest;
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const t = std.testing;
+            var fs_dummy: fsdrive.Fs = undefined;
+            const m = try Mount.init(t.allocator, &fs_dummy, "/", "test-rename-oom", -1);
+            defer m.deinit();
+            const source = try m.ensureNode("/source");
+            const child = try m.ensureNode("/source/child");
+            const target = try m.ensureNode("/target");
+            m.allocator = allocator;
+            defer m.allocator = t.allocator;
+            var renamed = m.prepareRenamePaths("/source", "/target") catch |err| {
+                try t.expectEqual(source, m.by_path.get("/source").?);
+                try t.expectEqual(child, m.by_path.get("/source/child").?);
+                try t.expectEqual(target, m.by_path.get("/target").?);
+                try t.expectEqualStrings("/source", m.pathOf(source).?);
+                return err;
+            };
+            defer renamed.deinit(allocator);
+            renamed.commit(m);
+            try t.expectEqual(source, m.by_path.get("/target").?);
+            try t.expectEqual(child, m.by_path.get("/target/child").?);
+        }
+    }.run, .{});
+}
+
+test "directory snapshots survive changes until rewind and failed refresh keeps the snapshot" {
+    const t = std.testing;
+    const Reader = struct {
+        calls: usize = 0,
+        fail: bool = false,
+
+        fn list(self: *@This(), path: []const u8) fsdrive.Error!fsdrive.Listing {
+            self.calls += 1;
+            if (self.fail) return error.NotConnected;
+            var listing: fsdrive.Listing = .{ .arena = std.heap.ArenaAllocator.init(t.allocator) };
+            errdefer listing.deinit();
+            listing.path = try listing.arena.allocator().dupe(u8, path);
+            listing.entries = try listing.arena.allocator().alloc(fsdrive.Entry, 1);
+            listing.entries[0] = .{ .name = "new", .kind = "file" };
+            return listing;
+        }
+    };
+    var reader: Reader = .{};
+    var old_entries = [_]fsdrive.Entry{.{ .name = "old", .kind = "file" }};
+    var path = "/dir".*;
+    var dh: DirH = .{
+        .listing = .{ .arena = std.heap.ArenaAllocator.init(t.allocator), .entries = &old_entries },
+        .path = &path,
+        .view_id = 1,
+        .stale = true,
+    };
+    defer dh.listing.deinit();
+    try dh.refresh(&reader, 3);
+    try t.expectEqual(@as(usize, 0), reader.calls);
+    try t.expectEqualStrings("old", dh.listing.entries[0].name);
+    reader.fail = true;
+    try t.expectError(error.NotConnected, dh.refresh(&reader, 0));
+    try t.expect(dh.stale);
+    try t.expectEqualStrings("old", dh.listing.entries[0].name);
+    reader.fail = false;
+    try dh.refresh(&reader, 0);
+    try t.expect(!dh.stale);
+    try t.expectEqualStrings("new", dh.listing.entries[0].name);
+    try dh.refresh(&reader, 0);
+    try t.expectEqual(@as(usize, 2), reader.calls);
+}
+
+test "successful hardlink rename preserves both live node handles" {
+    const t = std.testing;
+    if (comptime !is_linux) return error.SkipZigTest;
+    const Probe = struct {
+        source: fsdrive.Entry = .{ .name = "source", .kind = "file", .dev = 7, .ino = 42 },
+        target: fsdrive.Entry = .{ .name = "target", .kind = "file", .dev = 7, .ino = 42 },
+        source_exists: bool = true,
+
+        fn statPath(self: *@This(), _: std.mem.Allocator, path: []const u8) fsdrive.Error!fsdrive.Entry {
+            if (std.mem.eql(u8, path, "/source")) {
+                if (!self.source_exists) return error.FsOpFailed;
+                return self.source;
+            }
+            return self.target;
+        }
+    };
+    var fs_dummy: fsdrive.Fs = undefined;
+    const m = try Mount.init(t.allocator, &fs_dummy, "/", "test-rename-hardlinks", -1);
+    defer m.deinit();
+    const source = try m.ensureNode("/source");
+    const target = try m.ensureNode("/target");
+    var renamed = try m.prepareRenamePaths("/source", "/target");
+    defer renamed.deinit(t.allocator);
+    var probe: Probe = .{};
+    const unchanged = Mount.renameKeptSource(&probe, t.allocator, "/source", "/target");
+    try t.expect(unchanged);
+    if (!unchanged) renamed.commit(m);
+    try t.expectEqual(source, m.by_path.get("/source").?);
+    try t.expectEqual(target, m.by_path.get("/target").?);
+    try t.expectEqualStrings("/source", m.pathOf(source).?);
+    try t.expectEqualStrings("/target", m.pathOf(target).?);
+    probe.target.dev += 1;
+    try t.expect(!Mount.renameKeptSource(&probe, t.allocator, "/source", "/target"));
+    probe.target = probe.source;
+    probe.source.ino = 0;
+    probe.target.ino = 0;
+    try t.expect(!Mount.renameKeptSource(&probe, t.allocator, "/source", "/target"));
+    probe.source_exists = false;
+    try t.expect(!Mount.renameKeptSource(&probe, t.allocator, "/source", "/target"));
 }

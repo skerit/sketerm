@@ -2663,16 +2663,14 @@ pub const Screen = struct {
         }
     }
 
-    /// A recoverable parser error reached the main thread (the payload was
-    /// still applied best-effort). Logged here rather than on the worker so
-    /// it travels through the normal event pipeline, including over mux.
+    /// Log a control string the parser refused (over the size cap or failed to allocate) to stderr.
     fn onParseError(pe: Event.ParseError) void {
         const what = switch (pe.kind) {
             .dcs_truncated => "DCS",
             .osc_truncated => "OSC",
             .apc_truncated => "APC",
         };
-        std.debug.print("sketerm: {s} payload truncated (too long)\n", .{what});
+        std.debug.print("sketerm: {s} payload rejected (size limit or allocation failure)\n", .{what});
     }
 
     /// Reply current fg/bg/cursor color in xterm `rgb:RRRR/GGGG/BBBB` form.

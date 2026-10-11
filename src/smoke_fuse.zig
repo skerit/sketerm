@@ -104,8 +104,10 @@ pub fn main() u8 {
 
     var sbuf: [64]u8 = undefined;
     const src = mkTmp(&sbuf, "src");
+    defer pathz.removeTree(src);
     var mbuf: [64]u8 = undefined;
     const mnt = mkTmp(&mbuf, "mnt");
+    defer pathz.removeTree(mnt);
     writeFile(src, "hello.txt", "content over fuse\n");
     {
         var z: [4096]u8 = undefined;
@@ -134,6 +136,7 @@ pub fn main() u8 {
         std.debug.print("smoke-fuse: SKIP (fusermount3 present but mount denied)\n", .{});
         return 0;
     };
+    defer _ = c.close(fuse_fd);
     const sth = std.Thread.spawn(.{}, serveMain, .{ allocator, &fs, src, fuse_fd }) catch fail("serve thread");
 
     // ── readdir sees the source tree ───────────────────────────
@@ -150,6 +153,41 @@ pub fn main() u8 {
         }
         _ = c.closedir(dir);
         if (!found_hello or !found_sub) fail("readdir missing entries");
+    }
+
+    // Long names force multiple READDIR pages while each unlink produces a delta.
+    std.debug.print("smoke-fuse: stage readdir-unlink\n", .{});
+    {
+        var source_buf: [4096:0]u8 = undefined;
+        const source_dir = std.fmt.bufPrintZ(&source_buf, "{s}/enumerate", .{src}) catch unreachable;
+        if (c.mkdir(source_dir.ptr, 0o700) != 0) fail("enumeration fixture mkdir");
+        const padding = [_]u8{'x'} ** 96;
+        for (0..500) |i| {
+            var name_buf: [128]u8 = undefined;
+            const name = std.fmt.bufPrint(&name_buf, "file-{d:0>4}-{s}", .{ i, padding }) catch unreachable;
+            writeFile(source_dir, name, "");
+        }
+        var mounted_buf: [4096:0]u8 = undefined;
+        const mounted_dir = std.fmt.bufPrintZ(&mounted_buf, "{s}/enumerate", .{mnt}) catch unreachable;
+        const dir = c.opendir(mounted_dir.ptr) orelse fail("enumeration fixture opendir");
+        defer _ = c.closedir(dir);
+        var removed: usize = 0;
+        while (c.readdir(dir)) |entry| {
+            const name = std.mem.span(@as([*:0]const u8, @ptrCast(&entry.*.d_name)));
+            if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+            var file_buf: [4096:0]u8 = undefined;
+            const file = std.fmt.bufPrintZ(&file_buf, "{s}/{s}", .{ mounted_dir, name }) catch unreachable;
+            if (c.unlink(file.ptr) != 0) fail("unlink enumerated file");
+            removed += 1;
+        }
+        if (removed != 500) fail("readdir skipped entries after an unlink");
+        c.rewinddir(dir);
+        while (c.readdir(dir)) |entry| {
+            const name = std.mem.span(@as([*:0]const u8, @ptrCast(&entry.*.d_name)));
+            if (!std.mem.eql(u8, name, ".") and !std.mem.eql(u8, name, ".."))
+                fail("rewind did not refresh the directory snapshot");
+        }
+        if (c.rmdir(mounted_dir.ptr) != 0) fail("enumerated directory was not emptied");
     }
 
     // ── read content (small + multi-chunk) ─────────────────────
@@ -215,6 +253,40 @@ pub fn main() u8 {
         if (tn <= 0 or !std.mem.eql(u8, tgt[0..@intCast(tn)], "hello.txt")) fail("readlink via fuse");
         if (c.unlink(pathz.pathZ(&z, ln) catch unreachable) != 0) fail("unlink via fuse");
         if (c.rmdir(pathz.pathZ(&z2, rd) catch unreachable) != 0) fail("rmdir via fuse");
+    }
+
+    std.debug.print("smoke-fuse: stage hardlink-rename\n", .{});
+    {
+        writeFile(src, "hardlink-a", "hardlink content\n");
+        var source_a: [4096:0]u8 = undefined;
+        var source_b: [4096:0]u8 = undefined;
+        const a = std.fmt.bufPrintZ(&source_a, "{s}/hardlink-a", .{src}) catch unreachable;
+        const b = std.fmt.bufPrintZ(&source_b, "{s}/hardlink-b", .{src}) catch unreachable;
+        if (c.link(a.ptr, b.ptr) != 0) fail("hardlink fixture");
+        var mount_a: [4096:0]u8 = undefined;
+        var mount_b: [4096:0]u8 = undefined;
+        const ma = std.fmt.bufPrintZ(&mount_a, "{s}/hardlink-a", .{mnt}) catch unreachable;
+        const mb = std.fmt.bufPrintZ(&mount_b, "{s}/hardlink-b", .{mnt}) catch unreachable;
+        const fa = c.open(ma.ptr, c.O_RDONLY | c.O_CLOEXEC);
+        if (fa < 0) fail("open first hardlink");
+        defer _ = c.close(fa);
+        const fb = c.open(mb.ptr, c.O_RDONLY | c.O_CLOEXEC);
+        if (fb < 0) fail("open second hardlink");
+        defer _ = c.close(fb);
+        if (c.rename(ma.ptr, mb.ptr) != 0) fail("rename hardlink onto alias");
+        for ([_]c_int{ fa, fb }) |file| {
+            var buf: [32]u8 = undefined;
+            const n = c.pread(file, &buf, buf.len, 0);
+            if (n != "hardlink content\n".len or !std.mem.eql(u8, buf[0..@intCast(n)], "hardlink content\n"))
+                fail("hardlink rename invalidated a live handle");
+        }
+        var sa: c.struct_stat = undefined;
+        var sb: c.struct_stat = undefined;
+        if (c.stat(a.ptr, &sa) != 0 or c.stat(b.ptr, &sb) != 0 or sa.st_ino != sb.st_ino)
+            fail("hardlink rename changed the backing paths");
+        // Attribute revalidation must still resolve each old node id.
+        if (c.fstat(fa, &sa) != 0 or c.fstat(fb, &sb) != 0)
+            fail("hardlink rename lost an open node");
     }
 
     // ── O_TRUNC rewrite keeps content coherent ─────────────────

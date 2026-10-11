@@ -289,11 +289,9 @@ pub fn connectAndPump(endpoint_text: []const u8, destination: []const u8, port_t
     try pump(fd, stdin_fd, stdout_fd);
 }
 
-fn sigNoop(_: c_int) callconv(.c) void {}
-
 /// Hidden command entry point; its route is argv-only and its environment is discarded.
 pub fn serve(endpoint: []const u8, destination: []const u8, port: []const u8) u8 {
-    _ = c.signal(c.SIGPIPE, &sigNoop);
+    platform.ignoreSigpipe();
     platform.clearEnvironment();
     connectAndPump(endpoint, destination, port, 0, 1) catch |err| {
         _ = c.fprintf(platform.stderr(), "sketerm SOCKS5 proxy: %s\n", @as([*:0]const u8, @errorName(err)));

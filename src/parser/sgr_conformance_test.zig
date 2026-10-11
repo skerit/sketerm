@@ -42,6 +42,11 @@ test "DECRQSS m: a reset style reports a bare 0" {
     try expectReport("\x1b[0m", "0");
 }
 
+test "SGR trailing omitted parameters keep their reset semantics" {
+    try expectReport("\x1b[1;31;m", "0");
+    try expectReport("\x1b[31;4:3m\x1b[4:m", "0;31");
+}
+
 test "DECRQSS m: every attribute is reported in xterm order" {
     try expectReport("\x1b[1;2;3;4;5;6;7;8;9;53m", "0;1;2;3;4;5;6;7;8;9;53");
 }

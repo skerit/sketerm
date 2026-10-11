@@ -33,8 +33,6 @@ const uniqueName = @import("../filebrowser/paths.zig").uniqueName;
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
-fn sigNoop(_: c_int) callconv(.c) void {}
-
 const nowMs = @import("../util/clock.zig").nowMs;
 
 /// Every verb the `--job` helper runs. The wire verb IS the tag name
@@ -432,7 +430,7 @@ pub fn serve(allocator: std.mem.Allocator) u8 {
     durable_state = .{};
     // A daemon restart closes the progress pipe. The operation must
     // continue rather than dying from SIGPIPE while reporting progress.
-    _ = c.signal(c.SIGPIPE, &sigNoop);
+    platform.ignoreSigpipe();
     // Roomy enough for a media_meta batch: one line carries a base
     // directory plus a name list the daemon caps at 16 KiB, and every
     // separator costs six bytes once JSON-escaped.

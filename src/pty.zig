@@ -119,7 +119,7 @@ pub const Pty = struct {
     /// writable (the daemon ORs POLLOUT in while `queuedBytes` > 0).
     /// Uses `std.heap.c_allocator`, independent of any caller's.
     write_queue: std.ArrayList(u8) = .empty,
-    /// Bytes refused at `WRITE_QUEUE_CAP` since the queue last ran
+    /// Bytes refused by a write or `WRITE_QUEUE_CAP` since the queue last ran
     /// empty. The owner reports the first refusal of an episode
     /// (`WriteResult.first_drop`) and the total when the queue drains
     /// (`flushQueue` returns it in `.drained`), so a hung child costs
@@ -131,11 +131,12 @@ pub const Pty = struct {
         delivered: usize,
         /// Bytes parked in `write_queue` by this call.
         queued: usize,
-        /// Bytes refused because the queue is at `WRITE_QUEUE_CAP`.
+        /// Bytes refused by a write, allocation failure, or `WRITE_QUEUE_CAP`.
         dropped: usize,
         /// `dropped > 0` and nothing had been dropped since the queue
         /// last drained: the caller's cue to log the refusal.
         first_drop: bool,
+        failure: ?std.posix.E = null,
     };
 
     pub const Flush = union(enum) {
@@ -485,12 +486,7 @@ pub const Pty = struct {
         self.write_queue.deinit(std.heap.c_allocator);
     }
 
-    /// Try a non-blocking write. Bytes that don't fit (EAGAIN) get
-    /// queued and the kernel signals us via POLLOUT when it can take
-    /// more. Caller-visible behaviour: writes never block, queue
-    /// preserves order across calls. Never blocks and never spins:
-    /// what the kernel refuses is queued for `flushQueue`, and only
-    /// bytes past `WRITE_QUEUE_CAP` are refused (reported, not silent).
+    /// Queue backpressure without blocking, reporting any bytes refused by the queue or a hard write failure.
     pub fn writeAll(self: *Pty, bytes: []const u8) WriteResult {
         // Preserve ordering: if there's already queued data, append
         // and let the drain flush it. A direct write here would race
@@ -508,11 +504,9 @@ pub const Pty = struct {
                     // owner's POLLOUT drain.
                     return self.queueBytes(bytes[written..], written);
                 }
-                // Real error (EBADF, EIO, EPIPE, ...) — return what
-                // we managed; caller can't do much about it.
-                break;
+                return self.failedWrite(bytes.len, written, errn);
             }
-            if (n == 0) break;
+            if (n == 0) return self.failedWrite(bytes.len, written, .IO);
             written += @intCast(n);
         }
         return .{ .delivered = written, .queued = 0, .dropped = 0, .first_drop = false };
@@ -522,6 +516,23 @@ pub const Pty = struct {
     /// the daemon's cue to poll the master for POLLOUT.
     pub fn queuedBytes(self: *const Pty) usize {
         return self.write_queue.items.len;
+    }
+
+    fn failedWrite(self: *Pty, total: usize, written: usize, failure: std.posix.E) WriteResult {
+        const dropped = total - written;
+        return .{
+            .delivered = written,
+            .queued = 0,
+            .dropped = dropped,
+            .first_drop = self.noteDropped(dropped),
+            .failure = failure,
+        };
+    }
+
+    fn noteDropped(self: *Pty, dropped: usize) bool {
+        const first_drop = dropped > 0 and self.dropped_since_full == 0;
+        self.dropped_since_full +|= dropped;
+        return first_drop;
     }
 
     /// Append to the user-space queue, capped to `WRITE_QUEUE_CAP`
@@ -539,8 +550,7 @@ pub const Pty = struct {
             };
         }
         const dropped = bytes.len - take;
-        const first_drop = dropped > 0 and self.dropped_since_full == 0;
-        self.dropped_since_full += dropped;
+        const first_drop = self.noteDropped(dropped);
         return .{ .delivered = delivered, .queued = take, .dropped = dropped, .first_drop = first_drop };
     }
 
@@ -588,7 +598,6 @@ pub const Pty = struct {
         self.dropped_since_full = 0;
         return lost;
     }
-
 };
 
 test "writeAll: input past a sleeping child is queued, never spun on or lost" {
@@ -675,6 +684,22 @@ test "writeAll: refusal past WRITE_QUEUE_CAP is bounded and reported once per ep
     try std.testing.expect(total_dropped > 0);
     try std.testing.expectEqual(@as(usize, 1), first_drops);
     try std.testing.expectEqual(total_dropped, pty.dropped_since_full);
+}
+
+test "writeAll reports hard failures without silently losing input" {
+    var pty = Pty{ .master_fd = -1, .child_pid = -1 };
+    defer pty.releaseWriteResources();
+    const first = pty.writeAll("lost input");
+    try std.testing.expectEqual(@as(usize, 10), first.dropped);
+    try std.testing.expectEqual(@as(usize, 0), first.delivered + first.queued);
+    try std.testing.expect(first.first_drop);
+    try std.testing.expectEqual(std.posix.E.BADF, first.failure.?);
+    const second = pty.writeAll("more");
+    try std.testing.expectEqual(@as(usize, 4), second.dropped);
+    try std.testing.expect(!second.first_drop);
+    try std.testing.expectEqual(@as(usize, 14), pty.dropped_since_full);
+    try std.testing.expectEqual(@as(usize, 14), pty.flushQueue().drained);
+    try std.testing.expect(pty.writeAll("new episode").first_drop);
 }
 
 test "spawn: pane identity not exported is ABSENT in the child, never inherited" {

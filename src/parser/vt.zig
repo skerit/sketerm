@@ -208,6 +208,7 @@ pub const Parser = struct {
     // ── State entry helpers ──────────────────────────────────────
 
     fn enterEscape(self: *Parser) void {
+        self.vt52_y_state = 0;
         self.csi = .{};
         self.cur_param = 0;
         self.has_cur_param = false;
@@ -234,13 +235,28 @@ pub const Parser = struct {
     }
 
     fn dispatchDcs(self: *Parser, emit: EmitFn, ctx: ?*anyopaque) void {
-        if (self.osc_truncated) {
-            emit(ctx, .{ .parse_error = .{ .kind = .dcs_truncated } });
-        }
-        const body = self.allocator.dupe(u8, self.osc_buf.items) catch {
-            return;
-        };
+        const body = self.stringBody(.dcs_truncated, emit, ctx) orelse return;
         emit(ctx, .{ .dcs = .{ .proto = self.dcs_proto, .body = body } });
+    }
+
+    fn appendStringByte(self: *Parser, b: u8) void {
+        if (self.osc_truncated) return;
+        if (self.osc_buf.items.len >= osc_max) {
+            self.osc_truncated = true;
+            return;
+        }
+        self.osc_buf.append(self.allocator, b) catch {
+            self.osc_truncated = true;
+        };
+    }
+
+    /// Refuse an incomplete command instead of applying its valid-looking prefix.
+    fn stringBody(self: *Parser, kind: Event.ParseError.Kind, emit: EmitFn, ctx: ?*anyopaque) ?[]u8 {
+        if (!self.osc_truncated) {
+            if (self.allocator.dupe(u8, self.osc_buf.items)) |body| return body else |_| {}
+        }
+        emit(ctx, .{ .parse_error = .{ .kind = kind } });
+        return null;
     }
 
     fn enterOscString(self: *Parser) void {
@@ -257,6 +273,7 @@ pub const Parser = struct {
 
     fn transitionTo(self: *Parser, new: State) void {
         self.state = new;
+        if (new == .ground) self.vt52_y_state = 0;
     }
 
     // ── Per-state byte handlers ──────────────────────────────────
@@ -433,11 +450,19 @@ pub const Parser = struct {
         switch (b) {
             0x00...0x17, 0x19, 0x1C...0x1F => emit(ctx, .{ .execute = b }),
             0x30...0x39 => {
+                if (self.state == .csi_intermediate) {
+                    self.transitionTo(.csi_ignore);
+                    return;
+                }
                 self.has_cur_param = true;
                 self.cur_param = (self.cur_param *| 10) +| (b - '0');
                 self.transitionTo(.csi_param);
             },
             0x3A, 0x3B => {
+                if (self.state == .csi_intermediate) {
+                    self.transitionTo(.csi_ignore);
+                    return;
+                }
                 self.flushParam();
                 if (b == 0x3A) self.next_param_is_sub = true;
                 self.transitionTo(.csi_param);
@@ -458,13 +483,14 @@ pub const Parser = struct {
                 self.transitionTo(.csi_intermediate);
             },
             0x40...0x7E => {
-                if (self.has_cur_param) self.flushParam();
+                if (self.has_cur_param or self.csi.n_params > 0) self.flushParam();
                 if (self.state != .csi_ignore) {
                     self.csi.final = b;
                     emit(ctx, .{ .csi = self.csi });
                 }
                 self.transitionTo(.ground);
             },
+            0x7F => {},
             else => self.transitionTo(.csi_ignore),
         }
     }
@@ -472,12 +498,21 @@ pub const Parser = struct {
     fn byteDcs(self: *Parser, b: u8, emit: EmitFn, ctx: ?*anyopaque) void {
         switch (self.state) {
             .dcs_entry, .dcs_param, .dcs_intermediate => switch (b) {
+                0x00...0x17, 0x19, 0x1C...0x1F, 0x7F => {},
                 0x30...0x39 => {
+                    if (self.state == .dcs_intermediate) {
+                        self.transitionTo(.dcs_ignore);
+                        return;
+                    }
                     self.has_cur_param = true;
                     self.cur_param = self.cur_param *| 10 +| (b - '0');
                     self.transitionTo(.dcs_param);
                 },
                 0x3A, 0x3B => {
+                    if (self.state == .dcs_intermediate) {
+                        self.transitionTo(.dcs_ignore);
+                        return;
+                    }
                     if (self.dcs_proto.n_params < self.dcs_proto.params.len) {
                         const v: u16 = @intCast(@min(if (self.has_cur_param) self.cur_param else 0, std.math.maxInt(u16)));
                         self.dcs_proto.params[self.dcs_proto.n_params] = v;
@@ -495,7 +530,7 @@ pub const Parser = struct {
                     self.transitionTo(.dcs_intermediate);
                 },
                 0x40...0x7E => {
-                    if (self.has_cur_param and self.dcs_proto.n_params < self.dcs_proto.params.len) {
+                    if ((self.has_cur_param or self.dcs_proto.n_params > 0) and self.dcs_proto.n_params < self.dcs_proto.params.len) {
                         const v: u16 = @intCast(@min(self.cur_param, std.math.maxInt(u16)));
                         self.dcs_proto.params[self.dcs_proto.n_params] = v;
                         self.dcs_proto.n_params += 1;
@@ -524,13 +559,7 @@ pub const Parser = struct {
                     self.dispatchDcs(emit, ctx);
                     self.transitionTo(.escape);
                 } else {
-                    if (self.osc_buf.items.len < osc_max) {
-                        self.osc_buf.append(self.allocator, b) catch {
-                            self.osc_truncated = true;
-                        };
-                    } else {
-                        self.osc_truncated = true;
-                    }
+                    self.appendStringByte(b);
                 }
             },
             .dcs_ignore => {
@@ -552,15 +581,7 @@ pub const Parser = struct {
                 self.dispatchOsc(emit, ctx);
                 self.transitionTo(.escape);
             },
-            else => {
-                if (self.osc_buf.items.len < osc_max) {
-                    self.osc_buf.append(self.allocator, b) catch {
-                        self.osc_truncated = true;
-                    };
-                } else {
-                    self.osc_truncated = true;
-                }
-            },
+            else => self.appendStringByte(b),
         }
     }
 
@@ -571,15 +592,7 @@ pub const Parser = struct {
                 self.dispatchApc(emit, ctx);
                 self.transitionTo(.escape);
             },
-            else => {
-                if (self.osc_buf.items.len < osc_max) {
-                    self.osc_buf.append(self.allocator, b) catch {
-                        self.osc_truncated = true;
-                    };
-                } else {
-                    self.osc_truncated = true;
-                }
-            },
+            else => self.appendStringByte(b),
         }
     }
 
@@ -593,27 +606,15 @@ pub const Parser = struct {
     }
 
     fn dispatchOsc(self: *Parser, emit: EmitFn, ctx: ?*anyopaque) void {
-        if (self.osc_truncated) {
-            emit(ctx, .{ .parse_error = .{ .kind = .osc_truncated } });
-        }
-        const bytes = self.allocator.dupe(u8, self.osc_buf.items) catch {
-            self.transitionTo(.ground);
-            return;
-        };
+        defer self.transitionTo(.ground);
+        const bytes = self.stringBody(.osc_truncated, emit, ctx) orelse return;
         emit(ctx, .{ .osc = .{ .bytes = bytes } });
-        self.transitionTo(.ground);
     }
 
     fn dispatchApc(self: *Parser, emit: EmitFn, ctx: ?*anyopaque) void {
-        if (self.osc_truncated) {
-            emit(ctx, .{ .parse_error = .{ .kind = .apc_truncated } });
-        }
-        const bytes = self.allocator.dupe(u8, self.osc_buf.items) catch {
-            self.transitionTo(.ground);
-            return;
-        };
+        defer self.transitionTo(.ground);
+        const bytes = self.stringBody(.apc_truncated, emit, ctx) orelse return;
         emit(ctx, .{ .apc = .{ .bytes = bytes } });
-        self.transitionTo(.ground);
     }
 };
 
@@ -765,6 +766,51 @@ test "csi sgr complex" {
     try std.testing.expectEqual(@as(u32, 0), csi.params[5]);
 }
 
+test "CSI preserves trailing default parameters and subparameters" {
+    const cases = [_]struct { bytes: []const u8, want: []const u16, sub: u16 }{
+        .{ .bytes = "\x1b[31;m", .want = &.{ 31, 0 }, .sub = 0 },
+        .{ .bytes = "\x1b[;m", .want = &.{ 0, 0 }, .sub = 0 },
+        .{ .bytes = "\x1b[4:m", .want = &.{ 4, 0 }, .sub = 2 },
+        .{ .bytes = "\x1b[1;$p", .want = &.{ 1, 0 }, .sub = 0 },
+    };
+    for (cases) |case| {
+        var p = Parser.init(std.testing.allocator);
+        defer p.deinit();
+        var col = TestCollector{ .allocator = std.testing.allocator };
+        defer col.deinit();
+        for (case.bytes) |b| p.advance(&.{b}, TestCollector.emit, &col);
+        try std.testing.expectEqual(@as(usize, 1), col.events.items.len);
+        const csi = col.events.items[0].csi;
+        try std.testing.expectEqualSlices(u16, case.want, csi.params[0..csi.n_params]);
+        try std.testing.expectEqual(case.sub, csi.is_sub_bits);
+    }
+}
+
+test "CSI and DCS reject parameters after intermediates and ignore DEL" {
+    for ([_][]const u8{ "\x1b[1 2m", "\x1b[1 ;m", "\x1bP1$2qbad\x1b\\", "\x1bP1$;qbad\x1b\\" }) |bytes| {
+        var p = Parser.init(std.testing.allocator);
+        defer p.deinit();
+        var col = TestCollector{ .allocator = std.testing.allocator };
+        defer col.deinit();
+        p.advance(bytes, TestCollector.emit, &col);
+        for (col.events.items) |ev| switch (ev) {
+            .csi, .dcs => return error.TestUnexpectedResult,
+            else => {},
+        };
+    }
+    var p = Parser.init(std.testing.allocator);
+    defer p.deinit();
+    var col = TestCollector{ .allocator = std.testing.allocator };
+    defer col.deinit();
+    p.advance("\x1b[1\x7f;2H\x1bP1\x00;\x7fqbody\x07", TestCollector.emit, &col);
+    try std.testing.expectEqual(@as(usize, 2), col.events.items.len);
+    try std.testing.expectEqualSlices(u16, &.{ 1, 2 }, col.events.items[0].csi.params[0..2]);
+    const dcs = col.events.items[1].dcs;
+    try std.testing.expectEqual(@as(u8, 2), dcs.proto.n_params);
+    try std.testing.expectEqualSlices(u16, &.{ 1, 0 }, dcs.proto.params[0..2]);
+    try std.testing.expectEqualStrings("body", dcs.body);
+}
+
 test "csi private decset" {
     var p = Parser.init(std.testing.allocator);
     defer p.deinit();
@@ -857,7 +903,42 @@ test "OSC dispatches on BEL terminator" {
     try std.testing.expect(saw_osc);
 }
 
-test "truncated OSC emits a parse_error event before the payload" {
+test "incomplete string commands are refused and the next command recovers" {
+    const cases = [_]struct { prefix: []const u8, kind: Event.ParseError.Kind }{
+        .{ .prefix = "\x1b]0;partial", .kind = .osc_truncated },
+        .{ .prefix = "\x1b_Gpartial", .kind = .apc_truncated },
+        .{ .prefix = "\x1bPqpartial", .kind = .dcs_truncated },
+    };
+    for (cases) |case| {
+        var p = Parser.init(std.testing.allocator);
+        defer p.deinit();
+        var col = TestCollector{ .allocator = std.testing.allocator };
+        defer col.deinit();
+        p.advance(case.prefix, TestCollector.emit, &col);
+        p.osc_truncated = true;
+        p.advance("\x07\x1b]0;complete\x07", TestCollector.emit, &col);
+        try std.testing.expectEqual(@as(usize, 2), col.events.items.len);
+        try std.testing.expectEqual(case.kind, col.events.items[0].parse_error.kind);
+        try std.testing.expectEqualStrings("0;complete", col.events.items[1].osc.bytes);
+    }
+}
+
+test "string dispatch reports allocation failure without emitting a partial payload" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var p = Parser.init(failing.allocator());
+    defer p.deinit();
+    var col = TestCollector{ .allocator = std.testing.allocator };
+    defer col.deinit();
+    p.advance("\x1b]0;complete", TestCollector.emit, &col);
+    failing.fail_index = failing.alloc_index;
+    p.advance("\x07", TestCollector.emit, &col);
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 1), col.events.items.len);
+    try std.testing.expectEqual(Event.ParseError.Kind.osc_truncated, col.events.items[0].parse_error.kind);
+    try std.testing.expectEqual(State.ground, p.state);
+}
+
+test "truncated OSC emits a parse_error event" {
     var p = Parser.init(std.testing.allocator);
     defer p.deinit();
     var col = TestCollector{ .allocator = std.testing.allocator };
@@ -1027,4 +1108,18 @@ test "VT52 ESC < exits VT52 mode" {
     p.advance("\x1b<", TestCollector.emit, &col);
     defer col.deinit();
     try std.testing.expectEqual(false, p.vt52_mode);
+}
+
+test "VT52 address cancellation cannot consume the following escape command" {
+    for ([_][]const u8{ "\x1bY\x18\x1b<", "\x1bY!\x1a\x1b<", "\x1bY\x1b<" }) |bytes| {
+        var p = Parser.init(std.testing.allocator);
+        defer p.deinit();
+        p.vt52_mode = true;
+        var col = TestCollector{ .allocator = std.testing.allocator };
+        defer col.deinit();
+        p.advance(bytes, TestCollector.emit, &col);
+        try std.testing.expect(!p.vt52_mode);
+        try std.testing.expectEqual(@as(u8, 0), p.vt52_y_state);
+        try std.testing.expectEqual(State.ground, p.state);
+    }
 }
