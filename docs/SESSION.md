@@ -1,5 +1,36 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-11: kitty Unicode placeholders resolve per frame from the grid
+
+opencode's TUI draws images with kitty Unicode placeholders and showed two
+faults in sketerm: a grey box until something scrolled, then strips of the
+image's top rows stacked wherever it had been. Both came from turning each
+U+10EEEE cell into a pinned per-cell placement at print time. opencode
+writes its cells BEFORE the upload, so the image was missing when the cells
+were printed (and U+10EEEE drew as the font's missing-glyph box); and
+nothing ever removed those placements when the app redrew the cells.
+
+A placeholder cell now only records which image cell it shows
+(`Screen.ph_tiles`, keyed by line id + column; moved by ICH/DCH/insert
+mode, re-keyed by reflow, dropped on alt-screen re-entry, pruned at its
+cap). The renderer resolves the tiles of the rows on screen every frame
+(`collectPlaceholderRuns` -> `render/placeholder_draw.zig`, one whole-image
+texture per source in `ImageStore.sourceTexture`), and a tile counts only
+while its cell still holds U+10EEEE in the image's colour, so overwriting
+retires it and a late upload shows without a reprint. `Atlas.lookupGlyph`
+never draws U+10EEEE. Snapshot v12 carries the live tiles and the source
+images they show (sharing `RETAIN_IMAGE_BUDGET`); v11 peers still restore,
+without them. Reflow's position mapping is now one helper
+(`mapReflowProbes`) shared by retained images and tiles.
+
+Tests: image-pipeline cases for late upload, overwrite, the alt-screen
+redraw scroll, scrollback, ICH/DCH, reflow and alt re-entry; a v12
+snapshot round trip; a `smoke-image` stage drawing opencode's sequence on
+real GL with per-cell pixel checks (it caught a `u7` narrowing in the
+batched quad draw that wrapped the vertex byte count); and a smoke-e2e
+stage (`SKETERM_SMOKE_E2E_PLACEHOLDER_ONLY`) running the same sequence
+through PTY, daemon, wire and GUI with screenshot checks.
+
 ## 2026-10-11: guarded OAuth refusals survive late bootstrap loads
 
 CEF can commit a fresh view's initial `about:blank` after a blocked HTTP redirect
