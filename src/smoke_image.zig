@@ -15,6 +15,7 @@ const ImagePass = @import("render/image_pass.zig").ImagePass;
 const ImageStore = @import("grid/image_store.zig").Store;
 const Harness = @import("parser/test_harness.zig").Harness;
 const snapshot = @import("mux/snapshot.zig");
+const placeholder_draw = @import("render/placeholder_draw.zig");
 
 const W: c_int = 256;
 const H: c_int = 64;
@@ -270,6 +271,128 @@ pub fn main() !u8 {
         }
     }
     try std.testing.expectEqual(@as(c_uint, c.GL_NO_ERROR), c.glGetError());
-    std.debug.print("smoke-image: PASS (deferred GL deletion, 64 snapshot replacements, full-frame pixels)\n", .{});
+    if (try placeholderStage(allocator, &pass, &store, fb)) |code| return code;
+    std.debug.print("smoke-image: PASS (deferred GL deletion, 64 snapshot replacements, full-frame pixels, placeholders)\n", .{});
     return 0;
+}
+
+/// Append U+10EEEE with explicit image row/column diacritics.
+fn appendPlaceholder(list: *std.ArrayList(u8), a: std.mem.Allocator, img_row: usize, img_col: usize) !void {
+    const kitty_ph = @import("grid/kitty_placeholder.zig");
+    var buf: [4]u8 = undefined;
+    for ([_]u32{ kitty_ph.PLACEHOLDER, kitty_ph.diacritics[img_row], kitty_ph.diacritics[img_col] }) |cp| {
+        const n = try std.unicode.utf8Encode(@intCast(cp), &buf);
+        try list.appendSlice(a, buf[0..n]);
+    }
+}
+
+/// Render one frame of placeholder tiles and compare every pixel with
+/// `expect` (cell -> colour, black elsewhere). Null on a match.
+fn checkPlaceholderFrame(
+    allocator: std.mem.Allocator,
+    h: *Harness,
+    pass: *ImagePass,
+    store: *ImageStore,
+    scratch: *placeholder_draw.Scratch,
+    fb: []u8,
+    comptime label: []const u8,
+    expect: []const struct { row: usize, col: usize, rgb: [3]u8 },
+) ?u8 {
+    c.glClear(c.GL_COLOR_BUFFER_BIT);
+    placeholder_draw.draw(h.screen, store, pass, scratch, allocator, W, H);
+    c.glFinish();
+    c.glReadPixels(0, 0, W, H, c.GL_RGBA, c.GL_UNSIGNED_BYTE, fb.ptr);
+    // Cell centres only: tiles of a 2x2 image are one texel per cell,
+    // and linear filtering blends texels at the cell edges.
+    for (0..@intCast(@divExact(H, 16))) |row| {
+        for (0..@intCast(@divExact(W, 8))) |col| {
+            var want = [3]u8{ 0, 0, 0 };
+            for (expect) |e| {
+                if (e.row == row and e.col == col) want = e.rgb;
+            }
+            const x = col * 8 + 4;
+            const y = row * 16 + 8;
+            const idx = ((@as(usize, H) - 1 - y) * @as(usize, W) + x) * 4;
+            // Pixel centres sit half a pixel off the texel centres, so
+            // linear filtering blends in a little of the neighbours.
+            var off = false;
+            for (want, fb[idx..][0..3]) |w, got| {
+                if (@abs(@as(i32, w) - got) > 48) off = true;
+            }
+            if (off) {
+                std.debug.print("smoke-image: FAIL {s}: cell ({d},{d}) expected {any}, got {any}\n", .{ label, row, col, want, fb[idx..][0..3] });
+                return 5;
+            }
+        }
+    }
+    return null;
+}
+
+/// Kitty Unicode placeholders, in the order opencode's TUI emits them:
+/// the cells first, the upload and the `U=1` placement after. Then the
+/// app scrolls by redrawing (the image moves up a row, the row it left
+/// is blanked), then deletes the image. Each frame is checked pixel by
+/// pixel, which covers the two reported faults: a box instead of the
+/// image until something reprinted the cells, and stale image strips
+/// left on rows the image had moved away from.
+fn placeholderStage(allocator: std.mem.Allocator, pass: *ImagePass, store: *ImageStore, fb: []u8) !?u8 {
+    std.debug.print("smoke-image: unicode placeholders\n", .{});
+    var h = try Harness.init(allocator, 32, 4);
+    defer h.deinit();
+    var scratch: placeholder_draw.Scratch = .{};
+    defer scratch.deinit(allocator);
+    const red = [3]u8{ 255, 0, 0 };
+    const green = [3]u8{ 0, 255, 0 };
+    const blue = [3]u8{ 0, 0, 255 };
+    const white = [3]u8{ 255, 255, 255 };
+
+    var seq: std.ArrayList(u8) = .empty;
+    defer seq.deinit(allocator);
+    try seq.appendSlice(allocator, "\x1b[?1049h\x1b[3;3H\x1b[38;2;0;0;77m");
+    try appendPlaceholder(&seq, allocator, 0, 0);
+    try appendPlaceholder(&seq, allocator, 0, 1);
+    try seq.appendSlice(allocator, "\x1b[4;3H");
+    try appendPlaceholder(&seq, allocator, 1, 0);
+    try appendPlaceholder(&seq, allocator, 1, 1);
+    try seq.appendSlice(allocator, "\x1b[m");
+    h.feed(seq.items);
+    // Before the upload the cells draw nothing at all.
+    if (checkPlaceholderFrame(allocator, &h, pass, store, &scratch, fb, "before upload", &.{})) |code| return code;
+
+    // 2x2 RGBA: red green / blue white, then the virtual placement.
+    h.feed("\x1b_Ga=t,f=32,s=2,v=2,i=77,q=2;/wAA/wD/AP8AAP///////w==\x1b\\");
+    h.feed("\x1b_Ga=p,U=1,i=77,p=1,c=2,r=2,q=2\x1b\\");
+    if (checkPlaceholderFrame(allocator, &h, pass, store, &scratch, fb, "after upload", &.{
+        .{ .row = 2, .col = 2, .rgb = red },
+        .{ .row = 2, .col = 3, .rgb = green },
+        .{ .row = 3, .col = 2, .rgb = blue },
+        .{ .row = 3, .col = 3, .rgb = white },
+    })) |code| return code;
+
+    // Scroll by redraw: the image now starts on row 1, row 3 is blanked.
+    seq.clearRetainingCapacity();
+    try seq.appendSlice(allocator, "\x1b[2;3H\x1b[38;2;0;0;77m");
+    try appendPlaceholder(&seq, allocator, 0, 0);
+    try appendPlaceholder(&seq, allocator, 0, 1);
+    try seq.appendSlice(allocator, "\x1b[3;3H");
+    try appendPlaceholder(&seq, allocator, 1, 0);
+    try appendPlaceholder(&seq, allocator, 1, 1);
+    try seq.appendSlice(allocator, "\x1b[m\x1b[4;1H\x1b[2K");
+    h.feed(seq.items);
+    if (checkPlaceholderFrame(allocator, &h, pass, store, &scratch, fb, "after redraw scroll", &.{
+        .{ .row = 1, .col = 2, .rgb = red },
+        .{ .row = 1, .col = 3, .rgb = green },
+        .{ .row = 2, .col = 2, .rgb = blue },
+        .{ .row = 2, .col = 3, .rgb = white },
+    })) |code| return code;
+    try std.testing.expectEqual(@as(usize, 1), store.sources.items.len);
+
+    // Deleting the image clears its cells and frees its texture.
+    const tex = store.sources.items[0].gl_tex;
+    h.feed("\x1b_Ga=d,d=I,i=77,q=2\x1b\\");
+    if (checkPlaceholderFrame(allocator, &h, pass, store, &scratch, fb, "after delete", &.{})) |code| return code;
+    try std.testing.expectEqual(@as(usize, 0), store.sources.items.len);
+    try std.testing.expect(c.glIsTexture(tex) == c.GL_FALSE);
+    try std.testing.expectEqual(@as(c_uint, c.GL_NO_ERROR), c.glGetError());
+    return null;
 }

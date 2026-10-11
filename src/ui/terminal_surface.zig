@@ -32,6 +32,7 @@ const CursorTrail = @import("../render/cursor_trail.zig").Trail;
 const gl_mod = @import("../render/gl.zig");
 const scrollbar = @import("../render/scrollbar.zig");
 const ImageStore = @import("../grid/image_store.zig").Store;
+const placeholder_draw = @import("../render/placeholder_draw.zig");
 const Screen = @import("../grid/screen.zig").Screen;
 const Terminal = @import("../terminal.zig").Terminal;
 const termsource = @import("../a11y/termsource.zig");
@@ -129,6 +130,8 @@ pub const TerminalSurface = struct {
     /// sticky across config reloads and profile pushes.
     shader_cleared: bool = false,
     image_store: ImageStore,
+    /// Per-frame scratch for the Unicode-placeholder draw.
+    placeholders: placeholder_draw.Scratch = .{},
     allocator: std.mem.Allocator,
     /// True once the host's pre-widget-destruction hook removed every
     /// callback whose user-data is this surface.
@@ -329,6 +332,7 @@ pub const TerminalSurface = struct {
         self.cell_pass.deinit();
         self.image_pass.deinit();
         self.image_store.deinit();
+        self.placeholders.deinit(self.allocator);
         if (self.shader_own_src) |s| self.allocator.free(s);
         if (self.shader_own_dir) |d| self.allocator.free(d);
         if (self.custom_shader_path) |s| self.allocator.free(s);
@@ -1516,9 +1520,11 @@ fn onRender(area: *c.GtkGLArea, _: *c.GdkGLContext, user: ?*anyopaque) callconv(
     self.grid_pass.draw(atlas, rw, rh);
     if (profile.enabled) profile.record(.grid_draw, @intCast(profile.nanoTimestamp() - t_grid_draw));
 
-    // Foreground images (z >= 0).
+    // Foreground images (z >= 0), placeholder tiles first: they are the
+    // content of their cells, not something placed above the grid.
     {
         const t_img = if (profile.enabled) profile.nanoTimestamp() else 0;
+        placeholder_draw.draw(self.terminal.screen, &self.image_store, &self.image_pass, &self.placeholders, self.allocator, rw, rh);
         self.image_pass.drawZ(&self.image_store, rw, rh, .above);
         if (profile.enabled) img_ns += @intCast(profile.nanoTimestamp() - t_img);
     }

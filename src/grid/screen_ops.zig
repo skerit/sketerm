@@ -656,6 +656,7 @@ pub fn fullReset(self: *Screen) void {
     if (self.preedit_text) |t| self.allocator.free(t);
     self.preedit_text = null;
     self.clearAllClusters();
+    self.ph_tiles.clearRetainingCapacity();
     self.resetTabStops() catch |e| std.debug.print("sketerm: resetTabStops failed: {s}\n", .{@errorName(e)});
     // Bring the parser back to ANSI mode if it's in VT52.
     if (self.sink.on_decanm) |f| f(self.sink.ctx, true);
@@ -985,6 +986,7 @@ pub fn insertChars(self: *Screen, n: u32) void {
     // Shifted cells change column; clusters are keyed by (row, col)
     // and would point at the wrong cells afterwards.
     if (self.clusters.count() > 0) self.clearClustersRange(self.row, col, self.cols);
+    self.shiftPlaceholderTiles(ln.id, col, move);
     // A wide pair straddling the insertion point gets torn apart.
     self.splitWidePair(ln, col);
     // Shift cells right from col by `move`. Last cells fall off.
@@ -1009,6 +1011,7 @@ pub fn deleteChars(self: *Screen, n: u32) void {
     // Shifted cells change column; clusters are keyed by (row, col)
     // and would point at the wrong cells afterwards.
     if (self.clusters.count() > 0) self.clearClustersRange(self.row, col, self.cols);
+    self.shiftPlaceholderTiles(ln.id, col, -@as(i32, move));
     // Wide pairs straddling either edge of the deleted range get
     // torn apart — blank both halves before shifting.
     self.splitWidePair(ln, col);
@@ -1210,6 +1213,9 @@ pub fn toggleAltScreen(self: *Screen, on: bool) void {
     if (fresh) |alt| self.alt = alt;
     if (on) {
         self.use_alt = true;
+        // The alt lines are about to be reborn under fresh ids; the
+        // tiles of the previous alt session would never resolve again.
+        self.dropPlaceholderTilesOf(self.alt.?);
         for (self.alt.?) |*l| {
             l.clear();
             l.id = self.nextLineId();

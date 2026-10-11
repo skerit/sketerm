@@ -1260,6 +1260,13 @@ pub fn main() u8 {
         teardown();
         return 0;
     }
+    if (c.getenv("SKETERM_SMOKE_E2E_PLACEHOLDER_ONLY") != null) {
+        const app = drive orelse return fail("placeholder smoke has no display driver");
+        if (placeholderStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
+        say("placeholders: nothing drawn before the upload, image shown after it, no stale rows after a redraw scroll, gone after delete");
+        teardown();
+        return 0;
+    }
     if (c.getenv("SKETERM_SMOKE_E2E_WORKSPACE_ONLY") != null) {
         const app = drive orelse return fail("focused workspace smoke has no display driver");
         if (workspaceStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
@@ -1441,6 +1448,8 @@ pub fn main() u8 {
     // the seat, the palette's `action` path, and config keys.
     if (drive) |app| {
         if (captureSaveStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
+        if (placeholderStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
+        say("placeholders: late upload shown, redraw scroll leaves no stale rows, delete clears");
         if (workspaceStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
         say("workspace: font, copy/paste keybinds, zoom, close_pane chord, broadcast, find bar, cross search, profile, panel face, pin, restore, shader preset and close buttons");
     }
@@ -16550,6 +16559,180 @@ fn captureSaveStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]
     if (!capturePickPath(app, stale_pick, stale)) return "capture: accept stale pane picker";
     if (c.access(stale.ptr, c.F_OK) == 0) return "capture: closed pane picker captured a replacement pane";
     if (!wsFocus(allocator, sock, 1)) return "capture: GUI stopped responding after stale pick";
+    return null;
+}
+
+/// The bounding box of the pixels close to `rgb`, and how many there are.
+const PixelBox = struct { n: usize = 0, x0: u32 = std.math.maxInt(u32), y0: u32 = std.math.maxInt(u32), x1: u32 = 0, y1: u32 = 0 };
+
+fn pixelBox(shot: appdrive.App.RgbaShot, rgb: [3]u8) PixelBox {
+    var box: PixelBox = .{};
+    var y: u32 = 0;
+    while (y < shot.h) : (y += 1) {
+        var x: u32 = 0;
+        while (x < shot.w) : (x += 1) {
+            const i = (y * shot.w + x) * 4;
+            var near = true;
+            inline for (0..3) |k| {
+                if (@abs(@as(i32, shot.px[i + k]) - rgb[k]) > 12) near = false;
+            }
+            if (!near) continue;
+            box.n += 1;
+            box.x0 = @min(box.x0, x);
+            box.y0 = @min(box.y0, y);
+            box.x1 = @max(box.x1, x + 1);
+            box.y1 = @max(box.y1, y + 1);
+        }
+    }
+    return box;
+}
+
+/// Pump frames until `done` accepts the window's colour box, or 12 s.
+fn waitPixelBox(allocator: std.mem.Allocator, app: *appdrive.App, win: u32, rgb: [3]u8, ctx: anytype, comptime done: fn (@TypeOf(ctx), PixelBox) bool) ?PixelBox {
+    const deadline = clock.nowMs() + 12_000;
+    while (clock.nowMs() < deadline) {
+        _ = app.drainLive(250);
+        const shot = app.snapshotRgba(win, null) catch continue;
+        defer allocator.free(shot.px);
+        const box = pixelBox(shot, rgb);
+        if (done(ctx, box)) return box;
+    }
+    return null;
+}
+
+/// Kitty Unicode placeholders through the real stack (PTY, daemon, wire,
+/// the GUI's Screen, the renderer), in the order opencode's TUI emits
+/// them: cells first, upload and `U=1` placement afterwards. Checks the
+/// two reported faults on pixels: the cells must show nothing (no
+/// missing-glyph box) until the image arrives and then the image without
+/// being printed again; and after the app scrolls by redrawing, the rows
+/// the image left must not keep strips of it.
+fn placeholderStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]const u8, rt: []const u8) ?[]const u8 {
+    const win = wsMainWindow(app) orelse return "placeholders: no GUI window";
+    const rgb = [3]u8{ 255, 0, 200 };
+    const id: u32 = 0x00_00_4D;
+    var frames: [4]std.ArrayList(u8) = .{ .empty, .empty, .empty, .empty };
+    defer for (&frames) |*f| f.deinit(allocator);
+    const Cells = struct {
+        fn put(list: *std.ArrayList(u8), a: std.mem.Allocator, top: usize) !void {
+            const kitty_ph = @import("grid/kitty_placeholder.zig");
+            var buf: [4]u8 = undefined;
+            for (0..2) |r| {
+                const cup = try std.fmt.allocPrint(a, "\x1b[{d};10H\x1b[38;2;0;0;77m", .{top + r});
+                defer a.free(cup);
+                try list.appendSlice(a, cup);
+                for (0..4) |col| {
+                    for ([_]u32{ kitty_ph.PLACEHOLDER, kitty_ph.diacritics[r], kitty_ph.diacritics[col] }) |cp| {
+                        const n = try std.unicode.utf8Encode(@intCast(cp), &buf);
+                        try list.appendSlice(a, buf[0..n]);
+                    }
+                }
+            }
+            try list.appendSlice(a, "\x1b[m\x1b[1;1H");
+        }
+    };
+    // 0: the frame's cells, before any upload.
+    frames[0].appendSlice(allocator, "\x1b[?1049h\x1b[2J") catch return "placeholders: frame alloc";
+    Cells.put(&frames[0], allocator, 12) catch return "placeholders: frame alloc";
+    // 1: the upload (8x4 solid RGBA) and the virtual placement.
+    {
+        var rgba: [8 * 4 * 4]u8 = undefined;
+        for (0..8 * 4) |p| @memcpy(rgba[p * 4 ..][0..4], &[_]u8{ rgb[0], rgb[1], rgb[2], 255 });
+        var b64: [256]u8 = undefined;
+        const enc = std.base64.standard.Encoder.encode(&b64, &rgba);
+        const tx = std.fmt.allocPrint(allocator, "\x1b_Ga=t,f=32,s=8,v=4,i={d},q=2;{s}\x1b\\\x1b_Ga=p,U=1,i={d},p=1,c=4,r=2,q=2\x1b\\", .{ id, enc, id }) catch return "placeholders: frame alloc";
+        defer allocator.free(tx);
+        frames[1].appendSlice(allocator, tx) catch return "placeholders: frame alloc";
+    }
+    // 2: scrolled by redraw: three rows up, the rows it left blanked.
+    Cells.put(&frames[2], allocator, 9) catch return "placeholders: frame alloc";
+    frames[2].appendSlice(allocator, "\x1b[11;1H\x1b[2K\x1b[12;1H\x1b[2K\x1b[13;1H\x1b[2K\x1b[1;1H") catch return "placeholders: frame alloc";
+    // 3: the image deleted.
+    const del = std.fmt.allocPrint(allocator, "\x1b_Ga=d,d=I,i={d},q=2\x1b\\", .{id}) catch return "placeholders: frame alloc";
+    defer allocator.free(del);
+    frames[3].appendSlice(allocator, del) catch return "placeholders: frame alloc";
+
+    var script: std.ArrayList(u8) = .empty;
+    defer script.deinit(allocator);
+    script.appendSlice(allocator, "#!/bin/sh\nstty -echo\n") catch return "placeholders: script alloc";
+    for (&frames, 0..) |*f, i| {
+        var path_buf: [512:0]u8 = undefined;
+        const path = std.fmt.bufPrintZ(&path_buf, "{s}/ph-{d}.bin", .{ rt, i }) catch return "placeholders: frame path";
+        if (!writeFile(path, f.items)) return "placeholders: frame write";
+        const line = std.fmt.allocPrint(allocator, "cat '{s}'; read a\n", .{path}) catch return "placeholders: script alloc";
+        defer allocator.free(line);
+        script.appendSlice(allocator, line) catch return "placeholders: script alloc";
+    }
+    script.appendSlice(allocator, "printf '\\033[?1049l'; stty echo\n") catch return "placeholders: script alloc";
+    var script_buf: [512:0]u8 = undefined;
+    const script_path = std.fmt.bufPrintZ(&script_buf, "{s}/placeholders.sh", .{rt}) catch return "placeholders: script path";
+    if (!writeFile(script_path, script.items)) return "placeholders: script write";
+
+    const pane = wsNewTab(allocator, sock) orelse return "placeholders: open tab";
+    defer _ = wsClosePane(allocator, sock, pane);
+    var req_buf: [768]u8 = undefined;
+    const send = struct {
+        fn f(a: std.mem.Allocator, s: [:0]const u8, p: u32, data: []const u8, buf: []u8) bool {
+            const req = std.fmt.bufPrint(buf, "{{\"cmd\":\"send-text\",\"pane\":{d},\"data\":\"{s}\"}}\n", .{ p, data }) catch return false;
+            const resp = roundtrip(a, s, req) orelse return false;
+            defer a.free(resp);
+            return std.mem.indexOf(u8, resp, "\"ok\":true") != null;
+        }
+    }.f;
+    var cmd_buf: [600]u8 = undefined;
+    const run = std.fmt.bufPrint(&cmd_buf, "sh '{s}'\\n", .{script_path}) catch return "placeholders: command";
+    if (!send(allocator, sock, pane, run, &req_buf)) return "placeholders: start script";
+
+    // Frame 0 settles; keep its pixels to compare once the box is known.
+    _ = app.waitIdle(400, 6_000);
+    const before = app.snapshotRgba(win, null) catch return "placeholders: screenshot before upload";
+    defer allocator.free(before.px);
+    if (pixelBox(before, rgb).n != 0) return "placeholders: image colour visible before the upload";
+
+    if (!send(allocator, sock, pane, "\\n", &req_buf)) return "placeholders: advance to upload";
+    const shown = waitPixelBox(allocator, app, win, rgb, {}, struct {
+        fn f(_: void, b: PixelBox) bool {
+            return b.n > 64;
+        }
+    }.f) orelse return "placeholders: image never appeared after its late upload (cells were not reprinted)";
+    // No missing-glyph box: before the upload, the box held only the
+    // background, the same colour as just right of it.
+    {
+        const sx = @min(shown.x1 + 6, before.w - 1);
+        const sy = (shown.y0 + shown.y1) / 2;
+        const bg = before.px[(sy * before.w + sx) * 4 ..][0..3].*;
+        var y = shown.y0;
+        while (y < shown.y1) : (y += 1) {
+            var x = shown.x0;
+            while (x < shown.x1) : (x += 1) {
+                const px = before.px[(y * before.w + x) * 4 ..][0..3];
+                inline for (0..3) |k| {
+                    if (@abs(@as(i32, px[k]) - bg[k]) > 12) return "placeholders: placeholder cells drew something before their image arrived";
+                }
+            }
+        }
+    }
+    const height = shown.y1 - shown.y0;
+
+    if (!send(allocator, sock, pane, "\\n", &req_buf)) return "placeholders: advance to redraw";
+    const moved = waitPixelBox(allocator, app, win, rgb, shown, struct {
+        fn f(old: PixelBox, b: PixelBox) bool {
+            return b.n > 64 and b.y0 + 4 < old.y0;
+        }
+    }.f) orelse return "placeholders: image did not move up after the redraw";
+    if (moved.y1 - moved.y0 != height)
+        return "placeholders: rows the image left still show strips of it";
+    // Three rows up is one and a half image heights (two rows).
+    const shift = shown.y0 - moved.y0;
+    if (@abs(@as(i64, shift) * 2 - @as(i64, height) * 3) > 4) return "placeholders: image moved by the wrong amount";
+
+    if (!send(allocator, sock, pane, "\\n", &req_buf)) return "placeholders: advance to delete";
+    _ = waitPixelBox(allocator, app, win, rgb, {}, struct {
+        fn f(_: void, b: PixelBox) bool {
+            return b.n == 0;
+        }
+    }.f) orelse return "placeholders: deleted image is still drawn";
+    if (!send(allocator, sock, pane, "\\n", &req_buf)) return "placeholders: finish script";
     return null;
 }
 

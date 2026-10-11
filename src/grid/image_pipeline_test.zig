@@ -510,88 +510,309 @@ fn appendCp(list: *std.ArrayList(u8), a: std.mem.Allocator, cp: u21) !void {
     try list.appendSlice(a, buf[0..n]);
 }
 
+const screen_mod = @import("screen.zig");
+const kitty_ph = @import("kitty_placeholder.zig");
+
+/// 2x2 RGBA: (0,0)=red (1,0)=green (0,1)=blue (1,1)=white.
+const quad_rgba = [_]u8{
+    0xFF, 0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF,
+    0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+};
+
+/// Transmit `quad_rgba` as image `id` with a 2x2-cell virtual placement.
+fn feedQuadImage(h: *Harness, id: u32) !void {
+    var b64_buf: [32]u8 = undefined;
+    const b64 = std.base64.standard.Encoder.encode(&b64_buf, &quad_rgba);
+    var tx_buf: [128]u8 = undefined;
+    h.feed(try std.fmt.bufPrint(&tx_buf, "\x1b_Gi={d},a=T,U=1,f=32,s=2,v=2,c=2,r=2;{s}\x1b\\", .{ id, b64 }));
+}
+
+/// One placeholder cell with explicit row and column diacritics.
+fn appendPlaceholder(list: *std.ArrayList(u8), a: std.mem.Allocator, img_row: usize, img_col: usize) !void {
+    try appendCp(list, a, kitty_ph.PLACEHOLDER);
+    try appendCp(list, a, @intCast(kitty_ph.diacritics[img_row]));
+    try appendCp(list, a, @intCast(kitty_ph.diacritics[img_col]));
+}
+
+/// The placeholder runs on screen right now.
+fn runsOf(h: *Harness) !std.ArrayList(screen_mod.PlaceholderRun) {
+    var runs: std.ArrayList(screen_mod.PlaceholderRun) = .empty;
+    errdefer runs.deinit(std.testing.allocator);
+    try h.screen.collectPlaceholderRuns(std.testing.allocator, &runs);
+    return runs;
+}
+
 // Kitty Unicode placeholder: a U=1 virtual placement registers without
-// drawing; U+10EEEE cells then tile the image. Cell (0,0) with two
-// "row 0 / col 0" diacritics shows the top-left tile.
-test "kitty unicode placeholder tiles the image" {
+// drawing; U+10EEEE cells then name their image cell, which the renderer
+// resolves. Cell (0,0) with two "row 0 / col 0" diacritics shows the
+// top-left tile, and nothing reaches the placement sink.
+test "kitty unicode placeholder records the tile its cell shows" {
     const a = std.testing.allocator;
     var h = try Harness.init(a, 80, 24);
     defer h.deinit();
     h.arm();
 
-    // 2×2 RGBA: (0,0)=red (1,0)=green (0,1)=blue (1,1)=white.
-    const rgba = [_]u8{
-        0xFF, 0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF,
-        0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-    };
-    var b64_buf: [32]u8 = undefined;
-    const b64 = std.base64.standard.Encoder.encode(&b64_buf, &rgba);
-
-    // Transmit + virtual placement: i=5, U=1, 2×2 cell grid (c=2,r=2).
-    var tx_buf: [128]u8 = undefined;
-    const tx = try std.fmt.bufPrint(&tx_buf, "\x1b_Gi=5,a=T,U=1,f=32,s=2,v=2,c=2,r=2;{s}\x1b\\", .{b64});
-    h.feed(tx);
+    try feedQuadImage(&h, 5);
     // Virtual placement does NOT draw at the cursor.
     try std.testing.expect(!h.image.fired);
     try std.testing.expect(h.screen.kitty_images.get(5) != null);
 
     // fg = palette 5 (the image id), then U+10EEEE + row(0) + col(0)
-    // diacritics (0x0305 = index 0), then a newline to finalize.
+    // diacritics, then a newline to finalize.
     var seq = std.ArrayList(u8).empty;
     defer seq.deinit(a);
     try seq.appendSlice(a, "\x1b[38;5;5m");
-    try appendCp(&seq, a, 0x10EEEE);
-    try appendCp(&seq, a, 0x0305); // row 0
-    try appendCp(&seq, a, 0x0305); // col 0
+    try appendPlaceholder(&seq, a, 0, 0);
     try seq.append(a, '\n');
     h.feed(seq.items);
 
-    try std.testing.expect(h.image.fired);
-    // tile_w = 2/2 = 1, tile_h = 1 → single pixel.
-    try std.testing.expectEqual(@as(u32, 1), h.image.width);
-    try std.testing.expectEqual(@as(u32, 1), h.image.height);
-    try std.testing.expectEqual(@as(u32, 5), h.image.image_id);
-    try std.testing.expectEqual(@as(u32, 1), h.image.cells_wide);
-    // Top-left tile is the red pixel.
-    try std.testing.expectEqual(@as(u8, 0xFF), h.image.rgba.?[0]);
-    try std.testing.expectEqual(@as(u8, 0x00), h.image.rgba.?[1]);
-    try std.testing.expectEqual(@as(u8, 0x00), h.image.rgba.?[2]);
+    try std.testing.expect(!h.image.fired);
+    const tile = h.screen.placeholderTileAt(&h.screen.active[0], 0).?;
+    try std.testing.expectEqual(screen_mod.PlaceholderTile{ .image_id = 5, .img_row = 0, .img_col = 0 }, tile);
+    try std.testing.expectEqual(screen_mod.Screen.PlaceholderGrid{ .cols = 2, .rows = 2 }, h.screen.placeholderGrid(5, 10, 20).?);
+    var runs = try runsOf(&h);
+    defer runs.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), runs.items.len);
+    try std.testing.expectEqual(screen_mod.PlaceholderRun{ .display_row = 0, .col = 0, .len = 1, .image_id = 5, .img_row = 0, .img_col = 0 }, runs.items[0]);
 }
 
 // Column auto-increment: a second placeholder cell to the right with
-// only a row diacritic continues to the next image column.
+// only a row diacritic continues to the next image column, so the two
+// cells form one run.
 test "kitty unicode placeholder auto-increments the column" {
     const a = std.testing.allocator;
     var h = try Harness.init(a, 80, 24);
     defer h.deinit();
-    h.arm();
+    try feedQuadImage(&h, 6);
 
-    const rgba = [_]u8{
-        0xFF, 0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF,
-        0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-    };
-    var b64_buf: [32]u8 = undefined;
-    const b64 = std.base64.standard.Encoder.encode(&b64_buf, &rgba);
-    var tx_buf: [128]u8 = undefined;
-    const tx = try std.fmt.bufPrint(&tx_buf, "\x1b_Gi=6,a=T,U=1,f=32,s=2,v=2,c=2,r=2;{s}\x1b\\", .{b64});
-    h.feed(tx);
-
-    // Two placeholder cells: first row 0 col 0 (explicit), second only a
-    // row(0) diacritic → column auto-increments to 1 (the green pixel).
     var seq = std.ArrayList(u8).empty;
     defer seq.deinit(a);
     try seq.appendSlice(a, "\x1b[38;5;6m");
-    try appendCp(&seq, a, 0x10EEEE);
-    try appendCp(&seq, a, 0x0305); // row 0
-    try appendCp(&seq, a, 0x0305); // col 0
-    try appendCp(&seq, a, 0x10EEEE);
-    try appendCp(&seq, a, 0x0305); // row 0 only → col auto = 1
+    try appendPlaceholder(&seq, a, 0, 0);
+    try appendCp(&seq, a, kitty_ph.PLACEHOLDER);
+    try appendCp(&seq, a, @intCast(kitty_ph.diacritics[0])); // row 0 only -> col auto = 1
     try seq.append(a, '\n');
     h.feed(seq.items);
 
-    // The last tile emitted is image column 1 = the green pixel.
-    try std.testing.expect(h.image.fired);
-    try std.testing.expectEqual(@as(u8, 0x00), h.image.rgba.?[0]);
-    try std.testing.expectEqual(@as(u8, 0xFF), h.image.rgba.?[1]);
-    try std.testing.expectEqual(@as(u8, 0x00), h.image.rgba.?[2]);
+    try std.testing.expectEqual(@as(u16, 1), h.screen.placeholderTileAt(&h.screen.active[0], 1).?.img_col);
+    var runs = try runsOf(&h);
+    defer runs.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), runs.items.len);
+    try std.testing.expectEqual(@as(u16, 2), runs.items[0].len);
+    try std.testing.expectEqual(@as(u16, 0), runs.items[0].img_col);
+}
+
+// The order opencode's TUI uses: the frame's cells (with placeholders)
+// are written BEFORE the upload and the U=1 placement. The tile must
+// resolve once the image arrives, without the cells being printed again
+// (the diff renderer never reprints unchanged cells), and the transmit
+// itself must ask for a redraw.
+test "placeholder cells printed before their image resolve when it arrives" {
+    const a = std.testing.allocator;
+    var h = try Harness.init(a, 20, 4);
+    defer h.deinit();
+
+    var seq = std.ArrayList(u8).empty;
+    defer seq.deinit(a);
+    try seq.appendSlice(a, "\x1b[38;2;0;0;9m");
+    try appendPlaceholder(&seq, a, 0, 0);
+    try appendPlaceholder(&seq, a, 0, 1);
+    try seq.appendSlice(a, "\x1b[m");
+    h.feed(seq.items);
+
+    try std.testing.expect(h.screen.placeholderTileAt(&h.screen.active[0], 0) != null);
+    try std.testing.expect(h.screen.placeholderGrid(9, 10, 20) == null);
+    h.screen.dirty = false;
+
+    var b64_buf: [32]u8 = undefined;
+    const b64 = std.base64.standard.Encoder.encode(&b64_buf, &quad_rgba);
+    var tx_buf: [128]u8 = undefined;
+    h.feed(try std.fmt.bufPrint(&tx_buf, "\x1b_Ga=t,f=32,s=2,v=2,i=9,q=2;{s}\x1b\\", .{b64}));
+    try std.testing.expect(h.screen.dirty);
+    h.feed("\x1b_Ga=p,U=1,i=9,p=1,c=2,r=2,q=2\x1b\\");
+    try std.testing.expectEqual(screen_mod.Screen.PlaceholderGrid{ .cols = 2, .rows = 2 }, h.screen.placeholderGrid(9, 10, 20).?);
+    var runs = try runsOf(&h);
+    defer runs.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), runs.items.len);
+    try std.testing.expectEqual(@as(u16, 2), runs.items[0].len);
+}
+
+// Text written over a placeholder cell takes its tile with it. Before
+// tiles were resolved per frame, every placeholder cell became a pinned
+// placement that nothing ever removed.
+test "text over a placeholder cell retires its tile" {
+    const a = std.testing.allocator;
+    var h = try Harness.init(a, 20, 4);
+    defer h.deinit();
+    try feedQuadImage(&h, 5);
+
+    var seq = std.ArrayList(u8).empty;
+    defer seq.deinit(a);
+    try seq.appendSlice(a, "\x1b[38;5;5m");
+    try appendPlaceholder(&seq, a, 0, 0);
+    try appendPlaceholder(&seq, a, 0, 1);
+    try seq.appendSlice(a, "\x1b[m\x1b[1;2HX");
+    h.feed(seq.items);
+
+    try std.testing.expect(h.screen.placeholderTileAt(&h.screen.active[0], 0) != null);
+    try std.testing.expect(h.screen.placeholderTileAt(&h.screen.active[0], 1) == null);
+    // A placeholder of ANOTHER image printed over a recorded cell shows
+    // the new tile, never the old one.
+    seq.clearRetainingCapacity();
+    try seq.appendSlice(a, "\x1b[1;1H\x1b[38;5;7m");
+    try appendPlaceholder(&seq, a, 1, 1);
+    // The next event is what completes a placeholder cell.
+    try seq.appendSlice(a, "\x1b[m");
+    h.feed(seq.items);
+    try std.testing.expectEqual(screen_mod.PlaceholderTile{ .image_id = 7, .img_row = 1, .img_col = 1 }, h.screen.placeholderTileAt(&h.screen.active[0], 0).?);
+}
+
+// The reported bug, end to end: a TUI on the alternate screen scrolls its
+// content by redrawing, so the image's placeholder cells move up a row
+// and the cells they left are rewritten as blanks. Only the new position
+// may show the image; the old rows show nothing.
+test "a redrawn alt-screen frame leaves no stale placeholder rows" {
+    const a = std.testing.allocator;
+    var h = try Harness.init(a, 10, 6);
+    defer h.deinit();
+    try feedQuadImage(&h, 5);
+    h.feed("\x1b[?1049h");
+
+    var frame = std.ArrayList(u8).empty;
+    defer frame.deinit(a);
+    // Frame 1: the image's top row only, on the bottom row.
+    try frame.appendSlice(a, "\x1b[6;3H\x1b[38;5;5m");
+    try appendPlaceholder(&frame, a, 0, 0);
+    try appendPlaceholder(&frame, a, 0, 1);
+    try frame.appendSlice(a, "\x1b[m");
+    h.feed(frame.items);
+
+    // Frame 2: scrolled by one row, so the image starts a row higher and
+    // shows both rows; nothing else on the old row 5 but blanks.
+    frame.clearRetainingCapacity();
+    try frame.appendSlice(a, "\x1b[5;3H\x1b[38;5;5m");
+    try appendPlaceholder(&frame, a, 0, 0);
+    try appendPlaceholder(&frame, a, 0, 1);
+    try frame.appendSlice(a, "\x1b[6;3H");
+    try appendPlaceholder(&frame, a, 1, 0);
+    try appendPlaceholder(&frame, a, 1, 1);
+    try frame.appendSlice(a, "\x1b[m");
+    h.feed(frame.items);
+
+    var runs = try runsOf(&h);
+    defer runs.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), runs.items.len);
+    try std.testing.expectEqual(@as(u16, 4), runs.items[0].display_row);
+    try std.testing.expectEqual(@as(u16, 0), runs.items[0].img_row);
+    try std.testing.expectEqual(@as(u16, 5), runs.items[1].display_row);
+    try std.testing.expectEqual(@as(u16, 1), runs.items[1].img_row);
+
+    // Frame 3: the image scrolled off the top entirely (blanked rows).
+    h.feed("\x1b[5;1H\x1b[2K\x1b[6;1H\x1b[2K");
+    var gone = try runsOf(&h);
+    defer gone.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), gone.items.len);
+}
+
+// Lines that scroll keep their tiles (they are keyed by the line's id),
+// including into scrollback on the main screen.
+test "placeholder tiles scroll with their line" {
+    const a = std.testing.allocator;
+    var h = try Harness.init(a, 10, 3);
+    defer h.deinit();
+    try feedQuadImage(&h, 5);
+
+    var seq = std.ArrayList(u8).empty;
+    defer seq.deinit(a);
+    try seq.appendSlice(a, "\x1b[3;1H\x1b[38;5;5m");
+    try appendPlaceholder(&seq, a, 0, 0);
+    try seq.appendSlice(a, "\x1b[m\r\n");
+    h.feed(seq.items);
+
+    var runs = try runsOf(&h);
+    defer runs.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), runs.items.len);
+    try std.testing.expectEqual(@as(u16, 1), runs.items[0].display_row);
+
+    h.feed("\r\n\r\n");
+    var scrolled_off = try runsOf(&h);
+    defer scrolled_off.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), scrolled_off.items.len);
+    // Scrolled back into view, it shows again.
+    h.screen.view_offset = 1;
+    var back = try runsOf(&h);
+    defer back.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), back.items.len);
+    try std.testing.expectEqual(@as(u16, 0), back.items[0].display_row);
+}
+
+// ICH/DCH move cells sideways; their tiles move with them, and the tile
+// of a deleted cell goes.
+test "insert and delete characters carry placeholder tiles with their cells" {
+    const a = std.testing.allocator;
+    var h = try Harness.init(a, 10, 3);
+    defer h.deinit();
+    try feedQuadImage(&h, 5);
+
+    var seq = std.ArrayList(u8).empty;
+    defer seq.deinit(a);
+    try seq.appendSlice(a, "\x1b[38;5;5m");
+    try appendPlaceholder(&seq, a, 0, 0);
+    try appendPlaceholder(&seq, a, 0, 1);
+    try seq.appendSlice(a, "\x1b[m\x1b[1;1H\x1b[2@");
+    h.feed(seq.items);
+
+    const ln = &h.screen.active[0];
+    try std.testing.expect(h.screen.placeholderTileAt(ln, 0) == null);
+    try std.testing.expectEqual(@as(u16, 0), h.screen.placeholderTileAt(ln, 2).?.img_col);
+    try std.testing.expectEqual(@as(u16, 1), h.screen.placeholderTileAt(ln, 3).?.img_col);
+
+    // Delete the first image cell: the second slides into column 2.
+    h.feed("\x1b[1;3H\x1b[P");
+    try std.testing.expectEqual(@as(u16, 1), h.screen.placeholderTileAt(ln, 2).?.img_col);
+    try std.testing.expect(h.screen.placeholderTileAt(ln, 3) == null);
+}
+
+// A main-screen resize reflows text; a placeholder cell keeps its tile
+// on whatever line and column the reflow moved it to.
+test "reflow carries a placeholder tile to its cell's new position" {
+    const a = std.testing.allocator;
+    var h = try Harness.init(a, 10, 3);
+    defer h.deinit();
+    try feedQuadImage(&h, 5);
+
+    var seq = std.ArrayList(u8).empty;
+    defer seq.deinit(a);
+    try seq.appendSlice(a, "abcdefgh\x1b[38;5;5m");
+    try appendPlaceholder(&seq, a, 1, 1);
+    try seq.appendSlice(a, "\x1b[m");
+    h.feed(seq.items);
+    try std.testing.expect(h.screen.placeholderTileAt(&h.screen.active[0], 8) != null);
+
+    try h.screen.resize(5, 3);
+    var runs = try runsOf(&h);
+    defer runs.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), runs.items.len);
+    try std.testing.expectEqual(@as(u16, 3), runs.items[0].col);
+    try std.testing.expectEqual(@as(u16, 1), runs.items[0].img_row);
+    try std.testing.expectEqual(@as(u16, 1), runs.items[0].img_col);
+}
+
+// Re-entering the alternate screen starts a new alt session: the tiles
+// of the previous one are dropped, not left to accumulate.
+test "re-entering the alternate screen drops the previous session's tiles" {
+    const a = std.testing.allocator;
+    var h = try Harness.init(a, 10, 3);
+    defer h.deinit();
+    try feedQuadImage(&h, 5);
+
+    var seq = std.ArrayList(u8).empty;
+    defer seq.deinit(a);
+    try seq.appendSlice(a, "\x1b[?1049h\x1b[38;5;5m");
+    try appendPlaceholder(&seq, a, 0, 0);
+    try seq.appendSlice(a, "\x1b[m\x1b[?1049l");
+    h.feed(seq.items);
+    try std.testing.expectEqual(@as(u32, 1), h.screen.ph_tiles.count());
+    h.feed("\x1b[?1049h");
+    try std.testing.expectEqual(@as(u32, 0), h.screen.ph_tiles.count());
 }

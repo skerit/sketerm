@@ -124,8 +124,20 @@ it: placements are resolved from the store, not from the grid.
   cell glyphs. Renderer implication in §Render pass.
 - **Unicode placeholders** (`U=1` plus U+10EEEE cells with
   row/column diacritics) are implemented: the tables are in
-  `grid/kitty_placeholder.zig`, the tiling in `screen.zig`
-  (`virtual_placements` / `flushPlaceholder`).
+  `grid/kitty_placeholder.zig`. A printed placeholder cell records
+  which image cell it shows in `Screen.ph_tiles`, keyed by the line's
+  stable id and the column (`flushPlaceholder` ->
+  `recordPlaceholderTile`); nothing is placed at print time. The
+  renderer resolves the tiles of the rows on screen every frame
+  (`collectPlaceholderRuns`, drawn by `render/placeholder_draw.zig`
+  from one whole-image texture per source, `ImageStore.sourceTexture`),
+  and a tile only counts while its cell still holds U+10EEEE in the
+  image's colour (`placeholderTileAt`). So text written over a cell
+  retires its tile with no bookkeeping, tiles scroll and reflow with
+  their cells, and an image transmitted AFTER its cells (the order
+  opencode's TUI uses) shows without the cells being printed again.
+  The U+10EEEE glyph is never drawn (`Atlas.lookupGlyph`). Snapshots
+  v12+ carry the live tiles and the source images they show.
 
 ### iTerm2 OSC 1337 File=
 - Payload is base64 of a full image file.

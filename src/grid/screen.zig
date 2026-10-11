@@ -71,6 +71,41 @@ pub const VirtualPlacement = struct {
     placement_id: u32 = 0,
 };
 
+/// The image cell a U+10EEEE placeholder cell shows. Recorded when the
+/// cell is printed and resolved against the live grid at draw time, so a
+/// tile exists exactly as long as the placeholder cell carrying it: text
+/// written over the cell retires it, and an image transmitted after the
+/// cells still shows.
+pub const PlaceholderTile = struct {
+    image_id: u32,
+    img_row: u16,
+    img_col: u16,
+};
+
+/// A placeholder cell's identity: its line's stable id, so the tile
+/// scrolls, enters scrollback and survives line moves with its cell.
+pub const PlaceholderKey = struct {
+    line_id: u64,
+    col: u16,
+};
+
+/// Upper bound on recorded placeholder tiles (one per cell). Past it the
+/// table is pruned of tiles whose cells no longer exist; what still does
+/// not fit is not recorded, and that cell draws nothing.
+pub const PLACEHOLDER_TILE_CAP = 65536;
+
+/// Consecutive placeholder cells on one display row showing one image
+/// row left to right, so the renderer draws them as a single quad.
+pub const PlaceholderRun = struct {
+    display_row: u16,
+    col: u16,
+    len: u16,
+    image_id: u32,
+    img_row: u16,
+    /// The image column of the run's first cell.
+    img_col: u16,
+};
+
 /// A placeholder cell mid-assembly: base char printed at (screen_row,
 /// screen_col); up to three diacritics decode the image-cell row,
 /// column, and id high-byte.
@@ -355,6 +390,11 @@ pub const Screen = struct {
     /// The last finalized placeholder tile — drives auto-increment for
     /// the next cell when it omits row/column diacritics.
     ph_last: ?LastPlaceholder = null,
+    /// The tile each placeholder cell shows, keyed by its line id and
+    /// column. Entries are only HINTS: `placeholderTileAt` accepts one
+    /// only while that cell still holds U+10EEEE in the tile's image
+    /// colour, so overwritten cells need no bookkeeping here.
+    ph_tiles: std.AutoHashMap(PlaceholderKey, PlaceholderTile),
 
     /// Default fg / bg / cursor color overrides, RGBA in 0..1.
     /// Set via OSC 10 / 11 / 12, reset via OSC 110 / 111 / 112.
@@ -1010,6 +1050,7 @@ pub const Screen = struct {
             .kitty_images = @import("kitty_images.zig").Manager.init(allocator),
             .glyphs = @import("glyph_glossary.zig").Glossary.init(allocator),
             .virtual_placements = std.AutoHashMap(u32, VirtualPlacement).init(allocator),
+            .ph_tiles = std.AutoHashMap(PlaceholderKey, PlaceholderTile).init(allocator),
             .next_line_id = id_counter,
         };
         try self.resetTabStops();
@@ -1047,6 +1088,7 @@ pub const Screen = struct {
         self.kitty_images.deinit();
         self.glyphs.deinit();
         self.virtual_placements.deinit();
+        self.ph_tiles.deinit();
         for (self.user_vars.items) |uv| {
             self.allocator.free(uv.name);
             self.allocator.free(uv.value);
@@ -1418,6 +1460,7 @@ pub const Screen = struct {
         self.scrollback.clearRetainingCapacity();
         self.scrollback_head = 0;
         self.clearAllClusters();
+        self.ph_tiles.clearRetainingCapacity();
         self.row = 0;
         self.col = 0;
         self.view_offset = 0;
@@ -1726,7 +1769,13 @@ pub const Screen = struct {
         const old_active = self.active;
         var old_scrollback = self.scrollback;
 
+        // Staged before the retained images are re-anchored in place, so
+        // a failure here leaves both exactly as they were.
+        var staged_tiles = try self.stageReflowedTiles(combined.items, logicals.items, all_rows, sb_rows, new_cols);
+        errdefer staged_tiles.deinit();
         try self.reanchorRetainedImages(combined.items, logicals.items, all_rows, sb_rows, new_rows, new_cols);
+        self.ph_tiles.deinit();
+        self.ph_tiles = staged_tiles;
         self.active = new_active;
         self.scrollback = new_scrollback;
         self.scrollback_head = 0;
@@ -1751,23 +1800,33 @@ pub const Screen = struct {
         old_scrollback.deinit(self.allocator);
     }
 
-    /// Stage mapping allocations before changing anchors, then compact dead placements in replay order.
-    fn reanchorRetainedImages(
-        self: *Screen,
+    /// A cell position carried through `reflowMain`: (line id, column)
+    /// before the rechunk, the `all_rows` index and column after it.
+    const ReflowProbe = struct {
+        line_id: u64,
+        col: u16,
+        /// Null when the line was not part of the reflow.
+        dest_row: ?usize = null,
+        dest_col: u16 = 0,
+    };
+
+    /// Map every probe through a rechunk. Touches nothing on the Screen,
+    /// so callers can stage on its result before committing the reflow.
+    fn mapReflowProbes(
+        allocator: std.mem.Allocator,
         combined: []const Line,
         logicals: []const @import("reflow.zig").Logical,
         all_rows: []const Line,
-        sb_rows: usize,
-        new_rows: u16,
         new_cols: u16,
+        probes: []ReflowProbe,
     ) !void {
         const reflow = @import("reflow.zig");
-        if (self.retained_images.items.len == 0) return;
+        if (probes.len == 0) return;
         const Source = struct { idx: usize = std.math.maxInt(usize), col: u32 = 0, len: usize = 0 };
         var anchors: std.AutoHashMapUnmanaged(u64, Source) = .empty;
-        defer anchors.deinit(self.allocator);
-        for (self.retained_images.items) |ri| {
-            if (ri.ev.anchor_id != 0) try anchors.put(self.allocator, ri.ev.anchor_id, .{});
+        defer anchors.deinit(allocator);
+        for (probes) |p| {
+            if (p.line_id != 0) try anchors.put(allocator, p.line_id, .{});
         }
         var source: Source = .{ .idx = 0 };
         for (combined, 0..) |ln, row| {
@@ -1780,7 +1839,7 @@ pub const Screen = struct {
             source.col += @intCast(source.len);
         }
         const Request = struct {
-            image: usize,
+            probe: usize,
             source: Source,
 
             fn lessThan(_: void, a: @This(), b: @This()) bool {
@@ -1788,12 +1847,12 @@ pub const Screen = struct {
                     (a.source.idx == b.source.idx and a.source.col < b.source.col);
             }
         };
-        const requests = try self.allocator.alloc(Request, self.retained_images.items.len);
-        defer self.allocator.free(requests);
-        for (self.retained_images.items, requests, 0..) |ri, *request, image| {
-            var pos = anchors.get(ri.ev.anchor_id) orelse Source{};
-            pos.col += @intCast(@min(@as(usize, ri.ev.col), pos.len));
-            request.* = .{ .image = image, .source = pos };
+        const requests = try allocator.alloc(Request, probes.len);
+        defer allocator.free(requests);
+        for (probes, requests, 0..) |p, *request, index| {
+            var pos = anchors.get(p.line_id) orelse Source{};
+            pos.col += @intCast(@min(@as(usize, p.col), pos.len));
+            request.* = .{ .probe = index, .source = pos };
         }
         std.mem.sort(Request, requests, {}, Request.lessThan);
 
@@ -1802,12 +1861,11 @@ pub const Screen = struct {
         var logical_idx: usize = 0;
         var start_row: usize = 0;
         var cursor = reflow.PositionCursor{};
-        const first_kept = sb_rows - @min(sb_rows, self.scrollback_capacity);
         for (requests) |request| {
-            const ri = &self.retained_images.items[request.image];
+            const p = &probes[request.probe];
             const pos = request.source;
             if (pos.idx == std.math.maxInt(usize) or all_rows.len == 0) {
-                ri.ev.anchor_id = 0;
+                p.dest_row = null;
                 continue;
             }
             const dest: reflow.Position = if (pos.idx >= logicals.len)
@@ -1821,10 +1879,76 @@ pub const Screen = struct {
                 }
                 break :dest cursor.seek(logicals[pos.idx].cells.items, pos.col, new_cols, all_rows.len);
             };
-            ri.ev.anchor_id = if (dest.row < first_kept) 0 else all_rows[dest.row].id;
-            ri.ev.col = dest.col;
-            if (dest.row >= sb_rows and dest.row - sb_rows < new_rows) {
-                ri.ev.row = @intCast(dest.row - sb_rows);
+            p.dest_row = dest.row;
+            p.dest_col = dest.col;
+        }
+    }
+
+    /// The placeholder tile table re-keyed onto the reflowed rows, built
+    /// off to the side. Tiles of lines outside the reflow (the alternate
+    /// screen) keep their keys; tiles whose line fell out of the kept
+    /// scrollback are dropped.
+    fn stageReflowedTiles(
+        self: *Screen,
+        combined: []const Line,
+        logicals: []const @import("reflow.zig").Logical,
+        all_rows: []const Line,
+        sb_rows: usize,
+        new_cols: u16,
+    ) !std.AutoHashMap(PlaceholderKey, PlaceholderTile) {
+        var staged = std.AutoHashMap(PlaceholderKey, PlaceholderTile).init(self.allocator);
+        errdefer staged.deinit();
+        const n = self.ph_tiles.count();
+        if (n == 0) return staged;
+        const probes = try self.allocator.alloc(ReflowProbe, n);
+        defer self.allocator.free(probes);
+        const tiles = try self.allocator.alloc(PlaceholderTile, n);
+        defer self.allocator.free(tiles);
+        var it = self.ph_tiles.iterator();
+        var i: usize = 0;
+        while (it.next()) |entry| : (i += 1) {
+            probes[i] = .{ .line_id = entry.key_ptr.line_id, .col = entry.key_ptr.col };
+            tiles[i] = entry.value_ptr.*;
+        }
+        try mapReflowProbes(self.allocator, combined, logicals, all_rows, new_cols, probes);
+        try staged.ensureTotalCapacity(n);
+        const first_kept = sb_rows - @min(sb_rows, self.scrollback_capacity);
+        for (probes, tiles) |p, tile| {
+            const key: PlaceholderKey = if (p.dest_row) |row| key: {
+                if (row < first_kept) continue;
+                break :key .{ .line_id = all_rows[row].id, .col = p.dest_col };
+            } else .{ .line_id = p.line_id, .col = p.col };
+            staged.putAssumeCapacity(key, tile);
+        }
+        return staged;
+    }
+
+    /// Stage mapping allocations before changing anchors, then compact dead placements in replay order.
+    fn reanchorRetainedImages(
+        self: *Screen,
+        combined: []const Line,
+        logicals: []const @import("reflow.zig").Logical,
+        all_rows: []const Line,
+        sb_rows: usize,
+        new_rows: u16,
+        new_cols: u16,
+    ) !void {
+        if (self.retained_images.items.len == 0) return;
+        const probes = try self.allocator.alloc(ReflowProbe, self.retained_images.items.len);
+        defer self.allocator.free(probes);
+        for (self.retained_images.items, probes) |ri, *p| p.* = .{ .line_id = ri.ev.anchor_id, .col = ri.ev.col };
+        try mapReflowProbes(self.allocator, combined, logicals, all_rows, new_cols, probes);
+
+        const first_kept = sb_rows - @min(sb_rows, self.scrollback_capacity);
+        for (self.retained_images.items, probes) |*ri, p| {
+            const dest_row = p.dest_row orelse {
+                ri.ev.anchor_id = 0;
+                continue;
+            };
+            ri.ev.anchor_id = if (dest_row < first_kept) 0 else all_rows[dest_row].id;
+            ri.ev.col = p.dest_col;
+            if (dest_row >= sb_rows and dest_row - sb_rows < new_rows) {
+                ri.ev.row = @intCast(dest_row - sb_rows);
             } else {
                 ri.ev.row = 0;
             }
@@ -3494,6 +3618,9 @@ pub const Screen = struct {
             self.dirty = true;
             if (self.sink.on_image_animation) |f| f(self.sink.ctx);
         }
+        // Placeholder cells printed before this transmit resolve against
+        // the image now, without being printed again.
+        if (self.ph_tiles.count() > 0) self.dirty = true;
         if (outcome.action != .place) return;
 
         const stored = self.kitty_images.get(outcome.image_id) orelse return;
@@ -4154,6 +4281,7 @@ pub const Screen = struct {
             // and would point at the wrong cells afterwards (matches the
             // ICH/DCH clear-range approach).
             if (self.clusters.count() > 0) self.clearClustersRange(self.row, self.col, self.cols);
+            self.shiftPlaceholderTiles(ln.id, self.col, width);
             var k: u16 = self.cols;
             while (k > self.col + width) : (k -= 1) {
                 ln.cells[k - 1] = ln.cells[k - 1 - width];
@@ -4228,7 +4356,11 @@ pub const Screen = struct {
     /// The current foreground rendered as a kitty image id: palette
     /// index, or packed 24-bit truecolor. `.default` → 0 (no image).
     fn fgImageId(self: *Screen) u32 {
-        return switch (self.pool.get(self.cur_style).fg) {
+        return colorImageId(self.pool.get(self.cur_style).fg);
+    }
+
+    fn colorImageId(color: style_pool.Color) u32 {
+        return switch (color) {
             .default => 0,
             .palette => |p| p,
             .rgb => |c| (@as(u32, c.r) << 16) | (@as(u32, c.g) << 8) | c.b,
@@ -4278,7 +4410,7 @@ pub const Screen = struct {
             }
         }
 
-        self.emitPlaceholderTile(pp.screen_row, pp.screen_col, image_id, img_row, img_col);
+        self.recordPlaceholderTile(pp.screen_row, pp.screen_col, image_id, img_row, img_col);
         self.ph_last = .{
             .screen_row = pp.screen_row,
             .screen_col = pp.screen_col,
@@ -4288,63 +4420,179 @@ pub const Screen = struct {
         };
     }
 
-    /// Emit a single placeholder tile: the (img_row, img_col) cell of
-    /// the image's r×c grid, cropped to its own small pixel buffer and
-    /// placed at one terminal cell. The synthetic per-cell placement id
-    /// lets distinct tiles coexist while a re-print at the same cell
-    /// replaces cleanly.
-    fn emitPlaceholderTile(self: *Screen, srow: u16, scol: u16, image_id: u32, img_row: u32, img_col: u32) void {
-        const stored = self.kitty_images.get(image_id) orelse return;
-        if (stored.width == 0 or stored.height == 0) return;
-
-        var cols: u32 = 0;
-        var rows: u32 = 0;
-        if (self.virtual_placements.get(image_id)) |vp| {
-            cols = vp.cols;
-            rows = vp.rows;
+    /// Remember which image cell the placeholder at (row, col) shows.
+    /// Nothing is drawn here: the image may not have been transmitted yet
+    /// (apps commonly flush cells before the upload), and the renderer
+    /// resolves tiles against the grid it is about to draw.
+    fn recordPlaceholderTile(self: *Screen, row: u16, col: u16, image_id: u32, img_row: u32, img_col: u32) void {
+        if (row >= self.rows or col >= self.cols) return;
+        if (img_row > std.math.maxInt(u16) or img_col > std.math.maxInt(u16)) return;
+        const line_id = self.line(row).id;
+        if (line_id == 0) return;
+        const key = PlaceholderKey{ .line_id = line_id, .col = col };
+        if (self.ph_tiles.count() >= PLACEHOLDER_TILE_CAP and !self.ph_tiles.contains(key)) {
+            self.prunePlaceholderTiles();
+            if (self.ph_tiles.count() >= PLACEHOLDER_TILE_CAP) return;
         }
-        // Grid size unspecified: derive from native pixel size / cell.
-        if (cols == 0) {
-            const cw: u32 = if (self.cell_pixel_w > 0) self.cell_pixel_w else 8;
-            cols = @max(1, (stored.width + cw - 1) / cw);
-        }
-        if (rows == 0) {
-            const ch: u32 = if (self.cell_pixel_h > 0) self.cell_pixel_h else 16;
-            rows = @max(1, (stored.height + ch - 1) / ch);
-        }
-        if (img_row >= rows or img_col >= cols) return;
-
-        const tile_w = stored.width / cols;
-        const tile_h = stored.height / rows;
-        if (tile_w == 0 or tile_h == 0) return;
-
-        const sx = img_col * tile_w;
-        const sy = img_row * tile_h;
-        const row_bytes = tile_w * 4;
-
-        const tile = self.allocator.alloc(u8, tile_w * tile_h * 4) catch return;
-        defer self.allocator.free(tile);
-        var ty: u32 = 0;
-        while (ty < tile_h) : (ty += 1) {
-            const src_off = ((sy + ty) * stored.width + sx) * 4;
-            const dst_off = ty * row_bytes;
-            @memcpy(tile[dst_off .. dst_off + row_bytes], stored.rgba[src_off .. src_off + row_bytes]);
-        }
-
-        // High bit tags it as placeholder-synthetic so it never clashes
-        // with an app-chosen placement id; position keeps tiles distinct.
-        const synth_pid: u32 = 0x4000_0000 | (@as(u32, srow) << 12) | scol;
-        self.emitImage(.{
-            .width = tile_w,
-            .height = tile_h,
-            .rgba = tile,
-            .row = srow,
-            .col = scol,
+        self.ph_tiles.put(key, .{
             .image_id = image_id,
-            .placement_id = synth_pid,
-            .cells_wide = 1,
-            .cells_high = 1,
-        });
+            .img_row = @intCast(img_row),
+            .img_col = @intCast(img_col),
+        }) catch return;
+    }
+
+    /// The tile `ln`'s cell at `col` shows right now, or null when that
+    /// cell is not a live placeholder. A recorded tile only counts while
+    /// the cell still holds U+10EEEE in the tile's image colour, which is
+    /// what retires tiles under text written over them without any
+    /// bookkeeping on the write paths.
+    pub fn placeholderTileAt(self: *const Screen, ln: *const Line, col: u16) ?PlaceholderTile {
+        if (col >= ln.cells.len) return null;
+        const cell = ln.cells[col];
+        if (cell.rune != kitty_ph.PLACEHOLDER) return null;
+        const tile = self.ph_tiles.get(.{ .line_id = ln.id, .col = col }) orelse return null;
+        if (colorImageId(self.pool.get(cell.style_ref).fg) != tile.image_id & 0xFF_FFFF) return null;
+        return tile;
+    }
+
+    /// Image-cell grid of a placeholder image: the virtual placement's
+    /// `c=`/`r=`, else the image's pixel size over the cell size.
+    pub const PlaceholderGrid = struct { cols: u32, rows: u32 };
+
+    /// The grid placeholder tiles of `image_id` index into, or null when
+    /// the image is not stored. `cell_w`/`cell_h` are the cell's pixel
+    /// size; 0 falls back to the size the app was told, then 8x16.
+    pub fn placeholderGrid(self: *Screen, image_id: u32, cell_w: u32, cell_h: u32) ?PlaceholderGrid {
+        const stored = self.kitty_images.get(image_id) orelse return null;
+        if (stored.width == 0 or stored.height == 0) return null;
+        var grid: PlaceholderGrid = .{ .cols = 0, .rows = 0 };
+        if (self.virtual_placements.get(image_id)) |vp| {
+            grid.cols = vp.cols;
+            grid.rows = vp.rows;
+        }
+        if (grid.cols == 0) {
+            const cw: u32 = if (cell_w > 0) cell_w else if (self.cell_pixel_w > 0) self.cell_pixel_w else 8;
+            grid.cols = @max(1, (stored.width + cw - 1) / cw);
+        }
+        if (grid.rows == 0) {
+            const ch: u32 = if (cell_h > 0) cell_h else if (self.cell_pixel_h > 0) self.cell_pixel_h else 16;
+            grid.rows = @max(1, (stored.height + ch - 1) / ch);
+        }
+        return grid;
+    }
+
+    /// Append the live placeholder runs of the rows currently on screen
+    /// (scrollback rows first while scrolled back, as the cell passes
+    /// draw them) to `out`. Double-width and double-height lines carry
+    /// none: kitty does not lay placeholders out on them.
+    pub fn collectPlaceholderRuns(self: *const Screen, allocator: std.mem.Allocator, out: *std.ArrayList(PlaceholderRun)) !void {
+        if (self.ph_tiles.count() == 0) return;
+        const lines = if (self.use_alt) self.alt.? else self.active;
+        const sb_count: u32 = if (self.use_alt) 0 else self.scrollbackCount();
+        const view_off: u32 = @min(self.view_offset, sb_count);
+        var row: u16 = 0;
+        while (row < self.rows) : (row += 1) {
+            const ln: *const Line = if (row < view_off)
+                self.scrollbackLine(sb_count - view_off + row)
+            else
+                &lines[row - view_off];
+            if (ln.scaling != .single) continue;
+            var open: ?PlaceholderRun = null;
+            var col: u16 = 0;
+            while (col < ln.cells.len) : (col += 1) {
+                const tile = self.placeholderTileAt(ln, col) orelse {
+                    if (open) |run| try out.append(allocator, run);
+                    open = null;
+                    continue;
+                };
+                if (open) |*run| {
+                    if (run.image_id == tile.image_id and run.img_row == tile.img_row and
+                        @as(u32, run.img_col) + run.len == tile.img_col and run.col + run.len == col)
+                    {
+                        run.len += 1;
+                        continue;
+                    }
+                    try out.append(allocator, run.*);
+                }
+                open = .{
+                    .display_row = row,
+                    .col = col,
+                    .len = 1,
+                    .image_id = tile.image_id,
+                    .img_row = tile.img_row,
+                    .img_col = tile.img_col,
+                };
+            }
+            if (open) |run| try out.append(allocator, run);
+        }
+    }
+
+    /// Drop every recorded tile whose cell no longer shows it. Runs when
+    /// the table reaches its cap (orphans of scrolled-off lines and left
+    /// alternate screens are only collected here); without the memory to
+    /// index the lines it drops the whole table, which costs images until
+    /// their app redraws rather than ever drawing a wrong one.
+    fn prunePlaceholderTiles(self: *Screen) void {
+        var by_id: std.AutoHashMapUnmanaged(u64, *const Line) = .empty;
+        defer by_id.deinit(self.allocator);
+        const sb_count = self.scrollbackCount();
+        const total: usize = sb_count + self.active.len + (if (self.alt) |a| a.len else 0);
+        by_id.ensureTotalCapacity(self.allocator, @intCast(total)) catch {
+            self.ph_tiles.clearRetainingCapacity();
+            return;
+        };
+        var i: u32 = 0;
+        while (i < sb_count) : (i += 1) {
+            const ln = self.scrollbackLine(i);
+            by_id.putAssumeCapacity(ln.id, ln);
+        }
+        for (self.active) |*ln| by_id.putAssumeCapacity(ln.id, ln);
+        if (self.alt) |alt| for (alt) |*ln| by_id.putAssumeCapacity(ln.id, ln);
+
+        var it = self.ph_tiles.iterator();
+        while (it.next()) |entry| {
+            const live = if (by_id.get(entry.key_ptr.line_id)) |ln|
+                self.placeholderTileAt(ln, entry.key_ptr.col) != null
+            else
+                false;
+            // Removal leaves a tombstone, never moves an entry, so the
+            // iterator stays valid.
+            if (!live) self.ph_tiles.removeByPtr(entry.key_ptr);
+        }
+    }
+
+    /// Forget every recorded tile on the given lines.
+    pub fn dropPlaceholderTilesOf(self: *Screen, lines: []const Line) void {
+        if (self.ph_tiles.count() == 0) return;
+        for (lines) |*ln| {
+            var col: u16 = 0;
+            while (col < ln.cells.len) : (col += 1) _ = self.ph_tiles.remove(.{ .line_id = ln.id, .col = col });
+        }
+    }
+
+    /// Move the recorded tiles of one line by `delta` columns from `from`
+    /// rightwards, as ICH/DCH/insert mode move its cells. Tiles of cells
+    /// that fall off the line or into a deleted range are dropped.
+    pub fn shiftPlaceholderTiles(self: *Screen, line_id: u64, from: u16, delta: i32) void {
+        if (self.ph_tiles.count() == 0 or delta == 0) return;
+        const cols: i32 = self.cols;
+        if (delta > 0) {
+            var col: i32 = cols - 1;
+            while (col >= from) : (col -= 1) self.movePlaceholderTile(line_id, col, col + delta, cols);
+        } else {
+            var col: i32 = from;
+            while (col < cols) : (col += 1) {
+                // Cells in [from, from - delta) are the deleted ones.
+                const dest = if (col < @as(i32, from) - delta) -1 else col + delta;
+                self.movePlaceholderTile(line_id, col, dest, cols);
+            }
+        }
+    }
+
+    fn movePlaceholderTile(self: *Screen, line_id: u64, from: i32, to: i32, cols: i32) void {
+        const kv = self.ph_tiles.fetchRemove(.{ .line_id = line_id, .col = @intCast(from) }) orelse return;
+        if (to < 0 or to >= cols) return;
+        self.ph_tiles.put(.{ .line_id = line_id, .col = @intCast(to) }, kv.value) catch {};
     }
 
     /// Returns true if the codepoint is a "combining" or "extending"

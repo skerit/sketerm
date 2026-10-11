@@ -11,9 +11,9 @@
 //! - Animation frames (`a=f`, `a=a`) — see `appendFrame` /
 //!   `advanceAnimations` / `applyAnimateControl`
 //!
-//! Unicode placeholders (`U=1` + U+10EEEE cells) are handled in
-//! `screen.zig` (`virtual_placements` + `flushPlaceholder`), which
-//! tiles stored images from this manager.
+//! Unicode placeholders (`U=1` + U+10EEEE cells) are recorded in
+//! `screen.zig` (`virtual_placements` + `ph_tiles`) and drawn by the
+//! renderer straight from this manager's stored pixels.
 
 const std = @import("std");
 const c = @import("../c.zig").c;
@@ -522,6 +522,22 @@ pub const Manager = struct {
     /// Look up a stored image's RGBA + dims.
     pub fn get(self: *Manager, image_id: u32) ?StoredImage {
         return self.store.get(image_id);
+    }
+
+    /// Store already-decoded static pixels under `image_id`, taking
+    /// ownership of `rgba` whether or not it succeeds. Replaces any image
+    /// already stored under that id.
+    pub fn adoptDecoded(self: *Manager, image_id: u32, number: u32, width: u32, height: u32, rgba: []u8) !void {
+        const need = image_size.byteLen(width, height, 4) catch |err| {
+            self.allocator.free(rgba);
+            return err;
+        };
+        if (image_id == 0 or rgba.len != need) {
+            self.allocator.free(rgba);
+            return error.InvalidImage;
+        }
+        self.drop(image_id);
+        try self.insertStored(image_id, .{ .rgba = rgba, .width = width, .height = height, .number = number });
     }
 
     /// Report a dropped transfer under `--debug-images` and return false.

@@ -240,8 +240,10 @@ Side tables (all on `Screen`, per pane, main-thread-owned in the GUI):
   col`.
 - `glyphs` — the Glyph Protocol glossary (`grid/glyph_glossary.zig`).
 - Images are not in a cell side table: placements live in the pane's
-  `ImageStore` (see `images.md`), plus `virtual_placements` for kitty
-  Unicode-placeholder images.
+  `ImageStore` (see `images.md`). Kitty Unicode-placeholder images are
+  the one exception: `ph_tiles` maps (line id, column) to the image
+  cell a U+10EEEE cell shows, resolved by the renderer every frame,
+  plus `virtual_placements` for each image's cell grid.
 
 Rationale:
 - <1 % of cells carry images, OSC 8 links, or multi-codepoint

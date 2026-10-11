@@ -129,15 +129,8 @@ pub const ImagePass = struct {
             if (self.debug) std.debug.print("[image] draw: program=0, bailing\n", .{});
             return;
         }
-        c.glUseProgram(self.program);
-        c.glUniform2f(self.u_screen_px, @floatFromInt(viewport_w), @floatFromInt(viewport_h));
-        c.glActiveTexture(c.GL_TEXTURE0);
-        c.glUniform1i(self.u_image, 0);
-        c.glBindVertexArray(self.vao);
-        c.glBindBuffer(c.GL_ARRAY_BUFFER, self.vbo);
-        c.glEnable(c.GL_BLEND);
-        c.glBlendFunc(c.GL_SRC_ALPHA, c.GL_ONE_MINUS_SRC_ALPHA);
-        c.glUniform1i(self.u_blend_mode, @intFromEnum(self.blend_mode));
+        self.begin(viewport_w, viewport_h);
+        defer end();
 
         for (store.images.items) |img| {
             switch (zfilter) {
@@ -208,7 +201,63 @@ pub const ImagePass = struct {
                 );
             }
         }
+    }
 
+    /// A textured rectangle in canvas pixels (padding already applied).
+    pub const Quad = struct {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        uv0: [2]f32,
+        uv1: [2]f32,
+    };
+
+    /// Draw quads that all sample `tex`, blended exactly like images.
+    pub fn drawQuads(self: *ImagePass, tex: c_uint, quads: []const Quad, viewport_w: i32, viewport_h: i32) void {
+        if (quads.len == 0 or tex == 0 or self.program == 0) return;
+        self.begin(viewport_w, viewport_h);
+        defer end();
+        c.glBindTexture(c.GL_TEXTURE_2D, tex);
+        const BATCH = 64;
+        var verts: [BATCH * 6]Vertex = undefined;
+        var done: usize = 0;
+        while (done < quads.len) {
+            // Typed: `@min` with the comptime BATCH would narrow it to a
+            // u7, and the byte count below would wrap.
+            const n: usize = @min(BATCH, quads.len - done);
+            for (quads[done .. done + n], 0..) |q, i| {
+                const x1 = q.x + q.w;
+                const y1 = q.y + q.h;
+                verts[i * 6 ..][0..6].* = .{
+                    .{ .pos = .{ q.x, q.y }, .uv = q.uv0 },
+                    .{ .pos = .{ x1, q.y }, .uv = .{ q.uv1[0], q.uv0[1] } },
+                    .{ .pos = .{ q.x, y1 }, .uv = .{ q.uv0[0], q.uv1[1] } },
+                    .{ .pos = .{ x1, q.y }, .uv = .{ q.uv1[0], q.uv0[1] } },
+                    .{ .pos = .{ x1, y1 }, .uv = q.uv1 },
+                    .{ .pos = .{ q.x, y1 }, .uv = .{ q.uv0[0], q.uv1[1] } },
+                };
+            }
+            c.glBufferData(c.GL_ARRAY_BUFFER, @intCast(n * 6 * @sizeOf(Vertex)), &verts, c.GL_DYNAMIC_DRAW);
+            c.glDrawArrays(c.GL_TRIANGLES, 0, @intCast(n * 6));
+            done += n;
+        }
+    }
+
+    /// Bind the program, buffers and blend state every image draw shares.
+    fn begin(self: *ImagePass, viewport_w: i32, viewport_h: i32) void {
+        c.glUseProgram(self.program);
+        c.glUniform2f(self.u_screen_px, @floatFromInt(viewport_w), @floatFromInt(viewport_h));
+        c.glActiveTexture(c.GL_TEXTURE0);
+        c.glUniform1i(self.u_image, 0);
+        c.glBindVertexArray(self.vao);
+        c.glBindBuffer(c.GL_ARRAY_BUFFER, self.vbo);
+        c.glEnable(c.GL_BLEND);
+        c.glBlendFunc(c.GL_SRC_ALPHA, c.GL_ONE_MINUS_SRC_ALPHA);
+        c.glUniform1i(self.u_blend_mode, @intFromEnum(self.blend_mode));
+    }
+
+    fn end() void {
         c.glDisable(c.GL_BLEND);
         c.glBindVertexArray(0);
     }

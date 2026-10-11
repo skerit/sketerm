@@ -9,7 +9,24 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const image_size = @import("image_size.zig");
+const kitty_images = @import("kitty_images.zig");
 const Screen = @import("screen.zig").Screen;
+
+/// A stored kitty image uploaded whole for Unicode-placeholder tiles,
+/// which draw sub-rectangles of it. Its pixels stay owned by the Screen's
+/// image store; only the texture lives here.
+pub const SourceTexture = struct {
+    image_id: u32,
+    /// `StoredImage.seq` / `.generation` the texture was made from.
+    seq: u64,
+    generation: u32,
+    gl_tex: c_uint,
+    /// `Store.source_frame` at the last lookup, for LRU eviction.
+    last_used: u64,
+};
+
+/// Source textures kept per pane; the least recently drawn goes first.
+pub const SOURCE_TEXTURE_CAP = 16;
 
 pub const Image = struct {
     width: u32,
@@ -95,6 +112,10 @@ pub const Store = struct {
     max_texture_size: u32 = 0,
     /// GL-free tombstones can be compacted during the next append's replacement scan.
     reclaim_unuploaded: bool = false,
+    /// Whole-image textures for Unicode-placeholder tiles.
+    sources: std.ArrayList(SourceTexture) = .empty,
+    /// Lookup counter stamping `SourceTexture.last_used`.
+    source_frame: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator) Store {
         return .{ .allocator = allocator };
@@ -149,6 +170,7 @@ pub const Store = struct {
         // here without a current context is a no-op or crash; skip.
         for (self.images.items) |*img| self.freePending(img);
         self.images.deinit(self.allocator);
+        self.sources.deinit(self.allocator);
     }
 
     /// Add an image. Copies the RGBA bytes; caller retains ownership
@@ -400,6 +422,9 @@ pub const Store = struct {
             img.pending_dirty = true;
             if (img.deleting) self.reclaim_unuploaded = true;
         }
+        // Their pixels live in the Screen's image store; the next draw
+        // uploads them into the new context.
+        self.sources.clearRetainingCapacity();
     }
 
     /// Like `forgetGL`, but ALSO `glDeleteTextures` on every image
@@ -417,6 +442,8 @@ pub const Store = struct {
             img.pending_dirty = true;
             if (img.deleting) self.reclaim_unuploaded = true;
         }
+        for (self.sources.items) |*src| c.glDeleteTextures(1, &src.gl_tex);
+        self.sources.clearRetainingCapacity();
     }
 
     /// Free all images and their pending buffers, ignoring GL
@@ -476,35 +503,37 @@ pub const Store = struct {
     /// drawing, which is what happened before, and stays visible under
     /// `--debug-images`.
     fn scaleForLimit(self: *Store, img: *Image, source: []const u8, limit: u32) Fitted {
-        if (img.width <= limit and img.height <= limit) {
-            img.tex_w = img.width;
-            img.tex_h = img.height;
-            return .{ .pixels = source, .owned = false };
-        }
-        const tw: u32 = @min(img.width, limit);
-        const th: u32 = @min(img.height, limit);
-        const bytes = image_size.byteLen(tw, th, 4) catch {
-            img.tex_w = img.width;
-            img.tex_h = img.height;
-            return .{ .pixels = source, .owned = false };
-        };
+        const scaled = self.scalePixels(img.image_id, img.width, img.height, source, limit);
+        img.tex_w = scaled.w;
+        img.tex_h = scaled.h;
+        return scaled.fitted;
+    }
+
+    const Scaled = struct { fitted: Fitted, w: u32, h: u32 };
+
+    /// `scaleForLimit` on bare pixels: the texture size comes back
+    /// instead of landing on an `Image`.
+    fn scalePixels(self: *Store, image_id: u32, width: u32, height: u32, source: []const u8, limit: u32) Scaled {
+        const whole: Scaled = .{ .fitted = .{ .pixels = source, .owned = false }, .w = width, .h = height };
+        if (width <= limit and height <= limit) return whole;
+        const tw: u32 = @min(width, limit);
+        const th: u32 = @min(height, limit);
+        const bytes = image_size.byteLen(tw, th, 4) catch return whole;
         const out = self.allocator.alloc(u8, bytes) catch {
             if (self.debug) std.debug.print(
                 "[image] id={d}: no memory to downscale {d}x{d} to {d}x{d}\n",
-                .{ img.image_id, img.width, img.height, tw, th },
+                .{ image_id, width, height, tw, th },
             );
-            img.tex_w = img.width;
-            img.tex_h = img.height;
-            return .{ .pixels = source, .owned = false };
+            return whole;
         };
         var y: u32 = 0;
         while (y < th) : (y += 1) {
-            const sy: u64 = @as(u64, y) * img.height / th;
-            const src_row = @as(usize, @intCast(sy)) * @as(usize, img.width) * 4;
+            const sy: u64 = @as(u64, y) * height / th;
+            const src_row = @as(usize, @intCast(sy)) * @as(usize, width) * 4;
             const dst_row = @as(usize, y) * @as(usize, tw) * 4;
             var x: u32 = 0;
             while (x < tw) : (x += 1) {
-                const sx: u64 = @as(u64, x) * img.width / tw;
+                const sx: u64 = @as(u64, x) * width / tw;
                 const s_off = src_row + @as(usize, @intCast(sx)) * 4;
                 const d_off = dst_row + @as(usize, x) * 4;
                 @memcpy(out[d_off .. d_off + 4], source[s_off .. s_off + 4]);
@@ -512,11 +541,89 @@ pub const Store = struct {
         }
         if (self.debug) std.debug.print(
             "[image] id={d}: {d}x{d} exceeds GL_MAX_TEXTURE_SIZE {d}; uploading {d}x{d}\n",
-            .{ img.image_id, img.width, img.height, limit, tw, th },
+            .{ image_id, width, height, limit, tw, th },
         );
-        img.tex_w = tw;
-        img.tex_h = th;
-        return .{ .pixels = out, .owned = true };
+        return .{ .fitted = .{ .pixels = out, .owned = true }, .w = tw, .h = th };
+    }
+
+    /// Create a linear-filtered, edge-clamped RGBA texture from `pixels`.
+    fn createTexture(w: u32, h: u32, pixels: []const u8) c_uint {
+        var tex: c_uint = 0;
+        c.glGenTextures(1, &tex);
+        c.glBindTexture(c.GL_TEXTURE_2D, tex);
+        c.glPixelStorei(c.GL_UNPACK_ALIGNMENT, 4);
+        c.glTexImage2D(c.GL_TEXTURE_2D, 0, c.GL_RGBA8, @intCast(w), @intCast(h), 0, c.GL_RGBA, c.GL_UNSIGNED_BYTE, pixels.ptr);
+        c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_MIN_FILTER, c.GL_LINEAR);
+        c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_MAG_FILTER, c.GL_LINEAR);
+        c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_WRAP_S, c.GL_CLAMP_TO_EDGE);
+        c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_WRAP_T, c.GL_CLAMP_TO_EDGE);
+        return tex;
+    }
+
+    /// The texture holding stored image `image_id` whole, uploading it on
+    /// first use and again whenever its pixels changed (a re-transmit
+    /// moves `seq`, a frame advance moves `generation`). 0 when the upload
+    /// produced no texture. Caller must have a current GL context.
+    pub fn sourceTexture(self: *Store, image_id: u32, img: kitty_images.StoredImage) c_uint {
+        self.source_frame +%= 1;
+        for (self.sources.items) |*src| {
+            if (src.image_id != image_id) continue;
+            if (src.seq != img.seq or src.generation != img.generation) {
+                c.glDeleteTextures(1, &src.gl_tex);
+                src.gl_tex = self.uploadSource(image_id, img);
+                src.seq = img.seq;
+                src.generation = img.generation;
+            }
+            src.last_used = self.source_frame;
+            return src.gl_tex;
+        }
+        if (self.sources.items.len >= SOURCE_TEXTURE_CAP) {
+            var lru: usize = 0;
+            for (self.sources.items, 0..) |src, i| {
+                if (src.last_used < self.sources.items[lru].last_used) lru = i;
+            }
+            c.glDeleteTextures(1, &self.sources.items[lru].gl_tex);
+            _ = self.sources.swapRemove(lru);
+        }
+        const tex = self.uploadSource(image_id, img);
+        self.sources.append(self.allocator, .{
+            .image_id = image_id,
+            .seq = img.seq,
+            .generation = img.generation,
+            .gl_tex = tex,
+            .last_used = self.source_frame,
+        }) catch {
+            c.glDeleteTextures(1, &tex);
+            return 0;
+        };
+        return tex;
+    }
+
+    fn uploadSource(self: *Store, image_id: u32, img: kitty_images.StoredImage) c_uint {
+        const scaled = self.scalePixels(image_id, img.width, img.height, img.rgba, self.maxTextureSize());
+        defer if (scaled.fitted.owned) self.allocator.free(@constCast(scaled.fitted.pixels));
+        const tex = createTexture(scaled.w, scaled.h, scaled.fitted.pixels);
+        if (self.debug) std.debug.print(
+            "[image] placeholder source id={d} {d}x{d} (texture {d}x{d}) tex={d} glErr=0x{x}\n",
+            .{ image_id, img.width, img.height, scaled.w, scaled.h, tex, c.glGetError() },
+        );
+        return tex;
+    }
+
+    /// Delete the source textures whose image is no longer stored, so a
+    /// dropped image's GPU memory goes with it. Caller must have a
+    /// current GL context.
+    pub fn sweepSources(self: *Store, manager: *const kitty_images.Manager) void {
+        var i: usize = 0;
+        while (i < self.sources.items.len) {
+            const src = self.sources.items[i];
+            if (manager.store.contains(src.image_id)) {
+                i += 1;
+                continue;
+            }
+            c.glDeleteTextures(1, &self.sources.items[i].gl_tex);
+            _ = self.sources.swapRemove(i);
+        }
     }
 
     /// Upload pending images to GL, free deleted ones. Caller must
@@ -539,24 +646,7 @@ pub const Store = struct {
             defer if (fitted.owned) self.allocator.free(@constCast(fitted.pixels));
             const pending = fitted.pixels;
             if (img.gl_tex == 0) {
-                c.glGenTextures(1, &img.gl_tex);
-                c.glBindTexture(c.GL_TEXTURE_2D, img.gl_tex);
-                c.glPixelStorei(c.GL_UNPACK_ALIGNMENT, 4);
-                c.glTexImage2D(
-                    c.GL_TEXTURE_2D,
-                    0,
-                    c.GL_RGBA8,
-                    @intCast(img.tex_w),
-                    @intCast(img.tex_h),
-                    0,
-                    c.GL_RGBA,
-                    c.GL_UNSIGNED_BYTE,
-                    pending.ptr,
-                );
-                c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_MIN_FILTER, c.GL_LINEAR);
-                c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_MAG_FILTER, c.GL_LINEAR);
-                c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_WRAP_S, c.GL_CLAMP_TO_EDGE);
-                c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_WRAP_T, c.GL_CLAMP_TO_EDGE);
+                img.gl_tex = createTexture(img.tex_w, img.tex_h, pending);
                 const err = c.glGetError();
                 if (self.debug) {
                     std.debug.print(

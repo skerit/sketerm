@@ -18,6 +18,7 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const boxdraw = @import("boxdraw.zig");
 const glyph_glossary = @import("../grid/glyph_glossary.zig");
+const kitty_placeholder = @import("../grid/kitty_placeholder.zig");
 
 /// Pixels per page side. Cap at 2048 — cross-vendor safe.
 pub const PAGE_SIZE: u32 = 2048;
@@ -937,6 +938,10 @@ pub const Atlas = struct {
         italic: bool,
         fg: [4]f32,
     ) !Glyph {
+        // A Kitty Unicode placeholder is never text: the image tile drawn
+        // over the cell is its content, and with no image the cell shows
+        // its background, not the font's missing-glyph box.
+        if (cp == kitty_placeholder.PLACEHOLDER) return std.mem.zeroes(Glyph);
         if (glyph_glossary.isPua(cp)) {
             if (glossary.get(cp)) |e| {
                 return self.lookupOrLoadCustom(e.render_key, e.payload, e.fmt, e.upm, e.width, fg);

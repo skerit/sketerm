@@ -8,6 +8,9 @@
 //! v2: image placements retained by the daemon's Screen
 //! (`retain_images`) ride along, so reattach restores images.
 //! v11: placement image numbers survive source eviction and replay.
+//! v12: a third trailing block carries the Kitty Unicode-placeholder
+//! tiles of the serialized lines plus the source images they show, which
+//! a client cannot otherwise draw (the image store is not carried).
 //! v4: OSC 133 command state (open C marker, last zone, exit code,
 //! completion sequence), so command waits survive resyncs.
 //! v6: a format byte per glossary entry (glyf vs colrv0). A v5 peer
@@ -42,7 +45,7 @@ const wire = @import("wire.zig");
 const Pool = style_pool.Pool;
 const palette_default_256 = @import("../grid/palette.zig").default_256;
 
-pub const SNAPSHOT_VERSION = 11;
+pub const SNAPSHOT_VERSION = 12;
 pub const LEGACY_SNAPSHOT_VERSION = 3;
 
 /// What a `Screen` field means to a snapshot.
@@ -183,12 +186,15 @@ const field_policy = [_]struct { name: []const u8, class: FieldClass }{
     .{ .name = "clusters", .class = .carried },
     // The image store is deliberately not carried: the pixels dwarf the
     // rest of the body. Post-attach transmissions repopulate it, and
-    // pre-attach placements ride `retained_images` instead.
+    // pre-attach placements ride `retained_images` instead. The one
+    // exception is the sources placeholder tiles show, which the v12
+    // tail writes beside `ph_tiles` and restore re-stores.
     .{ .name = "kitty_images", .class = .transient },
     .{ .name = "glyphs", .class = .carried },
     .{ .name = "virtual_placements", .class = .carried },
     .{ .name = "ph_pending", .class = .carried },
     .{ .name = "ph_last", .class = .carried },
+    .{ .name = "ph_tiles", .class = .carried },
 
     .{ .name = "default_fg", .class = .carried },
     .{ .name = "default_bg", .class = .carried },
@@ -501,9 +507,13 @@ pub fn serializeVersion(screen: *const Screen, out: *std.ArrayList(u8), allocato
     // Newest-first budget pass keeps the freshest placements when
     // the lot would overflow the wire frame; emitted in original
     // order so z-equal stacking stays stable.
+    // Pixel bytes the placements spent, which the v12 placeholder
+    // sources share `RETAIN_IMAGE_BUDGET` with.
+    var retained_sent: usize = 0;
     if (version >= 2) {
         const items = screen.retained_images.items;
-        var budget: usize = @min(Screen.RETAIN_IMAGE_BUDGET, budgetLeft(out));
+        const allowance: usize = @min(Screen.RETAIN_IMAGE_BUDGET, budgetLeft(out));
+        var budget = allowance;
         var first_kept: usize = items.len;
         while (first_kept > 0) {
             const need = retainedImageBytes(items[first_kept - 1].owned.len, version);
@@ -511,6 +521,7 @@ pub fn serializeVersion(screen: *const Screen, out: *std.ArrayList(u8), allocato
             budget -= need;
             first_kept -= 1;
         }
+        retained_sent = allowance - budget;
         try s.int(u32, @intCast(items.len - first_kept));
         for (items[first_kept..]) |ri| {
             const ev = ri.ev;
@@ -707,6 +718,77 @@ pub fn serializeVersion(screen: *const Screen, out: *std.ArrayList(u8), allocato
             try s.bytes(uv.name);
             try s.bytes(uv.value);
         }
+    }
+
+    if (version >= 12) try writePlaceholderTail(screen, s, first_sb, retained_sent);
+}
+
+/// Serialized size of one placeholder tile record.
+const PLACEHOLDER_TILE_BYTES: usize = 8 + 2 + 4 + 2 + 2;
+
+/// v12 tail: the placeholder tiles live on the serialized lines, then the
+/// source images they show. Without the sources a client cannot draw an
+/// image transmitted before it attached, since the image store itself is
+/// not carried; they share `RETAIN_IMAGE_BUDGET` with the placements, and
+/// one that does not fit is left out (its cells draw nothing until the
+/// app transmits again).
+fn writePlaceholderTail(screen: *const Screen, s: Sink, first_sb: u32, retained_sent: usize) !void {
+    const allocator = s.allocator;
+    const Kept = struct { key: grid.PlaceholderKey, tile: grid.PlaceholderTile };
+    var kept: std.ArrayList(Kept) = .empty;
+    defer kept.deinit(allocator);
+    if (screen.ph_tiles.count() > 0) {
+        var lines: std.AutoHashMapUnmanaged(u64, *const Line) = .empty;
+        defer lines.deinit(allocator);
+        for (screen.active) |*ln| try lines.put(allocator, ln.id, ln);
+        if (screen.alt) |alt| for (alt) |*ln| try lines.put(allocator, ln.id, ln);
+        var i: u32 = first_sb;
+        while (i < screen.scrollbackCount()) : (i += 1) {
+            const ln = screen.scrollbackLine(i);
+            try lines.put(allocator, ln.id, ln);
+        }
+        var it = screen.ph_tiles.iterator();
+        while (it.next()) |entry| {
+            const ln = lines.get(entry.key_ptr.line_id) orelse continue;
+            const tile = screen.placeholderTileAt(ln, entry.key_ptr.col) orelse continue;
+            try kept.append(allocator, .{ .key = entry.key_ptr.*, .tile = tile });
+        }
+    }
+    // The 4 bytes held back are the source count that always follows.
+    const max_tiles = (budgetLeft(s.out) -| 8) / PLACEHOLDER_TILE_BYTES;
+    if (kept.items.len > max_tiles) kept.items.len = max_tiles;
+    try s.int(u32, @intCast(kept.items.len));
+    for (kept.items) |k| {
+        try s.int(u64, k.key.line_id);
+        try s.int(u16, k.key.col);
+        try s.int(u32, k.tile.image_id);
+        try s.int(u16, k.tile.img_row);
+        try s.int(u16, k.tile.img_col);
+    }
+
+    var ids: std.AutoArrayHashMapUnmanaged(u32, void) = .empty;
+    defer ids.deinit(allocator);
+    for (kept.items) |k| {
+        if (screen.kitty_images.store.contains(k.tile.image_id)) try ids.put(allocator, k.tile.image_id, {});
+    }
+    var budget: usize = @min(Screen.RETAIN_IMAGE_BUDGET -| retained_sent, budgetLeft(s.out) -| 4);
+    var sources: std.ArrayList(u32) = .empty;
+    defer sources.deinit(allocator);
+    for (ids.keys()) |id| {
+        const img = screen.kitty_images.store.get(id).?;
+        const need = 4 * 5 + img.rgba.len;
+        if (need > budget) continue;
+        budget -= need;
+        try sources.append(allocator, id);
+    }
+    try s.int(u32, @intCast(sources.items.len));
+    for (sources.items) |id| {
+        const img = screen.kitty_images.store.get(id).?;
+        try s.int(u32, id);
+        try s.int(u32, img.number);
+        try s.int(u32, img.width);
+        try s.int(u32, img.height);
+        try s.bytes(img.rgba);
     }
 }
 
@@ -1287,6 +1369,40 @@ pub fn restoreStaged(allocator: std.mem.Allocator, pool: *Pool, bytes: []const u
         }
     }
 
+    // v12 tail: older snapshots carry no placeholder tiles, so their
+    // placeholder cells draw nothing until the app prints them again.
+    if (version >= 12) {
+        const n_tiles = try src.int(u32);
+        if (n_tiles > grid.PLACEHOLDER_TILE_CAP) return error.BadSnapshot;
+        try screen.ph_tiles.ensureTotalCapacity(n_tiles);
+        for (0..n_tiles) |_| {
+            const key = grid.PlaceholderKey{ .line_id = try src.int(u64), .col = try src.int(u16) };
+            const tile = grid.PlaceholderTile{
+                .image_id = try src.int(u32),
+                .img_row = try src.int(u16),
+                .img_col = try src.int(u16),
+            };
+            if (key.line_id == 0 or key.col >= cols or tile.image_id == 0 or screen.ph_tiles.contains(key))
+                return error.BadSnapshot;
+            screen.ph_tiles.putAssumeCapacity(key, tile);
+        }
+        const n_sources = try src.int(u32);
+        for (0..n_sources) |_| {
+            const id = try src.int(u32);
+            const number = try src.int(u32);
+            const width = try src.int(u32);
+            const height = try src.int(u32);
+            const data_len = try src.int(u32);
+            const data = try src.take(data_len);
+            if (id == 0 or screen.kitty_images.store.contains(id)) return error.BadSnapshot;
+            const owned = try allocator.dupe(u8, data);
+            screen.kitty_images.adoptDecoded(id, number, width, height, owned) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.BadSnapshot,
+            };
+        }
+    }
+
     if (version >= 8) try validateLinkState(screen);
     if (version >= 8 and src.pos != src.bytes.len) return error.BadSnapshot;
 
@@ -1355,6 +1471,16 @@ fn expectLineEqual(expected: *const Line, actual: *const Line) !void {
 fn expectOptionalStringEqual(expected: ?[]u8, actual: ?[]u8) !void {
     try testing.expectEqual(expected != null, actual != null);
     if (expected) |value| try testing.expectEqualStrings(value, actual.?);
+}
+
+fn expectLiveTilesEqual(expected: *const Screen, actual: *const Screen, e_lines: []const Line, a_lines: []const Line) !void {
+    try testing.expectEqual(e_lines.len, a_lines.len);
+    for (e_lines, a_lines) |*e_ln, *a_ln| {
+        var col: u16 = 0;
+        while (col < e_ln.cells.len) : (col += 1) {
+            try testing.expectEqual(expected.placeholderTileAt(e_ln, col), actual.placeholderTileAt(a_ln, col));
+        }
+    }
 }
 
 fn expectScreensEqual(expected: *const Screen, actual: *const Screen) !void {
@@ -1450,6 +1576,16 @@ fn expectScreensEqual(expected: *const Screen, actual: *const Screen) !void {
     while (placements.next()) |entry| {
         try testing.expectEqual(entry.value_ptr.*, actual.virtual_placements.get(entry.key_ptr.*) orelse
             return error.TestExpectedEqual);
+    }
+    // Placeholder tiles compare as what each cell SHOWS: the table also
+    // holds hints for overwritten cells, which a snapshot leaves behind.
+    try expectLiveTilesEqual(expected, actual, expected.active, actual.active);
+    if (expected.alt) |alt| try expectLiveTilesEqual(expected, actual, alt, actual.alt.?);
+    if (expected.scrollbackCount() == actual.scrollbackCount()) {
+        var sb_line: u32 = 0;
+        while (sb_line < expected.scrollbackCount()) : (sb_line += 1) {
+            try expectLiveTilesEqual(expected, actual, &.{expected.scrollbackLine(sb_line).*}, &.{actual.scrollbackLine(sb_line).*});
+        }
     }
     try testing.expectEqual(expected.selection_bg, actual.selection_bg);
     try testing.expectEqual(expected.selection_fg, actual.selection_fg);
@@ -2537,6 +2673,11 @@ test "snapshot: numbered deletes survive source eviction and negotiated replay" 
         var current: std.ArrayList(u8) = .empty;
         defer current.deinit(a);
         try serialize(h.screen, &current, a);
+        var v11: std.ArrayList(u8) = .empty;
+        defer v11.deinit(a);
+        try serializeVersion(h.screen, &v11, a, 11);
+        // No placeholder tiles: v12 adds only its two empty counts.
+        try testing.expectEqual(v11.items.len + 2 * 4, current.items.len);
         // Every historical layout remains readable and omits the new field.
         for (1..11) |version| {
             var legacy: std.ArrayList(u8) = .empty;
@@ -2547,7 +2688,7 @@ test "snapshot: numbered deletes survive source eviction and negotiated replay" 
             const old = try restore(a, &pool, legacy.items);
             defer old.deinit();
             for (old.retained_images.items) |ri| try testing.expectEqual(@as(u32, 0), ri.ev.image_number);
-            if (version == 10) try testing.expectEqual(legacy.items.len + 3 * 4, current.items.len);
+            if (version == 10) try testing.expectEqual(legacy.items.len + 3 * 4, v11.items.len);
         }
 
         var pool = try Pool.init(a);
@@ -2967,6 +3108,59 @@ test "snapshot: v9 zones, placeholder context and OSC state stay aligned after a
     pair.feed("\x1b]117\x07\x1b]119\x07");
     try expectScreensEqual(h.screen, client);
     try testing.expectEqual(@as(f32, 0.0), client.selection_bg[3]);
+}
+
+test "snapshot: v12 carries placeholder tiles and the images they show" {
+    const a = testing.allocator;
+    var h = try Harness.init(a, 10, 4);
+    defer h.deinit();
+
+    const rgba = [_]u8{
+        0xFF, 0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF,
+        0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    };
+    var b64_buf: [32]u8 = undefined;
+    const b64 = std.base64.standard.Encoder.encode(&b64_buf, &rgba);
+    var tx_buf: [128]u8 = undefined;
+    h.feed(try std.fmt.bufPrint(&tx_buf, "\x1b_Gi=5,a=T,U=1,f=32,s=2,v=2,c=2,r=2;{s}\x1b\\", .{b64}));
+    var seq: std.ArrayList(u8) = .empty;
+    defer seq.deinit(a);
+    try seq.appendSlice(a, "\x1b[2;3H\x1b[38;5;5m");
+    try appendCp(&seq, a, 0x10EEEE);
+    try appendCp(&seq, a, 0x030D); // image row 1
+    try appendCp(&seq, a, 0x030D); // image column 1
+    // A second placeholder overwritten by text: its hint must not cross.
+    try appendCp(&seq, a, 0x10EEEE);
+    try appendCp(&seq, a, 0x0305);
+    try appendCp(&seq, a, 0x0305);
+    try seq.appendSlice(a, "\x1b[m\x1b[2;4HZ");
+    h.feed(seq.items);
+    try testing.expectEqual(@as(u32, 2), h.screen.ph_tiles.count());
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(a);
+    try serialize(h.screen, &body, a);
+    var client_pool = try Pool.init(a);
+    defer client_pool.deinit();
+    const client = try restore(a, &client_pool, body.items);
+    defer client.deinit();
+    try expectScreensEqual(h.screen, client);
+    try testing.expectEqual(@as(u32, 1), client.ph_tiles.count());
+    try testing.expectEqual(grid.PlaceholderTile{ .image_id = 5, .img_row = 1, .img_col = 1 }, client.placeholderTileAt(&client.active[1], 2).?);
+    const source = client.kitty_images.get(5).?;
+    try testing.expectEqualSlices(u8, &rgba, source.rgba);
+    try testing.expectEqual(grid.Screen.PlaceholderGrid{ .cols = 2, .rows = 2 }, client.placeholderGrid(5, 8, 16).?);
+
+    // A v11 peer gets a body it can read; the tiles simply are not there.
+    var v11: std.ArrayList(u8) = .empty;
+    defer v11.deinit(a);
+    try serializeVersion(h.screen, &v11, a, 11);
+    var old_pool = try Pool.init(a);
+    defer old_pool.deinit();
+    const old = try restore(a, &old_pool, v11.items);
+    defer old.deinit();
+    try testing.expectEqual(@as(u32, 0), old.ph_tiles.count());
+    try testing.expect(old.kitty_images.get(5) == null);
 }
 
 test "snapshot: a v9 body is refused by a v8 reader and truncation is Truncated" {
