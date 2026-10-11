@@ -10,6 +10,69 @@ allowed navigation clears it. A deterministic callback-ordering regression pins
 the full long URL, and Autologin's native suite exercises repeated fresh-view
 redirects without contacting the loopback callback listener.
 
+## 2026-10-11: cross-subsystem review repairs ownership and failure recovery
+
+Independent subsystem reviews and a second review of their diffs found
+ownership, ordering and error-reporting defects behind repeated code.
+Browser popups now own independent network policies, announce their exact
+inherited policy to headless clients, and share one retirement path with
+explicit view closure. Failed extension popups release dependent state;
+discard preserves active downloads and restores frame mappings when
+refused. Client navigation has one retry-reset path, including Shift+Reload,
+and new connections cannot consume another connection's poll entry.
+
+Agent terminals release background reconnect jobs at terminal teardown and
+use asynchronous recovery instead of blocking the MCP loop on SSH. App
+input conversions reject invalid IDs and overflowing scroll deltas, while a
+JSON null for an optional integer still means absent, as the tool bodies
+always read it; launch observation has one deadline covering startup and
+screenshot settling. OpenCode numeric parsing and integer form answers no
+longer convert out-of-range values through unchecked floating-point casts,
+so an integral float answer such as "3.0" is now refused.
+
+The daemon drains bounded multi-frame batches and compacts each output
+lane once, preserving audio preemption only between complete frames.
+PulseAudio requests validate sample specifications, failed GUI audio voices
+continue reporting consumed data, and hard PTY writes account for dropped
+input. Shared SIGPIPE handling replaces three duplicate handlers.
+
+FUSE directory handles retain stable enumeration snapshots until rewind.
+Rename metadata is prepared before the remote operation, overwritten nodes
+cannot remove replacement mappings, and hardlink-to-hardlink no-op renames
+preserve both handles. Batch rename orders occupied-target dependencies
+before execution. LSP framing queues whole messages atomically; document
+sync advances only after successful notification, retries failed opens and
+full replacements, and blocks requests against unsynchronized text. Server
+binding preserves the old connection if URI preparation fails.
+
+Forwarded windows share per-window teardown, including recording aborts.
+Deferred pane actions resolve stable IDs across window moves instead of
+comparing freed pointers. A shared capture writer reports save failures;
+GL reset lists have one implementation, and shader previews borrow their
+texture without deleting it. Parser regressions cover cancelled VT52
+addresses, omitted CSI parameters and incomplete control-string rejection.
+Layout parsing rejects discarded extra nodes and handles quoted arguments
+with shell rules, so an unbalanced quote anywhere in a pane command (an
+apostrophe in `it's`) is refused as `UnclosedQuote`;
+configuration rejects nonfinite numbers. Shared file readers distinguish
+read errors from EOF and reject excess data before allocation; path helpers
+reject files where directories or executable programs are required.
+
+Regression coverage includes allocation-failure sweeps, socket backpressure,
+real FUSE enumeration/rename, real CEF popup policy and download lifecycle,
+LSP stub-process resynchronization, and Wayland screenshot-save dialogs.
+The GUI-only capture writer is registered in `tests.zig`. The GTK Aro shim
+was synchronized with GTK 4.24 after the existing drift guard detected the
+host's header upgrade.
+
+Verification: `zig build test test-core test-web` passed 8,037 tests with
+23 skips and no failures. Daemon/broker, editor/LSP, FUSE, focused Wayland
+capture, focused browser lifecycle/network-retry (system and pinned CEF),
+and fake-agent MCP smokes passed. Portable Linux-musl and aarch64-macos
+builds passed; the native daemon still links only libc/libm. macOS was
+cross-compiled, not runtime-tested; optional Weston/Xwayland stages were
+skipped when their runtime tools were unavailable.
+
 ## 2026-10-10: the AI badge popover keeps its buttons across roster changes
 
 A click on the AI badge popover could be lost: every roster change
