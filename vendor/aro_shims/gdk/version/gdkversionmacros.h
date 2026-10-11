@@ -71,14 +71,14 @@
  *
  * The minor version component of the library's version, e.g. "2" for "1.2.3".
  */
-#define GDK_MINOR_VERSION (22)
+#define GDK_MINOR_VERSION (24)
 
 /**
  * GDK_MICRO_VERSION:
  *
  * The micro version component of the library's version, e.g. "3" for "1.2.3".
  */
-#define GDK_MICRO_VERSION (5)
+#define GDK_MICRO_VERSION (1)
 /**
  * GDK_VERSION_4_0:
  *
@@ -187,6 +187,15 @@
  * Since: 4.22
  */
 #define GDK_VERSION_4_22 (G_ENCODE_VERSION (4, 22))
+/**
+ * GDK_VERSION_4_24:
+ *
+ * A macro that evaluates to the 4.24 version of GTK, in a format
+ * that can be used by the C pre-processor.
+ *
+ * Since: 4.24
+ */
+#define GDK_VERSION_4_24 (G_ENCODE_VERSION (4, 24))
 
 /* evaluates to the current stable version; for development cycles,
  * this means the next stable target, with a hard backstop to the

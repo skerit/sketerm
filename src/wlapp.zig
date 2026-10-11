@@ -346,6 +346,26 @@ pub const AppHost = struct {
             im.deinit();
         }
 
+        /// Release window-owned state before destroying its widgets.
+        fn releaseOwned(self: *Win) void {
+            self.rec.abort();
+            self.opaque_resize.cancel();
+            self.severIm();
+            if (self.app_id) |aid| self.host.allocator.free(aid);
+            self.app_id = null;
+            if (self.icon_tex) |tex| c.g_object_unref(tex);
+            self.icon_tex = null;
+        }
+
+        /// Destroy a window after its overlays and embedded parent have been detached.
+        fn destroy(self: *Win) void {
+            const allocator = self.host.allocator;
+            self.releaseOwned();
+            _ = c.g_object_set_data(@ptrCast(self.window), "sketerm-wlapp", null);
+            destroyAppWindow(self.window);
+            allocator.destroy(self);
+        }
+
         /// Store the icon texture and apply it (needs the surface;
         /// onWinRealize re-applies). Takes ownership of one ref.
         fn setIconTexture(self: *Win, tex: *c.GdkTexture) void {
@@ -636,14 +656,7 @@ pub const AppHost = struct {
                 w.*.embedded = false;
                 if (self.embed_box) |box| c.gtk_box_remove(@ptrCast(box), w.*.overlay);
             }
-            // Break the close-request link before gtk teardown.
-            w.*.opaque_resize.cancel();
-            if (w.*.app_id) |aid| self.allocator.free(aid);
-            if (w.*.icon_tex) |tex| c.g_object_unref(tex);
-            w.*.severIm();
-            _ = c.g_object_set_data(@ptrCast(w.*.window), "sketerm-wlapp", null);
-            destroyAppWindow(w.*.window);
-            self.allocator.destroy(w.*);
+            w.*.destroy();
         }
         self.windows.deinit(self.allocator);
         var ppit = self.pending_popups.valueIterator();
@@ -1554,14 +1567,7 @@ pub const AppHost = struct {
             if (self.embed_box) |box| c.gtk_box_remove(@ptrCast(box), win.overlay);
             if (self.on_embed) |f| f(self.embed_ctx, false);
         }
-        win.rec.abort();
-        if (win.app_id) |aid| self.allocator.free(aid);
-        if (win.icon_tex) |tex| c.g_object_unref(tex);
-        win.opaque_resize.cancel();
-        win.severIm();
-        _ = c.g_object_set_data(@ptrCast(win.window), "sketerm-wlapp", null);
-        destroyAppWindow(win.window);
-        self.allocator.destroy(win);
+        win.destroy();
         if (self.on_windows_changed) |f| f(self.embed_ctx, self.windows.count());
     }
 
@@ -2683,4 +2689,27 @@ test "purgePendingUnder walks an arbitrarily deep chain without recursing" {
     try std.testing.expectEqual(@as(usize, 1), host.pending_popups.count());
     try std.testing.expectEqual(@as(usize, 0), host.pending_subsurfaces.count());
     try std.testing.expect(host.pending_popups.get(depth + 2) != null);
+}
+
+test "forwarded Wayland window releases an unfinished recording on teardown" {
+    const a = std.testing.allocator;
+    const host = try a.create(AppHost);
+    defer a.destroy(host);
+    host.allocator = a;
+    var win: AppHost.Win = .{
+        .host = host,
+        .surface = 1,
+        .window = undefined,
+        .overlay = undefined,
+        .picture = undefined,
+        .app_id = try a.dupe(u8, "recorded-app"),
+        .rec = .{ .gif = @import("util/gifrec.zig").Rec.init(a, 0) },
+    };
+    defer win.releaseOwned();
+    const pixels = [_]u8{255} ** (4 * 4 * 4);
+    try win.rec.gif.?.addShmFrame(&pixels, 4, 4, 0, 100);
+    try std.testing.expect(win.rec.gif.?.pend != null);
+    win.releaseOwned();
+    try std.testing.expect(!win.rec.active());
+    try std.testing.expect(win.app_id == null);
 }

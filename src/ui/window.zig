@@ -2531,10 +2531,8 @@ pub const Window = struct {
     // ── tab context menu (right-click a tab) ─────────────────────────
 
     const PaneTitleCtx = struct {
-        window: *Window,
-        pane: *Pane,
+        pane_id: u32,
         popover: *c.GtkWidget,
-        entry: *c.GtkWidget,
         allocator: std.mem.Allocator,
     };
 
@@ -2580,10 +2578,8 @@ pub const Window = struct {
 
         const ctx = self.allocator.create(PaneTitleCtx) catch return;
         ctx.* = .{
-            .window = self,
-            .pane = pane,
+            .pane_id = pane.id,
             .popover = popover,
-            .entry = entry,
             .allocator = self.allocator,
         };
 
@@ -2600,13 +2596,7 @@ pub const Window = struct {
         _ = c.gtk_widget_grab_focus(entry);
     }
 
-    const MuxRenameCtx = struct {
-        window: *Window,
-        pane: *Pane,
-        popover: *c.GtkWidget,
-        entry: *c.GtkWidget,
-        allocator: std.mem.Allocator,
-    };
+    const MuxRenameCtx = PaneTitleCtx;
 
     /// "Rename Session…" on a mux pane: popover entry pre-filled with
     /// the session name. Enter sends the rename to the daemon; the
@@ -2640,10 +2630,8 @@ pub const Window = struct {
 
         const ctx = self.allocator.create(MuxRenameCtx) catch return;
         ctx.* = .{
-            .window = self,
-            .pane = pane,
+            .pane_id = pane.id,
             .popover = popover,
-            .entry = entry,
             .allocator = self.allocator,
         };
 
@@ -3744,23 +3732,14 @@ fn onRenameActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
 
 fn onPaneTitleActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
     const ctx = cast.userData(Window.PaneTitleCtx, user);
-    // The pane can be closed (keybind, child exit) while the popover
-    // is open — verify it's still alive before dereferencing.
-    var alive = false;
-    for (ctx.window.panes.items) |p| {
-        if (p == ctx.pane) {
-            alive = true;
-            break;
-        }
-    }
-    if (alive) {
+    if (Window.remotectl.livePaneById(ctx.pane_id)) |ref| {
         const text_c = c.gtk_editable_get_text(@ptrCast(entry));
         if (text_c != null) {
             const text = std.mem.span(@as([*:0]const u8, @ptrCast(text_c)));
             if (text.len == 0) {
-                ctx.pane.unlockTitle();
+                ref.pane.unlockTitle();
             } else {
-                ctx.pane.lockTitle(text);
+                ref.pane.lockTitle(text);
             }
         }
     }
@@ -3769,20 +3748,11 @@ fn onPaneTitleActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void 
 
 fn onMuxRenameActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
     const ctx = cast.userData(Window.MuxRenameCtx, user);
-    // The pane can close while the popover is open — verify it's
-    // still alive before dereferencing.
-    var alive = false;
-    for (ctx.window.panes.items) |p| {
-        if (p == ctx.pane) {
-            alive = true;
-            break;
-        }
-    }
-    if (alive) {
+    if (Window.remotectl.livePaneById(ctx.pane_id)) |ref| {
         const text_c = c.gtk_editable_get_text(@ptrCast(entry));
         if (text_c != null) {
             const text = std.mem.span(@as([*:0]const u8, @ptrCast(text_c)));
-            if (text.len > 0) ctx.pane.terminal.renameSession(text);
+            if (text.len > 0) ref.pane.terminal.renameSession(text);
         }
     }
     c.gtk_popover_popdown(@ptrCast(ctx.popover));

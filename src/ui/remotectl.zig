@@ -201,6 +201,14 @@ pub fn windowForPane(app: ?*c.GtkApplication, pane_id: u32) ?PaneRef {
 
 pub const PaneRef = struct { win: *Window, pane: *Pane };
 
+/// Resolve a deferred pane action by process-unique identity, including after a tab moves.
+pub fn livePaneById(id: u32) ?PaneRef {
+    const app = c.g_application_get_default() orelse return null;
+    const ref = windowForPane(@ptrCast(app), id) orelse return null;
+    if (ref.win.destroying or ref.pane.widgets_dead or ref.pane.isSeveringFaces()) return null;
+    return ref;
+}
+
 /// The live Window with process-global `id`, if it has not been destroyed.
 pub fn windowById(app: ?*c.GtkApplication, id: u32) ?*Window {
     const a = app orelse return null;
@@ -1795,4 +1803,29 @@ test "IPC screenshots use private complete replacement" {
     var st: c.struct_stat = undefined;
     try t.expect(c.stat(path_z.ptr, &st) == 0);
     try t.expectEqual(@as(c_uint, 0o600), @as(c_uint, @intCast(st.st_mode & 0o777)));
+}
+
+test "pane identity rejects reused addresses and survives movement between owners" {
+    const a = std.testing.allocator;
+    const pane = try a.create(Pane);
+    defer a.destroy(pane);
+    const source = try a.create(Window);
+    defer a.destroy(source);
+    const destination = try a.create(Window);
+    defer a.destroy(destination);
+    pane.id = 101;
+    const saved_id = pane.id;
+    var panes = [_]*Pane{pane};
+    source.panes = .{ .items = &panes, .capacity = panes.len };
+    destination.panes = .empty;
+    try std.testing.expect(paneById(source, saved_id) == pane);
+    source.panes = .empty;
+    destination.panes = .{ .items = &panes, .capacity = panes.len };
+    try std.testing.expect(paneById(source, saved_id) == null);
+    try std.testing.expect(paneById(destination, saved_id) == pane);
+    // The address now belongs to a replacement; an earlier picker still
+    // names only the retired identity, not this new pane.
+    pane.id = 102;
+    try std.testing.expect(paneById(destination, saved_id) == null);
+    try std.testing.expect(paneById(destination, 102) == pane);
 }

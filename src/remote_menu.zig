@@ -24,7 +24,7 @@ const c = @import("c.zig").c;
 const cast = @import("util/cast.zig");
 const picker = @import("ui/picker.zig");
 const fpicker = @import("filebrowser/picker.zig");
-const pathZ = @import("util/pathz.zig").pathZ;
+const savebytes = @import("ui/savebytes.zig");
 const clock = @import("util/clock.zig");
 
 /// Pending "where do I put this blob?" pick. The encoded bytes are
@@ -50,12 +50,15 @@ fn askSaveBytes(
         return;
     };
     ctx.* = .{ .allocator = allocator, .bytes = bytes, .parent = parent };
+    if (parent) |p| _ = c.g_object_ref(p);
     _ = picker.PickerWindow.open(allocator, parent, .{
         .mode = .save_file,
         .title = title,
         .suggested_name = suggested,
         .filters = filters,
+        .local_only = true,
     }, &onShotPicked, @ptrCast(ctx)) catch {
+        if (parent) |p| c.g_object_unref(p);
         c.g_bytes_unref(bytes);
         allocator.destroy(ctx);
         return;
@@ -67,6 +70,7 @@ fn askSaveBytes(
 fn onShotPicked(user: ?*anyopaque, result: ?fpicker.Result) void {
     const ctx = cast.userData(SaveBytesCtx, user);
     defer {
+        if (ctx.parent) |parent| c.g_object_unref(parent);
         c.g_bytes_unref(ctx.bytes);
         ctx.allocator.destroy(ctx);
     }
@@ -79,23 +83,7 @@ fn onShotPicked(user: ?*anyopaque, result: ?fpicker.Result) void {
         res.specs[0],
         "Sketerm writes the file itself — pick a location on this machine.",
     ) orelse return;
-    var pz: [4096]u8 = undefined;
-    const path_z = pathZ(&pz, path) catch return;
-    const file = c.g_file_new_for_path(path_z) orelse return;
-    defer c.g_object_unref(file);
-    var sz: usize = 0;
-    const data = c.g_bytes_get_data(ctx.bytes, &sz) orelse return;
-    _ = c.g_file_replace_contents(
-        file,
-        @ptrCast(data),
-        sz,
-        null,
-        0,
-        c.G_FILE_CREATE_REPLACE_DESTINATION,
-        null,
-        null,
-        null,
-    );
+    _ = savebytes.save(ctx.parent, path, ctx.bytes, c.G_FILE_CREATE_REPLACE_DESTINATION);
 }
 
 const PNG_FILTERS = [_]fpicker.Filter{.{ .label = "PNG images", .patterns = &.{"*.png"} }};

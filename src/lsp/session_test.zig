@@ -10,6 +10,7 @@ const rpc = @import("rpc.zig");
 const session = @import("session.zig");
 const pos = @import("position.zig");
 const Session = session.Session;
+const docsync = @import("docsync.zig");
 
 /// Collects everything the session hands back so a test can assert on
 /// it, and decodes the session's outbound frames.
@@ -386,8 +387,8 @@ test "session: an empty capability set disables every feature" {
     try testing.expectEqual(session.SyncKind.none, fx.s.caps.sync);
     // Sync is off, so didOpen/didChange emit NOTHING rather than
     // desynchronising a server that never asked for documents.
-    fx.s.didOpen("file:///a.zig", "zig", 1, "x");
-    fx.s.didChange("file:///a.zig", 2, &.{}, "y");
+    try fx.s.didOpen("file:///a.zig", "zig", 1, "x");
+    try fx.s.didChange("file:///a.zig", 2, &.{}, "y");
     const after = try fx.drainSent();
     try testing.expectEqual(@as(usize, 1), after.items.len); // just "initialized"
 }
@@ -428,7 +429,7 @@ test "session: incremental didChange carries ranges in array order" {
         .{ .range = .{ .start = .{ .line = 3, .character = 2 }, .end = .{ .line = 3, .character = 5 } }, .text = "AB" },
         .{ .range = .{ .start = .{ .line = 0, .character = 0 }, .end = .{ .line = 0, .character = 0 } }, .text = "\n" },
     };
-    fx.s.didChange("file:///a.zig", 7, &changes, "IGNORED");
+    try fx.s.didChange("file:///a.zig", 7, &changes, "IGNORED");
     const sent = try fx.drainSent();
     try testing.expectEqualStrings("textDocument/didChange", sent.items[0].method());
     const p = sent.items[0].params().object;
@@ -455,7 +456,7 @@ test "session: a full-sync server gets the whole document, never the ranges" {
     const changes = [_]session.ContentChange{
         .{ .range = .{}, .text = "x" },
     };
-    fx.s.didChange("file:///a.zig", 2, &changes, "WHOLE TEXT");
+    try fx.s.didChange("file:///a.zig", 2, &changes, "WHOLE TEXT");
     const sent = try fx.drainSent();
     const arr = sent.items[0].params().object.get("contentChanges").?.array;
     try testing.expectEqual(@as(usize, 1), arr.items.len);
@@ -469,11 +470,138 @@ test "session: didOpen escapes control characters and multibyte text survives" {
     defer fx.deinit();
     try fx.ready();
     fx.s.out.clearRetainingCapacity();
-    fx.s.didOpen("file:///a.zig", "zig", 1, "a\t\"b\"\n\u{1F600}\x01");
+    try fx.s.didOpen("file:///a.zig", "zig", 1, "a\t\"b\"\n\u{1F600}\x01");
     const sent = try fx.drainSent();
     const td = sent.items[0].params().object.get("textDocument").?.object;
     try testing.expectEqualStrings("a\t\"b\"\n\u{1F600}\x01", td.get("text").?.string);
     try testing.expectEqualStrings("zig", td.get("languageId").?.string);
+}
+
+test "session: document notifications preserve queued messages on every allocation failure" {
+    inline for (.{ true, false }) |opening| {
+        try testing.checkAllAllocationFailures(testing.allocator, struct {
+            fn run(allocator: std.mem.Allocator) !void {
+                var fx: Fixture = undefined;
+                fx.init();
+                defer fx.deinit();
+                fx.s.state = .ready;
+                fx.s.caps = .{ .open_close = true, .sync = .full };
+                try fx.s.out.appendSlice(testing.allocator, "previous frame");
+                fx.s.alloc = allocator;
+                defer fx.s.alloc = testing.allocator;
+                const text = [_]u8{'x'} ** 512;
+                const sent = if (opening)
+                    fx.s.didOpen("file:///a.zig", "zig", 1, &text)
+                else
+                    fx.s.didChange("file:///a.zig", 2, &.{}, &text);
+                sent catch |err| {
+                    try testing.expectEqualStrings("previous frame", fx.s.out.items);
+                    return err;
+                };
+            }
+        }.run, .{});
+    }
+}
+
+test "session: failed didOpen remains unopened and can retry with the real document" {
+    var fx: Fixture = undefined;
+    fx.init();
+    defer fx.deinit();
+    fx.s.state = .ready;
+    fx.s.caps = .{ .open_close = true, .sync = .incremental };
+    var ds = docsync.DocSync.init(testing.allocator);
+    defer ds.deinit();
+    try ds.setUri("file:///a.zig");
+    ds.language_id = "zig";
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    fx.s.alloc = failing.allocator();
+    defer fx.s.alloc = testing.allocator;
+    try testing.expectError(error.OutOfMemory, ds.openDocument(&fx.s, 7, "real text"));
+    try testing.expect(!ds.open);
+    try testing.expectEqual(@as(i64, 0), ds.version);
+    try testing.expectEqual(@as(usize, 0), fx.s.out.items.len);
+    failing.fail_index = std.math.maxInt(usize);
+    try ds.openDocument(&fx.s, 8, "newer real text");
+    const sent = try fx.drainSent();
+    try testing.expectEqual(@as(usize, 1), sent.items.len);
+    try testing.expectEqualStrings("textDocument/didOpen", sent.items[0].method());
+    try testing.expectEqualStrings("newer real text", sent.items[0].params().object.get("textDocument").?.object.get("text").?.string);
+    try testing.expect(ds.open);
+    try testing.expectEqual(@as(u64, 8), ds.sent_revision);
+}
+
+test "session: failed incremental didChange retains the old version and retries in full" {
+    const Document = @import("../editor/document.zig").Document;
+    const Transaction = @import("../editor/transaction.zig").Transaction;
+    var fx: Fixture = undefined;
+    fx.init();
+    defer fx.deinit();
+    fx.s.state = .ready;
+    fx.s.caps = .{ .open_close = true, .sync = .incremental };
+    var doc = try Document.initFromBytes(testing.allocator, "abc");
+    defer doc.deinit();
+    var ds = docsync.DocSync.init(testing.allocator);
+    defer ds.deinit();
+    try ds.setUri("file:///a.zig");
+    try ds.openDocument(&fx.s, doc.revision, "abc");
+    _ = try fx.drainSent();
+    const sent_revision = ds.sent_revision;
+    var tx = Transaction.init(doc.revision);
+    defer tx.deinit(testing.allocator);
+    try tx.addInsert(testing.allocator, 0, "x");
+    ds.noteEdits(&doc, tx.edits.items, .utf16);
+    _ = try doc.applyTransaction(&tx);
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    fx.s.alloc = failing.allocator();
+    defer fx.s.alloc = testing.allocator;
+    ds.flush(&fx.s, "xabc");
+    try testing.expect(ds.hasPendingChanges());
+    try testing.expect(ds.needs_full);
+    try testing.expect(ds.queueHasItems());
+    try testing.expectEqual(sent_revision, ds.sent_revision);
+    try testing.expectEqual(@as(i64, 1), ds.version);
+    try testing.expectEqual(@as(usize, 0), fx.s.out.items.len);
+    failing.fail_index = std.math.maxInt(usize);
+    ds.flush(&fx.s, "xabc");
+    const sent = try fx.drainSent();
+    try testing.expectEqual(@as(usize, 1), sent.items.len);
+    const params = sent.items[0].params().object;
+    const changes = params.get("contentChanges").?.array.items;
+    try testing.expectEqual(@as(usize, 1), changes.len);
+    try testing.expect(changes[0].object.get("range") == null);
+    try testing.expectEqualStrings("xabc", changes[0].object.get("text").?.string);
+    try testing.expectEqual(@as(i64, 2), params.get("textDocument").?.object.get("version").?.integer);
+    try testing.expectEqual(doc.revision, ds.sent_revision);
+    try testing.expect(!ds.hasPendingChanges());
+}
+
+test "session: replacement send failure retains full sync and the replacement revision" {
+    var fx: Fixture = undefined;
+    fx.init();
+    defer fx.deinit();
+    fx.s.state = .ready;
+    fx.s.caps = .{ .open_close = true, .sync = .incremental };
+    var ds = docsync.DocSync.init(testing.allocator);
+    defer ds.deinit();
+    try ds.setUri("file:///a.zig");
+    try ds.openDocument(&fx.s, 3, "old");
+    _ = try fx.drainSent();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    fx.s.alloc = failing.allocator();
+    defer fx.s.alloc = testing.allocator;
+    try testing.expectError(error.OutOfMemory, ds.replaceDocument(&fx.s, 0, "replacement"));
+    try testing.expect(ds.needs_full);
+    try testing.expectEqual(@as(i64, 1), ds.version);
+    try testing.expectEqual(@as(u64, 0), ds.revision);
+    try testing.expectEqual(@as(u64, 3), ds.sent_revision);
+    failing.fail_index = std.math.maxInt(usize);
+    ds.flush(&fx.s, "replacement");
+    try testing.expect(!ds.hasPendingChanges());
+    try testing.expectEqual(@as(i64, 2), ds.version);
+    try testing.expectEqual(@as(u64, 0), ds.sent_revision);
+    const sent = try fx.drainSent();
+    const changes = sent.items[0].params().object.get("contentChanges").?.array.items;
+    try testing.expectEqualStrings("replacement", changes[0].object.get("text").?.string);
 }
 
 test "session: a stale response still carries the revision it was built for" {
@@ -580,7 +708,7 @@ test "session: workspace/configuration answers from the configured settings" {
         1,
         "",
         \\{"zls":{"enable_snippets":false},"typescript":{"format":{"semicolons":"remove"}}}
-    ,
+        ,
     );
     _ = try fx.drainSent();
     try fx.feed(

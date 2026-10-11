@@ -91,8 +91,9 @@ pub const DocSync = struct {
     }
 
     pub fn setUri(self: *DocSync, uri: []const u8) Allocator.Error!void {
+        const owned = try self.alloc.dupe(u8, uri);
         if (self.uri.len > 0) self.alloc.free(self.uri);
-        self.uri = try self.alloc.dupe(u8, uri);
+        self.uri = owned;
     }
 
     pub fn clearQueue(self: *DocSync) void {
@@ -121,6 +122,21 @@ pub const DocSync = struct {
         self.replaceSentRope(text);
     }
 
+    /// Mark the document open only after its complete notification was queued.
+    pub fn openDocument(self: *DocSync, sess: *session.Session, document_revision: u64, text: []const u8) session.SyncError!void {
+        try sess.didOpen(self.uri, self.language_id, 1, text);
+        self.noteSent(1, document_revision, text);
+        self.open = true;
+    }
+
+    /// Retain a full resync if a replacement's notification cannot be queued.
+    pub fn replaceDocument(self: *DocSync, sess: *session.Session, document_revision: u64, text: []const u8) session.SyncError!void {
+        self.resetForNewDocument(document_revision);
+        const next_version = self.version + 1;
+        try sess.didChange(self.uri, next_version, &.{}, text);
+        self.noteSent(next_version, document_revision, text);
+    }
+
     /// Forget everything describing the document that was just replaced.
     ///
     /// The queue and the anchor map are cleared as a PAIR: a map left
@@ -131,17 +147,22 @@ pub const DocSync = struct {
     /// rope goes with them, and `needs_full` is set so a caller that
     /// fails to send its didChange still resyncs on the next flush
     /// instead of latching a half-described document.
-    pub fn resetForNewDocument(self: *DocSync) void {
+    pub fn resetForNewDocument(self: *DocSync, document_revision: u64) void {
         self.clearQueue();
         self.clearMap();
         self.clearSentRope();
+        self.revision = document_revision;
         self.needs_full = true;
     }
 
     /// A numeric workspace edit version is current only for the exact synchronized document state.
     pub fn acceptsEditVersion(self: *const DocSync, version: i64, document_revision: u64) bool {
-        return self.open and version == self.version and !self.hasPendingChanges() and
-            document_revision == self.sent_revision;
+        return version == self.version and self.isSynchronized(document_revision);
+    }
+
+    /// Whether the outbound queue includes the complete current document state.
+    pub fn isSynchronized(self: *const DocSync, document_revision: u64) bool {
+        return self.open and !self.hasPendingChanges() and document_revision == self.sent_revision;
     }
 
     /// Capture one transaction's edits against the PRE-edit document.
@@ -181,24 +202,34 @@ pub const DocSync = struct {
     /// server wants full sync, or when a capture failed.
     pub fn flush(self: *DocSync, sess: *session.Session, full_text: []const u8) void {
         if (!self.open or !self.hasPendingChanges()) return;
-        self.version += 1;
-        if (self.needs_full) {
-            sess.didChange(self.uri, self.version, &.{}, full_text);
-        } else {
-            // The wire type borrows; a stack copy of the view is enough.
-            var view: std.ArrayList(session.ContentChange) = .empty;
-            defer view.deinit(self.alloc);
-            view.ensureTotalCapacity(self.alloc, self.queue.items.len) catch {
-                sess.didChange(self.uri, self.version, &.{}, full_text);
-                self.finishFlush(full_text);
-                return;
-            };
-            for (self.queue.items) |q| {
-                view.appendAssumeCapacity(.{ .range = q.range, .text = q.text });
-            }
-            sess.didChange(self.uri, self.version, view.items, full_text);
+        const next_version = self.version + 1;
+        var view: std.ArrayList(session.ContentChange) = .empty;
+        defer view.deinit(self.alloc);
+        if (!self.needs_full) {
+            if (view.ensureTotalCapacity(self.alloc, self.queue.items.len)) |_| {
+                for (self.queue.items) |q| {
+                    view.appendAssumeCapacity(.{ .range = q.range, .text = q.text });
+                }
+            } else |_| self.needs_full = true;
         }
+        sess.didChange(self.uri, next_version, view.items, full_text) catch {
+            self.needs_full = true;
+            return;
+        };
+        self.version = next_version;
         self.finishFlush(full_text);
+    }
+
+    /// Queue the current document, falling back to full text when incremental state is incomplete.
+    pub fn flushDocument(self: *DocSync, sess: *session.Session, doc: *const Document) bool {
+        if (!self.open or sess.state != .ready) return false;
+        if (self.isSynchronized(doc.revision)) return true;
+        if (self.revision != doc.revision or !self.hasPendingChanges())
+            self.resetForNewDocument(doc.revision);
+        const text = doc.textAlloc(self.alloc) catch return false;
+        defer self.alloc.free(text);
+        self.flush(sess, text);
+        return self.isSynchronized(doc.revision);
     }
 
     /// A publication mapper exists only when its ranges have a known source rope and forward edit path.
@@ -573,10 +604,21 @@ test "docsync: a replaced document drops its queue and its anchor map together" 
     _ = try doc.applyTransaction(&tx);
     try testing.expect(ds.diagnosticMapper(&doc, null) != null);
 
-    ds.resetForNewDocument();
+    ds.resetForNewDocument(doc.revision);
     try testing.expect(!ds.queueHasItems());
     // No stale replay survives, and the next flush resyncs in full.
     try testing.expect(ds.diagnosticMapper(&doc, null) == null);
     try testing.expect(ds.needs_full);
     try testing.expect(ds.hasPendingChanges());
+}
+
+test "docsync: a failed URI replacement preserves its owned URI" {
+    var ds = DocSync.init(testing.allocator);
+    defer ds.deinit();
+    try ds.setUri("file:///old.zig");
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    ds.alloc = failing.allocator();
+    defer ds.alloc = testing.allocator;
+    try testing.expectError(error.OutOfMemory, ds.setUri("file:///new.zig"));
+    try testing.expectEqualStrings("file:///old.zig", ds.uri);
 }

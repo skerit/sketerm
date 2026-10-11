@@ -85,12 +85,9 @@ const PresetButtonCtx = struct {
     /// focusedPane() then returns null). Null = delete-only ctx.
     pane: ?*Pane = null,
 };
-/// Carries its own allocator: the picker's cancel callback can fire
-/// while the parent window is being torn down, and freeing the ctx
-/// must not dereference `win` then.
+/// Picker cancellation may outlive the pane and its original window.
 const ShaderPickCtx = struct {
-    win: *Window,
-    pane: *Pane,
+    pane_id: u32,
     allocator: std.mem.Allocator,
 };
 
@@ -117,13 +114,14 @@ pub fn pickPaneShader(self: *Window) void {
     else
         null;
     const ctx = self.allocator.create(ShaderPickCtx) catch return;
-    ctx.* = .{ .win = self, .pane = pane, .allocator = self.allocator };
+    ctx.* = .{ .pane_id = pane.id, .allocator = self.allocator };
     _ = @import("picker.zig").PickerWindow.open(
         self.allocator,
         @ptrCast(self.app_window),
         .{
             .mode = .open_file,
             .title = "Choose Pane Shader (GLSL, shadertoy mainImage)",
+            .local_only = true,
             .initial_spec = start,
             .filters = &.{
                 .{ .label = "Shaders", .patterns = &.{ "*.glsl", "*.frag", "*.fs", "*.shader" } },
@@ -1481,29 +1479,20 @@ pub fn onShaderPicked(user: ?*anyopaque, result: ?@import("../filebrowser/picker
     const res = result orelse return;
     if (res.specs.len == 0) return;
 
-    // The pane may have closed while the dialog was up — only act if
-    // it's still listed (the pointer would be dangling otherwise).
-    var alive = false;
-    for (ctx.win.panes.items) |p| {
-        if (p == ctx.pane) {
-            alive = true;
-            break;
-        }
-    }
-    if (!alive) return;
+    const ref = @import("remotectl.zig").livePaneById(ctx.pane_id) orelse return;
     // The GL shader compiler reads the file with local libc; a remote
     // pick has no local path, so refuse it out loud.
     const path = @import("picker.zig").localPathOrRefuse(
-        @ptrCast(ctx.win.app_window),
+        @ptrCast(ref.win.app_window),
         res.specs[0],
         "The GL shader compiler reads the file locally — pick a shader on this machine.",
     ) orelse return;
     // Strictly per-pane: the pick lands on the clicked pane only. A
     // manual file pick replaces any bound preset; an unreadable file
     // leaves the previous selection untouched.
-    if (!ctx.pane.setCustomShader(path, ctx.win.config.custom_shader_animation, true)) return;
-    ctx.pane.dropShaderPreset(ctx.win.config.shader_params.items);
-    syncWindowGraphicsOffload(ctx.win);
+    if (!ref.pane.setCustomShader(path, ref.win.config.custom_shader_animation, true)) return;
+    ref.pane.dropShaderPreset(ref.win.config.shader_params.items);
+    syncWindowGraphicsOffload(ref.win);
 }
 
 /// The system flipped light/dark: re-resolve every pane against its

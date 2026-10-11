@@ -195,6 +195,7 @@ const Harness = struct {
     }
 
     fn request(self: *Harness, kind: session.Kind, method: []const u8, params: []const u8) bool {
+        if (!self.sync.flushDocument(&self.sess, &self.doc)) return false;
         if (self.last_result.len > 0) {
             self.alloc.free(self.last_result);
             self.last_result = &.{};
@@ -278,12 +279,21 @@ fn rangeOnlyStage(alloc: std.mem.Allocator) !?u8 {
         return fail("a range-only provider's legend was thrown away", .{});
 
     try h.sync.setUri(URI);
-    h.sync.open = true;
+    h.sync.language_id = "zig";
     {
         const text = try h.doc.textAlloc(alloc);
         defer alloc.free(text);
-        h.sync.noteSent(1, h.doc.revision, text);
-        h.sess.didOpen(URI, "zig", 1, text);
+        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+        const queued = h.sess.out.items.len;
+        h.sess.alloc = failing.allocator();
+        const opened = h.sync.openDocument(&h.sess, h.doc.revision, text);
+        h.sess.alloc = alloc;
+        if (opened) |_| {
+            return fail("faulted didOpen unexpectedly succeeded", .{});
+        } else |err| if (err != error.OutOfMemory) return err;
+        if (h.sync.open or h.sess.out.items.len != queued)
+            return fail("failed didOpen advanced state or appended a partial message", .{});
+        try h.sync.openDocument(&h.sess, h.doc.revision, text);
     }
 
     var params: std.ArrayList(u8) = .empty;
@@ -342,12 +352,10 @@ fn runOnce(alloc: std.mem.Allocator, utf8: bool) !?u8 {
     // ---- didOpen + diagnostics --------------------------------------
     try h.sync.setUri(URI);
     h.sync.language_id = "zig";
-    h.sync.open = true;
     {
         const text = try h.doc.textAlloc(alloc);
         defer alloc.free(text);
-        h.sync.noteSent(1, h.doc.revision, text);
-        h.sess.didOpen(URI, "zig", 1, text);
+        try h.sync.openDocument(&h.sess, h.doc.revision, text);
     }
     if (!h.waitFor(&h, Harness.publishedCond, 4000)) return fail("no diagnostics published", .{});
     {
@@ -378,6 +386,17 @@ fn runOnce(alloc: std.mem.Allocator, utf8: bool) !?u8 {
         const text = try h.doc.textAlloc(alloc);
         defer alloc.free(text);
         h.published = 0;
+        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+        const queued = h.sess.out.items.len;
+        const version = h.sync.version;
+        h.sess.alloc = failing.allocator();
+        defer h.sess.alloc = alloc;
+        h.sync.flush(&h.sess, text);
+        if (!h.sync.needs_full or !h.sync.hasPendingChanges() or h.sync.version != version)
+            return fail("failed didChange lost its pending synchronization", .{});
+        if (h.request(.hover, "textDocument/hover", "{}") or h.sess.pending.items.len != 0 or h.sess.out.items.len != queued)
+            return fail("a request escaped before failed synchronization recovered", .{});
+        h.sess.alloc = alloc;
         h.sync.flush(&h.sess, text);
     }
     if (!h.waitFor(&h, Harness.publishedCond, 4000)) return fail("no diagnostics after didChange", .{});
@@ -517,8 +536,7 @@ fn runOnce(alloc: std.mem.Allocator, utf8: bool) !?u8 {
         {
             const text = try h.doc.textAlloc(alloc);
             defer alloc.free(text);
-            h.sync.noteSent(h.sync.version + 1, h.doc.revision, text);
-            h.sess.didChange(URI, h.sync.version, &.{}, text);
+            try h.sync.replaceDocument(&h.sess, h.doc.revision, text);
             h.pump();
         }
         if (!h.request(.formatting, "textDocument/formatting", params.items)) return fail("formatting timed out", .{});

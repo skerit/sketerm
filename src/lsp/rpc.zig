@@ -99,8 +99,9 @@ pub fn frame(alloc: Allocator, body: []const u8) Allocator.Error![]u8 {
 pub fn frameInto(alloc: Allocator, out: *std.ArrayList(u8), body: []const u8) Allocator.Error!void {
     var head: [48]u8 = undefined;
     const h = std.fmt.bufPrint(&head, "Content-Length: {d}\r\n\r\n", .{body.len}) catch unreachable;
-    try out.appendSlice(alloc, h);
-    try out.appendSlice(alloc, body);
+    try out.ensureUnusedCapacity(alloc, h.len + body.len);
+    out.appendSliceAssumeCapacity(h);
+    out.appendSliceAssumeCapacity(body);
 }
 
 // ---- JSON envelope ----------------------------------------------------
@@ -273,6 +274,17 @@ test "rpc frame writes the header" {
     const f = try frame(testing.allocator, "{\"a\":1}");
     defer testing.allocator.free(f);
     try testing.expectEqualStrings("Content-Length: 7\r\n\r\n{\"a\":1}", f);
+}
+
+test "rpc frameInto leaves no partial header after an allocation failure" {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try out.ensureTotalCapacity(testing.allocator, 64);
+    try out.appendSlice(testing.allocator, "already queued");
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    const body = [_]u8{'x'} ** 512;
+    try testing.expectError(error.OutOfMemory, frameInto(failing.allocator(), &out, &body));
+    try testing.expectEqualStrings("already queued", out.items);
 }
 
 test "rpc classify: response, notification, request, error" {

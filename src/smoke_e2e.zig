@@ -1253,6 +1253,13 @@ pub fn main() u8 {
         teardown();
         return 0;
     }
+    if (c.getenv("SKETERM_SMOKE_E2E_CAPTURE_ONLY") != null) {
+        const app = drive orelse return fail("capture smoke has no display driver");
+        if (captureSaveStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
+        say("capture: save errors are visible, successful PNGs land, and closed-pane picks are inert");
+        teardown();
+        return 0;
+    }
     if (c.getenv("SKETERM_SMOKE_E2E_WORKSPACE_ONLY") != null) {
         const app = drive orelse return fail("focused workspace smoke has no display driver");
         if (workspaceStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
@@ -1433,6 +1440,7 @@ pub fn main() u8 {
     // 3f. The workspace verbs through their own entry points: chords on
     // the seat, the palette's `action` path, and config keys.
     if (drive) |app| {
+        if (captureSaveStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
         if (workspaceStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
         say("workspace: font, copy/paste keybinds, zoom, close_pane chord, broadcast, find bar, cross search, profile, panel face, pin, restore, shader preset and close buttons");
     }
@@ -16478,6 +16486,71 @@ fn wsNewTab(allocator: std.mem.Allocator, sock_path: [:0]const u8) ?u32 {
     defer allocator.free(resp);
     if (std.mem.indexOf(u8, resp, "\"ok\":true") == null) return null;
     return parseNumAfter(resp, "\"pane\":");
+}
+
+fn capturePicker(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]const u8, pane: u32) ?u32 {
+    if (!wsFocus(allocator, sock, pane)) return null;
+    _ = app.waitIdle(200, 4_000);
+    var known_buf: [16]u32 = undefined;
+    const known = known_buf[0..knownToplevels(app, &known_buf)];
+    if (!wsAction(allocator, sock, "screenshot_pane", pane)) return null;
+    const pick = waitNewToplevel(app, known, 15_000) orelse return null;
+    _ = app.waitIdle(200, 4_000);
+    return pick;
+}
+
+fn capturePickPath(app: *appdrive.App, pick: u32, path: []const u8) bool {
+    app.pressKey(pick, "ctrl+a") catch return false;
+    app.typeText(pick, path) catch return false;
+    app.pressKey(pick, "Enter") catch return false;
+    return waitToplevelGone(app, pick, 10_000);
+}
+
+/// Exercise capture saving and stale-picker identity through the real GUI.
+fn captureSaveStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]const u8, rt: []const u8) ?[]const u8 {
+    const main_win = wsMainWindow(app) orelse return "capture: no GUI window";
+    var dir_buf: [512:0]u8 = undefined;
+    const dir = std.fmt.bufPrintZ(&dir_buf, "{s}/capture-denied", .{rt}) catch return "capture: directory path";
+    if (c.mkdir(dir.ptr, 0o700) != 0) return "capture: create denied directory";
+    defer _ = c.rmdir(dir.ptr);
+    if (c.chmod(dir.ptr, 0o500) != 0) return "capture: make destination read-only";
+    defer _ = c.chmod(dir.ptr, 0o700);
+    var path_buf: [600:0]u8 = undefined;
+    const denied = std.fmt.bufPrintZ(&path_buf, "{s}/capture.png", .{dir}) catch return "capture: denied path";
+    if (c.geteuid() != 0) {
+        const pick = capturePicker(allocator, app, sock, 1) orelse return "capture: open denied picker";
+        if (!capturePickPath(app, pick, denied)) return "capture: accept denied destination";
+        if (!viewerWaitOcr(allocator, app, main_win, "Could not save file", 12_000))
+            return "capture: failed save produced no visible error";
+        if (c.access(denied.ptr, c.F_OK) == 0) return "capture: unexpected file in read-only directory";
+        app.pressKey(main_win, "Enter") catch return "capture: dismiss save error";
+        _ = app.waitIdle(200, 4_000);
+    } else say("capture: permission refusal skipped for root");
+
+    var good_buf: [600:0]u8 = undefined;
+    const good = std.fmt.bufPrintZ(&good_buf, "{s}/capture-ok.png", .{rt}) catch return "capture: success path";
+    defer _ = c.unlink(good.ptr);
+    const pick = capturePicker(allocator, app, sock, 1) orelse return "capture: open successful picker";
+    if (!capturePickPath(app, pick, good)) return "capture: accept successful destination";
+    {
+        const bytes = readFileAlloc(allocator, good) orelse return "capture: PNG never written";
+        defer allocator.free(bytes);
+        if (!std.mem.startsWith(u8, bytes, "\x89PNG\r\n\x1a\n")) return "capture: output is not a PNG";
+    }
+    // Accepting an old picker after a new pane is created must not capture
+    // that new pane, including when its allocator reused the old address.
+    const target = wsNewTab(allocator, sock) orelse return "capture: create closing pane";
+    const stale_pick = capturePicker(allocator, app, sock, target) orelse return "capture: open stale picker";
+    if (!wsClosePane(allocator, sock, target)) return "capture: close picker target";
+    const replacement = wsNewTab(allocator, sock) orelse return "capture: create replacement pane";
+    defer _ = wsClosePane(allocator, sock, replacement);
+    var stale_buf: [600:0]u8 = undefined;
+    const stale = std.fmt.bufPrintZ(&stale_buf, "{s}/capture-stale.png", .{rt}) catch return "capture: stale path";
+    defer _ = c.unlink(stale.ptr);
+    if (!capturePickPath(app, stale_pick, stale)) return "capture: accept stale pane picker";
+    if (c.access(stale.ptr, c.F_OK) == 0) return "capture: closed pane picker captured a replacement pane";
+    if (!wsFocus(allocator, sock, 1)) return "capture: GUI stopped responding after stale pick";
+    return null;
 }
 
 fn wsClosePane(allocator: std.mem.Allocator, sock_path: [:0]const u8, pane: u32) bool {

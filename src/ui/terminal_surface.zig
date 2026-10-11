@@ -1255,6 +1255,17 @@ fn onUnrealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
     releaseAreaGL(self, area);
 }
 
+/// Discard handles belonging to a lost or replaced GL context.
+fn forgetAllGL(self: *TerminalSurface) void {
+    self.grid_pass.forgetGL();
+    self.cell_pass.forgetGL();
+    self.image_pass.forgetGL();
+    self.bg_pass.forgetGL();
+    self.shader_pass.forgetGL();
+    self.linear_target.forgetGL();
+    self.image_store.forgetGL();
+}
+
 fn releaseAreaGL(self: *TerminalSurface, area: *c.GtkGLArea) void {
     // Make the area's context current so glDelete* lands on the right
     // resources. Unrealize and explicit sever both use this one path.
@@ -1262,13 +1273,7 @@ fn releaseAreaGL(self: *TerminalSurface, area: *c.GtkGLArea) void {
     if (c.gtk_gl_area_get_error(area) != null) {
         // Context is already broken; nothing useful to delete against
         // it. Forget the IDs so a future realize starts clean.
-        self.grid_pass.forgetGL();
-        self.cell_pass.forgetGL();
-        self.image_pass.forgetGL();
-        self.bg_pass.forgetGL();
-        self.shader_pass.forgetGL();
-        self.linear_target.forgetGL();
-        self.image_store.forgetGL();
+        forgetAllGL(self);
         self.gl_live = false;
         return;
     }
@@ -1306,13 +1311,7 @@ fn onRealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
         old.deinit();
         self.atlas = null;
     }
-    self.grid_pass.forgetGL();
-    self.cell_pass.forgetGL();
-    self.image_pass.forgetGL();
-    self.bg_pass.forgetGL();
-    self.shader_pass.forgetGL();
-    self.linear_target.forgetGL();
-    self.image_store.forgetGL();
+    forgetAllGL(self);
 
     // Resolution order: explicit font_path → font_family
     // (fontconfig) → $SKETERM_FONT env → built-in candidate list.

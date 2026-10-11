@@ -13,16 +13,14 @@ const Window = @import("window.zig").Window;
 const Pane = @import("pane.zig").Pane;
 const shader_pass = @import("../render/shader_pass.zig");
 const shader_preset = @import("../shader_preset.zig");
+const remotectl = @import("remotectl.zig");
 
 const PREVIEW_W = 380;
 const PREVIEW_H = 230;
 
 const Ctx = struct {
     allocator: std.mem.Allocator,
-    win: *Window,
-    /// Pane the dialog was opened on. May close while the dialog is
-    /// up — deref only via alivePane().
-    pane: *Pane,
+    pane_id: u32,
     /// Effective shader file path the dialog operates on (own copy —
     /// used to filter applicable presets and as save target).
     path_copy: ?[]u8 = null,
@@ -91,7 +89,7 @@ pub fn open(win: *Window) bool {
     };
 
     const ctx = win.allocator.create(Ctx) catch return false;
-    ctx.* = .{ .allocator = win.allocator, .win = win, .pane = pane };
+    ctx.* = .{ .allocator = win.allocator, .pane_id = pane.id };
     const eff_path: []const u8 = if (pane.surface.custom_shader_path) |p| p else win.config.settings.custom_shader;
     ctx.path_copy = win.allocator.dupe(u8, eff_path) catch null;
     ctx.params_len = shader_pass.parseParams(src, &ctx.params, &ctx.meta);
@@ -106,12 +104,12 @@ pub fn open(win: *Window) bool {
         ctx.preview_pass.source = &ctx.preview_source;
     }
 
-    const dialog = c.adw_preferences_dialog_new();
     const title_z = dupZ(win.allocator, if (ctx.meta.title().len > 0) ctx.meta.title() else "Shader") orelse {
-        win.allocator.destroy(ctx);
+        freeCtx(ctx);
         return false;
     };
     defer win.allocator.free(title_z);
+    const dialog = c.adw_preferences_dialog_new();
     c.adw_dialog_set_title(@ptrCast(@alignCast(dialog)), title_z.ptr);
 
     const page = c.adw_preferences_page_new();
@@ -360,19 +358,16 @@ fn digitsForStep(step: f32) c_int {
 
 /// The dialog's pane, or null if it closed while the dialog is up.
 fn alivePane(ctx: *Ctx) ?*Pane {
-    for (ctx.win.panes.items) |p| {
-        if (p == ctx.pane) return ctx.pane;
-    }
-    return null;
+    const ref = remotectl.livePaneById(ctx.pane_id) orelse return null;
+    return ref.pane;
 }
 
 /// Effective override slice the dialog reads/writes: the pane's own
 /// preset params when a preset is bound, else the global config.
 fn effectiveOverrides(ctx: *Ctx) []const shader_pass.ParamKV {
-    if (alivePane(ctx)) |pane| {
-        if (pane.hasOwnShaderParams()) return pane.surface.preset_params.items;
-    }
-    return ctx.win.config.shader_params.items;
+    const ref = remotectl.livePaneById(ctx.pane_id) orelse return &.{};
+    if (ref.pane.hasOwnShaderParams()) return ref.pane.surface.preset_params.items;
+    return ref.win.config.shader_params.items;
 }
 
 /// Current effective value: override else shader default.
@@ -394,11 +389,8 @@ fn currentColor(ctx: *Ctx, p: *const shader_pass.Param) [3]f32 {
 
 /// Route a param edit: preset pane → per-pane set, else global config.
 fn setParam(ctx: *Ctx, name: []const u8, value: f32, color: ?[3]f32) void {
-    if (alivePane(ctx)) |pane| {
-        ctx.win.setPaneShaderParam(pane, name, value, color);
-    } else {
-        ctx.win.setShaderParam(name, value, color);
-    }
+    const ref = remotectl.livePaneById(ctx.pane_id) orelse return;
+    ref.win.setPaneShaderParam(ref.pane, name, value, color);
 }
 
 fn onSliderChanged(adj: *c.GtkAdjustment, user: ?*anyopaque) callconv(.c) void {
@@ -484,8 +476,8 @@ fn onPresetNameChanged(_: *c.GtkEditable, user: ?*anyopaque) callconv(.c) void {
 fn onPresetLoadClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const ctx = cast.userData(Ctx, user);
     const name = selectedPresetName(ctx) orelse return;
-    const pane = alivePane(ctx) orelse return;
-    if (!ctx.win.applyShaderPresetByName(pane, name)) {
+    const ref = remotectl.livePaneById(ctx.pane_id) orelse return;
+    if (!ref.win.applyShaderPresetByName(ref.pane, name)) {
         std.debug.print("sketerm: preset '{s}' failed to load\n", .{name});
         return;
     }
@@ -561,7 +553,8 @@ fn onPresetDeleteClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 
 fn onSavePresetClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const ctx = cast.userData(Ctx, user);
-    const pane = alivePane(ctx) orelse return;
+    const ref = remotectl.livePaneById(ctx.pane_id) orelse return;
+    const pane = ref.pane;
     const entry = ctx.name_entry orelse return;
     const text_ptr = c.gtk_editable_get_text(@ptrCast(entry)) orelse return;
     const name = std.mem.span(@as([*:0]const u8, @ptrCast(text_ptr)));
@@ -603,7 +596,7 @@ fn onSavePresetClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         std.debug.print("sketerm: preset save failed: {s}\n", .{@errorName(err)});
         var msg: [160]u8 = undefined;
         @import("window.zig").showToast(
-            ctx.win,
+            ref.win,
             std.fmt.bufPrint(&msg, "Could not save shader preset: {s}", .{@errorName(err)}) catch
                 "Could not save shader preset",
         );
@@ -652,11 +645,15 @@ fn onDialogClosed(_: *c.AdwDialog, user: ?*anyopaque) callconv(.c) void {
 
 fn deferredCtxFree(user: ?*anyopaque) callconv(.c) c.gboolean {
     const ctx = cast.userData(Ctx, user);
+    freeCtx(ctx);
+    return 0; // G_SOURCE_REMOVE
+}
+
+fn freeCtx(ctx: *Ctx) void {
     if (ctx.src_copy) |s| ctx.allocator.free(s);
     if (ctx.dir_copy) |d| ctx.allocator.free(d);
     if (ctx.path_copy) |p| ctx.allocator.free(p);
     ctx.allocator.destroy(ctx);
-    return 0; // G_SOURCE_REMOVE
 }
 
 // ── Live preview ────────────────────────────────────────────────
@@ -796,6 +793,7 @@ fn onPreviewRender(area: *c.GtkGLArea, _: *c.GdkGLContext, user: ?*anyopaque) ca
     if (!compiled) return 1;
     c.glGetIntegerv(c.GL_DRAW_FRAMEBUFFER_BINDING, &sp.prev_fbo);
     sp.tex = ctx.dummy_tex;
+    defer sp.tex = 0; // The dialog owns this texture, not ShaderPass.
     const now = c.g_get_monotonic_time();
     if (ctx.epoch_us == 0) ctx.epoch_us = now;
     const t: f32 = @as(f32, @floatFromInt(now - ctx.epoch_us)) / 1e6;

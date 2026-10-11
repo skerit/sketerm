@@ -86,6 +86,25 @@ pub const WsHost = struct {
         /// The win_vtile stream decoder (build_options.video).
         vdec: vcodec.StreamDecoder = .{},
 
+        /// Release the state this Win owns, never its widgets; the one copy every teardown path runs.
+        fn releaseOwned(win: *Win, allocator: std.mem.Allocator) void {
+            win.opaque_resize.cancel();
+            win.rec.abort();
+            allocator.free(win.drag_rects);
+            win.drag_rects = &.{};
+            win.backing.deinit(allocator);
+            win.backing = .empty;
+            win.vdec.deinit();
+        }
+
+        /// Release, destroy the GtkWindow and free the Win itself.
+        fn destroy(win: *Win, allocator: std.mem.Allocator) void {
+            win.releaseOwned(allocator);
+            _ = c.g_object_set_data(@ptrCast(win.window), "sketerm-winapp", null);
+            c.gtk_window_destroy(win.window);
+            allocator.destroy(win);
+        }
+
         /// Is (x,y) — picture-local — inside a draggable region? Rects are
         /// in point space; scale to the current frame size so the test
         /// matches the press coordinates.
@@ -192,16 +211,7 @@ pub const WsHost = struct {
 
     pub fn destroy(self: *WsHost) void {
         var it = self.windows.valueIterator();
-        while (it.next()) |w| {
-            w.*.opaque_resize.cancel();
-            w.*.rec.abort();
-            self.allocator.free(w.*.drag_rects);
-            w.*.backing.deinit(self.allocator);
-            w.*.vdec.deinit();
-            _ = c.g_object_set_data(@ptrCast(w.*.window), "sketerm-winapp", null);
-            c.gtk_window_destroy(w.*.window);
-            self.allocator.destroy(w.*);
-        }
+        while (it.next()) |w| w.*.destroy(self.allocator);
         self.windows.deinit(self.allocator);
         self.inbuf.deinit(self.allocator);
         self.out.deinit(self.allocator);
@@ -324,14 +334,7 @@ pub const WsHost = struct {
                 const id = std.mem.readInt(u32, u.payload[0..4], .little);
                 const win = self.windows.get(id) orelse return;
                 _ = self.windows.remove(id);
-                win.opaque_resize.cancel();
-                win.rec.abort();
-                self.allocator.free(win.drag_rects);
-                win.backing.deinit(self.allocator);
-                win.vdec.deinit();
-                _ = c.g_object_set_data(@ptrCast(win.window), "sketerm-winapp", null);
-                c.gtk_window_destroy(win.window);
-                self.allocator.destroy(win);
+                win.destroy(self.allocator);
             },
             .win_drag => {
                 const wd = proto.decodeWinDrag(u.payload) orelse return error.Protocol;
@@ -570,4 +573,25 @@ test "drag regions are hit-tested in the window's current scale" {
     win.drag_rects = &rects;
     win.drag_ref_w = 0;
     try t.expect(!win.inDragRegion(0, 0));
+}
+
+test "forwarded stream window releases an unfinished recording and backing on teardown" {
+    const a = std.testing.allocator;
+    var win: WsHost.Win = .{
+        .host = undefined,
+        .id = 1,
+        .window = undefined,
+        .picture = undefined,
+        .drag_rects = try a.alloc(proto.DragRect, 2),
+        .rec = .{ .gif = @import("util/gifrec.zig").Rec.init(a, 0) },
+    };
+    defer win.releaseOwned(a);
+    const pixels = [_]u8{255} ** (4 * 4 * 4);
+    try win.backing.appendSlice(a, &pixels);
+    try win.rec.gif.?.addShmFrame(&pixels, 4, 4, 0, 100);
+    try std.testing.expect(win.rec.gif.?.pend != null);
+    win.releaseOwned(a);
+    try std.testing.expect(!win.rec.active());
+    try std.testing.expectEqual(@as(usize, 0), win.backing.items.len);
+    try std.testing.expectEqual(@as(usize, 0), win.drag_rects.len);
 }

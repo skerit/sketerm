@@ -328,7 +328,7 @@ pub const RemoteLink = struct {
             // Two documents of one project raced their lsp_opens: keep
             // the first server, kill the duplicate.
             self.discardChannel(rep.chan);
-            mgr.bindTabToConn(tab, existing);
+            _ = mgr.bindTabToConn(tab, existing);
             return;
         }
         const conf = mgr.cfg() orelse {
@@ -339,7 +339,7 @@ pub const RemoteLink = struct {
             self.discardChannel(rep.chan);
             return;
         };
-        mgr.bindTabToConn(tab, cn);
+        _ = mgr.bindTabToConn(tab, cn);
     }
 };
 
@@ -365,4 +365,72 @@ test "editorlsp link: a dead link is due only once its wait has passed" {
     try t.expect(link.due(5_000));
     link.state = .connecting;
     try t.expect(!link.due(9_999_999));
+}
+
+test "editorlsp link: a reply whose tab cannot bind retires the unreferenced remote connection" {
+    const t = std.testing;
+    const saved = registry.*;
+    defer registry.* = saved;
+    for ([_]bool{ false, true }) |fail_owned_uri| {
+        registry.* = .{ .alloc = t.allocator };
+        defer {
+            registry.managers.clearRetainingCapacity();
+            registry.noteFaceGone();
+            registry.conns.deinit(t.allocator);
+            registry.links.deinit(t.allocator);
+            registry.managers.deinit(t.allocator);
+        }
+        const conf = Config{};
+        var view = @import("editorview.zig").EditorView{
+            .allocator = t.allocator,
+            .pass = undefined,
+            .widgets_dead = true,
+            .standalone_config = &conf,
+        };
+        defer view.tabs.deinit(t.allocator);
+        var mgr = Manager{ .view = &view, .alloc = t.allocator };
+        registry.register(&mgr);
+        var tab: ETab = undefined;
+        tab.id = 37;
+        tab.spec = @constCast("box:/new.zig");
+        tab.language = .init(t.allocator);
+        defer tab.language.deinit();
+        tab.language.lang = .zig;
+        const st = editorlsp.TabState.create(t.allocator, &tab) orelse return error.OutOfMemory;
+        defer st.destroy();
+        tab.lsp = st;
+        try view.tabs.append(t.allocator, &tab);
+        try st.sync.setUri("file:///old.zig");
+        var old = Conn{
+            .name = @constCast("old"),
+            .root = @constCast("/old"),
+            .root_uri = @constCast("file:///old"),
+            .sess = @import("../lsp/session.zig").Session.init(t.allocator, undefined),
+            .refs = 1,
+        };
+        defer old.sess.deinit();
+        st.conn = &old;
+        st.sync.open = true;
+        // The reply handler and registry lifecycle need no live transport;
+        // a dead test link suppresses channel I/O during construction/removal.
+        var link = RemoteLink{ .host = @constCast("box"), .state = .dead };
+        defer link.pending.deinit(t.allocator);
+        try link.pending.append(t.allocator, .{ .req = 1, .tab_id = tab.id });
+        var failing = t.FailingAllocator.init(t.allocator, .{ .fail_index = 0 });
+        if (fail_owned_uri) st.sync.alloc = failing.allocator() else mgr.alloc = failing.allocator();
+        defer st.sync.alloc = t.allocator;
+        defer mgr.alloc = t.allocator;
+        link.onLspReply("{\"req\":1,\"ok\":true,\"chan\":77,\"name\":\"test\",\"root\":\"/new\"}");
+        try t.expect(failing.has_induced_failure);
+        try t.expectEqual(&old, st.conn.?);
+        try t.expectEqualStrings("file:///old.zig", st.sync.uri);
+        try t.expect(st.sync.open);
+        try t.expectEqual(@as(usize, 1), old.refs);
+        try t.expectEqual(@as(usize, 1), registry.conns.items.len);
+        const orphan = registry.conns.items[0];
+        try t.expect(orphan.remote != null and orphan.remote.?.chan == 77);
+        try t.expect(orphan.closing and orphan.refs == 0 and orphan.remove_idle != 0);
+        try editorlsp.testWaitForSourceRemoval(orphan.remove_idle);
+        try t.expectEqual(@as(usize, 0), registry.conns.items.len);
+    }
 }

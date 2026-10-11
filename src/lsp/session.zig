@@ -52,6 +52,7 @@ pub const State = enum {
 };
 
 pub const SyncKind = enum(u8) { none = 0, full = 1, incremental = 2 };
+pub const SyncError = Allocator.Error || error{NotReady};
 
 /// Requests sketerm issues. The tag travels with the response so the
 /// caller does not have to keep its own id table.
@@ -426,7 +427,7 @@ pub const Session = struct {
             return;
         }
         if (req.kind == .shutdown) {
-            self.sendNotification("exit", "null");
+            self.sendNotification("exit", "null") catch {};
             self.setState(.dead);
             return;
         }
@@ -444,7 +445,10 @@ pub const Session = struct {
         }
         self.caps.deinit(self.alloc);
         self.caps = parseCaps(self.alloc, env.result);
-        self.sendNotification("initialized", "{}");
+        self.sendNotification("initialized", "{}") catch {
+            self.markDead();
+            return;
+        };
         // Push-model servers read their settings from here; pull-model
         // ones ask `workspace/configuration`, answered from the same
         // object.
@@ -452,22 +456,22 @@ pub const Session = struct {
             var p: std.ArrayList(u8) = .empty;
             defer p.deinit(self.alloc);
             p.print(self.alloc, "{{\"settings\":{s}}}", .{self.settings}) catch {};
-            if (p.items.len > 0) self.sendNotification("workspace/didChangeConfiguration", p.items);
+            if (p.items.len > 0) self.sendNotification("workspace/didChangeConfiguration", p.items) catch {};
         }
         self.setState(.ready);
     }
 
     // ---- outbound -----------------------------------------------------
 
-    fn sendNotification(self: *Session, method: []const u8, params_json: []const u8) void {
+    fn sendNotification(self: *Session, method: []const u8, params_json: []const u8) Allocator.Error!void {
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.alloc);
-        buf.print(
+        try buf.print(
             self.alloc,
             "{{\"jsonrpc\":\"2.0\",\"method\":\"{s}\",\"params\":{s}}}",
             .{ method, params_json },
-        ) catch return;
-        rpc.frameInto(self.alloc, &self.out, buf.items) catch {};
+        );
+        try rpc.frameInto(self.alloc, &self.out, buf.items);
     }
 
     /// Issue a request with a pre-rendered params object. Returns the
@@ -501,7 +505,7 @@ pub const Session = struct {
             p.cancelled = true;
             var buf: [64]u8 = undefined;
             const params = std.fmt.bufPrint(&buf, "{{\"id\":{d}}}", .{id}) catch return;
-            self.sendNotification("$/cancelRequest", params);
+            self.sendNotification("$/cancelRequest", params) catch {};
             return;
         }
     }
@@ -588,18 +592,19 @@ pub const Session = struct {
 
     // ---- document sync -------------------------------------------------
 
-    pub fn didOpen(self: *Session, uri: []const u8, language_id: []const u8, version: i64, text: []const u8) void {
-        if (self.state != .ready or !self.caps.open_close) return;
+    pub fn didOpen(self: *Session, uri: []const u8, language_id: []const u8, version: i64, text: []const u8) SyncError!void {
+        if (self.state != .ready) return error.NotReady;
+        if (!self.caps.open_close) return;
         var p: std.ArrayList(u8) = .empty;
         defer p.deinit(self.alloc);
-        p.appendSlice(self.alloc, "{\"textDocument\":{\"uri\":") catch return;
-        appendJsonString(self.alloc, &p, uri) catch return;
-        p.appendSlice(self.alloc, ",\"languageId\":") catch return;
-        appendJsonString(self.alloc, &p, language_id) catch return;
-        p.print(self.alloc, ",\"version\":{d},\"text\":", .{version}) catch return;
-        appendJsonString(self.alloc, &p, text) catch return;
-        p.appendSlice(self.alloc, "}}") catch return;
-        self.sendNotification("textDocument/didOpen", p.items);
+        try p.appendSlice(self.alloc, "{\"textDocument\":{\"uri\":");
+        try appendJsonString(self.alloc, &p, uri);
+        try p.appendSlice(self.alloc, ",\"languageId\":");
+        try appendJsonString(self.alloc, &p, language_id);
+        try p.print(self.alloc, ",\"version\":{d},\"text\":", .{version});
+        try appendJsonString(self.alloc, &p, text);
+        try p.appendSlice(self.alloc, "}}");
+        try self.sendNotification("textDocument/didOpen", p.items);
     }
 
     pub fn didClose(self: *Session, uri: []const u8) void {
@@ -609,7 +614,7 @@ pub const Session = struct {
         p.appendSlice(self.alloc, "{\"textDocument\":{\"uri\":") catch return;
         appendJsonString(self.alloc, &p, uri) catch return;
         p.appendSlice(self.alloc, "}}") catch return;
-        self.sendNotification("textDocument/didClose", p.items);
+        self.sendNotification("textDocument/didClose", p.items) catch {};
     }
 
     /// Incremental when the server asked for it, full otherwise.
@@ -621,35 +626,36 @@ pub const Session = struct {
         version: i64,
         changes: []const ContentChange,
         full_text: []const u8,
-    ) void {
-        if (self.state != .ready or self.caps.sync == .none) return;
+    ) SyncError!void {
+        if (self.state != .ready) return error.NotReady;
+        if (self.caps.sync == .none) return;
         var p: std.ArrayList(u8) = .empty;
         defer p.deinit(self.alloc);
-        p.appendSlice(self.alloc, "{\"textDocument\":{\"uri\":") catch return;
-        appendJsonString(self.alloc, &p, uri) catch return;
-        p.print(self.alloc, ",\"version\":{d}}},\"contentChanges\":[", .{version}) catch return;
+        try p.appendSlice(self.alloc, "{\"textDocument\":{\"uri\":");
+        try appendJsonString(self.alloc, &p, uri);
+        try p.print(self.alloc, ",\"version\":{d}}},\"contentChanges\":[", .{version});
         if (self.caps.sync == .incremental and changes.len > 0) {
             for (changes, 0..) |ch, i| {
-                if (i > 0) p.append(self.alloc, ',') catch return;
+                if (i > 0) try p.append(self.alloc, ',');
                 if (ch.range) |r| {
-                    p.print(
+                    try p.print(
                         self.alloc,
                         "{{\"range\":{{\"start\":{{\"line\":{d},\"character\":{d}}},\"end\":{{\"line\":{d},\"character\":{d}}}}},\"text\":",
                         .{ r.start.line, r.start.character, r.end.line, r.end.character },
-                    ) catch return;
+                    );
                 } else {
-                    p.appendSlice(self.alloc, "{\"text\":") catch return;
+                    try p.appendSlice(self.alloc, "{\"text\":");
                 }
-                appendJsonString(self.alloc, &p, ch.text) catch return;
-                p.append(self.alloc, '}') catch return;
+                try appendJsonString(self.alloc, &p, ch.text);
+                try p.append(self.alloc, '}');
             }
         } else {
-            p.appendSlice(self.alloc, "{\"text\":") catch return;
-            appendJsonString(self.alloc, &p, full_text) catch return;
-            p.append(self.alloc, '}') catch return;
+            try p.appendSlice(self.alloc, "{\"text\":");
+            try appendJsonString(self.alloc, &p, full_text);
+            try p.append(self.alloc, '}');
         }
-        p.appendSlice(self.alloc, "]}") catch return;
-        self.sendNotification("textDocument/didChange", p.items);
+        try p.appendSlice(self.alloc, "]}");
+        try self.sendNotification("textDocument/didChange", p.items);
     }
 
     pub fn didSave(self: *Session, uri: []const u8, text: []const u8) void {
@@ -664,7 +670,7 @@ pub const Session = struct {
             appendJsonString(self.alloc, &p, text) catch return;
         }
         p.appendSlice(self.alloc, "}") catch return;
-        self.sendNotification("textDocument/didSave", p.items);
+        self.sendNotification("textDocument/didSave", p.items) catch {};
     }
 };
 

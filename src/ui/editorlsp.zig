@@ -550,29 +550,43 @@ pub const Manager = struct {
 
     // ---- connections --------------------------------------------------
 
-    /// The transport-blind bottom half of an attach: point the tab's
-    /// state at `cn` and open the document once both sides are ready.
-    /// Shared by the local spawn path and the remote reply path.
-    pub fn bindTabToConn(self: *Manager, tab: *ETab, cn: *Conn) void {
-        const spec = tab.spec orelse return;
+    /// Bind transactionally, retiring an unreferenced connection on refusal through its deferred dead path.
+    pub fn bindTabToConn(self: *Manager, tab: *ETab, cn: *Conn) bool {
+        var bound = false;
+        defer if (!bound and cn.refs == 0) cn.sess.markDead();
+        if (cn.closing or cn.sess.state == .dead or cn.sess.state == .stopping) return false;
+        const spec = tab.spec orelse return false;
         const loc = paths.parseSpec(spec);
         const lang = tab.language.lspId();
-        if (lang.len == 0) return;
+        if (lang.len == 0) return false;
         const st = tab.lsp orelse blk: {
-            const fresh = TabState.create(self.alloc, tab) orelse return;
+            const fresh = TabState.create(self.alloc, tab) orelse return false;
             tab.lsp = fresh;
             break :blk fresh;
         };
-        if (st.conn == cn) return;
+        if (st.conn == cn) {
+            bound = true;
+            return true;
+        }
+        const uri = servers.pathToUri(self.alloc, loc.path) catch return false;
+        defer self.alloc.free(uri);
+        const owned_uri = st.sync.alloc.dupe(u8, uri) catch return false;
+        var installed_uri = false;
+        defer if (!installed_uri) st.sync.alloc.free(owned_uri);
         if (st.conn) |old| self.detachFromConn(tab, st, old);
+        // Detaching can synchronously report transport death or promote a
+        // passive copy; preserve any binding made by those callbacks.
+        if (st.conn != null or cn.closing or cn.sess.state == .dead or cn.sess.state == .stopping) return false;
+        if (st.sync.uri.len > 0) st.sync.alloc.free(st.sync.uri);
+        st.sync.uri = owned_uri;
+        installed_uri = true;
+        st.sync.language_id = lang;
         st.conn = cn;
         cn.refs += 1;
-        st.sync.language_id = lang;
-        const uri = servers.pathToUri(self.alloc, loc.path) catch return;
-        defer self.alloc.free(uri);
-        st.sync.setUri(uri) catch return;
         tab.doc.addObserver(.{ .ctx = st, .before_apply = TabState.observeEdits });
         if (cn.sess.state == .ready) self.openDocument(tab, st);
+        bound = st.conn == cn;
+        return bound;
     }
 
     /// Attach a REMOTE document: park it on (or dial) the host's link;
@@ -701,7 +715,7 @@ pub const Manager = struct {
             dbg("could not spawn {s}", .{srv.command});
             return;
         };
-        self.bindTabToConn(tab, cn);
+        _ = self.bindTabToConn(tab, cn);
     }
 
     /// Send `didOpen`, but only once the document actually HAS its
@@ -746,10 +760,8 @@ pub const Manager = struct {
         st.passive = false;
         const text = tab.doc.textAlloc(self.alloc) catch return;
         defer self.alloc.free(text);
-        st.sync.noteSent(1, tab.doc.revision, text);
         dbg("didOpen {s} ({s}, {d} bytes)", .{ st.sync.uri, st.sync.language_id, text.len });
-        cn.sess.didOpen(st.sync.uri, st.sync.language_id, st.sync.version, text);
-        st.sync.open = true;
+        st.sync.openDocument(&cn.sess, tab.doc.revision, text) catch return;
         st.dropDecorations();
         cn.pumpWrite();
         self.armDecorations(tab);
@@ -774,7 +786,6 @@ pub const Manager = struct {
         const was_open = st.sync.open;
         if (was_open and !cn.closing) {
             cn.sess.didClose(st.sync.uri);
-            cn.pumpWrite();
         }
         st.sync.open = false;
         st.passive = false;
@@ -784,7 +795,7 @@ pub const Manager = struct {
         // The server may know this URI again, through a copy in another
         // face that waited its turn.
         if (was_open and !cn.closing) registry.promotePassive(cn, st.sync.uri);
-        if (cn.refs == 0) registry.shutdownConn(cn);
+        if (cn.refs == 0) registry.shutdownConn(cn) else cn.pumpWrite();
     }
 
     /// The tab is closing (or its document was replaced by a reload).
@@ -821,7 +832,9 @@ pub const Manager = struct {
             self.invalidateCompletion();
         }
         const st = tab.lsp orelse return;
-        if (st.conn == null or !st.sync.open) return;
+        if (st.conn == null) return;
+        if (!st.sync.open) self.openDocument(tab, st);
+        if (!st.sync.open or st.passive) return;
         // Hints and token spans describe bytes that just moved. They
         // are dropped rather than mapped: a decoration in the wrong
         // place is worse than none, and the refresh is one round trip.
@@ -840,28 +853,26 @@ pub const Manager = struct {
         const r = ctx.resolve() orelse return 0;
         const st = r.tab.lsp orelse return 0;
         st.change_timer = 0;
-        r.mgr.flushChanges(r.tab);
+        _ = r.mgr.flushChanges(r.tab);
         return 0;
     }
 
-    /// Send the queued changes NOW. Every feature request calls this
-    /// first: LSP notifications and requests are processed in order, so
-    /// flushing immediately before a request is what makes the answer
-    /// describe the text the user is looking at.
-    pub fn flushChanges(self: *Manager, tab: *ETab) void {
-        const st = tab.lsp orelse return;
-        const cn = st.conn orelse return;
-        if (!st.sync.hasPendingChanges()) return;
-        const text = tab.doc.textAlloc(self.alloc) catch return;
-        defer self.alloc.free(text);
-        st.sync.flush(&cn.sess, text);
+    /// Retry synchronization and report whether requests can use this exact document revision.
+    pub fn flushChanges(self: *Manager, tab: *ETab) bool {
+        const st = tab.lsp orelse return false;
+        const cn = st.conn orelse return false;
+        if (cn.closing or cn.sess.state != .ready or st.passive or tab.loading) return false;
+        if (!st.sync.open) self.openDocument(tab, st);
+        if (st.conn != cn or cn.sess.state != .ready or !st.sync.open or st.passive) return false;
+        const synchronized = st.sync.flushDocument(&cn.sess, &tab.doc);
         cn.pumpWrite();
+        return synchronized and st.conn == cn and cn.sess.state == .ready;
     }
 
     pub fn onSaved(self: *Manager, tab: *ETab) void {
         const st = tab.lsp orelse return;
         const cn = st.conn orelse return;
-        self.flushChanges(tab);
+        if (!self.flushChanges(tab)) return;
         const text = tab.doc.textAlloc(self.alloc) catch return;
         defer self.alloc.free(text);
         cn.sess.didSave(st.sync.uri, text);
@@ -880,7 +891,7 @@ pub const Manager = struct {
         // Queue AND anchor map, as a pair: the two early returns below
         // skip `noteSent`, and a map describing the dead document would
         // otherwise be replayed onto the shadow rope.
-        st.sync.resetForNewDocument();
+        st.sync.resetForNewDocument(tab.doc.revision);
         st.dropDecorations();
         tab.doc.addObserver(.{ .ctx = st, .before_apply = TabState.observeEdits });
         const cn = st.conn orelse {
@@ -893,8 +904,7 @@ pub const Manager = struct {
         }
         const text = tab.doc.textAlloc(self.alloc) catch return;
         defer self.alloc.free(text);
-        st.sync.noteSent(st.sync.version + 1, tab.doc.revision, text);
-        cn.sess.didChange(st.sync.uri, st.sync.version, &.{}, text);
+        st.sync.replaceDocument(&cn.sess, tab.doc.revision, text) catch return;
         cn.pumpWrite();
         self.armDecorations(tab);
     }
@@ -1074,7 +1084,7 @@ pub const Manager = struct {
             return null;
         }
         cn.last_mgr = self;
-        self.flushChanges(tab);
+        if (!self.flushChanges(tab)) return null;
         return .{ .tab = tab, .st = st, .cn = cn };
     }
 
@@ -1100,15 +1110,22 @@ pub const Manager = struct {
 
     fn issue(self: *Manager, r: Ready, kind: session.Kind, method: []const u8, params: []const u8, aux: u64) void {
         r.cn.sess.cancelKind(kind, r.tab.id);
-        _ = r.cn.sess.sendRequest(kind, method, params, .{
+        _ = queueRequest(r, kind, method, params, r.tab.doc.revision, aux) orelse return;
+        r.cn.pumpWrite();
+        _ = self;
+    }
+
+    /// Every document-bound request requires its current text to precede it on the wire.
+    fn queueRequest(r: Ready, kind: session.Kind, method: []const u8, params: []const u8, revision: u64, aux: u64) ?session.Request {
+        if (r.st.conn != r.cn or r.cn.closing or r.cn.sess.state != .ready or
+            r.st.passive or r.tab.loading or !r.st.sync.isSynchronized(r.tab.doc.revision)) return null;
+        return r.cn.sess.sendRequest(kind, method, params, .{
             .id = 0,
             .kind = kind,
             .tab_id = r.tab.id,
-            .revision = r.tab.doc.revision,
+            .revision = revision,
             .aux = aux,
         });
-        r.cn.pumpWrite();
-        _ = self;
     }
 
     // ---- completion ------------------------------------------------------
@@ -1138,13 +1155,7 @@ pub const Manager = struct {
         self.list.range_start = word_start;
         self.list.range_end = caret;
         r.cn.sess.cancelKind(.completion, r.tab.id);
-        const sent = r.cn.sess.sendRequest(.completion, "textDocument/completion", params, .{
-            .id = 0,
-            .kind = .completion,
-            .tab_id = r.tab.id,
-            .revision = r.tab.doc.revision,
-            .aux = word_start,
-        });
+        const sent = queueRequest(r, .completion, "textDocument/completion", params, r.tab.doc.revision, word_start);
         if (sent) |req| {
             self.completion_request_id = req.id;
             self.completion_request_conn = r.cn;
@@ -1331,14 +1342,9 @@ pub const Manager = struct {
         const st = tab.lsp orelse return;
         const cn = st.conn orelse return;
         if (!cn.sess.caps.completion_resolve) return;
+        if (!self.flushChanges(tab)) return;
         cn.sess.cancelKind(.completion_resolve, tab.id);
-        const sent = cn.sess.sendRequest(.completion_resolve, "completionItem/resolve", item.raw, .{
-            .id = 0,
-            .kind = .completion_resolve,
-            .tab_id = tab.id,
-            .revision = self.list.revision,
-            .aux = packCompletionRef(self.list.generation, idx),
-        });
+        const sent = queueRequest(.{ .tab = tab, .st = st, .cn = cn }, .completion_resolve, "completionItem/resolve", item.raw, self.list.revision, packCompletionRef(self.list.generation, idx));
         if (sent) |req| item.resolve_id = req.id;
         cn.pumpWrite();
     }
@@ -1689,14 +1695,14 @@ pub const Manager = struct {
         const cn = st.conn orelse return false;
         if (cn.sess.state != .ready) return false;
         if (!cn.sess.caps.document_symbol) return false;
-        self.flushChanges(tab);
+        if (!self.flushChanges(tab)) return false;
         const r = Ready{ .tab = tab, .st = st, .cn = cn };
         self.scratch.clearRetainingCapacity();
         self.scratch.appendSlice(self.alloc, "{\"textDocument\":{\"uri\":") catch return false;
         session.appendJsonString(self.alloc, &self.scratch, st.sync.uri) catch return false;
         self.scratch.appendSlice(self.alloc, "}}") catch return false;
         self.issue(r, .document_symbol, "textDocument/documentSymbol", self.scratch.items, OUTLINE_AUX);
-        return true;
+        return cn.sess.hasPending(.document_symbol, tab.id);
     }
 
     /// `Request.aux` value that means "this documentSymbol reply belongs
@@ -2319,7 +2325,7 @@ pub const Manager = struct {
         const cn = st.conn orelse return null;
         if (cn.sess.state != .ready or st.passive) return null;
         cn.last_mgr = self;
-        self.flushChanges(tab);
+        if (!self.flushChanges(tab)) return null;
         return .{ .tab = tab, .st = st, .cn = cn };
     }
 
@@ -2478,12 +2484,9 @@ pub const Manager = struct {
             self.view.setStatusText("The server offered an action with nothing to apply.");
             return;
         }
-        _ = cn.sess.sendRequest(.code_action_resolve, "codeAction/resolve", raw, .{
-            .id = 0,
-            .kind = .code_action_resolve,
-            .tab_id = stamp.tab_id,
-            .revision = stamp.revision,
-        });
+        const tab = self.view.findTabById(stamp.tab_id) orelse return;
+        const st = tab.lsp orelse return;
+        _ = queueRequest(.{ .tab = tab, .st = st, .cn = cn }, .code_action_resolve, "codeAction/resolve", raw, stamp.revision, 0) orelse return;
         cn.pumpWrite();
     }
 
@@ -2515,6 +2518,16 @@ pub const Manager = struct {
     }
 
     fn executeCommand(self: *Manager, cn: *Conn, cmd: std.json.Value) void {
+        const tab = self.view.activeTab() orelse return;
+        const st = tab.lsp orelse return;
+        if (st.conn != cn or !self.flushChanges(tab)) return;
+        // An action may first apply edits in other faces sharing this server.
+        for (registry.managers.items) |mgr| {
+            for (mgr.view.tabs.items) |other| {
+                const other_st = other.lsp orelse continue;
+                if (other_st.conn == cn and other_st.sync.open and !other_st.passive and !mgr.flushChanges(other)) return;
+            }
+        }
         // A `command` is either a Command object or (on a bare Command
         // action) the action itself with `command` as a string.
         const name = switch (cmd) {
@@ -2533,14 +2546,8 @@ pub const Manager = struct {
             self.scratch.appendSlice(self.alloc, txt) catch return;
         }
         self.scratch.appendSlice(self.alloc, "}") catch return;
-        const tab = self.view.activeTab() orelse return;
         dbg("executeCommand {s}", .{name});
-        _ = cn.sess.sendRequest(.execute_command, "workspace/executeCommand", self.scratch.items, .{
-            .id = 0,
-            .kind = .execute_command,
-            .tab_id = tab.id,
-            .revision = tab.doc.revision,
-        });
+        _ = queueRequest(.{ .tab = tab, .st = st, .cn = cn }, .execute_command, "workspace/executeCommand", self.scratch.items, tab.doc.revision, 0) orelse return;
         cn.pumpWrite();
     }
 
@@ -2701,8 +2708,7 @@ pub const Manager = struct {
     fn refreshDecorations(self: *Manager, tab: *ETab) void {
         const st = tab.lsp orelse return;
         const cn = st.conn orelse return;
-        if (cn.sess.state != .ready or !st.sync.open) return;
-        self.flushChanges(tab);
+        if (!self.flushChanges(tab)) return;
         const r = Ready{ .tab = tab, .st = st, .cn = cn };
 
         // The window both viewport-scoped requests use: the visible
@@ -4185,4 +4191,324 @@ test "lsp workspace edit: null and absent versions remain unversioned" {
     try std.testing.expect(textDocumentVersion(.null) == .unversioned);
     try std.testing.expect(textDocumentVersion(.{ .integer = 7 }) == .numeric);
     try std.testing.expect(textDocumentVersion(.{ .string = "7" }) == .invalid);
+}
+
+const SyncFixture = struct {
+    view: EditorView,
+    tab: ETab,
+    mgr: Manager,
+    cn: Conn,
+
+    fn init(self: *SyncFixture) !void {
+        const a = std.testing.allocator;
+        self.view = .{ .allocator = a, .pass = undefined, .widgets_dead = true };
+        self.tab = .{
+            .view = &self.view,
+            .id = 123,
+            .page = undefined,
+            .handle = undefined,
+            .doc = try Document.initFromBytes(a, "abc"),
+            .sels = .init(),
+            .layout = undefined,
+            .rows = undefined,
+            .language = .init(a),
+            .folds = undefined,
+            .sel_stack = undefined,
+            .git = undefined,
+            .outline = undefined,
+        };
+        errdefer self.tab.doc.deinit();
+        self.view.active = &self.tab;
+        try self.view.tabs.append(a, &self.tab);
+        errdefer self.view.tabs.deinit(a);
+        self.mgr = .{ .view = &self.view, .alloc = a };
+        self.mgr.list = .{ .mgr = &self.mgr };
+        self.mgr.hover = .{ .mgr = &self.mgr };
+        self.mgr.sig = .{ .mgr = &self.mgr };
+        self.cn = .{
+            .name = @constCast("test"),
+            .root = @constCast("/"),
+            .root_uri = @constCast("file:///"),
+            .sess = session.Session.init(a, undefined),
+        };
+        self.cn.sess.state = .ready;
+        self.cn.sess.caps = .{ .sync = .incremental, .open_close = true, .save_notify = true, .document_symbol = true };
+        const st = TabState.create(a, &self.tab) orelse return error.OutOfMemory;
+        errdefer st.destroy();
+        try st.sync.setUri("file:///a.zig");
+        st.sync.language_id = "zig";
+        st.conn = &self.cn;
+        self.tab.lsp = st;
+        self.tab.doc.addObserver(.{ .ctx = st, .before_apply = TabState.observeEdits });
+    }
+
+    fn deinit(self: *SyncFixture) void {
+        self.tab.lsp.?.destroy();
+        self.tab.doc.deinit();
+        self.tab.language.deinit();
+        self.view.tabs.deinit(std.testing.allocator);
+        self.mgr.scratch.deinit(std.testing.allocator);
+        self.cn.sess.deinit();
+    }
+
+    fn edit(self: *SyncFixture) !void {
+        var tx = tr.Transaction.init(self.tab.doc.revision);
+        defer tx.deinit(std.testing.allocator);
+        try tx.addInsert(std.testing.allocator, 0, "x");
+        _ = try self.tab.doc.applyTransaction(&tx);
+    }
+
+    fn expectFrames(self: *SyncFixture, expected: []const []const u8, text: []const u8) !void {
+        const t = std.testing;
+        var reader: rpc.Reader = .{};
+        defer reader.deinit(t.allocator);
+        try reader.feed(t.allocator, self.cn.sess.out.items);
+        for (expected, 0..) |method, i| {
+            const body = (try reader.next()) orelse return error.MissingFrame;
+            var parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, body, .{});
+            defer parsed.deinit();
+            const obj = parsed.value.object;
+            try t.expectEqualStrings(method, obj.get("method").?.string);
+            if (i == 0) {
+                const params = obj.get("params").?.object;
+                const got = if (std.mem.eql(u8, method, "textDocument/didOpen"))
+                    params.get("textDocument").?.object.get("text").?.string
+                else
+                    params.get("contentChanges").?.array.items[0].object.get("text").?.string;
+                try t.expectEqualStrings(text, got);
+            }
+        }
+        try t.expect(try reader.next() == null);
+    }
+};
+
+test "lsp sync: a failed didOpen retries from edits and explicit readiness" {
+    const t = std.testing;
+    for ([_]bool{ false, true }) |from_edit| {
+        var fx: SyncFixture = undefined;
+        try fx.init();
+        defer fx.deinit();
+        const st = fx.tab.lsp.?;
+        var failing = t.FailingAllocator.init(t.allocator, .{ .fail_index = 0 });
+        fx.cn.sess.alloc = failing.allocator();
+        defer fx.cn.sess.alloc = t.allocator;
+        fx.mgr.openDocument(&fx.tab, st);
+        try t.expect(!st.sync.open);
+        try t.expect(fx.mgr.ready("test") == null);
+        try t.expectEqual(@as(usize, 0), fx.cn.sess.out.items.len);
+        try fx.edit();
+        fx.cn.sess.alloc = t.allocator;
+        if (from_edit) fx.mgr.onEdited(&fx.tab) else try t.expect(fx.mgr.ready("test") != null);
+        try t.expect(st.sync.isSynchronized(fx.tab.doc.revision));
+        try t.expect(fx.mgr.ready("test") != null);
+        try fx.expectFrames(&.{"textDocument/didOpen"}, "xabc");
+    }
+}
+
+test "lsp sync: failed changes block requests and save until current text is queued" {
+    const t = std.testing;
+    for ([_]bool{ false, true }) |snapshot_failure| {
+        var fx: SyncFixture = undefined;
+        try fx.init();
+        defer fx.deinit();
+        const st = fx.tab.lsp.?;
+        fx.mgr.openDocument(&fx.tab, st);
+        fx.cn.sess.out.clearRetainingCapacity();
+        try fx.edit();
+        var failing = t.FailingAllocator.init(t.allocator, .{ .fail_index = 0 });
+        if (snapshot_failure) st.sync.alloc = failing.allocator() else fx.cn.sess.alloc = failing.allocator();
+        defer st.sync.alloc = t.allocator;
+        defer fx.cn.sess.alloc = t.allocator;
+        try t.expect(fx.mgr.ready("test") == null);
+        try t.expect(fx.mgr.quietReady() == null);
+        try t.expect(!fx.mgr.requestOutlineSymbols());
+        fx.mgr.refreshDecorations(&fx.tab);
+        fx.mgr.requestCompletion(.invoked);
+        fx.mgr.onSaved(&fx.tab);
+        const r = Manager.Ready{ .tab = &fx.tab, .st = st, .cn = &fx.cn };
+        try t.expect(Manager.queueRequest(r, .hover, "textDocument/hover", "{}", fx.tab.doc.revision, 0) == null);
+        try t.expect(st.sync.hasPendingChanges());
+        try t.expectEqual(@as(i64, 1), st.sync.version);
+        try t.expectEqual(@as(usize, 0), fx.cn.sess.pending.items.len);
+        try t.expectEqual(@as(usize, 0), fx.cn.sess.out.items.len);
+        st.sync.alloc = t.allocator;
+        fx.cn.sess.alloc = t.allocator;
+        try t.expect(fx.mgr.requestOutlineSymbols());
+        try t.expect(st.sync.isSynchronized(fx.tab.doc.revision));
+        try t.expectEqual(@as(usize, 1), fx.cn.sess.pending.items.len);
+        // The snapshot-allocation case still has a complete incremental
+        // change; notification failures deliberately retry with full text.
+        try fx.expectFrames(&.{ "textDocument/didChange", "textDocument/documentSymbol" }, if (snapshot_failure) "x" else "xabc");
+    }
+}
+
+test "lsp sync: a failed replacement with the same revision still blocks requests" {
+    const t = std.testing;
+    var fx: SyncFixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    const st = fx.tab.lsp.?;
+    fx.mgr.openDocument(&fx.tab, st);
+    fx.cn.sess.out.clearRetainingCapacity();
+    const replacement = try Document.initFromBytes(t.allocator, "replacement");
+    fx.tab.doc.deinit();
+    fx.tab.doc = replacement;
+    try t.expectEqual(st.sync.sent_revision, fx.tab.doc.revision);
+    var failing = t.FailingAllocator.init(t.allocator, .{ .fail_index = 0 });
+    fx.cn.sess.alloc = failing.allocator();
+    defer fx.cn.sess.alloc = t.allocator;
+    fx.mgr.onDocumentReplaced(&fx.tab);
+    try t.expect(st.sync.needs_full);
+    try t.expect(fx.mgr.ready("test") == null);
+    try t.expectEqual(@as(usize, 0), fx.cn.sess.out.items.len);
+    try t.expectEqual(@as(i64, 1), st.sync.version);
+    fx.cn.sess.alloc = t.allocator;
+    try t.expect(fx.mgr.ready("test") != null);
+    try t.expectEqual(@as(i64, 2), st.sync.version);
+    try t.expect(st.sync.isSynchronized(fx.tab.doc.revision));
+    try fx.expectFrames(&.{"textDocument/didChange"}, "replacement");
+}
+
+fn testRegisteredConn() !*Conn {
+    const a = registry.alloc;
+    const cn = try a.create(Conn);
+    errdefer a.destroy(cn);
+    const name = try a.dupe(u8, "test-new");
+    errdefer a.free(name);
+    const root = try a.dupe(u8, "/new");
+    errdefer a.free(root);
+    const uri = try a.dupe(u8, "file:///new");
+    errdefer a.free(uri);
+    cn.* = .{ .name = name, .root = root, .root_uri = uri, .sess = undefined };
+    cn.sess = session.Session.init(a, cn.handler());
+    cn.sess.state = .ready;
+    try registry.conns.append(a, cn);
+    return cn;
+}
+
+fn testClearRegistry() void {
+    registry.managers.clearRetainingCapacity();
+    registry.noteFaceGone();
+    registry.conns.deinit(registry.alloc);
+    registry.links.deinit(registry.alloc);
+    registry.managers.deinit(registry.alloc);
+}
+
+/// Wait for one test-owned source without assuming it outranks other ready GLib work.
+pub fn testWaitForSourceRemoval(source: c_uint) !void {
+    try std.testing.expect(source != 0);
+    const deadline = clock.nowMs() + 1000;
+    while (c.g_main_context_find_source_by_id(null, source) != null) {
+        if (clock.nowMs() >= deadline) return error.SourceRemovalTimeout;
+        if (c.g_main_context_iteration(null, 0) == 0) _ = c.usleep(1000);
+    }
+}
+
+test "lsp binding: either URI allocation failure preserves the old binding and retires the unused server" {
+    const t = std.testing;
+    const saved = registry.*;
+    defer registry.* = saved;
+    for ([_]bool{ false, true }) |fail_owned_uri| {
+        registry.* = .{ .alloc = t.allocator };
+        defer testClearRegistry();
+        var fx: SyncFixture = undefined;
+        try fx.init();
+        defer fx.deinit();
+        registry.register(&fx.mgr);
+        const st = fx.tab.lsp.?;
+        fx.cn.refs = 1;
+        fx.mgr.openDocument(&fx.tab, st);
+        fx.cn.sess.out.clearRetainingCapacity();
+        fx.tab.spec = @constCast("/new.zig");
+        fx.tab.language.lang = .zig;
+        const fresh = try testRegisteredConn();
+        var failing = t.FailingAllocator.init(t.allocator, .{ .fail_index = 0 });
+        if (fail_owned_uri) st.sync.alloc = failing.allocator() else fx.mgr.alloc = failing.allocator();
+        defer st.sync.alloc = t.allocator;
+        defer fx.mgr.alloc = t.allocator;
+        try t.expect(!fx.mgr.bindTabToConn(&fx.tab, fresh));
+        try t.expect(failing.has_induced_failure);
+        try t.expectEqual(&fx.cn, st.conn.?);
+        try t.expectEqualStrings("file:///a.zig", st.sync.uri);
+        try t.expect(st.sync.open);
+        try t.expectEqual(@as(usize, 1), fx.cn.refs);
+        try t.expectEqual(@as(usize, 0), fx.cn.sess.out.items.len);
+        try t.expect(fresh.closing and fresh.sess.state == .dead and fresh.refs == 0);
+        try t.expect(fresh.remove_idle != 0);
+        try t.expectEqual(@as(usize, 1), registry.conns.items.len);
+        const retirement_source = fresh.remove_idle;
+        const HigherPriority = struct {
+            ran: bool = false,
+
+            fn dispatch(user: ?*anyopaque) callconv(.c) c.gboolean {
+                cast.userData(@This(), user).ran = true;
+                return 0;
+            }
+        };
+        var higher_priority: HigherPriority = .{};
+        const higher_source = c.g_idle_add_full(c.G_PRIORITY_DEFAULT, HigherPriority.dispatch, &higher_priority, null);
+        defer if (c.g_main_context_find_source_by_id(null, higher_source) != null) {
+            _ = c.g_source_remove(higher_source);
+        };
+        // GIO leaves priority-0 cleanup work in the full suite's default
+        // context; it must run before this connection's priority-200 idle.
+        try testWaitForSourceRemoval(higher_source);
+        try t.expect(higher_priority.ran);
+        try t.expectEqual(@as(usize, 1), registry.conns.items.len);
+        try t.expect(c.g_main_context_find_source_by_id(null, retirement_source) != null);
+        try testWaitForSourceRemoval(retirement_source);
+        try t.expectEqual(@as(usize, 0), registry.conns.items.len);
+    }
+}
+
+test "lsp binding: detach callbacks can rebind without losing that binding or freeing the caller" {
+    const t = std.testing;
+    const saved = registry.*;
+    registry.* = .{ .alloc = t.allocator };
+    defer registry.* = saved;
+    defer testClearRegistry();
+    var fx: SyncFixture = undefined;
+    try fx.init();
+    defer fx.deinit();
+    registry.register(&fx.mgr);
+    const old = try testRegisteredConn();
+    const candidate = try testRegisteredConn();
+    const replacement = try testRegisteredConn();
+    const st = fx.tab.lsp.?;
+    st.conn = old;
+    old.refs = 1;
+    old.sess.caps.open_close = true;
+    fx.mgr.openDocument(&fx.tab, st);
+    fx.tab.spec = @constCast("/new.zig");
+    fx.tab.language.lang = .zig;
+    const Reentrant = struct {
+        mgr: *Manager,
+        tab: *ETab,
+        replacement: *Conn,
+        old: *Conn,
+        rebound: bool = false,
+
+        fn state(ctx: *anyopaque, value: session.State) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (value == .stopping) {
+                self.rebound = self.mgr.bindTabToConn(self.tab, self.replacement);
+            } else {
+                const handler = self.old.handler();
+                handler.on_state(handler.ctx, value);
+            }
+        }
+    };
+    var reentrant = Reentrant{ .mgr = &fx.mgr, .tab = &fx.tab, .replacement = replacement, .old = old };
+    old.sess.handler.ctx = &reentrant;
+    old.sess.handler.on_state = Reentrant.state;
+    try t.expect(!fx.mgr.bindTabToConn(&fx.tab, candidate));
+    try t.expect(reentrant.rebound);
+    try t.expectEqual(replacement, st.conn.?);
+    try t.expectEqual(@as(usize, 1), replacement.refs);
+    try t.expectEqualStrings("file:///new.zig", st.sync.uri);
+    try t.expect(candidate.closing and candidate.refs == 0);
+    try t.expect(candidate.remove_idle != 0);
+    try testWaitForSourceRemoval(candidate.remove_idle);
+    try t.expectEqual(@as(usize, 2), registry.conns.items.len);
+    try t.expectEqual(replacement, st.conn.?);
 }
