@@ -448,6 +448,17 @@ pub const CAP_VIEW_MAX_FPS = "view-max-fps";
 /// with reason `redirect_refused`. A client must not send the byte to a
 /// helper without this capability.
 pub const CAP_VIEW_FLAGS = "view-flags";
+/// The helper replays recorded human motion (0xE8 block). A client sends
+/// a validated motion pack once per connection (`motion_pack`, bounded
+/// chunks, answered by `ev_motion_pack`); afterwards a `sem_act` /
+/// `sem_act_guarded` whose optional trailing `motion` byte asks for
+/// `Motion.replay` reaches its target along a warped recorded path,
+/// presses for a recorded time, and types `set_value` text with
+/// recorded key timing, and `motion_scroll` scrolls in recorded wheel
+/// bursts (`ev_motion_done`). Replies to a replayed action carry
+/// `motion = replayed` and the duration. Without a loaded pack a replay
+/// request FAILS; it never falls back to direct input.
+pub const CAP_MOTION_REPLAY = "motion-replay";
 pub const MAX_VIEW_FPS: u16 = 240;
 pub const DEFAULT_HEADLESS_FPS: u16 = 60;
 
@@ -525,6 +536,7 @@ pub const Cap = enum {
     view_max_fps,
     view_flags,
     navigation_guard,
+    motion_replay,
 
     /// The wire name `hello_ack` carries.
     pub fn name(self: Cap) []const u8 {
@@ -877,6 +889,12 @@ pub const Tag = enum(u8) {
     ev_stream_open = 0xF9,
     stream_close = 0xFA,
     ev_stream_closed = 0xFB,
+    // 0xE8-0xEB: recorded-motion replay, capability "motion-replay"
+    // (see CAP_MOTION_REPLAY). 0xE6-0xE7 stay with cookie sync.
+    motion_pack = 0xE8,
+    ev_motion_pack = 0xE9,
+    motion_scroll = 0xEA,
+    ev_motion_done = 0xEB,
     _,
 
     /// Whether this build knows the frame; unknown tags are skipped.
@@ -2584,7 +2602,42 @@ pub const SemAction = struct {
     id: u32,
     action: u8,
     arg: []const u8,
+    /// Optional trailing `Motion` byte (capability `motion-replay`);
+    /// written only for a replay, so a direct action keeps the legacy
+    /// bytes.
+    motion: u8 = 0,
+
+    pub fn encodeTo(self: SemAction, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        try putU32(gpa, out, self.view);
+        try putU32(gpa, out, self.id);
+        try putU8(gpa, out, self.action);
+        try putStr(gpa, out, self.arg);
+        if (self.motion != 0) try putU8(gpa, out, self.motion);
+    }
+
+    pub fn decodeFrom(payload: []const u8) !SemAction {
+        var cur = Cur{ .buf = payload };
+        return .{
+            .view = try cur.readU32(),
+            .id = try cur.readU32(),
+            .action = try cur.readU8(),
+            .arg = try cur.readStr(),
+            .motion = if (cur.pos == payload.len) 0 else try cur.readU8(),
+        };
+    }
 };
+
+/// How an action's input is produced (`SemAction.motion`).
+pub const Motion = enum(u8) {
+    /// Today's synthesized input: one move, press and release at once.
+    direct = 0,
+    /// Recorded human motion from the connection's motion pack.
+    replay = 1,
+    _,
+};
+
+/// What a replayed action reports back (`SemActResult.motion`).
+pub const MotionResult = enum(u8) { absent = 0, direct = 1, replayed = 2, _ };
 
 pub const SemActResult = struct {
     pub const tag: Tag = .sem_act_result;
@@ -2592,7 +2645,117 @@ pub const SemActResult = struct {
     id: u32,
     ok: u8,
     msg: []const u8,
+    /// Optional trailing `MotionResult` and replay duration, written only
+    /// by a `motion-replay` helper answering a replayed action.
+    motion: u8 = 0,
+    duration_ms: u32 = 0,
+
+    pub fn encodeTo(self: SemActResult, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        try putU32(gpa, out, self.view);
+        try putU32(gpa, out, self.id);
+        try putU8(gpa, out, self.ok);
+        try putStr(gpa, out, self.msg);
+        if (self.motion != 0) {
+            try putU8(gpa, out, self.motion);
+            try putU32(gpa, out, self.duration_ms);
+        }
+    }
+
+    pub fn decodeFrom(payload: []const u8) !SemActResult {
+        var cur = Cur{ .buf = payload };
+        var out: SemActResult = .{
+            .view = try cur.readU32(),
+            .id = try cur.readU32(),
+            .ok = try cur.readU8(),
+            .msg = try cur.readStr(),
+        };
+        if (cur.pos == payload.len) return out;
+        out.motion = try cur.readU8();
+        out.duration_ms = try cur.readU32();
+        return out;
+    }
 };
+
+// -- motion replay (0xE8 block, capability "motion-replay") -----------
+
+/// Largest pack chunk a client sends in one `motion_pack`.
+pub const MOTION_CHUNK: usize = 1 << 20;
+/// Largest whole pack a helper assembles (mirrors `motion/pack.zig`).
+pub const MOTION_PACK_MAX: u32 = 32 << 20;
+
+/// One chunk of the connection's motion pack, in order: `offset` is
+/// where `chunk` starts in the `total`-byte pack, and the chunk that
+/// completes it makes the helper validate and install the pack, then
+/// answer `ev_motion_pack` with `serial`. `total` 0 clears the pack.
+/// A new `serial` restarts assembly.
+pub const MotionPack = struct {
+    pub const tag: Tag = .motion_pack;
+    serial: u32,
+    total: u32,
+    offset: u32,
+    chunk: Text,
+};
+
+/// The helper's verdict on a whole pack: `ok` 1 with its counts, or 0
+/// with why (the connection then has NO pack, never a partial one).
+pub const EvMotionPack = struct {
+    pub const tag: Tag = .ev_motion_pack;
+    serial: u32,
+    ok: u8,
+    reaches: u32,
+    keys: u32,
+    scroll: u32,
+    msg: []const u8,
+};
+
+/// Scroll (`dx`, `dy`) logical px in recorded wheel bursts at (`x`, `y`)
+/// (the helper prefers the replayed pointer's own position); answered by
+/// `ev_motion_done` with the same `req`.
+pub const MotionScroll = struct {
+    pub const tag: Tag = .motion_scroll;
+    view: u32,
+    req: u32,
+    x: i32,
+    y: i32,
+    dx: i32,
+    dy: i32,
+};
+
+pub const EvMotionDone = struct {
+    pub const tag: Tag = .ev_motion_done;
+    view: u32,
+    req: u32,
+    ok: u8,
+    duration_ms: u32,
+    msg: []const u8,
+};
+
+test "motion trailing fields keep legacy bytes and decode short payloads as absent" {
+    const gpa = std.testing.allocator;
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(gpa);
+    try encodePayload(gpa, &bytes, SemAction{ .view = 1, .id = 2, .action = 0, .arg = "x" });
+    try std.testing.expectEqual(@as(usize, 4 + 4 + 1 + 2 + 1), bytes.items.len);
+    try std.testing.expectEqual(@as(u8, 0), (try decode(SemAction, bytes.items)).motion);
+    bytes.clearRetainingCapacity();
+    try encodePayload(gpa, &bytes, SemAction{ .view = 1, .id = 2, .action = 0, .arg = "x", .motion = @intFromEnum(Motion.replay) });
+    try std.testing.expectEqual(@as(u8, 1), (try decode(SemAction, bytes.items)).motion);
+    bytes.clearRetainingCapacity();
+    try encodePayload(gpa, &bytes, SemActResult{ .view = 1, .id = 2, .ok = 1, .msg = "click" });
+    const legacy = try decode(SemActResult, bytes.items);
+    try std.testing.expectEqual(@as(u8, 0), legacy.motion);
+    bytes.clearRetainingCapacity();
+    try encodePayload(gpa, &bytes, SemActResult{ .view = 1, .id = 2, .ok = 1, .msg = "click", .motion = @intFromEnum(MotionResult.replayed), .duration_ms = 640 });
+    const replayed = try decode(SemActResult, bytes.items);
+    try std.testing.expectEqual(@as(u8, 2), replayed.motion);
+    try std.testing.expectEqual(@as(u32, 640), replayed.duration_ms);
+    try std.testing.expectError(error.Truncated, decode(SemActResult, bytes.items[0 .. bytes.items.len - 1]));
+    bytes.clearRetainingCapacity();
+    try encodePayload(gpa, &bytes, SemActGuarded{ .view = 1, .doc_gen = 2, .rev = 3, .id = 4, .guard = 5, .action = 0, .arg = "", .motion = 1 });
+    try std.testing.expectEqual(@as(u8, 1), (try decode(SemActGuarded, bytes.items)).motion);
+    try std.testing.expectEqualStrings("motion-replay", Cap.motion_replay.name());
+    try std.testing.expectEqual(@as(u8, 0xE8), @intFromEnum(Tag.motion_pack));
+}
 
 pub const SemExpand = struct {
     pub const tag: Tag = .sem_expand;
@@ -2719,6 +2882,33 @@ pub const SemActGuarded = struct {
     guard: u64,
     action: u8,
     arg: []const u8,
+    /// Optional trailing `Motion` byte, as on `SemAction`.
+    motion: u8 = 0,
+
+    pub fn encodeTo(self: SemActGuarded, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        try putU32(gpa, out, self.view);
+        try putU32(gpa, out, self.doc_gen);
+        try putU32(gpa, out, self.rev);
+        try putU32(gpa, out, self.id);
+        try putU64(gpa, out, self.guard);
+        try putU8(gpa, out, self.action);
+        try putStr(gpa, out, self.arg);
+        if (self.motion != 0) try putU8(gpa, out, self.motion);
+    }
+
+    pub fn decodeFrom(payload: []const u8) !SemActGuarded {
+        var cur = Cur{ .buf = payload };
+        return .{
+            .view = try cur.readU32(),
+            .doc_gen = try cur.readU32(),
+            .rev = try cur.readU32(),
+            .id = try cur.readU32(),
+            .guard = try cur.readU64(),
+            .action = try cur.readU8(),
+            .arg = try cur.readStr(),
+            .motion = if (cur.pos == payload.len) 0 else try cur.readU8(),
+        };
+    }
 };
 
 /// Correlated wrapper around one existing client-to-helper semantic

@@ -199,6 +199,7 @@ pub fn semanticNavigationStarted(self: *Host, v: *View) void {
     v.sem_context_doc = 0;
     v.sem_observing = false;
     self.portsAbandonView(v.id);
+    self.motionCancel(v, "the motion replay was interrupted by navigation");
     for (v.pending.items) |*p| {
         switch (p.kind) {
             .snapshot, .hints, .query, .read, .read_ids => {
@@ -444,11 +445,12 @@ pub fn semAct(self: *Host, req: proto.SemAction) !void {
         self.post(proto.SemActResult{ .view = v.id, .id = req.id, .ok = 0, .msg = v.sem.unknownReason(req.id) });
         return;
     }
+    const motion_conn = motionConnFor(self, v, req.id, req.motion) orelse return;
     var buf: [512]u8 = undefined;
     switch (@as(proto.SemAct, @enumFromInt(req.action))) {
         .click, .hover => {
             const kind: Pending.Kind = if (req.action == @intFromEnum(proto.SemAct.click)) .click else .hover;
-            const rid = try self.pushPending(v, .{ .req = nextReq(v), .kind = kind, .sid = req.id });
+            const rid = try self.pushPending(v, .{ .req = nextReq(v), .kind = kind, .sid = req.id, .motion_conn = motion_conn });
             const cmd = std.fmt.bufPrint(&buf, "{{\"op\":\"locate\",\"req\":{d},\"eid\":{d}}}", .{ rid, eid }) catch return;
             self.sendScript(v, cmd);
         },
@@ -470,6 +472,7 @@ pub fn semAct(self: *Host, req: proto.SemAction) !void {
                 .kind = .set_value,
                 .sid = req.id,
                 .arg = arg,
+                .motion_conn = motion_conn,
             });
             var cmd: std.Io.Writer.Allocating = .init(self.gpa);
             defer cmd.deinit();
@@ -480,6 +483,24 @@ pub fn semAct(self: *Host, req: proto.SemAction) !void {
         },
         _ => self.post(proto.SemActResult{ .view = v.id, .id = req.id, .ok = 0, .msg = "unknown action" }),
     }
+}
+
+/// The connection whose motion pack a `motion` byte asks for: 0 for a
+/// direct action, null (with the action already answered) for a replay
+/// this connection cannot serve. Never a silent direct fallback.
+fn motionConnFor(self: *Host, v: *View, sid: u32, motion: u8) ?u32 {
+    if (motion != @intFromEnum(proto.Motion.replay)) return 0;
+    if (self.motionPackFor(self.dispatch_conn) == null) {
+        self.post(proto.SemActResult{
+            .view = v.id,
+            .id = sid,
+            .ok = 0,
+            .msg = "motion replay was asked for but no motion pack is loaded on this connection; nothing was done",
+            .motion = @intFromEnum(proto.MotionResult.replayed),
+        });
+        return null;
+    }
+    return self.dispatch_conn;
 }
 
 /// Refresh the live tree before resolving a reader id, then require
@@ -494,6 +515,7 @@ pub fn semActGuarded(self: *Host, req: proto.SemActGuarded) !void {
         self.post(proto.SemActResult{ .view = v.id, .id = req.id, .ok = 0, .msg = stale_reader_msg });
         return;
     }
+    const motion_conn = motionConnFor(self, v, req.id, req.motion) orelse return;
     const arg = try self.gpa.dupe(u8, req.arg);
     errdefer self.gpa.free(arg);
     const rid = try self.pushPending(v, .{
@@ -506,6 +528,7 @@ pub fn semActGuarded(self: *Host, req: proto.SemActGuarded) !void {
         .guard = req.guard,
         .guarded = true,
         .arg = arg,
+        .motion_conn = motion_conn,
     });
     var buf: [96]u8 = undefined;
     const cmd = std.fmt.bufPrint(
@@ -953,7 +976,9 @@ pub fn onScriptMessage(self: *Host, v: *View, json: []const u8) void {
             ) catch a.value.msg,
             else => a.value.msg,
         };
-        self.post(proto.SemActResult{ .view = v.id, .id = p.sid, .ok = a.value.ok, .msg = msg });
+        if (p.kind == .commit and p.motion_ms != null) {
+            self.post(proto.SemActResult{ .view = v.id, .id = p.sid, .ok = a.value.ok, .msg = msg, .motion = @intFromEnum(proto.MotionResult.replayed), .duration_ms = p.motion_ms.? });
+        } else self.post(proto.SemActResult{ .view = v.id, .id = p.sid, .ok = a.value.ok, .msg = msg });
     } else if (std.mem.eql(u8, op, "text")) {
         const Txt = struct { off: u32 = 0, text: []const u8 = "" };
         const t = std.json.parseFromSlice(Txt, self.gpa, json, .{ .ignore_unknown_fields = true }) catch return;
@@ -1105,7 +1130,7 @@ pub fn semActAfterGuard(self: *Host, v: *View, p: Pending) void {
     switch (@as(proto.SemAct, @enumFromInt(p.mode))) {
         .click, .hover => {
             const kind: Pending.Kind = if (p.mode == @intFromEnum(proto.SemAct.click)) .click else .hover;
-            const rid = self.pushPending(v, .{ .req = nextReq(v), .kind = kind, .sid = p.sid, .guarded = true }) catch return;
+            const rid = self.pushPending(v, .{ .req = nextReq(v), .kind = kind, .sid = p.sid, .guarded = true, .motion_conn = p.motion_conn }) catch return;
             const cmd = std.fmt.bufPrint(&buf, "{{\"op\":\"locate\",\"req\":{d},\"eid\":{d}}}", .{ rid, eid }) catch return;
             self.sendScript(v, cmd);
         },
@@ -1117,7 +1142,7 @@ pub fn semActAfterGuard(self: *Host, v: *View, p: Pending) void {
         },
         .set_value => {
             const arg = self.gpa.dupe(u8, p.arg) catch return;
-            const rid = self.pushPending(v, .{ .req = nextReq(v), .kind = .set_value, .sid = p.sid, .guarded = true, .arg = arg }) catch {
+            const rid = self.pushPending(v, .{ .req = nextReq(v), .kind = .set_value, .sid = p.sid, .guarded = true, .arg = arg, .motion_conn = p.motion_conn }) catch {
                 self.gpa.free(arg);
                 return;
             };
@@ -1143,9 +1168,6 @@ pub fn onRect(self: *Host, v: *View, p: *Pending, json: []const u8) void {
         self.post(proto.SemActResult{ .view = v.id, .id = p.sid, .ok = 0, .msg = if (p.guarded) stale_reader_msg else "element has no box" });
         return;
     }
-    const pt = viewPoint(v, r.value.x, r.value.y);
-    var ev = cef.cef_mouse_event_t{ .x = pt.x, .y = pt.y, .modifiers = 0 };
-    withHostArgs(v, sendMove, .{ &ev, @as(c_int, 0) });
     // Echo WHAT the id resolved to, not only where the pointer
     // went: a mis-resolved id is invisible in bare coordinates.
     var target_buf: [140]u8 = undefined;
@@ -1160,16 +1182,23 @@ pub fn onRect(self: *Host, v: *View, p: *Pending, json: []const u8) void {
         std.fmt.bufPrint(&ctx_buf, "in {s} \"{s}\" ", .{ cx.role, cx.name[0..@min(cx.name.len, 120)] }) catch ""
     else
         "";
+    const click = p.kind != .hover;
     var buf: [400]u8 = undefined;
-    if (p.kind == .hover) {
-        const msg = std.fmt.bufPrint(&buf, "hover {s}{s}at {d},{d}", .{ target, ctx, r.value.x, r.value.y }) catch "hover";
-        self.post(proto.SemActResult{ .view = v.id, .id = p.sid, .ok = 1, .msg = msg });
+    const msg = std.fmt.bufPrint(&buf, "{s} {s}{s}at {d},{d}", .{ if (click) "click" else "hover", target, ctx, r.value.x, r.value.y }) catch (if (click) "click" else "hover");
+    if (p.motion_conn != 0) {
+        // Recorded motion: the result is posted when the replay ends.
+        self.motionStartPointer(v, p, .{ r.value.x, r.value.y, r.value.w, r.value.h }, click, msg);
         return;
     }
-    withHostArgs(v, setFocus, .{@as(c_int, 1)});
-    withHostArgs(v, sendClick, .{ &ev, cef.MBT_LEFT, @as(c_int, 0), @as(c_int, 1) });
-    withHostArgs(v, sendClick, .{ &ev, cef.MBT_LEFT, @as(c_int, 1), @as(c_int, 1) });
-    const msg = std.fmt.bufPrint(&buf, "click {s}{s}at {d},{d}", .{ target, ctx, r.value.x, r.value.y }) catch "click";
+    const pt = viewPoint(v, r.value.x, r.value.y);
+    var ev = cef.cef_mouse_event_t{ .x = pt.x, .y = pt.y, .modifiers = 0 };
+    withHostArgs(v, sendMove, .{ &ev, @as(c_int, 0) });
+    v.motion_ptr = .{ @floatFromInt(r.value.x), @floatFromInt(r.value.y) };
+    if (click) {
+        withHostArgs(v, setFocus, .{@as(c_int, 1)});
+        withHostArgs(v, sendClick, .{ &ev, cef.MBT_LEFT, @as(c_int, 0), @as(c_int, 1) });
+        withHostArgs(v, sendClick, .{ &ev, cef.MBT_LEFT, @as(c_int, 1), @as(c_int, 1) });
+    }
     self.post(proto.SemActResult{ .view = v.id, .id = p.sid, .ok = 1, .msg = msg });
 }
 
@@ -1334,17 +1363,29 @@ pub fn onSetValue(self: *Host, v: *View, p: *Pending, json: []const u8) void {
         });
         return;
     }
+    if (p.motion_conn != 0) {
+        // Recorded key timing: the commit read follows the last key.
+        _ = self.motionStartTyping(v, p);
+        return;
+    }
     withHostArgs(v, setFocus, .{@as(c_int, 1)});
     self.typeKeys(v, p.arg);
-    const eid = v.sem.eidFor(p.sid);
-    const rid = self.pushPending(v, .{ .req = nextReq(v), .kind = .commit, .sid = p.sid, .guarded = p.guarded }) catch return;
+    semCommitTyped(self, v, p.sid, p.guarded, p.arg, null);
+}
+
+/// After `set_value`'s keys were sent: read the value back, waiting
+/// (bounded) for `want` to land. `motion_ms` marks typing that was a
+/// replay, which the action's result then reports.
+pub fn semCommitTyped(self: *Host, v: *View, sid: u32, guarded: bool, want: []const u8, motion_ms: ?u32) void {
+    const eid = v.sem.eidFor(sid);
+    const rid = self.pushPending(v, .{ .req = nextReq(v), .kind = .commit, .sid = sid, .guarded = guarded, .motion_ms = motion_ms }) catch return;
     // The keystrokes are queued input and this script is an IPC to
     // the renderer: they race. `want` lets the commit read wait
     // (bounded) for the typed text to land before reporting.
     var cmd: std.Io.Writer.Allocating = .init(self.gpa);
     defer cmd.deinit();
     cmd.writer.print("{{\"op\":\"commit\",\"req\":{d},\"eid\":{d},\"want\":", .{ rid, eid }) catch return;
-    jsonStr(&cmd.writer, p.arg) catch return;
+    jsonStr(&cmd.writer, want) catch return;
     cmd.writer.writeByte('}') catch return;
     self.sendScript(v, cmd.written());
 }

@@ -163,6 +163,7 @@ const unconditional_caps = [_]proto.Cap{
     .web_stream,
     .view_max_fps,
     .view_flags,
+    .motion_replay,
 };
 
 /// Test-only negotiation seam: an environment switch that withholds one
@@ -185,6 +186,7 @@ fn withheld(cap: proto.Cap) bool {
         .view_flags => "SKETERM_WEB_DISABLE_VIEW_FLAGS",
         .query_live => "SKETERM_WEB_DISABLE_QUERY_LIVE",
         .page_read => "SKETERM_WEB_DISABLE_PAGE_READ",
+        .motion_replay => "SKETERM_WEB_DISABLE_MOTION_REPLAY",
         else => return false,
     };
     return c.getenv(env) != null;
@@ -633,7 +635,11 @@ pub const Server = struct {
             busy_timeout_ms
         else
             idle_timeout_ms;
-        const n = c.poll(&pfds, @intCast(n_pfds), timeout);
+        // A motion replay's next step may be due sooner than the turn
+        // would otherwise end: its timing is the whole point.
+        const motion_wait: c_int = if (self.host.motionWaitMs()) |ms| @intCast(@min(ms, idle_timeout_ms)) else idle_timeout_ms;
+        const turn_timeout: c_int = if (timeout == 0) 0 else @min(timeout, motion_wait);
+        const n = c.poll(&pfds, @intCast(n_pfds), turn_timeout);
         const poll_errno = errno();
         if (n < 0 and poll_errno != c.EINTR) {
             // The poll set itself failed; nothing per-connection can be
@@ -681,6 +687,8 @@ pub const Server = struct {
         // and run the periodic jar reconcile. A no-op — one branch —
         // while no connection has subscribed.
         self.host.cookieSyncPump(clock.nowMs());
+        // Recorded-motion replays: emit every step that is due.
+        self.host.motionPump();
         // CEF callbacks queue outbound frames, so pump BEFORE flushing.
         cefhost.pump();
         // A decision may have arrived in that pump; retire timeouts and
@@ -1026,6 +1034,10 @@ pub const Server = struct {
                 self.host.usStyleSet(req);
             },
             .scroll_to => self.host.scrollTo(try self.dec(cn, proto.ScrollTo, frame.payload)),
+            // Motion replay (0xE8). The pack is per CONNECTION: one
+            // client's recorded motion is never replayed for another.
+            .motion_pack => self.host.motionPackChunk(cn.id, try proto.decode(proto.MotionPack, frame.payload)),
+            .motion_scroll => self.host.motionScroll(cn.id, try self.dec(cn, proto.MotionScroll, frame.payload)),
             .devtools_show => try self.host.devtoolsShow(try self.dec(cn, proto.DevToolsShow, frame.payload)),
             .print_pdf => self.host.printPdf(try self.dec(cn, proto.PrintPdf, frame.payload)),
             .flush_req => {

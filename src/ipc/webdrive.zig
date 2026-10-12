@@ -183,6 +183,9 @@ pub const OpReq = struct {
     /// page-side serializer may emit before it marks a cut (0 = its own
     /// default). The caller's inline budget, not a wire constant.
     max_str: u32 = 0,
+    /// Act only: `proto.Motion`. A replay needs `motion-replay` and a
+    /// loaded pack, or the op fails before anything is sent.
+    motion: u8 = 0,
 };
 
 /// One finished round trip; `text` is arena-owned by the caller.
@@ -193,6 +196,9 @@ pub const OpOut = struct {
     rev: u32 = 0,
     snap_kind: u8 = 0,
     timed_out: bool = false,
+    /// `proto.MotionResult` and the replay's duration, for an act.
+    motion: u8 = 0,
+    duration_ms: u32 = 0,
 };
 
 /// A completed reply parked until the in-flight runOp collects it.
@@ -202,6 +208,41 @@ const Sem = struct {
     doc_gen: u32 = 0,
     rev: u32 = 0,
     snap_kind: u8 = 0,
+    motion: u8 = 0,
+    duration_ms: u32 = 0,
+};
+
+/// This engine's motion pack and what the current helper made of it
+/// (capability "motion-replay"). The pack outlives helper restarts and
+/// is re-sent to every helper the engine connects to.
+pub const MotionLink = struct {
+    /// Installed pack name and validated bytes; owned.
+    name: []u8 = &.{},
+    pack: ?[]u8 = null,
+    state: enum { none, sending, loaded, refused } = .none,
+    serial: u32 = 0,
+    reaches: u32 = 0,
+    keys: u32 = 0,
+    scroll: u32 = 0,
+    why_buf: [200]u8 = undefined,
+    why_len: usize = 0,
+
+    pub fn why(self: *const MotionLink) []const u8 {
+        return self.why_buf[0..self.why_len];
+    }
+};
+
+/// One `ev_motion_done` parked for the `motionScroll` waiting on it.
+pub const MotionDone = struct {
+    req: u32,
+    ok: bool,
+    duration_ms: u32,
+    msg_buf: [200]u8 = undefined,
+    msg_len: usize = 0,
+
+    pub fn msg(self: *const MotionDone) []const u8 {
+        return self.msg_buf[0..self.msg_len];
+    }
 };
 
 pub const View = struct {
@@ -317,6 +358,8 @@ pub const View = struct {
     stream_reply: ?[]u8 = null,
     /// From a successful open until `ev_stream_closed`: one stream per view.
     streaming: bool = false,
+    /// The last `ev_motion_done` (a replayed scroll's answer).
+    motion_done: ?MotionDone = null,
 
     /// Bounded mirror of the page's `ev_console` stream, so a tool can
     /// answer "what did the page log" after the fact. Drop-oldest; ids
@@ -1148,6 +1191,9 @@ pub const Engine = struct {
     /// would otherwise be a silent-loosening hole. Keys and host lists
     /// owned.
     profile_policy: std.StringHashMapUnmanaged(NetPolicy) = .empty,
+    /// Recorded-motion replay: the pack and its state on this helper.
+    motion: MotionLink = .{},
+    next_motion_req: u32 = 1,
 
     /// Durable profile store; null when it could not be taken (see
     /// `store_reason`). Opened lazily, ONCE per engine — a store that
@@ -1365,6 +1411,7 @@ pub const Engine = struct {
             freePolicy(self.gpa, entry.value_ptr);
         }
         self.profile_policy.deinit(self.gpa);
+        self.setMotionPack("", null) catch {};
         if (self.remote) |*r| {
             r.deinit();
             self.remote = null;
@@ -1765,6 +1812,7 @@ pub const Engine = struct {
         // id and lands in the SAME jar; ephemeral ones are simply gone.
         self.clearContexts();
         self.caps = .initEmpty();
+        self.motion.state = .none;
         // A download in flight died with the helper. Failing it here is
         // what turns a lost helper into an ANSWER for whoever is
         // waiting on the file, instead of a wait that runs out.
@@ -3248,6 +3296,91 @@ pub const Engine = struct {
         try self.sendInput(proto.InputScroll{ .view = id, .x = @intCast(v.w / 2), .y = @intCast(v.h / 2), .dx = dx, .dy = dy, .mods = 0 });
     }
 
+    pub const MotionError = error{ Unavailable, MotionUnsupported, NoMotionPack, MotionPackRefused, Timeout };
+
+    /// Use `bytes` (an installed, validated pack named `name`) for every
+    /// replay on this engine, sending it to the running helper now and
+    /// to every later one at its handshake. Null clears it.
+    pub fn setMotionPack(self: *Engine, name: []const u8, bytes: ?[]const u8) !void {
+        if (self.motion.pack) |old| self.gpa.free(old);
+        if (self.motion.name.len > 0) self.gpa.free(self.motion.name);
+        self.motion.pack = null;
+        self.motion.name = &.{};
+        self.motion.state = .none;
+        const b = bytes orelse return;
+        self.motion.pack = try self.gpa.dupe(u8, b);
+        self.motion.name = try self.gpa.dupe(u8, name);
+        if (self.state == .ready and self.has(.motion_replay)) self.sendMotionPack();
+    }
+
+    /// The pack in bounded chunks under a fresh serial; the helper
+    /// answers `ev_motion_pack` once the last chunk is in.
+    fn sendMotionPack(self: *Engine) void {
+        const bytes = self.motion.pack orelse return;
+        self.motion.serial +%= 1;
+        if (self.motion.serial == 0) self.motion.serial = 1;
+        self.motion.state = .sending;
+        var off: usize = 0;
+        while (off < bytes.len) {
+            const n = @min(bytes.len - off, proto.MOTION_CHUNK);
+            self.send(proto.MotionPack{
+                .serial = self.motion.serial,
+                .total = @intCast(bytes.len),
+                .offset = @intCast(off),
+                .chunk = .{ .s = bytes[off .. off + n] },
+            }) catch {
+                self.motion.state = .none;
+                return;
+            };
+            off += n;
+        }
+    }
+
+    /// Wait (bounded) until the current helper holds this engine's pack.
+    pub fn motionReady(self: *Engine, budget_ms: i64) MotionError!void {
+        if (!self.ensure()) return error.Unavailable;
+        if (!self.has(.motion_replay)) return error.MotionUnsupported;
+        if (self.motion.pack == null) return error.NoMotionPack;
+        if (self.motion.state == .none) self.sendMotionPack();
+        const deadline = clock.nowMs() + @max(budget_ms, 100);
+        while (self.motion.state == .sending) {
+            if (self.state != .ready) return error.Unavailable;
+            if (clock.nowMs() >= deadline) return error.Timeout;
+            self.pumpOnce(40);
+        }
+        return switch (self.motion.state) {
+            .loaded => {},
+            .refused => error.MotionPackRefused,
+            else => error.Unavailable,
+        };
+    }
+
+    pub const MotionScrollOut = struct { ok: bool, duration_ms: u32, msg: []const u8 };
+
+    /// Scroll in recorded wheel bursts and wait for the helper to finish
+    /// them. The message borrows `arena`.
+    pub fn motionScroll(self: *Engine, arena: std.mem.Allocator, id: u32, dx: i32, dy: i32, budget_ms: i64) !MotionScrollOut {
+        try self.motionReady(@min(budget_ms, 10_000));
+        const v = self.findView(id) orelse return error.NoView;
+        self.awaitFirstPaint(id, @min(budget_ms, 5_000));
+        const req = self.next_motion_req;
+        self.next_motion_req +%= 1;
+        if (self.next_motion_req == 0) self.next_motion_req = 1;
+        v.motion_done = null;
+        self.send(proto.MotionScroll{ .view = id, .req = req, .x = @intCast(v.w / 2), .y = @intCast(v.h / 2), .dx = dx, .dy = dy }) catch return error.Unavailable;
+        const deadline = clock.nowMs() + @max(budget_ms, 1_000);
+        while (true) {
+            const live = self.findView(id) orelse return error.NoView;
+            if (live.motion_done) |d| if (d.req == req) {
+                live.motion_done = null;
+                return .{ .ok = d.ok, .duration_ms = d.duration_ms, .msg = try arena.dupe(u8, d.msg()) };
+            };
+            if (self.state != .ready) return error.Unavailable;
+            if (clock.nowMs() >= deadline) return error.Timeout;
+            self.pumpOnce(40);
+        }
+    }
+
     /// Mirror one `ev_console` line into the view's bounded ring.
     fn pushConsole(self: *Engine, v: *View, level: u8, msg: []const u8) void {
         const text = self.gpa.dupe(u8, msg[0..@min(msg.len, CONSOLE_LINE_MAX)]) catch return;
@@ -3922,6 +4055,10 @@ pub const Engine = struct {
         if (!self.has(.semantic)) return error.NoSemantic;
         if (self.findView(view_id) == null) return error.NoView;
 
+        // A replay that cannot happen fails HERE, before anything is
+        // sent: a caller that asked for human motion must never get a
+        // direct click instead.
+        if (req.kind == .act and req.motion == @intFromEnum(proto.Motion.replay)) try self.motionReady(@min(budget_ms, 10_000));
         // `click`/`hover` are synthesized through the real input path,
         // which needs a composited frame to hit-test against.
         if (req.kind == .act) self.awaitFirstPaint(view_id, @min(budget_ms, 5_000));
@@ -3955,9 +4092,10 @@ pub const Engine = struct {
                     .guard = guard.guard,
                     .action = req.action,
                     .arg = req.arg,
+                    .motion = req.motion,
                 })
             else
-                self.sendSemantic(request, proto.SemAction{ .view = view_id, .id = req.id, .action = req.action, .arg = req.arg }),
+                self.sendSemantic(request, proto.SemAction{ .view = view_id, .id = req.id, .action = req.action, .arg = req.arg, .motion = req.motion }),
             .expand => self.sendSemantic(request, proto.SemExpand{ .view = view_id, .id = req.id, .off = req.off, .len = req.len }),
             .query => self.sendSemantic(request, proto.SemQueryReq{ .view = view_id, .kind = req.action, .arg = req.arg }),
             .read => if (self.has(.reader_ids))
@@ -3986,6 +4124,8 @@ pub const Engine = struct {
                         .doc_gen = sem.doc_gen,
                         .rev = sem.rev,
                         .snap_kind = sem.snap_kind,
+                        .motion = sem.motion,
+                        .duration_ms = sem.duration_ms,
                     };
                 }
             } else return error.NoView;
@@ -4212,11 +4352,17 @@ pub const Engine = struct {
     }
 
     fn park(self: *Engine, v: *View, kind: OpKind, request: u32, ok: bool, text: []const u8, doc_gen: u32, rev: u32, snap_kind: u8) void {
-        if (!acceptsSemanticReply(v, kind, request)) return;
+        _ = self.parkAccepted(v, kind, request, ok, text, doc_gen, rev, snap_kind);
+    }
+
+    /// `park`, saying whether the reply was taken.
+    fn parkAccepted(self: *Engine, v: *View, kind: OpKind, request: u32, ok: bool, text: []const u8, doc_gen: u32, rev: u32, snap_kind: u8) bool {
+        if (!acceptsSemanticReply(v, kind, request)) return false;
         const ki = @intFromEnum(kind);
-        const owned = self.gpa.dupe(u8, text) catch return;
+        const owned = self.gpa.dupe(u8, text) catch return false;
         if (v.inbox[ki]) |old| self.gpa.free(old.text);
         v.inbox[ki] = .{ .ok = ok, .text = owned, .doc_gen = doc_gen, .rev = rev, .snap_kind = snap_kind };
+        return true;
     }
 
     fn dispatch(self: *Engine, frame: proto.Frame) void {
@@ -4240,6 +4386,25 @@ pub const Engine = struct {
                 const ev = proto.decode(proto.EvStreamClosed, frame.payload) catch return;
                 if (self.findView(ev.view)) |v| v.streaming = false;
             },
+            .ev_motion_pack => {
+                const ev = proto.decode(proto.EvMotionPack, frame.payload) catch return;
+                if (ev.serial != self.motion.serial) return;
+                self.motion.state = if (ev.ok != 0) .loaded else .refused;
+                self.motion.reaches = ev.reaches;
+                self.motion.keys = ev.keys;
+                self.motion.scroll = ev.scroll;
+                const n = @min(ev.msg.len, self.motion.why_buf.len);
+                @memcpy(self.motion.why_buf[0..n], ev.msg[0..n]);
+                self.motion.why_len = n;
+            },
+            .ev_motion_done => {
+                const ev = proto.decode(proto.EvMotionDone, frame.payload) catch return;
+                const v = self.findView(ev.view) orelse return;
+                var done: MotionDone = .{ .req = ev.req, .ok = ev.ok != 0, .duration_ms = ev.duration_ms };
+                done.msg_len = @min(ev.msg.len, done.msg_buf.len);
+                @memcpy(done.msg_buf[0..done.msg_len], ev.msg[0..done.msg_len]);
+                v.motion_done = done;
+            },
             .hello_ack => {
                 const ack = proto.HelloAck.decodeAlloc(frame.payload, self.gpa) catch return;
                 defer self.gpa.free(ack.caps);
@@ -4249,6 +4414,8 @@ pub const Engine = struct {
                     return;
                 }
                 self.caps = proto.parseCaps(ack.caps);
+                self.motion.state = .none;
+                if (self.motion.pack != null and self.has(.motion_replay)) self.sendMotionPack();
                 // Headless: allow real popups for the whole connection.
                 // A cancelled popup makes window.open return null, which
                 // is what breaks every federated sign-in at its last
@@ -4528,7 +4695,11 @@ pub const Engine = struct {
             },
             .sem_act_result => {
                 const ev = proto.decode(proto.SemActResult, frame.payload) catch return;
-                if (self.findView(ev.view)) |v| self.park(v, .act, request, ev.ok != 0, ev.msg, 0, 0, 0);
+                const v = self.findView(ev.view) orelse return;
+                if (self.parkAccepted(v, .act, request, ev.ok != 0, ev.msg, 0, 0, 0)) {
+                    v.inbox[@intFromEnum(OpKind.act)].?.motion = ev.motion;
+                    v.inbox[@intFromEnum(OpKind.act)].?.duration_ms = ev.duration_ms;
+                }
             },
             .sem_expand_result => {
                 const ev = proto.decode(proto.SemExpandResult, frame.payload) catch return;

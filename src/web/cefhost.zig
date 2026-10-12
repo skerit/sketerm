@@ -55,6 +55,7 @@ const host_wreq = @import("cefhost/webrequest.zig");
 const host_webext = @import("cefhost/webext.zig");
 const host_cookies = @import("cefhost/cookies.zig");
 const host_stream = @import("cefhost/stream.zig");
+const host_motion = @import("cefhost/motion.zig");
 const streamsrv = @import("streamsrv.zig");
 pub const untrusted = @import("cefhost/untrusted.zig");
 const emulation = @import("cefhost/emulation.zig");
@@ -540,6 +541,11 @@ pub const View = struct {
     /// An explicit navigate/back/forward/reload has advanced the
     /// generation before CEF's matching load-start callback arrives.
     pending: std.ArrayList(Pending) = .empty,
+    /// The recorded-motion replay running on this view (cefhost/motion.zig).
+    motion_run: ?*host_motion.Run = null,
+    /// Where this view's pointer is, logical px, once a semantic action
+    /// put it somewhere; a replay starts from here.
+    motion_ptr: ?[2]f64 = null,
 
     /// The view id of this view's OPEN inspector, 0 when it has none.
     /// Set on the SOURCE view; destroying it takes the inspector with
@@ -741,6 +747,14 @@ pub const media_id_bit: u64 = 1 << 63;
 /// enqueued — see `Host.postDmabuf`.
 pub const max_frame_backlog = 8;
 
+/// The key that types one character (`Host.keystroke`).
+pub const Keystroke = struct {
+    keysym: u32,
+    shift: bool,
+    text: [4]u8 = undefined,
+    text_len: u8 = 0,
+};
+
 /// One in-flight round trip to the injected script.
 ///
 /// Actions are multi-step on purpose: a click first asks the script
@@ -777,6 +791,11 @@ pub const Pending = struct {
     /// the code for the same reason the two above do — the CSP re-send
     /// must be byte-equivalent, budget included.
     eval_max_str: u32 = 0,
+    /// Nonzero: the action asked for motion replay, from this connection's pack.
+    motion_conn: u32 = 0,
+    /// A commit after replayed typing: the replay's duration, reported
+    /// with `motion = replayed` on the action's result.
+    motion_ms: ?u32 = null,
 
     pub const Kind = enum {
         snapshot,
@@ -973,6 +992,8 @@ pub const Host = struct {
     subs: std.ArrayList(Sub) = .empty,
     observers: std.ArrayList(u32) = .empty,
     views: std.ArrayList(*View) = .empty,
+    /// Per-connection motion packs (capability "motion-replay").
+    motion_packs: std.ArrayList(*host_motion.ConnPack) = .empty,
     /// The view a create_browser_sync call is currently building, for
     /// the callbacks CEF fires BEFORE it returns the browser pointer.
     pending: ?*View = null,
@@ -1353,6 +1374,7 @@ pub const Host = struct {
     pub fn deinit(self: *Host) void {
         self.streamCloseAll();
         self.destroyAll();
+        self.motionDeinit();
         // After every view is gone: a teardown can still release held keys.
         if (self.us_layout) |*l| l.deinit(self.gpa);
         self.us_layout = null;
@@ -2314,6 +2336,7 @@ pub const Host = struct {
     pub fn dropConn(self: *Host, conn_id: u32) void {
         if (conn_id == 0) return;
         self.cookieSyncDropConn(conn_id);
+        self.motionDropConn(conn_id);
         self.observeDropConn(conn_id);
         // Its tabs leave with it, as onRemoved, or an extension keeps
         // per-tab state for a window that no longer exists.
@@ -2472,7 +2495,7 @@ pub const Host = struct {
     /// was discarded — those frames are exactly the ones that mean
     /// "somebody is using this page again". Null when the id is unknown
     /// or the revival failed, which every caller treats as "ignore".
-    fn findWake(self: *Host, id: u32) ?*View {
+    pub fn findWake(self: *Host, id: u32) ?*View {
         return self.findWakeWith(id, &system_browser_spawn_ops);
     }
 
@@ -2786,6 +2809,7 @@ pub const Host = struct {
     /// closed the browser itself, where asking
     /// it to close again would re-enter a teardown in progress.
     fn dropBrowser(self: *Host, v: *View, close: bool) void {
+        self.motionCancel(v, "the view's browser went away during the motion replay");
         // Only a view still creating its first document failed to be
         // created; a live media change awaiting its ACK is not a creation.
         if (v.initial_url != null and !v.initial_live) self.post(proto.EvViewCreateFailed{
@@ -3602,7 +3626,7 @@ pub const Host = struct {
     /// (MCP, a stream peer) gets the US-keyboard key that produces the
     /// keysym, so the page reads the `KeyboardEvent.code` a real keyboard
     /// event carries instead of an empty one.
-    fn keyTo(self: *Host, v: *View, req: proto.InputKey) void {
+    pub fn keyTo(self: *Host, v: *View, req: proto.InputKey) void {
         const mapped = keymap.map(req.keyval);
         var ev = std.mem.zeroes(cef.cef_key_event_t);
         ev.size = @sizeOf(cef.cef_key_event_t);
@@ -3653,23 +3677,45 @@ pub const Host = struct {
     pub fn typeKeys(self: *Host, v: *View, text: []const u8) void {
         var it = std.unicode.Utf8Iterator{ .bytes = text, .i = 0 };
         while (it.nextCodepointSlice()) |slice| {
-            const cp = std.unicode.utf8Decode(slice) catch continue;
-            const keysym: u32 = switch (cp) {
-                '\n', '\r' => 0xff0d,
-                '\t' => 0xff09,
-                else => keymap.keysymFromCodepoint(cp),
-            };
-            // A named key types its own character (Return's '\r').
-            const own: []const u8 = if (keysym >= 0xff00 and keysym <= 0xffff) "" else slice;
-            const shift = if (self.physKey(keysym)) |pk| pk.shift else false;
+            const ks = self.keystroke(slice) orelse continue;
             const shift_sym: u32 = 0xffe1;
-            if (shift) self.keyTo(v, .{ .view = v.id, .kind = @intFromEnum(proto.KeyKind.down), .keyval = shift_sym, .keycode = 0, .mods = proto.mod_shift, .text = "" });
-            const mods: u32 = if (shift) proto.mod_shift else 0;
-            self.keyTo(v, .{ .view = v.id, .kind = @intFromEnum(proto.KeyKind.down), .keyval = keysym, .keycode = 0, .mods = mods, .text = own });
-            self.keyTo(v, .{ .view = v.id, .kind = @intFromEnum(proto.KeyKind.up), .keyval = keysym, .keycode = 0, .mods = mods, .text = "" });
-            if (shift) self.keyTo(v, .{ .view = v.id, .kind = @intFromEnum(proto.KeyKind.up), .keyval = shift_sym, .keycode = 0, .mods = 0, .text = "" });
+            if (ks.shift) self.keyTo(v, .{ .view = v.id, .kind = @intFromEnum(proto.KeyKind.down), .keyval = shift_sym, .keycode = 0, .mods = proto.mod_shift, .text = "" });
+            const mods: u32 = if (ks.shift) proto.mod_shift else 0;
+            self.keyTo(v, .{ .view = v.id, .kind = @intFromEnum(proto.KeyKind.down), .keyval = ks.keysym, .keycode = 0, .mods = mods, .text = ks.text[0..ks.text_len] });
+            self.keyTo(v, .{ .view = v.id, .kind = @intFromEnum(proto.KeyKind.up), .keyval = ks.keysym, .keycode = 0, .mods = mods, .text = "" });
+            if (ks.shift) self.keyTo(v, .{ .view = v.id, .kind = @intFromEnum(proto.KeyKind.up), .keyval = shift_sym, .keycode = 0, .mods = 0, .text = "" });
         }
     }
+
+    /// The key that types one UTF-8 character `slice`: its keysym, the
+    /// text its down edge carries (none for a named key such as Return,
+    /// which types its own character) and whether Shift is held for it.
+    /// The one derivation `typeKeys` and replayed typing share.
+    pub fn keystroke(self: *Host, slice: []const u8) ?Keystroke {
+        const cp = std.unicode.utf8Decode(slice) catch return null;
+        const keysym: u32 = switch (cp) {
+            '\n', '\r' => 0xff0d,
+            '\t' => 0xff09,
+            else => keymap.keysymFromCodepoint(cp),
+        };
+        var ks: Keystroke = .{ .keysym = keysym, .shift = if (self.physKey(keysym)) |pk| pk.shift else false };
+        if (!(keysym >= 0xff00 and keysym <= 0xffff) and slice.len <= ks.text.len) {
+            @memcpy(ks.text[0..slice.len], slice);
+            ks.text_len = @intCast(slice.len);
+        }
+        return ks;
+    }
+
+    pub const motionPackChunk = host_motion.motionPackChunk;
+    pub const motionPackFor = host_motion.motionPackFor;
+    pub const motionDropConn = host_motion.motionDropConn;
+    pub const motionDeinit = host_motion.motionDeinit;
+    pub const motionStartPointer = host_motion.motionStartPointer;
+    pub const motionStartTyping = host_motion.motionStartTyping;
+    pub const motionScroll = host_motion.motionScroll;
+    pub const motionPump = host_motion.motionPump;
+    pub const motionWaitMs = host_motion.motionWaitMs;
+    pub const motionCancel = host_motion.motionCancel;
 
     /// One CHAR event for `cp`; codepoints outside the BMP need a
     /// surrogate pair because CEF's character field is UTF-16.
@@ -3900,6 +3946,7 @@ pub const Host = struct {
     pub const onOptionRect = host_sem.onOptionRect;
     pub const rewriteNodeRefs = host_sem.rewriteNodeRefs;
     pub const onSetValue = host_sem.onSetValue;
+    pub const semCommitTyped = host_sem.semCommitTyped;
     // -- outbound ------------------------------------------------------
 
     /// Resolve where an event about `view_id` goes and which id-window
