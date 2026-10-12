@@ -1,5 +1,25 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-12: the headful audit, a smoke-mcp gate against headful Chromium
+
+What fingerprint-scan.com, pixelscan, sannysoft, CreepJS, BotD and
+devtools-detector read is now our own page (`src/smoke/headful_audit.*`,
+118 checks: automation markers, native-code lies over ~1770 functions,
+worker/iframe/header consistency, geometry, media queries, focus and rAF,
+devtools tricks, permissions, graphics/media, navigator surface, UA-CH,
+and per click isTrusted/sequence/hold/pointer props). Stock Chromium 152
+headful on a sketerm display is the committed reference (three captures,
+identical values); every check id is classified once in
+`headful_audit.zig` (`must_match` / `host` / `accepted`, unknown ids fail
+closed). smoke-mcp runs it last, default config and `web_webgl =
+hardware`, direct and replayed click (`SKETERM_SMOKE_MCP_HEADFUL_ONLY=1`
+alone). Current `must_match` failures, both configs, product unchanged:
+screen == viewport, outer == inner (geometry package next), empty
+`navigator.keyboard` layout map, no `EyeDropper`, and the dedicated
+Worker's script request sends User-Agent before the sec-fetch headers
+(Chromium sends it after Referer; cause not established). So smoke-mcp is
+red until those land. Details in src/web/CLAUDE.md.
+
 ## 2026-10-12: pixelscan "isDevtoolOpen" is machine load, not the helper
 
 pixelscan flagged the MCP headless browser under CDP / `isDevtoolOpen`,
