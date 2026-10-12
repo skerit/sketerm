@@ -9170,6 +9170,22 @@ fn motionSum(cl: *Client, arena: std.mem.Allocator) MotionSum {
     };
 }
 
+/// The page summary once input stopped arriving. An act answers when the
+/// helper SENT its last event, and under load the page dispatches it a
+/// moment later, so a summary read at once can miss the release (seen:
+/// "the replayed press had no real duration" at load ~15).
+fn settledSum(cl: *Client, arena: std.mem.Allocator) MotionSum {
+    var s = motionSum(cl, arena);
+    const until = nowMs() + 3000;
+    while (nowMs() < until) {
+        _ = cl.drive(80, 0);
+        const n = motionSum(cl, arena);
+        if (n.moves == s.moves and n.down == s.down and n.press == s.press and n.keys == s.keys and n.wheels == s.wheels and n.scroll == s.scroll) return n;
+        s = n;
+    }
+    return s;
+}
+
 fn motionAct(cl: *Client, id: u32, action: proto.SemAct, arg: []const u8, motion: proto.Motion, timeout_ms: i64) void {
     const seq = cl.act_seq;
     cl.send(proto.SemAction{ .view = view_id, .id = id, .action = @intFromEnum(action), .arg = arg, .motion = @intFromEnum(motion) });
@@ -9216,7 +9232,7 @@ fn runMotionStage(cl: *Client, gpa: std.mem.Allocator) void {
     motionAct(cl, t_id, .click, "", .direct, 20_000);
     if (cl.act_ok != 1 or cl.act_motion != 0) fail("stage 3d motion: the direct click changed (failed, or reported motion)");
     {
-        const s = motionSum(cl, arena);
+        const s = settledSum(cl, arena);
         if (!s.down or s.moves > 2 or s.press > 5) {
             std.debug.print("smoke-web: direct click: moves={d} press={d}\n", .{ s.moves, s.press });
             fail("stage 3d motion: the direct click is no longer one move and an instant press");
@@ -9251,7 +9267,7 @@ fn runMotionStage(cl: *Client, gpa: std.mem.Allocator) void {
             std.debug.print("smoke-web: replayed click {d}: ok={d} motion={d} ms={d} \"{s}\"\n", .{ i, cl.act_ok, cl.act_motion, cl.act_duration, cl.act_msg[0..cl.act_msg_len] });
             fail("stage 3d motion: a replayed click did not report motion=replayed with a duration");
         }
-        const s = motionSum(cl, arena);
+        const s = settledSum(cl, arena);
         std.debug.print("smoke-web: replay {d}: {d} moves, increasing={}, press {d} ms, inside={}, {d} ms total\n", .{ i, s.moves, s.inc, s.press, s.inside, cl.act_duration });
         if (s.moves < 6) fail("stage 3d motion: a replayed reach reached the page as fewer than 6 moves");
         if (!s.inc) fail("stage 3d motion: replayed move timestamps are not strictly increasing");
@@ -9265,7 +9281,7 @@ fn runMotionStage(cl: *Client, gpa: std.mem.Allocator) void {
     _ = cl.evalWait("window.__clear()", false, 10_000);
     motionAct(cl, u_id, .hover, "", .replay, 20_000);
     {
-        const s = motionSum(cl, arena);
+        const s = settledSum(cl, arena);
         if (cl.act_ok != 1 or cl.act_motion != @intFromEnum(proto.MotionResult.replayed) or s.moves < 6 or s.down)
             fail("stage 3d motion: a replayed hover was not a reach without a press");
     }
@@ -9279,7 +9295,7 @@ fn runMotionStage(cl: *Client, gpa: std.mem.Allocator) void {
             std.debug.print("smoke-web: replayed set_value said ok={d} motion={d} \"{s}\"\n", .{ cl.act_ok, cl.act_motion, msg });
             fail("stage 3d motion: replayed typing did not land the text with motion=replayed");
         }
-        const s = motionSum(cl, arena);
+        const s = settledSum(cl, arena);
         if (s.keys < 11 or s.gaps.len < 2) fail("stage 3d motion: replayed typing sent too few key downs");
         var all_same = true;
         for (s.gaps) |g| {
@@ -9296,8 +9312,7 @@ fn runMotionStage(cl: *Client, gpa: std.mem.Allocator) void {
         cl.send(proto.MotionScroll{ .view = view_id, .req = 9, .x = 400, .y = 300, .dx = 0, .dy = 600 });
         if (!cl.waitSeq(&cl.motion_done_seq, seq, 20_000)) fail("stage 3d motion: no ev_motion_done for the scroll");
         if (cl.motion_done_ok != 1 or cl.motion_done_ms == 0) fail("stage 3d motion: the replayed scroll failed");
-        _ = cl.drive(600, 0);
-        const s = motionSum(cl, arena);
+        const s = settledSum(cl, arena);
         if (s.wheels < 3 or s.scroll < 200) {
             std.debug.print("smoke-web: replayed scroll: {d} wheel events, scrollY {d}\n", .{ s.wheels, s.scroll });
             fail("stage 3d motion: the replayed scroll was not several wheel events that moved the page");
