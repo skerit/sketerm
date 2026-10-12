@@ -517,6 +517,7 @@ pub fn actionLabel(a: Action) []const u8 {
         .web_extensions => "Browser extensions (install, enable, remove)",
         .web_userscripts => "Userscripts (add, enable, remove)",
         .web_filter_lists => "Ad-block filter lists (subscribe, unsubscribe)",
+        .motion_trainer => "Record a motion pack (your pointer reaches, typing rhythm, scrolling)",
         .close_pane => "Close the focused pane (un-split)",
         .toggle_browser_face => "Show the file browser / show the shell (this pane)",
         .new_editor_tab => "New text editor tab",

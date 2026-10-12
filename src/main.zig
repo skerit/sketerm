@@ -533,6 +533,20 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         return @import("doctor.zig").run(allocator, doc_args);
     }
 
+    // `sketerm motion ...`: motion packs. `record` opens the GTK
+    // trainer as its own short-lived app; the rest is file management.
+    if (argv.len >= 2 and std.mem.eql(u8, std.mem.span(argv[1]), "motion")) {
+        const m_args = allocator.alloc([]const u8, argv.len - 2) catch return 1;
+        defer allocator.free(m_args);
+        for (argv[2..], 0..) |a, n| m_args[n] = std.mem.span(a);
+        const mcli = @import("motion/cli.zig");
+        const req = mcli.parse(m_args);
+        return switch (req) {
+            .record => |r| @import("ui/motiontrainer.zig").runStandalone(allocator, .{ .name = r.name, .out = r.out }),
+            else => mcli.run(allocator, req),
+        };
+    }
+
     // `sketerm ssh [-u] <host>` — open a durable remote
     // shell on <host> as a tab in the running window. Sugar for
     // `sketerm mux [udp:|ssh:]<host> new`. Bare hosts automatically

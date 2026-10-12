@@ -222,6 +222,9 @@ pub const Action = enum {
     /// Open the filter-list subscription manager (src/ui/webfilters.zig):
     /// the `filter_list` urls the browser helper keeps current.
     web_filter_lists,
+    /// Open the motion trainer (src/ui/motiontrainer.zig): record a
+    /// motion pack of your own pointer, typing and scrolling.
+    motion_trainer,
     /// Close the focused pane, giving its space back to its sibling.
     /// The last pane in a tab closes the tab.
     close_pane,

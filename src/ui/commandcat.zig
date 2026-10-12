@@ -226,6 +226,8 @@ pub const curated = [_]Row{
        .desc = "Add, enable or remove userscripts; granted GM_* functions work on every page they match.", .action = .web_userscripts },
     .{ .icon = "security-high-symbolic", .title = "Filter Lists (Web)…",
        .desc = "Subscribe to ad-block filter lists (EasyList and others) by url, or drop one; the browser keeps them updated.", .action = .web_filter_lists },
+    .{ .icon = "input-mouse-symbolic", .title = "Record Motion Pack…",
+       .desc = "Record your own pointer reaches, typing rhythm and scrolling as a motion pack the headless browser can replay.", .action = .motion_trainer },
     .{ .icon = "window-close-symbolic", .title = "Close Pane",
        .desc = "Close the focused pane and give its space back (un-split).", .action = .close_pane },
     .{ .icon = "sketerm-terminal-symbolic", .title = "Show File Browser / Show Shell",

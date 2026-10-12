@@ -1223,6 +1223,7 @@ fn paneRoute(action: input.Action) PaneRoute {
         .web_extensions,
         .web_userscripts,
         .web_filter_lists,
+        .motion_trainer,
         .panel_open,
         .panel_open_window,
         .panel_close,

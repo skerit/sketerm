@@ -287,6 +287,8 @@ comptime {
     _ = @import("motion/replay.zig");
     _ = @import("motion/synth.zig");
     _ = @import("motion/store.zig");
+    _ = @import("motion/recorder.zig");
+    _ = @import("motion/cli.zig");
     _ = @import("web/userscript.zig");
     _ = @import("web/urlhost.zig");
     _ = @import("web/model.zig");

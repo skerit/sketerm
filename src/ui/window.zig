@@ -3586,6 +3586,7 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         .web_extensions => @import("webext.zig").openManager(self.allocator, @ptrCast(@alignCast(self.app_window))),
         .web_userscripts => @import("webuserscripts.zig").openManager(self),
         .web_filter_lists => @import("webfilters.zig").openManager(self),
+        .motion_trainer => @import("motiontrainer.zig").open(self.allocator, c.gtk_window_get_application(@ptrCast(self.app_window)), @ptrCast(self.app_window), .{}),
         .close_pane => self.closeFocusedPane(),
         // Only reached when the focused pane has NO browser face (the
         // pane-local dispatch consumes it otherwise): say so, rather
