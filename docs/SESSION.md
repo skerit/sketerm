@@ -32,6 +32,14 @@ than spoofed:
 - Focus: an authenticated stream focuses its view, FOCUS 0 blurs it, and
   a press/key/text on a blurred view refocuses it, as clicking into a
   window does.
+- Pointer: plain headless reported `(pointer: none)`/`(hover: none)` on a
+  host without input devices although a mouse drives the page; CPU-frame
+  helpers now pass Blink's pointer/hover settings for a fine pointer that
+  hovers. `capabilities.web_display` (`session`/`headless`/
+  `headless_fallback`) says whether the helper runs on the virtual display
+  or fell back, with a text-lane warning for the fallback.
+- `max_fps` throttles `requestAnimationFrame` (CEF's windowless frame rate
+  drives BeginFrame); documented as page-visible, default kept at 60.
 - Popups: `web_stream {"popups":true}` (capability `stream-popups`) gives
   every popup of the view its own raw stream, announced on the opener's
   stream as a new helper-to-peer `POPUP` frame (tag 8, sent only to a
