@@ -107,6 +107,8 @@ pub const Session = struct {
     arena: std.heap.ArenaAllocator,
     device: pack_mod.Device = .unknown,
     scale: f64 = 1,
+    /// Set to `arrival` by a recorder whose display sent no timestamps.
+    clock: pack_mod.Clock = .device,
     recorder: []const u8 = "",
     created: []const u8 = "",
     coverage: Coverage = .{},
@@ -310,7 +312,7 @@ pub const Session = struct {
             dst.* = src.items;
         };
         const p: pack_mod.Pack = .{
-            .header = .{ .device = self.device, .rate_hz = rate, .scale = self.scale, .recorder = self.recorder, .created = self.created },
+            .header = .{ .device = self.device, .rate_hz = rate, .scale = self.scale, .clock = self.clock, .recorder = self.recorder, .created = self.created },
             .reaches = self.reaches.items,
             .keys = keys,
             .scroll = self.bursts.items,

@@ -6327,8 +6327,12 @@ fn motionTrainerStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_pat
         _ = c.fprintf(platform.stderr(), "smoke-e2e: trainer pack refused: %.*s\n", @as(c_int, @intCast(diag.len)), &diag.buf);
         return "the trainer's pack does not validate";
     };
-    _ = c.fprintf(platform.stderr(), "smoke-e2e: trainer pack: device %s, %.0f Hz, %d reaches\n", @tagName(pk.header.device).ptr, pk.header.rate_hz, @as(c_int, @intCast(pk.reaches.len)));
+    _ = c.fprintf(platform.stderr(), "smoke-e2e: trainer pack: device %s, %.0f Hz, %d reaches, %s clock\n", @tagName(pk.header.device).ptr, pk.header.rate_hz, @as(c_int, @intCast(pk.reaches.len)), @tagName(pk.header.clock).ptr);
     if (pk.reaches.len < 5) return "the trainer's pack holds fewer than five of the six clicked reaches";
+    // sketerm's own display must stamp every input event: with time 0 the
+    // trainer falls back to arrival time, and every forwarded app reads
+    // any second click as a double-click.
+    if (pk.header.clock != .device) return "the display delivered input events without timestamps (the pack fell back to arrival time)";
     return null;
 }
 

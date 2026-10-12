@@ -33,6 +33,19 @@ pub const Device = enum {
     }
 };
 
+/// Which clock a pack's sample times come from. `arrival` means the
+/// display sent events without timestamps and the recorder stamped them
+/// on arrival, which blurs the device's real timing; a pack written
+/// before this field existed is read as `device`.
+pub const Clock = enum {
+    device,
+    arrival,
+
+    pub fn parse(s: []const u8) ?Clock {
+        return std.meta.stringToEnum(Clock, s);
+    }
+};
+
 /// Where a key sits on a US keyboard, which is all the typing timing is
 /// keyed by: the recorder never stores which letter was typed.
 pub const KeyClass = enum {
@@ -148,6 +161,7 @@ pub const Header = struct {
     device: Device = .unknown,
     rate_hz: f64 = 0,
     scale: f64 = 1,
+    clock: Clock = .device,
     recorder: []const u8 = "",
     created: []const u8 = "",
 };
@@ -244,6 +258,9 @@ fn parseHeader(v: std.json.Value, diag: *Diag) ParseError!Header {
     if (h.rate_hz <= 1 or h.rate_hz > 8000) return diag.set("header rate_hz {d} is outside 1..8000", .{h.rate_hz});
     if (v.object.get("scale")) |s| h.scale = num(s) orelse return diag.set("header \"scale\" is not a number", .{});
     if (h.scale <= 0 or h.scale > 8) return diag.set("header scale {d} is outside 0..8", .{h.scale});
+    if (v.object.get("clock")) |s| {
+        h.clock = if (s == .string) (Clock.parse(s.string) orelse return diag.set("unknown clock \"{s}\"", .{s.string})) else return diag.set("header \"clock\" is not a string", .{});
+    }
     if (v.object.get("recorder")) |s| if (s == .string) {
         h.recorder = s.string;
     };
@@ -375,7 +392,7 @@ fn parseIdle(arena: std.mem.Allocator, v: std.json.Value, diag: *Diag) ParseErro
 /// Serialize `pack` as the version-1 file format, header counts included.
 pub fn write(pack: Pack, w: *std.Io.Writer) std.Io.Writer.Error!void {
     const s = pack.summary();
-    try w.print("{{\"format\":\"{s}\",\"version\":{d},\"header\":{{\"device\":\"{s}\",\"rate_hz\":{d:.1},\"scale\":{d:.3},\"recorder\":", .{ FORMAT, VERSION, @tagName(pack.header.device), pack.header.rate_hz, pack.header.scale });
+    try w.print("{{\"format\":\"{s}\",\"version\":{d},\"header\":{{\"device\":\"{s}\",\"rate_hz\":{d:.1},\"scale\":{d:.3},\"clock\":\"{s}\",\"recorder\":", .{ FORMAT, VERSION, @tagName(pack.header.device), pack.header.rate_hz, pack.header.scale, @tagName(pack.header.clock) });
     try std.json.Stringify.value(pack.header.recorder, .{}, w);
     try w.writeAll(",\"created\":");
     try std.json.Stringify.value(pack.header.created, .{}, w);
@@ -466,13 +483,18 @@ test "a minimal pack parses and round-trips through write" {
     const p = try parse(arena.allocator(), minimal_reach, &diag);
     try testing.expectEqual(@as(usize, 1), p.reaches.len);
     try testing.expectEqual(Device.mouse, p.header.device);
+    // A pack from before the clock field reads as device time.
+    try testing.expectEqual(Clock.device, p.header.clock);
     try testing.expectApproxEqAbs(@as(f64, 100), p.reaches[0].distance(), 1e-9);
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
-    try write(p, &out.writer);
+    var arrival = p;
+    arrival.header.clock = .arrival;
+    try write(arrival, &out.writer);
     const again = try parse(arena.allocator(), out.written(), &diag);
     try testing.expectEqual(@as(usize, 3), again.reaches[0].samples.len);
     try testing.expectApproxEqAbs(@as(f64, 110), again.reaches[0].up, 1e-6);
+    try testing.expectEqual(Clock.arrival, again.header.clock);
 }
 
 test "bad versions, truncated samples and broken timing are refused with a reason" {
@@ -488,6 +510,7 @@ test "bad versions, truncated samples and broken timing are refused with a reaso
         .{ .json = "{\"format\":\"sketerm-motion\",\"version\":1,\"header\":{\"device\":\"mouse\",\"rate_hz\":125},\"reaches\":[{\"start\":[0,0],\"target\":[0,0,5,5],\"samples\":[[0,0,0],[8,40,0]],\"down\":10,\"up\":10,\"land\":[0.5,0.5]}]}", .want = "release is not after the press" },
         .{ .json = "{\"format\":\"sketerm-motion\",\"version\":1,\"header\":{\"device\":\"trackball\",\"rate_hz\":125}}", .want = "unknown device class" },
         .{ .json = "{\"format\":\"sketerm-motion\",\"version\":1,\"header\":{\"device\":\"mouse\",\"rate_hz\":125}}", .want = "holds no reaches" },
+        .{ .json = "{\"format\":\"sketerm-motion\",\"version\":1,\"header\":{\"device\":\"mouse\",\"rate_hz\":125,\"clock\":\"sundial\"}}", .want = "unknown clock" },
         .{ .json = "{\"format\":\"sketerm-motion\",\"version\":1,\"header\":{\"device\":\"mouse\",\"rate_hz\":125},\"keys\":{\"hold\":{\"thumb\":[80]}}}", .want = "unknown key class" },
     };
     for (cases) |cs| {

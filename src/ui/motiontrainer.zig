@@ -68,19 +68,44 @@ const Trainer = struct {
     missed: bool = false,
     misses: usize = 0,
     device_switch: bool = false,
-    /// The compositor sent events with time 0 (no timestamp): arrival
-    /// time on the monotonic clock stands in, and the header says so.
-    arrival_clock: bool = false,
+    /// Some event carried a device timestamp.
+    timed_seen: bool = false,
+    /// Untimed events seen before any timed one.
+    untimed: u8 = 0,
 };
 
-/// An event's device time in ms. A compositor that stamps nothing sends
-/// 0; from the first such event on, EVERY event uses the arrival time,
-/// because one session's samples must share one clock (a compositor can
-/// stamp buttons and leave motion at 0, and mixing the two broke every
-/// reach).
-fn eventMs(self: *Trainer, device_ms: u32) f64 {
-    if (device_ms == 0) self.arrival_clock = true;
-    if (!self.arrival_clock) return @floatFromInt(device_ms);
+/// Untimed events before the first timed one after which the display is
+/// taken to stamp nothing at all.
+const UNTIMED_LIMIT: u8 = 8;
+
+/// An event's time in ms on the session's ONE clock, or null for an
+/// event that carries no device sample. GTK synthesizes motion with
+/// time 0 on every compositor (a hover refresh after a redraw, the
+/// crossing that follows an enter), so a 0 while the display stamps its
+/// real events is skipped, never a reason to change clocks. Only a
+/// display that stamps NOTHING (`UNTIMED_LIMIT` untimed events before any
+/// timed one) moves the session to arrival time, for good: one session's
+/// samples must never mix two clocks.
+fn eventMs(self: *Trainer, device_ms: u32) ?f64 {
+    if (self.session.clock == .arrival) return arrivalMs();
+    if (device_ms != 0) {
+        self.timed_seen = true;
+        return @floatFromInt(device_ms);
+    }
+    if (self.timed_seen) return null;
+    self.untimed += 1;
+    if (self.untimed < UNTIMED_LIMIT) return null;
+    self.session.clock = .arrival;
+    return arrivalMs();
+}
+
+/// `eventMs` for a press, release, key or scroll, which the session must
+/// see even when untimed: it then takes the last sample's time.
+fn discreteMs(self: *Trainer, device_ms: u32) f64 {
+    return eventMs(self, device_ms) orelse self.last_t;
+}
+
+fn arrivalMs() f64 {
     return @as(f64, @floatFromInt(c.g_get_monotonic_time())) / 1000.0;
 }
 
@@ -265,7 +290,7 @@ fn feedMotion(self: *Trainer, ctl: ?*c.GtkEventController, x: f64, y: f64) void 
     const has_pos = c.gdk_event_get_position(ev, &sx, &sy) != 0;
     var n: c.guint = 0;
     const hist = c.gdk_event_get_history(ev, &n);
-    const device_clock = c.gdk_event_get_time(ev) != 0 and !self.arrival_clock;
+    const device_clock = c.gdk_event_get_time(ev) != 0 and self.session.clock == .device;
     if (hist != null and has_pos and device_clock) {
         defer c.g_free(hist);
         var i: usize = 0;
@@ -277,11 +302,11 @@ fn feedMotion(self: *Trainer, ctl: ?*c.GtkEventController, x: f64, y: f64) void 
         }
     }
     if (hist != null and !(has_pos and device_clock)) c.g_free(hist);
-    const t = eventMs(self, c.gdk_event_get_time(ev));
-    self.session.motion(t, x, y) catch {};
-    self.last_t = t;
     self.ptr = .{ x, y };
     self.have_ptr = true;
+    const t = eventMs(self, c.gdk_event_get_time(ev)) orelse return;
+    self.session.motion(t, x, y) catch {};
+    self.last_t = t;
 }
 
 fn noteDevice(self: *Trainer, ev: *c.GdkEvent) void {
@@ -325,7 +350,7 @@ fn spawnTarget(self: *Trainer) void {
 fn onPressed(gesture: ?*c.GtkGestureClick, n: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
     _ = n;
     const self = cast.userData(Trainer, user);
-    const t = eventMs(self, c.gtk_event_controller_get_current_event_time(@ptrCast(gesture)));
+    const t = discreteMs(self, c.gtk_event_controller_get_current_event_time(@ptrCast(gesture)));
     if (self.target == null) return;
     self.missed = !self.session.press(t, x, y);
     if (self.missed) self.misses += 1;
@@ -334,7 +359,7 @@ fn onPressed(gesture: ?*c.GtkGestureClick, n: c_int, x: f64, y: f64, user: ?*any
 fn onReleased(gesture: ?*c.GtkGestureClick, n: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
     _ = n;
     const self = cast.userData(Trainer, user);
-    const t = eventMs(self, c.gtk_event_controller_get_current_event_time(@ptrCast(gesture)));
+    const t = discreteMs(self, c.gtk_event_controller_get_current_event_time(@ptrCast(gesture)));
     self.ptr = .{ x, y };
     self.last_t = t;
     const tg = self.target orelse return;
@@ -396,7 +421,7 @@ fn isModifier(keyval: c.guint) bool {
 fn onKeyPressed(ctl: ?*c.GtkEventControllerKey, keyval: c.guint, keycode: c.guint, _: c.GdkModifierType, user: ?*anyopaque) callconv(.c) c.gboolean {
     const self = cast.userData(Trainer, user);
     if (isModifier(keyval) or keyval == 0xff0d) return 0;
-    const t = eventMs(self, c.gtk_event_controller_get_current_event_time(@ptrCast(ctl)));
+    const t = discreteMs(self, c.gtk_event_controller_get_current_event_time(@ptrCast(ctl)));
     const cp = c.gdk_keyval_to_unicode(keyval);
     const cls: pack_mod.KeyClass = if (cp == 0 or cp > 0x10ffff) .other else pack_mod.KeyClass.of(@intCast(cp));
     self.session.keyDown(t, keycode, cls) catch {};
@@ -406,7 +431,7 @@ fn onKeyPressed(ctl: ?*c.GtkEventControllerKey, keyval: c.guint, keycode: c.guin
 fn onKeyReleased(ctl: ?*c.GtkEventControllerKey, keyval: c.guint, keycode: c.guint, _: c.GdkModifierType, user: ?*anyopaque) callconv(.c) void {
     const self = cast.userData(Trainer, user);
     if (isModifier(keyval)) return;
-    const t = eventMs(self, c.gtk_event_controller_get_current_event_time(@ptrCast(ctl)));
+    const t = discreteMs(self, c.gtk_event_controller_get_current_event_time(@ptrCast(ctl)));
     self.session.keyUp(t, keycode) catch {};
     refresh(self);
 }
@@ -421,7 +446,7 @@ fn onPromptDone(entry: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
 
 fn onScroll(ctl: ?*c.GtkEventControllerScroll, dx: f64, dy: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
     const self = cast.userData(Trainer, user);
-    const t = eventMs(self, c.gtk_event_controller_get_current_event_time(@ptrCast(ctl)));
+    const t = discreteMs(self, c.gtk_event_controller_get_current_event_time(@ptrCast(ctl)));
     if (c.gtk_event_controller_get_current_event(@ptrCast(ctl))) |ev| noteDevice(self, ev);
     const smooth = c.gtk_event_controller_scroll_get_unit(ctl) != c.GDK_SCROLL_UNIT_WHEEL;
     self.session.wheel(t, dx, dy, smooth) catch {};
@@ -463,7 +488,7 @@ fn refresh(self: *Trainer) void {
     var buf: [400]u8 = undefined;
     const rate = s.rateHz();
     const head = std.fmt.bufPrintZ(&buf, "Device: {s}   measured rate: {d:.0} Hz{s}   display scale: {d:.0}   reaches {d} (misses {d})   key timings {d}   scroll bursts {d}   idle segments {d}", .{
-        @tagName(s.device), rate, if (self.arrival_clock) " (no device timestamps: arrival time)" else "", s.scale, s.reaches.items.len, self.misses, s.keyCount(), s.bursts.items.len + @intFromBool(s.burst.items.len > 0), s.idle.items.len,
+        @tagName(s.device), rate, if (s.clock == .arrival) " (no device timestamps: arrival time)" else "", s.scale, s.reaches.items.len, self.misses, s.keyCount(), s.bursts.items.len + @intFromBool(s.burst.items.len > 0), s.idle.items.len,
     }) catch return;
     c.gtk_label_set_text(@ptrCast(self.header), head.ptr);
     const want: f64 = @floatFromInt(recorder.CELLS * recorder.PER_CELL);
