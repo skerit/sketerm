@@ -424,7 +424,22 @@ pub const CAP_STREAM_AUDIO = "stream-audio";
 /// negotiated video codec. A helper without it streams raw whatever was
 /// asked, and its reply carries no encoding (raw).
 pub const CAP_STREAM_ENCODED = "stream-encoded";
+/// The helper selected SwiftShader WebGL with CPU compositing
+/// (`ozone.gpu_less_webgl == .software` on a GPU-less host).
 pub const CAP_SOFTWARE_WEBGL = "software-webgl";
+/// A CPU-frame helper (`SKETERM_WEB_FRAMES=cpu`) left its GPU process on
+/// the host's render node, so WebGL renders on the real GPU while paints
+/// stay CPU-readable. None of the three WebGL capabilities: the helper
+/// predates them, or is not a CPU-frame helper (the GUI's).
+pub const CAP_WEBGL_GPU = "webgl-gpu";
+/// A CPU-frame helper gives pages no WebGL or WebGL2 context (policy
+/// `off`, or `hardware` on a host with no usable GPU).
+pub const CAP_WEBGL_OFF = "webgl-off";
+/// `stream_open` honours its optional trailing `popups`: a page popup
+/// opened from a streamed view gets its own raw stream, announced on the
+/// opener's stream (`stream.Tag.popup`) and by an `ev_stream_open` with
+/// `req` 0. Without it a popup is a new view no stream peer hears of.
+pub const CAP_STREAM_POPUPS = "stream-popups";
 pub const CAP_VIEW_MAX_FPS = "view-max-fps";
 /// `view_create_url` honours its optional trailing `flags` byte
 /// (`ViewCreateUrl.FLAG_*`): a BACKGROUND view is never presented,
@@ -504,6 +519,9 @@ pub const Cap = enum {
     stream_audio,
     stream_encoded,
     software_webgl,
+    webgl_gpu,
+    webgl_off,
+    stream_popups,
     view_max_fps,
     view_flags,
     navigation_guard,
@@ -4727,7 +4745,11 @@ pub const StreamEncoding = enum(u8) {
 /// decodes in its preference order, empty = lossless only. They are
 /// written only for a non-raw request, so a raw open is byte-identical to
 /// the V1 frame; a helper without the capability ignores them and
-/// streams raw. Answered by exactly one `ev_stream_open`.
+/// streams raw. Optional trailing `popups` (capability `stream-popups`,
+/// written only when set, after `encoding`/`codecs`): every popup the
+/// view opens gets a raw stream of its own, announced on THIS stream as a
+/// `POPUP` frame and to the client as an unsolicited `ev_stream_open`
+/// (`req` 0). Answered by exactly one `ev_stream_open`.
 pub const StreamOpen = struct {
     pub const tag: Tag = .stream_open;
     view: u32,
@@ -4735,14 +4757,17 @@ pub const StreamOpen = struct {
     audio: u8,
     encoding: StreamEncoding = .raw,
     codecs: []const u8 = "",
+    popups: u8 = 0,
 
     pub fn encodeTo(self: StreamOpen, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
         try putU32(gpa, out, self.view);
         try putU32(gpa, out, self.req);
         try putU8(gpa, out, self.audio);
-        if (self.encoding == .raw and self.codecs.len == 0) return;
+        if (self.encoding == .raw and self.codecs.len == 0 and self.popups == 0) return;
         try putU8(gpa, out, @intFromEnum(self.encoding));
         try putStr(gpa, out, self.codecs);
+        if (self.popups == 0) return;
+        try putU8(gpa, out, self.popups);
     }
 
     pub fn decodeFrom(payload: []const u8) !StreamOpen {
@@ -4751,6 +4776,8 @@ pub const StreamOpen = struct {
         if (cur.pos == payload.len) return out;
         out.encoding = @enumFromInt(try cur.readU8());
         out.codecs = if (cur.pos == payload.len) "" else try cur.readStr();
+        if (cur.pos == payload.len) return out;
+        out.popups = try cur.readU8();
         return out;
     }
 };
@@ -4836,6 +4863,8 @@ test "round-trip: stream frames" {
     // byte-identical to the V1 frame an older client sends.
     try roundTrip(StreamOpen, .{ .view = 3, .req = 81, .audio = 0, .encoding = .encoded, .codecs = &.{ 2, 1 } });
     try roundTrip(StreamOpen, .{ .view = 3, .req = 82, .audio = 1, .encoding = .encoded });
+    try roundTrip(StreamOpen, .{ .view = 3, .req = 83, .audio = 1, .popups = 1 });
+    try roundTrip(StreamOpen, .{ .view = 3, .req = 84, .audio = 0, .encoding = .encoded, .codecs = &.{2}, .popups = 1 });
     var raw_open: std.ArrayList(u8) = .empty;
     defer raw_open.deinit(std.testing.allocator);
     try encodePayload(std.testing.allocator, &raw_open, StreamOpen{ .view = 3, .req = 83, .audio = 1 });

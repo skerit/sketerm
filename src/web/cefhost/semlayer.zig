@@ -23,7 +23,6 @@ const sendClick = host_mod.sendClick;
 const sendMove = host_mod.sendMove;
 const setFocus = host_mod.setFocus;
 const stale_reader_msg = host_mod.stale_reader_msg;
-const typeText = host_mod.typeText;
 const viewPoint = host_mod.viewPoint;
 const withHostArgs = host_mod.withHostArgs;
 
@@ -1336,7 +1335,7 @@ pub fn onSetValue(self: *Host, v: *View, p: *Pending, json: []const u8) void {
         return;
     }
     withHostArgs(v, setFocus, .{@as(c_int, 1)});
-    typeText(v, p.arg);
+    self.typeKeys(v, p.arg);
     const eid = v.sem.eidFor(p.sid);
     const rid = self.pushPending(v, .{ .req = nextReq(v), .kind = .commit, .sid = p.sid, .guarded = p.guarded }) catch return;
     // The keystrokes are queued input and this script is an IPC to

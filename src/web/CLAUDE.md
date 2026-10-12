@@ -142,23 +142,42 @@ share one level. Measured 2026-10-10: moving headless onto zoom as well
 (8a26f5ef) broke exactly that, which `dist/test-web-untrusted.py`
 `test_10` caught. Use zoom only where screen-info does not work.
 
-Ordinary MCP launchers set `SKETERM_WEB_SOFTWARE_WEBGL=1`: the helper
-selects `--use-angle=swiftshader --enable-unsafe-swiftshader
---disable-gpu-compositing`, omits the forced-Wayland `--disable-gpu`, and
-keeps `shared_texture_enabled=0`. This restores WebGL without changing
-the CPU `on_paint` source used by screenshots, pulled frames, streams,
-observers and the presenter. Measured on distro CEF/Chromium 152:
-WebGL 1 and 2 work; the renderer is ANGLE Vulkan SwiftShader Device
-(Subzero), not the host GPU. A WebGL GPU-service process is not proof of
-accelerated OSR paints. `software-webgl` reports the selected launch
-policy, not a guarantee that a page can allocate a context.
+**WebGL is the helper's ONE decision (`ozone.choose`, `Choice.webgl`),
+and it never spoofs.** Launchers that read pixels (webdrive, the broker's
+named helpers, `--frames-inline`) say only `SKETERM_WEB_FRAMES=cpu`: paints
+stay on the CPU `on_paint` path (`shared_texture_enabled=0`). Where WebGL
+renders is `ozone.WebglPolicy` (`SKETERM_WEB_WEBGL`, MCP config
+`web_webgl`, the broker's `engine_open.webgl`; a misspelt value exits the
+helper rather than guessing) crossed with the host:
 
-GUI launchers do not set this knob. Untrusted mode ignores it and keeps
-its existing no-GPU/security policy; enabling unsafe SwiftShader there
-would require a separate security decision. `smoke-mcp`'s existing
-web-stream journey asserts exact known-colour WebGL pixels through PNG
-screenshots, pulled frames and binary streams at DPR 1 and 2, plus a
-subsequent WebGL repaint on the binary stream.
+- a DRM render node opens (`ozone.renderNodePresent`, the one probe the
+  helper and the smoke rigs share) and the policy is `auto` or
+  `hardware`: no GPU switch, the GPU process runs on the real device
+  (`webgl-gpu`). An inherited `LIBGL_ALWAYS_SOFTWARE=1` (every shell in a
+  sketerm pane exports it, `pty.zig`) is unset first, or Mesa would hand
+  pages an llvmpipe renderer. NOT MEASURED on a GPU host yet (the
+  2026-10-12 machine had no `/dev/dri`); smoke-mcp's stream stage asserts
+  it wherever a render node exists, and the 2026-08 claim that headless
+  ozone never spawns a GPU process predates the SwiftShader measurement,
+  which shows it does when told to.
+- no render node, `auto` (the default, Jelle's call 2026-10-12: WebGL
+  pages must keep working): `--use-angle=swiftshader
+  --enable-unsafe-swiftshader --disable-gpu-compositing`, `software-webgl`,
+  renderer "ANGLE (... SwiftShader Device (Subzero) ...)".
+- no render node, `hardware`: `--disable-gpu --disable-webgl
+  --disable-webgl2`, `webgl-off`. MEASURED 2026-10-12 on a host without
+  `/dev/dri`: headful Chromium 152 on a sketerm display logs
+  "WebGL1/WebGL2 blocklisted" and offers a page no context (headless
+  Chromium offers SwiftShader), so this is the real-Chrome behaviour.
+- `off`: `--disable-webgl --disable-webgl2` (plus `--disable-gpu` without
+  a render node), `webgl-off`. `SKETERM_WEB_GPU=0` vetoes the GPU.
+
+The GUI's own launch (no `FRAMES`) is unchanged and `Choice.webgl` stays
+null there; the untrusted helper ignores the decision entirely and keeps
+its no-GPU/security policy. The three capabilities are the SELECTED
+launch, not a guarantee that a page can allocate a context; a helper
+without any of them predates them. `screen.colorDepth` is 24
+(`onGetScreenInfo`), what Chromium reports on every Linux display.
 
 ## Pacing: the engine paces itself
 
@@ -1641,6 +1660,23 @@ half in `cefhost/stream.zig`.
   by `stream.modsToProto` at the engine seam; key names go through
   `webkeys.parseChord`. A client disconnect, a blur, a view teardown or
   any stream end releases every key and button the client still holds.
+- **A streamed view behaves like a window someone is using.** AUTH
+  focuses it (`Stream.focused`, set by the glue once the view is awake),
+  a FOCUS 0 blurs it, and a press, a key down or TEXT on a blurred view
+  refocuses it first (`focusForInput`). KEY frames are typing: a key with
+  no client keycode gets the US-keyboard XKB keycode of its keysym
+  (`keymap.physKey` over the embedded US keymap), so `KeyboardEvent.code`
+  is `KeyA`, never empty. TEXT stays the paste path (`typeText`, CHAR
+  events only); MCP `set_value` types through `Host.typeKeys`, a down/up
+  per character inside a Shift press where the level needs one.
+- **Popups follow a stream that asked** (`stream_open.popups`, capability
+  `stream-popups`). `claimPopupBrowser` calls `streamFollowPopup`: the
+  popup gets a raw stream under the opener stream's owner (inheriting its
+  audio choice and popup-following), the owner an unsolicited
+  `ev_stream_open` with `req` 0, and the opener's peer a `POPUP` frame
+  (`stream.encodePopup`) queued in `Stream.popup_out` until AUTH and room.
+  POPUP is a helper-to-peer tag only such a stream ever sees, because a
+  V1 peer ends the connection on an unknown tag.
 - **Audio is the engine's loopback capture, and it MUTES the page.**
   Read from the CEF source at the installed commit (708dc14,
   `alloy_browser_host_impl.cc` / `audio_capturer.cc` /

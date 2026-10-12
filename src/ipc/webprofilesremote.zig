@@ -207,7 +207,10 @@ pub const Remote = struct {
     /// linger lifecycle). `error.Unsupported` against a daemon without
     /// the `web_engine` capability — the caller then spawns the helper
     /// itself, i.e. the Phase 2 shape.
-    pub fn engineOpen(self: *Remote, arena: std.mem.Allocator) error{ Unsupported, Io }!EngineInfo {
+    /// `webgl` is the `ozone.WebglPolicy` the broker launches a NEW engine
+    /// with; an engine already running keeps its own (the fact reports
+    /// what it uses), and an older broker ignores the field.
+    pub fn engineOpen(self: *Remote, arena: std.mem.Allocator, webgl: []const u8) error{ Unsupported, Io }!EngineInfo {
         {
             const cn = self.ensureConn() catch |err| return switch (err) {
                 error.Unsupported => error.Unsupported,
@@ -227,6 +230,7 @@ pub const Remote = struct {
         const reply = self.opWithRetry(Reply, arena, .{
             .op = "engine_open",
             .instance = self.instance,
+            .webgl = webgl,
         }) catch return error.Io;
         if (!reply.ok or reply.sock.len == 0) return error.Io;
         return .{ .sock = reply.sock, .pid = reply.pid, .spawned = reply.spawned, .diagnostics = reply.diagnostics };

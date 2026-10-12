@@ -14,6 +14,7 @@
 //! correct CHAR event with a zero virtual-key code.
 
 const std = @import("std");
+const xkblayout = @import("../ipc/xkblayout.zig");
 
 /// Windows virtual-key codes used below (winuser.h names).
 pub const VK_BACK: i32 = 0x08;
@@ -228,6 +229,87 @@ pub fn codepoint(keysym: u32) ?u21 {
         0xffbd => '=',
         else => null,
     };
+}
+
+/// Keysyms for the keys no character keymap names: editing, navigation,
+/// function and modifier keys, by evdev code. Read both ways: the
+/// presenter turns a seat's keycode into a keysym, `physKey` a keysym
+/// into the key that produces it.
+pub fn specialKeysym(code: u32) ?u32 {
+    return switch (code) {
+        1 => 0xff1b, // Escape
+        14 => 0xff08, // BackSpace
+        15 => 0xff09, // Tab
+        28 => 0xff0d, // Return
+        29 => 0xffe3, // Control_L
+        42 => 0xffe1, // Shift_L
+        54 => 0xffe2, // Shift_R
+        56 => 0xffe9, // Alt_L
+        58 => 0xffe5, // Caps_Lock
+        59...68 => 0xffbe + (code - 59), // F1..F10
+        69 => 0xff7f, // Num_Lock
+        70 => 0xff14, // Scroll_Lock
+        87 => 0xffc8, // F11
+        88 => 0xffc9, // F12
+        96 => 0xff8d, // KP_Enter
+        97 => 0xffe4, // Control_R
+        100 => 0xffea, // Alt_R
+        102 => 0xff50, // Home
+        103 => 0xff52, // Up
+        104 => 0xff55, // Prior
+        105 => 0xff51, // Left
+        106 => 0xff53, // Right
+        107 => 0xff57, // End
+        108 => 0xff54, // Down
+        109 => 0xff56, // Next
+        110 => 0xff63, // Insert
+        111 => 0xffff, // Delete
+        119 => 0xff13, // Pause
+        125 => 0xffeb, // Super_L
+        126 => 0xffec, // Super_R
+        else => null,
+    };
+}
+
+/// Codepoint -> keysym, the encoding `codepoint` decodes (Latin-1 is its
+/// own keysym, the rest is the Unicode keysym).
+pub fn keysymFromCodepoint(cp: u21) u32 {
+    if (cp >= 0x20 and cp <= 0xff) return cp;
+    return 0x01000000 | @as(u32, cp);
+}
+
+/// evdev code -> XKB keycode: what a Linux key event carries as its
+/// native key code, and what Chromium derives `KeyboardEvent.code` from.
+pub const XKB_OFFSET: u32 = 8;
+
+/// A physical key: XKB keycode, and whether Shift is held to produce the
+/// keysym asked for.
+pub const PhysKey = struct { xkb: u32, shift: bool = false };
+
+/// The key a keyboard with `layout` presses for `keysym`; null when no
+/// key produces it without AltGr.
+pub fn physKey(layout: *const xkblayout.Layout, keysym: u32) ?PhysKey {
+    var code: u32 = 0;
+    while (code < 256) : (code += 1) {
+        if (specialKeysym(code) == keysym) return .{ .xkb = code + XKB_OFFSET };
+    }
+    if (keysym == XK_ISO_Left_Tab) return .{ .xkb = 15 + XKB_OFFSET, .shift = true };
+    const cp = codepoint(keysym) orelse return null;
+    const e = layout.lookup(cp) orelse return null;
+    if (e.altgr) return null;
+    return .{ .xkb = e.code + XKB_OFFSET, .shift = e.shift };
+}
+
+test "physKey finds the US key and its Shift level, named keys included" {
+    const t = std.testing;
+    var us = try xkblayout.parse(t.allocator, @import("../wlhost/keymaps.zig").us);
+    defer us.deinit(t.allocator);
+    try t.expectEqual(PhysKey{ .xkb = 30 + XKB_OFFSET }, physKey(&us, 'a').?);
+    try t.expectEqual(PhysKey{ .xkb = 30 + XKB_OFFSET, .shift = true }, physKey(&us, 'A').?);
+    try t.expectEqual(PhysKey{ .xkb = 2 + XKB_OFFSET, .shift = true }, physKey(&us, '!').?);
+    try t.expectEqual(PhysKey{ .xkb = 28 + XKB_OFFSET }, physKey(&us, XK_Return).?);
+    try t.expectEqual(@as(?PhysKey, null), physKey(&us, keysymFromCodepoint(0x1f600)));
+    try t.expectEqual(@as(?u32, 0xff0d), specialKeysym(28));
 }
 
 /// Translate protocol modifier bits into Chromium event flags.

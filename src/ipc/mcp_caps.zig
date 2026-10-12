@@ -363,7 +363,9 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
         try res.fact("web_stream", web_ok and stream.supported);
         try res.fact("web_stream_audio", stream.audio);
         try res.fact("web_stream_encoded", stream.encoded);
-        try res.fact("web_software_webgl", @import("mcp_web.zig").softwareWebglCapability());
+        try res.fact("web_stream_popups", stream.popups);
+        try res.fact("web_software_webgl", @import("mcp_web.zig").webglCapability(.software_webgl));
+        try res.fact("web_webgl", if (@import("mcp_web.zig").webglMode()) |m| @tagName(m) else null);
         const frame_rate = @import("mcp_web.zig").frameRateCapability();
         try res.fact("web_max_fps", frame_rate.supported);
         try res.fact("web_default_max_fps", frame_rate.default);

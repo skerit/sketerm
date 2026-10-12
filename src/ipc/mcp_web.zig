@@ -41,6 +41,7 @@ const protocol = @import("protocol.zig");
 const webdrive = @import("webdrive.zig");
 const navfault = @import("../web/navfault.zig");
 const web_proto = @import("../web/protocol.zig");
+const ozone = @import("../web/ozone.zig");
 const vcodec = @import("../wlhost/vcodec.zig");
 const netpolicy = @import("../web/netpolicy.zig");
 const capture = @import("../web/capture.zig");
@@ -133,6 +134,13 @@ var g_engines: std.ArrayList(*RouteEngine) = .empty;
 var g_current_engine: usize = 0;
 var g_headless_alloc: ?std.mem.Allocator = null;
 var g_default_max_fps: ?u16 = null;
+/// `web_webgl` from `[mcp]` or the selected profile: every helper this
+/// server launches is started with it.
+var g_webgl_policy: ozone.WebglPolicy = .auto;
+
+pub fn configureWebgl(policy: ozone.WebglPolicy) void {
+    g_webgl_policy = policy;
+}
 var g_headless_dir: ?[]const u8 = null;
 var g_headless_instance: ?[]const u8 = null;
 /// The instance directory is removed when the server exits (`mcp-tmp-<pid>`).
@@ -667,20 +675,34 @@ pub fn printCapability() struct { supported: bool, css_page: ?bool } {
 
 /// Stream support is a code fact before startup and negotiated thereafter; audio is unknown before the handshake.
 /// `encoded` likewise: whether the helper honours an encoded open.
-pub fn streamCapability() struct { supported: bool, audio: ?bool, encoded: ?bool } {
-    if (guiDrivesWeb() or g_headless_alloc == null) return .{ .supported = false, .audio = false, .encoded = false };
-    const e = currentEngine() orelse return .{ .supported = true, .audio = null, .encoded = null };
-    if (e.state != .ready) return .{ .supported = true, .audio = null, .encoded = null };
+pub fn streamCapability() struct { supported: bool, audio: ?bool, encoded: ?bool, popups: ?bool } {
+    if (guiDrivesWeb() or g_headless_alloc == null) return .{ .supported = false, .audio = false, .encoded = false, .popups = false };
+    const e = currentEngine() orelse return .{ .supported = true, .audio = null, .encoded = null, .popups = null };
+    if (e.state != .ready) return .{ .supported = true, .audio = null, .encoded = null, .popups = null };
     const stream = e.has(.web_stream);
-    return .{ .supported = stream, .audio = stream and e.has(.stream_audio), .encoded = stream and e.has(.stream_encoded) };
+    return .{ .supported = stream, .audio = stream and e.has(.stream_audio), .encoded = stream and e.has(.stream_encoded), .popups = stream and e.has(.stream_popups) };
 }
 
-/// Null until the current headless helper reports its software WebGL launch policy.
-pub fn softwareWebglCapability() ?bool {
+/// Null until the current headless helper reports its WebGL launch policy:
+/// `cap` is `.software_webgl` (SwiftShader).
+pub fn webglCapability(cap: web_proto.Cap) ?bool {
     if (guiDrivesWeb() or g_headless_alloc == null) return false;
     const e = currentEngine() orelse return null;
     if (e.state != .ready) return null;
-    return e.has(.software_webgl);
+    return e.has(cap);
+}
+
+/// Where the running headless helper's WebGL renders, as it advertised;
+/// null before its handshake, for the GUI, and for a helper that predates
+/// the three capabilities.
+pub fn webglMode() ?ozone.Webgl {
+    if (guiDrivesWeb() or g_headless_alloc == null) return null;
+    const e = currentEngine() orelse return null;
+    if (e.state != .ready) return null;
+    if (e.has(.webgl_gpu)) return .hardware;
+    if (e.has(.software_webgl)) return .software;
+    if (e.has(.webgl_off)) return .off;
+    return null;
 }
 
 /// The adapter supports frame-rate options before startup and requires the helper's capability afterwards.
@@ -790,6 +812,7 @@ fn headlessEngineForMode(spec: webroute.Spec, untrusted: bool) ?*webdrive.Engine
     };
     re.engine.untrusted = untrusted;
     re.engine.default_max_fps = g_default_max_fps;
+    re.engine.webgl_policy = g_webgl_policy;
     @memcpy(re.slug[0..slug.len], slug);
     re.slug_len = slug.len;
     g_engines.append(alloc, re) catch {
@@ -4948,7 +4971,7 @@ fn knownCodecs() []const u8 {
 
 /// `asked_encoded`: the consumer asked for encoded frames, so a raw answer
 /// (an older helper) is said in the text lane as well as in `encoding`.
-fn streamResult(arena: std.mem.Allocator, view: View, offer: web_proto.EvStreamOpen, asked_encoded: bool) ![]const u8 {
+fn streamResult(arena: std.mem.Allocator, view: View, offer: web_proto.EvStreamOpen, asked_encoded: bool, popups: bool) ![]const u8 {
     var res = mcp.Res.init(arena);
     try head(&res, arena, .headless, view);
     try res.fact("pane", view.pane);
@@ -4958,6 +4981,7 @@ fn streamResult(arena: std.mem.Allocator, view: View, offer: web_proto.EvStreamO
     try res.fact("max_unacked_frames", @as(u32, @import("../web/stream.zig").MAX_UNACKED));
     try res.fact("pixel_format", "bgra-premultiplied");
     try res.fact("audio", offer.audio != 0);
+    try res.fact("popups", popups);
     const encoded = offer.encoding == .encoded;
     try res.fact("encoding", @tagName(if (encoded) web_proto.StreamEncoding.encoded else .raw));
     const codec: ?[]const u8 = if (encoded and offer.codec != 0) vcodec.codecName(@enumFromInt(offer.codec)) else null;
@@ -4988,13 +5012,14 @@ fn streamTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view:
         .err => |f| return failRes(arena, f),
         .value => |ids| ids,
     };
-    const offer = e.openStream(arena, view.pane, audio, 5000, max_fps, codecs) catch |err|
+    const popups = if (mcp.argValue(args, "popups")) |v| v == .bool and v.bool else false;
+    const offer = e.openStream(arena, view.pane, audio, 5000, max_fps, codecs, popups) catch |err|
         return failRes(arena, try headlessFail(arena, e, err));
     if (offer.err.len > 0) return mcp.errRes(arena, .refused, offer.err);
     var streamed_view = view;
     const live = e.findView(view.pane) orelse return mcp.errRes(arena, .not_found, "the view ended while opening its stream");
     streamed_view.max_fps = live.max_fps;
-    return streamResult(arena, streamed_view, offer, codecs != null);
+    return streamResult(arena, streamed_view, offer, codecs != null, popups and e.has(.stream_popups));
 }
 
 fn parseMaxFps(arena: std.mem.Allocator, args: std.json.Value) !union(enum) { absent, value: u16, err: Fail } {
@@ -9305,7 +9330,7 @@ test "web_stream returns common view facts and refuses GUI and malformed audio w
     const out = try streamResult(arena, .{ .pane = 7, .view = 7, .url = "https://example.com/", .route = "via:box" }, .{
         .view = 7, .req = 1, .path = "/tmp/web-stream.sock",
         .token = "0123456789abcdef0123456789abcdef", .err = "",
-    }, false);
+    }, false, false);
     const sc = (try mcp.expectToolResultShape(arena, "web_stream", out)).object.get("structuredContent").?.object;
     try std.testing.expectEqualStrings("headless", sc.get("backend").?.string);
     try std.testing.expectEqualStrings("via:box", sc.get("route").?.string);
@@ -9319,7 +9344,7 @@ test "web_stream returns common view facts and refuses GUI and malformed audio w
         const enc_out = try streamResult(arena, .{ .pane = 7, .view = 7, .url = "https://example.com/", .route = "direct" }, .{
             .view = 7, .req = 2, .path = "/tmp/web-stream.sock",
             .token = "0123456789abcdef0123456789abcdef", .err = "", .encoding = .encoded, .codec = codec,
-        }, true);
+        }, true, false);
         const esc = (try mcp.expectToolResultShape(arena, "web_stream", enc_out)).object.get("structuredContent").?.object;
         try std.testing.expectEqualStrings("encoded", esc.get("encoding").?.string);
         if (codec == 0) try std.testing.expect(esc.get("video_codec").? == .null) else try std.testing.expectEqualStrings("h264", esc.get("video_codec").?.string);
@@ -9328,7 +9353,7 @@ test "web_stream returns common view facts and refuses GUI and malformed audio w
     const fell_back = try streamResult(arena, .{ .pane = 7, .view = 7, .url = "https://example.com/", .route = "direct" }, .{
         .view = 7, .req = 3, .path = "/tmp/web-stream.sock",
         .token = "0123456789abcdef0123456789abcdef", .err = "",
-    }, true);
+    }, true, false);
     const fsc = (try mcp.expectToolResultShape(arena, "web_stream", fell_back)).object.get("structuredContent").?.object;
     try std.testing.expectEqualStrings("raw", fsc.get("encoding").?.string);
     try std.testing.expect(std.mem.indexOf(u8, fell_back, "RAW BGRA") != null);

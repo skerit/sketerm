@@ -78,6 +78,7 @@ const strz = @import("../util/strz.zig");
 const muxclient = @import("../mux/client.zig");
 const fsserve = @import("../mux/fsserve.zig");
 const display = @import("../mux/display.zig");
+const ozone = @import("../web/ozone.zig");
 const proto = @import("../web/protocol.zig");
 const untrusted_env = @import("../web/untrusted_env.zig");
 comptime {
@@ -1044,6 +1045,9 @@ fn nextViewId() error{ NoEntropy, ViewIdsExhausted }!u32 {
 
 pub const Engine = struct {
     default_max_fps: ?u16 = null,
+    /// `[mcp] web_webgl`: handed to every helper this engine launches
+    /// (`SKETERM_WEB_WEBGL`, or the broker's `engine_open.webgl`).
+    webgl_policy: ozone.WebglPolicy = .auto,
     gpa: std.mem.Allocator,
     /// Directory holding the helper socket and its cache; owned.
     dir: []u8,
@@ -2022,7 +2026,7 @@ pub const Engine = struct {
     fn brokerEngine(self: *Engine, sock: [:0]const u8) bool {
         var arena_state = std.heap.ArenaAllocator.init(self.gpa);
         defer arena_state.deinit();
-        const info = self.remote.?.engineOpen(arena_state.allocator()) catch return false;
+        const info = self.remote.?.engineOpen(arena_state.allocator(), @tagName(self.webgl_policy)) catch return false;
         self.broker_diagnostics = info.diagnostics;
         // The broker's engine listens where every sibling expects it
         // (this instance dir); a different path would mean a confused
@@ -2099,10 +2103,11 @@ pub const Engine = struct {
         var child_env = (if (self.untrusted)
             ChildEnv.build(self.gpa, &untrusted_env.dropped, &untrusted_env.sets)
         else if (env.active) blk: {
-            // The session's display, software rendering. The exact env
-            // recipe is display.zig's `run` (never derive wl-* paths; the
-            // daemon returned these). The presenter flag arms THIS helper
-            // as a client of a hub nobody else renders into, so its
+            // The session's display; CPU-readable frames, WebGL wherever
+            // the helper's one policy puts it (`web/ozone.zig`). The exact
+            // env recipe is display.zig's `run` (never derive wl-* paths;
+            // the daemon returned these). The presenter flag arms THIS
+            // helper as a client of a hub nobody else renders into, so its
             // toplevels are the watch-along surface and not a stray
             // desktop window.
             var sets: [9][2][]const u8 = undefined;
@@ -2119,10 +2124,9 @@ pub const Engine = struct {
             }
             for ([_][2][]const u8{
                 .{ "XDG_SESSION_TYPE", "wayland" },
-                .{ "LIBGL_ALWAYS_SOFTWARE", "1" },
                 .{ "SKETERM_WEB_OZONE", "wayland" },
-                .{ "SKETERM_WEB_GPU", "0" },
-                .{ "SKETERM_WEB_SOFTWARE_WEBGL", "1" },
+                .{ "SKETERM_WEB_FRAMES", "cpu" },
+                .{ ozone.WebglPolicy.ENV, @tagName(self.webgl_policy) },
                 .{ proto.PRESENTER_ENV, "1" },
             }) |kv| {
                 sets[n] = kv;
@@ -2130,9 +2134,9 @@ pub const Engine = struct {
             }
             break :blk ChildEnv.build(self.gpa, &sessionDropped, sets[0..n]);
         } else ChildEnv.build(self.gpa, &keepAll, &.{
-            .{ "SKETERM_WEB_GPU", "0" },
             .{ "SKETERM_WEB_OZONE", "headless" },
-            .{ "SKETERM_WEB_SOFTWARE_WEBGL", "1" },
+            .{ "SKETERM_WEB_FRAMES", "cpu" },
+            .{ ozone.WebglPolicy.ENV, @tagName(self.webgl_policy) },
         })) catch {
             if (lifetime[0] >= 0) _ = c.close(lifetime[0]);
             if (lifetime[1] >= 0) _ = c.close(lifetime[1]);
@@ -3734,7 +3738,9 @@ pub const Engine = struct {
     /// `codecs` non-null asks for an encoded stream (`vcodec.Codec` ids the
     /// consumer decodes, empty = lossless only); a helper without
     /// `stream-encoded` is asked for raw, and its reply says raw.
-    pub fn openStream(self: *Engine, arena: std.mem.Allocator, id: u32, audio: bool, budget_ms: i64, max_fps: ?u16, codecs: ?[]const u8) !proto.EvStreamOpen {
+    /// `popups` asks the helper to stream every popup the view opens
+    /// (capability `stream-popups`); an older helper is not asked.
+    pub fn openStream(self: *Engine, arena: std.mem.Allocator, id: u32, audio: bool, budget_ms: i64, max_fps: ?u16, codecs: ?[]const u8, popups: bool) !proto.EvStreamOpen {
         if (max_fps) |fps| if (fps == 0 or fps > proto.MAX_VIEW_FPS) return error.InvalidFrameRate;
         if (!self.ensure()) return error.Unavailable;
         if (!self.has(.web_stream)) return error.NoStream;
@@ -3762,6 +3768,7 @@ pub const Engine = struct {
             .audio = @intFromBool(audio and self.has(.stream_audio)),
             .encoding = if (encoded) .encoded else .raw,
             .codecs = if (encoded) codecs.? else "",
+            .popups = @intFromBool(popups and self.has(.stream_popups)),
         }) catch return error.Unavailable;
         const deadline = clock.nowMs() + @max(budget_ms, 1);
         while (clock.nowMs() < deadline) {
@@ -4204,6 +4211,14 @@ pub const Engine = struct {
             .ev_stream_open => {
                 const ev = proto.decode(proto.EvStreamOpen, frame.payload) catch return;
                 const v = self.findView(ev.view) orelse return;
+                // `req` 0 is a stream the helper opened by itself: a popup
+                // of a view streamed with `popups`. Its peer learnt the
+                // socket on the opener's stream; here it only occupies the
+                // view's one stream slot until `ev_stream_closed`.
+                if (ev.req == 0) {
+                    if (ev.err.len == 0) v.streaming = true;
+                    return;
+                }
                 if (v.stream_request == 0 or ev.req != v.stream_request or v.stream_reply != null) return;
                 if (ev.err.len == 0) v.streaming = true;
                 self.setOwned(&v.stream_reply, frame.payload);
@@ -4991,7 +5006,7 @@ test "stream opens correlate replies, negotiate audio, and refuse a second strea
         const reply = blk: {
             const thread = try std.Thread.spawn(.{}, StreamPeer.run, .{&peer});
             defer thread.join();
-            break :blk try pair.eng.openStream(arena_state.allocator(), 1, true, 1000, null, null);
+            break :blk try pair.eng.openStream(arena_state.allocator(), 1, true, 1000, null, null, false);
         };
         try std.testing.expectEqualStrings("/tmp/current.sock", reply.path);
         try std.testing.expectEqual(@as(u8, @intFromBool(has_audio)), peer.audio);
@@ -5003,7 +5018,7 @@ test "stream opens correlate replies, negotiate audio, and refuse a second strea
         try std.testing.expectEqual(proto.Tag.stream_open, (try reader.next()).?.tag);
         try std.testing.expect((try reader.next()) == null);
         // While it lives a second open is a conflict, decided here: nothing is sent.
-        try std.testing.expectError(error.StreamActive, pair.eng.openStream(arena_state.allocator(), 1, true, 10, null, null));
+        try std.testing.expectError(error.StreamActive, pair.eng.openStream(arena_state.allocator(), 1, true, 10, null, null, false));
         try std.testing.expectEqual(@as(usize, 0), pair.drain(&buf).len);
         // Its end frees the view for the next open.
         var closed: std.ArrayList(u8) = .empty;
@@ -5016,13 +5031,32 @@ test "stream opens correlate replies, negotiate audio, and refuse a second strea
     const reply = blk: {
         const thread = try std.Thread.spawn(.{}, StreamPeer.run, .{&peer});
         defer thread.join();
-        break :blk try pair.eng.openStream(arena_state.allocator(), 1, false, 1000, null, null);
+        break :blk try pair.eng.openStream(arena_state.allocator(), 1, false, 1000, null, null, false);
     };
     try std.testing.expectEqualStrings(peer.err, reply.err);
     var buf: [4096]u8 = undefined;
     var reader = proto.Reader.init(pair.drain(&buf));
     try std.testing.expectEqual(proto.Tag.stream_open, (try reader.next()).?.tag);
     try std.testing.expect((try reader.next()) == null);
+}
+
+test "a helper-opened popup stream occupies the popup view's one stream slot until it ends" {
+    const gpa = std.testing.allocator;
+    var pair = try Pair.init(gpa);
+    defer pair.deinit();
+    const v = try gpa.create(View);
+    v.* = .{ .id = proto.ENGINE_VIEW_BASE + 1, .w = 400, .h = 300 };
+    try pair.eng.views.append(gpa, v);
+    var open: std.ArrayList(u8) = .empty;
+    defer open.deinit(gpa);
+    try proto.encodePayload(gpa, &open, proto.EvStreamOpen{ .view = v.id, .req = 0, .path = "/tmp/popup.sock", .token = "0123456789abcdef0123456789abcdef", .err = "" });
+    pair.eng.dispatch(.{ .tag = .ev_stream_open, .payload = open.items });
+    try std.testing.expect(v.streaming and v.stream_reply == null);
+    var closed: std.ArrayList(u8) = .empty;
+    defer closed.deinit(gpa);
+    try proto.encodePayload(gpa, &closed, proto.EvStreamClosed{ .view = v.id, .reason = "the stream client disconnected" });
+    pair.eng.dispatch(.{ .tag = .ev_stream_closed, .payload = closed.items });
+    try std.testing.expect(!v.streaming);
 }
 
 test "an encoded stream is asked for only from a helper that streams encoded, and a raw open stays V1" {
@@ -5049,7 +5083,7 @@ test "an encoded stream is asked for only from a helper that streams encoded, an
         const reply = blk: {
             const thread = try std.Thread.spawn(.{}, StreamPeer.run, .{&peer});
             defer thread.join();
-            break :blk try pair.eng.openStream(arena_state.allocator(), 1, false, 1000, null, case.codecs);
+            break :blk try pair.eng.openStream(arena_state.allocator(), 1, false, 1000, null, case.codecs, false);
         };
         try std.testing.expectEqual(case.want, peer.encoding);
         try std.testing.expectEqual(case.len, peer.payload_len);
@@ -5087,7 +5121,7 @@ test "frame rates are per-view, pre-create, bounded and fail closed on unsupport
     try t.expectEqual(@as(u16, 15), view.max_fps.?);
     pair.eng.caps.insert(.web_stream);
     pair.eng.caps.remove(.view_max_fps);
-    try t.expectError(error.FrameRateUnsupported, pair.eng.openStream(t.allocator, view.id, false, 10, 60, null));
+    try t.expectError(error.FrameRateUnsupported, pair.eng.openStream(t.allocator, view.id, false, 10, 60, null, false));
     try t.expectEqual(@as(usize, 0), pair.drain(&buf).len);
 }
 
@@ -5139,9 +5173,9 @@ test "stream timeout cancels the slot and late replies cannot satisfy another op
     const v = try gpa.create(View);
     v.* = .{ .id = 1, .w = 800, .h = 600 };
     try pair.eng.views.append(gpa, v);
-    try std.testing.expectError(error.NoStream, pair.eng.openStream(gpa, 1, true, 10, null, null));
+    try std.testing.expectError(error.NoStream, pair.eng.openStream(gpa, 1, true, 10, null, null, false));
     pair.eng.caps.insert(.web_stream);
-    try std.testing.expectError(error.Timeout, pair.eng.openStream(gpa, 1, true, 10, null, null));
+    try std.testing.expectError(error.Timeout, pair.eng.openStream(gpa, 1, true, 10, null, null, false));
     try std.testing.expectEqual(@as(u32, 0), v.stream_request);
     var buf: [4096]u8 = undefined;
     var reader = proto.Reader.init(pair.drain(&buf));

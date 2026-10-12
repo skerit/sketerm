@@ -813,13 +813,16 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     var web_max_fps = cfg.mcp.web_max_fps;
     var web_idle_close_secs = cfg.mcp.web_idle_close_secs;
     var web_fetch_max_tabs = cfg.mcp.web_fetch_max_tabs;
+    var web_webgl = cfg.mcp.web_webgl;
     if (opts.profile) |name| {
         const prof = mcpProfileRecord(&cfg, name) catch return 2;
         if (prof.web_max_fps) |fps| web_max_fps = fps;
         if (prof.web_idle_close_secs) |secs| web_idle_close_secs = secs;
         if (prof.web_fetch_max_tabs) |n| web_fetch_max_tabs = n;
+        if (prof.web_webgl) |p| web_webgl = p;
     }
     @import("mcp_web.zig").configureIdleClose(web_idle_close_secs);
+    @import("mcp_web.zig").configureWebgl(web_webgl orelse .auto);
     mcp_webfetch.configure(web_fetch_max_tabs);
 
     if (opts.log_dir) |ld| {

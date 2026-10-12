@@ -72,6 +72,7 @@ const vcodec = @import("../wlhost/vcodec.zig");
 // helper's module root is src/web/.
 const zpool = @import("zpool");
 const keymap = @import("keymap.zig");
+const xkblayout = @import("../ipc/xkblayout.zig");
 const presenter = @import("presenter.zig");
 const platform = @import("../util/platform.zig");
 const semantic = @import("semantic.zig");
@@ -264,8 +265,10 @@ const adopt_timeout_ms: i64 = 8000;
 ///   `--ozone-platform=wayland` gets a GPU process that holds
 ///   /dev/dri render nodes and delivers 1-plane BGRA dma-bufs.
 var accelerated: bool = false;
-/// SwiftShader was explicitly selected with CPU compositing, not a page-level context guarantee.
-pub var software_webgl: bool = false;
+/// What `main.zig`'s WebGL decision selected (`ozone.Choice.webgl`);
+/// advertised as `webgl-gpu` / `software-webgl` / `webgl-off`. A launch policy, not a
+/// page-level guarantee that a context can be allocated.
+pub var webgl: ?@import("ozone.zig").Webgl = null;
 
 /// Called by `main.zig` before `Host.install`.
 pub fn setAccelerated(on: bool) void {
@@ -983,6 +986,8 @@ pub const Host = struct {
     /// be scoped to one call. It is consulted only for a browser no
     /// view claims by cef id, and cleared the moment one is adopted.
     adopting: ?*View = null,
+    /// The US layout behind `physKey`, parsed on first use.
+    us_layout: ?xkblayout.Layout = null,
     /// When `adopting` was armed. An engine that answers a
     /// `show_dev_tools` with no browser at all would otherwise leave a
     /// client waiting for a reply that never comes — see `watchdog`.
@@ -1348,6 +1353,9 @@ pub const Host = struct {
     pub fn deinit(self: *Host) void {
         self.streamCloseAll();
         self.destroyAll();
+        // After every view is gone: a teardown can still release held keys.
+        if (self.us_layout) |*l| l.deinit(self.gpa);
+        self.us_layout = null;
         if (self.presenter) |p| {
             p.deinit();
             self.presenter = null;
@@ -1606,6 +1614,7 @@ pub const Host = struct {
     }
 
     pub const streamOpen = host_stream.streamOpen;
+    pub const streamFollowPopup = host_stream.streamFollowPopup;
     pub const StreamEncoded = host_stream.Encoded;
     pub const streamClose = host_stream.streamClose;
     pub const streamPump = host_stream.streamPump;
@@ -2287,6 +2296,7 @@ pub const Host = struct {
         // The popup is already announced; without a buffer it never paints.
         self.allocBuffer(v) catch |err| logLine("popup view {d}: frame buffer allocation failed ({s}); it cannot paint", .{ v.id, @errorName(err) });
         self.observeViewPresent(v);
+        self.streamFollowPopup(v);
         return true;
     }
 
@@ -3585,6 +3595,14 @@ pub const Host = struct {
 
     pub fn key(self: *Host, req: proto.InputKey) void {
         const v = self.findWake(req.view) orelse return;
+        self.keyTo(v, req);
+    }
+
+    /// One key edge into `v`. A client that knows no hardware keycode
+    /// (MCP, a stream peer) gets the US-keyboard key that produces the
+    /// keysym, so the page reads the `KeyboardEvent.code` a real keyboard
+    /// event carries instead of an empty one.
+    fn keyTo(self: *Host, v: *View, req: proto.InputKey) void {
         const mapped = keymap.map(req.keyval);
         var ev = std.mem.zeroes(cef.cef_key_event_t);
         ev.size = @sizeOf(cef.cef_key_event_t);
@@ -3592,6 +3610,9 @@ pub const Host = struct {
         if (mapped.keypad) ev.modifiers |= keymap.flag_is_key_pad;
         ev.windows_key_code = mapped.windows_key_code;
         ev.native_key_code = @bitCast(req.keycode);
+        if (req.keycode == 0) {
+            if (self.physKey(req.keyval)) |pk| ev.native_key_code = @intCast(pk.xkb);
+        }
         ev.character = mapped.character;
         ev.unmodified_character = mapped.character;
 
@@ -3612,6 +3633,41 @@ pub const Host = struct {
             while (it.nextCodepoint()) |cp| charEvent(v, ev, cp);
         } else if (mapped.character != 0 and !chorded) {
             charEvent(v, ev, mapped.character);
+        }
+    }
+
+    /// The US keyboard layout `physKey` reads, parsed once from the
+    /// embedded keymap the MCP typing path encodes against too.
+    fn physKey(self: *Host, keysym: u32) ?keymap.PhysKey {
+        if (self.us_layout == null) {
+            self.us_layout = xkblayout.parse(self.gpa, @import("../wlhost/keymaps.zig").us) catch return null;
+        }
+        return keymap.physKey(&self.us_layout.?, keysym);
+    }
+
+    /// Type `text` as a keyboard does: per character the key that
+    /// produces it goes down and up (inside a Shift press when its level
+    /// needs one), so the page sees keydown, keypress, input and keyup
+    /// with a real `key` and `code`. A character no US key produces
+    /// still gets its own keydown/keyup pair, with no physical key.
+    pub fn typeKeys(self: *Host, v: *View, text: []const u8) void {
+        var it = std.unicode.Utf8Iterator{ .bytes = text, .i = 0 };
+        while (it.nextCodepointSlice()) |slice| {
+            const cp = std.unicode.utf8Decode(slice) catch continue;
+            const keysym: u32 = switch (cp) {
+                '\n', '\r' => 0xff0d,
+                '\t' => 0xff09,
+                else => keymap.keysymFromCodepoint(cp),
+            };
+            // A named key types its own character (Return's '\r').
+            const own: []const u8 = if (keysym >= 0xff00 and keysym <= 0xffff) "" else slice;
+            const shift = if (self.physKey(keysym)) |pk| pk.shift else false;
+            const shift_sym: u32 = 0xffe1;
+            if (shift) self.keyTo(v, .{ .view = v.id, .kind = @intFromEnum(proto.KeyKind.down), .keyval = shift_sym, .keycode = 0, .mods = proto.mod_shift, .text = "" });
+            const mods: u32 = if (shift) proto.mod_shift else 0;
+            self.keyTo(v, .{ .view = v.id, .kind = @intFromEnum(proto.KeyKind.down), .keyval = keysym, .keycode = 0, .mods = mods, .text = own });
+            self.keyTo(v, .{ .view = v.id, .kind = @intFromEnum(proto.KeyKind.up), .keyval = keysym, .keycode = 0, .mods = mods, .text = "" });
+            if (shift) self.keyTo(v, .{ .view = v.id, .kind = @intFromEnum(proto.KeyKind.up), .keyval = shift_sym, .keycode = 0, .mods = 0, .text = "" });
         }
     }
 
@@ -4732,7 +4788,7 @@ test "engine-closed page popup retires streams dependents and pending state" {
     const inspector_id = inspector.id;
     host.pending_media[0] = .{ .view = 202 };
     host.pending_popups[0] = .{ .view = unclaimed };
-    switch (host.streamOpen(202, false, null)) {
+    switch (host.streamOpen(202, false, null, false)) {
         .ok => {},
         .err => return error.StreamOpenFailed,
     }
@@ -6221,9 +6277,11 @@ fn imeCancel(host: *cef.cef_browser_host_t) void {
     if (host.ime_cancel_composition) |f| f(host);
 }
 
-/// Type `text` into whatever has focus as CHAR events — the same path
-/// `input_key` uses, so the page cannot tell a semantic set-value from
-/// a human at the keyboard.
+/// Insert `text` at the caret as CHAR events: the paste path. A page
+/// sees `beforeinput`/`input` per character with no key going down or
+/// up, so this is NOT typing (that is `Host.typeKeys`); it stays because
+/// CEF's C API can neither write the engine's clipboard for a real paste
+/// nor commit text outside a live IME composition (`Host.paste`).
 pub fn typeText(v: *View, text: []const u8) void {
     var ev = std.mem.zeroes(cef.cef_key_event_t);
     ev.size = @sizeOf(cef.cef_key_event_t);
@@ -6826,7 +6884,10 @@ fn onGetScreenInfo(
         .screen_info => @as(f32, @floatFromInt(v.scale_x1000)) / 1000.0,
         .zoom => 1.0,
     };
-    info.*.depth = 32;
+    // 24, as Chromium reports for every Linux display (`screen.colorDepth`
+    // of a real Chrome here measured 24); 32 was a value no real Linux
+    // browser shows a page.
+    info.*.depth = 24;
     info.*.depth_per_component = 8;
     info.*.rect = viewRect(v);
     info.*.available_rect = info.*.rect;

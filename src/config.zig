@@ -723,10 +723,13 @@ pub const McpProfile = struct {
     /// call, 1-16. Null leaves the built-in default
     /// (`ipc/webfetch.zig` DEFAULT_MAX_TABS).
     web_fetch_max_tabs: ?u16 = null,
+    /// What the headless helper does about WebGL (`web/ozone.zig`
+    /// `WebglPolicy`); null leaves `auto`.
+    web_webgl: ?@import("web/ozone.zig").WebglPolicy = null,
 
     /// Whether serializing this record writes anything.
     pub fn isEmpty(self: *const McpProfile) bool {
-        return self.tools.len == 0 and self.web_gui == null and self.web_max_fps == null and self.web_idle_close_secs == null and self.web_fetch_max_tabs == null;
+        return self.tools.len == 0 and self.web_gui == null and self.web_max_fps == null and self.web_idle_close_secs == null and self.web_fetch_max_tabs == null and self.web_webgl == null;
     }
 
     pub fn cloneInto(self: *const McpProfile, arena: std.mem.Allocator) error{OutOfMemory}!McpProfile {
@@ -2304,6 +2307,8 @@ fn applyMcpKv(prof: *McpProfile, arena: std.mem.Allocator, key: []const u8, valu
         const n = std.fmt.parseInt(u16, value, 10) catch return error.BadValue;
         if (n == 0 or n > @import("ipc/webfetch.zig").MAX_MAX_TABS) return error.BadValue;
         prof.web_fetch_max_tabs = n;
+    } else if (std.mem.eql(u8, key, "web_webgl")) {
+        prof.web_webgl = @import("web/ozone.zig").WebglPolicy.parse(value) orelse return error.BadValue;
     } else return error.UnknownKey;
 }
 
@@ -2315,6 +2320,7 @@ fn serialiseMcpKeys(prof: *const McpProfile, w: *std.Io.Writer) !void {
     if (prof.web_max_fps) |v| try w.print("web_max_fps = {d}\n", .{v});
     if (prof.web_idle_close_secs) |v| try w.print("web_idle_close_secs = {d}\n", .{v});
     if (prof.web_fetch_max_tabs) |v| try w.print("web_fetch_max_tabs = {d}\n", .{v});
+    if (prof.web_webgl) |v| try w.print("web_webgl = {s}\n", .{@tagName(v)});
 }
 
 fn applyDomainKv(dom: *Domain, arena: std.mem.Allocator, key: []const u8, value: []const u8) !void {
@@ -4467,11 +4473,13 @@ test "config: bare [mcp] defaults and web_gui parse and round-trip" {
         \\web_max_fps = 30
         \\web_idle_close_secs = 600
         \\web_fetch_max_tabs = 3
+        \\web_webgl = hardware
         \\
         \\[mcp.locked]
         \\tools = files:ro
         \\web_gui = off
         \\web_max_fps = 15
+        \\web_webgl = off
         \\web_idle_close_secs = 0
         \\
         \\[mcp.quiet]
@@ -4484,6 +4492,9 @@ test "config: bare [mcp] defaults and web_gui parse and round-trip" {
     try std.testing.expectEqual(@as(u16, 30), cfg.mcp.web_max_fps.?);
     try std.testing.expectEqual(@as(u16, 15), cfg.mcpProfile("locked").?.web_max_fps.?);
     try std.testing.expect(cfg.mcpProfile("quiet").?.web_max_fps == null);
+    try std.testing.expectEqual(.hardware, cfg.mcp.web_webgl.?);
+    try std.testing.expectEqual(.off, cfg.mcpProfile("locked").?.web_webgl.?);
+    try std.testing.expect(cfg.mcpProfile("quiet").?.web_webgl == null);
     try std.testing.expectEqualStrings("", cfg.mcp.tools);
     try std.testing.expectEqual(false, cfg.mcpProfile("locked").?.web_gui.?);
     // A section that does not mention the key leaves it unstated (null),

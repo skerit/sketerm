@@ -230,6 +230,9 @@ pub fn handleWebEngineOpen(self: *Daemon, cl: *Client, r: WebOpReq) void {
         slot = &self.web_engines.items[self.web_engines.items.len - 1];
     }
     const entry = slot.?;
+    // Validated before the fork: the child only setenvs a known name.
+    const webgl: ?[:0]const u8 = if (r.webgl.len == 0) null else if (@import("../web/ozone.zig").WebglPolicy.parse(r.webgl)) |p| @tagName(p) else
+        return webReplyErr(cl, r.req, "engine_open: webgl must be auto, hardware or off");
     entry.diagnostic.deinit();
     entry.diagnostic = @import("../web/diagnostic.zig").Capture.init() catch
         return webReplyErr(cl, r.req, "could not create helper diagnostic capture");
@@ -240,10 +243,11 @@ pub fn handleWebEngineOpen(self: *Daemon, cl: *Client, r: WebOpReq) void {
     }
     if (pid == 0) {
         entry.diagnostic.child();
-        // Named MCP helpers need readable CPU pixels, just like ephemeral ones.
-        if (c.setenv("SKETERM_WEB_GPU", "0", 1) != 0 or
-            c.setenv("SKETERM_WEB_OZONE", "headless", 1) != 0 or
-            c.setenv("SKETERM_WEB_SOFTWARE_WEBGL", "1", 1) != 0) c._exit(127);
+        // Named MCP helpers read CPU pixels, just like ephemeral ones;
+        // where WebGL renders is the helper's own policy (`web/ozone.zig`).
+        if (c.setenv("SKETERM_WEB_OZONE", "headless", 1) != 0 or
+            c.setenv("SKETERM_WEB_FRAMES", "cpu", 1) != 0) c._exit(127);
+        if (webgl) |w| if (c.setenv(@import("../web/ozone.zig").WebglPolicy.ENV, w.ptr, 1) != 0) c._exit(127);
         // Own process group so a future teardown can take CEF's whole
         // subprocess tree; stdio to /dev/null (CEF noise), like the
         // remote-helper spawn above.

@@ -845,6 +845,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         _ = c.setenv("SKETERM_WEB_BIN", web_bin, 1);
         defer _ = c.unsetenv("SKETERM_WEB_BIN");
         webStreamStage(allocator, exe, rt);
+        if (@import("builtin").os.tag == .linux) webglPolicyStage(allocator, exe, rt);
         say("smoke-mcp: focused pushed web stream ok");
         return 0;
     }
@@ -3678,6 +3679,14 @@ const StreamRig = struct {
     lossless_parts: usize = 0,
     /// Serial of the logical frame whose messages are still arriving.
     open_serial: ?u64 = null,
+    /// The stream was opened with `popups`: POPUP frames are expected.
+    popups: bool = false,
+    /// The last POPUP frame: its stream socket and token.
+    popup_path: [108]u8 = undefined,
+    popup_path_len: usize = 0,
+    popup_token: [webstream.TOKEN_LEN]u8 = undefined,
+    popup_w: u32 = 0,
+    popup_h: u32 = 0,
 
     fn connect(allocator: std.mem.Allocator, path: []const u8) StreamRig {
         var addr = std.mem.zeroes(c.struct_sockaddr_un);
@@ -3872,6 +3881,19 @@ const StreamRig = struct {
                 };
                 self.audio_packets += 1;
             },
+            .popup => {
+                if (!self.popups) fail("a stream opened without popups announced one");
+                const fixed = webstream.TOKEN_LEN + 1 + 8;
+                if (b.len < fixed + 2) fail("invalid stream popup");
+                const plen = std.mem.readInt(u16, b[fixed..][0..2], .little);
+                if (plen == 0 or plen >= self.popup_path.len or b.len < fixed + 2 + plen + 2) fail("invalid stream popup path");
+                if (!webstream.isToken(b[0..webstream.TOKEN_LEN])) fail("stream popup token is not a token");
+                self.popup_token = b[0..webstream.TOKEN_LEN].*;
+                @memcpy(self.popup_path[0..plen], b[fixed + 2 ..][0..plen]);
+                self.popup_path_len = plen;
+                self.popup_w = std.mem.readInt(u32, b[webstream.TOKEN_LEN + 1 ..][0..4], .little);
+                self.popup_h = std.mem.readInt(u32, b[webstream.TOKEN_LEN + 5 ..][0..4], .little);
+            },
             else => fail("unexpected helper-to-client stream tag"),
         }
         return tag;
@@ -3925,6 +3947,116 @@ const StreamRig = struct {
         fail("stream socket survived its owning view or MCP server");
     }
 };
+
+/// A streamed view behaves like a browser window someone is using: it
+/// has focus once the peer attached, a reported blur takes it away, a
+/// press gives it back; a typed key carries its physical `code`; and a
+/// popup the page opens reaches the peer as a POPUP frame whose socket
+/// streams the popup itself, focused.
+fn streamFocusPopupStage(allocator: std.mem.Allocator, arena: std.mem.Allocator, m: *Mcp, rt: []const u8) void {
+    var args: [1024]u8 = undefined;
+    const popup_path = std.fmt.allocPrint(arena, "{s}/stream-popup.html", .{rt}) catch fail("popup fixture path");
+    const popup_html = "<!doctype html><title>popup</title><body style=margin:0;background:#334455><script>" ++
+        "setInterval(()=>{const t='popup-'+document.hasFocus();if(document.title!==t)document.title=t},30)</script>";
+    @import("util/atomicwrite.zig").writeFileExact(popup_path, popup_html, 0o600) catch fail("write popup fixture");
+    const path = std.fmt.allocPrint(arena, "{s}/stream-opener.html", .{rt}) catch fail("opener fixture path");
+    const html = std.fmt.allocPrint(arena, "<!doctype html><title>opener</title><style>body{{margin:0;background:#112233}}#open{{position:fixed;left:20px;top:20px;width:100px;height:40px}}</style>" ++
+        "<button id=open>open</button><script>window.typed=[];" ++
+        "for(const k of ['keydown','keyup'])addEventListener(k,e=>typed.push(k+':'+e.key+':'+e.code),true);" ++
+        "document.getElementById('open').onclick=()=>{{window.child=window.open('file://{s}','signin','popup,width=420,height=320')}};" ++
+        "setInterval(()=>{{const t='focus-'+document.hasFocus();if(document.title!==t)document.title=t}},30)</script>", .{popup_path}) catch fail("opener fixture");
+    @import("util/atomicwrite.zig").writeFileExact(path, html, 0o600) catch fail("write opener fixture");
+    m.sendTool("web_open", std.fmt.bufPrint(&args, "{{\"url\":\"file://{s}\",\"ephemeral\":true,\"width\":800,\"height\":600,\"snapshot\":\"none\"}}", .{path}) catch unreachable);
+    _ = capSc(arena, m.recvLine(60_000), "popup opener open", false);
+    const caps = capSc(arena, m.callTool("capabilities", "{}"), "stream popups fact", false);
+    if (!caps.get("web_stream_popups").?.bool) fail("the built helper does not advertise stream-popups");
+    const offer = capSc(arena, m.callTool("web_stream", "{\"audio\":false,\"popups\":true}"), "web_stream popups", false);
+    if (!offer.get("popups").?.bool) fail("web_stream popups:true was not honoured");
+    var rig = StreamRig.connect(allocator, offer.get("socket_path").?.string);
+    defer rig.deinit();
+    rig.popups = true;
+    rig.send(.auth, offer.get("token").?.string);
+    _ = rig.frame();
+    rig.ack();
+    const waitTitle = struct {
+        fn run(mm: *Mcp, r: *StreamRig, want: []const u8) void {
+            var buf: [256]u8 = undefined;
+            mm.sendTool("web_wait", std.fmt.bufPrint(&buf, "{{\"for\":\"title\",\"arg\":\"{s}\",\"timeout_ms\":8000}}", .{want}) catch unreachable);
+            var pending = c.struct_pollfd{ .fd = mm.from_child, .events = c.POLLIN, .revents = 0 };
+            const deadline = nowMs() + 10_000;
+            while (nowMs() < deadline) {
+                pending.revents = 0;
+                if (c.poll(&pending, 1, 50) > 0) break;
+                // Keep the stream drained and acknowledged meanwhile.
+                if (r.next(10)) |tag| if (tag == .frame_end) {
+                    _ = r.damage.takeBounds();
+                    r.ack();
+                };
+            }
+            const line = mm.recvLine(1000);
+            if (std.mem.indexOf(u8, line, "\"isError\":true") != null) {
+                say(line);
+                std.debug.print("smoke-mcp: waited for title {s}\n", .{want});
+                fail("stream focus: the page never reported the expected focus");
+            }
+        }
+    }.run;
+    waitTitle(m, &rig, "focus-true");
+    rig.send(.focus, &.{0});
+    waitTitle(m, &rig, "focus-false");
+    rig.pointer(.move, 400, 300, 0);
+    rig.pointer(.down, 400, 300, 0);
+    rig.pointer(.up, 400, 300, 0);
+    waitTitle(m, &rig, "focus-true");
+    say("smoke-mcp: streamed view focused at AUTH, blurred by the peer, refocused by a press");
+
+    rig.key(.down, "a", 0);
+    rig.key(.up, "a", 0);
+    _ = rig.next(300);
+    const typed = capSc(arena, m.callTool("web_eval", "{\"body\":\"return typed.join(',')\"}"), "typed key events", false);
+    const typed_s = typed.get("value").?.object.get("value").?.string;
+    if (!std.mem.eql(u8, typed_s, "keydown:a:KeyA,keyup:a:KeyA")) {
+        std.debug.print("smoke-mcp: key events {s}\n", .{typed_s});
+        fail("a stream KEY frame did not reach the page as a physical key down and up");
+    }
+
+    rig.pointer(.move, 70, 40, 0);
+    rig.pointer(.down, 70, 40, 0);
+    rig.pointer(.up, 70, 40, 0);
+    const popup_deadline = nowMs() + 8000;
+    while (rig.popup_path_len == 0 and nowMs() < popup_deadline) {
+        if (rig.next(100)) |tag| if (tag == .frame_end) {
+            _ = rig.damage.takeBounds();
+            rig.ack();
+        };
+    }
+    if (rig.popup_path_len == 0) fail("a popup opened from a streamed view was never announced on its stream");
+    var popup = StreamRig.connect(allocator, rig.popup_path[0..rig.popup_path_len]);
+    defer popup.deinit();
+    popup.expect = .{ rig.popup_w, rig.popup_h, rig.popup_w, rig.popup_h };
+    popup.popups = true;
+    popup.send(.auth, &rig.popup_token);
+    _ = popup.frame();
+    popup.ack();
+    // The popup's own stream is focused like any attached window.
+    const tabs_deadline = nowMs() + 8000;
+    var focused_popup = false;
+    while (!focused_popup and nowMs() < tabs_deadline) {
+        const tabs = m.callTool("web_tabs", "{}");
+        focused_popup = std.mem.indexOf(u8, tabs, "popup-true") != null;
+        _ = popup.next(100);
+    }
+    if (!focused_popup) fail("the streamed popup never reported focus");
+    say("smoke-mcp: REAL popup reached the stream peer as a POPUP frame; its own stream painted and focused it");
+    // Leave the browser as this stage found it: popup first, then opener.
+    for ([_][]const u8{ "stream-popup.html", "stream-opener.html" }) |which| {
+        const tabs = capSc(arena, m.callTool("web_tabs", "{}"), "popup stage tabs", false);
+        for (tabs.get("views").?.array.items) |tv| {
+            if (std.mem.indexOf(u8, tv.object.get("url").?.string, which) == null) continue;
+            _ = capSc(arena, m.callTool("web_close", std.fmt.bufPrint(&args, "{{\"pane\":{d}}}", .{tv.object.get("view").?.integer}) catch unreachable), "popup stage close", false);
+        }
+    }
+}
 
 fn streamOffer(m: *Mcp, arena: std.mem.Allocator) std.json.ObjectMap {
     const deadline = nowMs() + 3000;
@@ -4024,13 +4156,70 @@ fn streamScaledBlock(px: []const u8, w: u32, h: u32, want: [4]u8, comptime what:
     }
 }
 
-/// The WebGL canvas occupies a distinct 64x64 logical rectangle, not a CSS colour substitute.
+/// Whether the helper under test gives pages a WebGL context; set by
+/// `webStreamStage` from what the host offers (`webglExpectation`).
+var g_webgl = true;
+
+/// The WebGL canvas occupies a distinct 64x64 logical rectangle, not a CSS
+/// colour substitute; without a WebGL context no pixel carries its colour.
 fn streamWebglPixels(px: []const u8, w: u32, h: u32, scale: u32, comptime what: []const u8) void {
     if (@import("builtin").os.tag != .linux) return;
     const g = streamColorBounds(px, w, h, .{ 255, 0, 255, 255 });
+    if (!g_webgl) {
+        if (g.count != 0) fail(what ++ ": WebGL colour painted although no context was expected");
+        return;
+    }
     const b = g.bounds orelse fail(what ++ ": WebGL pixels are missing");
     if (g.count != 4096 * scale * scale or b.x != 500 * scale or b.y != 40 * scale or b.w != 64 * scale or b.h != 64 * scale)
         fail(what ++ ": WebGL canvas does not contain the exact known-colour rectangle");
+}
+
+/// What a CPU-frame MCP helper under `policy` must offer pages on THIS
+/// host, read off the helper's own decision (`web/ozone.zig`).
+fn webglExpectation(policy: @import("web/ozone.zig").WebglPolicy) @import("web/ozone.zig").Webgl {
+    const ozone = @import("web/ozone.zig");
+    const gpu_wanted = if (c.getenv("SKETERM_WEB_GPU")) |v| blk: {
+        const s = std.mem.span(v);
+        break :blk !(std.mem.eql(u8, s, "0") or std.mem.eql(u8, s, "off") or std.mem.eql(u8, s, "no"));
+    } else true;
+    return ozone.choose(.{ .env_override = "headless", .gpu_wanted = gpu_wanted, .cpu_frames = true, .webgl_policy = policy, .render_node = gpu_wanted and ozone.renderNodePresent() }).webgl.?;
+}
+
+/// What the current page reports about its WebGL (`window.gl` is the
+/// fixture's context, or null).
+fn webglProbe(m: *Mcp, arena: std.mem.Allocator) struct { have: bool, renderer: []const u8, line: []const u8 } {
+    const line = m.callTool("web_eval", "{\"body\":\"if(!window.gl)return {webgl:false};const d=gl.getExtension('WEBGL_debug_renderer_info');return {webgl:true,renderer:d?gl.getParameter(d.UNMASKED_RENDERER_WEBGL):gl.getParameter(gl.RENDERER)}\",\"strict\":true}");
+    const v = capSc(arena, line, "WebGL renderer", false).get("value").?.object.get("value").?.object;
+    const have = v.get("webgl").?.bool;
+    return .{ .have = have, .renderer = if (have) v.get("renderer").?.string else "(no WebGL context)", .line = line };
+}
+
+/// `[mcp] web_webgl = off` gives pages no WebGL or WebGL2 context even
+/// where a GPU exists, and `hardware` none on a GPU-less host; the
+/// `web_webgl` fact reports what the helper really did.
+fn webglPolicyStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) void {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const page = "data:text/html,<title>gl</title><script>window.gl=document.createElement('canvas').getContext('webgl');window.gl2=document.createElement('canvas').getContext('webgl2')</script>";
+    for ([_]@import("web/ozone.zig").WebglPolicy{ .off, .hardware }) |policy| {
+        var body: [64]u8 = undefined;
+        writeSmokeConfig(rt, std.fmt.bufPrint(&body, "[mcp]\nweb_webgl = {s}\n", .{@tagName(policy)}) catch unreachable);
+        defer removeSmokeConfig(rt);
+        var m = Mcp.spawn(allocator, exe, &.{});
+        m.initialize();
+        m.sendTool("web_open", "{\"url\":\"" ++ page ++ "\",\"ephemeral\":true,\"snapshot\":\"none\"}");
+        _ = capSc(arena, m.recvLine(60_000), "webgl policy open", false);
+        const want = webglExpectation(policy);
+        const got = webglProbe(&m, arena);
+        const gl2 = capSc(arena, m.callTool("web_eval", "{\"body\":\"return !!window.gl2\"}"), "webgl2 probe", false).get("value").?.object.get("value").?.bool;
+        std.debug.print("smoke-mcp: web_webgl = {s}: expected {s}, page renderer {s}, webgl2 {}\n", .{ @tagName(policy), @tagName(want), got.renderer, gl2 });
+        if (got.have != (want != .off) or gl2 != (want != .off)) fail("a web_webgl policy did not decide the page's WebGL contexts");
+        const caps = capSc(arena, m.callTool("capabilities", "{}"), "webgl policy fact", false);
+        if (!std.mem.eql(u8, caps.get("web_webgl").?.string, @tagName(want))) fail("web_webgl does not report what the helper did");
+        m.closeStdinWait();
+    }
+    say("smoke-mcp: web_webgl off and hardware give pages exactly the WebGL the policy names, and the fact reports it");
 }
 
 /// The primary helper serving `socket` (its CEF subprocesses carry `--type=`).
@@ -4381,19 +4570,33 @@ fn webStreamStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const 
     const default_rate = capSc(arena, m.callTool("capabilities", "{}"), "default FPS preflight", false);
     if (!default_rate.get("web_max_fps").?.bool or capInt(default_rate, "web_default_max_fps") != 60) fail("headless default is not the configured CEF cap of 60 FPS");
     if (@import("builtin").os.tag == .linux) {
-        const gl_probe = m.callTool("web_eval", "{\"body\":\"if(!window.gl)return {webgl:false};const d=gl.getExtension('WEBGL_debug_renderer_info');return {webgl:true,renderer:d?gl.getParameter(d.UNMASKED_RENDERER_WEBGL):gl.getParameter(gl.RENDERER),version:gl.getParameter(gl.VERSION)}\",\"strict\":true}");
-        const gl_value = capSc(arena, gl_probe, "WebGL renderer", false).get("value").?.object.get("value").?.object;
-        if (!gl_value.get("webgl").?.bool) {
-            say(gl_probe);
-            fail("ordinary MCP CPU view lost WebGL");
+        // The host GPU's renderer when a render node exists (a real
+        // Chrome's), SwiftShader on a GPU-less host under the default
+        // `auto` policy (Jelle's call; headful Chromium 152 there has no
+        // context at all, which `web_webgl = hardware` reproduces).
+        const want = webglExpectation(.auto);
+        g_webgl = want != .off;
+        const got = webglProbe(&m, arena);
+        std.debug.print("smoke-mcp: WebGL policy auto -> {s}; page renderer: {s}\n", .{ @tagName(want), got.renderer });
+        if (got.have != g_webgl) {
+            say(got.line);
+            fail("MCP page WebGL availability differs from what this host's policy offers");
         }
-        const renderer = gl_value.get("renderer").?.string;
-        std.debug.print("smoke-mcp: WebGL renderer: {s}; version: {s}\n", .{ renderer, gl_value.get("version").?.string });
-        if (std.mem.indexOf(u8, renderer, "SwiftShader") == null) fail("MCP WebGL did not use the requested software renderer");
+        const software = std.mem.indexOf(u8, got.renderer, "SwiftShader") != null or std.mem.indexOf(u8, got.renderer, "llvmpipe") != null;
+        switch (want) {
+            .hardware => if (software) fail("a render node exists but MCP WebGL renders in software"),
+            .software => if (std.mem.indexOf(u8, got.renderer, "SwiftShader") == null) fail("the software policy did not select SwiftShader"),
+            .off => {},
+        }
+        if (want != .hardware) say("smoke-mcp: SKIP host-GPU WebGL renderer check (no render node on this host)");
     }
     const caps = capSc(arena, m.callTool("capabilities", "{}"), "stream handshake", false);
     if (!caps.get("web_stream").?.bool) fail("built real helper did not negotiate web-stream");
-    if (@import("builtin").os.tag == .linux and !caps.get("web_software_webgl").?.bool) fail("ordinary helper did not report its software WebGL policy");
+    if (@import("builtin").os.tag == .linux) {
+        const want = webglExpectation(.auto);
+        if (caps.get("web_software_webgl").?.bool != (want == .software) or !std.mem.eql(u8, caps.get("web_webgl").?.string, @tagName(want)))
+            fail("the helper's WebGL facts do not report what it selected");
+    }
     const audio = caps.get("web_stream_audio").?.bool;
     const offer = streamOffer(&m, arena);
     if (offer.get("audio").?.bool != audio or capInt(offer, "protocol_version") != 1 or capInt(offer, "max_unacked_frames") != 2 or
@@ -4451,19 +4654,21 @@ fn webStreamStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const 
             if (!checked) fail("WebGL screenshot/frame had no image");
         }
         // A subsequent WebGL clear must reach the existing pushed damage path too.
-        _ = capSc(arena, m.callTool("web_eval", "{\"body\":\"gl.clearColor(0,1,1,1);gl.clear(gl.COLOR_BUFFER_BIT);gl.finish();await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));return true\"}"), "WebGL repaint", false);
-        const gl_deadline = nowMs() + 5000;
-        var gl_repaint = false;
-        while (!gl_repaint and nowMs() < gl_deadline) {
-            const tag = rig.next(100) orelse continue;
-            if (tag != .frame_end) continue;
-            _ = rig.damage.takeBounds();
-            rig.ack();
-            gl_repaint = std.mem.eql(u8, rig.pixels[(40 * rig.w + 500) * 4 ..][0..4], &.{ 255, 255, 0, 255 });
-        }
-        if (!gl_repaint) fail("WebGL repaint never reached binary stream CPU pixels");
-        say("smoke-mcp: REAL SwiftShader WebGL: exact 64x64 magenta screenshot/frame/stream, subsequent cyan stream repaint ok");
-    } else say("smoke-mcp: SwiftShader WebGL policy is Linux-only; existing stream journey still runs");
+        if (g_webgl) {
+            _ = capSc(arena, m.callTool("web_eval", "{\"body\":\"gl.clearColor(0,1,1,1);gl.clear(gl.COLOR_BUFFER_BIT);gl.finish();await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));return true\"}"), "WebGL repaint", false);
+            const gl_deadline = nowMs() + 5000;
+            var gl_repaint = false;
+            while (!gl_repaint and nowMs() < gl_deadline) {
+                const tag = rig.next(100) orelse continue;
+                if (tag != .frame_end) continue;
+                _ = rig.damage.takeBounds();
+                rig.ack();
+                gl_repaint = std.mem.eql(u8, rig.pixels[(40 * rig.w + 500) * 4 ..][0..4], &.{ 255, 255, 0, 255 });
+            }
+            if (!gl_repaint) fail("WebGL repaint never reached binary stream CPU pixels");
+            say("smoke-mcp: REAL WebGL: exact 64x64 magenta screenshot/frame/stream, subsequent cyan stream repaint ok");
+        } else say("smoke-mcp: no WebGL context on this GPU-less host (as a real Chrome here): no WebGL colour in screenshot/frame/stream");
+    } else say("smoke-mcp: WebGL policy checks are Linux-only; existing stream journey still runs");
     if (fileExists(socket_path)) fail("stream token authentication did not unlink its single-use listener");
     const conflict = capSc(arena, m.callTool("web_stream", "{}"), "second stream conflict", true);
     if (!std.mem.eql(u8, conflict.get("error").?.object.get("code").?.string, "conflict")) fail("second stream was not refused as conflict");
@@ -4647,6 +4852,7 @@ fn webStreamStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const 
     streamEncodedStage(allocator, arena, &m, exe, rt, caps);
     streamScaleStage(allocator, arena, &m, path);
     streamFpsStage(allocator, arena, &m, exe, rt);
+    streamFocusPopupStage(allocator, arena, &m, rt);
 
     m.sendTool("web_open", "{\"url\":\"about:blank\",\"snapshot\":\"none\",\"width\":800,\"height\":600}");
     _ = capSc(arena, m.recvLine(60_000), "server teardown view", false);
@@ -5097,6 +5303,7 @@ fn webStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) vo
     webReviewStage(&m, rt);
     webHandStage(&m, rt);
     webStreamStage(allocator, exe, rt);
+    if (@import("builtin").os.tag == .linux) webglPolicyStage(allocator, exe, rt);
 
     // ── named profiles against REAL CEF ─────────────────────────────
     //
@@ -6094,7 +6301,7 @@ fn fakeWebengine(allocator: std.mem.Allocator, sock_path: []const u8) u8 {
         const f = c.fopen(out_path, "w");
         if (f) |fp| {
             defer _ = c.fclose(fp);
-            for ([_][*:0]const u8{ "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "XDG_SESSION_TYPE", "PULSE_SERVER", "LIBGL_ALWAYS_SOFTWARE", "SKETERM_WEB_OZONE", "SKETERM_WEB_GPU", "WAYLAND_SOCKET", "DISPLAY" }) |key| {
+            for ([_][*:0]const u8{ "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "XDG_SESSION_TYPE", "PULSE_SERVER", "SKETERM_WEB_FRAMES", "SKETERM_WEB_OZONE", "SKETERM_WEB_SOFTWARE_WEBGL", "WAYLAND_SOCKET", "DISPLAY" }) |key| {
                 const val = if (c.getenv(key)) |v| std.mem.span(@as([*:0]const u8, v)) else "";
                 var line: [4300]u8 = undefined;
                 const s = std.fmt.bufPrint(&line, "{s}={s}\n", .{ key, val }) catch continue;
@@ -6366,12 +6573,14 @@ fn webSessionFakeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []c
         if (wl.len == 0) fail("helper started without the session's WAYLAND_DISPLAY");
         if (std.mem.indexOf(u8, listing, wl) == null)
             fail("the helper's WAYLAND_DISPLAY is not the daemon-reported session display");
+        // CPU-readable frames are the launcher's whole ask; where WebGL
+        // renders is the helper's own policy, so no GPU knob is forced.
         if (std.mem.indexOf(u8, env, "SKETERM_WEB_OZONE=wayland\n") == null or
-            std.mem.indexOf(u8, env, "LIBGL_ALWAYS_SOFTWARE=1\n") == null or
-            std.mem.indexOf(u8, env, "SKETERM_WEB_GPU=0\n") == null or
+            std.mem.indexOf(u8, env, "SKETERM_WEB_FRAMES=cpu\n") == null or
+            std.mem.indexOf(u8, env, "SKETERM_WEB_SOFTWARE_WEBGL=\n") == null or
             std.mem.indexOf(u8, env, "WAYLAND_SOCKET=\n") == null or
             std.mem.indexOf(u8, env, "DISPLAY=\n") == null)
-            fail("session helper environment is missing the forced software-wayland recipe");
+            fail("session helper environment is missing the CPU-frame wayland recipe");
         m.closeStdinWait();
     }
 

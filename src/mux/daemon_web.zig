@@ -62,6 +62,9 @@ pub const WebOpReq = struct {
     /// (the store root is 0700); the daemon's own socket already scopes
     /// which clients can reach it at all.
     instance: []const u8 = "",
+    /// engine_open: the `web/ozone.zig` WebglPolicy a newly spawned
+    /// engine gets ("" = auto).
+    webgl: []const u8 = "",
     url: []const u8 = "",
     title: []const u8 = "",
     /// history_query search text ("" = overall top entries).

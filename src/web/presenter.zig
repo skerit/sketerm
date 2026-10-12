@@ -39,6 +39,7 @@ const xkblayout = @import("../ipc/xkblayout.zig");
 const clock = @import("../util/clock.zig");
 const platform = @import("../util/platform.zig");
 const scmrights = @import("../util/scmrights.zig");
+const keymap = @import("keymap.zig");
 
 /// The environment flag that arms the presenter. Set by webdrive for a
 /// session-mode helper; nothing else may set it.
@@ -135,50 +136,8 @@ pub fn protoButton(evdev: u32) ?u8 {
     };
 }
 
-/// Keysyms for the keys no character keymap names: editing, navigation,
-/// function and modifier keys, by evdev code.
-pub fn specialKeysym(code: u32) ?u32 {
-    return switch (code) {
-        1 => 0xff1b, // Escape
-        14 => 0xff08, // BackSpace
-        15 => 0xff09, // Tab
-        28 => 0xff0d, // Return
-        29 => 0xffe3, // Control_L
-        42 => 0xffe1, // Shift_L
-        54 => 0xffe2, // Shift_R
-        56 => 0xffe9, // Alt_L
-        58 => 0xffe5, // Caps_Lock
-        59...68 => 0xffbe + (code - 59), // F1..F10
-        69 => 0xff7f, // Num_Lock
-        70 => 0xff14, // Scroll_Lock
-        87 => 0xffc8, // F11
-        88 => 0xffc9, // F12
-        96 => 0xff8d, // KP_Enter
-        97 => 0xffe4, // Control_R
-        100 => 0xffea, // Alt_R
-        102 => 0xff50, // Home
-        103 => 0xff52, // Up
-        104 => 0xff55, // Prior
-        105 => 0xff51, // Left
-        106 => 0xff53, // Right
-        107 => 0xff57, // End
-        108 => 0xff54, // Down
-        109 => 0xff56, // Next
-        110 => 0xff63, // Insert
-        111 => 0xffff, // Delete
-        119 => 0xff13, // Pause
-        125 => 0xffeb, // Super_L
-        126 => 0xffec, // Super_R
-        else => null,
-    };
-}
-
-/// Codepoint -> keysym, the encoding `keymap.zig` decodes on the far
-/// side (Latin-1 is its own keysym, the rest is the Unicode keysym).
-pub fn keysymFromCodepoint(cp: u21) u32 {
-    if (cp >= 0x20 and cp <= 0xff) return cp;
-    return 0x01000000 | @as(u32, cp);
-}
+pub const specialKeysym = keymap.specialKeysym;
+pub const keysymFromCodepoint = keymap.keysymFromCodepoint;
 
 /// One key of the session keymap, by level.
 const KeyChars = struct { plain: u21 = 0, shift: u21 = 0, altgr: u21 = 0, shift_altgr: u21 = 0 };

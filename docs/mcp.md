@@ -798,7 +798,11 @@ tab is open;
 `audio` defaults to true. The result includes the common browser head facts
 (`backend:"headless"`, `view`, `pane`, `route`, `origin`, `url`, `title`,
 `loading`) plus `socket_path`, a single-use `token`, `protocol_version:1`,
-`max_unacked_frames:2`, `pixel_format:"bgra-premultiplied"` and `audio`.
+`max_unacked_frames:2`, `pixel_format:"bgra-premultiplied"`, `audio` and
+`popups`. `popups:true` (default false; capability `stream-popups`) makes
+every popup the view opens (a federated sign-in window, say) stream on a
+socket of its own, announced on this stream as a `POPUP` frame; the
+result's `popups` says whether the helper honours it.
 Only the token in structured content authorizes the connection; it is not
 repeated in the text lane. Treat it as a local credential.
 
@@ -806,12 +810,26 @@ repeated in the text lane. Treat it as a local credential.
 starts, then the current helper's negotiated `web-stream` capability.
 `web_stream_audio` is null before the handshake, then a runtime boolean
 from `stream-audio` (Opus available), not a promise that the page is audible.
-`web_software_webgl` is null before the current helper's handshake, then
-reports its `software-webgl` launch policy: ordinary Linux MCP helpers use
-ANGLE SwiftShader WebGL with software compositing and CPU-readable paints.
-It is false for GUI-backed or restricted helpers, and is not a guarantee
-that every page can allocate a WebGL context. GUI rendering and the
-untrusted helper's no-GPU/security policy are unchanged.
+`web_stream_popups` is null before the handshake, then the `stream-popups`
+capability.
+`web_webgl` is null before the current helper's handshake (and for an
+older helper or the GUI), then the WebGL mode the helper advertised it
+actually launched with: `hardware`, `software` or `off`;
+`web_software_webgl` stays the boolean form of `software`. MCP helpers
+ask for CPU-readable frames (`SKETERM_WEB_FRAMES=cpu`) and leave WebGL to
+the helper's one policy (`src/web/ozone.zig` `WebglPolicy`, config
+`[mcp] web_webgl`, docs/config.md): with the default `auto`, a host with a
+DRM render node gives pages the real GPU (`hardware`) while paints stay
+CPU-readable, and a GPU-less host ANGLE SwiftShader (`software`) so
+WebGL pages keep working. `hardware` keeps the GPU but never falls back
+to SwiftShader, which on a GPU-less host means no context at all, what a
+headful Chrome there does (measured 2026-10-12: WebGL1/WebGL2
+blocklisted); `off` never offers WebGL or WebGL2. `SKETERM_WEB_GPU=0` in
+the MCP server's environment vetoes the GPU (`off` unless the policy can
+use SwiftShader). A broker-owned helper that is already running keeps
+the policy it was started with; the fact says which. Neither fact
+guarantees that every page can allocate a context. GUI rendering and
+the untrusted helper's no-GPU/security policy are unchanged.
 The result's `audio` is true only when it was requested and the helper
 started the stream's Opus encoder. A GUI-owned
 browser refuses the tool; an older helper without `web-stream` also refuses
@@ -856,11 +874,12 @@ lengths, invalid UTF-8 and invalid values end the connection.
 | `4 FRAME_END` | helper -> peer | `serial:u64`, starting at 1 and increasing per completed frame |
 | `5 CURSOR` | helper -> peer | `visible:u8, kind:u8`; kind `0`: `name_len:u16, name:UTF-8`; kind `1`: `w:u32, h:u32, hot_x:i32, hot_y:i32, bgra:w*h*4` (premultiplied, like DAMAGE); hidden is visible `0`, kind `0`, empty name |
 | `6 AUDIO` | helper -> peer | `pts_us:u64` (CEF capture clock in microseconds; do not assume its epoch), `rate:u32, channels:u8, samples_per_channel:u16`, then raw Opus packet bytes (not Ogg); current format is 48 kHz, stereo, 960 samples (20 ms) |
+| `8 POPUP` | helper -> peer | Only on a stream opened with `popups`: `token:32 bytes, chromeless:u8, logical_w:u32, logical_h:u32, path_len:u16, path, url_len:u16, url` (url at most 8192 bytes, may be empty). A popup the view opened has its own raw stream at `path`; connect and AUTH with `token` exactly as for the first stream. It follows popups too, inherits the opener's audio choice, and ends when the popup closes. The MCP client sees an unsolicited `ev_stream_open` (`req` 0) and lists the popup in `web_tabs` |
 | `16 POINTER` | peer -> helper | `action:u8, x:i32, y:i32, button:u8, clicks:u8, mods:u32`; action `0` move, `1` down, `2` up, `3` leave; button `0` left, `1` middle, `2` right; clicks `1..3` |
 | `17 WHEEL` | peer -> helper | `x:i32, y:i32, dx:i32, dy:i32, mods:u32`; positive `dy` scrolls down |
-| `18 KEY` | peer -> helper | `action:u8, mods:u32, name_len:u16, name:UTF-8`; action `0` down, `1` up; name is a `webkeys.parseChord` key/chord, at most 64 bytes |
-| `19 TEXT` | peer -> helper | At most 4096 UTF-8 bytes inserted at the focused caret, no inner length field |
-| `20 FOCUS` | peer -> helper | `focused:u8`, `0` or `1` |
+| `18 KEY` | peer -> helper | `action:u8, mods:u32, name_len:u16, name:UTF-8`; action `0` down, `1` up; name is a `webkeys.parseChord` key/chord, at most 64 bytes. **Typing goes here**: one down and one up per key the viewer's user pressed (Shift included), which the page receives as `keydown`/`keypress`/`input`/`keyup` with the `key` and the US-keyboard `code` of that key |
+| `19 TEXT` | peer -> helper | At most 4096 UTF-8 bytes inserted at the focused caret, no inner length field. This is a PASTE (or an input method's committed text): per character the page sees a `keypress` with an empty `key` plus `beforeinput`/`input`, and no key going down or up (CEF's C API can neither fill the engine's clipboard for a real paste nor commit text outside a live composition). A viewer must not use it for typing |
+| `20 FOCUS` | peer -> helper | `focused:u8`, `0` or `1`. The view is focused when a peer authenticates (a window someone opened); send `0` when the viewer's window or tab loses focus. A press, a key down or TEXT while blurred refocuses it first, as clicking into a browser window does |
 | `21 RESIZE` | peer -> helper | `logical_w:u32, logical_h:u32`; width `320..3840`, height `240..2160` |
 | `22 ACK` | peer -> helper | `serial:u64`, cumulatively acknowledging that outstanding frame and every older one |
 

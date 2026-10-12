@@ -142,10 +142,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         } else if (std.mem.eql(u8, a, "--frames-inline")) {
             // Remote-helper mode: frames ride the socket in-band. The
             // GPU path would hand out dma-buf descriptors the bridge
-            // cannot carry, so force the software path BEFORE the
-            // ozone decision below reads the environment.
+            // cannot carry, so ask for CPU frames BEFORE the ozone
+            // decision below reads the environment.
             frames_inline = true;
-            _ = c.setenv("SKETERM_WEB_GPU", "0", 1);
+            _ = c.setenv("SKETERM_WEB_FRAMES", "cpu", 1);
         } else if (std.mem.eql(u8, a, "--cache-dir") and i + 1 < argv.len) {
             i += 1;
             cache_dir = copyArg(&cache_buf, std.mem.span(argv[i]));
@@ -484,13 +484,23 @@ fn buildCefArgv(argv: []const [*:0]const u8, disable_features: [:0]u8, routed: b
         if (std.mem.startsWith(u8, s, "--ozone-platform=")) explicit = s["--ozone-platform=".len..];
     }
     const override: ?[]const u8 = if (c.getenv("SKETERM_WEB_OZONE")) |o| std.mem.span(o) else null;
+    const cpu_frames = if (c.getenv("SKETERM_WEB_FRAMES")) |v| std.mem.eql(u8, std.mem.span(v), "cpu") else false;
+    const policy: ozone.WebglPolicy = if (c.getenv(ozone.WebglPolicy.ENV)) |v| ozone.WebglPolicy.parse(std.mem.span(v)) orelse {
+        // A misspelt policy must not quietly become one that shows pages
+        // a renderer the user asked to hide.
+        std.debug.print("sketerm-web: {s} must be auto, hardware or off\n", .{ozone.WebglPolicy.ENV});
+        c._exit(2);
+    } else .auto;
     const choice = blk: {
-        if (explicit != null) break :blk ozone.choose(explicit, null, gpuWanted(), false, false);
-        const forced_wayland = if (override) |o| std.mem.eql(u8, o, "wayland") else false;
         const g = gpuWanted();
+        if (explicit != null) break :blk ozone.choose(.{ .explicit = explicit, .gpu_wanted = g, .cpu_frames = cpu_frames, .webgl_policy = policy, .render_node = g and cpu_frames and ozone.renderNodePresent() });
+        const forced_wayland = if (override) |o| std.mem.eql(u8, o, "wayland") else false;
         const w = if (g or forced_wayland) waylandReachable() else false;
-        const r = if (g and w and !forced_wayland) renderNodePresent() else false;
-        break :blk ozone.choose(null, override, g, w, r);
+        // A CPU-frame helper needs the render node for its WebGL
+        // decision whatever the platform; the default chain only when
+        // it could pick wayland.
+        const r = g and (cpu_frames or (w and !forced_wayland)) and ozone.renderNodePresent();
+        break :blk ozone.choose(.{ .env_override = override, .gpu_wanted = g, .cpu_frames = cpu_frames, .webgl_policy = policy, .wayland_reachable = w, .render_node = r });
     };
     if (explicit == null) {
         const want: [*:0]const u8 = if (std.mem.eql(u8, choice.platform, "wayland"))
@@ -502,10 +512,20 @@ fn buildCefArgv(argv: []const [*:0]const u8, disable_features: [:0]u8, routed: b
             n += 1;
         }
     }
-    const software_webgl = !untrusted.enabled and if (c.getenv("SKETERM_WEB_SOFTWARE_WEBGL")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
-    cefhost.software_webgl = software_webgl;
-    if (software_webgl) {
-        // Keep WebGL's SwiftShader process, but deliver CPU OnPaint pixels.
+    // The untrusted helper keeps its own no-GPU policy whatever the
+    // launcher asked; a SwiftShader or GPU process there would need a
+    // separate security decision.
+    const webgl: ?ozone.Webgl = if (untrusted.enabled) null else choice.webgl;
+    cefhost.webgl = webgl;
+    // A shell in a sketerm pane exports LIBGL_ALWAYS_SOFTWARE=1 (pty.zig,
+    // for forwarded apps), and an MCP server started there hands it to
+    // this helper: the GPU process would then pick llvmpipe and pages
+    // would read a software renderer although a render node exists. The
+    // render-node decision is this helper's; `SKETERM_WEB_GPU=0` is the
+    // knob that vetoes it.
+    if (webgl == .hardware) _ = c.unsetenv("LIBGL_ALWAYS_SOFTWARE");
+    if (webgl == .software) {
+        // WebGL's SwiftShader process, but CPU OnPaint pixels.
         const switches = [_][*:0]const u8{ "--use-angle=swiftshader", "--enable-unsafe-swiftshader", "--disable-gpu-compositing" };
         if (n + switches.len > buf.len) c._exit(2);
         for (switches) |value| {
@@ -513,9 +533,17 @@ fn buildCefArgv(argv: []const [*:0]const u8, disable_features: [:0]u8, routed: b
             n += 1;
         }
     }
-    if (choice.disable_gpu and !software_webgl and n < buf.len) {
+    if (choice.disable_gpu and !untrusted.enabled and n < buf.len) {
         buf[n] = @ptrCast(@constCast("--disable-gpu"));
         n += 1;
+    }
+    if (choice.disable_webgl and !untrusted.enabled) {
+        const switches = [_][*:0]const u8{ "--disable-webgl", "--disable-webgl2" };
+        if (n + switches.len > buf.len) c._exit(2);
+        for (switches) |value| {
+            buf[n] = @ptrCast(@constCast(value));
+            n += 1;
+        }
     }
     // Subpixel (LCD) text AA. MEASURED on the software (headless-ozone)
     // path: no effect — glyph pixels stay 100% neutral gray with the
@@ -530,8 +558,7 @@ fn buildCefArgv(argv: []const [*:0]const u8, disable_features: [:0]u8, routed: b
         buf[n] = @ptrCast(@constCast("--enable-lcd-text"));
         n += 1;
     }
-    // WebGL can use a SwiftShader process without enabling shared OSR textures.
-    cefhost.setAccelerated(choice.accelerated and !software_webgl);
+    cefhost.setAccelerated(choice.accelerated);
     cefhost.setScaleLever(choice.scale_lever);
     return buf[0..n];
 }
@@ -575,23 +602,6 @@ fn waylandReachable() bool {
     if (fd < 0) return false;
     defer _ = c.close(fd);
     return c.connect(fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un)) == 0;
-}
-
-/// Whether any DRM render node can be opened. Without one the GPU
-/// process starts and dies, which costs a second of startup and lands
-/// in software anyway.
-fn renderNodePresent() bool {
-    var i: u8 = 0;
-    while (i < 8) : (i += 1) {
-        var path: [64]u8 = undefined;
-        const p = std.fmt.bufPrintZ(&path, "/dev/dri/renderD{d}", .{128 + @as(u16, i)}) catch return false;
-        const fd = c.open(p.ptr, c.O_RDWR | c.O_CLOEXEC);
-        if (fd >= 0) {
-            _ = c.close(fd);
-            return true;
-        }
-    }
-    return false;
 }
 
 /// $XDG_STATE_HOME/sketerm/web-cache, else ~/.local/state/... — the

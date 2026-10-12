@@ -41,26 +41,34 @@ fn streamOf(self: *Host, view: u32) ?*srv.Stream {
 
 /// Open `view`'s stream for the dispatching connection. The view id is
 /// already engine-global; ownership was checked by `find`. `encode` (the
-/// client's view id and codec list) makes it an encoded stream.
-pub fn streamOpen(self: *Host, view: u32, want_audio: bool, encode: ?Encoded) OpenResult {
+/// client's view id and codec list) makes it an encoded stream;
+/// `follow_popups` gives every popup the view opens a stream of its own.
+pub fn streamOpen(self: *Host, view: u32, want_audio: bool, encode: ?Encoded, follow_popups: bool) OpenResult {
     const v = self.find(view) orelse return .{ .err = "no such view" };
     if (v.webext_bg or v.webext_popup or v.windowed) return .{ .err = "this view has no page to stream" };
     // GPU frames never enter this process's memory, so there is nothing
     // to cut damage bands from.
     if (host_mod.isAccelerated()) return .{ .err = "this helper renders on the GPU; streams need CPU frames" };
     if (streamOf(self, v.id) != null) return .{ .err = "this view already has a stream" };
-    var live: usize = 0;
-    for (self.streams.items) |s| {
-        if (s.closed == null) live += 1;
-    }
-    if (live >= srv.MAX_STREAMS) return .{ .err = "too many open streams" };
     const enc: ?srv.Encode = if (encode) |e| .{
         .wire_view = e.wire_view,
         .codecs = e.codecs,
         .encodable = vcodec.encodableHere(),
         .open = surfenc.openNegotiated,
     } else null;
-    const s = srv.Stream.open(self.gpa, self.stream_dir, v.id, self.dispatch_conn, want_audio, enc, clock.nowMs()) catch |err|
+    const res = openFor(self, v, self.dispatch_conn, want_audio, enc);
+    if (res == .ok) res.ok.follow_popups = follow_popups;
+    return res;
+}
+
+/// Bind a stream for `v` on behalf of connection `owner` and track it.
+fn openFor(self: *Host, v: *const View, owner: u32, want_audio: bool, enc: ?srv.Encode) OpenResult {
+    var live: usize = 0;
+    for (self.streams.items) |s| {
+        if (s.closed == null) live += 1;
+    }
+    if (live >= srv.MAX_STREAMS) return .{ .err = "too many open streams" };
+    const s = srv.Stream.open(self.gpa, self.stream_dir, v.id, owner, want_audio, enc, clock.nowMs()) catch |err|
         return .{ .err = switch (err) {
             error.NoDirectory => "this helper has no socket directory to put a stream in",
             error.PathTooLong => "the stream socket path is too long",
@@ -78,6 +86,41 @@ pub fn streamOpen(self: *Host, view: u32, want_audio: bool, encode: ?Encoded) Op
         if (v.cef_id != 0 and srv.audio.capturing(v.cef_id)) srv.audio.bind(slot, v.cef_id);
     }
     return .{ .ok = s };
+}
+
+/// A popup `popup` was just adopted: when its opener's stream asked to
+/// follow popups, open a raw stream for it under the same owner, tell
+/// the owner (`ev_stream_open`, `req` 0) and the opener's peer (a POPUP
+/// frame with the socket and token), so a viewer sees the sign-in window
+/// a real browser would have put in front of it. The popup follows
+/// popups of its own too.
+pub fn streamFollowPopup(self: *Host, popup: *const View) void {
+    const opener = streamOf(self, popup.opener_view) orelse return;
+    if (!opener.follow_popups or streamOf(self, popup.id) != null) return;
+    const s = switch (openFor(self, popup, opener.owner, opener.audio_slot != null, null)) {
+        .ok => |s| s,
+        .err => |why| return host_mod.logLine("popup view {d}: no stream for its opener's peer ({s})", .{ popup.id, why }),
+    };
+    s.follow_popups = true;
+    opener.announcePopup(.{
+        .token = s.token,
+        .chromeless = popup.popup_chromeless,
+        .logical_w = popup.w,
+        .logical_h = popup.h,
+        .path = s.path(),
+        .url = popup.url,
+    }) catch {
+        s.shut("out of memory announcing the popup");
+        return;
+    };
+    self.post(proto.EvStreamOpen{
+        .view = popup.id,
+        .req = 0,
+        .path = s.path(),
+        .token = &s.token,
+        .err = "",
+        .audio = @intFromBool(s.encoder != null),
+    });
 }
 
 /// `stream_close` from the client.
@@ -127,9 +170,42 @@ pub fn streamPump(self: *Host) void {
     // reap is deferred to after the loop so no stream is freed while it
     // is being serviced.
     self.stream_busy = true;
-    for (self.streams.items) |s| s.service(source(self), now);
+    for (self.streams.items) |s| {
+        s.service(source(self), now);
+        // An authenticated peer is a window shown to someone: like a
+        // browser window that just opened, it has focus until the peer
+        // reports a blur.
+        if (s.authed and s.closed == null and s.focused == null and awake(self, s.view)) focusStream(self, s, true);
+    }
     self.stream_busy = false;
     streamReap(self);
+}
+
+/// Tell the engine the stream's view gained or lost focus, as the
+/// stream's owner.
+fn focusStream(self: *Host, s: *srv.Stream, on: bool) void {
+    s.focused = on;
+    if (!on) releaseHeld(self, s);
+    // A blur is let-go too: never a revival.
+    if (!on and !awake(self, s.view)) return;
+    const prev = self.dispatch_conn;
+    self.dispatch_conn = s.owner;
+    defer self.dispatch_conn = prev;
+    self.focus(.{ .view = s.view, .focused = @intFromBool(on) });
+}
+
+/// Input only a focused window receives (a press, a key, text) refocuses
+/// a blurred view first, as clicking or typing into a real browser
+/// window focuses it. Moves, wheels and releases do not.
+fn focusForInput(self: *Host, s: *srv.Stream, in: st.Input) void {
+    if (s.focused == true) return;
+    const takes = switch (in) {
+        .pointer => |p| p.action == .down,
+        .key => |k| k.action == .down,
+        .text => |txt| txt.len != 0,
+        else => false,
+    };
+    if (takes) focusStream(self, s, true);
 }
 
 /// Free ended streams: release what their client still held, announce
@@ -435,6 +511,7 @@ fn input(ctx: *anyopaque, s: *srv.Stream, in: st.Input) void {
     const prev = self.dispatch_conn;
     self.dispatch_conn = s.owner;
     defer self.dispatch_conn = prev;
+    focusForInput(self, s, in);
     switch (in) {
         .pointer => |p| {
             // The engine's button flags come from what the stream holds,
@@ -490,14 +567,7 @@ fn input(ctx: *anyopaque, s: *srv.Stream, in: st.Input) void {
             });
         },
         .text => |txt| if (txt.len != 0) self.paste(.{ .view = s.view, .text = .{ .s = txt } }),
-        .focus => |on| {
-            if (!on) {
-                releaseHeld(self, s);
-                // A blur is let-go too: never a revival.
-                if (!st.mayWake(in) and !awake(self, s.view)) return;
-            }
-            self.focus(.{ .view = s.view, .focused = @intFromBool(on) });
-        },
+        .focus => |on| focusStream(self, s, on),
         .resize => |sz| {
             const v = self.findAny(s.view) orelse return;
             self.resizeView(.{ .view = s.view, .w = @intCast(sz.w), .h = @intCast(sz.h), .scale_x1000 = v.scale_x1000 }) catch {};

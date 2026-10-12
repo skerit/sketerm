@@ -899,9 +899,12 @@ pub const Server = struct {
                 }
                 if (cefhost.untrusted.enabled and !withheld(.untrusted_web)) caps.add(.untrusted_web);
                 if (cefhost.isAccelerated()) caps.add(.frames_dmabuf);
-                if (cefhost.software_webgl) caps.add(.software_webgl);
+                if (cefhost.webgl == .software) caps.add(.software_webgl);
+                if (cefhost.webgl == .hardware) caps.add(.webgl_gpu);
+                if (cefhost.webgl == .off) caps.add(.webgl_off);
                 if (self.host.presenterActive()) caps.add(.presenter);
                 if (!withheld(.web_stream) and !withheld(.stream_audio) and streamsrv.audioAvailable()) caps.add(.stream_audio);
+                if (!withheld(.web_stream) and !withheld(.stream_popups)) caps.add(.stream_popups);
                 if (!withheld(.web_stream) and !withheld(.stream_encoded)) caps.add(.stream_encoded);
                 try cn.out.post(proto.HelloAck{
                     .proto = proto.PROTO_VERSION,
@@ -1070,7 +1073,7 @@ pub const Server = struct {
                     null;
                 if (withheld(.web_stream)) {
                     try cn.out.post(proto.EvStreamOpen{ .view = raw.view, .req = raw.req, .path = "", .token = "", .err = "this helper does not stream" }, null);
-                } else switch (self.host.streamOpen(req.view, req.audio != 0, encode)) {
+                } else switch (self.host.streamOpen(req.view, req.audio != 0, encode, raw.popups != 0 and !withheld(.stream_popups))) {
                     .ok => |st| try cn.out.post(proto.EvStreamOpen{
                         .view = raw.view,
                         .req = raw.req,

@@ -211,6 +211,15 @@ pub const Stream = struct {
     /// on every change; the pixels live in the view's `CursorCache`).
     cursor_pending: bool = true,
     held: st.Held = .{},
+    /// What this stream last told the engine about the view's focus;
+    /// null until it said anything (the glue focuses at AUTH).
+    focused: ?bool = null,
+    /// Opened with `popups`: the view's popups get streams of their own,
+    /// announced here.
+    follow_popups: bool = false,
+    /// Encoded POPUP frames not yet in the transmit buffer: they wait for
+    /// AUTH and for room, and are never dropped.
+    popup_out: std.ArrayList(u8) = .empty,
     audio_slot: ?usize = null,
     /// Set only while audio is actually encoded: what the open reports.
     encoder: ?opus.Encoder = null,
@@ -310,6 +319,7 @@ pub const Stream = struct {
         }
         self.enc_out.deinit();
         self.composed.deinit(self.gpa);
+        self.popup_out.deinit(self.gpa);
         self.gpa.destroy(self);
     }
 
@@ -373,6 +383,12 @@ pub const Stream = struct {
     /// The view's cursor changed; the newest one is what the client gets.
     pub fn markCursor(self: *Stream) void {
         self.cursor_pending = true;
+    }
+
+    /// Queue a POPUP announcement; it goes out after AUTH, in order.
+    pub fn announcePopup(self: *Stream, p: st.Popup) error{OutOfMemory}!void {
+        const dst = try self.popup_out.addManyAsSlice(self.gpa, st.popupLen(p));
+        st.encodePopup(dst, p);
     }
 
     /// One poll turn: accept, read and dispatch input, cut and write
@@ -555,6 +571,12 @@ pub const Stream = struct {
             if (self.reserve(st.cursorLen(cur))) |dst| {
                 st.encodeCursor(dst, cur);
                 self.cursor_pending = false;
+            }
+        }
+        if (self.popup_out.items.len != 0) {
+            if (self.reserve(self.popup_out.items.len)) |dst| {
+                @memcpy(dst, self.popup_out.items);
+                self.popup_out.clearRetainingCapacity();
             }
         }
         self.produceAudio();
@@ -804,6 +826,40 @@ const Reader = struct {
         return raw;
     }
 };
+
+test "stream: a popup announced before AUTH waits for it and then goes out once" {
+    var dbuf: [64]u8 = undefined;
+    const dir = try tmpDir(&dbuf);
+    defer _ = c.rmdir(@ptrCast(dir.ptr));
+    var fake: Fake = .{};
+    defer fake.inputs.deinit(t.allocator);
+    defer fake.texts.deinit(t.allocator);
+    const s = try Stream.open(t.allocator, dir, 5, 1, false, null, 0);
+    defer s.deinit();
+    s.follow_popups = true;
+    const popup_token = st.mintToken(@splat(3));
+    try s.announcePopup(.{ .token = popup_token, .chromeless = false, .logical_w = 400, .logical_h = 300, .path = "/tmp/x/ws-p.sock", .url = "https://idp.example/" });
+    const token = s.token;
+    const fd = try connectTo(s.path());
+    defer _ = c.close(fd);
+    s.service(fake.source(), 1);
+    var rd: Reader = .{};
+    defer rd.buf.deinit(t.allocator);
+    rd.pull(fd);
+    try t.expect(rd.next() == null);
+    try sendFrame(fd, .auth, &token);
+    s.service(fake.source(), 2);
+    s.service(fake.source(), 3);
+    rd.pull(fd);
+    var popups: usize = 0;
+    while (rd.next()) |raw| {
+        if (raw.tag != @intFromEnum(st.Tag.popup)) continue;
+        popups += 1;
+        try t.expectEqualSlices(u8, &popup_token, raw.body[0..st.TOKEN_LEN]);
+    }
+    try t.expectEqual(@as(usize, 1), popups);
+    try t.expectEqual(@as(usize, 0), s.popup_out.items.len);
+}
 
 test "stream: auth, first full frame, two-frame window, held release, bad token" {
     var dbuf: [64]u8 = undefined;

@@ -77,6 +77,9 @@ pub const Tag = enum(u8) {
     audio = 6,
     /// Encoded streams only: a `protocol.FrameEncoded` payload.
     encoded = 7,
+    /// Streams opened with `popups` only: a popup of this view, with its
+    /// own stream socket and token (`encodePopup`).
+    popup = 8,
     pointer = 16,
     wheel = 17,
     key = 18,
@@ -347,6 +350,56 @@ pub fn encodeAudio(dst: []u8, pts_us: u64, rate: u32, channels: u8, samples: u16
     dst[17] = channels;
     std.mem.writeInt(u16, dst[18..20], samples, .little);
     @memcpy(dst[20..][0..opus.len], opus);
+}
+
+/// A popup the view opened: where its own stream listens and the token
+/// that opens it, whether the page asked for a popup-shaped window, its
+/// logical size, and its url (possibly empty).
+pub const Popup = struct { token: [TOKEN_LEN]u8, chromeless: bool, logical_w: u32, logical_h: u32, path: []const u8, url: []const u8 };
+
+/// The url is cut to this much: an announcement, not a page.
+pub const MAX_POPUP_URL = 8192;
+
+pub fn popupLen(p: Popup) usize {
+    return HEADER + TOKEN_LEN + 1 + 8 + 2 + p.path.len + 2 + @min(p.url.len, MAX_POPUP_URL);
+}
+
+/// `token[32], chromeless:u8, logical_w:u32, logical_h:u32,
+/// path_len:u16, path, url_len:u16, url`.
+pub fn encodePopup(dst: []u8, p: Popup) void {
+    const url = p.url[0..@min(p.url.len, MAX_POPUP_URL)];
+    putHeader(dst, .popup, popupLen(p) - HEADER);
+    var off: usize = HEADER;
+    @memcpy(dst[off..][0..TOKEN_LEN], &p.token);
+    off += TOKEN_LEN;
+    dst[off] = @intFromBool(p.chromeless);
+    off += 1;
+    put32(dst, off, p.logical_w);
+    put32(dst, off + 4, p.logical_h);
+    off += 8;
+    std.mem.writeInt(u16, dst[off..][0..2], @intCast(p.path.len), .little);
+    @memcpy(dst[off + 2 ..][0..p.path.len], p.path);
+    off += 2 + p.path.len;
+    std.mem.writeInt(u16, dst[off..][0..2], @intCast(url.len), .little);
+    @memcpy(dst[off + 2 ..][0..url.len], url);
+}
+
+test "a popup announcement carries its socket, token, shape and url" {
+    const tk = mintToken(@splat(7));
+    const p = Popup{ .token = tk, .chromeless = true, .logical_w = 500, .logical_h = 600, .path = "/run/x/ws-1.sock", .url = "https://accounts.example/o" };
+    var buf: [256]u8 = undefined;
+    const n = popupLen(p);
+    encodePopup(buf[0..n], p);
+    const raw = (try split(buf[0..n])).?;
+    try std.testing.expectEqual(@as(u8, @intFromEnum(Tag.popup)), raw.tag);
+    try std.testing.expectEqualSlices(u8, &tk, raw.body[0..TOKEN_LEN]);
+    try std.testing.expectEqual(@as(u8, 1), raw.body[TOKEN_LEN]);
+    try std.testing.expectEqual(@as(u32, 600), std.mem.readInt(u32, raw.body[TOKEN_LEN + 5 ..][0..4], .little));
+    const plen = std.mem.readInt(u16, raw.body[TOKEN_LEN + 9 ..][0..2], .little);
+    try std.testing.expectEqualStrings(p.path, raw.body[TOKEN_LEN + 11 ..][0..plen]);
+    try std.testing.expectEqualStrings(p.url, raw.body[TOKEN_LEN + 13 + plen ..]);
+    // A helper-to-peer tag arriving from the peer is unknown, as V1 is strict.
+    try std.testing.expectError(error.UnknownTag, decode(@intFromEnum(Tag.popup), raw.body));
 }
 
 // -- damage bands and frame flow ------------------------------------------
