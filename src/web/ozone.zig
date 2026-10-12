@@ -44,6 +44,8 @@ pub const Choice = struct {
     disable_gpu: bool = false,
     /// Append `--disable-webgl --disable-webgl2`: no context of either.
     disable_webgl: bool = false,
+    /// Append `MOUSE_POINTER_SWITCH`: the input really is a mouse.
+    mouse_pointer: bool = false,
     /// What cefhost.setAccelerated is handed: dma-buf frames.
     accelerated: bool = false,
     /// What cefhost.setScaleLever is handed; follows `platform`.
@@ -87,6 +89,17 @@ pub const WebglPolicy = enum {
     }
 };
 
+/// A CPU-frame helper's input is mouse input (stream POINTER frames, MCP
+/// clicks, presenter seat events), so pages are told so: a fine primary
+/// pointer that hovers. Without it the engine derives the answer from the
+/// HOST's input devices, and a container or a headless box has none, so
+/// `(pointer: fine)` and `(hover: hover)` read false although a mouse
+/// drives the page. Values are Blink's `PointerType`/`HoverType` bits
+/// (fine = 4, coarse = 2; hover = 2, none = 1); measured 2026-10-12 on
+/// CEF 151: `primaryPointerType=2` flips `(pointer: coarse)` on, so the
+/// engine honours the switch.
+pub const MOUSE_POINTER_SWITCH = "--blink-settings=primaryPointerType=4,availablePointerTypes=4,primaryHoverType=2,availableHoverTypes=2";
+
 pub const Inputs = struct {
     /// An `--ozone-platform=` value already on argv (wins, passed
     /// through untouched — the smoke rig pins modes this way).
@@ -121,6 +134,7 @@ pub fn choose(in: Inputs) Choice {
         // a device to run on.
         out.disable_gpu = !gpu and webgl != .software;
         out.disable_webgl = webgl == .off;
+        out.mouse_pointer = true;
     }
     return out;
 }
@@ -249,7 +263,7 @@ test "WebGL policy x render node decides the switches" {
     // The GUI's launch (no FRAMES) is not touched by any policy.
     var gui = args(null, null, true, true, true);
     gui.webgl_policy = .off;
-    try t.expect(choose(gui).webgl == null and !choose(gui).disable_webgl);
+    try t.expect(choose(gui).webgl == null and !choose(gui).disable_webgl and !choose(gui).mouse_pointer);
     try t.expectEqual(WebglPolicy.hardware, WebglPolicy.parse("hardware").?);
     try t.expect(WebglPolicy.parse("software") == null);
 }

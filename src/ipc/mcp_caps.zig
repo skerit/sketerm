@@ -231,6 +231,10 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
         try res.textf("web_gui: the web_* tools may use the user's OWN browser and logins (granted via {s}); transport now {s}{s} -- a GUI is found or `sketerm web` started lazily at the first web call, found again if it goes away, and a web call with no reachable GUI fails 'unavailable' rather than opening a private headless view. Terminal/app/file/panel tools stay on the private daemon", .{ via, webGuiTransport().name(), sock_note });
     } else try res.textf("web_gui: not granted -- the web_* tools use a private browser with its own cookie jar (the assistant is logged in nowhere); the user grants their own browser with {s}, {s}=1 or web_gui = true in config.conf's [mcp] section", .{ mcp_webgui.FLAG, mcp_webgui.ENV });
     if (@import("mcp_web.zig").sessionInfo()) |ws| try res.fact("web_session", ws);
+    const display = @import("mcp_web.zig").displayMode();
+    try res.fact("web_display", if (display) |d| @tagName(d) else null);
+    if (display == .headless_fallback)
+        try res.text("web_display: the browser helper failed to start on its virtual display and runs PLAIN HEADLESS instead (no watch-along pixels or page audio for a viewer; pages see no display server)");
     // Watch-along: the private daemon socket and whether the web session
     // shows pixels. Both are facts a human needs to find the assistant's
     // browser from their own GUI; the text lane says where to look.

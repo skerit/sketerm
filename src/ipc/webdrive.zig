@@ -1544,6 +1544,19 @@ pub const Engine = struct {
         if (self.store) |*s| s.touch(name, clock.nowMs());
     }
 
+    /// Where the running helper draws: on the instance's virtual display
+    /// (a mux web session), plain headless by configuration (no instance
+    /// daemon, `SKETERM_WEB_SESSION=0`, a broker-owned helper), or plain
+    /// headless because session mode FAILED and this engine fell back.
+    pub const Display = enum { session, headless, headless_fallback };
+
+    /// Null until a helper serves.
+    pub fn displayKind(self: *const Engine) ?Display {
+        if (self.state != .ready) return null;
+        if (self.session != null) return .session;
+        return if (self.session_blocked) .headless_fallback else .headless;
+    }
+
     /// Name of the live watchable Wayland session the helper was
     /// started against; null in plain headless mode.
     pub fn sessionName(self: *const Engine) ?[]const u8 {

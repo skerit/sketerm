@@ -537,6 +537,10 @@ fn buildCefArgv(argv: []const [*:0]const u8, disable_features: [:0]u8, routed: b
         buf[n] = @ptrCast(@constCast("--disable-gpu"));
         n += 1;
     }
+    if (choice.mouse_pointer and !untrusted.enabled and n < buf.len) {
+        buf[n] = @ptrCast(@constCast(ozone.MOUSE_POINTER_SWITCH));
+        n += 1;
+    }
     if (choice.disable_webgl and !untrusted.enabled) {
         const switches = [_][*:0]const u8{ "--disable-webgl", "--disable-webgl2" };
         if (n + switches.len > buf.len) c._exit(2);

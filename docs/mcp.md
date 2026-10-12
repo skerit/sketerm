@@ -777,7 +777,13 @@ delivery. New views default to 60 FPS; `[mcp] web_max_fps = 30` changes that
 default, and a selected `[mcp.<name>]` section can override it. Explicit
 `web_open.max_fps` wins over config. Omitting `web_stream.max_fps` preserves
 the view's cap; a stream override persists after close. Successful opens
-and stream offers report the known `max_fps`.
+and stream offers report the known `max_fps`. **`max_fps` is page-visible**:
+CEF's windowless frame rate drives the page's BeginFrames, so
+`requestAnimationFrame` runs at the cap (12 measures as ~83 ms intervals),
+which no real display does. Keep the default 60 for pages that may
+fingerprint the display; a slow viewer is already handled without it,
+because the stream sends at most two unacknowledged frames and merges
+the rest into the newest one.
 
 `capabilities.web_max_fps` reports headless adapter support before startup,
 then the current helper's `view-max-fps` capability.

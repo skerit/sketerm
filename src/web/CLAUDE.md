@@ -179,6 +179,14 @@ launch, not a guarantee that a page can allocate a context; a helper
 without any of them predates them. `screen.colorDepth` is 24
 (`onGetScreenInfo`), what Chromium reports on every Linux display.
 
+A CPU-frame helper's input IS a mouse, so it says so:
+`ozone.MOUSE_POINTER_SWITCH` (`--blink-settings=primaryPointerType=4,...`)
+gives pages `(pointer: fine)` and `(hover: hover)` whatever input devices
+the host has (a container has none, and Chromium then reported `none`
+for both). CEF 151 honours the switch (measured: a coarse value flips
+`(pointer: coarse)` on). `max_fps` is page-visible: the windowless frame
+rate drives BeginFrame and so `requestAnimationFrame`.
+
 ## Pacing: the engine paces itself
 
 CEF's internal scheduler owns painting; the cap travels as

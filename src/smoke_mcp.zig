@@ -4009,6 +4009,19 @@ fn streamFocusPopupStage(allocator: std.mem.Allocator, arena: std.mem.Allocator,
     rig.pointer(.up, 400, 300, 0);
     waitTitle(m, &rig, "focus-true");
     say("smoke-mcp: streamed view focused at AUTH, blurred by the peer, refocused by a press");
+    // Mouse input drives the page, so it must say so whatever input
+    // devices the host has (a container has none).
+    const media = capSc(arena, m.callTool("web_eval", "{\"body\":\"const q=s=>matchMedia(s).matches;return [q('(pointer: fine)'),q('(hover: hover)'),q('(any-pointer: fine)'),q('(any-hover: hover)')].join(',')\"}"), "pointer media", false);
+    const media_s = media.get("value").?.object.get("value").?.string;
+    if (!std.mem.eql(u8, media_s, "true,true,true,true")) {
+        std.debug.print("smoke-mcp: pointer/hover media {s}\n", .{media_s});
+        fail("a mouse-driven headless view does not report a fine pointer that hovers");
+    }
+    const display_caps = capSc(arena, m.callTool("capabilities", "{}"), "web_display fact", false);
+    const shown = display_caps.get("web_display").?;
+    if (shown != .string or std.meta.stringToEnum(@import("ipc/webdrive.zig").Engine.Display, shown.string) == null)
+        fail("web_display does not name the running helper's display");
+    std.debug.print("smoke-mcp: web_display {s}; pointer fine + hover\n", .{shown.string});
 
     rig.key(.down, "a", 0);
     rig.key(.up, "a", 0);

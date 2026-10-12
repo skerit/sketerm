@@ -470,6 +470,13 @@ pub fn fileFacts(res: *mcp.Res, path: []const u8) !void {
 
 /// Name of the live watchable web session, when the headless engine is
 /// running as a mux session's Wayland client; null otherwise.
+/// The current headless helper's display (`webdrive.Engine.Display`).
+pub fn displayMode() ?webdrive.Engine.Display {
+    if (guiDrivesWeb() or g_headless_alloc == null) return null;
+    const e = currentEngine() orelse return null;
+    return e.displayKind();
+}
+
 pub fn sessionInfo() ?[]const u8 {
     for (g_engines.items) |re| {
         if (re.engine.sessionName()) |n| return n;
