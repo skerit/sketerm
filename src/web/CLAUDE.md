@@ -1079,21 +1079,39 @@ to the page with a NORMALISED value, classify it in `TABLE` (a non-
 Unset `HTTPS_PROXY`/`SSL_CERT_FILE` first (the proxy note above).
 
 Measured 2026-10-12 (CEF 151 helper vs Chromium 152, this GPU-less host),
-identical in both configs. The five `must_match` failures, which keep the
-full smoke-mcp red until they are fixed (the product was not changed):
+identical in both configs. The `must_match` failures still open, which keep
+the full smoke-mcp red until they are fixed:
 
 - `geo.screen_is_viewport` / `geo.outer_exceeds_inner`: `screen` is the
   1280x800 MCP view and `outer*` equals `inner*`; Chromium reports the 1920x1080
-  output and a window 32x129 px larger than its viewport (the geometry
-  package follows).
+  output and a window 32x129 px larger than its viewport. GUI views now
+  report real geometry (`view_screen`, below); the headless MCP lane is
+  waiting on the architecture decision and still says view == screen.
 - `kbd.layout_map`: `navigator.keyboard.getLayoutMap()` is empty (48
-  entries in Chromium, from the Wayland keymap).
-- `win.features`: no `window.EyeDropper` (Chromium has it).
-- `ctx.hdr_order_worker`: a dedicated Worker's script request sends
-  `User-Agent` right after `Accept`; Chromium sends it after `Referer`.
-  Documents, iframes, classic scripts and `fetch` match exactly. NOT
-  established whether it is the 151/152 skew or CEF's request proxy (every
-  request gets our `resource_request_handler`).
+  entries in Chromium, from the Wayland keymap). See "Keyboard layout map
+  and EyeDropper" below.
+- `win.features`: no `window.EyeDropper` (Chromium has it). Same section.
+
+Fixed: `ctx.hdr_order_worker` (2026-10-12). A dedicated Worker's script
+request sent `User-Agent` right after `Accept`; Chromium sends it after
+`Referer`. Not the 151/152 skew and not our handler: CEF's request proxy
+(`InterceptedRequestHandlerWrapper::OnBeforeRequest`,
+`libcef/browser/net_service/resource_request_handler_wrapper.cc`) does
+`SetHeaderIfMissing(User-Agent)` on EVERY proxied request BEFORE asking
+the client for a handler, and only takes back the `Accept-Language` it
+inserts the same way. Blink sets its own `User-Agent` on documents,
+iframes, scripts and `fetch` (so the insert is a no-op there); a worker's
+script is fetched browser-side with none. Measured: our handler returning
+null for every request left the worker's order as it was AND moved
+`Accept-Language` up on every kind (CEF only removes its insertion on the
+handler path), so the handler is not the cause. `onBeforeResourceLoad`
+now drops the inserted `User-Agent` for `RT_WORKER`
+(`intercept.userAgentInsertedByCef`), and the network stack adds the same
+value at Chromium's position (`ctx.hdr_ua` checks the value). Shared and
+service worker scripts are fetched the same way but are NOT measured, so
+they are not in the list. Changing a request's header map makes CEF
+regenerate it in its sorted map order, which is why this is limited to
+requests whose map holds only `Accept` plus CEF's own insertions.
 
 Reported, not gated: `gfx.webgl*` (SwiftShader under `auto`, none under
 `hardware` exactly as Chromium), `media.codecs_proprietary` (no H.264/AAC

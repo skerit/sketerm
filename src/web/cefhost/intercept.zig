@@ -2290,6 +2290,57 @@ fn denyRequest(cef_id: c_int, reason: proto.NetReason, req_id: u64, rtype: filte
     logRequest(s, req_id, now, rtype, reason, method, url);
 }
 
+/// The resource types whose request Blink hands over WITHOUT a
+/// `User-Agent`, which CEF's proxy (`InterceptedRequestHandlerWrapper::
+/// OnBeforeRequest`, `SetHeaderIfMissing(kUserAgent)`) then inserts in the
+/// middle of the header block. Measured for a dedicated worker's script
+/// (smoke-mcp's headful audit, `ctx.hdr_order_worker`); every other kind
+/// the audit sends already carries Blink's own and must not be touched.
+pub fn userAgentInsertedByCef(rtype: cef.cef_resource_type_t) bool {
+    return rtype == cef.RT_WORKER;
+}
+
+test "only a dedicated worker's script has its CEF-inserted User-Agent taken back" {
+    try std.testing.expect(userAgentInsertedByCef(cef.RT_WORKER));
+    for ([_]cef.cef_resource_type_t{ cef.RT_MAIN_FRAME, cef.RT_SUB_FRAME, cef.RT_SCRIPT, cef.RT_XHR, cef.RT_SUB_RESOURCE }) |rt|
+        try std.testing.expect(!userAgentInsertedByCef(rt));
+}
+
+/// IO THREAD. Take back the `User-Agent` CEF inserted, so the network
+/// stack adds the same value where Chromium sends it (after `Referer`,
+/// `URLRequestHttpJob::AddExtraHeaders`). CEF does exactly this for the
+/// `Accept-Language` it inserts; it never does it for this one. Changing
+/// the header map regenerates it in CEF's map order, which for these
+/// requests (only `Accept` plus what CEF itself added) keeps the order.
+fn undoCefUserAgent(req: *cef.cef_request_t) void {
+    const grt = req.get_resource_type orelse return;
+    if (!userAgentInsertedByCef(grt(req))) return;
+    const get = req.get_header_map orelse return;
+    const set = req.set_header_map orelse return;
+    const all = cef.cef_string_multimap_alloc() orelse return;
+    defer cef.cef_string_multimap_free(all);
+    const keep = cef.cef_string_multimap_alloc() orelse return;
+    defer cef.cef_string_multimap_free(keep);
+    get(req, all);
+    var dropped = false;
+    var i: usize = 0;
+    while (i < cef.cef_string_multimap_size(all)) : (i += 1) {
+        var key = std.mem.zeroes(cef.cef_string_t);
+        var val = std.mem.zeroes(cef.cef_string_t);
+        defer cef.cef_string_utf16_clear(&key);
+        defer cef.cef_string_utf16_clear(&val);
+        if (cef.cef_string_multimap_key(all, i, &key) == 0) continue;
+        _ = cef.cef_string_multimap_value(all, i, &val);
+        var name_buf: [16]u8 = undefined;
+        if (std.ascii.eqlIgnoreCase(utf16Into(&key, &name_buf), "user-agent")) {
+            dropped = true;
+            continue;
+        }
+        _ = cef.cef_string_multimap_append(keep, &key, &val);
+    }
+    if (dropped) set(req, keep);
+}
+
 /// IO THREAD. The verdict and the log append, inline with the request.
 pub fn onBeforeResourceLoad(
     _: [*c]cef.cef_resource_request_handler_t,
@@ -2320,6 +2371,7 @@ pub fn onBeforeResourceLoad(
     // request (browserless, or racing registration/teardown) has no slot
     // and therefore no ring or counter to name its refusal in.
     const req: *cef.cef_request_t = request orelse return if (untrusted) cef.RV_CANCEL else cef.RV_CONTINUE;
+    undoCefUserAgent(req);
     // Service-worker / urlrequest traffic has no browser and thus no
     // view to attribute it to; it passes unfiltered (matching without
     // a first-party context would misapply domain=/third-party rules).
