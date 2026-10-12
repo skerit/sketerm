@@ -217,6 +217,7 @@ const wf_hints = @import("webface/hints.zig");
 const wf_a11y = @import("webface/a11y.zig");
 const wf_obs = @import("webface/observed.zig");
 const wf_frames = @import("webface/frames.zig");
+const wf_screen = @import("webface/screen.zig");
 const wf_store = @import("webface/store.zig");
 const wf_prompts = @import("webface/prompts.zig");
 const wf_menus = @import("webface/menus.zig");
@@ -1159,6 +1160,9 @@ pub const WebFace = struct {
     /// Last `view_max_fps` sent on the CURRENT connection; the sentinel
     /// forces a send after every (re)create.
     sent_max_fps: u16 = 0xffff,
+    /// Last `view_screen` sent on the CURRENT connection; null forces a
+    /// send after every (re)create.
+    sent_screen: ?proto.ViewScreen = null,
     /// The realized surface whose scale we watch, with a reference held
     /// (CLAUDE.md: a raw widget/surface pointer kept past the widget
     /// tree's lifetime must own one) plus its handler id.
@@ -1168,6 +1172,9 @@ pub const WebFace = struct {
     /// output's refresh) and, under `SKETERM_WEB_STATS`, `after-paint`
     /// on its frame clock.
     monitor_handler: c.gulong = 0,
+    /// `layout` on `scale_surface`: the toplevel changed size, which the
+    /// page reads as `outerWidth`/`outerHeight`.
+    layout_handler: c.gulong = 0,
     present_handler: c.gulong = 0,
     /// Last pointer position in view coordinates — scroll events carry
     /// no coordinates of their own.
@@ -1971,6 +1978,7 @@ pub const WebFace = struct {
     }
 
     pub const dropMap = wf_frames.dropMap;
+    pub const syncScreen = wf_screen.syncScreen;
     pub const clearDmabufCache = wf_frames.clearDmabufCache;
     // ---- frame rate --------------------------------------------------
 
@@ -2219,6 +2227,14 @@ pub const WebFace = struct {
             null,
             0,
         );
+        self.layout_handler = c.g_signal_connect_data(
+            @ptrCast(surface),
+            "layout",
+            @ptrCast(&onSurfaceLayout),
+            self,
+            null,
+            0,
+        );
         // Stats only: count the surface's presents (see `Stats`). A
         // signal on the frame clock, never a tick, so an idle surface's
         // clock is left alone.
@@ -2248,6 +2264,10 @@ pub const WebFace = struct {
         if (self.monitor_handler != 0) {
             c.g_signal_handler_disconnect(@ptrCast(surface), self.monitor_handler);
             self.monitor_handler = 0;
+        }
+        if (self.layout_handler != 0) {
+            c.g_signal_handler_disconnect(@ptrCast(surface), self.layout_handler);
+            self.layout_handler = 0;
         }
         if (self.present_handler != 0) {
             if (c.gdk_surface_get_frame_clock(surface)) |clock_obj|
@@ -2895,6 +2915,9 @@ pub const WebFace = struct {
         // A fresh helper connection knows no cap; force the send.
         self.sent_max_fps = 0xffff;
         self.syncMaxFps();
+        // Nor where the view is: the real screen, window and offset.
+        self.sent_screen = null;
+        self.syncScreen();
         // And it knows no popup policy. It must, BEFORE the first page
         // can call window.open: the decision is synchronous helper-side.
         self.pushPopupPolicy();
@@ -3659,6 +3682,7 @@ pub const WebFace = struct {
         self.attachScaleWatch();
         self.syncScale();
         self.syncMaxFps();
+        self.syncScreen();
     }
 
     fn onAreaUnrealize(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
@@ -3741,11 +3765,19 @@ pub const WebFace = struct {
     }
 
     fn onSurfaceScale(_: ?*c.GObject, _: ?*c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
-        cast.userData(WebFace, user).syncScale();
+        const self = cast.userData(WebFace, user);
+        self.syncScale();
+        self.syncScreen();
     }
 
     fn onSurfaceMonitor(_: ?*c.GdkSurface, _: ?*c.GdkMonitor, user: ?*anyopaque) callconv(.c) void {
-        cast.userData(WebFace, user).syncMaxFps();
+        const self = cast.userData(WebFace, user);
+        self.syncMaxFps();
+        self.syncScreen();
+    }
+
+    fn onSurfaceLayout(_: ?*c.GdkSurface, _: c_int, _: c_int, user: ?*anyopaque) callconv(.c) void {
+        cast.userData(WebFace, user).syncScreen();
     }
 
     fn onAfterPaint(_: ?*c.GdkFrameClock, _: ?*anyopaque) callconv(.c) void {
@@ -3779,6 +3811,7 @@ pub const WebFace = struct {
             .h = nh,
             .scale_x1000 = scale,
         });
+        self.syncScreen();
     }
 
     /// `webframe.wireInput` sink. The GDK-to-protocol translation is

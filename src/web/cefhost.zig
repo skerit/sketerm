@@ -64,6 +64,7 @@ const builtin = @import("builtin");
 const cef = @import("cef");
 const c = @import("cbindings");
 const proto = @import("protocol.zig");
+const screengeom = @import("screengeom.zig");
 const frameflow = @import("frameflow.zig");
 const frameenc = @import("frameenc.zig");
 const surfenc = @import("../wlhost/surfenc.zig");
@@ -421,6 +422,10 @@ pub const View = struct {
     /// PAGE lays out at that DPR (see `zoomLevelFor`).
     scale_x1000: u16,
     media: proto.ViewEmulation = .{ .view = 0 },
+    /// The real screen, window and view position the owning client
+    /// reported (`view_screen`); null keeps the engine's view-is-the-
+    /// screen answer, which is what every client without the frame gets.
+    screen: ?proto.ViewScreen = null,
     media_observer: ?*emulation.Observer = null,
     media_generation: u64 = 0,
     /// Bootstrap blank callbacks cannot settle the deferred requested document.
@@ -1714,6 +1719,24 @@ pub const Host = struct {
 
     pub fn viewCount(self: *const Host) usize {
         return self.views.items.len;
+    }
+
+    /// `view_screen`: the real geometry the page reads as `screen.*`,
+    /// `outer*` and `screenX/Y`. A change reaches the engine as a screen
+    /// info change (which also re-sends the window rect to the renderer)
+    /// plus a resize, since the view's own origin may have moved.
+    pub fn setScreen(self: *Host, req: proto.ViewScreen) !void {
+        if (!req.valid()) return error.InvalidScreen;
+        const v = self.find(req.view) orelse return;
+        if (v.screen) |s| if (std.meta.eql(s, req)) return;
+        v.screen = req;
+        if (v.discarded) return;
+        withHost(v, struct {
+            fn f(host: *cef.cef_browser_host_t) void {
+                if (host.notify_screen_info_changed) |ns| ns(host);
+                if (host.was_resized) |wr| wr(host);
+            }
+        }.f);
     }
 
     pub fn setEmulation(self: *Host, req: proto.ViewEmulation) !void {
@@ -6673,6 +6696,7 @@ fn installHandlers() void {
     render_handler.base = staticBase(cef.cef_render_handler_t);
     render_handler.get_view_rect = onGetViewRect;
     render_handler.get_screen_info = onGetScreenInfo;
+    render_handler.get_root_screen_rect = onGetRootScreenRect;
     render_handler.on_paint = onPaint;
     // BOTH are installed, always. Which one Chromium calls is its own
     // decision per frame: with shared textures off it is `on_paint`, and
@@ -6902,14 +6926,29 @@ fn onGetViewRect(
         rect.* = .{ .x = 0, .y = 0, .width = 1, .height = 1 };
         return;
     };
-    rect.* = viewRect(v);
+    rect.* = cefRect(engineGeometry(v).view);
 }
 
-fn viewRect(v: *const View) cef.cef_rect_t {
-    return switch (scale_lever) {
-        .screen_info => .{ .x = 0, .y = 0, .width = v.w, .height = v.h },
-        .zoom => .{ .x = 0, .y = 0, .width = v.pw, .height = v.ph },
-    };
+fn engineGeometry(v: *const View) screengeom.Engine {
+    return screengeom.engine(scale_lever, v.w, v.h, v.scale_x1000, v.screen);
+}
+
+fn cefRect(r: screengeom.Rect) cef.cef_rect_t {
+    return .{ .x = r.x, .y = r.y, .width = r.w, .height = r.h };
+}
+
+/// The toplevel's rect (`outerWidth`/`outerHeight`, `screenX`/`screenY`);
+/// 0 without a client report, so the engine falls back to the view rect.
+fn onGetRootScreenRect(
+    _: [*c]cef.cef_render_handler_t,
+    browser: [*c]cef.cef_browser_t,
+    rect: [*c]cef.cef_rect_t,
+) callconv(.c) c_int {
+    defer releaseArg(browser);
+    const v = viewOf(browser) orelse return 0;
+    const root = engineGeometry(v).root orelse return 0;
+    rect.* = cefRect(root);
+    return 1;
 }
 
 /// The DPR the PAGE lays out at (and picks 2x images / hints text for).
@@ -6936,8 +6975,9 @@ fn onGetScreenInfo(
     // browser shows a page.
     info.*.depth = 24;
     info.*.depth_per_component = 8;
-    info.*.rect = viewRect(v);
-    info.*.available_rect = info.*.rect;
+    const g = engineGeometry(v);
+    info.*.rect = cefRect(g.screen);
+    info.*.available_rect = cefRect(g.avail);
     return 1;
 }
 

@@ -1205,6 +1205,15 @@ pub fn main() u8 {
         teardown();
         return 0;
     }
+    if (c.getenv("SKETERM_SMOKE_E2E_WEB_SCREEN_ONLY") != null) {
+        const app = drive orelse return fail("focused web screen smoke has no display driver");
+        if (!have_web_action) return fail("focused web screen smoke needs zig-out/bin/sketerm-webengine (run `zig build web` first)");
+        if (app.windows.items.len == 0) return fail("focused web screen smoke lost its window");
+        if (webScreenStage(allocator, app, sock_path)) |why| return failMsg(why);
+        say("web screen: focused real-geometry stage passed");
+        teardown();
+        return 0;
+    }
     if (c.getenv("SKETERM_SMOKE_E2E_EDITOR_LANG_ONLY") != null) {
         const app = drive orelse return fail("focused editor language smoke has no display driver");
         if (editorlang_stage.stage(allocator, app, sock_path, rt)) |why| return failMsg(why);
@@ -1390,6 +1399,9 @@ pub fn main() u8 {
 
             if (webPopupStage(allocator, app, sock_path)) |why| return failMsg(why);
             say("web popups: a popup-shaped open became a ~500x600 toplevel and no tab, its window.close() took the toplevel down with no shell left, a featureless open became a tab that closed itself, and a user-opened page could not close its own tab");
+
+            if (webScreenStage(allocator, app, sock_path)) |why| return failMsg(why);
+            say("web screen: a page in a web tab saw the display's 1920x1080 output as screen and avail, its toplevel as outer (larger than the viewport) and the window at the output's origin");
 
             if (webRouteStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
             say("web route: the toolbar route button opened its menu, Tor moved the tab through the SOCKS5 stub into its own helper instance, its site-info popover counted cookies from that instance, the palette actions moved it back and forth, and new_tor_web_tab opened a Tor-born tab");
@@ -6359,6 +6371,63 @@ fn knownToplevels(app: *appdrive.App, out: []u32) usize {
         n += 1;
     }
     return n;
+}
+
+/// The page's geometry, one marker string: `screen.width,height,
+/// availWidth,availHeight,availLeft,availTop,outerWidth,outerHeight,
+/// innerWidth,innerHeight,screenX,screenY`.
+const e2e_screen_probe = "'GEO:'+[screen.width,screen.height,screen.availWidth,screen.availHeight,screen.availLeft,screen.availTop,outerWidth,outerHeight,innerWidth,innerHeight,screenX,screenY].join(',')+':END'";
+
+/// A page in a GUI web tab reads the REAL geometry (`view_screen`): the
+/// display's output as `screen` and `avail`, the toplevel as `outer*`
+/// (sketerm's own chrome makes it larger than the viewport) and the
+/// window at the output's origin. With the capability withheld
+/// (`SKETERM_WEB_DISABLE_VIEW_SCREEN`, what an older helper looks like)
+/// the GUI must send nothing and the page keeps the old view == screen.
+fn webScreenStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]const u8) ?[]const u8 {
+    var doc = HttpDoc{ .body = "<!doctype html><title>e2e-screen</title><body style=\"margin:0;background:#fff\">screen</body>" };
+    if (!doc.start()) return "the screen document server did not start";
+    defer doc.stop();
+    var req_buf: [256]u8 = undefined;
+    const open_req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"web-open\",\"target\":\"tab\",\"data\":\"http://127.0.0.1:{d}/\"}}\n", .{doc.lis.port}) catch return "web-open request";
+    const opened = roundtrip(allocator, sock, open_req) orelse return "opening the screen page failed";
+    defer allocator.free(opened);
+    if (std.mem.indexOf(u8, opened, "\"ok\":true") == null) return "the screen page was rejected";
+    const pane = parseNumAfter(opened, "\"pane\":") orelse return "the screen page reply named no pane";
+    if (!waitWebPaneTitled(allocator, sock, app, pane, "e2e-screen", 30_000)) return "the screen page never loaded in the GUI";
+    const old_helper = c.getenv("SKETERM_WEB_DISABLE_VIEW_SCREEN") != null;
+    var g: [12]i64 = undefined;
+    var waited: u32 = 0;
+    // The report follows the view's creation; poll until the page sees
+    // the settled geometry (or, against an old helper, a stable one).
+    while (true) : (waited += 300) {
+        const r = webEval(allocator, sock, pane, e2e_screen_probe, 5_000) orelse return "the geometry probe never answered";
+        defer allocator.free(r);
+        const at = std.mem.indexOf(u8, r, "GEO:") orelse return "the geometry probe returned no marker";
+        const end = std.mem.indexOfPos(u8, r, at, ":END") orelse return "the geometry probe marker is cut";
+        var it = std.mem.splitScalar(u8, r[at + 4 .. end], ',');
+        for (&g) |*v| v.* = std.fmt.parseInt(i64, it.next() orelse return "the geometry probe is short", 10) catch return "the geometry probe is not numeric";
+        const settled = if (old_helper) g[0] == g[8] else g[0] == 1920;
+        if (settled or waited >= 10_000) break;
+        pumpFor(app, 300);
+    }
+    std.debug.print("smoke-e2e: web screen: screen {d}x{d} avail {d}x{d}+{d}+{d} outer {d}x{d} inner {d}x{d} at {d},{d}\n", .{ g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7], g[8], g[9], g[10], g[11] });
+    if (old_helper) {
+        if (g[0] != g[8] or g[1] != g[9] or g[6] != g[8] or g[7] != g[9]) return "without view-screen the page should still see its view as screen and window (the GUI sent the frame to a helper that never offered it?)";
+        return null;
+    }
+    if (g[0] != 1920 or g[1] != 1080) return "screen is not the display's 1920x1080 output";
+    if (g[2] != 1920 or g[3] != 1080 or g[4] != 0 or g[5] != 0) return "avail is not the whole output (what headful Chromium reports on Wayland)";
+    if (!(g[7] > g[9] and g[6] >= g[8])) return "outer does not exceed inner: the toplevel's chrome is missing from outerWidth/outerHeight";
+    if (g[10] != 0 or g[11] != 0) return "the window is not at the output's origin";
+    // outer is the toplevel the compositor holds, shadow excluded.
+    var matched = false;
+    for (app.windows.items) |w| {
+        const size = app.windowGeometry(w.id) orelse continue;
+        if (size.w == g[6] and size.h == g[7]) matched = true;
+    }
+    if (!matched) return "outerWidth/outerHeight match no toplevel's window geometry";
+    return null;
 }
 
 /// Popups the way a browser does them, on the real GUI: a page's

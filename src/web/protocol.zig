@@ -459,6 +459,12 @@ pub const CAP_VIEW_FLAGS = "view-flags";
 /// `motion = replayed` and the duration. Without a loaded pack a replay
 /// request FAILS; it never falls back to direct input.
 pub const CAP_MOTION_REPLAY = "motion-replay";
+/// The helper accepts `view_screen`: the REAL monitor, toplevel and view
+/// position a client reports, served to pages as `screen.*`,
+/// `outerWidth`/`outerHeight`, `screenX`/`screenY` and the view's screen
+/// origin. Without the frame (an older client, or the headless MCP
+/// lane) a page keeps seeing its view as the whole screen, at the origin.
+pub const CAP_VIEW_SCREEN = "view-screen";
 pub const MAX_VIEW_FPS: u16 = 240;
 pub const DEFAULT_HEADLESS_FPS: u16 = 60;
 
@@ -537,6 +543,7 @@ pub const Cap = enum {
     view_flags,
     navigation_guard,
     motion_replay,
+    view_screen,
 
     /// The wire name `hello_ack` carries.
     pub fn name(self: Cap) []const u8 {
@@ -895,6 +902,9 @@ pub const Tag = enum(u8) {
     ev_motion_pack = 0xE9,
     motion_scroll = 0xEA,
     ev_motion_done = 0xEB,
+    // 0xFC-0xFF: real presentation geometry, capability "view-screen"
+    // (see CAP_VIEW_SCREEN).
+    view_screen = 0xFC,
     _,
 
     /// Whether this build knows the frame; unknown tags are skipped.
@@ -1278,6 +1288,37 @@ pub const ViewResize = struct {
     w: u16,
     h: u16,
     scale_x1000: u16,
+};
+
+/// The real geometry around a view, in LOGICAL pixels (capability
+/// `view-screen`): the monitor it is on (`screen`), what of it windows
+/// may use (`avail`), its toplevel (`window`, origin included) and the
+/// view's own top-left inside that toplevel. Owner-only; a later report
+/// replaces the earlier one whole.
+pub const ViewScreen = struct {
+    pub const tag: Tag = .view_screen;
+    view: u32,
+    screen_x: i32 = 0,
+    screen_y: i32 = 0,
+    screen_w: u16,
+    screen_h: u16,
+    avail_x: i32 = 0,
+    avail_y: i32 = 0,
+    avail_w: u16,
+    avail_h: u16,
+    window_x: i32 = 0,
+    window_y: i32 = 0,
+    window_w: u16,
+    window_h: u16,
+    view_x: i32 = 0,
+    view_y: i32 = 0,
+
+    /// Every rect non-empty and the view's origin inside its window.
+    pub fn valid(self: ViewScreen) bool {
+        return self.screen_w != 0 and self.screen_h != 0 and self.avail_w != 0 and self.avail_h != 0 and
+            self.window_w != 0 and self.window_h != 0 and
+            self.view_x >= 0 and self.view_y >= 0 and self.view_x <= self.window_w and self.view_y <= self.window_h;
+    }
 };
 
 pub const ViewShow = struct {
@@ -7249,4 +7290,19 @@ test "new refusal counters append to legacy policy accounting" {
     try std.testing.expectEqualStrings("net-policy-ack", Cap.net_policy_ack.name());
     try roundTrip(NetPolicyReq, .{ .view = 1 });
     try roundTrip(NetPolicyReq, .{ .view = 1, .serial = 123 });
+}
+
+test "view_screen is a fresh owner-only block and validates its rects" {
+    try std.testing.expectEqual(@as(u8, 0xFC), @intFromEnum(Tag.view_screen));
+    try std.testing.expectEqualStrings("view-screen", Cap.view_screen.name());
+    const r = ViewScreen{ .view = 3, .screen_x = -1920, .screen_w = 1920, .screen_h = 1080, .avail_x = -1920, .avail_w = 1920, .avail_h = 1080, .window_x = -1920, .window_w = 1280, .window_h = 900, .view_y = 46 };
+    try roundTrip(ViewScreen, r);
+    try std.testing.expect(r.valid());
+    var bad = r;
+    bad.view_y = 901;
+    try std.testing.expect(!bad.valid());
+    bad = r;
+    bad.window_w = 0;
+    try std.testing.expect(!bad.valid());
+    try std.testing.expect(!observerAllows(.view_screen, true));
 }

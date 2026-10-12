@@ -298,6 +298,7 @@ comptime {
     _ = @import("web/navfault.zig");
     _ = @import("web/loadretry.zig");
     _ = @import("web/watchgeom.zig");
+    _ = @import("web/screengeom.zig");
     _ = @import("web/webpresence.zig");
     _ = @import("web/reader_guards.zig");
     _ = @import("web/quarantine.zig");

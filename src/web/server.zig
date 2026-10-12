@@ -164,6 +164,7 @@ const unconditional_caps = [_]proto.Cap{
     .view_max_fps,
     .view_flags,
     .motion_replay,
+    .view_screen,
 };
 
 /// Test-only negotiation seam: an environment switch that withholds one
@@ -187,6 +188,7 @@ fn withheld(cap: proto.Cap) bool {
         .query_live => "SKETERM_WEB_DISABLE_QUERY_LIVE",
         .page_read => "SKETERM_WEB_DISABLE_PAGE_READ",
         .motion_replay => "SKETERM_WEB_DISABLE_MOTION_REPLAY",
+        .view_screen => "SKETERM_WEB_DISABLE_VIEW_SCREEN",
         else => return false,
     };
     return c.getenv(env) != null;
@@ -935,6 +937,7 @@ pub const Server = struct {
             .view_hide => self.host.showView((try self.dec(cn, proto.ViewHide, frame.payload)).view, false),
             .view_max_fps => self.host.setMaxFps(try self.dec(cn, proto.ViewMaxFps, frame.payload)),
             .view_emulation => try self.host.setEmulation(try self.dec(cn, proto.ViewEmulation, frame.payload)),
+            .view_screen => try self.host.setScreen(try self.dec(cn, proto.ViewScreen, frame.payload)),
             .cert_decision => self.host.certDecision(try self.dec(cn, proto.CertDecision, frame.payload)),
             .permission_decision => self.host.permissionDecision(try self.dec(cn, proto.PermissionDecision, frame.payload)),
             .navigate => self.host.navigate(try self.dec(cn, proto.Navigate, frame.payload)),

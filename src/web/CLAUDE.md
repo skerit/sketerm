@@ -1123,6 +1123,79 @@ Everything else matched, including every automation marker, the
 `toString` scan in both realms, worker/iframe facts, devtools-detector's
 tricks, permissions, client hints, ClearKey and the storage quota.
 
+## Real geometry for GUI views (`view_screen`, capability "view-screen")
+
+A windowless browser knows no screen: CEF asks the client for the view
+rect (`get_view_rect`, its origin is the view's screen position and so
+`MouseEvent.screenX - clientX`), the screen (`get_screen_info` `rect` /
+`available_rect`: `screen.*`) and the root window (`get_root_screen_rect`:
+`outerWidth/Height`, `screenX/Y`; unanswered, the engine uses the view
+rect). Until 2026-10-12 every answer was the view itself at the origin,
+so a page in a GUI tab saw a screen the size of its viewport and no
+window chrome.
+
+The GUI face now reports what it really knows (`ui/webface/screen.zig`):
+the GdkMonitor the window is on (logical px, its layout origin), the
+toplevel's size (`gtk_widget_get_width/height` of the native, which is
+the xdg window geometry, shadow excluded) and the view's top-left in it
+(`gtk_widget_compute_point`). Wayland gives a client neither a window
+position nor a work area, so the window sits at its monitor's origin and
+`avail` is the whole monitor. MEASURED 2026-10-12, headful Chromium 152
+on a 1920x1080 sketerm display: `screen` and `avail` 1920x1080 at 0,0,
+`outer` 945x1060 = the compositor's window size, `inner` 913x931, and
+`screenX/Y` 10,10, which is Chrome's own default placement (WindowSizer),
+not something Wayland told it; we report the monitor origin instead (the
+audit classes that row `host`). Sent after `view_create`, on resize,
+realize, `enter-monitor`, a scale change and the surface's `layout`
+(toplevel resize), only when it changed; the helper (`Host.setScreen`)
+answers a change with `notify_screen_info_changed` (which also re-sends
+the window rect to the renderer) and `was_resized`. The mapping into the
+engine's space is `screengeom.zig` (pure, both test roots): logical
+under the `screen_info` lever, physical under `zoom` (the zoom-lever
+values are NOT measured: this host has no GPU, so the GUI's helper runs
+headless ozone here).
+
+Skew: the GUI sends the frame only to a helper that advertises the
+capability, and a helper keeps view == screen for a client that never
+sends it, which is the MCP headless lane today (its geometry waits on the
+headless architecture decision). `SKETERM_WEB_DISABLE_VIEW_SCREEN` makes
+a new helper look old. smoke-e2e `webScreenStage`
+(`SKETERM_SMOKE_E2E_WEB_SCREEN_ONLY=1`) asserts the real values on
+sketerm's own display, and with that variable set asserts the old ones.
+A monitor's own geometry changing under a window that stays on it (a
+mode change) is not watched.
+
+## Keyboard layout map and EyeDropper (investigated 2026-10-12, unchanged)
+
+- **`navigator.keyboard.getLayoutMap()` is empty in every helper, whatever
+  the ozone platform.** Blink asks the widget's view
+  (`RenderWidgetHostImpl::GetKeyboardLayoutMap` -> the view);
+  `CefRenderWidgetHostViewOSR` does not override it, so the base
+  `RenderWidgetHostViewBase::GetKeyboardLayoutMap` answers
+  `NOTIMPLEMENTED_LOG_ONCE(); return {}`. Aura's view (a windowed browser)
+  answers `WindowTreeHost::GetKeyboardLayoutMap()` ->
+  `ui::GenerateDomKeyboardLayoutMap()`, which on Wayland ozone is the
+  compositor's XKB keymap and on headless ozone the
+  `StubKeyboardLayoutEngine` (no keymap of the user's at all). No CEF
+  client API carries a layout map, so the GUI cannot supply one. Real
+  fixes: a CEF patch overriding `GetKeyboardLayoutMap` in the OSR view
+  (a libcef we build ourselves), or a windowed browser on a Wayland
+  ozone (the open architecture question).
+- **`window.EyeDropper` is off at the FEATURE level, not in Blink.** The
+  browser process runs with `--disable-features=...,EyeDropper,...`
+  (read off the helper's utility-process command line); it is not in
+  CEF's sources at our commit (`DisableFeatureByDefault` there lists
+  others), not ours (`cefargs`), and not in Chromium's field-trial testing
+  config. Stock `chromium --headless=new` 152 exposes it, and
+  `--enable-features=EyeDropper` or `--enable-blink-features=EyeDropperAPI`
+  on the helper brings `window.EyeDropper` back (measured). Not enabled:
+  the constructor alone would be a lie, since `open()` reaches
+  `WebContentsDelegate::OpenEyeDropper`, which CEF's alloy/OSR delegate
+  does not implement and no CEF handler forwards to a client, so the
+  promise could only fail. A real picker needs a CEF patch adding that
+  callback (the GUI could then sample its own presented frame) or the
+  windowed Chrome-style browser, whose views eye dropper Chrome ships.
+
 ## Cookies and site data: what the engine will and will not do
 
 The 0xC8 block (capability `sitedata`) is served from CEF's cookie
