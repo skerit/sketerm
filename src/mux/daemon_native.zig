@@ -141,7 +141,7 @@ pub fn nativeProcess(self: *Daemon, ch: *Channel) void {
         fail = true;
     }
     if (!fail and !close_after_flush and brain_in.items.len > 0) {
-        nv.brain.now_ms = @truncate(@as(u64, @intCast(nowMs())));
+        nv.brain.now_ms = brainClockMs();
         nv.brain.feed(brain_in.items) catch {
             fail = true;
         };
@@ -1117,6 +1117,15 @@ pub fn viewerUnitKind(tag: wlpipe.Tag) ViewerUnit {
     };
 }
 
+/// The brain compositor's clock (`Compositor.now_ms`, "caller-provided"):
+/// stamped before EVERY call that may emit timestamped events, app
+/// requests and viewer input alike. Input applied with a stale stamp
+/// gave two clicks the same time, so a toolkit read any second click as
+/// a double-click.
+fn brainClockMs() u32 {
+    return @truncate(@as(u64, @intCast(nowMs())));
+}
+
 /// Viewer→daemon bytes on a native channel: seat intents drive
 /// the brain; clipboard units keep their legacy handling. Raw
 /// wl_msg from viewers is IGNORED — the daemon brain is the only
@@ -1139,8 +1148,14 @@ pub fn nativeClientData(self: *Daemon, cl: *Client, ch: *Channel, bytes: []const
             // Non-controller input is DROPPED (not queued): a
             // stale pointer/key stream replayed later would be
             // worse than never having been sent.
-            .intent => if (drives) nv.brain.applyIntent(peeled.unit.tag, peeled.unit.payload),
-            .describe => nv.brain.applyIntent(peeled.unit.tag, peeled.unit.payload),
+            .intent => if (drives) {
+                nv.brain.now_ms = brainClockMs();
+                nv.brain.applyIntent(peeled.unit.tag, peeled.unit.payload);
+            },
+            .describe => {
+                nv.brain.now_ms = brainClockMs();
+                nv.brain.applyIntent(peeled.unit.tag, peeled.unit.payload);
+            },
             // A watcher may fetch the app's selection, never paste into it.
             .transfer => if (cl.actsOnSession() or peeled.unit.tag == .clip_send) {
                 settlePasteWait(ch.native.?, cl.id, peeled.unit.tag);
