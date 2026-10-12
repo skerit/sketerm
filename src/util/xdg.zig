@@ -40,6 +40,17 @@ pub fn configDir(buf: []u8) ?[]const u8 {
     return null;
 }
 
+/// The user's sketerm data directory (`$XDG_DATA_HOME/sketerm`, else
+/// `$HOME/.local/share/sketerm`), without a trailing slash.
+/// @return null when neither variable names a directory.
+pub fn dataDir(buf: []u8) ?[]const u8 {
+    if (env.nonEmpty("XDG_DATA_HOME")) |xd|
+        return std.fmt.bufPrint(buf, "{s}/sketerm", .{xd}) catch null;
+    if (env.nonEmpty("HOME")) |home|
+        return std.fmt.bufPrint(buf, "{s}/.local/share/sketerm", .{home}) catch null;
+    return null;
+}
+
 /// `<state dir>/<rel>`, allocated. `rel` is a relative path such as
 /// `places.json` or `file-transfers.d`.
 pub fn statePath(allocator: std.mem.Allocator, rel: []const u8) Error![]u8 {

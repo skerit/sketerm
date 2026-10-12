@@ -283,6 +283,10 @@ comptime {
     _ = @import("web/hints.zig");
     _ = @import("web/filter.zig");
     _ = @import("web/filtersub.zig");
+    _ = @import("motion/pack.zig");
+    _ = @import("motion/replay.zig");
+    _ = @import("motion/synth.zig");
+    _ = @import("motion/store.zig");
     _ = @import("web/userscript.zig");
     _ = @import("web/urlhost.zig");
     _ = @import("web/model.zig");
