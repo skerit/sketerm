@@ -1,5 +1,25 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-12: GUI web tabs report real geometry; worker header order fixed
+
+A page in a GUI web tab now sees the real monitor as `screen` and
+`avail`, the toplevel as `outerWidth/Height` and its view's real offset
+in it (`view_screen`, tag 0xFC, capability `view-screen`; GUI
+`ui/webface/screen.zig`, helper `Host.setScreen` + `screengeom.zig` +
+`get_root_screen_rect`). Values follow headful Chromium 152 measured on a
+sketerm display (avail = whole output on Wayland); the window sits at its
+monitor's origin because Wayland gives no position. Old helpers get no
+frame, and the MCP headless lane is unchanged (architecture decision
+pending). smoke-e2e `webScreenStage` checks both the new values and the
+old-helper path. The dedicated Worker script's `User-Agent` came from
+CEF's request proxy (`SetHeaderIfMissing` before any handler, never taken
+back); the helper now removes it for `RT_WORKER` and the network stack
+re-adds it at Chromium's position, so `ctx.hdr_order_worker` matches.
+Investigated, unchanged: the empty keyboard layout map (CEF's OSR view
+never implements it) and the missing `EyeDropper` (feature disabled in
+CEF's browser process; `open()` has no CEF delegate). Details in
+src/web/CLAUDE.md.
+
 ## 2026-10-12: the headful audit, a smoke-mcp gate against headful Chromium
 
 What fingerprint-scan.com, pixelscan, sannysoft, CreepJS, BotD and
