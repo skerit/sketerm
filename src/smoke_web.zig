@@ -1407,6 +1407,18 @@ const Client = struct {
     act_seq: u32 = 0,
     act_msg: [512]u8 = @splat(0),
     act_msg_len: usize = 0,
+    act_motion: u8 = 0,
+    act_duration: u32 = 0,
+    /// Any act result naming a superseded replay (the motion stage).
+    act_superseded: bool = false,
+    act_interrupted: bool = false,
+
+    motion_pack_seq: u32 = 0,
+    motion_pack_ok: u8 = 0,
+    motion_pack_reaches: u32 = 0,
+    motion_done_seq: u32 = 0,
+    motion_done_ok: u8 = 0,
+    motion_done_ms: u32 = 0,
 
     exp_text: [8192]u8 = @splat(0),
     exp_len: usize = 0,
@@ -2147,6 +2159,20 @@ const Client = struct {
                 self.stream_closed_seq += 1;
                 self.stream_closed_view = ev.view;
             },
+            .ev_motion_pack => {
+                const ev = proto.decode(proto.EvMotionPack, frame.payload) catch fail("ev_motion_pack decode");
+                self.motion_pack_ok = ev.ok;
+                self.motion_pack_reaches = ev.reaches;
+                if (ev.ok == 0) std.debug.print("smoke-web: motion pack refused: {s}\n", .{ev.msg});
+                self.motion_pack_seq += 1;
+            },
+            .ev_motion_done => {
+                const ev = proto.decode(proto.EvMotionDone, frame.payload) catch fail("ev_motion_done decode");
+                self.motion_done_ok = ev.ok;
+                self.motion_done_ms = ev.duration_ms;
+                if (ev.ok == 0) std.debug.print("smoke-web: motion scroll failed: {s}\n", .{ev.msg});
+                self.motion_done_seq += 1;
+            },
             .ev_download_progress => {
                 const p = proto.decode(proto.EvDownloadProgress, frame.payload) catch fail("ev_download_progress decode");
                 self.dl_prog_id = p.id;
@@ -2321,6 +2347,10 @@ const Client = struct {
                 self.act_ok = r.ok;
                 self.act_msg_len = @min(r.msg.len, self.act_msg.len);
                 @memcpy(self.act_msg[0..self.act_msg_len], r.msg[0..self.act_msg_len]);
+                self.act_motion = r.motion;
+                self.act_duration = r.duration_ms;
+                if (std.mem.indexOf(u8, r.msg, "superseded") != null) self.act_superseded = true;
+                if (std.mem.indexOf(u8, r.msg, "interrupted by navigation") != null) self.act_interrupted = true;
                 self.act_seq += 1;
             },
             .sem_expand_result => {
@@ -9012,6 +9042,225 @@ fn runCookieSyncStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u
     g_pid_b = -1;
 }
 
+/// The motion stage's page: pointer, key and wheel events logged with
+/// their own timestamps and coalesced samples; `__sum` boils the log
+/// down to what the stage asserts, so the eval reply stays small.
+const motion_page =
+    \\<!doctype html><html><head><title>motion</title><style>
+    \\body{margin:0;height:3000px;font:14px sans-serif}
+    \\#t{position:absolute;left:520px;top:300px;width:80px;height:40px}
+    \\#u{position:absolute;left:120px;top:140px;width:60px;height:30px}
+    \\#f{position:absolute;left:100px;top:450px;width:300px}
+    \\</style></head><body><button id="t">Target</button><button id="u">Other</button><input id="f" aria-label="field">
+    \\<script>
+    \\var L=[];
+    \\function rec(e){var cs=[];try{if(e.getCoalescedEvents)for(var c of e.getCoalescedEvents())cs.push([c.timeStamp,c.clientX,c.clientY]);}catch(_){}
+    \\if(!cs.length)cs.push([e.timeStamp,e.clientX,e.clientY]);L.push({k:e.type,t:e.timeStamp,x:e.clientX,y:e.clientY,c:cs,id:(e.target&&e.target.id)||''});}
+    \\['pointermove','pointerdown','pointerup'].forEach(function(k){document.addEventListener(k,rec,true);});
+    \\document.addEventListener('keydown',function(e){L.push({k:'keydown',t:e.timeStamp});},true);
+    \\document.addEventListener('keyup',function(e){L.push({k:'keyup',t:e.timeStamp});},true);
+    \\document.addEventListener('wheel',function(e){L.push({k:'wheel',t:e.timeStamp});},{capture:true,passive:true});
+    \\window.__clear=function(){L.length=0;return 0;};
+    \\window.__sum=function(){var moves=0,inc=true,last=-1,down=null,up=null,path=[],keys=[],wheels=0;
+    \\for(var e of L){if(e.k==='pointermove'&&!down){for(var c of e.c){moves++;if(c[0]<=last)inc=false;last=c[0];if(path.length<60)path.push(Math.round(c[1])+','+Math.round(c[2]));}}
+    \\else if(e.k==='pointerdown'&&!down)down=e;else if(e.k==='pointerup'&&down&&!up)up=e;else if(e.k==='keydown')keys.push(e.t);else if(e.k==='wheel')wheels++;}
+    \\var gaps=[];for(var i=1;i<keys.length;i++)gaps.push(Math.round(keys[i]-keys[i-1]));
+    \\var r=document.getElementById('t').getBoundingClientRect();
+    \\return {moves:moves,inc:inc,down:!!down,press:(down&&up)?Math.round((up.t-down.t)*10)/10:-1,
+    \\inside:!!down&&down.x>=r.left&&down.x<=r.right&&down.y>=r.top&&down.y<=r.bottom,id:down?down.id:'',
+    \\path:path.join(' '),keys:keys.length,gaps:gaps,wheels:wheels,scroll:Math.round(window.scrollY)};};
+    \\</script></body></html>
+;
+
+const MotionSum = struct {
+    moves: i64 = 0,
+    inc: bool = false,
+    down: bool = false,
+    press: f64 = -1,
+    inside: bool = false,
+    id: []const u8 = "",
+    path: []const u8 = "",
+    keys: i64 = 0,
+    gaps: []const i64 = &.{},
+    wheels: i64 = 0,
+    scroll: i64 = 0,
+};
+
+fn motionSum(cl: *Client, arena: std.mem.Allocator) MotionSum {
+    const raw = cl.evalWait("window.__sum()", false, 15_000);
+    const outer = std.json.parseFromSliceLeaky(std.json.Value, arena, raw, .{}) catch {
+        std.debug.print("smoke-web: __sum said {s}\n", .{raw});
+        fail("motion stage: the page summary is not JSON");
+    };
+    const v = (if (outer == .object) outer.object.get("value") else null) orelse {
+        std.debug.print("smoke-web: __sum said {s}\n", .{raw});
+        fail("motion stage: the page summary has no value");
+    };
+    return std.json.parseFromValueLeaky(MotionSum, arena, v, .{ .ignore_unknown_fields = true }) catch {
+        std.debug.print("smoke-web: __sum said {s}\n", .{raw});
+        fail("motion stage: the page summary has an unexpected shape");
+    };
+}
+
+fn motionAct(cl: *Client, id: u32, action: proto.SemAct, arg: []const u8, motion: proto.Motion, timeout_ms: i64) void {
+    const seq = cl.act_seq;
+    cl.send(proto.SemAction{ .view = view_id, .id = id, .action = @intFromEnum(action), .arg = arg, .motion = @intFromEnum(motion) });
+    if (!cl.waitSeq(&cl.act_seq, seq, timeout_ms)) fail("motion stage: no sem_act_result");
+}
+
+fn sendPack(cl: *Client, serial: u32, bytes: []const u8, chunk: usize) void {
+    const seq = cl.motion_pack_seq;
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const n = @min(chunk, bytes.len - off);
+        cl.send(proto.MotionPack{ .serial = serial, .total = @intCast(bytes.len), .offset = @intCast(off), .chunk = .{ .s = bytes[off .. off + n] } });
+        off += n;
+    }
+    if (!cl.waitSeq(&cl.motion_pack_seq, seq, 20_000)) fail("motion stage: no ev_motion_pack");
+}
+
+/// Stage 3d: recorded-motion replay (capability "motion-replay"). A
+/// GENERATED pack (motion/synth.zig, never a person's) drives a click,
+/// a hover, typed text and a scroll; the page's own event log proves
+/// the motion: a path of many moves, increasing timestamps, a real
+/// press duration, a landing inside the target, and two reaches onto
+/// one target that differ. Without a pack the direct click is
+/// unchanged, and a replay that cannot happen does nothing at all.
+fn runMotionStage(cl: *Client, gpa: std.mem.Allocator) void {
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    if (!cl.acks(.motion_replay)) fail("stage 3d motion: hello_ack lacks motion-replay");
+    var http = HttpProbe{ .body = motion_page };
+    if (!http.start()) fail("stage 3d motion: HTTP fixture did not start");
+    defer http.shutdown();
+    var url_buf: [128]u8 = undefined;
+    const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{http.lis.port}) catch fail("stage 3d url");
+    cl.navigate(url);
+    cl.resetSem();
+    cl.snapshot(@intFromEnum(proto.SnapMode.full), 1);
+    const t_id = cl.idOfLine("button \"Target\"") orelse fail("stage 3d motion: no Target button in the tree");
+    const u_id = cl.idOfLine("button \"Other\"") orelse fail("stage 3d motion: no Other button in the tree");
+    const f_id = cl.idOfLine("textbox \"field\"") orelse fail("stage 3d motion: no field in the tree");
+
+    // Direct, as before: one move, an instant press, no motion fact.
+    _ = cl.evalWait("window.__clear()", false, 10_000);
+    motionAct(cl, t_id, .click, "", .direct, 20_000);
+    if (cl.act_ok != 1 or cl.act_motion != 0) fail("stage 3d motion: the direct click changed (failed, or reported motion)");
+    {
+        const s = motionSum(cl, arena);
+        if (!s.down or s.moves > 2 or s.press > 5) {
+            std.debug.print("smoke-web: direct click: moves={d} press={d}\n", .{ s.moves, s.press });
+            fail("stage 3d motion: the direct click is no longer one move and an instant press");
+        }
+    }
+
+    // Replay asked with no pack: refused, and NOTHING reached the page.
+    _ = cl.evalWait("window.__clear()", false, 10_000);
+    motionAct(cl, t_id, .click, "", .replay, 20_000);
+    if (cl.act_ok != 0 or std.mem.indexOf(u8, cl.act_msg[0..cl.act_msg_len], "no motion pack is loaded") == null) {
+        std.debug.print("smoke-web: replay without a pack said ok={d} \"{s}\"\n", .{ cl.act_ok, cl.act_msg[0..cl.act_msg_len] });
+        fail("stage 3d motion: a replay without a pack was not refused");
+    }
+    if (motionSum(cl, arena).moves != 0) fail("stage 3d motion: a refused replay still moved the pointer");
+
+    // A broken pack is refused and leaves no pack; a generated one loads
+    // across several chunks.
+    sendPack(cl, 1, "{\"format\":\"sketerm-motion\",\"version\":9}", 1 << 20);
+    if (cl.motion_pack_ok != 0) fail("stage 3d motion: an invalid pack was accepted");
+    const pack_bytes = @import("motion/synth.zig").generate(gpa, .{ .seed = 77 }) catch fail("stage 3d motion: pack generation");
+    defer gpa.free(pack_bytes);
+    sendPack(cl, 2, pack_bytes, 64 * 1024);
+    if (cl.motion_pack_ok != 1 or cl.motion_pack_reaches == 0) fail("stage 3d motion: the generated pack was not loaded");
+
+    // Replayed clicks: Target (from the edge), Other, Target, Other, Target.
+    var t_paths: [2][]const u8 = .{ "", "" };
+    const order = [_]u32{ t_id, u_id, t_id, u_id, t_id };
+    for (order, 0..) |id, i| {
+        _ = cl.evalWait("window.__clear()", false, 10_000);
+        motionAct(cl, id, .click, "", .replay, 20_000);
+        if (cl.act_ok != 1 or cl.act_motion != @intFromEnum(proto.MotionResult.replayed) or cl.act_duration == 0) {
+            std.debug.print("smoke-web: replayed click {d}: ok={d} motion={d} ms={d} \"{s}\"\n", .{ i, cl.act_ok, cl.act_motion, cl.act_duration, cl.act_msg[0..cl.act_msg_len] });
+            fail("stage 3d motion: a replayed click did not report motion=replayed with a duration");
+        }
+        const s = motionSum(cl, arena);
+        std.debug.print("smoke-web: replay {d}: {d} moves, increasing={}, press {d} ms, inside={}, {d} ms total\n", .{ i, s.moves, s.inc, s.press, s.inside, cl.act_duration });
+        if (s.moves < 6) fail("stage 3d motion: a replayed reach reached the page as fewer than 6 moves");
+        if (!s.inc) fail("stage 3d motion: replayed move timestamps are not strictly increasing");
+        if (!s.down or s.press < 20) fail("stage 3d motion: the replayed press had no real duration");
+        if (id == t_id and !s.inside) fail("stage 3d motion: the replayed press landed outside the target");
+        if (id == t_id and i >= 2) t_paths[(i - 2) / 2] = arena.dupe(u8, s.path) catch fail("oom");
+    }
+    if (std.mem.eql(u8, t_paths[0], t_paths[1])) fail("stage 3d motion: two replayed reaches onto one target took the same path");
+
+    // Hover: a reach and no press.
+    _ = cl.evalWait("window.__clear()", false, 10_000);
+    motionAct(cl, u_id, .hover, "", .replay, 20_000);
+    {
+        const s = motionSum(cl, arena);
+        if (cl.act_ok != 1 or cl.act_motion != @intFromEnum(proto.MotionResult.replayed) or s.moves < 6 or s.down)
+            fail("stage 3d motion: a replayed hover was not a reach without a press");
+    }
+
+    // Typing with recorded timing.
+    _ = cl.evalWait("window.__clear()", false, 10_000);
+    motionAct(cl, f_id, .set_value, "Hello world", .replay, 30_000);
+    {
+        const msg = cl.act_msg[0..cl.act_msg_len];
+        if (cl.act_ok != 1 or cl.act_motion != @intFromEnum(proto.MotionResult.replayed) or std.mem.indexOf(u8, msg, "Hello world") == null) {
+            std.debug.print("smoke-web: replayed set_value said ok={d} motion={d} \"{s}\"\n", .{ cl.act_ok, cl.act_motion, msg });
+            fail("stage 3d motion: replayed typing did not land the text with motion=replayed");
+        }
+        const s = motionSum(cl, arena);
+        if (s.keys < 11 or s.gaps.len < 2) fail("stage 3d motion: replayed typing sent too few key downs");
+        var all_same = true;
+        for (s.gaps) |g| {
+            if (g < 15) fail("stage 3d motion: replayed key downs came less than 15 ms apart");
+            if (g != s.gaps[0]) all_same = false;
+        }
+        if (all_same) fail("stage 3d motion: replayed key timing is machine-flat");
+    }
+
+    // Scrolling in recorded bursts.
+    _ = cl.evalWait("window.__clear()", false, 10_000);
+    {
+        const seq = cl.motion_done_seq;
+        cl.send(proto.MotionScroll{ .view = view_id, .req = 9, .x = 400, .y = 300, .dx = 0, .dy = 600 });
+        if (!cl.waitSeq(&cl.motion_done_seq, seq, 20_000)) fail("stage 3d motion: no ev_motion_done for the scroll");
+        if (cl.motion_done_ok != 1 or cl.motion_done_ms == 0) fail("stage 3d motion: the replayed scroll failed");
+        _ = cl.drive(600, 0);
+        const s = motionSum(cl, arena);
+        if (s.wheels < 3 or s.scroll < 200) {
+            std.debug.print("smoke-web: replayed scroll: {d} wheel events, scrollY {d}\n", .{ s.wheels, s.scroll });
+            fail("stage 3d motion: the replayed scroll was not several wheel events that moved the page");
+        }
+    }
+
+    // Every replay is answered: one superseded by the next action on
+    // the view, one interrupted by a navigation.
+    cl.act_superseded = false;
+    {
+        const seq = cl.act_seq;
+        cl.send(proto.SemAction{ .view = view_id, .id = t_id, .action = @intFromEnum(proto.SemAct.click), .arg = "", .motion = @intFromEnum(proto.Motion.replay) });
+        cl.send(proto.SemAction{ .view = view_id, .id = u_id, .action = @intFromEnum(proto.SemAct.click), .arg = "", .motion = @intFromEnum(proto.Motion.replay) });
+        if (!cl.waitSeq(&cl.act_seq, seq + 1, 20_000)) fail("stage 3d motion: a superseded replay was never answered");
+        if (!cl.act_superseded) fail("stage 3d motion: the first of two replays was not answered as superseded");
+    }
+    cl.act_interrupted = false;
+    {
+        const seq = cl.act_seq;
+        cl.send(proto.SemAction{ .view = view_id, .id = t_id, .action = @intFromEnum(proto.SemAct.click), .arg = "", .motion = @intFromEnum(proto.Motion.replay) });
+        _ = cl.drive(60, 0);
+        cl.send(proto.Navigate{ .view = view_id, .url = red_page });
+        if (!cl.waitSeq(&cl.act_seq, seq, 20_000)) fail("stage 3d motion: a replay cut by navigation was never answered");
+        if (!cl.act_interrupted and cl.act_ok == 1) {
+            // The replay may have finished before the navigation began.
+            say("smoke-web: stage 3d note: the replay finished before the navigation could cut it");
+        } else if (!cl.act_interrupted) fail("stage 3d motion: a replay cut by navigation was not answered as interrupted");
+    }
+    _ = cl.drive(500, 0);
+}
+
 pub fn main(init: std.process.Init.Minimal) u8 {
     _ = c.signal(c.SIGPIPE, &sigNoop);
     const argv = init.args.vector;
@@ -9192,6 +9441,17 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         return 0;
     }
 
+    if (c.getenv("SKETERM_SMOKE_WEB_MOTION_ONLY") != null) {
+        runMotionStage(&cl, gpa);
+        pass("stage 3d motion replay");
+        cl.send(proto.ViewDestroy{ .view = view_id });
+        cl.deinit();
+        reapHelperTimeout(pid, "motion-only teardown", 15_000);
+        cleanup();
+        say("smoke-web: PASS (motion only)");
+        return 0;
+    }
+
     // ── Stage 3: trusted click ────────────────────────────────────
     cl.navigate(click_page);
     if (!cl.waitCenterColor(.{ 255, 0, 0 }, 20_000)) fail("stage 3 click: button page never painted blue");
@@ -9306,6 +9566,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         http.shutdown();
     }
     pass("stage 3c CSP spliced eval, act echoes, landed value");
+
+    // ── Stage 3d: recorded-motion replay ──────────────────────────
+    runMotionStage(&cl, gpa);
+    pass("stage 3d motion replay");
 
     // ── Stage 4: keyboard text entry ──────────────────────────────
     cl.navigate(input_page);
