@@ -1,5 +1,65 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-12: the MCP browser shows pages a real Chrome, not a SwiftShader rig
+
+claude.ai sign-in worked in the GUI browser and answered
+`sign_in_not_permitted` in the headless MCP browser. Measured against a
+real Chromium 152 on the same (GPU-less, no `/dev/dri`) host, the MCP
+helper differed in ways a page can read, and each is now made real rather
+than spoofed:
+
+- WebGL: the helper forced SwiftShader even where a GPU exists, so pages
+  read "ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device (Subzero) ...),
+  SwiftShader driver)" instead of the host GPU the GUI's browser shows.
+  Launchers now only ask for CPU-readable frames (`SKETERM_WEB_FRAMES=cpu`)
+  and `ozone.choose` decides WebGL once from `ozone.WebglPolicy` (`[mcp]
+  web_webgl` / profile, default `auto`): `auto` puts it on the host GPU
+  when a render node opens (paints stay CPU `on_paint`; an inherited
+  `LIBGL_ALWAYS_SOFTWARE` is dropped) and on SwiftShader otherwise (Jelle:
+  WebGL pages must keep working on a GPU-less host); `hardware` never
+  falls back, i.e. no context on a GPU-less host, which is what a headful
+  Chromium 152 here does (WebGL1/2 blocklisted); `off` never offers WebGL.
+  New capabilities `webgl-gpu` / `webgl-off` and the fact `web_webgl`
+  (`hardware`/`software`/`off`) report what the helper really launched.
+  The GPU branch is unmeasured: this host has no render node.
+- `screen.colorDepth` was 32; Chromium on Linux reports 24.
+- Stream KEY frames reached the page with an empty `KeyboardEvent.code`
+  (no native keycode). A keycode-less key now carries the US-keyboard
+  XKB keycode of its keysym (`keymap.physKey`), `KeyA` for `a`. MCP
+  `set_value` types real keys (`Host.typeKeys`: Shift press where needed,
+  down/char/up per character); stream TEXT stays the paste path and is
+  documented as such (a `keypress` with an empty `key`, no down/up).
+- Focus: an authenticated stream focuses its view, FOCUS 0 blurs it, and
+  a press/key/text on a blurred view refocuses it, as clicking into a
+  window does.
+- Popups: `web_stream {"popups":true}` (capability `stream-popups`) gives
+  every popup of the view its own raw stream, announced on the opener's
+  stream as a new helper-to-peer `POPUP` frame (tag 8, sent only to a
+  stream that asked) with socket path and token, and to MCP as an
+  unsolicited `ev_stream_open` (`req` 0).
+
+Tests: `ozone.zig` policy cases, `keymap.physKey`, POPUP encoding and
+announce-after-AUTH (`stream.zig`, `streamsrv.zig`), the `StreamOpen.popups`
+round trip, webdrive's unsolicited popup stream slot; smoke-mcp's stream
+stage now asserts the host's WebGL policy (renderer not SwiftShader or
+llvmpipe when a render node exists, skipped otherwise; SwiftShader on a
+GPU-less host), `webglPolicyStage` (`web_webgl = off` and `hardware`: the
+page context and the `web_webgl` fact match the policy; on this host both
+give no WebGL or WebGL2) and the new `streamFocusPopupStage` (focus at AUTH, blur,
+refocus by a press, `keydown:a:KeyA`, a real popup announced, streamed
+and focused).
+
+Not fixed, reported: `screen.width/height` and `outerWidth/outerHeight`
+equal the view (a real window reports its monitor and its chrome), and
+`screenX/Y` are 0; the shared OSR screen info has no monitor or toplevel
+to report without inventing one (GUI: the real monitor and window would
+have to travel to the helper; stream: the viewer's screen, which V1 does
+not carry). `navigator.keyboard.getLayoutMap()` is empty (headful
+Chromium here: 48 entries): headless ozone has no keyboard layout engine
+and CEF's C API cannot supply one. Same as a real Chromium on this host,
+so not differences: 0 speech voices (no speech-dispatcher here), empty
+UA-CH `platformVersion`, no WebGPU adapter.
+
 ## 2026-10-11: kitty Unicode placeholders resolve per frame from the grid
 
 opencode's TUI draws images with kitty Unicode placeholders and showed two
