@@ -1,5 +1,40 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-12: recorded human motion for automated browsing
+
+A `web_act` click teleported (one move, then press and release at once),
+typed text came at flat intervals and a scroll was one wheel delta: the
+textbook bot pattern. Per the approved design (MOTION-REPLAY-PLAN, kept
+out of the tree), the headless helper can now replay a person's RECORDED
+motion, opt-in per call:
+
+- `src/motion/` (pure, both test roots): the versioned pack format
+  (`pack.zig`), reach selection with a per-connection exclusion window,
+  the warp, Fitts timing, seeded jitter, typing and wheel-burst plans
+  (`replay.zig`), the trainer's recording model with its coverage grid
+  (`recorder.zig`), the packs directory (`store.zig`), the CLI
+  (`cli.zig`) and a synthetic test pack (`synth.zig`).
+- Wire: 0xE8 block, capability `motion-replay`: `motion_pack` chunks
+  answered by `ev_motion_pack`, `motion_scroll` / `ev_motion_done`, and
+  optional trailing `motion` / `duration_ms` on the semantic act frames.
+  The helper replays from its own poll loop and answers every run on
+  every exit (src/web/CLAUDE.md has the section).
+- MCP: `motion: "replay" | "direct"` on `web_act` and `web_scroll`,
+  replies carry `motion` and `motion_ms`; `web_motion_default` /
+  `web_motion_pack` in `[mcp]` / `[mcp.NAME]` and `--web-motion-default`
+  / `--web-motion-pack`; facts `web_motion`, `web_motion_default(_source)`,
+  `web_motion_replay`, `web_motion_broken`. A replay that cannot happen
+  fails closed, never clicks direct.
+- `sketerm motion record|install|list|remove`; the trainer is a GTK
+  window (also the palette's "Record Motion Pack") recording device
+  timestamps with coalesced history, the device class and its measured
+  rate; typing keeps timing per key class only.
+- Proof: smoke-web stage 3d, smoke-mcp `webMotionStage`, smoke-e2e
+  `SKETERM_SMOKE_E2E_MOTION_ONLY` (trainer on sketerm's own display,
+  injected reaches + Ctrl+S give a valid pack).
+- Not done: idle-drift replay, replayed custom-dropdown picks, replay
+  for GUI-backed tabs.
+
 ## 2026-10-12: the MCP browser shows pages a real Chrome, not a SwiftShader rig
 
 claude.ai sign-in worked in the GUI browser and answered

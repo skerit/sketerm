@@ -1741,6 +1741,69 @@ half in `cefhost/stream.zig`.
   one shows. smoke-mcp's `streamEncodedStage` decodes a real helper's
   stream and proves the raw fallback with `SKETERM_WEB_DISABLE_STREAM_ENCODED`.
 
+## Recorded-motion replay (0xE8 block, capability "motion-replay")
+
+`web_act` click/hover used to TELEPORT (one move, then press and release
+at the same instant), `set_value` typed at machine-flat intervals and a
+wheel scroll was one delta. With `motion = replay` the helper replays a
+person's RECORDED motion instead. The design is Jelle's (2026-10-12):
+the recorder is a native GTK window (`src/ui/motiontrainer.zig`), replay
+is opt-in per call with a configurable default (built-in `direct`), and
+only the trainer records; live use never is.
+
+- **The client sends the pack, the helper executes.** `motion_pack`
+  (0xE8) carries the validated pack file in bounded chunks
+  (`proto.MOTION_CHUNK`, whole pack at most `MOTION_PACK_MAX`), once per
+  CONNECTION; the completing chunk is parsed with the same pure
+  `src/motion/pack.zig` and answered by `ev_motion_pack` (0xE9) with the
+  counts, or a refusal that leaves the connection with NO pack. So an
+  `on:<host>` helper needs no files on its host, and one client's motion
+  is never replayed for another. `webdrive` re-sends it at every
+  handshake (`MotionLink`).
+- **Planning is pure, execution is a timer.** `src/motion/replay.zig`
+  picks the reach nearest (distance, direction, target width) excluding
+  the connection's last `exclusionWindow` picks, warps it with a complex
+  multiplier so the start is the pointer and the end exactly the sampled
+  landing point, stretches time by the pack's own fitted Fitts ratio and
+  jitters every sample from a per-replay `getentropy` seed. The helper
+  half (`cefhost/motion.zig`) turns the plan into timed `Step`s on the
+  view (`View.motion_run`); `motionPump` emits what is due from
+  `server.step`, and the poll timeout is shortened to the next due step
+  (`motionWaitMs`). Nothing sleeps, no thread exists, and each recorded
+  sample is its own `send_mouse_move_event` (the page's
+  `getCoalescedEvents()` sees the device rate).
+- **The request rides an OPTIONAL TRAILING byte.** `SemAction.motion` /
+  `SemActGuarded.motion` (written only for a replay, so a direct action
+  is the legacy bytes) and `SemActResult.motion` + `duration_ms`
+  (written only by a replay). `motion_scroll` (0xEA) is a new frame
+  answered by `ev_motion_done` (0xEB), because a wheel has no semantic
+  result. A replay asked of a connection with no pack is answered `ok=0`
+  at once (`motionConnFor`); it never runs direct.
+- **Every run is ANSWERED on every exit.** Completion posts the act
+  result (or, for typing, runs the ordinary commit read,
+  `semCommitTyped`, whose result then carries the motion). `motionCancel`
+  answers a superseded run (a new replay on the view), a navigation
+  (`semanticNavigationStarted`), the browser going away (`dropBrowser`:
+  discard, close, crash) and shutdown (`motionDeinit`), and first
+  releases any button or key the run still holds.
+- **Live human input is untouched.** Replay never reads or writes the
+  stream path or `input_*`; `View.motion_ptr` is set only by semantic
+  actions (direct or replayed) and is where the next reach starts. A view
+  the pointer never entered is entered from the edge nearest the target.
+- smoke-web stage 3d (`SKETERM_SMOKE_WEB_MOTION_ONLY`) proves it on a page
+  that logs its own events, with a GENERATED pack (`motion/synth.zig`;
+  never a person's): many moves before the press, strictly increasing
+  times, a real press duration, the landing inside the target, two
+  reaches onto one target that differ, a hover without a press, typing
+  whose gaps are not flat, a burst scroll, the superseded and the
+  navigation-cut answers, the unchanged direct click and the no-pack
+  refusal. `SKETERM_WEB_DISABLE_MOTION_REPLAY` withholds the capability
+  for the old-helper path (smoke-mcp).
+- Not done: idle drift is recorded but never replayed (the plan wanted it
+  opt-in per view; no surface exists yet), custom-dropdown option picks
+  in `set_value` stay direct, and replay is headless-MCP only (the GUI's
+  own face never sends a pack).
+
 ## Rules that outlive any one change
 
 - The wire protocol is **append-only**: new frame tags and capabilities,
