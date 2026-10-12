@@ -76,7 +76,11 @@ pub const Done = union(enum) {
 pub const Run = struct {
     steps: []Step,
     next: usize = 0,
+    /// When step times count from; slides forward when the loop falls
+    /// behind (`pumpView`).
     start_us: i64,
+    /// When the run began, for the duration actually taken.
+    began_us: i64,
     client_request: u32,
     done: Done,
     /// Input this run pressed and has not released yet.
@@ -84,13 +88,13 @@ pub const Run = struct {
     held_key: u32 = 0,
     held_shift: bool = false,
 
-    fn elapsedMs(self: *const Run, now_us: i64) f64 {
-        return @as(f64, @floatFromInt(now_us - self.start_us)) / 1000.0;
+    fn dueUs(self: *const Run) i64 {
+        return self.start_us + @as(i64, @intFromFloat(self.steps[self.next].at * 1000));
     }
 
-    fn durationMs(self: *const Run) u32 {
-        if (self.steps.len == 0) return 0;
-        return @intFromFloat(@max(@round(self.steps[self.steps.len - 1].at), 0));
+    /// Wall time the run took, slides included.
+    fn durationMs(self: *const Run, now_us: i64) u32 {
+        return @intCast(@max(@divFloor(now_us - self.began_us, 1000), 0));
     }
 };
 
@@ -200,11 +204,12 @@ fn begin(self: *Host, v: *View, steps: []Step, done: Done) void {
         finishFailed(self, v, done, self.active_sem_request, 0, "out of memory starting the motion replay");
         return;
     };
-    run.* = .{ .steps = steps, .start_us = clock.nowUs(), .client_request = self.active_sem_request, .done = done };
+    const now = clock.nowUs();
+    run.* = .{ .steps = steps, .start_us = now, .began_us = now, .client_request = self.active_sem_request, .done = done };
     v.motion_run = run;
-    // A plan's first steps are due at once; emit them now rather than a
+    // A plan's first step is due at once; emit it now rather than a
     // poll turn later.
-    pumpView(self, v, clock.nowUs());
+    pumpView(self, v, now);
 }
 
 /// Replay a reach onto `rect` (the element's centre x, y and size w, h,
@@ -395,20 +400,26 @@ fn emit(self: *Host, v: *View, run: *Run, s: Step) void {
     }
 }
 
+/// Emit the next step once it is due: ONE per turn. A loop that fell
+/// behind (load, a long engine turn) must not flush the backlog as a
+/// burst of same-instant moves, which is exactly the machine pattern
+/// replay exists to avoid; the rest of the plan slides by the lag
+/// instead, so the page still sees the recorded spacing, only later.
 fn pumpView(self: *Host, v: *View, now_us: i64) void {
     const run = v.motion_run orelse return;
-    const elapsed = run.elapsedMs(now_us);
-    while (run.next < run.steps.len and run.steps[run.next].at <= elapsed) {
-        const s = run.steps[run.next];
-        emit(self, v, run, s);
+    if (run.next < run.steps.len) {
+        const due_us = run.dueUs();
+        if (due_us > now_us) return;
+        emit(self, v, run, run.steps[run.next]);
         run.next += 1;
+        run.start_us += now_us - due_us;
+        if (run.next < run.steps.len) return;
     }
-    if (run.next < run.steps.len) return;
     v.motion_run = null;
     finishOk(self, v, run);
 }
 
-/// Emit every due step of every run.
+/// Emit the next due step of every run.
 pub fn motionPump(self: *Host) void {
     const now = clock.nowUs();
     for (self.views.items) |v| {
@@ -423,7 +434,7 @@ pub fn motionWaitMs(self: *Host) ?i64 {
     for (self.views.items) |v| {
         const run = v.motion_run orelse continue;
         if (run.next >= run.steps.len) return 0;
-        const due = run.start_us + @as(i64, @intFromFloat(run.steps[run.next].at * 1000));
+        const due = run.dueUs();
         const wait = @max(@divFloor(due - now + 999, 1000), 0);
         best = if (best) |b| @min(b, wait) else wait;
     }
@@ -438,7 +449,7 @@ fn finishOk(self: *Host, v: *View, run: *Run) void {
     const saved = self.active_sem_request;
     self.active_sem_request = run.client_request;
     defer self.active_sem_request = saved;
-    const duration = run.durationMs();
+    const duration = run.durationMs(clock.nowUs());
     switch (run.done) {
         .act => |a| {
             defer self.gpa.free(a.msg);
