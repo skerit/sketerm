@@ -22508,3 +22508,29 @@ covered the agents chip's white; the chips now clear it. smoke-agents-gui
 runs light, dark and GTK built-in dark with glyph-contrast checks, and the
 smoke-e2e watch stages press the popover's buttons over a private AT-SPI
 bus, with a new BADGE stage for the layout.
+
+## 2026-10-12: print to PDF honours the page's CSS page size; MCP web_print_pdf
+
+The helper's `print_pdf` (0xA4) gains two flag bits under the new
+capability `print-pdf-css-page`: `print_flag_css_page_size` (4) lets an
+`@page { size }` rule decide the sheet instead of the named paper, and
+`print_flag_no_margins` (8) drops the engine's own margins. A deck of
+1920x1080 px slides now prints as one 1440x810pt page per slide, with
+text kept as text and fonts embedded. The wire format is unchanged (the
+bits live in the existing `flags` byte) and an older helper ignores them.
+
+A new MCP tool exposes it, because sketerm-java (Folio's slide export)
+speaks only `sketerm mcp`: `web_print_pdf {pane, path, paper, landscape,
+background, css_page_size, no_margins}` prints a headless view to a local
+file and answers path/bytes/sha256; `capabilities` reports
+`web_print_pdf` and `web_print_pdf_css_page`. It refuses GUI-backed web
+tools and `on:<host>` views. The GUI's Print to PDF menu item still
+prints on the default paper.
+
+smoke-web stage 22h2 parses the written PDF (page count, MediaBox, text
+operators in each page's content stream, an embedded font program) for
+a local and a staged print, checks the margin bit on its own, and checks
+that the named paper still applies without the bits; stage 32d repeats
+the staged print over a remote helper on a mux channel; smoke-mcp's
+`webPrintPdfStage` drives the MCP tool. The PDF checks live in
+`src/smoke/pdf.zig`, shared by both rigs.
