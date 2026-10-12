@@ -4348,7 +4348,8 @@ fn webMotionStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const 
         _ = capSc(arena, no_cap, "replay on an old helper", true);
         if (std.mem.indexOf(u8, no_cap, "does not advertise motion-replay") == null) fail("a replay on a helper without motion-replay was not refused naming it");
         const title = old.callTool("web_eval", "{\"code\":\"document.title\"}");
-        if (std.mem.indexOf(u8, title, "clicked") != null) fail("a refused replay still clicked");
+        // The url itself spells the handler, so look for its RESULT.
+        if (std.mem.indexOf(u8, title, "clicked:true") != null) fail("a refused replay still clicked");
         old.closeStdinWait();
     }
 
