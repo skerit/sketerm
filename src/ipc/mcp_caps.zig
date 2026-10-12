@@ -342,6 +342,18 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
                 "web_download is available once the browser engine starts; it fetches a url INSIDE a view's browser (its cookies and session) straight to a file")
         else
             try res.text("this browser helper cannot download through a view (capabilities 'downloads' + 'download-start')");
+        // Printing a view: a consumer asks for an @page-sized sheet only
+        // when the running helper honours it.
+        const pr = @import("mcp_web.zig").printCapability();
+        try res.fact("web_print_pdf", pr.supported);
+        try res.fact("web_print_pdf_css_page", pr.css_page);
+        if (pr.supported)
+            try res.text(if (pr.css_page) |css| (if (css)
+                "web_print_pdf renders a view to a PDF file; css_page_size and no_margins are honoured"
+            else
+                "web_print_pdf renders a view to a PDF file; this helper predates css_page_size and no_margins")
+            else
+                "web_print_pdf renders a view to a PDF file; whether css_page_size is honoured is known once the browser engine starts");
         // Response-body capture: a fail-closed open option, so a
         // consumer must be able to preflight it rather than trip over
         // the refusal.

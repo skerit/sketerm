@@ -53,6 +53,13 @@ pub const CAP_PRINT_PDF = "print-pdf";
 /// only write a path on its own host, so a client must not offer the
 /// verb for a remote view.
 pub const CAP_PRINT_PDF_STAGING = "print-pdf-staging";
+/// The helper honours `print_flag_css_page_size` (an `@page { size }`
+/// rule decides the sheet, `paper`/landscape apply only to a document
+/// that declares none) and `print_flag_no_margins` (the engine adds no
+/// margin of its own). An older helper ignores unknown flag bits and
+/// prints on the named paper, so a client sets them only when this is
+/// advertised.
+pub const CAP_PRINT_PDF_CSS_PAGE = "print-pdf-css-page";
 /// The helper accepts `input_paste` and `clipboard_read`, and answers
 /// the latter with `ev_clipboard_text`.
 ///
@@ -446,6 +453,7 @@ pub const Cap = enum {
     devtools,
     print_pdf,
     print_pdf_staging,
+    print_pdf_css_page,
     clipboard,
     find,
     zoom,
@@ -3808,7 +3816,7 @@ pub const ENGINE_VIEW_BASE: u32 = 0x4000_0000;
 pub const PrintPdf = struct {
     pub const tag: Tag = .print_pdf;
     view: u32,
-    /// `print_flag_*` bits.
+    /// `print_flag_*` bits; a bit this helper does not know is ignored.
     flags: u8,
     /// `Paper` value; anything unknown means the engine default.
     paper: u8,
@@ -3836,6 +3844,12 @@ pub const PrintPdf = struct {
 /// `PrintPdf.flags` bits.
 pub const print_flag_landscape: u8 = 1;
 pub const print_flag_background: u8 = 2;
+/// Capability `print-pdf-css-page`: the document's `@page { size }` wins
+/// over `paper` and `print_flag_landscape`.
+pub const print_flag_css_page_size: u8 = 4;
+/// Capability `print-pdf-css-page`: no engine default margins, which a
+/// document without an `@page` margin rule otherwise gets.
+pub const print_flag_no_margins: u8 = 8;
 
 /// `PrintPdf.paper` presets, in the engine-agnostic terms every
 /// engine has: a named sheet, not a driver's page-setup blob.
@@ -4057,7 +4071,7 @@ pub const EvRequestRefused = struct {
 /// Capabilities an untrusted helper leaves out of `hello_ack`; `untrustedWithheld` refuses their frames.
 pub fn untrustedWithholdsCap(cap: Cap) bool {
     return switch (cap) {
-        .devtools, .print_pdf, .print_pdf_staging, .clipboard, .popup_open, .downloads, .download_start, .download_staging, .download_errors, .userscripts, .userscripts_gm, .webext, .webext_tabs, .webext_action, .webext_events, .webext_transaction, .filter_subscribe, .cookie_sync, .observe, .observe_notify => true,
+        .devtools, .print_pdf, .print_pdf_staging, .print_pdf_css_page, .clipboard, .popup_open, .downloads, .download_start, .download_staging, .download_errors, .userscripts, .userscripts_gm, .webext, .webext_tabs, .webext_action, .webext_events, .webext_transaction, .filter_subscribe, .cookie_sync, .observe, .observe_notify => true,
         else => false,
     };
 }
@@ -6617,7 +6631,7 @@ test "round-trip: devtools and print-to-pdf frames" {
     try roundTrip(EvDevToolsView, .{ .view = 7, .devtools = 0, .reason = "windowed" });
     try roundTrip(PrintPdf, .{
         .view = 7,
-        .flags = print_flag_landscape | print_flag_background,
+        .flags = print_flag_landscape | print_flag_background | print_flag_css_page_size | print_flag_no_margins,
         .paper = @intFromEnum(Paper.a4),
         .path = "/tmp/page.pdf",
     });

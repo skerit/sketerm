@@ -54,6 +54,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const c = @import("c.zig").c;
 const smoke_tls = @import("smoke_tls.zig");
+const smoke_pdf = @import("smoke/pdf.zig");
 const tcpserver = @import("smoke/tcpserver.zig");
 const unixsock = @import("smoke/unixsock.zig");
 const proto = @import("web/protocol.zig");
@@ -2954,6 +2955,126 @@ fn writeFile(dir: []const u8, name: []const u8, body: []const u8) bool {
     if (fd < 0) return false;
     defer _ = c.close(fd);
     return c.write(fd, body.ptr, body.len) == @as(isize, @intCast(body.len));
+}
+
+const deck_page = smoke_pdf.deck_page;
+
+/// The same deck without an `@page` margin, so only
+/// `print_flag_no_margins` can take the engine's default margins away.
+const deck_unmargined_page = smoke_pdf.deckHtml("size:1920px 1080px");
+
+/// Read a PDF the helper wrote; fails the stage when the file is missing
+/// or not shaped like an engine PDF.
+fn readPdfShape(path: [*:0]const u8, comptime what: []const u8) smoke_pdf.Shape {
+    return smoke_pdf.read(path) catch |err| {
+        std.debug.print("smoke-web: {s}: reading the PDF failed ({s})\n", .{ what, @errorName(err) });
+        fail(what ++ ": the PDF could not be read");
+    };
+}
+
+/// The deck printed with the CSS page size: three borderless 1440x810pt
+/// pages, each with its text still text.
+fn expectDeckPdf(path: [*:0]const u8, comptime what: []const u8) void {
+    const shape = readPdfShape(path, what);
+    for (shape.slice(), 0..) |p, i|
+        std.debug.print("smoke-web: MEASURED {s} page {d}: {d:.2} x {d:.2} pt, text={}\n", .{ what, i + 1, p.w, p.h, p.text });
+    if (smoke_pdf.deckProblem(&shape)) |why| {
+        say(why);
+        fail(what ++ ": the deck PDF is wrong (reason above)");
+    }
+}
+
+/// Send one print and wait for its answer; fails on silence or failure.
+fn printWait(cl: *Client, req: proto.PrintPdf, comptime what: []const u8) void {
+    const seq = cl.print_seq;
+    cl.send(req);
+    if (!cl.waitSeq(&cl.print_seq, seq, 30_000)) fail(what ++ ": no ev_print_pdf_done");
+    if (cl.print_ok != 1) fail(what ++ ": the helper reported a failure");
+    if (!std.mem.eql(u8, cl.print_path[0..cl.print_path_len], req.path)) fail(what ++ ": the done event echoed a different path");
+}
+
+/// Load the deck and print it STAGED with the CSS page flags: the shape a
+/// client on another host uses, and the only one a remote helper serves.
+fn deckStagedPrint(cl: *Client, dir: []const u8, comptime what: []const u8) void {
+    if (!cl.acks(.print_pdf_css_page)) fail(what ++ ": hello_ack lacks the print-pdf-css-page capability");
+    if (!cl.acks(.print_pdf_staging)) fail(what ++ ": hello_ack lacks the print-pdf-staging capability");
+    const load = cl.load_seq;
+    cl.send(proto.Navigate{ .view = view_id, .url = deck_page });
+    if (!cl.waitSeq(&cl.load_seq, load, 20_000)) fail(what ++ ": the deck never finished loading");
+    var key_buf: [128]u8 = undefined;
+    const key = std.fmt.bufPrintZ(&key_buf, "{s}/deck-staged-key.pdf", .{dir}) catch fail("pdf key path");
+    printWait(cl, .{
+        .view = view_id,
+        .flags = proto.print_flag_css_page_size | proto.print_flag_no_margins | proto.print_flag_background,
+        .paper = @intFromEnum(proto.Paper.a4),
+        .path = key,
+        .stage = 1,
+    }, what);
+    if (cl.print_staged_len == 0) fail(what ++ ": a staged print named no staged file");
+    if (c.access(key.ptr, c.F_OK) == 0) fail(what ++ ": a staged print wrote the request path too");
+    defer _ = c.unlink(@ptrCast(&cl.print_staged));
+    expectDeckPdf(@ptrCast(&cl.print_staged), what);
+}
+
+/// Stage 22h2: `print-pdf-css-page`. The deck's own `@page` decides the
+/// sheet only under the flag; without it the named paper still wins.
+fn cssPagePdfStage(cl: *Client, dir: []const u8) void {
+    const what = "stage 22h2 print_pdf css page";
+    if (!cl.acks(.print_pdf_css_page)) fail(what ++ ": hello_ack lacks the print-pdf-css-page capability");
+    cl.navigate(deck_page);
+
+    // A4 named and landscape asked for: the document's size must still win.
+    var pdf_buf: [128]u8 = undefined;
+    const pdf = std.fmt.bufPrintZ(&pdf_buf, "{s}/deck.pdf", .{dir}) catch fail("pdf path");
+    printWait(cl, .{
+        .view = view_id,
+        .flags = proto.print_flag_css_page_size | proto.print_flag_no_margins | proto.print_flag_background | proto.print_flag_landscape,
+        .paper = @intFromEnum(proto.Paper.a4),
+        .path = pdf,
+    }, what);
+    expectDeckPdf(pdf, what);
+
+    // `print_flag_no_margins` on its own terms: a deck that sets no `@page`
+    // margin gets the engine's default margins (each 1080px slide then
+    // spills onto a second page, measured 6 pages), and none under the flag.
+    cl.navigate(deck_unmargined_page);
+    var um_buf: [128]u8 = undefined;
+    const um = std.fmt.bufPrintZ(&um_buf, "{s}/deck-um.pdf", .{dir}) catch fail("pdf path");
+    printWait(cl, .{ .view = view_id, .flags = proto.print_flag_css_page_size | proto.print_flag_background, .paper = 0, .path = um }, what ++ " (engine margins)");
+    const margined = readPdfShape(um, what ++ " (engine margins)");
+    std.debug.print("smoke-web: MEASURED {s}: an unmargined deck prints as {d} pages with engine margins\n", .{ what, margined.count });
+    if (margined.count <= 3) fail(what ++ " (engine margins): the engine added no default margin, so the no-margins check proves nothing");
+    printWait(cl, .{ .view = view_id, .flags = proto.print_flag_css_page_size | proto.print_flag_no_margins | proto.print_flag_background, .paper = 0, .path = um }, what ++ " (no margins)");
+    if (readPdfShape(um, what ++ " (no margins)").count != 3) fail(what ++ " (no margins): print_flag_no_margins left engine margins in place");
+    cl.navigate(deck_page);
+
+    // Without the flags the named paper still wins: A4 sheets. The engine
+    // already turned a wider-than-tall `@page` into a LANDSCAPE A4 before
+    // this flag existed (measured 841.92 x 595.92), so either orientation
+    // is the unchanged behaviour here; 22h asserts portrait for a page
+    // that declares no `@page` at all.
+    var a4_buf: [128]u8 = undefined;
+    const a4 = std.fmt.bufPrintZ(&a4_buf, "{s}/deck-a4.pdf", .{dir}) catch fail("pdf path");
+    printWait(cl, .{ .view = view_id, .flags = proto.print_flag_background, .paper = @intFromEnum(proto.Paper.a4), .path = a4 }, what ++ " (no flag)");
+    const shape = readPdfShape(a4, what ++ " (no flag)");
+    if (shape.count == 0) fail(what ++ " (no flag): the A4 print has no pages");
+    std.debug.print("smoke-web: MEASURED {s} without the flag: {d} pages of {d:.2} x {d:.2} pt\n", .{ what, shape.count, shape.pages[0].w, shape.pages[0].h });
+    for (shape.pages[0..shape.count]) |p| {
+        if (a4Orientation(p) == .none) fail(what ++ " (no flag): a page is not an A4 sheet");
+    }
+
+    deckStagedPrint(cl, dir, what ++ " (staged)");
+}
+
+/// Whether a page is an A4 sheet (`proto.paperInches(.a4)` at 72pt per
+/// inch, within the engine's rounding to device units), and which way up.
+fn a4Orientation(p: smoke_pdf.Page) enum { portrait, landscape, none } {
+    const sheet = proto.paperInches(@intFromEnum(proto.Paper.a4)).?;
+    const w = sheet.w * 72;
+    const h = sheet.h * 72;
+    if (@abs(p.w - w) <= 2 and @abs(p.h - h) <= 2) return .portrait;
+    if (@abs(p.w - h) <= 2 and @abs(p.h - w) <= 2) return .landscape;
+    return .none;
 }
 
 /// A counter plus the value it must pass: what every wait in the
@@ -10746,6 +10867,12 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         if (size < 1000) fail("stage 22h print_pdf: the PDF is too small to hold a rendered page");
         std.debug.print("smoke-web: MEASURED pdf {d} bytes\n", .{size});
         if (cl.print_staged_len != 0) fail("stage 22h print_pdf: an unstaged print reported a staged path");
+        // No `@page` rule and no new flag: the named sheet, upright.
+        const a4 = readPdfShape(pdf, "stage 22h print_pdf");
+        for (a4.pages[0..a4.count]) |p| {
+            if (a4Orientation(p) != .portrait) fail("stage 22h print_pdf: a page is not a portrait A4 sheet");
+        }
+        if (a4.count == 0) fail("stage 22h print_pdf: the PDF has no pages");
 
         // STAGED (print-pdf-staging): the request path is only the
         // correlation key; the helper prints into a private file of its
@@ -10793,6 +10920,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         if (cl.print_ok != 0) fail("stage 22h print_pdf: an unknown view was reported as success");
     }
     pass("stage 22h print_pdf (real PDF on disk, failures answered)");
+    cssPagePdfStage(&cl, dir);
+    pass("stage 22h2 print_pdf css page (3 x 1440x810pt pages with text, staged too; A4 without the flag)");
 
     // ── Stage 22e: DevTools ────────────────────────────────────────
     //
@@ -11549,6 +11678,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         });
         if (!rc.waitInlineCenter(.{ 255, 0, 255 }, 15_000)) fail("stage 32: the click never repainted magenta");
         pass("stage 32c input over the bridge (mousedown repaints)");
+
+        // The `on:<host>` shape: a remote helper's PDF only ever leaves it
+        // staged, so the CSS page flags must survive that path too.
+        deckStagedPrint(&rc, dir, "stage 32d remote print_pdf css page");
+        pass("stage 32d remote print_pdf css page (staged deck over the bridge: 3 x 1440x810pt pages)");
 
         // Teardown: closing the protocol socket ends the channel; the
         // daemon kills the helper (it dies with the channel) and the

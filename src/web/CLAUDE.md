@@ -258,6 +258,23 @@ transfer, as a download-strip row). A failed staged print is removed
 by the helper. DevTools is refused for such a tab: CEF would open the
 inspector in a window on the remote host.
 
+With `print-pdf-css-page` two more `PrintPdf.flags` bits exist, each
+independent and combinable with `print_flag_background` and a staged
+print: `print_flag_css_page_size` (4) sets CEF's
+`prefer_css_page_size`, so an `@page { size }` rule decides the sheet
+and `paper`/`print_flag_landscape` only apply to a document without
+one; `print_flag_no_margins` (8) sets `margin_type =
+PDF_PRINT_MARGIN_NONE`. Measured on CEF 151 (smoke-web 22h2): an
+`@page { margin: 0 }` rule is honoured even WITHOUT the no-margins bit,
+while a deck that declares no `@page` margin gets the engine's default
+margins and each 1080px slide spills onto a second page (6 pages for
+3 slides) unless the bit is set. Without the size bit a wider-than-tall
+`@page` still turns the named paper LANDSCAPE: that rotation is
+Chromium's own and predates the flag. An older helper ignores unknown
+flag bits and prints on the named paper, so clients send the bits only
+when the capability is advertised. Stage 32d repeats the staged deck
+print over the remote (mux channel) helper path.
+
 ## Accessibility (0x70 block, capability "a11y")
 
 - **Nothing streams before `a11y_enable` for that view.** Engine-side

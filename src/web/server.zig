@@ -125,6 +125,7 @@ const unconditional_caps = [_]proto.Cap{
     .devtools,
     .print_pdf,
     .print_pdf_staging,
+    .print_pdf_css_page,
     .clipboard,
     .popup_open,
     .downloads,

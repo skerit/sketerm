@@ -655,6 +655,16 @@ pub fn downloadCapability() struct { supported: bool, started: bool } {
     return .{ .supported = e.has(.downloads) and e.has(.download_start), .started = true };
 }
 
+/// What `capabilities` reports about `web_print_pdf`: a code fact before
+/// the headless helper starts, negotiated afterwards. `css_page` is null
+/// until a handshake says whether the helper honours the layout flags.
+pub fn printCapability() struct { supported: bool, css_page: ?bool } {
+    if (guiDrivesWeb() or g_headless_alloc == null) return .{ .supported = false, .css_page = false };
+    const e = currentEngine() orelse headlessEngine() orelse return .{ .supported = true, .css_page = null };
+    if (e.state != .ready) return .{ .supported = true, .css_page = null };
+    return .{ .supported = e.has(.print_pdf), .css_page = e.has(.print_pdf) and e.has(.print_pdf_css_page) };
+}
+
 /// Stream support is a code fact before startup and negotiated thereafter; audio is unknown before the handshake.
 /// `encoded` likewise: whether the helper honours an encoded open.
 pub fn streamCapability() struct { supported: bool, audio: ?bool, encoded: ?bool } {
@@ -4891,6 +4901,7 @@ pub fn webTool(
     if (eql(u8, name, "web_capture_set")) return captureSetTool(drv, arena, args, view);
     if (eql(u8, name, "web_network")) return networkTool(drv, arena, args, view);
     if (eql(u8, name, "web_download")) return downloadTool(drv, arena, args, view);
+    if (eql(u8, name, "web_print_pdf")) return printTool(drv, arena, args, view);
 
     if (eql(u8, name, "web_screenshot")) {
         const png = switch (try capturePng(drv, arena, view, timeoutOf(args, 3000))) {
@@ -7016,6 +7027,79 @@ fn networkTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view
         .err => |e| return failRes(arena, e),
         .json => |json| return networkResult(arena, drv.mode(), view, counters, json),
     }
+}
+
+// ---------------------------------------------------------------------
+// web_print_pdf: the page rendered to a PDF file by its own browser
+// ---------------------------------------------------------------------
+
+/// `web_print_pdf`. Headless only: the GUI's control socket has no print
+/// verb (its user prints from the page's own Print to PDF item).
+fn printTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view: View) ![]const u8 {
+    const e = switch (drv) {
+        .gui => return mcp.errRes(arena, .unavailable, "web_print_pdf is headless only; in the sketerm GUI a page prints through its Print to PDF menu item"),
+        .headless => |engine| engine,
+    };
+    // The helper writes the file, so a helper on another host would
+    // write it THERE while this reply names a local path.
+    if (e.route_kind == .remote_browser)
+        return mcp.errRes(arena, .unavailable, "this view's browser runs on another host and would write the PDF there; web_print_pdf prints views of a local browser helper");
+    const path = mcp.argStr(args, "path") orelse
+        return mcp.errRes(arena, .invalid_args, "web_print_pdf needs 'path': the absolute file the PDF is written to");
+    if (path.len == 0 or path[0] != '/') return mcp.errRes(arena, .invalid_args, "'path' must be an absolute file path");
+    const paper: web_proto.Paper = if (mcp.argStr(args, "paper")) |name|
+        std.meta.stringToEnum(web_proto.Paper, name) orelse
+            return mcp.errRes(arena, .invalid_args, "'paper' must be one of: " ++ comptime paperNames())
+    else
+        .default;
+    const css_page_size = mcp.argBool(args, "css_page_size");
+    const no_margins = mcp.argBool(args, "no_margins");
+    const background = if (mcp.argValue(args, "background")) |v| v != .bool or v.bool else true;
+    var flags: u8 = 0;
+    if (mcp.argBool(args, "landscape")) flags |= web_proto.print_flag_landscape;
+    if (background) flags |= web_proto.print_flag_background;
+    if (css_page_size) flags |= web_proto.print_flag_css_page_size;
+    if (no_margins) flags |= web_proto.print_flag_no_margins;
+
+    e.startPrint(view.pane, path, flags, @intFromEnum(paper)) catch |err| return mcp.errRes(arena, switch (err) {
+        error.Busy => .conflict,
+        error.BadPath => .invalid_args,
+        else => .unavailable,
+    }, switch (err) {
+        error.Unsupported => "this browser helper cannot print to PDF (capability 'print-pdf')",
+        error.UnsupportedPageLayout => "this browser helper predates css_page_size/no_margins (capability 'print-pdf-css-page') and would print on the named paper; nothing was printed",
+        error.Busy => "a print to that path is still running",
+        error.BadPath => "'path' must be an absolute file path",
+        else => return failRes(arena, try headlessFail(arena, e, err)),
+    });
+    defer e.takePrint(path);
+    const deadline = clock.nowMs() + timeoutOf(args, 60_000);
+    while (e.printState(path).?.state == .pending) {
+        if (clock.nowMs() >= deadline)
+            return mcp.errRes(arena, .timeout, "the browser engine had not finished the PDF when the call's budget ran out; it may still be written");
+        drv.sleep(POLL_MS);
+    }
+    const done = e.printState(path).?;
+    if (done.state == .failed) return mcp.errRes(arena, .failed, done.fail_reason);
+
+    var res = mcp.Res.init(arena);
+    try head(&res, arena, drv.mode(), view);
+    const bytes = mcp_term.fileSize(path) orelse 0;
+    try res.fact("path", path);
+    try fileFacts(&res, path);
+    try res.fact("bytes", bytes);
+    if (mcp_term.sha256File(path)) |hex| try res.fact("sha256", try arena.dupe(u8, hex[0..]));
+    try res.fact("paper", @tagName(paper));
+    try res.fact("css_page_size", css_page_size);
+    try res.fact("no_margins", no_margins);
+    try res.textf("printed the page to {s} ({d} bytes)", .{ path, bytes });
+    return res.finish();
+}
+
+fn paperNames() []const u8 {
+    var out: []const u8 = "";
+    for (@typeInfo(web_proto.Paper).@"enum".fields, 0..) |f, i| out = out ++ (if (i > 0) ", " else "") ++ f.name;
+    return out;
 }
 
 // ---------------------------------------------------------------------
@@ -9997,7 +10081,7 @@ test "every tool this module serves declares an output schema" {
             return error.MissingOutputSchema;
         }
     }
-    try std.testing.expectEqual(@as(usize, 32), seen);
+    try std.testing.expectEqual(@as(usize, 33), seen);
 }
 
 test "parsePolicy fails closed on unknown names and invalid host authorities" {

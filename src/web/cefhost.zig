@@ -2665,6 +2665,8 @@ pub const Host = struct {
             settings.paper_width = sheet.w;
             settings.paper_height = sheet.h;
         }
+        if (req.flags & proto.print_flag_css_page_size != 0) settings.prefer_css_page_size = 1;
+        if (req.flags & proto.print_flag_no_margins != 0) settings.margin_type = cef.PDF_PRINT_MARGIN_NONE;
         var path = std.mem.zeroes(cef.cef_string_t);
         setStr(entry.target(), &path);
         defer cef.cef_string_utf16_clear(&path);

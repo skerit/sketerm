@@ -445,6 +445,32 @@ pub const DownloadError = error{
     BadPath,
 };
 
+/// One `print_pdf` this client asked for. The helper's answer carries no
+/// request id, so the PATH is the correlation key: one print per path
+/// may be in flight.
+pub const Print = struct {
+    view: u32,
+    /// The file the helper writes; owned.
+    path: []u8,
+    state: enum { pending, done, failed } = .pending,
+    /// Why it failed when nothing better is known. Static strings.
+    fail_reason: []const u8 = "",
+};
+
+pub const PrintError = error{
+    Unavailable,
+    NoView,
+    /// The helper predates `print-pdf`, or withholds it (untrusted).
+    Unsupported,
+    /// The flags ask for a CSS page size or no margins and the helper
+    /// predates `print-pdf-css-page`: it would print on the named paper.
+    UnsupportedPageLayout,
+    /// A print to the same path is still in flight.
+    Busy,
+    OutOfMemory,
+    BadPath,
+};
+
 pub const ConsoleLine = struct { id: u32, level: u8, text: []u8 };
 
 /// Console mirror bounds: entries kept per view, bytes kept per line.
@@ -1103,6 +1129,8 @@ pub const Engine = struct {
     /// Bounded by `DOWNLOAD_CAP`, drop-oldest-finished.
     downloads: std.ArrayList(Download) = .empty,
     next_download_req: u32 = 1,
+    /// Prints asked for and not yet collected by `takePrint`.
+    prints: std.ArrayList(Print) = .empty,
     next_sem_request: u32 = 1,
     next_stream_request: u32 = 1,
     /// Stamps every `net_policy_set`; `ev_net_policy` echoes it so a
@@ -1313,6 +1341,8 @@ pub const Engine = struct {
         self.views.deinit(self.gpa);
         self.clearDownloads();
         self.downloads.deinit(self.gpa);
+        self.clearPrints();
+        self.prints.deinit(self.gpa);
         self.in.deinit(self.gpa);
         self.rx_fds.deinit(self.gpa);
         // Persistent contexts are deliberately NEVER destroyed at
@@ -1722,6 +1752,7 @@ pub const Engine = struct {
         // what turns a lost helper into an ANSWER for whoever is
         // waiting on the file, instead of a wait that runs out.
         self.failDownloads(LOST_MSG);
+        self.failPrints(LOST_MSG);
         self.removePresence();
         self.state = .unavailable;
         self.owner = .none;
@@ -3368,6 +3399,71 @@ pub const Engine = struct {
         }
     }
 
+    // ---- print to PDF ------------------------------------------------
+
+    fn clearPrints(self: *Engine) void {
+        for (self.prints.items) |p| self.gpa.free(p.path);
+        self.prints.clearRetainingCapacity();
+    }
+
+    fn failPrints(self: *Engine, reason: []const u8) void {
+        for (self.prints.items) |*p| {
+            if (p.state != .pending) continue;
+            p.state = .failed;
+            p.fail_reason = reason;
+        }
+    }
+
+    fn printIndex(self: *const Engine, path: []const u8) ?usize {
+        for (self.prints.items, 0..) |p, i| {
+            if (std.mem.eql(u8, p.path, path)) return i;
+        }
+        return null;
+    }
+
+    /// Ask `view`'s browser to render its page to a PDF at `path`, which
+    /// the HELPER writes (a path on the helper's host). Poll with
+    /// `printState`, then drop the record with `takePrint`.
+    pub fn startPrint(self: *Engine, view_id: u32, path: []const u8, flags: u8, paper: u8) PrintError!void {
+        if (!self.ensure()) return error.Unavailable;
+        if (!self.has(.print_pdf)) return error.Unsupported;
+        const layout = proto.print_flag_css_page_size | proto.print_flag_no_margins;
+        if (flags & layout != 0 and !self.has(.print_pdf_css_page)) return error.UnsupportedPageLayout;
+        if (self.findView(view_id) == null) return error.NoView;
+        if (path.len == 0 or path[0] != '/') return error.BadPath;
+        if (self.printIndex(path)) |i| {
+            if (self.prints.items[i].state == .pending) return error.Busy;
+            self.gpa.free(self.prints.orderedRemove(i).path);
+        }
+        const owned = try self.gpa.dupe(u8, path);
+        errdefer self.gpa.free(owned);
+        try self.prints.append(self.gpa, .{ .view = view_id, .path = owned });
+        self.send(proto.PrintPdf{ .view = view_id, .flags = flags, .paper = paper, .path = path }) catch {
+            _ = self.prints.pop();
+            return error.Unavailable;
+        };
+    }
+
+    /// The state of the print to `path`, or null when none was asked for.
+    pub fn printState(self: *const Engine, path: []const u8) ?Print {
+        const i = self.printIndex(path) orelse return null;
+        return self.prints.items[i];
+    }
+
+    /// Forget the print to `path`, answered or not.
+    pub fn takePrint(self: *Engine, path: []const u8) void {
+        const i = self.printIndex(path) orelse return;
+        self.gpa.free(self.prints.orderedRemove(i).path);
+    }
+
+    fn onPrintDone(self: *Engine, ev: proto.EvPrintPdfDone) void {
+        const i = self.printIndex(ev.path) orelse return;
+        const p = &self.prints.items[i];
+        if (p.state != .pending) return;
+        p.state = if (ev.ok != 0) .done else .failed;
+        if (ev.ok == 0) p.fail_reason = "the browser engine could not write the PDF there";
+    }
+
     fn nextDownloadReq(self: *Engine) u32 {
         const r = self.next_download_req;
         self.next_download_req +%= 1;
@@ -4298,6 +4394,10 @@ pub const Engine = struct {
                 const ev = proto.decode(proto.EvDownloadProgress, frame.payload) catch return;
                 self.onDownloadProgress(ev);
             },
+            .ev_print_pdf_done => {
+                const ev = proto.decode(proto.EvPrintPdfDone, frame.payload) catch return;
+                self.onPrintDone(ev);
+            },
             .ev_console => {
                 const ev = proto.decode(proto.EvConsole, frame.payload) catch return;
                 if (self.findView(ev.view)) |v| self.pushConsole(v, ev.level, ev.msg);
@@ -4989,6 +5089,47 @@ test "frame rates are per-view, pre-create, bounded and fail closed on unsupport
     pair.eng.caps.remove(.view_max_fps);
     try t.expectError(error.FrameRateUnsupported, pair.eng.openStream(t.allocator, view.id, false, 10, 60, null));
     try t.expectEqual(@as(usize, 0), pair.drain(&buf).len);
+}
+
+test "print_pdf: layout flags need print-pdf-css-page, answers join by path, a lost helper fails them" {
+    const t = std.testing;
+    var pair = try Pair.init(t.allocator);
+    defer pair.deinit();
+    var buf: [4096]u8 = undefined;
+    const view = try pair.eng.openView("about:blank", 800, 600);
+    _ = pair.drain(&buf);
+    const flags = proto.print_flag_css_page_size | proto.print_flag_no_margins | proto.print_flag_background;
+
+    try t.expectError(error.Unsupported, pair.eng.startPrint(view.id, "/tmp/deck.pdf", 0, 0));
+    pair.eng.caps.insert(.print_pdf);
+    // An older helper would print the deck on the named paper: refused,
+    // and nothing reaches the wire.
+    try t.expectError(error.UnsupportedPageLayout, pair.eng.startPrint(view.id, "/tmp/deck.pdf", flags, 0));
+    try t.expectEqual(@as(usize, 0), pair.drain(&buf).len);
+    try t.expectError(error.BadPath, pair.eng.startPrint(view.id, "deck.pdf", 0, 0));
+    try t.expectError(error.NoView, pair.eng.startPrint(view.id + 99, "/tmp/deck.pdf", 0, 0));
+
+    pair.eng.caps.insert(.print_pdf_css_page);
+    try pair.eng.startPrint(view.id, "/tmp/deck.pdf", flags, @intFromEnum(proto.Paper.a4));
+    var reader = proto.Reader.init(pair.drain(&buf));
+    const req = try proto.decode(proto.PrintPdf, (try reader.next()).?.payload);
+    try t.expectEqual(flags, req.flags);
+    try t.expectEqualStrings("/tmp/deck.pdf", req.path);
+    try t.expectError(error.Busy, pair.eng.startPrint(view.id, "/tmp/deck.pdf", flags, 0));
+
+    // Another path's answer leaves this print pending; its own finishes it.
+    pair.eng.onPrintDone(.{ .view = view.id, .ok = 1, .path = "/tmp/other.pdf" });
+    try t.expect(pair.eng.printState("/tmp/deck.pdf").?.state == .pending);
+    pair.eng.onPrintDone(.{ .view = view.id, .ok = 1, .path = "/tmp/deck.pdf" });
+    try t.expect(pair.eng.printState("/tmp/deck.pdf").?.state == .done);
+    pair.eng.takePrint("/tmp/deck.pdf");
+    try t.expect(pair.eng.printState("/tmp/deck.pdf") == null);
+
+    try pair.eng.startPrint(view.id, "/tmp/deck.pdf", 0, 0);
+    pair.eng.failPrints("gone");
+    const lost = pair.eng.printState("/tmp/deck.pdf").?;
+    try t.expect(lost.state == .failed);
+    try t.expectEqualStrings("gone", lost.fail_reason);
 }
 
 test "stream timeout cancels the slot and late replies cannot satisfy another open" {

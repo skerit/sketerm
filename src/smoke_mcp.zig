@@ -26,6 +26,7 @@ const opuscodec = @import("mux/opuscodec.zig");
 const netpolicy = @import("web/netpolicy.zig");
 const version = @import("version.zig");
 const smoke_tls = @import("smoke_tls.zig");
+const smoke_pdf = @import("smoke/pdf.zig");
 const appdrive = @import("ipc/appdrive.zig");
 const platform = @import("util/platform.zig");
 const testserver = @import("agent/testserver.zig");
@@ -3259,6 +3260,52 @@ fn webDownloadStage(m: *Mcp, rt: []const u8, port: u16) void {
     _ = m.callTool("web_close", "{}");
 }
 
+/// `web_print_pdf` end to end against a real engine: the slide deck that
+/// declares `@page { size: 1920px 1080px; margin: 0 }` prints, through the
+/// MCP tool a Java client calls, as three 1440x810pt pages with real text,
+/// and `capabilities` preflights both the verb and the layout flags.
+fn webPrintPdfStage(m: *Mcp, rt: []const u8) void {
+    var args_buf: [1024]u8 = undefined;
+    const opened = m.callTool("web_open", std.fmt.bufPrint(&args_buf, "{{\"url\":\"{s}\",\"snapshot\":\"none\"}}", .{smoke_pdf.deck_page}) catch unreachable);
+    if (std.mem.indexOf(u8, opened, "isError") != null) {
+        std.debug.print("smoke-mcp: web_open deck: {s}\n", .{opened});
+        fail("print stage: could not open the slide deck");
+    }
+    const caps = m.callTool("capabilities", "{}");
+    if (std.mem.indexOf(u8, caps, "\"web_print_pdf\":true") == null)
+        fail("capabilities does not report that web_print_pdf works here");
+    if (std.mem.indexOf(u8, caps, "\"web_print_pdf_css_page\":true") == null)
+        fail("capabilities does not report that the running helper honours css_page_size");
+
+    var pdf_buf: [512:0]u8 = undefined;
+    const pdf = std.fmt.bufPrintZ(&pdf_buf, "{s}/home/deck.pdf", .{rt}) catch unreachable;
+    const printed = m.callTool("web_print_pdf", std.fmt.bufPrint(
+        &args_buf,
+        "{{\"path\":\"{s}\",\"css_page_size\":true,\"no_margins\":true,\"paper\":\"a4\",\"timeout_ms\":30000}}",
+        .{pdf},
+    ) catch unreachable);
+    if (std.mem.indexOf(u8, printed, "isError") != null) {
+        std.debug.print("smoke-mcp: web_print_pdf: {s}\n", .{printed});
+        fail("web_print_pdf failed");
+    }
+    if (std.mem.indexOf(u8, printed, "\"sha256\":\"") == null) fail("web_print_pdf did not report the file's digest");
+    if (std.mem.indexOf(u8, printed, "\"css_page_size\":true") == null) fail("web_print_pdf did not echo css_page_size");
+    const shape = smoke_pdf.read(pdf.ptr) catch |err| {
+        std.debug.print("smoke-mcp: reading {s}: {s}\n", .{ pdf, @errorName(err) });
+        fail("web_print_pdf reported success but the file is not a readable PDF");
+    };
+    for (shape.slice(), 0..) |p, i|
+        std.debug.print("smoke-mcp: MEASURED web_print_pdf page {d}: {d:.2} x {d:.2} pt, text={}\n", .{ i + 1, p.w, p.h, p.text });
+    if (smoke_pdf.deckProblem(&shape)) |why| {
+        say(why);
+        fail("web_print_pdf's deck PDF is wrong (reason above)");
+    }
+
+    const relative = m.callTool("web_print_pdf", "{\"path\":\"deck.pdf\"}");
+    if (std.mem.indexOf(u8, relative, "\"code\":\"invalid_args\"") == null) fail("web_print_pdf accepted a relative path");
+    _ = m.callTool("web_close", "{}");
+}
+
 /// The eval result-size contract. A 40000-character string used to come
 /// back as 4046 bytes of perfectly valid JSON — cut in the PAGE, so
 /// total_chars reported the cut length, strict:true never fired, and
@@ -5153,6 +5200,7 @@ fn webStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) vo
 
     webDownloadStage(&m, rt, http.port());
     webEvalSizeStage(&m, rt);
+    webPrintPdfStage(&m, rt);
 
     certStage(&m, rt);
 
