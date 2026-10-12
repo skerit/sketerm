@@ -418,8 +418,7 @@ pub fn configureHeadless(allocator: std.mem.Allocator, dir: []const u8, instance
     g_default_max_fps = max_fps;
 }
 
-/// Where a motion setting came from (`capabilities` reports it).
-pub const MotionSource = enum { built_in, config, profile, flag };
+pub const MotionSource = motion_replay.Source;
 
 /// Recorded-motion replay as this server resolved it at startup: the
 /// default mode, the selected pack (validated bytes every headless

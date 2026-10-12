@@ -4536,8 +4536,9 @@ test "config: bare [mcp] defaults and web_gui parse and round-trip" {
     try std.testing.expectEqualStrings("my-mouse", cfg2.mcp.web_motion_pack);
     try std.testing.expectEqual(.direct, cfg2.mcpProfile("locked").?.web_motion_default.?);
     try std.testing.expect(cfg2.mcpProfile("quiet").?.web_motion_default == null);
-    try std.testing.expectError(error.BadValue, applyMcpKv(cfg2.mcpProfile("quiet").?, std.testing.allocator, "web_motion_default", "sometimes"));
-    try std.testing.expectError(error.BadValue, applyMcpKv(cfg2.mcpProfile("quiet").?, std.testing.allocator, "web_motion_pack", "../x"));
+    var scratch: McpProfile = .{ .name = "scratch" };
+    try std.testing.expectError(error.BadValue, applyMcpKv(&scratch, std.testing.allocator, "web_motion_default", "sometimes"));
+    try std.testing.expectError(error.BadValue, applyMcpKv(&scratch, std.testing.allocator, "web_motion_pack", "../x"));
     try std.testing.expect(cfg2.mcpProfile("locked").?.web_fetch_max_tabs == null);
     try std.testing.expectEqual(false, cfg2.mcpProfile("locked").?.web_gui.?);
     try std.testing.expect(cfg2.mcpProfile("quiet").?.web_gui == null);

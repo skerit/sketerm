@@ -28,6 +28,9 @@ pub const Mode = enum {
     }
 };
 
+/// Where a motion setting came from (`capabilities` reports it).
+pub const Source = enum { built_in, config, profile, flag };
+
 /// What an action reports it got (`motion` on web_act / web_scroll).
 pub const Outcome = enum { direct, replayed };
 
