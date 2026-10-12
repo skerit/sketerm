@@ -287,22 +287,27 @@ pub fn motionStartTyping(self: *Host, v: *View, p: *const Pending) bool {
         return false;
     };
     defer self.gpa.free(times);
+    const owned = typingSteps(self.gpa, strokes.items, times) catch return failOomFree(self, v, p.sid, want);
+    begin(self, v, owned, .{ .typed = .{ .sid = p.sid, .guarded = p.guarded, .want = want } });
+    return true;
+}
+
+/// Key edges for the planned `times`, Shift wrapped around its key.
+fn typingSteps(gpa: std.mem.Allocator, strokes: []const host_mod.Keystroke, times: []const replay.KeyTime) ![]Step {
     var steps: std.ArrayList(Step) = .empty;
-    errdefer steps.deinit(self.gpa);
-    for (strokes.items, times) |ks, t| {
+    errdefer steps.deinit(gpa);
+    for (strokes, times) |ks, t| {
         const mods: u32 = if (ks.shift) proto.mod_shift else 0;
         var down: Step = .{ .at = t.down, .kind = .key_down, .keysym = ks.keysym, .mods = mods };
         const own = ks.text[0..ks.text_len];
         @memcpy(down.text[0..own.len], own);
         down.text_len = ks.text_len;
-        if (ks.shift) steps.append(self.gpa, .{ .at = t.shift_down, .kind = .key_down, .keysym = shift_sym, .mods = proto.mod_shift }) catch return failOomFree(self, v, p.sid, want);
-        steps.append(self.gpa, down) catch return failOomFree(self, v, p.sid, want);
-        steps.append(self.gpa, .{ .at = t.up, .kind = .key_up, .keysym = ks.keysym, .mods = mods }) catch return failOomFree(self, v, p.sid, want);
-        if (ks.shift) steps.append(self.gpa, .{ .at = t.shift_up, .kind = .key_up, .keysym = shift_sym, .mods = 0 }) catch return failOomFree(self, v, p.sid, want);
+        if (ks.shift) try steps.append(gpa, .{ .at = t.shift_down, .kind = .key_down, .keysym = shift_sym, .mods = proto.mod_shift });
+        try steps.append(gpa, down);
+        try steps.append(gpa, .{ .at = t.up, .kind = .key_up, .keysym = ks.keysym, .mods = mods });
+        if (ks.shift) try steps.append(gpa, .{ .at = t.shift_up, .kind = .key_up, .keysym = shift_sym, .mods = 0 });
     }
-    const owned = steps.toOwnedSlice(self.gpa) catch return failOomFree(self, v, p.sid, want);
-    begin(self, v, owned, .{ .typed = .{ .sid = p.sid, .guarded = p.guarded, .want = want } });
-    return true;
+    return steps.toOwnedSlice(gpa);
 }
 
 const shift_sym: u32 = 0xffe1;
