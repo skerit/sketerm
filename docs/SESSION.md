@@ -22637,3 +22637,24 @@ that the named paper still applies without the bits; stage 32d repeats
 the staged print over a remote helper on a mux channel; smoke-mcp's
 `webPrintPdfStage` drives the MCP tool. The PDF checks live in
 `src/smoke/pdf.zig`, shared by both rigs.
+
+## 2026-10-12: input timestamps, the trainer's clock, one data-dir helper
+
+The daemon brain stamped `Compositor.now_ms` only before feeding the
+app's own requests, so viewer input (`applyIntent`) carried the time of
+the app's LAST request: two clicks with no app traffic between them got
+one timestamp, which a toolkit reads as a double-click. Both entry
+points now stamp through `brainClockMs` (`daemon_native.zig`).
+
+The motion trainer switched a whole session to arrival time on the first
+event with time 0, but GTK synthesizes untimed motion on every
+compositor (hover refreshes, the crossing after an enter), so every real
+recording fell back. It now skips untimed motion while the display
+stamps real events and moves to arrival time only when a display stamps
+nothing. Packs record which clock they used (`header.clock`,
+`device`|`arrival`, absent = `device`), and smoke-e2e's trainer stage
+asserts `device` on sketerm's own display.
+
+`xdg.dataPath` is the one `$XDG_DATA_HOME/sketerm/<rel>` resolver; the
+webext host, the GUI's extension store and GM_* values used three
+hand-copied versions of it.
