@@ -51,6 +51,14 @@ pub fn dataDir(buf: []u8) ?[]const u8 {
     return null;
 }
 
+/// `<data dir>/<rel>`, allocated, e.g. `webext` or `userscripts`.
+/// @return null when no data directory can be named.
+pub fn dataPath(allocator: std.mem.Allocator, rel: []const u8) error{OutOfMemory}!?[]u8 {
+    var buf: [4096]u8 = undefined;
+    const dir = dataDir(&buf) orelse return null;
+    return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, rel });
+}
+
 /// `<state dir>/<rel>`, allocated. `rel` is a relative path such as
 /// `places.json` or `file-transfers.d`.
 pub fn statePath(allocator: std.mem.Allocator, rel: []const u8) Error![]u8 {
@@ -102,6 +110,29 @@ test "configDir prefers XDG_CONFIG_HOME, falls back to HOME" {
     _ = c.unsetenv("XDG_CONFIG_HOME");
     _ = c.unsetenv("HOME");
     try t.expect(configDir(&buf) == null);
+}
+
+test "dataPath prefers XDG_DATA_HOME, falls back to HOME, and is null with neither" {
+    const c = @import("../c.zig").c;
+    const t = std.testing;
+    const old_data = env.get("XDG_DATA_HOME");
+    const old_home = env.get("HOME");
+    defer {
+        restore("XDG_DATA_HOME", old_data);
+        restore("HOME", old_home);
+    }
+    _ = c.setenv("XDG_DATA_HOME", "/xd", 1);
+    _ = c.setenv("HOME", "/home/u", 1);
+    const a = (try dataPath(t.allocator, "webext")).?;
+    defer t.allocator.free(a);
+    try t.expectEqualStrings("/xd/sketerm/webext", a);
+    _ = c.setenv("XDG_DATA_HOME", "", 1);
+    const b = (try dataPath(t.allocator, "userscripts")).?;
+    defer t.allocator.free(b);
+    try t.expectEqualStrings("/home/u/.local/share/sketerm/userscripts", b);
+    _ = c.unsetenv("XDG_DATA_HOME");
+    _ = c.unsetenv("HOME");
+    try t.expect((try dataPath(t.allocator, "x")) == null);
 }
 
 fn restore(name: [*:0]const u8, value: ?[]const u8) void {

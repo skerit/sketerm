@@ -25,6 +25,7 @@ const extinstall = @import("../web/webext/install.zig");
 const extregistry = @import("../web/webext/registry.zig");
 const pathz = @import("../util/pathz.zig");
 const atomicwrite = @import("../util/atomicwrite.zig");
+const xdg = @import("../util/xdg.zig");
 
 /// One installed extension as the GUI tracks it.
 pub const Ext = struct {
@@ -110,14 +111,7 @@ fn find(id: []const u8) ?*Ext {
 
 /// Data dir (`$XDG_DATA_HOME/sketerm/webext`), owned by the caller.
 fn dataDir(gpa: std.mem.Allocator) InstallError![]u8 {
-    if (c.getenv("XDG_DATA_HOME")) |xdg| {
-        const base = std.mem.span(xdg);
-        if (base.len != 0) return std.fmt.allocPrint(gpa, "{s}/sketerm/webext", .{base}) catch error.OutOfMemory;
-    }
-    if (c.getenv("HOME")) |home| {
-        return std.fmt.allocPrint(gpa, "{s}/.local/share/sketerm/webext", .{std.mem.span(home)}) catch error.OutOfMemory;
-    }
-    return error.WriteFailed;
+    return (try xdg.dataPath(gpa, "webext")) orelse error.WriteFailed;
 }
 
 // -- registry persistence --------------------------------------------

@@ -18,6 +18,7 @@ const storage = @import("webext/storage.zig");
 const atomicwrite = @import("../util/atomicwrite.zig");
 const pathz = @import("../util/pathz.zig");
 const clock = @import("../util/clock.zig");
+const xdg = @import("../util/xdg.zig");
 
 const coalesce_ms: i64 = 300;
 const max_file: usize = 16 * 1024 * 1024;
@@ -193,12 +194,5 @@ pub const Values = struct {
 };
 
 fn resolveDir(gpa: std.mem.Allocator) []u8 {
-    if (c.getenv("XDG_DATA_HOME")) |xdg| {
-        const base = std.mem.span(xdg);
-        if (base.len != 0) return std.fmt.allocPrint(gpa, "{s}/sketerm/userscripts", .{base}) catch @constCast("");
-    }
-    if (c.getenv("HOME")) |home| {
-        return std.fmt.allocPrint(gpa, "{s}/.local/share/sketerm/userscripts", .{std.mem.span(home)}) catch @constCast("");
-    }
-    return @constCast("");
+    return (xdg.dataPath(gpa, "userscripts") catch null) orelse @constCast("");
 }

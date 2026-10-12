@@ -25,6 +25,7 @@ const atomicwrite = @import("../../util/atomicwrite.zig");
 const pathz = @import("../../util/pathz.zig");
 const diag = @import("../../util/diag.zig");
 const clock = @import("../../util/clock.zig");
+const xdg = @import("../../util/xdg.zig");
 
 /// The session's language tag, for `i18n` locale negotiation. POSIX
 /// order, and everything after the encoding or modifier is dropped
@@ -1283,14 +1284,5 @@ fn mkdirAll(path: []const u8) void {
 }
 
 fn resolveDataDir(gpa: std.mem.Allocator) []u8 {
-    if (c.getenv("XDG_DATA_HOME")) |xdg| {
-        const base = std.mem.span(xdg);
-        if (base.len != 0) {
-            return std.fmt.allocPrint(gpa, "{s}/sketerm/webext", .{base}) catch @constCast("");
-        }
-    }
-    if (c.getenv("HOME")) |home| {
-        return std.fmt.allocPrint(gpa, "{s}/.local/share/sketerm/webext", .{std.mem.span(home)}) catch @constCast("");
-    }
-    return @constCast("");
+    return (xdg.dataPath(gpa, "webext") catch null) orelse @constCast("");
 }
