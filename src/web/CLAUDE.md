@@ -999,6 +999,33 @@ offset destroys 1px detail into uniform gray on its own.
 - `zig build measure-web` is the latency/sharpness rig; it reproduces a
   fractional 1.5x desktop through sketerm's own compositor.
 
+## "DevTools open" verdicts are load, not the engine (measured 2026-10-12)
+
+pixelscan's `isDevtoolOpen` is the `devtools-detector` library: every
+500ms until the first hit it tries eruda, DevTools custom formatters,
+`performance` (`console.table` of 50 refs to a 500-key object costing over
+10x the running max of `console.log` of it) and `debugger-checker`
+(`Function("debugger")()` over 100ms). With `performance.now()` at 100us
+grain, `console.log` reads 0.1ms and the bar for `console.table` is 1.1ms,
+which a COLD first call (0.5-0.6ms idle) clears whenever the renderer
+thread is preempted. Measured with pixelscan's own module and our listener
+attached first: under 20 busy loops on 10 cores, `performance` fired in 1 of
+3 helper runs AND 2 of 3 stock Chromium 152 runs; idle, never (0/120
+iterations on pixelscan itself); `debugger-checker` never (max 0.2ms).
+Warm per-call costs are identical in the helper with the console mirror,
+without it (`on_console_message` unset), and in stock Chromium: table/log
+0.6-1.25, `debugger` 0-0.1ms. An attached inspector session is a different
+order of magnitude: `Runtime.enable` through `execute_dev_tools_method`
+made the ratio 193x. So the console mirror stays always on, and nothing is
+to be "fixed" in the product for a flip under load. Stage dt in smoke-web
+(`SKETERM_SMOKE_WEB_DT_ONLY`) asserts the warm ratio (min of five rounds,
+bound 4x) and the `debugger` cost (bound 50ms) of the default helper, so a
+change that attaches a DevTools agent or debugger by default fails there;
+the Runtime.enable control fails it, the shipped helper measured 1.12x.
+When reproducing on a real site from an agent session, unset the session's
+`HTTPS_PROXY`/`SSL_CERT_FILE`: the helper honours the proxy and its mitm
+CA is not in the engine's store (`ERR_CERT_AUTHORITY_INVALID`).
+
 ## Cookies and site data: what the engine will and will not do
 
 The 0xC8 block (capability `sitedata`) is served from CEF's cookie

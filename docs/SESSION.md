@@ -1,5 +1,19 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-12: pixelscan "isDevtoolOpen" is machine load, not the helper
+
+pixelscan flagged the MCP headless browser under CDP / `isDevtoolOpen`,
+2 of 4 runs. Its detector's `performance` checker fires when one
+`console.table` exceeds 10x the fastest-measurable `console.log`
+(0.1ms at the 100us timer grain); a cold first call under CPU
+contention does that in stock Chromium 152 as often as in the helper
+(1/3 helper, 2/3 Chromium under 20 busy loops; never idle). Console
+mirroring, the semantic bridge and the `debugger` path cost the same as
+stock Chrome (table/log 0.6-1.25x, `debugger` 0-0.1ms); an inspector
+session would be 193x. No product change; smoke-web stage dt guards the
+default helper against a DevTools agent or debugger ever attaching by
+default. Measurements in src/web/CLAUDE.md.
+
 ## 2026-10-12: recorded human motion for automated browsing
 
 A `web_act` click teleported (one move, then press and release at once),

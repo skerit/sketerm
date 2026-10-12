@@ -7702,6 +7702,74 @@ fn runGlobalsStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) 
     pass("stage gl no page-visible globals (main frame and iframe match the bare engine; snapshot/query/act/eval work)");
 }
 
+// ---------------------------------------------------------------------
+// Stage dt: console and `debugger` cost what they cost with DevTools closed
+// ---------------------------------------------------------------------
+
+/// devtools-detector (pixelscan's "isDevtoolOpen") calls DevTools open when
+/// `console.table` of a big array costs over 10x `console.log` of it, or a
+/// `debugger` statement takes over 100ms: both happen only with an inspector
+/// session that previews console arguments or pauses. Warm per-call costs,
+/// min over five rounds of 50 calls so load does not flip it; the title is
+/// `dt:<table/log ratio x100>:<debugger us>`.
+const devtools_page =
+    "<!doctype html><html><head><title>dt-loading</title></head><body><script>" ++
+    "var o={};for(var g=0;g<500;g++)o[''+g]=''+g;var a=[];for(var i=0;i<50;i++)a.push(o);" ++
+    "var N=50;function per(f){var s=performance.now();for(var i=0;i<N;i++)f(a);return(performance.now()-s)/N;}" ++
+    "function tb(x){console.table(x);}function lg(x){console.log(x);}" ++
+    "setTimeout(function(){for(var w=0;w<3;w++){tb(a);lg(a);}" ++
+    "var t=1e9,l=1e9,d=1e9,r;for(r=0;r<5;r++){t=Math.min(t,per(tb));l=Math.min(l,per(lg));console.clear();}" ++
+    "for(r=0;r<5;r++){var s=performance.now();try{(function(){}).constructor('debugger')();}catch(e){}" ++
+    "d=Math.min(d,performance.now()-s);}l=Math.max(l,0.1/N);" ++
+    "document.title='dt:'+Math.round(100*t/l)+':'+Math.round(1000*d);},300);" ++
+    "</script></body></html>";
+
+/// Ratio bound x100. Measured 2026-10-12 on CEF 151: 0.6-1.25 in the helper
+/// (console mirrored or not), 1.0 in stock Chromium 152, 1.07 under 20 busy
+/// loops on 10 cores; an inspector previewing arguments is the >10 case.
+const devtools_ratio_max_x100: u64 = 400;
+/// A paused `debugger` never returns at all; anything near 100ms is a stall.
+const devtools_debugger_max_us: u64 = 50_000;
+
+/// The default helper (semantic layer, console mirror) on `devtools_page`.
+fn runDevtoolsTimingStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) void {
+    var http = HttpProbe{ .body = devtools_page };
+    if (!http.start()) fail("stage dt: HTTP fixture did not start");
+    defer http.shutdown();
+    var url_buf: [64]u8 = undefined;
+    const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{http.lis.port}) catch fail("stage dt url");
+    var sock_buf: [96]u8 = undefined;
+    const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/dt.sock", .{dir}) catch fail("dt sock path");
+    var cache_buf: [96]u8 = undefined;
+    const cache = std.fmt.bufPrintZ(&cache_buf, "{s}/dt-cache", .{dir}) catch fail("dt cache path");
+    const pid = spawnHelper(exe, sock.ptr, cache.ptr, "--ozone-platform=headless", null, false);
+    g_pid = pid;
+    var cl = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
+    cl.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web-dt" });
+    {
+        const d = nowMs() + 15_000;
+        while (cl.ack_proto == 0 and nowMs() < d) cl.pump(100);
+    }
+    if (cl.ack_proto != proto.PROTO_VERSION) fail("stage dt: no hello_ack");
+    cl.send(proto.ViewCreate{ .view = view_id, .w = 640, .h = 480, .scale_x1000 = 1000, .context = 0 });
+    if (!cl.waitBufferAfter(0, 20_000)) fail("stage dt: no frame_buffer");
+    cl.navigate(url);
+    _ = cl.waitTitle("dt:", 30_000);
+    const t = cl.titleSlice();
+    var it = std.mem.splitScalar(u8, if (std.mem.startsWith(u8, t, "dt:")) t[3..] else "", ':');
+    const ratio = std.fmt.parseInt(u64, it.next() orelse "", 10) catch {
+        std.debug.print("smoke-web: stage dt title was \"{s}\"\n", .{t});
+        fail("stage dt: the timing page never reported (a paused `debugger` hangs it)");
+    };
+    const dbg = std.fmt.parseInt(u64, it.next() orelse "", 10) catch fail("stage dt: no debugger timing");
+    std.debug.print("smoke-web: stage dt console.table/console.log x100 = {d}, debugger = {d}us\n", .{ ratio, dbg });
+    if (ratio > devtools_ratio_max_x100) fail("stage dt: console.table costs like DevTools is open (inspector previews?)");
+    if (dbg > devtools_debugger_max_us) fail("stage dt: a `debugger` statement stalls (debugger agent enabled?)");
+    cl.deinit();
+    reapHelperTimeout(pid, "stage dt", 30_000);
+    pass("stage dt console.table and debugger cost what they cost with DevTools closed");
+}
+
 fn runObserveStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) void {
     var sock_buf: [96]u8 = undefined;
     const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/ob.sock", .{dir}) catch fail("ob sock path");
@@ -9360,6 +9428,16 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             return 1;
         }
         say("smoke-web: PASS (encoded frames only)");
+        return 0;
+    }
+    if (c.getenv("SKETERM_SMOKE_WEB_DT_ONLY") != null) {
+        runDevtoolsTimingStage(gpa, exe, dir);
+        cleanup();
+        if (gpa_state.deinit() == .leak) {
+            say("smoke-web: FAIL leaked memory (see GPA report above)");
+            return 1;
+        }
+        say("smoke-web: PASS (devtools timing only)");
         return 0;
     }
     if (c.getenv("SKETERM_SMOKE_WEB_GLOBALS_ONLY") != null) {
@@ -11994,6 +12072,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     runMultiClientStage(gpa, exe, dir);
     runObserveStage(gpa, exe, dir);
     runGlobalsStage(gpa, exe, dir);
+    runDevtoolsTimingStage(gpa, exe, dir);
     runEncodedStage(gpa, exe, dir);
     // ── Stage fl: flush + linger (broker-owned lifecycle) ─────────
     runFlushLingerStage(gpa, exe, dir);
