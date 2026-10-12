@@ -1306,11 +1306,17 @@
   // command right after; the two race, and this script can run BEFORE
   // the keys land (a connected control reading "" and no note, seen
   // once in a hundred smoke runs). `want` is what was typed: the read
-  // waits, bounded, until it shows up in the value, then reports.
+  // waits, bounded, until it shows up in the value, then reports. Each
+  // character is a whole key press (down/char/up, plus Shift), so the
+  // budget grows with the text and every change to the value restarts
+  // the quiet window: under load the first keys land late, not never.
   function commitValue(req, eid, want) {
     var el = elFor(eid);
     if (!el) return send({ op: "ack", req: req, ok: 0, msg: "unknown id" });
-    var deadline = Date.now() + 1500;
+    var quiet = 1500 + 60 * (want ? want.length : 0);
+    var hard = Date.now() + Math.min(10000, 3 * quiet);
+    var deadline = Date.now() + quiet;
+    var last = null;
     function attempt() {
       // Report the value that LANDED, read after typing. A framework
       // that re-created the control mid-typing leaves `el` detached
@@ -1330,6 +1336,10 @@
         }
       }
       var value = String(read.value === undefined ? (read.isContentEditable ? read.textContent : "") : read.value);
+      if (value !== last) {
+        last = value;
+        deadline = Math.min(hard, Date.now() + quiet);
+      }
       if (want && value.indexOf(want) < 0 && Date.now() < deadline) return setTimeout(attempt, 40);
       try {
         read.dispatchEvent(new Event("change", { bubbles: true }));
