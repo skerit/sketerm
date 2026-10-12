@@ -1509,6 +1509,69 @@ input and screenshot dimensions using the same geometry.
 CEF applies media emulation internally through DevTools commands without
 opening a remote debugging port or installing page-side JavaScript guards.
 
+### Recorded motion replay
+
+A `web_act` click, hover or `set_value` and a `web_scroll` wheel scroll are
+synthesized input: one pointer move straight to the target, then a press and
+release at the same instant, typed keys at machine-flat intervals, one large
+wheel delta. Bot detectors score exactly that. With `motion:"replay"` the
+headless helper instead replays YOUR recorded motion:
+
+- **Reaches**: the recorded reach nearest the wanted distance, direction and
+  target size (excluding the ones this connection used recently) is rotated
+  and scaled so it starts where the pointer is and ends on a landing point
+  sampled inside the target, its time is stretched by the Fitts's-law ratio
+  fitted from the pack itself, and every sample gets sub-pixel jitter from a
+  per-replay seed. Each sample is its own pointer move at the recorded device
+  rate, so `getCoalescedEvents()` shows a plausible rate; the press lasts as
+  long as the recorded one. A view the pointer never entered is entered from
+  the edge nearest the target. A hover is the same reach without the press.
+- **Typing** (`set_value` into a text field): per-key hold and key-to-key
+  times drawn from the pack's distributions for that key's position class
+  (left hand, right hand, space, other), never per letter.
+- **Scrolling** (`web_scroll dx/dy`): the distance is split over recorded
+  wheel-burst shapes, scaled so the total is exact.
+
+The reply carries `motion` (`replayed` or `direct`) and, for a replay,
+`motion_ms`: a replayed click takes hundreds of milliseconds, not ~0.
+`web_input` stays raw (it is the exact-input escape hatch).
+
+**Selecting a pack and the default.** `sketerm mcp --web-motion-pack NAME`
+(or `web_motion_pack` in `[mcp]` / `[mcp.NAME]`) picks an installed pack;
+`--web-motion-default replay` (or `web_motion_default`) makes replay what a
+call that omits `motion` gets. The built-in default is `direct`: an installed
+pack changes nothing until a call or the configured default asks for it.
+
+**Fail closed.** A replay that cannot happen is an ERROR and nothing is
+clicked, typed or scrolled: no pack selected, a selected pack that is missing
+or invalid, a helper that predates the `motion-replay` capability, or a
+GUI-backed tab (replay drives the headless browser only). The same holds when
+the CONFIGURED default is replay; `capabilities` reports it up front:
+`web_motion` (the pack: device, measured rate, reach/key/scroll counts, or
+null), `web_motion_default` and its source, `web_motion_replay` (whether the
+running helper advertises the capability; null before its handshake) and
+`web_motion_broken` (why the setup cannot replay, or null).
+
+**Recording.** `sketerm motion record` (also the palette's "Record Motion
+Pack") opens the trainer, a native GTK window, so it records the DEVICE with
+its own timestamps and coalesced samples: click targets of varying size,
+distance and direction until the coverage meter fills (8 distances x 8
+directions x 3 sizes x 4 reaches, about 15-20 minutes), type the prompted
+words (only key timing per key class is kept; the text is discarded), scroll
+while reading, and let the pointer rest for idle drift. The header shows the
+device class and the measured sample rate; a pack is ONE device. Ctrl+S
+installs it. Live use is never recorded. `sketerm motion install FILE`,
+`list` and `remove` manage packs in `$XDG_DATA_HOME/sketerm/motion-packs/`;
+packs never belong in a repository.
+
+**What a pack is.** It is still imitation: genuine human motion, re-used.
+Every replay is warped, jittered and time-stretched, and recently used reaches
+are excluded, but a detector that clusters behaviour server-side can learn a
+pack. A pack records ONE person's motor behaviour: using one pack for many
+unrelated accounts links those accounts behaviourally, and sharing a pack
+shares a biometric (motion and typing rhythm can identify a person). Idle
+drift is recorded but not replayed yet.
+
 ## Sub-agents (`agent_*`)
 
 The `agent` group runs another coding agent as a sub-agent and reads it

@@ -42,6 +42,9 @@ const webdrive = @import("webdrive.zig");
 const navfault = @import("../web/navfault.zig");
 const web_proto = @import("../web/protocol.zig");
 const ozone = @import("../web/ozone.zig");
+const motion_pack = @import("../motion/pack.zig");
+const motion_replay = @import("../motion/replay.zig");
+const motion_store = @import("../motion/store.zig");
 const vcodec = @import("../wlhost/vcodec.zig");
 const netpolicy = @import("../web/netpolicy.zig");
 const capture = @import("../web/capture.zig");
@@ -413,6 +416,74 @@ pub fn configureHeadless(allocator: std.mem.Allocator, dir: []const u8, instance
     g_headless_instance = instance;
     g_headless_mux_sock = mux_sock;
     g_default_max_fps = max_fps;
+}
+
+/// Where a motion setting came from (`capabilities` reports it).
+pub const MotionSource = enum { built_in, config, profile, flag };
+
+/// Recorded-motion replay as this server resolved it at startup: the
+/// default mode, the selected pack (validated bytes every headless
+/// engine sends to its helper) and, when the setup cannot work, why.
+const MotionSetup = struct {
+    default: motion_replay.Mode = .direct,
+    default_source: MotionSource = .built_in,
+    pack_name: []const u8 = "",
+    pack_source: MotionSource = .built_in,
+    pack: ?[]u8 = null,
+    summary: ?motion_pack.Pack.Summary = null,
+    broken: ?[]const u8 = null,
+};
+
+var g_motion: MotionSetup = .{};
+
+/// Resolve the motion setup once at startup. A selected pack that is
+/// missing or invalid is recorded as BROKEN, never ignored: with a
+/// replay default every action then fails closed, and `capabilities`
+/// reports it before the first click does.
+pub fn configureMotion(allocator: std.mem.Allocator, default: motion_replay.Mode, default_source: MotionSource, pack_name: []const u8, pack_source: MotionSource) void {
+    g_motion = .{ .default = default, .default_source = default_source, .pack_name = pack_name, .pack_source = pack_source };
+    if (pack_name.len == 0) {
+        if (default == .replay) g_motion.broken = "web_motion_default is replay but no motion pack is selected (config web_motion_pack, or sketerm mcp --web-motion-pack NAME; sketerm motion list shows the installed packs)";
+        return;
+    }
+    var diag: motion_pack.Diag = .{};
+    const loaded = motion_store.load(allocator, pack_name, &diag) catch |err| {
+        const why: []const u8 = switch (err) {
+            error.NotInstalled => "it is not installed (sketerm motion list shows the installed packs)",
+            error.Invalid => diag.msg(),
+            error.InvalidName => "that is not a valid pack name",
+            error.NoDataDir => "neither XDG_DATA_HOME nor HOME names a data directory",
+            else => @errorName(err),
+        };
+        g_motion.broken = std.fmt.allocPrint(allocator, "motion pack '{s}' cannot be used: {s}", .{ pack_name, why }) catch "the selected motion pack cannot be used";
+        return;
+    };
+    g_motion.pack = loaded.bytes;
+    g_motion.summary = loaded.summary;
+}
+
+/// The `web_motion*` capability facts.
+pub fn motionCapability() struct { setup: *const MotionSetup, helper: ?bool, headless: bool } {
+    const headless = !guiDrivesWeb() and g_headless_alloc != null;
+    if (!headless) return .{ .setup = &g_motion, .helper = false, .headless = false };
+    const e = currentEngine() orelse return .{ .setup = &g_motion, .helper = null, .headless = true };
+    if (e.state != .ready) return .{ .setup = &g_motion, .helper = null, .headless = true };
+    return .{ .setup = &g_motion, .helper = e.has(.motion_replay), .headless = true };
+}
+
+/// The motion one call asked for (its `motion` argument, else the
+/// configured default), or why replay cannot happen at all. Never a
+/// silent fall back to direct input.
+fn motionFor(drv: Driver, arena: std.mem.Allocator, args: std.json.Value) !union(enum) { mode: motion_replay.Mode, err: Fail } {
+    const mode: motion_replay.Mode = if (mcp.argStr(args, "motion")) |m|
+        (motion_replay.Mode.parse(m) orelse return .{ .err = fail(.invalid_args, "'motion' must be replay or direct") })
+    else
+        g_motion.default;
+    if (mode == .direct) return .{ .mode = .direct };
+    const asked = if (mcp.argStr(args, "motion") != null) "motion:\"replay\" was asked for" else "the configured web_motion_default is replay";
+    if (drv == .gui) return .{ .err = fail(.unavailable, try std.fmt.allocPrint(arena, "{s}, but recorded-motion replay drives the server's own headless browser only and a GUI is attached; nothing was done", .{asked})) };
+    if (g_motion.pack == null) return .{ .err = fail(.unavailable, try std.fmt.allocPrint(arena, "{s}, but {s}; nothing was done", .{ asked, g_motion.broken orelse "no motion pack is selected (config web_motion_pack, or sketerm mcp --web-motion-pack NAME)" })) };
+    return .{ .mode = .replay };
 }
 
 /// The instance directory the headless helper lives in; null when no
@@ -820,6 +891,7 @@ fn headlessEngineForMode(spec: webroute.Spec, untrusted: bool) ?*webdrive.Engine
     re.engine.untrusted = untrusted;
     re.engine.default_max_fps = g_default_max_fps;
     re.engine.webgl_policy = g_webgl_policy;
+    if (g_motion.pack) |bytes| re.engine.setMotionPack(g_motion.pack_name, bytes) catch {};
     @memcpy(re.slug[0..slug.len], slug);
     re.slug_len = slug.len;
     g_engines.append(alloc, re) catch {
@@ -1017,6 +1089,8 @@ pub const Op = struct {
     timeout_ms: ?i64 = null,
     /// Eval only: the page-side per-string budget (`EVAL_PAGE_CHARS`).
     max_chars: u32 = 0,
+    /// Act only: replay recorded motion (headless; `motionFor` decided).
+    motion: motion_replay.Mode = .direct,
 };
 
 pub const OpReply = struct {
@@ -1030,6 +1104,8 @@ pub const OpReply = struct {
     reader_ids: bool = false,
     /// Set when the round trip did not finish inside its budget.
     timed_out: bool = false,
+    /// An act's replay duration when the helper replayed recorded motion.
+    motion_ms: ?u32 = null,
 };
 
 /// One described backend failure: the sentence a caller reads AND the
@@ -1758,6 +1834,9 @@ pub fn headlessFail(arena: std.mem.Allocator, e: *webdrive.Engine, err: anyerror
         error.LegacySemanticReplyPending => fail(.conflict, "an older browser helper still owes the previous timed-out semantic reply; wait for it or restart the helper before retrying this operation kind"),
         error.NoFrame => fail(.unavailable, "the view has not painted a frame yet (a page must load first; try web_wait for:\"load\")"),
         error.NoTextInput => fail(.unavailable, "the browser helper does not advertise the clipboard capability text insertion rides on"),
+        error.MotionUnsupported => fail(.unavailable, "motion replay was asked for, but the browser helper does not advertise motion-replay (it predates recorded-motion replay); nothing was done"),
+        error.NoMotionPack => fail(.unavailable, "motion replay was asked for, but no motion pack is loaded; nothing was done"),
+        error.MotionPackRefused => fail(.unavailable, try std.fmt.allocPrint(arena, "motion replay was asked for, but the browser helper refused the motion pack ({s}); nothing was done", .{e.motion.why()})),
         error.NoStream => fail(.unavailable, "the browser helper does not advertise web-stream; no stream was opened"),
         error.FrameRateUnsupported => fail(.unavailable, "the helper did not advertise view-max-fps; no stream was opened"),
         error.InvalidFrameRate => fail(.invalid_args, "max_fps must be an integer from 1 to 240"),
@@ -1833,6 +1912,10 @@ fn runOpOnce(drv: Driver, arena: std.mem.Allocator, handle: u32, op: Op, budget:
                     return .{ .err = fail(.invalid_args, "unknown act action") };
                 req.action = @intFromEnum(semact);
                 req.arg = op.data orelse "";
+                req.motion = @intFromEnum(switch (op.motion) {
+                    .direct => web_proto.Motion.direct,
+                    .replay => web_proto.Motion.replay,
+                });
             } else if (eql(u8, op.op, "expand")) {
                 req.kind = .expand;
                 req.id = op.node orelse 0;
@@ -1866,6 +1949,7 @@ fn runOpOnce(drv: Driver, arena: std.mem.Allocator, handle: u32, op: Op, budget:
                 .rev = out.rev,
                 .reader_ids = req.kind == .read and e.has(.reader_ids),
                 .timed_out = out.timed_out,
+                .motion_ms = if (out.motion == @intFromEnum(web_proto.MotionResult.replayed)) out.duration_ms else null,
             } };
         },
     }
@@ -3101,6 +3185,7 @@ fn actResult(
     id: i64,
     action: []const u8,
     detail: []const u8,
+    motion_ms: ?u32,
     after: ActAfter,
 ) ![]const u8 {
     var res = mcp.Res.init(arena);
@@ -3109,12 +3194,25 @@ fn actResult(
     try res.fact("action", action);
     try res.fact("acted", true);
     try res.fact("detail", detail);
+    try motionFacts(&res, motion_ms);
     if (detail.len > 0)
         try res.textf("{s} on {d}: {s}", .{ action, id, detail })
     else
         try res.textf("{s} on {d}: acted", .{ action, id });
     try renderAfter(&res, arena, after);
     return res.finish();
+}
+
+/// `motion` (`motion_replay.Outcome`) and, for a replay, its duration:
+/// a replayed action takes hundreds of ms instead of ~0, and the caller
+/// must be able to see which one happened.
+fn motionFacts(res: *mcp.Res, motion_ms: ?u32) !void {
+    const outcome: motion_replay.Outcome = if (motion_ms != null) .replayed else .direct;
+    try res.fact("motion", @tagName(outcome));
+    if (motion_ms) |ms| {
+        try res.fact("motion_ms", ms);
+        try res.textf("input: replayed recorded motion ({d} ms)", .{ms});
+    }
 }
 
 /// The shared post-input tail: navigation outcome, caveat, and the
@@ -3922,10 +4020,12 @@ fn scrollResult(
     how: []const u8,
     before: ?ScrollPos,
     after: ?ScrollPos,
+    motion_ms: ?u32,
 ) ![]const u8 {
     var res = mcp.Res.init(arena);
     try head(&res, arena, mode, v);
     try res.fact("how", how);
+    try motionFacts(&res, motion_ms);
     if (before) |b| try res.fact("before", b);
     if (after) |a| try res.fact("after", a);
     if (before != null and after != null) {
@@ -4741,11 +4841,19 @@ pub fn webTool(
             return mcp.errRes(arena, .io_failed, "the name lookup named a node id outside the protocol's range");
         const action = mcp.argStr(args, "action") orelse "click";
         const value = mcp.argStr(args, "value");
+        // Only pointer and typing actions have motion; focus and
+        // scroll_into_view are the same either way.
+        const moves = eql(u8, action, "click") or eql(u8, action, "hover") or eql(u8, action, "set_value");
+        const motion: motion_replay.Mode = if (!moves) .direct else switch (try motionFor(drv, arena, args)) {
+            .err => |f| return failRes(arena, f),
+            .mode => |m| m,
+        };
         switch (try runOp(drv, arena, view.pane, .{
             .op = "act",
             .action = action,
             .node = node,
             .data = value,
+            .motion = motion,
         }, timeoutOf(args, DEFAULT_TIMEOUT_MS))) {
             .err => |e| return failRes(arena, e),
             .done => |r| {
@@ -4760,7 +4868,7 @@ pub fn webTool(
                     "the page refused the action");
 
                 const after = try settleAndDelta(drv, arena, view, args);
-                return actResult(arena, drv.mode(), view, id_v, action, r.payload, after);
+                return actResult(arena, drv.mode(), view, id_v, action, r.payload, r.motion_ms, after);
             },
         }
     }
@@ -6493,6 +6601,7 @@ fn scrollProbe(drv: Driver, arena: std.mem.Allocator, view: View) ![]const u8 {
 fn scrollTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view: View) ![]const u8 {
     const before = try scrollProbe(drv, arena, view);
     var how: []const u8 = "wheel";
+    var motion_ms: ?u32 = null;
 
     const to = if (args == .object) args.object.get("to") else null;
     // A numeric `to` is a node id; anything else falls through to the
@@ -6545,15 +6654,28 @@ fn scrollTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view:
         const dy: i32 = @intCast(std.math.clamp(mcp.argInt(args, "dy") orelse 0, -100_000, 100_000));
         if (dx == 0 and dy == 0)
             return mcp.errRes(arena, .invalid_args, "web_scroll needs dx/dy, or 'to' (a node id, or top|bottom|page_up|page_down)");
-        if (try scrollView(drv, arena, view.pane, dx, dy)) |e|
-            return failRes(arena, e);
+        switch (try motionFor(drv, arena, args)) {
+            .err => |f| return failRes(arena, f),
+            .mode => |m| switch (m) {
+                .direct => if (try scrollView(drv, arena, view.pane, dx, dy)) |e|
+                    return failRes(arena, e),
+                .replay => {
+                    // motionFor refused the GUI already.
+                    const e = drv.headless;
+                    const out = e.motionScroll(arena, view.pane, dx, dy, timeoutOf(args, DEFAULT_TIMEOUT_MS)) catch |err|
+                        return failRes(arena, try headlessFail(arena, e, err));
+                    if (!out.ok) return mcp.errRes(arena, .failed, if (out.msg.len > 0) out.msg else "the helper could not replay the scroll");
+                    motion_ms = out.duration_ms;
+                },
+            },
+        }
     }
 
     // Smooth scrolling means the position right after the input is not
     // the settled one.
     drv.sleep(250);
     const after = try scrollProbe(drv, arena, view);
-    return scrollResult(arena, drv.mode(), view, how, parsePos(arena, before), parsePos(arena, after));
+    return scrollResult(arena, drv.mode(), view, how, parsePos(arena, before), parsePos(arena, after), motion_ms);
 }
 
 const GUI_ONLY_HEADLESS =
@@ -8236,7 +8358,7 @@ test "web_act: what was acted on, then the delta" {
     const arena = arena_state.allocator();
     const t = std.testing;
 
-    const out = try actResult(arena, .headless, EXAMPLE, 7, "click", "clicked button PressMe", .{
+    const out = try actResult(arena, .headless, EXAMPLE, 7, "click", "clicked button PressMe", null, .{
         .delta_kind = "delta",
         .delta = "[9] paragraph AFTERCLICK",
         .navigated_to = "https://example.com/next",
@@ -8254,6 +8376,53 @@ test "web_act: what was acted on, then the delta" {
     try t.expect(std.mem.indexOf(u8, text, "click on 7: clicked button PressMe") != null);
     try t.expect(std.mem.indexOf(u8, text, "navigated to https://example.com/next") != null);
     try t.expect(std.mem.indexOf(u8, text, "--- delta ---\n[9] paragraph AFTERCLICK") != null);
+    try t.expectEqualStrings("direct", sc.get("motion").?.string);
+    try t.expect(sc.get("motion_ms") == null);
+
+    // A replayed act reports it, with the duration, in both lanes.
+    const replayed = try actResult(arena, .headless, EXAMPLE, 7, "click", "clicked", 640, .{});
+    const rp = try mcp.expectToolResultShape(arena, "web_act", replayed);
+    const rsc = rp.object.get("structuredContent").?.object;
+    try t.expectEqualStrings("replayed", rsc.get("motion").?.string);
+    try t.expectEqual(@as(i64, 640), rsc.get("motion_ms").?.integer);
+    try t.expect(std.mem.indexOf(u8, rp.object.get("content").?.array.items[0].object.get("text").?.string, "replayed recorded motion (640 ms)") != null);
+}
+
+test "web motion: a replay that cannot happen is refused, never run direct" {
+    var arena_state = testArena();
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const t = std.testing;
+    const saved = g_motion;
+    defer g_motion = saved;
+    var fake_engine: webdrive.Engine = undefined;
+    const drv: Driver = .{ .headless = &fake_engine };
+    const replay_arg = try std.json.parseFromSliceLeaky(std.json.Value, arena, "{\"motion\":\"replay\"}", .{});
+    const none = try std.json.parseFromSliceLeaky(std.json.Value, arena, "{}", .{});
+    const bad = try std.json.parseFromSliceLeaky(std.json.Value, arena, "{\"motion\":\"human\"}", .{});
+
+    // Built-in default: direct, and an explicit replay with no pack fails.
+    g_motion = .{};
+    try t.expectEqual(motion_replay.Mode.direct, (try motionFor(drv, arena, none)).mode);
+    const no_pack = (try motionFor(drv, arena, replay_arg)).err;
+    try t.expectEqual(mcp.ErrCode.unavailable, no_pack.code);
+    try t.expect(std.mem.indexOf(u8, no_pack.text, "no motion pack is selected") != null);
+    try t.expectEqual(mcp.ErrCode.invalid_args, (try motionFor(drv, arena, bad)).err.code);
+
+    // A configured replay default with a broken pack fails every action
+    // that has motion, naming the broken setup.
+    g_motion = .{ .default = .replay, .default_source = .config, .pack_name = "gone", .broken = "motion pack 'gone' cannot be used: it is not installed" };
+    const broken = (try motionFor(drv, arena, none)).err;
+    try t.expect(std.mem.indexOf(u8, broken.text, "configured web_motion_default is replay") != null);
+    try t.expect(std.mem.indexOf(u8, broken.text, "'gone' cannot be used") != null);
+    // ...while an explicit direct call still works.
+    const direct_arg = try std.json.parseFromSliceLeaky(std.json.Value, arena, "{\"motion\":\"direct\"}", .{});
+    try t.expectEqual(motion_replay.Mode.direct, (try motionFor(drv, arena, direct_arg)).mode);
+
+    // With a pack it is a replay.
+    var bytes = [_]u8{'x'};
+    g_motion = .{ .pack_name = "p", .pack = &bytes };
+    try t.expectEqual(motion_replay.Mode.replay, (try motionFor(drv, arena, replay_arg)).mode);
 }
 
 test "web_read: rich model and old-helper fallback both satisfy the schema" {
@@ -8961,7 +9130,7 @@ test "web_scroll: before/after are structured positions and 'moved' is derived" 
     // position", never garbage coordinates.
     try t.expect(parsePos(arena, "{\"x\":0,\"y\":720,\"max_y\":4200,\"viewport\":800}") == null);
     try t.expect(parsePos(arena, "{\"error\":\"eval refused\"}") == null);
-    const out = try scrollResult(arena, .headless, EXAMPLE, "page_down", before, after);
+    const out = try scrollResult(arena, .headless, EXAMPLE, "page_down", before, after, null);
     const parsed = try mcp.expectToolResultShape(arena, "web_scroll", out);
     const sc = parsed.object.get("structuredContent").?.object;
     try t.expectEqualStrings("page_down", sc.get("how").?.string);
@@ -8975,13 +9144,13 @@ test "web_scroll: before/after are structured positions and 'moved' is derived" 
 
     // The probe answers "null" on a page that never ran it.
     try t.expect(parsePos(arena, "null") == null);
-    const blind = try scrollResult(arena, .headless, EXAMPLE, "wheel", null, null);
+    const blind = try scrollResult(arena, .headless, EXAMPLE, "wheel", null, null, 420);
     const bsc = (try mcp.expectToolResultShape(arena, "web_scroll", blind)).object.get("structuredContent").?.object;
     try t.expect(bsc.get("moved") == null);
 
     // Equal positions: the "nothing moved" reading is stated, not left
     // to be derived from two coordinate pairs.
-    const stuck = try scrollResult(arena, .headless, EXAMPLE, "wheel", after, after);
+    const stuck = try scrollResult(arena, .headless, EXAMPLE, "wheel", after, after, null);
     try t.expect(std.mem.indexOf(
         u8,
         (try mcp.expectToolResultShape(arena, "web_scroll", stuck)).object.get("content").?.array.items[0].object.get("text").?.string,

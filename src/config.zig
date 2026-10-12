@@ -726,16 +726,23 @@ pub const McpProfile = struct {
     /// What the headless helper does about WebGL (`web/ozone.zig`
     /// `WebglPolicy`); null leaves `auto`.
     web_webgl: ?@import("web/ozone.zig").WebglPolicy = null,
+    /// Whether web actions replay recorded motion when a call does not
+    /// say (`motion/replay.zig` `Mode`); null leaves `direct`.
+    web_motion_default: ?@import("motion/replay.zig").Mode = null,
+    /// Installed motion pack (`sketerm motion list`) replays use; empty
+    /// = none.
+    web_motion_pack: []const u8 = "",
 
     /// Whether serializing this record writes anything.
     pub fn isEmpty(self: *const McpProfile) bool {
-        return self.tools.len == 0 and self.web_gui == null and self.web_max_fps == null and self.web_idle_close_secs == null and self.web_fetch_max_tabs == null and self.web_webgl == null;
+        return self.tools.len == 0 and self.web_gui == null and self.web_max_fps == null and self.web_idle_close_secs == null and self.web_fetch_max_tabs == null and self.web_webgl == null and self.web_motion_default == null and self.web_motion_pack.len == 0;
     }
 
     pub fn cloneInto(self: *const McpProfile, arena: std.mem.Allocator) error{OutOfMemory}!McpProfile {
         var out = self.*;
         out.name = try arena.dupe(u8, self.name);
         out.tools = try arena.dupe(u8, self.tools);
+        out.web_motion_pack = try arena.dupe(u8, self.web_motion_pack);
         return out;
     }
 };
@@ -2309,6 +2316,11 @@ fn applyMcpKv(prof: *McpProfile, arena: std.mem.Allocator, key: []const u8, valu
         prof.web_fetch_max_tabs = n;
     } else if (std.mem.eql(u8, key, "web_webgl")) {
         prof.web_webgl = @import("web/ozone.zig").WebglPolicy.parse(value) orelse return error.BadValue;
+    } else if (std.mem.eql(u8, key, "web_motion_default")) {
+        prof.web_motion_default = @import("motion/replay.zig").Mode.parse(value) orelse return error.BadValue;
+    } else if (std.mem.eql(u8, key, "web_motion_pack")) {
+        if (!@import("motion/pack.zig").validName(value)) return error.BadValue;
+        prof.web_motion_pack = try arena.dupe(u8, value);
     } else return error.UnknownKey;
 }
 
@@ -2321,6 +2333,8 @@ fn serialiseMcpKeys(prof: *const McpProfile, w: *std.Io.Writer) !void {
     if (prof.web_idle_close_secs) |v| try w.print("web_idle_close_secs = {d}\n", .{v});
     if (prof.web_fetch_max_tabs) |v| try w.print("web_fetch_max_tabs = {d}\n", .{v});
     if (prof.web_webgl) |v| try w.print("web_webgl = {s}\n", .{@tagName(v)});
+    if (prof.web_motion_default) |v| try w.print("web_motion_default = {s}\n", .{@tagName(v)});
+    if (prof.web_motion_pack.len > 0) try w.print("web_motion_pack = {s}\n", .{prof.web_motion_pack});
 }
 
 fn applyDomainKv(dom: *Domain, arena: std.mem.Allocator, key: []const u8, value: []const u8) !void {
@@ -4474,12 +4488,15 @@ test "config: bare [mcp] defaults and web_gui parse and round-trip" {
         \\web_idle_close_secs = 600
         \\web_fetch_max_tabs = 3
         \\web_webgl = hardware
+        \\web_motion_default = replay
+        \\web_motion_pack = my-mouse
         \\
         \\[mcp.locked]
         \\tools = files:ro
         \\web_gui = off
         \\web_max_fps = 15
         \\web_webgl = off
+        \\web_motion_default = direct
         \\web_idle_close_secs = 0
         \\
         \\[mcp.quiet]
@@ -4515,6 +4532,12 @@ test "config: bare [mcp] defaults and web_gui parse and round-trip" {
     try std.testing.expectEqual(@as(u32, 0), cfg2.mcpProfile("locked").?.web_idle_close_secs.?);
     try std.testing.expect(cfg2.mcpProfile("quiet").?.web_idle_close_secs == null);
     try std.testing.expectEqual(@as(u16, 3), cfg2.mcp.web_fetch_max_tabs.?);
+    try std.testing.expectEqual(.replay, cfg2.mcp.web_motion_default.?);
+    try std.testing.expectEqualStrings("my-mouse", cfg2.mcp.web_motion_pack);
+    try std.testing.expectEqual(.direct, cfg2.mcpProfile("locked").?.web_motion_default.?);
+    try std.testing.expect(cfg2.mcpProfile("quiet").?.web_motion_default == null);
+    try std.testing.expectError(error.BadValue, applyMcpKv(cfg2.mcpProfile("quiet").?, std.testing.allocator, "web_motion_default", "sometimes"));
+    try std.testing.expectError(error.BadValue, applyMcpKv(cfg2.mcpProfile("quiet").?, std.testing.allocator, "web_motion_pack", "../x"));
     try std.testing.expect(cfg2.mcpProfile("locked").?.web_fetch_max_tabs == null);
     try std.testing.expectEqual(false, cfg2.mcpProfile("locked").?.web_gui.?);
     try std.testing.expect(cfg2.mcpProfile("quiet").?.web_gui == null);

@@ -370,6 +370,16 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
         try res.fact("web_stream_popups", stream.popups);
         try res.fact("web_software_webgl", @import("mcp_web.zig").webglCapability(.software_webgl));
         try res.fact("web_webgl", if (@import("mcp_web.zig").webglMode()) |m| @tagName(m) else null);
+        const mo = @import("mcp_web.zig").motionCapability();
+        if (mo.setup.summary) |s| {
+            try res.fact("web_motion", .{ .pack = mo.setup.pack_name, .device = @tagName(s.device), .rate_hz = s.rate_hz, .reaches = s.reaches, .keys = s.keys, .scroll = s.scroll });
+            try res.textf("motion pack '{s}': {s} at {d:.0} Hz, {d} reaches, {d} key timings, {d} scroll bursts; web_act/web_scroll motion:\"replay\" replays it", .{ mo.setup.pack_name, @tagName(s.device), s.rate_hz, s.reaches, s.keys, s.scroll });
+        } else try res.fact("web_motion", null);
+        try res.fact("web_motion_default", @tagName(mo.setup.default));
+        try res.fact("web_motion_default_source", @tagName(mo.setup.default_source));
+        try res.fact("web_motion_replay", mo.helper);
+        try res.fact("web_motion_broken", mo.setup.broken);
+        if (mo.setup.broken) |why| try res.textf("motion replay is BROKEN: {s}{s}", .{ why, if (mo.setup.default == .replay) " (the default is replay, so actions fail until this is fixed)" else "" });
         const frame_rate = @import("mcp_web.zig").frameRateCapability();
         try res.fact("web_max_fps", frame_rate.supported);
         try res.fact("web_default_max_fps", frame_rate.default);

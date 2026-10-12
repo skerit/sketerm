@@ -53,6 +53,7 @@ const reattachApps = mcp_app.reattachApps;
 const MCP_HELP =
     \\Usage: sketerm mcp [--shared | --durable | --name NAME] [--socket PATH]
     \\                   [--log DIR] [--tools SPEC | --profile NAME] [--web-gui]
+    \\                   [--web-motion-default direct|replay] [--web-motion-pack NAME]
     \\                   [--channel-name NAME]
     \\       sketerm mcp agent-wait --socket PATH [--match TEXT] [--messages]
     \\                   [--follow] [--timeout SECONDS] [--since SEQ] AGENT
@@ -189,6 +190,14 @@ const MCP_HELP =
     \\  $SKETERM_GUI_BIN  executable started as `<bin> web` when none
     \\                 is running (default: this sketerm binary)
     \\
+    \\Recorded human motion for web_act / web_scroll (headless browser):
+    \\  --web-motion-pack NAME     the installed pack replays use (sketerm
+    \\                 motion list); overrides web_motion_pack in [mcp] /
+    \\                 [mcp.NAME]
+    \\  --web-motion-default MODE  direct (built-in) or replay: what a call
+    \\                 that omits `motion` gets; overrides web_motion_default.
+    \\                 A replay that cannot happen fails; it never clicks direct.
+    \\
 ;
 
 /// Both live in `src/version.zig`: our own version so a release bump
@@ -238,6 +247,10 @@ pub const Opts = struct {
     /// `--channel-name`: the `server:<name>` a Claude Code channel entry
     /// must name for this server to push (`agentpush.zig`).
     channel_name: ?[]const u8 = null,
+    /// `--web-motion-default`: highest-precedence motion default.
+    web_motion_default: ?@import("../motion/replay.zig").Mode = null,
+    /// `--web-motion-pack`: highest-precedence motion pack name.
+    web_motion_pack: ?[]const u8 = null,
 
     pub const ParseError = error{ UnknownFlag, MissingValue, BadName, SharedConflict };
 
@@ -278,6 +291,15 @@ pub const Opts = struct {
                 i += 1;
                 if (!validInstanceName(args[i])) return error.BadName;
                 o.channel_name = args[i];
+            } else if (std.mem.eql(u8, a, "--web-motion-default")) {
+                if (i + 1 >= args.len) return error.MissingValue;
+                i += 1;
+                o.web_motion_default = @import("../motion/replay.zig").Mode.parse(args[i]) orelse return error.BadName;
+            } else if (std.mem.eql(u8, a, "--web-motion-pack")) {
+                if (i + 1 >= args.len) return error.MissingValue;
+                i += 1;
+                if (!@import("../motion/pack.zig").validName(args[i])) return error.BadName;
+                o.web_motion_pack = args[i];
             } else if (std.mem.eql(u8, a, "--no-record")) {
                 o.no_record = true;
             } else if (std.mem.eql(u8, a, mcp_webgui.FLAG)) {
@@ -814,13 +836,36 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     var web_idle_close_secs = cfg.mcp.web_idle_close_secs;
     var web_fetch_max_tabs = cfg.mcp.web_fetch_max_tabs;
     var web_webgl = cfg.mcp.web_webgl;
+    const MotionSource = @import("mcp_web.zig").MotionSource;
+    var motion_default: @import("../motion/replay.zig").Mode = cfg.mcp.web_motion_default orelse .direct;
+    var motion_default_source: MotionSource = if (cfg.mcp.web_motion_default != null) .config else .built_in;
+    var motion_pack: []const u8 = cfg.mcp.web_motion_pack;
+    var motion_pack_source: MotionSource = if (motion_pack.len > 0) .config else .built_in;
     if (opts.profile) |name| {
         const prof = mcpProfileRecord(&cfg, name) catch return 2;
         if (prof.web_max_fps) |fps| web_max_fps = fps;
         if (prof.web_idle_close_secs) |secs| web_idle_close_secs = secs;
         if (prof.web_fetch_max_tabs) |n| web_fetch_max_tabs = n;
         if (prof.web_webgl) |p| web_webgl = p;
+        if (prof.web_motion_default) |m| {
+            motion_default = m;
+            motion_default_source = .profile;
+        }
+        if (prof.web_motion_pack.len > 0) {
+            motion_pack = prof.web_motion_pack;
+            motion_pack_source = .profile;
+        }
     }
+    if (opts.web_motion_default) |m| {
+        motion_default = m;
+        motion_default_source = .flag;
+    }
+    if (opts.web_motion_pack) |n| {
+        motion_pack = n;
+        motion_pack_source = .flag;
+    }
+    // The config arena dies with `cfg`; the pack name must outlive it.
+    @import("mcp_web.zig").configureMotion(allocator, motion_default, motion_default_source, allocator.dupe(u8, motion_pack) catch "", motion_pack_source);
     @import("mcp_web.zig").configureIdleClose(web_idle_close_secs);
     @import("mcp_web.zig").configureWebgl(web_webgl orelse .auto);
     mcp_webfetch.configure(web_fetch_max_tabs);
@@ -2172,6 +2217,12 @@ test "mcp flag parsing: isolation modes" {
     try t.expect(logged.durable);
     // --web-gui composes with every mode and defaults off.
     try t.expect(!def.web_gui);
+    const mo = try Opts.parse(&.{ "--web-motion-default", "replay", "--web-motion-pack", "my-mouse" });
+    try t.expectEqual(.replay, mo.web_motion_default.?);
+    try t.expectEqualStrings("my-mouse", mo.web_motion_pack.?);
+    try t.expectError(error.BadName, Opts.parse(&.{ "--web-motion-default", "sometimes" }));
+    try t.expectError(error.BadName, Opts.parse(&.{ "--web-motion-pack", "../x" }));
+    try t.expectError(error.MissingValue, Opts.parse(&.{"--web-motion-pack"}));
     try t.expect((try Opts.parse(&.{ "--web-gui", "--name", "w" })).web_gui);
     try t.expect((try Opts.parse(&.{ "--shared", "--web-gui" })).web_gui);
     // --no-record composes with every mode.

@@ -14,6 +14,23 @@ const KeyClass = pack_mod.KeyClass;
 
 pub const Rng = std.Random.DefaultPrng;
 
+/// How an automated action's input is produced: config
+/// `web_motion_default`, `sketerm mcp --web-motion-default`, and the
+/// per-call `motion` argument all speak this vocabulary.
+pub const Mode = enum {
+    /// Synthesized input: one move, then press and release at once.
+    direct,
+    /// Recorded human motion from the selected motion pack.
+    replay,
+
+    pub fn parse(s: []const u8) ?Mode {
+        return std.meta.stringToEnum(Mode, s);
+    }
+};
+
+/// What an action reports it got (`motion` on web_act / web_scroll).
+pub const Outcome = enum { direct, replayed };
+
 /// Recently used entries of one kind, excluded from the next picks.
 pub const Recent = struct {
     pub const CAP = 32;
