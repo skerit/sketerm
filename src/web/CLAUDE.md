@@ -1026,6 +1026,85 @@ When reproducing on a real site from an agent session, unset the session's
 `HTTPS_PROXY`/`SSL_CERT_FILE`: the helper honours the proxy and its mitm
 CA is not in the engine's store (`ERR_CERT_AUTHORITY_INVALID`).
 
+## The headful audit: "looks headful" is a gate (smoke-mcp)
+
+Jelle's direction (2026-10-12): by default the headless helper looks as
+headful as possible through REAL behaviour, never spoofing (no page-visible
+patch of navigator, console, `Function.prototype.toString` or anything
+else; stage gl proves the bridge installs nothing). What the public
+detectors read (fingerprint-scan.com's collector, pixelscan, sannysoft's
+fp-collect, CreepJS, BotD, devtools-detector) is re-implemented as OUR own
+page and judged against stock Chromium:
+
+- `src/smoke/headful_audit.js` + `.html`: one script for three realms (the
+  page, the `/frame` iframe, a dedicated Worker). Families: automation
+  markers (webdriver value AND where/how it is defined, driver globals and
+  document keys, `window.chrome` shape, `eval` length, stack shape, the CDP
+  `stack`-getter trick), native-code/lie checks (`toString` over ~1770
+  navigator/screen/canvas/WebGL/audio/window functions and getters, also
+  through a second realm; getter shape; own props; prototype chains),
+  context consistency (worker and iframe facts vs the page, request header
+  ORDER per request kind, client hints vs `userAgentData`, fetch metadata),
+  geometry, media queries, focus/visibility/rAF pacing, devtools-detector's
+  tricks, permissions, WebGL/WebGPU/canvas/audio/codecs/key systems/voices/
+  devices/keyboard map, navigator and window feature surface, storage quota,
+  Intl, UA-CH high entropy, and per click: isTrusted, the pointer sequence,
+  mouse compatibility events, hold, pointer properties. Each check posts
+  `{id, family, value, detail}`; `value` is normalised (no versions, raw
+  timings bucketed) so Chromium 152 and CEF 151 compare; `detail` is for
+  people.
+- `src/smoke/headful_audit_reference.json`: the reference, stock Chromium
+  headful on a sketerm display (launch_app, real seat click), with its
+  date and host notes. This host has no GPU, so WebGL is blocklisted there.
+- `src/smoke/headful_audit.zig`: THE classification (`TABLE`) plus the
+  loopback `Server`, `compare` and the table printer. `must_match`: a
+  difference is a bug and fails the stage; `host`: depends on the machine,
+  reported; `accepted`: an honest difference, reported, with `why`. An id
+  the table does not know fails closed, and so does a classified id the
+  page stopped reporting; a unit test (both test roots) holds the table and
+  the reference to the same id set. `Entry.replay` gives a check a stricter
+  class for the `motion:"replay"` click (a direct click is documented as
+  machine-shaped).
+
+Run it alone: `SKETERM_SMOKE_MCP_HEADFUL_ONLY=1 zig build smoke-mcp` (the
+full smoke-mcp runs it last). It serves the page on loopback, opens it with
+`web_open` in the default config and with `web_webgl = hardware`, clicks
+the probe direct and replayed (a generated pack), and prints one table per
+round: check, class, verdict, sketerm value, reference value. Refresh the
+reference with `SKETERM_SMOKE_MCP_HEADFUL_REFERENCE=/abs/out.json zig build
+smoke-mcp` (`SKETERM_SMOKE_MCP_HEADFUL_BROWSER` picks the browser, default
+`chromium`) and review the diff before committing it. To add a check: add it
+to the page with a NORMALISED value, classify it in `TABLE` (a non-
+`must_match` class needs its `why`), refresh the reference, run the stage.
+Unset `HTTPS_PROXY`/`SSL_CERT_FILE` first (the proxy note above).
+
+Measured 2026-10-12 (CEF 151 helper vs Chromium 152, this GPU-less host),
+identical in both configs. The five `must_match` failures, which keep the
+full smoke-mcp red until they are fixed (the product was not changed):
+
+- `geo.screen_is_viewport` / `geo.outer_exceeds_inner`: `screen` is the
+  1280x800 MCP view and `outer*` equals `inner*`; Chromium reports the 1920x1080
+  output and a window 32x129 px larger than its viewport (the geometry
+  package follows).
+- `kbd.layout_map`: `navigator.keyboard.getLayoutMap()` is empty (48
+  entries in Chromium, from the Wayland keymap).
+- `win.features`: no `window.EyeDropper` (Chromium has it).
+- `ctx.hdr_order_worker`: a dedicated Worker's script request sends
+  `User-Agent` right after `Accept`; Chromium sends it after `Referer`.
+  Documents, iframes, classic scripts and `fetch` match exactly. NOT
+  established whether it is the 151/152 skew or CEF's request proxy (every
+  request gets our `resource_request_handler`).
+
+Reported, not gated: `gfx.webgl*` (SwiftShader under `auto`, none under
+`hardware` exactly as Chromium), `media.codecs_proprietary` (no H.264/AAC
+in CEF's distribution), `input.moves_before_down` / `input.hold` for the
+direct click (one move, zero hold: documented; the replayed click holds
+and matches), and the host rows (`focus.has_focus` was false in Chromium
+until the first click, the window position, audio devices, voices).
+Everything else matched, including every automation marker, the
+`toString` scan in both realms, worker/iframe facts, devtools-detector's
+tricks, permissions, client hints, ClearKey and the storage quota.
+
 ## Cookies and site data: what the engine will and will not do
 
 The 0xC8 block (capability `sitedata`) is served from CEF's cookie

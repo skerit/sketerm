@@ -738,6 +738,19 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         webMotionStage(allocator, exe, rt);
         return 0;
     }
+    // The headful audit alone, in the product's default MCP lane.
+    if (c.getenv("SKETERM_SMOKE_MCP_HEADFUL_ONLY") != null) {
+        var bin_buf: [4096:0]u8 = undefined;
+        const web_bin = resolveWebBin(&bin_buf) orelse fail("sketerm-webengine missing for the headful audit");
+        _ = c.setenv("SKETERM_WEB_BIN", web_bin, 1);
+        headfulAuditStage(allocator, exe, rt);
+        return 0;
+    }
+    // Refresh the audit's reference from a stock browser (no helper needed).
+    if (c.getenv("SKETERM_SMOKE_MCP_HEADFUL_REFERENCE")) |out| {
+        headfulReferenceCapture(allocator, exe, rt, c.getenv("SKETERM_SMOKE_MCP_HEADFUL_BROWSER") orelse "chromium", out);
+        return 0;
+    }
     if (c.getenv("SKETERM_SMOKE_MCP_WEB_ONLY") != null) {
         // The client-spawn lane (sessions); see the full run's note.
         _ = c.setenv("SKETERM_WEB_BROKER_ENGINE", "0", 1);
@@ -2434,6 +2447,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             say("smoke-mcp: broker-owned engine lifecycle (real CEF) ok");
             webPresenterStage(allocator, exe, rt);
             say("smoke-mcp: watch-along presenter (real CEF) ok");
+            // Last: a red audit must not hide the stages above.
+            headfulAuditStage(allocator, exe, rt);
         }
     }
 
@@ -4283,23 +4298,7 @@ fn webMotionStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const 
     }
 
     // 2. `sketerm motion install` validates and installs a generated pack.
-    const pack_bytes = @import("motion/synth.zig").generate(allocator, .{ .seed = 5 }) catch fail("motion pack generation");
-    defer allocator.free(pack_bytes);
-    const pack_path = std.fmt.allocPrintSentinel(arena, "{s}/synthetic-pack.json", .{rt}, 0) catch fail("pack path");
-    {
-        const f = c.fopen(pack_path.ptr, "wb") orelse fail("cannot write the generated pack");
-        _ = c.fwrite(pack_bytes.ptr, 1, pack_bytes.len, f);
-        _ = c.fclose(f);
-        var out: [4096]u8 = undefined;
-        var status: c_int = 0;
-        const said = runCapture(&.{ exe, "motion", "install", pack_path.ptr, "--name", "smoke-pack", null }, &out, &status, 20_000);
-        if (status != 0 or std.mem.indexOf(u8, said, "installed motion pack 'smoke-pack'") == null) {
-            say(said);
-            fail("sketerm motion install did not install the generated pack");
-        }
-        const listed = runCapture(&.{ exe, "motion", "list", null }, &out, &status, 20_000);
-        if (status != 0 or std.mem.indexOf(u8, listed, "smoke-pack") == null) fail("sketerm motion list does not show the installed pack");
-    }
+    installSyntheticPack(allocator, arena, exe, rt);
 
     // 3. Selected by flag: the fact reports it, and a replayed click
     //    reports motion:replayed with its duration.
@@ -4377,6 +4376,179 @@ fn webMotionStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const 
     _ = runCapture(&.{ exe, "motion", "remove", "smoke-pack", null }, &out, &status, 20_000);
     if (status != 0) fail("sketerm motion remove failed");
     say("smoke-mcp: motion replay facts, replayed act/scroll, configured default and every fail-closed refusal ok");
+}
+
+/// Generate a motion pack (motion/synth.zig, never a person's) and
+/// install it as `smoke-pack` under the current `$XDG_DATA_HOME`.
+fn installSyntheticPack(allocator: std.mem.Allocator, arena: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) void {
+    const pack_bytes = @import("motion/synth.zig").generate(allocator, .{ .seed = 5 }) catch fail("motion pack generation");
+    defer allocator.free(pack_bytes);
+    const pack_path = std.fmt.allocPrintSentinel(arena, "{s}/synthetic-pack.json", .{rt}, 0) catch fail("pack path");
+    const f = c.fopen(pack_path.ptr, "wb") orelse fail("cannot write the generated pack");
+    _ = c.fwrite(pack_bytes.ptr, 1, pack_bytes.len, f);
+    _ = c.fclose(f);
+    var out: [4096]u8 = undefined;
+    var status: c_int = 0;
+    const said = runCapture(&.{ exe, "motion", "install", pack_path.ptr, "--name", "smoke-pack", null }, &out, &status, 20_000);
+    if (status != 0 or std.mem.indexOf(u8, said, "installed motion pack 'smoke-pack'") == null) {
+        say(said);
+        fail("sketerm motion install did not install the generated pack");
+    }
+    const listed = runCapture(&.{ exe, "motion", "list", null }, &out, &status, 20_000);
+    if (status != 0 or std.mem.indexOf(u8, listed, "smoke-pack") == null) fail("sketerm motion list does not show the installed pack");
+}
+
+const headful_audit = @import("smoke/headful_audit.zig");
+
+/// Poll the audit server until the page posted the passive result
+/// (`round` null) or input round `round`.
+fn auditAwait(srv: *headful_audit.Server, arena: std.mem.Allocator, round: ?usize, timeout_ms: i64) ?[]const u8 {
+    const deadline = nowMs() + timeout_ms;
+    while (nowMs() < deadline) {
+        const got = if (round) |r| srv.inputCopy(arena, r) else srv.passiveCopy(arena);
+        if (got) |g| return g;
+        _ = c.usleep(200_000);
+    }
+    return null;
+}
+
+/// Judge one page result against the committed reference and print the
+/// table; returns the failing rows.
+fn auditJudge(arena: std.mem.Allocator, label: []const u8, round: headful_audit.Round, body: []const u8) usize {
+    const rows = headful_audit.compare(arena, round, body, headful_audit.REFERENCE) catch |e| {
+        std.debug.print("smoke-mcp: headful audit [{s}]: unreadable result ({s}): {s}\n", .{ label, @errorName(e), body[0..@min(body.len, 400)] });
+        fail("headful audit: the page posted a result the judge cannot read");
+    };
+    headful_audit.printTable(label, rows);
+    return headful_audit.failures(rows);
+}
+
+/// The headful audit (`src/smoke/headful_audit.zig`) in the MCP headless
+/// helper, default config and `web_webgl = hardware`: the passive checks,
+/// a direct `web_act` click and a `motion:"replay"` click, each judged
+/// against headful Chromium. Fails on any `must_match` difference, after
+/// printing every table.
+fn headfulAuditStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) void {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var srv: headful_audit.Server = .{ .allocator = allocator };
+    if (!srv.start()) fail("headful audit: loopback server");
+    defer srv.deinit();
+
+    const data = std.fmt.allocPrintSentinel(arena, "{s}/audit-data", .{rt}, 0) catch fail("audit data dir");
+    _ = c.mkdir(data.ptr, 0o700);
+    const old_data = c.getenv("XDG_DATA_HOME");
+    _ = c.setenv("XDG_DATA_HOME", data.ptr, 1);
+    defer {
+        if (old_data) |o| _ = c.setenv("XDG_DATA_HOME", o, 1) else _ = c.unsetenv("XDG_DATA_HOME");
+    }
+    installSyntheticPack(allocator, arena, exe, rt);
+
+    const open_args = std.fmt.allocPrint(arena, "{{\"url\":\"http://127.0.0.1:{d}/\",\"snapshot\":\"none\"}}", .{srv.port()}) catch fail("audit url");
+    var failing: usize = 0;
+    for ([_]struct { label: []const u8, config: ?[]const u8 }{
+        .{ .label = "default", .config = null },
+        .{ .label = "web_webgl=hardware", .config = "[mcp]\nweb_webgl = hardware\n" },
+    }) |run| {
+        srv.reset();
+        if (run.config) |body| writeSmokeConfig(rt, body) else removeSmokeConfig(rt);
+        defer removeSmokeConfig(rt);
+        var m = Mcp.spawn(allocator, exe, &.{ "--web-motion-pack", "smoke-pack" });
+        m.initialize();
+        m.sendTool("web_open", open_args);
+        _ = capSc(arena, m.recvLine(90_000), "headful audit open", false);
+        const passive = auditAwait(&srv, arena, null, 120_000) orelse fail("headful audit: the page never posted its passive checks");
+        failing += auditJudge(arena, std.fmt.allocPrint(arena, "{s}, passive", .{run.label}) catch run.label, .passive, passive);
+
+        _ = capSc(arena, m.callToolTimeout("web_act", "{\"name\":\"Probe input\"}", 30_000), "headful audit direct click", false);
+        const direct = auditAwait(&srv, arena, 0, 20_000) orelse fail("headful audit: the direct click never reached the page");
+        failing += auditJudge(arena, std.fmt.allocPrint(arena, "{s}, direct click", .{run.label}) catch run.label, .direct, direct);
+
+        // Off the probe first, so the replayed reach enters it the way the
+        // reference click did instead of starting where the last one ended.
+        _ = capSc(arena, m.callToolTimeout("web_act", "{\"name\":\"passive done\",\"action\":\"hover\"}", 30_000), "headful audit hover away", false);
+        const replayed = capSc(arena, m.callToolTimeout("web_act", "{\"name\":\"Probe input\",\"motion\":\"replay\"}", 30_000), "headful audit replayed click", false);
+        if (!std.mem.eql(u8, replayed.get("motion").?.string, "replayed")) fail("headful audit: the replay click did not replay");
+        const replay = auditAwait(&srv, arena, 1, 20_000) orelse fail("headful audit: the replayed click never reached the page");
+        failing += auditJudge(arena, std.fmt.allocPrint(arena, "{s}, replayed click", .{run.label}) catch run.label, .replay, replay);
+        m.closeStdinWait();
+    }
+    if (failing > 0) {
+        std.debug.print("smoke-mcp: headful audit: {d} must_match row(s) differ from headful Chromium (FAIL rows above)\n", .{failing});
+        fail("headful audit: the headless helper does not look like headful Chrome");
+    }
+    say("smoke-mcp: headful audit: every must_match check matches headful Chromium");
+}
+
+/// Refresh the reference: the same page in a stock browser, headful on
+/// a sketerm display through this MCP's own `launch_app`, clicked with
+/// real seat input (`app_click`); writes `buildReference`'s file to
+/// `out_path` for review against the committed one.
+fn headfulReferenceCapture(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8, browser: [*:0]const u8, out_path: [*:0]const u8) void {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var srv: headful_audit.Server = .{ .allocator = allocator };
+    if (!srv.start()) fail("headful reference: loopback server");
+    defer srv.deinit();
+    var m = Mcp.spawn(allocator, exe, &.{});
+    m.initialize();
+    const launch = std.fmt.allocPrint(arena, "{{\"command\":[\"/usr/bin/env\",\"-u\",\"LIBGL_ALWAYS_SOFTWARE\",\"{s}\",\"--ozone-platform=wayland\",\"--user-data-dir={s}/reference-profile\",\"--no-first-run\",\"--no-default-browser-check\",\"--password-store=basic\",\"http://127.0.0.1:{d}/\"],\"wait_ms\":30000,\"stable_ms\":0}}", .{ browser, rt, srv.port() }) catch fail("launch args");
+    m.sendToolAllocated("launch_app", launch);
+    const app = capSc(arena, m.recvLine(60_000), "reference launch_app", false);
+    const window = app.get("primary_window").?.integer;
+    const passive = auditAwait(&srv, arena, null, 120_000) orelse fail("headful reference: the browser never posted the passive checks");
+    // Viewport origin inside the window: the toolbar's height above it,
+    // half the side border beside it. The probe is at (300,200) 160x48.
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, passive, .{}) catch fail("reference passive JSON");
+    const geo = for (parsed.object.get("checks").?.array.items) |ch| {
+        if (std.mem.eql(u8, ch.object.get("id").?.string, "geo.screen_is_viewport")) break ch.object.get("detail").?.object;
+    } else fail("reference passive lacks geometry");
+    const inner = geo.get("inner").?.array.items;
+    const outer = geo.get("outer").?.array.items;
+    const side = @divTrunc(outer[0].integer - inner[0].integer, 2);
+    const x = 380 + side;
+    const y = 224 + (outer[1].integer - inner[1].integer) - side;
+    var click: [160]u8 = undefined;
+    _ = capSc(arena, m.callTool("app_click", std.fmt.bufPrint(&click, "{{\"window\":{d},\"x\":{d},\"y\":{d},\"mark\":false,\"move_first\":true}}", .{ window, x, y }) catch unreachable), "reference app_click", false);
+    const input = auditAwait(&srv, arena, 0, 20_000) orelse fail("headful reference: the seat click never reached the page");
+    m.closeStdinWait();
+
+    var ver_buf: [512]u8 = undefined;
+    var status: c_int = 0;
+    const ver = std.mem.trim(u8, runCapture(&.{ "/usr/bin/env", browser, "--version", null }, &ver_buf, &status, 20_000), " \r\n");
+    var iso: [@import("util/clock.zig").ISO_LEN]u8 = undefined;
+    const stamp: []const u8 = @import("util/clock.zig").isoLocal(&iso, @import("util/clock.zig").wallMs()) orelse "unknown-date";
+    const date = stamp[0..@min(stamp.len, 10)];
+    var kbuf: [128]u8 = undefined;
+    var lbuf: [128]u8 = undefined;
+    const host = std.fmt.allocPrint(arena, "kernel {s}, {d} cores, GPU render node: {s}, load {s}", .{
+        std.mem.trim(u8, readSmall("/proc/sys/kernel/osrelease", &kbuf), " \n"),
+        std.Thread.getCpuCount() catch 0,
+        if (@import("web/ozone.zig").renderNodePresent()) "yes" else "NO (/dev/dri absent)",
+        loadavg: {
+            const l = readSmall("/proc/loadavg", &lbuf);
+            var it = std.mem.tokenizeScalar(u8, l, ' ');
+            var end: usize = 0;
+            for (0..3) |_| if (it.next()) |tok| {
+                end = @intFromPtr(tok.ptr) + tok.len - @intFromPtr(l.ptr);
+            };
+            break :loadavg l[0..end];
+        },
+    }) catch fail("host notes");
+    var notes: std.Io.Writer.Allocating = .init(arena);
+    std.json.Stringify.value(.{
+        .captured = date,
+        .browser = ver,
+        .how = "headful on a 1920x1080 sketerm display through `sketerm mcp` launch_app (--ozone-platform=wayland --no-first-run --no-default-browser-check --password-store=basic, fresh profile); the input round is an app_click on the probe (real seat input, move_first, 100ms hold)",
+        .host = host,
+    }, .{}, &notes.writer) catch fail("notes");
+    const file = headful_audit.buildReference(arena, notes.written(), passive, input) catch fail("headful reference: building the file");
+    const f = c.fopen(out_path, "wb") orelse fail("headful reference: cannot write the output");
+    _ = c.fwrite(file.ptr, 1, file.len, f);
+    _ = c.fclose(f);
+    say("smoke-mcp: headful reference written; diff it against src/smoke/headful_audit_reference.json");
 }
 
 /// The primary helper serving `socket` (its CEF subprocesses carry `--type=`).
