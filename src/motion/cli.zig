@@ -18,7 +18,11 @@ pub const USAGE =
     \\scrolling, replayed by the headless browser for web_act / web_scroll
     \\with motion:"replay" (sketerm mcp --web-motion-pack NAME, or config
     \\web_motion_pack). `record` opens the trainer window, the only way a
-    \\pack is made; Ctrl+S there installs it. Packs live in
+    \\pack is made; Ctrl+S there installs it, complete or not. When NAME
+    \\(default my-<device>) is already installed the window offers to
+    \\continue it, so a pack can be recorded over several sittings; an
+    \\unsaved recording is autosaved as a draft in
+    \\$XDG_STATE_HOME/sketerm/ and offered back next time. Packs live in
     \\$XDG_DATA_HOME/sketerm/motion-packs/ and are private (0600).
     \\
     \\A pack is one person's motor behaviour: sharing it shares a

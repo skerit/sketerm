@@ -1957,6 +1957,14 @@ only the trainer records; live use never is.
   `on:<host>` helper needs no files on its host, and one client's motion
   is never replayed for another. `webdrive` re-sends it at every
   handshake (`MotionLink`).
+- **What a pack may hold is decided in ONE place.** `pack.zig`'s
+  `Reach/Burst/Idle.problem`, `durationOk` and the `MAX_*` caps are what
+  `parse` refuses AND what the trainer's recorder drops at record time and
+  filters again at `Session.write`. A recorder-side check with its own
+  threshold is how a 440-reach session became unsaveable (a click 60 s
+  after its target appeared); never add one. The trainer can continue an
+  installed pack (`Session.load`: one device class, one clock) and
+  autosaves drafts to `$XDG_STATE_HOME/sketerm/motion-draft-<name>.json`.
 - **Planning is pure, execution is a timer.** `src/motion/replay.zig`
   picks the reach nearest (distance, direction, target width) excluding
   the connection's last `exclusionWindow` picks, warps it with a complex

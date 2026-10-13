@@ -1,6 +1,8 @@
-//! Installed motion packs: `$XDG_DATA_HOME/sketerm/motion-packs/<name>.json`.
-//! Packs never live in the repository; every write here validates the
-//! pack first, so an installed file always parses.
+//! Installed motion packs: `$XDG_DATA_HOME/sketerm/motion-packs/<name>.json`,
+//! and the trainer's autosaved drafts:
+//! `$XDG_STATE_HOME/sketerm/motion-draft-<name>.json`. Packs never live in
+//! the repository; every write here validates the pack first, so an
+//! installed file or a draft always parses.
 
 const std = @import("std");
 const c = @import("../c.zig").c;
@@ -10,7 +12,7 @@ const pathz = @import("../util/pathz.zig");
 const readfile = @import("../util/readfile.zig");
 const atomicwrite = @import("../util/atomicwrite.zig");
 
-pub const Error = error{ NoDataDir, InvalidName, NotInstalled, Invalid, ReadFailed, WriteFailed, OutOfMemory };
+pub const Error = error{ NoDataDir, NoStateDir, InvalidName, NotInstalled, Invalid, ReadFailed, WriteFailed, OutOfMemory };
 
 /// The packs directory, without a trailing slash.
 pub fn dir(buf: []u8) ?[]const u8 {
@@ -60,7 +62,11 @@ pub fn loadPath(gpa: std.mem.Allocator, path: []const u8, diag: *pack_mod.Diag) 
 /// Load the installed pack `name`.
 pub fn load(gpa: std.mem.Allocator, name: []const u8, diag: *pack_mod.Diag) Error!Loaded {
     var buf: [4096]u8 = undefined;
-    const path = try pathFor(&buf, name);
+    return loadExisting(gpa, try pathFor(&buf, name), diag);
+}
+
+/// `loadPath`, but `error.NotInstalled` when there is no such file.
+fn loadExisting(gpa: std.mem.Allocator, path: []const u8, diag: *pack_mod.Diag) Error!Loaded {
     var z: [4096]u8 = undefined;
     const pz = pathz.pathZ(&z, path) catch return error.NotInstalled;
     if (c.access(pz, c.F_OK) != 0) return error.NotInstalled;
@@ -75,29 +81,68 @@ pub fn install(gpa: std.mem.Allocator, src: []const u8, name: []const u8, diag: 
     const dest = try pathFor(&buf, name);
     const loaded = try loadPath(gpa, src, diag);
     defer gpa.free(loaded.bytes);
-    try writeValidated(dest, loaded.bytes);
+    var d: [4096]u8 = undefined;
+    try writeIn(dir(&d) orelse return error.NoDataDir, dest, loaded.bytes);
     return loaded.summary;
 }
 
-/// Install already-validated pack bytes as `name` (the trainer's save).
+/// Install pack bytes as `name` (the trainer's save), validated first:
+/// a refused pack writes nothing and leaves an installed one unchanged.
 pub fn installBytes(gpa: std.mem.Allocator, bytes: []const u8, name: []const u8, diag: *pack_mod.Diag) Error!pack_mod.Pack.Summary {
     var buf: [4096]u8 = undefined;
     const dest = try pathFor(&buf, name);
+    const summary = try validate(gpa, bytes, diag);
+    var d: [4096]u8 = undefined;
+    try writeIn(dir(&d) orelse return error.NoDataDir, dest, bytes);
+    return summary;
+}
+
+fn validate(gpa: std.mem.Allocator, bytes: []const u8, diag: *pack_mod.Diag) Error!pack_mod.Pack.Summary {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     const p = pack_mod.parse(arena.allocator(), bytes, diag) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Invalid => return error.Invalid,
     };
-    try writeValidated(dest, bytes);
     return p.summary();
 }
 
-fn writeValidated(dest: []const u8, bytes: []const u8) Error!void {
-    var d: [4096]u8 = undefined;
-    const base = dir(&d) orelse return error.NoDataDir;
+/// Write `bytes` to `dest` (0600) inside `base`, creating `base` (0700).
+fn writeIn(base: []const u8, dest: []const u8, bytes: []const u8) Error!void {
     pathz.makeDirs(base, 0o700) catch return error.WriteFailed;
     atomicwrite.writeFileExact(dest, bytes, 0o600) catch return error.WriteFailed;
+}
+
+/// The trainer's autosaved draft for pack `name`.
+pub fn draftPathFor(buf: []u8, name: []const u8) Error![]const u8 {
+    if (!pack_mod.validName(name)) return error.InvalidName;
+    var d: [4096]u8 = undefined;
+    const base = xdg.stateDir(&d) orelse return error.NoStateDir;
+    return std.fmt.bufPrint(buf, "{s}/motion-draft-{s}.json", .{ base, name }) catch error.NoStateDir;
+}
+
+/// Replace the draft for `name` with `bytes`, validated first.
+pub fn saveDraft(gpa: std.mem.Allocator, bytes: []const u8, name: []const u8, diag: *pack_mod.Diag) Error!void {
+    var buf: [4096]u8 = undefined;
+    const dest = try draftPathFor(&buf, name);
+    _ = try validate(gpa, bytes, diag);
+    var d: [4096]u8 = undefined;
+    try writeIn(xdg.stateDir(&d) orelse return error.NoStateDir, dest, bytes);
+}
+
+/// The draft for `name`; `error.NotInstalled` when there is none.
+pub fn loadDraft(gpa: std.mem.Allocator, name: []const u8, diag: *pack_mod.Diag) Error!Loaded {
+    var buf: [4096]u8 = undefined;
+    return loadExisting(gpa, try draftPathFor(&buf, name), diag);
+}
+
+/// Delete the draft for `name`, if there is one.
+pub fn removeDraft(name: []const u8) void {
+    var buf: [4096]u8 = undefined;
+    const path = draftPathFor(&buf, name) catch return;
+    var z: [4096]u8 = undefined;
+    const pz = pathz.pathZ(&z, path) catch return;
+    _ = c.unlink(pz);
 }
 
 /// Remove the installed pack `name`.
@@ -160,20 +205,35 @@ pub fn freeList(gpa: std.mem.Allocator, entries: []Entry) void {
     gpa.free(entries);
 }
 
+/// A test's override of one environment variable, undone by `restore`.
+const EnvOverride = struct {
+    name: [*:0]const u8,
+    buf: [4096]u8 = undefined,
+    old_len: ?usize = null,
+
+    fn set(self: *EnvOverride, value: [*:0]const u8) void {
+        if (@import("../util/env.zig").get(self.name)) |o| if (o.len < self.buf.len) {
+            @memcpy(self.buf[0..o.len], o);
+            self.buf[o.len] = 0;
+            self.old_len = o.len;
+        };
+        _ = c.setenv(self.name, value, 1);
+    }
+
+    fn restore(self: *EnvOverride) void {
+        if (self.old_len) |n| {
+            _ = c.setenv(self.name, self.buf[0..n :0].ptr, 1);
+        } else _ = c.unsetenv(self.name);
+    }
+};
+
 test "install, list, load and remove a generated pack under XDG_DATA_HOME" {
     const t = std.testing;
-    const env = @import("../util/env.zig");
     const td = pathz.TempDir.make("motion") orelse return error.SkipZigTest;
     defer td.remove();
-    const old = env.get("XDG_DATA_HOME");
-    var old_buf: [4096]u8 = undefined;
-    const saved: ?[:0]const u8 = if (old) |o| (std.fmt.bufPrintZ(&old_buf, "{s}", .{o}) catch null) else null;
-    defer if (saved) |s| {
-        _ = c.setenv("XDG_DATA_HOME", s.ptr, 1);
-    } else {
-        _ = c.unsetenv("XDG_DATA_HOME");
-    };
-    _ = c.setenv("XDG_DATA_HOME", td.pathZ(), 1);
+    var data: EnvOverride = .{ .name = "XDG_DATA_HOME" };
+    data.set(td.pathZ());
+    defer data.restore();
 
     const bytes = try @import("synth.zig").generate(t.allocator, .{ .seed = 9 });
     defer t.allocator.free(bytes);
@@ -204,4 +264,39 @@ test "install, list, load and remove a generated pack under XDG_DATA_HOME" {
     try remove("my-mouse");
     try t.expectError(error.NotInstalled, load(t.allocator, "my-mouse", &diag));
     try t.expectError(error.NotInstalled, remove("my-mouse"));
+}
+
+test "a draft saves under XDG_STATE_HOME privately, loads, and is removed" {
+    const t = std.testing;
+    const td = pathz.TempDir.make("motiondraft") orelse return error.SkipZigTest;
+    defer td.remove();
+    var state: EnvOverride = .{ .name = "XDG_STATE_HOME" };
+    state.set(td.pathZ());
+    defer state.restore();
+
+    var buf: [4096]u8 = undefined;
+    const path = try draftPathFor(&buf, "my-mouse");
+    var want: [4096]u8 = undefined;
+    try t.expectEqualStrings(try std.fmt.bufPrint(&want, "{s}/sketerm/motion-draft-my-mouse.json", .{td.path()}), path);
+    try t.expectError(error.InvalidName, draftPathFor(&buf, "../x"));
+
+    var diag: pack_mod.Diag = .{};
+    try t.expectError(error.NotInstalled, loadDraft(t.allocator, "my-mouse", &diag));
+    // An invalid pack is never written as a draft.
+    try t.expectError(error.Invalid, saveDraft(t.allocator, "{}", "my-mouse", &diag));
+    try t.expectError(error.NotInstalled, loadDraft(t.allocator, "my-mouse", &diag));
+
+    const bytes = try @import("synth.zig").generate(t.allocator, .{ .seed = 11 });
+    defer t.allocator.free(bytes);
+    try saveDraft(t.allocator, bytes, "my-mouse", &diag);
+    var z: [4096]u8 = undefined;
+    var st: c.struct_stat = undefined;
+    try t.expectEqual(@as(c_int, 0), c.stat(try pathz.pathZ(&z, path), &st));
+    try t.expectEqual(@as(c_uint, 0o600), @as(c_uint, @intCast(st.st_mode & 0o777)));
+    const loaded = try loadDraft(t.allocator, "my-mouse", &diag);
+    defer t.allocator.free(loaded.bytes);
+    try t.expect(loaded.summary.reaches > 0);
+    removeDraft("my-mouse");
+    try t.expectError(error.NotInstalled, loadDraft(t.allocator, "my-mouse", &diag));
+    removeDraft("my-mouse");
 }

@@ -21,6 +21,32 @@ pub const MAX_BURST_EVENTS: usize = 1024;
 pub const MAX_IDLE: usize = 256;
 /// A reach shorter than this (start to press) carries no direction.
 pub const MIN_REACH_PX: f64 = 4;
+/// Latest press after a reach's target appeared, ms.
+pub const MAX_PRESS_MS: f64 = 60_000;
+/// Longest press-to-release of a reach, ms.
+pub const MAX_CLICK_MS: f64 = 5_000;
+/// Longest key hold, ms.
+pub const MAX_HOLD_MS: f64 = 2_000;
+/// Longest key-down to key-down flight, ms.
+pub const MAX_FLIGHT_MS: f64 = 5_000;
+/// Longest scroll burst, first event to last, ms.
+pub const MAX_BURST_MS: f64 = 60_000;
+
+/// Whether a hold or flight of `ms` fits under `cap_ms`.
+pub fn durationOk(ms: f64, cap_ms: f64) bool {
+    return std.math.isFinite(ms) and ms > 0 and ms <= cap_ms;
+}
+
+/// Why a sample list cannot be stored, or null when it can.
+pub fn samplesProblem(samples: []const Sample) ?[]const u8 {
+    if (samples.len > MAX_SAMPLES) return std.fmt.comptimePrint("more than {d} pointer samples", .{MAX_SAMPLES});
+    for (samples, 0..) |s, i| {
+        if (!std.math.isFinite(s.t) or !std.math.isFinite(s.x) or !std.math.isFinite(s.y)) return "a sample is not a finite number";
+        if (s.t < 0) return "a sample has a negative time";
+        if (i > 0 and s.t <= samples[i - 1].t) return "sample times are not strictly increasing";
+    }
+    return null;
+}
 
 pub const Device = enum {
     mouse,
@@ -112,6 +138,21 @@ pub const Reach = struct {
     pub fn width(self: Reach) f64 {
         return @min(self.target[2], self.target[3]);
     }
+
+    /// Why this reach cannot be stored, or null when it can. The ONE
+    /// rule: `parse` refuses a pack holding such a reach, and the
+    /// recorder drops one before it is kept.
+    pub fn problem(self: Reach) ?[]const u8 {
+        if (!(self.target[2] > 0 and self.target[3] > 0)) return "the target has no area";
+        if (samplesProblem(self.samples)) |why| return why;
+        if (!(self.land[0] >= 0 and self.land[0] <= 1 and self.land[1] >= 0 and self.land[1] <= 1)) return "\"land\" is outside the target box";
+        if (!(self.up > self.down)) return "release is not after the press";
+        if (self.down > MAX_PRESS_MS) return std.fmt.comptimePrint("the press came more than {d} s after the target appeared", .{MAX_PRESS_MS / 1000});
+        if (self.up - self.down > MAX_CLICK_MS) return std.fmt.comptimePrint("the button was held down more than {d} s", .{MAX_CLICK_MS / 1000});
+        if (self.path().len < 2) return "fewer than two samples before the press";
+        if (self.distance() < MIN_REACH_PX) return std.fmt.comptimePrint("shorter than {d}px", .{MIN_REACH_PX});
+        return null;
+    }
 };
 
 /// One wheel event of a burst: ms since the burst began, deltas in the
@@ -132,6 +173,17 @@ pub const Burst = struct {
         }
         return s;
     }
+
+    /// Why this burst cannot be stored, or null when it can.
+    pub fn problem(self: Burst) ?[]const u8 {
+        if (self.events.len == 0) return "it has no events";
+        if (self.events.len > MAX_BURST_EVENTS) return std.fmt.comptimePrint("more than {d} events", .{MAX_BURST_EVENTS});
+        for (self.events, 0..) |e, j| {
+            if (!std.math.isFinite(e.t) or !std.math.isFinite(e.dx) or !std.math.isFinite(e.dy)) return "an event is not a finite number";
+            if (e.t < 0 or e.t > MAX_BURST_MS or (j > 0 and e.t < self.events[j - 1].t)) return "event times are out of order";
+        }
+        return null;
+    }
 };
 
 /// A resting hand's wander: samples in ms and CSS px, relative to the
@@ -149,6 +201,11 @@ pub const Idle = struct {
             hi = .{ @max(hi[0], s.x), @max(hi[1], s.y) };
         }
         return @max(hi[0] - lo[0], hi[1] - lo[1]);
+    }
+
+    /// Why this segment cannot be stored, or null when it can.
+    pub fn problem(self: Idle) ?[]const u8 {
+        return samplesProblem(self.samples);
     }
 };
 
@@ -286,17 +343,15 @@ fn parseHeader(v: std.json.Value, diag: *Diag) ParseError!Header {
     return h;
 }
 
+/// Structure only; what makes a sample list storable is `samplesProblem`.
 fn parseSamples(arena: std.mem.Allocator, v: std.json.Value, what: []const u8, idx: usize, diag: *Diag) ParseError![]Sample {
     if (v != .array) return diag.set("{s} {d}: \"samples\" is not an array", .{ what, idx });
-    if (v.array.items.len > MAX_SAMPLES) return diag.set("{s} {d}: {d} samples, past {d}", .{ what, idx, v.array.items.len, MAX_SAMPLES });
     const out = try arena.alloc(Sample, v.array.items.len);
     for (v.array.items, 0..) |s, i| {
         if (s != .array or s.array.items.len != 3) return diag.set("{s} {d}: sample {d} is not [t, dx, dy]", .{ what, idx, i });
         const t = num(s.array.items[0]) orelse return diag.set("{s} {d}: sample {d} has a non-numeric field", .{ what, idx, i });
         const x = num(s.array.items[1]) orelse return diag.set("{s} {d}: sample {d} has a non-numeric field", .{ what, idx, i });
         const y = num(s.array.items[2]) orelse return diag.set("{s} {d}: sample {d} has a non-numeric field", .{ what, idx, i });
-        if (t < 0) return diag.set("{s} {d}: sample {d} has a negative time", .{ what, idx, i });
-        if (i > 0 and t <= out[i - 1].t) return diag.set("{s} {d}: sample times are not strictly increasing at {d}", .{ what, idx, i });
         out[i] = .{ .t = t, .x = x, .y = y };
     }
     return out;
@@ -320,17 +375,12 @@ fn parseReaches(arena: std.mem.Allocator, v: std.json.Value, diag: *Diag) ParseE
         if (tv != .array or tv.array.items.len != 4) return diag.set("reach {d}: \"target\" is not [x, y, w, h]", .{i});
         var target: [4]f64 = undefined;
         for (&target, tv.array.items) |*dst, src| dst.* = num(src) orelse return diag.set("reach {d}: \"target\" has a non-numeric field", .{i});
-        if (target[2] <= 0 or target[3] <= 0) return diag.set("reach {d}: target has no area", .{i});
         const samples = try parseSamples(arena, o.get("samples") orelse return diag.set("reach {d} has no \"samples\"", .{i}), "reach", i, diag);
         const down = num(o.get("down") orelse return diag.set("reach {d} has no \"down\"", .{i})) orelse return diag.set("reach {d}: \"down\" is not a number", .{i});
         const up = num(o.get("up") orelse return diag.set("reach {d} has no \"up\"", .{i})) orelse return diag.set("reach {d}: \"up\" is not a number", .{i});
         const land = pair(o.get("land")) orelse return diag.set("reach {d}: \"land\" is not [u, v]", .{i});
-        if (land[0] < 0 or land[0] > 1 or land[1] < 0 or land[1] > 1) return diag.set("reach {d}: \"land\" is outside the target box", .{i});
-        if (up <= down) return diag.set("reach {d}: release is not after the press", .{i});
-        if (up - down > 5_000 or down > 60_000) return diag.set("reach {d}: press timing is implausible", .{i});
         out[i] = .{ .start = start, .target = target, .samples = samples, .down = down, .up = up, .land = land };
-        if (out[i].path().len < 2) return diag.set("reach {d}: fewer than two samples before the press", .{i});
-        if (out[i].distance() < MIN_REACH_PX) return diag.set("reach {d}: shorter than {d}px", .{ i, MIN_REACH_PX });
+        if (out[i].problem()) |why| return diag.set("reach {d}: {s}", .{ i, why });
     }
     return out;
 }
@@ -341,7 +391,7 @@ fn parseDurations(arena: std.mem.Allocator, v: std.json.Value, what: []const u8,
     const out = try arena.alloc(f64, v.array.items.len);
     for (v.array.items, 0..) |x, i| {
         out[i] = num(x) orelse return diag.set("keys {s}: entry {d} is not a number", .{ what, i });
-        if (out[i] <= 0 or out[i] > cap_ms) return diag.set("keys {s}: entry {d} is outside 0..{d}ms", .{ what, i, cap_ms });
+        if (!durationOk(out[i], cap_ms)) return diag.set("keys {s}: entry {d} is outside 0..{d}ms", .{ what, i, cap_ms });
     }
     return out;
 }
@@ -354,7 +404,7 @@ fn parseKeys(arena: std.mem.Allocator, v: std.json.Value, diag: *Diag) ParseErro
         var it = h.object.iterator();
         while (it.next()) |e| {
             const cls = std.meta.stringToEnum(KeyClass, e.key_ptr.*) orelse return diag.set("keys hold: unknown key class \"{s}\"", .{e.key_ptr.*});
-            keys.hold[@intFromEnum(cls)] = try parseDurations(arena, e.value_ptr.*, e.key_ptr.*, 2_000, diag);
+            keys.hold[@intFromEnum(cls)] = try parseDurations(arena, e.value_ptr.*, e.key_ptr.*, MAX_HOLD_MS, diag);
         }
     }
     if (v.object.get("flight")) |f| {
@@ -364,7 +414,7 @@ fn parseKeys(arena: std.mem.Allocator, v: std.json.Value, diag: *Diag) ParseErro
             const sep = std.mem.indexOfScalar(u8, e.key_ptr.*, '>') orelse return diag.set("keys flight: \"{s}\" is not \"<class>><class>\"", .{e.key_ptr.*});
             const from = std.meta.stringToEnum(KeyClass, e.key_ptr.*[0..sep]) orelse return diag.set("keys flight: unknown key class in \"{s}\"", .{e.key_ptr.*});
             const to = std.meta.stringToEnum(KeyClass, e.key_ptr.*[sep + 1 ..]) orelse return diag.set("keys flight: unknown key class in \"{s}\"", .{e.key_ptr.*});
-            keys.flight[@intFromEnum(from)][@intFromEnum(to)] = try parseDurations(arena, e.value_ptr.*, e.key_ptr.*, 5_000, diag);
+            keys.flight[@intFromEnum(from)][@intFromEnum(to)] = try parseDurations(arena, e.value_ptr.*, e.key_ptr.*, MAX_FLIGHT_MS, diag);
         }
     }
     return keys;
@@ -377,19 +427,18 @@ fn parseBursts(arena: std.mem.Allocator, v: std.json.Value, diag: *Diag) ParseEr
     for (v.array.items, 0..) |b, i| {
         if (b != .object) return diag.set("scroll burst {d} is not an object", .{i});
         const ev = b.object.get("events") orelse return diag.set("scroll burst {d} has no \"events\"", .{i});
-        if (ev != .array or ev.array.items.len == 0) return diag.set("scroll burst {d}: \"events\" is empty or not an array", .{i});
-        if (ev.array.items.len > MAX_BURST_EVENTS) return diag.set("scroll burst {d}: past {d} events", .{ i, MAX_BURST_EVENTS });
+        if (ev != .array) return diag.set("scroll burst {d}: \"events\" is not an array", .{i});
         const events = try arena.alloc(Wheel, ev.array.items.len);
         for (ev.array.items, 0..) |e, j| {
             if (e != .array or e.array.items.len != 3) return diag.set("scroll burst {d}: event {d} is not [t, dx, dy]", .{ i, j });
             const t = num(e.array.items[0]) orelse return diag.set("scroll burst {d}: event {d} has a non-numeric field", .{ i, j });
             const dx = num(e.array.items[1]) orelse return diag.set("scroll burst {d}: event {d} has a non-numeric field", .{ i, j });
             const dy = num(e.array.items[2]) orelse return diag.set("scroll burst {d}: event {d} has a non-numeric field", .{ i, j });
-            if (t < 0 or t > 60_000 or (j > 0 and t < events[j - 1].t)) return diag.set("scroll burst {d}: event {d} time is out of order", .{ i, j });
             events[j] = .{ .t = t, .dx = dx, .dy = dy };
         }
         const smooth = if (b.object.get("smooth")) |s| (s == .bool and s.bool) else false;
         out[i] = .{ .smooth = smooth, .events = events };
+        if (out[i].problem()) |why| return diag.set("scroll burst {d}: {s}", .{ i, why });
     }
     return out;
 }
@@ -401,6 +450,7 @@ fn parseIdle(arena: std.mem.Allocator, v: std.json.Value, diag: *Diag) ParseErro
     for (v.array.items, 0..) |s, i| {
         if (s != .object) return diag.set("idle segment {d} is not an object", .{i});
         out[i] = .{ .samples = try parseSamples(arena, s.object.get("samples") orelse return diag.set("idle segment {d} has no \"samples\"", .{i}), "idle segment", i, diag) };
+        if (out[i].problem()) |why| return diag.set("idle segment {d}: {s}", .{ i, why });
     }
     return out;
 }
@@ -528,6 +578,9 @@ test "bad versions, truncated samples and broken timing are refused with a reaso
         .{ .json = "{\"format\":\"sketerm-motion\",\"version\":1,\"header\":{\"device\":\"mouse\",\"rate_hz\":125}}", .want = "holds no reaches" },
         .{ .json = "{\"format\":\"sketerm-motion\",\"version\":1,\"header\":{\"device\":\"mouse\",\"rate_hz\":125,\"clock\":\"sundial\"}}", .want = "unknown clock" },
         .{ .json = "{\"format\":\"sketerm-motion\",\"version\":1,\"header\":{\"device\":\"mouse\",\"rate_hz\":125},\"keys\":{\"hold\":{\"thumb\":[80]}}}", .want = "unknown key class" },
+        .{ .json = "{\"format\":\"sketerm-motion\",\"version\":1,\"header\":{\"device\":\"mouse\",\"rate_hz\":125},\"reaches\":[{\"start\":[0,0],\"target\":[0,0,5,5],\"samples\":[[0,0,0],[70000,40,0]],\"down\":70000,\"up\":70100,\"land\":[0.5,0.5]}]}", .want = "reach 0: the press came more than 60 s after the target appeared" },
+        .{ .json = "{\"format\":\"sketerm-motion\",\"version\":1,\"header\":{\"device\":\"mouse\",\"rate_hz\":125},\"keys\":{\"hold\":{\"left\":[80,2500]}}}", .want = "entry 1 is outside 0..2000ms" },
+        .{ .json = "{\"format\":\"sketerm-motion\",\"version\":1,\"header\":{\"device\":\"mouse\",\"rate_hz\":125},\"keys\":{\"hold\":{\"left\":[80]}},\"scroll\":[{\"events\":[[0,0,1],[70000,0,1]]}]}", .want = "scroll burst 0: event times are out of order" },
     };
     for (cases) |cs| {
         var diag: Diag = .{};

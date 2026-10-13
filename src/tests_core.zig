@@ -290,6 +290,7 @@ comptime {
     _ = @import("motion/store.zig");
     _ = @import("motion/recorder.zig");
     _ = @import("motion/cli.zig");
+    _ = @import("motion/reading.zig");
     _ = @import("web/userscript.zig");
     _ = @import("web/urlhost.zig");
     _ = @import("web/model.zig");
