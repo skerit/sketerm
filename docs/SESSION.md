@@ -1,5 +1,32 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-13: motion trainer keeps your work; packs can be continued
+
+A 440-reach session was lost to "reach 440: press timing is implausible":
+the recorder kept a reach that `pack.parse` refuses (a click more than
+60 s after its target appeared), so every Save failed. Item validity now
+has one home in `pack.zig` (`Reach/Burst/Idle.problem`, `durationOk`,
+named caps) used by `parse`, by the recorder at record time (a refused
+reach is dropped with the reason shown and a new target appears) and by
+`Session.write` as a filter, so one bad item never blocks a save. A
+target left with no pointer motion for 3 s restarts its reach at the
+next motion. A failed Save says nothing was written, the installed pack
+is unchanged and the recording is still in the window; a successful one
+gives totals and what this session added. An installed pack can be
+continued (`Session.load`, refused on a device-class or clock mismatch,
+caps respected); the window offers Continue / Start new when its name is
+installed and asks before Save replaces one. Drafts autosave to
+`$XDG_STATE_HOME/sketerm/motion-draft-<name>.json` every 20 items and on
+a page switch, are offered back, and closing with unsaved items asks
+Save / Discard / Cancel. Goals: one reach per coverage cell (192,
+usable from 50), 300 key timings, 40 scroll bursts, 8 idle segments,
+each with a progress line and "(done)" in the switcher. The scrolling
+page shows a random public-domain story (`src/motion/reading.txt`).
+Also fixed: the rate estimate copied every motion interval into the
+session arena on each refresh (unbounded growth); it is now a 1024-entry
+ring. smoke-e2e's motion stage now continues the pack it saved and checks
+the reach count grows.
+
 ## 2026-10-13: idle drift replay; custom-dropdown picks replay too
 
 Recorded idle drift is now replayed, opt-in per view: `web_open
