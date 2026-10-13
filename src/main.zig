@@ -399,6 +399,9 @@ fn upgradeLocalDaemon(allocator: std.mem.Allocator) void {
 }
 
 pub fn main(init: std.process.Init.Minimal) u8 {
+    // Before GTK/GLib run: they unsetenv on their own (an inherited
+    // DESKTOP_STARTUP_ID / XDG_ACTIVATION_TOKEN), past env.unset.
+    @import("util/env.zig").detachEnviron();
     const argv = init.args.vector;
     // Internal OpenSSH ProxyCommand. It is intentionally absent from help;
     // dispatch before application initialization, then discard the environment.

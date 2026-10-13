@@ -73,6 +73,8 @@ const HELP =
 ;
 
 pub fn main(init: std.process.Init.Minimal) u8 {
+    // Before anything removes a variable: see env.detachEnviron.
+    @import("util/env.zig").detachEnviron();
     var gpa_state: std.heap.DebugAllocator(.{}) = .{};
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();

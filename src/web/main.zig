@@ -56,6 +56,8 @@ const USAGE =
 const PRELOAD_GUARD = "SKETERM_WEB_PRELOADED";
 
 pub fn main(init: std.process.Init.Minimal) u8 {
+    // Before CEF/Chromium run: they remove variables on their own, past env.unset.
+    @import("../util/env.zig").detachEnviron();
     const argv = init.args.vector;
     var restricted = c.getenv("SKETERM_WEB_UNTRUSTED") != null;
     var subprocess = false;
