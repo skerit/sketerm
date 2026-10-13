@@ -459,7 +459,7 @@ pub const CAP_VIEW_FLAGS = "view-flags";
 /// `motion = replayed` and the duration. Without a loaded pack a replay
 /// request FAILS; it never falls back to direct input.
 pub const CAP_MOTION_REPLAY = "motion-replay";
-/// The helper replays recorded IDLE DRIFT (a resting hand's wander) on
+/// The helper replays recorded IDLE DRIFT (an idling user's pointer) on
 /// a view that opted in with `motion_drift`, from the sending
 /// connection's motion pack, only between actions on that view. A
 /// client must not send `motion_drift` to a helper without it: an older

@@ -72,7 +72,7 @@ fn page(s: Section) Page {
         .idle => .{
             .name = "idle",
             .title = "Idle drift",
-            .about = std.fmt.comptimePrint("Press Start, then leave your hand resting on the pointer for {d} seconds without trying to move it. This records the small drift of a resting hand. Needed only for idle drift (web_open idle_drift).", .{IDLE_SECONDS}),
+            .about = std.fmt.comptimePrint("Press Start, then idle for {d} seconds the way you normally do while looking at a page: no need to keep the pointer still, and no need to move it on purpose. This records what your pointer does while you idle. Needed only for idle drift (web_open idle_drift).", .{IDLE_SECONDS}),
         },
     };
 }
@@ -697,19 +697,20 @@ fn onIdleStart(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
     const self = cast.userData(Trainer, user);
     if (self.idle_timer != 0 or self.blocked) return;
     self.session.beginIdle();
-    c.gtk_label_set_text(@ptrCast(self.idle_label), "Recording: keep your hand resting on the pointer...");
+    c.gtk_label_set_text(@ptrCast(self.idle_label), "Recording: idle as you normally would...");
     self.idle_timer = c.g_timeout_add_seconds(IDLE_SECONDS, @ptrCast(&onIdleDone), @ptrCast(self));
 }
 
 fn onIdleDone(user: ?*anyopaque) callconv(.c) c.gboolean {
     const self = cast.userData(Trainer, user);
     self.idle_timer = 0;
-    const before = self.session.idle.items.len;
-    self.session.endIdle() catch {};
-    c.gtk_label_set_text(@ptrCast(self.idle_label), if (self.session.idle.items.len > before)
-        "Recorded. Press Start again for another segment."
-    else
-        "Nothing was recorded: the pointer needs to be over this page while you rest your hand on it. Press Start to try again.");
+    const outcome = self.session.endIdle() catch .nothing;
+    c.gtk_label_set_text(@ptrCast(self.idle_label), switch (outcome) {
+        .kept => "Recorded. Press Start again for another segment.",
+        .nothing => "Nothing was recorded: the pointer needs to be over this page while you idle. Press Start to try again.",
+        .no_motion => "Not kept: the pointer did not move, so idle drift would have nothing to replay. Idle the way you normally do while looking at a page, then press Start again.",
+        .capped => "Not kept: the pack already holds as many idle segments as it can.",
+    });
     refresh(self);
     maybeDraft(self, false);
     return 0;

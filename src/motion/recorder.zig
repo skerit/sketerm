@@ -36,7 +36,7 @@ pub const Section = enum {
     /// The progress count at which the section is complete (see
     /// `Session.progress`). Typing: ~60 short prompts, enough holds per
     /// key class and flights per class pair. Scrolling: bursts of both
-    /// directions and lengths. Idle: about a minute of a resting hand.
+    /// directions and lengths. Idle: about a minute of an idling user's pointer.
     pub fn goal(self: Section) usize {
         return switch (self) {
             .reaches => CELLS,
@@ -396,17 +396,28 @@ pub const Session = struct {
         self.idle_cur = .{ .t0 = 0, .origin = .{ 0, 0 }, .samples = .empty };
     }
 
-    pub fn endIdle(self: *Session) !void {
-        const seg = self.idle_cur orelse return;
+    /// What became of the idle segment `endIdle` closed.
+    pub const IdleEnd = enum {
+        kept,
+        /// No segment was being recorded, or no motion sample arrived.
+        nothing,
+        /// The pointer never moved, so idle drift would have nothing to replay.
+        no_motion,
+        capped,
+    };
+
+    pub fn endIdle(self: *Session) !IdleEnd {
+        const seg = self.idle_cur orelse return .nothing;
         self.idle_cur = null;
         const idle: pack_mod.Idle = .{ .samples = seg.samples.items };
-        // One sample is no drift at all.
-        if (idle.samples.len < 2 or idle.problem() != null) return;
+        if (idle.samples.len == 0 or idle.problem() != null) return .nothing;
+        if (!idle.replayable()) return .no_motion;
         if (self.idle.items.len >= pack_mod.MAX_IDLE) {
             self.capped.insert(.idle);
-            return;
+            return .capped;
         }
         try self.idle.append(self.a(), idle);
+        return .kept;
     }
 
     /// The pack's sample rate: the median of this session's recent motion
@@ -665,8 +676,13 @@ test "a recorded session becomes a pack that validates, with nothing typed in it
     for (0..5) |i| try s.wheel(now + @as(f64, @floatFromInt(i)) * 15, 0, 40, true);
     s.beginIdle();
     for (0..10) |i| try s.motion(now + 100 + @as(f64, @floatFromInt(i)) * 8, 300 + @as(f64, @floatFromInt(i % 3)), 200);
-    try s.endIdle();
+    try testing.expectEqual(Session.IdleEnd.kept, try s.endIdle());
     try testing.expectEqual(@as(usize, 1), s.idle.items.len);
+    // A pointer that never moved records nothing drift could replay.
+    s.beginIdle();
+    try s.motion(now + 300, 300, 200);
+    try testing.expectEqual(Session.IdleEnd.no_motion, try s.endIdle());
+    try testing.expectEqual(Session.IdleEnd.nothing, try s.endIdle());
     try testing.expectEqual(@as(f64, 0), s.idle.items[0].samples[0].t);
     try s.wheel(now + 2000, 0, 120, false);
     try s.closeBurst();

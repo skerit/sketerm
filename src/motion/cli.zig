@@ -97,9 +97,9 @@ fn complain(comptime fmt: []const u8, args: anytype) u8 {
     return 1;
 }
 
-fn describe(s: pack_mod.Pack.Summary) [160]u8 {
-    var buf: [160]u8 = @splat(0);
-    _ = std.fmt.bufPrint(&buf, "{s}, {d:.0} Hz, {d} reaches, {d} key timings, {d} scroll bursts, {d} idle segments", .{ @tagName(s.device), s.rate_hz, s.reaches, s.keys, s.scroll, s.idle }) catch {};
+fn describe(s: pack_mod.Pack.Summary) [200]u8 {
+    var buf: [200]u8 = @splat(0);
+    _ = std.fmt.bufPrint(&buf, "{s}, {d:.0} Hz, {d} reaches, {d} key timings, {d} scroll bursts, {d} idle segments ({d} replayable as drift)", .{ @tagName(s.device), s.rate_hz, s.reaches, s.keys, s.scroll, s.idle, s.drift }) catch {};
     return buf;
 }
 

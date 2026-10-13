@@ -186,8 +186,8 @@ pub const Burst = struct {
     }
 };
 
-/// A resting hand's wander: samples in ms and CSS px, relative to the
-/// segment's own first sample.
+/// The pointer's wander while its user idles at the screen: samples in
+/// ms and CSS px, relative to the segment's own first sample.
 pub const Idle = struct {
     samples: []const Sample,
 
@@ -206,6 +206,14 @@ pub const Idle = struct {
     /// Why this segment cannot be stored, or null when it can.
     pub fn problem(self: Idle) ?[]const u8 {
         return samplesProblem(self.samples);
+    }
+
+    /// Whether idle drift can replay this segment: it moved at all. The
+    /// ONE rule, read by replay, the MCP pre-check, the trainer and
+    /// `capabilities`. How far it travels is deliberately unbounded: an
+    /// idling user's pointer wanders, and replay keeps it inside the view.
+    pub fn replayable(self: Idle) bool {
+        return self.samples.len >= 2 and self.extent() >= 1;
     }
 };
 
@@ -254,7 +262,15 @@ pub const Pack = struct {
         keys: usize,
         scroll: usize,
         idle: usize,
+        /// Idle segments drift can replay (`Idle.replayable`).
+        drift: usize,
     };
+
+    pub fn driftCount(self: Pack) usize {
+        var n: usize = 0;
+        for (self.idle) |seg| n += @intFromBool(seg.replayable());
+        return n;
+    }
 
     pub fn summary(self: Pack) Summary {
         return .{
@@ -265,6 +281,7 @@ pub const Pack = struct {
             .keys = self.keys.holdCount(),
             .scroll = self.scroll.len,
             .idle = self.idle.len,
+            .drift = self.driftCount(),
         };
     }
 };
@@ -602,4 +619,18 @@ test "key classes follow US hand positions, not letters" {
     try testing.expect(validName("my-mouse_1"));
     try testing.expect(!validName("../x"));
     try testing.expect(!validName(""));
+}
+
+test "an idle segment is replayable however far it wandered, but not when it never moved" {
+    const far = [_]Sample{ .{ .t = 0, .x = 0, .y = 0 }, .{ .t = 400, .x = 310, .y = -120 }, .{ .t = 900, .x = 280, .y = 40 } };
+    const still = [_]Sample{ .{ .t = 0, .x = 0, .y = 0 }, .{ .t = 4000, .x = 0.3, .y = 0.2 } };
+    const lone = [_]Sample{.{ .t = 0, .x = 0, .y = 0 }};
+    try testing.expect((Idle{ .samples = &far }).replayable());
+    try testing.expect(!(Idle{ .samples = &still }).replayable());
+    try testing.expect(!(Idle{ .samples = &lone }).replayable());
+    try testing.expect(!(Idle{ .samples = &.{} }).replayable());
+    const p: Pack = .{ .idle = &.{ .{ .samples = &far }, .{ .samples = &still }, .{ .samples = &far } } };
+    try testing.expectEqual(@as(usize, 3), p.summary().idle);
+    try testing.expectEqual(@as(usize, 2), p.summary().drift);
+    try testing.expectEqual(@as(usize, 0), (Pack{}).summary().drift);
 }

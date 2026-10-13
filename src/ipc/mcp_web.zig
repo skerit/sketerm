@@ -466,6 +466,8 @@ pub fn configureMotion(allocator: std.mem.Allocator, default: motion_replay.Mode
     };
     g_motion.pack = loaded.bytes;
     g_motion.summary = loaded.summary;
+    if (idle_drift and loaded.summary.drift == 0)
+        g_motion.broken = std.fmt.allocPrint(allocator, "web_motion_idle_drift is on but motion pack '{s}' has no idle segment in which the pointer moved, so every web_open fails (record them on the trainer's Idle drift page: sketerm motion record --name {s})", .{ pack_name, pack_name }) catch "web_motion_idle_drift is on but the motion pack has no replayable idle drift";
 }
 
 /// The `web_motion*` capability facts.
@@ -504,7 +506,12 @@ fn driftFor(drv: Driver, arena: std.mem.Allocator, args: std.json.Value) !union(
     const asked = if (explicit != null) "idle_drift:true was asked for" else "the configured web_motion_idle_drift is on";
     if (drv == .gui) return .{ .err = fail(.unavailable, try std.fmt.allocPrint(arena, "{s}, but recorded idle drift drives the server's own headless browser only and a GUI is attached; nothing was opened", .{asked})) };
     const s = g_motion.summary orelse return .{ .err = fail(.unavailable, try std.fmt.allocPrint(arena, "{s}, but {s}; nothing was opened", .{ asked, g_motion.broken orelse "no motion pack is selected (config web_motion_pack, or sketerm mcp --web-motion-pack NAME)" })) };
-    if (s.idle == 0) return .{ .err = fail(.unavailable, try std.fmt.allocPrint(arena, "{s}, but motion pack '{s}' recorded no idle drift (the trainer's \"read this\" pauses record it); nothing was opened", .{ asked, g_motion.pack_name })) };
+    if (s.drift == 0) return .{ .err = fail(.unavailable, try std.fmt.allocPrint(arena, "{s}, but motion pack '{s}' has no idle drift to replay ({s}; record it on the trainer's Idle drift page, `sketerm motion record --name {s}` continues the pack); nothing was opened", .{
+        asked,
+        g_motion.pack_name,
+        if (s.idle == 0) "it recorded no idle segments" else "in none of its idle segments did the pointer move",
+        g_motion.pack_name,
+    })) };
     return .{ .on = true };
 }
 
@@ -2856,7 +2863,7 @@ fn openResult(
         try res.fact("untrusted", v.untrusted);
         if (v.max_fps) |fps| try res.fact("max_fps", fps);
         try res.fact("idle_drift", v.idle_drift);
-        if (v.idle_drift) try res.text("idle drift: between actions the pointer wanders as a resting hand does (recorded segments from the motion pack, a few px), never during an action");
+        if (v.idle_drift) try res.text("idle drift: between actions the pointer replays a recorded idle wander from the motion pack, inside the viewport, never during an action");
         if (v.emulation.color_scheme) |value| try res.fact("color_scheme", @tagName(value));
         if (v.emulation.reduced_motion) |value| try res.fact("reduced_motion", if (value == .reduce) "reduce" else "no-preference");
         if (v.emulation.device_scale_factor != null) try res.fact("device_scale_factor", @as(f64, @floatFromInt(v.emulation.scale())) / 1000);
@@ -8505,14 +8512,22 @@ test "web_open idle_drift: off unless asked or configured, refused when it canno
     try t.expect(std.mem.indexOf(u8, configured.text, "configured web_motion_idle_drift is on") != null);
     try t.expect(!(try driftFor(drv, arena, off)).on);
 
-    // A pack without idle segments cannot drift; one with them can.
+    // Drift needs an idle segment in which the pointer moved: none
+    // recorded, or only still ones, refuse BEFORE a tab exists, as the
+    // helper would after.
     var bytes = [_]u8{'x'};
-    const summary: motion_pack.Pack.Summary = .{ .device = .mouse, .rate_hz = 125, .scale = 1, .reaches = 4, .keys = 0, .scroll = 0, .idle = 0 };
+    const summary: motion_pack.Pack.Summary = .{ .device = .mouse, .rate_hz = 125, .scale = 1, .reaches = 4, .keys = 0, .scroll = 0, .idle = 0, .drift = 0 };
     g_motion = .{ .pack_name = "p", .pack = &bytes, .summary = summary };
-    try t.expect(std.mem.indexOf(u8, (try driftFor(drv, arena, on)).err.text, "recorded no idle drift") != null);
-    var with_idle = summary;
-    with_idle.idle = 3;
-    g_motion.summary = with_idle;
+    try t.expect(std.mem.indexOf(u8, (try driftFor(drv, arena, on)).err.text, "it recorded no idle segments") != null);
+    var still_only = summary;
+    still_only.idle = 3;
+    g_motion.summary = still_only;
+    const still = (try driftFor(drv, arena, on)).err.text;
+    try t.expect(std.mem.indexOf(u8, still, "in none of its idle segments did the pointer move") != null);
+    try t.expect(std.mem.indexOf(u8, still, "sketerm motion record --name p") != null);
+    var with_drift = still_only;
+    with_drift.drift = 2;
+    g_motion.summary = with_drift;
     try t.expect((try driftFor(drv, arena, on)).on);
 
     // A GUI-backed browser never drifts.

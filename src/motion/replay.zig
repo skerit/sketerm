@@ -265,26 +265,14 @@ pub fn entryPoint(view_w: f64, view_h: f64, target: [2]f64, rng: std.Random) [2]
     return .{ slide_x, view_h - 1 };
 }
 
-/// A recorded idle segment that wanders further than this was a hand
-/// moving, not resting, and is never replayed as drift: a drifting
-/// pointer must not travel onto things a resting hand would not reach.
-pub const DRIFT_MAX_EXTENT_PX: f64 = 24;
 /// The rest before a drift segment, after another one or after any
 /// action on the view, ms (drawn uniformly per rest).
 pub const DRIFT_REST_MIN_MS: f64 = 900;
 pub const DRIFT_REST_MAX_MS: f64 = 4000;
 
-/// Whether `seg` may be replayed as idle drift.
-pub fn driftable(seg: pack_mod.Idle) bool {
-    if (seg.samples.len < 2) return false;
-    const e = seg.extent();
-    return e >= 1 and e <= DRIFT_MAX_EXTENT_PX;
-}
-
 /// Whether `pack` holds any segment idle drift can replay.
 pub fn driftUsable(pack: Pack) bool {
-    for (pack.idle) |seg| if (driftable(seg)) return true;
-    return false;
+    return pack.driftCount() > 0;
 }
 
 /// When idle drift may move next, in ms on the caller's clock. Drift
@@ -320,7 +308,7 @@ pub const DriftClock = struct {
 pub fn planDrift(gpa: std.mem.Allocator, pack: Pack, from: [2]f64, view_w: f64, view_h: f64, recent: *Recent, rng: std.Random) ![]Move {
     var usable: usize = 0;
     for (pack.idle) |seg| {
-        if (driftable(seg)) usable += 1;
+        if (seg.replayable()) usable += 1;
     }
     if (usable == 0) return error.NoIdle;
     const window = exclusionWindow(usable);
@@ -329,7 +317,7 @@ pub fn planDrift(gpa: std.mem.Allocator, pack: Pack, from: [2]f64, view_w: f64, 
     for (0..2) |pass| {
         for (pack.idle, 0..) |seg, i| {
             const idx: u32 = @intCast(i);
-            if (!driftable(seg) or (pass == 0 and recent.contains(idx, window))) continue;
+            if (!seg.replayable() or (pass == 0 and recent.contains(idx, window))) continue;
             seen += 1;
             if (rng.uintLessThan(usize, seen) == 0) pick = idx;
         }
@@ -686,7 +674,7 @@ fn idlePack(segs: []const pack_mod.Idle) Pack {
     return .{ .idle = segs };
 }
 
-test "drift replays the recorded wander unscaled, whole-pixel, in increasing time" {
+test "drift replays the recorded wander unscaled, whole-pixel, in increasing time, inside the view" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const p = try testPack(arena.allocator(), 3);
@@ -705,11 +693,22 @@ test "drift replays the recorded wander unscaled, whole-pixel, in increasing tim
             try testing.expectEqual(@round(m.y), m.y);
             try testing.expect(m.x != prev[0] or m.y != prev[1]);
             prev = .{ m.x, m.y };
-            // Never further from the rest point than a resting hand goes.
-            try testing.expect(@abs(m.x - 500) <= DRIFT_MAX_EXTENT_PX + 1);
-            try testing.expect(@abs(m.y - 400) <= DRIFT_MAX_EXTENT_PX + 1);
+            try testing.expect(m.x >= 0 and m.x <= 1279 and m.y >= 0 and m.y <= 799);
         }
     }
+}
+
+test "an idling user's long wander replays whole, however far it went" {
+    // 300 px across and back: the pointer of someone reading, not a still hand.
+    const s = [_]pack_mod.Sample{ .{ .t = 0, .x = 0, .y = 0 }, .{ .t = 300, .x = 150, .y = 20 }, .{ .t = 700, .x = 300, .y = 60 }, .{ .t = 1500, .x = 120, .y = 90 } };
+    const segs = [_]pack_mod.Idle{.{ .samples = &s }};
+    var recent: Recent = .{};
+    var prng = Rng.init(2);
+    const moves = try planDrift(testing.allocator, idlePack(&segs), .{ 400, 300 }, 1280, 800, &recent, prng.random());
+    defer testing.allocator.free(moves);
+    try testing.expectEqual(@as(usize, 3), moves.len);
+    try testing.expectEqual(@as(f64, 700), moves[1].x);
+    try testing.expectEqual(@as(f64, 360), moves[1].y);
 }
 
 test "drift at the view's edge mirrors inward and never leaves the view" {
@@ -734,10 +733,10 @@ test "drift at the view's edge mirrors inward and never leaves the view" {
     for (tiny) |m| try testing.expect(m.x >= 0 and m.x <= 5 and m.y >= 0 and m.y <= 5);
 }
 
-test "a moving hand or a still one is not drift, and a pack without drift has none" {
-    const far = [_]pack_mod.Sample{ .{ .t = 0, .x = 0, .y = 0 }, .{ .t = 40, .x = 120, .y = 0 } };
+test "a pointer that never moved is not drift, and a pack without drift has none" {
     const still = [_]pack_mod.Sample{ .{ .t = 0, .x = 0, .y = 0 }, .{ .t = 40, .x = 0.2, .y = 0.1 } };
-    const segs = [_]pack_mod.Idle{ .{ .samples = &far }, .{ .samples = &still } };
+    const lone = [_]pack_mod.Sample{.{ .t = 0, .x = 0, .y = 0 }};
+    const segs = [_]pack_mod.Idle{ .{ .samples = &still }, .{ .samples = &lone } };
     const p = idlePack(&segs);
     try testing.expect(!driftUsable(p));
     var recent: Recent = .{};
@@ -766,10 +765,10 @@ test "every synthetic idle segment is replayable drift" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     // smoke-web's drift stage replays the generated pack: its idle
-    // segments must all pass the resting-hand filter.
+    // segments must all be replayable.
     for (1..6) |seed| {
         const p = try testPack(arena.allocator(), seed);
         try testing.expect(p.idle.len >= 2);
-        for (p.idle) |seg| try testing.expect(driftable(seg));
+        for (p.idle) |seg| try testing.expect(seg.replayable());
     }
 }

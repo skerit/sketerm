@@ -11,7 +11,7 @@
 //! it still holds and posts a failure naming why.
 //!
 //! Idle DRIFT (capability "motion-drift") is the other per-view state:
-//! opted into per view, it replays a recorded resting-hand wander
+//! opted into per view, it replays a recorded idle wander of the pointer
 //! BETWEEN actions only. Anything else that touches the view (a run, a
 //! pending semantic action, live or direct input, a hidden or browserless
 //! view) stops the segment at once and restarts the rest before the
@@ -613,7 +613,7 @@ pub fn motionDriftSet(self: *Host, conn: u32, req: proto.MotionDrift) void {
     const slot = motionPackFor(self, conn) orelse
         return answer(self, v.id, req.req, 0, "idle drift was asked for but no motion pack is loaded on this connection; the pointer stays still");
     if (!replay.driftUsable(slot.pack.?))
-        return answer(self, v.id, req.req, 0, "idle drift was asked for but the motion pack holds no idle segment a resting hand made (none, or every one wanders too far); the pointer stays still");
+        return answer(self, v.id, req.req, 0, "idle drift was asked for but the motion pack holds no idle segment in which the pointer moved; the pointer stays still");
     const d = v.motion_drift orelse blk: {
         const fresh = self.gpa.create(Drift) catch return answer(self, v.id, req.req, 0, "out of memory starting idle drift");
         fresh.* = .{ .conn = conn, .rng = seededRng() };

@@ -1,5 +1,22 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-13: idle drift replays any recorded wander, however far it went
+
+A real pack's 8 idle segments were all refused: drift only replayed a
+segment whose whole wander fit 24 px (`DRIFT_MAX_EXTENT_PX`), and an
+idling user's pointer travels much further (the trainer had asked for a
+still "resting hand", which in practice does not move at all). Worse, the
+MCP pre-check only counted segments, so `web_open idle_drift:true` opened
+a tab, the helper refused, and the tab was closed again. The limit is
+gone: `Idle.replayable` (the pointer moved at all) is the ONE rule, read
+by `replay.planDrift`/`driftUsable`, the MCP pre-check (now refusing with
+a reason and the trainer command before any tab exists), the startup
+`web_motion_broken` check, the recorder (a still recording is not kept,
+and the trainer says why) and `Pack.Summary.drift`, reported as
+`capabilities.web_motion.drift` and by `sketerm motion list`. Replay
+still mirrors at a view edge and clamps inside the view. The trainer's
+Idle page now asks you to idle as you normally would.
+
 ## 2026-10-13: motion trainer keeps your work; packs can be continued
 
 A 440-reach session was lost to "reach 440: press timing is implausible":

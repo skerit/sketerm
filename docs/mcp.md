@@ -1543,14 +1543,15 @@ The reply carries `motion` (`replayed` or `direct`) and, for a replay,
 **Idle drift** (opt-in per tab). `web_open idle_drift:true` (or
 `web_motion_idle_drift = true` in `[mcp]` / `[mcp.NAME]` for every tab that
 omits it) replays the pack's recorded idle segments BETWEEN actions on that
-tab: after a rest of about one to four seconds the pointer wanders a few
-pixels from where the last action left it, as a resting hand does, and stays
+tab: after a rest of about one to four seconds the pointer replays one of the
+pack's recorded idle wanders from where the last action left it, as far as it
+went when recorded (no distance limit: an idling user's pointer wanders), kept
 inside the viewport. Any action on the tab (replayed or direct), live input
 and navigation stop it at once, and the rest restarts when the action ends;
 it never presses anything, never runs while the tab is hidden or discarded,
 and starts only once an action has put the pointer on the page. It is OFF by
 default because a moving pointer hovers things and can open menus. It fails
-closed like replay: no pack, a pack without usable idle segments, a helper
+closed like replay: no pack, a pack with no idle segment in which the pointer moved, a helper
 without the `motion-drift` capability or a GUI-backed tab refuse the open,
 and a refusal after the tab was created closes it. The reply reports
 `idle_drift`; `capabilities` reports `web_motion_idle_drift` (the default) and

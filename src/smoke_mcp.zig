@@ -4323,6 +4323,7 @@ fn webMotionStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const 
         if (caps2.get("web_motion_replay").? != .bool or !caps2.get("web_motion_replay").?.bool) fail("web_motion_replay is not true once the helper runs");
         if (caps2.get("web_motion_drift").? != .bool or !caps2.get("web_motion_drift").?.bool) fail("web_motion_drift is not true once the helper runs");
         if (wm.object.get("idle").?.integer < 1) fail("capabilities.web_motion does not count the pack's idle drift");
+        if (wm.object.get("drift").?.integer != wm.object.get("idle").?.integer) fail("capabilities.web_motion.drift does not count every replayable idle segment of the smoke pack");
         const replayed = capSc(arena, m.callTool("web_act", "{\"name\":\"Go\",\"motion\":\"replay\"}"), "replayed act", false);
         if (!std.mem.eql(u8, replayed.get("motion").?.string, "replayed")) fail("web_act motion:replay did not report motion:replayed");
         const ms = replayed.get("motion_ms").?.integer;

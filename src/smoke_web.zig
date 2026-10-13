@@ -9389,7 +9389,6 @@ fn runMotionStage(cl: *Client, gpa: std.mem.Allocator) void {
         if (s.all == 0) fail("stage 3d motion: idle drift produced no pointer moves on an idle view");
         if (s.down) fail("stage 3d motion: idle drift pressed a button");
         if (s.minx < 0 or s.miny < 0 or s.maxx >= s.vw or s.maxy >= s.vh) fail("stage 3d motion: idle drift left the viewport");
-        if (s.maxx - s.minx > 40 or s.maxy - s.miny > 40) fail("stage 3d motion: idle drift wandered further than a resting hand");
     }
     // An action while drifting is not disturbed: the replayed click
     // still holds every assertion, and nothing moved during its press.

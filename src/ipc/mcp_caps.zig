@@ -372,8 +372,8 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
         try res.fact("web_webgl", if (@import("mcp_web.zig").webglMode()) |m| @tagName(m) else null);
         const mo = @import("mcp_web.zig").motionCapability();
         if (mo.setup.summary) |s| {
-            try res.fact("web_motion", .{ .pack = mo.setup.pack_name, .device = @tagName(s.device), .rate_hz = s.rate_hz, .reaches = s.reaches, .keys = s.keys, .scroll = s.scroll, .idle = s.idle });
-            try res.textf("motion pack '{s}': {s} at {d:.0} Hz, {d} reaches, {d} key timings, {d} scroll bursts, {d} idle drift segments; web_act/web_scroll motion:\"replay\" replays it, web_open idle_drift:true drifts between actions", .{ mo.setup.pack_name, @tagName(s.device), s.rate_hz, s.reaches, s.keys, s.scroll, s.idle });
+            try res.fact("web_motion", .{ .pack = mo.setup.pack_name, .device = @tagName(s.device), .rate_hz = s.rate_hz, .reaches = s.reaches, .keys = s.keys, .scroll = s.scroll, .idle = s.idle, .drift = s.drift });
+            try res.textf("motion pack '{s}': {s} at {d:.0} Hz, {d} reaches, {d} key timings, {d} scroll bursts, {d} idle drift segments ({d} replayable); web_act/web_scroll motion:\"replay\" replays it, web_open idle_drift:true drifts between actions", .{ mo.setup.pack_name, @tagName(s.device), s.rate_hz, s.reaches, s.keys, s.scroll, s.idle, s.drift });
         } else try res.fact("web_motion", null);
         try res.fact("web_motion_default", @tagName(mo.setup.default));
         try res.fact("web_motion_default_source", @tagName(mo.setup.default_source));
@@ -382,7 +382,7 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
         try res.fact("web_motion_idle_drift", mo.setup.idle_drift);
         try res.fact("web_motion_idle_drift_source", @tagName(mo.setup.idle_drift_source));
         try res.fact("web_motion_drift", mo.drift_helper);
-        if (mo.setup.idle_drift) try res.text("idle drift is ON by default: every headless web_open that omits idle_drift replays a resting hand's wander between actions, and fails closed when it cannot");
+        if (mo.setup.idle_drift) try res.text("idle drift is ON by default: every headless web_open that omits idle_drift replays the pack's recorded idle wander between actions, and fails closed when it cannot");
         if (mo.setup.broken) |why| try res.textf("motion replay is BROKEN: {s}{s}", .{ why, if (mo.setup.default == .replay) " (the default is replay, so actions fail until this is fixed)" else "" });
         const frame_rate = @import("mcp_web.zig").frameRateCapability();
         try res.fact("web_max_fps", frame_rate.supported);

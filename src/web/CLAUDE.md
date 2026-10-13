@@ -2016,8 +2016,8 @@ only the trainer records; live use never is.
   per view.** `View.motion_drift` is null when off, which costs one branch
   per poll turn. On, `pumpDrift` replays a recorded idle segment
   (`replay.planDrift`: unscaled, whole-pixel moves, mirrored at a view
-  edge, clamped inside it; only segments a RESTING hand made,
-  `DRIFT_MAX_EXTENT_PX`) after a rest (`replay.DriftClock`), one move per
+  edge, clamped inside it; any segment in which the pointer moved,
+  `Idle.replayable`, however far it went) after a rest (`replay.DriftClock`), one move per
   turn like a run. It is BLOCKED while a run exists, an action `Pending`
   is queued (`Pending.Kind.isAction`, exhaustive so a new kind must pick
   a side), or the view is hidden, discarded or browserless; the rest
