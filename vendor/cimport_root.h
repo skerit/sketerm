@@ -19,8 +19,9 @@
 
 /* `gdkversionmacros.h` `#error`s when re-included without one of these
  * guards; Aro's `#pragma once` skip happens AT the directive, but the
- * `#error` is on a line BEFORE it. We shadow the system header via
- * `vendor/aro_shims/` and also predefine the guard for belt-and-braces. */
+ * `#error` is on a line BEFORE it, and gdk.h `#undef`s this macro on its
+ * way out. The build shadows the system header with a shim generated
+ * from it (src/gdk_shim_gen.zig); the define is belt-and-braces. */
 #define __GDK_H_INSIDE__ 1
 
 /* On aarch64, graphene-config.h selects its NEON backend, whose

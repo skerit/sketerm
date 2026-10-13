@@ -254,7 +254,7 @@ comptime {
     _ = @import("parser/wezterm_conformance_test.zig");
     _ = @import("remoteapp.zig");
     _ = @import("shader_preset.zig");
-    _ = @import("shim_drift_test.zig");
+    _ = @import("gdk_shim_gen.zig");
     _ = @import("panelvocab.zig");
     _ = @import("panelvocab_drift_test.zig");
     _ = @import("util/churn.zig");

@@ -1115,24 +1115,7 @@ pub fn build(b: *std.Build) void {
     // `errdefer` in a function that cannot return an error compiles
     // clean and never runs. See src/lint_errdefer.zig; every test step
     // depends on it so the class cannot come back.
-    const lint_errdefer_mod = b.createModule(.{
-        .root_source_file = b.path("src/lint_errdefer.zig"),
-        .target = b.graph.host,
-        .optimize = .Debug,
-    });
-    // Same trade as `test_llvm` above, but this helper is built for the
-    // HOST, so it is the host that must support the self-hosted backend
-    // — not the target. On aarch64-macOS `-fno-llvm` dies with SIGKILL,
-    // which reds out `test`, `test-core` and `test-web` before a single
-    // test runs.
-    const lint_self_hosted = b.graph.host.result.os.tag == .linux and
-        b.graph.host.result.cpu.arch == .x86_64;
-    const lint_errdefer_exe = b.addExecutable(.{
-        .name = "sketerm-lint-errdefer",
-        .root_module = lint_errdefer_mod,
-        .use_llvm = !lint_self_hosted,
-        .use_lld = if (lint_self_hosted) false else b.graph.host.result.os.tag == .linux,
-    });
+    const lint_errdefer_exe = addHostTool(b, "sketerm-lint-errdefer", "src/lint_errdefer.zig");
     const lint_errdefer_self = b.addRunArtifact(lint_errdefer_exe);
     lint_errdefer_self.addArg("--self-check");
     const lint_errdefer = b.addRunArtifact(lint_errdefer_exe);
@@ -1895,9 +1878,8 @@ fn buildCBindings(
         .optimize = optimize,
         .link_libc = true,
     });
-    // Same `-I` order as `configureSysDeps`: shim path first so it
-    // shadows the system gdkversionmacros.h.
-    tc.addIncludePath(b.path("vendor/aro_shims"));
+    // Generated shim FIRST so it shadows the system gdkversionmacros.h.
+    tc.addIncludePath(generateGdkShim(b));
     tc.linkSystemLibrary(gui_pkg, .{ .use_pkg_config = .force });
     // The macro is what `vendor/cimport_root.h` keys the
     // <gtk4-layer-shell.h> include on, so a `-Dlayer-shell=false` build
@@ -1931,6 +1913,44 @@ fn buildCBindings(
         .target = target,
         .optimize = optimize,
         .link_libc = true,
+    });
+}
+
+/// Generate the Aro shim of the HOST's `gdk/version/gdkversionmacros.h`
+/// (see src/gdk_shim_gen.zig) and return the include directory holding it.
+/// pkg-config runs when the TranslateC step that includes this path is
+/// built, never at graph construction, so GUI-less builds never probe gtk4.
+/// The probe reruns every build (it is cheap) so a moved GTK is noticed;
+/// the generator's dep file names the header, so an upgraded one regenerates.
+fn generateGdkShim(b: *std.Build) std.Build.LazyPath {
+    const pkg_config = b.graph.environ_map.get("PKG_CONFIG") orelse "pkg-config";
+    const probe = b.addSystemCommand(&.{ pkg_config, "--cflags-only-I", "gtk4" });
+    probe.has_side_effects = true;
+    const cflags = probe.captureStdOut(.{ .basename = "gtk4-cflags-I.txt" });
+    const gen = b.addRunArtifact(addHostTool(b, "sketerm-gdk-shim-gen", "src/gdk_shim_gen.zig"));
+    gen.addFileArg(cflags);
+    const dir = gen.addOutputDirectoryArg("aro_shims");
+    _ = gen.addDepFileOutputArg("gdkversionmacros.d");
+    return dir;
+}
+
+/// Build a libc-free helper executable for the build HOST.
+///
+/// Same trade as `test_llvm`, but for the HOST: on aarch64-macOS `-fno-llvm`
+/// dies with SIGKILL, so only an x86_64 Linux host uses the self-hosted
+/// backend + linker.
+fn addHostTool(b: *std.Build, name: []const u8, root: []const u8) *std.Build.Step.Compile {
+    const host = b.graph.host;
+    const self_hosted = host.result.os.tag == .linux and host.result.cpu.arch == .x86_64;
+    return b.addExecutable(.{
+        .name = name,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(root),
+            .target = host,
+            .optimize = .Debug,
+        }),
+        .use_llvm = !self_hosted,
+        .use_lld = if (self_hosted) false else host.result.os.tag == .linux,
     });
 }
 
@@ -1992,7 +2012,6 @@ fn configureCoreDeps(
     cbindings_mod: *std.Build.Module,
 ) void {
     mod.addImport("cbindings", cbindings_mod);
-    mod.addIncludePath(b.path("vendor/aro_shims"));
     addPkgConfig(b, mod, "fribidi");
     mod.addCSourceFile(.{
         .file = b.path("vendor/stb_image_impl.c"),
@@ -2342,7 +2361,6 @@ fn configureSysDeps(
     cbindings_mod: *std.Build.Module,
 ) void {
     mod.addImport("cbindings", cbindings_mod);
-    mod.addIncludePath(b.path("vendor/aro_shims"));
     // FIRST, before the GTK roster: gtk4-layer-shell interposes
     // libwayland-client's wl_proxy_* and only wins when it precedes
     // libwayland-client in DT_NEEDED order (upstream linking.md).

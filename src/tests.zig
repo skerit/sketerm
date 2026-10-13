@@ -133,7 +133,7 @@ comptime {
     _ = @import("util/churn.zig");
     _ = @import("util/content.zig");
     _ = @import("util/yuv.zig");
-    _ = @import("shim_drift_test.zig");
+    _ = @import("gdk_shim_gen.zig");
     _ = @import("panelvocab.zig");
     _ = @import("panelvocab_drift_test.zig");
     _ = @import("mux/predict.zig");
