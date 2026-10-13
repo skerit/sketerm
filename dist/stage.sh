@@ -156,6 +156,10 @@ sketerm_build() {
     local root=$1 kind=$2 web_ok=$3 cef_include=$4 cef_lib=$5 web_skip_reason=${6:-}
     local package_arch=$7 layer_shell=${8:-1} portable_target target
     local gui_flags=()
+    # A package is installed on machines other than the one that built it:
+    # zig's default (-Dcpu=native) can bake in AVX-512 and the like, which
+    # SIGILLs on an older CPU. mux-portable picks baseline itself.
+    local cpu_flag=-Dcpu=baseline
     portable_target=$(sketerm_portable_target_for_arch "$package_arch") || portable_target=
     cd "$root"
 
@@ -168,7 +172,7 @@ sketerm_build() {
         # video codecs when their headers are present (-Dvideo auto-detects
         # and prints a note when it turns itself off).
         sketerm_say "building GUI + daemon"
-        zig build -Doptimize=ReleaseFast ${gui_flags[@]+"${gui_flags[@]}"}
+        zig build -Doptimize=ReleaseFast "$cpu_flag" ${gui_flags[@]+"${gui_flags[@]}"}
         if [ "$web_ok" -eq 1 ]; then
             # The browser helper is built against a SPLIT cef install (headers
             # and runtime in two places, unlike the single-tree upstream
@@ -177,7 +181,7 @@ sketerm_build() {
             # installed location, so the rpath and the LD_PRELOAD the helper
             # re-execs with are both correct in the package.
             sketerm_say "building browser helper"
-            zig build web -Doptimize=ReleaseFast \
+            zig build web -Doptimize=ReleaseFast "$cpu_flag" \
                 -Dcef-include="$cef_include" \
                 -Dcef-lib="$cef_lib"
         else
@@ -185,7 +189,7 @@ sketerm_build() {
         fi
     else
         sketerm_say "building daemon only"
-        zig build mux -Doptimize=ReleaseFast
+        zig build mux -Doptimize=ReleaseFast "$cpu_flag"
     fi
 
     # The portable daemon compiles the Opus and video probes out and stays

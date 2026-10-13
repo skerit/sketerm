@@ -429,7 +429,7 @@ BASH_ENV="$work/no-makepkg.bash" \
     "$fixture/dist/install.sh" --mux-only --no-install \
     > "$work/unsupported-package-arch.out" 2>&1 \
     || fail "installer refused to build for an unsupported portable architecture"
-[[ "$(<"$work/unsupported-package-zig.log")" == *"<call> <build> <mux> <-Doptimize=ReleaseFast>"* ]] \
+[[ "$(<"$work/unsupported-package-zig.log")" == *"<call> <build> <mux> <-Doptimize=ReleaseFast> <-Dcpu=baseline>"* ]] \
     || fail "unsupported portable architecture did not build the daemon"
 [[ "$(<"$work/unsupported-package-zig.log")" != *"<mux-portable>"* ]] \
     || fail "unsupported portable architecture attempted a portable build"
@@ -503,16 +503,20 @@ BASH_ENV="$work/no-makepkg.bash" \
     || fail "--gui-only --deps did not install the optional gtk4-layer-shell dev package in its own apt call"
 ! grep -q '<libpulse-dev> <libgtk4-layer-shell-dev>' "$INSTALL_TEST_APT_LOG" \
     || fail "libgtk4-layer-shell-dev was put in the required apt list"
-grep -q '^<call> <build> <-Doptimize=ReleaseFast>$' "$INSTALL_TEST_ZIG_LOG" \
+grep -q '^<call> <build> <-Doptimize=ReleaseFast> <-Dcpu=baseline>$' "$INSTALL_TEST_ZIG_LOG" \
     || fail "a host with gtk4-layer-shell was built with the layer-shell fallback flag"
 [ ! -e "$INSTALL_TEST_FORBIDDEN" ] \
     || fail "non-Arch --no-install attempted a privileged install"
-[[ "$(<"$INSTALL_TEST_ZIG_LOG")" == *"<call> <build> <-Doptimize=ReleaseFast>"* ]] \
+[[ "$(<"$INSTALL_TEST_ZIG_LOG")" == *"<call> <build> <-Doptimize=ReleaseFast> <-Dcpu=baseline>"* ]] \
     || fail "non-Arch GUI build was not invoked"
 [[ "$(<"$INSTALL_TEST_ZIG_LOG")" == *"<call> <build> <mux-portable> <-Doptimize=ReleaseFast> <-Dportable-target=x86_64-linux-musl>"* ]] \
     || fail "non-Arch portable daemon build was not invoked"
-[[ "$(<"$INSTALL_TEST_ZIG_LOG")" == *"<call> <build> <web> <-Doptimize=ReleaseFast> <-Dcef-include=$cef_include> <-Dcef-lib=$cef_lib>"* ]] \
+[[ "$(<"$INSTALL_TEST_ZIG_LOG")" == *"<call> <build> <web> <-Doptimize=ReleaseFast> <-Dcpu=baseline> <-Dcef-include=$cef_include> <-Dcef-lib=$cef_lib>"* ]] \
     || fail "non-Arch browser helper build was not invoked"
+# Packages run on other machines: every build but mux-portable (which picks
+# its own baseline) must pin a baseline CPU, never zig's native default.
+! grep '^<call> <build>' "$INSTALL_TEST_ZIG_LOG" | grep -v '<mux-portable>' | grep -vq '<-Dcpu=baseline>' \
+    || fail "a packaged build was compiled for the build host's native CPU"
 [[ "$(<"$INSTALL_TEST_APT_LOG")" == *"<apt> <install> <-y> <build-essential> <pkg-config>"* ]] \
     || fail "--gui-only --deps did not install GUI dependencies before probing"
 [[ "$(<"$work/debian.out")" == *"staged only, not installed"* ]] \
@@ -544,7 +548,7 @@ BASH_ENV="$work/no-makepkg.bash" \
     INSTALL_TEST_FORBIDDEN="$INSTALL_TEST_FORBIDDEN" \
     "$fixture/dist/install.sh" --deps --no-install \
     > "$work/debian-auto.out" 2>&1
-[[ "$(<"$INSTALL_TEST_ZIG_LOG")" == *"<call> <build> <-Doptimize=ReleaseFast>"* ]] \
+[[ "$(<"$INSTALL_TEST_ZIG_LOG")" == *"<call> <build> <-Doptimize=ReleaseFast> <-Dcpu=baseline>"* ]] \
     || fail "auto --deps stayed locked to a mux-only build"
 
 # Ubuntu 24.04: no libgtk4-layer-shell-dev in the archive at all. The
@@ -585,9 +589,9 @@ set -e
     || fail "an unavailable optional package was not reported"
 [[ "$(<"$work/debian-no-layer-shell.out")" == *"gtk4-layer-shell development files missing"* ]] \
     || fail "building without gtk4-layer-shell was not reported"
-grep -q '^<call> <build> <-Doptimize=ReleaseFast> <-Dlayer-shell=false>$' "$INSTALL_TEST_ZIG_LOG" \
+grep -q '^<call> <build> <-Doptimize=ReleaseFast> <-Dcpu=baseline> <-Dlayer-shell=false>$' "$INSTALL_TEST_ZIG_LOG" \
     || fail "a host without gtk4-layer-shell was not built with -Dlayer-shell=false"
-[[ "$(<"$INSTALL_TEST_ZIG_LOG")" == *"<call> <build> <web> <-Doptimize=ReleaseFast>"* ]] \
+[[ "$(<"$INSTALL_TEST_ZIG_LOG")" == *"<call> <build> <web> <-Doptimize=ReleaseFast> <-Dcpu=baseline>"* ]] \
     || fail "the browser helper was skipped on a host without gtk4-layer-shell"
 [[ "$(<"$INSTALL_TEST_ZIG_LOG")" == *"<call> <build> <mux-portable> <-Doptimize=ReleaseFast>"* ]] \
     || fail "the portable daemon was skipped on a host without gtk4-layer-shell"
@@ -622,7 +626,7 @@ BASH_ENV="$work/no-makepkg.bash" \
     INSTALL_TEST_FORBIDDEN="$INSTALL_TEST_FORBIDDEN" \
     "$fixture/dist/install.sh" --no-install \
     > "$work/debian-auto-no-deps.out" 2>&1
-[[ "$(<"$INSTALL_TEST_ZIG_LOG")" == *"<call> <build> <mux> <-Doptimize=ReleaseFast>"* ]] \
+[[ "$(<"$INSTALL_TEST_ZIG_LOG")" == *"<call> <build> <mux> <-Doptimize=ReleaseFast> <-Dcpu=baseline>"* ]] \
     || fail "auto mode without --deps did not degrade to mux"
 [[ "$(<"$work/debian-auto-no-deps.out")" == *"building the sketerm-mux daemon only"* ]] \
     || fail "auto mode without --deps did not explain its mux fallback"
@@ -989,11 +993,13 @@ BASH_ENV="$work/no-packager.bash" \
     PATH="$fakebin:$PATH" package
 )
 
-grep -q '^<call> <build> <-Doptimize=ReleaseFast>$' "$work/package-zig.log" \
+grep -q '^<call> <build> <-Doptimize=ReleaseFast> <-Dcpu=baseline>$' "$work/package-zig.log" \
     || fail "PKGBUILD build() did not build the GUI with gtk4-layer-shell (it is a hard dependency there)"
 
-[[ "$(<"$work/package-zig.log")" == *"<call> <build> <web> <-Doptimize=ReleaseFast> <-Dcef-include=/usr/include/cef> <-Dcef-lib=/usr/lib/cef>"* ]] \
+[[ "$(<"$work/package-zig.log")" == *"<call> <build> <web> <-Doptimize=ReleaseFast> <-Dcpu=baseline> <-Dcef-include=/usr/include/cef> <-Dcef-lib=/usr/lib/cef>"* ]] \
     || fail "PKGBUILD build() did not build sketerm-webengine"
+! grep '^<call> <build>' "$work/package-zig.log" | grep -v '<mux-portable>' | grep -vq '<-Dcpu=baseline>' \
+    || fail "PKGBUILD build() compiled a packaged binary for the build host's native CPU"
 
 [ -x "$work/pkg/usr/bin/sketerm-webengine" ] \
     || fail "PKGBUILD package() did not include sketerm-webengine"
