@@ -1,5 +1,22 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-13: idle drift replay; custom-dropdown picks replay too
+
+Recorded idle drift is now replayed, opt-in per view: `web_open
+idle_drift:true` (default from `[mcp] web_motion_idle_drift`, built-in
+off) sends `motion_drift` (0xEC, capability `motion-drift`, answered by
+`ev_motion_done`). Between actions the helper replays a resting-hand
+segment of the pack from where the pointer is, inside the viewport, one
+move per poll turn; a run, a queued action, live input, navigation or a
+hidden/discarded view stops it and the rest restarts after. It fails
+closed (no pack, no replayable segment, a helper without the capability,
+a GUI tab; a refusal after the tab exists closes it). `capabilities`
+adds `web_motion_idle_drift`(`_source`), `web_motion_drift` and
+`web_motion.idle`. A `set_value` on a custom dropdown with
+`motion:"replay"` now replays the opening click AND the option click,
+one `motion_ms` for both. smoke-web stage 3d and smoke-mcp's motion
+stage cover both; details in src/web/CLAUDE.md.
+
 ## 2026-10-12: GUI web tabs report real geometry; worker header order fixed
 
 A page in a GUI web tab now sees the real monitor as `screen` and
