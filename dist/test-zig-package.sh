@@ -30,24 +30,11 @@ package="$work/package"
 [ -f "$package/build.zig.zon" ] \
     || fail "fetched archive did not extract to $package"
 
-vendor_entries=(
-    aro_shims
-    avdec_shim.c
-    cef_root.h
-    cimport_core.h
-    cimport_root.h
-    msf_gif.h
-    pkgconfig
-    stb_image_impl.c
-    stb_image_write.h
-    stb_image.h
-    svtav1_shim.c
-    tree-sitter
-    vpxenc_shim.c
-    vtenc_shim.c
-    x264_shim.c
-    zstd
-)
+# Every tracked vendor entry is part of the build's input, so the expected
+# set comes from git rather than a second hand-kept copy of the zon `paths`
+# (one fell behind and the archive's `web` build lost web_untrusted.h).
+mapfile -t vendor_entries < <(git -C "$root" ls-files vendor | cut -d/ -f2 | sort -u)
+[ "${#vendor_entries[@]}" -gt 0 ] || fail "git lists no tracked vendor entries"
 
 for entry in "${vendor_entries[@]}"; do
     [ -e "$package/vendor/$entry" ] \
@@ -64,8 +51,12 @@ for path in "$package/vendor"/*; do
 done
 shopt -u dotglob nullglob
 
+# The dist/ files the packaged test steps read; the rest of dist/ is
+# installer and rig tooling a package consumer never builds.
 dist_entries=(
     test-test-roots.sh
+    test-web-supervisor.c
+    test-web-untrusted.c
 )
 
 for entry in "${dist_entries[@]}"; do
