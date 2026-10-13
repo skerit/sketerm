@@ -386,12 +386,13 @@ fn failOomFree(self: *Host, v: *View, sid: u32, want: []u8) bool {
 /// A `motion_scroll`: wheel bursts from the pack, at the replayed
 /// pointer when there is one.
 pub fn motionScroll(self: *Host, conn: u32, req: proto.MotionScroll) void {
-    const v = self.findWake(req.view) orelse return;
     const fail = struct {
         fn f(h: *Host, view: u32, r: u32, why: []const u8) void {
             h.post(proto.EvMotionDone{ .view = view, .req = r, .ok = 0, .duration_ms = 0, .msg = why });
         }
     }.f;
+    // Answered even without a view: the client waits on this `req`.
+    const v = self.findWake(req.view) orelse return fail(self, req.view, req.req, "no view with that id; nothing was scrolled");
     const slot = motionPackFor(self, conn) orelse return fail(self, v.id, req.req, "motion replay was asked for but no motion pack is loaded on this connection; nothing was scrolled");
     var prng = seededRng();
     const plan = replay.planScroll(self.gpa, slot.pack.?, req.dx, req.dy, slot.typical_burst, &slot.recent_scroll, prng.random()) catch |err| {
