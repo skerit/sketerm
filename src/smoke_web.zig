@@ -2170,7 +2170,7 @@ const Client = struct {
                 const ev = proto.decode(proto.EvMotionDone, frame.payload) catch fail("ev_motion_done decode");
                 self.motion_done_ok = ev.ok;
                 self.motion_done_ms = ev.duration_ms;
-                if (ev.ok == 0) std.debug.print("smoke-web: motion scroll failed: {s}\n", .{ev.msg});
+                if (ev.ok == 0) std.debug.print("smoke-web: motion request {d} failed: {s}\n", .{ ev.req, ev.msg });
                 self.motion_done_seq += 1;
             },
             .ev_download_progress => {
@@ -9112,14 +9112,18 @@ fn runCookieSyncStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u
 
 /// The motion stage's page: pointer, key and wheel events logged with
 /// their own timestamps and coalesced samples; `__sum` boils the log
-/// down to what the stage asserts, so the eval reply stays small.
+/// down to what the stage asserts, so the eval reply stays small. `dd`
+/// is a custom dropdown whose options exist only while it is open.
 const motion_page =
     \\<!doctype html><html><head><title>motion</title><style>
     \\body{margin:0;height:3000px;font:14px sans-serif}
     \\#t{position:absolute;left:520px;top:300px;width:80px;height:40px}
     \\#u{position:absolute;left:120px;top:140px;width:60px;height:30px}
     \\#f{position:absolute;left:100px;top:450px;width:300px}
+    \\#dd{position:absolute;left:700px;top:140px;width:160px;height:30px;border:1px solid #000}
+    \\#ddl{display:none;position:absolute;left:700px;top:176px;width:160px}
     \\</style></head><body><button id="t">Target</button><button id="u">Other</button><input id="f" aria-label="field">
+    \\<div id="dd" role="combobox" aria-haspopup="listbox" aria-expanded="false" aria-label="Pick" tabindex="0">Alpha</div><div id="ddl" role="listbox"></div>
     \\<script>
     \\var L=[];
     \\function rec(e){var cs=[];try{if(e.getCoalescedEvents)for(var c of e.getCoalescedEvents())cs.push([c.timeStamp,c.clientX,c.clientY]);}catch(_){}
@@ -9128,15 +9132,23 @@ const motion_page =
     \\document.addEventListener('keydown',function(e){L.push({k:'keydown',t:e.timeStamp});},true);
     \\document.addEventListener('keyup',function(e){L.push({k:'keyup',t:e.timeStamp});},true);
     \\document.addEventListener('wheel',function(e){L.push({k:'wheel',t:e.timeStamp});},{capture:true,passive:true});
+    \\var dd=document.getElementById('dd'),ddl=document.getElementById('ddl');
+    \\dd.addEventListener('click',function(ev){if(!ev.isTrusted)return;ddl.style.display='block';dd.setAttribute('aria-expanded','true');ddl.innerHTML='';
+    \\['Alpha','Beta','Gamma'].forEach(function(t){var o=document.createElement('div');o.setAttribute('role','option');o.style.height='28px';o.textContent=t;
+    \\o.addEventListener('click',function(e2){if(!e2.isTrusted)return;dd.textContent=t;ddl.style.display='none';dd.setAttribute('aria-expanded','false');});ddl.appendChild(o);});});
     \\window.__clear=function(){L.length=0;return 0;};
     \\window.__sum=function(){var moves=0,inc=true,last=-1,down=null,up=null,path=[],keys=[],wheels=0;
-    \\for(var e of L){if(e.k==='pointermove'&&!down){for(var c of e.c){moves++;if(c[0]<=last)inc=false;last=c[0];if(path.length<60)path.push(Math.round(c[1])+','+Math.round(c[2]));}}
+    \\var all=0,minx=1e9,maxx=-1e9,miny=1e9,maxy=-1e9,segs=[],cur=0,pm=0,held=false;
+    \\for(var e of L){if(e.k==='pointermove'){all++;minx=Math.min(minx,e.x);maxx=Math.max(maxx,e.x);miny=Math.min(miny,e.y);maxy=Math.max(maxy,e.y);cur+=e.c.length;if(held)pm++;}
+    \\else if(e.k==='pointerdown'){segs.push(cur);cur=0;held=true;}else if(e.k==='pointerup')held=false;
+    \\if(e.k==='pointermove'&&!down){for(var c of e.c){moves++;if(c[0]<=last)inc=false;last=c[0];if(path.length<60)path.push(Math.round(c[1])+','+Math.round(c[2]));}}
     \\else if(e.k==='pointerdown'&&!down)down=e;else if(e.k==='pointerup'&&down&&!up)up=e;else if(e.k==='keydown')keys.push(e.t);else if(e.k==='wheel')wheels++;}
     \\var gaps=[];for(var i=1;i<keys.length;i++)gaps.push(Math.round(keys[i]-keys[i-1]));
     \\var r=document.getElementById('t').getBoundingClientRect();
     \\return {moves:moves,inc:inc,down:!!down,press:(down&&up)?Math.round((up.t-down.t)*10)/10:-1,
     \\inside:!!down&&down.x>=r.left&&down.x<=r.right&&down.y>=r.top&&down.y<=r.bottom,id:down?down.id:'',
-    \\path:path.join(' '),keys:keys.length,gaps:gaps,wheels:wheels,scroll:Math.round(window.scrollY)};};
+    \\path:path.join(' '),keys:keys.length,gaps:gaps,wheels:wheels,scroll:Math.round(window.scrollY),
+    \\all:all,minx:all?minx:0,maxx:all?maxx:0,miny:all?miny:0,maxy:all?maxy:0,vw:innerWidth,vh:innerHeight,segs:segs,press_moves:pm,dd:dd.textContent};};
     \\</script></body></html>
 ;
 
@@ -9152,6 +9164,19 @@ const MotionSum = struct {
     gaps: []const i64 = &.{},
     wheels: i64 = 0,
     scroll: i64 = 0,
+    /// Every pointermove event, drift included, and where they went.
+    all: i64 = 0,
+    minx: f64 = 0,
+    maxx: f64 = 0,
+    miny: f64 = 0,
+    maxy: f64 = 0,
+    vw: f64 = 0,
+    vh: f64 = 0,
+    /// Coalesced move samples before each press.
+    segs: []const i64 = &.{},
+    /// Moves while a button was held: a drift there would be a drag.
+    press_moves: i64 = 0,
+    dd: []const u8 = "",
 };
 
 fn motionSum(cl: *Client, arena: std.mem.Allocator) MotionSum {
@@ -9192,6 +9217,15 @@ fn motionAct(cl: *Client, id: u32, action: proto.SemAct, arg: []const u8, motion
     if (!cl.waitSeq(&cl.act_seq, seq, timeout_ms)) fail("motion stage: no sem_act_result");
 }
 
+/// Turn idle drift on or off for the stage's view; whether the helper
+/// agreed.
+fn motionDrift(cl: *Client, on: bool) bool {
+    const seq = cl.motion_done_seq;
+    cl.send(proto.MotionDrift{ .view = view_id, .req = 77, .on = @intFromBool(on) });
+    if (!cl.waitSeq(&cl.motion_done_seq, seq, 20_000)) fail("motion stage: no ev_motion_done for motion_drift");
+    return cl.motion_done_ok == 1;
+}
+
 fn sendPack(cl: *Client, serial: u32, bytes: []const u8, chunk: usize) void {
     const seq = cl.motion_pack_seq;
     var off: usize = 0;
@@ -9215,6 +9249,7 @@ fn runMotionStage(cl: *Client, gpa: std.mem.Allocator) void {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     if (!cl.acks(.motion_replay)) fail("stage 3d motion: hello_ack lacks motion-replay");
+    if (!cl.acks(.motion_drift)) fail("stage 3d motion: hello_ack lacks motion-drift");
     var http = HttpProbe{ .body = motion_page };
     if (!http.start()) fail("stage 3d motion: HTTP fixture did not start");
     defer http.shutdown();
@@ -9226,6 +9261,7 @@ fn runMotionStage(cl: *Client, gpa: std.mem.Allocator) void {
     const t_id = cl.idOfLine("button \"Target\"") orelse fail("stage 3d motion: no Target button in the tree");
     const u_id = cl.idOfLine("button \"Other\"") orelse fail("stage 3d motion: no Other button in the tree");
     const f_id = cl.idOfLine("textbox \"field\"") orelse fail("stage 3d motion: no field in the tree");
+    const dd_id = cl.idOfLine("combobox \"Pick\"") orelse fail("stage 3d motion: no Pick dropdown in the tree");
 
     // Direct, as before: one move, an instant press, no motion fact.
     _ = cl.evalWait("window.__clear()", false, 10_000);
@@ -9247,6 +9283,8 @@ fn runMotionStage(cl: *Client, gpa: std.mem.Allocator) void {
         fail("stage 3d motion: a replay without a pack was not refused");
     }
     if (motionSum(cl, arena).moves != 0) fail("stage 3d motion: a refused replay still moved the pointer");
+    // Idle drift needs a pack too: refused, never on without one.
+    if (motionDrift(cl, true)) fail("stage 3d motion: idle drift was turned on with no pack loaded");
 
     // A broken pack is refused and leaves no pack; a generated one loads
     // across several chunks.
@@ -9318,6 +9356,59 @@ fn runMotionStage(cl: *Client, gpa: std.mem.Allocator) void {
             fail("stage 3d motion: the replayed scroll was not several wheel events that moved the page");
         }
     }
+
+    // A custom dropdown set with replay: BOTH clicks (open, then the
+    // option) reach the page as replayed reaches, and the reply's
+    // duration covers the whole action.
+    _ = cl.evalWait("window.scrollTo(0,0)", false, 10_000);
+    _ = cl.evalWait("window.__clear()", false, 10_000);
+    motionAct(cl, dd_id, .set_value, "Beta", .replay, 30_000);
+    {
+        const msg = cl.act_msg[0..cl.act_msg_len];
+        const s = settledSum(cl, arena);
+        std.debug.print("smoke-web: replayed dropdown: ok={d} motion={d} {d} ms, reaches {any}, now \"{s}\" \"{s}\"\n", .{ cl.act_ok, cl.act_motion, cl.act_duration, s.segs, s.dd, msg });
+        if (cl.act_ok != 1 or cl.act_motion != @intFromEnum(proto.MotionResult.replayed) or cl.act_duration == 0)
+            fail("stage 3d motion: a replayed custom-dropdown pick did not report motion=replayed with a duration");
+        if (!std.mem.eql(u8, s.dd, "Beta") or std.mem.indexOf(u8, msg, "Beta") == null) fail("stage 3d motion: the replayed dropdown pick did not choose Beta");
+        if (s.segs.len < 2) fail("stage 3d motion: the replayed dropdown pick was not two presses");
+        for (s.segs[0..2]) |n| if (n < 4) fail("stage 3d motion: a dropdown click was not a replayed reach (too few moves before its press)");
+    }
+
+    // Idle drift, opted in: pointer moves on an idle view, inside it.
+    if (!motionDrift(cl, true)) fail("stage 3d motion: idle drift was refused with a pack loaded");
+    _ = cl.evalWait("window.__clear()", false, 10_000);
+    {
+        var s = motionSum(cl, arena);
+        const until = nowMs() + 12_000;
+        while (s.all < 2 and nowMs() < until) {
+            _ = cl.drive(300, 0);
+            s = motionSum(cl, arena);
+        }
+        std.debug.print("smoke-web: idle drift: {d} moves in x {d}..{d} y {d}..{d} of {d}x{d}\n", .{ s.all, s.minx, s.maxx, s.miny, s.maxy, s.vw, s.vh });
+        if (s.all == 0) fail("stage 3d motion: idle drift produced no pointer moves on an idle view");
+        if (s.down) fail("stage 3d motion: idle drift pressed a button");
+        if (s.minx < 0 or s.miny < 0 or s.maxx >= s.vw or s.maxy >= s.vh) fail("stage 3d motion: idle drift left the viewport");
+        if (s.maxx - s.minx > 40 or s.maxy - s.miny > 40) fail("stage 3d motion: idle drift wandered further than a resting hand");
+    }
+    // An action while drifting is not disturbed: the replayed click
+    // still holds every assertion, and nothing moved during its press.
+    _ = cl.evalWait("window.__clear()", false, 10_000);
+    motionAct(cl, t_id, .click, "", .replay, 20_000);
+    {
+        const s = settledSum(cl, arena);
+        if (cl.act_ok != 1 or cl.act_motion != @intFromEnum(proto.MotionResult.replayed)) fail("stage 3d motion: a replayed click during idle drift failed");
+        if (s.moves < 6 or !s.inc or !s.down or s.press < 20 or !s.inside) {
+            std.debug.print("smoke-web: click during drift: {d} moves, increasing={}, press {d} ms, inside={}\n", .{ s.moves, s.inc, s.press, s.inside });
+            fail("stage 3d motion: idle drift disturbed a replayed click");
+        }
+        if (s.press_moves != 0) fail("stage 3d motion: the pointer moved while the button was held (drift during an action)");
+    }
+    // Off again: no pointer moves at all on the idle view.
+    if (!motionDrift(cl, false)) fail("stage 3d motion: idle drift could not be turned off");
+    _ = cl.drive(300, 0);
+    _ = cl.evalWait("window.__clear()", false, 10_000);
+    _ = cl.drive(5_500, 0);
+    if (motionSum(cl, arena).all != 0) fail("stage 3d motion: the pointer moved with idle drift off");
 
     // Every replay is answered: one superseded by the next action on
     // the view, one interrupted by a navigation.

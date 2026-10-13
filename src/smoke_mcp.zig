@@ -4279,6 +4279,7 @@ fn webMotionStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const 
     }
     const page = "data:text/html,<title>motion</title><button style='position:absolute;left:300px;top:200px;width:90px;height:40px' onclick=\\\"document.title='clicked:'+event.isTrusted\\\">Go</button>";
     const open_args = "{\"url\":\"" ++ page ++ "\",\"ephemeral\":true}";
+    const drift_open_args = "{\"url\":\"" ++ page ++ "\",\"ephemeral\":true,\"idle_drift\":true}";
 
     // 1. Nothing installed: no pack, direct default, replay refused.
     {
@@ -4288,6 +4289,13 @@ fn webMotionStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const 
         if (caps.get("web_motion").? != .null) fail("web_motion is not null with no pack selected");
         if (!std.mem.eql(u8, caps.get("web_motion_default").?.string, "direct")) fail("the built-in web_motion_default is not direct");
         if (caps.get("web_motion_broken").? != .null) fail("web_motion_broken is set with nothing configured");
+        if (caps.get("web_motion_idle_drift").? != .bool or caps.get("web_motion_idle_drift").?.bool) fail("the built-in web_motion_idle_drift is not false");
+        if (caps.get("web_motion_drift") == null) fail("capabilities lacks web_motion_drift");
+        // Idle drift without a pack: refused before anything opens.
+        const no_drift = m.callTool("web_open", drift_open_args);
+        _ = capSc(arena, no_drift, "idle drift without a pack", true);
+        if (std.mem.indexOf(u8, no_drift, "no motion pack is selected") == null or std.mem.indexOf(u8, no_drift, "nothing was opened") == null)
+            fail("web_open idle_drift:true without a pack was not refused naming the missing pack");
         _ = capSc(arena, m.callTool("web_open", open_args), "motion open", false);
         const direct = capSc(arena, m.callTool("web_act", "{\"name\":\"Go\"}"), "direct act", false);
         if (!std.mem.eql(u8, direct.get("motion").?.string, "direct")) fail("a default web_act did not report motion:direct");
@@ -4312,6 +4320,8 @@ fn webMotionStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const 
         _ = capSc(arena, m.callTool("web_open", open_args), "motion open 2", false);
         const caps2 = capSc(arena, m.callTool("capabilities", "{}"), "motion caps with a helper", false);
         if (caps2.get("web_motion_replay").? != .bool or !caps2.get("web_motion_replay").?.bool) fail("web_motion_replay is not true once the helper runs");
+        if (caps2.get("web_motion_drift").? != .bool or !caps2.get("web_motion_drift").?.bool) fail("web_motion_drift is not true once the helper runs");
+        if (wm.object.get("idle").?.integer < 1) fail("capabilities.web_motion does not count the pack's idle drift");
         const replayed = capSc(arena, m.callTool("web_act", "{\"name\":\"Go\",\"motion\":\"replay\"}"), "replayed act", false);
         if (!std.mem.eql(u8, replayed.get("motion").?.string, "replayed")) fail("web_act motion:replay did not report motion:replayed");
         const ms = replayed.get("motion_ms").?.integer;
@@ -4321,6 +4331,14 @@ fn webMotionStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const 
         const sc = capSc(arena, m.callTool("web_scroll", "{\"dy\":300,\"motion\":\"replay\"}"), "replayed scroll", false);
         if (!std.mem.eql(u8, sc.get("motion").?.string, "replayed")) fail("web_scroll motion:replay did not report motion:replayed");
         std.debug.print("smoke-mcp: replayed click took {d} ms, replayed scroll {d} ms\n", .{ ms, sc.get("motion_ms").?.integer });
+        const drift_raw = m.callTool("web_open", drift_open_args);
+        const drifting = capSc(arena, drift_raw, "idle drift open", false);
+        if (drifting.get("idle_drift").? != .bool or !drifting.get("idle_drift").?.bool) fail("web_open idle_drift:true did not report idle_drift:true");
+        // An action on a drifting tab still runs and replays.
+        var drift_act: [96]u8 = undefined;
+        const drift_act_args = std.fmt.bufPrint(&drift_act, "{{\"pane\":{d},\"name\":\"Go\",\"motion\":\"replay\"}}", .{viewHandleOf(drift_raw)}) catch unreachable;
+        const on_drift = capSc(arena, m.callTool("web_act", drift_act_args), "replayed act on a drifting tab", false);
+        if (!std.mem.eql(u8, on_drift.get("motion").?.string, "replayed")) fail("a replayed act on a drifting tab did not replay");
         m.closeStdinWait();
     }
 
@@ -4349,6 +4367,34 @@ fn webMotionStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const 
         const title = old.callTool("web_eval", "{\"code\":\"document.title\"}");
         // The url itself spells the handler, so look for its RESULT.
         if (std.mem.indexOf(u8, title, "clicked:true") != null) fail("a refused replay still clicked");
+        old.closeStdinWait();
+    }
+
+    // 4b. A configured idle drift default applies without the argument,
+    //     and a helper without motion-drift fails the open closed and
+    //     leaves no tab behind.
+    {
+        writeSmokeConfig(rt, "[mcp]\nweb_motion_pack = smoke-pack\nweb_motion_idle_drift = true\n");
+        defer removeSmokeConfig(rt);
+        var m = Mcp.spawn(allocator, exe, &.{});
+        m.initialize();
+        const caps = capSc(arena, m.callTool("capabilities", "{}"), "motion caps drift configured", false);
+        if (caps.get("web_motion_idle_drift").? != .bool or !caps.get("web_motion_idle_drift").?.bool or !std.mem.eql(u8, caps.get("web_motion_idle_drift_source").?.string, "config"))
+            fail("a configured web_motion_idle_drift is not reported");
+        const opened = capSc(arena, m.callTool("web_open", open_args), "drift by default open", false);
+        if (opened.get("idle_drift").? != .bool or !opened.get("idle_drift").?.bool) fail("the configured idle drift default was not applied");
+        m.closeStdinWait();
+
+        _ = c.setenv("SKETERM_WEB_DISABLE_MOTION_DRIFT", "1", 1);
+        defer _ = c.unsetenv("SKETERM_WEB_DISABLE_MOTION_DRIFT");
+        var old = Mcp.spawn(allocator, exe, &.{});
+        old.initialize();
+        const refused = old.callTool("web_open", open_args);
+        _ = capSc(arena, refused, "idle drift on a helper without motion-drift", true);
+        if (std.mem.indexOf(u8, refused, "does not advertise motion-drift") == null or std.mem.indexOf(u8, refused, "the new tab was closed") == null)
+            fail("idle drift on a helper without motion-drift was not refused naming it");
+        const tabs = capSc(arena, old.callTool("web_tabs", "{}"), "tabs after a refused drift open", false);
+        if (tabs.get("count").?.integer != 0) fail("a web_open refused for idle drift left its tab open");
         old.closeStdinWait();
     }
 
