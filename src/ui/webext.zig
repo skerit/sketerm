@@ -956,16 +956,16 @@ const allocation_manifest =
 
 const AllocationTestDir = struct {
     storage: [96:0]u8,
-    old_xdg: ?[]u8,
+    saved_xdg: @import("../util/env.zig").Saved = .{},
 
     fn init() !AllocationTestDir {
-        var self = AllocationTestDir{ .storage = undefined, .old_xdg = null };
+        var self = AllocationTestDir{ .storage = undefined };
         const template = "/tmp/sketerm-ui-webext-XXXXXX";
         @memcpy(self.storage[0..template.len], template);
         self.storage[template.len] = 0;
         _ = c.mkdtemp(@ptrCast(&self.storage)) orelse return error.SkipZigTest;
-        if (c.getenv("XDG_DATA_HOME")) |old| self.old_xdg = try std.testing.allocator.dupe(u8, std.mem.span(old));
-        if (c.setenv("XDG_DATA_HOME", @ptrCast(&self.storage), 1) != 0) return error.SkipZigTest;
+        try self.saved_xdg.override("XDG_DATA_HOME", @ptrCast(&self.storage));
+        errdefer self.saved_xdg.restore();
 
         var package_buf: [256]u8 = undefined;
         const package = self.packageDir(&package_buf);
@@ -1004,14 +1004,7 @@ const AllocationTestDir = struct {
     }
 
     fn deinit(self: *AllocationTestDir) void {
-        if (self.old_xdg) |old| {
-            var old_z: [4096:0]u8 = undefined;
-            const value = std.fmt.bufPrintZ(&old_z, "{s}", .{old}) catch "";
-            _ = c.setenv("XDG_DATA_HOME", value.ptr, 1);
-            std.testing.allocator.free(old);
-        } else {
-            _ = c.unsetenv("XDG_DATA_HOME");
-        }
+        self.saved_xdg.restore();
         removeTree(std.testing.allocator, self.path());
     }
 };

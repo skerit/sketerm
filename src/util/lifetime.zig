@@ -122,14 +122,9 @@ test "lifetime: the fence trips on writer close, not on writes" {
 
 test "lifetime: inherited() reads the armed fence and refuses a dead one" {
     const t = std.testing;
-    const saved = c.getenv(ENV);
-    defer if (saved) |v| {
-        _ = c.setenv(ENV, v, 1);
-    } else {
-        _ = c.unsetenv(ENV);
-    };
-
-    _ = c.unsetenv(ENV);
+    var saved: @import("env.zig").Saved = .{};
+    try saved.take(ENV);
+    defer saved.restore();
     try t.expectEqual(@as(c_int, -1), try inherited());
 
     try t.expect(arm());

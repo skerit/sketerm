@@ -10626,27 +10626,6 @@ test "ordinary and untrusted engine addresses remain stable across route table g
     try std.testing.expect(untrusted.profileStorePath() == null);
 }
 
-/// Pins `SKETERM_WEB_BIN` for one test and restores the caller's value.
-const WebBinPin = struct {
-    const libc = @import("../c.zig").c;
-
-    saved: ?[:0]u8 = null,
-
-    fn set(gpa: std.mem.Allocator, value: [*:0]const u8) !WebBinPin {
-        var pin = WebBinPin{};
-        if (libc.getenv("SKETERM_WEB_BIN")) |old| pin.saved = try gpa.dupeZ(u8, std.mem.span(old));
-        if (libc.setenv("SKETERM_WEB_BIN", value, 1) != 0) return error.SkipZigTest;
-        return pin;
-    }
-
-    fn restore(self: *WebBinPin, gpa: std.mem.Allocator) void {
-        if (self.saved) |old| {
-            _ = libc.setenv("SKETERM_WEB_BIN", old.ptr, 1);
-            gpa.free(old);
-        } else _ = libc.unsetenv("SKETERM_WEB_BIN");
-    }
-};
-
 test "web_untrusted is a build fact, and lifecycle facts never come from the untrusted engine" {
     const saved_alloc = g_headless_alloc;
     const saved_dir = g_headless_dir;
@@ -10654,8 +10633,9 @@ test "web_untrusted is a build fact, and lifecycle facts never come from the unt
     const saved_mux = g_headless_mux_sock;
     if (g_engines.items.len != 0 or guiDrivesWeb()) return error.SkipZigTest;
     const gpa = std.testing.allocator;
-    var pin = try WebBinPin.set(gpa, "/bin/sh");
-    defer pin.restore(gpa);
+    var pin: @import("../util/env.zig").Saved = .{};
+    try pin.override("SKETERM_WEB_BIN", "/bin/sh");
+    defer pin.restore();
     configureHeadless(gpa, "/tmp/webdrive-mode-test", null, null, null, false);
     defer {
         shutdownHeadless();
@@ -10683,7 +10663,7 @@ test "web_untrusted is a build fact, and lifecycle facts never come from the unt
     try std.testing.expectEqual(webdrive.Owner.none, eng.owner);
     try std.testing.expectEqual(ordinary.brokerLaneAvailable(), eng.broker_lane);
     // A capable build with no resolvable helper says so.
-    _ = WebBinPin.libc.setenv("SKETERM_WEB_BIN", "/nonexistent/sketerm-webengine", 1);
+    _ = @import("../c.zig").c.setenv("SKETERM_WEB_BIN", "/nonexistent/sketerm-webengine", 1);
     try std.testing.expectEqual(@as(?bool, false), restrictedCapability(.untrusted_web));
     untrusted.state = .idle;
     ordinary.state = .idle;

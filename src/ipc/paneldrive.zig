@@ -48,6 +48,7 @@ pub const Origin = struct {
 
 /// An empty variable reads as unset, like a missing one.
 const getenv = @import("../util/env.zig").nonEmpty;
+const EnvSave = @import("../util/env.zig").Saved;
 
 pub fn hasEnvironmentSocket() bool {
     return getenv("SKETERM_MUX_SOCKET") != null;
@@ -506,27 +507,13 @@ fn addTestEntry(pool: *Pool, socket: []const u8, session: []const u8, fd: c_int)
 
 test "paneldrive origin prefers exact environment and otherwise names only the default socket" {
     const t = std.testing;
-    const old_socket = if (getenv("SKETERM_MUX_SOCKET")) |value| try t.allocator.dupe(u8, value) else null;
-    const old_runtime = if (getenv("XDG_RUNTIME_DIR")) |value| try t.allocator.dupe(u8, value) else null;
-    defer {
-        if (old_socket) |value| {
-            const z = std.fmt.allocPrintSentinel(t.allocator, "{s}", .{value}, 0) catch @panic("restore env oom");
-            defer t.allocator.free(z);
-            _ = c.setenv("SKETERM_MUX_SOCKET", z.ptr, 1);
-            t.allocator.free(value);
-        } else _ = c.unsetenv("SKETERM_MUX_SOCKET");
-        if (old_runtime) |value| {
-            const z = std.fmt.allocPrintSentinel(t.allocator, "{s}", .{value}, 0) catch @panic("restore env oom");
-            defer t.allocator.free(z);
-            _ = c.setenv("XDG_RUNTIME_DIR", z.ptr, 1);
-            t.allocator.free(value);
-        } else _ = c.unsetenv("XDG_RUNTIME_DIR");
-    }
+    var saved_socket: EnvSave = .{};
+    try saved_socket.override("SKETERM_MUX_SOCKET", "/tmp/exact-panel-origin.sock");
+    defer saved_socket.restore();
 
     // Compare canonical-to-canonical: resolve() canonicalizes on purpose
     // (two spellings of one socket must share an identity), and on Darwin
     // /tmp IS a symlink to /private/tmp, so the literal is not the answer.
-    _ = c.setenv("SKETERM_MUX_SOCKET", "/tmp/exact-panel-origin.sock", 1);
     var exact = try Origin.resolve(t.allocator, "session-a");
     defer exact.deinit(t.allocator);
     try t.expectEqual(SocketSource.environment, exact.source);
@@ -549,7 +536,9 @@ test "paneldrive origin prefers exact environment and otherwise names only the d
     try t.expect(std.mem.endsWith(u8, relative.socket, "/relative-panel-origin.sock"));
 
     _ = c.unsetenv("SKETERM_MUX_SOCKET");
-    _ = c.setenv("XDG_RUNTIME_DIR", "/tmp/paneldrive-origin-test", 1);
+    var saved_runtime: EnvSave = .{};
+    try saved_runtime.override("XDG_RUNTIME_DIR", "/tmp/paneldrive-origin-test");
+    defer saved_runtime.restore();
     var compat = try Origin.resolve(t.allocator, "session-b");
     defer compat.deinit(t.allocator);
     try t.expectEqual(SocketSource.default_compat, compat.source);
@@ -803,24 +792,12 @@ test "paneldrive evicts gone cached identity before a session alias is reused" {
 
 test "paneldrive reports stale inherited identity and never adopts a replacement" {
     const t = std.testing;
-    const old_session = if (getenv("SKETERM_SESSION")) |value| try t.allocator.dupe(u8, value) else null;
-    const old_id = if (getenv("SKETERM_SESSION_ORIGIN_ID")) |value| try t.allocator.dupe(u8, value) else null;
-    defer {
-        if (old_session) |value| {
-            const z = std.fmt.allocPrintSentinel(t.allocator, "{s}", .{value}, 0) catch @panic("restore env oom");
-            defer t.allocator.free(z);
-            _ = c.setenv("SKETERM_SESSION", z.ptr, 1);
-            t.allocator.free(value);
-        } else _ = c.unsetenv("SKETERM_SESSION");
-        if (old_id) |value| {
-            const z = std.fmt.allocPrintSentinel(t.allocator, "{s}", .{value}, 0) catch @panic("restore env oom");
-            defer t.allocator.free(z);
-            _ = c.setenv("SKETERM_SESSION_ORIGIN_ID", z.ptr, 1);
-            t.allocator.free(value);
-        } else _ = c.unsetenv("SKETERM_SESSION_ORIGIN_ID");
-    }
-    _ = c.setenv("SKETERM_SESSION", "reused", 1);
-    _ = c.setenv("SKETERM_SESSION_ORIGIN_ID", "00000000000000000000000000000001", 1);
+    var saved_session: EnvSave = .{};
+    try saved_session.override("SKETERM_SESSION", "reused");
+    defer saved_session.restore();
+    var saved_id: EnvSave = .{};
+    try saved_id.override("SKETERM_SESSION_ORIGIN_ID", "00000000000000000000000000000001");
+    defer saved_id.restore();
 
     var path_buf: [256:0]u8 = undefined;
     const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-panel-stale-{d}.sock", .{c.getpid()});

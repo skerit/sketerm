@@ -1467,6 +1467,7 @@ const UI_ISOLATED_ENV = [_][*:0]const u8{
     "SKETERM_MUX_SOCKET",
     "SKETERM_SESSION_ORIGIN_ID",
 };
+const UiEnvSave = @import("../util/env.zig").SavedSet(&UI_ISOLATED_ENV);
 
 /// XDG_STATE_HOME pointed at a scratch dir, plus a GUI socket the
 /// ui_* tools will believe in. Every panelstore path derives from the
@@ -1478,13 +1479,13 @@ const UiScratch = struct {
     saved_gui: bool = false,
     saved_source: GuiSocketSource = .none,
     saved_state_home: EnvSave = .{},
-    saved_env: [UI_ISOLATED_ENV.len]EnvSave = @splat(.{}),
+    saved_env: UiEnvSave = .{},
 
     fn init(self: *UiScratch, tag: []const u8, gui: bool) !void {
         self.* = .{};
         resetEventCursors();
         try self.saved_state_home.take("XDG_STATE_HOME");
-        for (&self.saved_env, UI_ISOLATED_ENV) |*slot, name| try slot.take(name);
+        try self.saved_env.take();
         const p = try std.fmt.bufPrintZ(&self.buf, "/tmp/sketerm-mcp-ui-{s}-{d}", .{ tag, c.getpid() });
         self.len = p.len;
         _ = c.mkdir(@ptrCast(&self.buf), 0o755);
@@ -1499,11 +1500,7 @@ const UiScratch = struct {
         resetEventCursors();
         mcp.srv_gui_socket = self.saved_gui;
         mcp.srv_gui_socket_source = self.saved_source;
-        var i = self.saved_env.len;
-        while (i > 0) {
-            i -= 1;
-            self.saved_env[i].restore();
-        }
+        self.saved_env.restore();
         self.saved_state_home.restore();
         var cmd: [256]u8 = undefined;
         const z = std.fmt.bufPrintZ(&cmd, "rm -rf {s}", .{self.buf[0..self.len]}) catch return;
@@ -2057,26 +2054,18 @@ test "panel transport precedence is exact origin, explicit GUI, then default com
     const old_pool = mcp.panel_pool;
     const old_gui = mcp.srv_gui_socket;
     const old_source = mcp.srv_gui_socket_source;
-    const old_socket = if (c.getenv("SKETERM_MUX_SOCKET")) |value|
-        try t.allocator.dupe(u8, std.mem.span(@as([*:0]const u8, @ptrCast(value))))
-    else
-        null;
+    var saved_socket: EnvSave = .{};
+    try saved_socket.override("SKETERM_MUX_SOCKET", "/tmp/exact.sock");
     defer {
         mcp.panel_pool = old_pool;
         mcp.srv_gui_socket = old_gui;
         mcp.srv_gui_socket_source = old_source;
-        if (old_socket) |value| {
-            const z = std.fmt.allocPrintSentinel(t.allocator, "{s}", .{value}, 0) catch @panic("restore env oom");
-            defer t.allocator.free(z);
-            _ = c.setenv("SKETERM_MUX_SOCKET", z.ptr, 1);
-            t.allocator.free(value);
-        } else _ = c.unsetenv("SKETERM_MUX_SOCKET");
+        saved_socket.restore();
     }
     mcp.panel_pool = &pool;
     mcp.srv_gui_socket = true;
     mcp.srv_gui_socket_source = .explicit;
 
-    _ = c.setenv("SKETERM_MUX_SOCKET", "/tmp/exact.sock", 1);
     var exact = UiTransport.init(arena, fake.backend(), "same");
     defer exact.deinit();
     try t.expect(exact.mode == .auto);
@@ -2138,11 +2127,11 @@ test "a daemon with no lifetime id falls back to by-session storage" {
     defer pool.deinit();
     mcp.panel_pool = &pool;
     defer mcp.panel_pool = old_pool;
+    var saved_env: UiEnvSave = .{};
+    try saved_env.take();
+    defer saved_env.restore();
     _ = c.setenv("SKETERM_MUX_SOCKET", path.ptr, 1);
     _ = c.setenv("SKETERM_SESSION", "old-session", 1);
-    _ = c.unsetenv("SKETERM_SESSION_ORIGIN_ID");
-    defer _ = c.unsetenv("SKETERM_MUX_SOCKET");
-    defer _ = c.unsetenv("SKETERM_SESSION");
 
     var fake = FakeBackend{ .responses = &.{}, .allocator = t.allocator };
     defer fake.deinit();
@@ -2162,9 +2151,10 @@ test "exact persistence failures never select reusable legacy storage" {
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+    var saved_env: UiEnvSave = .{};
+    try saved_env.take();
+    defer saved_env.restore();
     _ = c.setenv("SKETERM_MUX_SOCKET", "/tmp/exact-store-failure.sock", 1);
-    defer _ = c.unsetenv("SKETERM_MUX_SOCKET");
-    _ = c.unsetenv("SKETERM_SESSION_ORIGIN_ID");
 
     const cases = [_]struct {
         kind: paneldrive.FailureKind,
@@ -2210,8 +2200,9 @@ test "exact persistence retains a previously validated lifetime scope after ever
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    _ = c.setenv("SKETERM_MUX_SOCKET", "/tmp/exact-store-retained.sock", 1);
-    defer _ = c.unsetenv("SKETERM_MUX_SOCKET");
+    var saved_socket: EnvSave = .{};
+    try saved_socket.override("SKETERM_MUX_SOCKET", "/tmp/exact-store-retained.sock");
+    defer saved_socket.restore();
 
     const failures = [_]paneldrive.FailureKind{
         .attach_failed,
@@ -2263,12 +2254,12 @@ test "malformed inherited exact identity is an error rather than old-daemon evid
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+    var saved_env: UiEnvSave = .{};
+    try saved_env.take();
+    defer saved_env.restore();
     _ = c.setenv("SKETERM_MUX_SOCKET", "/tmp/exact-store-malformed.sock", 1);
     _ = c.setenv("SKETERM_SESSION", "exact-session", 1);
     _ = c.setenv("SKETERM_SESSION_ORIGIN_ID", "not-an-origin-id", 1);
-    defer _ = c.unsetenv("SKETERM_MUX_SOCKET");
-    defer _ = c.unsetenv("SKETERM_SESSION");
-    defer _ = c.unsetenv("SKETERM_SESSION_ORIGIN_ID");
 
     var fake = FakeBackend{ .responses = &.{}, .allocator = t.allocator };
     defer fake.deinit();

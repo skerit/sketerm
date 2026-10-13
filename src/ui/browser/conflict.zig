@@ -890,18 +890,13 @@ test "conflict decisions retain a failed durable skip until it can be persisted"
     var f: DecisionTest = .{};
     try f.init();
     defer f.deinit();
-    const old_state = if (c.getenv("XDG_STATE_HOME")) |value| try t.allocator.dupeZ(u8, std.mem.span(value)) else null;
-    defer {
-        if (old_state) |value| {
-            _ = c.setenv("XDG_STATE_HOME", value, 1);
-            t.allocator.free(value);
-        } else _ = c.unsetenv("XDG_STATE_HOME");
-    }
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var state_buf: [4096:0]u8 = undefined;
     const state = try std.fmt.bufPrintZ(&state_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
-    try t.expectEqual(@as(c_int, 0), c.setenv("XDG_STATE_HOME", state, 1));
+    var saved_state: @import("../../util/env.zig").Saved = .{};
+    try saved_state.override("XDG_STATE_HOME", state);
+    defer saved_state.restore();
     var failing = std.testing.FailingAllocator.init(t.allocator, .{});
     const service = try failing.allocator().create(@import("../file_transfers.zig").Service);
     service.* = .{ .allocator = failing.allocator(), .shutting_down = true };

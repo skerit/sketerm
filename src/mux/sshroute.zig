@@ -640,13 +640,9 @@ test "multiplexing uses sketerm's own ControlPath under the control dir" {
     const dir_ptr = c.mkdtemp(&tmpl) orelse return error.SkipZigTest;
     const dir = std.mem.span(@as([*:0]u8, @ptrCast(dir_ptr)));
     defer _ = c.rmdir(dir_ptr);
-    const old = c.getenv(CONTROL_DIR_ENV);
-    _ = c.setenv(CONTROL_DIR_ENV, dir_ptr, 1);
-    defer if (old) |o| {
-        _ = c.setenv(CONTROL_DIR_ENV, o, 1);
-    } else {
-        _ = c.unsetenv(CONTROL_DIR_ENV);
-    };
+    var saved: @import("../util/env.zig").Saved = .{};
+    try saved.override(CONTROL_DIR_ENV, dir_ptr);
+    defer saved.restore();
     const plan = try Plan.init("box", .direct, socks5_client.DEFAULT_ENDPOINT);
     var args = try plan.args(.{ .multiplex = true });
     try t.expect(args.multiplexes());

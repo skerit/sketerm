@@ -70,14 +70,12 @@ pub fn statePath(allocator: std.mem.Allocator, rel: []const u8) Error![]u8 {
 test "statePath prefers XDG_STATE_HOME, falls back to HOME, and never to /tmp" {
     const c = @import("../c.zig").c;
     const t = std.testing;
-    const old_state = env.get("XDG_STATE_HOME");
-    const old_home = env.get("HOME");
-    defer {
-        restore("XDG_STATE_HOME", old_state);
-        restore("HOME", old_home);
-    }
-    _ = c.setenv("XDG_STATE_HOME", "/xs", 1);
-    _ = c.setenv("HOME", "/home/u", 1);
+    var saved_state: env.Saved = .{};
+    try saved_state.override("XDG_STATE_HOME", "/xs");
+    defer saved_state.restore();
+    var saved_home: env.Saved = .{};
+    try saved_home.override("HOME", "/home/u");
+    defer saved_home.restore();
     const a = try statePath(t.allocator, "places.json");
     defer t.allocator.free(a);
     try t.expectEqualStrings("/xs/sketerm/places.json", a);
@@ -95,15 +93,13 @@ test "statePath prefers XDG_STATE_HOME, falls back to HOME, and never to /tmp" {
 test "configDir prefers XDG_CONFIG_HOME, falls back to HOME" {
     const c = @import("../c.zig").c;
     const t = std.testing;
-    const old_cfg = env.get("XDG_CONFIG_HOME");
-    const old_home = env.get("HOME");
-    defer {
-        restore("XDG_CONFIG_HOME", old_cfg);
-        restore("HOME", old_home);
-    }
+    var saved_cfg: env.Saved = .{};
+    try saved_cfg.override("XDG_CONFIG_HOME", "/xc");
+    defer saved_cfg.restore();
+    var saved_home: env.Saved = .{};
+    try saved_home.override("HOME", "/home/u");
+    defer saved_home.restore();
     var buf: [256]u8 = undefined;
-    _ = c.setenv("XDG_CONFIG_HOME", "/xc", 1);
-    _ = c.setenv("HOME", "/home/u", 1);
     try t.expectEqualStrings("/xc/sketerm", configDir(&buf).?);
     _ = c.setenv("XDG_CONFIG_HOME", "", 1);
     try t.expectEqualStrings("/home/u/.config/sketerm", configDir(&buf).?);
@@ -115,14 +111,12 @@ test "configDir prefers XDG_CONFIG_HOME, falls back to HOME" {
 test "dataPath prefers XDG_DATA_HOME, falls back to HOME, and is null with neither" {
     const c = @import("../c.zig").c;
     const t = std.testing;
-    const old_data = env.get("XDG_DATA_HOME");
-    const old_home = env.get("HOME");
-    defer {
-        restore("XDG_DATA_HOME", old_data);
-        restore("HOME", old_home);
-    }
-    _ = c.setenv("XDG_DATA_HOME", "/xd", 1);
-    _ = c.setenv("HOME", "/home/u", 1);
+    var saved_data: env.Saved = .{};
+    try saved_data.override("XDG_DATA_HOME", "/xd");
+    defer saved_data.restore();
+    var saved_home: env.Saved = .{};
+    try saved_home.override("HOME", "/home/u");
+    defer saved_home.restore();
     const a = (try dataPath(t.allocator, "webext")).?;
     defer t.allocator.free(a);
     try t.expectEqualStrings("/xd/sketerm/webext", a);
@@ -133,12 +127,4 @@ test "dataPath prefers XDG_DATA_HOME, falls back to HOME, and is null with neith
     _ = c.unsetenv("XDG_DATA_HOME");
     _ = c.unsetenv("HOME");
     try t.expect((try dataPath(t.allocator, "x")) == null);
-}
-
-fn restore(name: [*:0]const u8, value: ?[]const u8) void {
-    const c = @import("../c.zig").c;
-    if (value) |v| {
-        var z: [4096:0]u8 = undefined;
-        if (std.fmt.bufPrintZ(&z, "{s}", .{v})) |s| _ = c.setenv(name, s.ptr, 1) else |_| {}
-    } else _ = c.unsetenv(name);
 }

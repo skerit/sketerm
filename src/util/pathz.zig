@@ -329,21 +329,9 @@ test "isDir tells a directory from a file and a missing path" {
 }
 
 test "executableOnPath finds a real binary and misses a made-up one" {
-    const saved = c.getenv("PATH");
-    var saved_copy: [4096:0]u8 = undefined;
-    var saved_len: usize = 0;
-    if (saved) |p| {
-        const span = std.mem.span(@as([*:0]const u8, @ptrCast(p)));
-        if (span.len >= saved_copy.len) return error.SkipZigTest;
-        @memcpy(saved_copy[0..span.len], span);
-        saved_len = span.len;
-    }
-    saved_copy[saved_len] = 0;
-    defer if (saved != null) {
-        _ = c.setenv("PATH", &saved_copy, 1);
-    } else {
-        _ = c.unsetenv("PATH");
-    };
+    var saved: @import("env.zig").Saved = .{};
+    saved.take("PATH") catch return error.SkipZigTest;
+    defer saved.restore();
 
     const td = TempDir.make("onpath") orelse return error.SkipZigTest;
     defer td.remove();

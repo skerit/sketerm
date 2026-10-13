@@ -157,6 +157,7 @@ fn scopeLabel(scope: Scope) []const u8 {
 
 /// An empty variable reads as unset, like a missing one.
 const getenv = @import("../util/env.zig").nonEmpty;
+const EnvSave = @import("../util/env.zig").Saved;
 
 // ─── validation ─────────────────────────────────────────────────
 
@@ -689,6 +690,7 @@ const DOC =
 const Scratch = struct {
     buf: [128]u8 = undefined,
     len: usize = 0,
+    saved: EnvSave = .{},
 
     fn path(self: *const Scratch) []const u8 {
         return self.buf[0..self.len];
@@ -699,12 +701,12 @@ const Scratch = struct {
         const p = try std.fmt.bufPrintZ(&self.buf, "/tmp/sketerm-panels-{s}-{d}", .{ tag, c.getpid() });
         self.len = p.len;
         _ = c.mkdir(@ptrCast(&self.buf), 0o755);
-        _ = c.setenv("XDG_STATE_HOME", @ptrCast(&self.buf), 1);
+        try self.saved.override("XDG_STATE_HOME", @ptrCast(&self.buf));
     }
 
     fn deinit(self: *Scratch) void {
         pathz.removeTree(self.path());
-        _ = c.unsetenv("XDG_STATE_HOME");
+        self.saved.restore();
         self.* = undefined;
     }
 };
@@ -1227,13 +1229,14 @@ test "caps trip and say what happened" {
 }
 
 test "resolveSession prefers explicit, then env, else there is no session" {
-    _ = c.unsetenv("SKETERM_SESSION");
+    var saved: EnvSave = .{};
+    try saved.take("SKETERM_SESSION");
+    defer saved.restore();
     // Not a fallback NAME: the absence is the answer, and the type says so.
     try t.expectEqual(@as(?[]const u8, null), resolveSession(.absent));
     try t.expectEqual(@as(?[]const u8, null), resolveSession(.{ .explicit = "" }));
     try t.expectEqualStrings("explicit", resolveSession(.{ .explicit = "explicit" }).?);
     _ = c.setenv("SKETERM_SESSION", "pane-7", 1);
-    defer _ = c.unsetenv("SKETERM_SESSION");
     try t.expectEqualStrings("pane-7", resolveSession(.absent).?);
     try t.expectEqual(@as(?[]const u8, null), resolveSession(.{ .explicit = "" }));
     try t.expectEqualStrings("explicit", resolveSession(.{ .explicit = "explicit" }).?);

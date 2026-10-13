@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const c = @import("../c.zig").c;
+const EnvSave = @import("../util/env.zig").Saved;
 const clock = @import("../util/clock.zig");
 const platform = @import("../util/platform.zig");
 const SpinLock = @import("../util/spinlock.zig").SpinLock;
@@ -2246,22 +2247,13 @@ test "mcp isolation dir: durable is named, ephemeral is pid-based" {
     const t = std.testing;
     const allocator = t.allocator;
 
-    const saved = if (c.getenv("XDG_RUNTIME_DIR")) |v|
-        try allocator.dupe(u8, std.mem.span(@as([*:0]const u8, @ptrCast(v))))
-    else
-        null;
-    defer if (saved) |s| allocator.free(s);
+    var saved: EnvSave = .{};
     var root_buf: [128]u8 = undefined;
     const root = try std.fmt.bufPrintZ(&root_buf, "/tmp/sk-mcp-iso-{d}", .{c.getpid()});
     _ = c.mkdir(root.ptr, 0o700);
-    _ = c.setenv("XDG_RUNTIME_DIR", root.ptr, 1);
+    try saved.override("XDG_RUNTIME_DIR", root.ptr);
     defer {
-        if (saved) |s| {
-            var z: [4096]u8 = undefined;
-            if (std.fmt.bufPrintZ(&z, "{s}", .{s})) |sz| {
-                _ = c.setenv("XDG_RUNTIME_DIR", sz.ptr, 1);
-            } else |_| {}
-        } else _ = c.unsetenv("XDG_RUNTIME_DIR");
+        saved.restore();
         var cmd: [256]u8 = undefined;
         if (std.fmt.bufPrintZ(&cmd, "rm -rf -- '{s}'", .{root})) |cz| _ = c.system(cz.ptr) else |_| {}
     }
@@ -2417,13 +2409,14 @@ test "tuning defText: built-in vs project override" {
 
 test "tuning load reads and clamps env overrides" {
     const t = std.testing;
+    var saved: EnvSave = .{};
+    try saved.override("SKETERM_MCP_HOLD_MS", "250");
     // Restore the global regardless of outcome — other tests read it.
     defer {
         Tuning.hold_ms.value = Tuning.hold_ms.built_in;
         Tuning.hold_ms.overridden = false;
-        _ = c.unsetenv("SKETERM_MCP_HOLD_MS");
+        saved.restore();
     }
-    _ = c.setenv("SKETERM_MCP_HOLD_MS", "250", 1);
     Tuning.loadOne(&Tuning.hold_ms);
     try t.expectEqual(@as(i64, 250), Tuning.hold_ms.value);
     try t.expect(Tuning.hold_ms.overridden);

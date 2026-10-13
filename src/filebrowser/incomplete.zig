@@ -10,6 +10,7 @@ const c = @import("../c.zig").c;
 const atomicwrite = @import("../util/atomicwrite.zig");
 const readfile = @import("../util/readfile.zig");
 const profile = @import("../util/profile.zig");
+const EnvSave = @import("../util/env.zig").Saved;
 
 /// Cap on this state file. Past it there is no usable record to read,
 /// and the cap is what stops a doctored one exhausting memory.
@@ -158,16 +159,9 @@ test "incomplete: record, match, clear round-trip" {
         _ = c.rmdir(d.ptr);
         _ = c.rmdir(dir.ptr);
     }
-    const old = profile.getenv("XDG_STATE_HOME");
-    _ = c.setenv("XDG_STATE_HOME", dir.ptr, 1);
-    defer if (old) |o| {
-        var ob: [4096:0]u8 = undefined;
-        if (std.fmt.bufPrintZ(&ob, "{s}", .{o})) |z| {
-            _ = c.setenv("XDG_STATE_HOME", z.ptr, 1);
-        } else |_| {}
-    } else {
-        _ = c.unsetenv("XDG_STATE_HOME");
-    };
+    var saved: EnvSave = .{};
+    try saved.override("XDG_STATE_HOME", dir.ptr);
+    defer saved.restore();
 
     try t.expect(!match(t.allocator, "gobelijn", "/a", "", "/b"));
     try record(t.allocator, "gobelijn", "/a", "", "/b");

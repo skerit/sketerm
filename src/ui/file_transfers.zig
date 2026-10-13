@@ -20,6 +20,7 @@
 
 const std = @import("std");
 const c = @import("../c.zig").c;
+const EnvSave = @import("../util/env.zig").Saved;
 const muxclient = @import("../mux/client.zig");
 const wire = @import("../mux/wire.zig");
 const store = @import("../filebrowser/transfers.zig");
@@ -3365,24 +3366,13 @@ test "a durable batch materializes deterministic child records" {
 
         fn refresh(_: *anyopaque) void {}
     };
-    const old_state = if (@import("../util/profile.zig").getenv("XDG_STATE_HOME")) |value|
-        try t.allocator.dupe(u8, value)
-    else
-        null;
-    defer {
-        if (old_state) |value| {
-            var z: [4096:0]u8 = undefined;
-            if (std.fmt.bufPrintZ(&z, "{s}", .{value})) |state| _ = c.setenv("XDG_STATE_HOME", state.ptr, 1) else |_| {}
-            t.allocator.free(value);
-        } else {
-            _ = c.unsetenv("XDG_STATE_HOME");
-        }
-    }
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var state_buf: [4096:0]u8 = undefined;
     const state = try std.fmt.bufPrintZ(&state_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
-    _ = c.setenv("XDG_STATE_HOME", state.ptr, 1);
+    var saved_state: EnvSave = .{};
+    try saved_state.override("XDG_STATE_HOME", state.ptr);
+    defer saved_state.restore();
 
     var service = Service{ .allocator = t.allocator };
     var service_owned = true;
@@ -3541,25 +3531,13 @@ test "cancellation retains an unresolved submitted attempt" {
 
 test "recovered retry waits and repeated transport loss spends one bounded attempt" {
     const t = std.testing;
-    const old = if (c.getenv("XDG_STATE_HOME")) |value|
-        try t.allocator.dupe(u8, std.mem.span(@as([*:0]const u8, @ptrCast(value))))
-    else
-        null;
-    defer {
-        if (old) |value| {
-            var z: [4096:0]u8 = undefined;
-            const restored = std.fmt.bufPrintZ(&z, "{s}", .{value}) catch unreachable;
-            _ = c.setenv("XDG_STATE_HOME", restored.ptr, 1);
-            t.allocator.free(value);
-        } else {
-            _ = c.unsetenv("XDG_STATE_HOME");
-        }
-    }
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
     var state_buf: [4096:0]u8 = undefined;
     const state = try std.fmt.bufPrintZ(&state_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
-    _ = c.setenv("XDG_STATE_HOME", state.ptr, 1);
+    var saved_state: EnvSave = .{};
+    try saved_state.override("XDG_STATE_HOME", state.ptr);
+    defer saved_state.restore();
 
     var service = Service{ .allocator = t.allocator };
     const handle = (try store.open(t.allocator, .intent, "retry-test")).?;
@@ -3660,25 +3638,13 @@ test "direct transport loss waits and exhausts the same retry budget" {
 
 test "unresolved cancellation retains both recovery ledgers" {
     const t = std.testing;
-    const old = if (c.getenv("XDG_STATE_HOME")) |value|
-        try t.allocator.dupe(u8, std.mem.span(@as([*:0]const u8, @ptrCast(value))))
-    else
-        null;
-    defer {
-        if (old) |value| {
-            var z: [4096:0]u8 = undefined;
-            const restored = std.fmt.bufPrintZ(&z, "{s}", .{value}) catch unreachable;
-            _ = c.setenv("XDG_STATE_HOME", restored.ptr, 1);
-            t.allocator.free(value);
-        } else {
-            _ = c.unsetenv("XDG_STATE_HOME");
-        }
-    }
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
     var state_buf: [4096:0]u8 = undefined;
     const state = try std.fmt.bufPrintZ(&state_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
-    _ = c.setenv("XDG_STATE_HOME", state.ptr, 1);
+    var saved_state: EnvSave = .{};
+    try saved_state.override("XDG_STATE_HOME", state.ptr);
+    defer saved_state.restore();
 
     var service = Service{ .allocator = t.allocator, .shutting_down = true };
     const handle = (try store.open(t.allocator, .intent, "cancel-unresolved")).?;
@@ -3737,25 +3703,13 @@ test "repeated cancellation keeps an unresolved mediated recovery" {
 
 test "canceling a scheduled daemon retry durably rotates cleanup identity" {
     const t = std.testing;
-    const old_state = if (c.getenv("XDG_STATE_HOME")) |value|
-        try t.allocator.dupe(u8, std.mem.span(@as([*:0]const u8, @ptrCast(value))))
-    else
-        null;
-    defer {
-        if (old_state) |value| {
-            var z: [4096:0]u8 = undefined;
-            const restored = std.fmt.bufPrintZ(&z, "{s}", .{value}) catch unreachable;
-            _ = c.setenv("XDG_STATE_HOME", restored.ptr, 1);
-            t.allocator.free(value);
-        } else {
-            _ = c.unsetenv("XDG_STATE_HOME");
-        }
-    }
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
     var state_buf: [4096:0]u8 = undefined;
     const state = try std.fmt.bufPrintZ(&state_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
-    _ = c.setenv("XDG_STATE_HOME", state.ptr, 1);
+    var saved_state: EnvSave = .{};
+    try saved_state.override("XDG_STATE_HOME", state.ptr);
+    defer saved_state.restore();
 
     var service = Service{ .allocator = t.allocator, .shutting_down = true };
     const handle = (try store.open(t.allocator, .intent, "cancel-scheduled")).?;
@@ -3875,25 +3829,13 @@ pub fn release(service: *Service, notify_ctx: *anyopaque) void {
 
 test "a browser copy's record moves through legal phases and is admitted process-wide" {
     const t = std.testing;
-    const old_state = if (c.getenv("XDG_STATE_HOME")) |value|
-        try t.allocator.dupe(u8, std.mem.span(@as([*:0]const u8, @ptrCast(value))))
-    else
-        null;
-    defer {
-        if (old_state) |value| {
-            var z: [4096:0]u8 = undefined;
-            const restored = std.fmt.bufPrintZ(&z, "{s}", .{value}) catch unreachable;
-            _ = c.setenv("XDG_STATE_HOME", restored.ptr, 1);
-            t.allocator.free(value);
-        } else {
-            _ = c.unsetenv("XDG_STATE_HOME");
-        }
-    }
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
     var state_buf: [4096:0]u8 = undefined;
     const state = try std.fmt.bufPrintZ(&state_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
-    _ = c.setenv("XDG_STATE_HOME", state.ptr, 1);
+    var saved_state: EnvSave = .{};
+    try saved_state.override("XDG_STATE_HOME", state.ptr);
+    defer saved_state.restore();
 
     var service = Service{ .allocator = t.allocator, .shutting_down = true };
     defer {

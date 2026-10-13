@@ -3559,7 +3559,9 @@ test "new panel event epochs have the session-origin shape and do not repeat" {
 test "a sessionless panel-show and a sessionless store operation agree on the key" {
     // `resolveSession` consults the environment, and this test may well
     // be run from inside a sketerm pane.
-    _ = c.unsetenv("SKETERM_SESSION");
+    var saved: @import("../util/env.zig").Saved = .{};
+    try saved.take("SKETERM_SESSION");
+    defer saved.restore();
 
     // What panel-show scopes to with neither an explicit session nor a
     // pane to inherit one from...

@@ -1871,14 +1871,9 @@ test "web_helper_open: missing helper is a described refusal, a spawn bridges a 
 
     // The env pin is authoritative (findbin); tests running inside a
     // sketerm pane inherit real env, so save + restore it exactly.
-    const saved = if (c.getenv("SKETERM_WEB_BIN")) |v| std.mem.span(v) else null;
-    defer {
-        if (saved) |v| {
-            var buf: [4096:0]u8 = undefined;
-            const z = std.fmt.bufPrintZ(&buf, "{s}", .{v}) catch unreachable;
-            _ = c.setenv("SKETERM_WEB_BIN", z.ptr, 1);
-        } else _ = c.unsetenv("SKETERM_WEB_BIN");
-    }
+    var saved: @import("../util/env.zig").Saved = .{};
+    try saved.take("SKETERM_WEB_BIN");
+    defer saved.restore();
 
     const Pump = struct {
         fn next(dm: *Daemon, cn: *muxclient.Conn) !muxclient.Conn.OwnedFrame {

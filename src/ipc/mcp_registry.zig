@@ -599,31 +599,20 @@ fn containsPid(entries: []const Entry, pid: c.pid_t) bool {
 
 const ScopedRuntime = struct {
     allocator: std.mem.Allocator,
-    saved: ?[]u8,
+    saved: @import("../util/env.zig").Saved = .{},
     path: []u8,
 
     fn init(allocator: std.mem.Allocator, suffix: []const u8) !ScopedRuntime {
-        const saved = if (c.getenv("XDG_RUNTIME_DIR")) |value|
-            try allocator.dupe(u8, std.mem.span(@as([*:0]const u8, @ptrCast(value))))
-        else
-            null;
         const path = try std.fmt.allocPrint(allocator, "/tmp/sketerm-mcp-registry-{d}-{s}", .{ c.getpid(), suffix });
         var z: [4096]u8 = undefined;
         _ = c.mkdir(try pathZ(&z, path), 0o700);
-        _ = c.setenv("XDG_RUNTIME_DIR", try pathZ(&z, path), 1);
-        return .{ .allocator = allocator, .saved = saved, .path = path };
+        var self: ScopedRuntime = .{ .allocator = allocator, .path = path };
+        try self.saved.override("XDG_RUNTIME_DIR", try pathZ(&z, path));
+        return self;
     }
 
     fn deinit(self: *ScopedRuntime) void {
-        var z: [4096]u8 = undefined;
-        if (self.saved) |saved| {
-            if (pathZ(&z, saved)) |saved_z| {
-                _ = c.setenv("XDG_RUNTIME_DIR", saved_z, 1);
-            } else |_| {}
-            self.allocator.free(saved);
-        } else {
-            _ = c.unsetenv("XDG_RUNTIME_DIR");
-        }
+        self.saved.restore();
         pathz.removeTree(self.path);
         self.allocator.free(self.path);
     }

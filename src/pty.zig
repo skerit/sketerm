@@ -705,12 +705,12 @@ test "writeAll reports hard failures without silently losing input" {
 test "spawn: pane identity not exported is ABSENT in the child, never inherited" {
     // The spawning process stands in for a daemon started from inside a
     // pane: it carries a pane identity the child must not see.
+    var saved: @import("util/env.zig").SavedSet(&.{ "SKETERM_PANE_ID", "SKETERM_SESSION", "SKETERM_SOCKET" }) = .{};
+    try saved.take();
+    defer saved.restore();
     _ = c.setenv("SKETERM_PANE_ID", "10", 1);
     _ = c.setenv("SKETERM_SESSION", "s1-10", 1);
     _ = c.setenv("SKETERM_SOCKET", "/nonexistent/gui.sock", 1);
-    defer _ = c.unsetenv("SKETERM_PANE_ID");
-    defer _ = c.unsetenv("SKETERM_SESSION");
-    defer _ = c.unsetenv("SKETERM_SOCKET");
     var pty = try Pty.spawn(.{
         .argv = &.{ "/bin/sh", "-c", "echo P=${SKETERM_PANE_ID-unset} S=${SKETERM_SESSION-unset} K=${SKETERM_SOCKET-unset}" },
         .session_name = "durable-1",

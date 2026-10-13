@@ -606,29 +606,18 @@ fn splitJarDir(raw: []const u8) ?JarDir {
 const ScratchState = struct {
     tmpl: [64]u8 = undefined,
     dir: []const u8 = "",
-    saved: ?[]const u8 = null,
-    saved_buf: [4096]u8 = undefined,
+    saved: @import("../util/env.zig").Saved = .{},
 
     fn init(self: *ScratchState) !void {
         @memcpy(self.tmpl[0.."/tmp/sketerm-webprofiles-XXXXXX".len], "/tmp/sketerm-webprofiles-XXXXXX");
         self.tmpl["/tmp/sketerm-webprofiles-XXXXXX".len] = 0;
         const made = c.mkdtemp(@ptrCast(&self.tmpl)) orelse return error.SkipZigTest;
         self.dir = std.mem.span(@as([*:0]u8, @ptrCast(made)));
-        if (c.getenv("XDG_STATE_HOME")) |old| {
-            const s = std.mem.span(@as([*:0]const u8, @ptrCast(old)));
-            @memcpy(self.saved_buf[0..s.len], s);
-            self.saved_buf[s.len] = 0;
-            self.saved = self.saved_buf[0..s.len];
-        }
-        _ = c.setenv("XDG_STATE_HOME", @ptrCast(&self.tmpl), 1);
+        try self.saved.override("XDG_STATE_HOME", @ptrCast(&self.tmpl));
     }
 
     fn deinit(self: *ScratchState) void {
-        if (self.saved) |_| {
-            _ = c.setenv("XDG_STATE_HOME", @ptrCast(&self.saved_buf), 1);
-        } else {
-            _ = c.unsetenv("XDG_STATE_HOME");
-        }
+        self.saved.restore();
         pathz.removeTree(self.dir);
     }
 };

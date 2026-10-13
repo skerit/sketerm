@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const c = @import("../c.zig").c;
+const EnvSave = @import("../util/env.zig").Saved;
 const wire = @import("wire.zig");
 const sockpath = @import("sockpath.zig");
 const relisten = @import("relisten.zig");
@@ -2899,8 +2900,9 @@ test "ssh config resolution spawns ssh and reads back the hostname" {
     if (c.chmod(path.ptr, 0o755) != 0) return error.SkipZigTest;
     defer _ = c.unlink(path.ptr);
 
-    _ = c.setenv("SKETERM_SSH", path.ptr, 1);
-    defer _ = c.unsetenv("SKETERM_SSH");
+    var saved: EnvSave = .{};
+    try saved.override("SKETERM_SSH", path.ptr);
+    defer saved.restore();
 
     var buf: [256]u8 = undefined;
     const target = Conn.resolveSshConfig("some-alias", &buf, nowMs() + 5_000) orelse
@@ -2930,8 +2932,9 @@ test "UDP bootstrap sends the punch line with the pre-bound port on ssh stdin" {
     defer _ = c.unlink(path.ptr);
     defer _ = c.unlink(cap.ptr);
 
-    _ = c.setenv("SKETERM_SSH", path.ptr, 1);
-    defer _ = c.unsetenv("SKETERM_SSH");
+    var saved: EnvSave = .{};
+    try saved.override("SKETERM_SSH", path.ptr);
+    defer saved.restore();
 
     try std.testing.expectError(
         error.SshTransportFailed,
@@ -2961,8 +2964,9 @@ test "UDP tickets are refused for every forced non-UDP transport" {
     try t.expect(!udpTicketEligible("ssh:box"));
     try t.expect(!udpTicketEligible("tor:box"));
 
-    _ = c.setenv("SKETERM_UDP_TICKET", "box 40000 " ++ ("ab" ** rudp.KEY_LEN), 1);
-    defer _ = c.unsetenv("SKETERM_UDP_TICKET");
+    var saved: EnvSave = .{};
+    try saved.override("SKETERM_UDP_TICKET", "box 40000 " ++ ("ab" ** rudp.KEY_LEN));
+    defer saved.restore();
     try t.expect(takeTicketFromEnv("ssh:box") == null);
     try t.expect(takeTicketFromEnv("tor:box") == null);
     // Still present for an eligible spec: the refusals above consumed nothing.
@@ -3259,8 +3263,9 @@ test "env ticket is host-matched and single-use" {
     const hex = rudp.keyToHex(key, &hexbuf);
     var val_buf: [128:0]u8 = undefined;
     const val = try std.fmt.bufPrintZ(&val_buf, "boxy 61111 {s}", .{hex});
-    _ = c.setenv("SKETERM_UDP_TICKET", val.ptr, 1);
-    defer _ = c.unsetenv("SKETERM_UDP_TICKET");
+    var saved: EnvSave = .{};
+    try saved.override("SKETERM_UDP_TICKET", val.ptr);
+    defer saved.restore();
     // A mismatched host must neither match nor consume.
     try std.testing.expect(takeTicketFromEnv("otherbox") == null);
     try std.testing.expect(c.getenv("SKETERM_UDP_TICKET") != null);

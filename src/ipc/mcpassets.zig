@@ -169,9 +169,10 @@ test "save/load/list/delete round-trip in an isolated state dir" {
     var zbuf: [4096]u8 = undefined;
     var envbuf: [160]u8 = undefined;
     const env = try std.fmt.bufPrintZ(&envbuf, "{s}", .{dir});
-    _ = c.setenv("XDG_STATE_HOME", env, 1);
+    var saved: @import("../util/env.zig").Saved = .{};
+    try saved.override("XDG_STATE_HOME", env);
     defer {
-        _ = c.unsetenv("XDG_STATE_HOME");
+        saved.restore();
         if (std.fmt.bufPrintZ(&zbuf, "{s}/sketerm/macros", .{dir})) |macros| {
             _ = c.rmdir(macros.ptr);
         } else |_| {}

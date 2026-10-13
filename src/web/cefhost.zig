@@ -233,14 +233,9 @@ fn effectiveWindowlessFps(max_fps: u16) c_int {
 }
 
 test "explicit view caps override the measurement knob without changing uncapped GUI defaults" {
-    const saved = if (c.getenv("SKETERM_WEB_WFPS")) |v| try std.testing.allocator.dupeZ(u8, std.mem.span(v)) else null;
-    defer if (saved) |v| {
-        _ = c.setenv("SKETERM_WEB_WFPS", v.ptr, 1);
-        std.testing.allocator.free(v);
-    } else {
-        _ = c.unsetenv("SKETERM_WEB_WFPS");
-    };
-    _ = c.unsetenv("SKETERM_WEB_WFPS");
+    var saved: @import("../util/env.zig").Saved = .{};
+    try saved.take("SKETERM_WEB_WFPS");
+    defer saved.restore();
     try std.testing.expectEqual(@as(c_int, 240), effectiveWindowlessFps(0));
     _ = c.setenv("SKETERM_WEB_WFPS", "240", 1);
     for ([_]u16{ 15, 30, 60, proto.MAX_VIEW_FPS }) |fps|

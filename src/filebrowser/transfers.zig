@@ -489,37 +489,31 @@ pub fn retireLegacy(allocator: std.mem.Allocator) bool {
 
 // ── tests ───────────────────────────────────────────────────────
 
+const EnvSave = @import("../util/env.zig").Saved;
+
 const TmpState = struct {
     dir: std.testing.TmpDir,
-    old: ?[]u8,
+    saved: EnvSave = .{},
 
-    fn init(allocator: std.mem.Allocator) !TmpState {
-        const old = if (profile.getenv("XDG_STATE_HOME")) |v| try allocator.dupe(u8, v) else null;
-        var tmp = std.testing.tmpDir(.{});
+    fn init() !TmpState {
+        var self: TmpState = .{ .dir = std.testing.tmpDir(.{}) };
+        errdefer self.dir.cleanup();
         var state_buf: [4096:0]u8 = undefined;
-        const state = try std.fmt.bufPrintZ(&state_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
-        _ = c.setenv("XDG_STATE_HOME", state.ptr, 1);
-        return .{ .dir = tmp, .old = old };
+        const state = try std.fmt.bufPrintZ(&state_buf, ".zig-cache/tmp/{s}", .{&self.dir.sub_path});
+        try self.saved.override("XDG_STATE_HOME", state.ptr);
+        return self;
     }
 
-    fn deinit(self: *TmpState, allocator: std.mem.Allocator) void {
-        if (self.old) |v| {
-            var z: [4096:0]u8 = undefined;
-            if (std.fmt.bufPrintZ(&z, "{s}", .{v})) |s| {
-                _ = c.setenv("XDG_STATE_HOME", s.ptr, 1);
-            } else |_| {}
-            allocator.free(v);
-        } else {
-            _ = c.unsetenv("XDG_STATE_HOME");
-        }
+    fn deinit(self: *TmpState) void {
+        self.saved.restore();
         self.dir.cleanup();
     }
 };
 
 test "a record round trips through its own file" {
     const t = std.testing;
-    var tmp = try TmpState.init(t.allocator);
-    defer tmp.deinit(t.allocator);
+    var tmp = try TmpState.init();
+    defer tmp.deinit();
 
     var h = (try open(t.allocator, .intent, "abc")) orelse return error.LockBusy;
     defer _ = h.destroyRecord();
@@ -545,8 +539,8 @@ test "a record round trips through its own file" {
 
 test "an owned record cannot be taken by a second owner" {
     const t = std.testing;
-    var tmp = try TmpState.init(t.allocator);
-    defer tmp.deinit(t.allocator);
+    var tmp = try TmpState.init();
+    defer tmp.deinit();
 
     var h = (try open(t.allocator, .intent, "held")) orelse return error.LockBusy;
     try h.write(.{ .intent = .{ .token = "held" } });
@@ -564,8 +558,8 @@ test "an owned record cannot be taken by a second owner" {
 
 test "a client-mediated record carries what its driver needs to resume" {
     const t = std.testing;
-    var tmp = try TmpState.init(t.allocator);
-    defer tmp.deinit(t.allocator);
+    var tmp = try TmpState.init();
+    defer tmp.deinit();
 
     var h = (try open(t.allocator, .intent, "med")) orelse return error.LockBusy;
     defer _ = h.destroyRecord();
@@ -593,8 +587,8 @@ test "a client-mediated record carries what its driver needs to resume" {
 
 test "a batch manifest round trips deterministic child identities" {
     const t = std.testing;
-    var tmp = try TmpState.init(t.allocator);
-    defer tmp.deinit(t.allocator);
+    var tmp = try TmpState.init();
+    defer tmp.deinit();
 
     var h = (try open(t.allocator, .batch, "batch-one")) orelse return error.LockBusy;
     defer _ = h.destroyRecord();
@@ -624,8 +618,8 @@ test "a batch manifest round trips deterministic child identities" {
 
 test "a queued browser move persists its recovery identity" {
     const t = std.testing;
-    var tmp = try TmpState.init(t.allocator);
-    defer tmp.deinit(t.allocator);
+    var tmp = try TmpState.init();
+    defer tmp.deinit();
 
     var h = (try open(t.allocator, .intent, "move-record")) orelse return error.LockBusy;
     defer _ = h.destroyRecord();
@@ -672,8 +666,8 @@ test "ledger v6 excludes older writers while retaining v2 recovery" {
 
 test "list reports every record identity in the ledger directory" {
     const t = std.testing;
-    var tmp = try TmpState.init(t.allocator);
-    defer tmp.deinit(t.allocator);
+    var tmp = try TmpState.init();
+    defer tmp.deinit();
 
     var a = (try open(t.allocator, .intent, "one")) orelse return error.LockBusy;
     defer _ = a.destroyRecord();
@@ -696,8 +690,8 @@ test "list reports every record identity in the ledger directory" {
 
 test "a record write is skipped when nothing changed" {
     const t = std.testing;
-    var tmp = try TmpState.init(t.allocator);
-    defer tmp.deinit(t.allocator);
+    var tmp = try TmpState.init();
+    defer tmp.deinit();
 
     var h = (try open(t.allocator, .intent, "same")) orelse return error.LockBusy;
     defer _ = h.destroyRecord();
@@ -711,8 +705,8 @@ test "a record write is skipped when nothing changed" {
 
 test "the legacy ledger is readable and retirable" {
     const t = std.testing;
-    var tmp = try TmpState.init(t.allocator);
-    defer tmp.deinit(t.allocator);
+    var tmp = try TmpState.init();
+    defer tmp.deinit();
 
     const path = try legacyPath(t.allocator);
     defer t.allocator.free(path);

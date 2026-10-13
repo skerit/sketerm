@@ -241,28 +241,14 @@ test "crashlog: a too-small buffer still reports the signal" {
 }
 
 test "crashlog: the log path resolves under XDG_STATE_HOME and opens" {
-    // Restore the ambient value: later tests in this binary read it too.
-    var saved_buf: [4096]u8 = undefined;
-    const saved: ?[]const u8 = if (std.c.getenv("XDG_STATE_HOME")) |v|
-        std.fmt.bufPrint(&saved_buf, "{s}", .{std.mem.span(v)}) catch null
-    else
-        null;
-    defer {
-        if (saved) |s| {
-            var z: [4096]u8 = undefined;
-            if (std.fmt.bufPrintZ(&z, "{s}", .{s})) |zz| {
-                _ = c.setenv("XDG_STATE_HOME", zz.ptr, 1);
-            } else |_| {}
-        } else {
-            _ = c.unsetenv("XDG_STATE_HOME");
-        }
-    }
-
     var dir_buf: [256]u8 = undefined;
     const dir = try std.fmt.bufPrintZ(&dir_buf, "/tmp/sketerm-crashlog-test-{d}", .{c.getpid()});
     _ = c.mkdir(dir.ptr, 0o700);
     defer @import("pathz.zig").removeTree(dir);
-    _ = c.setenv("XDG_STATE_HOME", dir.ptr, 1);
+    // Restore the ambient value: later tests in this binary read it too.
+    var saved: @import("env.zig").Saved = .{};
+    try saved.override("XDG_STATE_HOME", dir.ptr);
+    defer saved.restore();
     var buf: [4096]u8 = undefined;
     const path = defaultPath(&buf) orelse return error.NoPath;
     try t.expect(std.mem.endsWith(u8, path, "/sketerm/crash.log"));

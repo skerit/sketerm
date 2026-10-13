@@ -102,13 +102,9 @@ test "only a named MCP instance daemon hosts a browser engine" {
 
 test "the engine linger TTL reads its override and falls back on nonsense" {
     const t = std.testing;
-    const saved = c.getenv("SKETERM_WEB_LINGER_MS");
-    defer if (saved) |v| {
-        _ = c.setenv("SKETERM_WEB_LINGER_MS", v, 1);
-    } else {
-        _ = c.unsetenv("SKETERM_WEB_LINGER_MS");
-    };
-    _ = c.unsetenv("SKETERM_WEB_LINGER_MS");
+    var saved: @import("../util/env.zig").Saved = .{};
+    try saved.take("SKETERM_WEB_LINGER_MS");
+    defer saved.restore();
     try t.expectEqual(@as(i64, 180_000), engineLingerMs());
     _ = c.setenv("SKETERM_WEB_LINGER_MS", "2500", 1);
     try t.expectEqual(@as(i64, 2500), engineLingerMs());

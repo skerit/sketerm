@@ -5037,12 +5037,13 @@ test "wait cleanup tolerates a view destroyed while the operation ran" {
 // FRAMES, because context publication has no ack and its correctness IS
 // the byte order on the wire.
 
+const EnvSave = @import("../util/env.zig").Saved;
+
 const Pair = struct {
     eng: Engine,
     peer: c_int = -1,
     tmpl: [64]u8 = undefined,
-    saved_state: ?[]const u8 = null,
-    saved_buf: [4096]u8 = undefined,
+    saved_state: EnvSave = .{},
 
     fn init(gpa: std.mem.Allocator) !Pair {
         var self = Pair{ .eng = undefined };
@@ -5050,13 +5051,8 @@ const Pair = struct {
         self.tmpl["/tmp/sketerm-webdrive-XXXXXX".len] = 0;
         const made = c.mkdtemp(@ptrCast(&self.tmpl)) orelse return error.SkipZigTest;
         _ = made;
-        if (c.getenv("XDG_STATE_HOME")) |old| {
-            const s = std.mem.span(@as([*:0]const u8, @ptrCast(old)));
-            @memcpy(self.saved_buf[0..s.len], s);
-            self.saved_buf[s.len] = 0;
-            self.saved_state = self.saved_buf[0..s.len];
-        }
-        _ = c.setenv("XDG_STATE_HOME", @ptrCast(&self.tmpl), 1);
+        try self.saved_state.override("XDG_STATE_HOME", @ptrCast(&self.tmpl));
+        errdefer self.saved_state.restore();
 
         var fds: [2]c_int = undefined;
         if (c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &fds) != 0) return error.SkipZigTest;
@@ -5103,11 +5099,7 @@ const Pair = struct {
     fn deinit(self: *Pair) void {
         self.eng.deinit();
         if (self.peer >= 0) _ = c.close(self.peer);
-        if (self.saved_state != null) {
-            _ = c.setenv("XDG_STATE_HOME", @ptrCast(&self.saved_buf), 1);
-        } else {
-            _ = c.unsetenv("XDG_STATE_HOME");
-        }
+        self.saved_state.restore();
         pathz.removeTree(self.stateDir());
     }
 
@@ -6932,32 +6924,14 @@ test "untrusted opens never switch an ordinary helper or loosen a live policy" {
     try std.testing.expectEqual(State.idle, pair.eng.state);
 }
 
-/// Sets one environment variable for a test and restores it.
-const EnvPin = struct {
-    name: [*:0]const u8,
-    saved: ?[:0]u8 = null,
-
-    fn set(name: [*:0]const u8, value: ?[*:0]const u8) !EnvPin {
-        var pin = EnvPin{ .name = name };
-        if (c.getenv(name)) |old| pin.saved = try std.testing.allocator.dupeZ(u8, std.mem.span(@as([*:0]const u8, @ptrCast(old))));
-        if (value) |v| _ = c.setenv(name, v, 1) else _ = c.unsetenv(name);
-        return pin;
-    }
-
-    fn restore(self: *EnvPin) void {
-        if (self.saved) |old| {
-            _ = c.setenv(self.name, old.ptr, 1);
-            std.testing.allocator.free(old);
-        } else _ = c.unsetenv(self.name);
-    }
-};
-
 test "a leftover private root never blocks the next untrusted launch and is never deleted here" {
     var pair = try Pair.init(std.testing.allocator);
     defer pair.deinit();
-    var runtime = try EnvPin.set("XDG_RUNTIME_DIR", @ptrCast(&pair.tmpl));
+    var runtime: EnvSave = .{};
+    try runtime.override("XDG_RUNTIME_DIR", @ptrCast(&pair.tmpl));
     defer runtime.restore();
-    var bin = try EnvPin.set("SKETERM_WEB_BIN", "/nonexistent/sketerm-webengine");
+    var bin: EnvSave = .{};
+    try bin.override("SKETERM_WEB_BIN", "/nonexistent/sketerm-webengine");
     defer bin.restore();
     pair.eng.untrusted = true;
     var parent_buf: [4096]u8 = undefined;
@@ -6983,9 +6957,11 @@ test "a runtime dir too long for Chromium's singleton socket fails the launch cl
     var deep: [256:0]u8 = undefined;
     const dir = try std.fmt.bufPrintZ(&deep, "{s}/{s}", .{ pair.stateDir(), "r" ** 40 });
     try std.testing.expectEqual(@as(c_int, 0), c.mkdir(dir.ptr, 0o700));
-    var runtime = try EnvPin.set("XDG_RUNTIME_DIR", dir.ptr);
+    var runtime: EnvSave = .{};
+    try runtime.override("XDG_RUNTIME_DIR", dir.ptr);
     defer runtime.restore();
-    var bin = try EnvPin.set("SKETERM_WEB_BIN", "/bin/sh");
+    var bin: EnvSave = .{};
+    try bin.override("SKETERM_WEB_BIN", "/bin/sh");
     defer bin.restore();
     pair.eng.untrusted = true;
     pair.eng.stopUntrusted();
@@ -7121,9 +7097,10 @@ test "inherited descriptors become close-on-exec on every fallback path" {
 
 test "untrusted child environment drops desktop, bus, agent and sketerm endpoints" {
     const names = [_][*:0]const u8{ "SKETERM_MUX_SOCKET", "SKETERM_WEB_WREQ_TIMEOUT_MS", "DBUS_SESSION_BUS_ADDRESS", "WAYLAND_DISPLAY", "SSH_AUTH_SOCK", "SKETERM_WEB_GPU", "SKETERM_UNIT_KEEP" };
-    var pins: [names.len]EnvPin = undefined;
-    for (names, 0..) |n, i| pins[i] = try EnvPin.set(n, "x");
-    defer for (&pins) |*p| p.restore();
+    var pins: @import("../util/env.zig").SavedSet(&names) = .{};
+    try pins.take();
+    defer pins.restore();
+    for (names) |n| _ = c.setenv(n, "x", 1);
     var env = try ChildEnv.build(std.testing.allocator, &untrusted_env.dropped, &untrusted_env.sets);
     defer env.deinit();
     var seen = std.StringHashMap([]const u8).init(std.testing.allocator);

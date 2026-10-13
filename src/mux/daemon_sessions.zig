@@ -1045,15 +1045,13 @@ test "broker list answers an allocation failure instead of dropping the reply" {
 test "the list reply reports this host's live MCP servers and their agents" {
     const t = std.testing;
     const a = t.allocator;
-    const saved = c.getenv("XDG_RUNTIME_DIR");
-    var saved_buf: [4096]u8 = undefined;
-    const saved_copy: ?[:0]const u8 = if (saved) |s| try std.fmt.bufPrintZ(&saved_buf, "{s}", .{std.mem.span(@as([*:0]const u8, @ptrCast(s)))}) else null;
     var rt_buf: [128]u8 = undefined;
     const rt = try std.fmt.bufPrintZ(&rt_buf, "/tmp/sketerm-list-assistants-{d}", .{c.getpid()});
     _ = c.mkdir(rt.ptr, 0o700);
-    _ = c.setenv("XDG_RUNTIME_DIR", rt.ptr, 1);
+    var saved: @import("../util/env.zig").Saved = .{};
+    try saved.override("XDG_RUNTIME_DIR", rt.ptr);
     defer {
-        if (saved_copy) |s| _ = c.setenv("XDG_RUNTIME_DIR", s.ptr, 1) else _ = c.unsetenv("XDG_RUNTIME_DIR");
+        saved.restore();
         pathz.removeTree(rt);
     }
     var sock_buf: [256]u8 = undefined;

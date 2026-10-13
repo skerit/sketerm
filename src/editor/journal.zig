@@ -689,30 +689,25 @@ pub fn prune(alloc: Allocator, max_age_ms: i64) !usize {
 // ======================================================================
 
 const testing = std.testing;
+const EnvSave = @import("../util/env.zig").Saved;
 
 /// Point the journal at a scratch directory for the duration of a test.
 const ScopedDir = struct {
-    saved: ?[]u8,
+    saved: EnvSave = .{},
     path: []u8,
     alloc: Allocator,
 
     fn init(alloc: Allocator, name: []const u8) !ScopedDir {
-        const saved: ?[]u8 = if (getenv("XDG_STATE_HOME")) |v| try alloc.dupe(u8, v) else null;
         const path = try std.fmt.allocPrint(alloc, "/tmp/sketerm-journal-test-{d}-{s}", .{ c.getpid(), name });
         var z: [4096]u8 = undefined;
         _ = c.mkdir(try pathz.pathZ(&z, path), 0o700);
-        _ = c.setenv("XDG_STATE_HOME", try pathz.pathZ(&z, path), 1);
-        return .{ .saved = saved, .path = path, .alloc = alloc };
+        var self: ScopedDir = .{ .path = path, .alloc = alloc };
+        try self.saved.override("XDG_STATE_HOME", try pathz.pathZ(&z, path));
+        return self;
     }
 
     fn deinit(self: *ScopedDir) void {
-        var z: [4096]u8 = undefined;
-        if (self.saved) |v| {
-            _ = c.setenv("XDG_STATE_HOME", pathz.pathZ(&z, v) catch "", 1);
-            self.alloc.free(v);
-        } else {
-            _ = c.unsetenv("XDG_STATE_HOME");
-        }
+        self.saved.restore();
         // Best-effort recursive cleanup of the scratch tree.
         var cmd_buf: [4200]u8 = undefined;
         const cmd = std.fmt.bufPrintZ(&cmd_buf, "rm -rf '{s}'", .{self.path}) catch {

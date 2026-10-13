@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const c = @import("../c.zig").c;
+const EnvSave = @import("../util/env.zig").Saved;
 const atomicwrite = @import("../util/atomicwrite.zig");
 const appdrive = @import("appdrive.zig");
 const videorec = @import("../util/videorec.zig");
@@ -3320,10 +3321,11 @@ test "app_macros show re-serializes the stored macro, never echoes it" {
     const dir = std.mem.span(@as([*:0]u8, @ptrCast(dir_z)));
     var envbuf: [160]u8 = undefined;
     const env = try std.fmt.bufPrintZ(&envbuf, "{s}", .{dir});
-    _ = c.setenv("XDG_STATE_HOME", env, 1);
+    var saved: EnvSave = .{};
+    try saved.override("XDG_STATE_HOME", env);
     var zbuf: [4096]u8 = undefined;
     defer {
-        _ = c.unsetenv("XDG_STATE_HOME");
+        saved.restore();
         if (std.fmt.bufPrintZ(&zbuf, "{s}/sketerm/macros/pretty.json", .{dir})) |f| {
             _ = c.unlink(f.ptr);
         } else |_| {}
