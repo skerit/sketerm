@@ -34,14 +34,16 @@ pub const Saved = struct {
     buf: [4096]u8 = undefined,
     had: bool = false,
 
+    /// @throws error.EnvValueTooLong leaving the variable untouched and `restore` a no-op.
     pub fn take(self: *Saved, name: [*:0]const u8) !void {
-        self.* = .{ .name = name };
+        self.* = .{};
         if (get(name)) |value| {
             if (value.len >= self.buf.len) return error.EnvValueTooLong;
             @memcpy(self.buf[0..value.len], value);
             self.buf[value.len] = 0;
             self.had = true;
         }
+        self.name = name;
         _ = c.unsetenv(name);
     }
 
@@ -60,6 +62,28 @@ pub const Saved = struct {
         }
     }
 };
+
+/// `Saved` for a fixed group of variables, taken together and restored
+/// in reverse order.
+pub fn SavedSet(comptime names: []const [*:0]const u8) type {
+    return struct {
+        slots: [names.len]Saved = @splat(.{}),
+
+        /// @throws error.EnvValueTooLong having put back the ones already taken.
+        pub fn take(self: *@This()) !void {
+            errdefer self.restore();
+            for (&self.slots, names) |*slot, name| try slot.take(name);
+        }
+
+        pub fn restore(self: *@This()) void {
+            var i = self.slots.len;
+            while (i > 0) {
+                i -= 1;
+                self.slots[i].restore();
+            }
+        }
+    };
+}
 
 test "get and nonEmpty disagree only on an empty variable" {
     const t = std.testing;
@@ -94,4 +118,37 @@ test "Saved puts back a set variable and unsets one that was unset" {
     try t.expectEqualStrings("before", get("SKETERM_TEST_ENV_SAVED").?);
     try t.expectEqual(@as(?[]const u8, null), get("SKETERM_TEST_ENV_SAVED_NONE"));
     _ = c.unsetenv("SKETERM_TEST_ENV_SAVED");
+}
+
+test "a refused take leaves the variable alone and makes restore a no-op" {
+    const t = std.testing;
+    const long = "v" ** 5000;
+    _ = c.setenv("SKETERM_TEST_ENV_LONG", long, 1);
+    defer _ = c.unsetenv("SKETERM_TEST_ENV_LONG");
+    var s: Saved = .{};
+    try t.expectError(error.EnvValueTooLong, s.take("SKETERM_TEST_ENV_LONG"));
+    s.restore();
+    try t.expectEqualStrings(long, get("SKETERM_TEST_ENV_LONG").?);
+}
+
+test "SavedSet puts back every variable, and a refused take undoes the earlier ones" {
+    const t = std.testing;
+    _ = c.setenv("SKETERM_TEST_ENV_SET_A", "a", 1);
+    _ = c.unsetenv("SKETERM_TEST_ENV_SET_B");
+    _ = c.setenv("SKETERM_TEST_ENV_SET_LONG", "v" ** 5000, 1);
+    defer _ = c.unsetenv("SKETERM_TEST_ENV_SET_A");
+    defer _ = c.unsetenv("SKETERM_TEST_ENV_SET_LONG");
+
+    var ok: SavedSet(&.{ "SKETERM_TEST_ENV_SET_A", "SKETERM_TEST_ENV_SET_B" }) = .{};
+    try ok.take();
+    try t.expectEqual(@as(?[]const u8, null), get("SKETERM_TEST_ENV_SET_A"));
+    _ = c.setenv("SKETERM_TEST_ENV_SET_B", "during", 1);
+    ok.restore();
+    try t.expectEqualStrings("a", get("SKETERM_TEST_ENV_SET_A").?);
+    try t.expectEqual(@as(?[]const u8, null), get("SKETERM_TEST_ENV_SET_B"));
+
+    var refused: SavedSet(&.{ "SKETERM_TEST_ENV_SET_A", "SKETERM_TEST_ENV_SET_LONG" }) = .{};
+    try t.expectError(error.EnvValueTooLong, refused.take());
+    try t.expectEqualStrings("a", get("SKETERM_TEST_ENV_SET_A").?);
+    try t.expectEqual(@as(usize, 5000), get("SKETERM_TEST_ENV_SET_LONG").?.len);
 }
