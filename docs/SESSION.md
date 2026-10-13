@@ -22756,3 +22756,25 @@ asserts `device` on sketerm's own display.
 `xdg.dataPath` is the one `$XDG_DATA_HOME/sketerm/<rel>` resolver; the
 webext host, the GUI's extension store and GM_* values used three
 hand-copied versions of it.
+
+## 2026-10-13: the gdk version-macros shim is generated, not vendored
+
+`vendor/aro_shims/gdk/version/gdkversionmacros.h` was a copy of the
+system header with its `#error "Only <gdk/gdk.h> ..."` guard removed
+(Aro honours `#pragma once` after that `#error` has already fired on a
+re-include). A copy of a host header drifts by construction: it carried
+4.24 macros on this 4.22 host, so `shim_drift_test.zig` kept `test` and
+`test-core` permanently red, and the bindings claimed GDK 4.24.
+
+`build.zig`'s `generateGdkShim` now produces it at make time, only for
+the GUI TranslateC step: `pkg-config --cflags-only-I gtk4` (rerun every
+build) feeds a host tool, `src/gdk_shim_gen.zig`, which finds the header
+in the first `-I` dir holding it, removes exactly the guard block, wraps
+the rest in the same `__SKETERM_SHIM_*` include guard, and names the
+header in a dep file so a GTK upgrade regenerates. A missing header or
+guard fails the build with its path. The drift test is replaced by unit
+tests of the transformation in both roots; the module include-path
+entries for `vendor/aro_shims` (which only C sources would see, and none
+includes GTK) are gone. `vendor/aro_shims/cef/uchar.h` is unchanged.
+`addHostTool` is now the one recipe for host helpers (`lint-errdefer`
+uses it too).
