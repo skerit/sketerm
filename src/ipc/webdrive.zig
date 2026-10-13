@@ -3363,11 +3363,36 @@ pub const Engine = struct {
         try self.motionReady(@min(budget_ms, 10_000));
         const v = self.findView(id) orelse return error.NoView;
         self.awaitFirstPaint(id, @min(budget_ms, 5_000));
+        const req = self.nextMotionReq(v);
+        self.send(proto.MotionScroll{ .view = id, .req = req, .x = @intCast(v.w / 2), .y = @intCast(v.h / 2), .dx = dx, .dy = dy }) catch return error.Unavailable;
+        return self.awaitMotionDone(arena, id, req, budget_ms);
+    }
+
+    /// Turn recorded idle drift on or off for view `id` (capability
+    /// "motion-drift") and wait for the helper's verdict. Turning it on
+    /// needs this engine's pack loaded; a helper without the capability
+    /// is refused HERE, because it would skip the frame unanswered.
+    pub fn motionDrift(self: *Engine, arena: std.mem.Allocator, id: u32, on: bool, budget_ms: i64) !MotionScrollOut {
+        if (!self.ensure()) return error.Unavailable;
+        if (!self.has(.motion_drift)) return error.DriftUnsupported;
+        if (on) try self.motionReady(@min(budget_ms, 10_000));
+        const v = self.findView(id) orelse return error.NoView;
+        const req = self.nextMotionReq(v);
+        self.send(proto.MotionDrift{ .view = id, .req = req, .on = @intFromBool(on) }) catch return error.Unavailable;
+        return self.awaitMotionDone(arena, id, req, budget_ms);
+    }
+
+    fn nextMotionReq(self: *Engine, v: *View) u32 {
         const req = self.next_motion_req;
         self.next_motion_req +%= 1;
         if (self.next_motion_req == 0) self.next_motion_req = 1;
         v.motion_done = null;
-        self.send(proto.MotionScroll{ .view = id, .req = req, .x = @intCast(v.w / 2), .y = @intCast(v.h / 2), .dx = dx, .dy = dy }) catch return error.Unavailable;
+        return req;
+    }
+
+    /// The `ev_motion_done` answering `req` on view `id`; its message
+    /// borrows `arena`.
+    fn awaitMotionDone(self: *Engine, arena: std.mem.Allocator, id: u32, req: u32, budget_ms: i64) !MotionScrollOut {
         const deadline = clock.nowMs() + @max(budget_ms, 1_000);
         while (true) {
             const live = self.findView(id) orelse return error.NoView;

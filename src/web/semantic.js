@@ -1221,6 +1221,8 @@
           ok: 1,
           x: Math.round(r.left + r.width / 2),
           y: Math.round(r.top + r.height / 2),
+          w: Math.round(r.width),
+          h: Math.round(r.height),
           text: String(optionText(hit)).replace(/\s+/g, " ").trim().slice(0, 120)
         });
       }
@@ -1278,6 +1280,8 @@
         custom: 1,
         x: Math.round(r.left + r.width / 2),
         y: Math.round(r.top + r.height / 2),
+        w: Math.round(r.width),
+        h: Math.round(r.height),
         msg: "custom dropdown"
       });
     }

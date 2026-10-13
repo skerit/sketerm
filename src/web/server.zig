@@ -165,6 +165,7 @@ const unconditional_caps = [_]proto.Cap{
     .view_flags,
     .motion_replay,
     .view_screen,
+    .motion_drift,
 };
 
 /// Test-only negotiation seam: an environment switch that withholds one
@@ -189,6 +190,7 @@ fn withheld(cap: proto.Cap) bool {
         .page_read => "SKETERM_WEB_DISABLE_PAGE_READ",
         .motion_replay => "SKETERM_WEB_DISABLE_MOTION_REPLAY",
         .view_screen => "SKETERM_WEB_DISABLE_VIEW_SCREEN",
+        .motion_drift => "SKETERM_WEB_DISABLE_MOTION_DRIFT",
         else => return false,
     };
     return c.getenv(env) != null;
@@ -1041,6 +1043,10 @@ pub const Server = struct {
             // client's recorded motion is never replayed for another.
             .motion_pack => self.host.motionPackChunk(cn.id, try proto.decode(proto.MotionPack, frame.payload)),
             .motion_scroll => self.host.motionScroll(cn.id, try self.dec(cn, proto.MotionScroll, frame.payload)),
+            // Idle drift is the connection's opt-in for one view, from
+            // its own pack; withheld, it is skipped as an older helper
+            // skips an unknown frame.
+            .motion_drift => if (!withheld(.motion_drift)) self.host.motionDriftSet(cn.id, try self.dec(cn, proto.MotionDrift, frame.payload)),
             .devtools_show => try self.host.devtoolsShow(try self.dec(cn, proto.DevToolsShow, frame.payload)),
             .print_pdf => self.host.printPdf(try self.dec(cn, proto.PrintPdf, frame.payload)),
             .flush_req => {

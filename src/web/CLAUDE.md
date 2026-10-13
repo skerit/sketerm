@@ -1996,10 +1996,35 @@ only the trainer records; live use never is.
   navigation-cut answers, the unchanged direct click and the no-pack
   refusal. `SKETERM_WEB_DISABLE_MOTION_REPLAY` withholds the capability
   for the old-helper path (smoke-mcp).
-- Not done: idle drift is recorded but never replayed (the plan wanted it
-  opt-in per view; no surface exists yet), custom-dropdown option picks
-  in `set_value` stay direct, and replay is headless-MCP only (the GUI's
-  own face never sends a pack).
+- **A custom-dropdown `set_value` replays BOTH clicks.** The opening reach
+  is a run whose `Done.pick_open` hands over to `semPickOption` (the
+  `pickoption` lookup, stamped `Pending.motion_t0_us`); the option's
+  `optrect` then starts the second reach (`Done.pick_option`), whose
+  completion runs `semPickChosen` with the duration since the FIRST run
+  began. Every answer of such an action goes through `postActFor`, so a
+  failure between the two still says `motion = replayed`. The direct path
+  is the same two handlers with `motion_conn = 0`.
+- **Idle drift (0xEC `motion_drift`, capability "motion-drift") is opt-in
+  per view.** `View.motion_drift` is null when off, which costs one branch
+  per poll turn. On, `pumpDrift` replays a recorded idle segment
+  (`replay.planDrift`: unscaled, whole-pixel moves, mirrored at a view
+  edge, clamped inside it; only segments a RESTING hand made,
+  `DRIFT_MAX_EXTENT_PX`) after a rest (`replay.DriftClock`), one move per
+  turn like a run. It is BLOCKED while a run exists, an action `Pending`
+  is queued (`Pending.Kind.isAction`, exhaustive so a new kind must pick
+  a side), or the view is hidden, discarded or browserless; the rest
+  restarts when the block ends. `pushPending`/`takePending` of an action,
+  `begin`, live pointer/wheel/key/IME/paste input and navigation call
+  `motionDriftYield`. Drift holds no button or key, so stopping it needs
+  no release. It is freed by `motion_drift off`, view destroy, the
+  connection dropping (`motionDropConn`), a pack cleared or replaced by
+  one without drift, and `motionDeinit`. Enabling is refused (`ok=0`) with
+  no pack or no replayable segment; `SKETERM_WEB_DISABLE_MOTION_DRIFT`
+  withholds the capability, and webdrive refuses to send the frame to a
+  helper without it (an older helper would skip it unanswered).
+- Not done: replay and drift are headless-MCP only (the GUI's own face
+  never sends a pack), and drift is set at `web_open` only (no tool turns
+  it on or off for a tab that is already open; the wire frame can).
 
 ## Rules that outlive any one change
 

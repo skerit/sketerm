@@ -1529,12 +1529,33 @@ headless helper instead replays YOUR recorded motion:
 - **Typing** (`set_value` into a text field): per-key hold and key-to-key
   times drawn from the pack's distributions for that key's position class
   (left hand, right hand, space, other), never per letter.
+- **Custom dropdowns** (`set_value` on a scripted listbox): the click that
+  opens it and the click on the option are both replayed reaches; the reply's
+  `motion_ms` covers the whole pick. A pack that disappears between the two
+  fails the action rather than clicking the option directly.
 - **Scrolling** (`web_scroll dx/dy`): the distance is split over recorded
   wheel-burst shapes, scaled so the total is exact.
 
 The reply carries `motion` (`replayed` or `direct`) and, for a replay,
 `motion_ms`: a replayed click takes hundreds of milliseconds, not ~0.
 `web_input` stays raw (it is the exact-input escape hatch).
+
+**Idle drift** (opt-in per tab). `web_open idle_drift:true` (or
+`web_motion_idle_drift = true` in `[mcp]` / `[mcp.NAME]` for every tab that
+omits it) replays the pack's recorded idle segments BETWEEN actions on that
+tab: after a rest of about one to four seconds the pointer wanders a few
+pixels from where the last action left it, as a resting hand does, and stays
+inside the viewport. Any action on the tab (replayed or direct), live input
+and navigation stop it at once, and the rest restarts when the action ends;
+it never presses anything, never runs while the tab is hidden or discarded,
+and starts only once an action has put the pointer on the page. It is OFF by
+default because a moving pointer hovers things and can open menus. It fails
+closed like replay: no pack, a pack without usable idle segments, a helper
+without the `motion-drift` capability or a GUI-backed tab refuse the open,
+and a refusal after the tab was created closes it. The reply reports
+`idle_drift`; `capabilities` reports `web_motion_idle_drift` (the default) and
+its source, `web_motion_drift` (whether the running helper advertises the
+capability) and the pack's idle segment count in `web_motion.idle`.
 
 **Selecting a pack and the default.** `sketerm mcp --web-motion-pack NAME`
 (or `web_motion_pack` in `[mcp]` / `[mcp.NAME]`) picks an installed pack;
@@ -1569,8 +1590,7 @@ Every replay is warped, jittered and time-stretched, and recently used reaches
 are excluded, but a detector that clusters behaviour server-side can learn a
 pack. A pack records ONE person's motor behaviour: using one pack for many
 unrelated accounts links those accounts behaviourally, and sharing a pack
-shares a biometric (motion and typing rhythm can identify a person). Idle
-drift is recorded but not replayed yet.
+shares a biometric (motion and typing rhythm can identify a person).
 
 ## Sub-agents (`agent_*`)
 

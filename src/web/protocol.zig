@@ -459,6 +459,12 @@ pub const CAP_VIEW_FLAGS = "view-flags";
 /// `motion = replayed` and the duration. Without a loaded pack a replay
 /// request FAILS; it never falls back to direct input.
 pub const CAP_MOTION_REPLAY = "motion-replay";
+/// The helper replays recorded IDLE DRIFT (a resting hand's wander) on
+/// a view that opted in with `motion_drift`, from the sending
+/// connection's motion pack, only between actions on that view. A
+/// client must not send `motion_drift` to a helper without it: an older
+/// helper skips the unknown frame, so the client refuses instead.
+pub const CAP_MOTION_DRIFT = "motion-drift";
 /// The helper accepts `view_screen`: the REAL monitor, toplevel and view
 /// position a client reports, served to pages as `screen.*`,
 /// `outerWidth`/`outerHeight`, `screenX`/`screenY` and the view's screen
@@ -544,6 +550,7 @@ pub const Cap = enum {
     navigation_guard,
     motion_replay,
     view_screen,
+    motion_drift,
 
     /// The wire name `hello_ack` carries.
     pub fn name(self: Cap) []const u8 {
@@ -896,12 +903,14 @@ pub const Tag = enum(u8) {
     ev_stream_open = 0xF9,
     stream_close = 0xFA,
     ev_stream_closed = 0xFB,
-    // 0xE8-0xEB: recorded-motion replay, capability "motion-replay"
-    // (see CAP_MOTION_REPLAY). 0xE6-0xE7 stay with cookie sync.
+    // 0xE8-0xEC: recorded-motion replay, capabilities "motion-replay"
+    // and "motion-drift" (see CAP_MOTION_REPLAY, CAP_MOTION_DRIFT).
+    // 0xE6-0xE7 stay with cookie sync.
     motion_pack = 0xE8,
     ev_motion_pack = 0xE9,
     motion_scroll = 0xEA,
     ev_motion_done = 0xEB,
+    motion_drift = 0xEC,
     // 0xFC-0xFF: real presentation geometry, capability "view-screen"
     // (see CAP_VIEW_SCREEN).
     view_screen = 0xFC,
@@ -2771,6 +2780,17 @@ pub const EvMotionDone = struct {
     msg: []const u8,
 };
 
+/// Turn idle drift on (`on` 1) or off (0) for `view`, from this
+/// connection's motion pack (capability `motion-drift`); answered by
+/// `ev_motion_done` with the same `req`. Enabling FAILS when the
+/// connection has no pack or the pack holds no replayable drift.
+pub const MotionDrift = struct {
+    pub const tag: Tag = .motion_drift;
+    view: u32,
+    req: u32,
+    on: u8,
+};
+
 test "motion trailing fields keep legacy bytes and decode short payloads as absent" {
     const gpa = std.testing.allocator;
     var bytes: std.ArrayList(u8) = .empty;
@@ -2796,6 +2816,13 @@ test "motion trailing fields keep legacy bytes and decode short payloads as abse
     try std.testing.expectEqual(@as(u8, 1), (try decode(SemActGuarded, bytes.items)).motion);
     try std.testing.expectEqualStrings("motion-replay", Cap.motion_replay.name());
     try std.testing.expectEqual(@as(u8, 0xE8), @intFromEnum(Tag.motion_pack));
+    try std.testing.expectEqualStrings("motion-drift", Cap.motion_drift.name());
+    try std.testing.expectEqual(@as(u8, 0xEC), @intFromEnum(Tag.motion_drift));
+    bytes.clearRetainingCapacity();
+    try encodePayload(gpa, &bytes, MotionDrift{ .view = 3, .req = 4, .on = 1 });
+    const drift = try decode(MotionDrift, bytes.items);
+    try std.testing.expectEqual(@as(u8, 1), drift.on);
+    try std.testing.expectEqual(@as(u32, 4), drift.req);
 }
 
 pub const SemExpand = struct {

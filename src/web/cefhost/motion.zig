@@ -10,6 +10,14 @@
 //! browser going away, helper shutdown) releases whatever button or key
 //! it still holds and posts a failure naming why.
 //!
+//! Idle DRIFT (capability "motion-drift") is the other per-view state:
+//! opted into per view, it replays a recorded resting-hand wander
+//! BETWEEN actions only. Anything else that touches the view (a run, a
+//! pending semantic action, live or direct input, a hidden or browserless
+//! view) stops the segment at once and restarts the rest before the
+//! next one; drift moves the pointer only and holds nothing, so being
+//! superseded needs no release.
+//!
 //! The planning is `src/motion/replay.zig` (pure); this module only
 //! turns plans into CEF input through the same senders the direct path
 //! uses.
@@ -71,6 +79,34 @@ pub const Done = union(enum) {
     /// `set_value` typing: on completion the commit read follows, which
     /// answers the action itself.
     typed: struct { sid: u32, guarded: bool, want: []u8 },
+    /// `set_value` on a custom dropdown, its opening click: on
+    /// completion the option `want` is looked up, and its pick replays
+    /// too (`pick_option`).
+    pick_open: struct { sid: u32, guarded: bool, want: []u8, conn: u32 },
+    /// The dropdown option's click: on completion the control is read
+    /// back, which answers the action with both replays' duration.
+    pick_option: struct { sid: u32, guarded: bool, picked: []u8 },
+
+    /// The `sem_act` id a failure is answered on, null for a scroll.
+    fn sid(self: Done) ?u32 {
+        return switch (self) {
+            .act => |a| a.sid,
+            .scroll => null,
+            .typed => |t| t.sid,
+            .pick_open => |p| p.sid,
+            .pick_option => |p| p.sid,
+        };
+    }
+
+    fn free(self: Done, gpa: std.mem.Allocator) void {
+        switch (self) {
+            .act => |a| gpa.free(a.msg),
+            .scroll => {},
+            .typed => |t| gpa.free(t.want),
+            .pick_open => |p| gpa.free(p.want),
+            .pick_option => |p| gpa.free(p.picked),
+        }
+    }
 };
 
 pub const Run = struct {
@@ -177,6 +213,10 @@ pub fn motionPackChunk(self: *Host, conn: u32, req: proto.MotionPack) void {
 }
 
 pub fn motionDropConn(self: *Host, conn: u32) void {
+    // Drift replays the connection's pack, which goes with it.
+    for (self.views.items) |v| {
+        if (v.motion_drift) |d| if (d.conn == conn) motionDriftFree(self, v);
+    }
     var i: usize = 0;
     while (i < self.motion_packs.items.len) {
         if (self.motion_packs.items[i].conn == conn) {
@@ -186,7 +226,10 @@ pub fn motionDropConn(self: *Host, conn: u32) void {
 }
 
 pub fn motionDeinit(self: *Host) void {
-    for (self.views.items) |v| motionCancel(self, v, "the browser helper shut down during the motion replay");
+    for (self.views.items) |v| {
+        motionCancel(self, v, "the browser helper shut down during the motion replay");
+        motionDriftFree(self, v);
+    }
     for (self.motion_packs.items) |s| s.deinit(self.gpa);
     self.motion_packs.deinit(self.gpa);
 }
@@ -197,15 +240,18 @@ fn seededRng() replay.Rng {
     return replay.Rng.init(seed);
 }
 
-fn begin(self: *Host, v: *View, steps: []Step, done: Done) void {
+/// Start `steps` on `v`. `began_us`, when set, is when an earlier run of
+/// the same action began, so the reported duration covers both.
+fn begin(self: *Host, v: *View, steps: []Step, done: Done, began_us: ?i64) void {
     motionCancel(self, v, "superseded by a newer replayed action on this view");
+    motionDriftYield(self, v);
     const run = self.gpa.create(Run) catch {
         self.gpa.free(steps);
         finishFailed(self, v, done, self.active_sem_request, 0, "out of memory starting the motion replay");
         return;
     };
     const now = clock.nowUs();
-    run.* = .{ .steps = steps, .start_us = now, .began_us = now, .client_request = self.active_sem_request, .done = done };
+    run.* = .{ .steps = steps, .start_us = now, .began_us = began_us orelse now, .client_request = self.active_sem_request, .done = done };
     v.motion_run = run;
     // A plan's first step is due at once; emit it now rather than a
     // poll turn later.
@@ -216,8 +262,22 @@ fn begin(self: *Host, v: *View, steps: []Step, done: Done) void {
 /// logical px) and, for a click, the press. `msg` is the echo the
 /// result carries; it is copied.
 pub fn motionStartPointer(self: *Host, v: *View, p: *const Pending, rect: [4]i32, click: bool, msg: []const u8) void {
-    const slot = motionPackFor(self, p.motion_conn) orelse
-        return postAct(self, v, p.sid, 0, "motion replay was asked for but this connection's motion pack is gone; nothing was clicked", 0);
+    const owned = self.gpa.dupe(u8, msg) catch
+        return postAct(self, v, p.sid, 0, "out of memory starting the motion replay", 0);
+    motionStartReach(self, v, p.motion_conn, rect, click, .{ .act = .{ .sid = p.sid, .msg = owned } }, null);
+}
+
+/// Replay a reach (and for a click, the press) onto `rect` from
+/// connection `conn`'s pack, answered through `done`, which this owns
+/// from here on: a replay that cannot start answers it as failed.
+pub fn motionStartReach(self: *Host, v: *View, conn: u32, rect: [4]i32, click: bool, done: Done, began_us: ?i64) void {
+    const failed = struct {
+        fn f(h: *Host, view: *View, d: Done, why: []const u8) void {
+            finishFailed(h, view, d, h.active_sem_request, 0, why);
+        }
+    }.f;
+    const slot = motionPackFor(self, conn) orelse
+        return failed(self, v, done, "motion replay was asked for but this connection's motion pack is gone; nothing was clicked");
     const pk = slot.pack.?;
     const vw: f64 = @floatFromInt(@max(v.w, 1));
     const vh: f64 = @floatFromInt(@max(v.h, 1));
@@ -236,11 +296,11 @@ pub fn motionStartPointer(self: *Host, v: *View, p: *const Pending, rect: [4]i32
     const from = v.motion_ptr orelse replay.entryPoint(vw, vh, .{ box[0] + box[2] / 2, box[1] + box[3] / 2 }, rng);
     const plan = replay.planReach(self.gpa, pk, slot.fitts, from, box, &slot.recent_reach, rng) catch |err| {
         const why = if (err == error.NoReaches) "motion replay was asked for but the motion pack holds no reaches; nothing was clicked" else "out of memory planning the motion replay";
-        return postAct(self, v, p.sid, 0, why, 0);
+        return failed(self, v, done, why);
     };
     defer plan.deinit(self.gpa);
     const n = plan.moves.len + @as(usize, if (click) 2 else 0);
-    const steps = self.gpa.alloc(Step, n) catch return postAct(self, v, p.sid, 0, "out of memory planning the motion replay", 0);
+    const steps = self.gpa.alloc(Step, n) catch return failed(self, v, done, "out of memory planning the motion replay");
     for (plan.moves, 0..) |m, i| steps[i] = .{ .at = m.t, .kind = .move, .x = @intFromFloat(@round(m.x)), .y = @intFromFloat(@round(m.y)) };
     const land = plan.moves[plan.moves.len - 1];
     if (click) {
@@ -249,11 +309,7 @@ pub fn motionStartPointer(self: *Host, v: *View, p: *const Pending, rect: [4]i32
         steps[n - 2] = .{ .at = plan.press, .kind = .down, .x = lx, .y = ly };
         steps[n - 1] = .{ .at = plan.release, .kind = .up, .x = lx, .y = ly };
     }
-    const owned = self.gpa.dupe(u8, msg) catch {
-        self.gpa.free(steps);
-        return postAct(self, v, p.sid, 0, "out of memory starting the motion replay", 0);
-    };
-    begin(self, v, steps, .{ .act = .{ .sid = p.sid, .msg = owned } });
+    begin(self, v, steps, done, began_us);
 }
 
 /// Type `p.arg` with key timing drawn from the pack. On completion the
@@ -282,7 +338,7 @@ pub fn motionStartTyping(self: *Host, v: *View, p: *const Pending) bool {
     const want = self.gpa.dupe(u8, p.arg) catch return failOom(self, v, p.sid);
     if (strokes.items.len == 0) {
         const none = self.gpa.alloc(Step, 0) catch return failOomFree(self, v, p.sid, want);
-        begin(self, v, none, .{ .typed = .{ .sid = p.sid, .guarded = p.guarded, .want = want } });
+        begin(self, v, none, .{ .typed = .{ .sid = p.sid, .guarded = p.guarded, .want = want } }, null);
         return true;
     }
     var prng = seededRng();
@@ -293,7 +349,7 @@ pub fn motionStartTyping(self: *Host, v: *View, p: *const Pending) bool {
     };
     defer self.gpa.free(times);
     const owned = typingSteps(self.gpa, strokes.items, times) catch return failOomFree(self, v, p.sid, want);
-    begin(self, v, owned, .{ .typed = .{ .sid = p.sid, .guarded = p.guarded, .want = want } });
+    begin(self, v, owned, .{ .typed = .{ .sid = p.sid, .guarded = p.guarded, .want = want } }, null);
     return true;
 }
 
@@ -348,7 +404,7 @@ pub fn motionScroll(self: *Host, conn: u32, req: proto.MotionScroll) void {
     const saved = self.active_sem_request;
     self.active_sem_request = 0;
     defer self.active_sem_request = saved;
-    begin(self, v, steps, .{ .scroll = .{ .req = req.req } });
+    begin(self, v, steps, .{ .scroll = .{ .req = req.req } }, null);
 }
 
 fn postAct(self: *Host, v: *View, sid: u32, ok: u8, msg: []const u8, duration: u32) void {
@@ -419,22 +475,25 @@ fn pumpView(self: *Host, v: *View, now_us: i64) void {
     finishOk(self, v, run);
 }
 
-/// Emit the next due step of every run.
+/// Emit the next due step of every run, and of every idle drift.
 pub fn motionPump(self: *Host) void {
     const now = clock.nowUs();
     for (self.views.items) |v| {
         if (v.motion_run != null) pumpView(self, v, now);
+        if (v.motion_drift != null) pumpDrift(self, v, now);
     }
 }
 
-/// Milliseconds until the next due step of any run, or null with none.
+/// Milliseconds until the next due step of any run or drift, or null
+/// with none.
 pub fn motionWaitMs(self: *Host) ?i64 {
     const now = clock.nowUs();
     var best: ?i64 = null;
     for (self.views.items) |v| {
-        const run = v.motion_run orelse continue;
-        if (run.next >= run.steps.len) return 0;
-        const due = run.dueUs();
+        const due: i64 = if (v.motion_run) |run| blk: {
+            if (run.next >= run.steps.len) return 0;
+            break :blk run.dueUs();
+        } else if (v.motion_drift) |d| (driftDueUs(v, d) orelse continue) else continue;
         const wait = @max(@divFloor(due - now + 999, 1000), 0);
         best = if (best) |b| @min(b, wait) else wait;
     }
@@ -460,6 +519,9 @@ fn finishOk(self: *Host, v: *View, run: *Run) void {
             defer self.gpa.free(t.want);
             self.semCommitTyped(v, t.sid, t.guarded, t.want, duration);
         },
+        // Both take ownership of the owned text.
+        .pick_open => |p| self.semPickOption(v, p.sid, p.guarded, p.want, p.conn, run.began_us),
+        .pick_option => |p| self.semPickChosen(v, p.sid, p.guarded, p.picked, duration),
     }
 }
 
@@ -467,16 +529,12 @@ fn finishFailed(self: *Host, v: *View, done: Done, client_request: u32, duration
     const saved = self.active_sem_request;
     self.active_sem_request = client_request;
     defer self.active_sem_request = saved;
-    switch (done) {
-        .act => |a| {
-            defer self.gpa.free(a.msg);
-            postAct(self, v, a.sid, 0, why, duration);
-        },
+    defer done.free(self.gpa);
+    if (done.sid()) |sid| {
+        postAct(self, v, sid, 0, why, duration);
+    } else switch (done) {
         .scroll => |s| self.post(proto.EvMotionDone{ .view = v.id, .req = s.req, .ok = 0, .duration_ms = duration, .msg = why }),
-        .typed => |t| {
-            defer self.gpa.free(t.want);
-            postAct(self, v, t.sid, 0, why, duration);
-        },
+        else => unreachable,
     }
 }
 
@@ -500,4 +558,151 @@ pub fn motionCancel(self: *Host, v: *View, why: []const u8) void {
     }
     const done_ms: u32 = if (run.next > 0) @intFromFloat(@max(@round(run.steps[run.next - 1].at), 0)) else 0;
     finishFailed(self, v, run.done, run.client_request, done_ms, why);
+}
+
+// -- idle drift (capability "motion-drift") ---------------------------
+
+/// One view's idle drift: the connection whose pack it replays, when it
+/// may move next, and the segment being replayed (empty while resting).
+pub const Drift = struct {
+    conn: u32,
+    /// Seeded once per opt-in, so a busy view's every poll turn costs no
+    /// entropy read.
+    rng: replay.Rng,
+    clock: replay.DriftClock = .{},
+    recent: replay.Recent = .{},
+    moves: []replay.Move = &.{},
+    next: usize = 0,
+    /// When the segment's move times count from; slides like a run's.
+    start_us: i64 = 0,
+    /// The view was busy at the last turn: the rest restarts once it is
+    /// not, so it counts from the END of an action, not its start.
+    blocked: bool = false,
+
+    fn stopSegment(self: *Drift, gpa: std.mem.Allocator) void {
+        gpa.free(self.moves);
+        self.moves = &.{};
+        self.next = 0;
+    }
+
+    /// Stop any segment and rest a full rest from `now_us` on.
+    fn yieldAt(self: *Drift, gpa: std.mem.Allocator, now_us: i64) void {
+        self.stopSegment(gpa);
+        self.clock.yield(nowMsF(now_us), self.rng.random());
+    }
+};
+
+fn nowMsF(now_us: i64) f64 {
+    return @as(f64, @floatFromInt(now_us)) / 1000;
+}
+
+/// `motion_drift`: turn idle drift on or off for a view, from connection
+/// `conn`'s pack; always answered by `ev_motion_done`.
+pub fn motionDriftSet(self: *Host, conn: u32, req: proto.MotionDrift) void {
+    const answer = struct {
+        fn f(h: *Host, view: u32, r: u32, ok: u8, msg: []const u8) void {
+            h.post(proto.EvMotionDone{ .view = view, .req = r, .ok = ok, .duration_ms = 0, .msg = msg });
+        }
+    }.f;
+    const v = self.find(req.view) orelse return answer(self, req.view, req.req, 0, "no view with that id; idle drift was not changed");
+    if (req.on == 0) {
+        motionDriftFree(self, v);
+        return answer(self, v.id, req.req, 1, "idle drift off");
+    }
+    const slot = motionPackFor(self, conn) orelse
+        return answer(self, v.id, req.req, 0, "idle drift was asked for but no motion pack is loaded on this connection; the pointer stays still");
+    if (!replay.driftUsable(slot.pack.?))
+        return answer(self, v.id, req.req, 0, "idle drift was asked for but the motion pack holds no idle segment a resting hand made (none, or every one wanders too far); the pointer stays still");
+    const d = v.motion_drift orelse blk: {
+        const fresh = self.gpa.create(Drift) catch return answer(self, v.id, req.req, 0, "out of memory starting idle drift");
+        fresh.* = .{ .conn = conn, .rng = seededRng() };
+        v.motion_drift = fresh;
+        break :blk fresh;
+    };
+    d.conn = conn;
+    d.yieldAt(self.gpa, clock.nowUs());
+    answer(self, v.id, req.req, 1, "idle drift on");
+}
+
+/// Something other than drift touched the view: stop the segment and
+/// rest before the next. A no-op when drift is off.
+pub fn motionDriftYield(self: *Host, v: *View) void {
+    const d = v.motion_drift orelse return;
+    d.yieldAt(self.gpa, clock.nowUs());
+}
+
+/// Turn the view's drift off and free it.
+pub fn motionDriftFree(self: *Host, v: *View) void {
+    const d = v.motion_drift orelse return;
+    v.motion_drift = null;
+    d.stopSegment(self.gpa);
+    self.gpa.destroy(d);
+}
+
+/// Drift may not move now: an action runs or is in flight, or nothing
+/// is there to move a pointer over.
+fn driftBlocked(v: *const View) bool {
+    if (v.motion_run != null or v.hidden or v.discarded or v.browser == null) return true;
+    for (v.pending.items) |p| if (p.kind.isAction()) return true;
+    return false;
+}
+
+/// When drift next wants a turn, null when it is blocked or has no
+/// pointer to move.
+fn driftDueUs(v: *const View, d: *const Drift) ?i64 {
+    if (driftBlocked(v) or v.motion_ptr == null) return null;
+    // Just unblocked: the rest restarts from now, on this very turn.
+    if (d.blocked) return 0;
+    if (d.next < d.moves.len) return d.start_us + @as(i64, @intFromFloat(d.moves[d.next].t * 1000));
+    return @intFromFloat(d.clock.rest_until * 1000);
+}
+
+/// One drift turn: rest, start a segment from where the pointer is, or
+/// emit its next due move (ONE per turn, sliding like a run).
+fn pumpDrift(self: *Host, v: *View, now_us: i64) void {
+    const d = v.motion_drift orelse return;
+    if (driftBlocked(v)) {
+        if (!d.blocked) d.stopSegment(self.gpa);
+        d.blocked = true;
+        return;
+    }
+    if (d.blocked) {
+        d.blocked = false;
+        return d.yieldAt(self.gpa, now_us);
+    }
+    const now_ms = nowMsF(now_us);
+    if (d.next >= d.moves.len) {
+        if (!d.clock.due(now_ms)) return;
+        // A pointer that never entered the view has no resting place.
+        const from = v.motion_ptr orelse return d.clock.rest(now_ms, d.rng.random());
+        // The connection cleared its pack: there is nothing left to replay.
+        const slot = motionPackFor(self, d.conn) orelse return motionDriftFree(self, v);
+        d.stopSegment(self.gpa);
+        const moves = replay.planDrift(self.gpa, slot.pack.?, from, @floatFromInt(@max(v.w, 1)), @floatFromInt(@max(v.h, 1)), &d.recent, d.rng.random()) catch |err| switch (err) {
+            // A replacement pack without drift: nothing left to replay.
+            error.NoIdle => return motionDriftFree(self, v),
+            else => return d.clock.rest(now_ms, d.rng.random()),
+        };
+        if (moves.len == 0) {
+            self.gpa.free(moves);
+            return d.clock.rest(now_ms, d.rng.random());
+        }
+        d.moves = moves;
+        d.start_us = now_us;
+    }
+    const m = d.moves[d.next];
+    const due_us = d.start_us + @as(i64, @intFromFloat(m.t * 1000));
+    if (due_us > now_us) return;
+    const x: i32 = @intFromFloat(m.x);
+    const y: i32 = @intFromFloat(m.y);
+    const pt = host_mod.viewPoint(v, x, y);
+    var ev = cef.cef_mouse_event_t{ .x = pt.x, .y = pt.y, .modifiers = 0 };
+    host_mod.withHostArgs(v, host_mod.sendMove, .{ &ev, @as(c_int, 0) });
+    v.motion_ptr = .{ m.x, m.y };
+    d.next += 1;
+    d.start_us += now_us - due_us;
+    if (d.next >= d.moves.len) {
+        d.stopSegment(self.gpa);
+        d.clock.rest(now_ms, d.rng.random());
+    }
 }

@@ -551,6 +551,9 @@ pub const View = struct {
     /// Where this view's pointer is, logical px, once a semantic action
     /// put it somewhere; a replay starts from here.
     motion_ptr: ?[2]f64 = null,
+    /// Opt-in idle drift (`motion_drift`, cefhost/motion.zig); null =
+    /// off, which costs one branch per poll turn.
+    motion_drift: ?*host_motion.Drift = null,
 
     /// The view id of this view's OPEN inspector, 0 when it has none.
     /// Set on the SOURCE view; destroying it takes the inspector with
@@ -801,6 +804,9 @@ pub const Pending = struct {
     /// A commit after replayed typing: the replay's duration, reported
     /// with `motion = replayed` on the action's result.
     motion_ms: ?u32 = null,
+    /// A replayed custom-dropdown pick (`choose_pick`): when its opening
+    /// replay began, so the reply's duration covers both clicks.
+    motion_t0_us: i64 = 0,
 
     pub const Kind = enum {
         snapshot,
@@ -834,6 +840,16 @@ pub const Pending = struct {
         /// The option was clicked; waiting for what the control reads
         /// as now.
         choose_done,
+
+        /// Whether the request is an ACTION in flight (input is about
+        /// to reach the page, or did and is being read back), which no
+        /// idle drift may run beside.
+        pub fn isAction(self: Kind) bool {
+            return switch (self) {
+                .snapshot, .hints, .query, .review, .page, .expand, .read, .read_ids, .eval => false,
+                .click, .hover, .act, .set_value, .commit, .guarded_act, .choose_pick, .choose_done => true,
+            };
+        }
     };
 };
 
@@ -2914,6 +2930,7 @@ pub const Host = struct {
         // and the shadow tree; what is left is the record's own memory.
         interceptUnregister(self.gpa, v.id);
         self.dropBrowser(v, close);
+        self.motionDriftFree(v);
         if (v.url.len != 0) self.gpa.free(v.url);
         if (v.title.len != 0) self.gpa.free(v.title);
         if (v.sel_text.len != 0) self.gpa.free(v.sel_text);
@@ -3600,6 +3617,8 @@ pub const Host = struct {
     pub fn pointerFlags(self: *Host, req: proto.InputPointer, extra_flags: u32) void {
         latStamp("input");
         const v = self.findWake(req.view) orelse return;
+        // Live input owns the pointer: drift rests until it is quiet.
+        self.motionDriftYield(v);
         const pt = viewPoint(v, req.x, req.y);
         var ev = cef.cef_mouse_event_t{
             .x = pt.x,
@@ -3628,6 +3647,7 @@ pub const Host = struct {
     /// `scroll` with extra engine event flags (see `pointerFlags`).
     pub fn scrollFlags(self: *Host, req: proto.InputScroll, extra_flags: u32) void {
         const v = self.findWake(req.view) orelse return;
+        self.motionDriftYield(v);
         const pt = viewPoint(v, req.x, req.y);
         var ev = cef.cef_mouse_event_t{
             .x = pt.x,
@@ -3651,6 +3671,7 @@ pub const Host = struct {
     /// event carries instead of an empty one.
     pub fn keyTo(self: *Host, v: *View, req: proto.InputKey) void {
         const mapped = keymap.map(req.keyval);
+        self.motionDriftYield(v);
         var ev = std.mem.zeroes(cef.cef_key_event_t);
         ev.size = @sizeOf(cef.cef_key_event_t);
         ev.modifiers = keymap.eventFlags(req.mods);
@@ -3739,6 +3760,10 @@ pub const Host = struct {
     pub const motionPump = host_motion.motionPump;
     pub const motionWaitMs = host_motion.motionWaitMs;
     pub const motionCancel = host_motion.motionCancel;
+    pub const motionStartReach = host_motion.motionStartReach;
+    pub const motionDriftSet = host_motion.motionDriftSet;
+    pub const motionDriftYield = host_motion.motionDriftYield;
+    pub const motionDriftFree = host_motion.motionDriftFree;
 
     /// One CHAR event for `cp`; codepoints outside the BMP need a
     /// surrogate pair because CEF's character field is UTF-16.
@@ -3765,6 +3790,7 @@ pub const Host = struct {
 
     pub fn ime(self: *Host, req: proto.InputIme) void {
         const v = self.findWake(req.view) orelse return;
+        self.motionDriftYield(v);
         var text = std.mem.zeroes(cef.cef_string_t);
         setStr(req.text, &text);
         defer cef.cef_string_utf16_clear(&text);
@@ -3827,6 +3853,7 @@ pub const Host = struct {
     /// what a real paste into a textarea does.
     pub fn paste(self: *Host, req: proto.InputPaste) void {
         const v = self.findWake(req.view) orelse return;
+        self.motionDriftYield(v);
         typeText(v, req.text.s);
     }
 
@@ -3970,6 +3997,8 @@ pub const Host = struct {
     pub const rewriteNodeRefs = host_sem.rewriteNodeRefs;
     pub const onSetValue = host_sem.onSetValue;
     pub const semCommitTyped = host_sem.semCommitTyped;
+    pub const semPickOption = host_sem.semPickOption;
+    pub const semPickChosen = host_sem.semPickChosen;
     // -- outbound ------------------------------------------------------
 
     /// Resolve where an event about `view_id` goes and which id-window

@@ -426,6 +426,9 @@ pub const MotionSource = motion_replay.Source;
 const MotionSetup = struct {
     default: motion_replay.Mode = .direct,
     default_source: MotionSource = .built_in,
+    /// Whether a web_open that does not say gets idle drift.
+    idle_drift: bool = false,
+    idle_drift_source: MotionSource = .built_in,
     pack_name: []const u8 = "",
     pack_source: MotionSource = .built_in,
     pack: ?[]u8 = null,
@@ -438,11 +441,15 @@ var g_motion: MotionSetup = .{};
 /// Resolve the motion setup once at startup. A selected pack that is
 /// missing or invalid is recorded as BROKEN, never ignored: with a
 /// replay default every action then fails closed, and `capabilities`
-/// reports it before the first click does.
-pub fn configureMotion(allocator: std.mem.Allocator, default: motion_replay.Mode, default_source: MotionSource, pack_name: []const u8, pack_source: MotionSource) void {
-    g_motion = .{ .default = default, .default_source = default_source, .pack_name = pack_name, .pack_source = pack_source };
+/// reports it before the first click does. The same holds for an idle
+/// drift default with no pack: every web_open then fails closed.
+pub fn configureMotion(allocator: std.mem.Allocator, default: motion_replay.Mode, default_source: MotionSource, idle_drift: bool, idle_drift_source: MotionSource, pack_name: []const u8, pack_source: MotionSource) void {
+    g_motion = .{ .default = default, .default_source = default_source, .idle_drift = idle_drift, .idle_drift_source = idle_drift_source, .pack_name = pack_name, .pack_source = pack_source };
     if (pack_name.len == 0) {
-        if (default == .replay) g_motion.broken = "web_motion_default is replay but no motion pack is selected (config web_motion_pack, or sketerm mcp --web-motion-pack NAME; sketerm motion list shows the installed packs)";
+        if (default == .replay)
+            g_motion.broken = "web_motion_default is replay but no motion pack is selected (config web_motion_pack, or sketerm mcp --web-motion-pack NAME; sketerm motion list shows the installed packs)"
+        else if (idle_drift)
+            g_motion.broken = "web_motion_idle_drift is on but no motion pack is selected (config web_motion_pack, or sketerm mcp --web-motion-pack NAME; sketerm motion list shows the installed packs)";
         return;
     }
     var diag: motion_pack.Diag = .{};
@@ -462,12 +469,12 @@ pub fn configureMotion(allocator: std.mem.Allocator, default: motion_replay.Mode
 }
 
 /// The `web_motion*` capability facts.
-pub fn motionCapability() struct { setup: *const MotionSetup, helper: ?bool, headless: bool } {
+pub fn motionCapability() struct { setup: *const MotionSetup, helper: ?bool, drift_helper: ?bool, headless: bool } {
     const headless = !guiDrivesWeb() and g_headless_alloc != null;
-    if (!headless) return .{ .setup = &g_motion, .helper = false, .headless = false };
-    const e = currentEngine() orelse return .{ .setup = &g_motion, .helper = null, .headless = true };
-    if (e.state != .ready) return .{ .setup = &g_motion, .helper = null, .headless = true };
-    return .{ .setup = &g_motion, .helper = e.has(.motion_replay), .headless = true };
+    if (!headless) return .{ .setup = &g_motion, .helper = false, .drift_helper = false, .headless = false };
+    const e = currentEngine() orelse return .{ .setup = &g_motion, .helper = null, .drift_helper = null, .headless = true };
+    if (e.state != .ready) return .{ .setup = &g_motion, .helper = null, .drift_helper = null, .headless = true };
+    return .{ .setup = &g_motion, .helper = e.has(.motion_replay), .drift_helper = e.has(.motion_drift), .headless = true };
 }
 
 /// The motion one call asked for (its `motion` argument, else the
@@ -483,6 +490,22 @@ fn motionFor(drv: Driver, arena: std.mem.Allocator, args: std.json.Value) !union
     if (drv == .gui) return .{ .err = fail(.unavailable, try std.fmt.allocPrint(arena, "{s}, but recorded-motion replay drives the server's own headless browser only and a GUI is attached; nothing was done", .{asked})) };
     if (g_motion.pack == null) return .{ .err = fail(.unavailable, try std.fmt.allocPrint(arena, "{s}, but {s}; nothing was done", .{ asked, g_motion.broken orelse "no motion pack is selected (config web_motion_pack, or sketerm mcp --web-motion-pack NAME)" })) };
     return .{ .mode = .replay };
+}
+
+/// Whether a web_open gets idle drift (its `idle_drift` argument, else
+/// the configured default), or why it cannot, decided BEFORE anything
+/// is opened. Never a silent tab without the drift that was asked for.
+fn driftFor(drv: Driver, arena: std.mem.Allocator, args: std.json.Value) !union(enum) { on: bool, err: Fail } {
+    const explicit: ?bool = if (mcp.argValue(args, "idle_drift")) |val| switch (val) {
+        .bool => |b| b,
+        else => return .{ .err = fail(.invalid_args, "'idle_drift' must be true or false") },
+    } else null;
+    if (!(explicit orelse g_motion.idle_drift)) return .{ .on = false };
+    const asked = if (explicit != null) "idle_drift:true was asked for" else "the configured web_motion_idle_drift is on";
+    if (drv == .gui) return .{ .err = fail(.unavailable, try std.fmt.allocPrint(arena, "{s}, but recorded idle drift drives the server's own headless browser only and a GUI is attached; nothing was opened", .{asked})) };
+    const s = g_motion.summary orelse return .{ .err = fail(.unavailable, try std.fmt.allocPrint(arena, "{s}, but {s}; nothing was opened", .{ asked, g_motion.broken orelse "no motion pack is selected (config web_motion_pack, or sketerm mcp --web-motion-pack NAME)" })) };
+    if (s.idle == 0) return .{ .err = fail(.unavailable, try std.fmt.allocPrint(arena, "{s}, but motion pack '{s}' recorded no idle drift (the trainer's \"read this\" pauses record it); nothing was opened", .{ asked, g_motion.pack_name })) };
+    return .{ .on = true };
 }
 
 /// The instance directory the headless helper lives in; null when no
@@ -991,6 +1014,9 @@ pub const View = struct {
     untrusted: bool = false,
     emulation: webdrive.Emulation = .{},
     max_fps: ?u16 = null,
+    /// Recorded idle drift runs on this view (set by web_open, which is
+    /// where it is turned on).
+    idle_drift: bool = false,
     policy_serial: u32 = 0,
     policy_install_failed: bool = false,
     policy_exhausted: []const u8 = "",
@@ -2829,6 +2855,8 @@ fn openResult(
         try res.fact("context", v.context);
         try res.fact("untrusted", v.untrusted);
         if (v.max_fps) |fps| try res.fact("max_fps", fps);
+        try res.fact("idle_drift", v.idle_drift);
+        if (v.idle_drift) try res.text("idle drift: between actions the pointer wanders as a resting hand does (recorded segments from the motion pack, a few px), never during an action");
         if (v.emulation.color_scheme) |value| try res.fact("color_scheme", @tagName(value));
         if (v.emulation.reduced_motion) |value| try res.fact("reduced_motion", if (value == .reduce) "reduce" else "no-preference");
         if (v.emulation.device_scale_factor != null) try res.fact("device_scale_factor", @as(f64, @floatFromInt(v.emulation.scale())) / 1000);
@@ -4367,6 +4395,11 @@ pub fn webTool(
             .err => |f| return failRes(arena, f),
             .wait => |w| w,
         };
+        // Idle drift, decided before anything is opened.
+        const drift_on = switch (try driftFor(drv, arena, args)) {
+            .err => |f| return failRes(arena, f),
+            .on => |on| on,
+        };
         const nav_started = clock.nowMs();
         const new_handle: u32 = switch (try openViewConfigured(drv, arena, url, where, vw, vh, spec, if (policy) |*p| p else null, if (cap) |*f| f else null, route, emulation, max_fps, browser_name)) {
             .err => |e| return failRes(arena, e),
@@ -4391,6 +4424,21 @@ pub fn webTool(
             error.InvalidFingerprint => unreachable,
             else => return mcp.errRes(arena, .io_failed, "could not record accept_cert on the new view"),
         };
+        // Idle drift asked for and impossible (a helper without
+        // motion-drift, a refused pack) closes the new tab rather than
+        // leaving one without the drift the caller relies on.
+        if (drift_on) {
+            const why: ?[]const u8 = if (drv.headless.motionDrift(arena, new_handle, true, 10_000)) |out|
+                (if (out.ok) null else out.msg)
+            else |err| switch (err) {
+                error.DriftUnsupported => "the browser helper does not advertise motion-drift (it predates recorded idle drift)",
+                else => (try headlessFail(arena, drv.headless, err)).text,
+            };
+            if (why) |w| {
+                drv.headless.closeView(new_handle);
+                return mcp.errRes(arena, .unavailable, try std.fmt.allocPrint(arena, "idle drift could not be turned on: {s}; the new tab was closed", .{w}));
+            }
+        }
 
         // Settle: a fresh view needs the helper handshake plus the
         // load, and a snapshot before the document exists is empty.
@@ -4469,6 +4517,7 @@ pub fn webTool(
             if (drv == .gui) g_tabs.setLabel(tabs_alloc, tabKey(.gui, v), l, clock.nowMs()) catch {};
             v.label = l;
         }
+        v.idle_drift = drift_on;
         if (drv == .gui) g_tabs.touch(tabs_alloc, tabKey(.gui, v), clock.nowMs()) catch {};
         var post: NavPost = .{};
         if (nav_wait) |w| {
@@ -4479,6 +4528,7 @@ pub fn webTool(
                 post.wait = r.report;
                 v = r.view;
                 if (tab_label) |l| v.label = l;
+                v.idle_drift = drift_on;
             }
         }
         // A fresh view's log starts with this navigation: cursor 0.
@@ -8422,6 +8472,51 @@ test "web motion: a replay that cannot happen is refused, never run direct" {
     var bytes = [_]u8{'x'};
     g_motion = .{ .pack_name = "p", .pack = &bytes };
     try t.expectEqual(motion_replay.Mode.replay, (try motionFor(drv, arena, replay_arg)).mode);
+}
+
+test "web_open idle_drift: off unless asked or configured, refused when it cannot happen" {
+    var arena_state = testArena();
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const t = std.testing;
+    const saved = g_motion;
+    defer g_motion = saved;
+    var fake_engine: webdrive.Engine = undefined;
+    const drv: Driver = .{ .headless = &fake_engine };
+    const on = try std.json.parseFromSliceLeaky(std.json.Value, arena, "{\"idle_drift\":true}", .{});
+    const off = try std.json.parseFromSliceLeaky(std.json.Value, arena, "{\"idle_drift\":false}", .{});
+    const none = try std.json.parseFromSliceLeaky(std.json.Value, arena, "{}", .{});
+    const bad = try std.json.parseFromSliceLeaky(std.json.Value, arena, "{\"idle_drift\":\"yes\"}", .{});
+
+    // Built-in: off, and costs nothing; an explicit ask with no pack fails.
+    g_motion = .{};
+    try t.expect(!(try driftFor(drv, arena, none)).on);
+    try t.expect(!(try driftFor(drv, arena, off)).on);
+    const no_pack = (try driftFor(drv, arena, on)).err;
+    try t.expectEqual(mcp.ErrCode.unavailable, no_pack.code);
+    try t.expect(std.mem.indexOf(u8, no_pack.text, "no motion pack is selected") != null);
+    try t.expect(std.mem.indexOf(u8, no_pack.text, "nothing was opened") != null);
+    try t.expectEqual(mcp.ErrCode.invalid_args, (try driftFor(drv, arena, bad)).err.code);
+
+    // A configured default applies to a call that omits it, and its
+    // refusal names the configuration; an explicit false still opts out.
+    g_motion = .{ .idle_drift = true, .idle_drift_source = .config, .broken = "web_motion_idle_drift is on but no motion pack is selected" };
+    const configured = (try driftFor(drv, arena, none)).err;
+    try t.expect(std.mem.indexOf(u8, configured.text, "configured web_motion_idle_drift is on") != null);
+    try t.expect(!(try driftFor(drv, arena, off)).on);
+
+    // A pack without idle segments cannot drift; one with them can.
+    var bytes = [_]u8{'x'};
+    const summary: motion_pack.Pack.Summary = .{ .device = .mouse, .rate_hz = 125, .scale = 1, .reaches = 4, .keys = 0, .scroll = 0, .idle = 0 };
+    g_motion = .{ .pack_name = "p", .pack = &bytes, .summary = summary };
+    try t.expect(std.mem.indexOf(u8, (try driftFor(drv, arena, on)).err.text, "recorded no idle drift") != null);
+    var with_idle = summary;
+    with_idle.idle = 3;
+    g_motion.summary = with_idle;
+    try t.expect((try driftFor(drv, arena, on)).on);
+
+    // A GUI-backed browser never drifts.
+    try t.expectEqual(mcp.ErrCode.unavailable, (try driftFor(Driver{ .gui = unusedBackend() }, arena, on)).err.code);
 }
 
 test "web_read: rich model and old-helper fallback both satisfy the schema" {

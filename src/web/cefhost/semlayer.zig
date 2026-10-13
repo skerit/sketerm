@@ -7,7 +7,8 @@
 
 const std = @import("std");
 const cef = @import("cef");
-const nowMs = @import("../../util/clock.zig").nowMs;
+const clock = @import("../../util/clock.zig");
+const nowMs = clock.nowMs;
 const proto = @import("../protocol.zig");
 const semantic = @import("../semantic.zig");
 const host_mod = @import("../cefhost.zig");
@@ -104,14 +105,35 @@ pub fn pushPending(self: *Host, v: *View, p: Pending) !u32 {
     stamped.nav_gen = v.sem_nav.generation;
     stamped.deadline_ms = nowMs() + semantic_request_timeout_ms;
     try v.pending.append(self.gpa, stamped);
+    // An action is starting: idle drift stops and rests (no-op when off).
+    if (p.kind.isAction()) self.motionDriftYield(v);
     return p.req;
 }
 
+/// The replay duration an action's reply reports: a replayed commit's,
+/// or a replayed dropdown pick's so far; null when nothing replayed.
+fn pendingMotionMs(p: *const Pending) ?u32 {
+    if (p.motion_ms) |ms| return ms;
+    if (p.motion_t0_us == 0) return null;
+    return @intCast(std.math.clamp(@divFloor(clock.nowUs() - p.motion_t0_us, 1000), 0, std.math.maxInt(u32)));
+}
+
+/// Answer the action `p` with a `sem_act_result`, carrying
+/// `motion = replayed` and the duration when it replayed anything.
+fn postActFor(self: *Host, v: *View, p: *const Pending, ok: u8, msg: []const u8) void {
+    if (pendingMotionMs(p)) |ms| {
+        self.post(proto.SemActResult{ .view = v.id, .id = p.sid, .ok = ok, .msg = msg, .motion = @intFromEnum(proto.MotionResult.replayed), .duration_ms = ms });
+    } else self.post(proto.SemActResult{ .view = v.id, .id = p.sid, .ok = ok, .msg = msg });
+}
+
 pub fn takePending(self: *Host, v: *View, req: u32) ?Pending {
-    _ = self;
     if (req == 0) return null;
     for (v.pending.items, 0..) |p, i| {
-        if (p.req == req) return v.pending.orderedRemove(i);
+        if (p.req == req) {
+            // The action's input goes out now: drift rests from here.
+            if (p.kind.isAction()) self.motionDriftYield(v);
+            return v.pending.orderedRemove(i);
+        }
     }
     return null;
 }
@@ -152,7 +174,7 @@ pub fn failPending(self: *Host, v: *View, p: Pending, msg: []const u8) void {
         .hints, .query => self.post(proto.SemQueryResult{ .view = v.id, .payload = .{ .s = msg } }),
         .review => self.post(proto.SemQueryResult{ .view = v.id, .payload = .{ .s = "{\"pending\":true}" } }),
         .page => postPageError(self, v, msg),
-        .click, .hover, .act, .set_value, .commit, .guarded_act, .choose_pick, .choose_done => self.post(proto.SemActResult{ .view = v.id, .id = p.sid, .ok = 0, .msg = msg }),
+        .click, .hover, .act, .set_value, .commit, .guarded_act, .choose_pick, .choose_done => postActFor(self, v, &p, 0, msg),
         .expand => self.post(proto.SemExpandResult{ .view = v.id, .id = p.sid, .off = p.off, .text = msg }),
         .read => self.post(proto.SemReadResult{ .view = v.id, .markdown = .{ .s = msg } }),
         .read_ids => self.post(proto.SemReadIdsResult{
@@ -200,6 +222,7 @@ pub fn semanticNavigationStarted(self: *Host, v: *View) void {
     v.sem_observing = false;
     self.portsAbandonView(v.id);
     self.motionCancel(v, "the motion replay was interrupted by navigation");
+    self.motionDriftYield(v);
     for (v.pending.items) |*p| {
         switch (p.kind) {
             .snapshot, .hints, .query, .read, .read_ids => {
@@ -976,9 +999,7 @@ pub fn onScriptMessage(self: *Host, v: *View, json: []const u8) void {
             ) catch a.value.msg,
             else => a.value.msg,
         };
-        if (p.kind == .commit and p.motion_ms != null) {
-            self.post(proto.SemActResult{ .view = v.id, .id = p.sid, .ok = a.value.ok, .msg = msg, .motion = @intFromEnum(proto.MotionResult.replayed), .duration_ms = p.motion_ms.? });
-        } else self.post(proto.SemActResult{ .view = v.id, .id = p.sid, .ok = a.value.ok, .msg = msg });
+        postActFor(self, v, &p, a.value.ok, msg);
     } else if (std.mem.eql(u8, op, "text")) {
         const Txt = struct { off: u32 = 0, text: []const u8 = "" };
         const t = std.json.parseFromSlice(Txt, self.gpa, json, .{ .ignore_unknown_fields = true }) catch return;
@@ -1204,12 +1225,15 @@ pub fn onRect(self: *Host, v: *View, p: *Pending, json: []const u8) void {
 
 /// A custom dropdown's option, located after the trusted click that
 /// opened the list: clicking it is trusted too, which is the whole
-/// reason this is a round trip instead of `option.click()`.
+/// reason this is a round trip instead of `option.click()`. A replayed
+/// pick replays this click as well.
 pub fn onOptionRect(self: *Host, v: *View, p: *Pending, json: []const u8) void {
     const R = struct {
         ok: u8 = 0,
         x: i32 = 0,
         y: i32 = 0,
+        w: i32 = 0,
+        h: i32 = 0,
         text: []const u8 = "",
         seen: []const u8 = "",
     };
@@ -1222,7 +1246,13 @@ pub fn onOptionRect(self: *Host, v: *View, p: *Pending, json: []const u8) void {
             "no option matched \"{s}\" in the opened dropdown; options seen: {s}",
             .{ p.arg[0..@min(p.arg.len, 96)], r.value.seen[0..@min(r.value.seen.len, 300)] },
         ) catch "no matching option in the opened dropdown";
-        self.post(proto.SemActResult{ .view = v.id, .id = p.sid, .ok = 0, .msg = msg });
+        postActFor(self, v, p, 0, msg);
+        return;
+    }
+    const picked = self.gpa.dupe(u8, r.value.text) catch return;
+    if (p.motion_conn != 0) {
+        // The option's own reach; its completion reads the control back.
+        self.motionStartReach(v, p.motion_conn, .{ r.value.x, r.value.y, @max(r.value.w, 1), @max(r.value.h, 1) }, true, .{ .pick_option = .{ .sid = p.sid, .guarded = p.guarded, .picked = picked } }, p.motion_t0_us);
         return;
     }
     const pt = viewPoint(v, r.value.x, r.value.y);
@@ -1230,21 +1260,53 @@ pub fn onOptionRect(self: *Host, v: *View, p: *Pending, json: []const u8) void {
     withHostArgs(v, sendMove, .{ &ev, @as(c_int, 0) });
     withHostArgs(v, sendClick, .{ &ev, cef.MBT_LEFT, @as(c_int, 0), @as(c_int, 1) });
     withHostArgs(v, sendClick, .{ &ev, cef.MBT_LEFT, @as(c_int, 1), @as(c_int, 1) });
+    v.motion_ptr = .{ @floatFromInt(r.value.x), @floatFromInt(r.value.y) };
+    semPickChosen(self, v, p.sid, p.guarded, picked, null);
+}
 
-    const picked = self.gpa.dupe(u8, r.value.text) catch return;
-    const eid = v.sem.eidFor(p.sid);
+/// After a dropdown option was clicked: read back what the control now
+/// reads as, which answers the action. Takes ownership of `picked`;
+/// `motion_ms` marks a replayed pick, reported on the result.
+pub fn semPickChosen(self: *Host, v: *View, sid: u32, guarded: bool, picked: []u8, motion_ms: ?u32) void {
+    var buf: [96]u8 = undefined;
+    const eid = v.sem.eidFor(sid);
     const rid = self.pushPending(v, .{
         .req = nextReq(v),
         .kind = .choose_done,
-        .sid = p.sid,
-        .guarded = p.guarded,
+        .sid = sid,
+        .guarded = guarded,
         .arg = picked,
+        .motion_ms = motion_ms,
     }) catch {
         self.gpa.free(picked);
         return;
     };
     const cmd = std.fmt.bufPrint(&buf, "{{\"op\":\"chosen\",\"req\":{d},\"eid\":{d}}}", .{ rid, eid }) catch return;
     self.sendScript(v, cmd);
+}
+
+/// After a custom dropdown was clicked open: go looking for the option
+/// `want`. Takes ownership of `want`; a nonzero `motion_conn` makes the
+/// option's click a replay too, timed from `motion_t0_us`.
+pub fn semPickOption(self: *Host, v: *View, sid: u32, guarded: bool, want: []u8, motion_conn: u32, motion_t0_us: i64) void {
+    const rid = self.pushPending(v, .{
+        .req = nextReq(v),
+        .kind = .choose_pick,
+        .sid = sid,
+        .guarded = guarded,
+        .arg = want,
+        .motion_conn = motion_conn,
+        .motion_t0_us = motion_t0_us,
+    }) catch {
+        self.gpa.free(want);
+        return;
+    };
+    var cmd: std.Io.Writer.Allocating = .init(self.gpa);
+    defer cmd.deinit();
+    cmd.writer.print("{{\"op\":\"pickoption\",\"req\":{d},\"timeout\":4000,\"arg\":", .{rid}) catch return;
+    jsonStr(&cmd.writer, want) catch return;
+    cmd.writer.writeByte('}') catch return;
+    self.sendScript(v, cmd.written());
 }
 
 /// Replace the script's `{"__kind":"node","eid":N,...}` markers with
@@ -1314,6 +1376,8 @@ pub fn onSetValue(self: *Host, v: *View, p: *Pending, json: []const u8) void {
         custom: u8 = 0,
         x: i32 = 0,
         y: i32 = 0,
+        w: i32 = 0,
+        h: i32 = 0,
         msg: []const u8 = "",
     };
     const s = std.json.parseFromSlice(S, self.gpa, json, .{ .ignore_unknown_fields = true }) catch return;
@@ -1325,30 +1389,21 @@ pub fn onSetValue(self: *Host, v: *View, p: *Pending, json: []const u8) void {
     if (s.value.custom != 0) {
         // Open the list with a real click, then go looking for the
         // option; both clicks are trusted, which is what a custom
-        // dropdown's own key handlers need to see.
+        // dropdown's own key handlers need to see, and both replay
+        // when the action asked for recorded motion.
+        const want = self.gpa.dupe(u8, p.arg) catch return;
+        if (p.motion_conn != 0) {
+            self.motionStartReach(v, p.motion_conn, .{ s.value.x, s.value.y, @max(s.value.w, 1), @max(s.value.h, 1) }, true, .{ .pick_open = .{ .sid = p.sid, .guarded = p.guarded, .want = want, .conn = p.motion_conn } }, null);
+            return;
+        }
         const pt = viewPoint(v, s.value.x, s.value.y);
         var ev = cef.cef_mouse_event_t{ .x = pt.x, .y = pt.y, .modifiers = 0 };
         withHostArgs(v, setFocus, .{@as(c_int, 1)});
         withHostArgs(v, sendMove, .{ &ev, @as(c_int, 0) });
         withHostArgs(v, sendClick, .{ &ev, cef.MBT_LEFT, @as(c_int, 0), @as(c_int, 1) });
         withHostArgs(v, sendClick, .{ &ev, cef.MBT_LEFT, @as(c_int, 1), @as(c_int, 1) });
-        const want = self.gpa.dupe(u8, p.arg) catch return;
-        const rid = self.pushPending(v, .{
-            .req = nextReq(v),
-            .kind = .choose_pick,
-            .sid = p.sid,
-            .guarded = p.guarded,
-            .arg = want,
-        }) catch {
-            self.gpa.free(want);
-            return;
-        };
-        var cmd: std.Io.Writer.Allocating = .init(self.gpa);
-        defer cmd.deinit();
-        cmd.writer.print("{{\"op\":\"pickoption\",\"req\":{d},\"timeout\":4000,\"arg\":", .{rid}) catch return;
-        jsonStr(&cmd.writer, p.arg) catch return;
-        cmd.writer.writeByte('}') catch return;
-        self.sendScript(v, cmd.written());
+        v.motion_ptr = .{ @floatFromInt(s.value.x), @floatFromInt(s.value.y) };
+        semPickOption(self, v, p.sid, p.guarded, want, 0, 0);
         return;
     }
     if (s.value.typeable == 0) {
