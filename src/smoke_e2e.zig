@@ -947,7 +947,7 @@ pub fn main() u8 {
         const app = drive orelse return fail("focused motion smoke has no display driver");
         if (!have_wl) return fail("focused motion smoke is GTK/Wayland-only");
         if (motionTrainerStage(allocator, app, sock_path, rt, &wl_z)) |why| return failMsg(why);
-        say("motion trainer: CLI and palette open it, injected reaches + Ctrl+S install a valid pack");
+        say("motion trainer: CLI and palette open it, injected reaches + Ctrl+S install a valid pack, reopening continues it");
         teardown();
         return 0;
     }
@@ -6233,7 +6233,9 @@ fn waitTitled(app: *appdrive.App, title: []const u8, ms: u32) ?u32 {
 /// opens its window, the palette's "Record Motion Pack" opens it from a
 /// running GUI, and injected pointer reaches onto the magenta targets
 /// (moved in steps, pressed, released) plus Ctrl+S install a pack that
-/// validates. The motion is the rig's, never a person's.
+/// validates. Reopened, the trainer offers to continue that pack, and a
+/// second save ADDS the new reaches to it. The motion is the rig's,
+/// never a person's.
 fn motionTrainerStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]const u8, rt: []const u8, wl: [*:0]const u8) ?[]const u8 {
     _ = app.drainLive(1_000);
     // The CLI entry point opens the window as its own application.
@@ -6255,6 +6257,92 @@ fn motionTrainerStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_pat
     }
 
     // The palette opens it from the running GUI.
+    var win: u32 = 0;
+    if (openMotionTrainer(allocator, app, sock_path, &win)) |why| return why;
+    var pack_name: [256]u8 = undefined;
+    var pack_name_len: usize = 0;
+    var first_reaches: usize = 0;
+    {
+        defer {
+            app.closeWindow(win) catch {};
+            _ = waitToplevelGone(app, win, 5_000);
+        }
+        if (motionClicks(allocator, app, win, 6)) |why| return why;
+
+        app.pressKey(win, "ctrl+s") catch return "pressing Ctrl+S in the trainer failed";
+        var dir_buf: [512:0]u8 = undefined;
+        const dir = std.fmt.bufPrintZ(&dir_buf, "{s}/sketerm/motion-packs", .{rt}) catch return "packs dir";
+        var found: ?[]u8 = null;
+        defer if (found) |f| allocator.free(f);
+        var waited: u32 = 0;
+        while (waited < 10_000 and found == null) : (waited += 100) {
+            pumpFor(app, 100);
+            const d = c.opendir(dir.ptr) orelse continue;
+            defer _ = c.closedir(d);
+            while (c.readdir(d)) |ent| {
+                const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
+                if (!std.mem.endsWith(u8, name, ".json")) continue;
+                const path = std.fmt.bufPrint(&pack_name, "{s}/{s}", .{ dir, name }) catch continue;
+                found = @import("util/readfile.zig").cappedAlloc(allocator, path, 32 << 20) catch null;
+                if (found != null) {
+                    pack_name_len = path.len;
+                    break;
+                }
+            }
+        }
+        const bytes = found orelse {
+            shotTo(allocator, app, win, "zig-out/smoke-e2e-motion-trainer.png");
+            return "Ctrl+S in the trainer installed no pack (window: zig-out/smoke-e2e-motion-trainer.png)";
+        };
+        var arena: std.heap.ArenaAllocator = .init(allocator);
+        defer arena.deinit();
+        var diag: @import("motion/pack.zig").Diag = .{};
+        const pk = @import("motion/pack.zig").parse(arena.allocator(), bytes, &diag) catch {
+            _ = c.fprintf(platform.stderr(), "smoke-e2e: trainer pack refused: %.*s\n", @as(c_int, @intCast(diag.len)), &diag.buf);
+            return "the trainer's pack does not validate";
+        };
+        _ = c.fprintf(platform.stderr(), "smoke-e2e: trainer pack: device %s, %.0f Hz, %d reaches, %s clock\n", @tagName(pk.header.device).ptr, pk.header.rate_hz, @as(c_int, @intCast(pk.reaches.len)), @tagName(pk.header.clock).ptr);
+        if (pk.reaches.len < 5) return "the trainer's pack holds fewer than five of the six clicked reaches";
+        // sketerm's own display must stamp every input event: with time 0 the
+        // trainer falls back to arrival time, and every forwarded app reads
+        // any second click as a double-click.
+        if (pk.header.clock != .device) return "the display delivered input events without timestamps (the pack fell back to arrival time)";
+        first_reaches = pk.reaches.len;
+    }
+
+    // Reopened, the trainer asks on the first pointer motion whether to
+    // continue the installed pack; Enter takes the default, Continue.
+    if (openMotionTrainer(allocator, app, sock_path, &win)) |why| return why;
+    defer {
+        app.closeWindow(win) catch {};
+        _ = waitToplevelGone(app, win, 5_000);
+    }
+    for (app.windows.items) |w| if (w.id == win) {
+        _ = app.moveMouse(win, @as(f64, @floatFromInt(w.w)) / 2, @as(f64, @floatFromInt(w.h)) / 2) catch return "placing the pointer in the reopened trainer failed";
+    };
+    pumpFor(app, 1_500);
+    _ = app.waitIdle(300, 5_000);
+    app.pressKey(win, "Return") catch return "answering the trainer's Continue question failed";
+    pumpFor(app, 800);
+    if (motionClicks(allocator, app, win, 3)) |why| return why;
+    app.pressKey(win, "ctrl+s") catch return "pressing Ctrl+S in the reopened trainer failed";
+    const path = pack_name[0..pack_name_len];
+    var now_reaches: usize = 0;
+    var waited: u32 = 0;
+    while (waited < 10_000 and now_reaches <= first_reaches) : (waited += 100) {
+        pumpFor(app, 100);
+        now_reaches = installedReaches(allocator, path) orelse 0;
+    }
+    _ = c.fprintf(platform.stderr(), "smoke-e2e: continued trainer pack: %d reaches (was %d)\n", @as(c_int, @intCast(now_reaches)), @as(c_int, @intCast(first_reaches)));
+    // The window after the continued save, for a reviewer's eye.
+    pumpFor(app, 300);
+    shotTo(allocator, app, win, "zig-out/smoke-e2e-motion-continue.png");
+    if (now_reaches <= first_reaches) return "saving a continued pack did not add reaches to it (window: zig-out/smoke-e2e-motion-continue.png)";
+    return null;
+}
+
+/// Open the trainer through the command palette; `out` is its window.
+fn openMotionTrainer(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]const u8, out: *u32) ?[]const u8 {
     const main_id = mainWin(app).id;
     app.focusWindow(main_id) catch return "activating the window for the palette failed";
     _ = app.waitIdle(300, 5_000);
@@ -6265,15 +6353,14 @@ fn motionTrainerStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_pat
     allocator.free(opened);
     if (!app.waitChangeSince(main_id, &ref, 15_000, 0.01, null)) return "the command palette did not open";
     if (editorlang_stage.paletteQuery(allocator, app, main_id, main_id, "record motion")) |why| return why;
-    const win = waitTitled(app, "Record Motion Pack", 15_000) orelse return "the palette's Record Motion Pack row did not open the trainer";
-    defer {
-        app.closeWindow(win) catch {};
-        _ = waitToplevelGone(app, win, 5_000);
-    }
+    out.* = waitTitled(app, "Record Motion Pack", 15_000) orelse return "the palette's Record Motion Pack row did not open the trainer";
     _ = app.waitIdle(300, 5_000);
-    app.focusWindow(win) catch return "activating the trainer failed";
+    app.focusWindow(out.*) catch return "activating the trainer failed";
+    return null;
+}
 
-    // Reaches: find the magenta target, move there in steps, click it.
+/// Click `want` magenta targets: find each, move there in steps, click.
+fn motionClicks(allocator: std.mem.Allocator, app: *appdrive.App, win: u32, want: usize) ?[]const u8 {
     var w_w: f64 = 0;
     var w_h: f64 = 0;
     for (app.windows.items) |w| if (w.id == win) {
@@ -6285,7 +6372,7 @@ fn motionTrainerStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_pat
     _ = app.moveMouse(win, at[0], at[1]) catch return "placing the pointer in the trainer failed";
     var reaches: usize = 0;
     var tries: usize = 0;
-    while (reaches < 6 and tries < 40) : (tries += 1) {
+    while (reaches < want and tries < 40) : (tries += 1) {
         _ = app.moveMouse(win, at[0] + 1, at[1]) catch return "pointer move failed";
         _ = app.drainLive(300);
         const shot = app.snapshotRgba(win, null) catch continue;
@@ -6307,45 +6394,19 @@ fn motionTrainerStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_pat
         at = goal;
         reaches += 1;
     }
-    if (reaches < 6) return "the trainer did not show six targets to click";
+    if (reaches < want) return "the trainer did not show the targets to click";
+    return null;
+}
 
-    app.pressKey(win, "ctrl+s") catch return "pressing Ctrl+S in the trainer failed";
-    var dir_buf: [512:0]u8 = undefined;
-    const dir = std.fmt.bufPrintZ(&dir_buf, "{s}/sketerm/motion-packs", .{rt}) catch return "packs dir";
-    var found: ?[]u8 = null;
-    defer if (found) |f| allocator.free(f);
-    var waited: u32 = 0;
-    while (waited < 10_000 and found == null) : (waited += 100) {
-        pumpFor(app, 100);
-        const d = c.opendir(dir.ptr) orelse continue;
-        defer _ = c.closedir(d);
-        while (c.readdir(d)) |ent| {
-            const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
-            if (!std.mem.endsWith(u8, name, ".json")) continue;
-            var pbuf: [700]u8 = undefined;
-            const path = std.fmt.bufPrint(&pbuf, "{s}/{s}", .{ dir, name }) catch continue;
-            found = @import("util/readfile.zig").cappedAlloc(allocator, path, 32 << 20) catch null;
-            if (found != null) break;
-        }
-    }
-    const bytes = found orelse {
-        shotTo(allocator, app, win, "zig-out/smoke-e2e-motion-trainer.png");
-        return "Ctrl+S in the trainer installed no pack (window: zig-out/smoke-e2e-motion-trainer.png)";
-    };
+/// The reach count of the pack file at `path`, or null when unreadable.
+fn installedReaches(allocator: std.mem.Allocator, path: []const u8) ?usize {
+    const bytes = @import("util/readfile.zig").cappedAlloc(allocator, path, 32 << 20) catch return null;
+    defer allocator.free(bytes);
     var arena: std.heap.ArenaAllocator = .init(allocator);
     defer arena.deinit();
     var diag: @import("motion/pack.zig").Diag = .{};
-    const pk = @import("motion/pack.zig").parse(arena.allocator(), bytes, &diag) catch {
-        _ = c.fprintf(platform.stderr(), "smoke-e2e: trainer pack refused: %.*s\n", @as(c_int, @intCast(diag.len)), &diag.buf);
-        return "the trainer's pack does not validate";
-    };
-    _ = c.fprintf(platform.stderr(), "smoke-e2e: trainer pack: device %s, %.0f Hz, %d reaches, %s clock\n", @tagName(pk.header.device).ptr, pk.header.rate_hz, @as(c_int, @intCast(pk.reaches.len)), @tagName(pk.header.clock).ptr);
-    if (pk.reaches.len < 5) return "the trainer's pack holds fewer than five of the six clicked reaches";
-    // sketerm's own display must stamp every input event: with time 0 the
-    // trainer falls back to arrival time, and every forwarded app reads
-    // any second click as a double-click.
-    if (pk.header.clock != .device) return "the display delivered input events without timestamps (the pack fell back to arrival time)";
-    return null;
+    const pk = @import("motion/pack.zig").parse(arena.allocator(), bytes, &diag) catch return null;
+    return pk.reaches.len;
 }
 
 fn waitToplevelGone(app: *appdrive.App, id: u32, ms: u32) bool {
