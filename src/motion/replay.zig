@@ -265,6 +265,108 @@ pub fn entryPoint(view_w: f64, view_h: f64, target: [2]f64, rng: std.Random) [2]
     return .{ slide_x, view_h - 1 };
 }
 
+/// A recorded idle segment that wanders further than this was a hand
+/// moving, not resting, and is never replayed as drift: a drifting
+/// pointer must not travel onto things a resting hand would not reach.
+pub const DRIFT_MAX_EXTENT_PX: f64 = 24;
+/// The rest before a drift segment, after another one or after any
+/// action on the view, ms (drawn uniformly per rest).
+pub const DRIFT_REST_MIN_MS: f64 = 900;
+pub const DRIFT_REST_MAX_MS: f64 = 4000;
+
+/// Whether `seg` may be replayed as idle drift.
+pub fn driftable(seg: pack_mod.Idle) bool {
+    if (seg.samples.len < 2) return false;
+    const e = seg.extent();
+    return e >= 1 and e <= DRIFT_MAX_EXTENT_PX;
+}
+
+/// Whether `pack` holds any segment idle drift can replay.
+pub fn driftUsable(pack: Pack) bool {
+    for (pack.idle) |seg| if (driftable(seg)) return true;
+    return false;
+}
+
+/// When idle drift may move next, in ms on the caller's clock. Drift
+/// runs only after a rest, and anything else touching the view (an
+/// action, live input, a hidden page) restarts that rest.
+pub const DriftClock = struct {
+    rest_until: f64 = 0,
+
+    /// The view was busy at `now`: no drift before a fresh rest has passed.
+    pub fn yield(self: *DriftClock, now: f64, rng: std.Random) void {
+        self.rest_until = @max(self.rest_until, now + restMs(rng));
+    }
+
+    /// A drift segment ended at `now`.
+    pub fn rest(self: *DriftClock, now: f64, rng: std.Random) void {
+        self.rest_until = now + restMs(rng);
+    }
+
+    pub fn due(self: DriftClock, now: f64) bool {
+        return now >= self.rest_until;
+    }
+
+    fn restMs(rng: std.Random) f64 {
+        return DRIFT_REST_MIN_MS + (DRIFT_REST_MAX_MS - DRIFT_REST_MIN_MS) * rng.float(f64);
+    }
+};
+
+/// One idle-drift segment replayed from `from` in a `view_w` x `view_h`
+/// view: the recorded wander as it is (never scaled or jittered),
+/// mirrored on an axis it would leave the view along and clamped inside
+/// it, reduced to the moves that change the whole-pixel position. Empty
+/// when the wander rounds to no movement at all.
+pub fn planDrift(gpa: std.mem.Allocator, pack: Pack, from: [2]f64, view_w: f64, view_h: f64, recent: *Recent, rng: std.Random) ![]Move {
+    var usable: usize = 0;
+    for (pack.idle) |seg| {
+        if (driftable(seg)) usable += 1;
+    }
+    if (usable == 0) return error.NoIdle;
+    const window = exclusionWindow(usable);
+    var pick: ?u32 = null;
+    var seen: usize = 0;
+    for (0..2) |pass| {
+        for (pack.idle, 0..) |seg, i| {
+            const idx: u32 = @intCast(i);
+            if (!driftable(seg) or (pass == 0 and recent.contains(idx, window))) continue;
+            seen += 1;
+            if (rng.uintLessThan(usize, seen) == 0) pick = idx;
+        }
+        if (pick != null) break;
+    }
+    const idx = pick.?;
+    recent.push(idx);
+    const samples = pack.idle[idx].samples;
+    const o = samples[0];
+    var lo = [2]f64{ 0, 0 };
+    var hi = [2]f64{ 0, 0 };
+    for (samples) |s| {
+        lo = .{ @min(lo[0], s.x - o.x), @min(lo[1], s.y - o.y) };
+        hi = .{ @max(hi[0], s.x - o.x), @max(hi[1], s.y - o.y) };
+    }
+    const lim = [2]f64{ @max(view_w - 1, 0), @max(view_h - 1, 0) };
+    var sign = [2]f64{ 1, 1 };
+    inline for (0..2) |k| {
+        const leaves = from[k] + hi[k] > lim[k] or from[k] + lo[k] < 0;
+        const mirrored_fits = from[k] - hi[k] >= 0 and from[k] - lo[k] <= lim[k];
+        if (leaves and mirrored_fits) sign[k] = -1;
+    }
+    var out: std.ArrayList(Move) = .empty;
+    errdefer out.deinit(gpa);
+    var last = [2]f64{ @round(std.math.clamp(from[0], 0, lim[0])), @round(std.math.clamp(from[1], 0, lim[1])) };
+    for (samples) |s| {
+        const px = [2]f64{
+            @round(std.math.clamp(from[0] + sign[0] * (s.x - o.x), 0, lim[0])),
+            @round(std.math.clamp(from[1] + sign[1] * (s.y - o.y), 0, lim[1])),
+        };
+        if (px[0] == last[0] and px[1] == last[1]) continue;
+        try out.append(gpa, .{ .t = s.t - o.t, .x = px[0], .y = px[1] });
+        last = px;
+    }
+    return out.toOwnedSlice(gpa);
+}
+
 /// One typed character's edges, ms from the plan's start. The shift
 /// times are meaningful only for a character typed with Shift.
 pub const KeyTime = struct { down: f64, up: f64, shift_down: f64, shift_up: f64 };
@@ -578,4 +680,96 @@ test "a fresh view is entered from the edge nearest the target" {
     try testing.expectEqual(@as(f64, 0), left[0]);
     const bottom = entryPoint(1000, 800, .{ 500, 790 }, prng.random());
     try testing.expectEqual(@as(f64, 799), bottom[1]);
+}
+
+fn idlePack(segs: []const pack_mod.Idle) Pack {
+    return .{ .idle = segs };
+}
+
+test "drift replays the recorded wander unscaled, whole-pixel, in increasing time" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const p = try testPack(arena.allocator(), 3);
+    try testing.expect(driftUsable(p));
+    var recent: Recent = .{};
+    var prng = Rng.init(11);
+    for (0..20) |_| {
+        const moves = try planDrift(testing.allocator, p, .{ 500, 400 }, 1280, 800, &recent, prng.random());
+        defer testing.allocator.free(moves);
+        var last_t: f64 = -1;
+        var prev = [2]f64{ 500, 400 };
+        for (moves) |m| {
+            try testing.expect(m.t > last_t);
+            last_t = m.t;
+            try testing.expectEqual(@round(m.x), m.x);
+            try testing.expectEqual(@round(m.y), m.y);
+            try testing.expect(m.x != prev[0] or m.y != prev[1]);
+            prev = .{ m.x, m.y };
+            // Never further from the rest point than a resting hand goes.
+            try testing.expect(@abs(m.x - 500) <= DRIFT_MAX_EXTENT_PX + 1);
+            try testing.expect(@abs(m.y - 400) <= DRIFT_MAX_EXTENT_PX + 1);
+        }
+    }
+}
+
+test "drift at the view's edge mirrors inward and never leaves the view" {
+    // A wander that heads right and down by up to 10 px.
+    const s = [_]pack_mod.Sample{ .{ .t = 0, .x = 0, .y = 0 }, .{ .t = 40, .x = 4, .y = 3 }, .{ .t = 80, .x = 10, .y = 8 }, .{ .t = 120, .x = 7, .y = 10 } };
+    const segs = [_]pack_mod.Idle{.{ .samples = &s }};
+    const p = idlePack(&segs);
+    var recent: Recent = .{};
+    var prng = Rng.init(5);
+    const moves = try planDrift(testing.allocator, p, .{ 1279, 799 }, 1280, 800, &recent, prng.random());
+    defer testing.allocator.free(moves);
+    try testing.expectEqual(@as(usize, 3), moves.len);
+    for (moves) |m| {
+        try testing.expect(m.x >= 0 and m.x <= 1279 and m.y >= 0 and m.y <= 799);
+    }
+    // Mirrored, not flattened against the edge: the shape survives.
+    try testing.expectEqual(@as(f64, 1269), moves[1].x);
+    try testing.expectEqual(@as(f64, 791), moves[1].y);
+    // A view too small for either orientation is clamped instead.
+    const tiny = try planDrift(testing.allocator, p, .{ 2, 2 }, 6, 6, &recent, prng.random());
+    defer testing.allocator.free(tiny);
+    for (tiny) |m| try testing.expect(m.x >= 0 and m.x <= 5 and m.y >= 0 and m.y <= 5);
+}
+
+test "a moving hand or a still one is not drift, and a pack without drift has none" {
+    const far = [_]pack_mod.Sample{ .{ .t = 0, .x = 0, .y = 0 }, .{ .t = 40, .x = 120, .y = 0 } };
+    const still = [_]pack_mod.Sample{ .{ .t = 0, .x = 0, .y = 0 }, .{ .t = 40, .x = 0.2, .y = 0.1 } };
+    const segs = [_]pack_mod.Idle{ .{ .samples = &far }, .{ .samples = &still } };
+    const p = idlePack(&segs);
+    try testing.expect(!driftUsable(p));
+    var recent: Recent = .{};
+    var prng = Rng.init(1);
+    try testing.expectError(error.NoIdle, planDrift(testing.allocator, p, .{ 10, 10 }, 100, 100, &recent, prng.random()));
+    try testing.expect(!driftUsable(.{}));
+}
+
+test "drift waits a full rest after anything else touched the view" {
+    var prng = Rng.init(9);
+    var clock: DriftClock = .{};
+    try testing.expect(clock.due(0));
+    clock.yield(1000, prng.random());
+    try testing.expect(!clock.due(1000 + DRIFT_REST_MIN_MS - 1));
+    try testing.expect(clock.due(1000 + DRIFT_REST_MAX_MS));
+    // Yielding again while busy only ever pushes the rest later.
+    const before = clock.rest_until;
+    clock.yield(1001, prng.random());
+    try testing.expect(clock.rest_until >= before);
+    clock.rest(20_000, prng.random());
+    try testing.expect(!clock.due(20_000 + DRIFT_REST_MIN_MS - 1));
+    try testing.expect(clock.due(20_000 + DRIFT_REST_MAX_MS));
+}
+
+test "every synthetic idle segment is replayable drift" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    // smoke-web's drift stage replays the generated pack: its idle
+    // segments must all pass the resting-hand filter.
+    for (1..6) |seed| {
+        const p = try testPack(arena.allocator(), seed);
+        try testing.expect(p.idle.len >= 2);
+        for (p.idle) |seg| try testing.expect(driftable(seg));
+    }
 }

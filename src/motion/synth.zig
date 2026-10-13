@@ -91,8 +91,8 @@ pub fn generate(gpa: std.mem.Allocator, opts: Options) ![]u8 {
         var x: f64 = 0;
         var y: f64 = 0;
         for (samples, 0..) |*s, k| {
-            x += (rng.float(f64) - 0.5) * 0.8;
-            y += (rng.float(f64) - 0.5) * 0.8;
+            x += (rng.float(f64) - 0.5) * 2.4;
+            y += (rng.float(f64) - 0.5) * 2.4;
             s.* = .{ .t = @as(f64, @floatFromInt(k)) * 40, .x = x, .y = y };
         }
         try idle.append(a, .{ .samples = samples });

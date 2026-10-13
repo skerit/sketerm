@@ -134,7 +134,23 @@ pub const Burst = struct {
     }
 };
 
-pub const Idle = struct { samples: []const Sample };
+/// A resting hand's wander: samples in ms and CSS px, relative to the
+/// segment's own first sample.
+pub const Idle = struct {
+    samples: []const Sample,
+
+    /// The larger side of the wander's bounding box, px.
+    pub fn extent(self: Idle) f64 {
+        if (self.samples.len == 0) return 0;
+        var lo = [2]f64{ self.samples[0].x, self.samples[0].y };
+        var hi = lo;
+        for (self.samples) |s| {
+            lo = .{ @min(lo[0], s.x), @min(lo[1], s.y) };
+            hi = .{ @max(hi[0], s.x), @max(hi[1], s.y) };
+        }
+        return @max(hi[0] - lo[0], hi[1] - lo[1]);
+    }
+};
 
 /// Per key class hold times and per class-pair down-to-down flight
 /// times, in ms, as observed (an empirical distribution, drawn from).
