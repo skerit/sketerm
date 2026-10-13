@@ -1,8 +1,7 @@
 //! Test doubles shared by the MCP modules' unit tests: a scripted GUI
-//! backend and an environment snapshot. Referenced only from tests.
+//! backend. Referenced only from tests.
 
 const std = @import("std");
-const c = @import("../c.zig").c;
 const mcp = @import("mcp.zig");
 const Backend = mcp.Backend;
 const DirectTalkFailure = mcp.DirectTalkFailure;
@@ -92,35 +91,3 @@ pub const FakeBackend = struct {
 pub fn parseTestValue(a: std.mem.Allocator, json: []const u8) !std.json.Value {
     return std.json.parseFromSliceLeaky(std.json.Value, a, json, .{});
 }
-
-/// One environment variable saved, cleared and put back, without an
-/// allocator (a test helper must not perturb `std.testing.allocator`'s
-/// leak accounting). A value longer than the buffer is refused rather
-/// than truncated: silently restoring a different value is worse than
-/// failing the test that clobbered it.
-pub const EnvSave = struct {
-    name: [*:0]const u8 = "",
-    buf: [512]u8 = undefined,
-    had: bool = false,
-
-    pub fn take(self: *EnvSave, name: [*:0]const u8) !void {
-        self.* = .{ .name = name };
-        if (c.getenv(name)) |raw| {
-            const value = std.mem.span(@as([*:0]const u8, @ptrCast(raw)));
-            if (value.len >= self.buf.len) return error.EnvValueTooLong;
-            @memcpy(self.buf[0..value.len], value);
-            self.buf[value.len] = 0;
-            self.had = true;
-        }
-        _ = c.unsetenv(name);
-    }
-
-    pub fn restore(self: *EnvSave) void {
-        if (self.name[0] == 0) return;
-        if (self.had) {
-            _ = c.setenv(self.name, @ptrCast(&self.buf), 1);
-        } else {
-            _ = c.unsetenv(self.name);
-        }
-    }
-};

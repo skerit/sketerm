@@ -24,6 +24,43 @@ pub fn nonEmpty(name: [*:0]const u8) ?[]const u8 {
     return if (v.len == 0) null else v;
 }
 
+/// One environment variable saved, cleared and put back, without an
+/// allocator (a test helper must not perturb `std.testing.allocator`'s
+/// leak accounting). A value longer than the buffer is refused rather
+/// than truncated: silently restoring a different value is worse than
+/// failing the test that clobbered it.
+pub const Saved = struct {
+    name: [*:0]const u8 = "",
+    buf: [4096]u8 = undefined,
+    had: bool = false,
+
+    pub fn take(self: *Saved, name: [*:0]const u8) !void {
+        self.* = .{ .name = name };
+        if (get(name)) |value| {
+            if (value.len >= self.buf.len) return error.EnvValueTooLong;
+            @memcpy(self.buf[0..value.len], value);
+            self.buf[value.len] = 0;
+            self.had = true;
+        }
+        _ = c.unsetenv(name);
+    }
+
+    /// `take`, then set the variable to `value`.
+    pub fn override(self: *Saved, name: [*:0]const u8, value: [*:0]const u8) !void {
+        try self.take(name);
+        _ = c.setenv(name, value, 1);
+    }
+
+    pub fn restore(self: *Saved) void {
+        if (self.name[0] == 0) return;
+        if (self.had) {
+            _ = c.setenv(self.name, @ptrCast(&self.buf), 1);
+        } else {
+            _ = c.unsetenv(self.name);
+        }
+    }
+};
+
 test "get and nonEmpty disagree only on an empty variable" {
     const t = std.testing;
     _ = c.setenv("SKETERM_TEST_ENV_SET", "value", 1);
@@ -41,4 +78,20 @@ test "get and nonEmpty disagree only on an empty variable" {
 
     _ = c.unsetenv("SKETERM_TEST_ENV_SET");
     _ = c.unsetenv("SKETERM_TEST_ENV_EMPTY");
+}
+
+test "Saved puts back a set variable and unsets one that was unset" {
+    const t = std.testing;
+    _ = c.setenv("SKETERM_TEST_ENV_SAVED", "before", 1);
+    _ = c.unsetenv("SKETERM_TEST_ENV_SAVED_NONE");
+    var a: Saved = .{};
+    try a.override("SKETERM_TEST_ENV_SAVED", "during");
+    var b: Saved = .{};
+    try b.override("SKETERM_TEST_ENV_SAVED_NONE", "during");
+    try t.expectEqualStrings("during", get("SKETERM_TEST_ENV_SAVED").?);
+    b.restore();
+    a.restore();
+    try t.expectEqualStrings("before", get("SKETERM_TEST_ENV_SAVED").?);
+    try t.expectEqual(@as(?[]const u8, null), get("SKETERM_TEST_ENV_SAVED_NONE"));
+    _ = c.unsetenv("SKETERM_TEST_ENV_SAVED");
 }

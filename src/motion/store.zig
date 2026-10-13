@@ -205,34 +205,12 @@ pub fn freeList(gpa: std.mem.Allocator, entries: []Entry) void {
     gpa.free(entries);
 }
 
-/// A test's override of one environment variable, undone by `restore`.
-const EnvOverride = struct {
-    name: [*:0]const u8,
-    buf: [4096]u8 = undefined,
-    old_len: ?usize = null,
-
-    fn set(self: *EnvOverride, value: [*:0]const u8) void {
-        if (@import("../util/env.zig").get(self.name)) |o| if (o.len < self.buf.len) {
-            @memcpy(self.buf[0..o.len], o);
-            self.buf[o.len] = 0;
-            self.old_len = o.len;
-        };
-        _ = c.setenv(self.name, value, 1);
-    }
-
-    fn restore(self: *EnvOverride) void {
-        if (self.old_len) |n| {
-            _ = c.setenv(self.name, self.buf[0..n :0].ptr, 1);
-        } else _ = c.unsetenv(self.name);
-    }
-};
-
 test "install, list, load and remove a generated pack under XDG_DATA_HOME" {
     const t = std.testing;
     const td = pathz.TempDir.make("motion") orelse return error.SkipZigTest;
     defer td.remove();
-    var data: EnvOverride = .{ .name = "XDG_DATA_HOME" };
-    data.set(td.pathZ());
+    var data: @import("../util/env.zig").Saved = .{};
+    try data.override("XDG_DATA_HOME", td.pathZ());
     defer data.restore();
 
     const bytes = try @import("synth.zig").generate(t.allocator, .{ .seed = 9 });
@@ -270,8 +248,8 @@ test "a draft saves under XDG_STATE_HOME privately, loads, and is removed" {
     const t = std.testing;
     const td = pathz.TempDir.make("motiondraft") orelse return error.SkipZigTest;
     defer td.remove();
-    var state: EnvOverride = .{ .name = "XDG_STATE_HOME" };
-    state.set(td.pathZ());
+    var state: @import("../util/env.zig").Saved = .{};
+    try state.override("XDG_STATE_HOME", td.pathZ());
     defer state.restore();
 
     var buf: [4096]u8 = undefined;
