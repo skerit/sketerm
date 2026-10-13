@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const c = @import("../../c.zig").c;
+const unsetEnv = @import("../../util/env.zig").unset;
 const platform = @import("../../util/platform.zig");
 const wire = @import("../../mux/wire.zig");
 
@@ -2185,7 +2186,7 @@ pub fn verifyInlineRenameTeardown(self: *BrowserView, tab: ?*BTab, scope: []cons
     }
     // A split close can leave another BrowserView alive in the same
     // process; only the close this smoke armed is expected to assert.
-    _ = c.unsetenv("SKETERM_VERIFY_INLINE_RENAME_TEARDOWN");
+    _ = unsetEnv("SKETERM_VERIFY_INLINE_RENAME_TEARDOWN");
 }
 
 fn disposeInlineRename(ctx: *InlineRename, refocus: bool) void {

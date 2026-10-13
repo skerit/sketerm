@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const c = @import("c.zig").c;
+const unsetEnv = @import("util/env.zig").unset;
 const client_mod = @import("mux/client.zig");
 const wire = @import("mux/wire.zig");
 const wlpipe = @import("wlhost/pipe.zig");
@@ -123,7 +124,7 @@ fn spawn(wl: []const u8, argv: []const [*:0]const u8) Child {
         _ = c.close(pfds[0]);
         _ = c.close(pfds[1]);
         _ = c.setenv("WAYLAND_DISPLAY", wz.ptr, 1);
-        _ = c.unsetenv("DISPLAY");
+        _ = unsetEnv("DISPLAY");
         _ = c.execv(args[0].?, @ptrCast(&args));
         c._exit(127);
     }

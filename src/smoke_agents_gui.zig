@@ -25,6 +25,7 @@
 
 const std = @import("std");
 const c = @import("c.zig").c;
+const unsetEnv = @import("util/env.zig").unset;
 const platform = @import("util/platform.zig");
 const appdrive = @import("ipc/appdrive.zig");
 const clock = @import("util/clock.zig");
@@ -131,7 +132,7 @@ const Theme = enum {
 
     /// In the GUI child, before exec.
     fn apply(self: Theme) void {
-        _ = c.unsetenv("GTK_THEME");
+        _ = unsetEnv("GTK_THEME");
         switch (self) {
             .light => _ = c.setenv("ADW_DEBUG_COLOR_SCHEME", "prefer-light", 1),
             .dark => _ = c.setenv("ADW_DEBUG_COLOR_SCHEME", "prefer-dark", 1),
@@ -410,7 +411,7 @@ pub fn main() u8 {
     _ = c.setenv("XDG_RUNTIME_DIR", rt.ptr, 1);
     _ = c.setenv("XDG_CONFIG_HOME", rt.ptr, 1);
     _ = c.setenv("XDG_STATE_HOME", rt.ptr, 1);
-    for ([_][*:0]const u8{ "SKETERM_SOCKET", "SKETERM_MUX_SOCKET", "SKETERM_SESSION", "SKETERM_PANE_ID", "SKETERM_SESSION_ORIGIN_ID" }) |name| _ = c.unsetenv(name);
+    for ([_][*:0]const u8{ "SKETERM_SOCKET", "SKETERM_MUX_SOCKET", "SKETERM_SESSION", "SKETERM_PANE_ID", "SKETERM_SESSION_ORIGIN_ID" }) |name| _ = unsetEnv(name);
     defer @import("util/pathz.zig").removeTree(rt);
     // Isolated XDG_CONFIG_HOME races pango/fontconfig unless warmed.
     _ = c.system("fc-cache >/dev/null 2>&1");
@@ -461,7 +462,7 @@ pub fn main() u8 {
         _ = c.setenv("SKETERM_APP_ID", "dev.sker.sketerm.agentsmoke", 1);
         _ = c.setenv("WAYLAND_DISPLAY", &wl_z, 1);
         _ = c.setenv("GDK_BACKEND", "wayland", 1);
-        _ = c.unsetenv("DISPLAY");
+        _ = unsetEnv("DISPLAY");
         _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
         _ = c.setenv("GTK_A11Y", "none", 1);
         _ = c.setenv("SKETERM_WELCOME", "0", 1);

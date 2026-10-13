@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const c = @import("../c.zig").c;
+const unsetEnv = @import("../util/env.zig").unset;
 const clock = @import("../util/clock.zig");
 const muxclient = @import("../mux/client.zig");
 const muxdaemon = @import("../mux/daemon.zig");
@@ -535,7 +536,7 @@ test "paneldrive origin prefers exact environment and otherwise names only the d
     try t.expect(relative.socket[0] == '/');
     try t.expect(std.mem.endsWith(u8, relative.socket, "/relative-panel-origin.sock"));
 
-    _ = c.unsetenv("SKETERM_MUX_SOCKET");
+    _ = unsetEnv("SKETERM_MUX_SOCKET");
     var saved_runtime: EnvSave = .{};
     try saved_runtime.override("XDG_RUNTIME_DIR", "/tmp/paneldrive-origin-test");
     defer saved_runtime.restore();

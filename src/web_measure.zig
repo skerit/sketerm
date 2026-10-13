@@ -19,6 +19,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const c = @import("c.zig").c;
+const unsetEnv = @import("util/env.zig").unset;
 const platform = @import("util/platform.zig");
 const appdrive = @import("ipc/appdrive.zig");
 
@@ -124,7 +125,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     _ = c.setenv("XDG_CONFIG_HOME", rt.ptr, 1);
     _ = c.setenv("XDG_STATE_HOME", rt.ptr, 1);
     _ = c.setenv("XDG_CACHE_HOME", rt.ptr, 1);
-    _ = c.unsetenv("SKETERM_SOCKET");
+    _ = unsetEnv("SKETERM_SOCKET");
     _ = c.system("fc-cache >/dev/null 2>&1");
 
     const mux_pid = c.fork();
@@ -172,7 +173,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         _ = c.setenv("SKETERM_APP_ID", "dev.sker.sketerm.webmeasure", 1);
         _ = c.setenv("WAYLAND_DISPLAY", &wl_z, 1);
         _ = c.setenv("GDK_BACKEND", "wayland", 1);
-        _ = c.unsetenv("DISPLAY");
+        _ = unsetEnv("DISPLAY");
         _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
         _ = c.setenv("GTK_A11Y", "none", 1);
         // No first-run tour: a modal dialog would sit over the

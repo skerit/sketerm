@@ -1124,9 +1124,18 @@ pub fn build(b: *std.Build) void {
     const lint_errdefer_step = b.step("lint-errdefer", "Reject `errdefer` in functions that cannot return an error");
     lint_errdefer_step.dependOn(&lint_errdefer.step);
 
+    // A raw `unsetenv` on the startup environ array breaks std's
+    // fixed-length view of it; every removal goes through env.unset.
+    const env_removal = b.addSystemCommand(&.{"bash"});
+    env_removal.addFileArg(b.path("dist/test-env-removal.sh"));
+    env_removal.has_side_effects = true;
+    const env_removal_step = b.step("lint-env-removal", "Reject environment removals that bypass env.unset");
+    env_removal_step.dependOn(&env_removal.step);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&test_roots.step);
     test_step.dependOn(&lint_errdefer.step);
+    test_step.dependOn(&env_removal.step);
     test_step.dependOn(&run_tests.step);
 
     const atomicwrite_tests_mod = b.createModule(.{
@@ -1177,6 +1186,7 @@ pub fn build(b: *std.Build) void {
     const core_test_step = b.step("test-core", "Run the GTK-free unit-test subset (no GUI toolchain needed)");
     core_test_step.dependOn(&test_roots.step);
     core_test_step.dependOn(&lint_errdefer.step);
+    core_test_step.dependOn(&env_removal.step);
     core_test_step.dependOn(&b.addRunArtifact(coretests).step);
 
     // Optional CEF browser helper — `zig build fetch-cef` / `zig build
@@ -1184,7 +1194,7 @@ pub fn build(b: *std.Build) void {
     // step, the binary distribution is never downloaded unless the fetch
     // step is asked for by name, and the CEF headers are only translated
     // when that distribution is already on disk.
-    addCef(b, target, optimize, strip, use_lld, have_opus, core_cbindings_mod, mux_exe, mcp_exe, smoke_mcp_run, &test_roots.step, &lint_errdefer.step);
+    addCef(b, target, optimize, strip, use_lld, have_opus, core_cbindings_mod, mux_exe, mcp_exe, smoke_mcp_run, &test_roots.step, &lint_errdefer.step, &env_removal.step);
 }
 
 /// Pinned CEF binary distribution ("minimal" distro). SINGLE source of
@@ -1263,6 +1273,7 @@ fn addCef(
     smoke_mcp_run: *std.Build.Step.Run,
     test_roots: *std.Build.Step,
     lint_errdefer: *std.Build.Step,
+    env_removal: *std.Build.Step,
 ) void {
     // Default cache location, XDG-correct: $XDG_CACHE_HOME/sketerm/cef/
     // <version>/ (~/.cache/... when unset). Version-scoped so several
@@ -1435,6 +1446,7 @@ fn addCef(
     const test_web_step = b.step("test-web", "Run CEF-gated browser-helper unit tests");
     test_web_step.dependOn(test_roots);
     test_web_step.dependOn(lint_errdefer);
+    test_web_step.dependOn(env_removal);
     const smoke_web_step = b.step("smoke-web", "browser-helper end-to-end smoke (headless)");
     const bench_wreq_step = b.step("bench-webreq", "Blocking-webRequest added-latency benchmark (real helper, real page)");
     const native_untrusted_step = if (target.result.os.tag == .linux)

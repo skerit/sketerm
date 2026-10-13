@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const c = @import("../c.zig").c;
+const unsetEnv = @import("../util/env.zig").unset;
 const clock = @import("../util/clock.zig");
 const platform = @import("../util/platform.zig");
 const protocol = @import("protocol.zig");
@@ -1697,7 +1698,7 @@ test "an explicit empty ui session overrides SKETERM_SESSION for live and saved 
     try scratch.init("explicit-empty", true);
     defer scratch.deinit();
     _ = c.setenv("SKETERM_SESSION", "environment-session", 1);
-    defer _ = c.unsetenv("SKETERM_SESSION");
+    defer _ = unsetEnv("SKETERM_SESSION");
 
     var fake = FakeBackend{
         .responses = &.{"{\"ok\":true,\"panel_id\":17}"},
@@ -1733,7 +1734,7 @@ test "every ui tool rejects a present non-string session without fallback or sid
     try scratch.init("session-types", false);
     defer scratch.deinit();
     _ = c.setenv("SKETERM_SESSION", "environment-session", 1);
-    defer _ = c.unsetenv("SKETERM_SESSION");
+    defer _ = unsetEnv("SKETERM_SESSION");
 
     var fake = FakeBackend{ .responses = &.{}, .allocator = t.allocator };
     defer fake.deinit();
@@ -2072,7 +2073,7 @@ test "panel transport precedence is exact origin, explicit GUI, then default com
     exact.origin = try paneldrive.Origin.resolve(arena, "same");
     try t.expectEqualStrings("SKETERM_MUX_SOCKET", exact.source());
 
-    _ = c.unsetenv("SKETERM_MUX_SOCKET");
+    _ = unsetEnv("SKETERM_MUX_SOCKET");
     var explicit = UiTransport.init(arena, fake.backend(), "same");
     defer explicit.deinit();
     try t.expect(explicit.mode == .gui_socket);
@@ -2358,9 +2359,9 @@ test "relay to explicit direct fallback shares one deadline for ui_wait_event" {
     defer mcp.panel_pool = old_pool;
     _ = c.setenv("SKETERM_MUX_SOCKET", path.ptr, 1);
     _ = c.setenv("SKETERM_SESSION", "legacy-session", 1);
-    defer _ = c.unsetenv("SKETERM_MUX_SOCKET");
-    defer _ = c.unsetenv("SKETERM_SESSION");
-    _ = c.unsetenv("SKETERM_SESSION_ORIGIN_ID");
+    defer _ = unsetEnv("SKETERM_MUX_SOCKET");
+    defer _ = unsetEnv("SKETERM_SESSION");
+    _ = unsetEnv("SKETERM_SESSION_ORIGIN_ID");
 
     var fake = FakeBackend{
         .responses = &.{"{\"ok\":true,\"event_epoch\":\"10000000000000000000000000000001\",\"events\":[{\"seq\":1,\"component\":\"ok\",\"kind\":\"click\",\"value\":\"yes\",\"ts\":1}],\"cursor\":1,\"dropped_total\":0}"},
@@ -2921,9 +2922,9 @@ test "store-only panel tools refuse an unidentified exact daemon environment" {
     defer mcp.panel_pool = old_pool;
     _ = c.setenv("SKETERM_MUX_SOCKET", "/tmp/exact-pre-panel/mux.sock", 1);
     _ = c.setenv("SKETERM_SESSION", "old-session", 1);
-    _ = c.unsetenv("SKETERM_SESSION_ORIGIN_ID");
-    defer _ = c.unsetenv("SKETERM_MUX_SOCKET");
-    defer _ = c.unsetenv("SKETERM_SESSION");
+    _ = unsetEnv("SKETERM_SESSION_ORIGIN_ID");
+    defer _ = unsetEnv("SKETERM_MUX_SOCKET");
+    defer _ = unsetEnv("SKETERM_SESSION");
 
     var fake = FakeBackend{ .responses = &.{}, .allocator = t.allocator };
     defer fake.deinit();
@@ -2984,7 +2985,7 @@ test "explicit empty ui session selects sessionless despite inherited session" {
     try scratch.init("explicit-empty", false);
     defer scratch.deinit();
     _ = c.setenv("SKETERM_SESSION", "inherited-session", 1);
-    defer _ = c.unsetenv("SKETERM_SESSION");
+    defer _ = unsetEnv("SKETERM_SESSION");
 
     var fake = FakeBackend{ .responses = &.{}, .allocator = std.testing.allocator };
     defer fake.deinit();

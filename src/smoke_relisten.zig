@@ -17,6 +17,7 @@
 
 const std = @import("std");
 const c = @import("c.zig").c;
+const unsetEnv = @import("util/env.zig").unset;
 const platform = @import("util/platform.zig");
 const pathz = @import("util/pathz.zig");
 const clock = @import("util/clock.zig");
@@ -51,7 +52,7 @@ const Env = struct {
             if (self.saved[i]) |v| {
                 _ = c.setenv(n.ptr, v.ptr, 1);
                 allocator.free(v);
-            } else _ = c.unsetenv(n.ptr);
+            } else _ = unsetEnv(n.ptr);
         }
     }
 };

@@ -21,6 +21,7 @@
 
 const std = @import("std");
 const c = @import("c.zig").c;
+const unsetEnv = @import("util/env.zig").unset;
 const client_mod = @import("mux/client.zig");
 const muxrig = @import("smoke/muxrig.zig");
 const lifetime = @import("util/lifetime.zig");
@@ -356,7 +357,7 @@ pub fn main() u8 {
 
     // The app may only reach the session's own display; the rig's
     // shell must not leak an X server or a host compositor into it.
-    _ = c.unsetenv("DISPLAY");
+    _ = unsetEnv("DISPLAY");
     _ = c.setenv("SKETERM_WINSTREAM", "off", 1);
 
     var path_buf: [128]u8 = undefined;

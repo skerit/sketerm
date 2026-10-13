@@ -42,6 +42,7 @@
 
 const std = @import("std");
 const c = @import("c.zig").c;
+const unsetEnv = @import("util/env.zig").unset;
 const proto = @import("web/protocol.zig");
 const axtree = @import("web/axtree.zig");
 const webproj = @import("a11y/webproj.zig");
@@ -385,7 +386,7 @@ pub fn main() !void {
         _ = c.setenv("SKETERM_WEB_A11Y", "1", 1);
         if (!a11ydetect.detect(gpa).enabled())
             fail("SKETERM_WEB_A11Y=1 did not force accessibility on");
-        _ = c.unsetenv("SKETERM_WEB_A11Y");
+        _ = unsetEnv("SKETERM_WEB_A11Y");
 
         // Point the probe at a session bus that has no accessibility
         // stack at all: it must fail SAFE, and must not activate one.

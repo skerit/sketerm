@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const c = @import("../c.zig").c;
+const unsetEnv = @import("../util/env.zig").unset;
 const clock = @import("../util/clock.zig");
 const platform = @import("../util/platform.zig");
 const muxclient = @import("../mux/client.zig");
@@ -231,7 +232,7 @@ fn realSpawn(_: *anyopaque) bool {
             _ = c.dup2(devnull, 2);
             if (devnull > 2) _ = c.close(devnull);
         }
-        _ = c.unsetenv(muxclient.Conn.IDLE_EXIT_ENV);
+        _ = unsetEnv(muxclient.Conn.IDLE_EXIT_ENV);
         var argv: [3:null]?[*:0]const u8 = .{ exe, "web", null };
         _ = c.execv(exe, @ptrCast(@constCast(&argv)));
         c._exit(127);

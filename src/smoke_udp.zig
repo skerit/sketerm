@@ -19,6 +19,7 @@
 
 const std = @import("std");
 const c = @import("c.zig").c;
+const unsetEnv = @import("util/env.zig").unset;
 const client_mod = @import("mux/client.zig");
 const lifetime = @import("util/lifetime.zig");
 const muxrig = @import("smoke/muxrig.zig");
@@ -171,7 +172,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     _ = c.setenv("SKETERM_SSH", ssh3.ptr, 1);
     _ = c.setenv("SKETERM_MUX_PORTABLE", argv[1], 1);
     connectStage(allocator, "auto-deployed connect (emulated login shell)");
-    _ = c.unsetenv("SKETERM_MUX_PORTABLE");
+    _ = unsetEnv("SKETERM_MUX_PORTABLE");
     {
         // The bootstrap above must have run the DEPLOYED binary: the
         // content-addressed copy exists in the isolated $HOME.

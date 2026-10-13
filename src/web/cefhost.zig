@@ -5849,7 +5849,7 @@ test "a context whose proxy is refused registers nothing and releases once" {
 
     var context_ops = ContextCreateTest.ops();
     _ = c.setenv("SKETERM_WEB_FAIL_PROXY", "1", 1);
-    defer _ = c.unsetenv("SKETERM_WEB_FAIL_PROXY");
+    defer _ = @import("../util/env.zig").unset("SKETERM_WEB_FAIL_PROXY");
     // The proxy is the INSTANCE's route; a per-context `proxy` on the
     // wire is ignored, so the refusal under test is the instance one.
     host.instance_proxy = "socks5://127.0.0.1:9";

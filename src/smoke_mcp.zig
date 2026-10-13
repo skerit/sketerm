@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const c = @import("c.zig").c;
+const unsetEnv = @import("util/env.zig").unset;
 const tcpserver = @import("smoke/tcpserver.zig");
 const pathz = @import("util/pathz.zig");
 const lifetime = @import("util/lifetime.zig");
@@ -264,7 +265,7 @@ fn clearInheritedOrigin() void {
         // $SKETERM_SESSION would scope them to that pane instead.
         "SKETERM_SESSION",
         "SKETERM_SESSION_ORIGIN_ID",
-    }) |key| _ = c.unsetenv(key);
+    }) |key| _ = unsetEnv(key);
 }
 
 fn fileExists(path: []const u8) bool {
@@ -717,14 +718,14 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     const exe = "zig-out/bin/sketerm";
     if (c.access(exe, c.X_OK) != 0) fail("zig-out/bin/sketerm missing (build first)");
     _ = c.setenv("SKETERM_MUX_BIN", "zig-out/bin/sketerm-mux", 1);
-    defer _ = c.unsetenv("SKETERM_MUX_BIN");
+    defer _ = unsetEnv("SKETERM_MUX_BIN");
     if (c.getenv("SKETERM_SMOKE_MCP_WEBSTARTUP_ONLY") != null) {
         var bin_buf: [4096:0]u8 = undefined;
         const web_bin = resolveWebBin(&bin_buf) orelse fail("sketerm-webengine missing for cold-start regression");
         _ = c.setenv("SKETERM_WEB_BIN", web_bin, 1);
-        defer _ = c.unsetenv("SKETERM_WEB_BIN");
+        defer _ = unsetEnv("SKETERM_WEB_BIN");
         _ = c.setenv("SKETERM_WEB_BROKER_ENGINE", "0", 1);
-        defer _ = c.unsetenv("SKETERM_WEB_BROKER_ENGINE");
+        defer _ = unsetEnv("SKETERM_WEB_BROKER_ENGINE");
         webStartupStage(allocator, exe);
         say("smoke-mcp: focused fresh-cache browser startup ok");
         return 0;
@@ -754,19 +755,19 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     if (c.getenv("SKETERM_SMOKE_MCP_WEB_ONLY") != null) {
         // The client-spawn lane (sessions); see the full run's note.
         _ = c.setenv("SKETERM_WEB_BROKER_ENGINE", "0", 1);
-        defer _ = c.unsetenv("SKETERM_WEB_BROKER_ENGINE");
+        defer _ = unsetEnv("SKETERM_WEB_BROKER_ENGINE");
         return webOnly(allocator, exe, rt);
     }
     if (c.getenv("SKETERM_SMOKE_MCP_WEBSESSION_ONLY") != null) {
         _ = c.setenv("SKETERM_WEB_BROKER_ENGINE", "0", 1);
-        defer _ = c.unsetenv("SKETERM_WEB_BROKER_ENGINE");
+        defer _ = unsetEnv("SKETERM_WEB_BROKER_ENGINE");
         webSessionFakeStage(allocator, exe, rt);
         say("smoke-mcp: focused watchable web session ok");
         return 0;
     }
     if (c.getenv("SKETERM_SMOKE_MCP_WEBPROFILE_ONLY") != null) {
         _ = c.setenv("SKETERM_WEB_BROKER_ENGINE", "0", 1);
-        defer _ = c.unsetenv("SKETERM_WEB_BROKER_ENGINE");
+        defer _ = unsetEnv("SKETERM_WEB_BROKER_ENGINE");
         webProfileFakeStage(allocator, exe, rt);
         say("smoke-mcp: focused headless browsing profiles ok");
         return 0;
@@ -778,7 +779,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     }
     if (c.getenv("SKETERM_SMOKE_MCP_WEBPOLICY_ONLY") != null) {
         _ = c.setenv("SKETERM_WEB_BROKER_ENGINE", "0", 1);
-        defer _ = c.unsetenv("SKETERM_WEB_BROKER_ENGINE");
+        defer _ = unsetEnv("SKETERM_WEB_BROKER_ENGINE");
         webPolicyFakeStage(allocator, exe, rt);
         say("smoke-mcp: focused network policy (fake helper) ok");
         return 0;
@@ -790,7 +791,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             return 0;
         };
         _ = c.setenv("SKETERM_WEB_BIN", web_bin, 1);
-        defer _ = c.unsetenv("SKETERM_WEB_BIN");
+        defer _ = unsetEnv("SKETERM_WEB_BIN");
         webSharedProfileStage(allocator, exe, rt);
         say("smoke-mcp: focused shared-profile stage ok");
         return 0;
@@ -799,9 +800,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         var bin_buf: [4096:0]u8 = undefined;
         const web_bin = resolveWebBin(&bin_buf) orelse fail("sketerm-webengine not built for the capture stage");
         _ = c.setenv("SKETERM_WEB_BIN", web_bin, 1);
-        defer _ = c.unsetenv("SKETERM_WEB_BIN");
+        defer _ = unsetEnv("SKETERM_WEB_BIN");
         _ = c.setenv("SKETERM_WEB_BROKER_ENGINE", "0", 1);
-        defer _ = c.unsetenv("SKETERM_WEB_BROKER_ENGINE");
+        defer _ = unsetEnv("SKETERM_WEB_BROKER_ENGINE");
         webCaptureStage(allocator, exe, rt);
         say("smoke-mcp: focused response-body capture ok");
         return 0;
@@ -810,9 +811,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         var bin_buf: [4096:0]u8 = undefined;
         const web_bin = resolveWebBin(&bin_buf) orelse fail("sketerm-webengine not built for the tab-targeting stage");
         _ = c.setenv("SKETERM_WEB_BIN", web_bin, 1);
-        defer _ = c.unsetenv("SKETERM_WEB_BIN");
+        defer _ = unsetEnv("SKETERM_WEB_BIN");
         _ = c.setenv("SKETERM_WEB_BROKER_ENGINE", "0", 1);
-        defer _ = c.unsetenv("SKETERM_WEB_BROKER_ENGINE");
+        defer _ = unsetEnv("SKETERM_WEB_BROKER_ENGINE");
         webTabsStage(allocator, exe, rt);
         say("smoke-mcp: focused shared-browser tab targeting ok");
         return 0;
@@ -821,9 +822,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         var bin_buf: [4096:0]u8 = undefined;
         const web_bin = resolveWebBin(&bin_buf) orelse fail("sketerm-webengine not built for the navigation-result stage");
         _ = c.setenv("SKETERM_WEB_BIN", web_bin, 1);
-        defer _ = c.unsetenv("SKETERM_WEB_BIN");
+        defer _ = unsetEnv("SKETERM_WEB_BIN");
         _ = c.setenv("SKETERM_WEB_BROKER_ENGINE", "0", 1);
-        defer _ = c.unsetenv("SKETERM_WEB_BROKER_ENGINE");
+        defer _ = unsetEnv("SKETERM_WEB_BROKER_ENGINE");
         webNavStage(allocator, exe, rt);
         say("smoke-mcp: focused navigation results ok");
         return 0;
@@ -832,9 +833,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         var bin_buf: [4096:0]u8 = undefined;
         const web_bin = resolveWebBin(&bin_buf) orelse fail("sketerm-webengine not built for the web_fetch stage");
         _ = c.setenv("SKETERM_WEB_BIN", web_bin, 1);
-        defer _ = c.unsetenv("SKETERM_WEB_BIN");
+        defer _ = unsetEnv("SKETERM_WEB_BIN");
         _ = c.setenv("SKETERM_WEB_BROKER_ENGINE", "0", 1);
-        defer _ = c.unsetenv("SKETERM_WEB_BROKER_ENGINE");
+        defer _ = unsetEnv("SKETERM_WEB_BROKER_ENGINE");
         webFetchStage(allocator, exe, rt);
         say("smoke-mcp: focused web_fetch ok");
         return 0;
@@ -843,9 +844,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         var bin_buf: [4096:0]u8 = undefined;
         const web_bin = resolveWebBin(&bin_buf) orelse fail("sketerm-webengine not built for the reading stage");
         _ = c.setenv("SKETERM_WEB_BIN", web_bin, 1);
-        defer _ = c.unsetenv("SKETERM_WEB_BIN");
+        defer _ = unsetEnv("SKETERM_WEB_BIN");
         _ = c.setenv("SKETERM_WEB_BROKER_ENGINE", "0", 1);
-        defer _ = c.unsetenv("SKETERM_WEB_BROKER_ENGINE");
+        defer _ = unsetEnv("SKETERM_WEB_BROKER_ENGINE");
         webReadStage(allocator, exe, rt);
         say("smoke-mcp: focused web reading ok");
         return 0;
@@ -854,9 +855,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         var bin_buf: [4096:0]u8 = undefined;
         const web_bin = resolveWebBin(&bin_buf) orelse fail("sketerm-webengine not built for the persistence stage");
         _ = c.setenv("SKETERM_WEB_BIN", web_bin, 1);
-        defer _ = c.unsetenv("SKETERM_WEB_BIN");
+        defer _ = unsetEnv("SKETERM_WEB_BIN");
         _ = c.setenv("SKETERM_WEB_BROKER_ENGINE", "0", 1);
-        defer _ = c.unsetenv("SKETERM_WEB_BROKER_ENGINE");
+        defer _ = unsetEnv("SKETERM_WEB_BROKER_ENGINE");
         webPersistStage(allocator, exe, rt);
         say("smoke-mcp: focused web persistence facts ok");
         return 0;
@@ -865,7 +866,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         var bin_buf: [4096:0]u8 = undefined;
         const web_bin = resolveWebBin(&bin_buf) orelse fail("built sketerm-webengine missing for the stream stage");
         _ = c.setenv("SKETERM_WEB_BIN", web_bin, 1);
-        defer _ = c.unsetenv("SKETERM_WEB_BIN");
+        defer _ = unsetEnv("SKETERM_WEB_BIN");
         webStreamStage(allocator, exe, rt);
         if (@import("builtin").os.tag == .linux) webglPolicyStage(allocator, exe, rt);
     webMotionStage(allocator, exe, rt);
@@ -879,7 +880,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             return 0;
         };
         _ = c.setenv("SKETERM_WEB_BIN", web_bin, 1);
-        defer _ = c.unsetenv("SKETERM_WEB_BIN");
+        defer _ = unsetEnv("SKETERM_WEB_BIN");
         webPresenterStage(allocator, exe, rt);
         say("smoke-mcp: focused watch-along presenter stage ok");
         return 0;
@@ -919,7 +920,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             return 0;
         };
         _ = c.setenv("SKETERM_WEB_BIN", web_bin, 1);
-        defer _ = c.unsetenv("SKETERM_WEB_BIN");
+        defer _ = unsetEnv("SKETERM_WEB_BIN");
         webEngineLifecycleStage(allocator, exe, rt);
         say("smoke-mcp: focused engine-lifecycle stage ok");
         return 0;
@@ -1342,7 +1343,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // some other way, with an error that says why.
     {
         _ = c.setenv("SKETERM_MCP_TOOLS", "app:ro, term_list", 1);
-        defer _ = c.unsetenv("SKETERM_MCP_TOOLS");
+        defer _ = unsetEnv("SKETERM_MCP_TOOLS");
         var m = Mcp.spawn(allocator, exe, &.{});
         m.initialize();
 
@@ -1394,7 +1395,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // ── Stage 4: an invalid policy fails loudly at startup ────────
     {
         _ = c.setenv("SKETERM_MCP_TOOLS", "app, browzer", 1);
-        defer _ = c.unsetenv("SKETERM_MCP_TOOLS");
+        defer _ = unsetEnv("SKETERM_MCP_TOOLS");
         var err_pipe: [2]c_int = undefined;
         if (c.pipe(&err_pipe) != 0) fail("pipe");
         const pid = c.fork();
@@ -1429,7 +1430,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // which the store used to reject outright.
     {
         _ = c.setenv("SKETERM_MCP_TOOLS", "ui", 1);
-        defer _ = c.unsetenv("SKETERM_MCP_TOOLS");
+        defer _ = unsetEnv("SKETERM_MCP_TOOLS");
         var m = Mcp.spawn(allocator, exe, &.{});
         m.initialize();
 
@@ -1573,9 +1574,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         _ = c.setenv("SKETERM_SESSION", "panel-origin", 1);
         _ = c.setenv("SKETERM_MUX_SOCKET", origin_sock.ptr, 1);
         _ = c.setenv("SKETERM_SESSION_ORIGIN_ID", origin_id.ptr, 1);
-        defer _ = c.unsetenv("SKETERM_SESSION");
-        defer _ = c.unsetenv("SKETERM_MUX_SOCKET");
-        defer _ = c.unsetenv("SKETERM_SESSION_ORIGIN_ID");
+        defer _ = unsetEnv("SKETERM_SESSION");
+        defer _ = unsetEnv("SKETERM_MUX_SOCKET");
+        defer _ = unsetEnv("SKETERM_SESSION_ORIGIN_ID");
 
         var m = Mcp.spawn(allocator, exe, &.{});
         m.initialize();
@@ -1954,8 +1955,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             std.mem.indexOf(u8, store_only, "refusing to downgrade") == null)
             fail("store-only exact missing origin silently selected reusable storage");
         m.closeStdinWait();
-        _ = c.unsetenv("SKETERM_MUX_SOCKET");
-        _ = c.unsetenv("SKETERM_SESSION");
+        _ = unsetEnv("SKETERM_MUX_SOCKET");
+        _ = unsetEnv("SKETERM_SESSION");
     }
 
     {
@@ -1965,8 +1966,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         defer legacy.deinit();
         _ = c.setenv("SKETERM_SESSION", "legacy", 1);
         _ = c.setenv("SKETERM_MUX_SOCKET", legacy_sock.ptr, 1);
-        defer _ = c.unsetenv("SKETERM_SESSION");
-        defer _ = c.unsetenv("SKETERM_MUX_SOCKET");
+        defer _ = unsetEnv("SKETERM_SESSION");
+        defer _ = unsetEnv("SKETERM_MUX_SOCKET");
 
         // No direct GUI: unsupported stays an honest failure.
         var old = Mcp.spawn(allocator, exe, &.{});
@@ -2010,7 +2011,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
         // Without an exact environment socket, explicit GUI control wins
         // before the canonical-default compatibility probe.
-        _ = c.unsetenv("SKETERM_MUX_SOCKET");
+        _ = unsetEnv("SKETERM_MUX_SOCKET");
         var direct = Mcp.spawn(allocator, exe, &.{ "--socket", gui_sock });
         direct.initialize();
         direct.sendTool("capabilities", "{}");
@@ -2061,8 +2062,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         defer gui.deinit();
         _ = c.setenv("SKETERM_SESSION", "mixed-version", 1);
         _ = c.setenv("SKETERM_MUX_SOCKET", mixed_sock.ptr, 1);
-        defer _ = c.unsetenv("SKETERM_SESSION");
-        defer _ = c.unsetenv("SKETERM_MUX_SOCKET");
+        defer _ = unsetEnv("SKETERM_SESSION");
+        defer _ = unsetEnv("SKETERM_MUX_SOCKET");
 
         var m = Mcp.spawn(allocator, exe, &.{ "--socket", gui_sock });
         m.initialize();
@@ -2084,9 +2085,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
     // ── Stage 8: exact/default/discovered transport collision ─────
     {
-        _ = c.unsetenv("SKETERM_MUX_SOCKET");
+        _ = unsetEnv("SKETERM_MUX_SOCKET");
         _ = c.setenv("SKETERM_SESSION", "panel-collision", 1);
-        defer _ = c.unsetenv("SKETERM_SESSION");
+        defer _ = unsetEnv("SKETERM_SESSION");
 
         // Two real daemons deliberately own the same session name. One is the
         // canonical default; the other is the exact inherited origin.
@@ -2155,7 +2156,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
         // No exact socket and no explicit GUI: connect-only canonical default
         // compatibility is safe and succeeds without autostarting anything.
-        _ = c.unsetenv("SKETERM_MUX_SOCKET");
+        _ = unsetEnv("SKETERM_MUX_SOCKET");
         var compat = Mcp.spawn(allocator, exe, &.{});
         compat.initialize();
         compat.sendTool("capabilities", "{}");
@@ -2255,7 +2256,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // answers panel-show and the stage reads the document off the wire.
     {
         _ = c.setenv("SKETERM_MCP_TOOLS", "ui", 1);
-        defer _ = c.unsetenv("SKETERM_MCP_TOOLS");
+        defer _ = unsetEnv("SKETERM_MCP_TOOLS");
         var sock_buf: [320]u8 = undefined;
         const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/gui.sock", .{rt}) catch return 1;
         var gui = FakeGui.listen(sock);
@@ -2428,7 +2429,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             say("smoke-mcp: SKIP web stage (sketerm-webengine not built; `zig build web`)");
         } else {
             _ = c.setenv("SKETERM_WEB_BIN", web_bin.?, 1);
-            defer _ = c.unsetenv("SKETERM_WEB_BIN");
+            defer _ = unsetEnv("SKETERM_WEB_BIN");
             webStartupStage(allocator, exe);
             webStage(allocator, exe, rt);
             say("smoke-mcp: headless web tools ok");
@@ -2440,7 +2441,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             say("smoke-mcp: shared-browser tab targeting (real CEF) ok");
             webPersistStage(allocator, exe, rt);
             say("smoke-mcp: web persistence facts (real CEF) ok");
-            _ = c.unsetenv("SKETERM_WEB_BROKER_ENGINE");
+            _ = unsetEnv("SKETERM_WEB_BROKER_ENGINE");
             webSharedProfileStage(allocator, exe, rt);
             say("smoke-mcp: broker-owned shared profiles (real CEF) ok");
             webEngineLifecycleStage(allocator, exe, rt);
@@ -2739,9 +2740,9 @@ fn webGuiGrantStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: [:0]co
     // nothing here runs it (the GUI is what would), so any executable
     // stands in and no CEF is needed.
     _ = c.setenv("SKETERM_WEB_BIN", "/bin/true", 1);
-    defer _ = c.unsetenv("SKETERM_WEB_BIN");
-    defer _ = c.unsetenv(mcpWebGuiEnv());
-    defer _ = c.unsetenv("SKETERM_GUI_BIN");
+    defer _ = unsetEnv("SKETERM_WEB_BIN");
+    defer _ = unsetEnv(mcpWebGuiEnv());
+    defer _ = unsetEnv("SKETERM_GUI_BIN");
     defer removeSmokeConfig(rt);
 
     var log_buf: [16384]u8 = undefined;
@@ -2804,14 +2805,14 @@ fn webGuiGrantStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: [:0]co
         off.initialize();
         expectWebGuiFacts(off.callTool("capabilities", "{}"), false, "env", "none", "env 0 over config true");
         off.closeStdinWait();
-        _ = c.unsetenv(mcpWebGuiEnv());
+        _ = unsetEnv(mcpWebGuiEnv());
         // and the flag beats env=0.
         _ = c.setenv(mcpWebGuiEnv(), "0", 1);
         var flag = Mcp.spawn(allocator, exe, &.{"--web-gui"});
         flag.initialize();
         expectWebGuiFacts(flag.callTool("capabilities", "{}"), true, "flag", "none", "flag over env 0");
         flag.closeStdinWait();
-        _ = c.unsetenv(mcpWebGuiEnv());
+        _ = unsetEnv(mcpWebGuiEnv());
     }
     {
         writeSmokeConfig(rt, "[mcp]\nweb_gui = true\n");
@@ -2835,7 +2836,7 @@ fn webGuiGrantStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: [:0]co
     {
         _ = c.setenv(mcpWebGuiEnv(), "maybe", 1);
         var bad = Mcp.spawn(allocator, exe, &.{});
-        _ = c.unsetenv(mcpWebGuiEnv());
+        _ = unsetEnv(mcpWebGuiEnv());
         var st: c_int = 0;
         const deadline = nowMs() + 10_000;
         while (c.waitpid(bad.pid, &st, 1) != bad.pid) {
@@ -2854,7 +2855,7 @@ fn webGuiGrantStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: [:0]co
     stopFakeGui(rt, running);
     _ = c.setenv("SKETERM_GUI_BIN", self_exe, 1);
     _ = c.setenv(FAKE_GUI_ENV, rt.ptr, 1);
-    defer _ = c.unsetenv(FAKE_GUI_ENV);
+    defer _ = unsetEnv(FAKE_GUI_ENV);
     {
         var pid_buf: [32]c.pid_t = undefined;
         const pids_before = fakeGuiPids(rt, &pid_buf).len;
@@ -4275,7 +4276,7 @@ fn webMotionStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const 
     const old_data = c.getenv("XDG_DATA_HOME");
     _ = c.setenv("XDG_DATA_HOME", data.ptr, 1);
     defer {
-        if (old_data) |o| _ = c.setenv("XDG_DATA_HOME", o, 1) else _ = c.unsetenv("XDG_DATA_HOME");
+        if (old_data) |o| _ = c.setenv("XDG_DATA_HOME", o, 1) else _ = unsetEnv("XDG_DATA_HOME");
     }
     const page = "data:text/html,<title>motion</title><button style='position:absolute;left:300px;top:200px;width:90px;height:40px' onclick=\\\"document.title='clicked:'+event.isTrusted\\\">Go</button>";
     const open_args = "{\"url\":\"" ++ page ++ "\",\"ephemeral\":true}";
@@ -4357,7 +4358,7 @@ fn webMotionStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const 
         m.closeStdinWait();
 
         _ = c.setenv("SKETERM_WEB_DISABLE_MOTION_REPLAY", "1", 1);
-        defer _ = c.unsetenv("SKETERM_WEB_DISABLE_MOTION_REPLAY");
+        defer _ = unsetEnv("SKETERM_WEB_DISABLE_MOTION_REPLAY");
         var old = Mcp.spawn(allocator, exe, &.{});
         old.initialize();
         _ = capSc(arena, old.callTool("web_open", open_args), "motion open old helper", false);
@@ -4386,7 +4387,7 @@ fn webMotionStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const 
         m.closeStdinWait();
 
         _ = c.setenv("SKETERM_WEB_DISABLE_MOTION_DRIFT", "1", 1);
-        defer _ = c.unsetenv("SKETERM_WEB_DISABLE_MOTION_DRIFT");
+        defer _ = unsetEnv("SKETERM_WEB_DISABLE_MOTION_DRIFT");
         var old = Mcp.spawn(allocator, exe, &.{});
         old.initialize();
         const refused = old.callTool("web_open", open_args);
@@ -4487,7 +4488,7 @@ fn headfulAuditStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []con
     const old_data = c.getenv("XDG_DATA_HOME");
     _ = c.setenv("XDG_DATA_HOME", data.ptr, 1);
     defer {
-        if (old_data) |o| _ = c.setenv("XDG_DATA_HOME", o, 1) else _ = c.unsetenv("XDG_DATA_HOME");
+        if (old_data) |o| _ = c.setenv("XDG_DATA_HOME", o, 1) else _ = unsetEnv("XDG_DATA_HOME");
     }
     installSyntheticPack(allocator, arena, exe, rt);
 
@@ -4724,7 +4725,7 @@ fn streamEncodedStage(allocator: std.mem.Allocator, arena: std.mem.Allocator, m:
 
     // A helper without the capability ignores the request: raw, and said so.
     _ = c.setenv("SKETERM_WEB_DISABLE_STREAM_ENCODED", "1", 1);
-    defer _ = c.unsetenv("SKETERM_WEB_DISABLE_STREAM_ENCODED");
+    defer _ = unsetEnv("SKETERM_WEB_DISABLE_STREAM_ENCODED");
     var old = Mcp.spawn(allocator, exe, &.{});
     defer old.closeStdinWait();
     old.initialize();
@@ -4870,7 +4871,7 @@ fn streamFpsStage(allocator: std.mem.Allocator, arena: std.mem.Allocator, m: *Mc
     configured.closeStdinWait();
     _ = c.unlink(pathz.pathZ(&z, config) catch unreachable);
     _ = c.setenv("SKETERM_WEB_DISABLE_MAX_FPS", "1", 1);
-    defer _ = c.unsetenv("SKETERM_WEB_DISABLE_MAX_FPS");
+    defer _ = unsetEnv("SKETERM_WEB_DISABLE_MAX_FPS");
     var unsupported = Mcp.spawn(allocator, exe, &.{});
     unsupported.initialize();
     const refused = capSc(arena, unsupported.callTool("web_open", "{\"url\":\"about:blank\",\"max_fps\":15,\"snapshot\":\"none\"}"), "unsupported FPS open", true);
@@ -5451,7 +5452,7 @@ fn webTabsStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8
 }
 
 fn webStartupStage(allocator: std.mem.Allocator, exe: [*:0]const u8) void {
-    defer _ = c.unsetenv("SKETERM_WEB_SESSION");
+    defer _ = unsetEnv("SKETERM_WEB_SESSION");
     for ([_][*:0]const u8{ "cold-headless", "cold-session" }, 0..) |name, index| {
         _ = c.setenv("SKETERM_WEB_SESSION", if (index == 0) "0" else "1", 1);
         var m = Mcp.spawn(allocator, exe, &.{ "--name", name });
@@ -5833,9 +5834,9 @@ fn webStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) vo
     // helper: the MCP adapter must choose sem_read and keep JSON-shaped
     // page bytes as markdown rather than guessing a rich envelope.
     _ = c.setenv("SKETERM_WEB_DISABLE_READER_IDS", "1", 1);
-    defer _ = c.unsetenv("SKETERM_WEB_DISABLE_READER_IDS");
+    defer _ = unsetEnv("SKETERM_WEB_DISABLE_READER_IDS");
     _ = c.setenv("SKETERM_WEB_DISABLE_SEMANTIC_REQUEST_IDS", "1", 1);
-    defer _ = c.unsetenv("SKETERM_WEB_DISABLE_SEMANTIC_REQUEST_IDS");
+    defer _ = unsetEnv("SKETERM_WEB_DISABLE_SEMANTIC_REQUEST_IDS");
     var legacy = Mcp.spawn(allocator, exe, &.{});
     legacy.initialize();
     legacy.sendTool("web_open", std.fmt.bufPrint(&args_buf, "{{\"url\":\"file://{s}\"}}", .{page_path}) catch unreachable);
@@ -6070,7 +6071,7 @@ fn webCaptureStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const
     // Fail closed: a helper that withholds the capability opens nothing.
     {
         _ = c.setenv("SKETERM_WEB_DISABLE_CAPTURE", "1", 1);
-        defer _ = c.unsetenv("SKETERM_WEB_DISABLE_CAPTURE");
+        defer _ = unsetEnv("SKETERM_WEB_DISABLE_CAPTURE");
         _ = c.setenv("SKETERM_WEB_BROKER_ENGINE", "0", 1);
         var w = Mcp.spawn(allocator, exe, &.{});
         w.initialize();
@@ -6242,7 +6243,7 @@ fn webPolicyStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const 
     // net-policy refuses a policied open outright, minting nothing.
     {
         _ = c.setenv("SKETERM_WEB_DISABLE_NET_POLICY", "1", 1);
-        defer _ = c.unsetenv("SKETERM_WEB_DISABLE_NET_POLICY");
+        defer _ = unsetEnv("SKETERM_WEB_DISABLE_NET_POLICY");
         var suppressed = Mcp.spawn(allocator, exe, &.{});
         suppressed.initialize();
         suppressed.sendTool("web_open", std.fmt.bufPrint(&args_buf, "{{\"url\":\"http://127.0.0.1:{d}/doc\",\"policy\":{{\"allow_hosts\":[\"127.0.0.1\"],\"allow_private_addresses\":true}}}}", .{http.port}) catch unreachable);
@@ -6339,7 +6340,7 @@ fn webSharedProfileStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: [
     // stage's tail waits out the TTL reap rather than an
     // exit-with-last-client that no longer happens.
     _ = c.setenv("SKETERM_WEB_LINGER_MS", "3000", 1);
-    defer _ = c.unsetenv("SKETERM_WEB_LINGER_MS");
+    defer _ = unsetEnv("SKETERM_WEB_LINGER_MS");
     var http: TinyHttp = .{};
     if (!http.start()) fail("could not bind a loopback HTTP server for the shared-profile stage");
     defer http.deinit();
@@ -6536,7 +6537,7 @@ fn webPresenterStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []con
 /// disk (read back by a third generation's fresh engine).
 fn webEngineLifecycleStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) void {
     _ = c.setenv("SKETERM_WEB_LINGER_MS", "4000", 1);
-    defer _ = c.unsetenv("SKETERM_WEB_LINGER_MS");
+    defer _ = unsetEnv("SKETERM_WEB_LINGER_MS");
     var http: TinyHttp = .{};
     if (!http.start()) fail("could not bind a loopback HTTP server for the engine-lifecycle stage");
     defer http.deinit();
@@ -6900,13 +6901,13 @@ fn webSessionFakeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []c
     if (self_len <= 0) fail("cannot resolve the smoke binary path");
     self_buf[@intCast(self_len)] = 0;
     _ = c.setenv("SKETERM_WEB_BIN", &self_buf, 1);
-    defer _ = c.unsetenv("SKETERM_WEB_BIN");
+    defer _ = unsetEnv("SKETERM_WEB_BIN");
     _ = c.setenv("SKETERM_FAKE_WEBENGINE", "1", 1);
-    defer _ = c.unsetenv("SKETERM_FAKE_WEBENGINE");
+    defer _ = unsetEnv("SKETERM_FAKE_WEBENGINE");
     var envout_buf: [512]u8 = undefined;
     const envout = std.fmt.bufPrintZ(&envout_buf, "{s}/fake-web-env.txt", .{rt}) catch unreachable;
     _ = c.setenv("SKETERM_FAKE_WEB_ENV", envout.ptr, 1);
-    defer _ = c.unsetenv("SKETERM_FAKE_WEB_ENV");
+    defer _ = unsetEnv("SKETERM_FAKE_WEB_ENV");
     var args_buf: [256]u8 = undefined;
     var probe_buf: [512]u8 = undefined;
     var file_buf: [8192]u8 = undefined;
@@ -6965,7 +6966,7 @@ fn webSessionFakeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []c
         _ = c.setenv("SKETERM_WEB_BROKER_ENGINE", if (broker) "1" else "0", 1);
         defer _ = c.setenv("SKETERM_WEB_BROKER_ENGINE", "0", 1);
         _ = c.setenv("SKETERM_FAKE_WEB_EXIT", "1", 1);
-        defer _ = c.unsetenv("SKETERM_FAKE_WEB_EXIT");
+        defer _ = unsetEnv("SKETERM_FAKE_WEB_EXIT");
         var m = Mcp.spawn(allocator, exe, if (broker) &.{ "--name", "diagnostic-failure" } else &.{});
         m.initialize();
         m.sendTool("web_open", "{\"url\":\"https://smoke.invalid/broken\"}");
@@ -7001,7 +7002,7 @@ fn webSessionFakeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []c
     // Explicit opt-out: plain headless, no session anywhere.
     {
         _ = c.setenv("SKETERM_WEB_SESSION", "0", 1);
-        defer _ = c.unsetenv("SKETERM_WEB_SESSION");
+        defer _ = unsetEnv("SKETERM_WEB_SESSION");
         var m = Mcp.spawn(allocator, exe, &.{});
         m.initialize();
         m.sendTool("web_open", "{\"url\":\"https://smoke.invalid/optout\"}");
@@ -7036,13 +7037,13 @@ fn webProfileFakeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []c
     if (self_len <= 0) fail("cannot resolve the smoke binary path");
     self_buf[@intCast(self_len)] = 0;
     _ = c.setenv("SKETERM_WEB_BIN", &self_buf, 1);
-    defer _ = c.unsetenv("SKETERM_WEB_BIN");
+    defer _ = unsetEnv("SKETERM_WEB_BIN");
     _ = c.setenv("SKETERM_FAKE_WEBENGINE", "1", 1);
-    defer _ = c.unsetenv("SKETERM_FAKE_WEBENGINE");
+    defer _ = unsetEnv("SKETERM_FAKE_WEBENGINE");
     // A session would add a Wayland compositor to every spawn here and
     // proves nothing about profiles.
     _ = c.setenv("SKETERM_WEB_SESSION", "0", 1);
-    defer _ = c.unsetenv("SKETERM_WEB_SESSION");
+    defer _ = unsetEnv("SKETERM_WEB_SESSION");
 
     var probe_buf: [512]u8 = undefined;
     var file_buf: [64 * 1024]u8 = undefined;
@@ -7076,12 +7077,12 @@ fn webProfileFakeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []c
     }
 
     _ = c.setenv("SKETERM_FAKE_WEB_CONTEXTS", "1", 1);
-    defer _ = c.unsetenv("SKETERM_FAKE_WEB_CONTEXTS");
+    defer _ = unsetEnv("SKETERM_FAKE_WEB_CONTEXTS");
     var frames_buf: [512]u8 = undefined;
     const frames = std.fmt.bufPrintZ(&frames_buf, "{s}/fake-web-frames.txt", .{rt}) catch unreachable;
     _ = c.unlink(frames.ptr);
     _ = c.setenv("SKETERM_FAKE_WEB_FRAMES", frames.ptr, 1);
-    defer _ = c.unsetenv("SKETERM_FAKE_WEB_FRAMES");
+    defer _ = unsetEnv("SKETERM_FAKE_WEB_FRAMES");
 
     // (b) With the caps, the context is published BEFORE the view that
     // names it, the id is persisted, and a WHOLE MCP RESTART re-sends
@@ -7215,7 +7216,7 @@ fn webProfileFakeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []c
     // nothing may have been loaded in the shared jar.
     {
         _ = c.setenv("SKETERM_FAKE_WEB_CONTEXT_FAIL", "1", 1);
-        defer _ = c.unsetenv("SKETERM_FAKE_WEB_CONTEXT_FAIL");
+        defer _ = unsetEnv("SKETERM_FAKE_WEB_CONTEXT_FAIL");
         var m = Mcp.spawn(allocator, exe, &.{});
         m.initialize();
         m.sendTool("web_open", "{\"url\":\"https://smoke.invalid/p\",\"profile\":\"fails\"}");
@@ -7245,11 +7246,11 @@ fn webPolicyFakeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []co
     if (self_len <= 0) fail("cannot resolve the smoke binary path");
     self_buf[@intCast(self_len)] = 0;
     _ = c.setenv("SKETERM_WEB_BIN", &self_buf, 1);
-    defer _ = c.unsetenv("SKETERM_WEB_BIN");
+    defer _ = unsetEnv("SKETERM_WEB_BIN");
     _ = c.setenv("SKETERM_FAKE_WEBENGINE", "1", 1);
-    defer _ = c.unsetenv("SKETERM_FAKE_WEBENGINE");
+    defer _ = unsetEnv("SKETERM_FAKE_WEBENGINE");
     _ = c.setenv("SKETERM_WEB_SESSION", "0", 1);
-    defer _ = c.unsetenv("SKETERM_WEB_SESSION");
+    defer _ = unsetEnv("SKETERM_WEB_SESSION");
 
     var file_buf: [64 * 1024]u8 = undefined;
 
@@ -7276,12 +7277,12 @@ fn webPolicyFakeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []co
     }
 
     _ = c.setenv("SKETERM_FAKE_WEB_POLICY", "1", 1);
-    defer _ = c.unsetenv("SKETERM_FAKE_WEB_POLICY");
+    defer _ = unsetEnv("SKETERM_FAKE_WEB_POLICY");
     var frames_buf: [512]u8 = undefined;
     const frames = std.fmt.bufPrintZ(&frames_buf, "{s}/fake-web-policy-frames.txt", .{rt}) catch unreachable;
     _ = c.unlink(frames.ptr);
     _ = c.setenv("SKETERM_FAKE_WEB_FRAMES", frames.ptr, 1);
-    defer _ = c.unsetenv("SKETERM_FAKE_WEB_FRAMES");
+    defer _ = unsetEnv("SKETERM_FAKE_WEB_FRAMES");
 
     // (15) The capable fake acknowledges installation before the first view.
     {
@@ -7328,7 +7329,7 @@ fn webPolicyFakeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []co
     // Older helpers can install policies, but cannot acknowledge live updates.
     {
         _ = c.setenv("SKETERM_FAKE_WEB_POLICY_LEGACY", "1", 1);
-        defer _ = c.unsetenv("SKETERM_FAKE_WEB_POLICY_LEGACY");
+        defer _ = unsetEnv("SKETERM_FAKE_WEB_POLICY_LEGACY");
         var m = Mcp.spawn(allocator, exe, &.{});
         m.initialize();
         m.sendTool("web_open", "{\"url\":\"https://smoke.invalid/p\",\"policy\":{\"allow_hosts\":[\"smoke.invalid\"],\"max_requests\":9}}");
@@ -7357,7 +7358,7 @@ fn webPolicyFakeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []co
     // read tools still answer carrying the exhausted facts.
     {
         _ = c.setenv("SKETERM_FAKE_WEB_POLICY_EXHAUST", "1", 1);
-        defer _ = c.unsetenv("SKETERM_FAKE_WEB_POLICY_EXHAUST");
+        defer _ = unsetEnv("SKETERM_FAKE_WEB_POLICY_EXHAUST");
         var m = Mcp.spawn(allocator, exe, &.{});
         m.initialize();
         m.sendTool("web_open", "{\"url\":\"https://smoke.invalid/p\",\"policy\":{\"allow_hosts\":[\"smoke.invalid\"],\"max_requests\":5}}");
@@ -7384,7 +7385,7 @@ fn webPolicyFakeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []co
     // web_policy_set refuses a pure loosening on a live view.
     {
         _ = c.setenv("SKETERM_FAKE_WEB_CONTEXTS", "1", 1);
-        defer _ = c.unsetenv("SKETERM_FAKE_WEB_CONTEXTS");
+        defer _ = unsetEnv("SKETERM_FAKE_WEB_CONTEXTS");
         var m = Mcp.spawn(allocator, exe, &.{});
         m.initialize();
         const set = m.callTool("web_policy_set", "{\"profile\":\"work\",\"policy\":{\"allow_hosts\":[\"smoke.invalid\"],\"max_requests\":9}}");
@@ -8433,8 +8434,8 @@ fn webReadStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8
     _ = c.setenv("SKETERM_WEB_DISABLE_PAGE_READ", "1", 1);
     _ = c.setenv("SKETERM_WEB_DISABLE_QUERY_LIVE", "1", 1);
     var old = Mcp.spawn(allocator, exe, &.{});
-    _ = c.unsetenv("SKETERM_WEB_DISABLE_PAGE_READ");
-    _ = c.unsetenv("SKETERM_WEB_DISABLE_QUERY_LIVE");
+    _ = unsetEnv("SKETERM_WEB_DISABLE_PAGE_READ");
+    _ = unsetEnv("SKETERM_WEB_DISABLE_QUERY_LIVE");
     old.initialize();
     old.sendTool("web_open", std.fmt.bufPrint(&args, "{{\"url\":\"http://127.0.0.1:{d}/long\",\"snapshot\":\"none\",\"label\":\"wr\"}}", .{port}) catch unreachable);
     _ = capSc(arena, old.recvLine(60_000), "wr: old open", false);
@@ -10229,10 +10230,10 @@ fn agentStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
     // exactly that request, and timed out).
     _ = c.setenv(FAKE_OC_DEAF_ENV, "4500", 1);
     defer {
-        _ = c.unsetenv(FAKE_AGENT_ENV);
-        _ = c.unsetenv("CLAUDE_CODE_CHILD_SESSION");
-        _ = c.unsetenv("CLAUDE_CONFIG_DIR");
-        _ = c.unsetenv(FAKE_OC_DEAF_ENV);
+        _ = unsetEnv(FAKE_AGENT_ENV);
+        _ = unsetEnv("CLAUDE_CODE_CHILD_SESSION");
+        _ = unsetEnv("CLAUDE_CONFIG_DIR");
+        _ = unsetEnv(FAKE_OC_DEAF_ENV);
     }
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -11489,8 +11490,8 @@ fn routeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) 
         _ = c.setenv("PATH", saved_path.ptr, 1);
         _ = c.setenv("XDG_RUNTIME_DIR", saved_rt.ptr, 1);
         _ = c.setenv(FAKE_SSH_ENV, "1", 1);
-        _ = c.unsetenv(FAKE_AGENT_ENV);
-        _ = c.unsetenv("SKETERM_SSH");
+        _ = unsetEnv(FAKE_AGENT_ENV);
+        _ = unsetEnv("SKETERM_SSH");
     }
     // The per-user daemons of hosta and hostb, started here so their pids are ours.
     const pid_a = startHostDaemon(host_rt[0]);
@@ -11854,13 +11855,13 @@ fn agentSshStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u
     writeExecutable(std.fmt.allocPrintSentinel(arena, "{s}/rsync", .{norsync_bin}, 0) catch fail("oom"), "#!/bin/sh\nexit 127\n");
     _ = c.setenv(NORSYNC_BIN_ENV, norsync_bin.ptr, 1);
     defer {
-        _ = c.unsetenv(NORSYNC_BIN_ENV);
+        _ = unsetEnv(NORSYNC_BIN_ENV);
         _ = c.setenv("PATH", saved_path.ptr, 1);
         _ = c.setenv(FAKE_SSH_ENV, "1", 1);
-        _ = c.unsetenv(FAKE_AGENT_ENV);
-        _ = c.unsetenv(FAKE_OC_DEAF_ENV);
-        _ = c.unsetenv("CLAUDE_CODE_CHILD_SESSION");
-        _ = c.unsetenv("SKETERM_SSH");
+        _ = unsetEnv(FAKE_AGENT_ENV);
+        _ = unsetEnv(FAKE_OC_DEAF_ENV);
+        _ = unsetEnv("CLAUDE_CODE_CHILD_SESSION");
+        _ = unsetEnv("SKETERM_SSH");
     }
 
     // The "remote" daemon, and the `$SKETERM_SSH` bridge to it. A flag

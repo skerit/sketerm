@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const c = @import("c.zig").c;
+const unsetEnv = @import("util/env.zig").unset;
 const gl = @import("render/gl.zig");
 const atlas_mod = @import("render/atlas.zig");
 const Atlas = atlas_mod.Atlas;
@@ -202,7 +203,7 @@ fn journalStage(allocator: std.mem.Allocator) !?u8 {
         if (saved) |v| {
             _ = c.setenv("XDG_STATE_HOME", v, 1);
         } else {
-            _ = c.unsetenv("XDG_STATE_HOME");
+            _ = unsetEnv("XDG_STATE_HOME");
         }
         var cmd: [200]u8 = undefined;
         if (std.fmt.bufPrintZ(&cmd, "rm -rf '{s}'", .{dir})) |z| {

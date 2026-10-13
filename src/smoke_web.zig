@@ -53,6 +53,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const c = @import("c.zig").c;
+const unsetEnv = @import("util/env.zig").unset;
 const smoke_tls = @import("smoke_tls.zig");
 const smoke_pdf = @import("smoke/pdf.zig");
 const tcpserver = @import("smoke/tcpserver.zig");
@@ -2885,7 +2886,7 @@ fn scrubProxyEnv() void {
     for ([_][*:0]const u8{
         "http_proxy", "https_proxy", "all_proxy", "ftp_proxy", "no_proxy",
         "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "FTP_PROXY", "NO_PROXY",
-    }) |name| _ = c.unsetenv(name);
+    }) |name| _ = unsetEnv(name);
 }
 
 fn spawnHelper(
@@ -3721,7 +3722,7 @@ fn runNetChangeStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8
     // -- one blink: healed ---------------------------------------------
     {
         _ = c.setenv("SKETERM_WEB_FAULT_NET_CHANGED", "1", 1);
-        defer _ = c.unsetenv("SKETERM_WEB_FAULT_NET_CHANGED");
+        defer _ = unsetEnv("SKETERM_WEB_FAULT_NET_CHANGED");
         var cache_buf: [4096]u8 = undefined;
         const cache_dir = std.fmt.bufPrintZ(&cache_buf, "{s}/nc1-cache", .{dir}) catch fail("stage nc cache path");
         mkdirZ(cache_dir);
@@ -3764,7 +3765,7 @@ fn runNetChangeStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8
     // -- consecutive failures: bounded retry, then a fresh hard reload --
     {
         _ = c.setenv("SKETERM_WEB_FAULT_NET_CHANGED", "3", 1);
-        defer _ = c.unsetenv("SKETERM_WEB_FAULT_NET_CHANGED");
+        defer _ = unsetEnv("SKETERM_WEB_FAULT_NET_CHANGED");
         var cache_buf: [4096]u8 = undefined;
         const cache_dir = std.fmt.bufPrintZ(&cache_buf, "{s}/nc2-cache", .{dir}) catch fail("stage nc cache path");
         mkdirZ(cache_dir);
@@ -4387,7 +4388,7 @@ fn runCaptureStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) 
 fn runDownloadHoldStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) void {
     const HOLD_MS: i64 = 1_500;
     _ = c.setenv("SKETERM_WEB_DOWNLOAD_HOLD_MS", "1500", 1);
-    defer _ = c.unsetenv("SKETERM_WEB_DOWNLOAD_HOLD_MS");
+    defer _ = unsetEnv("SKETERM_WEB_DOWNLOAD_HOLD_MS");
     var cache_buf: [4096]u8 = undefined;
     const cache_dir = std.fmt.bufPrintZ(&cache_buf, "{s}/dlhold-cache", .{dir}) catch fail("stage 22j3 cache path");
     mkdirZ(cache_dir);
@@ -4646,7 +4647,7 @@ fn runWebrequestStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u
         cl.deinit();
         reapHelperTimeout(pid, "stage 34 helper 2", 30_000);
     }
-    _ = c.unsetenv("SKETERM_WEB_WREQ_TIMEOUT_MS");
+    _ = unsetEnv("SKETERM_WEB_WREQ_TIMEOUT_MS");
 }
 
 // ---------------------------------------------------------------------
@@ -6653,7 +6654,7 @@ fn runFilterSubscriptionStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: [
         if (had_config_home) {
             _ = c.setenv("XDG_CONFIG_HOME", &old_config_buf, 1);
         } else {
-            _ = c.unsetenv("XDG_CONFIG_HOME");
+            _ = unsetEnv("XDG_CONFIG_HOME");
         }
     }
 
@@ -7017,7 +7018,7 @@ fn globalsPrint(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8, url
     const cache = std.fmt.bufPrintZ(&cache_buf, "{s}/gl{d}-cache", .{ dir, @intFromBool(bare) }) catch fail("gl cache path");
     if (bare) _ = c.setenv("SKETERM_WEB_SEMANTIC", "off", 1);
     const pid = spawnHelper(exe, sock.ptr, cache.ptr, "--ozone-platform=headless", null, false);
-    _ = c.unsetenv("SKETERM_WEB_SEMANTIC");
+    _ = unsetEnv("SKETERM_WEB_SEMANTIC");
     g_pid = pid;
     var cl = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
     cl.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web-gl" });
@@ -7529,7 +7530,7 @@ fn runRouteStages(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
         const cache_fail = std.fmt.bufPrintZ(&cache_fail_buf, "{s}/cache-egress-fail", .{dir}) catch fail("cache path");
         _ = c.setenv("SKETERM_WEB_FAIL_PROXY", "1", 1);
         const fail_pid = spawnHelperArgs(exe, sock_fail.ptr, cache_fail.ptr, &[_][*:0]const u8{ "--ozone-platform=headless", "--proxy", "socks5://127.0.0.1:9" });
-        _ = c.unsetenv("SKETERM_WEB_FAIL_PROXY");
+        _ = unsetEnv("SKETERM_WEB_FAIL_PROXY");
         g_pid = fail_pid;
         var fc = Client{ .gpa = gpa, .fd = connectWithRetry(sock_fail.ptr, sock_fail.len) };
         fc.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web-egress-fail" });
@@ -7584,7 +7585,7 @@ fn runRouteStages(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
         const cache_w = std.fmt.bufPrintZ(&cache_w_buf, "{s}/cache-webrtc-fail", .{dir}) catch fail("cache path");
         _ = c.setenv("SKETERM_WEB_FAIL_WEBRTC_POLICY", "1", 1);
         const w_pid = spawnHelperArgs(exe, sock_w.ptr, cache_w.ptr, &[_][*:0]const u8{ "--ozone-platform=headless", "--proxy", "socks5://127.0.0.1:9" });
-        _ = c.unsetenv("SKETERM_WEB_FAIL_WEBRTC_POLICY");
+        _ = unsetEnv("SKETERM_WEB_FAIL_WEBRTC_POLICY");
         g_pid = w_pid;
         var wc = Client{ .gpa = gpa, .fd = connectWithRetry(sock_w.ptr, sock_w.len) };
         wc.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web-webrtc-fail" });
@@ -8756,7 +8757,7 @@ fn runCookieSyncStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u
     g_pid = pid_a;
     const pid_b = spawnHelperArgs(exe, sock_b.ptr, cache_b.ptr, &.{"--ozone-platform=headless"});
     g_pid_b = pid_b;
-    _ = c.unsetenv("SKETERM_WEB_COOKIE_SYNC_MS");
+    _ = unsetEnv("SKETERM_WEB_COOKIE_SYNC_MS");
 
     var st_a = gpa.create(CkState) catch fail("stage 42: out of memory");
     defer gpa.destroy(st_a);

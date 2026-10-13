@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const c = @import("c.zig").c;
+const unsetEnv = @import("util/env.zig").unset;
 const daemon = @import("mux/daemon.zig");
 const platform = @import("util/platform.zig");
 const selfexec = @import("mux/selfexec.zig");
@@ -248,7 +249,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     d.lifetime_fd = lifetime_fd;
     // The autostart knob travelled in OUR environment; the shells and
     // apps this daemon spawns must not carry it on to daemons THEY start.
-    _ = c.unsetenv(@import("mux/client.zig").Conn.IDLE_EXIT_ENV);
+    _ = unsetEnv(@import("mux/client.zig").Conn.IDLE_EXIT_ENV);
     defer d.deinit();
     g_daemon = d;
 

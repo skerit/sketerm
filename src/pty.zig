@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const c = @import("c.zig").c;
+const unsetEnv = @import("util/env.zig").unset;
 const platform = @import("util/platform.zig");
 const version = @import("version.zig");
 
@@ -243,12 +244,12 @@ pub const Pty = struct {
                 _ = c.setenv("SKETERM_PANE_ID", s.ptr, 1);
             } else |_| {}
         } else {
-            _ = c.unsetenv("SKETERM_PANE_ID");
+            _ = unsetEnv("SKETERM_PANE_ID");
         }
-        if (opts.session_name) |sn| _ = c.setenv("SKETERM_SESSION", sn, 1) else _ = c.unsetenv("SKETERM_SESSION");
-        if (opts.session_origin_id) |id| _ = c.setenv("SKETERM_SESSION_ORIGIN_ID", id, 1) else _ = c.unsetenv("SKETERM_SESSION_ORIGIN_ID");
-        if (opts.mux_socket_path) |sp| _ = c.setenv("SKETERM_MUX_SOCKET", sp, 1) else _ = c.unsetenv("SKETERM_MUX_SOCKET");
-        if (opts.socket_path) |sp| _ = c.setenv("SKETERM_SOCKET", sp, 1) else _ = c.unsetenv("SKETERM_SOCKET");
+        if (opts.session_name) |sn| _ = c.setenv("SKETERM_SESSION", sn, 1) else _ = unsetEnv("SKETERM_SESSION");
+        if (opts.session_origin_id) |id| _ = c.setenv("SKETERM_SESSION_ORIGIN_ID", id, 1) else _ = unsetEnv("SKETERM_SESSION_ORIGIN_ID");
+        if (opts.mux_socket_path) |sp| _ = c.setenv("SKETERM_MUX_SOCKET", sp, 1) else _ = unsetEnv("SKETERM_MUX_SOCKET");
+        if (opts.socket_path) |sp| _ = c.setenv("SKETERM_SOCKET", sp, 1) else _ = unsetEnv("SKETERM_SOCKET");
         if (opts.wayland_display) |wd| {
             _ = c.setenv("WAYLAND_DISPLAY", wd, 1);
             // Software GL by default: without a GPU device the EGL
@@ -269,7 +270,7 @@ pub const Pty = struct {
         if (opts.pulse_server) |ps| {
             _ = c.setenv("PULSE_SERVER", ps, 1);
         } else if (opts.clear_pulse_server) {
-            _ = c.unsetenv("PULSE_SERVER");
+            _ = unsetEnv("PULSE_SERVER");
         }
         // Isolated app session: give the child a private runtime dir
         // and drop the inherited session bus. Both are how
@@ -278,7 +279,7 @@ pub const Pty = struct {
         // window to an instance already rendering on another client.
         if (opts.runtime_dir) |rd| {
             _ = c.setenv("XDG_RUNTIME_DIR", rd, 1);
-            _ = c.unsetenv("DBUS_SESSION_BUS_ADDRESS");
+            _ = unsetEnv("DBUS_SESSION_BUS_ADDRESS");
         }
         // Private a11y session bus: the daemon spawned a dbus-daemon
         // for this app and reads its AT-SPI tree there. Point the app

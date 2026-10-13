@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const c = @import("c.zig").c;
+const unsetEnv = @import("util/env.zig").unset;
 const client_mod = @import("mux/client.zig");
 const wire = @import("mux/wire.zig");
 const display_cli = @import("mux/display.zig");
@@ -617,7 +618,7 @@ fn spawnExternalApp(wl_path: []const u8) c.pid_t {
         _ = c.setenv("WAYLAND_DISPLAY", wz.ptr, 1);
         // The daemon's own hub is the display; a stray X11 display or
         // GDK backend hint must not divert the client.
-        _ = c.unsetenv("DISPLAY");
+        _ = unsetEnv("DISPLAY");
         const argv = [_:null]?[*:0]const u8{ "/usr/bin/weston-terminal", null };
         _ = c.execv("/usr/bin/weston-terminal", @ptrCast(@constCast(&argv)));
         c._exit(127);
@@ -642,8 +643,8 @@ fn spawnExternalX11(display: []const u8, authority: []const u8) c.pid_t {
         }
         _ = c.setenv("DISPLAY", display_z.ptr, 1);
         _ = c.setenv("XAUTHORITY", auth_z.ptr, 1);
-        _ = c.unsetenv("WAYLAND_DISPLAY");
-        _ = c.unsetenv("WAYLAND_SOCKET");
+        _ = unsetEnv("WAYLAND_DISPLAY");
+        _ = unsetEnv("WAYLAND_SOCKET");
         const argv = [_:null]?[*:0]const u8{
             "/usr/bin/xterm", "-geometry", "40x10", "-title", "sketerm-x11-smoke", null,
         };
@@ -824,7 +825,7 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8) void {
                 var zbuf: [128:0]u8 = undefined;
                 const z = std.fmt.bufPrintZ(&zbuf, "{s}", .{p}) catch fail("prior LIBGL value too long");
                 _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", z.ptr, 1);
-            } else _ = c.unsetenv("LIBGL_ALWAYS_SOFTWARE");
+            } else _ = unsetEnv("LIBGL_ALWAYS_SOFTWARE");
         }
         const r = runCli(allocator, &.{ "run", "--name", "dsprun-gpu", "--gpu", "--no-xwayland", "--socket", sock_path, "--", "/bin/sh", "-c", "test -z \"$LIBGL_ALWAYS_SOFTWARE\" && printf gpu-ok" });
         defer r.deinit(allocator);

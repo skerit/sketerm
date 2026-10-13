@@ -36,6 +36,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const c = @import("c.zig").c;
+const unsetEnv = @import("util/env.zig").unset;
 const platform = @import("util/platform.zig");
 const appdrive = @import("ipc/appdrive.zig");
 const clock = @import("util/clock.zig");
@@ -100,7 +101,7 @@ fn teardown() void {
         _ = c.waitpid(remote_mux_pid, &status, 0);
         remote_mux_pid = 0;
     }
-    _ = c.unsetenv("SKETERM_SSH");
+    _ = unsetEnv("SKETERM_SSH");
 }
 
 fn fail(comptime fmt: []const u8, args: anytype) u8 {
@@ -699,8 +700,8 @@ fn runLeg(allocator: std.mem.Allocator, remote: bool) u8 {
     _ = c.setenv("XDG_RUNTIME_DIR", rt.ptr, 1);
     _ = c.setenv("XDG_CONFIG_HOME", rt.ptr, 1);
     _ = c.setenv("XDG_STATE_HOME", rt.ptr, 1);
-    _ = c.unsetenv("SKETERM_SOCKET");
-    _ = c.unsetenv("SKETERM_SSH");
+    _ = unsetEnv("SKETERM_SOCKET");
+    _ = unsetEnv("SKETERM_SSH");
     defer @import("util/pathz.zig").removeTree(rt);
     // Isolated XDG_CONFIG_HOME races pango/fontconfig into heap
     // corruption unless the cache is warmed first (memory:
@@ -873,7 +874,7 @@ fn runLeg(allocator: std.mem.Allocator, remote: bool) u8 {
         _ = c.setenv("SKETERM_APP_ID", "dev.sker.sketerm.lspsmoke", 1);
         _ = c.setenv("WAYLAND_DISPLAY", &wl_z, 1);
         _ = c.setenv("GDK_BACKEND", "wayland", 1);
-        _ = c.unsetenv("DISPLAY");
+        _ = unsetEnv("DISPLAY");
         _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
         _ = c.setenv("GTK_A11Y", "none", 1);
         // No first-run tour: a modal dialog would swallow the

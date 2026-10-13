@@ -8,32 +8,37 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const c = @import("../c.zig").c;
+// `cbindings` directly, as pathz.zig does: env.zig imports this file, and
+// modules rooted inside src/util cannot reach `../c.zig`.
+const c = @import("cbindings");
 
 pub const is_linux = builtin.os.tag == .linux;
 pub const is_macos = builtin.os.tag == .macos;
 
 extern fn _NSGetEnviron() [*c][*c][*c]u8;
 
+/// libc's `environ` variable itself, so a caller can repoint it (Darwin exports it only through `_NSGetEnviron`).
+pub fn environSlot() *[*c][*c]u8 {
+    if (is_linux) return @ptrCast(&std.c.environ);
+    return @ptrCast(_NSGetEnviron());
+}
+
+var empty_environ = [_][*c]u8{null};
+
 /// Empty the process environment without depending on Darwin's missing clearenv declaration.
+/// Darwin repoints `environ` rather than writing into the array, which may be the startup one std still reads.
 pub fn clearEnvironment() void {
     if (is_linux) {
         _ = c.clearenv();
     } else {
-        const slot = _NSGetEnviron();
-        if (slot != null and slot[0] != null) slot[0][0] = null;
+        environSlot().* = &empty_environ;
     }
 }
 
-/// Drop every `NAME=VALUE` entry of the process environment that `drop`
-/// names, in place: no allocation and no libc lock, so a forked child of a
-/// threaded parent may call it before exec.
+/// Drop every `NAME=VALUE` entry that `drop` names, in place, with no allocation and no libc lock.
+/// Compacting in place breaks std's fixed-length view of the startup environment, so ONLY a forked child about to exec may call it.
 pub fn dropEnvironment(drop: *const fn ([]const u8) bool) void {
-    const env: [*c][*c]u8 = if (is_linux) @ptrCast(std.c.environ) else blk: {
-        const slot = _NSGetEnviron();
-        if (slot == null) return;
-        break :blk slot[0];
-    };
+    const env = environSlot().*;
     if (env == null) return;
     var r: usize = 0;
     var w: usize = 0;
@@ -1239,7 +1244,7 @@ test "environOfPid reflects exec time, not the live environment" {
     // rechecking rather than celebrating.
     const key = "SKETERM_PLATFORM_LIVE_ONLY_PROBE";
     try std.testing.expectEqual(@as(c_int, 0), c.setenv(key, "1", 1));
-    defer _ = c.unsetenv(key);
+    defer _ = @import("env.zig").unset(key);
 
     var buf: [64 * 1024]u8 = undefined;
     const env = environOfPid(c.getpid(), &buf) orelse return error.NoEnviron;
@@ -1276,9 +1281,11 @@ pub fn mtimeSecs(st: *const c.struct_stat) i64 {
 
 test "dropEnvironment removes exactly the entries it is told to" {
     const t = std.testing;
+    // This process is no child about to exec: compact a copy, never the startup array.
+    @import("env.zig").detachEnviron();
     _ = c.setenv("SKETERM_DROPTEST_GONE", "1", 1);
     _ = c.setenv("SKETERM_DROPTEST_KEPT", "2", 1);
-    defer _ = c.unsetenv("SKETERM_DROPTEST_KEPT");
+    defer _ = @import("env.zig").unset("SKETERM_DROPTEST_KEPT");
     dropEnvironment(&struct {
         fn drop(entry: []const u8) bool {
             return std.mem.startsWith(u8, entry, "SKETERM_DROPTEST_GONE=");

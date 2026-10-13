@@ -10,6 +10,7 @@
 const std = @import("std");
 const nowMs = @import("../util/clock.zig").nowMs;
 const c = @import("../c.zig").c;
+const unsetEnv = @import("../util/env.zig").unset;
 const fdio = @import("../util/fdio.zig");
 const client = @import("client.zig");
 const daemon = @import("daemon.zig");
@@ -1034,16 +1035,16 @@ fn runCommand(allocator: std.mem.Allocator, a_in: Args) u8 {
         _ = c.setenv("WAYLAND_DISPLAY", wl_z.ptr, 1);
         _ = c.setenv("XDG_RUNTIME_DIR", rt_z.ptr, 1);
         _ = c.setenv("XDG_SESSION_TYPE", "wayland", 1);
-        if (display_z) |p| _ = c.setenv("DISPLAY", p.ptr, 1) else _ = c.unsetenv("DISPLAY");
-        if (xauth_z) |p| _ = c.setenv("XAUTHORITY", p.ptr, 1) else _ = c.unsetenv("XAUTHORITY");
+        if (display_z) |p| _ = c.setenv("DISPLAY", p.ptr, 1) else _ = unsetEnv("DISPLAY");
+        if (xauth_z) |p| _ = c.setenv("XAUTHORITY", p.ptr, 1) else _ = unsetEnv("XAUTHORITY");
         if (display_z != null) _ = c.setenv("_JAVA_AWT_WM_NONREPARENTING", "1", 1);
-        _ = c.unsetenv("WAYLAND_SOCKET");
-        if (a.isolated) _ = c.unsetenv("DBUS_SESSION_BUS_ADDRESS");
-        if (pulse_z) |p| _ = c.setenv("PULSE_SERVER", p.ptr, 1) else _ = c.unsetenv("PULSE_SERVER");
+        _ = unsetEnv("WAYLAND_SOCKET");
+        if (a.isolated) _ = unsetEnv("DBUS_SESSION_BUS_ADDRESS");
+        if (pulse_z) |p| _ = c.setenv("PULSE_SERVER", p.ptr, 1) else _ = unsetEnv("PULSE_SERVER");
         if (env.software_gl)
             _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1)
         else
-            _ = c.unsetenv("LIBGL_ALWAYS_SOFTWARE");
+            _ = unsetEnv("LIBGL_ALWAYS_SOFTWARE");
         _ = c.execvp(argv_ptrs.items[0].?, @ptrCast(@constCast(argv_ptrs.items.ptr)));
         const exec_errno = std.posix.errno(@as(c_int, -1));
         errPrint("cannot execute '{s}': {s}", .{ a.command[0], @tagName(exec_errno) });

@@ -33,6 +33,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const c = @import("c.zig").c;
+const unsetEnv = @import("util/env.zig").unset;
 const platform = @import("util/platform.zig");
 const appdrive = @import("ipc/appdrive.zig");
 const ctlsock = @import("smoke/ctlsock.zig");
@@ -126,7 +127,7 @@ pub fn main() u8 {
     _ = c.setenv("XDG_RUNTIME_DIR", rt.ptr, 1);
     _ = c.setenv("XDG_CONFIG_HOME", rt.ptr, 1);
     _ = c.setenv("XDG_STATE_HOME", rt.ptr, 1);
-    _ = c.unsetenv("SKETERM_SOCKET");
+    _ = unsetEnv("SKETERM_SOCKET");
     // dbus-broker silently reuses the HOST accessibility bus; every bus
     // process this smoke spawns (dbus-daemon → at-spi-bus-launcher →
     // registryd) inherits this and stays on the private one.
@@ -203,7 +204,7 @@ pub fn main() u8 {
         _ = c.setenv("SKETERM_APP_ID", "dev.sker.sketerm.a11y", 1);
         _ = c.setenv("WAYLAND_DISPLAY", &wl_z, 1);
         _ = c.setenv("GDK_BACKEND", "wayland", 1);
-        _ = c.unsetenv("DISPLAY");
+        _ = unsetEnv("DISPLAY");
         _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
         // `atspi`, not `1`: GTK4 silently ignores the GTK3-ism.
         _ = c.setenv("GTK_A11Y", "atspi", 1);

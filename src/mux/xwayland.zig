@@ -7,6 +7,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const c = @import("../c.zig").c;
+const unsetEnv = @import("../util/env.zig").unset;
 const platform = @import("../util/platform.zig");
 const pathz = @import("../util/pathz.zig");
 const pathZ = pathz.pathZ;
@@ -112,12 +113,12 @@ pub const Instance = struct {
             }
             _ = c.setenv("WAYLAND_DISPLAY", wl.ptr, 1);
             _ = c.setenv("XDG_RUNTIME_DIR", rt.ptr, 1);
-            _ = c.unsetenv("DISPLAY");
-            _ = c.unsetenv("WAYLAND_SOCKET");
+            _ = unsetEnv("DISPLAY");
+            _ = unsetEnv("WAYLAND_SOCKET");
             if (!self.gpu)
                 _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1)
             else
-                _ = c.unsetenv("LIBGL_ALWAYS_SOFTWARE");
+                _ = unsetEnv("LIBGL_ALWAYS_SOFTWARE");
             var argv: [14:null]?[*:0]const u8 = .{
                 "xwayland-satellite",
                 display.ptr,

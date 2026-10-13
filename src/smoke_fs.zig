@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const c = @import("c.zig").c;
+const unsetEnv = @import("util/env.zig").unset;
 const daemon_mod = @import("mux/daemon.zig");
 const client_mod = @import("mux/client.zig");
 const wire = @import("mux/wire.zig");
@@ -3033,7 +3034,7 @@ fn crossStage(
     defer if (had_rt) {
         _ = c.setenv("XDG_RUNTIME_DIR", &prev_rt_buf, 1);
     } else {
-        _ = c.unsetenv("XDG_RUNTIME_DIR");
+        _ = unsetEnv("XDG_RUNTIME_DIR");
     };
 
     var fs = fsdrive.Fs.connect(allocator, sock_dst) catch fail("cross: connect coordinator");
@@ -3371,7 +3372,7 @@ fn crossStage(
             fail("cross: reconnect double-counted transferred bytes");
         }
     }
-    _ = c.unsetenv("SKETERM_SSH");
+    _ = unsetEnv("SKETERM_SSH");
 
     // ── cross-host MOVE: verified copy, then the source is gone ──
     // delete_src runs strictly after the rename, on the SOURCE
@@ -3478,7 +3479,7 @@ fn crossStage(
         const canceler = std.Thread.spawn(.{}, cancelAtInstallElection, .{&cancel}) catch
             fail("cross: pre-install cancellation watcher");
         const outcome = collectJob(&fs, job, 180_000);
-        _ = c.unsetenv("SKETERM_FSJOB_PRE_INSTALL_DELAY_MS");
+        _ = unsetEnv("SKETERM_FSJOB_PRE_INSTALL_DELAY_MS");
         canceler.join();
         if (!cancel.requested) fail("cross: cancellation missed the final install election");
         if (!outcome.is("canceled")) failErr("cross: pre-install election did not cancel", outcome.messageText());
@@ -3517,7 +3518,7 @@ fn crossStage(
         const canceler = std.Thread.spawn(.{}, cancelAtInstallElection, .{&cancel}) catch
             fail("cross: post-install cancellation watcher");
         const outcome = collectJob(&fs, job, 180_000);
-        _ = c.unsetenv("SKETERM_FSJOB_POST_INSTALL_DELAY_MS");
+        _ = unsetEnv("SKETERM_FSJOB_POST_INSTALL_DELAY_MS");
         canceler.join();
         if (!cancel.requested) fail("cross: cancellation missed the post-install window");
         if (!cancel.killed) fail("cross: post-install helper was not interrupted");
@@ -3558,7 +3559,7 @@ fn crossStage(
         const canceler = std.Thread.spawn(.{}, cancelMoveAfterQuarantine, .{&cancel}) catch
             fail("cross: cancel-safe move watcher");
         const outcome = collectJob(&fs, job, 180_000);
-        _ = c.unsetenv("SKETERM_FSJOB_QUARANTINE_DELAY_MS");
+        _ = unsetEnv("SKETERM_FSJOB_QUARANTINE_DELAY_MS");
         canceler.join();
         if (!cancel.requested) fail("cross: cancel request missed the quarantine window");
         if (!cancel.killed) fail("cross: cancel recovery helper was not interrupted after the durable request");
@@ -3601,7 +3602,7 @@ fn crossStage(
         const canceler = std.Thread.spawn(.{}, cancelMoveAfterQuarantine, .{&cancel}) catch
             fail("cross: deferred-cancel move watcher");
         const outcome = collectJob(&fs, job, 180_000);
-        _ = c.unsetenv("SKETERM_FSJOB_DELETE_DELAY_MS");
+        _ = unsetEnv("SKETERM_FSJOB_DELETE_DELAY_MS");
         canceler.join();
         if (!cancel.requested) fail("cross: cancel request missed the deletion window");
         if (!cancel.killed) fail("cross: deleting move helper was not interrupted before cancellation");
@@ -3884,7 +3885,7 @@ fn crossStage(
         const got_final = fileSha(q_dst) orelse fail("cross: cleanup-retry destination hash");
         if (!std.mem.eql(u8, &got_final, &want_q)) fail("cross: cleanup retry damaged the destination");
     }
-    _ = c.unsetenv("SKETERM_SSH");
+    _ = unsetEnv("SKETERM_SSH");
 
     // ── an unreachable source names itself in the failure ──────
     var ssh_dead_buf: [160:0]u8 = undefined;
@@ -3914,7 +3915,7 @@ fn crossStage(
         if (!std.mem.eql(u8, res.kindText(), "unreachable"))
             failErr("cross: dial failure not stamped kind=unreachable", res.kindText());
     }
-    _ = c.unsetenv("SKETERM_SSH");
+    _ = unsetEnv("SKETERM_SSH");
     std.debug.print("smoke-fs: cross-host copy reconnect/resume OK\n", .{});
 }
 

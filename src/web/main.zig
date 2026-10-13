@@ -30,6 +30,7 @@ const cefhost = @import("cefhost.zig");
 const ozone = @import("ozone.zig");
 const server = @import("server.zig");
 const pathz = @import("../util/pathz.zig");
+const unsetEnv = @import("../util/env.zig").unset;
 const untrusted = @import("cefhost/untrusted.zig");
 const cef = @import("cef");
 const untrusted_env = @import("untrusted_env.zig");
@@ -341,7 +342,7 @@ fn scrubUntrustedEnv() bool {
         names[count][name.len] = 0;
         count += 1;
     }
-    for (names[0..count]) |*name| if (c.unsetenv(name) != 0) return false;
+    for (names[0..count]) |*name| if (!unsetEnv(name)) return false;
     for (untrusted_env.sets) |kv| {
         var key: [64:0]u8 = undefined;
         var value: [64:0]u8 = undefined;
@@ -523,7 +524,7 @@ fn buildCefArgv(argv: []const [*:0]const u8, disable_features: [:0]u8, routed: b
     // would read a software renderer although a render node exists. The
     // render-node decision is this helper's; `SKETERM_WEB_GPU=0` is the
     // knob that vetoes it.
-    if (webgl == .hardware) _ = c.unsetenv("LIBGL_ALWAYS_SOFTWARE");
+    if (webgl == .hardware) _ = unsetEnv("LIBGL_ALWAYS_SOFTWARE");
     if (webgl == .software) {
         // WebGL's SwiftShader process, but CPU OnPaint pixels.
         const switches = [_][*:0]const u8{ "--use-angle=swiftshader", "--enable-unsafe-swiftshader", "--disable-gpu-compositing" };

@@ -23,6 +23,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const c = @import("c.zig").c;
+const unsetEnv = @import("util/env.zig").unset;
 const platform = @import("util/platform.zig");
 const protocol = @import("ipc/protocol.zig");
 const version = @import("version.zig");
@@ -508,13 +509,13 @@ pub fn main() u8 {
     _ = c.setenv("XDG_STATE_HOME", rt.ptr, 1);
     _ = c.setenv("XDG_CACHE_HOME", rt.ptr, 1);
     _ = c.setenv("XDG_DATA_HOME", rt.ptr, 1);
-    _ = c.unsetenv("SKETERM_SOCKET");
+    _ = unsetEnv("SKETERM_SOCKET");
     // Run from inside a sketerm pane, the rig inherits that pane's
     // identity, and the GUI child then took `SKETERM_MUX_SOCKET` as its
     // web store's daemon: every page the rig loaded was recorded in the
     // USER'S real browsing history.
     for ([_][*:0]const u8{ "SKETERM_MUX_SOCKET", "SKETERM_SESSION", "SKETERM_SESSION_ORIGIN_ID", "SKETERM_PANE_ID" }) |name|
-        _ = c.unsetenv(name);
+        _ = unsetEnv(name);
     // Downloads land in the rig too: with no user-dirs.dirs under the
     // isolated config home, GLib's download directory falls back to the
     // user's REAL $HOME.
@@ -773,7 +774,7 @@ pub fn main() u8 {
             // makes every input assertion below a false green.
             _ = c.setenv("WAYLAND_DISPLAY", &wl_z, 1);
             _ = c.setenv("GDK_BACKEND", "wayland", 1);
-            _ = c.unsetenv("DISPLAY");
+            _ = unsetEnv("DISPLAY");
             // The hub has no GPU; the daemon mmaps shm planes.
             _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
             // "The user configured a real IME": makes the editor face
@@ -3503,10 +3504,10 @@ fn watchAlongStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: 
     {
         const mux_cli = @import("ipc/mux_cli.zig");
         _ = c.setenv("SKETERM_SOCKET", sock_path.ptr, 1);
-        defer _ = c.unsetenv("SKETERM_SOCKET");
-        defer _ = c.unsetenv("SKETERM_PANE_ID");
-        defer _ = c.unsetenv("SKETERM_SESSION");
-        _ = c.unsetenv("SKETERM_SESSION");
+        defer _ = unsetEnv("SKETERM_SOCKET");
+        defer _ = unsetEnv("SKETERM_PANE_ID");
+        defer _ = unsetEnv("SKETERM_SESSION");
+        _ = unsetEnv("SKETERM_SESSION");
 
         const opened = roundtrip(allocator, sock_path, "{\"cmd\":\"new-tab\"}\n") orelse
             return "opening the attach origin pane timed out";
@@ -3569,9 +3570,9 @@ fn spawnIsolatedMcp(allocator: std.mem.Allocator, fake_log: ?[*:0]const u8) ?Mcp
         _ = c.close(out_pipe[1]);
         // The harness may run inside a sketerm pane; this child is an
         // assistant of its own, not that pane's.
-        _ = c.unsetenv("SKETERM_SESSION");
-        _ = c.unsetenv("SKETERM_MUX_SOCKET");
-        _ = c.unsetenv("SKETERM_SESSION_ORIGIN_ID");
+        _ = unsetEnv("SKETERM_SESSION");
+        _ = unsetEnv("SKETERM_MUX_SOCKET");
+        _ = unsetEnv("SKETERM_SESSION_ORIGIN_ID");
         if (fake_log) |path| {
             _ = c.setenv(FAKE_AGENT_ENV, "1", 1);
             _ = c.setenv(FAKE_AGENT_LOG_ENV, path, 1);
@@ -4132,7 +4133,7 @@ fn assistantWebWatchStage(allocator: std.mem.Allocator, app: *appdrive.App, sock
     const web_bin = c.realpath("zig-out/bin/sketerm-webengine", &web_bin_buf) orelse
         return "could not resolve sketerm-webengine for the web watch stage";
     _ = c.setenv("SKETERM_WEB_BIN", web_bin, 1);
-    defer _ = c.unsetenv("SKETERM_WEB_BIN");
+    defer _ = unsetEnv("SKETERM_WEB_BIN");
     if (assistantChipBox(app, win_id) != null)
         return "an assistant chip was already showing before the web watch MCP registered";
     var m = spawnIsolatedMcp(allocator, null) orelse return "could not spawn an isolated `sketerm mcp`";
@@ -4930,7 +4931,7 @@ fn restoreStage(
         _ = c.setenv("SKETERM_APP_ID", "dev.sker.sketerm.e2e.restore", 1);
         _ = c.setenv("WAYLAND_DISPLAY", wl, 1);
         _ = c.setenv("GDK_BACKEND", "wayland", 1);
-        _ = c.unsetenv("DISPLAY");
+        _ = unsetEnv("DISPLAY");
         _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
         _ = c.setenv("GTK_A11Y", "none", 1);
         _ = c.setenv("SKETERM_VERIFY_TREE", "1", 1);
@@ -7343,7 +7344,7 @@ fn viewerMenuStage(allocator: std.mem.Allocator, app: *appdrive.App, rt: []const
         _ = c.setenv("SKETERM_APP_ID", "dev.sker.sketerm.e2eview", 1);
         _ = c.setenv("WAYLAND_DISPLAY", wl, 1);
         _ = c.setenv("GDK_BACKEND", "wayland", 1);
-        _ = c.unsetenv("DISPLAY");
+        _ = unsetEnv("DISPLAY");
         _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
         _ = c.setenv("GTK_A11Y", "none", 1);
         const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "view", img_path.ptr, null };
@@ -7537,7 +7538,7 @@ fn castPlaybackStage(
         _ = c.setenv("SKETERM_APP_ID", "dev.sker.sketerm.e2ecast", 1);
         _ = c.setenv("WAYLAND_DISPLAY", wl, 1);
         _ = c.setenv("GDK_BACKEND", "wayland", 1);
-        _ = c.unsetenv("DISPLAY");
+        _ = unsetEnv("DISPLAY");
         _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
         _ = c.setenv("GTK_A11Y", "none", 1);
         // A GLib/GTK critical (e.g. severing a finalized surface at
@@ -8066,7 +8067,7 @@ fn viewerReuseStage(allocator: std.mem.Allocator, app: *appdrive.App, rt: [:0]co
         _ = c.setenv("SKETERM_APP_ID", "dev.sker.sketerm.e2evreuse", 1);
         _ = c.setenv("WAYLAND_DISPLAY", wl, 1);
         _ = c.setenv("GDK_BACKEND", "wayland", 1);
-        _ = c.unsetenv("DISPLAY");
+        _ = unsetEnv("DISPLAY");
         _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
         _ = c.setenv("GTK_A11Y", "none", 1);
         const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "view", &specs[0], &specs[1], &specs[2], null };
@@ -8213,7 +8214,7 @@ fn viewerCastStage(
         _ = c.setenv("SKETERM_APP_ID", "dev.sker.sketerm.e2evcast", 1);
         _ = c.setenv("WAYLAND_DISPLAY", wl, 1);
         _ = c.setenv("GDK_BACKEND", "wayland", 1);
-        _ = c.unsetenv("DISPLAY");
+        _ = unsetEnv("DISPLAY");
         _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
         _ = c.setenv("GTK_A11Y", "none", 1);
         // Same guard as the sketerm-play child: criticals abort, and
@@ -8505,10 +8506,10 @@ fn launchRenameFiles(
         if (verify_scope.len > 0)
             _ = c.setenv("SKETERM_VERIFY_INLINE_RENAME_TEARDOWN", verify_scope.ptr, 1)
         else
-            _ = c.unsetenv("SKETERM_VERIFY_INLINE_RENAME_TEARDOWN");
+            _ = unsetEnv("SKETERM_VERIFY_INLINE_RENAME_TEARDOWN");
         _ = c.setenv("WAYLAND_DISPLAY", wl, 1);
         _ = c.setenv("GDK_BACKEND", "wayland", 1);
-        _ = c.unsetenv("DISPLAY");
+        _ = unsetEnv("DISPLAY");
         _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
         _ = c.setenv("GTK_A11Y", "none", 1);
         // A rig must never meet the first-run tour: it covers the
@@ -8659,7 +8660,7 @@ fn secondGuiBrowserStage(
         _ = c.setenv("SKETERM_APP_ID", "dev.sker.sketerm.e2eweb2", 1);
         _ = c.setenv("WAYLAND_DISPLAY", wl, 1);
         _ = c.setenv("GDK_BACKEND", "wayland", 1);
-        _ = c.unsetenv("DISPLAY");
+        _ = unsetEnv("DISPLAY");
         _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
         _ = c.setenv("GTK_A11Y", "none", 1);
         _ = c.setenv("SKETERM_WELCOME", "0", 1);
@@ -8848,7 +8849,7 @@ fn filesMountBypassStage(
         if (!wrote) return "files bypass: table write";
     }
     _ = c.setenv("SKETERM_MOUNT_TABLE", table.ptr, 1);
-    defer _ = c.unsetenv("SKETERM_MOUNT_TABLE");
+    defer _ = unsetEnv("SKETERM_MOUNT_TABLE");
 
     const Case = struct { dir: usize, tag: []const u8, rerouted: bool };
     const cases = [_]Case{
@@ -9040,7 +9041,7 @@ fn spawnSketermChild(app_id: [*:0]const u8, wl: [*:0]const u8, args: []const [*:
         _ = c.setenv("SKETERM_APP_ID", app_id, 1);
         _ = c.setenv("WAYLAND_DISPLAY", wl, 1);
         _ = c.setenv("GDK_BACKEND", "wayland", 1);
-        _ = c.unsetenv("DISPLAY");
+        _ = unsetEnv("DISPLAY");
         _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
         _ = c.setenv("GTK_A11Y", "none", 1);
         _ = c.setenv("SKETERM_WELCOME", "0", 1);
@@ -10821,7 +10822,7 @@ fn quickLookStage(allocator: std.mem.Allocator, app: *appdrive.App, rt: []const 
         _ = c.setenv("SKETERM_APP_ID", "dev.sker.sketerm.e2eql", 1);
         _ = c.setenv("WAYLAND_DISPLAY", wl, 1);
         _ = c.setenv("GDK_BACKEND", "wayland", 1);
-        _ = c.unsetenv("DISPLAY");
+        _ = unsetEnv("DISPLAY");
         _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
         _ = c.setenv("GTK_A11Y", "none", 1);
         // A rig must never meet the first-run tour: it covers the
@@ -12893,9 +12894,9 @@ const McpChild = struct {
                 // The harness may itself have been launched from inside a
                 // sketerm pane. This child is explicitly testing legacy direct
                 // GUI-socket semantics, not that ambient pane's mux origin.
-                _ = c.unsetenv("SKETERM_SESSION");
-                _ = c.unsetenv("SKETERM_MUX_SOCKET");
-                _ = c.unsetenv("SKETERM_SESSION_ORIGIN_ID");
+                _ = unsetEnv("SKETERM_SESSION");
+                _ = unsetEnv("SKETERM_MUX_SOCKET");
+                _ = unsetEnv("SKETERM_SESSION_ORIGIN_ID");
                 // --shared skips the private daemon entirely (no second
                 // mux to clean up); --socket points it at THIS GUI.
                 const argv = [_:null]?[*:0]const u8{
@@ -13014,7 +13015,7 @@ fn mcpWebReaderStage(allocator: std.mem.Allocator, sock_path: [:0]const u8, rt: 
     if (!wrote) return "could not write the GUI MCP reader page";
 
     _ = c.setenv("SKETERM_WEB_BIN", web_bin, 1);
-    defer _ = c.unsetenv("SKETERM_WEB_BIN");
+    defer _ = unsetEnv("SKETERM_WEB_BIN");
     var m = McpChild.spawn(allocator, sock_path) orelse return "could not spawn MCP for the GUI reader stage";
     defer m.close();
     if (!m.initialize()) return "GUI reader MCP did not answer initialize";
@@ -14878,7 +14879,7 @@ fn themeSingletonStage(
         _ = c.setenv("SKETERM_APP_ID", "dev.sker.sketerm.e2e.theme", 1);
         _ = c.setenv("WAYLAND_DISPLAY", wl, 1);
         _ = c.setenv("GDK_BACKEND", "wayland", 1);
-        _ = c.unsetenv("DISPLAY");
+        _ = unsetEnv("DISPLAY");
         _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
         _ = c.setenv("GTK_A11Y", "none", 1);
         _ = c.setenv("SKETERM_VERIFY_TREE", "1", 1);
@@ -16389,12 +16390,12 @@ fn deadKeyStage(allocator: std.mem.Allocator, rt: []const u8, mux_sock: []const 
         _ = c.setenv("SKETERM_APP_ID", "dev.sker.sketerm.e2e.deadkey", 1);
         _ = c.setenv("WAYLAND_DISPLAY", &wl_z, 1);
         _ = c.setenv("GDK_BACKEND", "wayland", 1);
-        _ = c.unsetenv("DISPLAY");
+        _ = unsetEnv("DISPLAY");
         _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
         // The whole point of a second instance: no declared input
         // method, so `input_method = auto` resolves BOTH faces to
         // GtkIMContextSimple and compose/dead keys are live.
-        _ = c.unsetenv("GTK_IM_MODULE");
+        _ = unsetEnv("GTK_IM_MODULE");
         _ = c.setenv("SKETERM_VERIFY_TREE", "1", 1);
         // Same hermeticity rule as the primary GUI child above.
         _ = c.setenv("GTK_A11Y", "none", 1);
@@ -18336,7 +18337,7 @@ fn spawnHostMcp(allocator: std.mem.Allocator, host_rt: [:0]const u8, path_env: [
         _ = c.dup2(in_pipe[0], 0);
         _ = c.dup2(out_pipe[1], 1);
         for ([_]c_int{ in_pipe[0], in_pipe[1], out_pipe[0], out_pipe[1] }) |fd| _ = c.close(fd);
-        for ([_][*:0]const u8{ "SKETERM_SESSION", "SKETERM_MUX_SOCKET", "SKETERM_SESSION_ORIGIN_ID" }) |name| _ = c.unsetenv(name);
+        for ([_][*:0]const u8{ "SKETERM_SESSION", "SKETERM_MUX_SOCKET", "SKETERM_SESSION_ORIGIN_ID" }) |name| _ = unsetEnv(name);
         _ = c.setenv("XDG_RUNTIME_DIR", host_rt.ptr, 1);
         _ = c.setenv("XDG_STATE_HOME", host_rt.ptr, 1);
         _ = c.setenv("XDG_CONFIG_HOME", host_rt.ptr, 1);
@@ -18721,7 +18722,7 @@ fn assistantRemoteWebWatchStage(allocator: std.mem.Allocator, app: *appdrive.App
     const web_bin = c.realpath("zig-out/bin/sketerm-webengine", &web_bin_buf) orelse
         return "could not resolve sketerm-webengine for the remote web watch stage";
     _ = c.setenv("SKETERM_WEB_BIN", web_bin, 1);
-    defer _ = c.unsetenv("SKETERM_WEB_BIN");
+    defer _ = unsetEnv("SKETERM_WEB_BIN");
     var m = spawnHostMcp(allocator, hosts.rt[0], hosts.path_env, hosts.log_path) orelse return "could not spawn `sketerm mcp` on hosta";
     var m_open = true;
     defer if (m_open) m.close();

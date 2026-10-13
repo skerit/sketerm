@@ -85,8 +85,8 @@ test "statePath prefers XDG_STATE_HOME, falls back to HOME, and never to /tmp" {
     defer t.allocator.free(b);
     try t.expectEqualStrings("/home/u/.local/state/sketerm/file-transfers.d", b);
 
-    _ = c.unsetenv("XDG_STATE_HOME");
-    _ = c.unsetenv("HOME");
+    _ = env.unset("XDG_STATE_HOME");
+    _ = env.unset("HOME");
     try t.expectError(Error.NoStateDir, statePath(t.allocator, "x"));
 }
 
@@ -103,8 +103,8 @@ test "configDir prefers XDG_CONFIG_HOME, falls back to HOME" {
     try t.expectEqualStrings("/xc/sketerm", configDir(&buf).?);
     _ = c.setenv("XDG_CONFIG_HOME", "", 1);
     try t.expectEqualStrings("/home/u/.config/sketerm", configDir(&buf).?);
-    _ = c.unsetenv("XDG_CONFIG_HOME");
-    _ = c.unsetenv("HOME");
+    _ = env.unset("XDG_CONFIG_HOME");
+    _ = env.unset("HOME");
     try t.expect(configDir(&buf) == null);
 }
 
@@ -124,7 +124,7 @@ test "dataPath prefers XDG_DATA_HOME, falls back to HOME, and is null with neith
     const b = (try dataPath(t.allocator, "userscripts")).?;
     defer t.allocator.free(b);
     try t.expectEqualStrings("/home/u/.local/share/sketerm/userscripts", b);
-    _ = c.unsetenv("XDG_DATA_HOME");
-    _ = c.unsetenv("HOME");
+    _ = env.unset("XDG_DATA_HOME");
+    _ = env.unset("HOME");
     try t.expect((try dataPath(t.allocator, "x")) == null);
 }

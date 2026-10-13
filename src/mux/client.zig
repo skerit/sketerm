@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const c = @import("../c.zig").c;
+const unsetEnv = @import("../util/env.zig").unset;
 const EnvSave = @import("../util/env.zig").Saved;
 const wire = @import("wire.zig");
 const sockpath = @import("sockpath.zig");
@@ -262,7 +263,7 @@ pub fn takeTicketFromEnv(host: []const u8) ?UdpTicket {
     if (port == 0 or key.len != rudp.KEY_LEN * 2 or rudp.keyFromHex(key) == null) return null;
     var ticket = UdpTicket{ .port = port, .key = undefined };
     @memcpy(&ticket.key, key);
-    _ = c.unsetenv("SKETERM_UDP_TICKET");
+    _ = unsetEnv("SKETERM_UDP_TICKET");
     return ticket;
 }
 
