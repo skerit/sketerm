@@ -939,6 +939,9 @@ pub const Config = struct {
     /// agent_open refuses a host with less memory available than this (MB).
     /// 0 = no cap.
     mcp_agent_min_free_mb: u32 = 0,
+    /// Hours a peer message waits in a mailbox for its recipient before
+    /// it expires and its sender is told. 0 = never.
+    peer_mail_ttl_hours: u32 = 6,
     /// Smart copy: when no selection is active, Ctrl+Shift+C
     /// forwards as Ctrl+C (interrupt) instead of being a no-op.
     smart_copy: bool = true,
@@ -2688,6 +2691,7 @@ pub const keys = [_]Key{
     .{ .name = "mcp_agent_idle_ttl_hours", .codec = .{ .int = .{ .min = 1, .max = 30 * 24 } } },
     .{ .name = "mcp_agent_max_per_host", .codec = .{ .int = .{ .min = 0, .max = 1000 } } },
     .{ .name = "mcp_agent_min_free_mb", .codec = .{ .int = .{ .min = 0, .max = 1024 * 1024 } } },
+    .{ .name = "peer_mail_ttl_hours", .codec = .{ .int = .{ .min = 0, .max = 30 * 24 } } },
     // File browser.
     .{ .name = "files_default_view", .codec = .{ .enum_ = .{} } },
     .{ .name = "files_show_hidden", .codec = .bool },

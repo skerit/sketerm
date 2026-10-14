@@ -35,6 +35,7 @@ const daemon_cast = @import("daemon_cast.zig");
 const kitty_image = @import("../parser/kitty_image.zig");
 const logring = @import("logring.zig");
 pub const tombstones = @import("tombstones.zig");
+const daemon_peers = @import("daemon_peers.zig");
 const fsserve = @import("fsserve.zig");
 const fsjournal = @import("fsjournal.zig");
 const fs_boundary = @import("fs_boundary.zig");
@@ -3269,6 +3270,8 @@ pub const Daemon = struct {
     worker_failures: u32 = 0,
     /// Broker: why recently ended sessions ended (`tombstone_get`).
     tombstones: tombstones.Ring = .{},
+    /// Broker: registered peers and their mailboxes (`daemon_peers.zig`).
+    peers: daemon_peers.State = .{},
     /// Broker only: forked session workers, by session name.
     workers: std.ArrayList(*Worker) = .empty,
     /// Worker only: an attached client's rename forwarded to the broker (the
@@ -3343,6 +3346,12 @@ pub const Daemon = struct {
         sock: []u8,
     };
 
+    /// The per-listener namespace of state-dir files (fs-job journals,
+    /// peer mailboxes): a hash of the CANONICAL socket path.
+    pub fn socketNamespace(canonical_sock: []const u8) u64 {
+        return std.hash.Fnv1a_64.hash(canonical_sock);
+    }
+
     /// Where this socket's fs-job journals live: under the STATE dir,
     /// not the runtime dir, so an interrupted transfer's staged data
     /// (and a completed-but-uncleaned move's quarantine identity) can
@@ -3354,7 +3363,7 @@ pub const Daemon = struct {
     pub fn fsJobsDirAlloc(allocator: std.mem.Allocator, sock_path: []const u8) ![]u8 {
         const canonical = try canonicalSocketPath(allocator, sock_path);
         defer allocator.free(canonical);
-        const h = std.hash.Fnv1a_64.hash(canonical);
+        const h = socketNamespace(canonical);
         var state_buf: [4096]u8 = undefined;
         const state: ?[]const u8 = blk: {
             if (std.c.getenv("XDG_STATE_HOME")) |sh| {
@@ -3508,6 +3517,7 @@ pub const Daemon = struct {
             self.allocator.free(e.sock);
         }
         self.web_engines.deinit(self.allocator);
+        daemon_peers.deinit(self);
         for (self.clients.items) |cl| cl.deinit();
         self.clients.deinit(self.allocator);
         for (self.sessions.items) |s| s.deinit();
@@ -3557,6 +3567,7 @@ pub const Daemon = struct {
         // session workers it left running before serving anyone.
         if (!self.isWorker() and self.listen_fd >= 0) daemon_adopt.brokerAdoptAtStartup(self);
         if (!self.isWorker() and self.listen_fd >= 0) self.relisten_keeper.startBroker(self.sock_path);
+        if (!self.isWorker() and self.listen_fd >= 0) daemon_peers.start(self);
         log.info("daemon up v{s} mode={s} socket={s}", .{
             version.string,
             @tagName(self.role),
@@ -7393,6 +7404,11 @@ pub const Daemon = struct {
         }
 
         // -- phase 2: sweep every holder of a raw *Client -----------
+        // A dying connection's peer registration ends (by id; the peer
+        // table never holds the pointer).
+        for (self.clients.items) |cl| {
+            if (cl.reaping) daemon_peers.clientGone(self, cl.id);
+        }
         // A dying client takes its WINSTREAM channels down. Native
         // channels are session-owned and deliberately survive client
         // death — the daemon brain keeps the app alive for the next
@@ -7570,6 +7586,7 @@ pub const Daemon = struct {
         // reap. Dead clients were dropped just above, so the viewer
         // count here is live.
         self.ttlSweep();
+        daemon_peers.sweep(self);
         // Exited sessions are removed outright — sessionExited
         // already detached every client (defensively re-checked here
         // so a dangling cl.attached is impossible) — unless held for

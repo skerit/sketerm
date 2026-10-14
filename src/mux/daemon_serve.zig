@@ -15,6 +15,7 @@ const selfexec = @import("selfexec.zig");
 const fsserve = @import("fsserve.zig");
 const fsjob = @import("fsjob.zig");
 const daemon_fsjobs = @import("daemon_fsjobs.zig");
+const daemon_peers = @import("daemon_peers.zig");
 const pulse = @import("pulse.zig");
 const snapshot = @import("snapshot.zig");
 const dmod = @import("daemon.zig");
@@ -381,6 +382,12 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
         // NOT attach-scoped: the broker keeps the tombstones.
         .tombstone_get => self.handleTombstoneGet(cl, frame.payload),
         .fg_signal => self.handleFgSignal(cl, frame.payload),
+        // NOT attach-scoped: the broker keeps the peer table; a worker
+        // refuses these, naming why.
+        .peer_register => daemon_peers.handleRegister(self, cl, frame.payload),
+        .peer_list_req => daemon_peers.handleListReq(self, cl, frame.payload),
+        .peer_send => daemon_peers.handleSend(self, cl, frame.payload),
+        .peer_ack => daemon_peers.handleAck(self, cl, frame.payload),
         .rec_stop => {
             const s = cl.attached orelse {
                 cl.queueErr("not attached");

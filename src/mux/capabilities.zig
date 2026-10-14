@@ -124,6 +124,11 @@ pub const Flag = enum {
     /// ^\) reach a running command. A worker adopted from an older
     /// build may still leave it unanswered, so a client bounds the wait.
     fg_signal,
+    /// The broker serves peer messaging (`peer_register`, `peer_list_req`,
+    /// `peer_send`, `peer_ack`; it pushes `peer_deliver`/`peer_event`).
+    /// Absent = never send them; peers on that daemon are unavailable and
+    /// the MCP peer tools say so.
+    peers,
 };
 
 /// One bool per flag, keyed by wire name; the parsed form on the

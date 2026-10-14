@@ -277,6 +277,19 @@ pub const FrameType = enum(u8) {
     /// `fg_signal_reply`. Only sent to daemons whose welcome advertises
     /// `fg_signal:true`.
     fg_signal = 37,
+    /// Peer frames (`peermail.zig` bodies), all NOT attach-scoped: the
+    /// broker keeps the peer table, a worker refuses them with `.err`.
+    /// Only sent to daemons whose welcome advertises `peers:true`.
+    /// Announce this connection as a peer (`peermail.RegisterReq`); re-sent
+    /// whenever a field changes, ended by the connection closing. Answered
+    /// by an unsolicited `peer_list` with req 0 carrying `self`.
+    peer_register = 38,
+    /// Every known peer (`peermail.ListReq`); answered by `peer_list`.
+    peer_list_req = 39,
+    /// One message (`peermail.SendReq`); answered by `peer_send_reply`.
+    peer_send = 40,
+    /// Ids handed to the client (`peermail.AckReq`); no reply.
+    peer_ack = 41,
     // daemon → client
     welcome = 64,
     snapshot = 65,
@@ -422,6 +435,17 @@ pub const FrameType = enum(u8) {
     tombstone_reply = 99,
     /// Answer to `fg_signal`, ALWAYS echoing `req` (`FgSignalReply`).
     fg_signal_reply = 100,
+    /// `peermail.ListReply`, echoing `peer_list_req.req`; req 0 answers a
+    /// `peer_register` and carries `self`.
+    peer_list = 101,
+    /// `peermail.SendReply`, echoing `peer_send.req`.
+    peer_send_reply = 102,
+    /// One message for this connection (`peermail.Deliver`), pushed at
+    /// most once per connection; it stays queued until `peer_ack`.
+    peer_deliver = 103,
+    /// What became of a message this connection's address sent
+    /// (`peermail.Event`); acked like a delivery.
+    peer_event = 104,
     _,
 };
 
@@ -1135,6 +1159,14 @@ test "wire: append-only frame and event values include panel RPC" {
     try std.testing.expectEqual(@as(u8, 98), @intFromEnum(FrameType.web_helper_reply));
     try std.testing.expectEqual(@as(u8, 36), @intFromEnum(FrameType.tombstone_get));
     try std.testing.expectEqual(@as(u8, 99), @intFromEnum(FrameType.tombstone_reply));
+    try std.testing.expectEqual(@as(u8, 38), @intFromEnum(FrameType.peer_register));
+    try std.testing.expectEqual(@as(u8, 39), @intFromEnum(FrameType.peer_list_req));
+    try std.testing.expectEqual(@as(u8, 40), @intFromEnum(FrameType.peer_send));
+    try std.testing.expectEqual(@as(u8, 41), @intFromEnum(FrameType.peer_ack));
+    try std.testing.expectEqual(@as(u8, 101), @intFromEnum(FrameType.peer_list));
+    try std.testing.expectEqual(@as(u8, 102), @intFromEnum(FrameType.peer_send_reply));
+    try std.testing.expectEqual(@as(u8, 103), @intFromEnum(FrameType.peer_deliver));
+    try std.testing.expectEqual(@as(u8, 104), @intFromEnum(FrameType.peer_event));
     try std.testing.expectEqual(@as(u8, 7), @intFromEnum(ChannelKind.web_helper));
     try std.testing.expectEqual(@as(u8, 64), @intFromEnum(FrameType.welcome));
     try std.testing.expectEqual(@as(u8, 94), @intFromEnum(FrameType.play_state));

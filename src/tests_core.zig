@@ -228,6 +228,8 @@ comptime {
     _ = @import("mux/capabilities.zig");
     _ = @import("mux/tombstones.zig");
     _ = @import("mux/peermail.zig");
+    _ = @import("mux/peerclient.zig");
+    _ = @import("mux/daemon_peers.zig");
     _ = @import("mux/punch.zig");
     _ = @import("mux/rudp.zig");
     _ = @import("mux/selfexec.zig");
