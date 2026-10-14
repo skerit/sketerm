@@ -9403,7 +9403,46 @@ fn runMotionStage(cl: *Client, gpa: std.mem.Allocator) void {
         }
         if (s.press_moves != 0) fail("stage 3d motion: the pointer moved while the button was held (drift during an action)");
     }
+    // A live viewer moves far away from the last automated click. Drift must
+    // resume around that NEW position, not jump back to Target. Synthetic idle
+    // samples move at most 24 px over a segment, so the two origins are distinct.
+    cl.send(proto.InputPointer{ .view = view_id, .kind = @intFromEnum(proto.PointerKind.move), .x = 60, .y = 80, .button = 0, .clicks = 1, .mods = 0 });
+    _ = cl.drive(200, 0);
+    _ = cl.evalWait("window.__clear()", false, 10_000);
+    {
+        var s = motionSum(cl, arena);
+        const until = nowMs() + 12_000;
+        while (s.all < 2 and nowMs() < until) {
+            _ = cl.drive(200, 0);
+            s = motionSum(cl, arena);
+        }
+        if (s.all < 2 or s.down or s.minx < 28 or s.maxx > 92 or s.miny < 48 or s.maxy > 112)
+            fail("stage 3d motion: idle drift did not resume from the live pointer position");
+    }
+    // A wheel packet names the live pointer location too, even if no separate
+    // move arrived, and must become the next drift origin.
+    cl.send(proto.InputScroll{ .view = view_id, .x = 650, .y = 100, .dx = 0, .dy = 20, .mods = 0 });
+    _ = cl.drive(200, 0);
+    _ = cl.evalWait("window.__clear()", false, 10_000);
+    {
+        var s = motionSum(cl, arena);
+        const until = nowMs() + 12_000;
+        while (s.all < 2 and nowMs() < until) {
+            _ = cl.drive(200, 0);
+            s = motionSum(cl, arena);
+        }
+        if (s.all < 2 or s.down or s.minx < 618 or s.maxx > 682 or s.miny < 68 or s.maxy > 132)
+            fail("stage 3d motion: idle drift did not resume from the wheel location");
+    }
+    cl.send(proto.InputPointer{ .view = view_id, .kind = @intFromEnum(proto.PointerKind.leave), .x = 650, .y = 100, .button = 0, .clicks = 1, .mods = 0 });
+    _ = cl.drive(200, 0);
+    _ = cl.evalWait("window.__clear()", false, 10_000);
+    _ = cl.drive(5_500, 0);
+    if (motionSum(cl, arena).all != 0) fail("stage 3d motion: idle drift continued after the pointer left the view");
+
     // Off again: no pointer moves at all on the idle view.
+    cl.send(proto.InputPointer{ .view = view_id, .kind = @intFromEnum(proto.PointerKind.move), .x = 650, .y = 100, .button = 0, .clicks = 1, .mods = 0 });
+    _ = cl.drive(200, 0);
     if (!motionDrift(cl, false)) fail("stage 3d motion: idle drift could not be turned off");
     _ = cl.drive(300, 0);
     _ = cl.evalWait("window.__clear()", false, 10_000);

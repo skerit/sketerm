@@ -543,8 +543,8 @@ pub const View = struct {
     pending: std.ArrayList(Pending) = .empty,
     /// The recorded-motion replay running on this view (cefhost/motion.zig).
     motion_run: ?*host_motion.Run = null,
-    /// Where this view's pointer is, logical px, once a semantic action
-    /// put it somewhere; a replay starts from here.
+    /// Where this view's pointer is, logical px, after semantic/replayed or
+    /// live input. Leaving the view clears it; the next replay starts here.
     motion_ptr: ?[2]f64 = null,
     /// Opt-in idle drift (`motion_drift`, cefhost/motion.zig); null =
     /// off, which costs one branch per poll turn.
@@ -3648,6 +3648,14 @@ pub const Host = struct {
         const v = self.findWake(req.view) orelse return;
         // Live input owns the pointer: drift rests until it is quiet.
         self.motionDriftYield(v);
+        const kind: proto.PointerKind = @enumFromInt(req.kind);
+        // Keep the replay origin in logical coordinates, before viewPoint's
+        // DPI conversion. A live takeover must not resume from the old reach.
+        v.motion_ptr = switch (kind) {
+            .move, .down, .up => .{ @floatFromInt(req.x), @floatFromInt(req.y) },
+            .leave => null,
+            _ => v.motion_ptr,
+        };
         const pt = viewPoint(v, req.x, req.y);
         var ev = cef.cef_mouse_event_t{
             .x = pt.x,
@@ -3660,7 +3668,7 @@ pub const Host = struct {
             else => cef.MBT_LEFT,
         };
         const clicks: c_int = @max(1, @as(c_int, req.clicks));
-        switch (@as(proto.PointerKind, @enumFromInt(req.kind))) {
+        switch (kind) {
             .move => withHostArgs(v, sendMove, .{ &ev, @as(c_int, 0) }),
             .leave => withHostArgs(v, sendMove, .{ &ev, @as(c_int, 1) }),
             .down => withHostArgs(v, sendClick, .{ &ev, button, @as(c_int, 0), clicks }),
@@ -3677,6 +3685,7 @@ pub const Host = struct {
     pub fn scrollFlags(self: *Host, req: proto.InputScroll, extra_flags: u32) void {
         const v = self.findWake(req.view) orelse return;
         self.motionDriftYield(v);
+        v.motion_ptr = .{ @floatFromInt(req.x), @floatFromInt(req.y) };
         const pt = viewPoint(v, req.x, req.y);
         var ev = cef.cef_mouse_event_t{
             .x = pt.x,
@@ -4539,6 +4548,59 @@ const MediaTest = struct {
         try std.testing.expectEqual(@as(usize, 1), count);
     }
 };
+
+test "live pointer and wheel input reanchor replay in logical coordinates and leave clears it" {
+    const t = std.testing;
+    try t.expect(apiHash());
+    const Sink = struct {
+        var last: [2]c_int = .{ 0, 0 };
+        fn move(_: [*c]cef.cef_browser_host_t, ev: [*c]const cef.cef_mouse_event_t, _: c_int) callconv(.c) void {
+            last = .{ ev.*.x, ev.*.y };
+        }
+        fn click(_: [*c]cef.cef_browser_host_t, ev: [*c]const cef.cef_mouse_event_t, _: cef.cef_mouse_button_type_t, _: c_int, _: c_int) callconv(.c) void {
+            last = .{ ev.*.x, ev.*.y };
+        }
+        fn wheel(_: [*c]cef.cef_browser_host_t, ev: [*c]const cef.cef_mouse_event_t, _: c_int, _: c_int) callconv(.c) void {
+            last = .{ ev.*.x, ev.*.y };
+        }
+    };
+    MediaTest.reset();
+    MediaTest.browser_host.send_mouse_move_event = Sink.move;
+    MediaTest.browser_host.send_mouse_click_event = Sink.click;
+    MediaTest.browser_host.send_mouse_wheel_event = Sink.wheel;
+    const saved_lever = scale_lever;
+    defer setScaleLever(saved_lever);
+    setScaleLever(.zoom);
+    var out = proto.Outbox.init(t.allocator);
+    defer out.deinit();
+    var host = Host.init(t.allocator, &out);
+    defer host.deinit();
+    const v = try host.registerView(.{ .view = 98, .w = 800, .h = 600, .scale_x1000 = 2000, .context = 0 });
+    v.browser = &MediaTest.browser;
+    v.motion_ptr = .{ 10, 20 };
+    const drift = try t.allocator.create(host_motion.Drift);
+    drift.* = .{ .conn = 0, .rng = .init(77) };
+    v.motion_drift = drift;
+
+    for ([_]proto.PointerKind{ .move, .down, .up }, 0..) |kind, index| {
+        // A manual edge must discard the old segment as well as its origin.
+        drift.moves = try t.allocator.dupe(@import("../motion/replay.zig").Move, &.{.{ .t = 0, .x = 12, .y = 22 }});
+        const x: i32 = @intCast(100 + index * 10);
+        const y: i32 = @intCast(150 + index * 10);
+        host.pointerFlags(.{ .view = v.id, .kind = @intFromEnum(kind), .x = x, .y = y, .button = 0, .clicks = 1, .mods = 0 }, 0);
+        try t.expectEqualDeep([2]f64{ @floatFromInt(x), @floatFromInt(y) }, v.motion_ptr.?);
+        try t.expectEqualDeep([2]c_int{ x * 2, y * 2 }, Sink.last);
+        try t.expectEqual(@as(usize, 0), drift.moves.len);
+        try t.expect(drift.clock.rest_until > 0);
+    }
+    host.scroll(.{ .view = v.id, .x = 400, .y = 200, .dx = 0, .dy = 10, .mods = 0 });
+    try t.expectEqualDeep([2]f64{ 400, 200 }, v.motion_ptr.?);
+    try t.expectEqualDeep([2]c_int{ 800, 400 }, Sink.last);
+    host.pointer(.{ .view = v.id, .kind = @intFromEnum(proto.PointerKind.leave), .x = 400, .y = 200, .button = 0, .clicks = 1, .mods = 0 });
+    try t.expect(v.motion_ptr == null);
+    host.pointer(.{ .view = v.id, .kind = @intFromEnum(proto.PointerKind.move), .x = 60, .y = 70, .button = 0, .clicks = 1, .mods = 0 });
+    try t.expectEqualDeep([2]f64{ 60, 70 }, v.motion_ptr.?);
+}
 
 test "a view_screen naming a view not created yet is held, taken at registration and dropped with its id" {
     const t = std.testing;

@@ -1,5 +1,21 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-14: live input updates the recorded-motion origin
+
+The live pointer path paused idle drift without updating `View.motion_ptr`.
+After an operator moved the cursor, drift could resume at the previous automated
+position. Moves/down/up and wheels now update that anchor in logical view
+coordinates; leaving clears it until re-entry. The shared host path covers both
+control-protocol and stream input. No live event is replayed or changed.
+
+A CEF unit regression failed with the old anchor (expected 100, got 10), then
+passed after the fix; it also checks 2x coordinate conversion and stale-segment
+retirement. Smoke-web's motion stage verifies actual resumed movement around
+the new live pointer/wheel location and no drift after leaving the viewport.
+The focused CEF test and motion-only smoke pass here. The broader `test-web`
+run is blocked by the separate native cleanup-supervisor assertion at
+`dist/test-web-supervisor.c:300` (`lstat(root)`); that test also fails on its own.
+
 ## 2026-10-14: headless MCP pages report a believable screen and window
 
 A page in the MCP server's headless browser no longer sees screen =

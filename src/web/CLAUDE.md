@@ -2039,10 +2039,12 @@ only the trainer records; live use never is.
   (`semanticNavigationStarted`), the browser going away (`dropBrowser`:
   discard, close, crash) and shutdown (`motionDeinit`), and first
   releases any button or key the run still holds.
-- **Live human input is untouched.** Replay never reads or writes the
-  stream path or `input_*`; `View.motion_ptr` is set only by semantic
-  actions (direct or replayed) and is where the next reach starts. A view
-  the pointer never entered is entered from the edge nearest the target.
+- **Live human input stays direct.** It pauses an idle segment and updates
+  `View.motion_ptr` in logical coordinates for moves, presses, releases and
+  wheels, before any DPI conversion. A leave clears the anchor so idle replay
+  cannot move an absent pointer. Semantic/replayed actions and drift update the
+  same anchor; the next segment starts from the most recently delivered input.
+  A view the pointer never entered is entered from the edge nearest the target.
 - smoke-web stage 3d (`SKETERM_SMOKE_WEB_MOTION_ONLY`) proves it on a page
   that logs its own events, with a GENERATED pack (`motion/synth.zig`;
   never a person's): many moves before the press, strictly increasing
