@@ -1,5 +1,27 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-10-14: headless MCP pages report a believable screen and window
+
+A page in the MCP server's headless browser no longer sees screen =
+window = viewport at 0,0. `webdrive.Engine` sends `view_screen` with
+geometry synthesized in one place, `screengeom.headless`: `screen` and
+`avail` are `[mcp] web_screen` (new key, `[mcp.<name>]` overrides,
+default 1920x1080; a window that does not fit moves to 2560x1440, then
+3840x2160, then its own size), the window is the viewport + 32x129 at
+10,10 pulled back onto the screen, the viewport sits 16,97 inside it
+(measured from the headful reference's `input.screen_offset` [26,107]).
+Measured race: a report sent after `view_create_url` lost to its first
+navigation, so the helper now holds a report for a view it has not
+created (`view-screen-early`, `Host.pending_screen`) and the engine sends
+it before the create; it resends on `web_resize` and for adopted popups,
+only on change. The helper also installs `get_screen_point`, without
+which a click's `screenX - clientX` stayed 0 (GUI tabs too).
+`capabilities` adds `web_screen` / `web_screen_source`. smoke-mcp
+`webScreenStage` (`SKETERM_SMOKE_MCP_WEBSCREEN_ONLY=1`) covers it; the
+headful audit's geometry rows now all match, and `geo.window_at_origin`
+and `input.screen_offset` became `must_match`. Details in
+src/web/CLAUDE.md.
+
 ## 2026-10-13: idle drift replays any recorded wander, however far it went
 
 A real pack's 8 idle segments were all refused: drift only replayed a
