@@ -259,6 +259,12 @@ is kept by a `:ro` policy term. The full descriptions and schemas are in
 - `agent_templates` (read-only): List the saved brief templates (name, description, variable names); with `name`, show one in full: its text and its variables with their defaults.
 - `agent_template_delete`: Delete a saved brief template (no undo).
 
+### `peer`
+
+- `peer_list` (read-only): List the peers on this host: every MCP client session (Claude Code, opencode) whose sketerm server registered with the per-user daemon, one line each.
+- `peer_send`: Send a message to another peer (another assistant's session) by address and learn what became of it: delivered (its live server has it), queued (a durable address with no live server: it arrives when one starts, within the mail TTL), or refused with a reason.
+- `peer_read` (read-only): Read the peer messages that reached this session and were not handed to you before (a pushed one is never repeated), what became of messages you sent (expired), and mail that expired while no server of yours ran: each is returned once and acknowledged to the daemon.
+
 ### `core`
 
 - `capabilities` (read-only): Preflight report of what THIS MCP server can do right now: isolation mode, headless GUI-app support (headless_gui — launch_app renders apps into the mux daemon and NEVER needs a display, an X server or a sketerm window), whether a direct sketerm GUI control socket is attached (gui_socket; independent of the session panel relay and of headless GUI apps), the live panel transport (panels + panel_transport) and the saved-panel store (panels_store + panel_store), OCR (tesseract) availability, whether the web_* tools can run and against what (web + web_backend "gui"/"session"/"headless"/"none" — "session" adds web_session, the watchable Wayland app session the helper renders into — plus the sketerm-webengine path in web_helper; web_gui says whether the user granted the web_* tools their OWN browser and logins, web_gui_source where that came from and web_gui_transport which GUI socket they hold now; web_profiles says whether named cookie jars work, web_routes which per-tab network routes web_open can honour, web_engine_broker whether the mux daemon owns the engine's lifetime and web_engine_owner who started the one in use; web_downloads whether web_download can pull a url through a view; web_print_pdf whether web_print_pdf can print a view to a PDF file and web_print_pdf_css_page whether the running helper honours its css_page_size/no_margins; web_capture whether web_open can record the response bodies a headless view's page receives; web_engine_started whether an engine exists YET, since web_backend/web_watch/web_session are undetermined until it does), ssh/scp presence, the directory terminal asciicast recordings land in, the EFFECTIVE input-timing defaults (hold_ms/settle_ms/timeout_ms/click_retry, each marked when a SKETERM_MCP_* env override changed it from the built-in), whether sub-agents run here (agents, agent_adapters, agent_waiter, agent_ssh, agent_open_args_env for a wrapper's args and env, agent_open_resume for continuing an existing conversation (agent_resume_checked: an unknown id fails instead of starting afresh), agent_open_process_args for server_args/tui_args, agent_conversation for the conversation id results report, user_daemon_env_scrubbed for a per-user daemon started without the assistant's environment, agent_resume_by_id for agent_attach {agent} from any server, agent_idle_ttl_hours for how long an unattached agent lives, tombstones for agent_attach saying why a gone agent ended) and how agent_read selects what it returns (agent_read_select), how sub-agent output is delivered (agent_records_once, agent_events_shared), whether agent_wait can watch several agents (agent_wait_any; agent_wait_all: once every one settled), whether agent_send queues a prompt for a busy agent (agent_send_queue), reaches several agents in one call (agent_send_many) and interrupts a busy one first (agent_send_interrupt), whether agent_read returns just the final message (agent_read_final), agent_list is compact by default (agent_list_compact), each agent's attention is published for `sketerm mcp agents` (agent_attention), agent_attach relaunches a gone agent (agent_relaunch) and agent_open hands a prompt off with timeout_ms 0 (agent_open_handoff), whether agent_answer takes free text (agent_answer_text), agent_open takes a permission policy (agent_permissions), brief templates (agent_templates), side questions (agent_side_question: the apps agent_ask works with) and retry_on_overload (agent_retry_on_overload: the error classes it retries and its bounds), a lost link that finds its session gone ends the agent (agent_gone_on_reconnect), when done fires (agent_done), and whether agent events are pushed into this session (agent_push: channel = Claude Code channel messages; agent_push_follow / agent_push_followers for the agent-wait --server follower the opencode plugin runs), whether term_open takes exec_shell (term_exec_shell_default), and open session counts.
@@ -2754,6 +2760,45 @@ one wake-up once all settled), that `agent_send` takes `interrupt` and
 `agent_list` is compact unless `detail:true`, and that `agent_open`
 returns an id that `agent_attach {agent: id}` resumes after a restart
 (`relaunch: true` for a gone one), whenever the agent tools are offered.
+
+## Peers (`peer_*`)
+
+Every `sketerm mcp` is a peer: at startup it opens one connection to the
+per-user daemon (the one sub-agents live on) and registers there, so
+assistants' sessions on one host can message each other. Nothing reads a
+peer's screen, and a peer message is information, never an approval.
+
+- **Address**, decided once at startup: the server's `--name` (not the
+  implied `default` of a bare `--durable`), else `$SKETERM_PEER_NAME`, else
+  the pane session it was started in (`$SKETERM_SESSION`), else none: the
+  daemon mints `anon-xxxx`. A named address is durable: mail for it waits
+  (the daemon's `peer_mail_ttl_hours`, default 6) for whichever server
+  next registers it. A name another live server holds is not merged:
+  this one gets an anon address and `name_taken`.
+- **Tools**: `peer_list {detail?}`, `peer_send {to, text, reply_to?}`
+  (`outcome` `delivered`, `queued` or `refused` with a `reason`; it never
+  interrupts the recipient), `peer_read {since?}`.
+- **Delivery**: a message arrives pushed into the session by the same
+  routes as agent events: the Claude Code channel (`claude/channel` is
+  declared whenever the peer tools are offered) or the `agent-wait --server`
+  follower the opencode plugin starts after an `agent_*` or `peer_*` call.
+  The text reads `Peer message from Zenit (claude-code on host, /cwd,
+  state), sent 5 min ago while you were offline. id m-.... Reply with
+  peer_send to "Zenit".`, a blank line, then the message (the age from a
+  minute on, the offline clause only for queued mail); `meta` carries
+  `from`, `message`, `queued`, `age_s` and the sender's facts. Each item
+  is handed out once, by whichever route or `peer_read` takes it first,
+  and acknowledged to the daemon only then; unacknowledged mail is
+  redelivered after a reconnect and never shown twice. What became of a
+  sent message (`expired`, or ended unread because its non-durable
+  recipient is gone) and mail that expired while no server of this
+  address ran reach the session the same way.
+- **`capabilities.peers`**: `{available, reason?, ttl_hours, address,
+  durable, name_taken, channel_armed}`; `reason` is `daemon_without_peers`
+  (an older daemon: every peer tool answers `available: false`),
+  `daemon_unreachable` (the next peer tool call reconnects, with backoff,
+  and registers again) or `withheld` (tool policy). The registry record
+  carries `peer: {address, durable, state, name_taken}`.
 
 ## Panels (`ui_*`)
 

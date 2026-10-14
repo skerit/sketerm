@@ -632,6 +632,15 @@ pub fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 
         try res.fact("agent_push", @tagName(if (agents_ok) mcp_agent.state.push else .none));
         try res.fact("agent_push_follow", agents_ok and mcp_agent.state.waiter.path != null);
         try res.fact("agent_push_followers", if (agents_ok) mcp_agent.followers() else 0);
+        {
+            const mcp_peer = @import("mcp_peer.zig");
+            try res.raw("peers", try mcp_peer.capabilityJson(arena));
+            const pc = mcp_peer.capability();
+            if (pc.available)
+                try res.textf("peers: this session is {s}{s}; peer_list, peer_send and peer_read reach the other assistants' sessions on this host, their messages {s}", .{ if (pc.address.len > 0) pc.address else "(registering)", if (pc.durable) " (durable)" else "", if (pc.channel_armed) "arrive as channel messages" else "arrive through peer_read unless a follower (the opencode plugin) pushes them" })
+            else
+                try res.textf("peers: unavailable ({s})", .{pc.reason orelse "unknown"});
+        }
         const vocab = @import("../agent/vocab.zig");
         var quiet: std.ArrayList([]const u8) = .empty;
         for (std.enums.values(vocab.ErrorClass)) |cls| if (!cls.wakesByDefault()) try quiet.append(arena, @tagName(cls));

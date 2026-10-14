@@ -29,6 +29,7 @@ pub const mcp_tools = @import("mcp_tools.zig");
 pub const panelstore = @import("panelstore.zig");
 const paneldrive = @import("paneldrive.zig");
 const mcp_registry = @import("mcp_registry.zig");
+const mcp_peer = @import("mcp_peer.zig");
 pub const mcp_webgui = @import("mcp_webgui.zig");
 const Config = @import("../config.zig").Config;
 pub const shellquote = @import("../util/shellquote.zig");
@@ -161,7 +162,8 @@ const MCP_HELP =
     \\                   TOOL           one tool by name
     \\                   -GROUP, -TOOL  deny (always wins)
     \\                 Groups: panes, app, term, files, net, browser,
-    \\                 ui, agent, core. `core` (capabilities) is always on.
+    \\                 ui, agent, peer, core. `core` (capabilities) is
+    \\                 always on.
     \\                 A spec with any allow term starts from nothing;
     \\                 a spec of only deny terms keeps everything else.
     \\                 Example: --tools "app, files:ro"
@@ -1035,6 +1037,13 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
         mcp_agent.reattach();
     }
     defer mcp_agent.shutdown();
+    // Peers: one link to the per-user daemon (the one agents use),
+    // registered under this session's address, unless withheld.
+    if (policy.allows("peer_send") or policy.allows("peer_read") or policy.allows("peer_list")) {
+        const explicit: ?[]const u8 = if (opts.name) |n| (if (std.mem.eql(u8, n, DURABLE_DEFAULT_NAME)) null else n) else null;
+        mcp_peer.configure(allocator, .{ .explicit = explicit, .cwd = cwd, .lease = if (registry_lease) |*lease| lease else null });
+    }
+    defer mcp_peer.shutdown();
 
     // Headless web fallback: with no GUI socket the web_* tools run
     // their own sketerm-webengine inside the instance dir (spawned
@@ -1175,7 +1184,8 @@ var channel_name: []const u8 = agentpush.DEFAULT_CHANNEL_NAME;
 /// `client_name`: a channel only when the agent tools are offered, the
 /// client is Claude Code and an ancestor's argv names our channel.
 fn pushRouteFor(client_name: ?[]const u8) agentpush.Route {
-    if (!mcp_agent.available() or !policy.allows("agent_open")) return .none;
+    const agents = mcp_agent.available() and policy.allows("agent_open");
+    if (!agents and !mcp_peer.link.configured) return .none;
     const name = client_name orelse return .none;
     if (!std.mem.eql(u8, name, agentpush.CLAUDE_CODE_CLIENT)) return .none;
     return if (agentpush.ancestorNamesChannel(channel_name)) .channel else .none;
@@ -1197,14 +1207,16 @@ fn minDue(a: ?i64, b: ?i64) ?i64 {
 fn waitInput(input: *std.ArrayList(u8), allocator: std.mem.Allocator) InputWait {
     var pfds: [129]c.struct_pollfd = undefined;
     pfds[0] = .{ .fd = 0, .events = c.POLLIN, .revents = 0 };
-    const n = 1 + mcp_agent.pollFds(pfds[1..]);
+    var n = 1 + mcp_agent.pollFds(pfds[1..]);
+    n += mcp_peer.pollFds(pfds[n..]);
     const now = clock.nowMs();
-    const due = minDue(minDue(mcp_agent.dueInMs(now), @import("mcp_web.zig").idleDueInMs(now)), mcp_webfetch.dueInMs(now));
+    const due = minDue(minDue(minDue(mcp_agent.dueInMs(now), @import("mcp_web.zig").idleDueInMs(now)), mcp_webfetch.dueInMs(now)), mcp_peer.dueInMs(now));
     const timeout: c_int = if (due) |d| @intCast(std.math.clamp(d, 0, 1000)) else -1;
     const rc = c.poll(&pfds, @intCast(n), timeout);
     if (rc < 0) return if (std.posix.errno(rc) == .INTR) .more else .failed;
     mcp_agent.service(clock.nowMs());
     mcp_agent.sweep(clock.nowMs());
+    mcp_peer.service(clock.nowMs());
     // Between requests: an idle browser tab closes on time even when no
     // web call arrives to notice it.
     @import("mcp_web.zig").idleSweep(clock.nowMs());
@@ -1320,24 +1332,29 @@ pub fn handleMessage(arena: std.mem.Allocator, backend: Backend, line: []const u
             };
         }
         const agents_offered = mcp_agent.available() and policy.allows("agent_open");
+        const peers_offered = mcp_peer.link.configured;
         const route = pushRouteFor(client_name);
         mcp_agent.armPush(route, &writeOut);
+        mcp_peer.setApp(client_name);
         var aw: std.Io.Writer.Allocating = .init(arena);
         const w = &aw.writer;
         w.writeAll("{\"protocolVersion\":") catch return null;
         std.json.Stringify.value(ver, .{}, w) catch return null;
         // A channel server declares `claude/channel`; Claude Code delivers
         // its notifications only in a session that lists the channel.
-        if (agents_offered)
+        if (agents_offered or peers_offered)
             w.writeAll(",\"capabilities\":{\"tools\":{},\"experimental\":{\"" ++ agentpush.CHANNEL_CAPABILITY ++ "\":{}}}") catch return null
         else
             w.writeAll(",\"capabilities\":{\"tools\":{}}") catch return null;
         w.print(",\"serverInfo\":{{\"name\":\"sketerm\",\"version\":\"{s}\"}}", .{SERVER_VERSION}) catch return null;
         // Server instructions: MCP clients put them in the assistant's
         // system prompt, so they only name tools this connection can use.
-        if (agents_offered) {
+        if (agents_offered or peers_offered) {
             w.writeAll(",\"instructions\":") catch return null;
-            std.json.Stringify.value(mcp_agent.instructions(route), .{}, w) catch return null;
+            const text = if (agents_offered and peers_offered)
+                std.fmt.allocPrint(arena, "{s} {s}", .{ mcp_agent.instructions(route), mcp_peer.INSTRUCTIONS }) catch return null
+            else if (agents_offered) mcp_agent.instructions(route) else mcp_peer.INSTRUCTIONS;
+            std.json.Stringify.value(text, .{}, w) catch return null;
         }
         w.writeAll("}") catch return null;
         return rpcResult(arena, id, aw.written());
@@ -1407,6 +1424,7 @@ fn callTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: 
         .browser => |tool| @import("mcp_web.zig").webTool(arena, backend, @tagName(tool), args),
         .ui => |tool| mcp_ui.uiTool(arena, backend, tool, args),
         .agent => |tool| mcp_agent.agentTool(arena, tool, args),
+        .peer => |tool| mcp_peer.peerTool(arena, tool, args),
         .core => |tool| switch (tool) {
             .capabilities => mcp_caps.capabilitiesTool(arena, backend),
         },

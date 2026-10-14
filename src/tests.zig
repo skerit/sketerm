@@ -304,6 +304,7 @@ comptime {
     _ = @import("ipc/mcp_agent_loop.zig");
     _ = @import("ipc/mcp_agent_results.zig");
     _ = @import("ipc/mcp_agent_waiter.zig");
+    _ = @import("ipc/mcp_peer.zig");
     _ = @import("ipc/paneldrive.zig");
     _ = @import("ipc/evkeys.zig");
     _ = @import("ipc/xkblayout.zig");
