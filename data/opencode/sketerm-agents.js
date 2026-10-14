@@ -1,7 +1,8 @@
 // sketerm agents plugin for opencode: pushes the events of the sub-agents
-// that sketerm's MCP server runs (done, needs_input, error, ...) into the
-// session that last called one of its agent_* tools, as a new message, so
-// the orchestrator needs no waiter.
+// that sketerm's MCP server runs (done, needs_input, error, ...) and the
+// messages of its peers (other assistants' sessions) into the session that
+// last called one of its agent_* or peer_* tools, as a new message, so the
+// orchestrator needs no waiter.
 //
 // Install: symlink this file into opencode's plugin directory, e.g.
 //   mkdir -p ~/.config/opencode/plugin && ln -s /usr/share/sketerm/opencode/sketerm-agents.js ~/.config/opencode/plugin/
@@ -22,12 +23,12 @@ const sanitize = (value) => value.replace(/[^a-zA-Z0-9_-]/g, "_")
 const escapeAttr = (value) => value.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;")
 
 export const SketermAgents = async ({ client }, options = {}) => {
-  /** @type {{prefix: string, binary: string}[] | null} */
+  /** @type {{prefixes: string[], binary: string}[] | null} */
   let servers = null
   let target = null
   let follower = null
 
-  // The sketerm entries of opencode's MCP config: their tool prefix and
+  // The sketerm entries of opencode's MCP config: their tool prefixes and
   // the binary opencode runs for them (options.binary overrides it).
   async function discover() {
     if (servers) return servers
@@ -38,7 +39,8 @@ export const SketermAgents = async ({ client }, options = {}) => {
         const command = Array.isArray(entry?.command) ? entry.command : []
         if (entry?.type !== "local" || entry.enabled === false || command.length === 0) continue
         if (!/^sketerm(-mcp)?$/.test(basename(command[0]))) continue
-        found.push({ prefix: sanitize(key) + "_agent_", binary: options.binary ?? command[0] })
+        const base = sanitize(key)
+        found.push({ prefixes: [base + "_agent_", base + "_peer_"], binary: options.binary ?? command[0] })
       }
     } catch {
       return []
@@ -63,8 +65,8 @@ export const SketermAgents = async ({ client }, options = {}) => {
     client.session.promptAsync({ path: { id: target }, body: { parts: [{ type: "text", text }] } }).catch(() => {})
   }
 
-  // One follower for the server; started again by the next agent_* call
-  // once it ended (the server restarted, or was not up yet).
+  // One follower for the server; started again by the next agent_* or
+  // peer_* call once it ended (the server restarted, or was not up yet).
   function follow(binary) {
     if (follower) return
     let child
@@ -96,7 +98,7 @@ export const SketermAgents = async ({ client }, options = {}) => {
 
   return {
     "tool.execute.before": async (input) => {
-      const hit = (await discover()).find((s) => input.tool.startsWith(s.prefix))
+      const hit = (await discover()).find((s) => s.prefixes.some((p) => input.tool.startsWith(p)))
       if (!hit) return
       target = input.sessionID
       follow(hit.binary)

@@ -106,6 +106,20 @@ const Record = struct {
     /// written by an older server (unknown, never "no session").
     session: ?[]const u8 = null,
     session_socket: ?[]const u8 = null,
+    /// This server as a peer (`mcp_peer.zig`); absent before the broker
+    /// answered its registration, or from an older server.
+    peer: ?PeerFacts = null,
+};
+
+/// What a record says about its server as a peer. `state` is a
+/// `vocab.PeerState` name, kept a string so a reader older than a new
+/// member still reads the record.
+pub const PeerFacts = struct {
+    address: []const u8,
+    durable: bool = false,
+    state: []const u8 = "unknown",
+    /// The name it asked for was held by another live server.
+    name_taken: bool = false,
 };
 
 pub const Entry = struct {
@@ -223,6 +237,11 @@ pub const Lease = struct {
     registration: Registration = .{ .mode = .isolated, .mux_socket = "" },
     /// Owned; empty until `setAgentSocket`.
     agent_socket: []u8 = &.{},
+    /// Owned copies of the last published agents and peer facts: every
+    /// write rewrites the whole record, so one publication never drops
+    /// the other's.
+    agents: ?[]Agent = null,
+    peer: ?PeerFacts = null,
 
     /// Publish this MCP server and hold its ownership lock until deinit/process exit.
     pub fn acquire(allocator: std.mem.Allocator, registration: Registration) !Lease {
@@ -265,14 +284,36 @@ pub const Lease = struct {
         lease.registration.mux_socket = try allocator.dupe(u8, registration.mux_socket);
         lease.registration.session = try allocator.dupe(u8, registration.session);
         lease.registration.session_socket = try allocator.dupe(u8, registration.session_socket);
-        try lease.write(null);
+        try lease.write();
         return lease;
     }
 
     /// Rewrite the record (atomically, like the first publication) with
     /// the current agents; past `MAX_PUBLISHED_AGENTS` the tail is dropped.
     pub fn publishAgents(self: *Lease, agents: []const Agent) !void {
-        try self.write(agents[0..@min(agents.len, MAX_PUBLISHED_AGENTS)]);
+        const owned = try dupeAgents(self.allocator, agents[0..@min(agents.len, MAX_PUBLISHED_AGENTS)]);
+        if (self.agents) |old| freeAgents(self.allocator, old);
+        self.agents = owned;
+        try self.write();
+    }
+
+    /// Rewrite the record with this server's peer facts; the agents last
+    /// published stay.
+    pub fn publishPeer(self: *Lease, peer: PeerFacts) !void {
+        const address = try self.allocator.dupe(u8, peer.address);
+        errdefer self.allocator.free(address);
+        const st = try self.allocator.dupe(u8, peer.state);
+        self.freePeer();
+        self.peer = .{ .address = address, .durable = peer.durable, .state = st, .name_taken = peer.name_taken };
+        try self.write();
+    }
+
+    fn freePeer(self: *Lease) void {
+        if (self.peer) |p| {
+            self.allocator.free(p.address);
+            self.allocator.free(p.state);
+        }
+        self.peer = null;
     }
 
     /// Record the agent waiter socket; the next write publishes it.
@@ -282,7 +323,7 @@ pub const Lease = struct {
         self.agent_socket = owned;
     }
 
-    fn write(self: *Lease, agents: ?[]const Agent) !void {
+    fn write(self: *Lease) !void {
         var aw: std.Io.Writer.Allocating = .init(self.allocator);
         defer aw.deinit();
         try std.json.Stringify.value(Record{
@@ -293,7 +334,8 @@ pub const Lease = struct {
             .log_dir = self.registration.log_dir,
             .cwd = self.registration.cwd,
             .mux_socket = self.registration.mux_socket,
-            .agents = agents,
+            .agents = self.agents,
+            .peer = self.peer,
             .ppid = self.ppid,
             .agent_socket = if (self.agent_socket.len > 0) self.agent_socket else null,
             .session = if (self.registration.session.len > 0) self.registration.session else null,
@@ -318,6 +360,9 @@ pub const Lease = struct {
         self.registration = .{ .mode = .isolated, .mux_socket = "" };
         a.free(self.agent_socket);
         self.agent_socket = &.{};
+        if (self.agents) |old| freeAgents(a, old);
+        self.agents = null;
+        self.freePeer();
     }
 
     pub fn deinit(self: *Lease) void {
@@ -642,6 +687,36 @@ test "mcp registry lists a live lease and cleans an abandoned record" {
     const after = try list(allocator, false);
     defer freeEntries(allocator, after);
     try std.testing.expectEqual(@as(usize, 0), after.len);
+}
+
+test "a peer-only rewrite keeps the agents, and an agents rewrite keeps the peer" {
+    const allocator = std.testing.allocator;
+    var scope = try ScopedRuntime.init(allocator, "peer");
+    defer scope.deinit();
+    var sock_buf: [256]u8 = undefined;
+    const sock = try std.fmt.bufPrint(&sock_buf, "{s}/sketerm/mcp-tmp-{d}/mux.sock", .{ scope.path, c.getpid() });
+    var lease = try Lease.acquire(allocator, .{ .mode = .isolated, .mux_socket = sock });
+    defer lease.deinit();
+    try lease.publishAgents(&.{.{ .id = "claude-1", .app = "claude", .sessions = &.{"agent-claude-1"}, .location = "instance" }});
+    try lease.publishPeer(.{ .address = "Zenit", .durable = true });
+    {
+        const bytes = try readfile.cappedAlloc(allocator, lease.record_path, MAX_RECORD_BYTES);
+        defer allocator.free(bytes);
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "\"claude-1\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "\"peer\":{\"address\":\"Zenit\",\"durable\":true,\"state\":\"unknown\",\"name_taken\":false}") != null);
+    }
+    try lease.publishAgents(&.{});
+    try lease.publishPeer(.{ .address = "anon-ab12", .name_taken = true });
+    try lease.publishAgents(&.{.{ .id = "opencode-2", .app = "opencode", .sessions = &.{}, .location = "instance" }});
+    const bytes = try readfile.cappedAlloc(allocator, lease.record_path, MAX_RECORD_BYTES);
+    defer allocator.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"opencode-2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"address\":\"anon-ab12\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"name_taken\":true") != null);
+    // Readers still list the server.
+    const entries = try list(allocator, false);
+    defer freeEntries(allocator, entries);
+    try std.testing.expectEqual(@as(usize, 1), entries[0].agents.?.len);
 }
 
 test "mcp registry publishes agents and still reads a record that predates them" {

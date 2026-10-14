@@ -123,6 +123,26 @@ pub const RefuseReason = enum {
     }
 };
 
+/// Why this MCP server's peer tools cannot reach the broker now.
+pub const PeerUnavailable = enum {
+    /// The per-user daemon predates peers (no welcome flag `peers`).
+    daemon_without_peers,
+    /// No daemon answered (or the link was lost); the next peer tool
+    /// call reconnects once its backoff passed.
+    daemon_unreachable,
+    /// The operator's tool policy withholds the peer group.
+    withheld,
+
+    /// The sentence a caller reads.
+    pub fn describe(self: PeerUnavailable) []const u8 {
+        return switch (self) {
+            .daemon_without_peers => "the per-user sketerm daemon predates peer messaging; restart it idle with a newer build",
+            .daemon_unreachable => "the per-user sketerm daemon is not reachable now; the next peer tool call reconnects",
+            .withheld => "the tool policy withholds the peer tools",
+        };
+    }
+};
+
 pub const State = enum {
     starting,
     working,
@@ -432,6 +452,7 @@ test "peer vocabulary: every state ranked except unknown, every reason described
     try t.expectEqual(@as(?Attention, .lost), PeerState.gone.attention());
     try t.expectEqual(@as(?Attention, null), PeerState.unknown.attention());
     for (std.enums.values(RefuseReason)) |r| try t.expect(r.describe().len > 0);
+    for (std.enums.values(PeerUnavailable)) |r| try t.expect(r.describe().len > 0);
     try t.expectEqualStrings("waiting_user", names(PeerState)[3]);
     try t.expectEqual(@as(usize, 4), names(PeerOutcome).len);
 }

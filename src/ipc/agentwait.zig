@@ -107,18 +107,33 @@ pub const WireDigest = struct { count: u32, latest: []const u8 };
 
 /// A pushed wake-up's facts. Every value is a string: Claude Code's
 /// channel `meta` takes nothing else, and its keys must be identifiers.
+/// `agent`, `state` and `seq` are an agent wake's; a peer message
+/// (`agentpush.composePeer`) carries the `from`..`age_s` facts instead.
 pub const Meta = struct {
-    agent: []const u8,
+    agent: ?[]const u8 = null,
     name: ?[]const u8 = null,
-    /// The kind that decides the wake-up, or `digest`.
+    /// The kind that decides the wake-up, or `digest`; `peer_message`,
+    /// `peer_expired`, `peer_expired_away` for a peer push.
     kind: []const u8,
-    state: []const u8,
-    seq: []const u8,
+    state: ?[]const u8 = null,
+    seq: ?[]const u8 = null,
     record: ?[]const u8 = null,
     job: ?[]const u8 = null,
     conversation: ?[]const u8 = null,
-    /// When the deciding event happened (`eventAt`).
+    /// When the deciding event happened (`eventAt`); a peer message's send time.
     at: ?[]const u8 = null,
+    /// Peer: the sender's address and registration facts.
+    from: ?[]const u8 = null,
+    host: ?[]const u8 = null,
+    app: ?[]const u8 = null,
+    cwd: ?[]const u8 = null,
+    /// Peer: the message id (`m-...`), and the one it answers.
+    message: ?[]const u8 = null,
+    reply_to: ?[]const u8 = null,
+    /// Peer: the recipient was offline when it was sent (`true`/`false`).
+    queued: ?[]const u8 = null,
+    /// Peer: seconds between sending and delivery.
+    age_s: ?[]const u8 = null,
 };
 
 /// What a `server` subscription's wake carries besides the events.
@@ -192,6 +207,12 @@ pub fn encodeWake(arena: std.mem.Allocator, agent: []const u8, state: vocab.Stat
         msg.meta = p.meta;
     }
     return std.fmt.allocPrint(arena, "{f}\n", .{std.json.fmt(msg, .{ .emit_null_optional_fields = false })});
+}
+
+/// The wake line of a push that belongs to no agent (a peer message), for
+/// a `server` follower: only `content` and `meta`, newline-terminated.
+pub fn encodePushed(arena: std.mem.Allocator, p: Pushed) ![]const u8 {
+    return std.fmt.allocPrint(arena, "{f}\n", .{std.json.fmt(Message{ .type = "wake", .content = p.content, .meta = p.meta }, .{ .emit_null_optional_fields = false })});
 }
 
 /// The wake message for `d` (what `formatWake` prints).
@@ -643,6 +664,27 @@ test "a server subscription and its pushed wake round-trip" {
     const plain = try std.fmt.allocPrint(a, "{f}", .{std.json.fmt(Subscribe{ .agent = "claude-1", .content = true }, .{ .emit_null_optional_fields = false })});
     try t.expect((try std.json.parseFromSliceLeaky(Subscribe, a, plain, .{ .ignore_unknown_fields = true })).content);
     try t.expect(!(try std.json.parseFromSliceLeaky(Subscribe, a, "{\"agent\":\"claude-1\"}", .{ .ignore_unknown_fields = true })).content);
+}
+
+test "a peer push's wake has no agent facts and prints its content" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const line = try encodePushed(a, .{ .content = "Peer message from Zenit.\n\nhi", .meta = .{ .kind = "peer_message", .from = "Zenit", .message = "m-00000000" } });
+    try t.expect(std.mem.indexOfScalar(u8, line[0 .. line.len - 1], '\n') == null);
+    try t.expect(std.mem.indexOf(u8, line, "\"meta\":{\"kind\":\"peer_message\",\"from\":\"Zenit\",\"message\":\"m-00000000\"}") != null);
+    const m = try std.json.parseFromSliceLeaky(Message, a, line[0 .. line.len - 1], .{ .ignore_unknown_fields = true });
+    try t.expectEqualStrings("wake", m.type);
+    const meta = m.meta.?;
+    try t.expect(meta.agent == null and meta.state == null and meta.seq == null);
+    try t.expectEqualStrings("Zenit", meta.from.?);
+    try t.expectEqualStrings("m-00000000", meta.message.?);
+    var printed: std.Io.Writer.Allocating = .init(a);
+    try formatPrinted(&printed.writer, m);
+    try t.expectEqualStrings("Peer message from Zenit.\n\nhi", printed.written());
+    // An agent wake's meta still round-trips with its three facts.
+    const agent_meta = try std.fmt.allocPrint(a, "{f}", .{std.json.fmt(Meta{ .agent = "claude-1", .kind = "done", .state = "idle", .seq = "3" }, .{ .emit_null_optional_fields = false })});
+    try t.expectEqualStrings("{\"agent\":\"claude-1\",\"kind\":\"done\",\"state\":\"idle\",\"seq\":\"3\"}", agent_meta);
 }
 
 test "the watch command round-trips through the cli grammar and bakes in no cursor" {

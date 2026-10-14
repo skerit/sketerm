@@ -1,10 +1,11 @@
-//! Push delivery: a sub-agent's wake-up sent INTO the orchestrator's
-//! session instead of waiting for a waiter it armed. Two routes share the
-//! text composed here and the agent's one delivery state: a Claude Code
-//! channel notification (`notifications/claude/channel`, written by the
-//! MCP server itself) and an `agent-wait --server` follower (the opencode
-//! plugin runs one and prompts the session with each wake-up). The plain
-//! waiter prints the same text (`agentwait.Subscribe.content`).
+//! Push delivery: a sub-agent's wake-up (or a peer message) sent INTO the
+//! orchestrator's session instead of waiting for a waiter it armed. Two
+//! routes share the text composed here and the one delivery state of what
+//! they deliver: a Claude Code channel notification
+//! (`notifications/claude/channel`, written by the MCP server itself) and
+//! an `agent-wait --server` follower (the opencode plugin runs one and
+//! prompts the session with each wake-up). The plain waiter prints the same
+//! text (`agentwait.Subscribe.content`); `peer_read` returns it too.
 //!
 //! Claude Code tells a server nothing about channels: it only registers a
 //! listener when the session was started with `--channels server:<name>`
@@ -21,6 +22,8 @@ const vocab = @import("../agent/vocab.zig");
 const output = @import("../agent/output.zig");
 const select = @import("../agent/select.zig");
 const agentwait = @import("agentwait.zig");
+const peermail = @import("../mux/peermail.zig");
+const clock = @import("../util/clock.zig");
 
 /// The push route of this server's MCP session (`capabilities.agent_push`).
 pub const Route = enum { channel, none };
@@ -187,6 +190,112 @@ fn carryText(w: *std.Io.Writer, ev: *const events.Event) !void {
     if (detail.len > 0) try w.print("\n\n{s}", .{events.clip(detail, ANSWER_MAX_CHARS * 4)});
 }
 
+/// What a peer push is about (`composePeer`).
+pub const PeerItem = union(enum) {
+    /// A message for this session.
+    message: peermail.Deliver,
+    /// What became of a message this session sent.
+    event: peermail.Event,
+    /// A message for this address that expired before any server of it read it.
+    expired_away: peermail.Expired,
+};
+
+/// A peer message shows its age from this much on.
+pub const PEER_AGE_SHOWN_MS: i64 = 60_000;
+
+/// Compose the push for one peer item: the same `Push` the agent wake-ups
+/// use, so both routes and `peer_read` carry this text and nothing else.
+/// The sender's presence is its `PeerState`: `gone` when its server is not
+/// live, else `unknown` until presence (hooks) reports more.
+pub fn composePeer(arena: std.mem.Allocator, item: PeerItem) !Push {
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    switch (item) {
+        .message => |m| {
+            try w.print("Peer message from {s} (", .{m.from.address});
+            try w.writeAll(if (m.from.app.len > 0) m.from.app else "unknown app");
+            if (m.from.host.len > 0) try w.print(" on {s}", .{m.from.host});
+            if (m.from.cwd.len > 0) try w.print(", {s}", .{m.from.cwd});
+            const presence: vocab.PeerState = if (m.sender_live) .unknown else .gone;
+            try w.print(", {s})", .{@tagName(presence)});
+            const aged = m.age_ms >= PEER_AGE_SHOWN_MS;
+            if (aged or m.queued) try w.writeAll(", sent");
+            if (aged) {
+                try w.writeAll(" ");
+                try writeAge(w, m.age_ms);
+                try w.writeAll(" ago");
+            }
+            if (m.queued) try w.writeAll(" while you were offline");
+            try w.print(". id {s}.", .{m.id});
+            if (m.reply_to) |r| try w.print(" In reply to {s}.", .{r});
+            try w.print(" Reply with peer_send to \"{s}\".", .{m.from.address});
+            try w.print("\n\n{s}", .{m.text});
+        },
+        .event => |e| {
+            try w.print("Your peer message {s} to {s} ", .{ e.id, e.to });
+            if (e.reason) |r| {
+                try w.print("ended unread: {s}.", .{r.describe()});
+            } else if (e.outcome == .expired) {
+                try w.writeAll("expired unread after ");
+                try writeAge(w, e.queued_ms);
+                try w.writeAll(".");
+            } else try w.print("is {s}.", .{@tagName(e.outcome)});
+        },
+        .expired_away => |x| {
+            try w.print("Peer message {s} from {s} expired unread while you were away (", .{ x.id, x.from });
+            try writeAge(w, x.expired_ms - x.sent_ms);
+            try w.writeAll(" after it was sent).");
+        },
+    }
+    return .{ .content = aw.written(), .meta = try peerMeta(arena, item) };
+}
+
+fn peerMeta(arena: std.mem.Allocator, item: PeerItem) !agentwait.Meta {
+    return switch (item) {
+        .message => |m| .{
+            .kind = "peer_message",
+            .from = m.from.address,
+            .host = nonEmpty(m.from.host),
+            .app = nonEmpty(m.from.app),
+            .cwd = nonEmpty(m.from.cwd),
+            .message = m.id,
+            .reply_to = m.reply_to,
+            .queued = if (m.queued) "true" else "false",
+            .age_s = try std.fmt.allocPrint(arena, "{d}", .{@divTrunc(@max(m.age_ms, 0), 1000)}),
+            .at = try wallAt(arena, m.sent_ms),
+        },
+        .event => |e| .{
+            .kind = try std.fmt.allocPrint(arena, "peer_{s}", .{@tagName(e.outcome)}),
+            .message = e.id,
+        },
+        .expired_away => |x| .{
+            .kind = "peer_expired_away",
+            .from = x.from,
+            .message = x.id,
+            .at = try wallAt(arena, x.sent_ms),
+        },
+    };
+}
+
+fn nonEmpty(s: []const u8) ?[]const u8 {
+    return if (s.len > 0) s else null;
+}
+
+fn wallAt(arena: std.mem.Allocator, wall_ms: i64) !?[]const u8 {
+    if (wall_ms <= 0) return null;
+    var buf: [clock.ISO_LEN]u8 = undefined;
+    return if (clock.isoLocal(&buf, wall_ms)) |s| try arena.dupe(u8, s) else null;
+}
+
+/// `5 min`, `3 h`, `2 days`: minutes below two hours, hours below two days.
+fn writeAge(w: *std.Io.Writer, ms: i64) !void {
+    const mins = @divTrunc(@max(ms, 0), 60_000);
+    if (mins < 120) return w.print("{d} min", .{mins});
+    const hours = @divTrunc(mins, 60);
+    if (hours < 48) return w.print("{d} h", .{hours});
+    try w.print("{d} days", .{@divTrunc(hours, 24)});
+}
+
 /// The channel notification for `p`, one newline-free JSON-RPC line.
 pub fn encodeChannel(arena: std.mem.Allocator, p: Push) ![]const u8 {
     const Params = struct { content: []const u8, meta: agentwait.Meta };
@@ -294,4 +403,58 @@ test "a wake carries what its line cuts: a message in full, a prompt's options, 
     const dx = (try cur.take(&q, .{}, 3, a)).?;
     const px = try compose(a, .{ .agent = "claude-k3f9", .state = .exited }, dx, &q, &recs, &handed);
     try t.expectEqualStrings("claude-k3f9 exited [state exited]", px.content);
+}
+
+test "a peer message reads as the plan's sentence: age from a minute on, offline only when queued" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const from: peermail.From = .{ .address = "Zenit", .host = "hohenheim", .cwd = "/home/u/zenit-workspace", .app = "claude-code", .pid = 7 };
+
+    // Fresh and live: no age, no offline clause.
+    const fresh = try composePeer(a, .{ .message = .{ .id = "m-k3f9x2qa", .from = from, .to = "Qq", .text = "Who owns the migration?", .age_ms = 4_000, .sender_live = true } });
+    try t.expectEqualStrings("Peer message from Zenit (claude-code on hohenheim, /home/u/zenit-workspace, unknown). id m-k3f9x2qa. Reply with peer_send to \"Zenit\".\n\nWho owns the migration?", fresh.content);
+    try t.expectEqualStrings("peer_message", fresh.meta.kind);
+    try t.expectEqualStrings("Zenit", fresh.meta.from.?);
+    try t.expectEqualStrings("m-k3f9x2qa", fresh.meta.message.?);
+    try t.expectEqualStrings("false", fresh.meta.queued.?);
+    try t.expectEqualStrings("4", fresh.meta.age_s.?);
+    try t.expect(fresh.meta.agent == null and fresh.meta.seq == null);
+
+    // Aged but delivered live: the age alone.
+    const aged = try composePeer(a, .{ .message = .{ .id = "m-1", .from = from, .text = "x", .age_ms = 5 * 60_000 + 10, .sender_live = true } });
+    try t.expect(std.mem.startsWith(u8, aged.content, "Peer message from Zenit (claude-code on hohenheim, /home/u/zenit-workspace, unknown), sent 5 min ago. id m-1."));
+
+    // Queued while offline, sender gone since, and an answer to another.
+    const queued = try composePeer(a, .{ .message = .{ .id = "m-2", .from = from, .text = "x", .age_ms = 5 * 60_000, .queued = true, .reply_to = "m-1" } });
+    try t.expectEqualStrings("Peer message from Zenit (claude-code on hohenheim, /home/u/zenit-workspace, gone), sent 5 min ago while you were offline. id m-2. In reply to m-1. Reply with peer_send to \"Zenit\".\n\nx", queued.content);
+    try t.expectEqualStrings("true", queued.meta.queued.?);
+    try t.expectEqualStrings("m-1", queued.meta.reply_to.?);
+
+    // Queued but fresh: offline without an age; an unregistered app and host.
+    const quick = try composePeer(a, .{ .message = .{ .id = "m-3", .from = .{ .address = "anon-ab12" }, .text = "x", .age_ms = 30_000, .queued = true, .sender_live = true } });
+    try t.expect(std.mem.startsWith(u8, quick.content, "Peer message from anon-ab12 (unknown app, unknown), sent while you were offline. id m-3."));
+    try t.expect(quick.meta.host == null and quick.meta.cwd == null);
+
+    // Hours past two hours; the channel line stays newline-free.
+    const old = try composePeer(a, .{ .message = .{ .id = "m-4", .from = from, .text = "line1\nline2", .age_ms = 3 * 3600_000 } });
+    try t.expect(std.mem.indexOf(u8, old.content, "sent 3 h ago. id m-4.") != null);
+    const note = try encodeChannel(a, old);
+    try t.expect(std.mem.indexOfScalar(u8, note, '\n') == null);
+    try t.expect(std.mem.indexOf(u8, note, "\"meta\":{\"kind\":\"peer_message\",") != null);
+    try t.expect(std.mem.indexOf(u8, note, "\"agent\"") == null);
+}
+
+test "what became of a sent message, and mail that expired while away, read as one sentence" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const exp = try composePeer(a, .{ .event = .{ .id = "m-5", .to = "Qq", .queued_ms = 6 * 3600_000 } });
+    try t.expectEqualStrings("Your peer message m-5 to Qq expired unread after 6 h.", exp.content);
+    try t.expectEqualStrings("peer_expired", exp.meta.kind);
+    const gone = try composePeer(a, .{ .event = .{ .id = "m-6", .to = "anon-x1y2", .reason = .not_durable_gone } });
+    try t.expectEqualStrings("Your peer message m-6 to anon-x1y2 ended unread: that peer's address was not durable and its server is gone.", gone.content);
+    const away = try composePeer(a, .{ .expired_away = .{ .id = "m-7", .from = "Zenit", .sent_ms = 1_000, .expired_ms = 1_000 + 7 * 3600_000 } });
+    try t.expectEqualStrings("Peer message m-7 from Zenit expired unread while you were away (7 h after it was sent).", away.content);
+    try t.expectEqualStrings("peer_expired_away", away.meta.kind);
 }

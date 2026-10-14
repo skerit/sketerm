@@ -110,6 +110,34 @@ pub fn servicePush(now_ms: i64) void {
     }
 }
 
+/// A push that belongs to no agent (a peer message) can reach the session
+/// now: a live channel, or a follower watching the whole server.
+pub fn looseRouteReady() bool {
+    return pushing();
+}
+
+/// Hand a push that belongs to no agent to this session: the live channel
+/// when there is one (the session reads it there), else every server
+/// follower (each prompts its own session). The caller owns its delivery
+/// state: it marks the item handed out only when this returns true.
+/// @return whether a route took it.
+pub fn pushLoose(arena: std.mem.Allocator, p: agentpush.Push) bool {
+    if (state.push == .channel and state.push_live) {
+        if (state.push_sink) |sink| {
+            sink(agentpush.encodeChannel(arena, p) catch return false);
+            return true;
+        }
+    }
+    const line = agentwait.encodePushed(arena, .{ .content = p.content, .meta = p.meta }) catch return false;
+    var took = false;
+    for (state.waiter.subs.items) |s| {
+        if (!s.server or !s.subscribed or s.done) continue;
+        sendLine(s, line);
+        if (!s.done) took = true;
+    }
+    return took;
+}
+
 // ── the waiter socket ────────────────────────────────────────────
 
 /// One agent a waiter watches, with its own examined mark.
